@@ -119,6 +119,13 @@ enum PodCmd {
         #[arg(long)]
         apply: bool,
     },
+    /// Restart a pod in place by name or id. Dry-run unless --apply.
+    Restart {
+        /// Machine name (e.g. arena8-apple) or raw provider id.
+        target: String,
+        #[arg(long)]
+        apply: bool,
+    },
     /// Terminate (delete) a pod by name or id. Dry-run unless --apply.
     Terminate {
         /// Machine name (e.g. arena8-apple) or raw provider id.
@@ -663,6 +670,16 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
                 println!("[stopped] {label}");
             } else {
                 println!("[dry-run] would stop {label} (--apply to execute)");
+            }
+        }
+
+        PodCmd::Restart { target, apply } => {
+            let (id, label) = resolve_target(provider, &target).await?;
+            if apply {
+                provider.restart_pod(&id).await?;
+                println!("[restarted] {label}");
+            } else {
+                println!("[dry-run] would restart {label} (--apply to execute)");
             }
         }
 

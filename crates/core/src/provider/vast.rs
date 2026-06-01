@@ -284,6 +284,27 @@ impl Provider for VastProvider {
         Ok(())
     }
 
+    async fn restart_pod(&self, id: &str) -> Result<()> {
+        // Vast has no single reboot endpoint; a restart is stop then start. Vast keeps
+        // the stopped instance, so this preserves it (just cycles the container).
+        for state in ["stopped", "running"] {
+            let resp = self
+                .auth(
+                    self.client
+                        .put(format!("{}/instances/{}/", self.base, id))
+                        .json(&json!({ "state": state })),
+                )
+                .send()
+                .await?;
+            let status = resp.status();
+            if !status.is_success() {
+                let body: Value = resp.json().await.unwrap_or(Value::Null);
+                return Err(Error::provider_http(status, &body, "vast restart"));
+            }
+        }
+        Ok(())
+    }
+
     async fn terminate_pod(&self, id: &str) -> Result<()> {
         let resp = self
             .auth(self.client.delete(format!("{}/instances/{}/", self.base, id)))

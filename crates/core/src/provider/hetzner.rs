@@ -176,6 +176,20 @@ impl Provider for HetznerProvider {
         Ok(())
     }
 
+    async fn restart_pod(&self, id: &str) -> Result<()> {
+        // Clean OS reboot — preserves the VM and its disk.
+        let resp = self
+            .auth(self.client.post(format!("{}/servers/{}/actions/reboot", self.base, id)))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body: Value = resp.json().await.unwrap_or(Value::Null);
+            return Err(Error::provider_http(status, &body, "hetzner reboot"));
+        }
+        Ok(())
+    }
+
     async fn terminate_pod(&self, id: &str) -> Result<()> {
         let resp = self
             .auth(self.client.delete(format!("{}/servers/{}", self.base, id)))

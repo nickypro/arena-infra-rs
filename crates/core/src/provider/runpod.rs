@@ -148,6 +148,21 @@ impl Provider for RunpodProvider {
         Ok(())
     }
 
+    async fn restart_pod(&self, id: &str) -> Result<()> {
+        // Dedicated restart endpoint: restarts the container in place (keeps the pod
+        // and its disk), unlike stop/start which deallocates.
+        let resp = self
+            .auth(self.client.post(format!("{BASE}/pods/{id}/restart")))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body: Value = resp.json().await.unwrap_or(Value::Null);
+            return Err(Error::provider_http(status, &body, "restart pod"));
+        }
+        Ok(())
+    }
+
     async fn terminate_pod(&self, id: &str) -> Result<()> {
         let resp = self
             .auth(self.client.delete(format!("{BASE}/pods/{id}")))

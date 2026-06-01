@@ -59,6 +59,10 @@ pub trait Provider: Send + Sync {
     /// Mutating.
     async fn stop_pod(&self, id: &str) -> Result<()>;
 
+    /// Mutating. Restart in place (preserves the machine/disk where the provider
+    /// supports it), for when a pod is wedged.
+    async fn restart_pod(&self, id: &str) -> Result<()>;
+
     /// Mutating and irreversible.
     async fn terminate_pod(&self, id: &str) -> Result<()>;
 }
