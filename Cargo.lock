@@ -71,6 +71,7 @@ dependencies = [
  "anyhow",
  "arena-core",
  "clap",
+ "serde_json",
  "tokio",
 ]
 

@@ -35,7 +35,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     and a returning machine reclaims its port. Pure/no-I/O — it plans, you apply.
 - `arena` (CLI):
   - `pods list | create | stop | terminate` (`--provider runpod|vast|hetzner`; Vast
-    reads `VAST_API_KEY`, Hetzner reads `HETZNER_API_KEY` + `HETZNER_*`).
+    reads `VAST_API_KEY`, Hetzner reads `HETZNER_API_KEY` + `HETZNER_*`). `list`
+    takes `--json`; `stop`/`terminate` accept a **machine name or id**.
   - `pods up -n N` — one-command spin-up: create, poll until each pod has an SSH
     endpoint, then print the proxy plan. Dry-run unless `--apply`; `--no-wait` skips
     polling. Polling stops at `--timeout`; nothing runs in the background.

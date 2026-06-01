@@ -76,7 +76,11 @@ enum ProxyCmd {
 #[derive(Subcommand)]
 enum PodCmd {
     /// List current pods (read-only).
-    List,
+    List {
+        /// Emit JSON instead of a table (for scripting).
+        #[arg(long)]
+        json: bool,
+    },
     /// Create N pods on the next free machine names. Dry-run unless --apply.
     Create {
         #[arg(short = 'n', long)]
@@ -108,15 +112,17 @@ enum PodCmd {
         #[arg(long, default_value_t = 12)]
         interval: u64,
     },
-    /// Stop a pod by id. Dry-run unless --apply.
+    /// Stop a pod by name or id. Dry-run unless --apply.
     Stop {
-        id: String,
+        /// Machine name (e.g. arena8-apple) or raw provider id.
+        target: String,
         #[arg(long)]
         apply: bool,
     },
-    /// Terminate (delete) a pod by id. Dry-run unless --apply.
+    /// Terminate (delete) a pod by name or id. Dry-run unless --apply.
     Terminate {
-        id: String,
+        /// Machine name (e.g. arena8-apple) or raw provider id.
+        target: String,
         #[arg(long)]
         apply: bool,
     },
@@ -143,6 +149,17 @@ fn base_spec(cfg: &Config) -> PodSpec {
         volume_gb: first_parsed(&["VOLUME_GB", "RUNPOD_VOLUME_SPACE_IN_GB"], 0),
         ports: "8888/http,22/tcp".to_string(),
         env: Vec::new(),
+    }
+}
+
+/// Warn (on a GPU provider) when pods would be created with no persistent volume —
+/// container disk is wiped on restart, so uncommitted work would be lost.
+fn warn_no_volume(provider: &dyn Provider, spec: &PodSpec) {
+    if spec.volume_gb == 0 && provider.name() != "hetzner" {
+        eprintln!(
+            "⚠ no persistent volume (VOLUME_GB=0): work is lost when a pod restarts. \
+             Set VOLUME_GB to keep it."
+        );
     }
 }
 
@@ -503,21 +520,26 @@ fn emit_proxy_plan(pods: &[arena_core::Pod], cfg: &Config, out: Option<&std::pat
 
 async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Result<()> {
     match cmd {
-        PodCmd::List => {
+        PodCmd::List { json } => {
             let policy = arena_core::retry::RetryPolicy::default();
             let pods = arena_core::retry::retrying(&policy, || provider.list_pods()).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&pods)?);
+                return Ok(());
+            }
             if pods.is_empty() {
                 println!("(no pods)");
                 return Ok(());
             }
             println!(
-                "{:<24} {:<10} {:<16} {:<16} {}",
-                "NAME", "STATUS", "GPU", "IP", "PORT"
+                "{:<22} {:<14} {:<10} {:<16} {:<16} {}",
+                "NAME", "ID", "STATUS", "GPU", "IP", "PORT"
             );
             for p in &pods {
                 println!(
-                    "{:<24} {:<10} {:<16} {:<16} {}",
+                    "{:<22} {:<14} {:<10} {:<16} {:<16} {}",
                     p.name,
+                    p.id,
                     p.status,
                     p.gpu_type.as_deref().unwrap_or("-"),
                     p.ssh_ip.as_deref().unwrap_or("-"),
@@ -533,10 +555,12 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
                 return Ok(());
             }
             if !apply {
-                let desc = provider.describe(&base_spec(cfg));
+                let spec = base_spec(cfg);
+                let desc = provider.describe(&spec);
                 for name in &names {
                     println!("[dry-run] would create {name} on {} ({desc})", provider.name());
                 }
+                warn_no_volume(provider, &spec);
                 println!("\nDry-run only — no pods created. Re-run with --apply to execute.");
                 return Ok(());
             }
@@ -551,10 +575,12 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
             }
 
             if !apply {
-                let desc = provider.describe(&base_spec(cfg));
+                let spec = base_spec(cfg);
+                let desc = provider.describe(&spec);
                 for name in &names {
                     println!("[dry-run] would create {name} on {} ({desc})", provider.name());
                 }
+                warn_no_volume(provider, &spec);
                 println!(
                     "\nDry-run only — no pods created. With --apply: create the above, \
                      poll up to {timeout}s for SSH endpoints, then print the proxy plan."
@@ -629,23 +655,39 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
             emit_proxy_plan(&pods, cfg, None)?;
         }
 
-        PodCmd::Stop { id, apply } => {
+        PodCmd::Stop { target, apply } => {
+            let (id, label) = resolve_target(provider, &target).await?;
             if apply {
                 provider.stop_pod(&id).await?;
-                println!("[stopped] {id}");
+                println!("[stopped] {label}");
             } else {
-                println!("[dry-run] would stop {id} (--apply to execute)");
+                println!("[dry-run] would stop {label} (--apply to execute)");
             }
         }
 
-        PodCmd::Terminate { id, apply } => {
+        PodCmd::Terminate { target, apply } => {
+            let (id, label) = resolve_target(provider, &target).await?;
             if apply {
                 provider.terminate_pod(&id).await?;
-                println!("[terminated] {id}");
+                println!("[terminated] {label}");
             } else {
-                println!("[dry-run] would terminate {id} (--apply to execute)");
+                println!("[dry-run] would terminate {label} (--apply to execute)");
             }
         }
     }
     Ok(())
+}
+
+/// Resolve a user-supplied target (machine name OR raw provider id) to a concrete
+/// `(id, label)`, by listing pods. Requires the pod to actually exist, so a typo'd
+/// name/id fails clearly instead of issuing a no-op or wrong mutation. Read-only.
+async fn resolve_target(provider: &dyn Provider, target: &str) -> Result<(String, String)> {
+    let policy = arena_core::retry::RetryPolicy::default();
+    let pods = arena_core::retry::retrying(&policy, || provider.list_pods())
+        .await
+        .context("listing pods to resolve target")?;
+    match pods.iter().find(|p| p.name == target || p.id == target) {
+        Some(p) => Ok((p.id.clone(), format!("{} (id={})", p.name, p.id))),
+        None => anyhow::bail!("no pod with name or id '{target}' (run `arena pods list`)"),
+    }
 }

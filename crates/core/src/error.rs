@@ -86,7 +86,20 @@ pub enum Error {
 impl Error {
     /// Build a classified provider error from an HTTP status + body and a short
     /// context label (e.g. "create pod"). The kind is inferred from status/body.
+    ///
+    /// The body is truncated (on a char boundary) before it goes into the message:
+    /// these errors get logged/printed, and an unbounded response body is both noisy
+    /// and a needless place for sensitive echoed request context to land.
     pub fn provider_http(status: reqwest::StatusCode, body: &dyn std::fmt::Display, ctx: &str) -> Self {
+        const MAX_BODY: usize = 300;
+        let raw = body.to_string();
+        let body = if raw.chars().count() > MAX_BODY {
+            let mut s: String = raw.chars().take(MAX_BODY).collect();
+            s.push('…');
+            s
+        } else {
+            raw
+        };
         let message = format!("{ctx} HTTP {status}: {body}");
         let kind = ProviderErrorKind::classify(status, &message);
         Error::Provider { kind, message }
