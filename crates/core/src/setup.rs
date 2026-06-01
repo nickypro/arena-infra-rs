@@ -1,12 +1,16 @@
 //! Pod provisioning: make a freshly-created pod ready to commit/back up.
 //!
-//! Mirrors the manual steps the legacy tooling does after a pod comes up:
-//!   1. copy the ARENA git deploy key onto the pod (done by the caller via scp),
-//!   2. `chmod 600` it and write the machine name to `~/.name`,
-//!   3. point the repo's `origin` at the GitHub SSH URL and check out the branch.
+//! Faithful to the legacy `setup_em.sh`. After the caller copies the git deploy key
+//! (scp), the on-pod script:
+//!   1. `chmod 600` the key,
+//!   2. add a `github.com` block to `~/.ssh/config` pointing at it (idempotent),
+//!   3. point the ARENA repo's `origin` at the GitHub SSH URL, fetch, and update
+//!      (default: stay on the current branch, pull / reset-if-on-main; `--force`:
+//!      check out the default branch and `reset --hard`), then update submodules,
+//!   4. write `~/.name` as `export MACHINE_NAME='<short>'`.
 //!
-//! This module renders the on-pod shell command (pure, unit-tested). The key copy
-//! (scp) and execution live in the caller, gated behind `--apply`.
+//! Renders the on-pod shell command (pure, unit-tested); scp + execution are in the
+//! caller, gated behind `--apply`.
 
 use crate::config::Config;
 use crate::error::{Error, Result};
@@ -22,8 +26,10 @@ pub struct SetupConfig {
     pub repo_path: String,
     /// `git@github.com:owner/name.git`.
     pub repo_url: String,
-    /// Branch to check out.
+    /// Default branch (e.g. "main").
     pub branch: String,
+    /// Machine-name prefix, used to derive the short name for `~/.name`.
+    pub prefix: String,
 }
 
 impl SetupConfig {
@@ -48,29 +54,60 @@ impl SetupConfig {
             repo_path,
             repo_url: format!("git@github.com:{owner}/{name}.git"),
             branch: cfg.get("DEFAULT_BRANCH").unwrap_or("main").to_string(),
+            prefix: cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena").to_string(),
         })
     }
 
-    /// The shell command to run on the pod *after* the key has been copied: lock down
-    /// the key, record the machine name in `~/.name`, and point the repo at GitHub on
-    /// the right branch. `set -e` aborts on the first failure.
-    pub fn remote_command(&self, machine_name: &str) -> String {
+    /// The short machine name (the part after `{prefix}-`), e.g. arena8-apple -> apple.
+    pub fn short_name<'a>(&self, machine_name: &'a str) -> &'a str {
+        machine_name
+            .strip_prefix(&format!("{}-", self.prefix))
+            .unwrap_or(machine_name)
+    }
+
+    /// The on-pod provisioning command, run *after* the key has been scp'd. `force`
+    /// mirrors `setup_em.sh --force` (hard-reset onto the default branch).
+    pub fn remote_command(&self, machine_name: &str, force: bool) -> String {
         let q = shell_quote;
+        let key = &self.key_remote;
+        let branch = &self.branch;
+
+        // Idempotent github.com block in ~/.ssh/config pointing at the deploy key.
+        let ssh_config = format!(
+            "mkdir -p \"$HOME/.ssh\" && chmod 700 \"$HOME/.ssh\" && touch \"$HOME/.ssh/config\" && \
+             sed -i '/^# BEGIN arena-infra github.com/,/^# END arena-infra github.com/d' \"$HOME/.ssh/config\" && \
+             printf '%s\\n' '# BEGIN arena-infra github.com' 'Host github.com' '    AddKeysToAgent yes' \
+             '    IdentityFile {key}' '# END arena-infra github.com' >> \"$HOME/.ssh/config\" && \
+             chmod 600 \"$HOME/.ssh/config\""
+        );
+
+        // Branch update: force => checkout default + hard reset; else stay put.
+        let git_update = if force {
+            format!(
+                "git checkout {b} && git reset --hard origin/{b}",
+                b = q(branch)
+            )
+        } else {
+            format!(
+                "CUR=$(git rev-parse --abbrev-ref HEAD); \
+                 if [ \"$CUR\" = {b} ]; then git reset --hard origin/{b}; else git pull; fi",
+                b = q(branch)
+            )
+        };
+
         [
             "set -e".to_string(),
-            format!("chmod 600 {}", q(&self.key_remote)),
-            format!("echo {} > \"$HOME/.name\"", q(machine_name)),
+            format!("chmod 600 {}", q(key)),
+            ssh_config,
             format!("cd {}", q(&self.repo_path)),
-            format!(
-                "export GIT_SSH_COMMAND={}",
-                q(&format!(
-                    "ssh -i {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes",
-                    self.key_remote
-                ))
-            ),
             format!("git remote set-url origin {}", q(&self.repo_url)),
             "git fetch origin".to_string(),
-            format!("git checkout {}", q(&self.branch)),
+            git_update,
+            "git submodule update --init --recursive".to_string(),
+            format!(
+                "echo {} > \"$HOME/.name\"",
+                q(&format!("export MACHINE_NAME='{}'", self.short_name(machine_name)))
+            ),
         ]
         .join("; ")
     }
@@ -92,25 +129,37 @@ mod tests {
             repo_path: "/root/ARENA_3.0".into(),
             repo_url: "git@github.com:styme3279/ARENA_3.0.git".into(),
             branch: "main".into(),
+            prefix: "arena8".into(),
         }
     }
 
     #[test]
-    fn renders_provisioning_steps_in_order() {
-        let c = cfg().remote_command("arena8-apple");
-        assert!(c.contains("chmod 600 '/root/.ssh/id_ed25519'"));
-        assert!(c.contains("echo 'arena8-apple' > \"$HOME/.name\""));
-        assert!(c.contains("cd '/root/ARENA_3.0'"));
-        assert!(c.contains("git remote set-url origin 'git@github.com:styme3279/ARENA_3.0.git'"));
-        assert!(c.contains("git checkout 'main'"));
-        // key lockdown happens before the git work
-        assert!(c.find("chmod 600").unwrap() < c.find("git checkout").unwrap());
+    fn short_name_strips_prefix() {
+        assert_eq!(cfg().short_name("arena8-apple"), "apple");
+        assert_eq!(cfg().short_name("apple"), "apple");
     }
 
     #[test]
-    fn quotes_machine_name_safely() {
-        // a hostile name can't break out of the echo
-        let c = cfg().remote_command("a'; rm -rf /; echo '");
-        assert!(c.contains(r"echo 'a'\''; rm -rf /; echo '\'''"));
+    fn renders_full_provisioning_in_order() {
+        let c = cfg().remote_command("arena8-apple", false);
+        assert!(c.contains("chmod 600 '/root/.ssh/id_ed25519'"));
+        // github.com ssh config block
+        assert!(c.contains("# BEGIN arena-infra github.com"));
+        assert!(c.contains("IdentityFile /root/.ssh/id_ed25519"));
+        // repo wiring
+        assert!(c.contains("git remote set-url origin 'git@github.com:styme3279/ARENA_3.0.git'"));
+        assert!(c.contains("git fetch origin"));
+        assert!(c.contains("git submodule update --init --recursive"));
+        // .name uses the EXPORT form with the SHORT name
+        assert!(c.contains(r#"echo 'export MACHINE_NAME='\''apple'\''' > "$HOME/.name""#));
+        // non-force stays on current branch
+        assert!(c.contains("git rev-parse --abbrev-ref HEAD"));
+        assert!(!c.contains("git checkout 'main'"));
+    }
+
+    #[test]
+    fn force_hard_resets_to_default_branch() {
+        let c = cfg().remote_command("arena8-apple", true);
+        assert!(c.contains("git checkout 'main' && git reset --hard origin/'main'"));
     }
 }

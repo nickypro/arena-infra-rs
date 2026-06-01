@@ -53,13 +53,20 @@ impl BackupConfig {
     }
 }
 
-/// Render the remote shell command that backs up one machine's working tree.
+/// Render the remote shell command that backs up one machine's working tree, matching
+/// the legacy `init_branches.sh` + `sync_git.sh` flow:
 ///
-/// It stages all changes and, if any are staged, commits and pushes to the machine's
-/// backup branch; if the tree is clean it prints `NO_CHANGES` and exits 0 so a no-op
-/// backup is distinguishable from a failure. `set -e` aborts on the first real error.
+/// 1. **check out the autocommit branch** (creating it if needed) — so commits never
+///    land on `main`/the wrong branch;
+/// 2. ensure an `Arena Autocommit` git identity exists;
+/// 3. stage everything; if the tree is clean, print `NO_CHANGES` and exit 0 (a no-op
+///    is distinguishable from a failure);
+/// 4. otherwise commit and `push -u origin <branch>`.
+///
+/// `set -e` aborts on the first real error.
 pub fn backup_command(cfg: &BackupConfig, machine_name: &str, commit_msg: &str) -> String {
     let branch = cfg.branch_for(machine_name);
+    let bq = shell_quote(&branch);
     let mut parts: Vec<String> = vec![
         "set -e".into(),
         format!("cd {}", shell_quote(&cfg.repo_path)),
@@ -72,11 +79,18 @@ pub fn backup_command(cfg: &BackupConfig, machine_name: &str, commit_msg: &str) 
             ))
         ));
     }
+    // On the machine's own autocommit branch (create-or-switch), never on main.
+    parts.push(format!("git checkout -b {bq} 2>/dev/null || git checkout {bq}"));
+    // A committer identity, in case the pod has none configured.
+    parts.push("git config user.name >/dev/null 2>&1 || git config user.name 'Arena Autocommit'".into());
+    parts.push(
+        "git config user.email >/dev/null 2>&1 || git config user.email 'autocommit@arena.education'"
+            .into(),
+    );
     parts.push("git add -A".into());
-    // Nothing staged -> clean tree -> report and stop, not an error.
     parts.push("if git diff --cached --quiet; then echo NO_CHANGES; exit 0; fi".into());
     parts.push(format!("git commit -m {}", shell_quote(commit_msg)));
-    parts.push(format!("git push origin HEAD:refs/heads/{}", shell_quote(&branch)));
+    parts.push(format!("git push -u origin {bq}"));
     parts.join("; ")
 }
 
@@ -108,9 +122,10 @@ mod tests {
         // Clean-tree guard so a no-op isn't treated as failure.
         assert!(c.contains("echo NO_CHANGES"));
         assert!(c.contains("git commit -m 'arena backup'"));
-        // Autocommit branch, never main.
-        assert!(c.contains("HEAD:refs/heads/'autocommit-arena8-w0d1-apple'"));
-        assert!(!c.contains("refs/heads/main"));
+        // Checks out the autocommit branch first (never commits onto main).
+        assert!(c.contains("git checkout -b 'autocommit-arena8-w0d1-apple'"));
+        assert!(c.contains("git push -u origin 'autocommit-arena8-w0d1-apple'"));
+        assert!(c.contains("Arena Autocommit"));
         // Uses the configured push key.
         assert!(c.contains("GIT_SSH_COMMAND='ssh -i /root/.ssh/id_ed25519"));
     }

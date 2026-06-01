@@ -54,10 +54,13 @@ enum Cmd {
         day: Option<u32>,
     },
     /// Provision pods over SSH: copy the git deploy key, write ~/.name, point the
-    /// repo at GitHub on the default branch. Dry-run unless --apply.
+    /// repo at GitHub. Dry-run unless --apply.
     Setup {
         #[arg(long)]
         apply: bool,
+        /// Force-checkout the default branch and hard-reset (else stay on current).
+        #[arg(long)]
+        force: bool,
     },
     /// Inspect the loaded config.
     #[command(subcommand)]
@@ -329,11 +332,13 @@ async fn main() -> Result<()> {
         Cmd::Backup { apply, message, week, day } => {
             handle_backup(provider.unwrap().as_ref(), &cfg, apply, message, week, day).await
         }
-        Cmd::Setup { apply } => handle_setup(provider.unwrap().as_ref(), &cfg, apply).await,
+        Cmd::Setup { apply, force } => {
+            handle_setup(provider.unwrap().as_ref(), &cfg, apply, force).await
+        }
     }
 }
 
-async fn handle_setup(provider: &dyn Provider, cfg: &Config, apply: bool) -> Result<()> {
+async fn handle_setup(provider: &dyn Provider, cfg: &Config, apply: bool, force: bool) -> Result<()> {
     use arena_core::ssh::{self, SshTarget};
 
     let scfg = arena_core::setup::SetupConfig::from_config(cfg)?;
@@ -360,7 +365,7 @@ async fn handle_setup(provider: &dyn Provider, cfg: &Config, apply: bool) -> Res
         for (name, target) in &targets {
             println!("# {name}");
             println!("{}", target.display_scp(&scfg.key_local, &scfg.key_remote));
-            println!("{}\n", target.display_command(&scfg.remote_command(name)));
+            println!("{}\n", target.display_command(&scfg.remote_command(name, force)));
         }
         println!("Re-run with --apply to execute over SSH.");
         return Ok(());
@@ -372,7 +377,7 @@ async fn handle_setup(provider: &dyn Provider, cfg: &Config, apply: bool) -> Res
         // 1) copy the key, 2) run the provisioning script.
         let copied = ssh::scp(target, &scfg.key_local, &scfg.key_remote).await;
         let result = match copied {
-            Ok(out) if out.success => ssh::run(target, &scfg.remote_command(name)).await,
+            Ok(out) if out.success => ssh::run(target, &scfg.remote_command(name, force)).await,
             Ok(out) => Err(arena_core::Error::provider(format!(
                 "scp key failed: {}",
                 out.stderr.trim()
