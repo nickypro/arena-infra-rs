@@ -522,7 +522,8 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
     match cmd {
         PodCmd::List { json } => {
             let policy = arena_core::retry::RetryPolicy::default();
-            let pods = arena_core::retry::retrying(&policy, || provider.list_pods()).await?;
+            let mut pods = arena_core::retry::retrying(&policy, || provider.list_pods()).await?;
+            pods.sort_by(|a, b| a.name.cmp(&b.name));
             if json {
                 println!("{}", serde_json::to_string_pretty(&pods)?);
                 return Ok(());

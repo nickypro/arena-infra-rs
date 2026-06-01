@@ -49,13 +49,14 @@ struct App {
 
 impl App {
     async fn refresh(&mut self) {
-        let pods = match self.provider.list_pods().await {
+        let mut pods = match self.provider.list_pods().await {
             Ok(p) => p,
             Err(e) => {
                 self.status = format!("error listing pods: {e}");
                 return;
             }
         };
+        pods.sort_by(|a, b| a.name.cmp(&b.name));
 
         // Fan out metric fetches across the fleet; one down pod can't stall the rest.
         let mut set = JoinSet::new();
