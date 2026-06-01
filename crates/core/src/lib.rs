@@ -5,12 +5,14 @@
 //! existing bash/python tooling, and a safety posture where nothing here mutates
 //! remote state unless a caller explicitly asks it to.
 
+pub mod backup;
 pub mod config;
 pub mod error;
 pub mod naming;
 pub mod pod;
 pub mod provider;
 pub mod proxy;
+pub mod ssh;
 
 pub use config::Config;
 pub use error::{Error, Result};

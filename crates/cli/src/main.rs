@@ -43,6 +43,15 @@ enum Cmd {
     /// Plan port-forwarding/proxy wiring (read-only; prints config to apply).
     #[command(subcommand)]
     Proxy(ProxyCmd),
+    /// Commit + push each pod's ARENA working tree to its backup branch over SSH.
+    /// Dry-run unless --apply.
+    Backup {
+        #[arg(long)]
+        apply: bool,
+        /// Commit message (default: "arena backup <unix-time>").
+        #[arg(long)]
+        message: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -153,7 +162,89 @@ async fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Pods(p) => handle_pods(p, provider.as_ref(), &cfg).await,
         Cmd::Proxy(p) => handle_proxy(p, provider.as_ref(), &cfg).await,
+        Cmd::Backup { apply, message } => {
+            handle_backup(provider.as_ref(), &cfg, apply, message).await
+        }
     }
+}
+
+async fn handle_backup(
+    provider: &dyn Provider,
+    cfg: &Config,
+    apply: bool,
+    message: Option<String>,
+) -> Result<()> {
+    use arena_core::ssh::{self, SshTarget};
+
+    let bcfg = arena_core::backup::BackupConfig::from_config(cfg);
+    let msg = message.unwrap_or_else(|| {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        format!("arena backup {ts}")
+    });
+
+    let pods = provider.list_pods().await.context("listing pods for backup")?;
+    // Back up only pods that actually have an SSH endpoint; report the rest.
+    let mut targets = Vec::new();
+    for pod in &pods {
+        match SshTarget::from_pod(pod, cfg) {
+            Ok(t) => targets.push((pod.name.clone(), t)),
+            Err(_) => eprintln!("skip {} — no SSH endpoint yet", pod.name),
+        }
+    }
+    if targets.is_empty() {
+        println!("(no pods with an SSH endpoint to back up)");
+        return Ok(());
+    }
+
+    if !apply {
+        println!("Dry-run — would back up {} pod(s) with message {msg:?}:\n", targets.len());
+        for (name, target) in &targets {
+            let cmd = arena_core::backup::backup_command(&bcfg, name, &msg);
+            println!("# {name}  ->  branch {}", bcfg.branch_for(name));
+            println!("{}\n", target.display_command(&cmd));
+        }
+        println!("Re-run with --apply to execute over SSH.");
+        return Ok(());
+    }
+
+    // Apply: run sequentially so output stays readable and one failure doesn't
+    // obscure the rest. Each pod's result is classified (backed up / no changes / error).
+    let mut backed_up = 0;
+    let mut no_changes = 0;
+    let mut failed = 0;
+    for (name, target) in &targets {
+        let cmd = arena_core::backup::backup_command(&bcfg, name, &msg);
+        match ssh::run(target, &cmd).await {
+            Ok(out) if out.success && out.stdout.contains("NO_CHANGES") => {
+                println!("[no changes] {name}");
+                no_changes += 1;
+            }
+            Ok(out) if out.success => {
+                println!("[backed up]  {name} -> {}", bcfg.branch_for(name));
+                backed_up += 1;
+            }
+            Ok(out) => {
+                eprintln!(
+                    "[FAILED]     {name} (exit {:?}): {}",
+                    out.code,
+                    out.stderr.trim()
+                );
+                failed += 1;
+            }
+            Err(e) => {
+                eprintln!("[FAILED]     {name}: {e}");
+                failed += 1;
+            }
+        }
+    }
+    println!("\nDone: {backed_up} backed up, {no_changes} unchanged, {failed} failed.");
+    if failed > 0 {
+        anyhow::bail!("{failed} pod(s) failed to back up");
+    }
+    Ok(())
 }
 
 async fn handle_proxy(cmd: ProxyCmd, provider: &dyn Provider, cfg: &Config) -> Result<()> {

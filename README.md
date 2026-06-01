@@ -40,9 +40,15 @@ This is the **scaffold + machine-spin-up vertical**. Implemented so far:
     polling. Polling stops at `--timeout`; nothing runs in the background.
   - `proxy plan` — read-only; prints the nginx `stream` config to apply (`--out`
     saves it locally; never deploys to the proxy).
+  - `backup` — commit + push each pod's ARENA working tree to a per-machine branch
+    (`backup/<name>`) over SSH. Dry-run unless `--apply`; clean trees report
+    `NO_CHANGES` rather than failing. Repo path / branch / push key via `BACKUP_*`.
 - `arena-tui` (TUI) — read-only pod dashboard (ratatui).
 
-Not yet built (planned verticals): commit/backup flow, GPU/progress dashboard.
+Shared: `ssh` (non-interactive, fail-fast SSH command build + run), used by `backup`
+and the dashboard.
+
+Not yet built (planned verticals): GPU/progress dashboard.
 
 ## Safety model (this is developed against live production)
 
