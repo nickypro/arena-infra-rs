@@ -1,0 +1,15 @@
+[package]
+name = "arena-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "arena"
+path = "src/main.rs"
+
+[dependencies]
+arena-core = { path = "../core" }
+clap.workspace = true
+tokio.workspace = true
+anyhow.workspace = true

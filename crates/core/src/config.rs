@@ -1,0 +1,126 @@
+//! Tolerant parser for the existing `config.env` format.
+//!
+//! The legacy file mixes simple `KEY=value` pairs (some quoted, some with inline
+//! `# comments`) with one bash array, `MACHINE_NAME_LIST=( "a" "b" ... )`, that
+//! may span many lines. We parse both so the Rust tooling reads the *same* config
+//! the bash/python scripts use — no migration required.
+
+use std::collections::HashMap;
+use std::path::Path;
+
+use crate::error::{Error, Result};
+
+#[derive(Debug, Clone, Default)]
+pub struct Config {
+    pub values: HashMap<String, String>,
+    pub machine_names: Vec<String>,
+}
+
+impl Config {
+    pub fn load(path: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| Error::Config(format!("reading {}: {e}", path.display())))?;
+        Ok(Self::parse(&text))
+    }
+
+    pub fn parse(text: &str) -> Self {
+        let mut values = HashMap::new();
+        let mut machine_names = Vec::new();
+        let mut lines = text.lines();
+
+        while let Some(line) = lines.next() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+
+            // Bash array, possibly multi-line, terminated by ')'.
+            if let Some(rest) = trimmed.strip_prefix("MACHINE_NAME_LIST=(") {
+                let mut buf = rest.to_string();
+                while !buf.contains(')') {
+                    match lines.next() {
+                        Some(l) => {
+                            buf.push('\n');
+                            buf.push_str(l);
+                        }
+                        None => break,
+                    }
+                }
+                let inner = buf.split(')').next().unwrap_or("");
+                for tok in inner.split_whitespace() {
+                    let name = tok.trim().trim_matches(['"', '\'']);
+                    if !name.is_empty() && !name.starts_with('#') {
+                        machine_names.push(name.to_string());
+                    }
+                }
+                continue;
+            }
+
+            if let Some((k, v)) = trimmed.split_once('=') {
+                values.insert(k.trim().to_string(), strip_value(v));
+            }
+        }
+
+        Config { values, machine_names }
+    }
+
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.values.get(key).map(String::as_str)
+    }
+
+    pub fn require(&self, key: &str) -> Result<&str> {
+        self.get(key)
+            .ok_or_else(|| Error::Config(format!("missing required key `{key}`")))
+    }
+
+    pub fn get_parsed<T: std::str::FromStr>(&self, key: &str) -> Option<T> {
+        self.get(key).and_then(|s| s.parse().ok())
+    }
+}
+
+/// Strip surrounding quotes and trailing ` # inline comments` from a raw value.
+fn strip_value(raw: &str) -> String {
+    let s = raw.trim();
+    // Quoted value: take the content between the first matching quotes.
+    for q in ['"', '\''] {
+        if let Some(rest) = s.strip_prefix(q) {
+            if let Some(end) = rest.find(q) {
+                return rest[..end].to_string();
+            }
+        }
+    }
+    // Unquoted: drop an inline comment if present.
+    let s = match s.find(" #") {
+        Some(idx) => s[..idx].trim(),
+        None => s,
+    };
+    s.trim_matches(['"', '\'']).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_mixed_config() {
+        let text = r#"
+# comment
+RUNPOD_API_KEY=rpa_secret
+RUNPOD_GPU_TYPE="NVIDIA RTX A4000" # with comment
+MACHINE_NAME_PREFIX="arena8"
+RUNPOD_NUM_GPUS=1
+MAX_PARALLEL=10
+MACHINE_NAME_LIST=(
+    "apple"
+    "autumn"
+    "bloom"
+)
+"#;
+        let c = Config::parse(text);
+        assert_eq!(c.get("RUNPOD_API_KEY"), Some("rpa_secret"));
+        assert_eq!(c.get("RUNPOD_GPU_TYPE"), Some("NVIDIA RTX A4000"));
+        assert_eq!(c.get("MACHINE_NAME_PREFIX"), Some("arena8"));
+        assert_eq!(c.get_parsed::<u32>("RUNPOD_NUM_GPUS"), Some(1));
+        assert_eq!(c.machine_names, vec!["apple", "autumn", "bloom"]);
+    }
+}
