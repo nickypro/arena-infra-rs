@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use crate::error::Result;
 use crate::pod::{Pod, PodSpec};
 
+pub mod hetzner;
 pub mod runpod;
 pub mod vast;
 

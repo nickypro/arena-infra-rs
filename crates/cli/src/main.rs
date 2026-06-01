@@ -10,7 +10,12 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use arena_core::provider::{runpod::RunpodProvider, vast::VastProvider, Provider};
+use arena_core::provider::{
+    hetzner::{HetznerOpts, HetznerProvider},
+    runpod::RunpodProvider,
+    vast::VastProvider,
+    Provider,
+};
 use arena_core::{Config, PodSpec};
 
 const DEFAULT_CONFIG: &str = "/home/dev/prod-ro/config.env";
@@ -106,7 +111,21 @@ fn build_provider(name: &str, cfg: &Config) -> Result<Box<dyn Provider>> {
             let key = cfg.get("VAST_API_KEY").unwrap_or_default();
             Ok(Box::new(VastProvider::new(key)))
         }
-        other => anyhow::bail!("unknown provider `{other}` (known: runpod, vast)"),
+        "hetzner" => {
+            let key = cfg.require("HETZNER_API_KEY")?;
+            let opts = HetznerOpts {
+                server_type: cfg.get("HETZNER_SERVER_TYPE").unwrap_or("cx22").to_string(),
+                image: cfg.get("HETZNER_IMAGE").unwrap_or("ubuntu-24.04").to_string(),
+                location: cfg.get("HETZNER_LOCATION").map(String::from),
+                ssh_keys: cfg
+                    .get("HETZNER_SSH_KEY")
+                    .filter(|s| !s.is_empty())
+                    .map(|s| vec![s.to_string()])
+                    .unwrap_or_default(),
+            };
+            Ok(Box::new(HetznerProvider::new(key, opts)))
+        }
+        other => anyhow::bail!("unknown provider `{other}` (known: runpod, vast, hetzner)"),
     }
 }
 

@@ -20,6 +20,10 @@ This is the **scaffold + machine-spin-up vertical**. Implemented so far:
     the cheapest rentable offer matching the spec (GPU type/count, disk) and rents
     it, carrying the machine name as the instance `label`. GPU-name matching is
     normalized so the same `RUNPOD_GPU_TYPE` value works across both providers.
+  - `provider::hetzner` — Hetzner Cloud backend for **CPU-only** VMs. Not a GPU
+    container host, so it ignores the GPU-centric `PodSpec` fields and takes its
+    sizing/OS/location/SSH-keys from `HETZNER_*` config. VMs come up on a real public
+    IP with SSH on `:22`, so they use the same proxy/`pods up` flow as GPU providers.
   - `naming` — next-free machine-name allocation, mirroring the legacy logic.
   - `proxy` — port-forwarding planner. Pods are reached over SSH (VS Code
     Remote-SSH), and the provider reassigns a pod's SSH endpoint on restart, so the
@@ -29,8 +33,8 @@ This is the **scaffold + machine-spin-up vertical**. Implemented so far:
     index in `MACHINE_NAME_LIST`, so tearing down one pod never renumbers the others
     and a returning machine reclaims its port. Pure/no-I/O — it plans, you apply.
 - `arena` (CLI):
-  - `pods list | create | stop | terminate` (`--provider runpod|vast`, Vast reads
-    `VAST_API_KEY`).
+  - `pods list | create | stop | terminate` (`--provider runpod|vast|hetzner`; Vast
+    reads `VAST_API_KEY`, Hetzner reads `HETZNER_API_KEY` + `HETZNER_*`).
   - `pods up -n N` — one-command spin-up: create, poll until each pod has an SSH
     endpoint, then print the proxy plan. Dry-run unless `--apply`; `--no-wait` skips
     polling. Polling stops at `--timeout`; nothing runs in the background.
