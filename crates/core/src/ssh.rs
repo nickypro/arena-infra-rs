@@ -73,6 +73,49 @@ impl SshTarget {
     pub fn display_command(&self, remote_cmd: &str) -> String {
         format!("ssh {} '{}'", self.ssh_args().join(" "), remote_cmd.replace('\'', "'\\''"))
     }
+
+    /// The `scp` argv to copy `local` -> `host:remote`. scp uses `-P` for the port
+    /// (capital, unlike ssh's `-p`) and the same non-interactive/fail-fast options.
+    pub fn scp_args(&self, local: &str, remote: &str) -> Vec<String> {
+        let mut a = vec![
+            "-P".into(),
+            self.port.to_string(),
+            "-o".into(),
+            "BatchMode=yes".into(),
+            "-o".into(),
+            "StrictHostKeyChecking=accept-new".into(),
+            "-o".into(),
+            format!("ConnectTimeout={}", self.connect_timeout_secs),
+        ];
+        if let Some(key) = &self.key_path {
+            a.push("-i".into());
+            a.push(key.clone());
+        }
+        a.push(local.to_string());
+        a.push(format!("{}@{}:{}", self.user, self.host, remote));
+        a
+    }
+
+    /// Human-readable `scp` command for dry-run output.
+    pub fn display_scp(&self, local: &str, remote: &str) -> String {
+        format!("scp {}", self.scp_args(local, remote).join(" "))
+    }
+}
+
+/// Copy a local file to the target over scp.
+pub async fn scp(target: &SshTarget, local: &str, remote: &str) -> Result<SshOutput> {
+    let out = Command::new("scp")
+        .args(target.scp_args(local, remote))
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| Error::provider(format!("spawning scp to {}: {e}", target.host)))?;
+    Ok(SshOutput {
+        success: out.status.success(),
+        code: out.status.code(),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    })
 }
 
 /// The result of a remote command.

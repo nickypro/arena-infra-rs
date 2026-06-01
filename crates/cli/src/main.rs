@@ -53,6 +53,12 @@ enum Cmd {
         #[arg(long)]
         day: Option<u32>,
     },
+    /// Provision pods over SSH: copy the git deploy key, write ~/.name, point the
+    /// repo at GitHub on the default branch. Dry-run unless --apply.
+    Setup {
+        #[arg(long)]
+        apply: bool,
+    },
     /// Inspect the loaded config.
     #[command(subcommand)]
     Config(ConfigCmd),
@@ -304,7 +310,76 @@ async fn main() -> Result<()> {
         Cmd::Backup { apply, message, week, day } => {
             handle_backup(provider.unwrap().as_ref(), &cfg, apply, message, week, day).await
         }
+        Cmd::Setup { apply } => handle_setup(provider.unwrap().as_ref(), &cfg, apply).await,
     }
+}
+
+async fn handle_setup(provider: &dyn Provider, cfg: &Config, apply: bool) -> Result<()> {
+    use arena_core::ssh::{self, SshTarget};
+
+    let scfg = arena_core::setup::SetupConfig::from_config(cfg)?;
+    let pods = provider.list_pods().await.context("listing pods for setup")?;
+    let mut targets = Vec::new();
+    for pod in &pods {
+        match SshTarget::from_pod(pod, cfg) {
+            Ok(t) => targets.push((pod.name.clone(), t)),
+            Err(_) => eprintln!("skip {} — no SSH endpoint yet", pod.name),
+        }
+    }
+    if targets.is_empty() {
+        println!("(no pods with an SSH endpoint to set up)");
+        return Ok(());
+    }
+
+    if !apply {
+        println!(
+            "Dry-run — would provision {} pod(s) (copy key {} -> {}, then):\n",
+            targets.len(),
+            scfg.key_local,
+            scfg.key_remote
+        );
+        for (name, target) in &targets {
+            println!("# {name}");
+            println!("{}", target.display_scp(&scfg.key_local, &scfg.key_remote));
+            println!("{}\n", target.display_command(&scfg.remote_command(name)));
+        }
+        println!("Re-run with --apply to execute over SSH.");
+        return Ok(());
+    }
+
+    let mut ok = 0;
+    let mut failed = 0;
+    for (name, target) in &targets {
+        // 1) copy the key, 2) run the provisioning script.
+        let copied = ssh::scp(target, &scfg.key_local, &scfg.key_remote).await;
+        let result = match copied {
+            Ok(out) if out.success => ssh::run(target, &scfg.remote_command(name)).await,
+            Ok(out) => Err(arena_core::Error::provider(format!(
+                "scp key failed: {}",
+                out.stderr.trim()
+            ))),
+            Err(e) => Err(e),
+        };
+        match result {
+            Ok(out) if out.success => {
+                println!("[set up]  {name}");
+                ok += 1;
+            }
+            Ok(out) => {
+                eprintln!("[FAILED]  {name} (exit {:?}): {}", out.code, out.stderr.trim());
+                failed += 1;
+            }
+            Err(e) => {
+                eprintln!("[FAILED]  {name}: {e}");
+                failed += 1;
+            }
+        }
+    }
+    println!("\nDone: {ok} provisioned, {failed} failed.");
+    if failed > 0 {
+        anyhow::bail!("{failed} pod(s) failed to set up");
+    }
+    Ok(())
 }
 
 /// Resolve the iteration (week, day): explicit `--week/--day` win; otherwise compute

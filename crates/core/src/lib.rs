@@ -15,6 +15,7 @@ pub mod provider;
 pub mod proxy;
 pub mod retry;
 pub mod schedule;
+pub mod setup;
 pub mod ssh;
 
 pub use config::Config;

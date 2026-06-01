@@ -54,9 +54,14 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
   - `config check` — validate that the keys the selected provider + proxy + backup
     need are present (never prints secret values; exits non-zero if a required key is
     missing). Copy `config.env.example` to get started.
-  - `backup` — commit + push each pod's ARENA working tree to a per-machine branch
-    (`backup/<name>`) over SSH. Dry-run unless `--apply`; clean trees report
-    `NO_CHANGES` rather than failing. Repo path / branch / push key via `BACKUP_*`.
+  - `backup` — commit + push each pod's ARENA tree to its autocommit branch
+    (`autocommit-{prefix}-w{week}d{day}-{machine}`, week/day from `ARENA_START_DATE`,
+    `--week`/`--day` to override) over SSH. Dry-run unless `--apply`; clean trees
+    report `NO_CHANGES` rather than failing.
+  - `setup` — provision pods over SSH: copy the git deploy key, write `~/.name`,
+    point the repo at the GitHub SSH URL on the default branch. Dry-run unless
+    `--apply`. Uses `GIT_SSH_KEY_LOCAL/REMOTE`, `ARENA_REPO_OWNER/NAME`,
+    `DEFAULT_BRANCH`.
 - `arena-tui` (TUI) — read-only dashboard (ratatui): pods from the configured
   provider plus, per pod, GPU utilization/mem/temp via `nvidia-smi` over SSH and an
   optional progress signal (`PROGRESS_CMD`). Metrics fetched concurrently across the
