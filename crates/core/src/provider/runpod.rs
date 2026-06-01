@@ -83,6 +83,13 @@ impl Provider for RunpodProvider {
         "runpod"
     }
 
+    fn describe(&self, spec: &PodSpec) -> String {
+        format!(
+            "{} x{}, {}, disk {}GB, image {}",
+            spec.gpu_type, spec.gpu_count, spec.cloud_type, spec.disk_gb, spec.image
+        )
+    }
+
     async fn list_pods(&self) -> Result<Vec<Pod>> {
         let resp = self.auth(self.client.get(format!("{BASE}/pods"))).send().await?;
         let status = resp.status();

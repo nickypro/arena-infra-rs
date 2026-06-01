@@ -106,6 +106,18 @@ impl Provider for HetznerProvider {
         "hetzner"
     }
 
+    fn describe(&self, _spec: &PodSpec) -> String {
+        // CPU VM: describe what we actually send (server type/image/location), not the
+        // GPU fields the spec carries and we ignore.
+        let loc = self
+            .opts
+            .location
+            .as_deref()
+            .map(|l| format!(", location {l}"))
+            .unwrap_or_default();
+        format!("{} CPU VM, image {}{}", self.opts.server_type, self.opts.image, loc)
+    }
+
     async fn list_pods(&self) -> Result<Vec<Pod>> {
         let resp = self
             .auth(self.client.get(format!("{}/servers", self.base)))

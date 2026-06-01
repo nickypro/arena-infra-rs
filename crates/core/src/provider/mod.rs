@@ -46,6 +46,12 @@ pub fn build(name: &str, cfg: &Config) -> Result<Box<dyn Provider>> {
 pub trait Provider: Send + Sync {
     fn name(&self) -> &'static str;
 
+    /// A human-readable, provider-accurate description of what `create_pod` would do
+    /// with this spec — used for dry-run output. Each backend describes only the
+    /// fields it actually honors (e.g. Hetzner reports its server type/image, not the
+    /// GPU fields it ignores), so the dry-run never misrepresents a create.
+    fn describe(&self, spec: &PodSpec) -> String;
+
     /// Read-only. Safe to call freely.
     async fn list_pods(&self) -> Result<Vec<Pod>>;
 

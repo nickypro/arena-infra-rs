@@ -112,15 +112,24 @@ enum PodCmd {
 }
 
 
+/// Build the base spec for a create, preferring provider-neutral keys and falling
+/// back to the legacy `RUNPOD_*` names (which is what existing config.env files have).
+/// So a Vast/Hetzner operator can set `GPU_TYPE`/`DISK_GB`/etc. without touching the
+/// RunPod keys, while a pure-RunPod config keeps working unchanged.
 fn base_spec(cfg: &Config) -> PodSpec {
+    // first non-empty of the given keys, as &str
+    let first = |keys: &[&str]| keys.iter().find_map(|k| cfg.get(k).filter(|v| !v.is_empty()));
+    let first_parsed = |keys: &[&str], default| {
+        keys.iter().find_map(|k| cfg.get_parsed(k)).unwrap_or(default)
+    };
     PodSpec {
         name: String::new(),
-        image: cfg.get("RUNPOD_DOCKER_IMAGE").unwrap_or_default().to_string(),
-        gpu_type: cfg.get("RUNPOD_GPU_TYPE").unwrap_or_default().to_string(),
-        gpu_count: cfg.get_parsed("RUNPOD_NUM_GPUS").unwrap_or(1),
-        cloud_type: cfg.get("RUNPOD_CLOUD_TYPE").unwrap_or("COMMUNITY").to_string(),
-        disk_gb: cfg.get_parsed("RUNPOD_DISK_SPACE_IN_GB").unwrap_or(100),
-        volume_gb: cfg.get_parsed("RUNPOD_VOLUME_SPACE_IN_GB").unwrap_or(0),
+        image: first(&["IMAGE", "RUNPOD_DOCKER_IMAGE"]).unwrap_or_default().to_string(),
+        gpu_type: first(&["GPU_TYPE", "RUNPOD_GPU_TYPE"]).unwrap_or_default().to_string(),
+        gpu_count: first_parsed(&["NUM_GPUS", "RUNPOD_NUM_GPUS"], 1),
+        cloud_type: first(&["CLOUD_TYPE", "RUNPOD_CLOUD_TYPE"]).unwrap_or("COMMUNITY").to_string(),
+        disk_gb: first_parsed(&["DISK_GB", "RUNPOD_DISK_SPACE_IN_GB"], 100),
+        volume_gb: first_parsed(&["VOLUME_GB", "RUNPOD_VOLUME_SPACE_IN_GB"], 0),
         ports: "8888/http,22/tcp".to_string(),
         env: Vec::new(),
     }
@@ -416,12 +425,9 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
                 return Ok(());
             }
             if !apply {
-                let base = base_spec(cfg);
+                let desc = provider.describe(&base_spec(cfg));
                 for name in &names {
-                    println!(
-                        "[dry-run] would create {} ({} x{}, {}, disk {}GB)",
-                        name, base.gpu_type, base.gpu_count, base.cloud_type, base.disk_gb
-                    );
+                    println!("[dry-run] would create {name} on {} ({desc})", provider.name());
                 }
                 println!("\nDry-run only — no pods created. Re-run with --apply to execute.");
                 return Ok(());
@@ -437,8 +443,9 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
             }
 
             if !apply {
+                let desc = provider.describe(&base_spec(cfg));
                 for name in &names {
-                    println!("[dry-run] would create {name}");
+                    println!("[dry-run] would create {name} on {} ({desc})", provider.name());
                 }
                 println!(
                     "\nDry-run only — no pods created. With --apply: create the above, \

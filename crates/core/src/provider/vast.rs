@@ -183,6 +183,13 @@ impl Provider for VastProvider {
         "vast"
     }
 
+    fn describe(&self, spec: &PodSpec) -> String {
+        format!(
+            "cheapest rentable {} x{} offer (disk >= {}GB), image {}",
+            spec.gpu_type, spec.gpu_count, spec.disk_gb, spec.image
+        )
+    }
+
     async fn list_pods(&self) -> Result<Vec<Pod>> {
         let resp = self
             .auth(self.client.get(format!("{}/instances/", self.base)))
