@@ -42,12 +42,10 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum ProxyCmd {
-    /// Compute the proxy plan for current pods and print the nginx config +
-    /// SSH-tunnel commands to apply on the proxy host. Never connects anywhere.
+    /// Compute the proxy plan for current pods and print the nginx `stream` config
+    /// (stable public port -> each pod's current SSH endpoint) to apply on the proxy
+    /// host. Read-only: never connects to the proxy.
     Plan {
-        /// Service port inside each pod to expose (default: Jupyter 8888).
-        #[arg(long, default_value_t = arena_core::proxy::DEFAULT_TARGET_PORT)]
-        port: u16,
         /// Also write the rendered nginx config to this local path for review.
         /// (Local only — this never copies anything to the proxy host.)
         #[arg(long)]
@@ -65,6 +63,24 @@ enum PodCmd {
         count: usize,
         #[arg(long)]
         apply: bool,
+    },
+    /// Create N pods, then poll until they have SSH endpoints and print the proxy
+    /// plan — the one-command spin-up. Dry-run unless --apply. Polling stops at the
+    /// timeout; it never runs in the background or mutates the proxy.
+    Up {
+        #[arg(short = 'n', long)]
+        count: usize,
+        #[arg(long)]
+        apply: bool,
+        /// Don't poll after creating; just print ids (run `proxy plan` later).
+        #[arg(long)]
+        no_wait: bool,
+        /// Give up waiting for endpoints after this many seconds.
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
+        /// Seconds between readiness polls (one list call per poll, whole fleet).
+        #[arg(long, default_value_t = 12)]
+        interval: u64,
     },
     /// Stop a pod by id. Dry-run unless --apply.
     Stop {
@@ -123,56 +139,55 @@ async fn main() -> Result<()> {
 
 async fn handle_proxy(cmd: ProxyCmd, provider: &dyn Provider, cfg: &Config) -> Result<()> {
     match cmd {
-        ProxyCmd::Plan { port, out } => {
-            let pxcfg = arena_core::proxy::ProxyConfig::from_config(cfg)?;
-            let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
+        ProxyCmd::Plan { out } => {
             let pods = provider.list_pods().await.context("listing pods for proxy plan")?;
-            let plan = arena_core::proxy::plan_forwards(
-                &pxcfg,
-                prefix,
-                &cfg.machine_names,
-                &pods,
-                port,
-            );
-
-            println!(
-                "# proxy host: {}@{}  (nginx config path: {})\n",
-                pxcfg.proxy_user, pxcfg.proxy_host, pxcfg.nginx_path
-            );
-            if plan.forwards.is_empty() {
-                println!("(no forwardable pods — nothing with an SSH endpoint in the name list)");
-            } else {
-                println!("{:<24} {:<8} {:<8} {}", "NAME", "PUBLIC", "LOCAL", "POD SSH");
-                for f in &plan.forwards {
-                    println!(
-                        "{:<24} {:<8} {:<8} {}@{}:{}",
-                        f.name, f.public_port, f.local_port, f.pod_ssh_user, f.pod_ip, f.pod_ssh_port
-                    );
-                }
-            }
-            for s in &plan.skipped {
-                eprintln!("warning: skipped {} — {}", s.name, s.reason);
-            }
-
-            let nginx = arena_core::proxy::render_nginx(&plan.forwards);
-            println!("\n# ----- nginx config (write to {} on the proxy) -----", pxcfg.nginx_path);
-            println!("{nginx}");
-            println!("# ----- SSH tunnels (run on the proxy host {}) -----", pxcfg.proxy_host);
-            for line in arena_core::proxy::render_tunnels(&plan.forwards) {
-                println!("{line}");
-            }
-
-            if let Some(path) = out {
-                std::fs::write(&path, &nginx)
-                    .with_context(|| format!("writing nginx config to {}", path.display()))?;
-                eprintln!("\nwrote nginx config to {} (local only — not deployed)", path.display());
-            } else {
-                println!(
-                    "\n# Review the above, then apply manually. \
-                     Re-run with --out <file> to save the nginx config locally."
-                );
-            }
+            emit_proxy_plan(&pods, cfg, out.as_deref())?;
         }
+    }
+    Ok(())
+}
+
+/// Render and print the proxy plan for the given pods: a summary table, the nginx
+/// `stream` config (optionally also written to `out`, locally), and any skipped
+/// pods. Shared by `proxy plan` and `pods up`. Never connects to the proxy.
+fn emit_proxy_plan(pods: &[arena_core::Pod], cfg: &Config, out: Option<&std::path::Path>) -> Result<()> {
+    let pxcfg = arena_core::proxy::ProxyConfig::from_config(cfg)?;
+    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
+    let plan = arena_core::proxy::plan_forwards(&pxcfg, prefix, &cfg.machine_names, pods);
+
+    println!(
+        "\n# proxy host: {}@{}  (nginx config path: {})",
+        pxcfg.proxy_user, pxcfg.proxy_host, pxcfg.nginx_path
+    );
+    if plan.forwards.is_empty() {
+        println!("(no forwardable pods — nothing with an SSH endpoint in the name list)");
+    } else {
+        println!("{:<24} {:<14} {}", "NAME", "PUBLIC", "-> POD SSH");
+        for f in &plan.forwards {
+            println!(
+                "{:<24} {}:{:<8} {}:{}",
+                f.name, pxcfg.proxy_host, f.public_port, f.target_ip, f.target_port
+            );
+        }
+    }
+    for s in &plan.skipped {
+        eprintln!("warning: skipped {} — {}", s.name, s.reason);
+    }
+
+    let nginx = arena_core::proxy::render_nginx(&plan.forwards);
+    println!("\n# ----- nginx config (write to {} on the proxy) -----", pxcfg.nginx_path);
+    println!("{nginx}");
+
+    if let Some(path) = out {
+        std::fs::write(path, &nginx)
+            .with_context(|| format!("writing nginx config to {}", path.display()))?;
+        eprintln!("wrote nginx config to {} (local only — not deployed)", path.display());
+    } else {
+        println!(
+            "# Review, then apply on the proxy: write the above to {}, then \
+             `nginx -t && nginx -s reload`. (--out <file> saves it locally.)",
+            pxcfg.nginx_path
+        );
     }
     Ok(())
 }
@@ -230,6 +245,101 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
             if !apply {
                 println!("\nDry-run only — no pods created. Re-run with --apply to execute.");
             }
+        }
+
+        PodCmd::Up { count, apply, no_wait, timeout, interval } => {
+            let existing = provider.list_pods().await.unwrap_or_default();
+            let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
+            let names =
+                arena_core::naming::next_free_names(prefix, &cfg.machine_names, &existing, count);
+            if names.len() < count {
+                eprintln!(
+                    "warning: requested {count} but only {} free machine names available",
+                    names.len()
+                );
+            }
+            if names.is_empty() {
+                eprintln!("no free machine names available — nothing to do");
+                return Ok(());
+            }
+
+            if !apply {
+                for name in &names {
+                    println!("[dry-run] would create {name}");
+                }
+                println!(
+                    "\nDry-run only — no pods created. With --apply: create the above, \
+                     poll up to {timeout}s for SSH endpoints, then print the proxy plan."
+                );
+                return Ok(());
+            }
+
+            // Create, tracking the names we asked for so we only wait on those.
+            let base = base_spec(cfg);
+            for name in &names {
+                let mut spec = base.clone();
+                spec.name = name.clone();
+                spec.env.push(("MACHINE_NAME".into(), name.clone()));
+                let pod = provider.create_pod(&spec).await?;
+                println!("[created] {} id={}", pod.name, pod.id);
+            }
+
+            if no_wait {
+                println!(
+                    "\n--no-wait: not polling. Run `arena proxy plan` once endpoints are assigned."
+                );
+                return Ok(());
+            }
+
+            // Poll the whole fleet (one list call per tick) until our pods have SSH
+            // endpoints or we hit the timeout. Stateless: each tick re-reads truth.
+            let want: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
+            let interval = interval.max(1);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+            println!(
+                "\nWaiting up to {timeout}s for SSH endpoints (polling every {interval}s)…"
+            );
+            let pods = loop {
+                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                let pods = match provider.list_pods().await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("  poll failed ({e}); retrying");
+                        if std::time::Instant::now() >= deadline {
+                            break Vec::new();
+                        }
+                        continue;
+                    }
+                };
+                let ready = pods
+                    .iter()
+                    .filter(|p| {
+                        want.contains(p.name.as_str()) && p.ssh_ip.is_some() && p.ssh_port.is_some()
+                    })
+                    .count();
+                println!("  {ready}/{} ready", want.len());
+                if ready == want.len() || std::time::Instant::now() >= deadline {
+                    break pods;
+                }
+            };
+
+            let not_ready: Vec<&str> = want
+                .iter()
+                .copied()
+                .filter(|n| {
+                    !pods.iter().any(|p| {
+                        p.name == *n && p.ssh_ip.is_some() && p.ssh_port.is_some()
+                    })
+                })
+                .collect();
+            if !not_ready.is_empty() {
+                eprintln!(
+                    "warning: timed out waiting for: {} (still starting?). \
+                     Re-run `arena proxy plan` once they're up.",
+                    not_ready.join(", ")
+                );
+            }
+            emit_proxy_plan(&pods, cfg, None)?;
         }
 
         PodCmd::Stop { id, apply } => {

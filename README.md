@@ -21,13 +21,21 @@ This is the **scaffold + machine-spin-up vertical**. Implemented so far:
     it, carrying the machine name as the instance `label`. GPU-name matching is
     normalized so the same `RUNPOD_GPU_TYPE` value works across both providers.
   - `naming` — next-free machine-name allocation, mirroring the legacy logic.
-  - `proxy` — port-forwarding planner. Computes a *stable* public-port map (each
-    pod's port is anchored to its index in `MACHINE_NAME_LIST`, so tearing down one
-    pod never renumbers the others), and renders the nginx `stream` config plus the
-    SSH-tunnel commands to apply on the proxy host. Pure/no-I/O — it plans, you apply.
-- `arena` (CLI) — `pods list | create | stop | terminate` (`--provider runpod|vast`,
-  Vast reads `VAST_API_KEY`) and `proxy plan` (read-only; prints config to apply,
-  `--out` saves the nginx config locally).
+  - `proxy` — port-forwarding planner. Pods are reached over SSH (VS Code
+    Remote-SSH), and the provider reassigns a pod's SSH endpoint on restart, so the
+    proxy host gives each machine a *stable* public port (`cute.sus.cat:7000`, …)
+    that nginx's `stream` module forwards straight to the pod's current SSH endpoint
+    — pure nginx, no tunnel process. The public port is anchored to the machine's
+    index in `MACHINE_NAME_LIST`, so tearing down one pod never renumbers the others
+    and a returning machine reclaims its port. Pure/no-I/O — it plans, you apply.
+- `arena` (CLI):
+  - `pods list | create | stop | terminate` (`--provider runpod|vast`, Vast reads
+    `VAST_API_KEY`).
+  - `pods up -n N` — one-command spin-up: create, poll until each pod has an SSH
+    endpoint, then print the proxy plan. Dry-run unless `--apply`; `--no-wait` skips
+    polling. Polling stops at `--timeout`; nothing runs in the background.
+  - `proxy plan` — read-only; prints the nginx `stream` config to apply (`--out`
+    saves it locally; never deploys to the proxy).
 - `arena-tui` (TUI) — read-only pod dashboard (ratatui).
 
 Not yet built (planned verticals): commit/backup flow, GPU/progress dashboard.

@@ -10,7 +10,7 @@ flowchart TD
     user([operator])
 
     subgraph present[presentation layer · thin, swappable]
-        CLI["arena (CLI)<br/>clap · pods list/create/stop/terminate · proxy plan"]
+        CLI["arena (CLI)<br/>clap · pods list/create/up/stop/terminate · proxy plan"]
         TUI["arena-tui<br/>ratatui · read-only pod dashboard"]
     end
 
@@ -23,7 +23,7 @@ flowchart TD
         Runpod["RunpodProvider"]
         Vast["VastProvider<br/>(offer-search rent model)"]
         Naming["naming<br/>next_free_names()"]
-        Proxy["proxy<br/>plan_forwards / render_nginx / render_tunnels"]
+        Proxy["proxy<br/>plan_forwards / render_nginx (SSH stream)"]
         Model["model: Pod · PodSpec<br/>errors: Error / Result"]
 
         Config --> Provider
@@ -70,8 +70,9 @@ flowchart TD
 
 - **Read-only by default**: only `list_pods()` issues GETs; the TUI is GET-only.
 - **Mutations are dry-run** unless `--apply` is passed.
-- **`proxy plan` never connects** to the proxy host — it renders nginx config +
-  SSH-tunnel commands for manual application (`--out` writes the config *locally*).
+- **`proxy plan` never connects** to the proxy host — it renders the nginx `stream`
+  config (stable port → pod SSH endpoint) for manual application (`--out` writes the
+  config *locally*). `pods up` polls only during spin-up, then stops; no background loop.
 - **Secrets stay out of git**: `config.env` and `*.key` are git-ignored.
 
 ## Extending
