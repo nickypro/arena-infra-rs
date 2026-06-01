@@ -88,7 +88,7 @@ impl Provider for RunpodProvider {
         let status = resp.status();
         let body: Value = resp.json().await?;
         if !status.is_success() {
-            return Err(Error::Provider(format!("list pods HTTP {status}: {body}")));
+            return Err(Error::provider_http(status, &body, "list pods"));
         }
         let arr = body
             .as_array()
@@ -123,7 +123,7 @@ impl Provider for RunpodProvider {
         let status = resp.status();
         let body: Value = resp.json().await?;
         if !status.is_success() {
-            return Err(Error::Provider(format!("create pod HTTP {status}: {body}")));
+            return Err(Error::provider_http(status, &body, "create pod"));
         }
         Ok(parse_pod(&body))
     }
@@ -136,7 +136,7 @@ impl Provider for RunpodProvider {
         let status = resp.status();
         if !status.is_success() {
             let body: Value = resp.json().await.unwrap_or(Value::Null);
-            return Err(Error::Provider(format!("stop pod HTTP {status}: {body}")));
+            return Err(Error::provider_http(status, &body, "stop pod"));
         }
         Ok(())
     }
@@ -149,7 +149,7 @@ impl Provider for RunpodProvider {
         let status = resp.status();
         if !status.is_success() {
             let body: Value = resp.json().await.unwrap_or(Value::Null);
-            return Err(Error::Provider(format!("terminate pod HTTP {status}: {body}")));
+            return Err(Error::provider_http(status, &body, "terminate pod"));
         }
         Ok(())
     }

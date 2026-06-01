@@ -70,7 +70,7 @@ impl VastProvider {
         let status = resp.status();
         let body: Value = resp.json().await?;
         if !status.is_success() {
-            return Err(Error::Provider(format!("vast search HTTP {status}: {body}")));
+            return Err(Error::provider_http(status, &body, "vast search"));
         }
         let offers = body
             .get("offers")
@@ -191,7 +191,7 @@ impl Provider for VastProvider {
         let status = resp.status();
         let body: Value = resp.json().await?;
         if !status.is_success() {
-            return Err(Error::Provider(format!("vast list HTTP {status}: {body}")));
+            return Err(Error::provider_http(status, &body, "vast list"));
         }
         let arr = body
             .get("instances")
@@ -204,7 +204,8 @@ impl Provider for VastProvider {
 
     async fn create_pod(&self, spec: &PodSpec) -> Result<Pod> {
         let offer = self.cheapest_offer(spec).await?.ok_or_else(|| {
-            Error::Provider(format!(
+            // No matching offer == the marketplace has no capacity for this spec.
+            Error::capacity(format!(
                 "vast: no rentable offer matching {} x{} (disk >= {}GB)",
                 spec.gpu_type, spec.gpu_count, spec.disk_gb
             ))
@@ -234,12 +235,12 @@ impl Provider for VastProvider {
         let status = resp.status();
         let body: Value = resp.json().await?;
         if !status.is_success() {
-            return Err(Error::Provider(format!("vast create HTTP {status}: {body}")));
+            return Err(Error::provider_http(status, &body, "vast create"));
         }
         // Vast returns {"success": true, "new_contract": <instance id>}; the full
         // instance object isn't echoed, so synthesize the Pod from what we know.
         if body.get("success").and_then(Value::as_bool) == Some(false) {
-            return Err(Error::Provider(format!("vast create rejected: {body}")));
+            return Err(Error::provider(format!("vast create rejected: {body}")));
         }
         let id = body
             .get("new_contract")
@@ -271,7 +272,7 @@ impl Provider for VastProvider {
         let status = resp.status();
         if !status.is_success() {
             let body: Value = resp.json().await.unwrap_or(Value::Null);
-            return Err(Error::Provider(format!("vast stop HTTP {status}: {body}")));
+            return Err(Error::provider_http(status, &body, "vast stop"));
         }
         Ok(())
     }
@@ -284,7 +285,7 @@ impl Provider for VastProvider {
         let status = resp.status();
         if !status.is_success() {
             let body: Value = resp.json().await.unwrap_or(Value::Null);
-            return Err(Error::Provider(format!("vast terminate HTTP {status}: {body}")));
+            return Err(Error::provider_http(status, &body, "vast terminate"));
         }
         Ok(())
     }

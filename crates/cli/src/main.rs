@@ -72,6 +72,9 @@ enum PodCmd {
         count: usize,
         #[arg(long)]
         apply: bool,
+        /// On capacity exhaustion, wait and keep retrying instead of stopping.
+        #[arg(long)]
+        keep_trying: bool,
     },
     /// Create N pods, then poll until they have SSH endpoints and print the proxy
     /// plan — the one-command spin-up. Dry-run unless --apply. Polling stops at the
@@ -84,6 +87,9 @@ enum PodCmd {
         /// Don't poll after creating; just print ids (run `proxy plan` later).
         #[arg(long)]
         no_wait: bool,
+        /// On capacity exhaustion, wait and keep retrying instead of stopping.
+        #[arg(long)]
+        keep_trying: bool,
         /// Give up waiting for endpoints after this many seconds.
         #[arg(long, default_value_t = 600)]
         timeout: u64,
@@ -118,6 +124,84 @@ fn base_spec(cfg: &Config) -> PodSpec {
         ports: "8888/http,22/tcp".to_string(),
         env: Vec::new(),
     }
+}
+
+/// Compute the next free machine names for `count` pods, warning if fewer are
+/// available than requested. (Read-only: lists current pods to know what's taken.)
+async fn plan_names(provider: &dyn Provider, cfg: &Config, count: usize) -> Vec<String> {
+    let existing = provider.list_pods().await.unwrap_or_default();
+    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
+    let names = arena_core::naming::next_free_names(prefix, &cfg.machine_names, &existing, count);
+    if names.len() < count {
+        eprintln!(
+            "warning: requested {count} but only {} free machine names available",
+            names.len()
+        );
+    }
+    names
+}
+
+/// Seconds to wait between capacity retries when `--keep-trying` is set.
+const CAPACITY_RETRY_SECS: u64 = 30;
+
+/// Create one pod per name, returning those that came up. Error handling is typed:
+/// - `Capacity` → the pool is exhausted; stop gracefully (or, with `keep_trying`,
+///   wait `CAPACITY_RETRY_SECS` and retry that name) — the pods already created are
+///   kept, never rolled back.
+/// - `Auth` → credentials are wrong; abort immediately (retrying is pointless).
+/// - anything else → report what we made so far, then surface the error.
+async fn create_pods(
+    provider: &dyn Provider,
+    cfg: &Config,
+    names: &[String],
+    keep_trying: bool,
+) -> Result<Vec<arena_core::Pod>> {
+    use arena_core::ProviderErrorKind as K;
+
+    let base = base_spec(cfg);
+    let mut created = Vec::new();
+    'names: for name in names {
+        let mut spec = base.clone();
+        spec.name = name.clone();
+        spec.env.push(("MACHINE_NAME".into(), name.clone()));
+        loop {
+            match provider.create_pod(&spec).await {
+                Ok(pod) => {
+                    println!("[created] {} id={}", pod.name, pod.id);
+                    created.push(pod);
+                    continue 'names;
+                }
+                Err(e) => match e.kind() {
+                    Some(K::Capacity) if keep_trying => {
+                        eprintln!(
+                            "[waiting] no capacity for {name}; retrying in {CAPACITY_RETRY_SECS}s (have {}/{})",
+                            created.len(),
+                            names.len()
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(CAPACITY_RETRY_SECS)).await;
+                        // loop: retry the same name
+                    }
+                    Some(K::Capacity) => {
+                        eprintln!(
+                            "[stop] no more capacity (created {}/{}). Re-run with --keep-trying to wait.",
+                            created.len(),
+                            names.len()
+                        );
+                        break 'names;
+                    }
+                    Some(K::Auth) => {
+                        anyhow::bail!("authentication failed creating {name}: {e}");
+                    }
+                    _ => {
+                        eprintln!("created {}/{} before failure", created.len(), names.len());
+                        return Err(anyhow::anyhow!("creating {name}: {e}"));
+                    }
+                },
+            }
+        }
+    }
+    println!("\nCreated {} of {} requested.", created.len(), names.len());
+    Ok(created)
 }
 
 #[tokio::main]
@@ -294,48 +378,28 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
             }
         }
 
-        PodCmd::Create { count, apply } => {
-            let existing = provider.list_pods().await.unwrap_or_default();
-            let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
-            let names =
-                arena_core::naming::next_free_names(prefix, &cfg.machine_names, &existing, count);
-            if names.len() < count {
-                eprintln!(
-                    "warning: requested {count} but only {} free machine names available",
-                    names.len()
-                );
-            }
-            let base = base_spec(cfg);
-            for name in names {
-                let mut spec = base.clone();
-                spec.name = name.clone();
-                spec.env.push(("MACHINE_NAME".into(), name.clone()));
-                if apply {
-                    let pod = provider.create_pod(&spec).await?;
-                    println!("[created] {} id={}", pod.name, pod.id);
-                } else {
-                    println!(
-                        "[dry-run] would create {} ({} x{}, {}, disk {}GB)",
-                        spec.name, spec.gpu_type, spec.gpu_count, spec.cloud_type, spec.disk_gb
-                    );
-                }
+        PodCmd::Create { count, apply, keep_trying } => {
+            let names = plan_names(provider, cfg, count).await;
+            if names.is_empty() {
+                eprintln!("no free machine names available — nothing to do");
+                return Ok(());
             }
             if !apply {
+                let base = base_spec(cfg);
+                for name in &names {
+                    println!(
+                        "[dry-run] would create {} ({} x{}, {}, disk {}GB)",
+                        name, base.gpu_type, base.gpu_count, base.cloud_type, base.disk_gb
+                    );
+                }
                 println!("\nDry-run only — no pods created. Re-run with --apply to execute.");
+                return Ok(());
             }
+            create_pods(provider, cfg, &names, keep_trying).await?;
         }
 
-        PodCmd::Up { count, apply, no_wait, timeout, interval } => {
-            let existing = provider.list_pods().await.unwrap_or_default();
-            let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
-            let names =
-                arena_core::naming::next_free_names(prefix, &cfg.machine_names, &existing, count);
-            if names.len() < count {
-                eprintln!(
-                    "warning: requested {count} but only {} free machine names available",
-                    names.len()
-                );
-            }
+        PodCmd::Up { count, apply, no_wait, keep_trying, timeout, interval } => {
+            let names = plan_names(provider, cfg, count).await;
             if names.is_empty() {
                 eprintln!("no free machine names available — nothing to do");
                 return Ok(());
@@ -352,15 +416,14 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
                 return Ok(());
             }
 
-            // Create, tracking the names we asked for so we only wait on those.
-            let base = base_spec(cfg);
-            for name in &names {
-                let mut spec = base.clone();
-                spec.name = name.clone();
-                spec.env.push(("MACHINE_NAME".into(), name.clone()));
-                let pod = provider.create_pod(&spec).await?;
-                println!("[created] {} id={}", pod.name, pod.id);
+            // Create as many as capacity allows; we only wait on the ones we got.
+            let created = create_pods(provider, cfg, &names, keep_trying).await?;
+            if created.is_empty() {
+                eprintln!("no pods were created — nothing to wait for");
+                return Ok(());
             }
+            let want: std::collections::HashSet<String> =
+                created.iter().map(|p| p.name.clone()).collect();
 
             if no_wait {
                 println!(
@@ -371,7 +434,6 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
 
             // Poll the whole fleet (one list call per tick) until our pods have SSH
             // endpoints or we hit the timeout. Stateless: each tick re-reads truth.
-            let want: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
             let interval = interval.max(1);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
             println!(
@@ -403,7 +465,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
 
             let not_ready: Vec<&str> = want
                 .iter()
-                .copied()
+                .map(String::as_str)
                 .filter(|n| {
                     !pods.iter().any(|p| {
                         p.name == *n && p.ssh_ip.is_some() && p.ssh_port.is_some()

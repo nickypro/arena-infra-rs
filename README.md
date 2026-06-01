@@ -39,6 +39,11 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
   - `pods up -n N` — one-command spin-up: create, poll until each pod has an SSH
     endpoint, then print the proxy plan. Dry-run unless `--apply`; `--no-wait` skips
     polling. Polling stops at `--timeout`; nothing runs in the background.
+  - Batch create (`create`/`up`) uses **typed provider errors** (`ProviderErrorKind`):
+    on **capacity** exhaustion it stops gracefully and keeps the pods it got (e.g.
+    "created 6 of 10") rather than erroring — `--keep-trying` instead waits and
+    retries; on **auth** failure it aborts immediately. Already-created pods are
+    never rolled back.
   - `proxy plan` — read-only; prints the nginx `stream` config to apply (`--out`
     saves it locally; never deploys to the proxy).
   - `backup` — commit + push each pod's ARENA working tree to a per-machine branch

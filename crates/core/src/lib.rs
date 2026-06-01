@@ -16,6 +16,6 @@ pub mod proxy;
 pub mod ssh;
 
 pub use config::Config;
-pub use error::{Error, Result};
+pub use error::{Error, ProviderErrorKind, Result};
 pub use pod::{Pod, PodSpec};
 pub use provider::Provider;

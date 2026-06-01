@@ -35,10 +35,10 @@ impl SshTarget {
         let host = pod
             .ssh_ip
             .clone()
-            .ok_or_else(|| Error::Provider(format!("{}: no SSH ip yet", pod.name)))?;
+            .ok_or_else(|| Error::provider(format!("{}: no SSH ip yet", pod.name)))?;
         let port = pod
             .ssh_port
-            .ok_or_else(|| Error::Provider(format!("{}: no SSH port yet", pod.name)))?;
+            .ok_or_else(|| Error::provider(format!("{}: no SSH port yet", pod.name)))?;
         Ok(Self {
             user: cfg.get("SSH_USER").unwrap_or("root").to_string(),
             host,
@@ -93,7 +93,7 @@ pub async fn run(target: &SshTarget, remote_cmd: &str) -> Result<SshOutput> {
         .stdin(Stdio::null())
         .output()
         .await
-        .map_err(|e| Error::Provider(format!("spawning ssh to {}: {e}", target.host)))?;
+        .map_err(|e| Error::provider(format!("spawning ssh to {}: {e}", target.host)))?;
     Ok(SshOutput {
         success: out.status.success(),
         code: out.status.code(),

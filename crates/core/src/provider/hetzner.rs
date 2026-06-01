@@ -114,7 +114,7 @@ impl Provider for HetznerProvider {
         let status = resp.status();
         let body: Value = resp.json().await?;
         if !status.is_success() {
-            return Err(Error::Provider(format!("hetzner list HTTP {status}: {body}")));
+            return Err(Error::provider_http(status, &body, "hetzner list"));
         }
         let arr = body
             .get("servers")
@@ -144,7 +144,7 @@ impl Provider for HetznerProvider {
         let status = resp.status();
         let body: Value = resp.json().await?;
         if !status.is_success() {
-            return Err(Error::Provider(format!("hetzner create HTTP {status}: {body}")));
+            return Err(Error::provider_http(status, &body, "hetzner create"));
         }
         // The created server is under `server`; parse what's there (IP may not be
         // populated until it finishes provisioning — `pods up` polls for that).
@@ -159,7 +159,7 @@ impl Provider for HetznerProvider {
         let status = resp.status();
         if !status.is_success() {
             let body: Value = resp.json().await.unwrap_or(Value::Null);
-            return Err(Error::Provider(format!("hetzner stop HTTP {status}: {body}")));
+            return Err(Error::provider_http(status, &body, "hetzner stop"));
         }
         Ok(())
     }
@@ -172,7 +172,7 @@ impl Provider for HetznerProvider {
         let status = resp.status();
         if !status.is_success() {
             let body: Value = resp.json().await.unwrap_or(Value::Null);
-            return Err(Error::Provider(format!("hetzner terminate HTTP {status}: {body}")));
+            return Err(Error::provider_http(status, &body, "hetzner terminate"));
         }
         Ok(())
     }
