@@ -38,14 +38,20 @@ enum Cmd {
     /// Plan port-forwarding/proxy wiring (read-only; prints config to apply).
     #[command(subcommand)]
     Proxy(ProxyCmd),
-    /// Commit + push each pod's ARENA working tree to its backup branch over SSH.
-    /// Dry-run unless --apply.
+    /// Commit + push each pod's ARENA working tree to its autocommit branch over SSH.
+    /// Branch is autocommit-{prefix}-w{week}d{day}-{machine}. Dry-run unless --apply.
     Backup {
         #[arg(long)]
         apply: bool,
-        /// Commit message (default: "arena backup <unix-time>").
+        /// Commit message (default: the autocommit branch name per machine).
         #[arg(long)]
         message: Option<String>,
+        /// Override the iteration week (default: computed from ARENA_START_DATE).
+        #[arg(long)]
+        week: Option<u32>,
+        /// Override the day-within-week (default: computed from ARENA_START_DATE).
+        #[arg(long)]
+        day: Option<u32>,
     },
     /// Inspect the loaded config.
     #[command(subcommand)]
@@ -295,10 +301,34 @@ async fn main() -> Result<()> {
         Cmd::Config(c) => handle_config(c, &cfg, &cli.provider),
         Cmd::Pods(p) => handle_pods(p, provider.unwrap().as_ref(), &cfg).await,
         Cmd::Proxy(p) => handle_proxy(p, provider.unwrap().as_ref(), &cfg).await,
-        Cmd::Backup { apply, message } => {
-            handle_backup(provider.unwrap().as_ref(), &cfg, apply, message).await
+        Cmd::Backup { apply, message, week, day } => {
+            handle_backup(provider.unwrap().as_ref(), &cfg, apply, message, week, day).await
         }
     }
+}
+
+/// Resolve the iteration (week, day): explicit `--week/--day` win; otherwise compute
+/// from `ARENA_START_DATE` (the start date is w0d1) and today's date.
+fn resolve_week_day(cfg: &Config, week: Option<u32>, day: Option<u32>) -> Result<(u32, u32)> {
+    if let (Some(w), Some(d)) = (week, day) {
+        return Ok((w, d));
+    }
+    let start = cfg
+        .get("ARENA_START_DATE")
+        .and_then(arena_core::schedule::parse_ymd)
+        .context(
+            "computing week/day needs ARENA_START_DATE=YYYY-MM-DD in config (or pass \
+             --week and --day)",
+        )?;
+    let start_days = arena_core::schedule::days_from_civil(start.0, start.1, start.2);
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let today = arena_core::schedule::days_from_unix(now_secs);
+    let (w, d) = arena_core::schedule::week_day(start_days, today);
+    // Allow overriding just one of the two.
+    Ok((week.unwrap_or(w), day.unwrap_or(d)))
 }
 
 fn handle_config(cmd: ConfigCmd, cfg: &Config, provider_name: &str) -> Result<()> {
@@ -379,6 +409,7 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
     println!("\nBackup (`backup`):");
     cfg_row(cfg, &mut missing, "ARENA_REPO_NAME", false, false);
     cfg_row(cfg, &mut missing, "GIT_SSH_KEY_REMOTE", false, false);
+    cfg_row(cfg, &mut missing, "ARENA_START_DATE", false, false); // for wNdM naming
 
     println!("\nDashboard (optional):");
     cfg_row(cfg, &mut missing, "PROGRESS_CMD", false, false);
@@ -396,17 +427,16 @@ async fn handle_backup(
     cfg: &Config,
     apply: bool,
     message: Option<String>,
+    week: Option<u32>,
+    day: Option<u32>,
 ) -> Result<()> {
     use arena_core::ssh::{self, SshTarget};
 
-    let bcfg = arena_core::backup::BackupConfig::from_config(cfg);
-    let msg = message.unwrap_or_else(|| {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        format!("arena backup {ts}")
-    });
+    let (week, day) = resolve_week_day(cfg, week, day)?;
+    let bcfg = arena_core::backup::BackupConfig::from_config(cfg, week, day);
+    // Per-machine default commit message = that machine's autocommit branch name.
+    let msg_for = |name: &str| message.clone().unwrap_or_else(|| bcfg.branch_for(name));
+    println!("Iteration: w{week}d{day}\n");
 
     let pods = provider.list_pods().await.context("listing pods for backup")?;
     // Back up only pods that actually have an SSH endpoint; report the rest.
@@ -423,9 +453,9 @@ async fn handle_backup(
     }
 
     if !apply {
-        println!("Dry-run — would back up {} pod(s) with message {msg:?}:\n", targets.len());
+        println!("Dry-run — would back up {} pod(s):\n", targets.len());
         for (name, target) in &targets {
-            let cmd = arena_core::backup::backup_command(&bcfg, name, &msg);
+            let cmd = arena_core::backup::backup_command(&bcfg, name, &msg_for(name));
             println!("# {name}  ->  branch {}", bcfg.branch_for(name));
             println!("{}\n", target.display_command(&cmd));
         }
@@ -439,7 +469,7 @@ async fn handle_backup(
     let mut no_changes = 0;
     let mut failed = 0;
     for (name, target) in &targets {
-        let cmd = arena_core::backup::backup_command(&bcfg, name, &msg);
+        let cmd = arena_core::backup::backup_command(&bcfg, name, &msg_for(name));
         match ssh::run(target, &cmd).await {
             Ok(out) if out.success && out.stdout.lines().any(|l| l.trim() == "NO_CHANGES") => {
                 println!("[no changes] {name}");

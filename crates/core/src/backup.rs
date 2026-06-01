@@ -16,14 +16,18 @@ use crate::config::Config;
 pub struct BackupConfig {
     /// Absolute path to the ARENA checkout on the pod.
     pub repo_path: String,
-    /// Branch prefix; each machine pushes to `{prefix}/{machine}`.
-    pub branch_prefix: String,
+    /// Machine-name prefix / ARENA iteration label (e.g. "arena8").
+    pub prefix: String,
+    /// Iteration week (the start date is week 0) and day-within-week (1-based).
+    pub week: u32,
+    pub day: u32,
     /// SSH key on the pod to authenticate the `git push` (`GIT_SSH_KEY_REMOTE`).
     pub git_ssh_key: Option<String>,
 }
 
 impl BackupConfig {
-    pub fn from_config(cfg: &Config) -> Self {
+    /// Build from config plus the already-computed iteration `week`/`day`.
+    pub fn from_config(cfg: &Config, week: u32, day: u32) -> Self {
         // Default the repo path to /root/<ARENA_REPO_NAME>, matching the legacy layout.
         let repo_path = cfg.get("BACKUP_REPO_PATH").map(String::from).unwrap_or_else(|| {
             let name = cfg.get("ARENA_REPO_NAME").unwrap_or("ARENA_3.0");
@@ -31,14 +35,21 @@ impl BackupConfig {
         });
         Self {
             repo_path,
-            branch_prefix: cfg.get("BACKUP_BRANCH_PREFIX").unwrap_or("backup").to_string(),
+            prefix: cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena").to_string(),
+            week,
+            day,
             git_ssh_key: cfg.get("GIT_SSH_KEY_REMOTE").map(String::from),
         }
     }
 
-    /// The branch a given machine backs up to.
+    /// The autocommit branch a machine backs up to, following the ARENA convention:
+    /// `autocommit-{prefix}-w{week}d{day}-{machine}` (machine = name minus the
+    /// `{prefix}-` part), e.g. `autocommit-arena8-w0d1-apple`.
     pub fn branch_for(&self, machine_name: &str) -> String {
-        format!("{}/{}", self.branch_prefix, machine_name)
+        let short = machine_name
+            .strip_prefix(&format!("{}-", self.prefix))
+            .unwrap_or(machine_name);
+        format!("autocommit-{}-w{}d{}-{}", self.prefix, self.week, self.day, short)
     }
 }
 
@@ -82,7 +93,9 @@ mod tests {
     fn cfg() -> BackupConfig {
         BackupConfig {
             repo_path: "/root/ARENA_3.0".into(),
-            branch_prefix: "backup".into(),
+            prefix: "arena8".into(),
+            week: 0,
+            day: 1,
             git_ssh_key: Some("/root/.ssh/id_ed25519".into()),
         }
     }
@@ -95,8 +108,8 @@ mod tests {
         // Clean-tree guard so a no-op isn't treated as failure.
         assert!(c.contains("echo NO_CHANGES"));
         assert!(c.contains("git commit -m 'arena backup'"));
-        // Per-machine branch, never main.
-        assert!(c.contains("HEAD:refs/heads/'backup/arena8-apple'"));
+        // Autocommit branch, never main.
+        assert!(c.contains("HEAD:refs/heads/'autocommit-arena8-w0d1-apple'"));
         assert!(!c.contains("refs/heads/main"));
         // Uses the configured push key.
         assert!(c.contains("GIT_SSH_COMMAND='ssh -i /root/.ssh/id_ed25519"));
@@ -116,7 +129,13 @@ mod tests {
     }
 
     #[test]
-    fn branch_for_uses_prefix() {
-        assert_eq!(cfg().branch_for("arena8-luna"), "backup/arena8-luna");
+    fn branch_follows_autocommit_convention_with_short_name() {
+        let mut c = cfg();
+        c.week = 1;
+        c.day = 2;
+        // prefix is stripped to the short machine name
+        assert_eq!(c.branch_for("arena8-luna"), "autocommit-arena8-w1d2-luna");
+        // a name without the prefix is used as-is
+        assert_eq!(c.branch_for("luna"), "autocommit-arena8-w1d2-luna");
     }
 }
