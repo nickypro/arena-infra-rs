@@ -129,7 +129,10 @@ fn base_spec(cfg: &Config) -> PodSpec {
 /// Compute the next free machine names for `count` pods, warning if fewer are
 /// available than requested. (Read-only: lists current pods to know what's taken.)
 async fn plan_names(provider: &dyn Provider, cfg: &Config, count: usize) -> Vec<String> {
-    let existing = provider.list_pods().await.unwrap_or_default();
+    let policy = arena_core::retry::RetryPolicy::default();
+    let existing = arena_core::retry::retrying(&policy, || provider.list_pods())
+        .await
+        .unwrap_or_default();
     let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
     let names = arena_core::naming::next_free_names(prefix, &cfg.machine_names, &existing, count);
     if names.len() < count {
@@ -159,13 +162,16 @@ async fn create_pods(
     use arena_core::ProviderErrorKind as K;
 
     let base = base_spec(cfg);
+    let policy = arena_core::retry::RetryPolicy::default();
     let mut created = Vec::new();
     'names: for name in names {
         let mut spec = base.clone();
         spec.name = name.clone();
         spec.env.push(("MACHINE_NAME".into(), name.clone()));
         loop {
-            match provider.create_pod(&spec).await {
+            // Retry transient/throttle failures with backoff; capacity & auth fall
+            // through immediately to the classification below.
+            match arena_core::retry::retrying(&policy, || provider.create_pod(&spec)).await {
                 Ok(pod) => {
                     println!("[created] {} id={}", pod.name, pod.id);
                     created.push(pod);
@@ -357,7 +363,8 @@ fn emit_proxy_plan(pods: &[arena_core::Pod], cfg: &Config, out: Option<&std::pat
 async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Result<()> {
     match cmd {
         PodCmd::List => {
-            let pods = provider.list_pods().await?;
+            let policy = arena_core::retry::RetryPolicy::default();
+            let pods = arena_core::retry::retrying(&policy, || provider.list_pods()).await?;
             if pods.is_empty() {
                 println!("(no pods)");
                 return Ok(());

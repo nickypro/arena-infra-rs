@@ -11,6 +11,8 @@ pub enum ProviderErrorKind {
     Capacity,
     /// We're being throttled (HTTP 429). Caller may back off and retry.
     RateLimited,
+    /// A transient server-side failure (HTTP 5xx). Worth retrying with backoff.
+    Transient,
     /// Bad/again credentials (HTTP 401/403). Retrying is pointless — abort.
     Auth,
     /// Anything else.
@@ -25,6 +27,7 @@ impl ProviderErrorKind {
         match status.as_u16() {
             401 | 403 => return Self::Auth,
             429 => return Self::RateLimited,
+            500..=599 => return Self::Transient,
             _ => {}
         }
         if looks_like_capacity(message) {
@@ -112,6 +115,14 @@ mod tests {
         assert_eq!(
             ProviderErrorKind::classify(StatusCode::TOO_MANY_REQUESTS, ""),
             ProviderErrorKind::RateLimited
+        );
+        assert_eq!(
+            ProviderErrorKind::classify(StatusCode::BAD_GATEWAY, ""),
+            ProviderErrorKind::Transient
+        );
+        assert_eq!(
+            ProviderErrorKind::classify(StatusCode::SERVICE_UNAVAILABLE, ""),
+            ProviderErrorKind::Transient
         );
     }
 

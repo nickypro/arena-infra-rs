@@ -43,7 +43,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     on **capacity** exhaustion it stops gracefully and keeps the pods it got (e.g.
     "created 6 of 10") rather than erroring — `--keep-trying` instead waits and
     retries; on **auth** failure it aborts immediately. Already-created pods are
-    never rolled back.
+    never rolled back. **Transient** failures (429 / 5xx / connect-timeout) are
+    retried automatically with exponential backoff (`retry` module) around create
+    and list calls — so a throttle or blip doesn't fail the command.
   - `proxy plan` — read-only; prints the nginx `stream` config to apply (`--out`
     saves it locally; never deploys to the proxy).
   - `backup` — commit + push each pod's ARENA working tree to a per-machine branch

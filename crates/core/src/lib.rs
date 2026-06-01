@@ -13,6 +13,7 @@ pub mod naming;
 pub mod pod;
 pub mod provider;
 pub mod proxy;
+pub mod retry;
 pub mod ssh;
 
 pub use config::Config;
