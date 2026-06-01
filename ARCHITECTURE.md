@@ -19,43 +19,52 @@ flowchart TD
 
     subgraph core[arena-core · library · all logic + safety]
         Config["Config<br/>parses config.env<br/>(KEY=val + MACHINE_NAME_LIST array)"]
+        Build["provider::build<br/>name -> Box&lt;dyn Provider&gt; factory"]
         Provider{{"Provider (trait)<br/>list / create / stop / terminate"}}
         Runpod["RunpodProvider"]
-        Vast["VastProvider<br/>(offer-search rent model)"]
+        Vast["VastProvider<br/>(offer-search rent)"]
+        Hetzner["HetznerProvider<br/>(CPU VMs)"]
         Naming["naming<br/>next_free_names()"]
         Proxy["proxy<br/>plan_forwards / render_nginx (SSH stream)"]
+        Ssh["ssh<br/>build + run remote cmd"]
+        Backup["backup<br/>per-machine git push"]
+        Metrics["metrics<br/>nvidia-smi parse + aggregate"]
         Model["model: Pod · PodSpec<br/>errors: Error / Result"]
 
-        Config --> Provider
+        Config --> Build
+        Build --> Provider
         Provider --> Runpod
         Provider --> Vast
+        Provider --> Hetzner
         Config --> Naming
         Config --> Proxy
+        Backup --> Ssh
+        Metrics --> Ssh
         Provider -.->|"Pod list feeds"| Naming
         Provider -.->|"Pod list feeds"| Proxy
     end
 
-    CLI --> Config
-    CLI --> Provider
-    CLI --> Naming
-    CLI --> Proxy
-    TUI --> Config
-    TUI --> Provider
+    CLI -->|"build / pods / proxy / backup"| Build
+    TUI -->|"build / dashboard"| Build
+    CLI --> Backup
+    TUI --> Metrics
+    Ssh -->|SSH| pods2[("pods (nvidia-smi, git)")]
 
     cfg[("/home/dev/prod-ro/config.env<br/>read-only prod copy")]
     cfg -->|read| Config
 
     Runpod -->|HTTPS| RP[("rest.runpod.io/v1")]
     Vast -->|HTTPS| VA[("console.vast.ai/api/v0")]
+    Hetzner -->|HTTPS| HZ[("api.hetzner.cloud/v1")]
 ```
 
 ## Crates
 
 | crate | binary | role |
 |-------|--------|------|
-| `arena-core` | — | config parsing, `Provider` trait + RunPod/Vast backends, `Pod`/`PodSpec` model, `naming`, `proxy`, errors |
-| `arena-cli` | `arena` | clap CLI over the library (`pods …`, `proxy plan`) |
-| `arena-tui` | `arena-tui` | ratatui read-only dashboard |
+| `arena-core` | — | config parsing, `Provider` trait + RunPod/Vast/Hetzner backends + `build` factory, `Pod`/`PodSpec` model, `naming`, `proxy`, `ssh`, `backup`, `metrics`, errors |
+| `arena-cli` | `arena` | clap CLI over the library (`pods … / up`, `proxy plan`, `backup`) |
+| `arena-tui` | `arena-tui` | ratatui read-only dashboard (pods + GPU/progress metrics) |
 
 ## Request flow (example: `arena --provider vast pods create -n 3`)
 

@@ -5,9 +5,10 @@ pods. Goals: multi-provider machine spin-up, a tidy commit/backup flow, a
 performance/GPU/progress dashboard, and robust port forwarding, behind both a CLI
 and an interactive TUI.
 
-## Status: first slice
+## Status
 
-This is the **scaffold + machine-spin-up vertical**. Implemented so far:
+All four target verticals are implemented (multi-provider spin-up, commit/backup,
+GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive TUI:
 
 - `arena-core` — library
   - `config` — tolerant parser for the existing `config.env` (incl. the
@@ -43,12 +44,17 @@ This is the **scaffold + machine-spin-up vertical**. Implemented so far:
   - `backup` — commit + push each pod's ARENA working tree to a per-machine branch
     (`backup/<name>`) over SSH. Dry-run unless `--apply`; clean trees report
     `NO_CHANGES` rather than failing. Repo path / branch / push key via `BACKUP_*`.
-- `arena-tui` (TUI) — read-only pod dashboard (ratatui).
+- `arena-tui` (TUI) — read-only dashboard (ratatui): pods from the configured
+  provider plus, per pod, GPU utilization/mem/temp via `nvidia-smi` over SSH and an
+  optional progress signal (`PROGRESS_CMD`). Metrics fetched concurrently across the
+  fleet. Provider via `ARENA_PROVIDER` (default `runpod`), config via `ARENA_CONFIG`.
 
-Shared: `ssh` (non-interactive, fail-fast SSH command build + run), used by `backup`
-and the dashboard.
+Shared library pieces: `ssh` (non-interactive, fail-fast SSH command build + run),
+`metrics` (nvidia-smi parsing + per-pod aggregation), and `provider::build` (the one
+factory that constructs a backend by name — used by both the CLI and TUI).
 
-Not yet built (planned verticals): GPU/progress dashboard.
+All four target verticals are now in place: multi-provider spin-up (RunPod/Vast/
+Hetzner), commit/backup, the GPU/progress dashboard, and proxy/port-forwarding.
 
 ## Safety model (this is developed against live production)
 

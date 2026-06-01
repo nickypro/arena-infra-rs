@@ -1,8 +1,14 @@
-//! `arena-tui` — the interactive surface. This first cut is a read-only pod
-//! dashboard: it fetches the pod list once and renders it in a table. `r` refetches,
-//! `q`/Esc quits. It deliberately has *no* mutating actions yet — wiring create/stop
-//! into the TUI comes after the lifecycle vertical is trusted from the CLI.
+//! `arena-tui` — the interactive dashboard. Read-only: it lists pods from the
+//! configured provider and, for each pod with an SSH endpoint, fetches GPU stats
+//! (`nvidia-smi`) and an optional operator-defined progress signal (`PROGRESS_CMD`)
+//! over SSH. `r` refreshes, `q`/Esc quits. No mutating actions — spin-up/backup stay
+//! in the CLI where they're explicitly gated.
+//!
+//! Provider is chosen by `ARENA_PROVIDER` (default `runpod`); config path by
+//! `ARENA_CONFIG`. Metrics for the whole fleet are fetched concurrently so one slow
+//! or down pod doesn't stall the others.
 
+use std::collections::HashMap;
 use std::io::{stdout, Stdout};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -17,27 +23,59 @@ use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Cell, Paragraph, Row, Table},
 };
+use tokio::task::JoinSet;
 
-use arena_core::provider::{runpod::RunpodProvider, Provider};
+use arena_core::metrics::{self, PodMetrics};
+use arena_core::provider::Provider;
+use arena_core::ssh::SshTarget;
 use arena_core::{Config, Pod};
 
 const DEFAULT_CONFIG: &str = "/home/dev/prod-ro/config.env";
 
 struct App {
-    provider: RunpodProvider,
+    provider: Box<dyn Provider>,
+    cfg: Config,
+    progress_cmd: Option<String>,
     pods: Vec<Pod>,
+    metrics: HashMap<String, PodMetrics>,
     status: String,
 }
 
 impl App {
     async fn refresh(&mut self) {
-        match self.provider.list_pods().await {
-            Ok(pods) => {
-                self.status = format!("{} pods", pods.len());
-                self.pods = pods;
+        let pods = match self.provider.list_pods().await {
+            Ok(p) => p,
+            Err(e) => {
+                self.status = format!("error listing pods: {e}");
+                return;
             }
-            Err(e) => self.status = format!("error: {e}"),
+        };
+
+        // Fan out metric fetches across the fleet; one down pod can't stall the rest.
+        let mut set = JoinSet::new();
+        for pod in &pods {
+            if let Ok(target) = SshTarget::from_pod(pod, &self.cfg) {
+                let name = pod.name.clone();
+                let progress_cmd = self.progress_cmd.clone();
+                set.spawn(async move {
+                    (name, metrics::fetch(&target, progress_cmd.as_deref()).await)
+                });
+            }
         }
+        let mut fresh = HashMap::new();
+        while let Some(joined) = set.join_next().await {
+            if let Ok((name, m)) = joined {
+                fresh.insert(name, m);
+            }
+        }
+
+        self.metrics = fresh;
+        self.pods = pods;
+        self.status = format!(
+            "{} pods · {} reporting metrics · [r] refresh  [q] quit",
+            self.pods.len(),
+            self.metrics.values().filter(|m| !m.gpus.is_empty()).count(),
+        );
     }
 }
 
@@ -48,11 +86,16 @@ async fn main() -> Result<()> {
     );
     let cfg = Config::load(&config_path)
         .with_context(|| format!("loading config {}", config_path.display()))?;
-    let key = cfg.require("RUNPOD_API_KEY")?.to_string();
+    let provider_name = std::env::var("ARENA_PROVIDER").unwrap_or_else(|_| "runpod".to_string());
+    let provider = arena_core::provider::build(&provider_name, &cfg)?;
+    let progress_cmd = cfg.get("PROGRESS_CMD").map(String::from);
 
     let mut app = App {
-        provider: RunpodProvider::new(key),
+        provider,
+        cfg,
+        progress_cmd,
         pods: Vec::new(),
+        metrics: HashMap::new(),
         status: "loading…".into(),
     };
     app.refresh().await;
@@ -97,45 +140,62 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -
     Ok(())
 }
 
+/// Format one pod's metric cells: (util, mem, temp, progress), each falling back to
+/// "-" when unknown, or "err" for the util cell when the fetch failed outright.
+fn metric_cells(m: Option<&PodMetrics>) -> (String, String, String, String) {
+    let Some(m) = m else {
+        return ("-".into(), "-".into(), "-".into(), "-".into());
+    };
+    let util = match (m.mean_util(), &m.error) {
+        (Some(u), _) => format!("{u}%"),
+        (None, Some(_)) => "err".into(),
+        (None, None) => "-".into(),
+    };
+    let mem = match m.mem_summary() {
+        Some((used, total)) => format!("{:.0}/{:.0}G", used as f64 / 1024.0, total as f64 / 1024.0),
+        None => "-".into(),
+    };
+    let temp = m.max_temp().map(|t| format!("{t}C")).unwrap_or_else(|| "-".into());
+    let progress = m.progress.clone().unwrap_or_else(|| "-".into());
+    (util, mem, temp, progress)
+}
+
 fn ui(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(1)])
         .split(f.area());
 
-    let title = Paragraph::new("arena-infra-rs — pods (read-only)   [r] refresh   [q] quit")
+    let title = Paragraph::new("arena-infra-rs — dashboard (read-only)   [r] refresh   [q] quit")
         .block(Block::default().borders(Borders::ALL));
     f.render_widget(title, chunks[0]);
 
-    let header = Row::new(vec!["NAME", "STATUS", "GPU", "IP", "PORT"])
+    let header = Row::new(vec!["NAME", "STATUS", "GPU", "GPU%", "MEM", "TEMP", "PROGRESS"])
         .style(Style::default().add_modifier(Modifier::BOLD));
     let rows: Vec<Row> = app
         .pods
         .iter()
         .map(|p| {
+            let (util, mem, temp, progress) = metric_cells(app.metrics.get(&p.name));
             Row::new(vec![
                 Cell::from(p.name.clone()),
                 Cell::from(p.status.clone()),
                 Cell::from(p.gpu_type.clone().unwrap_or_else(|| "-".into())),
-                Cell::from(p.ssh_ip.clone().unwrap_or_else(|| "-".into())),
-                Cell::from(
-                    p.ssh_port
-                        .map(|x| x.to_string())
-                        .unwrap_or_else(|| "-".into()),
-                ),
+                Cell::from(util),
+                Cell::from(mem),
+                Cell::from(temp),
+                Cell::from(progress),
             ])
         })
         .collect();
     let widths = [
-        Constraint::Length(24),
+        Constraint::Length(22),
         Constraint::Length(10),
-        Constraint::Length(18),
-        Constraint::Length(18),
-        Constraint::Length(8),
+        Constraint::Length(16),
+        Constraint::Length(6),
+        Constraint::Length(12),
+        Constraint::Length(6),
+        Constraint::Min(10),
     ];
     let table = Table::new(rows, widths)
         .header(header)

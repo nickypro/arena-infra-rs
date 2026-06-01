@@ -8,6 +8,7 @@
 pub mod backup;
 pub mod config;
 pub mod error;
+pub mod metrics;
 pub mod naming;
 pub mod pod;
 pub mod provider;
