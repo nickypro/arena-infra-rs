@@ -62,6 +62,24 @@ enum Cmd {
     /// Inspect the loaded config.
     #[command(subcommand)]
     Config(ConfigCmd),
+    /// Manage a cron schedule for `arena backup` (edits your crontab, touching only
+    /// arena-managed lines).
+    #[command(subcommand)]
+    Cron(CronCmd),
+}
+
+#[derive(Subcommand)]
+enum CronCmd {
+    /// Install/replace the arena backup cron job.
+    Install {
+        /// Cron schedule expression (default: hourly).
+        #[arg(long, default_value = "0 * * * *")]
+        schedule: String,
+    },
+    /// Remove the arena-managed cron lines.
+    Remove,
+    /// Show the currently-installed arena cron lines.
+    Show,
 }
 
 #[derive(Subcommand)]
@@ -299,12 +317,13 @@ async fn main() -> Result<()> {
     // `config check` must work even when a provider key is missing (that's what it's
     // for), so build the provider lazily — only for commands that actually talk to one.
     let provider = match cli.cmd {
-        Cmd::Config(_) => None,
+        Cmd::Config(_) | Cmd::Cron(_) => None,
         _ => Some(arena_core::provider::build(&cli.provider, &cfg)?),
     };
 
     match cli.cmd {
         Cmd::Config(c) => handle_config(c, &cfg, &cli.provider),
+        Cmd::Cron(c) => handle_cron(c, &cli.config).await,
         Cmd::Pods(p) => handle_pods(p, provider.unwrap().as_ref(), &cfg).await,
         Cmd::Proxy(p) => handle_proxy(p, provider.unwrap().as_ref(), &cfg).await,
         Cmd::Backup { apply, message, week, day } => {
@@ -404,6 +423,130 @@ fn resolve_week_day(cfg: &Config, week: Option<u32>, day: Option<u32>) -> Result
     let (w, d) = arena_core::schedule::week_day(start_days, today);
     // Allow overriding just one of the two.
     Ok((week.unwrap_or(w), day.unwrap_or(d)))
+}
+
+const CRON_BEGIN: &str = "# >>> arena-infra-rs >>>";
+const CRON_END: &str = "# <<< arena-infra-rs <<<";
+
+/// Return `existing` crontab text with any arena-managed block removed.
+fn strip_arena_block(existing: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut in_block = false;
+    for line in existing.lines() {
+        match line.trim() {
+            CRON_BEGIN => in_block = true,
+            CRON_END => in_block = false,
+            _ if !in_block => out.push(line),
+            _ => {}
+        }
+    }
+    let mut s = out.join("\n");
+    while s.ends_with('\n') {
+        s.pop();
+    }
+    s
+}
+
+/// Build new crontab text = existing (minus old arena block) + the new arena block
+/// (empty `lines` => just remove). Other entries are preserved untouched.
+fn with_arena_block(existing: &str, lines: &[String]) -> String {
+    let base = strip_arena_block(existing);
+    if lines.is_empty() {
+        return if base.is_empty() { String::new() } else { format!("{base}\n") };
+    }
+    let mut s = String::new();
+    if !base.is_empty() {
+        s.push_str(&base);
+        s.push('\n');
+    }
+    s.push_str(CRON_BEGIN);
+    s.push('\n');
+    for l in lines {
+        s.push_str(l);
+        s.push('\n');
+    }
+    s.push_str(CRON_END);
+    s.push('\n');
+    s
+}
+
+async fn handle_cron(cmd: CronCmd, config_path: &std::path::Path) -> Result<()> {
+    use tokio::process::Command;
+
+    // Read the current crontab (no crontab installed => empty, not an error).
+    let read = Command::new("crontab").arg("-l").output().await.context("running `crontab -l`")?;
+    let current = if read.status.success() {
+        String::from_utf8_lossy(&read.stdout).into_owned()
+    } else {
+        String::new()
+    };
+
+    match cmd {
+        CronCmd::Show => {
+            let arena: Vec<&str> = current
+                .lines()
+                .skip_while(|l| l.trim() != CRON_BEGIN)
+                .take_while(|l| l.trim() != CRON_END)
+                .filter(|l| l.trim() != CRON_BEGIN)
+                .collect();
+            if arena.is_empty() {
+                println!("(no arena-managed cron lines)");
+            } else {
+                for l in arena {
+                    println!("{l}");
+                }
+            }
+            return Ok(());
+        }
+        CronCmd::Remove => {
+            let new = with_arena_block(&current, &[]);
+            write_crontab(&new).await?;
+            println!("Removed arena-managed cron lines.");
+            return Ok(());
+        }
+        CronCmd::Install { schedule } => {
+            let exe = std::env::current_exe().context("finding the arena executable path")?;
+            let cfg_abs = std::fs::canonicalize(config_path)
+                .unwrap_or_else(|_| config_path.to_path_buf());
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            let line = format!(
+                "{schedule} {} --config {} backup --apply >> {}/arena-cron.log 2>&1",
+                exe.display(),
+                cfg_abs.display(),
+                home
+            );
+            let new = with_arena_block(&current, &[line.clone()]);
+            write_crontab(&new).await?;
+            println!("Installed arena cron job:\n  {line}");
+            println!("\n(remove with `arena cron remove`; view with `arena cron show`)");
+            return Ok(());
+        }
+    }
+}
+
+/// Replace the crontab with `content` via `crontab -` (reads from stdin).
+async fn write_crontab(content: &str) -> Result<()> {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+    use tokio::process::Command;
+
+    let mut child = Command::new("crontab")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .spawn()
+        .context("spawning `crontab -`")?;
+    child
+        .stdin
+        .as_mut()
+        .context("opening crontab stdin")?
+        .write_all(content.as_bytes())
+        .await
+        .context("writing crontab")?;
+    let status = child.wait().await.context("waiting for crontab")?;
+    if !status.success() {
+        anyhow::bail!("`crontab -` exited with {status}");
+    }
+    Ok(())
 }
 
 fn handle_config(cmd: ConfigCmd, cfg: &Config, provider_name: &str) -> Result<()> {
@@ -812,5 +955,49 @@ async fn resolve_target(provider: &dyn Provider, target: &str) -> Result<(String
     match pods.iter().find(|p| p.name == target || p.id == target) {
         Some(p) => Ok((p.id.clone(), format!("{} (id={})", p.name, p.id))),
         None => anyhow::bail!("no pod with name or id '{target}' (run `arena pods list`)"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{strip_arena_block, with_arena_block, CRON_BEGIN, CRON_END};
+
+    #[test]
+    fn install_preserves_other_crontab_entries() {
+        let existing = "0 9 * * * /usr/bin/other-job\n# my note\n";
+        let line = "0 * * * * arena backup --apply".to_string();
+        let out = with_arena_block(existing, &[line.clone()]);
+        // keeps the user's entries…
+        assert!(out.contains("/usr/bin/other-job"));
+        assert!(out.contains("# my note"));
+        // …and adds a fenced arena block
+        assert!(out.contains(CRON_BEGIN));
+        assert!(out.contains(CRON_END));
+        assert!(out.contains(&line));
+    }
+
+    #[test]
+    fn install_is_idempotent_replacing_old_block() {
+        let existing = "0 9 * * * keep-me".to_string();
+        let v1 = with_arena_block(&existing, &["A".to_string()]);
+        let v2 = with_arena_block(&v1, &["B".to_string()]);
+        assert!(v2.contains("keep-me"));
+        assert!(v2.contains('B'));
+        assert!(!v2.contains("* A") && v2.matches(CRON_BEGIN).count() == 1); // only one block
+    }
+
+    #[test]
+    fn remove_strips_only_the_arena_block() {
+        let existing = "keep-me\n# >>> arena-infra-rs >>>\njob\n# <<< arena-infra-rs <<<\nalso-keep\n";
+        let out = with_arena_block(existing, &[]);
+        assert!(out.contains("keep-me"));
+        assert!(out.contains("also-keep"));
+        assert!(!out.contains("job"));
+        assert!(!out.contains(CRON_BEGIN));
+    }
+
+    #[test]
+    fn strip_handles_no_block() {
+        assert_eq!(strip_arena_block("a\nb"), "a\nb");
     }
 }

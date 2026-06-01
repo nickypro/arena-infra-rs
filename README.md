@@ -54,6 +54,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
   - `config check` — validate that the keys the selected provider + proxy + backup
     need are present (never prints secret values; exits non-zero if a required key is
     missing). Copy `config.env.example` to get started.
+  - `cron install|remove|show` — manage a crontab schedule for `arena backup`
+    (default hourly); edits only arena-managed lines, leaving other entries intact.
   - `backup` — commit + push each pod's ARENA tree to its autocommit branch
     (`autocommit-{prefix}-w{week}d{day}-{machine}`, week/day from `ARENA_START_DATE`,
     `--week`/`--day` to override) over SSH. Dry-run unless `--apply`; clean trees
