@@ -15,13 +15,18 @@ This is the **scaffold + machine-spin-up vertical**. Implemented so far:
     the legacy bash/python scripts.
   - `provider::Provider` — the single trait every backend implements.
   - `provider::runpod` — RunPod REST backend: list / create / stop / terminate.
-  - `provider::vast` — Vast.ai stub against the same trait (next vertical).
+  - `provider::vast` — Vast.ai REST backend against the same trait. Vast rents
+    *offers* rather than named pods, so `create_pod` searches the marketplace for
+    the cheapest rentable offer matching the spec (GPU type/count, disk) and rents
+    it, carrying the machine name as the instance `label`. GPU-name matching is
+    normalized so the same `RUNPOD_GPU_TYPE` value works across both providers.
   - `naming` — next-free machine-name allocation, mirroring the legacy logic.
-- `arena` (CLI) — `pods list | create | stop | terminate`.
+- `arena` (CLI) — `pods list | create | stop | terminate`, with
+  `--provider runpod|vast` (Vast reads `VAST_API_KEY`).
 - `arena-tui` (TUI) — read-only pod dashboard (ratatui).
 
-Not yet built (planned verticals): Vast.ai impl, commit/backup flow, GPU/progress
-dashboard, port-forwarding/proxy management.
+Not yet built (planned verticals): commit/backup flow, GPU/progress dashboard,
+port-forwarding/proxy management.
 
 ## Safety model (this is developed against live production)
 
