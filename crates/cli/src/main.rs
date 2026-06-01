@@ -47,6 +47,17 @@ enum Cmd {
         #[arg(long)]
         message: Option<String>,
     },
+    /// Inspect the loaded config.
+    #[command(subcommand)]
+    Config(ConfigCmd),
+}
+
+#[derive(Subcommand)]
+enum ConfigCmd {
+    /// Validate that the keys needed by the selected provider, proxy, and backup are
+    /// present. Read-only; never prints secret values. Exits non-zero if a required
+    /// key is missing.
+    Check,
 }
 
 #[derive(Subcommand)]
@@ -248,14 +259,111 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg = Config::load(&cli.config)
         .with_context(|| format!("loading config {}", cli.config.display()))?;
-    let provider = arena_core::provider::build(&cli.provider, &cfg)?;
+
+    // `config check` must work even when a provider key is missing (that's what it's
+    // for), so build the provider lazily — only for commands that actually talk to one.
+    let provider = match cli.cmd {
+        Cmd::Config(_) => None,
+        _ => Some(arena_core::provider::build(&cli.provider, &cfg)?),
+    };
 
     match cli.cmd {
-        Cmd::Pods(p) => handle_pods(p, provider.as_ref(), &cfg).await,
-        Cmd::Proxy(p) => handle_proxy(p, provider.as_ref(), &cfg).await,
+        Cmd::Config(c) => handle_config(c, &cfg, &cli.provider),
+        Cmd::Pods(p) => handle_pods(p, provider.unwrap().as_ref(), &cfg).await,
+        Cmd::Proxy(p) => handle_proxy(p, provider.unwrap().as_ref(), &cfg).await,
         Cmd::Backup { apply, message } => {
-            handle_backup(provider.as_ref(), &cfg, apply, message).await
+            handle_backup(provider.unwrap().as_ref(), &cfg, apply, message).await
         }
+    }
+}
+
+fn handle_config(cmd: ConfigCmd, cfg: &Config, provider_name: &str) -> Result<()> {
+    match cmd {
+        ConfigCmd::Check => config_check(cfg, provider_name),
+    }
+}
+
+/// Report one config key: prints a ✓/✗/· line (never the value if `secret`) and
+/// records it in `missing` when it's required but absent/empty.
+fn cfg_row(cfg: &Config, missing: &mut Vec<String>, key: &str, required: bool, secret: bool) {
+    let ok = cfg.get(key).map(|v| !v.is_empty()).unwrap_or(false);
+    let mark = if ok { "✓" } else if required { "✗" } else { "·" };
+    let shown = if !ok {
+        "(missing)".to_string()
+    } else if secret {
+        "(set)".to_string()
+    } else {
+        cfg.get(key).unwrap_or("").to_string()
+    };
+    println!("  {mark} {key:<28} {shown}");
+    if required && !ok {
+        missing.push(key.to_string());
+    }
+}
+
+/// Print a config checklist for the selected provider + proxy + backup, never showing
+/// secret values. Returns an error if a required key is missing.
+fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
+    let mut missing: Vec<String> = Vec::new();
+
+    let provider_key = match provider_name {
+        "runpod" => "RUNPOD_API_KEY",
+        "vast" => "VAST_API_KEY",
+        "hetzner" => "HETZNER_API_KEY",
+        _ => "RUNPOD_API_KEY",
+    };
+
+    println!("Provider ({provider_name}):");
+    cfg_row(cfg, &mut missing, provider_key, true, true);
+    if provider_name == "hetzner" {
+        cfg_row(cfg, &mut missing, "HETZNER_SERVER_TYPE", false, false);
+        cfg_row(cfg, &mut missing, "HETZNER_IMAGE", false, false);
+        cfg_row(cfg, &mut missing, "HETZNER_SSH_KEY", false, false);
+    }
+
+    println!("\nMachine naming:");
+    cfg_row(cfg, &mut missing, "MACHINE_NAME_PREFIX", false, false);
+    println!(
+        "  {} MACHINE_NAME_LIST          {} names",
+        if cfg.machine_names.is_empty() { "✗" } else { "✓" },
+        cfg.machine_names.len()
+    );
+    if cfg.machine_names.is_empty() {
+        missing.push("MACHINE_NAME_LIST".into());
+    }
+
+    if provider_name != "hetzner" {
+        println!("\nCreate spec (generic key, else RUNPOD_* fallback):");
+        let spec = base_spec(cfg);
+        let yn = |s: &str| if s.is_empty() { "✗ (missing)".into() } else { format!("✓ {s}") };
+        println!("  GPU_TYPE / RUNPOD_GPU_TYPE   {}", yn(&spec.gpu_type));
+        println!("  IMAGE / RUNPOD_DOCKER_IMAGE  {}", yn(&spec.image));
+        println!("  resolved disk                {}GB", spec.disk_gb);
+        if spec.volume_gb == 0 {
+            println!("  ⚠ persistent volume          0GB — work is lost on pod restart");
+        }
+    }
+
+    println!("\nSSH (backup + dashboard metrics):");
+    cfg_row(cfg, &mut missing, "SSH_USER", false, false);
+    cfg_row(cfg, &mut missing, "SHARED_SSH_KEY_PATH", false, false);
+
+    println!("\nProxy (`proxy plan`):");
+    cfg_row(cfg, &mut missing, "SSH_PROXY_HOST", false, false);
+    cfg_row(cfg, &mut missing, "SSH_PROXY_STARTING_PORT", false, false);
+
+    println!("\nBackup (`backup`):");
+    cfg_row(cfg, &mut missing, "ARENA_REPO_NAME", false, false);
+    cfg_row(cfg, &mut missing, "GIT_SSH_KEY_REMOTE", false, false);
+
+    println!("\nDashboard (optional):");
+    cfg_row(cfg, &mut missing, "PROGRESS_CMD", false, false);
+
+    if missing.is_empty() {
+        println!("\nOK — required keys for provider `{provider_name}` are present.");
+        Ok(())
+    } else {
+        anyhow::bail!("missing required keys: {}", missing.join(", "))
     }
 }
 

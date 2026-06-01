@@ -48,6 +48,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     and list calls — so a throttle or blip doesn't fail the command.
   - `proxy plan` — read-only; prints the nginx `stream` config to apply (`--out`
     saves it locally; never deploys to the proxy).
+  - `config check` — validate that the keys the selected provider + proxy + backup
+    need are present (never prints secret values; exits non-zero if a required key is
+    missing). Copy `config.env.example` to get started.
   - `backup` — commit + push each pod's ARENA working tree to a per-machine branch
     (`backup/<name>`) over SSH. Dry-run unless `--apply`; clean trees report
     `NO_CHANGES` rather than failing. Repo path / branch / push key via `BACKUP_*`.

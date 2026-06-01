@@ -17,9 +17,7 @@ pub mod vast;
 pub fn build(name: &str, cfg: &Config) -> Result<Box<dyn Provider>> {
     match name {
         "runpod" => Ok(Box::new(runpod::RunpodProvider::new(cfg.require("RUNPOD_API_KEY")?))),
-        "vast" => Ok(Box::new(vast::VastProvider::new(
-            cfg.get("VAST_API_KEY").unwrap_or_default(),
-        ))),
+        "vast" => Ok(Box::new(vast::VastProvider::new(cfg.require("VAST_API_KEY")?))),
         "hetzner" => {
             let opts = hetzner::HetznerOpts {
                 server_type: cfg.get("HETZNER_SERVER_TYPE").unwrap_or("cx22").to_string(),
