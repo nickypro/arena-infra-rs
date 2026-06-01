@@ -35,6 +35,24 @@ enum Cmd {
     /// Machine (pod) lifecycle.
     #[command(subcommand)]
     Pods(PodCmd),
+    /// Plan port-forwarding/proxy wiring (read-only; prints config to apply).
+    #[command(subcommand)]
+    Proxy(ProxyCmd),
+}
+
+#[derive(Subcommand)]
+enum ProxyCmd {
+    /// Compute the proxy plan for current pods and print the nginx config +
+    /// SSH-tunnel commands to apply on the proxy host. Never connects anywhere.
+    Plan {
+        /// Service port inside each pod to expose (default: Jupyter 8888).
+        #[arg(long, default_value_t = arena_core::proxy::DEFAULT_TARGET_PORT)]
+        port: u16,
+        /// Also write the rendered nginx config to this local path for review.
+        /// (Local only — this never copies anything to the proxy host.)
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -99,7 +117,64 @@ async fn main() -> Result<()> {
 
     match cli.cmd {
         Cmd::Pods(p) => handle_pods(p, provider.as_ref(), &cfg).await,
+        Cmd::Proxy(p) => handle_proxy(p, provider.as_ref(), &cfg).await,
     }
+}
+
+async fn handle_proxy(cmd: ProxyCmd, provider: &dyn Provider, cfg: &Config) -> Result<()> {
+    match cmd {
+        ProxyCmd::Plan { port, out } => {
+            let pxcfg = arena_core::proxy::ProxyConfig::from_config(cfg)?;
+            let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
+            let pods = provider.list_pods().await.context("listing pods for proxy plan")?;
+            let plan = arena_core::proxy::plan_forwards(
+                &pxcfg,
+                prefix,
+                &cfg.machine_names,
+                &pods,
+                port,
+            );
+
+            println!(
+                "# proxy host: {}@{}  (nginx config path: {})\n",
+                pxcfg.proxy_user, pxcfg.proxy_host, pxcfg.nginx_path
+            );
+            if plan.forwards.is_empty() {
+                println!("(no forwardable pods — nothing with an SSH endpoint in the name list)");
+            } else {
+                println!("{:<24} {:<8} {:<8} {}", "NAME", "PUBLIC", "LOCAL", "POD SSH");
+                for f in &plan.forwards {
+                    println!(
+                        "{:<24} {:<8} {:<8} {}@{}:{}",
+                        f.name, f.public_port, f.local_port, f.pod_ssh_user, f.pod_ip, f.pod_ssh_port
+                    );
+                }
+            }
+            for s in &plan.skipped {
+                eprintln!("warning: skipped {} — {}", s.name, s.reason);
+            }
+
+            let nginx = arena_core::proxy::render_nginx(&plan.forwards);
+            println!("\n# ----- nginx config (write to {} on the proxy) -----", pxcfg.nginx_path);
+            println!("{nginx}");
+            println!("# ----- SSH tunnels (run on the proxy host {}) -----", pxcfg.proxy_host);
+            for line in arena_core::proxy::render_tunnels(&plan.forwards) {
+                println!("{line}");
+            }
+
+            if let Some(path) = out {
+                std::fs::write(&path, &nginx)
+                    .with_context(|| format!("writing nginx config to {}", path.display()))?;
+                eprintln!("\nwrote nginx config to {} (local only — not deployed)", path.display());
+            } else {
+                println!(
+                    "\n# Review the above, then apply manually. \
+                     Re-run with --out <file> to save the nginx config locally."
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Result<()> {

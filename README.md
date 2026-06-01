@@ -21,12 +21,16 @@ This is the **scaffold + machine-spin-up vertical**. Implemented so far:
     it, carrying the machine name as the instance `label`. GPU-name matching is
     normalized so the same `RUNPOD_GPU_TYPE` value works across both providers.
   - `naming` — next-free machine-name allocation, mirroring the legacy logic.
-- `arena` (CLI) — `pods list | create | stop | terminate`, with
-  `--provider runpod|vast` (Vast reads `VAST_API_KEY`).
+  - `proxy` — port-forwarding planner. Computes a *stable* public-port map (each
+    pod's port is anchored to its index in `MACHINE_NAME_LIST`, so tearing down one
+    pod never renumbers the others), and renders the nginx `stream` config plus the
+    SSH-tunnel commands to apply on the proxy host. Pure/no-I/O — it plans, you apply.
+- `arena` (CLI) — `pods list | create | stop | terminate` (`--provider runpod|vast`,
+  Vast reads `VAST_API_KEY`) and `proxy plan` (read-only; prints config to apply,
+  `--out` saves the nginx config locally).
 - `arena-tui` (TUI) — read-only pod dashboard (ratatui).
 
-Not yet built (planned verticals): commit/backup flow, GPU/progress dashboard,
-port-forwarding/proxy management.
+Not yet built (planned verticals): commit/backup flow, GPU/progress dashboard.
 
 ## Safety model (this is developed against live production)
 

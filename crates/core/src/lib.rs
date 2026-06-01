@@ -10,6 +10,7 @@ pub mod error;
 pub mod naming;
 pub mod pod;
 pub mod provider;
+pub mod proxy;
 
 pub use config::Config;
 pub use error::{Error, Result};
