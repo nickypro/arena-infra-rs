@@ -9,7 +9,6 @@
 //! All of this is read-only: it only ever *reads* `nvidia-smi` and runs the operator's
 //! progress command. Parsing is pure and unit-tested; the SSH calls are thin.
 
-use crate::error::Result;
 use crate::ssh::{self, SshTarget};
 
 /// `nvidia-smi` invocation that emits one CSV row per GPU, no header/units, in the
@@ -65,14 +64,23 @@ impl PodMetrics {
         }
     }
 
-    /// Summed memory (used, total) in MB across GPUs, if reported.
+    /// Summed memory (used, total) in MB across GPUs, counting only GPUs that report
+    /// *both* values — so a half-reported GPU can't skew the ratio (e.g. used > total).
     pub fn mem_summary(&self) -> Option<(u32, u32)> {
-        let used: u32 = self.gpus.iter().filter_map(|g| g.mem_used_mb).sum();
-        let total: u32 = self.gpus.iter().filter_map(|g| g.mem_total_mb).sum();
-        if total == 0 {
-            None
-        } else {
+        let mut used = 0u32;
+        let mut total = 0u32;
+        let mut any = false;
+        for g in &self.gpus {
+            if let (Some(u), Some(t)) = (g.mem_used_mb, g.mem_total_mb) {
+                used += u;
+                total += t;
+                any = true;
+            }
+        }
+        if any {
             Some((used, total))
+        } else {
+            None
         }
     }
 
@@ -108,10 +116,6 @@ pub async fn fetch(target: &SshTarget, progress_cmd: Option<&str>) -> PodMetrics
     }
     m
 }
-
-/// The `Result` re-export keeps the public signature consistent with the rest of the
-/// crate even though `fetch` itself is infallible by design.
-pub type FetchResult = Result<PodMetrics>;
 
 #[cfg(test)]
 mod tests {

@@ -128,11 +128,19 @@ fn base_spec(cfg: &Config) -> PodSpec {
 
 /// Compute the next free machine names for `count` pods, warning if fewer are
 /// available than requested. (Read-only: lists current pods to know what's taken.)
-async fn plan_names(provider: &dyn Provider, cfg: &Config, count: usize) -> Vec<String> {
+///
+/// CRITICAL: this propagates a list failure instead of swallowing it. If we can't
+/// confirm what already exists, we must NOT proceed — treating a failed list as "zero
+/// pods" would make `--apply` create a duplicate of the entire fleet on the live
+/// account. Better to abort with an error the operator can see.
+async fn plan_names(provider: &dyn Provider, cfg: &Config, count: usize) -> Result<Vec<String>> {
     let policy = arena_core::retry::RetryPolicy::default();
     let existing = arena_core::retry::retrying(&policy, || provider.list_pods())
         .await
-        .unwrap_or_default();
+        .context(
+            "listing existing pods (refusing to allocate names — a failed list could \
+             create duplicate pods)",
+        )?;
     let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
     let names = arena_core::naming::next_free_names(prefix, &cfg.machine_names, &existing, count);
     if names.len() < count {
@@ -141,11 +149,15 @@ async fn plan_names(provider: &dyn Provider, cfg: &Config, count: usize) -> Vec<
             names.len()
         );
     }
-    names
+    Ok(names)
 }
 
 /// Seconds to wait between capacity retries when `--keep-trying` is set.
 const CAPACITY_RETRY_SECS: u64 = 30;
+
+/// Max capacity retries per machine under `--keep-trying` (~1h at 30s) — generous
+/// enough to "wait around" for a free GPU, bounded enough to never spin forever.
+const MAX_CAPACITY_ATTEMPTS: u32 = 120;
 
 /// Create one pod per name, returning those that came up. Error handling is typed:
 /// - `Capacity` → the pool is exhausted; stop gracefully (or, with `keep_trying`,
@@ -168,6 +180,9 @@ async fn create_pods(
         let mut spec = base.clone();
         spec.name = name.clone();
         spec.env.push(("MACHINE_NAME".into(), name.clone()));
+        // Bound the capacity wait so a *misclassified* permanent error (e.g. a config
+        // problem whose message merely looks capacity-ish) can't spin forever.
+        let mut cap_attempts = 0u32;
         loop {
             // Retry transient/throttle failures with backoff; capacity & auth fall
             // through immediately to the classification below.
@@ -178,14 +193,23 @@ async fn create_pods(
                     continue 'names;
                 }
                 Err(e) => match e.kind() {
-                    Some(K::Capacity) if keep_trying => {
+                    Some(K::Capacity) if keep_trying && cap_attempts < MAX_CAPACITY_ATTEMPTS => {
+                        cap_attempts += 1;
                         eprintln!(
-                            "[waiting] no capacity for {name}; retrying in {CAPACITY_RETRY_SECS}s (have {}/{})",
+                            "[waiting] no capacity for {name}; retry {cap_attempts}/{MAX_CAPACITY_ATTEMPTS} in {CAPACITY_RETRY_SECS}s (have {}/{})",
                             created.len(),
                             names.len()
                         );
                         tokio::time::sleep(std::time::Duration::from_secs(CAPACITY_RETRY_SECS)).await;
                         // loop: retry the same name
+                    }
+                    Some(K::Capacity) if keep_trying => {
+                        eprintln!(
+                            "[stop] still no capacity for {name} after {MAX_CAPACITY_ATTEMPTS} attempts (created {}/{}).",
+                            created.len(),
+                            names.len()
+                        );
+                        break 'names;
                     }
                     Some(K::Capacity) => {
                         eprintln!(
@@ -276,7 +300,7 @@ async fn handle_backup(
     for (name, target) in &targets {
         let cmd = arena_core::backup::backup_command(&bcfg, name, &msg);
         match ssh::run(target, &cmd).await {
-            Ok(out) if out.success && out.stdout.contains("NO_CHANGES") => {
+            Ok(out) if out.success && out.stdout.lines().any(|l| l.trim() == "NO_CHANGES") => {
                 println!("[no changes] {name}");
                 no_changes += 1;
             }
@@ -386,7 +410,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
         }
 
         PodCmd::Create { count, apply, keep_trying } => {
-            let names = plan_names(provider, cfg, count).await;
+            let names = plan_names(provider, cfg, count).await?;
             if names.is_empty() {
                 eprintln!("no free machine names available — nothing to do");
                 return Ok(());
@@ -406,7 +430,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
         }
 
         PodCmd::Up { count, apply, no_wait, keep_trying, timeout, interval } => {
-            let names = plan_names(provider, cfg, count).await;
+            let names = plan_names(provider, cfg, count).await?;
             if names.is_empty() {
                 eprintln!("no free machine names available — nothing to do");
                 return Ok(());
@@ -429,8 +453,11 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
                 eprintln!("no pods were created — nothing to wait for");
                 return Ok(());
             }
-            let want: std::collections::HashSet<String> =
-                created.iter().map(|p| p.name.clone()).collect();
+            // Match readiness by pod id, not name: a provider's reported name doesn't
+            // always equal the name we asked for (e.g. Vast's `vast-<id>` fallback),
+            // which would make us wait forever on a pod that's actually up.
+            let want_ids: std::collections::HashSet<String> =
+                created.iter().map(|p| p.id.clone()).collect();
 
             if no_wait {
                 println!(
@@ -441,14 +468,18 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
 
             // Poll the whole fleet (one list call per tick) until our pods have SSH
             // endpoints or we hit the timeout. Stateless: each tick re-reads truth.
+            let policy = arena_core::retry::RetryPolicy::default();
             let interval = interval.max(1);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
             println!(
                 "\nWaiting up to {timeout}s for SSH endpoints (polling every {interval}s)…"
             );
+            let is_ready =
+                |p: &arena_core::Pod| p.ssh_ip.is_some() && p.ssh_port.is_some();
             let pods = loop {
                 tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
-                let pods = match provider.list_pods().await {
+                let pods = match arena_core::retry::retrying(&policy, || provider.list_pods()).await
+                {
                     Ok(p) => p,
                     Err(e) => {
                         eprintln!("  poll failed ({e}); retrying");
@@ -460,24 +491,18 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
                 };
                 let ready = pods
                     .iter()
-                    .filter(|p| {
-                        want.contains(p.name.as_str()) && p.ssh_ip.is_some() && p.ssh_port.is_some()
-                    })
+                    .filter(|p| want_ids.contains(&p.id) && is_ready(p))
                     .count();
-                println!("  {ready}/{} ready", want.len());
-                if ready == want.len() || std::time::Instant::now() >= deadline {
+                println!("  {ready}/{} ready", want_ids.len());
+                if ready == want_ids.len() || std::time::Instant::now() >= deadline {
                     break pods;
                 }
             };
 
-            let not_ready: Vec<&str> = want
+            let not_ready: Vec<&str> = created
                 .iter()
-                .map(String::as_str)
-                .filter(|n| {
-                    !pods.iter().any(|p| {
-                        p.name == *n && p.ssh_ip.is_some() && p.ssh_port.is_some()
-                    })
-                })
+                .filter(|c| !pods.iter().any(|p| p.id == c.id && is_ready(p)))
+                .map(|c| c.name.as_str())
                 .collect();
             if !not_ready.is_empty() {
                 eprintln!(

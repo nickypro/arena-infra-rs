@@ -40,18 +40,26 @@ impl ProviderErrorKind {
 
 /// Heuristic: does this message read like "no machines available"? Providers don't
 /// share a status code for this, so we match the phrasings RunPod/Vast/Hetzner use.
+///
+/// Needles are kept SPECIFIC to pool-exhaustion on purpose. Broad words like
+/// "insufficient" or bare "unavailable" were removed: "insufficient funds/credit" is a
+/// billing failure, not capacity, and misclassifying it as capacity would make
+/// `--keep-trying` wait for a GPU that will never come because the account is out of
+/// money. When unsure we return false (→ `Other`), which fails fast rather than looping.
 pub fn looks_like_capacity(message: &str) -> bool {
     let m = message.to_lowercase();
     [
         "no instances",
         "no longer any instances",
         "no rentable offer",
-        "capacity",
-        "unavailable",
+        "no capacity",
+        "no availability",
+        "not available in",
+        "currently unavailable",
         "out of stock",
         "no offers",
-        "insufficient",
-        "no resources",
+        "no gpus available",
+        "no resources available",
     ]
     .iter()
     .any(|needle| m.contains(needle))
@@ -137,6 +145,14 @@ mod tests {
             ProviderErrorKind::classify(s, "create pod HTTP 400: bad image name"),
             ProviderErrorKind::Other
         );
+        // Billing/credit failures must NOT be read as capacity — otherwise
+        // --keep-trying would wait forever for a GPU the account can't pay for.
+        assert_eq!(
+            ProviderErrorKind::classify(s, "create pod HTTP 402: insufficient funds"),
+            ProviderErrorKind::Other
+        );
+        assert!(!looks_like_capacity("insufficient credit balance"));
+        assert!(looks_like_capacity("no instances available for this gpu type"));
     }
 
     #[test]

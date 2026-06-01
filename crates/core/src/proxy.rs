@@ -110,9 +110,27 @@ pub fn plan_forwards(
             });
             continue;
         };
+        // Reject empty/garbage SSH hosts and ports that would run off the u16 ceiling,
+        // rather than emitting a broken nginx block or silently colliding two pods on a
+        // saturated port. Compute the port in u32 so the overflow is detectable.
+        if ip.trim().is_empty() {
+            plan.skipped.push(Skipped {
+                name: pod.name.clone(),
+                reason: "empty SSH host from provider".into(),
+            });
+            continue;
+        }
+        let port = cfg.starting_port as u32 + idx as u32;
+        let Ok(public_port) = u16::try_from(port) else {
+            plan.skipped.push(Skipped {
+                name: pod.name.clone(),
+                reason: format!("public port {port} exceeds 65535 (starting_port + index too high)"),
+            });
+            continue;
+        };
         plan.forwards.push(Forward {
             name: pod.name.clone(),
-            public_port: cfg.starting_port.saturating_add(idx as u16),
+            public_port,
             target_ip: ip,
             target_port: ssh_port,
         });
@@ -205,6 +223,24 @@ mod tests {
         assert_eq!(plan.skipped.len(), 2);
         assert!(plan.skipped.iter().any(|s| s.name == "arena8-ghost"));
         assert!(plan.skipped.iter().any(|s| s.name == "arena8-bloom"));
+    }
+
+    #[test]
+    fn skips_port_overflow_and_empty_host_instead_of_silently_colliding() {
+        let mut c = cfg();
+        c.starting_port = 65535;
+        // index 0 -> 65535 (ok); index 1 -> 65536 (overflow -> skipped, not saturated).
+        let pods = vec![
+            pod("arena8-apple", Some("1.1.1.1"), Some(22000)),
+            pod("arena8-autumn", Some("2.2.2.2"), Some(22001)),
+            pod("arena8-bloom", Some("   "), Some(22002)), // empty/garbage host -> skipped
+        ];
+        let plan = plan_forwards(&c, "arena8", &candidates(), &pods);
+        assert_eq!(plan.forwards.len(), 1);
+        assert_eq!(plan.forwards[0].name, "arena8-apple");
+        assert_eq!(plan.forwards[0].public_port, 65535);
+        assert!(plan.skipped.iter().any(|s| s.name == "arena8-autumn" && s.reason.contains("65535")));
+        assert!(plan.skipped.iter().any(|s| s.name == "arena8-bloom" && s.reason.contains("empty")));
     }
 
     #[test]
