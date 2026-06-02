@@ -71,8 +71,15 @@ enum Mode {
     FleetMenu,
     /// A pending fleet action; requires typing `ALL` to confirm.
     FleetConfirm { action: Action, typed: String },
-    /// Add-pod form: `free` is the list of available machine names, `count` how many.
-    NewPod { free: Vec<String>, count: usize },
+    /// Add-pod form: `free` machine names available, `count` pods to make, plus the
+    /// chosen GPU type (index into `gpu_types`) and GPUs-per-pod.
+    NewPod {
+        free: Vec<String>,
+        count: usize,
+        gpu_types: Vec<String>,
+        gpu_idx: usize,
+        gpu_count: u32,
+    },
     /// The outcome of the last action; any key dismisses (then we nudge a refresh).
     Result(String),
 }
@@ -382,7 +389,14 @@ async fn run(
                                     &existing,
                                     usize::MAX,
                                 );
-                                ui.mode = Mode::NewPod { free, count: 1 };
+                                let gpu_count = PodSpec::from_config(&ui.cfg).gpu_count.max(1);
+                                ui.mode = Mode::NewPod {
+                                    free,
+                                    count: 1,
+                                    gpu_types: gpu_type_choices(&ui.cfg),
+                                    gpu_idx: 0,
+                                    gpu_count,
+                                };
                             }
                             Err(e) => ui.mode = Mode::Result(format!("✗ list failed: {e}")),
                         }
@@ -467,34 +481,57 @@ async fn run(
                 }
                 _ => ui.mode = Mode::FleetConfirm { action, typed },
             },
-            Mode::NewPod { free, count } => match code {
-                KeyCode::Esc => ui.mode = Mode::List,
-                KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('+') => {
-                    let count = (count + 1).min(free.len().max(1));
-                    ui.mode = Mode::NewPod { free, count };
-                }
-                KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('-') => {
-                    let count = count.saturating_sub(1).max(1);
-                    ui.mode = Mode::NewPod { free, count };
-                }
-                KeyCode::Enter => {
-                    let names: Vec<String> = free.iter().take(count).cloned().collect();
-                    if names.is_empty() {
-                        ui.mode = Mode::Result("✗ no free machine names available".into());
-                    } else {
-                        ui.mode =
-                            Mode::Result(format!("creating {} pod(s)…", names.len()));
-                        {
-                            let s = shared.lock().unwrap();
-                            terminal.draw(|f| view(f, &s, &ui, secs))?;
+            Mode::NewPod { free, count, gpu_types, gpu_idx, gpu_count } => {
+                let n_types = gpu_types.len().max(1);
+                match code {
+                    KeyCode::Esc => ui.mode = Mode::List,
+                    KeyCode::Enter => {
+                        let names: Vec<String> = free.iter().take(count).cloned().collect();
+                        if names.is_empty() {
+                            ui.mode = Mode::Result("✗ no free machine names available".into());
+                        } else {
+                            let gpu_type = gpu_types.get(gpu_idx).cloned().unwrap_or_default();
+                            ui.mode = Mode::Result(format!(
+                                "creating {} × {}gpu {} pod(s)…",
+                                names.len(),
+                                gpu_count,
+                                gpu_type
+                            ));
+                            {
+                                let s = shared.lock().unwrap();
+                                terminal.draw(|f| view(f, &s, &ui, secs))?;
+                            }
+                            let msg =
+                                create_pods(provider, &ui.cfg, &names, &gpu_type, gpu_count).await;
+                            ui.mode = Mode::Result(msg);
+                            nudge.notify_one();
                         }
-                        let msg = create_pods(provider, &ui.cfg, &names).await;
-                        ui.mode = Mode::Result(msg);
-                        nudge.notify_one();
+                    }
+                    other => {
+                        // Adjust one of the three knobs and rebuild the form state.
+                        let (count, gpu_idx, gpu_count) = match other {
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                ((count + 1).min(free.len().max(1)), gpu_idx, gpu_count)
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                (count.saturating_sub(1).max(1), gpu_idx, gpu_count)
+                            }
+                            KeyCode::Left | KeyCode::Char('h') => {
+                                (count, (gpu_idx + n_types - 1) % n_types, gpu_count)
+                            }
+                            KeyCode::Right | KeyCode::Char('l') => {
+                                (count, (gpu_idx + 1) % n_types, gpu_count)
+                            }
+                            KeyCode::Char('+') | KeyCode::Char('=') => {
+                                (count, gpu_idx, (gpu_count + 1).min(8))
+                            }
+                            KeyCode::Char('-') => (count, gpu_idx, gpu_count.saturating_sub(1).max(1)),
+                            _ => (count, gpu_idx, gpu_count),
+                        };
+                        ui.mode = Mode::NewPod { free, count, gpu_types, gpu_idx, gpu_count };
                     }
                 }
-                _ => {}
-            },
+            }
             Mode::Result(_) => {
                 // Any key dismisses the result, then nudge a refresh to re-sync.
                 ui.mode = Mode::List;
@@ -545,10 +582,51 @@ async fn execute_fleet(
     s
 }
 
+/// Common GPU types offered in the add-pod form, after the config's own default. These
+/// are best-effort presets (provider-specific strings); the configured default is
+/// known-good and listed first.
+const GPU_PRESETS: &[&str] = &[
+    "NVIDIA GeForce RTX 4090",
+    "NVIDIA GeForce RTX 3090",
+    "NVIDIA RTX A4000",
+    "NVIDIA RTX A5000",
+    "NVIDIA RTX A6000",
+    "NVIDIA A100 80GB PCIe",
+    "NVIDIA H100 80GB HBM3",
+    "NVIDIA L40S",
+];
+
+/// Build the GPU-type choices for the add-pod form: the config default first (so the
+/// default create matches the CLI), then the presets, de-duplicated.
+fn gpu_type_choices(cfg: &Config) -> Vec<String> {
+    let mut out = Vec::new();
+    let default = PodSpec::from_config(cfg).gpu_type;
+    if !default.is_empty() {
+        out.push(default);
+    }
+    for t in GPU_PRESETS {
+        if !out.iter().any(|x| x == t) {
+            out.push(t.to_string());
+        }
+    }
+    if out.is_empty() {
+        out.push("NVIDIA GeForce RTX 4090".to_string());
+    }
+    out
+}
+
 /// Create the named pods (sequentially, no capacity-wait), returning a summary line.
 /// Each create is gated by the add-pod form's Enter, mirroring `arena pods create`.
-async fn create_pods(provider: &Arc<dyn Provider>, cfg: &Config, names: &[String]) -> String {
-    let base = PodSpec::from_config(cfg);
+async fn create_pods(
+    provider: &Arc<dyn Provider>,
+    cfg: &Config,
+    names: &[String],
+    gpu_type: &str,
+    gpu_count: u32,
+) -> String {
+    let mut base = PodSpec::from_config(cfg);
+    base.gpu_type = gpu_type.to_string();
+    base.gpu_count = gpu_count;
     let mut ok = 0usize;
     let mut fails: Vec<String> = Vec::new();
     for name in names {
@@ -824,7 +902,9 @@ fn view(f: &mut Frame, shared: &Shared, ui: &Ui, secs: u64) {
         Mode::Confirm(c) => render_confirm(f, c),
         Mode::FleetMenu => render_fleet_menu(f, shared),
         Mode::FleetConfirm { action, typed } => render_fleet_confirm(f, shared, *action, typed),
-        Mode::NewPod { free, count } => render_new_pod(f, free, *count),
+        Mode::NewPod { free, count, gpu_types, gpu_idx, gpu_count } => {
+            render_new_pod(f, free, *count, gpu_types, *gpu_idx, *gpu_count)
+        }
         Mode::Result(msg) => render_result(f, msg),
         _ => {}
     }
@@ -1062,13 +1142,13 @@ fn footer_hint(shared: &Shared, ui: &Ui, secs: u64) -> String {
     };
     let spin = if shared.refreshing { " ⟳" } else { "" };
     let keys = match ui.mode {
-        Mode::List => "[jk] sel  [enter] detail  [a] act  [A] fleet  [n] new  [s] names  [f] interval  [r] now  [q] quit",
-        Mode::Detail => "[jk] sel  [a] act  [A] fleet  [n] new  [s] names  [f] interval  [r] now  [esc] back  [q] quit",
+        Mode::List => "[enter] detail  [a] act  [A] fleet  [n] new  [s] names  [f] interval  [r] now  [q] quit",
+        Mode::Detail => "[a] act  [A] fleet  [n] new  [s] names  [f] interval  [r] now  [esc] back  [q] quit",
         Mode::Menu => "[r/s/t/b/p] choose action  [esc] cancel",
         Mode::Confirm(_) => "type to confirm  [enter] apply  [esc] cancel",
         Mode::FleetMenu => "[r/b/p] choose fleet action  [esc] cancel",
         Mode::FleetConfirm { .. } => "type ALL to confirm  [enter] apply  [esc] cancel",
-        Mode::NewPod { .. } => "[↑↓/±] count  [enter] create  [esc] cancel",
+        Mode::NewPod { .. } => "[↑↓] pods  [+-] gpus  [←→] type  [enter] create  [esc] cancel",
         Mode::Result(_) => "[any key] dismiss",
     };
     format!("{}{} · {} · every {}s · {}", shared.status, spin, age, secs, keys)
@@ -1197,11 +1277,20 @@ fn render_fleet_confirm(f: &mut Frame, shared: &Shared, action: Action, typed: &
     );
 }
 
-fn render_new_pod(f: &mut Frame, free: &[String], count: usize) {
+fn render_new_pod(
+    f: &mut Frame,
+    free: &[String],
+    count: usize,
+    gpu_types: &[String],
+    gpu_idx: usize,
+    gpu_count: u32,
+) {
     let planned: Vec<&String> = free.iter().take(count).collect();
+    let gpu_type = gpu_types.get(gpu_idx).map(String::as_str).unwrap_or("-");
     let mut text = format!(
-        "Create {} pod(s) on the next free name(s):\n\n",
-        planned.len()
+        "Add pods:\n\n  GPU type:  ‹ {gpu_type} ›        (← →)\n  GPUs/pod:  {gpu_count}                       (+ -)\n  pods:      {}  of {} free        (↑ ↓)\n\nwill create:\n",
+        planned.len(),
+        free.len(),
     );
     if planned.is_empty() {
         text.push_str("  (no free machine names left in MACHINE_NAME_LIST)\n");
@@ -1210,9 +1299,8 @@ fn render_new_pod(f: &mut Frame, free: &[String], count: usize) {
             text.push_str(&format!("  • {name}\n"));
         }
     }
-    text.push_str(&format!("\n{} names free total\n\n", free.len()));
-    text.push_str("[↑↓ / + -] adjust count   [enter] CREATE   [esc] cancel");
-    let area = centered_rect(60, 60, f.area());
+    text.push_str("\n[enter] CREATE   [esc] cancel");
+    let area = centered_rect(64, 65, f.area());
     f.render_widget(Clear, area);
     f.render_widget(
         Paragraph::new(text).wrap(Wrap { trim: false }).block(
