@@ -43,7 +43,7 @@ impl SshTarget {
             user: cfg.get("SSH_USER").unwrap_or("root").to_string(),
             host,
             port,
-            key_path: cfg.get("SHARED_SSH_KEY_PATH").map(String::from),
+            key_path: cfg.get("SHARED_SSH_KEY_PATH").map(resolve_key_path),
             connect_timeout_secs: 10,
         })
     }
@@ -100,6 +100,46 @@ impl SshTarget {
     pub fn display_scp(&self, local: &str, remote: &str) -> String {
         format!("scp {}", self.scp_args(local, remote).join(" "))
     }
+}
+
+/// Resolve the configured SSH key path to one the current user can actually read.
+///
+/// The shared `config.env` typically points at a key under `/root` (the prod layout),
+/// but the tooling often runs as a less-privileged user that keeps a readable copy at
+/// `~/.ssh/<same-name>`. Without this, the dashboard's `nvidia-smi`-over-SSH just fails
+/// with "identity file not accessible". So: expand a leading `~`, and if the configured
+/// path isn't readable but a key with the same file name exists under `$HOME/.ssh`,
+/// prefer that. If neither is readable, keep the configured path so the resulting error
+/// names what was actually tried. An explicit `SHARED_SSH_KEY_PATH` env override still
+/// wins (it's applied before this, at config load) — this is only a fallback.
+fn resolve_key_path(configured: &str) -> String {
+    let home = std::env::var("HOME").ok();
+    resolve_key_with(configured, home.as_deref(), |p| {
+        std::fs::File::open(p).is_ok()
+    })
+}
+
+/// The pure core of [`resolve_key_path`], with `$HOME` and the readability check
+/// injected so it's testable without touching the real filesystem.
+fn resolve_key_with<R: Fn(&str) -> bool>(configured: &str, home: Option<&str>, readable: R) -> String {
+    // Expand a leading `~/` against $HOME.
+    let expanded = match (configured.strip_prefix("~/"), home) {
+        (Some(rest), Some(h)) => format!("{}/{rest}", h.trim_end_matches('/')),
+        _ => configured.to_string(),
+    };
+    if readable(&expanded) {
+        return expanded;
+    }
+    // Fall back to a same-named key under $HOME/.ssh, if that one is readable.
+    if let Some(h) = home {
+        if let Some(name) = std::path::Path::new(&expanded).file_name().and_then(|n| n.to_str()) {
+            let candidate = format!("{}/.ssh/{name}", h.trim_end_matches('/'));
+            if candidate != expanded && readable(&candidate) {
+                return candidate;
+            }
+        }
+    }
+    expanded
 }
 
 /// Copy a local file to the target over scp.
@@ -176,6 +216,34 @@ mod tests {
         let mut t = target();
         t.key_path = None;
         assert!(!t.ssh_args().join(" ").contains("-i "));
+    }
+
+    #[test]
+    fn key_falls_back_to_home_ssh_when_root_unreadable() {
+        // /root key unreadable; same-named key under $HOME/.ssh is readable.
+        let got = resolve_key_with("/root/.ssh/arena8_key", Some("/home/dev"), |p| {
+            p == "/home/dev/.ssh/arena8_key"
+        });
+        assert_eq!(got, "/home/dev/.ssh/arena8_key");
+    }
+
+    #[test]
+    fn key_keeps_configured_path_when_readable() {
+        let got = resolve_key_with("/root/.ssh/arena8_key", Some("/home/dev"), |_| true);
+        assert_eq!(got, "/root/.ssh/arena8_key");
+    }
+
+    #[test]
+    fn key_keeps_configured_path_when_no_fallback_exists() {
+        // Nothing readable -> keep the original so the error names what was tried.
+        let got = resolve_key_with("/root/.ssh/arena8_key", Some("/home/dev"), |_| false);
+        assert_eq!(got, "/root/.ssh/arena8_key");
+    }
+
+    #[test]
+    fn key_expands_leading_tilde() {
+        let got = resolve_key_with("~/.ssh/k", Some("/home/dev"), |p| p == "/home/dev/.ssh/k");
+        assert_eq!(got, "/home/dev/.ssh/k");
     }
 
     #[test]
