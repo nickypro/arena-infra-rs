@@ -122,6 +122,10 @@ Hetzner), commit/backup, the GPU/progress dashboard, and proxy/port-forwarding.
 - **Read-only by default.** `pods list` and the TUI only ever issue GET requests.
 - **Every mutating command is dry-run by default.** `create`/`stop`/`terminate`
   print what they *would* do and only act when given `--apply`.
+- **`--apply` then asks for confirmation.** At an interactive terminal, mutating
+  commands print what they'll do and prompt `Proceed? [y/N]`. Pass `-y`/`--yes` to
+  skip it; non-interactive runs (cron, pipes) proceed without prompting so automation
+  isn't blocked.
 
 ## Usage
 

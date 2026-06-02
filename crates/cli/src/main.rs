@@ -34,8 +34,27 @@ struct Cli {
     #[arg(long, default_value = "runpod", global = true)]
     provider: String,
 
+    /// Skip the interactive "Proceed? [y/N]" confirmation on mutating commands.
+    #[arg(long, short = 'y', global = true)]
+    yes: bool,
+
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+/// Ask the operator to confirm a mutating action. Returns true (proceed) when `--yes`
+/// is set or stdin isn't a terminal (cron/pipes — they already opted in via `--apply`);
+/// otherwise prompts on stderr and reads a y/N answer.
+fn confirm(assume_yes: bool, what: &str) -> Result<bool> {
+    use std::io::{IsTerminal, Write};
+    if assume_yes || !std::io::stdin().is_terminal() {
+        return Ok(true);
+    }
+    eprint!("{what}\nProceed? [y/N] ");
+    std::io::stderr().flush().ok();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
 }
 
 #[derive(Subcommand)]
@@ -436,8 +455,8 @@ async fn main() -> Result<()> {
         Cmd::Plan(c) => handle_plan(c, provider.unwrap().as_ref(), &cfg).await,
         Cmd::Config(c) => handle_config(c, &cfg, &cli.provider, &cli.config),
         Cmd::Cron(c) => handle_cron(c, &cli.config).await,
-        Cmd::Pods(p) => handle_pods(p, provider.unwrap().as_ref(), &cfg).await,
-        Cmd::Proxy(p) => handle_proxy(p, provider.unwrap().as_ref(), &cfg).await,
+        Cmd::Pods(p) => handle_pods(p, provider.unwrap().as_ref(), &cfg, cli.yes).await,
+        Cmd::Proxy(p) => handle_proxy(p, provider.unwrap().as_ref(), &cfg, cli.yes).await,
     }
 }
 
@@ -924,7 +943,7 @@ async fn handle_backup(
     Ok(())
 }
 
-async fn handle_proxy(cmd: ProxyCmd, provider: &dyn Provider, cfg: &Config) -> Result<()> {
+async fn handle_proxy(cmd: ProxyCmd, provider: &dyn Provider, cfg: &Config, yes: bool) -> Result<()> {
     match cmd {
         ProxyCmd::Plan { out } => {
             let pods = provider.list_pods().await.context("listing pods for proxy plan")?;
@@ -932,6 +951,13 @@ async fn handle_proxy(cmd: ProxyCmd, provider: &dyn Provider, cfg: &Config) -> R
         }
         ProxyCmd::Apply { apply } => {
             let pods = provider.list_pods().await.context("listing pods for proxy apply")?;
+            if apply {
+                let pxcfg = arena_core::proxy::ProxyConfig::from_config(cfg)?;
+                if !confirm(yes, &format!("Will deploy the nginx config to {} and reload nginx.", pxcfg.proxy_host))? {
+                    println!("aborted.");
+                    return Ok(());
+                }
+            }
             deploy_proxy(cfg, &pods, apply).await?;
         }
     }
@@ -1163,7 +1189,7 @@ fn emit_proxy_plan(pods: &[arena_core::Pod], cfg: &Config, out: Option<&std::pat
     Ok(())
 }
 
-async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Result<()> {
+async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bool) -> Result<()> {
     match cmd {
         PodCmd::List { json } => {
             let policy = arena_core::retry::RetryPolicy::default();
@@ -1211,6 +1237,14 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
                 println!("\nDry-run only — no pods created. Re-run with --apply to execute.");
                 return Ok(());
             }
+            let spec = spec_with_overrides(cfg, &ov);
+            if !confirm(yes, &format!(
+                "Will create {} pod(s) on {} ({}).",
+                names.len(), provider.name(), provider.describe(&spec)
+            ))? {
+                println!("aborted.");
+                return Ok(());
+            }
             create_pods(provider, cfg, &names, keep_trying, &ov).await?;
         }
 
@@ -1242,6 +1276,18 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
                 return Ok(());
             }
 
+            let spec = spec_with_overrides(cfg, &ov);
+            if !confirm(yes, &format!(
+                "Will create {} pod(s) on {} ({}), wait for endpoints{}{}.",
+                names.len(),
+                provider.name(),
+                provider.describe(&spec),
+                if setup { ", run setup" } else { "" },
+                if proxy { ", deploy proxy" } else { "" }
+            ))? {
+                println!("aborted.");
+                return Ok(());
+            }
             // Create as many as capacity allows; we only wait on the ones we got.
             let created = create_pods(provider, cfg, &names, keep_trying, &ov).await?;
             if created.is_empty() {
@@ -1322,6 +1368,10 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
         PodCmd::Stop { target, apply } => {
             let (id, label) = resolve_target(provider, &target).await?;
             if apply {
+                if !confirm(yes, &format!("Will stop {label}."))? {
+                    println!("aborted.");
+                    return Ok(());
+                }
                 provider.stop_pod(&id).await?;
                 println!("[stopped] {label}");
             } else {
@@ -1332,6 +1382,10 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
         PodCmd::Restart { target, apply } => {
             let (id, label) = resolve_target(provider, &target).await?;
             if apply {
+                if !confirm(yes, &format!("Will restart {label}."))? {
+                    println!("aborted.");
+                    return Ok(());
+                }
                 provider.restart_pod(&id).await?;
                 println!("[restarted] {label}");
             } else {
@@ -1359,6 +1413,10 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
                     );
                     return Ok(());
                 }
+                if !confirm(yes, &format!("Will TERMINATE ALL {} pod(s) — irreversible.", pods.len()))? {
+                    println!("aborted.");
+                    return Ok(());
+                }
                 let total = pods.len();
                 let mut ok = 0;
                 for p in &pods {
@@ -1378,6 +1436,10 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
             (false, Some(target)) => {
                 let (id, label) = resolve_target(provider, &target).await?;
                 if apply {
+                    if !confirm(yes, &format!("Will TERMINATE {label} — irreversible."))? {
+                        println!("aborted.");
+                        return Ok(());
+                    }
                     provider.terminate_pod(&id).await?;
                     println!("[terminated] {label}");
                 } else {
@@ -1390,9 +1452,17 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
         },
 
         PodCmd::Backup { apply, message, week, day } => {
+            if apply && !confirm(yes, "Will commit + push each pod's ARENA tree over SSH.")? {
+                println!("aborted.");
+                return Ok(());
+            }
             handle_backup(provider, cfg, apply, message, week, day).await?;
         }
         PodCmd::Setup { apply, force } => {
+            if apply && !confirm(yes, "Will provision each pod over SSH (deploy key, ~/.name, repo).")? {
+                println!("aborted.");
+                return Ok(());
+            }
             handle_setup(provider, cfg, apply, force).await?;
         }
     }
