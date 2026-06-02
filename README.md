@@ -37,7 +37,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
   - `pods list | create | stop | restart | terminate` (`--provider
     runpod|vast|hetzner`; Vast reads `VAST_API_KEY`, Hetzner reads `HETZNER_API_KEY`
     + `HETZNER_*`). `list` takes `--json`; `stop`/`restart`/`terminate` accept a
-    **machine name or id**. `restart` restarts in place (RunPod restart / Hetzner
+    **machine name or id**. `list --probe` fills the GPU column from `nvidia-smi` over
+    SSH (the provider list API omits GPU type). `restart` restarts in place (RunPod restart / Hetzner
     reboot / Vast stop+start), preserving the machine where supported. `terminate
     --all` tears down the **whole fleet** (confirms first; `--dry-run` lists every
     pod without touching them) — for end-of-program teardown.

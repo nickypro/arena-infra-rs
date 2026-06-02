@@ -169,6 +169,10 @@ enum PodCmd {
         /// Emit JSON instead of a table (for scripting).
         #[arg(long)]
         json: bool,
+        /// Fill the GPU column by querying `nvidia-smi` over SSH (the provider's list
+        /// API omits GPU type). Slower — one SSH per pod.
+        #[arg(long)]
+        probe: bool,
     },
     /// Create N pods on the next free machine names. Requires -n/--count. GPU
     /// type/count and cloud default to config but can be overridden here.
@@ -1308,10 +1312,37 @@ fn emit_proxy_plan(pods: &[arena_core::Pod], cfg: &Config, out: Option<&std::pat
 
 async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bool) -> Result<()> {
     match cmd {
-        PodCmd::List { json } => {
+        PodCmd::List { json, probe } => {
             let policy = arena_core::retry::RetryPolicy::default();
             let mut pods = arena_core::retry::retrying(&policy, || provider.list_pods()).await?;
             pods.sort_by(|a, b| a.name.cmp(&b.name));
+            if probe {
+                // The list API omits GPU type; fill it from nvidia-smi over SSH
+                // (same source as the TUI), concurrently across the fleet.
+                use arena_core::metrics::{self, ProbeOpts};
+                use arena_core::ssh::SshTarget;
+                let mut set = tokio::task::JoinSet::new();
+                for pod in &pods {
+                    if let Ok(mut t) = SshTarget::from_pod(pod, cfg) {
+                        t.connect_timeout_secs = 5;
+                        let name = pod.name.clone();
+                        set.spawn(async move { (name, metrics::fetch(&t, &ProbeOpts::default()).await) });
+                    }
+                }
+                let mut gpus = std::collections::HashMap::new();
+                while let Some(joined) = set.join_next().await {
+                    if let Ok((name, m)) = joined {
+                        if let Some(g) = m.gpu_summary() {
+                            gpus.insert(name, g);
+                        }
+                    }
+                }
+                for p in &mut pods {
+                    if let Some(g) = gpus.get(&p.name) {
+                        p.gpu_type = Some(g.clone());
+                    }
+                }
+            }
             if json {
                 println!("{}", serde_json::to_string_pretty(&pods)?);
                 return Ok(());
