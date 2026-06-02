@@ -305,32 +305,11 @@ struct SpecOverrides {
     cloud: Option<String>,
 }
 
-/// Map a friendly GPU short-name (`A4000`, `3090`, `a100 sxm`, …) to the provider's
-/// full type string. Unknown values pass through unchanged, so a full name still works.
-fn resolve_gpu(s: &str) -> String {
-    let key: String = s.to_ascii_lowercase().chars().filter(|c| c.is_alphanumeric()).collect();
-    let full = match key.as_str() {
-        "a4000" => "NVIDIA RTX A4000",
-        "a4000ada" | "rtx4000ada" | "4000ada" => "NVIDIA RTX 4000 Ada Generation",
-        "3090" | "rtx3090" => "NVIDIA GeForce RTX 3090",
-        "4090" | "rtx4090" => "NVIDIA GeForce RTX 4090",
-        "a40" => "NVIDIA A40",
-        "a100" | "a100pcie" => "NVIDIA A100 80GB PCIe",
-        "a100sxm" | "a100sxm4" => "NVIDIA A100-SXM4-80GB",
-        "a5000" => "NVIDIA RTX A5000",
-        "a6000" => "NVIDIA RTX A6000",
-        "h100" => "NVIDIA H100 80GB HBM3",
-        "l40s" => "NVIDIA L40S",
-        _ => return s.to_string(),
-    };
-    full.to_string()
-}
-
 /// The base spec from config, with any command-line overrides applied.
 fn spec_with_overrides(cfg: &Config, ov: &SpecOverrides) -> PodSpec {
     let mut spec = PodSpec::from_config(cfg);
     if let Some(g) = &ov.gpu {
-        spec.gpu_type = resolve_gpu(g);
+        spec.gpu_type = arena_core::gpu::resolve(g);
     }
     if let Some(n) = ov.gpus {
         spec.gpu_count = n;

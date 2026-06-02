@@ -584,69 +584,17 @@ async fn execute_fleet(
     s
 }
 
-/// A GPU preset for the add-pod picker. Prices are *approximate* RunPod $/hr and differ
-/// by cloud tier (community vs secure); other providers (e.g. Vast) are a marketplace
-/// where the real number varies, so we show a band there. VRAM is exact.
-struct GpuPreset {
-    api: &'static str,
-    label: &'static str,
-    vram: u32,
-    community: f64,
-    secure: f64,
-}
-
-/// Common GPU types, most-wanted first (A4000, 3090, A40, A100). Prices are rough and
-/// will drift — they're shown with a `~` and adapt to the selected provider/cloud.
-const GPU_PRESETS: &[GpuPreset] = &[
-    GpuPreset { api: "NVIDIA RTX A4000", label: "RTX A4000", vram: 16, community: 0.17, secure: 0.32 },
-    GpuPreset { api: "NVIDIA GeForce RTX 3090", label: "RTX 3090", vram: 24, community: 0.22, secure: 0.43 },
-    GpuPreset { api: "NVIDIA A40", label: "A40", vram: 48, community: 0.39, secure: 0.47 },
-    GpuPreset { api: "NVIDIA A100 80GB PCIe", label: "A100 PCIe", vram: 80, community: 1.19, secure: 1.64 },
-    GpuPreset { api: "NVIDIA A100-SXM4-80GB", label: "A100 SXM", vram: 80, community: 1.39, secure: 1.89 },
-    GpuPreset { api: "NVIDIA RTX 4000 Ada Generation", label: "RTX 4000 Ada", vram: 20, community: 0.20, secure: 0.32 },
-    GpuPreset { api: "NVIDIA GeForce RTX 4090", label: "RTX 4090", vram: 24, community: 0.34, secure: 0.69 },
-    GpuPreset { api: "NVIDIA RTX A5000", label: "RTX A5000", vram: 24, community: 0.22, secure: 0.36 },
-    GpuPreset { api: "NVIDIA RTX A6000", label: "RTX A6000", vram: 48, community: 0.49, secure: 0.79 },
-    GpuPreset { api: "NVIDIA H100 80GB HBM3", label: "H100", vram: 80, community: 1.99, secure: 2.79 },
-    GpuPreset { api: "NVIDIA L40S", label: "L40S", vram: 48, community: 0.79, secure: 1.03 },
-];
-
-/// A picker label for a GPU type, including VRAM: `RTX A4000 · 16GB`. Falls back to the
-/// normalized name for an unknown type (e.g. a config default not in the presets).
-fn gpu_label(gpu_type: &str) -> String {
-    match GPU_PRESETS.iter().find(|g| g.api == gpu_type) {
-        Some(g) => format!("{} · {}GB", g.label, g.vram),
-        None => metrics::normalize_gpu_name(gpu_type),
-    }
-}
-
-/// An approximate price string for a GPU *in the currently-selected context*: RunPod
-/// shows the community or secure number; Vast shows a "varies" band; Hetzner (CPU-only)
-/// and unknown GPUs show nothing.
-fn gpu_price_label(gpu_type: &str, provider: &str, cloud_type: Option<&str>) -> Option<String> {
-    let g = GPU_PRESETS.iter().find(|g| g.api == gpu_type)?;
-    match provider {
-        "runpod" => {
-            let secure = cloud_type.map(|c| c.eq_ignore_ascii_case("SECURE")).unwrap_or(false);
-            let p = if secure { g.secure } else { g.community };
-            Some(format!("~${p:.2}/hr"))
-        }
-        "vast" => Some(format!("~${:.2}–{:.2}/hr (varies)", g.community, g.secure)),
-        _ => None,
-    }
-}
-
 /// Build the GPU-type choices for the add-pod form: the config default first (so the
-/// default create matches the CLI), then the presets, de-duplicated.
+/// default create matches the CLI), then the shared core presets, de-duplicated.
 fn gpu_type_choices(cfg: &Config) -> Vec<String> {
     let mut out = Vec::new();
     let default = PodSpec::from_config(cfg).gpu_type;
     if !default.is_empty() {
         out.push(default);
     }
-    for g in GPU_PRESETS {
-        if !out.iter().any(|x| x == g.api) {
-            out.push(g.api.to_string());
+    for api in arena_core::gpu::preset_apis() {
+        if !out.iter().any(|x| *x == api) {
+            out.push(api);
         }
     }
     if out.is_empty() {
@@ -1406,10 +1354,10 @@ fn render_new_pod(f: &mut Frame, form: &NewPodForm) {
             NpField::Provider => ("provider", form.provider_name().to_string()),
             NpField::CloudType => ("cloud", form.cloud_type().unwrap_or("-").to_string()),
             NpField::GpuType => {
-                let price = gpu_price_label(form.gpu_type(), form.provider_name(), form.cloud_type())
+                let price = arena_core::gpu::price_label(form.gpu_type(), form.provider_name(), form.cloud_type())
                     .map(|p| format!("  {p}"))
                     .unwrap_or_default();
-                ("gpu type", format!("{}{price}", gpu_label(form.gpu_type())))
+                ("gpu type", format!("{}{price}", arena_core::gpu::label(form.gpu_type())))
             }
             NpField::GpuCount => ("gpus/pod", form.gpu_count.to_string()),
             NpField::Pods => ("pods", format!("{} of {} free", form.count, form.free.len())),
@@ -1463,11 +1411,11 @@ fn render_new_pod(f: &mut Frame, form: &NewPodForm) {
             lines.push(Line::styled("gpu types (← → · VRAM · ~price for this provider/cloud):", label));
             for (i, g) in form.gpu_types.iter().enumerate() {
                 let mark = if i == form.gpu_idx { "●" } else { "○" };
-                let price = gpu_price_label(g, form.provider_name(), form.cloud_type())
+                let price = arena_core::gpu::price_label(g, form.provider_name(), form.cloud_type())
                     .map(|p| format!("   {p}"))
                     .unwrap_or_default();
                 lines.push(Line::styled(
-                    format!("  {mark} {:<16}{price}", gpu_label(g)),
+                    format!("  {mark} {:<16}{price}", arena_core::gpu::label(g)),
                     if i == form.gpu_idx { cur } else { Style::default() },
                 ));
             }

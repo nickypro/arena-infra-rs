@@ -8,6 +8,7 @@
 pub mod backup;
 pub mod config;
 pub mod error;
+pub mod gpu;
 pub mod metrics;
 pub mod naming;
 pub mod plan;
