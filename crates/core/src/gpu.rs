@@ -27,6 +27,10 @@ pub const PRESETS: &[Gpu] = &[
     Gpu { api: "NVIDIA RTX A6000", label: "RTX A6000", vram_gb: 48, community: 0.49, secure: 0.79 },
     Gpu { api: "NVIDIA H100 80GB HBM3", label: "H100", vram_gb: 80, community: 1.99, secure: 2.79 },
     Gpu { api: "NVIDIA L40S", label: "L40S", vram_gb: 48, community: 0.79, secure: 1.03 },
+    Gpu { api: "NVIDIA L40", label: "L40", vram_gb: 48, community: 0.69, secure: 0.99 },
+    Gpu { api: "NVIDIA GeForce RTX 5090", label: "RTX 5090", vram_gb: 32, community: 0.89, secure: 1.29 },
+    Gpu { api: "NVIDIA RTX 6000 Ada Generation", label: "RTX 6000 Ada", vram_gb: 48, community: 0.77, secure: 1.03 },
+    Gpu { api: "NVIDIA RTX PRO 6000 Blackwell Workstation Edition", label: "RTX PRO 6000", vram_gb: 96, community: 1.79, secure: 2.49 },
 ];
 
 /// The known GPU matching a provider type string, if any.
@@ -55,6 +59,10 @@ pub fn resolve(s: &str) -> String {
         "a6000" => "NVIDIA RTX A6000",
         "h100" => "NVIDIA H100 80GB HBM3",
         "l40s" => "NVIDIA L40S",
+        "l40" => "NVIDIA L40",
+        "5090" | "rtx5090" => "NVIDIA GeForce RTX 5090",
+        "rtx6000ada" | "6000ada" | "a6000ada" => "NVIDIA RTX 6000 Ada Generation",
+        "rtxpro6000" | "pro6000" | "rtx6000pro" => "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
         _ => return s.to_string(),
     };
     api.to_string()
@@ -92,6 +100,10 @@ mod tests {
         assert_eq!(resolve("A4000"), "NVIDIA RTX A4000");
         assert_eq!(resolve("a100 sxm"), "NVIDIA A100-SXM4-80GB");
         assert_eq!(resolve("3090"), "NVIDIA GeForce RTX 3090");
+        assert_eq!(resolve("5090"), "NVIDIA GeForce RTX 5090");
+        assert_eq!(resolve("A6000 Ada"), "NVIDIA RTX 6000 Ada Generation");
+        assert_eq!(resolve("pro 6000"), "NVIDIA RTX PRO 6000 Blackwell Workstation Edition");
+        assert_eq!(resolve("L40"), "NVIDIA L40");
         // a full/unknown string is left as-is
         assert_eq!(resolve("NVIDIA Something Custom"), "NVIDIA Something Custom");
     }
