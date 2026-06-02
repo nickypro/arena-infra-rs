@@ -24,13 +24,16 @@ pub struct SshTarget {
     pub user: String,
     pub host: String,
     pub port: u16,
-    pub key_path: Option<String>,
+    /// Identity files to offer, in order — ssh tries each, so the tool gets in with
+    /// whichever key a pod authorizes (handy for a mixed fleet across cohorts).
+    pub key_paths: Vec<String>,
     pub connect_timeout_secs: u32,
 }
 
 impl SshTarget {
-    /// Build from a pod's current SSH endpoint plus config (`SSH_USER`,
-    /// `SHARED_SSH_KEY_PATH`). Errors if the pod has no endpoint yet.
+    /// Build from a pod's current SSH endpoint plus config. Offers every configured key
+    /// (`SHARED_SSH_KEY_PATH`, `GIT_SSH_KEY_LOCAL`, and comma-separated `EXTRA_SSH_KEYS`)
+    /// so a pod authorized by any of them is reachable. Errors if no endpoint yet.
     pub fn from_pod(pod: &Pod, cfg: &Config) -> Result<Self> {
         let host = pod
             .ssh_ip
@@ -43,7 +46,7 @@ impl SshTarget {
             user: cfg.get("SSH_USER").unwrap_or("root").to_string(),
             host,
             port,
-            key_path: cfg.get("SHARED_SSH_KEY_PATH").map(resolve_key_path),
+            key_paths: config_ssh_keys(cfg),
             connect_timeout_secs: 10,
         })
     }
@@ -55,7 +58,7 @@ impl SshTarget {
             user: user.to_string(),
             host: host.to_string(),
             port,
-            key_path: key_path.map(resolve_key_path),
+            key_paths: key_path.map(resolve_key_path).into_iter().collect(),
             connect_timeout_secs: 10,
         }
     }
@@ -72,7 +75,7 @@ impl SshTarget {
             "-o".into(),
             format!("ConnectTimeout={}", self.connect_timeout_secs),
         ];
-        if let Some(key) = &self.key_path {
+        for key in &self.key_paths {
             a.push("-i".into());
             a.push(key.clone());
         }
@@ -99,7 +102,7 @@ impl SshTarget {
             "-o".into(),
             format!("ConnectTimeout={}", self.connect_timeout_secs),
         ];
-        if let Some(key) = &self.key_path {
+        for key in &self.key_paths {
             a.push("-i".into());
             a.push(key.clone());
         }
@@ -129,6 +132,70 @@ pub fn resolve_key_path(configured: &str) -> String {
     resolve_key_with(configured, home.as_deref(), |p| {
         std::fs::File::open(p).is_ok()
     })
+}
+
+/// The public half of a configured private key (for authorizing it on pods): resolves
+/// the path, prefers an existing `<key>.pub`, else derives it with `ssh-keygen -y`.
+pub fn public_key_for(private_path: &str) -> Option<String> {
+    let resolved = resolve_key_path(private_path);
+    let pubkey = std::fs::read_to_string(format!("{resolved}.pub")).ok().or_else(|| {
+        std::process::Command::new("ssh-keygen")
+            .args(["-y", "-f", &resolved])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    })?;
+    let pubkey = pubkey.trim().to_string();
+    (!pubkey.is_empty()).then_some(pubkey)
+}
+
+/// The public keys that should be authorized on every pod (the shared key + the git
+/// deploy key), for `PUBLIC_KEY` injection at create and `setup`'s authorized_keys.
+/// (The provider's own account key — e.g. `arena_admin` — is injected automatically.)
+pub fn authorized_pubkeys(cfg: &Config) -> Vec<String> {
+    let mut out = Vec::new();
+    for key in ["SHARED_SSH_KEY_PATH", "GIT_SSH_KEY_LOCAL"] {
+        if let Some(p) = cfg.get(key).filter(|s| !s.is_empty()) {
+            if let Some(pk) = public_key_for(p) {
+                if !out.contains(&pk) {
+                    out.push(pk);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The ordered, de-duplicated list of SSH identity files the tool should offer pods:
+/// `SHARED_SSH_KEY_PATH`, `GIT_SSH_KEY_LOCAL`, then comma-separated `EXTRA_SSH_KEYS`
+/// (e.g. a previous cohort's key like `arena7_key`). Each is resolved to a readable
+/// copy; if none are readable, all are kept so the resulting error names what was tried.
+pub fn config_ssh_keys(cfg: &Config) -> Vec<String> {
+    let mut all: Vec<String> = Vec::new();
+    let mut add = |raw: &str| {
+        let r = resolve_key_path(raw);
+        if !all.contains(&r) {
+            all.push(r);
+        }
+    };
+    if let Some(s) = cfg.get("SHARED_SSH_KEY_PATH").filter(|s| !s.is_empty()) {
+        add(s);
+    }
+    if let Some(g) = cfg.get("GIT_SSH_KEY_LOCAL").filter(|s| !s.is_empty()) {
+        add(g);
+    }
+    if let Some(extra) = cfg.get("EXTRA_SSH_KEYS") {
+        for p in extra.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            add(p);
+        }
+    }
+    let readable: Vec<String> = all.iter().filter(|p| std::fs::File::open(p).is_ok()).cloned().collect();
+    if readable.is_empty() {
+        all
+    } else {
+        readable
+    }
 }
 
 /// The pure core of [`resolve_key_path`], with `$HOME` and the readability check
@@ -206,7 +273,7 @@ mod tests {
             user: "root".into(),
             host: "1.2.3.4".into(),
             port: 22001,
-            key_path: Some("/root/.ssh/arena8_key".into()),
+            key_paths: vec!["/root/.ssh/arena8_key".into()],
             connect_timeout_secs: 10,
         }
     }
@@ -224,9 +291,13 @@ mod tests {
     }
 
     #[test]
-    fn omits_identity_flag_without_key() {
+    fn offers_multiple_keys_or_none() {
         let mut t = target();
-        t.key_path = None;
+        t.key_paths = vec!["/a/key1".into(), "/a/key2".into()];
+        let joined = t.ssh_args().join(" ");
+        assert!(joined.contains("-i /a/key1"));
+        assert!(joined.contains("-i /a/key2")); // tries each
+        t.key_paths.clear();
         assert!(!t.ssh_args().join(" ").contains("-i "));
     }
 

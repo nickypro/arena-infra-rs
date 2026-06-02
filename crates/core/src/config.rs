@@ -29,7 +29,7 @@ impl Config {
     /// that an operator legitimately needs to set per-run without editing the read-only
     /// prod file (e.g. the iteration start date). These may be *introduced* from the
     /// environment, not just overridden.
-    const ENV_INTRODUCIBLE: &'static [&'static str] = &["ARENA_START_DATE"];
+    const ENV_INTRODUCIBLE: &'static [&'static str] = &["ARENA_START_DATE", "EXTRA_SSH_KEYS"];
 
     /// Let environment variables override values from the file: any key already in the
     /// config can be overridden by an env var of the same name (e.g.

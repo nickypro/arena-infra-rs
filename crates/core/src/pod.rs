@@ -44,9 +44,13 @@ impl PodSpec {
         let first = |keys: &[&str]| keys.iter().find_map(|k| cfg.get(k).filter(|v| !v.is_empty()));
         let first_parsed =
             |keys: &[&str], default| keys.iter().find_map(|k| cfg.get_parsed(k)).unwrap_or(default);
+        // RunPod adds PUBLIC_KEY (newline-joined) to ~/.ssh/authorized_keys at boot, so
+        // the created pod authorizes the shared key + the deploy key (the account's own
+        // key, e.g. arena_admin, is injected by the provider automatically).
         let mut env = Vec::new();
-        if let Some(pubkey) = shared_public_key(cfg) {
-            env.push(("PUBLIC_KEY".to_string(), pubkey));
+        let pubkeys = crate::ssh::authorized_pubkeys(cfg);
+        if !pubkeys.is_empty() {
+            env.push(("PUBLIC_KEY".to_string(), pubkeys.join("\n")));
         }
         PodSpec {
             name: String::new(),
@@ -60,22 +64,4 @@ impl PodSpec {
             env,
         }
     }
-}
-
-/// The shared SSH key's public half, for injecting as the pod's `PUBLIC_KEY`. Prefers
-/// an existing `<key>.pub`; if absent, derives it from the private key via
-/// `ssh-keygen -y`. None if no key is configured / it can't be read.
-fn shared_public_key(cfg: &Config) -> Option<String> {
-    let keypath = cfg.get("SHARED_SSH_KEY_PATH").filter(|s| !s.is_empty())?;
-    let resolved = crate::ssh::resolve_key_path(keypath);
-    let pubkey = std::fs::read_to_string(format!("{resolved}.pub")).ok().or_else(|| {
-        std::process::Command::new("ssh-keygen")
-            .args(["-y", "-f", &resolved])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-    })?;
-    let pubkey = pubkey.trim().to_string();
-    (!pubkey.is_empty()).then_some(pubkey)
 }

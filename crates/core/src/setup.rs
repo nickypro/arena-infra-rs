@@ -33,6 +33,8 @@ pub struct SetupConfig {
     pub branch: String,
     /// Machine-name prefix, used to derive the short name for `~/.name`.
     pub prefix: String,
+    /// Public keys to ensure in `~/.ssh/authorized_keys` (shared key + deploy key).
+    pub authorized_pubkeys: Vec<String>,
 }
 
 impl SetupConfig {
@@ -61,6 +63,7 @@ impl SetupConfig {
             repo_url: format!("git@github.com:{owner}/{name}.git"),
             branch: cfg.get("DEFAULT_BRANCH").unwrap_or("main").to_string(),
             prefix: cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena").to_string(),
+            authorized_pubkeys: crate::ssh::authorized_pubkeys(cfg),
         })
     }
 
@@ -87,15 +90,25 @@ impl SetupConfig {
              chmod 600 \"$HOME/.ssh/config\""
         );
 
-        // Add the deploy key's public half to the authorized_keys allow-list, so the
-        // same key can SSH into the pod. We derive the public key on the pod from the
-        // private key we just copied (`ssh-keygen -y`), append only if not already
-        // present, and tolerate a missing key without aborting `set -e`.
-        let authorized_keys = format!(
-            "PUB=$(ssh-keygen -y -f {key} 2>/dev/null) && touch \"$HOME/.ssh/authorized_keys\" && \
-             chmod 600 \"$HOME/.ssh/authorized_keys\" && \
-             (grep -qxF \"$PUB\" \"$HOME/.ssh/authorized_keys\" || echo \"$PUB\" >> \"$HOME/.ssh/authorized_keys\")"
+        // Ensure the shared key + deploy key are in authorized_keys (so the tool and
+        // participants can SSH in with whichever they hold). Each is appended only if
+        // not already present. (The provider's account key is injected automatically.)
+        let mut ak = String::from(
+            "touch \"$HOME/.ssh/authorized_keys\" && chmod 600 \"$HOME/.ssh/authorized_keys\"",
         );
+        for pk in &self.authorized_pubkeys {
+            let qpk = q(pk);
+            ak.push_str(&format!(
+                " && (grep -qxF {qpk} \"$HOME/.ssh/authorized_keys\" || echo {qpk} >> \"$HOME/.ssh/authorized_keys\")"
+            ));
+        }
+        // Also re-derive the on-pod deploy key's public half and add it (covers the case
+        // where the local deploy-key .pub differs from what's on the pod).
+        ak.push_str(&format!(
+            " && PUB=$(ssh-keygen -y -f {key} 2>/dev/null) && \
+             (grep -qxF \"$PUB\" \"$HOME/.ssh/authorized_keys\" || echo \"$PUB\" >> \"$HOME/.ssh/authorized_keys\")"
+        ));
+        let authorized_keys = ak;
 
         // Branch update: force => checkout default + hard reset; else stay put.
         let git_update = if force {
@@ -147,6 +160,7 @@ mod tests {
             repo_url: "git@github.com:styme3279/ARENA_3.0.git".into(),
             branch: "main".into(),
             prefix: "arena8".into(),
+            authorized_pubkeys: vec!["ssh-ed25519 AAAASHARED shared".into()],
         }
     }
 
@@ -163,10 +177,10 @@ mod tests {
         // github.com ssh config block
         assert!(c.contains("# BEGIN arena-infra github.com"));
         assert!(c.contains("IdentityFile /root/.ssh/id_ed25519"));
-        // deploy key added to the authorized_keys allow-list (idempotently)
+        // configured pubkeys + the on-pod deploy key added to authorized_keys (idempotent)
+        assert!(c.contains("grep -qxF 'ssh-ed25519 AAAASHARED shared'"));
         assert!(c.contains("ssh-keygen -y -f /root/.ssh/id_ed25519"));
         assert!(c.contains(r#"grep -qxF "$PUB" "$HOME/.ssh/authorized_keys""#));
-        assert!(c.contains(r#"echo "$PUB" >> "$HOME/.ssh/authorized_keys""#));
         // repo wiring
         assert!(c.contains("git remote set-url origin 'git@github.com:styme3279/ARENA_3.0.git'"));
         assert!(c.contains("git fetch origin"));

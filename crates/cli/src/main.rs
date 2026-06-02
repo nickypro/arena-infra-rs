@@ -1023,9 +1023,7 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
     let readable = |p: &str| std::fs::File::open(p).is_ok();
     if let Some(k) = cfg.get("SHARED_SSH_KEY_PATH") {
         // Resolve the same way pods/proxy do (readable ~/.ssh fallback).
-        let resolved = arena_core::ssh::SshTarget::for_host("x", "x", 22, Some(k))
-            .key_path
-            .unwrap_or_default();
+        let resolved = arena_core::ssh::resolve_key_path(k);
         let ok = readable(&resolved);
         println!(
             "  {} shared SSH key             {}{}",
