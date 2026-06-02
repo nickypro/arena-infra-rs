@@ -117,9 +117,13 @@ impl SetupConfig {
                 b = q(branch)
             )
         } else {
+            // Stay on the current branch. On the default branch, hard-reset to origin;
+            // otherwise (e.g. an autocommit-wNdM branch with no upstream) only fast-
+            // forward if it actually tracks a remote — never fail the whole setup.
             format!(
                 "CUR=$(git rev-parse --abbrev-ref HEAD); \
-                 if [ \"$CUR\" = {b} ]; then git reset --hard origin/{b}; else git pull; fi",
+                 if [ \"$CUR\" = {b} ]; then git reset --hard origin/{b}; \
+                 else (git rev-parse '@{{u}}' >/dev/null 2>&1 && git pull --ff-only) || true; fi",
                 b = q(branch)
             )
         };
