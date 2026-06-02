@@ -2,10 +2,12 @@
 //!
 //! It lists pods from the configured provider and, for each pod with an SSH endpoint,
 //! fetches GPU stats (`nvidia-smi`) and an optional operator-defined progress signal
-//! (`PROGRESS_CMD`) over SSH, auto-refreshing on an interval. Beyond viewing, it is
-//! interactive: move the cursor with `↑/↓`/`j/k`, open a per-pod detail pane (per-GPU
-//! breakdown + util/temp sparklines) with `Enter`, and act on the selected pod with
-//! `a` (restart / stop / terminate / backup / setup).
+//! (`PROGRESS_CMD`) over SSH. Fetching runs in a **background task** so the UI never
+//! blocks: the loop redraws and handles keys continuously while fresh data lands as
+//! soon as each sweep finishes. Move the cursor with `↑/↓`/`j/k`, open a per-pod detail
+//! pane (per-GPU breakdown + util/temp sparklines) with `Enter`, act on the selected
+//! pod with `a` (restart / stop / terminate / backup / setup), `f` cycles the refresh
+//! cadence, `r` refreshes now.
 //!
 //! Safety against live prod is built into the *interaction*, not bolted on: a mutating
 //! action always pops a confirmation modal. Lifecycle actions (restart/stop/terminate)
@@ -14,15 +16,15 @@
 //! pod without going through that modal — the dashboard's reads stay reads.
 //!
 //! Provider is chosen by `ARENA_PROVIDER` (default `runpod`); config path by
-//! `ARENA_CONFIG`; auto-refresh seconds by `ARENA_REFRESH_SECS` (default 20). Metrics
-//! for the whole fleet are fetched concurrently so one slow or down pod doesn't stall
-//! the others.
+//! `ARENA_CONFIG`; initial cadence by `ARENA_REFRESH_SECS` (default 5).
 
 mod state;
 
 use std::collections::HashMap;
 use std::io::{stdout, Stdout};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -35,6 +37,7 @@ use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Sparkline, Table, TableState, Wrap},
 };
+use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
 use arena_core::metrics::{self, PodMetrics};
@@ -45,10 +48,14 @@ use arena_core::{Config, Pod};
 use state::{summarize, Action, Confirm, FleetSummary, History};
 
 const DEFAULT_CONFIG: &str = "/home/dev/prod-ro/config.env";
+/// Shorter than backup/setup's 10s: a down pod shouldn't stall a whole metrics sweep.
+const METRICS_CONNECT_TIMEOUT: u32 = 4;
+/// The cadences `f` cycles through (seconds).
+const REFRESH_STEPS: &[u64] = &[2, 5, 10, 20, 60];
 
-/// What the UI is currently showing. `List`/`Detail` are the normal views (and the
-/// only ones that auto-refresh); the rest are modal and pause auto-refresh so an
-/// in-progress confirmation can't be yanked out from under the operator.
+/// What the UI is currently showing. `List`/`Detail` are the normal views; the rest
+/// are modal (the background fetch keeps running, but a modal can't be acted on by a
+/// stray refresh — it only reads shared data).
 #[derive(Debug, Clone)]
 enum Mode {
     List,
@@ -57,92 +64,34 @@ enum Mode {
     Menu,
     /// A pending action awaiting confirmation.
     Confirm(Confirm),
-    /// The outcome of the last action; any key dismisses (then we refresh).
+    /// The outcome of the last action; any key dismisses (then we nudge a refresh).
     Result(String),
 }
 
-struct App {
-    provider: Box<dyn Provider>,
-    provider_name: String,
-    config_path: String,
-    cfg: Config,
-    progress_cmd: Option<String>,
+/// Live fleet data, written by the background fetch task and read by the UI thread.
+/// Guarded by a std `Mutex` held only for brief, synchronous critical sections — never
+/// across an `.await`, so the fetcher and the UI never deadlock.
+#[derive(Default)]
+struct Shared {
     pods: Vec<Pod>,
     metrics: HashMap<String, PodMetrics>,
     history: HashMap<String, History>,
     summary: FleetSummary,
     status: String,
     last_refresh: Option<Instant>,
-    auto_refresh: Duration,
-    mode: Mode,
-    /// Cursor into `pods` (kept clamped to a valid row).
-    selected: usize,
+    /// True while a sweep is in flight (drives the footer's ⟳ indicator).
+    refreshing: bool,
 }
 
-impl App {
-    async fn refresh(&mut self) {
-        let mut pods = match self.provider.list_pods().await {
-            Ok(p) => p,
-            Err(e) => {
-                self.status = format!("error listing pods: {e}");
-                return;
-            }
-        };
-        pods.sort_by(|a, b| a.name.cmp(&b.name));
-
-        // Fan out metric fetches across the fleet; one down pod can't stall the rest.
-        let mut set = JoinSet::new();
-        for pod in &pods {
-            if let Ok(target) = SshTarget::from_pod(pod, &self.cfg) {
-                let name = pod.name.clone();
-                let progress_cmd = self.progress_cmd.clone();
-                set.spawn(async move {
-                    (name, metrics::fetch(&target, progress_cmd.as_deref()).await)
-                });
-            }
-        }
-        let mut fresh = HashMap::new();
-        while let Some(joined) = set.join_next().await {
-            if let Ok((name, m)) = joined {
-                fresh.insert(name, m);
-            }
-        }
-
-        // Record a sample per pod so the sparklines have a steady time axis.
-        for pod in &pods {
-            let m = fresh.get(&pod.name);
-            let entry = self.history.entry(pod.name.clone()).or_default();
-            entry.push(m.and_then(|m| m.mean_util()), m.and_then(|m| m.max_temp()));
-        }
-
-        self.summary = summarize(&pods, &fresh);
-        self.metrics = fresh;
-        self.pods = pods;
-        self.clamp_selection();
-        self.last_refresh = Some(Instant::now());
-        self.status = format!(
-            "{} pods · {} reporting{}",
-            self.summary.pods,
-            self.summary.reporting,
-            if self.summary.unreachable > 0 {
-                format!(" · {} unreachable", self.summary.unreachable)
-            } else {
-                String::new()
-            }
-        );
-    }
-
-    fn clamp_selection(&mut self) {
-        if self.pods.is_empty() {
-            self.selected = 0;
-        } else if self.selected >= self.pods.len() {
-            self.selected = self.pods.len() - 1;
-        }
-    }
-
-    fn selected_pod(&self) -> Option<&Pod> {
-        self.pods.get(self.selected)
-    }
+/// UI-thread-only state: what the operator is looking at / interacting with. Kept
+/// separate from `Shared` so key handling never contends with the fetcher.
+struct Ui {
+    provider_name: String,
+    config_path: String,
+    cfg: Config,
+    mode: Mode,
+    /// Cursor into `Shared::pods` (clamped to a valid row each frame).
+    selected: usize,
 }
 
 #[tokio::main]
@@ -152,34 +101,133 @@ async fn main() -> Result<()> {
     let cfg = Config::load(&PathBuf::from(&config_path))
         .with_context(|| format!("loading config {config_path}"))?;
     let provider_name = std::env::var("ARENA_PROVIDER").unwrap_or_else(|_| "runpod".to_string());
-    let provider = arena_core::provider::build(&provider_name, &cfg)?;
+    let provider: Arc<dyn Provider> =
+        Arc::from(arena_core::provider::build(&provider_name, &cfg)?);
     let progress_cmd = cfg.get("PROGRESS_CMD").map(String::from);
-    let auto_refresh = Duration::from_secs(
-        std::env::var("ARENA_REFRESH_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(20),
-    );
+    let initial_secs = std::env::var("ARENA_REFRESH_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
 
-    let mut app = App {
-        provider,
+    let shared = Arc::new(Mutex::new(Shared {
+        status: "loading…".into(),
+        ..Default::default()
+    }));
+    let interval = Arc::new(AtomicU64::new(initial_secs));
+    let nudge = Arc::new(Notify::new());
+
+    // Background fetcher: keeps `shared` fresh without blocking the UI.
+    tokio::spawn(fetch_loop(
+        provider.clone(),
+        cfg.clone(),
+        progress_cmd,
+        shared.clone(),
+        interval.clone(),
+        nudge.clone(),
+    ));
+
+    let ui = Ui {
         provider_name,
         config_path,
         cfg,
-        progress_cmd,
-        pods: Vec::new(),
-        metrics: HashMap::new(),
-        history: HashMap::new(),
-        summary: FleetSummary::default(),
-        status: "loading…".into(),
-        last_refresh: None,
-        auto_refresh,
         mode: Mode::List,
         selected: 0,
     };
-    app.refresh().await;
 
     let mut terminal = setup_terminal()?;
-    let res = run(&mut terminal, &mut app).await;
+    let res = run(&mut terminal, &shared, &provider, &interval, &nudge, ui).await;
     restore_terminal(&mut terminal)?;
     res
+}
+
+/// The background refresh loop: list pods, fetch their metrics concurrently, publish to
+/// `shared`, then wait for the cadence to elapse *or* a manual nudge (`r`/`f`/action),
+/// whichever comes first.
+async fn fetch_loop(
+    provider: Arc<dyn Provider>,
+    cfg: Config,
+    progress_cmd: Option<String>,
+    shared: Arc<Mutex<Shared>>,
+    interval: Arc<AtomicU64>,
+    nudge: Arc<Notify>,
+) {
+    loop {
+        shared.lock().unwrap().refreshing = true;
+
+        match provider.list_pods().await {
+            Err(e) => {
+                // Keep the last known pods on screen; just report the error.
+                let mut s = shared.lock().unwrap();
+                s.status = format!("list error: {e}");
+                s.refreshing = false;
+            }
+            Ok(mut pods) => {
+                pods.sort_by(|a, b| a.name.cmp(&b.name));
+                let metrics = fetch_metrics(&pods, &cfg, progress_cmd.as_deref()).await;
+                let summary = summarize(&pods, &metrics);
+                let status = status_line(&summary);
+
+                let mut s = shared.lock().unwrap();
+                for pod in &pods {
+                    let m = metrics.get(&pod.name);
+                    s.history
+                        .entry(pod.name.clone())
+                        .or_default()
+                        .push(m.and_then(|m| m.mean_util()), m.and_then(|m| m.max_temp()));
+                }
+                s.summary = summary;
+                s.status = status;
+                s.metrics = metrics;
+                s.pods = pods;
+                s.last_refresh = Some(Instant::now());
+                s.refreshing = false;
+            }
+        }
+
+        let secs = interval.load(Ordering::Relaxed).max(1);
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(secs)) => {}
+            _ = nudge.notified() => {}
+        }
+    }
+}
+
+/// Fan metric fetches out across the fleet concurrently, with a short connect timeout
+/// so a single unreachable pod can't hold up the sweep.
+async fn fetch_metrics(
+    pods: &[Pod],
+    cfg: &Config,
+    progress_cmd: Option<&str>,
+) -> HashMap<String, PodMetrics> {
+    let mut set = JoinSet::new();
+    for pod in pods {
+        if let Ok(mut target) = SshTarget::from_pod(pod, cfg) {
+            target.connect_timeout_secs = METRICS_CONNECT_TIMEOUT;
+            let name = pod.name.clone();
+            let pc = progress_cmd.map(|s| s.to_string());
+            set.spawn(async move { (name, metrics::fetch(&target, pc.as_deref()).await) });
+        }
+    }
+    let mut fresh = HashMap::new();
+    while let Some(joined) = set.join_next().await {
+        if let Ok((name, m)) = joined {
+            fresh.insert(name, m);
+        }
+    }
+    fresh
+}
+
+fn status_line(s: &FleetSummary) -> String {
+    format!(
+        "{} pods · {} reporting{}",
+        s.pods,
+        s.reporting,
+        if s.unreachable > 0 {
+            format!(" · {} unreachable", s.unreachable)
+        } else {
+            String::new()
+        }
+    )
 }
 
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
@@ -196,22 +244,41 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
     Ok(())
 }
 
-async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
-    loop {
-        terminal.draw(|f| ui(f, app))?;
+/// Read the currently selected pod (a clone, so we don't hold the lock).
+fn selected_pod(shared: &Arc<Mutex<Shared>>, idx: usize) -> Option<Pod> {
+    shared.lock().unwrap().pods.get(idx).cloned()
+}
 
-        // Auto-refresh only in the non-modal views — never mid-confirmation.
-        let modal = !matches!(app.mode, Mode::List | Mode::Detail);
-        let due = !modal
-            && app.last_refresh.map(|t| t.elapsed() >= app.auto_refresh).unwrap_or(true);
-        if due {
-            app.status = "refreshing…".into();
-            terminal.draw(|f| ui(f, app))?;
-            app.refresh().await;
-            continue;
+/// Advance the cadence to the next step in `REFRESH_STEPS` (wrapping).
+fn cycle_interval(interval: &AtomicU64) {
+    let cur = interval.load(Ordering::Relaxed);
+    let idx = REFRESH_STEPS.iter().position(|&s| s == cur).unwrap_or(usize::MAX);
+    let next = REFRESH_STEPS[idx.wrapping_add(1) % REFRESH_STEPS.len()];
+    interval.store(next, Ordering::Relaxed);
+}
+
+async fn run(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    shared: &Arc<Mutex<Shared>>,
+    provider: &Arc<dyn Provider>,
+    interval: &AtomicU64,
+    nudge: &Notify,
+    mut ui: Ui,
+) -> Result<()> {
+    loop {
+        // Clamp the cursor in case the fleet shrank under us.
+        let len = shared.lock().unwrap().pods.len();
+        ui.selected = if len == 0 { 0 } else { ui.selected.min(len - 1) };
+
+        let secs = interval.load(Ordering::Relaxed);
+        {
+            let s = shared.lock().unwrap();
+            terminal.draw(|f| view(f, &s, &ui, secs))?;
         }
 
-        if !event::poll(Duration::from_millis(250))? {
+        // Short poll: the loop keeps redrawing (~7 fps) so live data and the
+        // "updated Ns ago" line stay current without any key press.
+        if !event::poll(Duration::from_millis(150))? {
             continue;
         }
         let Event::Key(k) = event::read()? else { continue };
@@ -225,58 +292,52 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -
         }
         let code = k.code;
 
-        // Clone the mode so we can freely mutate `app` while deciding what to do.
-        match app.mode.clone() {
+        match ui.mode.clone() {
             Mode::List | Mode::Detail => {
-                let in_detail = matches!(app.mode, Mode::Detail);
+                let in_detail = matches!(ui.mode, Mode::Detail);
                 match code {
                     KeyCode::Char('q') => break,
                     KeyCode::Esc => {
                         if in_detail {
-                            app.mode = Mode::List;
+                            ui.mode = Mode::List;
                         } else {
                             break;
                         }
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
-                        app.selected = app.selected.saturating_sub(1);
+                        ui.selected = ui.selected.saturating_sub(1);
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        if app.selected + 1 < app.pods.len() {
-                            app.selected += 1;
+                        if ui.selected + 1 < len {
+                            ui.selected += 1;
                         }
                     }
                     KeyCode::Enter => {
-                        if app.selected_pod().is_some() {
-                            app.mode = Mode::Detail;
+                        if len > 0 {
+                            ui.mode = Mode::Detail;
                         }
                     }
-                    KeyCode::Char('r') => {
-                        app.status = "refreshing…".into();
-                        terminal.draw(|f| ui(f, app))?;
-                        app.refresh().await;
+                    KeyCode::Char('r') => nudge.notify_one(),
+                    KeyCode::Char('f') => {
+                        cycle_interval(interval);
+                        nudge.notify_one(); // apply a shorter cadence immediately
                     }
                     KeyCode::Char('a') => {
-                        if app.selected_pod().is_some() {
-                            app.mode = Mode::Menu;
+                        if len > 0 {
+                            ui.mode = Mode::Menu;
                         }
                     }
                     _ => {}
                 }
             }
             Mode::Menu => match code {
-                KeyCode::Esc => app.mode = Mode::List,
+                KeyCode::Esc => ui.mode = Mode::List,
                 KeyCode::Char(ch) => {
                     if let (Some(action), Some(pod)) =
-                        (Action::from_key(ch), app.selected_pod().cloned())
+                        (Action::from_key(ch), selected_pod(shared, ui.selected))
                     {
-                        let preview = build_preview(&app.cfg, action, &pod);
-                        app.mode = Mode::Confirm(Confirm::new(
-                            action,
-                            pod.name,
-                            pod.id,
-                            preview,
-                        ));
+                        let preview = build_preview(&ui.cfg, action, &pod);
+                        ui.mode = Mode::Confirm(Confirm::new(action, pod.name, pod.id, preview));
                     }
                 }
                 _ => {}
@@ -284,55 +345,59 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -
             Mode::Confirm(mut c) => {
                 let typed = c.action.requires_typed_name();
                 match code {
-                    KeyCode::Esc => app.mode = Mode::List,
-                    // Apply: typed-name actions need the exact name; others confirm on y/Enter.
+                    KeyCode::Esc => ui.mode = Mode::List,
                     KeyCode::Enter if c.is_satisfied() => {
-                        apply_action(terminal, app, &c).await?;
+                        apply_action(terminal, shared, &mut ui, provider, secs, &c).await?;
+                        nudge.notify_one();
                     }
                     KeyCode::Char('y') if !typed => {
-                        apply_action(terminal, app, &c).await?;
+                        apply_action(terminal, shared, &mut ui, provider, secs, &c).await?;
+                        nudge.notify_one();
                     }
-                    KeyCode::Char('n') if !typed => app.mode = Mode::List,
+                    KeyCode::Char('n') if !typed => ui.mode = Mode::List,
                     KeyCode::Backspace if typed => {
                         c.typed.pop();
-                        app.mode = Mode::Confirm(c);
+                        ui.mode = Mode::Confirm(c);
                     }
                     KeyCode::Char(ch) if typed => {
                         c.typed.push(ch);
-                        app.mode = Mode::Confirm(c);
+                        ui.mode = Mode::Confirm(c);
                     }
-                    _ => app.mode = Mode::Confirm(c),
+                    _ => ui.mode = Mode::Confirm(c),
                 }
             }
             Mode::Result(_) => {
-                // Any key dismisses the result, then re-sync with reality.
-                app.mode = Mode::List;
-                app.status = "refreshing…".into();
-                terminal.draw(|f| ui(f, app))?;
-                app.refresh().await;
+                // Any key dismisses the result, then nudge a refresh to re-sync.
+                ui.mode = Mode::List;
+                nudge.notify_one();
             }
         }
     }
     Ok(())
 }
 
-/// Run a confirmed action against its pod, show a busy line, then park the outcome in
-/// a result modal. The pod is looked up fresh by id (it may have moved in the list).
+/// Run a confirmed action against its pod, show a busy line, then park the outcome in a
+/// result modal. The pod is looked up fresh by id (it may have moved in the list).
 async fn apply_action(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    app: &mut App,
+    shared: &Arc<Mutex<Shared>>,
+    ui: &mut Ui,
+    provider: &Arc<dyn Provider>,
+    secs: u64,
     c: &Confirm,
 ) -> Result<()> {
-    let Some(pod) = app.pods.iter().find(|p| p.id == c.pod_id).cloned() else {
-        app.mode = Mode::Result(format!("{} is gone — refresh", c.pod_name));
+    let Some(pod) = shared.lock().unwrap().pods.iter().find(|p| p.id == c.pod_id).cloned() else {
+        ui.mode = Mode::Result(format!("{} is gone — refresh", c.pod_name));
         return Ok(());
     };
-    app.status = format!("{}ing {}…", c.action.label(), pod.name);
-    app.mode = Mode::Result(format!("{}ing {}…", c.action.label(), pod.name));
-    terminal.draw(|f| ui(f, app))?;
+    ui.mode = Mode::Result(format!("{}ing {}…", c.action.label(), pod.name));
+    {
+        let s = shared.lock().unwrap();
+        terminal.draw(|f| view(f, &s, ui, secs))?;
+    }
 
-    let msg = execute(app.provider.as_ref(), &app.cfg, c.action, &pod).await;
-    app.mode = Mode::Result(msg);
+    let msg = execute(provider.as_ref(), &ui.cfg, c.action, &pod).await;
+    ui.mode = Mode::Result(msg);
     Ok(())
 }
 
@@ -488,7 +553,7 @@ fn detail_cell(m: Option<&PodMetrics>) -> (String, Style) {
     }
 }
 
-fn ui(f: &mut Frame, app: &App) {
+fn view(f: &mut Frame, shared: &Shared, ui: &Ui, secs: u64) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -501,30 +566,28 @@ fn ui(f: &mut Frame, app: &App) {
 
     let title = Paragraph::new(format!(
         "arena-infra-rs dashboard · provider: {} · {}",
-        app.provider_name, app.config_path
+        ui.provider_name, ui.config_path
     ))
     .block(Block::default().borders(Borders::ALL));
     f.render_widget(title, chunks[0]);
 
-    f.render_widget(summary_line(&app.summary), chunks[1]);
+    f.render_widget(summary_line(&shared.summary), chunks[1]);
 
-    // In Detail mode, split the body so the table and the per-pod pane sit side by side.
-    if matches!(app.mode, Mode::Detail) {
+    if matches!(ui.mode, Mode::Detail) {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
             .split(chunks[2]);
-        pods_table(f, app, cols[0]);
-        detail_pane(f, app, cols[1]);
+        pods_table(f, shared, ui, cols[0]);
+        detail_pane(f, shared, ui, cols[1]);
     } else {
-        pods_table(f, app, chunks[2]);
+        pods_table(f, shared, ui, chunks[2]);
     }
 
-    f.render_widget(Paragraph::new(footer_hint(app)), chunks[3]);
+    f.render_widget(Paragraph::new(footer_hint(shared, ui, secs)), chunks[3]);
 
-    // Modal overlays.
-    match &app.mode {
-        Mode::Menu => render_menu(f, app),
+    match &ui.mode {
+        Mode::Menu => render_menu(f, shared, ui),
         Mode::Confirm(c) => render_confirm(f, c),
         Mode::Result(msg) => render_result(f, msg),
         _ => {}
@@ -554,15 +617,15 @@ fn summary_line(s: &FleetSummary) -> Paragraph<'static> {
     .style(Style::default().add_modifier(Modifier::BOLD))
 }
 
-fn pods_table(f: &mut Frame, app: &App, area: Rect) {
+fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     let header =
         Row::new(vec!["NAME", "STATUS", "GPU", "GPU%", "MEM", "TEMP", "$/HR", "PROGRESS / ERROR"])
             .style(Style::default().add_modifier(Modifier::BOLD));
-    let rows: Vec<Row> = app
+    let rows: Vec<Row> = shared
         .pods
         .iter()
         .map(|p| {
-            let m = app.metrics.get(&p.name);
+            let m = shared.metrics.get(&p.name);
             let util = m.and_then(|m| m.mean_util());
             let err = m.map(|m| m.error.is_some()).unwrap_or(false);
             let util_str = match (util, err) {
@@ -607,17 +670,17 @@ fn pods_table(f: &mut Frame, app: &App, area: Rect) {
         .block(Block::default().borders(Borders::ALL).title("Pods"));
 
     let mut ts = TableState::default();
-    if !app.pods.is_empty() {
-        ts.select(Some(app.selected));
+    if !shared.pods.is_empty() {
+        ts.select(Some(ui.selected.min(shared.pods.len() - 1)));
     }
     f.render_stateful_widget(table, area, &mut ts);
 }
 
 /// The per-pod detail pane (shown in Detail mode): identity + endpoint, a per-GPU
 /// table, full progress text, and util/temp sparklines from the rolling history.
-fn detail_pane(f: &mut Frame, app: &App, area: Rect) {
-    let Some(pod) = app.selected_pod() else { return };
-    let m = app.metrics.get(&pod.name);
+fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
+    let Some(pod) = shared.pods.get(ui.selected) else { return };
+    let m = shared.metrics.get(&pod.name);
 
     let block = Block::default().borders(Borders::ALL).title(format!(" {} ", pod.name));
     let inner = block.inner(area);
@@ -651,7 +714,6 @@ fn detail_pane(f: &mut Frame, app: &App, area: Rect) {
     );
     f.render_widget(Paragraph::new(facts).wrap(Wrap { trim: true }), rows[0]);
 
-    // Per-GPU breakdown (rather than the table's aggregate).
     let gpu_rows: Vec<Row> = m
         .map(|m| {
             m.gpus
@@ -691,8 +753,7 @@ fn detail_pane(f: &mut Frame, app: &App, area: Rect) {
     .block(Block::default().borders(Borders::TOP).title("per-GPU"));
     f.render_widget(gpu_table, rows[1]);
 
-    // Sparklines from the rolling history (steady time axis; missing = 0).
-    let hist = app.history.get(&pod.name);
+    let hist = shared.history.get(&pod.name);
     let util_data = hist.map(|h| h.util_data()).unwrap_or_default();
     let temp_data = hist.map(|h| h.temp_data()).unwrap_or_default();
     f.render_widget(
@@ -713,19 +774,20 @@ fn detail_pane(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn footer_hint(app: &App) -> String {
-    let age = match app.last_refresh {
+fn footer_hint(shared: &Shared, ui: &Ui, secs: u64) -> String {
+    let age = match shared.last_refresh {
         Some(t) => format!("updated {}s ago", t.elapsed().as_secs()),
         None => "never updated".into(),
     };
-    let keys = match app.mode {
-        Mode::List => "[↑↓/jk] select  [enter] detail  [a] actions  [r] refresh  [q] quit",
-        Mode::Detail => "[↑↓/jk] select  [a] actions  [r] refresh  [esc] back  [q] quit",
+    let spin = if shared.refreshing { " ⟳" } else { "" };
+    let keys = match ui.mode {
+        Mode::List => "[↑↓/jk] select  [enter] detail  [a] actions  [f] interval  [r] now  [q] quit",
+        Mode::Detail => "[↑↓/jk] select  [a] actions  [f] interval  [r] now  [esc] back  [q] quit",
         Mode::Menu => "[r/s/t/b/p] choose action  [esc] cancel",
         Mode::Confirm(_) => "type to confirm  [enter] apply  [esc] cancel",
         Mode::Result(_) => "[any key] dismiss",
     };
-    format!("{} · {} · {}", app.status, age, keys)
+    format!("{}{} · {} · every {}s · {}", shared.status, spin, age, secs, keys)
 }
 
 /// A centered popup rect `pct_x` × `pct_y` percent of the screen.
@@ -748,8 +810,8 @@ fn centered_rect(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
         .split(v[1])[1]
 }
 
-fn render_menu(f: &mut Frame, app: &App) {
-    let name = app.selected_pod().map(|p| p.name.as_str()).unwrap_or("?");
+fn render_menu(f: &mut Frame, shared: &Shared, ui: &Ui) {
+    let name = shared.pods.get(ui.selected).map(|p| p.name.as_str()).unwrap_or("?");
     let lines = vec![
         format!("Actions for {name}:"),
         String::new(),
