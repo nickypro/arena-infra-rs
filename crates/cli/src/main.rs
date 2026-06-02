@@ -1216,14 +1216,16 @@ async fn deploy_proxy(cfg: &Config, pods: &[arena_core::Pod], apply: bool) -> Re
     let target =
         SshTarget::for_host(&pxcfg.proxy_user, &pxcfg.proxy_host, 22, cfg.get("SHARED_SSH_KEY_PATH"));
     let reload = "nginx -t && nginx -s reload";
-
-    for s in &plan.skipped {
-        eprintln!("warning: skipped {} — {}", s.name, s.reason);
-    }
+    // One-line summary of pods still without an endpoint (instead of a line each).
+    let starting = if plan.skipped.is_empty() {
+        String::new()
+    } else {
+        format!(" ({} still starting)", plan.skipped.len())
+    };
 
     if !apply {
         println!(
-            "[dry-run] would deploy {} forward(s) to {}@{}:{}",
+            "[dry-run] would deploy {} forward(s) to {}@{}:{}{starting}",
             plan.forwards.len(),
             pxcfg.proxy_user,
             pxcfg.proxy_host,
@@ -1235,7 +1237,15 @@ async fn deploy_proxy(cfg: &Config, pods: &[arena_core::Pod], apply: bool) -> Re
         return Ok(());
     }
 
-    // Write the rendered config locally, scp it to the proxy, then reload nginx.
+    // Idempotent: only scp + reload when the rendered config differs from what's live —
+    // so calling this repeatedly (e.g. while waiting for pods) reloads only on a change.
+    let current = ssh::run(&target, &format!("cat {} 2>/dev/null", pxcfg.nginx_path)).await;
+    if let Ok(out) = &current {
+        if out.success && out.stdout == nginx {
+            return Ok(()); // already up to date — quiet (caller loops)
+        }
+    }
+
     let tmp = std::env::temp_dir().join("arena-proxy.conf");
     std::fs::write(&tmp, &nginx).context("writing rendered nginx config to a temp file")?;
     let scp = ssh::scp(&target, &tmp.to_string_lossy(), &pxcfg.nginx_path).await?;
@@ -1245,7 +1255,7 @@ async fn deploy_proxy(cfg: &Config, pods: &[arena_core::Pod], apply: bool) -> Re
     let out = ssh::run(&target, reload).await?;
     if out.success {
         println!(
-            "[proxy] deployed {} forward(s) to {} and reloaded nginx",
+            "[proxy] deployed {} forward(s) to {} and reloaded nginx{starting}",
             plan.forwards.len(),
             pxcfg.proxy_host
         );
@@ -1575,36 +1585,54 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                 return Ok(());
             }
 
-            // Poll the whole fleet (one list call per tick) until our pods have SSH
-            // endpoints or we hit the timeout. Stateless: each tick re-reads truth.
+            // Is nginx set up on the proxy host? (Decides deploy-as-they-come vs.
+            // just instructing at the end — checked once up front.)
+            let nginx_present = match arena_core::proxy::ProxyConfig::from_config(cfg) {
+                Ok(px) => {
+                    let tgt = arena_core::ssh::SshTarget::for_host(
+                        &px.proxy_user, &px.proxy_host, 22, cfg.get("SHARED_SSH_KEY_PATH"));
+                    matches!(
+                        arena_core::ssh::run(&tgt, "command -v nginx >/dev/null 2>&1 && echo yes").await,
+                        Ok(o) if o.success && o.stdout.contains("yes")
+                    )
+                }
+                Err(_) => false,
+            };
+
+            // Poll until our pods have SSH endpoints or we hit the timeout, updating
+            // nginx as endpoints appear (idempotent — reloads only on a real change).
+            // Ctrl+C stops the wait early. Stateless: each tick re-reads truth.
             let policy = arena_core::retry::RetryPolicy::default();
             let interval = interval.max(1);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+            let is_ready = |p: &arena_core::Pod| p.ssh_ip.is_some() && p.ssh_port.is_some();
             println!(
-                "\nWaiting up to {timeout}s for SSH endpoints (polling every {interval}s)…"
+                "\nWaiting up to {timeout}s for SSH endpoints{} (Ctrl+C to stop)…",
+                if nginx_present { ", updating nginx as they come up" } else { "" }
             );
-            let is_ready =
-                |p: &arena_core::Pod| p.ssh_ip.is_some() && p.ssh_port.is_some();
             let pods = loop {
-                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
-                let pods = match arena_core::retry::retrying(&policy, || provider.list_pods()).await
-                {
-                    Ok(p) => p,
-                    Err(e) => {
+                let pods = arena_core::retry::retrying(&policy, || provider.list_pods())
+                    .await
+                    .unwrap_or_else(|e| {
                         eprintln!("  poll failed ({e}); retrying");
-                        if std::time::Instant::now() >= deadline {
-                            break Vec::new();
-                        }
-                        continue;
-                    }
-                };
-                let ready = pods
-                    .iter()
-                    .filter(|p| want_ids.contains(&p.id) && is_ready(p))
-                    .count();
+                        Vec::new()
+                    });
+                let ready = pods.iter().filter(|p| want_ids.contains(&p.id) && is_ready(p)).count();
                 println!("  {ready}/{} ready", want_ids.len());
+                if nginx_present && !pods.is_empty() {
+                    if let Err(e) = deploy_proxy(cfg, &pods, true).await {
+                        eprintln!("  proxy update failed: {e}");
+                    }
+                }
                 if ready == want_ids.len() || std::time::Instant::now() >= deadline {
                     break pods;
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}
+                    _ = tokio::signal::ctrl_c() => {
+                        eprintln!("interrupted — stopping wait");
+                        break pods;
+                    }
                 }
             };
 
@@ -1615,8 +1643,8 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                 .collect();
             if !not_ready.is_empty() {
                 eprintln!(
-                    "warning: timed out waiting for: {} (still starting?). \
-                     Re-run `arena proxy plan` once they're up.",
+                    "{} pod(s) still without an endpoint: {} — re-run `arena proxy apply` once they're up.",
+                    not_ready.len(),
                     not_ready.join(", ")
                 );
             }
@@ -1625,9 +1653,10 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                 println!("\nProvisioning pods over SSH…");
                 handle_setup(provider, cfg, true, false).await?;
             }
-            // Wire the proxy: update nginx if it's set up on the proxy host, else just
-            // say how to get the config (don't dump it).
-            smart_proxy(cfg, &pods).await?;
+            // If there's no nginx to deploy to, say how to wire it (don't dump config).
+            if !nginx_present {
+                smart_proxy(cfg, &pods).await?;
+            }
         }
 
         PodCmd::Stop { target, dry_run } => {
