@@ -64,10 +64,21 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     point the repo at the GitHub SSH URL on the default branch. Dry-run unless
     `--apply`. Uses `GIT_SSH_KEY_LOCAL/REMOTE`, `ARENA_REPO_OWNER/NAME`,
     `DEFAULT_BRANCH`.
-- `arena-tui` (TUI) — read-only dashboard (ratatui): pods from the configured
+- `arena-tui` (TUI) — interactive dashboard (ratatui): pods from the configured
   provider plus, per pod, GPU utilization/mem/temp via `nvidia-smi` over SSH and an
   optional progress signal (`PROGRESS_CMD`). Metrics fetched concurrently across the
-  fleet. Provider via `ARENA_PROVIDER` (default `runpod`), config via `ARENA_CONFIG`.
+  fleet, auto-refreshing (`ARENA_REFRESH_SECS`, default 20). Provider via
+  `ARENA_PROVIDER` (default `runpod`), config via `ARENA_CONFIG`.
+  - **Navigate** with `↑/↓` or `j/k`; `enter` opens a per-pod detail pane (per-GPU
+    util/mem/temp breakdown + util/temp **sparklines** from a rolling sample history).
+    A **fleet summary bar** shows total GPUs, mean util, memory, $/hr burn, and
+    unreachable count at a glance.
+  - **Act** on the selected pod with `a` → an action menu (restart / stop / terminate
+    / backup / setup). Every action goes through a confirmation modal — the *only*
+    place the TUI mutates anything. Lifecycle actions (restart/stop/terminate) require
+    **typing the pod's exact name** to confirm; backup/setup show the precise
+    command(s) that will run and take a single `y`. There is no way to mutate a pod
+    without the modal, so the dashboard's reads stay reads.
 
 Shared library pieces: `ssh` (non-interactive, fail-fast SSH command build + run),
 `metrics` (nvidia-smi parsing + per-pod aggregation), and `provider::build` (the one
