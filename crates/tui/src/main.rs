@@ -1173,12 +1173,16 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                 let h = shared.history.get(&p.name);
                 let gpu_hist = h.map(|h| h.util_data()).unwrap_or_default();
                 let mem_hist = h.map(|h| h.mem_data()).unwrap_or_default();
-                cells.push(
-                    Cell::from(spark(&gpu_hist, SPARK_W)).style(Style::default().fg(Color::Green)),
-                );
-                cells.push(
-                    Cell::from(spark(&mem_hist, SPARK_W)).style(Style::default().fg(Color::Cyan)),
-                );
+                // Grey the sparklines out when the pod isn't reachable — the history is
+                // just zeros then, so colour would imply live data that isn't there.
+                let connected = m.map(|m| m.error.is_none() && !m.gpus.is_empty()).unwrap_or(false);
+                let (gpu_c, mem_c) = if connected {
+                    (Color::Green, Color::Cyan)
+                } else {
+                    (Color::DarkGray, Color::DarkGray)
+                };
+                cells.push(Cell::from(spark(&gpu_hist, SPARK_W)).style(Style::default().fg(gpu_c)));
+                cells.push(Cell::from(spark(&mem_hist, SPARK_W)).style(Style::default().fg(mem_c)));
             }
             Row::new(cells)
         })

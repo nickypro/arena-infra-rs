@@ -36,11 +36,18 @@ impl PodSpec {
     /// back to the legacy `RUNPOD_*` names (which is what existing config.env files
     /// have). So a Vast/Hetzner operator can set `GPU_TYPE`/`DISK_GB`/etc. without
     /// touching the RunPod keys, while a pure-RunPod config keeps working unchanged.
-    /// `name`/`env` are left empty for the caller to fill per machine.
+    /// `name` is left empty for the caller to fill per machine. `env` is seeded with
+    /// `PUBLIC_KEY` (the shared SSH key's public half) so the created pod authorizes it
+    /// in `~/.ssh/authorized_keys` — without this, pods we create reject the shared key
+    /// and SSH (metrics/backup/setup) fails with "Permission denied".
     pub fn from_config(cfg: &Config) -> PodSpec {
         let first = |keys: &[&str]| keys.iter().find_map(|k| cfg.get(k).filter(|v| !v.is_empty()));
         let first_parsed =
             |keys: &[&str], default| keys.iter().find_map(|k| cfg.get_parsed(k)).unwrap_or(default);
+        let mut env = Vec::new();
+        if let Some(pubkey) = shared_public_key(cfg) {
+            env.push(("PUBLIC_KEY".to_string(), pubkey));
+        }
         PodSpec {
             name: String::new(),
             image: first(&["IMAGE", "RUNPOD_DOCKER_IMAGE"]).unwrap_or_default().to_string(),
@@ -50,7 +57,25 @@ impl PodSpec {
             disk_gb: first_parsed(&["DISK_GB", "RUNPOD_DISK_SPACE_IN_GB"], 100),
             volume_gb: first_parsed(&["VOLUME_GB", "RUNPOD_VOLUME_SPACE_IN_GB"], 0),
             ports: "8888/http,22/tcp".to_string(),
-            env: Vec::new(),
+            env,
         }
     }
+}
+
+/// The shared SSH key's public half, for injecting as the pod's `PUBLIC_KEY`. Prefers
+/// an existing `<key>.pub`; if absent, derives it from the private key via
+/// `ssh-keygen -y`. None if no key is configured / it can't be read.
+fn shared_public_key(cfg: &Config) -> Option<String> {
+    let keypath = cfg.get("SHARED_SSH_KEY_PATH").filter(|s| !s.is_empty())?;
+    let resolved = crate::ssh::resolve_key_path(keypath);
+    let pubkey = std::fs::read_to_string(format!("{resolved}.pub")).ok().or_else(|| {
+        std::process::Command::new("ssh-keygen")
+            .args(["-y", "-f", &resolved])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    })?;
+    let pubkey = pubkey.trim().to_string();
+    (!pubkey.is_empty()).then_some(pubkey)
 }
