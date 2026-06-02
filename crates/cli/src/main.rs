@@ -169,10 +169,13 @@ enum PodCmd {
         /// Emit JSON instead of a table (for scripting).
         #[arg(long)]
         json: bool,
-        /// Fill the GPU column by querying `nvidia-smi` over SSH (the provider's list
-        /// API omits GPU type). Slower — one SSH per pod.
+        /// Force the GPU-via-SSH probe (default for `--json`, which skips it otherwise).
         #[arg(long)]
         probe: bool,
+        /// Skip the GPU-via-SSH probe (faster; GPU shows "-"). The table view probes
+        /// by default since the provider list API omits GPU type.
+        #[arg(long)]
+        no_probe: bool,
     },
     /// Create N pods on the next free machine names. Requires -n/--count. GPU
     /// type/count and cloud default to config but can be overridden here.
@@ -1427,10 +1430,13 @@ fn emit_proxy_plan(pods: &[arena_core::Pod], cfg: &Config, out: Option<&std::pat
 
 async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bool) -> Result<()> {
     match cmd {
-        PodCmd::List { json, probe } => {
+        PodCmd::List { json, probe, no_probe } => {
             let policy = arena_core::retry::RetryPolicy::default();
             let mut pods = arena_core::retry::retrying(&policy, || provider.list_pods()).await?;
             pods.sort_by(|a, b| a.name.cmp(&b.name));
+            // Probe GPU by default for the human table (the list API omits GPU type);
+            // JSON stays fast/scriptable unless asked. `--no-probe` always wins.
+            let probe = !no_probe && (probe || !json);
             if probe {
                 // The list API omits GPU type; fill it from nvidia-smi over SSH
                 // (same source as the TUI), concurrently across the fleet.
