@@ -75,6 +75,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     (`autocommit-{prefix}-w{week}d{day}-{machine}`, week/day from `ARENA_START_DATE`,
     `--week`/`--day` to override) over SSH. Confirms first (`--dry-run` previews); clean
     trees report `NO_CHANGES` rather than failing.
+  - `pods set-branch <branch> [target|--all]` — gently switch pods' ARENA checkout to a
+    branch (fetch + checkout + ff-only pull, no hard reset) — e.g. end-of-day back to
+    `main`. Confirms first; `--dry-run` previews.
   - `pods setup` — provision pods over SSH: copy the git deploy key, write `~/.name`,
     point the repo at the GitHub SSH URL on the default branch. Confirms first
     (`--dry-run` previews). Uses `GIT_SSH_KEY_LOCAL/REMOTE`, `ARENA_REPO_OWNER/NAME`,

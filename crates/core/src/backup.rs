@@ -94,6 +94,27 @@ pub fn backup_command(cfg: &BackupConfig, machine_name: &str, commit_msg: &str) 
     parts.join("; ")
 }
 
+/// Render the remote command that switches a pod's ARENA checkout to `branch`
+/// **gently** (no hard reset): fetch, checkout, fast-forward pull. A diverged/dirty
+/// tree makes the `--ff-only` pull fail loudly rather than clobbering work — that's the
+/// point versus `setup --force`. Used by `pods set-branch` (e.g. end-of-day, back to
+/// `main` or a feature branch).
+pub fn checkout_command(repo_path: &str, branch: &str, git_ssh_key: Option<&str>) -> String {
+    let mut parts: Vec<String> = vec!["set -e".into(), format!("cd {}", shell_quote(repo_path))];
+    if let Some(key) = git_ssh_key {
+        parts.push(format!(
+            "export GIT_SSH_COMMAND={}",
+            shell_quote(&format!(
+                "ssh -i {key} -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+            ))
+        ));
+    }
+    parts.push("git fetch origin".into());
+    parts.push(format!("git checkout {}", shell_quote(branch)));
+    parts.push("git pull --ff-only".into());
+    parts.join("; ")
+}
+
 /// Wrap a value in single quotes for safe inclusion in a `sh -c` string, escaping any
 /// embedded single quotes the POSIX way (`'\''`).
 fn shell_quote(s: &str) -> String {
@@ -141,6 +162,17 @@ mod tests {
     fn escapes_single_quotes_in_message() {
         let c = backup_command(&cfg(), "arena8-apple", "it's a backup");
         assert!(c.contains(r"'it'\''s a backup'"));
+    }
+
+    #[test]
+    fn checkout_is_gentle_ff_only() {
+        let c = checkout_command("/root/ARENA_3.0", "main", Some("/root/.ssh/id_ed25519"));
+        assert!(c.contains("cd '/root/ARENA_3.0'"));
+        assert!(c.contains("git fetch origin"));
+        assert!(c.contains("git checkout 'main'"));
+        assert!(c.contains("git pull --ff-only")); // no hard reset
+        assert!(!c.contains("reset --hard"));
+        assert!(c.contains("GIT_SSH_COMMAND='ssh -i /root/.ssh/id_ed25519"));
     }
 
     #[test]

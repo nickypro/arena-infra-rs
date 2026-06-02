@@ -296,6 +296,21 @@ enum PodCmd {
         #[arg(long)]
         force: bool,
     },
+    /// Gently switch a pod's ARENA checkout to a branch (fetch + checkout +
+    /// fast-forward pull, no hard reset). One pod (name/id) or --all. Acts by default;
+    /// --dry-run to preview.
+    SetBranch {
+        /// Branch to check out (e.g. main, or a feature branch).
+        branch: String,
+        /// Machine name or id. Omit with --all.
+        target: Option<String>,
+        /// Apply to every pod with an SSH endpoint.
+        #[arg(long)]
+        all: bool,
+        /// Preview only: print what would happen, change nothing.
+        #[arg(long, visible_aliases = ["dryrun", "dry"])]
+        dry_run: bool,
+    },
 }
 
 
@@ -1476,6 +1491,87 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             }
             handle_setup(provider, cfg, !dry_run, force).await?;
         }
+        PodCmd::SetBranch { branch, target, all, dry_run } => {
+            handle_set_branch(provider, cfg, &branch, target.as_deref(), all, dry_run, yes).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Switch one pod (or, with `all`, every pod with an SSH endpoint) to `branch` via a
+/// gentle fetch+checkout+ff-pull over SSH. Dry-run prints the exact command per pod.
+async fn handle_set_branch(
+    provider: &dyn Provider,
+    cfg: &Config,
+    branch: &str,
+    target: Option<&str>,
+    all: bool,
+    dry_run: bool,
+    yes: bool,
+) -> Result<()> {
+    use arena_core::ssh::{self, SshTarget};
+
+    let repo_path = cfg.get("BACKUP_REPO_PATH").map(String::from).unwrap_or_else(|| {
+        format!("/root/{}", cfg.get("ARENA_REPO_NAME").unwrap_or("ARENA_3.0"))
+    });
+    let key = cfg.get("GIT_SSH_KEY_REMOTE");
+    let cmd = arena_core::backup::checkout_command(&repo_path, branch, key);
+
+    // Which pods: --all (every reachable one) or a single resolved target.
+    let pods = provider.list_pods().await.context("listing pods")?;
+    let mut targets: Vec<(String, SshTarget)> = Vec::new();
+    if all {
+        for pod in &pods {
+            if let Ok(t) = SshTarget::from_pod(pod, cfg) {
+                targets.push((pod.name.clone(), t));
+            }
+        }
+    } else if let Some(want) = target {
+        match pods.iter().find(|p| p.name == want || p.id == want) {
+            Some(pod) => targets.push((pod.name.clone(), SshTarget::from_pod(pod, cfg)?)),
+            None => anyhow::bail!("no pod with name or id '{want}' (run `arena pods list`)"),
+        }
+    } else {
+        anyhow::bail!("specify a pod (name or id) or pass --all");
+    }
+    if targets.is_empty() {
+        println!("(no pods with an SSH endpoint to switch)");
+        return Ok(());
+    }
+
+    if dry_run {
+        for (name, t) in &targets {
+            println!("# {name}");
+            println!("{}\n", t.display_command(&cmd));
+        }
+        println!("Dry-run only — nothing changed (preview).");
+        return Ok(());
+    }
+    if !confirm(yes, &format!("Will switch {} pod(s) to branch '{branch}' (gentle, no reset).", targets.len()))? {
+        println!("aborted.");
+        return Ok(());
+    }
+
+    let (mut ok, mut failed) = (0, 0);
+    for (name, t) in &targets {
+        match ssh::run(t, &cmd).await {
+            Ok(out) if out.success => {
+                println!("[on {branch}]  {name}");
+                ok += 1;
+            }
+            Ok(out) => {
+                eprintln!("[FAILED]  {name}: {}", out.stderr.trim());
+                failed += 1;
+            }
+            Err(e) => {
+                eprintln!("[FAILED]  {name}: {e}");
+                failed += 1;
+            }
+        }
+    }
+    println!("\nswitched {ok}/{}", ok + failed);
+    if failed > 0 {
+        anyhow::bail!("{failed} pod(s) failed to switch branch");
     }
     Ok(())
 }
