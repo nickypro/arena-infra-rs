@@ -43,7 +43,8 @@ use tokio::task::JoinSet;
 use arena_core::metrics::{self, PodMetrics, ProbeOpts};
 use arena_core::provider::Provider;
 use arena_core::ssh::{self, SshTarget};
-use arena_core::{Config, Pod};
+use arena_core::naming;
+use arena_core::{Config, Pod, PodSpec};
 
 use state::{summarize, Action, Confirm, FleetSummary, History};
 
@@ -64,6 +65,12 @@ enum Mode {
     Menu,
     /// A pending action awaiting confirmation.
     Confirm(Confirm),
+    /// Fleet action chooser (safe ops only: restart / backup / setup).
+    FleetMenu,
+    /// A pending fleet action; requires typing `ALL` to confirm.
+    FleetConfirm { action: Action, typed: String },
+    /// Add-pod form: `free` is the list of available machine names, `count` how many.
+    NewPod { free: Vec<String>, count: usize },
     /// The outcome of the last action; any key dismisses (then we nudge a refresh).
     Result(String),
 }
@@ -337,6 +344,28 @@ async fn run(
                             ui.mode = Mode::Menu;
                         }
                     }
+                    KeyCode::Char('A') => {
+                        if len > 0 {
+                            ui.mode = Mode::FleetMenu;
+                        }
+                    }
+                    KeyCode::Char('n') => {
+                        // Fresh list (not the cached snapshot) so we never allocate a
+                        // name that already exists and create a duplicate.
+                        match provider.list_pods().await {
+                            Ok(existing) => {
+                                let prefix = ui.cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
+                                let free = naming::next_free_names(
+                                    prefix,
+                                    &ui.cfg.machine_names,
+                                    &existing,
+                                    usize::MAX,
+                                );
+                                ui.mode = Mode::NewPod { free, count: 1 };
+                            }
+                            Err(e) => ui.mode = Mode::Result(format!("✗ list failed: {e}")),
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -376,6 +405,74 @@ async fn run(
                     _ => ui.mode = Mode::Confirm(c),
                 }
             }
+            Mode::FleetMenu => match code {
+                KeyCode::Esc => ui.mode = Mode::List,
+                // Safe ops only — stop/terminate are deliberately not fleet-wide.
+                KeyCode::Char(ch @ ('r' | 'b' | 'p')) => {
+                    let action = match ch {
+                        'r' => Action::Restart,
+                        'b' => Action::Backup,
+                        _ => Action::Setup,
+                    };
+                    ui.mode = Mode::FleetConfirm { action, typed: String::new() };
+                }
+                _ => {}
+            },
+            Mode::FleetConfirm { action, mut typed } => match code {
+                KeyCode::Esc => ui.mode = Mode::List,
+                KeyCode::Enter if typed == "ALL" => {
+                    let pods = shared.lock().unwrap().pods.clone();
+                    ui.mode = Mode::Result(format!(
+                        "running {} on all {} pods…",
+                        action.label(),
+                        pods.len()
+                    ));
+                    {
+                        let s = shared.lock().unwrap();
+                        terminal.draw(|f| view(f, &s, &ui, secs))?;
+                    }
+                    let msg = execute_fleet(provider, &ui.cfg, action, pods).await;
+                    ui.mode = Mode::Result(msg);
+                    nudge.notify_one();
+                }
+                KeyCode::Backspace => {
+                    typed.pop();
+                    ui.mode = Mode::FleetConfirm { action, typed };
+                }
+                KeyCode::Char(c) => {
+                    typed.push(c);
+                    ui.mode = Mode::FleetConfirm { action, typed };
+                }
+                _ => ui.mode = Mode::FleetConfirm { action, typed },
+            },
+            Mode::NewPod { free, count } => match code {
+                KeyCode::Esc => ui.mode = Mode::List,
+                KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('+') => {
+                    let count = (count + 1).min(free.len().max(1));
+                    ui.mode = Mode::NewPod { free, count };
+                }
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('-') => {
+                    let count = count.saturating_sub(1).max(1);
+                    ui.mode = Mode::NewPod { free, count };
+                }
+                KeyCode::Enter => {
+                    let names: Vec<String> = free.iter().take(count).cloned().collect();
+                    if names.is_empty() {
+                        ui.mode = Mode::Result("✗ no free machine names available".into());
+                    } else {
+                        ui.mode =
+                            Mode::Result(format!("creating {} pod(s)…", names.len()));
+                        {
+                            let s = shared.lock().unwrap();
+                            terminal.draw(|f| view(f, &s, &ui, secs))?;
+                        }
+                        let msg = create_pods(provider, &ui.cfg, &names).await;
+                        ui.mode = Mode::Result(msg);
+                        nudge.notify_one();
+                    }
+                }
+                _ => {}
+            },
             Mode::Result(_) => {
                 // Any key dismisses the result, then nudge a refresh to re-sync.
                 ui.mode = Mode::List;
@@ -384,6 +481,69 @@ async fn run(
         }
     }
     Ok(())
+}
+
+/// Run a safe action against every pod concurrently, returning a summary line plus the
+/// first few failures. Used by the fleet menu (restart / backup / setup only).
+async fn execute_fleet(
+    provider: &Arc<dyn Provider>,
+    cfg: &Config,
+    action: Action,
+    pods: Vec<Pod>,
+) -> String {
+    let total = pods.len();
+    let mut set = JoinSet::new();
+    for pod in pods {
+        let provider = provider.clone();
+        let cfg = cfg.clone();
+        set.spawn(async move { execute(provider.as_ref(), &cfg, action, &pod).await });
+    }
+    let mut ok = 0usize;
+    let mut fails: Vec<String> = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        if let Ok(msg) = joined {
+            if msg.starts_with('✓') {
+                ok += 1;
+            } else {
+                fails.push(msg);
+            }
+        }
+    }
+    let mut s = format!("fleet {}: {ok}/{total} ok", action.label());
+    if !fails.is_empty() {
+        s.push_str(&format!(", {} failed:", fails.len()));
+        for f in fails.iter().take(8) {
+            s.push('\n');
+            s.push_str(f);
+        }
+        if fails.len() > 8 {
+            s.push_str(&format!("\n… +{} more", fails.len() - 8));
+        }
+    }
+    s
+}
+
+/// Create the named pods (sequentially, no capacity-wait), returning a summary line.
+/// Each create is gated by the add-pod form's Enter, mirroring `arena pods create`.
+async fn create_pods(provider: &Arc<dyn Provider>, cfg: &Config, names: &[String]) -> String {
+    let base = PodSpec::from_config(cfg);
+    let mut ok = 0usize;
+    let mut fails: Vec<String> = Vec::new();
+    for name in names {
+        let mut spec = base.clone();
+        spec.name = name.clone();
+        spec.env.push(("MACHINE_NAME".into(), name.clone()));
+        match provider.create_pod(&spec).await {
+            Ok(_) => ok += 1,
+            Err(e) => fails.push(format!("✗ {name}: {e}")),
+        }
+    }
+    let mut s = format!("created {ok}/{}", names.len());
+    for f in fails.iter().take(8) {
+        s.push('\n');
+        s.push_str(f);
+    }
+    s
 }
 
 /// Run a confirmed action against its pod, show a busy line, then park the outcome in a
@@ -626,6 +786,9 @@ fn view(f: &mut Frame, shared: &Shared, ui: &Ui, secs: u64) {
     match &ui.mode {
         Mode::Menu => render_menu(f, shared, ui),
         Mode::Confirm(c) => render_confirm(f, c),
+        Mode::FleetMenu => render_fleet_menu(f, shared),
+        Mode::FleetConfirm { action, typed } => render_fleet_confirm(f, shared, *action, typed),
+        Mode::NewPod { free, count } => render_new_pod(f, free, *count),
         Mode::Result(msg) => render_result(f, msg),
         _ => {}
     }
@@ -859,10 +1022,13 @@ fn footer_hint(shared: &Shared, ui: &Ui, secs: u64) -> String {
     };
     let spin = if shared.refreshing { " ⟳" } else { "" };
     let keys = match ui.mode {
-        Mode::List => "[↑↓/jk] select  [enter] detail  [a] actions  [f] interval  [r] now  [q] quit",
-        Mode::Detail => "[↑↓/jk] select  [a] actions  [f] interval  [r] now  [esc] back  [q] quit",
+        Mode::List => "[jk] select  [enter] detail  [a] act  [A] fleet  [n] new  [f] interval  [r] now  [q] quit",
+        Mode::Detail => "[jk] select  [a] act  [A] fleet  [n] new  [f] interval  [r] now  [esc] back  [q] quit",
         Mode::Menu => "[r/s/t/b/p] choose action  [esc] cancel",
         Mode::Confirm(_) => "type to confirm  [enter] apply  [esc] cancel",
+        Mode::FleetMenu => "[r/b/p] choose fleet action  [esc] cancel",
+        Mode::FleetConfirm { .. } => "type ALL to confirm  [enter] apply  [esc] cancel",
+        Mode::NewPod { .. } => "[↑↓/±] count  [enter] create  [esc] cancel",
         Mode::Result(_) => "[any key] dismiss",
     };
     format!("{}{} · {} · every {}s · {}", shared.status, spin, age, secs, keys)
@@ -946,10 +1112,82 @@ fn render_confirm(f: &mut Frame, c: &Confirm) {
     );
 }
 
-fn render_result(f: &mut Frame, msg: &str) {
-    let area = centered_rect(60, 25, f.area());
+fn render_fleet_menu(f: &mut Frame, shared: &Shared) {
+    let n = shared.pods.len();
+    let lines = vec![
+        format!("Fleet actions — all {n} pods:"),
+        String::new(),
+        "  [r]  restart all  (in place)".into(),
+        "  [b]  backup all   (commit + push trees)".into(),
+        "  [p]  setup all    (provision / re-point git)".into(),
+        String::new(),
+        "(stop/terminate are per-pod only — use [a])".into(),
+        "[esc] cancel".into(),
+    ];
+    let area = centered_rect(56, 45, f.area());
     f.render_widget(Clear, area);
-    let color = if msg.starts_with('✗') { Color::Red } else { Color::Green };
+    f.render_widget(
+        Paragraph::new(lines.join("\n"))
+            .block(Block::default().borders(Borders::ALL).title(" fleet action ")),
+        area,
+    );
+}
+
+fn render_fleet_confirm(f: &mut Frame, shared: &Shared, action: Action, typed: &str) {
+    let n = shared.pods.len();
+    let text = format!(
+        "{} ALL {n} pods.\n\nThis runs across the whole fleet. Type ALL to confirm:\n\n  > {}\n\n[enter] apply  [esc] cancel",
+        action.label(),
+        typed
+    );
+    let area = centered_rect(64, 45, f.area());
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(text).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(format!(" confirm fleet {} ", action.label())),
+        ),
+        area,
+    );
+}
+
+fn render_new_pod(f: &mut Frame, free: &[String], count: usize) {
+    let planned: Vec<&String> = free.iter().take(count).collect();
+    let mut text = format!(
+        "Create {} pod(s) on the next free name(s):\n\n",
+        planned.len()
+    );
+    if planned.is_empty() {
+        text.push_str("  (no free machine names left in MACHINE_NAME_LIST)\n");
+    } else {
+        for name in &planned {
+            text.push_str(&format!("  • {name}\n"));
+        }
+    }
+    text.push_str(&format!("\n{} names free total\n\n", free.len()));
+    text.push_str("[↑↓ / + -] adjust count   [enter] CREATE   [esc] cancel");
+    let area = centered_rect(60, 60, f.area());
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(text).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(" add pod "),
+        ),
+        area,
+    );
+}
+
+fn render_result(f: &mut Frame, msg: &str) {
+    // Grow the box for multi-line results (e.g. a fleet summary with failures).
+    let lines = msg.lines().count() as u16 + 2;
+    let pct_y = (lines * 100 / f.area().height.max(1) + 6).clamp(20, 80);
+    let area = centered_rect(60, pct_y, f.area());
+    f.render_widget(Clear, area);
+    let color = if msg.contains('✗') { Color::Red } else { Color::Green };
     f.render_widget(
         Paragraph::new(format!("{msg}\n\n[any key] dismiss"))
             .wrap(Wrap { trim: true })

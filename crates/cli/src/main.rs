@@ -179,29 +179,6 @@ enum PodCmd {
 }
 
 
-/// Build the base spec for a create, preferring provider-neutral keys and falling
-/// back to the legacy `RUNPOD_*` names (which is what existing config.env files have).
-/// So a Vast/Hetzner operator can set `GPU_TYPE`/`DISK_GB`/etc. without touching the
-/// RunPod keys, while a pure-RunPod config keeps working unchanged.
-fn base_spec(cfg: &Config) -> PodSpec {
-    // first non-empty of the given keys, as &str
-    let first = |keys: &[&str]| keys.iter().find_map(|k| cfg.get(k).filter(|v| !v.is_empty()));
-    let first_parsed = |keys: &[&str], default| {
-        keys.iter().find_map(|k| cfg.get_parsed(k)).unwrap_or(default)
-    };
-    PodSpec {
-        name: String::new(),
-        image: first(&["IMAGE", "RUNPOD_DOCKER_IMAGE"]).unwrap_or_default().to_string(),
-        gpu_type: first(&["GPU_TYPE", "RUNPOD_GPU_TYPE"]).unwrap_or_default().to_string(),
-        gpu_count: first_parsed(&["NUM_GPUS", "RUNPOD_NUM_GPUS"], 1),
-        cloud_type: first(&["CLOUD_TYPE", "RUNPOD_CLOUD_TYPE"]).unwrap_or("COMMUNITY").to_string(),
-        disk_gb: first_parsed(&["DISK_GB", "RUNPOD_DISK_SPACE_IN_GB"], 100),
-        volume_gb: first_parsed(&["VOLUME_GB", "RUNPOD_VOLUME_SPACE_IN_GB"], 0),
-        ports: "8888/http,22/tcp".to_string(),
-        env: Vec::new(),
-    }
-}
-
 /// Warn (on a GPU provider) when pods would be created with no persistent volume —
 /// container disk is wiped on restart, so uncommitted work would be lost.
 fn warn_no_volume(provider: &dyn Provider, spec: &PodSpec) {
@@ -260,7 +237,7 @@ async fn create_pods(
 ) -> Result<Vec<arena_core::Pod>> {
     use arena_core::ProviderErrorKind as K;
 
-    let base = base_spec(cfg);
+    let base = PodSpec::from_config(cfg);
     let policy = arena_core::retry::RetryPolicy::default();
     let mut created = Vec::new();
     'names: for name in names {
@@ -658,7 +635,7 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
 
     if provider_name != "hetzner" {
         println!("\nCreate spec (generic key, else RUNPOD_* fallback):");
-        let spec = base_spec(cfg);
+        let spec = PodSpec::from_config(cfg);
         let yn = |s: &str| if s.is_empty() { "✗ (missing)".into() } else { format!("✓ {s}") };
         println!("  GPU_TYPE / RUNPOD_GPU_TYPE   {}", yn(&spec.gpu_type));
         println!("  IMAGE / RUNPOD_DOCKER_IMAGE  {}", yn(&spec.image));
@@ -863,7 +840,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
                 return Ok(());
             }
             if !apply {
-                let spec = base_spec(cfg);
+                let spec = PodSpec::from_config(cfg);
                 let desc = provider.describe(&spec);
                 for name in &names {
                     println!("[dry-run] would create {name} on {} ({desc})", provider.name());
@@ -883,7 +860,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
             }
 
             if !apply {
-                let spec = base_spec(cfg);
+                let spec = PodSpec::from_config(cfg);
                 let desc = provider.describe(&spec);
                 for name in &names {
                     println!("[dry-run] would create {name} on {} ({desc})", provider.name());

@@ -65,20 +65,24 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `--apply`. Uses `GIT_SSH_KEY_LOCAL/REMOTE`, `ARENA_REPO_OWNER/NAME`,
     `DEFAULT_BRANCH`.
 - `arena-tui` (TUI) — interactive dashboard (ratatui): pods from the configured
-  provider plus, per pod, GPU utilization/mem/temp via `nvidia-smi` over SSH and an
-  optional progress signal (`PROGRESS_CMD`). Metrics fetched concurrently across the
-  fleet, auto-refreshing (`ARENA_REFRESH_SECS`, default 20). Provider via
-  `ARENA_PROVIDER` (default `runpod`), config via `ARENA_CONFIG`.
-  - **Navigate** with `↑/↓` or `j/k`; `enter` opens a per-pod detail pane (per-GPU
-    util/mem/temp breakdown + util/temp **sparklines** from a rolling sample history).
-    A **fleet summary bar** shows total GPUs, mean util, memory, $/hr burn, and
-    unreachable count at a glance.
-  - **Act** on the selected pod with `a` → an action menu (restart / stop / terminate
-    / backup / setup). Every action goes through a confirmation modal — the *only*
-    place the TUI mutates anything. Lifecycle actions (restart/stop/terminate) require
-    **typing the pod's exact name** to confirm; backup/setup show the precise
-    command(s) that will run and take a single `y`. There is no way to mutate a pod
-    without the modal, so the dashboard's reads stay reads.
+  provider plus, per pod, GPU stats via `nvidia-smi`, git branch, a setup-health check,
+  and an optional progress signal (`PROGRESS_CMD`) — all over SSH in **one** probe per
+  pod. Fetching runs in a **background task** so the UI never freezes; it auto-refreshes
+  (`ARENA_REFRESH_SECS`, default 5) and `f` cycles the cadence live (2/5/10/20/60s).
+  Provider via `ARENA_PROVIDER` (default `runpod`), config via `ARENA_CONFIG`.
+  - **Columns**: GPU (live from `nvidia-smi`, e.g. `2×RTX A4000` — the provider list
+    API omits this), GPU%/MEM/TEMP, `$/HR`, a **SET** health glyph (`✓/✗/·` for
+    `~/.name`, the deploy key, git origin→GitHub), and **BRANCH**. The **fleet summary
+    bar** shows total GPUs, mean util, memory, and burn as both `$/hr` and `$/day`.
+  - **Navigate** with `↑/↓`/`j/k`; `enter` opens a per-pod detail pane (per-GPU
+    breakdown, full branch/origin/health, util/temp **sparklines**). `Ctrl-C`/`q` quit.
+  - **Act** on the selected pod with `a` (restart / stop / terminate / backup / setup),
+    on the **whole fleet** with `A` (safe ops only: restart / backup / setup), or **add
+    pods** with `n`. Every mutation goes through a confirmation modal — the *only* place
+    the TUI mutates anything. Lifecycle actions (restart/stop/terminate) require
+    **typing the pod's exact name**; fleet actions require typing **ALL**; backup/setup
+    show the precise command(s) and take a single `y`; add-pod previews the names it
+    will allocate before `enter`. The dashboard's reads stay reads.
 
 Shared library pieces: `ssh` (non-interactive, fail-fast SSH command build + run),
 `metrics` (nvidia-smi parsing + per-pod aggregation), and `provider::build` (the one
