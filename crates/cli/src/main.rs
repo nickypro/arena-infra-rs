@@ -92,6 +92,11 @@ enum CronCmd {
         /// Cron schedule expression (default: hourly).
         #[arg(long, default_value = "0 * * * *")]
         schedule: String,
+        /// Bake `ARENA_START_DATE=YYYY-MM-DD` into the cron line, so the scheduled
+        /// backup computes the right wNdM label without it being in config.env
+        /// (a crontab line doesn't inherit your shell environment).
+        #[arg(long)]
+        start_date: Option<String>,
     },
     /// Remove the arena-managed cron lines.
     Remove,
@@ -642,13 +647,22 @@ async fn handle_cron(cmd: CronCmd, config_path: &std::path::Path) -> Result<()> 
             println!("Removed arena-managed cron lines.");
             return Ok(());
         }
-        CronCmd::Install { schedule } => {
+        CronCmd::Install { schedule, start_date } => {
             let exe = std::env::current_exe().context("finding the arena executable path")?;
             let cfg_abs = std::fs::canonicalize(config_path)
                 .unwrap_or_else(|_| config_path.to_path_buf());
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            // Optional inline env (cron runs the line via sh, so `VAR=val cmd` works).
+            let env_prefix = match &start_date {
+                Some(d) => {
+                    arena_core::schedule::parse_ymd(d)
+                        .context("--start-date must be YYYY-MM-DD")?;
+                    format!("ARENA_START_DATE={d} ")
+                }
+                None => String::new(),
+            };
             let line = format!(
-                "{schedule} {} --config {} backup --apply >> {}/arena-cron.log 2>&1",
+                "{schedule} {env_prefix}{} --config {} backup --apply >> {}/arena-cron.log 2>&1",
                 exe.display(),
                 cfg_abs.display(),
                 home
