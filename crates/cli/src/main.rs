@@ -1,9 +1,10 @@
 //! `arena` — the CLI surface over arena-core.
 //!
-//! Safety posture: read-only commands (`pods list`) run freely. Every mutating
-//! command defaults to a **dry-run** that prints exactly what it *would* do; you
-//! must pass `--apply` to actually call the provider. This is deliberate — the
-//! tool is developed against a live production account.
+//! Safety posture: read-only commands (`pods list`) run freely. Mutating commands
+//! **act by default but confirm first**: at a terminal they print what they'll do and
+//! prompt `Proceed? [y/N]`; `--yes` skips the prompt; with no terminal they refuse
+//! unless `--yes`. `--dry-run` previews without doing anything. This is deliberate —
+//! the tool is developed against a live production account.
 
 use std::path::PathBuf;
 
@@ -152,10 +153,11 @@ enum ProxyCmd {
         out: Option<PathBuf>,
     },
     /// Deploy the rendered nginx config to the proxy host and reload nginx
-    /// (`nginx -t && nginx -s reload`). Dry-run unless --apply.
+    /// (`nginx -t && nginx -s reload`). Acts by default; --dry-run to preview.
     Apply {
-        #[arg(long)]
-        apply: bool,
+        /// Preview only: print what would happen, change nothing.
+        #[arg(long, visible_aliases = ["dryrun", "dry"])]
+        dry_run: bool,
     },
 }
 
@@ -169,7 +171,7 @@ enum PodCmd {
     },
     /// Create N pods on the next free machine names. Requires -n/--count. GPU
     /// type/count and cloud default to config but can be overridden here.
-    /// Dry-run unless --apply.
+    /// Acts by default; --dry-run to preview.
     Create {
         /// How many pods to create (required).
         #[arg(short = 'n', long)]
@@ -189,14 +191,15 @@ enum PodCmd {
         /// Persistent volume size in GB (overrides config VOLUME_GB; default 0).
         #[arg(long)]
         volume: Option<u32>,
-        #[arg(long)]
-        apply: bool,
+        /// Preview only: print what would happen, change nothing.
+        #[arg(long, visible_aliases = ["dryrun", "dry"])]
+        dry_run: bool,
         /// On capacity exhaustion, wait and keep retrying instead of stopping.
         #[arg(long)]
         keep_trying: bool,
     },
     /// Create N pods, then poll until they have SSH endpoints and print the proxy
-    /// plan — the one-command spin-up. Dry-run unless --apply. Polling stops at the
+    /// plan — the one-command spin-up. Acts by default; --dry-run to preview. Polling stops at the
     /// timeout; it never runs in the background or mutates the proxy.
     Up {
         /// How many pods to create (required).
@@ -217,8 +220,9 @@ enum PodCmd {
         /// Persistent volume size in GB (overrides config VOLUME_GB; default 0).
         #[arg(long)]
         volume: Option<u32>,
-        #[arg(long)]
-        apply: bool,
+        /// Preview only: print what would happen, change nothing.
+        #[arg(long, visible_aliases = ["dryrun", "dry"])]
+        dry_run: bool,
         /// Don't poll after creating; just print ids (run `proxy plan` later).
         #[arg(long)]
         no_wait: bool,
@@ -238,36 +242,40 @@ enum PodCmd {
         #[arg(long, default_value_t = 12)]
         interval: u64,
     },
-    /// Stop a pod by name or id. Dry-run unless --apply.
+    /// Stop a pod by name or id. Acts by default; --dry-run to preview.
     Stop {
         /// Machine name (e.g. arena8-apple) or raw provider id.
         target: String,
-        #[arg(long)]
-        apply: bool,
+        /// Preview only: print what would happen, change nothing.
+        #[arg(long, visible_aliases = ["dryrun", "dry"])]
+        dry_run: bool,
     },
-    /// Restart a pod in place by name or id. Dry-run unless --apply.
+    /// Restart a pod in place by name or id. Acts by default; --dry-run to preview.
     Restart {
         /// Machine name (e.g. arena8-apple) or raw provider id.
         target: String,
-        #[arg(long)]
-        apply: bool,
+        /// Preview only: print what would happen, change nothing.
+        #[arg(long, visible_aliases = ["dryrun", "dry"])]
+        dry_run: bool,
     },
     /// Terminate (delete) a pod by name or id, or the whole fleet with --all.
-    /// Dry-run unless --apply.
+    /// Acts by default; --dry-run to preview.
     Terminate {
         /// Machine name (e.g. arena8-apple) or raw provider id. Omit with --all.
         target: Option<String>,
         /// Terminate every pod the provider reports (the whole fleet).
         #[arg(long)]
         all: bool,
-        #[arg(long)]
-        apply: bool,
+        /// Preview only: print what would happen, change nothing.
+        #[arg(long, visible_aliases = ["dryrun", "dry"])]
+        dry_run: bool,
     },
     /// Commit + push each pod's ARENA working tree to its autocommit branch over SSH.
-    /// Branch is autocommit-{prefix}-w{week}d{day}-{machine}. Dry-run unless --apply.
+    /// Branch is autocommit-{prefix}-w{week}d{day}-{machine}. Acts by default; --dry-run to preview.
     Backup {
-        #[arg(long)]
-        apply: bool,
+        /// Preview only: print what would happen, change nothing.
+        #[arg(long, visible_aliases = ["dryrun", "dry"])]
+        dry_run: bool,
         /// Commit message (default: the autocommit branch name per machine).
         #[arg(long)]
         message: Option<String>,
@@ -279,10 +287,11 @@ enum PodCmd {
         day: Option<u32>,
     },
     /// Provision pods over SSH: copy the git deploy key, write ~/.name, point the
-    /// repo at GitHub. Dry-run unless --apply.
+    /// repo at GitHub. Acts by default; --dry-run to preview.
     Setup {
-        #[arg(long)]
-        apply: bool,
+        /// Preview only: print what would happen, change nothing.
+        #[arg(long, visible_aliases = ["dryrun", "dry"])]
+        dry_run: bool,
         /// Force-checkout the default branch and hard-reset (else stay on current).
         #[arg(long)]
         force: bool,
@@ -306,8 +315,8 @@ fn warn_no_volume(provider: &dyn Provider, spec: &PodSpec) {
 ///
 /// CRITICAL: this propagates a list failure instead of swallowing it. If we can't
 /// confirm what already exists, we must NOT proceed — treating a failed list as "zero
-/// pods" would make `--apply` create a duplicate of the entire fleet on the live
-/// account. Better to abort with an error the operator can see.
+/// pods" would create a duplicate of the entire fleet on the live account. Better to
+/// abort with an error the operator can see.
 async fn plan_names(provider: &dyn Provider, cfg: &Config, count: usize) -> Result<Vec<String>> {
     let policy = arena_core::retry::RetryPolicy::default();
     let existing = arena_core::retry::retrying(&policy, || provider.list_pods())
@@ -530,7 +539,7 @@ async fn handle_setup(provider: &dyn Provider, cfg: &Config, apply: bool, force:
             println!("{}", target.display_scp(&scfg.key_local, &scfg.key_remote));
             println!("{}\n", target.display_command(&scfg.remote_command(name, force)));
         }
-        println!("Re-run with --apply to execute over SSH.");
+        println!("Preview only — run without --dry-run to execute over SSH.");
         return Ok(());
     }
 
@@ -687,7 +696,7 @@ async fn handle_cron(cmd: CronCmd, config_path: &std::path::Path) -> Result<()> 
                 None => String::new(),
             };
             let line = format!(
-                "{schedule} {env_prefix}{} --config {} pods backup --apply --yes >> {}/arena-cron.log 2>&1",
+                "{schedule} {env_prefix}{} --config {} pods backup --yes >> {}/arena-cron.log 2>&1",
                 exe.display(),
                 cfg_abs.display(),
                 home
@@ -907,7 +916,7 @@ async fn handle_backup(
             println!("# {name}  ->  branch {}", bcfg.branch_for(name));
             println!("{}\n", target.display_command(&cmd));
         }
-        println!("Re-run with --apply to execute over SSH.");
+        println!("Preview only — run without --dry-run to execute over SSH.");
         return Ok(());
     }
 
@@ -954,16 +963,16 @@ async fn handle_proxy(cmd: ProxyCmd, provider: &dyn Provider, cfg: &Config, yes:
             let pods = provider.list_pods().await.context("listing pods for proxy plan")?;
             emit_proxy_plan(&pods, cfg, out.as_deref())?;
         }
-        ProxyCmd::Apply { apply } => {
+        ProxyCmd::Apply { dry_run } => {
             let pods = provider.list_pods().await.context("listing pods for proxy apply")?;
-            if apply {
+            if !dry_run {
                 let pxcfg = arena_core::proxy::ProxyConfig::from_config(cfg)?;
                 if !confirm(yes, &format!("Will deploy the nginx config to {} and reload nginx.", pxcfg.proxy_host))? {
                     println!("aborted.");
                     return Ok(());
                 }
             }
-            deploy_proxy(cfg, &pods, apply).await?;
+            deploy_proxy(cfg, &pods, !dry_run).await?;
         }
     }
     Ok(())
@@ -997,7 +1006,7 @@ async fn deploy_proxy(cfg: &Config, pods: &[arena_core::Pod], apply: bool) -> Re
         );
         println!("  {}", target.display_scp("<rendered nginx>", &pxcfg.nginx_path));
         println!("  {}", target.display_command(reload));
-        println!("(--apply to deploy and reload nginx)");
+        println!("(preview only — run without --dry-run to deploy and reload nginx)");
         return Ok(());
     }
 
@@ -1225,21 +1234,21 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             }
         }
 
-        PodCmd::Create { count, gpu, gpus, cloud, disk, volume, apply, keep_trying } => {
+        PodCmd::Create { count, gpu, gpus, cloud, disk, volume, dry_run, keep_trying } => {
             let ov = SpecOverrides { gpu, gpus, cloud, disk, volume };
             let names = plan_names(provider, cfg, count).await?;
             if names.is_empty() {
                 eprintln!("no free machine names available — nothing to do");
                 return Ok(());
             }
-            if !apply {
+            if dry_run {
                 let spec = spec_with_overrides(cfg, &ov);
                 let desc = provider.describe(&spec);
                 for name in &names {
                     println!("[dry-run] would create {name} on {} ({desc})", provider.name());
                 }
                 warn_no_volume(provider, &spec);
-                println!("\nDry-run only — no pods created. Re-run with --apply to execute.");
+                println!("\nDry-run only — no pods created (this is a preview).");
                 return Ok(());
             }
             let spec = spec_with_overrides(cfg, &ov);
@@ -1253,7 +1262,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             create_pods(provider, cfg, &names, keep_trying, &ov).await?;
         }
 
-        PodCmd::Up { count, gpu, gpus, cloud, disk, volume, apply, no_wait, keep_trying, proxy, setup, timeout, interval } => {
+        PodCmd::Up { count, gpu, gpus, cloud, disk, volume, dry_run, no_wait, keep_trying, proxy, setup, timeout, interval } => {
             let ov = SpecOverrides { gpu, gpus, cloud, disk, volume };
             let names = plan_names(provider, cfg, count).await?;
             if names.is_empty() {
@@ -1261,7 +1270,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                 return Ok(());
             }
 
-            if !apply {
+            if dry_run {
                 let spec = spec_with_overrides(cfg, &ov);
                 let desc = provider.describe(&spec);
                 for name in &names {
@@ -1275,7 +1284,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                     (false, false) => "",
                 };
                 println!(
-                    "\nDry-run only — no pods created. With --apply: create the above, \
+                    "\nDry-run only — no pods created (preview): would create the above, \
                      poll up to {timeout}s for SSH endpoints, print the proxy plan{extra}."
                 );
                 return Ok(());
@@ -1370,35 +1379,35 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             }
         }
 
-        PodCmd::Stop { target, apply } => {
+        PodCmd::Stop { target, dry_run } => {
             let (id, label) = resolve_target(provider, &target).await?;
-            if apply {
+            if dry_run {
+                println!("[dry-run] would stop {label}");
+            } else {
                 if !confirm(yes, &format!("Will stop {label}."))? {
                     println!("aborted.");
                     return Ok(());
                 }
                 provider.stop_pod(&id).await?;
                 println!("[stopped] {label}");
-            } else {
-                println!("[dry-run] would stop {label} (--apply to execute)");
             }
         }
 
-        PodCmd::Restart { target, apply } => {
+        PodCmd::Restart { target, dry_run } => {
             let (id, label) = resolve_target(provider, &target).await?;
-            if apply {
+            if dry_run {
+                println!("[dry-run] would restart {label}");
+            } else {
                 if !confirm(yes, &format!("Will restart {label}."))? {
                     println!("aborted.");
                     return Ok(());
                 }
                 provider.restart_pod(&id).await?;
                 println!("[restarted] {label}");
-            } else {
-                println!("[dry-run] would restart {label} (--apply to execute)");
             }
         }
 
-        PodCmd::Terminate { target, all, apply } => match (all, target) {
+        PodCmd::Terminate { target, all, dry_run } => match (all, target) {
             (true, _) => {
                 let policy = arena_core::retry::RetryPolicy::default();
                 let mut pods =
@@ -1408,14 +1417,11 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                     println!("(no pods to terminate)");
                     return Ok(());
                 }
-                if !apply {
+                if dry_run {
                     for p in &pods {
                         println!("[dry-run] would terminate {} (id={})", p.name, p.id);
                     }
-                    println!(
-                        "\nDry-run only — would terminate ALL {} pod(s). Re-run with --apply.",
-                        pods.len()
-                    );
+                    println!("\nDry-run only — would terminate ALL {} pod(s) (preview).", pods.len());
                     return Ok(());
                 }
                 if !confirm(yes, &format!("Will TERMINATE ALL {} pod(s) — irreversible.", pods.len()))? {
@@ -1440,15 +1446,15 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             }
             (false, Some(target)) => {
                 let (id, label) = resolve_target(provider, &target).await?;
-                if apply {
+                if dry_run {
+                    println!("[dry-run] would terminate {label}");
+                } else {
                     if !confirm(yes, &format!("Will TERMINATE {label} — irreversible."))? {
                         println!("aborted.");
                         return Ok(());
                     }
                     provider.terminate_pod(&id).await?;
                     println!("[terminated] {label}");
-                } else {
-                    println!("[dry-run] would terminate {label} (--apply to execute)");
                 }
             }
             (false, None) => {
@@ -1456,19 +1462,19 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             }
         },
 
-        PodCmd::Backup { apply, message, week, day } => {
-            if apply && !confirm(yes, "Will commit + push each pod's ARENA tree over SSH.")? {
+        PodCmd::Backup { dry_run, message, week, day } => {
+            if !dry_run && !confirm(yes, "Will commit + push each pod's ARENA tree over SSH.")? {
                 println!("aborted.");
                 return Ok(());
             }
-            handle_backup(provider, cfg, apply, message, week, day).await?;
+            handle_backup(provider, cfg, !dry_run, message, week, day).await?;
         }
-        PodCmd::Setup { apply, force } => {
-            if apply && !confirm(yes, "Will provision each pod over SSH (deploy key, ~/.name, repo).")? {
+        PodCmd::Setup { dry_run, force } => {
+            if !dry_run && !confirm(yes, "Will provision each pod over SSH (deploy key, ~/.name, repo).")? {
                 println!("aborted.");
                 return Ok(());
             }
-            handle_setup(provider, cfg, apply, force).await?;
+            handle_setup(provider, cfg, !dry_run, force).await?;
         }
     }
     Ok(())
@@ -1495,7 +1501,7 @@ mod tests {
     #[test]
     fn install_preserves_other_crontab_entries() {
         let existing = "0 9 * * * /usr/bin/other-job\n# my note\n";
-        let line = "0 * * * * arena pods backup --apply".to_string();
+        let line = "0 * * * * arena pods backup --yes".to_string();
         let out = with_arena_block(existing, &[line.clone()]);
         // keeps the user's entries…
         assert!(out.contains("/usr/bin/other-job"));

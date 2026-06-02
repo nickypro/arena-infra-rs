@@ -39,12 +39,12 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     + `HETZNER_*`). `list` takes `--json`; `stop`/`restart`/`terminate` accept a
     **machine name or id**. `restart` restarts in place (RunPod restart / Hetzner
     reboot / Vast stop+start), preserving the machine where supported. `terminate
-    --all` tears down the **whole fleet** (dry-run lists every pod first; `--apply`
-    to execute) — for end-of-program teardown.
+    --all` tears down the **whole fleet** (confirms first; `--dry-run` lists every
+    pod without touching them) — for end-of-program teardown.
   - `pods up -n N` — one-command spin-up: create, poll until each pod has an SSH
     endpoint, then print the proxy plan. `--setup` then provisions each pod over SSH
-    and `--proxy` deploys + reloads the proxy config — so `pods up -n 15 --apply
-    --setup --proxy` is a full start-of-iteration spin-up. Dry-run unless `--apply`;
+    and `--proxy` deploys + reloads the proxy config — so `pods up -n 15 --setup
+    --proxy` is a full start-of-iteration spin-up. Confirms first (`--dry-run` previews);
     `--no-wait` skips polling. Polling stops at `--timeout`; nothing runs in the background.
   - Batch create (`create`/`up`) uses **typed provider errors** (`ProviderErrorKind`):
     on **capacity** exhaustion it stops gracefully and keeps the pods it got (e.g.
@@ -55,8 +55,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     and list calls — so a throttle or blip doesn't fail the command.
   - `proxy plan` — read-only; prints the nginx `stream` config (`--out` saves it
     locally; never connects to the proxy). `proxy apply` **deploys** that config to the
-    proxy host over SSH and reloads nginx (`nginx -t && nginx -s reload`); dry-run shows
-    the exact scp + reload, `--apply` executes. This is the one place the tool touches
+    proxy host over SSH and reloads nginx (`nginx -t && nginx -s reload`); `--dry-run`
+    shows the exact scp + reload without doing it. This is the one place the tool touches
     the proxy host.
   - `plan check | show` — a scheduled provisioning plan (`arena-plan.json`, see
     `arena-plan.example.json`): per-day target fleets with **GPU-first fallback chains**
@@ -73,11 +73,11 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     arena-managed lines, leaving other entries intact.
   - `pods backup` — commit + push each pod's ARENA tree to its autocommit branch
     (`autocommit-{prefix}-w{week}d{day}-{machine}`, week/day from `ARENA_START_DATE`,
-    `--week`/`--day` to override) over SSH. Dry-run unless `--apply`; clean trees
-    report `NO_CHANGES` rather than failing.
+    `--week`/`--day` to override) over SSH. Confirms first (`--dry-run` previews); clean
+    trees report `NO_CHANGES` rather than failing.
   - `pods setup` — provision pods over SSH: copy the git deploy key, write `~/.name`,
-    point the repo at the GitHub SSH URL on the default branch. Dry-run unless
-    `--apply`. Uses `GIT_SSH_KEY_LOCAL/REMOTE`, `ARENA_REPO_OWNER/NAME`,
+    point the repo at the GitHub SSH URL on the default branch. Confirms first
+    (`--dry-run` previews). Uses `GIT_SSH_KEY_LOCAL/REMOTE`, `ARENA_REPO_OWNER/NAME`,
     `DEFAULT_BRANCH`.
   - `config check | set` — `check` is the read-only doctor (keys + setup readiness);
     `config set KEY VALUE` writes a key (e.g. an API key) into config.env.
@@ -120,13 +120,12 @@ Hetzner), commit/backup, the GPU/progress dashboard, and proxy/port-forwarding.
 - Runs as the unprivileged `dev` user, which **cannot read `/root`**. It only sees
   a read-only copy of config at `/home/dev/prod-ro/config.env`.
 - **Read-only by default.** `pods list` and the TUI only ever issue GET requests.
-- **Every mutating command is dry-run by default.** `create`/`stop`/`terminate`
-  print what they *would* do and only act when given `--apply`.
-- **`--apply` then asks for confirmation.** At an interactive terminal, mutating
-  commands print what they'll do and prompt `Proceed? [y/N]`. Pass `-y`/`--yes` to skip
-  it. With **no terminal** (cron, pipes) the command *refuses* unless `--yes` is given —
-  so nothing mutates non-interactively by accident. (`cron install` bakes `--yes` into
-  the scheduled backup line.)
+- **Mutating commands act, but confirm first.** `create`/`stop`/`terminate`/… print
+  what they'll do and prompt `Proceed? [y/N]` at a terminal. `-y`/`--yes` skips the
+  prompt. With **no terminal** (cron, pipes) they *refuse* unless `--yes` is given — so
+  nothing mutates non-interactively by accident. (`cron install` bakes `--yes` in.)
+- **`--dry-run` previews** any mutating command (also `--dry`/`--dryrun`): prints exactly
+  what would happen and changes nothing.
 
 ## Usage
 
@@ -137,11 +136,11 @@ cargo build
 # list pods (read-only)
 cargo run -p arena-cli -- pods list
 
-# preview creating 3 pods (dry-run — no API mutation)
-cargo run -p arena-cli -- pods create -n 3
+# preview creating 3 pods (no API mutation)
+cargo run -p arena-cli -- pods create -n 3 --dry-run
 
-# actually create them
-cargo run -p arena-cli -- pods create -n 3 --apply
+# actually create them (prompts to confirm; -y to skip)
+cargo run -p arena-cli -- pods create -n 3
 
 # interactive dashboard (or `arena tui`, which inherits --provider/--config)
 cargo run -p arena-tui
@@ -158,7 +157,7 @@ Subcommands accept any **unambiguous prefix** (Cisco-style), at every level:
 arena po l          # == arena pods list
 arena tui           # launch the dashboard
 arena co c          # == arena config check
-arena po ba --apply # == arena pods backup --apply
+arena po ba          # == arena pods backup (prompts to confirm)
 ```
 
 An ambiguous prefix errors and lists the candidates — e.g. `arena p` is rejected
@@ -178,7 +177,7 @@ because the configured key lives under `/root`:
 SHARED_SSH_KEY_PATH=~/.ssh/arena8_key arena tui
 
 # same idea for the git deploy key used by `setup`
-GIT_SSH_KEY_LOCAL=~/.ssh/arena_infra_key arena setup --apply
+GIT_SSH_KEY_LOCAL=~/.ssh/arena_infra_key arena pods setup
 ```
 
 ## Layout
