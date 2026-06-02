@@ -48,30 +48,6 @@ enum Cmd {
     /// Plan port-forwarding/proxy wiring (read-only; prints config to apply).
     #[command(subcommand, infer_subcommands = true)]
     Proxy(ProxyCmd),
-    /// Commit + push each pod's ARENA working tree to its autocommit branch over SSH.
-    /// Branch is autocommit-{prefix}-w{week}d{day}-{machine}. Dry-run unless --apply.
-    Backup {
-        #[arg(long)]
-        apply: bool,
-        /// Commit message (default: the autocommit branch name per machine).
-        #[arg(long)]
-        message: Option<String>,
-        /// Override the iteration week (default: computed from ARENA_START_DATE).
-        #[arg(long)]
-        week: Option<u32>,
-        /// Override the day-within-week (default: computed from ARENA_START_DATE).
-        #[arg(long)]
-        day: Option<u32>,
-    },
-    /// Provision pods over SSH: copy the git deploy key, write ~/.name, point the
-    /// repo at GitHub. Dry-run unless --apply.
-    Setup {
-        #[arg(long)]
-        apply: bool,
-        /// Force-checkout the default branch and hard-reset (else stay on current).
-        #[arg(long)]
-        force: bool,
-    },
     /// View/preview a scheduled provisioning plan (arena-plan.json). Read-only for now;
     /// the timed executor + arming come next.
     #[command(subcommand, infer_subcommands = true)]
@@ -79,7 +55,7 @@ enum Cmd {
     /// Inspect the loaded config.
     #[command(subcommand, infer_subcommands = true)]
     Config(ConfigCmd),
-    /// Manage a cron schedule for `arena backup` (edits your crontab, touching only
+    /// Manage a cron schedule for `arena pods backup` (edits your crontab, touching only
     /// arena-managed lines).
     #[command(subcommand, infer_subcommands = true)]
     Cron(CronCmd),
@@ -263,6 +239,30 @@ enum PodCmd {
         #[arg(long)]
         apply: bool,
     },
+    /// Commit + push each pod's ARENA working tree to its autocommit branch over SSH.
+    /// Branch is autocommit-{prefix}-w{week}d{day}-{machine}. Dry-run unless --apply.
+    Backup {
+        #[arg(long)]
+        apply: bool,
+        /// Commit message (default: the autocommit branch name per machine).
+        #[arg(long)]
+        message: Option<String>,
+        /// Override the iteration week (default: computed from ARENA_START_DATE).
+        #[arg(long)]
+        week: Option<u32>,
+        /// Override the day-within-week (default: computed from ARENA_START_DATE).
+        #[arg(long)]
+        day: Option<u32>,
+    },
+    /// Provision pods over SSH: copy the git deploy key, write ~/.name, point the
+    /// repo at GitHub. Dry-run unless --apply.
+    Setup {
+        #[arg(long)]
+        apply: bool,
+        /// Force-checkout the default branch and hard-reset (else stay on current).
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 
@@ -438,12 +438,6 @@ async fn main() -> Result<()> {
         Cmd::Cron(c) => handle_cron(c, &cli.config).await,
         Cmd::Pods(p) => handle_pods(p, provider.unwrap().as_ref(), &cfg).await,
         Cmd::Proxy(p) => handle_proxy(p, provider.unwrap().as_ref(), &cfg).await,
-        Cmd::Backup { apply, message, week, day } => {
-            handle_backup(provider.unwrap().as_ref(), &cfg, apply, message, week, day).await
-        }
-        Cmd::Setup { apply, force } => {
-            handle_setup(provider.unwrap().as_ref(), &cfg, apply, force).await
-        }
     }
 }
 
@@ -669,7 +663,7 @@ async fn handle_cron(cmd: CronCmd, config_path: &std::path::Path) -> Result<()> 
                 None => String::new(),
             };
             let line = format!(
-                "{schedule} {env_prefix}{} --config {} backup --apply >> {}/arena-cron.log 2>&1",
+                "{schedule} {env_prefix}{} --config {} pods backup --apply >> {}/arena-cron.log 2>&1",
                 exe.display(),
                 cfg_abs.display(),
                 home
@@ -1394,6 +1388,13 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
                 anyhow::bail!("specify a pod (name or id) to terminate, or pass --all");
             }
         },
+
+        PodCmd::Backup { apply, message, week, day } => {
+            handle_backup(provider, cfg, apply, message, week, day).await?;
+        }
+        PodCmd::Setup { apply, force } => {
+            handle_setup(provider, cfg, apply, force).await?;
+        }
     }
     Ok(())
 }
@@ -1419,7 +1420,7 @@ mod tests {
     #[test]
     fn install_preserves_other_crontab_entries() {
         let existing = "0 9 * * * /usr/bin/other-job\n# my note\n";
-        let line = "0 * * * * arena backup --apply".to_string();
+        let line = "0 * * * * arena pods backup --apply".to_string();
         let out = with_arena_block(existing, &[line.clone()]);
         // keeps the user's entries…
         assert!(out.contains("/usr/bin/other-job"));
