@@ -130,6 +130,14 @@ enum ConfigCmd {
     /// present. Read-only; never prints secret values. Exits non-zero if a required
     /// key is missing.
     Check,
+    /// Set a key in config.env (e.g. an API key): replaces the line if present, else
+    /// appends `KEY="value"`. Writes to the --config file; never echoes the value.
+    Set {
+        /// Config key, e.g. RUNPOD_API_KEY.
+        key: String,
+        /// Value to store (will be quoted).
+        value: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -426,7 +434,7 @@ async fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Tui => launch_tui(&cli.provider, &cli.config),
         Cmd::Plan(c) => handle_plan(c, provider.unwrap().as_ref(), &cfg).await,
-        Cmd::Config(c) => handle_config(c, &cfg, &cli.provider),
+        Cmd::Config(c) => handle_config(c, &cfg, &cli.provider, &cli.config),
         Cmd::Cron(c) => handle_cron(c, &cli.config).await,
         Cmd::Pods(p) => handle_pods(p, provider.unwrap().as_ref(), &cfg).await,
         Cmd::Proxy(p) => handle_proxy(p, provider.unwrap().as_ref(), &cfg).await,
@@ -700,9 +708,24 @@ async fn write_crontab(content: &str) -> Result<()> {
     Ok(())
 }
 
-fn handle_config(cmd: ConfigCmd, cfg: &Config, provider_name: &str) -> Result<()> {
+fn handle_config(
+    cmd: ConfigCmd,
+    cfg: &Config,
+    provider_name: &str,
+    config_path: &std::path::Path,
+) -> Result<()> {
     match cmd {
         ConfigCmd::Check => config_check(cfg, provider_name),
+        ConfigCmd::Set { key, value } => {
+            let text = std::fs::read_to_string(config_path)
+                .with_context(|| format!("reading {}", config_path.display()))?;
+            let updated = arena_core::config::upsert_line(&text, &key, &value);
+            std::fs::write(config_path, updated)
+                .with_context(|| format!("writing {}", config_path.display()))?;
+            // Never echo the value (it may be a secret).
+            println!("set {key} in {}", config_path.display());
+            Ok(())
+        }
     }
 }
 

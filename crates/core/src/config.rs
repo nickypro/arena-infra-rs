@@ -108,6 +108,29 @@ impl Config {
     }
 }
 
+/// Return `text` with `key` set to `value` (quoted): replace the first `KEY=…` line if
+/// present, else append `KEY="value"`. Comments and other lines are preserved. Intended
+/// for simple scalar keys (e.g. API keys) — not the `MACHINE_NAME_LIST` array.
+pub fn upsert_line(text: &str, key: &str, value: &str) -> String {
+    let needle = format!("{key}=");
+    let mut replaced = false;
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        if !replaced && line.trim_start().starts_with(&needle) {
+            out.push(format!("{key}=\"{value}\""));
+            replaced = true;
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    if !replaced {
+        out.push(format!("{key}=\"{value}\""));
+    }
+    let mut s = out.join("\n");
+    s.push('\n');
+    s
+}
+
 /// Strip surrounding quotes and trailing ` # inline comments` from a raw value.
 fn strip_value(raw: &str) -> String {
     let s = raw.trim();
@@ -166,6 +189,21 @@ MACHINE_NAME_LIST=(
         assert_eq!(c.get("SHARED_SSH_KEY_PATH"), Some("/home/dev/.ssh/k"));
         assert_eq!(c.get("IMAGE"), Some("base:1")); // untouched
         assert_eq!(c.get("BRAND_NEW_KEY"), None); // env can't introduce an arbitrary key
+    }
+
+    #[test]
+    fn upsert_replaces_or_appends() {
+        let text = "# comment\nRUNPOD_API_KEY=\"old\"\nMACHINE_NAME_PREFIX=\"arena8\"\n";
+        // replace existing
+        let r = upsert_line(text, "RUNPOD_API_KEY", "rpa_new");
+        assert!(r.contains("RUNPOD_API_KEY=\"rpa_new\""));
+        assert!(!r.contains("\"old\""));
+        assert!(r.contains("# comment")); // other lines preserved
+        assert_eq!(Config::parse(&r).get("RUNPOD_API_KEY"), Some("rpa_new"));
+        // append new
+        let a = upsert_line(text, "VAST_API_KEY", "vk_123");
+        assert!(a.trim_end().ends_with("VAST_API_KEY=\"vk_123\""));
+        assert_eq!(Config::parse(&a).get("VAST_API_KEY"), Some("vk_123"));
     }
 
     #[test]
