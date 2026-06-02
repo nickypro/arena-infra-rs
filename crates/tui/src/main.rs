@@ -77,6 +77,8 @@ enum Mode {
     FleetConfirm { action: Action, typed: String },
     /// Interactive add-pod form (↑↓ field, ←→ value).
     NewPod(NewPodForm),
+    /// Confirm terminating the marked (multi-selected) pods; type the count to confirm.
+    TermMarked { typed: String },
     /// The outcome of the last action; any key dismisses (then we nudge a refresh).
     Result(String),
 }
@@ -113,6 +115,8 @@ struct Ui {
     mode: Mode,
     /// Cursor into `Shared::pods` (clamped to a valid row each frame).
     selected: usize,
+    /// Pod ids marked for a bulk action (multi-select via space).
+    marked: std::collections::HashSet<String>,
 }
 
 impl Ui {
@@ -163,6 +167,7 @@ async fn main() -> Result<()> {
         cfg,
         mode: Mode::List,
         selected: 0,
+        marked: std::collections::HashSet::new(),
     };
 
     let mut terminal = setup_terminal()?;
@@ -387,6 +392,20 @@ async fn run(
                             ui.mode = Mode::FleetMenu;
                         }
                     }
+                    KeyCode::Char(' ') => {
+                        // Toggle multi-select mark on the cursor pod.
+                        if let Some(pod) = selected_pod(shared, ui.selected) {
+                            if !ui.marked.remove(&pod.id) {
+                                ui.marked.insert(pod.id);
+                            }
+                        }
+                    }
+                    KeyCode::Char('c') => ui.marked.clear(),
+                    KeyCode::Char('x') => {
+                        if !ui.marked.is_empty() {
+                            ui.mode = Mode::TermMarked { typed: String::new() };
+                        }
+                    }
                     KeyCode::Char('n') => {
                         // Fresh list (not the cached snapshot) so we never allocate a
                         // name that already exists and create a duplicate.
@@ -561,6 +580,37 @@ async fn run(
                 }
                 _ => ui.mode = Mode::NewPod(form),
             },
+            Mode::TermMarked { mut typed } => {
+                let n = ui.marked.len();
+                match code {
+                    KeyCode::Esc => ui.mode = Mode::List,
+                    // Require typing the count — a deliberate gate for a bulk delete.
+                    KeyCode::Enter if typed == n.to_string() => {
+                        let pods: Vec<Pod> = {
+                            let s = shared.lock().unwrap();
+                            s.pods.iter().filter(|p| ui.marked.contains(&p.id)).cloned().collect()
+                        };
+                        ui.mode = Mode::Result(format!("terminating {} pod(s)…", pods.len()));
+                        {
+                            let s = shared.lock().unwrap();
+                            terminal.draw(|f| view(f, &s, &ui, secs))?;
+                        }
+                        let msg = terminate_many(provider, pods).await;
+                        ui.marked.clear();
+                        ui.mode = Mode::Result(msg);
+                        nudge.notify_one();
+                    }
+                    KeyCode::Backspace => {
+                        typed.pop();
+                        ui.mode = Mode::TermMarked { typed };
+                    }
+                    KeyCode::Char(ch) => {
+                        typed.push(ch);
+                        ui.mode = Mode::TermMarked { typed };
+                    }
+                    _ => ui.mode = Mode::TermMarked { typed },
+                }
+            }
             Mode::Result(_) => {
                 // Any key dismisses the result, then nudge a refresh to re-sync.
                 ui.mode = Mode::List;
@@ -569,6 +619,36 @@ async fn run(
         }
     }
     Ok(())
+}
+
+/// Terminate several pods concurrently, returning a one-line summary + first failures.
+async fn terminate_many(provider: &Arc<dyn Provider>, pods: Vec<Pod>) -> String {
+    let total = pods.len();
+    let mut set = JoinSet::new();
+    for pod in pods {
+        let provider = provider.clone();
+        set.spawn(async move {
+            match provider.terminate_pod(&pod.id).await {
+                Ok(()) => Ok(pod.name),
+                Err(e) => Err(format!("✗ {}: {e}", pod.name)),
+            }
+        });
+    }
+    let mut ok = 0usize;
+    let mut fails: Vec<String> = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok(Ok(_)) => ok += 1,
+            Ok(Err(e)) => fails.push(e),
+            Err(_) => fails.push("✗ task failed".into()),
+        }
+    }
+    let mut s = format!("terminated {ok}/{total}");
+    for f in fails.iter().take(8) {
+        s.push('\n');
+        s.push_str(f);
+    }
+    s
 }
 
 /// Run a safe action against every pod concurrently, returning a summary line plus the
@@ -984,6 +1064,7 @@ fn view(f: &mut Frame, shared: &Shared, ui: &Ui, secs: u64) {
         Mode::FleetMenu => render_fleet_menu(f, shared),
         Mode::FleetConfirm { action, typed } => render_fleet_confirm(f, shared, *action, typed),
         Mode::NewPod(form) => render_new_pod(f, form),
+        Mode::TermMarked { typed } => render_term_marked(f, shared, ui, typed),
         Mode::Result(msg) => render_result(f, msg),
         _ => {}
     }
@@ -1021,7 +1102,7 @@ fn summary_line(s: &FleetSummary) -> Paragraph<'static> {
 fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: bool) {
     const SPARK_W: usize = 12;
     let mut header_cells =
-        vec!["P", "NAME", "STATUS", "SET", "GPU", "GPU%", "MEM", "TEMP", "DISK", "$/HR", "BRANCH", "PROGRESS / ERROR"];
+        vec!["", "P", "NAME", "STATUS", "SET", "GPU", "GPU%", "MEM", "TEMP", "DISK", "$/HR", "BRANCH", "PROGRESS / ERROR"];
     if with_spark {
         header_cells.push("GPU%~");
         header_cells.push("MEM%~");
@@ -1068,7 +1149,13 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
             } else {
                 Cell::from(status_label)
             };
+            let mark = if ui.marked.contains(&p.id) {
+                Cell::from("•").style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+            } else {
+                Cell::from(" ")
+            };
             let mut cells = vec![
+                mark,
                 provider_cell(&p.provider),
                 Cell::from(ui.shown_name(&p.name)),
                 status_cell,
@@ -1098,6 +1185,7 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
         .collect();
 
     let mut widths = vec![
+        Constraint::Length(1),  // mark (•)
         Constraint::Length(1),  // P (provider glyph)
         Constraint::Length(16), // NAME
         Constraint::Length(4),  // STATUS (abbreviated: run/exit/stop…)
@@ -1263,13 +1351,14 @@ fn footer_hint(shared: &Shared, ui: &Ui, secs: u64) -> String {
     };
     let spin = if shared.refreshing { " ⟳" } else { "" };
     let keys = match ui.mode {
-        Mode::List => "[enter] detail  [a] act  [A] fleet  [n] new  [s] names  [f] interval  [r] now  [q] quit",
-        Mode::Detail => "[a] act  [A] fleet  [n] new  [s] names  [f] interval  [r] now  [esc] back  [q] quit",
+        Mode::List => "[enter] detail  [space] mark  [x] term marked  [a] act  [A] fleet  [n] new  [s] names  [r] now  [q] quit",
+        Mode::Detail => "[space] mark  [x] term marked  [a] act  [A] fleet  [n] new  [s] names  [r] now  [esc] back  [q] quit",
         Mode::Menu => "[r/s/t/b/p] choose action  [esc] cancel",
         Mode::Confirm(_) => "type to confirm  [enter] apply  [esc] cancel",
         Mode::FleetMenu => "[r/b/p] choose fleet action  [esc] cancel",
         Mode::FleetConfirm { .. } => "type ALL to confirm  [enter] apply  [esc] cancel",
         Mode::NewPod { .. } => "[↑↓] pods  [+-] gpus  [←→] type  [enter] create  [esc] cancel",
+        Mode::TermMarked { .. } => "type the count to confirm  [enter] terminate  [esc] cancel",
         Mode::Result(_) => "[any key] dismiss",
     };
     format!("{}{} · {} · every {}s · {}", shared.status, spin, age, secs, keys)
@@ -1519,6 +1608,35 @@ fn render_new_pod(f: &mut Frame, form: &NewPodForm) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan))
                 .title(" add pod "),
+        ),
+        area,
+    );
+}
+
+fn render_term_marked(f: &mut Frame, shared: &Shared, ui: &Ui, typed: &str) {
+    let names: Vec<String> = shared
+        .pods
+        .iter()
+        .filter(|p| ui.marked.contains(&p.id))
+        .map(|p| ui.shown_name(&p.name))
+        .collect();
+    let n = names.len();
+    let mut text = format!("TERMINATE {n} pod(s) — irreversible:\n\n");
+    for name in names.iter().take(20) {
+        text.push_str(&format!("  • {name}\n"));
+    }
+    if n > 20 {
+        text.push_str(&format!("  … +{} more\n", n - 20));
+    }
+    text.push_str(&format!("\nType the count ({n}) to confirm:\n\n  > {typed}\n\n[enter] apply  [esc] cancel"));
+    let area = centered_rect(60, 70, f.area());
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(text).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red))
+                .title(" confirm terminate "),
         ),
         area,
     );
