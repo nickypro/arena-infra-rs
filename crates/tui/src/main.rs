@@ -1625,18 +1625,41 @@ fn render_term_marked(f: &mut Frame, shared: &Shared, ui: &Ui, typed: &str) {
         .map(|p| ui.shown_name(&p.name))
         .collect();
     let n = names.len();
-    let mut text = format!("TERMINATE {n} pod(s) — irreversible:\n\n");
-    for name in names.iter().take(20) {
-        text.push_str(&format!("  • {name}\n"));
+
+    let area = centered_rect(64, 80, f.area());
+    let dim = Style::default().fg(Color::DarkGray);
+
+    // Header first, so the count-to-type + input field are NEVER pushed off-screen by a
+    // long list. The list below is then capped to whatever space remains.
+    let mut lines: Vec<Line> = vec![
+        Line::styled(
+            format!("TERMINATE {n} pod(s) — IRREVERSIBLE"),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        Line::from(""),
+        Line::from(format!("Type {n} to confirm:   > {typed}")),
+        Line::styled("[enter] terminate   [esc] cancel", dim),
+        Line::from(""),
+        Line::styled("pods:", Style::default().add_modifier(Modifier::BOLD)),
+    ];
+    let header = lines.len();
+    // Rows available for names inside the bordered box.
+    let cap = (area.height as usize).saturating_sub(2).saturating_sub(header).max(1);
+    if n <= cap {
+        for name in &names {
+            lines.push(Line::from(format!("  • {name}")));
+        }
+    } else {
+        // Leave one row for the "+K more" marker.
+        for name in names.iter().take(cap - 1) {
+            lines.push(Line::from(format!("  • {name}")));
+        }
+        lines.push(Line::styled(format!("  … +{} more", n - (cap - 1)), dim));
     }
-    if n > 20 {
-        text.push_str(&format!("  … +{} more\n", n - 20));
-    }
-    text.push_str(&format!("\nType the count ({n}) to confirm:\n\n  > {typed}\n\n[enter] apply  [esc] cancel"));
-    let area = centered_rect(60, 70, f.area());
+
     f.render_widget(Clear, area);
     f.render_widget(
-        Paragraph::new(text).wrap(Wrap { trim: false }).block(
+        Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Red))
