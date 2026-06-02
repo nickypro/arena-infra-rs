@@ -16,7 +16,15 @@ use arena_core::{Config, PodSpec};
 const DEFAULT_CONFIG: &str = "/home/dev/prod-ro/config.env";
 
 #[derive(Parser)]
-#[command(name = "arena", version, about = "Streamlined ARENA infra control plane")]
+#[command(
+    name = "arena",
+    version,
+    about = "Streamlined ARENA infra control plane",
+    // Cisco-style shorthands: any unambiguous prefix works (`arena po l` == `pods
+    // list`). Ambiguous prefixes (e.g. `p` for pods/proxy) error and ask you to
+    // disambiguate. Applies at each level.
+    infer_subcommands = true
+)]
 struct Cli {
     /// Path to config.env (defaults to the read-only prod copy).
     #[arg(long, default_value = DEFAULT_CONFIG, global = true)]
@@ -33,10 +41,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Machine (pod) lifecycle.
-    #[command(subcommand)]
+    #[command(subcommand, infer_subcommands = true)]
     Pods(PodCmd),
+    /// Launch the interactive dashboard (arena-tui), inheriting --provider/--config.
+    Tui,
     /// Plan port-forwarding/proxy wiring (read-only; prints config to apply).
-    #[command(subcommand)]
+    #[command(subcommand, infer_subcommands = true)]
     Proxy(ProxyCmd),
     /// Commit + push each pod's ARENA working tree to its autocommit branch over SSH.
     /// Branch is autocommit-{prefix}-w{week}d{day}-{machine}. Dry-run unless --apply.
@@ -63,11 +73,11 @@ enum Cmd {
         force: bool,
     },
     /// Inspect the loaded config.
-    #[command(subcommand)]
+    #[command(subcommand, infer_subcommands = true)]
     Config(ConfigCmd),
     /// Manage a cron schedule for `arena backup` (edits your crontab, touching only
     /// arena-managed lines).
-    #[command(subcommand)]
+    #[command(subcommand, infer_subcommands = true)]
     Cron(CronCmd),
 }
 
@@ -320,11 +330,12 @@ async fn main() -> Result<()> {
     // `config check` must work even when a provider key is missing (that's what it's
     // for), so build the provider lazily — only for commands that actually talk to one.
     let provider = match cli.cmd {
-        Cmd::Config(_) | Cmd::Cron(_) => None,
+        Cmd::Config(_) | Cmd::Cron(_) | Cmd::Tui => None,
         _ => Some(arena_core::provider::build(&cli.provider, &cfg)?),
     };
 
     match cli.cmd {
+        Cmd::Tui => launch_tui(&cli.provider, &cli.config),
         Cmd::Config(c) => handle_config(c, &cfg, &cli.provider),
         Cmd::Cron(c) => handle_cron(c, &cli.config).await,
         Cmd::Pods(p) => handle_pods(p, provider.unwrap().as_ref(), &cfg).await,
@@ -335,6 +346,42 @@ async fn main() -> Result<()> {
         Cmd::Setup { apply, force } => {
             handle_setup(provider.unwrap().as_ref(), &cfg, apply, force).await
         }
+    }
+}
+
+/// Launch the interactive dashboard, handing it the same provider/config the CLI was
+/// invoked with (the TUI reads these from `ARENA_PROVIDER`/`ARENA_CONFIG`). We prefer
+/// the `arena-tui` sitting next to this binary (so a workspace install is consistent),
+/// falling back to `arena-tui` on `PATH`. On Unix we `exec`-replace this process so the
+/// dashboard owns the terminal directly.
+fn launch_tui(provider: &str, config: &std::path::Path) -> Result<()> {
+    use std::process::Command;
+
+    let sibling = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("arena-tui")));
+    let program = match sibling {
+        Some(p) if p.exists() => p.into_os_string(),
+        _ => std::ffi::OsString::from("arena-tui"),
+    };
+
+    let mut cmd = Command::new(&program);
+    cmd.env("ARENA_PROVIDER", provider).env("ARENA_CONFIG", config);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // exec only returns on failure.
+        Err(anyhow::anyhow!(
+            "could not launch {}: {}",
+            program.to_string_lossy(),
+            cmd.exec()
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let status = cmd.status().context("launching arena-tui")?;
+        std::process::exit(status.code().unwrap_or(1));
     }
 }
 

@@ -110,11 +110,42 @@ cargo run -p arena-cli -- pods create -n 3
 # actually create them
 cargo run -p arena-cli -- pods create -n 3 --apply
 
-# interactive dashboard
+# interactive dashboard (or `arena tui`, which inherits --provider/--config)
 cargo run -p arena-tui
 
 # point at a different config
 cargo run -p arena-cli -- --config ./config.env pods list
+```
+
+### Command shorthands
+
+Subcommands accept any **unambiguous prefix** (Cisco-style), at every level:
+
+```bash
+arena po l          # == arena pods list
+arena tui           # launch the dashboard
+arena co c          # == arena config check
+arena b --apply     # == arena backup --apply
+```
+
+An ambiguous prefix errors and lists the candidates — e.g. `arena p` is rejected
+because it matches both `pods` and `proxy` (use `po`/`pr`); likewise `c` →
+`config`/`cron` (use `co`/`cr`).
+
+### Overriding config without editing it
+
+Any key in `config.env` can be overridden by an **environment variable of the same
+name** (env wins; it can't introduce brand-new keys). This is how you point at an SSH
+key the current user can actually read, without editing the shared, read-only prod
+config — e.g. when the dashboard's metrics show `ssh connect failed … key unreadable`
+because the configured key lives under `/root`:
+
+```bash
+# use a readable copy of the shared key for nvidia-smi over SSH
+SHARED_SSH_KEY_PATH=~/.ssh/arena8_key arena tui
+
+# same idea for the git deploy key used by `setup`
+GIT_SSH_KEY_LOCAL=~/.ssh/arena_infra_key arena setup --apply
 ```
 
 ## Layout

@@ -20,7 +20,23 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| Error::Config(format!("reading {}: {e}", path.display())))?;
-        Ok(Self::parse(&text))
+        let mut cfg = Self::parse(&text);
+        cfg.apply_overrides(|k| std::env::var(k).ok());
+        Ok(cfg)
+    }
+
+    /// Let environment variables override values from the file: any key already in the
+    /// config can be overridden by an env var of the same name (e.g.
+    /// `SHARED_SSH_KEY_PATH=~/.ssh/key arena-tui`). This is how an operator points at a
+    /// readable SSH key — or a different image, branch, etc. — *without editing the
+    /// shared, read-only prod config*. Only keys already present are overridden, so a
+    /// stray env var can't silently introduce a new setting.
+    fn apply_overrides<F: Fn(&str) -> Option<String>>(&mut self, lookup: F) {
+        for (k, v) in self.values.iter_mut() {
+            if let Some(override_val) = lookup(k) {
+                *v = override_val;
+            }
+        }
     }
 
     pub fn parse(text: &str) -> Self {
@@ -122,5 +138,19 @@ MACHINE_NAME_LIST=(
         assert_eq!(c.get("MACHINE_NAME_PREFIX"), Some("arena8"));
         assert_eq!(c.get_parsed::<u32>("RUNPOD_NUM_GPUS"), Some(1));
         assert_eq!(c.machine_names, vec!["apple", "autumn", "bloom"]);
+    }
+
+    #[test]
+    fn env_overrides_existing_keys_only() {
+        let mut c = Config::parse("SHARED_SSH_KEY_PATH=/root/.ssh/k\nIMAGE=base:1");
+        // A lookup that overrides a present key and offers one that isn't in the file.
+        c.apply_overrides(|k| match k {
+            "SHARED_SSH_KEY_PATH" => Some("/home/dev/.ssh/k".to_string()),
+            "BRAND_NEW_KEY" => Some("ignored".to_string()),
+            _ => None,
+        });
+        assert_eq!(c.get("SHARED_SSH_KEY_PATH"), Some("/home/dev/.ssh/k"));
+        assert_eq!(c.get("IMAGE"), Some("base:1")); // untouched
+        assert_eq!(c.get("BRAND_NEW_KEY"), None); // env can't introduce new keys
     }
 }
