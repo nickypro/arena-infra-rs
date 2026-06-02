@@ -97,9 +97,7 @@ pub async fn fetch(target: &SshTarget, progress_cmd: Option<&str>) -> PodMetrics
     let mut m = PodMetrics::default();
     match ssh::run(target, NVIDIA_SMI_QUERY).await {
         Ok(out) if out.success => m.gpus = parse_nvidia_smi(&out.stdout),
-        Ok(out) => {
-            m.error = Some(format!("nvidia-smi exit {:?}: {}", out.code, out.stderr.trim()))
-        }
+        Ok(out) => m.error = Some(describe_failure(out.code, &out.stderr)),
         Err(e) => m.error = Some(e.to_string()),
     }
     if let Some(pc) = progress_cmd.filter(|s| !s.is_empty()) {
@@ -117,9 +115,49 @@ pub async fn fetch(target: &SshTarget, progress_cmd: Option<&str>) -> PodMetrics
     m
 }
 
+/// Turn a failed remote command into a readable, correctly-attributed error.
+///
+/// SSH itself exits 255 when it can't connect or authenticate — that's *not* an
+/// nvidia-smi failure, so saying "nvidia-smi exit 255" is misleading. We attribute
+/// 255 to SSH and, when the stderr shows the identity file couldn't be read or the
+/// key was rejected, add the most common cause: the dashboard isn't running as a user
+/// that can read the configured SSH key (e.g. a `/root` key while running as `dev`).
+fn describe_failure(code: Option<i32>, stderr: &str) -> String {
+    let stderr = stderr.trim();
+    if code == Some(255) {
+        let auth_problem = stderr.contains("not accessible")
+            || stderr.contains("Permission denied")
+            || stderr.contains("Too many authentication failures");
+        let hint = if auth_problem {
+            " (ssh key unreadable or rejected — run as a user that can read SHARED_SSH_KEY_PATH, e.g. root)"
+        } else {
+            ""
+        };
+        format!("ssh connect failed: {stderr}{hint}")
+    } else {
+        format!("nvidia-smi exit {code:?}: {stderr}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attributes_255_to_ssh_with_key_hint() {
+        let e = describe_failure(
+            Some(255),
+            "Warning: Identity file /root/.ssh/arena8_key not accessible: Permission denied.",
+        );
+        assert!(e.starts_with("ssh connect failed:"));
+        assert!(e.contains("run as a user that can read"));
+    }
+
+    #[test]
+    fn real_nvidia_smi_exit_is_not_relabeled() {
+        let e = describe_failure(Some(127), "nvidia-smi: command not found");
+        assert!(e.starts_with("nvidia-smi exit Some(127)"));
+    }
 
     #[test]
     fn parses_multi_gpu_csv() {

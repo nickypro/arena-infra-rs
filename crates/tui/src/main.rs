@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -217,6 +217,11 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -
         let Event::Key(k) = event::read()? else { continue };
         if k.kind != KeyEventKind::Press {
             continue; // ignore key-release/repeat on terminals that emit them
+        }
+        // Ctrl+C always quits, from any mode. Raw mode swallows the usual SIGINT, so
+        // we handle the keystroke ourselves and let `restore_terminal` clean up.
+        if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
+            break;
         }
         let code = k.code;
 
