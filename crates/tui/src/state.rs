@@ -120,6 +120,21 @@ pub fn short_branch(branch: &str, prefix: &str) -> String {
     }
 }
 
+/// A compact status label so the STATUS column stays narrow: `RUNNING` -> `run`,
+/// `EXITED` -> `exit`, etc. Unknown statuses fall back to a lowercased 4-char prefix.
+pub fn short_status(s: &str) -> String {
+    match s.to_ascii_uppercase().as_str() {
+        "RUNNING" => "run".into(),
+        "EXITED" => "exit".into(),
+        "STOPPED" => "stop".into(),
+        "TERMINATED" => "term".into(),
+        "CREATED" => "new".into(),
+        "PENDING" | "PROVISIONING" => "prov".into(),
+        "RESTARTING" => "rstr".into(),
+        _ => s.chars().take(4).collect::<String>().to_lowercase(),
+    }
+}
+
 /// The actions a user can trigger against the selected pod from the dashboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -293,6 +308,14 @@ mod tests {
         assert_eq!(display_name("arena8-apple", "arena8", false), "arena8-apple");
         // a name without the prefix is left as-is
         assert_eq!(display_name("apple", "arena8", true), "apple");
+    }
+
+    #[test]
+    fn short_status_abbreviates_known_and_falls_back() {
+        assert_eq!(short_status("RUNNING"), "run");
+        assert_eq!(short_status("exited"), "exit");
+        assert_eq!(short_status("TERMINATED"), "term");
+        assert_eq!(short_status("WEIRDSTATE"), "weir"); // 4-char lowercased fallback
     }
 
     #[test]

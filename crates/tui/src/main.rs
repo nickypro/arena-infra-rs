@@ -48,7 +48,9 @@ use arena_core::naming;
 use arena_core::{Config, Pod, PodSpec};
 
 use prefs::Prefs;
-use state::{display_name, short_branch, summarize, Action, Confirm, FleetSummary, History};
+use state::{
+    display_name, short_branch, short_status, summarize, Action, Confirm, FleetSummary, History,
+};
 
 const DEFAULT_CONFIG: &str = "/home/dev/prod-ro/config.env";
 /// Shorter than backup/setup's 10s: a down pod shouldn't stall a whole metrics sweep.
@@ -970,14 +972,14 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
                 .or_else(|| p.gpu_type.clone())
                 .unwrap_or_else(|| "-".into());
             let branch = match m.and_then(|m| m.branch.clone()) {
-                Some(b) => truncate(&short_branch(&b, &ui.prefix), 18),
+                Some(b) => truncate(&short_branch(&b, &ui.prefix), 6),
                 None => "-".into(),
             };
             let (detail, detail_style) = detail_cell(m);
             Row::new(vec![
                 provider_cell(&p.provider),
                 Cell::from(ui.shown_name(&p.name)),
-                Cell::from(p.status.clone()),
+                Cell::from(short_status(&p.status)),
                 health_cell(m),
                 Cell::from(gpu),
                 Cell::from(util_str).style(util_style(util, err)),
@@ -992,14 +994,14 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     let widths = [
         Constraint::Length(1),  // P (provider glyph)
         Constraint::Length(16), // NAME
-        Constraint::Length(8),  // STATUS
+        Constraint::Length(4),  // STATUS (abbreviated: run/exit/stop…)
         Constraint::Length(3),  // SET (✓✓✓)
-        Constraint::Length(13), // GPU (e.g. "2×RTX A4000")
+        Constraint::Length(18), // GPU (e.g. "A100 80GB PCIe")
         Constraint::Length(5),  // GPU%
         Constraint::Length(8),  // MEM (e.g. "120/240G")
         Constraint::Length(4),  // TEMP (e.g. "85C")
         Constraint::Length(7),  // $/HR
-        Constraint::Length(18), // BRANCH
+        Constraint::Length(6),  // BRANCH (e.g. "w1d2")
         Constraint::Min(10),    // PROGRESS / ERROR
     ];
     let table = Table::new(rows, widths)
