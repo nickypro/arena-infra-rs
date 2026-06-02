@@ -25,16 +25,30 @@ impl Config {
         Ok(cfg)
     }
 
+    /// A few arena-specific keys that are commonly *absent* from a shared config but
+    /// that an operator legitimately needs to set per-run without editing the read-only
+    /// prod file (e.g. the iteration start date). These may be *introduced* from the
+    /// environment, not just overridden.
+    const ENV_INTRODUCIBLE: &'static [&'static str] = &["ARENA_START_DATE"];
+
     /// Let environment variables override values from the file: any key already in the
     /// config can be overridden by an env var of the same name (e.g.
-    /// `SHARED_SSH_KEY_PATH=~/.ssh/key arena-tui`). This is how an operator points at a
-    /// readable SSH key — or a different image, branch, etc. — *without editing the
-    /// shared, read-only prod config*. Only keys already present are overridden, so a
-    /// stray env var can't silently introduce a new setting.
+    /// `SHARED_SSH_KEY_PATH=~/.ssh/key arena-tui`), and the [`Self::ENV_INTRODUCIBLE`]
+    /// keys may be *added* even if the file omits them (e.g.
+    /// `ARENA_START_DATE=2026-05-25 arena backup`). This is how an operator configures a
+    /// run *without editing the shared, read-only prod config*; a stray env var still
+    /// can't introduce an arbitrary new setting.
     fn apply_overrides<F: Fn(&str) -> Option<String>>(&mut self, lookup: F) {
         for (k, v) in self.values.iter_mut() {
             if let Some(override_val) = lookup(k) {
                 *v = override_val;
+            }
+        }
+        for &k in Self::ENV_INTRODUCIBLE {
+            if !self.values.contains_key(k) {
+                if let Some(val) = lookup(k) {
+                    self.values.insert(k.to_string(), val);
+                }
             }
         }
     }
@@ -151,6 +165,15 @@ MACHINE_NAME_LIST=(
         });
         assert_eq!(c.get("SHARED_SSH_KEY_PATH"), Some("/home/dev/.ssh/k"));
         assert_eq!(c.get("IMAGE"), Some("base:1")); // untouched
-        assert_eq!(c.get("BRAND_NEW_KEY"), None); // env can't introduce new keys
+        assert_eq!(c.get("BRAND_NEW_KEY"), None); // env can't introduce an arbitrary key
+    }
+
+    #[test]
+    fn env_can_introduce_allowlisted_keys() {
+        // ARENA_START_DATE is absent from the file but may be set from the environment.
+        let mut c = Config::parse("IMAGE=base:1");
+        assert_eq!(c.get("ARENA_START_DATE"), None);
+        c.apply_overrides(|k| (k == "ARENA_START_DATE").then(|| "2026-05-25".to_string()));
+        assert_eq!(c.get("ARENA_START_DATE"), Some("2026-05-25"));
     }
 }
