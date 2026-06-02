@@ -1360,7 +1360,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                     "{:<22} {:<14} {:<10} {:<16} {:<16} {}",
                     p.name,
                     p.id,
-                    p.status,
+                    arena_core::status::short_status(&p.status),
                     p.gpu_type.as_deref().unwrap_or("-"),
                     p.ssh_ip.as_deref().unwrap_or("-"),
                     p.ssh_port.map(|x| x.to_string()).unwrap_or_else(|| "-".into()),

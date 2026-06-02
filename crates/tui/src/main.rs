@@ -48,9 +48,10 @@ use arena_core::naming;
 use arena_core::{Config, Pod, PodSpec};
 
 use prefs::Prefs;
+use arena_core::status::display_status;
 use state::{
-    display_name, display_status, short_branch, spark, summarize, Action, Confirm, FleetSummary,
-    History, NewPodForm, NpField, ProviderOpt,
+    display_name, short_branch, spark, summarize, Action, Confirm, FleetSummary, History,
+    NewPodForm, NpField, ProviderOpt,
 };
 
 const DEFAULT_CONFIG: &str = "/home/dev/prod-ro/config.env";
@@ -1180,7 +1181,7 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     let origin_ok = m.and_then(|m| m.origin.as_deref().map(|o| o.contains("github.com")));
     let facts = format!(
         "status:   {}\ngpu:      {}\nendpoint: {}\ncost:     {}\ndisk:     {}\nbranch:   {}\norigin:   {} {}\nsetup:    .name {}   key {}   origin→gh {}\nprogress: {}",
-        pod.status,
+        display_status(&pod.status, m.map(|m| m.error.is_none())),
         gpu,
         endpoint,
         cost,

@@ -19,6 +19,7 @@ pub mod retry;
 pub mod schedule;
 pub mod setup;
 pub mod ssh;
+pub mod status;
 
 pub use config::Config;
 pub use error::{Error, ProviderErrorKind, Result};
