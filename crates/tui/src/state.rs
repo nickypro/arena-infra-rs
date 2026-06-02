@@ -135,6 +135,147 @@ pub fn short_status(s: &str) -> String {
     }
 }
 
+/// One provider choice in the add-pod form, with whether its API key is configured.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderOpt {
+    pub name: String,
+    pub available: bool,
+}
+
+/// The editable fields of the add-pod form, in display order. Which ones apply depends
+/// on the chosen provider (no cloud type except RunPod; no GPU fields on Hetzner).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NpField {
+    Provider,
+    CloudType,
+    GpuType,
+    GpuCount,
+    Pods,
+}
+
+/// State of the interactive add-pod form: `↑↓` moves between [`NpField`]s, `←→` changes
+/// the selected field's value. All pure — `main` owns the provider build / listing.
+#[derive(Debug, Clone)]
+pub struct NewPodForm {
+    pub providers: Vec<ProviderOpt>,
+    pub provider_idx: usize,
+    pub cloud_types: Vec<String>,
+    pub cloud_idx: usize,
+    pub gpu_types: Vec<String>,
+    pub gpu_idx: usize,
+    pub gpu_count: u32,
+    pub count: usize,
+    /// Free machine names available on the selected provider (for the count cap).
+    pub free: Vec<String>,
+    /// Index into [`Self::fields`] of the currently-selected field.
+    pub field: usize,
+}
+
+fn wrap(idx: usize, delta: i32, len: usize) -> usize {
+    if len == 0 {
+        0
+    } else {
+        (idx as i32 + delta).rem_euclid(len as i32) as usize
+    }
+}
+
+impl NewPodForm {
+    pub fn provider_name(&self) -> &str {
+        self.providers.get(self.provider_idx).map(|p| p.name.as_str()).unwrap_or("runpod")
+    }
+
+    fn is_runpod(&self) -> bool {
+        self.provider_name() == "runpod"
+    }
+
+    /// GPU providers take GPU type/count; Hetzner is CPU-only.
+    fn is_gpu(&self) -> bool {
+        self.provider_name() != "hetzner"
+    }
+
+    /// The fields that apply to the current provider, in display order.
+    pub fn fields(&self) -> Vec<NpField> {
+        let mut f = vec![NpField::Provider];
+        if self.is_runpod() {
+            f.push(NpField::CloudType);
+        }
+        if self.is_gpu() {
+            f.push(NpField::GpuType);
+            f.push(NpField::GpuCount);
+        }
+        f.push(NpField::Pods);
+        f
+    }
+
+    pub fn selected(&self) -> NpField {
+        let f = self.fields();
+        f[self.field.min(f.len() - 1)]
+    }
+
+    pub fn move_field(&mut self, delta: i32) {
+        let n = self.fields().len();
+        self.field = wrap(self.field, delta, n);
+    }
+
+    /// Change the selected field's value by `delta` (−1 left / +1 right). Returns true
+    /// if the *provider* changed, since the caller must then re-list free names.
+    pub fn change(&mut self, delta: i32) -> bool {
+        match self.selected() {
+            NpField::Provider => {
+                self.cycle_provider(delta);
+                // The field set may have shrunk (e.g. → Hetzner); keep `field` valid.
+                let n = self.fields().len();
+                self.field = self.field.min(n - 1);
+                return true;
+            }
+            NpField::CloudType => self.cloud_idx = wrap(self.cloud_idx, delta, self.cloud_types.len()),
+            NpField::GpuType => self.gpu_idx = wrap(self.gpu_idx, delta, self.gpu_types.len()),
+            NpField::GpuCount => self.gpu_count = (self.gpu_count as i32 + delta).clamp(1, 8) as u32,
+            NpField::Pods => {
+                let max = self.free.len().max(1) as i32;
+                self.count = (self.count as i32 + delta).clamp(1, max) as usize;
+            }
+        }
+        false
+    }
+
+    /// Step to the next available provider in `delta`'s direction, skipping any whose
+    /// API key isn't configured (so you can't select an unusable provider).
+    fn cycle_provider(&mut self, delta: i32) {
+        let n = self.providers.len() as i32;
+        if n == 0 {
+            return;
+        }
+        let step = if delta < 0 { -1 } else { 1 };
+        let mut idx = self.provider_idx as i32;
+        for _ in 0..n {
+            idx = (idx + step).rem_euclid(n);
+            if self.providers[idx as usize].available {
+                self.provider_idx = idx as usize;
+                return;
+            }
+        }
+    }
+
+    /// The selected cloud type, only meaningful for RunPod.
+    pub fn cloud_type(&self) -> Option<&str> {
+        if self.is_runpod() {
+            self.cloud_types.get(self.cloud_idx).map(String::as_str)
+        } else {
+            None
+        }
+    }
+
+    pub fn gpu_type(&self) -> &str {
+        self.gpu_types.get(self.gpu_idx).map(String::as_str).unwrap_or("")
+    }
+
+    /// The names that would be created for the current count.
+    pub fn planned_names(&self) -> Vec<String> {
+        self.free.iter().take(self.count).cloned().collect()
+    }
+}
+
 /// The actions a user can trigger against the selected pod from the dashboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -308,6 +449,60 @@ mod tests {
         assert_eq!(display_name("arena8-apple", "arena8", false), "arena8-apple");
         // a name without the prefix is left as-is
         assert_eq!(display_name("apple", "arena8", true), "apple");
+    }
+
+    fn form() -> NewPodForm {
+        NewPodForm {
+            providers: vec![
+                ProviderOpt { name: "runpod".into(), available: true },
+                ProviderOpt { name: "vast".into(), available: false },
+                ProviderOpt { name: "hetzner".into(), available: true },
+            ],
+            provider_idx: 0,
+            cloud_types: vec!["COMMUNITY".into(), "SECURE".into()],
+            cloud_idx: 0,
+            gpu_types: vec!["RTX 3090".into(), "RTX 4090".into()],
+            gpu_idx: 0,
+            gpu_count: 1,
+            count: 1,
+            free: vec!["arena8-apple".into(), "arena8-autumn".into()],
+            field: 0,
+        }
+    }
+
+    #[test]
+    fn fields_depend_on_provider() {
+        let f = form();
+        assert_eq!(
+            f.fields(),
+            vec![NpField::Provider, NpField::CloudType, NpField::GpuType, NpField::GpuCount, NpField::Pods]
+        );
+    }
+
+    #[test]
+    fn provider_cycle_skips_unavailable_and_reshapes_fields() {
+        let mut f = form();
+        // runpod -> (skip vast, no key) -> hetzner
+        assert!(f.change(1)); // provider changed
+        assert_eq!(f.provider_name(), "hetzner");
+        // hetzner is CPU-only: no cloud/gpu fields
+        assert_eq!(f.fields(), vec![NpField::Provider, NpField::Pods]);
+        assert_eq!(f.cloud_type(), None);
+    }
+
+    #[test]
+    fn change_clamps_gpu_count_and_pods() {
+        let mut f = form();
+        f.field = 3; // GpuCount
+        for _ in 0..20 {
+            f.change(1);
+        }
+        assert_eq!(f.gpu_count, 8); // capped
+        f.field = 4; // Pods
+        for _ in 0..20 {
+            f.change(1);
+        }
+        assert_eq!(f.count, 2); // capped at free.len()
     }
 
     #[test]
