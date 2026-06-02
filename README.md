@@ -70,10 +70,14 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
   pod. Fetching runs in a **background task** so the UI never freezes; it auto-refreshes
   (`ARENA_REFRESH_SECS`, default 5) and `f` cycles the cadence live (2/5/10/20/60s).
   Provider via `ARENA_PROVIDER` (default `runpod`), config via `ARENA_CONFIG`.
-  - **Columns**: GPU (live from `nvidia-smi`, e.g. `2×RTX A4000` — the provider list
-    API omits this), GPU%/MEM/TEMP, `$/HR`, a **SET** health glyph (`✓/✗/·` for
-    `~/.name`, the deploy key, git origin→GitHub), and **BRANCH**. The **fleet summary
-    bar** shows total GPUs, mean util, memory, and burn as both `$/hr` and `$/day`.
+  - **Columns**: a provider badge (`R`/`V`/`H`), NAME (short `apple` by default;
+    `s` toggles full `arena8-apple` and the choice persists to
+    `~/.config/arena-tui/prefs`), STATUS, a **SET** health glyph (`✓/✗/·` for `~/.name`,
+    the deploy key, git origin→GitHub), GPU (live from `nvidia-smi`, e.g. `2×RTX A4000`
+    — the provider list API omits this), GPU%/MEM/TEMP, `$/HR`, **BRANCH** (autocommit
+    branches shortened to their `w1d2` label; `main`/others shown as-is), and progress.
+    The **fleet summary bar** shows total GPUs, mean util, memory, and burn as both
+    `$/hr` and `$/day`.
   - **Navigate** with `↑/↓`/`j/k`; `enter` opens a per-pod detail pane (per-GPU
     breakdown, full branch/origin/health, util/temp **sparklines**). `Ctrl-C`/`q` quit.
   - **Act** on the selected pod with `a` (restart / stop / terminate / backup / setup),

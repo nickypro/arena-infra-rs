@@ -99,6 +99,27 @@ pub fn summarize(pods: &[Pod], metrics: &HashMap<String, PodMetrics>) -> FleetSu
     s
 }
 
+/// How a pod name is shown: full (`arena8-apple`) or short (`apple`). Stripping the
+/// `{prefix}-` is purely cosmetic — the canonical name is still used for provider calls.
+pub fn display_name(full: &str, prefix: &str, short: bool) -> String {
+    if short {
+        full.strip_prefix(&format!("{prefix}-")).unwrap_or(full).to_string()
+    } else {
+        full.to_string()
+    }
+}
+
+/// Shorten an autocommit branch to just its iteration label: an
+/// `autocommit-{prefix}-w1d2-apple` becomes `w1d2` (the machine name is already in the
+/// NAME column). Any other branch (`main`, a feature branch, …) is returned unchanged.
+pub fn short_branch(branch: &str, prefix: &str) -> String {
+    match branch.strip_prefix(&format!("autocommit-{prefix}-")) {
+        // rest is "w1d2-apple" -> take the part before the trailing "-<machine>".
+        Some(rest) => rest.rsplit_once('-').map(|(label, _)| label.to_string()).unwrap_or_else(|| rest.to_string()),
+        None => branch.to_string(),
+    }
+}
+
 /// The actions a user can trigger against the selected pod from the dashboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -264,5 +285,22 @@ mod tests {
     fn menu_keys_map_to_actions() {
         assert_eq!(Action::from_key('t'), Some(Action::Terminate));
         assert_eq!(Action::from_key('z'), None);
+    }
+
+    #[test]
+    fn display_name_strips_prefix_only_when_short() {
+        assert_eq!(display_name("arena8-apple", "arena8", true), "apple");
+        assert_eq!(display_name("arena8-apple", "arena8", false), "arena8-apple");
+        // a name without the prefix is left as-is
+        assert_eq!(display_name("apple", "arena8", true), "apple");
+    }
+
+    #[test]
+    fn short_branch_extracts_iteration_label() {
+        assert_eq!(short_branch("autocommit-arena8-w1d2-apple", "arena8"), "w1d2");
+        assert_eq!(short_branch("autocommit-arena8-w0d1-autumn", "arena8"), "w0d1");
+        // non-autocommit branches are untouched
+        assert_eq!(short_branch("main", "arena8"), "main");
+        assert_eq!(short_branch("feature/foo", "arena8"), "feature/foo");
     }
 }

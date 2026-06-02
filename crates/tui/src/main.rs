@@ -18,6 +18,7 @@
 //! Provider is chosen by `ARENA_PROVIDER` (default `runpod`); config path by
 //! `ARENA_CONFIG`; initial cadence by `ARENA_REFRESH_SECS` (default 5).
 
+mod prefs;
 mod state;
 
 use std::collections::HashMap;
@@ -46,7 +47,8 @@ use arena_core::ssh::{self, SshTarget};
 use arena_core::naming;
 use arena_core::{Config, Pod, PodSpec};
 
-use state::{summarize, Action, Confirm, FleetSummary, History};
+use prefs::Prefs;
+use state::{display_name, short_branch, summarize, Action, Confirm, FleetSummary, History};
 
 const DEFAULT_CONFIG: &str = "/home/dev/prod-ro/config.env";
 /// Shorter than backup/setup's 10s: a down pod shouldn't stall a whole metrics sweep.
@@ -96,9 +98,20 @@ struct Ui {
     provider_name: String,
     config_path: String,
     cfg: Config,
+    /// `MACHINE_NAME_PREFIX`, for shortening names/branches.
+    prefix: String,
+    /// Show short pod names (`apple`) instead of full (`arena8-apple`). Persisted.
+    short_names: bool,
     mode: Mode,
     /// Cursor into `Shared::pods` (clamped to a valid row each frame).
     selected: usize,
+}
+
+impl Ui {
+    /// The pod's name as currently displayed (short or full).
+    fn shown_name(&self, full: &str) -> String {
+        display_name(full, &self.prefix, self.short_names)
+    }
 }
 
 #[tokio::main]
@@ -133,9 +146,12 @@ async fn main() -> Result<()> {
         nudge.clone(),
     ));
 
+    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena").to_string();
     let ui = Ui {
         provider_name,
         config_path,
+        prefix,
+        short_names: Prefs::load().short_names,
         cfg,
         mode: Mode::List,
         selected: 0,
@@ -335,6 +351,11 @@ async fn run(
                         }
                     }
                     KeyCode::Char('r') => nudge.notify_one(),
+                    KeyCode::Char('s') => {
+                        // Toggle short/full names and persist the choice.
+                        ui.short_names = !ui.short_names;
+                        Prefs { short_names: ui.short_names }.save();
+                    }
                     KeyCode::Char('f') => {
                         cycle_interval(interval);
                         nudge.notify_one(); // apply a shorter cadence immediately
@@ -376,7 +397,8 @@ async fn run(
                         (Action::from_key(ch), selected_pod(shared, ui.selected))
                     {
                         let preview = build_preview(&ui.cfg, action, &pod);
-                        ui.mode = Mode::Confirm(Confirm::new(action, pod.name, pod.id, preview));
+                        let shown = ui.shown_name(&pod.name);
+                        ui.mode = Mode::Confirm(Confirm::new(action, shown, pod.id, preview));
                     }
                 }
                 _ => {}
@@ -716,6 +738,20 @@ fn truncate(s: &str, max: usize) -> String {
     out
 }
 
+/// A one-letter, color-coded provider badge: R=runpod, V=vast, H=hetzner.
+fn provider_cell(provider: &str) -> Cell<'static> {
+    let (letter, color) = match provider {
+        "runpod" => ("R", Color::Cyan),
+        "vast" => ("V", Color::Magenta),
+        "hetzner" => ("H", Color::Yellow),
+        other => (other.get(0..1).unwrap_or("?"), Color::Gray),
+    };
+    Cell::from(Span::styled(
+        letter.to_uppercase(),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    ))
+}
+
 /// The compact setup-health cell: three glyphs for `~/.name`, the deploy key, and the
 /// git origin pointing at GitHub. ✓ green / ✗ red / · gray (unknown or unreachable).
 fn health_cell(m: Option<&PodMetrics>) -> Cell<'static> {
@@ -825,7 +861,8 @@ fn summary_line(s: &FleetSummary) -> Paragraph<'static> {
 
 fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     let header = Row::new(vec![
-        "NAME", "STATUS", "SET", "GPU", "GPU%", "MEM", "TEMP", "$/HR", "BRANCH", "PROGRESS / ERROR",
+        "P", "NAME", "STATUS", "SET", "GPU", "GPU%", "MEM", "TEMP", "$/HR", "BRANCH",
+        "PROGRESS / ERROR",
     ])
     .style(Style::default().add_modifier(Modifier::BOLD));
     let rows: Vec<Row> = shared
@@ -852,13 +889,14 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
                 .and_then(|m| m.gpu_summary())
                 .or_else(|| p.gpu_type.clone())
                 .unwrap_or_else(|| "-".into());
-            let branch = truncate(
-                &m.and_then(|m| m.branch.clone()).unwrap_or_else(|| "-".into()),
-                20,
-            );
+            let branch = match m.and_then(|m| m.branch.clone()) {
+                Some(b) => truncate(&short_branch(&b, &ui.prefix), 18),
+                None => "-".into(),
+            };
             let (detail, detail_style) = detail_cell(m);
             Row::new(vec![
-                Cell::from(p.name.clone()),
+                provider_cell(&p.provider),
+                Cell::from(ui.shown_name(&p.name)),
                 Cell::from(p.status.clone()),
                 health_cell(m),
                 Cell::from(gpu),
@@ -872,7 +910,8 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
         })
         .collect();
     let widths = [
-        Constraint::Length(18), // NAME
+        Constraint::Length(1),  // P (provider glyph)
+        Constraint::Length(16), // NAME
         Constraint::Length(8),  // STATUS
         Constraint::Length(3),  // SET (✓✓✓)
         Constraint::Length(13), // GPU (e.g. "2×RTX A4000")
@@ -880,7 +919,7 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
         Constraint::Length(8),  // MEM (e.g. "120/240G")
         Constraint::Length(4),  // TEMP (e.g. "85C")
         Constraint::Length(7),  // $/HR
-        Constraint::Length(20), // BRANCH
+        Constraint::Length(18), // BRANCH
         Constraint::Min(10),    // PROGRESS / ERROR
     ];
     let table = Table::new(rows, widths)
@@ -902,7 +941,8 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     let Some(pod) = shared.pods.get(ui.selected) else { return };
     let m = shared.metrics.get(&pod.name);
 
-    let block = Block::default().borders(Borders::ALL).title(format!(" {} ", pod.name));
+    let block =
+        Block::default().borders(Borders::ALL).title(format!(" {} ", ui.shown_name(&pod.name)));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -1022,8 +1062,8 @@ fn footer_hint(shared: &Shared, ui: &Ui, secs: u64) -> String {
     };
     let spin = if shared.refreshing { " ⟳" } else { "" };
     let keys = match ui.mode {
-        Mode::List => "[jk] select  [enter] detail  [a] act  [A] fleet  [n] new  [f] interval  [r] now  [q] quit",
-        Mode::Detail => "[jk] select  [a] act  [A] fleet  [n] new  [f] interval  [r] now  [esc] back  [q] quit",
+        Mode::List => "[jk] sel  [enter] detail  [a] act  [A] fleet  [n] new  [s] names  [f] interval  [r] now  [q] quit",
+        Mode::Detail => "[jk] sel  [a] act  [A] fleet  [n] new  [s] names  [f] interval  [r] now  [esc] back  [q] quit",
         Mode::Menu => "[r/s/t/b/p] choose action  [esc] cancel",
         Mode::Confirm(_) => "type to confirm  [enter] apply  [esc] cancel",
         Mode::FleetMenu => "[r/b/p] choose fleet action  [esc] cancel",
@@ -1055,7 +1095,11 @@ fn centered_rect(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
 }
 
 fn render_menu(f: &mut Frame, shared: &Shared, ui: &Ui) {
-    let name = shared.pods.get(ui.selected).map(|p| p.name.as_str()).unwrap_or("?");
+    let name = shared
+        .pods
+        .get(ui.selected)
+        .map(|p| ui.shown_name(&p.name))
+        .unwrap_or_else(|| "?".into());
     let lines = vec![
         format!("Actions for {name}:"),
         String::new(),
