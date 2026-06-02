@@ -688,30 +688,44 @@ async fn handle_setup(provider: &dyn Provider, cfg: &Config, apply: bool, force:
         return Ok(());
     }
 
-    let mut ok = 0;
-    let mut failed = 0;
-    for (name, target) in &targets {
-        // 1) copy the key, 2) run the provisioning script.
-        let copied = ssh::scp(target, &scfg.key_local, &scfg.key_remote).await;
-        let result = match copied {
-            Ok(out) if out.success => ssh::run(target, &scfg.remote_command(name, force)).await,
-            Ok(out) => Err(arena_core::Error::provider(format!(
-                "scp key failed: {}",
-                out.stderr.trim()
-            ))),
-            Err(e) => Err(e),
-        };
+    // Provision concurrently across the fleet, printing a [done/total] line as each
+    // pod finishes so there's live progress (36 pods × scp+ssh is slow serially).
+    let total = targets.len();
+    println!("Provisioning {total} pod(s) over SSH…");
+    let mut set = tokio::task::JoinSet::new();
+    for (name, target) in targets {
+        let key_local = scfg.key_local.clone();
+        let key_remote = scfg.key_remote.clone();
+        let remote_cmd = scfg.remote_command(&name, force);
+        set.spawn(async move {
+            let copied = ssh::scp(&target, &key_local, &key_remote).await;
+            let result = match copied {
+                Ok(out) if out.success => ssh::run(&target, &remote_cmd).await,
+                Ok(out) => Err(arena_core::Error::provider(format!(
+                    "scp key failed: {}",
+                    out.stderr.trim()
+                ))),
+                Err(e) => Err(e),
+            };
+            (name, result)
+        });
+    }
+
+    let (mut ok, mut failed, mut done) = (0, 0, 0);
+    while let Some(joined) = set.join_next().await {
+        done += 1;
+        let Ok((name, result)) = joined else { continue };
         match result {
             Ok(out) if out.success => {
-                println!("[set up]  {name}");
+                println!("[{done}/{total}] ✓ {name}");
                 ok += 1;
             }
             Ok(out) => {
-                eprintln!("[FAILED]  {name} (exit {:?}): {}", out.code, out.stderr.trim());
+                println!("[{done}/{total}] ✗ {name} (exit {:?}): {}", out.code, out.stderr.trim());
                 failed += 1;
             }
             Err(e) => {
-                eprintln!("[FAILED]  {name}: {e}");
+                println!("[{done}/{total}] ✗ {name}: {e}");
                 failed += 1;
             }
         }
