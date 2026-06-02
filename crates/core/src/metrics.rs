@@ -92,6 +92,9 @@ pub struct PodMetrics {
     pub has_name: Option<bool>,
     /// Whether the deploy key exists on the pod (None = not probed / unreachable).
     pub has_key: Option<bool>,
+    /// Root-filesystem usage (used, total) in MB, if reported.
+    pub disk_used_mb: Option<u32>,
+    pub disk_total_mb: Option<u32>,
 }
 
 impl PodMetrics {
@@ -130,6 +133,14 @@ impl PodMetrics {
         self.gpus.iter().filter_map(|g| g.temp_c).max()
     }
 
+    /// Root-filesystem (used, total) in MB, if both reported.
+    pub fn disk_summary(&self) -> Option<(u32, u32)> {
+        match (self.disk_used_mb, self.disk_total_mb) {
+            (Some(u), Some(t)) => Some((u, t)),
+            _ => None,
+        }
+    }
+
     /// A compact GPU descriptor like "RTX A4000" or "2×RTX A4000", from the live
     /// `nvidia-smi` readout (the provider list API often doesn't report GPU type).
     pub fn gpu_summary(&self) -> Option<String> {
@@ -163,6 +174,8 @@ fn remote_command(opts: &ProbeOpts) -> String {
         let q = shell_quote(key);
         s.push_str(&format!("([ -e {q} ] && echo key=1 || echo key=0); "));
     }
+    // Root-filesystem usage in 1K-blocks: "used total" (portable df -k + awk).
+    s.push_str("echo \"disk=$(df -k / 2>/dev/null | awk 'NR>1{print $3\" \"$2; exit}')\"; ");
     if let Some(pc) = opts.progress_cmd.as_deref().filter(|s| !s.is_empty()) {
         // Take the last line so a chatty command still yields one tidy value.
         s.push_str(&format!("echo \"progress=$({pc} 2>/dev/null | tail -n1)\"; "));
@@ -183,6 +196,14 @@ fn parse_probe(stdout: &str, m: &mut PodMetrics) {
             "origin" => m.origin = (!v.is_empty()).then(|| v.to_string()),
             "name" => m.has_name = Some(v == "1"),
             "key" => m.has_key = Some(v == "1"),
+            "disk" => {
+                // "used_kb total_kb" -> MB
+                let mut it = v.split_whitespace().filter_map(|x| x.parse::<u64>().ok());
+                if let (Some(u), Some(t)) = (it.next(), it.next()) {
+                    m.disk_used_mb = Some((u / 1024) as u32);
+                    m.disk_total_mb = Some((t / 1024) as u32);
+                }
+            }
             "progress" => m.progress = (!v.is_empty()).then(|| v.to_string()),
             _ => {}
         }
@@ -299,7 +320,7 @@ mod tests {
     #[test]
     fn parses_combined_probe_output() {
         let out = format!(
-            "NVIDIA RTX A4000, 15, 1000, 16000, 45\n{SENTINEL}\nbranch=autocommit-arena8-w0d1-apple\norigin=git@github.com:styme3279/ARENA_3.0.git\nname=1\nkey=0\nprogress=epoch 3/10\n"
+            "NVIDIA RTX A4000, 15, 1000, 16000, 45\n{SENTINEL}\nbranch=autocommit-arena8-w0d1-apple\norigin=git@github.com:styme3279/ARENA_3.0.git\nname=1\nkey=0\ndisk=12582912 104857600\nprogress=epoch 3/10\n"
         );
         let mut m = PodMetrics::default();
         parse_probe(&out, &mut m);
@@ -309,6 +330,8 @@ mod tests {
         assert_eq!(m.origin.as_deref(), Some("git@github.com:styme3279/ARENA_3.0.git"));
         assert_eq!(m.has_name, Some(true));
         assert_eq!(m.has_key, Some(false));
+        // 12582912 KB / 1024 = 12288 MB used; 104857600 KB / 1024 = 102400 MB total.
+        assert_eq!(m.disk_summary(), Some((12288, 102400)));
         assert_eq!(m.progress.as_deref(), Some("epoch 3/10"));
     }
 

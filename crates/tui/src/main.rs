@@ -984,7 +984,7 @@ fn summary_line(s: &FleetSummary) -> Paragraph<'static> {
 fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: bool) {
     const SPARK_W: usize = 12;
     let mut header_cells =
-        vec!["P", "NAME", "STATUS", "SET", "GPU", "GPU%", "MEM", "TEMP", "$/HR", "BRANCH", "PROGRESS / ERROR"];
+        vec!["P", "NAME", "STATUS", "SET", "GPU", "GPU%", "MEM", "TEMP", "DISK", "$/HR", "BRANCH", "PROGRESS / ERROR"];
     if with_spark {
         header_cells.push("GPU%~");
         header_cells.push("MEM%~");
@@ -1004,6 +1004,10 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                 (None, false) => "-".into(),
             };
             let mem = match m.and_then(|m| m.mem_summary()) {
+                Some((u, t)) => format!("{:.0}/{:.0}G", u as f64 / 1024.0, t as f64 / 1024.0),
+                None => "-".into(),
+            };
+            let disk = match m.and_then(|m| m.disk_summary()) {
                 Some((u, t)) => format!("{:.0}/{:.0}G", u as f64 / 1024.0, t as f64 / 1024.0),
                 None => "-".into(),
             };
@@ -1029,6 +1033,7 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                 Cell::from(util_str).style(util_style(util, err)),
                 Cell::from(mem),
                 Cell::from(temp_str).style(temp_style(temp)),
+                Cell::from(disk),
                 Cell::from(cost),
                 Cell::from(branch),
                 Cell::from(detail).style(detail_style),
@@ -1057,6 +1062,7 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
         Constraint::Length(5),  // GPU%
         Constraint::Length(9),  // MEM (e.g. "120/240G")
         Constraint::Length(4),  // TEMP (e.g. "85C")
+        Constraint::Length(9),  // DISK (e.g. "12/100G")
         Constraint::Length(7),  // $/HR
         Constraint::Length(6),  // BRANCH (e.g. "w1d2")
         Constraint::Min(10),    // PROGRESS / ERROR
@@ -1092,7 +1098,7 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(8), // header facts
+            Constraint::Length(9), // header facts
             Constraint::Min(3),    // per-GPU table
             Constraint::Length(3), // util sparkline
             Constraint::Length(3), // temp sparkline
@@ -1115,6 +1121,13 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
         .cost_per_hr
         .map(|c| format!("${c:.2}/hr  (${:.2}/day)", c * 24.0))
         .unwrap_or_else(|| "-".into());
+    let disk = match m.and_then(|m| m.disk_summary()) {
+        Some((u, t)) => {
+            let pct = if t > 0 { u as f64 / t as f64 * 100.0 } else { 0.0 };
+            format!("{:.1}/{:.1}G ({pct:.0}%)", u as f64 / 1024.0, t as f64 / 1024.0)
+        }
+        None => "-".into(),
+    };
     let ok = |b: Option<bool>| match b {
         Some(true) => "✓",
         Some(false) => "✗",
@@ -1123,11 +1136,12 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     let origin = m.and_then(|m| m.origin.clone()).unwrap_or_else(|| "-".into());
     let origin_ok = m.and_then(|m| m.origin.as_deref().map(|o| o.contains("github.com")));
     let facts = format!(
-        "status:   {}\ngpu:      {}\nendpoint: {}\ncost:     {}\nbranch:   {}\norigin:   {} {}\nsetup:    .name {}   key {}   origin→gh {}\nprogress: {}",
+        "status:   {}\ngpu:      {}\nendpoint: {}\ncost:     {}\ndisk:     {}\nbranch:   {}\norigin:   {} {}\nsetup:    .name {}   key {}   origin→gh {}\nprogress: {}",
         pod.status,
         gpu,
         endpoint,
         cost,
+        disk,
         m.and_then(|m| m.branch.clone()).unwrap_or_else(|| "-".into()),
         truncate(&origin, 32),
         ok(origin_ok),
