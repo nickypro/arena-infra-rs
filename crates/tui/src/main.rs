@@ -49,8 +49,8 @@ use arena_core::{Config, Pod, PodSpec};
 
 use prefs::Prefs;
 use state::{
-    display_name, short_branch, short_status, summarize, Action, Confirm, FleetSummary, History,
-    NewPodForm, NpField, ProviderOpt,
+    display_name, short_branch, short_status, spark, summarize, Action, Confirm, FleetSummary,
+    History, NewPodForm, NpField, ProviderOpt,
 };
 
 const DEFAULT_CONFIG: &str = "/home/dev/prod-ro/config.env";
@@ -206,10 +206,14 @@ async fn fetch_loop(
                 let mut s = shared.lock().unwrap();
                 for pod in &pods {
                     let m = metrics.get(&pod.name);
-                    s.history
-                        .entry(pod.name.clone())
-                        .or_default()
-                        .push(m.and_then(|m| m.mean_util()), m.and_then(|m| m.max_temp()));
+                    let mem_pct = m.and_then(|m| m.mem_summary()).map(|(u, t)| {
+                        if t > 0 { (u as u64 * 100 / t as u64) as u32 } else { 0 }
+                    });
+                    s.history.entry(pod.name.clone()).or_default().push(
+                        m.and_then(|m| m.mean_util()),
+                        m.and_then(|m| m.max_temp()),
+                        mem_pct,
+                    );
                 }
                 s.summary = summary;
                 s.status = status;
@@ -980,10 +984,11 @@ fn view(f: &mut Frame, shared: &Shared, ui: &Ui, secs: u64) {
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
             .split(chunks[2]);
-        pods_table(f, shared, ui, cols[0]);
+        // No room for the history sparklines in the split view.
+        pods_table(f, shared, ui, cols[0], false);
         detail_pane(f, shared, ui, cols[1]);
     } else {
-        pods_table(f, shared, ui, chunks[2]);
+        pods_table(f, shared, ui, chunks[2], true);
     }
 
     f.render_widget(Paragraph::new(footer_hint(shared, ui, secs)), chunks[3]);
@@ -1028,12 +1033,16 @@ fn summary_line(s: &FleetSummary) -> Paragraph<'static> {
     .style(Style::default().add_modifier(Modifier::BOLD))
 }
 
-fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
-    let header = Row::new(vec![
-        "P", "NAME", "STATUS", "SET", "GPU", "GPU%", "MEM", "TEMP", "$/HR", "BRANCH",
-        "PROGRESS / ERROR",
-    ])
-    .style(Style::default().add_modifier(Modifier::BOLD));
+fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: bool) {
+    const SPARK_W: usize = 12;
+    let mut header_cells =
+        vec!["P", "NAME", "STATUS", "SET", "GPU", "GPU%", "MEM", "TEMP", "$/HR", "BRANCH", "PROGRESS / ERROR"];
+    if with_spark {
+        header_cells.push("GPU%~");
+        header_cells.push("MEM%~");
+    }
+    let header = Row::new(header_cells).style(Style::default().add_modifier(Modifier::BOLD));
+
     let rows: Vec<Row> = shared
         .pods
         .iter()
@@ -1063,7 +1072,7 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
                 None => "-".into(),
             };
             let (detail, detail_style) = detail_cell(m);
-            Row::new(vec![
+            let mut cells = vec![
                 provider_cell(&p.provider),
                 Cell::from(ui.shown_name(&p.name)),
                 Cell::from(short_status(&p.status)),
@@ -1075,10 +1084,23 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
                 Cell::from(cost),
                 Cell::from(branch),
                 Cell::from(detail).style(detail_style),
-            ])
+            ];
+            if with_spark {
+                let h = shared.history.get(&p.name);
+                let gpu_hist = h.map(|h| h.util_data()).unwrap_or_default();
+                let mem_hist = h.map(|h| h.mem_data()).unwrap_or_default();
+                cells.push(
+                    Cell::from(spark(&gpu_hist, SPARK_W)).style(Style::default().fg(Color::Green)),
+                );
+                cells.push(
+                    Cell::from(spark(&mem_hist, SPARK_W)).style(Style::default().fg(Color::Cyan)),
+                );
+            }
+            Row::new(cells)
         })
         .collect();
-    let widths = [
+
+    let mut widths = vec![
         Constraint::Length(1),  // P (provider glyph)
         Constraint::Length(16), // NAME
         Constraint::Length(4),  // STATUS (abbreviated: run/exit/stop…)
@@ -1091,6 +1113,10 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
         Constraint::Length(6),  // BRANCH (e.g. "w1d2")
         Constraint::Min(10),    // PROGRESS / ERROR
     ];
+    if with_spark {
+        widths.push(Constraint::Length(SPARK_W as u16)); // GPU% history
+        widths.push(Constraint::Length(SPARK_W as u16)); // MEM% history
+    }
     let table = Table::new(rows, widths)
         .header(header)
         .row_highlight_style(Style::default().bg(Color::Indexed(237)).add_modifier(Modifier::BOLD))

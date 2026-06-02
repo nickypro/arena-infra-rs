@@ -20,13 +20,16 @@ pub const HISTORY_LEN: usize = 60;
 pub struct History {
     pub util: VecDeque<u64>,
     pub temp: VecDeque<u64>,
+    /// GPU memory usage as a percentage of total.
+    pub mem: VecDeque<u64>,
 }
 
 impl History {
     /// Append one refresh's reading, evicting the oldest beyond [`HISTORY_LEN`].
-    pub fn push(&mut self, util: Option<u32>, temp: Option<u32>) {
+    pub fn push(&mut self, util: Option<u32>, temp: Option<u32>, mem_pct: Option<u32>) {
         push_capped(&mut self.util, util.unwrap_or(0) as u64);
         push_capped(&mut self.temp, temp.unwrap_or(0) as u64);
+        push_capped(&mut self.mem, mem_pct.unwrap_or(0) as u64);
     }
 
     pub fn util_data(&self) -> Vec<u64> {
@@ -36,6 +39,10 @@ impl History {
     pub fn temp_data(&self) -> Vec<u64> {
         self.temp.iter().copied().collect()
     }
+
+    pub fn mem_data(&self) -> Vec<u64> {
+        self.mem.iter().copied().collect()
+    }
 }
 
 fn push_capped(q: &mut VecDeque<u64>, v: u64) {
@@ -43,6 +50,25 @@ fn push_capped(q: &mut VecDeque<u64>, v: u64) {
     while q.len() > HISTORY_LEN {
         q.pop_front();
     }
+}
+
+/// Render the last `width` values of `data` (each a 0–100 percentage) as a one-line
+/// block-eighths sparkline (`▁▂▃▄▅▆▇█`), left-padded with spaces if there's less
+/// history than `width`. Empty history renders all spaces.
+pub fn spark(data: &[u64], width: usize) -> String {
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let start = data.len().saturating_sub(width);
+    let slice = &data[start..];
+    let mut s = String::with_capacity(width);
+    for _ in 0..width.saturating_sub(slice.len()) {
+        s.push(' ');
+    }
+    for &v in slice {
+        // Map 0..=100 to one of 8 bar heights (rounded).
+        let level = ((v.min(100) * 7 + 50) / 100) as usize;
+        s.push(BARS[level.min(7)]);
+    }
+    s
 }
 
 /// At-a-glance numbers across the whole fleet, for the summary bar.
@@ -375,12 +401,27 @@ mod tests {
     fn history_caps_and_pads_missing() {
         let mut h = History::default();
         for _ in 0..(HISTORY_LEN + 5) {
-            h.push(Some(50), None); // temp missing -> recorded as 0
+            h.push(Some(50), None, Some(10)); // temp missing -> recorded as 0
         }
         assert_eq!(h.util.len(), HISTORY_LEN);
         assert_eq!(h.temp.len(), HISTORY_LEN);
+        assert_eq!(h.mem.len(), HISTORY_LEN);
         assert_eq!(*h.temp.back().unwrap(), 0);
         assert_eq!(*h.util.back().unwrap(), 50);
+        assert_eq!(*h.mem.back().unwrap(), 10);
+    }
+
+    #[test]
+    fn spark_pads_and_scales() {
+        // Empty -> all spaces.
+        assert_eq!(spark(&[], 4), "    ");
+        // Left-padded when shorter than width.
+        let s = spark(&[100], 3);
+        assert_eq!(s.chars().count(), 3);
+        assert!(s.starts_with("  "));
+        assert!(s.ends_with('█')); // 100 -> full bar
+        // 0 -> lowest bar.
+        assert_eq!(spark(&[0], 1), "▁");
     }
 
     #[test]
