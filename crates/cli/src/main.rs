@@ -174,9 +174,12 @@ enum PodCmd {
     /// type/count and cloud default to config but can be overridden here.
     /// Acts by default; --dry-run to preview.
     Create {
-        /// How many pods to create (required).
+        /// Target TOTAL number of pods — tops up to this many (mutually exclusive with -a).
         #[arg(short = 'n', long)]
-        count: usize,
+        count: Option<usize>,
+        /// Number of pods to ADD (mutually exclusive with -n).
+        #[arg(short = 'a', long)]
+        add: Option<usize>,
         /// GPU type, e.g. `A4000`, `3090`, `A100`, `A100 SXM` (or a full provider name).
         #[arg(long)]
         gpu: Option<String>,
@@ -203,9 +206,12 @@ enum PodCmd {
     /// plan — the one-command spin-up. Acts by default; --dry-run to preview. Polling stops at the
     /// timeout; it never runs in the background or mutates the proxy.
     Up {
-        /// How many pods to create (required).
+        /// Target TOTAL number of pods — tops up to this many (mutually exclusive with -a).
         #[arg(short = 'n', long)]
-        count: usize,
+        count: Option<usize>,
+        /// Number of pods to ADD (mutually exclusive with -n).
+        #[arg(short = 'a', long)]
+        add: Option<usize>,
         /// GPU type, e.g. `A4000`, `3090`, `A100`, `A100 SXM` (or a full provider name).
         #[arg(long)]
         gpu: Option<String>,
@@ -333,7 +339,24 @@ fn warn_no_volume(provider: &dyn Provider, spec: &PodSpec) {
 /// confirm what already exists, we must NOT proceed — treating a failed list as "zero
 /// pods" would create a duplicate of the entire fleet on the live account. Better to
 /// abort with an error the operator can see.
-async fn plan_names(provider: &dyn Provider, cfg: &Config, count: usize) -> Result<Vec<String>> {
+/// How many pods to make: a TOTAL to reach (top up to N) or a number to ADD.
+#[derive(Debug, Clone, Copy)]
+enum Want {
+    Total(usize),
+    Add(usize),
+}
+
+/// Resolve the `-n`(total) / `-a`(add) flags into a `Want`. Exactly one is required.
+fn resolve_want(count: Option<usize>, add: Option<usize>) -> Result<Want> {
+    match (count, add) {
+        (Some(n), None) => Ok(Want::Total(n)),
+        (None, Some(a)) => Ok(Want::Add(a)),
+        (Some(_), Some(_)) => anyhow::bail!("pass either -n/--count (total) or -a/--add, not both"),
+        (None, None) => anyhow::bail!("pass -n/--count <total> or -a/--add <count>"),
+    }
+}
+
+async fn plan_names(provider: &dyn Provider, cfg: &Config, want: Want) -> Result<Vec<String>> {
     let policy = arena_core::retry::RetryPolicy::default();
     let existing = arena_core::retry::retrying(&policy, || provider.list_pods())
         .await
@@ -342,10 +365,22 @@ async fn plan_names(provider: &dyn Provider, cfg: &Config, count: usize) -> Resu
              create duplicate pods)",
         )?;
     let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
-    let names = arena_core::naming::next_free_names(prefix, &cfg.machine_names, &existing, count);
-    if names.len() < count {
+    // `-n` is a target total: create only enough to top up to it. `-a` adds outright.
+    let to_create = match want {
+        Want::Add(a) => a,
+        Want::Total(n) => {
+            let have = existing.iter().filter(|p| p.name.starts_with(&format!("{prefix}-"))).count();
+            if n <= have {
+                eprintln!("already have {have} pod(s) (target {n}) — nothing to create");
+                return Ok(Vec::new());
+            }
+            n - have
+        }
+    };
+    let names = arena_core::naming::next_free_names(prefix, &cfg.machine_names, &existing, to_create);
+    if names.len() < to_create {
         eprintln!(
-            "warning: requested {count} but only {} free machine names available",
+            "warning: need {to_create} but only {} free machine name(s) available",
             names.len()
         );
     }
@@ -1302,9 +1337,9 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             }
         }
 
-        PodCmd::Create { count, gpu, gpus, cloud, disk, volume, dry_run, keep_trying } => {
+        PodCmd::Create { count, add, gpu, gpus, cloud, disk, volume, dry_run, keep_trying } => {
             let ov = SpecOverrides { gpu, gpus, cloud, disk, volume };
-            let names = plan_names(provider, cfg, count).await?;
+            let names = plan_names(provider, cfg, resolve_want(count, add)?).await?;
             if names.is_empty() {
                 eprintln!("no free machine names available — nothing to do");
                 return Ok(());
@@ -1330,9 +1365,9 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             create_pods(provider, cfg, &names, keep_trying, &ov).await?;
         }
 
-        PodCmd::Up { count, gpu, gpus, cloud, disk, volume, dry_run, no_wait, keep_trying, proxy, setup, timeout, interval } => {
+        PodCmd::Up { count, add, gpu, gpus, cloud, disk, volume, dry_run, no_wait, keep_trying, proxy, setup, timeout, interval } => {
             let ov = SpecOverrides { gpu, gpus, cloud, disk, volume };
-            let names = plan_names(provider, cfg, count).await?;
+            let names = plan_names(provider, cfg, resolve_want(count, add)?).await?;
             if names.is_empty() {
                 eprintln!("no free machine names available — nothing to do");
                 return Ok(());
