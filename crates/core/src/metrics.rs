@@ -67,7 +67,7 @@ pub fn parse_nvidia_smi(stdout: &str) -> Vec<GpuStat> {
 
 /// Trim vendor noise from an `nvidia-smi` GPU name, preserving model case:
 /// "NVIDIA RTX A4000" -> "RTX A4000", "NVIDIA GeForce RTX 4090" -> "RTX 4090".
-fn normalize_gpu_name(raw: &str) -> String {
+pub fn normalize_gpu_name(raw: &str) -> String {
     let mut s = raw.trim();
     for prefix in ["NVIDIA ", "GeForce ", "Tesla "] {
         while let Some(rest) = s.strip_prefix(prefix) {

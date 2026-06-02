@@ -580,19 +580,35 @@ async fn execute_fleet(
     s
 }
 
-/// Common GPU types offered in the add-pod form, after the config's own default. These
-/// are best-effort presets (provider-specific strings); the configured default is
-/// known-good and listed first.
-const GPU_PRESETS: &[&str] = &[
-    "NVIDIA GeForce RTX 4090",
-    "NVIDIA GeForce RTX 3090",
-    "NVIDIA RTX A4000",
-    "NVIDIA RTX A5000",
-    "NVIDIA RTX A6000",
-    "NVIDIA A100 80GB PCIe",
-    "NVIDIA H100 80GB HBM3",
-    "NVIDIA L40S",
+/// Common GPU types offered in the add-pod form, with an approximate `$/hr` (rough,
+/// static — actual price/availability varies by provider and time; real availability
+/// data can be wired in later). The most-wanted ones (A4000, 3090, A40, A100) lead.
+const GPU_PRESETS: &[(&str, f64)] = &[
+    ("NVIDIA RTX A4000", 0.32),
+    ("NVIDIA GeForce RTX 3090", 0.44),
+    ("NVIDIA A40", 0.79),
+    ("NVIDIA A100 80GB PCIe", 1.89),
+    ("NVIDIA GeForce RTX 4090", 0.69),
+    ("NVIDIA RTX A5000", 0.36),
+    ("NVIDIA RTX A6000", 0.79),
+    ("NVIDIA H100 80GB HBM3", 2.99),
+    ("NVIDIA L40S", 1.19),
 ];
+
+/// Approximate `$/hr` for a GPU type string, if we have a figure for it.
+fn gpu_price(gpu_type: &str) -> Option<f64> {
+    GPU_PRESETS.iter().find(|(t, _)| *t == gpu_type).map(|(_, p)| *p)
+}
+
+/// A picker label for a GPU type: the short name (e.g. `RTX A4000`) plus an approximate
+/// price when known (e.g. `RTX A4000  ~$0.32/hr`).
+fn gpu_label(gpu_type: &str) -> String {
+    let name = metrics::normalize_gpu_name(gpu_type);
+    match gpu_price(gpu_type) {
+        Some(p) => format!("{name}  ~${p:.2}/hr"),
+        None => name,
+    }
+}
 
 /// Build the GPU-type choices for the add-pod form: the config default first (so the
 /// default create matches the CLI), then the presets, de-duplicated.
@@ -602,13 +618,13 @@ fn gpu_type_choices(cfg: &Config) -> Vec<String> {
     if !default.is_empty() {
         out.push(default);
     }
-    for t in GPU_PRESETS {
+    for (t, _) in GPU_PRESETS {
         if !out.iter().any(|x| x == t) {
             out.push(t.to_string());
         }
     }
     if out.is_empty() {
-        out.push("NVIDIA GeForce RTX 4090".to_string());
+        out.push("NVIDIA RTX A4000".to_string());
     }
     out
 }
@@ -1341,7 +1357,7 @@ fn render_new_pod(f: &mut Frame, form: &NewPodForm) {
         let (name, value) = match fld {
             NpField::Provider => ("provider", form.provider_name().to_string()),
             NpField::CloudType => ("cloud", form.cloud_type().unwrap_or("-").to_string()),
-            NpField::GpuType => ("gpu type", form.gpu_type().to_string()),
+            NpField::GpuType => ("gpu type", gpu_label(form.gpu_type())),
             NpField::GpuCount => ("gpus/pod", form.gpu_count.to_string()),
             NpField::Pods => ("pods", format!("{} of {} free", form.count, form.free.len())),
         };
@@ -1391,11 +1407,11 @@ fn render_new_pod(f: &mut Frame, form: &NewPodForm) {
             }
         }
         NpField::GpuType => {
-            lines.push(Line::styled("gpu types (← → to change):", label));
+            lines.push(Line::styled("gpu types (← → to change · ~price/hr):", label));
             for (i, g) in form.gpu_types.iter().enumerate() {
                 let mark = if i == form.gpu_idx { "●" } else { "○" };
                 lines.push(Line::styled(
-                    format!("  {mark} {g}"),
+                    format!("  {mark} {}", gpu_label(g)),
                     if i == form.gpu_idx { cur } else { Style::default() },
                 ));
             }
