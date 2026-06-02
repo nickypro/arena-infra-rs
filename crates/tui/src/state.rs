@@ -314,6 +314,18 @@ impl NewPodForm {
     }
 }
 
+/// The status to show, combining the provider's reported status with whether we can
+/// actually reach the pod over SSH. The provider calls a pod `RUNNING` the moment it's
+/// requested (`desiredStatus`), well before it's booted/serving SSH — so a `RUNNING`
+/// pod we can't reach yet shows `init` ("coming up"), not `run`. `reachable`:
+/// `Some(true)` = probe succeeded, `Some(false)` = probe errored, `None` = not probed.
+pub fn display_status(status: &str, reachable: Option<bool>) -> String {
+    if status.eq_ignore_ascii_case("RUNNING") && reachable != Some(true) {
+        return "init".to_string();
+    }
+    short_status(status)
+}
+
 /// The actions a user can trigger against the selected pod from the dashboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -581,6 +593,17 @@ mod tests {
         assert_eq!(short_status("exited"), "exit");
         assert_eq!(short_status("TERMINATED"), "term");
         assert_eq!(short_status("WEIRDSTATE"), "weir"); // 4-char lowercased fallback
+    }
+
+    #[test]
+    fn display_status_reflects_reachability() {
+        // RUNNING but not (yet) reachable -> "init", not "run".
+        assert_eq!(display_status("RUNNING", Some(true)), "run");
+        assert_eq!(display_status("RUNNING", Some(false)), "init");
+        assert_eq!(display_status("RUNNING", None), "init");
+        // non-running statuses pass straight through.
+        assert_eq!(display_status("EXITED", Some(false)), "exit");
+        assert_eq!(display_status("pending", None), "prov"); // PENDING/PROVISIONING -> prov
     }
 
     #[test]

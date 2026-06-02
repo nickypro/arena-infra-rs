@@ -49,7 +49,7 @@ use arena_core::{Config, Pod, PodSpec};
 
 use prefs::Prefs;
 use state::{
-    display_name, short_branch, short_status, spark, summarize, Action, Confirm, FleetSummary,
+    display_name, display_status, short_branch, spark, summarize, Action, Confirm, FleetSummary,
     History, NewPodForm, NpField, ProviderOpt,
 };
 
@@ -1060,10 +1060,17 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                 None => "-".into(),
             };
             let (detail, detail_style) = detail_cell(m);
+            // RUNNING-but-unreachable reads as "init" (still coming up), in yellow.
+            let status_label = display_status(&p.status, m.map(|m| m.error.is_none()));
+            let status_cell = if status_label == "init" {
+                Cell::from(status_label).style(Style::default().fg(Color::Yellow))
+            } else {
+                Cell::from(status_label)
+            };
             let mut cells = vec![
                 provider_cell(&p.provider),
                 Cell::from(ui.shown_name(&p.name)),
-                Cell::from(short_status(&p.status)),
+                status_cell,
                 health_cell(m),
                 Cell::from(gpu),
                 Cell::from(util_str).style(util_style(util, err)),
