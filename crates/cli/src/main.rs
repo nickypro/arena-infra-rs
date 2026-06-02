@@ -72,6 +72,10 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// View/preview a scheduled provisioning plan (arena-plan.json). Read-only for now;
+    /// the timed executor + arming come next.
+    #[command(subcommand, infer_subcommands = true)]
+    Plan(PlanCmd),
     /// Inspect the loaded config.
     #[command(subcommand, infer_subcommands = true)]
     Config(ConfigCmd),
@@ -93,6 +97,26 @@ enum CronCmd {
     Remove,
     /// Show the currently-installed arena cron lines.
     Show,
+}
+
+#[derive(Subcommand)]
+enum PlanCmd {
+    /// Validate the plan file; print the detected local time/timezone, the night
+    /// window, caps, and every day entry with its resolved date.
+    Check {
+        #[arg(long, default_value = "arena-plan.json")]
+        file: PathBuf,
+    },
+    /// Preview what the plan would do for a date (default: today): the GPU/provider
+    /// fallback order, fill-to-target against the current fleet, and (for a replace
+    /// day) what it would tear down. Read-only — never mutates.
+    Show {
+        #[arg(long, default_value = "arena-plan.json")]
+        file: PathBuf,
+        /// Date to preview (YYYY-MM-DD). Defaults to today (local).
+        #[arg(long)]
+        date: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -397,6 +421,7 @@ async fn main() -> Result<()> {
 
     match cli.cmd {
         Cmd::Tui => launch_tui(&cli.provider, &cli.config),
+        Cmd::Plan(c) => handle_plan(c, provider.unwrap().as_ref(), &cfg).await,
         Cmd::Config(c) => handle_config(c, &cfg, &cli.provider),
         Cmd::Cron(c) => handle_cron(c, &cli.config).await,
         Cmd::Pods(p) => handle_pods(p, provider.unwrap().as_ref(), &cfg).await,
@@ -900,6 +925,129 @@ async fn deploy_proxy(cfg: &Config, pods: &[arena_core::Pod], apply: bool) -> Re
             out.stderr.trim()
         )
     }
+}
+
+/// Local date/time from the system clock — honors the box's timezone + DST (cron does
+/// too), so a window of "00:00–06:00" means local night. Returns
+/// `(today_days, minutes_since_local_midnight, "YYYY-MM-DD", "TZ")`.
+fn local_now() -> Result<(i64, u32, String, String)> {
+    let out = std::process::Command::new("date")
+        .arg("+%Y-%m-%d %H:%M %Z")
+        .output()
+        .context("running `date` to read local time")?;
+    anyhow::ensure!(out.status.success(), "`date` command failed");
+    let s = String::from_utf8_lossy(&out.stdout);
+    let mut parts = s.split_whitespace();
+    let ymd = parts.next().context("date: missing day")?.to_string();
+    let hm = parts.next().context("date: missing time")?;
+    let tz = parts.next().unwrap_or("").to_string();
+    let (y, m, d) = arena_core::schedule::parse_ymd(&ymd).context("date: unparseable day")?;
+    let today_days = arena_core::schedule::days_from_civil(y, m, d);
+    let minutes = arena_core::plan::parse_hm(hm).context("date: unparseable time")?;
+    Ok((today_days, minutes, ymd, tz))
+}
+
+async fn handle_plan(cmd: PlanCmd, provider: &dyn Provider, cfg: &Config) -> Result<()> {
+    use arena_core::plan::{within_window, Plan};
+    use arena_core::schedule::{days_from_civil, parse_ymd, ymd_string};
+
+    let (today_days, now_min, today_ymd, tz) = local_now()?;
+
+    match cmd {
+        PlanCmd::Check { file } => {
+            let plan = Plan::load(&file)?;
+            println!("plan file:  {}", file.display());
+            println!("local now:  {today_ymd} {:02}:{:02} {tz}", now_min / 60, now_min % 60);
+            match plan.window_minutes() {
+                Some((s, e)) => println!(
+                    "window:     {}–{} local — now is {}",
+                    plan.window[0],
+                    plan.window[1],
+                    if within_window(now_min, s, e) { "INSIDE" } else { "outside" }
+                ),
+                None => println!("window:     INVALID {:?} — fix HH:MM", plan.window),
+            }
+            println!(
+                "caps:       max_total={:?}  max_hourly={:?}  max_replace={:?}",
+                plan.max_total, plan.max_hourly, plan.max_replace
+            );
+            println!("gpus:       {}", plan.gpus.join(" > "));
+            println!("providers:  {}", plan.providers.join(" > "));
+            println!("days:");
+            if plan.days.is_empty() {
+                println!("  (none)");
+            }
+            for d in &plan.days {
+                let date = d.effective_days(today_days).map(ymd_string).unwrap_or_else(|| "??".into());
+                let today = (d.effective_days(today_days) == Some(today_days)).then_some(" (today)").unwrap_or("");
+                println!(
+                    "  {date}{today}: {} pods × {}gpu{}",
+                    d.count,
+                    d.gpus_per_pod,
+                    if d.replace { "  [REPLACE]" } else { "" }
+                );
+            }
+            println!("\n✓ plan parses. (Scheduled apply + arming aren't wired yet — preview with `plan show`.)");
+        }
+
+        PlanCmd::Show { file, date } => {
+            let plan = Plan::load(&file)?;
+            let target_days = match &date {
+                Some(s) => {
+                    let (y, m, d) = parse_ymd(s).context("--date must be YYYY-MM-DD")?;
+                    days_from_civil(y, m, d)
+                }
+                None => today_days,
+            };
+            let target_ymd = ymd_string(target_days);
+            let Some(day) = plan.day_for(today_days, target_days) else {
+                println!("No plan entry for {target_ymd}.");
+                return Ok(());
+            };
+
+            println!(
+                "Plan for {target_ymd}: {} pods × {} GPU/pod{}",
+                day.count,
+                day.gpus_per_pod,
+                if day.replace { "  [REPLACE]" } else { "" }
+            );
+
+            // Existing fleet on the current provider (for the fill-to-target preview).
+            let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
+            let pods = provider.list_pods().await.context("listing pods")?;
+            let existing = pods.iter().filter(|p| p.name.starts_with(&format!("{prefix}-"))).count();
+            let remaining = day.count.saturating_sub(existing);
+            println!(
+                "Current fleet on {}: {existing} pod(s) named {prefix}-*  →  would create up to {remaining} more to reach {}.",
+                provider.name(),
+                day.count
+            );
+            if day.replace {
+                println!(
+                    "REPLACE: would back up, then terminate those {existing} pod(s) (cap max_replace={:?}), then create {} fresh.",
+                    plan.max_replace, day.count
+                );
+            }
+
+            println!("\nFallback order (GPU-first; stop once {} filled):", day.count);
+            for (i, c) in day.candidates(&plan).iter().enumerate() {
+                let tier = c.cloud.as_deref().map(|t| format!(":{t}")).unwrap_or_default();
+                println!("  {:>2}. {} on {}{tier}", i + 1, c.gpu, c.provider);
+            }
+
+            if let Some((s, e)) = plan.window_minutes() {
+                let inside = within_window(now_min, s, e);
+                println!(
+                    "\nWindow {}–{} local — a scheduled run right now would be {}.",
+                    plan.window[0],
+                    plan.window[1],
+                    if inside { "ELIGIBLE" } else { "SKIPPED (outside window)" }
+                );
+            }
+            println!("(Preview only — the executor that actually creates/replaces is the next step.)");
+        }
+    }
+    Ok(())
 }
 
 /// Render and print the proxy plan for the given pods: a summary table, the nginx

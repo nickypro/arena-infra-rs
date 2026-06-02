@@ -58,6 +58,13 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     proxy host over SSH and reloads nginx (`nginx -t && nginx -s reload`); dry-run shows
     the exact scp + reload, `--apply` executes. This is the one place the tool touches
     the proxy host.
+  - `plan check | show` — a scheduled provisioning plan (`arena-plan.json`, see
+    `arena-plan.example.json`): per-day target fleets with **GPU-first fallback chains**
+    (e.g. `A4000` across community→secure→vast, then `3090`, then `A5000`) and a night
+    **window** + caps. `check` validates + prints the detected local time/timezone and
+    every day's resolved date; `show [--date]` previews the fallback order and
+    fill-to-target vs the live fleet. Read-only today; the timed executor + `arm`/`disarm`
+    (which only fires inside the night window, in system-local time) are the next step.
   - `config check` — validate that the keys the selected provider + proxy + backup
     need are present (never prints secret values; exits non-zero if a required key is
     missing). Copy `config.env.example` to get started.

@@ -10,6 +10,7 @@ pub mod config;
 pub mod error;
 pub mod metrics;
 pub mod naming;
+pub mod plan;
 pub mod pod;
 pub mod provider;
 pub mod proxy;

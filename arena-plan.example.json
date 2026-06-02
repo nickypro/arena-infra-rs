@@ -1,0 +1,13 @@
+{
+  "providers": ["runpod:community", "runpod:secure", "vast"],
+  "gpus": ["A4000", "3090", "A5000"],
+  "max_total": 20,
+  "max_hourly": 12.0,
+  "max_replace": 20,
+  "window": ["00:00", "06:00"],
+  "days": [
+    { "offset": 0, "count": 15, "gpus_per_pod": 1 },
+    { "offset": 1, "count": 15, "gpus_per_pod": 2, "replace": true },
+    { "date": "2026-06-10", "count": 8, "gpus_per_pod": 1, "gpus": ["A100", "A40"] }
+  ]
+}

@@ -17,6 +17,27 @@ pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     era * 146097 + doe - 719468
 }
 
+/// Inverse of [`days_from_civil`]: a days-from-epoch count back to `(year, month, day)`
+/// — Howard Hinnant's `civil_from_days`. Used to display a resolved plan date.
+pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = z - era * 146097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Format a days-from-epoch count as `YYYY-MM-DD`.
+pub fn ymd_string(days: i64) -> String {
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 /// Parse a `YYYY-MM-DD` date into `(year, month, day)`.
 pub fn parse_ymd(s: &str) -> Option<(i64, u32, u32)> {
     let mut it = s.trim().split('-');
@@ -51,6 +72,15 @@ mod tests {
         assert_eq!(days_from_civil(1970, 1, 2), 1);
         assert_eq!(days_from_civil(2000, 1, 1), 10_957);
         assert_eq!(days_from_civil(2026, 6, 1), 20_605);
+    }
+
+    #[test]
+    fn civil_from_days_round_trips() {
+        for &(y, m, d) in &[(1970, 1, 1), (2000, 1, 1), (2026, 6, 2), (2026, 12, 31), (1999, 2, 28)] {
+            let days = days_from_civil(y, m, d);
+            assert_eq!(civil_from_days(days), (y, m, d));
+        }
+        assert_eq!(ymd_string(days_from_civil(2026, 6, 2)), "2026-06-02");
     }
 
     #[test]
