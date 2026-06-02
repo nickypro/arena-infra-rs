@@ -590,6 +590,7 @@ const GPU_PRESETS: &[(&str, &str, u32)] = &[
     ("NVIDIA GeForce RTX 3090", "RTX 3090", 24),
     ("NVIDIA A40", "A40", 48),
     ("NVIDIA A100 80GB PCIe", "A100 PCIe", 80),
+    ("NVIDIA A100-SXM4-80GB", "A100 SXM", 80),
     ("NVIDIA RTX 4000 Ada Generation", "RTX 4000 Ada", 20),
     ("NVIDIA GeForce RTX 4090", "RTX 4090", 24),
     ("NVIDIA RTX A5000", "RTX A5000", 24),
