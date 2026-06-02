@@ -42,6 +42,11 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     reboot / Vast stop+start), preserving the machine where supported. `terminate
     --all` tears down the **whole fleet** (confirms first; `--dry-run` lists every
     pod without touching them) — for end-of-program teardown.
+  - `create`/`up` take `--retry-mins <M>` (`--retry-secs`, default 60) to **keep
+    topping up to the target** while capacity is short — one round per interval for up
+    to M minutes, **Ctrl+C** stops early keeping what was made. `up --retry-mins 60
+    --proxy` does the full "spin up 28× A40 SECURE, retrying for an hour, then wire the
+    proxy" flow. The confirm prompt lists the exact pod names about to be created.
   - `pods up -n N` — one-command spin-up: create, poll until each pod has an SSH
     endpoint, then print the proxy plan. `--setup` then provisions each pod over SSH
     and `--proxy` deploys + reloads the proxy config — so `pods up -n 15 --setup

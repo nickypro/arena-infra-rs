@@ -205,6 +205,13 @@ enum PodCmd {
         /// On capacity exhaustion, wait and keep retrying instead of stopping.
         #[arg(long)]
         keep_trying: bool,
+        /// Keep re-attempting (topping up to the target) for up to this many minutes,
+        /// e.g. while waiting for capacity. 0 = a single attempt. Ctrl+C stops early.
+        #[arg(long, default_value_t = 0)]
+        retry_mins: u64,
+        /// Seconds between retry rounds.
+        #[arg(long, default_value_t = 60)]
+        retry_secs: u64,
     },
     /// Create N pods, then poll until they have SSH endpoints and print the proxy
     /// plan — the one-command spin-up. Acts by default; --dry-run to preview. Polling stops at the
@@ -240,6 +247,14 @@ enum PodCmd {
         /// On capacity exhaustion, wait and keep retrying instead of stopping.
         #[arg(long)]
         keep_trying: bool,
+        /// Keep re-attempting (topping up to the target) for up to this many minutes
+        /// before waiting for endpoints / deploying the proxy. 0 = a single attempt.
+        /// Ctrl+C stops the retry loop early.
+        #[arg(long, default_value_t = 0)]
+        retry_mins: u64,
+        /// Seconds between retry rounds.
+        #[arg(long, default_value_t = 60)]
+        retry_secs: u64,
         /// After endpoints are up, deploy the nginx config to the proxy and reload it.
         #[arg(long)]
         proxy: bool,
@@ -434,6 +449,67 @@ fn spec_with_overrides(cfg: &Config, ov: &SpecOverrides) -> PodSpec {
         spec.volume_gb = v;
     }
     spec
+}
+
+/// Top up toward the target, retrying for up to `retry_mins` (rounds every
+/// `retry_secs`) while capacity is short — Ctrl+C stops the loop early and keeps what
+/// was made. With `retry_mins == 0` it's a single attempt (honoring `keep_trying`).
+/// Returns every pod created across all rounds.
+async fn create_with_retry(
+    provider: &dyn Provider,
+    cfg: &Config,
+    want: Want,
+    ov: &SpecOverrides,
+    keep_trying: bool,
+    retry_mins: u64,
+    retry_secs: u64,
+) -> Result<Vec<arena_core::Pod>> {
+    // Fix a target *total* so each round only creates what's still missing. For -a,
+    // the target is "what we have right now plus N".
+    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena").to_string();
+    let target = match want {
+        Want::Total(n) => n,
+        Want::Add(a) => {
+            let policy = arena_core::retry::RetryPolicy::default();
+            let pods = arena_core::retry::retrying(&policy, || provider.list_pods()).await?;
+            pods.iter().filter(|p| p.name.starts_with(&format!("{prefix}-"))).count() + a
+        }
+    };
+    let retry_secs = retry_secs.max(1);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(retry_mins * 60);
+    let mut all: Vec<arena_core::Pod> = Vec::new();
+    let mut round = 0u32;
+    loop {
+        round += 1;
+        let names = plan_names(provider, cfg, Want::Total(target)).await?;
+        if names.is_empty() {
+            break; // target reached (or no free names left)
+        }
+        // In retry mode the *loop* is the keep-trying, so each round is one-shot.
+        let kt = retry_mins == 0 && keep_trying;
+        let made = create_pods(provider, cfg, &names, kt, ov).await?;
+        let got = made.len();
+        all.extend(made);
+        if got == names.len() || retry_mins == 0 {
+            break; // filled what this round needed, or no retry requested
+        }
+        if std::time::Instant::now() >= deadline {
+            eprintln!("retry window ({retry_mins}m) elapsed — have {} of {target}", all.len());
+            break;
+        }
+        let have = target.saturating_sub(names.len() - got);
+        eprintln!(
+            "round {round}: {have}/{target} pods (capacity short); retrying in {retry_secs}s (Ctrl+C to stop)…"
+        );
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(retry_secs)) => {}
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("interrupted — stopping retries with {} of {target}", all.len());
+                break;
+            }
+        }
+    }
+    Ok(all)
 }
 
 async fn create_pods(
@@ -1368,15 +1444,16 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             }
         }
 
-        PodCmd::Create { count, add, gpu, gpus, cloud, disk, volume, dry_run, keep_trying } => {
+        PodCmd::Create { count, add, gpu, gpus, cloud, disk, volume, dry_run, keep_trying, retry_mins, retry_secs } => {
             let ov = SpecOverrides { gpu, gpus, cloud, disk, volume };
-            let names = plan_names(provider, cfg, resolve_want(count, add)?).await?;
+            let want = resolve_want(count, add)?;
+            let names = plan_names(provider, cfg, want).await?;
             if names.is_empty() {
-                eprintln!("no free machine names available — nothing to do");
+                eprintln!("nothing to create (target already met or no free names)");
                 return Ok(());
             }
+            let spec = spec_with_overrides(cfg, &ov);
             if dry_run {
-                let spec = spec_with_overrides(cfg, &ov);
                 let desc = provider.describe(&spec);
                 for name in &names {
                     println!("[dry-run] would create {name} on {} ({desc})", provider.name());
@@ -1385,27 +1462,27 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                 println!("\nDry-run only — no pods created (this is a preview).");
                 return Ok(());
             }
-            let spec = spec_with_overrides(cfg, &ov);
             if !confirm(yes, &format!(
-                "Will create {} pod(s) on {} ({}).",
-                names.len(), provider.name(), provider.describe(&spec)
+                "Will create {} pod(s) on {} ({}):\n  {}",
+                names.len(), provider.name(), provider.describe(&spec), names.join(", ")
             ))? {
                 println!("aborted.");
                 return Ok(());
             }
-            create_pods(provider, cfg, &names, keep_trying, &ov).await?;
+            create_with_retry(provider, cfg, want, &ov, keep_trying, retry_mins, retry_secs).await?;
         }
 
-        PodCmd::Up { count, add, gpu, gpus, cloud, disk, volume, dry_run, no_wait, keep_trying, proxy, setup, timeout, interval } => {
+        PodCmd::Up { count, add, gpu, gpus, cloud, disk, volume, dry_run, no_wait, keep_trying, retry_mins, retry_secs, proxy, setup, timeout, interval } => {
             let ov = SpecOverrides { gpu, gpus, cloud, disk, volume };
-            let names = plan_names(provider, cfg, resolve_want(count, add)?).await?;
+            let want = resolve_want(count, add)?;
+            let names = plan_names(provider, cfg, want).await?;
             if names.is_empty() {
-                eprintln!("no free machine names available — nothing to do");
+                eprintln!("nothing to create (target already met or no free names)");
                 return Ok(());
             }
 
+            let spec = spec_with_overrides(cfg, &ov);
             if dry_run {
-                let spec = spec_with_overrides(cfg, &ov);
                 let desc = provider.describe(&spec);
                 for name in &names {
                     println!("[dry-run] would create {name} on {} ({desc})", provider.name());
@@ -1417,27 +1494,31 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                     (false, true) => " then deploy the proxy",
                     (false, false) => "",
                 };
+                let retry = if retry_mins > 0 { format!(" (retrying up to {retry_mins}m for capacity)") } else { String::new() };
                 println!(
-                    "\nDry-run only — no pods created (preview): would create the above, \
+                    "\nDry-run only — no pods created (preview){retry}: would create the above, \
                      poll up to {timeout}s for SSH endpoints, print the proxy plan{extra}."
                 );
                 return Ok(());
             }
 
-            let spec = spec_with_overrides(cfg, &ov);
             if !confirm(yes, &format!(
-                "Will create {} pod(s) on {} ({}), wait for endpoints{}{}.",
+                "Will create {} pod(s) on {} ({}){}, wait for endpoints{}{}:\n  {}",
                 names.len(),
                 provider.name(),
                 provider.describe(&spec),
+                if retry_mins > 0 { format!(", retrying up to {retry_mins}m") } else { String::new() },
                 if setup { ", run setup" } else { "" },
-                if proxy { ", deploy proxy" } else { "" }
+                if proxy { ", deploy proxy" } else { "" },
+                names.join(", ")
             ))? {
                 println!("aborted.");
                 return Ok(());
             }
-            // Create as many as capacity allows; we only wait on the ones we got.
-            let created = create_pods(provider, cfg, &names, keep_trying, &ov).await?;
+            // Create as many as capacity allows (retrying if requested); only wait on
+            // the ones we got. Proxy is deployed *after* this returns — i.e. once the
+            // retry loop has finished topping up.
+            let created = create_with_retry(provider, cfg, want, &ov, keep_trying, retry_mins, retry_secs).await?;
             if created.is_empty() {
                 eprintln!("no pods were created — nothing to wait for");
                 return Ok(());

@@ -11,7 +11,7 @@ license = "MIT"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process", "signal"] }
 async-trait = "0.1"
 thiserror = "2"
 anyhow = "1"
