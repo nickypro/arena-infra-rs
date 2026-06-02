@@ -130,10 +130,22 @@ enum PodCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Create N pods on the next free machine names. Dry-run unless --apply.
+    /// Create N pods on the next free machine names. Requires -n/--count. GPU
+    /// type/count and cloud default to config but can be overridden here.
+    /// Dry-run unless --apply.
     Create {
+        /// How many pods to create (required).
         #[arg(short = 'n', long)]
         count: usize,
+        /// GPU type, e.g. `A4000`, `3090`, `A100`, `A100 SXM` (or a full provider name).
+        #[arg(long)]
+        gpu: Option<String>,
+        /// GPUs per pod (overrides config NUM_GPUS).
+        #[arg(long)]
+        gpus: Option<u32>,
+        /// RunPod cloud tier: COMMUNITY or SECURE (overrides config).
+        #[arg(long)]
+        cloud: Option<String>,
         #[arg(long)]
         apply: bool,
         /// On capacity exhaustion, wait and keep retrying instead of stopping.
@@ -144,8 +156,18 @@ enum PodCmd {
     /// plan — the one-command spin-up. Dry-run unless --apply. Polling stops at the
     /// timeout; it never runs in the background or mutates the proxy.
     Up {
+        /// How many pods to create (required).
         #[arg(short = 'n', long)]
         count: usize,
+        /// GPU type, e.g. `A4000`, `3090`, `A100`, `A100 SXM` (or a full provider name).
+        #[arg(long)]
+        gpu: Option<String>,
+        /// GPUs per pod (overrides config NUM_GPUS).
+        #[arg(long)]
+        gpus: Option<u32>,
+        /// RunPod cloud tier: COMMUNITY or SECURE (overrides config).
+        #[arg(long)]
+        cloud: Option<String>,
         #[arg(long)]
         apply: bool,
         /// Don't poll after creating; just print ids (run `proxy plan` later).
@@ -245,15 +267,61 @@ const MAX_CAPACITY_ATTEMPTS: u32 = 120;
 ///   kept, never rolled back.
 /// - `Auth` → credentials are wrong; abort immediately (retrying is pointless).
 /// - anything else → report what we made so far, then surface the error.
+/// Command-line overrides for the create spec, so you don't have to edit config.env
+/// to spin up a different GPU/count/cloud for one run.
+#[derive(Debug, Clone, Default)]
+struct SpecOverrides {
+    gpu: Option<String>,
+    gpus: Option<u32>,
+    cloud: Option<String>,
+}
+
+/// Map a friendly GPU short-name (`A4000`, `3090`, `a100 sxm`, …) to the provider's
+/// full type string. Unknown values pass through unchanged, so a full name still works.
+fn resolve_gpu(s: &str) -> String {
+    let key: String = s.to_ascii_lowercase().chars().filter(|c| c.is_alphanumeric()).collect();
+    let full = match key.as_str() {
+        "a4000" => "NVIDIA RTX A4000",
+        "a4000ada" | "rtx4000ada" | "4000ada" => "NVIDIA RTX 4000 Ada Generation",
+        "3090" | "rtx3090" => "NVIDIA GeForce RTX 3090",
+        "4090" | "rtx4090" => "NVIDIA GeForce RTX 4090",
+        "a40" => "NVIDIA A40",
+        "a100" | "a100pcie" => "NVIDIA A100 80GB PCIe",
+        "a100sxm" | "a100sxm4" => "NVIDIA A100-SXM4-80GB",
+        "a5000" => "NVIDIA RTX A5000",
+        "a6000" => "NVIDIA RTX A6000",
+        "h100" => "NVIDIA H100 80GB HBM3",
+        "l40s" => "NVIDIA L40S",
+        _ => return s.to_string(),
+    };
+    full.to_string()
+}
+
+/// The base spec from config, with any command-line overrides applied.
+fn spec_with_overrides(cfg: &Config, ov: &SpecOverrides) -> PodSpec {
+    let mut spec = PodSpec::from_config(cfg);
+    if let Some(g) = &ov.gpu {
+        spec.gpu_type = resolve_gpu(g);
+    }
+    if let Some(n) = ov.gpus {
+        spec.gpu_count = n;
+    }
+    if let Some(c) = &ov.cloud {
+        spec.cloud_type = c.to_uppercase();
+    }
+    spec
+}
+
 async fn create_pods(
     provider: &dyn Provider,
     cfg: &Config,
     names: &[String],
     keep_trying: bool,
+    ov: &SpecOverrides,
 ) -> Result<Vec<arena_core::Pod>> {
     use arena_core::ProviderErrorKind as K;
 
-    let base = PodSpec::from_config(cfg);
+    let base = spec_with_overrides(cfg, ov);
     let policy = arena_core::retry::RetryPolicy::default();
     let mut created = Vec::new();
     'names: for name in names {
@@ -910,14 +978,15 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
             }
         }
 
-        PodCmd::Create { count, apply, keep_trying } => {
+        PodCmd::Create { count, gpu, gpus, cloud, apply, keep_trying } => {
+            let ov = SpecOverrides { gpu, gpus, cloud };
             let names = plan_names(provider, cfg, count).await?;
             if names.is_empty() {
                 eprintln!("no free machine names available — nothing to do");
                 return Ok(());
             }
             if !apply {
-                let spec = PodSpec::from_config(cfg);
+                let spec = spec_with_overrides(cfg, &ov);
                 let desc = provider.describe(&spec);
                 for name in &names {
                     println!("[dry-run] would create {name} on {} ({desc})", provider.name());
@@ -926,10 +995,11 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
                 println!("\nDry-run only — no pods created. Re-run with --apply to execute.");
                 return Ok(());
             }
-            create_pods(provider, cfg, &names, keep_trying).await?;
+            create_pods(provider, cfg, &names, keep_trying, &ov).await?;
         }
 
-        PodCmd::Up { count, apply, no_wait, keep_trying, proxy, setup, timeout, interval } => {
+        PodCmd::Up { count, gpu, gpus, cloud, apply, no_wait, keep_trying, proxy, setup, timeout, interval } => {
+            let ov = SpecOverrides { gpu, gpus, cloud };
             let names = plan_names(provider, cfg, count).await?;
             if names.is_empty() {
                 eprintln!("no free machine names available — nothing to do");
@@ -937,7 +1007,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
             }
 
             if !apply {
-                let spec = PodSpec::from_config(cfg);
+                let spec = spec_with_overrides(cfg, &ov);
                 let desc = provider.describe(&spec);
                 for name in &names {
                     println!("[dry-run] would create {name} on {} ({desc})", provider.name());
@@ -957,7 +1027,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
             }
 
             // Create as many as capacity allows; we only wait on the ones we got.
-            let created = create_pods(provider, cfg, &names, keep_trying).await?;
+            let created = create_pods(provider, cfg, &names, keep_trying, &ov).await?;
             if created.is_empty() {
                 eprintln!("no pods were created — nothing to wait for");
                 return Ok(());
