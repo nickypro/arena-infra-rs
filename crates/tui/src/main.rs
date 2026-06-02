@@ -517,6 +517,7 @@ async fn run(
                                 } else {
                                     let cloud = form.cloud_type().map(String::from);
                                     let gpu_type = form.gpu_type().to_string();
+                                    let disk = form.disk_gb;
                                     let volume = form.volume_gb;
                                     ui.mode = Mode::Result(format!(
                                         "creating {} pod(s) on {pname}…",
@@ -533,6 +534,7 @@ async fn run(
                                         cloud.as_deref(),
                                         &gpu_type,
                                         form.gpu_count,
+                                        Some(disk),
                                         Some(volume),
                                     )
                                     .await;
@@ -672,6 +674,7 @@ fn build_new_pod_form(cfg: &Config, launch_provider: &str, existing: &[Pod]) -> 
         gpu_types: gpu_type_choices(cfg),
         gpu_idx: 0,
         gpu_count: spec.gpu_count.max(1),
+        disk_gb: spec.disk_gb.max(20),
         volume_gb: spec.volume_gb,
         count: 1,
         free,
@@ -688,6 +691,7 @@ async fn create_pods(
     cloud_type: Option<&str>,
     gpu_type: &str,
     gpu_count: u32,
+    disk_gb: Option<u32>,
     volume_gb: Option<u32>,
 ) -> (String, Vec<Pod>) {
     let mut base = PodSpec::from_config(cfg);
@@ -695,6 +699,9 @@ async fn create_pods(
     base.gpu_count = gpu_count;
     if let Some(c) = cloud_type {
         base.cloud_type = c.to_string();
+    }
+    if let Some(d) = disk_gb {
+        base.disk_gb = d;
     }
     if let Some(v) = volume_gb {
         base.volume_gb = v;
@@ -1403,6 +1410,7 @@ fn render_new_pod(f: &mut Frame, form: &NewPodForm) {
                 ("gpu type", format!("{}{price}", arena_core::gpu::label(form.gpu_type())))
             }
             NpField::GpuCount => ("gpus/pod", form.gpu_count.to_string()),
+            NpField::Disk => ("disk", format!("{}GB", form.disk_gb)),
             NpField::Volume => (
                 "volume",
                 if form.volume_gb == 0 { "none".to_string() } else { format!("{}GB", form.volume_gb) },
@@ -1468,8 +1476,12 @@ fn render_new_pod(f: &mut Frame, form: &NewPodForm) {
             }
         }
         NpField::GpuCount => lines.push(Line::styled("GPUs per pod: 1–8", dim)),
+        NpField::Disk => lines.push(Line::styled(
+            "container disk in 50GB steps — the main storage (wiped if the pod is destroyed).",
+            dim,
+        )),
         NpField::Volume => lines.push(Line::styled(
-            "persistent volume in 100GB steps (0 = none). Survives pod restarts.",
+            "persistent volume in 100GB steps (0 = none, the default). Survives restarts.",
             dim,
         )),
         NpField::Pods => {

@@ -175,7 +175,10 @@ enum PodCmd {
         /// RunPod cloud tier: COMMUNITY or SECURE (overrides config).
         #[arg(long)]
         cloud: Option<String>,
-        /// Persistent volume size in GB (overrides config VOLUME_GB).
+        /// Container disk size in GB (overrides config DISK_GB).
+        #[arg(long)]
+        disk: Option<u32>,
+        /// Persistent volume size in GB (overrides config VOLUME_GB; default 0).
         #[arg(long)]
         volume: Option<u32>,
         #[arg(long)]
@@ -200,7 +203,10 @@ enum PodCmd {
         /// RunPod cloud tier: COMMUNITY or SECURE (overrides config).
         #[arg(long)]
         cloud: Option<String>,
-        /// Persistent volume size in GB (overrides config VOLUME_GB).
+        /// Container disk size in GB (overrides config DISK_GB).
+        #[arg(long)]
+        disk: Option<u32>,
+        /// Persistent volume size in GB (overrides config VOLUME_GB; default 0).
         #[arg(long)]
         volume: Option<u32>,
         #[arg(long)]
@@ -309,6 +315,7 @@ struct SpecOverrides {
     gpu: Option<String>,
     gpus: Option<u32>,
     cloud: Option<String>,
+    disk: Option<u32>,
     volume: Option<u32>,
 }
 
@@ -323,6 +330,9 @@ fn spec_with_overrides(cfg: &Config, ov: &SpecOverrides) -> PodSpec {
     }
     if let Some(c) = &ov.cloud {
         spec.cloud_type = c.to_uppercase();
+    }
+    if let Some(d) = ov.disk {
+        spec.disk_gb = d;
     }
     if let Some(v) = ov.volume {
         spec.volume_gb = v;
@@ -1167,8 +1177,8 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
             }
         }
 
-        PodCmd::Create { count, gpu, gpus, cloud, volume, apply, keep_trying } => {
-            let ov = SpecOverrides { gpu, gpus, cloud, volume };
+        PodCmd::Create { count, gpu, gpus, cloud, disk, volume, apply, keep_trying } => {
+            let ov = SpecOverrides { gpu, gpus, cloud, disk, volume };
             let names = plan_names(provider, cfg, count).await?;
             if names.is_empty() {
                 eprintln!("no free machine names available — nothing to do");
@@ -1187,8 +1197,8 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
             create_pods(provider, cfg, &names, keep_trying, &ov).await?;
         }
 
-        PodCmd::Up { count, gpu, gpus, cloud, volume, apply, no_wait, keep_trying, proxy, setup, timeout, interval } => {
-            let ov = SpecOverrides { gpu, gpus, cloud, volume };
+        PodCmd::Up { count, gpu, gpus, cloud, disk, volume, apply, no_wait, keep_trying, proxy, setup, timeout, interval } => {
+            let ov = SpecOverrides { gpu, gpus, cloud, disk, volume };
             let names = plan_names(provider, cfg, count).await?;
             if names.is_empty() {
                 eprintln!("no free machine names available — nothing to do");

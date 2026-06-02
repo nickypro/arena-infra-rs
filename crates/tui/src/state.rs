@@ -176,6 +176,7 @@ pub enum NpField {
     CloudType,
     GpuType,
     GpuCount,
+    Disk,
     Volume,
     Pods,
 }
@@ -191,7 +192,9 @@ pub struct NewPodForm {
     pub gpu_types: Vec<String>,
     pub gpu_idx: usize,
     pub gpu_count: u32,
-    /// Persistent volume size in GB (0 = none); adjusted in 100GB steps.
+    /// Container disk size in GB (adjusted in 50GB steps) — the main storage knob.
+    pub disk_gb: u32,
+    /// Persistent volume size in GB (0 = none, the default); 100GB steps.
     pub volume_gb: u32,
     pub count: usize,
     /// Free machine names available on the selected provider (for the count cap).
@@ -231,6 +234,7 @@ impl NewPodForm {
         if self.is_gpu() {
             f.push(NpField::GpuType);
             f.push(NpField::GpuCount);
+            f.push(NpField::Disk);
             f.push(NpField::Volume);
         }
         f.push(NpField::Pods);
@@ -261,6 +265,8 @@ impl NewPodForm {
             NpField::CloudType => self.cloud_idx = wrap(self.cloud_idx, delta, self.cloud_types.len()),
             NpField::GpuType => self.gpu_idx = wrap(self.gpu_idx, delta, self.gpu_types.len()),
             NpField::GpuCount => self.gpu_count = (self.gpu_count as i32 + delta).clamp(1, 8) as u32,
+            // Container disk in 50GB steps, 20–2000GB.
+            NpField::Disk => self.disk_gb = (self.disk_gb as i32 + delta * 50).clamp(20, 2000) as u32,
             // Volume in 100GB steps, 0 (none) up to 2000GB.
             NpField::Volume => self.volume_gb = (self.volume_gb as i32 + delta * 100).clamp(0, 2000) as u32,
             NpField::Pods => {
@@ -511,6 +517,7 @@ mod tests {
             gpu_types: vec!["RTX 3090".into(), "RTX 4090".into()],
             gpu_idx: 0,
             gpu_count: 1,
+            disk_gb: 100,
             volume_gb: 0,
             count: 1,
             free: vec!["arena8-apple".into(), "arena8-autumn".into()],
@@ -528,6 +535,7 @@ mod tests {
                 NpField::CloudType,
                 NpField::GpuType,
                 NpField::GpuCount,
+                NpField::Disk,
                 NpField::Volume,
                 NpField::Pods
             ]
@@ -553,11 +561,14 @@ mod tests {
             f.change(1);
         }
         assert_eq!(f.gpu_count, 8); // capped
-        f.field = 4; // Volume (100GB steps)
+        f.field = 4; // Disk (50GB steps)
+        f.change(1);
+        assert_eq!(f.disk_gb, 150);
+        f.field = 5; // Volume (100GB steps)
         f.change(1);
         f.change(1);
         assert_eq!(f.volume_gb, 200);
-        f.field = 5; // Pods
+        f.field = 6; // Pods
         for _ in 0..20 {
             f.change(1);
         }
