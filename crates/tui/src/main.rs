@@ -586,14 +586,14 @@ fn pods_table(f: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
     let widths = [
-        Constraint::Length(20),
-        Constraint::Length(9),
-        Constraint::Length(14),
-        Constraint::Length(6),
-        Constraint::Length(11),
-        Constraint::Length(6),
-        Constraint::Length(7),
-        Constraint::Min(10),
+        Constraint::Length(20), // NAME
+        Constraint::Length(9),  // STATUS
+        Constraint::Length(14), // GPU
+        Constraint::Length(6),  // GPU%
+        Constraint::Length(8),  // MEM (e.g. "120/240G")
+        Constraint::Length(4),  // TEMP (e.g. "85C")
+        Constraint::Length(7),  // $/HR
+        Constraint::Min(10),    // PROGRESS / ERROR
     ];
     let table = Table::new(rows, widths)
         .header(header)
