@@ -580,33 +580,30 @@ async fn execute_fleet(
     s
 }
 
-/// Common GPU types offered in the add-pod form, with an approximate `$/hr` (rough,
-/// static — actual price/availability varies by provider and time; real availability
-/// data can be wired in later). The most-wanted ones (A4000, 3090, A40, A100) lead.
-const GPU_PRESETS: &[(&str, f64)] = &[
-    ("NVIDIA RTX A4000", 0.32),
-    ("NVIDIA GeForce RTX 3090", 0.44),
-    ("NVIDIA A40", 0.79),
-    ("NVIDIA A100 80GB PCIe", 1.89),
-    ("NVIDIA GeForce RTX 4090", 0.69),
-    ("NVIDIA RTX A5000", 0.36),
-    ("NVIDIA RTX A6000", 0.79),
-    ("NVIDIA H100 80GB HBM3", 2.99),
-    ("NVIDIA L40S", 1.19),
+/// Common GPU types offered in the add-pod form: `(api type, short label, VRAM GB)`.
+/// Most-wanted ones (A4000, 3090, A40, A100) lead. We don't carry a price — it swings
+/// too much by provider and community-vs-secure to show a meaningful single number;
+/// VRAM is the stable, decision-useful figure (real price/availability can be wired in
+/// later from operator-supplied data).
+const GPU_PRESETS: &[(&str, &str, u32)] = &[
+    ("NVIDIA RTX A4000", "RTX A4000", 16),
+    ("NVIDIA GeForce RTX 3090", "RTX 3090", 24),
+    ("NVIDIA A40", "A40", 48),
+    ("NVIDIA A100 80GB PCIe", "A100 PCIe", 80),
+    ("NVIDIA RTX 4000 Ada Generation", "RTX 4000 Ada", 20),
+    ("NVIDIA GeForce RTX 4090", "RTX 4090", 24),
+    ("NVIDIA RTX A5000", "RTX A5000", 24),
+    ("NVIDIA RTX A6000", "RTX A6000", 48),
+    ("NVIDIA H100 80GB HBM3", "H100", 80),
+    ("NVIDIA L40S", "L40S", 48),
 ];
 
-/// Approximate `$/hr` for a GPU type string, if we have a figure for it.
-fn gpu_price(gpu_type: &str) -> Option<f64> {
-    GPU_PRESETS.iter().find(|(t, _)| *t == gpu_type).map(|(_, p)| *p)
-}
-
-/// A picker label for a GPU type: the short name (e.g. `RTX A4000`) plus an approximate
-/// price when known (e.g. `RTX A4000  ~$0.32/hr`).
+/// A picker label for a GPU type, including VRAM: `RTX A4000 · 16GB`. Falls back to the
+/// normalized name for an unknown type (e.g. a config default not in the presets).
 fn gpu_label(gpu_type: &str) -> String {
-    let name = metrics::normalize_gpu_name(gpu_type);
-    match gpu_price(gpu_type) {
-        Some(p) => format!("{name}  ~${p:.2}/hr"),
-        None => name,
+    match GPU_PRESETS.iter().find(|(t, _, _)| *t == gpu_type) {
+        Some((_, label, vram)) => format!("{label} · {vram}GB"),
+        None => metrics::normalize_gpu_name(gpu_type),
     }
 }
 
@@ -618,7 +615,7 @@ fn gpu_type_choices(cfg: &Config) -> Vec<String> {
     if !default.is_empty() {
         out.push(default);
     }
-    for (t, _) in GPU_PRESETS {
+    for (t, _, _) in GPU_PRESETS {
         if !out.iter().any(|x| x == t) {
             out.push(t.to_string());
         }
@@ -1407,7 +1404,7 @@ fn render_new_pod(f: &mut Frame, form: &NewPodForm) {
             }
         }
         NpField::GpuType => {
-            lines.push(Line::styled("gpu types (← → to change · ~price/hr):", label));
+            lines.push(Line::styled("gpu types (← → to change · VRAM):", label));
             for (i, g) in form.gpu_types.iter().enumerate() {
                 let mark = if i == form.gpu_idx { "●" } else { "○" };
                 lines.push(Line::styled(
