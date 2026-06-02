@@ -40,7 +40,7 @@ use ratatui::{
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
-use arena_core::metrics::{self, PodMetrics};
+use arena_core::metrics::{self, PodMetrics, ProbeOpts};
 use arena_core::provider::Provider;
 use arena_core::ssh::{self, SshTarget};
 use arena_core::{Config, Pod};
@@ -151,6 +151,16 @@ async fn fetch_loop(
     interval: Arc<AtomicU64>,
     nudge: Arc<Notify>,
 ) {
+    // The per-pod probe gathers GPU stats + branch + setup health in one SSH call.
+    let repo_path = cfg.get("BACKUP_REPO_PATH").map(String::from).unwrap_or_else(|| {
+        format!("/root/{}", cfg.get("ARENA_REPO_NAME").unwrap_or("ARENA_3.0"))
+    });
+    let opts = ProbeOpts {
+        progress_cmd,
+        repo_path: Some(repo_path),
+        key_remote: Some(cfg.get("GIT_SSH_KEY_REMOTE").unwrap_or("/root/.ssh/id_ed25519").to_string()),
+    };
+
     loop {
         shared.lock().unwrap().refreshing = true;
 
@@ -163,7 +173,7 @@ async fn fetch_loop(
             }
             Ok(mut pods) => {
                 pods.sort_by(|a, b| a.name.cmp(&b.name));
-                let metrics = fetch_metrics(&pods, &cfg, progress_cmd.as_deref()).await;
+                let metrics = fetch_metrics(&pods, &cfg, &opts).await;
                 let summary = summarize(&pods, &metrics);
                 let status = status_line(&summary);
 
@@ -197,15 +207,15 @@ async fn fetch_loop(
 async fn fetch_metrics(
     pods: &[Pod],
     cfg: &Config,
-    progress_cmd: Option<&str>,
+    opts: &ProbeOpts,
 ) -> HashMap<String, PodMetrics> {
     let mut set = JoinSet::new();
     for pod in pods {
         if let Ok(mut target) = SshTarget::from_pod(pod, cfg) {
             target.connect_timeout_secs = METRICS_CONNECT_TIMEOUT;
             let name = pod.name.clone();
-            let pc = progress_cmd.map(|s| s.to_string());
-            set.spawn(async move { (name, metrics::fetch(&target, pc.as_deref()).await) });
+            let opts = opts.clone();
+            set.spawn(async move { (name, metrics::fetch(&target, &opts).await) });
         }
     }
     let mut fresh = HashMap::new();
@@ -536,6 +546,33 @@ fn util_style(u: Option<u32>, err: bool) -> Style {
     }
 }
 
+/// Truncate a string to `max` display columns, adding an ellipsis if cut.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// The compact setup-health cell: three glyphs for `~/.name`, the deploy key, and the
+/// git origin pointing at GitHub. ✓ green / ✗ red / · gray (unknown or unreachable).
+fn health_cell(m: Option<&PodMetrics>) -> Cell<'static> {
+    let glyph = |ok: Option<bool>| match ok {
+        Some(true) => Span::styled("✓", Style::default().fg(Color::Green)),
+        Some(false) => Span::styled("✗", Style::default().fg(Color::Red)),
+        None => Span::styled("·", Style::default().fg(Color::DarkGray)),
+    };
+    match m {
+        Some(m) if m.error.is_none() => {
+            let origin_ok = m.origin.as_deref().map(|o| o.contains("github.com"));
+            Cell::from(Line::from(vec![glyph(m.has_name), glyph(m.has_key), glyph(origin_ok)]))
+        }
+        _ => Cell::from(Span::styled("···", Style::default().fg(Color::DarkGray))),
+    }
+}
+
 /// The right-hand detail cell: progress if we have it, else the (truncated) fetch
 /// error, else "-".
 fn detail_cell(m: Option<&PodMetrics>) -> (String, Style) {
@@ -611,16 +648,23 @@ fn summary_line(s: &FleetSummary) -> Paragraph<'static> {
         String::new()
     };
     Paragraph::new(format!(
-        " fleet: {} pods · {} GPUs · mean util {} · mem {} · ${:.2}/hr{}",
-        s.pods, s.total_gpus, util, mem, s.total_cost, unreachable
+        " fleet: {} pods · {} GPUs · mean util {} · mem {} · ${:.2}/hr (${:.0}/day){}",
+        s.pods,
+        s.total_gpus,
+        util,
+        mem,
+        s.total_cost,
+        s.total_cost * 24.0,
+        unreachable
     ))
     .style(Style::default().add_modifier(Modifier::BOLD))
 }
 
 fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
-    let header =
-        Row::new(vec!["NAME", "STATUS", "GPU", "GPU%", "MEM", "TEMP", "$/HR", "PROGRESS / ERROR"])
-            .style(Style::default().add_modifier(Modifier::BOLD));
+    let header = Row::new(vec![
+        "NAME", "STATUS", "SET", "GPU", "GPU%", "MEM", "TEMP", "$/HR", "BRANCH", "PROGRESS / ERROR",
+    ])
+    .style(Style::default().add_modifier(Modifier::BOLD));
     let rows: Vec<Row> = shared
         .pods
         .iter()
@@ -640,27 +684,40 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
             let temp = m.and_then(|m| m.max_temp());
             let temp_str = temp.map(|t| format!("{t}C")).unwrap_or_else(|| "-".into());
             let cost = p.cost_per_hr.map(|c| format!("${c:.2}")).unwrap_or_else(|| "-".into());
+            // GPU now comes from the live nvidia-smi readout (provider list omits it).
+            let gpu = m
+                .and_then(|m| m.gpu_summary())
+                .or_else(|| p.gpu_type.clone())
+                .unwrap_or_else(|| "-".into());
+            let branch = truncate(
+                &m.and_then(|m| m.branch.clone()).unwrap_or_else(|| "-".into()),
+                20,
+            );
             let (detail, detail_style) = detail_cell(m);
             Row::new(vec![
                 Cell::from(p.name.clone()),
                 Cell::from(p.status.clone()),
-                Cell::from(p.gpu_type.clone().unwrap_or_else(|| "-".into())),
+                health_cell(m),
+                Cell::from(gpu),
                 Cell::from(util_str).style(util_style(util, err)),
                 Cell::from(mem),
                 Cell::from(temp_str).style(temp_style(temp)),
                 Cell::from(cost),
+                Cell::from(branch),
                 Cell::from(detail).style(detail_style),
             ])
         })
         .collect();
     let widths = [
-        Constraint::Length(20), // NAME
-        Constraint::Length(9),  // STATUS
-        Constraint::Length(14), // GPU
-        Constraint::Length(6),  // GPU%
+        Constraint::Length(18), // NAME
+        Constraint::Length(8),  // STATUS
+        Constraint::Length(3),  // SET (✓✓✓)
+        Constraint::Length(13), // GPU (e.g. "2×RTX A4000")
+        Constraint::Length(5),  // GPU%
         Constraint::Length(8),  // MEM (e.g. "120/240G")
         Constraint::Length(4),  // TEMP (e.g. "85C")
         Constraint::Length(7),  // $/HR
+        Constraint::Length(20), // BRANCH
         Constraint::Min(10),    // PROGRESS / ERROR
     ];
     let table = Table::new(rows, widths)
@@ -689,7 +746,7 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5), // header facts
+            Constraint::Length(8), // header facts
             Constraint::Min(3),    // per-GPU table
             Constraint::Length(3), // util sparkline
             Constraint::Length(3), // temp sparkline
@@ -704,12 +761,33 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
         .and_then(|m| m.progress.clone())
         .or_else(|| m.and_then(|m| m.error.clone()))
         .unwrap_or_else(|| "-".into());
+    let gpu = m
+        .and_then(|m| m.gpu_summary())
+        .or_else(|| pod.gpu_type.clone())
+        .unwrap_or_else(|| "-".into());
+    let cost = pod
+        .cost_per_hr
+        .map(|c| format!("${c:.2}/hr  (${:.2}/day)", c * 24.0))
+        .unwrap_or_else(|| "-".into());
+    let ok = |b: Option<bool>| match b {
+        Some(true) => "✓",
+        Some(false) => "✗",
+        None => "·",
+    };
+    let origin = m.and_then(|m| m.origin.clone()).unwrap_or_else(|| "-".into());
+    let origin_ok = m.and_then(|m| m.origin.as_deref().map(|o| o.contains("github.com")));
     let facts = format!(
-        "status:   {}\ngpu:      {}\nendpoint: {}\ncost:     {}\nprogress: {}",
+        "status:   {}\ngpu:      {}\nendpoint: {}\ncost:     {}\nbranch:   {}\norigin:   {} {}\nsetup:    .name {}   key {}   origin→gh {}\nprogress: {}",
         pod.status,
-        pod.gpu_type.clone().unwrap_or_else(|| "-".into()),
+        gpu,
         endpoint,
-        pod.cost_per_hr.map(|c| format!("${c:.2}/hr")).unwrap_or_else(|| "-".into()),
+        cost,
+        m.and_then(|m| m.branch.clone()).unwrap_or_else(|| "-".into()),
+        truncate(&origin, 32),
+        ok(origin_ok),
+        ok(m.and_then(|m| m.has_name)),
+        ok(m.and_then(|m| m.has_key)),
+        ok(origin_ok),
         progress,
     );
     f.render_widget(Paragraph::new(facts).wrap(Wrap { trim: true }), rows[0]);

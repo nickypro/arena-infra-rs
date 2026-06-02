@@ -212,11 +212,11 @@ mod tests {
         let mut metrics = HashMap::new();
         metrics.insert(
             "arena8-apple".to_string(),
-            PodMetrics { gpus: parse_nvidia_smi("100, 8000, 16000, 60\n"), ..Default::default() },
+            PodMetrics { gpus: parse_nvidia_smi("RTX 3090, 100, 8000, 16000, 60\n"), ..Default::default() },
         );
         metrics.insert(
             "arena8-luna".to_string(),
-            PodMetrics { gpus: parse_nvidia_smi("0, 1000, 16000, 40\n"), ..Default::default() },
+            PodMetrics { gpus: parse_nvidia_smi("RTX 3090, 0, 1000, 16000, 40\n"), ..Default::default() },
         );
         let s = summarize(&pods, &metrics);
         assert_eq!(s.pods, 2);
