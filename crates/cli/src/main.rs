@@ -255,10 +255,7 @@ enum PodCmd {
         /// Seconds between retry rounds.
         #[arg(long, default_value_t = 60)]
         retry_secs: u64,
-        /// After endpoints are up, deploy the nginx config to the proxy and reload it.
-        #[arg(long)]
-        proxy: bool,
-        /// After endpoints are up, provision the pods over SSH (like `arena setup`).
+        /// After endpoints are up, provision the pods over SSH (like `arena pods setup`).
         #[arg(long)]
         setup: bool,
         /// Give up waiting for endpoints after this many seconds.
@@ -561,7 +558,8 @@ async fn create_pods(
                     }
                     Some(K::Capacity) => {
                         eprintln!(
-                            "[stop] no more capacity (created {}/{}). Re-run with --keep-trying to wait.",
+                            "[stop] no capacity for this GPU right now (created {}/{}). \
+                             Re-run with --retry-mins N (or --keep-trying) to wait for it to free up.",
                             created.len(),
                             names.len()
                         );
@@ -1161,6 +1159,47 @@ async fn handle_proxy(cmd: ProxyCmd, provider: &dyn Provider, cfg: &Config, yes:
     Ok(())
 }
 
+/// The proxy step for `pods up`: print a short forward summary, then — if nginx is
+/// actually set up on the proxy host — deploy + reload it; otherwise just say how to
+/// get the config (don't dump it). Never errors the spin-up: a proxy hiccup is reported,
+/// not fatal.
+async fn smart_proxy(cfg: &Config, pods: &[arena_core::Pod]) -> Result<()> {
+    use arena_core::ssh::{self, SshTarget};
+
+    let pxcfg = arena_core::proxy::ProxyConfig::from_config(cfg)?;
+    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
+    let plan = arena_core::proxy::plan_forwards(&pxcfg, prefix, &cfg.machine_names, pods);
+    println!(
+        "\nproxy: {} forward(s) for {}@{}",
+        plan.forwards.len(),
+        pxcfg.proxy_user,
+        pxcfg.proxy_host
+    );
+
+    // Is nginx present on the proxy host?
+    let target =
+        SshTarget::for_host(&pxcfg.proxy_user, &pxcfg.proxy_host, 22, cfg.get("SHARED_SSH_KEY_PATH"));
+    let has_nginx = matches!(
+        ssh::run(&target, "command -v nginx >/dev/null 2>&1 && echo yes").await,
+        Ok(out) if out.success && out.stdout.contains("yes")
+    );
+
+    if has_nginx {
+        // nginx is set up — update it. (Part of the already-confirmed `up` flow.)
+        if let Err(e) = deploy_proxy(cfg, pods, true).await {
+            eprintln!("proxy update failed (pods are up): {e}");
+        }
+    } else {
+        println!(
+            "proxy host {} has no nginx (or is unreachable) — not deploying.\n\
+             To wire the ports, run `arena proxy plan` to print/save the nginx config, \
+             or `arena proxy apply` once nginx is set up.",
+            pxcfg.proxy_host
+        );
+    }
+    Ok(())
+}
+
 /// Render the proxy config for `pods` and (with `apply`) deploy it to the proxy host
 /// over SSH, then reload nginx. Dry-run prints the exact scp + reload it would run.
 /// This is the one place the tool touches the proxy host.
@@ -1472,7 +1511,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             create_with_retry(provider, cfg, want, &ov, keep_trying, retry_mins, retry_secs).await?;
         }
 
-        PodCmd::Up { count, add, gpu, gpus, cloud, disk, volume, dry_run, no_wait, keep_trying, retry_mins, retry_secs, proxy, setup, timeout, interval } => {
+        PodCmd::Up { count, add, gpu, gpus, cloud, disk, volume, dry_run, no_wait, keep_trying, retry_mins, retry_secs, setup, timeout, interval } => {
             let ov = SpecOverrides { gpu, gpus, cloud, disk, volume };
             let want = resolve_want(count, add)?;
             let names = plan_names(provider, cfg, want).await?;
@@ -1488,28 +1527,22 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                     println!("[dry-run] would create {name} on {} ({desc})", provider.name());
                 }
                 warn_no_volume(provider, &spec);
-                let extra = match (setup, proxy) {
-                    (true, true) => " then run setup and deploy the proxy",
-                    (true, false) => " then run setup",
-                    (false, true) => " then deploy the proxy",
-                    (false, false) => "",
-                };
+                let extra = if setup { " then run setup," } else { "" };
                 let retry = if retry_mins > 0 { format!(" (retrying up to {retry_mins}m for capacity)") } else { String::new() };
                 println!(
                     "\nDry-run only — no pods created (preview){retry}: would create the above, \
-                     poll up to {timeout}s for SSH endpoints, print the proxy plan{extra}."
+                     poll up to {timeout}s for SSH endpoints,{extra} then update the proxy (if nginx is set up)."
                 );
                 return Ok(());
             }
 
             if !confirm(yes, &format!(
-                "Will create {} pod(s) on {} ({}){}, wait for endpoints{}{}:\n  {}",
+                "Will create {} pod(s) on {} ({}){}, wait for endpoints{}, then update the proxy if nginx is set up:\n  {}",
                 names.len(),
                 provider.name(),
                 provider.describe(&spec),
                 if retry_mins > 0 { format!(", retrying up to {retry_mins}m") } else { String::new() },
                 if setup { ", run setup" } else { "" },
-                if proxy { ", deploy proxy" } else { "" },
                 names.join(", ")
             ))? {
                 println!("aborted.");
@@ -1581,17 +1614,14 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                     not_ready.join(", ")
                 );
             }
-            emit_proxy_plan(&pods, cfg, None)?;
-
-            // Optional chaining so spin-up is one command (provision + wire the proxy).
+            // Optional: provision the pods over SSH as part of the spin-up.
             if setup {
                 println!("\nProvisioning pods over SSH…");
                 handle_setup(provider, cfg, true, false).await?;
             }
-            if proxy {
-                println!("\nDeploying proxy config…");
-                deploy_proxy(cfg, &pods, true).await?;
-            }
+            // Wire the proxy: update nginx if it's set up on the proxy host, else just
+            // say how to get the config (don't dump it).
+            smart_proxy(cfg, &pods).await?;
         }
 
         PodCmd::Stop { target, dry_run } => {

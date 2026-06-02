@@ -24,16 +24,20 @@ impl ProviderErrorKind {
     /// and throttling unambiguously; capacity has no standard code, so we sniff the
     /// body for the phrases providers actually use.
     pub fn classify(status: reqwest::StatusCode, message: &str) -> Self {
+        // Status wins for auth/rate-limit. But capacity is checked *before* the generic
+        // 5xx→Transient rule, because providers (e.g. RunPod) report "no instances
+        // available" as an HTTP 500 — that's exhaustion to wait out, not a blip to retry.
         match status.as_u16() {
             401 | 403 => return Self::Auth,
             429 => return Self::RateLimited,
-            500..=599 => return Self::Transient,
             _ => {}
         }
         if looks_like_capacity(message) {
-            Self::Capacity
-        } else {
-            Self::Other
+            return Self::Capacity;
+        }
+        match status.as_u16() {
+            500..=599 => Self::Transient,
+            _ => Self::Other,
         }
     }
 }
@@ -166,6 +170,22 @@ mod tests {
         );
         assert!(!looks_like_capacity("insufficient credit balance"));
         assert!(looks_like_capacity("no instances available for this gpu type"));
+    }
+
+    #[test]
+    fn capacity_500_beats_transient() {
+        // RunPod reports capacity as a 500 — it must classify as Capacity (wait it out),
+        // not Transient (retry a few times then give up).
+        let msg = r#"create pod HTTP 500 Internal Server Error: {"error":"create pod: There are no instances currently available","status":500}"#;
+        assert_eq!(
+            ProviderErrorKind::classify(StatusCode::INTERNAL_SERVER_ERROR, msg),
+            ProviderErrorKind::Capacity
+        );
+        // A 500 without a capacity message is still Transient.
+        assert_eq!(
+            ProviderErrorKind::classify(StatusCode::INTERNAL_SERVER_ERROR, "boom"),
+            ProviderErrorKind::Transient
+        );
     }
 
     #[test]

@@ -44,14 +44,16 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     pod without touching them) — for end-of-program teardown.
   - `create`/`up` take `--retry-mins <M>` (`--retry-secs`, default 60) to **keep
     topping up to the target** while capacity is short — one round per interval for up
-    to M minutes, **Ctrl+C** stops early keeping what was made. `up --retry-mins 60
-    --proxy` does the full "spin up 28× A40 SECURE, retrying for an hour, then wire the
-    proxy" flow. The confirm prompt lists the exact pod names about to be created.
+    to M minutes, **Ctrl+C** stops early keeping what was made. A `no instances
+    available` capacity error is recognized as such (it waits), not treated as fatal.
+    The confirm prompt lists the exact pod names about to be created.
   - `pods up -n N` — one-command spin-up: create, poll until each pod has an SSH
-    endpoint, then print the proxy plan. `--setup` then provisions each pod over SSH
-    and `--proxy` deploys + reloads the proxy config — so `pods up -n 15 --setup
-    --proxy` is a full start-of-iteration spin-up. Confirms first (`--dry-run` previews);
-    `--no-wait` skips polling. Polling stops at `--timeout`; nothing runs in the background.
+    endpoint, then **wire the proxy**: if nginx is set up on the proxy host it deploys +
+    reloads it; otherwise it just says to run `arena proxy plan` (no config dump).
+    `--setup` also provisions each pod over SSH. So `pods up -n 28 --gpu A40 --cloud
+    SECURE --disk 200 --retry-mins 60 --setup` is a full start-of-iteration spin-up that
+    waits for capacity then wires everything. Confirms first (`--dry-run` previews);
+    `--no-wait` skips polling.
   - Batch create (`create`/`up`) uses **typed provider errors** (`ProviderErrorKind`):
     on **capacity** exhaustion it stops gracefully and keeps the pods it got (e.g.
     "created 6 of 10") rather than erroring — `--keep-trying` instead waits and
