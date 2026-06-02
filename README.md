@@ -38,10 +38,14 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     runpod|vast|hetzner`; Vast reads `VAST_API_KEY`, Hetzner reads `HETZNER_API_KEY`
     + `HETZNER_*`). `list` takes `--json`; `stop`/`restart`/`terminate` accept a
     **machine name or id**. `restart` restarts in place (RunPod restart / Hetzner
-    reboot / Vast stop+start), preserving the machine where supported.
+    reboot / Vast stop+start), preserving the machine where supported. `terminate
+    --all` tears down the **whole fleet** (dry-run lists every pod first; `--apply`
+    to execute) — for end-of-program teardown.
   - `pods up -n N` — one-command spin-up: create, poll until each pod has an SSH
-    endpoint, then print the proxy plan. Dry-run unless `--apply`; `--no-wait` skips
-    polling. Polling stops at `--timeout`; nothing runs in the background.
+    endpoint, then print the proxy plan. `--setup` then provisions each pod over SSH
+    and `--proxy` deploys + reloads the proxy config — so `pods up -n 15 --apply
+    --setup --proxy` is a full start-of-iteration spin-up. Dry-run unless `--apply`;
+    `--no-wait` skips polling. Polling stops at `--timeout`; nothing runs in the background.
   - Batch create (`create`/`up`) uses **typed provider errors** (`ProviderErrorKind`):
     on **capacity** exhaustion it stops gracefully and keeps the pods it got (e.g.
     "created 6 of 10") rather than erroring — `--keep-trying` instead waits and
@@ -49,8 +53,11 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     never rolled back. **Transient** failures (429 / 5xx / connect-timeout) are
     retried automatically with exponential backoff (`retry` module) around create
     and list calls — so a throttle or blip doesn't fail the command.
-  - `proxy plan` — read-only; prints the nginx `stream` config to apply (`--out`
-    saves it locally; never deploys to the proxy).
+  - `proxy plan` — read-only; prints the nginx `stream` config (`--out` saves it
+    locally; never connects to the proxy). `proxy apply` **deploys** that config to the
+    proxy host over SSH and reloads nginx (`nginx -t && nginx -s reload`); dry-run shows
+    the exact scp + reload, `--apply` executes. This is the one place the tool touches
+    the proxy host.
   - `config check` — validate that the keys the selected provider + proxy + backup
     need are present (never prints secret values; exits non-zero if a required key is
     missing). Copy `config.env.example` to get started.

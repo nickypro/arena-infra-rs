@@ -114,6 +114,12 @@ enum ProxyCmd {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Deploy the rendered nginx config to the proxy host and reload nginx
+    /// (`nginx -t && nginx -s reload`). Dry-run unless --apply.
+    Apply {
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -148,6 +154,12 @@ enum PodCmd {
         /// On capacity exhaustion, wait and keep retrying instead of stopping.
         #[arg(long)]
         keep_trying: bool,
+        /// After endpoints are up, deploy the nginx config to the proxy and reload it.
+        #[arg(long)]
+        proxy: bool,
+        /// After endpoints are up, provision the pods over SSH (like `arena setup`).
+        #[arg(long)]
+        setup: bool,
         /// Give up waiting for endpoints after this many seconds.
         #[arg(long, default_value_t = 600)]
         timeout: u64,
@@ -169,10 +181,14 @@ enum PodCmd {
         #[arg(long)]
         apply: bool,
     },
-    /// Terminate (delete) a pod by name or id. Dry-run unless --apply.
+    /// Terminate (delete) a pod by name or id, or the whole fleet with --all.
+    /// Dry-run unless --apply.
     Terminate {
-        /// Machine name (e.g. arena8-apple) or raw provider id.
-        target: String,
+        /// Machine name (e.g. arena8-apple) or raw provider id. Omit with --all.
+        target: Option<String>,
+        /// Terminate every pod the provider reports (the whole fleet).
+        #[arg(long)]
+        all: bool,
         #[arg(long)]
         apply: bool,
     },
@@ -753,8 +769,69 @@ async fn handle_proxy(cmd: ProxyCmd, provider: &dyn Provider, cfg: &Config) -> R
             let pods = provider.list_pods().await.context("listing pods for proxy plan")?;
             emit_proxy_plan(&pods, cfg, out.as_deref())?;
         }
+        ProxyCmd::Apply { apply } => {
+            let pods = provider.list_pods().await.context("listing pods for proxy apply")?;
+            deploy_proxy(cfg, &pods, apply).await?;
+        }
     }
     Ok(())
+}
+
+/// Render the proxy config for `pods` and (with `apply`) deploy it to the proxy host
+/// over SSH, then reload nginx. Dry-run prints the exact scp + reload it would run.
+/// This is the one place the tool touches the proxy host.
+async fn deploy_proxy(cfg: &Config, pods: &[arena_core::Pod], apply: bool) -> Result<()> {
+    use arena_core::ssh::{self, SshTarget};
+
+    let pxcfg = arena_core::proxy::ProxyConfig::from_config(cfg)?;
+    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
+    let plan = arena_core::proxy::plan_forwards(&pxcfg, prefix, &cfg.machine_names, pods);
+    let nginx = arena_core::proxy::render_nginx(&plan.forwards);
+    let target =
+        SshTarget::for_host(&pxcfg.proxy_user, &pxcfg.proxy_host, 22, cfg.get("SHARED_SSH_KEY_PATH"));
+    let reload = "nginx -t && nginx -s reload";
+
+    for s in &plan.skipped {
+        eprintln!("warning: skipped {} — {}", s.name, s.reason);
+    }
+
+    if !apply {
+        println!(
+            "[dry-run] would deploy {} forward(s) to {}@{}:{}",
+            plan.forwards.len(),
+            pxcfg.proxy_user,
+            pxcfg.proxy_host,
+            pxcfg.nginx_path
+        );
+        println!("  {}", target.display_scp("<rendered nginx>", &pxcfg.nginx_path));
+        println!("  {}", target.display_command(reload));
+        println!("(--apply to deploy and reload nginx)");
+        return Ok(());
+    }
+
+    // Write the rendered config locally, scp it to the proxy, then reload nginx.
+    let tmp = std::env::temp_dir().join("arena-proxy.conf");
+    std::fs::write(&tmp, &nginx).context("writing rendered nginx config to a temp file")?;
+    let scp = ssh::scp(&target, &tmp.to_string_lossy(), &pxcfg.nginx_path).await?;
+    if !scp.success {
+        anyhow::bail!("scp to proxy {} failed: {}", pxcfg.proxy_host, scp.stderr.trim());
+    }
+    let out = ssh::run(&target, reload).await?;
+    if out.success {
+        println!(
+            "[proxy] deployed {} forward(s) to {} and reloaded nginx",
+            plan.forwards.len(),
+            pxcfg.proxy_host
+        );
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "nginx reload on {} failed (exit {:?}): {}",
+            pxcfg.proxy_host,
+            out.code,
+            out.stderr.trim()
+        )
+    }
 }
 
 /// Render and print the proxy plan for the given pods: a summary table, the nginx
@@ -852,7 +929,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
             create_pods(provider, cfg, &names, keep_trying).await?;
         }
 
-        PodCmd::Up { count, apply, no_wait, keep_trying, timeout, interval } => {
+        PodCmd::Up { count, apply, no_wait, keep_trying, proxy, setup, timeout, interval } => {
             let names = plan_names(provider, cfg, count).await?;
             if names.is_empty() {
                 eprintln!("no free machine names available — nothing to do");
@@ -866,9 +943,15 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
                     println!("[dry-run] would create {name} on {} ({desc})", provider.name());
                 }
                 warn_no_volume(provider, &spec);
+                let extra = match (setup, proxy) {
+                    (true, true) => " then run setup and deploy the proxy",
+                    (true, false) => " then run setup",
+                    (false, true) => " then deploy the proxy",
+                    (false, false) => "",
+                };
                 println!(
                     "\nDry-run only — no pods created. With --apply: create the above, \
-                     poll up to {timeout}s for SSH endpoints, then print the proxy plan."
+                     poll up to {timeout}s for SSH endpoints, print the proxy plan{extra}."
                 );
                 return Ok(());
             }
@@ -938,6 +1021,16 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
                 );
             }
             emit_proxy_plan(&pods, cfg, None)?;
+
+            // Optional chaining so spin-up is one command (provision + wire the proxy).
+            if setup {
+                println!("\nProvisioning pods over SSH…");
+                handle_setup(provider, cfg, true, false).await?;
+            }
+            if proxy {
+                println!("\nDeploying proxy config…");
+                deploy_proxy(cfg, &pods, true).await?;
+            }
         }
 
         PodCmd::Stop { target, apply } => {
@@ -960,15 +1053,55 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config) -> Resu
             }
         }
 
-        PodCmd::Terminate { target, apply } => {
-            let (id, label) = resolve_target(provider, &target).await?;
-            if apply {
-                provider.terminate_pod(&id).await?;
-                println!("[terminated] {label}");
-            } else {
-                println!("[dry-run] would terminate {label} (--apply to execute)");
+        PodCmd::Terminate { target, all, apply } => match (all, target) {
+            (true, _) => {
+                let policy = arena_core::retry::RetryPolicy::default();
+                let mut pods =
+                    arena_core::retry::retrying(&policy, || provider.list_pods()).await?;
+                pods.sort_by(|a, b| a.name.cmp(&b.name));
+                if pods.is_empty() {
+                    println!("(no pods to terminate)");
+                    return Ok(());
+                }
+                if !apply {
+                    for p in &pods {
+                        println!("[dry-run] would terminate {} (id={})", p.name, p.id);
+                    }
+                    println!(
+                        "\nDry-run only — would terminate ALL {} pod(s). Re-run with --apply.",
+                        pods.len()
+                    );
+                    return Ok(());
+                }
+                let total = pods.len();
+                let mut ok = 0;
+                for p in &pods {
+                    match provider.terminate_pod(&p.id).await {
+                        Ok(()) => {
+                            println!("[terminated] {}", p.name);
+                            ok += 1;
+                        }
+                        Err(e) => eprintln!("[FAILED] {}: {e}", p.name),
+                    }
+                }
+                println!("\nterminated {ok}/{total}");
+                if ok < total {
+                    anyhow::bail!("{} pod(s) failed to terminate", total - ok);
+                }
             }
-        }
+            (false, Some(target)) => {
+                let (id, label) = resolve_target(provider, &target).await?;
+                if apply {
+                    provider.terminate_pod(&id).await?;
+                    println!("[terminated] {label}");
+                } else {
+                    println!("[dry-run] would terminate {label} (--apply to execute)");
+                }
+            }
+            (false, None) => {
+                anyhow::bail!("specify a pod (name or id) to terminate, or pass --all");
+            }
+        },
     }
     Ok(())
 }

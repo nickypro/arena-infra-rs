@@ -48,6 +48,18 @@ impl SshTarget {
         })
     }
 
+    /// Build a target for an arbitrary host (e.g. the proxy box), resolving the key the
+    /// same way pods do (prefer a readable `~/.ssh/<name>` if the configured path isn't).
+    pub fn for_host(user: &str, host: &str, port: u16, key_path: Option<&str>) -> Self {
+        Self {
+            user: user.to_string(),
+            host: host.to_string(),
+            port,
+            key_path: key_path.map(resolve_key_path),
+            connect_timeout_secs: 10,
+        }
+    }
+
     /// The `ssh` argv *before* the remote command — non-interactive, fail-fast.
     pub fn ssh_args(&self) -> Vec<String> {
         let mut a = vec![
