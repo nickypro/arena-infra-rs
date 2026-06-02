@@ -176,6 +176,7 @@ pub enum NpField {
     CloudType,
     GpuType,
     GpuCount,
+    Volume,
     Pods,
 }
 
@@ -190,6 +191,8 @@ pub struct NewPodForm {
     pub gpu_types: Vec<String>,
     pub gpu_idx: usize,
     pub gpu_count: u32,
+    /// Persistent volume size in GB (0 = none); adjusted in 100GB steps.
+    pub volume_gb: u32,
     pub count: usize,
     /// Free machine names available on the selected provider (for the count cap).
     pub free: Vec<String>,
@@ -228,6 +231,7 @@ impl NewPodForm {
         if self.is_gpu() {
             f.push(NpField::GpuType);
             f.push(NpField::GpuCount);
+            f.push(NpField::Volume);
         }
         f.push(NpField::Pods);
         f
@@ -257,6 +261,8 @@ impl NewPodForm {
             NpField::CloudType => self.cloud_idx = wrap(self.cloud_idx, delta, self.cloud_types.len()),
             NpField::GpuType => self.gpu_idx = wrap(self.gpu_idx, delta, self.gpu_types.len()),
             NpField::GpuCount => self.gpu_count = (self.gpu_count as i32 + delta).clamp(1, 8) as u32,
+            // Volume in 100GB steps, 0 (none) up to 2000GB.
+            NpField::Volume => self.volume_gb = (self.volume_gb as i32 + delta * 100).clamp(0, 2000) as u32,
             NpField::Pods => {
                 let max = self.free.len().max(1) as i32;
                 self.count = (self.count as i32 + delta).clamp(1, max) as usize;
@@ -505,6 +511,7 @@ mod tests {
             gpu_types: vec!["RTX 3090".into(), "RTX 4090".into()],
             gpu_idx: 0,
             gpu_count: 1,
+            volume_gb: 0,
             count: 1,
             free: vec!["arena8-apple".into(), "arena8-autumn".into()],
             field: 0,
@@ -516,7 +523,14 @@ mod tests {
         let f = form();
         assert_eq!(
             f.fields(),
-            vec![NpField::Provider, NpField::CloudType, NpField::GpuType, NpField::GpuCount, NpField::Pods]
+            vec![
+                NpField::Provider,
+                NpField::CloudType,
+                NpField::GpuType,
+                NpField::GpuCount,
+                NpField::Volume,
+                NpField::Pods
+            ]
         );
     }
 
@@ -539,7 +553,11 @@ mod tests {
             f.change(1);
         }
         assert_eq!(f.gpu_count, 8); // capped
-        f.field = 4; // Pods
+        f.field = 4; // Volume (100GB steps)
+        f.change(1);
+        f.change(1);
+        assert_eq!(f.volume_gb, 200);
+        f.field = 5; // Pods
         for _ in 0..20 {
             f.change(1);
         }

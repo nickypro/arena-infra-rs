@@ -93,6 +93,10 @@ struct Shared {
     last_refresh: Option<Instant>,
     /// True while a sweep is in flight (drives the footer's ⟳ indicator).
     refreshing: bool,
+    /// Optimistic placeholders for pods we just created but the provider's list API
+    /// hasn't reported yet — shown as "pending" so a new card appears immediately. The
+    /// fetcher drops each one as soon as the real pod shows up.
+    pending: Vec<Pod>,
 }
 
 /// UI-thread-only state: what the operator is looking at / interacting with. Kept
@@ -200,11 +204,16 @@ async fn fetch_loop(
             Ok(mut pods) => {
                 pods.sort_by(|a, b| a.name.cmp(&b.name));
                 let metrics = fetch_metrics(&pods, &cfg, &opts).await;
-                let summary = summarize(&pods, &metrics);
-                let status = status_line(&summary);
 
                 let mut s = shared.lock().unwrap();
-                for pod in &pods {
+                // Drop optimistic placeholders the provider now reports, then show the
+                // real fleet plus any still-pending placeholders.
+                s.pending.retain(|pp| !pods.iter().any(|r| r.name == pp.name));
+                let mut display = pods;
+                display.extend(s.pending.iter().cloned());
+                display.sort_by(|a, b| a.name.cmp(&b.name));
+
+                for pod in &display {
                     let m = metrics.get(&pod.name);
                     let mem_pct = m.and_then(|m| m.mem_summary()).map(|(u, t)| {
                         if t > 0 { (u as u64 * 100 / t as u64) as u32 } else { 0 }
@@ -215,10 +224,10 @@ async fn fetch_loop(
                         mem_pct,
                     );
                 }
-                s.summary = summary;
-                s.status = status;
+                s.summary = summarize(&display, &metrics);
+                s.status = status_line(&s.summary);
                 s.metrics = metrics;
-                s.pods = pods;
+                s.pods = display;
                 s.last_refresh = Some(Instant::now());
                 s.refreshing = false;
             }
@@ -508,6 +517,7 @@ async fn run(
                                 } else {
                                     let cloud = form.cloud_type().map(String::from);
                                     let gpu_type = form.gpu_type().to_string();
+                                    let volume = form.volume_gb;
                                     ui.mode = Mode::Result(format!(
                                         "creating {} pod(s) on {pname}…",
                                         free.len()
@@ -516,15 +526,29 @@ async fn run(
                                         let s = shared.lock().unwrap();
                                         terminal.draw(|f| view(f, &s, &ui, secs))?;
                                     }
-                                    let msg = create_pods(
+                                    let (msg, created) = create_pods(
                                         &prov,
                                         &ui.cfg,
                                         &free,
                                         cloud.as_deref(),
                                         &gpu_type,
                                         form.gpu_count,
+                                        Some(volume),
                                     )
                                     .await;
+                                    // Show the new pods immediately as "pending" until
+                                    // the provider's list API reports them.
+                                    {
+                                        let mut s = shared.lock().unwrap();
+                                        for mut p in created {
+                                            p.status = "pending".into();
+                                            p.ssh_ip = None;
+                                            p.ssh_port = None;
+                                            if !s.pending.iter().any(|x| x.name == p.name) {
+                                                s.pending.push(p);
+                                            }
+                                        }
+                                    }
                                     ui.mode = Mode::Result(msg);
                                     nudge.notify_one();
                                 }
@@ -648,6 +672,7 @@ fn build_new_pod_form(cfg: &Config, launch_provider: &str, existing: &[Pod]) -> 
         gpu_types: gpu_type_choices(cfg),
         gpu_idx: 0,
         gpu_count: spec.gpu_count.max(1),
+        volume_gb: spec.volume_gb,
         count: 1,
         free,
         field: 0,
@@ -663,30 +688,34 @@ async fn create_pods(
     cloud_type: Option<&str>,
     gpu_type: &str,
     gpu_count: u32,
-) -> String {
+    volume_gb: Option<u32>,
+) -> (String, Vec<Pod>) {
     let mut base = PodSpec::from_config(cfg);
     base.gpu_type = gpu_type.to_string();
     base.gpu_count = gpu_count;
     if let Some(c) = cloud_type {
         base.cloud_type = c.to_string();
     }
-    let mut ok = 0usize;
+    if let Some(v) = volume_gb {
+        base.volume_gb = v;
+    }
+    let mut created: Vec<Pod> = Vec::new();
     let mut fails: Vec<String> = Vec::new();
     for name in names {
         let mut spec = base.clone();
         spec.name = name.clone();
         spec.env.push(("MACHINE_NAME".into(), name.clone()));
         match provider.create_pod(&spec).await {
-            Ok(_) => ok += 1,
+            Ok(pod) => created.push(pod),
             Err(e) => fails.push(format!("✗ {name}: {e}")),
         }
     }
-    let mut s = format!("created {ok}/{}", names.len());
+    let mut s = format!("created {}/{}", created.len(), names.len());
     for f in fails.iter().take(8) {
         s.push('\n');
         s.push_str(f);
     }
-    s
+    (s, created)
 }
 
 /// Run a confirmed action against its pod, show a busy line, then park the outcome in a
@@ -1374,6 +1403,10 @@ fn render_new_pod(f: &mut Frame, form: &NewPodForm) {
                 ("gpu type", format!("{}{price}", arena_core::gpu::label(form.gpu_type())))
             }
             NpField::GpuCount => ("gpus/pod", form.gpu_count.to_string()),
+            NpField::Volume => (
+                "volume",
+                if form.volume_gb == 0 { "none".to_string() } else { format!("{}GB", form.volume_gb) },
+            ),
             NpField::Pods => ("pods", format!("{} of {} free", form.count, form.free.len())),
         };
         let marker = if selected { "▶ " } else { "  " };
@@ -1435,6 +1468,10 @@ fn render_new_pod(f: &mut Frame, form: &NewPodForm) {
             }
         }
         NpField::GpuCount => lines.push(Line::styled("GPUs per pod: 1–8", dim)),
+        NpField::Volume => lines.push(Line::styled(
+            "persistent volume in 100GB steps (0 = none). Survives pod restarts.",
+            dim,
+        )),
         NpField::Pods => {
             let planned = form.planned_names();
             lines.push(Line::styled("will create:", label));

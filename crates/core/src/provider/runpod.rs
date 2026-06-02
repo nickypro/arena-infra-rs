@@ -84,8 +84,13 @@ impl Provider for RunpodProvider {
     }
 
     fn describe(&self, spec: &PodSpec) -> String {
+        let volume = if spec.volume_gb > 0 {
+            format!(", volume {}GB", spec.volume_gb)
+        } else {
+            String::new()
+        };
         format!(
-            "{} x{}, {}, disk {}GB, image {}",
+            "{} x{}, {}, disk {}GB{volume}, image {}",
             spec.gpu_type, spec.gpu_count, spec.cloud_type, spec.disk_gb, spec.image
         )
     }
