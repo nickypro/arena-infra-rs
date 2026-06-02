@@ -1101,9 +1101,19 @@ fn summary_line(s: &FleetSummary) -> Paragraph<'static> {
 
 fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: bool) {
     const SPARK_W: usize = 12;
+    // Responsive: the essential columns (~92 wide) always show; the nice-to-haves
+    // (PROGRESS, then the GPU%/MEM% graphs) are dropped when the terminal is too narrow
+    // so the core data isn't crushed to one column each.
+    let w = area.width as usize;
+    let show_progress = w >= 104;
+    let show_spark = with_spark && w >= 132;
+
     let mut header_cells =
-        vec!["", "P", "NAME", "STATUS", "SET", "GPU", "GPU%", "MEM", "TEMP", "DISK", "$/HR", "BRANCH", "PROGRESS / ERROR"];
-    if with_spark {
+        vec!["", "P", "NAME", "STATUS", "SET", "GPU", "GPU%", "MEM", "TEMP", "DISK", "$/HR", "BRANCH"];
+    if show_progress {
+        header_cells.push("PROGRESS / ERROR");
+    }
+    if show_spark {
         header_cells.push("GPU%~");
         header_cells.push("MEM%~");
     }
@@ -1141,7 +1151,6 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                 Some(b) => truncate(&short_branch(&b, &ui.prefix), 6),
                 None => "-".into(),
             };
-            let (detail, detail_style) = detail_cell(m);
             // RUNNING-but-unreachable reads as "init" (still coming up), in yellow.
             let status_label = display_status(&p.status, m.map(|m| m.error.is_none()));
             let status_cell = if status_label == "init" {
@@ -1167,9 +1176,12 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                 Cell::from(disk),
                 Cell::from(cost),
                 Cell::from(branch),
-                Cell::from(detail).style(detail_style),
             ];
-            if with_spark {
+            if show_progress {
+                let (detail, detail_style) = detail_cell(m);
+                cells.push(Cell::from(detail).style(detail_style));
+            }
+            if show_spark {
                 let h = shared.history.get(&p.name);
                 let gpu_hist = h.map(|h| h.util_data()).unwrap_or_default();
                 let mem_hist = h.map(|h| h.mem_data()).unwrap_or_default();
@@ -1201,9 +1213,11 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
         Constraint::Length(9),  // DISK (e.g. "12/100G")
         Constraint::Length(7),  // $/HR
         Constraint::Length(6),  // BRANCH (e.g. "w1d2")
-        Constraint::Min(10),    // PROGRESS / ERROR
     ];
-    if with_spark {
+    if show_progress {
+        widths.push(Constraint::Min(10)); // PROGRESS / ERROR (flexible)
+    }
+    if show_spark {
         widths.push(Constraint::Length(SPARK_W as u16)); // GPU% history
         widths.push(Constraint::Length(SPARK_W as u16)); // MEM% history
     }
@@ -1231,15 +1245,23 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
+    // Only show the history graphs if the pane is tall enough; otherwise give the space
+    // to the facts + per-GPU table (the graphs are a nice-to-have).
+    let show_graphs = inner.height >= 18;
+    let constraints: &[Constraint] = if show_graphs {
+        &[
             Constraint::Length(9), // header facts
             Constraint::Min(3),    // per-GPU table
             Constraint::Length(3), // util sparkline
             Constraint::Length(3), // temp sparkline
-        ])
-        .split(inner);
+        ]
+    } else {
+        &[
+            Constraint::Length(9), // header facts
+            Constraint::Min(3),    // per-GPU table
+        ]
+    };
+    let rows = Layout::default().direction(Direction::Vertical).constraints(constraints).split(inner);
 
     let endpoint = match (&pod.ssh_ip, pod.ssh_port) {
         (Some(ip), Some(port)) => format!("{ip}:{port}"),
@@ -1327,25 +1349,27 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     .block(Block::default().borders(Borders::TOP).title("per-GPU"));
     f.render_widget(gpu_table, rows[1]);
 
-    let hist = shared.history.get(&pod.name);
-    let util_data = hist.map(|h| h.util_data()).unwrap_or_default();
-    let temp_data = hist.map(|h| h.temp_data()).unwrap_or_default();
-    f.render_widget(
-        Sparkline::default()
-            .block(Block::default().borders(Borders::TOP).title("util % (history)"))
-            .data(&util_data)
-            .max(100)
-            .style(Style::default().fg(Color::Green)),
-        rows[2],
-    );
-    f.render_widget(
-        Sparkline::default()
-            .block(Block::default().borders(Borders::TOP).title("temp C (history)"))
-            .data(&temp_data)
-            .max(100)
-            .style(Style::default().fg(Color::Yellow)),
-        rows[3],
-    );
+    if show_graphs {
+        let hist = shared.history.get(&pod.name);
+        let util_data = hist.map(|h| h.util_data()).unwrap_or_default();
+        let temp_data = hist.map(|h| h.temp_data()).unwrap_or_default();
+        f.render_widget(
+            Sparkline::default()
+                .block(Block::default().borders(Borders::TOP).title("util % (history)"))
+                .data(&util_data)
+                .max(100)
+                .style(Style::default().fg(Color::Green)),
+            rows[2],
+        );
+        f.render_widget(
+            Sparkline::default()
+                .block(Block::default().borders(Borders::TOP).title("temp C (history)"))
+                .data(&temp_data)
+                .max(100)
+                .style(Style::default().fg(Color::Yellow)),
+            rows[3],
+        );
+    }
 }
 
 fn footer_hint(shared: &Shared, ui: &Ui, secs: u64) -> String {
