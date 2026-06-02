@@ -85,8 +85,11 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     pods** with `n`. Every mutation goes through a confirmation modal — the *only* place
     the TUI mutates anything. Lifecycle actions (restart/stop/terminate) require
     **typing the pod's exact name**; fleet actions require typing **ALL**; backup/setup
-    show the precise command(s) and take a single `y`; add-pod previews the names it
-    will allocate before `enter`. The dashboard's reads stay reads.
+    show the precise command(s) and take a single `y`. The dashboard's reads stay reads.
+  - **Add-pod (`n`)** is an interactive form: `↑↓` moves between fields, `←→` changes
+    the value. Pick the provider (unavailable ones — no API key — are greyed out),
+    cloud type (RunPod only), GPU type (full option list shown) and count, and how many
+    pods; it previews the names it will allocate, then creates on `enter`.
 
 Shared library pieces: `ssh` (non-interactive, fail-fast SSH command build + run),
 `metrics` (nvidia-smi parsing + per-pod aggregation), and `provider::build` (the one
