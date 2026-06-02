@@ -124,7 +124,7 @@ impl SshTarget {
 /// prefer that. If neither is readable, keep the configured path so the resulting error
 /// names what was actually tried. An explicit `SHARED_SSH_KEY_PATH` env override still
 /// wins (it's applied before this, at config load) — this is only a fallback.
-fn resolve_key_path(configured: &str) -> String {
+pub fn resolve_key_path(configured: &str) -> String {
     let home = std::env::var("HOME").ok();
     resolve_key_with(configured, home.as_deref(), |p| {
         std::fs::File::open(p).is_ok()

@@ -52,7 +52,10 @@ impl SetupConfig {
             .map(String::from)
             .unwrap_or_else(|| format!("/root/{name}"));
         Ok(Self {
-            key_local: key_local.to_string(),
+            // Resolve to a readable copy (prefer ~/.ssh/<name> if the configured path
+            // isn't readable), same as the shared key — so `setup` works when run as a
+            // user that can't read the configured /root path.
+            key_local: crate::ssh::resolve_key_path(key_local),
             key_remote: cfg.get("GIT_SSH_KEY_REMOTE").unwrap_or("/root/.ssh/id_ed25519").to_string(),
             repo_path,
             repo_url: format!("git@github.com:{owner}/{name}.git"),

@@ -763,6 +763,44 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
     println!("\nDashboard (optional):");
     cfg_row(cfg, &mut missing, "PROGRESS_CMD", false, false);
 
+    // Read-only readiness: are the local files this user needs actually there/readable?
+    // Answers "is it set up yet?" without touching any API.
+    println!("\nSetup readiness (local, read-only):");
+    let readable = |p: &str| std::fs::File::open(p).is_ok();
+    if let Some(k) = cfg.get("SHARED_SSH_KEY_PATH") {
+        // Resolve the same way pods/proxy do (readable ~/.ssh fallback).
+        let resolved = arena_core::ssh::SshTarget::for_host("x", "x", 22, Some(k))
+            .key_path
+            .unwrap_or_default();
+        let ok = readable(&resolved);
+        println!(
+            "  {} shared SSH key             {}{}",
+            if ok { "✓" } else { "✗" },
+            resolved,
+            if ok || resolved == k { String::new() } else { format!("  (configured: {k})") }
+        );
+        if !ok {
+            println!("      └ not readable by this user — dashboard metrics / SSH will fail");
+        }
+    }
+    if let Some(k) = cfg.get("GIT_SSH_KEY_LOCAL") {
+        let resolved = arena_core::ssh::resolve_key_path(k);
+        println!("  {} git deploy key (local)    {resolved}", if readable(&resolved) { "✓" } else { "✗" });
+        let pubk = format!("{resolved}.pub");
+        println!("  {} git deploy key .pub       {pubk}", if readable(&pubk) { "✓" } else { "✗" });
+    }
+    let plan_present = readable("arena-plan.json");
+    println!(
+        "  {} provisioning plan          {}",
+        if plan_present { "✓" } else { "·" },
+        if plan_present { "arena-plan.json" } else { "none (optional — `arena plan`)" }
+    );
+    println!(
+        "  {} iteration start date       {}",
+        if cfg.get("ARENA_START_DATE").is_some() { "✓" } else { "✗" },
+        cfg.get("ARENA_START_DATE").unwrap_or("unset — backups can't label wNdM")
+    );
+
     if missing.is_empty() {
         println!("\nOK — required keys for provider `{provider_name}` are present.");
         Ok(())
