@@ -1129,32 +1129,34 @@ async fn handle_backup(
         return Ok(());
     }
 
-    // Apply: run sequentially so output stays readable and one failure doesn't
-    // obscure the rest. Each pod's result is classified (backed up / no changes / error).
-    let mut backed_up = 0;
-    let mut no_changes = 0;
-    let mut failed = 0;
-    for (name, target) in &targets {
-        let cmd = arena_core::backup::backup_command(&bcfg, name, &msg_for(name));
-        match ssh::run(target, &cmd).await {
+    // Run concurrently with a live [done/total] counter (one SSH per pod, slow serially).
+    let total = targets.len();
+    println!("Backing up {total} pod(s) over SSH…");
+    let mut set = tokio::task::JoinSet::new();
+    for (name, target) in targets {
+        let cmd = arena_core::backup::backup_command(&bcfg, &name, &msg_for(&name));
+        let branch = bcfg.branch_for(&name);
+        set.spawn(async move { (name, branch, ssh::run(&target, &cmd).await) });
+    }
+    let (mut backed_up, mut no_changes, mut failed, mut done) = (0, 0, 0, 0);
+    while let Some(joined) = set.join_next().await {
+        done += 1;
+        let Ok((name, branch, res)) = joined else { continue };
+        match res {
             Ok(out) if out.success && out.stdout.lines().any(|l| l.trim() == "NO_CHANGES") => {
-                println!("[no changes] {name}");
+                println!("[{done}/{total}] = {name} (no changes, on {branch})");
                 no_changes += 1;
             }
             Ok(out) if out.success => {
-                println!("[backed up]  {name} -> {}", bcfg.branch_for(name));
+                println!("[{done}/{total}] ✓ {name} -> {branch}");
                 backed_up += 1;
             }
             Ok(out) => {
-                eprintln!(
-                    "[FAILED]     {name} (exit {:?}): {}",
-                    out.code,
-                    out.stderr.trim()
-                );
+                println!("[{done}/{total}] ✗ {name} (exit {:?}): {}", out.code, out.stderr.trim());
                 failed += 1;
             }
             Err(e) => {
-                eprintln!("[FAILED]     {name}: {e}");
+                println!("[{done}/{total}] ✗ {name}: {e}");
                 failed += 1;
             }
         }
