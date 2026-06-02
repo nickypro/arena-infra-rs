@@ -132,12 +132,13 @@ enum ConfigCmd {
     /// key is missing.
     Check,
     /// Set a key in config.env (e.g. an API key): replaces the line if present, else
-    /// appends `KEY="value"`. Writes to the --config file; never echoes the value.
+    /// appends `KEY="value"`. Writes to the --config file; never echoes the value. With
+    /// no KEY/VALUE it prompts interactively (pick a key, type the value).
     Set {
-        /// Config key, e.g. RUNPOD_API_KEY.
-        key: String,
-        /// Value to store (will be quoted).
-        value: String,
+        /// Config key, e.g. RUNPOD_API_KEY. Omit to choose interactively.
+        key: Option<String>,
+        /// Value to store (will be quoted). Omit to be prompted.
+        value: Option<String>,
     },
 }
 
@@ -759,6 +760,10 @@ fn handle_config(
     match cmd {
         ConfigCmd::Check => config_check(cfg, provider_name),
         ConfigCmd::Set { key, value } => {
+            let (key, value) = match (key, value) {
+                (Some(k), Some(v)) => (k, v),
+                _ => interactive_config_set()?,
+            };
             let text = std::fs::read_to_string(config_path)
                 .with_context(|| format!("reading {}", config_path.display()))?;
             let updated = arena_core::config::upsert_line(&text, &key, &value);
@@ -789,20 +794,68 @@ fn cfg_row(cfg: &Config, missing: &mut Vec<String>, key: &str, required: bool, s
     }
 }
 
+/// Interactively pick a config key and read its value (for `config set` with no args).
+/// Requires a terminal.
+fn interactive_config_set() -> Result<(String, String)> {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("config set needs a key and value non-interactively: arena config set KEY VALUE");
+    }
+    let read = |prompt: &str| -> Result<String> {
+        eprint!("{prompt}");
+        std::io::stderr().flush().ok();
+        let mut s = String::new();
+        std::io::stdin().read_line(&mut s)?;
+        Ok(s.trim().to_string())
+    };
+
+    const OPTS: &[&str] = &["RUNPOD_API_KEY", "VAST_API_KEY", "HETZNER_API_KEY", "ARENA_START_DATE"];
+    eprintln!("Which key to set?");
+    for (i, k) in OPTS.iter().enumerate() {
+        eprintln!("  {}) {k}", i + 1);
+    }
+    eprintln!("  {}) other (type the key name)", OPTS.len() + 1);
+    let choice = read("> ")?;
+    let key = match choice.parse::<usize>() {
+        Ok(n) if (1..=OPTS.len()).contains(&n) => OPTS[n - 1].to_string(),
+        Ok(n) if n == OPTS.len() + 1 => read("key name: ")?,
+        _ => choice, // a key name typed directly
+    };
+    if key.is_empty() {
+        anyhow::bail!("no key chosen");
+    }
+    let value = read(&format!("value for {key}: "))?;
+    if value.is_empty() {
+        anyhow::bail!("empty value — nothing set");
+    }
+    Ok((key, value))
+}
+
 /// Print a config checklist for the selected provider + proxy + backup, never showing
 /// secret values. Returns an error if a required key is missing.
 fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
     let mut missing: Vec<String> = Vec::new();
 
-    let provider_key = match provider_name {
-        "runpod" => "RUNPOD_API_KEY",
-        "vast" => "VAST_API_KEY",
-        "hetzner" => "HETZNER_API_KEY",
-        _ => "RUNPOD_API_KEY",
-    };
-
-    println!("Provider ({provider_name}):");
-    cfg_row(cfg, &mut missing, provider_key, true, true);
+    // Show every provider's API key (set/empty), marking the selected one. Only the
+    // selected provider's key is *required* (counts toward `missing`).
+    println!("Providers (selected: {provider_name}):");
+    for (name, key) in [
+        ("runpod", "RUNPOD_API_KEY"),
+        ("vast", "VAST_API_KEY"),
+        ("hetzner", "HETZNER_API_KEY"),
+    ] {
+        let selected = name == provider_name;
+        let set = cfg.get(key).map(|v| !v.is_empty()).unwrap_or(false);
+        let mark = if set { "✓" } else if selected { "✗" } else { "·" };
+        println!(
+            "  {mark} {key:<24} {}{}",
+            if set { "(set)" } else { "(empty)" },
+            if selected { "   ← selected" } else { "" }
+        );
+        if selected && !set {
+            missing.push(key.to_string());
+        }
+    }
     if provider_name == "hetzner" {
         cfg_row(cfg, &mut missing, "HETZNER_SERVER_TYPE", false, false);
         cfg_row(cfg, &mut missing, "HETZNER_IMAGE", false, false);
