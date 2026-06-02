@@ -42,13 +42,18 @@ struct Cli {
     cmd: Cmd,
 }
 
-/// Ask the operator to confirm a mutating action. Returns true (proceed) when `--yes`
-/// is set or stdin isn't a terminal (cron/pipes — they already opted in via `--apply`);
-/// otherwise prompts on stderr and reads a y/N answer.
+/// Ask the operator to confirm a mutating action. `--yes` proceeds without asking. At
+/// an interactive terminal, prompts y/N. With **no terminal** (cron/pipes) and no
+/// `--yes`, it *refuses* — automation must opt in explicitly with `--yes`, so nothing
+/// mutates non-interactively by accident.
 fn confirm(assume_yes: bool, what: &str) -> Result<bool> {
     use std::io::{IsTerminal, Write};
-    if assume_yes || !std::io::stdin().is_terminal() {
+    if assume_yes {
         return Ok(true);
+    }
+    if !std::io::stdin().is_terminal() {
+        eprintln!("{what}\nRefusing to proceed without a terminal — pass --yes to confirm non-interactively.");
+        return Ok(false);
     }
     eprint!("{what}\nProceed? [y/N] ");
     std::io::stderr().flush().ok();
@@ -682,7 +687,7 @@ async fn handle_cron(cmd: CronCmd, config_path: &std::path::Path) -> Result<()> 
                 None => String::new(),
             };
             let line = format!(
-                "{schedule} {env_prefix}{} --config {} pods backup --apply >> {}/arena-cron.log 2>&1",
+                "{schedule} {env_prefix}{} --config {} pods backup --apply --yes >> {}/arena-cron.log 2>&1",
                 exe.display(),
                 cfg_abs.display(),
                 home

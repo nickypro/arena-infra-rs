@@ -123,9 +123,10 @@ Hetzner), commit/backup, the GPU/progress dashboard, and proxy/port-forwarding.
 - **Every mutating command is dry-run by default.** `create`/`stop`/`terminate`
   print what they *would* do and only act when given `--apply`.
 - **`--apply` then asks for confirmation.** At an interactive terminal, mutating
-  commands print what they'll do and prompt `Proceed? [y/N]`. Pass `-y`/`--yes` to
-  skip it; non-interactive runs (cron, pipes) proceed without prompting so automation
-  isn't blocked.
+  commands print what they'll do and prompt `Proceed? [y/N]`. Pass `-y`/`--yes` to skip
+  it. With **no terminal** (cron, pipes) the command *refuses* unless `--yes` is given —
+  so nothing mutates non-interactively by accident. (`cron install` bakes `--yes` into
+  the scheduled backup line.)
 
 ## Usage
 
