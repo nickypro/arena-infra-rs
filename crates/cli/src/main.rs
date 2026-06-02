@@ -322,6 +322,19 @@ enum PodCmd {
         #[arg(long)]
         force: bool,
     },
+    /// Run a shell command on every pod over SSH (concurrent), printing each pod's
+    /// output. Confirms first (it's arbitrary remote execution). e.g.
+    /// `arena pods run nvidia-smi -L`.
+    Run {
+        /// The command to run (everything after `run`).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
+        /// Preview only: print the command + target pods, run nothing.
+        #[arg(long, visible_aliases = ["dryrun", "dry"])]
+        dry_run: bool,
+    },
+    /// Quick health check on every pod: import torch and print its version (read-only).
+    Test,
     /// Gently switch a pod's ARENA checkout to a branch (fetch + checkout +
     /// fast-forward pull, no hard reset). One pod (name/id) or --all. Acts by default;
     /// --dry-run to preview.
@@ -1757,7 +1770,94 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
         PodCmd::SetBranch { branch, target, all, dry_run } => {
             handle_set_branch(provider, cfg, &branch, target.as_deref(), all, dry_run, yes).await?;
         }
+        PodCmd::Run { command, dry_run } => {
+            let cmd = command.join(" ");
+            handle_run(provider, cfg, &cmd, dry_run, yes, /*confirm*/ true, /*compact*/ false).await?;
+        }
+        PodCmd::Test => {
+            // Read-only: no confirm, compact one-line-per-pod output.
+            handle_run(
+                provider,
+                cfg,
+                "python -c 'import torch; print(torch.__version__)' 2>&1 || python3 -c 'import torch; print(torch.__version__)'",
+                false,
+                yes,
+                false,
+                true,
+            )
+            .await?;
+        }
     }
+    Ok(())
+}
+
+/// Run `cmd` on every pod with an SSH endpoint, concurrently. `compact` prints one line
+/// per pod (last stdout line); otherwise a per-pod block. `confirm_needed` gates it
+/// behind the y/N prompt (arbitrary exec); read-only checks pass false.
+async fn handle_run(
+    provider: &dyn Provider,
+    cfg: &Config,
+    cmd: &str,
+    dry_run: bool,
+    yes: bool,
+    confirm_needed: bool,
+    compact: bool,
+) -> Result<()> {
+    use arena_core::ssh::{self, SshTarget};
+
+    let pods = provider.list_pods().await.context("listing pods")?;
+    let mut targets: Vec<(String, SshTarget)> = Vec::new();
+    for pod in &pods {
+        if let Ok(t) = SshTarget::from_pod(pod, cfg) {
+            targets.push((pod.name.clone(), t));
+        }
+    }
+    targets.sort_by(|a, b| a.0.cmp(&b.0));
+    if targets.is_empty() {
+        println!("(no pods with an SSH endpoint)");
+        return Ok(());
+    }
+
+    if dry_run {
+        println!("[dry-run] would run on {} pod(s):\n  {cmd}", targets.len());
+        return Ok(());
+    }
+    if confirm_needed && !confirm(yes, &format!("Run `{cmd}` on {} pod(s) over SSH.", targets.len()))? {
+        println!("aborted.");
+        return Ok(());
+    }
+
+    let mut set = tokio::task::JoinSet::new();
+    for (name, t) in targets {
+        let cmd = cmd.to_string();
+        set.spawn(async move { (name, ssh::run(&t, &cmd).await) });
+    }
+    let mut results: Vec<(String, String, bool)> = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        if let Ok((name, res)) = joined {
+            let (text, ok) = match res {
+                Ok(out) if out.success => (out.stdout.trim().to_string(), true),
+                Ok(out) => (format!("exit {:?}: {}", out.code, out.stderr.trim()), false),
+                Err(e) => (e.to_string(), false),
+            };
+            results.push((name, text, ok));
+        }
+    }
+    results.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let (mut ok, mut bad) = (0, 0);
+    for (name, text, success) in &results {
+        if *success { ok += 1 } else { bad += 1 }
+        if compact {
+            let line = text.lines().last().unwrap_or("").trim();
+            let shown = if *success { line.to_string() } else { format!("✗ {line}") };
+            println!("{name:<22} {shown}");
+        } else {
+            println!("\n── {name} {}", if *success { "" } else { "(FAILED)" });
+            println!("{text}");
+        }
+    }
+    println!("\n{ok} ok, {bad} failed");
     Ok(())
 }
 
