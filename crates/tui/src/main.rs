@@ -1256,11 +1256,15 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
     // (PROGRESS, then the GPU%/MEM% graphs) are dropped when the terminal is too narrow
     // so the core data isn't crushed to one column each.
     let w = area.width as usize;
-    let show_progress = w >= 104;
-    let show_spark = with_spark && w >= 132;
+    let show_saved = w >= 96;
+    let show_progress = w >= 110;
+    let show_spark = with_spark && w >= 138;
 
     let mut header_cells =
         vec!["", "P", "NAME", "STATUS", "SET", "GPU", "GPU%", "MEM", "TEMP", "DISK", "$/HR", "BRANCH"];
+    if show_saved {
+        header_cells.push("SAVED");
+    }
     if show_progress {
         header_cells.push("PROGRESS / ERROR");
     }
@@ -1328,6 +1332,16 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                 Cell::from(cost),
                 Cell::from(branch),
             ];
+            if show_saved {
+                // Yellow when there's uncommitted work since the last backup, grey when
+                // unknown, default otherwise.
+                let style = match m.and_then(|m| m.dirty_files) {
+                    Some(n) if n > 0 => Style::default().fg(Color::Yellow),
+                    None => Style::default().fg(Color::DarkGray),
+                    _ => Style::default(),
+                };
+                cells.push(Cell::from(rel_time_short(m)).style(style));
+            }
             if show_progress {
                 let (detail, detail_style) = detail_cell(m);
                 cells.push(Cell::from(detail).style(detail_style));
@@ -1365,6 +1379,9 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
         Constraint::Length(7),  // $/HR
         Constraint::Length(6),  // BRANCH (e.g. "w1d2")
     ];
+    if show_saved {
+        widths.push(Constraint::Length(5)); // SAVED (e.g. "3h", "2d")
+    }
     if show_progress {
         widths.push(Constraint::Min(10)); // PROGRESS / ERROR (flexible)
     }
@@ -1385,6 +1402,58 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
     f.render_stateful_widget(table, area, &mut ts);
 }
 
+/// When the pod's repo was last committed (= last backup, since `pods backup` commits +
+/// pushes), plus whether there's uncommitted work since. `-` if not reported yet.
+fn backup_summary(m: Option<&PodMetrics>) -> String {
+    let Some(m) = m else { return "-".into() };
+    match m.last_commit {
+        Some(ts) => {
+            let state = match m.dirty_files {
+                Some(0) => "clean".to_string(),
+                Some(n) => format!("⚠ {n} uncommitted"),
+                None => "?".to_string(),
+            };
+            format!("{}  ({state})", rel_time(ts))
+        }
+        None => "-".into(),
+    }
+}
+
+/// A short relative time like "3h ago" / "2d ago" from a unix timestamp.
+fn rel_time(unix_secs: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let d = now - unix_secs;
+    match d {
+        d if d < 60 => "just now".into(),
+        d if d < 3600 => format!("{}m ago", d / 60),
+        d if d < 86_400 => format!("{}h ago", d / 3600),
+        d => format!("{}d ago", d / 86_400),
+    }
+}
+
+/// A compact relative time for the table cell: "3h", "2d", "12m", "now", or "-".
+fn rel_time_short(m: Option<&PodMetrics>) -> String {
+    match m.and_then(|m| m.last_commit) {
+        None => "-".into(),
+        Some(ts) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let d = now - ts;
+            match d {
+                d if d < 60 => "now".into(),
+                d if d < 3600 => format!("{}m", d / 60),
+                d if d < 86_400 => format!("{}h", d / 3600),
+                d => format!("{}d", d / 86_400),
+            }
+        }
+    }
+}
+
 /// The per-pod detail pane (shown in Detail mode): identity + endpoint, a per-GPU
 /// table, full progress text, and util/temp sparklines from the rolling history.
 fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
@@ -1401,14 +1470,14 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     let show_graphs = inner.height >= 18;
     let constraints: &[Constraint] = if show_graphs {
         &[
-            Constraint::Length(9), // header facts
+            Constraint::Length(10), // header facts
             Constraint::Min(3),    // per-GPU table
             Constraint::Length(3), // util sparkline
             Constraint::Length(3), // temp sparkline
         ]
     } else {
         &[
-            Constraint::Length(9), // header facts
+            Constraint::Length(10), // header facts
             Constraint::Min(3),    // per-GPU table
         ]
     };
@@ -1445,13 +1514,14 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     let origin = m.and_then(|m| m.origin.clone()).unwrap_or_else(|| "-".into());
     let origin_ok = m.and_then(|m| m.origin.as_deref().map(|o| o.contains("github.com")));
     let facts = format!(
-        "status:   {}\ngpu:      {}\nendpoint: {}\ncost:     {}\ndisk:     {}\nbranch:   {}\norigin:   {} {}\nsetup:    .name {}   key {}   origin→gh {}\nprogress: {}",
+        "status:   {}\ngpu:      {}\nendpoint: {}\ncost:     {}\ndisk:     {}\nbranch:   {}\nbackup:   {}\norigin:   {} {}\nsetup:    .name {}   key {}   origin→gh {}\nprogress: {}",
         display_status(&pod.status, m.map(|m| m.error.is_none())),
         gpu,
         endpoint,
         cost,
         disk,
         m.and_then(|m| m.branch.clone()).unwrap_or_else(|| "-".into()),
+        backup_summary(m),
         truncate(&origin, 32),
         ok(origin_ok),
         ok(m.and_then(|m| m.has_name)),

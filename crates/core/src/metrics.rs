@@ -95,6 +95,13 @@ pub struct PodMetrics {
     /// Root-filesystem usage (used, total) in MB, if reported.
     pub disk_used_mb: Option<u32>,
     pub disk_total_mb: Option<u32>,
+    /// Unix timestamp (committer date) of the ARENA checkout's last commit, if reported.
+    /// In this workflow a commit *is* a backup (`pods backup` commits + pushes), so this
+    /// is "when the pod was last backed up".
+    pub last_commit: Option<i64>,
+    /// Number of uncommitted entries in the working tree (`git status --porcelain`), if
+    /// reported — i.e. work done since the last backup. `Some(0)` means a clean tree.
+    pub dirty_files: Option<u32>,
 }
 
 impl PodMetrics {
@@ -168,6 +175,14 @@ fn remote_command(opts: &ProbeOpts) -> String {
         s.push_str(&format!(
             "echo \"origin=$(cd {q} 2>/dev/null && git config --get remote.origin.url 2>/dev/null)\"; "
         ));
+        // Last commit time (= last backup, since `pods backup` commits + pushes) and how
+        // many entries are uncommitted (work since that backup; 0 = clean tree).
+        s.push_str(&format!(
+            "echo \"committed=$(cd {q} 2>/dev/null && git log -1 --format=%ct 2>/dev/null)\"; "
+        ));
+        s.push_str(&format!(
+            "echo \"dirty=$(cd {q} 2>/dev/null && git status --porcelain 2>/dev/null | wc -l)\"; "
+        ));
     }
     s.push_str("([ -e \"$HOME/.name\" ] && echo name=1 || echo name=0); ");
     if let Some(key) = &opts.key_remote {
@@ -204,6 +219,8 @@ fn parse_probe(stdout: &str, m: &mut PodMetrics) {
                     m.disk_total_mb = Some((t / 1024) as u32);
                 }
             }
+            "committed" => m.last_commit = v.parse::<i64>().ok(),
+            "dirty" => m.dirty_files = v.parse::<u32>().ok(),
             "progress" => m.progress = (!v.is_empty()).then(|| v.to_string()),
             _ => {}
         }
@@ -320,7 +337,7 @@ mod tests {
     #[test]
     fn parses_combined_probe_output() {
         let out = format!(
-            "NVIDIA RTX A4000, 15, 1000, 16000, 45\n{SENTINEL}\nbranch=autocommit-arena8-w0d1-apple\norigin=git@github.com:styme3279/ARENA_3.0.git\nname=1\nkey=0\ndisk=12582912 104857600\nprogress=epoch 3/10\n"
+            "NVIDIA RTX A4000, 15, 1000, 16000, 45\n{SENTINEL}\nbranch=autocommit-arena8-w0d1-apple\norigin=git@github.com:styme3279/ARENA_3.0.git\ncommitted=1717412400\ndirty=3\nname=1\nkey=0\ndisk=12582912 104857600\nprogress=epoch 3/10\n"
         );
         let mut m = PodMetrics::default();
         parse_probe(&out, &mut m);
@@ -328,6 +345,8 @@ mod tests {
         assert_eq!(m.gpus[0].util_pct, Some(15));
         assert_eq!(m.branch.as_deref(), Some("autocommit-arena8-w0d1-apple"));
         assert_eq!(m.origin.as_deref(), Some("git@github.com:styme3279/ARENA_3.0.git"));
+        assert_eq!(m.last_commit, Some(1717412400));
+        assert_eq!(m.dirty_files, Some(3));
         assert_eq!(m.has_name, Some(true));
         assert_eq!(m.has_key, Some(false));
         // 12582912 KB / 1024 = 12288 MB used; 104857600 KB / 1024 = 102400 MB total.
@@ -356,6 +375,8 @@ mod tests {
         assert!(cmd.contains("nvidia-smi"));
         assert!(cmd.contains("git rev-parse --abbrev-ref HEAD"));
         assert!(cmd.contains("remote.origin.url"));
+        assert!(cmd.contains("git log -1 --format=%ct"));
+        assert!(cmd.contains("git status --porcelain"));
         assert!(cmd.contains("'/root/ARENA_3.0'"));
         assert!(cmd.contains("echo name=1"));
         assert!(cmd.contains("'/root/.ssh/id_ed25519'"));
