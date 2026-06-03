@@ -351,21 +351,18 @@ enum PodCmd {
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// Commit + push each pod's ARENA working tree to its autocommit branch over SSH.
-    /// Branch is autocommit-{prefix}-w{week}d{day}-{machine}. Acts by default; --dry-run to preview.
+    /// Commit + push each pod's ARENA working tree over SSH, **on whatever branch the
+    /// pod is currently on** — it never switches or creates a branch (so bespoke
+    /// branches are respected), and it skips `main`/`master` (won't push the protected
+    /// branch). To stage onto a dated autocommit branch, run `pods init-branches` first.
+    /// Acts by default; --dry-run to preview.
     Backup {
         /// Preview only: print what would happen, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
-        /// Commit message (default: the autocommit branch name per machine).
+        /// Commit message (default: "arena backup <machine>").
         #[arg(long)]
         message: Option<String>,
-        /// Override the iteration week (default: computed from ARENA_START_DATE).
-        #[arg(long)]
-        week: Option<u32>,
-        /// Override the day-within-week (default: computed from ARENA_START_DATE).
-        #[arg(long)]
-        day: Option<u32>,
     },
     /// Provision pods over SSH. Acts by default; --dry-run to preview.
     ///
@@ -1357,16 +1354,17 @@ async fn handle_backup(
     cfg: &Config,
     apply: bool,
     message: Option<String>,
-    week: Option<u32>,
-    day: Option<u32>,
 ) -> Result<()> {
+    use arena_core::backup::{self, parse_backup_output};
     use arena_core::ssh::{self, SshTarget};
 
-    let (week, day) = resolve_week_day(cfg, week, day)?;
-    let bcfg = arena_core::backup::BackupConfig::from_config(cfg, week, day);
-    // Per-machine default commit message = that machine's autocommit branch name.
-    let msg_for = |name: &str| message.clone().unwrap_or_else(|| bcfg.branch_for(name));
-    println!("Iteration: w{week}d{day}\n");
+    // Backup commits the *current* branch (never switches/creates one), so it just needs
+    // the repo path + push key — no week/day / autocommit-branch naming.
+    let repo_path = cfg.get("BACKUP_REPO_PATH").map(String::from).unwrap_or_else(|| {
+        format!("/root/{}", cfg.get("ARENA_REPO_NAME").unwrap_or("ARENA_3.0"))
+    });
+    let key = cfg.get("GIT_SSH_KEY_REMOTE").map(String::from);
+    let msg_for = |name: &str| message.clone().unwrap_or_else(|| format!("arena backup {name}"));
 
     let pods = provider.list_pods().await.context("listing pods for backup")?;
     // Back up only pods that actually have an SSH endpoint; report the rest.
@@ -1383,10 +1381,13 @@ async fn handle_backup(
     }
 
     if !apply {
-        println!("Dry-run — would back up {} pod(s):\n", targets.len());
+        println!(
+            "Dry-run — would commit + push the current branch on {} pod(s) (skips main/master):\n",
+            targets.len()
+        );
         for (name, target) in &targets {
-            let cmd = arena_core::backup::backup_command(&bcfg, name, &msg_for(name));
-            println!("# {name}  ->  branch {}", bcfg.branch_for(name));
+            let cmd = backup::backup_command(&repo_path, key.as_deref(), &msg_for(name));
+            println!("# {name}");
             println!("{}\n", target.display_command(&cmd));
         }
         println!("Preview only — run without --dry-run to execute over SSH.");
@@ -1395,26 +1396,35 @@ async fn handle_backup(
 
     // Run concurrently with a live [done/total] counter (one SSH per pod, slow serially).
     let total = targets.len();
-    println!("Backing up {total} pod(s) over SSH…");
+    println!("Backing up {total} pod(s) over SSH (current branch; main/master skipped)…");
     let mut set = tokio::task::JoinSet::new();
     for (name, target) in targets {
-        let cmd = arena_core::backup::backup_command(&bcfg, &name, &msg_for(&name));
-        let branch = bcfg.branch_for(&name);
-        set.spawn(async move { (name, branch, ssh::run(&target, &cmd).await) });
+        let cmd = backup::backup_command(&repo_path, key.as_deref(), &msg_for(&name));
+        set.spawn(async move { (name, ssh::run(&target, &cmd).await) });
     }
-    let (mut backed_up, mut no_changes, mut failed, mut done) = (0, 0, 0, 0);
+    let (mut backed_up, mut no_changes, mut skipped, mut failed, mut done) = (0, 0, 0, 0, 0);
     while let Some(joined) = set.join_next().await {
         done += 1;
-        let Ok((name, branch, res)) = joined else { continue };
+        let Ok((name, res)) = joined else { continue };
         match res {
-            Ok(out) if out.success && out.stdout.lines().any(|l| l.trim() == "NO_CHANGES") => {
-                println!("[{done}/{total}] = {name} (no changes, on {branch})");
-                no_changes += 1;
-            }
-            Ok(out) if out.success => {
-                println!("[{done}/{total}] ✓ {name} -> {branch}");
-                backed_up += 1;
-            }
+            Ok(out) if out.success => match parse_backup_output(&out.stdout) {
+                Some((backup::BACKUP_PUSHED, branch)) => {
+                    println!("[{done}/{total}] ✓ {name} -> {branch}");
+                    backed_up += 1;
+                }
+                Some((backup::BACKUP_NO_CHANGES, branch)) => {
+                    println!("[{done}/{total}] = {name} (no changes, on {branch})");
+                    no_changes += 1;
+                }
+                Some((backup::BACKUP_SKIPPED, branch)) => {
+                    println!("[{done}/{total}] ⊘ {name} (skipped — on protected branch {branch})");
+                    skipped += 1;
+                }
+                _ => {
+                    println!("[{done}/{total}] ✓ {name} (done)");
+                    backed_up += 1;
+                }
+            },
             Ok(out) => {
                 println!("[{done}/{total}] ✗ {name} (exit {:?}): {}", out.code, out.stderr.trim());
                 failed += 1;
@@ -1425,7 +1435,7 @@ async fn handle_backup(
             }
         }
     }
-    println!("\nDone: {backed_up} backed up, {no_changes} unchanged, {failed} failed.");
+    println!("\nDone: {backed_up} pushed, {no_changes} unchanged, {skipped} skipped (main/master), {failed} failed.");
     if failed > 0 {
         anyhow::bail!("{failed} pod(s) failed to back up");
     }
@@ -2100,12 +2110,12 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             }
         },
 
-        PodCmd::Backup { dry_run, message, week, day } => {
-            if !dry_run && !confirm(yes, "Will commit + push each pod's ARENA tree over SSH.")? {
+        PodCmd::Backup { dry_run, message } => {
+            if !dry_run && !confirm(yes, "Will commit + push each pod's ARENA tree on its current branch (main/master skipped).")? {
                 println!("aborted.");
                 return Ok(());
             }
-            handle_backup(provider, cfg, !dry_run, message, week, day).await?;
+            handle_backup(provider, cfg, !dry_run, message).await?;
         }
         PodCmd::Setup { dry_run, force } => {
             if !dry_run && !confirm(yes, "Will provision each pod over SSH (deploy key, ~/.name, repo).")? {

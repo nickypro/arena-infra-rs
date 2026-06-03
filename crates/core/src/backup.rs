@@ -53,25 +53,27 @@ impl BackupConfig {
     }
 }
 
-/// Render the remote shell command that backs up one machine's working tree, matching
-/// the legacy `init_branches.sh` + `sync_git.sh` flow:
+/// Sentinels the backup command prints (followed by the branch) so the caller can tell a
+/// push apart from a no-op or a deliberately-skipped protected branch.
+pub const BACKUP_PUSHED: &str = "PUSHED";
+pub const BACKUP_NO_CHANGES: &str = "NO_CHANGES";
+pub const BACKUP_SKIPPED: &str = "SKIP";
+
+/// Render the remote shell command that commits + pushes one machine's working tree **on
+/// whatever branch it is currently on** — it never switches or creates a branch, so a
+/// participant's bespoke branch is respected (matching legacy `sync_git.sh`, not
+/// `init_branches.sh`). To stage work on a dedicated autocommit branch, put the pod there
+/// first with `init-branches`/`set-branch`.
 ///
-/// 1. **check out the autocommit branch** (creating it if needed) — so commits never
-///    land on `main`/the wrong branch;
-/// 2. ensure an `Arena Autocommit` git identity exists;
-/// 3. stage everything; if the tree is clean, print `NO_CHANGES` and exit 0 (a no-op
-///    is distinguishable from a failure);
-/// 4. otherwise commit and `push -u origin <branch>`.
-///
-/// `set -e` aborts on the first real error.
-pub fn backup_command(cfg: &BackupConfig, machine_name: &str, commit_msg: &str) -> String {
-    let branch = cfg.branch_for(machine_name);
-    let bq = shell_quote(&branch);
-    let mut parts: Vec<String> = vec![
-        "set -e".into(),
-        format!("cd {}", shell_quote(&cfg.repo_path)),
-    ];
-    if let Some(key) = &cfg.git_ssh_key {
+/// It refuses to push `main`/`master` (or a detached `HEAD`), printing `SKIP <branch>`
+/// and exiting 0 — so an automated backup never lands commits on the protected branch.
+/// Flow: resolve the current branch; skip if protected; ensure a git identity; stage; if
+/// the tree is clean print `NO_CHANGES <branch>` and exit 0; otherwise commit and
+/// `push -u origin <branch>`, then print `PUSHED <branch>`. `set -e` aborts on error.
+pub fn backup_command(repo_path: &str, git_ssh_key: Option<&str>, commit_msg: &str) -> String {
+    let mut parts: Vec<String> =
+        vec!["set -e".into(), format!("cd {}", shell_quote(repo_path))];
+    if let Some(key) = git_ssh_key {
         parts.push(format!(
             "export GIT_SSH_COMMAND={}",
             shell_quote(&format!(
@@ -79,8 +81,11 @@ pub fn backup_command(cfg: &BackupConfig, machine_name: &str, commit_msg: &str) 
             ))
         ));
     }
-    // On the machine's own autocommit branch (create-or-switch), never on main.
-    parts.push(format!("git checkout -b {bq} 2>/dev/null || git checkout {bq}"));
+    // Stay on the current branch; never push a protected/detached one.
+    parts.push("B=$(git rev-parse --abbrev-ref HEAD)".into());
+    parts.push(format!(
+        "if [ \"$B\" = main ] || [ \"$B\" = master ] || [ \"$B\" = HEAD ]; then echo \"{BACKUP_SKIPPED} $B\"; exit 0; fi"
+    ));
     // A committer identity, in case the pod has none configured.
     parts.push("git config user.name >/dev/null 2>&1 || git config user.name 'Arena Autocommit'".into());
     parts.push(
@@ -88,10 +93,28 @@ pub fn backup_command(cfg: &BackupConfig, machine_name: &str, commit_msg: &str) 
             .into(),
     );
     parts.push("git add -A".into());
-    parts.push("if git diff --cached --quiet; then echo NO_CHANGES; exit 0; fi".into());
+    parts.push(format!(
+        "if git diff --cached --quiet; then echo \"{BACKUP_NO_CHANGES} $B\"; exit 0; fi"
+    ));
     parts.push(format!("git commit -m {}", shell_quote(commit_msg)));
-    parts.push(format!("git push -u origin {bq}"));
+    parts.push("git push -u origin \"$B\"".into());
+    parts.push(format!("echo \"{BACKUP_PUSHED} $B\""));
     parts.join("; ")
+}
+
+/// Classify a backup command's stdout: `(sentinel, branch)`. Returns the matched
+/// `BACKUP_*` sentinel and the branch it reported, or `None` if neither appeared
+/// (treat that as a failure at the call site).
+pub fn parse_backup_output(stdout: &str) -> Option<(&'static str, String)> {
+    for line in stdout.lines() {
+        let line = line.trim();
+        for sentinel in [BACKUP_PUSHED, BACKUP_NO_CHANGES, BACKUP_SKIPPED] {
+            if let Some(rest) = line.strip_prefix(sentinel) {
+                return Some((sentinel, rest.trim().to_string()));
+            }
+        }
+    }
+    None
 }
 
 /// Render the remote command that *creates* (or switches to) a machine's autocommit
@@ -161,32 +184,43 @@ mod tests {
     }
 
     #[test]
-    fn renders_safe_per_machine_backup() {
-        let c = backup_command(&cfg(), "arena8-apple", "arena backup");
+    fn backup_stays_on_current_branch_and_protects_main() {
+        let c = backup_command("/root/ARENA_3.0", Some("/root/.ssh/id_ed25519"), "arena backup");
         assert!(c.contains("cd '/root/ARENA_3.0'"));
+        // Never switches/creates a branch — works on whatever HEAD is on.
+        assert!(!c.contains("git checkout"));
+        assert!(c.contains("B=$(git rev-parse --abbrev-ref HEAD)"));
+        // Refuses to push main/master/detached.
+        assert!(c.contains(r#"[ "$B" = main ]"#));
+        assert!(c.contains(r#"[ "$B" = master ]"#));
+        assert!(c.contains("SKIP $B"));
+        // Stage + clean-tree guard + commit + push the *current* branch.
         assert!(c.contains("git add -A"));
-        // Clean-tree guard so a no-op isn't treated as failure.
-        assert!(c.contains("echo NO_CHANGES"));
+        assert!(c.contains("NO_CHANGES $B"));
         assert!(c.contains("git commit -m 'arena backup'"));
-        // Checks out the autocommit branch first (never commits onto main).
-        assert!(c.contains("git checkout -b 'autocommit-arena8-w0d1-apple'"));
-        assert!(c.contains("git push -u origin 'autocommit-arena8-w0d1-apple'"));
+        assert!(c.contains(r#"git push -u origin "$B""#));
+        assert!(c.contains("PUSHED $B"));
         assert!(c.contains("Arena Autocommit"));
-        // Uses the configured push key.
         assert!(c.contains("GIT_SSH_COMMAND='ssh -i /root/.ssh/id_ed25519"));
     }
 
     #[test]
     fn omits_git_ssh_command_without_key() {
-        let mut c = cfg();
-        c.git_ssh_key = None;
-        assert!(!backup_command(&c, "arena8-apple", "m").contains("GIT_SSH_COMMAND"));
+        assert!(!backup_command("/root/ARENA_3.0", None, "m").contains("GIT_SSH_COMMAND"));
     }
 
     #[test]
     fn escapes_single_quotes_in_message() {
-        let c = backup_command(&cfg(), "arena8-apple", "it's a backup");
+        let c = backup_command("/root/ARENA_3.0", None, "it's a backup");
         assert!(c.contains(r"'it'\''s a backup'"));
+    }
+
+    #[test]
+    fn parses_backup_sentinels() {
+        assert_eq!(parse_backup_output("PUSHED feature-x\n"), Some(("PUSHED", "feature-x".into())));
+        assert_eq!(parse_backup_output("NO_CHANGES main"), Some(("NO_CHANGES", "main".into())));
+        assert_eq!(parse_backup_output("SKIP master"), Some(("SKIP", "master".into())));
+        assert_eq!(parse_backup_output("garbage"), None);
     }
 
     #[test]

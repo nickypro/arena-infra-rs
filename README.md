@@ -84,10 +84,12 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
   - `cron install|remove|show` — manage a crontab schedule for `arena pods backup`
     (default every 15 min; `--start-date` bakes `ARENA_START_DATE` into the line); edits only
     arena-managed lines, leaving other entries intact.
-  - `pods backup` — commit + push each pod's ARENA tree to its autocommit branch
-    (`autocommit-{prefix}-w{week}d{day}-{machine}`, week/day from `ARENA_START_DATE`,
-    `--week`/`--day` to override) over SSH. Confirms first (`--dry-run` previews); clean
-    trees report `NO_CHANGES` rather than failing.
+  - `pods backup` — commit + push each pod's ARENA tree over SSH **on whatever branch
+    the pod is currently on** (never switches/creates a branch, so bespoke branches are
+    respected), and **skips `main`/`master`** (won't push the protected branch).
+    `--message` overrides the commit message. Confirms first (`--dry-run` previews); clean
+    trees report `NO_CHANGES` rather than failing. To stage onto a dated autocommit
+    branch, run `pods init-branches` first.
   - `pods set-branch <branch> [target|--all]` — gently switch pods' ARENA checkout to a
     branch (fetch + checkout + ff-only pull, no hard reset) — e.g. end-of-day back to
     `main`. Confirms first; `--dry-run` previews.

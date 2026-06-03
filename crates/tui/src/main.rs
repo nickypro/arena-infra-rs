@@ -983,31 +983,32 @@ async fn run_set_branch(cfg: &Config, pod: &Pod, branch: &str) -> String {
     }
 }
 
-/// Commit + push the pod's ARENA tree to its autocommit branch over SSH (mirrors
-/// `arena backup --apply` for a single pod).
+/// Commit + push the pod's ARENA tree over SSH **on its current branch** (mirrors
+/// `arena backup` for a single pod): never switches/creates a branch, skips main/master.
 async fn run_backup(cfg: &Config, pod: &Pod) -> String {
+    use arena_core::backup::{self, parse_backup_output};
     let target = match SshTarget::from_pod(pod, cfg) {
         Ok(t) => t,
         Err(e) => return format!("✗ {}: {e}", pod.name),
     };
-    let (week, day) = match resolve_week_day(cfg) {
-        Ok(wd) => wd,
-        Err(e) => return format!("✗ {}: {e}", pod.name),
-    };
-    let bcfg = arena_core::backup::BackupConfig::from_config(cfg, week, day);
-    let msg = format!("arena-tui backup {}", pod.name);
-    let cmd = arena_core::backup::backup_command(&bcfg, &pod.name, &msg);
+    let cmd = backup::backup_command(&backup_repo_path(cfg), cfg.get("GIT_SSH_KEY_REMOTE"), &format!("arena-tui backup {}", pod.name));
     match ssh::run(&target, &cmd).await {
-        Ok(out) if out.success => {
-            if out.stdout.contains("NO_CHANGES") {
-                format!("✓ {} — no changes", pod.name)
-            } else {
-                format!("✓ backed up {} → {}", pod.name, bcfg.branch_for(&pod.name))
-            }
-        }
+        Ok(out) if out.success => match parse_backup_output(&out.stdout) {
+            Some((backup::BACKUP_PUSHED, branch)) => format!("✓ backed up {} → {branch}", pod.name),
+            Some((backup::BACKUP_NO_CHANGES, branch)) => format!("✓ {} — no changes (on {branch})", pod.name),
+            Some((backup::BACKUP_SKIPPED, branch)) => format!("⊘ {} — skipped (on protected branch {branch})", pod.name),
+            _ => format!("✓ backed up {}", pod.name),
+        },
         Ok(out) => format!("✗ backup {} (exit {:?}): {}", pod.name, out.code, out.stderr.trim()),
         Err(e) => format!("✗ backup {} failed: {e}", pod.name),
     }
+}
+
+/// The ARENA checkout path on a pod (config `BACKUP_REPO_PATH`, else /root/<repo name>).
+fn backup_repo_path(cfg: &Config) -> String {
+    cfg.get("BACKUP_REPO_PATH").map(String::from).unwrap_or_else(|| {
+        format!("/root/{}", cfg.get("ARENA_REPO_NAME").unwrap_or("ARENA_3.0"))
+    })
 }
 
 /// Provision the pod over SSH: copy the deploy key, then run the setup script (mirrors
@@ -1038,14 +1039,16 @@ async fn run_setup(cfg: &Config, pod: &Pod) -> String {
 fn build_preview(cfg: &Config, action: Action, pod: &Pod) -> Option<String> {
     let target = SshTarget::from_pod(pod, cfg);
     match action {
-        Action::Backup => Some(match (&target, resolve_week_day(cfg)) {
-            (Ok(t), Ok((week, day))) => {
-                let bcfg = arena_core::backup::BackupConfig::from_config(cfg, week, day);
+        Action::Backup => Some(match &target {
+            Ok(t) => {
                 let msg = format!("arena-tui backup {}", pod.name);
-                t.display_command(&arena_core::backup::backup_command(&bcfg, &pod.name, &msg))
+                t.display_command(&arena_core::backup::backup_command(
+                    &backup_repo_path(cfg),
+                    cfg.get("GIT_SSH_KEY_REMOTE"),
+                    &msg,
+                ))
             }
-            (Err(e), _) => format!("⚠ {e}"),
-            (_, Err(e)) => format!("⚠ {e}"),
+            Err(e) => format!("⚠ {e}"),
         }),
         Action::Setup => Some(match (&target, arena_core::setup::SetupConfig::from_config(cfg)) {
             (Ok(t), Ok(scfg)) => format!(
@@ -1062,22 +1065,6 @@ fn build_preview(cfg: &Config, action: Action, pod: &Pod) -> Option<String> {
         }),
         _ => None,
     }
-}
-
-/// Resolve the iteration (week, day) from `ARENA_START_DATE` (the start date is w0d1).
-/// Mirrors the CLI's resolver; the TUI has no `--week/--day` overrides.
-fn resolve_week_day(cfg: &Config) -> anyhow::Result<(u32, u32)> {
-    let start = cfg
-        .get("ARENA_START_DATE")
-        .and_then(arena_core::schedule::parse_ymd)
-        .context("backup needs ARENA_START_DATE=YYYY-MM-DD in config")?;
-    let start_days = arena_core::schedule::days_from_civil(start.0, start.1, start.2);
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let today = arena_core::schedule::days_from_unix(now_secs);
-    Ok(arena_core::schedule::week_day(start_days, today))
 }
 
 fn temp_style(t: Option<u32>) -> Style {
