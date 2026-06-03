@@ -35,6 +35,9 @@ pub struct SetupConfig {
     pub prefix: String,
     /// Public keys to ensure in `~/.ssh/authorized_keys` (shared key + deploy key).
     pub authorized_pubkeys: Vec<String>,
+    /// Optional Hugging Face token (config `HF_TOKEN`) to export on the pod so the
+    /// cohort can pull gated repos (Llama 3 …). `None` => the HF step is skipped.
+    pub hf_token: Option<String>,
 }
 
 impl SetupConfig {
@@ -64,6 +67,7 @@ impl SetupConfig {
             branch: cfg.get("DEFAULT_BRANCH").unwrap_or("main").to_string(),
             prefix: cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena").to_string(),
             authorized_pubkeys: crate::ssh::authorized_pubkeys(cfg),
+            hf_token: cfg.get("HF_TOKEN").filter(|s| !s.is_empty()).map(String::from),
         })
     }
 
@@ -128,7 +132,7 @@ impl SetupConfig {
             )
         };
 
-        [
+        let mut steps = vec![
             "set -e".to_string(),
             format!("chmod 600 {}", q(key)),
             ssh_config,
@@ -142,8 +146,21 @@ impl SetupConfig {
                 "echo {} > \"$HOME/.name\"",
                 q(&format!("export MACHINE_NAME='{}'", self.short_name(machine_name)))
             ),
-        ]
-        .join("; ")
+        ];
+        // Optional: export the Hugging Face token into the login shells (idempotently),
+        // so participants can pull gated repos. Both env names are set — `transformers`/
+        // `huggingface_hub` read `HF_TOKEN`; older code reads `HUGGING_FACE_HUB_TOKEN`.
+        if let Some(token) = &self.hf_token {
+            let mut hf = String::from("touch \"$HOME/.bashrc\" \"$HOME/.zshrc\"");
+            for name in ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"] {
+                let line = q(&format!("export {name}=\"{token}\""));
+                for file in ["\"$HOME/.bashrc\"", "\"$HOME/.zshrc\""] {
+                    hf.push_str(&format!(" && (grep -qxF {line} {file} || echo {line} >> {file})"));
+                }
+            }
+            steps.push(hf);
+        }
+        steps.join("; ")
     }
 }
 
@@ -165,6 +182,7 @@ mod tests {
             branch: "main".into(),
             prefix: "arena8".into(),
             authorized_pubkeys: vec!["ssh-ed25519 AAAASHARED shared".into()],
+            hf_token: None,
         }
     }
 
@@ -200,5 +218,22 @@ mod tests {
     fn force_hard_resets_to_default_branch() {
         let c = cfg().remote_command("arena8-apple", true);
         assert!(c.contains("git checkout 'main' && git reset --hard origin/'main'"));
+    }
+
+    #[test]
+    fn no_hf_export_without_a_token() {
+        let c = cfg().remote_command("arena8-apple", false);
+        assert!(!c.contains("HF_TOKEN"));
+    }
+
+    #[test]
+    fn exports_hf_token_idempotently_when_present() {
+        let mut sc = cfg();
+        sc.hf_token = Some("hf_secret".into());
+        let c = sc.remote_command("arena8-apple", false);
+        // Both env names, into both shells, guarded so a re-run doesn't duplicate.
+        assert!(c.contains(r#"grep -qxF 'export HF_TOKEN="hf_secret"' "$HOME/.bashrc""#));
+        assert!(c.contains(r#"export HUGGING_FACE_HUB_TOKEN="hf_secret""#));
+        assert!(c.contains("\"$HOME/.zshrc\""));
     }
 }

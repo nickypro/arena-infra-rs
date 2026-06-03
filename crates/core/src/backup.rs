@@ -94,6 +94,31 @@ pub fn backup_command(cfg: &BackupConfig, machine_name: &str, commit_msg: &str) 
     parts.join("; ")
 }
 
+/// Render the remote command that *creates* (or switches to) a machine's autocommit
+/// branch for the iteration and pushes it upstream — **without committing any work**
+/// (legacy `init_branches.sh`). Run at the start of a day so the branch exists (with an
+/// upstream) before any `backup`; later backups then just commit onto it. `set -e`
+/// aborts on the first real error.
+pub fn init_branch_command(cfg: &BackupConfig, machine_name: &str) -> String {
+    let branch = cfg.branch_for(machine_name);
+    let bq = shell_quote(&branch);
+    let mut parts: Vec<String> =
+        vec!["set -e".into(), format!("cd {}", shell_quote(&cfg.repo_path))];
+    if let Some(key) = &cfg.git_ssh_key {
+        parts.push(format!(
+            "export GIT_SSH_COMMAND={}",
+            shell_quote(&format!(
+                "ssh -i {key} -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+            ))
+        ));
+    }
+    parts.push("git fetch --all --prune".into());
+    // Create the branch from the current HEAD, or switch to it if it already exists.
+    parts.push(format!("git checkout -b {bq} 2>/dev/null || git checkout {bq}"));
+    parts.push(format!("git push -u origin {bq}"));
+    parts.join("; ")
+}
+
 /// Render the remote command that switches a pod's ARENA checkout to `branch`
 /// **gently** (no hard reset): fetch, checkout, fast-forward pull. A diverged/dirty
 /// tree makes the `--ff-only` pull fail loudly rather than clobbering work — that's the
@@ -162,6 +187,20 @@ mod tests {
     fn escapes_single_quotes_in_message() {
         let c = backup_command(&cfg(), "arena8-apple", "it's a backup");
         assert!(c.contains(r"'it'\''s a backup'"));
+    }
+
+    #[test]
+    fn init_branch_creates_and_pushes_without_committing() {
+        let mut c = cfg();
+        c.week = 1;
+        c.day = 4;
+        let cmd = init_branch_command(&c, "arena8-apple");
+        assert!(cmd.contains("git fetch --all --prune"));
+        assert!(cmd.contains("git checkout -b 'autocommit-arena8-w1d4-apple'"));
+        assert!(cmd.contains("git push -u origin 'autocommit-arena8-w1d4-apple'"));
+        // It only creates/pushes the branch — never stages or commits work.
+        assert!(!cmd.contains("git add"));
+        assert!(!cmd.contains("git commit"));
     }
 
     #[test]
