@@ -89,6 +89,30 @@ impl SshTarget {
         format!("ssh {} '{}'", self.ssh_args().join(" "), remote_cmd.replace('\'', "'\\''"))
     }
 
+    /// The `ssh …` invocation *without* the `user@host` — i.e. just the transport
+    /// options (port, BatchMode, host-key policy, timeout, identity files). This is what
+    /// `rsync -e` (and `scp -o ProxyCommand`, etc.) want: rsync appends the `user@host`
+    /// itself, so handing it the full `ssh_args` (which end in `user@host`) would be
+    /// wrong. Returns a single shell-ready string.
+    pub fn rsh_command(&self) -> String {
+        let mut parts = vec![
+            "ssh".to_string(),
+            "-p".into(),
+            self.port.to_string(),
+            "-o".into(),
+            "BatchMode=yes".into(),
+            "-o".into(),
+            "StrictHostKeyChecking=accept-new".into(),
+            "-o".into(),
+            format!("ConnectTimeout={}", self.connect_timeout_secs),
+        ];
+        for key in &self.key_paths {
+            parts.push("-i".into());
+            parts.push(key.clone());
+        }
+        parts.join(" ")
+    }
+
     /// The `scp` argv to copy `local` -> `host:remote`. scp uses `-P` for the port
     /// (capital, unlike ssh's `-p`) and the same non-interactive/fail-fast options.
     pub fn scp_args(&self, local: &str, remote: &str) -> Vec<String> {
