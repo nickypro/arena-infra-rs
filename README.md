@@ -104,8 +104,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     (idempotent): per-host keys from `<keys-dir>/<provider>_api_keys.csv`
     (openai/anthropic/openrouter) **plus a broadcast Hugging Face token** (`--hf-token`
     or config `HF_TOKEN`) so the cohort can pull **gated repos** we're approved for
-    (Llama 3, …) — it sets both `HF_TOKEN` and `HUGGING_FACE_HUB_TOKEN`. Confirms first;
-    `--dry-run` lists what would be set (values redacted).
+    (Llama 3, …) — it sets both `HF_TOKEN` and `HUGGING_FACE_HUB_TOKEN`. `--include`/
+    `--exclude` (name or id) scope it to specific pods. Confirms first; `--dry-run` lists
+    what would be set (values redacted).
   - `ssh-config [--proxy] [--out]` — emit the **participant-facing `~/.ssh/config`**:
     direct pod endpoints by default, or stable proxy ports (`--proxy`) anchored to each
     machine's `MACHINE_NAME_LIST` index. Read-only.

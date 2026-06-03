@@ -465,6 +465,12 @@ enum PodCmd {
         /// Overrides config HF_TOKEN. Use to enable pulls from gated repos.
         #[arg(long)]
         hf_token: Option<String>,
+        /// Only copy to these pods (name or id, repeatable). Default: all reachable.
+        #[arg(long)]
+        include: Vec<String>,
+        /// Never copy to these pods (name or id, repeatable).
+        #[arg(long)]
+        exclude: Vec<String>,
         /// Preview only: print what would be set per pod (key values redacted).
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
@@ -2021,8 +2027,8 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             handle_pull(provider, cfg, label, &dir, &max_size, remote_path, dry_run, yes).await?;
         }
 
-        PodCmd::CopyKeys { keys_dir, hf_token, dry_run } => {
-            handle_copy_keys(provider, cfg, &keys_dir, hf_token, dry_run, yes).await?;
+        PodCmd::CopyKeys { keys_dir, hf_token, include, exclude, dry_run } => {
+            handle_copy_keys(provider, cfg, &keys_dir, hf_token, &include, &exclude, dry_run, yes).await?;
         }
 
         PodCmd::Restart { target, dry_run } => {
@@ -2609,11 +2615,14 @@ async fn handle_pull(
 /// `pods copy-keys`: distribute API keys to each pod's shell. Per-host keys come from
 /// `<keys_dir>/<provider>_api_keys.csv`; a Hugging Face token (from `--hf-token` or
 /// config `HF_TOKEN`) is broadcast to every pod (for gated repos like Llama 3).
+#[allow(clippy::too_many_arguments)]
 async fn handle_copy_keys(
     provider: &dyn Provider,
     cfg: &Config,
     keys_dir: &str,
     hf_token: Option<String>,
+    include: &[String],
+    exclude: &[String],
     dry_run: bool,
     yes: bool,
 ) -> Result<()> {
@@ -2655,7 +2664,15 @@ async fn handle_copy_keys(
     println!("Key sources: {}\n", sources.join(", "));
 
     // Build the per-pod var set (broadcast HF merged into every reachable pod).
-    let pods = provider.list_pods().await.context("listing pods for copy-keys")?;
+    let mut pods = provider.list_pods().await.context("listing pods for copy-keys")?;
+    // Apply --exclude then --include (name or id), same as stop/kill.
+    pods.retain(|p| !exclude.iter().any(|x| x == &p.name || x == &p.id));
+    if !include.is_empty() {
+        pods.retain(|p| include.iter().any(|x| x == &p.name || x == &p.id));
+        if pods.is_empty() {
+            anyhow::bail!("no pods matched --include {:?} (run `arena pods list`)", include);
+        }
+    }
     let hf_vars = hf.as_deref().map(apikeys::hf_env_vars).unwrap_or_default();
     let mut jobs: Vec<(String, SshTarget, Vec<(String, String)>)> = Vec::new();
     for pod in &pods {
