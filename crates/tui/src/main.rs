@@ -6,8 +6,8 @@
 //! blocks: the loop redraws and handles keys continuously while fresh data lands as
 //! soon as each sweep finishes. Move the cursor with `↑/↓`/`j/k`, open a per-pod detail
 //! pane (per-GPU breakdown + util/temp sparklines) with `Enter`, act on the selected
-//! pod with `a` (restart / stop / terminate / backup / setup), `f` cycles the refresh
-//! cadence, `r` refreshes now.
+//! pod with `a` (restart / stop / terminate / backup / setup / test / run / set-branch),
+//! `f` cycles the refresh cadence, `r` refreshes now.
 //!
 //! Safety against live prod is built into the *interaction*, not bolted on: a mutating
 //! action always pops a confirmation modal. Lifecycle actions (restart/stop/terminate)
@@ -79,8 +79,18 @@ enum Mode {
     NewPod(NewPodForm),
     /// Confirm terminating the marked (multi-selected) pods; type the count to confirm.
     TermMarked { typed: String },
+    /// Collect a free-text argument (a command, or a branch) for `Run`/`SetBranch`,
+    /// against one pod or the whole fleet, then execute on Enter.
+    Input { action: Action, scope: InputScope, value: String },
     /// The outcome of the last action; any key dismisses (then we nudge a refresh).
     Result(String),
+}
+
+/// Who an [`Mode::Input`] action targets.
+#[derive(Debug, Clone)]
+enum InputScope {
+    Pod { name: String, id: String },
+    Fleet,
 }
 
 /// Live fleet data, written by the background fetch task and read by the UI thread.
@@ -426,9 +436,18 @@ async fn run(
                     if let (Some(action), Some(pod)) =
                         (Action::from_key(ch), selected_pod(shared, ui.selected))
                     {
-                        let preview = build_preview(&ui.cfg, action, &pod);
                         let shown = ui.shown_name(&pod.name);
-                        ui.mode = Mode::Confirm(Confirm::new(action, shown, pod.id, preview));
+                        ui.mode = if action.needs_input() {
+                            // Run / set-branch: collect the command/branch first.
+                            Mode::Input {
+                                action,
+                                scope: InputScope::Pod { name: shown, id: pod.id },
+                                value: String::new(),
+                            }
+                        } else {
+                            let preview = build_preview(&ui.cfg, action, &pod);
+                            Mode::Confirm(Confirm::new(action, shown, pod.id, preview))
+                        };
                     }
                 }
                 _ => {}
@@ -459,7 +478,7 @@ async fn run(
             }
             Mode::FleetMenu => match code {
                 KeyCode::Esc => ui.mode = Mode::List,
-                // Safe ops only — stop/terminate are deliberately not fleet-wide.
+                // Safe mutating ops (require typing ALL) — stop/terminate stay per-pod.
                 KeyCode::Char(ch @ ('r' | 'b' | 'p')) => {
                     let action = match ch {
                         'r' => Action::Restart,
@@ -467,6 +486,22 @@ async fn run(
                         _ => Action::Setup,
                     };
                     ui.mode = Mode::FleetConfirm { action, typed: String::new() };
+                }
+                // Set-branch / run need an argument typed first.
+                KeyCode::Char(ch @ ('x' | 'g')) => {
+                    let action = if ch == 'x' { Action::Run } else { Action::SetBranch };
+                    ui.mode = Mode::Input { action, scope: InputScope::Fleet, value: String::new() };
+                }
+                // Test is read-only — run it across the fleet right away, no ALL gate.
+                KeyCode::Char('e') => {
+                    let pods = shared.lock().unwrap().pods.clone();
+                    ui.mode = Mode::Result(format!("testing torch on {} pods…", pods.len()));
+                    {
+                        let s = shared.lock().unwrap();
+                        terminal.draw(|f| view(f, &s, &ui, secs))?;
+                    }
+                    let msg = execute_fleet(provider, &ui.cfg, Action::Test, pods, None).await;
+                    ui.mode = Mode::Result(msg);
                 }
                 _ => {}
             },
@@ -483,7 +518,7 @@ async fn run(
                         let s = shared.lock().unwrap();
                         terminal.draw(|f| view(f, &s, &ui, secs))?;
                     }
-                    let msg = execute_fleet(provider, &ui.cfg, action, pods).await;
+                    let msg = execute_fleet(provider, &ui.cfg, action, pods, None).await;
                     ui.mode = Mode::Result(msg);
                     nudge.notify_one();
                 }
@@ -611,6 +646,52 @@ async fn run(
                     _ => ui.mode = Mode::TermMarked { typed },
                 }
             }
+            Mode::Input { action, scope, mut value } => match code {
+                KeyCode::Esc => ui.mode = Mode::List,
+                KeyCode::Enter if !value.trim().is_empty() => {
+                    match scope {
+                        InputScope::Pod { name, id } => {
+                            let pod = {
+                                let s = shared.lock().unwrap();
+                                s.pods.iter().find(|p| p.id == id).cloned()
+                            };
+                            match pod {
+                                None => ui.mode = Mode::Result(format!("{name} is gone — refresh")),
+                                Some(pod) => {
+                                    ui.mode = Mode::Result(format!("{} on {name}…", action.label()));
+                                    {
+                                        let s = shared.lock().unwrap();
+                                        terminal.draw(|f| view(f, &s, &ui, secs))?;
+                                    }
+                                    let msg = execute(provider.as_ref(), &ui.cfg, action, &pod, Some(&value)).await;
+                                    ui.mode = Mode::Result(msg);
+                                    nudge.notify_one();
+                                }
+                            }
+                        }
+                        InputScope::Fleet => {
+                            let pods = shared.lock().unwrap().pods.clone();
+                            ui.mode = Mode::Result(format!("{} on {} pods…", action.label(), pods.len()));
+                            {
+                                let s = shared.lock().unwrap();
+                                terminal.draw(|f| view(f, &s, &ui, secs))?;
+                            }
+                            let msg = execute_fleet(provider, &ui.cfg, action, pods, Some(value.clone())).await;
+                            ui.mode = Mode::Result(msg);
+                            nudge.notify_one();
+                        }
+                    }
+                }
+                KeyCode::Backspace => {
+                    value.pop();
+                    ui.mode = Mode::Input { action, scope, value };
+                }
+                KeyCode::Char(ch) => {
+                    value.push(ch);
+                    ui.mode = Mode::Input { action, scope, value };
+                }
+                _ => ui.mode = Mode::Input { action, scope, value },
+            },
             Mode::Result(_) => {
                 // Any key dismisses the result, then nudge a refresh to re-sync.
                 ui.mode = Mode::List;
@@ -658,13 +739,15 @@ async fn execute_fleet(
     cfg: &Config,
     action: Action,
     pods: Vec<Pod>,
+    arg: Option<String>,
 ) -> String {
     let total = pods.len();
     let mut set = JoinSet::new();
     for pod in pods {
         let provider = provider.clone();
         let cfg = cfg.clone();
-        set.spawn(async move { execute(provider.as_ref(), &cfg, action, &pod).await });
+        let arg = arg.clone();
+        set.spawn(async move { execute(provider.as_ref(), &cfg, action, &pod, arg.as_deref()).await });
     }
     let mut ok = 0usize;
     let mut fails: Vec<String> = Vec::new();
@@ -826,14 +909,15 @@ async fn apply_action(
         terminal.draw(|f| view(f, &s, ui, secs))?;
     }
 
-    let msg = execute(provider.as_ref(), &ui.cfg, c.action, &pod).await;
+    let msg = execute(provider.as_ref(), &ui.cfg, c.action, &pod, None).await;
     ui.mode = Mode::Result(msg);
     Ok(())
 }
 
 /// Perform one action against a pod, returning a one-line human-readable outcome.
-/// This is the *only* place the dashboard mutates anything.
-async fn execute(provider: &dyn Provider, cfg: &Config, action: Action, pod: &Pod) -> String {
+/// This is the *only* place the dashboard mutates anything. `arg` carries the typed
+/// command (`Run`) or branch (`SetBranch`); it's `None` for the other actions.
+async fn execute(provider: &dyn Provider, cfg: &Config, action: Action, pod: &Pod, arg: Option<&str>) -> String {
     let name = &pod.name;
     match action {
         Action::Restart => match provider.restart_pod(&pod.id).await {
@@ -850,6 +934,52 @@ async fn execute(provider: &dyn Provider, cfg: &Config, action: Action, pod: &Po
         },
         Action::Backup => run_backup(cfg, pod).await,
         Action::Setup => run_setup(cfg, pod).await,
+        Action::Test => run_ssh_oneline(cfg, pod, TORCH_TEST_CMD, "torch").await,
+        Action::Run => match arg {
+            Some(cmd) if !cmd.trim().is_empty() => run_ssh_oneline(cfg, pod, cmd, "run").await,
+            _ => format!("✗ {name}: no command given"),
+        },
+        Action::SetBranch => match arg {
+            Some(branch) if !branch.trim().is_empty() => run_set_branch(cfg, pod, branch.trim()).await,
+            _ => format!("✗ {name}: no branch given"),
+        },
+    }
+}
+
+/// The torch health check (mirrors `arena pods test`).
+const TORCH_TEST_CMD: &str =
+    "python -c 'import torch; print(torch.__version__)' 2>&1 || python3 -c 'import torch; print(torch.__version__)'";
+
+/// Run a command over SSH and report its last output line (read-only flows: test / run).
+async fn run_ssh_oneline(cfg: &Config, pod: &Pod, cmd: &str, what: &str) -> String {
+    let target = match SshTarget::from_pod(pod, cfg) {
+        Ok(t) => t,
+        Err(e) => return format!("✗ {}: {e}", pod.name),
+    };
+    match ssh::run(&target, cmd).await {
+        Ok(out) if out.success => {
+            let line = out.stdout.lines().last().unwrap_or("").trim();
+            format!("✓ {} {what}: {line}", pod.name)
+        }
+        Ok(out) => format!("✗ {} {what} (exit {:?}): {}", pod.name, out.code, out.stderr.trim()),
+        Err(e) => format!("✗ {} {what} failed: {e}", pod.name),
+    }
+}
+
+/// Gently switch a pod's ARENA checkout to `branch` (mirrors `arena pods set-branch`).
+async fn run_set_branch(cfg: &Config, pod: &Pod, branch: &str) -> String {
+    let target = match SshTarget::from_pod(pod, cfg) {
+        Ok(t) => t,
+        Err(e) => return format!("✗ {}: {e}", pod.name),
+    };
+    let repo_path = cfg.get("BACKUP_REPO_PATH").map(String::from).unwrap_or_else(|| {
+        format!("/root/{}", cfg.get("ARENA_REPO_NAME").unwrap_or("ARENA_3.0"))
+    });
+    let cmd = arena_core::backup::checkout_command(&repo_path, branch, cfg.get("GIT_SSH_KEY_REMOTE"));
+    match ssh::run(&target, &cmd).await {
+        Ok(out) if out.success => format!("✓ {} → {branch}", pod.name),
+        Ok(out) => format!("✗ {} set-branch (exit {:?}): {}", pod.name, out.code, out.stderr.trim()),
+        Err(e) => format!("✗ {} set-branch failed: {e}", pod.name),
     }
 }
 
@@ -925,6 +1055,10 @@ fn build_preview(cfg: &Config, action: Action, pod: &Pod) -> Option<String> {
             ),
             (Err(e), _) => format!("⚠ {e}"),
             (_, Err(e)) => format!("⚠ {e}"),
+        }),
+        Action::Test => Some(match &target {
+            Ok(t) => t.display_command(TORCH_TEST_CMD),
+            Err(e) => format!("⚠ {e}"),
         }),
         _ => None,
     }
@@ -1065,9 +1199,36 @@ fn view(f: &mut Frame, shared: &Shared, ui: &Ui, secs: u64) {
         Mode::FleetConfirm { action, typed } => render_fleet_confirm(f, shared, *action, typed),
         Mode::NewPod(form) => render_new_pod(f, form),
         Mode::TermMarked { typed } => render_term_marked(f, shared, ui, typed),
+        Mode::Input { action, scope, value } => render_input(f, shared, *action, scope, value),
         Mode::Result(msg) => render_result(f, msg),
         _ => {}
     }
+}
+
+/// The free-text input modal for `run` / `set-branch` (one pod or the whole fleet).
+fn render_input(f: &mut Frame, shared: &Shared, action: Action, scope: &InputScope, value: &str) {
+    let who = match scope {
+        InputScope::Pod { name, .. } => name.clone(),
+        InputScope::Fleet => format!("ALL {} pods", shared.pods.len()),
+    };
+    let text = format!(
+        "{} on {who}\n\n{}\n\n  > {value}\n\n[enter] run  [esc] cancel",
+        action.label(),
+        action.input_prompt(),
+    );
+    let area = centered_rect(70, 40, f.area());
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title(format!(" {} ", action.label())),
+            ),
+        area,
+    );
 }
 
 fn summary_line(s: &FleetSummary) -> Paragraph<'static> {
@@ -1381,12 +1542,13 @@ fn footer_hint(shared: &Shared, ui: &Ui, secs: u64) -> String {
     let keys = match ui.mode {
         Mode::List => "[enter] detail  [space] mark  [x] term marked  [a] act  [A] fleet  [n] new  [s] names  [r] now  [q] quit",
         Mode::Detail => "[space] mark  [x] term marked  [a] act  [A] fleet  [n] new  [s] names  [r] now  [esc] back  [q] quit",
-        Mode::Menu => "[r/s/t/b/p] choose action  [esc] cancel",
+        Mode::Menu => "[r/s/t/b/p/e/x/g] choose action  [esc] cancel",
         Mode::Confirm(_) => "type to confirm  [enter] apply  [esc] cancel",
-        Mode::FleetMenu => "[r/b/p] choose fleet action  [esc] cancel",
+        Mode::FleetMenu => "[r/b/p/e/x/g] choose fleet action  [esc] cancel",
         Mode::FleetConfirm { .. } => "type ALL to confirm  [enter] apply  [esc] cancel",
         Mode::NewPod { .. } => "[↑↓] pods  [+-] gpus  [←→] type  [enter] create  [esc] cancel",
         Mode::TermMarked { .. } => "type the count to confirm  [enter] terminate  [esc] cancel",
+        Mode::Input { .. } => "type the value  [enter] run  [esc] cancel",
         Mode::Result(_) => "[any key] dismiss",
     };
     format!("{}{} · {} · every {}s · {}", shared.status, spin, age, secs, keys)
@@ -1421,15 +1583,18 @@ fn render_menu(f: &mut Frame, shared: &Shared, ui: &Ui) {
     let lines = vec![
         format!("Actions for {name}:"),
         String::new(),
-        "  [r]  restart  (in place)".into(),
+        "  [r]  restart   (in place)".into(),
         "  [s]  stop".into(),
-        "  [t]  terminate  (irreversible)".into(),
-        "  [b]  backup   (commit + push tree)".into(),
-        "  [p]  setup    (provision / re-point git)".into(),
+        "  [t]  terminate (irreversible)".into(),
+        "  [b]  backup    (commit + push tree)".into(),
+        "  [p]  setup     (provision / re-point git)".into(),
+        "  [e]  test      (torch version)".into(),
+        "  [x]  run       (type a shell command)".into(),
+        "  [g]  set-branch (type a branch)".into(),
         String::new(),
         "[esc] cancel".into(),
     ];
-    let area = centered_rect(50, 45, f.area());
+    let area = centered_rect(54, 55, f.area());
     f.render_widget(Clear, area);
     f.render_widget(
         Paragraph::new(lines.join("\n"))
@@ -1479,14 +1644,17 @@ fn render_fleet_menu(f: &mut Frame, shared: &Shared) {
     let lines = vec![
         format!("Fleet actions — all {n} pods:"),
         String::new(),
-        "  [r]  restart all  (in place)".into(),
-        "  [b]  backup all   (commit + push trees)".into(),
-        "  [p]  setup all    (provision / re-point git)".into(),
+        "  [r]  restart all   (in place)".into(),
+        "  [b]  backup all    (commit + push trees)".into(),
+        "  [p]  setup all     (provision / re-point git)".into(),
+        "  [e]  test all      (torch version)".into(),
+        "  [x]  run all       (type a shell command)".into(),
+        "  [g]  set-branch all (type a branch)".into(),
         String::new(),
         "(stop/terminate are per-pod only — use [a])".into(),
         "[esc] cancel".into(),
     ];
-    let area = centered_rect(56, 45, f.area());
+    let area = centered_rect(60, 55, f.area());
     f.render_widget(Clear, area);
     f.render_widget(
         Paragraph::new(lines.join("\n"))

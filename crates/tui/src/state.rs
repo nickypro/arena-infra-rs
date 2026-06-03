@@ -307,6 +307,12 @@ pub enum Action {
     Terminate,
     Backup,
     Setup,
+    /// Health check: import torch and print its version (read-only).
+    Test,
+    /// Run an arbitrary shell command (the operator types it first).
+    Run,
+    /// Gently switch the ARENA checkout to a branch (the operator types it first).
+    SetBranch,
 }
 
 impl Action {
@@ -317,6 +323,9 @@ impl Action {
         ('t', Action::Terminate),
         ('b', Action::Backup),
         ('p', Action::Setup),
+        ('e', Action::Test),
+        ('x', Action::Run),
+        ('g', Action::SetBranch),
     ];
 
     pub fn from_key(c: char) -> Option<Action> {
@@ -330,6 +339,9 @@ impl Action {
             Action::Terminate => "terminate",
             Action::Backup => "backup",
             Action::Setup => "setup",
+            Action::Test => "test",
+            Action::Run => "run",
+            Action::SetBranch => "set-branch",
         }
     }
 
@@ -343,6 +355,21 @@ impl Action {
     /// Whether this action is irreversible (drives the warning styling).
     pub fn is_destructive(&self) -> bool {
         matches!(self, Action::Terminate)
+    }
+
+    /// Actions that need a free-text argument typed first (the command / the branch),
+    /// collected in an input modal before they run.
+    pub fn needs_input(&self) -> bool {
+        matches!(self, Action::Run | Action::SetBranch)
+    }
+
+    /// The prompt shown in the input modal for [`Self::needs_input`] actions.
+    pub fn input_prompt(&self) -> &'static str {
+        match self {
+            Action::Run => "shell command to run on the pod(s):",
+            Action::SetBranch => "branch to switch to (fetch + checkout + ff-pull):",
+            _ => "",
+        }
     }
 }
 
