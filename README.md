@@ -34,14 +34,19 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     index in `MACHINE_NAME_LIST`, so tearing down one pod never renumbers the others
     and a returning machine reclaims its port. Pure/no-I/O — it plans, you apply.
 - `arena` (CLI):
-  - `pods list | create | stop | restart | terminate` (`--provider
+  - `pods list | create | stop | restart | terminate | kill` (`--provider
     runpod|vast|hetzner`; Vast reads `VAST_API_KEY`, Hetzner reads `HETZNER_API_KEY`
     + `HETZNER_*`). `list` takes `--json`; `stop`/`restart`/`terminate` accept a
     **machine name or id**. `list --probe` fills the GPU column from `nvidia-smi` over
     SSH (the provider list API omits GPU type). `restart` restarts in place (RunPod restart / Hetzner
     reboot / Vast stop+start), preserving the machine where supported. `terminate
     --all` tears down the **whole fleet** (confirms first; `--dry-run` lists every
-    pod without touching them) — for end-of-program teardown.
+    pod without touching them) — for end-of-program teardown. `stop --all`
+    (with `--include`/`--exclude`) stops many at once; `kill` is the stop→wait-for-
+    EXITED→delete flow (`--timeout`; one target or `--all`).
+  - `create` also takes **explicit names** (`pods create apple bloom`) and an
+    **`--image`** override, alongside `-n`(target total) / `-a`(add). Bare names get
+    the configured prefix; names already present are skipped.
   - `create`/`up` take `--retry-mins <M>` (`--retry-secs`, default 60) to **keep
     topping up to the target** while capacity is short — one round per interval for up
     to M minutes, **Ctrl+C** stops early keeping what was made. A `no instances
@@ -86,6 +91,21 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
   - `pods set-branch <branch> [target|--all]` — gently switch pods' ARENA checkout to a
     branch (fetch + checkout + ff-only pull, no hard reset) — e.g. end-of-day back to
     `main`. Confirms first; `--dry-run` previews.
+  - `pods run <cmd>` / `pods test` — run an arbitrary command on every pod (concurrent,
+    confirms first) / the read-only torch-version health check.
+  - `pods pull [label]` — the **file** backup (complementing the git `backup`): rsyncs
+    each pod's home into `<dir>/<label>/<pod>/` (`--dir`, `--max-size`, `--remote-path`),
+    size-capped with dotfile/`site-packages` excludes. Label defaults to the `wNdM`
+    iteration. Confirms first; `--dry-run` prints the exact rsync commands.
+  - `pods copy-keys` — distribute API keys into each pod's `~/.bashrc`/`~/.zshrc`
+    (idempotent): per-host keys from `<keys-dir>/<provider>_api_keys.csv`
+    (openai/anthropic/openrouter) **plus a broadcast Hugging Face token** (`--hf-token`
+    or config `HF_TOKEN`) so the cohort can pull **gated repos** we're approved for
+    (Llama 3, …) — it sets both `HF_TOKEN` and `HUGGING_FACE_HUB_TOKEN`. Confirms first;
+    `--dry-run` lists what would be set (values redacted).
+  - `ssh-config [--proxy] [--out]` — emit the **participant-facing `~/.ssh/config`**:
+    direct pod endpoints by default, or stable proxy ports (`--proxy`) anchored to each
+    machine's `MACHINE_NAME_LIST` index. Read-only.
   - `pods setup` — provision pods over SSH: copy the git deploy key, write `~/.name`,
     point the repo at the GitHub SSH URL on the default branch. Confirms first
     (`--dry-run` previews). Uses `GIT_SSH_KEY_LOCAL/REMOTE`, `ARENA_REPO_OWNER/NAME`,
@@ -108,12 +128,14 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `$/hr` and `$/day`.
   - **Navigate** with `↑/↓`/`j/k`; `enter` opens a per-pod detail pane (per-GPU
     breakdown, full branch/origin/health, util/temp **sparklines**). `Ctrl-C`/`q` quit.
-  - **Act** on the selected pod with `a` (restart / stop / terminate / backup / setup),
-    on the **whole fleet** with `A` (safe ops only: restart / backup / setup), or **add
-    pods** with `n`. Every mutation goes through a confirmation modal — the *only* place
-    the TUI mutates anything. Lifecycle actions (restart/stop/terminate) require
-    **typing the pod's exact name**; fleet actions require typing **ALL**; backup/setup
-    show the precise command(s) and take a single `y`. The dashboard's reads stay reads.
+  - **Act** on the selected pod with `a` (restart / stop / terminate / backup / setup /
+    test / run / set-branch), on the **whole fleet** with `A` (restart / backup / setup /
+    test / run / set-branch), or **add pods** with `n`. `run` and `set-branch` pop a
+    text-input modal to type the command / branch; `test` is read-only. Every mutation
+    goes through a confirmation modal — the *only* place the TUI mutates anything.
+    Lifecycle actions (restart/stop/terminate) require **typing the pod's exact name**;
+    fleet mutations require typing **ALL**; backup/setup/test show the precise
+    command(s) and take a single `y`. The dashboard's reads stay reads.
   - **Add-pod (`n`)** is an interactive form: `↑↓` moves between fields, `←→` changes
     the value. Pick the provider (unavailable ones — no API key — are greyed out),
     cloud type (RunPod only), GPU type (full option list shown) and count, and how many

@@ -10,7 +10,7 @@ flowchart TD
     user([operator])
 
     subgraph present[presentation layer · thin, swappable]
-        CLI["arena (CLI)<br/>clap · pods list/create/up/stop/terminate · proxy plan"]
+        CLI["arena (CLI)<br/>clap · pods list/create/up/stop/kill/terminate/backup/pull/run/copy-keys · proxy plan · ssh-config"]
         TUI["arena-tui<br/>ratatui · read-only pod dashboard"]
     end
 
@@ -62,8 +62,8 @@ flowchart TD
 
 | crate | binary | role |
 |-------|--------|------|
-| `arena-core` | — | config parsing, `Provider` trait + RunPod/Vast/Hetzner backends + `build` factory, `Pod`/`PodSpec` model, `naming`, `proxy`, `ssh`, `backup`, `metrics`, errors |
-| `arena-cli` | `arena` | clap CLI over the library (`pods … / up`, `proxy plan`, `backup`) |
+| `arena-core` | — | config parsing, `Provider` trait + RunPod/Vast/Hetzner backends + `build` factory, `Pod`/`PodSpec` model, `naming`, `proxy`, `ssh`, `backup`, `pull`, `sshconfig`, `apikeys`, `metrics`, errors |
+| `arena-cli` | `arena` | clap CLI over the library (`pods … / up`, `proxy plan/apply`, `backup`, `pull`, `copy-keys`, `ssh-config`) |
 | `arena-tui` | `arena-tui` | ratatui read-only dashboard (pods + GPU/progress metrics) |
 
 ## Request flow (example: `arena --provider vast pods create -n 3`)
