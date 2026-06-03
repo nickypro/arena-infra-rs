@@ -5,6 +5,7 @@
 //! existing bash/python tooling, and a safety posture where nothing here mutates
 //! remote state unless a caller explicitly asks it to.
 
+pub mod apikeys;
 pub mod backup;
 pub mod config;
 pub mod error;
@@ -15,9 +16,11 @@ pub mod plan;
 pub mod pod;
 pub mod provider;
 pub mod proxy;
+pub mod pull;
 pub mod retry;
 pub mod schedule;
 pub mod setup;
+pub mod sshconfig;
 pub mod ssh;
 pub mod status;
 
