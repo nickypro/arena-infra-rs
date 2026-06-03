@@ -143,13 +143,17 @@ enum ConfigCmd {
     Check,
     /// Set a key in config.env (e.g. an API key): replaces the line if present, else
     /// appends `KEY="value"`. Writes to the --config file; never echoes the value. With
-    /// no KEY/VALUE it prompts interactively (pick a key, type the value).
+    /// no KEY/VALUE it prompts interactively (pick a key — showing which are already
+    /// set — then type the value).
     Set {
         /// Config key, e.g. RUNPOD_API_KEY. Omit to choose interactively.
         key: Option<String>,
         /// Value to store (will be quoted). Omit to be prompted.
         value: Option<String>,
     },
+    /// Show which config file is active (path + whether it's readable/writable), plus a
+    /// summary of what's loaded and any keys currently coming from the environment.
+    Which,
 }
 
 #[derive(Subcommand)]
@@ -1037,10 +1041,11 @@ fn handle_config(
 ) -> Result<()> {
     match cmd {
         ConfigCmd::Check => config_check(cfg, provider_name),
+        ConfigCmd::Which => config_which(cfg, provider_name, config_path),
         ConfigCmd::Set { key, value } => {
             let (key, value) = match (key, value) {
                 (Some(k), Some(v)) => (k, v),
-                _ => interactive_config_set()?,
+                _ => interactive_config_set(cfg)?,
             };
             let text = std::fs::read_to_string(config_path)
                 .with_context(|| format!("reading {}", config_path.display()))?;
@@ -1072,9 +1077,32 @@ fn cfg_row(cfg: &Config, missing: &mut Vec<String>, key: &str, required: bool, s
     }
 }
 
+/// The keys offered in the interactive `config set` picker, with whether each is a
+/// secret (so we show "set" rather than the value). Order roughly by how often they're
+/// set per run.
+const SETTABLE_KEYS: &[(&str, bool)] = &[
+    ("RUNPOD_API_KEY", true),
+    ("VAST_API_KEY", true),
+    ("HETZNER_API_KEY", true),
+    ("HF_TOKEN", true), // broadcast to pods for gated repos (Llama 3 …)
+    ("ARENA_START_DATE", false),
+    ("MACHINE_NAME_PREFIX", false),
+    ("SHARED_SSH_KEY_PATH", false),
+];
+
+/// How a key currently reads for the picker: "not set", "set" (secret), or its value.
+fn key_state(cfg: &Config, key: &str, secret: bool) -> String {
+    match cfg.get(key).filter(|v| !v.is_empty()) {
+        None => "· not set".to_string(),
+        Some(_) if secret => "✓ set".to_string(),
+        Some(v) => format!("✓ {v}"),
+    }
+}
+
 /// Interactively pick a config key and read its value (for `config set` with no args).
-/// Requires a terminal.
-fn interactive_config_set() -> Result<(String, String)> {
+/// Shows which keys are already set (secrets as "set", others as their value) so the
+/// operator can see at a glance what's configured. Requires a terminal.
+fn interactive_config_set(cfg: &Config) -> Result<(String, String)> {
     use std::io::{IsTerminal, Write};
     if !std::io::stdin().is_terminal() {
         anyhow::bail!("config set needs a key and value non-interactively: arena config set KEY VALUE");
@@ -1087,26 +1115,76 @@ fn interactive_config_set() -> Result<(String, String)> {
         Ok(s.trim().to_string())
     };
 
-    const OPTS: &[&str] = &["RUNPOD_API_KEY", "VAST_API_KEY", "HETZNER_API_KEY", "ARENA_START_DATE"];
-    eprintln!("Which key to set?");
-    for (i, k) in OPTS.iter().enumerate() {
-        eprintln!("  {}) {k}", i + 1);
+    eprintln!("Which key to set?  (✓ = already set in this config)\n");
+    for (i, (k, secret)) in SETTABLE_KEYS.iter().enumerate() {
+        eprintln!("  {:>2}) {k:<22} {}", i + 1, key_state(cfg, k, *secret));
     }
-    eprintln!("  {}) other (type the key name)", OPTS.len() + 1);
-    let choice = read("> ")?;
-    let key = match choice.parse::<usize>() {
-        Ok(n) if (1..=OPTS.len()).contains(&n) => OPTS[n - 1].to_string(),
-        Ok(n) if n == OPTS.len() + 1 => read("key name: ")?,
-        _ => choice, // a key name typed directly
+    eprintln!("  {:>2}) other (type the key name)", SETTABLE_KEYS.len() + 1);
+    let choice = read("\n> ")?;
+    let (key, secret) = match choice.parse::<usize>() {
+        Ok(n) if (1..=SETTABLE_KEYS.len()).contains(&n) => {
+            let (k, s) = SETTABLE_KEYS[n - 1];
+            (k.to_string(), s)
+        }
+        Ok(n) if n == SETTABLE_KEYS.len() + 1 => (read("key name: ")?, true),
+        _ => (choice, true), // a key name typed directly; treat as secret-ish
     };
     if key.is_empty() {
         anyhow::bail!("no key chosen");
+    }
+    // Flag an overwrite so it's never a surprise.
+    if cfg.get(&key).map(|v| !v.is_empty()).unwrap_or(false) {
+        eprintln!("({key} is already set — entering a value overwrites it; blank keeps it)");
     }
     let value = read(&format!("value for {key}: "))?;
     if value.is_empty() {
         anyhow::bail!("empty value — nothing set");
     }
+    let _ = secret; // (reserved: could mask the input later)
     Ok((key, value))
+}
+
+/// `config which`: show the active config file (path, readable/writable), a one-line
+/// summary of what parsed, and any keys currently being supplied by the environment
+/// (which silently override the file) so it's clear where values are coming from.
+fn config_which(cfg: &Config, provider_name: &str, config_path: &std::path::Path) -> Result<()> {
+    let abs = std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
+    let meta = std::fs::metadata(&abs).ok();
+    let readable = std::fs::File::open(&abs).is_ok();
+    let writable = meta
+        .as_ref()
+        .map(|m| !m.permissions().readonly())
+        .unwrap_or(false);
+
+    println!("Active config: {}", abs.display());
+    println!(
+        "  {}  ·  {}",
+        if readable { "✓ readable" } else { "✗ not readable" },
+        if writable { "writable" } else { "read-only (config set can't write here)" },
+    );
+    if std::env::var("ARENA_CONFIG").is_ok() {
+        println!("  source: ARENA_CONFIG environment variable");
+    }
+    println!("\nLoaded: provider {provider_name} · {} key(s) · {} machine name(s)",
+        cfg.values.len(), cfg.machine_names.len());
+
+    // Keys whose value is currently coming from the environment (env overrides the file
+    // at load — easy to forget, so surface it).
+    let mut from_env: Vec<&String> = cfg
+        .values
+        .keys()
+        .filter(|k| std::env::var(k.as_str()).is_ok())
+        .collect();
+    from_env.sort();
+    if from_env.is_empty() {
+        println!("\nEnvironment overrides: none (all values come from the file)");
+    } else {
+        println!("\nEnvironment overrides in effect (env wins over the file):");
+        for k in from_env {
+            println!("  • {k}");
+        }
+    }
+    Ok(())
 }
 
 /// Print a config checklist for the selected provider + proxy + backup, never showing

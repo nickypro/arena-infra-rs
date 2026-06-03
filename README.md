@@ -110,8 +110,11 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     point the repo at the GitHub SSH URL on the default branch. Confirms first
     (`--dry-run` previews). Uses `GIT_SSH_KEY_LOCAL/REMOTE`, `ARENA_REPO_OWNER/NAME`,
     `DEFAULT_BRANCH`.
-  - `config check | set` — `check` is the read-only doctor (keys + setup readiness);
-    `config set KEY VALUE` writes a key (e.g. an API key) into config.env.
+  - `config check | set | which` — `check` is the read-only doctor (keys + setup
+    readiness); `config set KEY VALUE` writes a key (e.g. an API key) into config.env, or
+    with no args prompts interactively (the picker shows which keys are already set, and
+    includes `HF_TOKEN`); `config which` shows the active config file (path,
+    readable/**writable**), what parsed, and any keys coming from the environment.
 - `arena-tui` (TUI) — interactive dashboard (ratatui): pods from the configured
   provider plus, per pod, GPU stats via `nvidia-smi`, git branch, a setup-health check,
   and an optional progress signal (`PROGRESS_CMD`) — all over SSH in **one** probe per
