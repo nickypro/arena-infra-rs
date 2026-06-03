@@ -91,6 +91,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
   - `pods set-branch <branch> [target|--all]` — gently switch pods' ARENA checkout to a
     branch (fetch + checkout + ff-only pull, no hard reset) — e.g. end-of-day back to
     `main`. Confirms first; `--dry-run` previews.
+  - `pods init-branches` — create each pod's `autocommit-…-wNdM-…` branch and push it
+    upstream **without committing** (legacy `init_branches`), so a new day's branch
+    exists before `backup` runs. `--week`/`--day` override; `--dry-run` previews.
   - `pods run <cmd>` / `pods test` — run an arbitrary command on every pod (concurrent,
     confirms first) / the read-only torch-version health check.
   - `pods pull [label]` — the **file** backup (complementing the git `backup`): rsyncs
@@ -106,10 +109,12 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
   - `ssh-config [--proxy] [--out]` — emit the **participant-facing `~/.ssh/config`**:
     direct pod endpoints by default, or stable proxy ports (`--proxy`) anchored to each
     machine's `MACHINE_NAME_LIST` index. Read-only.
-  - `pods setup` — provision pods over SSH: copy the git deploy key, write `~/.name`,
-    point the repo at the GitHub SSH URL on the default branch. Confirms first
-    (`--dry-run` previews). Uses `GIT_SSH_KEY_LOCAL/REMOTE`, `ARENA_REPO_OWNER/NAME`,
-    `DEFAULT_BRANCH`.
+  - `pods setup` — provision pods over SSH (ordered steps in `--help`): copy the git
+    deploy key, write `~/.ssh/config` + `authorized_keys`, point the repo at GitHub,
+    update submodules, write `~/.name`, and — **if `HF_TOKEN` is set** — export it
+    (`HF_TOKEN` + `HUGGING_FACE_HUB_TOKEN`) for gated-repo access (else that step is
+    skipped, and it says so). Confirms first (`--dry-run` previews, with the token
+    redacted). Uses `GIT_SSH_KEY_LOCAL/REMOTE`, `ARENA_REPO_OWNER/NAME`, `DEFAULT_BRANCH`.
   - `config check | set | which` — `check` is the read-only doctor (keys + setup
     readiness); `config set KEY VALUE` writes a key (e.g. an API key) into config.env, or
     with no args prompts interactively (the picker shows which keys are already set, and

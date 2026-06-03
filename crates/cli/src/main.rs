@@ -367,8 +367,22 @@ enum PodCmd {
         #[arg(long)]
         day: Option<u32>,
     },
-    /// Provision pods over SSH: copy the git deploy key, write ~/.name, point the
-    /// repo at GitHub. Acts by default; --dry-run to preview.
+    /// Provision pods over SSH. Acts by default; --dry-run to preview.
+    ///
+    /// Per pod, in order:
+    ///   1. copy the git deploy key (scp) and chmod it;
+    ///   2. add a github.com block to ~/.ssh/config pointing at that key;
+    ///   3. add the shared + deploy public keys to ~/.ssh/authorized_keys;
+    ///   4. point the ARENA repo's origin at GitHub, fetch, and update the branch
+    ///      (stay on the current branch by default; --force checks out the default
+    ///      branch and hard-resets);
+    ///   5. update submodules;
+    ///   6. write ~/.name (export MACHINE_NAME=…);
+    ///   7. (optional) if HF_TOKEN is set, export it (HF_TOKEN + HUGGING_FACE_HUB_TOKEN)
+    ///      into ~/.bashrc & ~/.zshrc for gated-repo access — else this step is skipped.
+    ///
+    /// It does NOT distribute per-host API keys (use `pods copy-keys`) or back anything
+    /// up (use `pods backup` / `pods pull`).
     Setup {
         /// Preview only: print what would happen, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
@@ -402,6 +416,21 @@ enum PodCmd {
         #[arg(long)]
         all: bool,
         /// Preview only: print what would happen, change nothing.
+        #[arg(long, visible_aliases = ["dryrun", "dry"])]
+        dry_run: bool,
+    },
+    /// Create each pod's autocommit branch for the iteration and push it upstream,
+    /// WITHOUT committing work (legacy init_branches) — e.g. start a new day so later
+    /// `backup`s have a branch with an upstream. Branch is
+    /// autocommit-{prefix}-w{week}d{day}-{machine}. Acts by default; --dry-run to preview.
+    InitBranches {
+        /// Override the iteration week (default: computed from ARENA_START_DATE).
+        #[arg(long)]
+        week: Option<u32>,
+        /// Override the day-within-week (default: computed from ARENA_START_DATE).
+        #[arg(long)]
+        day: Option<u32>,
+        /// Preview only: print the per-pod commands, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
@@ -798,6 +827,12 @@ async fn handle_setup(provider: &dyn Provider, cfg: &Config, apply: bool, force:
     use arena_core::ssh::{self, SshTarget};
 
     let scfg = arena_core::setup::SetupConfig::from_config(cfg)?;
+    // Tell the operator whether the HF token will be exported (it's an optional step).
+    if scfg.hf_token.is_some() {
+        println!("HF token: found — will export HF_TOKEN on each pod (gated-repo access).");
+    } else {
+        println!("HF token: none set — skipping (set HF_TOKEN to give pods gated-repo access).");
+    }
     let pods = provider.list_pods().await.context("listing pods for setup")?;
     let mut targets = Vec::new();
     for pod in &pods {
@@ -812,6 +847,13 @@ async fn handle_setup(provider: &dyn Provider, cfg: &Config, apply: bool, force:
     }
 
     if !apply {
+        // Redact the HF token in the *previewed* command — the dry-run prints the exact
+        // shell, and the real value must never land in a terminal/log. (The actual run
+        // below uses `scfg` with the real token and never prints the command.)
+        let mut display_scfg = scfg.clone();
+        if display_scfg.hf_token.is_some() {
+            display_scfg.hf_token = Some("<HF_TOKEN>".to_string());
+        }
         println!(
             "Dry-run — would provision {} pod(s) (copy key {} -> {}, then):\n",
             targets.len(),
@@ -821,7 +863,7 @@ async fn handle_setup(provider: &dyn Provider, cfg: &Config, apply: bool, force:
         for (name, target) in &targets {
             println!("# {name}");
             println!("{}", target.display_scp(&scfg.key_local, &scfg.key_remote));
-            println!("{}\n", target.display_command(&scfg.remote_command(name, force)));
+            println!("{}\n", target.display_command(&display_scfg.remote_command(name, force)));
         }
         println!("Preview only — run without --dry-run to execute over SSH.");
         return Ok(());
@@ -1971,6 +2013,10 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             handle_kill(provider, target, all, &include, &exclude, timeout, dry_run, yes).await?;
         }
 
+        PodCmd::InitBranches { week, day, dry_run } => {
+            handle_init_branches(provider, cfg, week, day, dry_run, yes).await?;
+        }
+
         PodCmd::Pull { label, dir, max_size, remote_path, dry_run } => {
             handle_pull(provider, cfg, label, &dir, &max_size, remote_path, dry_run, yes).await?;
         }
@@ -2371,6 +2417,87 @@ async fn handle_kill(
     println!("\nkilled {ok}/{} ({} not exited in time)", pods.len(), pods.len() - ok - failed);
     if failed > 0 {
         anyhow::bail!("{failed} pod(s) failed to terminate");
+    }
+    Ok(())
+}
+
+/// `pods init-branches`: create each pod's `autocommit-…-wNdM-…` branch and push it
+/// upstream, without committing — so a new day's branch exists before backups run.
+async fn handle_init_branches(
+    provider: &dyn Provider,
+    cfg: &Config,
+    week: Option<u32>,
+    day: Option<u32>,
+    dry_run: bool,
+    yes: bool,
+) -> Result<()> {
+    use arena_core::ssh::{self, SshTarget};
+
+    let (week, day) = resolve_week_day(cfg, week, day)?;
+    let bcfg = arena_core::backup::BackupConfig::from_config(cfg, week, day);
+    println!("Iteration: w{week}d{day}\n");
+
+    let pods = provider.list_pods().await.context("listing pods for init-branches")?;
+    let mut targets = Vec::new();
+    for pod in &pods {
+        match SshTarget::from_pod(pod, cfg) {
+            Ok(t) => targets.push((pod.name.clone(), t)),
+            Err(_) => eprintln!("skip {} — no SSH endpoint yet", pod.name),
+        }
+    }
+    if targets.is_empty() {
+        println!("(no pods with an SSH endpoint)");
+        return Ok(());
+    }
+
+    if dry_run {
+        println!("Dry-run — would init the w{week}d{day} branch on {} pod(s):\n", targets.len());
+        for (name, t) in &targets {
+            let cmd = arena_core::backup::init_branch_command(&bcfg, name);
+            println!("# {name}  ->  branch {}", bcfg.branch_for(name));
+            println!("{}\n", t.display_command(&cmd));
+        }
+        println!("Preview only — run without --dry-run to execute over SSH.");
+        return Ok(());
+    }
+    if !confirm(yes, &format!(
+        "Will create + push the w{week}d{day} autocommit branch on {} pod(s).",
+        targets.len()
+    ))? {
+        println!("aborted.");
+        return Ok(());
+    }
+
+    let total = targets.len();
+    println!("Initializing branches on {total} pod(s) over SSH…");
+    let mut set = tokio::task::JoinSet::new();
+    for (name, target) in targets {
+        let cmd = arena_core::backup::init_branch_command(&bcfg, &name);
+        let branch = bcfg.branch_for(&name);
+        set.spawn(async move { (name, branch, ssh::run(&target, &cmd).await) });
+    }
+    let (mut ok, mut failed, mut done) = (0, 0, 0);
+    while let Some(joined) = set.join_next().await {
+        done += 1;
+        let Ok((name, branch, res)) = joined else { continue };
+        match res {
+            Ok(out) if out.success => {
+                println!("[{done}/{total}] ✓ {name} -> {branch}");
+                ok += 1;
+            }
+            Ok(out) => {
+                println!("[{done}/{total}] ✗ {name} (exit {:?}): {}", out.code, out.stderr.trim());
+                failed += 1;
+            }
+            Err(e) => {
+                println!("[{done}/{total}] ✗ {name}: {e}");
+                failed += 1;
+            }
+        }
+    }
+    println!("\nDone: {ok} initialized, {failed} failed.");
+    if failed > 0 {
+        anyhow::bail!("{failed} pod(s) failed to init branch");
     }
     Ok(())
 }
