@@ -472,6 +472,26 @@ enum PodCmd {
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
+    /// Copy a local file to every pod over scp (concurrent). With no DEST, mirrors the
+    /// file's path under the ARENA repo (e.g. a local `…/ARENA_3.0/foo/bar.py` lands at
+    /// `/root/ARENA_3.0/foo/bar.py`); otherwise DEST is the remote path (a trailing `/`
+    /// means "into this dir"). The remote parent dir is created if needed.
+    /// Acts by default; --dry-run to preview.
+    Copy {
+        /// Local file to copy.
+        file: PathBuf,
+        /// Destination path on each pod. Omit to mirror the repo path / land in `~`.
+        dest: Option<String>,
+        /// Only copy to these pods (name or id, repeatable). Default: all reachable.
+        #[arg(long)]
+        include: Vec<String>,
+        /// Never copy to these pods (name or id, repeatable).
+        #[arg(long)]
+        exclude: Vec<String>,
+        /// Preview only: print the scp commands, copy nothing.
+        #[arg(long, visible_aliases = ["dryrun", "dry"])]
+        dry_run: bool,
+    },
 }
 
 
@@ -2041,6 +2061,10 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             handle_copy_keys(provider, cfg, &keys_dir, hf_token, &include, &exclude, dry_run, yes).await?;
         }
 
+        PodCmd::Copy { file, dest, include, exclude, dry_run } => {
+            handle_copy(provider, cfg, &file, dest.as_deref(), &include, &exclude, dry_run, yes).await?;
+        }
+
         PodCmd::Restart { target, dry_run } => {
             let (id, label) = resolve_target(provider, &target).await?;
             if dry_run {
@@ -2622,6 +2646,144 @@ async fn handle_pull(
     Ok(())
 }
 
+/// Single-quote for safe inclusion in a remote `sh -c` string (POSIX `'\''` escaping).
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Resolve where a copied file should land on the pod. With an explicit `dest`, use it
+/// verbatim. Otherwise, if the local path runs through the repo dir (`<repo_name>/…`),
+/// mirror that path under the pod's repo parent (so `…/ARENA_3.0/a/b.py` →
+/// `/root/ARENA_3.0/a/b.py`); failing that, fall back to the file's basename (lands in
+/// the login/home dir). Pure, so it's unit-tested.
+fn resolve_remote_dest(
+    local: &std::path::Path,
+    dest: Option<&str>,
+    repo_name: &str,
+    repo_parent: &str,
+) -> String {
+    if let Some(d) = dest {
+        return d.to_string();
+    }
+    let s = local.to_string_lossy().replace('\\', "/");
+    let needle = format!("{repo_name}/");
+    if let Some(idx) = s.find(&needle) {
+        return format!("{}/{}", repo_parent.trim_end_matches('/'), &s[idx..]);
+    }
+    local.file_name().and_then(|n| n.to_str()).unwrap_or("copied_file").to_string()
+}
+
+/// `pods copy`: scp a local file to every (filtered) pod, creating the remote parent
+/// dir first. Destination per [`resolve_remote_dest`].
+#[allow(clippy::too_many_arguments)]
+async fn handle_copy(
+    provider: &dyn Provider,
+    cfg: &Config,
+    file: &std::path::Path,
+    dest: Option<&str>,
+    include: &[String],
+    exclude: &[String],
+    dry_run: bool,
+    yes: bool,
+) -> Result<()> {
+    use arena_core::ssh::{self, SshTarget};
+
+    if !file.is_file() {
+        anyhow::bail!("not a file: {} (pods copy takes a single local file)", file.display());
+    }
+    let local = file.to_string_lossy().into_owned();
+
+    // Resolve the remote destination (same for every pod).
+    let repo_name = cfg.get("ARENA_REPO_NAME").unwrap_or("ARENA_3.0");
+    let repo_path = cfg.get("BACKUP_REPO_PATH").map(String::from).unwrap_or_else(|| format!("/root/{repo_name}"));
+    let repo_parent = std::path::Path::new(&repo_path)
+        .parent()
+        .and_then(|p| p.to_str())
+        .unwrap_or("/root");
+    let remote = resolve_remote_dest(file, dest, repo_name, repo_parent);
+    // The parent dir to ensure exists: the dir itself if `remote` ends with `/`, else its dirname.
+    let remote_parent = if remote.ends_with('/') {
+        remote.trim_end_matches('/').to_string()
+    } else {
+        match remote.rsplit_once('/') {
+            Some((dir, _)) if !dir.is_empty() => dir.to_string(),
+            _ => ".".to_string(),
+        }
+    };
+
+    let mut pods = provider.list_pods().await.context("listing pods for copy")?;
+    pods.retain(|p| !exclude.iter().any(|x| x == &p.name || x == &p.id));
+    if !include.is_empty() {
+        pods.retain(|p| include.iter().any(|x| x == &p.name || x == &p.id));
+    }
+    let mut targets: Vec<(String, SshTarget)> = Vec::new();
+    for pod in &pods {
+        match SshTarget::from_pod(pod, cfg) {
+            Ok(t) => targets.push((pod.name.clone(), t)),
+            Err(_) => eprintln!("skip {} — no SSH endpoint yet", pod.name),
+        }
+    }
+    if targets.is_empty() {
+        println!("(no pods with an SSH endpoint to copy to)");
+        return Ok(());
+    }
+
+    println!("Copy: {local}  ->  {remote}");
+    if dry_run {
+        println!("\nDry-run — would scp to {} pod(s):\n", targets.len());
+        for (name, t) in &targets {
+            println!("# {name}");
+            println!("{}\n", t.display_scp(&local, &remote));
+        }
+        println!("Preview only — run without --dry-run to copy.");
+        return Ok(());
+    }
+    if !confirm(yes, &format!("Will copy {local} to {} on {} pod(s).", remote, targets.len()))? {
+        println!("aborted.");
+        return Ok(());
+    }
+
+    let total = targets.len();
+    let mut set = tokio::task::JoinSet::new();
+    for (name, t) in targets {
+        let (local, remote, remote_parent) = (local.clone(), remote.clone(), remote_parent.clone());
+        set.spawn(async move {
+            // Ensure the remote parent dir exists, then scp.
+            let mk = ssh::run(&t, &format!("mkdir -p {}", shell_quote(&remote_parent))).await;
+            let res = match mk {
+                Ok(o) if o.success => ssh::scp(&t, &local, &remote).await,
+                Ok(o) => Err(arena_core::Error::provider(format!("mkdir failed: {}", o.stderr.trim()))),
+                Err(e) => Err(e),
+            };
+            (name, res)
+        });
+    }
+    let (mut ok, mut failed, mut done) = (0, 0, 0);
+    while let Some(joined) = set.join_next().await {
+        done += 1;
+        let Ok((name, res)) = joined else { continue };
+        match res {
+            Ok(o) if o.success => {
+                println!("[{done}/{total}] ✓ {name}");
+                ok += 1;
+            }
+            Ok(o) => {
+                println!("[{done}/{total}] ✗ {name}: {}", o.stderr.trim());
+                failed += 1;
+            }
+            Err(e) => {
+                println!("[{done}/{total}] ✗ {name}: {e}");
+                failed += 1;
+            }
+        }
+    }
+    println!("\nDone: {ok} copied, {failed} failed.");
+    if failed > 0 {
+        anyhow::bail!("{failed} pod(s) failed to receive the file");
+    }
+    Ok(())
+}
+
 /// `pods copy-keys`: distribute API keys to each pod's shell. Per-host keys come from
 /// `<keys_dir>/<provider>_api_keys.csv`; a Hugging Face token (from `--hf-token` or
 /// config `HF_TOKEN`) is broadcast to every pod (for gated repos like Llama 3).
@@ -2822,5 +2984,26 @@ mod tests {
     #[test]
     fn strip_handles_no_block() {
         assert_eq!(strip_arena_block("a\nb"), "a\nb");
+    }
+
+    #[test]
+    fn copy_dest_mirrors_repo_path_or_falls_back() {
+        use super::resolve_remote_dest;
+        use std::path::Path;
+        // explicit dest wins
+        assert_eq!(
+            resolve_remote_dest(Path::new("./x/y.py"), Some("/tmp/z.py"), "ARENA_3.0", "/root"),
+            "/tmp/z.py"
+        );
+        // path through the repo dir mirrors under the repo parent
+        assert_eq!(
+            resolve_remote_dest(Path::new("./ARENA_3.0/ch1/ex/tests.py"), None, "ARENA_3.0", "/root"),
+            "/root/ARENA_3.0/ch1/ex/tests.py"
+        );
+        // not under the repo -> basename (lands in home)
+        assert_eq!(
+            resolve_remote_dest(Path::new("/home/dev/notes.txt"), None, "ARENA_3.0", "/root"),
+            "notes.txt"
+        );
     }
 }

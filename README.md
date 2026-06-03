@@ -109,6 +109,11 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     (Llama 3, …) — it sets both `HF_TOKEN` and `HUGGING_FACE_HUB_TOKEN`. `--include`/
     `--exclude` (name or id) scope it to specific pods. Confirms first; `--dry-run` lists
     what would be set (values redacted).
+  - `pods copy <file> [dest]` — scp a local file to every pod (concurrent; `--include`/
+    `--exclude` to scope). With no `dest` it **mirrors the path under the ARENA repo**
+    (a local `…/ARENA_3.0/foo/bar.py` → `/root/ARENA_3.0/foo/bar.py`); otherwise `dest`
+    is the remote path (trailing `/` = into that dir). Creates the remote parent dir;
+    confirms first; `--dry-run` previews.
   - `ssh-config [--proxy] [--out]` — emit the **participant-facing `~/.ssh/config`**:
     direct pod endpoints by default, or stable proxy ports (`--proxy`) anchored to each
     machine's `MACHINE_NAME_LIST` index. Read-only.
