@@ -82,7 +82,7 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     need are present (never prints secret values; exits non-zero if a required key is
     missing). Copy `config.env.example` to get started.
   - `cron install|remove|show` — manage a crontab schedule for `arena pods backup`
-    (default hourly; `--start-date` bakes `ARENA_START_DATE` into the line); edits only
+    (default every 15 min; `--start-date` bakes `ARENA_START_DATE` into the line); edits only
     arena-managed lines, leaving other entries intact.
   - `pods backup` — commit + push each pod's ARENA tree to its autocommit branch
     (`autocommit-{prefix}-w{week}d{day}-{machine}`, week/day from `ARENA_START_DATE`,

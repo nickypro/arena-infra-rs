@@ -100,8 +100,8 @@ enum Cmd {
 enum CronCmd {
     /// Install/replace the arena backup cron job.
     Install {
-        /// Cron schedule expression (default: hourly).
-        #[arg(long, default_value = "0 * * * *")]
+        /// Cron schedule expression (default: every 15 minutes).
+        #[arg(long, default_value = "*/15 * * * *")]
         schedule: String,
         /// Bake `ARENA_START_DATE=YYYY-MM-DD` into the cron line, so the scheduled
         /// backup computes the right wNdM label without it being in config.env
