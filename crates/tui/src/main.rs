@@ -283,9 +283,9 @@ async fn fetch_metrics(
 }
 
 fn status_line(s: &FleetSummary) -> String {
+    // Pod count lives in the top summary bar — keep the footer to liveness only.
     format!(
-        "{} pods · {} reporting{}",
-        s.pods,
+        "{} reporting{}",
         s.reporting,
         if s.unreachable > 0 {
             format!(" · {} unreachable", s.unreachable)
@@ -1232,15 +1232,6 @@ fn render_input(f: &mut Frame, shared: &Shared, action: Action, scope: &InputSco
 }
 
 fn summary_line(s: &FleetSummary) -> Paragraph<'static> {
-    let mem = if s.mem_total_mb > 0 {
-        format!(
-            "{:.0}/{:.0}G",
-            s.mem_used_mb as f64 / 1024.0,
-            s.mem_total_mb as f64 / 1024.0
-        )
-    } else {
-        "-".into()
-    };
     let util = s.mean_util.map(|u| format!("{u}%")).unwrap_or_else(|| "-".into());
     let unreachable = if s.unreachable > 0 {
         format!("  ·  {} unreachable", s.unreachable)
@@ -1248,11 +1239,10 @@ fn summary_line(s: &FleetSummary) -> Paragraph<'static> {
         String::new()
     };
     Paragraph::new(format!(
-        " fleet: {} pods · {} GPUs · mean util {} · mem {} · ${:.2}/hr (${:.0}/day){}",
+        " fleet: {} pods · {} GPUs · mean util {} · ${:.2}/hr (${:.0}/day){}",
         s.pods,
         s.total_gpus,
         util,
-        mem,
         s.total_cost,
         s.total_cost * 24.0,
         unreachable
