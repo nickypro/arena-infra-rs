@@ -84,6 +84,16 @@ enum Cmd {
     /// arena-managed lines).
     #[command(subcommand, infer_subcommands = true)]
     Cron(CronCmd),
+    /// Print the participant-facing `~/.ssh/config` for the fleet (read-only). Direct
+    /// pod endpoints by default, or stable proxy ports with --proxy.
+    SshConfig {
+        /// Use the proxy layout (stable `SSH_PROXY_*` ports) instead of direct pod IPs.
+        #[arg(long)]
+        proxy: bool,
+        /// Also write the rendered config to this local path (else just prints it).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -177,10 +187,13 @@ enum PodCmd {
         #[arg(long)]
         no_probe: bool,
     },
-    /// Create N pods on the next free machine names. Requires -n/--count. GPU
-    /// type/count and cloud default to config but can be overridden here.
-    /// Acts by default; --dry-run to preview.
+    /// Create pods. Either name them explicitly (`create apple bloom`), top up to a
+    /// total (`-n`), or add a count (`-a`). GPU type/count, cloud, and image default to
+    /// config but can be overridden here. Acts by default; --dry-run to preview.
     Create {
+        /// Explicit machine names to create (e.g. `apple bloom`). Bare names get the
+        /// configured prefix. Mutually exclusive with -n/-a.
+        names: Vec<String>,
         /// Target TOTAL number of pods — tops up to this many (mutually exclusive with -a).
         #[arg(short = 'n', long)]
         count: Option<usize>,
@@ -202,6 +215,9 @@ enum PodCmd {
         /// Persistent volume size in GB (overrides config VOLUME_GB; default 0).
         #[arg(long)]
         volume: Option<u32>,
+        /// Docker image (overrides config IMAGE/RUNPOD_DOCKER_IMAGE).
+        #[arg(long)]
+        image: Option<String>,
         /// Preview only: print what would happen, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
@@ -241,6 +257,9 @@ enum PodCmd {
         /// Persistent volume size in GB (overrides config VOLUME_GB; default 0).
         #[arg(long)]
         volume: Option<u32>,
+        /// Docker image (overrides config IMAGE/RUNPOD_DOCKER_IMAGE).
+        #[arg(long)]
+        image: Option<String>,
         /// Preview only: print what would happen, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
@@ -268,10 +287,42 @@ enum PodCmd {
         #[arg(long, default_value_t = 12)]
         interval: u64,
     },
-    /// Stop a pod by name or id. Acts by default; --dry-run to preview.
+    /// Stop a pod by name or id, or many with --all (optionally filtered by
+    /// --include/--exclude). Acts by default; --dry-run to preview.
     Stop {
-        /// Machine name (e.g. arena8-apple) or raw provider id.
-        target: String,
+        /// Machine name (e.g. arena8-apple) or raw provider id. Omit with --all.
+        target: Option<String>,
+        /// Stop every running pod (subject to --include/--exclude).
+        #[arg(long)]
+        all: bool,
+        /// With --all: only stop these names/ids (repeatable).
+        #[arg(long)]
+        include: Vec<String>,
+        /// With --all: never stop these names/ids (repeatable).
+        #[arg(long)]
+        exclude: Vec<String>,
+        /// Preview only: print what would happen, change nothing.
+        #[arg(long, visible_aliases = ["dryrun", "dry"])]
+        dry_run: bool,
+    },
+    /// Stop pods, wait for them to fully exit, then terminate (delete) them — the
+    /// legacy `kill_pods` flow. One target or --all (with --include/--exclude).
+    /// Acts by default; --dry-run to preview.
+    Kill {
+        /// Machine name or raw provider id. Omit with --all.
+        target: Option<String>,
+        /// Kill every running pod (subject to --include/--exclude).
+        #[arg(long)]
+        all: bool,
+        /// With --all: only kill these names/ids (repeatable).
+        #[arg(long)]
+        include: Vec<String>,
+        /// With --all: never kill these names/ids (repeatable).
+        #[arg(long)]
+        exclude: Vec<String>,
+        /// Max seconds to wait for pods to reach EXITED before terminating those that did.
+        #[arg(long, default_value_t = 300)]
+        timeout: u64,
         /// Preview only: print what would happen, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
@@ -350,6 +401,41 @@ enum PodCmd {
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
+    /// Rsync each pod's home directory to a local backup folder
+    /// (`<dir>/<label>/<pod>/`) — the file backup, complementing the git `backup`.
+    /// Acts by default; --dry-run to preview.
+    Pull {
+        /// Backup label, e.g. `w1d3`. Defaults to the computed `wNdM` iteration.
+        label: Option<String>,
+        /// Local base directory for backups.
+        #[arg(long, default_value = "./backup")]
+        dir: String,
+        /// Skip any single file larger than this (rsync --max-size), e.g. `50M`.
+        #[arg(long, default_value = "50M")]
+        max_size: String,
+        /// Remote path to pull, relative to the home dir (default: the whole home dir).
+        #[arg(long)]
+        remote_path: Option<String>,
+        /// Preview only: print the rsync commands, copy nothing.
+        #[arg(long, visible_aliases = ["dryrun", "dry"])]
+        dry_run: bool,
+    },
+    /// Distribute API keys to every pod's shell (`~/.bashrc`/`~/.zshrc`): per-host keys
+    /// from `<keys-dir>/<provider>_api_keys.csv` (openai/anthropic/openrouter), plus a
+    /// broadcast Hugging Face token (from --hf-token or config HF_TOKEN) for gated repos
+    /// like Llama 3. Idempotent. Acts by default; --dry-run to preview.
+    CopyKeys {
+        /// Directory holding the per-host `<provider>_api_keys.csv` files.
+        #[arg(long, default_value = "./keys")]
+        keys_dir: String,
+        /// Hugging Face token to set on every pod (HF_TOKEN + HUGGING_FACE_HUB_TOKEN).
+        /// Overrides config HF_TOKEN. Use to enable pulls from gated repos.
+        #[arg(long)]
+        hf_token: Option<String>,
+        /// Preview only: print what would be set per pod (key values redacted).
+        #[arg(long, visible_aliases = ["dryrun", "dry"])]
+        dry_run: bool,
+    },
 }
 
 
@@ -419,6 +505,48 @@ async fn plan_names(provider: &dyn Provider, cfg: &Config, want: Want) -> Result
     Ok(names)
 }
 
+/// Resolve operator-supplied machine names for `create <names…>`: prefix bare names
+/// with `MACHINE_NAME_PREFIX`, warn about any not in the configured `MACHINE_NAME_LIST`
+/// (allowed, but usually a typo), and drop any that already exist (so re-running is
+/// safe). Propagates a list failure rather than risking a duplicate create.
+async fn resolve_explicit_names(
+    provider: &dyn Provider,
+    cfg: &Config,
+    raw: &[String],
+) -> Result<Vec<String>> {
+    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
+    let policy = arena_core::retry::RetryPolicy::default();
+    let existing = arena_core::retry::retrying(&policy, || provider.list_pods())
+        .await
+        .context("listing existing pods (refusing to allocate names — a failed list could create duplicates)")?;
+    let taken: std::collections::HashSet<&str> = existing.iter().map(|p| p.name.as_str()).collect();
+
+    let mut out: Vec<String> = Vec::new();
+    for n in raw {
+        let n = n.trim();
+        if n.is_empty() {
+            continue;
+        }
+        let full = if n.starts_with(&format!("{prefix}-")) {
+            n.to_string()
+        } else {
+            format!("{prefix}-{n}")
+        };
+        let bare = full.strip_prefix(&format!("{prefix}-")).unwrap_or(&full);
+        if !cfg.machine_names.iter().any(|m| m == bare) {
+            eprintln!("warning: '{bare}' is not in MACHINE_NAME_LIST (creating anyway)");
+        }
+        if taken.contains(full.as_str()) {
+            eprintln!("skip {full} — already exists");
+            continue;
+        }
+        if !out.contains(&full) {
+            out.push(full);
+        }
+    }
+    Ok(out)
+}
+
 /// Seconds to wait between capacity retries when `--keep-trying` is set.
 const CAPACITY_RETRY_SECS: u64 = 30;
 
@@ -441,6 +569,7 @@ struct SpecOverrides {
     cloud: Option<String>,
     disk: Option<u32>,
     volume: Option<u32>,
+    image: Option<String>,
 }
 
 /// The base spec from config, with any command-line overrides applied.
@@ -460,6 +589,9 @@ fn spec_with_overrides(cfg: &Config, ov: &SpecOverrides) -> PodSpec {
     }
     if let Some(v) = ov.volume {
         spec.volume_gb = v;
+    }
+    if let Some(img) = &ov.image {
+        spec.image = img.clone();
     }
     spec
 }
@@ -616,6 +748,9 @@ async fn main() -> Result<()> {
         Cmd::Cron(c) => handle_cron(c, &cli.config).await,
         Cmd::Pods(p) => handle_pods(p, provider.unwrap().as_ref(), &cfg, cli.yes).await,
         Cmd::Proxy(p) => handle_proxy(p, provider.unwrap().as_ref(), &cfg, cli.yes).await,
+        Cmd::SshConfig { proxy, out } => {
+            handle_ssh_config(provider.unwrap().as_ref(), &cfg, proxy, out.as_deref()).await
+        }
     }
 }
 
@@ -1043,6 +1178,9 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
 
     println!("\nDashboard (optional):");
     cfg_row(cfg, &mut missing, "PROGRESS_CMD", false, false);
+
+    println!("\nEvals / model access (optional, `pods copy-keys`):");
+    cfg_row(cfg, &mut missing, "HF_TOKEN", false, true); // broadcast for gated repos (Llama 3 …)
 
     // Read-only readiness: are the local files this user needs actually there/readable?
     // Answers "is it set up yet?" without touching any API.
@@ -1526,12 +1664,20 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             }
         }
 
-        PodCmd::Create { count, add, gpu, gpus, cloud, disk, volume, dry_run, keep_trying, retry_mins, retry_secs } => {
-            let ov = SpecOverrides { gpu, gpus, cloud, disk, volume };
-            let want = resolve_want(count, add)?;
-            let names = plan_names(provider, cfg, want).await?;
+        PodCmd::Create { names, count, add, gpu, gpus, cloud, disk, volume, image, dry_run, keep_trying, retry_mins, retry_secs } => {
+            let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image };
+            // Explicit names take a different path than the -n/-a top-up: create exactly
+            // those (minus any that already exist), no name allocation.
+            let names = if !names.is_empty() {
+                if count.is_some() || add.is_some() {
+                    anyhow::bail!("pass explicit names OR -n/-a, not both");
+                }
+                resolve_explicit_names(provider, cfg, &names).await?
+            } else {
+                plan_names(provider, cfg, resolve_want(count, add)?).await?
+            };
             if names.is_empty() {
-                eprintln!("nothing to create (target already met or no free names)");
+                eprintln!("nothing to create (target already met or no new names)");
                 return Ok(());
             }
             let spec = spec_with_overrides(cfg, &ov);
@@ -1551,11 +1697,17 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                 println!("aborted.");
                 return Ok(());
             }
-            create_with_retry(provider, cfg, want, &ov, keep_trying, retry_mins, retry_secs).await?;
+            // Explicit names: create them directly. -n/-a: use the top-up retry loop.
+            if count.is_none() && add.is_none() {
+                create_pods(provider, cfg, &names, keep_trying, &ov).await?;
+            } else {
+                let want = resolve_want(count, add)?;
+                create_with_retry(provider, cfg, want, &ov, keep_trying, retry_mins, retry_secs).await?;
+            }
         }
 
-        PodCmd::Up { count, add, gpu, gpus, cloud, disk, volume, dry_run, no_wait, keep_trying, retry_mins, retry_secs, setup, timeout, interval } => {
-            let ov = SpecOverrides { gpu, gpus, cloud, disk, volume };
+        PodCmd::Up { count, add, gpu, gpus, cloud, disk, volume, image, dry_run, no_wait, keep_trying, retry_mins, retry_secs, setup, timeout, interval } => {
+            let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image };
             let want = resolve_want(count, add)?;
             let names = plan_names(provider, cfg, want).await?;
             if names.is_empty() {
@@ -1686,18 +1838,67 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             }
         }
 
-        PodCmd::Stop { target, dry_run } => {
-            let (id, label) = resolve_target(provider, &target).await?;
-            if dry_run {
-                println!("[dry-run] would stop {label}");
-            } else {
-                if !confirm(yes, &format!("Will stop {label}."))? {
-                    println!("aborted.");
-                    return Ok(());
+        PodCmd::Stop { target, all, include, exclude, dry_run } => {
+            match (all, target) {
+                (false, Some(target)) => {
+                    let (id, label) = resolve_target(provider, &target).await?;
+                    if dry_run {
+                        println!("[dry-run] would stop {label}");
+                    } else {
+                        if !confirm(yes, &format!("Will stop {label}."))? {
+                            println!("aborted.");
+                            return Ok(());
+                        }
+                        provider.stop_pod(&id).await?;
+                        println!("[stopped] {label}");
+                    }
                 }
-                provider.stop_pod(&id).await?;
-                println!("[stopped] {label}");
+                (true, _) => {
+                    let pods = select_pods(provider, &include, &exclude, Some("RUNNING")).await?;
+                    if pods.is_empty() {
+                        println!("(no running pods to stop)");
+                        return Ok(());
+                    }
+                    if dry_run {
+                        for p in &pods {
+                            println!("[dry-run] would stop {} (id={})", p.name, p.id);
+                        }
+                        println!("\nDry-run only — would stop {} pod(s).", pods.len());
+                        return Ok(());
+                    }
+                    if !confirm(yes, &format!("Will stop {} running pod(s).", pods.len()))? {
+                        println!("aborted.");
+                        return Ok(());
+                    }
+                    let (mut ok, total) = (0, pods.len());
+                    for p in &pods {
+                        match provider.stop_pod(&p.id).await {
+                            Ok(()) => {
+                                println!("[stopped] {}", p.name);
+                                ok += 1;
+                            }
+                            Err(e) => eprintln!("[FAILED] {}: {e}", p.name),
+                        }
+                    }
+                    println!("\nstopped {ok}/{total}");
+                    if ok < total {
+                        anyhow::bail!("{} pod(s) failed to stop", total - ok);
+                    }
+                }
+                (false, None) => anyhow::bail!("specify a pod (name or id) to stop, or pass --all"),
             }
+        }
+
+        PodCmd::Kill { target, all, include, exclude, timeout, dry_run } => {
+            handle_kill(provider, target, all, &include, &exclude, timeout, dry_run, yes).await?;
+        }
+
+        PodCmd::Pull { label, dir, max_size, remote_path, dry_run } => {
+            handle_pull(provider, cfg, label, &dir, &max_size, remote_path, dry_run, yes).await?;
+        }
+
+        PodCmd::CopyKeys { keys_dir, hf_token, dry_run } => {
+            handle_copy_keys(provider, cfg, &keys_dir, hf_token, dry_run, yes).await?;
         }
 
         PodCmd::Restart { target, dry_run } => {
@@ -1967,6 +2168,385 @@ async fn resolve_target(provider: &dyn Provider, target: &str) -> Result<(String
         Some(p) => Ok((p.id.clone(), format!("{} (id={})", p.name, p.id))),
         None => anyhow::bail!("no pod with name or id '{target}' (run `arena pods list`)"),
     }
+}
+
+/// List pods and apply the legacy filter semantics: drop `exclude` first, then keep only
+/// `include` (if that list is non-empty), then optionally keep only pods whose status
+/// contains `status_contains` (case-insensitive, e.g. "RUNNING"). Names *or* ids match.
+async fn select_pods(
+    provider: &dyn Provider,
+    include: &[String],
+    exclude: &[String],
+    status_contains: Option<&str>,
+) -> Result<Vec<arena_core::Pod>> {
+    let policy = arena_core::retry::RetryPolicy::default();
+    let mut pods = arena_core::retry::retrying(&policy, || provider.list_pods())
+        .await
+        .context("listing pods")?;
+    pods.sort_by(|a, b| a.name.cmp(&b.name));
+    pods.retain(|p| !exclude.iter().any(|x| x == &p.name || x == &p.id));
+    if !include.is_empty() {
+        pods.retain(|p| include.iter().any(|x| x == &p.name || x == &p.id));
+    }
+    if let Some(s) = status_contains {
+        let s = s.to_uppercase();
+        pods.retain(|p| p.status.to_uppercase().contains(&s));
+    }
+    Ok(pods)
+}
+
+/// `pods kill`: stop the targeted pods, poll until they reach EXITED (up to `timeout`),
+/// then terminate those that did. Mirrors legacy `kill_pods.py` (stop → wait → delete).
+#[allow(clippy::too_many_arguments)]
+async fn handle_kill(
+    provider: &dyn Provider,
+    target: Option<String>,
+    all: bool,
+    include: &[String],
+    exclude: &[String],
+    timeout: u64,
+    dry_run: bool,
+    yes: bool,
+) -> Result<()> {
+    let pods = match (all, target) {
+        (true, _) => select_pods(provider, include, exclude, Some("RUNNING")).await?,
+        (false, Some(t)) => {
+            let policy = arena_core::retry::RetryPolicy::default();
+            let all_pods = arena_core::retry::retrying(&policy, || provider.list_pods()).await?;
+            match all_pods.into_iter().find(|p| p.name == t || p.id == t) {
+                Some(p) => vec![p],
+                None => anyhow::bail!("no pod with name or id '{t}' (run `arena pods list`)"),
+            }
+        }
+        (false, None) => anyhow::bail!("specify a pod (name or id) to kill, or pass --all"),
+    };
+    if pods.is_empty() {
+        println!("(no running pods to kill)");
+        return Ok(());
+    }
+
+    if dry_run {
+        for p in &pods {
+            println!("[dry-run] would stop+terminate {} (id={})", p.name, p.id);
+        }
+        println!("\nDry-run only — would kill {} pod(s) (stop, wait ≤{timeout}s, delete).", pods.len());
+        return Ok(());
+    }
+    if !confirm(yes, &format!("Will STOP then TERMINATE {} pod(s) — irreversible.", pods.len()))? {
+        println!("aborted.");
+        return Ok(());
+    }
+
+    // Stop them.
+    for p in &pods {
+        match provider.stop_pod(&p.id).await {
+            Ok(()) => println!("[stopping] {}", p.name),
+            Err(e) => eprintln!("[FAILED to stop] {}: {e}", p.name),
+        }
+    }
+
+    // Wait for EXITED (poll the whole fleet; Ctrl+C stops the wait early).
+    let target_ids: std::collections::HashSet<String> = pods.iter().map(|p| p.id.clone()).collect();
+    let policy = arena_core::retry::RetryPolicy::default();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+    println!("\nWaiting up to {timeout}s for pods to exit (Ctrl+C to stop)…");
+    let exited: std::collections::HashSet<String> = loop {
+        let cur = arena_core::retry::retrying(&policy, || provider.list_pods())
+            .await
+            .unwrap_or_default();
+        let exited: std::collections::HashSet<String> = cur
+            .iter()
+            .filter(|p| target_ids.contains(&p.id) && p.status.to_uppercase().contains("EXIT"))
+            .map(|p| p.id.clone())
+            .collect();
+        println!("  {}/{} exited", exited.len(), target_ids.len());
+        if exited.len() == target_ids.len() || std::time::Instant::now() >= deadline {
+            break exited;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("interrupted — terminating those that have exited");
+                break exited;
+            }
+        }
+    };
+
+    // Terminate the ones that exited.
+    let (mut ok, mut failed) = (0, 0);
+    for p in &pods {
+        if !exited.contains(&p.id) {
+            eprintln!("[skip] {} did not reach EXITED in time — not deleting", p.name);
+            continue;
+        }
+        match provider.terminate_pod(&p.id).await {
+            Ok(()) => {
+                println!("[terminated] {}", p.name);
+                ok += 1;
+            }
+            Err(e) => {
+                eprintln!("[FAILED] {}: {e}", p.name);
+                failed += 1;
+            }
+        }
+    }
+    println!("\nkilled {ok}/{} ({} not exited in time)", pods.len(), pods.len() - ok - failed);
+    if failed > 0 {
+        anyhow::bail!("{failed} pod(s) failed to terminate");
+    }
+    Ok(())
+}
+
+/// `pods pull`: rsync each pod's home directory to `<dir>/<label>/<pod-name>/`. The file
+/// backup (legacy `backup.sh`), complementing the git autocommit `backup`.
+#[allow(clippy::too_many_arguments)]
+async fn handle_pull(
+    provider: &dyn Provider,
+    cfg: &Config,
+    label: Option<String>,
+    dir: &str,
+    max_size: &str,
+    remote_path: Option<String>,
+    dry_run: bool,
+    yes: bool,
+) -> Result<()> {
+    use arena_core::pull::{self, PullConfig};
+    use arena_core::ssh::SshTarget;
+
+    // Label: explicit, else the computed wNdM iteration.
+    let label = match label {
+        Some(l) => l,
+        None => {
+            let (w, d) = resolve_week_day(cfg, None, None)?;
+            format!("w{w}d{d}")
+        }
+    };
+    let pc = PullConfig {
+        max_size: max_size.to_string(),
+        remote_path: remote_path.unwrap_or_default(),
+        ..PullConfig::default()
+    };
+
+    let pods = provider.list_pods().await.context("listing pods for pull")?;
+    let mut targets: Vec<(String, SshTarget)> = Vec::new();
+    for pod in &pods {
+        match SshTarget::from_pod(pod, cfg) {
+            Ok(t) => targets.push((pod.name.clone(), t)),
+            Err(_) => eprintln!("skip {} — no SSH endpoint yet", pod.name),
+        }
+    }
+    if targets.is_empty() {
+        println!("(no pods with an SSH endpoint to pull)");
+        return Ok(());
+    }
+
+    if dry_run {
+        println!("Dry-run — would rsync {} pod(s) into {dir}/{label}/:\n", targets.len());
+        for (name, t) in &targets {
+            let dest = pull::local_dest(dir, &label, name);
+            println!("# {name}");
+            println!("{}\n", pull::display_rsync(t, &pc, &dest));
+        }
+        println!("Preview only — run without --dry-run to copy.");
+        return Ok(());
+    }
+    if !confirm(yes, &format!("Will rsync {} pod home(s) into {dir}/{label}/.", targets.len()))? {
+        println!("aborted.");
+        return Ok(());
+    }
+
+    let total = targets.len();
+    println!("Pulling {total} pod(s) into {dir}/{label}/…");
+    let mut set = tokio::task::JoinSet::new();
+    for (name, t) in targets {
+        let dest = pull::local_dest(dir, &label, &name);
+        // rsync needs the destination directory to exist.
+        if let Err(e) = std::fs::create_dir_all(&dest) {
+            eprintln!("[FAILED] {name}: creating {dest}: {e}");
+            continue;
+        }
+        let args = pull::rsync_args(&t, &pc, &dest);
+        set.spawn(async move {
+            let out = tokio::process::Command::new("rsync")
+                .args(&args)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .await;
+            (name, out)
+        });
+    }
+    let (mut ok, mut failed, mut done) = (0, 0, 0);
+    while let Some(joined) = set.join_next().await {
+        done += 1;
+        let Ok((name, out)) = joined else { continue };
+        match out {
+            Ok(o) if o.status.success() => {
+                println!("[{done}/{total}] ✓ {name}");
+                ok += 1;
+            }
+            Ok(o) => {
+                println!("[{done}/{total}] ✗ {name}: {}", String::from_utf8_lossy(&o.stderr).trim());
+                failed += 1;
+            }
+            Err(e) => {
+                println!("[{done}/{total}] ✗ {name}: spawning rsync: {e}");
+                failed += 1;
+            }
+        }
+    }
+    println!("\nDone: {ok} pulled, {failed} failed.");
+    if failed > 0 {
+        anyhow::bail!("{failed} pod(s) failed to pull");
+    }
+    Ok(())
+}
+
+/// `pods copy-keys`: distribute API keys to each pod's shell. Per-host keys come from
+/// `<keys_dir>/<provider>_api_keys.csv`; a Hugging Face token (from `--hf-token` or
+/// config `HF_TOKEN`) is broadcast to every pod (for gated repos like Llama 3).
+async fn handle_copy_keys(
+    provider: &dyn Provider,
+    cfg: &Config,
+    keys_dir: &str,
+    hf_token: Option<String>,
+    dry_run: bool,
+    yes: bool,
+) -> Result<()> {
+    use arena_core::apikeys;
+    use arena_core::ssh::{self, SshTarget};
+    use std::collections::HashMap;
+
+    // Per-host vars from the CSVs: host -> [(ENV_NAME, value), …].
+    let mut per_host: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    let mut sources: Vec<String> = Vec::new();
+    for (base, display, env_names) in apikeys::PROVIDERS {
+        let path = format!("{}/{base}_api_keys.csv", keys_dir.trim_end_matches('/'));
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let rows = apikeys::parse_csv(&text);
+        if rows.is_empty() {
+            continue;
+        }
+        sources.push(format!("{display} ({} host{})", rows.len(), if rows.len() == 1 { "" } else { "s" }));
+        for (host, key) in rows {
+            let entry = per_host.entry(host).or_default();
+            for env in *env_names {
+                entry.push((env.to_string(), key.clone()));
+            }
+        }
+    }
+
+    // Broadcast Hugging Face token (CLI flag wins over config).
+    let hf = hf_token.or_else(|| cfg.get("HF_TOKEN").filter(|s| !s.is_empty()).map(String::from));
+    if hf.is_some() {
+        sources.push("Hugging Face (broadcast to all)".to_string());
+    }
+
+    if per_host.is_empty() && hf.is_none() {
+        anyhow::bail!(
+            "no keys to copy: put `<provider>_api_keys.csv` in {keys_dir}/ \
+             (openai/anthropic/openrouter) and/or pass --hf-token (or set HF_TOKEN)"
+        );
+    }
+    println!("Key sources: {}\n", sources.join(", "));
+
+    // Build the per-pod var set (broadcast HF merged into every reachable pod).
+    let pods = provider.list_pods().await.context("listing pods for copy-keys")?;
+    let hf_vars = hf.as_deref().map(apikeys::hf_env_vars).unwrap_or_default();
+    let mut jobs: Vec<(String, SshTarget, Vec<(String, String)>)> = Vec::new();
+    for pod in &pods {
+        let mut vars = hf_vars.clone();
+        if let Some(h) = per_host.get(&pod.name) {
+            vars.extend(h.iter().cloned());
+        }
+        if vars.is_empty() {
+            continue; // nothing for this pod
+        }
+        match SshTarget::from_pod(pod, cfg) {
+            Ok(t) => jobs.push((pod.name.clone(), t, vars)),
+            Err(_) => eprintln!("skip {} — no SSH endpoint yet", pod.name),
+        }
+    }
+    if jobs.is_empty() {
+        println!("(no reachable pods matched any keys)");
+        return Ok(());
+    }
+
+    if dry_run {
+        println!("Dry-run — would set on {} pod(s) (values redacted):\n", jobs.len());
+        for (name, _, vars) in &jobs {
+            let names: Vec<&str> = vars.iter().map(|(k, _)| k.as_str()).collect();
+            println!("  {name:<22} {}", names.join(", "));
+        }
+        println!("\nPreview only — run without --dry-run to write to ~/.bashrc & ~/.zshrc.");
+        return Ok(());
+    }
+    if !confirm(yes, &format!("Will export API keys into ~/.bashrc & ~/.zshrc on {} pod(s).", jobs.len()))? {
+        println!("aborted.");
+        return Ok(());
+    }
+
+    let total = jobs.len();
+    let mut set = tokio::task::JoinSet::new();
+    for (name, t, vars) in jobs {
+        let cmd = apikeys::remote_export_command(&vars);
+        set.spawn(async move { (name, ssh::run(&t, &cmd).await) });
+    }
+    let (mut ok, mut failed, mut done) = (0, 0, 0);
+    while let Some(joined) = set.join_next().await {
+        done += 1;
+        let Ok((name, res)) = joined else { continue };
+        match res {
+            Ok(o) if o.success => {
+                println!("[{done}/{total}] ✓ {name}");
+                ok += 1;
+            }
+            Ok(o) => {
+                println!("[{done}/{total}] ✗ {name}: {}", o.stderr.trim());
+                failed += 1;
+            }
+            Err(e) => {
+                println!("[{done}/{total}] ✗ {name}: {e}");
+                failed += 1;
+            }
+        }
+    }
+    println!("\nDone: {ok} updated, {failed} failed.");
+    if failed > 0 {
+        anyhow::bail!("{failed} pod(s) failed");
+    }
+    Ok(())
+}
+
+/// `arena ssh-config`: print (and optionally write) the participant-facing
+/// `~/.ssh/config` — direct pod endpoints, or stable proxy ports with `--proxy`.
+async fn handle_ssh_config(
+    provider: &dyn Provider,
+    cfg: &Config,
+    proxy: bool,
+    out: Option<&std::path::Path>,
+) -> Result<()> {
+    use arena_core::sshconfig;
+
+    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
+    let user = cfg.get("SSH_USER").unwrap_or("root");
+    // The identity file as the *participant* will reference it — keep the configured
+    // value verbatim (do not resolve to this operator's local copy).
+    let identity = cfg.get("SHARED_SSH_KEY_PATH").unwrap_or("~/.ssh/shared_infra_key");
+
+    let rendered = if proxy {
+        let px = arena_core::proxy::ProxyConfig::from_config(cfg)?;
+        sshconfig::render_proxy(prefix, user, identity, &px.proxy_host, px.starting_port, &cfg.machine_names)
+    } else {
+        let pods = provider.list_pods().await.context("listing pods for ssh-config")?;
+        sshconfig::render_manual(prefix, user, identity, &pods)
+    };
+
+    print!("{rendered}");
+    if let Some(path) = out {
+        std::fs::write(path, &rendered).with_context(|| format!("writing {}", path.display()))?;
+        eprintln!("\n(wrote {})", path.display());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
