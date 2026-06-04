@@ -85,8 +85,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     (default every 15 min; `--start-date` bakes `ARENA_START_DATE` into the line; `--pull`
     also runs the rsync file backup each tick after the git backup); edits only
     arena-managed lines, leaving other entries intact.
-  - `pods backup` — commit + push each pod's ARENA tree over SSH **on whatever branch
-    the pod is currently on** (never switches/creates a branch, so bespoke branches are
+  - `pods backup [target]` — commit + push a pod's ARENA tree over SSH **on whatever
+    branch the pod is currently on** (one pod by name/id, or all pods if omitted) (never switches/creates a branch, so bespoke branches are
     respected), and **skips `main`/`master`** (won't push the protected branch).
     `--message` overrides the commit message. Confirms first (`--dry-run` previews); clean
     trees report `NO_CHANGES` rather than failing. To stage onto a dated autocommit

@@ -386,8 +386,11 @@ enum PodCmd {
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// Commit + push each pod's current branch over SSH (skips main/master).
+    /// Commit + push a pod's current branch over SSH (skips main/master). One pod by
+    /// name/id, or all pods if omitted.
     Backup {
+        /// Machine name or id to back up. Omit to back up every reachable pod.
+        target: Option<String>,
         /// Preview only: print what would happen, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
@@ -1462,6 +1465,7 @@ async fn handle_backup(
     cfg: &Config,
     apply: bool,
     message: Option<String>,
+    target_filter: Option<&str>,
 ) -> Result<()> {
     use arena_core::backup::{self, parse_backup_output};
     use arena_core::ssh::{self, SshTarget};
@@ -1475,9 +1479,17 @@ async fn handle_backup(
     let msg_for = |name: &str| message.clone().unwrap_or_else(|| format!("arena backup {name}"));
 
     let pods = provider.list_pods().await.context("listing pods for backup")?;
+    // One pod (by name/id) if a target was given, else the whole fleet.
+    let selected: Vec<&arena_core::Pod> = match target_filter {
+        Some(t) => match pods.iter().find(|p| p.name == t || p.id == t) {
+            Some(p) => vec![p],
+            None => anyhow::bail!("no pod with name or id '{t}' (run `arena pods list`)"),
+        },
+        None => pods.iter().collect(),
+    };
     // Back up only pods that actually have an SSH endpoint; report the rest.
     let mut targets = Vec::new();
-    for pod in &pods {
+    for pod in selected {
         match SshTarget::from_pod(pod, cfg) {
             Ok(t) => targets.push((pod.name.clone(), t)),
             Err(_) => eprintln!("skip {} — no SSH endpoint yet", pod.name),
@@ -2220,12 +2232,16 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             }
         },
 
-        PodCmd::Backup { dry_run, message } => {
-            if !dry_run && !confirm(yes, "Will commit + push each pod's ARENA tree on its current branch (main/master skipped).")? {
+        PodCmd::Backup { target, dry_run, message } => {
+            let scope = match &target {
+                Some(t) => format!("{t}'s ARENA tree"),
+                None => "each pod's ARENA tree".to_string(),
+            };
+            if !dry_run && !confirm(yes, &format!("Will commit + push {scope} on its current branch (main/master skipped)."))? {
                 println!("aborted.");
                 return Ok(());
             }
-            handle_backup(provider, cfg, !dry_run, message).await?;
+            handle_backup(provider, cfg, !dry_run, message, target.as_deref()).await?;
         }
         PodCmd::Setup { dry_run, force } => {
             if !dry_run && !confirm(yes, "Will provision each pod over SSH (deploy key, ~/.name, repo).")? {
