@@ -98,6 +98,11 @@ pub struct PodMetrics {
     /// Root-filesystem usage (used, total) in MB, if reported.
     pub disk_used_mb: Option<u32>,
     pub disk_total_mb: Option<u32>,
+    /// Host CPU utilization % over a short window (`/proc/stat`), if reported.
+    pub cpu_pct: Option<u32>,
+    /// Host RAM (used, total) in MB (`/proc/meminfo`), if reported.
+    pub host_mem_used_mb: Option<u32>,
+    pub host_mem_total_mb: Option<u32>,
     /// Unix timestamp (committer date) of the ARENA checkout's last commit, if reported.
     /// In this workflow a commit *is* a backup (`pods backup` commits + pushes), so this
     /// is "when the pod was last backed up".
@@ -141,6 +146,14 @@ impl PodMetrics {
             Some((used, total))
         } else {
             None
+        }
+    }
+
+    /// Host RAM (used, total) in MB, if both reported.
+    pub fn host_mem_summary(&self) -> Option<(u32, u32)> {
+        match (self.host_mem_used_mb, self.host_mem_total_mb) {
+            (Some(u), Some(t)) => Some((u, t)),
+            _ => None,
         }
     }
 
@@ -220,6 +233,14 @@ fn remote_command(opts: &ProbeOpts) -> String {
     }
     // Root-filesystem usage in 1K-blocks: "used total" (portable df -k + awk).
     s.push_str("echo \"disk=$(df -k / 2>/dev/null | awk 'NR>1{print $3\" \"$2; exit}')\"; ");
+    // Host CPU% over a short /proc/stat window, and host RAM (used/total KB) from
+    // /proc/meminfo. Cheap, and independent of the GPU.
+    s.push_str(
+        r#"echo "cpu=$({ grep '^cpu ' /proc/stat; sleep 0.25; grep '^cpu ' /proc/stat; } 2>/dev/null | awk 'NR==1{i1=$5;t1=0;for(i=2;i<=8;i++)t1+=$i}NR==2{i2=$5;t2=0;for(i=2;i<=8;i++)t2+=$i;dt=t2-t1;di=i2-i1;if(dt>0)printf "%.0f",(1-di/dt)*100}')"; "#,
+    );
+    s.push_str(
+        r#"echo "hostmem=$(awk '/^MemTotal:/{t=$2}/^MemAvailable:/{a=$2}END{if(t>0)print t-a, t}' /proc/meminfo 2>/dev/null)"; "#,
+    );
     if let Some(pc) = opts.progress_cmd.as_deref().filter(|s| !s.is_empty()) {
         // Take the last line so a chatty command still yields one tidy value.
         s.push_str(&format!("echo \"progress=$({pc} 2>/dev/null | tail -n1)\"; "));
@@ -247,6 +268,14 @@ fn parse_probe(stdout: &str, m: &mut PodMetrics) {
                 if let (Some(u), Some(t)) = (it.next(), it.next()) {
                     m.disk_used_mb = Some((u / 1024) as u32);
                     m.disk_total_mb = Some((t / 1024) as u32);
+                }
+            }
+            "cpu" => m.cpu_pct = v.parse::<u32>().ok(),
+            "hostmem" => {
+                let mut it = v.split_whitespace().filter_map(|x| x.parse::<u64>().ok());
+                if let (Some(u), Some(t)) = (it.next(), it.next()) {
+                    m.host_mem_used_mb = Some((u / 1024) as u32);
+                    m.host_mem_total_mb = Some((t / 1024) as u32);
                 }
             }
             "committed" => m.last_commit = v.parse::<i64>().ok(),
@@ -375,10 +404,12 @@ mod tests {
     #[test]
     fn parses_combined_probe_output() {
         let out = format!(
-            "NVIDIA RTX A4000, 15, 1000, 16000, 45\n{SENTINEL}\nbranch=autocommit-arena8-w0d1-apple\norigin=git@github.com:styme3279/ARENA_3.0.git\ncommitted=1717412400\ndirty=3\nsync=0\t2\nname=1\napikey=1\nkey=0\ndisk=12582912 104857600\nprogress=epoch 3/10\n"
+            "NVIDIA RTX A4000, 15, 1000, 16000, 45\n{SENTINEL}\nbranch=autocommit-arena8-w0d1-apple\norigin=git@github.com:styme3279/ARENA_3.0.git\ncommitted=1717412400\ndirty=3\nsync=0\t2\nname=1\napikey=1\nkey=0\ndisk=12582912 104857600\ncpu=37\nhostmem=8388608 16777216\nprogress=epoch 3/10\n"
         );
         let mut m = PodMetrics::default();
         parse_probe(&out, &mut m);
+        assert_eq!(m.cpu_pct, Some(37));
+        assert_eq!(m.host_mem_summary(), Some((8192, 16384))); // 8/16 GiB
         assert_eq!(m.behind, Some(0));
         assert_eq!(m.ahead, Some(2)); // 2 commits unpushed
         assert_eq!(m.gpus.len(), 1);
@@ -428,6 +459,8 @@ mod tests {
         assert!(cmd.contains("remote.origin.url"));
         assert!(cmd.contains("git log -1 --format=%ct"));
         assert!(cmd.contains("git status --porcelain"));
+        assert!(cmd.contains("/proc/stat"));
+        assert!(cmd.contains("/proc/meminfo"));
         assert!(cmd.contains("'/root/ARENA_3.0'"));
         assert!(cmd.contains("echo name=1"));
         assert!(cmd.contains("OPENROUTER_API_KEY|ANTHROPIC_API_KEY|OPENAI_API_KEY"));

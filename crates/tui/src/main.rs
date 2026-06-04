@@ -1344,8 +1344,9 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
     // so the core data isn't crushed to one column each.
     let w = area.width as usize;
     let show_saved = w >= 96;
+    let show_host = w >= 134; // host CPU% + RAM (extra, only when there's room)
     let show_progress = w >= 110;
-    let show_spark = with_spark && w >= 138;
+    let show_spark = with_spark && w >= 156;
     // When cramped, names compress (arena8-apple→apple) and the GPU drops the "RTX "
     // noise. Names compact a bit earlier (so you see "jack", not a truncated
     // "arena8-ja"); GPU always carries count + VRAM ("2×A4000 16G"), truncated if tight.
@@ -1356,6 +1357,10 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
         vec!["", "P", "NAME", "STATUS", "SET", "GPU", "GPU%", "MEM", "TEMP", "DISK", "$/HR", "BRANCH"];
     if show_saved {
         header_cells.push("SAVED");
+    }
+    if show_host {
+        header_cells.push("CPU%");
+        header_cells.push("RAM");
     }
     if show_progress {
         header_cells.push("PROGRESS / ERROR");
@@ -1461,6 +1466,17 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                     Span::styled(rel_time_short(m), style),
                 ])));
             }
+            if show_host {
+                // Host CPU% (coloured by load) and host RAM used/total.
+                let cpu = m.and_then(|m| m.cpu_pct);
+                let cpu_str = cpu.map(|c| format!("{c}%")).unwrap_or_else(|| "-".into());
+                cells.push(Cell::from(cpu_str).style(util_style(cpu, err)));
+                let ram = match m.and_then(|m| m.host_mem_summary()) {
+                    Some((u, t)) => format!("{:.0}/{:.0}G", u as f64 / 1024.0, t as f64 / 1024.0),
+                    None => "-".into(),
+                };
+                cells.push(Cell::from(ram));
+            }
             if show_progress {
                 let (detail, detail_style) = detail_cell(m);
                 cells.push(Cell::from(detail).style(detail_style));
@@ -1502,6 +1518,10 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
     ];
     if show_saved {
         widths.push(Constraint::Length(6)); // SAVED (e.g. "3h", "↑2d")
+    }
+    if show_host {
+        widths.push(Constraint::Length(4)); // CPU%
+        widths.push(Constraint::Length(9)); // RAM (e.g. "46/504G")
     }
     if show_progress {
         widths.push(Constraint::Min(10)); // PROGRESS / ERROR (flexible)
