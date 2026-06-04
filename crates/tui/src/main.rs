@@ -1379,17 +1379,10 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                 .and_then(|m| m.gpu_summary())
                 .or_else(|| p.gpu_type.clone())
                 .unwrap_or_else(|| "-".into());
-            let branch_label = match m.and_then(|m| m.branch.clone()) {
-                Some(b) => short_branch(&b, &ui.prefix),
+            let branch = match m.and_then(|m| m.branch.clone()) {
+                Some(b) => truncate(&short_branch(&b, &ui.prefix), 6),
                 None => "-".into(),
             };
-            // Mark when the local branch diverges from its upstream (↑ unpushed — e.g. a
-            // blocked push, ↓ behind, ⇕ diverged), reserving a column for the glyph.
-            let (mark, mark_style) = sync_marker(m);
-            let branch_cell = Cell::from(Line::from(vec![
-                Span::styled(mark, mark_style),
-                Span::raw(truncate(&branch_label, if mark.is_empty() { 6 } else { 5 })),
-            ]));
             // RUNNING-but-unreachable reads as "init" (still coming up), in yellow.
             let status_label = display_status(&p.status, m.map(|m| m.error.is_none()));
             let status_cell = if status_label == "init" {
@@ -1415,17 +1408,23 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                 Cell::from(temp_str).style(temp_style(temp)),
                 Cell::from(disk),
                 Cell::from(cost),
-                branch_cell,
+                Cell::from(branch),
             ];
             if show_saved {
-                // Yellow when there's uncommitted work since the last backup, grey when
-                // unknown, default otherwise.
+                // Time style: yellow when there's uncommitted work since the last backup,
+                // grey when unknown, default otherwise.
                 let style = match m.and_then(|m| m.dirty_files) {
                     Some(n) if n > 0 => Style::default().fg(Color::Yellow),
                     None => Style::default().fg(Color::DarkGray),
                     _ => Style::default(),
                 };
-                cells.push(Cell::from(rel_time_short(m)).style(style));
+                // A sync glyph (↑ unpushed / ↓ behind / ⇕ diverged) sits right before the
+                // time, so a blocked/failed push is obvious next to "when it was saved".
+                let (sync, sync_style) = sync_marker(m);
+                cells.push(Cell::from(Line::from(vec![
+                    Span::styled(sync, sync_style),
+                    Span::styled(rel_time_short(m), style),
+                ])));
             }
             if show_progress {
                 let (detail, detail_style) = detail_cell(m);
@@ -1466,7 +1465,7 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
         Constraint::Length(6),  // BRANCH (e.g. "w1d2")
     ];
     if show_saved {
-        widths.push(Constraint::Length(5)); // SAVED (e.g. "3h", "2d")
+        widths.push(Constraint::Length(6)); // SAVED (e.g. "3h", "↑2d")
     }
     if show_progress {
         widths.push(Constraint::Min(10)); // PROGRESS / ERROR (flexible)
