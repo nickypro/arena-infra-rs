@@ -975,7 +975,8 @@ async fn run_set_branch(cfg: &Config, pod: &Pod, branch: &str) -> String {
     let repo_path = cfg.get("BACKUP_REPO_PATH").map(String::from).unwrap_or_else(|| {
         format!("/root/{}", cfg.get("ARENA_REPO_NAME").unwrap_or("ARENA_3.0"))
     });
-    let cmd = arena_core::backup::checkout_command(&repo_path, branch, cfg.get("GIT_SSH_KEY_REMOTE"));
+    // The TUI set-branch is gentle (ff-only); the destructive --hard reset is CLI-only.
+    let cmd = arena_core::backup::checkout_command(&repo_path, branch, cfg.get("GIT_SSH_KEY_REMOTE"), false);
     match ssh::run(&target, &cmd).await {
         Ok(out) if out.success => format!("✓ {} → {branch}", pod.name),
         Ok(out) => format!("✗ {} set-branch (exit {:?}): {}", pod.name, out.code, out.stderr.trim()),

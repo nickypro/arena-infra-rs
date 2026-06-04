@@ -401,9 +401,11 @@ enum PodCmd {
     },
     /// Quick health check on every pod: import torch and print its version (read-only).
     Test,
-    /// Gently switch a pod's ARENA checkout to a branch (fetch + checkout +
-    /// fast-forward pull, no hard reset). One pod (name/id) or --all. Acts by default;
-    /// --dry-run to preview.
+    /// Switch a pod's ARENA checkout to a branch. Gentle by default (fetch + checkout +
+    /// fast-forward pull — fails on a diverged/dirty tree rather than clobbering work).
+    /// With --hard it's DESTRUCTIVE: force the branch to match `origin/<branch>`,
+    /// discarding local commits/changes (e.g. `set-branch main --all --hard` to reset
+    /// the fleet to main). One pod (name/id) or --all. Acts by default; --dry-run previews.
     SetBranch {
         /// Branch to check out (e.g. main, or a feature branch).
         branch: String,
@@ -412,6 +414,10 @@ enum PodCmd {
         /// Apply to every pod with an SSH endpoint.
         #[arg(long)]
         all: bool,
+        /// DESTRUCTIVE: hard-reset the branch to `origin/<branch>`, discarding local
+        /// commits/changes (untracked files are left alone).
+        #[arg(long)]
+        hard: bool,
         /// Preview only: print what would happen, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
@@ -2148,8 +2154,8 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             }
             handle_setup(provider, cfg, !dry_run, force).await?;
         }
-        PodCmd::SetBranch { branch, target, all, dry_run } => {
-            handle_set_branch(provider, cfg, &branch, target.as_deref(), all, dry_run, yes).await?;
+        PodCmd::SetBranch { branch, target, all, hard, dry_run } => {
+            handle_set_branch(provider, cfg, &branch, target.as_deref(), all, hard, dry_run, yes).await?;
         }
         PodCmd::Run { command, dry_run } => {
             let cmd = command.join(" ");
@@ -2242,14 +2248,17 @@ async fn handle_run(
     Ok(())
 }
 
-/// Switch one pod (or, with `all`, every pod with an SSH endpoint) to `branch` via a
-/// gentle fetch+checkout+ff-pull over SSH. Dry-run prints the exact command per pod.
+/// Switch one pod (or, with `all`, every pod with an SSH endpoint) to `branch` over SSH.
+/// Gentle (fetch+checkout+ff-pull) by default; `hard` force-resets to `origin/<branch>`,
+/// discarding local commits/changes. Dry-run prints the exact command per pod.
+#[allow(clippy::too_many_arguments)]
 async fn handle_set_branch(
     provider: &dyn Provider,
     cfg: &Config,
     branch: &str,
     target: Option<&str>,
     all: bool,
+    hard: bool,
     dry_run: bool,
     yes: bool,
 ) -> Result<()> {
@@ -2259,7 +2268,7 @@ async fn handle_set_branch(
         format!("/root/{}", cfg.get("ARENA_REPO_NAME").unwrap_or("ARENA_3.0"))
     });
     let key = cfg.get("GIT_SSH_KEY_REMOTE");
-    let cmd = arena_core::backup::checkout_command(&repo_path, branch, key);
+    let cmd = arena_core::backup::checkout_command(&repo_path, branch, key, hard);
 
     // Which pods: --all (every reachable one) or a single resolved target.
     let pods = provider.list_pods().await.context("listing pods")?;
@@ -2291,7 +2300,12 @@ async fn handle_set_branch(
         println!("Dry-run only — nothing changed (preview).");
         return Ok(());
     }
-    if !confirm(yes, &format!("Will switch {} pod(s) to branch '{branch}' (gentle, no reset).", targets.len()))? {
+    let how = if hard {
+        format!("HARD-reset {} pod(s) to 'origin/{branch}' — DISCARDS local commits/changes", targets.len())
+    } else {
+        format!("switch {} pod(s) to branch '{branch}' (gentle, no reset)", targets.len())
+    };
+    if !confirm(yes, &format!("Will {how}."))? {
         println!("aborted.");
         return Ok(());
     }

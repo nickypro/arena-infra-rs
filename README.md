@@ -90,9 +90,12 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `--message` overrides the commit message. Confirms first (`--dry-run` previews); clean
     trees report `NO_CHANGES` rather than failing. To stage onto a dated autocommit
     branch, run `pods init-branches` first.
-  - `pods set-branch <branch> [target|--all]` — gently switch pods' ARENA checkout to a
-    branch (fetch + checkout + ff-only pull, no hard reset) — e.g. end-of-day back to
-    `main`. Confirms first; `--dry-run` previews.
+  - `pods set-branch <branch> [target|--all] [--hard]` — switch pods' ARENA checkout to a
+    branch. Gentle by default (fetch + checkout + ff-only pull — fails on a diverged/dirty
+    tree rather than clobbering work). **`--hard` is destructive**: force the branch to
+    match `origin/<branch>`, discarding local commits/changes (untracked files survive) —
+    e.g. `set-branch main --all --hard` resets the fleet to `main`. Confirms first;
+    `--dry-run` previews.
   - `pods init-branches` — create each pod's `autocommit-…-wNdM-…` branch and push it
     upstream **without committing** (legacy `init_branches`), so a new day's branch
     exists before `backup` runs. `--week`/`--day` override; `--dry-run` previews.

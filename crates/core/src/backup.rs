@@ -142,12 +142,15 @@ pub fn init_branch_command(cfg: &BackupConfig, machine_name: &str) -> String {
     parts.join("; ")
 }
 
-/// Render the remote command that switches a pod's ARENA checkout to `branch`
-/// **gently** (no hard reset): fetch, checkout, fast-forward pull. A diverged/dirty
-/// tree makes the `--ff-only` pull fail loudly rather than clobbering work — that's the
-/// point versus `setup --force`. Used by `pods set-branch` (e.g. end-of-day, back to
-/// `main` or a feature branch).
-pub fn checkout_command(repo_path: &str, branch: &str, git_ssh_key: Option<&str>) -> String {
+/// Render the remote command that switches a pod's ARENA checkout to `branch`.
+///
+/// `hard == false` (default): **gentle** — fetch, checkout, fast-forward pull. A
+/// diverged/dirty tree makes the `--ff-only` pull fail loudly rather than clobbering
+/// work. `hard == true`: **destructive** — fetch, then force the local branch to exactly
+/// match `origin/<branch>` (`checkout -f -B … origin/<branch>` + `reset --hard`),
+/// **discarding any local commits/changes on it** (untracked files are left in place).
+/// Used by `pods set-branch [--hard]` (e.g. reset everyone back to `main`).
+pub fn checkout_command(repo_path: &str, branch: &str, git_ssh_key: Option<&str>, hard: bool) -> String {
     let mut parts: Vec<String> = vec!["set -e".into(), format!("cd {}", shell_quote(repo_path))];
     if let Some(key) = git_ssh_key {
         parts.push(format!(
@@ -158,8 +161,15 @@ pub fn checkout_command(repo_path: &str, branch: &str, git_ssh_key: Option<&str>
         ));
     }
     parts.push("git fetch origin".into());
-    parts.push(format!("git checkout {}", shell_quote(branch)));
-    parts.push("git pull --ff-only".into());
+    if hard {
+        let remote_ref = shell_quote(&format!("origin/{branch}"));
+        // Force-switch to the branch reset to origin (discards local changes/commits on it).
+        parts.push(format!("git checkout -f -B {} {remote_ref}", shell_quote(branch)));
+        parts.push(format!("git reset --hard {remote_ref}"));
+    } else {
+        parts.push(format!("git checkout {}", shell_quote(branch)));
+        parts.push("git pull --ff-only".into());
+    }
     parts.join("; ")
 }
 
@@ -239,13 +249,23 @@ mod tests {
 
     #[test]
     fn checkout_is_gentle_ff_only() {
-        let c = checkout_command("/root/ARENA_3.0", "main", Some("/root/.ssh/id_ed25519"));
+        let c = checkout_command("/root/ARENA_3.0", "main", Some("/root/.ssh/id_ed25519"), false);
         assert!(c.contains("cd '/root/ARENA_3.0'"));
         assert!(c.contains("git fetch origin"));
         assert!(c.contains("git checkout 'main'"));
         assert!(c.contains("git pull --ff-only")); // no hard reset
         assert!(!c.contains("reset --hard"));
         assert!(c.contains("GIT_SSH_COMMAND='ssh -i /root/.ssh/id_ed25519"));
+    }
+
+    #[test]
+    fn checkout_hard_resets_to_origin() {
+        let c = checkout_command("/root/ARENA_3.0", "main", None, true);
+        assert!(c.contains("git fetch origin"));
+        // Force-switch the branch to origin and hard-reset (destructive).
+        assert!(c.contains("git checkout -f -B 'main' 'origin/main'"));
+        assert!(c.contains("git reset --hard 'origin/main'"));
+        assert!(!c.contains("--ff-only"));
     }
 
     #[test]
