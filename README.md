@@ -82,15 +82,16 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     need are present (never prints secret values; exits non-zero if a required key is
     missing). Copy `config.env.example` to get started.
   - `cron install|remove|show` — manage a crontab schedule for `arena pods backup`
-    (default every 15 min; `--start-date` bakes `ARENA_START_DATE` into the line; `--pull`
-    also runs the rsync file backup each tick after the git backup); edits only
+    (default every 15 min, git-only; `--pull` runs the full backup — git + rsync file
+    backup — each tick; `--start-date` bakes `ARENA_START_DATE` into the line); edits only
     arena-managed lines, leaving other entries intact.
-  - `pods backup [target]` — commit + push a pod's ARENA tree over SSH **on whatever
-    branch the pod is currently on** (one pod by name/id, or all pods if omitted) (never switches/creates a branch, so bespoke branches are
-    respected), and **skips `main`/`master`** (won't push the protected branch).
-    `--message` overrides the commit message. Confirms first (`--dry-run` previews); clean
-    trees report `NO_CHANGES` rather than failing. To stage onto a dated autocommit
-    branch, run `pods init-branches` first.
+  - `pods backup [target]` — the **full save**: git-push the ARENA tree **and** rsync the
+    home to the local backups folder (`pull`). The git push is on **whatever branch the
+    pod is on** (never switches/creates one, so bespoke branches are respected) and
+    **skips `main`/`master`**; clean trees report `NO_CHANGES`. One pod (name/id) or all.
+    `--no-pull` = git only; `--message` overrides the commit message. Confirms first
+    (`--dry-run` previews both). To stage onto a dated autocommit branch, run
+    `pods init-branches` first.
   - `pods set-branch <branch> [target|--all] [--hard]` — switch pods' ARENA checkout to a
     branch. Gentle by default (fetch + checkout + ff-only pull — fails on a diverged/dirty
     tree rather than clobbering work). **`--hard` is destructive**: force the branch to

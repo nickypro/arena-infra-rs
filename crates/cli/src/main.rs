@@ -413,10 +413,14 @@ enum PodCmd {
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// Commit + push a pod's (or all pods') current branch over SSH (skips main/master).
+    /// Full backup: git-push each pod's current branch (skips main/master) AND rsync its
+    /// home to the local backups folder (`pull`). One pod or all. --no-pull = git only.
     Backup {
         /// Machine name or id to back up. Omit to back up every reachable pod.
         target: Option<String>,
+        /// Only do the git push; skip the rsync file backup.
+        #[arg(long)]
+        no_pull: bool,
         /// Preview only: print what would happen, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
@@ -1179,17 +1183,15 @@ async fn handle_cron(cmd: CronCmd, config_path: &std::path::Path) -> Result<()> 
             };
             let exe = exe.display();
             let cfg_abs = cfg_abs.display();
-            let backup = format!("{env_prefix}{exe} --config {cfg_abs} pods backup --yes");
-            // With --pull, also run the rsync file backup each tick (after the git
-            // backup). The two run in a subshell so the redirect covers both; rsync is
-            // incremental, so repeated pulls only move deltas.
-            let cmds = if pull {
-                let pull_cmd = format!("{env_prefix}{exe} --config {cfg_abs} pods pull --yes");
-                format!("( {backup} ; {pull_cmd} )")
+            // `pods backup` now also rsyncs the home (the file backup); default the cron to
+            // git-only (`--no-pull`) since it runs frequently, and let `--pull` opt into the
+            // full backup each tick (rsync is incremental, so repeats only move deltas).
+            let cmd = if pull {
+                format!("{env_prefix}{exe} --config {cfg_abs} pods backup --yes")
             } else {
-                backup
+                format!("{env_prefix}{exe} --config {cfg_abs} pods backup --no-pull --yes")
             };
-            let line = format!("{schedule} {cmds} >> {home}/arena-cron.log 2>&1");
+            let line = format!("{schedule} {cmd} >> {home}/arena-cron.log 2>&1");
             let new = with_arena_block(&current, &[line.clone()]);
             write_crontab(&new).await?;
             println!("Installed arena cron job:\n  {line}");
@@ -2218,7 +2220,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
 
         PodCmd::Pull { label, dir, max_size, remote_path, no_git, dry_run } => {
             let dir = dir.unwrap_or_else(|| local_backup_dir(cfg));
-            handle_pull(provider, cfg, label, &dir, max_size, remote_path, no_git, dry_run, yes).await?;
+            handle_pull(provider, cfg, label, &dir, max_size, remote_path, no_git, None, dry_run, yes).await?;
         }
 
         PodCmd::CopyKeys { keys_dir, hf_token, include, exclude, dry_run } => {
@@ -2298,16 +2300,27 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             }
         },
 
-        PodCmd::Backup { target, dry_run, message } => {
+        PodCmd::Backup { target, no_pull, dry_run, message } => {
             let scope = match &target {
                 Some(t) => format!("{t}'s ARENA tree"),
                 None => "each pod's ARENA tree".to_string(),
             };
-            if !dry_run && !confirm(yes, &format!("Will commit + push {scope} on its current branch (main/master skipped)."))? {
+            let what = if no_pull {
+                format!("commit + push {scope} on its current branch (main/master skipped)")
+            } else {
+                format!("commit + push {scope} (git), then rsync the home(s) to {}", local_backup_dir(cfg))
+            };
+            if !dry_run && !confirm(yes, &format!("Will {what}."))? {
                 println!("aborted.");
                 return Ok(());
             }
+            // 1) git push, then 2) rsync file backup (unless --no-pull). Already confirmed.
             handle_backup(provider, cfg, !dry_run, message, target.as_deref()).await?;
+            if !no_pull {
+                println!();
+                let dir = local_backup_dir(cfg);
+                handle_pull(provider, cfg, None, &dir, None, None, false, target.as_deref(), dry_run, true).await?;
+            }
         }
         PodCmd::Setup { dry_run, force } => {
             if !dry_run && !confirm(yes, "Will provision each pod over SSH (deploy key, ~/.name, repo).")? {
@@ -2630,6 +2643,7 @@ async fn handle_init_branches(
 /// `pods pull`: rsync each pod's home directory to `<dir>/<label>/<pod-name>/`. The file
 /// backup (legacy `backup.sh`), complementing the git autocommit `backup`.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn handle_pull(
     provider: &dyn Provider,
     cfg: &Config,
@@ -2638,6 +2652,7 @@ async fn handle_pull(
     max_size: Option<String>,
     remote_path: Option<String>,
     no_git: bool,
+    target_filter: Option<&str>,
     dry_run: bool,
     yes: bool,
 ) -> Result<()> {
@@ -2672,8 +2687,14 @@ async fn handle_pull(
     );
 
     let pods = provider.list_pods().await.context("listing pods for pull")?;
+    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
     let mut targets: Vec<(String, SshTarget)> = Vec::new();
     for pod in &pods {
+        if let Some(t) = target_filter {
+            if !pod_matches(pod, t, prefix) {
+                continue;
+            }
+        }
         match SshTarget::from_pod(pod, cfg) {
             Ok(t) => targets.push((pod.name.clone(), t)),
             Err(_) => eprintln!("skip {} — no SSH endpoint yet", pod.name),
