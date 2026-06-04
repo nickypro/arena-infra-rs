@@ -335,6 +335,36 @@ fn selected_pod(shared: &Arc<Mutex<Shared>>, idx: usize) -> Option<Pod> {
     shared.lock().unwrap().pods.get(idx).cloned()
 }
 
+/// Open an interactive SSH shell to the selected pod: suspend the dashboard (leave the
+/// alternate screen + raw mode), hand the terminal to `ssh`, then restore on exit.
+fn connect_ssh(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    shared: &Arc<Mutex<Shared>>,
+    ui: &mut Ui,
+) -> Result<()> {
+    let Some(pod) = selected_pod(shared, ui.selected) else { return Ok(()) };
+    let target = match SshTarget::from_pod(&pod, &ui.cfg) {
+        Ok(t) => t,
+        Err(e) => {
+            ui.mode = Mode::Result(format!("✗ {}: {e}", pod.name));
+            return Ok(());
+        }
+    };
+    restore_terminal(terminal)?;
+    println!(
+        "Connecting to {} ({}@{}:{}) — exit the shell to return to the dashboard…\n",
+        pod.name, target.user, target.host, target.port
+    );
+    // Blocking, inherits this terminal (interactive PTY). ssh_args carries the port/keys.
+    let status = std::process::Command::new("ssh").args(target.ssh_args()).status();
+    *terminal = setup_terminal()?;
+    terminal.clear()?;
+    if let Err(e) = status {
+        ui.mode = Mode::Result(format!("✗ ssh {}: {e}", pod.name));
+    }
+    Ok(())
+}
+
 /// Advance the cadence to the next step in `REFRESH_STEPS` (wrapping).
 fn cycle_interval(interval: &AtomicU64) {
     let cur = interval.load(Ordering::Relaxed);
@@ -490,7 +520,11 @@ async fn run(
                             }
                         }
                     }
-                    KeyCode::Char('c') => ui.marked.clear(),
+                    KeyCode::Char('c') => {
+                        connect_ssh(terminal, shared, &mut ui)?;
+                        nudge.notify_one();
+                    }
+                    KeyCode::Char('x') => ui.marked.clear(),
                     KeyCode::Char('n') => {
                         // Fresh list (not the cached snapshot) so we never allocate a
                         // name that already exists and create a duplicate.
@@ -1683,8 +1717,8 @@ fn footer_hint(shared: &Shared, ui: &Ui, secs: u64) -> String {
     };
     let spin = if shared.refreshing { " ⟳" } else { "" };
     let keys = match ui.mode {
-        Mode::List => "[enter] detail  [space] mark  [a] act (cursor/marked)  [A] all  [c] clear marks  [n] new  [s] names  [r] now  [q] quit",
-        Mode::Detail => "[space] mark  [a] act (cursor/marked)  [A] all  [c] clear marks  [n] new  [s] names  [r] now  [esc] back  [q] quit",
+        Mode::List => "[enter] detail  [c] ssh  [space] mark  [a] act  [A] all  [x] clear  [n] new  [s] names  [r] now  [q] quit",
+        Mode::Detail => "[c] ssh  [space] mark  [a] act  [A] all  [x] clear  [n] new  [s] names  [r] now  [esc] back  [q] quit",
         Mode::Menu { .. } => "[↑↓] move  [enter] choose  [letter] pick  [esc] cancel",
         Mode::Confirm(_) => "type to confirm  [enter] apply  [esc] cancel",
         Mode::FleetMenu { .. } => "[↑↓] move  [enter] choose  [letter] pick  [esc] cancel",
