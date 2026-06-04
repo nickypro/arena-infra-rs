@@ -1147,6 +1147,17 @@ fn util_style(u: Option<u32>, err: bool) -> Style {
     }
 }
 
+/// Style a fullness percentage (RAM / disk): plain until ~90%, yellow when nearly full,
+/// red when critically full — so a pod about to run out of space/RAM stands out.
+fn capacity_style(pct: Option<u32>) -> Style {
+    match pct {
+        Some(p) if p >= 95 => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        Some(p) if p >= 90 => Style::default().fg(Color::Yellow),
+        None => Style::default().fg(Color::DarkGray),
+        _ => Style::default(),
+    }
+}
+
 /// Truncate a string to `max` display columns, adding an ellipsis if cut.
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -1402,6 +1413,8 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                 Some((u, t)) => format!("{:.0}/{:.0}G", u as f64 / 1024.0, t as f64 / 1024.0),
                 None => "-".into(),
             };
+            let disk_pct = m.and_then(|m| m.disk_summary()).filter(|(_, t)| *t > 0)
+                .map(|(u, t)| (u as u64 * 100 / t as u64) as u32);
             let disk = match m.and_then(|m| m.disk_summary()) {
                 Some((u, t)) => format!("{:.0}/{:.0}G", u as f64 / 1024.0, t as f64 / 1024.0),
                 None => "-".into(),
@@ -1455,7 +1468,7 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                 Cell::from(util_str).style(util_style(util, err)),
                 Cell::from(mem),
                 Cell::from(temp_str).style(temp_style(temp)),
-                Cell::from(disk),
+                Cell::from(disk).style(capacity_style(disk_pct)),
                 Cell::from(cost),
                 Cell::from(branch),
             ];
@@ -1490,7 +1503,7 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                     .filter(|(_, t)| *t > 0)
                     .map(|(u, t)| (u as u64 * 100 / t as u64) as u32);
                 cells.push(Cell::from(ram_pct.map(|p| format!("{p}%")).unwrap_or_else(|| "-".into()))
-                    .style(util_style(ram_pct, err)));
+                    .style(capacity_style(ram_pct)));
             }
             if show_progress {
                 let (detail, detail_style) = detail_cell(m);
