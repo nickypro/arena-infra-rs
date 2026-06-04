@@ -443,9 +443,9 @@ enum PodCmd {
     Pull {
         /// Backup label, e.g. `w1d3`. Defaults to the computed `wNdM` iteration.
         label: Option<String>,
-        /// Local base directory for backups.
-        #[arg(long, default_value = "./backup")]
-        dir: String,
+        /// Local base directory for backups (default: config LOCAL_BACKUP_DIR, else ./backup).
+        #[arg(long)]
+        dir: Option<String>,
         /// Skip any single file larger than this (rsync --max-size), e.g. `50M`.
         #[arg(long, default_value = "50M")]
         max_size: String,
@@ -1320,10 +1320,28 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
     cfg_row(cfg, &mut missing, "SSH_PROXY_HOST", false, false);
     cfg_row(cfg, &mut missing, "SSH_PROXY_STARTING_PORT", false, false);
 
-    println!("\nBackup (`backup`):");
+    println!("\nBackup (git `backup` + file `pull`):");
     cfg_row(cfg, &mut missing, "ARENA_REPO_NAME", false, false);
     cfg_row(cfg, &mut missing, "GIT_SSH_KEY_REMOTE", false, false);
-    cfg_row(cfg, &mut missing, "ARENA_START_DATE", false, false); // for wNdM naming
+    cfg_row(cfg, &mut missing, "ARENA_START_DATE", false, false); // wNdM label (init-branches / pull)
+    // Where `pods pull` rsyncs pod files to locally (config LOCAL_BACKUP_DIR, else ./backup),
+    // shown as an absolute path so it's obvious where backups land.
+    let backup_dir = local_backup_dir(cfg);
+    let abs = std::fs::canonicalize(&backup_dir)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| {
+            // Not created yet — resolve relative to cwd, dropping a leading "./".
+            let rel = backup_dir.trim_start_matches("./");
+            std::env::current_dir()
+                .map(|d| d.join(rel).display().to_string())
+                .unwrap_or_else(|_| backup_dir.clone())
+        });
+    let exists = std::path::Path::new(&backup_dir).is_dir();
+    println!(
+        "  {} local rsync backup dir     {abs}{}",
+        if exists { "✓" } else { "·" },
+        if exists { "" } else { "  (created on first `pods pull`)" }
+    );
 
     println!("\nDashboard (optional):");
     cfg_row(cfg, &mut missing, "PROGRESS_CMD", false, false);
@@ -2060,6 +2078,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
         }
 
         PodCmd::Pull { label, dir, max_size, remote_path, dry_run } => {
+            let dir = dir.unwrap_or_else(|| local_backup_dir(cfg));
             handle_pull(provider, cfg, label, &dir, &max_size, remote_path, dry_run, yes).await?;
         }
 
@@ -2663,6 +2682,11 @@ async fn handle_pull(
 /// Single-quote for safe inclusion in a remote `sh -c` string (POSIX `'\''` escaping).
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The local directory `pods pull` rsyncs into: config `LOCAL_BACKUP_DIR`, else `./backup`.
+fn local_backup_dir(cfg: &Config) -> String {
+    cfg.get("LOCAL_BACKUP_DIR").filter(|s| !s.is_empty()).unwrap_or("./backup").to_string()
 }
 
 /// Resolve where a copied file should land on the pod. With an explicit `dest`, use it
