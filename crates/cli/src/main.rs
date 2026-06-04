@@ -972,6 +972,15 @@ async fn handle_setup(provider: &dyn Provider, cfg: &Config, apply: bool, force:
             println!("{}", target.display_scp(&scfg.key_local, &scfg.key_remote));
             println!("{}\n", target.display_command(&display_scfg.remote_command(name, force)));
         }
+        let keys_present = arena_core::apikeys::PROVIDERS.iter().any(|(base, _, _)| {
+            std::fs::read_to_string(format!("./keys/{base}_api_keys.csv"))
+                .map(|t| !arena_core::apikeys::parse_csv(&t).is_empty())
+                .unwrap_or(false)
+        });
+        println!(
+            "API keys: {}",
+            if keys_present { "found in ./keys — would distribute after provisioning" } else { "none in ./keys — would skip" }
+        );
         println!("Preview only — run without --dry-run to execute over SSH.");
         return Ok(());
     }
@@ -1019,6 +1028,32 @@ async fn handle_setup(provider: &dyn Provider, cfg: &Config, apply: bool, force:
         }
     }
     println!("\nDone: {ok} provisioned, {failed} failed.");
+
+    // Auto-handle API keys: if per-host CSVs have been generated, distribute them and say
+    // so; otherwise report they're not set up (rather than silently doing nothing). HF is
+    // already handled inline above. Best-effort — never fails the setup.
+    let keys_dir = "./keys";
+    let csv_sources: Vec<&str> = arena_core::apikeys::PROVIDERS
+        .iter()
+        .filter(|(base, _, _)| {
+            std::fs::read_to_string(format!("{keys_dir}/{base}_api_keys.csv"))
+                .map(|t| !arena_core::apikeys::parse_csv(&t).is_empty())
+                .unwrap_or(false)
+        })
+        .map(|(_, display, _)| *display)
+        .collect();
+    if csv_sources.is_empty() {
+        println!(
+            "API keys: none generated in {keys_dir}/ — skipping (run `arena keys gen --all` \
+             or drop in <provider>_api_keys.csv, then re-run setup / `pods copy-keys`)."
+        );
+    } else {
+        println!("API keys: found {} — distributing to pods…", csv_sources.join(", "));
+        if let Err(e) = handle_copy_keys(provider, cfg, keys_dir, None, &[], &[], false, true).await {
+            eprintln!("  (API-key distribution failed: {e})");
+        }
+    }
+
     if failed > 0 {
         anyhow::bail!("{failed} pod(s) failed to set up");
     }

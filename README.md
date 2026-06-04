@@ -138,8 +138,10 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     deploy key, write `~/.ssh/config` + `authorized_keys`, point the repo at GitHub,
     update submodules, write `~/.name`, and — **if `HF_TOKEN` is set** — export it
     (`HF_TOKEN` + `HUGGING_FACE_HUB_TOKEN`) for gated-repo access (else that step is
-    skipped, and it says so). Confirms first (`--dry-run` previews, with the token
-    redacted). Uses `GIT_SSH_KEY_LOCAL/REMOTE`, `ARENA_REPO_OWNER/NAME`, `DEFAULT_BRANCH`.
+    skipped, and it says so). It also **auto-distributes per-host API keys** if any
+    `keys/*_api_keys.csv` exist (reporting what it added, or that none are set up), so a
+    `setup` (or `up --setup`) makes pods fully ready. Confirms first (`--dry-run` previews,
+    token redacted). Uses `GIT_SSH_KEY_LOCAL/REMOTE`, `ARENA_REPO_OWNER/NAME`, `DEFAULT_BRANCH`.
   - `config check | set | which` — `check` is the read-only doctor (keys + setup
     readiness); `config set KEY VALUE` writes a key (e.g. an API key) into config.env, or
     with no args prompts interactively (the picker shows which keys are already set, and
