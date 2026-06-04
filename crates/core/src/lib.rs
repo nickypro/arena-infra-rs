@@ -12,6 +12,7 @@ pub mod error;
 pub mod gpu;
 pub mod metrics;
 pub mod naming;
+pub mod openrouter;
 pub mod plan;
 pub mod pod;
 pub mod provider;

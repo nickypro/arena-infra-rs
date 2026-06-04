@@ -117,6 +117,14 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     (a local `…/ARENA_3.0/foo/bar.py` → `/root/ARENA_3.0/foo/bar.py`); otherwise `dest`
     is the remote path (trailing `/` = into that dir). Creates the remote parent dir;
     confirms first; `--dry-run` previews.
+  - `keys gen|list|rotate|revoke` — manage **OpenRouter** runtime keys via the
+    provisioning API (needs `OPENROUTER_PROVISIONING_KEY`). `gen [machines|--all]` mints
+    one key per machine (named `<prefix>-<machine>`) with a USD cap (`--limit`, default
+    `OPENROUTER_KEY_LIMIT` or $5) and writes `keys/openrouter_api_keys.csv`; `--copy` also
+    pushes them out via `copy-keys`. `rotate <machine|--all>` deletes + re-mints (leak
+    recovery), `revoke` deletes only, `list` shows names/limits/usage. Keys are found by
+    name, so no local hash bookkeeping. (`copy-keys` is the *distributor*; `keys` is the
+    *generator*.)
   - `ssh-config [--proxy] [--out]` — emit the **participant-facing `~/.ssh/config`**:
     direct pod endpoints by default, or stable proxy ports (`--proxy`) anchored to each
     machine's `MACHINE_NAME_LIST` index. Read-only.

@@ -84,6 +84,10 @@ enum Cmd {
     /// arena-managed lines).
     #[command(subcommand, infer_subcommands = true)]
     Cron(CronCmd),
+    /// Manage OpenRouter API keys for the cohort (generate / list / rotate / revoke) via
+    /// the provisioning API. Needs OPENROUTER_PROVISIONING_KEY in config.
+    #[command(subcommand, infer_subcommands = true)]
+    Keys(KeysCmd),
     /// Print the participant-facing `~/.ssh/config` for the fleet (read-only). Direct
     /// pod endpoints by default, or stable proxy ports with --proxy.
     SshConfig {
@@ -93,6 +97,60 @@ enum Cmd {
         /// Also write the rendered config to this local path (else just prints it).
         #[arg(long)]
         out: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum KeysCmd {
+    /// Generate an OpenRouter runtime key per machine (named `<prefix>-<machine>`), each
+    /// with a USD credit cap, and save to `keys/openrouter_api_keys.csv`. Skips machines
+    /// that already have a key (use `rotate`). `--copy` also distributes them to the pods.
+    Gen {
+        /// Machine names to generate for (bare names get the prefix). Omit + use --all.
+        machines: Vec<String>,
+        /// Generate for every current pod.
+        #[arg(long)]
+        all: bool,
+        /// USD credit cap per key (default: config OPENROUTER_KEY_LIMIT, else 5).
+        #[arg(long)]
+        limit: Option<f64>,
+        /// After generating, copy the key(s) onto the pod(s) (runs copy-keys for them).
+        #[arg(long)]
+        copy: bool,
+        /// Preview only: show what would be created, change nothing.
+        #[arg(long, visible_aliases = ["dryrun", "dry"])]
+        dry_run: bool,
+    },
+    /// List the provisioned OpenRouter keys (name, USD limit, usage).
+    List,
+    /// Rotate a machine's key — delete it and generate a fresh one (e.g. after a leak).
+    /// Updates the CSV; `--copy` re-pushes to the pod(s). One machine or --all.
+    Rotate {
+        /// Machine name (bare ok). Omit with --all.
+        machine: Option<String>,
+        /// Rotate every current pod's key.
+        #[arg(long)]
+        all: bool,
+        /// USD credit cap for the new key (default: config OPENROUTER_KEY_LIMIT, else 5).
+        #[arg(long)]
+        limit: Option<f64>,
+        /// After rotating, copy the new key(s) onto the pod(s).
+        #[arg(long)]
+        copy: bool,
+        /// Preview only: change nothing.
+        #[arg(long, visible_aliases = ["dryrun", "dry"])]
+        dry_run: bool,
+    },
+    /// Revoke (delete) a machine's key without regenerating. One machine or --all.
+    Revoke {
+        /// Machine name (bare ok). Omit with --all.
+        machine: Option<String>,
+        /// Revoke every current pod's key.
+        #[arg(long)]
+        all: bool,
+        /// Preview only: change nothing.
+        #[arg(long, visible_aliases = ["dryrun", "dry"])]
+        dry_run: bool,
     },
 }
 
@@ -813,6 +871,7 @@ async fn main() -> Result<()> {
         Cmd::SshConfig { proxy, out } => {
             handle_ssh_config(provider.unwrap().as_ref(), &cfg, proxy, out.as_deref()).await
         }
+        Cmd::Keys(k) => handle_keys(k, provider.unwrap().as_ref(), &cfg, cli.yes).await,
     }
 }
 
@@ -1156,6 +1215,7 @@ const SETTABLE_KEYS: &[(&str, bool)] = &[
     ("VAST_API_KEY", true),
     ("HETZNER_API_KEY", true),
     ("HF_TOKEN", true), // broadcast to pods for gated repos (Llama 3 …)
+    ("OPENROUTER_PROVISIONING_KEY", true), // mints per-machine OpenRouter keys (`arena keys`)
     ("ARENA_START_DATE", false),
     ("MACHINE_NAME_PREFIX", false),
     ("SHARED_SSH_KEY_PATH", false),
@@ -1346,8 +1406,10 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
     println!("\nDashboard (optional):");
     cfg_row(cfg, &mut missing, "PROGRESS_CMD", false, false);
 
-    println!("\nEvals / model access (optional, `pods copy-keys`):");
+    println!("\nEvals / model access (optional, `pods copy-keys` / `arena keys`):");
     cfg_row(cfg, &mut missing, "HF_TOKEN", false, true); // broadcast for gated repos (Llama 3 …)
+    cfg_row(cfg, &mut missing, "OPENROUTER_PROVISIONING_KEY", false, true); // mints runtime keys
+    cfg_row(cfg, &mut missing, "OPENROUTER_KEY_LIMIT", false, false); // USD cap per generated key
 
     // Read-only readiness: are the local files this user needs actually there/readable?
     // Answers "is it set up yet?" without touching any API.
@@ -2945,6 +3007,224 @@ async fn handle_copy_keys(
     println!("\nDone: {ok} updated, {failed} failed.");
     if failed > 0 {
         anyhow::bail!("{failed} pod(s) failed");
+    }
+    Ok(())
+}
+
+/// Where generated OpenRouter keys are persisted (also where `copy-keys` reads them).
+const OPENROUTER_KEYS_CSV: &str = "./keys/openrouter_api_keys.csv";
+
+/// Full pod name for a machine arg (prefix added once).
+fn full_machine_name(prefix: &str, m: &str) -> String {
+    if m.starts_with(&format!("{prefix}-")) { m.to_string() } else { format!("{prefix}-{m}") }
+}
+
+/// Resolve which machines (full pod names) a `keys` action targets: `--all` = every
+/// current pod; else the explicitly named ones (prefixed).
+async fn keys_targets(
+    provider: &dyn Provider,
+    prefix: &str,
+    machines: &[String],
+    all: bool,
+) -> Result<Vec<String>> {
+    if all {
+        let pods = provider.list_pods().await.context("listing pods")?;
+        Ok(pods.iter().map(|p| p.name.clone()).collect())
+    } else if !machines.is_empty() {
+        Ok(machines.iter().map(|m| full_machine_name(prefix, m)).collect())
+    } else {
+        anyhow::bail!("specify machine name(s) or --all")
+    }
+}
+
+/// Persist one machine's freshly minted OpenRouter key into the per-host CSV (upsert).
+fn write_openrouter_key(host: &str, secret: &str) -> Result<()> {
+    std::fs::create_dir_all("./keys").context("creating ./keys")?;
+    let existing = std::fs::read_to_string(OPENROUTER_KEYS_CSV).unwrap_or_default();
+    let updated = arena_core::apikeys::upsert_csv(&existing, host, secret);
+    std::fs::write(OPENROUTER_KEYS_CSV, updated)
+        .with_context(|| format!("writing {OPENROUTER_KEYS_CSV}"))?;
+    Ok(())
+}
+
+/// `arena keys`: manage OpenRouter runtime keys (generate / list / rotate / revoke) via
+/// the provisioning API. Secrets are saved to `keys/openrouter_api_keys.csv` (which
+/// `pods copy-keys` then distributes); rotation/revocation find a key by its name
+/// (`<prefix>-<machine>`), so no local hash bookkeeping is needed.
+async fn handle_keys(cmd: KeysCmd, provider: &dyn Provider, cfg: &Config, yes: bool) -> Result<()> {
+    use arena_core::openrouter::{key_name, OpenRouter};
+
+    let prov_key = cfg
+        .get("OPENROUTER_PROVISIONING_KEY")
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "set OPENROUTER_PROVISIONING_KEY first (openrouter.ai → Settings → \
+                 Provisioning API Keys), e.g. `arena config set OPENROUTER_PROVISIONING_KEY <key>`"
+            )
+        })?;
+    let or = OpenRouter::new(prov_key);
+    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena").to_string();
+    let default_limit = cfg.get_parsed::<f64>("OPENROUTER_KEY_LIMIT").unwrap_or(5.0);
+
+    match cmd {
+        KeysCmd::List => {
+            let mut keys = or.list_keys().await.context("listing OpenRouter keys")?;
+            keys.sort_by(|a, b| a.name.cmp(&b.name));
+            if keys.is_empty() {
+                println!("(no provisioned OpenRouter keys)");
+                return Ok(());
+            }
+            println!("{:<28} {:>9} {:>9}  {}", "NAME", "LIMIT", "USAGE", "HASH");
+            for k in &keys {
+                let lim = k.limit.map(|l| format!("${l:.2}")).unwrap_or_else(|| "-".into());
+                let used = k.usage.map(|u| format!("${u:.2}")).unwrap_or_else(|| "-".into());
+                let short = &k.hash[..k.hash.len().min(12)];
+                let dis = if k.disabled { "  (disabled)" } else { "" };
+                println!("{:<28} {lim:>9} {used:>9}  {short}{dis}", k.name.clone().unwrap_or_default());
+            }
+        }
+
+        KeysCmd::Gen { machines, all, limit, copy, dry_run } => {
+            let names = keys_targets(provider, &prefix, &machines, all).await?;
+            let limit = limit.unwrap_or(default_limit);
+            if names.is_empty() {
+                println!("(no target machines)");
+                return Ok(());
+            }
+            if dry_run {
+                println!("Dry-run — would mint a ${limit:.2}-cap key for {} machine(s):", names.len());
+                for h in &names {
+                    println!("  {}", key_name(&prefix, h));
+                }
+                return Ok(());
+            }
+            if !confirm(yes, &format!(
+                "Will mint {} OpenRouter key(s) (cap ${limit:.2} each) and write {OPENROUTER_KEYS_CSV}.",
+                names.len()
+            ))? {
+                println!("aborted.");
+                return Ok(());
+            }
+            let existing = or.list_keys().await.context("listing existing keys")?;
+            let (mut made, mut skipped, mut failed) = (0, 0, 0);
+            for host in &names {
+                let kn = key_name(&prefix, host);
+                if existing.iter().any(|k| k.name.as_deref() == Some(&kn) && !k.disabled) {
+                    println!("= {host}: '{kn}' already exists — use `arena keys rotate {host}` to replace");
+                    skipped += 1;
+                    continue;
+                }
+                match or.create_key(&kn, Some(limit)).await {
+                    Ok(ck) => {
+                        write_openrouter_key(host, &ck.secret)?;
+                        println!("✓ {host}: minted {}", &ck.hash[..ck.hash.len().min(12)]);
+                        made += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("✗ {host}: {e}");
+                        failed += 1;
+                    }
+                }
+            }
+            println!("\nGenerated {made}, skipped {skipped}, failed {failed} → {OPENROUTER_KEYS_CSV}");
+            if copy && made > 0 {
+                println!();
+                handle_copy_keys(provider, cfg, "./keys", None, &names, &[], false, yes).await?;
+            }
+        }
+
+        KeysCmd::Rotate { machine, all, limit, copy, dry_run } => {
+            let names = keys_targets(provider, &prefix, &machine.into_iter().collect::<Vec<_>>(), all).await?;
+            let limit = limit.unwrap_or(default_limit);
+            if dry_run {
+                println!("Dry-run — would delete + re-mint a key for {} machine(s):", names.len());
+                for h in &names {
+                    println!("  {}", key_name(&prefix, h));
+                }
+                return Ok(());
+            }
+            if !confirm(yes, &format!("Will DELETE + re-mint {} OpenRouter key(s) (cap ${limit:.2}).", names.len()))? {
+                println!("aborted.");
+                return Ok(());
+            }
+            let (mut ok, mut failed) = (0, 0);
+            for host in &names {
+                let kn = key_name(&prefix, host);
+                // Delete the existing key (by name) if present, then mint a fresh one.
+                match or.find_by_name(&kn).await {
+                    Ok(Some(k)) => {
+                        if let Err(e) = or.delete_key(&k.hash).await {
+                            eprintln!("✗ {host}: delete old: {e}");
+                            failed += 1;
+                            continue;
+                        }
+                    }
+                    Ok(None) => {} // nothing to delete; just create
+                    Err(e) => {
+                        eprintln!("✗ {host}: lookup: {e}");
+                        failed += 1;
+                        continue;
+                    }
+                }
+                match or.create_key(&kn, Some(limit)).await {
+                    Ok(ck) => {
+                        write_openrouter_key(host, &ck.secret)?;
+                        println!("✓ {host}: rotated");
+                        ok += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("✗ {host}: create: {e}");
+                        failed += 1;
+                    }
+                }
+            }
+            println!("\nRotated {ok}, failed {failed}.");
+            if copy && ok > 0 {
+                println!();
+                handle_copy_keys(provider, cfg, "./keys", None, &names, &[], false, yes).await?;
+            }
+        }
+
+        KeysCmd::Revoke { machine, all, dry_run } => {
+            let names = keys_targets(provider, &prefix, &machine.into_iter().collect::<Vec<_>>(), all).await?;
+            if dry_run {
+                println!("Dry-run — would revoke the key for {} machine(s):", names.len());
+                for h in &names {
+                    println!("  {}", key_name(&prefix, h));
+                }
+                return Ok(());
+            }
+            if !confirm(yes, &format!("Will DELETE {} OpenRouter key(s) — no regenerate.", names.len()))? {
+                println!("aborted.");
+                return Ok(());
+            }
+            let (mut ok, mut missing, mut failed) = (0, 0, 0);
+            for host in &names {
+                let kn = key_name(&prefix, host);
+                match or.find_by_name(&kn).await {
+                    Ok(Some(k)) => match or.delete_key(&k.hash).await {
+                        Ok(()) => {
+                            println!("✓ {host}: revoked");
+                            ok += 1;
+                        }
+                        Err(e) => {
+                            eprintln!("✗ {host}: {e}");
+                            failed += 1;
+                        }
+                    },
+                    Ok(None) => {
+                        println!("= {host}: no key named '{kn}'");
+                        missing += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("✗ {host}: {e}");
+                        failed += 1;
+                    }
+                }
+            }
+            println!("\nRevoked {ok}, none-found {missing}, failed {failed}. (The CSV is left as-is; rotate to refresh.)");
+        }
     }
     Ok(())
 }

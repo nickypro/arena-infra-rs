@@ -60,6 +60,32 @@ pub fn parse_csv(text: &str) -> Vec<(String, String)> {
     out
 }
 
+/// Upsert a `host,key` row into a per-host keys CSV's text: replace the line for `host`
+/// if present, else append `host,key`. Other lines (comments, blanks) are preserved.
+/// Used by key generation/rotation to persist a machine's freshly minted key.
+pub fn upsert_csv(text: &str, host: &str, key: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut replaced = false;
+    for line in text.lines() {
+        let is_row = line
+            .split_once(',')
+            .map(|(h, _)| h.trim() == host)
+            .unwrap_or(false);
+        if is_row && !replaced {
+            out.push(format!("{host},{key}"));
+            replaced = true;
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    if !replaced {
+        out.push(format!("{host},{key}"));
+    }
+    let mut s = out.join("\n");
+    s.push('\n');
+    s
+}
+
 /// Render an idempotent shell command that ensures each `export NAME="value"` line is
 /// present in both `~/.bashrc` and `~/.zshrc` (creating the files if absent). Safe to
 /// re-run: a line already present is not appended again.
@@ -123,6 +149,19 @@ arena8-bloom,sk-ccc,extra-ignored-no
         assert!(cmd.contains("grep -qxF"));
         // the exact export line is what we look for + append
         assert!(cmd.contains(r#"'export HF_TOKEN="hf_x"'"#));
+    }
+
+    #[test]
+    fn upsert_csv_replaces_or_appends() {
+        let text = "# openrouter keys\narena8-apple,sk-or-old\narena8-bloom,sk-or-b\n";
+        let r = upsert_csv(text, "arena8-apple", "sk-or-new");
+        assert!(r.contains("arena8-apple,sk-or-new"));
+        assert!(!r.contains("sk-or-old"));
+        assert!(r.contains("arena8-bloom,sk-or-b")); // others kept
+        assert!(r.contains("# openrouter keys"));
+        // append a new host
+        let a = upsert_csv(text, "arena8-nova", "sk-or-n");
+        assert!(a.trim_end().ends_with("arena8-nova,sk-or-n"));
     }
 
     #[test]
