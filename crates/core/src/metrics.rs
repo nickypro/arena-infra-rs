@@ -105,6 +105,12 @@ pub struct PodMetrics {
     /// Number of uncommitted entries in the working tree (`git status --porcelain`), if
     /// reported — i.e. work done since the last backup. `Some(0)` means a clean tree.
     pub dirty_files: Option<u32>,
+    /// Commits the local branch is **ahead** of its upstream (`origin/<branch>`) — i.e.
+    /// committed but not pushed (a blocked/failed push, e.g. GitHub secret-scanning,
+    /// shows up here). `None` = no upstream / not probed / unreachable.
+    pub ahead: Option<u32>,
+    /// Commits the local branch is **behind** its upstream (origin has newer commits).
+    pub behind: Option<u32>,
 }
 
 impl PodMetrics {
@@ -186,6 +192,11 @@ fn remote_command(opts: &ProbeOpts) -> String {
         s.push_str(&format!(
             "echo \"dirty=$(cd {q} 2>/dev/null && git status --porcelain 2>/dev/null | wc -l)\"; "
         ));
+        // Divergence vs the upstream: "<behind>\t<ahead>" (empty when there's no
+        // upstream). ahead>0 means committed-but-unpushed — e.g. a push GitHub blocked.
+        s.push_str(&format!(
+            "echo \"sync=$(cd {q} 2>/dev/null && git rev-list --left-right --count '@{{u}}...HEAD' 2>/dev/null)\"; "
+        ));
     }
     s.push_str("([ -e \"$HOME/.name\" ] && echo name=1 || echo name=0); ");
     // Any LLM API key exported in the shell rc files (i.e. `copy-keys` has run)?
@@ -230,6 +241,14 @@ fn parse_probe(stdout: &str, m: &mut PodMetrics) {
             }
             "committed" => m.last_commit = v.parse::<i64>().ok(),
             "dirty" => m.dirty_files = v.parse::<u32>().ok(),
+            "sync" => {
+                // "<behind> <ahead>" (tab/space separated); empty => no upstream.
+                let mut it = v.split_whitespace().filter_map(|x| x.parse::<u32>().ok());
+                if let (Some(b), Some(a)) = (it.next(), it.next()) {
+                    m.behind = Some(b);
+                    m.ahead = Some(a);
+                }
+            }
             "progress" => m.progress = (!v.is_empty()).then(|| v.to_string()),
             _ => {}
         }
@@ -346,10 +365,12 @@ mod tests {
     #[test]
     fn parses_combined_probe_output() {
         let out = format!(
-            "NVIDIA RTX A4000, 15, 1000, 16000, 45\n{SENTINEL}\nbranch=autocommit-arena8-w0d1-apple\norigin=git@github.com:styme3279/ARENA_3.0.git\ncommitted=1717412400\ndirty=3\nname=1\napikey=1\nkey=0\ndisk=12582912 104857600\nprogress=epoch 3/10\n"
+            "NVIDIA RTX A4000, 15, 1000, 16000, 45\n{SENTINEL}\nbranch=autocommit-arena8-w0d1-apple\norigin=git@github.com:styme3279/ARENA_3.0.git\ncommitted=1717412400\ndirty=3\nsync=0\t2\nname=1\napikey=1\nkey=0\ndisk=12582912 104857600\nprogress=epoch 3/10\n"
         );
         let mut m = PodMetrics::default();
         parse_probe(&out, &mut m);
+        assert_eq!(m.behind, Some(0));
+        assert_eq!(m.ahead, Some(2)); // 2 commits unpushed
         assert_eq!(m.gpus.len(), 1);
         assert_eq!(m.gpus[0].util_pct, Some(15));
         assert_eq!(m.branch.as_deref(), Some("autocommit-arena8-w0d1-apple"));
@@ -362,6 +383,16 @@ mod tests {
         // 12582912 KB / 1024 = 12288 MB used; 104857600 KB / 1024 = 102400 MB total.
         assert_eq!(m.disk_summary(), Some((12288, 102400)));
         assert_eq!(m.progress.as_deref(), Some("epoch 3/10"));
+    }
+
+    #[test]
+    fn no_upstream_leaves_ahead_behind_none() {
+        // `sync=` with an empty value (no upstream) must not parse to (0,0).
+        let out = format!("{SENTINEL}\nbranch=feature\nsync=\nname=1\n");
+        let mut m = PodMetrics::default();
+        parse_probe(&out, &mut m);
+        assert_eq!(m.ahead, None);
+        assert_eq!(m.behind, None);
     }
 
     #[test]

@@ -1175,6 +1175,38 @@ fn health_cell(m: Option<&PodMetrics>) -> Cell<'static> {
     }
 }
 
+/// A glyph + style marking how the local branch diverges from its upstream:
+/// `↑` ahead (committed but unpushed — e.g. a blocked push), `↓` behind, `⇕` diverged,
+/// or none when in sync / no upstream / unreachable.
+fn sync_marker(m: Option<&PodMetrics>) -> (&'static str, Style) {
+    match m {
+        Some(m) if m.error.is_none() => match (m.ahead.unwrap_or(0), m.behind.unwrap_or(0)) {
+            (a, b) if a > 0 && b > 0 => ("⇕", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            (a, _) if a > 0 => ("↑", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            (_, b) if b > 0 => ("↓", Style::default().fg(Color::Cyan)),
+            _ => ("", Style::default()),
+        },
+        _ => ("", Style::default()),
+    }
+}
+
+/// A human description of branch-vs-origin sync, for the detail pane.
+fn sync_summary(m: Option<&PodMetrics>) -> String {
+    let Some(m) = m else { return "-".into() };
+    if m.error.is_some() {
+        return "-".into();
+    }
+    match (m.ahead, m.behind) {
+        (Some(a), Some(b)) if a > 0 && b > 0 => {
+            format!("⇕ diverged — {a} ahead, {b} behind origin (push blocked?)")
+        }
+        (Some(a), _) if a > 0 => format!("↑ {a} commit(s) NOT on origin — push blocked/failed?"),
+        (_, Some(b)) if b > 0 => format!("↓ {b} commit(s) behind origin"),
+        (Some(_), Some(_)) => "✓ in sync with origin".into(),
+        _ => "· no upstream (branch never pushed)".into(),
+    }
+}
+
 /// The API-key cell: ✓ if any LLM API key (OpenRouter/Anthropic/OpenAI) is exported on
 /// the pod (i.e. `copy-keys`/`keys` ran), ✗ if not, · if unknown/unreachable.
 fn api_cell(m: Option<&PodMetrics>) -> Cell<'static> {
@@ -1347,10 +1379,17 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                 .and_then(|m| m.gpu_summary())
                 .or_else(|| p.gpu_type.clone())
                 .unwrap_or_else(|| "-".into());
-            let branch = match m.and_then(|m| m.branch.clone()) {
-                Some(b) => truncate(&short_branch(&b, &ui.prefix), 6),
+            let branch_label = match m.and_then(|m| m.branch.clone()) {
+                Some(b) => short_branch(&b, &ui.prefix),
                 None => "-".into(),
             };
+            // Mark when the local branch diverges from its upstream (↑ unpushed — e.g. a
+            // blocked push, ↓ behind, ⇕ diverged), reserving a column for the glyph.
+            let (mark, mark_style) = sync_marker(m);
+            let branch_cell = Cell::from(Line::from(vec![
+                Span::styled(mark, mark_style),
+                Span::raw(truncate(&branch_label, if mark.is_empty() { 6 } else { 5 })),
+            ]));
             // RUNNING-but-unreachable reads as "init" (still coming up), in yellow.
             let status_label = display_status(&p.status, m.map(|m| m.error.is_none()));
             let status_cell = if status_label == "init" {
@@ -1376,7 +1415,7 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                 Cell::from(temp_str).style(temp_style(temp)),
                 Cell::from(disk),
                 Cell::from(cost),
-                Cell::from(branch),
+                branch_cell,
             ];
             if show_saved {
                 // Yellow when there's uncommitted work since the last backup, grey when
@@ -1517,14 +1556,14 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     let show_graphs = inner.height >= 18;
     let constraints: &[Constraint] = if show_graphs {
         &[
-            Constraint::Length(10), // header facts
+            Constraint::Length(11), // header facts
             Constraint::Min(3),    // per-GPU table
             Constraint::Length(3), // util sparkline
             Constraint::Length(3), // temp sparkline
         ]
     } else {
         &[
-            Constraint::Length(10), // header facts
+            Constraint::Length(11), // header facts
             Constraint::Min(3),    // per-GPU table
         ]
     };
@@ -1561,7 +1600,7 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     let origin = m.and_then(|m| m.origin.clone()).unwrap_or_else(|| "-".into());
     let origin_ok = m.and_then(|m| m.origin.as_deref().map(|o| o.contains("github.com")));
     let facts = format!(
-        "status:   {}\ngpu:      {}\nendpoint: {}\ncost:     {}\ndisk:     {}\nbranch:   {}\nbackup:   {}\norigin:   {} {}\nsetup:    .name {}   deploy-key {}   origin→gh {}   api-key {}\nprogress: {}",
+        "status:   {}\ngpu:      {}\nendpoint: {}\ncost:     {}\ndisk:     {}\nbranch:   {}\nbackup:   {}\nsync:     {}\norigin:   {} {}\nsetup:    .name {}   deploy-key {}   origin→gh {}   api-key {}\nprogress: {}",
         display_status(&pod.status, m.map(|m| m.error.is_none())),
         gpu,
         endpoint,
@@ -1569,6 +1608,7 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
         disk,
         m.and_then(|m| m.branch.clone()).unwrap_or_else(|| "-".into()),
         backup_summary(m),
+        sync_summary(m),
         truncate(&origin, 32),
         ok(origin_ok),
         ok(m.and_then(|m| m.has_name)),
