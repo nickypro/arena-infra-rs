@@ -127,8 +127,10 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `OPENROUTER_KEY_LIMIT` or $5) and writes `keys/openrouter_api_keys.csv`; `--copy` also
     pushes them out via `copy-keys`. `rotate <machine|--all>` deletes + re-mints (leak
     recovery), `revoke` deletes only, `list` shows names/limits/usage. Keys are found by
-    name, so no local hash bookkeeping. (`copy-keys` is the *distributor*; `keys` is the
-    *generator*.)
+    name, so no local hash bookkeeping. `keys which` shows the local keys file. (`copy-keys`
+    is the *distributor*; `keys` is the *generator*.)
+  - `gpus` — list the GPU types for `--gpu`: RunPod's **full live catalog** (via GraphQL)
+    when on RunPod with a key, else the local presets. Shows VRAM + rough $/hr where known.
   - `ssh-config [--proxy] [--out]` — emit the **participant-facing `~/.ssh/config`**:
     direct pod endpoints by default, or stable proxy ports (`--proxy`) anchored to each
     machine's `MACHINE_NAME_LIST` index. Read-only.

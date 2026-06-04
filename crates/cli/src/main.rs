@@ -841,31 +841,55 @@ async fn main() -> Result<()> {
             handle_ssh_config(provider.unwrap().as_ref(), &cfg, proxy, out.as_deref()).await
         }
         Cmd::Keys(k) => handle_keys(k, provider.unwrap().as_ref(), &cfg, cli.yes).await,
-        Cmd::Gpus => handle_gpus(),
+        Cmd::Gpus => handle_gpus(&cfg, &cli.provider).await,
     }
 }
 
-/// `arena gpus`: print the known GPU catalog — the names you can pass to `--gpu`
-/// (the full RunPod API name, the short label, or an alias), with VRAM and rough $/hr.
-fn handle_gpus() -> Result<()> {
+/// `arena gpus`: list the GPU types you can pass to `--gpu`. Fetches RunPod's **full,
+/// live** catalog (via GraphQL) when on RunPod with a key; otherwise falls back to the
+/// local curated presets. Prices come from the local presets where known.
+async fn handle_gpus(cfg: &Config, provider_name: &str) -> Result<()> {
     use arena_core::gpu;
-    println!(
-        "{:<14} {:>5}  {:>9}  {:>8}   {}",
-        "GPU", "VRAM", "$/hr comm", "$/hr sec", "RunPod API name (pass to --gpu)"
-    );
+
+    let price = |api: &str| {
+        gpu::find(api).map(|g| format!("${:.2}/${:.2}", g.community, g.secure)).unwrap_or_else(|| "—".into())
+    };
+
+    if provider_name == "runpod" {
+        if let Some(key) = cfg.get("RUNPOD_API_KEY").filter(|s| !s.is_empty()) {
+            match arena_core::provider::runpod::fetch_gpu_types(key).await {
+                Ok(mut types) if !types.is_empty() => {
+                    // Drop RunPod's "unknown" placeholder.
+                    types.retain(|t| t.id != "unknown" && t.memory_gb > 0);
+                    types.sort_by(|a, b| a.memory_gb.cmp(&b.memory_gb).then(a.display_name.cmp(&b.display_name)));
+                    println!("{:<16} {:>5}  {:>14}   {}", "GPU", "VRAM", "$/hr comm/sec", "API name (pass to --gpu)");
+                    for t in &types {
+                        println!("{:<16} {:>4}G  {:>14}   {}", t.display_name, t.memory_gb, price(&t.id), t.id);
+                    }
+                    println!(
+                        "\n{} GPU types (live from RunPod). Pass the API name (or a short alias like \
+                         A4000 / 3090) to --gpu. Prices are rough preset rates where known.",
+                        types.len()
+                    );
+                    return Ok(());
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("(couldn't fetch the live GPU list: {e} — showing local presets)\n"),
+            }
+        }
+    }
+
+    // Fallback: the curated presets (no network / non-RunPod).
+    println!("{:<14} {:>5}  {:>9}  {:>8}   {}", "GPU", "VRAM", "$/hr comm", "$/hr sec", "RunPod API name (--gpu)");
     for g in gpu::PRESETS {
         println!(
             "{:<14} {:>4}G  {:>9}  {:>8}   {}",
-            g.label,
-            g.vram_gb,
-            format!("${:.2}", g.community),
-            format!("${:.2}", g.secure),
-            g.api,
+            g.label, g.vram_gb, format!("${:.2}", g.community), format!("${:.2}", g.secure), g.api,
         );
     }
     println!(
-        "\nPass the API name, the label, or a short alias (e.g. `A4000`, `3090`, \"A100 SXM\") to --gpu.\n\
-         Prices are rough RunPod community/secure rates; Vast varies."
+        "\n(local presets — run with --provider runpod + a key for the full live list.)\n\
+         Pass the API name, label, or alias (e.g. `A4000`, `3090`, \"A100 SXM\") to --gpu."
     );
     Ok(())
 }

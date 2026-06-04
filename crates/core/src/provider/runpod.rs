@@ -181,3 +181,44 @@ impl Provider for RunpodProvider {
         Ok(())
     }
 }
+
+/// One entry from RunPod's GPU catalog (its GraphQL `gpuTypes`).
+#[derive(Debug, Clone)]
+pub struct GpuType {
+    /// The exact name to pass to `--gpu` (e.g. "NVIDIA A100 80GB PCIe").
+    pub id: String,
+    /// Short display name (e.g. "A100 PCIe").
+    pub display_name: String,
+    pub memory_gb: u32,
+}
+
+/// Fetch RunPod's full GPU catalog via GraphQL (the REST v1 API has no gpu-types route).
+/// This is the authoritative, live list of `--gpu` names — including ones the local
+/// preset table doesn't alias.
+pub async fn fetch_gpu_types(api_key: &str) -> Result<Vec<GpuType>> {
+    let client = Client::new();
+    let url = format!("https://api.runpod.io/graphql?api_key={api_key}");
+    let q = json!({ "query": "{ gpuTypes { id displayName memoryInGb } }" });
+    let resp = client.post(&url).json(&q).send().await?;
+    let status = resp.status();
+    let v: Value = resp.json().await?;
+    if !status.is_success() {
+        return Err(Error::provider_http(status, &v, "fetch gpu types"));
+    }
+    let arr = v
+        .get("data")
+        .and_then(|d| d.get("gpuTypes"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Ok(arr
+        .iter()
+        .filter_map(|x| {
+            Some(GpuType {
+                id: x.get("id")?.as_str()?.to_string(),
+                display_name: x.get("displayName").and_then(Value::as_str).unwrap_or("").to_string(),
+                memory_gb: x.get("memoryInGb").and_then(Value::as_u64).unwrap_or(0) as u32,
+            })
+        })
+        .collect())
+}
