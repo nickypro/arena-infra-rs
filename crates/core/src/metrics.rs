@@ -178,7 +178,8 @@ impl PodMetrics {
             .iter()
             .find_map(|g| g.name.clone())
             .unwrap_or_else(|| "GPU".to_string());
-        Some(if n > 1 { format!("{n}×{name}") } else { name })
+        // Always prefix the count ("1×…"/"2×…") so the column reads consistently.
+        Some(format!("{n}×{name}"))
     }
 }
 
@@ -349,7 +350,7 @@ mod tests {
             gpus: parse_nvidia_smi("NVIDIA RTX A4000, 0, 0, 16000, 30\n"),
             ..Default::default()
         };
-        assert_eq!(m.gpu_summary().as_deref(), Some("RTX A4000"));
+        assert_eq!(m.gpu_summary().as_deref(), Some("1×RTX A4000"));
         let m2 = PodMetrics {
             gpus: parse_nvidia_smi(
                 "NVIDIA RTX A4000, 0, 0, 16000, 30\nNVIDIA RTX A4000, 0, 0, 16000, 30\n",

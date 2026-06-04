@@ -1277,9 +1277,9 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
     let show_saved = w >= 96;
     let show_progress = w >= 110;
     let show_spark = with_spark && w >= 138;
-    // GPU shows VRAM ("RTX A4000 16G") when there's room; when cramped, names compress
-    // (arena8-apple→apple, RTX A4000→A4000) so the core columns stay readable.
-    let gpu_vram = w >= 122;
+    // When cramped, names compress (arena8-apple→apple, RTX A4000→A4000) so the core
+    // columns stay readable. GPU always carries count + VRAM ("2×A4000 16G"), truncated
+    // by the column when there's no room.
     let narrow = w < 100;
 
     let mut header_cells =
@@ -1328,7 +1328,8 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
             if narrow {
                 gpu = gpu.replace("RTX ", "");
             }
-            if gpu_vram && gpu != "-" {
+            // Always append VRAM; the column truncates the tail if space is tight.
+            if gpu != "-" {
                 if let Some(g) = m.and_then(|m| m.vram_gb()) {
                     gpu = format!("{gpu} {g}G");
                 }
@@ -1409,7 +1410,7 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
         .collect();
 
     let name_w = if narrow { 10 } else { 16 }; // short names when cramped
-    let gpu_w = if gpu_vram { 20 } else if narrow { 11 } else { 16 }; // wider for "… 16G"
+    let gpu_w = if narrow { 12 } else { 16 }; // fits "2×A4000 16G"; truncates if longer
     let mut widths = vec![
         Constraint::Length(1),  // mark (•)
         Constraint::Length(1),  // P (provider glyph)
