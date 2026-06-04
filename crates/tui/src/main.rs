@@ -67,13 +67,13 @@ const REFRESH_STEPS: &[u64] = &[2, 5, 10, 20, 60];
 enum Mode {
     List,
     Detail,
-    /// Action chooser for the selected pod.
-    Menu,
+    /// Action chooser for the selected pod (`sel` = highlighted row, navigable ↑/↓).
+    Menu { sel: usize },
     /// A pending action awaiting confirmation.
     Confirm(Confirm),
     /// Multi-pod action chooser (safe ops). `scope` is the whole fleet (`A`) or just the
-    /// marked set (`a` with marks).
-    FleetMenu { scope: Scope },
+    /// marked set (`a` with marks); `sel` = highlighted row.
+    FleetMenu { scope: Scope, sel: usize },
     /// A pending multi-pod action; requires typing the confirm token (`ALL` for the whole
     /// fleet, the pod count for a marked set).
     FleetConfirm { action: Action, typed: String, scope: Scope },
@@ -145,6 +145,8 @@ struct Ui {
     selected: usize,
     /// Pod ids marked for a bulk action (multi-select via space).
     marked: std::collections::HashSet<String>,
+    /// Scroll offset for the result modal (so long fleet outputs are readable).
+    result_scroll: u16,
 }
 
 impl Ui {
@@ -196,6 +198,7 @@ async fn main() -> Result<()> {
         mode: Mode::List,
         selected: 0,
         marked: std::collections::HashSet::new(),
+        result_scroll: 0,
     };
 
     let mut terminal = setup_terminal()?;
@@ -400,6 +403,7 @@ async fn run(
         {
             let msg = shared.lock().unwrap().action_result.take();
             if let Some(msg) = msg {
+                ui.result_scroll = 0;
                 ui.mode = Mode::Result(msg);
                 nudge.notify_one();
             }
@@ -468,14 +472,14 @@ async fn run(
                     KeyCode::Char('a') => {
                         // Act on the marked set if any are marked, else the cursor pod.
                         if !ui.marked.is_empty() {
-                            ui.mode = Mode::FleetMenu { scope: Scope::Marked };
+                            ui.mode = Mode::FleetMenu { scope: Scope::Marked, sel: 0 };
                         } else if len > 0 {
-                            ui.mode = Mode::Menu;
+                            ui.mode = Mode::Menu { sel: 0 };
                         }
                     }
                     KeyCode::Char('A') => {
                         if len > 0 {
-                            ui.mode = Mode::FleetMenu { scope: Scope::All };
+                            ui.mode = Mode::FleetMenu { scope: Scope::All, sel: 0 };
                         }
                     }
                     KeyCode::Char(' ') => {
@@ -501,28 +505,26 @@ async fn run(
                     _ => {}
                 }
             }
-            Mode::Menu => match code {
-                KeyCode::Esc => ui.mode = Mode::List,
-                KeyCode::Char(ch) => {
-                    if let (Some(action), Some(pod)) =
-                        (Action::from_key(ch), selected_pod(shared, ui.selected))
-                    {
-                        let shown = ui.shown_name(&pod.name);
-                        ui.mode = if action.needs_input() {
-                            // Run / set-branch: collect the command/branch first.
-                            Mode::Input {
-                                action,
-                                scope: InputScope::Pod { name: shown, id: pod.id },
-                                value: String::new(),
-                            }
-                        } else {
-                            let preview = build_preview(&ui.cfg, action, &pod);
-                            Mode::Confirm(Confirm::new(action, shown, pod.id, preview))
-                        };
+            Mode::Menu { mut sel } => {
+                let n = Action::MENU.len();
+                match code {
+                    KeyCode::Esc => ui.mode = Mode::List,
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        sel = sel.saturating_sub(1);
+                        ui.mode = Mode::Menu { sel };
                     }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        sel = (sel + 1).min(n - 1);
+                        ui.mode = Mode::Menu { sel };
+                    }
+                    KeyCode::Enter => choose_pod_action(shared, &mut ui, Action::MENU[sel.min(n - 1)].1),
+                    KeyCode::Char(ch) => match Action::from_key(ch) {
+                        Some(action) => choose_pod_action(shared, &mut ui, action),
+                        None => ui.mode = Mode::Menu { sel },
+                    },
+                    _ => ui.mode = Mode::Menu { sel },
                 }
-                _ => {}
-            },
+            }
             Mode::Confirm(mut c) => {
                 let typed = c.action.requires_typed_name();
                 match code {
@@ -541,38 +543,29 @@ async fn run(
                     _ => ui.mode = Mode::Confirm(c),
                 }
             }
-            Mode::FleetMenu { scope } => match code {
-                KeyCode::Esc => ui.mode = Mode::List,
-                // Safe mutating ops (require typing the confirm token).
-                KeyCode::Char(ch @ ('r' | 'b' | 'p')) => {
-                    let action = match ch {
-                        'r' => Action::Restart,
-                        'b' => Action::Backup,
-                        _ => Action::Setup,
-                    };
-                    ui.mode = Mode::FleetConfirm { action, typed: String::new(), scope };
+            Mode::FleetMenu { scope, mut sel } => {
+                let actions = Action::fleet_menu(scope == Scope::Marked);
+                let n = actions.len();
+                match code {
+                    KeyCode::Esc => ui.mode = Mode::List,
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        sel = sel.saturating_sub(1);
+                        ui.mode = Mode::FleetMenu { scope, sel };
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        sel = (sel + 1).min(n - 1);
+                        ui.mode = Mode::FleetMenu { scope, sel };
+                    }
+                    KeyCode::Enter => {
+                        choose_fleet_action(shared, &mut ui, provider, actions[sel.min(n - 1)].1, scope);
+                    }
+                    KeyCode::Char(ch) => match actions.iter().find(|(k, _)| *k == ch) {
+                        Some((_, action)) => choose_fleet_action(shared, &mut ui, provider, *action, scope),
+                        None => ui.mode = Mode::FleetMenu { scope, sel },
+                    },
+                    _ => ui.mode = Mode::FleetMenu { scope, sel },
                 }
-                // Terminate the marked set (not offered fleet-wide — use per-pod / CLI
-                // `terminate --all` for that). Gated by typing the count, like the rest.
-                KeyCode::Char('t') if scope == Scope::Marked => {
-                    ui.mode = Mode::FleetConfirm { action: Action::Terminate, typed: String::new(), scope };
-                }
-                // Set-branch / run need an argument typed first.
-                KeyCode::Char(ch @ ('x' | 'g')) => {
-                    let action = if ch == 'x' { Action::Run } else { Action::SetBranch };
-                    ui.mode = Mode::Input { action, scope: InputScope::Set(scope), value: String::new() };
-                }
-                // Test is read-only — run it (scoped) right away, no confirm gate.
-                KeyCode::Char('e') => {
-                    let pods = scope_pods(shared, &ui.marked, scope);
-                    let (provider, cfg) = (provider.clone(), ui.cfg.clone());
-                    ui.mode = Mode::Working(format!("testing torch on {} pod(s)…", pods.len()));
-                    start_action(shared, async move {
-                        execute_fleet(&provider, &cfg, Action::Test, pods, None).await
-                    });
-                }
-                _ => {}
-            },
+            }
             Mode::FleetConfirm { action, mut typed, scope } => {
                 let token = fleet_confirm_token(shared, &ui.marked, scope);
                 match code {
@@ -720,11 +713,22 @@ async fn run(
             },
             // A background action is running — ignore keys (Ctrl+C still quits, above).
             Mode::Working(_) => {}
-            Mode::Result(_) => {
-                // Any key dismisses the result, then nudge a refresh to re-sync.
-                ui.mode = Mode::List;
-                nudge.notify_one();
-            }
+            Mode::Result(_) => match code {
+                // Scroll long outputs (e.g. a fleet test); other keys dismiss.
+                KeyCode::Up | KeyCode::Char('k') => {
+                    ui.result_scroll = ui.result_scroll.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    ui.result_scroll = ui.result_scroll.saturating_add(1);
+                }
+                KeyCode::PageUp => ui.result_scroll = ui.result_scroll.saturating_sub(10),
+                KeyCode::PageDown => ui.result_scroll = ui.result_scroll.saturating_add(10),
+                _ => {
+                    ui.result_scroll = 0;
+                    ui.mode = Mode::List;
+                    nudge.notify_one();
+                }
+            },
         }
     }
     Ok(())
@@ -748,28 +752,20 @@ async fn execute_fleet(
         set.spawn(async move { execute(provider.as_ref(), &cfg, action, &pod, arg.as_deref()).await });
     }
     let mut ok = 0usize;
-    let mut fails: Vec<String> = Vec::new();
+    let mut lines: Vec<String> = Vec::new();
     while let Some(joined) = set.join_next().await {
         if let Ok(msg) = joined {
             if msg.starts_with('✓') {
                 ok += 1;
-            } else {
-                fails.push(msg);
             }
+            lines.push(msg);
         }
     }
-    let mut s = format!("fleet {}: {ok}/{total} ok", action.label());
-    if !fails.is_empty() {
-        s.push_str(&format!(", {} failed:", fails.len()));
-        for f in fails.iter().take(8) {
-            s.push('\n');
-            s.push_str(f);
-        }
-        if fails.len() > 8 {
-            s.push_str(&format!("\n… +{} more", fails.len() - 8));
-        }
-    }
-    s
+    // Show EVERY pod's line (sorted), not just failures — so e.g. `test` shows each
+    // pod's torch version. The result modal scrolls if it's taller than the screen.
+    lines.sort();
+    let header = format!("{} — {ok}/{total} ok", action.label());
+    std::iter::once(header).chain(lines).collect::<Vec<_>>().join("\n")
 }
 
 /// Build the GPU-type choices for the add-pod form: the config default first (so the
@@ -885,6 +881,47 @@ async fn create_pods(
         s.push_str(f);
     }
     (s, created)
+}
+
+/// A menu pick for the cursor pod: run/set-branch collect an argument first; everything
+/// else goes through a confirm modal. Shared by the arrow-Enter and letter-key paths.
+fn choose_pod_action(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, action: Action) {
+    let Some(pod) = selected_pod(shared, ui.selected) else {
+        ui.mode = Mode::List;
+        return;
+    };
+    let shown = ui.shown_name(&pod.name);
+    ui.mode = if action.needs_input() {
+        Mode::Input { action, scope: InputScope::Pod { name: shown, id: pod.id }, value: String::new() }
+    } else {
+        let preview = build_preview(&ui.cfg, action, &pod);
+        Mode::Confirm(Confirm::new(action, shown, pod.id, preview))
+    };
+}
+
+/// A menu pick for a multi-pod scope: `test` runs right away (read-only); run/set-branch
+/// collect an argument; the rest go through the typed-token confirm.
+fn choose_fleet_action(
+    shared: &Arc<Mutex<Shared>>,
+    ui: &mut Ui,
+    provider: &Arc<dyn Provider>,
+    action: Action,
+    scope: Scope,
+) {
+    match action {
+        Action::Test => {
+            let pods = scope_pods(shared, &ui.marked, scope);
+            let (provider, cfg) = (provider.clone(), ui.cfg.clone());
+            ui.mode = Mode::Working(format!("testing torch on {} pod(s)…", pods.len()));
+            start_action(shared, async move {
+                execute_fleet(&provider, &cfg, Action::Test, pods, None).await
+            });
+        }
+        Action::Run | Action::SetBranch => {
+            ui.mode = Mode::Input { action, scope: InputScope::Set(scope), value: String::new() };
+        }
+        _ => ui.mode = Mode::FleetConfirm { action, typed: String::new(), scope },
+    }
 }
 
 /// Start a confirmed single-pod action **in the background** (so a slow SSH op doesn't
@@ -1211,14 +1248,14 @@ fn view(f: &mut Frame, shared: &Shared, ui: &Ui, secs: u64) {
     f.render_widget(Paragraph::new(footer_hint(shared, ui, secs)), chunks[3]);
 
     match &ui.mode {
-        Mode::Menu => render_menu(f, shared, ui),
+        Mode::Menu { sel } => render_menu(f, shared, ui, *sel),
         Mode::Confirm(c) => render_confirm(f, c),
-        Mode::FleetMenu { scope } => render_fleet_menu(f, shared, ui, *scope),
+        Mode::FleetMenu { scope, sel } => render_fleet_menu(f, shared, ui, *scope, *sel),
         Mode::FleetConfirm { action, typed, scope } => render_fleet_confirm(f, shared, ui, *action, typed, *scope),
         Mode::NewPod(form) => render_new_pod(f, form),
         Mode::Input { action, scope, value } => render_input(f, shared, ui, *action, scope, value),
-        Mode::Working(msg) => render_result(f, msg),
-        Mode::Result(msg) => render_result(f, msg),
+        Mode::Working(msg) => render_result(f, msg, 0),
+        Mode::Result(msg) => render_result(f, msg, ui.result_scroll),
         _ => {}
     }
 }
@@ -1651,14 +1688,14 @@ fn footer_hint(shared: &Shared, ui: &Ui, secs: u64) -> String {
     let keys = match ui.mode {
         Mode::List => "[enter] detail  [space] mark  [a] act (cursor/marked)  [A] all  [c] clear marks  [n] new  [s] names  [r] now  [q] quit",
         Mode::Detail => "[space] mark  [a] act (cursor/marked)  [A] all  [c] clear marks  [n] new  [s] names  [r] now  [esc] back  [q] quit",
-        Mode::Menu => "[r/s/t/b/p/e/x/g] choose action  [esc] cancel",
+        Mode::Menu { .. } => "[↑↓] move  [enter] choose  [letter] pick  [esc] cancel",
         Mode::Confirm(_) => "type to confirm  [enter] apply  [esc] cancel",
-        Mode::FleetMenu { .. } => "[r/b/p/e/x/g] (+[t] terminate on marked)  [esc] cancel",
+        Mode::FleetMenu { .. } => "[↑↓] move  [enter] choose  [letter] pick  [esc] cancel",
         Mode::FleetConfirm { .. } => "type the token to confirm  [enter] apply  [esc] cancel",
         Mode::NewPod { .. } => "[↑↓] pods  [+-] gpus  [←→] type  [enter] create  [esc] cancel",
         Mode::Input { .. } => "type the value  [enter] run  [esc] cancel",
         Mode::Working(_) => "working… (background) — please wait",
-        Mode::Result(_) => "[any key] dismiss",
+        Mode::Result(_) => "[↑↓] scroll  ·  [any other key] dismiss",
     };
     format!("{}{} · {} · every {}s · {}", shared.status, spin, age, secs, keys)
 }
@@ -1683,33 +1720,45 @@ fn centered_rect(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
         .split(v[1])[1]
 }
 
-fn render_menu(f: &mut Frame, shared: &Shared, ui: &Ui) {
+/// Render a navigable action menu: a title, one highlighted row per action (with its
+/// key + description; destructive ones in red), and a key hint. `sel` is the cursor.
+fn render_action_menu(f: &mut Frame, title: String, actions: &[(char, Action)], sel: usize) {
+    let mut lines: Vec<Line> = vec![Line::from(title), Line::from("")];
+    for (i, (k, a)) in actions.iter().enumerate() {
+        let selected = i == sel;
+        let base = if a.is_destructive() {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default()
+        };
+        let style = if selected {
+            base.add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            base
+        };
+        let marker = if selected { "▶ " } else { "  " };
+        lines.push(Line::styled(format!("{marker}[{k}] {:<10} {}", a.label(), a.desc()), style));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::styled(
+        "[↑↓] move   [enter] choose   [letter] pick   [esc] cancel",
+        Style::default().fg(Color::DarkGray),
+    ));
+    let area = centered_rect(58, 60, f.area());
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" action ")),
+        area,
+    );
+}
+
+fn render_menu(f: &mut Frame, shared: &Shared, ui: &Ui, sel: usize) {
     let name = shared
         .pods
         .get(ui.selected)
         .map(|p| ui.shown_name(&p.name))
         .unwrap_or_else(|| "?".into());
-    let lines = vec![
-        format!("Actions for {name}:"),
-        String::new(),
-        "  [r]  restart   (in place)".into(),
-        "  [s]  stop".into(),
-        "  [t]  terminate (irreversible)".into(),
-        "  [b]  backup    (commit + push tree)".into(),
-        "  [p]  setup     (provision / re-point git)".into(),
-        "  [e]  test      (torch version)".into(),
-        "  [x]  run       (type a shell command)".into(),
-        "  [g]  set-branch (type a branch)".into(),
-        String::new(),
-        "[esc] cancel".into(),
-    ];
-    let area = centered_rect(54, 55, f.area());
-    f.render_widget(Clear, area);
-    f.render_widget(
-        Paragraph::new(lines.join("\n"))
-            .block(Block::default().borders(Borders::ALL).title(" action ")),
-        area,
-    );
+    render_action_menu(f, format!("Actions for {name}:"), Action::MENU, sel);
 }
 
 fn render_confirm(f: &mut Frame, c: &Confirm) {
@@ -1762,34 +1811,10 @@ fn scope_label(shared: &Shared, marked: &std::collections::HashSet<String>, scop
     }
 }
 
-fn render_fleet_menu(f: &mut Frame, shared: &Shared, ui: &Ui, scope: Scope) {
+fn render_fleet_menu(f: &mut Frame, shared: &Shared, ui: &Ui, scope: Scope, sel: usize) {
     let (_, who) = scope_label(shared, &ui.marked, scope);
-    let mut lines = vec![
-        format!("Actions — {who}:"),
-        String::new(),
-        "  [r]  restart    (in place)".into(),
-        "  [b]  backup     (commit + push trees)".into(),
-        "  [p]  setup      (provision / re-point git)".into(),
-        "  [e]  test       (torch version)".into(),
-        "  [x]  run        (type a shell command)".into(),
-        "  [g]  set-branch (type a branch)".into(),
-    ];
-    // Terminate is offered for a marked selection only (not fleet-wide).
-    if scope == Scope::Marked {
-        lines.push("  [t]  terminate  (irreversible)".into());
-    }
-    lines.push(String::new());
-    if scope == Scope::All {
-        lines.push("(to terminate, mark pods and use [a], or the CLI)".into());
-    }
-    lines.push("[esc] cancel".into());
-    let area = centered_rect(60, 55, f.area());
-    f.render_widget(Clear, area);
-    f.render_widget(
-        Paragraph::new(lines.join("\n"))
-            .block(Block::default().borders(Borders::ALL).title(" multi-pod action ")),
-        area,
-    );
+    let actions = Action::fleet_menu(scope == Scope::Marked);
+    render_action_menu(f, format!("Actions — {who}:"), &actions, sel);
 }
 
 fn render_fleet_confirm(f: &mut Frame, shared: &Shared, ui: &Ui, action: Action, typed: &str, scope: Scope) {
@@ -1949,21 +1974,27 @@ fn render_new_pod(f: &mut Frame, form: &NewPodForm) {
     );
 }
 
-fn render_result(f: &mut Frame, msg: &str) {
-    // Grow the box for multi-line results (e.g. a fleet summary with failures).
-    let lines = msg.lines().count() as u16 + 2;
-    let pct_y = (lines * 100 / f.area().height.max(1) + 6).clamp(20, 80);
-    let area = centered_rect(60, pct_y, f.area());
+fn render_result(f: &mut Frame, msg: &str, scroll: u16) {
+    // Grow the box for multi-line results (e.g. a per-pod fleet readout); it scrolls if
+    // taller than the screen.
+    let n = msg.lines().count() as u16;
+    let pct_y = ((n + 4) * 100 / f.area().height.max(1) + 6).clamp(25, 85);
+    let area = centered_rect(70, pct_y, f.area());
     f.render_widget(Clear, area);
     let color = if msg.contains('✗') { Color::Red } else { Color::Green };
+    // Clamp scroll so you can't page past the end.
+    let visible = area.height.saturating_sub(2);
+    let max_scroll = n.saturating_sub(visible.saturating_sub(1));
+    let scroll = scroll.min(max_scroll);
+    let footer = if n + 2 > visible { "  [↑↓] scroll · [esc] dismiss" } else { "" };
     f.render_widget(
-        Paragraph::new(format!("{msg}\n\n[any key] dismiss"))
-            .wrap(Wrap { trim: true })
+        Paragraph::new(msg.to_string())
+            .scroll((scroll, 0))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(color))
-                    .title(" result "),
+                    .title(format!(" result {footer}")),
             ),
         area,
     );

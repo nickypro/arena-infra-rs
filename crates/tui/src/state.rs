@@ -316,20 +316,47 @@ pub enum Action {
 }
 
 impl Action {
-    /// The action-menu entries, in display order, with their selector keys.
+    /// The action-menu entries, in display order (harmless first, destructive last —
+    /// so the default-highlighted top option is the read-only `test`), with their keys.
     pub const MENU: &'static [(char, Action)] = &[
-        ('r', Action::Restart),
-        ('s', Action::Stop),
-        ('t', Action::Terminate),
-        ('b', Action::Backup),
-        ('p', Action::Setup),
         ('e', Action::Test),
         ('x', Action::Run),
         ('g', Action::SetBranch),
+        ('b', Action::Backup),
+        ('p', Action::Setup),
+        ('r', Action::Restart),
+        ('s', Action::Stop),
+        ('t', Action::Terminate),
     ];
 
     pub fn from_key(c: char) -> Option<Action> {
         Self::MENU.iter().find(|(k, _)| *k == c).map(|(_, a)| *a)
+    }
+
+    /// The multi-pod menu's actions (and keys): everything except the per-pod-only
+    /// `stop`; `terminate` is offered only when a marked set is selected.
+    pub fn fleet_menu(has_marked: bool) -> Vec<(char, Action)> {
+        Self::MENU
+            .iter()
+            .copied()
+            .filter(|(_, a)| {
+                !matches!(a, Action::Stop) && (*a != Action::Terminate || has_marked)
+            })
+            .collect()
+    }
+
+    /// A short description shown beside the action in the menu.
+    pub fn desc(&self) -> &'static str {
+        match self {
+            Action::Restart => "restart in place",
+            Action::Stop => "stop the pod",
+            Action::Terminate => "terminate — irreversible",
+            Action::Backup => "commit + push the tree",
+            Action::Setup => "provision / re-point git",
+            Action::Test => "torch version (read-only)",
+            Action::Run => "run a shell command",
+            Action::SetBranch => "switch branch",
+        }
     }
 
     pub fn label(&self) -> &'static str {
