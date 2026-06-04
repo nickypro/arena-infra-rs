@@ -379,9 +379,16 @@ impl Action {
         matches!(self, Action::Restart | Action::Stop | Action::Terminate)
     }
 
-    /// Whether this action is irreversible (drives the warning styling).
+    /// Whether this action is irreversible (drives the IRREVERSIBLE warning).
     pub fn is_destructive(&self) -> bool {
         matches!(self, Action::Terminate)
+    }
+
+    /// Whether to render the action in red in the menu — destructive *or* disruptive
+    /// (stop takes the pod down). Distinct from [`Self::is_destructive`] so stop is red
+    /// without claiming to be irreversible.
+    pub fn is_risky(&self) -> bool {
+        matches!(self, Action::Terminate | Action::Stop)
     }
 
     /// Actions that need a free-text argument typed first (the command / the branch),

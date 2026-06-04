@@ -1743,8 +1743,8 @@ fn footer_hint(shared: &Shared, ui: &Ui, secs: u64) -> String {
     };
     let spin = if shared.refreshing { " ⟳" } else { "" };
     let keys = match ui.mode {
-        Mode::List => "[enter] detail  [c] ssh  [space] mark  [a] act  [A] all  [x] clear  [n] new  [s] names  [r] now  [q] quit",
-        Mode::Detail => "[c] ssh  [space] mark  [a] act  [A] all  [x] clear  [n] new  [s] names  [r] now  [esc] back  [q] quit",
+        Mode::List => "[enter] detail  [c] ssh  [space] mark / [x] unmark all  [a] act  [A] all  [n] new  [r] refresh",
+        Mode::Detail => "[c] ssh  [space] mark / [x] unmark all  [a] act  [A] all  [n] new  [r] refresh  [esc] back",
         Mode::Menu { .. } => "[↑↓] move  [enter] choose  [letter] pick  [esc] cancel",
         Mode::Confirm(_) => "type to confirm  [enter] apply  [esc] cancel",
         Mode::FleetMenu { .. } => "[↑↓] move  [enter] choose  [letter] pick  [esc] cancel",
@@ -1783,7 +1783,7 @@ fn render_action_menu(f: &mut Frame, title: String, actions: &[(char, Action)], 
     let mut lines: Vec<Line> = vec![Line::from(title), Line::from("")];
     for (i, (k, a)) in actions.iter().enumerate() {
         let selected = i == sel;
-        let base = if a.is_destructive() {
+        let base = if a.is_risky() {
             Style::default().fg(Color::Red)
         } else {
             Style::default()
