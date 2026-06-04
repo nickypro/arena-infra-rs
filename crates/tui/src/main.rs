@@ -1175,6 +1175,16 @@ fn health_cell(m: Option<&PodMetrics>) -> Cell<'static> {
     }
 }
 
+/// The API-key cell: ✓ if any LLM API key (OpenRouter/Anthropic/OpenAI) is exported on
+/// the pod (i.e. `copy-keys`/`keys` ran), ✗ if not, · if unknown/unreachable.
+fn api_cell(m: Option<&PodMetrics>) -> Cell<'static> {
+    match m.and_then(|m| (m.error.is_none()).then_some(m.has_api_key).flatten()) {
+        Some(true) => Cell::from(Span::styled("✓", Style::default().fg(Color::Green))),
+        Some(false) => Cell::from(Span::styled("✗", Style::default().fg(Color::Red))),
+        None => Cell::from(Span::styled("·", Style::default().fg(Color::DarkGray))),
+    }
+}
+
 /// The right-hand detail cell: progress if we have it, else the (truncated) fetch
 /// error, else "-".
 fn detail_cell(m: Option<&PodMetrics>) -> (String, Style) {
@@ -1296,7 +1306,7 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
     let show_spark = with_spark && w >= 138;
 
     let mut header_cells =
-        vec!["", "P", "NAME", "STATUS", "SET", "GPU", "GPU%", "MEM", "TEMP", "DISK", "$/HR", "BRANCH"];
+        vec!["", "P", "NAME", "STATUS", "SET", "API", "GPU", "GPU%", "MEM", "TEMP", "DISK", "$/HR", "BRANCH"];
     if show_saved {
         header_cells.push("SAVED");
     }
@@ -1359,6 +1369,7 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                 Cell::from(ui.shown_name(&p.name)),
                 status_cell,
                 health_cell(m),
+                api_cell(m),
                 Cell::from(gpu),
                 Cell::from(util_str).style(util_style(util, err)),
                 Cell::from(mem),
@@ -1406,6 +1417,7 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
         Constraint::Length(16), // NAME
         Constraint::Length(4),  // STATUS (abbreviated: run/exit/stop…)
         Constraint::Length(3),  // SET (✓✓✓)
+        Constraint::Length(3),  // API (key set?)
         Constraint::Length(16), // GPU (e.g. "A100 80GB PCIe")
         Constraint::Length(5),  // GPU%
         Constraint::Length(9),  // MEM (e.g. "120/240G")
@@ -1549,7 +1561,7 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     let origin = m.and_then(|m| m.origin.clone()).unwrap_or_else(|| "-".into());
     let origin_ok = m.and_then(|m| m.origin.as_deref().map(|o| o.contains("github.com")));
     let facts = format!(
-        "status:   {}\ngpu:      {}\nendpoint: {}\ncost:     {}\ndisk:     {}\nbranch:   {}\nbackup:   {}\norigin:   {} {}\nsetup:    .name {}   key {}   origin→gh {}\nprogress: {}",
+        "status:   {}\ngpu:      {}\nendpoint: {}\ncost:     {}\ndisk:     {}\nbranch:   {}\nbackup:   {}\norigin:   {} {}\nsetup:    .name {}   deploy-key {}   origin→gh {}   api-key {}\nprogress: {}",
         display_status(&pod.status, m.map(|m| m.error.is_none())),
         gpu,
         endpoint,
@@ -1562,6 +1574,7 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
         ok(m.and_then(|m| m.has_name)),
         ok(m.and_then(|m| m.has_key)),
         ok(origin_ok),
+        ok(m.and_then(|m| m.has_api_key)),
         progress,
     );
     f.render_widget(Paragraph::new(facts).wrap(Wrap { trim: true }), rows[0]);

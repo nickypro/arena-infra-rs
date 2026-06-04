@@ -3038,9 +3038,16 @@ async fn keys_targets(
 }
 
 /// Persist one machine's freshly minted OpenRouter key into the per-host CSV (upsert).
-fn write_openrouter_key(host: &str, secret: &str) -> Result<()> {
+/// A new file is seeded with a header naming the arena iteration (`prefix`) so the CSV
+/// is self-documenting about which cohort the keys belong to.
+fn write_openrouter_key(host: &str, secret: &str, prefix: &str) -> Result<()> {
     std::fs::create_dir_all("./keys").context("creating ./keys")?;
-    let existing = std::fs::read_to_string(OPENROUTER_KEYS_CSV).unwrap_or_default();
+    let mut existing = std::fs::read_to_string(OPENROUTER_KEYS_CSV).unwrap_or_default();
+    if existing.trim().is_empty() {
+        existing = format!(
+            "# OpenRouter API keys — arena iteration: {prefix}\n# host,key (one runtime key per machine; managed by `arena keys`)\n"
+        );
+    }
     let updated = arena_core::apikeys::upsert_csv(&existing, host, secret);
     std::fs::write(OPENROUTER_KEYS_CSV, updated)
         .with_context(|| format!("writing {OPENROUTER_KEYS_CSV}"))?;
@@ -3117,7 +3124,7 @@ async fn handle_keys(cmd: KeysCmd, provider: &dyn Provider, cfg: &Config, yes: b
                 }
                 match or.create_key(&kn, Some(limit)).await {
                     Ok(ck) => {
-                        write_openrouter_key(host, &ck.secret)?;
+                        write_openrouter_key(host, &ck.secret, &prefix)?;
                         println!("✓ {host}: minted {}", &ck.hash[..ck.hash.len().min(12)]);
                         made += 1;
                     }
@@ -3169,7 +3176,7 @@ async fn handle_keys(cmd: KeysCmd, provider: &dyn Provider, cfg: &Config, yes: b
                 }
                 match or.create_key(&kn, Some(limit)).await {
                     Ok(ck) => {
-                        write_openrouter_key(host, &ck.secret)?;
+                        write_openrouter_key(host, &ck.secret, &prefix)?;
                         println!("✓ {host}: rotated");
                         ok += 1;
                     }

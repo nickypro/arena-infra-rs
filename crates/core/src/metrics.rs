@@ -92,6 +92,9 @@ pub struct PodMetrics {
     pub has_name: Option<bool>,
     /// Whether the deploy key exists on the pod (None = not probed / unreachable).
     pub has_key: Option<bool>,
+    /// Whether any LLM API key (OpenRouter / Anthropic / OpenAI) is exported in the pod's
+    /// shell rc files — i.e. `copy-keys` has run. None = not probed / unreachable.
+    pub has_api_key: Option<bool>,
     /// Root-filesystem usage (used, total) in MB, if reported.
     pub disk_used_mb: Option<u32>,
     pub disk_total_mb: Option<u32>,
@@ -185,6 +188,11 @@ fn remote_command(opts: &ProbeOpts) -> String {
         ));
     }
     s.push_str("([ -e \"$HOME/.name\" ] && echo name=1 || echo name=0); ");
+    // Any LLM API key exported in the shell rc files (i.e. `copy-keys` has run)?
+    s.push_str(
+        "(grep -qsE '^[[:space:]]*export (OPENROUTER_API_KEY|ANTHROPIC_API_KEY|OPENAI_API_KEY)=' \
+         \"$HOME/.bashrc\" \"$HOME/.zshrc\" && echo apikey=1 || echo apikey=0); ",
+    );
     if let Some(key) = &opts.key_remote {
         let q = shell_quote(key);
         s.push_str(&format!("([ -e {q} ] && echo key=1 || echo key=0); "));
@@ -211,6 +219,7 @@ fn parse_probe(stdout: &str, m: &mut PodMetrics) {
             "origin" => m.origin = (!v.is_empty()).then(|| v.to_string()),
             "name" => m.has_name = Some(v == "1"),
             "key" => m.has_key = Some(v == "1"),
+            "apikey" => m.has_api_key = Some(v == "1"),
             "disk" => {
                 // "used_kb total_kb" -> MB
                 let mut it = v.split_whitespace().filter_map(|x| x.parse::<u64>().ok());
@@ -337,7 +346,7 @@ mod tests {
     #[test]
     fn parses_combined_probe_output() {
         let out = format!(
-            "NVIDIA RTX A4000, 15, 1000, 16000, 45\n{SENTINEL}\nbranch=autocommit-arena8-w0d1-apple\norigin=git@github.com:styme3279/ARENA_3.0.git\ncommitted=1717412400\ndirty=3\nname=1\nkey=0\ndisk=12582912 104857600\nprogress=epoch 3/10\n"
+            "NVIDIA RTX A4000, 15, 1000, 16000, 45\n{SENTINEL}\nbranch=autocommit-arena8-w0d1-apple\norigin=git@github.com:styme3279/ARENA_3.0.git\ncommitted=1717412400\ndirty=3\nname=1\napikey=1\nkey=0\ndisk=12582912 104857600\nprogress=epoch 3/10\n"
         );
         let mut m = PodMetrics::default();
         parse_probe(&out, &mut m);
@@ -348,6 +357,7 @@ mod tests {
         assert_eq!(m.last_commit, Some(1717412400));
         assert_eq!(m.dirty_files, Some(3));
         assert_eq!(m.has_name, Some(true));
+        assert_eq!(m.has_api_key, Some(true));
         assert_eq!(m.has_key, Some(false));
         // 12582912 KB / 1024 = 12288 MB used; 104857600 KB / 1024 = 102400 MB total.
         assert_eq!(m.disk_summary(), Some((12288, 102400)));
@@ -379,6 +389,7 @@ mod tests {
         assert!(cmd.contains("git status --porcelain"));
         assert!(cmd.contains("'/root/ARENA_3.0'"));
         assert!(cmd.contains("echo name=1"));
+        assert!(cmd.contains("OPENROUTER_API_KEY|ANTHROPIC_API_KEY|OPENAI_API_KEY"));
         assert!(cmd.contains("'/root/.ssh/id_ed25519'"));
         assert!(cmd.contains("cat /tmp/p"));
     }
