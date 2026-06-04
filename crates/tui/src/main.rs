@@ -1338,7 +1338,6 @@ fn summary_line(s: &FleetSummary) -> Paragraph<'static> {
 }
 
 fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: bool) {
-    const SPARK_W: usize = 12;
     // Responsive: the essential columns (~92 wide) always show; the nice-to-haves
     // (PROGRESS, then the GPU%/MEM% graphs) are dropped when the terminal is too narrow
     // so the core data isn't crushed to one column each.
@@ -1346,12 +1345,28 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
     let show_saved = w >= 96;
     let show_host = w >= 134; // host CPU% + RAM (extra, only when there's room)
     let show_progress = w >= 110;
-    let show_spark = with_spark && w >= 156;
     // When cramped, names compress (arena8-apple→apple) and the GPU drops the "RTX "
     // noise. Names compact a bit earlier (so you see "jack", not a truncated
     // "arena8-ja"); GPU always carries count + VRAM ("2×A4000 16G"), truncated if tight.
     let compact_names = w < 116;
     let narrow = w < 100;
+    let name_w = if compact_names { 10 } else { 16 };
+    let gpu_w = if narrow { 12 } else { 16 };
+
+    // Sparklines (GPU%/MEM% history) flex to fill whatever horizontal space is left after
+    // the other columns — so they grow on a wide screen and simply vanish when there's no
+    // room, rather than living behind a fixed threshold. PROGRESS gets a fixed budget when
+    // sparks are present so the leftover math is stable.
+    const PROGRESS_W: usize = 16;
+    let nonspark_cols = 12 + show_saved as usize + if show_host { 2 } else { 0 } + show_progress as usize;
+    let used = 1 + 1 + name_w + 4 + 4 + gpu_w + 5 + 9 + 4 + 9 + 7 + 6
+        + if show_saved { 6 } else { 0 }
+        + if show_host { 8 } else { 0 }
+        + if show_progress { PROGRESS_W } else { 0 }
+        + nonspark_cols.saturating_sub(1); // inter-column spacing
+    let leftover = w.saturating_sub(used);
+    let show_spark = with_spark && leftover >= 20; // ~2×9 + spacing
+    let spark_w = if show_spark { (leftover.saturating_sub(3) / 2).clamp(9, 30) } else { 0 };
 
     let mut header_cells =
         vec!["", "P", "NAME", "STATUS", "SET", "GPU", "GPU%", "MEM", "TEMP", "DISK", "$/HR", "BRANCH"];
@@ -1360,7 +1375,7 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
     }
     if show_host {
         header_cells.push("CPU%");
-        header_cells.push("RAM");
+        header_cells.push("RAM%");
     }
     if show_progress {
         header_cells.push("PROGRESS / ERROR");
@@ -1467,15 +1482,15 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                 ])));
             }
             if show_host {
-                // Host CPU% (coloured by load) and host RAM used/total.
+                // Host CPU% and RAM% (both coloured by load); exact RAM GB is in detail.
                 let cpu = m.and_then(|m| m.cpu_pct);
-                let cpu_str = cpu.map(|c| format!("{c}%")).unwrap_or_else(|| "-".into());
-                cells.push(Cell::from(cpu_str).style(util_style(cpu, err)));
-                let ram = match m.and_then(|m| m.host_mem_summary()) {
-                    Some((u, t)) => format!("{:.0}/{:.0}G", u as f64 / 1024.0, t as f64 / 1024.0),
-                    None => "-".into(),
-                };
-                cells.push(Cell::from(ram));
+                cells.push(Cell::from(cpu.map(|c| format!("{c}%")).unwrap_or_else(|| "-".into()))
+                    .style(util_style(cpu, err)));
+                let ram_pct = m.and_then(|m| m.host_mem_summary())
+                    .filter(|(_, t)| *t > 0)
+                    .map(|(u, t)| (u as u64 * 100 / t as u64) as u32);
+                cells.push(Cell::from(ram_pct.map(|p| format!("{p}%")).unwrap_or_else(|| "-".into()))
+                    .style(util_style(ram_pct, err)));
             }
             if show_progress {
                 let (detail, detail_style) = detail_cell(m);
@@ -1493,15 +1508,13 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                 } else {
                     (Color::DarkGray, Color::DarkGray)
                 };
-                cells.push(Cell::from(spark(&gpu_hist, SPARK_W)).style(Style::default().fg(gpu_c)));
-                cells.push(Cell::from(spark(&mem_hist, SPARK_W)).style(Style::default().fg(mem_c)));
+                cells.push(Cell::from(spark(&gpu_hist, spark_w)).style(Style::default().fg(gpu_c)));
+                cells.push(Cell::from(spark(&mem_hist, spark_w)).style(Style::default().fg(mem_c)));
             }
             Row::new(cells)
         })
         .collect();
 
-    let name_w = if compact_names { 10 } else { 16 }; // short names when cramped
-    let gpu_w = if narrow { 12 } else { 16 }; // fits "2×A4000 16G"; truncates if longer
     let mut widths = vec![
         Constraint::Length(1),  // mark (•)
         Constraint::Length(1),  // P (provider glyph)
@@ -1521,14 +1534,15 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
     }
     if show_host {
         widths.push(Constraint::Length(4)); // CPU%
-        widths.push(Constraint::Length(9)); // RAM (e.g. "46/504G")
+        widths.push(Constraint::Length(4)); // RAM%
     }
     if show_progress {
-        widths.push(Constraint::Min(10)); // PROGRESS / ERROR (flexible)
+        // Fixed budget when sparks are filling the rest; otherwise flex to fill.
+        widths.push(if show_spark { Constraint::Length(PROGRESS_W as u16) } else { Constraint::Min(10) });
     }
     if show_spark {
-        widths.push(Constraint::Length(SPARK_W as u16)); // GPU% history
-        widths.push(Constraint::Length(SPARK_W as u16)); // MEM% history
+        widths.push(Constraint::Length(spark_w as u16)); // GPU% history
+        widths.push(Constraint::Length(spark_w as u16)); // MEM% history
     }
     let table = Table::new(rows, widths)
         .header(header)
@@ -1611,14 +1625,14 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     let show_graphs = inner.height >= 18;
     let constraints: &[Constraint] = if show_graphs {
         &[
-            Constraint::Length(11), // header facts
+            Constraint::Length(12), // header facts
             Constraint::Min(3),    // per-GPU table
             Constraint::Length(3), // util sparkline
             Constraint::Length(3), // temp sparkline
         ]
     } else {
         &[
-            Constraint::Length(11), // header facts
+            Constraint::Length(12), // header facts
             Constraint::Min(3),    // per-GPU table
         ]
     };
@@ -1654,13 +1668,26 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     };
     let origin = m.and_then(|m| m.origin.clone()).unwrap_or_else(|| "-".into());
     let origin_ok = m.and_then(|m| m.origin.as_deref().map(|o| o.contains("github.com")));
+    // Host: CPU% and RAM (exact GB + %).
+    let host = {
+        let cpu = m.and_then(|m| m.cpu_pct).map(|c| format!("CPU {c}%")).unwrap_or_else(|| "CPU -".into());
+        let ram = match m.and_then(|m| m.host_mem_summary()) {
+            Some((u, t)) => {
+                let pct = if t > 0 { u as f64 / t as f64 * 100.0 } else { 0.0 };
+                format!("RAM {:.1}/{:.1}G ({pct:.0}%)", u as f64 / 1024.0, t as f64 / 1024.0)
+            }
+            None => "RAM -".into(),
+        };
+        format!("{cpu}   {ram}")
+    };
     let facts = format!(
-        "status:   {}\ngpu:      {}\nendpoint: {}\ncost:     {}\ndisk:     {}\nbranch:   {}\nbackup:   {}\nsync:     {}\norigin:   {} {}\nsetup:    .name {}   deploy-key {}   origin→gh {}   api-key {}\nprogress: {}",
+        "status:   {}\ngpu:      {}\nendpoint: {}\ncost:     {}\ndisk:     {}\nhost:     {}\nbranch:   {}\nbackup:   {}\nsync:     {}\norigin:   {} {}\nsetup:    .name {}   deploy-key {}   origin→gh {}   api-key {}\nprogress: {}",
         display_status(&pod.status, m.map(|m| m.error.is_none())),
         gpu,
         endpoint,
         cost,
         disk,
+        host,
         m.and_then(|m| m.branch.clone()).unwrap_or_else(|| "-".into()),
         backup_summary(m),
         sync_summary(m),
