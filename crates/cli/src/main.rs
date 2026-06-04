@@ -350,6 +350,30 @@ enum PodCmd {
         #[arg(long, default_value_t = 12)]
         interval: u64,
     },
+    /// Provision pods over SSH. Acts by default; --dry-run to preview.
+    ///
+    /// Per pod, in order:
+    ///   1. copy the git deploy key (scp) and chmod it;
+    ///   2. add a github.com block to ~/.ssh/config pointing at that key;
+    ///   3. add the shared + deploy public keys to ~/.ssh/authorized_keys;
+    ///   4. point the ARENA repo's origin at GitHub, fetch, and update the branch
+    ///      (stay on the current branch by default; --force checks out the default
+    ///      branch and hard-resets);
+    ///   5. update submodules;
+    ///   6. write ~/.name (export MACHINE_NAME=…);
+    ///   7. (optional) if HF_TOKEN is set, export it (HF_TOKEN + HUGGING_FACE_HUB_TOKEN)
+    ///      into ~/.bashrc & ~/.zshrc for gated-repo access — else this step is skipped.
+    ///
+    /// It does NOT distribute per-host API keys (use `pods copy-keys`) or back anything
+    /// up (use `pods backup` / `pods pull`).
+    Setup {
+        /// Preview only: print what would happen, change nothing.
+        #[arg(long, visible_aliases = ["dryrun", "dry"])]
+        dry_run: bool,
+        /// Force-checkout the default branch and hard-reset (else stay on current).
+        #[arg(long)]
+        force: bool,
+    },
     /// Stop a pod, or many with --all (+ --include/--exclude).
     Stop {
         /// Machine name (e.g. arena8-apple) or raw provider id. Omit with --all.
@@ -386,8 +410,7 @@ enum PodCmd {
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// Commit + push a pod's current branch over SSH (skips main/master). One pod by
-    /// name/id, or all pods if omitted.
+    /// Commit + push a pod's (or all pods') current branch over SSH (skips main/master).
     Backup {
         /// Machine name or id to back up. Omit to back up every reachable pod.
         target: Option<String>,
@@ -397,70 +420,6 @@ enum PodCmd {
         /// Commit message (default: "arena backup <machine>").
         #[arg(long)]
         message: Option<String>,
-    },
-    /// Provision pods over SSH. Acts by default; --dry-run to preview.
-    ///
-    /// Per pod, in order:
-    ///   1. copy the git deploy key (scp) and chmod it;
-    ///   2. add a github.com block to ~/.ssh/config pointing at that key;
-    ///   3. add the shared + deploy public keys to ~/.ssh/authorized_keys;
-    ///   4. point the ARENA repo's origin at GitHub, fetch, and update the branch
-    ///      (stay on the current branch by default; --force checks out the default
-    ///      branch and hard-resets);
-    ///   5. update submodules;
-    ///   6. write ~/.name (export MACHINE_NAME=…);
-    ///   7. (optional) if HF_TOKEN is set, export it (HF_TOKEN + HUGGING_FACE_HUB_TOKEN)
-    ///      into ~/.bashrc & ~/.zshrc for gated-repo access — else this step is skipped.
-    ///
-    /// It does NOT distribute per-host API keys (use `pods copy-keys`) or back anything
-    /// up (use `pods backup` / `pods pull`).
-    Setup {
-        /// Preview only: print what would happen, change nothing.
-        #[arg(long, visible_aliases = ["dryrun", "dry"])]
-        dry_run: bool,
-        /// Force-checkout the default branch and hard-reset (else stay on current).
-        #[arg(long)]
-        force: bool,
-    },
-    /// Run a shell command on every pod over SSH (concurrent).
-    Run {
-        /// The command to run (everything after `run`).
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
-        command: Vec<String>,
-        /// Preview only: print the command + target pods, run nothing.
-        #[arg(long, visible_aliases = ["dryrun", "dry"])]
-        dry_run: bool,
-    },
-    /// Health check: torch version on every pod (read-only).
-    Test,
-    /// Switch a pod's branch (gentle ff-only; --hard force-resets to origin).
-    SetBranch {
-        /// Branch to check out (e.g. main, or a feature branch).
-        branch: String,
-        /// Machine name or id. Omit with --all.
-        target: Option<String>,
-        /// Apply to every pod with an SSH endpoint.
-        #[arg(long)]
-        all: bool,
-        /// DESTRUCTIVE: hard-reset the branch to `origin/<branch>`, discarding local
-        /// commits/changes (untracked files are left alone).
-        #[arg(long)]
-        hard: bool,
-        /// Preview only: print what would happen, change nothing.
-        #[arg(long, visible_aliases = ["dryrun", "dry"])]
-        dry_run: bool,
-    },
-    /// Create + push each pod's wNdM autocommit branch (no commit).
-    InitBranches {
-        /// Override the iteration week (default: computed from ARENA_START_DATE).
-        #[arg(long)]
-        week: Option<u32>,
-        /// Override the day-within-week (default: computed from ARENA_START_DATE).
-        #[arg(long)]
-        day: Option<u32>,
-        /// Preview only: print the per-pod commands, change nothing.
-        #[arg(long, visible_aliases = ["dryrun", "dry"])]
-        dry_run: bool,
     },
     /// Rsync each pod's home to a local backup folder (the file backup).
     Pull {
@@ -484,6 +443,46 @@ enum PodCmd {
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
+    /// Create + push each pod's wNdM autocommit branch (no commit).
+    InitBranches {
+        /// Override the iteration week (default: computed from ARENA_START_DATE).
+        #[arg(long)]
+        week: Option<u32>,
+        /// Override the day-within-week (default: computed from ARENA_START_DATE).
+        #[arg(long)]
+        day: Option<u32>,
+        /// Preview only: print the per-pod commands, change nothing.
+        #[arg(long, visible_aliases = ["dryrun", "dry"])]
+        dry_run: bool,
+    },
+    /// Switch a pod's branch (gentle ff-only; --hard force-resets to origin).
+    SetBranch {
+        /// Branch to check out (e.g. main, or a feature branch).
+        branch: String,
+        /// Machine name or id. Omit with --all.
+        target: Option<String>,
+        /// Apply to every pod with an SSH endpoint.
+        #[arg(long)]
+        all: bool,
+        /// DESTRUCTIVE: hard-reset the branch to `origin/<branch>`, discarding local
+        /// commits/changes (untracked files are left alone).
+        #[arg(long)]
+        hard: bool,
+        /// Preview only: print what would happen, change nothing.
+        #[arg(long, visible_aliases = ["dryrun", "dry"])]
+        dry_run: bool,
+    },
+    /// Run a shell command on every pod over SSH (concurrent).
+    Run {
+        /// The command to run (everything after `run`).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
+        /// Preview only: print the command + target pods, run nothing.
+        #[arg(long, visible_aliases = ["dryrun", "dry"])]
+        dry_run: bool,
+    },
+    /// Health check: torch version on every pod (read-only).
+    Test,
     /// Distribute API keys to pods' shells (per-host CSVs + broadcast HF token).
     CopyKeys {
         /// Directory holding the per-host `<provider>_api_keys.csv` files.
