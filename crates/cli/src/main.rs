@@ -1482,9 +1482,10 @@ async fn handle_backup(
     let msg_for = |name: &str| message.clone().unwrap_or_else(|| format!("arena backup {name}"));
 
     let pods = provider.list_pods().await.context("listing pods for backup")?;
-    // One pod (by name/id) if a target was given, else the whole fleet.
+    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
+    // One pod (by name/id/bare name) if a target was given, else the whole fleet.
     let selected: Vec<&arena_core::Pod> = match target_filter {
-        Some(t) => match pods.iter().find(|p| p.name == t || p.id == t) {
+        Some(t) => match pods.iter().find(|p| pod_matches(p, t, prefix)) {
             Some(p) => vec![p],
             None => anyhow::bail!("no pod with name or id '{t}' (run `arena pods list`)"),
         },
@@ -2100,7 +2101,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
         PodCmd::Stop { target, all, include, exclude, dry_run } => {
             match (all, target) {
                 (false, Some(target)) => {
-                    let (id, label) = resolve_target(provider, &target).await?;
+                    let (id, label) = resolve_target(provider, cfg, &target).await?;
                     if dry_run {
                         println!("[dry-run] would stop {label}");
                     } else {
@@ -2113,7 +2114,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                     }
                 }
                 (true, _) => {
-                    let pods = select_pods(provider, &include, &exclude, Some("RUNNING")).await?;
+                    let pods = select_pods(provider, cfg, &include, &exclude, Some("RUNNING")).await?;
                     if pods.is_empty() {
                         println!("(no running pods to stop)");
                         return Ok(());
@@ -2167,7 +2168,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
         }
 
         PodCmd::Restart { target, dry_run } => {
-            let (id, label) = resolve_target(provider, &target).await?;
+            let (id, label) = resolve_target(provider, cfg, &target).await?;
             if dry_run {
                 println!("[dry-run] would restart {label}");
             } else {
@@ -2218,7 +2219,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                 }
             }
             (false, Some(target)) => {
-                let (id, label) = resolve_target(provider, &target).await?;
+                let (id, label) = resolve_target(provider, cfg, &target).await?;
                 if dry_run {
                     println!("[dry-run] would terminate {label}");
                 } else {
@@ -2379,7 +2380,8 @@ async fn handle_set_branch(
             }
         }
     } else if let Some(want) = target {
-        match pods.iter().find(|p| p.name == want || p.id == want) {
+        let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
+        match pods.iter().find(|p| pod_matches(p, want, prefix)) {
             Some(pod) => targets.push((pod.name.clone(), SshTarget::from_pod(pod, cfg)?)),
             None => anyhow::bail!("no pod with name or id '{want}' (run `arena pods list`)"),
         }
@@ -2433,15 +2435,22 @@ async fn handle_set_branch(
     Ok(())
 }
 
-/// Resolve a user-supplied target (machine name OR raw provider id) to a concrete
-/// `(id, label)`, by listing pods. Requires the pod to actually exist, so a typo'd
-/// name/id fails clearly instead of issuing a no-op or wrong mutation. Read-only.
-async fn resolve_target(provider: &dyn Provider, target: &str) -> Result<(String, String)> {
+/// Does `token` identify `pod`? Matches the full name, the provider id, or a **bare
+/// short name** (`zebra` ⇒ `<prefix>-zebra`), so targets/filters accept either form.
+fn pod_matches(pod: &arena_core::Pod, token: &str, prefix: &str) -> bool {
+    pod.name == token || pod.id == token || pod.name == format!("{prefix}-{token}")
+}
+
+/// Resolve a user-supplied target (machine name, bare short name, OR raw provider id) to
+/// a concrete `(id, label)`, by listing pods. Requires the pod to actually exist, so a
+/// typo'd name/id fails clearly instead of issuing a no-op or wrong mutation. Read-only.
+async fn resolve_target(provider: &dyn Provider, cfg: &Config, target: &str) -> Result<(String, String)> {
+    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
     let policy = arena_core::retry::RetryPolicy::default();
     let pods = arena_core::retry::retrying(&policy, || provider.list_pods())
         .await
         .context("listing pods to resolve target")?;
-    match pods.iter().find(|p| p.name == target || p.id == target) {
+    match pods.iter().find(|p| pod_matches(p, target, prefix)) {
         Some(p) => Ok((p.id.clone(), format!("{} (id={})", p.name, p.id))),
         None => anyhow::bail!("no pod with name or id '{target}' (run `arena pods list`)"),
     }
@@ -2449,21 +2458,24 @@ async fn resolve_target(provider: &dyn Provider, target: &str) -> Result<(String
 
 /// List pods and apply the legacy filter semantics: drop `exclude` first, then keep only
 /// `include` (if that list is non-empty), then optionally keep only pods whose status
-/// contains `status_contains` (case-insensitive, e.g. "RUNNING"). Names *or* ids match.
+/// contains `status_contains` (case-insensitive, e.g. "RUNNING"). Names (full or bare)
+/// or ids match.
 async fn select_pods(
     provider: &dyn Provider,
+    cfg: &Config,
     include: &[String],
     exclude: &[String],
     status_contains: Option<&str>,
 ) -> Result<Vec<arena_core::Pod>> {
+    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
     let policy = arena_core::retry::RetryPolicy::default();
     let mut pods = arena_core::retry::retrying(&policy, || provider.list_pods())
         .await
         .context("listing pods")?;
     pods.sort_by(|a, b| a.name.cmp(&b.name));
-    pods.retain(|p| !exclude.iter().any(|x| x == &p.name || x == &p.id));
+    pods.retain(|p| !exclude.iter().any(|x| pod_matches(p, x, prefix)));
     if !include.is_empty() {
-        pods.retain(|p| include.iter().any(|x| x == &p.name || x == &p.id));
+        pods.retain(|p| include.iter().any(|x| pod_matches(p, x, prefix)));
     }
     if let Some(s) = status_contains {
         let s = s.to_uppercase();
@@ -2753,9 +2765,10 @@ async fn handle_copy(
     };
 
     let mut pods = provider.list_pods().await.context("listing pods for copy")?;
-    pods.retain(|p| !exclude.iter().any(|x| x == &p.name || x == &p.id));
+    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
+    pods.retain(|p| !exclude.iter().any(|x| pod_matches(p, x, prefix)));
     if !include.is_empty() {
-        pods.retain(|p| include.iter().any(|x| x == &p.name || x == &p.id));
+        pods.retain(|p| include.iter().any(|x| pod_matches(p, x, prefix)));
     }
     let mut targets: Vec<(String, SshTarget)> = Vec::new();
     for pod in &pods {
@@ -2889,10 +2902,11 @@ async fn handle_copy_keys(
 
     // Build the per-pod var set (broadcast HF merged into every reachable pod).
     let mut pods = provider.list_pods().await.context("listing pods for copy-keys")?;
-    // Apply --exclude then --include (name or id), same as stop/kill.
-    pods.retain(|p| !exclude.iter().any(|x| x == &p.name || x == &p.id));
+    // Apply --exclude then --include (full name, bare short name, or id).
+    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
+    pods.retain(|p| !exclude.iter().any(|x| pod_matches(p, x, prefix)));
     if !include.is_empty() {
-        pods.retain(|p| include.iter().any(|x| x == &p.name || x == &p.id));
+        pods.retain(|p| include.iter().any(|x| pod_matches(p, x, prefix)));
         if pods.is_empty() {
             anyhow::bail!("no pods matched --include {:?} (run `arena pods list`)", include);
         }
