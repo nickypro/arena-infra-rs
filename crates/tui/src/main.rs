@@ -1182,7 +1182,7 @@ fn sync_marker(m: Option<&PodMetrics>) -> (&'static str, Style) {
     match m {
         Some(m) if m.error.is_none() => match (m.ahead.unwrap_or(0), m.behind.unwrap_or(0)) {
             (a, b) if a > 0 && b > 0 => ("⇕", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-            (a, _) if a > 0 => ("↑", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            (a, _) if a > 0 => ("↑", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
             (_, b) if b > 0 => ("↓", Style::default().fg(Color::Cyan)),
             _ => ("", Style::default()),
         },
