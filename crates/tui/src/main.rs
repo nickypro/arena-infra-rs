@@ -1139,6 +1139,9 @@ fn provider_cell(provider: &str) -> Cell<'static> {
 
 /// The compact setup-health cell: three glyphs for `~/.name`, the deploy key, and the
 /// git origin pointing at GitHub. ✓ green / ✗ red / · gray (unknown or unreachable).
+/// The compact health cluster: four glyphs for `~/.name`, the deploy key, the git
+/// origin→GitHub, and an API key — `.name`/key/origin/api. ✓ green / ✗ red / · gray.
+/// (Detail pane spells them out.)
 fn health_cell(m: Option<&PodMetrics>) -> Cell<'static> {
     let glyph = |ok: Option<bool>| match ok {
         Some(true) => Span::styled("✓", Style::default().fg(Color::Green)),
@@ -1148,9 +1151,14 @@ fn health_cell(m: Option<&PodMetrics>) -> Cell<'static> {
     match m {
         Some(m) if m.error.is_none() => {
             let origin_ok = m.origin.as_deref().map(|o| o.contains("github.com"));
-            Cell::from(Line::from(vec![glyph(m.has_name), glyph(m.has_key), glyph(origin_ok)]))
+            Cell::from(Line::from(vec![
+                glyph(m.has_name),
+                glyph(m.has_key),
+                glyph(origin_ok),
+                glyph(m.has_api_key),
+            ]))
         }
-        _ => Cell::from(Span::styled("···", Style::default().fg(Color::DarkGray))),
+        _ => Cell::from(Span::styled("····", Style::default().fg(Color::DarkGray))),
     }
 }
 
@@ -1183,16 +1191,6 @@ fn sync_summary(m: Option<&PodMetrics>) -> String {
         (_, Some(b)) if b > 0 => format!("↓ {b} commit(s) behind origin"),
         (Some(_), Some(_)) => "✓ in sync with origin".into(),
         _ => "· no upstream (branch never pushed)".into(),
-    }
-}
-
-/// The API-key cell: ✓ if any LLM API key (OpenRouter/Anthropic/OpenAI) is exported on
-/// the pod (i.e. `copy-keys`/`keys` ran), ✗ if not, · if unknown/unreachable.
-fn api_cell(m: Option<&PodMetrics>) -> Cell<'static> {
-    match m.and_then(|m| (m.error.is_none()).then_some(m.has_api_key).flatten()) {
-        Some(true) => Cell::from(Span::styled("✓", Style::default().fg(Color::Green))),
-        Some(false) => Cell::from(Span::styled("✗", Style::default().fg(Color::Red))),
-        None => Cell::from(Span::styled("·", Style::default().fg(Color::DarkGray))),
     }
 }
 
@@ -1314,13 +1312,14 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
     let show_saved = w >= 96;
     let show_progress = w >= 110;
     let show_spark = with_spark && w >= 138;
-    // When cramped, names compress (arena8-apple→apple, RTX A4000→A4000) so the core
-    // columns stay readable. GPU always carries count + VRAM ("2×A4000 16G"), truncated
-    // by the column when there's no room.
+    // When cramped, names compress (arena8-apple→apple) and the GPU drops the "RTX "
+    // noise. Names compact a bit earlier (so you see "jack", not a truncated
+    // "arena8-ja"); GPU always carries count + VRAM ("2×A4000 16G"), truncated if tight.
+    let compact_names = w < 116;
     let narrow = w < 100;
 
     let mut header_cells =
-        vec!["", "P", "NAME", "STATUS", "SET", "API", "GPU", "GPU%", "MEM", "TEMP", "DISK", "$/HR", "BRANCH"];
+        vec!["", "P", "NAME", "STATUS", "SET", "GPU", "GPU%", "MEM", "TEMP", "DISK", "$/HR", "BRANCH"];
     if show_saved {
         header_cells.push("SAVED");
     }
@@ -1391,14 +1390,13 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                 mark,
                 provider_cell(&p.provider),
                 // Force the short name when cramped, regardless of the persisted pref.
-                Cell::from(if narrow {
+                Cell::from(if compact_names {
                     display_name(&p.name, &ui.prefix, true)
                 } else {
                     ui.shown_name(&p.name)
                 }),
                 status_cell,
                 health_cell(m),
-                api_cell(m),
                 Cell::from(gpu),
                 Cell::from(util_str).style(util_style(util, err)),
                 Cell::from(mem),
@@ -1446,15 +1444,14 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
         })
         .collect();
 
-    let name_w = if narrow { 10 } else { 16 }; // short names when cramped
+    let name_w = if compact_names { 10 } else { 16 }; // short names when cramped
     let gpu_w = if narrow { 12 } else { 16 }; // fits "2×A4000 16G"; truncates if longer
     let mut widths = vec![
         Constraint::Length(1),  // mark (•)
         Constraint::Length(1),  // P (provider glyph)
         Constraint::Length(name_w as u16), // NAME (auto-short when cramped)
         Constraint::Length(4),  // STATUS (abbreviated: run/exit/stop…)
-        Constraint::Length(3),  // SET (✓✓✓)
-        Constraint::Length(3),  // API (key set?)
+        Constraint::Length(4),  // SET (.name/key/origin/api)
         Constraint::Length(gpu_w as u16), // GPU (+VRAM when wide)
         Constraint::Length(5),  // GPU%
         Constraint::Length(9),  // MEM (e.g. "120/240G")
