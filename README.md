@@ -82,7 +82,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     need are present (never prints secret values; exits non-zero if a required key is
     missing). Copy `config.env.example` to get started.
   - `cron install|remove|show` — manage a crontab schedule for `arena pods backup`
-    (default every 15 min; `--start-date` bakes `ARENA_START_DATE` into the line); edits only
+    (default every 15 min; `--start-date` bakes `ARENA_START_DATE` into the line; `--pull`
+    also runs the rsync file backup each tick after the git backup); edits only
     arena-managed lines, leaving other entries intact.
   - `pods backup` — commit + push each pod's ARENA tree over SSH **on whatever branch
     the pod is currently on** (never switches/creates a branch, so bespoke branches are
@@ -102,8 +103,11 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
   - `pods run <cmd>` / `pods test` — run an arbitrary command on every pod (concurrent,
     confirms first) / the read-only torch-version health check.
   - `pods pull [label]` — the **file** backup (complementing the git `backup`): rsyncs
-    each pod's home into `<dir>/<label>/<pod>/` (`--dir`, `--max-size`, `--remote-path`),
-    size-capped with dotfile/`site-packages` excludes. Label defaults to the `wNdM`
+    each pod's home into `<dir>/<label>/<pod>/`, reporting files/bytes moved per pod.
+    **Keeps `.git`** (so the backup is a usable repo; `--no-git` to skip), size-caps with
+    `--max-size`, excludes other dotfile dirs + `site-packages`. Knobs come from flags
+    else config: `LOCAL_BACKUP_DIR` (`--dir`), `BACKUP_MAX_SIZE` (`--max-size`),
+    `BACKUP_REMOTE_PATH` (`--remote-path`, default `~/`). Label defaults to the `wNdM`
     iteration. Confirms first; `--dry-run` prints the exact rsync commands.
   - `pods copy-keys` — distribute API keys into each pod's `~/.bashrc`/`~/.zshrc`
     (idempotent): per-host keys from `<keys-dir>/<provider>_api_keys.csv`

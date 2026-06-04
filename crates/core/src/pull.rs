@@ -17,6 +17,10 @@ use crate::ssh::SshTarget;
 pub struct PullConfig {
     /// Skip any single file larger than this (rsync `--max-size`), e.g. `"50M"`.
     pub max_size: String,
+    /// Paths/globs to **keep** even if a later exclude would drop them (rsync
+    /// `--include`, emitted first so it wins). Defaults keep `.git` so backups carry git
+    /// history/branch state, while still excluding other dotfile dirs.
+    pub includes: Vec<String>,
     /// Paths/globs to exclude (rsync `--exclude`).
     pub excludes: Vec<String>,
     /// Remote path to pull from, relative to the SSH login dir. Empty = the home dir.
@@ -27,10 +31,20 @@ impl Default for PullConfig {
     fn default() -> Self {
         Self {
             max_size: "50M".to_string(),
-            // Dotfile dirs (`.cache`, `.git`, …) and python envs: big and/or rebuildable.
+            // Keep `.git` (at any depth) so the backup is a usable git repo…
+            includes: vec!["**/.git/".to_string(), "**/.git/**".to_string()],
+            // …but still drop other dotfile dirs (`.cache`, …) and python envs.
             excludes: vec!["**/.*/".to_string(), "site-packages/".to_string()],
             remote_path: String::new(),
         }
+    }
+}
+
+impl PullConfig {
+    /// Drop the `.git` includes (so `.git` is excluded by `**/.*/` like other dotdirs).
+    pub fn without_git(mut self) -> Self {
+        self.includes.retain(|i| !i.contains(".git"));
+        self
     }
 }
 
@@ -48,9 +62,15 @@ pub fn rsync_args(target: &SshTarget, pc: &PullConfig, local_dest: &str) -> Vec<
         "-avz".to_string(),
         "--human-readable".into(),
         "--info=progress2".into(),
+        "--stats".into(), // emit a summary we parse to report files/bytes per pod
         "--prune-empty-dirs".into(),
         format!("--max-size={}", pc.max_size),
     ];
+    // Includes first (they win over a later exclude), then excludes.
+    for inc in &pc.includes {
+        a.push("--include".into());
+        a.push(inc.clone());
+    }
     for ex in &pc.excludes {
         a.push("--exclude".into());
         a.push(ex.clone());
@@ -62,6 +82,35 @@ pub fn rsync_args(target: &SshTarget, pc: &PullConfig, local_dest: &str) -> Vec<
     a.push(format!("{}@{}:{}", target.user, target.host, pc.remote_path));
     a.push(local_dest.to_string());
     a
+}
+
+/// Parse rsync `--stats` output into `(files_transferred, human-readable bytes)` so a
+/// pull reports what actually moved (not just "done"). `None` if the stats aren't found.
+pub fn parse_rsync_stats(stdout: &str) -> Option<(u64, String)> {
+    let mut files = None;
+    let mut bytes = None;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("Number of regular files transferred:") {
+            files = rest.trim().replace(',', "").parse::<u64>().ok();
+        } else if let Some(rest) = line.strip_prefix("Total transferred file size:") {
+            // e.g. "Total transferred file size: 1,234,567 bytes"
+            let digits: String = rest.chars().filter(|c| c.is_ascii_digit()).collect();
+            bytes = digits.parse::<u64>().ok();
+        }
+    }
+    files.map(|f| (f, human_bytes(bytes.unwrap_or(0))))
+}
+
+/// Bytes as a compact human string ("0", "12K", "3.4M", "1.2G").
+pub fn human_bytes(b: u64) -> String {
+    const U: &[(&str, u64)] = &[("G", 1 << 30), ("M", 1 << 20), ("K", 1 << 10)];
+    for (suffix, scale) in U {
+        if b >= *scale {
+            return format!("{:.1}{suffix}", b as f64 / *scale as f64);
+        }
+    }
+    b.to_string()
 }
 
 /// Human-readable `rsync` command for dry-run output (the `-e` value is quoted since it
@@ -94,6 +143,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_rsync_stats() {
+        let out = "sent 18 bytes  received 102000000 bytes\n\
+                   Number of files: 1,200\n\
+                   Number of regular files transferred: 922\n\
+                   Total transferred file size: 107,000,000 bytes\n";
+        let (files, size) = parse_rsync_stats(out).unwrap();
+        assert_eq!(files, 922);
+        assert_eq!(size, "102.0M");
+        assert_eq!(parse_rsync_stats("nothing here"), None);
+    }
+
+    #[test]
     fn dest_nests_label_and_name_with_trailing_slash() {
         assert_eq!(local_dest("./backup", "w1d3", "arena8-apple"), "./backup/w1d3/arena8-apple/");
         // base's trailing slash is normalized
@@ -111,6 +172,14 @@ mod tests {
         // both default excludes present as separate args
         assert!(a.windows(2).any(|w| w[0] == "--exclude" && w[1] == "**/.*/"));
         assert!(a.windows(2).any(|w| w[0] == "--exclude" && w[1] == "site-packages/"));
+        // .git is kept via an include that precedes the dotdir exclude
+        assert!(a.windows(2).any(|w| w[0] == "--include" && w[1] == "**/.git/"));
+        let inc = a.iter().position(|x| x == "--include").unwrap();
+        let exc = a.iter().position(|x| x == "--exclude").unwrap();
+        assert!(inc < exc, "includes must come before excludes");
+        // without_git drops the .git include
+        let no_git = rsync_args(&target(), &PullConfig::default().without_git(), "./d/");
+        assert!(!no_git.iter().any(|x| x.contains(".git")));
         // transport carries port + key but NOT the host (rsync adds that)
         let e_idx = a.iter().position(|x| x == "-e").unwrap();
         let rsh = &a[e_idx + 1];

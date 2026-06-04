@@ -166,6 +166,9 @@ enum CronCmd {
         /// (a crontab line doesn't inherit your shell environment).
         #[arg(long)]
         start_date: Option<String>,
+        /// Also run `pods pull` (the rsync file backup) each tick, after the git backup.
+        #[arg(long)]
+        pull: bool,
     },
     /// Remove the arena-managed cron lines.
     Remove,
@@ -504,12 +507,17 @@ enum PodCmd {
         /// Local base directory for backups (default: config LOCAL_BACKUP_DIR, else ./backup).
         #[arg(long)]
         dir: Option<String>,
-        /// Skip any single file larger than this (rsync --max-size), e.g. `50M`.
-        #[arg(long, default_value = "50M")]
-        max_size: String,
-        /// Remote path to pull, relative to the home dir (default: the whole home dir).
+        /// Skip any single file larger than this (rsync --max-size), e.g. `50M`
+        /// (default: config BACKUP_MAX_SIZE, else 50M).
+        #[arg(long)]
+        max_size: Option<String>,
+        /// Remote path to pull, relative to the home dir (default: config
+        /// BACKUP_REMOTE_PATH, else the whole home dir).
         #[arg(long)]
         remote_path: Option<String>,
+        /// Exclude `.git` (by default the repo's git history/state IS backed up).
+        #[arg(long)]
+        no_git: bool,
         /// Preview only: print the rsync commands, copy nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
@@ -1109,7 +1117,7 @@ async fn handle_cron(cmd: CronCmd, config_path: &std::path::Path) -> Result<()> 
             println!("Removed arena-managed cron lines.");
             return Ok(());
         }
-        CronCmd::Install { schedule, start_date } => {
+        CronCmd::Install { schedule, start_date, pull } => {
             let exe = std::env::current_exe().context("finding the arena executable path")?;
             let cfg_abs = std::fs::canonicalize(config_path)
                 .unwrap_or_else(|_| config_path.to_path_buf());
@@ -1123,12 +1131,19 @@ async fn handle_cron(cmd: CronCmd, config_path: &std::path::Path) -> Result<()> 
                 }
                 None => String::new(),
             };
-            let line = format!(
-                "{schedule} {env_prefix}{} --config {} pods backup --yes >> {}/arena-cron.log 2>&1",
-                exe.display(),
-                cfg_abs.display(),
-                home
-            );
+            let exe = exe.display();
+            let cfg_abs = cfg_abs.display();
+            let backup = format!("{env_prefix}{exe} --config {cfg_abs} pods backup --yes");
+            // With --pull, also run the rsync file backup each tick (after the git
+            // backup). The two run in a subshell so the redirect covers both; rsync is
+            // incremental, so repeated pulls only move deltas.
+            let cmds = if pull {
+                let pull_cmd = format!("{env_prefix}{exe} --config {cfg_abs} pods pull --yes");
+                format!("( {backup} ; {pull_cmd} )")
+            } else {
+                backup
+            };
+            let line = format!("{schedule} {cmds} >> {home}/arena-cron.log 2>&1");
             let new = with_arena_block(&current, &[line.clone()]);
             write_crontab(&new).await?;
             println!("Installed arena cron job:\n  {line}");
@@ -1401,6 +1416,15 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
         "  {} local rsync backup dir     {abs}{}",
         if exists { "✓" } else { "·" },
         if exists { "" } else { "  (created on first `pods pull`)" }
+    );
+    // The `pods pull` knobs (all optional; shown so it's clear what's configurable).
+    println!(
+        "  · pull max file size         {} (BACKUP_MAX_SIZE)",
+        cfg.get("BACKUP_MAX_SIZE").filter(|s| !s.is_empty()).unwrap_or("50M (default)")
+    );
+    println!(
+        "  · pull remote source         {} (BACKUP_REMOTE_PATH)",
+        cfg.get("BACKUP_REMOTE_PATH").filter(|s| !s.is_empty()).unwrap_or("~/ (home, default)")
     );
 
     println!("\nDashboard (optional):");
@@ -2139,9 +2163,9 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             handle_init_branches(provider, cfg, week, day, dry_run, yes).await?;
         }
 
-        PodCmd::Pull { label, dir, max_size, remote_path, dry_run } => {
+        PodCmd::Pull { label, dir, max_size, remote_path, no_git, dry_run } => {
             let dir = dir.unwrap_or_else(|| local_backup_dir(cfg));
-            handle_pull(provider, cfg, label, &dir, &max_size, remote_path, dry_run, yes).await?;
+            handle_pull(provider, cfg, label, &dir, max_size, remote_path, no_git, dry_run, yes).await?;
         }
 
         PodCmd::CopyKeys { keys_dir, hf_token, include, exclude, dry_run } => {
@@ -2645,8 +2669,9 @@ async fn handle_pull(
     cfg: &Config,
     label: Option<String>,
     dir: &str,
-    max_size: &str,
+    max_size: Option<String>,
     remote_path: Option<String>,
+    no_git: bool,
     dry_run: bool,
     yes: bool,
 ) -> Result<()> {
@@ -2661,11 +2686,24 @@ async fn handle_pull(
             format!("w{w}d{d}")
         }
     };
-    let pc = PullConfig {
-        max_size: max_size.to_string(),
-        remote_path: remote_path.unwrap_or_default(),
-        ..PullConfig::default()
-    };
+    // Knobs come from flags, else config (BACKUP_MAX_SIZE / BACKUP_REMOTE_PATH), else
+    // sensible defaults. `.git` is kept by default unless --no-git.
+    let max_size = max_size
+        .or_else(|| cfg.get("BACKUP_MAX_SIZE").filter(|s| !s.is_empty()).map(String::from))
+        .unwrap_or_else(|| "50M".to_string());
+    let remote_path = remote_path
+        .or_else(|| cfg.get("BACKUP_REMOTE_PATH").filter(|s| !s.is_empty()).map(String::from))
+        .unwrap_or_default();
+    let mut pc = PullConfig { max_size, remote_path, ..PullConfig::default() };
+    if no_git {
+        pc = pc.without_git();
+    }
+    let src = if pc.remote_path.is_empty() { "~/ (home)".to_string() } else { pc.remote_path.clone() };
+    println!(
+        "Source {src} · dest {dir}/{label}/<pod>/ · max-size {} · {}\n",
+        pc.max_size,
+        if no_git { "no .git" } else { "incl .git" },
+    );
 
     let pods = provider.list_pods().await.context("listing pods for pull")?;
     let mut targets: Vec<(String, SshTarget)> = Vec::new();
@@ -2721,7 +2759,13 @@ async fn handle_pull(
         let Ok((name, out)) = joined else { continue };
         match out {
             Ok(o) if o.status.success() => {
-                println!("[{done}/{total}] ✓ {name}");
+                // Report what actually moved, so a pull isn't "silent".
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                let summary = match pull::parse_rsync_stats(&stdout) {
+                    Some((files, size)) => format!("{files} files, {size}"),
+                    None => "done".into(),
+                };
+                println!("[{done}/{total}] ✓ {name} ({summary})");
                 ok += 1;
             }
             Ok(o) => {
