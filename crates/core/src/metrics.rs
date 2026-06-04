@@ -238,8 +238,12 @@ fn remote_command(opts: &ProbeOpts) -> String {
     s.push_str(
         r#"echo "cpu=$({ grep '^cpu ' /proc/stat; sleep 0.25; grep '^cpu ' /proc/stat; } 2>/dev/null | awk 'NR==1{i1=$5;t1=0;for(i=2;i<=8;i++)t1+=$i}NR==2{i2=$5;t2=0;for(i=2;i<=8;i++)t2+=$i;dt=t2-t1;di=i2-i1;if(dt>0)printf "%.0f",(1-di/dt)*100}')"; "#,
     );
+    // Memory used/total (KB). Prefer the *container's* cgroup limit (v2 memory.max /
+    // v1 memory.limit_in_bytes) — `/proc/meminfo` isn't namespaced, so it reports the
+    // whole host (e.g. 503G) rather than the pod's ~46G limit. Fall back to host meminfo
+    // when there's no cgroup limit ("max", or a v1 sentinel ≥ host RAM).
     s.push_str(
-        r#"echo "hostmem=$(awk '/^MemTotal:/{t=$2}/^MemAvailable:/{a=$2}END{if(t>0)print t-a, t}' /proc/meminfo 2>/dev/null)"; "#,
+        r#"echo "hostmem=$(mt=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null); ma=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null); hu=$(( ${mt:-0} - ${ma:-0} )); ht=${mt:-0}; if [ -s /sys/fs/cgroup/memory.max ]; then lm=$(cat /sys/fs/cgroup/memory.max); cu=$(cat /sys/fs/cgroup/memory.current 2>/dev/null); if [ x$lm != xmax ]; then hu=$(( ${cu:-0} / 1024 )); ht=$(( lm / 1024 )); fi; elif [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then lm=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes); cu=$(cat /sys/fs/cgroup/memory/memory.usage_in_bytes 2>/dev/null); if [ ${lm:-0} -lt $(( ${mt:-0} * 1024 )) ]; then hu=$(( ${cu:-0} / 1024 )); ht=$(( lm / 1024 )); fi; fi; echo $hu $ht)"; "#,
     );
     if let Some(pc) = opts.progress_cmd.as_deref().filter(|s| !s.is_empty()) {
         // Take the last line so a chatty command still yields one tidy value.
