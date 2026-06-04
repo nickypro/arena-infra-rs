@@ -144,6 +144,15 @@ impl PodMetrics {
         }
     }
 
+    /// Per-GPU VRAM in GB (from the first GPU that reports a total), rounded — for the
+    /// dashboard's GPU column, e.g. "16G" / "80G".
+    pub fn vram_gb(&self) -> Option<u32> {
+        self.gpus
+            .iter()
+            .find_map(|g| g.mem_total_mb)
+            .map(|mb| (mb as f64 / 1024.0).round() as u32)
+    }
+
     /// Max temperature across GPUs, if reported.
     pub fn max_temp(&self) -> Option<u32> {
         self.gpus.iter().filter_map(|g| g.temp_c).max()

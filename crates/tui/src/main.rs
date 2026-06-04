@@ -1277,6 +1277,10 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
     let show_saved = w >= 96;
     let show_progress = w >= 110;
     let show_spark = with_spark && w >= 138;
+    // GPU shows VRAM ("RTX A4000 16G") when there's room; when cramped, names compress
+    // (arena8-apple→apple, RTX A4000→A4000) so the core columns stay readable.
+    let gpu_vram = w >= 122;
+    let narrow = w < 100;
 
     let mut header_cells =
         vec!["", "P", "NAME", "STATUS", "SET", "API", "GPU", "GPU%", "MEM", "TEMP", "DISK", "$/HR", "BRANCH"];
@@ -1316,10 +1320,19 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
             let temp_str = temp.map(|t| format!("{t}C")).unwrap_or_else(|| "-".into());
             let cost = p.cost_per_hr.map(|c| format!("${c:.2}")).unwrap_or_else(|| "-".into());
             // GPU now comes from the live nvidia-smi readout (provider list omits it).
-            let gpu = m
+            // Append VRAM when wide; drop the "RTX " noise when the table is cramped.
+            let mut gpu = m
                 .and_then(|m| m.gpu_summary())
                 .or_else(|| p.gpu_type.clone())
                 .unwrap_or_else(|| "-".into());
+            if narrow {
+                gpu = gpu.replace("RTX ", "");
+            }
+            if gpu_vram && gpu != "-" {
+                if let Some(g) = m.and_then(|m| m.vram_gb()) {
+                    gpu = format!("{gpu} {g}G");
+                }
+            }
             let branch = match m.and_then(|m| m.branch.clone()) {
                 Some(b) => truncate(&short_branch(&b, &ui.prefix), 6),
                 None => "-".into(),
@@ -1339,7 +1352,12 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
             let mut cells = vec![
                 mark,
                 provider_cell(&p.provider),
-                Cell::from(ui.shown_name(&p.name)),
+                // Force the short name when cramped, regardless of the persisted pref.
+                Cell::from(if narrow {
+                    display_name(&p.name, &ui.prefix, true)
+                } else {
+                    ui.shown_name(&p.name)
+                }),
                 status_cell,
                 health_cell(m),
                 api_cell(m),
@@ -1390,14 +1408,16 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
         })
         .collect();
 
+    let name_w = if narrow { 10 } else { 16 }; // short names when cramped
+    let gpu_w = if gpu_vram { 20 } else if narrow { 11 } else { 16 }; // wider for "… 16G"
     let mut widths = vec![
         Constraint::Length(1),  // mark (•)
         Constraint::Length(1),  // P (provider glyph)
-        Constraint::Length(16), // NAME
+        Constraint::Length(name_w as u16), // NAME (auto-short when cramped)
         Constraint::Length(4),  // STATUS (abbreviated: run/exit/stop…)
         Constraint::Length(3),  // SET (✓✓✓)
         Constraint::Length(3),  // API (key set?)
-        Constraint::Length(16), // GPU (e.g. "A100 80GB PCIe")
+        Constraint::Length(gpu_w as u16), // GPU (+VRAM when wide)
         Constraint::Length(5),  // GPU%
         Constraint::Length(9),  // MEM (e.g. "120/240G")
         Constraint::Length(4),  // TEMP (e.g. "85C")
