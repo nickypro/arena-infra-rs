@@ -1440,10 +1440,16 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                 Cell::from(branch),
             ];
             if show_saved {
-                // Time style: yellow when there's uncommitted work since the last backup,
-                // grey when unknown, default otherwise.
+                // Time style: yellow when there's uncommitted work; grey when unknown OR
+                // when it's a clean tree that's been quiet for a day+ (nothing to do); plain
+                // otherwise.
+                let stale = m
+                    .and_then(|m| m.last_commit)
+                    .map(|ts| now_unix().saturating_sub(ts) > 86_400)
+                    .unwrap_or(false);
                 let style = match m.and_then(|m| m.dirty_files) {
                     Some(n) if n > 0 => Style::default().fg(Color::Yellow),
+                    Some(0) if stale => Style::default().fg(Color::DarkGray),
                     None => Style::default().fg(Color::DarkGray),
                     _ => Style::default(),
                 };
@@ -1534,13 +1540,17 @@ fn backup_summary(m: Option<&PodMetrics>) -> String {
     }
 }
 
-/// A short relative time like "3h ago" / "2d ago" from a unix timestamp.
-fn rel_time(unix_secs: i64) -> String {
-    let now = std::time::SystemTime::now()
+/// Current unix time in seconds.
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let d = now - unix_secs;
+        .unwrap_or(0)
+}
+
+/// A short relative time like "3h ago" / "2d ago" from a unix timestamp.
+fn rel_time(unix_secs: i64) -> String {
+    let d = now_unix() - unix_secs;
     match d {
         d if d < 60 => "just now".into(),
         d if d < 3600 => format!("{}m ago", d / 60),
@@ -1554,11 +1564,7 @@ fn rel_time_short(m: Option<&PodMetrics>) -> String {
     match m.and_then(|m| m.last_commit) {
         None => "-".into(),
         Some(ts) => {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            let d = now - ts;
+            let d = now_unix() - ts;
             match d {
                 d if d < 60 => "now".into(),
                 d if d < 3600 => format!("{}m", d / 60),
