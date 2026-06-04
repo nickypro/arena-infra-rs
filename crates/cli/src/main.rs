@@ -502,12 +502,16 @@ enum PodCmd {
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// Copy a local file to every pod over scp (mirrors the repo path if no DEST).
-    Copy {
-        /// Local file to copy.
+    /// scp a local file (or dir, with -r) to every pod (mirrors the repo path if no DEST).
+    #[command(visible_alias = "copy")]
+    Cp {
+        /// Local file (or directory, with -r) to copy.
         file: PathBuf,
         /// Destination path on each pod. Omit to mirror the repo path / land in `~`.
         dest: Option<String>,
+        /// Recurse into a directory (scp -r).
+        #[arg(short = 'r', long)]
+        recursive: bool,
         /// Only copy to these pods (name or id, repeatable). Default: all reachable.
         #[arg(long)]
         include: Vec<String>,
@@ -2158,8 +2162,8 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             handle_copy_keys(provider, cfg, &keys_dir, hf_token, &include, &exclude, dry_run, yes).await?;
         }
 
-        PodCmd::Copy { file, dest, include, exclude, dry_run } => {
-            handle_copy(provider, cfg, &file, dest.as_deref(), &include, &exclude, dry_run, yes).await?;
+        PodCmd::Cp { file, dest, recursive, include, exclude, dry_run } => {
+            handle_copy(provider, cfg, &file, dest.as_deref(), recursive, &include, &exclude, dry_run, yes).await?;
         }
 
         PodCmd::Restart { target, dry_run } => {
@@ -2713,6 +2717,7 @@ async fn handle_copy(
     cfg: &Config,
     file: &std::path::Path,
     dest: Option<&str>,
+    recursive: bool,
     include: &[String],
     exclude: &[String],
     dry_run: bool,
@@ -2720,8 +2725,12 @@ async fn handle_copy(
 ) -> Result<()> {
     use arena_core::ssh::{self, SshTarget};
 
-    if !file.is_file() {
-        anyhow::bail!("not a file: {} (pods copy takes a single local file)", file.display());
+    if recursive {
+        if !file.exists() {
+            anyhow::bail!("not found: {}", file.display());
+        }
+    } else if !file.is_file() {
+        anyhow::bail!("not a file: {} (pass -r to copy a directory)", file.display());
     }
     let local = file.to_string_lossy().into_owned();
 
@@ -2760,12 +2769,13 @@ async fn handle_copy(
         return Ok(());
     }
 
-    println!("Copy: {local}  ->  {remote}");
+    let rflag = if recursive { "-r " } else { "" };
+    println!("Copy{}: {local}  ->  {remote}", if recursive { " (recursive)" } else { "" });
     if dry_run {
         println!("\nDry-run — would scp to {} pod(s):\n", targets.len());
         for (name, t) in &targets {
             println!("# {name}");
-            println!("{}\n", t.display_scp(&local, &remote));
+            println!("scp {rflag}{}\n", t.scp_args(&local, &remote).join(" "));
         }
         println!("Preview only — run without --dry-run to copy.");
         return Ok(());
@@ -2780,12 +2790,26 @@ async fn handle_copy(
     for (name, t) in targets {
         let (local, remote, remote_parent) = (local.clone(), remote.clone(), remote_parent.clone());
         set.spawn(async move {
-            // Ensure the remote parent dir exists, then scp.
+            // Ensure the remote parent dir exists, then scp (with -r if recursive).
             let mk = ssh::run(&t, &format!("mkdir -p {}", shell_quote(&remote_parent))).await;
-            let res = match mk {
-                Ok(o) if o.success => ssh::scp(&t, &local, &remote).await,
-                Ok(o) => Err(arena_core::Error::provider(format!("mkdir failed: {}", o.stderr.trim()))),
-                Err(e) => Err(e),
+            match mk {
+                Ok(o) if o.success => {}
+                Ok(o) => return (name, Err(format!("mkdir failed: {}", o.stderr.trim().to_string()))),
+                Err(e) => return (name, Err(e.to_string())),
+            }
+            let mut args = t.scp_args(&local, &remote);
+            if recursive {
+                args.insert(0, "-r".to_string());
+            }
+            let out = tokio::process::Command::new("scp")
+                .args(&args)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .await;
+            let res = match out {
+                Ok(o) if o.status.success() => Ok(()),
+                Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+                Err(e) => Err(format!("spawning scp: {e}")),
             };
             (name, res)
         });
@@ -2795,13 +2819,9 @@ async fn handle_copy(
         done += 1;
         let Ok((name, res)) = joined else { continue };
         match res {
-            Ok(o) if o.success => {
+            Ok(()) => {
                 println!("[{done}/{total}] ✓ {name}");
                 ok += 1;
-            }
-            Ok(o) => {
-                println!("[{done}/{total}] ✗ {name}: {}", o.stderr.trim());
-                failed += 1;
             }
             Err(e) => {
                 println!("[{done}/{total}] ✗ {name}: {e}");
