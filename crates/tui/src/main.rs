@@ -79,8 +79,6 @@ enum Mode {
     FleetConfirm { action: Action, typed: String, scope: Scope },
     /// Interactive add-pod form (↑↓ field, ←→ value).
     NewPod(NewPodForm),
-    /// Confirm terminating the marked (multi-selected) pods; type the count to confirm.
-    TermMarked { typed: String },
     /// Collect a free-text argument (a command, or a branch) for `Run`/`SetBranch`,
     /// against one pod or a multi-pod scope, then execute on Enter.
     Input { action: Action, scope: InputScope, value: String },
@@ -489,11 +487,6 @@ async fn run(
                         }
                     }
                     KeyCode::Char('c') => ui.marked.clear(),
-                    KeyCode::Char('x') => {
-                        if !ui.marked.is_empty() {
-                            ui.mode = Mode::TermMarked { typed: String::new() };
-                        }
-                    }
                     KeyCode::Char('n') => {
                         // Fresh list (not the cached snapshot) so we never allocate a
                         // name that already exists and create a duplicate.
@@ -558,6 +551,11 @@ async fn run(
                         _ => Action::Setup,
                     };
                     ui.mode = Mode::FleetConfirm { action, typed: String::new(), scope };
+                }
+                // Terminate the marked set (not offered fleet-wide — use per-pod / CLI
+                // `terminate --all` for that). Gated by typing the count, like the rest.
+                KeyCode::Char('t') if scope == Scope::Marked => {
+                    ui.mode = Mode::FleetConfirm { action: Action::Terminate, typed: String::new(), scope };
                 }
                 // Set-branch / run need an argument typed first.
                 KeyCode::Char(ch @ ('x' | 'g')) => {
@@ -681,32 +679,6 @@ async fn run(
                 }
                 _ => ui.mode = Mode::NewPod(form),
             },
-            Mode::TermMarked { mut typed } => {
-                let n = ui.marked.len();
-                match code {
-                    KeyCode::Esc => ui.mode = Mode::List,
-                    // Require typing the count — a deliberate gate for a bulk delete.
-                    KeyCode::Enter if typed == n.to_string() => {
-                        let pods: Vec<Pod> = {
-                            let s = shared.lock().unwrap();
-                            s.pods.iter().filter(|p| ui.marked.contains(&p.id)).cloned().collect()
-                        };
-                        let provider = provider.clone();
-                        ui.marked.clear();
-                        ui.mode = Mode::Working(format!("terminating {} pod(s)…", pods.len()));
-                        start_action(shared, async move { terminate_many(&provider, pods).await });
-                    }
-                    KeyCode::Backspace => {
-                        typed.pop();
-                        ui.mode = Mode::TermMarked { typed };
-                    }
-                    KeyCode::Char(ch) => {
-                        typed.push(ch);
-                        ui.mode = Mode::TermMarked { typed };
-                    }
-                    _ => ui.mode = Mode::TermMarked { typed },
-                }
-            }
             Mode::Input { action, scope, mut value } => match code {
                 KeyCode::Esc => ui.mode = Mode::List,
                 KeyCode::Enter if !value.trim().is_empty() => {
@@ -756,36 +728,6 @@ async fn run(
         }
     }
     Ok(())
-}
-
-/// Terminate several pods concurrently, returning a one-line summary + first failures.
-async fn terminate_many(provider: &Arc<dyn Provider>, pods: Vec<Pod>) -> String {
-    let total = pods.len();
-    let mut set = JoinSet::new();
-    for pod in pods {
-        let provider = provider.clone();
-        set.spawn(async move {
-            match provider.terminate_pod(&pod.id).await {
-                Ok(()) => Ok(pod.name),
-                Err(e) => Err(format!("✗ {}: {e}", pod.name)),
-            }
-        });
-    }
-    let mut ok = 0usize;
-    let mut fails: Vec<String> = Vec::new();
-    while let Some(joined) = set.join_next().await {
-        match joined {
-            Ok(Ok(_)) => ok += 1,
-            Ok(Err(e)) => fails.push(e),
-            Err(_) => fails.push("✗ task failed".into()),
-        }
-    }
-    let mut s = format!("terminated {ok}/{total}");
-    for f in fails.iter().take(8) {
-        s.push('\n');
-        s.push_str(f);
-    }
-    s
 }
 
 /// Run a safe action against every pod concurrently, returning a summary line plus the
@@ -1274,7 +1216,6 @@ fn view(f: &mut Frame, shared: &Shared, ui: &Ui, secs: u64) {
         Mode::FleetMenu { scope } => render_fleet_menu(f, shared, ui, *scope),
         Mode::FleetConfirm { action, typed, scope } => render_fleet_confirm(f, shared, ui, *action, typed, *scope),
         Mode::NewPod(form) => render_new_pod(f, form),
-        Mode::TermMarked { typed } => render_term_marked(f, shared, ui, typed),
         Mode::Input { action, scope, value } => render_input(f, shared, ui, *action, scope, value),
         Mode::Working(msg) => render_result(f, msg),
         Mode::Result(msg) => render_result(f, msg),
@@ -1687,14 +1628,13 @@ fn footer_hint(shared: &Shared, ui: &Ui, secs: u64) -> String {
     };
     let spin = if shared.refreshing { " ⟳" } else { "" };
     let keys = match ui.mode {
-        Mode::List => "[enter] detail  [space] mark  [x] term marked  [a] act (sel/marked)  [A] all  [n] new  [s] names  [r] now  [q] quit",
-        Mode::Detail => "[space] mark  [x] term marked  [a] act (sel/marked)  [A] all  [n] new  [s] names  [r] now  [esc] back  [q] quit",
+        Mode::List => "[enter] detail  [space] mark  [a] act (cursor/marked)  [A] all  [c] clear marks  [n] new  [s] names  [r] now  [q] quit",
+        Mode::Detail => "[space] mark  [a] act (cursor/marked)  [A] all  [c] clear marks  [n] new  [s] names  [r] now  [esc] back  [q] quit",
         Mode::Menu => "[r/s/t/b/p/e/x/g] choose action  [esc] cancel",
         Mode::Confirm(_) => "type to confirm  [enter] apply  [esc] cancel",
-        Mode::FleetMenu { .. } => "[r/b/p/e/x/g] choose action  [esc] cancel",
+        Mode::FleetMenu { .. } => "[r/b/p/e/x/g] (+[t] terminate on marked)  [esc] cancel",
         Mode::FleetConfirm { .. } => "type the token to confirm  [enter] apply  [esc] cancel",
         Mode::NewPod { .. } => "[↑↓] pods  [+-] gpus  [←→] type  [enter] create  [esc] cancel",
-        Mode::TermMarked { .. } => "type the count to confirm  [enter] terminate  [esc] cancel",
         Mode::Input { .. } => "type the value  [enter] run  [esc] cancel",
         Mode::Working(_) => "working… (background) — please wait",
         Mode::Result(_) => "[any key] dismiss",
@@ -1803,7 +1743,7 @@ fn scope_label(shared: &Shared, marked: &std::collections::HashSet<String>, scop
 
 fn render_fleet_menu(f: &mut Frame, shared: &Shared, ui: &Ui, scope: Scope) {
     let (_, who) = scope_label(shared, &ui.marked, scope);
-    let lines = vec![
+    let mut lines = vec![
         format!("Actions — {who}:"),
         String::new(),
         "  [r]  restart    (in place)".into(),
@@ -1812,10 +1752,16 @@ fn render_fleet_menu(f: &mut Frame, shared: &Shared, ui: &Ui, scope: Scope) {
         "  [e]  test       (torch version)".into(),
         "  [x]  run        (type a shell command)".into(),
         "  [g]  set-branch (type a branch)".into(),
-        String::new(),
-        "(terminate the marked set with [x] from the list)".into(),
-        "[esc] cancel".into(),
     ];
+    // Terminate is offered for a marked selection only (not fleet-wide).
+    if scope == Scope::Marked {
+        lines.push("  [t]  terminate  (irreversible)".into());
+    }
+    lines.push(String::new());
+    if scope == Scope::All {
+        lines.push("(to terminate, mark pods and use [a], or the CLI)".into());
+    }
+    lines.push("[esc] cancel".into());
     let area = centered_rect(60, 55, f.area());
     f.render_widget(Clear, area);
     f.render_widget(
@@ -1828,18 +1774,20 @@ fn render_fleet_menu(f: &mut Frame, shared: &Shared, ui: &Ui, scope: Scope) {
 fn render_fleet_confirm(f: &mut Frame, shared: &Shared, ui: &Ui, action: Action, typed: &str, scope: Scope) {
     let (_, who) = scope_label(shared, &ui.marked, scope);
     let token = fleet_confirm_token_str(shared, &ui.marked, scope);
+    let warn = if action.is_destructive() { "  ⚠ IRREVERSIBLE" } else { "" };
     let text = format!(
-        "{} {who}.\n\nType {token} to confirm:\n\n  > {}\n\n[enter] apply  [esc] cancel",
+        "{} {who}.{warn}\n\nType {token} to confirm:\n\n  > {}\n\n[enter] apply  [esc] cancel",
         action.label(),
         typed
     );
+    let border = if action.is_destructive() { Color::Red } else { Color::Yellow };
     let area = centered_rect(64, 45, f.area());
     f.render_widget(Clear, area);
     f.render_widget(
         Paragraph::new(text).wrap(Wrap { trim: false }).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow))
+                .border_style(Style::default().fg(border))
                 .title(format!(" confirm {} ", action.label())),
         ),
         area,
@@ -1975,58 +1923,6 @@ fn render_new_pod(f: &mut Frame, form: &NewPodForm) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan))
                 .title(" add pod "),
-        ),
-        area,
-    );
-}
-
-fn render_term_marked(f: &mut Frame, shared: &Shared, ui: &Ui, typed: &str) {
-    let names: Vec<String> = shared
-        .pods
-        .iter()
-        .filter(|p| ui.marked.contains(&p.id))
-        .map(|p| ui.shown_name(&p.name))
-        .collect();
-    let n = names.len();
-
-    let area = centered_rect(64, 80, f.area());
-    let dim = Style::default().fg(Color::DarkGray);
-
-    // Header first, so the count-to-type + input field are NEVER pushed off-screen by a
-    // long list. The list below is then capped to whatever space remains.
-    let mut lines: Vec<Line> = vec![
-        Line::styled(
-            format!("TERMINATE {n} pod(s) — IRREVERSIBLE"),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ),
-        Line::from(""),
-        Line::from(format!("Type {n} to confirm:   > {typed}")),
-        Line::styled("[enter] terminate   [esc] cancel", dim),
-        Line::from(""),
-        Line::styled("pods:", Style::default().add_modifier(Modifier::BOLD)),
-    ];
-    let header = lines.len();
-    // Rows available for names inside the bordered box.
-    let cap = (area.height as usize).saturating_sub(2).saturating_sub(header).max(1);
-    if n <= cap {
-        for name in &names {
-            lines.push(Line::from(format!("  • {name}")));
-        }
-    } else {
-        // Leave one row for the "+K more" marker.
-        for name in names.iter().take(cap - 1) {
-            lines.push(Line::from(format!("  • {name}")));
-        }
-        lines.push(Line::styled(format!("  … +{} more", n - (cap - 1)), dim));
-    }
-
-    f.render_widget(Clear, area);
-    f.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Red))
-                .title(" confirm terminate "),
         ),
         area,
     );
