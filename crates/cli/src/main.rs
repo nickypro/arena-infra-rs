@@ -125,6 +125,9 @@ enum KeysCmd {
     },
     /// List the provisioned OpenRouter keys (name, USD limit, usage).
     List,
+    /// Show the local OpenRouter keys file (path, whether it exists, and which pods have
+    /// a key) — never prints the secret values.
+    Which,
     /// Rotate a machine's key — delete it and generate a fresh one (e.g. after a leak).
     /// Updates the CSV; `--copy` re-pushes to the pod(s). One machine or --all.
     Rotate {
@@ -3027,6 +3030,31 @@ fn write_openrouter_key(host: &str, secret: &str, prefix: &str) -> Result<()> {
 async fn handle_keys(cmd: KeysCmd, provider: &dyn Provider, cfg: &Config, yes: bool) -> Result<()> {
     use arena_core::openrouter::{key_name, OpenRouter};
 
+    // `which` just reads the local CSV — no provisioning key / network needed.
+    if let KeysCmd::Which = cmd {
+        let abs = std::fs::canonicalize(OPENROUTER_KEYS_CSV)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| {
+                std::env::current_dir()
+                    .map(|d| d.join(OPENROUTER_KEYS_CSV.trim_start_matches("./")).display().to_string())
+                    .unwrap_or_else(|_| OPENROUTER_KEYS_CSV.to_string())
+            });
+        match std::fs::read_to_string(OPENROUTER_KEYS_CSV) {
+            Ok(text) => {
+                let rows = arena_core::apikeys::parse_csv(&text);
+                println!("OpenRouter keys file: {abs}");
+                println!("  ✓ exists · {} key(s) for: {}", rows.len(),
+                    rows.iter().map(|(h, _)| h.as_str()).collect::<Vec<_>>().join(", "));
+                println!("\n(distribute with `arena pods copy-keys`; values not shown)");
+            }
+            Err(_) => {
+                println!("OpenRouter keys file: {abs}");
+                println!("  · not created yet — run `arena keys gen --all` to mint keys");
+            }
+        }
+        return Ok(());
+    }
+
     let prov_key = cfg
         .get("OPENROUTER_PROVISIONING_KEY")
         .filter(|s| !s.is_empty())
@@ -3041,6 +3069,7 @@ async fn handle_keys(cmd: KeysCmd, provider: &dyn Provider, cfg: &Config, yes: b
     let default_limit = cfg.get_parsed::<f64>("OPENROUTER_KEY_LIMIT").unwrap_or(5.0);
 
     match cmd {
+        KeysCmd::Which => unreachable!("handled before the provisioning-key check"),
         KeysCmd::List => {
             let mut keys = or.list_keys().await.context("listing OpenRouter keys")?;
             keys.sort_by(|a, b| a.name.cmp(&b.name));
