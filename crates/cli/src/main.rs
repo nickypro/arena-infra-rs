@@ -88,6 +88,8 @@ enum Cmd {
     /// the provisioning API. Needs OPENROUTER_PROVISIONING_KEY in config.
     #[command(subcommand, infer_subcommands = true)]
     Keys(KeysCmd),
+    /// List the known GPU types (names to pass to `--gpu`, with VRAM + rough $/hr).
+    Gpus,
     /// Print the participant-facing `~/.ssh/config` for the fleet (read-only). Direct
     /// pod endpoints by default, or stable proxy ports with --proxy.
     SshConfig {
@@ -252,9 +254,7 @@ enum PodCmd {
         #[arg(long)]
         no_probe: bool,
     },
-    /// Create pods. Either name them explicitly (`create apple bloom`), top up to a
-    /// total (`-n`), or add a count (`-a`). GPU type/count, cloud, and image default to
-    /// config but can be overridden here. Acts by default; --dry-run to preview.
+    /// Create pods — by name (`create apple bloom`), `-n` total, or `-a` add.
     Create {
         /// Explicit machine names to create (e.g. `apple bloom`). Bare names get the
         /// configured prefix. Mutually exclusive with -n/-a.
@@ -297,9 +297,7 @@ enum PodCmd {
         #[arg(long, default_value_t = 60)]
         retry_secs: u64,
     },
-    /// Create N pods, then poll until they have SSH endpoints and print the proxy
-    /// plan — the one-command spin-up. Acts by default; --dry-run to preview. Polling stops at the
-    /// timeout; it never runs in the background or mutates the proxy.
+    /// Spin up: create pods, wait for SSH endpoints, then wire the proxy.
     Up {
         /// Target TOTAL number of pods — tops up to this many (mutually exclusive with -a).
         #[arg(short = 'n', long)]
@@ -352,8 +350,7 @@ enum PodCmd {
         #[arg(long, default_value_t = 12)]
         interval: u64,
     },
-    /// Stop a pod by name or id, or many with --all (optionally filtered by
-    /// --include/--exclude). Acts by default; --dry-run to preview.
+    /// Stop a pod, or many with --all (+ --include/--exclude).
     Stop {
         /// Machine name (e.g. arena8-apple) or raw provider id. Omit with --all.
         target: Option<String>,
@@ -370,29 +367,7 @@ enum PodCmd {
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// Stop pods, wait for them to fully exit, then terminate (delete) them — the
-    /// legacy `kill_pods` flow. One target or --all (with --include/--exclude).
-    /// Acts by default; --dry-run to preview.
-    Kill {
-        /// Machine name or raw provider id. Omit with --all.
-        target: Option<String>,
-        /// Kill every running pod (subject to --include/--exclude).
-        #[arg(long)]
-        all: bool,
-        /// With --all: only kill these names/ids (repeatable).
-        #[arg(long)]
-        include: Vec<String>,
-        /// With --all: never kill these names/ids (repeatable).
-        #[arg(long)]
-        exclude: Vec<String>,
-        /// Max seconds to wait for pods to reach EXITED before terminating those that did.
-        #[arg(long, default_value_t = 300)]
-        timeout: u64,
-        /// Preview only: print what would happen, change nothing.
-        #[arg(long, visible_aliases = ["dryrun", "dry"])]
-        dry_run: bool,
-    },
-    /// Restart a pod in place by name or id. Acts by default; --dry-run to preview.
+    /// Restart a pod in place.
     Restart {
         /// Machine name (e.g. arena8-apple) or raw provider id.
         target: String,
@@ -400,8 +375,7 @@ enum PodCmd {
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// Terminate (delete) a pod by name or id, or the whole fleet with --all.
-    /// Acts by default; --dry-run to preview.
+    /// Terminate (delete) a pod, or the whole fleet with --all.
     Terminate {
         /// Machine name (e.g. arena8-apple) or raw provider id. Omit with --all.
         target: Option<String>,
@@ -412,11 +386,7 @@ enum PodCmd {
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// Commit + push each pod's ARENA working tree over SSH, **on whatever branch the
-    /// pod is currently on** — it never switches or creates a branch (so bespoke
-    /// branches are respected), and it skips `main`/`master` (won't push the protected
-    /// branch). To stage onto a dated autocommit branch, run `pods init-branches` first.
-    /// Acts by default; --dry-run to preview.
+    /// Commit + push each pod's current branch over SSH (skips main/master).
     Backup {
         /// Preview only: print what would happen, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
@@ -449,9 +419,7 @@ enum PodCmd {
         #[arg(long)]
         force: bool,
     },
-    /// Run a shell command on every pod over SSH (concurrent), printing each pod's
-    /// output. Confirms first (it's arbitrary remote execution). e.g.
-    /// `arena pods run nvidia-smi -L`.
+    /// Run a shell command on every pod over SSH (concurrent).
     Run {
         /// The command to run (everything after `run`).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
@@ -460,13 +428,9 @@ enum PodCmd {
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// Quick health check on every pod: import torch and print its version (read-only).
+    /// Health check: torch version on every pod (read-only).
     Test,
-    /// Switch a pod's ARENA checkout to a branch. Gentle by default (fetch + checkout +
-    /// fast-forward pull — fails on a diverged/dirty tree rather than clobbering work).
-    /// With --hard it's DESTRUCTIVE: force the branch to match `origin/<branch>`,
-    /// discarding local commits/changes (e.g. `set-branch main --all --hard` to reset
-    /// the fleet to main). One pod (name/id) or --all. Acts by default; --dry-run previews.
+    /// Switch a pod's branch (gentle ff-only; --hard force-resets to origin).
     SetBranch {
         /// Branch to check out (e.g. main, or a feature branch).
         branch: String,
@@ -483,10 +447,7 @@ enum PodCmd {
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// Create each pod's autocommit branch for the iteration and push it upstream,
-    /// WITHOUT committing work (legacy init_branches) — e.g. start a new day so later
-    /// `backup`s have a branch with an upstream. Branch is
-    /// autocommit-{prefix}-w{week}d{day}-{machine}. Acts by default; --dry-run to preview.
+    /// Create + push each pod's wNdM autocommit branch (no commit).
     InitBranches {
         /// Override the iteration week (default: computed from ARENA_START_DATE).
         #[arg(long)]
@@ -498,9 +459,7 @@ enum PodCmd {
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// Rsync each pod's home directory to a local backup folder
-    /// (`<dir>/<label>/<pod>/`) — the file backup, complementing the git `backup`.
-    /// Acts by default; --dry-run to preview.
+    /// Rsync each pod's home to a local backup folder (the file backup).
     Pull {
         /// Backup label, e.g. `w1d3`. Defaults to the computed `wNdM` iteration.
         label: Option<String>,
@@ -522,10 +481,7 @@ enum PodCmd {
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// Distribute API keys to every pod's shell (`~/.bashrc`/`~/.zshrc`): per-host keys
-    /// from `<keys-dir>/<provider>_api_keys.csv` (openai/anthropic/openrouter), plus a
-    /// broadcast Hugging Face token (from --hf-token or config HF_TOKEN) for gated repos
-    /// like Llama 3. Idempotent. Acts by default; --dry-run to preview.
+    /// Distribute API keys to pods' shells (per-host CSVs + broadcast HF token).
     CopyKeys {
         /// Directory holding the per-host `<provider>_api_keys.csv` files.
         #[arg(long, default_value = "./keys")]
@@ -544,11 +500,7 @@ enum PodCmd {
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// Copy a local file to every pod over scp (concurrent). With no DEST, mirrors the
-    /// file's path under the ARENA repo (e.g. a local `…/ARENA_3.0/foo/bar.py` lands at
-    /// `/root/ARENA_3.0/foo/bar.py`); otherwise DEST is the remote path (a trailing `/`
-    /// means "into this dir"). The remote parent dir is created if needed.
-    /// Acts by default; --dry-run to preview.
+    /// Copy a local file to every pod over scp (mirrors the repo path if no DEST).
     Copy {
         /// Local file to copy.
         file: PathBuf,
@@ -865,7 +817,7 @@ async fn main() -> Result<()> {
     // `config check` must work even when a provider key is missing (that's what it's
     // for), so build the provider lazily — only for commands that actually talk to one.
     let provider = match cli.cmd {
-        Cmd::Config(_) | Cmd::Cron(_) | Cmd::Tui => None,
+        Cmd::Config(_) | Cmd::Cron(_) | Cmd::Tui | Cmd::Gpus => None,
         _ => Some(arena_core::provider::build(&cli.provider, &cfg)?),
     };
 
@@ -880,7 +832,33 @@ async fn main() -> Result<()> {
             handle_ssh_config(provider.unwrap().as_ref(), &cfg, proxy, out.as_deref()).await
         }
         Cmd::Keys(k) => handle_keys(k, provider.unwrap().as_ref(), &cfg, cli.yes).await,
+        Cmd::Gpus => handle_gpus(),
     }
+}
+
+/// `arena gpus`: print the known GPU catalog — the names you can pass to `--gpu`
+/// (the full RunPod API name, the short label, or an alias), with VRAM and rough $/hr.
+fn handle_gpus() -> Result<()> {
+    use arena_core::gpu;
+    println!(
+        "{:<14} {:>5}  {:>9}  {:>8}   {}",
+        "GPU", "VRAM", "$/hr comm", "$/hr sec", "RunPod API name (pass to --gpu)"
+    );
+    for g in gpu::PRESETS {
+        println!(
+            "{:<14} {:>4}G  {:>9}  {:>8}   {}",
+            g.label,
+            g.vram_gb,
+            format!("${:.2}", g.community),
+            format!("${:.2}", g.secure),
+            g.api,
+        );
+    }
+    println!(
+        "\nPass the API name, the label, or a short alias (e.g. `A4000`, `3090`, \"A100 SXM\") to --gpu.\n\
+         Prices are rough RunPod community/secure rates; Vast varies."
+    );
+    Ok(())
 }
 
 /// Launch the interactive dashboard, handing it the same provider/config the CLI was
@@ -2155,9 +2133,6 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             }
         }
 
-        PodCmd::Kill { target, all, include, exclude, timeout, dry_run } => {
-            handle_kill(provider, target, all, &include, &exclude, timeout, dry_run, yes).await?;
-        }
 
         PodCmd::InitBranches { week, day, dry_run } => {
             handle_init_branches(provider, cfg, week, day, dry_run, yes).await?;
@@ -2476,108 +2451,6 @@ async fn select_pods(
         pods.retain(|p| p.status.to_uppercase().contains(&s));
     }
     Ok(pods)
-}
-
-/// `pods kill`: stop the targeted pods, poll until they reach EXITED (up to `timeout`),
-/// then terminate those that did. Mirrors legacy `kill_pods.py` (stop → wait → delete).
-#[allow(clippy::too_many_arguments)]
-async fn handle_kill(
-    provider: &dyn Provider,
-    target: Option<String>,
-    all: bool,
-    include: &[String],
-    exclude: &[String],
-    timeout: u64,
-    dry_run: bool,
-    yes: bool,
-) -> Result<()> {
-    let pods = match (all, target) {
-        (true, _) => select_pods(provider, include, exclude, Some("RUNNING")).await?,
-        (false, Some(t)) => {
-            let policy = arena_core::retry::RetryPolicy::default();
-            let all_pods = arena_core::retry::retrying(&policy, || provider.list_pods()).await?;
-            match all_pods.into_iter().find(|p| p.name == t || p.id == t) {
-                Some(p) => vec![p],
-                None => anyhow::bail!("no pod with name or id '{t}' (run `arena pods list`)"),
-            }
-        }
-        (false, None) => anyhow::bail!("specify a pod (name or id) to kill, or pass --all"),
-    };
-    if pods.is_empty() {
-        println!("(no running pods to kill)");
-        return Ok(());
-    }
-
-    if dry_run {
-        for p in &pods {
-            println!("[dry-run] would stop+terminate {} (id={})", p.name, p.id);
-        }
-        println!("\nDry-run only — would kill {} pod(s) (stop, wait ≤{timeout}s, delete).", pods.len());
-        return Ok(());
-    }
-    if !confirm(yes, &format!("Will STOP then TERMINATE {} pod(s) — irreversible.", pods.len()))? {
-        println!("aborted.");
-        return Ok(());
-    }
-
-    // Stop them.
-    for p in &pods {
-        match provider.stop_pod(&p.id).await {
-            Ok(()) => println!("[stopping] {}", p.name),
-            Err(e) => eprintln!("[FAILED to stop] {}: {e}", p.name),
-        }
-    }
-
-    // Wait for EXITED (poll the whole fleet; Ctrl+C stops the wait early).
-    let target_ids: std::collections::HashSet<String> = pods.iter().map(|p| p.id.clone()).collect();
-    let policy = arena_core::retry::RetryPolicy::default();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
-    println!("\nWaiting up to {timeout}s for pods to exit (Ctrl+C to stop)…");
-    let exited: std::collections::HashSet<String> = loop {
-        let cur = arena_core::retry::retrying(&policy, || provider.list_pods())
-            .await
-            .unwrap_or_default();
-        let exited: std::collections::HashSet<String> = cur
-            .iter()
-            .filter(|p| target_ids.contains(&p.id) && p.status.to_uppercase().contains("EXIT"))
-            .map(|p| p.id.clone())
-            .collect();
-        println!("  {}/{} exited", exited.len(), target_ids.len());
-        if exited.len() == target_ids.len() || std::time::Instant::now() >= deadline {
-            break exited;
-        }
-        tokio::select! {
-            _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!("interrupted — terminating those that have exited");
-                break exited;
-            }
-        }
-    };
-
-    // Terminate the ones that exited.
-    let (mut ok, mut failed) = (0, 0);
-    for p in &pods {
-        if !exited.contains(&p.id) {
-            eprintln!("[skip] {} did not reach EXITED in time — not deleting", p.name);
-            continue;
-        }
-        match provider.terminate_pod(&p.id).await {
-            Ok(()) => {
-                println!("[terminated] {}", p.name);
-                ok += 1;
-            }
-            Err(e) => {
-                eprintln!("[FAILED] {}: {e}", p.name);
-                failed += 1;
-            }
-        }
-    }
-    println!("\nkilled {ok}/{} ({} not exited in time)", pods.len(), pods.len() - ok - failed);
-    if failed > 0 {
-        anyhow::bail!("{failed} pod(s) failed to terminate");
-    }
-    Ok(())
 }
 
 /// `pods init-branches`: create each pod's `autocommit-…-wNdM-…` branch and push it
