@@ -1638,14 +1638,14 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     let show_graphs = inner.height >= 18;
     let constraints: &[Constraint] = if show_graphs {
         &[
-            Constraint::Length(12), // header facts
+            Constraint::Length(13), // header facts
             Constraint::Min(3),    // per-GPU table
             Constraint::Length(3), // util sparkline
             Constraint::Length(3), // temp sparkline
         ]
     } else {
         &[
-            Constraint::Length(12), // header facts
+            Constraint::Length(13), // header facts
             Constraint::Min(3),    // per-GPU table
         ]
     };
@@ -1694,7 +1694,7 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
         format!("{cpu}   {ram}")
     };
     let facts = format!(
-        "status:   {}\ngpu:      {}\nendpoint: {}\ncost:     {}\ndisk:     {}\nhost:     {}\nbranch:   {}\nbackup:   {}\nsync:     {}\norigin:   {} {}\nsetup:    .name {}   deploy-key {}   origin→gh {}   api-key {}\nprogress: {}",
+        "status:   {}\ngpu:      {}\nendpoint: {}\ncost:     {}\ndisk:     {}\nhost:     {}\nbranch:   {}\nbackup:   {}\nsync:     {}\norigin:   {} {}\nsetup:    .name {}   deploy-key {}   origin→gh {}   api-key {}\ntokens:   HF {}   Claude-Code {}\nprogress: {}",
         display_status(&pod.status, m.map(|m| m.error.is_none())),
         gpu,
         endpoint,
@@ -1710,6 +1710,8 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
         ok(m.and_then(|m| m.has_key)),
         ok(origin_ok),
         ok(m.and_then(|m| m.has_api_key)),
+        ok(m.and_then(|m| m.has_hf_token)),
+        ok(m.and_then(|m| m.has_cc_token)),
         progress,
     );
     f.render_widget(Paragraph::new(facts).wrap(Wrap { trim: true }), rows[0]);
