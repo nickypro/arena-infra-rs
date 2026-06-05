@@ -148,9 +148,11 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `setup` (or `up --setup`) makes pods fully ready. Confirms first (`--dry-run` previews,
     token redacted). Uses `GIT_SSH_KEY_LOCAL/REMOTE`, `ARENA_REPO_OWNER/NAME`, `DEFAULT_BRANCH`.
   - `config check | set | which` — `check` is the read-only doctor (keys + setup
-    readiness); `config set KEY VALUE` writes a key (e.g. an API key) into config.env, or
-    with no args prompts interactively (the picker shows which keys are already set, and
-    includes `HF_TOKEN`); `config which` shows the active config file (path,
+    readiness); `config set KEY VALUE` writes a key (e.g. an API key) into config.env —
+    or give just `KEY` and **pipe the value on stdin** (`printf %s "$TOK" | arena config
+    set HF_TOKEN`, script-friendly, keeps secrets out of `argv`/`ps`), or with no args
+    prompt interactively (the picker shows which keys are already set); `config which`
+    shows the active config file (path,
     readable/**writable**), what parsed, and any keys coming from the environment.
 - `arena-tui` (TUI) — interactive dashboard (ratatui): pods from the configured
   provider plus, per pod, GPU stats via `nvidia-smi`, git branch, a setup-health check,

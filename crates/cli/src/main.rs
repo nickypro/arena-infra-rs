@@ -214,13 +214,18 @@ enum ConfigCmd {
     /// key is missing.
     Check,
     /// Set a key in config.env (e.g. an API key): replaces the line if present, else
-    /// appends `KEY="value"`. Writes to the --config file; never echoes the value. With
-    /// no KEY/VALUE it prompts interactively (pick a key — showing which are already
-    /// set — then type the value).
+    /// appends `KEY="value"`. Writes to the --config file; never echoes the value.
+    ///
+    /// Script-friendly: `config set KEY VALUE` sets it directly, or give just `KEY` and
+    /// pipe the value on stdin (keeps secrets out of argv / `ps`):
+    ///   printf %s "$TOKEN" | arena config set HF_TOKEN
+    /// With no KEY at all it prompts interactively (pick a key — showing which are
+    /// already set — then type the value); that path needs a terminal.
+    #[command(verbatim_doc_comment)]
     Set {
         /// Config key, e.g. RUNPOD_API_KEY. Omit to choose interactively.
         key: Option<String>,
-        /// Value to store (will be quoted). Omit to be prompted.
+        /// Value to store (will be quoted). Omit to read from stdin / be prompted.
         value: Option<String>,
     },
     /// Show which config file is active (path + whether it's readable/writable), plus a
@@ -1274,7 +1279,14 @@ fn handle_config(
         ConfigCmd::Set { key, value } => {
             let (key, value) = match (key, value) {
                 (Some(k), Some(v)) => (k, v),
-                _ => interactive_config_set(cfg)?,
+                // Key given but no value: read it from stdin when piped (script-friendly,
+                // and keeps secrets out of argv/`ps`), or prompt at a terminal.
+                (Some(k), None) => {
+                    let v = read_value_for(&k)?;
+                    (k, v)
+                }
+                // No key: pick interactively (needs a terminal).
+                (None, _) => interactive_config_set(cfg)?,
             };
             let text = std::fs::read_to_string(config_path)
                 .with_context(|| format!("reading {}", config_path.display()))?;
@@ -1327,6 +1339,37 @@ fn key_state(cfg: &Config, key: &str, secret: bool) -> String {
         None => "· not set".to_string(),
         Some(_) if secret => "✓ set".to_string(),
         Some(v) => format!("✓ {v}"),
+    }
+}
+
+/// Read the value for `key` when it wasn't given on the command line: from **stdin** if
+/// it's piped (so scripts can do `printf %s "$TOKEN" | arena config set KEY` — the secret
+/// never lands in argv / `ps` / shell history), or by prompting at a terminal. Trailing
+/// newline is stripped; an empty value is an error.
+fn read_value_for(key: &str) -> Result<String> {
+    use std::io::{IsTerminal, Read, Write};
+    if std::io::stdin().is_terminal() {
+        eprint!("value for {key}: ");
+        std::io::stderr().flush().ok();
+        let mut s = String::new();
+        std::io::stdin().read_line(&mut s)?;
+        let s = s.trim().to_string();
+        if s.is_empty() {
+            anyhow::bail!("empty value — nothing set");
+        }
+        Ok(s)
+    } else {
+        // Piped: take all of stdin, trimming a trailing newline (the usual `echo`/here-string).
+        let mut s = String::new();
+        std::io::stdin().read_to_string(&mut s).context("reading value from stdin")?;
+        let s = s.trim_end_matches(['\n', '\r']).to_string();
+        if s.is_empty() {
+            anyhow::bail!(
+                "no value for {key}: pass it as an argument or pipe it \
+                 (e.g. `printf %s \"$VALUE\" | arena config set {key}`)"
+            );
+        }
+        Ok(s)
     }
 }
 
