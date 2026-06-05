@@ -123,8 +123,14 @@ enum KeysCmd {
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// List the provisioned OpenRouter keys (name, USD limit, usage).
-    List,
+    /// List the provisioned OpenRouter keys (name, USD limit, usage). By default shows
+    /// only this iteration's keys (named `<MACHINE_NAME_PREFIX>-*`) and notes how many
+    /// others were hidden; `--all` shows every key on the account.
+    List {
+        /// Show every key on the account, not just this iteration's `<prefix>-*` keys.
+        #[arg(long)]
+        all: bool,
+    },
     /// Show the local OpenRouter keys file (path, whether it exists, and which pods have
     /// a key) — never prints the secret values.
     Which,
@@ -3164,20 +3170,40 @@ async fn handle_keys(cmd: KeysCmd, provider: &dyn Provider, cfg: &Config, yes: b
 
     match cmd {
         KeysCmd::Which => unreachable!("handled before the provisioning-key check"),
-        KeysCmd::List => {
+        KeysCmd::List { all } => {
             let mut keys = or.list_keys().await.context("listing OpenRouter keys")?;
             keys.sort_by(|a, b| a.name.cmp(&b.name));
             if keys.is_empty() {
                 println!("(no provisioned OpenRouter keys)");
                 return Ok(());
             }
+            // Default to this iteration's keys (named `<prefix>-…`); count the rest.
+            let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
+            let needle = format!("{prefix}-");
+            let total = keys.len();
+            let shown: Vec<_> = if all {
+                keys.iter().collect()
+            } else {
+                keys.iter()
+                    .filter(|k| k.name.as_deref().map(|n| n.starts_with(&needle)).unwrap_or(false))
+                    .collect()
+            };
+            let excluded = total - shown.len();
+
+            if shown.is_empty() {
+                println!("(no {prefix}-* keys; {excluded} other key(s) hidden — use --all to show all)");
+                return Ok(());
+            }
             println!("{:<28} {:>9} {:>9}  {}", "NAME", "LIMIT", "USAGE", "HASH");
-            for k in &keys {
+            for k in &shown {
                 let lim = k.limit.map(|l| format!("${l:.2}")).unwrap_or_else(|| "-".into());
                 let used = k.usage.map(|u| format!("${u:.2}")).unwrap_or_else(|| "-".into());
                 let short = &k.hash[..k.hash.len().min(12)];
                 let dis = if k.disabled { "  (disabled)" } else { "" };
                 println!("{:<28} {lim:>9} {used:>9}  {short}{dis}", k.name.clone().unwrap_or_default());
+            }
+            if !all && excluded > 0 {
+                println!("\n(excluded {excluded} non-{prefix} key(s) — use --all to show all)");
             }
         }
 
