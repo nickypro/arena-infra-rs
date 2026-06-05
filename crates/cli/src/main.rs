@@ -938,12 +938,15 @@ async fn handle_setup(provider: &dyn Provider, cfg: &Config, apply: bool, force:
     use arena_core::ssh::{self, SshTarget};
 
     let scfg = arena_core::setup::SetupConfig::from_config(cfg)?;
-    // Tell the operator whether the HF token will be exported (it's an optional step).
-    if scfg.hf_token.is_some() {
-        println!("HF token: found — will export HF_TOKEN on each pod (gated-repo access).");
-    } else {
-        println!("HF token: none set — skipping (set HF_TOKEN to give pods gated-repo access).");
-    }
+    // Report which broadcast tokens (HF, Claude Code) will be exported (optional step).
+    let token_summary: Vec<String> = arena_core::apikeys::BROADCAST_TOKENS
+        .iter()
+        .map(|(key, display, _)| {
+            let present = cfg.get(key).map(|v| !v.is_empty()).unwrap_or(false);
+            format!("{display} {}", if present { "✓" } else { "✗" })
+        })
+        .collect();
+    println!("Broadcast tokens: {} (✓ exported on each pod; ✗ skipped)", token_summary.join(", "));
     let pods = provider.list_pods().await.context("listing pods for setup")?;
     let mut targets = Vec::new();
     for pod in &pods {
@@ -958,12 +961,12 @@ async fn handle_setup(provider: &dyn Provider, cfg: &Config, apply: bool, force:
     }
 
     if !apply {
-        // Redact the HF token in the *previewed* command — the dry-run prints the exact
-        // shell, and the real value must never land in a terminal/log. (The actual run
-        // below uses `scfg` with the real token and never prints the command.)
+        // Redact broadcast token values in the *previewed* command — the dry-run prints
+        // the exact shell, and real token values must never land in a terminal/log. (The
+        // actual run below uses `scfg` with real values and never prints the command.)
         let mut display_scfg = scfg.clone();
-        if display_scfg.hf_token.is_some() {
-            display_scfg.hf_token = Some("<HF_TOKEN>".to_string());
+        for (name, value) in display_scfg.broadcast_exports.iter_mut() {
+            *value = format!("<{name}>");
         }
         println!(
             "Dry-run — would provision {} pod(s) (copy key {} -> {}, then):\n",
@@ -1278,6 +1281,7 @@ const SETTABLE_KEYS: &[(&str, bool)] = &[
     ("VAST_API_KEY", true),
     ("HETZNER_API_KEY", true),
     ("HF_TOKEN", true), // broadcast to pods for gated repos (Llama 3 …)
+    ("CLAUDE_CODE_OAUTH_TOKEN", true), // broadcast to pods for Claude Code access
     ("OPENROUTER_PROVISIONING_KEY", true), // mints per-machine OpenRouter keys (`arena keys`)
     ("ARENA_START_DATE", false),
     ("MACHINE_NAME_PREFIX", false),
@@ -1480,6 +1484,7 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
 
     println!("\nEvals / model access (optional, `pods copy-keys` / `arena keys`):");
     cfg_row(cfg, &mut missing, "HF_TOKEN", false, true); // broadcast for gated repos (Llama 3 …)
+    cfg_row(cfg, &mut missing, "CLAUDE_CODE_OAUTH_TOKEN", false, true); // broadcast for Claude Code
     cfg_row(cfg, &mut missing, "OPENROUTER_PROVISIONING_KEY", false, true); // mints runtime keys
     cfg_row(cfg, &mut missing, "OPENROUTER_KEY_LIMIT", false, false); // USD cap per generated key
 
@@ -2969,16 +2974,26 @@ async fn handle_copy_keys(
         }
     }
 
-    // Broadcast Hugging Face token (CLI flag wins over config).
-    let hf = hf_token.or_else(|| cfg.get("HF_TOKEN").filter(|s| !s.is_empty()).map(String::from));
-    if hf.is_some() {
-        sources.push("Hugging Face (broadcast to all)".to_string());
+    // Broadcast tokens (HF, Claude Code): --hf-token overrides config HF_TOKEN; the rest
+    // (e.g. CLAUDE_CODE_OAUTH_TOKEN) come from config.
+    let token_value = |k: &str| -> Option<String> {
+        if k == "HF_TOKEN" {
+            hf_token.clone().or_else(|| cfg.get(k).filter(|s| !s.is_empty()).map(String::from))
+        } else {
+            cfg.get(k).filter(|s| !s.is_empty()).map(String::from)
+        }
+    };
+    let broadcast = apikeys::broadcast_env_vars(&token_value);
+    for (key, display, _) in apikeys::BROADCAST_TOKENS {
+        if token_value(key).is_some() {
+            sources.push(format!("{display} (broadcast to all)"));
+        }
     }
 
-    if per_host.is_empty() && hf.is_none() {
+    if per_host.is_empty() && broadcast.is_empty() {
         anyhow::bail!(
             "no keys to copy: put `<provider>_api_keys.csv` in {keys_dir}/ \
-             (openai/anthropic/openrouter) and/or pass --hf-token (or set HF_TOKEN)"
+             (openai/anthropic/openrouter), set HF_TOKEN / CLAUDE_CODE_OAUTH_TOKEN, or pass --hf-token"
         );
     }
     println!("Key sources: {}\n", sources.join(", "));
@@ -2994,10 +3009,9 @@ async fn handle_copy_keys(
             anyhow::bail!("no pods matched --include {:?} (run `arena pods list`)", include);
         }
     }
-    let hf_vars = hf.as_deref().map(apikeys::hf_env_vars).unwrap_or_default();
     let mut jobs: Vec<(String, SshTarget, Vec<(String, String)>)> = Vec::new();
     for pod in &pods {
-        let mut vars = hf_vars.clone();
+        let mut vars = broadcast.clone();
         if let Some(h) = per_host.get(&pod.name) {
             vars.extend(h.iter().cloned());
         }
