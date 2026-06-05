@@ -370,11 +370,13 @@ enum PodCmd {
     ///      branch and hard-resets);
     ///   5. update submodules;
     ///   6. write ~/.name (export MACHINE_NAME=…);
-    ///   7. (optional) if HF_TOKEN is set, export it (HF_TOKEN + HUGGING_FACE_HUB_TOKEN)
-    ///      into ~/.bashrc & ~/.zshrc for gated-repo access — else this step is skipped.
+    ///   7. (optional) export any broadcast tokens that are set — Hugging Face
+    ///      (HF_TOKEN + HUGGING_FACE_HUB_TOKEN) and Claude Code (CLAUDE_CODE_OAUTH_TOKEN)
+    ///      — into ~/.bashrc & ~/.zshrc; tokens not set are skipped.
     ///
     /// It does NOT distribute per-host API keys (use `pods copy-keys`) or back anything
     /// up (use `pods backup` / `pods pull`).
+    #[command(verbatim_doc_comment)]
     Setup {
         /// Preview only: print what would happen, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
@@ -382,6 +384,12 @@ enum PodCmd {
         /// Force-checkout the default branch and hard-reset (else stay on current).
         #[arg(long)]
         force: bool,
+        /// Hugging Face token to broadcast (overrides config HF_TOKEN).
+        #[arg(long)]
+        hf_token: Option<String>,
+        /// Claude Code OAuth token to broadcast (overrides config CLAUDE_CODE_OAUTH_TOKEN).
+        #[arg(long)]
+        cc_token: Option<String>,
     },
     /// Stop a pod, or many with --all (+ --include/--exclude).
     Stop {
@@ -505,6 +513,10 @@ enum PodCmd {
         /// Overrides config HF_TOKEN. Use to enable pulls from gated repos.
         #[arg(long)]
         hf_token: Option<String>,
+        /// Claude Code OAuth token to set on every pod (CLAUDE_CODE_OAUTH_TOKEN).
+        /// Overrides config CLAUDE_CODE_OAUTH_TOKEN.
+        #[arg(long)]
+        cc_token: Option<String>,
         /// Only copy to these pods (name or id, repeatable). Default: all reachable.
         #[arg(long)]
         include: Vec<String>,
@@ -940,17 +952,32 @@ fn launch_tui(provider: &str, config: &std::path::Path) -> Result<()> {
     }
 }
 
-async fn handle_setup(provider: &dyn Provider, cfg: &Config, apply: bool, force: bool) -> Result<()> {
+async fn handle_setup(
+    provider: &dyn Provider,
+    cfg: &Config,
+    apply: bool,
+    force: bool,
+    hf_token: Option<String>,
+    cc_token: Option<String>,
+) -> Result<()> {
     use arena_core::ssh::{self, SshTarget};
 
-    let scfg = arena_core::setup::SetupConfig::from_config(cfg)?;
+    // Broadcast token values: CLI flags override config (so a token can be supplied
+    // without editing the read-only prod config).
+    let token_value = |k: &str| -> Option<String> {
+        let flag = match k {
+            "HF_TOKEN" => hf_token.clone(),
+            "CLAUDE_CODE_OAUTH_TOKEN" => cc_token.clone(),
+            _ => None,
+        };
+        flag.or_else(|| cfg.get(k).filter(|s| !s.is_empty()).map(String::from))
+    };
+    let mut scfg = arena_core::setup::SetupConfig::from_config(cfg)?;
+    scfg.broadcast_exports = arena_core::apikeys::broadcast_env_vars(&token_value);
     // Report which broadcast tokens (HF, Claude Code) will be exported (optional step).
     let token_summary: Vec<String> = arena_core::apikeys::BROADCAST_TOKENS
         .iter()
-        .map(|(key, display, _)| {
-            let present = cfg.get(key).map(|v| !v.is_empty()).unwrap_or(false);
-            format!("{display} {}", if present { "✓" } else { "✗" })
-        })
+        .map(|(key, display, _)| format!("{display} {}", if token_value(key).is_some() { "✓" } else { "✗" }))
         .collect();
     println!("Broadcast tokens: {} (✓ exported on each pod; ✗ skipped)", token_summary.join(", "));
     let pods = provider.list_pods().await.context("listing pods for setup")?;
@@ -1062,7 +1089,7 @@ async fn handle_setup(provider: &dyn Provider, cfg: &Config, apply: bool, force:
         );
     } else {
         println!("API keys: found {} — distributing to pods…", csv_sources.join(", "));
-        if let Err(e) = handle_copy_keys(provider, cfg, keys_dir, None, &[], &[], false, true).await {
+        if let Err(e) = handle_copy_keys(provider, cfg, keys_dir, None, None, &[], &[], false, true).await {
             eprintln!("  (API-key distribution failed: {e})");
         }
     }
@@ -2165,7 +2192,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             // Optional: provision the pods over SSH as part of the spin-up.
             if setup {
                 println!("\nProvisioning pods over SSH…");
-                handle_setup(provider, cfg, true, false).await?;
+                handle_setup(provider, cfg, true, false, None, None).await?;
             }
             // If there's no nginx to deploy to, say how to wire it (don't dump config).
             if !nginx_present {
@@ -2234,8 +2261,8 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             handle_pull(provider, cfg, label, &dir, max_size, remote_path, no_git, None, dry_run, yes).await?;
         }
 
-        PodCmd::CopyKeys { keys_dir, hf_token, include, exclude, dry_run } => {
-            handle_copy_keys(provider, cfg, &keys_dir, hf_token, &include, &exclude, dry_run, yes).await?;
+        PodCmd::CopyKeys { keys_dir, hf_token, cc_token, include, exclude, dry_run } => {
+            handle_copy_keys(provider, cfg, &keys_dir, hf_token, cc_token, &include, &exclude, dry_run, yes).await?;
         }
 
         PodCmd::Cp { file, dest, recursive, include, exclude, dry_run } => {
@@ -2333,12 +2360,12 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                 handle_pull(provider, cfg, None, &dir, None, None, false, target.as_deref(), dry_run, true).await?;
             }
         }
-        PodCmd::Setup { dry_run, force } => {
+        PodCmd::Setup { dry_run, force, hf_token, cc_token } => {
             if !dry_run && !confirm(yes, "Will provision each pod over SSH (deploy key, ~/.name, repo).")? {
                 println!("aborted.");
                 return Ok(());
             }
-            handle_setup(provider, cfg, !dry_run, force).await?;
+            handle_setup(provider, cfg, !dry_run, force, hf_token, cc_token).await?;
         }
         PodCmd::SetBranch { branch, target, all, hard, dry_run } => {
             handle_set_branch(provider, cfg, &branch, target.as_deref(), all, hard, dry_run, yes).await?;
@@ -2952,6 +2979,7 @@ async fn handle_copy_keys(
     cfg: &Config,
     keys_dir: &str,
     hf_token: Option<String>,
+    cc_token: Option<String>,
     include: &[String],
     exclude: &[String],
     dry_run: bool,
@@ -2983,11 +3011,12 @@ async fn handle_copy_keys(
     // Broadcast tokens (HF, Claude Code): --hf-token overrides config HF_TOKEN; the rest
     // (e.g. CLAUDE_CODE_OAUTH_TOKEN) come from config.
     let token_value = |k: &str| -> Option<String> {
-        if k == "HF_TOKEN" {
-            hf_token.clone().or_else(|| cfg.get(k).filter(|s| !s.is_empty()).map(String::from))
-        } else {
-            cfg.get(k).filter(|s| !s.is_empty()).map(String::from)
-        }
+        let flag = match k {
+            "HF_TOKEN" => hf_token.clone(),
+            "CLAUDE_CODE_OAUTH_TOKEN" => cc_token.clone(),
+            _ => None,
+        };
+        flag.or_else(|| cfg.get(k).filter(|s| !s.is_empty()).map(String::from))
     };
     let broadcast = apikeys::broadcast_env_vars(&token_value);
     for (key, display, _) in apikeys::BROADCAST_TOKENS {
@@ -3252,7 +3281,7 @@ async fn handle_keys(cmd: KeysCmd, provider: &dyn Provider, cfg: &Config, yes: b
             println!("\nGenerated {made}, skipped {skipped}, failed {failed} → {OPENROUTER_KEYS_CSV}");
             if copy && made > 0 {
                 println!();
-                handle_copy_keys(provider, cfg, "./keys", None, &names, &[], false, yes).await?;
+                handle_copy_keys(provider, cfg, "./keys", None, None, &names, &[], false, yes).await?;
             }
         }
 
@@ -3304,7 +3333,7 @@ async fn handle_keys(cmd: KeysCmd, provider: &dyn Provider, cfg: &Config, yes: b
             println!("\nRotated {ok}, failed {failed}.");
             if copy && ok > 0 {
                 println!();
-                handle_copy_keys(provider, cfg, "./keys", None, &names, &[], false, yes).await?;
+                handle_copy_keys(provider, cfg, "./keys", None, None, &names, &[], false, yes).await?;
             }
         }
 

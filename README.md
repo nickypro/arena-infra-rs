@@ -114,7 +114,7 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     (idempotent): per-host keys from `<keys-dir>/<provider>_api_keys.csv`
     (openai/anthropic/openrouter) **plus broadcast tokens** — a Hugging Face token
     (`--hf-token`/`HF_TOKEN`, sets `HF_TOKEN` + `HUGGING_FACE_HUB_TOKEN`) for **gated
-    repos** (Llama 3, …) and a **Claude Code token** (`CLAUDE_CODE_OAUTH_TOKEN`).
+    repos** (Llama 3, …) and a **Claude Code token** (`--cc-token`/`CLAUDE_CODE_OAUTH_TOKEN`).
     `--include`/`--exclude` (name or id) scope it to specific pods. Confirms first;
     `--dry-run` lists what would be set (values redacted). Both broadcast tokens are
     env-introducible (e.g. `CLAUDE_CODE_OAUTH_TOKEN=… arena pods copy-keys`).
@@ -141,8 +141,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
   - `pods setup` — provision pods over SSH (ordered steps in `--help`): copy the git
     deploy key, write `~/.ssh/config` + `authorized_keys`, point the repo at GitHub,
     update submodules, write `~/.name`, and export any set **broadcast tokens** (Hugging
-    Face for gated-repo access, Claude Code) — else those steps are skipped and it says
-    so. It also **auto-distributes per-host API keys** if any
+    Face for gated-repo access, Claude Code; via config or `--hf-token`/`--cc-token`) —
+    else those steps are skipped and it says so. It also **auto-distributes per-host API
+    keys** if any
     `keys/*_api_keys.csv` exist (reporting what it added, or that none are set up), so a
     `setup` (or `up --setup`) makes pods fully ready. Confirms first (`--dry-run` previews,
     token redacted). Uses `GIT_SSH_KEY_LOCAL/REMOTE`, `ARENA_REPO_OWNER/NAME`, `DEFAULT_BRANCH`.
