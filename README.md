@@ -112,11 +112,12 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     iteration. Confirms first; `--dry-run` prints the exact rsync commands.
   - `pods copy-keys` — distribute API keys into each pod's `~/.bashrc`/`~/.zshrc`
     (idempotent): per-host keys from `<keys-dir>/<provider>_api_keys.csv`
-    (openai/anthropic/openrouter) **plus a broadcast Hugging Face token** (`--hf-token`
-    or config `HF_TOKEN`) so the cohort can pull **gated repos** we're approved for
-    (Llama 3, …) — it sets both `HF_TOKEN` and `HUGGING_FACE_HUB_TOKEN`. `--include`/
-    `--exclude` (name or id) scope it to specific pods. Confirms first; `--dry-run` lists
-    what would be set (values redacted).
+    (openai/anthropic/openrouter) **plus broadcast tokens** — a Hugging Face token
+    (`--hf-token`/`HF_TOKEN`, sets `HF_TOKEN` + `HUGGING_FACE_HUB_TOKEN`) for **gated
+    repos** (Llama 3, …) and a **Claude Code token** (`CLAUDE_CODE_OAUTH_TOKEN`).
+    `--include`/`--exclude` (name or id) scope it to specific pods. Confirms first;
+    `--dry-run` lists what would be set (values redacted). Both broadcast tokens are
+    env-introducible (e.g. `CLAUDE_CODE_OAUTH_TOKEN=… arena pods copy-keys`).
   - `pods copy <file> [dest]` — scp a local file to every pod (concurrent; `--include`/
     `--exclude` to scope). With no `dest` it **mirrors the path under the ARENA repo**
     (a local `…/ARENA_3.0/foo/bar.py` → `/root/ARENA_3.0/foo/bar.py`); otherwise `dest`
@@ -137,9 +138,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     machine's `MACHINE_NAME_LIST` index. Read-only.
   - `pods setup` — provision pods over SSH (ordered steps in `--help`): copy the git
     deploy key, write `~/.ssh/config` + `authorized_keys`, point the repo at GitHub,
-    update submodules, write `~/.name`, and — **if `HF_TOKEN` is set** — export it
-    (`HF_TOKEN` + `HUGGING_FACE_HUB_TOKEN`) for gated-repo access (else that step is
-    skipped, and it says so). It also **auto-distributes per-host API keys** if any
+    update submodules, write `~/.name`, and export any set **broadcast tokens** (Hugging
+    Face for gated-repo access, Claude Code) — else those steps are skipped and it says
+    so. It also **auto-distributes per-host API keys** if any
     `keys/*_api_keys.csv` exist (reporting what it added, or that none are set up), so a
     `setup` (or `up --setup`) makes pods fully ready. Confirms first (`--dry-run` previews,
     token redacted). Uses `GIT_SSH_KEY_LOCAL/REMOTE`, `ARENA_REPO_OWNER/NAME`, `DEFAULT_BRANCH`.
