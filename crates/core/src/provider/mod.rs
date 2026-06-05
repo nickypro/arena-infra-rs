@@ -20,7 +20,7 @@ pub fn build(name: &str, cfg: &Config) -> Result<Box<dyn Provider>> {
         "vast" => Ok(Box::new(vast::VastProvider::new(cfg.require("VAST_API_KEY")?))),
         "hetzner" => {
             let opts = hetzner::HetznerOpts {
-                server_type: cfg.get("HETZNER_SERVER_TYPE").unwrap_or("cx22").to_string(),
+                server_type: cfg.get("HETZNER_SERVER_TYPE").unwrap_or("cax11").to_string(),
                 image: cfg.get("HETZNER_IMAGE").unwrap_or("ubuntu-24.04").to_string(),
                 location: cfg.get("HETZNER_LOCATION").map(String::from),
                 ssh_keys: cfg

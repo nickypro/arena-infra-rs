@@ -32,7 +32,9 @@ pub struct HetznerOpts {
 impl Default for HetznerOpts {
     fn default() -> Self {
         Self {
-            server_type: "cx22".into(),
+            // cax11: current, cheap Arm Ampere shared vCPU (the older cx-line types like
+            // cx22 are being deprecated by Hetzner). Override via HETZNER_SERVER_TYPE.
+            server_type: "cax11".into(),
             image: "ubuntu-24.04".into(),
             location: None,
             ssh_keys: Vec::new(),
