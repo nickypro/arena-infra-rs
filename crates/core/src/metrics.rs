@@ -95,6 +95,10 @@ pub struct PodMetrics {
     /// Whether any LLM API key (OpenRouter / Anthropic / OpenAI) is exported in the pod's
     /// shell rc files — i.e. `copy-keys` has run. None = not probed / unreachable.
     pub has_api_key: Option<bool>,
+    /// Whether a Hugging Face token (`HF_TOKEN`) is exported in the pod's shell rc files.
+    pub has_hf_token: Option<bool>,
+    /// Whether a Claude Code token (`CLAUDE_CODE_OAUTH_TOKEN`) is exported in the rc files.
+    pub has_cc_token: Option<bool>,
     /// Root-filesystem usage (used, total) in MB, if reported.
     pub disk_used_mb: Option<u32>,
     pub disk_total_mb: Option<u32>,
@@ -227,6 +231,15 @@ fn remote_command(opts: &ProbeOpts) -> String {
         "(grep -qsE '^[[:space:]]*export (OPENROUTER_API_KEY|ANTHROPIC_API_KEY|OPENAI_API_KEY)=' \
          \"$HOME/.bashrc\" \"$HOME/.zshrc\" && echo apikey=1 || echo apikey=0); ",
     );
+    // Broadcast tokens present in the shell rc files: Hugging Face and Claude Code.
+    s.push_str(
+        "(grep -qsE '^[[:space:]]*export (HF_TOKEN|HUGGING_FACE_HUB_TOKEN)=' \
+         \"$HOME/.bashrc\" \"$HOME/.zshrc\" && echo hf=1 || echo hf=0); ",
+    );
+    s.push_str(
+        "(grep -qsE '^[[:space:]]*export CLAUDE_CODE_OAUTH_TOKEN=' \
+         \"$HOME/.bashrc\" \"$HOME/.zshrc\" && echo cc=1 || echo cc=0); ",
+    );
     if let Some(key) = &opts.key_remote {
         let q = shell_quote(key);
         s.push_str(&format!("([ -e {q} ] && echo key=1 || echo key=0); "));
@@ -266,6 +279,8 @@ fn parse_probe(stdout: &str, m: &mut PodMetrics) {
             "name" => m.has_name = Some(v == "1"),
             "key" => m.has_key = Some(v == "1"),
             "apikey" => m.has_api_key = Some(v == "1"),
+            "hf" => m.has_hf_token = Some(v == "1"),
+            "cc" => m.has_cc_token = Some(v == "1"),
             "disk" => {
                 // "used_kb total_kb" -> MB
                 let mut it = v.split_whitespace().filter_map(|x| x.parse::<u64>().ok());
@@ -408,7 +423,7 @@ mod tests {
     #[test]
     fn parses_combined_probe_output() {
         let out = format!(
-            "NVIDIA RTX A4000, 15, 1000, 16000, 45\n{SENTINEL}\nbranch=autocommit-arena8-w0d1-apple\norigin=git@github.com:styme3279/ARENA_3.0.git\ncommitted=1717412400\ndirty=3\nsync=0\t2\nname=1\napikey=1\nkey=0\ndisk=12582912 104857600\ncpu=37\nhostmem=8388608 16777216\nprogress=epoch 3/10\n"
+            "NVIDIA RTX A4000, 15, 1000, 16000, 45\n{SENTINEL}\nbranch=autocommit-arena8-w0d1-apple\norigin=git@github.com:styme3279/ARENA_3.0.git\ncommitted=1717412400\ndirty=3\nsync=0\t2\nname=1\napikey=1\nhf=1\ncc=0\nkey=0\ndisk=12582912 104857600\ncpu=37\nhostmem=8388608 16777216\nprogress=epoch 3/10\n"
         );
         let mut m = PodMetrics::default();
         parse_probe(&out, &mut m);
@@ -424,6 +439,8 @@ mod tests {
         assert_eq!(m.dirty_files, Some(3));
         assert_eq!(m.has_name, Some(true));
         assert_eq!(m.has_api_key, Some(true));
+        assert_eq!(m.has_hf_token, Some(true));
+        assert_eq!(m.has_cc_token, Some(false));
         assert_eq!(m.has_key, Some(false));
         // 12582912 KB / 1024 = 12288 MB used; 104857600 KB / 1024 = 102400 MB total.
         assert_eq!(m.disk_summary(), Some((12288, 102400)));
@@ -463,6 +480,8 @@ mod tests {
         assert!(cmd.contains("remote.origin.url"));
         assert!(cmd.contains("git log -1 --format=%ct"));
         assert!(cmd.contains("git status --porcelain"));
+        assert!(cmd.contains("echo hf=1"));
+        assert!(cmd.contains("echo cc=1"));
         assert!(cmd.contains("/proc/stat"));
         assert!(cmd.contains("/proc/meminfo"));
         assert!(cmd.contains("'/root/ARENA_3.0'"));

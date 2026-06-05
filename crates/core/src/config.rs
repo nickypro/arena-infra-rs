@@ -29,7 +29,14 @@ impl Config {
     /// that an operator legitimately needs to set per-run without editing the read-only
     /// prod file (e.g. the iteration start date). These may be *introduced* from the
     /// environment, not just overridden.
-    const ENV_INTRODUCIBLE: &'static [&'static str] = &["ARENA_START_DATE", "EXTRA_SSH_KEYS"];
+    const ENV_INTRODUCIBLE: &'static [&'static str] = &[
+        "ARENA_START_DATE",
+        "EXTRA_SSH_KEYS",
+        // Broadcast tokens (distributed by `copy-keys`/`setup`): supplying them via the
+        // environment avoids editing the shared, read-only prod config for a run.
+        "HF_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+    ];
 
     /// Let environment variables override values from the file: any key already in the
     /// config can be overridden by an env var of the same name (e.g.
@@ -213,5 +220,13 @@ MACHINE_NAME_LIST=(
         assert_eq!(c.get("ARENA_START_DATE"), None);
         c.apply_overrides(|k| (k == "ARENA_START_DATE").then(|| "2026-05-25".to_string()));
         assert_eq!(c.get("ARENA_START_DATE"), Some("2026-05-25"));
+    }
+
+    #[test]
+    fn env_can_introduce_broadcast_tokens() {
+        // A broadcast token absent from the read-only file can be supplied per-run via env.
+        let mut c = Config::parse("IMAGE=base:1");
+        c.apply_overrides(|k| (k == "CLAUDE_CODE_OAUTH_TOKEN").then(|| "cc_secret".to_string()));
+        assert_eq!(c.get("CLAUDE_CODE_OAUTH_TOKEN"), Some("cc_secret"));
     }
 }

@@ -35,9 +35,9 @@ pub struct SetupConfig {
     pub prefix: String,
     /// Public keys to ensure in `~/.ssh/authorized_keys` (shared key + deploy key).
     pub authorized_pubkeys: Vec<String>,
-    /// Optional Hugging Face token (config `HF_TOKEN`) to export on the pod so the
-    /// cohort can pull gated repos (Llama 3 …). `None` => the HF step is skipped.
-    pub hf_token: Option<String>,
+    /// Broadcast token exports `(env name, value)` to write into the login shells
+    /// (e.g. Hugging Face + Claude Code, from config). Empty => the token step is skipped.
+    pub broadcast_exports: Vec<(String, String)>,
 }
 
 impl SetupConfig {
@@ -67,7 +67,7 @@ impl SetupConfig {
             branch: cfg.get("DEFAULT_BRANCH").unwrap_or("main").to_string(),
             prefix: cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena").to_string(),
             authorized_pubkeys: crate::ssh::authorized_pubkeys(cfg),
-            hf_token: cfg.get("HF_TOKEN").filter(|s| !s.is_empty()).map(String::from),
+            broadcast_exports: crate::apikeys::broadcast_env_vars(|k| cfg.get(k).map(String::from)),
         })
     }
 
@@ -147,18 +147,17 @@ impl SetupConfig {
                 q(&format!("export MACHINE_NAME='{}'", self.short_name(machine_name)))
             ),
         ];
-        // Optional: export the Hugging Face token into the login shells (idempotently),
-        // so participants can pull gated repos. Both env names are set — `transformers`/
-        // `huggingface_hub` read `HF_TOKEN`; older code reads `HUGGING_FACE_HUB_TOKEN`.
-        if let Some(token) = &self.hf_token {
-            let mut hf = String::from("touch \"$HOME/.bashrc\" \"$HOME/.zshrc\"");
-            for name in ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"] {
-                let line = q(&format!("export {name}=\"{token}\""));
+        // Optional: export broadcast tokens (Hugging Face, Claude Code) into the login
+        // shells, idempotently, so participants get gated-repo / Claude Code access.
+        if !self.broadcast_exports.is_empty() {
+            let mut block = String::from("touch \"$HOME/.bashrc\" \"$HOME/.zshrc\"");
+            for (name, value) in &self.broadcast_exports {
+                let line = q(&format!("export {name}=\"{value}\""));
                 for file in ["\"$HOME/.bashrc\"", "\"$HOME/.zshrc\""] {
-                    hf.push_str(&format!(" && (grep -qxF {line} {file} || echo {line} >> {file})"));
+                    block.push_str(&format!(" && (grep -qxF {line} {file} || echo {line} >> {file})"));
                 }
             }
-            steps.push(hf);
+            steps.push(block);
         }
         steps.join("; ")
     }
@@ -182,7 +181,7 @@ mod tests {
             branch: "main".into(),
             prefix: "arena8".into(),
             authorized_pubkeys: vec!["ssh-ed25519 AAAASHARED shared".into()],
-            hf_token: None,
+            broadcast_exports: Vec::new(),
         }
     }
 
@@ -221,19 +220,24 @@ mod tests {
     }
 
     #[test]
-    fn no_hf_export_without_a_token() {
+    fn no_token_export_without_any_token() {
         let c = cfg().remote_command("arena8-apple", false);
         assert!(!c.contains("HF_TOKEN"));
+        assert!(!c.contains("CLAUDE_CODE_OAUTH_TOKEN"));
     }
 
     #[test]
-    fn exports_hf_token_idempotently_when_present() {
+    fn exports_broadcast_tokens_idempotently_when_present() {
         let mut sc = cfg();
-        sc.hf_token = Some("hf_secret".into());
+        sc.broadcast_exports = vec![
+            ("HF_TOKEN".into(), "hf_secret".into()),
+            ("HUGGING_FACE_HUB_TOKEN".into(), "hf_secret".into()),
+            ("CLAUDE_CODE_OAUTH_TOKEN".into(), "cc_secret".into()),
+        ];
         let c = sc.remote_command("arena8-apple", false);
-        // Both env names, into both shells, guarded so a re-run doesn't duplicate.
+        // Each into both shells, guarded so a re-run doesn't duplicate.
         assert!(c.contains(r#"grep -qxF 'export HF_TOKEN="hf_secret"' "$HOME/.bashrc""#));
-        assert!(c.contains(r#"export HUGGING_FACE_HUB_TOKEN="hf_secret""#));
+        assert!(c.contains(r#"export CLAUDE_CODE_OAUTH_TOKEN="cc_secret""#));
         assert!(c.contains("\"$HOME/.zshrc\""));
     }
 }
