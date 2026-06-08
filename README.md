@@ -121,8 +121,10 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
   - `pods copy <file> [dest]` — scp a local file to every pod (concurrent; `--include`/
     `--exclude` to scope). With no `dest` it **mirrors the path under the ARENA repo**
     (a local `…/ARENA_3.0/foo/bar.py` → `/root/ARENA_3.0/foo/bar.py`); otherwise `dest`
-    is the remote path (trailing `/` = into that dir). Creates the remote parent dir;
-    confirms first; `--dry-run` previews.
+    is the remote path (trailing `/` = into that dir). Creates the remote parent dir and
+    **verifies the file landed** (size check; flags a silent scp non-write or a
+    misplacement when the dest is actually a directory) rather than trusting scp's exit
+    code. Confirms first; `--dry-run` previews.
   - `keys gen|list|rotate|revoke` — manage **OpenRouter** runtime keys via the
     provisioning API (needs `OPENROUTER_PROVISIONING_KEY`). `gen [machines|--all]` mints
     one key per machine (named `<prefix>-<machine>`) with a USD cap (`--limit`, default

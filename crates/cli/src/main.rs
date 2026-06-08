@@ -2962,10 +2962,17 @@ async fn handle_copy(
         return Ok(());
     }
 
+    // For a single file we verify it actually landed afterward (scp can exit 0 without
+    // writing what you intended — e.g. the dest already exists as a directory, so the
+    // file lands *inside* it). Skipped for -r (the dest is a tree, not one file).
+    let expect_size = if recursive { None } else { std::fs::metadata(file).ok().map(|m| m.len()) };
+    let basename = file.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
+
     let total = targets.len();
     let mut set = tokio::task::JoinSet::new();
     for (name, t) in targets {
-        let (local, remote, remote_parent) = (local.clone(), remote.clone(), remote_parent.clone());
+        let (local, remote, remote_parent, basename) =
+            (local.clone(), remote.clone(), remote_parent.clone(), basename.clone());
         set.spawn(async move {
             // Ensure the remote parent dir exists, then scp (with -r if recursive).
             let mk = ssh::run(&t, &format!("mkdir -p {}", shell_quote(&remote_parent))).await;
@@ -2983,10 +2990,49 @@ async fn handle_copy(
                 .stdin(std::process::Stdio::null())
                 .output()
                 .await;
-            let res = match out {
-                Ok(o) if o.status.success() => Ok(()),
-                Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
-                Err(e) => Err(format!("spawning scp: {e}")),
+            match out {
+                Ok(o) if o.status.success() => {}
+                Ok(o) => return (name, Err(String::from_utf8_lossy(&o.stderr).trim().to_string())),
+                Err(e) => return (name, Err(format!("spawning scp: {e}"))),
+            }
+            // Verify the single-file copy actually landed at the expected size. A `remote`
+            // ending in `/` means "into this dir" (intended → check <remote><basename>);
+            // otherwise `remote` should BE the file, and finding a directory there is a
+            // silent misplacement (scp dropped the file inside it) we flag rather than pass.
+            let res = if let Some(expected) = expect_size {
+                let into_dir = remote.ends_with('/');
+                let check = if into_dir {
+                    let final_path = format!("{remote}{basename}");
+                    format!(
+                        "f={f}; [ -f \"$f\" ] && echo \"OK $(wc -c < \"$f\" | tr -d ' ')\" || echo MISSING",
+                        f = shell_quote(&final_path),
+                    )
+                } else {
+                    format!(
+                        "f={r}; if [ -d \"$f\" ]; then echo MISPLACED; elif [ -f \"$f\" ]; then echo \"OK $(wc -c < \"$f\" | tr -d ' ')\"; else echo MISSING; fi",
+                        r = shell_quote(&remote),
+                    )
+                };
+                match ssh::run(&t, &check).await {
+                    Ok(o) if o.success => {
+                        let line = o.stdout.trim();
+                        if let Some(n) = line.strip_prefix("OK ") {
+                            match n.trim().parse::<u64>() {
+                                Ok(sz) if sz == expected => Ok(()),
+                                Ok(sz) => Err(format!("size mismatch after copy: {sz}B on pod vs {expected}B local (partial / clobbered)")),
+                                Err(_) => Ok(()), // couldn't parse size; don't false-fail
+                            }
+                        } else if line == "MISPLACED" {
+                            Err(format!("{remote} is a directory on the pod — the file landed *inside* it; pass an explicit file DEST or remove that dir"))
+                        } else {
+                            Err(format!("nothing at {remote} after scp (silent non-write)"))
+                        }
+                    }
+                    // If the verify probe itself can't run, don't override a successful scp.
+                    _ => Ok(()),
+                }
+            } else {
+                Ok(())
             };
             (name, res)
         });
