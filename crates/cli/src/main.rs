@@ -499,6 +499,10 @@ enum PodCmd {
         dry_run: bool,
     },
     /// Run a shell command on every pod over SSH (concurrent).
+    ///
+    /// Runs inside an interactive shell with the conda env active (default `arena-env`,
+    /// override via `CONDA_ENV`; set it empty to disable), so commands see the
+    /// participants' python/packages and the token exports written by `setup`.
     Run {
         /// The command to run (everything after `run`).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
@@ -2461,8 +2465,14 @@ async fn handle_run(
         return Ok(());
     }
 
+    // Run inside an interactive shell with the conda env active, so commands see the
+    // participants' `arena-env` (python/packages) and the token exports from setup.
+    // `CONDA_ENV=""` in config disables activation (still sources the rc for tokens).
+    let conda_env = cfg.get("CONDA_ENV").unwrap_or("arena-env");
+    let remote = ssh::login_shell_wrap(cmd, Some(conda_env));
+
     if dry_run {
-        println!("[dry-run] would run on {} pod(s):\n  {cmd}", targets.len());
+        println!("[dry-run] would run on {} pod(s):\n  {remote}", targets.len());
         return Ok(());
     }
     if confirm_needed && !confirm(yes, &format!("Run `{cmd}` on {} pod(s) over SSH.", targets.len()))? {
@@ -2472,15 +2482,25 @@ async fn handle_run(
 
     let mut set = tokio::task::JoinSet::new();
     for (name, t) in targets {
-        let cmd = cmd.to_string();
-        set.spawn(async move { (name, ssh::run(&t, &cmd).await) });
+        let remote = remote.clone();
+        set.spawn(async move { (name, ssh::run(&t, &remote).await) });
     }
     let mut results: Vec<(String, String, bool)> = Vec::new();
     while let Some(joined) = set.join_next().await {
         if let Ok((name, res)) = joined {
+            // `bash -ic` without a PTY emits harmless job-control chatter; strip it.
             let (text, ok) = match res {
-                Ok(out) if out.success => (out.stdout.trim().to_string(), true),
-                Ok(out) => (format!("exit {:?}: {}", out.code, out.stderr.trim()), false),
+                Ok(out) if out.success => {
+                    (ssh::strip_interactive_noise(out.stdout.trim()).trim().to_string(), true)
+                }
+                Ok(out) => (
+                    format!(
+                        "exit {:?}: {}",
+                        out.code,
+                        ssh::strip_interactive_noise(out.stderr.trim()).trim()
+                    ),
+                    false,
+                ),
                 Err(e) => (e.to_string(), false),
             };
             results.push((name, text, ok));

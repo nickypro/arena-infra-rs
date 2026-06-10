@@ -245,6 +245,44 @@ fn resolve_key_with<R: Fn(&str) -> bool>(configured: &str, home: Option<&str>, r
     expanded
 }
 
+/// Wrap a command so it runs with the participants' environment — the conda env active
+/// and the broadcast-token exports present — instead of a bare non-interactive shell.
+///
+/// Two things normally get skipped by a plain `ssh host 'cmd'`, both because they live
+/// at the *end* of `~/.bashrc` (after the stock `case $- in *i*) ;; *) return` guard
+/// that bails out of a non-interactive shell): conda's `conda init` block, and the
+/// `setup`/`copy-keys` token exports (HF_TOKEN, CLAUDE_CODE_OAUTH_TOKEN, …). Hand-
+/// sourcing `~/.bashrc` hits the same guard. Running under `bash -ic` flips the
+/// interactive flag, so `~/.bashrc` is sourced in full — defining the `conda` shell
+/// function and exporting the tokens. We then `conda activate <env>` so `python` and
+/// installed packages resolve to the participants' env (activation failure is left
+/// visible on stderr but never aborts the command). Pass `conda_env: None` to source
+/// the rc / tokens without switching envs.
+///
+/// The inner command is single-quoted for `bash -c`; history expansion doesn't apply to
+/// a `-c` string, so a literal `!` is safe.
+pub fn login_shell_wrap(cmd: &str, conda_env: Option<&str>) -> String {
+    let inner = match conda_env.filter(|e| !e.is_empty()) {
+        Some(env) => format!("conda activate {env} >/dev/null; {cmd}"),
+        None => cmd.to_string(),
+    };
+    format!("bash -ic '{}'", inner.replace('\'', "'\\''"))
+}
+
+/// Strip the harmless startup chatter an interactive shell prints when it has no
+/// controlling TTY (we run `bash -ic` without requesting a PTY). Leaves real output and
+/// errors untouched — only the two fixed job-control lines are removed.
+pub fn strip_interactive_noise(s: &str) -> String {
+    s.lines()
+        .filter(|l| {
+            let t = l.trim();
+            !(t.contains("cannot set terminal process group")
+                || t.contains("no job control in this shell"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Copy a local file to the target over scp.
 pub async fn scp(target: &SshTarget, local: &str, remote: &str) -> Result<SshOutput> {
     let out = Command::new("scp")
@@ -351,6 +389,36 @@ mod tests {
     fn key_expands_leading_tilde() {
         let got = resolve_key_with("~/.ssh/k", Some("/home/dev"), |p| p == "/home/dev/.ssh/k");
         assert_eq!(got, "/home/dev/.ssh/k");
+    }
+
+    #[test]
+    fn login_shell_wrap_activates_conda_and_quotes() {
+        // Sources the interactive rc (conda + token exports), activates the env, and
+        // single-quotes the whole inner command, escaping any embedded quotes.
+        let w = login_shell_wrap("python -c 'import torch'", Some("arena-env"));
+        assert_eq!(
+            w,
+            r#"bash -ic 'conda activate arena-env >/dev/null; python -c '\''import torch'\'''"#
+        );
+    }
+
+    #[test]
+    fn login_shell_wrap_without_env_just_sources_rc() {
+        // No conda env => still an interactive shell (rc/tokens), but no activation.
+        let w = login_shell_wrap("echo hi", None);
+        assert_eq!(w, r#"bash -ic 'echo hi'"#);
+        // Empty string is treated the same as None.
+        assert_eq!(login_shell_wrap("echo hi", Some("")), w);
+    }
+
+    #[test]
+    fn strip_interactive_noise_drops_only_job_control_lines() {
+        let raw = "bash: cannot set terminal process group (42): Inappropriate ioctl for device\n\
+                   bash: no job control in this shell\n\
+                   2.3.1";
+        assert_eq!(strip_interactive_noise(raw), "2.3.1");
+        // Real content with neither marker is untouched.
+        assert_eq!(strip_interactive_noise("hello\nworld"), "hello\nworld");
     }
 
     #[test]
