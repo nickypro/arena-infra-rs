@@ -1633,22 +1633,37 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // Only show the history graphs if the pane is tall enough; otherwise give the space
-    // to the facts + per-GPU table (the graphs are a nice-to-have).
-    let show_graphs = inner.height >= 18;
-    let constraints: &[Constraint] = if show_graphs {
-        &[
-            Constraint::Length(13), // header facts
-            Constraint::Min(3),    // per-GPU table
-            Constraint::Length(3), // util sparkline
-            Constraint::Length(3), // temp sparkline
-        ]
-    } else {
-        &[
-            Constraint::Length(13), // header facts
-            Constraint::Min(3),    // per-GPU table
-        ]
-    };
+    // Optional extra sections, shown only when there's data: GPU compute processes and
+    // the most-recent ARENA_3.0 commits. Each costs one row for its TOP border/title.
+    let n_procs = m.map(|m| m.gpu_procs.len()).unwrap_or(0).min(4);
+    let n_commits = m.map(|m| m.recent_commits.len()).unwrap_or(0).min(4);
+    let procs_h = if n_procs > 0 { n_procs as u16 + 1 } else { 0 };
+    let commits_h = if n_commits > 0 { n_commits as u16 + 1 } else { 0 };
+    // History graphs are a nice-to-have; show them only if the pane is still tall enough
+    // once the facts, per-GPU table, and the extra sections have taken their space.
+    let show_graphs = inner.height >= 13 + 3 + procs_h + commits_h + 6;
+
+    let mut constraints: Vec<Constraint> = vec![
+        Constraint::Length(13), // header facts
+        Constraint::Min(3),     // per-GPU table
+    ];
+    let mut idx = 2;
+    let procs_idx = (procs_h > 0).then(|| {
+        constraints.push(Constraint::Length(procs_h));
+        let x = idx;
+        idx += 1;
+        x
+    });
+    let commits_idx = (commits_h > 0).then(|| {
+        constraints.push(Constraint::Length(commits_h));
+        let x = idx;
+        idx += 1;
+        x
+    });
+    if show_graphs {
+        constraints.push(Constraint::Length(3)); // util sparkline
+        constraints.push(Constraint::Length(3)); // temp sparkline
+    }
     let rows = Layout::default().direction(Direction::Vertical).constraints(constraints).split(inner);
 
     let endpoint = match (&pod.ssh_ip, pod.ssh_port) {
@@ -1755,6 +1770,52 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     .block(Block::default().borders(Borders::TOP).title("per-GPU"));
     f.render_widget(gpu_table, rows[1]);
 
+    // GPU compute processes (what's actually holding the cards), under the per-GPU table.
+    if let Some(pi) = procs_idx {
+        let proc_rows: Vec<Row> = m
+            .map(|m| {
+                // Biggest VRAM first — surface the "main" jobs, not idle ~300M helpers.
+                let mut procs: Vec<&metrics::GpuProc> = m.gpu_procs.iter().collect();
+                procs.sort_by(|a, b| b.mem_mb.unwrap_or(0).cmp(&a.mem_mb.unwrap_or(0)));
+                procs
+                    .into_iter()
+                    .take(n_procs)
+                    .map(|p| {
+                        let mem = p.mem_mb.map(|mb| format!("{mb}M")).unwrap_or_else(|| "-".into());
+                        // Show the basename; the full path is rarely useful and is long.
+                        let name = p.name.rsplit('/').next().unwrap_or(&p.name).to_string();
+                        Row::new(vec![
+                            Cell::from(p.pid.to_string()),
+                            Cell::from(mem),
+                            Cell::from(name),
+                        ])
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let proc_table = Table::new(
+            proc_rows,
+            [Constraint::Length(8), Constraint::Length(7), Constraint::Min(10)],
+        )
+        .header(
+            Row::new(vec!["PID", "VRAM", "PROCESS"]).style(Style::default().add_modifier(Modifier::BOLD)),
+        )
+        .block(Block::default().borders(Borders::TOP).title("GPU procs"));
+        f.render_widget(proc_table, rows[pi]);
+    }
+
+    // The last few ARENA_3.0 commits (= backup history), one compact line each.
+    if let Some(ci) = commits_idx {
+        let text = m
+            .map(|m| m.recent_commits.iter().take(n_commits).cloned().collect::<Vec<_>>().join("\n"))
+            .unwrap_or_default();
+        f.render_widget(
+            Paragraph::new(text)
+                .block(Block::default().borders(Borders::TOP).title("recent commits (ARENA_3.0)")),
+            rows[ci],
+        );
+    }
+
     if show_graphs {
         let hist = shared.history.get(&pod.name);
         let util_data = hist.map(|h| h.util_data()).unwrap_or_default();
@@ -1765,7 +1826,7 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
                 .data(&util_data)
                 .max(100)
                 .style(Style::default().fg(Color::Green)),
-            rows[2],
+            rows[idx],
         );
         f.render_widget(
             Sparkline::default()
@@ -1773,7 +1834,7 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
                 .data(&temp_data)
                 .max(100)
                 .style(Style::default().fg(Color::Yellow)),
-            rows[3],
+            rows[idx + 1],
         );
     }
 }

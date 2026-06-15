@@ -18,6 +18,11 @@ use crate::ssh::{self, SshTarget};
 /// combined stdout.
 pub const SENTINEL: &str = "@@ARENA_PROBE@@";
 
+/// Separates the trailing `nvidia-smi` compute-process block from the rest of the probe
+/// output. Process names can contain `=`/`,`, so they get their own CSV section rather
+/// than going through the key=value parser.
+pub const PROC_SENTINEL: &str = "@@ARENA_PROC@@";
+
 /// One GPU's stats. Fields are optional so a partial/odd row degrades gracefully.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct GpuStat {
@@ -26,6 +31,15 @@ pub struct GpuStat {
     pub mem_used_mb: Option<u32>,
     pub mem_total_mb: Option<u32>,
     pub temp_c: Option<u32>,
+}
+
+/// One GPU compute process from `nvidia-smi --query-compute-apps`: pid, VRAM it holds,
+/// and the (possibly path-y) process name.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GpuProc {
+    pub pid: u32,
+    pub mem_mb: Option<u32>,
+    pub name: String,
 }
 
 /// The `nvidia-smi` query: one CSV row per GPU, name first, then the numeric fields in
@@ -120,6 +134,12 @@ pub struct PodMetrics {
     pub ahead: Option<u32>,
     /// Commits the local branch is **behind** its upstream (origin has newer commits).
     pub behind: Option<u32>,
+    /// The last few ARENA_3.0 commits, newest first, each preformatted as
+    /// "<short-hash>  <relative-date>  <subject>" for a one-line-per-commit display.
+    pub recent_commits: Vec<String>,
+    /// GPU compute processes (`nvidia-smi --query-compute-apps`), so the detail pane can
+    /// show what's actually holding the GPUs.
+    pub gpu_procs: Vec<GpuProc>,
 }
 
 impl PodMetrics {
@@ -224,6 +244,12 @@ fn remote_command(opts: &ProbeOpts) -> String {
         s.push_str(&format!(
             "echo \"sync=$(cd {q} 2>/dev/null && git rev-list --left-right --count '@{{u}}...HEAD' 2>/dev/null)\"; "
         ));
+        // The last few commits, newest first — a compact backup/work history. One
+        // `clog=` line per commit; the subject is free text (may contain '=') but it's
+        // the whole value after the first '=', so it survives the key=value parse.
+        s.push_str(&format!(
+            "(cd {q} 2>/dev/null && git log -n 4 --format='clog=%h  %cr  %s' 2>/dev/null); "
+        ));
     }
     s.push_str("([ -e \"$HOME/.name\" ] && echo name=1 || echo name=0); ");
     // Any LLM API key exported in the shell rc files (i.e. `copy-keys` has run)?
@@ -262,7 +288,31 @@ fn remote_command(opts: &ProbeOpts) -> String {
         // Take the last line so a chatty command still yields one tidy value.
         s.push_str(&format!("echo \"progress=$({pc} 2>/dev/null | tail -n1)\"; "));
     }
+    // GPU compute processes, last and in their own sentinel-delimited CSV block (process
+    // names can contain '='/','). `used_memory` before `process_name` so the name is the
+    // free-text tail. No-GPU / no-process pods just emit nothing here.
+    s.push_str(&format!(
+        "echo '{PROC_SENTINEL}'; nvidia-smi --query-compute-apps=pid,used_memory,process_name --format=csv,noheader,nounits 2>/dev/null; "
+    ));
     s
+}
+
+/// Parse the trailing `nvidia-smi --query-compute-apps` CSV (pid, used_memory MiB,
+/// process_name) into one [`GpuProc`] per running process. Non-numeric lines (e.g.
+/// "No running processes found") are skipped via the pid parse.
+pub fn parse_compute_apps(stdout: &str) -> Vec<GpuProc> {
+    stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|line| {
+            // splitn(3): name is the remainder, so a path with commas stays intact.
+            let mut it = line.splitn(3, ',').map(str::trim);
+            let pid = it.next()?.parse::<u32>().ok()?;
+            let mem_mb = it.next().and_then(|s| s.parse::<u32>().ok());
+            let name = it.next().unwrap_or("").to_string();
+            Some(GpuProc { pid, mem_mb, name })
+        })
+        .collect()
 }
 
 /// Parse the combined probe stdout into GPU stats plus the health/branch/progress
@@ -270,10 +320,15 @@ fn remote_command(opts: &ProbeOpts) -> String {
 fn parse_probe(stdout: &str, m: &mut PodMetrics) {
     let (smi, rest) = stdout.split_once(SENTINEL).unwrap_or((stdout, ""));
     m.gpus = parse_nvidia_smi(smi);
-    for line in rest.lines() {
+    // The compute-process CSV is fenced off at the end so its free-text names don't hit
+    // the key=value parser below.
+    let (kv, procs) = rest.split_once(PROC_SENTINEL).unwrap_or((rest, ""));
+    m.gpu_procs = parse_compute_apps(procs);
+    for line in kv.lines() {
         let Some((k, v)) = line.split_once('=') else { continue };
         let v = v.trim();
         match k.trim() {
+            "clog" if !v.is_empty() => m.recent_commits.push(v.to_string()),
             "branch" => m.branch = (!v.is_empty()).then(|| v.to_string()),
             "origin" => m.origin = (!v.is_empty()).then(|| v.to_string()),
             "name" => m.has_name = Some(v == "1"),
@@ -410,6 +465,16 @@ mod tests {
     }
 
     #[test]
+    fn parses_compute_apps_and_skips_noise() {
+        let out = "1234, 512, python\n5678, 2048, /usr/bin/python3\nNo running processes found\n\n";
+        let procs = parse_compute_apps(out);
+        assert_eq!(procs.len(), 2);
+        assert_eq!(procs[0], GpuProc { pid: 1234, mem_mb: Some(512), name: "python".into() });
+        assert_eq!(procs[1].pid, 5678);
+        assert_eq!(procs[1].name, "/usr/bin/python3");
+    }
+
+    #[test]
     fn aggregates_across_gpus() {
         let m = PodMetrics {
             gpus: parse_nvidia_smi("A, 40, 1000, 16000, 50\nB, 60, 2000, 16000, 70\n"),
@@ -423,10 +488,23 @@ mod tests {
     #[test]
     fn parses_combined_probe_output() {
         let out = format!(
-            "NVIDIA RTX A4000, 15, 1000, 16000, 45\n{SENTINEL}\nbranch=autocommit-arena8-w0d1-apple\norigin=git@github.com:styme3279/ARENA_3.0.git\ncommitted=1717412400\ndirty=3\nsync=0\t2\nname=1\napikey=1\nhf=1\ncc=0\nkey=0\ndisk=12582912 104857600\ncpu=37\nhostmem=8388608 16777216\nprogress=epoch 3/10\n"
+            "NVIDIA RTX A4000, 15, 1000, 16000, 45\n{SENTINEL}\nbranch=autocommit-arena8-w0d1-apple\norigin=git@github.com:styme3279/ARENA_3.0.git\ncommitted=1717412400\ndirty=3\nsync=0\t2\nclog=a1b2c3d  2 hours ago  arena backup arena8-apple\nclog=f00ba12  3 hours ago  fix: handle k=v in subject\nname=1\napikey=1\nhf=1\ncc=0\nkey=0\ndisk=12582912 104857600\ncpu=37\nhostmem=8388608 16777216\nprogress=epoch 3/10\n{PROC_SENTINEL}\n12345, 512, /opt/conda/envs/arena-env/bin/python\n67890, 1024, python\nNo running processes found\n"
         );
         let mut m = PodMetrics::default();
         parse_probe(&out, &mut m);
+        // Recent commits collect in order; a subject containing '=' survives intact.
+        assert_eq!(
+            m.recent_commits,
+            vec![
+                "a1b2c3d  2 hours ago  arena backup arena8-apple".to_string(),
+                "f00ba12  3 hours ago  fix: handle k=v in subject".to_string(),
+            ]
+        );
+        // GPU processes parse from the fenced CSV; the path-y name (last field) is intact.
+        assert_eq!(m.gpu_procs.len(), 2);
+        assert_eq!(m.gpu_procs[0].pid, 12345);
+        assert_eq!(m.gpu_procs[0].mem_mb, Some(512));
+        assert_eq!(m.gpu_procs[0].name, "/opt/conda/envs/arena-env/bin/python");
         assert_eq!(m.cpu_pct, Some(37));
         assert_eq!(m.host_mem_summary(), Some((8192, 16384))); // 8/16 GiB
         assert_eq!(m.behind, Some(0));
@@ -479,6 +557,8 @@ mod tests {
         assert!(cmd.contains("git rev-parse --abbrev-ref HEAD"));
         assert!(cmd.contains("remote.origin.url"));
         assert!(cmd.contains("git log -1 --format=%ct"));
+        assert!(cmd.contains("git log -n 4 --format='clog=%h"));
+        assert!(cmd.contains("--query-compute-apps=pid,used_memory,process_name"));
         assert!(cmd.contains("git status --porcelain"));
         assert!(cmd.contains("echo hf=1"));
         assert!(cmd.contains("echo cc=1"));
