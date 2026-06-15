@@ -241,6 +241,34 @@ An ambiguous prefix errors and lists the candidates — e.g. `arena p` is reject
 because it matches both `pods` and `proxy` (use `po`/`pr`); likewise `c` →
 `config`/`cron` (use `co`/`cr`).
 
+### Targeting & concurrency (current state)
+
+Target-selection syntax is **not yet uniform** across `pods` subcommands (a cleanup is
+planned). Until then, here's exactly how each picks pods and whether it fans out
+concurrently or runs one pod at a time:
+
+| Command | How to target pods | Execution |
+| --- | --- | --- |
+| `run`, `test` | **always all** (no scoping flag) | parallel |
+| `pull`, `setup`, `init-branches` | **always all** (no scoping flag) | parallel |
+| `backup` | one `[target]` **or** `--all` | parallel |
+| `cp`, `copy-keys` | `--include`/`--exclude` (default all) | parallel |
+| `list --probe` | all | parallel |
+| `set-branch` | one `[target]` **or** `--all` | **serial** (slow on a fleet) |
+| `stop` | one `[target]` **or** `--all` + `--include`/`--exclude` | serial (provider API) |
+| `terminate` | one `[target]` **or** `--all` | serial (provider API) |
+| `restart` | one `[target]` only (**no `--all`**) | n/a |
+| `create` | positional `names` + `-n`/`-a` | serial (capacity backoff) |
+
+Notes / sharp edges to know:
+- `run`/`test`/`pull`/`setup`/`init-branches` can't be scoped to a subset — it's the
+  whole fleet or nothing.
+- `restart` can't target the fleet (single pod only).
+- `set-branch` is the one SSH command that runs **serially** — a fleet `set-branch` is
+  much slower than its parallel siblings.
+- A non-empty `--include` that matches nothing now **errors** (not a silent no-op);
+  `copy-keys` warns by name about any reachable pod that matched no per-host key.
+
 ### Overriding config without editing it
 
 Any key in `config.env` can be overridden by an **environment variable of the same
