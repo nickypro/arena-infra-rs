@@ -6,9 +6,10 @@
 //!
 //! Mirrors the legacy flags: archive + compress, human-readable progress, prune empty
 //! dirs, and a per-file size cap so a stray multi-GB checkpoint doesn't blow up the
-//! backup. Dotfile *directories* (caches, `.git`, …) and `site-packages/` are excluded —
-//! they're either reconstructable or huge. The rsync arg vector is built purely here so
-//! it's unit-tested; the process spawn lives in the caller.
+//! backup. Dotfile *directories* (caches, `.git`, …), `site-packages/`, and common
+//! reconstructable/huge non-dot dirs (`hf_cache/`, `__pycache__/`, `venv/`,
+//! `node_modules/`) are excluded — they're either reconstructable or huge. The rsync arg
+//! vector is built purely here so it's unit-tested; the process spawn lives in the caller.
 
 use crate::ssh::SshTarget;
 
@@ -33,8 +34,20 @@ impl Default for PullConfig {
             max_size: "50M".to_string(),
             // Keep `.git` (at any depth) so the backup is a usable git repo…
             includes: vec!["**/.git/".to_string(), "**/.git/**".to_string()],
-            // …but still drop other dotfile dirs (`.cache`, …) and python envs.
-            excludes: vec!["**/.*/".to_string(), "site-packages/".to_string()],
+            // …but still drop reconstructable/huge dirs. `**/.*/` covers dotfile dirs
+            // (`.cache`, `.venv`, …); the rest catch non-dot caches and envs that aren't
+            // (notably `hf_cache/` — multi-GB model/dataset blobs that filled the backup
+            // volume) so they never get archived.
+            excludes: vec![
+                "**/.*/".to_string(),        // dotfile dirs (.cache, .venv, .pytest_cache, …)
+                ".cache/".to_string(),       // explicit: caches (HF/pip/etc) at any depth
+                "site-packages/".to_string(), // installed python packages
+                "__pycache__/".to_string(),  // python bytecode cache
+                "hf_cache/".to_string(),     // HuggingFace HF_HOME cache (models/datasets)
+                "huggingface/".to_string(),  // HuggingFace cache (alt HF_HOME layout)
+                "venv/".to_string(),         // non-dot python virtualenvs
+                "node_modules/".to_string(), // npm deps
+            ],
             remote_path: String::new(),
         }
     }
@@ -169,9 +182,11 @@ mod tests {
         assert!(joined.contains("-avz"));
         assert!(joined.contains("--max-size=50M"));
         assert!(joined.contains("--prune-empty-dirs"));
-        // both default excludes present as separate args
-        assert!(a.windows(2).any(|w| w[0] == "--exclude" && w[1] == "**/.*/"));
-        assert!(a.windows(2).any(|w| w[0] == "--exclude" && w[1] == "site-packages/"));
+        // default excludes present as separate args (dotdirs, site-packages, and the
+        // non-dot caches/envs that would otherwise bloat the backup)
+        for ex in ["**/.*/", ".cache/", "site-packages/", "__pycache__/", "hf_cache/", "huggingface/", "venv/", "node_modules/"] {
+            assert!(a.windows(2).any(|w| w[0] == "--exclude" && w[1] == ex), "missing exclude {ex}");
+        }
         // .git is kept via an include that precedes the dotdir exclude
         assert!(a.windows(2).any(|w| w[0] == "--include" && w[1] == "**/.git/"));
         let inc = a.iter().position(|x| x == "--include").unwrap();
