@@ -70,6 +70,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arena-core",
+ "async-trait",
  "clap",
  "serde_json",
  "tokio",

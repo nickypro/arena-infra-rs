@@ -313,6 +313,9 @@ enum PodCmd {
     },
     /// Spin up: create pods, wait for SSH endpoints, then wire the proxy.
     Up {
+        /// Explicit machine names to create (e.g. `apple bloom`), like `pods create`.
+        /// Bare names get the configured prefix. Mutually exclusive with -n/-a.
+        names: Vec<String>,
         /// Target TOTAL number of pods — tops up to this many (mutually exclusive with -a).
         #[arg(short = 'n', long)]
         count: Option<usize>,
@@ -594,6 +597,29 @@ fn resolve_want(count: Option<usize>, add: Option<usize>) -> Result<Want> {
     }
 }
 
+/// Pods that exist on the OTHER configured providers (not `current`) — so name
+/// allocation never hands out a name already live on a different backend (e.g. an
+/// `arena8-apple` on both runpod and hetzner). Best-effort: a provider we can't build
+/// (no creds in config) or can't list is skipped with a warning, never fatal — so a
+/// single-provider setup behaves exactly as before.
+async fn other_provider_pods(cfg: &Config, current: &str) -> Vec<arena_core::Pod> {
+    let policy = arena_core::retry::RetryPolicy::default();
+    let mut out = Vec::new();
+    for name in ["runpod", "vast", "hetzner"] {
+        if name == current {
+            continue;
+        }
+        let Ok(p) = arena_core::provider::build(name, cfg) else { continue };
+        match arena_core::retry::retrying(&policy, || p.list_pods()).await {
+            Ok(pods) => out.extend(pods),
+            Err(e) => {
+                eprintln!("warning: couldn't list {name} pods for cross-provider name check ({e})")
+            }
+        }
+    }
+    out
+}
+
 async fn plan_names(provider: &dyn Provider, cfg: &Config, want: Want) -> Result<Vec<String>> {
     let policy = arena_core::retry::RetryPolicy::default();
     let existing = arena_core::retry::retrying(&policy, || provider.list_pods())
@@ -615,7 +641,10 @@ async fn plan_names(provider: &dyn Provider, cfg: &Config, want: Want) -> Result
             n - have
         }
     };
-    let names = arena_core::naming::next_free_names(prefix, &cfg.machine_names, &existing, to_create);
+    // Exclude names already taken on ANY provider, not just this one.
+    let mut all = existing;
+    all.extend(other_provider_pods(cfg, provider.name()).await);
+    let names = arena_core::naming::next_free_names(prefix, &cfg.machine_names, &all, to_create);
     if names.len() < to_create {
         eprintln!(
             "warning: need {to_create} but only {} free machine name(s) available",
@@ -639,7 +668,10 @@ async fn resolve_explicit_names(
     let existing = arena_core::retry::retrying(&policy, || provider.list_pods())
         .await
         .context("listing existing pods (refusing to allocate names — a failed list could create duplicates)")?;
-    let taken: std::collections::HashSet<&str> = existing.iter().map(|p| p.name.as_str()).collect();
+    // Collision check spans every provider, so the same name can't be live on two backends.
+    let others = other_provider_pods(cfg, provider.name()).await;
+    let taken: std::collections::HashSet<&str> =
+        existing.iter().chain(others.iter()).map(|p| p.name.as_str()).collect();
 
     let mut out: Vec<String> = Vec::new();
     for n in raw {
@@ -2115,10 +2147,18 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             }
         }
 
-        PodCmd::Up { count, add, gpu, gpus, cloud, disk, volume, image, dry_run, no_wait, keep_trying, retry_mins, retry_secs, setup, timeout, interval } => {
+        PodCmd::Up { names, count, add, gpu, gpus, cloud, disk, volume, image, dry_run, no_wait, keep_trying, retry_mins, retry_secs, setup, timeout, interval } => {
             let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image };
-            let want = resolve_want(count, add)?;
-            let names = plan_names(provider, cfg, want).await?;
+            // Like `create`: explicit names take the direct path; -n/-a top up by count.
+            let explicit = !names.is_empty();
+            if explicit && (count.is_some() || add.is_some()) {
+                anyhow::bail!("pass explicit names OR -n/-a, not both");
+            }
+            let names = if explicit {
+                resolve_explicit_names(provider, cfg, &names).await?
+            } else {
+                plan_names(provider, cfg, resolve_want(count, add)?).await?
+            };
             if names.is_empty() {
                 eprintln!("nothing to create (target already met or no free names)");
                 return Ok(());
@@ -2154,8 +2194,12 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             }
             // Create as many as capacity allows (retrying if requested); only wait on
             // the ones we got. Proxy is deployed *after* this returns — i.e. once the
-            // retry loop has finished topping up.
-            let created = create_with_retry(provider, cfg, want, &ov, keep_trying, retry_mins, retry_secs).await?;
+            // retry loop has finished topping up. Explicit names create directly.
+            let created = if explicit {
+                create_pods(provider, cfg, &names, keep_trying, &ov).await?
+            } else {
+                create_with_retry(provider, cfg, resolve_want(count, add)?, &ov, keep_trying, retry_mins, retry_secs).await?
+            };
             if created.is_empty() {
                 eprintln!("no pods were created — nothing to wait for");
                 return Ok(());
@@ -2455,8 +2499,11 @@ async fn handle_run(
     let pods = provider.list_pods().await.context("listing pods")?;
     let mut targets: Vec<(String, SshTarget)> = Vec::new();
     for pod in &pods {
-        if let Ok(t) = SshTarget::from_pod(pod, cfg) {
-            targets.push((pod.name.clone(), t));
+        // Report (don't silently drop) pods we can't reach yet, so a "run on every pod"
+        // can't quietly skip part of the fleet while reporting success.
+        match SshTarget::from_pod(pod, cfg) {
+            Ok(t) => targets.push((pod.name.clone(), t)),
+            Err(_) => eprintln!("skip {} — no SSH endpoint yet", pod.name),
         }
     }
     targets.sort_by(|a, b| a.0.cmp(&b.0));
@@ -2465,7 +2512,7 @@ async fn handle_run(
         return Ok(());
     }
 
-    // Run inside an interactive shell with the conda env active, so commands see the
+    // Source the participants' ~/.zshrc and activate the conda env, so commands see the
     // participants' `arena-env` (python/packages) and the token exports from setup.
     // `CONDA_ENV=""` in config disables activation (still sources the rc for tokens).
     let conda_env = cfg.get("CONDA_ENV").unwrap_or("arena-env");
@@ -2487,23 +2534,27 @@ async fn handle_run(
     }
     let mut results: Vec<(String, String, bool)> = Vec::new();
     while let Some(joined) = set.join_next().await {
-        if let Ok((name, res)) = joined {
-            // `bash -ic` without a PTY emits harmless job-control chatter; strip it.
-            let (text, ok) = match res {
-                Ok(out) if out.success => {
-                    (ssh::strip_interactive_noise(out.stdout.trim()).trim().to_string(), true)
-                }
-                Ok(out) => (
-                    format!(
-                        "exit {:?}: {}",
-                        out.code,
-                        ssh::strip_interactive_noise(out.stderr.trim()).trim()
+        match joined {
+            Ok((name, res)) => {
+                // a no-PTY shell can emit harmless job-control chatter; strip it.
+                let (text, ok) = match res {
+                    Ok(out) if out.success => {
+                        (ssh::strip_interactive_noise(out.stdout.trim()).trim().to_string(), true)
+                    }
+                    Ok(out) => (
+                        format!(
+                            "exit {:?}: {}",
+                            out.code,
+                            ssh::strip_interactive_noise(out.stderr.trim()).trim()
+                        ),
+                        false,
                     ),
-                    false,
-                ),
-                Err(e) => (e.to_string(), false),
-            };
-            results.push((name, text, ok));
+                    Err(e) => (e.to_string(), false),
+                };
+                results.push((name, text, ok));
+            }
+            // A panicked/cancelled task must count as a failure, not vanish from the tally.
+            Err(e) => results.push(("?".to_string(), format!("task did not complete: {e}"), false)),
         }
     }
     results.sort_by(|a, b| a.0.cmp(&b.0));
@@ -2521,6 +2572,11 @@ async fn handle_run(
         }
     }
     println!("\n{ok} ok, {bad} failed");
+    // Propagate partial failure to the exit code, like the mutating sibling handlers — so
+    // a scripted `pods test` / `pods run` can't pass while the command failed on pods.
+    if bad > 0 {
+        anyhow::bail!("{bad} pod(s) failed");
+    }
     Ok(())
 }
 
@@ -2551,8 +2607,11 @@ async fn handle_set_branch(
     let mut targets: Vec<(String, SshTarget)> = Vec::new();
     if all {
         for pod in &pods {
-            if let Ok(t) = SshTarget::from_pod(pod, cfg) {
-                targets.push((pod.name.clone(), t));
+            // Report unreachable pods — a silently-skipped pod left on a stale/diverged
+            // branch (especially under --hard) is exactly what we don't want.
+            match SshTarget::from_pod(pod, cfg) {
+                Ok(t) => targets.push((pod.name.clone(), t)),
+                Err(_) => eprintln!("skip {} — no SSH endpoint yet", pod.name),
             }
         }
     } else if let Some(want) = target {
@@ -2652,6 +2711,11 @@ async fn select_pods(
     pods.retain(|p| !exclude.iter().any(|x| pod_matches(p, x, prefix)));
     if !include.is_empty() {
         pods.retain(|p| include.iter().any(|x| pod_matches(p, x, prefix)));
+        // A non-empty include that matches nothing is a user error (typo'd name) — fail
+        // loudly instead of looking like an idle/empty fleet.
+        if pods.is_empty() {
+            anyhow::bail!("no pods matched --include {include:?} (run `arena pods list`)");
+        }
     }
     if let Some(s) = status_contains {
         let s = s.to_uppercase();
@@ -2953,6 +3017,11 @@ async fn handle_copy(
     pods.retain(|p| !exclude.iter().any(|x| pod_matches(p, x, prefix)));
     if !include.is_empty() {
         pods.retain(|p| include.iter().any(|x| pod_matches(p, x, prefix)));
+        // A non-empty include that matches nothing is a typo, not an empty fleet — fail
+        // loudly so the file doesn't silently copy nowhere.
+        if pods.is_empty() {
+            anyhow::bail!("no pods matched --include {include:?} (run `arena pods list`)");
+        }
     }
     let mut targets: Vec<(String, SshTarget)> = Vec::new();
     for pod in &pods {
@@ -3154,22 +3223,39 @@ async fn handle_copy_keys(
         }
     }
     let mut jobs: Vec<(String, SshTarget, Vec<(String, String)>)> = Vec::new();
+    // Reachable pods that matched NO per-host key — they'd get broadcast tokens only.
+    // Worth flagging loudly: a stale/misnamed CSV (e.g. last cohort's hosts) otherwise
+    // hides behind a per-pod ✓, so nobody notices the per-host keys never landed.
+    let mut broadcast_only: Vec<String> = Vec::new();
     for pod in &pods {
         let mut vars = broadcast.clone();
-        if let Some(h) = per_host.get(&pod.name) {
-            vars.extend(h.iter().cloned());
-        }
+        let matched_per_host =
+            per_host.get(&pod.name).map(|h| vars.extend(h.iter().cloned())).is_some();
         if vars.is_empty() {
             continue; // nothing for this pod
         }
         match SshTarget::from_pod(pod, cfg) {
-            Ok(t) => jobs.push((pod.name.clone(), t, vars)),
+            Ok(t) => {
+                if !matched_per_host && !per_host.is_empty() {
+                    broadcast_only.push(pod.name.clone());
+                }
+                jobs.push((pod.name.clone(), t, vars));
+            }
             Err(_) => eprintln!("skip {} — no SSH endpoint yet", pod.name),
         }
     }
     if jobs.is_empty() {
         println!("(no reachable pods matched any keys)");
         return Ok(());
+    }
+    if !broadcast_only.is_empty() {
+        eprintln!(
+            "⚠ {} reachable pod(s) matched NO per-host key — broadcast tokens only: {}\n  \
+             (per-host keys come from <provider>_api_keys.csv, matched on exact pod name; \
+             check that file actually lists these hosts)\n",
+            broadcast_only.len(),
+            broadcast_only.join(", ")
+        );
     }
 
     if dry_run {
@@ -3519,6 +3605,119 @@ async fn handle_ssh_config(
         eprintln!("\n(wrote {})", path.display());
     }
     Ok(())
+}
+
+/// Scenario tests for pod-selection control flow, driven by a fake `Provider` (no real
+/// API/SSH). Covers the filter logic + the "--include matched nothing" guard that keeps a
+/// typo'd target from silently looking like an idle fleet.
+#[cfg(test)]
+mod selection_tests {
+    use super::select_pods;
+    use arena_core::{Config, Pod, PodSpec, Provider, Result};
+    use async_trait::async_trait;
+
+    struct FakeProvider {
+        pods: Vec<Pod>,
+    }
+
+    fn pod(name: &str, status: &str) -> Pod {
+        Pod {
+            id: format!("id-{name}"),
+            name: name.to_string(),
+            provider: "fake".into(),
+            status: status.to_string(),
+            gpu_type: None,
+            cost_per_hr: None,
+            ssh_ip: None,
+            ssh_port: None,
+        }
+    }
+
+    #[async_trait]
+    impl Provider for FakeProvider {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+        fn describe(&self, _spec: &PodSpec) -> String {
+            String::new()
+        }
+        async fn list_pods(&self) -> Result<Vec<Pod>> {
+            Ok(self.pods.clone())
+        }
+        async fn create_pod(&self, _spec: &PodSpec) -> Result<Pod> {
+            unimplemented!("not exercised by selection tests")
+        }
+        async fn stop_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn restart_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn terminate_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn cfg() -> Config {
+        Config::parse("MACHINE_NAME_PREFIX=arena8")
+    }
+    fn names(pods: &[Pod]) -> Vec<String> {
+        pods.iter().map(|p| p.name.clone()).collect()
+    }
+    fn fleet() -> FakeProvider {
+        FakeProvider {
+            pods: vec![
+                pod("arena8-bloom", "RUNNING"),
+                pod("arena8-apple", "RUNNING"),
+                pod("arena8-zebra", "EXITED"),
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn include_matching_nothing_errors_not_silent() {
+        // The regression guard: a typo'd --include must fail loudly, not return an empty
+        // set that reads like "nothing to do".
+        let r = select_pods(&fleet(), &cfg(), &["arena8-zebrra".into()], &[], None).await;
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_string().contains("no pods matched --include"));
+    }
+
+    #[tokio::test]
+    async fn no_filters_returns_all_sorted() {
+        let got = select_pods(&fleet(), &cfg(), &[], &[], None).await.unwrap();
+        assert_eq!(names(&got), ["arena8-apple", "arena8-bloom", "arena8-zebra"]);
+    }
+
+    #[tokio::test]
+    async fn exclude_then_include_then_status_compose() {
+        // exclude apple; include bloom+zebra; keep only RUNNING => bloom.
+        let got = select_pods(
+            &fleet(),
+            &cfg(),
+            &["arena8-bloom".into(), "arena8-zebra".into()],
+            &["arena8-apple".into()],
+            Some("RUNNING"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(names(&got), ["arena8-bloom"]);
+    }
+
+    #[tokio::test]
+    async fn bare_short_name_matches_via_prefix() {
+        // "bloom" should resolve to arena8-bloom through MACHINE_NAME_PREFIX.
+        let got = select_pods(&fleet(), &cfg(), &["bloom".into()], &[], None).await.unwrap();
+        assert_eq!(names(&got), ["arena8-bloom"]);
+    }
+
+    #[tokio::test]
+    async fn status_filter_matching_nothing_is_empty_not_error() {
+        // No --include here, so an all-stopped fleet legitimately yields an empty set
+        // (distinct from the typo case above) — must NOT error.
+        let got = select_pods(&fleet(), &cfg(), &[], &[], Some("PROVISIONING")).await.unwrap();
+        assert!(got.is_empty());
+    }
 }
 
 #[cfg(test)]
