@@ -620,6 +620,31 @@ async fn other_provider_pods(cfg: &Config, current: &str) -> Vec<arena_core::Pod
     out
 }
 
+/// Every configured provider's pods (runpod/vast/hetzner), each tagged with its
+/// `.provider`, for the fleet-wide `list`. Best-effort: a backend with no creds in config
+/// is skipped silently; one that errors is warned about but doesn't sink the others. Only
+/// errors if every provider that *was* configured failed to list.
+async fn all_pods(cfg: &Config) -> Result<Vec<arena_core::Pod>> {
+    let policy = arena_core::retry::RetryPolicy::default();
+    let mut out = Vec::new();
+    let (mut attempted, mut failed) = (0u32, 0u32);
+    for name in ["runpod", "vast", "hetzner"] {
+        let Ok(p) = arena_core::provider::build(name, cfg) else { continue };
+        attempted += 1;
+        match arena_core::retry::retrying(&policy, || p.list_pods()).await {
+            Ok(pods) => out.extend(pods),
+            Err(e) => {
+                eprintln!("warning: couldn't list {name} pods ({e})");
+                failed += 1;
+            }
+        }
+    }
+    if attempted > 0 && failed == attempted {
+        anyhow::bail!("could not list pods from any configured provider");
+    }
+    Ok(out)
+}
+
 async fn plan_names(provider: &dyn Provider, cfg: &Config, want: Want) -> Result<Vec<String>> {
     let policy = arena_core::retry::RetryPolicy::default();
     let existing = arena_core::retry::retrying(&policy, || provider.list_pods())
@@ -2047,9 +2072,10 @@ fn emit_proxy_plan(pods: &[arena_core::Pod], cfg: &Config, out: Option<&std::pat
 async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bool) -> Result<()> {
     match cmd {
         PodCmd::List { json, probe, no_probe } => {
-            let policy = arena_core::retry::RetryPolicy::default();
-            let mut pods = arena_core::retry::retrying(&policy, || provider.list_pods()).await?;
-            pods.sort_by(|a, b| a.name.cmp(&b.name));
+            // Fleet view: aggregate across every configured provider, not just --provider,
+            // so e.g. hetzner CPU pods show up alongside the GPU fleet. Grouped by provider.
+            let mut pods = all_pods(cfg).await?;
+            pods.sort_by(|a, b| a.provider.cmp(&b.provider).then(a.name.cmp(&b.name)));
             // Probe GPU by default for the human table (the list API omits GPU type);
             // JSON stays fast/scriptable unless asked. `--no-probe` always wins.
             let probe = !no_probe && (probe || !json);
@@ -2089,13 +2115,14 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                 return Ok(());
             }
             println!(
-                "{:<22} {:<14} {:<10} {:<16} {:<16} {}",
-                "NAME", "ID", "STATUS", "GPU", "IP", "PORT"
+                "{:<22} {:<8} {:<14} {:<10} {:<16} {:<16} {}",
+                "NAME", "PROVIDER", "ID", "STATUS", "GPU", "IP", "PORT"
             );
             for p in &pods {
                 println!(
-                    "{:<22} {:<14} {:<10} {:<16} {:<16} {}",
+                    "{:<22} {:<8} {:<14} {:<10} {:<16} {:<16} {}",
                     p.name,
+                    p.provider,
                     p.id,
                     arena_core::status::short_status(&p.status),
                     p.gpu_type.as_deref().unwrap_or("-"),
