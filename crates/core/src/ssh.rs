@@ -248,25 +248,29 @@ fn resolve_key_with<R: Fn(&str) -> bool>(configured: &str, home: Option<&str>, r
 /// Wrap a command so it runs with the participants' environment — the conda env active
 /// and the broadcast-token exports present — instead of a bare non-interactive shell.
 ///
-/// Two things normally get skipped by a plain `ssh host 'cmd'`, both because they live
-/// at the *end* of `~/.bashrc` (after the stock `case $- in *i*) ;; *) return` guard
-/// that bails out of a non-interactive shell): conda's `conda init` block, and the
-/// `setup`/`copy-keys` token exports (HF_TOKEN, CLAUDE_CODE_OAUTH_TOKEN, …). Hand-
-/// sourcing `~/.bashrc` hits the same guard. Running under `bash -ic` flips the
-/// interactive flag, so `~/.bashrc` is sourced in full — defining the `conda` shell
-/// function and exporting the tokens. We then `conda activate <env>` so `python` and
+/// On the pods the login shell is **zsh**, and the participant setup lives in `~/.zshrc`:
+/// conda's `conda init` block (defining the `conda` shell function and activating
+/// `arena-env`) and the `setup`/`copy-keys` token exports (HF_TOKEN,
+/// CLAUDE_CODE_OAUTH_TOKEN, …). A plain `ssh host 'cmd'` runs a non-interactive shell
+/// that never reads `~/.zshrc`, so none of that is present (a bare `bash -ic` reads
+/// `~/.bashrc`, which gets conda *base* but not the participants' `arena-env`). We
+/// therefore source `~/.zshrc` explicitly and then `conda activate <env>` so `python` and
 /// installed packages resolve to the participants' env (activation failure is left
-/// visible on stderr but never aborts the command). Pass `conda_env: None` to source
-/// the rc / tokens without switching envs.
+/// visible on stderr but never aborts the command). Pass `conda_env: None` to source the
+/// rc / tokens without an explicit activate. `~/.zshrc` has no non-interactive guard, so
+/// its init runs in full; using `zsh -c` (not `zsh -ic`) avoids the p10k/gitstatus
+/// chatter an interactive shell prints when it has no controlling TTY.
 ///
-/// The inner command is single-quoted for `bash -c`; history expansion doesn't apply to
-/// a `-c` string, so a literal `!` is safe.
+/// The inner command is single-quoted for `zsh -c`; history expansion doesn't apply to a
+/// `-c` string, so a literal `!` is safe.
 pub fn login_shell_wrap(cmd: &str, conda_env: Option<&str>) -> String {
     let inner = match conda_env.filter(|e| !e.is_empty()) {
-        Some(env) => format!("conda activate {env} >/dev/null; {cmd}"),
-        None => cmd.to_string(),
+        Some(env) => {
+            format!("source ~/.zshrc 2>/dev/null; conda activate {env} >/dev/null 2>&1; {cmd}")
+        }
+        None => format!("source ~/.zshrc 2>/dev/null; {cmd}"),
     };
-    format!("bash -ic '{}'", inner.replace('\'', "'\\''"))
+    format!("zsh -c '{}'", inner.replace('\'', "'\\''"))
 }
 
 /// Strip the harmless startup chatter an interactive shell prints when it has no
@@ -393,20 +397,20 @@ mod tests {
 
     #[test]
     fn login_shell_wrap_activates_conda_and_quotes() {
-        // Sources the interactive rc (conda + token exports), activates the env, and
-        // single-quotes the whole inner command, escaping any embedded quotes.
+        // Sources ~/.zshrc (conda + token exports), activates the env, and single-quotes
+        // the whole inner command, escaping any embedded quotes.
         let w = login_shell_wrap("python -c 'import torch'", Some("arena-env"));
         assert_eq!(
             w,
-            r#"bash -ic 'conda activate arena-env >/dev/null; python -c '\''import torch'\'''"#
+            r#"zsh -c 'source ~/.zshrc 2>/dev/null; conda activate arena-env >/dev/null 2>&1; python -c '\''import torch'\'''"#
         );
     }
 
     #[test]
     fn login_shell_wrap_without_env_just_sources_rc() {
-        // No conda env => still an interactive shell (rc/tokens), but no activation.
+        // No conda env => still source ~/.zshrc (rc/tokens), but no explicit activation.
         let w = login_shell_wrap("echo hi", None);
-        assert_eq!(w, r#"bash -ic 'echo hi'"#);
+        assert_eq!(w, r#"zsh -c 'source ~/.zshrc 2>/dev/null; echo hi'"#);
         // Empty string is treated the same as None.
         assert_eq!(login_shell_wrap("echo hi", Some("")), w);
     }
