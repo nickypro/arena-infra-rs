@@ -2321,7 +2321,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
         PodCmd::Stop { target, all, include, exclude, dry_run } => {
             match (all, target) {
                 (false, Some(target)) => {
-                    let (id, label) = resolve_target(provider, cfg, &target).await?;
+                    let (owner, id, label) = resolve_target_any(cfg, &target).await?;
                     if dry_run {
                         println!("[dry-run] would stop {label}");
                     } else {
@@ -2329,7 +2329,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                             println!("aborted.");
                             return Ok(());
                         }
-                        provider.stop_pod(&id).await?;
+                        owner.stop_pod(&id).await?;
                         println!("[stopped] {label}");
                     }
                 }
@@ -2388,7 +2388,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
         }
 
         PodCmd::Restart { target, dry_run } => {
-            let (id, label) = resolve_target(provider, cfg, &target).await?;
+            let (owner, id, label) = resolve_target_any(cfg, &target).await?;
             if dry_run {
                 println!("[dry-run] would restart {label}");
             } else {
@@ -2396,7 +2396,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                     println!("aborted.");
                     return Ok(());
                 }
-                provider.restart_pod(&id).await?;
+                owner.restart_pod(&id).await?;
                 println!("[restarted] {label}");
             }
         }
@@ -2439,7 +2439,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                 }
             }
             (false, Some(target)) => {
-                let (id, label) = resolve_target(provider, cfg, &target).await?;
+                let (owner, id, label) = resolve_target_any(cfg, &target).await?;
                 if dry_run {
                     println!("[dry-run] would terminate {label}");
                 } else {
@@ -2447,7 +2447,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                         println!("aborted.");
                         return Ok(());
                     }
-                    provider.terminate_pod(&id).await?;
+                    owner.terminate_pod(&id).await?;
                     println!("[terminated] {label}");
                 }
             }
@@ -2703,19 +2703,33 @@ fn pod_matches(pod: &arena_core::Pod, token: &str, prefix: &str) -> bool {
     pod.name == token || pod.id == token || pod.name == format!("{prefix}-{token}")
 }
 
-/// Resolve a user-supplied target (machine name, bare short name, OR raw provider id) to
-/// a concrete `(id, label)`, by listing pods. Requires the pod to actually exist, so a
-/// typo'd name/id fails clearly instead of issuing a no-op or wrong mutation. Read-only.
-async fn resolve_target(provider: &dyn Provider, cfg: &Config, target: &str) -> Result<(String, String)> {
+/// Resolve a user-supplied target (machine name, bare short name, OR raw provider id) by
+/// searching EVERY configured provider, returning the owning provider too — so
+/// `stop`/`restart`/`terminate <name>` work whatever backend the pod lives on, without
+/// passing `--provider`. The mutation must go to the owning provider's API. Requires the
+/// pod to actually exist (a typo fails clearly). Best-effort listing; a provider that
+/// errors is warned about and skipped.
+async fn resolve_target_any(
+    cfg: &Config,
+    target: &str,
+) -> Result<(Box<dyn Provider>, String, String)> {
     let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
     let policy = arena_core::retry::RetryPolicy::default();
-    let pods = arena_core::retry::retrying(&policy, || provider.list_pods())
-        .await
-        .context("listing pods to resolve target")?;
-    match pods.iter().find(|p| pod_matches(p, target, prefix)) {
-        Some(p) => Ok((p.id.clone(), format!("{} (id={})", p.name, p.id))),
-        None => anyhow::bail!("no pod with name or id '{target}' (run `arena pods list`)"),
+    for name in ["runpod", "vast", "hetzner"] {
+        let Ok(p) = arena_core::provider::build(name, cfg) else { continue };
+        let pods = match arena_core::retry::retrying(&policy, || p.list_pods()).await {
+            Ok(pods) => pods,
+            Err(e) => {
+                eprintln!("warning: couldn't list {name} pods ({e})");
+                continue;
+            }
+        };
+        if let Some(pod) = pods.iter().find(|pd| pod_matches(pd, target, prefix)) {
+            let label = format!("{} (id={}, {name})", pod.name, pod.id);
+            return Ok((p, pod.id.clone(), label));
+        }
     }
+    anyhow::bail!("no pod with name or id '{target}' on any provider (run `arena pods list`)")
 }
 
 /// List pods and apply the legacy filter semantics: drop `exclude` first, then keep only
