@@ -32,11 +32,13 @@ pub struct HetznerOpts {
 impl Default for HetznerOpts {
     fn default() -> Self {
         Self {
-            // cax11: current, cheap Arm Ampere shared vCPU (the older cx-line types like
-            // cx22 are being deprecated by Hetzner). Override via HETZNER_SERVER_TYPE.
-            server_type: "cax11".into(),
+            // cx23: newest Intel **x86** shared vCPU (2 vCPU / 4 GB). The old cx/cax lines
+            // had poor availability; cx23 is the current gen. Override via
+            // HETZNER_SERVER_TYPE. Default location nbg1 (EU) — x86 shared types are
+            // EU-only, so a pinned location avoids the US auto-placement failure.
+            server_type: "cx23".into(),
             image: "ubuntu-24.04".into(),
-            location: None,
+            location: Some("nbg1".into()),
             ssh_keys: Vec::new(),
         }
     }

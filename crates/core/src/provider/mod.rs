@@ -20,9 +20,13 @@ pub fn build(name: &str, cfg: &Config) -> Result<Box<dyn Provider>> {
         "vast" => Ok(Box::new(vast::VastProvider::new(cfg.require("VAST_API_KEY")?))),
         "hetzner" => {
             let opts = hetzner::HetznerOpts {
-                server_type: cfg.get("HETZNER_SERVER_TYPE").unwrap_or("cax11").to_string(),
+                // cx23: newest Intel x86 shared gen (the old cx/cax lines had poor
+                // availability). Pin an EU location so placement is deterministic — the
+                // x86 shared types live only in the EU DCs, so no-location auto-placement
+                // can land on a US DC that lacks them and fail with "error during placement".
+                server_type: cfg.get("HETZNER_SERVER_TYPE").unwrap_or("cx23").to_string(),
                 image: cfg.get("HETZNER_IMAGE").unwrap_or("ubuntu-24.04").to_string(),
-                location: cfg.get("HETZNER_LOCATION").map(String::from),
+                location: Some(cfg.get("HETZNER_LOCATION").unwrap_or("nbg1").to_string()),
                 ssh_keys: cfg
                     .get("HETZNER_SSH_KEY")
                     .filter(|s| !s.is_empty())
