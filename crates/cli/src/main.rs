@@ -1091,6 +1091,12 @@ fn launch_tui(provider: &str, config: &std::path::Path) -> Result<()> {
     }
 }
 
+/// Bare-VM provisioning script for hetzner (CPU) pods — embedded so `arena pods setup`
+/// can push + run it: system deps, docker + compose, a uv venv with the ARENA packages
+/// (CPU substitutions), and a zsh rc that activates the venv. GPU pods come from a
+/// prebuilt image and take the lighter post-image config path instead.
+const HETZNER_SETUP: &str = include_str!("hetzner_setup.sh");
+
 async fn handle_setup(
     provider: &dyn Provider,
     cfg: &Config,
@@ -1123,7 +1129,8 @@ async fn handle_setup(
     let mut targets = Vec::new();
     for pod in &pods {
         match SshTarget::from_pod(pod, cfg) {
-            Ok(t) => targets.push((pod.name.clone(), t)),
+            // Carry the provider so we can pick bare-VM vs image-based provisioning.
+            Ok(t) => targets.push((pod.name.clone(), pod.provider.clone(), t)),
             Err(_) => eprintln!("skip {} — no SSH endpoint yet", pod.name),
         }
     }
@@ -1146,10 +1153,15 @@ async fn handle_setup(
             scfg.key_local,
             scfg.key_remote
         );
-        for (name, target) in &targets {
+        for (name, provider_name, target) in &targets {
             println!("# {name}");
-            println!("{}", target.display_scp(&scfg.key_local, &scfg.key_remote));
-            println!("{}\n", target.display_command(&display_scfg.remote_command(name, force)));
+            if provider_name == "hetzner" {
+                println!("scp <embedded hetzner_setup.sh> -> /root/hetzner_setup.sh");
+                println!("{}\n", target.display_command("bash /root/hetzner_setup.sh"));
+            } else {
+                println!("{}", target.display_scp(&scfg.key_local, &scfg.key_remote));
+                println!("{}\n", target.display_command(&display_scfg.remote_command(name, force)));
+            }
         }
         let keys_present = arena_core::apikeys::PROVIDERS.iter().any(|(base, _, _)| {
             std::fs::read_to_string(format!("./keys/{base}_api_keys.csv"))
@@ -1166,22 +1178,42 @@ async fn handle_setup(
 
     // Provision concurrently across the fleet, printing a [done/total] line as each
     // pod finishes so there's live progress (36 pods × scp+ssh is slow serially).
+    // Hetzner (bare-VM) pods get the full provisioning script; write it to a temp file so
+    // each pod can scp it. Image-based (GPU) pods don't touch it.
+    let hetzner_script = {
+        let p = std::env::temp_dir().join("arena-hetzner-setup.sh");
+        std::fs::write(&p, HETZNER_SETUP).context("writing hetzner setup script to a temp file")?;
+        p.to_string_lossy().into_owned()
+    };
     let total = targets.len();
     println!("Provisioning {total} pod(s) over SSH…");
     let mut set = tokio::task::JoinSet::new();
-    for (name, target) in targets {
+    for (name, provider_name, target) in targets {
         let key_local = scfg.key_local.clone();
         let key_remote = scfg.key_remote.clone();
         let remote_cmd = scfg.remote_command(&name, force);
+        let hetzner_script = hetzner_script.clone();
         set.spawn(async move {
-            let copied = ssh::scp(&target, &key_local, &key_remote).await;
-            let result = match copied {
-                Ok(out) if out.success => ssh::run(&target, &remote_cmd).await,
-                Ok(out) => Err(arena_core::Error::provider(format!(
-                    "scp key failed: {}",
-                    out.stderr.trim()
-                ))),
-                Err(e) => Err(e),
+            let result = if provider_name == "hetzner" {
+                // Bare VM: push the embedded script, run it with bash (it has bashisms).
+                match ssh::scp(&target, &hetzner_script, "/root/hetzner_setup.sh").await {
+                    Ok(out) if out.success => ssh::run(&target, "bash /root/hetzner_setup.sh").await,
+                    Ok(out) => Err(arena_core::Error::provider(format!(
+                        "scp setup script failed: {}",
+                        out.stderr.trim()
+                    ))),
+                    Err(e) => Err(e),
+                }
+            } else {
+                // Image-based pod: copy the git deploy key, then the post-image config.
+                match ssh::scp(&target, &key_local, &key_remote).await {
+                    Ok(out) if out.success => ssh::run(&target, &remote_cmd).await,
+                    Ok(out) => Err(arena_core::Error::provider(format!(
+                        "scp key failed: {}",
+                        out.stderr.trim()
+                    ))),
+                    Err(e) => Err(e),
+                }
             };
             (name, result)
         });
