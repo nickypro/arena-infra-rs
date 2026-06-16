@@ -27,11 +27,18 @@ pub fn build(name: &str, cfg: &Config) -> Result<Box<dyn Provider>> {
                 server_type: cfg.get("HETZNER_SERVER_TYPE").unwrap_or("cx23").to_string(),
                 image: cfg.get("HETZNER_IMAGE").unwrap_or("ubuntu-24.04").to_string(),
                 location: Some(cfg.get("HETZNER_LOCATION").unwrap_or("nbg1").to_string()),
+                // Universal default: attach the cohort SSH key, named after
+                // MACHINE_NAME_PREFIX (e.g. "arena8"), so every hetzner pod is reachable
+                // with the same arena key as the GPU fleet — no per-pod config. Upload it
+                // once to the Hetzner project under that name (`arena keys`/console).
+                // Override/disable via HETZNER_SSH_KEY.
                 ssh_keys: cfg
                     .get("HETZNER_SSH_KEY")
                     .filter(|s| !s.is_empty())
                     .map(|s| vec![s.to_string()])
-                    .unwrap_or_default(),
+                    .unwrap_or_else(|| {
+                        vec![cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena").to_string()]
+                    }),
             };
             Ok(Box::new(hetzner::HetznerProvider::new(
                 cfg.require("HETZNER_API_KEY")?,
