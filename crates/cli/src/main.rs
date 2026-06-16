@@ -357,9 +357,10 @@ enum PodCmd {
         /// Seconds between retry rounds.
         #[arg(long, default_value_t = 60)]
         retry_secs: u64,
-        /// After endpoints are up, provision the pods over SSH (like `arena pods setup`).
+        /// Skip provisioning the new pods over SSH. By default `up` runs setup on the
+        /// pods it creates (deploy key + repo + tokens, or the hetzner bare-VM script).
         #[arg(long)]
-        setup: bool,
+        no_setup: bool,
         /// Give up waiting for endpoints after this many seconds.
         #[arg(long, default_value_t = 600)]
         timeout: u64,
@@ -1170,6 +1171,8 @@ async fn handle_setup(
     force: bool,
     hf_token: Option<String>,
     cc_token: Option<String>,
+    // Restrict to these pod names (e.g. the ones `up` just created). None = whole fleet.
+    only: Option<&[String]>,
 ) -> Result<()> {
     use arena_core::ssh::SshTarget;
 
@@ -1199,6 +1202,10 @@ async fn handle_setup(
             Ok(t) => targets.push((pod.name.clone(), pod.provider.clone(), t)),
             Err(_) => eprintln!("skip {} — no SSH endpoint yet", pod.name),
         }
+    }
+    // Scope to a subset by name when asked (e.g. `up` provisions only what it created).
+    if let Some(only) = only {
+        targets.retain(|(name, _, _)| only.iter().any(|n| n == name));
     }
     if targets.is_empty() {
         println!("(no pods with an SSH endpoint to set up)");
@@ -2349,7 +2356,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             }
         }
 
-        PodCmd::Up { names, count, add, gpu, gpus, cloud, disk, volume, image, dry_run, no_wait, keep_trying, retry_mins, retry_secs, setup, timeout, interval } => {
+        PodCmd::Up { names, count, add, gpu, gpus, cloud, disk, volume, image, dry_run, no_wait, keep_trying, retry_mins, retry_secs, no_setup, timeout, interval } => {
             let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image };
             // Like `create`: explicit names take the direct path; -n/-a top up by count.
             let explicit = !names.is_empty();
@@ -2373,7 +2380,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                     println!("[dry-run] would create {name} on {} ({desc})", provider.name());
                 }
                 warn_no_volume(provider, &spec);
-                let extra = if setup { " then run setup," } else { "" };
+                let extra = if no_setup { "" } else { " then provision them," };
                 let retry = if retry_mins > 0 { format!(" (retrying up to {retry_mins}m for capacity)") } else { String::new() };
                 println!(
                     "\nDry-run only — no pods created (preview){retry}: would create the above, \
@@ -2388,7 +2395,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                 provider.name(),
                 provider.describe(&spec),
                 if retry_mins > 0 { format!(", retrying up to {retry_mins}m") } else { String::new() },
-                if setup { ", run setup" } else { "" },
+                if no_setup { "" } else { ", provision them" },
                 names.join(", ")
             ))? {
                 println!("aborted.");
@@ -2482,10 +2489,13 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                     not_ready.join(", ")
                 );
             }
-            // Optional: provision the pods over SSH as part of the spin-up.
-            if setup {
-                println!("\nProvisioning pods over SSH…");
-                handle_setup(provider, cfg, true, false, None, None).await?;
+            // Provision the pods we just created over SSH (deploy key + repo + tokens, or
+            // the bare-VM script for hetzner), unless --no-setup. Scoped to the new pods so
+            // a top-up `up` doesn't re-provision the whole fleet.
+            if !no_setup {
+                println!("\nProvisioning the new pod(s) over SSH…");
+                let new: Vec<String> = created.iter().map(|p| p.name.clone()).collect();
+                handle_setup(provider, cfg, true, false, None, None, Some(&new)).await?;
             }
             // If there's no nginx to deploy to, say how to wire it (don't dump config).
             if !nginx_present {
@@ -2658,7 +2668,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                 println!("aborted.");
                 return Ok(());
             }
-            handle_setup(provider, cfg, !dry_run, force, hf_token, cc_token).await?;
+            handle_setup(provider, cfg, !dry_run, force, hf_token, cc_token, None).await?;
         }
         PodCmd::SetBranch { branch, target, all, hard, dry_run } => {
             handle_set_branch(provider, cfg, &branch, target.as_deref(), all, hard, dry_run, yes).await?;
