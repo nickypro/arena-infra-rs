@@ -3150,7 +3150,29 @@ async fn handle_copy(
     }
 
     let rflag = if recursive { "-r " } else { "" };
-    println!("Copy{}: {local}  ->  {remote}", if recursive { " (recursive)" } else { "" });
+    // Clear input→output preview before the confirm. Label the *type* (file vs folder)
+    // explicitly — that's the thing people get wrong — and, for folders, spell out the
+    // scp -r nesting rule (an existing dest dir, or a trailing slash, lands the folder
+    // INSIDE → <dest>/<name>) that quietly produces a `name/name` mess.
+    let is_dir = file.is_dir();
+    let kind = if is_dir { "folder" } else { "file" };
+    let base = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    println!("Copy preview (same on every pod):");
+    println!("  input  [{kind} — check the type!]: {local}");
+    println!("  output [{kind}]:                   {remote}");
+    // Surface a flag/type mismatch: -r on a file is harmless but usually a mistake.
+    if recursive && !is_dir {
+        println!("  note: -r was passed but '{local}' is a FILE on disk, not a folder — copying it as a single file.");
+    }
+    if is_dir {
+        let nested = format!("{}/{base}", remote.trim_end_matches('/'));
+        println!(
+            "  ⚠ -r nesting: scp drops the folder AT that path, but if {dest} already exists \
+             on the pod (or {dest} has a trailing slash) it lands INSIDE → {nested}\n  \
+             To overwrite a folder's contents, copy to its PARENT (or `rm -rf` the remote dir first).",
+            dest = remote.trim_end_matches('/'),
+        );
+    }
     if dry_run {
         println!("\nDry-run — would scp to {} pod(s):\n", targets.len());
         for (name, t) in &targets {
