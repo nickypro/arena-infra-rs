@@ -1908,31 +1908,44 @@ async fn smart_proxy(cfg: &Config, pods: &[arena_core::Pod]) -> Result<()> {
     let pxcfg = arena_core::proxy::ProxyConfig::from_config(cfg)?;
     let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
     let plan = arena_core::proxy::plan_forwards(&pxcfg, prefix, &cfg.machine_names, pods);
-    println!(
-        "\nproxy: {} forward(s) for {}@{}",
-        plan.forwards.len(),
-        pxcfg.proxy_user,
-        pxcfg.proxy_host
-    );
+    let where_ = if pxcfg.local { "locally".to_string() } else { format!("{}@{}", pxcfg.proxy_user, pxcfg.proxy_host) };
+    println!("\nproxy: {} forward(s) ({where_})", plan.forwards.len());
 
-    // Is nginx present on the proxy host?
-    let target =
-        SshTarget::for_host(&pxcfg.proxy_user, &pxcfg.proxy_host, 22, cfg.get("SHARED_SSH_KEY_PATH"));
-    let has_nginx = matches!(
-        ssh::run(&target, "command -v nginx >/dev/null 2>&1 && echo yes").await,
-        Ok(out) if out.success && out.stdout.contains("yes")
-    );
+    // Is nginx present where we'd deploy — on this box (local) or the proxy host (SSH)?
+    let has_nginx = if pxcfg.local {
+        std::process::Command::new("sh")
+            .args(["-c", "command -v nginx >/dev/null 2>&1"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    } else {
+        let target = SshTarget::for_host(
+            &pxcfg.proxy_user,
+            &pxcfg.proxy_host,
+            22,
+            cfg.get("SHARED_SSH_KEY_PATH"),
+        );
+        matches!(
+            ssh::run(&target, "command -v nginx >/dev/null 2>&1 && echo yes").await,
+            Ok(out) if out.success && out.stdout.contains("yes")
+        )
+    };
 
     if has_nginx {
         // nginx is set up — update it. (Part of the already-confirmed `up` flow.)
         if let Err(e) = deploy_proxy(cfg, pods, true).await {
             eprintln!("proxy update failed (pods are up): {e}");
         }
+    } else if pxcfg.local {
+        println!(
+            "nginx not found on this host — not deploying. Install nginx (or run \
+             `arena proxy plan` to print the config), then `arena proxy apply`."
+        );
     } else {
         println!(
-            "proxy host {} has no nginx (or is unreachable) — not deploying.\n\
-             To wire the ports, run `arena proxy plan` to print/save the nginx config, \
-             or `arena proxy apply` once nginx is set up.",
+            "proxy host {} has no nginx (or is unreachable) — not deploying. Run \
+             `arena proxy plan` to print/save the config, or `arena proxy apply` once \
+             nginx is set up. (If this box IS the proxy, unset PROXY_LOCAL / set it true.)",
             pxcfg.proxy_host
         );
     }
@@ -1949,8 +1962,6 @@ async fn deploy_proxy(cfg: &Config, pods: &[arena_core::Pod], apply: bool) -> Re
     let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
     let plan = arena_core::proxy::plan_forwards(&pxcfg, prefix, &cfg.machine_names, pods);
     let nginx = arena_core::proxy::render_nginx(&plan.forwards);
-    let target =
-        SshTarget::for_host(&pxcfg.proxy_user, &pxcfg.proxy_host, 22, cfg.get("SHARED_SSH_KEY_PATH"));
     let reload = "nginx -t && nginx -s reload";
     // One-line summary of pods still without an endpoint (instead of a line each).
     let starting = if plan.skipped.is_empty() {
@@ -1960,28 +1971,47 @@ async fn deploy_proxy(cfg: &Config, pods: &[arena_core::Pod], apply: bool) -> Re
     };
 
     if !apply {
-        println!(
-            "[dry-run] would deploy {} forward(s) to {}@{}:{}{starting}",
-            plan.forwards.len(),
-            pxcfg.proxy_user,
-            pxcfg.proxy_host,
-            pxcfg.nginx_path
-        );
-        println!("  {}", target.display_scp("<rendered nginx>", &pxcfg.nginx_path));
-        println!("  {}", target.display_command(reload));
+        let dest = if pxcfg.local { "this host".into() } else { format!("{}@{}", pxcfg.proxy_user, pxcfg.proxy_host) };
+        println!("[dry-run] would deploy {} forward(s) to {dest}:{}{starting}", plan.forwards.len(), pxcfg.nginx_path);
+        if pxcfg.local {
+            println!("  write {} + run `{reload}` locally", expand_tilde(&pxcfg.nginx_path));
+        } else {
+            let target = SshTarget::for_host(&pxcfg.proxy_user, &pxcfg.proxy_host, 22, cfg.get("SHARED_SSH_KEY_PATH"));
+            println!("  {}", target.display_scp("<rendered nginx>", &pxcfg.nginx_path));
+            println!("  {}", target.display_command(reload));
+        }
         println!("(preview only — run without --dry-run to deploy and reload nginx)");
         return Ok(());
     }
 
-    // Idempotent: only scp + reload when the rendered config differs from what's live —
-    // so calling this repeatedly (e.g. while waiting for pods) reloads only on a change.
+    // Local: this box IS the proxy — write the config + reload nginx directly, no SSH.
+    if pxcfg.local {
+        let path = expand_tilde(&pxcfg.nginx_path);
+        // Idempotent: skip the write+reload if the live config already matches.
+        if std::fs::read_to_string(&path).map(|c| c == nginx).unwrap_or(false) {
+            return Ok(());
+        }
+        std::fs::write(&path, &nginx).with_context(|| format!("writing nginx config to {path}"))?;
+        let out = std::process::Command::new("sh")
+            .args(["-c", reload])
+            .output()
+            .context("reloading nginx locally")?;
+        if out.status.success() {
+            println!("[proxy] deployed {} forward(s) locally and reloaded nginx{starting}", plan.forwards.len());
+            return Ok(());
+        }
+        anyhow::bail!("local nginx reload failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+
+    // Remote: SSH to the proxy host. Idempotent — only scp + reload on a real change.
+    let target =
+        SshTarget::for_host(&pxcfg.proxy_user, &pxcfg.proxy_host, 22, cfg.get("SHARED_SSH_KEY_PATH"));
     let current = ssh::run(&target, &format!("cat {} 2>/dev/null", pxcfg.nginx_path)).await;
     if let Ok(out) = &current {
         if out.success && out.stdout == nginx {
-            return Ok(()); // already up to date — quiet (caller loops)
+            return Ok(());
         }
     }
-
     let tmp = std::env::temp_dir().join("arena-proxy.conf");
     std::fs::write(&tmp, &nginx).context("writing rendered nginx config to a temp file")?;
     let scp = ssh::scp(&target, &tmp.to_string_lossy(), &pxcfg.nginx_path).await?;
@@ -1990,19 +2020,22 @@ async fn deploy_proxy(cfg: &Config, pods: &[arena_core::Pod], apply: bool) -> Re
     }
     let out = ssh::run(&target, reload).await?;
     if out.success {
-        println!(
-            "[proxy] deployed {} forward(s) to {} and reloaded nginx{starting}",
-            plan.forwards.len(),
-            pxcfg.proxy_host
-        );
+        println!("[proxy] deployed {} forward(s) to {} and reloaded nginx{starting}", plan.forwards.len(), pxcfg.proxy_host);
         Ok(())
     } else {
-        anyhow::bail!(
-            "nginx reload on {} failed (exit {:?}): {}",
-            pxcfg.proxy_host,
-            out.code,
-            out.stderr.trim()
-        )
+        anyhow::bail!("nginx reload on {} failed (exit {:?}): {}", pxcfg.proxy_host, out.code, out.stderr.trim())
+    }
+}
+
+/// Expand a leading `~/` to `$HOME` for local filesystem ops (the nginx config path uses
+/// `~` for the remote `$HOME`; local deploy needs a real path).
+fn expand_tilde(p: &str) -> String {
+    match p.strip_prefix("~/") {
+        Some(rest) => match std::env::var("HOME") {
+            Ok(h) => format!("{}/{rest}", h.trim_end_matches('/')),
+            Err(_) => p.to_string(),
+        },
+        None => p.to_string(),
     }
 }
 

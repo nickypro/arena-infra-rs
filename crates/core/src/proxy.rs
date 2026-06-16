@@ -34,22 +34,36 @@ pub struct ProxyConfig {
     pub nginx_path: String,
     /// First public port; machine index 0 gets this, index 1 gets +1, etc.
     pub starting_port: u16,
+    /// Deploy nginx on THIS machine (write the config + reload locally) instead of over
+    /// SSH to `proxy_host`. Defaults on: the control plane usually *is* the proxy host
+    /// (e.g. `proxy_host` resolves back to this box), where SSHing to it is a needless
+    /// hairpin. Set `PROXY_LOCAL=false` for a genuinely remote proxy.
+    pub local: bool,
 }
 
 impl ProxyConfig {
     pub fn from_config(cfg: &Config) -> Result<Self> {
+        let proxy_host = cfg
+            .get("SSH_PROXY_HOST")
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| Error::Config("missing SSH_PROXY_HOST".into()))?
+            .to_string();
+        // Local by default; only a literal false/0/no opts back into remote SSH deploy.
+        // A loopback host name also forces local regardless.
+        let opted_remote = matches!(
+            cfg.get("PROXY_LOCAL").map(|s| s.trim().to_lowercase()).as_deref(),
+            Some("false") | Some("0") | Some("no") | Some("off")
+        );
+        let loopback = matches!(proxy_host.as_str(), "localhost" | "127.0.0.1" | "::1");
         Ok(Self {
             proxy_user: cfg.get("SSH_PROXY_USER").unwrap_or("root").to_string(),
-            proxy_host: cfg
-                .get("SSH_PROXY_HOST")
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| Error::Config("missing SSH_PROXY_HOST".into()))?
-                .to_string(),
+            proxy_host,
             nginx_path: cfg
                 .get("SSH_PROXY_NGINX_CONFIG_PATH")
                 .unwrap_or("~/proxy.conf")
                 .to_string(),
             starting_port: cfg.get_parsed("SSH_PROXY_STARTING_PORT").unwrap_or(7000),
+            local: loopback || !opted_remote,
         })
     }
 }
@@ -175,6 +189,7 @@ mod tests {
             proxy_host: "cute.sus.cat".into(),
             nginx_path: "~/proxy.conf".into(),
             starting_port: 7000,
+            local: false,
         }
     }
 
