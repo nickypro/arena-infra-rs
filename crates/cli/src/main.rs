@@ -1097,6 +1097,72 @@ fn launch_tui(provider: &str, config: &std::path::Path) -> Result<()> {
 /// prebuilt image and take the lighter post-image config path instead.
 const HETZNER_SETUP: &str = include_str!("hetzner_setup.sh");
 
+/// One step of provisioning a pod over SSH: push a file, or run a command.
+#[derive(Debug, Clone, PartialEq)]
+enum ProvisionStep {
+    Scp { local: String, remote: String },
+    Run { cmd: String },
+}
+
+/// The ordered provisioning steps for a pod, chosen by provider — pure and unit-tested,
+/// so the executor never has to know what a provider *is*. Adding a backend = add its
+/// steps here; the runner and the dry-run preview stay generic.
+///   - bare-VM (hetzner): push the full setup script, then run it.
+///   - image-based (runpod/vast): push the git deploy key, then the post-image config.
+fn provisioning_steps(
+    provider: &str,
+    scfg: &arena_core::setup::SetupConfig,
+    name: &str,
+    force: bool,
+    hetzner_script_local: &str,
+) -> Vec<ProvisionStep> {
+    match provider {
+        "hetzner" => vec![
+            ProvisionStep::Scp {
+                local: hetzner_script_local.to_string(),
+                remote: "/root/hetzner_setup.sh".into(),
+            },
+            ProvisionStep::Run { cmd: "bash /root/hetzner_setup.sh".into() },
+        ],
+        _ => vec![
+            ProvisionStep::Scp { local: scfg.key_local.clone(), remote: scfg.key_remote.clone() },
+            ProvisionStep::Run { cmd: scfg.remote_command(name, force) },
+        ],
+    }
+}
+
+/// Run a pod's provisioning steps in order over SSH, stopping at the first failure.
+/// Returns the last command's output (so the caller's ✓/✗ tally works) or an error.
+async fn run_provisioning(
+    target: &arena_core::ssh::SshTarget,
+    steps: Vec<ProvisionStep>,
+) -> arena_core::Result<arena_core::ssh::SshOutput> {
+    use arena_core::ssh;
+    let mut last = None;
+    for step in steps {
+        match step {
+            ProvisionStep::Scp { local, remote } => {
+                let out = ssh::scp(target, &local, &remote).await?;
+                if !out.success {
+                    return Err(arena_core::Error::provider(format!(
+                        "scp {local} -> {remote} failed: {}",
+                        out.stderr.trim()
+                    )));
+                }
+                last = Some(out);
+            }
+            ProvisionStep::Run { cmd } => {
+                let out = ssh::run(target, &cmd).await?;
+                if !out.success {
+                    return Ok(out); // command failed — surface it as a failed pod
+                }
+                last = Some(out);
+            }
+        }
+    }
+    last.ok_or_else(|| arena_core::Error::provider("no provisioning steps"))
+}
+
 async fn handle_setup(
     provider: &dyn Provider,
     cfg: &Config,
@@ -1105,7 +1171,7 @@ async fn handle_setup(
     hf_token: Option<String>,
     cc_token: Option<String>,
 ) -> Result<()> {
-    use arena_core::ssh::{self, SshTarget};
+    use arena_core::ssh::SshTarget;
 
     // Broadcast token values: CLI flags override config (so a token can be supplied
     // without editing the read-only prod config).
@@ -1139,6 +1205,14 @@ async fn handle_setup(
         return Ok(());
     }
 
+    // Bare-VM (hetzner) pods scp this script; write it once to a temp file. Shared by the
+    // dry-run preview and the real run.
+    let hetzner_script = {
+        let p = std::env::temp_dir().join("arena-hetzner-setup.sh");
+        std::fs::write(&p, HETZNER_SETUP).context("writing hetzner setup script to a temp file")?;
+        p.to_string_lossy().into_owned()
+    };
+
     if !apply {
         // Redact broadcast token values in the *previewed* command — the dry-run prints
         // the exact shell, and real token values must never land in a terminal/log. (The
@@ -1147,21 +1221,16 @@ async fn handle_setup(
         for (name, value) in display_scfg.broadcast_exports.iter_mut() {
             *value = format!("<{name}>");
         }
-        println!(
-            "Dry-run — would provision {} pod(s) (copy key {} -> {}, then):\n",
-            targets.len(),
-            scfg.key_local,
-            scfg.key_remote
-        );
+        println!("Dry-run — would provision {} pod(s):\n", targets.len());
         for (name, provider_name, target) in &targets {
             println!("# {name}");
-            if provider_name == "hetzner" {
-                println!("scp <embedded hetzner_setup.sh> -> /root/hetzner_setup.sh");
-                println!("{}\n", target.display_command("bash /root/hetzner_setup.sh"));
-            } else {
-                println!("{}", target.display_scp(&scfg.key_local, &scfg.key_remote));
-                println!("{}\n", target.display_command(&display_scfg.remote_command(name, force)));
+            for step in provisioning_steps(provider_name, &display_scfg, name, force, &hetzner_script) {
+                match step {
+                    ProvisionStep::Scp { local, remote } => println!("  {}", target.display_scp(&local, &remote)),
+                    ProvisionStep::Run { cmd } => println!("  {}", target.display_command(&cmd)),
+                }
             }
+            println!();
         }
         let keys_present = arena_core::apikeys::PROVIDERS.iter().any(|(base, _, _)| {
             std::fs::read_to_string(format!("./keys/{base}_api_keys.csv"))
@@ -1176,47 +1245,15 @@ async fn handle_setup(
         return Ok(());
     }
 
-    // Provision concurrently across the fleet, printing a [done/total] line as each
-    // pod finishes so there's live progress (36 pods × scp+ssh is slow serially).
-    // Hetzner (bare-VM) pods get the full provisioning script; write it to a temp file so
-    // each pod can scp it. Image-based (GPU) pods don't touch it.
-    let hetzner_script = {
-        let p = std::env::temp_dir().join("arena-hetzner-setup.sh");
-        std::fs::write(&p, HETZNER_SETUP).context("writing hetzner setup script to a temp file")?;
-        p.to_string_lossy().into_owned()
-    };
+    // Provision concurrently across the fleet, printing a [done/total] line as each pod
+    // finishes (scp+ssh is slow serially). The per-pod flow is *data* (provisioning_steps)
+    // run by a generic runner — the executor below never names a provider.
     let total = targets.len();
     println!("Provisioning {total} pod(s) over SSH…");
     let mut set = tokio::task::JoinSet::new();
     for (name, provider_name, target) in targets {
-        let key_local = scfg.key_local.clone();
-        let key_remote = scfg.key_remote.clone();
-        let remote_cmd = scfg.remote_command(&name, force);
-        let hetzner_script = hetzner_script.clone();
-        set.spawn(async move {
-            let result = if provider_name == "hetzner" {
-                // Bare VM: push the embedded script, run it with bash (it has bashisms).
-                match ssh::scp(&target, &hetzner_script, "/root/hetzner_setup.sh").await {
-                    Ok(out) if out.success => ssh::run(&target, "bash /root/hetzner_setup.sh").await,
-                    Ok(out) => Err(arena_core::Error::provider(format!(
-                        "scp setup script failed: {}",
-                        out.stderr.trim()
-                    ))),
-                    Err(e) => Err(e),
-                }
-            } else {
-                // Image-based pod: copy the git deploy key, then the post-image config.
-                match ssh::scp(&target, &key_local, &key_remote).await {
-                    Ok(out) if out.success => ssh::run(&target, &remote_cmd).await,
-                    Ok(out) => Err(arena_core::Error::provider(format!(
-                        "scp key failed: {}",
-                        out.stderr.trim()
-                    ))),
-                    Err(e) => Err(e),
-                }
-            };
-            (name, result)
-        });
+        let steps = provisioning_steps(&provider_name, &scfg, &name, force, &hetzner_script);
+        set.spawn(async move { (name, run_provisioning(&target, steps).await) });
     }
 
     let (mut ok, mut failed, mut done) = (0, 0, 0);
@@ -3924,6 +3961,34 @@ mod selection_tests {
 #[cfg(test)]
 mod tests {
     use super::{strip_arena_block, with_arena_block, CRON_BEGIN, CRON_END};
+
+    #[test]
+    fn provisioning_steps_branch_by_provider() {
+        use super::{provisioning_steps, ProvisionStep};
+        let scfg = arena_core::setup::SetupConfig {
+            key_local: "/local/key".into(),
+            key_remote: "/root/.ssh/id_ed25519".into(),
+            repo_path: "/root/ARENA_3.0".into(),
+            repo_url: "git@github.com:o/r.git".into(),
+            branch: "main".into(),
+            prefix: "arena8".into(),
+            authorized_pubkeys: vec![],
+            broadcast_exports: vec![],
+        };
+        // bare-VM (hetzner): push the script + run it — never touches the deploy key.
+        assert_eq!(
+            provisioning_steps("hetzner", &scfg, "arena8-flutter", false, "/tmp/h.sh"),
+            vec![
+                ProvisionStep::Scp { local: "/tmp/h.sh".into(), remote: "/root/hetzner_setup.sh".into() },
+                ProvisionStep::Run { cmd: "bash /root/hetzner_setup.sh".into() },
+            ]
+        );
+        // image-based (runpod/vast): scp the deploy key, then a config command that
+        // re-points origin — i.e. the post-image flow, not the bare-VM script.
+        let r = provisioning_steps("runpod", &scfg, "arena8-apple", false, "/tmp/h.sh");
+        assert!(matches!(&r[0], ProvisionStep::Scp { local, remote } if local == "/local/key" && remote == "/root/.ssh/id_ed25519"));
+        assert!(matches!(&r[1], ProvisionStep::Run { cmd } if cmd.contains("git remote set-url")));
+    }
 
     #[test]
     fn install_preserves_other_crontab_entries() {
