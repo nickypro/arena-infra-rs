@@ -1119,11 +1119,21 @@ fn provisioning_steps(
 ) -> Vec<ProvisionStep> {
     match provider {
         "hetzner" => vec![
+            // Copy the git deploy key first, so the script can clone (and later push to)
+            // the PRIVATE cohort repo over SSH — not just the public mirror.
+            ProvisionStep::Scp { local: scfg.key_local.clone(), remote: scfg.key_remote.clone() },
             ProvisionStep::Scp {
                 local: hetzner_script_local.to_string(),
                 remote: "/root/hetzner_setup.sh".into(),
             },
-            ProvisionStep::Run { cmd: "bash /root/hetzner_setup.sh".into() },
+            ProvisionStep::Run {
+                cmd: format!(
+                    "REPO_URL={} REPO_DIR={} REPO_KEY={} bash /root/hetzner_setup.sh",
+                    shell_quote(&scfg.repo_url),
+                    shell_quote(&scfg.repo_path),
+                    shell_quote(&scfg.key_remote),
+                ),
+            },
         ],
         _ => vec![
             ProvisionStep::Scp { local: scfg.key_local.clone(), remote: scfg.key_remote.clone() },
@@ -3985,12 +3995,16 @@ mod tests {
             authorized_pubkeys: vec![],
             broadcast_exports: vec![],
         };
-        // bare-VM (hetzner): push the script + run it — never touches the deploy key.
+        // bare-VM (hetzner): copy the deploy key, push the script, run it with the repo
+        // URL/key passed in (so it clones the PRIVATE repo over SSH).
         assert_eq!(
             provisioning_steps("hetzner", &scfg, "arena8-flutter", false, "/tmp/h.sh"),
             vec![
+                ProvisionStep::Scp { local: "/local/key".into(), remote: "/root/.ssh/id_ed25519".into() },
                 ProvisionStep::Scp { local: "/tmp/h.sh".into(), remote: "/root/hetzner_setup.sh".into() },
-                ProvisionStep::Run { cmd: "bash /root/hetzner_setup.sh".into() },
+                ProvisionStep::Run {
+                    cmd: "REPO_URL='git@github.com:o/r.git' REPO_DIR='/root/ARENA_3.0' REPO_KEY='/root/.ssh/id_ed25519' bash /root/hetzner_setup.sh".into(),
+                },
             ]
         );
         // image-based (runpod/vast): scp the deploy key, then a config command that
