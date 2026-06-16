@@ -141,10 +141,17 @@ impl Provider for HetznerProvider {
     }
 
     async fn create_pod(&self, spec: &PodSpec) -> Result<Pod> {
+        // Hetzner's `image` is an ID *or* a name: a system image is a name ("ubuntu-24.04"),
+        // but a snapshot has no name — it's referenced by numeric id. Send all-digits as an
+        // int so HETZNER_IMAGE can be a snapshot id.
+        let image = match self.opts.image.parse::<u64>() {
+            Ok(id) => json!(id),
+            Err(_) => json!(self.opts.image),
+        };
         let mut payload = json!({
             "name": spec.name,
             "server_type": self.opts.server_type,
-            "image": self.opts.image,
+            "image": image,
             "start_after_create": true,
         });
         if let Some(loc) = &self.opts.location {

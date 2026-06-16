@@ -55,21 +55,31 @@ if [ -n "${REPO_KEY:-}" ] && [ -f "$REPO_KEY" ]; then
 fi
 [ -d "$REPO_DIR" ] || git clone "$REPO_URL" "$REPO_DIR"
 cd "$REPO_DIR"
-# CPU substitutions: torch CPU wheels instead of CUDA, jax[cpu] instead of jax[cuda12].
-sed -e 's#https://download.pytorch.org/whl/cu118#https://download.pytorch.org/whl/cpu#' \
-    -e 's#^jax\[cuda12\]#jax[cpu]#' \
-    requirements.txt > requirements.cpu.txt
-# transformer_lens pins numpy<2, which conflicts with jax (numpy>=2). That pin is stale —
-# override it so the resolve succeeds (TL runs fine on numpy 2.x).
-printf 'numpy>=2.0\n' > overrides.txt
-uv venv --python 3.11 "$VENV"
+# Skip the slow (~4GB) install if the env is already baked in — e.g. the pod booted from a
+# pre-built snapshot. This is what makes snapshot-based pods come up in ~1 min instead of 10.
+if [ -d "$VENV" ] && "$VENV/bin/python" -c "import torch" >/dev/null 2>&1; then
+    echo "ARENA env already present — skipping uv install"
+else
+    # CPU substitutions: torch CPU wheels, jax[cpu]; drop bitsandbytes (CUDA-only — 176MB
+    # of GPU quantization kernels that are dead weight on a CPU box).
+    sed -e 's#https://download.pytorch.org/whl/cu118#https://download.pytorch.org/whl/cpu#' \
+        -e 's#^jax\[cuda12\]#jax[cpu]#' \
+        -e '/^bitsandbytes/d' \
+        requirements.txt > requirements.cpu.txt
+    # transformer_lens pins numpy<2, which conflicts with jax (numpy>=2). That pin is stale —
+    # override it so the resolve succeeds (TL runs fine on numpy 2.x).
+    printf 'numpy>=2.0\n' > overrides.txt
+    uv venv --python 3.11 "$VENV"
+    # shellcheck disable=SC1091
+    source "$VENV/bin/activate"
+    # --index-strategy unsafe-best-match: the torch CPU extra-index also carries some shared
+    # deps (e.g. importlib-metadata) at versions that conflict with PyPI pins (circuitsvis);
+    # this lets uv pick the best version across BOTH indexes instead of first-index-only.
+    uv pip install --no-cache-dir --index-strategy unsafe-best-match \
+        --override overrides.txt -r requirements.cpu.txt
+fi
 # shellcheck disable=SC1091
 source "$VENV/bin/activate"
-# --index-strategy unsafe-best-match: the torch CPU extra-index also carries some shared
-# deps (e.g. importlib-metadata) at versions that conflict with PyPI pins (circuitsvis);
-# this lets uv pick the best version across BOTH indexes instead of first-index-only.
-uv pip install --no-cache-dir --index-strategy unsafe-best-match \
-    --override overrides.txt -r requirements.cpu.txt
 
 echo "### 5/5 shell rc (auto-activate the venv for arena pods run)"
 ACT="source $VENV/bin/activate 2>/dev/null"

@@ -118,6 +118,16 @@ pub fn remote_export_command(vars: &[(String, String)]) -> String {
             ));
         }
     }
+    // Claude Code ignores CLAUDE_CODE_OAUTH_TOKEN until onboarding is marked complete, so
+    // set hasCompletedOnboarding=true in ~/.claude.json — create it, or merge into an
+    // existing one (preserving its other keys).
+    if vars.iter().any(|(n, _)| n == "CLAUDE_CODE_OAUTH_TOKEN") {
+        cmd.push_str(
+            "; python3 -c 'import json,os; p=os.path.expanduser(\"~/.claude.json\"); \
+             d=json.load(open(p)) if os.path.isfile(p) and os.path.getsize(p) else {}; \
+             d[\"hasCompletedOnboarding\"]=True; json.dump(d,open(p,\"w\"))'",
+        );
+    }
     cmd
 }
 
