@@ -80,14 +80,49 @@ else
 fi
 # shellcheck disable=SC1091
 source "$VENV/bin/activate"
+# uv venv omits pip; install it INTO the venv so a bare `pip show <pkg>` works from the CLI
+# (matches the GPU arena-env). Idempotent + cheap, so it also back-fills snapshot-booted pods.
+python -m pip --version >/dev/null 2>&1 || uv pip install pip >/dev/null 2>&1 || true
 
-echo "### 5/5 shell rc (auto-activate the venv for arena pods run)"
-ACT="source $VENV/bin/activate 2>/dev/null"
+echo "### 5/5 zsh + oh-my-zsh + dotfiles + MOTD (match the GPU pods)"
+apt-get install -y --no-install-recommends zsh figlet >/dev/null 2>&1 || true
+
+# Same dotfiles repo the GPU pods clone — so the shell is byte-for-byte identical.
+[ -d "$HOME/.arena_infra" ] || git clone --depth 1 https://github.com/nickypro/arena-infra "$HOME/.arena_infra"
+
+# oh-my-zsh + powerlevel10k + the exact plugin set from the GPU image. RUNZSH/CHSH=no so the
+# installer doesn't exec a shell or chsh mid-provision (we chsh explicitly below).
+if [ ! -d "$HOME/.oh-my-zsh" ]; then
+    RUNZSH=no CHSH=no sh -c \
+        "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" \
+        "" --unattended
+fi
+ZSH_CUSTOM="${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}"
+clone_plugin() { [ -d "$2" ] || git clone --depth 1 "$1" "$2"; }
+clone_plugin https://github.com/romkatv/powerlevel10k.git             "$ZSH_CUSTOM/themes/powerlevel10k"
+clone_plugin https://github.com/zsh-users/zsh-autosuggestions.git     "$ZSH_CUSTOM/plugins/zsh-autosuggestions"
+clone_plugin https://github.com/zsh-users/zsh-syntax-highlighting.git "$ZSH_CUSTOM/plugins/zsh-syntax-highlighting"
+clone_plugin https://github.com/zsh-users/zsh-history-substring-search "$ZSH_CUSTOM/plugins/zsh-history-substring-search"
+clone_plugin https://github.com/zsh-users/zsh-completions             "$ZSH_CUSTOM/plugins/zsh-completions"
+
+# p10k + vimrc symlinked verbatim. The shared .zshrc only knows conda, so we copy it and
+# append a uv-venv activation (guarded by `! command -v conda`, so it's a no-op on GPU pods).
+ln -sf "$HOME/.arena_infra/dotfiles/.vimrc"    "$HOME/.vimrc"
+ln -sf "$HOME/.arena_infra/dotfiles/.p10k.zsh" "$HOME/.p10k.zsh"
+cp -f  "$HOME/.arena_infra/dotfiles/.zshrc"    "$HOME/.zshrc"
 for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
     touch "$rc"
-    grep -qF "$ACT" "$rc" || printf '\n# ARENA venv (added by hetzner_setup.sh)\n%s\n' "$ACT" >> "$rc"
+    grep -qF "ARENA_3.0/.venv/bin/activate" "$rc" || \
+        printf '\n# ARENA env: no conda on CPU pods — activate the uv venv (no-op on conda GPU pods).\nif ! command -v conda >/dev/null 2>&1 && [ -f "%s/bin/activate" ]; then\n    source "%s/bin/activate"\nfi\n' "$VENV" "$VENV" >> "$rc"
 done
+
+# Machine name (MOTD + prompt) from the Hetzner hostname, e.g. arena8-flutter.
+[ -f "$HOME/.name" ] || printf 'export MACHINE_NAME=%s\n' "$(hostname)" > "$HOME/.name"
+# ARENA figlet login banner, same script the GPU pods use.
+MACHINE_NAME="$(hostname)" bash "$HOME/.arena_infra/scripts/motd.sh" 2>/dev/null || true
+# Default shell -> zsh, so interactive SSH and `arena pods run` land in the configured env.
+chsh -s "$(which zsh)" root 2>/dev/null || true
 # Tokens (OPENROUTER_API_KEY, HF_TOKEN, …) are distributed separately by
 # `arena pods copy-keys` (cross-provider), which appends exports to these same rc files.
 
-echo "### done — $(python --version 2>&1), torch $(python -c 'import torch; print(torch.__version__)' 2>/dev/null || echo '?')"
+echo "### done — $(python --version 2>&1), torch $(python -c 'import torch; print(torch.__version__)' 2>/dev/null || echo '?'), shell=$(getent passwd root | cut -d: -f7)"

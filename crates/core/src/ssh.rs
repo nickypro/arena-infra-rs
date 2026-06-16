@@ -6,9 +6,17 @@
 //! gate mutation; this module just builds and runs the SSH invocation.
 //!
 //! The options are deliberately non-interactive and fail-fast: `BatchMode=yes` (never
-//! prompt for a password/passphrase), `StrictHostKeyChecking=accept-new` (trust a new
-//! host once, but error if a known key changed), and a short `ConnectTimeout` so a
-//! down or unreachable pod errors quickly instead of hanging the whole fleet sweep.
+//! prompt for a password/passphrase) and a short `ConnectTimeout` so a down or unreachable
+//! pod errors quickly instead of hanging the whole fleet sweep.
+//!
+//! Host-key checking is turned OFF (`StrictHostKeyChecking=no` + `UserKnownHostsFile=/dev/null`):
+//! pod IPs are recycled across the provider's pool constantly, so the *same* IP routinely
+//! comes back with a *different* host key. `accept-new` would reject that as "host key
+//! changed" and break provisioning of a freshly-created pod the moment it reuses an IP we've
+//! seen before — and it would also pollute the operator's `~/.ssh/known_hosts`. The pods are
+//! created by us via the provider API, so IP-pinned host-key verification buys little here.
+//! `LogLevel=ERROR` suppresses the per-connection "Permanently added …" warning that
+//! `/dev/null` known-hosts would otherwise print on every call.
 
 use std::process::Stdio;
 
@@ -71,7 +79,11 @@ impl SshTarget {
             "-o".into(),
             "BatchMode=yes".into(),
             "-o".into(),
-            "StrictHostKeyChecking=accept-new".into(),
+            "StrictHostKeyChecking=no".into(),
+            "-o".into(),
+            "UserKnownHostsFile=/dev/null".into(),
+            "-o".into(),
+            "LogLevel=ERROR".into(),
             "-o".into(),
             format!("ConnectTimeout={}", self.connect_timeout_secs),
         ];
@@ -102,7 +114,11 @@ impl SshTarget {
             "-o".into(),
             "BatchMode=yes".into(),
             "-o".into(),
-            "StrictHostKeyChecking=accept-new".into(),
+            "StrictHostKeyChecking=no".into(),
+            "-o".into(),
+            "UserKnownHostsFile=/dev/null".into(),
+            "-o".into(),
+            "LogLevel=ERROR".into(),
             "-o".into(),
             format!("ConnectTimeout={}", self.connect_timeout_secs),
         ];
@@ -122,7 +138,11 @@ impl SshTarget {
             "-o".into(),
             "BatchMode=yes".into(),
             "-o".into(),
-            "StrictHostKeyChecking=accept-new".into(),
+            "StrictHostKeyChecking=no".into(),
+            "-o".into(),
+            "UserKnownHostsFile=/dev/null".into(),
+            "-o".into(),
+            "LogLevel=ERROR".into(),
             "-o".into(),
             format!("ConnectTimeout={}", self.connect_timeout_secs),
         ];
@@ -350,7 +370,8 @@ mod tests {
         let joined = a.join(" ");
         assert!(joined.contains("-p 22001"));
         assert!(joined.contains("BatchMode=yes"));
-        assert!(joined.contains("StrictHostKeyChecking=accept-new"));
+        assert!(joined.contains("StrictHostKeyChecking=no"));
+        assert!(joined.contains("UserKnownHostsFile=/dev/null"));
         assert!(joined.contains("ConnectTimeout=10"));
         assert!(joined.contains("-i /root/.ssh/arena8_key"));
         assert!(joined.ends_with("root@1.2.3.4"));
