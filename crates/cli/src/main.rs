@@ -1174,6 +1174,16 @@ async fn run_provisioning(
     last.ok_or_else(|| arena_core::Error::provider("no provisioning steps"))
 }
 
+/// True if an SSH error looks like a host that isn't reachable *yet* (worth waiting on a
+/// freshly-booted VM) rather than a real provisioning failure (e.g. auth, or a script
+/// error). Used to ride out the create-vs-sshd-up boot race.
+fn is_connection_error(e: &arena_core::Error) -> bool {
+    let s = e.to_string().to_lowercase();
+    ["connect", "timed out", "connection closed", "refused", "no route", "unreachable"]
+        .iter()
+        .any(|m| s.contains(m))
+}
+
 async fn handle_setup(
     provider: &dyn Provider,
     cfg: &Config,
@@ -1270,7 +1280,21 @@ async fn handle_setup(
     let mut set = tokio::task::JoinSet::new();
     for (name, provider_name, target) in targets {
         let steps = provisioning_steps(&provider_name, &scfg, &name, force, &hetzner_script);
-        set.spawn(async move { (name, run_provisioning(&target, steps).await) });
+        set.spawn(async move {
+            // A just-created VM can report an SSH endpoint before sshd is up (hetzner
+            // assigns the IP at create). Retry on connection errors for ~2.5 min to ride
+            // out the boot race; real failures (auth, script errors) break immediately.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(150);
+            let result = loop {
+                match run_provisioning(&target, steps.clone()).await {
+                    Err(e) if is_connection_error(&e) && std::time::Instant::now() < deadline => {
+                        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+                    }
+                    other => break other,
+                }
+            };
+            (name, result)
+        });
     }
 
     let (mut ok, mut failed, mut done) = (0, 0, 0);
