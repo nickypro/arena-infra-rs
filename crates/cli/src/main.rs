@@ -748,9 +748,18 @@ async fn create_with_retry(
     let target = match want {
         Want::Total(n) => n,
         Want::Add(a) => {
+            // Count only THIS provider's pods, matching how plan_names(Total) tops up
+            // below. `list_pods()` spans the whole fleet, so without the provider filter
+            // the target would include every other backend's pods (e.g. all the runpod
+            // GPU pods), and the hetzner top-up — which sees only hetzner pods — would try
+            // to create the entire difference. (`-a 1 --provider hetzner` once tried to
+            // make ~23 pods this way.)
             let policy = arena_core::retry::RetryPolicy::default();
             let pods = arena_core::retry::retrying(&policy, || provider.list_pods()).await?;
-            pods.iter().filter(|p| p.name.starts_with(&format!("{prefix}-"))).count() + a
+            pods.iter()
+                .filter(|p| p.provider.as_str() == provider.name() && p.name.starts_with(&format!("{prefix}-")))
+                .count()
+                + a
         }
     };
     let retry_secs = retry_secs.max(1);
