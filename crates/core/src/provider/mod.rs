@@ -9,8 +9,11 @@ use crate::error::{Error, Result};
 use crate::pod::{Pod, PodSpec};
 
 pub mod hetzner;
+pub mod multi;
 pub mod runpod;
 pub mod vast;
+
+pub use multi::build_fleet;
 
 /// Construct a provider by name from config. The single place concrete backends are
 /// built, so the CLI and TUI share one source of truth (and one list of known names).

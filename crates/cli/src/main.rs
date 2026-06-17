@@ -884,122 +884,6 @@ async fn create_pods(
     Ok(created)
 }
 
-/// One `Provider` that fans every command out across all configured backends, so the CLI
-/// is a single fleet view spanning runpod + vast + hetzner. `list_pods` concatenates all
-/// of them (caching pod-id → backend so mutations route correctly); `create_pod` goes to
-/// the chosen `--provider` (the "primary"); `stop`/`restart`/`terminate` route to whichever
-/// backend actually owns the pod id. With only one backend configured it behaves exactly
-/// like that single provider, so single-provider setups are unaffected.
-struct MultiProvider {
-    backends: Vec<Box<dyn Provider>>,
-    primary: usize,
-    owner: std::sync::Mutex<std::collections::HashMap<String, usize>>,
-}
-
-impl MultiProvider {
-    /// The backend that owns `id`, using the cache; on a miss, refresh via a full list.
-    async fn backend_for(&self, id: &str) -> arena_core::Result<&dyn Provider> {
-        if let Some(i) = self.owner.lock().unwrap().get(id).copied() {
-            return Ok(self.backends[i].as_ref());
-        }
-        self.list_pods().await?; // cold cache — populate, then look up
-        let idx = self.owner.lock().unwrap().get(id).copied();
-        match idx {
-            Some(i) => Ok(self.backends[i].as_ref()),
-            None => Err(arena_core::Error::provider(format!(
-                "no configured provider owns pod id '{id}'"
-            ))),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl Provider for MultiProvider {
-    fn name(&self) -> &'static str {
-        self.backends[self.primary].name()
-    }
-    fn describe(&self, spec: &arena_core::PodSpec) -> String {
-        self.backends[self.primary].describe(spec)
-    }
-    async fn list_pods(&self) -> arena_core::Result<Vec<arena_core::Pod>> {
-        // Gather first (awaiting), then populate the cache without holding the lock across
-        // an await. A provider that errors is warned about but doesn't sink the others;
-        // only a total wipeout (every backend failed) is fatal.
-        let mut gathered: Vec<(usize, Vec<arena_core::Pod>)> = Vec::new();
-        let mut errs: Vec<String> = Vec::new();
-        for (i, b) in self.backends.iter().enumerate() {
-            match b.list_pods().await {
-                Ok(pods) => gathered.push((i, pods)),
-                Err(e) => errs.push(format!("{}: {e}", b.name())),
-            }
-        }
-        if gathered.is_empty() && !errs.is_empty() {
-            return Err(arena_core::Error::provider(format!(
-                "all providers failed to list: {}",
-                errs.join("; ")
-            )));
-        }
-        if !errs.is_empty() {
-            eprintln!("warning: some providers failed to list ({})", errs.join("; "));
-        }
-        let mut map = self.owner.lock().unwrap();
-        map.clear();
-        let mut out = Vec::new();
-        for (i, pods) in gathered {
-            for p in &pods {
-                map.insert(p.id.clone(), i);
-            }
-            out.extend(pods);
-        }
-        Ok(out)
-    }
-    async fn create_pod(&self, spec: &arena_core::PodSpec) -> arena_core::Result<arena_core::Pod> {
-        // Creation needs a concrete target: always the chosen --provider.
-        let pod = self.backends[self.primary].create_pod(spec).await?;
-        self.owner.lock().unwrap().insert(pod.id.clone(), self.primary);
-        Ok(pod)
-    }
-    async fn stop_pod(&self, id: &str) -> arena_core::Result<()> {
-        self.backend_for(id).await?.stop_pod(id).await
-    }
-    async fn restart_pod(&self, id: &str) -> arena_core::Result<()> {
-        self.backend_for(id).await?.restart_pod(id).await
-    }
-    async fn terminate_pod(&self, id: &str) -> arena_core::Result<()> {
-        self.backend_for(id).await?.terminate_pod(id).await
-    }
-}
-
-/// Build the fleet-wide provider: the chosen `--provider` (required, for create) plus
-/// every *other* backend that has credentials in config (best-effort). One configured
-/// backend → just that provider.
-fn build_multi(primary: &str, cfg: &Config) -> Result<Box<dyn Provider>> {
-    const KNOWN: [&str; 3] = ["runpod", "vast", "hetzner"];
-    if !KNOWN.contains(&primary) {
-        anyhow::bail!("unknown provider `{primary}` (known: {})", KNOWN.join(", "));
-    }
-    let mut backends: Vec<Box<dyn Provider>> = Vec::new();
-    let mut primary_idx = None;
-    for name in KNOWN {
-        let built = if name == primary {
-            Some(arena_core::provider::build(name, cfg)?) // primary's creds are required
-        } else {
-            arena_core::provider::build(name, cfg).ok() // others: include only if configured
-        };
-        if let Some(p) = built {
-            if name == primary {
-                primary_idx = Some(backends.len());
-            }
-            backends.push(p);
-        }
-    }
-    Ok(Box::new(MultiProvider {
-        backends,
-        primary: primary_idx.expect("primary is built or we bailed above"),
-        owner: std::sync::Mutex::new(std::collections::HashMap::new()),
-    }))
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -1012,7 +896,7 @@ async fn main() -> Result<()> {
         Cmd::Config(_) | Cmd::Cron(_) | Cmd::Tui | Cmd::Gpus => None,
         // Fleet-wide: every command spans all configured providers (create still targets
         // --provider). One configured backend behaves like that single provider.
-        _ => Some(build_multi(&cli.provider, &cfg)?),
+        _ => Some(arena_core::provider::build_fleet(&cli.provider, &cfg, true)?),
     };
 
     match cli.cmd {

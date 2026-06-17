@@ -163,8 +163,12 @@ async fn main() -> Result<()> {
     let cfg = Config::load(&PathBuf::from(&config_path))
         .with_context(|| format!("loading config {config_path}"))?;
     let provider_name = std::env::var("ARENA_PROVIDER").unwrap_or_else(|_| "runpod".to_string());
+    // Fleet-spanning provider (like the CLI): the dashboard lists pods across ALL configured
+    // backends — runpod + vast + hetzner — not just the primary. `warn_on_partial=false` so a
+    // provider hiccup (e.g. Vast 429) doesn't print onto the alternate screen. Creates still
+    // go to the chosen primary (ARENA_PROVIDER).
     let provider: Arc<dyn Provider> =
-        Arc::from(arena_core::provider::build(&provider_name, &cfg)?);
+        Arc::from(arena_core::provider::build_fleet(&provider_name, &cfg, false)?);
     let progress_cmd = cfg.get("PROGRESS_CMD").map(String::from);
     let initial_secs = std::env::var("ARENA_REFRESH_SECS")
         .ok()
