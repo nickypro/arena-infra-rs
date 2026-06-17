@@ -598,7 +598,44 @@ fn resolve_want(count: Option<usize>, add: Option<usize>) -> Result<Want> {
     }
 }
 
-async fn plan_names(provider: &dyn Provider, cfg: &Config, want: Want) -> Result<Vec<String>> {
+/// Count the pods belonging to this provider's cohort: its backend name *and* the
+/// configured machine-name prefix. `pods` is the whole-fleet snapshot from `list_pods()`
+/// (which spans every backend), so the provider filter is load-bearing — without it a
+/// per-provider top-up gets sized against the entire fleet. (`up -a 1 --provider hetzner`
+/// once tried to make ~23 pods because this very count wasn't provider-scoped.)
+fn provider_pod_count(pods: &[arena_core::Pod], provider_name: &str, prefix: &str) -> usize {
+    let pre = format!("{prefix}-");
+    pods.iter()
+        .filter(|p| p.provider.as_str() == provider_name && p.name.starts_with(&pre))
+        .count()
+}
+
+/// The provider-scoped *total* a create aims for: `-n` is that total outright; `-a` adds
+/// to what this provider already has. One definition, used for both preview and executor,
+/// so they can never disagree about how big the create is.
+fn target_total(want: Want, pods: &[arena_core::Pod], provider_name: &str, prefix: &str) -> usize {
+    match want {
+        Want::Total(n) => n,
+        Want::Add(a) => provider_pod_count(pods, provider_name, prefix) + a,
+    }
+}
+
+/// A resolved create plan: the provider-scoped total to reach, plus the concrete new names
+/// to make this round (`target - have`, capped by free names). Built in ONE place
+/// (`plan_create`) so the dry-run preview, the `[y/N]` confirmation, and the `[created] …`
+/// lines are the *same* plan — not three independent recomputations that can drift apart
+/// (which is exactly how a confirmed "1 pod" turned into a 23-pod create).
+struct CreatePlan {
+    /// Provider-scoped total we're topping up to (carried into the retry loop).
+    target: usize,
+    /// New names to create this round.
+    names: Vec<String>,
+}
+
+/// Resolve a `-n`/`-a` request into a concrete [`CreatePlan`] against the current fleet.
+/// Lists pods (failing closed — a failed list could otherwise duplicate pods) and picks
+/// the next free machine names for the shortfall.
+async fn plan_create(provider: &dyn Provider, cfg: &Config, want: Want) -> Result<CreatePlan> {
     let policy = arena_core::retry::RetryPolicy::default();
     let existing = arena_core::retry::retrying(&policy, || provider.list_pods())
         .await
@@ -607,26 +644,15 @@ async fn plan_names(provider: &dyn Provider, cfg: &Config, want: Want) -> Result
              create duplicate pods)",
         )?;
     let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
-    // `-n` is a target total: create only enough to top up to it. `-a` adds outright.
-    let to_create = match want {
-        Want::Add(a) => a,
-        Want::Total(n) => {
-            // Count only the chosen --provider's pods, so "top up to N" tops up that
-            // provider — `existing` now spans the whole fleet, so an unrelated hetzner
-            // pod mustn't shrink a runpod top-up.
-            let have = existing
-                .iter()
-                .filter(|p| p.provider.as_str() == provider.name() && p.name.starts_with(&format!("{prefix}-")))
-                .count();
-            if n <= have {
-                eprintln!("already have {have} {} pod(s) (target {n}) — nothing to create", provider.name());
-                return Ok(Vec::new());
-            }
-            n - have
+    let have = provider_pod_count(&existing, provider.name(), prefix);
+    let target = target_total(want, &existing, provider.name(), prefix);
+    if let Want::Total(n) = want {
+        if n <= have {
+            eprintln!("already have {have} {} pod(s) (target {n}) — nothing to create", provider.name());
         }
-    };
-    // `existing` already spans every provider, so a name live on another backend won't be
-    // reused here.
+    }
+    let to_create = target.saturating_sub(have);
+    // `existing` spans every provider, so a name live on another backend won't be reused.
     let names = arena_core::naming::next_free_names(prefix, &cfg.machine_names, &existing, to_create);
     if names.len() < to_create {
         eprintln!(
@@ -634,7 +660,7 @@ async fn plan_names(provider: &dyn Provider, cfg: &Config, want: Want) -> Result
             names.len()
         );
     }
-    Ok(names)
+    Ok(CreatePlan { target, names })
 }
 
 /// Resolve operator-supplied machine names for `create <names…>`: prefix bare names
@@ -736,39 +762,24 @@ fn spec_with_overrides(cfg: &Config, ov: &SpecOverrides) -> PodSpec {
 async fn create_with_retry(
     provider: &dyn Provider,
     cfg: &Config,
-    want: Want,
+    initial: Vec<String>,
+    target: usize,
     ov: &SpecOverrides,
     keep_trying: bool,
     retry_mins: u64,
     retry_secs: u64,
 ) -> Result<Vec<arena_core::Pod>> {
-    // Fix a target *total* so each round only creates what's still missing. For -a,
-    // the target is "what we have right now plus N".
-    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena").to_string();
-    let target = match want {
-        Want::Total(n) => n,
-        Want::Add(a) => {
-            // Count only THIS provider's pods, matching how plan_names(Total) tops up
-            // below. `list_pods()` spans the whole fleet, so without the provider filter
-            // the target would include every other backend's pods (e.g. all the runpod
-            // GPU pods), and the hetzner top-up — which sees only hetzner pods — would try
-            // to create the entire difference. (`-a 1 --provider hetzner` once tried to
-            // make ~23 pods this way.)
-            let policy = arena_core::retry::RetryPolicy::default();
-            let pods = arena_core::retry::retrying(&policy, || provider.list_pods()).await?;
-            pods.iter()
-                .filter(|p| p.provider.as_str() == provider.name() && p.name.starts_with(&format!("{prefix}-")))
-                .count()
-                + a
-        }
-    };
+    // Round 1 creates exactly the names that were previewed + confirmed, so the
+    // `[created] …` output matches the `[y/N]` prompt. `target` (a provider-scoped total,
+    // computed once in plan_create) bounds the whole operation: retries only ever re-plan
+    // toward it, so a top-up can never balloon past what the operator agreed to.
     let retry_secs = retry_secs.max(1);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(retry_mins * 60);
     let mut all: Vec<arena_core::Pod> = Vec::new();
+    let mut names = initial;
     let mut round = 0u32;
     loop {
         round += 1;
-        let names = plan_names(provider, cfg, Want::Total(target)).await?;
         if names.is_empty() {
             break; // target reached (or no free names left)
         }
@@ -784,17 +795,20 @@ async fn create_with_retry(
             eprintln!("retry window ({retry_mins}m) elapsed — have {} of {target}", all.len());
             break;
         }
-        let have = target.saturating_sub(names.len() - got);
         eprintln!(
-            "round {round}: {have}/{target} pods (capacity short); retrying in {retry_secs}s (Ctrl+C to stop)…"
+            "round {round}: {} short of target {target} (capacity); retrying in {retry_secs}s (Ctrl+C to stop)…",
+            names.len() - got
         );
-        tokio::select! {
-            _ = tokio::time::sleep(std::time::Duration::from_secs(retry_secs)) => {}
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!("interrupted — stopping retries with {} of {target}", all.len());
-                break;
-            }
+        let interrupted = tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(retry_secs)) => false,
+            _ = tokio::signal::ctrl_c() => true,
+        };
+        if interrupted {
+            eprintln!("interrupted — stopping retries with {} of {target}", all.len());
+            break;
         }
+        // Re-plan toward the SAME target so the next round only fills the shortfall.
+        names = plan_create(provider, cfg, Want::Total(target)).await?.names;
     }
     Ok(all)
 }
@@ -2361,13 +2375,16 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image };
             // Explicit names take a different path than the -n/-a top-up: create exactly
             // those (minus any that already exist), no name allocation.
+            let mut topup_target = 0usize; // provider-scoped total for the -n/-a retry loop
             let names = if !names.is_empty() {
                 if count.is_some() || add.is_some() {
                     anyhow::bail!("pass explicit names OR -n/-a, not both");
                 }
                 resolve_explicit_names(provider, cfg, &names).await?
             } else {
-                plan_names(provider, cfg, resolve_want(count, add)?).await?
+                let plan = plan_create(provider, cfg, resolve_want(count, add)?).await?;
+                topup_target = plan.target;
+                plan.names
             };
             if names.is_empty() {
                 eprintln!("nothing to create (target already met or no new names)");
@@ -2394,8 +2411,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             if count.is_none() && add.is_none() {
                 create_pods(provider, cfg, &names, keep_trying, &ov).await?;
             } else {
-                let want = resolve_want(count, add)?;
-                create_with_retry(provider, cfg, want, &ov, keep_trying, retry_mins, retry_secs).await?;
+                create_with_retry(provider, cfg, names, topup_target, &ov, keep_trying, retry_mins, retry_secs).await?;
             }
         }
 
@@ -2406,10 +2422,13 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             if explicit && (count.is_some() || add.is_some()) {
                 anyhow::bail!("pass explicit names OR -n/-a, not both");
             }
+            let mut topup_target = 0usize; // provider-scoped total for the -n/-a retry loop
             let names = if explicit {
                 resolve_explicit_names(provider, cfg, &names).await?
             } else {
-                plan_names(provider, cfg, resolve_want(count, add)?).await?
+                let plan = plan_create(provider, cfg, resolve_want(count, add)?).await?;
+                topup_target = plan.target;
+                plan.names
             };
             if names.is_empty() {
                 eprintln!("nothing to create (target already met or no free names)");
@@ -2450,7 +2469,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             let created = if explicit {
                 create_pods(provider, cfg, &names, keep_trying, &ov).await?
             } else {
-                create_with_retry(provider, cfg, resolve_want(count, add)?, &ov, keep_trying, retry_mins, retry_secs).await?
+                create_with_retry(provider, cfg, names, topup_target, &ov, keep_trying, retry_mins, retry_secs).await?
             };
             if created.is_empty() {
                 eprintln!("no pods were created — nothing to wait for");
@@ -4045,6 +4064,51 @@ mod tests {
         let r = provisioning_steps("runpod", &scfg, "arena8-apple", false, "/tmp/h.sh");
         assert!(matches!(&r[0], ProvisionStep::Scp { local, remote } if local == "/local/key" && remote == "/root/.ssh/id_ed25519"));
         assert!(matches!(&r[1], ProvisionStep::Run { cmd } if cmd.contains("git remote set-url")));
+    }
+
+    fn mk_pod(name: &str, provider: &str) -> arena_core::Pod {
+        arena_core::Pod {
+            id: name.into(),
+            name: name.into(),
+            provider: provider.into(),
+            status: "RUNNING".into(),
+            gpu_type: None,
+            cost_per_hr: None,
+            ssh_ip: None,
+            ssh_port: None,
+        }
+    }
+
+    #[test]
+    fn create_sizing_is_provider_scoped() {
+        use super::{provider_pod_count, target_total, Want};
+        // A realistic mixed fleet: many runpod GPU pods + a single hetzner pod. `list_pods()`
+        // returns this whole thing, which is what makes provider-scoping load-bearing.
+        let mut fleet: Vec<arena_core::Pod> =
+            (0..22).map(|i| mk_pod(&format!("arena8-gpu{i}"), "runpod")).collect();
+        fleet.push(mk_pod("arena8-flutter", "hetzner"));
+
+        // Counting is per-provider, not whole-fleet.
+        assert_eq!(provider_pod_count(&fleet, "hetzner", "arena8"), 1);
+        assert_eq!(provider_pod_count(&fleet, "runpod", "arena8"), 22);
+
+        // THE REGRESSION: `-a 1 --provider hetzner` targets hetzner's 1 + 1 = 2 (creates
+        // exactly 1) — NOT the whole-fleet 23 + 1 that once made it try to create ~23 pods.
+        assert_eq!(target_total(Want::Add(1), &fleet, "hetzner", "arena8"), 2);
+        assert_eq!(target_total(Want::Add(2), &fleet, "runpod", "arena8"), 24);
+        // `-n N` is an absolute total, independent of any other provider's pods.
+        assert_eq!(target_total(Want::Total(30), &fleet, "hetzner", "arena8"), 30);
+    }
+
+    #[test]
+    fn pod_count_excludes_other_prefixes_on_same_provider() {
+        use super::provider_pod_count;
+        let fleet = vec![
+            mk_pod("arena8-flutter", "hetzner"),
+            mk_pod("unrelated-box", "hetzner"), // same provider, different cohort prefix
+            mk_pod("arena8-bloom", "hetzner"),
+        ];
+        assert_eq!(provider_pod_count(&fleet, "hetzner", "arena8"), 2);
     }
 
     #[test]
