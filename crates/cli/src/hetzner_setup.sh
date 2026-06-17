@@ -85,12 +85,28 @@ source "$VENV/bin/activate"
 python -m pip --version >/dev/null 2>&1 || uv pip install pip >/dev/null 2>&1 || true
 
 echo "### 5/6 coding agents (claude code + codex)"
-# Both ship a node-free curl installer that drops a binary into ~/.local/bin (already on
-# PATH + in the rc files). Idempotent: skip if already present. Auth is separate — the
-# Claude Code OAuth token + ~/.claude.json onboarding come from `arena pods copy-keys`.
+# Node-free curl installers drop a binary into ~/.local/bin (already on PATH + in the rc
+# files). Idempotent: skip if already present. Auth is separate — the Claude Code OAuth
+# token + ~/.claude.json onboarding come from `arena pods copy-keys`.
 export PATH="$HOME/.local/bin:$PATH"
 command -v claude >/dev/null 2>&1 || curl -fsSL https://claude.ai/install.sh | bash || echo "WARN: claude install failed (continuing)"
-command -v codex  >/dev/null 2>&1 || curl -fsSL https://chatgpt.com/codex/install.sh | sh || echo "WARN: codex install failed (continuing)"
+install_codex() {
+    command -v codex >/dev/null 2>&1 && return 0
+    # Try the official installer first…
+    curl -fsSL https://chatgpt.com/codex/install.sh | sh >/dev/null 2>&1
+    command -v codex >/dev/null 2>&1 && return 0
+    # …it has a SHA-digest bug that fails on some hosts, so fall back to the prebuilt musl
+    # binary from the latest GitHub release.
+    case "$(uname -m)" in aarch64|arm64) a=aarch64 ;; *) a=x86_64 ;; esac
+    mkdir -p "$HOME/.local/bin" /tmp/cx
+    url=$(curl -fsSL https://api.github.com/repos/openai/codex/releases/latest \
+        | grep -oE "https://[^\"]*codex-${a}-unknown-linux-musl\.tar\.gz" | head -1)
+    [ -n "$url" ] || { echo "WARN: codex release asset not found (continuing)"; return 0; }
+    curl -fsSL "$url" | tar xz -C /tmp/cx 2>/dev/null
+    bin=$(find /tmp/cx -type f -name 'codex*' | head -1)
+    [ -n "$bin" ] && install -m755 "$bin" "$HOME/.local/bin/codex" || echo "WARN: codex install failed (continuing)"
+}
+install_codex
 
 echo "### 6/6 zsh + oh-my-zsh + dotfiles + MOTD (match the GPU pods)"
 apt-get install -y --no-install-recommends zsh figlet >/dev/null 2>&1 || true
