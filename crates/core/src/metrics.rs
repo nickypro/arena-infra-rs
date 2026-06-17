@@ -294,6 +294,13 @@ fn remote_command(opts: &ProbeOpts) -> String {
     s.push_str(&format!(
         "echo '{PROC_SENTINEL}'; nvidia-smi --query-compute-apps=pid,used_memory,process_name --format=csv,noheader,nounits 2>/dev/null; "
     ));
+    // The probe is a `;`-chain of independent reads, so its overall exit code is just the
+    // LAST command's. That last command is nvidia-smi, which doesn't exist on a CPU/Hetzner
+    // pod → exit 127 → `fetch` would mark the whole probe as failed and blank EVERY column
+    // (branch, disk, cpu, git) while the GPU cell shows "err". End on a guaranteed success
+    // so any reachable pod parses (missing fields stay None); a genuinely unreachable pod
+    // still fails earlier at the SSH layer (exit 255), which is the error we actually want.
+    s.push_str("true");
     s
 }
 
@@ -569,5 +576,9 @@ mod tests {
         assert!(cmd.contains("OPENROUTER_API_KEY|ANTHROPIC_API_KEY|OPENAI_API_KEY"));
         assert!(cmd.contains("'/root/.ssh/id_ed25519'"));
         assert!(cmd.contains("cat /tmp/p"));
+        // Must end on a guaranteed-success command so a CPU/Hetzner pod (no nvidia-smi,
+        // which would otherwise exit 127 as the chain's last command) isn't reported as a
+        // wholly-failed probe — see remote_command's trailing `true`.
+        assert!(cmd.trim_end().ends_with("true"));
     }
 }

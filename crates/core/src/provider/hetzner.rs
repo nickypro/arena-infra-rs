@@ -91,8 +91,27 @@ fn parse_server(v: &Value) -> Pod {
             .and_then(|t| t.get("name"))
             .and_then(Value::as_str)
             .map(String::from),
-        // Hetzner's server object doesn't carry an hourly price; leave it None.
-        cost_per_hr: None,
+        // Hourly price from the embedded server_type.prices (Hetzner returns them as
+        // strings, per location). Prefer the price for the server's own location, else the
+        // first listed; use gross (what's actually billed). EUR — the dashboard column is
+        // currency-agnostic, so it sits alongside runpod's USD as a plain cost/hr.
+        cost_per_hr: v.get("server_type").and_then(|t| t.get("prices")).and_then(Value::as_array).and_then(
+            |prices| {
+                let loc = v
+                    .get("datacenter")
+                    .and_then(|d| d.get("location"))
+                    .and_then(|l| l.get("name"))
+                    .and_then(Value::as_str);
+                prices
+                    .iter()
+                    .find(|p| p.get("location").and_then(Value::as_str) == loc)
+                    .or_else(|| prices.first())
+                    .and_then(|p| p.get("price_hourly"))
+                    .and_then(|h| h.get("gross").or_else(|| h.get("net")))
+                    .and_then(Value::as_str)
+                    .and_then(|s| s.parse::<f64>().ok())
+            },
+        ),
         ssh_ip: v
             .get("public_net")
             .and_then(|n| n.get("ipv4"))
