@@ -107,6 +107,9 @@ install_codex() {
     [ -n "$bin" ] && install -m755 "$bin" "$HOME/.local/bin/codex" || echo "WARN: codex install failed (continuing)"
 }
 install_codex
+# The shared dotfiles .zshrc does NOT put ~/.local/bin on PATH, so symlink the agents into
+# /usr/local/bin — on PATH for every shell (login, non-login, bash, zsh, `arena pods run`).
+for b in claude codex; do [ -e "$HOME/.local/bin/$b" ] && ln -sf "$HOME/.local/bin/$b" "/usr/local/bin/$b"; done
 
 echo "### 6/6 zsh + oh-my-zsh + dotfiles + MOTD (match the GPU pods)"
 apt-get install -y --no-install-recommends zsh figlet >/dev/null 2>&1 || true
