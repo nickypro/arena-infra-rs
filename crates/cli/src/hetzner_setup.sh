@@ -84,7 +84,15 @@ source "$VENV/bin/activate"
 # (matches the GPU arena-env). Idempotent + cheap, so it also back-fills snapshot-booted pods.
 python -m pip --version >/dev/null 2>&1 || uv pip install pip >/dev/null 2>&1 || true
 
-echo "### 5/5 zsh + oh-my-zsh + dotfiles + MOTD (match the GPU pods)"
+echo "### 5/6 coding agents (claude code + codex)"
+# Both ship a node-free curl installer that drops a binary into ~/.local/bin (already on
+# PATH + in the rc files). Idempotent: skip if already present. Auth is separate — the
+# Claude Code OAuth token + ~/.claude.json onboarding come from `arena pods copy-keys`.
+export PATH="$HOME/.local/bin:$PATH"
+command -v claude >/dev/null 2>&1 || curl -fsSL https://claude.ai/install.sh | bash || echo "WARN: claude install failed (continuing)"
+command -v codex  >/dev/null 2>&1 || curl -fsSL https://chatgpt.com/codex/install.sh | sh || echo "WARN: codex install failed (continuing)"
+
+echo "### 6/6 zsh + oh-my-zsh + dotfiles + MOTD (match the GPU pods)"
 apt-get install -y --no-install-recommends zsh figlet >/dev/null 2>&1 || true
 
 # Same dotfiles repo the GPU pods clone — so the shell is byte-for-byte identical.
