@@ -69,6 +69,39 @@ impl HetznerProvider {
     fn auth(&self, rb: RequestBuilder) -> RequestBuilder {
         rb.bearer_auth(&self.api_key)
     }
+
+    /// Current Hetzner status string for a server (e.g. "running", "off", "starting").
+    async fn server_status(&self, id: &str) -> Result<String> {
+        let resp = self
+            .auth(self.client.get(format!("{}/servers/{}", self.base, id)))
+            .send()
+            .await?;
+        let st = resp.status();
+        let body: Value = resp.json().await.unwrap_or(Value::Null);
+        if !st.is_success() {
+            return Err(Error::provider_http(st, &body, "hetzner get server"));
+        }
+        Ok(body
+            .get("server")
+            .and_then(|s| s.get("status"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string())
+    }
+
+    /// POST a power action (`reset`/`poweron`/`reboot`/`poweroff`) to a server.
+    async fn power_action(&self, id: &str, action: &str) -> Result<()> {
+        let resp = self
+            .auth(self.client.post(format!("{}/servers/{}/actions/{}", self.base, id, action)))
+            .send()
+            .await?;
+        let st = resp.status();
+        if !st.is_success() {
+            let body: Value = resp.json().await.unwrap_or(Value::Null);
+            return Err(Error::provider_http(st, &body, &format!("hetzner {action}")));
+        }
+        Ok(())
+    }
 }
 
 fn parse_server(v: &Value) -> Pod {
@@ -194,30 +227,20 @@ impl Provider for HetznerProvider {
     }
 
     async fn stop_pod(&self, id: &str) -> Result<()> {
-        let resp = self
-            .auth(self.client.post(format!("{}/servers/{}/actions/poweroff", self.base, id)))
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body: Value = resp.json().await.unwrap_or(Value::Null);
-            return Err(Error::provider_http(status, &body, "hetzner stop"));
-        }
-        Ok(())
+        self.power_action(id, "poweroff").await
     }
 
     async fn restart_pod(&self, id: &str) -> Result<()> {
-        // Clean OS reboot — preserves the VM and its disk.
-        let resp = self
-            .auth(self.client.post(format!("{}/servers/{}/actions/reboot", self.base, id)))
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body: Value = resp.json().await.unwrap_or(Value::Null);
-            return Err(Error::provider_http(status, &body, "hetzner reboot"));
+        // "Restart" must recover a pod *in place*, including a wedged one — and the disk is
+        // preserved either way. Hetzner's `reboot` is a soft ACPI signal that a hung OS just
+        // ignores (so it silently no-ops), which is why restart "didn't work". Use a hard
+        // `reset` (forced power-cycle) on a running server; a stopped server can't be reset,
+        // so bring it back up with `poweron`.
+        let status = self.server_status(id).await?;
+        match status.as_str() {
+            "off" | "stopped" => self.power_action(id, "poweron").await,
+            _ => self.power_action(id, "reset").await,
         }
-        Ok(())
     }
 
     async fn terminate_pod(&self, id: &str) -> Result<()> {
