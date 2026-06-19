@@ -387,6 +387,9 @@ enum PodCmd {
     /// up (use `pods backup` / `pods pull`).
     #[command(verbatim_doc_comment)]
     Setup {
+        /// Pods to provision (machine names, e.g. `bulk` / `bulk apple` / `arena8-bulk`).
+        /// Omit to provision the whole fleet.
+        names: Vec<String>,
         /// Preview only: print what would happen, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
@@ -1130,9 +1133,24 @@ async fn handle_setup(
             Err(_) => eprintln!("skip {} — no SSH endpoint yet", pod.name),
         }
     }
-    // Scope to a subset by name when asked (e.g. `up` provisions only what it created).
+    // Scope to a subset by name when asked (e.g. `up` provisions only what it created, or
+    // the operator passed explicit names). Warn about any requested name that matched no
+    // reachable pod (typo, terminated, or no SSH endpoint yet) instead of silently dropping
+    // it; if NONE matched, fail loudly rather than provisioning zero pods.
     if let Some(only) = only {
+        let reachable: std::collections::HashSet<&str> =
+            targets.iter().map(|(n, _, _)| n.as_str()).collect();
+        let missing: Vec<&str> =
+            only.iter().map(String::as_str).filter(|n| !reachable.contains(n)).collect();
+        if !missing.is_empty() {
+            eprintln!("warning: no reachable pod matched: {}", missing.join(", "));
+        }
         targets.retain(|(name, _, _)| only.iter().any(|n| n == name));
+        if targets.is_empty() {
+            anyhow::bail!(
+                "no reachable pod matched {only:?} (check the name(s) against `arena pods list`)"
+            );
+        }
     }
     if targets.is_empty() {
         println!("(no pods with an SSH endpoint to set up)");
@@ -2609,12 +2627,37 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                 handle_pull(provider, cfg, None, &dir, None, None, false, target.as_deref(), dry_run, true).await?;
             }
         }
-        PodCmd::Setup { dry_run, force, hf_token, cc_token } => {
-            if !dry_run && !confirm(yes, "Will provision each pod over SSH (deploy key, ~/.name, repo).")? {
+        PodCmd::Setup { names, dry_run, force, hf_token, cc_token } => {
+            // Normalize bare names to full ones (`bulk` -> `arena8-bulk`); empty = whole fleet.
+            let only: Option<Vec<String>> = if names.is_empty() {
+                None
+            } else {
+                let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
+                Some(
+                    names
+                        .iter()
+                        .map(|n| {
+                            let n = n.trim();
+                            if n.starts_with(&format!("{prefix}-")) {
+                                n.to_string()
+                            } else {
+                                format!("{prefix}-{n}")
+                            }
+                        })
+                        .collect(),
+                )
+            };
+            let scope = match &only {
+                Some(v) => format!("{} pod(s) ({})", v.len(), v.join(", ")),
+                None => "each pod".to_string(),
+            };
+            if !dry_run
+                && !confirm(yes, &format!("Will provision {scope} over SSH (deploy key, ~/.name, repo)."))?
+            {
                 println!("aborted.");
                 return Ok(());
             }
-            handle_setup(provider, cfg, !dry_run, force, hf_token, cc_token, None).await?;
+            handle_setup(provider, cfg, !dry_run, force, hf_token, cc_token, only.as_deref()).await?;
         }
         PodCmd::SetBranch { branch, target, all, hard, dry_run } => {
             handle_set_branch(provider, cfg, &branch, target.as_deref(), all, hard, dry_run, yes).await?;
