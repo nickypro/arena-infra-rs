@@ -3169,6 +3169,36 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Build the remote command that wires up *fleet* SSH on a pod: authorize every fleet
+/// pubkey for incoming SSH (arena8 + arena_infra + admin), and write the fleet host map
+/// into a managed block in `~/.ssh/config` so the pod can `ssh <prefix>-<peer>` any other
+/// pod (using its arena_infra key, `id_ed25519`). Idempotent — re-running refreshes the
+/// block and skips already-present authorized keys, and it preserves other `~/.ssh/config`
+/// blocks (e.g. the github.com deploy-key block `setup` writes).
+fn fleet_ssh_command(pubkeys: &[String], rendered_config: &str) -> String {
+    let mut cmd = String::from(
+        "mkdir -p \"$HOME/.ssh\" && chmod 700 \"$HOME/.ssh\" && \
+         touch \"$HOME/.ssh/authorized_keys\" && chmod 600 \"$HOME/.ssh/authorized_keys\"",
+    );
+    for pk in pubkeys {
+        let q = shell_quote(pk.trim());
+        cmd.push_str(&format!(
+            "; (grep -qxF {q} \"$HOME/.ssh/authorized_keys\" || echo {q} >> \"$HOME/.ssh/authorized_keys\")"
+        ));
+    }
+    cmd.push_str("; touch \"$HOME/.ssh/config\" && chmod 600 \"$HOME/.ssh/config\"");
+    cmd.push_str(
+        "; sed -i '/^# BEGIN arena-infra fleet/,/^# END arena-infra fleet/d' \"$HOME/.ssh/config\"",
+    );
+    cmd.push_str("; cat >> \"$HOME/.ssh/config\" <<'ARENAFLEETCFG'\n# BEGIN arena-infra fleet\n");
+    cmd.push_str(rendered_config);
+    if !rendered_config.ends_with('\n') {
+        cmd.push('\n');
+    }
+    cmd.push_str("# END arena-infra fleet\nARENAFLEETCFG");
+    cmd
+}
+
 /// The local directory `pods pull` rsyncs into: config `LOCAL_BACKUP_DIR`, else `./backup`.
 fn local_backup_dir(cfg: &Config) -> String {
     cfg.get("LOCAL_BACKUP_DIR").filter(|s| !s.is_empty()).unwrap_or("./backup").to_string()
@@ -3507,6 +3537,25 @@ async fn handle_copy_keys(
         );
     }
 
+    // Also wire fleet SSH on every reachable pod: authorize the fleet pubkeys (arena8 +
+    // arena_infra + admin) and write the host map into ~/.ssh/config so pods can ssh each
+    // other with the arena_infra key. Prefer the stable proxy layout (survives restarts);
+    // fall back to live endpoints if no proxy is configured. Built once — same on every pod.
+    let fleet_pubkeys = arena_core::ssh::authorized_pubkeys(cfg);
+    let ssh_user = cfg.get("SSH_USER").unwrap_or("root");
+    let pod_identity = cfg.get("GIT_SSH_KEY_REMOTE").unwrap_or("/root/.ssh/id_ed25519");
+    let fleet_cfg = match arena_core::proxy::ProxyConfig::from_config(cfg) {
+        Ok(px) if !cfg.machine_names.is_empty() => arena_core::sshconfig::render_proxy(
+            prefix, ssh_user, pod_identity, &px.proxy_host, px.starting_port, &cfg.machine_names,
+        ),
+        _ => arena_core::sshconfig::render_manual(prefix, ssh_user, pod_identity, &pods),
+    };
+    let fleet_ssh = fleet_ssh_command(&fleet_pubkeys, &fleet_cfg);
+    println!(
+        "Also: authorize {} fleet key(s) + write ~/.ssh/config so pods can ssh each other.",
+        fleet_pubkeys.len()
+    );
+
     if dry_run {
         println!("Dry-run — would set on {} pod(s) (values redacted):\n", jobs.len());
         for (name, _, vars) in &jobs {
@@ -3516,7 +3565,7 @@ async fn handle_copy_keys(
         println!("\nPreview only — run without --dry-run to write to ~/.bashrc & ~/.zshrc.");
         return Ok(());
     }
-    if !confirm(yes, &format!("Will export API keys into ~/.bashrc & ~/.zshrc on {} pod(s).", jobs.len()))? {
+    if !confirm(yes, &format!("Will export API keys into ~/.bashrc & ~/.zshrc, authorize the fleet keys, and write ~/.ssh/config on {} pod(s).", jobs.len()))? {
         println!("aborted.");
         return Ok(());
     }
@@ -3524,7 +3573,8 @@ async fn handle_copy_keys(
     let total = jobs.len();
     let mut set = tokio::task::JoinSet::new();
     for (name, t, vars) in jobs {
-        let cmd = apikeys::remote_export_command(&vars);
+        // Tokens (export lines) + fleet SSH (authorized_keys + ~/.ssh/config) in one round-trip.
+        let cmd = format!("{}; {}", apikeys::remote_export_command(&vars), fleet_ssh);
         set.spawn(async move { (name, ssh::run(&t, &cmd).await) });
     }
     let (mut ok, mut failed, mut done) = (0, 0, 0);

@@ -199,7 +199,11 @@ pub fn public_key_for(private_path: &str) -> Option<String> {
 /// (The provider's own account key — e.g. `arena_admin` — is injected automatically.)
 pub fn authorized_pubkeys(cfg: &Config) -> Vec<String> {
     let mut out = Vec::new();
-    for key in ["SHARED_SSH_KEY_PATH", "GIT_SSH_KEY_LOCAL"] {
+    // SHARED_SSH_KEY_PATH = the cohort key (arena8), GIT_SSH_KEY_LOCAL = the persistent
+    // deploy key (arena_infra), ADMIN_SSH_KEY_PATH = the ops/admin key. All three are
+    // authorized for incoming SSH so the control plane, git, AND an admin can reach pods —
+    // and (via the fleet ssh-config) pods can reach each other with the arena_infra key.
+    for key in ["SHARED_SSH_KEY_PATH", "GIT_SSH_KEY_LOCAL", "ADMIN_SSH_KEY_PATH"] {
         if let Some(p) = cfg.get(key).filter(|s| !s.is_empty()) {
             if let Some(pk) = public_key_for(p) {
                 if !out.contains(&pk) {
