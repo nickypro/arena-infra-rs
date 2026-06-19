@@ -2613,7 +2613,15 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             let what = if no_pull {
                 format!("commit + push {scope} on its current branch (main/master skipped)")
             } else {
-                format!("commit + push {scope} (git), then rsync the home(s) to {}", local_backup_dir(cfg))
+                // Show the real destination subfolder (base/<wNdM>/<pod>) so it's clear where
+                // the rsync lands; fall back to just the base if the wNdM label can't be
+                // computed (e.g. ARENA_START_DATE unset).
+                let base = local_backup_dir(cfg);
+                let dest = match resolve_week_day(cfg, None, None) {
+                    Ok((w, d)) => format!("{base}/w{w}d{d}/<pod>"),
+                    Err(_) => base,
+                };
+                format!("commit + push {scope} (git), then rsync the home(s) to {dest}")
             };
             if !dry_run && !confirm(yes, &format!("Will {what}."))? {
                 println!("aborted.");
