@@ -47,6 +47,10 @@ impl Default for PullConfig {
                 "huggingface/".to_string(),  // HuggingFace cache (alt HF_HOME layout)
                 "venv/".to_string(),         // non-dot python virtualenvs
                 "node_modules/".to_string(), // npm deps
+                // Scratch dir for sweeps/RLVR runs — deliberately NOT backed up (these
+                // outputs are large + reproducible/wandb-logged). zebra's orchestrator is
+                // told to do all its run work here.
+                "TEMP_FOLDER_FOR_SWEEPS/".to_string(),
             ],
             remote_path: String::new(),
         }
