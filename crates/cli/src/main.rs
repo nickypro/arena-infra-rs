@@ -2627,13 +2627,17 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                 println!("aborted.");
                 return Ok(());
             }
-            // 1) git push, then 2) rsync file backup (unless --no-pull). Already confirmed.
-            handle_backup(provider, cfg, !dry_run, message, target.as_deref()).await?;
+            // 1) git push, then 2) rsync file backup (unless --no-pull). The file backup is
+            // INDEPENDENT of git, so a git failure on one pod (e.g. a missing repo, or a pod
+            // sitting on main) must NOT skip the rsync for the whole fleet. Capture the git
+            // result, always run the pull, then surface the git error at the end.
+            let git_result = handle_backup(provider, cfg, !dry_run, message, target.as_deref()).await;
             if !no_pull {
                 println!();
                 let dir = local_backup_dir(cfg);
                 handle_pull(provider, cfg, None, &dir, None, None, false, target.as_deref(), dry_run, true).await?;
             }
+            git_result?;
         }
         PodCmd::Setup { names, dry_run, force, hf_token, cc_token } => {
             // Normalize bare names to full ones (`bulk` -> `arena8-bulk`); empty = whole fleet.
