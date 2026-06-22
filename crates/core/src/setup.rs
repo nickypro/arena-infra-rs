@@ -147,6 +147,21 @@ impl SetupConfig {
                 q(&format!("export MACHINE_NAME='{}'", self.short_name(machine_name)))
             ),
         ];
+        // Coding agents (claude code + codex) + tmux. All idempotent; the whole block runs in
+        // a `set +e` subshell ending in `|| true`, so a flaky installer never aborts setup.
+        // Node-free curl installers drop into ~/.local/bin; symlink into /usr/local/bin since
+        // the dotfiles .zshrc doesn't put ~/.local/bin on PATH. Codex's official installer has
+        // a SHA-digest bug on some hosts, so fall back to the prebuilt GitHub release.
+        steps.push(
+            r#"( set +e
+export PATH="$HOME/.local/bin:$PATH"
+command -v tmux >/dev/null 2>&1 || apt-get install -y -qq tmux >/dev/null 2>&1 || { apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq tmux >/dev/null 2>&1; }
+command -v claude >/dev/null 2>&1 || curl -fsSL https://claude.ai/install.sh | bash >/dev/null 2>&1
+command -v codex >/dev/null 2>&1 || curl -fsSL https://chatgpt.com/codex/install.sh | sh >/dev/null 2>&1
+if ! command -v codex >/dev/null 2>&1; then case "$(uname -m)" in aarch64|arm64) a=aarch64;; *) a=x86_64;; esac; mkdir -p "$HOME/.local/bin" /tmp/cx; url=$(curl -fsSL https://api.github.com/repos/openai/codex/releases/latest | grep -oE 'https://[^"]*codex-'"$a"'-unknown-linux-musl\.tar\.gz' | head -1); [ -n "$url" ] && curl -fsSL "$url" | tar xz -C /tmp/cx 2>/dev/null && bin=$(find /tmp/cx -type f -name 'codex*' | head -1) && [ -n "$bin" ] && install -m755 "$bin" "$HOME/.local/bin/codex"; fi
+for b in claude codex; do [ -e "$HOME/.local/bin/$b" ] && ln -sf "$HOME/.local/bin/$b" /usr/local/bin/$b; done
+) || true"#.to_string(),
+        );
         // Optional: export broadcast tokens (Hugging Face, Claude Code) into the login
         // shells, idempotently, so participants get gated-repo / Claude Code access.
         if !self.broadcast_exports.is_empty() {

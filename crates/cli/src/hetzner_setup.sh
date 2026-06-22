@@ -21,7 +21,7 @@ VENV="$REPO_DIR/.venv"
 echo "### 1/5 system packages"
 apt-get update -qq
 apt-get install -y --no-install-recommends \
-    build-essential ffmpeg git curl wget ca-certificates libosmesa6 jq zsh \
+    build-essential ffmpeg git curl wget ca-certificates libosmesa6 jq zsh tmux \
     python3-dev pkg-config
 
 echo "### 2/5 docker + docker compose"
