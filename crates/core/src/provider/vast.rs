@@ -334,6 +334,7 @@ mod tests {
             volume_gb: 0,
             ports: "8888/http,22/tcp".into(),
             env: vec![],
+            docker_args: None,
         }
     }
 

@@ -29,6 +29,12 @@ pub struct PodSpec {
     /// e.g. "8888/http,22/tcp"
     pub ports: String,
     pub env: Vec<(String, String)>,
+    /// Optional container start command as an argv (RunPod REST `dockerStartCmd`, which
+    /// overrides the image's CMD but keeps its ENTRYPOINT). `None` => use the image's own
+    /// CMD (correct for the prebuilt arena image, which already starts sshd). `Some(..)`
+    /// overrides it — e.g. the `--bootstrap` start script (`["bash","-c", …]`) that installs
+    /// + launches sshd on a non-arena base image (NVIDIA NGC, etc.) so the pod is reachable.
+    pub docker_args: Option<Vec<String>>,
 }
 
 impl PodSpec {
@@ -62,6 +68,7 @@ impl PodSpec {
             volume_gb: first_parsed(&["VOLUME_GB", "RUNPOD_VOLUME_SPACE_IN_GB"], 0),
             ports: "8888/http,22/tcp".to_string(),
             env,
+            docker_args: None,
         }
     }
 }

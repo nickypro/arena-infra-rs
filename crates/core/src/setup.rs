@@ -38,6 +38,10 @@ pub struct SetupConfig {
     /// Broadcast token exports `(env name, value)` to write into the login shells
     /// (e.g. Hugging Face + Claude Code, from config). Empty => the token step is skipped.
     pub broadcast_exports: Vec<(String, String)>,
+    /// `--zsh-install`: install zsh, make it the login shell, and drop an idempotent
+    /// `.zshrc` that activates the arena env. Off by default (the prebuilt arena image
+    /// already ships zsh); useful on a bare/non-arena base image.
+    pub zsh_install: bool,
 }
 
 impl SetupConfig {
@@ -68,6 +72,7 @@ impl SetupConfig {
             prefix: cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena").to_string(),
             authorized_pubkeys: crate::ssh::authorized_pubkeys(cfg),
             broadcast_exports: crate::apikeys::broadcast_env_vars(|k| cfg.get(k).map(String::from)),
+            zsh_install: false,
         })
     }
 
@@ -132,16 +137,31 @@ impl SetupConfig {
             )
         };
 
+        // The repo update only applies when the ARENA checkout is actually on the image
+        // (the prebuilt arena image bakes it in at `repo_path`). On a non-arena base image
+        // (e.g. an NVIDIA NGC image brought up with `--bootstrap`) it's absent — skip the
+        // git steps with a notice instead of `cd`-ing into a missing dir and aborting the
+        // whole setup under `set -e`. Everything else (SSH keys, ~/.name, agents, zsh,
+        // tokens) still runs. The then-branch runs under the outer `set -e`, so a real git
+        // failure on an arena pod still fails loudly.
+        let repo_block = format!(
+            "if [ -d {repo}/.git ]; then cd {repo}; git remote set-url origin {url}; \
+             git fetch origin; {git_update}; git submodule update --init --recursive; \
+             else echo {skip} >&2; fi",
+            repo = q(&self.repo_path),
+            url = q(&self.repo_url),
+            skip = q(&format!(
+                "arena setup: {} not present — skipping repo update (non-arena image)",
+                self.repo_path
+            )),
+        );
+
         let mut steps = vec![
             "set -e".to_string(),
             format!("chmod 600 {}", q(key)),
             ssh_config,
             authorized_keys,
-            format!("cd {}", q(&self.repo_path)),
-            format!("git remote set-url origin {}", q(&self.repo_url)),
-            "git fetch origin".to_string(),
-            git_update,
-            "git submodule update --init --recursive".to_string(),
+            repo_block,
             format!(
                 "echo {} > \"$HOME/.name\"",
                 q(&format!("export MACHINE_NAME='{}'", self.short_name(machine_name)))
@@ -162,6 +182,36 @@ if ! command -v codex >/dev/null 2>&1; then case "$(uname -m)" in aarch64|arm64)
 for b in claude codex; do [ -e "$HOME/.local/bin/$b" ] && ln -sf "$HOME/.local/bin/$b" /usr/local/bin/$b; done
 ) || true"#.to_string(),
         );
+        // Optional (`--zsh-install`): the same shell the GPU pods get — zsh + oh-my-zsh +
+        // powerlevel10k + the shared `nickypro/arena-infra` dotfiles, with zsh as the login
+        // shell. Mirrors the hetzner `hetzner_setup.sh` "6/6" block, minus the ARENA_3.0
+        // checkout and venv/conda activation (this path is for non-arena base images that
+        // don't have conda). The whole thing is a `set +e … || true` subshell so a missing
+        // apt mirror / network blip never aborts the rest of setup. The cp'd dotfiles
+        // .zshrc ends in a bare `conda activate arena-env`; we guard it with `command -v
+        // conda` so a no-conda image doesn't print a "command not found" on every shell.
+        if self.zsh_install {
+            steps.push(
+                r#"( set +e
+export DEBIAN_FRONTEND=noninteractive
+command -v zsh >/dev/null 2>&1 || apt-get install -y -qq zsh figlet >/dev/null 2>&1 || { apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq zsh figlet >/dev/null 2>&1; }
+[ -d "$HOME/.arena_infra" ] || git clone --depth 1 https://github.com/nickypro/arena-infra "$HOME/.arena_infra" >/dev/null 2>&1
+if [ ! -d "$HOME/.oh-my-zsh" ]; then RUNZSH=no CHSH=no sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended >/dev/null 2>&1; fi
+ZSH_CUSTOM="${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}"
+cl() { [ -d "$2" ] || git clone --depth 1 "$1" "$2" >/dev/null 2>&1; }
+cl https://github.com/romkatv/powerlevel10k.git              "$ZSH_CUSTOM/themes/powerlevel10k"
+cl https://github.com/zsh-users/zsh-autosuggestions.git      "$ZSH_CUSTOM/plugins/zsh-autosuggestions"
+cl https://github.com/zsh-users/zsh-syntax-highlighting.git  "$ZSH_CUSTOM/plugins/zsh-syntax-highlighting"
+cl https://github.com/zsh-users/zsh-history-substring-search "$ZSH_CUSTOM/plugins/zsh-history-substring-search"
+cl https://github.com/zsh-users/zsh-completions              "$ZSH_CUSTOM/plugins/zsh-completions"
+[ -f "$HOME/.arena_infra/dotfiles/.vimrc" ]    && ln -sf "$HOME/.arena_infra/dotfiles/.vimrc"    "$HOME/.vimrc"
+[ -f "$HOME/.arena_infra/dotfiles/.p10k.zsh" ] && ln -sf "$HOME/.arena_infra/dotfiles/.p10k.zsh" "$HOME/.p10k.zsh"
+[ -f "$HOME/.arena_infra/dotfiles/.zshrc" ]    && cp -f "$HOME/.arena_infra/dotfiles/.zshrc"     "$HOME/.zshrc"
+[ -f "$HOME/.zshrc" ] && sed -i 's/^conda activate arena-env$/command -v conda >\/dev\/null 2>\&1 \&\& conda activate arena-env/' "$HOME/.zshrc"
+ZSH_BIN=$(command -v zsh); [ -n "$ZSH_BIN" ] && chsh -s "$ZSH_BIN" "$(id -un)" >/dev/null 2>&1
+) || true"#.to_string(),
+            );
+        }
         // Optional: export broadcast tokens (Hugging Face, Claude Code) into the login
         // shells, idempotently, so participants get gated-repo / Claude Code access.
         if !self.broadcast_exports.is_empty() {
@@ -197,6 +247,7 @@ mod tests {
             prefix: "arena8".into(),
             authorized_pubkeys: vec!["ssh-ed25519 AAAASHARED shared".into()],
             broadcast_exports: Vec::new(),
+            zsh_install: false,
         }
     }
 
@@ -217,7 +268,9 @@ mod tests {
         assert!(c.contains("grep -qxF 'ssh-ed25519 AAAASHARED shared'"));
         assert!(c.contains("ssh-keygen -y -f /root/.ssh/id_ed25519"));
         assert!(c.contains(r#"grep -qxF "$PUB" "$HOME/.ssh/authorized_keys""#));
-        // repo wiring
+        // repo wiring — guarded so a missing checkout (non-arena image) skips, not aborts
+        assert!(c.contains("if [ -d '/root/ARENA_3.0'/.git ]; then cd '/root/ARENA_3.0'"));
+        assert!(c.contains("not present — skipping repo update"));
         assert!(c.contains("git remote set-url origin 'git@github.com:styme3279/ARENA_3.0.git'"));
         assert!(c.contains("git fetch origin"));
         assert!(c.contains("git submodule update --init --recursive"));
@@ -232,6 +285,29 @@ mod tests {
     fn force_hard_resets_to_default_branch() {
         let c = cfg().remote_command("arena8-apple", true);
         assert!(c.contains("git checkout 'main' && git reset --hard origin/'main'"));
+    }
+
+    #[test]
+    fn zsh_install_off_by_default_on_when_set() {
+        // Off: no zsh step at all.
+        let off = cfg().remote_command("arena8-apple", false);
+        assert!(!off.contains("install -y -qq zsh"));
+        assert!(!off.contains(".arena_infra"));
+        // On: installs zsh, clones the shared dotfiles + oh-my-zsh/p10k, sets the login
+        // shell, and guards the dotfiles' conda activation for no-conda images.
+        let mut c = cfg();
+        c.zsh_install = true;
+        let on = c.remote_command("arena8-apple", false);
+        assert!(on.contains("install -y -qq zsh figlet"));
+        assert!(on.contains("git clone --depth 1 https://github.com/nickypro/arena-infra"));
+        assert!(on.contains("tools/install.sh")); // oh-my-zsh
+        assert!(on.contains("themes/powerlevel10k"));
+        assert!(on.contains(r#"cp -f "$HOME/.arena_infra/dotfiles/.zshrc""#));
+        // bare `conda activate` is rewritten to a guarded form, never left unguarded.
+        assert!(on.contains(r"s/^conda activate arena-env$/command -v conda"));
+        assert!(on.contains(r#"chsh -s "$ZSH_BIN""#));
+        // no ARENA_3.0 checkout / venv activation on this path.
+        assert!(!on.contains("/opt/arena-env/bin/activate"));
     }
 
     #[test]

@@ -30,7 +30,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseButton, MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -147,6 +150,10 @@ struct Ui {
     marked: std::collections::HashSet<String>,
     /// Scroll offset for the result modal (so long fleet outputs are readable).
     result_scroll: u16,
+    /// The pods table's last-rendered `(area, scroll_offset)`, set by `pods_table` each
+    /// frame so mouse clicks can be mapped back to a pod row. Cell because `view` borrows
+    /// `&Ui` (the TUI is single-threaded, so interior mutability is safe here).
+    last_table: std::cell::Cell<(Rect, usize)>,
 }
 
 impl Ui {
@@ -203,6 +210,7 @@ async fn main() -> Result<()> {
         selected: 0,
         marked: std::collections::HashSet::new(),
         result_scroll: 0,
+        last_table: std::cell::Cell::new((Rect::default(), 0)),
     };
 
     let mut terminal = setup_terminal()?;
@@ -323,15 +331,73 @@ fn status_line(s: &FleetSummary) -> String {
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut out = stdout();
-    execute!(out, EnterAlternateScreen)?;
+    // EnableMouseCapture: wheel-scroll the list + click to select/multi-select rows.
+    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
     Ok(Terminal::new(CrosstermBackend::new(out))?)
 }
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+/// Mouse handling: wheel-scroll the pod list (or the result modal), and in the list
+/// left-click a row to select it. Clicking the far-left of a row — or shift-clicking
+/// anywhere on it — toggles that pod's multi-select mark (same `marked` set as `space`).
+fn handle_mouse(m: MouseEvent, ui: &mut Ui, shared: &Arc<Mutex<Shared>>) {
+    let in_list = matches!(ui.mode, Mode::List);
+    let in_result = matches!(ui.mode, Mode::Result(_));
+    match m.kind {
+        MouseEventKind::ScrollUp => {
+            if in_result {
+                ui.result_scroll = ui.result_scroll.saturating_sub(1);
+            } else if in_list {
+                ui.selected = ui.selected.saturating_sub(1);
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if in_result {
+                ui.result_scroll = ui.result_scroll.saturating_add(1);
+            } else if in_list {
+                let len = shared.lock().unwrap().pods.len();
+                if len > 0 {
+                    ui.selected = (ui.selected + 1).min(len - 1);
+                }
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            if !in_list {
+                return;
+            }
+            let (area, offset) = ui.last_table.get();
+            // Data rows sit below the top border (1) + header (1), above the bottom border.
+            let rows_top = area.y.saturating_add(2);
+            let rows_bot = area.y.saturating_add(area.height).saturating_sub(1);
+            let (mx, my) = (m.column, m.row);
+            if my < rows_top || my >= rows_bot || mx < area.x || mx >= area.x.saturating_add(area.width)
+            {
+                return; // click outside the table rows
+            }
+            let idx = offset + (my - rows_top) as usize;
+            let id = {
+                let s = shared.lock().unwrap();
+                if idx >= s.pods.len() {
+                    return;
+                }
+                s.pods[idx].id.clone()
+            };
+            ui.selected = idx;
+            // Far-left of the row, or shift-click, toggles the multi-select mark.
+            let left_zone = mx < area.x.saturating_add(5);
+            let shift = m.modifiers.contains(KeyModifiers::SHIFT);
+            if (left_zone || shift) && !ui.marked.remove(&id) {
+                ui.marked.insert(id);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Read the currently selected pod (a clone, so we don't hold the lock).
@@ -457,7 +523,12 @@ async fn run(
         if !event::poll(Duration::from_millis(150))? {
             continue;
         }
-        let Event::Key(k) = event::read()? else { continue };
+        let ev = event::read()?;
+        if let Event::Mouse(m) = ev {
+            handle_mouse(m, &mut ui, shared);
+            continue; // redraw at the top of the loop
+        }
+        let Event::Key(k) = ev else { continue };
         if k.kind != KeyEventKind::Press {
             continue; // ignore key-release/repeat on terminals that emit them
         }
@@ -1572,6 +1643,9 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
         ts.select(Some(ui.selected.min(shared.pods.len() - 1)));
     }
     f.render_stateful_widget(table, area, &mut ts);
+    // Record where the rows landed (area + the scroll offset ratatui chose) so a mouse
+    // click can be mapped back to a pod index.
+    ui.last_table.set((area, ts.offset()));
 }
 
 /// When the pod's repo was last committed (= last backup, since `pods backup` commits +

@@ -295,8 +295,15 @@ enum PodCmd {
         #[arg(long)]
         volume: Option<u32>,
         /// Docker image (overrides config IMAGE/RUNPOD_DOCKER_IMAGE).
+        /// NOTE: for a custom (non-arena) image you probably want --bootstrap too,
+        /// or the pod won't come up SSH-reachable.
         #[arg(long)]
         image: Option<String>,
+        /// Set a start command that installs + launches sshd on boot, so a non-arena base
+        /// image (e.g. an NVIDIA NGC image) is SSH-reachable. The prebuilt arena image
+        /// doesn't need this.
+        #[arg(long)]
+        bootstrap: bool,
         /// Preview only: print what would happen, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
@@ -338,8 +345,15 @@ enum PodCmd {
         #[arg(long)]
         volume: Option<u32>,
         /// Docker image (overrides config IMAGE/RUNPOD_DOCKER_IMAGE).
+        /// NOTE: for a custom (non-arena) image you probably want --bootstrap too,
+        /// or the pod won't come up SSH-reachable.
         #[arg(long)]
         image: Option<String>,
+        /// Set a start command that installs + launches sshd on boot, so a non-arena base
+        /// image (e.g. an NVIDIA NGC image) is SSH-reachable. The prebuilt arena image
+        /// doesn't need this.
+        #[arg(long)]
+        bootstrap: bool,
         /// Preview only: print what would happen, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
@@ -402,6 +416,11 @@ enum PodCmd {
         /// Claude Code OAuth token to broadcast (overrides config CLAUDE_CODE_OAUTH_TOKEN).
         #[arg(long)]
         cc_token: Option<String>,
+        /// Install the full shell the GPU pods get: zsh + oh-my-zsh + powerlevel10k + the
+        /// shared arena-infra dotfiles, set as the login shell (no conda/ARENA_3.0). For
+        /// bare / non-arena base images — the prebuilt arena image already has this.
+        #[arg(long)]
+        zsh_install: bool,
     },
     /// Stop a pod, or many with --all (+ --include/--exclude).
     Stop {
@@ -724,6 +743,15 @@ const MAX_CAPACITY_ATTEMPTS: u32 = 120;
 /// - anything else → report what we made so far, then surface the error.
 /// Command-line overrides for the create spec, so you don't have to edit config.env
 /// to spin up a different GPU/count/cloud for one run.
+/// Start-command script for `--bootstrap`: makes a non-arena base image (e.g. an NVIDIA
+/// NGC image) SSH-reachable. Installs openssh-server, authorizes `$PUBLIC_KEY` (which
+/// RunPod injects from the pod's env), generates host keys, and runs sshd in the
+/// foreground so it's the long-lived process — if it dies, RunPod restarts the container.
+/// `$PUBLIC_KEY` stays a runtime variable so it expands inside the container, not here.
+/// Sent as `dockerStartCmd` argv `["bash","-c", THIS]` so no outer shell-quoting is needed.
+/// The prebuilt arena image needs none of this, so `--bootstrap` is opt-in.
+const BOOTSTRAP_SCRIPT: &str = r#"export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get install -y --no-install-recommends openssh-server && mkdir -p ~/.ssh && echo "$PUBLIC_KEY" >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && ssh-keygen -A && mkdir -p /run/sshd && /usr/sbin/sshd -D"#;
+
 #[derive(Debug, Clone, Default)]
 struct SpecOverrides {
     gpu: Option<String>,
@@ -732,6 +760,9 @@ struct SpecOverrides {
     disk: Option<u32>,
     volume: Option<u32>,
     image: Option<String>,
+    /// Set the `--bootstrap` start command (`dockerArgs`) so a non-arena base image
+    /// brings up sshd on boot. Off => use the image's own entrypoint.
+    bootstrap: bool,
 }
 
 /// The base spec from config, with any command-line overrides applied.
@@ -754,6 +785,10 @@ fn spec_with_overrides(cfg: &Config, ov: &SpecOverrides) -> PodSpec {
     }
     if let Some(img) = &ov.image {
         spec.image = img.clone();
+    }
+    if ov.bootstrap {
+        spec.docker_args =
+            Some(vec!["bash".to_string(), "-c".to_string(), BOOTSTRAP_SCRIPT.to_string()]);
     }
     spec
 }
@@ -933,16 +968,35 @@ async fn handle_gpus(cfg: &Config, provider_name: &str) -> Result<()> {
                 Ok(mut types) if !types.is_empty() => {
                     // Drop RunPod's "unknown" placeholder.
                     types.retain(|t| t.id != "unknown" && t.memory_gb > 0);
+                    // RunPod's create-validation enum can be NARROWER than the gpuTypes
+                    // catalog — listing a GPU that `--gpu` then gets a 400 for. Intersect
+                    // with the creatable enum so we only advertise types that actually work.
+                    // If the enum can't be fetched, fall back to showing all (with no claim).
+                    let creatable = arena_core::provider::runpod::fetch_creatable_gpu_ids(key).await.ok().filter(|v| !v.is_empty());
+                    let hidden = match &creatable {
+                        Some(ok) => {
+                            let before = types.len();
+                            types.retain(|t| ok.contains(&t.id));
+                            before - types.len()
+                        }
+                        None => 0,
+                    };
                     types.sort_by(|a, b| a.memory_gb.cmp(&b.memory_gb).then(a.display_name.cmp(&b.display_name)));
                     println!("{:<16} {:>5}  {:>14}   {}", "GPU", "VRAM", "$/hr comm/sec", "API name (pass to --gpu)");
                     for t in &types {
                         println!("{:<16} {:>4}G  {:>14}   {}", t.display_name, t.memory_gb, price(&t.id), t.id);
                     }
                     println!(
-                        "\n{} GPU types (live from RunPod). Pass the API name (or a short alias like \
+                        "\n{} GPU types {}. Pass the API name (or a short alias like \
                          A4000 / 3090) to --gpu. Prices are rough preset rates where known.",
-                        types.len()
+                        types.len(),
+                        if creatable.is_some() { "(live from RunPod, creatable via the create API)" } else { "(live from RunPod)" }
                     );
+                    if hidden > 0 {
+                        println!(
+                            "({hidden} more in RunPod's catalog are hidden — listed but rejected by the create API, so --gpu can't use them.)"
+                        );
+                    }
                     return Ok(());
                 }
                 Ok(_) => {}
@@ -1101,6 +1155,7 @@ async fn handle_setup(
     force: bool,
     hf_token: Option<String>,
     cc_token: Option<String>,
+    zsh_install: bool,
     // Restrict to these pod names (e.g. the ones `up` just created). None = whole fleet.
     only: Option<&[String]>,
 ) -> Result<()> {
@@ -1118,6 +1173,7 @@ async fn handle_setup(
     };
     let mut scfg = arena_core::setup::SetupConfig::from_config(cfg)?;
     scfg.broadcast_exports = arena_core::apikeys::broadcast_env_vars(&token_value);
+    scfg.zsh_install = zsh_install;
     // Report which broadcast tokens (HF, Claude Code) will be exported (optional step).
     let token_summary: Vec<String> = arena_core::apikeys::BROADCAST_TOKENS
         .iter()
@@ -1189,9 +1245,13 @@ async fn handle_setup(
                 .map(|t| !arena_core::apikeys::parse_csv(&t).is_empty())
                 .unwrap_or(false)
         });
+        let key_scope = match only {
+            Some(names) if !names.is_empty() => names.join(", "),
+            _ => "all reachable pods".to_string(),
+        };
         println!(
             "API keys: {}",
-            if keys_present { "found in ./keys — would distribute after provisioning" } else { "none in ./keys — would skip" }
+            if keys_present { format!("found in ./keys — would distribute to {key_scope} after provisioning") } else { "none in ./keys — would skip".to_string() }
         );
         println!("Preview only — run without --dry-run to execute over SSH.");
         return Ok(());
@@ -1262,8 +1322,14 @@ async fn handle_setup(
              or drop in <provider>_api_keys.csv, then re-run setup / `pods copy-keys`)."
         );
     } else {
-        println!("API keys: found {} — distributing to pods…", csv_sources.join(", "));
-        if let Err(e) = handle_copy_keys(provider, cfg, keys_dir, None, None, &[], &[], false, true).await {
+        // Scope key distribution to the SAME pods we just provisioned: when `setup` was
+        // given explicit names, only those pods get keys — otherwise (whole-fleet setup)
+        // `&[]` means all reachable. Without this, `setup <one-pod>` provisioned one pod
+        // but copied keys to the entire fleet.
+        let key_include: &[String] = only.unwrap_or(&[]);
+        let scope_note = if key_include.is_empty() { "all reachable pods".to_string() } else { key_include.join(", ") };
+        println!("API keys: found {} — distributing to {scope_note}…", csv_sources.join(", "));
+        if let Err(e) = handle_copy_keys(provider, cfg, keys_dir, None, None, key_include, &[], false, true).await {
             eprintln!("  (API-key distribution failed: {e})");
         }
     }
@@ -2273,8 +2339,8 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             }
         }
 
-        PodCmd::Create { names, count, add, gpu, gpus, cloud, disk, volume, image, dry_run, keep_trying, retry_mins, retry_secs } => {
-            let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image };
+        PodCmd::Create { names, count, add, gpu, gpus, cloud, disk, volume, image, bootstrap, dry_run, keep_trying, retry_mins, retry_secs } => {
+            let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap };
             // Explicit names take a different path than the -n/-a top-up: create exactly
             // those (minus any that already exist), no name allocation.
             let mut topup_target = 0usize; // provider-scoped total for the -n/-a retry loop
@@ -2317,8 +2383,8 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             }
         }
 
-        PodCmd::Up { names, count, add, gpu, gpus, cloud, disk, volume, image, dry_run, no_wait, keep_trying, retry_mins, retry_secs, no_setup, timeout, interval } => {
-            let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image };
+        PodCmd::Up { names, count, add, gpu, gpus, cloud, disk, volume, image, bootstrap, dry_run, no_wait, keep_trying, retry_mins, retry_secs, no_setup, timeout, interval } => {
+            let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap };
             // Like `create`: explicit names take the direct path; -n/-a top up by count.
             let explicit = !names.is_empty();
             if explicit && (count.is_some() || add.is_some()) {
@@ -2459,7 +2525,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             if !no_setup {
                 println!("\nProvisioning the new pod(s) over SSH…");
                 let new: Vec<String> = created.iter().map(|p| p.name.clone()).collect();
-                handle_setup(provider, cfg, true, false, None, None, Some(&new)).await?;
+                handle_setup(provider, cfg, true, false, None, None, false, Some(&new)).await?;
             }
             // If there's no nginx to deploy to, say how to wire it (don't dump config).
             if !nginx_present {
@@ -2639,7 +2705,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             }
             git_result?;
         }
-        PodCmd::Setup { names, dry_run, force, hf_token, cc_token } => {
+        PodCmd::Setup { names, dry_run, force, hf_token, cc_token, zsh_install } => {
             // Normalize bare names to full ones (`bulk` -> `arena8-bulk`); empty = whole fleet.
             let only: Option<Vec<String>> = if names.is_empty() {
                 None
@@ -2669,7 +2735,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                 println!("aborted.");
                 return Ok(());
             }
-            handle_setup(provider, cfg, !dry_run, force, hf_token, cc_token, only.as_deref()).await?;
+            handle_setup(provider, cfg, !dry_run, force, hf_token, cc_token, zsh_install, only.as_deref()).await?;
         }
         PodCmd::SetBranch { branch, target, all, hard, dry_run } => {
             handle_set_branch(provider, cfg, &branch, target.as_deref(), all, hard, dry_run, yes).await?;
@@ -4035,6 +4101,7 @@ mod tests {
             prefix: "arena8".into(),
             authorized_pubkeys: vec![],
             broadcast_exports: vec![],
+            zsh_install: false,
         };
         // bare-VM (hetzner): copy the deploy key, push the script, run it with the repo
         // URL/key passed in (so it clones the PRIVATE repo over SSH).

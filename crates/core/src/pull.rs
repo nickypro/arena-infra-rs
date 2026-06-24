@@ -32,8 +32,16 @@ impl Default for PullConfig {
     fn default() -> Self {
         Self {
             max_size: "50M".to_string(),
-            // Keep `.git` (at any depth) so the backup is a usable git repo…
-            includes: vec!["**/.git/".to_string(), "**/.git/**".to_string()],
+            // Keep `.git` (at any depth) so the backup is a usable git repo, and
+            // `.claude/` so Claude Code session transcripts (`.claude/projects/**/*.jsonl`,
+            // the token-usage record) are archived — both would otherwise be dropped by
+            // the `**/.*/` dotfile-dir exclude below. Includes are emitted first so they win.
+            includes: vec![
+                "**/.git/".to_string(),
+                "**/.git/**".to_string(),
+                "**/.claude/".to_string(),
+                "**/.claude/**".to_string(),
+            ],
             // …but still drop reconstructable/huge dirs. `**/.*/` covers dotfile dirs
             // (`.cache`, `.venv`, …); the rest catch non-dot caches and envs that aren't
             // (notably `hf_cache/` — multi-GB model/dataset blobs that filled the backup
@@ -47,6 +55,13 @@ impl Default for PullConfig {
                 "huggingface/".to_string(),  // HuggingFace cache (alt HF_HOME layout)
                 "venv/".to_string(),         // non-dot python virtualenvs
                 "node_modules/".to_string(), // npm deps
+                // HuggingFace *hub* cache when HF_HOME/HF_HUB_CACHE points at a non-dot
+                // dir (e.g. `rlvr_run/hf/hub/`), so it escaped the dotdir/.cache excludes
+                // above. `models--*/` and `datasets--*/` are the hub's content-addressed
+                // blob store — reconstructable public downloads (e.g. a ~15GB DeepSeek-R1
+                // base re-pulled onto every pod). Was ~337GB / 40% of the uncapped backup.
+                "models--*/".to_string(),    // HF hub model cache dirs (blobs/snapshots/refs)
+                "datasets--*/".to_string(),  // HF hub dataset cache dirs
                 // Scratch dir for sweeps/RLVR runs — deliberately NOT backed up (these
                 // outputs are large + reproducible/wandb-logged). zebra's orchestrator is
                 // told to do all its run work here.
@@ -188,7 +203,7 @@ mod tests {
         assert!(joined.contains("--prune-empty-dirs"));
         // default excludes present as separate args (dotdirs, site-packages, and the
         // non-dot caches/envs that would otherwise bloat the backup)
-        for ex in ["**/.*/", ".cache/", "site-packages/", "__pycache__/", "hf_cache/", "huggingface/", "venv/", "node_modules/"] {
+        for ex in ["**/.*/", ".cache/", "site-packages/", "__pycache__/", "hf_cache/", "huggingface/", "venv/", "node_modules/", "models--*/", "datasets--*/"] {
             assert!(a.windows(2).any(|w| w[0] == "--exclude" && w[1] == ex), "missing exclude {ex}");
         }
         // .git is kept via an include that precedes the dotdir exclude
