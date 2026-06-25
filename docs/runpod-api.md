@@ -54,8 +54,12 @@ parsed defensively from `serde_json::Value`, so a RunPod schema tweak degrades a
    **`lastStartedAt` from the REST API is NOT a reliable restart signal** — use the `/proc/1`
    start time via SSH instead.
 
-5. **SECURE-cloud pods are not directly SSH-reachable by public IP** the way COMMUNITY pods
-   are. Reach them through the proxy, not a raw `publicIp:port`.
+5. **Public IP availability depends on cloud tier.** SECURE-cloud pods reliably get a public
+   IP and ARE directly SSH-reachable (`publicIp:portMappings["22"]`). COMMUNITY pods sometimes
+   get **no public IP** — only reachable via RunPod's SSH proxy (`ssh <podid>-<hash>@ssh.runpod.io
+   -i <key>`), which the tool's `SshTarget::from_pod` (raw `publicIp:port`) can't use, so such a
+   pod looks like it "never gets an SSH endpoint." Use `--cloud SECURE` for pods you must reach
+   directly. (See docs/TODO.md.)
 
 6. **The container-disk-loss class of bug is only fully fixed with a network volume.** The
    fleet currently runs `volumeInGb=0`, so all data sits on ephemeral container disk — any

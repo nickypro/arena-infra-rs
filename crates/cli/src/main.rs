@@ -279,6 +279,10 @@ enum MigrateCmd {
         /// Docker image (default: same as the source, else config IMAGE).
         #[arg(long)]
         image: Option<String>,
+        /// Bring up sshd on boot via a start script — needed when `--image` is a bare
+        /// (non-arena, non-RunPod) base image that doesn't already run sshd.
+        #[arg(long)]
+        bootstrap: bool,
         /// Preview only.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
@@ -2777,8 +2781,8 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
         }
 
         PodCmd::Migrate { cmd } => match cmd {
-            MigrateCmd::Copy { target, gpu, gpus, cloud, disk, volume, image, dry_run } => {
-                let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap: false };
+            MigrateCmd::Copy { target, gpu, gpus, cloud, disk, volume, image, bootstrap, dry_run } => {
+                let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap };
                 handle_migrate_copy(cfg, &target, &ov, dry_run, yes).await?;
             }
             MigrateCmd::Cutover { target, yes: y, skip_proxy, dry_run } => {
