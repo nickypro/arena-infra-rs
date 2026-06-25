@@ -198,17 +198,27 @@ impl Provider for RunpodProvider {
     }
 
     async fn rename_pod(&self, id: &str, new_name: &str) -> Result<()> {
-        // REST v1 `PATCH /pods/{id}` edits mutable fields in place; `name` is one of them
-        // (confirmed against the live OpenAPI). Only the name is sent so nothing else is
-        // disturbed.
-        let resp = self
-            .auth(self.client.patch(format!("{BASE}/pods/{id}")).json(&json!({ "name": new_name })))
-            .send()
-            .await?;
+        // Use the GraphQL `podEditName` mutation — the one the RunPod *dashboard* uses for a
+        // rename — NOT the REST `PATCH /pods/{id}`. The REST update is documented as "Update a
+        // Pod, potentially triggering a reset", and empirically it RESTARTS the container,
+        // which wipes the container disk (everything not on a network volume) — i.e. silent
+        // data loss. `podEditName` is a pure metadata rename: verified (via `/proc/1` start
+        // time before/after) to leave the running container completely untouched.
+        let url = format!("https://api.runpod.io/graphql?api_key={}", self.api_key);
+        let body = json!({
+            "query": "mutation editPodName($input: PodEditNameInput!) { \
+                      podEditName(input: $input) { id name } }",
+            "variables": { "input": { "podId": id, "name": new_name } },
+        });
+        let resp = self.client.post(&url).json(&body).send().await?;
         let status = resp.status();
+        let v: Value = resp.json().await?;
         if !status.is_success() {
-            let body: Value = resp.json().await.unwrap_or(Value::Null);
-            return Err(Error::provider_http(status, &body, "rename pod"));
+            return Err(Error::provider_http(status, &v, "rename pod"));
+        }
+        // GraphQL returns HTTP 200 even on logical errors — surface them.
+        if let Some(errors) = v.get("errors").filter(|e| !e.as_array().map(|a| a.is_empty()).unwrap_or(false)) {
+            return Err(Error::provider(format!("rename pod (podEditName): {errors}")));
         }
         Ok(())
     }
