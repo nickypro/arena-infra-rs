@@ -3235,8 +3235,12 @@ async fn proxy_reaches_pod(cfg: &Config, name: &str, expected_id: &str) -> Resul
     match arena_core::ssh::run(&target, probe).await {
         Ok(o) if o.success => {
             let got = o.stdout.trim();
-            // Empty id (non-RunPod) → accept any successful SSH as "reachable".
-            Ok(got.is_empty() || got == expected_id)
+            // FAIL CLOSED: require the pod's own RUNPOD_POD_ID to be present AND match. An
+            // empty read (probe failed, or a recycled ip:port landed on a pod that doesn't
+            // expose it) must NOT pass — the entire point of this gate is to catch the proxy
+            // reaching the wrong/foreign pod. RunPod always exposes RUNPOD_POD_ID in PID 1's
+            // env, so empty == "couldn't confirm" == not safe to cut over.
+            Ok(!got.is_empty() && got == expected_id)
         }
         _ => Ok(false),
     }
@@ -3873,8 +3877,28 @@ async fn marker_present(provider: &dyn Provider, dest_id: &str, cfg: &Config) ->
         if let Some(v) = line.strip_prefix("ID=") { pid = v.trim().to_string(); }
         if let Some(v) = line.strip_prefix("MARK=") { mark = v.trim().to_string(); }
     }
-    // identity: empty id means we couldn't read it (non-RunPod) — don't fail on that.
-    mark == token && (pid.is_empty() || pid == dest_id)
+    // Identity: on RunPod, FAIL CLOSED — require a non-empty RUNPOD_POD_ID that matches. An
+    // empty read on a recycled-port pod (or one that can't expose the id) must not be treated
+    // as "right pod"; the marker token alone can ride along a copy that landed on the wrong
+    // pod. Only non-RunPod providers (no such id) fall back to token-only.
+    let identity_ok = if provider.name() == "runpod" { pid == dest_id } else { pid.is_empty() || pid == dest_id };
+    mark == token && identity_ok
+}
+
+/// Confirm the pod answering at `target` really is `expected_id` (via `RUNPOD_POD_ID` in
+/// PID 1's env). On RunPod, fail closed: a mismatch/empty means a recycled ip:port reached a
+/// DIFFERENT pod, so we must not read from / write to it. Non-RunPod providers (no such id)
+/// pass. Used to identity-check the SOURCE before copying (the dest is checked separately).
+async fn target_is_pod(
+    target: &arena_core::ssh::SshTarget,
+    expected_id: &str,
+    provider: &dyn Provider,
+) -> bool {
+    if provider.name() != "runpod" {
+        return true;
+    }
+    let probe = "tr '\\0' '\\n' < /proc/1/environ 2>/dev/null | sed -n 's/^RUNPOD_POD_ID=//p'";
+    matches!(arena_core::ssh::run(target, probe).await, Ok(o) if o.success && o.stdout.trim() == expected_id)
 }
 
 /// Best-effort removal of the copy marker from a pod.
@@ -3961,6 +3985,15 @@ async fn copy_pod_files(
     let token = copy_marker_token(dest_id);
     let marker = copy_marker_path();
     let src_target = fresh_target(provider, src_id, cfg).await.context("resolving source endpoint")?;
+    // Identity-check the SOURCE before reading from it: if its ip:port was reassigned to a
+    // different pod, we'd otherwise copy a STRANGER's home onto the new pod (and the dest
+    // marker check would still pass, since the marker rides along). Fail closed.
+    if !target_is_pod(&src_target, src_id, provider).await {
+        anyhow::bail!(
+            "source {src_id}'s SSH endpoint doesn't resolve to that pod (its ip:port was likely \
+             reassigned to a different pod) — refusing to copy from the wrong pod. Re-run."
+        );
+    }
     ssh::run(&src_target, &format!("printf %s {} > \"{marker}\"", shell_quote(&token)))
         .await
         .context("planting copy marker on source")?;
@@ -3986,6 +4019,12 @@ async fn copy_pod_files(
             .with_context(|| format!("creating staging dir {}", stage.display()))?;
         let stage_s = format!("{}/", stage.to_string_lossy());
         let src_target = fresh_target(provider, src_id, cfg).await?;
+        if !target_is_pod(&src_target, src_id, provider).await {
+            anyhow::bail!(
+                "source {src_id}'s endpoint resolved to a different pod before the pull — \
+                 refusing to copy the wrong pod's data. Re-run."
+            );
+        }
         run_rsync(&pull::rsync_args(&src_target, &pc, &stage_s)).await.context("pull source -> staging")?;
         let dest_target = fresh_target(provider, dest_id, cfg).await?;
         run_rsync(&pull::push_rsync_args(&dest_target, &pc, &stage_s)).await.context("push staging -> dest")?;
