@@ -19,7 +19,7 @@ const DEFAULT_CONFIG: &str = "/home/dev/prod-ro/config.env";
 #[derive(Parser)]
 #[command(
     name = "arena",
-    version,
+    version = env!("ARENA_VERSION"),
     about = "Streamlined ARENA infra control plane",
     // Cisco-style shorthands: any unambiguous prefix works (`arena po l` == `pods
     // list`). Ambiguous prefixes (e.g. `p` for pods/proxy) error and ask you to
