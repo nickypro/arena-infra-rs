@@ -20,11 +20,8 @@ pub struct PullConfig {
     /// `None` = no upper cap. The snapshot tier sets this; the big-file mirror leaves it `None`.
     pub max_size: Option<String>,
     /// Only transfer files **at least** this large (rsync `--min-size`), e.g. `Some("50M")`.
-    /// `None` = no lower bound. The big-file mirror sets this so the two tiers partition by size.
+    /// `None` = no lower bound. (Currently unused — the tiers split by `max_size` only.)
     pub min_size: Option<String>,
-    /// Mirror mode: delete dest files that no longer exist on the source (rsync `--delete`).
-    /// Used by the running big-file mirror so it tracks current pod state instead of growing.
-    pub delete: bool,
     /// Paths/globs to **keep** even if a later exclude would drop them (rsync
     /// `--include`, emitted first so it wins). Defaults keep `.git` so backups carry git
     /// history/branch state, while still excluding other dotfile dirs.
@@ -40,7 +37,6 @@ impl Default for PullConfig {
         Self {
             max_size: Some("50M".to_string()),
             min_size: None,
-            delete: false,
             // Keep `.git` (at any depth) so the backup is a usable git repo, and
             // `.claude/` so Claude Code session transcripts (`.claude/projects/**/*.jsonl`,
             // the token-usage record) are archived — both would otherwise be dropped by
@@ -114,21 +110,31 @@ impl PullConfig {
         // both a security and a lockout risk).
         s.excludes.push("**/.ssh/".to_string());
         s.excludes.push(".ssh/".to_string());
+        // Don't copy the shell rc files: `copy-keys`/`setup` write the per-pod API keys into
+        // `~/.bashrc` and `~/.zshrc` (as `export OPENAI_API_KEY=…` etc.), so replicating them
+        // would carry one pod's keys onto another. The new pod gets its OWN keys re-distributed
+        // at setup, and its base rc files from the image — so just skip these (plus shell
+        // history, which can hold secrets typed on the command line).
+        for f in [".bashrc", ".zshrc", ".zshrc.pre-oh-my-zsh", ".bash_history", ".zsh_history"] {
+            s.excludes.push(f.to_string());
+            s.excludes.push(format!("**/{f}"));
+        }
         s
     }
 
     /// Snapshot tier: only files **smaller** than `threshold`, copied into the dated `wNdM`
     /// folder (`local_dest`). This is the historical default, named explicitly for symmetry.
     pub fn small_tier(threshold: impl Into<String>) -> Self {
-        Self { max_size: Some(threshold.into()), min_size: None, delete: false, ..Self::default() }
+        Self { max_size: Some(threshold.into()), min_size: None, ..Self::default() }
     }
 
-    /// Running full-mirror tier: the **complete** home (no size filter), mirrored with
-    /// `--delete` into a single dateless folder (`big_dest`) so it's always a standalone
-    /// latest-state copy of the pod. The snapshot tier (`small_tier`) layers dated history of
-    /// the sub-threshold files on top, so small files live in both (a cheap extra copy).
-    pub fn full_mirror() -> Self {
-        Self { max_size: None, min_size: None, delete: true, ..Self::default() }
+    /// Big tier: the **complete** home (no size filter) accumulated into a single dateless
+    /// folder (`big_dest`). It never deletes — every file ever backed up is kept, even after
+    /// it's gone from the pod — so it's a pure "save all the files" copy, not a `--delete`
+    /// mirror of current state. The snapshot tier (`small_tier`) layers dated history of the
+    /// sub-threshold files on top. Both share the default excludes (HF cache, venvs, …).
+    pub fn big_tier() -> Self {
+        Self { max_size: None, min_size: None, ..Self::default() }
     }
 }
 
@@ -235,18 +241,13 @@ fn rsync_flags(pc: &PullConfig) -> Vec<String> {
         "--stats".into(), // emit a summary we parse to report files/bytes per pod
         "--prune-empty-dirs".into(),
     ];
-    // Size split: `--max-size` keeps the snapshot tier small; `--min-size` routes the big
-    // files to the running mirror. A given tier sets exactly one (the other stays `None`).
+    // `--max-size` keeps the snapshot tier small (the big tier leaves it `None` to take
+    // everything). `--min-size` is currently unused but honored if a caller sets it.
     if let Some(m) = &pc.max_size {
         a.push(format!("--max-size={m}"));
     }
     if let Some(m) = &pc.min_size {
         a.push(format!("--min-size={m}"));
-    }
-    // Mirror mode for the big tier: drop dest files gone from the source. `--delete` (without
-    // `--delete-excluded`) never removes excluded paths, so the cache excludes stay protected.
-    if pc.delete {
-        a.push("--delete".into());
     }
     // Includes first (they win over a later exclude), then excludes.
     for inc in &pc.includes {
@@ -370,12 +371,12 @@ mod tests {
     }
 
     #[test]
-    fn full_mirror_has_no_size_filter_and_deletes() {
-        let a = rsync_args(&target(), &PullConfig::full_mirror(), "./backup/big/arena8-apple/");
+    fn big_tier_keeps_all_files_no_delete() {
+        let a = rsync_args(&target(), &PullConfig::big_tier(), "./backup/big/arena8-apple/");
         let joined = a.join(" ");
-        assert!(joined.contains("--delete"), "mirror tier mirrors with --delete");
-        assert!(!joined.contains("--max-size"), "mirror tier has no upper cap");
-        assert!(!joined.contains("--min-size"), "full mirror has no lower bound");
+        assert!(!joined.contains("--delete"), "big tier accumulates; it must never delete");
+        assert!(!joined.contains("--max-size"), "big tier has no upper cap");
+        assert!(!joined.contains("--min-size"), "big tier has no lower bound");
         // shares the same excludes (HF cache etc.) as the snapshot tier
         assert!(a.windows(2).any(|w| w[0] == "--exclude" && w[1] == "models--*/"));
         // dateless running dest
@@ -397,6 +398,10 @@ mod tests {
         assert!(a.windows(2).any(|w| w[0] == "--exclude" && w[1] == "**/.claude*"));
         // .ssh is explicitly excluded too (never replicate keys/authorized_keys).
         assert!(a.windows(2).any(|w| w[0] == "--exclude" && w[1] == ".ssh/"));
+        // shell rc files carry per-pod API keys (copy-keys writes them there) — excluded.
+        for f in [".bashrc", ".zshrc", ".zsh_history"] {
+            assert!(a.windows(2).any(|w| w[0] == "--exclude" && w[1] == f), "missing exclude {f}");
+        }
         // .git is still kept (branch/commit state carries to the new pod).
         assert!(a.windows(2).any(|w| w[0] == "--include" && w[1] == "**/.git/"));
         // cache / HF model caches stay excluded (already covered by defaults).
