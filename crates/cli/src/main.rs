@@ -3437,10 +3437,26 @@ async fn handle_migrate_cutover(
             cutover_revert(cfg, owner.as_ref(), &canonical, &new_id, &src_id, true).await;
             anyhow::bail!("cutover reverted: proxy apply failed. {canonical} is back on the original.");
         }
-        if proxy_reaches_pod(cfg, &canonical, &new_id).await.unwrap_or(false) {
-            println!("      ✓ {canonical} is reachable through the proxy on the new pod.");
-        } else {
-            eprintln!("      ✗ {canonical} NOT reachable through the proxy — auto-reverting.");
+        // `nginx -s reload` is GRACEFUL: for a few seconds after the reload, existing worker
+        // processes keep serving the OLD config, so a fresh connection can still be routed to
+        // the OLD pod. A single immediate probe therefore reads the old pod's id and false-
+        // fails. Wait for the reload to settle and retry the through-proxy identity check —
+        // succeed as soon as the proxy actually reaches the new pod (up to ~45s).
+        let settle_tries = 15;
+        let mut reached = false;
+        for attempt in 1..=settle_tries {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            if proxy_reaches_pod(cfg, &canonical, &new_id).await.unwrap_or(false) {
+                reached = true;
+                println!("      ✓ {canonical} reachable through the proxy on the new pod (after ~{}s).", attempt * 3);
+                break;
+            }
+            if attempt % 3 == 0 {
+                eprintln!("      waiting for nginx to finish cutting over to the new pod ({}s)…", attempt * 3);
+            }
+        }
+        if !reached {
+            eprintln!("      ✗ {canonical} NOT reachable through the proxy after ~{}s — auto-reverting.", settle_tries * 3);
             cutover_revert(cfg, owner.as_ref(), &canonical, &new_id, &src_id, true).await;
             anyhow::bail!(
                 "cutover reverted: the new pod wasn't reachable through the proxy. {canonical} is \
