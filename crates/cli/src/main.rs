@@ -4695,9 +4695,13 @@ async fn handle_copy_keys(
         flag.or_else(|| cfg.get(k).filter(|s| !s.is_empty()).map(String::from))
     };
     let broadcast = apikeys::broadcast_env_vars(&token_value);
+    // "broadcast" = same value on every *targeted* pod (vs per-host CSV keys). Say "all pods"
+    // only when there's no include/target filter — otherwise it misleadingly implies the whole
+    // fleet when you've restricted to specific pods.
+    let bcast_scope = if include.is_empty() { "broadcast to all pods" } else { "broadcast" };
     for (key, display, _) in apikeys::BROADCAST_TOKENS {
         if token_value(key).is_some() {
-            sources.push(format!("{display} (broadcast to all)"));
+            sources.push(format!("{display} ({bcast_scope})"));
         }
     }
 
@@ -4771,7 +4775,9 @@ async fn handle_copy_keys(
     };
     let fleet_ssh = fleet_ssh_command(&fleet_pubkeys, &fleet_cfg);
     println!(
-        "Also: authorize {} fleet key(s) + write ~/.ssh/config so pods can ssh each other.",
+        "Also on each target ({} pod(s)): authorize {} fleet key(s) + write that pod's own \
+         ~/.ssh/config (the fleet host map, so it can ssh the others).",
+        jobs.len(),
         fleet_pubkeys.len()
     );
 
