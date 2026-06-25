@@ -196,6 +196,99 @@ impl Provider for RunpodProvider {
         }
         Ok(())
     }
+
+    async fn rename_pod(&self, id: &str, new_name: &str) -> Result<()> {
+        // REST v1 `PATCH /pods/{id}` edits mutable fields in place; `name` is one of them
+        // (confirmed against the live OpenAPI). Only the name is sent so nothing else is
+        // disturbed.
+        let resp = self
+            .auth(self.client.patch(format!("{BASE}/pods/{id}")).json(&json!({ "name": new_name })))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body: Value = resp.json().await.unwrap_or(Value::Null);
+            return Err(Error::provider_http(status, &body, "rename pod"));
+        }
+        Ok(())
+    }
+
+    async fn pod_spec(&self, id: &str) -> Result<PodSpec> {
+        let resp = self.auth(self.client.get(format!("{BASE}/pods/{id}"))).send().await?;
+        let status = resp.status();
+        let body: Value = resp.json().await?;
+        if !status.is_success() {
+            return Err(Error::provider_http(status, &body, "get pod"));
+        }
+        Ok(parse_spec(&body))
+    }
+}
+
+/// Recover a recreate-able `PodSpec` from a RunPod `GET /pods/{id}` body. Pure (no I/O) so
+/// it's unit-testable. Defensive: any field RunPod doesn't return is left blank/default for
+/// the caller's config/CLI overrides to fill. In practice the REST API reliably returns
+/// `imageName`, `containerDiskInGb`, `volumeInGb`, `gpuCount`, `ports` and `env` — but the
+/// `machine` object comes back **empty**, so the **GPU type and cloud tier are NOT
+/// recoverable** (both come back blank → caller falls back to the configured `GPU_TYPE` /
+/// `CLOUD_TYPE`, which is correct since the fleet is provisioned uniformly from config).
+/// `name` is returned empty for the caller to set, and the per-machine/identity env vars
+/// (`PUBLIC_KEY`, `MACHINE_NAME`) are dropped — `replace` re-seeds those for the new pod.
+fn parse_spec(v: &Value) -> PodSpec {
+    let machine = v.get("machine");
+    let m = |k: &str| machine.and_then(|mc| mc.get(k));
+
+    let gpu_type = m("gpuTypeId")
+        .or_else(|| m("gpuType"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let gpu_count = v
+        .get("gpuCount")
+        .and_then(Value::as_u64)
+        .or_else(|| m("minPodGpuCount").and_then(Value::as_u64))
+        .unwrap_or(1) as u32;
+    // RunPod splits its catalog into a secure cloud and a community cloud; `secureCloud`
+    // on the machine *would* tell us which tier this pod is on — but the REST API returns
+    // an empty `machine` object (no `secureCloud`, and notably no GPU type) for both list
+    // and get. So this is usually absent: return "" ("couldn't determine") and let the
+    // caller fall back to the configured tier, exactly as it does for the GPU type.
+    let cloud_type = match m("secureCloud").and_then(Value::as_bool) {
+        Some(true) => "SECURE",
+        Some(false) => "COMMUNITY",
+        None => "",
+    }
+    .to_string();
+
+    let ports = v
+        .get("ports")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(","))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "8888/http,22/tcp".to_string());
+
+    let env = v
+        .get("env")
+        .and_then(Value::as_object)
+        .map(|o| {
+            o.iter()
+                .filter(|(k, _)| k.as_str() != "PUBLIC_KEY" && k.as_str() != "MACHINE_NAME")
+                .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    PodSpec {
+        name: String::new(),
+        image: v.get("imageName").and_then(Value::as_str).unwrap_or_default().to_string(),
+        gpu_type,
+        gpu_count,
+        cloud_type,
+        disk_gb: v.get("containerDiskInGb").and_then(Value::as_u64).unwrap_or(0) as u32,
+        volume_gb: v.get("volumeInGb").and_then(Value::as_u64).unwrap_or(0) as u32,
+        ports,
+        env,
+        docker_args: None,
+    }
 }
 
 /// One entry from RunPod's GPU catalog (its GraphQL `gpuTypes`).
@@ -318,6 +411,43 @@ mod tests {
         // REST v1 wants an array of strings under `dockerStartCmd`, not a `dockerArgs` string.
         assert_eq!(p["dockerStartCmd"], json!(["bash", "-c", "/usr/sbin/sshd -D"]));
         assert!(p.get("dockerArgs").is_none());
+    }
+
+    #[test]
+    fn parse_spec_recovers_recreate_fields_and_drops_identity_env() {
+        let body = json!({
+            "id": "abc", "name": "arena8-apple",
+            "imageName": "arena/base:latest",
+            "containerDiskInGb": 200, "volumeInGb": 50,
+            "ports": ["8888/http", "22/tcp"],
+            "env": {"PUBLIC_KEY": "ssh-ed25519 AAAA", "MACHINE_NAME": "arena8-apple", "WANDB_KEY": "w"},
+            "machine": {"gpuTypeId": "NVIDIA A40", "secureCloud": true, "minPodGpuCount": 2}
+        });
+        let s = parse_spec(&body);
+        assert_eq!(s.name, ""); // caller fills
+        assert_eq!(s.image, "arena/base:latest");
+        assert_eq!(s.gpu_type, "NVIDIA A40");
+        assert_eq!(s.gpu_count, 2); // from minPodGpuCount when gpuCount absent
+        assert_eq!(s.cloud_type, "SECURE");
+        assert_eq!(s.disk_gb, 200);
+        assert_eq!(s.volume_gb, 50);
+        assert_eq!(s.ports, "8888/http,22/tcp");
+        // PUBLIC_KEY + MACHINE_NAME dropped (replace re-seeds them); other env kept.
+        assert_eq!(s.env, vec![("WANDB_KEY".to_string(), "w".to_string())]);
+        assert!(s.docker_args.is_none());
+    }
+
+    #[test]
+    fn parse_spec_defaults_when_fields_absent() {
+        // A sparse body (image omitted as the docs schema does) must not panic and must
+        // leave image blank so the caller falls back to the configured image.
+        let s = parse_spec(&json!({"name": "x", "machine": {}}));
+        assert_eq!(s.image, "");
+        assert_eq!(s.gpu_type, ""); // machine is empty in the real API → unknown
+        assert_eq!(s.gpu_count, 1);
+        assert_eq!(s.cloud_type, ""); // unknown → caller falls back to config
+        assert_eq!(s.ports, "8888/http,22/tcp");
+        assert!(s.env.is_empty());
     }
 
     #[test]

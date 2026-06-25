@@ -99,6 +99,12 @@ impl Provider for MultiProvider {
     async fn terminate_pod(&self, id: &str) -> Result<()> {
         self.backend_for(id).await?.terminate_pod(id).await
     }
+    async fn rename_pod(&self, id: &str, new_name: &str) -> Result<()> {
+        self.backend_for(id).await?.rename_pod(id, new_name).await
+    }
+    async fn pod_spec(&self, id: &str) -> Result<PodSpec> {
+        self.backend_for(id).await?.pod_spec(id).await
+    }
 }
 
 /// Build the fleet-wide provider: the chosen `primary` (required, for create) plus every

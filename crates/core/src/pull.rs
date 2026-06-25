@@ -16,8 +16,15 @@ use crate::ssh::SshTarget;
 /// Options for a pull, defaulting to the legacy `backup.sh` behavior.
 #[derive(Debug, Clone)]
 pub struct PullConfig {
-    /// Skip any single file larger than this (rsync `--max-size`), e.g. `"50M"`.
-    pub max_size: String,
+    /// Only transfer files **smaller** than this (rsync `--max-size`), e.g. `Some("50M")`.
+    /// `None` = no upper cap. The snapshot tier sets this; the big-file mirror leaves it `None`.
+    pub max_size: Option<String>,
+    /// Only transfer files **at least** this large (rsync `--min-size`), e.g. `Some("50M")`.
+    /// `None` = no lower bound. The big-file mirror sets this so the two tiers partition by size.
+    pub min_size: Option<String>,
+    /// Mirror mode: delete dest files that no longer exist on the source (rsync `--delete`).
+    /// Used by the running big-file mirror so it tracks current pod state instead of growing.
+    pub delete: bool,
     /// Paths/globs to **keep** even if a later exclude would drop them (rsync
     /// `--include`, emitted first so it wins). Defaults keep `.git` so backups carry git
     /// history/branch state, while still excluding other dotfile dirs.
@@ -31,7 +38,9 @@ pub struct PullConfig {
 impl Default for PullConfig {
     fn default() -> Self {
         Self {
-            max_size: "50M".to_string(),
+            max_size: Some("50M".to_string()),
+            min_size: None,
+            delete: false,
             // Keep `.git` (at any depth) so the backup is a usable git repo, and
             // `.claude/` so Claude Code session transcripts (`.claude/projects/**/*.jsonl`,
             // the token-usage record) are archived — both would otherwise be dropped by
@@ -78,6 +87,49 @@ impl PullConfig {
         self.includes.retain(|i| !i.contains(".git"));
         self
     }
+
+    /// Pod-to-pod **replication** profile (the `pods replace` copy), as opposed to the
+    /// operator-local backup tiers above. Two differences from the backup default:
+    ///
+    /// - **`.claude/` is excluded, not archived.** The backup tiers deliberately *keep*
+    ///   `.claude/` to archive Claude Code transcripts onto the operator's own machine, but
+    ///   replicating Claude Code session/credential state from one pod onto another is a ToS
+    ///   concern — so the `.claude` include is dropped (the `**/.*/` dotdir exclude then
+    ///   drops it) and an explicit `.claude/` exclude is added for clarity/safety.
+    /// - **no size cap** — a replacement should carry the participant's full working tree,
+    ///   not just sub-50MB files.
+    ///
+    /// `.cache` and the HuggingFace model/dataset caches are already excluded by the shared
+    /// defaults, and `.git` is still kept so the new pod inherits branch/commit state.
+    pub fn replication() -> Self {
+        let mut s = Self { max_size: None, ..Self::default() };
+        s.includes.retain(|i| !i.contains(".claude"));
+        // Exclude the whole `.claude` family — both the `.claude/` dir AND the `.claude.json`
+        // credential *file* in the home root. The default `**/.*/` only drops dot-*dirs*, so
+        // `.claude.json` (a file) would otherwise be replicated, leaking Claude Code creds.
+        s.excludes.push("**/.claude*".to_string());
+        s.excludes.push(".claude*".to_string());
+        // Belt-and-suspenders: never replicate SSH material between pods (already covered by
+        // the dotdir exclude, but make the intent explicit — a leaked authorized_keys/key is
+        // both a security and a lockout risk).
+        s.excludes.push("**/.ssh/".to_string());
+        s.excludes.push(".ssh/".to_string());
+        s
+    }
+
+    /// Snapshot tier: only files **smaller** than `threshold`, copied into the dated `wNdM`
+    /// folder (`local_dest`). This is the historical default, named explicitly for symmetry.
+    pub fn small_tier(threshold: impl Into<String>) -> Self {
+        Self { max_size: Some(threshold.into()), min_size: None, delete: false, ..Self::default() }
+    }
+
+    /// Running full-mirror tier: the **complete** home (no size filter), mirrored with
+    /// `--delete` into a single dateless folder (`big_dest`) so it's always a standalone
+    /// latest-state copy of the pod. The snapshot tier (`small_tier`) layers dated history of
+    /// the sub-threshold files on top, so small files live in both (a cheap extra copy).
+    pub fn full_mirror() -> Self {
+        Self { max_size: None, min_size: None, delete: true, ..Self::default() }
+    }
 }
 
 /// The local destination for a pod's backup: `<base>/<label>/<pod-name>/`. The trailing
@@ -86,18 +138,116 @@ pub fn local_dest(base: &str, label: &str, pod_name: &str) -> String {
     format!("{}/{label}/{pod_name}/", base.trim_end_matches('/'))
 }
 
+/// The single running destination for a pod's big files: `<base>/big/<pod-name>/`. Unlike
+/// `local_dest` there's no `wNdM` label — every backup updates this one folder in place, so a
+/// multi-GB checkpoint is stored once instead of re-copied into each day's snapshot.
+pub fn big_dest(base: &str, pod_name: &str) -> String {
+    format!("{}/big/{pod_name}/", base.trim_end_matches('/'))
+}
+
 /// Build the `rsync` argv (everything after the program name) to pull `target`'s home
 /// (or `pc.remote_path`) into `local_dest`. Uses the target's transport options via
 /// `-e ssh …`; rsync appends `user@host` to the remote spec itself.
 pub fn rsync_args(target: &SshTarget, pc: &PullConfig, local_dest: &str) -> Vec<String> {
+    let mut a = rsync_flags(pc);
+    // Transport: the ssh command without user@host (rsync supplies that).
+    a.push("-e".into());
+    a.push(target.rsh_command());
+    // Source `user@host:<path>` — empty path means the login (home) dir.
+    a.push(format!("{}@{}:{}", target.user, target.host, pc.remote_path));
+    a.push(local_dest.to_string());
+    a
+}
+
+/// Build the `rsync` argv to **push** the contents of a local directory up to `target`'s
+/// home (or `pc.remote_path`). This is the second leg of the via-local pod-to-pod copy that
+/// backs `pods replace`: `pull` a pod's home into a control-side staging dir, then push that
+/// dir up to the freshly-built replacement. Same flags/excludes as `rsync_args`; only the
+/// direction flips (local source dir → `user@host:`).
+pub fn push_rsync_args(target: &SshTarget, pc: &PullConfig, local_src: &str) -> Vec<String> {
+    let mut a = rsync_flags(pc);
+    // CRITICAL: don't preserve owner/group. `-a` would otherwise apply the *staging dir's*
+    // owner (the control user, e.g. uid 1000) to the destination's top directory (the `.`
+    // entry) — chowning the pod's `/root` to a non-root uid, after which sshd StrictModes
+    // rejects every key ("Permission denied") and the pod is locked out. Receiving as root,
+    // dropping `-o`/`-g` leaves the home root-owned and files owned by root.
+    a.push("--no-owner".into());
+    a.push("--no-group".into());
+    a.push("-e".into());
+    a.push(target.rsh_command());
+    // Local source dir first (a trailing slash means "contents of"), then the remote dest.
+    a.push(local_src.to_string());
+    a.push(format!("{}@{}:{}", target.user, target.host, pc.remote_path));
+    a
+}
+
+/// A shell command to run **on the source pod** that rsyncs its home directly up to a
+/// destination pod's raw `ip:port` — the fast path for `pods replace` (no round-trip
+/// through the control machine). It authenticates with `remote_key`, a private key present
+/// on the source pod whose public half the destination authorizes: the shared deploy key
+/// both pods receive at `setup`. The destination's staging name (`<name>-new`) isn't in the
+/// pod-side ssh config, so we target the endpoint directly. Everything is shell-quoted so
+/// the glob excludes (`**/.*/` etc.) survive the source pod's shell intact; `$HOME` is left
+/// unquoted on purpose so the remote shell expands it.
+pub fn pod_to_pod_command(
+    dest_ip: &str,
+    dest_port: u16,
+    dest_user: &str,
+    remote_key: &str,
+    pc: &PullConfig,
+) -> String {
+    let mut parts = vec!["rsync".to_string()];
+    for a in rsync_flags(pc) {
+        parts.push(shell_quote(&a));
+    }
+    // Keep the destination home root-owned regardless of source file ownership (see
+    // `push_rsync_args` — the `.`-entry chown of `/root` is what locks sshd out).
+    parts.push("--no-owner".into());
+    parts.push("--no-group".into());
+    let ssh = format!(
+        "ssh -p {dest_port} -o BatchMode=yes -o StrictHostKeyChecking=no \
+         -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -i {remote_key}"
+    );
+    parts.push("-e".into());
+    parts.push(shell_quote(&ssh));
+    let src = if pc.remote_path.is_empty() {
+        "$HOME/".to_string()
+    } else {
+        format!("$HOME/{}", pc.remote_path)
+    };
+    parts.push(src);
+    parts.push(format!("{dest_user}@{dest_ip}:"));
+    parts.join(" ")
+}
+
+/// Single-quote a value for safe inclusion in a remote `sh -c` string (POSIX `'\''`).
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The shared `rsync` flags + size filters + include/exclude rules (everything except the
+/// `-e` transport and the source/dest operands), so pull and push stay in lockstep.
+fn rsync_flags(pc: &PullConfig) -> Vec<String> {
     let mut a = vec![
         "-avz".to_string(),
         "--human-readable".into(),
         "--info=progress2".into(),
         "--stats".into(), // emit a summary we parse to report files/bytes per pod
         "--prune-empty-dirs".into(),
-        format!("--max-size={}", pc.max_size),
     ];
+    // Size split: `--max-size` keeps the snapshot tier small; `--min-size` routes the big
+    // files to the running mirror. A given tier sets exactly one (the other stays `None`).
+    if let Some(m) = &pc.max_size {
+        a.push(format!("--max-size={m}"));
+    }
+    if let Some(m) = &pc.min_size {
+        a.push(format!("--min-size={m}"));
+    }
+    // Mirror mode for the big tier: drop dest files gone from the source. `--delete` (without
+    // `--delete-excluded`) never removes excluded paths, so the cache excludes stay protected.
+    if pc.delete {
+        a.push("--delete".into());
+    }
     // Includes first (they win over a later exclude), then excludes.
     for inc in &pc.includes {
         a.push("--include".into());
@@ -107,12 +257,6 @@ pub fn rsync_args(target: &SshTarget, pc: &PullConfig, local_dest: &str) -> Vec<
         a.push("--exclude".into());
         a.push(ex.clone());
     }
-    // Transport: the ssh command without user@host (rsync supplies that).
-    a.push("-e".into());
-    a.push(target.rsh_command());
-    // Source `user@host:<path>` — empty path means the login (home) dir.
-    a.push(format!("{}@{}:{}", target.user, target.host, pc.remote_path));
-    a.push(local_dest.to_string());
     a
 }
 
@@ -223,6 +367,77 @@ mod tests {
         // source is user@host: (home) and dest is local, in that order at the end
         assert_eq!(a[a.len() - 2], "root@1.2.3.4:");
         assert_eq!(a[a.len() - 1], "./backup/w1d3/arena8-apple/");
+    }
+
+    #[test]
+    fn full_mirror_has_no_size_filter_and_deletes() {
+        let a = rsync_args(&target(), &PullConfig::full_mirror(), "./backup/big/arena8-apple/");
+        let joined = a.join(" ");
+        assert!(joined.contains("--delete"), "mirror tier mirrors with --delete");
+        assert!(!joined.contains("--max-size"), "mirror tier has no upper cap");
+        assert!(!joined.contains("--min-size"), "full mirror has no lower bound");
+        // shares the same excludes (HF cache etc.) as the snapshot tier
+        assert!(a.windows(2).any(|w| w[0] == "--exclude" && w[1] == "models--*/"));
+        // dateless running dest
+        assert_eq!(big_dest("./backup", "arena8-apple"), "./backup/big/arena8-apple/");
+        // and the snapshot tier still caps with --max-size and never deletes
+        let s = rsync_args(&target(), &PullConfig::small_tier("50M"), "./d/").join(" ");
+        assert!(s.contains("--max-size=50M") && !s.contains("--min-size") && !s.contains("--delete"));
+    }
+
+    #[test]
+    fn replication_excludes_claude_keeps_git_and_caches() {
+        let pc = PullConfig::replication();
+        let a = rsync_args(&target(), &pc, "root@5.6.7.8:");
+        // .claude is NOT re-included (would be ToS-sensitive to replicate pod->pod)…
+        assert!(!pc.includes.iter().any(|i| i.contains(".claude")));
+        // …and the whole .claude* family is excluded — crucially the `.claude.json` *file*
+        // (creds), which the dotdir-only `**/.*/` exclude would miss.
+        assert!(a.windows(2).any(|w| w[0] == "--exclude" && w[1] == ".claude*"));
+        assert!(a.windows(2).any(|w| w[0] == "--exclude" && w[1] == "**/.claude*"));
+        // .ssh is explicitly excluded too (never replicate keys/authorized_keys).
+        assert!(a.windows(2).any(|w| w[0] == "--exclude" && w[1] == ".ssh/"));
+        // .git is still kept (branch/commit state carries to the new pod).
+        assert!(a.windows(2).any(|w| w[0] == "--include" && w[1] == "**/.git/"));
+        // cache / HF model caches stay excluded (already covered by defaults).
+        for ex in [".cache/", "hf_cache/", "models--*/", "datasets--*/"] {
+            assert!(a.windows(2).any(|w| w[0] == "--exclude" && w[1] == ex), "missing exclude {ex}");
+        }
+        // full tree — no size cap for a replacement.
+        assert!(!a.iter().any(|x| x.starts_with("--max-size")));
+    }
+
+    #[test]
+    fn pod_to_pod_command_quotes_globs_and_targets_endpoint() {
+        let cmd = pod_to_pod_command("5.6.7.8", 22042, "root", "/root/.ssh/id_ed25519", &PullConfig::replication());
+        // runs rsync, authenticates with the deploy key over the dest's raw port…
+        assert!(cmd.starts_with("rsync "));
+        assert!(cmd.contains("ssh -p 22042"));
+        assert!(cmd.contains("-i /root/.ssh/id_ed25519"));
+        // …glob excludes are single-quoted so the source shell doesn't expand them…
+        assert!(cmd.contains("'**/.*/'"));
+        assert!(cmd.contains("'.claude*'"));
+        // …$HOME stays unquoted (remote shell expands it), dest is endpoint:home.
+        assert!(cmd.contains(" $HOME/ "));
+        assert!(cmd.trim_end().ends_with("root@5.6.7.8:"));
+    }
+
+    #[test]
+    fn push_rsync_flips_direction_local_to_remote() {
+        let pc = PullConfig::replication();
+        let a = push_rsync_args(&target(), &pc, "/tmp/stage/arena8-apple/");
+        // Same flags/excludes as a pull…
+        assert!(a.contains(&"-avz".to_string()));
+        assert!(a.windows(2).any(|w| w[0] == "--exclude" && w[1] == ".claude*"));
+        // …but local dir is the SOURCE and the pod is the DEST (reverse of rsync_args).
+        assert_eq!(a[a.len() - 2], "/tmp/stage/arena8-apple/");
+        assert_eq!(a[a.len() - 1], "root@1.2.3.4:");
+        // owner/group preservation is OFF on a push, so the dest home isn't chowned to the
+        // control user (which would lock sshd out).
+        assert!(a.contains(&"--no-owner".to_string()) && a.contains(&"--no-group".to_string()));
+        // transport still carries port + key
+        let e = a.iter().position(|x| x == "-e").unwrap();
+        assert!(a[e + 1].contains("-p 22001") && a[e + 1].contains("-i /root/.ssh/arena8_key"));
     }
 
     #[test]

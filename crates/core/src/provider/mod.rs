@@ -79,4 +79,29 @@ pub trait Provider: Send + Sync {
 
     /// Mutating and irreversible.
     async fn terminate_pod(&self, id: &str) -> Result<()>;
+
+    /// Mutating. Rename a pod in place (the cloud-side `name`). The blue-green `replace`
+    /// flow uses this to swap a freshly-built pod into the canonical machine name while
+    /// parking the old one under `<name>-old`. The pod's identity/disk/endpoint are
+    /// untouched — only the name changes.
+    ///
+    /// Default: unsupported. A provider whose API can't rename a live pod inherits this,
+    /// and `replace` refuses up front rather than half-running the swap.
+    async fn rename_pod(&self, _id: &str, _new_name: &str) -> Result<()> {
+        Err(Error::NotImplemented(format!(
+            "rename not supported on provider `{}`",
+            self.name()
+        )))
+    }
+
+    /// Read-only. Best-effort recovery of the spec needed to recreate this pod — the
+    /// "same spec by default" half of `replace`. `name` is returned empty for the caller
+    /// to fill; fields the provider can't recover are left at their spec defaults (the
+    /// caller layers config + CLI overrides on top). Default: unsupported.
+    async fn pod_spec(&self, _id: &str) -> Result<PodSpec> {
+        Err(Error::NotImplemented(format!(
+            "spec snapshot not supported on provider `{}`",
+            self.name()
+        )))
+    }
 }
