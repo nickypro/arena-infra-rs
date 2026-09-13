@@ -109,7 +109,7 @@ pub fn plan_forwards(
     for pod in pods {
         let idx = candidates
             .iter()
-            .position(|c| format!("{prefix}-{c}") == pod.name);
+            .position(|c| crate::naming::qualify(prefix, c) == pod.name);
         let Some(idx) = idx else {
             plan.skipped.push(Skipped {
                 name: pod.name.clone(),
@@ -257,6 +257,22 @@ mod tests {
         assert_eq!(plan.forwards[0].public_port, 65535);
         assert!(plan.skipped.iter().any(|s| s.name == "arena8-autumn" && s.reason.contains("65535")));
         assert!(plan.skipped.iter().any(|s| s.name == "arena8-bloom" && s.reason.contains("empty")));
+    }
+
+    #[test]
+    fn absolute_name_forwards_to_bare_pod_at_its_index_port() {
+        // An `@`-marked candidate forwards to the bare pod name and still gets its
+        // index-anchored port (index 2 -> 7002), exactly like a prefixed machine.
+        let candidates =
+            ["apple".to_string(), "autumn".into(), "@james-gpu".into()].to_vec();
+        let pods = vec![pod("james-gpu", Some("5.6.7.8"), Some(22055))];
+        let plan = plan_forwards(&cfg(), "arena8", &candidates, &pods);
+        assert_eq!(plan.forwards.len(), 1, "skipped: {:?}", plan.skipped);
+        let f = &plan.forwards[0];
+        assert_eq!(f.name, "james-gpu");
+        assert_eq!(f.public_port, 7002);
+        assert_eq!(f.target_ip, "5.6.7.8");
+        assert_eq!(f.target_port, 22055);
     }
 
     #[test]

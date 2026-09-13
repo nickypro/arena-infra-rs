@@ -44,14 +44,12 @@ pub struct KeyInfo {
     pub usage: Option<f64>,
 }
 
-/// The runtime-key name we give a machine, so keys are findable for rotate/revoke:
-/// `<prefix>-<machine>` with the prefix added once (a name already carrying it is kept).
-pub fn key_name(prefix: &str, machine: &str) -> String {
-    if machine.starts_with(&format!("{prefix}-")) {
-        machine.to_string()
-    } else {
-        format!("{prefix}-{machine}")
-    }
+/// The runtime-key name we give a machine, so keys are findable for rotate/revoke: the
+/// machine's canonical pod name. Normally `<prefix>-<machine>` (prefix added once), but an
+/// absolute (`@name`) list entry keeps its bare name — so the key label matches the pod,
+/// not a phantom `<prefix>-james-gpu`. Idempotent on already-qualified names.
+pub fn key_name(prefix: &str, candidates: &[String], machine: &str) -> String {
+    crate::naming::canonical_name(prefix, candidates, machine)
 }
 
 impl OpenRouter {
@@ -125,8 +123,11 @@ mod tests {
 
     #[test]
     fn key_name_adds_prefix_once() {
-        assert_eq!(key_name("arena8", "nova"), "arena8-nova");
-        assert_eq!(key_name("arena8", "arena8-nova"), "arena8-nova");
+        let cands = vec!["nova".to_string(), "@james-gpu".into()];
+        assert_eq!(key_name("arena8", &cands, "nova"), "arena8-nova");
+        assert_eq!(key_name("arena8", &cands, "arena8-nova"), "arena8-nova");
+        // absolute machine keeps its bare label (matches the pod name)
+        assert_eq!(key_name("arena8", &cands, "james-gpu"), "james-gpu");
     }
 
     #[test]

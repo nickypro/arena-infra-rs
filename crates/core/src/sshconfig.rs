@@ -63,10 +63,20 @@ pub fn render_proxy(
     candidates: &[String],
 ) -> String {
     let mut out = wildcard_block(prefix, user, identity_file, Some(proxy_host));
-    for (idx, name) in candidates.iter().enumerate() {
+    for (idx, entry) in candidates.iter().enumerate() {
         let port = starting_port as u32 + idx as u32;
-        if let Ok(port) = u16::try_from(port) {
-            out.push_str(&format!("\nHost {prefix}-{name}\n    Port {port}\n"));
+        let Ok(port) = u16::try_from(port) else { continue };
+        let name = crate::naming::qualify(prefix, entry);
+        if crate::naming::is_absolute(entry) {
+            // A bare name doesn't match the `Host {prefix}-*` wildcard, so it must carry the
+            // shared options itself (same User/HostName/IdentityFile the wildcard supplies).
+            out.push_str(&format!(
+                "\nHost {name}\n    User {user}\n    HostName {proxy_host}\n    \
+                 IdentityFile {identity_file}\n    UserKnownHostsFile=/dev/null\n    \
+                 StrictHostKeyChecking=no\n    Port {port}\n"
+            ));
+        } else {
+            out.push_str(&format!("\nHost {name}\n    Port {port}\n"));
         }
     }
     out
@@ -119,5 +129,22 @@ mod tests {
         assert!(cfg.contains("Host arena8-apple\n    Port 7000"));
         assert!(cfg.contains("Host arena8-autumn\n    Port 7001"));
         assert!(cfg.contains("Host arena8-bloom\n    Port 7002"));
+    }
+
+    #[test]
+    fn proxy_absolute_name_gets_bare_host_with_standalone_options() {
+        let candidates = ["apple".to_string(), "@james-gpu".into()].to_vec();
+        let cfg = render_proxy("arena8", "root", "~/.ssh/arena8_key", "cute.sus.cat", 7000, &candidates);
+        // prefixed machine relies on the wildcard: just Host + Port
+        assert!(cfg.contains("Host arena8-apple\n    Port 7000"));
+        // absolute machine: bare Host, carries its own options (won't match `arena8-*`),
+        // still on the proxy host at its index port (7001).
+        assert!(cfg.contains(
+            "Host james-gpu\n    User root\n    HostName cute.sus.cat\n    \
+             IdentityFile ~/.ssh/arena8_key\n    UserKnownHostsFile=/dev/null\n    \
+             StrictHostKeyChecking=no\n    Port 7001"
+        ));
+        // it must NOT be emitted as a prefixed host
+        assert!(!cfg.contains("arena8-james-gpu"));
     }
 }

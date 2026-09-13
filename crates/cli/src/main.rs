@@ -853,14 +853,12 @@ async fn resolve_explicit_names(
         if n.is_empty() {
             continue;
         }
-        let full = if n.starts_with(&format!("{prefix}-")) {
-            n.to_string()
-        } else {
-            format!("{prefix}-{n}")
-        };
-        let bare = full.strip_prefix(&format!("{prefix}-")).unwrap_or(&full);
-        if !cfg.machine_names.iter().any(|m| m == bare) {
-            eprintln!("warning: '{bare}' is not in MACHINE_NAME_LIST (creating anyway)");
+        let full = arena_core::naming::canonical_name(prefix, &cfg.machine_names, n);
+        // Membership check against the list: compare on the qualified name so absolute
+        // (`@james-gpu` → `james-gpu`) and prefixed entries both match without false warnings.
+        let known = cfg.machine_names.iter().any(|m| arena_core::naming::qualify(prefix, m) == full);
+        if !known {
+            eprintln!("warning: '{full}' is not in MACHINE_NAME_LIST (creating anyway)");
         }
         if taken.contains(full.as_str()) {
             eprintln!("skip {full} — already exists");
@@ -2897,14 +2895,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                 Some(
                     names
                         .iter()
-                        .map(|n| {
-                            let n = n.trim();
-                            if n.starts_with(&format!("{prefix}-")) {
-                                n.to_string()
-                            } else {
-                                format!("{prefix}-{n}")
-                            }
-                        })
+                        .map(|n| arena_core::naming::canonical_name(prefix, &cfg.machine_names, n))
                         .collect(),
                 )
             };
@@ -3223,7 +3214,7 @@ async fn proxy_reaches_pod(cfg: &Config, name: &str, expected_id: &str) -> Resul
     let idx = cfg
         .machine_names
         .iter()
-        .position(|c| format!("{prefix}-{c}") == name)
+        .position(|c| arena_core::naming::qualify(prefix, c) == name)
         .ok_or_else(|| anyhow::anyhow!("{name} not in MACHINE_NAME_LIST — no stable proxy port"))?;
     let port = px.starting_port.checked_add(idx as u16).ok_or_else(|| {
         anyhow::anyhow!("proxy port for {name} overflows u16 (starting_port + index too high)")
@@ -4890,9 +4881,9 @@ async fn handle_copy_keys(
 /// Where generated OpenRouter keys are persisted (also where `copy-keys` reads them).
 const OPENROUTER_KEYS_CSV: &str = "./keys/openrouter_api_keys.csv";
 
-/// Full pod name for a machine arg (prefix added once).
-fn full_machine_name(prefix: &str, m: &str) -> String {
-    if m.starts_with(&format!("{prefix}-")) { m.to_string() } else { format!("{prefix}-{m}") }
+/// Full pod name for a machine arg (prefix added once; honors absolute `@name` list entries).
+fn full_machine_name(prefix: &str, candidates: &[String], m: &str) -> String {
+    arena_core::naming::canonical_name(prefix, candidates, m)
 }
 
 /// Resolve which machines (full pod names) a `keys` action targets: `--all` = every
@@ -4900,6 +4891,7 @@ fn full_machine_name(prefix: &str, m: &str) -> String {
 async fn keys_targets(
     provider: &dyn Provider,
     prefix: &str,
+    candidates: &[String],
     machines: &[String],
     all: bool,
 ) -> Result<Vec<String>> {
@@ -4907,7 +4899,7 @@ async fn keys_targets(
         let pods = provider.list_pods().await.context("listing pods")?;
         Ok(pods.iter().map(|p| p.name.clone()).collect())
     } else if !machines.is_empty() {
-        Ok(machines.iter().map(|m| full_machine_name(prefix, m)).collect())
+        Ok(machines.iter().map(|m| full_machine_name(prefix, candidates, m)).collect())
     } else {
         anyhow::bail!("specify machine name(s) or --all")
     }
@@ -5015,7 +5007,7 @@ async fn handle_keys(cmd: KeysCmd, provider: &dyn Provider, cfg: &Config, yes: b
         }
 
         KeysCmd::Gen { machines, all, limit, copy, dry_run } => {
-            let names = keys_targets(provider, &prefix, &machines, all).await?;
+            let names = keys_targets(provider, &prefix, &cfg.machine_names, &machines, all).await?;
             let limit = limit.unwrap_or(default_limit);
             if names.is_empty() {
                 println!("(no target machines)");
@@ -5024,7 +5016,7 @@ async fn handle_keys(cmd: KeysCmd, provider: &dyn Provider, cfg: &Config, yes: b
             if dry_run {
                 println!("Dry-run — would mint a ${limit:.2}-cap key for {} machine(s):", names.len());
                 for h in &names {
-                    println!("  {}", key_name(&prefix, h));
+                    println!("  {}", key_name(&prefix, &cfg.machine_names, h));
                 }
                 return Ok(());
             }
@@ -5038,7 +5030,7 @@ async fn handle_keys(cmd: KeysCmd, provider: &dyn Provider, cfg: &Config, yes: b
             let existing = or.list_keys().await.context("listing existing keys")?;
             let (mut made, mut skipped, mut failed) = (0, 0, 0);
             for host in &names {
-                let kn = key_name(&prefix, host);
+                let kn = key_name(&prefix, &cfg.machine_names, host);
                 if existing.iter().any(|k| k.name.as_deref() == Some(&kn) && !k.disabled) {
                     println!("= {host}: '{kn}' already exists — use `arena keys rotate {host}` to replace");
                     skipped += 1;
@@ -5064,12 +5056,12 @@ async fn handle_keys(cmd: KeysCmd, provider: &dyn Provider, cfg: &Config, yes: b
         }
 
         KeysCmd::Rotate { machine, all, limit, copy, dry_run } => {
-            let names = keys_targets(provider, &prefix, &machine.into_iter().collect::<Vec<_>>(), all).await?;
+            let names = keys_targets(provider, &prefix, &cfg.machine_names, &machine.into_iter().collect::<Vec<_>>(), all).await?;
             let limit = limit.unwrap_or(default_limit);
             if dry_run {
                 println!("Dry-run — would delete + re-mint a key for {} machine(s):", names.len());
                 for h in &names {
-                    println!("  {}", key_name(&prefix, h));
+                    println!("  {}", key_name(&prefix, &cfg.machine_names, h));
                 }
                 return Ok(());
             }
@@ -5079,7 +5071,7 @@ async fn handle_keys(cmd: KeysCmd, provider: &dyn Provider, cfg: &Config, yes: b
             }
             let (mut ok, mut failed) = (0, 0);
             for host in &names {
-                let kn = key_name(&prefix, host);
+                let kn = key_name(&prefix, &cfg.machine_names, host);
                 // Delete the existing key (by name) if present, then mint a fresh one.
                 match or.find_by_name(&kn).await {
                     Ok(Some(k)) => {
@@ -5116,11 +5108,11 @@ async fn handle_keys(cmd: KeysCmd, provider: &dyn Provider, cfg: &Config, yes: b
         }
 
         KeysCmd::Revoke { machine, all, dry_run } => {
-            let names = keys_targets(provider, &prefix, &machine.into_iter().collect::<Vec<_>>(), all).await?;
+            let names = keys_targets(provider, &prefix, &cfg.machine_names, &machine.into_iter().collect::<Vec<_>>(), all).await?;
             if dry_run {
                 println!("Dry-run — would revoke the key for {} machine(s):", names.len());
                 for h in &names {
-                    println!("  {}", key_name(&prefix, h));
+                    println!("  {}", key_name(&prefix, &cfg.machine_names, h));
                 }
                 return Ok(());
             }
@@ -5130,7 +5122,7 @@ async fn handle_keys(cmd: KeysCmd, provider: &dyn Provider, cfg: &Config, yes: b
             }
             let (mut ok, mut missing, mut failed) = (0, 0, 0);
             for host in &names {
-                let kn = key_name(&prefix, host);
+                let kn = key_name(&prefix, &cfg.machine_names, host);
                 match or.find_by_name(&kn).await {
                     Ok(Some(k)) => match or.delete_key(&k.hash).await {
                         Ok(()) => {
