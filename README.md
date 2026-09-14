@@ -162,6 +162,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
   pod. Fetching runs in a **background task** so the UI never freezes; it auto-refreshes
   (`ARENA_REFRESH_SECS`, default 5) and `f` cycles the cadence live (2/5/10/20/60s).
   Provider via `ARENA_PROVIDER` (default `runpod`), config via `ARENA_CONFIG`.
+  Both binaries resolve the config the same way: `--config` (CLI) > `ARENA_CONFIG` >
+  `/home/dev/prod-ro/config.env` if it exists > `$XDG_CONFIG_HOME/arena/config.env`
+  (`~/.config/arena/config.env`). `arena config which` shows which one won.
   - **Columns**: a provider badge (`R`/`V`/`H`), NAME (short `apple` by default;
     `s` toggles full `arena8-apple` and the choice persists to
     `~/.config/arena-tui/prefs`), STATUS, a **SET** health glyph (`✓/✗/·` for `~/.name`,

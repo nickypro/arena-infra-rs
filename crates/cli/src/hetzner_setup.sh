@@ -4,7 +4,7 @@
 #   - docker + docker compose
 #   - uv + a Python 3.11 venv with the ARENA packages (CPU substitutions)
 #   - a ~/.zshrc / ~/.bashrc that auto-activates the venv, so `arena pods run`
-#     (which does `zsh -c 'source ~/.zshrc; …'`) lands in the right Python.
+#     (which runs `zsh -c 'source ~/.zshrc; …'` when zsh is present) lands in the right Python.
 #
 # The arena8 SSH key is attached at CREATE time by the provider (MACHINE_NAME_PREFIX),
 # so this script assumes you can already SSH in. Run as root on the pod:

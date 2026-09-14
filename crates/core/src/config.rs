@@ -6,7 +6,7 @@
 //! the bash/python scripts use — no migration required.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 
@@ -113,6 +113,97 @@ impl Config {
     pub fn get_parsed<T: std::str::FromStr>(&self, key: &str) -> Option<T> {
         self.get(key).and_then(|s| s.parse().ok())
     }
+}
+
+/// The read-only prod copy on the ARENA host. When it exists (and nothing more specific
+/// was asked for) it's the config — so the production host behaves exactly as before.
+pub const PROD_CONFIG: &str = "/home/dev/prod-ro/config.env";
+
+/// The environment variable naming a config file (below `--config`, above the defaults).
+pub const CONFIG_ENV_VAR: &str = "ARENA_CONFIG";
+
+/// Where the active config path came from, so `config which` can say so accurately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigSource {
+    /// An explicit `--config <path>`.
+    Flag,
+    /// The `ARENA_CONFIG` environment variable.
+    Env,
+    /// The default read-only prod copy ([`PROD_CONFIG`]), which exists on this host.
+    ProdDefault,
+    /// The per-user default, `$XDG_CONFIG_HOME/arena/config.env` (else
+    /// `~/.config/arena/config.env`), used when the prod copy isn't present.
+    UserDefault,
+}
+
+impl ConfigSource {
+    /// A short human description, e.g. for `config which`.
+    pub fn describe(self) -> &'static str {
+        match self {
+            ConfigSource::Flag => "--config flag",
+            ConfigSource::Env => "ARENA_CONFIG environment variable",
+            ConfigSource::ProdDefault => "default (read-only prod copy)",
+            ConfigSource::UserDefault => "default (user config; no prod copy on this host)",
+        }
+    }
+}
+
+/// The per-user config path: `$XDG_CONFIG_HOME/arena/config.env` when that's set to an
+/// absolute path (per the XDG spec, relative values are ignored), else
+/// `$HOME/.config/arena/config.env`. `None` when neither variable is usable.
+pub fn user_config_path() -> Option<PathBuf> {
+    user_config_path_with(|k| std::env::var_os(k))
+}
+
+fn user_config_path_with<F: Fn(&str) -> Option<std::ffi::OsString>>(var: F) -> Option<PathBuf> {
+    let nonempty = |k: &str| var(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let base = nonempty("XDG_CONFIG_HOME")
+        .filter(|p| p.is_absolute())
+        .or_else(|| nonempty("HOME").map(|h| h.join(".config")))?;
+    Some(base.join("arena").join("config.env"))
+}
+
+/// Resolve which config file to load — the one resolver shared by the CLI and the TUI so
+/// they can't drift. Precedence: `flag` (`--config`) > `ARENA_CONFIG` (empty = unset) >
+/// [`PROD_CONFIG`] if it exists > [`user_config_path`] if it exists. An explicit flag/env
+/// path is returned as-is even if missing (loading it then names that path in the error);
+/// if neither default exists the error lists both paths tried and how to point elsewhere.
+pub fn resolve_config_path(flag: Option<&Path>) -> Result<(PathBuf, ConfigSource)> {
+    resolve_config_path_with(
+        flag,
+        std::env::var_os(CONFIG_ENV_VAR),
+        user_config_path(),
+        |p| p.is_file(),
+    )
+}
+
+fn resolve_config_path_with<F: Fn(&Path) -> bool>(
+    flag: Option<&Path>,
+    env: Option<std::ffi::OsString>,
+    user: Option<PathBuf>,
+    exists: F,
+) -> Result<(PathBuf, ConfigSource)> {
+    if let Some(p) = flag {
+        return Ok((p.to_path_buf(), ConfigSource::Flag));
+    }
+    if let Some(e) = env.filter(|e| !e.is_empty()) {
+        return Ok((PathBuf::from(e), ConfigSource::Env));
+    }
+    let prod = PathBuf::from(PROD_CONFIG);
+    if exists(&prod) {
+        return Ok((prod, ConfigSource::ProdDefault));
+    }
+    if let Some(u) = user.as_ref().filter(|u| exists(u)) {
+        return Ok((u.clone(), ConfigSource::UserDefault));
+    }
+    let tried = match &user {
+        Some(u) => format!("{PROD_CONFIG} and {}", u.display()),
+        None => format!("{PROD_CONFIG} (no $XDG_CONFIG_HOME/$HOME for a user config)"),
+    };
+    Err(Error::Config(format!(
+        "no config file found (tried {tried}); pass --config <path> or set \
+         {CONFIG_ENV_VAR}=<path> (see config.env.example)"
+    )))
 }
 
 /// Return `text` with `key` set to `value` (quoted): replace the first `KEY=…` line if
@@ -228,5 +319,54 @@ MACHINE_NAME_LIST=(
         let mut c = Config::parse("IMAGE=base:1");
         c.apply_overrides(|k| (k == "CLAUDE_CODE_OAUTH_TOKEN").then(|| "cc_secret".to_string()));
         assert_eq!(c.get("CLAUDE_CODE_OAUTH_TOKEN"), Some("cc_secret"));
+    }
+
+    #[test]
+    fn user_config_path_prefers_absolute_xdg_then_home() {
+        let vars = |xdg: Option<&str>, home: Option<&str>| {
+            let (xdg, home) = (xdg.map(String::from), home.map(String::from));
+            move |k: &str| match k {
+                "XDG_CONFIG_HOME" => xdg.clone().map(Into::into),
+                "HOME" => home.clone().map(Into::into),
+                _ => None,
+            }
+        };
+        let got = |x, h| user_config_path_with(vars(x, h));
+        assert_eq!(got(Some("/x"), Some("/h")), Some(PathBuf::from("/x/arena/config.env")));
+        // Unset, empty or relative XDG_CONFIG_HOME falls back to ~/.config.
+        let home = Some(PathBuf::from("/h/.config/arena/config.env"));
+        assert_eq!(got(None, Some("/h")), home);
+        assert_eq!(got(Some(""), Some("/h")), home);
+        assert_eq!(got(Some("rel"), Some("/h")), home);
+        assert_eq!(got(None, None), None);
+    }
+
+    #[test]
+    fn resolve_config_precedence() {
+        let user = Some(PathBuf::from("/h/.config/arena/config.env"));
+        let all = |_: &Path| true;
+        // --config beats ARENA_CONFIG beats the defaults (even when those exist).
+        let (p, s) =
+            resolve_config_path_with(Some(Path::new("/f.env")), Some("/e.env".into()), user.clone(), all).unwrap();
+        assert_eq!((p.to_str().unwrap(), s), ("/f.env", ConfigSource::Flag));
+        let (p, s) = resolve_config_path_with(None, Some("/e.env".into()), user.clone(), all).unwrap();
+        assert_eq!((p.to_str().unwrap(), s), ("/e.env", ConfigSource::Env));
+        // Empty ARENA_CONFIG is treated as unset; the prod copy wins when present.
+        let (p, s) = resolve_config_path_with(None, Some("".into()), user.clone(), all).unwrap();
+        assert_eq!((p.to_str().unwrap(), s), (PROD_CONFIG, ConfigSource::ProdDefault));
+    }
+
+    #[test]
+    fn resolve_config_falls_back_to_user_config_then_errors() {
+        let user = PathBuf::from("/h/.config/arena/config.env");
+        // No prod copy on this host -> the user config.
+        let only_user = |p: &Path| p == Path::new("/h/.config/arena/config.env");
+        let (p, s) = resolve_config_path_with(None, None, Some(user.clone()), only_user).unwrap();
+        assert_eq!((p, s), (user.clone(), ConfigSource::UserDefault));
+        // Neither exists -> an error naming both paths and how to point elsewhere.
+        let e = resolve_config_path_with(None, None, Some(user), |_| false).unwrap_err().to_string();
+        assert!(e.contains(PROD_CONFIG), "{e}");
+        assert!(e.contains("/h/.config/arena/config.env"), "{e}");
+        assert!(e.contains("--config") && e.contains("ARENA_CONFIG"), "{e}");
     }
 }

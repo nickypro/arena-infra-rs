@@ -272,34 +272,52 @@ fn resolve_key_with<R: Fn(&str) -> bool>(configured: &str, home: Option<&str>, r
 /// Wrap a command so it runs with the participants' environment — the conda env active
 /// and the broadcast-token exports present — instead of a bare non-interactive shell.
 ///
-/// On the pods the login shell is **zsh**, and the participant setup lives in `~/.zshrc`:
-/// conda's `conda init` block (defining the `conda` shell function and activating
-/// `arena-env`) and the `setup`/`copy-keys` token exports (HF_TOKEN,
+/// On the ARENA pods the login shell is **zsh**, and the participant setup lives in
+/// `~/.zshrc`: conda's `conda init` block (defining the `conda` shell function and
+/// activating `arena-env`) and the `setup`/`copy-keys` token exports (HF_TOKEN,
 /// CLAUDE_CODE_OAUTH_TOKEN, …). A plain `ssh host 'cmd'` runs a non-interactive shell
-/// that never reads `~/.zshrc`, so none of that is present (a bare `bash -ic` reads
-/// `~/.bashrc`, which gets conda *base* but not the participants' `arena-env`). We
-/// therefore source `~/.zshrc` explicitly and then `conda activate <env>` so `python` and
-/// installed packages resolve to the participants' env (activation failure is left
-/// visible on stderr but never aborts the command). Pass `conda_env: None` to source the
-/// rc / tokens without an explicit activate. `~/.zshrc` has no non-interactive guard, so
-/// its init runs in full; using `zsh -c` (not `zsh -ic`) avoids the p10k/gitstatus
-/// chatter an interactive shell prints when it has no controlling TTY.
+/// that never reads an rc file, so none of that is present. Other images may have no zsh
+/// (or no conda) at all, so the wrapper picks the shell *on the pod*, at run time:
 ///
-/// The inner command is single-quoted for `zsh -c`; history expansion doesn't apply to a
-/// `-c` string, so a literal `!` is safe.
+/// - **zsh**, if installed and `~/.zshrc` exists: `zsh -c 'source ~/.zshrc; …'`.
+///   `~/.zshrc` has no non-interactive guard, so its init runs in full; `zsh -c` (not
+///   `zsh -ic`) avoids the p10k/gitstatus chatter an interactive shell prints without a
+///   TTY. This is the path the ARENA pods take.
+/// - else **bash**: `bash -ic '…'`, which reads `~/.bashrc` itself. Interactive (rather
+///   than `bash -c 'source ~/.bashrc'`) because stock `.bashrc`s `return` early when
+///   non-interactive, which would skip the token exports appended at the end; the
+///   job-control chatter that prints without a TTY is removed by
+///   [`strip_interactive_noise`].
+/// - else plain **sh** (no rc).
+///
+/// Then, only if `conda` is actually available in that shell, `conda activate <env>` so
+/// `python` and installed packages resolve to the participants' env. Activation output
+/// is discarded and a missing conda / env never aborts the command. Pass
+/// `conda_env: None` (or `Some("")`) for no activation at all (the rc is still sourced).
+///
+/// The selector itself is plain POSIX `if … fi`, so it works whatever the remote login
+/// shell is. The inner command is single-quoted (POSIX `'\''` escaping) for each `-c`;
+/// history expansion doesn't apply to a `-c` string, so a literal `!` is safe.
 pub fn login_shell_wrap(cmd: &str, conda_env: Option<&str>) -> String {
-    let inner = match conda_env.filter(|e| !e.is_empty()) {
+    let activate = match conda_env.filter(|e| !e.is_empty()) {
         Some(env) => {
-            format!("source ~/.zshrc 2>/dev/null; conda activate {env} >/dev/null 2>&1; {cmd}")
+            format!("command -v conda >/dev/null 2>&1 && conda activate {env} >/dev/null 2>&1; ")
         }
-        None => format!("source ~/.zshrc 2>/dev/null; {cmd}"),
+        None => String::new(),
     };
-    format!("zsh -c '{}'", inner.replace('\'', "'\\''"))
+    let quote = |s: String| format!("'{}'", s.replace('\'', "'\\''"));
+    let zsh = quote(format!("source ~/.zshrc 2>/dev/null; {activate}{cmd}"));
+    let other = quote(format!("{activate}{cmd}"));
+    format!(
+        "if command -v zsh >/dev/null 2>&1 && [ -f \"$HOME/.zshrc\" ]; then zsh -c {zsh}; \
+         elif command -v bash >/dev/null 2>&1; then bash -ic {other}; \
+         else sh -c {other}; fi"
+    )
 }
 
 /// Strip the harmless startup chatter an interactive shell prints when it has no
-/// controlling TTY (we run `bash -ic` without requesting a PTY). Leaves real output and
-/// errors untouched — only the two fixed job-control lines are removed.
+/// controlling TTY (e.g. [`login_shell_wrap`]'s `bash -ic`, run without a PTY). Leaves
+/// real output and errors untouched — only the two fixed job-control lines are removed.
 pub fn strip_interactive_noise(s: &str) -> String {
     s.lines()
         .filter(|l| {
@@ -422,22 +440,93 @@ mod tests {
 
     #[test]
     fn login_shell_wrap_activates_conda_and_quotes() {
-        // Sources ~/.zshrc (conda + token exports), activates the env, and single-quotes
-        // the whole inner command, escaping any embedded quotes.
+        // zsh (+ ~/.zshrc) first, else bash -i (reads ~/.bashrc), else sh. conda activate
+        // only when conda exists. Each inner command is single-quoted, escaping embedded
+        // quotes.
         let w = login_shell_wrap("python -c 'import torch'", Some("arena-env"));
+        let act = "command -v conda >/dev/null 2>&1 && conda activate arena-env >/dev/null 2>&1; ";
+        let q = r#"python -c '\''import torch'\''"#;
         assert_eq!(
             w,
-            r#"zsh -c 'source ~/.zshrc 2>/dev/null; conda activate arena-env >/dev/null 2>&1; python -c '\''import torch'\'''"#
+            format!(
+                r#"if command -v zsh >/dev/null 2>&1 && [ -f "$HOME/.zshrc" ]; then zsh -c 'source ~/.zshrc 2>/dev/null; {act}{q}'; elif command -v bash >/dev/null 2>&1; then bash -ic '{act}{q}'; else sh -c '{act}{q}'; fi"#
+            )
         );
     }
 
     #[test]
-    fn login_shell_wrap_without_env_just_sources_rc() {
-        // No conda env => still source ~/.zshrc (rc/tokens), but no explicit activation.
+    fn login_shell_wrap_without_env_skips_conda() {
+        // No conda env => still source the rc (tokens), but no conda at all.
         let w = login_shell_wrap("echo hi", None);
-        assert_eq!(w, r#"zsh -c 'source ~/.zshrc 2>/dev/null; echo hi'"#);
+        assert_eq!(
+            w,
+            r#"if command -v zsh >/dev/null 2>&1 && [ -f "$HOME/.zshrc" ]; then zsh -c 'source ~/.zshrc 2>/dev/null; echo hi'; elif command -v bash >/dev/null 2>&1; then bash -ic 'echo hi'; else sh -c 'echo hi'; fi"#
+        );
+        assert!(!w.contains("conda"));
         // Empty string is treated the same as None.
         assert_eq!(login_shell_wrap("echo hi", Some("")), w);
+    }
+
+    /// Actually run the wrapper through the local `sh` with a throwaway $HOME, for each
+    /// branch this machine can take: quotes and `!` survive, the selected shell's rc is
+    /// read, `conda activate` happens only when a `conda` exists, and a missing conda is
+    /// a silent no-op (exit 0).
+    #[cfg(unix)]
+    #[test]
+    fn login_shell_wrap_runs_portably() {
+        use std::process::Command;
+        // A minimal PATH hides any real conda; the rc files below define a fake one.
+        let path = "/usr/local/bin:/usr/bin:/bin";
+        let have = |bin: &str| {
+            Command::new("sh")
+                .arg("-c")
+                .arg(format!("command -v {bin}"))
+                .env("PATH", path)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        if !have("sh") {
+            return;
+        }
+        let home = std::env::temp_dir().join(format!("arena-wrap-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let cmd = r#"printf '%s|%s|%s|%s\n' "it's" 'a!b' "${RC:-none}" "${ENV_ON:-none}""#;
+        let run = || {
+            let out = Command::new("sh")
+                .arg("-c")
+                .arg(login_shell_wrap(cmd, Some("arena-env")))
+                .env_clear()
+                .env("HOME", &home)
+                .env("PATH", path)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            (out.status.success(), strip_interactive_noise(&stdout))
+        };
+        let fake_conda = "conda() { [ \"$1\" = activate ] && export ENV_ON=\"$2\"; }\n";
+
+        // No ~/.zshrc: bash -i reads ~/.bashrc (even past a non-interactive guard), or
+        // plain sh (no rc) when there's no bash. No conda => no activation, still exit 0.
+        let guarded = "case $- in *i*) ;; *) return;; esac\nexport RC=bash\n";
+        std::fs::write(home.join(".bashrc"), guarded).unwrap();
+        let bash = have("bash");
+        let want = if bash { "it's|a!b|bash|none" } else { "it's|a!b|none|none" };
+        assert_eq!(run(), (true, want.to_string()));
+        // With conda available, the env is activated.
+        std::fs::write(home.join(".bashrc"), format!("{guarded}{fake_conda}")).unwrap();
+        let want = if bash { "it's|a!b|bash|arena-env" } else { "it's|a!b|none|none" };
+        assert_eq!(run(), (true, want.to_string()));
+
+        // With zsh installed and a ~/.zshrc, that's what runs.
+        if have("zsh") {
+            std::fs::write(home.join(".zshrc"), "export RC=zsh\n").unwrap();
+            assert_eq!(run(), (true, "it's|a!b|zsh|none".to_string()));
+            std::fs::write(home.join(".zshrc"), format!("export RC=zsh\n{fake_conda}")).unwrap();
+            assert_eq!(run(), (true, "it's|a!b|zsh|arena-env".to_string()));
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
