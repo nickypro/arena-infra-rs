@@ -16,14 +16,14 @@
 //! pod without going through that modal — the dashboard's reads stay reads.
 //!
 //! Provider is chosen by `ARENA_PROVIDER` (default `runpod`); config path by
-//! `ARENA_CONFIG`; initial cadence by `ARENA_REFRESH_SECS` (default 5).
+//! `ARENA_CONFIG` (else the same defaults as the CLI: the read-only prod copy if present,
+//! then `~/.config/arena/config.env`); initial cadence by `ARENA_REFRESH_SECS` (default 5).
 
 mod prefs;
 mod state;
 
 use std::collections::HashMap;
 use std::io::{stdout, Stdout};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -57,7 +57,6 @@ use state::{
     NewPodForm, NpField, ProviderOpt,
 };
 
-const DEFAULT_CONFIG: &str = "/home/dev/prod-ro/config.env";
 /// Shorter than backup/setup's 10s: a down pod shouldn't stall a whole metrics sweep.
 const METRICS_CONNECT_TIMEOUT: u32 = 4;
 /// The cadences `f` cycles through (seconds).
@@ -165,10 +164,10 @@ impl Ui {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config_path =
-        std::env::var("ARENA_CONFIG").unwrap_or_else(|_| DEFAULT_CONFIG.to_string());
-    let cfg = Config::load(&PathBuf::from(&config_path))
-        .with_context(|| format!("loading config {config_path}"))?;
+    // Same resolver as the CLI (ARENA_CONFIG > prod copy > ~/.config/arena/config.env).
+    let (config_path, _) = arena_core::config::resolve_config_path(None)?;
+    let cfg = Config::load(&config_path)
+        .with_context(|| format!("loading config {}", config_path.display()))?;
     let provider_name = std::env::var("ARENA_PROVIDER").unwrap_or_else(|_| "runpod".to_string());
     // Fleet-spanning provider (like the CLI): the dashboard lists pods across ALL configured
     // backends — runpod + vast + hetzner — not just the primary. `warn_on_partial=false` so a
@@ -202,7 +201,7 @@ async fn main() -> Result<()> {
     let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena").to_string();
     let ui = Ui {
         provider_name,
-        config_path,
+        config_path: config_path.display().to_string(),
         prefix,
         short_names: Prefs::load().short_names,
         cfg,

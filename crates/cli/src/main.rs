@@ -12,9 +12,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use arena_core::provider::Provider;
+use arena_core::config::ConfigSource;
 use arena_core::{Config, PodSpec};
-
-const DEFAULT_CONFIG: &str = "/home/dev/prod-ro/config.env";
 
 #[derive(Parser)]
 #[command(
@@ -27,9 +26,10 @@ const DEFAULT_CONFIG: &str = "/home/dev/prod-ro/config.env";
     infer_subcommands = true
 )]
 struct Cli {
-    /// Path to config.env (defaults to the read-only prod copy).
-    #[arg(long, default_value = DEFAULT_CONFIG, global = true)]
-    config: PathBuf,
+    /// Path to config.env. If omitted: $ARENA_CONFIG, else /home/dev/prod-ro/config.env
+    /// if present, else $XDG_CONFIG_HOME/arena/config.env (~/.config/arena/config.env).
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
 
     /// Compute provider to target.
     #[arg(long, default_value = "runpod", global = true)]
@@ -668,9 +668,10 @@ enum PodCmd {
     },
     /// Run a shell command on every pod over SSH (concurrent).
     ///
-    /// Runs inside an interactive shell with the conda env active (default `arena-env`,
-    /// override via `CONDA_ENV`; set it empty to disable), so commands see the
-    /// participants' python/packages and the token exports written by `setup`.
+    /// Runs inside the pod's shell with its rc sourced (zsh + ~/.zshrc if present, else
+    /// bash + ~/.bashrc, else sh) and the conda env active when conda exists (default
+    /// `arena-env`, override via `CONDA_ENV`; set it empty to disable), so commands see
+    /// the participants' python/packages and the token exports written by `setup`.
     Run {
         /// The command to run (everything after `run`).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
@@ -1075,8 +1076,10 @@ async fn create_pods(
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let cfg = Config::load(&cli.config)
-        .with_context(|| format!("loading config {}", cli.config.display()))?;
+    // One resolver shared with arena-tui (flag > ARENA_CONFIG > prod copy > user config).
+    let (config_path, config_source) = arena_core::config::resolve_config_path(cli.config.as_deref())?;
+    let cfg = Config::load(&config_path)
+        .with_context(|| format!("loading config {}", config_path.display()))?;
 
     // `config check` must work even when a provider key is missing (that's what it's
     // for), so build the provider lazily — only for commands that actually talk to one.
@@ -1088,10 +1091,10 @@ async fn main() -> Result<()> {
     };
 
     match cli.cmd {
-        Cmd::Tui => launch_tui(&cli.provider, &cli.config),
+        Cmd::Tui => launch_tui(&cli.provider, &config_path),
         Cmd::Plan(c) => handle_plan(c, provider.unwrap().as_ref(), &cfg).await,
-        Cmd::Config(c) => handle_config(c, &cfg, &cli.provider, &cli.config),
-        Cmd::Cron(c) => handle_cron(c, &cli.config).await,
+        Cmd::Config(c) => handle_config(c, &cfg, &cli.provider, &config_path, config_source),
+        Cmd::Cron(c) => handle_cron(c, &config_path).await,
         Cmd::Pods(p) => handle_pods(p, provider.unwrap().as_ref(), &cfg, cli.yes).await,
         Cmd::Proxy(p) => handle_proxy(p, provider.unwrap().as_ref(), &cfg, cli.yes).await,
         Cmd::SshConfig { proxy, out } => {
@@ -1662,10 +1665,11 @@ fn handle_config(
     cfg: &Config,
     provider_name: &str,
     config_path: &std::path::Path,
+    config_source: ConfigSource,
 ) -> Result<()> {
     match cmd {
         ConfigCmd::Check => config_check(cfg, provider_name),
-        ConfigCmd::Which => config_which(cfg, provider_name, config_path),
+        ConfigCmd::Which => config_which(cfg, provider_name, config_path, config_source),
         ConfigCmd::Set { key, value } => {
             let (key, value) = match (key, value) {
                 (Some(k), Some(v)) => (k, v),
@@ -1691,12 +1695,13 @@ fn handle_config(
 }
 
 /// Report one config key: prints a ✓/✗/· line (never the value if `secret`) and
-/// records it in `missing` when it's required but absent/empty.
+/// records it in `missing` when it's required but absent/empty. An absent optional key
+/// reads "not set" rather than "(missing)", which is reserved for required ones.
 fn cfg_row(cfg: &Config, missing: &mut Vec<String>, key: &str, required: bool, secret: bool) {
     let ok = cfg.get(key).map(|v| !v.is_empty()).unwrap_or(false);
     let mark = if ok { "✓" } else if required { "✗" } else { "·" };
     let shown = if !ok {
-        "(missing)".to_string()
+        if required { "(missing)" } else { "not set" }.to_string()
     } else if secret {
         "(set)".to_string()
     } else {
@@ -1705,6 +1710,21 @@ fn cfg_row(cfg: &Config, missing: &mut Vec<String>, key: &str, required: bool, s
     println!("  {mark} {key:<28} {shown}");
     if required && !ok {
         missing.push(key.to_string());
+    }
+}
+
+/// Report the keys of an opt-in feature (proxy, git backups). When none are set, print a
+/// single `·` "not configured" line naming what the feature is for, instead of a row of
+/// "missing" keys that reads like a failure on a setup that simply doesn't use it. When
+/// any are set, show every row so a half-configured feature shows what's absent. Never
+/// counts toward `missing` (exit code), since the feature is optional.
+fn cfg_optional_group(cfg: &Config, missing: &mut Vec<String>, keys: &[&str], needed_for: &str) {
+    if keys.iter().all(|k| cfg.get(k).is_none_or(str::is_empty)) {
+        println!("  · not configured (only needed for {needed_for})");
+        return;
+    }
+    for k in keys {
+        cfg_row(cfg, missing, k, false, false);
     }
 }
 
@@ -1808,10 +1828,16 @@ fn interactive_config_set(cfg: &Config) -> Result<(String, String)> {
     Ok((key, value))
 }
 
-/// `config which`: show the active config file (path, readable/writable), a one-line
-/// summary of what parsed, and any keys currently being supplied by the environment
-/// (which silently override the file) so it's clear where values are coming from.
-fn config_which(cfg: &Config, provider_name: &str, config_path: &std::path::Path) -> Result<()> {
+/// `config which`: show the active config file (path, readable/writable), where that path
+/// came from (`--config` / `ARENA_CONFIG` / which default), a one-line summary of what
+/// parsed, and any keys currently being supplied by the environment (which silently
+/// override the file) so it's clear where values are coming from.
+fn config_which(
+    cfg: &Config,
+    provider_name: &str,
+    config_path: &std::path::Path,
+    source: ConfigSource,
+) -> Result<()> {
     let abs = std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
     let meta = std::fs::metadata(&abs).ok();
     let readable = std::fs::File::open(&abs).is_ok();
@@ -1826,9 +1852,9 @@ fn config_which(cfg: &Config, provider_name: &str, config_path: &std::path::Path
         if readable { "✓ readable" } else { "✗ not readable" },
         if writable { "writable" } else { "read-only (config set can't write here)" },
     );
-    if std::env::var("ARENA_CONFIG").is_ok() {
-        println!("  source: ARENA_CONFIG environment variable");
-    }
+    // The source actually used (a set ARENA_CONFIG is shadowed by --config, so don't just
+    // check the env var).
+    println!("  source: {}", source.describe());
     println!("\nLoaded: provider {provider_name} · {} key(s) · {} machine name(s)",
         cfg.values.len(), cfg.machine_names.len());
 
@@ -1910,13 +1936,21 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
     cfg_row(cfg, &mut missing, "SHARED_SSH_KEY_PATH", false, false);
 
     println!("\nProxy (`proxy plan`):");
-    cfg_row(cfg, &mut missing, "SSH_PROXY_HOST", false, false);
-    cfg_row(cfg, &mut missing, "SSH_PROXY_STARTING_PORT", false, false);
+    cfg_optional_group(
+        cfg,
+        &mut missing,
+        &["SSH_PROXY_HOST", "SSH_PROXY_STARTING_PORT"],
+        "`proxy` / `ssh-config --proxy`",
+    );
 
     println!("\nBackup (git `backup` + file `pull`):");
-    cfg_row(cfg, &mut missing, "ARENA_REPO_NAME", false, false);
-    cfg_row(cfg, &mut missing, "GIT_SSH_KEY_REMOTE", false, false);
-    cfg_row(cfg, &mut missing, "ARENA_START_DATE", false, false); // wNdM label (init-branches / pull)
+    // ARENA_START_DATE = the wNdM label (init-branches / pull).
+    cfg_optional_group(
+        cfg,
+        &mut missing,
+        &["ARENA_REPO_NAME", "GIT_SSH_KEY_REMOTE", "ARENA_START_DATE"],
+        "ARENA git backups: `pods backup` / `init-branches`",
+    );
     // Where `pods pull` rsyncs pod files to locally (config LOCAL_BACKUP_DIR, else ./backup),
     // shown as an absolute path so it's obvious where backups land.
     let backup_dir = local_backup_dir(cfg);
@@ -1984,10 +2018,12 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
         if plan_present { "✓" } else { "·" },
         if plan_present { "arena-plan.json" } else { "none (optional — `arena plan`)" }
     );
+    // Optional: only ARENA backup branches are labelled by it, so unset isn't a failure.
     println!(
         "  {} iteration start date       {}",
-        if cfg.get("ARENA_START_DATE").is_some() { "✓" } else { "✗" },
-        cfg.get("ARENA_START_DATE").unwrap_or("unset — backups can't label wNdM")
+        if cfg.get("ARENA_START_DATE").is_some() { "✓" } else { "·" },
+        cfg.get("ARENA_START_DATE")
+            .unwrap_or("not set (only needed to label ARENA backup branches wNdM)")
     );
 
     if missing.is_empty() {
@@ -2965,9 +3001,11 @@ async fn handle_run(
         return Ok(());
     }
 
-    // Source the participants' ~/.zshrc and activate the conda env, so commands see the
-    // participants' `arena-env` (python/packages) and the token exports from setup.
-    // `CONDA_ENV=""` in config disables activation (still sources the rc for tokens).
+    // Source the participants' rc (~/.zshrc, else ~/.bashrc) and activate the conda env,
+    // so commands see the participants' `arena-env` (python/packages) and the token
+    // exports from setup. Activation is skipped on the pod when there's no conda, so the
+    // ARENA default is harmless elsewhere; `CONDA_ENV=""` in config disables it outright
+    // (still sources the rc for tokens).
     let conda_env = cfg.get("CONDA_ENV").unwrap_or("arena-env");
     let remote = ssh::login_shell_wrap(cmd, Some(conda_env));
 
