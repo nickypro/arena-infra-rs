@@ -1808,6 +1808,40 @@ fn interactive_config_set(cfg: &Config) -> Result<(String, String)> {
     Ok((key, value))
 }
 
+/// What `config which` should report about `ARENA_CONFIG`.
+///
+/// The variable picks the config file for `arena-tui`, but this CLI resolves its path
+/// from `--config` alone. Reporting the variable as the config's "source" whenever it
+/// merely happens to be set names a file we may never have read — and the dangerous
+/// shape of that is a developer with `ARENA_CONFIG` pointed at a local file while the
+/// CLI silently loads the read-only prod default. So say which way it actually went.
+#[derive(Debug, PartialEq, Eq)]
+enum EnvConfigNote {
+    /// `ARENA_CONFIG` is unset — nothing to report.
+    Unset,
+    /// Set, and resolving to the same file the CLI loaded: consistent, worth confirming.
+    SameFile,
+    /// Set, but pointing elsewhere — the CLI ignored it. Warn.
+    Ignored { env_path: String },
+}
+
+/// Pure: decide the note from the raw variable and the config path actually loaded.
+fn env_config_note(env_config: Option<&str>, active: &std::path::Path) -> EnvConfigNote {
+    let Some(raw) = env_config else {
+        return EnvConfigNote::Unset;
+    };
+    // Compare canonicalized, so `./config.env` and an absolute path to the same file
+    // don't read as a mismatch. A non-existent ARENA_CONFIG can't canonicalize, and
+    // falls back to the literal value — which won't equal the loaded path, so it
+    // correctly lands in `Ignored`.
+    let env_abs = std::fs::canonicalize(raw).unwrap_or_else(|_| PathBuf::from(raw));
+    if env_abs == active {
+        EnvConfigNote::SameFile
+    } else {
+        EnvConfigNote::Ignored { env_path: raw.to_string() }
+    }
+}
+
 /// `config which`: show the active config file (path, readable/writable), a one-line
 /// summary of what parsed, and any keys currently being supplied by the environment
 /// (which silently override the file) so it's clear where values are coming from.
@@ -1826,8 +1860,16 @@ fn config_which(cfg: &Config, provider_name: &str, config_path: &std::path::Path
         if readable { "✓ readable" } else { "✗ not readable" },
         if writable { "writable" } else { "read-only (config set can't write here)" },
     );
-    if std::env::var("ARENA_CONFIG").is_ok() {
-        println!("  source: ARENA_CONFIG environment variable");
+    match env_config_note(std::env::var("ARENA_CONFIG").ok().as_deref(), &abs) {
+        EnvConfigNote::Unset => {}
+        EnvConfigNote::SameFile => {
+            println!("  ARENA_CONFIG (read by arena-tui) points at this same file");
+        }
+        EnvConfigNote::Ignored { env_path } => {
+            println!("  ⚠ ARENA_CONFIG is set to {env_path}, but this CLI reads only --config,");
+            println!("    so that file was NOT loaded (only arena-tui honors the variable).");
+            println!("    Pass --config {env_path} to load it.");
+        }
     }
     println!("\nLoaded: provider {provider_name} · {} key(s) · {} machine name(s)",
         cfg.values.len(), cfg.machine_names.len());
@@ -5298,6 +5340,31 @@ mod selection_tests {
 #[cfg(test)]
 mod tests {
     use super::{strip_arena_block, with_arena_block, CRON_BEGIN, CRON_END};
+
+    #[test]
+    fn env_config_note_only_claims_arena_config_when_it_matches() {
+        use super::{env_config_note, EnvConfigNote};
+        use std::path::Path;
+
+        // Unset: say nothing.
+        assert_eq!(env_config_note(None, Path::new("/etc/arena/config.env")), EnvConfigNote::Unset);
+
+        // Set but pointing elsewhere — the CLI loaded the prod default and ignored it.
+        // This is the case the old code mislabeled as "source: ARENA_CONFIG".
+        assert_eq!(
+            env_config_note(Some("/home/me/arena/config.env"), Path::new("/home/dev/prod-ro/config.env")),
+            EnvConfigNote::Ignored { env_path: "/home/me/arena/config.env".into() },
+        );
+
+        // Set and resolving to the very file we loaded: consistent.
+        let dir = std::env::temp_dir().join("arena_env_config_note_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("config.env");
+        std::fs::write(&f, "RUNPOD_API_KEY=\"x\"\n").unwrap();
+        let canon = std::fs::canonicalize(&f).unwrap();
+        assert_eq!(env_config_note(Some(f.to_str().unwrap()), &canon), EnvConfigNote::SameFile);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn provisioning_steps_branch_by_provider() {
