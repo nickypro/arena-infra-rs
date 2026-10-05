@@ -530,6 +530,29 @@ enum PodCmd {
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
+    /// Rename a pod (metadata only — the container is NOT restarted), then re-point the proxy.
+    ///
+    /// `rename <old> <new>` renames one pod; `<new>` must be a free MACHINE_NAME_LIST name
+    /// (bare `apple` or full `arena9-apple`). `rename --from-prefix arena8` renames every
+    /// `arena8-<x>` to `{MACHINE_NAME_PREFIX}-<x>` — for a cohort prefix change. Every rename
+    /// is validated up front; nothing is touched if any of them is invalid.
+    Rename {
+        /// Current machine name (e.g. arena8-apple) or raw provider id.
+        #[arg(required_unless_present = "from_prefix", conflicts_with = "from_prefix")]
+        target: Option<String>,
+        /// New machine name (must be in MACHINE_NAME_LIST and not taken).
+        #[arg(required_unless_present = "from_prefix")]
+        new_name: Option<String>,
+        /// Rename every `<from_prefix>-<x>` pod to `{MACHINE_NAME_PREFIX}-<x>`.
+        #[arg(long)]
+        from_prefix: Option<String>,
+        /// Don't redeploy the proxy afterwards.
+        #[arg(long)]
+        skip_proxy: bool,
+        /// Preview only: print what would happen, change nothing.
+        #[arg(long, visible_aliases = ["dryrun", "dry"])]
+        dry_run: bool,
+    },
     /// Replace a pod with a fresh one on a new host, keeping its name + files (blue-green).
     ///
     /// Unlike `restart` (same host — useless when the *host* is the problem), `replace`
@@ -2773,6 +2796,10 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             }
         }
 
+        PodCmd::Rename { target, new_name, from_prefix, skip_proxy, dry_run } => {
+            handle_rename(provider, cfg, target, new_name, from_prefix, skip_proxy, dry_run, yes).await?;
+        }
+
         PodCmd::Replace { target, gpu, gpus, cloud, disk, volume, image, keep_old, skip_proxy, dry_run } => {
             let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap: false };
             handle_replace(cfg, &target, &ov, keep_old, skip_proxy, dry_run, yes).await?;
@@ -3125,6 +3152,129 @@ async fn handle_set_branch(
 
 /// Does `token` identify `pod`? Matches the full name, the provider id, or a **bare
 /// short name** (`zebra` ⇒ `<prefix>-zebra`), so targets/filters accept either form.
+/// `pods rename`: validate every (old → new) pair, confirm, rename via the provider's
+/// metadata-only rename, then redeploy the proxy so stable ports follow the new names.
+#[allow(clippy::too_many_arguments)]
+async fn handle_rename(
+    provider: &dyn Provider,
+    cfg: &Config,
+    target: Option<String>,
+    new_name: Option<String>,
+    from_prefix: Option<String>,
+    skip_proxy: bool,
+    dry_run: bool,
+    yes: bool,
+) -> Result<()> {
+    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
+    let pods = provider.list_pods().await.context("listing pods")?;
+    let request = match (from_prefix, target, new_name) {
+        (Some(from), _, _) => RenameRequest::FromPrefix(from),
+        (None, Some(old), Some(new)) => RenameRequest::One { old, new },
+        _ => anyhow::bail!("pass `<old> <new>` or `--from-prefix <prefix>`"),
+    };
+    let plan = plan_renames(prefix, &cfg.machine_names, &pods, &request)?;
+    if plan.is_empty() {
+        println!("nothing to rename.");
+        return Ok(());
+    }
+    let summary: Vec<String> = plan.iter().map(|r| format!("  {} → {} (id={})", r.old, r.new, r.id)).collect();
+    if dry_run {
+        println!("[dry-run] would rename {} pod(s):\n{}", plan.len(), summary.join("\n"));
+        if !skip_proxy {
+            println!("  then redeploy the proxy");
+        }
+        println!("[dry-run] nothing changed.");
+        return Ok(());
+    }
+    if !confirm(yes, &format!("Will rename {} pod(s):\n{}", plan.len(), summary.join("\n")))? {
+        println!("aborted.");
+        return Ok(());
+    }
+    let policy = arena_core::retry::RetryPolicy::default();
+    for (i, r) in plan.iter().enumerate() {
+        if let Err(e) = arena_core::retry::retrying(&policy, || provider.rename_pod(&r.id, &r.new)).await {
+            anyhow::bail!(
+                "renaming {} → {} failed: {e}\n{i} of {} rename(s) done; proxy NOT redeployed",
+                r.old,
+                r.new,
+                plan.len()
+            );
+        }
+        println!("[renamed] {} → {}", r.old, r.new);
+    }
+    if skip_proxy {
+        println!("(proxy not redeployed — run `arena proxy apply`)");
+    } else {
+        apply_proxy(cfg, provider).await.context("renames done, but redeploying the proxy failed")?;
+    }
+    Ok(())
+}
+
+enum RenameRequest {
+    One { old: String, new: String },
+    FromPrefix(String),
+}
+
+#[derive(Debug, PartialEq)]
+struct PlannedRename {
+    id: String,
+    old: String,
+    new: String,
+}
+
+/// Pure planner for `pods rename`. Every new name must be a MACHINE_NAME_LIST entry (so it
+/// has a stable proxy port) and not held by another pod or another rename in the batch.
+/// All problems are collected and reported together; any problem → no plan.
+fn plan_renames(
+    prefix: &str,
+    candidates: &[String],
+    pods: &[arena_core::Pod],
+    request: &RenameRequest,
+) -> Result<Vec<PlannedRename>> {
+    use std::collections::HashSet;
+    let pairs: Vec<(&arena_core::Pod, String)> = match request {
+        RenameRequest::One { old, new } => {
+            let pod = pods
+                .iter()
+                .find(|p| pod_matches(p, old, prefix))
+                .ok_or_else(|| anyhow::anyhow!("no pod with name or id '{old}' (run `arena pods list`)"))?;
+            vec![(pod, arena_core::naming::canonical_name(prefix, candidates, new))]
+        }
+        RenameRequest::FromPrefix(from) => {
+            let pre = format!("{from}-");
+            pods.iter()
+                .filter_map(|p| p.name.strip_prefix(&pre).map(|rest| (p, format!("{prefix}-{rest}"))))
+                .filter(|(p, new)| p.name != *new)
+                .collect()
+        }
+    };
+    let valid: HashSet<String> = candidates.iter().map(|c| arena_core::naming::qualify(prefix, c)).collect();
+    let renamed: HashSet<&str> = pairs.iter().map(|(p, _)| p.id.as_str()).collect();
+    // Names still held after the batch: pods not being renamed keep theirs.
+    let held: HashSet<&str> =
+        pods.iter().filter(|p| !renamed.contains(p.id.as_str())).map(|p| p.name.as_str()).collect();
+    let mut seen = HashSet::new();
+    let mut problems = Vec::new();
+    for (pod, new) in &pairs {
+        if pod.name == *new {
+            problems.push(format!("{} is already named {new}", pod.name));
+        } else if !valid.contains(new) {
+            problems.push(format!("{} → {new}: not in MACHINE_NAME_LIST (no stable proxy port)", pod.name));
+        } else if held.contains(new.as_str()) {
+            problems.push(format!("{} → {new}: name already taken by another pod", pod.name));
+        } else if !seen.insert(new.clone()) {
+            problems.push(format!("{} → {new}: two pods would get this name", pod.name));
+        }
+    }
+    if !problems.is_empty() {
+        anyhow::bail!("refusing to rename anything:\n  {}", problems.join("\n  "));
+    }
+    Ok(pairs
+        .into_iter()
+        .map(|(p, new)| PlannedRename { id: p.id.clone(), old: p.name.clone(), new })
+        .collect())
+}
+
 fn pod_matches(pod: &arena_core::Pod, token: &str, prefix: &str) -> bool {
     pod.name == token || pod.id == token || pod.name == format!("{prefix}-{token}")
 }
@@ -5443,5 +5593,57 @@ mod tests {
         let (new, old) = replace_stage_names("arena8-apple");
         assert_eq!(new, "arena8-apple-new");
         assert_eq!(old, "arena8-apple-old");
+    }
+
+    fn rename_pod_fixture(id: &str, name: &str) -> arena_core::Pod {
+        arena_core::Pod {
+            id: id.into(),
+            name: name.into(),
+            provider: "runpod".into(),
+            status: "RUNNING".into(),
+            gpu_type: None,
+            cost_per_hr: None,
+            ssh_ip: None,
+            ssh_port: None,
+        }
+    }
+
+    fn rename_list() -> Vec<String> {
+        ["apple", "bloom", "cloud", "@james-gpu"].iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn rename_from_prefix_moves_whole_cohort() {
+        use super::{plan_renames, RenameRequest};
+        let pods = vec![
+            rename_pod_fixture("a", "arena8-apple"),
+            rename_pod_fixture("b", "arena8-bloom"),
+            rename_pod_fixture("j", "james-gpu"),
+        ];
+        let plan = plan_renames("arena9", &rename_list(), &pods, &RenameRequest::FromPrefix("arena8".into())).unwrap();
+        let got: Vec<(&str, &str)> = plan.iter().map(|r| (r.old.as_str(), r.new.as_str())).collect();
+        assert_eq!(got, vec![("arena8-apple", "arena9-apple"), ("arena8-bloom", "arena9-bloom")]);
+    }
+
+    #[test]
+    fn rename_from_prefix_refuses_all_if_any_off_list() {
+        use super::{plan_renames, RenameRequest};
+        let pods = vec![rename_pod_fixture("a", "arena8-apple"), rename_pod_fixture("z", "arena8-zebra")];
+        let err = plan_renames("arena9", &rename_list(), &pods, &RenameRequest::FromPrefix("arena8".into())).unwrap_err();
+        assert!(err.to_string().contains("arena9-zebra: not in MACHINE_NAME_LIST"), "{err}");
+    }
+
+    #[test]
+    fn rename_one_bare_new_name_and_taken_check() {
+        use super::{plan_renames, RenameRequest};
+        let pods = vec![rename_pod_fixture("a", "arena9-apple"), rename_pod_fixture("b", "arena9-bloom")];
+        let one = |old: &str, new: &str| RenameRequest::One { old: old.into(), new: new.into() };
+        let plan = plan_renames("arena9", &rename_list(), &pods, &one("apple", "cloud")).unwrap();
+        assert_eq!((plan[0].id.as_str(), plan[0].new.as_str()), ("a", "arena9-cloud"));
+        let err = plan_renames("arena9", &rename_list(), &pods, &one("apple", "bloom")).unwrap_err();
+        assert!(err.to_string().contains("already taken"), "{err}");
+        // Absolute list entries resolve without the prefix.
+        let plan = plan_renames("arena9", &rename_list(), &pods, &one("b", "james-gpu")).unwrap();
+        assert_eq!(plan[0].new, "james-gpu");
     }
 }
