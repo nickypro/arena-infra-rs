@@ -10,10 +10,10 @@ The RunPod image that `arena pods create` launches (`IMAGE=` in `config.env`). I
 ## Build & push
 
 ```bash
-docker build -t nickypro/arena-env:9.0 docker/
+docker build -t nickypro/arena-env:9.1 docker/
 # to use a different repo or branch:
 #   --build-arg ARENA_REPO_ARG=owner/repo --build-arg ARENA_BRANCH_ARG=branch
-docker login -u nickypro && docker push nickypro/arena-env:9.0
+docker login -u nickypro && docker push nickypro/arena-env:9.1
 ```
 
 Needs ~120GB of free disk (~50GB uncompressed, ~18GB compressed on Docker Hub). The
@@ -23,6 +23,6 @@ install Docker, rsync `docker/` over, then build, test, push and destroy the ser
 ## Smoke test
 
 ```bash
-docker run --rm nickypro/arena-env:9.0 zsh -lc 'which python; pip show torch | head -2; \
+docker run --rm nickypro/arena-env:9.1 zsh -lc 'which python; pip show torch | head -2; \
   python -c "import torch, wandb, transformer_lens"; ls /root/ARENA_materials'
 ```
