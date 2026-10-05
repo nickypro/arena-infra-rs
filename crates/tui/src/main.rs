@@ -232,7 +232,7 @@ async fn fetch_loop(
 ) {
     // The per-pod probe gathers GPU stats + branch + setup health in one SSH call.
     let repo_path = cfg.get("BACKUP_REPO_PATH").map(String::from).unwrap_or_else(|| {
-        format!("/root/{}", cfg.get("ARENA_REPO_NAME").unwrap_or("ARENA_3.0"))
+        format!("/root/{}", cfg.get("ARENA_REPO_NAME").unwrap_or("ARENA_materials"))
     });
     let opts = ProbeOpts {
         progress_cmd,
@@ -1107,7 +1107,7 @@ async fn run_set_branch(cfg: &Config, pod: &Pod, branch: &str) -> String {
         Err(e) => return format!("✗ {}: {e}", pod.name),
     };
     let repo_path = cfg.get("BACKUP_REPO_PATH").map(String::from).unwrap_or_else(|| {
-        format!("/root/{}", cfg.get("ARENA_REPO_NAME").unwrap_or("ARENA_3.0"))
+        format!("/root/{}", cfg.get("ARENA_REPO_NAME").unwrap_or("ARENA_materials"))
     });
     // The TUI set-branch is gentle (ff-only); the destructive --hard reset is CLI-only.
     let cmd = arena_core::backup::checkout_command(&repo_path, branch, cfg.get("GIT_SSH_KEY_REMOTE"), false);
@@ -1142,7 +1142,7 @@ async fn run_backup(cfg: &Config, pod: &Pod) -> String {
 /// The ARENA checkout path on a pod (config `BACKUP_REPO_PATH`, else /root/<repo name>).
 fn backup_repo_path(cfg: &Config) -> String {
     cfg.get("BACKUP_REPO_PATH").map(String::from).unwrap_or_else(|| {
-        format!("/root/{}", cfg.get("ARENA_REPO_NAME").unwrap_or("ARENA_3.0"))
+        format!("/root/{}", cfg.get("ARENA_REPO_NAME").unwrap_or("ARENA_materials"))
     })
 }
 
@@ -1889,7 +1889,7 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
             .unwrap_or_default();
         f.render_widget(
             Paragraph::new(text)
-                .block(Block::default().borders(Borders::TOP).title("recent commits (ARENA_3.0)")),
+                .block(Block::default().borders(Borders::TOP).title("recent commits (ARENA repo)")),
             rows[ci],
         );
     }

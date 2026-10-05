@@ -102,6 +102,9 @@ impl Provider for MultiProvider {
     async fn rename_pod(&self, id: &str, new_name: &str) -> Result<()> {
         self.backend_for(id).await?.rename_pod(id, new_name).await
     }
+    async fn reimage_pod(&self, id: &str, image: &str, env: &[(String, String)]) -> Result<()> {
+        self.backend_for(id).await?.reimage_pod(id, image, env).await
+    }
     async fn pod_spec(&self, id: &str) -> Result<PodSpec> {
         self.backend_for(id).await?.pod_spec(id).await
     }

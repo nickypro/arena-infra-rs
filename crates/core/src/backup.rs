@@ -30,7 +30,7 @@ impl BackupConfig {
     pub fn from_config(cfg: &Config, week: u32, day: u32) -> Self {
         // Default the repo path to /root/<ARENA_REPO_NAME>, matching the legacy layout.
         let repo_path = cfg.get("BACKUP_REPO_PATH").map(String::from).unwrap_or_else(|| {
-            let name = cfg.get("ARENA_REPO_NAME").unwrap_or("ARENA_3.0");
+            let name = cfg.get("ARENA_REPO_NAME").unwrap_or("ARENA_materials");
             format!("/root/{name}")
         });
         Self {

@@ -94,6 +94,16 @@ pub trait Provider: Send + Sync {
         )))
     }
 
+    /// DESTRUCTIVE. Swap a pod's image and replace its env in place (same host, same id).
+    /// The container is reset, so its disk is wiped — callers must confirm first.
+    /// Default: unsupported.
+    async fn reimage_pod(&self, _id: &str, _image: &str, _env: &[(String, String)]) -> Result<()> {
+        Err(Error::NotImplemented(format!(
+            "reimage not supported on provider `{}`",
+            self.name()
+        )))
+    }
+
     /// Read-only. Best-effort recovery of the spec needed to recreate this pod — the
     /// "same spec by default" half of `replace`. `name` is returned empty for the caller
     /// to fill; fields the provider can't recover are left at their spec defaults (the

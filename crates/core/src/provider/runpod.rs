@@ -223,6 +223,19 @@ impl Provider for RunpodProvider {
         Ok(())
     }
 
+    async fn reimage_pod(&self, id: &str, image: &str, env: &[(String, String)]) -> Result<()> {
+        // REST `PATCH /pods/{id}` resets the container (see `rename_pod`): exactly what a
+        // reimage wants. `env` replaces the pod's env wholesale, so pass everything to keep.
+        let body = reimage_payload(image, env);
+        let resp = self.auth(self.client.patch(format!("{BASE}/pods/{id}"))).json(&body).send().await?;
+        let status = resp.status();
+        let v: Value = resp.json().await.unwrap_or(Value::Null);
+        if !status.is_success() {
+            return Err(Error::provider_http(status, &v, "reimage pod"));
+        }
+        Ok(())
+    }
+
     async fn pod_spec(&self, id: &str) -> Result<PodSpec> {
         let resp = self.auth(self.client.get(format!("{BASE}/pods/{id}"))).send().await?;
         let status = resp.status();
@@ -232,6 +245,13 @@ impl Provider for RunpodProvider {
         }
         Ok(parse_spec(&body))
     }
+}
+
+/// Build the REST `PATCH /pods/{id}` body for a reimage. Pure, for testing.
+fn reimage_payload(image: &str, env: &[(String, String)]) -> Value {
+    let env: serde_json::Map<String, Value> =
+        env.iter().map(|(k, v)| (k.clone(), Value::String(v.clone()))).collect();
+    json!({ "imageName": image, "env": env })
 }
 
 /// Recover a recreate-able `PodSpec` from a RunPod `GET /pods/{id}` body. Pure (no I/O) so
@@ -445,6 +465,14 @@ mod tests {
         // PUBLIC_KEY + MACHINE_NAME dropped (replace re-seeds them); other env kept.
         assert_eq!(s.env, vec![("WANDB_KEY".to_string(), "w".to_string())]);
         assert!(s.docker_args.is_none());
+    }
+
+    #[test]
+    fn reimage_payload_sets_image_and_full_env() {
+        let v = reimage_payload("img:9", &[("MACHINE_NAME".into(), "a-b".into()), ("PUBLIC_KEY".into(), "k1\nk2".into())]);
+        assert_eq!(v["imageName"], "img:9");
+        assert_eq!(v["env"]["MACHINE_NAME"], "a-b");
+        assert_eq!(v["env"]["PUBLIC_KEY"], "k1\nk2");
     }
 
     #[test]

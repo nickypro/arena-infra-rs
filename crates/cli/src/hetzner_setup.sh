@@ -13,9 +13,9 @@
 set -uo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
-REPO_DIR="${REPO_DIR:-/root/ARENA_3.0}"
+REPO_DIR="${REPO_DIR:-/root/ARENA_materials}"
 # If the repo isn't already present (e.g. rsync'd from the control plane), clone it.
-REPO_URL="${REPO_URL:-https://github.com/callummcdougall/ARENA_3.0.git}"
+REPO_URL="${REPO_URL:-https://github.com/ARENA-education/ARENA_materials.git}"
 VENV="$REPO_DIR/.venv"
 
 echo "### 1/5 system packages"
@@ -39,7 +39,7 @@ fi
 export PATH="$HOME/.local/bin:$PATH"
 uv --version
 
-echo "### 4/5 ARENA_3.0 + Python env"
+echo "### 4/5 ARENA repo + Python env"
 # If a git deploy key was provided (REPO_KEY), wire github.com to it so we can clone — and
 # later push backups to — the PRIVATE cohort repo over SSH. Without it, REPO_URL stays the
 # public default and the clone is anonymous.
@@ -139,7 +139,7 @@ ln -sf "$HOME/.arena_infra/dotfiles/.p10k.zsh" "$HOME/.p10k.zsh"
 cp -f  "$HOME/.arena_infra/dotfiles/.zshrc"    "$HOME/.zshrc"
 for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
     touch "$rc"
-    grep -qF "ARENA_3.0/.venv/bin/activate" "$rc" || \
+    grep -qF "$VENV/bin/activate" "$rc" || \
         printf '\n# ARENA env: no conda on CPU pods — activate the uv venv (no-op on conda GPU pods).\nif ! command -v conda >/dev/null 2>&1 && [ -f "%s/bin/activate" ]; then\n    source "%s/bin/activate"\nfi\n' "$VENV" "$VENV" >> "$rc"
 done
 

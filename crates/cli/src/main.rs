@@ -500,7 +500,7 @@ enum PodCmd {
         #[arg(long)]
         cc_token: Option<String>,
         /// Install the full shell the GPU pods get: zsh + oh-my-zsh + powerlevel10k + the
-        /// shared arena-infra dotfiles, set as the login shell (no conda/ARENA_3.0). For
+        /// shared arena-infra dotfiles, set as the login shell (no conda/ARENA repo). For
         /// bare / non-arena base images — the prebuilt arena image already has this.
         #[arg(long)]
         zsh_install: bool,
@@ -547,6 +547,31 @@ enum PodCmd {
         #[arg(long)]
         from_prefix: Option<String>,
         /// Don't redeploy the proxy afterwards.
+        #[arg(long)]
+        skip_proxy: bool,
+        /// Preview only: print what would happen, change nothing.
+        #[arg(long, visible_aliases = ["dryrun", "dry"])]
+        dry_run: bool,
+    },
+    /// Reimage pods in place: swap the image + re-seed SSH keys, WIPING the container disk.
+    ///
+    /// Same host/id/name, fresh container from `--image` (default RUNPOD_DOCKER_IMAGE).
+    /// PUBLIC_KEY is re-seeded from the current config keys and MACHINE_NAME set to the
+    /// pod's name; other env is kept. Nothing is copied over — use `replace` to keep files.
+    /// Afterwards waits for SSH endpoints and redeploys the proxy (ports can change).
+    Reimage {
+        /// Machine names (bare `apple` or full `arena9-apple`) or ids. Or use --all.
+        targets: Vec<String>,
+        /// Reimage every pod (subject to --exclude).
+        #[arg(long, conflicts_with = "targets")]
+        all: bool,
+        /// With --all: never reimage these names/ids (repeatable).
+        #[arg(long)]
+        exclude: Vec<String>,
+        /// Image to use (default: RUNPOD_DOCKER_IMAGE from config).
+        #[arg(long)]
+        image: Option<String>,
+        /// Don't wait for endpoints / redeploy the proxy afterwards.
         #[arg(long)]
         skip_proxy: bool,
         /// Preview only: print what would happen, change nothing.
@@ -2034,7 +2059,7 @@ async fn handle_backup(
     // Backup commits the *current* branch (never switches/creates one), so it just needs
     // the repo path + push key — no week/day / autocommit-branch naming.
     let repo_path = cfg.get("BACKUP_REPO_PATH").map(String::from).unwrap_or_else(|| {
-        format!("/root/{}", cfg.get("ARENA_REPO_NAME").unwrap_or("ARENA_3.0"))
+        format!("/root/{}", cfg.get("ARENA_REPO_NAME").unwrap_or("ARENA_materials"))
     });
     let key = cfg.get("GIT_SSH_KEY_REMOTE").map(String::from);
     let msg_for = |name: &str| message.clone().unwrap_or_else(|| format!("arena backup {name}"));
@@ -2800,6 +2825,10 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             handle_rename(provider, cfg, target, new_name, from_prefix, skip_proxy, dry_run, yes).await?;
         }
 
+        PodCmd::Reimage { targets, all, exclude, image, skip_proxy, dry_run } => {
+            handle_reimage(provider, cfg, &targets, all, &exclude, image, skip_proxy, dry_run, yes).await?;
+        }
+
         PodCmd::Replace { target, gpu, gpus, cloud, disk, volume, image, keep_old, skip_proxy, dry_run } => {
             let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap: false };
             handle_replace(cfg, &target, &ov, keep_old, skip_proxy, dry_run, yes).await?;
@@ -3077,7 +3106,7 @@ async fn handle_set_branch(
     use arena_core::ssh::{self, SshTarget};
 
     let repo_path = cfg.get("BACKUP_REPO_PATH").map(String::from).unwrap_or_else(|| {
-        format!("/root/{}", cfg.get("ARENA_REPO_NAME").unwrap_or("ARENA_3.0"))
+        format!("/root/{}", cfg.get("ARENA_REPO_NAME").unwrap_or("ARENA_materials"))
     });
     let key = cfg.get("GIT_SSH_KEY_REMOTE");
     let cmd = arena_core::backup::checkout_command(&repo_path, branch, key, hard);
@@ -3146,6 +3175,82 @@ async fn handle_set_branch(
     println!("\nswitched {ok}/{}", ok + failed);
     if failed > 0 {
         anyhow::bail!("{failed} pod(s) failed to switch branch");
+    }
+    Ok(())
+}
+
+/// `pods reimage`: swap image + re-seed keys in place (disk wiped), then re-point the proxy.
+#[allow(clippy::too_many_arguments)]
+async fn handle_reimage(
+    provider: &dyn Provider,
+    cfg: &Config,
+    targets: &[String],
+    all: bool,
+    exclude: &[String],
+    image: Option<String>,
+    skip_proxy: bool,
+    dry_run: bool,
+    yes: bool,
+) -> Result<()> {
+    if targets.is_empty() && !all {
+        anyhow::bail!("name the pods to reimage, or pass --all");
+    }
+    let pods = select_pods(provider, cfg, targets, exclude, None).await?;
+    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
+    if let Some(miss) = targets.iter().find(|t| !pods.iter().any(|p| pod_matches(p, t, prefix))) {
+        anyhow::bail!("no pod matched '{miss}' (run `arena pods list`)");
+    }
+    let image = image.unwrap_or_else(|| PodSpec::from_config(cfg).image);
+    if image.is_empty() {
+        anyhow::bail!("no image: pass --image or set RUNPOD_DOCKER_IMAGE");
+    }
+    let pubkeys = arena_core::ssh::authorized_pubkeys(cfg);
+    if pubkeys.is_empty() {
+        anyhow::bail!("no readable public keys from SHARED_SSH_KEY_PATH/GIT_SSH_KEY_LOCAL — refusing to lock pods out");
+    }
+    let names: Vec<&str> = pods.iter().map(|p| p.name.as_str()).collect();
+    println!("image: {image}\nkeys:  {}", pubkeys.iter().map(|k| k.split_whitespace().last().unwrap_or("?")).collect::<Vec<_>>().join(", "));
+    if dry_run {
+        println!("[dry-run] would reimage {} pod(s): {}", pods.len(), names.join(" "));
+        return Ok(());
+    }
+    if !confirm(yes, &format!("Will reimage {} pod(s), WIPING their disks: {}", pods.len(), names.join(" ")))? {
+        println!("aborted.");
+        return Ok(());
+    }
+    let policy = arena_core::retry::RetryPolicy::default();
+    let mut failed = Vec::new();
+    for pod in &pods {
+        let mut env = match provider.pod_spec(&pod.id).await {
+            Ok(spec) => spec.env,
+            Err(e) => {
+                eprintln!("[failed] {}: reading current env: {e}", pod.name);
+                failed.push(pod.name.clone());
+                continue;
+            }
+        };
+        env.retain(|(k, _)| k != "PUBLIC_KEY" && k != "MACHINE_NAME");
+        env.push(("MACHINE_NAME".into(), pod.name.clone()));
+        env.push(("PUBLIC_KEY".into(), pubkeys.join("\n")));
+        match arena_core::retry::retrying(&policy, || provider.reimage_pod(&pod.id, &image, &env)).await {
+            Ok(()) => println!("[reimaged] {}", pod.name),
+            Err(e) => {
+                eprintln!("[failed] {}: {e}", pod.name);
+                failed.push(pod.name.clone());
+            }
+        }
+    }
+    if !skip_proxy {
+        println!("waiting for SSH endpoints…");
+        for pod in pods.iter().filter(|p| !failed.contains(&p.name)) {
+            if let Err(e) = wait_for_stable_endpoint(provider, &pod.id, 30, 600).await {
+                eprintln!("warning: {} has no endpoint yet ({e})", pod.name);
+            }
+        }
+        apply_proxy(cfg, provider).await.context("reimage done, but redeploying the proxy failed")?;
+    }
+    if !failed.is_empty() {
+        anyhow::bail!("{} pod(s) failed to reimage: {}", failed.len(), failed.join(" "));
     }
     Ok(())
 }
@@ -4671,7 +4776,7 @@ async fn handle_copy(
     let local = file.to_string_lossy().into_owned();
 
     // Resolve the remote destination (same for every pod).
-    let repo_name = cfg.get("ARENA_REPO_NAME").unwrap_or("ARENA_3.0");
+    let repo_name = cfg.get("ARENA_REPO_NAME").unwrap_or("ARENA_materials");
     let repo_path = cfg.get("BACKUP_REPO_PATH").map(String::from).unwrap_or_else(|| format!("/root/{repo_name}"));
     let repo_parent = std::path::Path::new(&repo_path)
         .parent()
