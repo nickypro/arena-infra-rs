@@ -5165,16 +5165,44 @@ async fn keys_targets(
 /// is self-documenting about which cohort the keys belong to.
 fn write_openrouter_key(host: &str, secret: &str, prefix: &str) -> Result<()> {
     std::fs::create_dir_all("./keys").context("creating ./keys")?;
-    let mut existing = std::fs::read_to_string(OPENROUTER_KEYS_CSV).unwrap_or_default();
+    let target = ensure_cohort_keys_file(prefix)?;
+    let mut existing = std::fs::read_to_string(&target).unwrap_or_default();
     if existing.trim().is_empty() {
         existing = format!(
             "# OpenRouter API keys — arena iteration: {prefix}\n# host,key (one runtime key per machine; managed by `arena keys`)\n"
         );
     }
     let updated = arena_core::apikeys::upsert_csv(&existing, host, secret);
-    std::fs::write(OPENROUTER_KEYS_CSV, updated)
-        .with_context(|| format!("writing {OPENROUTER_KEYS_CSV}"))?;
+    std::fs::write(&target, updated).with_context(|| format!("writing {}", target.display()))?;
     Ok(())
+}
+
+/// Keys live per cohort in `keys/<prefix>_openrouter_keys.csv`; the canonical
+/// `keys/openrouter_api_keys.csv` (what copy-keys reads) is a symlink to the current one.
+/// Repoints the symlink when the prefix changes, so a new cohort's keys never get written
+/// into the previous cohort's file. A legacy regular file is moved aside to `.bak`.
+fn ensure_cohort_keys_file(prefix: &str) -> Result<PathBuf> {
+    let file = format!("{prefix}_openrouter_keys.csv");
+    let target = PathBuf::from("./keys").join(&file);
+    let link = std::path::Path::new(OPENROUTER_KEYS_CSV);
+    match std::fs::symlink_metadata(link) {
+        Ok(m) if m.file_type().is_symlink() => {
+            if std::fs::read_link(link)?.file_name() != Some(std::ffi::OsStr::new(&file)) {
+                std::fs::remove_file(link)?;
+                std::os::unix::fs::symlink(&file, link)?;
+                println!("(keys) {OPENROUTER_KEYS_CSV} now → {file}");
+            }
+        }
+        Ok(_) => {
+            let bak = format!("{OPENROUTER_KEYS_CSV}.pre-{prefix}.bak");
+            anyhow::ensure!(!std::path::Path::new(&bak).exists(), "{bak} already exists — sort out {OPENROUTER_KEYS_CSV} by hand");
+            std::fs::rename(link, &bak)?;
+            println!("(keys) moved old {OPENROUTER_KEYS_CSV} aside to {bak}");
+            std::os::unix::fs::symlink(&file, link)?;
+        }
+        Err(_) => std::os::unix::fs::symlink(&file, link)?,
+    }
+    Ok(target)
 }
 
 /// `arena keys`: manage OpenRouter runtime keys (generate / list / rotate / revoke) via
