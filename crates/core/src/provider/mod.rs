@@ -115,6 +115,19 @@ pub trait Provider: Send + Sync {
         vec![(self.name().to_string(), bounded_list(self.name(), self.list_pods(), LIST_TIMEOUT).await)]
     }
 
+    /// Read-only, best-effort. Fill in display details the cheap `list_pods` call leaves
+    /// out — RunPod's REST list returns an empty `machine`, so GPU type, gpu count, $/h and
+    /// the host's maintenance window come from one extra GraphQL query. Pods this backend
+    /// doesn't know are left untouched; on `Err` the pods may be partially filled and
+    /// remain valid to display.
+    ///
+    /// Deliberately separate from `list_pods` (and only called by `pods list`): the TUI
+    /// poll loop and every mutating command list pods often, and folding this in would
+    /// double their API call volume against rate-limited providers. Default: no-op.
+    async fn enrich(&self, _pods: &mut [Pod]) -> Result<()> {
+        Ok(())
+    }
+
     /// Mutating. Callers gate this behind an explicit apply/confirm step.
     async fn create_pod(&self, spec: &PodSpec) -> Result<Pod>;
 

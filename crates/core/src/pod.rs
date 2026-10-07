@@ -100,3 +100,52 @@ impl PodSpec {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `pods list --json` is a scripting interface: what it prints must deserialize back
+    /// into the same pods, including the Phase 0.D fields (gpu_count, maintenance).
+    #[test]
+    fn pod_json_round_trips_with_maintenance() {
+        let pods = vec![
+            Pod {
+                id: "abc123".into(),
+                name: "devtest-apple".into(),
+                provider: "runpod".into(),
+                status: "RUNNING".into(),
+                gpu_type: Some("RTX A4000".into()),
+                gpu_count: Some(2),
+                cost_per_hr: Some(0.34),
+                ssh_ip: Some("1.2.3.4".into()),
+                ssh_port: Some(10022),
+                maintenance: Some(Maintenance {
+                    start: Some("2026-10-09T02:00:00Z".into()),
+                    end: Some("2026-10-09T06:00:00Z".into()),
+                    note: Some("host upgrade".into()),
+                }),
+            },
+            Pod { id: "1".into(), name: "devtest-flutter".into(), provider: "hetzner".into(), ..Default::default() },
+        ];
+        let json = serde_json::to_string_pretty(&pods).unwrap();
+        let back: Vec<Pod> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, pods);
+        // The schema is the field names scripts key on — pin them.
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v[0]["gpu_count"], 2);
+        assert_eq!(v[0]["maintenance"]["start"], "2026-10-09T02:00:00Z");
+        assert!(v[1]["maintenance"].is_null());
+    }
+
+    /// JSON written before gpu_count/maintenance existed must still load (`#[serde(default)]`).
+    #[test]
+    fn pod_json_without_new_fields_still_deserializes() {
+        let old = r#"{"id":"x","name":"n","provider":"runpod","status":"RUNNING",
+                      "gpu_type":null,"cost_per_hr":0.2,"ssh_ip":null,"ssh_port":null}"#;
+        let p: Pod = serde_json::from_str(old).unwrap();
+        assert_eq!(p.gpu_count, None);
+        assert_eq!(p.maintenance, None);
+        assert_eq!(p.cost_per_hr, Some(0.2));
+    }
+}

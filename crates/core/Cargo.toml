@@ -8,6 +8,22 @@ license.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true
-tokio.workspace = true
+# io-util: remote.rs reads a child's stdout/stderr itself (it keeps the `Child` so a
+# timed-out one can be stopped gracefully).
+tokio = { workspace = true, features = ["io-util"] }
 async-trait.workspace = true
 thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# `kill(pid, SIGTERM)` for a graceful stop of a timed-out ssh/scp child (remote.rs);
+# std/tokio only offer SIGKILL. Already in the lock file via tokio.
+libc = "0.2"
+
+[features]
+# Test doubles (`remote::FakeRemote`) for downstream crates' tests. Enabled only from
+# dev-dependencies, so it never ships in a release build.
+test-util = []
+
+[dev-dependencies]
+# Paused-clock tests (`#[tokio::test(start_paused = true)]`): timeouts/retries run instantly.
+tokio = { workspace = true, features = ["test-util"] }
