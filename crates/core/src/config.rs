@@ -41,6 +41,10 @@ impl Config {
         // it empty so no lifecycle sync can reload the system nginx, whatever its config file
         // says — absent from the file, the default reload would run.
         "SSH_PROXY_RELOAD_CMD",
+        // Which RunPod REST API to use (`v1`/`v2`): lets an operator trial the v2 backend
+        // for one command — or roll straight back to v1 — without editing the shared,
+        // read-only prod config (`RUNPOD_API=v2 arena pods list`).
+        "RUNPOD_API",
     ];
 
     /// Let environment variables override values from the file: any key already in the
@@ -236,6 +240,18 @@ MACHINE_NAME_LIST=(
             c.apply_overrides(|k| (k == "SSH_PROXY_RELOAD_CMD").then(String::new));
             assert_eq!(c.get("SSH_PROXY_RELOAD_CMD"), Some(""), "{file}");
         }
+    }
+
+    #[test]
+    fn env_can_introduce_runpod_api() {
+        // Absent from the file, `RUNPOD_API=v2` from the environment still selects v2 — and
+        // it overrides a file value both ways (trial v2, or roll back to v1).
+        let mut c = Config::parse("IMAGE=base:1");
+        c.apply_overrides(|k| (k == "RUNPOD_API").then(|| "v2".to_string()));
+        assert_eq!(c.get("RUNPOD_API"), Some("v2"));
+        let mut c = Config::parse("RUNPOD_API=v2");
+        c.apply_overrides(|k| (k == "RUNPOD_API").then(|| "v1".to_string()));
+        assert_eq!(c.get("RUNPOD_API"), Some("v1"));
     }
 
     #[test]

@@ -52,6 +52,12 @@ impl ProviderErrorKind {
 /// billing failure, not capacity, and misclassifying it as capacity would make
 /// `--keep-trying` wait for a GPU that will never come because the account is out of
 /// money. When unsure we return false (→ `Other`), which fails fast rather than looping.
+///
+/// RunPod REST v2 answers capacity exhaustion with an HTTP 400 that carries "no
+/// machine-readable code of its own — only a human-readable `detail`" (its OpenAPI doc),
+/// describing it as the GPU/data-center combination that "could not be placed"; those
+/// phrasings are matched too (the exact live wording is unverified — v1's "no instances"
+/// is still covered if v2 passes it through).
 pub fn looks_like_capacity(message: &str) -> bool {
     let m = message.to_lowercase();
     [
@@ -59,12 +65,15 @@ pub fn looks_like_capacity(message: &str) -> bool {
         "no longer any instances",
         "no rentable offer",
         "no capacity",
+        "insufficient capacity",
         "no availability",
         "not available in",
         "currently unavailable",
         "out of stock",
         "no offers",
         "no gpus available",
+        "no machines available",
+        "could not be placed",
         "no resources available",
     ]
     .iter()
@@ -192,6 +201,31 @@ mod tests {
         );
         assert!(!looks_like_capacity("insufficient credit balance"));
         assert!(looks_like_capacity("no instances available for this gpu type"));
+    }
+
+    /// RunPod v2 errors are problem+json; capacity is a 400 known only by its `detail`.
+    /// Its 402 "Insufficient balance" must stay `Other` (stop, don't wait for a GPU).
+    #[test]
+    fn sniffs_runpod_v2_problem_details() {
+        let s = StatusCode::BAD_REQUEST;
+        let msg = |detail: &str| {
+            format!(r#"create pod HTTP 400 Bad Request: {{"detail":"{detail}","status":400,"title":"Bad Request"}}"#)
+        };
+        for detail in [
+            "this GPU and data center combination could not be placed",
+            "Insufficient capacity for the requested GPU type",
+            "There are no instances currently available",
+            "no machines available with the requested CUDA version",
+        ] {
+            assert_eq!(ProviderErrorKind::classify(s, &msg(detail)), ProviderErrorKind::Capacity, "{detail}");
+        }
+        for detail in ["allowedCudaVersions and minCudaVersion are mutually exclusive", "request could not be processed"] {
+            assert_eq!(ProviderErrorKind::classify(s, &msg(detail)), ProviderErrorKind::Other, "{detail}");
+        }
+        assert_eq!(
+            ProviderErrorKind::classify(StatusCode::PAYMENT_REQUIRED, "create pod HTTP 402: Insufficient balance"),
+            ProviderErrorKind::Other
+        );
     }
 
     #[test]

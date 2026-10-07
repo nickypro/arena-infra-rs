@@ -1217,27 +1217,52 @@ async fn main() -> Result<()> {
 }
 
 /// `arena gpus`: list the GPU types you can pass to `--gpu`. Fetches RunPod's **full,
-/// live** catalog (via GraphQL) with live community/secure prices + stock when on RunPod
-/// with a key; otherwise falls back to the local curated presets. `--json` emits the same
-/// rows machine-readably (`arena_core::gpu::GpuRow`). Diagnostics go to stderr so the JSON
-/// on stdout stays parseable.
+/// live** catalog with live community/secure prices + stock when on RunPod with a key —
+/// via GraphQL on `RUNPOD_API=v1`, via REST `GET /v2/catalog/gpus` (stock for the configured
+/// cloud tier) on `v2`, falling back to GraphQL if that fails; otherwise falls back to the
+/// local curated presets. `--json` emits the same rows machine-readably
+/// (`arena_core::gpu::GpuRow`). Diagnostics go to stderr so the JSON on stdout stays
+/// parseable.
 async fn handle_gpus(cfg: &Config, provider_name: &str, json: bool) -> Result<()> {
     use arena_core::gpu;
+    use arena_core::provider::{runpod, runpod_v2, RunpodApi};
 
     // (rows, whether the create-API enum was available to flag `creatable`)
     let mut live: Option<(Vec<gpu::GpuRow>, bool)> = None;
+    // Which cloud the STOCK column describes (v2's availability is per tier).
+    let mut stock_cloud: Option<&str> = None;
     if provider_name == "runpod" {
         if let Some(key) = cfg.get("RUNPOD_API_KEY").filter(|s| !s.is_empty()) {
-            match arena_core::provider::runpod::fetch_gpu_types(key).await {
+            let api = RunpodApi::from_config(cfg)?;
+            let fetched = match api {
+                RunpodApi::V1 => runpod::fetch_gpu_types(key).await,
+                RunpodApi::V2 => {
+                    let cloud = runpod_v2::normalize_cloud(&PodSpec::from_config(cfg).cloud_type).unwrap_or("COMMUNITY");
+                    match runpod_v2::fetch_gpu_types(key, cloud).await {
+                        Ok(types) if !types.is_empty() => {
+                            stock_cloud = Some(cloud);
+                            Ok(types)
+                        }
+                        other => {
+                            let why = other.err().map_or_else(|| "empty catalog".to_string(), |e| e.to_string());
+                            eprintln!("(v2 GPU catalog unavailable: {why} — trying the GraphQL catalog)\n");
+                            runpod::fetch_gpu_types(key).await
+                        }
+                    }
+                }
+            };
+            match fetched {
                 Ok(types) if !types.is_empty() => {
-                    // RunPod's create-validation enum can be NARROWER than the gpuTypes
-                    // catalog — listing a GPU that `--gpu` then gets a 400 for. Flag rows
-                    // against it (the table hides rejected ones). If the enum can't be
-                    // fetched, `creatable` stays unknown and everything is shown.
-                    let creatable = arena_core::provider::runpod::fetch_creatable_gpu_ids(key)
-                        .await
-                        .ok()
-                        .filter(|v| !v.is_empty());
+                    // v1 only: RunPod's v1 create-validation enum can be NARROWER than the
+                    // gpuTypes catalog — listing a GPU that `--gpu` then gets a 400 for. Flag
+                    // rows against it (the table hides rejected ones). If the enum can't be
+                    // fetched, `creatable` stays unknown and everything is shown. v2's
+                    // `gpu.id` has no such enum (and the v1 document is retiring), so on v2
+                    // `creatable` is unknown.
+                    let creatable = match api {
+                        RunpodApi::V1 => runpod::fetch_creatable_gpu_ids(key).await.ok().filter(|v| !v.is_empty()),
+                        RunpodApi::V2 => None,
+                    };
                     live = Some((gpu::rows_from_live(&types, creatable.as_deref()), creatable.is_some()));
                 }
                 Ok(_) => {}
@@ -1259,9 +1284,10 @@ async fn handle_gpus(cfg: &Config, provider_name: &str, json: bool) -> Result<()
             println!(
                 "\n{} GPU types {}. Pass the API name (or a short alias like \
                  A4000 / 3090) to --gpu. Prices are RunPod's live $/hr per GPU (~ = preset \
-                 estimate, - = not offered); STOCK is RunPod's 1-GPU stock hint.",
+                 estimate, - = not offered); STOCK is RunPod's 1-GPU stock hint{}.",
                 shown.len(),
-                if creatable_known { "(live from RunPod, creatable via the create API)" } else { "(live from RunPod)" }
+                if creatable_known { "(live from RunPod, creatable via the create API)" } else { "(live from RunPod)" },
+                stock_cloud.map(|c| format!(" on the {c} cloud")).unwrap_or_default()
             );
             if !hidden.is_empty() {
                 println!(
@@ -1991,6 +2017,25 @@ fn config_which(cfg: &Config, provider_name: &str, config_path: &std::path::Path
     Ok(())
 }
 
+/// The `config check` row for `RUNPOD_API`, and whether it's valid. Pure, for testing.
+/// v1 gets a warning with the retirement date: past it, every RunPod call fails.
+fn runpod_api_row(cfg: &Config) -> (String, bool) {
+    use arena_core::provider::{RunpodApi, RUNPOD_V1_RETIREMENT};
+    let key = "RUNPOD_API";
+    match RunpodApi::from_config(cfg) {
+        Ok(RunpodApi::V2) => (format!("  ✓ {key:<24} v2 (api.runpod.io/v2)"), true),
+        Ok(RunpodApi::V1) => (
+            format!(
+                "  ⚠ {key:<24} v1{} (rest.runpod.io/v1) — RunPod retires REST v1 on {RUNPOD_V1_RETIREMENT}; \
+                 set RUNPOD_API=v2 once it's been live-tested",
+                if cfg.get(key).is_some_and(|v| !v.trim().is_empty()) { "" } else { " (default)" }
+            ),
+            true,
+        ),
+        Err(e) => (format!("  ✗ {key:<24} {e}"), false),
+    }
+}
+
 /// Print a config checklist for the selected provider + proxy + backup, never showing
 /// secret values. Returns an error if a required key is missing.
 fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
@@ -2014,6 +2059,15 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
         );
         if selected && !set {
             missing.push(key.to_string());
+        }
+    }
+    // Which RunPod REST generation `runpod` talks to — shown whenever RunPod is in play,
+    // because v1 is retired by RunPod and this is the switch.
+    if provider_name == "runpod" || cfg.get("RUNPOD_API_KEY").is_some_and(|v| !v.is_empty()) || cfg.get("RUNPOD_API").is_some() {
+        let (line, ok) = runpod_api_row(cfg);
+        println!("{line}");
+        if !ok {
+            missing.push("RUNPOD_API (must be v1 or v2)".into());
         }
     }
     if provider_name == "hetzner" {
@@ -6837,6 +6891,21 @@ mod setup_tests {
 #[cfg(test)]
 mod tests {
     use super::{strip_arena_block, with_arena_block, CRON_BEGIN, CRON_END};
+
+    /// `config check` says which RunPod API is selected, warns on v1 with the retirement
+    /// date, and fails on a value that's neither.
+    #[test]
+    fn config_check_runpod_api_row() {
+        use super::{runpod_api_row, Config};
+        let (line, ok) = runpod_api_row(&Config::parse("RUNPOD_API_KEY=k"));
+        assert!(ok && line.contains("⚠") && line.contains("v1 (default)") && line.contains("2026-11-15"), "{line}");
+        let (line, ok) = runpod_api_row(&Config::parse("RUNPOD_API=v1"));
+        assert!(ok && line.contains("v1 (rest.runpod.io/v1)") && line.contains("2026-11-15"), "{line}");
+        let (line, ok) = runpod_api_row(&Config::parse("RUNPOD_API=v2"));
+        assert!(ok && line.contains("✓") && line.contains("v2") && !line.contains("retires"), "{line}");
+        let (line, ok) = runpod_api_row(&Config::parse("RUNPOD_API=v3"));
+        assert!(!ok && line.contains("✗") && line.contains("must be `v1` or `v2`"), "{line}");
+    }
 
     /// `--json` on `gpus` and `pods list` is a scripting contract — pin the flag parsing
     /// (and let clap validate the whole command tree while we're at it).

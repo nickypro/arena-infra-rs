@@ -51,9 +51,9 @@ pub struct PodSpec {
     /// e.g. "8888/http,22/tcp"
     pub ports: String,
     pub env: Vec<(String, String)>,
-    /// Optional container start command as an argv (RunPod REST `dockerStartCmd`, which
-    /// overrides the image's CMD but keeps its ENTRYPOINT). `None` => use the image's own
-    /// CMD (correct for the prebuilt arena image, which already starts sshd). `Some(..)`
+    /// Optional container start command as an argv (RunPod REST v1 `dockerStartCmd` / v2
+    /// `cmd`, which override the image's CMD but keep its ENTRYPOINT). `None` => use the
+    /// image's own CMD (correct for the prebuilt arena image, which already starts sshd). `Some(..)`
     /// overrides it — e.g. the `--bootstrap` start script (`["bash","-c", …]`) that installs
     /// + launches sshd on a non-arena base image (NVIDIA NGC, etc.) so the pod is reachable.
     pub docker_args: Option<Vec<String>>,
@@ -77,7 +77,8 @@ impl PodSpec {
             |keys: &[&str], default| keys.iter().find_map(|k| cfg.get_parsed(k)).unwrap_or(default);
         // RunPod adds PUBLIC_KEY (newline-joined) to ~/.ssh/authorized_keys at boot, so
         // the created pod authorizes the shared key + the deploy key (the account's own
-        // key, e.g. arena_admin, is injected by the provider automatically).
+        // key, e.g. arena_admin, is added by RunPod itself on REST v1; the v2 backend
+        // merges the account's registered keys in, as v2 skips them when PUBLIC_KEY is set).
         let mut env = Vec::new();
         let pubkeys = crate::ssh::authorized_pubkeys(cfg);
         if !pubkeys.is_empty() {

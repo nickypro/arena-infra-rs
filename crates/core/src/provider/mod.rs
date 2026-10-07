@@ -11,6 +11,7 @@ use crate::pod::{Pod, PodSpec};
 pub mod hetzner;
 pub mod multi;
 pub mod runpod;
+pub mod runpod_v2;
 pub mod vast;
 
 pub use multi::build_fleet;
@@ -28,11 +29,47 @@ pub(crate) fn body_excerpt(body: &serde_json::Value) -> String {
     }
 }
 
+/// The day RunPod retires REST v1 (`rest.runpod.io/v1`, the [`runpod`] backend), per its
+/// v1→v2 migration guide. Shown by `config check` while v1 is still selected.
+pub const RUNPOD_V1_RETIREMENT: &str = "2026-11-15";
+
+/// Which RunPod REST generation the `runpod` provider talks to, from `RUNPOD_API`.
+///
+/// v1 stays the default until v2 has been live-tested — then the operator flips it (one
+/// config line, or `RUNPOD_API=v2` in the environment), and can flip back just as fast.
+/// Both report themselves as provider `runpod`, so pod names, the proxy's provider tags
+/// and `--provider runpod` don't change with the switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunpodApi {
+    V1,
+    V2,
+}
+
+impl RunpodApi {
+    /// Parse `RUNPOD_API`: unset/empty → v1; `v1`/`v2` (any case); anything else is a
+    /// config error — never a silent fallback, since a typo would otherwise keep a fleet
+    /// on the retiring API (or quietly move it) without anyone noticing.
+    pub fn from_config(cfg: &Config) -> Result<Self> {
+        match cfg.get("RUNPOD_API").map(str::trim) {
+            None | Some("") => Ok(Self::V1),
+            Some(v) if v.eq_ignore_ascii_case("v1") => Ok(Self::V1),
+            Some(v) if v.eq_ignore_ascii_case("v2") => Ok(Self::V2),
+            Some(other) => Err(Error::Config(format!("RUNPOD_API must be `v1` or `v2` (got `{other}`)"))),
+        }
+    }
+}
+
 /// Construct a provider by name from config. The single place concrete backends are
 /// built, so the CLI and TUI share one source of truth (and one list of known names).
 pub fn build(name: &str, cfg: &Config) -> Result<Box<dyn Provider>> {
     match name {
-        "runpod" => Ok(Box::new(runpod::RunpodProvider::new(cfg.require("RUNPOD_API_KEY")?))),
+        "runpod" => {
+            let key = cfg.require("RUNPOD_API_KEY")?;
+            Ok(match RunpodApi::from_config(cfg)? {
+                RunpodApi::V1 => Box::new(runpod::RunpodProvider::new(key)),
+                RunpodApi::V2 => Box::new(runpod_v2::RunpodV2Provider::new(key)),
+            })
+        }
         "vast" => Ok(Box::new(vast::VastProvider::new(cfg.require("VAST_API_KEY")?))),
         "hetzner" => {
             let opts = hetzner::HetznerOpts {
@@ -174,5 +211,71 @@ pub trait Provider: Send + Sync {
             "spec snapshot not supported on provider `{}`",
             self.name()
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec() -> PodSpec {
+        PodSpec {
+            name: "devtest-apple".into(),
+            image: "img:1".into(),
+            gpu_type: "NVIDIA RTX A4000".into(),
+            gpu_count: 1,
+            cloud_type: "COMMUNITY".into(),
+            disk_gb: 50,
+            volume_gb: 0,
+            ports: "22/tcp".into(),
+            env: Vec::new(),
+            docker_args: None,
+            allowed_cuda: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn runpod_api_parses_known_values_and_rejects_the_rest() {
+        let api = |text: &str| RunpodApi::from_config(&Config::parse(text));
+        assert_eq!(api("").unwrap(), RunpodApi::V1); // unset → default
+        assert_eq!(api("RUNPOD_API=\"\"").unwrap(), RunpodApi::V1); // empty = unset
+        assert_eq!(api("RUNPOD_API=v1").unwrap(), RunpodApi::V1);
+        assert_eq!(api("RUNPOD_API=v2").unwrap(), RunpodApi::V2);
+        assert_eq!(api("RUNPOD_API=\"V2\" # new backend").unwrap(), RunpodApi::V2);
+        for bad in ["RUNPOD_API=v3", "RUNPOD_API=2", "RUNPOD_API=rest"] {
+            let e = api(bad).unwrap_err();
+            assert!(matches!(e, Error::Config(_)), "{bad}: {e}");
+            assert!(e.to_string().contains("RUNPOD_API must be `v1` or `v2`"), "{bad}: {e}");
+        }
+    }
+
+    /// `build("runpod")` follows RUNPOD_API. Both report as `runpod`; the v2 backend says so
+    /// in its dry-run description, which is how an operator (and this test) tells them apart.
+    #[test]
+    fn build_selects_runpod_backend_by_runpod_api() {
+        let v1 = build("runpod", &Config::parse("RUNPOD_API_KEY=k")).unwrap();
+        assert_eq!(v1.name(), "runpod");
+        assert!(!v1.describe(&spec()).contains("API v2"), "{}", v1.describe(&spec()));
+        let v2 = build("runpod", &Config::parse("RUNPOD_API_KEY=k\nRUNPOD_API=v2")).unwrap();
+        assert_eq!(v2.name(), "runpod");
+        assert!(v2.describe(&spec()).contains("RunPod API v2"), "{}", v2.describe(&spec()));
+
+        let bad = build("runpod", &Config::parse("RUNPOD_API_KEY=k\nRUNPOD_API=v3")).err().unwrap();
+        assert!(bad.to_string().contains("RUNPOD_API"), "{bad}");
+        // No key is still the "not configured" error, whatever RUNPOD_API says.
+        let nokey = build("runpod", &Config::parse("RUNPOD_API=v2")).err().unwrap();
+        assert!(nokey.to_string().contains("RUNPOD_API_KEY"), "{nokey}");
+    }
+
+    /// A bad RUNPOD_API must fail the fleet even when RunPod isn't the primary: secondary
+    /// backends are built best-effort (`.ok()`), which would otherwise drop RunPod from the
+    /// fleet silently — every RunPod pod vanishing from `pods list` over a typo.
+    #[test]
+    fn build_fleet_rejects_bad_runpod_api_even_as_a_secondary() {
+        let cfg = Config::parse("RUNPOD_API_KEY=k\nHETZNER_API_KEY=h\nRUNPOD_API=v3");
+        let e = build_fleet("hetzner", &cfg, false).err().unwrap();
+        assert!(e.to_string().contains("RUNPOD_API"), "{e}");
+        let ok = Config::parse("RUNPOD_API_KEY=k\nHETZNER_API_KEY=h\nRUNPOD_API=v2");
+        assert!(build_fleet("hetzner", &ok, false).is_ok());
     }
 }

@@ -15,7 +15,15 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `MACHINE_NAME_LIST` bash array), so this tooling reads the *same* config as
     the legacy bash/python scripts.
   - `provider::Provider` — the single trait every backend implements.
-  - `provider::runpod` — RunPod REST backend: list / create / stop / terminate.
+  - `provider::runpod` — RunPod REST **v1** backend: list / create / stop / terminate.
+    RunPod retires REST v1 on **2026-11-15**.
+  - `provider::runpod_v2` — RunPod REST **v2** backend (`api.runpod.io/v2`), opt-in via
+    `RUNPOD_API=v2` (default `v1`; any other value is an error; `config check` shows which
+    is active). Same provider name and commands. Differences: real lifecycle statuses
+    (`PROVISIONING`/`STARTING`/`RUNNING`/`EXITED`/`ERROR`); the SSH endpoint comes from
+    `ssh.direct` only; create always sends `cloud` (v2 defaults to SECURE) and merges the
+    account's registered SSH keys into `PUBLIC_KEY` (v2 skips them when it's set);
+    `replace` recovers GPU type + cloud tier. Rename and maintenance still use GraphQL.
   - `provider::vast` — Vast.ai REST backend against the same trait. Vast rents
     *offers* rather than named pods, so `create_pod` searches the marketplace for
     the cheapest rentable offer matching the spec (GPU type/count, disk) and rents
@@ -183,9 +191,10 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     every key on the account). Keys are found by
     name, so no local hash bookkeeping. `keys which` shows the local keys file. (`copy-keys`
     is the *distributor*; `keys` is the *generator*.)
-  - `gpus` — list the GPU types for `--gpu`: RunPod's **full live catalog** (via GraphQL)
-    when on RunPod with a key, else the local presets. Shows VRAM, **live** community/secure
-    $/hr and RunPod's 1-GPU stock hint (`~` marks a preset estimate). If RunPod rejects
+  - `gpus` — list the GPU types for `--gpu`: RunPod's **full live catalog** (via GraphQL;
+    on `RUNPOD_API=v2` via `GET /v2/catalog/gpus`, STOCK then for the configured cloud,
+    falling back to GraphQL) when on RunPod with a key, else the local presets. Shows
+    VRAM, **live** community/secure $/hr and RunPod's 1-GPU stock hint (`~` marks a preset estimate). If RunPod rejects
     the priced query (HTTP 200 with errors, or a non-auth 4xx/5xx), the plain catalog
     query is tried before falling back to presets. `--json` emits rows
     `{id, display_name, memory_gb, community_price, secure_price, stock_status, creatable,
@@ -339,7 +348,9 @@ Notes / sharp edges to know:
 ### Overriding config without editing it
 
 Any key in `config.env` can be overridden by an **environment variable of the same
-name** (env wins; it can't introduce brand-new keys). This is how you point at an SSH
+name** (env wins; it can't introduce brand-new keys — except a short allowlist such as
+`ARENA_START_DATE`, `SSH_PROXY_RELOAD_CMD` and `RUNPOD_API`, e.g. `RUNPOD_API=v2 arena pods
+list` to try the RunPod v2 backend for one command). This is how you point at an SSH
 key the current user can actually read, without editing the shared, read-only prod
 config — e.g. when the dashboard's metrics show `ssh connect failed … key unreadable`
 because the configured key lives under `/root`:

@@ -1,6 +1,9 @@
 //! RunPod backend, talking to the REST API (https://rest.runpod.io/v1), plus GraphQL for
 //! the few things REST can't do (restart-free rename, GPU catalog/prices, host details).
 //!
+//! RunPod retires REST v1 on 2026-11-15; its replacement is [`super::runpod_v2`], picked
+//! with `RUNPOD_API=v2`. The GraphQL helpers here (rename, pod details) are shared with it.
+//!
 //! Responses are parsed defensively from `serde_json::Value` so a schema tweak on
 //! RunPod's side degrades a field to `None` rather than crashing the tool.
 
@@ -181,21 +184,7 @@ impl Provider for RunpodProvider {
     }
 
     fn describe(&self, spec: &PodSpec) -> String {
-        let volume = if spec.volume_gb > 0 {
-            format!(", volume {}GB", spec.volume_gb)
-        } else {
-            String::new()
-        };
-        let bootstrap = if spec.docker_args.is_some() { ", +bootstrap start script" } else { "" };
-        let cuda = if spec.allowed_cuda.is_empty() {
-            String::new()
-        } else {
-            format!(", CUDA {}", spec.allowed_cuda.join("/"))
-        };
-        format!(
-            "{} x{}, {}, disk {}GB{volume}, image {}{bootstrap}{cuda}",
-            spec.gpu_type, spec.gpu_count, spec.cloud_type, spec.disk_gb, spec.image
-        )
+        describe_spec(spec)
     }
 
     async fn list_pods(&self) -> Result<Vec<Pod>> {
@@ -209,17 +198,7 @@ impl Provider for RunpodProvider {
     }
 
     async fn enrich(&self, pods: &mut [Pod]) -> Result<()> {
-        if pods.is_empty() {
-            return Ok(()); // nothing to fill: don't spend an API call
-        }
-        let v = graphql(&self.client, &self.api_key, &json!({ "query": POD_DETAILS_QUERY }), "pod details").await?;
-        // Merge whatever `data` came back even alongside errors (GraphQL partial results),
-        // then still report the errors so `pods list` can warn that details are incomplete.
-        merge_pod_details(pods, &parse_pod_details(&v));
-        match graphql_errors(&v) {
-            Some(e) => Err(Error::provider(format!("pod details: {e}"))),
-            None => Ok(()),
-        }
+        enrich_via_graphql(&self.client, &self.api_key, pods).await
     }
 
     async fn create_pod(&self, spec: &PodSpec) -> Result<Pod> {
@@ -278,23 +257,7 @@ impl Provider for RunpodProvider {
     }
 
     async fn rename_pod(&self, id: &str, new_name: &str) -> Result<()> {
-        // Use the GraphQL `podEditName` mutation — the one the RunPod *dashboard* uses for a
-        // rename — NOT the REST `PATCH /pods/{id}`. The REST update is documented as "Update a
-        // Pod, potentially triggering a reset", and empirically it RESTARTS the container,
-        // which wipes the container disk (everything not on a network volume) — i.e. silent
-        // data loss. `podEditName` is a pure metadata rename: verified (via `/proc/1` start
-        // time before/after) to leave the running container completely untouched.
-        let body = json!({
-            "query": "mutation editPodName($input: PodEditNameInput!) { \
-                      podEditName(input: $input) { id name } }",
-            "variables": { "input": { "podId": id, "name": new_name } },
-        });
-        let v = graphql(&self.client, &self.api_key, &body, "rename pod").await?;
-        // GraphQL returns HTTP 200 even on logical errors — a mutation must surface any.
-        if let Some(errors) = graphql_errors(&v) {
-            return Err(Error::provider(format!("rename pod (podEditName): {errors}")));
-        }
-        Ok(())
+        rename_via_graphql(&self.client, &self.api_key, id, new_name).await
     }
 
     async fn reimage_pod(&self, id: &str, image: &str, env: &[(String, String)]) -> Result<()> {
@@ -319,6 +282,63 @@ impl Provider for RunpodProvider {
         }
         Ok(parse_spec(&body))
     }
+}
+
+/// The dry-run description of a RunPod create (both API generations take the same spec).
+pub(super) fn describe_spec(spec: &PodSpec) -> String {
+    let volume = if spec.volume_gb > 0 {
+        format!(", volume {}GB", spec.volume_gb)
+    } else {
+        String::new()
+    };
+    let bootstrap = if spec.docker_args.is_some() { ", +bootstrap start script" } else { "" };
+    let cuda = if spec.allowed_cuda.is_empty() {
+        String::new()
+    } else {
+        format!(", CUDA {}", spec.allowed_cuda.join("/"))
+    };
+    format!(
+        "{} x{}, {}, disk {}GB{volume}, image {}{bootstrap}{cuda}",
+        spec.gpu_type, spec.gpu_count, spec.cloud_type, spec.disk_gb, spec.image
+    )
+}
+
+/// Fill GPU type/count, $/h and the host's maintenance window from one GraphQL query (see
+/// [`Provider::enrich`]). Shared with the v2 backend: REST v2 reports GPU and cost itself
+/// but has no maintenance field, so GraphQL stays the only source of the window.
+pub(super) async fn enrich_via_graphql(client: &Client, api_key: &str, pods: &mut [Pod]) -> Result<()> {
+    if pods.is_empty() {
+        return Ok(()); // nothing to fill: don't spend an API call
+    }
+    let v = graphql(client, api_key, &json!({ "query": POD_DETAILS_QUERY }), "pod details").await?;
+    // Merge whatever `data` came back even alongside errors (GraphQL partial results),
+    // then still report the errors so `pods list` can warn that details are incomplete.
+    merge_pod_details(pods, &parse_pod_details(&v));
+    match graphql_errors(&v) {
+        Some(e) => Err(Error::provider(format!("pod details: {e}"))),
+        None => Ok(()),
+    }
+}
+
+/// Rename a pod in place with the GraphQL `podEditName` mutation — the one the RunPod
+/// *dashboard* uses for a rename — NOT the REST `PATCH /pods/{id}`. The v1 REST update is
+/// documented as "Update a Pod, potentially triggering a reset", and empirically it RESTARTS
+/// the container, which wipes the container disk (everything not on a network volume) —
+/// i.e. silent data loss. `podEditName` is a pure metadata rename: verified (via `/proc/1`
+/// start time before/after) to leave the running container completely untouched. Shared
+/// with the v2 backend, whose `PATCH name` isn't documented as restart-free either.
+pub(super) async fn rename_via_graphql(client: &Client, api_key: &str, id: &str, new_name: &str) -> Result<()> {
+    let body = json!({
+        "query": "mutation editPodName($input: PodEditNameInput!) { \
+                  podEditName(input: $input) { id name } }",
+        "variables": { "input": { "podId": id, "name": new_name } },
+    });
+    let v = graphql(client, api_key, &body, "rename pod").await?;
+    // GraphQL returns HTTP 200 even on logical errors — a mutation must surface any.
+    if let Some(errors) = graphql_errors(&v) {
+        return Err(Error::provider(format!("rename pod (podEditName): {errors}")));
+    }
+    Ok(())
 }
 
 /// Build the REST `PATCH /pods/{id}` body for a reimage. Pure, for testing.
@@ -412,7 +432,7 @@ struct PodDetail {
 }
 
 /// A non-empty string from a JSON string or number (`null`/other → `None`).
-fn loose_string(v: &Value) -> Option<String> {
+pub(super) fn loose_string(v: &Value) -> Option<String> {
     match v {
         Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
         Value::Number(n) => Some(n.to_string()),
@@ -423,7 +443,7 @@ fn loose_string(v: &Value) -> Option<String> {
 /// A number from a JSON number or numeric string. RunPod doesn't document these GraphQL
 /// scalar types (some APIs send decimals as strings), so accept either rather than lose
 /// a price to a representation change.
-fn loose_f64(v: &Value) -> Option<f64> {
+pub(super) fn loose_f64(v: &Value) -> Option<f64> {
     match v {
         Value::Number(n) => n.as_f64(),
         Value::String(s) => s.trim().parse().ok(),

@@ -183,6 +183,9 @@ pub fn build_fleet(primary: &str, cfg: &Config, warn_on_partial: bool) -> Result
             KNOWN.join(", ")
         )));
     }
+    // Validate RUNPOD_API up front: a non-primary backend is built best-effort below, so
+    // a typo there would otherwise silently drop RunPod from the fleet instead of erroring.
+    crate::provider::RunpodApi::from_config(cfg)?;
     let mut backends: Vec<Box<dyn Provider>> = Vec::new();
     let mut primary_idx = None;
     for name in KNOWN {
