@@ -54,7 +54,7 @@ impl VastProvider {
         // cheapest first. We still re-filter client-side (below) because Vast's
         // matching is fuzzy and we'd rather under-trust the server than rent the
         // wrong machine.
-        let query = json!({
+        let mut query = json!({
             "rentable": {"eq": true},
             "num_gpus": {"gte": spec.gpu_count},
             "gpu_name": {"eq": query_gpu_name(&spec.gpu_type)},
@@ -63,6 +63,10 @@ impl VastProvider {
             "order": [["dph_total", "asc"]],
             "limit": 64,
         });
+        // ALLOWED_CUDA_VERSIONS: only hosts whose driver supports at least the lowest one.
+        if let Some(min) = spec.allowed_cuda.iter().filter_map(|v| v.parse::<f64>().ok()).reduce(f64::min) {
+            query["cuda_max_good"] = json!({"gte": min});
+        }
         let resp = self
             .auth(self.client.put(format!("{}/search/asks/", self.base)).json(&query))
             .send()
