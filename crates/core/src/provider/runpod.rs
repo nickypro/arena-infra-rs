@@ -11,7 +11,7 @@ use reqwest::{Client, RequestBuilder};
 use serde_json::{json, Value};
 
 use super::Provider;
-use crate::error::{Error, Result};
+use crate::error::{Error, ProviderErrorKind, Result};
 use crate::pod::{Maintenance, Pod, PodSpec};
 
 const BASE: &str = "https://rest.runpod.io/v1";
@@ -547,22 +547,72 @@ fn parse_gpu_types(v: &Value) -> Vec<GpuType> {
         .collect()
 }
 
+/// What the priced catalog query's result means for [`fetch_gpu_types`].
+#[derive(Debug)]
+enum PricedCatalog {
+    /// Use this result as-is (the catalog, or an error the plain query couldn't fix).
+    Final(Result<Vec<GpuType>>),
+    /// The server rejected the priced query: try the plain one (carrying why, for the
+    /// message if that fails too).
+    Fallback(String),
+}
+
+/// Judge the priced query's result. Pure, so the fallback policy is table-tested.
+///
+/// Falls back when RunPod *answered* but rejected the query — the case the plain query
+/// exists for (pricing sub-fields renamed/removed). That arrives either as HTTP 200 with
+/// `errors` and no data, or as a non-2xx: GraphQL servers commonly answer a schema
+/// validation error with HTTP 400, and a crashing price resolver with a 5xx. Not on
+/// auth (401/403) or rate-limit (429) — the plain query would fail the same way, or add
+/// to the throttling — nor on a transport error (no answer at all). Partial data
+/// alongside errors (e.g. one GPU's price failed) is still useful: kept.
+fn judge_priced_catalog(result: Result<Value>) -> PricedCatalog {
+    match result {
+        Ok(v) => {
+            let types = parse_gpu_types(&v);
+            match graphql_errors(&v).filter(|_| types.is_empty()) {
+                Some(err) => PricedCatalog::Fallback(err),
+                None => PricedCatalog::Final(Ok(types)),
+            }
+        }
+        Err(e @ Error::Provider { kind: ProviderErrorKind::Auth | ProviderErrorKind::RateLimited, .. }) => {
+            PricedCatalog::Final(Err(e))
+        }
+        Err(e @ Error::Provider { .. }) => PricedCatalog::Fallback(e.to_string()),
+        Err(e) => PricedCatalog::Final(Err(e)),
+    }
+}
+
+/// Judge the plain (fallback) catalog query's result: its catalog, or an error that
+/// names both failures (`priced_err` is why the priced query was abandoned).
+fn judge_plain_catalog(result: Result<Value>, priced_err: &str) -> Result<Vec<GpuType>> {
+    let plain_err = match result {
+        Ok(v) => {
+            let types = parse_gpu_types(&v);
+            if !types.is_empty() {
+                return Ok(types);
+            }
+            graphql_errors(&v).unwrap_or_else(|| "no gpuTypes in the response".into())
+        }
+        Err(e) => e.to_string(),
+    };
+    Err(Error::provider(format!("fetch gpu types: {priced_err} (plain catalog query also failed: {plain_err})")))
+}
+
 /// Fetch RunPod's full GPU catalog via GraphQL (the REST v1 API has no gpu-types route).
 /// This is the authoritative, live list of `--gpu` names — including ones the local
-/// preset table doesn't alias — with live community/secure prices and stock status.
+/// preset table doesn't alias — with live community/secure prices and stock status. If
+/// RunPod rejects the priced query, the plain catalog query is tried before giving up
+/// (see [`judge_priced_catalog`]), so the live `--gpu` names survive a pricing-schema change.
 pub async fn fetch_gpu_types(api_key: &str) -> Result<Vec<GpuType>> {
     let client = Client::new();
-    let v = graphql(&client, api_key, &json!({ "query": GPU_TYPES_QUERY }), "fetch gpu types").await?;
-    let types = parse_gpu_types(&v);
-    // Partial data alongside errors (e.g. one GPU's price failed) is still useful: keep it.
-    let Some(rich_err) = graphql_errors(&v).filter(|_| types.is_empty()) else { return Ok(types) };
-    let v = graphql(&client, api_key, &json!({ "query": GPU_TYPES_BASIC_QUERY }), "fetch gpu types").await?;
-    let types = parse_gpu_types(&v);
-    if types.is_empty() {
-        let err = graphql_errors(&v).unwrap_or(rich_err);
-        return Err(Error::provider(format!("fetch gpu types: {err}")));
-    }
-    Ok(types)
+    let priced = graphql(&client, api_key, &json!({ "query": GPU_TYPES_QUERY }), "fetch gpu types").await;
+    let priced_err = match judge_priced_catalog(priced) {
+        PricedCatalog::Final(result) => return result,
+        PricedCatalog::Fallback(why) => why,
+    };
+    let plain = graphql(&client, api_key, &json!({ "query": GPU_TYPES_BASIC_QUERY }), "fetch gpu types").await;
+    judge_plain_catalog(plain, &priced_err)
 }
 
 /// Pull the GPU type ids the REST `create` endpoint actually accepts, from its OpenAPI
@@ -875,5 +925,59 @@ mod tests {
         // Basic-query shape (no price fields at all) parses with prices None.
         assert_eq!((t[2].community_price, t[2].secure_price, t[2].stock_status.clone()), (None, None, None));
         assert_eq!(t[3].id, "unknown"); // filtering placeholders is the caller's policy
+    }
+
+    /// Review finding: a non-2xx rejection of the priced query (GraphQL validation errors
+    /// are commonly HTTP 400) must still fall back to the plain catalog — before, `?`
+    /// skipped straight to the local presets.
+    #[test]
+    fn priced_catalog_fallback_policy() {
+        use reqwest::StatusCode;
+        let catalog = json!({ "data": { "gpuTypes": [ { "id": "NVIDIA RTX A4000", "displayName": "RTX A4000" } ] } });
+        let rejected = json!({ "errors": [ { "message": "Cannot query field \"securePrice\" on type \"GpuType\"." } ] });
+        let http = |code: u16| Err(Error::provider_http(StatusCode::from_u16(code).unwrap(), &rejected, "fetch gpu types"));
+        let transport = || Err(Error::Http(Client::new().get("not a url").build().unwrap_err()));
+
+        // (case, priced query result, falls back?)
+        let cases: Vec<(&str, Result<Value>, bool)> = vec![
+            ("200 + data", Ok(catalog.clone()), false),
+            ("200 + errors, no data", Ok(rejected.clone()), true),
+            ("200 + errors + partial data", Ok(json!({ "data": catalog["data"], "errors": rejected["errors"] })), false),
+            ("400 validation error", http(400), true),
+            ("422", http(422), true),
+            ("500 resolver crash", http(500), true),
+            ("401 bad key", http(401), false),
+            ("403", http(403), false),
+            ("429 throttled", http(429), false),
+            ("transport error", transport(), false),
+        ];
+        for (case, result, want_fallback) in cases {
+            match judge_priced_catalog(result) {
+                PricedCatalog::Fallback(why) => {
+                    assert!(want_fallback, "{case}: fell back ({why})");
+                    assert!(why.contains("Cannot query field"), "{case}: the reason is kept: {why}");
+                }
+                PricedCatalog::Final(r) => {
+                    assert!(!want_fallback, "{case}: did not fall back ({r:?})");
+                    if case.starts_with("200") {
+                        assert_eq!(r.unwrap()[0].id, "NVIDIA RTX A4000", "{case}");
+                    } else {
+                        assert!(r.is_err(), "{case}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn plain_catalog_result_names_both_failures() {
+        let catalog = json!({ "data": { "gpuTypes": [ { "id": "NVIDIA L4", "displayName": "L4", "memoryInGb": 24 } ] } });
+        assert_eq!(judge_plain_catalog(Ok(catalog), "priced: 400").unwrap()[0].id, "NVIDIA L4");
+        let e = judge_plain_catalog(Ok(json!({ "errors": [ { "message": "boom" } ] })), "priced: 400").unwrap_err();
+        assert_eq!(e.to_string(), "provider error: fetch gpu types: priced: 400 (plain catalog query also failed: boom)");
+        let e = judge_plain_catalog(Ok(json!({ "data": { "gpuTypes": [] } })), "priced: 400").unwrap_err();
+        assert!(e.to_string().contains("no gpuTypes"), "{e}");
+        let e = judge_plain_catalog(Err(Error::provider("network down")), "priced: 400").unwrap_err();
+        assert!(e.to_string().contains("priced: 400") && e.to_string().contains("network down"), "{e}");
     }
 }

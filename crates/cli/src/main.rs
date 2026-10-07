@@ -519,9 +519,9 @@ enum PodCmd {
         zsh_install: bool,
         /// Per-pod budget in seconds for the main provisioning command (default 300 for
         /// image-based pods, 1800 for the hetzner bare-VM script; overrides config
-        /// SETUP_TIMEOUT_SECS). A pod that runs over reports `timed out at <step>`; the
-        /// others carry on.
-        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        /// SETUP_TIMEOUT_SECS; at most 86400). A pod that runs over reports `timed out at
+        /// <step>`; the others carry on.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=arena_core::setup::MAX_STEP_TIMEOUT_SECS))]
         timeout: Option<u64>,
     },
     /// Stop a pod, or many with --all (+ --include/--exclude).
@@ -1295,44 +1295,59 @@ struct SetupJob {
 /// per-step budgets (see `arena_core::setup::provision`), so a wedged pod reports
 /// `timed out at <step>` and never holds up the others — the whole run takes as long as
 /// the slowest pod's budget, not forever. The flow is *data* (`provisioning_steps`) run
-/// by a generic runner — nothing here names a provider. Returns `(ok, failed)`.
+/// by a generic runner — nothing here names a provider. Returns the names of the pods
+/// that were fully provisioned (in finishing order) and the number that failed — the
+/// caller only follows up (API keys) on the former, never on a pod that just timed out.
 async fn provision_fleet(
     remote: std::sync::Arc<dyn arena_core::remote::Remote>,
     jobs: Vec<SetupJob>,
     boot: arena_core::setup::BootRetry,
     mut emit: impl FnMut(&str),
-) -> (usize, usize) {
+) -> (Vec<String>, usize) {
     use arena_core::setup::{progress_line, provision};
     let total = jobs.len();
     let mut set = tokio::task::JoinSet::new();
+    // Task id -> pod name, so even a task that panicked is reported by name.
+    let mut names = std::collections::HashMap::new();
     for job in jobs {
         let remote = remote.clone();
-        set.spawn(async move {
+        let name = job.name.clone();
+        let handle = set.spawn(async move {
             let outcome = provision(remote.as_ref(), &job.target, &job.steps, boot).await;
             (job.name, outcome)
         });
+        names.insert(handle.id(), name);
     }
-    let (mut ok, mut failed, mut done) = (0, 0, 0);
+    let (mut provisioned, mut failed, mut done) = (Vec::new(), 0, 0);
     while let Some(joined) = set.join_next().await {
         done += 1;
         match joined {
             Ok((name, outcome)) => {
+                emit(&progress_line(done, total, &name, &outcome));
                 if outcome.is_done() {
-                    ok += 1;
+                    provisioned.push(name);
                 } else {
                     failed += 1;
                 }
-                emit(&progress_line(done, total, &name, &outcome));
             }
             // A panicked task still counts — as a failure, never silently.
             Err(e) => {
                 failed += 1;
-                emit(&format!("[{done}/{total}] ✗ (a setup task crashed: {e})"));
+                let name = names.get(&e.id()).map(String::as_str).unwrap_or("?");
+                emit(&format!("[{done}/{total}] ✗ {name} (its setup task crashed: {e})"));
             }
         }
     }
-    (ok, failed)
+    (provisioned, failed)
 }
+
+/// How long one pod gets for the post-setup API-key + fleet-SSH write (`copy-keys`): a
+/// few greps/appends to rc files and `~/.ssh/config` — seconds on a healthy pod, so a
+/// minute means a wedged one, which must not hang the command (see `handle_copy_keys`).
+const COPY_KEYS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Where `keys gen` writes, and `setup` / `copy-keys` read, the per-host API-key CSVs.
+const KEYS_DIR: &str = "./keys";
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_setup(
@@ -1345,16 +1360,18 @@ async fn handle_setup(
     hf_token: Option<String>,
     cc_token: Option<String>,
     zsh_install: bool,
-    // `--timeout`: the run-step budget per pod (else SETUP_TIMEOUT_SECS, else defaults).
-    run_timeout: Option<u64>,
+    // Per-step budgets, resolved by the caller (`SetupTimeouts::from_config`) *before* it
+    // does anything costly: `up` / `replace` / `migrate copy` create (billing) pods before
+    // they get here, so a malformed SETUP_TIMEOUT_SECS must fail before the create, not
+    // after it — taking the resolved value (not the raw flag) makes that the only option.
+    timeouts: arena_core::setup::SetupTimeouts,
     // Restrict to these pod names (e.g. the ones `up` just created). None = whole fleet.
     only: Option<&[String]>,
+    // Where the per-host API-key CSVs live (`KEYS_DIR`; a temp dir in tests).
+    keys_dir: &str,
 ) -> Result<()> {
-    use arena_core::setup::{provisioning_steps, BootRetry, ProvisionStep, SetupTimeouts};
+    use arena_core::setup::{provisioning_steps, BootRetry, ProvisionStep};
     use arena_core::ssh::SshTarget;
-
-    // Resolve budgets first: a malformed SETUP_TIMEOUT_SECS fails before any SSH.
-    let timeouts = SetupTimeouts::from_config(cfg, run_timeout)?;
 
     // Broadcast token values: CLI flags override config (so a token can be supplied
     // without editing the read-only prod config).
@@ -1442,17 +1459,17 @@ async fn handle_setup(
             println!();
         }
         let keys_present = arena_core::apikeys::PROVIDERS.iter().any(|(base, _, _)| {
-            std::fs::read_to_string(format!("./keys/{base}_api_keys.csv"))
+            std::fs::read_to_string(format!("{keys_dir}/{base}_api_keys.csv"))
                 .map(|t| !arena_core::apikeys::parse_csv(&t).is_empty())
                 .unwrap_or(false)
         });
-        let key_scope = match only {
-            Some(names) if !names.is_empty() => names.join(", "),
-            _ => "all reachable pods".to_string(),
-        };
         println!(
             "API keys: {}",
-            if keys_present { format!("found in ./keys — would distribute to {key_scope} after provisioning") } else { "none in ./keys — would skip".to_string() }
+            if keys_present {
+                format!("found in {keys_dir} — would distribute to each pod above that provisions successfully")
+            } else {
+                format!("none in {keys_dir} — would skip")
+            }
         );
         println!("Preview only — run without --dry-run to execute over SSH.");
         return Ok(());
@@ -1475,13 +1492,13 @@ async fn handle_setup(
             target,
         })
         .collect();
-    let (ok, failed) = provision_fleet(remote, jobs, BootRetry::default(), |line| println!("{line}")).await;
-    println!("\nDone: {ok} provisioned, {failed} failed.");
+    let (provisioned, failed) =
+        provision_fleet(remote.clone(), jobs, BootRetry::default(), |line| println!("{line}")).await;
+    println!("\nDone: {} provisioned, {failed} failed.", provisioned.len());
 
     // Auto-handle API keys: if per-host CSVs have been generated, distribute them and say
     // so; otherwise report they're not set up (rather than silently doing nothing). HF is
     // already handled inline above. Best-effort — never fails the setup.
-    let keys_dir = "./keys";
     let csv_sources: Vec<&str> = arena_core::apikeys::PROVIDERS
         .iter()
         .filter(|(base, _, _)| {
@@ -1496,15 +1513,23 @@ async fn handle_setup(
             "API keys: none generated in {keys_dir}/ — skipping (run `arena keys gen --all` \
              or drop in <provider>_api_keys.csv, then re-run setup / `pods copy-keys`)."
         );
+    } else if provisioned.is_empty() {
+        println!("API keys: found {} — skipped, no pod provisioned successfully.", csv_sources.join(", "));
     } else {
-        // Scope key distribution to the SAME pods we just provisioned: when `setup` was
-        // given explicit names, only those pods get keys — otherwise (whole-fleet setup)
-        // `&[]` means all reachable. Without this, `setup <one-pod>` provisioned one pod
-        // but copied keys to the entire fleet.
-        let key_include: &[String] = only.unwrap_or(&[]);
-        let scope_note = if key_include.is_empty() { "all reachable pods".to_string() } else { key_include.join(", ") };
-        println!("API keys: found {} — distributing to {scope_note}…", csv_sources.join(", "));
-        if let Err(e) = handle_copy_keys(provider, cfg, keys_dir, None, None, key_include, &[], false, true).await {
+        // Scope key distribution to exactly the pods that just provisioned OK: never the
+        // rest of the fleet (`setup <one-pod>` must not touch the others), and never a pod
+        // that just failed or timed out — re-contacting a wedged pod would hang here.
+        // `provisioned` is non-empty, so this can't fall through to copy-keys' "empty
+        // include = every pod". Each pod's write is bounded by COPY_KEYS_TIMEOUT anyway.
+        let skipped = if failed > 0 { format!(" (skipping the {failed} that failed)") } else { String::new() };
+        println!(
+            "API keys: found {} — distributing to the {} provisioned pod(s){skipped}…",
+            csv_sources.join(", "),
+            provisioned.len()
+        );
+        if let Err(e) =
+            handle_copy_keys(provider, remote, cfg, keys_dir, None, None, &provisioned, &[], false, true).await
+        {
             eprintln!("  (API-key distribution failed: {e})");
         }
     }
@@ -2603,9 +2628,11 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             let spec = spec_with_overrides(cfg, &ov);
             // Setup runs after create: reject a malformed SETUP_TIMEOUT_SECS *before*
             // creating (billing) pods, not after.
-            if !no_setup {
-                arena_core::setup::SetupTimeouts::from_config(cfg, None)?;
-            }
+            let setup_timeouts = if no_setup {
+                arena_core::setup::SetupTimeouts::default()
+            } else {
+                arena_core::setup::SetupTimeouts::from_config(cfg, None)?
+            };
             if dry_run {
                 let desc = provider.describe(&spec);
                 for name in &names {
@@ -2725,7 +2752,8 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                 println!("\nProvisioning the new pod(s) over SSH…");
                 let new: Vec<String> = created.iter().map(|p| p.name.clone()).collect();
                 let remote = std::sync::Arc::new(arena_core::remote::SshRemote);
-                handle_setup(provider, remote, cfg, true, false, None, None, false, None, Some(&new)).await?;
+                handle_setup(provider, remote, cfg, true, false, None, None, false, setup_timeouts, Some(&new), KEYS_DIR)
+                    .await?;
             }
             // If there's no nginx to deploy to, say how to wire it (don't dump config).
             if !nginx_present {
@@ -2797,7 +2825,9 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
         PodCmd::CopyKeys { target, keys_dir, hf_token, cc_token, include, exclude, dry_run } => {
             // Positional targets are a friendlier spelling of --include; merge the two.
             let include: Vec<String> = include.into_iter().chain(target).collect();
-            handle_copy_keys(provider, cfg, &keys_dir, hf_token, cc_token, &include, &exclude, dry_run, yes).await?;
+            let remote = std::sync::Arc::new(arena_core::remote::SshRemote);
+            handle_copy_keys(provider, remote, cfg, &keys_dir, hf_token, cc_token, &include, &exclude, dry_run, yes)
+                .await?;
         }
 
         PodCmd::Cp { file, dest, recursive, include, exclude, dry_run } => {
@@ -2956,6 +2986,8 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                 Some(v) => format!("{} pod(s) ({})", v.len(), v.join(", ")),
                 None => "each pod".to_string(),
             };
+            // Budgets first: a malformed SETUP_TIMEOUT_SECS fails before the prompt.
+            let timeouts = arena_core::setup::SetupTimeouts::from_config(cfg, timeout)?;
             if !dry_run
                 && !confirm(yes, &format!("Will provision {scope} over SSH (deploy key, ~/.name, repo)."))?
             {
@@ -2971,8 +3003,9 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                 hf_token,
                 cc_token,
                 zsh_install,
-                timeout,
+                timeouts,
                 only.as_deref(),
+                KEYS_DIR,
             )
             .await?;
         }
@@ -3521,6 +3554,11 @@ async fn handle_migrate_copy(
     dry_run: bool,
     yes: bool,
 ) -> Result<()> {
+    // Setup runs after the create below: a malformed SETUP_TIMEOUT_SECS must fail now,
+    // before anything is created (and billed) — not after a ~15 min wait for the new pod,
+    // stranding it. Checked even on a dry-run (so the preview surfaces it) and on a
+    // re-sync that won't run setup (it's a config error either way; fix it once).
+    let setup_timeouts = arena_core::setup::SetupTimeouts::from_config(cfg, None)?;
     let (owner, canonical, pods) = resolve_migration(cfg, target).await?;
     let src_id = pods.iter().find(|p| p.name == canonical).unwrap().id.clone();
     let new_name = format!("{canonical}-new");
@@ -3574,7 +3612,8 @@ async fn handle_migrate_copy(
             .with_context(|| format!("{new_name} never stabilized"))?;
         println!("      provisioning {new_name}…");
         let remote = std::sync::Arc::new(arena_core::remote::SshRemote);
-        handle_setup(owner.as_ref(), remote, cfg, true, false, None, None, false, None, Some(&[new_name.clone()]))
+        let only = [new_name.clone()];
+        handle_setup(owner.as_ref(), remote, cfg, true, false, None, None, false, setup_timeouts, Some(&only), KEYS_DIR)
             .await
             .with_context(|| format!("provisioning {new_name}"))?;
         created.id
@@ -3860,6 +3899,10 @@ async fn handle_replace(
     yes: bool,
 ) -> Result<()> {
     use arena_core::ssh;
+    // Setup runs after the create (step 3/7): a malformed SETUP_TIMEOUT_SECS must fail
+    // now, before anything is created (and billed) — not after the new pod has come up,
+    // which would strand a `-new` pod that also blocks a re-run. Dry-runs check it too.
+    let setup_timeouts = arena_core::setup::SetupTimeouts::from_config(cfg, None)?;
     // Resolve the source pod and the backend that owns it. `resolve_target_any` accepts a
     // name or a raw id, so read the canonical name back from the fleet rather than trusting
     // the argument (a user may pass an id).
@@ -3972,7 +4015,8 @@ async fn handle_replace(
     for attempt in 1..=copy_attempts {
         println!("[3/7] provisioning {new_name}… (attempt {attempt}/{copy_attempts})");
         let remote = std::sync::Arc::new(arena_core::remote::SshRemote);
-        handle_setup(owner.as_ref(), remote, cfg, true, false, None, None, false, None, Some(&[new_name.clone()]))
+        let only = [new_name.clone()];
+        handle_setup(owner.as_ref(), remote, cfg, true, false, None, None, false, setup_timeouts, Some(&only), KEYS_DIR)
             .await
             .with_context(|| format!("provisioning {new_name}"))?;
         println!("[4/7] copying {canonical} → {new_name} (excludes caches, HF models, .claude, .ssh, shell-rc keys)…");
@@ -4968,6 +5012,9 @@ async fn handle_copy(
 #[allow(clippy::too_many_arguments)]
 async fn handle_copy_keys(
     provider: &dyn Provider,
+    // How we reach pods: `SshRemote` for real, `FakeRemote` in tests. Each pod's write is
+    // bounded by COPY_KEYS_TIMEOUT, so one wedged pod can't hang the command.
+    remote: std::sync::Arc<dyn arena_core::remote::Remote>,
     cfg: &Config,
     keys_dir: &str,
     hf_token: Option<String>,
@@ -4978,7 +5025,7 @@ async fn handle_copy_keys(
     yes: bool,
 ) -> Result<()> {
     use arena_core::apikeys;
-    use arena_core::ssh::{self, SshTarget};
+    use arena_core::ssh::SshTarget;
     use std::collections::HashMap;
 
     // Per-host vars from the CSVs: host -> [(ENV_NAME, value), …].
@@ -5116,7 +5163,8 @@ async fn handle_copy_keys(
     for (name, t, vars) in jobs {
         // Tokens (export lines) + fleet SSH (authorized_keys + ~/.ssh/config) in one round-trip.
         let cmd = format!("{}; {}", apikeys::remote_export_command(&vars), fleet_ssh);
-        set.spawn(async move { (name, ssh::run(&t, &cmd).await) });
+        let remote = remote.clone();
+        set.spawn(async move { (name, remote.exec(&t, &cmd, Some(COPY_KEYS_TIMEOUT)).await) });
     }
     let (mut ok, mut failed, mut done) = (0, 0, 0);
     while let Some(joined) = set.join_next().await {
@@ -5345,7 +5393,8 @@ async fn handle_keys(cmd: KeysCmd, provider: &dyn Provider, cfg: &Config, yes: b
             println!("\nGenerated {made}, skipped {skipped}, failed {failed} → {OPENROUTER_KEYS_CSV}");
             if copy && made > 0 {
                 println!();
-                handle_copy_keys(provider, cfg, "./keys", None, None, &names, &[], false, yes).await?;
+                let remote = std::sync::Arc::new(arena_core::remote::SshRemote);
+                handle_copy_keys(provider, remote, cfg, KEYS_DIR, None, None, &names, &[], false, yes).await?;
             }
         }
 
@@ -5397,7 +5446,8 @@ async fn handle_keys(cmd: KeysCmd, provider: &dyn Provider, cfg: &Config, yes: b
             println!("\nRotated {ok}, failed {failed}.");
             if copy && ok > 0 {
                 println!();
-                handle_copy_keys(provider, cfg, "./keys", None, None, &names, &[], false, yes).await?;
+                let remote = std::sync::Arc::new(arena_core::remote::SshRemote);
+                handle_copy_keys(provider, remote, cfg, KEYS_DIR, None, None, &names, &[], false, yes).await?;
             }
         }
 
@@ -5679,10 +5729,10 @@ mod list_tests {
 /// budget — not at the hang.
 #[cfg(test)]
 mod setup_tests {
-    use super::{handle_setup, provision_fleet, SetupJob};
-    use arena_core::remote::{FakeRemote, FakeReply, RemoteCall};
+    use super::{handle_copy_keys, handle_setup, provision_fleet, SetupJob, COPY_KEYS_TIMEOUT};
+    use arena_core::remote::{FakeRemote, FakeReply, Remote, RemoteCall};
     use arena_core::setup::{provisioning_steps, BootRetry, SetupConfig, SetupTimeouts};
-    use arena_core::ssh::SshTarget;
+    use arena_core::ssh::{SshOutput, SshTarget};
     use arena_core::{Config, Pod, PodSpec, Provider, Result};
     use async_trait::async_trait;
     use std::sync::Arc;
@@ -5723,9 +5773,11 @@ mod setup_tests {
         let jobs = vec![job("devtest-apple", 22001), job("devtest-bloom", 22002), job("devtest-cloud", 22003)];
         let mut lines = Vec::new();
         let start = Instant::now();
-        let (ok, failed) = provision_fleet(fake.clone(), jobs, BootRetry::default(), |l| lines.push(l.to_string())).await;
+        let (mut provisioned, failed) =
+            provision_fleet(fake.clone(), jobs, BootRetry::default(), |l| lines.push(l.to_string())).await;
 
-        assert_eq!((ok, failed), (2, 1));
+        provisioned.sort();
+        assert_eq!((provisioned, failed), (vec!["devtest-apple".to_string(), "devtest-cloud".to_string()], 1));
         assert_eq!(start.elapsed(), Duration::from_secs(300), "ends at the stuck step's budget, not the hang");
         // Healthy pods are reported first (they never waited on bloom), in either order.
         assert!(lines[0].starts_with("[1/3] ✓ ") && lines[1].starts_with("[2/3] ✓ "), "{lines:?}");
@@ -5744,9 +5796,9 @@ mod setup_tests {
         let fake = Arc::new(FakeRemote::new());
         fake.script("10.0.0.1:22001", [FakeReply::exit(1, "scp: /root/.ssh: Permission denied")]);
         let mut lines = Vec::new();
-        let (ok, failed) =
+        let (provisioned, failed) =
             provision_fleet(fake, vec![job("devtest-apple", 22001)], BootRetry::default(), |l| lines.push(l.to_string())).await;
-        assert_eq!((ok, failed), (0, 1));
+        assert_eq!((provisioned.len(), failed), (0, 1));
         assert_eq!(lines, ["[1/1] ✗ devtest-apple (failed at copy deploy key, exit 1): scp: /root/.ssh: Permission denied"]);
     }
 
@@ -5797,6 +5849,41 @@ mod setup_tests {
         ))
     }
 
+    /// A Remote whose calls panic — to check a crashed setup task is still reported.
+    struct PanickyRemote;
+
+    #[async_trait]
+    impl Remote for PanickyRemote {
+        async fn exec(&self, _: &SshTarget, _: &str, _: Option<Duration>) -> Result<SshOutput> {
+            panic!("boom")
+        }
+        async fn copy(&self, _: &SshTarget, _: &str, _: &str, _: Option<Duration>) -> Result<SshOutput> {
+            panic!("boom")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_crashed_setup_task_is_a_named_failure() {
+        let mut lines = Vec::new();
+        let (provisioned, failed) = provision_fleet(
+            Arc::new(PanickyRemote),
+            vec![job("devtest-apple", 22001)],
+            BootRetry::default(),
+            |l| lines.push(l.to_string()),
+        )
+        .await;
+        assert_eq!((provisioned.len(), failed), (0, 1));
+        assert!(lines[0].starts_with("[1/1] ✗ devtest-apple (its setup task crashed: "), "{lines:?}");
+    }
+
+    /// The resolved budgets for a test config (`--timeout` = `flag`).
+    fn budgets(cfg: &Config, flag: Option<u64>) -> SetupTimeouts {
+        SetupTimeouts::from_config(cfg, flag).unwrap()
+    }
+
+    /// No API-key CSVs: setup skips key distribution.
+    const NO_KEYS: &str = "/nonexistent/arena-test-keys";
+
     #[tokio::test(start_paused = true)]
     async fn handle_setup_runs_over_the_given_remote_with_configured_budget() {
         // End to end through the command: SETUP_TIMEOUT_SECS sets the config-step budget,
@@ -5805,7 +5892,8 @@ mod setup_tests {
         let fake = Arc::new(FakeRemote::new());
         fake.script("10.0.0.1:22002", [FakeReply::ok(), FakeReply::hang()]);
         let start = Instant::now();
-        let err = handle_setup(&fleet(), fake.clone(), &setup_cfg("SETUP_TIMEOUT_SECS=120"), true, false, None, None, false, None, None)
+        let cfg = setup_cfg("SETUP_TIMEOUT_SECS=120");
+        let err = handle_setup(&fleet(), fake.clone(), &cfg, true, false, None, None, false, budgets(&cfg, None), None, NO_KEYS)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("1 pod(s) failed to set up"), "{err}");
@@ -5826,7 +5914,8 @@ mod setup_tests {
     async fn handle_setup_timeout_flag_wins_and_names_scope_the_run() {
         let fake = Arc::new(FakeRemote::new());
         let only = vec!["devtest-apple".to_string()];
-        handle_setup(&fleet(), fake.clone(), &setup_cfg("SETUP_TIMEOUT_SECS=120"), true, false, None, None, false, Some(45), Some(&only))
+        let cfg = setup_cfg("SETUP_TIMEOUT_SECS=120");
+        handle_setup(&fleet(), fake.clone(), &cfg, true, false, None, None, false, budgets(&cfg, Some(45)), Some(&only), NO_KEYS)
             .await
             .unwrap();
         let calls = fake.calls();
@@ -5834,14 +5923,96 @@ mod setup_tests {
         assert!(matches!(calls.last(), Some(RemoteCall::Exec { timeout, .. }) if *timeout == Some(Duration::from_secs(45))));
     }
 
-    #[tokio::test]
-    async fn handle_setup_rejects_a_bad_budget_before_any_ssh() {
+    /// A temp keys dir holding an OpenAI per-host CSV for the whole test fleet.
+    fn keys_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("arena-setup-keys-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("openai_api_keys.csv"),
+            "host,key\ndevtest-apple,sk-a\ndevtest-bloom,sk-b\ndevtest-cloud,sk-c\n",
+        )
+        .unwrap();
+        d
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn keys_go_only_to_provisioned_pods_so_a_wedged_pod_cannot_hang_setup() {
+        // Review finding: once `keys gen` has run, a whole-fleet setup hands off to
+        // copy-keys — which used to target every reachable pod (incl. the one that just
+        // timed out) over an unbounded ssh, hanging the command forever. Now: bloom
+        // (wedged at its config step) is never contacted again, the others get their keys,
+        // and the command ends at bloom's step budget.
+        let dir = keys_dir("wedged");
         let fake = Arc::new(FakeRemote::new());
-        let err = handle_setup(&fleet(), fake.clone(), &setup_cfg("SETUP_TIMEOUT_SECS=5m"), true, false, None, None, false, None, None)
+        fake.script("10.0.0.1:22002", [FakeReply::ok(), FakeReply::hang(), FakeReply::hang()]);
+        let cfg = setup_cfg("SETUP_TIMEOUT_SECS=120");
+        let start = Instant::now();
+        let keys = dir.to_string_lossy();
+        let err = handle_setup(&fleet(), fake.clone(), &cfg, true, false, None, None, false, budgets(&cfg, None), None, &keys)
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("SETUP_TIMEOUT_SECS"), "{err}");
-        assert!(fake.calls().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(err.to_string().contains("1 pod(s) failed to set up"), "{err}");
+        assert_eq!(start.elapsed(), Duration::from_secs(120), "ends at bloom's budget, not the hang");
+        assert_eq!(fake.calls_to("10.0.0.1:22002").len(), 2, "the timed-out pod is not re-contacted for keys");
+        for port in [22001, 22003] {
+            let calls = fake.calls_to(&format!("10.0.0.1:{port}"));
+            assert_eq!(calls.len(), 3, "copy, config, keys: {calls:?}");
+            assert!(
+                matches!(&calls[2], RemoteCall::Exec { cmd, timeout, .. }
+                    if cmd.contains("OPENAI_API_KEY") && *timeout == Some(COPY_KEYS_TIMEOUT)),
+                "{calls:?}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pod_wedging_during_key_distribution_times_out() {
+        // Every pod provisions, then apple hangs on the key write: copy-keys reports it
+        // after COPY_KEYS_TIMEOUT (best-effort: setup itself still succeeds).
+        let dir = keys_dir("keyhang");
+        let fake = Arc::new(FakeRemote::new());
+        fake.script("10.0.0.1:22001", [FakeReply::ok(), FakeReply::ok(), FakeReply::hang()]);
+        let cfg = setup_cfg("");
+        let start = Instant::now();
+        let keys = dir.to_string_lossy().into_owned();
+        handle_setup(&fleet(), fake.clone(), &cfg, true, false, None, None, false, budgets(&cfg, None), None, &keys)
+            .await
+            .unwrap();
+        assert_eq!(start.elapsed(), COPY_KEYS_TIMEOUT);
+        for port in [22001, 22002, 22003] {
+            assert_eq!(fake.calls_to(&format!("10.0.0.1:{port}")).len(), 3, "port {port}");
+        }
+
+        // copy-keys on its own (`pods copy-keys`) is bounded the same way.
+        let fake = Arc::new(FakeRemote::new());
+        fake.script("10.0.0.1:22003", [FakeReply::hang()]);
+        let start = Instant::now();
+        let err = handle_copy_keys(&fleet(), fake.clone(), &cfg, &keys, None, None, &[], &[], false, true)
+            .await
+            .unwrap_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(err.to_string().contains("1 pod(s) failed"), "{err}");
+        assert_eq!(start.elapsed(), COPY_KEYS_TIMEOUT);
+        assert_eq!(fake.calls().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn create_then_setup_commands_reject_a_bad_budget_before_doing_anything() {
+        // Review finding: `replace` / `migrate copy` create (and bill) a pod, wait up to
+        // ~15 min for it, and only then ran setup — which is where a malformed
+        // SETUP_TIMEOUT_SECS used to be caught, stranding the new pod. Now they fail first.
+        // (The config has no provider keys, so getting past the check would fail
+        // differently — and never reach a provider.)
+        let cfg = setup_cfg("SETUP_TIMEOUT_SECS=5m");
+        let ov = super::SpecOverrides::default();
+        for dry_run in [true, false] {
+            let err = super::handle_replace(&cfg, "apple", &ov, false, true, dry_run, true).await.unwrap_err();
+            assert!(err.to_string().contains("SETUP_TIMEOUT_SECS"), "replace (dry_run={dry_run}): {err}");
+            let err = super::handle_migrate_copy(&cfg, "apple", &ov, dry_run, true).await.unwrap_err();
+            assert!(err.to_string().contains("SETUP_TIMEOUT_SECS"), "migrate copy (dry_run={dry_run}): {err}");
+        }
     }
 
     #[test]
@@ -5853,6 +6024,11 @@ mod setup_tests {
         let parsed = Cli::try_parse_from(["arena", "pods", "setup"]).unwrap().cmd;
         assert!(matches!(parsed, Cmd::Pods(PodCmd::Setup { timeout: None, .. })));
         assert!(Cli::try_parse_from(["arena", "pods", "setup", "--timeout", "0"]).is_err());
+        // Bounded above (no overflow from "no limit" spelled as a huge number).
+        assert!(Cli::try_parse_from(["arena", "pods", "setup", "--timeout", "86400"]).is_ok());
+        for big in ["86401", "18446744073709551615"] {
+            assert!(Cli::try_parse_from(["arena", "pods", "setup", "--timeout", big]).is_err(), "{big}");
+        }
     }
 }
 

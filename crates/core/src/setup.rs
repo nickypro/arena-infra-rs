@@ -286,21 +286,34 @@ impl Default for SetupTimeouts {
     }
 }
 
+/// The largest run-step budget `--timeout` / `SETUP_TIMEOUT_SECS` accept: a day. No
+/// provisioning step legitimately runs that long (the slowest, the hetzner script, gets
+/// 30 minutes), so a bigger value is a typo or an attempt at "no limit" — and an
+/// unbounded one (e.g. `u64::MAX`) would overflow the per-pod budget arithmetic.
+pub const MAX_STEP_TIMEOUT_SECS: u64 = 24 * 3600;
+
 impl SetupTimeouts {
     /// Defaults, with the run-step budget overridden by `--timeout <secs>` (wins) or the
     /// `SETUP_TIMEOUT_SECS` config value. The override sets the budget of the main
     /// provisioning command for *every* provider (image config and hetzner script alike)
     /// — it's the operator saying "give each pod this long". The config value is only
     /// read (and validated) when no flag is given, so a bad value can be overridden.
+    /// Either must be 1..=[`MAX_STEP_TIMEOUT_SECS`].
     pub fn resolve(config_value: Option<&str>, flag: Option<u64>) -> Result<Self> {
+        let in_range = |n: u64| (1..=MAX_STEP_TIMEOUT_SECS).contains(&n);
         let secs = match flag {
-            Some(0) => return Err(Error::Config("--timeout must be at least 1 second".into())),
+            Some(n) if !in_range(n) => {
+                return Err(Error::Config(format!(
+                    "--timeout must be between 1 and {MAX_STEP_TIMEOUT_SECS} seconds (got {n})"
+                )))
+            }
             Some(n) => Some(n),
             None => match config_value.map(str::trim).filter(|s| !s.is_empty()) {
                 None => None,
-                Some(raw) => Some(raw.parse::<u64>().ok().filter(|&n| n > 0).ok_or_else(|| {
+                Some(raw) => Some(raw.parse::<u64>().ok().filter(|&n| in_range(n)).ok_or_else(|| {
                     Error::Config(format!(
-                        "SETUP_TIMEOUT_SECS must be a whole number of seconds > 0 (got `{raw}`)"
+                        "SETUP_TIMEOUT_SECS must be a whole number of seconds, 1..={MAX_STEP_TIMEOUT_SECS} \
+                         (got `{raw}`)"
                     ))
                 })?),
             },
@@ -414,9 +427,15 @@ impl Default for BootRetry {
 /// The hard ceiling on one pod's provisioning: the boot-race window (plus one retry
 /// pause) and every step's budget. Step timeouts already bound each attempt, so this
 /// only bites if a [`Remote`] fails to honour its timeout — the guarantee that no pod
-/// can hold a fleet `setup` longer than this, whatever the transport does.
+/// can hold a fleet `setup` longer than this, whatever the transport does. Saturating:
+/// the inputs are public, and `Duration`'s `+`/`sum` panic on overflow — which would
+/// crash every pod's setup task instead of provisioning anything.
 pub fn pod_budget(steps: &[ProvisionStep], boot: BootRetry) -> Duration {
-    steps.iter().map(ProvisionStep::timeout).sum::<Duration>() + boot.window + boot.every
+    steps
+        .iter()
+        .map(ProvisionStep::timeout)
+        .chain([boot.window, boot.every])
+        .fold(Duration::ZERO, Duration::saturating_add)
 }
 
 /// How one pod's provisioning ended.
@@ -456,14 +475,38 @@ pub fn progress_line(done: usize, total: usize, name: &str, outcome: &ProvisionO
 /// True if a failure message reads like a host that isn't reachable *yet* (worth
 /// waiting on during the boot race) rather than a real provisioning failure. Matches
 /// what ssh/scp print: "connect to host … Connection refused", "Connection timed out",
-/// "kex_exchange_identification: Connection closed", "No route to host", "Network is
-/// unreachable". Only ever applied to a provider/stderr message — a step *timeout*
-/// is its own error variant and is never routed here.
+/// "kex_exchange_identification: Connection closed" / "… Connection reset by peer", "No
+/// route to host", "Network is unreachable". Only ever applied to a provider/stderr
+/// message — a step *timeout* is its own error variant and is never routed here.
+///
+/// An *authentication* failure is checked first and is never "unreachable": the host
+/// answered and rejected our key, which waiting won't change. It needs the explicit
+/// check because scp follows ssh's `Permission denied (publickey).` with its own
+/// `scp: Connection closed` (sftp mode) / `lost connection` (`-O`), which a plain
+/// connection-word match would read as the boot race — burning the whole window and then
+/// misreporting a key problem as "still unreachable".
 pub fn looks_unreachable(message: &str) -> bool {
     let m = message.to_lowercase();
-    ["connect", "timed out", "connection closed", "refused", "no route", "unreachable"]
-        .iter()
-        .any(|needle| m.contains(needle))
+    const REJECTED: &[&str] = &[
+        "permission denied (", // ssh: "Permission denied (publickey,password)."
+        "too many authentication failures",
+        "no supported authentication methods",
+        "host key verification failed",
+    ];
+    if REJECTED.iter().any(|needle| m.contains(needle)) {
+        return false;
+    }
+    [
+        "connect to host",
+        "connection refused",
+        "timed out",
+        "connection closed",
+        "connection reset",
+        "no route",
+        "unreachable",
+    ]
+    .iter()
+    .any(|needle| m.contains(needle))
 }
 
 /// One pass over the steps.
@@ -793,6 +836,22 @@ mod tests {
             let e = run(cfg, flag).unwrap_err();
             assert!(matches!(e, Error::Config(_)), "{cfg:?} {flag:?}: {e}");
         }
+        // Bounded above too: "no limit" spelled as a huge number is refused with a clear
+        // message instead of overflowing the budget arithmetic later (inside every pod's
+        // setup task). The cap itself is accepted.
+        let day = MAX_STEP_TIMEOUT_SECS;
+        assert_eq!(run(None, Some(day)).unwrap().1, secs(day));
+        assert_eq!(run(Some("86400"), None).unwrap().2, secs(day));
+        for (cfg, flag) in [
+            (None, Some(u64::MAX)),
+            (None, Some(day + 1)),
+            (Some("18446744073709551400"), None),
+            (Some("18446744073709551616"), None), // > u64::MAX: unparsable, same error
+            (Some("86401"), None),
+        ] {
+            let e = run(cfg, flag).unwrap_err().to_string();
+            assert!(e.contains("86400"), "{cfg:?} {flag:?}: {e}");
+        }
         let cfg = Config::parse("SETUP_TIMEOUT_SECS=42");
         assert_eq!(SetupTimeouts::from_config(&cfg, None).unwrap().config, secs(42));
     }
@@ -811,6 +870,20 @@ mod tests {
         for msg in ["fatal: couldn't find remote ref refs/heads/main", "bash: line 1: foo: command not found", ""] {
             assert!(!looks_unreachable(msg), "{msg}");
         }
+        // The pod answered and rejected our key — what real scp (OpenSSH 9.6) prints on an
+        // auth failure in sftp mode and in legacy `-O` mode. Its trailing "Connection
+        // closed" / "lost connection" must not read as the boot race.
+        for msg in [
+            "root@10.0.0.1: Permission denied (publickey).\nscp: Connection closed\r\n",
+            "root@10.0.0.1: Permission denied (publickey).\nlost connection\n",
+            "root@10.0.0.1: Permission denied (publickey,password).",
+            "Received disconnect from 10.0.0.1 port 22:2: Too many authentication failures\nscp: Connection closed",
+            "Host key verification failed.\r\nlost connection",
+        ] {
+            assert!(!looks_unreachable(msg), "{msg}");
+        }
+        // Still the boot race: sshd up but not ready yet.
+        assert!(looks_unreachable("kex_exchange_identification: read: Connection reset by peer\nscp: Connection closed"));
     }
 
     #[test]
@@ -836,6 +909,29 @@ mod tests {
         let steps = provisioning_steps("runpod", &steps_cfg(), "arena8-apple", false, "", &SetupTimeouts::default());
         // 60 (key) + 300 (config) + 150 (boot window) + 6 (one retry pause)
         assert_eq!(pod_budget(&steps, BootRetry::default()), secs(516));
+    }
+
+    #[test]
+    fn pod_budget_saturates_instead_of_panicking() {
+        // Huge step budgets (the inputs are public) must not panic on overflow.
+        let mut steps = image_steps();
+        for s in &mut steps {
+            match s {
+                ProvisionStep::Scp { timeout, .. } | ProvisionStep::Run { timeout, .. } => *timeout = Duration::MAX,
+            }
+        }
+        assert_eq!(pod_budget(&steps, BootRetry::default()), Duration::MAX);
+        let boot = BootRetry { window: Duration::MAX, every: Duration::MAX };
+        assert_eq!(pod_budget(&image_steps(), boot), Duration::MAX);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provision_survives_an_unbounded_budget() {
+        let mut steps = image_steps();
+        if let ProvisionStep::Run { timeout, .. } = &mut steps[1] {
+            *timeout = Duration::MAX;
+        }
+        assert_eq!(provision(&FakeRemote::new(), &target(22), &steps, BootRetry::default()).await, ProvisionOutcome::Done);
     }
 
     fn image_steps() -> Vec<ProvisionStep> {
@@ -876,6 +972,23 @@ mod tests {
             }
         );
         assert_eq!(fake.calls().len(), 1, "stopped at the failing step");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rejected_key_fails_at_once_not_after_the_boot_window() {
+        // A pod that refuses our key answers scp exactly like this. One attempt, reported
+        // as the auth failure it is — not 150s of retries ending in "still unreachable".
+        let fake = FakeRemote::new();
+        let denied = "root@10.0.0.1: Permission denied (publickey).\nscp: Connection closed\r\n";
+        fake.script("10.0.0.1:22", (0..50).map(|_| FakeReply::exit(255, denied)));
+        let start = tokio::time::Instant::now();
+        let out = provision(&fake, &target(22), &image_steps(), BootRetry::default()).await;
+        assert_eq!(
+            out,
+            ProvisionOutcome::Failed { step: "copy deploy key", code: Some(255), detail: denied.trim().into() }
+        );
+        assert_eq!(fake.calls().len(), 1, "an auth failure is never retried");
+        assert_eq!(start.elapsed(), Duration::ZERO);
     }
 
     #[tokio::test(start_paused = true)]

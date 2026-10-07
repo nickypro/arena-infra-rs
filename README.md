@@ -38,7 +38,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     runpod|vast|hetzner`; Vast reads `VAST_API_KEY`, Hetzner reads `HETZNER_API_KEY`
     + `HETZNER_*`). `stop`/`restart`/`terminate` accept a **machine name or id**.
     `list` shows NAME PROVIDER ID STATUS GPU (`count×type`) $/H ENDPOINT MAINT (the
-    host's RunPod maintenance window, e.g. `maint 10-09 02:00→06:00 UTC`) and a footer
+    host's RunPod maintenance window, e.g. `maint 10-09 02:00→06:00 UTC`; the host's
+    free-text note is flattened onto one line) and a footer
     `fleet: $X/h across N running pod(s)` summing RUNNING pods (Hetzner's € shown
     separately, unpriced pods counted). GPU/$/maintenance come from one extra read-only
     RunPod GraphQL query per `list` (best-effort: if it fails you get one warning line and
@@ -123,7 +124,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     repos** (Llama 3, …) and a **Claude Code token** (`--cc-token`/`CLAUDE_CODE_OAUTH_TOKEN`).
     `--include`/`--exclude` (name or id) scope it to specific pods. Confirms first;
     `--dry-run` lists what would be set (values redacted). Both broadcast tokens are
-    env-introducible (e.g. `CLAUDE_CODE_OAUTH_TOKEN=… arena pods copy-keys`).
+    env-introducible (e.g. `CLAUDE_CODE_OAUTH_TOKEN=… arena pods copy-keys`). Each pod's
+    write has a 60s budget, so a wedged pod reports `✗ <name>: … timed out` instead of
+    hanging the command.
   - `pods copy <file> [dest]` — scp a local file to every pod (concurrent; `--include`/
     `--exclude` to scope). With no `dest` it **mirrors the path under the ARENA repo**
     (a local `…/ARENA_3.0/foo/bar.py` → `/root/ARENA_3.0/foo/bar.py`); otherwise `dest`
@@ -143,7 +146,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     is the *distributor*; `keys` is the *generator*.)
   - `gpus` — list the GPU types for `--gpu`: RunPod's **full live catalog** (via GraphQL)
     when on RunPod with a key, else the local presets. Shows VRAM, **live** community/secure
-    $/hr and RunPod's 1-GPU stock hint (`~` marks a preset estimate). `--json` emits rows
+    $/hr and RunPod's 1-GPU stock hint (`~` marks a preset estimate). If RunPod rejects
+    the priced query (HTTP 200 with errors, or a non-auth 4xx/5xx), the plain catalog
+    query is tried before falling back to presets. `--json` emits rows
     `{id, display_name, memory_gb, community_price, secure_price, stock_status, creatable,
     source, price_source}` (incl. catalog entries the create API rejects, `creatable: false`).
   - `ssh-config [--proxy] [--out]` — emit the **participant-facing `~/.ssh/config`**:
@@ -155,17 +160,21 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     Face for gated-repo access, Claude Code; via config or `--hf-token`/`--cc-token`) —
     else those steps are skipped and it says so. It also **auto-distributes per-host API
     keys** if any
-    `keys/*_api_keys.csv` exist (reporting what it added, or that none are set up), so a
-    `setup` (or `up --setup`) makes pods fully ready. Confirms first (`--dry-run` previews,
+    `keys/*_api_keys.csv` exist (reporting what it added, or that none are set up) — to
+    exactly the pods that just provisioned successfully, never one that failed or timed
+    out — so a `setup` (or `up --setup`) makes pods fully ready. Confirms first (`--dry-run` previews,
     token redacted). Uses `GIT_SSH_KEY_LOCAL/REMOTE`, `ARENA_REPO_OWNER/NAME`, `DEFAULT_BRANCH`.
     The repo update fetches **only the default branch, without tags** (a bare `git fetch`
     would pull every participant's autocommit branch); a tracked non-default branch pulls
     just its own upstream. Pods run in parallel and **every step has a time budget** —
     copies 60s, the image config step 300s, the hetzner bare-VM script 1800s; `--timeout
-    <secs>` (or config `SETUP_TIMEOUT_SECS`; `up` uses the config value) overrides the
+    <secs>` (or config `SETUP_TIMEOUT_SECS`, 1..86400; `up`/`replace`/`migrate copy` use the
+    config value and reject a bad one *before* creating anything) overrides the
     main-step budget. A wedged pod prints `✗ <name> (timed out at <step> after Ns)` and the
-    others finish normally; connection refusals right after create are still retried for
-    ~150s (sshd booting).
+    others finish normally; a timed-out `ssh`/`scp` is stopped (SIGTERM, so scp also stops
+    its ssh transport; SIGKILL 2s later). Connection refusals right after create are still
+    retried for ~150s (sshd booting); an auth failure (`Permission denied (publickey)`)
+    fails at once.
   - `config check | set | which` — `check` is the read-only doctor (keys + setup
     readiness); `config set KEY VALUE` writes a key (e.g. an API key) into config.env —
     or give just `KEY` and **pipe the value on stdin** (`printf %s "$TOK" | arena config

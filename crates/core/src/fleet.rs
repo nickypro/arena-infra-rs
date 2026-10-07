@@ -97,6 +97,17 @@ fn is_utc(s: &str) -> bool {
     s.ends_with('Z') || s.ends_with("+00:00")
 }
 
+/// Provider free text flattened onto one line: every run of whitespace / control
+/// characters becomes a single space (and the ends are trimmed). A host-written
+/// maintenance note is arbitrary text — a `\n` in it would split the pod's row in two
+/// (and break the column layout), and an ESC could smuggle terminal escape sequences.
+fn one_line(s: &str) -> String {
+    s.split(|c: char| c.is_whitespace() || c.is_control())
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Truncate to `max` chars with an ellipsis, so free text can't blow up a table row.
 fn clip(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -111,10 +122,11 @@ fn clip(s: &str, max: usize) -> String {
 /// The MAINT column: a compact host-maintenance window, e.g. `maint 10-09 02:00→06:00 UTC`
 /// (the end's date is dropped when it's the same day), with the provider's note appended
 /// (clipped). `-` when there's no window. Times are shown as the provider reports them;
-/// unparseable strings are shown raw (clipped) instead of guessed at.
+/// unparseable strings are shown raw (clipped, flattened onto one line) instead of
+/// guessed at.
 pub fn maintenance_label(m: Option<&Maintenance>) -> String {
     let Some(m) = m else { return "-".to_string() };
-    let nonempty = |o: &Option<String>| o.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    let nonempty = |o: &Option<String>| o.as_deref().map(one_line).filter(|s| !s.is_empty());
     let (start, end, note) = (nonempty(&m.start), nonempty(&m.end), nonempty(&m.note));
     if start.is_none() && end.is_none() && note.is_none() {
         return "-".to_string();
@@ -336,6 +348,14 @@ mod tests {
                 Some(maint(None, None, Some("a very long maintenance note that keeps going and going"))),
                 "maint · a very long maintenance note that keeps…",
             ),
+            (
+                // Host-written free text: newlines/tabs/control chars (incl. an ESC) are
+                // flattened to single spaces so the row stays one table line.
+                Some(maint(None, None, Some("Host reboot.\nPlease\tmigrate\r\n\x1b[31mnow"))),
+                "maint · Host reboot. Please migrate [31mnow",
+            ),
+            (Some(maint(Some("\n\t"), None, Some(" \u{7}\n "))), "-"),
+            (Some(maint(Some("next\ntuesday"), None, None)), "maint next tuesday→?"),
         ];
         for (m, want) in cases {
             assert_eq!(maintenance_label(m.as_ref()), *want, "{m:?}");
@@ -421,5 +441,14 @@ devtest-flutter  hetzner   51234567  run     cx23         €0.006  5.6.7.8:22  
 fleet: $0.17/h across 2 running pod(s) + €0.006/h hetzner
 ";
         assert_eq!(out, want, "\n--- got ---\n{out}");
+    }
+
+    #[test]
+    fn multiline_maintenance_note_keeps_the_table_one_line_per_pod() {
+        let mut p = pod("devtest-apple", "runpod", "RUNNING");
+        p.maintenance = Some(maint(None, None, Some("Host reboot.\nPlease migrate")));
+        let out = render_pods_table(&[p]);
+        assert_eq!(out.lines().count(), 2, "header + one row:\n{out}");
+        assert!(out.ends_with("maint · Host reboot. Please migrate\n"), "{out}");
     }
 }

@@ -10,17 +10,25 @@
 //! Timeouts: `timeout` bounds the whole call (connect + transfer/remote run). On expiry
 //! the call returns [`Error::Timeout`] — a distinct variant, so a caller never mistakes
 //! "took too long" for a retryable connection error. The local `ssh`/`scp` child is
-//! killed when the call is abandoned: tokio's default is to leave a dropped child
-//! *running*, so without `kill_on_drop` every "timed out" step would keep a stray ssh
-//! process (and its remote command) alive behind the operator's back. Killing the client
-//! closes the connection; the remote side then dies on its next write to the closed
-//! channel, and our provisioning commands are idempotent, so a re-run is safe either way.
+//! stopped when the call is abandoned (timed out, or the caller dropped it): tokio's
+//! default is to leave a dropped child *running*, so without this every "timed out" step
+//! would keep a stray ssh process (and its remote command) alive behind the operator's
+//! back. Stopping is SIGTERM first, SIGKILL after a short grace ([`TERM_GRACE`], plus
+//! `kill_on_drop` as the backstop): `scp` runs its own `ssh` transport as a child, and
+//! only a catchable signal lets scp take that transport down with it — a bare SIGKILL of
+//! scp orphans the transport, which then lingers on a wedged pod. (Deliberately not a
+//! separate process group + `killpg`: that would take the children out of the terminal's
+//! foreground group, so an operator's Ctrl-C would no longer reach them — they'd outlive
+//! the CLI.) Stopping the client closes the connection; the remote side then dies on its
+//! next write to the closed channel, and our provisioning commands are idempotent, so a
+//! re-run is safe either way.
 
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::process::Command;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::{Child, Command};
 
 use crate::error::{Error, Result};
 use crate::ssh::{SshOutput, SshTarget};
@@ -93,19 +101,84 @@ fn child(program: &str) -> Command {
     c
 }
 
-/// Run `cmd` to completion (capturing stdout/stderr) within `timeout`. On timeout the
-/// output future — and with it the child, thanks to `kill_on_drop` — is dropped.
+/// How long an abandoned child gets to exit on SIGTERM before it is SIGKILLed. scp/ssh
+/// exit at once on SIGTERM; this only matters for one that ignores it.
+pub const TERM_GRACE: Duration = Duration::from_secs(2);
+
+/// Run `cmd` to completion (capturing stdout/stderr) within `timeout`. On timeout (or if
+/// this future is dropped) the child is stopped by [`Stopper`].
 async fn output_within(mut cmd: Command, what: &str, timeout: Option<Duration>) -> Result<SshOutput> {
-    let run = async {
-        cmd.output().await.map_err(|e| Error::provider(format!("spawning {what}: {e}")))
-    };
-    let out = within(what, timeout, run).await?;
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let spawned = cmd.spawn().map_err(|e| Error::provider(format!("spawning {what}: {e}")))?;
+    let mut child = Stopper(Some(spawned));
+    let (status, stdout, stderr) = within(what, timeout, child.output(what)).await?;
     Ok(SshOutput {
-        success: out.status.success(),
-        code: out.status.code(),
-        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        success: status.success(),
+        code: status.code(),
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
     })
+}
+
+/// Owns a running child; if dropped before the child finished, stops it gracefully (see
+/// the module doc): SIGTERM now, then SIGKILL (`kill_on_drop`) once it has had
+/// [`TERM_GRACE`] to exit. Holding the `Child` — rather than handing it to
+/// `wait_with_output`, whose drop SIGKILLs at once — is what makes SIGTERM-first possible.
+struct Stopper(Option<Child>);
+
+impl Stopper {
+    /// Wait for exit while draining stdout/stderr (concurrently, so a chatty child can't
+    /// block on a full pipe).
+    async fn output(&mut self, what: &str) -> Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
+        let child = self.0.as_mut().expect("the child is only taken on drop");
+        let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+        tokio::try_join!(child.wait(), read_all(stdout), read_all(stderr))
+            .map_err(|e| Error::provider(format!("waiting for {what}: {e}")))
+    }
+}
+
+impl Drop for Stopper {
+    fn drop(&mut self) {
+        let Some(mut child) = self.0.take() else { return };
+        // `id()` is `None` once the child has been reaped (it finished normally): nothing
+        // to stop — and its pid may already belong to another process, so never signal it.
+        let Some(pid) = child.id() else { return };
+        terminate(pid);
+        match tokio::runtime::Handle::try_current() {
+            // Let it exit on SIGTERM (scp first takes its ssh transport down); if it is
+            // still running after the grace, dropping `child` SIGKILLs it.
+            Ok(rt) => {
+                rt.spawn(async move {
+                    let _ = tokio::time::timeout(TERM_GRACE, child.wait()).await;
+                });
+            }
+            // No runtime to wait on: SIGKILL now, via `kill_on_drop`.
+            Err(_) => drop(child),
+        }
+    }
+}
+
+/// SIGTERM `pid` (a child we have not reaped, so the pid can't have been reused).
+#[cfg(unix)]
+fn terminate(pid: u32) {
+    if let Ok(pid) = libc::pid_t::try_from(pid) {
+        // SAFETY: a plain kill(2) on our own live child; no memory is involved.
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+    }
+}
+
+/// No SIGTERM off unix: the `kill_on_drop` kill is all there is.
+#[cfg(not(unix))]
+fn terminate(_pid: u32) {}
+
+async fn read_all(pipe: Option<impl AsyncRead + Unpin>) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    if let Some(mut pipe) = pipe {
+        pipe.read_to_end(&mut buf).await?;
+    }
+    Ok(buf)
 }
 
 /// Bound `fut` by `timeout`, mapping expiry to [`Error::Timeout`]. Shared by the real and
@@ -370,6 +443,98 @@ mod tests {
                 Some(_) => std::thread::sleep(Duration::from_millis(20)),
             }
         }
+    }
+
+    /// `/proc/<pid>` state letter, or `None` once the process is gone.
+    #[cfg(target_os = "linux")]
+    fn proc_state(pid: &str) -> Option<String> {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|s| s.rsplit(')').next().and_then(|r| r.split_whitespace().next()).map(String::from))
+    }
+
+    /// Wait (yielding to the runtime, so a background stop can run) until `pid` is gone
+    /// or a zombie; panic if it is still alive after `within`.
+    #[cfg(target_os = "linux")]
+    async fn assert_dies(pid: &str, within: Duration, what: &str) {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            match proc_state(pid).as_deref() {
+                None | Some("Z") | Some("X") => return,
+                Some(s) if std::time::Instant::now() >= deadline => {
+                    panic!("{what} {pid} still alive (state {s})")
+                }
+                Some(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+    }
+
+    /// A temp dir for one test's scripts/pid files.
+    #[cfg(target_os = "linux")]
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("arena-remote-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The finding behind SIGTERM-first: scp runs its ssh transport as a child, and a
+    /// SIGKILLed scp orphans it (left running on a wedged pod). A timed-out copy must take
+    /// the transport down too. Real `scp`, with a fake transport (`-S`) that records its
+    /// pid and hangs like a wedged pod would — no network.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn timed_out_scp_takes_its_ssh_transport_down_too() {
+        if std::process::Command::new("scp").arg("-h").output().is_err() {
+            eprintln!("scp not installed — skipping");
+            return;
+        }
+        let dir = scratch("scp");
+        let pidfile = dir.join("transport.pid");
+        let transport = dir.join("fake-ssh.sh");
+        std::fs::write(&transport, format!("#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n", pidfile.display())).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&transport, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let local = dir.join("payload");
+        std::fs::write(&local, "x").unwrap();
+
+        let mut c = child("scp");
+        c.arg("-S").arg(&transport).args(["-o", "BatchMode=yes"]).arg(&local).arg("root@10.0.0.1:/tmp/payload");
+        let err = output_within(c, "scp", Some(Duration::from_millis(700))).await.unwrap_err();
+        assert!(matches!(err, Error::Timeout { .. }), "{err}");
+
+        let pid = std::fs::read_to_string(&pidfile).expect("transport wrote its pid").trim().to_string();
+        assert_dies(&pid, Duration::from_secs(5), "scp's ssh transport").await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A child that ignores SIGTERM is still SIGKILLed once the grace has passed.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn child_ignoring_sigterm_is_killed_after_the_grace() {
+        let dir = scratch("ignore-term");
+        let pidfile = dir.join("pid");
+        let mut c = child("sh");
+        c.arg("-c").arg(format!("trap '' TERM; echo $$ > '{}'; while :; do sleep 0.2; done", pidfile.display()));
+        let err = output_within(c, "sh", Some(Duration::from_millis(500))).await.unwrap_err();
+        assert!(matches!(err, Error::Timeout { .. }), "{err}");
+        let pid = std::fs::read_to_string(&pidfile).expect("child wrote its pid").trim().to_string();
+        // SIGTERM came first (ignored here), so it is not dead yet…
+        assert!(matches!(proc_state(&pid).as_deref(), Some(s) if s != "Z" && s != "X"), "killed without a grace");
+        // …but it is once the grace is over.
+        assert_dies(&pid, TERM_GRACE + Duration::from_secs(5), "sh ignoring SIGTERM").await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn finished_child_output_is_captured() {
+        let mut c = child("sh");
+        c.arg("-c").arg("echo out; echo err >&2; exit 3");
+        let out = output_within(c, "sh", Some(Duration::from_secs(10))).await.unwrap();
+        assert_eq!((out.success, out.code), (false, Some(3)));
+        assert_eq!((out.stdout.as_str(), out.stderr.as_str()), ("out\n", "err\n"));
+        let err = output_within(child("/nonexistent/arena-no-such-binary"), "ssh x", None).await.unwrap_err();
+        assert!(err.to_string().contains("spawning ssh x"), "{err}");
     }
 
     #[tokio::test]
