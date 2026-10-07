@@ -6,6 +6,8 @@
 //!   wipeout — every backend failing — is fatal.
 //! - `create_pod` goes to the chosen primary (the `--provider` / `ARENA_PROVIDER`).
 //! - `stop`/`restart`/`terminate` route to whichever backend actually owns the pod id.
+//! - `enrich` hands each pod to the backend that listed it; a failing backend is reported
+//!   (as one error naming it) without costing the other backends' pods their details.
 //!
 //! With a single backend configured it behaves exactly like that one provider, so
 //! single-provider setups are unaffected.
@@ -84,6 +86,45 @@ impl Provider for MultiProvider {
         }
         Ok(out)
     }
+    async fn enrich(&self, pods: &mut [Pod]) -> Result<()> {
+        // Route each pod to the backend that listed it: by its `provider` tag first (set by
+        // that backend, so unambiguous even if two backends' numeric ids collide), else the
+        // id→backend cache. Resolve under the lock, then release it before any await.
+        let owners: Vec<Option<usize>> = {
+            let map = self.owner.lock().unwrap();
+            pods.iter()
+                .map(|p| {
+                    self.backends
+                        .iter()
+                        .position(|b| b.name() == p.provider)
+                        .or_else(|| map.get(&p.id).copied())
+                })
+                .collect()
+        };
+        // Backends are independent: one failing (rate limit, outage) must not cost the
+        // others their details, so try them all and report the failures together.
+        let mut errs: Vec<String> = Vec::new();
+        for (i, b) in self.backends.iter().enumerate() {
+            let idx: Vec<usize> = (0..pods.len()).filter(|&j| owners[j] == Some(i)).collect();
+            if idx.is_empty() {
+                continue; // no API call for a backend with nothing to enrich
+            }
+            let mut mine: Vec<Pod> = idx.iter().map(|&j| pods[j].clone()).collect();
+            let r = b.enrich(&mut mine).await;
+            // Write back even on Err: whatever the backend filled before failing is valid.
+            for (j, p) in idx.into_iter().zip(mine) {
+                pods[j] = p;
+            }
+            if let Err(e) = r {
+                errs.push(format!("{}: {e}", b.name()));
+            }
+        }
+        if errs.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::provider(format!("pod details unavailable ({})", errs.join("; "))))
+        }
+    }
     async fn create_pod(&self, spec: &PodSpec) -> Result<Pod> {
         // Creation needs a concrete target: always the chosen primary.
         let pod = self.backends[self.primary].create_pod(spec).await?;
@@ -142,4 +183,111 @@ pub fn build_fleet(primary: &str, cfg: &Config, warn_on_partial: bool) -> Result
         owner: std::sync::Mutex::new(std::collections::HashMap::new()),
         warn_on_partial,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    /// A backend that records which pod ids it was asked to enrich and stamps a marker
+    /// `gpu_count` on them (then optionally fails, to model a rate-limited provider).
+    struct FakeBackend {
+        name: &'static str,
+        marker: u32,
+        fail: bool,
+        seen: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    #[async_trait]
+    impl Provider for FakeBackend {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        fn describe(&self, _spec: &PodSpec) -> String {
+            String::new()
+        }
+        async fn list_pods(&self) -> Result<Vec<Pod>> {
+            Ok(Vec::new())
+        }
+        async fn create_pod(&self, _spec: &PodSpec) -> Result<Pod> {
+            unimplemented!("not exercised by enrich tests")
+        }
+        async fn stop_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn restart_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn terminate_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn enrich(&self, pods: &mut [Pod]) -> Result<()> {
+            self.seen.lock().unwrap().push(pods.iter().map(|p| p.id.clone()).collect());
+            for p in pods.iter_mut() {
+                p.gpu_count = Some(self.marker);
+            }
+            if self.fail {
+                return Err(Error::provider("HTTP 429"));
+            }
+            Ok(())
+        }
+    }
+
+    fn backend(name: &'static str, marker: u32, fail: bool) -> (Box<dyn Provider>, Arc<Mutex<Vec<Vec<String>>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        (Box::new(FakeBackend { name, marker, fail, seen: seen.clone() }), seen)
+    }
+
+    fn multi(backends: Vec<Box<dyn Provider>>, owner: HashMap<String, usize>) -> MultiProvider {
+        MultiProvider { backends, primary: 0, owner: Mutex::new(owner), warn_on_partial: false }
+    }
+
+    fn pod(id: &str, provider: &str) -> Pod {
+        Pod { id: id.into(), name: format!("devtest-{id}"), provider: provider.into(), ..Default::default() }
+    }
+
+    #[tokio::test]
+    async fn enrich_routes_each_pod_to_its_backend() {
+        let (rp, rp_seen) = backend("runpod", 1, false);
+        let (va, va_seen) = backend("vast", 2, false);
+        let (hz, hz_seen) = backend("hetzner", 3, false);
+        let m = multi(vec![rp, va, hz], HashMap::new());
+        let mut pods = vec![pod("r1", "runpod"), pod("v1", "vast"), pod("r2", "runpod"), pod("x1", "lambda")];
+        m.enrich(&mut pods).await.unwrap();
+        // One batched call per backend, with only its own pods, in list order.
+        assert_eq!(*rp_seen.lock().unwrap(), vec![vec!["r1".to_string(), "r2".to_string()]]);
+        assert_eq!(*va_seen.lock().unwrap(), vec![vec!["v1".to_string()]]);
+        // A backend with no pods is not called at all (no wasted API request).
+        assert!(hz_seen.lock().unwrap().is_empty());
+        let counts: Vec<Option<u32>> = pods.iter().map(|p| p.gpu_count).collect();
+        // Results land on the right pods; a pod no backend owns is left untouched.
+        assert_eq!(counts, vec![Some(1), Some(2), Some(1), None]);
+    }
+
+    #[tokio::test]
+    async fn enrich_falls_back_to_owner_cache_when_tag_is_unknown() {
+        let (rp, rp_seen) = backend("runpod", 1, false);
+        let owner = HashMap::from([("odd".to_string(), 0usize)]);
+        let m = multi(vec![rp], owner);
+        let mut pods = vec![pod("odd", "")];
+        m.enrich(&mut pods).await.unwrap();
+        assert_eq!(*rp_seen.lock().unwrap(), vec![vec!["odd".to_string()]]);
+        assert_eq!(pods[0].gpu_count, Some(1));
+    }
+
+    #[tokio::test]
+    async fn enrich_failure_is_reported_but_other_backends_still_fill() {
+        let (rp, _) = backend("runpod", 1, true); // e.g. rate-limited
+        let (va, _) = backend("vast", 2, false);
+        let m = multi(vec![rp, va], HashMap::new());
+        let mut pods = vec![pod("r1", "runpod"), pod("v1", "vast")];
+        let err = m.enrich(&mut pods).await.unwrap_err().to_string();
+        assert!(err.contains("runpod: provider error: HTTP 429"), "{err}");
+        assert!(!err.contains("vast"), "{err}");
+        // vast's details still applied; runpod's partial fill is kept too.
+        assert_eq!(pods[1].gpu_count, Some(2));
+        assert_eq!(pods[0].gpu_count, Some(1));
+    }
 }

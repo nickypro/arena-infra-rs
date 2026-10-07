@@ -9,6 +9,7 @@ pub mod apikeys;
 pub mod backup;
 pub mod config;
 pub mod error;
+pub mod fleet;
 pub mod gpu;
 pub mod metrics;
 pub mod naming;
@@ -24,6 +25,7 @@ pub mod setup;
 pub mod sshconfig;
 pub mod ssh;
 pub mod status;
+pub mod table;
 
 pub use config::Config;
 pub use error::{Error, ProviderErrorKind, Result};

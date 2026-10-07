@@ -36,9 +36,15 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
 - `arena` (CLI):
   - `pods list | create | stop | restart | terminate | kill` (`--provider
     runpod|vast|hetzner`; Vast reads `VAST_API_KEY`, Hetzner reads `HETZNER_API_KEY`
-    + `HETZNER_*`). `list` takes `--json`; `stop`/`restart`/`terminate` accept a
-    **machine name or id**. `list --probe` fills the GPU column from `nvidia-smi` over
-    SSH (the provider list API omits GPU type). `restart` restarts in place (RunPod restart / Hetzner
+    + `HETZNER_*`). `stop`/`restart`/`terminate` accept a **machine name or id**.
+    `list` shows NAME PROVIDER ID STATUS GPU (`count×type`) $/H ENDPOINT MAINT (the
+    host's RunPod maintenance window, e.g. `maint 10-09 02:00→06:00 UTC`) and a footer
+    `fleet: $X/h across N running pod(s)` summing RUNNING pods (Hetzner's € shown
+    separately, unpriced pods counted). GPU/$/maintenance come from one extra read-only
+    RunPod GraphQL query per `list` (best-effort: if it fails you get one warning line and
+    the list still renders); the `nvidia-smi` probe over SSH (default for the table,
+    `--probe`/`--no-probe`) overrides the GPU when a pod answers. `list --json` emits the
+    pods incl. `gpu_count`/`cost_per_hr`/`maintenance`. `restart` restarts in place (RunPod restart / Hetzner
     reboot / Vast stop+start), preserving the machine where supported. `terminate
     --all` tears down the **whole fleet** (confirms first; `--dry-run` lists every
     pod without touching them) — for end-of-program teardown. `stop --all`
@@ -136,7 +142,10 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     name, so no local hash bookkeeping. `keys which` shows the local keys file. (`copy-keys`
     is the *distributor*; `keys` is the *generator*.)
   - `gpus` — list the GPU types for `--gpu`: RunPod's **full live catalog** (via GraphQL)
-    when on RunPod with a key, else the local presets. Shows VRAM + rough $/hr where known.
+    when on RunPod with a key, else the local presets. Shows VRAM, **live** community/secure
+    $/hr and RunPod's 1-GPU stock hint (`~` marks a preset estimate). `--json` emits rows
+    `{id, display_name, memory_gb, community_price, secure_price, stock_status, creatable,
+    source, price_source}` (incl. catalog entries the create API rejects, `creatable: false`).
   - `ssh-config [--proxy] [--out]` — emit the **participant-facing `~/.ssh/config`**:
     direct pod endpoints by default, or stable proxy ports (`--proxy`) anchored to each
     machine's `MACHINE_NAME_LIST` index. Read-only.
@@ -196,7 +205,9 @@ Hetzner), commit/backup, the GPU/progress dashboard, and proxy/port-forwarding.
 
 - Runs as the unprivileged `dev` user, which **cannot read `/root`**. It only sees
   a read-only copy of config at `/home/dev/prod-ro/config.env`.
-- **Read-only by default.** `pods list` and the TUI only ever issue GET requests.
+- **Read-only by default.** `pods list`, `gpus` and the TUI only ever read: REST GETs plus
+  read-only GraphQL queries (a POST, but a query, never a mutation). The RunPod key is sent
+  only as an `Authorization: Bearer` header — never in a URL, which errors would print.
 - **Mutating commands act, but confirm first.** `create`/`stop`/`terminate`/… print
   what they'll do and prompt `Proceed? [y/N]` at a terminal. `-y`/`--yes` skips the
   prompt. With **no terminal** (cron, pipes) they *refuse* unless `--yes` is given — so

@@ -1,9 +1,13 @@
 //! Shared GPU catalog: one source of truth for the CLI's `--gpu` short-names and the
-//! TUI add-pod picker, so both speak the same list. Prices are **approximate** and
-//! tier-dependent (community vs secure); VRAM is exact. Real price/availability data
-//! can replace the static figures later.
+//! TUI add-pod picker, so both speak the same list. Preset prices are **approximate** and
+//! tier-dependent (community vs secure); VRAM is exact. `arena gpus` prefers RunPod's live
+//! prices ([`rows_from_live`]) and falls back to these presets.
+
+use serde::{Deserialize, Serialize};
 
 use crate::metrics::normalize_gpu_name;
+use crate::provider::runpod::GpuType;
+use crate::table::{self, Align};
 
 /// A known GPU: the provider's type string, a short label, VRAM, and rough RunPod $/hr.
 pub struct Gpu {
@@ -91,9 +95,197 @@ pub fn price_label(api: &str, provider: &str, cloud: Option<&str>) -> Option<Str
     }
 }
 
+/// Where a `gpus` row (or its prices) came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Source {
+    /// RunPod's live GraphQL catalog.
+    Live,
+    /// The local [`PRESETS`] table (no key / not RunPod / live fetch failed).
+    Presets,
+}
+
+/// One row of `arena gpus` — the `--json` schema and what the table renders.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GpuRow {
+    /// The exact provider type string to pass to `--gpu`.
+    pub id: String,
+    pub display_name: String,
+    pub memory_gb: u32,
+    /// $/h per GPU on the community / secure cloud; `None` = not offered / unknown.
+    pub community_price: Option<f64>,
+    pub secure_price: Option<f64>,
+    /// RunPod's 1-GPU stock hint ("Low"/"Medium"/"High"); `None` = unreported.
+    pub stock_status: Option<String>,
+    /// Whether RunPod's create API accepts this id (its OpenAPI enum can lag the catalog).
+    /// `None` = couldn't determine (enum unavailable, or a preset row).
+    pub creatable: Option<bool>,
+    /// Where the row itself came from.
+    pub source: Source,
+    /// Where the prices came from: live rows use RunPod's prices when it sent any, else
+    /// the preset estimate for that GPU; `None` = no price known at all. Kept separate from
+    /// `source` so a script never mistakes a preset estimate for a live quote.
+    pub price_source: Option<Source>,
+}
+
+/// Rows from RunPod's live catalog. Drops RunPod's `unknown`/0-GB placeholders and sorts
+/// by VRAM then name. `creatable` is the create-API enum when it could be fetched; rows
+/// are flagged against it rather than dropped, so `--json` shows the whole catalog and
+/// the table decides what to hide.
+pub fn rows_from_live(types: &[GpuType], creatable: Option<&[String]>) -> Vec<GpuRow> {
+    let mut rows: Vec<GpuRow> = types
+        .iter()
+        .filter(|t| t.id != "unknown" && t.memory_gb > 0)
+        .map(|t| {
+            // Trust RunPod's prices as a pair when it sent any (a None tier then really
+            // means "not offered"); only with no live price at all fall back to presets.
+            let live = t.community_price.is_some() || t.secure_price.is_some();
+            let (community_price, secure_price, price_source) = match find(&t.id) {
+                _ if live => (t.community_price, t.secure_price, Some(Source::Live)),
+                Some(g) => (Some(g.community), Some(g.secure), Some(Source::Presets)),
+                None => (None, None, None),
+            };
+            GpuRow {
+                id: t.id.clone(),
+                display_name: t.display_name.clone(),
+                memory_gb: t.memory_gb,
+                community_price,
+                secure_price,
+                stock_status: t.stock_status.clone(),
+                creatable: creatable.map(|ok| ok.iter().any(|c| c == &t.id)),
+                source: Source::Live,
+                price_source,
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| a.memory_gb.cmp(&b.memory_gb).then_with(|| a.display_name.cmp(&b.display_name)));
+    rows
+}
+
+/// Rows from the local presets, in their preference order.
+pub fn rows_from_presets() -> Vec<GpuRow> {
+    PRESETS
+        .iter()
+        .map(|g| GpuRow {
+            id: g.api.to_string(),
+            display_name: g.label.to_string(),
+            memory_gb: g.vram_gb,
+            community_price: Some(g.community),
+            secure_price: Some(g.secure),
+            stock_status: None,
+            creatable: None,
+            source: Source::Presets,
+            price_source: Some(Source::Presets),
+        })
+        .collect()
+}
+
+/// The `arena gpus` table. A preset (estimated) price is marked `~` so it can't be
+/// mistaken for a live quote; `-` = not offered / unknown.
+pub fn render_gpu_table(rows: &[GpuRow]) -> String {
+    use Align::{Left, Right};
+    let price = |p: Option<f64>, src: Option<Source>| match (p, src) {
+        (Some(v), Some(Source::Presets)) => format!("~${v:.2}"),
+        (Some(v), _) => format!("${v:.2}"),
+        (None, _) => "-".to_string(),
+    };
+    let cells: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| {
+            vec![
+                r.display_name.clone(),
+                format!("{}G", r.memory_gb),
+                price(r.community_price, r.price_source),
+                price(r.secure_price, r.price_source),
+                r.stock_status.clone().unwrap_or_else(|| "-".to_string()),
+                r.id.clone(),
+            ]
+        })
+        .collect();
+    table::render(
+        &["GPU", "VRAM", "$/HR COMM", "$/HR SEC", "STOCK", "API NAME (--gpu)"],
+        &[Left, Right, Right, Right, Left, Left],
+        &cells,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn live(id: &str, name: &str, mem: u32, comm: Option<f64>, sec: Option<f64>, stock: Option<&str>) -> GpuType {
+        GpuType {
+            id: id.into(),
+            display_name: name.into(),
+            memory_gb: mem,
+            community_price: comm,
+            secure_price: sec,
+            stock_status: stock.map(String::from),
+        }
+    }
+
+    #[test]
+    fn live_rows_prefer_live_prices_and_flag_creatable() {
+        let types = vec![
+            live("NVIDIA A40", "A40", 48, None, None, None), // no live price: preset estimate
+            live("NVIDIA RTX A4000", "RTX A4000", 16, Some(0.17), Some(0.25), Some("Low")),
+            live("NVIDIA H100 80GB HBM3", "H100", 80, None, Some(2.69), Some("High")), // secure-only
+            live("NVIDIA Mystery", "Mystery", 12, None, None, None), // unpriced, not a preset
+            live("unknown", "unknown", 0, None, None, None),          // placeholder: dropped
+        ];
+        let ok = vec!["NVIDIA RTX A4000".to_string(), "NVIDIA A40".to_string()];
+        let rows = rows_from_live(&types, Some(&ok));
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["NVIDIA Mystery", "NVIDIA RTX A4000", "NVIDIA A40", "NVIDIA H100 80GB HBM3"]); // by VRAM
+        let a4000 = &rows[1];
+        assert_eq!((a4000.community_price, a4000.secure_price), (Some(0.17), Some(0.25)));
+        assert_eq!((a4000.price_source, a4000.source, a4000.creatable), (Some(Source::Live), Source::Live, Some(true)));
+        assert_eq!(a4000.stock_status.as_deref(), Some("Low"));
+        let a40 = &rows[2];
+        assert_eq!((a40.community_price, a40.secure_price, a40.price_source), (Some(0.39), Some(0.47), Some(Source::Presets)));
+        // A live secure-only GPU is NOT back-filled with the preset community price.
+        let h100 = &rows[3];
+        assert_eq!((h100.community_price, h100.secure_price, h100.creatable), (None, Some(2.69), Some(false)));
+        assert_eq!((rows[0].community_price, rows[0].price_source), (None, None));
+        // Enum unavailable => creatable unknown, not false.
+        assert!(rows_from_live(&types, None).iter().all(|r| r.creatable.is_none()));
+    }
+
+    #[test]
+    fn gpu_rows_json_schema_and_round_trip() {
+        let rows = rows_from_live(&[live("NVIDIA RTX A4000", "RTX A4000", 16, Some(0.17), Some(0.25), Some("Low"))], None);
+        let v = serde_json::to_value(&rows).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!([{
+                "id": "NVIDIA RTX A4000", "display_name": "RTX A4000", "memory_gb": 16,
+                "community_price": 0.17, "secure_price": 0.25, "stock_status": "Low",
+                "creatable": null, "source": "live", "price_source": "live"
+            }])
+        );
+        let back: Vec<GpuRow> = serde_json::from_value(v).unwrap();
+        assert_eq!(back, rows);
+        let presets = rows_from_presets();
+        assert_eq!(presets.len(), PRESETS.len());
+        assert_eq!(serde_json::to_value(&presets[0]).unwrap()["source"], "presets");
+    }
+
+    #[test]
+    fn gpu_table_snapshot() {
+        let types = vec![
+            live("NVIDIA RTX A4000", "RTX A4000", 16, Some(0.17), Some(0.25), Some("Low")),
+            live("NVIDIA A40", "A40", 48, None, None, None),
+            live("NVIDIA H100 80GB HBM3", "H100", 80, None, Some(2.69), Some("High")),
+        ];
+        let out = render_gpu_table(&rows_from_live(&types, None));
+        let want = "\
+GPU        VRAM  $/HR COMM  $/HR SEC  STOCK  API NAME (--gpu)
+RTX A4000   16G      $0.17     $0.25  Low    NVIDIA RTX A4000
+A40         48G     ~$0.39    ~$0.47  -      NVIDIA A40
+H100        80G          -     $2.69  High   NVIDIA H100 80GB HBM3
+";
+        assert_eq!(out, want, "\n--- got ---\n{out}");
+    }
 
     #[test]
     fn resolves_short_names_and_passes_through() {

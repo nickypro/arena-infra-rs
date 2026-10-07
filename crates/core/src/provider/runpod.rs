@@ -1,7 +1,10 @@
-//! RunPod backend, talking to the REST API (https://rest.runpod.io/v1).
+//! RunPod backend, talking to the REST API (https://rest.runpod.io/v1), plus GraphQL for
+//! the few things REST can't do (restart-free rename, GPU catalog/prices, host details).
 //!
 //! Responses are parsed defensively from `serde_json::Value` so a schema tweak on
 //! RunPod's side degrades a field to `None` rather than crashing the tool.
+
+use std::collections::HashMap;
 
 use async_trait::async_trait;
 use reqwest::{Client, RequestBuilder};
@@ -9,9 +12,52 @@ use serde_json::{json, Value};
 
 use super::Provider;
 use crate::error::{Error, Result};
-use crate::pod::{Pod, PodSpec};
+use crate::pod::{Maintenance, Pod, PodSpec};
 
 const BASE: &str = "https://rest.runpod.io/v1";
+
+/// RunPod's GraphQL endpoint. The key goes in the `Authorization: Bearer` header — NEVER
+/// the `?api_key=` query param RunPod also accepts: reqwest's error `Display` includes the
+/// request URL, so with the key in the URL any network error (timeout, DNS, TLS, a bad
+/// JSON body) would print the secret verbatim to the terminal/cron logs.
+const GRAPHQL: &str = "https://api.runpod.io/graphql";
+
+/// Build a GraphQL POST (bearer auth, key never in the URL). Separate from sending so a
+/// test can assert on the built request without a network call.
+fn graphql_request(client: &Client, api_key: &str, body: &Value) -> RequestBuilder {
+    client.post(GRAPHQL).bearer_auth(api_key).json(body)
+}
+
+/// POST one GraphQL request and return the decoded body. Checks only the HTTP status: a
+/// GraphQL error still comes back as HTTP 200, and whether `errors` is fatal depends on
+/// the caller (a mutation must fail on any; a read query can use partial `data`) — see
+/// [`graphql_errors`].
+async fn graphql(client: &Client, api_key: &str, body: &Value, ctx: &str) -> Result<Value> {
+    let resp = graphql_request(client, api_key, body).send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        // An error body may not be JSON (proxy HTML on a 502) — keep the status either way.
+        let v: Value = resp.json().await.unwrap_or(Value::Null);
+        return Err(Error::provider_http(status, &v, ctx));
+    }
+    Ok(resp.json().await?)
+}
+
+/// The GraphQL-level errors in a response, as one message (`None` when there are none —
+/// absent, `null`, or an empty array). Messages are joined; anything unexpected is shown
+/// raw, clipped, so a long error body can't flood the terminal.
+fn graphql_errors(v: &Value) -> Option<String> {
+    let errors = v.get("errors").filter(|e| !e.is_null())?;
+    if errors.as_array().is_some_and(|a| a.is_empty()) {
+        return None;
+    }
+    let msgs: Vec<&str> = errors
+        .as_array()
+        .map(|a| a.iter().filter_map(|e| e.get("message").and_then(Value::as_str)).collect())
+        .unwrap_or_default();
+    let msg = if msgs.is_empty() { errors.to_string() } else { msgs.join("; ") };
+    Some(if msg.chars().count() > 300 { format!("{}…", msg.chars().take(300).collect::<String>()) } else { msg })
+}
 
 pub struct RunpodProvider {
     api_key: String,
@@ -152,6 +198,20 @@ impl Provider for RunpodProvider {
         Ok(arr.iter().map(parse_pod).collect())
     }
 
+    async fn enrich(&self, pods: &mut [Pod]) -> Result<()> {
+        if pods.is_empty() {
+            return Ok(()); // nothing to fill: don't spend an API call
+        }
+        let v = graphql(&self.client, &self.api_key, &json!({ "query": POD_DETAILS_QUERY }), "pod details").await?;
+        // Merge whatever `data` came back even alongside errors (GraphQL partial results),
+        // then still report the errors so `pods list` can warn that details are incomplete.
+        merge_pod_details(pods, &parse_pod_details(&v));
+        match graphql_errors(&v) {
+            Some(e) => Err(Error::provider(format!("pod details: {e}"))),
+            None => Ok(()),
+        }
+    }
+
     async fn create_pod(&self, spec: &PodSpec) -> Result<Pod> {
         let payload = create_payload(spec);
         let resp = self
@@ -214,20 +274,14 @@ impl Provider for RunpodProvider {
         // which wipes the container disk (everything not on a network volume) — i.e. silent
         // data loss. `podEditName` is a pure metadata rename: verified (via `/proc/1` start
         // time before/after) to leave the running container completely untouched.
-        let url = format!("https://api.runpod.io/graphql?api_key={}", self.api_key);
         let body = json!({
             "query": "mutation editPodName($input: PodEditNameInput!) { \
                       podEditName(input: $input) { id name } }",
             "variables": { "input": { "podId": id, "name": new_name } },
         });
-        let resp = self.client.post(&url).json(&body).send().await?;
-        let status = resp.status();
-        let v: Value = resp.json().await?;
-        if !status.is_success() {
-            return Err(Error::provider_http(status, &v, "rename pod"));
-        }
-        // GraphQL returns HTTP 200 even on logical errors — surface them.
-        if let Some(errors) = v.get("errors").filter(|e| !e.as_array().map(|a| a.is_empty()).unwrap_or(false)) {
+        let v = graphql(&self.client, &self.api_key, &body, "rename pod").await?;
+        // GraphQL returns HTTP 200 even on logical errors — a mutation must surface any.
+        if let Some(errors) = graphql_errors(&v) {
             return Err(Error::provider(format!("rename pod (podEditName): {errors}")));
         }
         Ok(())
@@ -332,45 +386,183 @@ fn parse_spec(v: &Value) -> PodSpec {
     }
 }
 
+/// The per-pod details the REST list leaves out (its `machine` object comes back empty).
+/// One query for the whole account — not one per pod — so `pods list` costs exactly one
+/// extra request. Field names validated against the live API (2026-10-07).
+const POD_DETAILS_QUERY: &str = "{ myself { pods { id gpuCount costPerHr \
+     machine { gpuDisplayName maintenanceStart maintenanceEnd maintenanceNote } } } }";
+
+/// What GraphQL `myself.pods` adds for one pod (see [`merge_pod_details`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+struct PodDetail {
+    gpu_type: Option<String>,
+    gpu_count: Option<u32>,
+    cost_per_hr: Option<f64>,
+    maintenance: Option<Maintenance>,
+}
+
+/// A non-empty string from a JSON string or number (`null`/other → `None`).
+fn loose_string(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// A number from a JSON number or numeric string. RunPod doesn't document these GraphQL
+/// scalar types (some APIs send decimals as strings), so accept either rather than lose
+/// a price to a representation change.
+fn loose_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+/// Unix epoch seconds → `YYYY-MM-DDTHH:MM:SSZ` (proleptic Gregorian, UTC). Hand-rolled
+/// (days-from-civil inverse) to avoid a date-time dependency for one conversion.
+fn epoch_to_iso(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3_600, rem % 3_600 / 60, rem % 60)
+}
+
+/// A maintenance timestamp. The live API's type for `maintenanceStart/End` is unknown, so
+/// accept an ISO string as-is, or an epoch number (or numeric string) in seconds or
+/// milliseconds (> 1e11 can only be ms: 1e11 s is the year 5138), normalized to ISO UTC.
+fn loose_time(v: &Value) -> Option<String> {
+    let epoch = match v {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) if !s.trim().is_empty() => match s.trim().parse::<f64>() {
+            Ok(n) => Some(n),
+            Err(_) => return Some(s.trim().to_string()),
+        },
+        _ => None,
+    }?;
+    if !epoch.is_finite() || epoch <= 0.0 {
+        return None; // 0 / negative = "unset" placeholders, not a 1970 window
+    }
+    let secs = if epoch > 1e11 { epoch / 1000.0 } else { epoch };
+    Some(epoch_to_iso(secs as i64))
+}
+
+/// Parse GraphQL `{ data: { myself: { pods: [...] } } }` into id → details. Pure, so it's
+/// tested against a recorded-shape fixture. Entries without an id are skipped; a missing
+/// or `null` `machine` just leaves its fields `None`.
+fn parse_pod_details(v: &Value) -> HashMap<String, PodDetail> {
+    let pods = v.pointer("/data/myself/pods").and_then(Value::as_array).cloned().unwrap_or_default();
+    pods.iter()
+        .filter_map(|p| {
+            let id = p.get("id").and_then(loose_string)?;
+            let machine = |k: &str| p.get("machine").and_then(|m| m.get(k));
+            let maintenance = Maintenance {
+                start: machine("maintenanceStart").and_then(loose_time),
+                end: machine("maintenanceEnd").and_then(loose_time),
+                note: machine("maintenanceNote").and_then(loose_string),
+            };
+            let has_window = maintenance.start.is_some() || maintenance.end.is_some() || maintenance.note.is_some();
+            let detail = PodDetail {
+                gpu_type: machine("gpuDisplayName").and_then(loose_string),
+                gpu_count: p.get("gpuCount").and_then(loose_f64).filter(|n| *n >= 0.0).map(|n| n as u32),
+                cost_per_hr: p.get("costPerHr").and_then(loose_f64).filter(|c| *c >= 0.0),
+                maintenance: has_window.then_some(maintenance),
+            };
+            Some((id, detail))
+        })
+        .collect()
+}
+
+/// Fold GraphQL details into REST-listed pods, matched by id. REST stays authoritative
+/// for what it does return (GPU type, $/h); GraphQL fills the gaps, owns `gpu_count` when
+/// it has one, and is the only source of `maintenance` (set only when a window exists).
+/// Pods GraphQL doesn't mention are untouched.
+fn merge_pod_details(pods: &mut [Pod], details: &HashMap<String, PodDetail>) {
+    for p in pods.iter_mut() {
+        let Some(d) = details.get(&p.id) else { continue };
+        if p.gpu_type.is_none() {
+            p.gpu_type = d.gpu_type.clone();
+        }
+        p.gpu_count = d.gpu_count.or(p.gpu_count);
+        if p.cost_per_hr.is_none() {
+            p.cost_per_hr = d.cost_per_hr;
+        }
+        if d.maintenance.is_some() {
+            p.maintenance = d.maintenance.clone();
+        }
+    }
+}
+
 /// One entry from RunPod's GPU catalog (its GraphQL `gpuTypes`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct GpuType {
     /// The exact name to pass to `--gpu` (e.g. "NVIDIA A100 80GB PCIe").
     pub id: String,
     /// Short display name (e.g. "A100 PCIe").
     pub display_name: String,
     pub memory_gb: u32,
+    /// Live on-demand $/h per GPU on the community / secure cloud. `None` when RunPod
+    /// reports no price (null/0 — that tier doesn't offer the GPU) or the field is absent.
+    pub community_price: Option<f64>,
+    pub secure_price: Option<f64>,
+    /// RunPod's stock indicator for a 1-GPU pod (`lowestPrice.stockStatus`, e.g. "Low",
+    /// "Medium", "High"); `None` when unreported. A hint only — creating is the real test.
+    pub stock_status: Option<String>,
 }
 
-/// Fetch RunPod's full GPU catalog via GraphQL (the REST v1 API has no gpu-types route).
-/// This is the authoritative, live list of `--gpu` names — including ones the local
-/// preset table doesn't alias.
-pub async fn fetch_gpu_types(api_key: &str) -> Result<Vec<GpuType>> {
-    let client = Client::new();
-    let url = format!("https://api.runpod.io/graphql?api_key={api_key}");
-    let q = json!({ "query": "{ gpuTypes { id displayName memoryInGb } }" });
-    let resp = client.post(&url).json(&q).send().await?;
-    let status = resp.status();
-    let v: Value = resp.json().await?;
-    if !status.is_success() {
-        return Err(Error::provider_http(status, &v, "fetch gpu types"));
-    }
-    let arr = v
-        .get("data")
-        .and_then(|d| d.get("gpuTypes"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    Ok(arr
-        .iter()
+/// The catalog with live prices + stock (fields validated against the live API 2026-10-07,
+/// e.g. A4000 → communityPrice 0.17, securePrice 0.25, stockStatus "Low").
+const GPU_TYPES_QUERY: &str = "{ gpuTypes { id displayName memoryInGb securePrice communityPrice \
+     lowestPrice(input: {gpuCount: 1}) { stockStatus } } }";
+/// The plain catalog, kept as a fallback: if RunPod ever rejects the pricing sub-fields,
+/// `arena gpus` still lists live names (prices then come from the local presets).
+const GPU_TYPES_BASIC_QUERY: &str = "{ gpuTypes { id displayName memoryInGb } }";
+
+/// Parse a `gpuTypes` response. Pure, for fixture tests. Entries without an id are
+/// skipped; non-positive prices are `None` (RunPod sends 0/null for an unoffered tier).
+fn parse_gpu_types(v: &Value) -> Vec<GpuType> {
+    let arr = v.pointer("/data/gpuTypes").and_then(Value::as_array).cloned().unwrap_or_default();
+    let price = |x: &Value, k: &str| x.get(k).and_then(loose_f64).filter(|p| *p > 0.0);
+    arr.iter()
         .filter_map(|x| {
             Some(GpuType {
                 id: x.get("id")?.as_str()?.to_string(),
                 display_name: x.get("displayName").and_then(Value::as_str).unwrap_or("").to_string(),
-                memory_gb: x.get("memoryInGb").and_then(Value::as_u64).unwrap_or(0) as u32,
+                memory_gb: x.get("memoryInGb").and_then(loose_f64).map(|n| n.max(0.0) as u32).unwrap_or(0),
+                community_price: price(x, "communityPrice"),
+                secure_price: price(x, "securePrice"),
+                stock_status: x.pointer("/lowestPrice/stockStatus").and_then(loose_string),
             })
         })
-        .collect())
+        .collect()
+}
+
+/// Fetch RunPod's full GPU catalog via GraphQL (the REST v1 API has no gpu-types route).
+/// This is the authoritative, live list of `--gpu` names — including ones the local
+/// preset table doesn't alias — with live community/secure prices and stock status.
+pub async fn fetch_gpu_types(api_key: &str) -> Result<Vec<GpuType>> {
+    let client = Client::new();
+    let v = graphql(&client, api_key, &json!({ "query": GPU_TYPES_QUERY }), "fetch gpu types").await?;
+    let types = parse_gpu_types(&v);
+    // Partial data alongside errors (e.g. one GPU's price failed) is still useful: keep it.
+    let Some(rich_err) = graphql_errors(&v).filter(|_| types.is_empty()) else { return Ok(types) };
+    let v = graphql(&client, api_key, &json!({ "query": GPU_TYPES_BASIC_QUERY }), "fetch gpu types").await?;
+    let types = parse_gpu_types(&v);
+    if types.is_empty() {
+        let err = graphql_errors(&v).unwrap_or(rich_err);
+        return Err(Error::provider(format!("fetch gpu types: {err}")));
+    }
+    Ok(types)
 }
 
 /// Pull the GPU type ids the REST `create` endpoint actually accepts, from its OpenAPI
@@ -521,5 +713,167 @@ mod tests {
         assert_eq!(extract_gpu_enum(&spec), vec!["NVIDIA A40", "NVIDIA GeForce RTX 4090"]);
         // Absent => empty (caller treats empty as "couldn't determine", shows all).
         assert!(extract_gpu_enum(&json!({"paths": {}})).is_empty());
+    }
+
+    /// Regression guard for the key-in-URL leak: every GraphQL call is built here, and the
+    /// key must travel only in the Authorization header (reqwest errors print the URL).
+    #[test]
+    fn graphql_request_keeps_key_out_of_url() {
+        let req = graphql_request(&Client::new(), "rpa_SECRET", &json!({ "query": "{ x }" }))
+            .build()
+            .unwrap();
+        assert_eq!(req.url().as_str(), "https://api.runpod.io/graphql");
+        assert!(!req.url().as_str().contains("SECRET"));
+        assert!(req.url().query().is_none());
+        assert_eq!(req.headers()["authorization"], "Bearer rpa_SECRET");
+        assert_eq!(req.method(), reqwest::Method::POST);
+    }
+
+    #[test]
+    fn graphql_errors_extracts_messages_and_ignores_empty() {
+        assert_eq!(graphql_errors(&json!({ "data": {} })), None);
+        assert_eq!(graphql_errors(&json!({ "errors": null })), None);
+        assert_eq!(graphql_errors(&json!({ "errors": [] })), None);
+        assert_eq!(
+            graphql_errors(&json!({ "errors": [{ "message": "a" }, { "message": "b", "path": ["x"] }] })).as_deref(),
+            Some("a; b")
+        );
+        // Unexpected shape: shown raw rather than swallowed.
+        assert_eq!(graphql_errors(&json!({ "errors": "boom" })).as_deref(), Some("\"boom\""));
+    }
+
+    #[test]
+    fn epoch_to_iso_matches_known_dates() {
+        assert_eq!(epoch_to_iso(0), "1970-01-01T00:00:00Z");
+        assert_eq!(epoch_to_iso(1_760_000_000), "2025-10-09T08:53:20Z");
+        assert_eq!(epoch_to_iso(1_791_936_000), "2026-10-14T00:00:00Z");
+        assert_eq!(epoch_to_iso(951_782_400), "2000-02-29T00:00:00Z"); // leap day
+        assert_eq!(epoch_to_iso(-86_400), "1969-12-31T00:00:00Z");
+    }
+
+    /// Recorded-shape fixture of `{ myself { pods { … machine { … } } } }`. The maintenance
+    /// fields' live types are unknown, so cover ISO strings, epoch s/ms numbers, numeric
+    /// strings, empty strings and null.
+    fn pod_details_fixture() -> Value {
+        json!({ "data": { "myself": { "pods": [
+            { "id": "pa", "gpuCount": 1, "costPerHr": 0.17,
+              "machine": { "gpuDisplayName": "RTX A4000",
+                           "maintenanceStart": "2026-10-09T02:00:00.000Z",
+                           "maintenanceEnd": "2026-10-09T06:00:00.000Z",
+                           "maintenanceNote": "host upgrade" } },
+            { "id": "pb", "gpuCount": 2, "costPerHr": "0.34",
+              "machine": { "gpuDisplayName": "RTX 3090",
+                           "maintenanceStart": 1_791_936_000_000u64,
+                           "maintenanceEnd": 1_791_950_400,
+                           "maintenanceNote": "" } },
+            { "id": "pc", "gpuCount": 1, "costPerHr": 0.2,
+              "machine": { "gpuDisplayName": "RTX A4000",
+                           "maintenanceStart": null, "maintenanceEnd": "", "maintenanceNote": null } },
+            { "id": "pd", "gpuCount": 0, "costPerHr": 0, "machine": null },
+            { "id": "pe", "machine": { "maintenanceStart": "1791936000" } },
+            { "gpuCount": 1, "machine": { "gpuDisplayName": "no id — skipped" } }
+        ] } } })
+    }
+
+    #[test]
+    fn parse_pod_details_fixture() {
+        let d = parse_pod_details(&pod_details_fixture());
+        assert_eq!(d.len(), 5);
+        assert_eq!(
+            d["pa"],
+            PodDetail {
+                gpu_type: Some("RTX A4000".into()),
+                gpu_count: Some(1),
+                cost_per_hr: Some(0.17),
+                maintenance: Some(Maintenance {
+                    start: Some("2026-10-09T02:00:00.000Z".into()),
+                    end: Some("2026-10-09T06:00:00.000Z".into()),
+                    note: Some("host upgrade".into()),
+                }),
+            }
+        );
+        // Epoch ms / s numbers normalize to ISO UTC; an empty note is no note.
+        let pb = d["pb"].maintenance.clone().unwrap();
+        assert_eq!(pb.start.as_deref(), Some("2026-10-14T00:00:00Z"));
+        assert_eq!(pb.end.as_deref(), Some("2026-10-14T04:00:00Z"));
+        assert_eq!(pb.note, None);
+        assert_eq!(d["pb"].cost_per_hr, Some(0.34)); // numeric string accepted
+        // All-empty/null window => no maintenance at all (not an empty struct).
+        assert_eq!(d["pc"].maintenance, None);
+        // null machine => machine fields None, top-level ones still read.
+        assert_eq!(d["pd"].gpu_type, None);
+        assert_eq!(d["pd"].gpu_count, Some(0));
+        assert_eq!(d["pe"].maintenance.as_ref().unwrap().start.as_deref(), Some("2026-10-14T00:00:00Z"));
+        // Anything unexpected degrades to empty, never panics.
+        assert!(parse_pod_details(&json!({ "errors": [{ "message": "x" }] })).is_empty());
+        assert!(parse_pod_details(&json!({ "data": { "myself": null } })).is_empty());
+    }
+
+    #[test]
+    fn merge_pod_details_fills_gaps_without_clobbering_rest() {
+        let details = parse_pod_details(&pod_details_fixture());
+        let mut pods = vec![
+            // REST list shape: no machine info at all.
+            Pod { id: "pa".into(), provider: "runpod".into(), ..Default::default() },
+            // REST already had type + price: kept; GraphQL count wins.
+            Pod {
+                id: "pb".into(),
+                gpu_type: Some("NVIDIA GeForce RTX 3090".into()),
+                gpu_count: Some(1),
+                cost_per_hr: Some(0.30),
+                ..Default::default()
+            },
+            // No window reported: an existing value is not wiped.
+            Pod {
+                id: "pc".into(),
+                maintenance: Some(Maintenance { note: Some("keep".into()), ..Default::default() }),
+                ..Default::default()
+            },
+            // Unknown to GraphQL: untouched.
+            Pod { id: "zz".into(), ..Default::default() },
+        ];
+        merge_pod_details(&mut pods, &details);
+        assert_eq!(pods[0].gpu_type.as_deref(), Some("RTX A4000"));
+        assert_eq!(pods[0].gpu_count, Some(1));
+        assert_eq!(pods[0].cost_per_hr, Some(0.17));
+        assert_eq!(pods[0].maintenance.as_ref().unwrap().note.as_deref(), Some("host upgrade"));
+        assert_eq!(pods[1].gpu_type.as_deref(), Some("NVIDIA GeForce RTX 3090"));
+        assert_eq!(pods[1].gpu_count, Some(2));
+        assert_eq!(pods[1].cost_per_hr, Some(0.30));
+        assert_eq!(pods[2].maintenance.as_ref().unwrap().note.as_deref(), Some("keep"));
+        assert_eq!(pods[3], Pod { id: "zz".into(), ..Default::default() });
+    }
+
+    /// Recorded-shape fixture of the `gpuTypes` query with prices + stock.
+    #[test]
+    fn parse_gpu_types_fixture() {
+        let v = json!({ "data": { "gpuTypes": [
+            { "id": "NVIDIA RTX A4000", "displayName": "RTX A4000", "memoryInGb": 16,
+              "securePrice": 0.25, "communityPrice": 0.17, "lowestPrice": { "stockStatus": "Low" } },
+            { "id": "NVIDIA H100 80GB HBM3", "displayName": "H100 SXM", "memoryInGb": 80,
+              "securePrice": 2.69, "communityPrice": 0, "lowestPrice": { "stockStatus": null } },
+            { "id": "NVIDIA L4", "displayName": "L4", "memoryInGb": 24,
+              "securePrice": null, "communityPrice": null, "lowestPrice": null },
+            { "id": "unknown", "displayName": "unknown", "memoryInGb": 0 },
+            { "displayName": "no id — skipped" }
+        ] } });
+        let t = parse_gpu_types(&v);
+        assert_eq!(t.len(), 4);
+        assert_eq!(
+            t[0],
+            GpuType {
+                id: "NVIDIA RTX A4000".into(),
+                display_name: "RTX A4000".into(),
+                memory_gb: 16,
+                community_price: Some(0.17),
+                secure_price: Some(0.25),
+                stock_status: Some("Low".into()),
+            }
+        );
+        // communityPrice 0 = not offered on community => None, not "$0.00".
+        assert_eq!((t[1].community_price, t[1].secure_price, t[1].stock_status.clone()), (None, Some(2.69), None));
+        // Basic-query shape (no price fields at all) parses with prices None.
+        assert_eq!((t[2].community_price, t[2].secure_price, t[2].stock_status.clone()), (None, None, None));
+        assert_eq!(t[3].id, "unknown"); // filtering placeholders is the caller's policy
     }
 }

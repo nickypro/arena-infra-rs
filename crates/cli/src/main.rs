@@ -88,8 +88,14 @@ enum Cmd {
     /// the provisioning API. Needs OPENROUTER_PROVISIONING_KEY in config.
     #[command(subcommand, infer_subcommands = true)]
     Keys(KeysCmd),
-    /// List the known GPU types (names to pass to `--gpu`, with VRAM + rough $/hr).
-    Gpus,
+    /// List the known GPU types (names to pass to `--gpu`, with VRAM, $/hr and stock —
+    /// live from RunPod where available, else the local presets).
+    Gpus {
+        /// Emit JSON instead of a table (for scripting). Includes every live catalog entry,
+        /// with `creatable` flagging the ones the create API rejects (the table hides them).
+        #[arg(long)]
+        json: bool,
+    },
     /// Print the participant-facing `~/.ssh/config` for the fleet (read-only). Direct
     /// pod endpoints by default, or stable proxy ports with --proxy.
     SshConfig {
@@ -340,14 +346,16 @@ enum MigrateCmd {
 enum PodCmd {
     /// List current pods (read-only).
     List {
-        /// Emit JSON instead of a table (for scripting).
+        /// Emit JSON instead of a table (for scripting): the pods, including gpu_count,
+        /// cost_per_hr and the host maintenance window where the provider reports them.
         #[arg(long)]
         json: bool,
         /// Force the GPU-via-SSH probe (default for `--json`, which skips it otherwise).
         #[arg(long)]
         probe: bool,
-        /// Skip the GPU-via-SSH probe (faster; GPU shows "-"). The table view probes
-        /// by default since the provider list API omits GPU type.
+        /// Skip the GPU-via-SSH probe (faster; GPU shows only what the provider reports,
+        /// else "-"). The table view probes by default: `nvidia-smi` on the machine is the
+        /// ground truth, and some listings omit the GPU.
         #[arg(long)]
         no_probe: bool,
     },
@@ -1135,7 +1143,7 @@ async fn main() -> Result<()> {
     // `config check` must work even when a provider key is missing (that's what it's
     // for), so build the provider lazily — only for commands that actually talk to one.
     let provider = match cli.cmd {
-        Cmd::Config(_) | Cmd::Cron(_) | Cmd::Tui | Cmd::Gpus => None,
+        Cmd::Config(_) | Cmd::Cron(_) | Cmd::Tui | Cmd::Gpus { .. } => None,
         // Fleet-wide: every command spans all configured providers (create still targets
         // --provider). One configured backend behaves like that single provider.
         _ => Some(arena_core::provider::build_fleet(&cli.provider, &cfg, true)?),
@@ -1152,56 +1160,33 @@ async fn main() -> Result<()> {
             handle_ssh_config(provider.unwrap().as_ref(), &cfg, proxy, out.as_deref()).await
         }
         Cmd::Keys(k) => handle_keys(k, provider.unwrap().as_ref(), &cfg, cli.yes).await,
-        Cmd::Gpus => handle_gpus(&cfg, &cli.provider).await,
+        Cmd::Gpus { json } => handle_gpus(&cfg, &cli.provider, json).await,
     }
 }
 
 /// `arena gpus`: list the GPU types you can pass to `--gpu`. Fetches RunPod's **full,
-/// live** catalog (via GraphQL) when on RunPod with a key; otherwise falls back to the
-/// local curated presets. Prices come from the local presets where known.
-async fn handle_gpus(cfg: &Config, provider_name: &str) -> Result<()> {
+/// live** catalog (via GraphQL) with live community/secure prices + stock when on RunPod
+/// with a key; otherwise falls back to the local curated presets. `--json` emits the same
+/// rows machine-readably (`arena_core::gpu::GpuRow`). Diagnostics go to stderr so the JSON
+/// on stdout stays parseable.
+async fn handle_gpus(cfg: &Config, provider_name: &str, json: bool) -> Result<()> {
     use arena_core::gpu;
 
-    let price = |api: &str| {
-        gpu::find(api).map(|g| format!("${:.2}/${:.2}", g.community, g.secure)).unwrap_or_else(|| "—".into())
-    };
-
+    // (rows, whether the create-API enum was available to flag `creatable`)
+    let mut live: Option<(Vec<gpu::GpuRow>, bool)> = None;
     if provider_name == "runpod" {
         if let Some(key) = cfg.get("RUNPOD_API_KEY").filter(|s| !s.is_empty()) {
             match arena_core::provider::runpod::fetch_gpu_types(key).await {
-                Ok(mut types) if !types.is_empty() => {
-                    // Drop RunPod's "unknown" placeholder.
-                    types.retain(|t| t.id != "unknown" && t.memory_gb > 0);
+                Ok(types) if !types.is_empty() => {
                     // RunPod's create-validation enum can be NARROWER than the gpuTypes
-                    // catalog — listing a GPU that `--gpu` then gets a 400 for. Intersect
-                    // with the creatable enum so we only advertise types that actually work.
-                    // If the enum can't be fetched, fall back to showing all (with no claim).
-                    let creatable = arena_core::provider::runpod::fetch_creatable_gpu_ids(key).await.ok().filter(|v| !v.is_empty());
-                    let hidden = match &creatable {
-                        Some(ok) => {
-                            let before = types.len();
-                            types.retain(|t| ok.contains(&t.id));
-                            before - types.len()
-                        }
-                        None => 0,
-                    };
-                    types.sort_by(|a, b| a.memory_gb.cmp(&b.memory_gb).then(a.display_name.cmp(&b.display_name)));
-                    println!("{:<16} {:>5}  {:>14}   {}", "GPU", "VRAM", "$/hr comm/sec", "API name (pass to --gpu)");
-                    for t in &types {
-                        println!("{:<16} {:>4}G  {:>14}   {}", t.display_name, t.memory_gb, price(&t.id), t.id);
-                    }
-                    println!(
-                        "\n{} GPU types {}. Pass the API name (or a short alias like \
-                         A4000 / 3090) to --gpu. Prices are rough preset rates where known.",
-                        types.len(),
-                        if creatable.is_some() { "(live from RunPod, creatable via the create API)" } else { "(live from RunPod)" }
-                    );
-                    if hidden > 0 {
-                        println!(
-                            "({hidden} more in RunPod's catalog are hidden — listed but rejected by the create API, so --gpu can't use them.)"
-                        );
-                    }
-                    return Ok(());
+                    // catalog — listing a GPU that `--gpu` then gets a 400 for. Flag rows
+                    // against it (the table hides rejected ones). If the enum can't be
+                    // fetched, `creatable` stays unknown and everything is shown.
+                    let creatable = arena_core::provider::runpod::fetch_creatable_gpu_ids(key)
+                        .await
+                        .ok()
+                        .filter(|v| !v.is_empty());
+                    live = Some((gpu::rows_from_live(&types, creatable.as_deref()), creatable.is_some()));
                 }
                 Ok(_) => {}
                 Err(e) => eprintln!("(couldn't fetch the live GPU list: {e} — showing local presets)\n"),
@@ -1209,18 +1194,39 @@ async fn handle_gpus(cfg: &Config, provider_name: &str) -> Result<()> {
         }
     }
 
-    // Fallback: the curated presets (no network / non-RunPod).
-    println!("{:<14} {:>5}  {:>9}  {:>8}   {}", "GPU", "VRAM", "$/hr comm", "$/hr sec", "RunPod API name (--gpu)");
-    for g in gpu::PRESETS {
-        println!(
-            "{:<14} {:>4}G  {:>9}  {:>8}   {}",
-            g.label, g.vram_gb, format!("${:.2}", g.community), format!("${:.2}", g.secure), g.api,
-        );
+    if json {
+        let rows = live.map(|(rows, _)| rows).unwrap_or_else(gpu::rows_from_presets);
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
     }
-    println!(
-        "\n(local presets — run with --provider runpod + a key for the full live list.)\n\
-         Pass the API name, label, or alias (e.g. `A4000`, `3090`, \"A100 SXM\") to --gpu."
-    );
+
+    match live {
+        Some((rows, creatable_known)) => {
+            let (shown, hidden): (Vec<_>, Vec<_>) = rows.into_iter().partition(|r| r.creatable != Some(false));
+            print!("{}", gpu::render_gpu_table(&shown));
+            println!(
+                "\n{} GPU types {}. Pass the API name (or a short alias like \
+                 A4000 / 3090) to --gpu. Prices are RunPod's live $/hr per GPU (~ = preset \
+                 estimate, - = not offered); STOCK is RunPod's 1-GPU stock hint.",
+                shown.len(),
+                if creatable_known { "(live from RunPod, creatable via the create API)" } else { "(live from RunPod)" }
+            );
+            if !hidden.is_empty() {
+                println!(
+                    "({} more in RunPod's catalog are hidden — listed but rejected by the create API, so --gpu can't use them; see --json.)",
+                    hidden.len()
+                );
+            }
+        }
+        None => {
+            // Fallback: the curated presets (no network / non-RunPod).
+            print!("{}", gpu::render_gpu_table(&gpu::rows_from_presets()));
+            println!(
+                "\n(local presets, ~ = rough estimate — run with --provider runpod + a key for the full live list.)\n\
+                 Pass the API name, label, or alias (e.g. `A4000`, `3090`, \"A100 SXM\") to --gpu."
+            );
+        }
+    }
     Ok(())
 }
 
@@ -2485,6 +2491,25 @@ fn emit_proxy_plan(pods: &[arena_core::Pod], cfg: &Config, out: Option<&std::pat
     Ok(())
 }
 
+/// How long `pods list` waits for the best-effort pod details before rendering without them.
+const ENRICH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// `pods list`'s best-effort [`Provider::enrich`]: never fatal and never hangs the listing
+/// (the HTTP client has no timeout of its own). Returns the one warning line to print when
+/// details are incomplete; the pods keep whatever was filled before the failure.
+async fn enrich_best_effort(
+    provider: &dyn Provider,
+    pods: &mut [arena_core::Pod],
+    limit: std::time::Duration,
+) -> Option<String> {
+    let what = "warning: pod details incomplete (GPU/$/h/maintenance)";
+    match tokio::time::timeout(limit, provider.enrich(pods)).await {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => Some(format!("{what}: {e}")),
+        Err(_) => Some(format!("{what}: timed out after {limit:?}")),
+    }
+}
+
 async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bool) -> Result<()> {
     match cmd {
         PodCmd::List { json, probe, no_probe } => {
@@ -2492,12 +2517,19 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             // e.g. hetzner CPU pods show up alongside the GPU fleet. Grouped by provider.
             let mut pods = provider.list_pods().await?;
             pods.sort_by(|a, b| a.provider.cmp(&b.provider).then(a.name.cmp(&b.name)));
-            // Probe GPU by default for the human table (the list API omits GPU type);
-            // JSON stays fast/scriptable unless asked. `--no-probe` always wins.
+            // Best-effort details the list API omits (RunPod: GPU, $/h, host maintenance
+            // window) — one extra read-only query. Never fatal: on failure or a hang the
+            // list still renders, just with fewer columns filled, after one warning line.
+            if let Some(warning) = enrich_best_effort(provider, &mut pods, ENRICH_TIMEOUT).await {
+                eprintln!("{warning}");
+            }
+            // Probe GPU by default for the human table; JSON stays fast/scriptable unless
+            // asked. `--no-probe` always wins.
             let probe = !no_probe && (probe || !json);
             if probe {
-                // The list API omits GPU type; fill it from nvidia-smi over SSH
-                // (same source as the TUI), concurrently across the fleet.
+                // nvidia-smi over SSH (same source as the TUI), concurrently across the
+                // fleet. When a pod answers, what the machine itself sees overrides the
+                // provider-reported GPU (type and count).
                 use arena_core::metrics::{self, ProbeOpts};
                 use arena_core::ssh::SshTarget;
                 let mut set = tokio::task::JoinSet::new();
@@ -2512,13 +2544,14 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                 while let Some(joined) = set.join_next().await {
                     if let Ok((name, m)) = joined {
                         if let Some(g) = m.gpu_summary() {
-                            gpus.insert(name, g);
+                            gpus.insert(name, (g, m.gpus.len() as u32));
                         }
                     }
                 }
                 for p in &mut pods {
-                    if let Some(g) = gpus.get(&p.name) {
+                    if let Some((g, n)) = gpus.get(&p.name) {
                         p.gpu_type = Some(g.clone());
+                        p.gpu_count = Some(*n);
                     }
                 }
             }
@@ -2530,22 +2563,10 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                 println!("(no pods)");
                 return Ok(());
             }
-            println!(
-                "{:<22} {:<8} {:<14} {:<10} {:<16} {:<16} {}",
-                "NAME", "PROVIDER", "ID", "STATUS", "GPU", "IP", "PORT"
-            );
-            for p in &pods {
-                println!(
-                    "{:<22} {:<8} {:<14} {:<10} {:<16} {:<16} {}",
-                    p.name,
-                    p.provider,
-                    p.id,
-                    arena_core::status::short_status(&p.status),
-                    p.gpu_type.as_deref().unwrap_or("-"),
-                    p.ssh_ip.as_deref().unwrap_or("-"),
-                    p.ssh_port.map(|x| x.to_string()).unwrap_or_else(|| "-".into()),
-                );
-            }
+            // Columns + footer come from arena_core::fleet so the TUI/snapshot reuse them.
+            use arena_core::fleet;
+            print!("{}", fleet::render_pods_table(&pods));
+            println!("{}", fleet::fleet_footer(&fleet::fleet_cost(&pods)));
         }
 
         PodCmd::Create { names, count, add, gpu, gpus, cloud, disk, volume, image, bootstrap, dry_run, keep_trying, retry_mins, retry_secs } => {
@@ -5579,9 +5600,106 @@ mod selection_tests {
     }
 }
 
+/// `pods list` enrichment must degrade, not fail: a provider error or a hang yields one
+/// warning and the pods (as listed) still render.
+#[cfg(test)]
+mod list_tests {
+    use super::enrich_best_effort;
+    use arena_core::{Error, Pod, PodSpec, Provider, Result};
+    use async_trait::async_trait;
+    use std::time::Duration;
+
+    enum Mode {
+        Fill,
+        Fail,
+        Hang,
+    }
+
+    struct EnrichFake(Mode);
+
+    #[async_trait]
+    impl Provider for EnrichFake {
+        fn name(&self) -> &'static str {
+            "runpod"
+        }
+        fn describe(&self, _spec: &PodSpec) -> String {
+            String::new()
+        }
+        async fn list_pods(&self) -> Result<Vec<Pod>> {
+            Ok(Vec::new())
+        }
+        async fn create_pod(&self, _spec: &PodSpec) -> Result<Pod> {
+            unimplemented!("not exercised")
+        }
+        async fn stop_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn restart_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn terminate_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn enrich(&self, pods: &mut [Pod]) -> Result<()> {
+            match self.0 {
+                Mode::Fill => {
+                    pods.iter_mut().for_each(|p| p.cost_per_hr = Some(0.17));
+                    Ok(())
+                }
+                Mode::Fail => Err(Error::provider("pod details HTTP 429 Too Many Requests")),
+                Mode::Hang => {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    fn pods() -> Vec<Pod> {
+        vec![Pod { id: "a".into(), name: "devtest-apple".into(), provider: "runpod".into(), ..Default::default() }]
+    }
+
+    #[tokio::test]
+    async fn success_fills_and_stays_quiet() {
+        let mut p = pods();
+        assert_eq!(enrich_best_effort(&EnrichFake(Mode::Fill), &mut p, Duration::from_secs(5)).await, None);
+        assert_eq!(p[0].cost_per_hr, Some(0.17));
+    }
+
+    #[tokio::test]
+    async fn failure_is_one_warning_and_pods_survive() {
+        let mut p = pods();
+        let w = enrich_best_effort(&EnrichFake(Mode::Fail), &mut p, Duration::from_secs(5)).await.unwrap();
+        assert!(w.starts_with("warning: pod details incomplete") && w.contains("429"), "{w}");
+        assert!(!w.contains('\n'), "one line: {w}");
+        assert_eq!(p, pods()); // listing untouched, still renders
+    }
+
+    #[tokio::test]
+    async fn hang_times_out_instead_of_blocking_the_list() {
+        let mut p = pods();
+        let w = enrich_best_effort(&EnrichFake(Mode::Hang), &mut p, Duration::from_millis(50)).await.unwrap();
+        assert!(w.contains("timed out after 50ms"), "{w}");
+        assert_eq!(p, pods());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{strip_arena_block, with_arena_block, CRON_BEGIN, CRON_END};
+
+    /// `--json` on `gpus` and `pods list` is a scripting contract — pin the flag parsing
+    /// (and let clap validate the whole command tree while we're at it).
+    #[test]
+    fn gpus_and_pods_list_take_json() {
+        use super::{Cli, Cmd, PodCmd};
+        use clap::{CommandFactory, Parser};
+        Cli::command().debug_assert();
+        let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap().cmd;
+        assert!(matches!(parse(&["arena", "gpus", "--json"]), Cmd::Gpus { json: true }));
+        assert!(matches!(parse(&["arena", "gpus"]), Cmd::Gpus { json: false }));
+        assert!(matches!(parse(&["arena", "pods", "list", "--json"]), Cmd::Pods(PodCmd::List { json: true, .. })));
+    }
 
     #[test]
     fn provisioning_steps_branch_by_provider() {
