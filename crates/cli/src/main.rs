@@ -15,6 +15,7 @@ use clap::{Parser, Subcommand};
 
 use arena_core::provider::Provider;
 use arena_core::remote::{describe_error, Remote, PROBE_TIMEOUT};
+use arena_core::selector::{Naming, SelectArgs, Selector};
 use arena_core::ssh::SshTarget;
 use arena_core::{Config, PodSpec};
 
@@ -137,17 +138,101 @@ enum Cmd {
     },
 }
 
+// ---- Target selection (PLAN 1.C) --------------------------------------------------------
+//
+// Every fleet command picks its pods with the same syntax, parsed and resolved by
+// `arena_core::selector`: names (`apple`, `arena8-apple`, `@james-gpu`), provider ids,
+// ranges `apple..mayor`, `all`/`--all`, filtered by `--exclude`, `--gpus N`, `--on
+// <provider>`. Typos fail loudly. The flags live in one struct (`SelectOpts`); the targets
+// themselves are positional (`Select`) except where a command's positionals are already
+// taken — `run`'s command, `cp`'s file/dest, `pull`'s label — which take `-t/--target`
+// (`SelectByFlag`). Plain `//` comments here: a doc comment on a flattened struct can leak
+// into the subcommand's help text. Each command flattens its selection as its *last* field:
+// the "Target selection" help heading carries over to every arg declared after it.
+
+#[derive(clap::Args, Debug, Clone, Default)]
+#[command(next_help_heading = "Target selection")]
+struct SelectOpts {
+    /// Every pod (narrow it with --exclude / --gpus / --on).
+    #[arg(long)]
+    all: bool,
+    /// Leave these pods out: same syntax as the targets, ranges too (repeatable, or
+    /// comma-separated). A name that matches no pod is an error, not a no-op.
+    #[arg(long, value_name = "TARGET")]
+    exclude: Vec<String>,
+    /// Only pods with exactly N GPUs (the provider's count; a pod whose count is unknown
+    /// never matches).
+    #[arg(long, value_name = "N")]
+    gpus: Option<u32>,
+    /// Only pods on this provider: runpod, vast or hetzner. (Not `--provider`, which picks
+    /// where `create`/`up` make pods.)
+    #[arg(long, value_name = "PROVIDER")]
+    on: Option<String>,
+    /// The old spelling of the targets, still accepted. With --all it keeps its old meaning
+    /// "of all pods, only these" (`stop --all --include apple` = `stop apple`).
+    #[arg(long, hide = true, value_name = "TARGET")]
+    include: Vec<String>,
+}
+
+impl SelectOpts {
+    /// The core selection for `targets` (positional or `-t`) plus these flags. The hidden
+    /// `--include` joins the targets — and keeps its legacy narrowing of `--all`, so
+    /// existing scripts do exactly what they did (any other targets + `--all` is refused).
+    fn args(&self, targets: &[String]) -> SelectArgs {
+        let legacy_narrowing = self.all && targets.is_empty() && !self.include.is_empty();
+        SelectArgs {
+            targets: targets.iter().chain(&self.include).cloned().collect(),
+            all: self.all && !legacy_narrowing,
+            exclude: self.exclude.clone(),
+            gpus: self.gpus,
+            on: self.on.clone(),
+        }
+    }
+}
+
+#[derive(clap::Args, Debug, Clone, Default)]
+#[command(next_help_heading = "Target selection")]
+struct Select {
+    /// Pods: names (`apple`, `arena8-apple`, `@james-gpu`), provider ids, ranges
+    /// `apple..mayor` (inclusive, MACHINE_NAME_LIST order) or `all`.
+    #[arg(value_name = "TARGET")]
+    targets: Vec<String>,
+    #[command(flatten)]
+    opts: SelectOpts,
+}
+
+impl Select {
+    fn args(&self) -> SelectArgs {
+        self.opts.args(&self.targets)
+    }
+}
+
+#[derive(clap::Args, Debug, Clone, Default)]
+#[command(next_help_heading = "Target selection")]
+struct SelectByFlag {
+    /// Only these pods (repeatable, or comma-separated): names (`apple`, `arena8-apple`,
+    /// `@james-gpu`), provider ids, ranges `apple..mayor` (inclusive, MACHINE_NAME_LIST
+    /// order) or `all`. Default: every pod.
+    #[arg(long = "target", short = 't', value_name = "TARGET")]
+    targets: Vec<String>,
+    #[command(flatten)]
+    opts: SelectOpts,
+}
+
+impl SelectByFlag {
+    fn args(&self) -> SelectArgs {
+        self.opts.args(&self.targets)
+    }
+}
+
 #[derive(Subcommand)]
 enum KeysCmd {
     /// Generate an OpenRouter runtime key per machine (named `<prefix>-<machine>`), each
     /// with a USD credit cap, and save to `keys/openrouter_api_keys.csv`. Skips machines
     /// that already have a key (use `rotate`). `--copy` also distributes them to the pods.
+    /// Targets are pods or MACHINE_NAME_LIST names (a key can be minted before its pod
+    /// exists); `--all` = every current pod.
     Gen {
-        /// Machine names to generate for (bare names get the prefix). Omit + use --all.
-        machines: Vec<String>,
-        /// Generate for every current pod.
-        #[arg(long)]
-        all: bool,
         /// USD credit cap per key (default: config OPENROUTER_KEY_LIMIT, else 5).
         #[arg(long)]
         limit: Option<f64>,
@@ -157,6 +242,8 @@ enum KeysCmd {
         /// Preview only: show what would be created, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
+        #[command(flatten)]
+        sel: Select,
     },
     /// List the provisioned OpenRouter keys (name, USD limit, usage). By default shows
     /// only this iteration's keys (named `<MACHINE_NAME_PREFIX>-*`) and notes how many
@@ -169,14 +256,9 @@ enum KeysCmd {
     /// Show the local OpenRouter keys file (path, whether it exists, and which pods have
     /// a key) — never prints the secret values.
     Which,
-    /// Rotate a machine's key — delete it and generate a fresh one (e.g. after a leak).
-    /// Updates the CSV; `--copy` re-pushes to the pod(s). One machine or --all.
+    /// Rotate machines' keys — delete each and generate a fresh one (e.g. after a leak).
+    /// Updates the CSV; `--copy` re-pushes to the pod(s). Targets as for `gen`, or --all.
     Rotate {
-        /// Machine name (bare ok). Omit with --all.
-        machine: Option<String>,
-        /// Rotate every current pod's key.
-        #[arg(long)]
-        all: bool,
         /// USD credit cap for the new key (default: config OPENROUTER_KEY_LIMIT, else 5).
         #[arg(long)]
         limit: Option<f64>,
@@ -186,17 +268,16 @@ enum KeysCmd {
         /// Preview only: change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
+        #[command(flatten)]
+        sel: Select,
     },
-    /// Revoke (delete) a machine's key without regenerating. One machine or --all.
+    /// Revoke (delete) machines' keys without regenerating. Targets as for `gen`, or --all.
     Revoke {
-        /// Machine name (bare ok). Omit with --all.
-        machine: Option<String>,
-        /// Revoke every current pod's key.
-        #[arg(long)]
-        all: bool,
         /// Preview only: change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
+        #[command(flatten)]
+        sel: Select,
     },
 }
 
@@ -561,11 +642,10 @@ enum PodCmd {
     ///
     /// It does NOT distribute per-host API keys (use `pods copy-keys`) or back anything
     /// up (use `pods backup` / `pods pull`).
+    ///
+    /// Targets: names / ids / ranges / `all` (see "Target selection"); none = the whole fleet.
     #[command(verbatim_doc_comment)]
     Setup {
-        /// Pods to provision (machine names, e.g. `bulk` / `bulk apple` / `arena8-bulk`).
-        /// Omit to provision the whole fleet.
-        names: Vec<String>,
         /// Preview only: print what would happen, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
@@ -589,23 +669,17 @@ enum PodCmd {
         /// <step>`; the others carry on.
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..=arena_core::setup::MAX_STEP_TIMEOUT_SECS))]
         timeout: Option<u64>,
+        #[command(flatten)]
+        sel: Select,
     },
-    /// Stop a pod, or many with --all (+ --include/--exclude).
+    /// Stop the selected running pods: names / ids / ranges, or --all (narrowed by
+    /// --exclude / --gpus / --on). Needs targets or --all.
     Stop {
-        /// Machine name (e.g. arena8-apple) or raw provider id. Omit with --all.
-        target: Option<String>,
-        /// Stop every running pod (subject to --include/--exclude).
-        #[arg(long)]
-        all: bool,
-        /// With --all: only stop these names/ids (repeatable).
-        #[arg(long)]
-        include: Vec<String>,
-        /// With --all: never stop these names/ids (repeatable).
-        #[arg(long)]
-        exclude: Vec<String>,
         /// Preview only: print what would happen, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
+        #[command(flatten)]
+        sel: Select,
     },
     /// Restart a pod in place.
     Restart {
@@ -644,15 +718,9 @@ enum PodCmd {
     /// PUBLIC_KEY is re-seeded from the current config keys and MACHINE_NAME set to the
     /// pod's name; other env is kept. Nothing is copied over — use `replace` to keep files.
     /// Afterwards waits for SSH endpoints and redeploys the proxy (ports can change).
+    ///
+    /// Targets: names / ids / ranges, or --all (narrowed by --exclude / --gpus / --on).
     Reimage {
-        /// Machine names (bare `apple` or full `arena9-apple`) or ids. Or use --all.
-        targets: Vec<String>,
-        /// Reimage every pod (subject to --exclude).
-        #[arg(long, conflicts_with = "targets")]
-        all: bool,
-        /// With --all: never reimage these names/ids (repeatable).
-        #[arg(long)]
-        exclude: Vec<String>,
         /// Image to use (default: RUNPOD_DOCKER_IMAGE from config).
         #[arg(long)]
         image: Option<String>,
@@ -662,6 +730,8 @@ enum PodCmd {
         /// Preview only: print what would happen, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
+        #[command(flatten)]
+        sel: Select,
     },
     /// Replace a pod with a fresh one on a new host, keeping its name + files (blue-green).
     ///
@@ -718,11 +788,15 @@ enum PodCmd {
         cmd: MigrateCmd,
     },
     /// Terminate (delete) a pod, or the whole fleet with --all.
+    ///
+    /// Deliberately one pod at a time (no ranges or lists — irreversible): the target is
+    /// matched like every other command's (name, bare name, `@name` or id), and a name two
+    /// pods share is refused (pass the id).
     Terminate {
         /// Machine name (e.g. arena8-apple) or raw provider id. Omit with --all.
         target: Option<String>,
         /// Terminate every pod the provider reports (the whole fleet).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "target")]
         all: bool,
         /// Don't sync the proxy afterwards (the forward stays until the next
         /// `arena proxy apply`).
@@ -733,10 +807,9 @@ enum PodCmd {
         dry_run: bool,
     },
     /// Full backup: git-push each pod's current branch (skips main/master) AND rsync its
-    /// home to the local backups folder (`pull`). One pod or all. --no-pull = git only.
+    /// home to the local backups folder (`pull`). Targets: names / ids / ranges (none = every
+    /// reachable pod). --no-pull = git only.
     Backup {
-        /// Machine name or id to back up. Omit to back up every reachable pod.
-        target: Option<String>,
         /// Only do the git push; skip the rsync file backup.
         #[arg(long)]
         no_pull: bool,
@@ -746,6 +819,8 @@ enum PodCmd {
         /// Commit message (default: "arena backup <machine>").
         #[arg(long)]
         message: Option<String>,
+        #[command(flatten)]
+        sel: Select,
     },
     /// Rsync each pod's home to a local backup folder (the file backup).
     Pull {
@@ -773,8 +848,11 @@ enum PodCmd {
         /// Preview only: print the rsync commands, copy nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
+        #[command(flatten)]
+        sel: SelectByFlag,
     },
-    /// Create + push each pod's wNdM autocommit branch (no commit).
+    /// Create + push each pod's wNdM autocommit branch (no commit). Targets: names / ids /
+    /// ranges (none = every reachable pod).
     InitBranches {
         /// Override the iteration week (default: computed from ARENA_START_DATE).
         #[arg(long)]
@@ -785,16 +863,14 @@ enum PodCmd {
         /// Preview only: print the per-pod commands, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
+        #[command(flatten)]
+        sel: Select,
     },
-    /// Switch a pod's branch (gentle ff-only; --hard force-resets to origin).
+    /// Switch pods' branch (gentle ff-only; --hard force-resets to origin). Targets after
+    /// the branch: names / ids / ranges, or --all (every pod with an SSH endpoint).
     SetBranch {
         /// Branch to check out (e.g. main, or a feature branch).
         branch: String,
-        /// Machine name or id. Omit with --all.
-        target: Option<String>,
-        /// Apply to every pod with an SSH endpoint.
-        #[arg(long)]
-        all: bool,
         /// DESTRUCTIVE: hard-reset the branch to `origin/<branch>`, discarding local
         /// commits/changes (untracked files are left alone).
         #[arg(long)]
@@ -802,13 +878,16 @@ enum PodCmd {
         /// Preview only: print what would happen, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
+        #[command(flatten)]
+        sel: Select,
     },
     /// Run a shell command on every pod over SSH (concurrent).
     ///
     /// Runs inside an interactive shell with the conda env active (default `arena-env`,
     /// override via `CONDA_ENV`; set it empty to disable), so commands see the
     /// participants' python/packages and the token exports written by `setup`. Flags go
-    /// BEFORE the command — everything after it is the command.
+    /// BEFORE the command — everything after it is the command. Scope it with
+    /// `-t <targets>` (names / ids / ranges) and the other selection flags; default: every pod.
     Run {
         /// The command to run (everything after `run`).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
@@ -820,6 +899,8 @@ enum PodCmd {
         /// Preview only: print the command + target pods, run nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
+        #[command(flatten)]
+        sel: SelectByFlag,
     },
     /// Health check (read-only). Plain: torch version on every pod (90s budget per pod).
     ///
@@ -828,25 +909,24 @@ enum PodCmd {
     /// count vs nvidia-smi, GPU↔GPU copy + NCCL all_reduce (only with >1 GPU), Hugging
     /// Face download speed, disk, host load, maintenance window. One pass/warn/fail row
     /// per pod (150s budget each); exits non-zero if any pod FAILs (warnings don't).
+    ///
+    /// Targets (both checks): names / ids / ranges (none = every pod with an SSH endpoint).
     Test {
         /// Run the deep check instead of the torch-version check.
         #[arg(long)]
         deep: bool,
-        /// Only these pods (name, bare name or id). Default: every pod with an SSH endpoint.
-        #[arg(requires = "deep")]
-        names: Vec<String>,
         /// Emit per-pod `{name, provider, status, checks[], facts}` as JSON on stdout.
         #[arg(long, requires = "deep")]
         json: bool,
         /// Print every check of every pod, not just the table.
         #[arg(short, long, requires = "deep")]
         verbose: bool,
+        #[command(flatten)]
+        sel: Select,
     },
-    /// Distribute API keys to pods' shells (per-host CSVs + broadcast HF token).
+    /// Distribute API keys to pods' shells (per-host CSVs + broadcast HF token). Targets:
+    /// names / ids / ranges (none = every reachable pod).
     CopyKeys {
-        /// Pod(s) to copy to (name or id) — a positional shorthand for --include. Omit to
-        /// copy to every reachable pod. Merged with any --include values.
-        target: Vec<String>,
         /// Directory holding the per-host `<provider>_api_keys.csv` files.
         #[arg(long, default_value = "./keys")]
         keys_dir: String,
@@ -858,15 +938,11 @@ enum PodCmd {
         /// Overrides config CLAUDE_CODE_OAUTH_TOKEN.
         #[arg(long)]
         cc_token: Option<String>,
-        /// Only copy to these pods (name or id, repeatable). Default: all reachable.
-        #[arg(long)]
-        include: Vec<String>,
-        /// Never copy to these pods (name or id, repeatable).
-        #[arg(long)]
-        exclude: Vec<String>,
         /// Preview only: print what would be set per pod (key values redacted).
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
+        #[command(flatten)]
+        sel: Select,
     },
     /// scp a local file (or dir, with -r) to every pod (mirrors the repo path if no DEST).
     #[command(visible_alias = "copy")]
@@ -878,12 +954,6 @@ enum PodCmd {
         /// Recurse into a directory (scp -r).
         #[arg(short = 'r', long)]
         recursive: bool,
-        /// Only copy to these pods (name or id, repeatable). Default: all reachable.
-        #[arg(long)]
-        include: Vec<String>,
-        /// Never copy to these pods (name or id, repeatable).
-        #[arg(long)]
-        exclude: Vec<String>,
         /// Per-pod scp budget in seconds (default: 10 min plus 1s per MB sent across all
         /// pods — every copy shares your uplink; at most 86400). A pod that runs over
         /// reports `✗ timed out after Ns` and counts as failed; the others carry on.
@@ -892,6 +962,8 @@ enum PodCmd {
         /// Preview only: print the scp commands, copy nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
+        #[command(flatten)]
+        sel: SelectByFlag,
     },
 }
 
@@ -1945,7 +2017,6 @@ fn failure_line(done: usize, total: usize, name: &str, call: &PodCall) -> String
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_setup(
-    provider: &dyn Provider,
     // How we reach pods: `SshRemote` for real, `FakeRemote` in tests.
     remote: std::sync::Arc<dyn arena_core::remote::Remote>,
     cfg: &Config,
@@ -1959,8 +2030,9 @@ async fn handle_setup(
     // they get here, so a malformed SETUP_TIMEOUT_SECS must fail before the create, not
     // after it — taking the resolved value (not the raw flag) makes that the only option.
     timeouts: arena_core::setup::SetupTimeouts,
-    // Restrict to these pod names (e.g. the ones `up` just created). None = whole fleet.
-    only: Option<&[String]>,
+    // The pods to provision, resolved by the caller: the operator's selection, or the pods
+    // `up` / `replace` / `migrate copy` just created.
+    sel: &Selected,
     // Where the per-host API-key CSVs live (`KEYS_DIR`; a temp dir in tests).
     keys_dir: &str,
 ) -> Result<()> {
@@ -1986,34 +2058,10 @@ async fn handle_setup(
         .map(|(key, display, _)| format!("{display} {}", if token_value(key).is_some() { "✓" } else { "✗" }))
         .collect();
     println!("Broadcast tokens: {} (✓ exported on each pod; ✗ skipped)", token_summary.join(", "));
-    let pods = provider.list_pods().await.context("listing pods for setup")?;
-    let mut targets = Vec::new();
-    for pod in &pods {
-        match SshTarget::from_pod(pod, cfg) {
-            // Carry the provider so we can pick bare-VM vs image-based provisioning.
-            Ok(t) => targets.push((pod.name.clone(), pod.provider.clone(), t)),
-            Err(_) => eprintln!("skip {} — no SSH endpoint yet", pod.name),
-        }
-    }
-    // Scope to a subset by name when asked (e.g. `up` provisions only what it created, or
-    // the operator passed explicit names). Warn about any requested name that matched no
-    // reachable pod (typo, terminated, or no SSH endpoint yet) instead of silently dropping
-    // it; if NONE matched, fail loudly rather than provisioning zero pods.
-    if let Some(only) = only {
-        let reachable: std::collections::HashSet<&str> =
-            targets.iter().map(|(n, _, _)| n.as_str()).collect();
-        let missing: Vec<&str> =
-            only.iter().map(String::as_str).filter(|n| !reachable.contains(n)).collect();
-        if !missing.is_empty() {
-            eprintln!("warning: no reachable pod matched: {}", missing.join(", "));
-        }
-        targets.retain(|(name, _, _)| only.iter().any(|n| n == name));
-        if targets.is_empty() {
-            anyhow::bail!(
-                "no reachable pod matched {only:?} (check the name(s) against `arena pods list`)"
-            );
-        }
-    }
+    // Carry each pod's provider so we can pick bare-VM vs image-based provisioning. A named
+    // pod without an endpoint is reported; if none of the named pods is reachable, it fails.
+    let targets: Vec<(String, String, SshTarget)> =
+        sel.ssh_targets(cfg)?.into_iter().map(|(p, t)| (p.name.clone(), p.provider.clone(), t)).collect();
     if targets.is_empty() {
         println!("(no pods with an SSH endpoint to set up)");
         return Ok(());
@@ -2112,18 +2160,19 @@ async fn handle_setup(
     } else {
         // Scope key distribution to exactly the pods that just provisioned OK: never the
         // rest of the fleet (`setup <one-pod>` must not touch the others), and never a pod
-        // that just failed or timed out — re-contacting a wedged pod would hang here.
-        // `provisioned` is non-empty, so this can't fall through to copy-keys' "empty
-        // include = every pod". Each pod's write is bounded by COPY_KEYS_TIMEOUT anyway.
+        // that just failed or timed out — re-contacting a wedged pod would hang here. Each
+        // pod's write is bounded by COPY_KEYS_TIMEOUT anyway.
         let skipped = if failed > 0 { format!(" (skipping the {failed} that failed)") } else { String::new() };
         println!(
             "API keys: found {} — distributing to the {} provisioned pod(s){skipped}…",
             csv_sources.join(", "),
             provisioned.len()
         );
-        if let Err(e) =
-            handle_copy_keys(provider, remote, cfg, keys_dir, None, None, &provisioned, &[], false, true).await
-        {
+        let done = Selected {
+            pods: sel.pods.iter().filter(|p| provisioned.contains(&p.name)).cloned().collect(),
+            named: true,
+        };
+        if let Err(e) = handle_copy_keys(remote, cfg, keys_dir, None, None, &done, false, true).await {
             eprintln!("  (API-key distribution failed: {e})");
         }
     }
@@ -2753,13 +2802,13 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
 }
 
 async fn handle_backup(
-    provider: &dyn Provider,
     // How we reach pods: `SshRemote` for real, `FakeRemote` in tests.
     remote: Arc<dyn Remote>,
     cfg: &Config,
     apply: bool,
     message: Option<String>,
-    target_filter: Option<&str>,
+    // The pods to back up, resolved by the caller (`pods backup` shares it with the pull).
+    sel: &Selected,
 ) -> Result<()> {
     use arena_core::backup;
 
@@ -2771,24 +2820,8 @@ async fn handle_backup(
     let key = cfg.get("GIT_SSH_KEY_REMOTE").map(String::from);
     let msg_for = |name: &str| message.clone().unwrap_or_else(|| format!("arena backup {name}"));
 
-    let pods = provider.list_pods().await.context("listing pods for backup")?;
-    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
-    // One pod (by name/id/bare name) if a target was given, else the whole fleet.
-    let selected: Vec<&arena_core::Pod> = match target_filter {
-        Some(t) => match pods.iter().find(|p| pod_matches(p, t, prefix)) {
-            Some(p) => vec![p],
-            None => anyhow::bail!("no pod with name or id '{t}' (run `arena pods list`)"),
-        },
-        None => pods.iter().collect(),
-    };
     // Back up only pods that actually have an SSH endpoint; report the rest.
-    let mut targets = Vec::new();
-    for pod in selected {
-        match SshTarget::from_pod(pod, cfg) {
-            Ok(t) => targets.push((pod.name.clone(), t)),
-            Err(_) => eprintln!("skip {} — no SSH endpoint yet", pod.name),
-        }
-    }
+    let targets = sel.named_targets(cfg)?;
     if targets.is_empty() {
         println!("(no pods with an SSH endpoint to back up)");
         return Ok(());
@@ -4140,9 +4173,16 @@ async fn handle_pods(
                 Ok(())
             } else {
                 println!("\nProvisioning the new pod(s) over SSH…");
-                let new: Vec<String> = created.iter().map(|p| p.name.clone()).collect();
-                handle_setup(provider, remote.clone(), cfg, true, false, None, None, false, setup_timeouts, Some(&new), KEYS_DIR)
-                    .await
+                // By id, not name: a provider's reported name can differ from the one asked
+                // for (Vast's `vast-<id>` fallback), as for the readiness wait above.
+                let new: Vec<String> = created.iter().map(|p| p.id.clone()).collect();
+                match just_these(provider, &new).await {
+                    Ok(sel) => {
+                        handle_setup(remote.clone(), cfg, true, false, None, None, false, setup_timeouts, &sel, KEYS_DIR)
+                            .await
+                    }
+                    Err(e) => Err(e),
+                }
             };
             // Final state: one more merge from a fresh listing (an endpoint can move while
             // setup runs), and the one line saying where the proxy stands — including why
@@ -4152,78 +4192,68 @@ async fn handle_pods(
             setup?;
         }
 
-        PodCmd::Stop { target, all, include, exclude, dry_run } => {
-            match (all, target) {
-                (false, Some(target)) => {
-                    let (owner, id, label) = resolve_target_any(cfg, &target).await?;
-                    if dry_run {
-                        println!("[dry-run] would stop {label}");
-                    } else {
-                        if !confirm(yes, &format!("Will stop {label}."))? {
-                            println!("aborted.");
-                            return Ok(());
-                        }
-                        owner.stop_pod(&id).await?;
-                        println!("[stopped] {label}");
-                    }
+        PodCmd::Stop { sel, dry_run } => {
+            let sel = select(provider, cfg, &sel.args(), Unscoped::Refuse("stop")).await?;
+            // Only running pods can be stopped; a selected pod that isn't is said, not hidden.
+            let running = |p: &arena_core::Pod| p.status.to_uppercase().contains("RUNNING");
+            for p in sel.pods.iter().filter(|p| !running(p)) {
+                eprintln!("skip {} — not running ({})", p.name, p.status);
+            }
+            let pods: Vec<&arena_core::Pod> = sel.pods.iter().filter(|p| running(p)).collect();
+            if pods.is_empty() {
+                println!("(no running pods to stop)");
+                return Ok(());
+            }
+            if dry_run {
+                for p in &pods {
+                    println!("[dry-run] would stop {} (id={}, {})", p.name, p.id, p.provider);
                 }
-                (true, _) => {
-                    let pods = select_pods(provider, cfg, &include, &exclude, Some("RUNNING")).await?;
-                    if pods.is_empty() {
-                        println!("(no running pods to stop)");
-                        return Ok(());
+                println!("\nDry-run only — would stop {} pod(s).", pods.len());
+                return Ok(());
+            }
+            let names: Vec<&str> = pods.iter().map(|p| p.name.as_str()).collect();
+            if !confirm(yes, &format!("Will stop {} running pod(s): {}", pods.len(), names.join(", ")))? {
+                println!("aborted.");
+                return Ok(());
+            }
+            // The fleet provider routes each stop to the backend that owns the pod id.
+            let (mut ok, total) = (0, pods.len());
+            for p in &pods {
+                match provider.stop_pod(&p.id).await {
+                    Ok(()) => {
+                        println!("[stopped] {}", p.name);
+                        ok += 1;
                     }
-                    if dry_run {
-                        for p in &pods {
-                            println!("[dry-run] would stop {} (id={})", p.name, p.id);
-                        }
-                        println!("\nDry-run only — would stop {} pod(s).", pods.len());
-                        return Ok(());
-                    }
-                    if !confirm(yes, &format!("Will stop {} running pod(s).", pods.len()))? {
-                        println!("aborted.");
-                        return Ok(());
-                    }
-                    let (mut ok, total) = (0, pods.len());
-                    for p in &pods {
-                        match provider.stop_pod(&p.id).await {
-                            Ok(()) => {
-                                println!("[stopped] {}", p.name);
-                                ok += 1;
-                            }
-                            Err(e) => eprintln!("[FAILED] {}: {e}", p.name),
-                        }
-                    }
-                    println!("\nstopped {ok}/{total}");
-                    if ok < total {
-                        anyhow::bail!("{} pod(s) failed to stop", total - ok);
-                    }
+                    Err(e) => eprintln!("[FAILED] {}: {e}", p.name),
                 }
-                (false, None) => anyhow::bail!("specify a pod (name or id) to stop, or pass --all"),
+            }
+            println!("\nstopped {ok}/{total}");
+            if ok < total {
+                anyhow::bail!("{} pod(s) failed to stop", total - ok);
             }
         }
 
 
-        PodCmd::InitBranches { week, day, dry_run } => {
-            handle_init_branches(provider, remote, cfg, week, day, dry_run, yes).await?;
+        PodCmd::InitBranches { sel, week, day, dry_run } => {
+            let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
+            handle_init_branches(remote, cfg, week, day, &sel, dry_run, yes).await?;
         }
 
-        PodCmd::Pull { label, dir, max_size, remote_path, no_git, no_big, dry_run } => {
+        PodCmd::Pull { label, dir, max_size, remote_path, no_git, no_big, sel, dry_run } => {
             let dir = dir.unwrap_or_else(|| local_backup_dir(cfg));
-            handle_pull(provider, cfg, label, &dir, max_size, remote_path, no_git, no_big, None, dry_run, yes).await?;
+            let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
+            handle_pull(cfg, label, &dir, max_size, remote_path, no_git, no_big, &sel, dry_run, yes).await?;
         }
 
-        PodCmd::CopyKeys { target, keys_dir, hf_token, cc_token, include, exclude, dry_run } => {
-            // Positional targets are a friendlier spelling of --include; merge the two.
-            let include: Vec<String> = include.into_iter().chain(target).collect();
-            handle_copy_keys(provider, remote, cfg, &keys_dir, hf_token, cc_token, &include, &exclude, dry_run, yes)
-                .await?;
+        PodCmd::CopyKeys { sel, keys_dir, hf_token, cc_token, dry_run } => {
+            let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
+            handle_copy_keys(remote, cfg, &keys_dir, hf_token, cc_token, &sel, dry_run, yes).await?;
         }
 
-        PodCmd::Cp { file, dest, recursive, include, exclude, timeout, dry_run } => {
+        PodCmd::Cp { file, dest, recursive, sel, timeout, dry_run } => {
             let timeout = timeout.map(Duration::from_secs);
-            handle_copy(provider, remote, cfg, &file, dest.as_deref(), recursive, &include, &exclude, timeout, dry_run, yes)
-                .await?;
+            let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
+            handle_copy(remote, cfg, &file, dest.as_deref(), recursive, &sel, timeout, dry_run, yes).await?;
         }
 
         PodCmd::Restart { target, dry_run } => {
@@ -4244,8 +4274,9 @@ async fn handle_pods(
             handle_rename(provider, cfg, target, new_name, from_prefix, skip_proxy, dry_run, yes).await?;
         }
 
-        PodCmd::Reimage { targets, all, exclude, image, skip_proxy, dry_run } => {
-            handle_reimage(provider, cfg, &targets, all, &exclude, image, skip_proxy, dry_run, yes).await?;
+        PodCmd::Reimage { sel, image, skip_proxy, dry_run } => {
+            let sel = select(provider, cfg, &sel.args(), Unscoped::Refuse("reimage")).await?;
+            handle_reimage(provider, cfg, &sel, image, skip_proxy, dry_run, yes).await?;
         }
 
         PodCmd::Replace { target, gpu, gpus, cloud, disk, volume, image, keep_old, skip_proxy, dry_run } => {
@@ -4315,7 +4346,13 @@ async fn handle_pods(
                 }
             }
             (false, Some(target)) => {
-                let (owner, id, label) = resolve_target_any(cfg, &target).await?;
+                // One pod, matched like every other command's targets (the shared selector's
+                // single-pod rule): a typo names the closest pods, a range/`all` is refused,
+                // and a name two pods share is refused — pass the id.
+                let policy = arena_core::retry::RetryPolicy::default();
+                let pods = arena_core::retry::retrying(&policy, || provider.list_pods()).await.context("listing pods")?;
+                let pod = &pods[arena_core::selector::resolve_one(&Naming::from_config(cfg), &pods, &target)?];
+                let label = format!("{} (id={}, {})", pod.name, pod.id, pod.provider);
                 let then_sync = if skip_proxy { "" } else { ", then sync the proxy" };
                 if dry_run {
                     println!("[dry-run] would terminate {label}{then_sync}");
@@ -4324,9 +4361,9 @@ async fn handle_pods(
                         println!("aborted.");
                         return Ok(());
                     }
-                    owner.terminate_pod(&id).await?;
+                    // The fleet provider routes it to the backend that owns the pod id.
+                    provider.terminate_pod(&pod.id).await?;
                     println!("[terminated] {label}");
-                    // `owner` is one backend; the sync lists the whole fleet.
                     if !skip_proxy {
                         sync_proxy(cfg, provider, "terminate").await;
                     }
@@ -4337,13 +4374,17 @@ async fn handle_pods(
             }
         },
 
-        PodCmd::Backup { target, no_pull, dry_run, message } => {
-            let scope = match &target {
-                Some(t) => format!("{t}'s ARENA tree"),
-                None => "each pod's ARENA tree".to_string(),
-            };
+        PodCmd::Backup { sel, no_pull, dry_run, message } => {
+            // Resolved once, before the prompt (a typo fails before asking), and shared by the
+            // git push and the pull.
+            let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
+            if sel.pods.is_empty() {
+                println!("(no pods to back up)");
+                return Ok(());
+            }
+            let scope = format!("the ARENA tree of {} pod(s) ({})", sel.pods.len(), sel.names());
             let what = if no_pull {
-                format!("commit + push {scope} on its current branch (main/master skipped)")
+                format!("commit + push {scope}, each on its current branch (main/master skipped)")
             } else {
                 // Show the real destination subfolder (base/<wNdM>/<pod>) so it's clear where
                 // the rsync lands; fall back to just the base if the wNdM label can't be
@@ -4363,72 +4404,60 @@ async fn handle_pods(
             // INDEPENDENT of git, so a git failure on one pod (e.g. a missing repo, or a pod
             // sitting on main) must NOT skip the rsync for the whole fleet. Capture the git
             // result, always run the pull, then surface the git error at the end.
-            let git_result = handle_backup(provider, remote, cfg, !dry_run, message, target.as_deref()).await;
+            let git_result = handle_backup(remote, cfg, !dry_run, message, &sel).await;
             if !no_pull {
                 println!();
                 let dir = local_backup_dir(cfg);
-                handle_pull(provider, cfg, None, &dir, None, None, false, false, target.as_deref(), dry_run, true).await?;
+                handle_pull(cfg, None, &dir, None, None, false, false, &sel, dry_run, true).await?;
             }
             git_result?;
         }
-        PodCmd::Setup { names, dry_run, force, hf_token, cc_token, zsh_install, timeout } => {
-            // Normalize bare names to full ones (`bulk` -> `arena8-bulk`); empty = whole fleet.
-            let only: Option<Vec<String>> = if names.is_empty() {
-                None
-            } else {
-                let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
-                Some(
-                    names
-                        .iter()
-                        .map(|n| arena_core::naming::canonical_name(prefix, &cfg.machine_names, n))
-                        .collect(),
-                )
-            };
-            let scope = match &only {
-                Some(v) => format!("{} pod(s) ({})", v.len(), v.join(", ")),
-                None => "each pod".to_string(),
-            };
-            // Budgets first: a malformed SETUP_TIMEOUT_SECS fails before the prompt.
+        PodCmd::Setup { sel, dry_run, force, hf_token, cc_token, zsh_install, timeout } => {
+            // Budgets first: a malformed SETUP_TIMEOUT_SECS fails before anything else.
             let timeouts = arena_core::setup::SetupTimeouts::from_config(cfg, timeout)?;
+            // Resolved before the prompt, so a typo fails before asking and the prompt names
+            // exactly the pods that will be provisioned.
+            let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
             if !dry_run
-                && !confirm(yes, &format!("Will provision {scope} over SSH (deploy key, ~/.name, repo)."))?
+                && !sel.pods.is_empty()
+                && !confirm(
+                    yes,
+                    &format!(
+                        "Will provision {} pod(s) over SSH (deploy key, ~/.name, repo): {}",
+                        sel.pods.len(),
+                        sel.names()
+                    ),
+                )?
             {
                 println!("aborted.");
                 return Ok(());
             }
-            handle_setup(
-                provider,
-                remote,
-                cfg,
-                !dry_run,
-                force,
-                hf_token,
-                cc_token,
-                zsh_install,
-                timeouts,
-                only.as_deref(),
-                KEYS_DIR,
-            )
-            .await?;
+            handle_setup(remote, cfg, !dry_run, force, hf_token, cc_token, zsh_install, timeouts, &sel, KEYS_DIR).await?;
         }
-        PodCmd::SetBranch { branch, target, all, hard, dry_run } => {
-            handle_set_branch(provider, remote, cfg, &branch, target.as_deref(), all, hard, dry_run, yes).await?;
+        PodCmd::SetBranch { branch, sel, hard, dry_run } => {
+            let sel = select(provider, cfg, &sel.args(), Unscoped::Refuse("switch")).await?;
+            handle_set_branch(remote, cfg, &branch, &sel, hard, dry_run, yes).await?;
         }
-        PodCmd::Run { command, timeout, dry_run } => {
+        PodCmd::Run { sel, command, timeout, dry_run } => {
             let cmd = command.join(" ");
             let budget = Duration::from_secs(timeout);
-            handle_run(provider, remote, cfg, &cmd, budget, dry_run, yes, /*confirm*/ true, /*compact*/ false).await?;
+            let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
+            handle_run(remote, cfg, &sel, &cmd, budget, dry_run, yes, /*confirm*/ true, /*compact*/ false).await?;
         }
-        PodCmd::Test { deep: true, names, json, verbose } => {
-            // Read-only: no confirm.
-            handle_deep_test(provider, remote, cfg, &names, json, verbose).await?;
+        PodCmd::Test { deep: true, sel, json, verbose } => {
+            // Read-only: no confirm. Config first: a malformed MIN_DRIVER_VERSION fails before
+            // the fleet is even listed.
+            arena_core::health::HealthPolicy::from_config(cfg)?;
+            let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
+            handle_deep_test(provider, remote, cfg, &sel, json, verbose).await?;
         }
-        PodCmd::Test { deep: false, .. } => {
+        PodCmd::Test { deep: false, sel, .. } => {
             // Read-only: no confirm, compact one-line-per-pod output.
+            let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
             handle_run(
-                provider,
                 remote,
                 cfg,
+                &sel,
                 "python -c 'import torch; print(torch.__version__)' 2>&1 || python3 -c 'import torch; print(torch.__version__)'",
                 TEST_TIMEOUT,
                 false,
@@ -4442,16 +4471,17 @@ async fn handle_pods(
     Ok(())
 }
 
-/// Run `cmd` on every pod with an SSH endpoint, concurrently, each pod within `timeout`
-/// (a pod that runs over is a failure; the others carry on). `compact` prints one line
-/// per pod (last stdout line); otherwise a per-pod block. `confirm_needed` gates it
+/// Run `cmd` on every selected pod with an SSH endpoint, concurrently, each pod within
+/// `timeout` (a pod that runs over is a failure; the others carry on). `compact` prints one
+/// line per pod (last stdout line); otherwise a per-pod block. `confirm_needed` gates it
 /// behind the y/N prompt (arbitrary exec); read-only checks pass false.
 #[allow(clippy::too_many_arguments)]
 async fn handle_run(
-    provider: &dyn Provider,
     // How we reach pods: `SshRemote` for real, `FakeRemote` in tests.
     remote: Arc<dyn Remote>,
     cfg: &Config,
+    // The pods to run on, resolved by the caller.
+    sel: &Selected,
     cmd: &str,
     timeout: Duration,
     dry_run: bool,
@@ -4459,16 +4489,9 @@ async fn handle_run(
     confirm_needed: bool,
     compact: bool,
 ) -> Result<()> {
-    let pods = provider.list_pods().await.context("listing pods")?;
-    let mut targets: Vec<(String, SshTarget)> = Vec::new();
-    for pod in &pods {
-        // Report (don't silently drop) pods we can't reach yet, so a "run on every pod"
-        // can't quietly skip part of the fleet while reporting success.
-        match SshTarget::from_pod(pod, cfg) {
-            Ok(t) => targets.push((pod.name.clone(), t)),
-            Err(_) => eprintln!("skip {} — no SSH endpoint yet", pod.name),
-        }
-    }
+    // Pods we can't reach yet are reported (not silently dropped), so a "run on every pod"
+    // can't quietly skip part of the fleet while reporting success.
+    let mut targets = sel.named_targets(cfg)?;
     targets.sort_by(|a, b| a.0.cmp(&b.0));
     if targets.is_empty() {
         println!("(no pods with an SSH endpoint)");
@@ -4481,15 +4504,16 @@ async fn handle_run(
     let conda_env = cfg.get("CONDA_ENV").unwrap_or("arena-env");
     let remote_cmd = arena_core::ssh::login_shell_wrap(cmd, Some(conda_env));
 
+    let names = targets.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", ");
     if dry_run {
         println!(
-            "[dry-run] would run on {} pod(s) ({}s budget each):\n  {remote_cmd}",
+            "[dry-run] would run on {} pod(s) ({}s budget each): {names}\n  {remote_cmd}",
             targets.len(),
             timeout.as_secs()
         );
         return Ok(());
     }
-    if confirm_needed && !confirm(yes, &format!("Run `{cmd}` on {} pod(s) over SSH.", targets.len()))? {
+    if confirm_needed && !confirm(yes, &format!("Run `{cmd}` on {} pod(s) over SSH: {names}", targets.len()))? {
         println!("aborted.");
         return Ok(());
     }
@@ -4577,12 +4601,12 @@ async fn handle_deep_test(
     // How we reach pods: `SshRemote` for real, `FakeRemote` in tests.
     remote: Arc<dyn Remote>,
     cfg: &Config,
-    names: &[String],
+    sel: &Selected,
     json: bool,
     verbose: bool,
 ) -> Result<()> {
     use arena_core::health::Status;
-    let results = deep_check_fleet(provider, &remote, cfg, names).await?;
+    let results = deep_check_fleet(provider, &remote, cfg, sel).await?;
     let (stdout, stderr) = render_deep_test(&results, json, verbose)?;
     print!("{stdout}");
     for line in stderr {
@@ -4614,13 +4638,13 @@ fn render_deep_test(
     })
 }
 
-/// Deep-check pods concurrently over `remote`, one exec each bounded by
-/// [`arena_core::health::DEEP_CHECK_TIMEOUT`]; results sorted by name. `names` (full, bare
-/// or id) restrict it — an unknown name is an error, and a named pod without an SSH
-/// endpoint is a FAIL (it was asked about and couldn't be checked); otherwise pods without
-/// an endpoint are skipped with a note, like `pods test`. An unreachable or timed-out pod
-/// is a FAIL with the reason. The provider's maintenance windows are fetched alongside the
-/// SSH runs (best-effort, bounded) — it's an API-side fact the pod can't report.
+/// Deep-check the selected pods concurrently over `remote`, one exec each bounded by
+/// [`arena_core::health::DEEP_CHECK_TIMEOUT`]; results sorted by name. A pod the operator
+/// named that has no SSH endpoint is a FAIL (it was asked about and couldn't be checked);
+/// one swept in by the default/`--all` is skipped with a note, like `pods test`. An
+/// unreachable or timed-out pod is a FAIL with the reason. The provider's maintenance
+/// windows are fetched alongside the SSH runs (best-effort, bounded) — it's an API-side
+/// fact the pod can't report.
 ///
 /// Results are matched back to pods by position, not name: two pods can share a name (a
 /// double create, a leftover), and each must get its own row and verdict — keyed by name,
@@ -4630,20 +4654,12 @@ async fn deep_check_fleet(
     provider: &dyn Provider,
     remote: &Arc<dyn Remote>,
     cfg: &Config,
-    names: &[String],
+    sel: &Selected,
 ) -> Result<Vec<arena_core::health::PodHealth>> {
     use arena_core::health::{deep_check_command, parse_deep, HealthPolicy, PodHealth, DEEP_CHECK_TIMEOUT};
     // Config first: a malformed MIN_DRIVER_VERSION fails before any pod is touched.
     let policy = HealthPolicy::from_config(cfg)?;
-    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
-    let mut pods = provider.list_pods().await.context("listing pods")?;
-    if !names.is_empty() {
-        let unknown: Vec<&String> = names.iter().filter(|n| !pods.iter().any(|p| pod_matches(p, n, prefix))).collect();
-        if !unknown.is_empty() {
-            anyhow::bail!("no pod matched {unknown:?} (run `arena pods list`)");
-        }
-        pods.retain(|p| names.iter().any(|n| pod_matches(p, n, prefix)));
-    }
+    let mut pods = sel.pods.clone();
     pods.sort_by(|a, b| a.name.cmp(&b.name));
     for (name, ids) in duplicate_names(&pods) {
         eprintln!(
@@ -4672,7 +4688,7 @@ async fn deep_check_fleet(
                 jobs.push(((i, pod.name.clone()), t, cmd.clone()));
                 Slot::Probed
             }
-            Err(_) if !names.is_empty() => Slot::NoEndpoint,
+            Err(_) if sel.named => Slot::NoEndpoint,
             Err(_) => {
                 eprintln!("skip {} — no SSH endpoint yet", pod.name);
                 Slot::Skipped
@@ -4750,20 +4766,19 @@ fn duplicate_names(pods: &[arena_core::Pod]) -> Vec<(String, Vec<String>)> {
     by_name.into_iter().filter(|(_, ids)| ids.len() > 1).map(|(n, ids)| (n.to_string(), ids)).collect()
 }
 
-/// Switch one pod (or, with `all`, every pod with an SSH endpoint) to `branch` over SSH.
+/// Switch the selected pods (those with an SSH endpoint) to `branch` over SSH.
 /// Gentle (fetch+checkout+ff-pull) by default; `hard` force-resets to `origin/<branch>`,
 /// discarding local commits/changes. Dry-run prints the exact command per pod. Pods run
 /// concurrently, each within [`BRANCH_TIMEOUT`] (it used to be serial, so one wedged pod
 /// held up every pod after it).
 #[allow(clippy::too_many_arguments)]
 async fn handle_set_branch(
-    provider: &dyn Provider,
     // How we reach pods: `SshRemote` for real, `FakeRemote` in tests.
     remote: Arc<dyn Remote>,
     cfg: &Config,
     branch: &str,
-    target: Option<&str>,
-    all: bool,
+    // The pods to switch, resolved by the caller (which demands names or --all).
+    sel: &Selected,
     hard: bool,
     dry_run: bool,
     yes: bool,
@@ -4774,27 +4789,9 @@ async fn handle_set_branch(
     let key = cfg.get("GIT_SSH_KEY_REMOTE");
     let cmd = arena_core::backup::checkout_command(&repo_path, branch, key, hard);
 
-    // Which pods: --all (every reachable one) or a single resolved target.
-    let pods = provider.list_pods().await.context("listing pods")?;
-    let mut targets: Vec<(String, SshTarget)> = Vec::new();
-    if all {
-        for pod in &pods {
-            // Report unreachable pods — a silently-skipped pod left on a stale/diverged
-            // branch (especially under --hard) is exactly what we don't want.
-            match SshTarget::from_pod(pod, cfg) {
-                Ok(t) => targets.push((pod.name.clone(), t)),
-                Err(_) => eprintln!("skip {} — no SSH endpoint yet", pod.name),
-            }
-        }
-    } else if let Some(want) = target {
-        let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
-        match pods.iter().find(|p| pod_matches(p, want, prefix)) {
-            Some(pod) => targets.push((pod.name.clone(), SshTarget::from_pod(pod, cfg)?)),
-            None => anyhow::bail!("no pod with name or id '{want}' (run `arena pods list`)"),
-        }
-    } else {
-        anyhow::bail!("specify a pod (name or id) or pass --all");
-    }
+    // Unreachable pods are reported — a silently-skipped pod left on a stale/diverged branch
+    // (especially under --hard) is exactly what we don't want.
+    let targets = sel.named_targets(cfg)?;
     if targets.is_empty() {
         println!("(no pods with an SSH endpoint to switch)");
         return Ok(());
@@ -4813,7 +4810,8 @@ async fn handle_set_branch(
     } else {
         format!("switch {} pod(s) to branch '{branch}' (gentle, no reset)", targets.len())
     };
-    if !confirm(yes, &format!("Will {how}."))? {
+    let names = targets.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", ");
+    if !confirm(yes, &format!("Will {how}: {names}"))? {
         println!("aborted.");
         return Ok(());
     }
@@ -4845,21 +4843,17 @@ async fn handle_set_branch(
 async fn handle_reimage(
     provider: &dyn Provider,
     cfg: &Config,
-    targets: &[String],
-    all: bool,
-    exclude: &[String],
+    // The pods to reimage, resolved by the caller (which demands names or --all).
+    sel: &Selected,
     image: Option<String>,
     skip_proxy: bool,
     dry_run: bool,
     yes: bool,
 ) -> Result<()> {
-    if targets.is_empty() && !all {
-        anyhow::bail!("name the pods to reimage, or pass --all");
-    }
-    let pods = select_pods(provider, cfg, targets, exclude, None).await?;
-    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
-    if let Some(miss) = targets.iter().find(|t| !pods.iter().any(|p| pod_matches(p, t, prefix))) {
-        anyhow::bail!("no pod matched '{miss}' (run `arena pods list`)");
+    let pods = &sel.pods;
+    if pods.is_empty() {
+        println!("(no pods to reimage)");
+        return Ok(());
     }
     let image = image.unwrap_or_else(|| PodSpec::from_config(cfg).image);
     if image.is_empty() {
@@ -4881,7 +4875,7 @@ async fn handle_reimage(
     }
     let policy = arena_core::retry::RetryPolicy::default();
     let mut failed = Vec::new();
-    for pod in &pods {
+    for pod in pods {
         let mut env = match provider.pod_spec(&pod.id).await {
             Ok(spec) => spec.env,
             Err(e) => {
@@ -4918,8 +4912,6 @@ async fn handle_reimage(
     Ok(())
 }
 
-/// Does `token` identify `pod`? Matches the full name, the provider id, or a **bare
-/// short name** (`zebra` ⇒ `<prefix>-zebra`), so targets/filters accept either form.
 /// `pods rename`: validate every (old → new) pair, confirm, rename via the provider's
 /// metadata-only rename, then redeploy the proxy so stable ports follow the new names.
 #[allow(clippy::too_many_arguments)]
@@ -5027,10 +5019,10 @@ fn plan_renames(
     use std::collections::HashSet;
     let pairs: Vec<(&arena_core::Pod, String)> = match request {
         RenameRequest::One { old, new } => {
-            let pod = pods
-                .iter()
-                .find(|p| pod_matches(p, old, prefix))
-                .ok_or_else(|| anyhow::anyhow!("no pod with name or id '{old}' (run `arena pods list`)"))?;
+            // The shared single-pod matcher: a typo names the closest pods, and a name two
+            // pods share is refused (renaming whichever listed first could be the wrong one).
+            let naming = Naming { prefix, list: candidates };
+            let pod = &pods[arena_core::selector::resolve_one(&naming, pods, old)?];
             vec![(pod, arena_core::naming::canonical_name(prefix, candidates, new))]
         }
         RenameRequest::FromPrefix(from) => {
@@ -5066,10 +5058,6 @@ fn plan_renames(
         .into_iter()
         .map(|(p, new)| PlannedRename { id: p.id.clone(), old: p.name.clone(), new })
         .collect())
-}
-
-fn pod_matches(pod: &arena_core::Pod, token: &str, prefix: &str) -> bool {
-    pod.name == token || pod.id == token || pod.name == format!("{prefix}-{token}")
 }
 
 /// Derive the staging + parked names for a blue-green replace of `canonical`. The
@@ -5253,8 +5241,9 @@ async fn handle_migrate_copy(
             .await
             .with_context(|| format!("{new_name} never stabilized"))?;
         println!("      provisioning {new_name}…");
-        let only = [new_name.clone()];
-        handle_setup(owner.as_ref(), remote.clone(), cfg, true, false, None, None, false, setup_timeouts, Some(&only), KEYS_DIR)
+        // By id (a fresh listing, for the settled endpoint): the pod we just made.
+        let new = just_these(owner.as_ref(), std::slice::from_ref(&created.id)).await?;
+        handle_setup(remote.clone(), cfg, true, false, None, None, false, setup_timeouts, &new, KEYS_DIR)
             .await
             .with_context(|| format!("provisioning {new_name}"))?;
         created.id
@@ -5656,8 +5645,9 @@ async fn handle_replace(
     let mut persisted = false;
     for attempt in 1..=copy_attempts {
         println!("[3/7] provisioning {new_name}… (attempt {attempt}/{copy_attempts})");
-        let only = [new_name.clone()];
-        handle_setup(owner.as_ref(), remote.clone(), cfg, true, false, None, None, false, setup_timeouts, Some(&only), KEYS_DIR)
+        // By id (a fresh listing each attempt, for the current endpoint): the pod we made.
+        let new = just_these(owner.as_ref(), std::slice::from_ref(&created.id)).await?;
+        handle_setup(remote.clone(), cfg, true, false, None, None, false, setup_timeouts, &new, KEYS_DIR)
             .await
             .with_context(|| format!("provisioning {new_name}"))?;
         println!("[4/7] copying {canonical} → {new_name} (excludes caches, HF models, .claude, .ssh, shell-rc keys)…");
@@ -6153,77 +6143,149 @@ async fn verify_replacement(provider: &dyn Provider, remote: &dyn Remote, id: &s
     );
 }
 
-/// Resolve a user-supplied target (machine name, bare short name, OR raw provider id) by
-/// searching EVERY configured provider, returning the owning provider too — so
-/// `stop`/`restart`/`terminate <name>` work whatever backend the pod lives on, without
-/// passing `--provider`. The mutation must go to the owning provider's API. Requires the
-/// pod to actually exist (a typo fails clearly). Best-effort listing; a provider that
-/// errors is warned about and skipped.
+/// Resolve a user-supplied target (machine name, bare short name, `@name` OR raw provider
+/// id) by searching EVERY configured provider, returning the owning provider too — so
+/// `restart`/`replace`/`migrate <name>` work whatever backend the pod lives on, without
+/// passing `--provider`. The mutation must go to the owning provider's API. Matched with
+/// the shared selector's single-pod rule (`arena_core::selector::resolve_one`): a typo
+/// fails with the closest names, and a name two pods share is refused rather than taking
+/// whichever listed first. Best-effort listing; a provider that errors is warned about and
+/// skipped.
 async fn resolve_target_any(
     cfg: &Config,
     target: &str,
 ) -> Result<(Box<dyn Provider>, String, String)> {
-    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
     let policy = arena_core::retry::RetryPolicy::default();
+    let mut backends: Vec<(&str, Box<dyn Provider>)> = Vec::new();
+    let mut pods: Vec<arena_core::Pod> = Vec::new();
+    let mut owner_of: Vec<usize> = Vec::new(); // pods[i] belongs to backends[owner_of[i]]
     for name in ["runpod", "vast", "hetzner"] {
         let Ok(p) = arena_core::provider::build(name, cfg) else { continue };
-        let pods = match arena_core::retry::retrying(&policy, || p.list_pods()).await {
-            Ok(pods) => pods,
-            Err(e) => {
-                eprintln!("warning: couldn't list {name} pods ({e})");
-                continue;
+        match arena_core::retry::retrying(&policy, || p.list_pods()).await {
+            Ok(listed) => {
+                owner_of.extend(std::iter::repeat(backends.len()).take(listed.len()));
+                pods.extend(listed);
+                backends.push((name, p));
             }
-        };
-        if let Some(pod) = pods.iter().find(|pd| pod_matches(pd, target, prefix)) {
-            let label = format!("{} (id={}, {name})", pod.name, pod.id);
-            return Ok((p, pod.id.clone(), label));
+            Err(e) => eprintln!("warning: couldn't list {name} pods ({e})"),
         }
     }
-    anyhow::bail!("no pod with name or id '{target}' on any provider (run `arena pods list`)")
+    let i = arena_core::selector::resolve_one(&Naming::from_config(cfg), &pods, target)?;
+    let (name, _) = &backends[owner_of[i]];
+    let label = format!("{} (id={}, {name})", pods[i].name, pods[i].id);
+    let id = pods[i].id.clone();
+    let (_, owner) = backends.swap_remove(owner_of[i]);
+    Ok((owner, id, label))
 }
 
-/// List pods and apply the legacy filter semantics: drop `exclude` first, then keep only
-/// `include` (if that list is non-empty), then optionally keep only pods whose status
-/// contains `status_contains` (case-insensitive, e.g. "RUNNING"). Names (full or bare)
-/// or ids match.
-async fn select_pods(
-    provider: &dyn Provider,
-    cfg: &Config,
-    include: &[String],
-    exclude: &[String],
-    status_contains: Option<&str>,
-) -> Result<Vec<arena_core::Pod>> {
-    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
+/// What a fleet command does when the operator names no pods (no targets, no `--all`).
+#[derive(Debug, Clone, Copy)]
+enum Unscoped {
+    /// The whole fleet: read-only checks, and the commands that always defaulted to it
+    /// (`run`, `test`, `setup`, `copy-keys`, `cp`, `backup`, `pull`, `init-branches`).
+    All,
+    /// Refuse: a command that changes pods (`stop`, `reimage`, `set-branch`, `keys`) must
+    /// be told which — names or `--all` (the verb goes in the message).
+    Refuse(&'static str),
+}
+
+/// The pods a fleet command acts on, resolved once at the command layer, and whether the
+/// operator *named* them. Named matters downstream: a named pod that can't be reached is a
+/// failure to report, while one swept in by `--all` (or the default) is skipped with a note.
+#[derive(Debug, Clone, Default)]
+struct Selected {
+    pods: Vec<arena_core::Pod>,
+    named: bool,
+}
+
+impl Selected {
+    /// The whole given list, as if nothing was named (what an unscoped selection of that
+    /// fleet resolves to) — for tests that drive a handler directly.
+    #[cfg(test)]
+    fn all(pods: Vec<arena_core::Pod>) -> Selected {
+        Selected { pods, named: false }
+    }
+
+    /// `name, name, …` — for prompts and dry-runs, so the operator sees what will run.
+    fn names(&self) -> String {
+        self.pods.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ")
+    }
+
+    /// Every selected pod with an SSH endpoint, with its target, in selection order. A pod
+    /// without one is reported (`skip <name> — no SSH endpoint yet`), never silently dropped;
+    /// when the operator named pods and *none* is reachable, that's an error — not a quiet
+    /// "nothing to do" that reads like success.
+    fn ssh_targets(&self, cfg: &Config) -> Result<Vec<(&arena_core::Pod, SshTarget)>> {
+        let mut targets = Vec::new();
+        for pod in &self.pods {
+            match SshTarget::from_pod(pod, cfg) {
+                Ok(t) => targets.push((pod, t)),
+                Err(_) => eprintln!("skip {} — no SSH endpoint yet", pod.name),
+            }
+        }
+        if targets.is_empty() && self.named {
+            anyhow::bail!("none of the selected pods ({}) has an SSH endpoint yet — check `arena pods list`", self.names());
+        }
+        Ok(targets)
+    }
+
+    /// [`ssh_targets`](Self::ssh_targets) keyed by pod name — what the per-pod runners take.
+    fn named_targets(&self, cfg: &Config) -> Result<Vec<(String, SshTarget)>> {
+        Ok(self.ssh_targets(cfg)?.into_iter().map(|(p, t)| (p.name.clone(), t)).collect())
+    }
+}
+
+/// Resolve the operator's selection (PLAN 1.C): validate it (`arena_core::selector`: token
+/// syntax, ranges against MACHINE_NAME_LIST, `--on`) *before* listing, refuse an unscoped
+/// selection where the command needs one, list the fleet (retrying transient failures),
+/// then resolve — a typo or a narrowed-to-nothing selection is an error before anything is
+/// touched. With `--gpus`, the provider's details are fetched first (best-effort, bounded):
+/// a listing may omit GPU counts, and an unknown count never matches.
+async fn select(provider: &dyn Provider, cfg: &Config, sel: &SelectArgs, unscoped: Unscoped) -> Result<Selected> {
+    let naming = Naming::from_config(cfg);
+    let selector = Selector::parse(sel, &naming)?;
+    if let (true, Unscoped::Refuse(verb)) = (selector.is_unscoped(), unscoped) {
+        anyhow::bail!("name the pods to {verb} (names, ids or a range like apple..mayor), or pass --all");
+    }
     let policy = arena_core::retry::RetryPolicy::default();
-    let mut pods = arena_core::retry::retrying(&policy, || provider.list_pods())
-        .await
-        .context("listing pods")?;
-    pods.sort_by(|a, b| a.name.cmp(&b.name));
-    pods.retain(|p| !exclude.iter().any(|x| pod_matches(p, x, prefix)));
-    if !include.is_empty() {
-        pods.retain(|p| include.iter().any(|x| pod_matches(p, x, prefix)));
-        // A non-empty include that matches nothing is a user error (typo'd name) — fail
-        // loudly instead of looking like an idle/empty fleet.
-        if pods.is_empty() {
-            anyhow::bail!("no pods matched --include {include:?} (run `arena pods list`)");
+    let mut pods = arena_core::retry::retrying(&policy, || provider.list_pods()).await.context("listing pods")?;
+    if selector.gpus.is_some() {
+        if let Some(warning) = enrich_best_effort(provider, &mut pods, ENRICH_TIMEOUT).await {
+            eprintln!("{warning}");
         }
     }
-    if let Some(s) = status_contains {
-        let s = s.to_uppercase();
-        pods.retain(|p| p.status.to_uppercase().contains(&s));
+    let picked = selector.resolve(&naming, &pods)?;
+    Ok(Selected { pods: picked.into_iter().map(|i| pods[i].clone()).collect(), named: sel.names_pods() })
+}
+
+/// A fresh listing narrowed to the pods with these `ids` — ones the program itself just
+/// made (`up`, `replace`, `migrate copy`) and is about to set up. Not operator input, so no
+/// typo check: a pod missing from the listing is warned about and left out (the old
+/// `setup --only` behaviour); it's an error only if none is left.
+async fn just_these(provider: &dyn Provider, ids: &[String]) -> Result<Selected> {
+    let listed = provider.list_pods().await.context("listing pods")?;
+    let pods: Vec<arena_core::Pod> = listed.into_iter().filter(|p| ids.contains(&p.id)).collect();
+    let missing: Vec<&str> = ids.iter().map(String::as_str).filter(|id| !pods.iter().any(|p| p.id == *id)).collect();
+    if !missing.is_empty() {
+        eprintln!("warning: not in the listing (gone?): id {}", missing.join(", "));
     }
-    Ok(pods)
+    if pods.is_empty() {
+        anyhow::bail!("none of the new pods (id {}) is in the listing — check `arena pods list`", ids.join(", "));
+    }
+    Ok(Selected { pods, named: true })
 }
 
 /// `pods init-branches`: create each pod's `autocommit-…-wNdM-…` branch and push it
 /// upstream, without committing — so a new day's branch exists before backups run.
+#[allow(clippy::too_many_arguments)]
 async fn handle_init_branches(
-    provider: &dyn Provider,
     // How we reach pods: `SshRemote` for real, `FakeRemote` in tests.
     remote: Arc<dyn Remote>,
     cfg: &Config,
     week: Option<u32>,
     day: Option<u32>,
+    // The pods to init, resolved by the caller.
+    sel: &Selected,
     dry_run: bool,
     yes: bool,
 ) -> Result<()> {
@@ -6231,14 +6293,7 @@ async fn handle_init_branches(
     let bcfg = arena_core::backup::BackupConfig::from_config(cfg, week, day);
     println!("Iteration: w{week}d{day}\n");
 
-    let pods = provider.list_pods().await.context("listing pods for init-branches")?;
-    let mut targets = Vec::new();
-    for pod in &pods {
-        match SshTarget::from_pod(pod, cfg) {
-            Ok(t) => targets.push((pod.name.clone(), t)),
-            Err(_) => eprintln!("skip {} — no SSH endpoint yet", pod.name),
-        }
-    }
+    let targets = sel.named_targets(cfg)?;
     if targets.is_empty() {
         println!("(no pods with an SSH endpoint)");
         return Ok(());
@@ -6255,8 +6310,9 @@ async fn handle_init_branches(
         return Ok(());
     }
     if !confirm(yes, &format!(
-        "Will create + push the w{week}d{day} autocommit branch on {} pod(s).",
-        targets.len()
+        "Will create + push the w{week}d{day} autocommit branch on {} pod(s): {}",
+        targets.len(),
+        targets.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", ")
     ))? {
         println!("aborted.");
         return Ok(());
@@ -6298,7 +6354,6 @@ async fn handle_init_branches(
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 async fn handle_pull(
-    provider: &dyn Provider,
     cfg: &Config,
     label: Option<String>,
     dir: &str,
@@ -6306,12 +6361,12 @@ async fn handle_pull(
     remote_path: Option<String>,
     no_git: bool,
     no_big: bool,
-    target_filter: Option<&str>,
+    // The pods to pull, resolved by the caller.
+    sel: &Selected,
     dry_run: bool,
     yes: bool,
 ) -> Result<()> {
     use arena_core::pull::{self, PullConfig};
-    use arena_core::ssh::SshTarget;
 
     // Label: explicit, else the computed wNdM iteration.
     let label = match label {
@@ -6353,20 +6408,7 @@ async fn handle_pull(
         if no_git { "no .git" } else { "incl .git" },
     );
 
-    let pods = provider.list_pods().await.context("listing pods for pull")?;
-    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
-    let mut targets: Vec<(String, SshTarget)> = Vec::new();
-    for pod in &pods {
-        if let Some(t) = target_filter {
-            if !pod_matches(pod, t, prefix) {
-                continue;
-            }
-        }
-        match SshTarget::from_pod(pod, cfg) {
-            Ok(t) => targets.push((pod.name.clone(), t)),
-            Err(_) => eprintln!("skip {} — no SSH endpoint yet", pod.name),
-        }
-    }
+    let targets = sel.named_targets(cfg)?;
     if targets.is_empty() {
         println!("(no pods with an SSH endpoint to pull)");
         return Ok(());
@@ -6399,7 +6441,8 @@ async fn handle_pull(
     } else {
         format!("{dir}/ (dated snapshot {label} + the all-files big/)")
     };
-    if !confirm(yes, &format!("Will rsync {} pod home(s) into {dest_msg}.", targets.len()))? {
+    let names = targets.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", ");
+    if !confirm(yes, &format!("Will rsync {} pod home(s) into {dest_msg}: {names}", targets.len()))? {
         println!("aborted.");
         return Ok(());
     }
@@ -6523,21 +6566,20 @@ fn resolve_remote_dest(
     local.file_name().and_then(|n| n.to_str()).unwrap_or("copied_file").to_string()
 }
 
-/// `pods copy`: scp a local file to every (filtered) pod, creating the remote parent
+/// `pods copy`: scp a local file to every selected pod, creating the remote parent
 /// dir first. Destination per [`resolve_remote_dest`]. Pods run concurrently, each step
 /// bounded (see [`copy_to_pod`]); the scp gets `timeout` (`--timeout`), else a budget
 /// proportional to what's sent ([`cp_timeout`]).
 #[allow(clippy::too_many_arguments)]
 async fn handle_copy(
-    provider: &dyn Provider,
     // How we reach pods: `SshRemote` for real, `FakeRemote` in tests.
     remote_ssh: Arc<dyn Remote>,
     cfg: &Config,
     file: &std::path::Path,
     dest: Option<&str>,
     recursive: bool,
-    include: &[String],
-    exclude: &[String],
+    // The pods to copy to, resolved by the caller.
+    sel: &Selected,
     timeout: Option<Duration>,
     dry_run: bool,
     yes: bool,
@@ -6569,24 +6611,7 @@ async fn handle_copy(
         }
     };
 
-    let mut pods = provider.list_pods().await.context("listing pods for copy")?;
-    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
-    pods.retain(|p| !exclude.iter().any(|x| pod_matches(p, x, prefix)));
-    if !include.is_empty() {
-        pods.retain(|p| include.iter().any(|x| pod_matches(p, x, prefix)));
-        // A non-empty include that matches nothing is a typo, not an empty fleet — fail
-        // loudly so the file doesn't silently copy nowhere.
-        if pods.is_empty() {
-            anyhow::bail!("no pods matched --include {include:?} (run `arena pods list`)");
-        }
-    }
-    let mut targets: Vec<(String, SshTarget)> = Vec::new();
-    for pod in &pods {
-        match SshTarget::from_pod(pod, cfg) {
-            Ok(t) => targets.push((pod.name.clone(), t)),
-            Err(_) => eprintln!("skip {} — no SSH endpoint yet", pod.name),
-        }
-    }
+    let targets = sel.named_targets(cfg)?;
     if targets.is_empty() {
         println!("(no pods with an SSH endpoint to copy to)");
         return Ok(());
@@ -6631,7 +6656,8 @@ async fn handle_copy(
         println!("Preview only — run without --dry-run to copy.");
         return Ok(());
     }
-    if !confirm(yes, &format!("Will copy {local} to {} on {} pod(s).", remote, targets.len()))? {
+    let names = targets.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", ");
+    if !confirm(yes, &format!("Will copy {local} to {} on {} pod(s): {names}", remote, targets.len()))? {
         println!("aborted.");
         return Ok(());
     }
@@ -6753,7 +6779,6 @@ async fn copy_to_pod(remote: &dyn Remote, t: &SshTarget, plan: &CopyPlan) -> std
 /// config `HF_TOKEN`) is broadcast to every pod (for gated repos like Llama 3).
 #[allow(clippy::too_many_arguments)]
 async fn handle_copy_keys(
-    provider: &dyn Provider,
     // How we reach pods: `SshRemote` for real, `FakeRemote` in tests. Each pod's write is
     // bounded by COPY_KEYS_TIMEOUT, so one wedged pod can't hang the command.
     remote: std::sync::Arc<dyn arena_core::remote::Remote>,
@@ -6761,8 +6786,9 @@ async fn handle_copy_keys(
     keys_dir: &str,
     hf_token: Option<String>,
     cc_token: Option<String>,
-    include: &[String],
-    exclude: &[String],
+    // The pods to write to, resolved by the caller (the operator's selection, or the pods
+    // `setup` / `keys --copy` just handled).
+    sel: &Selected,
     dry_run: bool,
     yes: bool,
 ) -> Result<()> {
@@ -6800,13 +6826,11 @@ async fn handle_copy_keys(
         flag.or_else(|| cfg.get(k).filter(|s| !s.is_empty()).map(String::from))
     };
     let broadcast = apikeys::broadcast_env_vars(&token_value);
-    // "broadcast" = same value on every *targeted* pod (vs per-host CSV keys). Say "all pods"
-    // only when there's no include/target filter — otherwise it misleadingly implies the whole
-    // fleet when you've restricted to specific pods.
-    let bcast_scope = if include.is_empty() { "broadcast to all pods" } else { "broadcast" };
+    // "broadcast" = same value on every *selected* pod (vs per-host CSV keys) — not "all
+    // pods", which misleadingly implies the whole fleet when the selection is narrower.
     for (key, display, _) in apikeys::BROADCAST_TOKENS {
         if token_value(key).is_some() {
-            sources.push(format!("{display} ({bcast_scope})"));
+            sources.push(format!("{display} (broadcast to every selected pod)"));
         }
     }
 
@@ -6818,23 +6842,16 @@ async fn handle_copy_keys(
     }
     println!("Key sources: {}\n", sources.join(", "));
 
-    // Build the per-pod var set (broadcast HF merged into every reachable pod).
-    let mut pods = provider.list_pods().await.context("listing pods for copy-keys")?;
-    // Apply --exclude then --include (full name, bare short name, or id).
+    // Build the per-pod var set (broadcast HF merged into every reachable selected pod).
+    let pods = &sel.pods;
     let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
-    pods.retain(|p| !exclude.iter().any(|x| pod_matches(p, x, prefix)));
-    if !include.is_empty() {
-        pods.retain(|p| include.iter().any(|x| pod_matches(p, x, prefix)));
-        if pods.is_empty() {
-            anyhow::bail!("no pods matched --include {:?} (run `arena pods list`)", include);
-        }
-    }
     let mut jobs: Vec<(String, SshTarget, Vec<(String, String)>)> = Vec::new();
     // Reachable pods that matched NO per-host key — they'd get broadcast tokens only.
     // Worth flagging loudly: a stale/misnamed CSV (e.g. last cohort's hosts) otherwise
     // hides behind a per-pod ✓, so nobody notices the per-host keys never landed.
     let mut broadcast_only: Vec<String> = Vec::new();
-    for pod in &pods {
+    let mut unreachable = 0;
+    for pod in pods {
         let mut vars = broadcast.clone();
         let matched_per_host =
             per_host.get(&pod.name).map(|h| vars.extend(h.iter().cloned())).is_some();
@@ -6848,10 +6865,17 @@ async fn handle_copy_keys(
                 }
                 jobs.push((pod.name.clone(), t, vars));
             }
-            Err(_) => eprintln!("skip {} — no SSH endpoint yet", pod.name),
+            Err(_) => {
+                eprintln!("skip {} — no SSH endpoint yet", pod.name);
+                unreachable += 1;
+            }
         }
     }
     if jobs.is_empty() {
+        // Pods the operator named, all without an endpoint: a failure, not "nothing to do".
+        if sel.named && unreachable > 0 {
+            anyhow::bail!("none of the selected pods ({}) has an SSH endpoint yet — check `arena pods list`", sel.names());
+        }
         println!("(no reachable pods matched any keys)");
         return Ok(());
     }
@@ -6876,7 +6900,7 @@ async fn handle_copy_keys(
         Ok(px) if !cfg.machine_names.is_empty() => arena_core::sshconfig::render_proxy(
             prefix, ssh_user, pod_identity, &px.proxy_host, px.starting_port, &cfg.machine_names,
         ),
-        _ => arena_core::sshconfig::render_manual(prefix, ssh_user, pod_identity, &pods),
+        _ => arena_core::sshconfig::render_manual(prefix, ssh_user, pod_identity, pods),
     };
     let fleet_ssh = fleet_ssh_command(&fleet_pubkeys, &fleet_cfg);
     println!(
@@ -6895,7 +6919,8 @@ async fn handle_copy_keys(
         println!("\nPreview only — run without --dry-run to write to ~/.bashrc & ~/.zshrc.");
         return Ok(());
     }
-    if !confirm(yes, &format!("Will export API keys into ~/.bashrc & ~/.zshrc, authorize the fleet keys, and write ~/.ssh/config on {} pod(s).", jobs.len()))? {
+    let names = jobs.iter().map(|(n, _, _)| n.as_str()).collect::<Vec<_>>().join(", ");
+    if !confirm(yes, &format!("Will export API keys into ~/.bashrc & ~/.zshrc, authorize the fleet keys, and write ~/.ssh/config on {} pod(s): {names}", jobs.len()))? {
         println!("aborted.");
         return Ok(());
     }
@@ -6937,28 +6962,44 @@ async fn handle_copy_keys(
 /// Where generated OpenRouter keys are persisted (also where `copy-keys` reads them).
 const OPENROUTER_KEYS_CSV: &str = "./keys/openrouter_api_keys.csv";
 
-/// Full pod name for a machine arg (prefix added once; honors absolute `@name` list entries).
-fn full_machine_name(prefix: &str, candidates: &[String], m: &str) -> String {
-    arena_core::naming::canonical_name(prefix, candidates, m)
+/// Resolve which machines a `keys` action targets, with the shared selector. A key belongs
+/// to a *machine name*, which can exist before its pod (mint keys, then `up`) or after it
+/// (revoke a terminated pod's key) — so names and ranges resolve against the current pods
+/// **plus** every MACHINE_NAME_LIST name without a pod (a name in neither is still a typo
+/// error). `--all` keeps its meaning: every *current* pod. Returns the full machine names,
+/// and the selection of those that are pods (what `--copy` can reach).
+async fn keys_targets(provider: &dyn Provider, cfg: &Config, sel: &SelectArgs) -> Result<(Vec<String>, Selected)> {
+    let naming = Naming::from_config(cfg);
+    let selector = Selector::parse(sel, &naming)?;
+    if selector.is_unscoped() {
+        anyhow::bail!("name the machines (names or a range like apple..mayor), or pass --all");
+    }
+    let policy = arena_core::retry::RetryPolicy::default();
+    let pods = arena_core::retry::retrying(&policy, || provider.list_pods()).await.context("listing pods")?;
+    let mut universe = pods.clone();
+    if !selector.all {
+        // Spare list names, as pod-less stand-ins (no id, no provider: `--on`/`--gpus` skip them).
+        for entry in &cfg.machine_names {
+            let name = arena_core::naming::qualify(naming.prefix, entry);
+            if !pods.iter().any(|p| p.name == name) {
+                universe.push(arena_core::Pod { name, ..Default::default() });
+            }
+        }
+    }
+    let picked = selector.resolve(&naming, &universe)?;
+    let names = picked.iter().map(|&i| universe[i].name.clone()).collect();
+    let live = picked.into_iter().filter(|&i| i < pods.len()).map(|i| pods[i].clone()).collect();
+    Ok((names, Selected { pods: live, named: true }))
 }
 
-/// Resolve which machines (full pod names) a `keys` action targets: `--all` = every
-/// current pod; else the explicitly named ones (prefixed).
-async fn keys_targets(
-    provider: &dyn Provider,
-    prefix: &str,
-    candidates: &[String],
-    machines: &[String],
-    all: bool,
-) -> Result<Vec<String>> {
-    if all {
-        let pods = provider.list_pods().await.context("listing pods")?;
-        Ok(pods.iter().map(|p| p.name.clone()).collect())
-    } else if !machines.is_empty() {
-        Ok(machines.iter().map(|m| full_machine_name(prefix, candidates, m)).collect())
-    } else {
-        anyhow::bail!("specify machine name(s) or --all")
+/// `keys gen|rotate --copy`: push the fresh keys to the targeted machines that are pods
+/// (a name without a pod has nowhere to go yet — `setup`/`copy-keys` deliver it later).
+async fn copy_new_keys(remote: Arc<dyn Remote>, cfg: &Config, live: &Selected, yes: bool) -> Result<()> {
+    if live.pods.is_empty() {
+        println!("(--copy: none of these machines has a pod yet — run `arena pods copy-keys` once they're up)");
+        return Ok(());
     }
+    handle_copy_keys(remote, cfg, KEYS_DIR, None, None, live, false, yes).await
 }
 
 /// Persist one machine's freshly minted OpenRouter key into the per-host CSV (upsert).
@@ -7097,8 +7138,8 @@ async fn handle_keys(
             }
         }
 
-        KeysCmd::Gen { machines, all, limit, copy, dry_run } => {
-            let names = keys_targets(provider, &prefix, &cfg.machine_names, &machines, all).await?;
+        KeysCmd::Gen { sel, limit, copy, dry_run } => {
+            let (names, live) = keys_targets(provider, cfg, &sel.args()).await?;
             let limit = limit.unwrap_or(default_limit);
             if names.is_empty() {
                 println!("(no target machines)");
@@ -7112,8 +7153,9 @@ async fn handle_keys(
                 return Ok(());
             }
             if !confirm(yes, &format!(
-                "Will mint {} OpenRouter key(s) (cap ${limit:.2} each) and write {OPENROUTER_KEYS_CSV}.",
-                names.len()
+                "Will mint {} OpenRouter key(s) (cap ${limit:.2} each) and write {OPENROUTER_KEYS_CSV}: {}",
+                names.len(),
+                names.join(", ")
             ))? {
                 println!("aborted.");
                 return Ok(());
@@ -7142,12 +7184,12 @@ async fn handle_keys(
             println!("\nGenerated {made}, skipped {skipped}, failed {failed} → {OPENROUTER_KEYS_CSV}");
             if copy && made > 0 {
                 println!();
-                handle_copy_keys(provider, remote.clone(), cfg, KEYS_DIR, None, None, &names, &[], false, yes).await?;
+                copy_new_keys(remote.clone(), cfg, &live, yes).await?;
             }
         }
 
-        KeysCmd::Rotate { machine, all, limit, copy, dry_run } => {
-            let names = keys_targets(provider, &prefix, &cfg.machine_names, &machine.into_iter().collect::<Vec<_>>(), all).await?;
+        KeysCmd::Rotate { sel, limit, copy, dry_run } => {
+            let (names, live) = keys_targets(provider, cfg, &sel.args()).await?;
             let limit = limit.unwrap_or(default_limit);
             if dry_run {
                 println!("Dry-run — would delete + re-mint a key for {} machine(s):", names.len());
@@ -7156,7 +7198,7 @@ async fn handle_keys(
                 }
                 return Ok(());
             }
-            if !confirm(yes, &format!("Will DELETE + re-mint {} OpenRouter key(s) (cap ${limit:.2}).", names.len()))? {
+            if !confirm(yes, &format!("Will DELETE + re-mint {} OpenRouter key(s) (cap ${limit:.2}): {}", names.len(), names.join(", ")))? {
                 println!("aborted.");
                 return Ok(());
             }
@@ -7194,12 +7236,12 @@ async fn handle_keys(
             println!("\nRotated {ok}, failed {failed}.");
             if copy && ok > 0 {
                 println!();
-                handle_copy_keys(provider, remote.clone(), cfg, KEYS_DIR, None, None, &names, &[], false, yes).await?;
+                copy_new_keys(remote.clone(), cfg, &live, yes).await?;
             }
         }
 
-        KeysCmd::Revoke { machine, all, dry_run } => {
-            let names = keys_targets(provider, &prefix, &cfg.machine_names, &machine.into_iter().collect::<Vec<_>>(), all).await?;
+        KeysCmd::Revoke { sel, dry_run } => {
+            let (names, _) = keys_targets(provider, cfg, &sel.args()).await?;
             if dry_run {
                 println!("Dry-run — would revoke the key for {} machine(s):", names.len());
                 for h in &names {
@@ -7207,7 +7249,7 @@ async fn handle_keys(
                 }
                 return Ok(());
             }
-            if !confirm(yes, &format!("Will DELETE {} OpenRouter key(s) — no regenerate.", names.len()))? {
+            if !confirm(yes, &format!("Will DELETE {} OpenRouter key(s) — no regenerate: {}", names.len(), names.join(", ")))? {
                 println!("aborted.");
                 return Ok(());
             }
@@ -7273,117 +7315,379 @@ async fn handle_ssh_config(
     Ok(())
 }
 
-/// Scenario tests for pod-selection control flow, driven by a fake `Provider` (no real
-/// API/SSH). Covers the filter logic + the "--include matched nothing" guard that keeps a
-/// typo'd target from silently looking like an idle fleet.
+/// Scenario tests for target selection (PLAN 1.C) at the command layer, driven by a fake
+/// `Provider` that records every mutation (no real API/SSH): the shared selector picks
+/// exactly the pods each command family acts on, typos fail before anything is touched,
+/// commands that change pods demand names or `--all`, and every old spelling still parses.
 #[cfg(test)]
 mod selection_tests {
-    use super::select_pods;
+    use super::{handle_keys, handle_pods, keys_targets, select, Cli, Cmd, KeysCmd, PodCmd, Unscoped};
+    use arena_core::remote::FakeRemote;
+    use arena_core::selector::SelectArgs;
     use arena_core::{Config, Pod, PodSpec, Provider, Result};
     use async_trait::async_trait;
+    use clap::Parser;
+    use std::sync::{Arc, Mutex};
 
+    /// A fleet that records `(op, id)` for every mutation, and counts list calls.
     struct FakeProvider {
         pods: Vec<Pod>,
+        calls: Mutex<Vec<(&'static str, String)>>,
+        lists: Mutex<usize>,
+        /// GPU counts `enrich` fills in (by pod name) — the details a bare list omits.
+        enriched: Vec<(&'static str, u32)>,
     }
 
-    fn pod(name: &str, status: &str) -> Pod {
-        Pod {
-            id: format!("id-{name}"),
-            name: name.to_string(),
-            provider: "fake".into(),
-            status: status.to_string(),
-            gpu_type: None,
-            cost_per_hr: None,
-            ssh_ip: None,
-            ssh_port: None,
-            ..Default::default()
+    impl FakeProvider {
+        fn calls(&self) -> Vec<(&'static str, String)> {
+            self.calls.lock().unwrap().clone()
+        }
+        fn record(&self, op: &'static str, id: &str) {
+            self.calls.lock().unwrap().push((op, id.to_string()));
         }
     }
 
     #[async_trait]
     impl Provider for FakeProvider {
         fn name(&self) -> &'static str {
-            "fake"
+            "runpod"
         }
         fn describe(&self, _spec: &PodSpec) -> String {
             String::new()
         }
         async fn list_pods(&self) -> Result<Vec<Pod>> {
+            *self.lists.lock().unwrap() += 1;
             Ok(self.pods.clone())
+        }
+        async fn enrich(&self, pods: &mut [Pod]) -> Result<()> {
+            for p in pods.iter_mut() {
+                if let Some((_, n)) = self.enriched.iter().find(|(name, _)| *name == p.name) {
+                    p.gpu_count = Some(*n);
+                }
+            }
+            Ok(())
         }
         async fn create_pod(&self, _spec: &PodSpec) -> Result<Pod> {
             unimplemented!("not exercised by selection tests")
         }
-        async fn stop_pod(&self, _id: &str) -> Result<()> {
+        async fn stop_pod(&self, id: &str) -> Result<()> {
+            self.record("stop", id);
             Ok(())
         }
-        async fn restart_pod(&self, _id: &str) -> Result<()> {
+        async fn restart_pod(&self, id: &str) -> Result<()> {
+            self.record("restart", id);
             Ok(())
         }
-        async fn terminate_pod(&self, _id: &str) -> Result<()> {
+        async fn terminate_pod(&self, id: &str) -> Result<()> {
+            self.record("terminate", id);
             Ok(())
+        }
+        async fn pod_spec(&self, _id: &str) -> Result<PodSpec> {
+            let mut spec = PodSpec::from_config(&Config::parse(""));
+            spec.env = vec![("KEEP".into(), "1".into())];
+            Ok(spec)
+        }
+        async fn reimage_pod(&self, id: &str, _image: &str, _env: &[(String, String)]) -> Result<()> {
+            self.record("reimage", id);
+            Ok(())
+        }
+    }
+
+    fn pod(name: &str, status: &str, provider: &str, gpus: Option<u32>) -> Pod {
+        Pod {
+            id: format!("id-{name}"),
+            name: name.to_string(),
+            provider: provider.into(),
+            status: status.to_string(),
+            gpu_count: gpus,
+            ..Default::default()
+        }
+    }
+
+    /// apple (1 GPU), bloom (2), cloud (count unknown until enriched), zebra (stopped), and
+    /// a hetzner VM — listed out of order.
+    fn fleet() -> FakeProvider {
+        FakeProvider {
+            pods: vec![
+                pod("arena8-zebra", "EXITED", "runpod", Some(1)),
+                pod("arena8-bloom", "RUNNING", "runpod", Some(2)),
+                pod("arena8-apple", "RUNNING", "runpod", Some(1)),
+                pod("arena8-cloud", "RUNNING", "runpod", None),
+                pod("arena8-vm", "running", "hetzner", None),
+            ],
+            calls: Mutex::new(Vec::new()),
+            lists: Mutex::new(0),
+            enriched: vec![("arena8-cloud", 2)],
         }
     }
 
     fn cfg() -> Config {
-        Config::parse("MACHINE_NAME_PREFIX=arena8")
+        Config::parse("MACHINE_NAME_PREFIX=arena8\nMACHINE_NAME_LIST=(apple bloom cloud mayor vm zebra)\n")
     }
-    fn names(pods: &[Pod]) -> Vec<String> {
-        pods.iter().map(|p| p.name.clone()).collect()
+
+    fn args(targets: &[&str]) -> SelectArgs {
+        SelectArgs::exact(targets.iter().copied())
     }
-    fn fleet() -> FakeProvider {
-        FakeProvider {
-            pods: vec![
-                pod("arena8-bloom", "RUNNING"),
-                pod("arena8-apple", "RUNNING"),
-                pod("arena8-zebra", "EXITED"),
-            ],
+
+    async fn names(f: &FakeProvider, a: &SelectArgs) -> std::result::Result<Vec<String>, String> {
+        select(f, &cfg(), a, Unscoped::All)
+            .await
+            .map(|s| s.pods.into_iter().map(|p| p.name).collect())
+            .map_err(|e| e.to_string())
+    }
+
+    fn parse(argv: &[&str]) -> std::result::Result<Cmd, clap::Error> {
+        Cli::try_parse_from(["arena"].iter().chain(argv).copied()).map(|c| c.cmd)
+    }
+
+    fn pods_cmd(argv: &[&str]) -> PodCmd {
+        match parse(&[&["pods"][..], argv].concat()).unwrap_or_else(|e| panic!("{argv:?}: {e}")) {
+            Cmd::Pods(p) => p,
+            _ => unreachable!(),
+        }
+    }
+
+    /// Run `pods <argv…>` against a fresh fleet; the recorded mutations, or the error.
+    async fn run_pods(argv: &[&str]) -> (FakeProvider, std::result::Result<(), String>) {
+        let f = fleet();
+        let r = handle_pods(pods_cmd(argv), &f, Arc::new(FakeRemote::new()), &cfg(), true).await.map_err(|e| e.to_string());
+        (f, r)
+    }
+
+    fn ids(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| format!("id-arena8-{n}")).collect()
+    }
+
+    #[tokio::test]
+    async fn the_resolver_picks_in_list_order_and_fails_loudly_on_typos() {
+        let f = fleet();
+        assert_eq!(names(&f, &SelectArgs::default()).await.unwrap(), ["arena8-apple", "arena8-bloom", "arena8-cloud", "arena8-vm", "arena8-zebra"]);
+        assert_eq!(names(&f, &args(&["bloom", "arena8-apple"])).await.unwrap(), ["arena8-apple", "arena8-bloom"]);
+        assert_eq!(names(&f, &args(&["apple..cloud"])).await.unwrap(), ["arena8-apple", "arena8-bloom", "arena8-cloud"]);
+        assert_eq!(names(&f, &SelectArgs { on: Some("hetzner".into()), ..Default::default() }).await.unwrap(), ["arena8-vm"]);
+        // The regression guard, now for every token: a typo (include OR exclude) is an
+        // error naming it and the closest pod — never a quietly smaller (or larger) set.
+        let e = names(&f, &args(&["arena8-zebrra"])).await.unwrap_err();
+        assert!(e.contains("`arena8-zebrra`: no pod has that name or id — did you mean arena8-zebra?"), "{e}");
+        let e = names(&f, &SelectArgs { exclude: vec!["aple".into()], ..Default::default() }).await.unwrap_err();
+        assert!(e.contains("--exclude `aple`: no pod has that name or id — did you mean arena8-apple?"), "{e}");
+        // A list name with no pod, and a narrowed-to-nothing selection, are errors too.
+        assert!(names(&f, &args(&["mayor"])).await.unwrap_err().contains("no pod named arena8-mayor right now"));
+        let e = names(&f, &SelectArgs { on: Some("vast".into()), ..Default::default() }).await.unwrap_err();
+        assert!(e.starts_with("nothing selected: all pods → 5, --on vast → 0"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn gpus_fetches_the_details_a_listing_omits() {
+        // cloud's list entry has no GPU count; `--gpus` enriches first, so it's found.
+        let f = fleet();
+        let two = SelectArgs { gpus: Some(2), ..Default::default() };
+        assert_eq!(names(&f, &two).await.unwrap(), ["arena8-bloom", "arena8-cloud"]);
+        // Still unknown after enriching (the VM): never matches.
+        let none = SelectArgs { gpus: Some(0), on: Some("hetzner".into()), ..Default::default() };
+        assert!(names(&f, &none).await.unwrap_err().contains("(1 with an unknown GPU count)"));
+    }
+
+    #[tokio::test]
+    async fn a_command_that_changes_pods_needs_names_or_all_before_listing() {
+        let f = fleet();
+        for a in [SelectArgs::default(), SelectArgs { gpus: Some(1), ..Default::default() }] {
+            let e = select(&f, &cfg(), &a, Unscoped::Refuse("stop")).await.unwrap_err().to_string();
+            assert_eq!(e, "name the pods to stop (names, ids or a range like apple..mayor), or pass --all");
+        }
+        // A malformed range fails before listing too.
+        assert!(select(&f, &cfg(), &args(&["cloud..apple"]), Unscoped::All).await.is_err());
+        assert_eq!(*f.lists.lock().unwrap(), 0, "nothing was listed");
+    }
+
+    #[tokio::test]
+    async fn stop_stops_exactly_the_selected_running_pods() {
+        let cases: &[(&[&str], &[&str])] = &[
+            (&["stop", "bloom", "apple"], &["apple", "bloom"]),
+            (&["stop", "apple..cloud", "--exclude", "bloom"], &["apple", "cloud"]),
+            // zebra is EXITED: skipped (said, not stopped); the VM is `running` (any case).
+            (&["stop", "--all"], &["apple", "bloom", "cloud", "vm"]),
+            (&["stop", "--all", "--on", "runpod", "--gpus", "2"], &["bloom", "cloud"]),
+            // the old spellings: one positional; `--all` narrowed by --include/--exclude
+            (&["stop", "arena8-apple"], &["apple"]),
+            (&["stop", "--all", "--include", "bloom", "--include", "cloud", "--exclude", "cloud"], &["bloom"]),
+            // a dry run stops nothing
+            (&["stop", "--all", "--dry-run"], &[]),
+        ];
+        for (argv, stopped) in cases {
+            let (f, r) = run_pods(argv).await;
+            r.unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            let got: Vec<String> = f.calls().into_iter().map(|(op, id)| format!("{op} {id}")).collect();
+            let want: Vec<String> = ids(stopped).into_iter().map(|id| format!("stop {id}")).collect();
+            assert_eq!(got, want, "{argv:?}");
+        }
+        for (argv, err) in [
+            (&["stop"][..], "name the pods to stop"),
+            (&["stop", "--exclude", "apple"], "name the pods to stop"),
+            (&["stop", "bloon"], "did you mean arena8-bloom?"),
+            (&["stop", "--all", "--exclude", "bloon"], "--exclude `bloon`"),
+            (&["stop", "apple", "--all"], "pass target names or --all, not both"),
+        ] {
+            let (f, r) = run_pods(argv).await;
+            let e = r.unwrap_err();
+            assert!(e.contains(err), "{argv:?}: {e}");
+            assert!(f.calls().is_empty(), "{argv:?}");
         }
     }
 
     #[tokio::test]
-    async fn include_matching_nothing_errors_not_silent() {
-        // The regression guard: a typo'd --include must fail loudly, not return an empty
-        // set that reads like "nothing to do".
-        let r = select_pods(&fleet(), &cfg(), &["arena8-zebrra".into()], &[], None).await;
-        assert!(r.is_err());
-        assert!(r.unwrap_err().to_string().contains("no pods matched --include"));
+    async fn reimage_reimages_exactly_the_selected_pods() {
+        // reimage refuses without a readable public key, so give it one.
+        let dir = std::env::temp_dir().join(format!("arena-sel-reimage-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("k"), "private").unwrap();
+        std::fs::write(dir.join("k.pub"), "ssh-ed25519 AAAAtest arena-test").unwrap();
+        let cfg = Config::parse(&format!(
+            "{}SHARED_SSH_KEY_PATH={}\nIMAGE=img:1\n",
+            "MACHINE_NAME_PREFIX=arena8\nMACHINE_NAME_LIST=(apple bloom cloud mayor vm zebra)\n",
+            dir.join("k").display()
+        ));
+        let cases: &[(&[&str], &[&str])] = &[
+            (&["reimage", "bloom", "zebra", "--skip-proxy"], &["bloom", "zebra"]),
+            (&["reimage", "--all", "--exclude", "apple..cloud", "--skip-proxy"], &["vm", "zebra"]),
+            (&["reimage", "apple..bloom", "--dry-run"], &[]),
+        ];
+        for (argv, reimaged) in cases {
+            let f = fleet();
+            handle_pods(pods_cmd(argv), &f, Arc::new(FakeRemote::new()), &cfg, true)
+                .await
+                .unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            let got: Vec<String> = f.calls().into_iter().map(|(op, id)| format!("{op} {id}")).collect();
+            let want: Vec<String> = ids(reimaged).into_iter().map(|id| format!("reimage {id}")).collect();
+            assert_eq!(got, want, "{argv:?}");
+        }
+        for argv in [&["reimage"][..], &["reimage", "--gpus", "1"], &["reimage", "appel"]] {
+            let f = fleet();
+            assert!(handle_pods(pods_cmd(argv), &f, Arc::new(FakeRemote::new()), &cfg, true).await.is_err(), "{argv:?}");
+            assert!(f.calls().is_empty(), "{argv:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
-    async fn no_filters_returns_all_sorted() {
-        let got = select_pods(&fleet(), &cfg(), &[], &[], None).await.unwrap();
-        assert_eq!(names(&got), ["arena8-apple", "arena8-bloom", "arena8-zebra"]);
+    async fn terminate_takes_one_pod_by_the_same_matcher() {
+        let (f, r) = run_pods(&["terminate", "bloom", "--skip-proxy"]).await;
+        r.unwrap();
+        assert_eq!(f.calls(), [("terminate", "id-arena8-bloom".to_string())]);
+        let (f, r) = run_pods(&["terminate", "id-arena8-apple", "--skip-proxy", "--dry-run"]).await;
+        r.unwrap();
+        assert!(f.calls().is_empty());
+        // No ranges, no `all` token, no typos, no ambiguity — and nothing terminated.
+        for (argv, err) in [
+            (&["terminate", "apple..cloud"][..], "takes one pod — `apple..cloud` is a range"),
+            (&["terminate", "all"], "`all` isn't accepted"),
+            (&["terminate", "blom"], "did you mean arena8-bloom?"),
+        ] {
+            let (f, r) = run_pods(argv).await;
+            assert!(r.unwrap_err().contains(err), "{argv:?}");
+            assert!(f.calls().is_empty(), "{argv:?}");
+        }
+        let mut f = fleet();
+        f.pods.push(Pod { id: "id-second-bloom".into(), ..f.pods[1].clone() });
+        let e = handle_pods(pods_cmd(&["terminate", "bloom"]), &f, Arc::new(FakeRemote::new()), &cfg(), true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("`bloom` matches 2 pods") && e.contains("id-second-bloom"), "{e}");
+        assert!(f.calls().is_empty());
+        // A target and --all together is refused by the parser (it used to mean "all").
+        assert!(parse(&["pods", "terminate", "apple", "--all"]).is_err());
     }
 
     #[tokio::test]
-    async fn exclude_then_include_then_status_compose() {
-        // exclude apple; include bloom+zebra; keep only RUNNING => bloom.
-        let got = select_pods(
-            &fleet(),
-            &cfg(),
-            &["arena8-bloom".into(), "arena8-zebra".into()],
-            &["arena8-apple".into()],
-            Some("RUNNING"),
-        )
-        .await
-        .unwrap();
-        assert_eq!(names(&got), ["arena8-bloom"]);
+    async fn keys_target_machine_names_with_or_without_a_pod() {
+        let f = fleet();
+        let keys = |a: SelectArgs| {
+            let f = &f;
+            async move { keys_targets(f, &cfg(), &a).await.map(|(n, live)| (n, live.pods.len())).map_err(|e| e.to_string()) }
+        };
+        // A range spans list names without a pod (mayor): a key can precede its pod.
+        assert_eq!(
+            keys(args(&["cloud..vm"])).await.unwrap(),
+            (vec!["arena8-cloud".to_string(), "arena8-mayor".into(), "arena8-vm".into()], 2)
+        );
+        // A spare list name alone (revoke a terminated pod's key) is fine; a typo is not.
+        assert_eq!(keys(args(&["mayor"])).await.unwrap(), (vec!["arena8-mayor".to_string()], 0));
+        assert!(keys(args(&["mayr"])).await.unwrap_err().contains("did you mean arena8-mayor?"));
+        // --all = every current pod (not the spare names), narrowed as usual.
+        let all = SelectArgs { all: true, exclude: vec!["vm".into()], ..Default::default() };
+        assert_eq!(keys(all).await.unwrap().0, ["arena8-apple", "arena8-bloom", "arena8-cloud", "arena8-zebra"]);
+        assert!(keys(SelectArgs::default()).await.unwrap_err().contains("name the machines"));
+        // Through the command (a dry run never reaches OpenRouter).
+        let cfg = Config::parse("MACHINE_NAME_PREFIX=arena8\nMACHINE_NAME_LIST=(apple bloom)\nOPENROUTER_PROVISIONING_KEY=test\n");
+        for argv in [&["keys", "gen", "apple..bloom", "--dry-run"][..], &["keys", "revoke", "--all", "--dry-run"]] {
+            let Cmd::Keys(k) = parse(argv).unwrap() else { unreachable!() };
+            handle_keys(k, &f, Arc::new(FakeRemote::new()), &cfg, true).await.unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+        }
+        let Cmd::Keys(k) = parse(&["keys", "rotate", "aple", "--dry-run"]).unwrap() else { unreachable!() };
+        assert!(handle_keys(k, &f, Arc::new(FakeRemote::new()), &cfg, true).await.unwrap_err().to_string().contains("did you mean"));
     }
 
-    #[tokio::test]
-    async fn bare_short_name_matches_via_prefix() {
-        // "bloom" should resolve to arena8-bloom through MACHINE_NAME_PREFIX.
-        let got = select_pods(&fleet(), &cfg(), &["bloom".into()], &[], None).await.unwrap();
-        assert_eq!(names(&got), ["arena8-bloom"]);
-    }
-
-    #[tokio::test]
-    async fn status_filter_matching_nothing_is_empty_not_error() {
-        // No --include here, so an all-stopped fleet legitimately yields an empty set
-        // (distinct from the typo case above) — must NOT error.
-        let got = select_pods(&fleet(), &cfg(), &[], &[], Some("PROVISIONING")).await.unwrap();
-        assert!(got.is_empty());
+    #[test]
+    fn every_old_spelling_still_parses() {
+        let ok: &[&[&str]] = &[
+            &["pods", "stop", "apple"],
+            &["pods", "stop", "--all", "--include", "apple", "--exclude", "bloom"],
+            &["pods", "reimage", "apple", "bloom"],
+            &["pods", "reimage", "--all", "--exclude", "apple"],
+            &["pods", "terminate", "apple"],
+            &["pods", "terminate", "--all"],
+            &["pods", "setup"],
+            &["pods", "setup", "bulk", "apple", "--dry-run"],
+            &["pods", "copy-keys", "apple", "--include", "bloom", "--exclude", "cloud"],
+            &["pods", "cp", "f.txt", "--include", "apple", "--exclude", "bloom"],
+            &["pods", "cp", "f.txt", "/root/x/", "-r"],
+            &["pods", "backup"],
+            &["pods", "backup", "apple", "--no-pull"],
+            &["pods", "set-branch", "main", "apple"],
+            &["pods", "set-branch", "main", "--all", "--hard"],
+            &["pods", "init-branches", "--week", "1", "--day", "2"],
+            &["pods", "pull", "w1d2", "--dry-run"],
+            &["pods", "run", "nvidia-smi", "-L"],
+            &["pods", "test"],
+            &["pods", "test", "--deep", "apple", "--json"],
+            &["keys", "gen", "apple", "bloom", "--limit", "5"],
+            &["keys", "gen", "--all", "--copy"],
+            &["keys", "rotate", "apple"],
+            &["keys", "rotate", "--all"],
+            &["keys", "revoke", "apple"],
+            &["keys", "revoke", "--all"],
+            // and the new syntax
+            &["pods", "run", "-t", "apple..mayor", "--exclude", "bloom", "--gpus", "2", "--on", "runpod", "nvidia-smi"],
+            &["pods", "run", "--target", "apple,bloom", "--target", "cloud", "echo", "hi"],
+            &["pods", "cp", "f.txt", "-t", "apple"],
+            &["pods", "pull", "-t", "apple..bloom"],
+            &["pods", "test", "all", "--on", "vast"],
+            &["pods", "init-branches", "apple", "bloom"],
+            &["pods", "backup", "apple..cloud", "--exclude", "bloom"],
+        ];
+        for argv in ok {
+            parse(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+        }
+        // `run`'s targets are flags: everything after the command is the command.
+        match parse(&["pods", "run", "-t", "apple", "echo", "-t", "x"]).unwrap() {
+            Cmd::Pods(PodCmd::Run { sel, command, .. }) => {
+                assert_eq!((sel.targets, command), (vec!["apple".to_string()], vec!["echo".into(), "-t".into(), "x".into()]));
+            }
+            _ => panic!("not pods run"),
+        }
+        // The legacy narrowing of --all by --include, and the parsed selection itself.
+        let Cmd::Pods(PodCmd::Stop { sel, .. }) = parse(&["pods", "stop", "--all", "--include", "apple"]).unwrap() else {
+            panic!("not pods stop")
+        };
+        assert_eq!(sel.args(), SelectArgs { targets: vec!["apple".into()], ..Default::default() });
+        let Cmd::Keys(KeysCmd::Gen { sel, .. }) = parse(&["keys", "gen", "apple", "--on", "runpod"]).unwrap() else {
+            panic!("not keys gen")
+        };
+        assert_eq!(sel.args(), SelectArgs { targets: vec!["apple".into()], on: Some("runpod".into()), ..Default::default() });
+        for bad in [&["pods", "terminate", "apple", "--all"][..], &["pods", "run", "--gpus", "two", "x"]] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
     }
 }
 
@@ -7476,7 +7780,7 @@ mod list_tests {
 /// budget — not at the hang.
 #[cfg(test)]
 mod setup_tests {
-    use super::{handle_copy_keys, handle_setup, provision_fleet, SetupJob, COPY_KEYS_TIMEOUT};
+    use super::{handle_copy_keys, handle_pods, handle_setup, provision_fleet, Cli, Cmd, Selected, SetupJob, COPY_KEYS_TIMEOUT};
     use arena_core::remote::{FakeRemote, FakeReply, Remote, RemoteCall};
     use arena_core::setup::{provisioning_steps, BootRetry, SetupConfig, SetupTimeouts};
     use arena_core::ssh::{SshOutput, SshTarget};
@@ -7589,6 +7893,11 @@ mod setup_tests {
         Fleet(vec![pod("devtest-apple", 22001), pod("devtest-bloom", 22002), pod("devtest-cloud", 22003)])
     }
 
+    /// The whole test fleet, nothing named.
+    fn everyone() -> Selected {
+        Selected::all(fleet().0)
+    }
+
     fn setup_cfg(extra: &str) -> Config {
         Config::parse(&format!(
             "MACHINE_NAME_PREFIX=devtest\nARENA_REPO_OWNER=o\nARENA_REPO_NAME=r\n\
@@ -7643,7 +7952,7 @@ mod setup_tests {
         fake.script("10.0.0.1:22002", [FakeReply::ok(), FakeReply::hang()]);
         let start = Instant::now();
         let cfg = setup_cfg("SETUP_TIMEOUT_SECS=120");
-        let err = handle_setup(&fleet(), fake.clone(), &cfg, true, false, None, None, false, budgets(&cfg, None), None, NO_KEYS)
+        let err = handle_setup(fake.clone(), &cfg, true, false, None, None, false, budgets(&cfg, None), &everyone(), NO_KEYS)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("1 pod(s) failed to set up"), "{err}");
@@ -7663,9 +7972,9 @@ mod setup_tests {
     #[tokio::test(start_paused = true)]
     async fn handle_setup_timeout_flag_wins_and_names_scope_the_run() {
         let fake = Arc::new(FakeRemote::new());
-        let only = vec!["devtest-apple".to_string()];
+        let only = Selected { pods: vec![fleet().0.remove(0)], named: true };
         let cfg = setup_cfg("SETUP_TIMEOUT_SECS=120");
-        handle_setup(&fleet(), fake.clone(), &cfg, true, false, None, None, false, budgets(&cfg, Some(45)), Some(&only), NO_KEYS)
+        handle_setup(fake.clone(), &cfg, true, false, None, None, false, budgets(&cfg, Some(45)), &only, NO_KEYS)
             .await
             .unwrap();
         let calls = fake.calls();
@@ -7699,7 +8008,7 @@ mod setup_tests {
         let cfg = setup_cfg("SETUP_TIMEOUT_SECS=120");
         let start = Instant::now();
         let keys = dir.to_string_lossy();
-        let err = handle_setup(&fleet(), fake.clone(), &cfg, true, false, None, None, false, budgets(&cfg, None), None, &keys)
+        let err = handle_setup(fake.clone(), &cfg, true, false, None, None, false, budgets(&cfg, None), &everyone(), &keys)
             .await
             .unwrap_err();
         let _ = std::fs::remove_dir_all(&dir);
@@ -7727,7 +8036,7 @@ mod setup_tests {
         let cfg = setup_cfg("");
         let start = Instant::now();
         let keys = dir.to_string_lossy().into_owned();
-        handle_setup(&fleet(), fake.clone(), &cfg, true, false, None, None, false, budgets(&cfg, None), None, &keys)
+        handle_setup(fake.clone(), &cfg, true, false, None, None, false, budgets(&cfg, None), &everyone(), &keys)
             .await
             .unwrap();
         assert_eq!(start.elapsed(), COPY_KEYS_TIMEOUT);
@@ -7739,7 +8048,7 @@ mod setup_tests {
         let fake = Arc::new(FakeRemote::new());
         fake.script("10.0.0.1:22003", [FakeReply::hang()]);
         let start = Instant::now();
-        let err = handle_copy_keys(&fleet(), fake.clone(), &cfg, &keys, None, None, &[], &[], false, true)
+        let err = handle_copy_keys(fake.clone(), &cfg, &keys, None, None, &everyone(), false, true)
             .await
             .unwrap_err();
         let _ = std::fs::remove_dir_all(&dir);
@@ -7766,6 +8075,60 @@ mod setup_tests {
             assert!(fake.calls().is_empty(), "nothing reached a pod");
             assert!(err.to_string().contains("SETUP_TIMEOUT_SECS"), "migrate copy (dry_run={dry_run}): {err}");
         }
+    }
+
+    /// `pods <args…>` parsed as the CLI would.
+    fn pods(args: &[&str]) -> super::PodCmd {
+        use clap::Parser;
+        let argv = ["arena", "pods"].iter().chain(args).copied();
+        match Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{args:?}: {e}")).cmd {
+            Cmd::Pods(p) => p,
+            _ => unreachable!(),
+        }
+    }
+
+    /// The hosts (`ip:port`) that got any call, sorted.
+    fn hosts(fake: &FakeRemote) -> Vec<String> {
+        let mut h: Vec<String> = fake.calls().iter().map(|c| c.host().to_string()).collect();
+        h.sort();
+        h.dedup();
+        h
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn setup_and_copy_keys_run_on_exactly_the_selected_pods() {
+        // PLAN 1.C through the commands: the shared selector decides who is provisioned /
+        // gets keys — names, ranges, --exclude — and a typo touches nobody.
+        let dir = keys_dir("select");
+        let keys = dir.to_string_lossy().into_owned();
+        let cfg = setup_cfg("MACHINE_NAME_LIST=(apple bloom cloud)\n");
+        let cases: &[(&[&str], &[u16])] = &[
+            (&["setup", "apple", "cloud"], &[22001, 22003]),
+            (&["setup", "bloom..cloud", "--exclude", "cloud"], &[22002]),
+            (&["setup", "--include", "apple"], &[22001]), // the old spelling
+        ];
+        for (args, ports) in cases {
+            let fake = Arc::new(FakeRemote::new());
+            handle_pods(pods(args), &fleet(), fake.clone(), &cfg, true).await.unwrap_or_else(|e| panic!("{args:?}: {e}"));
+            let want: Vec<String> = ports.iter().map(|p| format!("10.0.0.1:{p}")).collect();
+            assert_eq!(hosts(&fake), want, "{args:?}");
+        }
+        for (args, ports) in [
+            (vec!["copy-keys", "--keys-dir", keys.as_str(), "--all", "--exclude", "bloom"], [22001, 22003]),
+            (vec!["copy-keys", "--keys-dir", keys.as_str(), "apple", "--include", "cloud"], [22001, 22003]),
+        ] {
+            let fake = Arc::new(FakeRemote::new());
+            handle_pods(pods(&args), &fleet(), fake.clone(), &cfg, true).await.unwrap_or_else(|e| panic!("{args:?}: {e}"));
+            let want: Vec<String> = ports.iter().map(|p| format!("10.0.0.1:{p}")).collect();
+            assert_eq!(hosts(&fake), want, "{args:?}");
+        }
+        for args in [&["setup", "apple", "clod"][..], &["copy-keys", "--exclude", "bloon"]] {
+            let fake = Arc::new(FakeRemote::new());
+            let err = handle_pods(pods(args), &fleet(), fake.clone(), &cfg, true).await.unwrap_err().to_string();
+            assert!(err.contains("matched no pod") && err.contains("did you mean devtest-"), "{args:?}: {err}");
+            assert!(fake.calls().is_empty(), "{args:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -9148,10 +9511,11 @@ mod remote_tests {
         backup_fleet, copy_pod_files, copy_to_pod, cp_timeout, deep_check_fleet, duplicate_names, each_pod,
         handle_backup, handle_copy, handle_deep_test, handle_init_branches,
         handle_pods, handle_run, handle_set_branch, local_size, marker_present, probe_gpus, proxy_reaches_pod,
-        render_deep_test, render_run, replace_copy_failed, run_fleet, target_is_pod, BackupTally, Cli, Cmd, CopyPlan,
-        PodCmd, RunResult, BACKUP_TIMEOUT, BRANCH_TIMEOUT, CP_BASE_TIMEOUT, POD_COPY_TIMEOUT, RUN_TIMEOUT_SECS,
-        TEST_TIMEOUT,
+        render_deep_test, render_run, replace_copy_failed, run_fleet, select, target_is_pod, BackupTally, Cli, Cmd,
+        CopyPlan, PodCmd, RunResult, Select, SelectByFlag, Selected, Unscoped, BACKUP_TIMEOUT, BRANCH_TIMEOUT,
+        CP_BASE_TIMEOUT, POD_COPY_TIMEOUT, RUN_TIMEOUT_SECS, TEST_TIMEOUT,
     };
+    use arena_core::selector::SelectArgs;
     use arena_core::backup::{backup_command, checkout_command, init_branch_command, BackupConfig};
     use arena_core::remote::{FakeRemote, FakeReply, Remote, RemoteCall, PROBE_TIMEOUT};
     use arena_core::ssh::{login_shell_wrap, SshTarget};
@@ -9236,6 +9600,34 @@ mod remote_tests {
         f.pods.iter().map(|p| (p.name.clone(), SshTarget::from_pod(p, &cfg()).unwrap())).collect()
     }
 
+    /// The whole fleet, nothing named (what a bare `pods run` / `pods backup` resolves to).
+    fn everyone(f: &Fleet) -> Selected {
+        Selected::all(f.pods.clone())
+    }
+
+    /// `targets` resolved against `f` by the shared selector, as the command would.
+    async fn picked(f: &Fleet, cfg: &Config, targets: &[&str]) -> Selected {
+        select(f, cfg, &SelectArgs::exact(targets.iter().copied()), Unscoped::All).await.unwrap()
+    }
+
+    /// `pods <args…>` parsed as the CLI would.
+    fn pods(args: &[&str]) -> PodCmd {
+        let argv = ["arena", "pods"].iter().chain(args).copied();
+        match Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{args:?}: {e}")).cmd {
+            Cmd::Pods(p) => p,
+            _ => unreachable!(),
+        }
+    }
+
+    /// The ports that got any call, sorted.
+    fn ports(fake: &FakeRemote) -> Vec<u16> {
+        let mut p: Vec<u16> =
+            fake.calls().iter().filter_map(|c| c.host().rsplit_once(':').and_then(|(_, p)| p.parse().ok())).collect();
+        p.sort();
+        p.dedup();
+        p
+    }
+
     /// The (cmd, timeout) of every exec made to one host, in order.
     fn execs(fake: &FakeRemote, port: u16) -> Vec<(String, Option<Duration>)> {
         fake.calls_to(&host(port))
@@ -9261,7 +9653,7 @@ mod remote_tests {
         // Through the command: one wrapped exec per pod with the given budget; non-zero exit.
         let fake = Arc::new(FakeRemote::new());
         script(&fake);
-        let err = handle_run(&fleet(), fake.clone(), &cfg(), "nvidia-smi -L", Duration::from_secs(60), false, true, true, false)
+        let err = handle_run(fake.clone(), &cfg(), &everyone(&fleet()), "nvidia-smi -L", Duration::from_secs(60), false, true, true, false)
             .await
             .unwrap_err();
         assert_eq!(err.to_string(), "1 pod(s) failed");
@@ -9307,6 +9699,57 @@ mod remote_tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn ssh_fleet_commands_reach_exactly_the_selected_pods() {
+        // PLAN 1.C through each SSH command family: the shared selector decides which pods
+        // are reached — names, ranges, --exclude, `-t` for `run` — and nothing else is.
+        let cfg = Config::parse(&format!(
+            "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple bloom cloud)\nBACKUP_REPO_PATH={REPO}\n\
+             GIT_SSH_KEY_REMOTE={KEY}\nSHARED_SSH_KEY_PATH=/nonexistent/devtest_key\n"
+        ));
+        let cases: &[(&[&str], &[u16])] = &[
+            (&["run", "-t", "apple,cloud", "true"], &[22001, 22003]),
+            (&["run", "-t", "bloom..cloud", "--", "true"], &[22002, 22003]),
+            (&["run", "--exclude", "bloom", "true"], &[22001, 22003]),
+            (&["test", "bloom"], &[22002]),
+            (&["test", "--deep", "apple..bloom"], &[22001, 22002]),
+            (&["backup", "apple", "--no-pull"], &[22001]),
+            (&["backup", "--exclude", "apple", "--no-pull"], &[22002, 22003]),
+            (&["init-branches", "cloud", "--week", "1", "--day", "2"], &[22003]),
+            (&["set-branch", "main", "apple", "cloud"], &[22001, 22003]),
+            (&["set-branch", "main", "--all", "--exclude", "bloom..cloud"], &[22001]),
+        ];
+        for (argv, want) in cases {
+            let fake = Arc::new(FakeRemote::new());
+            // `test --deep` on an empty reply FAILs its pods; only who was reached matters here.
+            let _ = handle_pods(pods(argv), &fleet(), fake.clone(), &cfg, true).await;
+            assert_eq!(ports(&fake), *want, "{argv:?}");
+        }
+        // Typos, a reversed range, a bad --on and a missing scope reach nobody.
+        for argv in [
+            &["run", "-t", "aple", "true"][..],
+            &["backup", "--exclude", "clod", "--no-pull"],
+            &["test", "--deep", "cloud..apple"],
+            &["init-branches", "--on", "aws"],
+            &["set-branch", "main"],
+        ] {
+            let fake = Arc::new(FakeRemote::new());
+            assert!(handle_pods(pods(argv), &fleet(), fake.clone(), &cfg, true).await.is_err(), "{argv:?}");
+            assert!(fake.calls().is_empty(), "{argv:?}");
+        }
+        // A named pod without an endpoint fails the command; swept in by default, it's skipped.
+        let mut f = fleet();
+        f.pods[0].ssh_port = None;
+        let fake = Arc::new(FakeRemote::new());
+        let err = handle_pods(pods(&["run", "-t", "apple", "true"]), &f, fake.clone(), &cfg, true).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "none of the selected pods (devtest-apple) has an SSH endpoint yet — check `arena pods list`"
+        );
+        handle_pods(pods(&["run", "true"]), &f, fake.clone(), &cfg, true).await.unwrap();
+        assert_eq!(ports(&fake), [22002, 22003]);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_hanging_pod_times_out_while_the_others_finish() {
         let fake = Arc::new(FakeRemote::new());
         fake.script(&host(22002), [FakeReply::hang()]);
@@ -9326,7 +9769,7 @@ mod remote_tests {
         let fake = Arc::new(FakeRemote::new());
         fake.script(&host(22003), [FakeReply::hang()]);
         let start = Instant::now();
-        let plain = PodCmd::Test { deep: false, names: vec![], json: false, verbose: false };
+        let plain = PodCmd::Test { deep: false, sel: Select::default(), json: false, verbose: false };
         let err = handle_pods(plain, &fleet(), fake.clone(), &cfg(), true).await.unwrap_err();
         assert_eq!(err.to_string(), "1 pod(s) failed");
         assert_eq!(start.elapsed(), TEST_TIMEOUT);
@@ -9335,14 +9778,14 @@ mod remote_tests {
 
         // `pods run --timeout 45`.
         let fake = Arc::new(FakeRemote::new());
-        let run = PodCmd::Run { command: vec!["nvidia-smi".into()], timeout: 45, dry_run: false };
+        let run = PodCmd::Run { sel: SelectByFlag::default(), command: vec!["nvidia-smi".into()], timeout: 45, dry_run: false };
         handle_pods(run, &fleet(), fake.clone(), &cfg(), true).await.unwrap();
         assert_eq!(fake.calls().len(), 3);
         assert!(fake.calls().iter().all(|c| matches!(c, RemoteCall::Exec { timeout, .. } if *timeout == Some(Duration::from_secs(45)))));
 
         // A dry run reaches no pod.
         let fake = Arc::new(FakeRemote::new());
-        let run = PodCmd::Run { command: vec!["reboot".into()], timeout: 45, dry_run: true };
+        let run = PodCmd::Run { sel: SelectByFlag::default(), command: vec!["reboot".into()], timeout: 45, dry_run: true };
         handle_pods(run, &fleet(), fake.clone(), &cfg(), true).await.unwrap();
         assert!(fake.calls().is_empty());
     }
@@ -9401,7 +9844,7 @@ mod remote_tests {
         // Through the command: each pod's own commit message, the budget, a non-zero result.
         let fake = Arc::new(FakeRemote::new());
         fake.script(&host(22002), [FakeReply::exit(1, "boom")]);
-        let err = handle_backup(&fleet(), fake.clone(), &cfg(), true, None, None).await.unwrap_err();
+        let err = handle_backup(fake.clone(), &cfg(), true, None, &everyone(&fleet())).await.unwrap_err();
         assert_eq!(err.to_string(), "1 pod(s) failed to back up");
         for (name, port) in [("apple", 22001), ("bloom", 22002), ("cloud", 22003)] {
             let want = backup_command(REPO, Some(KEY), &format!("arena backup devtest-{name}"));
@@ -9409,18 +9852,18 @@ mod remote_tests {
         }
         // Dry run: nothing reaches a pod.
         let fake = Arc::new(FakeRemote::new());
-        handle_backup(&fleet(), fake.clone(), &cfg(), false, None, None).await.unwrap();
+        handle_backup(fake.clone(), &cfg(), false, None, &everyone(&fleet())).await.unwrap();
         assert!(fake.calls().is_empty());
     }
 
     #[tokio::test(start_paused = true)]
     async fn set_branch_dry_run_runs_nothing_and_apply_runs_the_checkout_on_each_pod() {
         let fake = Arc::new(FakeRemote::new());
-        handle_set_branch(&fleet(), fake.clone(), &cfg(), "main", None, true, false, true, true).await.unwrap();
+        handle_set_branch(fake.clone(), &cfg(), "main", &everyone(&fleet()), false, true, true).await.unwrap();
         assert!(fake.calls().is_empty(), "dry run: {:?}", fake.calls());
 
         // Gentle, whole fleet: the ff-only checkout on every pod, within the budget.
-        handle_set_branch(&fleet(), fake.clone(), &cfg(), "main", None, true, false, false, true).await.unwrap();
+        handle_set_branch(fake.clone(), &cfg(), "main", &everyone(&fleet()), false, false, true).await.unwrap();
         let gentle = checkout_command(REPO, "main", Some(KEY), false);
         for port in [22001, 22002, 22003] {
             assert_eq!(execs(&fake, port), [(gentle.clone(), Some(BRANCH_TIMEOUT))], "port {port}");
@@ -9428,7 +9871,7 @@ mod remote_tests {
 
         // --hard on one pod: only that pod, the destructive command.
         let fake = Arc::new(FakeRemote::new());
-        handle_set_branch(&fleet(), fake.clone(), &cfg(), "main", Some("bloom"), false, true, false, true).await.unwrap();
+        handle_pods(pods(&["set-branch", "main", "bloom", "--hard"]), &fleet(), fake.clone(), &cfg(), true).await.unwrap();
         let hard = checkout_command(REPO, "main", Some(KEY), true);
         assert!(hard.contains("reset --hard"));
         assert_eq!(fake.calls().len(), 1);
@@ -9439,7 +9882,7 @@ mod remote_tests {
         fake.script(&host(22001), [FakeReply::hang()]);
         let start = Instant::now();
         let err =
-            handle_set_branch(&fleet(), fake.clone(), &cfg(), "main", None, true, false, false, true).await.unwrap_err();
+            handle_set_branch(fake.clone(), &cfg(), "main", &everyone(&fleet()), false, false, true).await.unwrap_err();
         assert_eq!(err.to_string(), "1 pod(s) failed to switch branch");
         assert_eq!(start.elapsed(), BRANCH_TIMEOUT);
         assert_eq!(fake.calls().len(), 3);
@@ -9449,7 +9892,7 @@ mod remote_tests {
     async fn init_branches_runs_each_pods_branch_command_within_the_budget() {
         let fake = Arc::new(FakeRemote::new());
         fake.script(&host(22003), [FakeReply::exit(1, "error: failed to push some refs")]);
-        let err = handle_init_branches(&fleet(), fake.clone(), &cfg(), Some(1), Some(2), false, true).await.unwrap_err();
+        let err = handle_init_branches(fake.clone(), &cfg(), Some(1), Some(2), &everyone(&fleet()), false, true).await.unwrap_err();
         assert_eq!(err.to_string(), "1 pod(s) failed to init branch");
         let bcfg = BackupConfig::from_config(&cfg(), 1, 2);
         for (name, port) in [("apple", 22001), ("bloom", 22002), ("cloud", 22003)] {
@@ -9458,7 +9901,7 @@ mod remote_tests {
             assert_eq!(execs(&fake, port), [(want, Some(BRANCH_TIMEOUT))]);
         }
         let fake = Arc::new(FakeRemote::new());
-        handle_init_branches(&fleet(), fake.clone(), &cfg(), Some(1), Some(2), true, true).await.unwrap();
+        handle_init_branches(fake.clone(), &cfg(), Some(1), Some(2), &everyone(&fleet()), true, true).await.unwrap();
         assert!(fake.calls().is_empty(), "dry run");
     }
 
@@ -9483,7 +9926,7 @@ mod remote_tests {
         fake.script(&host(22003), [FakeReply::ok(), FakeReply::exit(1, "scp: /root/x/hello.txt: No space left on device")]);
         fake.script(&host(22004), [FakeReply::ok(), FakeReply::hang()]);
         let start = Instant::now();
-        let err = handle_copy(&f, fake.clone(), &cfg(), &file.0, Some("/root/x/hello.txt"), false, &[], &[], None, false, true)
+        let err = handle_copy(fake.clone(), &cfg(), &file.0, Some("/root/x/hello.txt"), false, &everyone(&f), None, false, true)
             .await
             .unwrap_err();
         assert_eq!(err.to_string(), "3 pod(s) failed to receive the file");
@@ -9510,11 +9953,11 @@ mod remote_tests {
         assert_eq!(fake.calls_to(&host(22004))[1], copy(22004));
         assert_eq!(fake.calls_to(&host(22004)).len(), 2);
 
-        // `-r`: the tree goes through copy_recursive, with no single-file size check.
+        // `-r`: the tree goes through copy_recursive, with no single-file size check (and
+        // `-t` scopes it to one pod).
         let fake = Arc::new(FakeRemote::new());
-        handle_copy(&f, fake.clone(), &cfg(), &file.0, Some("/root/x/"), true, &["apple".into()], &[], None, false, true)
-            .await
-            .unwrap();
+        let local = file.0.to_str().unwrap();
+        handle_pods(pods(&["cp", "-r", "-t", "apple", local, "/root/x/"]), &f, fake.clone(), &cfg(), true).await.unwrap();
         assert!(matches!(
             &fake.calls()[..],
             [RemoteCall::Exec { cmd, .. }, RemoteCall::Copy { recursive: true, remote, .. }] if cmd == "mkdir -p '/root/x'" && remote == "/root/x/"
@@ -9603,7 +10046,7 @@ mod remote_tests {
         fake.script(&host(22001), [FakeReply::ok(), FakeReply::hang()]);
         fake.script(&host(22002), [FakeReply::ok(), FakeReply::ok(), FakeReply::stdout("OK 3000000")]);
         let start = Instant::now();
-        let err = handle_copy(&f, fake.clone(), &cfg(), &file.0, Some("/root/x.bin"), false, &[], &[], None, false, true)
+        let err = handle_copy(fake.clone(), &cfg(), &file.0, Some("/root/x.bin"), false, &everyone(&f), None, false, true)
             .await
             .unwrap_err();
         assert_eq!(err.to_string(), "1 pod(s) failed to receive the file");
@@ -9616,7 +10059,7 @@ mod remote_tests {
         fake.script(&host(22001), [FakeReply::ok(), FakeReply::hang()]);
         let start = Instant::now();
         let flag = Some(Duration::from_secs(30));
-        handle_copy(&f, fake.clone(), &cfg(), &file.0, Some("/root/x.bin"), false, &[], &[], flag, false, true)
+        handle_copy(fake.clone(), &cfg(), &file.0, Some("/root/x.bin"), false, &everyone(&f), flag, false, true)
             .await
             .unwrap_err();
         assert_eq!(start.elapsed(), Duration::from_secs(30));
@@ -9839,7 +10282,7 @@ deep_check_end=1
         script_deep(&fake);
         let remote: Arc<dyn Remote> = fake.clone();
         let start = Instant::now();
-        let results = deep_check_fleet(&fleet(), &remote, &deep_cfg(), &[]).await.unwrap();
+        let results = deep_check_fleet(&fleet(), &remote, &deep_cfg(), &everyone(&fleet())).await.unwrap();
         assert_eq!(start.elapsed(), DEEP_CHECK_TIMEOUT, "ends at the hung pod's budget, not the hang");
 
         // One exec per pod: the script (base64, inside the conda login wrap), bounded.
@@ -9888,7 +10331,7 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
     #[tokio::test(start_paused = true)]
     async fn pods_test_deep_exit_status_follows_failures_not_warnings() {
         use arena_core::health::DEEP_CHECK_TIMEOUT;
-        let deep = |json: bool| PodCmd::Test { deep: true, names: vec![], json, verbose: false };
+        let deep = |json: bool| PodCmd::Test { deep: true, sel: Select::default(), json, verbose: false };
         // Any FAIL fails the command (table or JSON), at the hung pod's budget.
         for json in [false, true] {
             let fake = Arc::new(FakeRemote::new());
@@ -9907,12 +10350,12 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
         };
         let fake = Arc::new(FakeRemote::new());
         script_slow(&fake);
-        handle_deep_test(&fleet(), fake.clone(), &deep_cfg(), &[], false, true).await.unwrap();
+        handle_deep_test(&fleet(), fake.clone(), &deep_cfg(), &everyone(&fleet()), false, true).await.unwrap();
         // ...and bloom really was a warning, not a pass.
         let fake = Arc::new(FakeRemote::new());
         script_slow(&fake);
         let remote: Arc<dyn Remote> = fake.clone();
-        let results = deep_check_fleet(&fleet(), &remote, &deep_cfg(), &[]).await.unwrap();
+        let results = deep_check_fleet(&fleet(), &remote, &deep_cfg(), &everyone(&fleet())).await.unwrap();
         assert_eq!(results[1].status, arena_core::health::Status::Warn, "{:#?}", results[1].checks);
         // A malformed MIN_DRIVER_VERSION fails before any pod is reached.
         let fake = Arc::new(FakeRemote::new());
@@ -9926,19 +10369,20 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
     async fn pods_test_deep_names_scope_the_run_and_report_unreachable_pods() {
         use arena_core::health::Status;
         let remote = |fake: &Arc<FakeRemote>| -> Arc<dyn Remote> { fake.clone() };
-        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
         // Bare, full and id forms; only those pods are reached.
         let fake = Arc::new(FakeRemote::new());
-        let results =
-            deep_check_fleet(&fleet(), &remote(&fake), &deep_cfg(), &names(&["bloom", "id-devtest-cloud"])).await.unwrap();
+        let sel = picked(&fleet(), &deep_cfg(), &["bloom", "id-devtest-cloud"]).await;
+        let results = deep_check_fleet(&fleet(), &remote(&fake), &deep_cfg(), &sel).await.unwrap();
         assert_eq!(results.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(), ["devtest-bloom", "devtest-cloud"]);
         assert!(fake.calls_to(&host(22001)).is_empty());
 
-        // A typo fails loudly, touching nothing.
+        // A typo fails loudly (through the command), touching nothing.
         let fake = Arc::new(FakeRemote::new());
-        let err = deep_check_fleet(&fleet(), &remote(&fake), &deep_cfg(), &names(&["apple", "nope"])).await.unwrap_err();
-        assert!(err.to_string().contains("\"nope\""), "{err}");
+        let err = handle_pods(pods(&["test", "--deep", "apple", "nope"]), &fleet(), fake.clone(), &deep_cfg(), true)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("`nope`: no pod has that name or id"), "{err}");
         assert!(fake.calls().is_empty());
 
         // A named pod with no endpoint yet is a FAIL (it was asked about), never silently
@@ -9949,8 +10393,8 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
         let fake = Arc::new(FakeRemote::new());
         fake.script(&host(22002), [FakeReply::exit(255, "ssh: connect to host 10.0.0.1 port 22002: Connection refused\n")]);
         fake.script(&host(22003), [FakeReply::exit(0, "\nzsh:1: command not found: base64\n")]);
-        let results =
-            deep_check_fleet(&f, &remote(&fake), &deep_cfg(), &names(&["apple", "bloom", "cloud"])).await.unwrap();
+        let sel = picked(&f, &deep_cfg(), &["apple", "bloom", "cloud"]).await;
+        let results = deep_check_fleet(&f, &remote(&fake), &deep_cfg(), &sel).await.unwrap();
         let got: Vec<(&str, Status, &str, &str)> = results
             .iter()
             .map(|h| (h.name.as_str(), h.status, h.checks[0].name.as_str(), h.checks[0].detail.as_str()))
@@ -9980,7 +10424,7 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
         for port in [22002, 22003] {
             fake.script(&host(port), all.clone());
         }
-        let results = deep_check_fleet(&f, &remote(&fake), &deep_cfg(), &[]).await.unwrap();
+        let results = deep_check_fleet(&f, &remote(&fake), &deep_cfg(), &everyone(&f)).await.unwrap();
         assert_eq!(results.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(), ["devtest-bloom", "devtest-cloud"]);
     }
 
@@ -10001,7 +10445,7 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
             };
             script(&fake);
             let remote: Arc<dyn Remote> = fake.clone();
-            let results = deep_check_fleet(&f, &remote, &deep_cfg(), &[]).await.unwrap();
+            let results = deep_check_fleet(&f, &remote, &deep_cfg(), &everyone(&f)).await.unwrap();
             let got: Vec<(&str, &str, Status)> =
                 results.iter().map(|h| (h.id.as_str(), h.name.as_str(), h.status)).collect();
             let verdict = |port| if port == healthy_port { Status::Pass } else { Status::Fail };
@@ -10011,7 +10455,7 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
                 "broken_first={broken_first}"
             );
             script(&fake);
-            let err = handle_deep_test(&f, fake.clone(), &deep_cfg(), &[], false, false).await.unwrap_err();
+            let err = handle_deep_test(&f, fake.clone(), &deep_cfg(), &everyone(&f), false, false).await.unwrap_err();
             assert_eq!(err.to_string(), "1 pod(s) failed the deep check");
         }
         assert_eq!(
@@ -10034,7 +10478,7 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
         let fake = Arc::new(FakeRemote::new());
         script_deep(&fake);
         let remote: Arc<dyn Remote> = fake.clone();
-        let results = deep_check_fleet(&fleet(), &remote, &deep_cfg(), &[]).await.unwrap();
+        let results = deep_check_fleet(&fleet(), &remote, &deep_cfg(), &everyone(&fleet())).await.unwrap();
         let (out, err) = render_deep_test(&results, true, false).unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v.as_array().unwrap().len(), 3);
@@ -10042,7 +10486,7 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
         // An empty fleet through the command itself: no failure, nothing reached.
         let empty = Fleet { kind: "runpod", pods: vec![] };
         let fake = Arc::new(FakeRemote::new());
-        handle_deep_test(&empty, fake.clone(), &deep_cfg(), &[], true, false).await.unwrap();
+        handle_deep_test(&empty, fake.clone(), &deep_cfg(), &everyone(&empty), true, false).await.unwrap();
         assert!(fake.calls().is_empty());
     }
 
@@ -10051,17 +10495,24 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
         let parse = |args: &[&str]| Cli::try_parse_from(args).map(|c| c.cmd);
         assert!(matches!(
             parse(&["arena", "pods", "test"]).unwrap(),
-            Cmd::Pods(PodCmd::Test { deep: false, ref names, json: false, verbose: false }) if names.is_empty()
+            Cmd::Pods(PodCmd::Test { deep: false, ref sel, json: false, verbose: false }) if sel.targets.is_empty()
         ));
         match parse(&["arena", "pods", "test", "--deep", "apple", "bloom", "--json", "-v"]).unwrap() {
-            Cmd::Pods(PodCmd::Test { deep, names, json, verbose }) => {
+            Cmd::Pods(PodCmd::Test { deep, sel, json, verbose }) => {
                 assert!(deep && json && verbose);
-                assert_eq!(names, ["apple", "bloom"]);
+                assert_eq!(sel.targets, ["apple", "bloom"]);
             }
             _ => panic!("not pods test"),
         }
-        // Names/--json/-v belong to --deep; plain `pods test` stays the torch check.
-        for args in [&["arena", "pods", "test", "apple"][..], &["arena", "pods", "test", "--json"], &["arena", "pods", "test", "-v"]] {
+        // Plain `pods test` (the torch check) takes targets too now (PLAN 1.C) …
+        match parse(&["arena", "pods", "test", "apple..bloom", "--exclude", "cloud"]).unwrap() {
+            Cmd::Pods(PodCmd::Test { deep: false, sel, .. }) => {
+                assert_eq!((sel.targets, sel.opts.exclude), (vec!["apple..bloom".to_string()], vec!["cloud".to_string()]));
+            }
+            _ => panic!("not pods test"),
+        }
+        // … but --json/-v still belong to --deep.
+        for args in [&["arena", "pods", "test", "--json"][..], &["arena", "pods", "test", "-v"]] {
             assert!(parse(args).is_err(), "{args:?}");
         }
     }

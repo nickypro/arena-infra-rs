@@ -24,6 +24,7 @@ pub mod pull;
 pub mod remote;
 pub mod retry;
 pub mod schedule;
+pub mod selector;
 pub mod setup;
 pub mod sshconfig;
 pub mod ssh;

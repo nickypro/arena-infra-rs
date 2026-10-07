@@ -53,7 +53,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
 - `arena` (CLI):
   - `pods list | create | stop | restart | terminate | kill` (`--provider
     runpod|vast|hetzner`; Vast reads `VAST_API_KEY`, Hetzner reads `HETZNER_API_KEY`
-    + `HETZNER_*`). `stop`/`restart`/`terminate` accept a **machine name or id**.
+    + `HETZNER_*`). `restart`/`terminate` take **one** pod (name, bare name, `@name` or id —
+    a name two pods share is refused: pass the id); `stop` takes the shared
+    [target selection](#targeting--concurrency).
     `list` shows NAME PROVIDER ID STATUS GPU (`count×type`) $/H ENDPOINT MAINT (the
     host's RunPod maintenance window, e.g. `maint 10-09 02:00→06:00 UTC`; the host's
     free-text note is flattened onto one line) and a footer
@@ -65,8 +67,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     pods incl. `gpu_count`/`cost_per_hr`/`maintenance`. `restart` restarts in place (RunPod restart / Hetzner
     reboot / Vast stop+start), preserving the machine where supported. `terminate
     --all` tears down the **whole fleet** (confirms first; `--dry-run` lists every
-    pod without touching them) — for end-of-program teardown. `stop --all`
-    (with `--include`/`--exclude`) stops many at once; `kill` is the stop→wait-for-
+    pod without touching them) — for end-of-program teardown (`terminate <name> --all` is
+    refused). `stop apple..mayor` / `stop --all --exclude bloom` stops many at once (running
+    pods only; needs targets or `--all`); `kill` is the stop→wait-for-
     EXITED→delete flow (`--timeout`; one target or `--all`).
   - `create` also takes **explicit names** (`pods create apple bloom`) and an
     **`--image`** override, alongside `-n`(target total) / `-a`(add). Bare names get
@@ -165,14 +168,14 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     (dashboard terminates, restarts that move an endpoint); re-running `install` without
     it removes that line. Remove it before changing `MACHINE_NAME_PREFIX`/`_LIST`: a name
     that leaves the list loses its forward on the next tick.
-  - `pods backup [target]` — the **full save**: git-push the ARENA tree **and** rsync the
+  - `pods backup [targets]` — the **full save**: git-push the ARENA tree **and** rsync the
     home to the local backups folder (`pull`). The git push is on **whatever branch the
     pod is on** (never switches/creates one, so bespoke branches are respected) and
-    **skips `main`/`master`**; clean trees report `NO_CHANGES`. One pod (name/id) or all.
+    **skips `main`/`master`**; clean trees report `NO_CHANGES`. Selected pods, or all.
     `--no-pull` = git only; `--message` overrides the commit message. Confirms first
     (`--dry-run` previews both). Each pod's git push has a 5-min budget. To stage onto a
     dated autocommit branch, run `pods init-branches` first.
-  - `pods set-branch <branch> [target|--all] [--hard]` — switch pods' ARENA checkout to a
+  - `pods set-branch <branch> <targets|--all> [--hard]` — switch pods' ARENA checkout to a
     branch. Gentle by default (fetch + checkout + ff-only pull — fails on a diverged/dirty
     tree rather than clobbering work). **`--hard` is destructive**: force the branch to
     match `origin/<branch>`, discarding local commits/changes (untracked files survive) —
@@ -182,12 +185,12 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     upstream **without committing** (legacy `init_branches`), so a new day's branch
     exists before `backup` runs. `--week`/`--day` override; `--dry-run` previews. 2-min
     budget per pod.
-  - `pods run [--timeout <secs>] <cmd>` / `pods test` — run an arbitrary command on every
-    pod (concurrent, confirms first; each pod gets `--timeout`, default 1800s = 30 min —
-    flags go *before* the command; on a timeout the local ssh is killed, and the remote
+  - `pods run [-t <targets>] [--timeout <secs>] <cmd>` / `pods test [targets]` — run an
+    arbitrary command on every (selected) pod (concurrent, confirms first naming the pods;
+    each pod gets `--timeout`, default 1800s = 30 min — flags go *before* the command; on a timeout the local ssh is killed, and the remote
     command dies at its next write to the closed connection) / the read-only
     torch-version health check (90s per pod).
-  - `pods test --deep [names…] [--json] [-v]` — the **is-this-pod-usable** check (read-only),
+  - `pods test --deep [targets] [--json] [-v]` — the **is-this-pod-usable** check (read-only),
     for what a plain `import torch` misses on a bad host. One embedded script per pod
     (one SSH exec, 150s budget, inside the conda env) measures: nvidia-smi GPUs + driver +
     CUDA version; torch import, `cuda.is_available()`, device count vs nvidia-smi; a small
@@ -208,7 +211,7 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     Vast pods sit behind a shared SSH proxy, so they're never grouped).
     `--json` prints per-pod `{id, name, provider, status, checks, facts}` (no IPs) — `[]`
     when no pod could be checked; summary/notes go to stderr. Exits
-    non-zero if any pod FAILs; warnings don't. Names scope the run (a named pod with no SSH
+    non-zero if any pod FAILs; warnings don't. Targets scope the run (a named pod with no SSH
     endpoint is a FAIL; a typo is an error). Two pods sharing a name each get their own row
     (with a warning naming their ids).
   - `pods pull [label]` — the **file** backup (complementing the git `backup`): rsyncs
@@ -223,12 +226,12 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     (openai/anthropic/openrouter) **plus broadcast tokens** — a Hugging Face token
     (`--hf-token`/`HF_TOKEN`, sets `HF_TOKEN` + `HUGGING_FACE_HUB_TOKEN`) for **gated
     repos** (Llama 3, …) and a **Claude Code token** (`--cc-token`/`CLAUDE_CODE_OAUTH_TOKEN`).
-    `--include`/`--exclude` (name or id) scope it to specific pods. Confirms first;
+    Targets / `--exclude` scope it to specific pods. Confirms first;
     `--dry-run` lists what would be set (values redacted). Both broadcast tokens are
     env-introducible (e.g. `CLAUDE_CODE_OAUTH_TOKEN=… arena pods copy-keys`). Each pod's
     write has a 60s budget, so a wedged pod reports `✗ <name>: … timed out` instead of
     hanging the command.
-  - `pods copy <file> [dest]` — scp a local file to every pod (concurrent; `--include`/
+  - `pods copy <file> [dest]` — scp a local file to every pod (concurrent; `-t <targets>`/
     `--exclude` to scope). With no `dest` it **mirrors the path under the ARENA repo**
     (a local `…/ARENA_3.0/foo/bar.py` → `/root/ARENA_3.0/foo/bar.py`); otherwise `dest`
     is the remote path (trailing `/` = into that dir). Creates the remote parent dir and
@@ -239,10 +242,11 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     uplink; `-r` counts the tree), or `--timeout <secs>` — and the mkdir/check get 20s
     each. Confirms first (the preview shows the budget); `--dry-run` previews.
   - `keys gen|list|rotate|revoke` — manage **OpenRouter** runtime keys via the
-    provisioning API (needs `OPENROUTER_PROVISIONING_KEY`). `gen [machines|--all]` mints
+    provisioning API (needs `OPENROUTER_PROVISIONING_KEY`). `gen <targets|--all>` mints
     one key per machine (named `<prefix>-<machine>`) with a USD cap (`--limit`, default
     `OPENROUTER_KEY_LIMIT` or $5) and writes `keys/openrouter_api_keys.csv`; `--copy` also
-    pushes them out via `copy-keys`. `rotate <machine|--all>` deletes + re-mints (leak
+    pushes them out via `copy-keys` (targets may be MACHINE_NAME_LIST names with no pod yet;
+    `--all` = every current pod). `rotate <targets|--all>` deletes + re-mints (leak
     recovery), `revoke` deletes only, `list` shows names/limits/usage for **this
     iteration's** `<prefix>-*` keys (noting how many others were hidden; `--all` shows
     every key on the account). Keys are found by
@@ -376,30 +380,41 @@ An ambiguous prefix errors and lists the candidates — e.g. `arena p` is reject
 because it matches both `pods` and `proxy` (use `po`/`pr`); likewise `c` →
 `config`/`cron` (use `co`/`cr`).
 
-### Targeting & concurrency (current state)
+### Targeting & concurrency
 
-Target-selection syntax is **not yet uniform** across `pods` subcommands (a cleanup is
-planned). Until then, here's exactly how each picks pods and whether it fans out
-concurrently or runs one pod at a time:
+Every fleet command picks pods with **one selector syntax** (`arena_core::selector`):
 
-| Command | How to target pods | Execution |
-| --- | --- | --- |
-| `run`, `test` | **always all** (no scoping flag) | parallel |
-| `test --deep` | positional names (default all) | parallel |
-| `pull`, `setup`, `init-branches` | **always all** (no scoping flag) | parallel |
-| `backup` | one `[target]` **or** `--all` | parallel |
-| `cp`, `copy-keys` | `--include`/`--exclude` (default all) | parallel |
-| `list --probe` | all | parallel |
-| `set-branch` | one `[target]` **or** `--all` | parallel |
-| `stop` | one `[target]` **or** `--all` + `--include`/`--exclude` | serial (provider API) |
-| `terminate` | one `[target]` **or** `--all` | serial (provider API) |
-| `restart` | one `[target]` only (**no `--all`**) | n/a |
-| `create` | positional `names` + `-n`/`-a` | serial (capacity backoff) |
+- **names** — bare `apple`, full `arena8-apple`, absolute `@james-gpu` / `james-gpu` — or
+  a provider **id**; several at once (`apple bloom`, or `apple,bloom`);
+- **ranges** `apple..mayor` — inclusive, in `MACHINE_NAME_LIST` order (the proxy-port
+  order); both ends must be list names, and a reversed range is an error;
+- **`all`** / `--all` — every pod;
+- filters: `--exclude <targets>` (same syntax, ranges too; repeatable), `--gpus N` (exactly
+  N GPUs by the provider's count — an unknown count never matches), `--on
+  runpod|vast|hetzner` (not `--provider`, which picks where `create`/`up` make pods).
+
+**Typos fail loudly**: a target *or* `--exclude` that matches no pod is an error naming it
+and the closest pod names, and a narrowed selection (names/filters) that ends up empty is an
+error saying how each step narrowed it — nothing is touched. Targets + `--all` together is
+refused. Dry-runs and prompts list the resolved pods. `--include X` is still accepted as an
+old spelling of a target (`stop --all --include X` keeps meaning "only X").
+
+| Command | Targets | Nothing given | Execution |
+| --- | --- | --- | --- |
+| `run` | `-t <targets>` (the command is positional) | every pod | parallel |
+| `test`, `test --deep` | positional | every pod | parallel |
+| `setup`, `copy-keys`, `backup`, `init-branches` | positional | every pod | parallel |
+| `cp`, `pull` | `-t <targets>` (file/label are positional) | every pod | parallel |
+| `set-branch <branch>` | positional after the branch | **refused** (targets or `--all`) | parallel |
+| `stop`, `reimage` | positional | **refused** (targets or `--all`) | serial (provider API) |
+| `keys gen/rotate/revoke` | positional (pods *or* list names) | **refused** (`--all` = current pods) | serial |
+| `terminate`, `restart`, `rename`, `replace`, `migrate` | **one** pod (same matcher; ambiguous name refused) | — (`terminate --all` for the fleet) | n/a |
+| `create`, `up` | names to create + `-n`/`-a` | — | serial (capacity backoff) |
 
 Notes / sharp edges to know:
-- `run`/`test`/`pull`/`setup`/`init-branches` can't be scoped to a subset — it's the
-  whole fleet or nothing.
-- `restart` can't target the fleet (single pod only).
+- A pod you **named** that has no SSH endpoint is reported, and if none of the named pods is
+  reachable the command fails (`test --deep` FAILs each one); pods swept in by `--all` or
+  the default are skipped with a note.
 - **Every pod-SSH call has a time budget**, so one wedged pod can't hang a fleet command:
   it reports `✗ <name>: timed out after Ns`, counts as a failure (non-zero exit) and the
   other pods carry on. Budgets: quick probes 20s (`list` GPU probe, `cp` mkdir/check,
@@ -412,8 +427,7 @@ Notes / sharp edges to know:
   with `migrate copy <name>` + `migrate cutover <name>`, or terminate it);
   `setup`/`copy-keys` as described above. rsync transfers (`pull`, the replace/migrate
   via-local copy) have no budget yet.
-- A non-empty `--include` that matches nothing now **errors** (not a silent no-op);
-  `copy-keys` warns by name about any reachable pod that matched no per-host key.
+- `copy-keys` warns by name about any reachable pod that matched no per-host key.
 
 ### Overriding config without editing it
 
