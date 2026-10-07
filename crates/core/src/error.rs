@@ -17,6 +17,13 @@ pub enum ProviderErrorKind {
     Transient,
     /// Bad/again credentials (HTTP 401/403). Retrying is pointless — abort.
     Auth,
+    /// This one request is refused for this account, though the key works and other
+    /// requests may not be: RunPod v2's `POST /v2/pods` documents its 403 as "your account
+    /// cannot access the requested pool — skip this candidate, keep going". Not `Auth`
+    /// (aborting would throw away the fallback options), not `Capacity` (waiting won't
+    /// change it). Never produced by [`ProviderErrorKind::classify`] — only a backend that
+    /// knows an endpoint means this re-tags its error.
+    Denied,
     /// Anything else.
     Other,
 }

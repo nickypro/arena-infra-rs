@@ -1246,10 +1246,16 @@ fn parse_max_price(s: &str) -> std::result::Result<f64, String> {
     }
 }
 
-/// Decide how `create`/`up` place pods, before anything is listed or created. `None` = one
-/// GPU, one cloud and no price cap: today's single-spec path, unchanged (same output, same
-/// `--keep-trying`). `Some` = ordered placement over several options, with the spec base
-/// (config + every other override) the options are layered on.
+/// Decide how `create`/`up` place pods, before anything is listed or created. Returns the
+/// overrides the single-spec path creates from, and: `None` = one GPU, one cloud and no
+/// price cap: today's single-spec path, unchanged (same output, same `--keep-trying`).
+/// `Some` = ordered placement over several options, with the spec base (config + every
+/// other override) the options are layered on.
+///
+/// A list that collapses to one option (`--gpu A4000,a4000`, `--cloud community,`) is
+/// "single" because it names one option — so the single path must create *that* option:
+/// `--gpu`/`--cloud` come back as the parsed values, never the raw list string, which
+/// would otherwise reach the provider as a GPU id `A4000,a4000` / tier `COMMUNITY,`.
 ///
 /// `--keep-trying` waits on *one* pool; with several options the retry window
 /// (`--retry-mins`) is the waiting mechanism — each round re-tries every option — so the
@@ -1257,16 +1263,23 @@ fn parse_max_price(s: &str) -> std::result::Result<f64, String> {
 fn placement_request(
     cfg: &Config,
     provider_name: &str,
-    ov: &SpecOverrides,
+    ov: SpecOverrides,
     max_price: Option<f64>,
     order: arena_core::placement::Order,
     keep_trying: bool,
-) -> Result<Option<(arena_core::placement::Request, PodSpec)>> {
+) -> Result<(SpecOverrides, Option<(arena_core::placement::Request, PodSpec)>)> {
     let base = spec_with_overrides(cfg, &SpecOverrides { gpu: None, cloud: None, ..ov.clone() });
     let req =
         arena_core::placement::Request::from_flags(ov.gpu.as_deref(), ov.cloud.as_deref(), &base, max_price, order)?;
     if req.is_single() {
-        return Ok(None);
+        // Only a flag that was given is replaced (an absent one keeps "what config says",
+        // exactly as today); the parsed GPU is already resolved, and resolving is idempotent.
+        let single = SpecOverrides {
+            gpu: ov.gpu.as_ref().map(|_| req.gpus[0].clone()),
+            cloud: ov.cloud.as_ref().map(|_| req.clouds[0].clone()),
+            ..ov
+        };
+        return Ok((single, None));
     }
     req.validate_for(provider_name)?;
     if keep_trying {
@@ -1275,7 +1288,7 @@ fn placement_request(
              --retry-mins N instead (each round re-tries every option)"
         );
     }
-    Ok(Some((req, base)))
+    Ok((ov, Some((req, base))))
 }
 
 /// Upper bound on each read-only catalog lookup before placement. The HTTP client has no
@@ -1467,7 +1480,13 @@ async fn place_names(
         End::WindowElapsed => eprintln!("retry window ({retry_mins}m) elapsed — placed {placed} of {total}"),
         End::Interrupted => eprintln!("interrupted — stopping retries with {placed} of {total}"),
         End::Aborted { name, error } => {
-            let error = anyhow::anyhow!("authentication failed creating {name}: {error}");
+            // Every option refused (RunPod v2 403s) is about the key's access, not a bad key.
+            let what = if error.kind() == Some(arena_core::ProviderErrorKind::Denied) {
+                "access refused"
+            } else {
+                "authentication failed"
+            };
+            let error = anyhow::anyhow!("{what} creating {name}: {error}");
             return Err(CreateFailed::new(run.created, error));
         }
         End::Failed { name, error } => {
@@ -3662,7 +3681,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap };
             // Several --gpu/--cloud options or a --max-price → ordered placement; otherwise
             // the single-spec path below, unchanged. Decided before anything is listed.
-            let placing = placement_request(cfg, provider.name(), &ov, max_price, order, keep_trying)?;
+            let (ov, placing) = placement_request(cfg, provider.name(), ov, max_price, order, keep_trying)?;
             // Explicit names take a different path than the -n/-a top-up: create exactly
             // those (minus any that already exist), no name allocation.
             let mut topup_target = 0usize; // provider-scoped total for the -n/-a retry loop
@@ -3735,7 +3754,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
         PodCmd::Up { names, count, add, gpu, gpus, cloud, max_price, order, disk, volume, image, bootstrap, dry_run, no_wait, keep_trying, retry_mins, retry_secs, no_setup, timeout, interval } => {
             let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap };
             // Several --gpu/--cloud options or a --max-price → ordered placement (as `create`).
-            let placing = placement_request(cfg, provider.name(), &ov, max_price, order, keep_trying)?;
+            let (ov, placing) = placement_request(cfg, provider.name(), ov, max_price, order, keep_trying)?;
             // Like `create`: explicit names take the direct path; -n/-a top up by count.
             let explicit = !names.is_empty();
             if explicit && (count.is_some() || add.is_some()) {
@@ -7271,6 +7290,9 @@ mod tests {
         assert!(ok && line.contains("✓") && line.contains("v2") && !line.contains("retires"), "{line}");
         let (line, ok) = runpod_api_row(&Config::parse("RUNPOD_API=v3"));
         assert!(!ok && line.contains("✗") && line.contains("must be `v1` or `v2`"), "{line}");
+        // `config check` never shows secret values — not even a key pasted into RUNPOD_API.
+        let (line, ok) = runpod_api_row(&Config::parse("RUNPOD_API=rpa_SECRETKEY123"));
+        assert!(!ok && line.contains("✗") && !line.contains("SECRETKEY"), "{line}");
     }
 
     /// `--json` on `gpus` and `pods list` is a scripting contract — pin the flag parsing
@@ -8383,7 +8405,9 @@ mod placement_cli_tests {
             cloud: cloud.map(String::from),
             ..Default::default()
         };
-        let route = |o: &SpecOverrides, cap, kt| placement_request(&cfg(), "runpod", o, cap, Order::Cheapest, kt);
+        let route = |o: &SpecOverrides, cap, kt| {
+            placement_request(&cfg(), "runpod", o.clone(), cap, Order::Cheapest, kt).map(|(_, placing)| placing)
+        };
         // Today's flags (or none) stay on the single-spec path — `--keep-trying` included.
         for o in [ov(None, None), ov(Some("3090"), None), ov(Some("A4000"), Some("secure"))] {
             assert!(route(&o, None, false).unwrap().is_none(), "{o:?}");
@@ -8398,6 +8422,44 @@ mod placement_cli_tests {
         assert!(e.contains("--retry-mins"), "{e}");
         let e = route(&ov(None, Some("community,spot")), None, false).unwrap_err().to_string();
         assert!(e.contains("`SPOT`"), "{e}");
+    }
+
+    #[test]
+    fn a_list_that_collapses_to_one_option_creates_that_option_not_the_raw_string() {
+        // Review fix: duplicates / stray commas parse to one option, so the single path runs —
+        // and it must create the parsed option, not the raw flag text as a GPU id / tier.
+        let single = |gpu: Option<&str>, cloud: Option<&str>| {
+            let o = SpecOverrides { gpu: gpu.map(String::from), cloud: cloud.map(String::from), ..Default::default() };
+            let (ov, placing) = placement_request(&cfg(), "runpod", o, None, Order::Cheapest, false).unwrap();
+            assert!(placing.is_none(), "{gpu:?} {cloud:?} is one option");
+            let spec = spec_with_overrides(&cfg(), &ov);
+            (spec.gpu_type, spec.cloud_type)
+        };
+        let a4000 = "NVIDIA RTX A4000";
+        let rtx3090 = "NVIDIA GeForce RTX 3090";
+        for (gpu, cloud, want) in [
+            (Some("A4000,a4000"), Some("community,COMMUNITY"), (a4000, "COMMUNITY")),
+            (Some("NVIDIA RTX A4000,"), None, (a4000, "COMMUNITY")),
+            (None, Some("community,"), (a4000, "COMMUNITY")),
+            (Some("3090, 3090"), Some("secure,SECURE"), (rtx3090, "SECURE")),
+            (Some(" 3090 "), Some(" secure "), (rtx3090, "SECURE")),
+            // Unchanged: plain single flags, and absent flags keep config's values.
+            (Some("3090"), Some("secure"), (rtx3090, "SECURE")),
+            (Some("NVIDIA GeForce RTX 3090"), None, (rtx3090, "COMMUNITY")),
+            (None, None, (a4000, "COMMUNITY")),
+        ] {
+            let got = single(gpu, cloud);
+            assert_eq!((got.0.as_str(), got.1.as_str()), want, "{gpu:?} {cloud:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_collapsing_list_on_create_sends_the_one_parsed_option() {
+        let fake = Recorder::default();
+        handle_pods(create(&["apple"], Some("A4000,a4000"), Some("community,COMMUNITY"), None), &fake, &cfg(), true)
+            .await
+            .unwrap();
+        assert_eq!(fake.calls(), [call("arena8-apple", "NVIDIA RTX A4000", "COMMUNITY")]);
     }
 
     #[tokio::test]

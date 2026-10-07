@@ -36,7 +36,7 @@ use serde_json::{json, Map, Value};
 
 use super::runpod::{self, loose_f64, loose_string, GpuType};
 use super::Provider;
-use crate::error::{Error, Result};
+use crate::error::{Error, ProviderErrorKind, Result};
 use crate::pod::{Pod, PodSpec};
 
 const BASE: &str = "https://api.runpod.io/v2";
@@ -100,10 +100,16 @@ fn base_url(path: &str) -> Url {
 }
 
 /// `{BASE}/pods/{id}[/{suffix}]`, with `id` pushed as one encoded path segment (so an odd
-/// id can't walk to another endpoint). An empty id is refused: `pods/` would be the list.
+/// id can't walk to another endpoint: `/`, `?`, `#`, `%` are percent-encoded). The ids the
+/// encoding can't contain are refused: an empty id (`pods/` is the list), and `.`/`..`,
+/// which the URL parser resolves as dot-segments — `pods/..` is the list too, so a
+/// terminate would DELETE the collection and `pod_spec` would read the list as one pod.
 fn pod_url(id: &str, suffix: Option<&str>) -> Result<Url> {
     if id.trim().is_empty() {
         return Err(Error::provider("runpod v2: empty pod id"));
+    }
+    if matches!(id.trim(), "." | "..") {
+        return Err(Error::provider(format!("runpod v2: invalid pod id `{}`", id.trim())));
     }
     let mut url = base_url("pods");
     {
@@ -170,6 +176,20 @@ fn judge(status: StatusCode, text: &str, ctx: &str) -> Result<Value> {
         Ok(v) => Err(Error::provider_http(status, &v, ctx)),
         Err(_) => Err(Error::provider_http(status, &text, ctx)),
     }
+}
+
+/// [`judge`] for `POST /v2/pods`, whose error table gives 403 a meaning of its own: "Your
+/// account cannot access the requested pool. | Skip this candidate, keep going." So a 403
+/// here is [`ProviderErrorKind::Denied`] (placement skips that option and tries the next),
+/// not `Auth` (which aborts the whole run on one restricted pool). 401 stays `Auth`, and a
+/// 403 anywhere else (e.g. the ssh-keys read) stays `Auth` too. Pure.
+fn judge_create(status: StatusCode, text: &str) -> Result<Value> {
+    judge(status, text, "create pod").map_err(|e| match e {
+        Error::Provider { message, .. } if status == StatusCode::FORBIDDEN => {
+            Error::Provider { kind: ProviderErrorKind::Denied, message }
+        }
+        e => e,
+    })
 }
 
 /// What a JSON body looks like — its top-level keys, or its type — for shape errors.
@@ -513,7 +533,7 @@ impl Provider for RunpodV2Provider {
         let may_exist = |e: Error| {
             Error::provider(format!("{e} — the pod may have been created: check `arena pods list` before retrying"))
         };
-        let body = judge(status, &text, "create pod").map_err(|e| if status.is_success() { may_exist(e) } else { e })?;
+        let body = judge_create(status, &text).map_err(|e| if status.is_success() { may_exist(e) } else { e })?;
         let pod = parse_pod(&body);
         if pod.id.is_empty() {
             return Err(may_exist(Error::provider(format!("create pod: HTTP {status} without a pod id: {}", shape_of(&body)))));
@@ -560,7 +580,6 @@ impl Provider for RunpodV2Provider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::ProviderErrorKind;
 
     /// A RUNNING pod exactly as the v2 OpenAPI example has it (`listPods` 200), plus a
     /// second `22/tcp` mapping in `runtime.ports` to show it isn't what we read.
@@ -644,6 +663,12 @@ mod tests {
         let p = parse_pod(&provisioning_pod());
         assert_eq!((p.status.as_str(), p.ssh_ip, p.ssh_port), ("PROVISIONING", None, None));
         assert_eq!(p.gpu_count, Some(1));
+        // PROVISIONING with the whole `ssh` object null. The schema has `ssh` required (only
+        // `direct`/`proxy` nullable), but parsing is defensive: still a pod, no endpoint yet.
+        let mut bare = provisioning_pod();
+        bare["ssh"] = Value::Null;
+        let b = parse_pod(&bare);
+        assert_eq!((b.id.as_str(), b.status.as_str(), b.ssh_ip, b.ssh_port), (p.id.as_str(), "PROVISIONING", None, None));
 
         // EXITED: the ssh proxy is still offered — it must NOT become the endpoint.
         let e = parse_pod(&exited_pod());
@@ -790,21 +815,38 @@ mod tests {
             ("400 rule violation", 400, problem(400, "allowedCudaVersions and minCudaVersion are mutually exclusive"), false, Some(K::Other)),
             ("402 balance is not capacity", 402, problem(402, "Insufficient balance"), false, Some(K::Other)),
             ("401", 401, problem(401, "missing bearer token"), false, Some(K::Auth)),
-            ("403 pool", 403, problem(403, "access denied"), false, Some(K::Auth)),
+            ("403 (key lacks access)", 403, problem(403, "access denied"), false, Some(K::Auth)),
             ("409 bad action", 409, problem(409, "action not valid for current pod status"), false, Some(K::Other)),
             ("422", 422, problem(422, "Request validation failed."), false, Some(K::Other)),
             ("429", 429, problem(429, "rate limit exceeded for the minute window"), false, Some(K::RateLimited)),
             ("502 html", 502, "<html>Bad Gateway</html>".into(), false, Some(K::Transient)),
             ("500 capacity", 500, problem(500, "no instances available"), false, Some(K::Capacity)),
         ];
-        for (case, code, body, ok, kind) in cases {
-            let r = judge(StatusCode::from_u16(code).unwrap(), &body, "create pod");
-            assert_eq!(r.is_ok(), ok, "{case}: {r:?}");
+        for (case, code, body, ok, kind) in &cases {
+            let r = judge(StatusCode::from_u16(*code).unwrap(), body, "get pod");
+            assert_eq!(r.is_ok(), *ok, "{case}: {r:?}");
             if let Err(e) = r {
-                assert_eq!(e.kind(), kind, "{case}: {e}");
+                assert_eq!(e.kind(), *kind, "{case}: {e}");
                 assert!(!crate::retry::is_retryable(&e) || matches!(kind, Some(K::Transient | K::RateLimited)), "{case}");
             }
         }
+        // `POST /v2/pods` reads every response the same, except its documented 403 ("Your
+        // account cannot access the requested pool. Skip this candidate, keep going."):
+        // Denied, so placement tries the next option instead of aborting the run.
+        for (case, code, body, ok, kind) in &cases {
+            let want = if *code == 403 { Some(K::Denied) } else { *kind };
+            let r = judge_create(StatusCode::from_u16(*code).unwrap(), body);
+            assert_eq!(r.is_ok(), *ok, "create {case}: {r:?}");
+            if let Err(e) = r {
+                assert_eq!(e.kind(), want, "create {case}: {e}");
+                assert!(e.to_string().contains("create pod"), "create {case}: {e}");
+                assert!(!crate::retry::is_retryable(&e) || matches!(want, Some(K::Transient | K::RateLimited)), "{case}");
+            }
+        }
+        let pool = problem(403, "your account cannot access the requested pool");
+        let e = judge_create(StatusCode::FORBIDDEN, &pool).unwrap_err();
+        assert_eq!(e.kind(), Some(K::Denied));
+        assert!(e.to_string().contains("cannot access the requested pool"), "{e}");
         assert_eq!(judge(StatusCode::NO_CONTENT, "", "terminate pod").unwrap(), Value::Null);
         // The problem's `detail` makes it into the message.
         let e = judge(StatusCode::NOT_FOUND, &problem(404, "pod not found"), "get pod").unwrap_err();
@@ -1069,6 +1111,17 @@ mod tests {
         assert_eq!(pod_url("a b", Some("action")).unwrap().as_str(), "https://api.runpod.io/v2/pods/a%20b/action");
         assert!(pod_url("", None).is_err());
         assert!(pod_url("  ", Some("action")).is_err());
+        // Dot-segments would resolve back to the list endpoint (`pods/..` → `/v2/pods`).
+        for dots in [".", "..", " .. ", ". "] {
+            assert!(pod_url(dots, None).is_err(), "{dots:?}");
+            assert!(pod_url(dots, Some("action")).is_err(), "{dots:?}");
+        }
+        // Percent-encoded dots and dot-containing ids stay inside their own segment.
+        for odd in ["%2e%2e", "%2E.", ".%2e", "%2e", "...", "a.b"] {
+            let u = pod_url(odd, Some("action")).unwrap();
+            let segs: Vec<&str> = u.path_segments().unwrap().collect();
+            assert_eq!((segs.len(), segs[0], segs[1], segs[3]), (4, "v2", "pods", "action"), "{odd:?} -> {u}");
+        }
     }
 
     /// The `listGpuTypes` example shape, plus a GPU only on secure and one with no stock.

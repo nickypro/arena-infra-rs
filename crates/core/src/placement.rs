@@ -470,6 +470,9 @@ pub enum Outcome {
     Created { pod_id: String },
     /// No capacity on this option: blocked for the rest of the round.
     Capacity(String),
+    /// This account may not use this option (RunPod v2's 403 on create: no access to the
+    /// pool): skipped for the rest of the run — waiting won't grant access.
+    Denied(String),
     /// Credentials rejected: the run aborts.
     Auth(String),
     /// Anything else: the run stops, as a single-option create does.
@@ -513,7 +516,8 @@ pub enum End {
     WindowElapsed,
     /// Ctrl+C between rounds; what was made is kept.
     Interrupted,
-    /// Credentials rejected creating `name`.
+    /// Credentials rejected creating `name` — or every option was refused (`Denied`), which
+    /// reads as an access problem with the key rather than with any one pool.
     Aborted { name: String, error: Error },
     /// A non-capacity error creating `name` (or, with `name: None`, the re-list before a
     /// retry round failed — no round runs without knowing what exists).
@@ -618,6 +622,10 @@ impl Progress<'_> {
                         "[no capacity] {name} on {on}{}",
                         if *next { " — trying the next option" } else { " — no option left this round" }
                     ),
+                    Outcome::Denied(e) => format!(
+                        "[no access] {name} on {on}: {e}{}",
+                        if *next { " — skipping this option, trying the next" } else { " — skipping this option" }
+                    ),
                     Outcome::Auth(e) => format!("[auth failed] {name} on {on}: {e}"),
                     Outcome::Failed(e) => format!("[failed] {name} on {on}: {e}"),
                 }
@@ -633,16 +641,19 @@ impl Progress<'_> {
 
 /// Fill `names` from `plan.options`. Per name: try the options in order, **one create at a
 /// time**; the first success places it (never a second create for that name). A capacity
-/// error blocks the option for the rest of the round; auth aborts the run; any other error
-/// stops it (the single-option create does the same — a bad request isn't something the
-/// next option fixes reliably, and stopping keeps a misconfiguration from fanning out).
-/// Transient errors (429/5xx/connect) are retried with backoff inside one attempt.
+/// error blocks the option for the rest of the round; a `Denied` one (no access to that
+/// pool) for the rest of the run, and once *every* option is denied the run aborts — that's
+/// the key, not the pools. Auth aborts the run; any other error stops it (the single-option
+/// create does the same — a bad request isn't something the next option fixes reliably,
+/// and stopping keeps a misconfiguration from fanning out). Transient errors
+/// (429/5xx/connect) are retried with backoff inside one attempt.
 ///
-/// With a retry window, unplaced names get another round every `rounds.every` until the
-/// window closes; blocks are cleared each round, and the fleet is re-listed first
-/// ([`still_needed`]) — a failed list ends the run rather than risk a duplicate. `interrupt`
-/// makes a fresh "stop" future per wait (Ctrl+C in the CLI): it ends the run between rounds,
-/// keeping what was made. The option order is the confirmed plan's — fixed for the run.
+/// With a retry window, unplaced names get another round every `rounds.every` while that
+/// round would still start inside the window; capacity blocks are cleared each round, and
+/// the fleet is re-listed first ([`still_needed`]) — a failed list ends the run rather than
+/// risk a duplicate. `interrupt` makes a fresh "stop" future per wait (Ctrl+C in the CLI): it
+/// ends the run between rounds, keeping what was made. The option order is the confirmed
+/// plan's — fixed for the run.
 pub async fn place<W, F>(
     provider: &dyn Provider,
     base: &PodSpec,
@@ -664,6 +675,8 @@ where
         names.iter().map(|n| NameLog { name: n.clone(), turns: 0, attempts: Vec::new(), placed: None, skipped: None }).collect();
     let mut created = Vec::new();
     let mut pending: Vec<usize> = (0..log.len()).collect();
+    // Options this account can't use: unlike capacity blocks, never cleared.
+    let mut denied = vec![false; plan.options.len()];
     let mut round = 0u32;
     let end = 'run: loop {
         if pending.is_empty() {
@@ -677,7 +690,7 @@ where
             let name = log[i].name.clone();
             let mut placed = false;
             for (k, option) in plan.options.iter().enumerate() {
-                if blocked[k] {
+                if blocked[k] || denied[k] {
                     continue;
                 }
                 let spec = spec_for(base, &name, option);
@@ -695,13 +708,30 @@ where
                             blocked[k] = true;
                             (Outcome::Capacity(e.to_string()), None)
                         }
+                        Some(ProviderErrorKind::Denied) => {
+                            denied[k] = true;
+                            let outcome = Outcome::Denied(e.to_string());
+                            if denied.iter().all(|d| *d) {
+                                let error = Error::Provider {
+                                    kind: ProviderErrorKind::Denied,
+                                    message: format!(
+                                        "every option was refused (no access) — the API key may lack \
+                                         permission to create pods, or the account can't use any of these \
+                                         pools; last: {e}"
+                                    ),
+                                };
+                                (outcome, Some(End::Aborted { name: name.clone(), error }))
+                            } else {
+                                (outcome, None)
+                            }
+                        }
                         Some(ProviderErrorKind::Auth) => {
                             (Outcome::Auth(e.to_string()), Some(End::Aborted { name: name.clone(), error: e }))
                         }
                         _ => (Outcome::Failed(e.to_string()), Some(End::Failed { name: Some(name.clone()), error: e })),
                     },
                 };
-                let next = blocked.iter().skip(k + 1).any(|b| !b);
+                let next = (k + 1..plan.options.len()).any(|j| !blocked[j] && !denied[j]);
                 on_progress(&Progress::Attempt { name: &name, option, outcome: &outcome, next });
                 log[i].attempts.push(Attempt { option: k, round, at, outcome });
                 if placed {
@@ -724,7 +754,12 @@ where
         if rounds.window.is_zero() || plan.options.is_empty() {
             break End::Exhausted;
         }
-        if tokio::time::Instant::now() >= deadline {
+        // A round starts only inside the window. The next one would start `every` from now,
+        // so if that's past the deadline, end here — not sleep just to give up, nor create
+        // (bill) up to `every` after the window the operator agreed to. (Decided before the
+        // sleep, so timer slack can't flip it.)
+        let now = tokio::time::Instant::now();
+        if now >= deadline || now + rounds.every > deadline {
             break End::WindowElapsed;
         }
         on_progress(&Progress::Waiting { round, unplaced: pending.len(), every: rounds.every });
@@ -765,6 +800,7 @@ pub fn render_summary(plan: &OptionPlan, run: &Placement) -> String {
             let what = match a.outcome {
                 Outcome::Created { .. } => continue,
                 Outcome::Capacity(_) => "capacity",
+                Outcome::Denied(_) => "no access",
                 Outcome::Auth(_) => "auth failed",
                 Outcome::Failed(_) => "failed",
             };
@@ -781,6 +817,7 @@ pub fn render_summary(plan: &OptionPlan, run: &Placement) -> String {
             .collect::<Vec<_>>()
             .join("; ")
     };
+    let any_denied = run.log.iter().flat_map(|l| &l.attempts).any(|a| matches!(a.outcome, Outcome::Denied(_)));
     let rows: Vec<Vec<String>> = run
         .log
         .iter()
@@ -794,6 +831,9 @@ pub fn render_summary(plan: &OptionPlan, run: &Placement) -> String {
                 }
                 (None, Some(why)) => format!("skipped ({why})"),
                 (None, None) if l.turns == 0 => "not attempted (run stopped)".to_string(),
+                (None, None) if l.attempts.is_empty() && any_denied => {
+                    "not placed (every option was out of capacity or refused before its turn)".to_string()
+                }
                 (None, None) if l.attempts.is_empty() => {
                     "not placed (every option ran out of capacity before its turn)".to_string()
                 }
@@ -1067,6 +1107,8 @@ note: ~ = preset estimate (no live price for that GPU); --max-price is checked a
     enum Reply {
         Ok,
         Capacity,
+        /// RunPod v2's create 403: no access to this pool.
+        Denied,
         Auth,
         Bad,
     }
@@ -1127,6 +1169,10 @@ note: ~ = preset estimate (no live price for that GPU); --max-price is checked a
                     Ok(pod)
                 }
                 Reply::Capacity => Err(Error::capacity("create pod HTTP 500: There are no instances currently available")),
+                Reply::Denied => Err(Error::Provider {
+                    kind: ProviderErrorKind::Denied,
+                    message: "create pod HTTP 403 Forbidden: your account cannot access the requested pool".into(),
+                }),
                 Reply::Auth => Err(Error::Provider { kind: ProviderErrorKind::Auth, message: "create pod HTTP 401".into() }),
                 Reply::Bad => Err(Error::provider("create pod HTTP 400: bad image")),
             }
@@ -1241,6 +1287,63 @@ note: ~ = preset estimate (no live price for that GPU); --max-price is checked a
         assert!(render_summary(&plan, &out).contains("arena8-cider  not attempted (run stopped)"));
     }
 
+    /// Review fix: RunPod v2 documents a create 403 as "no access to the requested pool — skip
+    /// this candidate, keep going". One restricted pool must not abort a multi-option run.
+    #[tokio::test(start_paused = true)]
+    async fn a_pool_without_access_is_skipped_for_the_whole_run() {
+        // A4000 COMMUNITY is refused; 3090 COMMUNITY is dry in round 1, then fills.
+        let fake = Fake::new(Reply::Ok)
+            .script(A4000, "COMMUNITY", &[Reply::Denied])
+            .script(R3090, "COMMUNITY", &[Reply::Capacity])
+            .script(A4000, "SECURE", &[Reply::Capacity]);
+        let plan = three();
+        let rounds = Rounds { window: Duration::from_secs(600), every: Duration::from_secs(60) };
+        let (out, lines) = run(&fake, &plan, &["arena8-apple", "arena8-bloom"], rounds, None).await;
+        assert!(matches!(out.end, End::Filled), "{:?}", out.end);
+        assert_eq!(
+            fake.calls(),
+            [
+                call("arena8-apple", A4000, "COMMUNITY"), // 403: skipped from now on
+                call("arena8-apple", R3090, "COMMUNITY"), // dry
+                call("arena8-apple", A4000, "SECURE"),    // dry — round 1 is over for everyone
+                // Round 2: capacity blocks are cleared, the refused pool stays skipped.
+                call("arena8-apple", R3090, "COMMUNITY"),
+                call("arena8-bloom", R3090, "COMMUNITY"),
+            ]
+        );
+        assert!(lines[0].starts_with("[no access] arena8-apple on 1×RTX A4000 COMMUNITY:"), "{lines:?}");
+        assert!(lines[0].ends_with("— skipping this option, trying the next"), "{lines:?}");
+        let summary = render_summary(&plan, &out);
+        assert!(summary.contains("(after 1×RTX A4000 COMMUNITY: no access; 1×RTX 3090 COMMUNITY: capacity;"), "{summary}");
+    }
+
+    #[tokio::test]
+    async fn every_option_refused_aborts_as_an_access_problem() {
+        // A key that may not create at all 403s everywhere: once no option is left that
+        // wasn't refused, stop — later names would only collect the same 403s.
+        let fake = Fake::new(Reply::Denied);
+        let plan = three();
+        let rounds = Rounds { window: Duration::from_secs(600), every: Duration::from_secs(60) };
+        let (out, lines) = run(&fake, &plan, &["arena8-apple", "arena8-bloom"], rounds, None).await;
+        match &out.end {
+            End::Aborted { name, error } => {
+                assert_eq!(name, "arena8-apple");
+                assert_eq!(error.kind(), Some(ProviderErrorKind::Denied));
+                assert!(error.to_string().contains("every option was refused"), "{error}");
+            }
+            other => panic!("expected abort, got {other:?}"),
+        }
+        assert_eq!(fake.calls().len(), 3, "each option once, then stop");
+        assert!(lines[2].ends_with("— skipping this option"), "{lines:?}");
+        assert!(render_summary(&plan, &out).contains("arena8-bloom  not attempted (run stopped)"));
+
+        // A refusal for a later name (after others were placed) still only skips that option.
+        let fake = Fake::new(Reply::Ok).script(A4000, "COMMUNITY", &[Reply::Ok, Reply::Denied]);
+        let (out, _) = run(&fake, &plan, &["arena8-apple", "arena8-bloom", "arena8-cider"], ONE_ROUND, None).await;
+        assert!(matches!(out.end, End::Filled), "{:?}", out.end);
+        assert_eq!(fake.calls()[2..], [call("arena8-bloom", R3090, "COMMUNITY"), call("arena8-cider", R3090, "COMMUNITY")]);
+    }
+
     #[tokio::test]
     async fn another_error_stops_like_a_single_create() {
         let fake = Fake::new(Reply::Ok).script(A4000, "COMMUNITY", &[Reply::Bad]);
@@ -1303,9 +1406,34 @@ note: ~ = preset estimate (no live price for that GPU); --max-price is checked a
         let rounds = Rounds { window: Duration::from_secs(150), every: Duration::from_secs(60) };
         let (out, _) = run(&fake, &three(), &["arena8-apple"], rounds, None).await;
         assert!(matches!(out.end, End::WindowElapsed), "{:?}", out.end);
-        assert_eq!(out.rounds, 4); // t=0, 60, 120, 180 (the last starts inside the window)
-        assert_eq!(fake.calls().len(), 12);
-        assert!(render_summary(&three(), &out).contains("capacity ×4"));
+        // t=0, 60, 120 — a fourth round would start at t=180, after the 150s window.
+        assert_eq!(out.rounds, 3);
+        assert_eq!(fake.calls().len(), 9);
+        let last = out.log[0].attempts.iter().map(|a| a.at).max().unwrap();
+        assert_eq!(last, Duration::from_secs(120));
+        assert!(render_summary(&three(), &out).contains("capacity ×3"));
+    }
+
+    /// Review fix: no round (no create, no bill) after the window closes — even when the
+    /// interval is longer than the window, and with no pointless sleep before giving up.
+    #[tokio::test(start_paused = true)]
+    async fn no_round_starts_after_the_window() {
+        for (window, every, want_rounds) in [
+            (60, 600, 1),  // --retry-mins 1 --retry-secs 600: the 2nd round would be at t=600
+            (120, 60, 3),  // t=0, 60, 120: a round exactly at the deadline is still inside
+            (119, 60, 2),  // t=0, 60: t=120 would be past it
+            (600, 60, 11), // t=0..600
+        ] {
+            let fake = Fake::new(Reply::Capacity);
+            let rounds = Rounds { window: Duration::from_secs(window), every: Duration::from_secs(every) };
+            let started = tokio::time::Instant::now();
+            let (out, _) = run(&fake, &three(), &["arena8-apple"], rounds, None).await;
+            assert!(matches!(out.end, End::WindowElapsed), "{window}/{every}: {:?}", out.end);
+            assert_eq!(out.rounds, want_rounds, "{window}/{every}");
+            assert!(out.log[0].attempts.iter().all(|a| a.at <= Duration::from_secs(window)), "{window}/{every}");
+            // Gave up right after the last round, not after one more sleep.
+            assert_eq!(started.elapsed(), Duration::from_secs(every * (want_rounds as u64 - 1)), "{window}/{every}");
+        }
     }
 
     #[tokio::test(start_paused = true)]

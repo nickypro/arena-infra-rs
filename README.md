@@ -18,8 +18,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
   - `provider::runpod` — RunPod REST **v1** backend: list / create / stop / terminate.
     RunPod retires REST v1 on **2026-11-15**.
   - `provider::runpod_v2` — RunPod REST **v2** backend (`api.runpod.io/v2`), opt-in via
-    `RUNPOD_API=v2` (default `v1`; any other value is an error; `config check` shows which
-    is active). Same provider name and commands. Differences: real lifecycle statuses
+    `RUNPOD_API=v2` (default `v1`; any other value is an error, which quotes the value only
+    if it's short and version-like — never a pasted key; `config check` shows which is
+    active). Same provider name and commands. Differences: real lifecycle statuses
     (`PROVISIONING`/`STARTING`/`RUNNING`/`EXITED`/`ERROR`); the SSH endpoint comes from
     `ssh.direct` only; create always sends `cloud` (v2 defaults to SECURE) and merges the
     account's registered SSH keys into `PUBLIC_KEY` (v2 skips them when it's set);
@@ -83,15 +84,19 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     (default; a price tie goes to the better stock hint, then the listed order) or `listed`
     (GPU-major). Stock never filters — creating is the truth. Per name the options are tried
     **one create at a time** (never two creates for one name); a capacity error skips that
-    option for the rest of the round, auth aborts, any other error stops as before.
+    option for the rest of the round; a v2 create `403` ("no access to the requested pool")
+    skips it for the whole run (`[no access]`), and if *every* option is refused the run
+    aborts as an access problem; auth aborts, any other error stops as before.
     `--retry-mins` re-runs rounds (blocks cleared, fleet re-listed first so a name that
-    appeared meanwhile — or a met `-n` target — isn't created again); Ctrl+C between rounds
-    keeps what was made. Ends with a per-name table: `created on 1×RTX 3090 COMMUNITY
+    appeared meanwhile — or a met `-n` target — isn't created again) only while the next
+    round would still start inside the window; Ctrl+C between rounds keeps what was made. Ends with a per-name table: `created on 1×RTX 3090 COMMUNITY
     ($0.22/h) (after 1×RTX A4000 COMMUNITY: capacity)` or `not placed (tried: …)`. Cloud
     tiers exist only on RunPod (Vast/Hetzner collapse them, and Hetzner the GPU list too,
     with a note); Vast/Hetzner quote no price before create, so their options are unpriced.
     `--keep-trying` stays single-option (use `--retry-mins`). One `--gpu`, one `--cloud` and
-    no `--max-price` is exactly the old single-spec path. `--dry-run` prints the option
+    no `--max-price` is exactly the old single-spec path; a list that collapses to one
+    option (`--gpu A4000,a4000`, `--cloud community,`) takes it too, creating the parsed
+    option (never the raw list text). `--dry-run` prints the option
     table and the names it would attempt; the option order is fixed once confirmed.
   - `offers [--gpu …] [--cloud …] [--max-price …] [--gpus N] [--order …] [--json]` —
     read-only: the same option table (OPTION, CLOUD, $/H/POD, PRICE source, STOCK, plus what
