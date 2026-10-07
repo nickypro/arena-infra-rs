@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -85,6 +87,26 @@ pub enum Error {
 
     #[error("not implemented: {0}")]
     NotImplemented(String),
+
+    /// An operation ran out of its time budget (e.g. an SSH step on a wedged pod). Kept
+    /// distinct from `Provider` so callers can tell "took too long" from "failed": a
+    /// timeout must never be mistaken for a retryable connection error (the message says
+    /// "timed out", which a string-sniffing classifier would happily match).
+    #[error("{what} timed out after {}", human_duration(.after))]
+    Timeout { what: String, after: Duration },
+}
+
+/// Render a duration for humans: whole seconds as `300s`, sub-second as `50ms`, else
+/// one decimal (`1.5s`). Used in timeout messages, where the budget is usually whole
+/// seconds but tests use short ones.
+pub fn human_duration(d: &Duration) -> String {
+    if d.subsec_nanos() == 0 {
+        format!("{}s", d.as_secs())
+    } else if d.as_secs() == 0 {
+        format!("{}ms", d.as_millis())
+    } else {
+        format!("{:.1}s", d.as_secs_f64())
+    }
 }
 
 impl Error {
@@ -186,6 +208,15 @@ mod tests {
             ProviderErrorKind::classify(StatusCode::INTERNAL_SERVER_ERROR, "boom"),
             ProviderErrorKind::Transient
         );
+    }
+
+    #[test]
+    fn timeout_is_its_own_variant_with_a_readable_message() {
+        let e = Error::Timeout { what: "ssh 1.2.3.4:22".into(), after: Duration::from_secs(300) };
+        assert_eq!(e.to_string(), "ssh 1.2.3.4:22 timed out after 300s");
+        assert_eq!(e.kind(), None); // not a provider error — never classified/retried as one
+        assert_eq!(human_duration(&Duration::from_millis(50)), "50ms");
+        assert_eq!(human_duration(&Duration::from_millis(1500)), "1.5s");
     }
 
     #[test]

@@ -158,6 +158,14 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `keys/*_api_keys.csv` exist (reporting what it added, or that none are set up), so a
     `setup` (or `up --setup`) makes pods fully ready. Confirms first (`--dry-run` previews,
     token redacted). Uses `GIT_SSH_KEY_LOCAL/REMOTE`, `ARENA_REPO_OWNER/NAME`, `DEFAULT_BRANCH`.
+    The repo update fetches **only the default branch, without tags** (a bare `git fetch`
+    would pull every participant's autocommit branch); a tracked non-default branch pulls
+    just its own upstream. Pods run in parallel and **every step has a time budget** —
+    copies 60s, the image config step 300s, the hetzner bare-VM script 1800s; `--timeout
+    <secs>` (or config `SETUP_TIMEOUT_SECS`; `up` uses the config value) overrides the
+    main-step budget. A wedged pod prints `✗ <name> (timed out at <step> after Ns)` and the
+    others finish normally; connection refusals right after create are still retried for
+    ~150s (sshd booting).
   - `config check | set | which` — `check` is the read-only doctor (keys + setup
     readiness); `config set KEY VALUE` writes a key (e.g. an API key) into config.env —
     or give just `KEY` and **pipe the value on stdin** (`printf %s "$TOK" | arena config

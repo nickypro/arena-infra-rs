@@ -11,3 +11,12 @@ reqwest.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
+
+[features]
+# Test doubles (`remote::FakeRemote`) for downstream crates' tests. Enabled only from
+# dev-dependencies, so it never ships in a release build.
+test-util = []
+
+[dev-dependencies]
+# Paused-clock tests (`#[tokio::test(start_paused = true)]`): timeouts/retries run instantly.
+tokio = { workspace = true, features = ["test-util"] }

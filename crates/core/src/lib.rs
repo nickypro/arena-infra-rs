@@ -19,6 +19,7 @@ pub mod pod;
 pub mod provider;
 pub mod proxy;
 pub mod pull;
+pub mod remote;
 pub mod retry;
 pub mod schedule;
 pub mod setup;
