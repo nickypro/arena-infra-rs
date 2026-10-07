@@ -334,21 +334,20 @@ impl Action {
     }
 
     /// The multi-pod menu's actions (and keys): everything except the per-pod-only
-    /// `stop`; `terminate` is offered only when a marked set is selected.
+    /// `stop`; the destructive ones (`terminate`, `restart`) are offered only for a marked
+    /// set — never for "the whole fleet" in one keystroke.
     pub fn fleet_menu(has_marked: bool) -> Vec<(char, Action)> {
         Self::MENU
             .iter()
             .copied()
-            .filter(|(_, a)| {
-                !matches!(a, Action::Stop) && (*a != Action::Terminate || has_marked)
-            })
+            .filter(|(_, a)| !matches!(a, Action::Stop) && (!a.is_destructive() || has_marked))
             .collect()
     }
 
     /// A short description shown beside the action in the menu.
     pub fn desc(&self) -> &'static str {
         match self {
-            Action::Restart => "restart in place",
+            Action::Restart => "restart — WIPES the container disk",
             Action::Stop => "stop the pod",
             Action::Terminate => "terminate — irreversible",
             Action::Backup => "commit + push the tree",
@@ -379,16 +378,39 @@ impl Action {
         matches!(self, Action::Restart | Action::Stop | Action::Terminate)
     }
 
-    /// Whether this action is irreversible (drives the IRREVERSIBLE warning).
+    /// Whether this action destroys something that can't be got back: terminate (the pod),
+    /// and restart — on RunPod a restart resets the container to its image, wiping its
+    /// disk (live finding 2026-10-07). Drives the red border and keeps both off the
+    /// whole-fleet menu.
     pub fn is_destructive(&self) -> bool {
-        matches!(self, Action::Terminate)
+        matches!(self, Action::Terminate | Action::Restart)
     }
 
     /// Whether to render the action in red in the menu — destructive *or* disruptive
     /// (stop takes the pod down). Distinct from [`Self::is_destructive`] so stop is red
     /// without claiming to be irreversible.
     pub fn is_risky(&self) -> bool {
-        matches!(self, Action::Terminate | Action::Stop)
+        matches!(self, Action::Terminate | Action::Restart | Action::Stop)
+    }
+
+    /// The warning in the confirm modal, if any. `wipes_disk`: whether the pod's provider
+    /// resets the container disk on restart / stop→start (`Provider::
+    /// restart_wipes_container_disk`; Hetzner's VM keeps it) — pass `true` when unknown.
+    pub fn warning(&self, wipes_disk: bool) -> Option<&'static str> {
+        match self {
+            Action::Terminate => Some("⚠ IRREVERSIBLE"),
+            Action::Restart if wipes_disk => Some(
+                "⚠ WIPES THE CONTAINER DISK: the pod is reset to its image — everything outside a \
+                 /workspace volume is lost (participants' files, ~/.name, git remote, keys). Back it \
+                 up first; run setup (p) afterwards.",
+            ),
+            Action::Restart => Some("hard reset: running processes are killed; the disk is kept."),
+            Action::Stop if wipes_disk => Some(
+                "⚠ a stopped RunPod pod keeps no data: its container disk is discarded and it starts \
+                 again as a fresh image (only a /workspace volume survives).",
+            ),
+            _ => None,
+        }
     }
 
     /// Actions that need a free-text argument typed first (the command / the branch),
@@ -418,11 +440,19 @@ pub struct Confirm {
     /// The exact command(s) that will run, shown for backup/setup so the operator
     /// sees precisely what's about to execute.
     pub preview: Option<String>,
+    /// Whether this pod's restart/stop resets its container disk — selects the warning
+    /// ([`Action::warning`]). Defaults to `true`: assuming a wipe only adds a warning.
+    pub wipes_disk: bool,
 }
 
 impl Confirm {
     pub fn new(action: Action, pod_name: String, pod_id: String, preview: Option<String>) -> Self {
-        Self { action, pod_name, pod_id, typed: String::new(), preview }
+        Self { action, pod_name, pod_id, typed: String::new(), preview, wipes_disk: true }
+    }
+
+    /// The warning line for this confirmation, if any.
+    pub fn warning(&self) -> Option<&'static str> {
+        self.action.warning(self.wipes_disk)
     }
 
     /// Is the confirmation satisfied enough to apply? Typed-name actions need an exact
@@ -534,7 +564,33 @@ mod tests {
         assert!(c.is_satisfied());
         assert!(!Action::Backup.requires_typed_name());
         assert!(Action::Terminate.is_destructive());
-        assert!(!Action::Restart.is_destructive());
+        assert!(!Action::Stop.is_destructive());
+        assert!(Action::Backup.warning(true).is_none());
+    }
+
+    /// Restart wipes a RunPod pod's container disk (live finding), so it's destructive like
+    /// terminate: typed name, red, the wipe spelled out, and never offered for the whole
+    /// fleet in one keystroke — only for a marked set.
+    #[test]
+    fn restart_is_destructive_and_says_it_wipes_the_disk() {
+        let mut c = Confirm::new(Action::Restart, "arena8-apple".into(), "id".into(), None);
+        assert!(Action::Restart.requires_typed_name() && Action::Restart.is_destructive() && Action::Restart.is_risky());
+        assert!(!c.is_satisfied());
+        c.typed = "arena8-apple".into();
+        assert!(c.is_satisfied());
+        // Unknown provider → assume the wipe; Hetzner's reset keeps the disk.
+        assert!(c.warning().unwrap().contains("WIPES THE CONTAINER DISK"));
+        c.wipes_disk = false;
+        let kept = c.warning().unwrap();
+        assert!(kept.contains("disk is kept") && !kept.contains("WIPES"), "{kept}");
+        assert!(Action::Stop.warning(true).unwrap().contains("keeps no data"));
+        assert!(Action::Stop.warning(false).is_none());
+        assert!(Action::Restart.desc().contains("WIPES"));
+        let fleet = |marked| Action::fleet_menu(marked).into_iter().map(|(_, a)| a).collect::<Vec<_>>();
+        assert!(!fleet(false).contains(&Action::Restart) && !fleet(false).contains(&Action::Terminate));
+        assert!(fleet(true).contains(&Action::Restart) && fleet(true).contains(&Action::Terminate));
+        assert!(!fleet(true).contains(&Action::Stop));
+        assert!(fleet(false).contains(&Action::Setup));
     }
 
     #[test]

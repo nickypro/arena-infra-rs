@@ -626,9 +626,9 @@ async fn run(
                         sel = (sel + 1).min(n - 1);
                         ui.mode = Mode::Menu { sel };
                     }
-                    KeyCode::Enter => choose_pod_action(shared, &mut ui, Action::MENU[sel.min(n - 1)].1),
+                    KeyCode::Enter => choose_pod_action(shared, &mut ui, provider, Action::MENU[sel.min(n - 1)].1),
                     KeyCode::Char(ch) => match Action::from_key(ch) {
-                        Some(action) => choose_pod_action(shared, &mut ui, action),
+                        Some(action) => choose_pod_action(shared, &mut ui, provider, action),
                         None => ui.mode = Mode::Menu { sel },
                     },
                     _ => ui.mode = Mode::Menu { sel },
@@ -844,7 +844,8 @@ async fn run(
 }
 
 /// Run a safe action against every pod concurrently, returning a summary line plus the
-/// first few failures. Used by the fleet menu (restart / backup / setup only).
+/// first few failures. Used by the fleet menu (backup / setup / test / run / set-branch, and
+/// restart / terminate on a marked set).
 async fn execute_fleet(
     provider: &Arc<dyn Provider>,
     cfg: &Config,
@@ -994,7 +995,7 @@ async fn create_pods(
 
 /// A menu pick for the cursor pod: run/set-branch collect an argument first; everything
 /// else goes through a confirm modal. Shared by the arrow-Enter and letter-key paths.
-fn choose_pod_action(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, action: Action) {
+fn choose_pod_action(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, provider: &Arc<dyn Provider>, action: Action) {
     let Some(pod) = selected_pod(shared, ui.selected) else {
         ui.mode = Mode::List;
         return;
@@ -1004,7 +1005,8 @@ fn choose_pod_action(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, action: Action) {
         Mode::Input { action, scope: InputScope::Pod { name: shown, id: pod.id }, value: String::new() }
     } else {
         let preview = build_preview(&ui.cfg, action, &pod);
-        Mode::Confirm(Confirm::new(action, shown, pod.id, preview))
+        let wipes_disk = provider.restart_wipes_container_disk(&pod);
+        Mode::Confirm(Confirm { wipes_disk, ..Confirm::new(action, shown, pod.id, preview) })
     };
 }
 
@@ -1055,6 +1057,9 @@ async fn execute(provider: &dyn Provider, cfg: &Config, action: Action, pod: &Po
     let name = &pod.name;
     match action {
         Action::Restart => match provider.restart_pod(&pod.id).await {
+            Ok(()) if provider.restart_wipes_container_disk(pod) => {
+                format!("✓ restarted {name} — reset to the image: run setup (p) once it's up")
+            }
             Ok(()) => format!("✓ restarted {name}"),
             Err(e) => format!("✗ restart {name} failed: {e}"),
         },
@@ -2002,7 +2007,7 @@ fn render_menu(f: &mut Frame, shared: &Shared, ui: &Ui, sel: usize) {
 fn render_confirm(f: &mut Frame, c: &Confirm) {
     let mut text = String::new();
     if c.action.requires_typed_name() {
-        let warn = if c.action.is_destructive() { "  ⚠ IRREVERSIBLE" } else { "" };
+        let warn = c.warning().map(|w| format!("\n\n{w}")).unwrap_or_default();
         text.push_str(&format!(
             "{} pod '{}'{}\n\nType the pod name to confirm:\n\n  > {}\n\n[enter] apply  [esc] cancel",
             c.action.label(),
@@ -2058,7 +2063,8 @@ fn render_fleet_menu(f: &mut Frame, shared: &Shared, ui: &Ui, scope: Scope, sel:
 fn render_fleet_confirm(f: &mut Frame, shared: &Shared, ui: &Ui, action: Action, typed: &str, scope: Scope) {
     let (_, who) = scope_label(shared, &ui.marked, scope);
     let token = fleet_confirm_token_str(shared, &ui.marked, scope);
-    let warn = if action.is_destructive() { "  ⚠ IRREVERSIBLE" } else { "" };
+    // Per-pod providers aren't known here: warn as if each one wipes (the safe side).
+    let warn = action.warning(true).map(|w| format!("\n\n{w}")).unwrap_or_default();
     let text = format!(
         "{} {who}.{warn}\n\nType {token} to confirm:\n\n  > {}\n\n[enter] apply  [esc] cancel",
         action.label(),

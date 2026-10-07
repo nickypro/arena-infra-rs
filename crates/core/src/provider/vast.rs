@@ -302,9 +302,15 @@ impl Provider for VastProvider {
         Ok(())
     }
 
+    fn restart_wipes_container_disk(&self, _pod: &Pod) -> bool {
+        // Unverified either way, so assume the worst (see restart_pod).
+        true
+    }
+
     async fn restart_pod(&self, id: &str) -> Result<()> {
-        // Vast has no single reboot endpoint; a restart is stop then start. Vast keeps
-        // the stopped instance, so this preserves it (just cycles the container).
+        // Vast has no single reboot endpoint; a restart is stop then start. Vast keeps the
+        // stopped instance (same id), but whether its container disk survives the cycle
+        // hasn't been verified here — so callers treat it as wiping, like RunPod's.
         for state in ["stopped", "running"] {
             let resp = self
                 .auth(

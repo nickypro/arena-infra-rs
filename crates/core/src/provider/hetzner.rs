@@ -276,6 +276,11 @@ impl Provider for HetznerProvider {
         self.power_action(id, "poweroff").await
     }
 
+    fn restart_wipes_container_disk(&self, _pod: &Pod) -> bool {
+        // A Hetzner server is a VM with a real disk: reset/poweroff/poweron keep it.
+        false
+    }
+
     async fn restart_pod(&self, id: &str) -> Result<()> {
         // "Restart" must recover a pod *in place*, including a wedged one — and the disk is
         // preserved either way. Hetzner's `reboot` is a soft ACPI signal that a hung OS just

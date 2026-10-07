@@ -8,7 +8,8 @@
 //!   callers that must not mistake "that backend didn't answer" for "that backend has no
 //!   pods" — the proxy merge, which only drops a forward on a *successful* listing.
 //! - `create_pod` goes to the chosen primary (the `--provider` / `ARENA_PROVIDER`).
-//! - `stop`/`restart`/`terminate` route to whichever backend actually owns the pod id.
+//! - `stop`/`restart`/`terminate` route to whichever backend actually owns the pod id, and
+//!   so does `restart_wipes_container_disk` (by the pod's provider tag, then the id cache).
 //! - `enrich` hands each pod to the backend that listed it; a failing backend is reported
 //!   (as one error naming it) without costing the other backends' pods their details.
 //!
@@ -157,6 +158,15 @@ impl Provider for MultiProvider {
     }
     async fn restart_pod(&self, id: &str) -> Result<()> {
         self.backend_for(id).await?.restart_pod(id).await
+    }
+    fn restart_wipes_container_disk(&self, pod: &Pod) -> bool {
+        // Ask the backend that owns the pod: by its `provider` tag first (as `enrich`),
+        // else the id→backend cache. A pod no backend claims is assumed to wipe — the
+        // answer only ever adds a confirmation, never removes one.
+        let owner = self.backends.iter().position(|b| b.name() == pod.provider).or_else(|| {
+            self.owner.lock().unwrap().get(&pod.id).copied()
+        });
+        owner.map_or(true, |i| self.backends[i].restart_wipes_container_disk(pod))
     }
     async fn terminate_pod(&self, id: &str) -> Result<()> {
         self.backend_for(id).await?.terminate_pod(id).await
@@ -338,6 +348,52 @@ mod tests {
         let total = multi(vec![Fake { name: "runpod", pods: None }, Fake { name: "vast", pods: None }]);
         let err = total.list_pods().await.unwrap_err().to_string();
         assert!(err.contains("all providers failed"), "{err}");
+    }
+
+    /// A backend whose restart keeps the disk (like Hetzner's reset).
+    struct Keeps;
+
+    #[async_trait]
+    impl Provider for Keeps {
+        fn name(&self) -> &'static str {
+            "hetzner"
+        }
+        fn describe(&self, _spec: &PodSpec) -> String {
+            String::new()
+        }
+        async fn list_pods(&self) -> Result<Vec<Pod>> {
+            Ok(vec![pod("h1", "arena8-vm")])
+        }
+        async fn create_pod(&self, _spec: &PodSpec) -> Result<Pod> {
+            unimplemented!("not exercised")
+        }
+        async fn stop_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn restart_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn terminate_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        fn restart_wipes_container_disk(&self, _pod: &Pod) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_wipes_is_answered_by_the_owning_backend() {
+        let mut m = multi(vec![Fake { name: "runpod", pods: Some(vec![pod("r1", "arena8-apple")]) }]);
+        m.backends.push(Box::new(Keeps));
+        // By provider tag (no listing needed).
+        assert!(m.restart_wipes_container_disk(&tagged_pod("r1", "runpod")));
+        assert!(!m.restart_wipes_container_disk(&tagged_pod("h1", "hetzner")));
+        // Untagged: by the id→backend cache once listed.
+        m.list_pods().await.unwrap();
+        assert!(!m.restart_wipes_container_disk(&pod("h1", "arena8-vm")));
+        assert!(m.restart_wipes_container_disk(&pod("r1", "arena8-apple")));
+        // Nobody owns it: assume it wipes (the safe answer).
+        assert!(m.restart_wipes_container_disk(&tagged_pod("x1", "lambda")));
     }
 
     #[tokio::test]

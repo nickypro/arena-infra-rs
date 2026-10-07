@@ -51,7 +51,7 @@ const MAX_PAGES: usize = 20;
 
 /// Where a persistent volume (`VOLUME_GB` > 0) is mounted: RunPod's conventional path, and
 /// what v1 used when `volumeMountPath` was omitted (v2 makes the path mandatory).
-const VOLUME_MOUNT_PATH: &str = "/workspace";
+pub const VOLUME_MOUNT_PATH: &str = "/workspace";
 
 pub struct RunpodV2Provider {
     api_key: String,
@@ -546,9 +546,15 @@ impl Provider for RunpodV2Provider {
         send(rb.json(&action_body("stop")), "stop pod").await.map(drop)
     }
 
+    fn restart_wipes_container_disk(&self, _pod: &Pod) -> bool {
+        true // live-verified 2026-10-07: restart resets the container to its image
+    }
+
     async fn restart_pod(&self, id: &str) -> Result<()> {
-        // In-place container restart of a RUNNING pod (keeps the pod and its machine),
-        // unlike stop/start. A pod in any other state answers 409.
+        // In-place container restart of a RUNNING pod (keeps the pod id and its machine),
+        // unlike stop/start. A pod in any other state answers 409. It resets the container
+        // to its image: everything outside a volume is WIPED (live-verified on a sandbox
+        // pod — a marker file, ~/.name and setup's git remote were all gone afterwards).
         let rb = api_request(&self.client, &self.api_key, Method::POST, pod_url(id, Some("action"))?);
         send(rb.json(&action_body("restart")), "restart pod").await.map(drop)
     }

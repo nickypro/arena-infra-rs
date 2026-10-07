@@ -228,9 +228,16 @@ impl Provider for RunpodProvider {
         Ok(())
     }
 
+    fn restart_wipes_container_disk(&self, _pod: &Pod) -> bool {
+        true // the container is reset to its image; only a volume survives (see restart_pod)
+    }
+
     async fn restart_pod(&self, id: &str) -> Result<()> {
-        // Dedicated restart endpoint: restarts the container in place (keeps the pod
-        // and its disk), unlike stop/start which deallocates.
+        // Dedicated restart endpoint: restarts the container on the same pod/machine
+        // (same id and GPU), unlike stop/start which deallocates. It does NOT keep the
+        // container disk: the container is reset to its image, so everything outside a
+        // volume is wiped (RunPod documents the container disk as ephemeral; the same
+        // action on v2 was live-verified to drop ~/.name and setup's git remote).
         let resp = self
             .auth(self.client.post(format!("{BASE}/pods/{id}/restart")))
             .send()

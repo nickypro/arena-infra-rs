@@ -86,9 +86,7 @@ impl SetupConfig {
 
     /// The short machine name (the part after `{prefix}-`), e.g. arena8-apple -> apple.
     pub fn short_name<'a>(&self, machine_name: &'a str) -> &'a str {
-        machine_name
-            .strip_prefix(&format!("{}-", self.prefix))
-            .unwrap_or(machine_name)
+        short_name(&self.prefix, machine_name)
     }
 
     /// The on-pod provisioning command, run *after* the key has been scp'd. `force`
@@ -132,10 +130,7 @@ impl SetupConfig {
             ssh_config,
             authorized_keys,
             self.repo_update_command(force),
-            format!(
-                "echo {} > \"$HOME/.name\"",
-                q(&format!("export MACHINE_NAME='{}'", self.short_name(machine_name)))
-            ),
+            name_file_command(self.short_name(machine_name)),
         ];
         // Coding agents (claude code + codex) + tmux. All idempotent; the whole block runs in
         // a `set +e` subshell ending in `|| true`, so a flaky installer never aborts setup.
@@ -260,6 +255,24 @@ ZSH_BIN=$(command -v zsh); [ -n "$ZSH_BIN" ] && chsh -s "$ZSH_BIN" "$(id -un)" >
             )),
         )
     }
+}
+
+/// The short machine name for `prefix`: the part after `{prefix}-` (`arena8-apple` →
+/// `apple`); a name without the prefix (an absolute `@name` entry) is returned whole.
+/// Free-standing (as well as [`SetupConfig::short_name`]) because `pods rename` rewrites
+/// `~/.name` without needing the repo/deploy-key settings a full [`SetupConfig`] demands.
+pub fn short_name<'a>(prefix: &str, machine_name: &'a str) -> &'a str {
+    machine_name.strip_prefix(&format!("{prefix}-")).unwrap_or(machine_name)
+}
+
+/// The command that writes `~/.name` (`export MACHINE_NAME='<short>'`, overwriting) — the
+/// one place its format lives: setup's step 5, and `pods rename`, which must leave the
+/// file exactly as a fresh setup under the new name would.
+pub fn name_file_command(short: &str) -> String {
+    format!(
+        "echo {} > \"$HOME/.name\"",
+        shell_quote(&format!("export MACHINE_NAME='{short}'"))
+    )
 }
 
 /// Time budgets for one pod's provisioning steps. Per step, not per pod, because the
@@ -642,6 +655,18 @@ mod tests {
     fn short_name_strips_prefix() {
         assert_eq!(cfg().short_name("arena8-apple"), "apple");
         assert_eq!(cfg().short_name("apple"), "apple");
+        assert_eq!(short_name("arena9", "arena9-bloom"), "bloom");
+        assert_eq!(short_name("arena9", "james-gpu"), "james-gpu"); // absolute entry
+        assert_eq!(short_name("arena9", "arena8-bloom"), "arena8-bloom"); // other prefix: whole
+    }
+
+    /// `pods rename` rewrites `~/.name` with `name_file_command`: it must be byte-for-byte
+    /// the step setup runs, so a renamed pod looks exactly like one set up under the name.
+    #[test]
+    fn name_file_command_is_setups_name_step() {
+        let cmd = name_file_command("apple");
+        assert_eq!(cmd, r#"echo 'export MACHINE_NAME='\''apple'\''' > "$HOME/.name""#);
+        assert!(cfg().remote_command("arena8-apple", false).contains(&cmd));
     }
 
     #[test]

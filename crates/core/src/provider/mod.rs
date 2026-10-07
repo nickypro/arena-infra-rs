@@ -180,12 +180,32 @@ pub trait Provider: Send + Sync {
     /// Mutating. Callers gate this behind an explicit apply/confirm step.
     async fn create_pod(&self, spec: &PodSpec) -> Result<Pod>;
 
-    /// Mutating.
+    /// Mutating. On a backend where [`Self::restart_wipes_container_disk`] holds, a
+    /// stopped pod's container disk is gone when it starts again (RunPod: "Stopping a pod
+    /// keeps no data" — only a volume survives), so callers gate it like a restart.
     async fn stop_pod(&self, id: &str) -> Result<()>;
 
-    /// Mutating. Restart in place (preserves the machine/disk where the provider
-    /// supports it), for when a pod is wedged.
+    /// Mutating, and on most backends DESTRUCTIVE: restart in place (same id, same
+    /// machine), for when a pod is wedged. It is *not* a reboot that keeps files: on
+    /// RunPod (REST v1 and v2) the container is reset to its image, so the container disk
+    /// — everything outside a persistent/network volume: participants' work, `~/.name`,
+    /// setup's git remote, distributed keys — is wiped (live-verified on v2, 2026-10-07;
+    /// RunPod documents the container disk as ephemeral). Hetzner's hard reset keeps the
+    /// VM disk. Callers ask [`Self::restart_wipes_container_disk`] and confirm (and re-run
+    /// setup) accordingly.
     async fn restart_pod(&self, id: &str) -> Result<()>;
+
+    /// Whether restarting `pod` — or stopping it and starting it again — resets its
+    /// container disk to the image, leaving only a persistent volume (if it has one).
+    /// Drives the restart/stop confirm text and the `--wipe-ok` gate.
+    ///
+    /// Default **true**: a backend that hasn't said otherwise is assumed to wipe, so a new
+    /// provider can only err towards one confirmation too many, never towards silent data
+    /// loss. Takes the pod (not just `self`) so the fleet provider can route the question
+    /// to the backend that owns it, like every per-pod call.
+    fn restart_wipes_container_disk(&self, _pod: &Pod) -> bool {
+        true
+    }
 
     /// Mutating and irreversible.
     async fn terminate_pod(&self, id: &str) -> Result<()>;
@@ -269,6 +289,19 @@ mod tests {
             assert!(e.contains("unrecognised value of") && e.contains("not shown"), "{e}");
         }
         assert!(api("RUNPOD_API=rpa_SECRETKEY123").unwrap_err().to_string().contains("of 16 chars"));
+    }
+
+    /// Restart safety (live finding 2026-10-07): RunPod's restart resets the container to
+    /// its image, on both API generations; Vast's stop+start is unverified and treated the
+    /// same; only Hetzner's VM disk survives. The CLI/TUI gate restart/stop on this answer.
+    #[test]
+    fn only_hetzner_keeps_the_disk_across_a_restart() {
+        let any = Pod::default();
+        let keys = "RUNPOD_API_KEY=k\nVAST_API_KEY=v\nHETZNER_API_KEY=h\n";
+        for (name, api, wipes) in [("runpod", "v1", true), ("runpod", "v2", true), ("vast", "v1", true), ("hetzner", "v1", false)] {
+            let p = build(name, &Config::parse(&format!("{keys}RUNPOD_API={api}"))).unwrap();
+            assert_eq!(p.restart_wipes_container_disk(&any), wipes, "{name} {api}");
+        }
     }
 
     /// `build("runpod")` follows RUNPOD_API. Both report as `runpod`; the v2 backend says so

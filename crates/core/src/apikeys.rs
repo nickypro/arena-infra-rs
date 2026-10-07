@@ -102,6 +102,59 @@ pub fn upsert_csv(text: &str, host: &str, key: &str) -> String {
     s
 }
 
+/// Whether a CSV line is a data row for `host` (`<host>,<key>`; comments never are).
+fn is_row_for(line: &str, host: &str) -> bool {
+    line.split_once(',').map(|(h, _)| h.trim() == host).unwrap_or(false)
+}
+
+/// Rejoin CSV lines the way [`upsert_csv`] writes them (one trailing newline).
+fn join_lines(lines: Vec<String>) -> String {
+    let mut s = lines.join("\n");
+    s.push('\n');
+    s
+}
+
+/// What [`rename_csv_host`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CsvRename {
+    /// The rewritten text: every `old,<key>` row now reads `new,<key>` (key untouched).
+    Renamed(String),
+    /// `old` has no row — nothing to move.
+    NoRow,
+    /// `new` already has a row of its own (e.g. a key minted for that name earlier and
+    /// never revoked). Left alone: two rows for one host would make `copy-keys` export
+    /// both keys, the later silently winning — the operator has to pick one.
+    Taken,
+}
+
+/// Move a machine's per-host key to its new name (`pods rename`): rename the host column
+/// of `old`'s row(s) to `new`, keeping the key and every other line (comments included).
+pub fn rename_csv_host(text: &str, old: &str, new: &str) -> CsvRename {
+    if !text.lines().any(|l| is_row_for(l, old)) {
+        return CsvRename::NoRow;
+    }
+    if old != new && text.lines().any(|l| is_row_for(l, new)) {
+        return CsvRename::Taken;
+    }
+    let lines = text
+        .lines()
+        .map(|l| match l.split_once(',') {
+            Some((h, key)) if h.trim() == old => format!("{new},{key}"),
+            _ => l.to_string(),
+        })
+        .collect();
+    CsvRename::Renamed(join_lines(lines))
+}
+
+/// Drop a machine's row(s) from a per-host keys CSV (`terminate --revoke-key`, after its
+/// key was revoked), keeping every other line. `None` when `host` has no row.
+pub fn remove_csv_host(text: &str, host: &str) -> Option<String> {
+    if !text.lines().any(|l| is_row_for(l, host)) {
+        return None;
+    }
+    Some(join_lines(text.lines().filter(|l| !is_row_for(l, host)).map(String::from).collect()))
+}
+
 /// Render an idempotent shell command that ensures each `export NAME="value"` line is
 /// present in both `~/.bashrc` and `~/.zshrc` (creating the files if absent). Safe to
 /// re-run: a line already present is not appended again.
@@ -199,6 +252,33 @@ arena8-bloom,sk-ccc,extra-ignored-no
         // append a new host
         let a = upsert_csv(text, "arena8-nova", "sk-or-n");
         assert!(a.trim_end().ends_with("arena8-nova,sk-or-n"));
+    }
+
+    #[test]
+    fn rename_csv_host_moves_the_row_and_keeps_the_rest() {
+        let text = "# OpenRouter API keys — arena iteration: arena8\narena8-apple,sk-or-a\narena8-bloom , sk-or-b\njames-gpu,sk-or-j\n";
+        let CsvRename::Renamed(r) = rename_csv_host(text, "arena8-apple", "arena8-cloud") else { panic!() };
+        assert_eq!(r, "# OpenRouter API keys — arena iteration: arena8\narena8-cloud,sk-or-a\narena8-bloom , sk-or-b\njames-gpu,sk-or-j\n");
+        assert_eq!(parse_csv(&r).len(), 3);
+        // Spaces around the host still match; the key (and its spacing) is kept as-is.
+        let CsvRename::Renamed(r) = rename_csv_host(text, "arena8-bloom", "arena9-bloom") else { panic!() };
+        assert!(r.contains("arena9-bloom, sk-or-b") && !r.contains("arena8-bloom"), "{r}");
+        // Absolute names are just hosts too.
+        let CsvRename::Renamed(r) = rename_csv_host(text, "james-gpu", "arena8-mayor") else { panic!() };
+        assert!(parse_csv(&r).contains(&("arena8-mayor".into(), "sk-or-j".into())));
+        // No row → nothing to move; the new name already holding a key → left alone.
+        assert_eq!(rename_csv_host(text, "arena8-zebra", "arena8-cloud"), CsvRename::NoRow);
+        assert_eq!(rename_csv_host(text, "arena8-apple", "arena8-bloom"), CsvRename::Taken);
+        // A comment that merely mentions the host is not a row.
+        assert_eq!(rename_csv_host("# arena8-apple,old\n", "arena8-apple", "x"), CsvRename::NoRow);
+    }
+
+    #[test]
+    fn remove_csv_host_drops_only_that_hosts_rows() {
+        let text = "# keys\narena8-apple,sk-or-a\narena8-bloom,sk-or-b\n";
+        assert_eq!(remove_csv_host(text, "arena8-apple").unwrap(), "# keys\narena8-bloom,sk-or-b\n");
+        assert_eq!(remove_csv_host(text, "arena8-zebra"), None);
+        assert_eq!(remove_csv_host("# arena8-apple,x\n", "arena8-apple"), None);
     }
 
     #[test]

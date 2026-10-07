@@ -64,13 +64,34 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     RunPod GraphQL query per `list` (best-effort: if it fails you get one warning line and
     the list still renders); the `nvidia-smi` probe over SSH (default for the table,
     `--probe`/`--no-probe`) overrides the GPU when a pod answers. `list --json` emits the
-    pods incl. `gpu_count`/`cost_per_hr`/`maintenance`. `restart` restarts in place (RunPod restart / Hetzner
-    reboot / Vast stop+start), preserving the machine where supported. `terminate
+    pods incl. `gpu_count`/`cost_per_hr`/`maintenance`. **`restart` WIPES a RunPod pod's
+    container disk** (live finding: the container is reset to its image — everything
+    outside a `/workspace` volume, `~/.name`, setup's git remote and keys are gone; Vast's
+    stop+start is treated the same, unverified; a Hetzner hard reset keeps the VM disk). The
+    prompt says what's lost and what survives (the volume size comes from the pod's spec);
+    a pod with **no volume, or none confirmed, is refused unless `--wipe-ok`** (even with
+    `--yes`). Afterwards it waits for the endpoint to settle, **re-runs `setup`** on the pod
+    (`--no-setup` skips) and syncs the proxy (`--skip-proxy`), so it comes back usable; if
+    that setup fails the error says to run `pods setup <name>`, not another restart. `stop`
+    gets the same gate (`--wipe-ok`): a stopped RunPod pod keeps no data. `terminate
     --all` tears down the **whole fleet** (confirms first; `--dry-run` lists every
     pod without touching them) — for end-of-program teardown (`terminate <name> --all` is
-    refused). `stop apple..mayor` / `stop --all --exclude bloom` stops many at once (running
+    refused). `terminate … --revoke-key` also deletes each terminated machine's OpenRouter
+    key(s) (found by name; needs `OPENROUTER_PROVISIONING_KEY`) and drops its row from
+    `keys/openrouter_api_keys.csv` — only for pods that actually terminated; a failed revoke
+    keeps the row, is named, and makes the exit non-zero without stopping any terminate.
+    `stop apple..mayor` / `stop --all --exclude bloom` stops many at once (running
     pods only; needs targets or `--all`); `kill` is the stop→wait-for-
     EXITED→delete flow (`--timeout`; one target or `--all`).
+  - `rename <old> <new>` / `rename --from-prefix <p>` renames the pod (metadata only, no
+    restart) and then brings along what's keyed by the name: rewrites `~/.name` over SSH
+    (setup's exact `export MACHINE_NAME='<short>'` line; an unreachable pod is reported with
+    a `pods setup <name>` hint, never fatal), moves the machine's row in the keys CSV (the
+    per-cohort file the symlink points at) and renames its key on OpenRouter in place
+    (`PATCH /keys/{hash}` `name`; skipped quietly with no CSV / no provisioning key; a new
+    name that already has its own row or key is left alone and warned about), then syncs
+    the proxy. The pod's `MACHINE_NAME` env var keeps the old name (env only changes with a
+    reimage) — the output says so. `--dry-run` lists every step.
   - `create` also takes **explicit names** (`pods create apple bloom`) and an
     **`--image`** override, alongside `-n`(target total) / `-a`(add). Bare names get
     the configured prefix; names already present are skipped.
@@ -308,11 +329,13 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
   - **Navigate** with `↑/↓`/`j/k`; `enter` opens a per-pod detail pane (per-GPU
     breakdown, full branch/origin/health, util/temp **sparklines**). `Ctrl-C`/`q` quit.
   - **Act** on the selected pod with `a` (restart / stop / terminate / backup / setup /
-    test / run / set-branch), on the **whole fleet** with `A` (restart / backup / setup /
-    test / run / set-branch), or **add pods** with `n`. `run` and `set-branch` pop a
+    test / run / set-branch), on the **whole fleet** with `A` (backup / setup /
+    test / run / set-branch; restart and terminate only on a **marked** set), or **add pods** with `n`. `run` and `set-branch` pop a
     text-input modal to type the command / branch; `test` is read-only. Every mutation
     goes through a confirmation modal — the *only* place the TUI mutates anything.
     Lifecycle actions (restart/stop/terminate) require **typing the pod's exact name**;
+    restart is destructive like terminate (red, and its modal says it wipes the container
+    disk on RunPod/Vast; Hetzner: "disk kept");
     fleet mutations require typing **ALL**; backup/setup/test show the precise
     command(s) and take a single `y`. The dashboard's reads stay reads.
   - **Add-pod (`n`)** is an interactive form: `↑↓` moves between fields, `←→` changes
