@@ -1,18 +1,40 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 
 /// A provider-agnostic view of a running (or requested) machine.
-#[derive(Debug, Clone, Serialize)]
+///
+/// `Default` exists so tests and fakes can spell only the fields they care about
+/// (`Pod { name, ..Default::default() }`); providers always fill `id`/`name`/`status`.
+/// `Deserialize` lets `pods list --json` output round-trip (scripts, snapshots).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Pod {
     pub id: String,
     pub name: String,
     pub provider: String,
     pub status: String,
     pub gpu_type: Option<String>,
+    /// GPUs attached to the pod, when the provider reports it (RunPod `gpuCount`, Vast
+    /// `num_gpus`). `None` for CPU VMs and providers that don't say.
+    #[serde(default)]
+    pub gpu_count: Option<u32>,
     pub cost_per_hr: Option<f64>,
     pub ssh_ip: Option<String>,
     pub ssh_port: Option<u16>,
+    /// The host's scheduled maintenance window, when the provider exposes one (RunPod's
+    /// GraphQL `machine.maintenanceStart/End/Note`). A pod on a host going into
+    /// maintenance will be stopped by the provider, so this is surfaced in `pods list`.
+    #[serde(default)]
+    pub maintenance: Option<Maintenance>,
+}
+
+/// A provider-reported maintenance window for the host a pod runs on. Times are kept as
+/// the provider's own strings (RunPod sends ISO-8601) — they're displayed, not computed on.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Maintenance {
+    pub start: Option<String>,
+    pub end: Option<String>,
+    pub note: Option<String>,
 }
 
 /// What we want when creating a machine. Provider implementations translate this

@@ -96,6 +96,7 @@ mod tests {
             cost_per_hr: None,
             ssh_ip: ip.map(String::from),
             ssh_port: port,
+            ..Default::default()
         }
     }
 

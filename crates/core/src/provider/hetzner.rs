@@ -153,6 +153,9 @@ fn parse_server(v: &Value) -> Pod {
             .map(String::from),
         // Cloud VMs expose plain SSH on 22.
         ssh_port: Some(22),
+        // CPU VMs: no GPUs, and Hetzner has no per-server maintenance window in the API.
+        gpu_count: None,
+        maintenance: None,
     }
 }
 

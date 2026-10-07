@@ -105,9 +105,11 @@ fn parse_pod(v: &Value) -> Pod {
         // GPU type id is not returned in the list view (`machine` is empty there);
         // these paths populate it on create / detailed responses.
         gpu_type: str_at(&[&["machine", "gpuDisplayName"], &["machine", "gpuType"], &["gpuTypeId"]]),
+        gpu_count: v.get("gpuCount").and_then(Value::as_u64).map(|n| n as u32),
         cost_per_hr: v.get("costPerHr").and_then(Value::as_f64),
         ssh_ip,
         ssh_port,
+        maintenance: None,
     }
 }
 

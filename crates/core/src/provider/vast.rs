@@ -175,9 +175,11 @@ fn parse_instance(v: &Value) -> Pod {
         provider: "vast".into(),
         status,
         gpu_type: v.get("gpu_name").and_then(Value::as_str).map(String::from),
+        gpu_count: v.get("num_gpus").and_then(Value::as_u64).map(|n| n as u32),
         cost_per_hr: v.get("dph_total").and_then(Value::as_f64),
         ssh_ip: v.get("ssh_host").and_then(Value::as_str).map(String::from),
         ssh_port: v.get("ssh_port").and_then(Value::as_u64).map(|n| n as u16),
+        maintenance: None,
     }
 }
 
@@ -264,9 +266,11 @@ impl Provider for VastProvider {
             provider: "vast".into(),
             status: "CREATING".into(),
             gpu_type: Some(offer.gpu_name),
+            gpu_count: Some(offer.num_gpus),
             cost_per_hr: Some(offer.dph_total),
             ssh_ip: None,
             ssh_port: None,
+            maintenance: None,
         })
     }
 

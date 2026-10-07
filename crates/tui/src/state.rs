@@ -452,6 +452,7 @@ mod tests {
             cost_per_hr: cost,
             ssh_ip: Some("1.2.3.4".into()),
             ssh_port: Some(22001),
+            ..Default::default()
         }
     }
 
