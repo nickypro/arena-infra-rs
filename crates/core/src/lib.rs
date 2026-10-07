@@ -16,6 +16,7 @@ pub(crate) mod http;
 pub mod metrics;
 pub mod naming;
 pub mod openrouter;
+pub mod pipeline;
 pub mod placement;
 pub mod plan;
 pub mod pod;

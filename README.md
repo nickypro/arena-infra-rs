@@ -115,14 +115,30 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
   - `offers [--gpu …] [--cloud …] [--max-price …] [--gpus N] [--order …] [--json]` —
     read-only: the same option table (OPTION, CLOUD, $/H/POD, PRICE source, STOCK, plus what
     the cap dropped and why), i.e. what `create`/`up` would try. `--json` = the plan.
-  - `pods up -n N` — one-command spin-up: create, poll until each pod has an SSH
-    endpoint, then **wire the proxy**: if nginx is set up on the proxy host (or the proxy
-    is write-only) it deploys as endpoints appear, and ends with the same one-line sync
-    as the other lifecycle commands (below) — or a note saying why it skipped.
-    `--setup` also provisions each pod over SSH. So `pods up -n 28 --gpu A40 --cloud
-    SECURE --disk 200 --retry-mins 60 --setup` is a full start-of-iteration spin-up that
-    waits for capacity then wires everything. Confirms first (`--dry-run` previews);
-    `--no-wait` skips polling.
+  - `pods up -n N` — one-command spin-up: create, then **one independent pipeline per
+    pod** (never a batch): wait for *its* SSH endpoint and sshd answering (`--timeout`,
+    default 600s, per pod)
+    → sync the proxy (one writer at a time) → provision it (`--no-setup` skips) →
+    [`--check`: deep check] → copy its API keys (when `keys/*_api_keys.csv` exist) →
+    `[name] READY after 4m10s — …` or `[name] FAILED <stage>: …`, printed the moment that
+    pod is done — a slow pod never holds up another. One fleet listing per `--interval`
+    serves every pod's endpoint wait. Ends with the usual one-line proxy sync and a `NAME
+    GPU $/H PROXY PORT HEALTH STATUS READY AFTER` table (READY AFTER = first create →
+    confirmed ready, replacements included: start participants' clocks at READY), plus a
+    line per name that failed, warned or was replaced; exits non-zero unless every pod is
+    READY. A pod that fails is left running — one is only ever terminated to make room for
+    its `--check` replacement.
+    **`--check`** deep-checks each pod after setup (`pods test --deep`). A FAIL is a bad
+    host: the pod is terminated, confirmed gone (never two pods per name), and the name
+    recreated from the same `--gpu/--cloud/--max-price` options (or the one configured spec)
+    — options that haven't failed first — and run through the pipeline again; a replacement
+    that lands on a machine IP that already failed (any name's) is rejected unseen. Up to
+    `--check-attempts N` placements per name (default 2); the last failing pod is left
+    running for a look. A WARN counts as ready (shown in HEALTH). **Ctrl+C** stops every
+    pipeline where it is, starts nothing new, terminates nothing, and reports.
+    So `pods up -n 28 --gpu A40 --cloud SECURE --disk 200 --retry-mins 60 --check` is a full
+    start-of-iteration spin-up. Confirms first (`--dry-run` previews the pipeline);
+    `--no-wait` skips everything after the create (not with `--check`).
   - Batch create (`create`/`up`) uses **typed provider errors** (`ProviderErrorKind`):
     on **capacity** exhaustion it stops gracefully and keeps the pods it got (e.g.
     "created 6 of 10") rather than erroring — `--keep-trying` instead waits and
@@ -283,14 +299,15 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     keys** if any
     `keys/*_api_keys.csv` exist (reporting what it added, or that none are set up) — to
     exactly the pods that just provisioned successfully, never one that failed or timed
-    out — so a `setup` (or `up --setup`) makes pods fully ready. Confirms first (`--dry-run` previews,
+    out — so a `setup` (or `up`, per pod) makes pods fully ready. Confirms first (`--dry-run` previews,
     token redacted). Uses `GIT_SSH_KEY_LOCAL/REMOTE`, `ARENA_REPO_OWNER/NAME`, `DEFAULT_BRANCH`.
     The repo update fetches **only the default branch, without tags** (a bare `git fetch`
     would pull every participant's autocommit branch); a tracked non-default branch pulls
     just its own upstream. Pods run in parallel and **every step has a time budget** —
     copies 60s, the image config step 300s, the hetzner bare-VM script 1800s; `--timeout
     <secs>` (or config `SETUP_TIMEOUT_SECS`, 1..86400; `up`/`replace`/`migrate copy` use the
-    config value and reject a bad one *before* creating anything) overrides the
+    config value and reject a bad one — and `up` missing `ARENA_REPO_*` unless `--no-setup`,
+    or with `--check` a bad `MIN_DRIVER_VERSION` — *before* creating anything) overrides the
     main-step budget. A wedged pod prints `✗ <name> (timed out at <step> after Ns)` and the
     others finish normally; a timed-out `ssh`/`scp` is stopped (SIGTERM, so scp also stops
     its ssh transport; SIGKILL 2s later). Connection refusals right after create are still

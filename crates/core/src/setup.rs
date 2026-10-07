@@ -453,6 +453,21 @@ impl ProvisionOutcome {
     pub fn is_done(&self) -> bool {
         matches!(self, ProvisionOutcome::Done)
     }
+
+    /// What happened, without the pod's name: `done`, `timed out at <step> after Ns`, or
+    /// `failed at <step>, exit N: <stderr>` — for a line that already names the pod (the
+    /// fleet runner's, or `up`'s per-pod `[name] FAILED setup: …`).
+    pub fn describe(&self) -> String {
+        match self {
+            ProvisionOutcome::Done => "done".to_string(),
+            ProvisionOutcome::TimedOut { step, after } => format!("timed out at {step} after {}", human_duration(after)),
+            ProvisionOutcome::Failed { step, code, detail } => {
+                let exit = code.map(|c| format!(", exit {c}")).unwrap_or_default();
+                let tail = if detail.is_empty() { String::new() } else { format!(": {detail}") };
+                format!("failed at {step}{exit}{tail}")
+            }
+        }
+    }
 }
 
 /// The fleet runner's per-pod progress line: `[done/total] ✓ name`, or
@@ -461,9 +476,7 @@ impl ProvisionOutcome {
 pub fn progress_line(done: usize, total: usize, name: &str, outcome: &ProvisionOutcome) -> String {
     match outcome {
         ProvisionOutcome::Done => format!("[{done}/{total}] ✓ {name}"),
-        ProvisionOutcome::TimedOut { step, after } => {
-            format!("[{done}/{total}] ✗ {name} (timed out at {step} after {})", human_duration(after))
-        }
+        ProvisionOutcome::TimedOut { .. } => format!("[{done}/{total}] ✗ {name} ({})", outcome.describe()),
         ProvisionOutcome::Failed { step, code, detail } => {
             let exit = code.map(|c| format!(", exit {c}")).unwrap_or_default();
             let tail = if detail.is_empty() { String::new() } else { format!(": {detail}") };
@@ -901,6 +914,16 @@ mod tests {
         assert_eq!(
             progress_line(3, 3, "c", &Failed { step: "repo + keys config", code: None, detail: String::new() }),
             "[3/3] ✗ c (failed at repo + keys config)"
+        );
+        // The same reasons without the name/counter, for a line that already names the pod.
+        assert_eq!(Done.describe(), "done");
+        assert_eq!(
+            TimedOut { step: "repo + keys config", after: secs(300) }.describe(),
+            "timed out at repo + keys config after 300s"
+        );
+        assert_eq!(
+            Failed { step: "copy deploy key", code: Some(1), detail: "scp: denied".into() }.describe(),
+            "failed at copy deploy key, exit 1: scp: denied"
         );
     }
 

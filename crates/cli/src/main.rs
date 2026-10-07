@@ -18,6 +18,8 @@ use arena_core::remote::{describe_error, Remote, PROBE_TIMEOUT};
 use arena_core::ssh::SshTarget;
 use arena_core::{Config, PodSpec};
 
+mod up;
+
 const DEFAULT_CONFIG: &str = "/home/dev/prod-ro/config.env";
 
 #[derive(Parser)]
@@ -463,7 +465,22 @@ enum PodCmd {
         #[arg(long, default_value_t = 60)]
         retry_secs: u64,
     },
-    /// Spin up: create pods, wait for SSH endpoints, then wire the proxy.
+    /// Spin up: create pods, then bring each up on its own — endpoint, proxy, setup, keys.
+    ///
+    /// After the create every pod runs an independent pipeline: wait for its SSH endpoint →
+    /// sync the proxy → provision it (unless --no-setup) → [--check: deep-check it] → copy
+    /// its API keys (when keys/*_api_keys.csv exist) → `[name] READY …` or `[name] FAILED
+    /// <stage>: …`, printed the moment that pod is done; one slow pod never holds up another.
+    /// Ends with a NAME/GPU/$/H/PROXY PORT/HEALTH/STATUS/READY AFTER table and exits non-zero
+    /// if any pod isn't READY. A pod that fails is left running: one is only ever terminated
+    /// to make room for its --check replacement.
+    ///
+    /// --check: a pod that FAILs the deep check (`pods test --deep`) is on a bad host — it
+    /// is TERMINATED and its name recreated from the same --gpu/--cloud/--max-price options
+    /// (options that haven't failed first), up to --check-attempts placements per name; a
+    /// replacement that lands on a machine IP that already failed is rejected the same way.
+    /// A WARN counts as ready. Ctrl+C: no new attempts, nothing terminated, report.
+    #[command(verbatim_doc_comment)]
     Up {
         /// Explicit machine names to create (e.g. `apple bloom`), like `pods create`.
         /// Bare names get the configured prefix. Mutually exclusive with -n/-a.
@@ -514,7 +531,7 @@ enum PodCmd {
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
         /// Don't poll after creating; just print ids (run `proxy plan` later).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "check")]
         no_wait: bool,
         /// On capacity exhaustion, wait and keep retrying instead of stopping (one GPU/cloud
         /// only — with several options use --retry-mins).
@@ -528,14 +545,25 @@ enum PodCmd {
         /// Seconds between retry rounds.
         #[arg(long, default_value_t = 60)]
         retry_secs: u64,
-        /// Skip provisioning the new pods over SSH. By default `up` runs setup on the
-        /// pods it creates (deploy key + repo + tokens, or the hetzner bare-VM script).
+        /// Skip provisioning the new pods over SSH (and so their API keys). By default `up`
+        /// runs setup on each pod it creates (deploy key + repo + tokens, or the hetzner
+        /// bare-VM script) as soon as that pod has an endpoint.
         #[arg(long)]
         no_setup: bool,
-        /// Give up waiting for endpoints after this many seconds.
+        /// After setup, deep-check each pod (`pods test --deep`); a pod that FAILs is
+        /// terminated and its name recreated (see --check-attempts). A WARN counts as ready.
+        #[arg(long)]
+        check: bool,
+        /// With --check: placements per name in total, the first create included (2 = one
+        /// replacement). A pod that fails its last attempt is left running, never terminated.
+        #[arg(long, default_value_t = 2, requires = "check", value_parser = clap::value_parser!(u32).range(1..=10))]
+        check_attempts: u32,
+        /// Per pod (and per replacement): how long it may take to come up — its SSH endpoint
+        /// to appear, then sshd to answer on it. Past that it's `FAILED endpoint`, left running.
         #[arg(long, default_value_t = 600)]
         timeout: u64,
-        /// Seconds between readiness polls (one list call per poll, whole fleet).
+        /// Seconds between endpoint polls (one list call per poll for the whole fleet, shared
+        /// by every pod's pipeline).
         #[arg(long, default_value_t = 12)]
         interval: u64,
     },
@@ -1109,17 +1137,28 @@ fn apply_spec_overrides(spec: &mut PodSpec, ov: &SpecOverrides) {
     }
 }
 
+/// A pod this run created: when its create returned (tokio's clock — `up` times each pod's
+/// create→ready from it, not from when a batch of creates finished), and which placement
+/// option it landed on (`None` = the single-spec path), so `up --check` knows what a
+/// replacement should try first.
+#[derive(Debug)]
+struct Made {
+    pod: arena_core::Pod,
+    at: tokio::time::Instant,
+    option: Option<usize>,
+}
+
 /// A create that failed part-way. `created` are the pods made before the failure: they
 /// exist (and bill) whatever happened next, so the caller still finishes its job for them
 /// — the proxy sync — before reporting `error`.
 #[derive(Debug)]
 struct CreateFailed {
-    created: Vec<arena_core::Pod>,
+    created: Vec<Made>,
     error: anyhow::Error,
 }
 
 impl CreateFailed {
-    fn new(created: Vec<arena_core::Pod>, error: anyhow::Error) -> Self {
+    fn new(created: Vec<Made>, error: anyhow::Error) -> Self {
         Self { created, error }
     }
 }
@@ -1137,7 +1176,7 @@ async fn create_with_retry(
     keep_trying: bool,
     retry_mins: u64,
     retry_secs: u64,
-) -> std::result::Result<Vec<arena_core::Pod>, CreateFailed> {
+) -> std::result::Result<Vec<Made>, CreateFailed> {
     // Round 1 creates exactly the names that were previewed + confirmed, so the
     // `[created] …` output matches the `[y/N]` prompt. `target` (a provider-scoped total,
     // computed once in plan_create) bounds the whole operation: retries only ever re-plan
@@ -1145,7 +1184,7 @@ async fn create_with_retry(
     let retry_secs = retry_secs.max(1);
     // tokio's clock (not std's), so the paused-clock tests drive the window.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(retry_mins * 60);
-    let mut all: Vec<arena_core::Pod> = Vec::new();
+    let mut all: Vec<Made> = Vec::new();
     let mut names = initial;
     let shown = if target == 0 { names.len() } else { target };
     let mut round = 0u32;
@@ -1191,7 +1230,7 @@ async fn create_with_retry(
         // Re-plan toward the SAME target so the next round only fills the shortfall.
         // Explicit names (target == 0) just retry the ones not created yet.
         names = if target == 0 {
-            names.into_iter().filter(|n| !all.iter().any(|p| &p.name == n)).collect()
+            names.into_iter().filter(|n| !all.iter().any(|m| &m.pod.name == n)).collect()
         } else {
             match plan_create(provider, cfg, Want::Total(target)).await {
                 Ok(plan) => plan.names,
@@ -1208,7 +1247,7 @@ async fn create_pods(
     names: &[String],
     keep_trying: bool,
     ov: &SpecOverrides,
-) -> std::result::Result<Vec<arena_core::Pod>, CreateFailed> {
+) -> std::result::Result<Vec<Made>, CreateFailed> {
     use arena_core::ProviderErrorKind as K;
 
     let base = spec_with_overrides(cfg, ov);
@@ -1227,7 +1266,7 @@ async fn create_pods(
             match arena_core::retry::retrying(&policy, || provider.create_pod(&spec)).await {
                 Ok(pod) => {
                     println!("[created] {} id={}", pod.name, pod.id);
-                    created.push(pod);
+                    created.push(Made { pod, at: tokio::time::Instant::now(), option: None });
                     continue 'names;
                 }
                 Err(e) => match e.kind() {
@@ -1469,6 +1508,21 @@ async fn plan_placement(
     Ok(plan)
 }
 
+/// The single-spec path's one option, as a plan — what an `up --check` replacement creates
+/// from when no `--gpu`/`--cloud` list or `--max-price` was given: the same GPU, count and
+/// tier the first create used. Unpriced (that path never quoted one).
+fn single_option_plan(provider_name: &str, spec: &PodSpec) -> arena_core::placement::OptionPlan {
+    use arena_core::placement::{plan_options, Order, PriceBook, Request};
+    let req = Request {
+        gpus: vec![spec.gpu_type.clone()],
+        clouds: vec![spec.cloud_type.trim().to_uppercase()],
+        gpu_count: spec.gpu_count,
+        max_price: None,
+        order: Order::Listed,
+    };
+    plan_options(&req, provider_name, &PriceBook::unpriced())
+}
+
 /// The line above an option table: provider, GPUs per pod, order, cap.
 fn plan_header(plan: &arena_core::placement::OptionPlan) -> String {
     use arena_core::placement::Order;
@@ -1536,7 +1590,7 @@ fn placement_prompt(
 /// Ordered placement for `names` (see `arena_core::placement::place`): progress lines as it
 /// goes, then the per-name summary. Same contract as [`create_with_retry`]: every pod made,
 /// or — on an auth/other failure — those pods inside [`CreateFailed`], so the caller still
-/// syncs the proxy for them.
+/// syncs the proxy for them. Each [`Made`] carries the option it landed on.
 #[allow(clippy::too_many_arguments)]
 async fn place_names(
     provider: &dyn Provider,
@@ -1547,8 +1601,8 @@ async fn place_names(
     plan: &arena_core::placement::OptionPlan,
     retry_mins: u64,
     retry_secs: u64,
-) -> std::result::Result<Vec<arena_core::Pod>, CreateFailed> {
-    use arena_core::placement::{self, End, Progress, Rounds, TopUp};
+) -> std::result::Result<Vec<Made>, CreateFailed> {
+    use arena_core::placement::{self, End, Outcome, Progress, Rounds, TopUp};
     let rounds = Rounds {
         window: std::time::Duration::from_secs(retry_mins * 60),
         every: std::time::Duration::from_secs(retry_secs.max(1)),
@@ -1569,9 +1623,26 @@ async fn place_names(
     let ctrl_c = || async {
         let _ = tokio::signal::ctrl_c().await;
     };
+    let start = tokio::time::Instant::now();
     let run = placement::place(provider, base, &names, plan, rounds, topup.as_ref(), ctrl_c, &mut show).await;
     print!("\n{}", placement::render_summary(plan, &run));
     let (placed, total) = (run.created.len(), names.len());
+    // Each pod with its option and create time, from the attempt that made it.
+    let made: Vec<Made> = run
+        .created
+        .iter()
+        .map(|pod| {
+            let created = run.log.iter().flat_map(|l| &l.attempts).find_map(|a| match &a.outcome {
+                Outcome::Created { pod_id } if *pod_id == pod.id => Some((a.option, a.at)),
+                _ => None,
+            });
+            Made {
+                pod: pod.clone(),
+                at: start + created.map_or(Duration::ZERO, |(_, at)| at),
+                option: created.map(|(k, _)| k),
+            }
+        })
+        .collect();
     match run.end {
         End::Filled => println!("Placed {placed} of {total}."),
         End::Exhausted => eprintln!(
@@ -1588,7 +1659,7 @@ async fn place_names(
                 "authentication failed"
             };
             let error = anyhow::anyhow!("{what} creating {name}: {error}");
-            return Err(CreateFailed::new(run.created, error));
+            return Err(CreateFailed::new(made, error));
         }
         End::Failed { name, error } => {
             eprintln!("placed {placed}/{total} before failure");
@@ -1596,10 +1667,10 @@ async fn place_names(
                 Some(name) => anyhow::anyhow!("creating {name}: {error}"),
                 None => anyhow::Error::new(error),
             };
-            return Err(CreateFailed::new(run.created, error));
+            return Err(CreateFailed::new(made, error));
         }
     }
-    Ok(run.created)
+    Ok(made)
 }
 
 #[tokio::main]
@@ -2012,6 +2083,50 @@ fn failure_line(done: usize, total: usize, name: &str, call: &PodCall) -> String
     }
 }
 
+/// The provisioning settings `pods setup` (and `up`'s per-pod setup) run with: config's,
+/// plus the broadcast tokens — `--hf-token`/`--cc-token` over config, so a token can be
+/// supplied without editing the read-only prod config — and `--zsh-install`. Also returns
+/// the `Broadcast tokens: …` line saying which will be exported.
+fn setup_config(
+    cfg: &Config,
+    hf_token: Option<String>,
+    cc_token: Option<String>,
+    zsh_install: bool,
+) -> Result<(arena_core::setup::SetupConfig, String)> {
+    let token_value = |k: &str| -> Option<String> {
+        let flag = match k {
+            "HF_TOKEN" => hf_token.clone(),
+            "CLAUDE_CODE_OAUTH_TOKEN" => cc_token.clone(),
+            _ => None,
+        };
+        flag.or_else(|| cfg.get(k).filter(|s| !s.is_empty()).map(String::from))
+    };
+    let mut scfg = arena_core::setup::SetupConfig::from_config(cfg)?;
+    scfg.broadcast_exports = arena_core::apikeys::broadcast_env_vars(&token_value);
+    scfg.zsh_install = zsh_install;
+    // Which broadcast tokens (HF, Claude Code) will be exported (an optional step).
+    let token_summary: Vec<String> = arena_core::apikeys::BROADCAST_TOKENS
+        .iter()
+        .map(|(key, display, _)| format!("{display} {}", if token_value(key).is_some() { "✓" } else { "✗" }))
+        .collect();
+    let line = format!("Broadcast tokens: {} (✓ exported on each pod; ✗ skipped)", token_summary.join(", "));
+    Ok((scfg, line))
+}
+
+/// Bare-VM (hetzner) pods scp [`HETZNER_SETUP`]; write it once to a temp file and return
+/// its path — only when `needed` (a hetzner pod is in the target set): a runpod-only setup
+/// (e.g. `replace`) needs no hetzner script, and writing one is pure overhead (`""` then).
+/// The filename carries the pid so concurrent runs (or another user's run) never collide on
+/// a fixed path and hit EACCES overwriting a file they don't own.
+fn stage_hetzner_script(needed: bool) -> Result<String> {
+    if !needed {
+        return Ok(String::new());
+    }
+    let p = std::env::temp_dir().join(format!("arena-hetzner-setup-{}.sh", std::process::id()));
+    std::fs::write(&p, HETZNER_SETUP).context("writing hetzner setup script to a temp file")?;
+    Ok(p.to_string_lossy().into_owned())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_setup(
     provider: &dyn Provider,
@@ -2036,25 +2151,8 @@ async fn handle_setup(
     use arena_core::setup::{provisioning_steps, BootRetry, ProvisionStep};
     use arena_core::ssh::SshTarget;
 
-    // Broadcast token values: CLI flags override config (so a token can be supplied
-    // without editing the read-only prod config).
-    let token_value = |k: &str| -> Option<String> {
-        let flag = match k {
-            "HF_TOKEN" => hf_token.clone(),
-            "CLAUDE_CODE_OAUTH_TOKEN" => cc_token.clone(),
-            _ => None,
-        };
-        flag.or_else(|| cfg.get(k).filter(|s| !s.is_empty()).map(String::from))
-    };
-    let mut scfg = arena_core::setup::SetupConfig::from_config(cfg)?;
-    scfg.broadcast_exports = arena_core::apikeys::broadcast_env_vars(&token_value);
-    scfg.zsh_install = zsh_install;
-    // Report which broadcast tokens (HF, Claude Code) will be exported (optional step).
-    let token_summary: Vec<String> = arena_core::apikeys::BROADCAST_TOKENS
-        .iter()
-        .map(|(key, display, _)| format!("{display} {}", if token_value(key).is_some() { "✓" } else { "✗" }))
-        .collect();
-    println!("Broadcast tokens: {} (✓ exported on each pod; ✗ skipped)", token_summary.join(", "));
+    let (scfg, tokens_line) = setup_config(cfg, hf_token, cc_token, zsh_install)?;
+    println!("{tokens_line}");
     let pods = provider.list_pods().await.context("listing pods for setup")?;
     let mut targets = Vec::new();
     for pod in &pods {
@@ -2088,18 +2186,7 @@ async fn handle_setup(
         return Ok(());
     }
 
-    // Bare-VM (hetzner) pods scp this script; write it once to a temp file. Only stage it
-    // when a hetzner pod is actually in the target set — a runpod-only setup (e.g. `replace`)
-    // needs no hetzner script, and writing one is pure overhead. The filename carries the pid
-    // so concurrent runs (or another user's run) never collide on a fixed path and hit EACCES
-    // overwriting a file they don't own.
-    let hetzner_script = if targets.iter().any(|(_, prov, _)| prov == "hetzner") {
-        let p = std::env::temp_dir().join(format!("arena-hetzner-setup-{}.sh", std::process::id()));
-        std::fs::write(&p, HETZNER_SETUP).context("writing hetzner setup script to a temp file")?;
-        p.to_string_lossy().into_owned()
-    } else {
-        String::new()
-    };
+    let hetzner_script = stage_hetzner_script(targets.iter().any(|(_, prov, _)| prov == "hetzner"))?;
 
     if !apply {
         // Redact broadcast token values in the *previewed* command — the dry-run prints
@@ -3343,28 +3430,33 @@ fn sync_line(why: &str, s: &ProxySync) -> String {
 async fn sync_proxy(cfg: &Config, fleet: &dyn Provider, why: &str) -> ProxySync {
     let outcome = match proxy_deployable(cfg).await {
         Err(reason) => ProxySync::Skipped(reason),
-        Ok(()) => {
-            let listing = fleet_listing(fleet).await;
-            match deploy_proxy(cfg, &listing, false).await {
-                Ok((prepared, written)) => ProxySync::Synced {
-                    written,
-                    counts: prepared.plan.counts(),
-                    removed: prepared
-                        .plan
-                        .changes
-                        .iter()
-                        .filter(|c| matches!(c.kind, arena_core::proxy::ChangeKind::Removed { .. }))
-                        .map(|c| c.forward.name.clone())
-                        .collect(),
-                    pending: prepared.plan.pending.len(),
-                    failed_providers: listing.errors().iter().map(|(p, _)| p.to_string()).collect(),
-                    routed: prepared.plan.routed(),
-                },
-                Err(e) => ProxySync::Failed(format!("{e:#}")),
-            }
-        }
+        Ok(()) => proxy_sync_now(cfg, fleet).await,
     };
     report_sync(why, outcome)
+}
+
+/// [`sync_proxy`]'s merge + write, without its deployability probe or its report line — for
+/// a caller that probed once and reports in its own words (`up`'s per-pod pipelines, which
+/// also make sure no two of these run at once).
+async fn proxy_sync_now(cfg: &Config, fleet: &dyn Provider) -> ProxySync {
+    let listing = fleet_listing(fleet).await;
+    match deploy_proxy(cfg, &listing, false).await {
+        Ok((prepared, written)) => ProxySync::Synced {
+            written,
+            counts: prepared.plan.counts(),
+            removed: prepared
+                .plan
+                .changes
+                .iter()
+                .filter(|c| matches!(c.kind, arena_core::proxy::ChangeKind::Removed { .. }))
+                .map(|c| c.forward.name.clone())
+                .collect(),
+            pending: prepared.plan.pending.len(),
+            failed_providers: listing.errors().iter().map(|(p, _)| p.to_string()).collect(),
+            routed: prepared.plan.routed(),
+        },
+        Err(e) => ProxySync::Failed(format!("{e:#}")),
+    }
 }
 
 /// Print a sync's line (failures to stderr) and hand the outcome back.
@@ -4052,7 +4144,7 @@ async fn handle_pods(
             }
         }
 
-        PodCmd::Up { names, count, add, gpu, gpus, cloud, max_price, order, disk, volume, image, bootstrap, dry_run, no_wait, keep_trying, retry_mins, retry_secs, no_setup, timeout, interval } => {
+        PodCmd::Up { names, count, add, gpu, gpus, cloud, max_price, order, disk, volume, image, bootstrap, dry_run, no_wait, keep_trying, retry_mins, retry_secs, no_setup, check, check_attempts, timeout, interval } => {
             let gpu = checked_gpu(cfg, provider.name(), gpu).await?;
             let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap };
             // Several --gpu/--cloud options or a --max-price → ordered placement (as `create`).
@@ -4075,17 +4167,20 @@ async fn handle_pods(
                 return Ok(());
             }
 
-            // Setup runs after create: reject a malformed SETUP_TIMEOUT_SECS *before*
-            // creating (billing) pods, not after.
+            // The pipelines' config is checked *before* creating (billing) pods, not after: a
+            // malformed SETUP_TIMEOUT_SECS / MIN_DRIVER_VERSION fails here.
             let setup_timeouts = if no_setup {
                 arena_core::setup::SetupTimeouts::default()
             } else {
                 arena_core::setup::SetupTimeouts::from_config(cfg, None)?
             };
+            let policy = if check { Some(arena_core::health::HealthPolicy::from_config(cfg)?) } else { None };
             let (spec, options) = match placing {
                 Some((req, base)) => (base, Some(plan_placement(cfg, provider.name(), &req).await?)),
                 None => (spec_with_overrides(cfg, &ov), None),
             };
+            let keys = (!no_setup).then(|| KeySources::load(cfg, KEYS_DIR, None, None)).filter(|k| !k.csv.is_empty());
+            let per_pod = up::pipeline_text(!no_setup, check.then_some(check_attempts), keys.is_some());
             if dry_run {
                 match &options {
                     Some(plan) => print_placement_preview(provider, plan, &spec, &names),
@@ -4097,19 +4192,24 @@ async fn handle_pods(
                     }
                 }
                 warn_no_volume(provider, &spec);
-                let extra = if no_setup { "" } else { " then provision them," };
                 let retry = if retry_mins > 0 { format!(" (retrying up to {retry_mins}m for capacity)") } else { String::new() };
                 println!(
-                    "\nDry-run only — no pods created (preview){retry}: would create the above, \
-                     poll up to {timeout}s for SSH endpoints,{extra} then update the proxy (if nginx is set up)."
+                    "\nDry-run only — no pods created (preview){retry}: would create the above, then {per_pod}. \
+                     Each pod waits up to {timeout}s for its endpoint."
                 );
                 return Ok(());
             }
+            // Provisioning settings too: a config without ARENA_REPO_* must fail before the
+            // create, not strand the new pods after it.
+            let setup = if no_setup {
+                None
+            } else {
+                Some(setup_config(cfg, None, None, false).context("provisioning settings (or pass --no-setup)")?)
+            };
 
             let then = format!(
-                "{}, wait for endpoints{}, then update the proxy if nginx is set up",
+                "{}, then {per_pod}",
                 if retry_mins > 0 { format!(", retrying up to {retry_mins}m") } else { String::new() },
-                if no_setup { "" } else { ", provision them" },
             );
             let what = match &options {
                 Some(plan) => placement_prompt(provider, plan, &spec, &names, &then)?,
@@ -4122,10 +4222,9 @@ async fn handle_pods(
                 println!("aborted.");
                 return Ok(());
             }
-            // Create as many as capacity allows (retrying if requested); only wait on
-            // the ones we got. Proxy is deployed *after* this returns — i.e. once the
-            // retry loop has finished topping up. Explicit names create directly. A create
-            // that failed part-way still syncs the proxy for the pods it made, then fails.
+            // Create as many as capacity allows (retrying if requested); the pipelines run
+            // on the ones we got. Explicit names create directly. A create that failed
+            // part-way still syncs the proxy for the pods it made, then fails.
             let outcome = match &options {
                 Some(plan) => place_names(provider, cfg, names, topup_target, &spec, plan, retry_mins, retry_secs).await,
                 None => create_with_retry(provider, cfg, names, topup_target, &ov, keep_trying, retry_mins, retry_secs).await,
@@ -4143,89 +4242,65 @@ async fn handle_pods(
                 eprintln!("no pods were created — nothing to wait for");
                 return Ok(());
             }
-            // Match readiness by pod id, not name: a provider's reported name doesn't
-            // always equal the name we asked for (e.g. Vast's `vast-<id>` fallback),
-            // which would make us wait forever on a pod that's actually up.
-            let want_ids: std::collections::HashSet<String> =
-                created.iter().map(|p| p.id.clone()).collect();
-
             if no_wait {
                 println!("\n--no-wait: not polling. Run `arena proxy apply` once endpoints are assigned.");
                 sync_proxy(cfg, provider, "up").await;
                 return Ok(());
             }
 
-            // Is there a proxy to deploy to? (Decides deploy-as-they-come; checked once up
-            // front, with the same check the final sync makes.)
-            let deployable = proxy_deployable(cfg).await.is_ok();
-
-            // Poll until our pods have SSH endpoints or we hit the timeout, updating
-            // nginx as endpoints appear (idempotent — reloads only on a real change).
-            // Ctrl+C stops the wait early. Stateless: each tick re-reads truth. Each tick
-            // lists per provider, so the proxy merge never mistakes a provider that
-            // didn't answer for one whose pods are all gone.
-            let interval = interval.max(1);
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
-            let is_ready = |p: &arena_core::Pod| p.ssh_ip.is_some() && p.ssh_port.is_some();
-            println!(
-                "\nWaiting up to {timeout}s for SSH endpoints{} (Ctrl+C to stop)…",
-                if deployable { ", updating nginx as they come up" } else { "" }
-            );
-            let pods = loop {
-                let listing = fleet_listing(provider).await;
-                if !listing.any_ok() {
-                    let errs: Vec<String> = listing.errors().iter().map(|(p, e)| format!("{p}: {e}")).collect();
-                    eprintln!("  poll failed ({}); retrying", errs.join("; "));
-                }
-                let pods = listing.pods();
-                let ready = pods.iter().filter(|p| want_ids.contains(&p.id) && is_ready(p)).count();
-                println!("  {ready}/{} ready", want_ids.len());
-                if deployable && listing.any_ok() {
-                    if let Err(e) = deploy_proxy(cfg, &listing, true).await {
-                        eprintln!("  proxy update failed: {e}");
-                    }
-                }
-                if ready == want_ids.len() || std::time::Instant::now() >= deadline {
-                    break pods;
-                }
-                tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}
-                    _ = tokio::signal::ctrl_c() => {
-                        eprintln!("interrupted — stopping wait");
-                        break pods;
-                    }
+            // One independent pipeline per pod (see `up`). Replacements draw from the
+            // confirmed options — on the single-spec path, that one spec as an option.
+            let options = options.unwrap_or_else(|| single_option_plan(provider.name(), &spec));
+            let hetzner = provider.name() == "hetzner" || created.iter().any(|m| m.pod.provider == "hetzner");
+            let setup = match setup {
+                None => None,
+                Some((scfg, tokens)) => {
+                    println!("{tokens}");
+                    Some(up::SetupStage { scfg, timeouts: setup_timeouts, hetzner_script: stage_hetzner_script(hetzner)? })
                 }
             };
-
-            let not_ready: Vec<&str> = created
-                .iter()
-                .filter(|c| !pods.iter().any(|p| p.id == c.id && is_ready(p)))
-                .map(|c| c.name.as_str())
-                .collect();
-            if !not_ready.is_empty() {
-                eprintln!(
-                    "{} pod(s) still without an endpoint: {} — re-run `arena proxy apply` once they're up.",
-                    not_ready.len(),
-                    not_ready.join(", ")
-                );
+            match &keys {
+                Some(k) => println!("API keys: {} — copied to each pod once it's set up", k.csv.join(", ")),
+                None if setup.is_some() => println!(
+                    "API keys: none generated in {KEYS_DIR}/ — skipping (run `arena keys gen --all` or drop in \
+                     <provider>_api_keys.csv, then `pods copy-keys`)."
+                ),
+                None => {}
             }
-            // Provision the pods we just created over SSH (deploy key + repo + tokens, or
-            // the bare-VM script for hetzner), unless --no-setup. Scoped to the new pods so
-            // a top-up `up` doesn't re-provision the whole fleet.
-            let setup = if no_setup {
-                Ok(())
-            } else {
-                println!("\nProvisioning the new pod(s) over SSH…");
-                let new: Vec<String> = created.iter().map(|p| p.name.clone()).collect();
-                handle_setup(provider, remote.clone(), cfg, true, false, None, None, false, setup_timeouts, Some(&new), KEYS_DIR)
-                    .await
+            let run = up::UpRun {
+                provider,
+                remote: remote.clone(),
+                cfg,
+                options,
+                base: spec,
+                rounds: arena_core::placement::Rounds {
+                    window: Duration::from_secs(retry_mins * 60),
+                    every: Duration::from_secs(retry_secs.max(1)),
+                },
+                timeout: Duration::from_secs(timeout),
+                interval: Duration::from_secs(interval.max(1)),
+                proxy: proxy_deployable(cfg).await,
+                setup,
+                check: policy.map(|policy| up::CheckStage {
+                    policy,
+                    attempts: check_attempts,
+                    cmd: arena_core::health::deep_check_command(Some(cfg.get("CONDA_ENV").unwrap_or("arena-env"))),
+                }),
+                keys,
             };
-            // Final state: one more merge from a fresh listing (an endpoint can move while
-            // setup runs), and the one line saying where the proxy stands — including why
-            // it was skipped when there's nothing to deploy to. Runs even if setup failed:
-            // the pods exist either way.
-            sync_proxy(cfg, provider, "up").await;
-            setup?;
+            println!(
+                "\nBringing up {} pod(s), each on its own (endpoint wait ≤{timeout}s per pod; Ctrl+C stops — \
+                 nothing is terminated by it)…",
+                created.len()
+            );
+            let interrupt = async {
+                // No handler (can't happen on unix): then there's nothing to wait for.
+                if tokio::signal::ctrl_c().await.is_err() {
+                    std::future::pending::<()>().await
+                }
+            };
+            let rows = up::run_up(&run, created, interrupt, &up::console).await;
+            up::conclude(&rows, &up::console)?;
         }
 
         PodCmd::Stop { target, all, include, exclude, dry_run } => {
@@ -4712,7 +4787,7 @@ async fn deep_check_fleet(
     cfg: &Config,
     names: &[String],
 ) -> Result<Vec<arena_core::health::PodHealth>> {
-    use arena_core::health::{deep_check_command, parse_deep, HealthPolicy, PodHealth, DEEP_CHECK_TIMEOUT};
+    use arena_core::health::{deep_check_command, HealthPolicy, PodHealth, DEEP_CHECK_TIMEOUT};
     // Config first: a malformed MIN_DRIVER_VERSION fails before any pod is touched.
     let policy = HealthPolicy::from_config(cfg)?;
     let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
@@ -4795,29 +4870,42 @@ async fn deep_check_fleet(
             results.push(PodHealth::unreachable(pod, "no result from the check"));
             continue;
         };
-        results.push(match call {
-            Err(why) => PodHealth::unreachable(pod, why),
-            Ok(out) => {
-                let facts = parse_deep(&out.stdout);
-                let stderr = out.stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
-                if !facts.started && !out.success {
-                    // ssh itself failed (255 = refused/auth/…): say that, not "no output".
-                    PodHealth::unreachable(pod, format!("exit {:?}: {stderr}", out.code))
-                } else {
-                    let started = facts.started;
-                    let mut health = PodHealth::checked(pod, facts, &policy);
-                    // The script never started (e.g. no `base64` on the pod): stderr says why.
-                    if !started && !stderr.is_empty() {
-                        for c in health.checks.iter_mut().filter(|c| c.name == "script") {
-                            c.detail = format!("{} ({stderr})", c.detail);
-                        }
-                    }
-                    health
-                }
-            }
-        });
+        results.push(judge_deep_call(pod, call, &policy));
     }
     Ok(results)
+}
+
+/// One pod's deep-check call → its verdict: the script's facts judged by `policy`, or a
+/// FAIL saying why there are none (no answer, ssh itself failed, the script never
+/// started). Shared by `pods test --deep` and `up --check`, so a pod is judged the same
+/// way by both.
+fn judge_deep_call(
+    pod: &arena_core::Pod,
+    call: PodCall,
+    policy: &arena_core::health::HealthPolicy,
+) -> arena_core::health::PodHealth {
+    use arena_core::health::{parse_deep, PodHealth};
+    match call {
+        Err(why) => PodHealth::unreachable(pod, why),
+        Ok(out) => {
+            let facts = parse_deep(&out.stdout);
+            let stderr = out.stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+            if !facts.started && !out.success {
+                // ssh itself failed (255 = refused/auth/…): say that, not "no output".
+                PodHealth::unreachable(pod, format!("exit {:?}: {stderr}", out.code))
+            } else {
+                let started = facts.started;
+                let mut health = PodHealth::checked(pod, facts, policy);
+                // The script never started (e.g. no `base64` on the pod): stderr says why.
+                if !started && !stderr.is_empty() {
+                    for c in health.checks.iter_mut().filter(|c| c.name == "script") {
+                        c.detail = format!("{} ({stderr})", c.detail);
+                    }
+                }
+                health
+            }
+        }
+    }
 }
 
 /// Names held by more than one pod, with those pods' ids (in listing order) — for the
@@ -6839,6 +6927,87 @@ async fn copy_to_pod(remote: &dyn Remote, t: &SshTarget, plan: &CopyPlan) -> std
     }
 }
 
+/// The API keys `copy-keys` (and `up`'s per-pod keys stage) hand out: per-host vars from
+/// the `<provider>_api_keys.csv` files in a keys dir, and the broadcast tokens (`--hf-token`
+/// / `--cc-token` over config) that every targeted pod gets.
+struct KeySources {
+    /// host (exact pod name) -> [(ENV_NAME, value), …].
+    per_host: std::collections::HashMap<String, Vec<(String, String)>>,
+    broadcast: Vec<(String, String)>,
+    /// `OpenAI (3 hosts)` per CSV with rows — empty = no per-host keys at all.
+    csv: Vec<String>,
+    /// Display names of the broadcast tokens that are set (`Hugging Face`, …).
+    broadcast_names: Vec<&'static str>,
+}
+
+impl KeySources {
+    fn load(cfg: &Config, keys_dir: &str, hf_token: Option<String>, cc_token: Option<String>) -> Self {
+        use arena_core::apikeys;
+        let mut per_host: std::collections::HashMap<String, Vec<(String, String)>> = Default::default();
+        let mut csv = Vec::new();
+        for (base, display, env_names) in apikeys::PROVIDERS {
+            let path = format!("{}/{base}_api_keys.csv", keys_dir.trim_end_matches('/'));
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            let rows = apikeys::parse_csv(&text);
+            if rows.is_empty() {
+                continue;
+            }
+            csv.push(format!("{display} ({} host{})", rows.len(), if rows.len() == 1 { "" } else { "s" }));
+            for (host, key) in rows {
+                let entry = per_host.entry(host).or_default();
+                for env in *env_names {
+                    entry.push((env.to_string(), key.clone()));
+                }
+            }
+        }
+        // Broadcast tokens (HF, Claude Code): a flag overrides the config value.
+        let token_value = |k: &str| -> Option<String> {
+            let flag = match k {
+                "HF_TOKEN" => hf_token.clone(),
+                "CLAUDE_CODE_OAUTH_TOKEN" => cc_token.clone(),
+                _ => None,
+            };
+            flag.or_else(|| cfg.get(k).filter(|s| !s.is_empty()).map(String::from))
+        };
+        let broadcast = apikeys::broadcast_env_vars(&token_value);
+        let broadcast_names =
+            apikeys::BROADCAST_TOKENS.iter().filter(|(key, _, _)| token_value(key).is_some()).map(|(_, d, _)| *d).collect();
+        Self { per_host, broadcast, csv, broadcast_names }
+    }
+
+    /// One pod's vars — the broadcast tokens plus its per-host keys — and whether it matched
+    /// a per-host row at all (on its exact name).
+    fn vars_for(&self, name: &str) -> (Vec<(String, String)>, bool) {
+        let mut vars = self.broadcast.clone();
+        let matched = self.per_host.get(name).map(|h| vars.extend(h.iter().cloned())).is_some();
+        (vars, matched)
+    }
+}
+
+/// The fleet-SSH half of a key write, and how many fleet keys it authorizes: authorize the
+/// fleet pubkeys (arena8 + arena_infra + admin) and write the host map into `~/.ssh/config`
+/// so pods can ssh each other with the arena_infra key. The stable proxy layout (survives
+/// restarts) when a proxy is configured, else the live endpoints of `pods`.
+fn fleet_ssh_for(cfg: &Config, pods: &[arena_core::Pod]) -> (String, usize) {
+    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
+    let fleet_pubkeys = arena_core::ssh::authorized_pubkeys(cfg);
+    let ssh_user = cfg.get("SSH_USER").unwrap_or("root");
+    let pod_identity = cfg.get("GIT_SSH_KEY_REMOTE").unwrap_or("/root/.ssh/id_ed25519");
+    let fleet_cfg = match arena_core::proxy::ProxyConfig::from_config(cfg) {
+        Ok(px) if !cfg.machine_names.is_empty() => arena_core::sshconfig::render_proxy(
+            prefix, ssh_user, pod_identity, &px.proxy_host, px.starting_port, &cfg.machine_names,
+        ),
+        _ => arena_core::sshconfig::render_manual(prefix, ssh_user, pod_identity, pods),
+    };
+    (fleet_ssh_command(&fleet_pubkeys, &fleet_cfg), fleet_pubkeys.len())
+}
+
+/// One pod's key write: the token export lines + the fleet SSH (authorized_keys +
+/// `~/.ssh/config`), in one round-trip.
+fn copy_keys_command(vars: &[(String, String)], fleet_ssh: &str) -> String {
+    format!("{}; {}", arena_core::apikeys::remote_export_command(vars), fleet_ssh)
+}
+
 /// `pods copy-keys`: distribute API keys to each pod's shell. Per-host keys come from
 /// `<keys_dir>/<provider>_api_keys.csv`; a Hugging Face token (from `--hf-token` or
 /// config `HF_TOKEN`) is broadcast to every pod (for gated repos like Llama 3).
@@ -6857,51 +7026,19 @@ async fn handle_copy_keys(
     dry_run: bool,
     yes: bool,
 ) -> Result<()> {
-    use arena_core::apikeys;
     use arena_core::ssh::SshTarget;
-    use std::collections::HashMap;
 
-    // Per-host vars from the CSVs: host -> [(ENV_NAME, value), …].
-    let mut per_host: HashMap<String, Vec<(String, String)>> = HashMap::new();
-    let mut sources: Vec<String> = Vec::new();
-    for (base, display, env_names) in apikeys::PROVIDERS {
-        let path = format!("{}/{base}_api_keys.csv", keys_dir.trim_end_matches('/'));
-        let Ok(text) = std::fs::read_to_string(&path) else { continue };
-        let rows = apikeys::parse_csv(&text);
-        if rows.is_empty() {
-            continue;
-        }
-        sources.push(format!("{display} ({} host{})", rows.len(), if rows.len() == 1 { "" } else { "s" }));
-        for (host, key) in rows {
-            let entry = per_host.entry(host).or_default();
-            for env in *env_names {
-                entry.push((env.to_string(), key.clone()));
-            }
-        }
-    }
-
-    // Broadcast tokens (HF, Claude Code): --hf-token overrides config HF_TOKEN; the rest
-    // (e.g. CLAUDE_CODE_OAUTH_TOKEN) come from config.
-    let token_value = |k: &str| -> Option<String> {
-        let flag = match k {
-            "HF_TOKEN" => hf_token.clone(),
-            "CLAUDE_CODE_OAUTH_TOKEN" => cc_token.clone(),
-            _ => None,
-        };
-        flag.or_else(|| cfg.get(k).filter(|s| !s.is_empty()).map(String::from))
-    };
-    let broadcast = apikeys::broadcast_env_vars(&token_value);
+    let keys = KeySources::load(cfg, keys_dir, hf_token, cc_token);
+    let mut sources = keys.csv.clone();
     // "broadcast" = same value on every *targeted* pod (vs per-host CSV keys). Say "all pods"
     // only when there's no include/target filter — otherwise it misleadingly implies the whole
     // fleet when you've restricted to specific pods.
     let bcast_scope = if include.is_empty() { "broadcast to all pods" } else { "broadcast" };
-    for (key, display, _) in apikeys::BROADCAST_TOKENS {
-        if token_value(key).is_some() {
-            sources.push(format!("{display} ({bcast_scope})"));
-        }
+    for display in &keys.broadcast_names {
+        sources.push(format!("{display} ({bcast_scope})"));
     }
 
-    if per_host.is_empty() && broadcast.is_empty() {
+    if keys.per_host.is_empty() && keys.broadcast.is_empty() {
         anyhow::bail!(
             "no keys to copy: put `<provider>_api_keys.csv` in {keys_dir}/ \
              (openai/anthropic/openrouter), set HF_TOKEN / CLAUDE_CODE_OAUTH_TOKEN, or pass --hf-token"
@@ -6926,15 +7063,13 @@ async fn handle_copy_keys(
     // hides behind a per-pod ✓, so nobody notices the per-host keys never landed.
     let mut broadcast_only: Vec<String> = Vec::new();
     for pod in &pods {
-        let mut vars = broadcast.clone();
-        let matched_per_host =
-            per_host.get(&pod.name).map(|h| vars.extend(h.iter().cloned())).is_some();
+        let (vars, matched_per_host) = keys.vars_for(&pod.name);
         if vars.is_empty() {
             continue; // nothing for this pod
         }
         match SshTarget::from_pod(pod, cfg) {
             Ok(t) => {
-                if !matched_per_host && !per_host.is_empty() {
+                if !matched_per_host && !keys.per_host.is_empty() {
                     broadcast_only.push(pod.name.clone());
                 }
                 jobs.push((pod.name.clone(), t, vars));
@@ -6956,25 +7091,14 @@ async fn handle_copy_keys(
         );
     }
 
-    // Also wire fleet SSH on every reachable pod: authorize the fleet pubkeys (arena8 +
-    // arena_infra + admin) and write the host map into ~/.ssh/config so pods can ssh each
-    // other with the arena_infra key. Prefer the stable proxy layout (survives restarts);
-    // fall back to live endpoints if no proxy is configured. Built once — same on every pod.
-    let fleet_pubkeys = arena_core::ssh::authorized_pubkeys(cfg);
-    let ssh_user = cfg.get("SSH_USER").unwrap_or("root");
-    let pod_identity = cfg.get("GIT_SSH_KEY_REMOTE").unwrap_or("/root/.ssh/id_ed25519");
-    let fleet_cfg = match arena_core::proxy::ProxyConfig::from_config(cfg) {
-        Ok(px) if !cfg.machine_names.is_empty() => arena_core::sshconfig::render_proxy(
-            prefix, ssh_user, pod_identity, &px.proxy_host, px.starting_port, &cfg.machine_names,
-        ),
-        _ => arena_core::sshconfig::render_manual(prefix, ssh_user, pod_identity, &pods),
-    };
-    let fleet_ssh = fleet_ssh_command(&fleet_pubkeys, &fleet_cfg);
+    // Also wire fleet SSH on every reachable pod (see `fleet_ssh_for`). Built once — same
+    // on every pod.
+    let (fleet_ssh, fleet_keys) = fleet_ssh_for(cfg, &pods);
     println!(
         "Also on each target ({} pod(s)): authorize {} fleet key(s) + write that pod's own \
          ~/.ssh/config (the fleet host map, so it can ssh the others).",
         jobs.len(),
-        fleet_pubkeys.len()
+        fleet_keys
     );
 
     if dry_run {
@@ -6994,8 +7118,7 @@ async fn handle_copy_keys(
     let total = jobs.len();
     let mut set = tokio::task::JoinSet::new();
     for (name, t, vars) in jobs {
-        // Tokens (export lines) + fleet SSH (authorized_keys + ~/.ssh/config) in one round-trip.
-        let cmd = format!("{}; {}", apikeys::remote_export_command(&vars), fleet_ssh);
+        let cmd = copy_keys_command(&vars, &fleet_ssh);
         let remote = remote.clone();
         set.spawn(async move { (name, remote.exec(&t, &cmd, Some(COPY_KEYS_TIMEOUT)).await) });
     }
@@ -9353,6 +9476,8 @@ mod placement_cli_tests {
             retry_mins: 0,
             retry_secs: 60,
             no_setup: false,
+            check: true,
+            check_attempts: 2,
             timeout: 600,
             interval: 12,
         };
@@ -9382,6 +9507,8 @@ mod placement_cli_tests {
             retry_mins: 0,
             retry_secs: 60,
             no_setup: true,
+            check: false,
+            check_attempts: 2,
             timeout: 600,
             interval: 12,
         };
@@ -10066,7 +10193,7 @@ mod remote_tests {
 
     /// What the deep-check script prints on a healthy 2×A4000 pod, after some zshrc
     /// chatter (which the parser must skip).
-    const DEEP_HEALTHY: &str = "\
+    pub(crate) const DEEP_HEALTHY: &str = "\
 Welcome back! conda env: arena-env
 deep_check=1
 load1=0.84
@@ -10103,7 +10230,7 @@ deep_check_end=1
 ";
 
     /// A bad host: nvidia-smi is fine, CUDA init fails with error 999.
-    const DEEP_CUINIT_999: &str = "\
+    pub(crate) const DEEP_CUINIT_999: &str = "\
 deep_check=1
 load1=1.20
 cpus=64
