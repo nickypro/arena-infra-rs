@@ -159,6 +159,30 @@ fn parse_server(v: &Value) -> Pod {
     }
 }
 
+/// Servers per page we ask for (Hetzner's maximum; the default is 25).
+const PER_PAGE: u64 = 50;
+/// Hard stop for the pagination loop (50 × 20 = 1000 servers — far beyond any cohort).
+const MAX_PAGES: u64 = 20;
+
+/// One page of a 2xx `GET /servers` body: the `servers` array plus the next page number
+/// (`meta.pagination.next_page`, `None` on the last page or when no pagination is given).
+/// A body with no `servers` array is schema drift and an error — NOT an empty list, which
+/// the proxy merge would read as "every Hetzner server terminated". Fail closed.
+fn servers_page(body: &Value) -> Result<(&Vec<Value>, Option<u64>)> {
+    let servers = body.get("servers").and_then(Value::as_array).ok_or_else(|| {
+        Error::provider(format!(
+            "hetzner list: unexpected response shape (no servers array): {}",
+            super::body_excerpt(body)
+        ))
+    })?;
+    let next = body
+        .get("meta")
+        .and_then(|m| m.get("pagination"))
+        .and_then(|p| p.get("next_page"))
+        .and_then(Value::as_u64);
+    Ok((servers, next))
+}
+
 #[async_trait]
 impl Provider for HetznerProvider {
     fn name(&self) -> &'static str {
@@ -178,21 +202,40 @@ impl Provider for HetznerProvider {
     }
 
     async fn list_pods(&self) -> Result<Vec<Pod>> {
-        let resp = self
-            .auth(self.client.get(format!("{}/servers", self.base)))
-            .send()
-            .await?;
-        let status = resp.status();
-        let body: Value = resp.json().await?;
-        if !status.is_success() {
-            return Err(Error::provider_http(status, &body, "hetzner list"));
+        // Follow Hetzner's pagination: it returns 25 servers per page by default, and a
+        // server silently missing from page 1 would read as "terminated" to the proxy
+        // merge (dropping its forward). A pagination loop that doesn't advance or runs past
+        // MAX_PAGES fails the listing rather than returning a partial fleet as complete.
+        let mut out = Vec::new();
+        let mut page: u64 = 1;
+        for _ in 0..MAX_PAGES {
+            let resp = self
+                .auth(self.client.get(format!(
+                    "{}/servers?page={page}&per_page={PER_PAGE}",
+                    self.base
+                )))
+                .send()
+                .await?;
+            let status = resp.status();
+            let body: Value = resp.json().await?;
+            if !status.is_success() {
+                return Err(Error::provider_http(status, &body, "hetzner list"));
+            }
+            let (servers, next) = servers_page(&body)?;
+            out.extend(servers.iter().map(parse_server));
+            match next {
+                None => return Ok(out),
+                Some(n) if n > page => page = n,
+                Some(n) => {
+                    return Err(Error::provider(format!(
+                        "hetzner list: pagination did not advance (page {page} -> next_page {n})"
+                    )))
+                }
+            }
         }
-        let arr = body
-            .get("servers")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        Ok(arr.iter().map(parse_server).collect())
+        Err(Error::provider(format!(
+            "hetzner list: more than {MAX_PAGES} pages of servers — refusing a partial listing"
+        )))
     }
 
     async fn create_pod(&self, spec: &PodSpec) -> Result<Pod> {
@@ -263,6 +306,28 @@ impl Provider for HetznerProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn servers_page_reads_array_and_next_page() {
+        let last = json!({"servers": [{"id": 1}], "meta": {"pagination": {"page": 1, "next_page": null}}});
+        let (servers, next) = servers_page(&last).unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(next, None);
+
+        let more = json!({"servers": [], "meta": {"pagination": {"page": 1, "next_page": 2}}});
+        assert_eq!(servers_page(&more).unwrap().1, Some(2));
+
+        // No meta at all (older/mock responses) = a single page.
+        assert_eq!(servers_page(&json!({"servers": []})).unwrap().1, None);
+    }
+
+    #[test]
+    fn servers_page_fails_closed_on_schema_drift() {
+        for body in [json!({}), json!({"servers": null}), json!({"error": {"code": "x"}}), json!([])] {
+            let err = servers_page(&body).unwrap_err().to_string();
+            assert!(err.contains("unexpected response shape"), "{body}: {err}");
+        }
+    }
 
     #[test]
     fn parses_server_with_ip_and_type() {

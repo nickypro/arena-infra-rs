@@ -183,6 +183,22 @@ fn parse_instance(v: &Value) -> Pod {
     }
 }
 
+/// The instance objects in a 2xx `GET /instances/` body: an `instances` array (or a bare
+/// array). Any other shape is schema drift and must be an error, not an empty list — the
+/// proxy merge reads "listed OK without instance X" as "X was terminated", so an
+/// empty-by-accident list would drop every Vast forward. Fail closed.
+fn instances_array(body: &Value) -> Result<&Vec<Value>> {
+    body.get("instances")
+        .and_then(Value::as_array)
+        .or_else(|| body.as_array())
+        .ok_or_else(|| {
+            Error::provider(format!(
+                "vast list: unexpected response shape (no instances array): {}",
+                super::body_excerpt(body)
+            ))
+        })
+}
+
 #[async_trait]
 impl Provider for VastProvider {
     fn name(&self) -> &'static str {
@@ -206,13 +222,7 @@ impl Provider for VastProvider {
         if !status.is_success() {
             return Err(Error::provider_http(status, &body, "vast list"));
         }
-        let arr = body
-            .get("instances")
-            .and_then(Value::as_array)
-            .cloned()
-            .or_else(|| body.as_array().cloned())
-            .unwrap_or_default();
-        Ok(arr.iter().map(parse_instance).collect())
+        Ok(instances_array(&body)?.iter().map(parse_instance).collect())
     }
 
     async fn create_pod(&self, spec: &PodSpec) -> Result<Pod> {
@@ -344,6 +354,22 @@ mod tests {
             env: vec![],
             docker_args: None,
             allowed_cuda: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn instances_array_accepts_both_list_shapes() {
+        assert_eq!(instances_array(&json!({"instances": [{"id": 1}]})).unwrap().len(), 1);
+        assert!(instances_array(&json!({"instances": []})).unwrap().is_empty());
+        assert_eq!(instances_array(&json!([{"id": 1}, {"id": 2}])).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn instances_array_fails_closed_on_schema_drift() {
+        // e.g. a 200 carrying `{"success": false, "error": …}` must not read as "no instances".
+        for body in [json!({}), json!({"instances": null}), json!({"success": false, "error": "x"}), json!(null)] {
+            let err = instances_array(&body).unwrap_err().to_string();
+            assert!(err.contains("unexpected response shape"), "{body}: {err}");
         }
     }
 

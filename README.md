@@ -33,6 +33,14 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     — pure nginx, no tunnel process. The public port is anchored to the machine's
     index in `MACHINE_NAME_LIST`, so tearing down one pod never renumbers the others
     and a returning machine reclaims its port. Pure/no-I/O — it plans, you apply.
+    The plan is a **sticky merge**: the previous forwards are parsed back from the
+    config it rendered last time (each block carries a `# arena-forward name=… port=…
+    target=… provider=… pod_id=…` line; the older `# <name>` format is read too) and
+    merged with a **per-provider** listing (`Provider::list_by_provider`). A forward is
+    only removed once its pod is confirmed gone — absent from a provider whose listing
+    *succeeded*; a pod listed without an endpoint, or one whose provider failed to list
+    (e.g. a Vast 429), keeps its forward, and if no provider answers nothing is written.
+    Provider list responses with an unexpected shape are errors, never "zero pods".
 - `arena` (CLI):
   - `pods list | create | stop | restart | terminate | kill` (`--provider
     runpod|vast|hetzner`; Vast reads `VAST_API_KEY`, Hetzner reads `HETZNER_API_KEY`
@@ -66,11 +74,16 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     never rolled back. **Transient** failures (429 / 5xx / connect-timeout) are
     retried automatically with exponential backoff (`retry` module) around create
     and list calls — so a throttle or blip doesn't fail the command.
-  - `proxy plan` — read-only; prints the nginx `stream` config (`--out` saves it
-    locally; never connects to the proxy). `proxy apply` **deploys** that config to the
-    proxy host over SSH and reloads nginx (`nginx -t && nginx -s reload`); `--dry-run`
-    shows the exact scp + reload without doing it. This is the one place the tool touches
-    the proxy host.
+  - `proxy plan` — read-only; shows the merge against the current config (`+` added,
+    `~` changed, `-` removed, `=` kept-stale, plus a `+N added, ~N changed, …` summary;
+    a remote proxy's diff isn't shown) and prints the nginx `stream` config (`--out`
+    saves it locally; never connects to the proxy). `proxy apply` prints the same
+    changes, confirms, then **deploys** the config (locally, or over SSH when
+    `PROXY_LOCAL=false`) and runs `SSH_PROXY_RELOAD_CMD` — default `nginx -t && nginx -s
+    reload`; set it **empty** for write-only (never reloads nginx). `--dry-run` shows the
+    exact write/scp + reload without doing it. `pods up`, `rename`, `reimage`, `replace`
+    and `migrate cutover/revert` re-point the proxy through the same merge, always from
+    a fleet-wide listing. This is the one place the tool touches the proxy host.
   - `plan check | show` — a scheduled provisioning plan (`arena-plan.json`, see
     `arena-plan.example.json`): per-day target fleets with **GPU-first fallback chains**
     (e.g. `A4000` across community→secure→vast, then `3090`, then `A5000`) and a night

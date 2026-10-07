@@ -15,6 +15,19 @@ pub mod vast;
 
 pub use multi::build_fleet;
 
+/// A short, char-boundary-safe excerpt of a JSON body for an error message. Used by the
+/// list-shape checks: an unexpected 2xx body is reported (bounded — bodies get printed),
+/// never silently read as an empty list.
+pub(crate) fn body_excerpt(body: &serde_json::Value) -> String {
+    const MAX: usize = 120;
+    let s = body.to_string();
+    if s.chars().count() > MAX {
+        format!("{}…", s.chars().take(MAX).collect::<String>())
+    } else {
+        s
+    }
+}
+
 /// Construct a provider by name from config. The single place concrete backends are
 /// built, so the CLI and TUI share one source of truth (and one list of known names).
 pub fn build(name: &str, cfg: &Config) -> Result<Box<dyn Provider>> {
@@ -66,6 +79,17 @@ pub trait Provider: Send + Sync {
 
     /// Read-only. Safe to call freely.
     async fn list_pods(&self) -> Result<Vec<Pod>>;
+
+    /// Read-only. Every backend's *own* listing outcome, as `(provider name, result)`.
+    ///
+    /// `list_pods` on the fleet provider swallows partial failures (one backend 429ing
+    /// just vanishes from the list) — fine for a dashboard, but fatal for anything that
+    /// treats "absent from the list" as "terminated": the proxy merge must tell "vast
+    /// listed OK without this pod" apart from "vast didn't answer". Default: a single
+    /// backend reports its own `list_pods` under its own name.
+    async fn list_by_provider(&self) -> Vec<(String, Result<Vec<Pod>>)> {
+        vec![(self.name().to_string(), self.list_pods().await)]
+    }
 
     /// Mutating. Callers gate this behind an explicit apply/confirm step.
     async fn create_pod(&self, spec: &PodSpec) -> Result<Pod>;

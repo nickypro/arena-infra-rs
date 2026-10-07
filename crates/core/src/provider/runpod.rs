@@ -113,6 +113,21 @@ fn parse_pod(v: &Value) -> Pod {
     }
 }
 
+/// The pod objects in a 2xx `GET /pods` body: a top-level array (REST v1) or a `pods`
+/// array. Any other shape is schema drift and must be an error — NOT an empty list: the
+/// proxy merge reads "listed OK without pod X" as "X was terminated", so an
+/// empty-by-accident list would drop every RunPod forward at once. Fail closed.
+fn pods_array(body: &Value) -> Result<&Vec<Value>> {
+    body.as_array()
+        .or_else(|| body.get("pods").and_then(Value::as_array))
+        .ok_or_else(|| {
+            Error::provider(format!(
+                "list pods: unexpected response shape (no pod array): {}",
+                super::body_excerpt(body)
+            ))
+        })
+}
+
 #[async_trait]
 impl Provider for RunpodProvider {
     fn name(&self) -> &'static str {
@@ -144,12 +159,7 @@ impl Provider for RunpodProvider {
         if !status.is_success() {
             return Err(Error::provider_http(status, &body, "list pods"));
         }
-        let arr = body
-            .as_array()
-            .cloned()
-            .or_else(|| body.get("pods").and_then(Value::as_array).cloned())
-            .unwrap_or_default();
-        Ok(arr.iter().map(parse_pod).collect())
+        Ok(pods_array(&body)?.iter().map(parse_pod).collect())
     }
 
     async fn create_pod(&self, spec: &PodSpec) -> Result<Pod> {
@@ -417,6 +427,24 @@ fn extract_gpu_enum(spec: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pods_array_accepts_both_list_shapes() {
+        let top = json!([{"id": "a", "name": "arena8-apple"}]);
+        assert_eq!(pods_array(&top).unwrap().len(), 1);
+        let wrapped = json!({"pods": []});
+        assert!(pods_array(&wrapped).unwrap().is_empty()); // a real, empty fleet is fine
+    }
+
+    #[test]
+    fn pods_array_fails_closed_on_schema_drift() {
+        // None of these may read as "zero pods" — that would look like every pod was
+        // terminated and drop their proxy forwards.
+        for body in [json!({}), json!({"pods": null}), json!({"data": []}), json!(null), json!("ok")] {
+            let err = pods_array(&body).unwrap_err().to_string();
+            assert!(err.contains("unexpected response shape"), "{body}: {err}");
+        }
+    }
 
     fn spec() -> PodSpec {
         PodSpec {

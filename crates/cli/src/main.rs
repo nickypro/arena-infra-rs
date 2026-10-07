@@ -235,17 +235,20 @@ enum ConfigCmd {
 
 #[derive(Subcommand)]
 enum ProxyCmd {
-    /// Compute the proxy plan for current pods and print the nginx `stream` config
-    /// (stable public port -> each pod's current SSH endpoint) to apply on the proxy
-    /// host. Read-only: never connects to the proxy.
+    /// Compute the proxy plan — the current config merged with every provider's listing
+    /// (`+ ~ - =` per machine: added / changed / removed / kept-stale) — and print the
+    /// nginx `stream` config (stable public port -> each pod's current SSH endpoint).
+    /// Read-only: never connects to the proxy (a remote proxy's diff isn't shown).
     Plan {
         /// Also write the rendered nginx config to this local path for review.
         /// (Local only — this never copies anything to the proxy host.)
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    /// Deploy the rendered nginx config to the proxy host and reload nginx
-    /// (`nginx -t && nginx -s reload`). Acts by default; --dry-run to preview.
+    /// Merge the fleet's listing into the live proxy config, show the changes, then write
+    /// it and run SSH_PROXY_RELOAD_CMD (default `nginx -t && nginx -s reload`; empty =
+    /// write-only). A forward is only removed once its pod is confirmed gone; nothing is
+    /// written if no provider answered. Acts by default; --dry-run to preview.
     Apply {
         /// Preview only: print what would happen, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
@@ -1963,9 +1966,20 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
     cfg_row(cfg, &mut missing, "SSH_USER", false, false);
     cfg_row(cfg, &mut missing, "SHARED_SSH_KEY_PATH", false, false);
 
-    println!("\nProxy (`proxy plan`):");
+    println!("\nProxy (`proxy plan` / `proxy apply`):");
     cfg_row(cfg, &mut missing, "SSH_PROXY_HOST", false, false);
     cfg_row(cfg, &mut missing, "SSH_PROXY_STARTING_PORT", false, false);
+    // Absent and empty mean different things here (default reload vs never reload), so
+    // this row can't use `cfg_row`'s set/missing view.
+    let reload = arena_core::proxy::reload_cmd_from(cfg);
+    let key = "SSH_PROXY_RELOAD_CMD";
+    match cfg.get(key) {
+        None => println!("  · {key:<28} (default) {reload}"),
+        Some(_) if reload.is_empty() => {
+            println!("  ✓ {key:<28} (empty) write-only — the config file is written, nginx is never reloaded")
+        }
+        Some(_) => println!("  ✓ {key:<28} {reload}"),
+    }
 
     println!("\nBackup (git `backup` + file `pull`):");
     cfg_row(cfg, &mut missing, "ARENA_REPO_NAME", false, false);
@@ -2158,39 +2172,201 @@ async fn handle_backup(
 async fn handle_proxy(cmd: ProxyCmd, provider: &dyn Provider, cfg: &Config, yes: bool) -> Result<()> {
     match cmd {
         ProxyCmd::Plan { out } => {
-            let pods = provider.list_pods().await.context("listing pods for proxy plan")?;
-            emit_proxy_plan(&pods, cfg, out.as_deref())?;
+            let listing = fleet_listing(provider).await;
+            emit_proxy_plan(&listing, cfg, out.as_deref())?;
         }
         ProxyCmd::Apply { dry_run } => {
-            let pods = provider.list_pods().await.context("listing pods for proxy apply")?;
-            if !dry_run {
-                let pxcfg = arena_core::proxy::ProxyConfig::from_config(cfg)?;
-                if !confirm(yes, &format!("Will deploy the nginx config to {} and reload nginx.", pxcfg.proxy_host))? {
-                    println!("aborted.");
-                    return Ok(());
-                }
+            let listing = fleet_listing(provider).await;
+            let prepared = prepare_proxy(cfg, &listing).await?;
+            if let Some(why) = &prepared.plan.abort {
+                anyhow::bail!("refusing to write the proxy config: {why}");
             }
-            deploy_proxy(cfg, &pods, !dry_run).await?;
+            print_proxy_review(&prepared, &listing);
+            if dry_run {
+                print_proxy_dry_run(cfg, &prepared);
+                return Ok(());
+            }
+            if prepared.up_to_date() {
+                println!("proxy config already up to date — nothing to write.");
+                return Ok(());
+            }
+            if !confirm(yes, &format!("Will {}.", proxy_action(&prepared.pxcfg)))? {
+                println!("aborted.");
+                return Ok(());
+            }
+            write_proxy(cfg, &prepared).await?;
         }
     }
     Ok(())
 }
 
+/// The whole fleet's per-provider listing for the proxy merge. Deliberately NOT
+/// `list_pods`: that swallows a failing provider, which the merge would read as "every pod
+/// on it is gone" and drop their forwards.
+async fn fleet_listing(provider: &dyn Provider) -> arena_core::proxy::Listing {
+    arena_core::proxy::Listing::from_results(provider.list_by_provider().await)
+}
+
+/// The merge planner with this config's prefix + machine list.
+fn plan_proxy(
+    cfg: &Config,
+    pxcfg: &arena_core::proxy::ProxyConfig,
+    prev: &[arena_core::proxy::Forward],
+    listing: &arena_core::proxy::Listing,
+) -> arena_core::proxy::ProxyPlan {
+    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
+    arena_core::proxy::plan_forwards(pxcfg, prefix, &cfg.machine_names, prev, listing)
+}
+
+/// "deploy … and reload nginx" / "write … (no reload)" — for prompts and summaries.
+fn proxy_action(pxcfg: &arena_core::proxy::ProxyConfig) -> String {
+    let dest = if pxcfg.local {
+        format!("this host:{}", expand_tilde(&pxcfg.nginx_path))
+    } else {
+        format!("{}@{}:{}", pxcfg.proxy_user, pxcfg.proxy_host, pxcfg.nginx_path)
+    };
+    if pxcfg.write_only() {
+        format!("write the proxy config to {dest} (write-only: SSH_PROXY_RELOAD_CMD is empty, nginx is not reloaded)")
+    } else {
+        format!("write the proxy config to {dest} and run `{}`", pxcfg.reload_cmd)
+    }
+}
+
+/// A merge planned against the live config, ready to review and write.
+struct PreparedProxy {
+    pxcfg: arena_core::proxy::ProxyConfig,
+    /// The config as it is now; `None` = no file yet.
+    current: Option<String>,
+    plan: arena_core::proxy::ProxyPlan,
+    rendered: String,
+}
+
+impl PreparedProxy {
+    /// The rendered config is byte-identical to the live one — writing/reloading is a no-op.
+    fn up_to_date(&self) -> bool {
+        self.current.as_deref() == Some(self.rendered.as_str())
+    }
+}
+
+/// Read the live config, parse the previous forwards from it, and plan the merge against
+/// `listing`. Read-only (a remote proxy is read with `cat` over SSH).
+async fn prepare_proxy(cfg: &Config, listing: &arena_core::proxy::Listing) -> Result<PreparedProxy> {
+    let pxcfg = arena_core::proxy::ProxyConfig::from_config(cfg)?;
+    let current = read_current_proxy(cfg, &pxcfg).await?;
+    let parsed = current.as_deref().map(arena_core::proxy::parse_nginx_detailed).unwrap_or_default();
+    if parsed.ignored_blocks > 0 {
+        eprintln!(
+            "warning: {} server block(s) in the current proxy config aren't in a format arena can read \
+             back — they'll be dropped when it's rewritten",
+            parsed.ignored_blocks
+        );
+    }
+    let plan = plan_proxy(cfg, &pxcfg, &parsed.forwards, listing);
+    let rendered = arena_core::proxy::render_nginx(&plan.forwards);
+    Ok(PreparedProxy { pxcfg, current, plan, rendered })
+}
+
+/// The live proxy config (`None` = no file yet), which the merge starts from. A read that
+/// fails is an error, never "empty": a config rebuilt from an empty `prev` because we
+/// couldn't read the real one would drop every forward the merge is meant to keep.
+async fn read_current_proxy(cfg: &Config, pxcfg: &arena_core::proxy::ProxyConfig) -> Result<Option<String>> {
+    use arena_core::ssh::{self, SshTarget};
+    if pxcfg.local {
+        let path = expand_tilde(&pxcfg.nginx_path);
+        return match std::fs::read_to_string(&path) {
+            Ok(text) => Ok(Some(text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(anyhow::anyhow!(
+                "reading the current proxy config {path}: {e} — refusing to write one built without it"
+            )),
+        };
+    }
+    let target = SshTarget::for_host(&pxcfg.proxy_user, &pxcfg.proxy_host, 22, cfg.get("SHARED_SSH_KEY_PATH"));
+    let p = &pxcfg.nginx_path;
+    // Exit 3 means "no file yet" — distinct from cat's 1 and ssh's own 255 — so a missing
+    // file is an empty `prev` while any failure to read it aborts the deploy.
+    let out = ssh::run(&target, &format!("test -e {p} || exit 3; cat {p}"))
+        .await
+        .with_context(|| format!("reading the current proxy config on {}", pxcfg.proxy_host))?;
+    match out.code {
+        Some(0) => Ok(Some(out.stdout)),
+        Some(3) => Ok(None),
+        code => anyhow::bail!(
+            "couldn't read the current proxy config {p} on {} (exit {code:?}): {} — refusing to write \
+             one built without it",
+            pxcfg.proxy_host,
+            out.stderr.trim()
+        ),
+    }
+}
+
+/// Print a prepared merge for review: provider failures, one `+ ~ - =` line per change
+/// (unchanged lines omitted), and the summary.
+fn print_proxy_review(p: &PreparedProxy, listing: &arena_core::proxy::Listing) {
+    for (prov, e) in listing.errors() {
+        eprintln!("warning: {prov} listing failed: {e}");
+    }
+    for line in p.plan.change_lines(&p.pxcfg.proxy_host, false) {
+        println!("  {line}");
+    }
+    let skipped = if p.plan.skipped.is_empty() {
+        String::new()
+    } else {
+        format!("; {} pod(s) skipped (`arena proxy plan` lists why)", p.plan.skipped.len())
+    };
+    println!("proxy: {}{skipped}", p.plan.summary());
+}
+
+/// `proxy apply --dry-run`: exactly what a real apply would write and run.
+fn print_proxy_dry_run(cfg: &Config, p: &PreparedProxy) {
+    let px = &p.pxcfg;
+    let dest = if px.local { "this host".into() } else { format!("{}@{}", px.proxy_user, px.proxy_host) };
+    if p.up_to_date() {
+        println!("[dry-run] {dest}:{} already matches — nothing would be written", px.nginx_path);
+        return;
+    }
+    println!("[dry-run] would write {} forward(s) to {dest}:{}", p.plan.forwards.len(), px.nginx_path);
+    if px.local {
+        if px.write_only() {
+            println!(
+                "  write {} only — SSH_PROXY_RELOAD_CMD is empty, so nginx is never reloaded",
+                expand_tilde(&px.nginx_path)
+            );
+        } else {
+            println!("  write {} + run `{}` locally", expand_tilde(&px.nginx_path), px.reload_cmd);
+        }
+    } else {
+        let target = arena_core::ssh::SshTarget::for_host(&px.proxy_user, &px.proxy_host, 22, cfg.get("SHARED_SSH_KEY_PATH"));
+        println!("  {}", target.display_scp("<rendered nginx>", &px.nginx_path));
+        if px.write_only() {
+            println!("  (no reload — SSH_PROXY_RELOAD_CMD is empty)");
+        } else {
+            println!("  {}", target.display_command(&px.reload_cmd));
+        }
+    }
+    println!(
+        "(preview only — run without --dry-run to {})",
+        if px.write_only() { "write it" } else { "deploy and reload nginx" }
+    );
+}
+
 /// The proxy step for `pods up`: print a short forward summary, then — if nginx is
-/// actually set up on the proxy host — deploy + reload it; otherwise just say how to
-/// get the config (don't dump it). Never errors the spin-up: a proxy hiccup is reported,
-/// not fatal.
-async fn smart_proxy(cfg: &Config, pods: &[arena_core::Pod]) -> Result<()> {
+/// actually set up on the proxy host (or the proxy is write-only) — merge + deploy;
+/// otherwise just say how to get the config (don't dump it). Never errors the spin-up: a
+/// proxy hiccup is reported, not fatal.
+async fn smart_proxy(cfg: &Config, listing: &arena_core::proxy::Listing) -> Result<()> {
     use arena_core::ssh::{self, SshTarget};
 
     let pxcfg = arena_core::proxy::ProxyConfig::from_config(cfg)?;
-    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
-    let plan = arena_core::proxy::plan_forwards(&pxcfg, prefix, &cfg.machine_names, pods);
+    let listed = plan_proxy(cfg, &pxcfg, &[], listing);
     let where_ = if pxcfg.local { "locally".to_string() } else { format!("{}@{}", pxcfg.proxy_user, pxcfg.proxy_host) };
-    println!("\nproxy: {} forward(s) ({where_})", plan.forwards.len());
+    println!("\nproxy: {} forward(s) from the current listing ({where_})", listed.forwards.len());
 
     // Is nginx present where we'd deploy — on this box (local) or the proxy host (SSH)?
-    let has_nginx = if pxcfg.local {
+    // Write-only mode never runs nginx, so it's always deployable.
+    let has_nginx = if pxcfg.write_only() {
+        true
+    } else if pxcfg.local {
         std::process::Command::new("sh")
             .args(["-c", "command -v nginx >/dev/null 2>&1"])
             .status()
@@ -2211,7 +2387,7 @@ async fn smart_proxy(cfg: &Config, pods: &[arena_core::Pod]) -> Result<()> {
 
     if has_nginx {
         // nginx is set up — update it. (Part of the already-confirmed `up` flow.)
-        if let Err(e) = deploy_proxy(cfg, pods, true).await {
+        if let Err(e) = deploy_proxy(cfg, listing).await {
             eprintln!("proxy update failed (pods are up): {e}");
         }
     } else if pxcfg.local {
@@ -2230,75 +2406,72 @@ async fn smart_proxy(cfg: &Config, pods: &[arena_core::Pod]) -> Result<()> {
     Ok(())
 }
 
-/// Render the proxy config for `pods` and (with `apply`) deploy it to the proxy host
-/// over SSH, then reload nginx. Dry-run prints the exact scp + reload it would run.
-/// This is the one place the tool touches the proxy host.
-async fn deploy_proxy(cfg: &Config, pods: &[arena_core::Pod], apply: bool) -> Result<()> {
-    use arena_core::ssh::{self, SshTarget};
-
-    let pxcfg = arena_core::proxy::ProxyConfig::from_config(cfg)?;
-    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
-    let plan = arena_core::proxy::plan_forwards(&pxcfg, prefix, &cfg.machine_names, pods);
-    let nginx = arena_core::proxy::render_nginx(&plan.forwards);
-    let reload = "nginx -t && nginx -s reload";
-    // One-line summary of pods still without an endpoint (instead of a line each).
-    let starting = if plan.skipped.is_empty() {
-        String::new()
-    } else {
-        format!(" ({} still starting)", plan.skipped.len())
-    };
-
-    if !apply {
-        let dest = if pxcfg.local { "this host".into() } else { format!("{}@{}", pxcfg.proxy_user, pxcfg.proxy_host) };
-        println!("[dry-run] would deploy {} forward(s) to {dest}:{}{starting}", plan.forwards.len(), pxcfg.nginx_path);
-        if pxcfg.local {
-            println!("  write {} + run `{reload}` locally", expand_tilde(&pxcfg.nginx_path));
-        } else {
-            let target = SshTarget::for_host(&pxcfg.proxy_user, &pxcfg.proxy_host, 22, cfg.get("SHARED_SSH_KEY_PATH"));
-            println!("  {}", target.display_scp("<rendered nginx>", &pxcfg.nginx_path));
-            println!("  {}", target.display_command(reload));
-        }
-        println!("(preview only — run without --dry-run to deploy and reload nginx)");
+/// Merge `listing` into the live proxy config and, if anything changed, write it and run
+/// the reload (unless write-only). Used by the already-confirmed flows (`up`, rename,
+/// reimage, replace, migrate). Idempotent: an unchanged config is neither written nor
+/// reloaded; a listing where no provider answered writes nothing at all.
+async fn deploy_proxy(cfg: &Config, listing: &arena_core::proxy::Listing) -> Result<()> {
+    let prepared = prepare_proxy(cfg, listing).await?;
+    if let Some(why) = &prepared.plan.abort {
+        anyhow::bail!("not touching the proxy config: {why}");
+    }
+    if prepared.up_to_date() {
         return Ok(());
     }
+    print_proxy_review(&prepared, listing);
+    write_proxy(cfg, &prepared).await
+}
 
-    // Local: this box IS the proxy — write the config + reload nginx directly, no SSH.
+/// Write a prepared config to the proxy (locally, or scp over SSH) and run the reload
+/// command unless write-only. This is the one place the tool touches the proxy host.
+async fn write_proxy(cfg: &Config, p: &PreparedProxy) -> Result<()> {
+    use arena_core::ssh::{self, SshTarget};
+
+    // The planner's abort is also enforced here, so no caller can write around it.
+    if let Some(why) = &p.plan.abort {
+        anyhow::bail!("refusing to write the proxy config: {why}");
+    }
+    if p.up_to_date() {
+        return Ok(());
+    }
+    let pxcfg = &p.pxcfg;
+    let n = p.plan.forwards.len();
+
+    // Local: this box IS the proxy — write the config + reload directly, no SSH.
     if pxcfg.local {
         let path = expand_tilde(&pxcfg.nginx_path);
-        // Idempotent: skip the write+reload if the live config already matches.
-        if std::fs::read_to_string(&path).map(|c| c == nginx).unwrap_or(false) {
+        std::fs::write(&path, &p.rendered).with_context(|| format!("writing nginx config to {path}"))?;
+        if pxcfg.write_only() {
+            println!("[proxy] wrote {n} forward(s) to {path} (write-only: nginx not reloaded)");
             return Ok(());
         }
-        std::fs::write(&path, &nginx).with_context(|| format!("writing nginx config to {path}"))?;
         let out = std::process::Command::new("sh")
-            .args(["-c", reload])
+            .args(["-c", &pxcfg.reload_cmd])
             .output()
             .context("reloading nginx locally")?;
         if out.status.success() {
-            println!("[proxy] deployed {} forward(s) locally and reloaded nginx{starting}", plan.forwards.len());
+            println!("[proxy] deployed {n} forward(s) locally and reloaded nginx");
             return Ok(());
         }
         anyhow::bail!("local nginx reload failed: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
 
-    // Remote: SSH to the proxy host. Idempotent — only scp + reload on a real change.
+    // Remote: scp to the proxy host, then reload there.
     let target =
         SshTarget::for_host(&pxcfg.proxy_user, &pxcfg.proxy_host, 22, cfg.get("SHARED_SSH_KEY_PATH"));
-    let current = ssh::run(&target, &format!("cat {} 2>/dev/null", pxcfg.nginx_path)).await;
-    if let Ok(out) = &current {
-        if out.success && out.stdout == nginx {
-            return Ok(());
-        }
-    }
     let tmp = std::env::temp_dir().join("arena-proxy.conf");
-    std::fs::write(&tmp, &nginx).context("writing rendered nginx config to a temp file")?;
+    std::fs::write(&tmp, &p.rendered).context("writing rendered nginx config to a temp file")?;
     let scp = ssh::scp(&target, &tmp.to_string_lossy(), &pxcfg.nginx_path).await?;
     if !scp.success {
         anyhow::bail!("scp to proxy {} failed: {}", pxcfg.proxy_host, scp.stderr.trim());
     }
-    let out = ssh::run(&target, reload).await?;
+    if pxcfg.write_only() {
+        println!("[proxy] wrote {n} forward(s) to {}:{} (write-only: nginx not reloaded)", pxcfg.proxy_host, pxcfg.nginx_path);
+        return Ok(());
+    }
+    let out = ssh::run(&target, &pxcfg.reload_cmd).await?;
     if out.success {
-        println!("[proxy] deployed {} forward(s) to {} and reloaded nginx{starting}", plan.forwards.len(), pxcfg.proxy_host);
+        println!("[proxy] deployed {n} forward(s) to {} and reloaded nginx", pxcfg.proxy_host);
         Ok(())
     } else {
         anyhow::bail!("nginx reload on {} failed (exit {:?}): {}", pxcfg.proxy_host, out.code, out.stderr.trim())
@@ -2440,29 +2613,61 @@ async fn handle_plan(cmd: PlanCmd, provider: &dyn Provider, cfg: &Config) -> Res
     Ok(())
 }
 
-/// Render and print the proxy plan for the given pods: a summary table, the nginx
-/// `stream` config (optionally also written to `out`, locally), and any skipped
-/// pods. Shared by `proxy plan` and `pods up`. Never connects to the proxy.
-fn emit_proxy_plan(pods: &[arena_core::Pod], cfg: &Config, out: Option<&std::path::Path>) -> Result<()> {
+/// `proxy plan`: show the merge against the current config (`+ ~ - =` per machine, the
+/// summary, skipped pods), then the rendered nginx config (optionally also written to
+/// `out`, locally). Never connects to the proxy: for a local proxy the current config is a
+/// local file read; for a remote one the diff isn't shown (`proxy apply --dry-run` reads it).
+fn emit_proxy_plan(listing: &arena_core::proxy::Listing, cfg: &Config, out: Option<&std::path::Path>) -> Result<()> {
     let pxcfg = arena_core::proxy::ProxyConfig::from_config(cfg)?;
-    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
-    let plan = arena_core::proxy::plan_forwards(&pxcfg, prefix, &cfg.machine_names, pods);
 
     println!(
         "\n# proxy host: {}@{}  (nginx config path: {})",
         pxcfg.proxy_user, pxcfg.proxy_host, pxcfg.nginx_path
     );
-    if plan.forwards.is_empty() {
+    let prev = if pxcfg.local {
+        let path = expand_tilde(&pxcfg.nginx_path);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                let parsed = arena_core::proxy::parse_nginx_detailed(&text);
+                println!("# merge vs current config {path} ({} forward(s))", parsed.forwards.len());
+                if parsed.ignored_blocks > 0 {
+                    eprintln!(
+                        "warning: {} server block(s) in {path} aren't in a format arena can read back — \
+                         they'd be dropped on apply",
+                        parsed.ignored_blocks
+                    );
+                }
+                parsed.forwards
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!("# no current config at {path} yet — every forward is new");
+                Vec::new()
+            }
+            Err(e) => {
+                println!("# couldn't read {path} ({e}) — diff vs live config not shown");
+                Vec::new()
+            }
+        }
+    } else {
+        println!("# diff vs live config not shown (remote proxy) — `arena proxy apply --dry-run` reads it");
+        Vec::new()
+    };
+
+    for (prov, e) in listing.errors() {
+        eprintln!("warning: {prov} listing failed: {e}");
+    }
+    let plan = plan_proxy(cfg, &pxcfg, &prev, listing);
+    if let Some(why) = &plan.abort {
+        anyhow::bail!("{why} — `proxy apply` would refuse to write anything");
+    }
+    if plan.changes.is_empty() {
         println!("(no forwardable pods — nothing with an SSH endpoint in the name list)");
     } else {
-        println!("{:<24} {:<14} {}", "NAME", "PUBLIC", "-> POD SSH");
-        for f in &plan.forwards {
-            println!(
-                "{:<24} {}:{:<8} {}:{}",
-                f.name, pxcfg.proxy_host, f.public_port, f.target_ip, f.target_port
-            );
+        for line in plan.change_lines(&pxcfg.proxy_host, true) {
+            println!("{line}");
         }
     }
+    println!("{}", plan.summary());
     for s in &plan.skipped {
         eprintln!("warning: skipped {} — {}", s.name, s.reason);
     }
@@ -2477,9 +2682,8 @@ fn emit_proxy_plan(pods: &[arena_core::Pod], cfg: &Config, out: Option<&std::pat
         eprintln!("wrote nginx config to {} (local only — not deployed)", path.display());
     } else {
         println!(
-            "# Review, then apply on the proxy: write the above to {}, then \
-             `nginx -t && nginx -s reload`. (--out <file> saves it locally.)",
-            pxcfg.nginx_path
+            "# Review, then `arena proxy apply` to {}. (--out <file> saves it locally.)",
+            proxy_action(&pxcfg)
         );
     }
     Ok(())
@@ -2660,8 +2864,10 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             }
 
             // Is nginx set up on the proxy host? (Decides deploy-as-they-come vs.
-            // just instructing at the end — checked once up front.)
+            // just instructing at the end — checked once up front.) A write-only proxy
+            // (SSH_PROXY_RELOAD_CMD="") never runs nginx, so it's always deployable.
             let nginx_present = match arena_core::proxy::ProxyConfig::from_config(cfg) {
+                Ok(px) if px.write_only() => true,
                 Ok(px) => {
                     let tgt = arena_core::ssh::SshTarget::for_host(
                         &px.proxy_user, &px.proxy_host, 22, cfg.get("SHARED_SSH_KEY_PATH"));
@@ -2675,8 +2881,9 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
 
             // Poll until our pods have SSH endpoints or we hit the timeout, updating
             // nginx as endpoints appear (idempotent — reloads only on a real change).
-            // Ctrl+C stops the wait early. Stateless: each tick re-reads truth.
-            let policy = arena_core::retry::RetryPolicy::default();
+            // Ctrl+C stops the wait early. Stateless: each tick re-reads truth. Each tick
+            // lists per provider, so the proxy merge never mistakes a provider that
+            // didn't answer for one whose pods are all gone.
             let interval = interval.max(1);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
             let is_ready = |p: &arena_core::Pod| p.ssh_ip.is_some() && p.ssh_port.is_some();
@@ -2684,28 +2891,28 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                 "\nWaiting up to {timeout}s for SSH endpoints{} (Ctrl+C to stop)…",
                 if nginx_present { ", updating nginx as they come up" } else { "" }
             );
-            let pods = loop {
-                let pods = arena_core::retry::retrying(&policy, || provider.list_pods())
-                    .await
-                    .unwrap_or_else(|e| {
-                        eprintln!("  poll failed ({e}); retrying");
-                        Vec::new()
-                    });
+            let (pods, listing) = loop {
+                let listing = fleet_listing(provider).await;
+                if !listing.any_ok() {
+                    let errs: Vec<String> = listing.errors().iter().map(|(p, e)| format!("{p}: {e}")).collect();
+                    eprintln!("  poll failed ({}); retrying", errs.join("; "));
+                }
+                let pods = listing.pods();
                 let ready = pods.iter().filter(|p| want_ids.contains(&p.id) && is_ready(p)).count();
                 println!("  {ready}/{} ready", want_ids.len());
-                if nginx_present && !pods.is_empty() {
-                    if let Err(e) = deploy_proxy(cfg, &pods, true).await {
+                if nginx_present && listing.any_ok() {
+                    if let Err(e) = deploy_proxy(cfg, &listing).await {
                         eprintln!("  proxy update failed: {e}");
                     }
                 }
                 if ready == want_ids.len() || std::time::Instant::now() >= deadline {
-                    break pods;
+                    break (pods, listing);
                 }
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}
                     _ = tokio::signal::ctrl_c() => {
                         eprintln!("interrupted — stopping wait");
-                        break pods;
+                        break (pods, listing);
                     }
                 }
             };
@@ -2732,7 +2939,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             }
             // If there's no nginx to deploy to, say how to wire it (don't dump config).
             if !nginx_present {
-                smart_proxy(cfg, &pods).await?;
+                smart_proxy(cfg, &listing).await?;
             }
         }
 
@@ -3496,11 +3703,16 @@ async fn proxy_reaches_pod(cfg: &Config, name: &str, expected_id: &str) -> Resul
     }
 }
 
-/// Apply the current fleet's proxy config (re-point nginx). Best-effort wrapper used by the
-/// migration cutover/revert so the proxy follows the rename.
-async fn apply_proxy(cfg: &Config, owner: &dyn Provider) -> Result<()> {
-    let pods = owner.list_pods().await.context("listing pods for proxy apply")?;
-    deploy_proxy(cfg, &pods, true).await
+/// Re-point nginx after a rename/reimage/replace/migration, from a **fleet-wide**
+/// per-provider listing. `any` may be the fleet or a single backend (migrate/replace hold
+/// the pod's `owner`); either way the fleet is rebuilt from its name so every configured
+/// provider is listed. A single-provider listing would leave the others "not queried"
+/// and — for legacy entries with no recorded owner — could even read as "every provider
+/// listed OK without them", dropping their forwards.
+async fn apply_proxy(cfg: &Config, any: &dyn Provider) -> Result<()> {
+    let fleet = arena_core::provider::build_fleet(any.name(), cfg, true)?;
+    let listing = fleet_listing(fleet.as_ref()).await;
+    deploy_proxy(cfg, &listing).await
 }
 
 /// `migrate copy`: build + set up `<name>-new` (or reuse it) and sync `<name>`'s files onto
@@ -4054,8 +4266,9 @@ async fn handle_replace(
         println!("[7/7] proxy skipped (--skip-proxy) — run `arena proxy apply` to repoint nginx.");
     } else {
         println!("[7/7] re-pointing proxy…");
-        let fresh = owner.list_pods().await.unwrap_or_default();
-        if let Err(e) = deploy_proxy(cfg, &fresh, true).await {
+        // Fleet-wide (not just `owner`'s pods): a single-provider list here used to drop
+        // every other provider's forwards, and a failed list (`unwrap_or_default`) all of them.
+        if let Err(e) = apply_proxy(cfg, owner.as_ref()).await {
             eprintln!("      proxy apply failed: {e} — run `arena proxy apply` manually.");
         }
     }
@@ -5781,5 +5994,203 @@ mod tests {
         // Absolute list entries resolve without the prefix.
         let plan = plan_renames("arena9", &rename_list(), &pods, &one("b", "james-gpu")).unwrap();
         assert_eq!(plan[0].new, "james-gpu");
+    }
+}
+
+/// End-to-end tests of the proxy deploy path (read current file → merge → write), against
+/// a temp file in **write-only** mode (`SSH_PROXY_RELOAD_CMD=""`, loopback host = local)
+/// — so they can never run nginx or SSH anywhere.
+#[cfg(test)]
+mod proxy_deploy_tests {
+    use super::{deploy_proxy, fleet_listing, prepare_proxy, read_current_proxy, write_proxy};
+    use arena_core::proxy::{Listing, ProviderListing, ProxyConfig};
+    use arena_core::{Config, Error, Pod, PodSpec, Provider, Result};
+    use async_trait::async_trait;
+    use std::path::{Path, PathBuf};
+
+    fn cfg(path: &Path) -> Config {
+        Config::parse(&format!(
+            "MACHINE_NAME_PREFIX=arena8\nSSH_PROXY_HOST=localhost\nSSH_PROXY_NGINX_CONFIG_PATH={}\n\
+             SSH_PROXY_RELOAD_CMD=\"\"\nMACHINE_NAME_LIST=(\n  \"apple\"\n  \"autumn\"\n)\n",
+            path.display()
+        ))
+    }
+
+    /// A fresh temp path (per process + test name), removed again when dropped.
+    struct Tmp(PathBuf);
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+            let _ = std::fs::remove_dir(&self.0);
+        }
+    }
+    impl std::ops::Deref for Tmp {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl AsRef<Path> for Tmp {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+    fn tmp(name: &str) -> Tmp {
+        let p = std::env::temp_dir().join(format!("arena-proxy-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        Tmp(p)
+    }
+
+    fn pod(provider: &str, name: &str, ip: &str, port: u16) -> Pod {
+        Pod {
+            id: format!("{provider}-{name}"),
+            name: name.into(),
+            provider: provider.into(),
+            ssh_ip: Some(ip.into()),
+            ssh_port: Some(port),
+            ..Default::default()
+        }
+    }
+
+    fn listing(v: Vec<(&str, std::result::Result<Vec<Pod>, &str>)>) -> Listing {
+        Listing {
+            providers: v
+                .into_iter()
+                .map(|(p, r)| ProviderListing { provider: p.into(), pods: r.map_err(String::from) })
+                .collect(),
+        }
+    }
+
+    fn read(p: &Path) -> String {
+        std::fs::read_to_string(p).unwrap()
+    }
+
+    #[tokio::test]
+    async fn deploy_merges_with_the_file_it_wrote_and_refuses_on_total_failure() {
+        let path = tmp("merge.conf");
+        let cfg = cfg(&path);
+        assert!(ProxyConfig::from_config(&cfg).unwrap().write_only(), "tests must never reload nginx");
+        let apple = pod("runpod", "arena8-apple", "1.1.1.1", 22000);
+        let autumn = pod("vast", "arena8-autumn", "ssh4.vast.ai", 31000);
+
+        // 1. both providers answer → both forwards written (no file before = empty prev).
+        deploy_proxy(&cfg, &listing(vec![("runpod", Ok(vec![apple.clone()])), ("vast", Ok(vec![autumn]))]))
+            .await
+            .unwrap();
+        let first = read(&path);
+        assert!(first.contains("proxy_pass 1.1.1.1:22000;") && first.contains("proxy_pass ssh4.vast.ai:31000;"));
+
+        // 2. vast 429s while runpod moved apple: apple follows, autumn is kept.
+        let moved = pod("runpod", "arena8-apple", "2.2.2.2", 22001);
+        deploy_proxy(&cfg, &listing(vec![("runpod", Ok(vec![moved])), ("vast", Err("vast list HTTP 429"))]))
+            .await
+            .unwrap();
+        let second = read(&path);
+        assert!(second.contains("proxy_pass 2.2.2.2:22001;") && second.contains("proxy_pass ssh4.vast.ai:31000;"));
+
+        // 3. nobody answers → refuse, file untouched.
+        let err = deploy_proxy(&cfg, &listing(vec![("runpod", Err("HTTP 500")), ("vast", Err("HTTP 429"))]))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not touching the proxy config"), "{err}");
+        assert_eq!(read(&path), second);
+
+        // 4. runpod answers without apple (terminated) → removed; vast still down → kept.
+        deploy_proxy(&cfg, &listing(vec![("runpod", Ok(vec![])), ("vast", Err("HTTP 429"))])).await.unwrap();
+        let fourth = read(&path);
+        assert!(!fourth.contains("arena8-apple") && fourth.contains("proxy_pass ssh4.vast.ai:31000;"));
+    }
+
+    #[tokio::test]
+    async fn legacy_file_is_migrated_not_dropped() {
+        let path = tmp("legacy.conf");
+        std::fs::write(
+            &path,
+            "# Generated by arena-infra-rs `arena proxy plan`. Do not edit by hand.\n\
+             # arena8-apple\nserver {\n    listen 7000;\n    proxy_pass 1.1.1.1:22000;\n    proxy_timeout 24h;\n    proxy_connect_timeout 10s;\n}\n\
+             # arena8-autumn\nserver {\n    listen 7001;\n    proxy_pass ssh4.vast.ai:31000;\n    proxy_timeout 24h;\n    proxy_connect_timeout 10s;\n}\n",
+        )
+        .unwrap();
+        let cfg = cfg(&path);
+        let apple = pod("runpod", "arena8-apple", "1.1.1.1", 22000);
+        deploy_proxy(&cfg, &listing(vec![("runpod", Ok(vec![apple])), ("vast", Err("HTTP 429"))])).await.unwrap();
+        let text = read(&path);
+        assert!(text.contains("# arena-forward name=arena8-apple port=7000 target=1.1.1.1:22000 provider=runpod"));
+        // The legacy autumn entry's owner is unknown and vast didn't answer → kept.
+        assert!(text.contains("# arena-forward name=arena8-autumn port=7001 target=ssh4.vast.ai:31000\n"));
+    }
+
+    #[tokio::test]
+    async fn write_is_idempotent_and_honours_abort() {
+        let path = tmp("idem.conf");
+        let cfg = cfg(&path);
+        let l = listing(vec![("runpod", Ok(vec![pod("runpod", "arena8-apple", "1.1.1.1", 22000)]))]);
+        let p = prepare_proxy(&cfg, &l).await.unwrap();
+        assert!(!p.up_to_date());
+        write_proxy(&cfg, &p).await.unwrap();
+        let again = prepare_proxy(&cfg, &l).await.unwrap();
+        assert!(again.up_to_date(), "a second apply must be a no-op");
+
+        // Even a hand-assembled prepared config with `abort` set can't be written.
+        let mut forced = prepare_proxy(&cfg, &listing(vec![("runpod", Ok(vec![]))])).await.unwrap();
+        assert!(!forced.up_to_date());
+        forced.plan.abort = Some("test".into());
+        assert!(write_proxy(&cfg, &forced).await.is_err());
+        assert!(read(&path).contains("proxy_pass 1.1.1.1:22000;"));
+    }
+
+    #[tokio::test]
+    async fn current_config_missing_is_empty_but_unreadable_is_an_error() {
+        let missing = tmp("missing.conf");
+        let px = ProxyConfig::from_config(&cfg(&missing)).unwrap();
+        assert_eq!(read_current_proxy(&cfg(&missing), &px).await.unwrap(), None);
+
+        // A path we can't read (a directory) must abort, not read as "no forwards".
+        let dir = tmp("a-directory");
+        std::fs::create_dir_all(&dir).unwrap();
+        let px = ProxyConfig::from_config(&cfg(&dir)).unwrap();
+        let err = read_current_proxy(&cfg(&dir), &px).await.unwrap_err();
+        assert!(err.to_string().contains("refusing to write"), "{err}");
+    }
+
+    /// A single backend: `fleet_listing` reports its outcome under its own name.
+    struct Single(bool);
+
+    #[async_trait]
+    impl Provider for Single {
+        fn name(&self) -> &'static str {
+            "vast"
+        }
+        fn describe(&self, _spec: &PodSpec) -> String {
+            String::new()
+        }
+        async fn list_pods(&self) -> Result<Vec<Pod>> {
+            if self.0 {
+                Ok(vec![pod("vast", "arena8-autumn", "ssh4.vast.ai", 31000)])
+            } else {
+                Err(Error::provider("vast list HTTP 429"))
+            }
+        }
+        async fn create_pod(&self, _spec: &PodSpec) -> Result<Pod> {
+            unimplemented!("not exercised")
+        }
+        async fn stop_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn restart_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn terminate_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn fleet_listing_keeps_a_failure_as_a_failure() {
+        let ok = fleet_listing(&Single(true)).await;
+        assert_eq!(ok.pods().len(), 1);
+        let bad = fleet_listing(&Single(false)).await;
+        assert!(!bad.any_ok());
+        assert_eq!(bad.errors(), vec![("vast", "provider error: vast list HTTP 429")]);
     }
 }

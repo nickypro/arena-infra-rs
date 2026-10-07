@@ -4,6 +4,9 @@
 //! - `list_pods` concatenates every backend (caching pod-id → backend so mutations route
 //!   correctly). A backend that errors is skipped (optionally warned about); only a total
 //!   wipeout — every backend failing — is fatal.
+//! - `list_by_provider` exposes each backend's own outcome instead (Ok pods / Err), for
+//!   callers that must not mistake "that backend didn't answer" for "that backend has no
+//!   pods" — the proxy merge, which only drops a forward on a *successful* listing.
 //! - `create_pod` goes to the chosen primary (the `--provider` / `ARENA_PROVIDER`).
 //! - `stop`/`restart`/`terminate` route to whichever backend actually owns the pod id.
 //!
@@ -54,17 +57,22 @@ impl Provider for MultiProvider {
         self.backends[self.primary].describe(spec)
     }
     async fn list_pods(&self) -> Result<Vec<Pod>> {
-        // Gather first (awaiting), then populate the cache without holding the lock across
-        // an await. A provider that errors is skipped; only a total wipeout is fatal.
-        let mut gathered: Vec<(usize, Vec<Pod>)> = Vec::new();
+        // Built on the per-backend outcomes so there's one listing path (and one place the
+        // owner cache is filled). A provider that errors is skipped; only a total wipeout
+        // is fatal.
+        let mut out = Vec::new();
         let mut errs: Vec<String> = Vec::new();
-        for (i, b) in self.backends.iter().enumerate() {
-            match b.list_pods().await {
-                Ok(pods) => gathered.push((i, pods)),
-                Err(e) => errs.push(format!("{}: {e}", b.name())),
+        let mut any_ok = false;
+        for (name, res) in self.list_by_provider().await {
+            match res {
+                Ok(pods) => {
+                    any_ok = true;
+                    out.extend(pods);
+                }
+                Err(e) => errs.push(format!("{name}: {e}")),
             }
         }
-        if gathered.is_empty() && !errs.is_empty() {
+        if !any_ok && !errs.is_empty() {
             return Err(Error::provider(format!(
                 "all providers failed to list: {}",
                 errs.join("; ")
@@ -73,16 +81,27 @@ impl Provider for MultiProvider {
         if !errs.is_empty() && self.warn_on_partial {
             eprintln!("warning: some providers failed to list ({})", errs.join("; "));
         }
-        let mut map = self.owner.lock().unwrap();
-        map.clear();
-        let mut out = Vec::new();
-        for (i, pods) in gathered {
-            for p in &pods {
-                map.insert(p.id.clone(), i);
-            }
-            out.extend(pods);
-        }
         Ok(out)
+    }
+    async fn list_by_provider(&self) -> Vec<(String, Result<Vec<Pod>>)> {
+        // Gather first (awaiting), then populate the cache without holding the lock across
+        // an await. The cache is rebuilt from the successes only when at least one backend
+        // answered, so a total wipeout doesn't forget every owner.
+        let mut results: Vec<(String, Result<Vec<Pod>>)> = Vec::new();
+        let mut owners: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for (i, b) in self.backends.iter().enumerate() {
+            let res = b.list_pods().await;
+            if let Ok(pods) = &res {
+                for p in pods {
+                    owners.insert(p.id.clone(), i);
+                }
+            }
+            results.push((b.name().to_string(), res));
+        }
+        if results.iter().any(|(_, r)| r.is_ok()) {
+            *self.owner.lock().unwrap() = owners;
+        }
+        results
     }
     async fn create_pod(&self, spec: &PodSpec) -> Result<Pod> {
         // Creation needs a concrete target: always the chosen primary.
@@ -142,4 +161,96 @@ pub fn build_fleet(primary: &str, cfg: &Config, warn_on_partial: bool) -> Result
         owner: std::sync::Mutex::new(std::collections::HashMap::new()),
         warn_on_partial,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A backend that answers with fixed pods, or fails like a throttled API.
+    struct Fake {
+        name: &'static str,
+        pods: Option<Vec<Pod>>,
+    }
+
+    #[async_trait]
+    impl Provider for Fake {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        fn describe(&self, _spec: &PodSpec) -> String {
+            String::new()
+        }
+        async fn list_pods(&self) -> Result<Vec<Pod>> {
+            self.pods
+                .clone()
+                .ok_or_else(|| Error::provider(format!("{} list HTTP 429 Too Many Requests", self.name)))
+        }
+        async fn create_pod(&self, _spec: &PodSpec) -> Result<Pod> {
+            unimplemented!("not exercised")
+        }
+        async fn stop_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn restart_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn terminate_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn pod(id: &str, name: &str) -> Pod {
+        Pod { id: id.into(), name: name.into(), ..Default::default() }
+    }
+
+    fn multi(backends: Vec<Fake>) -> MultiProvider {
+        MultiProvider {
+            backends: backends.into_iter().map(|b| Box::new(b) as Box<dyn Provider>).collect(),
+            primary: 0,
+            owner: std::sync::Mutex::new(std::collections::HashMap::new()),
+            warn_on_partial: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn list_by_provider_reports_each_backends_own_outcome() {
+        let m = multi(vec![
+            Fake { name: "runpod", pods: Some(vec![pod("r1", "arena8-apple")]) },
+            Fake { name: "vast", pods: None },
+        ]);
+        let got = m.list_by_provider().await;
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, "runpod");
+        assert_eq!(got[0].1.as_ref().unwrap().len(), 1);
+        assert_eq!(got[1].0, "vast");
+        assert!(got[1].1.as_ref().unwrap_err().to_string().contains("429"));
+        // The owner cache is filled from the successes, so mutations still route.
+        assert_eq!(m.owner.lock().unwrap().get("r1"), Some(&0));
+    }
+
+    #[tokio::test]
+    async fn list_pods_still_swallows_partial_failure_but_not_total() {
+        let partial = multi(vec![
+            Fake { name: "runpod", pods: Some(vec![pod("r1", "arena8-apple")]) },
+            Fake { name: "vast", pods: None },
+        ]);
+        let pods = partial.list_pods().await.unwrap();
+        assert_eq!(pods.len(), 1);
+
+        let total = multi(vec![Fake { name: "runpod", pods: None }, Fake { name: "vast", pods: None }]);
+        let err = total.list_pods().await.unwrap_err().to_string();
+        assert!(err.contains("all providers failed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn backend_for_routes_by_owner_cache_from_the_listing() {
+        let m = multi(vec![
+            Fake { name: "runpod", pods: Some(vec![pod("r1", "arena8-apple")]) },
+            Fake { name: "vast", pods: Some(vec![pod("v1", "arena8-bloom")]) },
+        ]);
+        assert_eq!(m.backend_for("v1").await.unwrap().name(), "vast");
+        assert_eq!(m.backend_for("r1").await.unwrap().name(), "runpod");
+        assert!(m.backend_for("nope").await.is_err());
+    }
 }
