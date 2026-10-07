@@ -165,19 +165,42 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     pod is on** (never switches/creates one, so bespoke branches are respected) and
     **skips `main`/`master`**; clean trees report `NO_CHANGES`. One pod (name/id) or all.
     `--no-pull` = git only; `--message` overrides the commit message. Confirms first
-    (`--dry-run` previews both). To stage onto a dated autocommit branch, run
-    `pods init-branches` first.
+    (`--dry-run` previews both). Each pod's git push has a 5-min budget. To stage onto a
+    dated autocommit branch, run `pods init-branches` first.
   - `pods set-branch <branch> [target|--all] [--hard]` — switch pods' ARENA checkout to a
     branch. Gentle by default (fetch + checkout + ff-only pull — fails on a diverged/dirty
     tree rather than clobbering work). **`--hard` is destructive**: force the branch to
     match `origin/<branch>`, discarding local commits/changes (untracked files survive) —
     e.g. `set-branch main --all --hard` resets the fleet to `main`. Confirms first;
-    `--dry-run` previews.
+    `--dry-run` previews. Pods switch concurrently, 2-min budget each.
   - `pods init-branches` — create each pod's `autocommit-…-wNdM-…` branch and push it
     upstream **without committing** (legacy `init_branches`), so a new day's branch
-    exists before `backup` runs. `--week`/`--day` override; `--dry-run` previews.
-  - `pods run <cmd>` / `pods test` — run an arbitrary command on every pod (concurrent,
-    confirms first) / the read-only torch-version health check.
+    exists before `backup` runs. `--week`/`--day` override; `--dry-run` previews. 2-min
+    budget per pod.
+  - `pods run [--timeout <secs>] <cmd>` / `pods test` — run an arbitrary command on every
+    pod (concurrent, confirms first; each pod gets `--timeout`, default 1800s = 30 min —
+    flags go *before* the command; on a timeout the local ssh is killed, and the remote
+    command dies at its next write to the closed connection) / the read-only
+    torch-version health check (90s per pod).
+  - `pods test --deep [names…] [--json] [-v]` — the **is-this-pod-usable** check (read-only),
+    for what a plain `import torch` misses on a bad host. One embedded script per pod
+    (one SSH exec, 150s budget, inside the conda env) measures: nvidia-smi GPUs + driver +
+    CUDA version; torch import, `cuda.is_available()`, device count vs nvidia-smi; a small
+    tensor op on **every GPU** (catches `cuInit` 999 / `CUDA error: unknown error`); with >1
+    GPU a GPU→GPU copy that must arrive intact and an NCCL `all_reduce` across the GPUs
+    (else `skipped (1 GPU)`); a 32 MiB Hugging Face download (no token sent); free disk on
+    `/` and `/workspace`; host load + uptime. The provider's maintenance window comes from
+    the API. **FAIL**: any CUDA/tensor/copy/NCCL error, count mismatch, missing
+    torch/nvidia-smi, driver below the floor, unreachable/timed out. **WARN**: download
+    < 2 MB/s or unreachable, < 10 GB free, host load above max(32, host CPUs), a
+    maintenance window. Driver floor: `MIN_DRIVER_VERSION` (`none` = off), else derived from
+    `ALLOWED_CUDA_VERSIONS` (13.x → 580, 12.8 → 570, 12.4 → 550, …; the lowest listed
+    version wins), else no driver check. Hetzner CPU VMs skip the GPU checks. Output: a
+    `NAME RESULT GPUS DRIVER CUDA NET NOTES` table, `-v` lists every check, and a `same
+    host?` line when ≥2 failing pods share a public IP (a bad host breaks every pod on it).
+    `--json` prints per-pod `{name, provider, status, checks, facts}` (no IPs). Exits
+    non-zero if any pod FAILs; warnings don't. Names scope the run (a named pod with no SSH
+    endpoint is a FAIL; a typo is an error).
   - `pods pull [label]` — the **file** backup (complementing the git `backup`): rsyncs
     each pod's home into `<dir>/<label>/<pod>/`, reporting files/bytes moved per pod.
     **Keeps `.git`** (so the backup is a usable repo; `--no-git` to skip), size-caps with
@@ -201,7 +224,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     is the remote path (trailing `/` = into that dir). Creates the remote parent dir and
     **verifies the file landed** (size check; flags a silent scp non-write or a
     misplacement when the dest is actually a directory) rather than trusting scp's exit
-    code. Confirms first; `--dry-run` previews.
+    code. Per pod it runs mkdir → scp → check and stops at the first failure; the scp
+    has a 10-min budget, the mkdir/check 20s each. Confirms first; `--dry-run` previews.
   - `keys gen|list|rotate|revoke` — manage **OpenRouter** runtime keys via the
     provisioning API (needs `OPENROUTER_PROVISIONING_KEY`). `gen [machines|--all]` mints
     one key per machine (named `<prefix>-<machine>`) with a USD cap (`--limit`, default
@@ -281,8 +305,10 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     pods; it previews the names it will allocate, then creates on `enter`.
 
 Shared library pieces: `ssh` (non-interactive, fail-fast SSH command build + run),
-`metrics` (nvidia-smi parsing + per-pod aggregation), and `provider::build` (the one
-factory that constructs a backend by name — used by both the CLI and TUI).
+`remote` (the `Remote` trait every pod-SSH path goes through: `SshRemote` for real, a
+scripted `FakeRemote` in tests), `metrics` (nvidia-smi parsing + per-pod aggregation), and
+`provider::build` (the one factory that constructs a backend by name — used by both the
+CLI and TUI).
 
 All four target verticals are now in place: multi-provider spin-up (RunPod/Vast/
 Hetzner), commit/backup, the GPU/progress dashboard, and proxy/port-forwarding.
@@ -347,11 +373,12 @@ concurrently or runs one pod at a time:
 | Command | How to target pods | Execution |
 | --- | --- | --- |
 | `run`, `test` | **always all** (no scoping flag) | parallel |
+| `test --deep` | positional names (default all) | parallel |
 | `pull`, `setup`, `init-branches` | **always all** (no scoping flag) | parallel |
 | `backup` | one `[target]` **or** `--all` | parallel |
 | `cp`, `copy-keys` | `--include`/`--exclude` (default all) | parallel |
 | `list --probe` | all | parallel |
-| `set-branch` | one `[target]` **or** `--all` | **serial** (slow on a fleet) |
+| `set-branch` | one `[target]` **or** `--all` | parallel |
 | `stop` | one `[target]` **or** `--all` + `--include`/`--exclude` | serial (provider API) |
 | `terminate` | one `[target]` **or** `--all` | serial (provider API) |
 | `restart` | one `[target]` only (**no `--all`**) | n/a |
@@ -361,8 +388,16 @@ Notes / sharp edges to know:
 - `run`/`test`/`pull`/`setup`/`init-branches` can't be scoped to a subset — it's the
   whole fleet or nothing.
 - `restart` can't target the fleet (single pod only).
-- `set-branch` is the one SSH command that runs **serially** — a fleet `set-branch` is
-  much slower than its parallel siblings.
+- **Every pod-SSH call has a time budget**, so one wedged pod can't hang a fleet command:
+  it reports `✗ <name>: timed out after Ns`, counts as a failure (non-zero exit) and the
+  other pods carry on. Budgets: quick probes 20s (`list` GPU probe, `cp` mkdir/check,
+  replace/migrate identity/marker checks), `test` 90s, `test --deep` 150s,
+  `set-branch`/`init-branches` 2 min,
+  `backup` git push 5 min, `cp` scp 10 min, `run` `--timeout` (default 30 min), the
+  replace/migrate direct pod-to-pod copy 2 h (a copy that runs out stops the replace —
+  nothing swapped, re-run to continue — rather than redo it via local staging);
+  `setup`/`copy-keys` as described above. rsync transfers (`pull`, the replace/migrate
+  via-local copy) have no budget yet.
 - A non-empty `--include` that matches nothing now **errors** (not a silent no-op);
   `copy-keys` warns by name about any reachable pod that matched no per-host key.
 

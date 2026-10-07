@@ -11,6 +11,7 @@ pub mod config;
 pub mod error;
 pub mod fleet;
 pub mod gpu;
+pub mod health;
 pub mod metrics;
 pub mod naming;
 pub mod openrouter;
