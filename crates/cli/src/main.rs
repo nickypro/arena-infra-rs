@@ -1013,6 +1013,7 @@ async fn create_with_retry(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(retry_mins * 60);
     let mut all: Vec<arena_core::Pod> = Vec::new();
     let mut names = initial;
+    let shown = if target == 0 { names.len() } else { target };
     let mut round = 0u32;
     loop {
         round += 1;
@@ -1028,11 +1029,11 @@ async fn create_with_retry(
             break; // filled what this round needed, or no retry requested
         }
         if std::time::Instant::now() >= deadline {
-            eprintln!("retry window ({retry_mins}m) elapsed — have {} of {target}", all.len());
+            eprintln!("retry window ({retry_mins}m) elapsed — have {} of {shown}", all.len());
             break;
         }
         eprintln!(
-            "round {round}: {} short of target {target} (capacity); retrying in {retry_secs}s (Ctrl+C to stop)…",
+            "round {round}: {} short of target {shown} (capacity); retrying in {retry_secs}s (Ctrl+C to stop)…",
             names.len() - got
         );
         let interrupted = tokio::select! {
@@ -1044,7 +1045,12 @@ async fn create_with_retry(
             break;
         }
         // Re-plan toward the SAME target so the next round only fills the shortfall.
-        names = plan_create(provider, cfg, Want::Total(target)).await?.names;
+        // Explicit names (target == 0) just retry the ones not created yet.
+        names = if target == 0 {
+            names.into_iter().filter(|n| !all.iter().any(|p| &p.name == n)).collect()
+        } else {
+            plan_create(provider, cfg, Want::Total(target)).await?.names
+        };
     }
     Ok(all)
 }
@@ -2578,12 +2584,9 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                 println!("aborted.");
                 return Ok(());
             }
-            // Explicit names: create them directly. -n/-a: use the top-up retry loop.
-            if count.is_none() && add.is_none() {
-                create_pods(provider, cfg, &names, keep_trying, &ov).await?;
-            } else {
-                create_with_retry(provider, cfg, names, topup_target, &ov, keep_trying, retry_mins, retry_secs).await?;
-            }
+            // Explicit names retry just the names still missing; -n/-a re-plan toward the
+            // total (topup_target == 0 marks the explicit case).
+            create_with_retry(provider, cfg, names, topup_target, &ov, keep_trying, retry_mins, retry_secs).await?;
         }
 
         PodCmd::Up { names, count, add, gpu, gpus, cloud, disk, volume, image, bootstrap, dry_run, no_wait, keep_trying, retry_mins, retry_secs, no_setup, timeout, interval } => {
@@ -2637,11 +2640,8 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             // Create as many as capacity allows (retrying if requested); only wait on
             // the ones we got. Proxy is deployed *after* this returns — i.e. once the
             // retry loop has finished topping up. Explicit names create directly.
-            let created = if explicit {
-                create_pods(provider, cfg, &names, keep_trying, &ov).await?
-            } else {
-                create_with_retry(provider, cfg, names, topup_target, &ov, keep_trying, retry_mins, retry_secs).await?
-            };
+            let created =
+                create_with_retry(provider, cfg, names, topup_target, &ov, keep_trying, retry_mins, retry_secs).await?;
             if created.is_empty() {
                 eprintln!("no pods were created — nothing to wait for");
                 return Ok(());
