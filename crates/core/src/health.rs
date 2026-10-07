@@ -211,9 +211,15 @@ impl DeepFacts {
         }
     }
 
-    /// How many GPUs nvidia-smi listed — only when nvidia-smi itself worked.
+    /// How many GPUs nvidia-smi listed — only when it actually listed them. The header
+    /// call working isn't enough: if `--query-gpu` then failed (`smi_query`, the classic
+    /// GPU-fell-off-the-bus error) the count is unknown, not 0, and must not read as
+    /// "nvidia-smi sees 0 GPUs" next to torch's count.
     fn smi_count(&self) -> Option<u32> {
-        (self.smi.as_deref() == Some("ok")).then(|| self.smi_gpus.unwrap_or(self.gpus.len() as u32))
+        if self.smi.as_deref() != Some("ok") || self.smi_query.is_some() {
+            return None;
+        }
+        self.smi_gpus.or_else(|| (!self.gpus.is_empty()).then_some(self.gpus.len() as u32))
     }
 
     /// Why python facts may be missing: the step timed out / crashed / was cut off.
@@ -526,10 +532,12 @@ pub fn overall(checks: &[Check]) -> Status {
     }
 }
 
-/// Whether a pod should have GPUs. Hetzner pods are CPU VMs, so their GPU checks are
-/// skipped instead of failing every time; a provider-reported 0 GPUs means the same.
+/// Whether a pod should have GPUs: every pod but Hetzner's (CPU VMs, whose GPU checks are
+/// skipped instead of failing every time). Decided by provider only, never by the API's
+/// GPU count: a RunPod pod reported with 0 GPUs (resumed without one, or one the API lost
+/// track of) is a broken course pod, and skipping its GPU checks would PASS it.
 pub fn expects_gpu(pod: &Pod) -> bool {
-    !pod.provider.eq_ignore_ascii_case("hetzner") && pod.gpu_count != Some(0)
+    !pod.provider.eq_ignore_ascii_case("hetzner")
 }
 
 /// Judge a GPU pod's facts. See [`evaluate_cpu`] for CPU VMs.
@@ -838,46 +846,67 @@ fn load_check(f: &DeepFacts, p: &HealthPolicy) -> Check {
 /// One pod's deep-check outcome — also the `pods test --deep --json` element.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PodHealth {
+    /// The provider's pod id: tells apart two pods that share a name.
+    pub id: String,
     pub name: String,
     pub provider: String,
     pub status: Status,
     pub checks: Vec<Check>,
     /// `None` when the pod couldn't be checked at all (unreachable, timed out).
     pub facts: Option<DeepFacts>,
-    /// The pod's public IP, for the same-host summary only. Not serialized: the JSON is
-    /// per-pod health, and IPs are already in `pods list --json`.
+    /// The pod's machine IP, for the same-host summary only (see [`host_ip`]). Not
+    /// serialized: the JSON is per-pod health, and IPs are already in `pods list --json`.
     #[serde(skip)]
     pub host: Option<String>,
+}
+
+/// The IP that identifies the machine a pod runs on, for the same-host summary: its SSH
+/// IP, but only where that is the machine's own address. Vast pods are reached through
+/// Vast's shared SSH proxy (`ssh4.vast.ai`), which says nothing about the machine, so
+/// they — and any endpoint that isn't an IP literal — are never grouped: a false "same
+/// host?" would send the operator to switch GPU type for nothing.
+pub fn host_ip(pod: &Pod) -> Option<String> {
+    if pod.provider.eq_ignore_ascii_case("vast") {
+        return None;
+    }
+    pod.ssh_ip.as_deref().filter(|ip| ip.parse::<std::net::IpAddr>().is_ok()).map(String::from)
 }
 
 impl PodHealth {
     /// A pod whose script ran: its facts judged by `policy` (GPU or CPU rules per
     /// [`expects_gpu`]), with the pod's maintenance window.
     pub fn checked(pod: &Pod, facts: DeepFacts, policy: &HealthPolicy) -> Self {
-        let checks = if expects_gpu(pod) {
+        let mut checks = if expects_gpu(pod) {
             evaluate(&facts, policy, pod.maintenance.as_ref())
         } else {
             evaluate_cpu(&facts, policy, pod.maintenance.as_ref())
         };
+        // The GPU checks above judge what the machine sees; this says why they may have
+        // failed (or that the API's record of a working pod is off).
+        if expects_gpu(pod) && pod.gpu_count == Some(0) {
+            checks.push(Check::new("provider", Status::Warn, "reports 0 GPUs for this pod (resumed without one?)"));
+        }
         Self {
+            id: pod.id.clone(),
             name: pod.name.clone(),
             provider: pod.provider.clone(),
             status: overall(&checks),
             checks,
             facts: Some(facts),
-            host: pod.ssh_ip.clone(),
+            host: host_ip(pod),
         }
     }
 
     /// A pod that couldn't be checked (no SSH, timed out, no endpoint): a FAIL with why.
     pub fn unreachable(pod: &Pod, why: impl Into<String>) -> Self {
         Self {
+            id: pod.id.clone(),
             name: pod.name.clone(),
             provider: pod.provider.clone(),
             status: Status::Fail,
             checks: vec![Check::new("ssh", Status::Fail, why)],
             facts: None,
-            host: pod.ssh_ip.clone(),
+            host: host_ip(pod),
         }
     }
 
@@ -925,10 +954,10 @@ pub fn render_checks(h: &PodHealth) -> String {
     out
 }
 
-/// Failing pods grouped by public IP, where at least two share one — the ops playbook's
-/// "bad hosts break every pod on them": several pods failing on one IP is most likely the
-/// machine, and replacing them on the same GPU type can land them right back on it.
-/// Sorted by IP; names keep the input order.
+/// Failing pods grouped by machine IP ([`PodHealth::host`]), where at least two share one
+/// — the ops playbook's "bad hosts break every pod on them": several pods failing on one
+/// IP is most likely the machine, and replacing them on the same GPU type can land them
+/// right back on it. Sorted by IP; names keep the input order.
 pub fn same_host_failures(results: &[PodHealth]) -> Vec<(String, Vec<String>)> {
     let mut by_ip: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     for h in results.iter().filter(|h| h.status == Status::Fail) {
@@ -1320,6 +1349,11 @@ deep_check_end=1
             &without(HEALTHY_2GPU, &["smi_", "gpu."]),
             &[("smi", Some("error: NVIDIA-SMI has failed because it couldn't communicate with the NVIDIA driver."))],
         );
+        // The header call worked, the per-GPU query didn't: a GPU fallen off the bus.
+        let smi_query_error = edit(
+            &without(HEALTHY_2GPU, &["gpu.", "smi_gpus"]),
+            &[("smi_query", Some("error: Unable to determine the device handle for GPU 0000:41:00.0: Unknown Error"))],
+        );
         let count_mismatch = edit(
             &without(HEALTHY_2GPU, &["tensor.1", "peer.", "nccl"]),
             &[("device_count", Some("1")), ("peer", Some("skipped (1 GPU)")), ("nccl", Some("skipped (1 GPU)"))],
@@ -1347,6 +1381,9 @@ deep_check_end=1
             ("nvidia-smi missing: cuda", &smi_missing, "cuda", Fail, "Found no NVIDIA driver"),
             ("nvidia-smi error", &smi_error, "nvidia-smi", Fail, "couldn't communicate with the NVIDIA driver"),
             ("nvidia-smi error: count unknown", &smi_error, "device_count", Pass, "2 (nvidia-smi count unknown)"),
+            ("nvidia-smi query error", &smi_query_error, "nvidia-smi", Fail, "Unable to determine the device handle"),
+            // Not "nvidia-smi 0": its count is unknown, not zero.
+            ("nvidia-smi query error: count unknown", &smi_query_error, "device_count", Pass, "2 (nvidia-smi count unknown)"),
             ("device_count mismatch", &count_mismatch, "device_count", Fail, "torch sees 1 GPU(s), nvidia-smi 2"),
             ("python timed out: missing gpu", &py_timeout, "gpu1", Fail, "no result (python checks timed out)"),
             ("python timed out: peer", &py_timeout, "peer_copy", Fail, "not reported (python checks timed out)"),
@@ -1493,7 +1530,8 @@ deep_check_end=1
         let hetzner = Pod { name: "devtest-cpu".into(), provider: "hetzner".into(), ..Default::default() };
         assert!(!expects_gpu(&hetzner));
         assert!(expects_gpu(&Pod { provider: "runpod".into(), ..Default::default() }));
-        assert!(!expects_gpu(&Pod { provider: "vast".into(), gpu_count: Some(0), ..Default::default() }));
+        // The API's GPU count never switches the GPU checks off on a GPU provider.
+        assert!(expects_gpu(&Pod { provider: "vast".into(), gpu_count: Some(0), ..Default::default() }));
         let h = PodHealth::checked(&hetzner, parse_deep(&out), &cuda13());
         assert_eq!(h.status, Status::Pass, "{:#?}", h.checks);
         assert_eq!(check(&h.checks, "gpu"), &Check::new("gpu", Status::Skip, "CPU pod: GPU checks skipped"));
@@ -1501,6 +1539,36 @@ deep_check_end=1
         // The same output from a GPU pod is a failure.
         let gpu_pod = Pod { name: "devtest-gpu".into(), provider: "runpod".into(), ..Default::default() };
         assert_eq!(PodHealth::checked(&gpu_pod, parse_deep(&out), &cuda13()).status, Status::Fail);
+    }
+
+    #[test]
+    fn a_gpu_pod_the_api_reports_with_0_gpus_is_judged_as_a_gpu_pod() {
+        // RunPod's `gpuCount: 0` (a pod resumed without a GPU, or one the API lost track
+        // of) on a machine that indeed has no usable GPU: FAIL, not a CPU-pod PASS.
+        let no_gpu = edit(
+            &without(HEALTHY_2GPU, &["smi_", "gpu.", "tensor.", "peer.", "nccl", "device_count"]),
+            &[
+                ("smi", Some("missing")),
+                ("cuda_available", Some("false")),
+                ("cuda_error", Some("error: RuntimeError: Found no NVIDIA driver on your system.")),
+            ],
+        );
+        let zero = Pod { name: "devtest-zero".into(), provider: "runpod".into(), gpu_count: Some(0), ..Default::default() };
+        let h = PodHealth::checked(&zero, parse_deep(&no_gpu), &cuda13());
+        assert_eq!(h.status, Status::Fail, "{:#?}", h.checks);
+        assert_eq!(check(&h.checks, "nvidia-smi").status, Status::Fail);
+        assert_eq!(check(&h.checks, "cuda").status, Status::Fail);
+        assert!(!h.checks.iter().any(|c| c.name == "gpu"), "no CPU-pod skip line: {:#?}", h.checks);
+        assert_eq!(
+            check(&h.checks, "provider"),
+            &Check::new("provider", Status::Warn, "reports 0 GPUs for this pod (resumed without one?)")
+        );
+        // A machine that does have working GPUs passes its checks; the API mismatch only warns.
+        let h = PodHealth::checked(&zero, parse_deep(HEALTHY_2GPU), &cuda13());
+        assert_eq!(h.status, Status::Warn, "{:#?}", h.checks);
+        // No hint when the provider reports GPUs (or says nothing).
+        let one = Pod { gpu_count: Some(1), ..zero.clone() };
+        assert!(!PodHealth::checked(&one, parse_deep(HEALTHY_2GPU), &cuda13()).checks.iter().any(|c| c.name == "provider"));
     }
 
     fn pod(name: &str, ip: &str) -> Pod {
@@ -1561,6 +1629,30 @@ devtest-echo   fail    -            -          -             -  ssh: exit Some(2
     }
 
     #[test]
+    fn same_host_groups_only_real_machine_ips() {
+        let failing = |p: &Pod| PodHealth::unreachable(p, "timed out after 150s");
+        let vast = |name: &str, host: &str| Pod { provider: "vast".into(), ..pod(name, host) };
+        // Two Vast pods behind the same SSH proxy are not "the same host".
+        let results = vec![failing(&vast("apple", "ssh4.vast.ai")), failing(&vast("bloom", "ssh4.vast.ai"))];
+        assert!(same_host_failures(&results).is_empty());
+        assert_eq!(render_summary(&results), ["0 pass, 0 warn, 2 fail"]);
+        // ...even if Vast hands out an IP-literal proxy address.
+        let results = vec![failing(&vast("apple", "203.0.113.9")), failing(&vast("bloom", "203.0.113.9"))];
+        assert!(same_host_failures(&results).is_empty());
+        // A hostname (not an IP) never groups, on any provider.
+        let results = vec![failing(&pod("apple", "proxy.example")), failing(&pod("bloom", "proxy.example"))];
+        assert!(same_host_failures(&results).is_empty());
+        // Real IPs do, IPv6 included.
+        let results = vec![failing(&pod("apple", "2001:db8::7")), failing(&pod("bloom", "2001:db8::7"))];
+        assert_eq!(
+            same_host_failures(&results),
+            [("2001:db8::7".to_string(), vec!["devtest-apple".to_string(), "devtest-bloom".to_string()])]
+        );
+        assert_eq!(host_ip(&pod("apple", "1.2.3.4")).as_deref(), Some("1.2.3.4"));
+        assert_eq!(host_ip(&Pod { ssh_ip: None, ..pod("apple", "") }), None);
+    }
+
+    #[test]
     fn json_is_per_pod_health_without_the_ip() {
         let results = vec![
             PodHealth::checked(&pod("apple", "1.1.1.1"), parse_deep(HEALTHY_2GPU), &cuda13()),
@@ -1569,7 +1661,7 @@ devtest-echo   fail    -            -          -             -  ssh: exit Some(2
         let v: serde_json::Value = serde_json::to_value(&results).unwrap();
         let mut keys: Vec<&str> = v[0].as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort_unstable();
-        assert_eq!(keys, ["checks", "facts", "name", "provider", "status"]);
+        assert_eq!(keys, ["checks", "facts", "id", "name", "provider", "status"]);
         assert_eq!(v[0]["status"], "pass");
         assert_eq!(v[0]["checks"][0], serde_json::json!({"name": "nvidia-smi", "status": "pass", "detail": "2×RTX A4000"}));
         assert_eq!(v[0]["facts"]["gpus"][0]["driver"], "580.65.06");
