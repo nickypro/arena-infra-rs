@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 
 use super::Provider;
 use crate::error::{Error, Result};
+use crate::http::{send_json, send_ok};
 use crate::pod::{Pod, PodSpec};
 
 const BASE: &str = "https://console.vast.ai/api/v0";
@@ -67,15 +68,12 @@ impl VastProvider {
         if let Some(min) = spec.allowed_cuda.iter().filter_map(|v| v.parse::<f64>().ok()).reduce(f64::min) {
             query["cuda_max_good"] = json!({"gte": min});
         }
-        let resp = self
-            .auth(self.client.put(format!("{}/search/asks/", self.base)).json(&query))
-            .send()
-            .await?;
-        let status = resp.status();
-        let body: Value = resp.json().await?;
-        if !status.is_success() {
-            return Err(Error::provider_http(status, &body, "vast search"));
-        }
+        // Status first, then decode (crate::http): an auth/HTML error stays classified.
+        let body = send_json(
+            self.auth(self.client.put(format!("{}/search/asks/", self.base)).json(&query)),
+            "vast search",
+        )
+        .await?;
         let offers = body
             .get("offers")
             .and_then(Value::as_array)
@@ -213,15 +211,7 @@ impl Provider for VastProvider {
     }
 
     async fn list_pods(&self) -> Result<Vec<Pod>> {
-        let resp = self
-            .auth(self.client.get(format!("{}/instances/", self.base)))
-            .send()
-            .await?;
-        let status = resp.status();
-        let body: Value = resp.json().await?;
-        if !status.is_success() {
-            return Err(Error::provider_http(status, &body, "vast list"));
-        }
+        let body = send_json(self.auth(self.client.get(format!("{}/instances/", self.base))), "vast list").await?;
         Ok(instances_array(&body)?.iter().map(parse_instance).collect())
     }
 
@@ -247,19 +237,11 @@ impl Provider for VastProvider {
             "runtype": "ssh",
             "env": env,
         });
-        let resp = self
-            .auth(
-                self.client
-                    .put(format!("{}/asks/{}/", self.base, offer.id))
-                    .json(&payload),
-            )
-            .send()
-            .await?;
-        let status = resp.status();
-        let body: Value = resp.json().await?;
-        if !status.is_success() {
-            return Err(Error::provider_http(status, &body, "vast create"));
-        }
+        let body = send_json(
+            self.auth(self.client.put(format!("{}/asks/{}/", self.base, offer.id)).json(&payload)),
+            "vast create",
+        )
+        .await?;
         // Vast returns {"success": true, "new_contract": <instance id>}; the full
         // instance object isn't echoed, so synthesize the Pod from what we know.
         if body.get("success").and_then(Value::as_bool) == Some(false) {
@@ -286,54 +268,28 @@ impl Provider for VastProvider {
 
     async fn stop_pod(&self, id: &str) -> Result<()> {
         // Vast stops an instance by setting its desired state.
-        let resp = self
-            .auth(
-                self.client
-                    .put(format!("{}/instances/{}/", self.base, id))
-                    .json(&json!({"state": "stopped"})),
-            )
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body: Value = resp.json().await.unwrap_or(Value::Null);
-            return Err(Error::provider_http(status, &body, "vast stop"));
-        }
-        Ok(())
+        send_ok(
+            self.auth(self.client.put(format!("{}/instances/{}/", self.base, id)).json(&json!({"state": "stopped"}))),
+            "vast stop",
+        )
+        .await
     }
 
     async fn restart_pod(&self, id: &str) -> Result<()> {
         // Vast has no single reboot endpoint; a restart is stop then start. Vast keeps
         // the stopped instance, so this preserves it (just cycles the container).
         for state in ["stopped", "running"] {
-            let resp = self
-                .auth(
-                    self.client
-                        .put(format!("{}/instances/{}/", self.base, id))
-                        .json(&json!({ "state": state })),
-                )
-                .send()
-                .await?;
-            let status = resp.status();
-            if !status.is_success() {
-                let body: Value = resp.json().await.unwrap_or(Value::Null);
-                return Err(Error::provider_http(status, &body, "vast restart"));
-            }
+            send_ok(
+                self.auth(self.client.put(format!("{}/instances/{}/", self.base, id)).json(&json!({ "state": state }))),
+                "vast restart",
+            )
+            .await?;
         }
         Ok(())
     }
 
     async fn terminate_pod(&self, id: &str) -> Result<()> {
-        let resp = self
-            .auth(self.client.delete(format!("{}/instances/{}/", self.base, id)))
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body: Value = resp.json().await.unwrap_or(Value::Null);
-            return Err(Error::provider_http(status, &body, "vast terminate"));
-        }
-        Ok(())
+        send_ok(self.auth(self.client.delete(format!("{}/instances/{}/", self.base, id))), "vast terminate").await
     }
 }
 
@@ -355,6 +311,28 @@ mod tests {
             docker_args: None,
             allowed_cuda: Vec::new(),
         }
+    }
+
+    /// Status first, then decode: an error response whose body isn't JSON (a bad key's
+    /// 401, a proxy's HTML) is classified by its status — never "error decoding response
+    /// body". Against a loopback server, through the real request path.
+    #[tokio::test]
+    async fn error_statuses_are_classified_before_decoding() {
+        use crate::error::ProviderErrorKind as K;
+        use crate::http::test_server::{canned, client, serve};
+        let srv = serve(vec![
+            canned(401, "text/html", "<html>401 Unauthorized</html>"),
+            canned(429, "text/plain", "Too Many Requests"),
+            canned(403, "text/plain", "Forbidden"),
+        ]);
+        let p = VastProvider { api_key: "BOGUS".into(), client: client(), base: srv.base.clone() };
+        let e = p.list_pods().await.unwrap_err();
+        assert_eq!(e.kind(), Some(K::Auth), "{e}");
+        assert!(e.to_string().contains("vast list HTTP 401"), "{e}");
+        let e = p.create_pod(&spec("NVIDIA RTX A4000", 1, 50)).await.unwrap_err();
+        assert_eq!(e.kind(), Some(K::RateLimited), "the offer search: {e}");
+        let e = p.terminate_pod("7").await.unwrap_err();
+        assert_eq!(e.kind(), Some(K::Auth), "{e}");
     }
 
     #[test]

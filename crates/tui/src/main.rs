@@ -1496,7 +1496,12 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
             };
             let temp = m.and_then(|m| m.max_temp());
             let temp_str = temp.map(|t| format!("{t}C")).unwrap_or_else(|| "-".into());
-            let cost = p.cost_per_hr.map(|c| format!("${c:.2}")).unwrap_or_else(|| "-".into());
+            // A stopped pod's reported rate isn't being billed: `-`, as in `pods list`.
+            let cost = p
+                .cost_per_hr
+                .filter(|_| arena_core::status::bills_hourly(&p.provider, &p.status))
+                .map(|c| format!("${c:.2}"))
+                .unwrap_or_else(|| "-".into());
             // GPU now comes from the live nvidia-smi readout (provider list omits it).
             // Append VRAM when wide; drop the "RTX " noise when the table is cramped.
             let mut gpu = m
@@ -1758,6 +1763,7 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
         .unwrap_or_else(|| "-".into());
     let cost = pod
         .cost_per_hr
+        .filter(|_| arena_core::status::bills_hourly(&pod.provider, &pod.status))
         .map(|c| format!("${c:.2}/hr  (${:.2}/day)", c * 24.0))
         .unwrap_or_else(|| "-".into());
     let disk = match m.and_then(|m| m.disk_summary()) {

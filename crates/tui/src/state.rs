@@ -84,7 +84,8 @@ pub struct FleetSummary {
     pub mean_util: Option<u32>,
     pub mem_used_mb: u32,
     pub mem_total_mb: u32,
-    /// Summed $/hr over pods that report a cost.
+    /// Summed $/hr over billing pods that report a cost (a stopped pod's reported rate
+    /// isn't being charged — `arena_core::status::bills_hourly`, as `pods list` counts).
     pub total_cost: f64,
 }
 
@@ -97,7 +98,7 @@ pub fn summarize(pods: &[Pod], metrics: &HashMap<String, PodMetrics>) -> FleetSu
     let mut util_sum = 0u64;
     let mut util_n = 0u64;
     for pod in pods {
-        if let Some(c) = pod.cost_per_hr {
+        if let Some(c) = pod.cost_per_hr.filter(|_| arena_core::status::bills_hourly(&pod.provider, &pod.status)) {
             s.total_cost += c;
         }
         let Some(m) = metrics.get(&pod.name) else { continue };
@@ -502,6 +503,17 @@ mod tests {
         assert_eq!(s.mean_util, Some(50)); // (100 + 0) / 2 GPUs
         assert_eq!((s.mem_used_mb, s.mem_total_mb), (9000, 32000));
         assert!((s.total_cost - 1.09).abs() < 1e-9);
+    }
+
+    #[test]
+    fn summary_cost_counts_billing_pods_only() {
+        let mut exited = pod("arena8-zebra", Some(0.13));
+        exited.status = "EXITED".into();
+        let mut starting = pod("arena8-yak", Some(0.20));
+        starting.status = "STARTING".into();
+        let s = summarize(&[pod("arena8-apple", Some(0.40)), exited, starting], &HashMap::new());
+        assert!((s.total_cost - 0.60).abs() < 1e-9, "{}", s.total_cost);
+        assert_eq!(s.pods, 3);
     }
 
     #[test]

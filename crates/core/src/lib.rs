@@ -12,6 +12,7 @@ pub mod error;
 pub mod fleet;
 pub mod gpu;
 pub mod health;
+pub(crate) mod http;
 pub mod metrics;
 pub mod naming;
 pub mod openrouter;

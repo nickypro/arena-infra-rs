@@ -25,6 +25,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `ssh.direct` only; create always sends `cloud` (v2 defaults to SECURE) and merges the
     account's registered SSH keys into `PUBLIC_KEY` (v2 skips them when it's set);
     `replace` recovers GPU type + cloud tier. Rename and maintenance still use GraphQL.
+    Neither API reports a pod's CUDA constraint, so `replace`/`migrate copy` re-apply the
+    configured `ALLOWED_CUDA_VERSIONS` to the replacement (as `create` does).
   - `provider::vast` — Vast.ai REST backend against the same trait. Vast rents
     *offers* rather than named pods, so `create_pod` searches the marketplace for
     the cheapest rentable offer matching the spec (GPU type/count, disk) and rents
@@ -57,8 +59,12 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `list` shows NAME PROVIDER ID STATUS GPU (`count×type`) $/H ENDPOINT MAINT (the
     host's RunPod maintenance window, e.g. `maint 10-09 02:00→06:00 UTC`; the host's
     free-text note is flattened onto one line) and a footer
-    `fleet: $X/h across N running pod(s)` summing RUNNING pods (Hetzner's € shown
-    separately, unpriced pods counted). GPU/$/maintenance come from one extra read-only
+    `fleet: $X/h across N billing pod(s)` summing the **billing** pods (Hetzner's € shown
+    separately, unpriced pods counted). "Billing" is one rule (`status::is_billing`):
+    running or on its way up — RunPod v2 `PROVISIONING`/`STARTING`/`ERROR` too, Hetzner
+    `initializing`, Vast `loading` — not `EXITED`/`STOPPED`/`TERMINATED`/`off`; a Hetzner
+    server bills while it exists, powered off included. A non-billing pod's `$/H` shows `-`
+    (`--json` keeps the raw `cost_per_hr`). GPU/$/maintenance come from one extra read-only
     RunPod GraphQL query per `list` (best-effort: if it fails you get one warning line and
     the list still renders); the `nvidia-smi` probe over SSH (default for the table,
     `--probe`/`--no-probe`) overrides the GPU when a pod answers. `list --json` emits the
@@ -66,7 +72,7 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     reboot / Vast stop+start), preserving the machine where supported. `terminate
     --all` tears down the **whole fleet** (confirms first; `--dry-run` lists every
     pod without touching them) — for end-of-program teardown. `stop --all`
-    (with `--include`/`--exclude`) stops many at once; `kill` is the stop→wait-for-
+    (with `--include`/`--exclude`) stops every billing pod (running *or* starting) at once; `kill` is the stop→wait-for-
     EXITED→delete flow (`--timeout`; one target or `--all`).
   - `create` also takes **explicit names** (`pods create apple bloom`) and an
     **`--image`** override, alongside `-n`(target total) / `-a`(add). Bare names get
@@ -75,7 +81,15 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     topping up to the target** while capacity is short — one round per interval for up
     to M minutes, **Ctrl+C** stops early keeping what was made. A `no instances
     available` capacity error is recognized as such (it waits), not treated as fatal.
+    A round starts only while it still fits in the window (no create after it closes).
     The confirm prompt lists the exact pod names about to be created.
+  - **`--gpu` is checked** (`create`/`up`/`offers`/`replace`/`migrate copy`, RunPod only):
+    each token — an alias (`3070`, `4080super`, `L4`, `2000ada`, `A4500`, …), an exact id
+    (any case) or a unique catalog short name (`RTX 3070`, `H100 SXM`) — must be in RunPod's
+    live GPU catalog, else the command stops before anything is created: ``--gpu: `3070x`
+    isn't a RunPod GPU type — did you mean `NVIDIA GeForce RTX 3070` (RTX 3070)?``. If the
+    catalog can't be fetched it warns and passes the flag through unchecked. Vast/Hetzner:
+    passed through as before.
   - **Multi-option placement** (`create`/`up`): `--gpu A4000,4000Ada,3090 --cloud
     community,secure --max-price 0.5 [--order cheapest|listed]`. The gpu × cloud options
     are priced (RunPod's live catalog — v2 `/catalog/gpus` per tier on `RUNPOD_API=v2`, else
@@ -115,7 +129,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     retries; on **auth** failure it aborts immediately. Already-created pods are
     never rolled back. **Transient** failures (429 / 5xx / connect-timeout) are
     retried automatically with exponential backoff (`retry` module) around create
-    and list calls — so a throttle or blip doesn't fail the command.
+    and list calls — so a throttle or blip doesn't fail the command. Every backend reads a
+    response's **status before its body** (`http` module), so a bad key's `401` with an HTML
+    or empty body is `Auth` (`… HTTP 401 Unauthorized: …`), never "error decoding response body".
   - `proxy plan` — read-only; shows the merge against the current config (`+` added,
     `~` changed — including a kept entry whose port moved with the list —, `-` removed,
     `=` kept-stale, plus a `+N added, ~N changed, …` summary) and prints the nginx

@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 
 use super::Provider;
 use crate::error::{Error, Result};
+use crate::http::{send_json, send_ok};
 use crate::pod::{Pod, PodSpec};
 
 const BASE: &str = "https://api.hetzner.cloud/v1";
@@ -72,15 +73,7 @@ impl HetznerProvider {
 
     /// Current Hetzner status string for a server (e.g. "running", "off", "starting").
     async fn server_status(&self, id: &str) -> Result<String> {
-        let resp = self
-            .auth(self.client.get(format!("{}/servers/{}", self.base, id)))
-            .send()
-            .await?;
-        let st = resp.status();
-        let body: Value = resp.json().await.unwrap_or(Value::Null);
-        if !st.is_success() {
-            return Err(Error::provider_http(st, &body, "hetzner get server"));
-        }
+        let body = send_json(self.auth(self.client.get(format!("{}/servers/{}", self.base, id))), "hetzner get server").await?;
         Ok(body
             .get("server")
             .and_then(|s| s.get("status"))
@@ -91,16 +84,11 @@ impl HetznerProvider {
 
     /// POST a power action (`reset`/`poweron`/`reboot`/`poweroff`) to a server.
     async fn power_action(&self, id: &str, action: &str) -> Result<()> {
-        let resp = self
-            .auth(self.client.post(format!("{}/servers/{}/actions/{}", self.base, id, action)))
-            .send()
-            .await?;
-        let st = resp.status();
-        if !st.is_success() {
-            let body: Value = resp.json().await.unwrap_or(Value::Null);
-            return Err(Error::provider_http(st, &body, &format!("hetzner {action}")));
-        }
-        Ok(())
+        send_ok(
+            self.auth(self.client.post(format!("{}/servers/{}/actions/{}", self.base, id, action))),
+            &format!("hetzner {action}"),
+        )
+        .await
     }
 }
 
@@ -209,18 +197,9 @@ impl Provider for HetznerProvider {
         let mut out = Vec::new();
         let mut page: u64 = 1;
         for _ in 0..MAX_PAGES {
-            let resp = self
-                .auth(self.client.get(format!(
-                    "{}/servers?page={page}&per_page={PER_PAGE}",
-                    self.base
-                )))
-                .send()
-                .await?;
-            let status = resp.status();
-            let body: Value = resp.json().await?;
-            if !status.is_success() {
-                return Err(Error::provider_http(status, &body, "hetzner list"));
-            }
+            // Status first, then decode (crate::http): an auth/HTML error stays classified.
+            let url = format!("{}/servers?page={page}&per_page={PER_PAGE}", self.base);
+            let body = send_json(self.auth(self.client.get(url)), "hetzner list").await?;
             let (servers, next) = servers_page(&body)?;
             out.extend(servers.iter().map(parse_server));
             match next {
@@ -258,15 +237,7 @@ impl Provider for HetznerProvider {
         if !self.opts.ssh_keys.is_empty() {
             payload["ssh_keys"] = json!(self.opts.ssh_keys);
         }
-        let resp = self
-            .auth(self.client.post(format!("{}/servers", self.base)).json(&payload))
-            .send()
-            .await?;
-        let status = resp.status();
-        let body: Value = resp.json().await?;
-        if !status.is_success() {
-            return Err(Error::provider_http(status, &body, "hetzner create"));
-        }
+        let body = send_json(self.auth(self.client.post(format!("{}/servers", self.base)).json(&payload)), "hetzner create").await?;
         // The created server is under `server`; parse what's there (IP may not be
         // populated until it finishes provisioning — `pods up` polls for that).
         Ok(parse_server(body.get("server").unwrap_or(&body)))
@@ -290,22 +261,38 @@ impl Provider for HetznerProvider {
     }
 
     async fn terminate_pod(&self, id: &str) -> Result<()> {
-        let resp = self
-            .auth(self.client.delete(format!("{}/servers/{}", self.base, id)))
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body: Value = resp.json().await.unwrap_or(Value::Null);
-            return Err(Error::provider_http(status, &body, "hetzner terminate"));
-        }
-        Ok(())
+        send_ok(self.auth(self.client.delete(format!("{}/servers/{}", self.base, id))), "hetzner terminate").await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Status first, then decode: a bad token's 401 (or a proxy's HTML) is classified by
+    /// its status, never "error decoding response body". Loopback server, real request path.
+    #[tokio::test]
+    async fn error_statuses_are_classified_before_decoding() {
+        use crate::error::ProviderErrorKind as K;
+        use crate::http::test_server::{canned, client, serve};
+        let srv = serve(vec![
+            canned(401, "application/json", r#"{"error":{"code":"unauthorized","message":"unable to authenticate"}}"#),
+            canned(503, "text/html", "<html>Service Unavailable</html>"),
+            canned(200, "application/json", r#"{"server":{"id":5,"status":"off"}}"#),
+            canned(403, "text/plain", "Forbidden"),
+        ]);
+        let p = HetznerProvider { api_key: "BOGUS".into(), client: client(), base: srv.base.clone(), opts: HetznerOpts::default() };
+        let e = p.list_pods().await.unwrap_err();
+        assert_eq!(e.kind(), Some(K::Auth), "{e}");
+        assert!(e.to_string().contains("hetzner list HTTP 401") && e.to_string().contains("unable to authenticate"), "{e}");
+        let e = p.stop_pod("5").await.unwrap_err();
+        assert_eq!(e.kind(), Some(K::Transient), "{e}");
+        // restart: reads the status (off) → poweron, which is refused.
+        let e = p.restart_pod("5").await.unwrap_err();
+        assert!(e.to_string().contains("hetzner poweron HTTP 403"), "{e}");
+        assert_eq!(e.kind(), Some(K::Auth));
+        assert_eq!(srv.requests.lock().unwrap().last().unwrap(), "POST /servers/5/actions/poweron HTTP/1.1");
+    }
 
     #[test]
     fn servers_page_reads_array_and_next_page() {

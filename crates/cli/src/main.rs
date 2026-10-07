@@ -1143,7 +1143,8 @@ async fn create_with_retry(
     // computed once in plan_create) bounds the whole operation: retries only ever re-plan
     // toward it, so a top-up can never balloon past what the operator agreed to.
     let retry_secs = retry_secs.max(1);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(retry_mins * 60);
+    // tokio's clock (not std's), so the paused-clock tests drive the window.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(retry_mins * 60);
     let mut all: Vec<arena_core::Pod> = Vec::new();
     let mut names = initial;
     let shown = if target == 0 { names.len() } else { target };
@@ -1167,8 +1168,12 @@ async fn create_with_retry(
         if got == names.len() || retry_mins == 0 {
             break; // filled what this round needed, or no retry requested
         }
-        if std::time::Instant::now() >= deadline {
-            eprintln!("retry window ({retry_mins}m) elapsed — have {} of {shown}", all.len());
+        // A round starts only inside the window: if the next one (`retry_secs` from now)
+        // would start past it, stop here — not sleep, then create (bill) after the window
+        // the operator agreed to. Decided before the sleep, as the placement executor does.
+        let every = std::time::Duration::from_secs(retry_secs);
+        if !arena_core::placement::next_round_in_window(tokio::time::Instant::now(), every, deadline) {
+            eprintln!("retry window ({retry_mins}m) has no room for another round — have {} of {shown}", all.len());
             break;
         }
         eprintln!(
@@ -1337,6 +1342,69 @@ where
         Ok(r) => r,
         Err(_) => Err(arena_core::Error::provider(format!("timed out after {}s", PRICE_TIMEOUT.as_secs()))),
     }
+}
+
+/// RunPod's live GPU catalog, for checking `--gpu` (read-only; each fetch bounded by
+/// [`PRICE_TIMEOUT`]). The GraphQL `gpuTypes` first, on either API generation: it's the
+/// full catalog whatever the tier (a superset of what create accepts, so checking against it
+/// never refuses a creatable id); on `RUNPOD_API=v2` the REST v2 catalog is the fallback.
+/// `Err` says why there's no catalog (no key, unreachable, empty).
+async fn live_gpu_catalog(cfg: &Config) -> std::result::Result<Vec<arena_core::provider::runpod::GpuType>, String> {
+    use arena_core::provider::{runpod, runpod_v2, RunpodApi};
+    let Some(key) = cfg.get("RUNPOD_API_KEY").filter(|s| !s.is_empty()) else {
+        return Err("no RUNPOD_API_KEY".into());
+    };
+    let mut errs = Vec::new();
+    match bounded_catalog(runpod::fetch_gpu_types(key)).await {
+        Ok(types) if !types.is_empty() => return Ok(types),
+        Ok(_) => errs.push("GraphQL catalog: empty".to_string()),
+        Err(e) => errs.push(format!("GraphQL catalog: {e}")),
+    }
+    if matches!(RunpodApi::from_config(cfg), Ok(RunpodApi::V2)) {
+        let cloud = runpod_v2::normalize_cloud(&PodSpec::from_config(cfg).cloud_type).unwrap_or("COMMUNITY");
+        match bounded_catalog(runpod_v2::fetch_gpu_types(key, cloud)).await {
+            Ok(types) if !types.is_empty() => return Ok(types),
+            Ok(_) => errs.push(format!("v2 catalog ({cloud}): empty")),
+            Err(e) => errs.push(format!("v2 catalog ({cloud}): {e}")),
+        }
+    }
+    Err(errs.join("; "))
+}
+
+/// What to do with a `--gpu` value given the catalog fetch's outcome. Pure (the policy is
+/// table-tested): with a catalog, every token must be a RunPod GPU — the value comes back
+/// as exact ids, or the error names the bad tokens with "did you mean"
+/// ([`arena_core::gpu::check_gpu_flag`]); without one, the value passes through unchanged
+/// with a warning to print — being unable to *check* must not block a create.
+fn gpu_flag_or_warning(
+    raw: String,
+    catalog: std::result::Result<Vec<arena_core::provider::runpod::GpuType>, String>,
+) -> Result<(String, Option<String>)> {
+    match catalog {
+        Ok(types) => Ok((arena_core::gpu::check_gpu_flag(&raw, &types)?, None)),
+        Err(why) => {
+            let warning =
+                format!("warning: couldn't check --gpu `{raw}` against RunPod's live GPU catalog ({why}) — using it unchecked");
+            Ok((raw, Some(warning)))
+        }
+    }
+}
+
+/// `--gpu` as `create`/`up`/`offers`/`replace`/`migrate` should use it: on RunPod, checked
+/// against the live catalog first — a typo (or a card without an alias) used to go to the
+/// provider as an invalid id and fail late ("no known price", a 400 at create). Other
+/// providers name GPUs their own way (Vast matches loosely; Hetzner has none): passed
+/// through. Read-only, before anything is listed or created.
+async fn checked_gpu(cfg: &Config, provider_name: &str, gpu: Option<String>) -> Result<Option<String>> {
+    let Some(raw) = gpu else { return Ok(None) };
+    if provider_name != "runpod" {
+        return Ok(Some(raw));
+    }
+    let (gpu, warning) = gpu_flag_or_warning(raw, live_gpu_catalog(cfg).await)?;
+    if let Some(w) = warning {
+        eprintln!("{w}");
+    }
+    Ok(Some(gpu))
 }
 
 /// The prices placement can see (read-only), plus notes on where they came from. RunPod:
@@ -1681,6 +1749,7 @@ async fn handle_offers(
     if !["runpod", "vast", "hetzner"].contains(&provider_name) {
         anyhow::bail!("unknown provider `{provider_name}` (known: runpod, vast, hetzner)");
     }
+    let gpu = checked_gpu(cfg, provider_name, gpu).await?;
     let base = spec_with_overrides(cfg, &SpecOverrides { gpus, ..Default::default() });
     let req = arena_core::placement::Request::from_flags(gpu.as_deref(), cloud.as_deref(), &base, max_price, order)?;
     let plan = plan_placement(cfg, provider_name, &req).await?;
@@ -3836,28 +3905,32 @@ async fn enrich_best_effort(
 /// `metrics::fetch_with`), so a wedged pod costs the listing at most that budget. Where a
 /// pod answers, what the machine itself sees overrides the provider-reported GPU (type and
 /// count); one that doesn't keeps what the provider said.
+///
+/// Results are keyed by the pod's position in `pods`, not its name: two pods can share a
+/// name (a half-finished replace, a hand-made duplicate), and keyed by name one pod's GPU
+/// was shown on both rows. Not by id either — ids are only unique per provider.
 async fn probe_gpus(remote: &Arc<dyn Remote>, cfg: &Config, pods: &mut [arena_core::Pod]) {
     use arena_core::metrics::{self, ProbeOpts};
     let mut jobs = Vec::new();
-    for pod in pods.iter() {
+    for (i, pod) in pods.iter().enumerate() {
         if let Ok(mut t) = SshTarget::from_pod(pod, cfg) {
             t.connect_timeout_secs = 5;
             let remote = remote.clone();
             let probe = async move { metrics::fetch_with(remote.as_ref(), &t, &ProbeOpts::default()).await };
-            jobs.push((pod.name.clone(), probe));
+            jobs.push((i, probe));
         }
     }
     let mut gpus = std::collections::HashMap::new();
-    each_pod(jobs, |_, _, name, probed| {
+    each_pod(jobs, |_, _, i, probed| {
         if let Some((g, n)) = probed.ok().and_then(|m| m.gpu_summary().map(|g| (g, m.gpus.len() as u32))) {
-            gpus.insert(name.to_string(), (g, n));
+            gpus.insert(*i, (g, n));
         }
     })
     .await;
-    for p in pods.iter_mut() {
-        if let Some((g, n)) = gpus.get(&p.name) {
-            p.gpu_type = Some(g.clone());
-            p.gpu_count = Some(*n);
+    for (i, p) in pods.iter_mut().enumerate() {
+        if let Some((g, n)) = gpus.remove(&i) {
+            p.gpu_type = Some(g);
+            p.gpu_count = Some(n);
         }
     }
 }
@@ -3904,6 +3977,8 @@ async fn handle_pods(
         }
 
         PodCmd::Create { names, count, add, gpu, gpus, cloud, max_price, order, disk, volume, image, bootstrap, skip_proxy, dry_run, keep_trying, retry_mins, retry_secs } => {
+            // A typo'd --gpu fails here, before anything is listed or created.
+            let gpu = checked_gpu(cfg, provider.name(), gpu).await?;
             let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap };
             // Several --gpu/--cloud options or a --max-price → ordered placement; otherwise
             // the single-spec path below, unchanged. Decided before anything is listed.
@@ -3978,6 +4053,7 @@ async fn handle_pods(
         }
 
         PodCmd::Up { names, count, add, gpu, gpus, cloud, max_price, order, disk, volume, image, bootstrap, dry_run, no_wait, keep_trying, retry_mins, retry_secs, no_setup, timeout, interval } => {
+            let gpu = checked_gpu(cfg, provider.name(), gpu).await?;
             let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap };
             // Several --gpu/--cloud options or a --max-price → ordered placement (as `create`).
             let (ov, placing) = placement_request(cfg, provider.name(), ov, max_price, order, keep_trying)?;
@@ -4168,9 +4244,13 @@ async fn handle_pods(
                     }
                 }
                 (true, _) => {
-                    let pods = select_pods(provider, cfg, &include, &exclude, Some("RUNNING")).await?;
+                    // Every pod that's billing — not just RUNNING: RunPod v2 reports real
+                    // states, and a PROVISIONING/STARTING pod bills too (one status rule
+                    // for this, the $/H column and the fleet total: `status::is_billing`).
+                    let mut pods = select_pods(provider, cfg, &include, &exclude, None).await?;
+                    pods.retain(|p| arena_core::status::is_billing(&p.status));
                     if pods.is_empty() {
-                        println!("(no running pods to stop)");
+                        println!("(no running or starting pods to stop)");
                         return Ok(());
                     }
                     if dry_run {
@@ -4180,7 +4260,7 @@ async fn handle_pods(
                         println!("\nDry-run only — would stop {} pod(s).", pods.len());
                         return Ok(());
                     }
-                    if !confirm(yes, &format!("Will stop {} running pod(s).", pods.len()))? {
+                    if !confirm(yes, &format!("Will stop {} running/starting pod(s).", pods.len()))? {
                         println!("aborted.");
                         return Ok(());
                     }
@@ -5083,8 +5163,14 @@ fn replace_stage_names(canonical: &str) -> (String, String) {
 
 /// Build the spec for a replacement pod: snapshot the source's spec, fall GPU/cloud/image
 /// back to config (the REST API can't report GPU type or cloud tier — empty `machine`
-/// object), re-seed the shared SSH key, then apply CLI overrides. disk/volume/ports/env come
-/// from the snapshot so per-pod differences are preserved. Errors if no GPU type is known.
+/// object), re-apply the configured CUDA constraint, re-seed the shared SSH key, then apply
+/// CLI overrides. disk/volume/ports/env come from the snapshot so per-pod differences are
+/// preserved. Errors if no GPU type is known.
+///
+/// The CUDA constraint (`ALLOWED_CUDA_VERSIONS`) can't come from the snapshot — neither
+/// RunPod API reports it back — so without re-applying it a replacement was created
+/// unconstrained and could land the cu130 image on a CUDA 12 host (a pod whose torch can't
+/// use its GPU). A snapshot that did carry one keeps it.
 async fn build_replacement_spec(
     cfg: &Config,
     owner: &dyn Provider,
@@ -5092,6 +5178,8 @@ async fn build_replacement_spec(
     src_label: &str,
     ov: &SpecOverrides,
 ) -> Result<PodSpec> {
+    // `--gpu` is checked against the owner's catalog first (RunPod), as on create.
+    let ov = &SpecOverrides { gpu: checked_gpu(cfg, owner.name(), ov.gpu.clone()).await?, ..ov.clone() };
     let mut spec = owner
         .pod_spec(src_id)
         .await
@@ -5105,6 +5193,9 @@ async fn build_replacement_spec(
     }
     if spec.cloud_type.is_empty() {
         spec.cloud_type = base.cloud_type;
+    }
+    if spec.allowed_cuda.is_empty() {
+        spec.allowed_cuda = base.allowed_cuda;
     }
     let pubkeys = arena_core::ssh::authorized_pubkeys(cfg);
     if !pubkeys.is_empty() {
@@ -7273,6 +7364,131 @@ async fn handle_ssh_config(
     Ok(())
 }
 
+/// `replace`/`migrate`'s replacement spec and the `--gpu` check policy, with a fake
+/// provider (no network: the configs carry no RUNPOD_API_KEY, so no catalog is fetched).
+#[cfg(test)]
+mod replacement_spec_tests {
+    use super::{build_replacement_spec, gpu_flag_or_warning, SpecOverrides};
+    use arena_core::provider::runpod::GpuType;
+    use arena_core::{Config, Pod, PodSpec, Provider, Result};
+    use async_trait::async_trait;
+
+    /// A provider whose `pod_spec` returns a fixed snapshot (as RunPod's would: no CUDA
+    /// constraint, GPU/cloud blank on v1).
+    struct Snapshot {
+        name: &'static str,
+        spec: PodSpec,
+    }
+
+    #[async_trait]
+    impl Provider for Snapshot {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        fn describe(&self, _spec: &PodSpec) -> String {
+            String::new()
+        }
+        async fn list_pods(&self) -> Result<Vec<Pod>> {
+            Ok(Vec::new())
+        }
+        async fn create_pod(&self, _spec: &PodSpec) -> Result<Pod> {
+            unimplemented!("not exercised")
+        }
+        async fn stop_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn restart_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn terminate_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn pod_spec(&self, _id: &str) -> Result<PodSpec> {
+            Ok(self.spec.clone())
+        }
+    }
+
+    fn snapshot(allowed_cuda: &[&str]) -> PodSpec {
+        PodSpec {
+            name: String::new(),
+            image: "img:cu130".into(),
+            gpu_type: String::new(), // v1 can't report it: config's GPU_TYPE fills in
+            gpu_count: 1,
+            cloud_type: String::new(),
+            disk_gb: 40,
+            volume_gb: 0,
+            ports: "22/tcp".into(),
+            env: Vec::new(),
+            docker_args: None,
+            allowed_cuda: allowed_cuda.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn cfg(extra: &str) -> Config {
+        Config::parse(&format!(
+            "MACHINE_NAME_PREFIX=devtest\nGPU_TYPE=\"NVIDIA RTX A4000\"\nSHARED_SSH_KEY_PATH=/nonexistent/k\n{extra}"
+        ))
+    }
+
+    /// Review finding: the replacement never got `ALLOWED_CUDA_VERSIONS` back (the API
+    /// doesn't report it), so a cu130 image could land on a CUDA 12 host.
+    #[tokio::test]
+    async fn replacement_reapplies_the_configured_cuda_constraint() {
+        let owner = Snapshot { name: "runpod", spec: snapshot(&[]) };
+        let ov = SpecOverrides::default();
+        // (config, what the replacement is constrained to)
+        for (extra, want) in [
+            ("ALLOWED_CUDA_VERSIONS=\"13.0\"\n", vec!["13.0"]),
+            ("ALLOWED_CUDA_VERSIONS=\"13.0, 12.8\"\n", vec!["13.0", "12.8"]),
+            ("RUNPOD_ALLOWED_CUDA_VERSIONS=13.0\n", vec!["13.0"]), // the legacy key, as create reads it
+            ("", vec![]),                                          // unconfigured: any host, as before
+        ] {
+            let spec = build_replacement_spec(&cfg(extra), &owner, "id-1", "devtest-apple", &ov).await.unwrap();
+            assert_eq!(spec.allowed_cuda, want, "{extra:?}");
+            assert_eq!((spec.gpu_type.as_str(), spec.disk_gb), ("NVIDIA RTX A4000", 40), "snapshot + config fallback");
+        }
+        // A snapshot that does carry a constraint keeps it.
+        let pinned = Snapshot { name: "runpod", spec: snapshot(&["12.8"]) };
+        let spec = build_replacement_spec(&cfg("ALLOWED_CUDA_VERSIONS=13.0\n"), &pinned, "id-1", "x", &ov).await.unwrap();
+        assert_eq!(spec.allowed_cuda, ["12.8"]);
+        // --gpu still applies on top (unchecked here: no key → no catalog).
+        let ov = SpecOverrides { gpu: Some("3070".into()), ..Default::default() };
+        let spec = build_replacement_spec(&cfg("ALLOWED_CUDA_VERSIONS=13.0\n"), &owner, "id-1", "x", &ov).await.unwrap();
+        assert_eq!((spec.gpu_type.as_str(), spec.allowed_cuda.clone()), ("NVIDIA GeForce RTX 3070", vec!["13.0".to_string()]));
+    }
+
+    #[test]
+    fn gpu_flag_policy_checks_with_a_catalog_and_warns_without_one() {
+        let catalog = || {
+            Ok(vec![
+                GpuType { id: "NVIDIA GeForce RTX 3070".into(), display_name: "RTX 3070".into(), memory_gb: 8, ..Default::default() },
+                GpuType { id: "NVIDIA RTX A4000".into(), display_name: "RTX A4000".into(), memory_gb: 16, ..Default::default() },
+            ])
+        };
+        // Catalog reachable: canonical ids, no warning.
+        let (gpu, warn) = gpu_flag_or_warning("3070,a4000".into(), catalog()).unwrap();
+        assert_eq!((gpu.as_str(), warn), ("NVIDIA GeForce RTX 3070,NVIDIA RTX A4000", None));
+        // …and a typo fails loudly, with a suggestion.
+        let e = gpu_flag_or_warning("3070x".into(), catalog()).unwrap_err().to_string();
+        assert!(e.contains("`3070x` isn't a RunPod GPU type") && e.contains("did you mean `NVIDIA GeForce RTX 3070`"), "{e}");
+        // Unreachable: passed through as typed, with one warning saying why.
+        let (gpu, warn) = gpu_flag_or_warning("3070x".into(), Err("GraphQL catalog: timed out after 30s".into())).unwrap();
+        assert_eq!(gpu, "3070x");
+        let warn = warn.unwrap();
+        assert!(warn.starts_with("warning: couldn't check --gpu `3070x`") && warn.contains("timed out"), "{warn}");
+    }
+
+    /// Non-RunPod providers keep pass-through (no catalog fetched at all), and so does a
+    /// RunPod config without a key (the warning path; no network in either case).
+    #[tokio::test]
+    async fn checked_gpu_passes_through_off_runpod_and_without_a_key() {
+        let c = cfg("");
+        assert_eq!(super::checked_gpu(&c, "vast", Some("RTX 3070 typo".into())).await.unwrap().as_deref(), Some("RTX 3070 typo"));
+        assert_eq!(super::checked_gpu(&c, "hetzner", None).await.unwrap(), None);
+        assert_eq!(super::checked_gpu(&c, "runpod", Some("3070".into())).await.unwrap().as_deref(), Some("3070"));
+    }
+}
+
 /// Scenario tests for pod-selection control flow, driven by a fake `Provider` (no real
 /// API/SSH). Covers the filter logic + the "--include matched nothing" guard that keeps a
 /// typo'd target from silently looking like an idle fleet.
@@ -7376,6 +7592,64 @@ mod selection_tests {
         // "bloom" should resolve to arena8-bloom through MACHINE_NAME_PREFIX.
         let got = select_pods(&fleet(), &cfg(), &["bloom".into()], &[], None).await.unwrap();
         assert_eq!(names(&got), ["arena8-bloom"]);
+    }
+
+    /// `pods stop --all` stops every billing pod — a STARTING/PROVISIONING v2 pod (it
+    /// bills) used to be missed, as only `RUNNING` matched — and leaves stopped ones alone.
+    #[tokio::test]
+    async fn stop_all_targets_every_billing_status() {
+        use super::{handle_pods, PodCmd};
+        use std::sync::Mutex;
+        struct Stops {
+            pods: Vec<Pod>,
+            stopped: Mutex<Vec<String>>,
+        }
+        #[async_trait]
+        impl Provider for Stops {
+            fn name(&self) -> &'static str {
+                "runpod"
+            }
+            fn describe(&self, _spec: &PodSpec) -> String {
+                String::new()
+            }
+            async fn list_pods(&self) -> Result<Vec<Pod>> {
+                Ok(self.pods.clone())
+            }
+            async fn create_pod(&self, _spec: &PodSpec) -> Result<Pod> {
+                unimplemented!("not exercised")
+            }
+            async fn stop_pod(&self, id: &str) -> Result<()> {
+                self.stopped.lock().unwrap().push(id.to_string());
+                Ok(())
+            }
+            async fn restart_pod(&self, _id: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn terminate_pod(&self, _id: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+        let fake = Stops {
+            pods: vec![
+                pod("arena8-apple", "RUNNING"),
+                pod("arena8-bloom", "STARTING"),
+                pod("arena8-cider", "PROVISIONING"),
+                pod("arena8-dune", "EXITED"),
+                pod("arena8-elm", "TERMINATED"),
+                pod("arena8-fig", "ERROR"),
+                pod("arena8-gale", "running"),
+            ],
+            stopped: Mutex::new(Vec::new()),
+        };
+        let stop = |dry_run| PodCmd::Stop { target: None, all: true, include: vec![], exclude: vec![], dry_run };
+        let remote: std::sync::Arc<dyn arena_core::remote::Remote> = std::sync::Arc::new(arena_core::remote::FakeRemote::new());
+        handle_pods(stop(true), &fake, remote.clone(), &cfg(), true).await.unwrap();
+        assert!(fake.stopped.lock().unwrap().is_empty(), "dry-run stops nothing");
+        handle_pods(stop(false), &fake, remote, &cfg(), true).await.unwrap();
+        assert_eq!(
+            *fake.stopped.lock().unwrap(),
+            ["id-arena8-apple", "id-arena8-bloom", "id-arena8-cider", "id-arena8-fig", "id-arena8-gale"]
+        );
     }
 
     #[tokio::test]
@@ -8980,6 +9254,25 @@ mod placement_cli_tests {
         assert_eq!(fake.calls(), [call("arena8-apple", "NVIDIA RTX A4000", "COMMUNITY")]);
     }
 
+    /// The single-option retry loop starts no round after `--retry-mins` (the multi-option
+    /// executor's rule): it used to check the window only *before* sleeping, so with a
+    /// `--retry-secs` longer than what was left it slept past the window and created anyway.
+    #[tokio::test(start_paused = true)]
+    async fn single_option_retry_starts_no_round_after_the_window() {
+        // (retry_mins, retry_secs, rounds expected): rounds at t = 0, secs, 2·secs, … ≤ window.
+        for (mins, secs, want) in [(1, 600, 1), (1, 45, 2), (2, 60, 3), (1, 60, 2), (0, 30, 1)] {
+            let fake = Recorder::dry(&["NVIDIA RTX A4000"]);
+            let started = tokio::time::Instant::now();
+            let made = create_with_retry(&fake, &cfg(), vec!["arena8-apple".into()], 0, &SpecOverrides::default(), false, mins, secs)
+                .await
+                .unwrap();
+            assert!(made.is_empty());
+            assert_eq!(fake.calls().len(), want, "--retry-mins {mins} --retry-secs {secs}");
+            // It gave up right after the last round — no sleep just to give up.
+            assert_eq!(started.elapsed(), std::time::Duration::from_secs(secs * (want as u64 - 1)), "{mins}/{secs}");
+        }
+    }
+
     #[tokio::test]
     async fn create_with_a_gpu_list_falls_back_and_later_names_skip_the_dry_pool() {
         let fake = Recorder::dry(&["NVIDIA RTX A4000"]);
@@ -9655,6 +9948,23 @@ mod remote_tests {
         assert_eq!(gpu(1), ("RTX A4000".to_string(), 1), "no answer: the provider's GPU stays");
         assert_eq!(gpu(2), ("RTX A4000".to_string(), 1), "no GPU rows: the provider's GPU stays");
         assert!(fake.calls().iter().all(|c| matches!(c, RemoteCall::Exec { timeout, .. } if *timeout == Some(PROBE_TIMEOUT))));
+    }
+
+    /// Two pods with one name (e.g. a half-finished replace) each keep their own GPU: the
+    /// probe used to key results by name, so one pod's readout landed on both rows.
+    #[tokio::test]
+    async fn list_probe_keeps_each_pods_gpu_when_two_pods_share_a_name() {
+        let fake = Arc::new(FakeRemote::new());
+        let smi = |gpu: &str| format!("{gpu}, 3, 10, 24564, 40\n{}\n", arena_core::metrics::SENTINEL);
+        fake.script(&host(22001), [FakeReply::stdout(&smi("NVIDIA RTX A5000"))]);
+        fake.script(&host(22002), [FakeReply::stdout(&smi("NVIDIA GeForce RTX 3070"))]);
+        let remote: Arc<dyn Remote> = fake.clone();
+        let mut twin = pod("apple", 22002);
+        twin.id = "id-devtest-apple-2".into();
+        let mut pods = vec![pod("apple", 22001), twin];
+        probe_gpus(&remote, &cfg(), &mut pods).await;
+        assert_eq!(pods[0].gpu_type.as_deref(), Some("1×RTX A5000"));
+        assert_eq!(pods[1].gpu_type.as_deref(), Some("1×RTX 3070"));
     }
 
     #[tokio::test(start_paused = true)]
