@@ -75,6 +75,27 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     to M minutes, **Ctrl+C** stops early keeping what was made. A `no instances
     available` capacity error is recognized as such (it waits), not treated as fatal.
     The confirm prompt lists the exact pod names about to be created.
+  - **Multi-option placement** (`create`/`up`): `--gpu A4000,4000Ada,3090 --cloud
+    community,secure --max-price 0.5 [--order cheapest|listed]`. The gpu × cloud options
+    are priced (RunPod's live catalog — v2 `/catalog/gpus` per tier on `RUNPOD_API=v2`, else
+    GraphQL — falling back to preset estimates, shown `~`), capped per pod (price × `--gpus`;
+    with a cap an option with no known price is dropped, not risked) and ordered: `cheapest`
+    (default; a price tie goes to the better stock hint, then the listed order) or `listed`
+    (GPU-major). Stock never filters — creating is the truth. Per name the options are tried
+    **one create at a time** (never two creates for one name); a capacity error skips that
+    option for the rest of the round, auth aborts, any other error stops as before.
+    `--retry-mins` re-runs rounds (blocks cleared, fleet re-listed first so a name that
+    appeared meanwhile — or a met `-n` target — isn't created again); Ctrl+C between rounds
+    keeps what was made. Ends with a per-name table: `created on 1×RTX 3090 COMMUNITY
+    ($0.22/h) (after 1×RTX A4000 COMMUNITY: capacity)` or `not placed (tried: …)`. Cloud
+    tiers exist only on RunPod (Vast/Hetzner collapse them, and Hetzner the GPU list too,
+    with a note); Vast/Hetzner quote no price before create, so their options are unpriced.
+    `--keep-trying` stays single-option (use `--retry-mins`). One `--gpu`, one `--cloud` and
+    no `--max-price` is exactly the old single-spec path. `--dry-run` prints the option
+    table and the names it would attempt; the option order is fixed once confirmed.
+  - `offers [--gpu …] [--cloud …] [--max-price …] [--gpus N] [--order …] [--json]` —
+    read-only: the same option table (OPTION, CLOUD, $/H/POD, PRICE source, STOCK, plus what
+    the cap dropped and why), i.e. what `create`/`up` would try. `--json` = the plan.
   - `pods up -n N` — one-command spin-up: create, poll until each pod has an SSH
     endpoint, then **wire the proxy**: if nginx is set up on the proxy host (or the proxy
     is write-only) it deploys as endpoints appear, and ends with the same one-line sync

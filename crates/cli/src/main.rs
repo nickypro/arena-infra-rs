@@ -96,6 +96,31 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// What multi-option placement would try (read-only; a dry run of `pods create/up`
+    /// without the names): the --gpu × --cloud options with $/h per pod (RunPod's live
+    /// prices, ~ = preset estimate), price source and stock hint, ordered and filtered by
+    /// --max-price exactly as create does.
+    Offers {
+        /// GPU type(s), comma-separated, e.g. `A4000,4000Ada,3090` (default: config GPU_TYPE).
+        #[arg(long)]
+        gpu: Option<String>,
+        /// Cloud tier(s), comma-separated, e.g. `community,secure` (default: config
+        /// CLOUD_TYPE). Only RunPod has tiers.
+        #[arg(long)]
+        cloud: Option<String>,
+        /// Max $/h per pod: options above it, or with no known price, are dropped.
+        #[arg(long, value_parser = parse_max_price)]
+        max_price: Option<f64>,
+        /// GPUs per pod (default: config NUM_GPUS) — prices and the cap are per pod.
+        #[arg(long)]
+        gpus: Option<u32>,
+        /// `cheapest` (default) or `listed`.
+        #[arg(long, default_value = "cheapest")]
+        order: arena_core::placement::Order,
+        /// Emit the option plan as JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print the participant-facing `~/.ssh/config` for the fleet (read-only). Direct
     /// pod endpoints by default, or stable proxy ports with --proxy.
     SshConfig {
@@ -378,15 +403,26 @@ enum PodCmd {
         /// Number of pods to ADD (mutually exclusive with -n).
         #[arg(short = 'a', long)]
         add: Option<usize>,
-        /// GPU type, e.g. `A4000`, `3090`, `A100`, `A100 SXM` (or a full provider name).
+        /// GPU type, e.g. `A4000`, `3090`, `A100`, `A100 SXM` (or a full provider name) — or
+        /// a comma list of fallbacks (`A4000,4000Ada,3090`): each name tries the options one
+        /// create at a time, in --order, until one has capacity (see `arena offers`).
         #[arg(long)]
         gpu: Option<String>,
         /// GPUs per pod (overrides config NUM_GPUS).
         #[arg(long)]
         gpus: Option<u32>,
-        /// RunPod cloud tier: COMMUNITY or SECURE (overrides config).
+        /// RunPod cloud tier: COMMUNITY or SECURE (overrides config) — or a comma list
+        /// (`community,secure`) to fall back across tiers.
         #[arg(long)]
         cloud: Option<String>,
+        /// Max $/h per pod (per-GPU price × --gpus). Options above it, or with no known
+        /// price, are not tried. Prices: RunPod's live catalog (else preset estimates).
+        #[arg(long, value_parser = parse_max_price)]
+        max_price: Option<f64>,
+        /// Order to try several --gpu/--cloud options in: `cheapest` (by $/h per pod; a tie
+        /// goes to the better stock hint, then the listed order) or `listed` (GPU-major).
+        #[arg(long, default_value = "cheapest")]
+        order: arena_core::placement::Order,
         /// Container disk size in GB (overrides config DISK_GB).
         #[arg(long)]
         disk: Option<u32>,
@@ -410,11 +446,13 @@ enum PodCmd {
         /// Preview only: print what would happen, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
-        /// On capacity exhaustion, wait and keep retrying instead of stopping.
+        /// On capacity exhaustion, wait and keep retrying instead of stopping (one GPU/cloud
+        /// only — with several options use --retry-mins).
         #[arg(long)]
         keep_trying: bool,
         /// Keep re-attempting (topping up to the target) for up to this many minutes,
-        /// e.g. while waiting for capacity. 0 = a single attempt. Ctrl+C stops early.
+        /// e.g. while waiting for capacity. 0 = a single attempt. Ctrl+C stops early. With
+        /// several options, each round re-tries every option.
         #[arg(long, default_value_t = 0)]
         retry_mins: u64,
         /// Seconds between retry rounds.
@@ -432,15 +470,26 @@ enum PodCmd {
         /// Number of pods to ADD (mutually exclusive with -n).
         #[arg(short = 'a', long)]
         add: Option<usize>,
-        /// GPU type, e.g. `A4000`, `3090`, `A100`, `A100 SXM` (or a full provider name).
+        /// GPU type, e.g. `A4000`, `3090`, `A100`, `A100 SXM` (or a full provider name) — or
+        /// a comma list of fallbacks (`A4000,4000Ada,3090`): each name tries the options one
+        /// create at a time, in --order, until one has capacity (see `arena offers`).
         #[arg(long)]
         gpu: Option<String>,
         /// GPUs per pod (overrides config NUM_GPUS).
         #[arg(long)]
         gpus: Option<u32>,
-        /// RunPod cloud tier: COMMUNITY or SECURE (overrides config).
+        /// RunPod cloud tier: COMMUNITY or SECURE (overrides config) — or a comma list
+        /// (`community,secure`) to fall back across tiers.
         #[arg(long)]
         cloud: Option<String>,
+        /// Max $/h per pod (per-GPU price × --gpus). Options above it, or with no known
+        /// price, are not tried. Prices: RunPod's live catalog (else preset estimates).
+        #[arg(long, value_parser = parse_max_price)]
+        max_price: Option<f64>,
+        /// Order to try several --gpu/--cloud options in: `cheapest` (by $/h per pod; a tie
+        /// goes to the better stock hint, then the listed order) or `listed` (GPU-major).
+        #[arg(long, default_value = "cheapest")]
+        order: arena_core::placement::Order,
         /// Container disk size in GB (overrides config DISK_GB).
         #[arg(long)]
         disk: Option<u32>,
@@ -463,7 +512,8 @@ enum PodCmd {
         /// Don't poll after creating; just print ids (run `proxy plan` later).
         #[arg(long)]
         no_wait: bool,
-        /// On capacity exhaustion, wait and keep retrying instead of stopping.
+        /// On capacity exhaustion, wait and keep retrying instead of stopping (one GPU/cloud
+        /// only — with several options use --retry-mins).
         #[arg(long)]
         keep_trying: bool,
         /// Keep re-attempting (topping up to the target) for up to this many minutes
@@ -1186,6 +1236,252 @@ async fn create_pods(
     Ok(created)
 }
 
+/// `--max-price`: a positive, finite $/h (a leading `$` is fine).
+fn parse_max_price(s: &str) -> std::result::Result<f64, String> {
+    let v: f64 = s.trim().trim_start_matches('$').parse().map_err(|_| format!("`{s}` is not a $/h price (e.g. 0.50)"))?;
+    if v.is_finite() && v > 0.0 {
+        Ok(v)
+    } else {
+        Err(format!("must be a positive $/h (got {s})"))
+    }
+}
+
+/// Decide how `create`/`up` place pods, before anything is listed or created. `None` = one
+/// GPU, one cloud and no price cap: today's single-spec path, unchanged (same output, same
+/// `--keep-trying`). `Some` = ordered placement over several options, with the spec base
+/// (config + every other override) the options are layered on.
+///
+/// `--keep-trying` waits on *one* pool; with several options the retry window
+/// (`--retry-mins`) is the waiting mechanism — each round re-tries every option — so the
+/// combination is refused rather than given a third meaning.
+fn placement_request(
+    cfg: &Config,
+    provider_name: &str,
+    ov: &SpecOverrides,
+    max_price: Option<f64>,
+    order: arena_core::placement::Order,
+    keep_trying: bool,
+) -> Result<Option<(arena_core::placement::Request, PodSpec)>> {
+    let base = spec_with_overrides(cfg, &SpecOverrides { gpu: None, cloud: None, ..ov.clone() });
+    let req =
+        arena_core::placement::Request::from_flags(ov.gpu.as_deref(), ov.cloud.as_deref(), &base, max_price, order)?;
+    if req.is_single() {
+        return Ok(None);
+    }
+    req.validate_for(provider_name)?;
+    if keep_trying {
+        anyhow::bail!(
+            "--keep-trying waits on one GPU/cloud; with several options or --max-price use \
+             --retry-mins N instead (each round re-tries every option)"
+        );
+    }
+    Ok(Some((req, base)))
+}
+
+/// Upper bound on each read-only catalog lookup before placement. The HTTP client has no
+/// timeout of its own; a stalled price API must not hang a create that doesn't need it
+/// (it falls back to the preset estimates instead).
+const PRICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn bounded_catalog<F>(fetch: F) -> arena_core::Result<Vec<arena_core::provider::runpod::GpuType>>
+where
+    F: std::future::Future<Output = arena_core::Result<Vec<arena_core::provider::runpod::GpuType>>>,
+{
+    match tokio::time::timeout(PRICE_TIMEOUT, fetch).await {
+        Ok(r) => r,
+        Err(_) => Err(arena_core::Error::provider(format!("timed out after {}s", PRICE_TIMEOUT.as_secs()))),
+    }
+}
+
+/// The prices placement can see (read-only), plus notes on where they came from. RunPod:
+/// the live catalog — on `RUNPOD_API=v2` one `/v2/catalog/gpus` per requested tier (its stock
+/// is per tier), else / failing that the GraphQL `gpuTypes` (Phase 0.D) — backed by the preset
+/// estimates. Vast/Hetzner quote nothing before create.
+async fn fetch_price_book(
+    cfg: &Config,
+    provider_name: &str,
+    clouds: &[String],
+) -> Result<(arena_core::placement::PriceBook, Vec<String>)> {
+    use arena_core::placement::PriceBook;
+    use arena_core::provider::{runpod, runpod_v2, RunpodApi};
+    if provider_name != "runpod" {
+        let note = format!(
+            "{provider_name} quotes no price before create — options are unpriced, tried as listed \
+             (--max-price can't check them)"
+        );
+        return Ok((PriceBook::unpriced(), vec![note]));
+    }
+    let Some(key) = cfg.get("RUNPOD_API_KEY").filter(|s| !s.is_empty()) else {
+        return Ok((PriceBook::runpod(Vec::new()), vec!["no RUNPOD_API_KEY — prices are preset estimates (~)".into()]));
+    };
+    let mut catalogs = Vec::new();
+    let mut errs = Vec::new();
+    if RunpodApi::from_config(cfg)? == RunpodApi::V2 {
+        for cloud in clouds {
+            match bounded_catalog(runpod_v2::fetch_gpu_types(key, cloud)).await {
+                Ok(types) if !types.is_empty() => catalogs.push((Some(cloud.clone()), types)),
+                Ok(_) => errs.push(format!("v2 catalog ({cloud}): empty")),
+                Err(e) => errs.push(format!("v2 catalog ({cloud}): {e}")),
+            }
+        }
+    }
+    if catalogs.is_empty() {
+        match bounded_catalog(runpod::fetch_gpu_types(key)).await {
+            Ok(types) if !types.is_empty() => catalogs.push((None, types)),
+            Ok(_) => errs.push("GraphQL catalog: empty".into()),
+            Err(e) => errs.push(format!("GraphQL catalog: {e}")),
+        }
+    }
+    let mut notes = Vec::new();
+    if catalogs.is_empty() {
+        notes.push(format!("live prices unavailable ({}) — using preset estimates (~)", errs.join("; ")));
+    } else if !errs.is_empty() {
+        notes.push(format!("partly live ({})", errs.join("; ")));
+    }
+    Ok((PriceBook::runpod(catalogs), notes))
+}
+
+/// Price and order the options for `req` on `provider_name` — read-only. The one planner
+/// behind `arena offers`, the create/up dry-runs and their confirm prompt.
+async fn plan_placement(
+    cfg: &Config,
+    provider_name: &str,
+    req: &arena_core::placement::Request,
+) -> Result<arena_core::placement::OptionPlan> {
+    req.validate_for(provider_name)?;
+    let (book, notes) = fetch_price_book(cfg, provider_name, &req.clouds).await?;
+    let mut plan = arena_core::placement::plan_options(req, provider_name, &book);
+    plan.notes.splice(0..0, notes);
+    Ok(plan)
+}
+
+/// The line above an option table: provider, GPUs per pod, order, cap.
+fn plan_header(plan: &arena_core::placement::OptionPlan) -> String {
+    use arena_core::placement::Order;
+    let order = match plan.order {
+        Order::Cheapest => "cheapest first",
+        Order::Listed => "as listed",
+    };
+    let cap = plan
+        .max_price
+        .map(|c| format!(", max {}/h per pod", arena_core::fleet::fmt_money("$", c)))
+        .unwrap_or_default();
+    format!("Placement options on {} ({} GPU(s) per pod, {order}{cap}):", plan.provider, plan.gpu_count)
+}
+
+/// The create/up dry-run for several options: the option table and which names would be
+/// attempted, in what way.
+fn print_placement_preview(
+    provider: &dyn Provider,
+    plan: &arena_core::placement::OptionPlan,
+    base: &PodSpec,
+    names: &[String],
+) {
+    println!("{}", plan_header(plan));
+    print!("{}", arena_core::placement::render_plan(plan));
+    let Some(first) = plan.options.first() else {
+        println!("[dry-run] nothing would be attempted for {} — no option left to try", names.join(", "));
+        return;
+    };
+    println!(
+        "[dry-run] would place {} pod(s) on {}: each name tries options 1→{} in order, one create \
+         at a time, keeping the first that has capacity:\n  {}",
+        names.len(),
+        provider.name(),
+        plan.options.len(),
+        names.join(", ")
+    );
+    println!("[dry-run] option 1 is: {}", provider.describe(&arena_core::placement::spec_for(base, "", first)));
+}
+
+/// The `[y/N]` text for a multi-option create (the option table is printed just above it).
+/// Refuses when the cap left nothing to try.
+fn placement_prompt(
+    provider: &dyn Provider,
+    plan: &arena_core::placement::OptionPlan,
+    base: &PodSpec,
+    names: &[String],
+    then: &str,
+) -> Result<String> {
+    println!("{}", plan_header(plan));
+    print!("{}", arena_core::placement::render_plan(plan));
+    let Some(first) = plan.options.first() else {
+        anyhow::bail!("nothing to create: no option left to try (see the table above, or `arena offers`)");
+    };
+    Ok(format!(
+        "Will create up to {} pod(s) on {}, each name trying the {} option(s) above in order, one \
+         create at a time (option 1: {}){then}:\n  {}",
+        names.len(),
+        provider.name(),
+        plan.options.len(),
+        provider.describe(&arena_core::placement::spec_for(base, "", first)),
+        names.join(", ")
+    ))
+}
+
+/// Ordered placement for `names` (see `arena_core::placement::place`): progress lines as it
+/// goes, then the per-name summary. Same contract as [`create_with_retry`]: every pod made,
+/// or — on an auth/other failure — those pods inside [`CreateFailed`], so the caller still
+/// syncs the proxy for them.
+#[allow(clippy::too_many_arguments)]
+async fn place_names(
+    provider: &dyn Provider,
+    cfg: &Config,
+    names: Vec<String>,
+    topup_target: usize,
+    base: &PodSpec,
+    plan: &arena_core::placement::OptionPlan,
+    retry_mins: u64,
+    retry_secs: u64,
+) -> std::result::Result<Vec<arena_core::Pod>, CreateFailed> {
+    use arena_core::placement::{self, End, Progress, Rounds, TopUp};
+    let rounds = Rounds {
+        window: std::time::Duration::from_secs(retry_mins * 60),
+        every: std::time::Duration::from_secs(retry_secs.max(1)),
+    };
+    // -n/-a: retry rounds never top up past the provider-scoped total that was confirmed.
+    let topup = (topup_target > 0).then(|| TopUp {
+        target: topup_target,
+        provider: provider.name().to_string(),
+        prefix: cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena").to_string(),
+    });
+    let mut show = |p: &Progress| {
+        if p.is_created() {
+            println!("{}", p.line());
+        } else {
+            eprintln!("{}", p.line());
+        }
+    };
+    let ctrl_c = || async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    let run = placement::place(provider, base, &names, plan, rounds, topup.as_ref(), ctrl_c, &mut show).await;
+    print!("\n{}", placement::render_summary(plan, &run));
+    let (placed, total) = (run.created.len(), names.len());
+    match run.end {
+        End::Filled => println!("Placed {placed} of {total}."),
+        End::Exhausted => eprintln!(
+            "[stop] no capacity on any option right now (placed {placed}/{total}). \
+             Re-run with --retry-mins N to wait for it to free up."
+        ),
+        End::WindowElapsed => eprintln!("retry window ({retry_mins}m) elapsed — placed {placed} of {total}"),
+        End::Interrupted => eprintln!("interrupted — stopping retries with {placed} of {total}"),
+        End::Aborted { name, error } => {
+            let error = anyhow::anyhow!("authentication failed creating {name}: {error}");
+            return Err(CreateFailed::new(run.created, error));
+        }
+        End::Failed { name, error } => {
+            eprintln!("placed {placed}/{total} before failure");
+            let error = match name {
+                Some(name) => anyhow::anyhow!("creating {name}: {error}"),
+                None => anyhow::Error::new(error),
+            };
+            return Err(CreateFailed::new(run.created, error));
+        }
+    }
+    Ok(run.created)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -1195,7 +1491,7 @@ async fn main() -> Result<()> {
     // `config check` must work even when a provider key is missing (that's what it's
     // for), so build the provider lazily — only for commands that actually talk to one.
     let provider = match cli.cmd {
-        Cmd::Config(_) | Cmd::Cron(_) | Cmd::Tui | Cmd::Gpus { .. } => None,
+        Cmd::Config(_) | Cmd::Cron(_) | Cmd::Tui | Cmd::Gpus { .. } | Cmd::Offers { .. } => None,
         // Fleet-wide: every command spans all configured providers (create still targets
         // --provider). One configured backend behaves like that single provider.
         _ => Some(arena_core::provider::build_fleet(&cli.provider, &cfg, true)?),
@@ -1213,6 +1509,9 @@ async fn main() -> Result<()> {
         }
         Cmd::Keys(k) => handle_keys(k, provider.unwrap().as_ref(), &cfg, cli.yes).await,
         Cmd::Gpus { json } => handle_gpus(&cfg, &cli.provider, json).await,
+        Cmd::Offers { gpu, cloud, max_price, gpus, order, json } => {
+            handle_offers(&cfg, &cli.provider, gpu, cloud, max_price, gpus, order, json).await
+        }
     }
 }
 
@@ -1305,6 +1604,42 @@ async fn handle_gpus(cfg: &Config, provider_name: &str, json: bool) -> Result<()
             );
         }
     }
+    Ok(())
+}
+
+/// `arena offers`: the placement plan for these flags, read-only — the same planner
+/// create/up run, so it previews what they would try (minus the names). Unlike `pods`, it
+/// needs no fleet: only config (defaults) and, on RunPod, the key for live prices. `--json`
+/// prints the plan (`arena_core::placement::OptionPlan`, notes included) and nothing else on
+/// stdout.
+#[allow(clippy::too_many_arguments)]
+async fn handle_offers(
+    cfg: &Config,
+    provider_name: &str,
+    gpu: Option<String>,
+    cloud: Option<String>,
+    max_price: Option<f64>,
+    gpus: Option<u32>,
+    order: arena_core::placement::Order,
+    json: bool,
+) -> Result<()> {
+    if !["runpod", "vast", "hetzner"].contains(&provider_name) {
+        anyhow::bail!("unknown provider `{provider_name}` (known: runpod, vast, hetzner)");
+    }
+    let base = spec_with_overrides(cfg, &SpecOverrides { gpus, ..Default::default() });
+    let req = arena_core::placement::Request::from_flags(gpu.as_deref(), cloud.as_deref(), &base, max_price, order)?;
+    let plan = plan_placement(cfg, provider_name, &req).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&plan)?);
+        return Ok(());
+    }
+    println!("{}", plan_header(&plan));
+    print!("{}", arena_core::placement::render_plan(&plan));
+    println!(
+        "\n`pods create/up` with these flags try the options top to bottom per name, one create at \
+         a time; a pool that reports no capacity is skipped for the rest of that round. STOCK is a \
+         hint only — creating is the real test."
+    );
     Ok(())
 }
 
@@ -3323,8 +3658,11 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             println!("{}", fleet::fleet_footer(&fleet::fleet_cost(&pods)));
         }
 
-        PodCmd::Create { names, count, add, gpu, gpus, cloud, disk, volume, image, bootstrap, skip_proxy, dry_run, keep_trying, retry_mins, retry_secs } => {
+        PodCmd::Create { names, count, add, gpu, gpus, cloud, max_price, order, disk, volume, image, bootstrap, skip_proxy, dry_run, keep_trying, retry_mins, retry_secs } => {
             let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap };
+            // Several --gpu/--cloud options or a --max-price → ordered placement; otherwise
+            // the single-spec path below, unchanged. Decided before anything is listed.
+            let placing = placement_request(cfg, provider.name(), &ov, max_price, order, keep_trying)?;
             // Explicit names take a different path than the -n/-a top-up: create exactly
             // those (minus any that already exist), no name allocation.
             let mut topup_target = 0usize; // provider-scoped total for the -n/-a retry loop
@@ -3342,29 +3680,42 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                 eprintln!("nothing to create (target already met or no new names)");
                 return Ok(());
             }
-            let spec = spec_with_overrides(cfg, &ov);
+            let (spec, options) = match placing {
+                Some((req, base)) => (base, Some(plan_placement(cfg, provider.name(), &req).await?)),
+                None => (spec_with_overrides(cfg, &ov), None),
+            };
             if dry_run {
-                let desc = provider.describe(&spec);
-                for name in &names {
-                    println!("[dry-run] would create {name} on {} ({desc})", provider.name());
+                match &options {
+                    Some(plan) => print_placement_preview(provider, plan, &spec, &names),
+                    None => {
+                        let desc = provider.describe(&spec);
+                        for name in &names {
+                            println!("[dry-run] would create {name} on {} ({desc})", provider.name());
+                        }
+                    }
                 }
                 warn_no_volume(provider, &spec);
                 println!("\nDry-run only — no pods created (this is a preview).");
                 return Ok(());
             }
-            if !confirm(yes, &format!(
-                "Will create {} pod(s) on {} ({}){}:\n  {}",
-                names.len(), provider.name(), provider.describe(&spec),
-                if skip_proxy { "" } else { ", then sync the proxy" },
-                names.join(", ")
-            ))? {
+            let then = if skip_proxy { "" } else { ", then sync the proxy" };
+            let what = match &options {
+                Some(plan) => placement_prompt(provider, plan, &spec, &names, then)?,
+                None => format!(
+                    "Will create {} pod(s) on {} ({}){then}:\n  {}",
+                    names.len(), provider.name(), provider.describe(&spec), names.join(", ")
+                ),
+            };
+            if !confirm(yes, &what)? {
                 println!("aborted.");
                 return Ok(());
             }
             // Explicit names retry just the names still missing; -n/-a re-plan toward the
             // total (topup_target == 0 marks the explicit case).
-            let outcome =
-                create_with_retry(provider, cfg, names, topup_target, &ov, keep_trying, retry_mins, retry_secs).await;
+            let outcome = match &options {
+                Some(plan) => place_names(provider, cfg, names, topup_target, &spec, plan, retry_mins, retry_secs).await,
+                None => create_with_retry(provider, cfg, names, topup_target, &ov, keep_trying, retry_mins, retry_secs).await,
+            };
             let (created, error) = match outcome {
                 Ok(created) => (created, None),
                 Err(CreateFailed { created, error }) => (created, Some(error)),
@@ -3381,8 +3732,10 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             }
         }
 
-        PodCmd::Up { names, count, add, gpu, gpus, cloud, disk, volume, image, bootstrap, dry_run, no_wait, keep_trying, retry_mins, retry_secs, no_setup, timeout, interval } => {
+        PodCmd::Up { names, count, add, gpu, gpus, cloud, max_price, order, disk, volume, image, bootstrap, dry_run, no_wait, keep_trying, retry_mins, retry_secs, no_setup, timeout, interval } => {
             let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap };
+            // Several --gpu/--cloud options or a --max-price → ordered placement (as `create`).
+            let placing = placement_request(cfg, provider.name(), &ov, max_price, order, keep_trying)?;
             // Like `create`: explicit names take the direct path; -n/-a top up by count.
             let explicit = !names.is_empty();
             if explicit && (count.is_some() || add.is_some()) {
@@ -3401,7 +3754,6 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                 return Ok(());
             }
 
-            let spec = spec_with_overrides(cfg, &ov);
             // Setup runs after create: reject a malformed SETUP_TIMEOUT_SECS *before*
             // creating (billing) pods, not after.
             let setup_timeouts = if no_setup {
@@ -3409,10 +3761,19 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             } else {
                 arena_core::setup::SetupTimeouts::from_config(cfg, None)?
             };
+            let (spec, options) = match placing {
+                Some((req, base)) => (base, Some(plan_placement(cfg, provider.name(), &req).await?)),
+                None => (spec_with_overrides(cfg, &ov), None),
+            };
             if dry_run {
-                let desc = provider.describe(&spec);
-                for name in &names {
-                    println!("[dry-run] would create {name} on {} ({desc})", provider.name());
+                match &options {
+                    Some(plan) => print_placement_preview(provider, plan, &spec, &names),
+                    None => {
+                        let desc = provider.describe(&spec);
+                        for name in &names {
+                            println!("[dry-run] would create {name} on {} ({desc})", provider.name());
+                        }
+                    }
                 }
                 warn_no_volume(provider, &spec);
                 let extra = if no_setup { "" } else { " then provision them," };
@@ -3424,15 +3785,19 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                 return Ok(());
             }
 
-            if !confirm(yes, &format!(
-                "Will create {} pod(s) on {} ({}){}, wait for endpoints{}, then update the proxy if nginx is set up:\n  {}",
-                names.len(),
-                provider.name(),
-                provider.describe(&spec),
+            let then = format!(
+                "{}, wait for endpoints{}, then update the proxy if nginx is set up",
                 if retry_mins > 0 { format!(", retrying up to {retry_mins}m") } else { String::new() },
                 if no_setup { "" } else { ", provision them" },
-                names.join(", ")
-            ))? {
+            );
+            let what = match &options {
+                Some(plan) => placement_prompt(provider, plan, &spec, &names, &then)?,
+                None => format!(
+                    "Will create {} pod(s) on {} ({}){then}:\n  {}",
+                    names.len(), provider.name(), provider.describe(&spec), names.join(", ")
+                ),
+            };
+            if !confirm(yes, &what)? {
                 println!("aborted.");
                 return Ok(());
             }
@@ -3440,18 +3805,19 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             // the ones we got. Proxy is deployed *after* this returns — i.e. once the
             // retry loop has finished topping up. Explicit names create directly. A create
             // that failed part-way still syncs the proxy for the pods it made, then fails.
-            let created =
-                match create_with_retry(provider, cfg, names, topup_target, &ov, keep_trying, retry_mins, retry_secs)
-                    .await
-                {
-                    Ok(created) => created,
-                    Err(CreateFailed { created, error }) => {
-                        if !created.is_empty() {
-                            sync_proxy(cfg, provider, "up").await;
-                        }
-                        return Err(error);
+            let outcome = match &options {
+                Some(plan) => place_names(provider, cfg, names, topup_target, &spec, plan, retry_mins, retry_secs).await,
+                None => create_with_retry(provider, cfg, names, topup_target, &ov, keep_trying, retry_mins, retry_secs).await,
+            };
+            let created = match outcome {
+                Ok(created) => created,
+                Err(CreateFailed { created, error }) => {
+                    if !created.is_empty() {
+                        sync_proxy(cfg, provider, "up").await;
                     }
-                };
+                    return Err(error);
+                }
+            };
             if created.is_empty() {
                 eprintln!("no pods were created — nothing to wait for");
                 return Ok(());
@@ -7897,6 +8263,8 @@ mod proxy_deploy_tests {
             gpu: None,
             gpus: None,
             cloud: None,
+            max_price: None,
+            order: Default::default(),
             disk: None,
             volume: None,
             image: None,
@@ -7910,5 +8278,283 @@ mod proxy_deploy_tests {
         let err = handle_pods(cmd, &HalfCreate(Default::default()), &cfg(&path), true).await.unwrap_err();
         assert!(err.to_string().contains("creating arena8-autumn"), "{err}");
         assert!(read(&path).contains("proxy_pass 1.1.1.1:22000;"), "apple (made before the failure) is forwarded");
+    }
+}
+
+#[cfg(test)]
+mod placement_cli_tests {
+    use super::*;
+    use arena_core::placement::Order;
+    use arena_core::{Error, Pod, Result as CoreResult};
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    /// A RunPod-named provider whose creates succeed except on the GPU types in `dry`
+    /// (capacity). Records every create as `(name, gpu, cloud)` and counts list calls.
+    #[derive(Default)]
+    struct Recorder {
+        dry: Vec<&'static str>,
+        calls: Mutex<Vec<(String, String, String)>>,
+        made: Mutex<Vec<Pod>>,
+        lists: AtomicUsize,
+    }
+
+    impl Recorder {
+        fn dry(dry: &[&'static str]) -> Self {
+            Recorder { dry: dry.to_vec(), ..Default::default() }
+        }
+        fn calls(&self) -> Vec<(String, String, String)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl Provider for Recorder {
+        fn name(&self) -> &'static str {
+            "runpod"
+        }
+        fn describe(&self, spec: &PodSpec) -> String {
+            format!("{} x{}, {}", spec.gpu_type, spec.gpu_count, spec.cloud_type)
+        }
+        async fn list_pods(&self) -> CoreResult<Vec<Pod>> {
+            self.lists.fetch_add(1, Ordering::SeqCst);
+            Ok(self.made.lock().unwrap().clone())
+        }
+        async fn create_pod(&self, spec: &PodSpec) -> CoreResult<Pod> {
+            self.calls.lock().unwrap().push((spec.name.clone(), spec.gpu_type.clone(), spec.cloud_type.clone()));
+            if self.dry.contains(&spec.gpu_type.as_str()) {
+                return Err(Error::capacity("create pod HTTP 500: There are no instances currently available"));
+            }
+            let pod = Pod { id: format!("id-{}", spec.name), name: spec.name.clone(), provider: "runpod".into(), ..Default::default() };
+            self.made.lock().unwrap().push(pod.clone());
+            Ok(pod)
+        }
+        async fn stop_pod(&self, _id: &str) -> CoreResult<()> {
+            Ok(())
+        }
+        async fn restart_pod(&self, _id: &str) -> CoreResult<()> {
+            Ok(())
+        }
+        async fn terminate_pod(&self, _id: &str) -> CoreResult<()> {
+            Ok(())
+        }
+    }
+
+    /// No RUNPOD_API_KEY (so prices are the preset estimates — no network) and no proxy (so
+    /// the post-create sync is a skip note).
+    fn cfg() -> Config {
+        Config::parse(
+            "MACHINE_NAME_PREFIX=arena8\nGPU_TYPE=\"NVIDIA RTX A4000\"\nCLOUD_TYPE=COMMUNITY\n\
+             MACHINE_NAME_LIST=(\n  \"apple\"\n  \"bloom\"\n  \"cider\"\n)\n",
+        )
+    }
+
+    fn create(names: &[&str], gpu: Option<&str>, cloud: Option<&str>, max_price: Option<f64>) -> PodCmd {
+        PodCmd::Create {
+            names: names.iter().map(|s| s.to_string()).collect(),
+            count: None,
+            add: None,
+            gpu: gpu.map(String::from),
+            gpus: None,
+            cloud: cloud.map(String::from),
+            max_price,
+            order: Order::Cheapest,
+            disk: None,
+            volume: None,
+            image: None,
+            bootstrap: false,
+            skip_proxy: true,
+            dry_run: false,
+            keep_trying: false,
+            retry_mins: 0,
+            retry_secs: 0,
+        }
+    }
+
+    fn call(name: &str, gpu: &str, cloud: &str) -> (String, String, String) {
+        (name.into(), gpu.into(), cloud.into())
+    }
+
+    #[test]
+    fn only_several_options_or_a_cap_leave_the_single_spec_path() {
+        let ov = |gpu: Option<&str>, cloud: Option<&str>| SpecOverrides {
+            gpu: gpu.map(String::from),
+            cloud: cloud.map(String::from),
+            ..Default::default()
+        };
+        let route = |o: &SpecOverrides, cap, kt| placement_request(&cfg(), "runpod", o, cap, Order::Cheapest, kt);
+        // Today's flags (or none) stay on the single-spec path — `--keep-trying` included.
+        for o in [ov(None, None), ov(Some("3090"), None), ov(Some("A4000"), Some("secure"))] {
+            assert!(route(&o, None, false).unwrap().is_none(), "{o:?}");
+            assert!(route(&o, None, true).unwrap().is_none(), "{o:?}");
+        }
+        let (req, base) = route(&ov(Some("A4000,3090"), None), None, false).unwrap().unwrap();
+        assert_eq!(req.gpus, ["NVIDIA RTX A4000", "NVIDIA GeForce RTX 3090"]);
+        assert_eq!((base.gpu_type.as_str(), base.cloud_type.as_str()), ("NVIDIA RTX A4000", "COMMUNITY"));
+        assert!(route(&ov(None, Some("community,secure")), None, false).unwrap().is_some());
+        assert!(route(&ov(None, None), Some(0.5), false).unwrap().is_some());
+        let e = route(&ov(Some("A4000,3090"), None), None, true).unwrap_err().to_string();
+        assert!(e.contains("--retry-mins"), "{e}");
+        let e = route(&ov(None, Some("community,spot")), None, false).unwrap_err().to_string();
+        assert!(e.contains("`SPOT`"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn create_with_a_gpu_list_falls_back_and_later_names_skip_the_dry_pool() {
+        let fake = Recorder::dry(&["NVIDIA RTX A4000"]);
+        handle_pods(create(&["apple", "bloom"], Some("A4000,3090"), None, None), &fake, &cfg(), true).await.unwrap();
+        assert_eq!(
+            fake.calls(),
+            [
+                call("arena8-apple", "NVIDIA RTX A4000", "COMMUNITY"), // cheapest (~$0.17) first: dry
+                call("arena8-apple", "NVIDIA GeForce RTX 3090", "COMMUNITY"),
+                call("arena8-bloom", "NVIDIA GeForce RTX 3090", "COMMUNITY"), // A4000 blocked this round
+            ]
+        );
+        assert_eq!(fake.made.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_single_gpu_and_cloud_create_is_unchanged() {
+        // One option: the single-spec path — `--keep-trying` still accepted, one create per name.
+        let fake = Recorder::default();
+        let mut cmd = create(&["apple"], Some("3090"), Some("secure"), None);
+        if let PodCmd::Create { keep_trying, order, .. } = &mut cmd {
+            *keep_trying = true;
+            *order = Order::Listed; // meaningless with one option
+        }
+        handle_pods(cmd, &fake, &cfg(), true).await.unwrap();
+        assert_eq!(fake.calls(), [call("arena8-apple", "NVIDIA GeForce RTX 3090", "SECURE")]);
+    }
+
+    #[tokio::test]
+    async fn refusals_happen_before_anything_is_listed_or_created() {
+        let fake = Recorder::default();
+        let mut kt = create(&["apple"], Some("A4000,3090"), None, None);
+        if let PodCmd::Create { keep_trying, .. } = &mut kt {
+            *keep_trying = true;
+        }
+        assert!(handle_pods(kt, &fake, &cfg(), true).await.is_err());
+        let bad_tier = create(&["apple"], Some("A4000"), Some("community,all"), None);
+        let e = handle_pods(bad_tier, &fake, &cfg(), true).await.unwrap_err().to_string();
+        assert!(e.contains("`ALL`"), "{e}");
+        // A cap nothing fits under (A4000 ~$0.17, 3090 ~$0.22): refused, nothing created.
+        let e = handle_pods(create(&["apple"], Some("A4000,3090"), None, Some(0.10)), &fake, &cfg(), true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("no option left to try"), "{e}");
+        assert!(fake.calls().is_empty());
+        assert_eq!(fake.lists.load(Ordering::SeqCst), 1, "only the cap case got as far as listing names");
+    }
+
+    #[tokio::test]
+    async fn a_price_cap_filters_and_a_dry_run_creates_nothing() {
+        // 2 GPUs per pod: A4000 ~$0.34 fits $0.40, 3090 ~$0.44 doesn't.
+        let fake = Recorder::default();
+        let mut cmd = create(&["apple"], Some("3090,A4000"), None, Some(0.40));
+        if let PodCmd::Create { gpus, .. } = &mut cmd {
+            *gpus = Some(2);
+        }
+        handle_pods(cmd, &fake, &cfg(), true).await.unwrap();
+        assert_eq!(fake.calls(), [call("arena8-apple", "NVIDIA RTX A4000", "COMMUNITY")]);
+
+        let fake = Recorder::default();
+        let up = PodCmd::Up {
+            names: vec![],
+            count: Some(2),
+            add: None,
+            gpu: Some("A4000,3090".into()),
+            gpus: None,
+            cloud: Some("community,secure".into()),
+            max_price: Some(0.30),
+            order: Order::Listed,
+            disk: None,
+            volume: None,
+            image: None,
+            bootstrap: false,
+            dry_run: true,
+            no_wait: false,
+            keep_trying: false,
+            retry_mins: 0,
+            retry_secs: 60,
+            no_setup: false,
+            timeout: 600,
+            interval: 12,
+        };
+        handle_pods(up, &fake, &cfg(), true).await.unwrap();
+        assert!(fake.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn up_places_through_the_options_then_carries_on() {
+        let fake = Recorder::dry(&["NVIDIA GeForce RTX 3090"]);
+        let up = PodCmd::Up {
+            names: vec!["apple".into()],
+            count: None,
+            add: None,
+            gpu: Some("3090,A4000".into()),
+            gpus: None,
+            cloud: None,
+            max_price: None,
+            order: Order::Listed, // 3090 first despite the price
+            disk: None,
+            volume: None,
+            image: None,
+            bootstrap: false,
+            dry_run: false,
+            no_wait: true,
+            keep_trying: false,
+            retry_mins: 0,
+            retry_secs: 60,
+            no_setup: true,
+            timeout: 600,
+            interval: 12,
+        };
+        handle_pods(up, &fake, &cfg(), true).await.unwrap();
+        assert_eq!(
+            fake.calls(),
+            [call("arena8-apple", "NVIDIA GeForce RTX 3090", "COMMUNITY"), call("arena8-apple", "NVIDIA RTX A4000", "COMMUNITY")]
+        );
+    }
+
+    #[tokio::test]
+    async fn offers_plans_without_a_fleet_or_a_key() {
+        // Off RunPod nothing is priced, so a cap leaves nothing — but it's a view, not an error.
+        handle_offers(&cfg(), "vast", Some("A4000,3090".into()), Some("community,secure".into()), Some(1.0), None, Order::Cheapest, true)
+            .await
+            .unwrap();
+        handle_offers(&cfg(), "runpod", Some("A4000,3090".into()), None, None, Some(2), Order::Cheapest, false).await.unwrap();
+        assert!(handle_offers(&cfg(), "lambda", None, None, None, None, Order::Cheapest, false).await.is_err());
+        let base = spec_with_overrides(&cfg(), &SpecOverrides { gpus: Some(2), ..Default::default() });
+        let req = arena_core::placement::Request::from_flags(Some("3090,A4000"), None, &base, Some(0.40), Order::Cheapest).unwrap();
+        let plan = plan_placement(&cfg(), "runpod", &req).await.unwrap();
+        assert_eq!(plan.options.len(), 1);
+        assert_eq!(plan.notes[0], "no RUNPOD_API_KEY — prices are preset estimates (~)");
+        assert_eq!(
+            plan_header(&plan),
+            "Placement options on runpod (2 GPU(s) per pod, cheapest first, max $0.40/h per pod):"
+        );
+    }
+
+    #[test]
+    fn placement_flags_parse() {
+        use clap::Parser;
+        let parse = |args: &[&str]| Cli::try_parse_from(args).map(|c| c.cmd);
+        match parse(&["arena", "offers", "--gpu", "A4000,3090", "--max-price", "$0.5", "--gpus", "2", "--order", "listed", "--json"]).unwrap() {
+            Cmd::Offers { gpu, max_price, gpus, order, json, .. } => {
+                assert_eq!((gpu.as_deref(), max_price, gpus, order, json), (Some("A4000,3090"), Some(0.5), Some(2), Order::Listed, true));
+            }
+            _ => panic!("not offers"),
+        }
+        match parse(&["arena", "pods", "create", "-n", "3", "--gpu", "A4000,3090", "--cloud", "community,secure"]).unwrap() {
+            Cmd::Pods(PodCmd::Create { order, max_price, .. }) => assert_eq!((order, max_price), (Order::Cheapest, None)),
+            _ => panic!("not create"),
+        }
+        assert!(matches!(parse(&["arena", "pods", "up", "-n", "1", "--max-price", "0.3"]).unwrap(), Cmd::Pods(PodCmd::Up { max_price: Some(_), .. })));
+        for bad in [&["arena", "offers", "--max-price", "0"][..], &["arena", "offers", "--max-price", "cheap"], &["arena", "offers", "--order", "fastest"]] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
     }
 }

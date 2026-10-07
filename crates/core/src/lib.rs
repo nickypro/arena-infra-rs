@@ -14,6 +14,7 @@ pub mod gpu;
 pub mod metrics;
 pub mod naming;
 pub mod openrouter;
+pub mod placement;
 pub mod plan;
 pub mod pod;
 pub mod provider;
