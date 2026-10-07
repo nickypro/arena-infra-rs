@@ -61,8 +61,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     available` capacity error is recognized as such (it waits), not treated as fatal.
     The confirm prompt lists the exact pod names about to be created.
   - `pods up -n N` — one-command spin-up: create, poll until each pod has an SSH
-    endpoint, then **wire the proxy**: if nginx is set up on the proxy host it deploys +
-    reloads it; otherwise it just says to run `arena proxy plan` (no config dump).
+    endpoint, then **wire the proxy**: if nginx is set up on the proxy host (or the proxy
+    is write-only) it deploys as endpoints appear, and ends with the same one-line sync
+    as the other lifecycle commands (below) — or a note saying why it skipped.
     `--setup` also provisions each pod over SSH. So `pods up -n 28 --gpu A40 --cloud
     SECURE --disk 200 --retry-mins 60 --setup` is a full start-of-iteration spin-up that
     waits for capacity then wires everything. Confirms first (`--dry-run` previews);
@@ -81,9 +82,19 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     changes, confirms, then **deploys** the config (locally, or over SSH when
     `PROXY_LOCAL=false`) and runs `SSH_PROXY_RELOAD_CMD` — default `nginx -t && nginx -s
     reload`; set it **empty** for write-only (never reloads nginx). `--dry-run` shows the
-    exact write/scp + reload without doing it. `pods up`, `rename`, `reimage`, `replace`
-    and `migrate cutover/revert` re-point the proxy through the same merge, always from
-    a fleet-wide listing. This is the one place the tool touches the proxy host.
+    exact write/scp + reload without doing it. This is the one place the tool touches the
+    proxy host.
+  - **Auto proxy sync.** `pods create`, `up`, `rename`, `reimage`, `terminate` (one or
+    `--all`), `replace` and `migrate cutover/revert` end by re-syncing the proxy through the
+    same merge, from a fleet-wide listing, and print one line — e.g. `[proxy] after
+    terminate: +0 ~0 -1 =0 (deployed; removed arena8-apple)` or `… (unchanged)`. It's
+    best-effort: no proxy configured / no nginx to deploy to → a one-line skip note; a
+    listing or write error → a warning, never a failed command. `--skip-proxy` (create,
+    terminate, rename, reimage, replace, migrate) opts out. A just-terminated pod can still
+    be listed briefly, so its forward may survive that sync; the next one removes it. A
+    partly failed `rename` batch doesn't sync (a `--from-prefix` batch would drop the
+    not-yet-renamed pods' forwards). `migrate cutover` still treats a sync that didn't land
+    as a failure and auto-reverts.
   - `plan check | show` — a scheduled provisioning plan (`arena-plan.json`, see
     `arena-plan.example.json`): per-day target fleets with **GPU-first fallback chains**
     (e.g. `A4000` across community→secure→vast, then `3090`, then `A5000`) and a night
@@ -97,7 +108,11 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
   - `cron install|remove|show` — manage a crontab schedule for `arena pods backup`
     (default every 15 min, git-only; `--pull` runs the full backup — git + rsync file
     backup — each tick; `--start-date` bakes `ARENA_START_DATE` into the line); edits only
-    arena-managed lines, leaving other entries intact.
+    arena-managed lines, leaving other entries intact. `--proxy` adds a `*/5 … proxy apply
+    --yes` line (log: `~/arena-proxy-cron.log`) that catches changes made outside the CLI
+    (dashboard terminates, restarts that move an endpoint); re-running `install` without
+    it removes that line. Remove it before changing `MACHINE_NAME_PREFIX`/`_LIST`: a name
+    that leaves the list loses its forward on the next tick.
   - `pods backup [target]` — the **full save**: git-push the ARENA tree **and** rsync the
     home to the local backups folder (`pull`). The git push is on **whatever branch the
     pod is on** (never switches/creates one, so bespoke branches are respected) and

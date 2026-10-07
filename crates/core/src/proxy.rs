@@ -253,6 +253,11 @@ pub struct ProxyPlan {
     pub forwards: Vec<Forward>,
     pub changes: Vec<Change>,
     pub skipped: Vec<Skipped>,
+    /// Machines on the list that a provider listed with no usable SSH endpoint and no
+    /// previous forward to keep — typically pods still booting right after `pods create`.
+    /// They're also in `skipped` (with the precise reason); this list lets a post-lifecycle
+    /// sync say "N not forwarded yet" instead of a bare `+0` that reads like it did nothing.
+    pub pending: Vec<String>,
     /// Set when the listing can't support *any* decision (every provider failed, or none
     /// was queried). Callers must not write the config — a rebuild from nothing would
     /// drop every forward. `forwards` is then the previous set, untouched.
@@ -267,6 +272,15 @@ pub struct ChangeCounts {
     pub removed: usize,
     pub kept: usize,
     pub unchanged: usize,
+}
+
+impl ChangeCounts {
+    /// `+N ~N -N =N` (added, changed, removed, kept-stale) — the terse form for the
+    /// one-line sync report after a lifecycle command. Unchanged entries are left out:
+    /// they're the steady state, not news.
+    pub fn compact(&self) -> String {
+        format!("+{} ~{} -{} ={}", self.added, self.changed, self.removed, self.kept)
+    }
 }
 
 impl ProxyPlan {
@@ -563,7 +577,10 @@ pub fn plan_forwards(
                         kind: ChangeKind::Removed { reason: format!("previous target {:?} is not a plain host:port", p.target()) },
                     });
                 }
-                None => plan.skipped.push(Skipped { name: name.clone(), reason: issue.skip_reason() }),
+                None => {
+                    plan.skipped.push(Skipped { name: name.clone(), reason: issue.skip_reason() });
+                    plan.pending.push(name.clone());
+                }
             },
         }
     }
@@ -898,6 +915,9 @@ mod tests {
         assert_eq!(plan.skipped.len(), 2);
         assert!(plan.skipped.iter().any(|s| s.name == "arena8-ghost"));
         assert!(plan.skipped.iter().any(|s| s.name == "arena8-bloom" && s.reason.contains("no SSH endpoint")));
+        // Only the on-list pod still waiting for an endpoint is "pending" (the off-list
+        // ghost never gets a forward, so it isn't waiting for one).
+        assert_eq!(plan.pending, vec!["arena8-bloom".to_string()]);
     }
 
     #[test]
@@ -1006,6 +1026,7 @@ mod tests {
             let l = listing(vec![ok("runpod", vec![pod("arena8-apple", ip, port)])]);
             let plan = plan_forwards(&cfg(), "arena8", &candidates(), &prev, &l);
             assert_eq!(plan.forwards, prev, "{why}");
+            assert!(plan.pending.is_empty(), "{why}: a kept forward isn't pending");
             match kind_of(&plan, "arena8-apple") {
                 ChangeKind::Kept { reason } => {
                     assert!(reason.starts_with("listed by runpod"), "{reason}");
@@ -1306,6 +1327,7 @@ mod tests {
         assert!(lines[2].starts_with("+ arena8-bloom") && lines[2].contains("-> 3.3.3.3:22"), "{}", lines[2]);
         assert!(lines[3].starts_with("- james-gpu") && lines[3].contains("removed: no longer listed by runpod"), "{}", lines[3]);
         assert_eq!(plan.summary(), "+1 added, ~1 changed, -1 removed, =1 kept (stale), 0 unchanged");
+        assert_eq!(plan.counts().compact(), "+1 ~1 -1 =1");
         // Unchanged lines are opt-in (the `up` poll loop only prints real changes).
         let same = plan_forwards(&cfg(), "arena8", &cands, &plan.forwards, &l);
         assert!(same.change_lines("h", false).iter().all(|l| l.starts_with('=')));

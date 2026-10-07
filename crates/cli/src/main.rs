@@ -180,6 +180,11 @@ enum CronCmd {
         /// Also run `pods pull` (the rsync file backup) each tick, after the git backup.
         #[arg(long)]
         pull: bool,
+        /// Also re-sync the proxy every 5 minutes (`proxy apply --yes`, logged to
+        /// ~/arena-proxy-cron.log): catches what the CLI didn't do itself — a pod
+        /// terminated from the dashboard, a restart that moved an SSH endpoint.
+        #[arg(long)]
+        proxy: bool,
     },
     /// Remove the arena-managed cron lines.
     Remove,
@@ -390,6 +395,10 @@ enum PodCmd {
         /// doesn't need this.
         #[arg(long)]
         bootstrap: bool,
+        /// Don't sync the proxy afterwards. By default `create` re-syncs it once the pods
+        /// exist (best-effort; pods still booting get their forward on a later sync).
+        #[arg(long)]
+        skip_proxy: bool,
         /// Preview only: print what would happen, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
@@ -642,6 +651,10 @@ enum PodCmd {
         /// Terminate every pod the provider reports (the whole fleet).
         #[arg(long)]
         all: bool,
+        /// Don't sync the proxy afterwards (the forward stays until the next
+        /// `arena proxy apply`).
+        #[arg(long)]
+        skip_proxy: bool,
         /// Preview only: print what would happen, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
@@ -1655,7 +1668,7 @@ async fn handle_cron(cmd: CronCmd, config_path: &std::path::Path) -> Result<()> 
             println!("Removed arena-managed cron lines.");
             return Ok(());
         }
-        CronCmd::Install { schedule, start_date, pull } => {
+        CronCmd::Install { schedule, start_date, pull, proxy } => {
             let exe = std::env::current_exe().context("finding the arena executable path")?;
             let cfg_abs = std::fs::canonicalize(config_path)
                 .unwrap_or_else(|_| config_path.to_path_buf());
@@ -1669,24 +1682,68 @@ async fn handle_cron(cmd: CronCmd, config_path: &std::path::Path) -> Result<()> 
                 }
                 None => String::new(),
             };
-            let exe = exe.display();
-            let cfg_abs = cfg_abs.display();
-            // `pods backup` now also rsyncs the home (the file backup); default the cron to
-            // git-only (`--no-pull`) since it runs frequently, and let `--pull` opt into the
-            // full backup each tick (rsync is incremental, so repeats only move deltas).
-            let cmd = if pull {
-                format!("{env_prefix}{exe} --config {cfg_abs} pods backup --yes")
-            } else {
-                format!("{env_prefix}{exe} --config {cfg_abs} pods backup --no-pull --yes")
-            };
-            let line = format!("{schedule} {cmd} >> {home}/arena-cron.log 2>&1");
-            let new = with_arena_block(&current, &[line.clone()]);
+            let lines = cron_lines(&CronJob {
+                schedule: &schedule,
+                env_prefix: &env_prefix,
+                exe: &exe.display().to_string(),
+                config: &cfg_abs.display().to_string(),
+                home: &home,
+                pull,
+                proxy,
+            });
+            let new = with_arena_block(&current, &lines);
             write_crontab(&new).await?;
-            println!("Installed arena cron job:\n  {line}");
+            println!("Installed arena cron job(s):");
+            for l in &lines {
+                println!("  {l}");
+            }
             println!("\n(remove with `arena cron remove`; view with `arena cron show`)");
             return Ok(());
         }
     }
+}
+
+/// What `cron install` schedules (the paths already resolved to absolute ones).
+struct CronJob<'a> {
+    schedule: &'a str,
+    /// Inline env for the backup line (e.g. `ARENA_START_DATE=… `), already validated.
+    env_prefix: &'a str,
+    exe: &'a str,
+    config: &'a str,
+    home: &'a str,
+    pull: bool,
+    proxy: bool,
+}
+
+/// How often the optional proxy re-sync runs. Each tick is one list call per provider plus
+/// a no-op when nothing changed (the config is only rewritten — and nginx only reloaded —
+/// on a real change), so 5 minutes is cheap and bounds how long a moved endpoint stays
+/// unrouted.
+const PROXY_CRON_SCHEDULE: &str = "*/5 * * * *";
+
+/// The arena-managed crontab lines for `cron install` — pure, so the rendering is tested
+/// without touching a real crontab. Always the backup job; with `proxy`, also a
+/// `proxy apply --yes` every 5 minutes. That's safe unattended because the merge is
+/// sticky: a provider that fails to list never drops a forward, and if none answers
+/// nothing is written. It has its own log so its every-5-minutes chatter doesn't bury the
+/// backup's output.
+fn cron_lines(job: &CronJob) -> Vec<String> {
+    let CronJob { schedule, env_prefix, exe, config, home, pull, proxy } = job;
+    // `pods backup` now also rsyncs the home (the file backup); default the cron to
+    // git-only (`--no-pull`) since it runs frequently, and let `--pull` opt into the
+    // full backup each tick (rsync is incremental, so repeats only move deltas).
+    let backup = if *pull {
+        format!("{env_prefix}{exe} --config {config} pods backup --yes")
+    } else {
+        format!("{env_prefix}{exe} --config {config} pods backup --no-pull --yes")
+    };
+    let mut lines = vec![format!("{schedule} {backup} >> {home}/arena-cron.log 2>&1")];
+    if *proxy {
+        lines.push(format!(
+            "{PROXY_CRON_SCHEDULE} {exe} --config {config} proxy apply --yes >> {home}/arena-proxy-cron.log 2>&1"
+        ));
+    }
+    lines
 }
 
 /// Replace the crontab with `content` via `crontab -` (reads from stdin).
@@ -2194,7 +2251,10 @@ async fn handle_proxy(cmd: ProxyCmd, provider: &dyn Provider, cfg: &Config, yes:
                 println!("aborted.");
                 return Ok(());
             }
-            write_proxy(cfg, &prepared).await?;
+            let written = write_proxy(cfg, &prepared).await?;
+            if let Some(line) = written_line(&prepared.pxcfg, prepared.plan.forwards.len(), written) {
+                println!("{line}");
+            }
         }
     }
     Ok(())
@@ -2233,6 +2293,7 @@ fn proxy_action(pxcfg: &arena_core::proxy::ProxyConfig) -> String {
 }
 
 /// A merge planned against the live config, ready to review and write.
+#[derive(Debug)]
 struct PreparedProxy {
     pxcfg: arena_core::proxy::ProxyConfig,
     /// The config as it is now; `None` = no file yet.
@@ -2350,81 +2411,233 @@ fn print_proxy_dry_run(cfg: &Config, p: &PreparedProxy) {
     );
 }
 
-/// The proxy step for `pods up`: print a short forward summary, then — if nginx is
-/// actually set up on the proxy host (or the proxy is write-only) — merge + deploy;
-/// otherwise just say how to get the config (don't dump it). Never errors the spin-up: a
-/// proxy hiccup is reported, not fatal.
-async fn smart_proxy(cfg: &Config, listing: &arena_core::proxy::Listing) -> Result<()> {
+/// Is there a proxy a write can land on? `Err` carries the one-line reason a post-lifecycle
+/// sync skips. `pods up` makes the same check to decide whether to deploy as endpoints
+/// appear, so the poll loop and the final sync never disagree.
+async fn proxy_deployable(cfg: &Config) -> std::result::Result<(), String> {
     use arena_core::ssh::{self, SshTarget};
 
-    let pxcfg = arena_core::proxy::ProxyConfig::from_config(cfg)?;
-    let listed = plan_proxy(cfg, &pxcfg, &[], listing);
-    let where_ = if pxcfg.local { "locally".to_string() } else { format!("{}@{}", pxcfg.proxy_user, pxcfg.proxy_host) };
-    println!("\nproxy: {} forward(s) from the current listing ({where_})", listed.forwards.len());
-
-    // Is nginx present where we'd deploy — on this box (local) or the proxy host (SSH)?
-    // Write-only mode never runs nginx, so it's always deployable.
-    let has_nginx = if pxcfg.write_only() {
+    let Ok(px) = arena_core::proxy::ProxyConfig::from_config(cfg) else {
+        return Err(undeployable_reason(None, false).unwrap_or_default());
+    };
+    // Write-only mode never runs nginx, so it needs no probe at all.
+    let nginx_found = if px.write_only() {
         true
-    } else if pxcfg.local {
+    } else if px.local {
         std::process::Command::new("sh")
             .args(["-c", "command -v nginx >/dev/null 2>&1"])
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
     } else {
-        let target = SshTarget::for_host(
-            &pxcfg.proxy_user,
-            &pxcfg.proxy_host,
-            22,
-            cfg.get("SHARED_SSH_KEY_PATH"),
-        );
+        let target = SshTarget::for_host(&px.proxy_user, &px.proxy_host, 22, cfg.get("SHARED_SSH_KEY_PATH"));
         matches!(
             ssh::run(&target, "command -v nginx >/dev/null 2>&1 && echo yes").await,
             Ok(out) if out.success && out.stdout.contains("yes")
         )
     };
-
-    if has_nginx {
-        // nginx is set up — update it. (Part of the already-confirmed `up` flow.)
-        if let Err(e) = deploy_proxy(cfg, listing).await {
-            eprintln!("proxy update failed (pods are up): {e}");
-        }
-    } else if pxcfg.local {
-        println!(
-            "nginx not found on this host — not deploying. Install nginx (or run \
-             `arena proxy plan` to print the config), then `arena proxy apply`."
-        );
-    } else {
-        println!(
-            "proxy host {} has no nginx (or is unreachable) — not deploying. Run \
-             `arena proxy plan` to print/save the config, or `arena proxy apply` once \
-             nginx is set up. (If this box IS the proxy, unset PROXY_LOCAL / set it true.)",
-            pxcfg.proxy_host
-        );
+    match undeployable_reason(Some(&px), nginx_found) {
+        None => Ok(()),
+        Some(why) => Err(why),
     }
-    Ok(())
+}
+
+/// Why nothing can be deployed (pure, so each case is tested): no proxy configured, or
+/// nginx missing where the reload would run. A remote host that doesn't answer reads the
+/// same as one without nginx — either way a deploy couldn't land. Write-only never needs
+/// nginx.
+fn undeployable_reason(px: Option<&arena_core::proxy::ProxyConfig>, nginx_found: bool) -> Option<String> {
+    match px {
+        None => Some("no proxy configured (SSH_PROXY_HOST unset)".into()),
+        Some(px) if px.write_only() || nginx_found => None,
+        Some(px) if px.local => Some(
+            "nginx not found on this host — install it, then `arena proxy apply` \
+             (`arena proxy plan` prints the config)"
+                .into(),
+        ),
+        Some(px) => Some(format!(
+            "proxy host {} has no nginx or is unreachable — `arena proxy apply` once it's set up \
+             (if this box IS the proxy, unset PROXY_LOCAL)",
+            px.proxy_host
+        )),
+    }
+}
+
+/// How a merged config reached the proxy (what [`write_proxy`] did).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Written {
+    /// The rendered config already matched the live one byte for byte: nothing written,
+    /// nothing reloaded.
+    Unchanged,
+    /// Written, nginx deliberately not reloaded (`SSH_PROXY_RELOAD_CMD=""`).
+    WriteOnly,
+    /// Written and the reload command succeeded.
+    Reloaded,
+}
+
+/// `[proxy] deployed 3 forward(s) locally and reloaded nginx` and friends, for the
+/// verbose paths (`proxy apply`, the `up` poll loop); `None` when nothing was written.
+fn written_line(px: &arena_core::proxy::ProxyConfig, n: usize, w: Written) -> Option<String> {
+    let dest = if px.local { expand_tilde(&px.nginx_path) } else { format!("{}:{}", px.proxy_host, px.nginx_path) };
+    match w {
+        Written::Unchanged => None,
+        Written::WriteOnly => Some(format!("[proxy] wrote {n} forward(s) to {dest} (write-only: nginx not reloaded)")),
+        Written::Reloaded if px.local => Some(format!("[proxy] deployed {n} forward(s) locally and reloaded nginx")),
+        Written::Reloaded => Some(format!("[proxy] deployed {n} forward(s) to {} and reloaded nginx", px.proxy_host)),
+    }
 }
 
 /// Merge `listing` into the live proxy config and, if anything changed, write it and run
-/// the reload (unless write-only). Used by the already-confirmed flows (`up`, rename,
-/// reimage, replace, migrate). Idempotent: an unchanged config is neither written nor
-/// reloaded; a listing where no provider answered writes nothing at all.
-async fn deploy_proxy(cfg: &Config, listing: &arena_core::proxy::Listing) -> Result<()> {
+/// the reload (unless write-only). Idempotent: an unchanged config is neither written nor
+/// reloaded; a listing where no provider answered writes nothing at all (error). `review`
+/// prints the per-change lines and the write (the `up` poll loop); [`sync_proxy`] passes
+/// `false` and reports in one line from the returned plan instead.
+async fn deploy_proxy(
+    cfg: &Config,
+    listing: &arena_core::proxy::Listing,
+    review: bool,
+) -> Result<(PreparedProxy, Written)> {
     let prepared = prepare_proxy(cfg, listing).await?;
     if let Some(why) = &prepared.plan.abort {
         anyhow::bail!("not touching the proxy config: {why}");
     }
     if prepared.up_to_date() {
-        return Ok(());
+        return Ok((prepared, Written::Unchanged));
     }
-    print_proxy_review(&prepared, listing);
-    write_proxy(cfg, &prepared).await
+    if review {
+        print_proxy_review(&prepared, listing);
+    }
+    let written = write_proxy(cfg, &prepared).await?;
+    if review {
+        if let Some(line) = written_line(&prepared.pxcfg, prepared.plan.forwards.len(), written) {
+            println!("{line}");
+        }
+    }
+    Ok((prepared, written))
+}
+
+/// What a post-lifecycle proxy sync did. Returned so a caller that *depends* on the proxy
+/// (migrate cutover verifies through it, and reverts if it didn't land) can act on it;
+/// everyone else ignores it — [`sync_proxy`] has already printed its line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProxySync {
+    /// Not attempted: no proxy configured, or nowhere to deploy to (why).
+    Skipped(String),
+    /// Merged against a fresh fleet-wide listing.
+    Synced {
+        written: Written,
+        counts: arena_core::proxy::ChangeCounts,
+        /// Machines whose forward this sync dropped — the lockout-relevant change, so
+        /// it's named rather than just counted.
+        removed: Vec<String>,
+        /// On-list pods listed with no SSH endpoint yet (not forwarded until a later sync).
+        pending: usize,
+        /// Providers whose listing failed: their forwards were kept as they were.
+        failed_providers: Vec<String>,
+    },
+    /// Listing, reading the live config, writing or reloading failed.
+    Failed(String),
+}
+
+/// The single line a sync prints, e.g. `[proxy] after terminate: +0 ~0 -1 =0 (deployed;
+/// removed arena8-apple)`. Pure, so every variant is tested.
+fn sync_line(why: &str, s: &ProxySync) -> String {
+    match s {
+        ProxySync::Skipped(reason) => format!("[proxy] after {why}: skipped — {reason}"),
+        ProxySync::Failed(e) => format!("[proxy] after {why}: NOT synced — {e} (retry: `arena proxy apply`)"),
+        ProxySync::Synced { written, counts, removed, pending, failed_providers } => {
+            let mut notes = vec![match written {
+                Written::Unchanged => "unchanged".to_string(),
+                Written::WriteOnly => "written; write-only, nginx not reloaded".to_string(),
+                Written::Reloaded => "deployed".to_string(),
+            }];
+            if !removed.is_empty() {
+                const SHOWN: usize = 3;
+                let mut names = removed.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", ");
+                if removed.len() > SHOWN {
+                    names.push_str(&format!(" +{} more", removed.len() - SHOWN));
+                }
+                notes.push(format!("removed {names}"));
+            }
+            if *pending > 0 {
+                notes.push(format!("{pending} pod(s) not forwarded yet (no SSH endpoint)"));
+            }
+            if !failed_providers.is_empty() {
+                notes.push(format!("{} failed to list — forwards kept", failed_providers.join(", ")));
+            }
+            format!("[proxy] after {why}: {} ({})", counts.compact(), notes.join("; "))
+        }
+    }
+}
+
+/// Best-effort proxy sync at the end of a lifecycle command (create/up/rename/reimage/
+/// terminate/replace/migrate): skip with a note if there's no deployable proxy, else list
+/// the fleet per provider, merge (the sticky 0.A rules), write + reload only if the config
+/// changed, and print exactly one line. It never fails the command — the pods are already
+/// created/renamed/terminated, and an error exit would invite re-running the mutation
+/// itself; a failure is a warning naming `arena proxy apply`.
+///
+/// `fleet` must span every configured provider (the `build_fleet` provider the pods
+/// commands get); a flow holding one backend uses [`sync_proxy_via`].
+///
+/// A just-terminated pod can still be listed for a while (RunPod/Vast report it exited or
+/// terminating), so the sync right after `terminate` may keep its forward (R1/R2). That's
+/// harmless — its port belongs to that machine name alone — and the next sync (any
+/// lifecycle command, `proxy apply`, or the `cron install --proxy` tick) removes it once
+/// the provider stops listing the pod.
+async fn sync_proxy(cfg: &Config, fleet: &dyn Provider, why: &str) -> ProxySync {
+    let outcome = match proxy_deployable(cfg).await {
+        Err(reason) => ProxySync::Skipped(reason),
+        Ok(()) => {
+            let listing = fleet_listing(fleet).await;
+            match deploy_proxy(cfg, &listing, false).await {
+                Ok((prepared, written)) => ProxySync::Synced {
+                    written,
+                    counts: prepared.plan.counts(),
+                    removed: prepared
+                        .plan
+                        .changes
+                        .iter()
+                        .filter(|c| matches!(c.kind, arena_core::proxy::ChangeKind::Removed { .. }))
+                        .map(|c| c.forward.name.clone())
+                        .collect(),
+                    pending: prepared.plan.pending.len(),
+                    failed_providers: listing.errors().iter().map(|(p, _)| p.to_string()).collect(),
+                },
+                Err(e) => ProxySync::Failed(format!("{e:#}")),
+            }
+        }
+    };
+    report_sync(why, outcome)
+}
+
+/// Print a sync's line (failures to stderr) and hand the outcome back.
+fn report_sync(why: &str, outcome: ProxySync) -> ProxySync {
+    let line = sync_line(why, &outcome);
+    if matches!(outcome, ProxySync::Failed(_)) {
+        eprintln!("{line}");
+    } else {
+        println!("{line}");
+    }
+    outcome
+}
+
+/// [`sync_proxy`] for flows that hold a single backend (replace/migrate get the pod's
+/// `owner`): rebuild the fleet from its name first, so every configured provider is
+/// listed. A single-provider listing would leave the others "not queried" and — for legacy
+/// entries with no recorded owner — could even read as "every provider listed OK without
+/// them", dropping their forwards.
+async fn sync_proxy_via(cfg: &Config, owner: &dyn Provider, why: &str) -> ProxySync {
+    match arena_core::provider::build_fleet(owner.name(), cfg, true) {
+        Ok(fleet) => sync_proxy(cfg, fleet.as_ref(), why).await,
+        Err(e) => report_sync(why, ProxySync::Failed(format!("building the fleet provider: {e}"))),
+    }
 }
 
 /// Write a prepared config to the proxy (locally, or scp over SSH) and run the reload
 /// command unless write-only. This is the one place the tool touches the proxy host.
-async fn write_proxy(cfg: &Config, p: &PreparedProxy) -> Result<()> {
+/// Silent: callers report (see [`written_line`], [`sync_line`]).
+async fn write_proxy(cfg: &Config, p: &PreparedProxy) -> Result<Written> {
     use arena_core::ssh::{self, SshTarget};
 
     // The planner's abort is also enforced here, so no caller can write around it.
@@ -2432,26 +2645,23 @@ async fn write_proxy(cfg: &Config, p: &PreparedProxy) -> Result<()> {
         anyhow::bail!("refusing to write the proxy config: {why}");
     }
     if p.up_to_date() {
-        return Ok(());
+        return Ok(Written::Unchanged);
     }
     let pxcfg = &p.pxcfg;
-    let n = p.plan.forwards.len();
 
     // Local: this box IS the proxy — write the config + reload directly, no SSH.
     if pxcfg.local {
         let path = expand_tilde(&pxcfg.nginx_path);
         std::fs::write(&path, &p.rendered).with_context(|| format!("writing nginx config to {path}"))?;
         if pxcfg.write_only() {
-            println!("[proxy] wrote {n} forward(s) to {path} (write-only: nginx not reloaded)");
-            return Ok(());
+            return Ok(Written::WriteOnly);
         }
         let out = std::process::Command::new("sh")
             .args(["-c", &pxcfg.reload_cmd])
             .output()
             .context("reloading nginx locally")?;
         if out.status.success() {
-            println!("[proxy] deployed {n} forward(s) locally and reloaded nginx");
-            return Ok(());
+            return Ok(Written::Reloaded);
         }
         anyhow::bail!("local nginx reload failed: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
@@ -2466,13 +2676,11 @@ async fn write_proxy(cfg: &Config, p: &PreparedProxy) -> Result<()> {
         anyhow::bail!("scp to proxy {} failed: {}", pxcfg.proxy_host, scp.stderr.trim());
     }
     if pxcfg.write_only() {
-        println!("[proxy] wrote {n} forward(s) to {}:{} (write-only: nginx not reloaded)", pxcfg.proxy_host, pxcfg.nginx_path);
-        return Ok(());
+        return Ok(Written::WriteOnly);
     }
     let out = ssh::run(&target, &pxcfg.reload_cmd).await?;
     if out.success {
-        println!("[proxy] deployed {n} forward(s) to {} and reloaded nginx", pxcfg.proxy_host);
-        Ok(())
+        Ok(Written::Reloaded)
     } else {
         anyhow::bail!("nginx reload on {} failed (exit {:?}): {}", pxcfg.proxy_host, out.code, out.stderr.trim())
     }
@@ -2752,7 +2960,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             }
         }
 
-        PodCmd::Create { names, count, add, gpu, gpus, cloud, disk, volume, image, bootstrap, dry_run, keep_trying, retry_mins, retry_secs } => {
+        PodCmd::Create { names, count, add, gpu, gpus, cloud, disk, volume, image, bootstrap, skip_proxy, dry_run, keep_trying, retry_mins, retry_secs } => {
             let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap };
             // Explicit names take a different path than the -n/-a top-up: create exactly
             // those (minus any that already exist), no name allocation.
@@ -2782,15 +2990,24 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                 return Ok(());
             }
             if !confirm(yes, &format!(
-                "Will create {} pod(s) on {} ({}):\n  {}",
-                names.len(), provider.name(), provider.describe(&spec), names.join(", ")
+                "Will create {} pod(s) on {} ({}){}:\n  {}",
+                names.len(), provider.name(), provider.describe(&spec),
+                if skip_proxy { "" } else { ", then sync the proxy" },
+                names.join(", ")
             ))? {
                 println!("aborted.");
                 return Ok(());
             }
             // Explicit names retry just the names still missing; -n/-a re-plan toward the
             // total (topup_target == 0 marks the explicit case).
-            create_with_retry(provider, cfg, names, topup_target, &ov, keep_trying, retry_mins, retry_secs).await?;
+            let created =
+                create_with_retry(provider, cfg, names, topup_target, &ov, keep_trying, retry_mins, retry_secs).await?;
+            // Fresh pods rarely have an SSH endpoint yet, so this mostly reports them as
+            // "not forwarded yet" — but it keeps every create ending with the proxy in step
+            // (and a provider that hands out the IP at create, like Hetzner, is wired now).
+            if !skip_proxy && !created.is_empty() {
+                sync_proxy(cfg, provider, "create").await;
+            }
         }
 
         PodCmd::Up { names, count, add, gpu, gpus, cloud, disk, volume, image, bootstrap, dry_run, no_wait, keep_trying, retry_mins, retry_secs, no_setup, timeout, interval } => {
@@ -2857,27 +3074,14 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                 created.iter().map(|p| p.id.clone()).collect();
 
             if no_wait {
-                println!(
-                    "\n--no-wait: not polling. Run `arena proxy plan` once endpoints are assigned."
-                );
+                println!("\n--no-wait: not polling. Run `arena proxy apply` once endpoints are assigned.");
+                sync_proxy(cfg, provider, "up").await;
                 return Ok(());
             }
 
-            // Is nginx set up on the proxy host? (Decides deploy-as-they-come vs.
-            // just instructing at the end — checked once up front.) A write-only proxy
-            // (SSH_PROXY_RELOAD_CMD="") never runs nginx, so it's always deployable.
-            let nginx_present = match arena_core::proxy::ProxyConfig::from_config(cfg) {
-                Ok(px) if px.write_only() => true,
-                Ok(px) => {
-                    let tgt = arena_core::ssh::SshTarget::for_host(
-                        &px.proxy_user, &px.proxy_host, 22, cfg.get("SHARED_SSH_KEY_PATH"));
-                    matches!(
-                        arena_core::ssh::run(&tgt, "command -v nginx >/dev/null 2>&1 && echo yes").await,
-                        Ok(o) if o.success && o.stdout.contains("yes")
-                    )
-                }
-                Err(_) => false,
-            };
+            // Is there a proxy to deploy to? (Decides deploy-as-they-come; checked once up
+            // front, with the same check the final sync makes.)
+            let deployable = proxy_deployable(cfg).await.is_ok();
 
             // Poll until our pods have SSH endpoints or we hit the timeout, updating
             // nginx as endpoints appear (idempotent — reloads only on a real change).
@@ -2889,9 +3093,9 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             let is_ready = |p: &arena_core::Pod| p.ssh_ip.is_some() && p.ssh_port.is_some();
             println!(
                 "\nWaiting up to {timeout}s for SSH endpoints{} (Ctrl+C to stop)…",
-                if nginx_present { ", updating nginx as they come up" } else { "" }
+                if deployable { ", updating nginx as they come up" } else { "" }
             );
-            let (pods, listing) = loop {
+            let pods = loop {
                 let listing = fleet_listing(provider).await;
                 if !listing.any_ok() {
                     let errs: Vec<String> = listing.errors().iter().map(|(p, e)| format!("{p}: {e}")).collect();
@@ -2900,19 +3104,19 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                 let pods = listing.pods();
                 let ready = pods.iter().filter(|p| want_ids.contains(&p.id) && is_ready(p)).count();
                 println!("  {ready}/{} ready", want_ids.len());
-                if nginx_present && listing.any_ok() {
-                    if let Err(e) = deploy_proxy(cfg, &listing).await {
+                if deployable && listing.any_ok() {
+                    if let Err(e) = deploy_proxy(cfg, &listing, true).await {
                         eprintln!("  proxy update failed: {e}");
                     }
                 }
                 if ready == want_ids.len() || std::time::Instant::now() >= deadline {
-                    break (pods, listing);
+                    break pods;
                 }
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}
                     _ = tokio::signal::ctrl_c() => {
                         eprintln!("interrupted — stopping wait");
-                        break (pods, listing);
+                        break pods;
                     }
                 }
             };
@@ -2932,15 +3136,19 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             // Provision the pods we just created over SSH (deploy key + repo + tokens, or
             // the bare-VM script for hetzner), unless --no-setup. Scoped to the new pods so
             // a top-up `up` doesn't re-provision the whole fleet.
-            if !no_setup {
+            let setup = if no_setup {
+                Ok(())
+            } else {
                 println!("\nProvisioning the new pod(s) over SSH…");
                 let new: Vec<String> = created.iter().map(|p| p.name.clone()).collect();
-                handle_setup(provider, cfg, true, false, None, None, false, Some(&new)).await?;
-            }
-            // If there's no nginx to deploy to, say how to wire it (don't dump config).
-            if !nginx_present {
-                smart_proxy(cfg, &listing).await?;
-            }
+                handle_setup(provider, cfg, true, false, None, None, false, Some(&new)).await
+            };
+            // Final state: one more merge from a fresh listing (an endpoint can move while
+            // setup runs), and the one line saying where the proxy stands — including why
+            // it was skipped when there's nothing to deploy to. Runs even if setup failed:
+            // the pods exist either way.
+            sync_proxy(cfg, provider, "up").await;
+            setup?;
         }
 
         PodCmd::Stop { target, all, include, exclude, dry_run } => {
@@ -3060,7 +3268,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             }
         },
 
-        PodCmd::Terminate { target, all, dry_run } => match (all, target) {
+        PodCmd::Terminate { target, all, skip_proxy, dry_run } => match (all, target) {
             (true, _) => {
                 let policy = arena_core::retry::RetryPolicy::default();
                 let mut pods =
@@ -3070,14 +3278,15 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                     println!("(no pods to terminate)");
                     return Ok(());
                 }
+                let then_sync = if skip_proxy { "" } else { ", then sync the proxy" };
                 if dry_run {
                     for p in &pods {
                         println!("[dry-run] would terminate {} (id={})", p.name, p.id);
                     }
-                    println!("\nDry-run only — would terminate ALL {} pod(s) (preview).", pods.len());
+                    println!("\nDry-run only — would terminate ALL {} pod(s){then_sync} (preview).", pods.len());
                     return Ok(());
                 }
-                if !confirm(yes, &format!("Will TERMINATE ALL {} pod(s) — irreversible.", pods.len()))? {
+                if !confirm(yes, &format!("Will TERMINATE ALL {} pod(s) — irreversible{then_sync}.", pods.len()))? {
                     println!("aborted.");
                     return Ok(());
                 }
@@ -3093,21 +3302,30 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
                     }
                 }
                 println!("\nterminated {ok}/{total}");
+                // Sync whatever did go (the merge only drops what the providers confirm gone).
+                if ok > 0 && !skip_proxy {
+                    sync_proxy(cfg, provider, "terminate").await;
+                }
                 if ok < total {
                     anyhow::bail!("{} pod(s) failed to terminate", total - ok);
                 }
             }
             (false, Some(target)) => {
                 let (owner, id, label) = resolve_target_any(cfg, &target).await?;
+                let then_sync = if skip_proxy { "" } else { ", then sync the proxy" };
                 if dry_run {
-                    println!("[dry-run] would terminate {label}");
+                    println!("[dry-run] would terminate {label}{then_sync}");
                 } else {
-                    if !confirm(yes, &format!("Will TERMINATE {label} — irreversible."))? {
+                    if !confirm(yes, &format!("Will TERMINATE {label} — irreversible{then_sync}."))? {
                         println!("aborted.");
                         return Ok(());
                     }
                     owner.terminate_pod(&id).await?;
                     println!("[terminated] {label}");
+                    // `owner` is one backend; the sync lists the whole fleet.
+                    if !skip_proxy {
+                        sync_proxy(cfg, provider, "terminate").await;
+                    }
                 }
             }
             (false, None) => {
@@ -3447,14 +3665,16 @@ async fn handle_reimage(
             }
         }
     }
-    if !skip_proxy {
+    // A reimaged pod comes back on a new SSH port, so wait for it to settle before the
+    // sync (nothing to sync if every reimage failed).
+    if !skip_proxy && failed.len() < pods.len() {
         println!("waiting for SSH endpoints…");
         for pod in pods.iter().filter(|p| !failed.contains(&p.name)) {
             if let Err(e) = wait_for_stable_endpoint(provider, &pod.id, 30, 600).await {
                 eprintln!("warning: {} has no endpoint yet ({e})", pod.name);
             }
         }
-        apply_proxy(cfg, provider).await.context("reimage done, but redeploying the proxy failed")?;
+        sync_proxy(cfg, provider, "reimage").await;
     }
     if !failed.is_empty() {
         anyhow::bail!("{} pod(s) failed to reimage: {}", failed.len(), failed.join(" "));
@@ -3505,8 +3725,13 @@ async fn handle_rename(
     let policy = arena_core::retry::RetryPolicy::default();
     for (i, r) in plan.iter().enumerate() {
         if let Err(e) = arena_core::retry::retrying(&policy, || provider.rename_pod(&r.id, &r.new)).await {
+            // Deliberately no sync on a partial batch: in a `--from-prefix` rename the pods
+            // not renamed yet still carry the old prefix, which has no slot in the current
+            // list — a sync would drop their forwards. Left alone, every old forward keeps
+            // routing (a renamed pod keeps its port: same list index), until the re-run.
             anyhow::bail!(
-                "renaming {} → {} failed: {e}\n{i} of {} rename(s) done; proxy NOT redeployed",
+                "renaming {} → {} failed: {e}\n{i} of {} rename(s) done; proxy NOT synced \
+                 (fix and re-run the rename, or `arena proxy apply`)",
                 r.old,
                 r.new,
                 plan.len()
@@ -3515,9 +3740,9 @@ async fn handle_rename(
         println!("[renamed] {} → {}", r.old, r.new);
     }
     if skip_proxy {
-        println!("(proxy not redeployed — run `arena proxy apply`)");
+        println!("(proxy not synced — run `arena proxy apply`)");
     } else {
-        apply_proxy(cfg, provider).await.context("renames done, but redeploying the proxy failed")?;
+        sync_proxy(cfg, provider, "rename").await;
     }
     Ok(())
 }
@@ -3703,18 +3928,6 @@ async fn proxy_reaches_pod(cfg: &Config, name: &str, expected_id: &str) -> Resul
     }
 }
 
-/// Re-point nginx after a rename/reimage/replace/migration, from a **fleet-wide**
-/// per-provider listing. `any` may be the fleet or a single backend (migrate/replace hold
-/// the pod's `owner`); either way the fleet is rebuilt from its name so every configured
-/// provider is listed. A single-provider listing would leave the others "not queried"
-/// and — for legacy entries with no recorded owner — could even read as "every provider
-/// listed OK without them", dropping their forwards.
-async fn apply_proxy(cfg: &Config, any: &dyn Provider) -> Result<()> {
-    let fleet = arena_core::provider::build_fleet(any.name(), cfg, true)?;
-    let listing = fleet_listing(fleet.as_ref()).await;
-    deploy_proxy(cfg, &listing).await
-}
-
 /// `migrate copy`: build + set up `<name>-new` (or reuse it) and sync `<name>`'s files onto
 /// it. No rename, no proxy — the participant keeps using `<name>` and can test the new pod.
 async fn handle_migrate_copy(
@@ -3890,10 +4103,12 @@ async fn handle_migrate_cutover(
         println!("[4/4] proxy skipped — run `arena proxy apply` to route {canonical} to the new pod.");
     } else {
         println!("[4/4] re-pointing proxy and verifying {canonical} through it…");
-        if let Err(e) = apply_proxy(cfg, owner.as_ref()).await {
-            eprintln!("      proxy apply failed: {e} — auto-reverting.");
+        // Unlike the other lifecycle commands, the cutover *depends* on the proxy: a sync
+        // that was skipped or failed means nobody can reach the new pod, so revert now.
+        if !matches!(sync_proxy_via(cfg, owner.as_ref(), "migrate cutover").await, ProxySync::Synced { .. }) {
+            eprintln!("      the proxy wasn't re-pointed — auto-reverting.");
             cutover_revert(cfg, owner.as_ref(), &canonical, &new_id, &src_id, true).await;
-            anyhow::bail!("cutover reverted: proxy apply failed. {canonical} is back on the original.");
+            anyhow::bail!("cutover reverted: proxy sync failed. {canonical} is back on the original.");
         }
         // `nginx -s reload` is GRACEFUL: for a few seconds after the reload, existing worker
         // processes keep serving the OLD config, so a fresh connection can still be routed to
@@ -3949,10 +4164,8 @@ async fn cutover_revert(
     if let Err(e) = owner.rename_pod(old_id, canonical).await {
         eprintln!("  REVERT WARNING: couldn't restore {canonical} ({e}) — fix names manually!");
     }
-    if apply_px {
-        if let Err(e) = apply_proxy(cfg, owner).await {
-            eprintln!("  REVERT WARNING: proxy apply failed ({e}) — run `arena proxy apply`.");
-        }
+    if apply_px && !matches!(sync_proxy_via(cfg, owner, "migrate revert").await, ProxySync::Synced { .. }) {
+        eprintln!("  REVERT WARNING: the proxy wasn't re-pointed — run `arena proxy apply`.");
     }
 }
 
@@ -4268,9 +4481,7 @@ async fn handle_replace(
         println!("[7/7] re-pointing proxy…");
         // Fleet-wide (not just `owner`'s pods): a single-provider list here used to drop
         // every other provider's forwards, and a failed list (`unwrap_or_default`) all of them.
-        if let Err(e) = apply_proxy(cfg, owner.as_ref()).await {
-            eprintln!("      proxy apply failed: {e} — run `arena proxy apply` manually.");
-        }
+        sync_proxy_via(cfg, owner.as_ref(), "replace").await;
     }
     if keep_old {
         println!(
@@ -5914,6 +6125,148 @@ mod tests {
         assert_eq!(strip_arena_block("a\nb"), "a\nb");
     }
 
+    fn cron_job(pull: bool, proxy: bool) -> Vec<String> {
+        super::cron_lines(&super::CronJob {
+            schedule: "*/15 * * * *",
+            env_prefix: "",
+            exe: "/opt/arena",
+            config: "/srv/config.env",
+            home: "/home/u",
+            pull,
+            proxy,
+        })
+    }
+
+    #[test]
+    fn cron_lines_add_the_proxy_resync_only_when_asked() {
+        assert_eq!(
+            cron_job(false, false),
+            ["*/15 * * * * /opt/arena --config /srv/config.env pods backup --no-pull --yes >> /home/u/arena-cron.log 2>&1"]
+        );
+        let both = cron_job(true, true);
+        assert_eq!(
+            both,
+            [
+                "*/15 * * * * /opt/arena --config /srv/config.env pods backup --yes >> /home/u/arena-cron.log 2>&1",
+                "*/5 * * * * /opt/arena --config /srv/config.env proxy apply --yes >> /home/u/arena-proxy-cron.log 2>&1",
+            ]
+        );
+        // Both live inside the one arena block; re-installing without --proxy drops the
+        // proxy line again and leaves other entries alone.
+        let tab = with_arena_block("0 9 * * * keep-me\n", &both);
+        assert_eq!(tab.matches(CRON_BEGIN).count(), 1);
+        let block: Vec<&str> = tab.lines().skip_while(|l| *l != CRON_BEGIN).collect();
+        assert!(block.iter().any(|l| l.contains("proxy apply --yes")), "{tab}");
+        let tab = with_arena_block(&tab, &cron_job(false, false));
+        assert!(tab.contains("keep-me") && tab.contains("pods backup") && !tab.contains("proxy apply"), "{tab}");
+    }
+
+    #[test]
+    fn sync_line_reports_each_outcome_on_one_line() {
+        use super::{sync_line, ProxySync, Written};
+        use arena_core::proxy::ChangeCounts;
+        let synced = |written, counts, removed: &[&str], pending, failed: &[&str]| ProxySync::Synced {
+            written,
+            counts,
+            removed: removed.iter().map(|s| s.to_string()).collect(),
+            pending,
+            failed_providers: failed.iter().map(|s| s.to_string()).collect(),
+        };
+        let removed_one = ChangeCounts { removed: 1, unchanged: 4, ..Default::default() };
+        let cases: Vec<(ProxySync, &str)> = vec![
+            (
+                synced(Written::Reloaded, removed_one, &["arena8-apple"], 0, &[]),
+                "[proxy] after terminate: +0 ~0 -1 =0 (deployed; removed arena8-apple)",
+            ),
+            (
+                synced(Written::Unchanged, ChangeCounts { unchanged: 5, ..Default::default() }, &[], 0, &[]),
+                "[proxy] after terminate: +0 ~0 -0 =0 (unchanged)",
+            ),
+            (
+                synced(Written::WriteOnly, ChangeCounts { added: 1, ..Default::default() }, &[], 2, &[]),
+                "[proxy] after terminate: +1 ~0 -0 =0 (written; write-only, nginx not reloaded; \
+                 2 pod(s) not forwarded yet (no SSH endpoint))",
+            ),
+            (
+                synced(
+                    Written::Reloaded,
+                    ChangeCounts { removed: 5, kept: 2, ..Default::default() },
+                    &["a", "b", "c", "d", "e"],
+                    0,
+                    &["vast"],
+                ),
+                "[proxy] after terminate: +0 ~0 -5 =2 (deployed; removed a, b, c +2 more; \
+                 vast failed to list — forwards kept)",
+            ),
+            (
+                ProxySync::Skipped("no proxy configured (SSH_PROXY_HOST unset)".into()),
+                "[proxy] after terminate: skipped — no proxy configured (SSH_PROXY_HOST unset)",
+            ),
+            (
+                ProxySync::Failed("not touching the proxy config: every provider failed".into()),
+                "[proxy] after terminate: NOT synced — not touching the proxy config: every provider \
+                 failed (retry: `arena proxy apply`)",
+            ),
+        ];
+        for (outcome, want) in cases {
+            let got = sync_line("terminate", &outcome);
+            assert_eq!(got, want);
+            assert!(!got.contains('\n'), "one line: {got}");
+        }
+    }
+
+    #[test]
+    fn undeployable_only_without_a_proxy_or_without_nginx_unless_write_only() {
+        use super::undeployable_reason;
+        use arena_core::proxy::ProxyConfig;
+        let px = |extra: &str| {
+            ProxyConfig::from_config(&arena_core::Config::parse(&format!("SSH_PROXY_HOST=proxy.example.com\n{extra}")))
+                .unwrap()
+        };
+        let local = px("");
+        let remote = px("PROXY_LOCAL=false\n");
+        let write_only = px("PROXY_LOCAL=false\nSSH_PROXY_RELOAD_CMD=\"\"\n");
+
+        assert!(undeployable_reason(None, true).unwrap().contains("SSH_PROXY_HOST"));
+        assert_eq!(undeployable_reason(Some(&local), true), None);
+        assert!(undeployable_reason(Some(&local), false).unwrap().contains("not found on this host"));
+        assert_eq!(undeployable_reason(Some(&remote), true), None);
+        let why = undeployable_reason(Some(&remote), false).unwrap();
+        assert!(why.contains("proxy.example.com") && why.contains("unreachable"), "{why}");
+        // Write-only never runs nginx, so a missing nginx never blocks it.
+        assert_eq!(undeployable_reason(Some(&write_only), false), None);
+    }
+
+    #[test]
+    fn written_line_says_what_reached_the_proxy() {
+        use super::{written_line, Written};
+        use arena_core::proxy::ProxyConfig;
+        let px = |extra: &str| {
+            ProxyConfig::from_config(&arena_core::Config::parse(&format!(
+                "SSH_PROXY_HOST=proxy.example.com\nSSH_PROXY_NGINX_CONFIG_PATH=/srv/p.conf\n{extra}"
+            )))
+            .unwrap()
+        };
+        let (local, remote) = (px(""), px("PROXY_LOCAL=false\n"));
+        assert_eq!(written_line(&local, 3, Written::Unchanged), None);
+        assert_eq!(
+            written_line(&local, 3, Written::WriteOnly).as_deref(),
+            Some("[proxy] wrote 3 forward(s) to /srv/p.conf (write-only: nginx not reloaded)")
+        );
+        assert_eq!(
+            written_line(&local, 3, Written::Reloaded).as_deref(),
+            Some("[proxy] deployed 3 forward(s) locally and reloaded nginx")
+        );
+        assert_eq!(
+            written_line(&remote, 2, Written::WriteOnly).as_deref(),
+            Some("[proxy] wrote 2 forward(s) to proxy.example.com:/srv/p.conf (write-only: nginx not reloaded)")
+        );
+        assert_eq!(
+            written_line(&remote, 2, Written::Reloaded).as_deref(),
+            Some("[proxy] deployed 2 forward(s) to proxy.example.com and reloaded nginx")
+        );
+    }
+
     #[test]
     fn copy_dest_mirrors_repo_path_or_falls_back() {
         use super::resolve_remote_dest;
@@ -6002,7 +6355,10 @@ mod tests {
 /// — so they can never run nginx or SSH anywhere.
 #[cfg(test)]
 mod proxy_deploy_tests {
-    use super::{deploy_proxy, fleet_listing, prepare_proxy, read_current_proxy, write_proxy};
+    use super::{
+        deploy_proxy, fleet_listing, prepare_proxy, read_current_proxy, sync_proxy, write_proxy, ProxySync,
+        Written,
+    };
     use arena_core::proxy::{Listing, ProviderListing, ProxyConfig};
     use arena_core::{Config, Error, Pod, PodSpec, Provider, Result};
     use async_trait::async_trait;
@@ -6074,7 +6430,7 @@ mod proxy_deploy_tests {
         let autumn = pod("vast", "arena8-autumn", "ssh4.vast.ai", 31000);
 
         // 1. both providers answer → both forwards written (no file before = empty prev).
-        deploy_proxy(&cfg, &listing(vec![("runpod", Ok(vec![apple.clone()])), ("vast", Ok(vec![autumn]))]))
+        deploy_proxy(&cfg, &listing(vec![("runpod", Ok(vec![apple.clone()])), ("vast", Ok(vec![autumn]))]), false)
             .await
             .unwrap();
         let first = read(&path);
@@ -6082,21 +6438,21 @@ mod proxy_deploy_tests {
 
         // 2. vast 429s while runpod moved apple: apple follows, autumn is kept.
         let moved = pod("runpod", "arena8-apple", "2.2.2.2", 22001);
-        deploy_proxy(&cfg, &listing(vec![("runpod", Ok(vec![moved])), ("vast", Err("vast list HTTP 429"))]))
+        deploy_proxy(&cfg, &listing(vec![("runpod", Ok(vec![moved])), ("vast", Err("vast list HTTP 429"))]), false)
             .await
             .unwrap();
         let second = read(&path);
         assert!(second.contains("proxy_pass 2.2.2.2:22001;") && second.contains("proxy_pass ssh4.vast.ai:31000;"));
 
         // 3. nobody answers → refuse, file untouched.
-        let err = deploy_proxy(&cfg, &listing(vec![("runpod", Err("HTTP 500")), ("vast", Err("HTTP 429"))]))
+        let err = deploy_proxy(&cfg, &listing(vec![("runpod", Err("HTTP 500")), ("vast", Err("HTTP 429"))]), false)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not touching the proxy config"), "{err}");
         assert_eq!(read(&path), second);
 
         // 4. runpod answers without apple (terminated) → removed; vast still down → kept.
-        deploy_proxy(&cfg, &listing(vec![("runpod", Ok(vec![])), ("vast", Err("HTTP 429"))])).await.unwrap();
+        deploy_proxy(&cfg, &listing(vec![("runpod", Ok(vec![])), ("vast", Err("HTTP 429"))]), false).await.unwrap();
         let fourth = read(&path);
         assert!(!fourth.contains("arena8-apple") && fourth.contains("proxy_pass ssh4.vast.ai:31000;"));
     }
@@ -6113,7 +6469,7 @@ mod proxy_deploy_tests {
         .unwrap();
         let cfg = cfg(&path);
         let apple = pod("runpod", "arena8-apple", "1.1.1.1", 22000);
-        deploy_proxy(&cfg, &listing(vec![("runpod", Ok(vec![apple])), ("vast", Err("HTTP 429"))])).await.unwrap();
+        deploy_proxy(&cfg, &listing(vec![("runpod", Ok(vec![apple])), ("vast", Err("HTTP 429"))]), false).await.unwrap();
         let text = read(&path);
         assert!(text.contains("# arena-forward name=arena8-apple port=7000 target=1.1.1.1:22000 provider=runpod"));
         // The legacy autumn entry's owner is unknown and vast didn't answer → kept.
@@ -6127,9 +6483,10 @@ mod proxy_deploy_tests {
         let l = listing(vec![("runpod", Ok(vec![pod("runpod", "arena8-apple", "1.1.1.1", 22000)]))]);
         let p = prepare_proxy(&cfg, &l).await.unwrap();
         assert!(!p.up_to_date());
-        write_proxy(&cfg, &p).await.unwrap();
+        assert_eq!(write_proxy(&cfg, &p).await.unwrap(), Written::WriteOnly);
         let again = prepare_proxy(&cfg, &l).await.unwrap();
         assert!(again.up_to_date(), "a second apply must be a no-op");
+        assert_eq!(write_proxy(&cfg, &again).await.unwrap(), Written::Unchanged);
 
         // Even a hand-assembled prepared config with `abort` set can't be written.
         let mut forced = prepare_proxy(&cfg, &listing(vec![("runpod", Ok(vec![]))])).await.unwrap();
@@ -6192,5 +6549,146 @@ mod proxy_deploy_tests {
         let bad = fleet_listing(&Single(false)).await;
         assert!(!bad.any_ok());
         assert_eq!(bad.errors(), vec![("vast", "provider error: vast list HTTP 429")]);
+    }
+
+    /// A fleet whose per-provider listing the test scripts between lifecycle steps — the
+    /// shape `build_fleet` hands the pods commands.
+    struct Fleet(std::sync::Mutex<Vec<(&'static str, std::result::Result<Vec<Pod>, &'static str>)>>);
+
+    impl Fleet {
+        fn new(v: Vec<(&'static str, std::result::Result<Vec<Pod>, &'static str>)>) -> Self {
+            Fleet(std::sync::Mutex::new(v))
+        }
+        fn set(&self, v: Vec<(&'static str, std::result::Result<Vec<Pod>, &'static str>)>) {
+            *self.0.lock().unwrap() = v;
+        }
+    }
+
+    #[async_trait]
+    impl Provider for Fleet {
+        fn name(&self) -> &'static str {
+            "runpod"
+        }
+        fn describe(&self, _spec: &PodSpec) -> String {
+            String::new()
+        }
+        async fn list_pods(&self) -> Result<Vec<Pod>> {
+            Ok(self.0.lock().unwrap().iter().filter_map(|(_, r)| r.clone().ok()).flatten().collect())
+        }
+        async fn list_by_provider(&self) -> Vec<(String, Result<Vec<Pod>>)> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(p, r)| (p.to_string(), r.clone().map_err(Error::provider)))
+                .collect()
+        }
+        async fn create_pod(&self, _spec: &PodSpec) -> Result<Pod> {
+            unimplemented!("not exercised")
+        }
+        async fn stop_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn restart_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn terminate_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn synced(s: &ProxySync) -> (Written, String, Vec<String>, usize, Vec<String>) {
+        match s {
+            ProxySync::Synced { written, counts, removed, pending, failed_providers } => {
+                (*written, counts.compact(), removed.clone(), *pending, failed_providers.clone())
+            }
+            other => panic!("expected Synced, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_skips_without_a_proxy_and_never_lists() {
+        // No SSH_PROXY_HOST: a quiet skip, not an error — and the fleet isn't even listed
+        // (a fleet that would panic on listing proves it).
+        struct Unlistable;
+        #[async_trait]
+        impl Provider for Unlistable {
+            fn name(&self) -> &'static str {
+                "runpod"
+            }
+            fn describe(&self, _spec: &PodSpec) -> String {
+                String::new()
+            }
+            async fn list_pods(&self) -> Result<Vec<Pod>> {
+                panic!("a skipped sync must not list the fleet")
+            }
+            async fn create_pod(&self, _spec: &PodSpec) -> Result<Pod> {
+                unimplemented!("not exercised")
+            }
+            async fn stop_pod(&self, _id: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn restart_pod(&self, _id: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn terminate_pod(&self, _id: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+        let cfg = Config::parse("MACHINE_NAME_PREFIX=arena8\nMACHINE_NAME_LIST=(\n  \"apple\"\n)\n");
+        match sync_proxy(&cfg, &Unlistable, "terminate").await {
+            ProxySync::Skipped(why) => assert!(why.contains("SSH_PROXY_HOST"), "{why}"),
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_follows_a_create_terminate_lifecycle_and_never_drops_on_doubt() {
+        let path = tmp("sync.conf");
+        let cfg = cfg(&path);
+        let apple = pod("runpod", "arena8-apple", "1.1.1.1", 22000);
+        let autumn = pod("vast", "arena8-autumn", "ssh4.vast.ai", 31000);
+        let booting = Pod { ssh_ip: None, ssh_port: None, ..autumn.clone() };
+        let fleet = Fleet::new(vec![("runpod", Ok(vec![apple.clone()])), ("vast", Ok(vec![booting]))]);
+
+        // after create: apple is wired, autumn is still booting → reported as pending.
+        let s = sync_proxy(&cfg, &fleet, "create").await;
+        assert_eq!(synced(&s), (Written::WriteOnly, "+1 ~0 -0 =0".into(), vec![], 1, vec![]));
+        assert!(read(&path).contains("proxy_pass 1.1.1.1:22000;"));
+
+        // the same fleet again → nothing written.
+        let s = sync_proxy(&cfg, &fleet, "up").await;
+        assert_eq!(synced(&s).0, Written::Unchanged);
+
+        // autumn got its endpoint.
+        fleet.set(vec![("runpod", Ok(vec![apple.clone()])), ("vast", Ok(vec![autumn.clone()]))]);
+        let s = sync_proxy(&cfg, &fleet, "up").await;
+        assert_eq!(synced(&s), (Written::WriteOnly, "+1 ~0 -0 =0".into(), vec![], 0, vec![]));
+        let both = read(&path);
+
+        // terminate apple, but runpod still lists it (exited, no endpoint) → kept, untouched.
+        let exiting = Pod { status: "EXITED".into(), ssh_ip: None, ssh_port: None, ..apple.clone() };
+        fleet.set(vec![("runpod", Ok(vec![exiting])), ("vast", Ok(vec![autumn.clone()]))]);
+        let s = sync_proxy(&cfg, &fleet, "terminate").await;
+        assert_eq!(synced(&s), (Written::Unchanged, "+0 ~0 -0 =1".into(), vec![], 0, vec![]));
+        assert_eq!(read(&path), both);
+
+        // vast 429s while runpod has stopped listing apple → apple removed, autumn kept.
+        fleet.set(vec![("runpod", Ok(vec![])), ("vast", Err("vast list HTTP 429"))]);
+        let s = sync_proxy(&cfg, &fleet, "terminate").await;
+        assert_eq!(
+            synced(&s),
+            (Written::WriteOnly, "+0 ~0 -1 =1".into(), vec!["arena8-apple".into()], 0, vec!["vast".into()])
+        );
+        let text = read(&path);
+        assert!(!text.contains("arena8-apple") && text.contains("proxy_pass ssh4.vast.ai:31000;"));
+
+        // nobody answers → Failed (a warning, never an error), and the file is untouched.
+        fleet.set(vec![("runpod", Err("HTTP 500")), ("vast", Err("HTTP 429"))]);
+        match sync_proxy(&cfg, &fleet, "rename").await {
+            ProxySync::Failed(e) => assert!(e.contains("not touching the proxy config"), "{e}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert_eq!(read(&path), text);
     }
 }
