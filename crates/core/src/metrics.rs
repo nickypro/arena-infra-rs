@@ -10,9 +10,12 @@
 //!
 //! All of this is read-only: it only ever *reads* `nvidia-smi`, git state, a couple of
 //! file existence checks, and runs the operator's progress command. Parsing is pure and
-//! unit-tested; the SSH call is thin.
+//! unit-tested; the SSH call is thin, goes through a [`Remote`] (so it is testable with
+//! `FakeRemote`) and is bounded by [`PROBE_TIMEOUT`], so a wedged pod shows as an error
+//! row instead of stalling a `pods list` or a dashboard refresh.
 
-use crate::ssh::{self, SshTarget};
+use crate::remote::{Remote, SshRemote, PROBE_TIMEOUT};
+use crate::ssh::SshTarget;
 
 /// Separates the `nvidia-smi` block from the key=value health block in the probe's
 /// combined stdout.
@@ -375,16 +378,23 @@ fn parse_probe(stdout: &str, m: &mut PodMetrics) {
     }
 }
 
-/// Probe a pod over SSH in one round-trip. Never fails the caller — a connection error
-/// is recorded in `PodMetrics::error` so one down pod doesn't sink a whole-fleet sweep.
-pub async fn fetch(target: &SshTarget, opts: &ProbeOpts) -> PodMetrics {
+/// Probe a pod over `remote` in one round-trip, within [`PROBE_TIMEOUT`]. Never fails the
+/// caller — a connection error or a timeout is recorded in `PodMetrics::error` so one down
+/// (or wedged) pod doesn't sink a whole-fleet sweep.
+pub async fn fetch_with(remote: &dyn Remote, target: &SshTarget, opts: &ProbeOpts) -> PodMetrics {
     let mut m = PodMetrics::default();
-    match ssh::run(target, &remote_command(opts)).await {
+    match remote.exec(target, &remote_command(opts), Some(PROBE_TIMEOUT)).await {
         Ok(out) if out.success => parse_probe(&out.stdout, &mut m),
         Ok(out) => m.error = Some(describe_failure(out.code, &out.stderr)),
         Err(e) => m.error = Some(e.to_string()),
     }
     m
+}
+
+/// [`fetch_with`] over real SSH ([`SshRemote`]) — the TUI's entry point until it is handed
+/// a `Remote` too (PLAN Phase 3).
+pub async fn fetch(target: &SshTarget, opts: &ProbeOpts) -> PodMetrics {
+    fetch_with(&SshRemote, target, opts).await
 }
 
 /// Single-quote for safe inclusion in a `sh -c` string (POSIX `'\''` escaping).
@@ -551,6 +561,56 @@ mod tests {
         assert_eq!(m.origin, None);
         assert_eq!(m.has_name, Some(false));
         assert_eq!(m.has_key, None); // not in output -> not probed
+    }
+
+    fn target() -> SshTarget {
+        SshTarget {
+            user: "root".into(),
+            host: "10.0.0.1".into(),
+            port: 22001,
+            key_paths: vec![],
+            connect_timeout_secs: 5,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fetch_with_parses_a_fake_nvidia_smi_reply() {
+        use crate::remote::{FakeRemote, FakeReply, RemoteCall};
+        let fake = FakeRemote::new();
+        let reply = format!(
+            "NVIDIA RTX A4000, 12, 900, 16376, 41\nNVIDIA RTX A4000, 0, 3, 16376, 38\n{SENTINEL}\nbranch=main\nname=1\n{PROC_SENTINEL}\n"
+        );
+        fake.script("10.0.0.1:22001", [FakeReply::stdout(&reply)]);
+        let opts = ProbeOpts { repo_path: Some("/root/ARENA_materials".into()), ..Default::default() };
+        let m = fetch_with(&fake, &target(), &opts).await;
+        assert_eq!(m.error, None);
+        assert_eq!(m.gpu_summary().as_deref(), Some("2×RTX A4000"));
+        assert_eq!(m.gpus[0].util_pct, Some(12));
+        assert_eq!(m.branch.as_deref(), Some("main"));
+        assert_eq!(m.has_name, Some(true));
+        // One round-trip: the combined probe command, under the probe budget.
+        assert!(matches!(
+            &fake.calls()[..],
+            [RemoteCall::Exec { cmd, timeout, .. }] if *cmd == remote_command(&opts) && *timeout == Some(PROBE_TIMEOUT)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fetch_with_reports_a_failed_or_wedged_pod_as_an_error_row() {
+        use crate::remote::{FakeRemote, FakeReply};
+        let fake = FakeRemote::new();
+        fake.script(
+            "10.0.0.1:22001",
+            [FakeReply::exit(255, "ssh: connect to host 10.0.0.1 port 22001: Connection refused"), FakeReply::hang()],
+        );
+        let m = fetch_with(&fake, &target(), &ProbeOpts::default()).await;
+        assert!(m.error.as_deref().is_some_and(|e| e.starts_with("ssh connect failed:")), "{:?}", m.error);
+        assert!(m.gpus.is_empty());
+        // A hung probe ends at the budget (paused clock: instantly), not never.
+        let start = tokio::time::Instant::now();
+        let m = fetch_with(&fake, &target(), &ProbeOpts::default()).await;
+        assert_eq!(start.elapsed(), PROBE_TIMEOUT);
+        assert!(m.error.as_deref().is_some_and(|e| e.contains("timed out after 20s")), "{:?}", m.error);
     }
 
     #[test]

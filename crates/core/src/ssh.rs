@@ -311,7 +311,9 @@ pub fn strip_interactive_noise(s: &str) -> String {
         .join("\n")
 }
 
-/// Copy a local file to the target over scp.
+/// Copy a local file to the target over scp. No time budget: pod paths use
+/// [`crate::remote::Remote`] instead (timeouts, fakes); this stays for the proxy host and
+/// the TUI until the TUI takes a `Remote` too (PLAN Phase 3).
 pub async fn scp(target: &SshTarget, local: &str, remote: &str) -> Result<SshOutput> {
     let out = Command::new("scp")
         .args(target.scp_args(local, remote))
@@ -337,7 +339,8 @@ pub struct SshOutput {
 }
 
 /// Run `remote_cmd` on the target over SSH and capture its output. stdin is closed so
-/// a remote prompt can't wedge the call.
+/// a remote prompt can't wedge the call. No time budget — see [`scp`] for who still uses
+/// this rather than [`crate::remote::Remote`].
 pub async fn run(target: &SshTarget, remote_cmd: &str) -> Result<SshOutput> {
     let out = Command::new("ssh")
         .args(target.ssh_args())

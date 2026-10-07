@@ -7,11 +7,15 @@
 //! the tool is developed against a live production account.
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use arena_core::provider::Provider;
+use arena_core::remote::{describe_error, Remote, PROBE_TIMEOUT};
+use arena_core::ssh::SshTarget;
 use arena_core::{Config, PodSpec};
 
 const DEFAULT_CONFIG: &str = "/home/dev/prod-ro/config.env";
@@ -753,16 +757,21 @@ enum PodCmd {
     ///
     /// Runs inside an interactive shell with the conda env active (default `arena-env`,
     /// override via `CONDA_ENV`; set it empty to disable), so commands see the
-    /// participants' python/packages and the token exports written by `setup`.
+    /// participants' python/packages and the token exports written by `setup`. Flags go
+    /// BEFORE the command — everything after it is the command.
     Run {
         /// The command to run (everything after `run`).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
+        /// Per-pod budget in seconds (default 1800 = 30 min; at most 86400). A pod that
+        /// runs over reports `✗ timed out after Ns` and counts as failed; the others carry on.
+        #[arg(long, default_value_t = RUN_TIMEOUT_SECS, value_parser = clap::value_parser!(u64).range(1..=arena_core::setup::MAX_STEP_TIMEOUT_SECS))]
+        timeout: u64,
         /// Preview only: print the command + target pods, run nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// Health check: torch version on every pod (read-only).
+    /// Health check: torch version on every pod (read-only; 90s budget per pod).
     Test,
     /// Distribute API keys to pods' shells (per-host CSVs + broadcast HF token).
     CopyKeys {
@@ -1200,18 +1209,21 @@ async fn main() -> Result<()> {
         // --provider). One configured backend behaves like that single provider.
         _ => Some(arena_core::provider::build_fleet(&cli.provider, &cfg, true)?),
     };
+    // How every pod-SSH path reaches pods — one for the whole run: real ssh/scp here,
+    // `FakeRemote` in tests. Each call carries its own budget (see the `*_TIMEOUT`s).
+    let remote: Arc<dyn Remote> = Arc::new(arena_core::remote::SshRemote);
 
     match cli.cmd {
         Cmd::Tui => launch_tui(&cli.provider, &cli.config),
         Cmd::Plan(c) => handle_plan(c, provider.unwrap().as_ref(), &cfg).await,
         Cmd::Config(c) => handle_config(c, &cfg, &cli.provider, &cli.config),
         Cmd::Cron(c) => handle_cron(c, &cli.config).await,
-        Cmd::Pods(p) => handle_pods(p, provider.unwrap().as_ref(), &cfg, cli.yes).await,
+        Cmd::Pods(p) => handle_pods(p, provider.unwrap().as_ref(), remote, &cfg, cli.yes).await,
         Cmd::Proxy(p) => handle_proxy(p, provider.unwrap().as_ref(), &cfg, cli.yes).await,
         Cmd::SshConfig { proxy, out } => {
             handle_ssh_config(provider.unwrap().as_ref(), &cfg, proxy, out.as_deref()).await
         }
-        Cmd::Keys(k) => handle_keys(k, provider.unwrap().as_ref(), &cfg, cli.yes).await,
+        Cmd::Keys(k) => handle_keys(k, provider.unwrap().as_ref(), remote, &cfg, cli.yes).await,
         Cmd::Gpus { json } => handle_gpus(&cfg, &cli.provider, json).await,
     }
 }
@@ -1389,6 +1401,97 @@ const COPY_KEYS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60
 
 /// Where `keys gen` writes, and `setup` / `copy-keys` read, the per-host API-key CSVs.
 const KEYS_DIR: &str = "./keys";
+
+// Per-call SSH budgets (PLAN 1.B). Every pod-SSH call is bounded so one wedged pod can
+// never hang a fleet command: it reports `✗ <name>: timed out after Ns`, counts as a
+// failure, and the others carry on. Quick probes share `arena_core::remote::PROBE_TIMEOUT`.
+
+/// `pods test`: a cold `import torch` (CUDA libs off a cold disk) takes 10–30s, so 90s
+/// means the pod is wedged — and a read-only health check must not hang on it.
+const TEST_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// `pods run`'s default per-pod budget (`--timeout` overrides). Arbitrary commands can be
+/// long (a download, a test suite), so it's generous — but never unbounded: a fleet run
+/// must end even when one pod wedges. 30 min.
+const RUN_TIMEOUT_SECS: u64 = 30 * 60;
+
+/// `pods backup`: git add + commit + push of a participant's tree — seconds normally, but
+/// a first push of notebooks/outputs can take minutes. 5 min.
+const BACKUP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// `pods set-branch` / `init-branches`: a fetch + checkout (+ ff-pull or push) against
+/// GitHub — seconds normally, so 2 min means stuck (a hung fetch, a held lock).
+const BRANCH_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+
+/// `pods cp`'s scp, which scales with what's copied (a file, or a small tree with `-r`):
+/// 10 min. Its `mkdir -p` and post-copy size check are quick probes.
+const CP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// replace/migrate's direct pod-to-pod rsync of a home dir (caches/models excluded): a
+/// few GB, minutes pod-to-pod. Two hours means the transfer is wedged, and the pipeline
+/// must give the operator their terminal back instead of waiting forever.
+const POD_COPY_TIMEOUT: Duration = Duration::from_secs(2 * 3600);
+
+/// How one pod's SSH call ended, ready for its report line: the command's output (which
+/// may still be a non-zero exit), or why there is none — `timed out after Ns`, a spawn
+/// error, a crashed task.
+type PodCall = std::result::Result<arena_core::ssh::SshOutput, String>;
+
+/// Run one job per pod concurrently and hand each pod's result to `on_done(done, total,
+/// name, result)` as it finishes. Finishing order is the point: healthy pods report at
+/// once, and a pod whose job is stuck reports when its budget runs out — never holding the
+/// others, or the command, hostage (jobs bound their own SSH calls). A job that panicked is
+/// still reported, by name, as `Err` — never silently dropped from the tally.
+async fn each_pod<T, F>(
+    jobs: Vec<(String, F)>,
+    mut on_done: impl FnMut(usize, usize, &str, std::result::Result<T, String>),
+) where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let total = jobs.len();
+    let mut set = tokio::task::JoinSet::new();
+    let mut names = std::collections::HashMap::new();
+    for (name, job) in jobs {
+        names.insert(set.spawn(job).id(), name);
+    }
+    let mut done = 0;
+    while let Some(joined) = set.join_next_with_id().await {
+        done += 1;
+        let (id, result) = match joined {
+            Ok((id, out)) => (id, Ok(out)),
+            Err(e) => (e.id(), Err(format!("task crashed: {e}"))),
+        };
+        on_done(done, total, names.get(&id).map(String::as_str).unwrap_or("?"), result);
+    }
+}
+
+/// [`each_pod`] for the common case: one command per pod over `remote`, each bounded by
+/// `timeout`, reported as a [`PodCall`].
+async fn exec_each_pod(
+    remote: &Arc<dyn Remote>,
+    jobs: Vec<(String, SshTarget, String)>,
+    timeout: Duration,
+    mut on_done: impl FnMut(usize, usize, &str, PodCall),
+) {
+    let jobs = jobs
+        .into_iter()
+        .map(|(name, target, cmd)| {
+            let remote = remote.clone();
+            (name, async move { remote.exec(&target, &cmd, Some(timeout)).await.map_err(|e| describe_error(&e)) })
+        })
+        .collect();
+    each_pod(jobs, |done, total, name, result| on_done(done, total, name, result.and_then(|call| call))).await;
+}
+
+/// The `[done/total] ✗ <name> …` line for a pod whose call failed: the remote command's
+/// non-zero exit (with its stderr), or why there was no answer (`timed out after Ns`, …).
+fn failure_line(done: usize, total: usize, name: &str, call: &PodCall) -> String {
+    match call {
+        Ok(out) => format!("[{done}/{total}] ✗ {name} (exit {:?}): {}", out.code, out.stderr.trim()),
+        Err(why) => format!("[{done}/{total}] ✗ {name}: {why}"),
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_setup(
@@ -2161,13 +2264,14 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
 
 async fn handle_backup(
     provider: &dyn Provider,
+    // How we reach pods: `SshRemote` for real, `FakeRemote` in tests.
+    remote: Arc<dyn Remote>,
     cfg: &Config,
     apply: bool,
     message: Option<String>,
     target_filter: Option<&str>,
 ) -> Result<()> {
-    use arena_core::backup::{self, parse_backup_output};
-    use arena_core::ssh::{self, SshTarget};
+    use arena_core::backup;
 
     // Backup commits the *current* branch (never switches/creates one), so it just needs
     // the repo path + push key — no week/day / autocommit-branch naming.
@@ -2216,50 +2320,77 @@ async fn handle_backup(
 
     // Run concurrently with a live [done/total] counter (one SSH per pod, slow serially).
     let total = targets.len();
-    println!("Backing up {total} pod(s) over SSH (current branch; main/master skipped)…");
-    let mut set = tokio::task::JoinSet::new();
-    for (name, target) in targets {
-        let cmd = backup::backup_command(&repo_path, key.as_deref(), &msg_for(&name));
-        set.spawn(async move { (name, ssh::run(&target, &cmd).await) });
-    }
-    let (mut backed_up, mut no_changes, mut skipped, mut failed, mut done) = (0, 0, 0, 0, 0);
-    while let Some(joined) = set.join_next().await {
-        done += 1;
-        let Ok((name, res)) = joined else { continue };
-        match res {
-            Ok(out) if out.success => match parse_backup_output(&out.stdout) {
-                Some((backup::BACKUP_PUSHED, branch)) => {
-                    println!("[{done}/{total}] ✓ {name} -> {branch}");
-                    backed_up += 1;
-                }
-                Some((backup::BACKUP_NO_CHANGES, branch)) => {
-                    println!("[{done}/{total}] = {name} (no changes, on {branch})");
-                    no_changes += 1;
-                }
-                Some((backup::BACKUP_SKIPPED, branch)) => {
-                    println!("[{done}/{total}] ⊘ {name} (skipped — on protected branch {branch})");
-                    skipped += 1;
-                }
-                _ => {
-                    println!("[{done}/{total}] ✓ {name} (done)");
-                    backed_up += 1;
-                }
-            },
-            Ok(out) => {
-                println!("[{done}/{total}] ✗ {name} (exit {:?}): {}", out.code, out.stderr.trim());
-                failed += 1;
-            }
-            Err(e) => {
-                println!("[{done}/{total}] ✗ {name}: {e}");
-                failed += 1;
-            }
-        }
-    }
-    println!("\nDone: {backed_up} pushed, {no_changes} unchanged, {skipped} skipped (main/master), {failed} failed.");
-    if failed > 0 {
-        anyhow::bail!("{failed} pod(s) failed to back up");
+    println!(
+        "Backing up {total} pod(s) over SSH (current branch; main/master skipped; {}s budget each)…",
+        BACKUP_TIMEOUT.as_secs()
+    );
+    let jobs = targets
+        .into_iter()
+        .map(|(name, target)| {
+            let cmd = backup::backup_command(&repo_path, key.as_deref(), &msg_for(&name));
+            (name, target, cmd)
+        })
+        .collect();
+    let t = backup_fleet(&remote, jobs, |line| println!("{line}")).await;
+    println!(
+        "\nDone: {} pushed, {} unchanged, {} skipped (main/master), {} failed.",
+        t.pushed, t.unchanged, t.skipped, t.failed
+    );
+    if t.failed > 0 {
+        anyhow::bail!("{} pod(s) failed to back up", t.failed);
     }
     Ok(())
+}
+
+/// What a fleet `backup` did, per outcome.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct BackupTally {
+    pushed: usize,
+    unchanged: usize,
+    skipped: usize,
+    failed: usize,
+}
+
+/// Run each pod's backup command (`(name, target, cmd)`) concurrently over `remote`, each
+/// within [`BACKUP_TIMEOUT`], classifying its output by the sentinel it printed and
+/// emitting one `[done/total]` line per pod as it finishes. A non-zero exit, a timeout or a
+/// crashed task is a failure; the others still finish.
+async fn backup_fleet(
+    remote: &Arc<dyn Remote>,
+    jobs: Vec<(String, SshTarget, String)>,
+    mut emit: impl FnMut(&str),
+) -> BackupTally {
+    use arena_core::backup::{self, parse_backup_output};
+    let mut t = BackupTally::default();
+    exec_each_pod(remote, jobs, BACKUP_TIMEOUT, |done, total, name, call| {
+        let line = match &call {
+            Ok(out) if out.success => match parse_backup_output(&out.stdout) {
+                Some((backup::BACKUP_PUSHED, branch)) => {
+                    t.pushed += 1;
+                    format!("[{done}/{total}] ✓ {name} -> {branch}")
+                }
+                Some((backup::BACKUP_NO_CHANGES, branch)) => {
+                    t.unchanged += 1;
+                    format!("[{done}/{total}] = {name} (no changes, on {branch})")
+                }
+                Some((backup::BACKUP_SKIPPED, branch)) => {
+                    t.skipped += 1;
+                    format!("[{done}/{total}] ⊘ {name} (skipped — on protected branch {branch})")
+                }
+                _ => {
+                    t.pushed += 1;
+                    format!("[{done}/{total}] ✓ {name} (done)")
+                }
+            },
+            _ => {
+                t.failed += 1;
+                failure_line(done, total, name, &call)
+            }
+        };
+        emit(&line);
+    })
+    .await;
+    t
 }
 
 async fn handle_proxy(cmd: ProxyCmd, provider: &dyn Provider, cfg: &Config, yes: bool) -> Result<()> {
@@ -3210,7 +3341,45 @@ async fn enrich_best_effort(
     }
 }
 
-async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bool) -> Result<()> {
+/// `pods list`'s GPU probe: `nvidia-smi` on every pod with an endpoint, concurrently over
+/// `remote` (5s connect timeout, the whole probe within `PROBE_TIMEOUT` — see
+/// `metrics::fetch_with`), so a wedged pod costs the listing at most that budget. Where a
+/// pod answers, what the machine itself sees overrides the provider-reported GPU (type and
+/// count); one that doesn't keeps what the provider said.
+async fn probe_gpus(remote: &Arc<dyn Remote>, cfg: &Config, pods: &mut [arena_core::Pod]) {
+    use arena_core::metrics::{self, ProbeOpts};
+    let mut jobs = Vec::new();
+    for pod in pods.iter() {
+        if let Ok(mut t) = SshTarget::from_pod(pod, cfg) {
+            t.connect_timeout_secs = 5;
+            let remote = remote.clone();
+            let probe = async move { metrics::fetch_with(remote.as_ref(), &t, &ProbeOpts::default()).await };
+            jobs.push((pod.name.clone(), probe));
+        }
+    }
+    let mut gpus = std::collections::HashMap::new();
+    each_pod(jobs, |_, _, name, probed| {
+        if let Some((g, n)) = probed.ok().and_then(|m| m.gpu_summary().map(|g| (g, m.gpus.len() as u32))) {
+            gpus.insert(name.to_string(), (g, n));
+        }
+    })
+    .await;
+    for p in pods.iter_mut() {
+        if let Some((g, n)) = gpus.get(&p.name) {
+            p.gpu_type = Some(g.clone());
+            p.gpu_count = Some(*n);
+        }
+    }
+}
+
+async fn handle_pods(
+    cmd: PodCmd,
+    provider: &dyn Provider,
+    // How we reach pods (one for the whole command): `SshRemote` for real, `FakeRemote` in tests.
+    remote: Arc<dyn Remote>,
+    cfg: &Config,
+    yes: bool,
+) -> Result<()> {
     match cmd {
         PodCmd::List { json, probe, no_probe } => {
             // Fleet view across every configured provider (the aggregate provider), so
@@ -3227,33 +3396,8 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             // asked. `--no-probe` always wins.
             let probe = !no_probe && (probe || !json);
             if probe {
-                // nvidia-smi over SSH (same source as the TUI), concurrently across the
-                // fleet. When a pod answers, what the machine itself sees overrides the
-                // provider-reported GPU (type and count).
-                use arena_core::metrics::{self, ProbeOpts};
-                use arena_core::ssh::SshTarget;
-                let mut set = tokio::task::JoinSet::new();
-                for pod in &pods {
-                    if let Ok(mut t) = SshTarget::from_pod(pod, cfg) {
-                        t.connect_timeout_secs = 5;
-                        let name = pod.name.clone();
-                        set.spawn(async move { (name, metrics::fetch(&t, &ProbeOpts::default()).await) });
-                    }
-                }
-                let mut gpus = std::collections::HashMap::new();
-                while let Some(joined) = set.join_next().await {
-                    if let Ok((name, m)) = joined {
-                        if let Some(g) = m.gpu_summary() {
-                            gpus.insert(name, (g, m.gpus.len() as u32));
-                        }
-                    }
-                }
-                for p in &mut pods {
-                    if let Some((g, n)) = gpus.get(&p.name) {
-                        p.gpu_type = Some(g.clone());
-                        p.gpu_count = Some(*n);
-                    }
-                }
+                // nvidia-smi over SSH (same source as the TUI), concurrently, bounded per pod.
+                probe_gpus(&remote, cfg, &mut pods).await;
             }
             if json {
                 println!("{}", serde_json::to_string_pretty(&pods)?);
@@ -3476,8 +3620,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             } else {
                 println!("\nProvisioning the new pod(s) over SSH…");
                 let new: Vec<String> = created.iter().map(|p| p.name.clone()).collect();
-                let remote = std::sync::Arc::new(arena_core::remote::SshRemote);
-                handle_setup(provider, remote, cfg, true, false, None, None, false, setup_timeouts, Some(&new), KEYS_DIR)
+                handle_setup(provider, remote.clone(), cfg, true, false, None, None, false, setup_timeouts, Some(&new), KEYS_DIR)
                     .await
             };
             // Final state: one more merge from a fresh listing (an endpoint can move while
@@ -3541,7 +3684,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
 
 
         PodCmd::InitBranches { week, day, dry_run } => {
-            handle_init_branches(provider, cfg, week, day, dry_run, yes).await?;
+            handle_init_branches(provider, remote, cfg, week, day, dry_run, yes).await?;
         }
 
         PodCmd::Pull { label, dir, max_size, remote_path, no_git, no_big, dry_run } => {
@@ -3552,13 +3695,13 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
         PodCmd::CopyKeys { target, keys_dir, hf_token, cc_token, include, exclude, dry_run } => {
             // Positional targets are a friendlier spelling of --include; merge the two.
             let include: Vec<String> = include.into_iter().chain(target).collect();
-            let remote = std::sync::Arc::new(arena_core::remote::SshRemote);
             handle_copy_keys(provider, remote, cfg, &keys_dir, hf_token, cc_token, &include, &exclude, dry_run, yes)
                 .await?;
         }
 
         PodCmd::Cp { file, dest, recursive, include, exclude, dry_run } => {
-            handle_copy(provider, cfg, &file, dest.as_deref(), recursive, &include, &exclude, dry_run, yes).await?;
+            handle_copy(provider, remote, cfg, &file, dest.as_deref(), recursive, &include, &exclude, dry_run, yes)
+                .await?;
         }
 
         PodCmd::Restart { target, dry_run } => {
@@ -3585,16 +3728,16 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
 
         PodCmd::Replace { target, gpu, gpus, cloud, disk, volume, image, keep_old, skip_proxy, dry_run } => {
             let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap: false };
-            handle_replace(cfg, &target, &ov, keep_old, skip_proxy, dry_run, yes).await?;
+            handle_replace(remote, cfg, &target, &ov, keep_old, skip_proxy, dry_run, yes).await?;
         }
 
         PodCmd::Migrate { cmd } => match cmd {
             MigrateCmd::Copy { target, gpu, gpus, cloud, disk, volume, image, bootstrap, dry_run } => {
                 let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap };
-                handle_migrate_copy(cfg, &target, &ov, dry_run, yes).await?;
+                handle_migrate_copy(remote, cfg, &target, &ov, dry_run, yes).await?;
             }
             MigrateCmd::Cutover { target, yes: y, skip_proxy, dry_run } => {
-                handle_migrate_cutover(cfg, &target, skip_proxy, dry_run, yes || y).await?;
+                handle_migrate_cutover(remote.as_ref(), cfg, &target, skip_proxy, dry_run, yes || y).await?;
             }
             MigrateCmd::Finish { target, yes: y, dry_run } => {
                 handle_migrate_finish(cfg, &target, dry_run, yes || y).await?;
@@ -3698,7 +3841,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             // INDEPENDENT of git, so a git failure on one pod (e.g. a missing repo, or a pod
             // sitting on main) must NOT skip the rsync for the whole fleet. Capture the git
             // result, always run the pull, then surface the git error at the end.
-            let git_result = handle_backup(provider, cfg, !dry_run, message, target.as_deref()).await;
+            let git_result = handle_backup(provider, remote, cfg, !dry_run, message, target.as_deref()).await;
             if !no_pull {
                 println!();
                 let dir = local_backup_dir(cfg);
@@ -3733,7 +3876,7 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             }
             handle_setup(
                 provider,
-                std::sync::Arc::new(arena_core::remote::SshRemote),
+                remote,
                 cfg,
                 !dry_run,
                 force,
@@ -3747,18 +3890,21 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             .await?;
         }
         PodCmd::SetBranch { branch, target, all, hard, dry_run } => {
-            handle_set_branch(provider, cfg, &branch, target.as_deref(), all, hard, dry_run, yes).await?;
+            handle_set_branch(provider, remote, cfg, &branch, target.as_deref(), all, hard, dry_run, yes).await?;
         }
-        PodCmd::Run { command, dry_run } => {
+        PodCmd::Run { command, timeout, dry_run } => {
             let cmd = command.join(" ");
-            handle_run(provider, cfg, &cmd, dry_run, yes, /*confirm*/ true, /*compact*/ false).await?;
+            let budget = Duration::from_secs(timeout);
+            handle_run(provider, remote, cfg, &cmd, budget, dry_run, yes, /*confirm*/ true, /*compact*/ false).await?;
         }
         PodCmd::Test => {
             // Read-only: no confirm, compact one-line-per-pod output.
             handle_run(
                 provider,
+                remote,
                 cfg,
                 "python -c 'import torch; print(torch.__version__)' 2>&1 || python3 -c 'import torch; print(torch.__version__)'",
+                TEST_TIMEOUT,
                 false,
                 yes,
                 false,
@@ -3770,20 +3916,23 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
     Ok(())
 }
 
-/// Run `cmd` on every pod with an SSH endpoint, concurrently. `compact` prints one line
+/// Run `cmd` on every pod with an SSH endpoint, concurrently, each pod within `timeout`
+/// (a pod that runs over is a failure; the others carry on). `compact` prints one line
 /// per pod (last stdout line); otherwise a per-pod block. `confirm_needed` gates it
 /// behind the y/N prompt (arbitrary exec); read-only checks pass false.
+#[allow(clippy::too_many_arguments)]
 async fn handle_run(
     provider: &dyn Provider,
+    // How we reach pods: `SshRemote` for real, `FakeRemote` in tests.
+    remote: Arc<dyn Remote>,
     cfg: &Config,
     cmd: &str,
+    timeout: Duration,
     dry_run: bool,
     yes: bool,
     confirm_needed: bool,
     compact: bool,
 ) -> Result<()> {
-    use arena_core::ssh::{self, SshTarget};
-
     let pods = provider.list_pods().await.context("listing pods")?;
     let mut targets: Vec<(String, SshTarget)> = Vec::new();
     for pod in &pods {
@@ -3804,10 +3953,14 @@ async fn handle_run(
     // participants' `arena-env` (python/packages) and the token exports from setup.
     // `CONDA_ENV=""` in config disables activation (still sources the rc for tokens).
     let conda_env = cfg.get("CONDA_ENV").unwrap_or("arena-env");
-    let remote = ssh::login_shell_wrap(cmd, Some(conda_env));
+    let remote_cmd = arena_core::ssh::login_shell_wrap(cmd, Some(conda_env));
 
     if dry_run {
-        println!("[dry-run] would run on {} pod(s):\n  {remote}", targets.len());
+        println!(
+            "[dry-run] would run on {} pod(s) ({}s budget each):\n  {remote_cmd}",
+            targets.len(),
+            timeout.as_secs()
+        );
         return Ok(());
     }
     if confirm_needed && !confirm(yes, &format!("Run `{cmd}` on {} pod(s) over SSH.", targets.len()))? {
@@ -3815,51 +3968,11 @@ async fn handle_run(
         return Ok(());
     }
 
-    let mut set = tokio::task::JoinSet::new();
-    for (name, t) in targets {
-        let remote = remote.clone();
-        set.spawn(async move { (name, ssh::run(&t, &remote).await) });
+    let results = run_fleet(&remote, targets, &remote_cmd, timeout).await;
+    let (lines, bad) = render_run(&results, compact);
+    for line in lines {
+        println!("{line}");
     }
-    let mut results: Vec<(String, String, bool)> = Vec::new();
-    while let Some(joined) = set.join_next().await {
-        match joined {
-            Ok((name, res)) => {
-                // a no-PTY shell can emit harmless job-control chatter; strip it.
-                let (text, ok) = match res {
-                    Ok(out) if out.success => {
-                        (ssh::strip_interactive_noise(out.stdout.trim()).trim().to_string(), true)
-                    }
-                    Ok(out) => (
-                        format!(
-                            "exit {:?}: {}",
-                            out.code,
-                            ssh::strip_interactive_noise(out.stderr.trim()).trim()
-                        ),
-                        false,
-                    ),
-                    Err(e) => (e.to_string(), false),
-                };
-                results.push((name, text, ok));
-            }
-            // A panicked/cancelled task must count as a failure, not vanish from the tally.
-            Err(e) => results.push(("?".to_string(), format!("task did not complete: {e}"), false)),
-        }
-    }
-    results.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let (mut ok, mut bad) = (0, 0);
-    for (name, text, success) in &results {
-        if *success { ok += 1 } else { bad += 1 }
-        if compact {
-            let line = text.lines().last().unwrap_or("").trim();
-            let shown = if *success { line.to_string() } else { format!("✗ {line}") };
-            println!("{name:<22} {shown}");
-        } else {
-            println!("\n── {name} {}", if *success { "" } else { "(FAILED)" });
-            println!("{text}");
-        }
-    }
-    println!("\n{ok} ok, {bad} failed");
     // Propagate partial failure to the exit code, like the mutating sibling handlers — so
     // a scripted `pods test` / `pods run` can't pass while the command failed on pods.
     if bad > 0 {
@@ -3868,12 +3981,77 @@ async fn handle_run(
     Ok(())
 }
 
+/// One pod's `pods run` / `pods test` outcome: its output (or why it failed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunResult {
+    name: String,
+    text: String,
+    ok: bool,
+}
+
+/// Run `remote_cmd` on every target concurrently over `remote`, each within `timeout`;
+/// results sorted by pod name. A non-zero exit, a timeout (`timed out after Ns`) or a
+/// crashed task is a failed result — never dropped from the tally.
+async fn run_fleet(
+    remote: &Arc<dyn Remote>,
+    targets: Vec<(String, SshTarget)>,
+    remote_cmd: &str,
+    timeout: Duration,
+) -> Vec<RunResult> {
+    use arena_core::ssh::strip_interactive_noise;
+    let jobs = targets.into_iter().map(|(name, t)| (name, t, remote_cmd.to_string())).collect();
+    let mut results = Vec::new();
+    exec_each_pod(remote, jobs, timeout, |_, _, name, call| {
+        // a no-PTY shell can emit harmless job-control chatter; strip it.
+        let (text, ok) = match call {
+            Ok(out) if out.success => (strip_interactive_noise(out.stdout.trim()).trim().to_string(), true),
+            Ok(out) => {
+                (format!("exit {:?}: {}", out.code, strip_interactive_noise(out.stderr.trim()).trim()), false)
+            }
+            Err(why) => (why, false),
+        };
+        results.push(RunResult { name: name.to_string(), text, ok });
+    })
+    .await;
+    results.sort_by(|a, b| a.name.cmp(&b.name));
+    results
+}
+
+/// The `pods run` / `pods test` report: `compact` = one `<name>  <last line>` row per pod
+/// (`✗ <why>` on failure, e.g. `✗ timed out after 90s`), else a `── <name>` block with the
+/// full output; then the `N ok, M failed` tally. Returns the lines and the failure count.
+/// Pure, so per-pod reporting is tested without a terminal.
+fn render_run(results: &[RunResult], compact: bool) -> (Vec<String>, usize) {
+    let (mut lines, mut ok, mut bad) = (Vec::new(), 0, 0);
+    for r in results {
+        if r.ok {
+            ok += 1
+        } else {
+            bad += 1
+        }
+        if compact {
+            let line = r.text.lines().last().unwrap_or("").trim();
+            let shown = if r.ok { line.to_string() } else { format!("✗ {line}") };
+            lines.push(format!("{:<22} {shown}", r.name));
+        } else {
+            lines.push(format!("\n── {} {}", r.name, if r.ok { "" } else { "(FAILED)" }));
+            lines.push(r.text.clone());
+        }
+    }
+    lines.push(format!("\n{ok} ok, {bad} failed"));
+    (lines, bad)
+}
+
 /// Switch one pod (or, with `all`, every pod with an SSH endpoint) to `branch` over SSH.
 /// Gentle (fetch+checkout+ff-pull) by default; `hard` force-resets to `origin/<branch>`,
-/// discarding local commits/changes. Dry-run prints the exact command per pod.
+/// discarding local commits/changes. Dry-run prints the exact command per pod. Pods run
+/// concurrently, each within [`BRANCH_TIMEOUT`] (it used to be serial, so one wedged pod
+/// held up every pod after it).
 #[allow(clippy::too_many_arguments)]
 async fn handle_set_branch(
     provider: &dyn Provider,
+    // How we reach pods: `SshRemote` for real, `FakeRemote` in tests.
+    remote: Arc<dyn Remote>,
     cfg: &Config,
     branch: &str,
     target: Option<&str>,
@@ -3882,8 +4060,6 @@ async fn handle_set_branch(
     dry_run: bool,
     yes: bool,
 ) -> Result<()> {
-    use arena_core::ssh::{self, SshTarget};
-
     let repo_path = cfg.get("BACKUP_REPO_PATH").map(String::from).unwrap_or_else(|| {
         format!("/root/{}", cfg.get("ARENA_REPO_NAME").unwrap_or("ARENA_materials"))
     });
@@ -3934,24 +4110,22 @@ async fn handle_set_branch(
         return Ok(());
     }
 
+    let total = targets.len();
+    println!("Switching {total} pod(s) to '{branch}' over SSH ({}s budget each)…", BRANCH_TIMEOUT.as_secs());
+    let jobs = targets.into_iter().map(|(name, t)| (name, t, cmd.clone())).collect();
     let (mut ok, mut failed) = (0, 0);
-    for (name, t) in &targets {
-        match ssh::run(t, &cmd).await {
-            Ok(out) if out.success => {
-                println!("[on {branch}]  {name}");
-                ok += 1;
-            }
-            Ok(out) => {
-                eprintln!("[FAILED]  {name}: {}", out.stderr.trim());
-                failed += 1;
-            }
-            Err(e) => {
-                eprintln!("[FAILED]  {name}: {e}");
-                failed += 1;
-            }
+    exec_each_pod(&remote, jobs, BRANCH_TIMEOUT, |done, total, name, call| match &call {
+        Ok(out) if out.success => {
+            println!("[{done}/{total}] ✓ {name} (on {branch})");
+            ok += 1;
         }
-    }
-    println!("\nswitched {ok}/{}", ok + failed);
+        _ => {
+            println!("{}", failure_line(done, total, name, &call));
+            failed += 1;
+        }
+    })
+    .await;
+    println!("\nswitched {ok}/{total}");
     if failed > 0 {
         anyhow::bail!("{failed} pod(s) failed to switch branch");
     }
@@ -4268,8 +4442,9 @@ async fn resolve_migration(
 /// port (`starting_port + its index in MACHINE_NAME_LIST`), SSHes to `proxy_host:port`, and
 /// confirms the pod answering is the expected one (RUNPOD_POD_ID via /proc/1/environ). This
 /// is the cutover's safety gate — a swap that leaves the proxy pointing at an unreachable or
-/// wrong pod is exactly what broke a participant before.
-async fn proxy_reaches_pod(cfg: &Config, name: &str, expected_id: &str) -> Result<bool> {
+/// wrong pod is exactly what broke a participant before. A quick probe (`PROBE_TIMEOUT`):
+/// the caller retries while nginx settles, so a hung attempt must not stall that loop.
+async fn proxy_reaches_pod(remote: &dyn Remote, cfg: &Config, name: &str, expected_id: &str) -> Result<bool> {
     let px = arena_core::proxy::ProxyConfig::from_config(cfg)?;
     let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
     let idx = cfg
@@ -4288,7 +4463,7 @@ async fn proxy_reaches_pod(cfg: &Config, name: &str, expected_id: &str) -> Resul
         connect_timeout_secs: 15,
     };
     let probe = "tr '\\0' '\\n' < /proc/1/environ 2>/dev/null | sed -n 's/^RUNPOD_POD_ID=//p'";
-    match arena_core::ssh::run(&target, probe).await {
+    match remote.exec(&target, probe, Some(PROBE_TIMEOUT)).await {
         Ok(o) if o.success => {
             let got = o.stdout.trim();
             // FAIL CLOSED: require the pod's own RUNPOD_POD_ID to be present AND match. An
@@ -4305,6 +4480,8 @@ async fn proxy_reaches_pod(cfg: &Config, name: &str, expected_id: &str) -> Resul
 /// `migrate copy`: build + set up `<name>-new` (or reuse it) and sync `<name>`'s files onto
 /// it. No rename, no proxy — the participant keeps using `<name>` and can test the new pod.
 async fn handle_migrate_copy(
+    // How we reach pods: `SshRemote` for real, `FakeRemote` in tests.
+    remote: Arc<dyn Remote>,
     cfg: &Config,
     target: &str,
     ov: &SpecOverrides,
@@ -4368,19 +4545,18 @@ async fn handle_migrate_copy(
             .await
             .with_context(|| format!("{new_name} never stabilized"))?;
         println!("      provisioning {new_name}…");
-        let remote = std::sync::Arc::new(arena_core::remote::SshRemote);
         let only = [new_name.clone()];
-        handle_setup(owner.as_ref(), remote, cfg, true, false, None, None, false, setup_timeouts, Some(&only), KEYS_DIR)
+        handle_setup(owner.as_ref(), remote.clone(), cfg, true, false, None, None, false, setup_timeouts, Some(&only), KEYS_DIR)
             .await
             .with_context(|| format!("provisioning {new_name}"))?;
         created.id
     };
 
     println!("[3/3] syncing {canonical} → {new_name}…");
-    copy_pod_files(cfg, owner.as_ref(), &src_id, &new_id)
+    copy_pod_files(cfg, owner.as_ref(), remote.as_ref(), &src_id, &new_id)
         .await
         .with_context(|| format!("syncing {canonical} -> {new_name}"))?;
-    clean_marker(owner.as_ref(), &new_id, cfg).await;
+    clean_marker(owner.as_ref(), remote.as_ref(), &new_id, cfg).await;
 
     println!("\n✓ {new_name} is built and synced (participant still on {canonical}, untouched).");
     if let Ok(Some(p)) =
@@ -4400,13 +4576,14 @@ async fn handle_migrate_copy(
 /// `migrate cutover`: final delta sync, swap names, re-point + VERIFY the proxy, auto-revert
 /// if the new pod isn't reachable through the proxy. Keeps `<name>-old`.
 async fn handle_migrate_cutover(
+    // How we reach pods: `SshRemote` for real, `FakeRemote` in tests.
+    remote: &dyn Remote,
     cfg: &Config,
     target: &str,
     skip_proxy: bool,
     dry_run: bool,
     yes: bool,
 ) -> Result<()> {
-    use arena_core::ssh;
     let (owner, canonical, pods) = resolve_migration(cfg, target).await?;
     let new_name = format!("{canonical}-new");
     let old_name = format!("{canonical}-old");
@@ -4448,12 +4625,12 @@ async fn handle_migrate_cutover(
 
     // 1. final delta sync + verify it landed.
     println!("[1/4] final delta sync {canonical} → {new_name}…");
-    copy_pod_files(cfg, owner.as_ref(), &src_id, &new_id)
+    copy_pod_files(cfg, owner.as_ref(), remote, &src_id, &new_id)
         .await
         .with_context(|| format!("final sync {canonical} -> {new_name}"))?;
-    clean_marker(owner.as_ref(), &new_id, cfg).await;
+    clean_marker(owner.as_ref(), remote, &new_id, cfg).await;
     println!("[2/4] verifying {new_name} health…");
-    verify_replacement(owner.as_ref(), &new_id, cfg).await?;
+    verify_replacement(owner.as_ref(), remote, &new_id, cfg).await?;
 
     // 3. swap names (old-first so the canonical name is never on two pods).
     println!("[3/4] swapping names…");
@@ -4472,11 +4649,9 @@ async fn handle_migrate_cutover(
     let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
     let short = canonical.strip_prefix(&format!("{prefix}-")).unwrap_or(&canonical);
     if let Ok(t) = fresh_target(owner.as_ref(), &new_id, cfg).await {
-        let _ = ssh::run(
-            &t,
-            &format!("printf %s {} > \"$HOME/.name\"", shell_quote(&format!("export MACHINE_NAME='{short}'"))),
-        )
-        .await;
+        let name_cmd =
+            format!("printf %s {} > \"$HOME/.name\"", shell_quote(&format!("export MACHINE_NAME='{short}'")));
+        let _ = remote.exec(&t, &name_cmd, Some(PROBE_TIMEOUT)).await;
     }
 
     // 4. proxy apply + verify through the proxy; auto-revert on failure.
@@ -4500,7 +4675,7 @@ async fn handle_migrate_cutover(
         let mut reached = false;
         for attempt in 1..=settle_tries {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-            if proxy_reaches_pod(cfg, &canonical, &new_id).await.unwrap_or(false) {
+            if proxy_reaches_pod(remote, cfg, &canonical, &new_id).await.unwrap_or(false) {
                 reached = true;
                 println!("      ✓ {canonical} reachable through the proxy on the new pod (after ~{}s).", attempt * 3);
                 break;
@@ -4646,7 +4821,10 @@ async fn handle_migrate_status(cfg: &Config, target: &str) -> Result<()> {
 /// Ordering is chosen so nothing is destroyed until the replacement is built **and**
 /// verified, and there's a manual gate right before the swap. The swap renames old-first so
 /// two pods never share the canonical name; if the promote fails it rolls back.
+#[allow(clippy::too_many_arguments)]
 async fn handle_replace(
+    // How we reach pods: `SshRemote` for real, `FakeRemote` in tests.
+    remote: Arc<dyn Remote>,
     cfg: &Config,
     target: &str,
     ov: &SpecOverrides,
@@ -4655,7 +4833,6 @@ async fn handle_replace(
     dry_run: bool,
     yes: bool,
 ) -> Result<()> {
-    use arena_core::ssh;
     // Setup runs after the create (step 3/7): a malformed SETUP_TIMEOUT_SECS must fail
     // now, before anything is created (and billed) — not after the new pod has come up,
     // which would strand a `-new` pod that also blocks a re-run. Dry-runs check it too.
@@ -4771,18 +4948,17 @@ async fn handle_replace(
     let mut persisted = false;
     for attempt in 1..=copy_attempts {
         println!("[3/7] provisioning {new_name}… (attempt {attempt}/{copy_attempts})");
-        let remote = std::sync::Arc::new(arena_core::remote::SshRemote);
         let only = [new_name.clone()];
-        handle_setup(owner.as_ref(), remote, cfg, true, false, None, None, false, setup_timeouts, Some(&only), KEYS_DIR)
+        handle_setup(owner.as_ref(), remote.clone(), cfg, true, false, None, None, false, setup_timeouts, Some(&only), KEYS_DIR)
             .await
             .with_context(|| format!("provisioning {new_name}"))?;
         println!("[4/7] copying {canonical} → {new_name} (excludes caches, HF models, .claude, .ssh, shell-rc keys)…");
-        copy_pod_files(cfg, owner.as_ref(), &src_id, &created.id)
+        copy_pod_files(cfg, owner.as_ref(), remote.as_ref(), &src_id, &created.id)
             .await
             .with_context(|| format!("copying {canonical} -> {new_name}"))?;
         println!("[5/7] confirming the copy persists (~90s — pods can reset while still settling)…");
         tokio::time::sleep(std::time::Duration::from_secs(90)).await;
-        if marker_present(owner.as_ref(), &created.id, cfg).await {
+        if marker_present(owner.as_ref(), remote.as_ref(), &created.id, cfg).await {
             persisted = true;
             break;
         }
@@ -4796,11 +4972,11 @@ async fn handle_replace(
              less contended, or terminate {new_name} with `arena pods terminate {new_name}`."
         );
     }
-    clean_marker(owner.as_ref(), &created.id, cfg).await;
+    clean_marker(owner.as_ref(), remote.as_ref(), &created.id, cfg).await;
 
     // Health check before the swap (re-resolves the endpoint fresh and retries).
     println!("      verifying health of {new_name}…");
-    verify_replacement(owner.as_ref(), &created.id, cfg)
+    verify_replacement(owner.as_ref(), remote.as_ref(), &created.id, cfg)
         .await
         .with_context(|| format!("verifying {new_name}"))?;
 
@@ -4848,8 +5024,8 @@ async fn handle_replace(
     let dotname = format!("export MACHINE_NAME='{short}'");
     let name_cmd = format!("printf %s {} > \"$HOME/.name\"", shell_quote(&dotname));
     let name_written = match wait_for_endpoint(owner.as_ref(), &created.id, 60).await {
-        Ok(p) => match ssh::SshTarget::from_pod(&p, cfg) {
-            Ok(t) => ssh::run(&t, &name_cmd).await.map(|o| o.success).unwrap_or(false),
+        Ok(p) => match SshTarget::from_pod(&p, cfg) {
+            Ok(t) => remote.exec(&t, &name_cmd, Some(PROBE_TIMEOUT)).await.map(|o| o.success).unwrap_or(false),
             Err(_) => false,
         },
         Err(_) => false,
@@ -4981,8 +5157,9 @@ fn copy_marker_token(dest_id: &str) -> String {
 /// Is the copy marker present on pod `dest_id` *with the right token, on the right pod*?
 /// Re-resolves the endpoint fresh, confirms identity via `RUNPOD_POD_ID` (from
 /// `/proc/1/environ` — it's not in the non-interactive ssh env but is in PID 1's), and reads
-/// the marker. Any failure (unreachable, wrong recycled-port pod, marker gone) → false.
-async fn marker_present(provider: &dyn Provider, dest_id: &str, cfg: &Config) -> bool {
+/// the marker. Any failure (unreachable, wrong recycled-port pod, marker gone, a probe that
+/// ran out of its `PROBE_TIMEOUT`) → false.
+async fn marker_present(provider: &dyn Provider, remote: &dyn Remote, dest_id: &str, cfg: &Config) -> bool {
     let token = copy_marker_token(dest_id);
     let Ok(target) = fresh_target(provider, dest_id, cfg).await else { return false };
     let probe = format!(
@@ -4991,7 +5168,7 @@ async fn marker_present(provider: &dyn Provider, dest_id: &str, cfg: &Config) ->
          \"$(cat \"{}\" 2>/dev/null)\"",
         copy_marker_path()
     );
-    let Ok(o) = arena_core::ssh::run(&target, &probe).await else { return false };
+    let Ok(o) = remote.exec(&target, &probe, Some(PROBE_TIMEOUT)).await else { return false };
     if !o.success {
         return false;
     }
@@ -5012,7 +5189,9 @@ async fn marker_present(provider: &dyn Provider, dest_id: &str, cfg: &Config) ->
 /// PID 1's env). On RunPod, fail closed: a mismatch/empty means a recycled ip:port reached a
 /// DIFFERENT pod, so we must not read from / write to it. Non-RunPod providers (no such id)
 /// pass. Used to identity-check the SOURCE before copying (the dest is checked separately).
+/// A probe that times out (`PROBE_TIMEOUT`) is "couldn't confirm" → false.
 async fn target_is_pod(
+    remote: &dyn Remote,
     target: &arena_core::ssh::SshTarget,
     expected_id: &str,
     provider: &dyn Provider,
@@ -5021,13 +5200,13 @@ async fn target_is_pod(
         return true;
     }
     let probe = "tr '\\0' '\\n' < /proc/1/environ 2>/dev/null | sed -n 's/^RUNPOD_POD_ID=//p'";
-    matches!(arena_core::ssh::run(target, probe).await, Ok(o) if o.success && o.stdout.trim() == expected_id)
+    matches!(remote.exec(target, probe, Some(PROBE_TIMEOUT)).await, Ok(o) if o.success && o.stdout.trim() == expected_id)
 }
 
 /// Best-effort removal of the copy marker from a pod.
-async fn clean_marker(provider: &dyn Provider, dest_id: &str, cfg: &Config) {
+async fn clean_marker(provider: &dyn Provider, remote: &dyn Remote, dest_id: &str, cfg: &Config) {
     if let Ok(t) = fresh_target(provider, dest_id, cfg).await {
-        let _ = arena_core::ssh::run(&t, &format!("rm -f \"{}\"", copy_marker_path())).await;
+        let _ = remote.exec(&t, &format!("rm -f \"{}\"", copy_marker_path()), Some(PROBE_TIMEOUT)).await;
     }
 }
 
@@ -5090,14 +5269,18 @@ async fn wait_for_stable_endpoint(
 /// 2. **Delivery is verified, not assumed** — a marker is planted on the source, carried by
 ///    the copy, and read back from a freshly-resolved dest. A push that "succeeded" against
 ///    a stale endpoint fails this check, so we never swap in a pod that didn't get the data.
+///
+/// The probes and the direct copy go through `remote`, each with a budget (the copy gets
+/// [`POD_COPY_TIMEOUT`]). The via-local fallback spawns `rsync` itself ([`run_rsync`]):
+/// rsync runs its own ssh transport, which is neither a `Remote` exec nor a copy.
 async fn copy_pod_files(
     cfg: &Config,
     provider: &dyn Provider,
+    remote: &dyn Remote,
     src_id: &str,
     dest_id: &str,
 ) -> Result<()> {
     use arena_core::pull::{self, PullConfig};
-    use arena_core::ssh;
     let pc = PullConfig::replication();
     let remote_key = cfg.get("GIT_SSH_KEY_REMOTE").unwrap_or("/root/.ssh/id_ed25519").to_string();
     let user = cfg.get("SSH_USER").unwrap_or("root").to_string();
@@ -5111,13 +5294,15 @@ async fn copy_pod_files(
     // Identity-check the SOURCE before reading from it: if its ip:port was reassigned to a
     // different pod, we'd otherwise copy a STRANGER's home onto the new pod (and the dest
     // marker check would still pass, since the marker rides along). Fail closed.
-    if !target_is_pod(&src_target, src_id, provider).await {
+    if !target_is_pod(remote, &src_target, src_id, provider).await {
         anyhow::bail!(
             "source {src_id}'s SSH endpoint doesn't resolve to that pod (its ip:port was likely \
              reassigned to a different pod) — refusing to copy from the wrong pod. Re-run."
         );
     }
-    ssh::run(&src_target, &format!("printf %s {} > \"{marker}\"", shell_quote(&token)))
+    let unmark = format!("rm -f \"{marker}\"");
+    remote
+        .exec(&src_target, &format!("printf %s {} > \"{marker}\"", shell_quote(&token)), Some(PROBE_TIMEOUT))
         .await
         .context("planting copy marker on source")?;
 
@@ -5130,7 +5315,21 @@ async fn copy_pod_files(
         &remote_key,
         &pc,
     );
-    let direct_ok = matches!(ssh::run(&src_target, &direct).await, Ok(o) if o.success);
+    let direct_ok = match remote.exec(&src_target, &direct, Some(POD_COPY_TIMEOUT)).await {
+        Ok(o) => o.success,
+        // A copy that ran out of its budget was under way (a missing pod-to-pod key fails at
+        // once), so the via-local fallback would only repeat it, slower: stop here instead.
+        // Nothing has been swapped, and rsync is incremental — a re-run continues from here.
+        Err(e @ arena_core::Error::Timeout { .. }) => {
+            let _ = remote.exec(&src_target, &unmark, Some(PROBE_TIMEOUT)).await;
+            anyhow::bail!(
+                "direct pod-to-pod copy {} — NOT swapping; the original is untouched. Re-run to \
+                 continue (rsync picks up where it stopped).",
+                describe_error(&e)
+            );
+        }
+        Err(_) => false,
+    };
     if direct_ok {
         println!("      copied (direct pod-to-pod)");
     } else {
@@ -5142,7 +5341,7 @@ async fn copy_pod_files(
             .with_context(|| format!("creating staging dir {}", stage.display()))?;
         let stage_s = format!("{}/", stage.to_string_lossy());
         let src_target = fresh_target(provider, src_id, cfg).await?;
-        if !target_is_pod(&src_target, src_id, provider).await {
+        if !target_is_pod(remote, &src_target, src_id, provider).await {
             anyhow::bail!(
                 "source {src_id}'s endpoint resolved to a different pod before the pull — \
                  refusing to copy the wrong pod's data. Re-run."
@@ -5157,9 +5356,9 @@ async fn copy_pod_files(
     // Verify the data actually landed on the RIGHT pod (identity + marker). `marker_present`
     // re-resolves the endpoint fresh and confirms `RUNPOD_POD_ID` matches, so a push that
     // "succeeded" against a since-reassigned port (a different pod) is caught.
-    let landed = marker_present(provider, dest_id, cfg).await;
+    let landed = marker_present(provider, remote, dest_id, cfg).await;
     // Clean the SOURCE marker now; leave the DEST marker for the caller's persistence re-check.
-    let _ = ssh::run(&src_target, &format!("rm -f \"{marker}\"")).await;
+    let _ = remote.exec(&src_target, &unmark, Some(PROBE_TIMEOUT)).await;
     if !landed {
         anyhow::bail!(
             "copy verification failed — the data didn't reach the intended new pod ({dest_id}) \
@@ -5170,7 +5369,9 @@ async fn copy_pod_files(
     Ok(())
 }
 
-/// Spawn `rsync` with the given argv; error (with stderr) on a non-zero exit.
+/// Spawn `rsync` with the given argv; error (with stderr) on a non-zero exit. Deliberately
+/// not a [`Remote`] call (like `pods pull`'s rsyncs): rsync drives its own ssh transport
+/// (`-e`), so it is neither an exec nor a single-file copy — and it has no budget here.
 async fn run_rsync(args: &[String]) -> Result<()> {
     let out = tokio::process::Command::new("rsync")
         .args(args)
@@ -5190,7 +5391,7 @@ async fn run_rsync(args: &[String]) -> Result<()> {
 /// against a stale endpoint spuriously reads as "Permission denied". (A precise copied-size
 /// check is approximated by rsync's own success in `copy_pod_files`, plus the manual swap
 /// confirm; the post-swap `~/.name` write re-resolves its own endpoint.)
-async fn verify_replacement(provider: &dyn Provider, id: &str, cfg: &Config) -> Result<()> {
+async fn verify_replacement(provider: &dyn Provider, remote: &dyn Remote, id: &str, cfg: &Config) -> Result<()> {
     // A freshly-provisioned pod can take a while to settle into a stable SSH state (it may
     // restart once post-setup), so be patient: ~10 tries over ~100s, re-resolving each time.
     let attempts = 10;
@@ -5205,12 +5406,9 @@ async fn verify_replacement(provider: &dyn Provider, id: &str, cfg: &Config) -> 
             }
         };
         let target = arena_core::ssh::SshTarget::from_pod(&pod, cfg)?;
-        match arena_core::ssh::run(
-            &target,
-            "nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1; echo SSH_OK",
-        )
-        .await
-        {
+        let probe = "nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1; echo SSH_OK";
+        // A quick probe: a hung attempt counts as a failed one and the loop retries.
+        match remote.exec(&target, probe, Some(PROBE_TIMEOUT)).await {
             Ok(o) if o.success && o.stdout.contains("SSH_OK") => {
                 let gpu = o.stdout.lines().find(|l| !l.contains("SSH_OK")).unwrap_or("").trim();
                 println!("      ssh ok; gpu: {}", if gpu.is_empty() { "(none reported)" } else { gpu });
@@ -5299,14 +5497,14 @@ async fn select_pods(
 /// upstream, without committing — so a new day's branch exists before backups run.
 async fn handle_init_branches(
     provider: &dyn Provider,
+    // How we reach pods: `SshRemote` for real, `FakeRemote` in tests.
+    remote: Arc<dyn Remote>,
     cfg: &Config,
     week: Option<u32>,
     day: Option<u32>,
     dry_run: bool,
     yes: bool,
 ) -> Result<()> {
-    use arena_core::ssh::{self, SshTarget};
-
     let (week, day) = resolve_week_day(cfg, week, day)?;
     let bcfg = arena_core::backup::BackupConfig::from_config(cfg, week, day);
     println!("Iteration: w{week}d{day}\n");
@@ -5343,32 +5541,26 @@ async fn handle_init_branches(
     }
 
     let total = targets.len();
-    println!("Initializing branches on {total} pod(s) over SSH…");
-    let mut set = tokio::task::JoinSet::new();
-    for (name, target) in targets {
-        let cmd = arena_core::backup::init_branch_command(&bcfg, &name);
-        let branch = bcfg.branch_for(&name);
-        set.spawn(async move { (name, branch, ssh::run(&target, &cmd).await) });
-    }
-    let (mut ok, mut failed, mut done) = (0, 0, 0);
-    while let Some(joined) = set.join_next().await {
-        done += 1;
-        let Ok((name, branch, res)) = joined else { continue };
-        match res {
-            Ok(out) if out.success => {
-                println!("[{done}/{total}] ✓ {name} -> {branch}");
-                ok += 1;
-            }
-            Ok(out) => {
-                println!("[{done}/{total}] ✗ {name} (exit {:?}): {}", out.code, out.stderr.trim());
-                failed += 1;
-            }
-            Err(e) => {
-                println!("[{done}/{total}] ✗ {name}: {e}");
-                failed += 1;
-            }
+    println!("Initializing branches on {total} pod(s) over SSH ({}s budget each)…", BRANCH_TIMEOUT.as_secs());
+    let jobs = targets
+        .into_iter()
+        .map(|(name, target)| {
+            let cmd = arena_core::backup::init_branch_command(&bcfg, &name);
+            (name, target, cmd)
+        })
+        .collect();
+    let (mut ok, mut failed) = (0, 0);
+    exec_each_pod(&remote, jobs, BRANCH_TIMEOUT, |done, total, name, call| match &call {
+        Ok(out) if out.success => {
+            println!("[{done}/{total}] ✓ {name} -> {}", bcfg.branch_for(name));
+            ok += 1;
         }
-    }
+        _ => {
+            println!("{}", failure_line(done, total, name, &call));
+            failed += 1;
+        }
+    })
+    .await;
     println!("\nDone: {ok} initialized, {failed} failed.");
     if failed > 0 {
         anyhow::bail!("{failed} pod(s) failed to init branch");
@@ -5377,7 +5569,9 @@ async fn handle_init_branches(
 }
 
 /// `pods pull`: rsync each pod's home directory to `<dir>/<label>/<pod-name>/`. The file
-/// backup (legacy `backup.sh`), complementing the git autocommit `backup`.
+/// backup (legacy `backup.sh`), complementing the git autocommit `backup`. It spawns
+/// `rsync` itself rather than going through a [`Remote`]: rsync drives its own ssh
+/// transport (`-e`), which is neither an exec nor a single-file copy (and has no budget).
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
@@ -5608,10 +5802,13 @@ fn resolve_remote_dest(
 }
 
 /// `pods copy`: scp a local file to every (filtered) pod, creating the remote parent
-/// dir first. Destination per [`resolve_remote_dest`].
+/// dir first. Destination per [`resolve_remote_dest`]. Pods run concurrently, each step
+/// bounded (see [`copy_to_pod`]).
 #[allow(clippy::too_many_arguments)]
 async fn handle_copy(
     provider: &dyn Provider,
+    // How we reach pods: `SshRemote` for real, `FakeRemote` in tests.
+    remote_ssh: Arc<dyn Remote>,
     cfg: &Config,
     file: &std::path::Path,
     dest: Option<&str>,
@@ -5621,8 +5818,6 @@ async fn handle_copy(
     dry_run: bool,
     yes: bool,
 ) -> Result<()> {
-    use arena_core::ssh::{self, SshTarget};
-
     if recursive {
         if !file.exists() {
             anyhow::bail!("not found: {}", file.display());
@@ -5714,98 +5909,110 @@ async fn handle_copy(
     // For a single file we verify it actually landed afterward (scp can exit 0 without
     // writing what you intended — e.g. the dest already exists as a directory, so the
     // file lands *inside* it). Skipped for -r (the dest is a tree, not one file).
-    let expect_size = if recursive { None } else { std::fs::metadata(file).ok().map(|m| m.len()) };
-    let basename = file.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
-
-    let total = targets.len();
-    let mut set = tokio::task::JoinSet::new();
-    for (name, t) in targets {
-        let (local, remote, remote_parent, basename) =
-            (local.clone(), remote.clone(), remote_parent.clone(), basename.clone());
-        set.spawn(async move {
-            // Ensure the remote parent dir exists, then scp (with -r if recursive).
-            let mk = ssh::run(&t, &format!("mkdir -p {}", shell_quote(&remote_parent))).await;
-            match mk {
-                Ok(o) if o.success => {}
-                Ok(o) => return (name, Err(format!("mkdir failed: {}", o.stderr.trim().to_string()))),
-                Err(e) => return (name, Err(e.to_string())),
-            }
-            let mut args = t.scp_args(&local, &remote);
-            if recursive {
-                args.insert(0, "-r".to_string());
-            }
-            let out = tokio::process::Command::new("scp")
-                .args(&args)
-                .stdin(std::process::Stdio::null())
-                .output()
-                .await;
-            match out {
-                Ok(o) if o.status.success() => {}
-                Ok(o) => return (name, Err(String::from_utf8_lossy(&o.stderr).trim().to_string())),
-                Err(e) => return (name, Err(format!("spawning scp: {e}"))),
-            }
-            // Verify the single-file copy actually landed at the expected size. A `remote`
-            // ending in `/` means "into this dir" (intended → check <remote><basename>);
-            // otherwise `remote` should BE the file, and finding a directory there is a
-            // silent misplacement (scp dropped the file inside it) we flag rather than pass.
-            let res = if let Some(expected) = expect_size {
-                let into_dir = remote.ends_with('/');
-                let check = if into_dir {
-                    let final_path = format!("{remote}{basename}");
-                    format!(
-                        "f={f}; [ -f \"$f\" ] && echo \"OK $(wc -c < \"$f\" | tr -d ' ')\" || echo MISSING",
-                        f = shell_quote(&final_path),
-                    )
-                } else {
-                    format!(
-                        "f={r}; if [ -d \"$f\" ]; then echo MISPLACED; elif [ -f \"$f\" ]; then echo \"OK $(wc -c < \"$f\" | tr -d ' ')\"; else echo MISSING; fi",
-                        r = shell_quote(&remote),
-                    )
-                };
-                match ssh::run(&t, &check).await {
-                    Ok(o) if o.success => {
-                        let line = o.stdout.trim();
-                        if let Some(n) = line.strip_prefix("OK ") {
-                            match n.trim().parse::<u64>() {
-                                Ok(sz) if sz == expected => Ok(()),
-                                Ok(sz) => Err(format!("size mismatch after copy: {sz}B on pod vs {expected}B local (partial / clobbered)")),
-                                Err(_) => Ok(()), // couldn't parse size; don't false-fail
-                            }
-                        } else if line == "MISPLACED" {
-                            Err(format!("{remote} is a directory on the pod — the file landed *inside* it; pass an explicit file DEST or remove that dir"))
-                        } else {
-                            Err(format!("nothing at {remote} after scp (silent non-write)"))
-                        }
-                    }
-                    // If the verify probe itself can't run, don't override a successful scp.
-                    _ => Ok(()),
-                }
-            } else {
-                Ok(())
-            };
-            (name, res)
-        });
-    }
-    let (mut ok, mut failed, mut done) = (0, 0, 0);
-    while let Some(joined) = set.join_next().await {
-        done += 1;
-        let Ok((name, res)) = joined else { continue };
-        match res {
-            Ok(()) => {
-                println!("[{done}/{total}] ✓ {name}");
-                ok += 1;
-            }
-            Err(e) => {
-                println!("[{done}/{total}] ✗ {name}: {e}");
-                failed += 1;
-            }
+    let plan = Arc::new(CopyPlan {
+        expect_size: if recursive { None } else { std::fs::metadata(file).ok().map(|m| m.len()) },
+        basename: file.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string(),
+        local,
+        remote,
+        remote_parent,
+        recursive,
+    });
+    let jobs = targets
+        .into_iter()
+        .map(|(name, t)| {
+            let (remote_ssh, plan) = (remote_ssh.clone(), plan.clone());
+            (name, async move { copy_to_pod(remote_ssh.as_ref(), &t, &plan).await })
+        })
+        .collect();
+    let (mut ok, mut failed) = (0, 0);
+    each_pod(jobs, |done, total, name, result| match result.and_then(|copied| copied) {
+        Ok(()) => {
+            println!("[{done}/{total}] ✓ {name}");
+            ok += 1;
         }
-    }
+        Err(e) => {
+            println!("[{done}/{total}] ✗ {name}: {e}");
+            failed += 1;
+        }
+    })
+    .await;
     println!("\nDone: {ok} copied, {failed} failed.");
     if failed > 0 {
         anyhow::bail!("{failed} pod(s) failed to receive the file");
     }
     Ok(())
+}
+
+/// What `pods cp` copies where, and how it checks the copy landed — the same on every pod.
+struct CopyPlan {
+    local: String,
+    remote: String,
+    /// The remote dir to `mkdir -p` first.
+    remote_parent: String,
+    /// `-r`: copy a tree (`scp -r`); no size check.
+    recursive: bool,
+    /// A single file's local size, verified on the pod after the copy (`None` with `-r`).
+    expect_size: Option<u64>,
+    basename: String,
+}
+
+/// One pod's `pods cp`: `mkdir -p` the parent → scp (`-r` for a tree) → for a single file,
+/// verify it landed at the expected size. Stops at the first failure: no copy into a
+/// parent that couldn't be made, no check of a copy that failed. The mkdir and the check
+/// are quick probes (`PROBE_TIMEOUT`); the scp gets [`CP_TIMEOUT`].
+async fn copy_to_pod(remote: &dyn Remote, t: &SshTarget, plan: &CopyPlan) -> std::result::Result<(), String> {
+    let mkdir = format!("mkdir -p {}", shell_quote(&plan.remote_parent));
+    match remote.exec(t, &mkdir, Some(PROBE_TIMEOUT)).await {
+        Ok(o) if o.success => {}
+        Ok(o) => return Err(format!("mkdir failed: {}", o.stderr.trim())),
+        Err(e) => return Err(describe_error(&e)),
+    }
+    let copied = if plan.recursive {
+        remote.copy_recursive(t, &plan.local, &plan.remote, Some(CP_TIMEOUT)).await
+    } else {
+        remote.copy(t, &plan.local, &plan.remote, Some(CP_TIMEOUT)).await
+    };
+    match copied {
+        Ok(o) if o.success => {}
+        Ok(o) => return Err(o.stderr.trim().to_string()),
+        Err(e) => return Err(describe_error(&e)),
+    }
+    // Verify the single-file copy actually landed at the expected size. A `remote` ending
+    // in `/` means "into this dir" (intended → check <remote><basename>); otherwise
+    // `remote` should BE the file, and finding a directory there is a silent misplacement
+    // (scp dropped the file inside it) we flag rather than pass.
+    let Some(expected) = plan.expect_size else { return Ok(()) };
+    let remote_path = &plan.remote;
+    let check = if remote_path.ends_with('/') {
+        let final_path = format!("{remote_path}{}", plan.basename);
+        format!(
+            "f={f}; [ -f \"$f\" ] && echo \"OK $(wc -c < \"$f\" | tr -d ' ')\" || echo MISSING",
+            f = shell_quote(&final_path),
+        )
+    } else {
+        format!(
+            "f={r}; if [ -d \"$f\" ]; then echo MISPLACED; elif [ -f \"$f\" ]; then echo \"OK $(wc -c < \"$f\" | tr -d ' ')\"; else echo MISSING; fi",
+            r = shell_quote(remote_path),
+        )
+    };
+    match remote.exec(t, &check, Some(PROBE_TIMEOUT)).await {
+        Ok(o) if o.success => {
+            let line = o.stdout.trim();
+            if let Some(n) = line.strip_prefix("OK ") {
+                match n.trim().parse::<u64>() {
+                    Ok(sz) if sz == expected => Ok(()),
+                    Ok(sz) => Err(format!("size mismatch after copy: {sz}B on pod vs {expected}B local (partial / clobbered)")),
+                    Err(_) => Ok(()), // couldn't parse size; don't false-fail
+                }
+            } else if line == "MISPLACED" {
+                Err(format!("{remote_path} is a directory on the pod — the file landed *inside* it; pass an explicit file DEST or remove that dir"))
+            } else {
+                Err(format!("nothing at {remote_path} after scp (silent non-write)"))
+            }
+        }
+        // If the verify probe itself can't run (or times out), don't override a successful scp.
+        _ => Ok(()),
+    }
 }
 
 /// `pods copy-keys`: distribute API keys to each pod's shell. Per-host keys come from
@@ -6070,7 +6277,14 @@ fn ensure_cohort_keys_file(prefix: &str) -> Result<PathBuf> {
 /// the provisioning API. Secrets are saved to `keys/openrouter_api_keys.csv` (which
 /// `pods copy-keys` then distributes); rotation/revocation find a key by its name
 /// (`<prefix>-<machine>`), so no local hash bookkeeping is needed.
-async fn handle_keys(cmd: KeysCmd, provider: &dyn Provider, cfg: &Config, yes: bool) -> Result<()> {
+async fn handle_keys(
+    cmd: KeysCmd,
+    provider: &dyn Provider,
+    // How `--copy` reaches pods (via `copy-keys`): `SshRemote` for real.
+    remote: Arc<dyn Remote>,
+    cfg: &Config,
+    yes: bool,
+) -> Result<()> {
     use arena_core::openrouter::{key_name, OpenRouter};
 
     // `which` just reads the local CSV — no provisioning key / network needed.
@@ -6195,8 +6409,7 @@ async fn handle_keys(cmd: KeysCmd, provider: &dyn Provider, cfg: &Config, yes: b
             println!("\nGenerated {made}, skipped {skipped}, failed {failed} → {OPENROUTER_KEYS_CSV}");
             if copy && made > 0 {
                 println!();
-                let remote = std::sync::Arc::new(arena_core::remote::SshRemote);
-                handle_copy_keys(provider, remote, cfg, KEYS_DIR, None, None, &names, &[], false, yes).await?;
+                handle_copy_keys(provider, remote.clone(), cfg, KEYS_DIR, None, None, &names, &[], false, yes).await?;
             }
         }
 
@@ -6248,8 +6461,7 @@ async fn handle_keys(cmd: KeysCmd, provider: &dyn Provider, cfg: &Config, yes: b
             println!("\nRotated {ok}, failed {failed}.");
             if copy && ok > 0 {
                 println!();
-                let remote = std::sync::Arc::new(arena_core::remote::SshRemote);
-                handle_copy_keys(provider, remote, cfg, KEYS_DIR, None, None, &names, &[], false, yes).await?;
+                handle_copy_keys(provider, remote.clone(), cfg, KEYS_DIR, None, None, &names, &[], false, yes).await?;
             }
         }
 
@@ -6662,6 +6874,9 @@ mod setup_tests {
         async fn copy(&self, _: &SshTarget, _: &str, _: &str, _: Option<Duration>) -> Result<SshOutput> {
             panic!("boom")
         }
+        async fn copy_recursive(&self, _: &SshTarget, _: &str, _: &str, _: Option<Duration>) -> Result<SshOutput> {
+            panic!("boom")
+        }
     }
 
     #[tokio::test]
@@ -6810,9 +7025,12 @@ mod setup_tests {
         let cfg = setup_cfg("SETUP_TIMEOUT_SECS=5m");
         let ov = super::SpecOverrides::default();
         for dry_run in [true, false] {
-            let err = super::handle_replace(&cfg, "apple", &ov, false, true, dry_run, true).await.unwrap_err();
+            let fake = Arc::new(FakeRemote::new());
+            let err =
+                super::handle_replace(fake.clone(), &cfg, "apple", &ov, false, true, dry_run, true).await.unwrap_err();
             assert!(err.to_string().contains("SETUP_TIMEOUT_SECS"), "replace (dry_run={dry_run}): {err}");
-            let err = super::handle_migrate_copy(&cfg, "apple", &ov, dry_run, true).await.unwrap_err();
+            let err = super::handle_migrate_copy(fake.clone(), &cfg, "apple", &ov, dry_run, true).await.unwrap_err();
+            assert!(fake.calls().is_empty(), "nothing reached a pod");
             assert!(err.to_string().contains("SETUP_TIMEOUT_SECS"), "migrate copy (dry_run={dry_run}): {err}");
         }
     }
@@ -7838,8 +8056,518 @@ mod proxy_deploy_tests {
             retry_mins: 0,
             retry_secs: 0,
         };
-        let err = handle_pods(cmd, &HalfCreate(Default::default()), &cfg(&path), true).await.unwrap_err();
+        let remote = std::sync::Arc::new(arena_core::remote::FakeRemote::new());
+        let err = handle_pods(cmd, &HalfCreate(Default::default()), remote, &cfg(&path), true).await.unwrap_err();
         assert!(err.to_string().contains("creating arena8-autumn"), "{err}");
         assert!(read(&path).contains("proxy_pass 1.1.1.1:22000;"), "apple (made before the failure) is forwarded");
+    }
+}
+
+/// Every pod-SSH path over a scripted `FakeRemote` (PLAN 1.B): each call carries its
+/// budget, partial failures are reported per pod and fail the command, and one wedged pod
+/// never holds up the others — on a paused clock, so budgets elapse instantly and exactly.
+#[cfg(test)]
+mod remote_tests {
+    use super::{
+        backup_fleet, copy_pod_files, copy_to_pod, each_pod, handle_backup, handle_copy, handle_init_branches,
+        handle_pods, handle_run, handle_set_branch, marker_present, probe_gpus, proxy_reaches_pod, render_run,
+        run_fleet, target_is_pod, BackupTally, Cli, Cmd, CopyPlan, PodCmd, RunResult, BACKUP_TIMEOUT, BRANCH_TIMEOUT,
+        CP_TIMEOUT, POD_COPY_TIMEOUT, RUN_TIMEOUT_SECS, TEST_TIMEOUT,
+    };
+    use arena_core::backup::{backup_command, checkout_command, init_branch_command, BackupConfig};
+    use arena_core::remote::{FakeRemote, FakeReply, Remote, RemoteCall, PROBE_TIMEOUT};
+    use arena_core::ssh::{login_shell_wrap, SshTarget};
+    use arena_core::{Config, Pod, PodSpec, Provider, Result};
+    use async_trait::async_trait;
+    use clap::Parser;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    /// A provider that lists a fixed fleet (`name()` is `kind`: "runpod" turns on the
+    /// replace path's RUNPOD_POD_ID identity checks).
+    struct Fleet {
+        kind: &'static str,
+        pods: Vec<Pod>,
+    }
+
+    #[async_trait]
+    impl Provider for Fleet {
+        fn name(&self) -> &'static str {
+            self.kind
+        }
+        fn describe(&self, _spec: &PodSpec) -> String {
+            String::new()
+        }
+        async fn list_pods(&self) -> Result<Vec<Pod>> {
+            Ok(self.pods.clone())
+        }
+        async fn create_pod(&self, _spec: &PodSpec) -> Result<Pod> {
+            unimplemented!("not exercised")
+        }
+        async fn stop_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn restart_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn terminate_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `devtest-<name>` at `10.0.0.1:<port>` — the FakeRemote host key is `10.0.0.1:<port>`.
+    fn pod(name: &str, port: u16) -> Pod {
+        Pod {
+            id: format!("id-devtest-{name}"),
+            name: format!("devtest-{name}"),
+            provider: "runpod".into(),
+            status: "RUNNING".into(),
+            gpu_type: Some("RTX A4000".into()),
+            gpu_count: Some(1),
+            ssh_ip: Some("10.0.0.1".into()),
+            ssh_port: Some(port),
+            ..Default::default()
+        }
+    }
+
+    fn fleet_of(pods: &[(&str, u16)]) -> Fleet {
+        Fleet { kind: "runpod", pods: pods.iter().map(|(n, p)| pod(n, *p)).collect() }
+    }
+
+    /// apple / bloom / cloud on ports 22001-22003.
+    fn fleet() -> Fleet {
+        fleet_of(&[("apple", 22001), ("bloom", 22002), ("cloud", 22003)])
+    }
+
+    fn host(port: u16) -> String {
+        format!("10.0.0.1:{port}")
+    }
+
+    const REPO: &str = "/root/ARENA_materials";
+    const KEY: &str = "/root/.ssh/id_ed25519";
+
+    fn cfg() -> Config {
+        Config::parse(&format!(
+            "MACHINE_NAME_PREFIX=devtest\nBACKUP_REPO_PATH={REPO}\nGIT_SSH_KEY_REMOTE={KEY}\n\
+             SHARED_SSH_KEY_PATH=/nonexistent/devtest_key\n"
+        ))
+    }
+
+    fn targets(f: &Fleet) -> Vec<(String, SshTarget)> {
+        f.pods.iter().map(|p| (p.name.clone(), SshTarget::from_pod(p, &cfg()).unwrap())).collect()
+    }
+
+    /// The (cmd, timeout) of every exec made to one host, in order.
+    fn execs(fake: &FakeRemote, port: u16) -> Vec<(String, Option<Duration>)> {
+        fake.calls_to(&host(port))
+            .into_iter()
+            .filter_map(|c| match c {
+                RemoteCall::Exec { cmd, timeout, .. } => Some((cmd, timeout)),
+                RemoteCall::Copy { .. } => None,
+            })
+            .collect()
+    }
+
+    /// `[n/total] rest` → `rest` (finishing order among pods that finish together isn't fixed).
+    fn unnumbered(lines: &[String]) -> Vec<String> {
+        lines.iter().map(|l| l.split_once("] ").map_or(l.as_str(), |(_, r)| r).to_string()).collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pods_run_partial_failure_is_non_zero_with_a_line_per_pod() {
+        let script = |fake: &FakeRemote| {
+            fake.script(&host(22001), [FakeReply::stdout("bash: no job control in this shell\nhello\n")]);
+            fake.script(&host(22002), [FakeReply::exit(127, "zsh: command not found: nvidia-smi")]);
+        };
+        // Through the command: one wrapped exec per pod with the given budget; non-zero exit.
+        let fake = Arc::new(FakeRemote::new());
+        script(&fake);
+        let err = handle_run(&fleet(), fake.clone(), &cfg(), "nvidia-smi -L", Duration::from_secs(60), false, true, true, false)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "1 pod(s) failed");
+        let wrapped = login_shell_wrap("nvidia-smi -L", Some("arena-env"));
+        for port in [22001, 22002, 22003] {
+            assert_eq!(execs(&fake, port), [(wrapped.clone(), Some(Duration::from_secs(60)))], "port {port}");
+        }
+
+        // The per-pod report (sorted by name), block and compact layouts.
+        let fake = Arc::new(FakeRemote::new());
+        script(&fake);
+        let remote: Arc<dyn Remote> = fake.clone();
+        let results = run_fleet(&remote, targets(&fleet()), &wrapped, Duration::from_secs(60)).await;
+        let ok = |name: &str, text: &str| RunResult { name: name.into(), text: text.into(), ok: true };
+        assert_eq!(
+            results,
+            [
+                ok("devtest-apple", "hello"),
+                RunResult {
+                    name: "devtest-bloom".into(),
+                    text: "exit Some(127): zsh: command not found: nvidia-smi".into(),
+                    ok: false
+                },
+                ok("devtest-cloud", ""),
+            ]
+        );
+        let (lines, bad) = render_run(&results, false);
+        assert_eq!(bad, 1);
+        assert_eq!(
+            lines,
+            [
+                "\n── devtest-apple ",
+                "hello",
+                "\n── devtest-bloom (FAILED)",
+                "exit Some(127): zsh: command not found: nvidia-smi",
+                "\n── devtest-cloud ",
+                "",
+                "\n2 ok, 1 failed",
+            ]
+        );
+        let (lines, _) = render_run(&results, true);
+        assert_eq!(lines[1], "devtest-bloom          ✗ exit Some(127): zsh: command not found: nvidia-smi");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hanging_pod_times_out_while_the_others_finish() {
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22002), [FakeReply::hang()]);
+        let remote: Arc<dyn Remote> = fake.clone();
+        let start = Instant::now();
+        let results = run_fleet(&remote, targets(&fleet()), "true", Duration::from_secs(90)).await;
+        assert_eq!(start.elapsed(), Duration::from_secs(90), "ends at the budget, not the hang");
+        let failed: Vec<(&str, &str)> = results.iter().filter(|r| !r.ok).map(|r| (r.name.as_str(), r.text.as_str())).collect();
+        assert_eq!(failed, [("devtest-bloom", "timed out after 90s")]);
+        let (lines, bad) = render_run(&results, true);
+        assert_eq!((bad, lines[1].as_str()), (1, "devtest-bloom          ✗ timed out after 90s"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pods_test_and_pods_run_carry_their_budgets_through_the_command() {
+        // `pods test`: 90s per pod; a wedged pod fails the command at that budget.
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22003), [FakeReply::hang()]);
+        let start = Instant::now();
+        let err = handle_pods(PodCmd::Test, &fleet(), fake.clone(), &cfg(), true).await.unwrap_err();
+        assert_eq!(err.to_string(), "1 pod(s) failed");
+        assert_eq!(start.elapsed(), TEST_TIMEOUT);
+        assert!(fake.calls().iter().all(|c| matches!(c, RemoteCall::Exec { cmd, timeout, .. }
+            if cmd.contains("import torch") && *timeout == Some(TEST_TIMEOUT))));
+
+        // `pods run --timeout 45`.
+        let fake = Arc::new(FakeRemote::new());
+        let run = PodCmd::Run { command: vec!["nvidia-smi".into()], timeout: 45, dry_run: false };
+        handle_pods(run, &fleet(), fake.clone(), &cfg(), true).await.unwrap();
+        assert_eq!(fake.calls().len(), 3);
+        assert!(fake.calls().iter().all(|c| matches!(c, RemoteCall::Exec { timeout, .. } if *timeout == Some(Duration::from_secs(45)))));
+
+        // A dry run reaches no pod.
+        let fake = Arc::new(FakeRemote::new());
+        let run = PodCmd::Run { command: vec!["reboot".into()], timeout: 45, dry_run: true };
+        handle_pods(run, &fleet(), fake.clone(), &cfg(), true).await.unwrap();
+        assert!(fake.calls().is_empty());
+    }
+
+    #[test]
+    fn run_timeout_flag_goes_before_the_command_and_defaults_to_30_min() {
+        let run = |args: &[&str]| match Cli::try_parse_from(args).map(|c| c.cmd) {
+            Ok(Cmd::Pods(PodCmd::Run { command, timeout, .. })) => Ok((command, timeout)),
+            Ok(_) => panic!("not a run"),
+            Err(e) => Err(e),
+        };
+        assert_eq!(RUN_TIMEOUT_SECS, 1800);
+        assert_eq!(run(&["arena", "pods", "run", "nvidia-smi", "-L"]).unwrap(), (vec!["nvidia-smi".into(), "-L".into()], 1800));
+        assert_eq!(
+            run(&["arena", "pods", "run", "--timeout", "60", "nvidia-smi", "-L"]).unwrap(),
+            (vec!["nvidia-smi".into(), "-L".into()], 60)
+        );
+        // After the command, it's part of the command (like every other flag).
+        assert_eq!(run(&["arena", "pods", "run", "echo", "--timeout", "5"]).unwrap().0, ["echo", "--timeout", "5"]);
+        // Bounded: no zero, no "forever" spelled as a huge number.
+        for bad in ["0", "86401"] {
+            assert!(run(&["arena", "pods", "run", "--timeout", bad, "true"]).is_err(), "{bad}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backup_classifies_each_pods_reply_and_a_wedged_pod_fails_at_the_budget() {
+        let f = fleet_of(&[("apple", 22001), ("bloom", 22002), ("cloud", 22003), ("delta", 22004), ("echo", 22005)]);
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [FakeReply::stdout("[autocommit-x 1a2b3c] arena backup\nPUSHED autocommit-x\n")]);
+        fake.script(&host(22002), [FakeReply::hang()]);
+        fake.script(&host(22003), [FakeReply::stdout("NO_CHANGES feature-y\n")]);
+        fake.script(&host(22004), [FakeReply::stdout("SKIP main\n")]);
+        fake.script(&host(22005), [FakeReply::exit(128, "fatal: Could not read from remote repository.")]);
+        let remote: Arc<dyn Remote> = fake.clone();
+        let jobs = targets(&f).into_iter().map(|(n, t)| (n, t, "backup".to_string())).collect();
+        let mut lines = Vec::new();
+        let start = Instant::now();
+        let tally = backup_fleet(&remote, jobs, |l| lines.push(l.to_string())).await;
+        assert_eq!(tally, BackupTally { pushed: 1, unchanged: 1, skipped: 1, failed: 2 });
+        assert_eq!(start.elapsed(), BACKUP_TIMEOUT);
+        // The wedged pod reports last, after its budget; the rest as soon as they answered.
+        assert_eq!(lines[4], "[5/5] ✗ devtest-bloom: timed out after 300s");
+        let mut first: Vec<String> = unnumbered(&lines[..4]);
+        first.sort();
+        assert_eq!(
+            first,
+            [
+                "= devtest-cloud (no changes, on feature-y)",
+                "⊘ devtest-delta (skipped — on protected branch main)",
+                "✓ devtest-apple -> autocommit-x",
+                "✗ devtest-echo (exit Some(128)): fatal: Could not read from remote repository.",
+            ]
+        );
+
+        // Through the command: each pod's own commit message, the budget, a non-zero result.
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22002), [FakeReply::exit(1, "boom")]);
+        let err = handle_backup(&fleet(), fake.clone(), &cfg(), true, None, None).await.unwrap_err();
+        assert_eq!(err.to_string(), "1 pod(s) failed to back up");
+        for (name, port) in [("apple", 22001), ("bloom", 22002), ("cloud", 22003)] {
+            let want = backup_command(REPO, Some(KEY), &format!("arena backup devtest-{name}"));
+            assert_eq!(execs(&fake, port), [(want, Some(BACKUP_TIMEOUT))]);
+        }
+        // Dry run: nothing reaches a pod.
+        let fake = Arc::new(FakeRemote::new());
+        handle_backup(&fleet(), fake.clone(), &cfg(), false, None, None).await.unwrap();
+        assert!(fake.calls().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn set_branch_dry_run_runs_nothing_and_apply_runs_the_checkout_on_each_pod() {
+        let fake = Arc::new(FakeRemote::new());
+        handle_set_branch(&fleet(), fake.clone(), &cfg(), "main", None, true, false, true, true).await.unwrap();
+        assert!(fake.calls().is_empty(), "dry run: {:?}", fake.calls());
+
+        // Gentle, whole fleet: the ff-only checkout on every pod, within the budget.
+        handle_set_branch(&fleet(), fake.clone(), &cfg(), "main", None, true, false, false, true).await.unwrap();
+        let gentle = checkout_command(REPO, "main", Some(KEY), false);
+        for port in [22001, 22002, 22003] {
+            assert_eq!(execs(&fake, port), [(gentle.clone(), Some(BRANCH_TIMEOUT))], "port {port}");
+        }
+
+        // --hard on one pod: only that pod, the destructive command.
+        let fake = Arc::new(FakeRemote::new());
+        handle_set_branch(&fleet(), fake.clone(), &cfg(), "main", Some("bloom"), false, true, false, true).await.unwrap();
+        let hard = checkout_command(REPO, "main", Some(KEY), true);
+        assert!(hard.contains("reset --hard"));
+        assert_eq!(fake.calls().len(), 1);
+        assert_eq!(execs(&fake, 22002), [(hard, Some(BRANCH_TIMEOUT))]);
+
+        // Concurrent: a wedged pod costs the run one budget (not one per pod after it), fails it.
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [FakeReply::hang()]);
+        let start = Instant::now();
+        let err =
+            handle_set_branch(&fleet(), fake.clone(), &cfg(), "main", None, true, false, false, true).await.unwrap_err();
+        assert_eq!(err.to_string(), "1 pod(s) failed to switch branch");
+        assert_eq!(start.elapsed(), BRANCH_TIMEOUT);
+        assert_eq!(fake.calls().len(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn init_branches_runs_each_pods_branch_command_within_the_budget() {
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22003), [FakeReply::exit(1, "error: failed to push some refs")]);
+        let err = handle_init_branches(&fleet(), fake.clone(), &cfg(), Some(1), Some(2), false, true).await.unwrap_err();
+        assert_eq!(err.to_string(), "1 pod(s) failed to init branch");
+        let bcfg = BackupConfig::from_config(&cfg(), 1, 2);
+        for (name, port) in [("apple", 22001), ("bloom", 22002), ("cloud", 22003)] {
+            let want = init_branch_command(&bcfg, &format!("devtest-{name}"));
+            assert!(want.contains(&format!("autocommit-devtest-w1d2-{name}")));
+            assert_eq!(execs(&fake, port), [(want, Some(BRANCH_TIMEOUT))]);
+        }
+        let fake = Arc::new(FakeRemote::new());
+        handle_init_branches(&fleet(), fake.clone(), &cfg(), Some(1), Some(2), true, true).await.unwrap();
+        assert!(fake.calls().is_empty(), "dry run");
+    }
+
+    /// A local file to copy, removed on drop.
+    struct TmpFile(std::path::PathBuf);
+    impl Drop for TmpFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cp_runs_mkdir_then_copy_then_check_and_stops_a_pod_at_its_first_failure() {
+        let file = TmpFile(std::env::temp_dir().join(format!("arena-cp-test-{}.txt", std::process::id())));
+        std::fs::write(&file.0, "hello").unwrap();
+        let local = file.0.to_string_lossy().into_owned();
+        let f = fleet_of(&[("apple", 22001), ("bloom", 22002), ("cloud", 22003), ("delta", 22004)]);
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [FakeReply::ok(), FakeReply::ok(), FakeReply::stdout("OK 5\n")]);
+        fake.script(&host(22002), [FakeReply::exit(1, "mkdir: cannot create directory '/root/x': Permission denied")]);
+        fake.script(&host(22003), [FakeReply::ok(), FakeReply::exit(1, "scp: /root/x/hello.txt: No space left on device")]);
+        fake.script(&host(22004), [FakeReply::ok(), FakeReply::hang()]);
+        let start = Instant::now();
+        let err = handle_copy(&f, fake.clone(), &cfg(), &file.0, Some("/root/x/hello.txt"), false, &[], &[], false, true)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "3 pod(s) failed to receive the file");
+        assert_eq!(start.elapsed(), CP_TIMEOUT, "the stuck scp costs its budget, nothing more");
+
+        let mkdir = RemoteCall::Exec { host: host(22001), cmd: "mkdir -p '/root/x'".into(), timeout: Some(PROBE_TIMEOUT) };
+        let copy = |port| RemoteCall::Copy {
+            host: host(port),
+            local: local.clone(),
+            remote: "/root/x/hello.txt".into(),
+            recursive: false,
+            timeout: Some(CP_TIMEOUT),
+        };
+        let apple = fake.calls_to(&host(22001));
+        assert_eq!(apple[..2], [mkdir, copy(22001)]);
+        assert!(
+            matches!(&apple[2], RemoteCall::Exec { cmd, timeout, .. } if cmd.contains("wc -c") && *timeout == Some(PROBE_TIMEOUT)),
+            "{apple:?}"
+        );
+        assert_eq!(apple.len(), 3);
+        assert_eq!(fake.calls_to(&host(22002)).len(), 1, "a failed mkdir stops the pod before the copy");
+        assert_eq!(fake.calls_to(&host(22003)).len(), 2, "a failed copy is not size-checked");
+        assert_eq!(fake.calls_to(&host(22004))[1], copy(22004));
+        assert_eq!(fake.calls_to(&host(22004)).len(), 2);
+
+        // `-r`: the tree goes through copy_recursive, with no single-file size check.
+        let fake = Arc::new(FakeRemote::new());
+        handle_copy(&f, fake.clone(), &cfg(), &file.0, Some("/root/x/"), true, &["apple".into()], &[], false, true)
+            .await
+            .unwrap();
+        assert!(matches!(
+            &fake.calls()[..],
+            [RemoteCall::Exec { cmd, .. }, RemoteCall::Copy { recursive: true, remote, .. }] if cmd == "mkdir -p '/root/x'" && remote == "/root/x/"
+        ), "{:?}", fake.calls());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cp_says_why_a_pod_failed() {
+        let plan = CopyPlan {
+            local: "/l/hello.txt".into(),
+            remote: "/root/x/hello.txt".into(),
+            remote_parent: "/root/x".into(),
+            recursive: false,
+            expect_size: Some(5),
+            basename: "hello.txt".into(),
+        };
+        let t = SshTarget::from_pod(&pod("apple", 22001), &cfg()).unwrap();
+        let fake = FakeRemote::new();
+        fake.script(&host(22001), [FakeReply::ok(), FakeReply::hang()]);
+        assert_eq!(copy_to_pod(&fake, &t, &plan).await, Err("timed out after 600s".to_string()));
+        fake.script(&host(22001), [FakeReply::exit(1, "Permission denied")]);
+        assert_eq!(copy_to_pod(&fake, &t, &plan).await, Err("mkdir failed: Permission denied".to_string()));
+        fake.script(&host(22001), [FakeReply::ok(), FakeReply::ok(), FakeReply::stdout("OK 3")]);
+        assert!(copy_to_pod(&fake, &t, &plan).await.unwrap_err().starts_with("size mismatch after copy: 3B on pod vs 5B"));
+        fake.script(&host(22001), [FakeReply::ok(), FakeReply::ok(), FakeReply::stdout("MISPLACED")]);
+        assert!(copy_to_pod(&fake, &t, &plan).await.unwrap_err().contains("is a directory on the pod"));
+        // A check that can't run (here: wedged) doesn't override a successful scp.
+        fake.script(&host(22001), [FakeReply::ok(), FakeReply::ok(), FakeReply::hang()]);
+        assert_eq!(copy_to_pod(&fake, &t, &plan).await, Ok(()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn list_probe_overrides_the_gpu_where_a_pod_answers_and_a_wedged_pod_costs_only_its_budget() {
+        let fake = Arc::new(FakeRemote::new());
+        let smi = format!(
+            "NVIDIA RTX A5000, 3, 10, 24564, 40\nNVIDIA RTX A5000, 0, 10, 24564, 39\n{}\n",
+            arena_core::metrics::SENTINEL
+        );
+        fake.script(&host(22001), [FakeReply::stdout(&smi)]);
+        fake.script(&host(22002), [FakeReply::hang()]);
+        let remote: Arc<dyn Remote> = fake.clone();
+        let mut pods = fleet().pods;
+        let start = Instant::now();
+        probe_gpus(&remote, &cfg(), &mut pods).await;
+        assert_eq!(start.elapsed(), PROBE_TIMEOUT);
+        let gpu = |i: usize| (pods[i].gpu_type.clone().unwrap(), pods[i].gpu_count.unwrap());
+        assert_eq!(gpu(0), ("2×RTX A5000".to_string(), 2), "what nvidia-smi saw wins");
+        assert_eq!(gpu(1), ("RTX A4000".to_string(), 1), "no answer: the provider's GPU stays");
+        assert_eq!(gpu(2), ("RTX A4000".to_string(), 1), "no GPU rows: the provider's GPU stays");
+        assert!(fake.calls().iter().all(|c| matches!(c, RemoteCall::Exec { timeout, .. } if *timeout == Some(PROBE_TIMEOUT))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replace_identity_and_marker_probes_fail_closed_and_are_bounded() {
+        let f = fleet_of(&[("apple", 22001), ("apple-new", 22009)]);
+        let t = SshTarget::from_pod(&f.pods[0], &cfg()).unwrap();
+        let fake = FakeRemote::new();
+        fake.script(&host(22001), [FakeReply::stdout("id-devtest-apple\n"), FakeReply::stdout("id-someone-else\n")]);
+        assert!(target_is_pod(&fake, &t, "id-devtest-apple", &f).await);
+        assert!(!target_is_pod(&fake, &t, "id-devtest-apple", &f).await, "a recycled ip:port reaching another pod");
+        fake.script(&host(22001), [FakeReply::hang()]);
+        let start = Instant::now();
+        assert!(!target_is_pod(&fake, &t, "id-devtest-apple", &f).await, "couldn't confirm = not the pod");
+        assert_eq!(start.elapsed(), PROBE_TIMEOUT);
+
+        let dest = "id-devtest-apple-new";
+        fake.script(
+            &host(22009),
+            [
+                FakeReply::stdout(&format!("ID={dest}\nMARK=arena-replace-{dest}\n")),
+                FakeReply::stdout(&format!("ID=\nMARK=arena-replace-{dest}\n")),
+                FakeReply::hang(),
+            ],
+        );
+        assert!(marker_present(&f, &fake, dest, &cfg()).await);
+        assert!(!marker_present(&f, &fake, dest, &cfg()).await, "RunPod without a pod id fails closed");
+        let start = Instant::now();
+        assert!(!marker_present(&f, &fake, dest, &cfg()).await);
+        assert_eq!(start.elapsed(), PROBE_TIMEOUT);
+        assert!(fake.calls().iter().all(|c| matches!(c, RemoteCall::Exec { timeout, .. } if *timeout == Some(PROBE_TIMEOUT))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_direct_pod_copy_that_times_out_stops_instead_of_falling_back() {
+        let f = fleet_of(&[("apple", 22001), ("apple-new", 22002)]);
+        let fake = FakeRemote::new();
+        // identity check, plant the marker, the direct rsync (wedged), clean the marker.
+        fake.script(&host(22001), [FakeReply::stdout("id-devtest-apple"), FakeReply::ok(), FakeReply::hang()]);
+        let start = Instant::now();
+        let err = copy_pod_files(&cfg(), &f, &fake, "id-devtest-apple", "id-devtest-apple-new").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.starts_with("direct pod-to-pod copy timed out after 7200s — NOT swapping"), "{msg}");
+        assert_eq!(start.elapsed(), POD_COPY_TIMEOUT);
+        let src = execs(&fake, 22001);
+        assert_eq!(src.len(), 4, "{src:?}");
+        assert!(src[2].0.starts_with("rsync ") && src[2].1 == Some(POD_COPY_TIMEOUT), "{src:?}");
+        assert!(src[3].0.starts_with("rm -f ") && src[3].1 == Some(PROBE_TIMEOUT), "source marker cleaned: {src:?}");
+        assert!(fake.calls_to(&host(22002)).is_empty(), "no via-local push, no delivery check");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn proxy_gate_probes_the_stable_port_within_the_probe_budget() {
+        let cfg = Config::parse(
+            "MACHINE_NAME_PREFIX=devtest\nSSH_PROXY_HOST=proxy.test\nSSH_PROXY_STARTING_PORT=9500\n\
+             MACHINE_NAME_LIST=(\n  \"apple\"\n  \"bloom\"\n)\n",
+        );
+        let fake = FakeRemote::new();
+        fake.script("proxy.test:9501", [FakeReply::stdout("id-new\n"), FakeReply::stdout("id-old\n"), FakeReply::hang()]);
+        assert!(proxy_reaches_pod(&fake, &cfg, "devtest-bloom", "id-new").await.unwrap());
+        assert!(!proxy_reaches_pod(&fake, &cfg, "devtest-bloom", "id-new").await.unwrap(), "still the old pod");
+        let start = Instant::now();
+        assert!(!proxy_reaches_pod(&fake, &cfg, "devtest-bloom", "id-new").await.unwrap());
+        assert_eq!(start.elapsed(), PROBE_TIMEOUT);
+        assert!(fake.calls().iter().all(|c| matches!(c, RemoteCall::Exec { timeout, .. } if *timeout == Some(PROBE_TIMEOUT))));
+    }
+
+    #[tokio::test]
+    async fn each_pod_reports_a_crashed_job_by_name() {
+        let jobs = [("devtest-apple", false), ("devtest-bloom", true)]
+            .into_iter()
+            .map(|(name, crash)| {
+                (name.to_string(), async move {
+                    if crash {
+                        panic!("boom");
+                    }
+                    7
+                })
+            })
+            .collect();
+        let mut seen = Vec::new();
+        each_pod(jobs, |_, total, name, result| seen.push((total, name.to_string(), result))).await;
+        seen.sort_by(|a, b| a.1.cmp(&b.1));
+        assert_eq!(seen[0], (2, "devtest-apple".to_string(), Ok(7)));
+        assert!(matches!(&seen[1], (2, name, Err(e)) if name == "devtest-bloom" && e.starts_with("task crashed: ")), "{seen:?}");
     }
 }

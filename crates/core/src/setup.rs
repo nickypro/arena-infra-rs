@@ -1069,6 +1069,9 @@ mod tests {
         async fn copy(&self, _: &SshTarget, _: &str, _: &str, _: Option<Duration>) -> Result<crate::ssh::SshOutput> {
             std::future::pending().await
         }
+        async fn copy_recursive(&self, _: &SshTarget, _: &str, _: &str, _: Option<Duration>) -> Result<crate::ssh::SshOutput> {
+            std::future::pending().await
+        }
     }
 
     #[tokio::test(start_paused = true)]

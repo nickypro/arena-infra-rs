@@ -2,10 +2,14 @@
 //!
 //! SSH-touching commands historically called `ssh::run` / `ssh::scp` directly, which made
 //! timeouts and partial failures untestable without real hosts. This trait is the seam
-//! (the seed of PLAN 1.B): [`SshRemote`] is the real thing, built on the same argv
-//! builders as `ssh::run`/`ssh::scp`; `FakeRemote` (behind `cfg(test)` / the `test-util`
-//! feature, never in a release build) scripts per-host replies, delays and failures and
-//! records every call, so fleet behaviour can be tested with paused time.
+//! (PLAN 1.B): [`SshRemote`] is the real thing, built on the same argv builders as
+//! `ssh::run`/`ssh::scp`; `FakeRemote` (behind `cfg(test)` / the `test-util` feature,
+//! never in a release build) scripts per-host replies, delays and failures and records
+//! every call, so fleet behaviour can be tested with paused time. Every pod-SSH path in
+//! the CLI goes through it, each call with a budget, so one wedged pod can't hang a fleet
+//! command. Outside it on purpose: rsync transfers (`pods pull`, the replace/migrate
+//! via-local file copy) — rsync drives its own ssh transport (`-e`), which is neither an
+//! exec nor a single-file copy — and the proxy host's nginx deploy, which isn't a pod.
 //!
 //! Timeouts: `timeout` bounds the whole call (connect + transfer/remote run). On expiry
 //! the call returns [`Error::Timeout`] — a distinct variant, so a caller never mistakes
@@ -30,7 +34,7 @@ use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 
-use crate::error::{Error, Result};
+use crate::error::{human_duration, Error, Result};
 use crate::ssh::{SshOutput, SshTarget};
 
 /// Run commands on / copy files to a pod. `timeout: None` waits indefinitely (only for
@@ -50,6 +54,34 @@ pub trait Remote: Send + Sync {
         remote: &str,
         timeout: Option<Duration>,
     ) -> Result<SshOutput>;
+
+    /// Copy the local file *or directory tree* `local` to `remote` (`scp -r`) — what
+    /// `pods cp -r` needs. A separate method rather than a flag on [`Remote::copy`], so
+    /// every existing caller keeps copying exactly one file. Same contract as `copy`.
+    async fn copy_recursive(
+        &self,
+        t: &SshTarget,
+        local: &str,
+        remote: &str,
+        timeout: Option<Duration>,
+    ) -> Result<SshOutput>;
+}
+
+/// Budget for a quick read or tiny write on a pod: an identity/marker probe, `mkdir -p`, a
+/// post-copy size check, a `~/.name` write, the dashboard's metrics round-trip. On a
+/// healthy pod these finish in about a second (plus at most the ssh connect timeout), so
+/// 20s means wedged — and they sit inside fleet sweeps and the replace/migrate pipelines,
+/// which must never stall on one bad pod.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How a failed [`Remote`] call reads in a per-pod report line (`✗ <name>: <this>`): a
+/// timeout is just `timed out after Ns` — the line already names the pod, so the error's
+/// `ssh <host:port>` prefix is noise there — and anything else is the error as-is.
+pub fn describe_error(e: &Error) -> String {
+    match e {
+        Error::Timeout { after, .. } => format!("timed out after {}", human_duration(after)),
+        other => other.to_string(),
+    }
 }
 
 /// The real [`Remote`]: `ssh`/`scp` child processes with the non-interactive, fail-fast
@@ -72,6 +104,13 @@ impl SshRemote {
         c.args(t.scp_args(local, remote));
         c
     }
+
+    /// The `scp -r … local user@host:remote` child for [`Remote::copy_recursive`].
+    pub fn copy_recursive_command(t: &SshTarget, local: &str, remote: &str) -> Command {
+        let mut c = child("scp");
+        c.arg("-r").args(t.scp_args(local, remote));
+        c
+    }
 }
 
 #[async_trait]
@@ -90,6 +129,17 @@ impl Remote for SshRemote {
     ) -> Result<SshOutput> {
         let what = format!("scp to {}:{}", t.host, t.port);
         output_within(Self::copy_command(t, local, remote), &what, timeout).await
+    }
+
+    async fn copy_recursive(
+        &self,
+        t: &SshTarget,
+        local: &str,
+        remote: &str,
+        timeout: Option<Duration>,
+    ) -> Result<SshOutput> {
+        let what = format!("scp -r to {}:{}", t.host, t.port);
+        output_within(Self::copy_recursive_command(t, local, remote), &what, timeout).await
     }
 }
 
@@ -270,7 +320,8 @@ mod fake {
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum RemoteCall {
         Exec { host: String, cmd: String, timeout: Option<Duration> },
-        Copy { host: String, local: String, remote: String, timeout: Option<Duration> },
+        /// `recursive`: made through [`Remote::copy_recursive`] (`scp -r`).
+        Copy { host: String, local: String, remote: String, recursive: bool, timeout: Option<Duration> },
     }
 
     impl RemoteCall {
@@ -331,6 +382,28 @@ mod fake {
             })
             .await
         }
+
+        /// [`Remote::copy`] / [`Remote::copy_recursive`]: one scripted reply either way,
+        /// recorded with which one it was.
+        async fn copying(
+            &self,
+            t: &SshTarget,
+            local: &str,
+            remote: &str,
+            recursive: bool,
+            timeout: Option<Duration>,
+        ) -> Result<SshOutput> {
+            let host = format!("{}:{}", t.host, t.port);
+            let what = format!("scp to {host}");
+            let reply = self.begin(RemoteCall::Copy {
+                host,
+                local: local.to_string(),
+                remote: remote.to_string(),
+                recursive,
+                timeout,
+            });
+            Self::answer(&what, reply, timeout).await
+        }
     }
 
     #[async_trait]
@@ -349,15 +422,17 @@ mod fake {
             remote: &str,
             timeout: Option<Duration>,
         ) -> Result<SshOutput> {
-            let host = format!("{}:{}", t.host, t.port);
-            let what = format!("scp to {host}");
-            let reply = self.begin(RemoteCall::Copy {
-                host,
-                local: local.to_string(),
-                remote: remote.to_string(),
-                timeout,
-            });
-            Self::answer(&what, reply, timeout).await
+            self.copying(t, local, remote, false, timeout).await
+        }
+
+        async fn copy_recursive(
+            &self,
+            t: &SshTarget,
+            local: &str,
+            remote: &str,
+            timeout: Option<Duration>,
+        ) -> Result<SshOutput> {
+            self.copying(t, local, remote, true, timeout).await
         }
     }
 }
@@ -397,6 +472,23 @@ mod tests {
         assert_eq!(argv(&c), t.scp_args("/local/key", "/root/.ssh/id_ed25519"));
         assert!(argv(&c).ends_with(&["/local/key".into(), "root@1.2.3.4:/root/.ssh/id_ed25519".into()]));
         assert!(c.get_kill_on_drop());
+
+        // copy_recursive: the same scp, with `-r` first (`pods cp -r`).
+        let c = SshRemote::copy_recursive_command(&t, "/local/dir", "/root/dir");
+        assert_eq!(c.as_std().get_program(), "scp");
+        let mut want = vec!["-r".to_string()];
+        want.extend(t.scp_args("/local/dir", "/root/dir"));
+        assert_eq!(argv(&c), want);
+        assert!(c.get_kill_on_drop());
+    }
+
+    #[test]
+    fn describe_error_shortens_a_timeout_for_a_per_pod_line() {
+        let e = Error::Timeout { what: "ssh 1.2.3.4:22001".into(), after: Duration::from_secs(90) };
+        assert_eq!(describe_error(&e), "timed out after 90s");
+        // Anything else reads as the error itself.
+        let e = Error::provider("spawning ssh 1.2.3.4:22001: No such file");
+        assert_eq!(describe_error(&e), e.to_string());
     }
 
     #[tokio::test]
@@ -559,6 +651,7 @@ mod tests {
         assert_eq!(second.stdout, "hi");
         // Exhausted => success.
         assert!(fake.exec(&t, "true", None).await.unwrap().success);
+        assert!(fake.copy_recursive(&t, "/dir", "/r", None).await.unwrap().success);
         // A different, unscripted host also succeeds.
         let mut other = target();
         other.port = 22002;
@@ -567,16 +660,29 @@ mod tests {
         assert_eq!(
             fake.calls_to("1.2.3.4:22001"),
             vec![
-                RemoteCall::Copy { host: "1.2.3.4:22001".into(), local: "/a".into(), remote: "/b".into(), timeout: None },
+                RemoteCall::Copy {
+                    host: "1.2.3.4:22001".into(),
+                    local: "/a".into(),
+                    remote: "/b".into(),
+                    recursive: false,
+                    timeout: None,
+                },
                 RemoteCall::Exec {
                     host: "1.2.3.4:22001".into(),
                     cmd: "echo hi".into(),
                     timeout: Some(Duration::from_secs(5)),
                 },
                 RemoteCall::Exec { host: "1.2.3.4:22001".into(), cmd: "true".into(), timeout: None },
+                RemoteCall::Copy {
+                    host: "1.2.3.4:22001".into(),
+                    local: "/dir".into(),
+                    remote: "/r".into(),
+                    recursive: true,
+                    timeout: None,
+                },
             ]
         );
-        assert_eq!(fake.calls().len(), 4);
+        assert_eq!(fake.calls().len(), 5);
     }
 
     #[tokio::test(start_paused = true)]
