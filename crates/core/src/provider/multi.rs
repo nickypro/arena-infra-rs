@@ -31,6 +31,8 @@ pub struct MultiProvider {
     /// instead of warning on stderr — the TUI sets this so provider hiccups (e.g. Vast's
     /// frequent 429s) don't corrupt its alternate-screen rendering.
     warn_on_partial: bool,
+    /// Per-backend bound on a list call ([`crate::provider::LIST_TIMEOUT`]; shorter in tests).
+    list_timeout: std::time::Duration,
 }
 
 impl MultiProvider {
@@ -90,7 +92,7 @@ impl Provider for MultiProvider {
         let mut results: Vec<(String, Result<Vec<Pod>>)> = Vec::new();
         let mut owners: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for (i, b) in self.backends.iter().enumerate() {
-            let res = b.list_pods().await;
+            let res = crate::provider::bounded_list(b.name(), b.list_pods(), self.list_timeout).await;
             if let Ok(pods) = &res {
                 for p in pods {
                     owners.insert(p.id.clone(), i);
@@ -160,6 +162,7 @@ pub fn build_fleet(primary: &str, cfg: &Config, warn_on_partial: bool) -> Result
         primary: primary_idx.expect("primary is built or we bailed above"),
         owner: std::sync::Mutex::new(std::collections::HashMap::new()),
         warn_on_partial,
+        list_timeout: crate::provider::LIST_TIMEOUT,
     }))
 }
 
@@ -210,7 +213,55 @@ mod tests {
             primary: 0,
             owner: std::sync::Mutex::new(std::collections::HashMap::new()),
             warn_on_partial: false,
+            list_timeout: crate::provider::LIST_TIMEOUT,
         }
+    }
+
+    /// A backend whose API accepts the request and never answers.
+    struct Stalled;
+
+    #[async_trait]
+    impl Provider for Stalled {
+        fn name(&self) -> &'static str {
+            "vast"
+        }
+        fn describe(&self, _spec: &PodSpec) -> String {
+            String::new()
+        }
+        async fn list_pods(&self) -> Result<Vec<Pod>> {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            Ok(vec![])
+        }
+        async fn create_pod(&self, _spec: &PodSpec) -> Result<Pod> {
+            unimplemented!("not exercised")
+        }
+        async fn stop_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn restart_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn terminate_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stalled_backend_lists_as_failed_instead_of_hanging() {
+        let mut m = multi(vec![Fake { name: "runpod", pods: Some(vec![pod("r1", "arena8-apple")]) }]);
+        m.backends.push(Box::new(Stalled));
+        m.list_timeout = std::time::Duration::from_millis(50);
+        let started = std::time::Instant::now();
+        let got = m.list_by_provider().await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "must not wait for the stalled API");
+        assert_eq!(got[0].1.as_ref().unwrap().len(), 1, "the healthy backend still answers");
+        let err = got[1].1.as_ref().unwrap_err().to_string();
+        assert!(got[1].0 == "vast" && err.contains("vast list timed out"), "{err}");
+        // A single backend's default list_by_provider is bounded the same way.
+        let err = crate::provider::bounded_list("vast", Stalled.list_pods(), std::time::Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
     }
 
     #[tokio::test]

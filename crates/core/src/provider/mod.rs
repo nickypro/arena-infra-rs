@@ -67,6 +67,27 @@ pub fn build(name: &str, cfg: &Config) -> Result<Box<dyn Provider>> {
     }
 }
 
+/// Upper bound on one backend's list call in [`Provider::list_by_provider`]. The HTTP
+/// clients have no timeout of their own, so a provider API that accepts the connection
+/// and then stalls would hang the caller forever — and a `*/5` `proxy apply` cron would
+/// pile up one stuck process per tick. Only *listing* is bounded: it's read-only, so a
+/// timeout just reads as "that provider failed to list" (the proxy merge keeps its
+/// forwards). Mutating calls deliberately aren't — a create that timed out client-side
+/// may still have happened server-side, and the transport-error retry would then make a
+/// duplicate (billed) pod.
+pub const LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Await a backend's list call, failing as that backend's error once `limit` passes.
+pub async fn bounded_list<F>(name: &str, list: F, limit: std::time::Duration) -> Result<Vec<Pod>>
+where
+    F: std::future::Future<Output = Result<Vec<Pod>>>,
+{
+    match tokio::time::timeout(limit, list).await {
+        Ok(res) => res,
+        Err(_) => Err(Error::provider(format!("{name} list timed out after {}s", limit.as_secs_f64()))),
+    }
+}
+
 #[async_trait]
 pub trait Provider: Send + Sync {
     fn name(&self) -> &'static str;
@@ -87,8 +108,11 @@ pub trait Provider: Send + Sync {
     /// treats "absent from the list" as "terminated": the proxy merge must tell "vast
     /// listed OK without this pod" apart from "vast didn't answer". Default: a single
     /// backend reports its own `list_pods` under its own name.
+    ///
+    /// Each backend's list is bounded by [`LIST_TIMEOUT`] here (a stall becomes that
+    /// backend's `Err`), because these callers include the unattended proxy re-sync.
     async fn list_by_provider(&self) -> Vec<(String, Result<Vec<Pod>>)> {
-        vec![(self.name().to_string(), self.list_pods().await)]
+        vec![(self.name().to_string(), bounded_list(self.name(), self.list_pods(), LIST_TIMEOUT).await)]
     }
 
     /// Mutating. Callers gate this behind an explicit apply/confirm step.

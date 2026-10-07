@@ -36,6 +36,11 @@ impl Config {
         // environment avoids editing the shared, read-only prod config for a run.
         "HF_TOKEN",
         "CLAUDE_CODE_OAUTH_TOKEN",
+        // `SSH_PROXY_RELOAD_CMD=` (empty) = write the proxy config, never reload nginx. A
+        // wrapper sharing a box with the production nginx (the sandbox's `arena-dev`) exports
+        // it empty so no lifecycle sync can reload the system nginx, whatever its config file
+        // says — absent from the file, the default reload would run.
+        "SSH_PROXY_RELOAD_CMD",
     ];
 
     /// Let environment variables override values from the file: any key already in the
@@ -220,6 +225,17 @@ MACHINE_NAME_LIST=(
         assert_eq!(c.get("ARENA_START_DATE"), None);
         c.apply_overrides(|k| (k == "ARENA_START_DATE").then(|| "2026-05-25".to_string()));
         assert_eq!(c.get("ARENA_START_DATE"), Some("2026-05-25"));
+    }
+
+    #[test]
+    fn env_can_force_proxy_write_only() {
+        // Absent from the file (→ the default nginx reload), an *empty* env value still
+        // lands, and it also overrides a reload command the file does set.
+        for file in ["IMAGE=base:1", "SSH_PROXY_RELOAD_CMD=\"nginx -s reload\""] {
+            let mut c = Config::parse(file);
+            c.apply_overrides(|k| (k == "SSH_PROXY_RELOAD_CMD").then(String::new));
+            assert_eq!(c.get("SSH_PROXY_RELOAD_CMD"), Some(""), "{file}");
+        }
     }
 
     #[test]

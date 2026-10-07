@@ -1007,10 +1007,25 @@ fn apply_spec_overrides(spec: &mut PodSpec, ov: &SpecOverrides) {
     }
 }
 
+/// A create that failed part-way. `created` are the pods made before the failure: they
+/// exist (and bill) whatever happened next, so the caller still finishes its job for them
+/// — the proxy sync — before reporting `error`.
+#[derive(Debug)]
+struct CreateFailed {
+    created: Vec<arena_core::Pod>,
+    error: anyhow::Error,
+}
+
+impl CreateFailed {
+    fn new(created: Vec<arena_core::Pod>, error: anyhow::Error) -> Self {
+        Self { created, error }
+    }
+}
+
 /// Top up toward the target, retrying for up to `retry_mins` (rounds every
 /// `retry_secs`) while capacity is short — Ctrl+C stops the loop early and keeps what
 /// was made. With `retry_mins == 0` it's a single attempt (honoring `keep_trying`).
-/// Returns every pod created across all rounds.
+/// Returns every pod created across all rounds — on failure, inside [`CreateFailed`].
 async fn create_with_retry(
     provider: &dyn Provider,
     cfg: &Config,
@@ -1020,7 +1035,7 @@ async fn create_with_retry(
     keep_trying: bool,
     retry_mins: u64,
     retry_secs: u64,
-) -> Result<Vec<arena_core::Pod>> {
+) -> std::result::Result<Vec<arena_core::Pod>, CreateFailed> {
     // Round 1 creates exactly the names that were previewed + confirmed, so the
     // `[created] …` output matches the `[y/N]` prompt. `target` (a provider-scoped total,
     // computed once in plan_create) bounds the whole operation: retries only ever re-plan
@@ -1038,7 +1053,13 @@ async fn create_with_retry(
         }
         // In retry mode the *loop* is the keep-trying, so each round is one-shot.
         let kt = retry_mins == 0 && keep_trying;
-        let made = create_pods(provider, cfg, &names, kt, ov).await?;
+        let made = match create_pods(provider, cfg, &names, kt, ov).await {
+            Ok(made) => made,
+            Err(CreateFailed { created, error }) => {
+                all.extend(created);
+                return Err(CreateFailed::new(all, error));
+            }
+        };
         let got = made.len();
         all.extend(made);
         if got == names.len() || retry_mins == 0 {
@@ -1065,7 +1086,10 @@ async fn create_with_retry(
         names = if target == 0 {
             names.into_iter().filter(|n| !all.iter().any(|p| &p.name == n)).collect()
         } else {
-            plan_create(provider, cfg, Want::Total(target)).await?.names
+            match plan_create(provider, cfg, Want::Total(target)).await {
+                Ok(plan) => plan.names,
+                Err(e) => return Err(CreateFailed::new(all, e)),
+            }
         };
     }
     Ok(all)
@@ -1077,7 +1101,7 @@ async fn create_pods(
     names: &[String],
     keep_trying: bool,
     ov: &SpecOverrides,
-) -> Result<Vec<arena_core::Pod>> {
+) -> std::result::Result<Vec<arena_core::Pod>, CreateFailed> {
     use arena_core::ProviderErrorKind as K;
 
     let base = spec_with_overrides(cfg, ov);
@@ -1128,11 +1152,12 @@ async fn create_pods(
                         break 'names;
                     }
                     Some(K::Auth) => {
-                        anyhow::bail!("authentication failed creating {name}: {e}");
+                        let error = anyhow::anyhow!("authentication failed creating {name}: {e}");
+                        return Err(CreateFailed::new(created, error));
                     }
                     _ => {
                         eprintln!("created {}/{} before failure", created.len(), names.len());
-                        return Err(anyhow::anyhow!("creating {name}: {e}"));
+                        return Err(CreateFailed::new(created, anyhow::anyhow!("creating {name}: {e}")));
                     }
                 },
             }
@@ -1721,12 +1746,21 @@ struct CronJob<'a> {
 /// unrouted.
 const PROXY_CRON_SCHEDULE: &str = "*/5 * * * *";
 
+/// cron runs jobs with `PATH=/usr/bin:/bin`, but Debian/Ubuntu install nginx in
+/// `/usr/sbin`: without this the default reload (`nginx -t && nginx -s reload`) fails
+/// with "nginx: not found" on every tick.
+const PROXY_CRON_PATH: &str = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
 /// The arena-managed crontab lines for `cron install` — pure, so the rendering is tested
 /// without touching a real crontab. Always the backup job; with `proxy`, also a
 /// `proxy apply --yes` every 5 minutes. That's safe unattended because the merge is
 /// sticky: a provider that fails to list never drops a forward, and if none answers
 /// nothing is written. It has its own log so its every-5-minutes chatter doesn't bury the
-/// backup's output.
+/// backup's output. `flock -n` makes a tick that finds the previous one still running
+/// exit at once instead of piling up (list calls are bounded by `LIST_TIMEOUT`, but an
+/// SSH to a remote proxy isn't). Deliberately no `timeout` kill: one landing between the
+/// write and the reload would leave a file nginx never loaded, which later ticks would
+/// read as up to date.
 fn cron_lines(job: &CronJob) -> Vec<String> {
     let CronJob { schedule, env_prefix, exe, config, home, pull, proxy } = job;
     // `pods backup` now also rsyncs the home (the file backup); default the cron to
@@ -1740,7 +1774,8 @@ fn cron_lines(job: &CronJob) -> Vec<String> {
     let mut lines = vec![format!("{schedule} {backup} >> {home}/arena-cron.log 2>&1")];
     if *proxy {
         lines.push(format!(
-            "{PROXY_CRON_SCHEDULE} {exe} --config {config} proxy apply --yes >> {home}/arena-proxy-cron.log 2>&1"
+            "{PROXY_CRON_SCHEDULE} {PROXY_CRON_PATH} flock -n {home}/.arena-proxy-cron.lock \
+             {exe} --config {config} proxy apply --yes >> {home}/arena-proxy-cron.log 2>&1"
         ));
     }
     lines
@@ -2344,9 +2379,10 @@ async fn read_current_proxy(cfg: &Config, pxcfg: &arena_core::proxy::ProxyConfig
     }
     let target = SshTarget::for_host(&pxcfg.proxy_user, &pxcfg.proxy_host, 22, cfg.get("SHARED_SSH_KEY_PATH"));
     let p = &pxcfg.nginx_path;
+    let q = sh_path(p);
     // Exit 3 means "no file yet" — distinct from cat's 1 and ssh's own 255 — so a missing
     // file is an empty `prev` while any failure to read it aborts the deploy.
-    let out = ssh::run(&target, &format!("test -e {p} || exit 3; cat {p}"))
+    let out = ssh::run(&target, &format!("test -e {q} || exit 3; cat {q}"))
         .await
         .with_context(|| format!("reading the current proxy config on {}", pxcfg.proxy_host))?;
     match out.code {
@@ -2394,15 +2430,22 @@ fn print_proxy_dry_run(cfg: &Config, p: &PreparedProxy) {
                 expand_tilde(&px.nginx_path)
             );
         } else {
-            println!("  write {} + run `{}` locally", expand_tilde(&px.nginx_path), px.reload_cmd);
+            println!(
+                "  write {} + run `{}` locally (the previous config is put back if that fails)",
+                expand_tilde(&px.nginx_path),
+                px.reload_cmd
+            );
         }
     } else {
         let target = arena_core::ssh::SshTarget::for_host(&px.proxy_user, &px.proxy_host, 22, cfg.get("SHARED_SSH_KEY_PATH"));
-        println!("  {}", target.display_scp("<rendered nginx>", &px.nginx_path));
+        println!("  {}", target.display_scp("<rendered nginx>", "/tmp/.arena-proxy-<unique>.conf"));
         if px.write_only() {
-            println!("  (no reload — SSH_PROXY_RELOAD_CMD is empty)");
+            println!("  then over SSH: install it as {} (no reload — SSH_PROXY_RELOAD_CMD is empty)", px.nginx_path);
         } else {
-            println!("  {}", target.display_command(&px.reload_cmd));
+            println!(
+                "  then over SSH: install it as {}, run `{}` (the previous config is put back if that fails)",
+                px.nginx_path, px.reload_cmd
+            );
         }
     }
     println!(
@@ -2492,28 +2535,41 @@ fn written_line(px: &arena_core::proxy::ProxyConfig, n: usize, w: Written) -> Op
 /// reloaded; a listing where no provider answered writes nothing at all (error). `review`
 /// prints the per-change lines and the write (the `up` poll loop); [`sync_proxy`] passes
 /// `false` and reports in one line from the returned plan instead.
+///
+/// If another arena process rewrote the config between our read and our write
+/// ([`ProxyChanged`]), the merge is redone against the file it wrote — a merge built from
+/// the stale read would silently undo that writer's forwards.
 async fn deploy_proxy(
     cfg: &Config,
     listing: &arena_core::proxy::Listing,
     review: bool,
 ) -> Result<(PreparedProxy, Written)> {
-    let prepared = prepare_proxy(cfg, listing).await?;
-    if let Some(why) = &prepared.plan.abort {
-        anyhow::bail!("not touching the proxy config: {why}");
-    }
-    if prepared.up_to_date() {
-        return Ok((prepared, Written::Unchanged));
-    }
-    if review {
-        print_proxy_review(&prepared, listing);
-    }
-    let written = write_proxy(cfg, &prepared).await?;
-    if review {
-        if let Some(line) = written_line(&prepared.pxcfg, prepared.plan.forwards.len(), written) {
-            println!("{line}");
+    const ATTEMPTS: usize = 3;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let prepared = prepare_proxy(cfg, listing).await?;
+        if let Some(why) = &prepared.plan.abort {
+            anyhow::bail!("not touching the proxy config: {why}");
         }
+        if prepared.up_to_date() {
+            return Ok((prepared, Written::Unchanged));
+        }
+        if review {
+            print_proxy_review(&prepared, listing);
+        }
+        let written = match write_proxy(cfg, &prepared).await {
+            Ok(w) => w,
+            Err(e) if e.is::<ProxyChanged>() && attempt < ATTEMPTS => continue,
+            Err(e) => return Err(e),
+        };
+        if review {
+            if let Some(line) = written_line(&prepared.pxcfg, prepared.plan.forwards.len(), written) {
+                println!("{line}");
+            }
+        }
+        return Ok((prepared, written));
     }
-    Ok((prepared, written))
 }
 
 /// What a post-lifecycle proxy sync did. Returned so a caller that *depends* on the proxy
@@ -2534,18 +2590,26 @@ enum ProxySync {
         pending: usize,
         /// Providers whose listing failed: their forwards were kept as they were.
         failed_providers: Vec<String>,
+        /// Forwards this sync routed to an endpoint the listing confirmed (not kept-stale
+        /// ones) — what `pods replace` checks before terminating the pod it replaced.
+        routed: Vec<arena_core::proxy::Forward>,
     },
     /// Listing, reading the live config, writing or reloading failed.
     Failed(String),
 }
 
 /// The single line a sync prints, e.g. `[proxy] after terminate: +0 ~0 -1 =0 (deployed;
-/// removed arena8-apple)`. Pure, so every variant is tested.
+/// removed arena8-apple)`. Pure, so every variant is tested. Error text is folded onto the
+/// line: it often embeds a command's multi-line stderr (`nginx -t`'s `[emerg]` + "test
+/// failed", ssh's host-key notice).
 fn sync_line(why: &str, s: &ProxySync) -> String {
+    let one_line = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
     match s {
-        ProxySync::Skipped(reason) => format!("[proxy] after {why}: skipped — {reason}"),
-        ProxySync::Failed(e) => format!("[proxy] after {why}: NOT synced — {e} (retry: `arena proxy apply`)"),
-        ProxySync::Synced { written, counts, removed, pending, failed_providers } => {
+        ProxySync::Skipped(reason) => format!("[proxy] after {why}: skipped — {}", one_line(reason)),
+        ProxySync::Failed(e) => {
+            format!("[proxy] after {why}: NOT synced — {} (retry: `arena proxy apply`)", one_line(e))
+        }
+        ProxySync::Synced { written, counts, removed, pending, failed_providers, .. } => {
             let mut notes = vec![match written {
                 Written::Unchanged => "unchanged".to_string(),
                 Written::WriteOnly => "written; write-only, nginx not reloaded".to_string(),
@@ -2603,6 +2667,7 @@ async fn sync_proxy(cfg: &Config, fleet: &dyn Provider, why: &str) -> ProxySync 
                         .collect(),
                     pending: prepared.plan.pending.len(),
                     failed_providers: listing.errors().iter().map(|(p, _)| p.to_string()).collect(),
+                    routed: prepared.plan.routed(),
                 },
                 Err(e) => ProxySync::Failed(format!("{e:#}")),
             }
@@ -2634,9 +2699,177 @@ async fn sync_proxy_via(cfg: &Config, owner: &dyn Provider, why: &str) -> ProxyS
     }
 }
 
-/// Write a prepared config to the proxy (locally, or scp over SSH) and run the reload
-/// command unless write-only. This is the one place the tool touches the proxy host.
-/// Silent: callers report (see [`written_line`], [`sync_line`]).
+/// Another arena process (the proxy cron, a lifecycle sync, an interactive apply) changed
+/// the proxy config between our read and our write. Typed so [`deploy_proxy`] can redo
+/// the merge against the new file instead of overwriting it with one built from a stale
+/// `prev` — which would silently drop whatever that writer had kept or added.
+#[derive(Debug)]
+struct ProxyChanged;
+
+impl std::fmt::Display for ProxyChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "the proxy config changed since it was read (another arena run wrote it) — not \
+             overwriting it; re-run to merge against the new one",
+        )
+    }
+}
+
+impl std::error::Error for ProxyChanged {}
+
+/// How long a proxy write waits for another arena process's write to finish. A writer
+/// holds the lock only for re-read + write + reload (seconds), so this is generous.
+const PROXY_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Serialize proxy writes between arena processes on this box — the `cron install
+/// --proxy` tick, post-lifecycle syncs, an interactive `proxy apply` — with an exclusive
+/// `flock` held across re-read, write and reload. Local proxy: on the config's
+/// *directory*, which needs no write access and is the same inode for root's cron and a
+/// user's shell. Remote proxy: on a lock file in the temp dir keyed by host (only
+/// serializes writers on *this* control box). Best-effort: when no lock can be opened we
+/// go on — [`write_proxy`]'s re-read-and-compare still refuses to overwrite a change.
+async fn proxy_lock(pxcfg: &arena_core::proxy::ProxyConfig) -> Result<Option<std::fs::File>> {
+    use std::path::Path;
+    let file = if pxcfg.local {
+        let path = PathBuf::from(expand_tilde(&pxcfg.nginx_path));
+        let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        std::fs::File::open(dir).ok()
+    } else {
+        let host: String =
+            pxcfg.proxy_host.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' }).collect();
+        let path = std::env::temp_dir().join(format!("arena-proxy-{host}.lock"));
+        // Open an existing lock read-only (flock doesn't need write access, and another
+        // user may own it); create it world-readable otherwise so the next user can too.
+        std::fs::File::open(&path).ok().or_else(|| {
+            use std::os::unix::fs::PermissionsExt;
+            let f = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(&path).ok()?;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+            Some(f)
+        })
+    };
+    let Some(file) = file else { return Ok(None) };
+    let deadline = std::time::Instant::now() + PROXY_LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(Some(file)),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+                "another arena process has been writing the proxy config for over {}s — not writing",
+                PROXY_LOCK_WAIT.as_secs()
+            ),
+            // A filesystem without flock: go on, the compare-before-write still guards.
+            Err(std::fs::TryLockError::Error(_)) => return Ok(None),
+        }
+    }
+}
+
+/// Replace `path`'s contents so a concurrent reader (another arena's prepare, someone's
+/// `nginx -t`) sees the old file or the new one, never a truncated one: write a hidden temp
+/// sibling (the leading `.` keeps it out of an nginx `include …/*` glob), give it the old
+/// file's mode and owner, and rename it over. A symlink is followed — its target is
+/// replaced, the link kept. Where that isn't permitted (a directory we can't create files
+/// in, a sticky one we can't rename within — the old in-place write only needed the file
+/// itself to be writable) fall back to that in-place write rather than fail a deploy that
+/// used to work; the lock + compare in [`write_proxy`] still keep arena writers apart.
+fn replace_file(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let (Some(dir), Some(name)) = (real.parent(), real.file_name()) else {
+        return std::fs::write(&real, text);
+    };
+    let tmp = dir.join(format!(".{}.arena-tmp-{}", name.to_string_lossy(), std::process::id()));
+    let swapped = std::fs::write(&tmp, text).and_then(|()| {
+        if let Ok(meta) = std::fs::metadata(&real) {
+            let _ = std::fs::set_permissions(&tmp, meta.permissions());
+            // Root's cron rewriting a user-owned file must leave it user-owned, or the
+            // user's next interactive sync can't write it. (Fails harmlessly as non-root.)
+            let _ = std::os::unix::fs::chown(&tmp, Some(meta.uid()), Some(meta.gid()));
+        }
+        std::fs::rename(&tmp, &real)
+    });
+    match swapped {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                std::fs::write(&real, text)
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// A config path as a shell word: `~/x` → `"$HOME"/'x'` (still expands on the far side),
+/// anything else single-quoted.
+fn sh_path(p: &str) -> String {
+    match p.strip_prefix("~/") {
+        Some(rest) => format!("\"$HOME\"/{}", shell_quote(rest)),
+        None => shell_quote(p),
+    }
+}
+
+/// `<pid>-<nanos>`: unique enough for a temp file name no other process will pick.
+fn unique_tag() -> String {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    format!("{}-{nanos}", std::process::id())
+}
+
+/// Exit codes of [`remote_install_script`].
+const INSTALL_FAILED: i32 = 90;
+const RELOAD_FAILED_RESTORED: i32 = 91;
+const RELOAD_FAILED_NOT_RESTORED: i32 = 92;
+
+/// The single remote command that installs an uploaded config: back up the live file,
+/// copy the upload over it *in place* (keeps its owner and mode, and needs only write
+/// access to the file, like the old direct scp), run the reload, and if the reload fails
+/// put the backup back (or remove the file if there was none) — so the live file always
+/// matches what nginx is running, and the next sync sees a difference and retries.
+/// One SSH session after the upload, so a connection dropped between upload and install
+/// leaves the live config untouched. `reload_cmd: None` = write-only. Pure (and plain
+/// POSIX sh), so its behaviour is tested by running it locally.
+fn remote_install_script(path: &str, upload: &str, reload_cmd: Option<&str>) -> String {
+    let (p, n) = (sh_path(path), shell_quote(upload));
+    let mut script = format!(
+        "p={p}; n={n}; b=\"$n.prev\"; had=0\n\
+         restore() {{ if [ \"$had\" = 1 ]; then cat \"$b\" > \"$p\"; else rm -f \"$p\"; fi; }}\n\
+         if [ -e \"$p\" ]; then cat \"$p\" > \"$b\" || {{ rm -f \"$n\" \"$b\"; exit {INSTALL_FAILED}; }}; had=1; fi\n\
+         if ! cat \"$n\" > \"$p\"; then restore; rm -f \"$n\" \"$b\"; exit {INSTALL_FAILED}; fi\n\
+         rm -f \"$n\"\n"
+    );
+    match reload_cmd {
+        None => script.push_str("rm -f \"$b\"\nexit 0\n"),
+        Some(cmd) => script.push_str(&format!(
+            // On its own lines, so a reload command ending in a `# comment` can't swallow
+            // the rest of the script.
+            "if (\n{cmd}\n); then rm -f \"$b\"; exit 0; fi\n\
+             if restore; then rm -f \"$b\"; exit {RELOAD_FAILED_RESTORED}; fi\n\
+             exit {RELOAD_FAILED_NOT_RESTORED}\n"
+        )),
+    }
+    script
+}
+
+/// Removes a local temp file when dropped (the scp source), whatever path we leave by.
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Write a prepared config to the proxy (locally, or scp + one SSH install over SSH) and
+/// run the reload command unless write-only. This is the one place the tool touches the
+/// proxy host. Silent: callers report (see [`written_line`], [`sync_line`]).
+///
+/// - Under [`proxy_lock`], the live config is re-read and must still be what `p` was
+///   planned against, else [`ProxyChanged`] — never a blind overwrite.
+/// - A failed reload puts the previous config back. Leaving the new file in place would
+///   make every later sync see "already up to date" and never retry the reload, while
+///   nginx kept serving the old routes.
 async fn write_proxy(cfg: &Config, p: &PreparedProxy) -> Result<Written> {
     use arena_core::ssh::{self, SshTarget};
 
@@ -2648,41 +2881,75 @@ async fn write_proxy(cfg: &Config, p: &PreparedProxy) -> Result<Written> {
         return Ok(Written::Unchanged);
     }
     let pxcfg = &p.pxcfg;
+    let _lock = proxy_lock(pxcfg).await?;
+    if read_current_proxy(cfg, pxcfg).await? != p.current {
+        return Err(ProxyChanged.into());
+    }
 
     // Local: this box IS the proxy — write the config + reload directly, no SSH.
     if pxcfg.local {
-        let path = expand_tilde(&pxcfg.nginx_path);
-        std::fs::write(&path, &p.rendered).with_context(|| format!("writing nginx config to {path}"))?;
+        let path = PathBuf::from(expand_tilde(&pxcfg.nginx_path));
+        replace_file(&path, &p.rendered).with_context(|| format!("writing nginx config to {}", path.display()))?;
         if pxcfg.write_only() {
             return Ok(Written::WriteOnly);
         }
-        let out = std::process::Command::new("sh")
-            .args(["-c", &pxcfg.reload_cmd])
-            .output()
-            .context("reloading nginx locally")?;
-        if out.status.success() {
-            return Ok(Written::Reloaded);
+        let failure = match std::process::Command::new("sh").args(["-c", &pxcfg.reload_cmd]).output() {
+            Ok(out) if out.status.success() => return Ok(Written::Reloaded),
+            Ok(out) => format!("local nginx reload failed: {}", String::from_utf8_lossy(&out.stderr).trim()),
+            Err(e) => format!("running the local reload command: {e}"),
+        };
+        let restored = match &p.current {
+            Some(prev) => replace_file(&path, prev),
+            None => std::fs::remove_file(&path).or_else(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => Ok(()),
+                _ => Err(e),
+            }),
+        };
+        match restored {
+            Ok(()) => anyhow::bail!("{failure} — previous config put back, so the next sync retries"),
+            Err(e) => anyhow::bail!(
+                "{failure} — and putting the previous config back failed ({e}): {} now holds a config \
+                 nginx hasn't loaded, which a re-run will see as up to date; fix the cause, then run \
+                 `{}` by hand",
+                path.display(),
+                pxcfg.reload_cmd
+            ),
         }
-        anyhow::bail!("local nginx reload failed: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
 
-    // Remote: scp to the proxy host, then reload there.
+    // Remote: upload to a unique temp file on the proxy host, then install + reload there
+    // in one SSH session. (A fixed local temp name broke once another user had created it.)
     let target =
         SshTarget::for_host(&pxcfg.proxy_user, &pxcfg.proxy_host, 22, cfg.get("SHARED_SSH_KEY_PATH"));
-    let tmp = std::env::temp_dir().join("arena-proxy.conf");
-    std::fs::write(&tmp, &p.rendered).context("writing rendered nginx config to a temp file")?;
-    let scp = ssh::scp(&target, &tmp.to_string_lossy(), &pxcfg.nginx_path).await?;
+    let tag = unique_tag();
+    let local_tmp = RemoveOnDrop(std::env::temp_dir().join(format!("arena-proxy-{tag}.conf")));
+    std::fs::write(&local_tmp.0, &p.rendered).context("writing rendered nginx config to a temp file")?;
+    let upload = format!("/tmp/.arena-proxy-{tag}.conf");
+    let scp = ssh::scp(&target, &local_tmp.0.to_string_lossy(), &upload).await?;
     if !scp.success {
         anyhow::bail!("scp to proxy {} failed: {}", pxcfg.proxy_host, scp.stderr.trim());
     }
-    if pxcfg.write_only() {
-        return Ok(Written::WriteOnly);
-    }
-    let out = ssh::run(&target, &pxcfg.reload_cmd).await?;
-    if out.success {
-        Ok(Written::Reloaded)
-    } else {
-        anyhow::bail!("nginx reload on {} failed (exit {:?}): {}", pxcfg.proxy_host, out.code, out.stderr.trim())
+    let reload = (!pxcfg.write_only()).then_some(pxcfg.reload_cmd.as_str());
+    let out = ssh::run(&target, &remote_install_script(&pxcfg.nginx_path, &upload, reload)).await?;
+    let (host, err) = (&pxcfg.proxy_host, out.stderr.trim());
+    match out.code {
+        Some(0) if reload.is_none() => Ok(Written::WriteOnly),
+        Some(0) => Ok(Written::Reloaded),
+        Some(INSTALL_FAILED) => anyhow::bail!("installing the config on {host} failed (live config left as it was): {err}"),
+        Some(RELOAD_FAILED_RESTORED) => {
+            anyhow::bail!("nginx reload on {host} failed: {err} — previous config put back, so the next sync retries")
+        }
+        Some(RELOAD_FAILED_NOT_RESTORED) => anyhow::bail!(
+            "nginx reload on {host} failed: {err} — and putting the previous config back failed: {} \
+             holds a config nginx hasn't loaded, which a re-run will see as up to date; fix the cause, \
+             then run `{}` there by hand",
+            pxcfg.nginx_path,
+            pxcfg.reload_cmd
+        ),
+        code => anyhow::bail!(
+            "installing/reloading on {host} failed (exit {code:?}): {err} — the live config may not \
+             have changed; `arena proxy apply --dry-run` shows where it stands"
+        ),
     }
 }
 
@@ -2825,6 +3092,11 @@ async fn handle_plan(cmd: PlanCmd, provider: &dyn Provider, cfg: &Config) -> Res
 /// summary, skipped pods), then the rendered nginx config (optionally also written to
 /// `out`, locally). Never connects to the proxy: for a local proxy the current config is a
 /// local file read; for a remote one the diff isn't shown (`proxy apply --dry-run` reads it).
+///
+/// Without the current config (remote proxy, or the local file unreadable) the plan starts
+/// from nothing, so it lacks every forward the merge would *keep* (owner's provider
+/// failed, pod listed without an endpoint). That output is labelled a listing-only preview
+/// and `--out` is refused: deployed by hand, it would drop those participants' forwards.
 fn emit_proxy_plan(listing: &arena_core::proxy::Listing, cfg: &Config, out: Option<&std::path::Path>) -> Result<()> {
     let pxcfg = arena_core::proxy::ProxyConfig::from_config(cfg)?;
 
@@ -2832,7 +3104,8 @@ fn emit_proxy_plan(listing: &arena_core::proxy::Listing, cfg: &Config, out: Opti
         "\n# proxy host: {}@{}  (nginx config path: {})",
         pxcfg.proxy_user, pxcfg.proxy_host, pxcfg.nginx_path
     );
-    let prev = if pxcfg.local {
+    // `None` = the current config is unknown, so this can't be a merge.
+    let prev: Option<Vec<arena_core::proxy::Forward>> = if pxcfg.local {
         let path = expand_tilde(&pxcfg.nginx_path);
         match std::fs::read_to_string(&path) {
             Ok(text) => {
@@ -2845,26 +3118,33 @@ fn emit_proxy_plan(listing: &arena_core::proxy::Listing, cfg: &Config, out: Opti
                         parsed.ignored_blocks
                     );
                 }
-                parsed.forwards
+                Some(parsed.forwards)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 println!("# no current config at {path} yet — every forward is new");
-                Vec::new()
+                Some(Vec::new())
             }
             Err(e) => {
                 println!("# couldn't read {path} ({e}) — diff vs live config not shown");
-                Vec::new()
+                None
             }
         }
     } else {
         println!("# diff vs live config not shown (remote proxy) — `arena proxy apply --dry-run` reads it");
-        Vec::new()
+        None
     };
+    if prev.is_none() && out.is_some() {
+        anyhow::bail!(
+            "--out needs the current proxy config to merge against, and it isn't readable here — a \
+             config built from the listing alone would drop every forward the merge keeps. Use \
+             `arena proxy apply` (it reads the live config; --dry-run to preview)."
+        );
+    }
 
     for (prov, e) in listing.errors() {
         eprintln!("warning: {prov} listing failed: {e}");
     }
-    let plan = plan_proxy(cfg, &pxcfg, &prev, listing);
+    let plan = plan_proxy(cfg, &pxcfg, prev.as_deref().unwrap_or_default(), listing);
     if let Some(why) = &plan.abort {
         anyhow::bail!("{why} — `proxy apply` would refuse to write anything");
     }
@@ -2881,7 +3161,7 @@ fn emit_proxy_plan(listing: &arena_core::proxy::Listing, cfg: &Config, out: Opti
     }
 
     let nginx = arena_core::proxy::render_nginx(&plan.forwards);
-    println!("\n# ----- nginx config (write to {} on the proxy) -----", pxcfg.nginx_path);
+    println!("\n{}", plan_config_header(&pxcfg.nginx_path, prev.is_some()));
     println!("{nginx}");
 
     if let Some(path) = out {
@@ -2895,6 +3175,19 @@ fn emit_proxy_plan(listing: &arena_core::proxy::Listing, cfg: &Config, out: Opti
         );
     }
     Ok(())
+}
+
+/// The header above the config `proxy plan` prints. Only a real merge (the current config
+/// was read) may say "write to … on the proxy"; a plan from the listing alone is labelled
+/// as the preview it is, so nobody deploys it by hand.
+fn plan_config_header(nginx_path: &str, merged: bool) -> String {
+    if merged {
+        format!("# ----- nginx config (write to {nginx_path} on the proxy) -----")
+    } else {
+        "# ----- nginx config: LISTING-ONLY PREVIEW, not a merge — it omits every forward \
+         `proxy apply` would keep; do NOT deploy it by hand (`arena proxy apply --dry-run`) -----"
+            .to_string()
+    }
 }
 
 async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bool) -> Result<()> {
@@ -3000,13 +3293,21 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             }
             // Explicit names retry just the names still missing; -n/-a re-plan toward the
             // total (topup_target == 0 marks the explicit case).
-            let created =
-                create_with_retry(provider, cfg, names, topup_target, &ov, keep_trying, retry_mins, retry_secs).await?;
+            let outcome =
+                create_with_retry(provider, cfg, names, topup_target, &ov, keep_trying, retry_mins, retry_secs).await;
+            let (created, error) = match outcome {
+                Ok(created) => (created, None),
+                Err(CreateFailed { created, error }) => (created, Some(error)),
+            };
             // Fresh pods rarely have an SSH endpoint yet, so this mostly reports them as
             // "not forwarded yet" — but it keeps every create ending with the proxy in step
             // (and a provider that hands out the IP at create, like Hetzner, is wired now).
+            // Also after a create that failed part-way: the pods made before it exist.
             if !skip_proxy && !created.is_empty() {
                 sync_proxy(cfg, provider, "create").await;
+            }
+            if let Some(e) = error {
+                return Err(e);
             }
         }
 
@@ -3060,9 +3361,20 @@ async fn handle_pods(cmd: PodCmd, provider: &dyn Provider, cfg: &Config, yes: bo
             }
             // Create as many as capacity allows (retrying if requested); only wait on
             // the ones we got. Proxy is deployed *after* this returns — i.e. once the
-            // retry loop has finished topping up. Explicit names create directly.
+            // retry loop has finished topping up. Explicit names create directly. A create
+            // that failed part-way still syncs the proxy for the pods it made, then fails.
             let created =
-                create_with_retry(provider, cfg, names, topup_target, &ov, keep_trying, retry_mins, retry_secs).await?;
+                match create_with_retry(provider, cfg, names, topup_target, &ov, keep_trying, retry_mins, retry_secs)
+                    .await
+                {
+                    Ok(created) => created,
+                    Err(CreateFailed { created, error }) => {
+                        if !created.is_empty() {
+                            sync_proxy(cfg, provider, "up").await;
+                        }
+                        return Err(error);
+                    }
+                };
             if created.is_empty() {
                 eprintln!("no pods were created — nothing to wait for");
                 return Ok(());
@@ -3730,11 +4042,10 @@ async fn handle_rename(
             // list — a sync would drop their forwards. Left alone, every old forward keeps
             // routing (a renamed pod keeps its port: same list index), until the re-run.
             anyhow::bail!(
-                "renaming {} → {} failed: {e}\n{i} of {} rename(s) done; proxy NOT synced \
-                 (fix and re-run the rename, or `arena proxy apply`)",
+                "renaming {} → {} failed: {e}\n{}",
                 r.old,
                 r.new,
-                plan.len()
+                rename_failure_hint(&request, i, plan.len())
             );
         }
         println!("[renamed] {} → {}", r.old, r.new);
@@ -3750,6 +4061,27 @@ async fn handle_rename(
 enum RenameRequest {
     One { old: String, new: String },
     FromPrefix(String),
+}
+
+/// What to tell the operator when a rename batch stops part-way (pure, so tested). A
+/// `--from-prefix` batch must NOT suggest `proxy apply`: the pods not renamed yet still
+/// carry the old prefix, which has no slot in the current MACHINE_NAME_LIST, so any proxy
+/// write — `proxy apply`, another lifecycle command's sync, the `cron install --proxy`
+/// tick — drops their forwards. Re-running the rename finishes the batch, then syncs.
+fn rename_failure_hint(request: &RenameRequest, done: usize, total: usize) -> String {
+    match request {
+        RenameRequest::One { .. } => {
+            format!("{done} of {total} rename(s) done; proxy NOT synced (fix and re-run the rename, or `arena proxy apply`)")
+        }
+        RenameRequest::FromPrefix(from) => format!(
+            "{done} of {total} rename(s) done; proxy NOT synced — every forward still routes. Fix the \
+             cause and re-run the rename to finish the batch (it syncs the proxy at the end). Until \
+             then do NOT run `arena proxy apply` or another create/terminate/replace: the pods still \
+             named {from}-* have no slot in MACHINE_NAME_LIST, so any proxy sync drops their \
+             forwards — including the `cron install --proxy` tick (re-install the cron without \
+             --proxy to pause it)."
+        ),
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -4475,18 +4807,28 @@ async fn handle_replace(
     }
 
     // [7/7] proxy + cleanup.
-    if skip_proxy {
+    let blocker = if skip_proxy {
         println!("[7/7] proxy skipped (--skip-proxy) — run `arena proxy apply` to repoint nginx.");
+        None
     } else {
         println!("[7/7] re-pointing proxy…");
         // Fleet-wide (not just `owner`'s pods): a single-provider list here used to drop
         // every other provider's forwards, and a failed list (`unwrap_or_default`) all of them.
-        sync_proxy_via(cfg, owner.as_ref(), "replace").await;
-    }
+        let sync = sync_proxy_via(cfg, owner.as_ref(), "replace").await;
+        let proxied = arena_core::proxy::ProxyConfig::from_config(cfg).is_ok()
+            && cfg.machine_names.iter().any(|m| arena_core::naming::qualify(prefix, m) == canonical);
+        replace_cleanup_blocker(&sync, proxied, &canonical, owner.name(), &created.id)
+    };
     if keep_old {
         println!(
             "done — {canonical} is the fresh pod. {old_name} kept (--keep-old); terminate it with \
              `arena pods terminate {old_name}` once you're happy."
+        );
+    } else if let Some(why) = blocker {
+        eprintln!(
+            "{canonical} is the fresh pod, but {old_name} is NOT terminated: {why}. Its stable port \
+             would point at a dead pod. Once `arena proxy apply` routes {canonical} to the new pod, \
+             remove it with `arena pods terminate {old_name}`."
         );
     } else {
         println!("terminating parked {old_name}…");
@@ -4497,6 +4839,42 @@ async fn handle_replace(
         }
     }
     Ok(())
+}
+
+/// Why `pods replace` must keep the parked original instead of terminating it (pure, so
+/// every outcome is table-tested): the canonical name's stable port may still lead to it.
+/// Only a sync that *routed* the canonical forward to the replacement (its owner listed it
+/// with an endpoint — R1) clears that; a sync that failed, was skipped although a proxy is
+/// configured, or merely *kept* the forward (the owner's listing failed, or the new pod was
+/// listed without an endpoint) leaves it on the old target. `proxied` = a proxy is
+/// configured *and* `canonical` has a stable port on it (is in MACHINE_NAME_LIST); without
+/// that no forward can lead to the old pod, so nothing blocks.
+fn replace_cleanup_blocker(
+    sync: &ProxySync,
+    proxied: bool,
+    canonical: &str,
+    provider: &str,
+    new_id: &str,
+) -> Option<String> {
+    if !proxied {
+        return None;
+    }
+    match sync {
+        ProxySync::Skipped(why) => Some(format!("the proxy sync was skipped ({why})")),
+        ProxySync::Failed(e) => Some(format!("the proxy wasn't synced ({})", e.split_whitespace().collect::<Vec<_>>().join(" "))),
+        ProxySync::Synced { routed, failed_providers, .. } => {
+            let on_new = routed.iter().any(|f| {
+                f.name == canonical && f.provider.as_deref() == Some(provider) && f.pod_id.as_deref() == Some(new_id)
+            });
+            if on_new {
+                None
+            } else if failed_providers.iter().any(|p| p == provider) {
+                Some(format!("{provider} failed to list, so the proxy still routes {canonical} to its previous target"))
+            } else {
+                Some(format!("the proxy doesn't route {canonical} to the new pod yet (no SSH endpoint listed for it?)"))
+            }
+        }
+    }
 }
 
 /// Poll `provider` until the pod `id` has an SSH endpoint (ip + port), or `timeout_secs`
@@ -6143,12 +6521,16 @@ mod tests {
             cron_job(false, false),
             ["*/15 * * * * /opt/arena --config /srv/config.env pods backup --no-pull --yes >> /home/u/arena-cron.log 2>&1"]
         );
+        // The proxy line carries a PATH with /usr/sbin (cron's default lacks it, and that's
+        // where nginx lives on Ubuntu) and a `flock -n` so a slow tick can't pile up.
         let both = cron_job(true, true);
         assert_eq!(
             both,
             [
                 "*/15 * * * * /opt/arena --config /srv/config.env pods backup --yes >> /home/u/arena-cron.log 2>&1",
-                "*/5 * * * * /opt/arena --config /srv/config.env proxy apply --yes >> /home/u/arena-proxy-cron.log 2>&1",
+                "*/5 * * * * PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+                 flock -n /home/u/.arena-proxy-cron.lock /opt/arena --config /srv/config.env proxy apply --yes \
+                 >> /home/u/arena-proxy-cron.log 2>&1",
             ]
         );
         // Both live inside the one arena block; re-installing without --proxy drops the
@@ -6171,6 +6553,7 @@ mod tests {
             removed: removed.iter().map(|s| s.to_string()).collect(),
             pending,
             failed_providers: failed.iter().map(|s| s.to_string()).collect(),
+            routed: vec![],
         };
         let removed_one = ChangeCounts { removed: 1, unchanged: 4, ..Default::default() };
         let cases: Vec<(ProxySync, &str)> = vec![
@@ -6206,6 +6589,27 @@ mod tests {
                 ProxySync::Failed("not touching the proxy config: every provider failed".into()),
                 "[proxy] after terminate: NOT synced — not touching the proxy config: every provider \
                  failed (retry: `arena proxy apply`)",
+            ),
+            // What a failing `nginx -t` really prints: several stderr lines, folded into one.
+            (
+                ProxySync::Failed(
+                    "local nginx reload failed: nginx: [emerg] unexpected \"}\" in /p.conf:9\n\
+                     nginx: configuration file /etc/nginx/nginx.conf test failed — previous config put back"
+                        .into(),
+                ),
+                "[proxy] after terminate: NOT synced — local nginx reload failed: nginx: [emerg] \
+                 unexpected \"}\" in /p.conf:9 nginx: configuration file /etc/nginx/nginx.conf test \
+                 failed — previous config put back (retry: `arena proxy apply`)",
+            ),
+            (
+                ProxySync::Failed(
+                    "nginx reload on p.example failed: Warning: Permanently added 'p.example' (ED25519) \
+                     to the list of known hosts.\r\nnginx: [emerg] bind() failed"
+                        .into(),
+                ),
+                "[proxy] after terminate: NOT synced — nginx reload on p.example failed: Warning: \
+                 Permanently added 'p.example' (ED25519) to the list of known hosts. nginx: [emerg] \
+                 bind() failed (retry: `arena proxy apply`)",
             ),
         ];
         for (outcome, want) in cases {
@@ -6265,6 +6669,84 @@ mod tests {
             written_line(&remote, 2, Written::Reloaded).as_deref(),
             Some("[proxy] deployed 2 forward(s) to proxy.example.com and reloaded nginx")
         );
+    }
+
+    #[test]
+    fn replace_keeps_the_old_pod_unless_the_proxy_routes_to_the_new_one() {
+        use super::{replace_cleanup_blocker, ProxySync, Written};
+        use arena_core::proxy::{ChangeCounts, Forward};
+        let fwd = |provider: &str, pod_id: &str| Forward {
+            name: "arena8-apple".into(),
+            public_port: 7000,
+            target_ip: "1.1.1.1".into(),
+            target_port: 22000,
+            provider: Some(provider.into()),
+            pod_id: Some(pod_id.into()),
+        };
+        let synced = |routed: Vec<Forward>, failed: &[&str]| ProxySync::Synced {
+            written: Written::Reloaded,
+            counts: ChangeCounts::default(),
+            removed: vec![],
+            pending: 0,
+            failed_providers: failed.iter().map(|s| s.to_string()).collect(),
+            routed,
+        };
+        // (sync outcome, proxied?, terminate allowed?)
+        let cases: Vec<(ProxySync, bool, bool)> = vec![
+            (synced(vec![fwd("runpod", "new")], &[]), true, true),
+            (ProxySync::Skipped("no proxy configured (SSH_PROXY_HOST unset)".into()), false, true),
+            // an off-list machine has no forward that could lead to the old pod
+            (synced(vec![], &[]), false, true),
+            // still routed to the old pod (its listing said so), or kept-stale (not routed):
+            (synced(vec![fwd("runpod", "old")], &[]), true, false),
+            (synced(vec![], &["runpod"]), true, false),
+            (synced(vec![], &[]), true, false),
+            // the same pod id on another provider isn't the replacement
+            (synced(vec![fwd("vast", "new")], &[]), true, false),
+            (ProxySync::Skipped("nginx not found on this host".into()), true, false),
+            (ProxySync::Failed("nginx reload failed:\nline two".into()), true, false),
+        ];
+        for (sync, configured, may_terminate) in cases {
+            let got = replace_cleanup_blocker(&sync, configured, "arena8-apple", "runpod", "new");
+            assert_eq!(got.is_none(), may_terminate, "{sync:?} -> {got:?}");
+            if let Some(why) = got {
+                assert!(!why.contains('\n'), "{why}");
+            }
+        }
+        let why = replace_cleanup_blocker(&synced(vec![], &["runpod"]), true, "arena8-apple", "runpod", "new").unwrap();
+        assert!(why.contains("runpod failed to list"), "{why}");
+    }
+
+    #[test]
+    fn rename_failure_hint_never_suggests_proxy_apply_mid_prefix_rename() {
+        use super::{rename_failure_hint, RenameRequest};
+        let prefix = rename_failure_hint(&RenameRequest::FromPrefix("arena7".into()), 1, 2);
+        assert!(prefix.starts_with("1 of 2 rename(s) done"), "{prefix}");
+        assert!(prefix.contains("re-run the rename") && prefix.contains("arena7-*"), "{prefix}");
+        assert!(prefix.contains("do NOT run `arena proxy apply`") && prefix.contains("cron"), "{prefix}");
+        // A single rename that failed changed nothing, so `proxy apply` is harmless there.
+        let one = rename_failure_hint(&RenameRequest::One { old: "a".into(), new: "b".into() }, 0, 1);
+        assert!(one.contains("or `arena proxy apply`"), "{one}");
+    }
+
+    #[test]
+    fn plan_config_header_only_says_write_for_a_real_merge() {
+        use super::plan_config_header;
+        assert_eq!(
+            plan_config_header("/srv/p.conf", true),
+            "# ----- nginx config (write to /srv/p.conf on the proxy) -----"
+        );
+        let preview = plan_config_header("/srv/p.conf", false);
+        assert!(preview.contains("LISTING-ONLY PREVIEW") && preview.contains("do NOT deploy"), "{preview}");
+        assert!(!preview.contains("write to"), "{preview}");
+    }
+
+    #[test]
+    fn sh_path_keeps_tilde_expansion_and_quotes_the_rest() {
+        use super::sh_path;
+        assert_eq!(sh_path("~/proxy.conf"), "\"$HOME\"/'proxy.conf'");
+        assert_eq!(sh_path("/etc/nginx/streams-enabled/arena.conf"), "'/etc/nginx/streams-enabled/arena.conf'");
+        assert_eq!(sh_path("/a b/it's"), "'/a b/it'\\''s'");
     }
 
     #[test]
@@ -6356,8 +6838,9 @@ mod tests {
 #[cfg(test)]
 mod proxy_deploy_tests {
     use super::{
-        deploy_proxy, fleet_listing, prepare_proxy, read_current_proxy, sync_proxy, write_proxy, ProxySync,
-        Written,
+        deploy_proxy, emit_proxy_plan, fleet_listing, handle_pods, prepare_proxy, read_current_proxy,
+        remote_install_script, replace_file, sync_proxy, write_proxy, PodCmd, ProxyChanged, ProxySync, Written,
+        INSTALL_FAILED, RELOAD_FAILED_NOT_RESTORED, RELOAD_FAILED_RESTORED,
     };
     use arena_core::proxy::{Listing, ProviderListing, ProxyConfig};
     use arena_core::{Config, Error, Pod, PodSpec, Provider, Result};
@@ -6599,7 +7082,7 @@ mod proxy_deploy_tests {
 
     fn synced(s: &ProxySync) -> (Written, String, Vec<String>, usize, Vec<String>) {
         match s {
-            ProxySync::Synced { written, counts, removed, pending, failed_providers } => {
+            ProxySync::Synced { written, counts, removed, pending, failed_providers, .. } => {
                 (*written, counts.compact(), removed.clone(), *pending, failed_providers.clone())
             }
             other => panic!("expected Synced, got {other:?}"),
@@ -6664,6 +7147,10 @@ mod proxy_deploy_tests {
         fleet.set(vec![("runpod", Ok(vec![apple.clone()])), ("vast", Ok(vec![autumn.clone()]))]);
         let s = sync_proxy(&cfg, &fleet, "up").await;
         assert_eq!(synced(&s), (Written::WriteOnly, "+1 ~0 -0 =0".into(), vec![], 0, vec![]));
+        match &s {
+            ProxySync::Synced { routed, .. } => assert_eq!(routed.len(), 2, "both confirmed by this listing"),
+            other => panic!("{other:?}"),
+        }
         let both = read(&path);
 
         // terminate apple, but runpod still lists it (exited, no endpoint) → kept, untouched.
@@ -6690,5 +7177,236 @@ mod proxy_deploy_tests {
             other => panic!("expected Failed, got {other:?}"),
         }
         assert_eq!(read(&path), text);
+    }
+
+    /// `cfg` with a reload command instead of write-only. The command is a shell snippet
+    /// run via `sh -c` (echo/exit) — never nginx.
+    fn cfg_reloading(path: &Path, reload: &str) -> Config {
+        Config::parse(&format!(
+            "MACHINE_NAME_PREFIX=arena8\nSSH_PROXY_HOST=localhost\nSSH_PROXY_NGINX_CONFIG_PATH={}\n\
+             SSH_PROXY_RELOAD_CMD=\"{reload}\"\nMACHINE_NAME_LIST=(\n  \"apple\"\n  \"autumn\"\n)\n",
+            path.display()
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_failed_reload_puts_the_previous_config_back_so_the_next_sync_retries() {
+        let path = tmp("reload.conf");
+        let marker = tmp("reload.marker");
+        let apple = |ip: &str| pod("runpod", "arena8-apple", ip, 22000);
+        deploy_proxy(&cfg(&path), &listing(vec![("runpod", Ok(vec![apple("1.1.1.1")]))]), false).await.unwrap();
+        let v1 = read(&path);
+
+        // apple moved, but the reload fails: an error, and the live file is v1 again —
+        // what nginx is still running.
+        let failing = cfg_reloading(
+            &path,
+            &format!("echo ran >> {}; echo 'nginx: [emerg] boom' >&2; exit 1", marker.display()),
+        );
+        let moved = listing(vec![("runpod", Ok(vec![apple("2.2.2.2")]))]);
+        let err = deploy_proxy(&failing, &moved, false).await.unwrap_err().to_string();
+        assert!(err.contains("local nginx reload failed: nginx: [emerg] boom"), "{err}");
+        assert!(err.contains("previous config put back"), "{err}");
+        assert_eq!(read(&path), v1);
+
+        // So the next sync still sees the difference: it writes and reloads again (it used
+        // to report "unchanged" here and never reload).
+        let working = cfg_reloading(&path, &format!("echo ran >> {}", marker.display()));
+        let (_, written) = deploy_proxy(&working, &moved, false).await.unwrap();
+        assert_eq!(written, Written::Reloaded);
+        assert!(read(&path).contains("proxy_pass 2.2.2.2:22000;"));
+        assert_eq!(read(&marker).lines().count(), 2, "the reload ran again");
+
+        // No file before + a failing reload: no file left behind either.
+        let fresh = tmp("reload-fresh.conf");
+        assert!(deploy_proxy(&cfg_reloading(&fresh, "exit 1"), &moved, false).await.is_err());
+        assert!(!fresh.exists());
+    }
+
+    #[tokio::test]
+    async fn a_write_planned_against_a_stale_read_is_refused_then_redone() {
+        let path = tmp("cas.conf");
+        let cfg = cfg(&path);
+        let apple = pod("runpod", "arena8-apple", "1.1.1.1", 22000);
+        let autumn = pod("vast", "arena8-autumn", "ssh4.vast.ai", 31000);
+        deploy_proxy(&cfg, &listing(vec![("runpod", Ok(vec![apple.clone()])), ("vast", Ok(vec![]))]), false)
+            .await
+            .unwrap();
+        // Writer A reads and plans: apple moved, vast is down.
+        let a_listing = listing(vec![
+            ("runpod", Ok(vec![pod("runpod", "arena8-apple", "2.2.2.2", 22000)])),
+            ("vast", Err("HTTP 429")),
+        ]);
+        let a = prepare_proxy(&cfg, &a_listing).await.unwrap();
+        // Meanwhile writer B (a lifecycle sync, the cron) adds autumn.
+        deploy_proxy(&cfg, &listing(vec![("runpod", Ok(vec![apple])), ("vast", Ok(vec![autumn]))]), false)
+            .await
+            .unwrap();
+        let b_file = read(&path);
+        assert!(b_file.contains("proxy_pass ssh4.vast.ai:31000;"));
+
+        // A's write would drop autumn (its merge never saw it): refused, file untouched.
+        let err = write_proxy(&cfg, &a).await.unwrap_err();
+        assert!(err.is::<ProxyChanged>(), "{err}");
+        assert_eq!(read(&path), b_file);
+        // Redone against the current file, A's merge moves apple and keeps autumn.
+        deploy_proxy(&cfg, &a_listing, false).await.unwrap();
+        let merged = read(&path);
+        assert!(merged.contains("proxy_pass 2.2.2.2:22000;") && merged.contains("proxy_pass ssh4.vast.ai:31000;"), "{merged}");
+    }
+
+    /// A fresh, empty temp directory (removed with its contents at the end of the test).
+    struct TmpDir(PathBuf);
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn tmp_dir(name: &str) -> TmpDir {
+        let d = std::env::temp_dir().join(format!("arena-proxy-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        TmpDir(d)
+    }
+
+    #[test]
+    fn replace_file_swaps_atomically_and_keeps_mode_and_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp_dir("replace");
+        let real = dir.0.join("real.conf");
+        std::fs::write(&real, "old").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let link = dir.0.join("link.conf");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        replace_file(&link, "new").unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "the link is kept");
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
+        assert_eq!(std::fs::metadata(&real).unwrap().permissions().mode() & 0o777, 0o640);
+        let names: Vec<String> =
+            std::fs::read_dir(&dir.0).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names.len(), 2, "no temp file left behind: {names:?}");
+
+        // A directory we can't create files in (only the file is writable): falls back to
+        // the in-place write instead of failing a deploy that used to work.
+        std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o555)).unwrap();
+        replace_file(&real, "newer").unwrap();
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "newer");
+    }
+
+    #[test]
+    fn remote_install_script_puts_the_previous_config_back_on_a_failed_reload() {
+        // Plain POSIX sh, so it runs here against temp files; the "reload commands" are
+        // true/false/exit — nothing touches nginx or SSH.
+        let dir = tmp_dir("install");
+        let live = dir.0.join("proxy.conf");
+        let upload = dir.0.join("upload.conf");
+        let run_at = |live: &Path, reload: Option<&str>| -> (Option<i32>, Option<String>) {
+            std::fs::write(&upload, "NEW").unwrap();
+            let script = remote_install_script(&live.to_string_lossy(), &upload.to_string_lossy(), reload);
+            let out = std::process::Command::new("sh").args(["-c", &script]).output().unwrap();
+            assert!(!upload.exists(), "upload cleaned up");
+            assert!(!dir.0.join("upload.conf.prev").exists(), "backup cleaned up");
+            (out.status.code(), std::fs::read_to_string(live).ok())
+        };
+        let run = |reload: Option<&str>| run_at(&live, reload);
+        let (new, old) = (Some("NEW".to_string()), Some("OLD".to_string()));
+
+        std::fs::write(&live, "OLD").unwrap();
+        assert_eq!(run(Some("true")), (Some(0), new.clone()));
+        std::fs::write(&live, "OLD").unwrap();
+        assert_eq!(run(Some("echo bad >&2; exit 1")), (Some(RELOAD_FAILED_RESTORED), old.clone()));
+        // A trailing `# comment` in the reload command can't swallow the rest of the script.
+        assert_eq!(run(Some("false # reload")), (Some(RELOAD_FAILED_RESTORED), old.clone()));
+        // The restore itself failing (here: the backup vanished) says so.
+        assert_eq!(run(Some("rm -f \"$b\"; exit 1")).0, Some(RELOAD_FAILED_NOT_RESTORED));
+        // No live file before: a failed reload leaves none; write-only just installs.
+        std::fs::remove_file(&live).unwrap();
+        assert_eq!(run(Some("exit 1")), (Some(RELOAD_FAILED_RESTORED), None));
+        assert_eq!(run(None), (Some(0), new));
+        // Installing where it can't (a missing directory) fails before anything changed.
+        let nowhere = dir.0.join("missing/proxy.conf");
+        assert_eq!(run_at(&nowhere, Some("true")), (Some(INSTALL_FAILED), None));
+    }
+
+    #[test]
+    fn proxy_plan_without_the_current_config_refuses_out() {
+        let out = tmp("plan-out.conf");
+        let remote = Config::parse(
+            "MACHINE_NAME_PREFIX=arena8\nSSH_PROXY_HOST=proxy.example.com\nPROXY_LOCAL=false\n\
+             MACHINE_NAME_LIST=(\n  \"apple\"\n)\n",
+        );
+        let l = listing(vec![("runpod", Ok(vec![pod("runpod", "arena8-apple", "1.1.1.1", 22000)]))]);
+        // A remote proxy's config isn't read by `proxy plan` (it never connects), so the
+        // output is listing-only: saving it for a manual deploy is refused.
+        let err = emit_proxy_plan(&l, &remote, Some(&out)).unwrap_err().to_string();
+        assert!(err.contains("--out needs the current proxy config"), "{err}");
+        assert!(!out.exists());
+        emit_proxy_plan(&l, &remote, None).unwrap();
+        // A local proxy (no file yet = a known, empty config) merges and may save it.
+        let path = tmp("plan-local.conf");
+        emit_proxy_plan(&l, &cfg(&path), Some(&out)).unwrap();
+        assert!(read(&out).contains("proxy_pass 1.1.1.1:22000;"));
+    }
+
+    /// Creates `arena8-apple` (with an endpoint at once, like Hetzner) and fails on any
+    /// other name; lists what it created.
+    struct HalfCreate(std::sync::Mutex<Vec<Pod>>);
+
+    #[async_trait]
+    impl Provider for HalfCreate {
+        fn name(&self) -> &'static str {
+            "runpod"
+        }
+        fn describe(&self, _spec: &PodSpec) -> String {
+            String::new()
+        }
+        async fn list_pods(&self) -> Result<Vec<Pod>> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+        async fn create_pod(&self, spec: &PodSpec) -> Result<Pod> {
+            if spec.name != "arena8-apple" {
+                return Err(Error::provider(format!("create {}: HTTP 400 bad request", spec.name)));
+            }
+            let p = pod("runpod", &spec.name, "1.1.1.1", 22000);
+            self.0.lock().unwrap().push(p.clone());
+            Ok(p)
+        }
+        async fn stop_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn restart_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn terminate_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_create_that_fails_part_way_still_syncs_the_pods_it_made() {
+        let path = tmp("partial-create.conf");
+        let cmd = PodCmd::Create {
+            names: vec!["apple".into(), "autumn".into()],
+            count: None,
+            add: None,
+            gpu: None,
+            gpus: None,
+            cloud: None,
+            disk: None,
+            volume: None,
+            image: None,
+            bootstrap: false,
+            skip_proxy: false,
+            dry_run: false,
+            keep_trying: false,
+            retry_mins: 0,
+            retry_secs: 0,
+        };
+        let err = handle_pods(cmd, &HalfCreate(Default::default()), &cfg(&path), true).await.unwrap_err();
+        assert!(err.to_string().contains("creating arena8-autumn"), "{err}");
+        assert!(read(&path).contains("proxy_pass 1.1.1.1:22000;"), "apple (made before the failure) is forwarded");
     }
 }

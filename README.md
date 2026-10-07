@@ -76,13 +76,19 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     retried automatically with exponential backoff (`retry` module) around create
     and list calls — so a throttle or blip doesn't fail the command.
   - `proxy plan` — read-only; shows the merge against the current config (`+` added,
-    `~` changed, `-` removed, `=` kept-stale, plus a `+N added, ~N changed, …` summary;
-    a remote proxy's diff isn't shown) and prints the nginx `stream` config (`--out`
-    saves it locally; never connects to the proxy). `proxy apply` prints the same
-    changes, confirms, then **deploys** the config (locally, or over SSH when
-    `PROXY_LOCAL=false`) and runs `SSH_PROXY_RELOAD_CMD` — default `nginx -t && nginx -s
-    reload`; set it **empty** for write-only (never reloads nginx). `--dry-run` shows the
-    exact write/scp + reload without doing it. This is the one place the tool touches the
+    `~` changed — including a kept entry whose port moved with the list —, `-` removed,
+    `=` kept-stale, plus a `+N added, ~N changed, …` summary) and prints the nginx
+    `stream` config (`--out` saves it locally; never connects to the proxy). Without the
+    current config (remote proxy, unreadable file) it's labelled a **listing-only
+    preview** and `--out` is refused — deployed by hand it would drop every kept forward.
+    `proxy apply` prints the same changes, confirms, then **deploys** the config (locally,
+    or over SSH when `PROXY_LOCAL=false`) and runs `SSH_PROXY_RELOAD_CMD` — default
+    `nginx -t && nginx -s reload`; set it **empty** (in the file, or exported empty by a
+    wrapper) for write-only (never reloads nginx). Writes are serialized (`flock`), refuse
+    to overwrite a config another run changed since it was read (the merge is redone), and
+    are atomic locally (temp + rename). A **failed reload puts the previous config back**,
+    so the next sync retries instead of reporting "unchanged". `--dry-run` shows the
+    write/upload + reload without doing it. This is the one place the tool touches the
     proxy host.
   - **Auto proxy sync.** `pods create`, `up`, `rename`, `reimage`, `terminate` (one or
     `--all`), `replace` and `migrate cutover/revert` end by re-syncing the proxy through the
@@ -92,9 +98,13 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     listing or write error → a warning, never a failed command. `--skip-proxy` (create,
     terminate, rename, reimage, replace, migrate) opts out. A just-terminated pod can still
     be listed briefly, so its forward may survive that sync; the next one removes it. A
-    partly failed `rename` batch doesn't sync (a `--from-prefix` batch would drop the
-    not-yet-renamed pods' forwards). `migrate cutover` still treats a sync that didn't land
-    as a failure and auto-reverts.
+    `create`/`up` that fails part-way still syncs for the pods it made. A partly failed
+    `rename` batch doesn't sync: with `--from-prefix`, re-run the rename *before* any
+    `proxy apply`/lifecycle command/proxy cron tick, which would drop the not-yet-renamed
+    pods' forwards. `migrate cutover` still treats a sync that didn't land as a failure and
+    auto-reverts; `replace` only terminates the old pod once the sync routed the name to
+    the new one (else it keeps it and says why). Provider list calls are bounded (60s),
+    so a stalled API reads as "failed to list" (forwards kept), not a hang.
   - `plan check | show` — a scheduled provisioning plan (`arena-plan.json`, see
     `arena-plan.example.json`): per-day target fleets with **GPU-first fallback chains**
     (e.g. `A4000` across community→secure→vast, then `3090`, then `A5000`) and a night
@@ -109,7 +119,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     (default every 15 min, git-only; `--pull` runs the full backup — git + rsync file
     backup — each tick; `--start-date` bakes `ARENA_START_DATE` into the line); edits only
     arena-managed lines, leaving other entries intact. `--proxy` adds a `*/5 … proxy apply
-    --yes` line (log: `~/arena-proxy-cron.log`) that catches changes made outside the CLI
+    --yes` line (log: `~/arena-proxy-cron.log`; sets a `PATH` with `/usr/sbin` so cron
+    finds nginx, and `flock -n` so a slow tick never piles up) that catches changes made outside the CLI
     (dashboard terminates, restarts that move an endpoint); re-running `install` without
     it removes that line. Remove it before changing `MACHINE_NAME_PREFIX`/`_LIST`: a name
     that leaves the list loses its forward on the next tick.

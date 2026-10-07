@@ -32,7 +32,8 @@
 //! from a provider whose listing *succeeded*:
 //!
 //! - **R1** pod listed with an endpoint → forward to it (added / changed / unchanged);
-//! - **R2** pod listed without a usable endpoint → keep the previous forward;
+//! - **R2** pod listed without a usable endpoint → keep the previous forward (its recorded
+//!   owner only changes hands once the old owner is confirmed gone, as in R3);
 //! - **R3** previous forward absent from its provider's successful listing → removed
 //!   (a legacy entry with no recorded owner: only if *every* provider listed OK);
 //! - **R4** previous forward whose provider failed to list (or wasn't queried) → kept;
@@ -107,7 +108,9 @@ impl ProxyConfig {
 /// `SSH_PROXY_RELOAD_CMD`: **absent** → [`DEFAULT_RELOAD_CMD`] (prod's behaviour, so an
 /// existing config is unaffected); **present but empty** → `""` = write-only, never reload;
 /// otherwise the given command (e.g. `sudo systemctl reload nginx`). Absent and empty are
-/// deliberately different: an empty value is an explicit "don't touch nginx".
+/// deliberately different: an empty value is an explicit "don't touch nginx". It may also
+/// be set (to empty) from the environment, even when the file lacks it — how a wrapper on a
+/// box shared with a production nginx guarantees write-only.
 pub fn reload_cmd_from(cfg: &Config) -> String {
     match cfg.get("SSH_PROXY_RELOAD_CMD") {
         None => DEFAULT_RELOAD_CMD.to_string(),
@@ -222,7 +225,9 @@ impl Listing {
     }
 }
 
-/// What the plan does to one machine's forward.
+/// What the plan does to one machine's forward. `Added`, `Changed` and `Unchanged` come
+/// only from R1, so they mean "routed to the endpoint the listing reports for this pod";
+/// `Kept` never does (see [`ProxyPlan::routed`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChangeKind {
     /// New forward (no previous entry for this name).
@@ -232,8 +237,11 @@ pub enum ChangeKind {
     /// Previous entry dropped — the pod is confirmed gone, or the entry is invalid.
     Removed { reason: String },
     /// Previous entry carried over unconfirmed (stale): its pod was listed without an
-    /// endpoint, or its provider couldn't be listed.
-    Kept { reason: String },
+    /// endpoint, or its provider couldn't be listed. `moved_from` is its old public port
+    /// when the `MACHINE_NAME_LIST` index moved it: a port move breaks participants' SSH
+    /// configs even though the target is unchanged, so it's shown with `~` and counted as
+    /// *changed*, never hidden among the quiet `=` lines.
+    Kept { reason: String, moved_from: Option<u16> },
     /// Same routing as before.
     Unchanged,
 }
@@ -291,11 +299,24 @@ impl ProxyPlan {
                 ChangeKind::Added => c.added += 1,
                 ChangeKind::Changed { .. } => c.changed += 1,
                 ChangeKind::Removed { .. } => c.removed += 1,
+                ChangeKind::Kept { moved_from: Some(_), .. } => c.changed += 1,
                 ChangeKind::Kept { .. } => c.kept += 1,
                 ChangeKind::Unchanged => c.unchanged += 1,
             }
         }
         c
+    }
+
+    /// The forwards this plan routes to an endpoint the listing *confirmed* (R1: added,
+    /// changed or unchanged) — as opposed to kept-stale ones, whose target may be a pod
+    /// that's already gone. A caller about to destroy the pod a forward used to point at
+    /// (e.g. `pods replace` terminating the parked original) checks this first.
+    pub fn routed(&self) -> Vec<Forward> {
+        self.changes
+            .iter()
+            .filter(|c| matches!(c.kind, ChangeKind::Added | ChangeKind::Changed { .. } | ChangeKind::Unchanged))
+            .map(|c| c.forward.clone())
+            .collect()
     }
 
     /// `+N added, ~N changed, -N removed, =N kept (stale), N unchanged` — the line
@@ -330,7 +351,10 @@ fn change_line(c: &Change, proxy_host: &str) -> String {
         }
         ChangeKind::Changed { from } => ('~', format!("was {}", from.target())),
         ChangeKind::Removed { reason } => ('-', format!("removed: {reason}")),
-        ChangeKind::Kept { reason } => ('=', format!("kept: {reason}")),
+        ChangeKind::Kept { reason, moved_from: Some(old) } => {
+            ('~', format!("port moved :{old} -> :{}; kept: {reason}", f.public_port))
+        }
+        ChangeKind::Kept { reason, moved_from: None } => ('=', format!("kept: {reason}")),
         ChangeKind::Unchanged => (' ', owner.to_string()),
     };
     format!(
@@ -403,6 +427,25 @@ fn endpoint(pod: &Pod) -> std::result::Result<(String, u16), EndpointIssue> {
     Ok((ip.to_string(), port))
 }
 
+/// Why the listing can't confirm anything about a forward owned by `owner` — `None` when
+/// "absent" *would* be a confirmation: the owner's provider listed OK, or (a legacy entry
+/// with no recorded owner) every provider did. Shared by R2 (may the forward change
+/// hands?) and R3/R4 (may it be dropped?), so both ask the same question.
+fn owner_unconfirmed(owner: Option<&str>, listing: &Listing) -> Option<String> {
+    match owner {
+        Some(o) => match listing.status(o) {
+            ListingStatus::Ok => None,
+            ListingStatus::Failed(e) => Some(format!("{o} listing failed: {e}")),
+            ListingStatus::NotQueried => Some(format!("{o} was not queried")),
+        },
+        None if listing.all_ok() => None,
+        None => {
+            let failed: Vec<&str> = listing.errors().iter().map(|(prov, _)| *prov).collect();
+            Some(format!("owner unknown (legacy entry) and {} failed to list", failed.join(", ")))
+        }
+    }
+}
+
 /// Build the forwarding plan by merging the previous forwards with a per-provider
 /// listing (rules R1–R5 in the module docs). Pure (no I/O) so every rule is table-tested:
 /// the caller passes the fixed machine candidate list, the forwards parsed from the
@@ -434,7 +477,10 @@ pub fn plan_forwards(
         plan.changes = plan
             .forwards
             .iter()
-            .map(|f| Change { forward: f.clone(), kind: ChangeKind::Kept { reason: "nothing written".into() } })
+            .map(|f| Change {
+                forward: f.clone(),
+                kind: ChangeKind::Kept { reason: "nothing written".into(), moved_from: None },
+            })
             .collect();
         plan.abort = Some(reason);
         return plan;
@@ -558,17 +604,23 @@ pub fn plan_forwards(
                 plan.forwards.push(f.clone());
                 plan.changes.push(Change { forward: f, kind });
             }
-            // R2: listed without a usable endpoint → keep the previous forward. The owner
-            // becomes the pod that holds the name *now*: its provider's listing is what
-            // decides the entry's fate from here on.
+            // R2: listed without a usable endpoint → keep the previous forward. The pod that
+            // holds the name now becomes its owner (whose listing decides the entry's fate
+            // from here on) only once the *previous* owner is confirmed gone — its provider
+            // listed OK, or for a legacy entry every provider did. Otherwise a same-name pod
+            // elsewhere (a stale stopped duplicate, a `create` while the real owner's provider
+            // was hiding it) would inherit the forward, and the next sync would drop it on
+            // that pod's disappearance while the real owner still hadn't answered (R3/R4).
             Err(issue) => match prev_f {
                 Some(p) if safe_host(&p.target_ip) && p.target_port != 0 => {
-                    let f = Forward { public_port, provider: Some(prov.to_string()), pod_id, ..p.clone() };
+                    let listed = format!("listed by {prov} {}", issue.short());
+                    let (f, reason) = match owner_unconfirmed(p.provider.as_deref(), listing) {
+                        None => (Forward { public_port, provider: Some(prov.to_string()), pod_id, ..p.clone() }, listed),
+                        Some(why) => (Forward { public_port, ..p.clone() }, format!("{listed}; owner kept — {why}")),
+                    };
+                    let moved_from = (p.public_port != public_port).then_some(p.public_port);
                     plan.forwards.push(f.clone());
-                    plan.changes.push(Change {
-                        forward: f,
-                        kind: ChangeKind::Kept { reason: format!("listed by {prov} {}", issue.short()) },
-                    });
+                    plan.changes.push(Change { forward: f, kind: ChangeKind::Kept { reason, moved_from } });
                 }
                 Some(p) => {
                     plan.skipped.push(Skipped { name: name.clone(), reason: issue.skip_reason() });
@@ -607,29 +659,17 @@ pub fn plan_forwards(
             plan.changes.push(removed(format!("previous target {:?} is not a plain host:port", p.target())));
             continue;
         }
-        let keep_reason = match p.provider.as_deref() {
-            Some(owner) => match listing.status(owner) {
-                ListingStatus::Ok => {
-                    plan.changes.push(removed(format!("no longer listed by {owner} (terminated or renamed)")));
-                    continue;
-                }
-                ListingStatus::Failed(e) => format!("{owner} listing failed: {e}"),
-                ListingStatus::NotQueried => format!("{owner} was not queried"),
-            },
-            // A legacy entry doesn't say which provider owns it, so "absent" is only a
-            // confirmation when every provider answered.
-            None if listing.all_ok() => {
-                plan.changes.push(removed("not listed by any provider (legacy entry, owner unknown)".into()));
-                continue;
-            }
-            None => {
-                let failed: Vec<&str> = listing.errors().iter().map(|(prov, _)| *prov).collect();
-                format!("owner unknown (legacy entry) and {} failed to list", failed.join(", "))
-            }
+        let Some(keep_reason) = owner_unconfirmed(p.provider.as_deref(), listing) else {
+            plan.changes.push(removed(match p.provider.as_deref() {
+                Some(owner) => format!("no longer listed by {owner} (terminated or renamed)"),
+                None => "not listed by any provider (legacy entry, owner unknown)".into(),
+            }));
+            continue;
         };
+        let moved_from = (p.public_port != public_port).then_some(p.public_port);
         let f = Forward { public_port, ..p.clone() };
         plan.forwards.push(f.clone());
-        plan.changes.push(Change { forward: f, kind: ChangeKind::Kept { reason: keep_reason } });
+        plan.changes.push(Change { forward: f, kind: ChangeKind::Kept { reason: keep_reason, moved_from } });
     }
     for d in prev_dupes {
         plan.changes.push(Change {
@@ -1028,7 +1068,7 @@ mod tests {
             assert_eq!(plan.forwards, prev, "{why}");
             assert!(plan.pending.is_empty(), "{why}: a kept forward isn't pending");
             match kind_of(&plan, "arena8-apple") {
-                ChangeKind::Kept { reason } => {
+                ChangeKind::Kept { reason, .. } => {
                     assert!(reason.starts_with("listed by runpod"), "{reason}");
                     assert!(reason.contains(why), "{reason} !~ {why}");
                 }
@@ -1067,7 +1107,7 @@ mod tests {
         let plan = plan_forwards(&cfg(), "arena8", &candidates(), &prev, &one_failed);
         assert_eq!(plan.forwards, prev);
         match kind_of(&plan, "arena8-bloom") {
-            ChangeKind::Kept { reason } => assert!(reason.contains("owner unknown") && reason.contains("vast"), "{reason}"),
+            ChangeKind::Kept { reason, .. } => assert!(reason.contains("owner unknown") && reason.contains("vast"), "{reason}"),
             other => panic!("expected Kept, got {other:?}"),
         }
     }
@@ -1084,7 +1124,7 @@ mod tests {
             assert_eq!(plan.forwards, prev);
             assert!(plan.abort.is_none());
             match kind_of(&plan, "arena8-autumn") {
-                ChangeKind::Kept { reason } => assert!(reason.contains(want), "{reason}"),
+                ChangeKind::Kept { reason, .. } => assert!(reason.contains(want), "{reason}"),
                 other => panic!("expected Kept, got {other:?}"),
             }
         }
@@ -1148,7 +1188,7 @@ mod tests {
         assert!(plan.abort.is_none());
         assert_eq!(plan.forwards.len(), 2);
         assert!(matches!(kind_of(&plan, "arena8-apple"), ChangeKind::Changed { .. }));
-        assert!(matches!(kind_of(&plan, "arena8-autumn"), ChangeKind::Kept { reason } if reason.contains("vast listing failed")));
+        assert!(matches!(kind_of(&plan, "arena8-autumn"), ChangeKind::Kept { reason, .. } if reason.contains("vast listing failed")));
         assert_eq!(plan.summary(), "+0 added, ~1 changed, -0 removed, =1 kept (stale), 0 unchanged");
     }
 
@@ -1259,7 +1299,7 @@ mod tests {
         ]);
         let plan = plan_forwards(&cfg(), "arena8", &candidates(), &prev, &l);
         assert_eq!(kind_of(&plan, "arena8-apple"), &ChangeKind::Unchanged);
-        assert!(matches!(kind_of(&plan, "arena8-autumn"), ChangeKind::Kept { reason } if reason.contains("legacy")));
+        assert!(matches!(kind_of(&plan, "arena8-autumn"), ChangeKind::Kept { reason, .. } if reason.contains("legacy")));
         let migrated = render_nginx(&plan.forwards);
         assert!(migrated.contains("name=arena8-apple port=7000 target=1.1.1.1:22000 provider=runpod"));
         // autumn stays legacy (no provider=) until a listing actually claims it.
@@ -1332,6 +1372,105 @@ mod tests {
         let same = plan_forwards(&cfg(), "arena8", &cands, &plan.forwards, &l);
         assert!(same.change_lines("h", false).iter().all(|l| l.starts_with('=')));
         assert!(same.change_lines("h", true).iter().any(|l| l.starts_with("  arena8-apple")));
+    }
+
+    #[test]
+    fn r2_never_hands_a_forward_to_a_same_name_pod_while_its_owner_is_unconfirmed() {
+        // apple's real pod is on vast (v1). Tick 1: vast 429s while runpod lists a stale
+        // same-name pod r0 without an endpoint. Tick 2: r0 is gone, vast still 429s. The
+        // forward must survive both — vast never confirmed v1 gone. Driven through the
+        // rendered file, the way successive syncs see it. Then the same for a legacy entry
+        // (no recorded owner), which only goes once *every* provider lists OK.
+        let owned = Forward { pod_id: Some("v1".into()), ..fwd("arena8-apple", 7000, "ssh4.vast.ai", 31000, Some("vast")) };
+        let legacy = fwd("arena8-apple", 7000, "ssh4.vast.ai", 31000, None);
+        let stale = pod_on("runpod", "r0", "arena8-apple", None, None);
+        let tick1 = listing(vec![ok("runpod", vec![stale]), failed("vast", "vast list HTTP 429")]);
+        let tick2 = listing(vec![ok("runpod", vec![]), failed("vast", "vast list HTTP 429")]);
+        for prev in [owned, legacy] {
+            let file0 = render_nginx(std::slice::from_ref(&prev));
+            let p1 = plan_forwards(&cfg(), "arena8", &candidates(), &parse_nginx(&file0), &tick1);
+            match kind_of(&p1, "arena8-apple") {
+                ChangeKind::Kept { reason, moved_from: None } => {
+                    assert!(reason.starts_with("listed by runpod without endpoint; owner kept"), "{reason}")
+                }
+                other => panic!("tick 1: expected Kept, got {other:?}"),
+            }
+            assert_eq!(p1.forwards, vec![prev.clone()], "the owner must not move to runpod/r0");
+            let file1 = render_nginx(&p1.forwards);
+            assert_eq!(file1, file0, "nothing to write on tick 1");
+
+            let p2 = plan_forwards(&cfg(), "arena8", &candidates(), &parse_nginx(&file1), &tick2);
+            assert!(matches!(kind_of(&p2, "arena8-apple"), ChangeKind::Kept { .. }), "tick 2: {p2:?}");
+            assert_eq!(p2.forwards, vec![prev.clone()]);
+            assert_eq!(p2.counts().removed, 0);
+        }
+    }
+
+    #[test]
+    fn r2_hands_the_forward_over_once_the_previous_owner_is_confirmed_gone() {
+        // (prev owner, listing) → the holder (runpod/r0, no endpoint) takes ownership.
+        let stale = pod_on("runpod", "r0", "arena8-apple", None, None);
+        let cases = vec![
+            // vast listed OK without apple: v1 is confirmed gone.
+            (Some("vast"), listing(vec![ok("runpod", vec![stale.clone()]), ok("vast", vec![])])),
+            // the holder is on the owner's own provider, which listed OK.
+            (Some("runpod"), listing(vec![ok("runpod", vec![stale.clone()]), failed("vast", "HTTP 429")])),
+            // legacy entry and every provider answered.
+            (None, listing(vec![ok("runpod", vec![stale.clone()]), ok("vast", vec![])])),
+        ];
+        for (owner, l) in cases {
+            let prev = vec![Forward { pod_id: owner.map(|_| "old".into()), ..fwd("arena8-apple", 7000, "1.1.1.1", 22000, owner) }];
+            let plan = plan_forwards(&cfg(), "arena8", &candidates(), &prev, &l);
+            let f = &plan.forwards[0];
+            assert_eq!((f.provider.as_deref(), f.pod_id.as_deref()), (Some("runpod"), Some("r0")), "owner={owner:?}");
+            assert_eq!(f.target(), "1.1.1.1:22000", "the target itself is still the kept one");
+            assert!(matches!(kind_of(&plan, "arena8-apple"), ChangeKind::Kept { reason, .. } if reason == "listed by runpod without endpoint"));
+            assert!(plan.routed().is_empty(), "a kept forward is never 'routed'");
+        }
+    }
+
+    #[test]
+    fn kept_entry_whose_port_moved_is_reported_as_a_change() {
+        // apple moved from index 0 to 1 while its owner (vast) is down (R4), and bloom moved
+        // while listed without an endpoint (R2): both keep their targets, but the stable
+        // port changed — that must read as `~`, not as a quiet `=`.
+        let prev = vec![
+            fwd("arena8-apple", 7000, "ssh4.vast.ai", 31000, Some("vast")),
+            fwd("arena8-bloom", 7002, "3.3.3.3", 22, Some("runpod")),
+        ];
+        let cands: Vec<String> = vec!["bloom".into(), "apple".into()];
+        let l = listing(vec![ok("runpod", vec![pod("arena8-bloom", None, None)]), failed("vast", "HTTP 429")]);
+        let plan = plan_forwards(&cfg(), "arena8", &cands, &prev, &l);
+        assert_eq!(
+            plan.forwards.iter().map(|f| (f.name.as_str(), f.public_port)).collect::<Vec<_>>(),
+            [("arena8-bloom", 7000), ("arena8-apple", 7001)]
+        );
+        assert!(matches!(kind_of(&plan, "arena8-apple"), ChangeKind::Kept { moved_from: Some(7000), .. }));
+        assert!(matches!(kind_of(&plan, "arena8-bloom"), ChangeKind::Kept { moved_from: Some(7002), .. }));
+        let lines = plan.change_lines("h", false);
+        assert!(lines[0].starts_with("~ arena8-bloom") && lines[0].contains("port moved :7002 -> :7000; kept: listed by runpod"), "{}", lines[0]);
+        assert!(lines[1].starts_with("~ arena8-apple") && lines[1].contains("port moved :7000 -> :7001; kept: vast listing failed"), "{}", lines[1]);
+        assert_eq!(plan.counts().compact(), "+0 ~2 -0 =0");
+        assert_eq!(plan.summary(), "+0 added, ~2 changed, -0 removed, =0 kept (stale), 0 unchanged");
+
+        // An unmoved kept entry stays a quiet `=`.
+        let same = plan_forwards(&cfg(), "arena8", &cands, &plan.forwards, &l);
+        assert_eq!(same.counts().compact(), "+0 ~0 -0 =2");
+    }
+
+    #[test]
+    fn routed_is_only_what_the_listing_confirmed() {
+        let prev = vec![
+            fwd("arena8-apple", 7000, "1.1.1.1", 22000, Some("runpod")),
+            fwd("arena8-autumn", 7001, "ssh4.vast.ai", 31000, Some("vast")),
+        ];
+        let l = listing(vec![
+            ok("runpod", vec![pod("arena8-apple", Some("1.1.1.1"), Some(22000)), pod("arena8-bloom", Some("3.3.3.3"), Some(22))]),
+            failed("vast", "HTTP 429"),
+        ]);
+        let plan = plan_forwards(&cfg(), "arena8", &candidates(), &prev, &l);
+        let routed: Vec<String> = plan.routed().into_iter().map(|f| f.name).collect();
+        assert_eq!(routed, ["arena8-apple", "arena8-bloom"], "autumn is kept-stale, not routed");
     }
 
     #[test]
