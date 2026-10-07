@@ -195,12 +195,17 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     < 2 MB/s or unreachable, < 10 GB free, host load above max(32, host CPUs), a
     maintenance window. Driver floor: `MIN_DRIVER_VERSION` (`none` = off), else derived from
     `ALLOWED_CUDA_VERSIONS` (13.x → 580, 12.8 → 570, 12.4 → 550, …; the lowest listed
-    version wins), else no driver check. Hetzner CPU VMs skip the GPU checks. Output: a
+    version wins), else no driver check. Hetzner CPU VMs skip the GPU checks (decided by
+    provider only: a RunPod/Vast pod the API reports with 0 GPUs still gets them, plus a
+    `provider` warning). Output: a
     `NAME RESULT GPUS DRIVER CUDA NET NOTES` table, `-v` lists every check, and a `same
-    host?` line when ≥2 failing pods share a public IP (a bad host breaks every pod on it).
-    `--json` prints per-pod `{name, provider, status, checks, facts}` (no IPs). Exits
+    host?` line when ≥2 failing pods share a machine IP (a bad host breaks every pod on it;
+    Vast pods sit behind a shared SSH proxy, so they're never grouped).
+    `--json` prints per-pod `{id, name, provider, status, checks, facts}` (no IPs) — `[]`
+    when no pod could be checked; summary/notes go to stderr. Exits
     non-zero if any pod FAILs; warnings don't. Names scope the run (a named pod with no SSH
-    endpoint is a FAIL; a typo is an error).
+    endpoint is a FAIL; a typo is an error). Two pods sharing a name each get their own row
+    (with a warning naming their ids).
   - `pods pull [label]` — the **file** backup (complementing the git `backup`): rsyncs
     each pod's home into `<dir>/<label>/<pod>/`, reporting files/bytes moved per pod.
     **Keeps `.git`** (so the backup is a usable repo; `--no-git` to skip), size-caps with
@@ -224,8 +229,10 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     is the remote path (trailing `/` = into that dir). Creates the remote parent dir and
     **verifies the file landed** (size check; flags a silent scp non-write or a
     misplacement when the dest is actually a directory) rather than trusting scp's exit
-    code. Per pod it runs mkdir → scp → check and stops at the first failure; the scp
-    has a 10-min budget, the mkdir/check 20s each. Confirms first; `--dry-run` previews.
+    code. Per pod it runs mkdir → scp → check and stops at the first failure; the scp's
+    budget scales with what's sent — 10 min plus 1s per MB × pods (all copies share your
+    uplink; `-r` counts the tree), or `--timeout <secs>` — and the mkdir/check get 20s
+    each. Confirms first (the preview shows the budget); `--dry-run` previews.
   - `keys gen|list|rotate|revoke` — manage **OpenRouter** runtime keys via the
     provisioning API (needs `OPENROUTER_PROVISIONING_KEY`). `gen [machines|--all]` mints
     one key per machine (named `<prefix>-<machine>`) with a USD cap (`--limit`, default
@@ -393,9 +400,11 @@ Notes / sharp edges to know:
   other pods carry on. Budgets: quick probes 20s (`list` GPU probe, `cp` mkdir/check,
   replace/migrate identity/marker checks), `test` 90s, `test --deep` 150s,
   `set-branch`/`init-branches` 2 min,
-  `backup` git push 5 min, `cp` scp 10 min, `run` `--timeout` (default 30 min), the
-  replace/migrate direct pod-to-pod copy 2 h (a copy that runs out stops the replace —
-  nothing swapped, re-run to continue — rather than redo it via local staging);
+  `backup` git push 5 min, `cp` scp 10 min + 1s per MB × pods (or `--timeout`), `run`
+  `--timeout` (default 30 min), the replace/migrate direct pod-to-pod copy 2 h (a copy that
+  runs out stops rather than redo it via local staging — nothing swapped; re-running
+  `migrate copy` continues it, and a stopped `replace` leaves `<name>-new` running: continue
+  with `migrate copy <name>` + `migrate cutover <name>`, or terminate it);
   `setup`/`copy-keys` as described above. rsync transfers (`pull`, the replace/migrate
   via-local copy) have no budget yet.
 - A non-empty `--include` that matches nothing now **errors** (not a silent no-op);
