@@ -59,6 +59,9 @@ fn create_payload(spec: &PodSpec) -> Value {
     if let Some(args) = &spec.docker_args {
         payload["dockerStartCmd"] = Value::Array(args.iter().map(|s| Value::String(s.clone())).collect());
     }
+    if !spec.allowed_cuda.is_empty() {
+        payload["allowedCudaVersions"] = json!(spec.allowed_cuda);
+    }
     payload
 }
 
@@ -121,8 +124,13 @@ impl Provider for RunpodProvider {
             String::new()
         };
         let bootstrap = if spec.docker_args.is_some() { ", +bootstrap start script" } else { "" };
+        let cuda = if spec.allowed_cuda.is_empty() {
+            String::new()
+        } else {
+            format!(", CUDA {}", spec.allowed_cuda.join("/"))
+        };
         format!(
-            "{} x{}, {}, disk {}GB{volume}, image {}{bootstrap}",
+            "{} x{}, {}, disk {}GB{volume}, image {}{bootstrap}{cuda}",
             spec.gpu_type, spec.gpu_count, spec.cloud_type, spec.disk_gb, spec.image
         )
     }
@@ -318,6 +326,7 @@ fn parse_spec(v: &Value) -> PodSpec {
         ports,
         env,
         docker_args: None,
+        allowed_cuda: Vec::new(),
     }
 }
 
@@ -419,6 +428,7 @@ mod tests {
             ports: "8888/http,22/tcp".into(),
             env: vec![("PUBLIC_KEY".into(), "ssh-ed25519 AAAA test".into())],
             docker_args: None,
+            allowed_cuda: Vec::new(),
         }
     }
 
@@ -465,6 +475,14 @@ mod tests {
         // PUBLIC_KEY + MACHINE_NAME dropped (replace re-seeds them); other env kept.
         assert_eq!(s.env, vec![("WANDB_KEY".to_string(), "w".to_string())]);
         assert!(s.docker_args.is_none());
+    }
+
+    #[test]
+    fn payload_sends_allowed_cuda_only_when_set() {
+        let mut s = spec();
+        assert!(create_payload(&s).get("allowedCudaVersions").is_none());
+        s.allowed_cuda = vec!["13.0".into()];
+        assert_eq!(create_payload(&s)["allowedCudaVersions"], json!(["13.0"]));
     }
 
     #[test]

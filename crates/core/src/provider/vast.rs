@@ -335,6 +335,7 @@ mod tests {
             ports: "8888/http,22/tcp".into(),
             env: vec![],
             docker_args: None,
+            allowed_cuda: Vec::new(),
         }
     }
 

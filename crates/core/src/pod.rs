@@ -35,6 +35,9 @@ pub struct PodSpec {
     /// overrides it — e.g. the `--bootstrap` start script (`["bash","-c", …]`) that installs
     /// + launches sshd on a non-arena base image (NVIDIA NGC, etc.) so the pod is reachable.
     pub docker_args: Option<Vec<String>>,
+    /// Host CUDA versions the pod may land on (RunPod `allowedCudaVersions`, e.g. "13.0").
+    /// Empty = any host. The cu130 arena image needs a CUDA 13 driver (>= 580).
+    pub allowed_cuda: Vec<String>,
 }
 
 impl PodSpec {
@@ -69,6 +72,9 @@ impl PodSpec {
             ports: "8888/http,22/tcp".to_string(),
             env,
             docker_args: None,
+            allowed_cuda: first(&["ALLOWED_CUDA_VERSIONS", "RUNPOD_ALLOWED_CUDA_VERSIONS"])
+                .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+                .unwrap_or_default(),
         }
     }
 }
