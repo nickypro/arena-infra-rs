@@ -771,8 +771,27 @@ enum PodCmd {
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// Health check: torch version on every pod (read-only; 90s budget per pod).
-    Test,
+    /// Health check (read-only). Plain: torch version on every pod (90s budget per pod).
+    ///
+    /// `--deep`: per-GPU CUDA tensor op, driver vs the configured floor
+    /// (`MIN_DRIVER_VERSION`, else derived from `ALLOWED_CUDA_VERSIONS`), torch device
+    /// count vs nvidia-smi, GPU↔GPU copy + NCCL all_reduce (only with >1 GPU), Hugging
+    /// Face download speed, disk, host load, maintenance window. One pass/warn/fail row
+    /// per pod (150s budget each); exits non-zero if any pod FAILs (warnings don't).
+    Test {
+        /// Run the deep check instead of the torch-version check.
+        #[arg(long)]
+        deep: bool,
+        /// Only these pods (name, bare name or id). Default: every pod with an SSH endpoint.
+        #[arg(requires = "deep")]
+        names: Vec<String>,
+        /// Emit per-pod `{name, provider, status, checks[], facts}` as JSON on stdout.
+        #[arg(long, requires = "deep")]
+        json: bool,
+        /// Print every check of every pod, not just the table.
+        #[arg(short, long, requires = "deep")]
+        verbose: bool,
+    },
     /// Distribute API keys to pods' shells (per-host CSVs + broadcast HF token).
     CopyKeys {
         /// Pod(s) to copy to (name or id) — a positional shorthand for --include. Omit to
@@ -2252,6 +2271,18 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
             t.bare_vm.as_secs()
         ),
         Err(e) => println!("  ✗ setup step budgets        {e}"),
+    }
+    // The driver floor `pods test --deep` holds pods to (MIN_DRIVER_VERSION, else derived
+    // from ALLOWED_CUDA_VERSIONS).
+    match arena_core::health::HealthPolicy::from_config(cfg) {
+        Ok(p) => match p.min_driver {
+            Some(f) => {
+                let v = f.version.iter().map(u32::to_string).collect::<Vec<_>>().join(".");
+                println!("  · deep-check driver floor   ≥ {v} ({})", f.why)
+            }
+            None => println!("  · deep-check driver floor   none (no MIN_DRIVER_VERSION / ALLOWED_CUDA_VERSIONS)"),
+        },
+        Err(e) => println!("  ✗ deep-check driver floor   {e}"),
     }
 
     if missing.is_empty() {
@@ -3897,7 +3928,11 @@ async fn handle_pods(
             let budget = Duration::from_secs(timeout);
             handle_run(provider, remote, cfg, &cmd, budget, dry_run, yes, /*confirm*/ true, /*compact*/ false).await?;
         }
-        PodCmd::Test => {
+        PodCmd::Test { deep: true, names, json, verbose } => {
+            // Read-only: no confirm.
+            handle_deep_test(provider, remote, cfg, &names, json, verbose).await?;
+        }
+        PodCmd::Test { deep: false, .. } => {
             // Read-only: no confirm, compact one-line-per-pod output.
             handle_run(
                 provider,
@@ -4040,6 +4075,134 @@ fn render_run(results: &[RunResult], compact: bool) -> (Vec<String>, usize) {
     }
     lines.push(format!("\n{ok} ok, {bad} failed"));
     (lines, bad)
+}
+
+/// `pods test --deep`: run the deep check on the pods (see [`deep_check_fleet`]), print
+/// the pass/warn/fail table (or JSON), and fail the command if any pod FAILed — so a
+/// script or `up --check` can gate on it. Warnings (slow network, maintenance, …) are
+/// reported but don't change the exit status.
+async fn handle_deep_test(
+    provider: &dyn Provider,
+    // How we reach pods: `SshRemote` for real, `FakeRemote` in tests.
+    remote: Arc<dyn Remote>,
+    cfg: &Config,
+    names: &[String],
+    json: bool,
+    verbose: bool,
+) -> Result<()> {
+    use arena_core::health::{render_report, render_summary, Status};
+    let results = deep_check_fleet(provider, &remote, cfg, names).await?;
+    if results.is_empty() {
+        println!("(no pods with an SSH endpoint)");
+        return Ok(());
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&results)?);
+        // stdout stays parseable JSON; the human summary goes to stderr.
+        for line in render_summary(&results) {
+            eprintln!("{line}");
+        }
+    } else {
+        print!("{}", render_report(&results, verbose));
+    }
+    let failed = results.iter().filter(|h| h.status == Status::Fail).count();
+    if failed > 0 {
+        anyhow::bail!("{failed} pod(s) failed the deep check");
+    }
+    Ok(())
+}
+
+/// Deep-check pods concurrently over `remote`, one exec each bounded by
+/// [`arena_core::health::DEEP_CHECK_TIMEOUT`]; results sorted by name. `names` (full, bare
+/// or id) restrict it — an unknown name is an error, and a named pod without an SSH
+/// endpoint is a FAIL (it was asked about and couldn't be checked); otherwise pods without
+/// an endpoint are skipped with a note, like `pods test`. An unreachable or timed-out pod
+/// is a FAIL with the reason. The provider's maintenance windows are fetched alongside the
+/// SSH runs (best-effort, bounded) — it's an API-side fact the pod can't report.
+async fn deep_check_fleet(
+    provider: &dyn Provider,
+    remote: &Arc<dyn Remote>,
+    cfg: &Config,
+    names: &[String],
+) -> Result<Vec<arena_core::health::PodHealth>> {
+    use arena_core::health::{deep_check_command, parse_deep, HealthPolicy, PodHealth, DEEP_CHECK_TIMEOUT};
+    // Config first: a malformed MIN_DRIVER_VERSION fails before any pod is touched.
+    let policy = HealthPolicy::from_config(cfg)?;
+    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
+    let mut pods = provider.list_pods().await.context("listing pods")?;
+    if !names.is_empty() {
+        let unknown: Vec<&String> = names.iter().filter(|n| !pods.iter().any(|p| pod_matches(p, n, prefix))).collect();
+        if !unknown.is_empty() {
+            anyhow::bail!("no pod matched {unknown:?} (run `arena pods list`)");
+        }
+        pods.retain(|p| names.iter().any(|n| pod_matches(p, n, prefix)));
+    }
+    pods.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // `CONDA_ENV=""` disables activation (like `pods run`); python is then whatever the
+    // rc puts on PATH.
+    let cmd = deep_check_command(Some(cfg.get("CONDA_ENV").unwrap_or("arena-env")));
+    let mut jobs = Vec::new();
+    let mut no_endpoint = std::collections::HashSet::new();
+    for pod in &pods {
+        match SshTarget::from_pod(pod, cfg) {
+            Ok(t) => jobs.push((pod.name.clone(), t, cmd.clone())),
+            Err(_) if !names.is_empty() => {
+                no_endpoint.insert(pod.name.clone());
+            }
+            Err(_) => eprintln!("skip {} — no SSH endpoint yet", pod.name),
+        }
+    }
+    if !jobs.is_empty() {
+        eprintln!(
+            "Deep-checking {} pod(s) ({}s budget each)…",
+            jobs.len(),
+            DEEP_CHECK_TIMEOUT.as_secs()
+        );
+    }
+    let mut calls: std::collections::HashMap<String, PodCall> = std::collections::HashMap::new();
+    let probe = exec_each_pod(remote, jobs, DEEP_CHECK_TIMEOUT, |done, total, name, call| {
+        match &call {
+            Ok(out) if out.success => eprintln!("[{done}/{total}] {name}: checked"),
+            failed => eprintln!("{}", failure_line(done, total, name, failed)),
+        }
+        calls.insert(name.to_string(), call);
+    });
+    let (warning, ()) = tokio::join!(enrich_best_effort(provider, &mut pods, ENRICH_TIMEOUT), probe);
+    if let Some(warning) = warning {
+        eprintln!("{warning}");
+    }
+
+    let mut results = Vec::new();
+    for pod in &pods {
+        if no_endpoint.contains(&pod.name) {
+            results.push(PodHealth::unreachable(pod, format!("no SSH endpoint yet (status {})", pod.status)));
+            continue;
+        }
+        let Some(call) = calls.remove(&pod.name) else { continue };
+        results.push(match call {
+            Err(why) => PodHealth::unreachable(pod, why),
+            Ok(out) => {
+                let facts = parse_deep(&out.stdout);
+                let stderr = out.stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+                if !facts.started && !out.success {
+                    // ssh itself failed (255 = refused/auth/…): say that, not "no output".
+                    PodHealth::unreachable(pod, format!("exit {:?}: {stderr}", out.code))
+                } else {
+                    let started = facts.started;
+                    let mut health = PodHealth::checked(pod, facts, &policy);
+                    // The script never started (e.g. no `base64` on the pod): stderr says why.
+                    if !started && !stderr.is_empty() {
+                        for c in health.checks.iter_mut().filter(|c| c.name == "script") {
+                            c.detail = format!("{} ({stderr})", c.detail);
+                        }
+                    }
+                    health
+                }
+            }
+        });
+    }
+    Ok(results)
 }
 
 /// Switch one pod (or, with `all`, every pod with an SSH endpoint) to `branch` over SSH.
@@ -8069,7 +8232,8 @@ mod proxy_deploy_tests {
 #[cfg(test)]
 mod remote_tests {
     use super::{
-        backup_fleet, copy_pod_files, copy_to_pod, each_pod, handle_backup, handle_copy, handle_init_branches,
+        backup_fleet, copy_pod_files, copy_to_pod, deep_check_fleet, each_pod, handle_backup, handle_copy,
+        handle_deep_test, handle_init_branches,
         handle_pods, handle_run, handle_set_branch, marker_present, probe_gpus, proxy_reaches_pod, render_run,
         run_fleet, target_is_pod, BackupTally, Cli, Cmd, CopyPlan, PodCmd, RunResult, BACKUP_TIMEOUT, BRANCH_TIMEOUT,
         CP_TIMEOUT, POD_COPY_TIMEOUT, RUN_TIMEOUT_SECS, TEST_TIMEOUT,
@@ -8248,7 +8412,8 @@ mod remote_tests {
         let fake = Arc::new(FakeRemote::new());
         fake.script(&host(22003), [FakeReply::hang()]);
         let start = Instant::now();
-        let err = handle_pods(PodCmd::Test, &fleet(), fake.clone(), &cfg(), true).await.unwrap_err();
+        let plain = PodCmd::Test { deep: false, names: vec![], json: false, verbose: false };
+        let err = handle_pods(plain, &fleet(), fake.clone(), &cfg(), true).await.unwrap_err();
         assert_eq!(err.to_string(), "1 pod(s) failed");
         assert_eq!(start.elapsed(), TEST_TIMEOUT);
         assert!(fake.calls().iter().all(|c| matches!(c, RemoteCall::Exec { cmd, timeout, .. }
@@ -8569,5 +8734,257 @@ mod remote_tests {
         seen.sort_by(|a, b| a.1.cmp(&b.1));
         assert_eq!(seen[0], (2, "devtest-apple".to_string(), Ok(7)));
         assert!(matches!(&seen[1], (2, name, Err(e)) if name == "devtest-bloom" && e.starts_with("task crashed: ")), "{seen:?}");
+    }
+
+    // ---- `pods test --deep` (PLAN 1.A) ----
+
+    /// What the deep-check script prints on a healthy 2×A4000 pod, after some zshrc
+    /// chatter (which the parser must skip).
+    const DEEP_HEALTHY: &str = "\
+Welcome back! conda env: arena-env
+deep_check=1
+load1=0.84
+cpus=64
+nproc=16
+uptime_secs=1209600
+smi=ok
+smi_cuda=13.0
+gpu.0.name=NVIDIA RTX A4000
+gpu.0.driver=580.65.06
+gpu.1.name=NVIDIA RTX A4000
+gpu.1.driver=580.65.06
+smi_gpus=2
+python=/root/miniconda3/envs/arena-env/bin/python
+torch=ok
+torch_version=2.9.0+cu130
+torch_cuda=13.0
+cuda_available=true
+device_count=2
+tensor.0=ok
+tensor.1=ok
+peer.0-1=ok
+peer.1-0=ok
+nccl_ranks=2
+nccl=ok
+py_done=1
+py_exit=0
+disk.root_avail_kb=104857600
+net.curl_exit=0
+net.http=206
+net.bytes=33554432
+net.secs=0.712
+deep_check_end=1
+";
+
+    /// A bad host: nvidia-smi is fine, CUDA init fails with error 999.
+    const DEEP_CUINIT_999: &str = "\
+deep_check=1
+load1=1.20
+cpus=64
+smi=ok
+smi_cuda=13.0
+gpu.0.name=NVIDIA RTX A4000
+gpu.0.driver=580.65.06
+smi_gpus=1
+python=/root/miniconda3/envs/arena-env/bin/python
+torch=ok
+torch_version=2.9.0+cu130
+torch_cuda=13.0
+cuda_available=false
+cuda_error=error: RuntimeError: Unexpected error from cudaGetDeviceCount(). Did you run some cuda functions before calling NumCudaDevices() that might have already set an error? Error 999: unknown error
+device_count=0
+py_done=1
+py_exit=0
+disk.root_avail_kb=104857600
+net.curl_exit=0
+net.http=206
+net.bytes=33554432
+net.secs=0.712
+deep_check_end=1
+";
+
+    fn deep_cfg() -> Config {
+        Config::parse(
+            "MACHINE_NAME_PREFIX=devtest\nSHARED_SSH_KEY_PATH=/nonexistent/devtest_key\nALLOWED_CUDA_VERSIONS=\"13.0\"\n",
+        )
+    }
+
+    /// apple passes, bloom is on a cuInit-999 host, cloud hangs past the budget.
+    fn script_deep(fake: &FakeRemote) {
+        fake.script(&host(22001), [FakeReply::stdout(DEEP_HEALTHY).after(Duration::from_secs(40))]);
+        fake.script(&host(22002), [FakeReply::stdout(DEEP_CUINIT_999).after(Duration::from_secs(25))]);
+        fake.script(&host(22003), [FakeReply::hang()]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pods_test_deep_reports_pass_fail_and_timeout() {
+        use arena_core::health::{deep_check_command, render_report, Status, DEEP_CHECK_TIMEOUT};
+        let fake = Arc::new(FakeRemote::new());
+        script_deep(&fake);
+        let remote: Arc<dyn Remote> = fake.clone();
+        let start = Instant::now();
+        let results = deep_check_fleet(&fleet(), &remote, &deep_cfg(), &[]).await.unwrap();
+        assert_eq!(start.elapsed(), DEEP_CHECK_TIMEOUT, "ends at the hung pod's budget, not the hang");
+
+        // One exec per pod: the script (base64, inside the conda login wrap), bounded.
+        let want = deep_check_command(Some("arena-env"));
+        for port in [22001, 22002, 22003] {
+            assert_eq!(execs(&fake, port), [(want.clone(), Some(DEEP_CHECK_TIMEOUT))], "port {port}");
+        }
+
+        let statuses: Vec<(&str, Status)> = results.iter().map(|h| (h.name.as_str(), h.status)).collect();
+        assert_eq!(
+            statuses,
+            [("devtest-apple", Status::Pass), ("devtest-bloom", Status::Fail), ("devtest-cloud", Status::Fail)]
+        );
+        // The table, and — all three pods share 10.0.0.1 — the same-host hint for the two failures.
+        assert_eq!(
+            render_report(&results, false),
+            "\
+NAME           RESULT  GPUS         DRIVER     CUDA        NET  NOTES
+devtest-apple  pass    2×RTX A4000  580.65.06  13.0  47.1 MB/s
+devtest-bloom  fail    1×RTX A4000  580.65.06  13.0  47.1 MB/s  cuda: RuntimeError: Unexpected error from cudaGetDeviceCount(). Error 999: unknown error
+devtest-cloud  fail    -            -          -             -  ssh: timed out after 150s
+
+1 pass, 0 warn, 2 fail
+same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks every pod on it; a different GPU type draws a different host.
+"
+        );
+        // -v adds every check per pod.
+        let verbose = render_report(&results, true);
+        assert!(verbose.contains("── devtest-apple (pass)\n"), "{verbose}");
+        assert!(verbose.contains("  ✓ driver        580.65.06 ≥ 580 (CUDA 13.0)\n"), "{verbose}");
+        assert!(verbose.contains("  - peer_copy     needs CUDA\n"), "{verbose}");
+
+        // --json: per-pod {name, provider, status, checks, facts}; no IPs.
+        let v = serde_json::to_value(&results).unwrap();
+        assert_eq!(v[0]["status"], "pass");
+        assert_eq!(v[0]["facts"]["nccl"], "ok");
+        assert_eq!(v[1]["provider"], "runpod");
+        let cuda = v[1]["checks"].as_array().unwrap().iter().find(|c| c["name"] == "cuda").unwrap();
+        assert_eq!(cuda["status"], "fail");
+        assert!(cuda["detail"].as_str().unwrap().contains("Error 999: unknown error"));
+        assert_eq!(v[2]["checks"], serde_json::json!([{"name": "ssh", "status": "fail", "detail": "timed out after 150s"}]));
+        assert!(v[2]["facts"].is_null());
+        assert!(!v.to_string().contains("10.0.0.1"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pods_test_deep_exit_status_follows_failures_not_warnings() {
+        use arena_core::health::DEEP_CHECK_TIMEOUT;
+        let deep = |json: bool| PodCmd::Test { deep: true, names: vec![], json, verbose: false };
+        // Any FAIL fails the command (table or JSON), at the hung pod's budget.
+        for json in [false, true] {
+            let fake = Arc::new(FakeRemote::new());
+            script_deep(&fake);
+            let start = Instant::now();
+            let err = handle_pods(deep(json), &fleet(), fake.clone(), &deep_cfg(), true).await.unwrap_err();
+            assert_eq!(err.to_string(), "2 pod(s) failed the deep check", "json={json}");
+            assert_eq!(start.elapsed(), DEEP_CHECK_TIMEOUT);
+        }
+        // Warnings alone (a slow network on bloom) don't.
+        let slow = DEEP_HEALTHY.replace("net.secs=0.712", "net.secs=30.001").replace("net.bytes=33554432", "net.bytes=12000000");
+        let script_slow = |fake: &FakeRemote| {
+            fake.script(&host(22001), [FakeReply::stdout(DEEP_HEALTHY)]);
+            fake.script(&host(22002), [FakeReply::stdout(&slow)]);
+            fake.script(&host(22003), [FakeReply::stdout(DEEP_HEALTHY)]);
+        };
+        let fake = Arc::new(FakeRemote::new());
+        script_slow(&fake);
+        handle_deep_test(&fleet(), fake.clone(), &deep_cfg(), &[], false, true).await.unwrap();
+        // ...and bloom really was a warning, not a pass.
+        let fake = Arc::new(FakeRemote::new());
+        script_slow(&fake);
+        let remote: Arc<dyn Remote> = fake.clone();
+        let results = deep_check_fleet(&fleet(), &remote, &deep_cfg(), &[]).await.unwrap();
+        assert_eq!(results[1].status, arena_core::health::Status::Warn, "{:#?}", results[1].checks);
+        // A malformed MIN_DRIVER_VERSION fails before any pod is reached.
+        let fake = Arc::new(FakeRemote::new());
+        let bad = Config::parse("MACHINE_NAME_PREFIX=devtest\nMIN_DRIVER_VERSION=newest\n");
+        let err = handle_pods(deep(false), &fleet(), fake.clone(), &bad, true).await.unwrap_err();
+        assert!(err.to_string().contains("MIN_DRIVER_VERSION"), "{err}");
+        assert!(fake.calls().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pods_test_deep_names_scope_the_run_and_report_unreachable_pods() {
+        use arena_core::health::Status;
+        let remote = |fake: &Arc<FakeRemote>| -> Arc<dyn Remote> { fake.clone() };
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // Bare, full and id forms; only those pods are reached.
+        let fake = Arc::new(FakeRemote::new());
+        let results =
+            deep_check_fleet(&fleet(), &remote(&fake), &deep_cfg(), &names(&["bloom", "id-devtest-cloud"])).await.unwrap();
+        assert_eq!(results.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(), ["devtest-bloom", "devtest-cloud"]);
+        assert!(fake.calls_to(&host(22001)).is_empty());
+
+        // A typo fails loudly, touching nothing.
+        let fake = Arc::new(FakeRemote::new());
+        let err = deep_check_fleet(&fleet(), &remote(&fake), &deep_cfg(), &names(&["apple", "nope"])).await.unwrap_err();
+        assert!(err.to_string().contains("\"nope\""), "{err}");
+        assert!(fake.calls().is_empty());
+
+        // A named pod with no endpoint yet is a FAIL (it was asked about), never silently
+        // skipped; ssh refusing the connection is a FAIL with ssh's reason; a script that
+        // never started (exit 0, nothing printed) is a FAIL with the pod's stderr.
+        let mut f = fleet();
+        f.pods[0].ssh_port = None;
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22002), [FakeReply::exit(255, "ssh: connect to host 10.0.0.1 port 22002: Connection refused\n")]);
+        fake.script(&host(22003), [FakeReply::exit(0, "\nzsh:1: command not found: base64\n")]);
+        let results =
+            deep_check_fleet(&f, &remote(&fake), &deep_cfg(), &names(&["apple", "bloom", "cloud"])).await.unwrap();
+        let got: Vec<(&str, Status, &str, &str)> = results
+            .iter()
+            .map(|h| (h.name.as_str(), h.status, h.checks[0].name.as_str(), h.checks[0].detail.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("devtest-apple", Status::Fail, "ssh", "no SSH endpoint yet (status RUNNING)"),
+                (
+                    "devtest-bloom",
+                    Status::Fail,
+                    "ssh",
+                    "exit Some(255): ssh: connect to host 10.0.0.1 port 22002: Connection refused"
+                ),
+                (
+                    "devtest-cloud",
+                    Status::Fail,
+                    "script",
+                    "no output from the check script (zsh:1: command not found: base64)"
+                ),
+            ]
+        );
+        assert!(fake.calls_to(&host(22001)).is_empty());
+        // Without names, a pod without an endpoint is skipped (with a note), not failed.
+        let fake = Arc::new(FakeRemote::new());
+        let all: Vec<_> = (0..3).map(|_| FakeReply::stdout(DEEP_HEALTHY)).collect();
+        for port in [22002, 22003] {
+            fake.script(&host(port), all.clone());
+        }
+        let results = deep_check_fleet(&f, &remote(&fake), &deep_cfg(), &[]).await.unwrap();
+        assert_eq!(results.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(), ["devtest-bloom", "devtest-cloud"]);
+    }
+
+    #[test]
+    fn pods_test_flags_parse() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args).map(|c| c.cmd);
+        assert!(matches!(
+            parse(&["arena", "pods", "test"]).unwrap(),
+            Cmd::Pods(PodCmd::Test { deep: false, ref names, json: false, verbose: false }) if names.is_empty()
+        ));
+        match parse(&["arena", "pods", "test", "--deep", "apple", "bloom", "--json", "-v"]).unwrap() {
+            Cmd::Pods(PodCmd::Test { deep, names, json, verbose }) => {
+                assert!(deep && json && verbose);
+                assert_eq!(names, ["apple", "bloom"]);
+            }
+            _ => panic!("not pods test"),
+        }
+        // Names/--json/-v belong to --deep; plain `pods test` stays the torch check.
+        for args in [&["arena", "pods", "test", "apple"][..], &["arena", "pods", "test", "--json"], &["arena", "pods", "test", "-v"]] {
+            assert!(parse(args).is_err(), "{args:?}");
+        }
     }
 }

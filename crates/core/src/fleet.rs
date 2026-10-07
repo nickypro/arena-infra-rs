@@ -109,7 +109,8 @@ fn one_line(s: &str) -> String {
 }
 
 /// Truncate to `max` chars with an ellipsis, so free text can't blow up a table row.
-fn clip(s: &str, max: usize) -> String {
+/// (Also clips `pods test --deep`'s NOTES column.)
+pub(crate) fn clip(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {

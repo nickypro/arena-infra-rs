@@ -153,6 +153,25 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     flags go *before* the command; on a timeout the local ssh is killed, and the remote
     command dies at its next write to the closed connection) / the read-only
     torch-version health check (90s per pod).
+  - `pods test --deep [names…] [--json] [-v]` — the **is-this-pod-usable** check (read-only),
+    for what a plain `import torch` misses on a bad host. One embedded script per pod
+    (one SSH exec, 150s budget, inside the conda env) measures: nvidia-smi GPUs + driver +
+    CUDA version; torch import, `cuda.is_available()`, device count vs nvidia-smi; a small
+    tensor op on **every GPU** (catches `cuInit` 999 / `CUDA error: unknown error`); with >1
+    GPU a GPU→GPU copy that must arrive intact and an NCCL `all_reduce` across the GPUs
+    (else `skipped (1 GPU)`); a 32 MiB Hugging Face download (no token sent); free disk on
+    `/` and `/workspace`; host load + uptime. The provider's maintenance window comes from
+    the API. **FAIL**: any CUDA/tensor/copy/NCCL error, count mismatch, missing
+    torch/nvidia-smi, driver below the floor, unreachable/timed out. **WARN**: download
+    < 2 MB/s or unreachable, < 10 GB free, host load above max(32, host CPUs), a
+    maintenance window. Driver floor: `MIN_DRIVER_VERSION` (`none` = off), else derived from
+    `ALLOWED_CUDA_VERSIONS` (13.x → 580, 12.8 → 570, 12.4 → 550, …; the lowest listed
+    version wins), else no driver check. Hetzner CPU VMs skip the GPU checks. Output: a
+    `NAME RESULT GPUS DRIVER CUDA NET NOTES` table, `-v` lists every check, and a `same
+    host?` line when ≥2 failing pods share a public IP (a bad host breaks every pod on it).
+    `--json` prints per-pod `{name, provider, status, checks, facts}` (no IPs). Exits
+    non-zero if any pod FAILs; warnings don't. Names scope the run (a named pod with no SSH
+    endpoint is a FAIL; a typo is an error).
   - `pods pull [label]` — the **file** backup (complementing the git `backup`): rsyncs
     each pod's home into `<dir>/<label>/<pod>/`, reporting files/bytes moved per pod.
     **Keeps `.git`** (so the backup is a usable repo; `--no-git` to skip), size-caps with
@@ -324,6 +343,7 @@ concurrently or runs one pod at a time:
 | Command | How to target pods | Execution |
 | --- | --- | --- |
 | `run`, `test` | **always all** (no scoping flag) | parallel |
+| `test --deep` | positional names (default all) | parallel |
 | `pull`, `setup`, `init-branches` | **always all** (no scoping flag) | parallel |
 | `backup` | one `[target]` **or** `--all` | parallel |
 | `cp`, `copy-keys` | `--include`/`--exclude` (default all) | parallel |
@@ -341,7 +361,8 @@ Notes / sharp edges to know:
 - **Every pod-SSH call has a time budget**, so one wedged pod can't hang a fleet command:
   it reports `✗ <name>: timed out after Ns`, counts as a failure (non-zero exit) and the
   other pods carry on. Budgets: quick probes 20s (`list` GPU probe, `cp` mkdir/check,
-  replace/migrate identity/marker checks), `test` 90s, `set-branch`/`init-branches` 2 min,
+  replace/migrate identity/marker checks), `test` 90s, `test --deep` 150s,
+  `set-branch`/`init-branches` 2 min,
   `backup` git push 5 min, `cp` scp 10 min, `run` `--timeout` (default 30 min), the
   replace/migrate direct pod-to-pod copy 2 h (a copy that runs out stops the replace —
   nothing swapped, re-run to continue — rather than redo it via local staging);
