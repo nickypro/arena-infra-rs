@@ -49,12 +49,24 @@ impl RunpodApi {
     /// Parse `RUNPOD_API`: unset/empty → v1; `v1`/`v2` (any case); anything else is a
     /// config error — never a silent fallback, since a typo would otherwise keep a fleet
     /// on the retiring API (or quietly move it) without anyone noticing.
+    ///
+    /// The error quotes the bad value only when it's short and version-like (`v3`,
+    /// `2.0`): `RUNPOD_API` is one suffix away from `RUNPOD_API_KEY`, so a pasted key is
+    /// the likely long value — and this error reaches every fleet command's output, cron
+    /// logs and `config check`, which must never show a secret.
     pub fn from_config(cfg: &Config) -> Result<Self> {
         match cfg.get("RUNPOD_API").map(str::trim) {
             None | Some("") => Ok(Self::V1),
             Some(v) if v.eq_ignore_ascii_case("v1") => Ok(Self::V1),
             Some(v) if v.eq_ignore_ascii_case("v2") => Ok(Self::V2),
-            Some(other) => Err(Error::Config(format!("RUNPOD_API must be `v1` or `v2` (got `{other}`)"))),
+            Some(other) => {
+                let got = if other.len() <= 4 && other.chars().all(|c| c.is_ascii_alphanumeric() || c == '.') {
+                    format!("`{other}`")
+                } else {
+                    format!("an unrecognised value of {} chars, not shown in case it's a key", other.chars().count())
+                };
+                Err(Error::Config(format!("RUNPOD_API must be `v1` or `v2` (got {got})")))
+            }
         }
     }
 }
@@ -242,11 +254,21 @@ mod tests {
         assert_eq!(api("RUNPOD_API=v1").unwrap(), RunpodApi::V1);
         assert_eq!(api("RUNPOD_API=v2").unwrap(), RunpodApi::V2);
         assert_eq!(api("RUNPOD_API=\"V2\" # new backend").unwrap(), RunpodApi::V2);
-        for bad in ["RUNPOD_API=v3", "RUNPOD_API=2", "RUNPOD_API=rest"] {
+        for bad in ["RUNPOD_API=v3", "RUNPOD_API=2", "RUNPOD_API=rest", "RUNPOD_API=rpa_SECRETKEY123"] {
             let e = api(bad).unwrap_err();
             assert!(matches!(e, Error::Config(_)), "{bad}: {e}");
             assert!(e.to_string().contains("RUNPOD_API must be `v1` or `v2`"), "{bad}: {e}");
         }
+        // A short version-like typo is quoted back; anything else (a pasted key, most
+        // likely — it's one suffix from RUNPOD_API_KEY) is described, never echoed.
+        assert!(api("RUNPOD_API=v3").unwrap_err().to_string().contains("(got `v3`)"));
+        assert!(api("RUNPOD_API=2.0").unwrap_err().to_string().contains("(got `2.0`)"));
+        for secret in ["rpa_SECRETKEY123", "abcde", "v 2", "rpa_ÄÖÜ"] {
+            let e = api(&format!("RUNPOD_API=\"{secret}\"")).unwrap_err().to_string();
+            assert!(!e.contains(secret), "{secret} echoed: {e}");
+            assert!(e.contains("unrecognised value of") && e.contains("not shown"), "{e}");
+        }
+        assert!(api("RUNPOD_API=rpa_SECRETKEY123").unwrap_err().to_string().contains("of 16 chars"));
     }
 
     /// `build("runpod")` follows RUNPOD_API. Both report as `runpod`; the v2 backend says so
@@ -275,6 +297,10 @@ mod tests {
         let cfg = Config::parse("RUNPOD_API_KEY=k\nHETZNER_API_KEY=h\nRUNPOD_API=v3");
         let e = build_fleet("hetzner", &cfg, false).err().unwrap();
         assert!(e.to_string().contains("RUNPOD_API"), "{e}");
+        // The error every fleet command (and cron) prints never echoes a pasted key.
+        let pasted = Config::parse("RUNPOD_API_KEY=k\nRUNPOD_API=rpa_SECRETKEY123");
+        let e = build_fleet("runpod", &pasted, false).err().unwrap().to_string();
+        assert!(e.contains("RUNPOD_API must be") && !e.contains("SECRETKEY"), "{e}");
         let ok = Config::parse("RUNPOD_API_KEY=k\nHETZNER_API_KEY=h\nRUNPOD_API=v2");
         assert!(build_fleet("hetzner", &ok, false).is_ok());
     }
