@@ -13,6 +13,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+use arena_core::health::judge_deep_call;
 use arena_core::provider::Provider;
 use arena_core::remote::{describe_error, Remote, PROBE_TIMEOUT};
 use arena_core::selector::{Naming, SelectArgs, Selector};
@@ -5076,13 +5077,7 @@ fn health_cache_path(cfg: &Config) -> Option<std::result::Result<PathBuf, String
     if cfg!(test) && cfg.get("ARENA_STATE_DIR").is_none() {
         return None;
     }
-    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
-    // ARENA_STATE_DIR via the config (which also takes it from the environment); the XDG
-    // fallbacks straight from the environment.
-    Some(arena_core::snapshot::health_cache_path(prefix, |k| match k {
-        "ARENA_STATE_DIR" => cfg.get(k).map(String::from),
-        _ => std::env::var(k).ok(),
-    }))
+    Some(arena_core::snapshot::health_cache_path_for(cfg))
 }
 
 /// Record deep-check verdicts in the health cache that `arena snapshot` reads, dropping the
@@ -5176,7 +5171,7 @@ async fn collect_snapshot(
     if let Some(w) = enrich_best_effort(provider, &mut pods, ENRICH_TIMEOUT).await {
         warnings.push(w);
     }
-    let (proxy, w) = snapshot_proxy_text(cfg);
+    let (proxy, w) = snapshot::local_proxy_text(cfg);
     warnings.extend(w);
     let health = match health_cache_path(cfg) {
         None => HealthCache::new(),
@@ -5192,25 +5187,6 @@ async fn collect_snapshot(
     };
     let snap = snapshot::build(&pods, &partial, proxy.as_deref(), &health, &Naming::from_config(cfg), now);
     Ok((snap, warnings))
-}
-
-/// The proxy config the snapshot judges forwards by — never fetched over SSH: the local file
-/// when the proxy is local (`Some("")` when it doesn't exist yet), `Some("")` with no proxy
-/// configured at all (there are no forwards), `None` = unknown for a remote proxy or an
-/// unreadable file (with a warning for the latter).
-fn snapshot_proxy_text(cfg: &Config) -> (Option<String>, Option<String>) {
-    let Ok(px) = arena_core::proxy::ProxyConfig::from_config(cfg) else {
-        return (Some(String::new()), None);
-    };
-    if !px.local {
-        return (None, None);
-    }
-    let path = expand_tilde(&px.nginx_path);
-    match std::fs::read_to_string(&path) {
-        Ok(text) => (Some(text), None),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Some(String::new()), None),
-        Err(e) => (None, Some(format!("warning: can't read the proxy config {path} ({e}) — PROXY shows `?`"))),
-    }
 }
 
 /// What `arena snapshot` prints (or writes): the public allowlisted JSON with `--public`
@@ -5347,39 +5323,6 @@ async fn deep_check_fleet(
         results.push(judge_deep_call(pod, call, &policy));
     }
     Ok(results)
-}
-
-/// One pod's deep-check call → its verdict: the script's facts judged by `policy`, or a
-/// FAIL saying why there are none (no answer, ssh itself failed, the script never
-/// started). Shared by `pods test --deep` and `up --check`, so a pod is judged the same
-/// way by both.
-fn judge_deep_call(
-    pod: &arena_core::Pod,
-    call: PodCall,
-    policy: &arena_core::health::HealthPolicy,
-) -> arena_core::health::PodHealth {
-    use arena_core::health::{parse_deep, PodHealth};
-    match call {
-        Err(why) => PodHealth::unreachable(pod, why),
-        Ok(out) => {
-            let facts = parse_deep(&out.stdout);
-            let stderr = out.stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
-            if !facts.started && !out.success {
-                // ssh itself failed (255 = refused/auth/…): say that, not "no output".
-                PodHealth::unreachable(pod, format!("exit {:?}: {stderr}", out.code))
-            } else {
-                let started = facts.started;
-                let mut health = PodHealth::checked(pod, facts, policy);
-                // The script never started (e.g. no `base64` on the pod): stderr says why.
-                if !started && !stderr.is_empty() {
-                    for c in health.checks.iter_mut().filter(|c| c.name == "script") {
-                        c.detail = format!("{} ({stderr})", c.detail);
-                    }
-                }
-                health
-            }
-        }
-    }
 }
 
 /// Names held by more than one pod, with those pods' ids (in listing order) — for the

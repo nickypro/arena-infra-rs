@@ -311,9 +311,9 @@ pub fn strip_interactive_noise(s: &str) -> String {
         .join("\n")
 }
 
-/// Copy a local file to the target over scp. No time budget: pod paths use
-/// [`crate::remote::Remote`] instead (timeouts, fakes); this stays for the proxy host and
-/// the TUI until the TUI takes a `Remote` too (PLAN Phase 3).
+/// Copy a local file to the target over scp. No time budget: pod paths — the CLI's and
+/// the dashboard's — use [`crate::remote::Remote`] instead (timeouts, fakes); this stays
+/// for the proxy host.
 pub async fn scp(target: &SshTarget, local: &str, remote: &str) -> Result<SshOutput> {
     let out = Command::new("scp")
         .args(target.scp_args(local, remote))

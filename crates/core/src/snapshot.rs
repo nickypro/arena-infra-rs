@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::Config;
 use crate::fleet::{self, clip, FleetCost};
 use crate::health::{Check, PodHealth, Status};
 use crate::naming::{is_absolute, qualify};
@@ -253,6 +254,18 @@ pub fn health_cache_path(prefix: &str, lookup: impl Fn(&str) -> Option<String>) 
     Ok(root.join(path_component(prefix)).join(HEALTH_CACHE_FILE))
 }
 
+/// [`health_cache_path`] for a loaded config, as every surface resolves it: the fleet
+/// prefix and `ARENA_STATE_DIR` from the config (which also takes it from the
+/// environment), the XDG/`HOME` fallbacks from the environment. One function, so the CLI
+/// that writes the cache and the dashboard that reads it can't look in different places.
+pub fn health_cache_path_for(cfg: &Config) -> Result<PathBuf, String> {
+    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
+    health_cache_path(prefix, |k| match k {
+        "ARENA_STATE_DIR" => cfg.get(k).map(String::from),
+        _ => std::env::var(k).ok(),
+    })
+}
+
 impl HealthCache {
     pub fn new() -> Self {
         Self { version: HEALTH_CACHE_VERSION, pods: BTreeMap::new() }
@@ -441,8 +454,9 @@ pub struct SnapshotPod {
     pub in_name_list: bool,
 }
 
-/// The whole fleet at one moment. See the module docs.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+/// The whole fleet at one moment. See the module docs. (`Default` = the empty fleet at the
+/// epoch: what the dashboard shows before its first listing lands.)
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct FleetSnapshot {
     /// When it was built (Unix seconds), and the same as RFC 3339 UTC.
     pub generated_at: u64,
@@ -514,6 +528,35 @@ pub fn build(
         pods: pods_out,
         cost: fleet::fleet_cost(pods),
         partial: partial.to_vec(),
+    }
+}
+
+/// The proxy config text [`build`] judges forwards by — never fetched over SSH, so it is
+/// safe on every refresh of a dashboard: the local file when the proxy is local
+/// (`Some("")` when it doesn't exist yet), `Some("")` with no proxy configured at all
+/// (there are no forwards), `None` = unknown for a remote proxy or an unreadable file
+/// (with a warning line for the latter). Shared by `arena snapshot` and the TUI.
+pub fn local_proxy_text(cfg: &Config) -> (Option<String>, Option<String>) {
+    let Ok(px) = crate::proxy::ProxyConfig::from_config(cfg) else {
+        return (Some(String::new()), None);
+    };
+    if !px.local {
+        return (None, None);
+    }
+    let path = expand_home(&px.nginx_path);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => (Some(text), None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Some(String::new()), None),
+        Err(e) => (None, Some(format!("warning: can't read the proxy config {path} ({e}) — PROXY shows `?`"))),
+    }
+}
+
+/// `~/x` → `$HOME/x` (the config's default proxy path is `~/proxy.conf`); anything else,
+/// or no `HOME`, as given — the same rule the CLI applies to the paths it writes.
+fn expand_home(p: &str) -> String {
+    match (p.strip_prefix("~/"), std::env::var("HOME")) {
+        (Some(rest), Ok(h)) => format!("{}/{rest}", h.trim_end_matches('/')),
+        _ => p.to_string(),
     }
 }
 
@@ -891,7 +934,6 @@ pub fn public_json(public: &PublicSnapshot) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
     use crate::health::{Check, DeepFacts, GpuFact};
     use crate::pod::Maintenance;
 
@@ -1294,6 +1336,39 @@ mod tests {
         let snap = build(&[], &["runpod".to_string()], None, &HealthCache::new(), &naming, NOW);
         assert!(render_table(&snap).contains("partial: runpod failed to list"));
         assert!(!public_snapshot(&snap, &naming).complete);
+    }
+
+    /// The proxy file every surface judges PROXY by: read locally or not at all (never over
+    /// SSH), with "no file yet" and "no proxy configured" both meaning "no forwards".
+    #[test]
+    fn local_proxy_text_table() {
+        let dir = tmp("proxytext");
+        let file = dir.0.join("proxy.conf");
+        std::fs::write(&file, proxy_text()).unwrap();
+        let px = |extra: &str| Config::parse(&format!("SSH_PROXY_HOST=proxy.example.com\n{extra}"));
+        let at_path = |p: &Path| px(&format!("SSH_PROXY_NGINX_CONFIG_PATH={}\n", p.display()));
+        // (config, text read?, a warning?)
+        let cases: Vec<(&str, Config, Option<String>, bool)> = vec![
+            ("no proxy configured", Config::parse(""), Some(String::new()), false),
+            ("remote proxy: never fetched", px("PROXY_LOCAL=false\n"), None, false),
+            ("local, file present", at_path(&file), Some(proxy_text()), false),
+            ("local, no file yet", at_path(&dir.0.join("missing.conf")), Some(String::new()), false),
+            ("local, unreadable (a directory)", at_path(&dir.0), None, true),
+        ];
+        for (what, cfg, want, warns) in cases {
+            let (text, warning) = local_proxy_text(&cfg);
+            assert_eq!(text, want, "{what}");
+            assert_eq!(warning.is_some(), warns, "{what}: {warning:?}");
+        }
+        assert_eq!(expand_home("/abs/proxy.conf"), "/abs/proxy.conf");
+    }
+
+    #[test]
+    fn health_cache_path_for_takes_the_state_dir_and_prefix_from_config() {
+        let cfg = Config::parse("MACHINE_NAME_PREFIX=devtest\nARENA_STATE_DIR=/srv/arena-state\n");
+        assert_eq!(health_cache_path_for(&cfg).unwrap(), Path::new("/srv/arena-state/devtest/health.json"));
+        let rel = Config::parse("ARENA_STATE_DIR=state\n");
+        assert!(health_cache_path_for(&rel).unwrap_err().contains("absolute"));
     }
 
     #[test]

@@ -38,7 +38,7 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     IP with SSH on `:22`, so they use the same proxy/`pods up` flow as GPU providers.
   - `naming` — next-free machine-name allocation, mirroring the legacy logic.
   - `snapshot` — one read-only picture of the fleet (`FleetSnapshot`, built by one pure
-    `build` for the CLI now and the TUI next), the **health cache** of the last deep check per
+    `build` that the CLI and the TUI share), the **health cache** of the last deep check per
     pod, and the allowlisted `PublicSnapshot` for the web page.
   - `teardown` — the pure judge behind `teardown --check`: listings, volumes, keys, cron/`at`
     and proxy inputs in, a `✓ ✗ ? –` checklist with fix commands out (unknown ≠ empty).
@@ -420,10 +420,39 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `s` toggles full `arena8-apple` and the choice persists to
     `~/.config/arena-tui/prefs`), STATUS, a **SET** health glyph (`✓/✗/·` for `~/.name`,
     the deploy key, git origin→GitHub), GPU (live from `nvidia-smi`, e.g. `2×RTX A4000`
-    — the provider list API omits this), GPU%/MEM/TEMP, `$/HR`, **BRANCH** (autocommit
+    — the provider list API omits this), GPU%/MEM/TEMP, **BRANCH** (autocommit
     branches shortened to their `w1d2` label; `main`/others shown as-is), and progress.
-    The **fleet summary bar** shows total GPUs, mean util, memory, and burn as both
-    `$/hr` and `$/day`.
+    Below ~105 columns (or in the detail view's split) TEMP, MEM, BRANCH and DISK drop out
+    in that order, so NAME/STATUS/GPU/$/H/HEALTH/PROXY stay whole down to 73 columns.
+  - **Fleet columns from the core snapshot** — every refresh is one
+    `snapshot::build` (`arena snapshot`'s builder) over the per-provider listing, the
+    local proxy file and the health cache, so these read exactly as the CLI prints them:
+    `$/H` (provider currency, `-` unless billing), an **M** badge for a host maintenance
+    window (detail pane: window + note), **HEALTH** = the last `pods test --deep` verdict
+    + age (`pass 12m`, `fail 2h`; detail pane: worst issue + the failing check's text),
+    **PROXY** = the stable port, green live / yellow stale (`:9501 stale` when wide), `-`
+    no forward, `?` remote proxy. The **summary bar** is `pods list`'s footer (`$` and
+    Hetzner `€` kept apart, unpriced pods counted) plus per day, **led** by a yellow
+    `⚠ vast failed to list — its pods (and their cost) are missing` when a provider didn't
+    answer (first, so a narrow terminal can't cut it off). API calls per refresh are
+    unchanged (one list per provider); the details query (GPU/$/maintenance) runs every
+    60 s or on `r` (≥10 s apart); one that fails part-way still shows what it filled (as
+    `pods list` does) over the last good answer, with a footer warning.
+  - **`d`** deep-checks the cursor pod (or the marked set) **in the background** — no
+    modal; the row says `checking`, the footer reports the tally when done, and the
+    verdicts go to the same health cache `arena snapshot` reads. **`/`** marks pods with
+    the CLI's selector syntax (`alpha..delta`, ids, `-x`/`!name`, `--on`, `--gpus`); a
+    typo marks nothing and leaves the marks as they were, saying why in the footer; a
+    valid one replaces the marks. Marks are per `provider:id` (a Vast and a Hetzner id
+    can collide). `all` is refused, and since `/first..last` marks a cohort in one line,
+    terminate/restart on a marked set of more than 5 pods — or of every listed pod — ask
+    for `ALL`, like the whole fleet (smaller sets: the pod count). A marked-set confirm
+    names the pods (the first 10, then `… and N more`), with the token prompt always on
+    screen.
+  - Every pod SSH call (metrics, test/run/backup/set-branch/setup, deep check) goes
+    through `Remote` with a budget (90 s / 30 min / 5 min / 2 min / setup's per-step /
+    150 s), so a wedged pod ends an action with `timed out after …`; only `c` (your
+    interactive shell) is a plain `ssh`.
   - **Navigate** with `↑/↓`/`j/k`; `enter` opens a per-pod detail pane (per-GPU
     breakdown, full branch/origin/health, util/temp **sparklines**). `Ctrl-C`/`q` quit.
   - **Act** on the selected pod with `a` (restart / stop / terminate / backup / setup /
@@ -434,7 +463,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     Lifecycle actions (restart/stop/terminate) require **typing the pod's exact name**;
     restart is destructive like terminate (red, and its modal says it wipes the container
     disk on RunPod/Vast; Hetzner: "disk kept");
-    fleet mutations require typing **ALL**; backup/setup/test show the precise
+    whole-fleet mutations require typing **ALL** (a marked set: its count, or `ALL` as
+    above); backup/setup/test show the precise
     command(s) and take a single `y`. The dashboard's reads stay reads.
   - **Add-pod (`n`)** is an interactive form: `↑↓` moves between fields, `←→` changes
     the value. Pick the provider (unavailable ones — no API key — are greyed out),

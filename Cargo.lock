@@ -95,6 +95,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arena-core",
+ "async-trait",
  "crossterm",
  "ratatui",
  "tokio",

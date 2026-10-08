@@ -14,3 +14,9 @@ ratatui.workspace = true
 crossterm.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
+
+[dev-dependencies]
+# `FakeRemote` for the action / deep-check tests, a paused clock, and a fake `Provider`.
+arena-core = { path = "../core", features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util"] }
+async-trait.workspace = true
