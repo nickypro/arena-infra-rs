@@ -45,6 +45,9 @@ impl Config {
         // for one command — or roll straight back to v1 — without editing the shared,
         // read-only prod config (`RUNPOD_API=v2 arena pods list`).
         "RUNPOD_API",
+        // Where the health cache lives (`snapshot::health_cache_path`): lets the sandbox, a
+        // cron job or a test point it somewhere explicit without editing the shared config.
+        "ARENA_STATE_DIR",
     ];
 
     /// Let environment variables override values from the file: any key already in the
@@ -252,6 +255,15 @@ MACHINE_NAME_LIST=(
         let mut c = Config::parse("RUNPOD_API=v2");
         c.apply_overrides(|k| (k == "RUNPOD_API").then(|| "v1".to_string()));
         assert_eq!(c.get("RUNPOD_API"), Some("v1"));
+    }
+
+    #[test]
+    fn env_can_introduce_the_state_dir() {
+        // Where the health cache lives can be pointed elsewhere per run (a cron job, the
+        // sandbox) without touching the shared, read-only config.
+        let mut c = Config::parse("IMAGE=base:1");
+        c.apply_overrides(|k| (k == "ARENA_STATE_DIR").then(|| "/srv/arena-state".to_string()));
+        assert_eq!(c.get("ARENA_STATE_DIR"), Some("/srv/arena-state"));
     }
 
     #[test]

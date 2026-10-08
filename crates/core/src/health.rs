@@ -23,7 +23,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::error::{Error, Result};
@@ -477,7 +477,8 @@ fn cmp_versions(a: &[u32], b: &[u32]) -> std::cmp::Ordering {
 
 /// One check's verdict. Overall: any `Fail` fails the pod, else any `Warn` warns, else it
 /// passes (`Skip` = not applicable / not configured, never a verdict of its own).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// (`Deserialize`: the health cache stores it — see `snapshot`.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
     Pass,

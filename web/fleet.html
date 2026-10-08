@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; connect-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'none'; base-uri 'none'; form-action 'none'">
+<title>ARENA fleet</title>
+<!--
+  The ARENA fleet status page. Self-contained (no external fonts/scripts) and read-only:
+  it fetches `fleet.json` from its own directory — written every 2 minutes by
+  `arena snapshot --public --out <dir>/fleet.json` (see `arena cron install --snapshot`) —
+  and renders it. Every value from the JSON goes into the page through textContent, never
+  innerHTML, so nothing in the data can become markup.
+-->
+<style>
+  :root {
+    --bg: #f7f7f5; --fg: #1c1c1a; --muted: #6b6b66; --line: #e2e2dd; --card: #ffffff;
+    --up: #1f7a3d; --up-bg: #e3f3e8; --start: #8a5a00; --start-bg: #fbf0d9;
+    --down: #6b6b66; --down-bg: #ececea; --fail: #b3261e; --fail-bg: #fbe5e3;
+    --warn: #8a5a00; --warn-bg: #fbf0d9; --banner: #fff4d6; --banner-fg: #5c4300;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #151514; --fg: #ecece8; --muted: #9a9a94; --line: #2c2c2a; --card: #1d1d1b;
+      --up: #6fd08f; --up-bg: #183322; --start: #f0c46a; --start-bg: #3a2e12;
+      --down: #a3a39d; --down-bg: #2a2a28; --fail: #ff8a80; --fail-bg: #3d1a17;
+      --warn: #f0c46a; --warn-bg: #3a2e12; --banner: #3a2e12; --banner-fg: #f6dc9f;
+      color-scheme: dark;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    padding: max(16px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right))
+             max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+  }
+  main { max-width: 980px; margin: 0 auto; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 16px; margin-bottom: 12px; }
+  h1 { font-size: 1.35rem; margin: 0; }
+  #updated { color: var(--muted); font-size: .9rem; }
+  .banner { background: var(--banner); color: var(--banner-fg); border-radius: 8px; padding: 8px 12px; margin: 0 0 10px; }
+  .tools { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; margin-bottom: 10px; }
+  #summary { color: var(--muted); font-size: .9rem; }
+  input[type=search] {
+    font: inherit; padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px;
+    background: var(--card); color: var(--fg); min-width: 0; width: 14rem; max-width: 100%;
+  }
+  table { width: 100%; border-collapse: collapse; background: var(--card); border-radius: 10px; overflow: hidden; }
+  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  tbody tr:last-child td { border-bottom: 0; }
+  th { font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); font-weight: 600; }
+  th button {
+    all: unset; cursor: pointer; display: inline-flex; gap: 4px; align-items: center;
+  }
+  th button:focus-visible { outline: 2px solid var(--fg); outline-offset: 2px; border-radius: 3px; }
+  th[aria-sort=ascending] button::after { content: "▲"; font-size: .7em; }
+  th[aria-sort=descending] button::after { content: "▼"; font-size: .7em; }
+  .name { font-weight: 600; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: .85rem; font-weight: 600; }
+  .s-up { color: var(--up); background: var(--up-bg); }
+  .s-starting { color: var(--start); background: var(--start-bg); }
+  .s-down { color: var(--down); background: var(--down-bg); }
+  .h-pass { color: var(--up); background: var(--up-bg); }
+  .h-warn { color: var(--warn); background: var(--warn-bg); }
+  .h-fail { color: var(--fail); background: var(--fail-bg); }
+  .h-unknown { color: var(--down); background: var(--down-bg); }
+  .sub { display: block; color: var(--muted); font-size: .85rem; }
+  .old { opacity: .6; }
+  #empty { color: var(--muted); padding: 24px 0; text-align: center; }
+  footer { color: var(--muted); font-size: .8rem; margin-top: 14px; }
+  /* Phones get a sort menu instead of the (hidden) header row. */
+  .sortbar { display: none; gap: 8px; align-items: center; color: var(--muted); font-size: .9rem; }
+  .sortbar select { font: inherit; padding: 4px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--fg); }
+  @media (max-width: 600px) {
+    thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+    table, tbody, tr, td { display: block; width: 100%; }
+    table { background: none; }
+    tr { background: var(--card); border-radius: 10px; margin-bottom: 8px; padding: 6px 0; }
+    td { border: 0; padding: 4px 12px; display: flex; gap: 12px; }
+    td::before { content: attr(data-label); flex: 0 0 6.5rem; color: var(--muted); font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; padding-top: 2px; }
+    td > div { min-width: 0; }
+    .sortbar { display: flex; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>ARENA fleet</h1>
+    <span id="updated">loading…</span>
+  </header>
+  <p class="banner" id="stale" hidden></p>
+  <p class="banner" id="partial" hidden>Some machines may be missing: a provider didn’t answer when this was taken.</p>
+  <p class="banner" id="error" hidden></p>
+  <div class="tools">
+    <input type="search" id="filter" placeholder="Find a machine" aria-label="Find a machine by name">
+    <label class="sortbar">Sort
+      <select id="sortsel" aria-label="Sort by">
+        <option value="">list order</option>
+        <option value="name">name</option>
+        <option value="gpu">GPU</option>
+        <option value="status">status</option>
+        <option value="health">health</option>
+        <option value="maintenance">maintenance</option>
+      </select>
+    </label>
+    <span id="summary"></span>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th data-key="name" aria-sort="none"><button type="button">Machine</button></th>
+        <th data-key="gpu" aria-sort="none"><button type="button">GPU</button></th>
+        <th data-key="status" aria-sort="none"><button type="button">Status</button></th>
+        <th data-key="health" aria-sort="none"><button type="button">Health</button></th>
+        <th data-key="maintenance" aria-sort="none"><button type="button">Maintenance</button></th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <p id="empty" hidden>No machines.</p>
+  <footer>Health is the last deep check (GPU, driver, network, disk, load), with its age. Refreshes every minute.</footer>
+</main>
+<script>
+"use strict";
+(function () {
+  var REFRESH_MS = 60 * 1000;
+  var STALE_SECS = 10 * 60;
+  var OLD_HEALTH_SECS = 24 * 3600;
+  // Only these values get a style; anything else shows as plain text.
+  var STATUS = { up: "up", starting: "starting", down: "down" };
+  var HEALTH = { pass: "pass", warn: "warn", fail: "fail", unknown: "unknown" };
+  var STATUS_ORDER = { up: 0, starting: 1, down: 2 };
+  var HEALTH_ORDER = { fail: 0, warn: 1, unknown: 2, pass: 3 };
+  var LABELS = { name: "Machine", gpu: "GPU", status: "Status", health: "Health", maintenance: "Maintenance" };
+
+  var data = null;          // last good fleet.json
+  var sortKey = "", sortDir = 1;
+
+  function $(id) { return document.getElementById(id); }
+  function str(v) { return v === null || v === undefined ? "" : String(v); }
+  function el(tag, text, cls) {
+    var e = document.createElement(tag);
+    if (text !== undefined && text !== null) e.textContent = String(text);
+    if (cls) e.className = cls;
+    return e;
+  }
+  function secsSince(iso) {
+    var t = Date.parse(str(iso));
+    return isNaN(t) ? null : Math.max(0, Math.round((Date.now() - t) / 1000));
+  }
+  function ago(secs) {
+    if (secs === null) return "";
+    if (secs < 60) return "just now";
+    if (secs < 3600) return Math.floor(secs / 60) + " min ago";
+    if (secs < 86400) return Math.floor(secs / 3600) + " h ago";
+    return Math.floor(secs / 86400) + " d ago";
+  }
+  function when(iso) {
+    var t = Date.parse(str(iso));
+    if (isNaN(t)) return str(iso);
+    return new Date(t).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  }
+  // The machines to show: objects only, so one malformed entry can't break the page.
+  function all() {
+    return (data && Array.isArray(data.machines))
+      ? data.machines.filter(function (m) { return m !== null && typeof m === "object"; })
+      : [];
+  }
+  function healthOf(m) { return (m && m.health) || {}; }
+  // Age of a health check now: recomputed from checked_at so it keeps up between refreshes.
+  function healthAge(m) {
+    var h = healthOf(m);
+    var s = secsSince(h.checked_at);
+    return s === null ? (typeof h.age_secs === "number" ? h.age_secs : null) : s;
+  }
+  function maintText(m) {
+    var w = m.maintenance;
+    if (!w) return "";
+    var s = w.start ? when(w.start) : "", e = w.end ? when(w.end) : "";
+    if (s && e) return s + " → " + e;
+    if (s) return "from " + s;
+    if (e) return "until " + e;
+    return "scheduled";
+  }
+
+  function compare(a, b) {
+    var x, y;
+    switch (sortKey) {
+      case "name": x = str(a.name); y = str(b.name); break;
+      case "gpu": x = str(a.gpu); y = str(b.gpu); break;
+      case "status":
+        x = STATUS_ORDER[a.status]; y = STATUS_ORDER[b.status];
+        x = x === undefined ? 9 : x; y = y === undefined ? 9 : y; break;
+      case "health":
+        x = HEALTH_ORDER[healthOf(a).status]; y = HEALTH_ORDER[healthOf(b).status];
+        x = x === undefined ? 9 : x; y = y === undefined ? 9 : y; break;
+      case "maintenance":
+        x = a.maintenance ? (Date.parse(str(a.maintenance.start)) || 1e15) : 2e15;
+        y = b.maintenance ? (Date.parse(str(b.maintenance.start)) || 1e15) : 2e15; break;
+      default: return 0;
+    }
+    var c = typeof x === "string" ? x.localeCompare(y, undefined, { numeric: true, sensitivity: "base" }) : x - y;
+    return c * sortDir || str(a.name).localeCompare(str(b.name), undefined, { numeric: true });
+  }
+
+  function cell(tr, key) {
+    var td = el("td");
+    td.setAttribute("data-label", LABELS[key]);
+    var div = el("div");
+    td.appendChild(div);
+    tr.appendChild(td);
+    return div;
+  }
+
+  function render() {
+    var tbody = $("rows");
+    var machines = all();
+    var q = $("filter").value.trim().toLowerCase();
+    if (q) machines = machines.filter(function (m) { return str(m.name).toLowerCase().indexOf(q) !== -1; });
+    if (sortKey) machines.sort(compare);
+
+    var frag = document.createDocumentFragment();
+    machines.forEach(function (m) {
+      var tr = el("tr");
+      cell(tr, "name").appendChild(el("span", m.name, "name"));
+      cell(tr, "gpu").textContent = str(m.gpu) || "-";
+      var st = STATUS[m.status];
+      cell(tr, "status").appendChild(el("span", str(m.status) || "?", st ? "badge s-" + st : "badge"));
+
+      var h = healthOf(m), hs = HEALTH[h.status] || "unknown", age = healthAge(m);
+      var hc = cell(tr, "health");
+      hc.appendChild(el("span", hs === "unknown" ? "not checked" : hs, "badge h-" + hs));
+      var sub = [];
+      if (h.reason && (hs === "warn" || hs === "fail")) sub.push(str(h.reason));
+      if (age !== null && hs !== "unknown") sub.push("checked " + ago(age));
+      if (sub.length) {
+        var s = el("span", sub.join(" · "), "sub");
+        if (age !== null && age > OLD_HEALTH_SECS) s.classList.add("old");
+        hc.appendChild(s);
+      }
+
+      var mc = cell(tr, "maintenance"), mt = maintText(m);
+      mc.textContent = mt || "-";
+      if (m.maintenance) mc.title = [str(m.maintenance.start), str(m.maintenance.end)].filter(Boolean).join(" → ");
+      frag.appendChild(tr);
+    });
+    tbody.replaceChildren(frag);
+    $("empty").hidden = machines.length !== 0 || !data;
+
+    var count = function (f) { return all().filter(f).length; };
+    $("summary").textContent = data ? [
+      count(function (m) { return m.status === "up"; }) + " up",
+      count(function (m) { return m.status === "starting"; }) + " starting",
+      count(function (m) { return m.status === "down"; }) + " down",
+      count(function (m) { return healthOf(m).status === "fail"; }) + " failing checks",
+    ].join(" · ") : "";
+    tick();
+  }
+
+  // "updated N min ago" + the stale banner, recomputed between fetches too.
+  function tick() {
+    if (!data) return;
+    var secs = secsSince(data.updated_at);
+    $("updated").textContent = secs === null ? "update time unknown" : "updated " + ago(secs);
+    $("updated").title = str(data.updated_at);
+    var stale = secs === null || secs > STALE_SECS;
+    $("stale").hidden = !stale;
+    if (stale) {
+      $("stale").textContent = secs === null
+        ? "This data has no valid timestamp — it may be out of date."
+        : "This data is " + ago(secs).replace(" ago", " old") + " — the snapshot job may have stopped. Machines may have changed since.";
+    }
+    $("partial").hidden = data.complete !== false;
+  }
+
+  function showError(msg) {
+    $("error").hidden = !msg;
+    $("error").textContent = msg ? msg + (data ? " Showing the last data loaded." : "") : "";
+    if (!data) $("updated").textContent = "no data";
+  }
+
+  function load() {
+    var url = new URL("fleet.json", location.href);
+    url.searchParams.set("t", String(Date.now()));
+    fetch(url.toString(), { cache: "no-store", credentials: "omit" })
+      .then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      })
+      .then(function (j) {
+        if (!j || typeof j !== "object" || !Array.isArray(j.machines)) throw new Error("unexpected format");
+        data = j;
+        showError("");
+        render();
+      })
+      .catch(function (e) { showError("Couldn’t load fleet.json (" + str(e && e.message) + ")."); tick(); });
+  }
+
+  function setSort(key) {
+    if (key === sortKey) { sortDir = -sortDir; } else { sortKey = key; sortDir = 1; }
+    if (!key) sortDir = 1;
+    document.querySelectorAll("th[data-key]").forEach(function (th) {
+      var k = th.getAttribute("data-key");
+      th.setAttribute("aria-sort", k === sortKey ? (sortDir > 0 ? "ascending" : "descending") : "none");
+    });
+    $("sortsel").value = sortKey;
+    render();
+  }
+
+  document.querySelectorAll("th[data-key] button").forEach(function (b) {
+    b.addEventListener("click", function () { setSort(b.parentElement.getAttribute("data-key")); });
+  });
+  $("sortsel").addEventListener("change", function () { sortKey = ""; setSort($("sortsel").value); });
+  $("filter").addEventListener("input", render);
+
+  load();
+  setInterval(load, REFRESH_MS);
+  setInterval(tick, 15 * 1000);
+  document.addEventListener("visibilitychange", function () { if (!document.hidden) load(); });
+})();
+</script>
+</body>
+</html>

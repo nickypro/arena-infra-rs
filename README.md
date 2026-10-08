@@ -37,6 +37,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     sizing/OS/location/SSH-keys from `HETZNER_*` config. VMs come up on a real public
     IP with SSH on `:22`, so they use the same proxy/`pods up` flow as GPU providers.
   - `naming` — next-free machine-name allocation, mirroring the legacy logic.
+  - `snapshot` — one read-only picture of the fleet (`FleetSnapshot`, built by one pure
+    `build` for the CLI now and the TUI next), the **health cache** of the last deep check per
+    pod, and the allowlisted `PublicSnapshot` for the web page.
   - `proxy` — port-forwarding planner. Pods are reached over SSH (VS Code
     Remote-SSH), and the provider reassigns a pod's SSH endpoint on restart, so the
     proxy host gives each machine a *stable* public port (`cute.sus.cat:7000`, …)
@@ -233,7 +236,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     finds nginx, and `flock -n` so a slow tick never piles up) that catches changes made outside the CLI
     (dashboard terminates, restarts that move an endpoint); re-running `install` without
     it removes that line. Remove it before changing `MACHINE_NAME_PREFIX`/`_LIST`: a name
-    that leaves the list loses its forward on the next tick.
+    that leaves the list loses its forward on the next tick. `--snapshot <DIR>` adds a
+    `*/2 … snapshot --public --out <DIR>/fleet.json` line (`flock -n`, log
+    `~/arena-snapshot-cron.log`) for the [fleet page](#publishing-the-fleet-page).
   - `pods backup [targets]` — the **full save**: git-push the ARENA tree **and** rsync the
     home to the local backups folder (`pull`). The git push is on **whatever branch the
     pod is on** (never switches/creates one, so bespoke branches are respected) and
@@ -281,7 +286,22 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     when no pod could be checked; summary/notes go to stderr. Exits
     non-zero if any pod FAILs; warnings don't. Targets scope the run (a named pod with no SSH
     endpoint is a FAIL; a typo is an error). Two pods sharing a name each get their own row
-    (with a warning naming their ids).
+    (with a warning naming their ids). Each verdict (and `up --check`'s) is also kept in
+    the **health cache** for `snapshot`: `$ARENA_STATE_DIR/<prefix>/health.json`, else
+    `${XDG_STATE_HOME:-~/.local/state}/arena/<prefix>/health.json` — per
+    `MACHINE_NAME_PREFIX`, so the sandbox and prod never share one; owner-only, written
+    atomically under a lock, keyed by provider + pod id; records of pods their provider
+    listed OK without are dropped. A corrupt file is one warning and gets replaced.
+  - `snapshot [--json] [--public] [--out FILE]` — the fleet in one **read-only** picture
+    (one list per provider + the details query, the local proxy file, the health cache; **no
+    SSH, no checks**): `pods list`'s columns plus `PROXY` (`:9500`, `:9500 stale`, `?` =
+    remote proxy) and `HEALTH` (`fail 2h GPU error`). `--json` = the internal snapshot (ids,
+    endpoints, costs — never publish it). `--public` = the dashboard JSON, an **allowlist by
+    construction**: only *prefixed* `MACHINE_NAME_LIST` pods (`@` staff boxes and off-list
+    pods are left out) by short name, with GPU, `up|starting|down`, health + age + a reason
+    from a fixed vocabulary (never check text), maintenance start/end, `updated_at`,
+    `complete`. No IPs, hosts, ports, ids, providers, costs or keys (pinned by a leak test).
+    `--out` is atomic; if no provider answers, it fails and leaves the old file.
   - `pods pull [label]` — the **file** backup (complementing the git `backup`): rsyncs
     each pod's home into `<dir>/<label>/<pod>/`, reporting files/bytes moved per pod.
     **Keeps `.git`** (so the backup is a usable repo; `--no-git` to skip), size-caps with
@@ -523,6 +543,26 @@ SHARED_SSH_KEY_PATH=~/.ssh/arena8_key arena tui
 GIT_SSH_KEY_LOCAL=~/.ssh/arena_infra_key arena pods setup
 ```
 
+## Publishing the fleet page
+
+`web/fleet.html` is a self-contained status page (no external scripts or fonts, phone- and
+dark-mode-friendly) that reads `fleet.json` from its own directory every minute and shows a
+sortable table — machine, GPU, up/starting/down, last health check + age + reason,
+maintenance window — with "updated N min ago" and a banner once the data is over 10 minutes
+old (the cron stopped) or a provider didn't answer. It only displays; it can't change anything.
+
+```bash
+mkdir -p /srv/arena-fleet && cp web/fleet.html /srv/arena-fleet/index.html
+arena --config /path/to/config.env snapshot --public --out /srv/arena-fleet/fleet.json  # try it once
+arena --config /path/to/config.env cron install --proxy --snapshot /srv/arena-fleet      # then every 2 min
+```
+
+Then serve `/srv/arena-fleet` with any static host (an existing web server's directory, a
+`python3 -m http.server`, object storage synced from it …). `fleet.json` is public-safe by
+construction, so no auth is needed; health shows `unknown` until a `pods test --deep` or
+`up --check` has run under the same user (the cache lives in that user's state dir — set
+`ARENA_STATE_DIR` for both if the cron runs as someone else).
+
 ## Layout
 
 ```
@@ -530,4 +570,6 @@ crates/
   core/   library: config, provider trait + impls, pod model, naming
   cli/    `arena` binary (clap)
   tui/    `arena-tui` binary (ratatui)
+web/
+  fleet.html  the public fleet page (reads fleet.json next to it)
 ```
