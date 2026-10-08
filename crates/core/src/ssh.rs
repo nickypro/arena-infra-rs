@@ -95,10 +95,12 @@ impl SshTarget {
         a
     }
 
-    /// A human-readable rendering of the full command, for dry-run output. The remote
-    /// command is single-quoted so what's printed is what would run.
+    /// A human-readable rendering of the full command, for dry-run output — shell-quoted
+    /// ([`shell_word`]: the remote command always, any other argument that needs it), so what's
+    /// printed pastes into a shell as exactly what would run.
     pub fn display_command(&self, remote_cmd: &str) -> String {
-        format!("ssh {} '{}'", self.ssh_args().join(" "), remote_cmd.replace('\'', "'\\''"))
+        let args: Vec<String> = self.ssh_args().iter().map(|a| shell_word(a)).collect();
+        format!("ssh {} '{}'", args.join(" "), remote_cmd.replace('\'', "'\\''"))
     }
 
     /// The `ssh …` invocation *without* the `user@host` — i.e. just the transport
@@ -155,9 +157,24 @@ impl SshTarget {
         a
     }
 
-    /// Human-readable `scp` command for dry-run output.
+    /// Human-readable `scp` command for dry-run output, shell-quoted like [`Self::display_command`].
     pub fn display_scp(&self, local: &str, remote: &str) -> String {
-        format!("scp {}", self.scp_args(local, remote).join(" "))
+        let args: Vec<String> = self.scp_args(local, remote).iter().map(|a| shell_word(a)).collect();
+        format!("scp {}", args.join(" "))
+    }
+}
+
+/// One argument as a POSIX shell reads it back unchanged: as is when it's only characters no
+/// shell treats specially (`-avz`, `--timeout=300`, `root@1.2.3.4:`, `/a/b`), else
+/// single-quoted (`'**/.git/**'`, `'ssh -p 22'`, `''`) with any `'` as `'\''`. For the commands
+/// a dry run prints: an unquoted glob (`--include **/.git/**`) pasted into a shell would expand
+/// against the operator's current directory (live finding).
+pub fn shell_word(s: &str) -> String {
+    let safe = |c: char| c.is_ascii_alphanumeric() || "@%+=:,./_-".contains(c);
+    if !s.is_empty() && s.chars().all(safe) {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
     }
 }
 
@@ -338,6 +355,22 @@ pub struct SshOutput {
     pub stderr: String,
 }
 
+impl SshOutput {
+    /// How it ended, for a message: `exit 1`, or `killed by a signal` ([`exit_label`]).
+    pub fn exit_label(&self) -> String {
+        exit_label(self.code)
+    }
+}
+
+/// A process's exit status as a person reads it: `exit 1` — never Rust's `Some(1)` — or
+/// `killed by a signal` when there is no code (the process was signalled: a timeout's kill, OOM).
+pub fn exit_label(code: Option<i32>) -> String {
+    match code {
+        Some(c) => format!("exit {c}"),
+        None => "killed by a signal".to_string(),
+    }
+}
+
 /// Run `remote_cmd` on the target over SSH and capture its output. stdin is closed so
 /// a remote prompt can't wedge the call. No time budget — see [`scp`] for who still uses
 /// this rather than [`crate::remote::Remote`].
@@ -458,5 +491,42 @@ mod tests {
         let s = target().display_command("nvidia-smi");
         assert!(s.starts_with("ssh -p 22001"));
         assert!(s.ends_with("'nvidia-smi'"));
+    }
+
+    #[test]
+    fn shell_words_quote_only_what_a_shell_would_change() {
+        for (raw, want) in [
+            ("-avz", "-avz"),
+            ("--timeout=300", "--timeout=300"),
+            ("root@1.2.3.4:", "root@1.2.3.4:"),
+            ("/root/.ssh/arena8_key", "/root/.ssh/arena8_key"),
+            ("**/.git/**", "'**/.git/**'"),
+            ("models--*/", "'models--*/'"),
+            ("ssh -p 22", "'ssh -p 22'"),
+            ("it's", "'it'\\''s'"),
+            ("~/x", "'~/x'"),
+            ("$HOME", "'$HOME'"),
+            ("", "''"),
+        ] {
+            assert_eq!(shell_word(raw), want, "{raw:?}");
+        }
+    }
+
+    /// What a dry run prints is what a shell runs: every argument comes back intact — a key
+    /// path with a space included — from a real bash.
+    #[cfg(unix)]
+    #[test]
+    fn displayed_ssh_and_scp_commands_paste_back_as_their_argv() {
+        let mut t = target();
+        t.key_paths = vec!["/keys/my key".into(), "/keys/k2".into()];
+        let echo = |line: &str, program: &str| {
+            let rest = line.strip_prefix(&format!("{program} ")).expect("program first");
+            let o = std::process::Command::new("bash").arg("-c").arg(format!("printf '%s\\n' {rest}")).output().unwrap();
+            String::from_utf8_lossy(&o.stdout).lines().map(String::from).collect::<Vec<_>>()
+        };
+        let mut want = t.ssh_args();
+        want.push("echo 'hi' $HOME".into());
+        assert_eq!(echo(&t.display_command("echo 'hi' $HOME"), "ssh"), want);
+        assert_eq!(echo(&t.display_scp("/tmp/a b", "/root/x"), "scp"), t.scp_args("/tmp/a b", "/root/x"));
     }
 }

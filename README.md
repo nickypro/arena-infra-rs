@@ -264,8 +264,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     nothing was created at all). A pod that fails is left running — one is only ever
     terminated by `--check`. Without a proxy layout, a READY pod's `~/.ssh/config` fleet map
     is rewritten at the end if pods came up after it.
-    **`--check`** deep-checks each pod after setup (`pods test --deep`). A FAIL is a bad
-    host: the pod is terminated, confirmed gone from its own provider's listing (never two
+    **`--check`** deep-checks each pod after setup (`pods test --deep`). A FAIL on the host
+    (driver, CUDA, device count, a GPU's tensor op, peer copies, NCCL) is a bad machine: the
+    pod is terminated, confirmed gone from its own provider's listing (never two
     pods per name), and the name recreated from the same `--gpu/--cloud/--max-price` options
     (or the one configured spec) — options that haven't failed first, waiting for capacity
     per `--retry-mins` or `--keep-trying` — and run through the pipeline again; a replacement
@@ -274,7 +275,12 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     (default 2); the last pod that FAILed its check is left running for a look. Only a check
     whose script ran can condemn a host: one that couldn't run (SSH dropped, timed out) is
     rerun once SSH answers, and if it still can't run the name FAILs with the pod left
-    running. A WARN counts as ready (shown in HEALTH). **Ctrl+C** stops every pipeline where
+    running. A FAIL that is only **software/setup** (torch missing or not importing, no
+    python) is never replaced — a new pod boots the same image and runs the same setup, so it
+    would fail the same way: the name FAILs at once (`FAILED check — software/setup failure,
+    not the host — …`), the pod is left running and its machine isn't counted as bad
+    (`pods test --deep` says the same under its table). A WARN counts as ready (shown in
+    HEALTH). **Ctrl+C** stops every pipeline where
     it is, starts nothing new, terminates nothing, and reports — also when pressed during
     the create's retry wait (the pipelines then start stopped).
     So `pods up -n 28 --gpu A40 --cloud SECURE --disk 200 --retry-mins 60 --check` is a full
@@ -376,8 +382,11 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     each pod gets `--timeout`, default 1800s = 30 min — flags go *before* the command: a bare
     `-t`/`--exclude`/`--on`/`--gpus`/`--dry-run` after it is refused rather than run on every
     pod, so quote a command that takes one, `run 'tmux kill-session -t lab'`; on a timeout the local ssh is killed, and the remote
-    command dies at its next write to the closed connection) / the read-only
-    torch-version health check (90s per pod).
+    command dies at its next write to the closed connection; a pod whose command fails
+    shows what it printed on stdout too, then `exit N: <stderr>` — never `Some(N)`) / the
+    read-only torch-version health check (90s per pod). Every dry run's `ssh`/`scp`/`rsync`
+    line is shell-quoted, so it pastes as exactly what would run (globs like `'**/.git/**'`
+    don't expand).
   - `pods run --background [-t <targets>] <cmd>` / `pods jobs [targets] [JOB] [--kill JOB]` /
     `pods logs [targets] [JOB] [-n N] [-f]` — **detached course-test runs**. `--background`
     (confirms first; `--dry-run` shows the wrapper) starts the command on each pod with
@@ -641,6 +650,15 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     its ssh transport; SIGKILL 2s later). Connection refusals right after create are still
     retried for ~150s (sshd booting); an auth failure (`Permission denied (publickey)`)
     fails at once.
+    **Hetzner (bare VM):** the embedded `hetzner_setup.sh` builds the ARENA env with uv on
+    **Python 3.13** (the repo's `requires-python` lower bound when newer; `ARENA_PYTHON`
+    overrides) with CPU substitutions by pattern, not by exact upstream line (`jax[cuda…]` →
+    `jax[cpu]`, bitsandbytes and `nvidia-*cuNN` wheels dropped, CUDA indexes and `+cuNNN`
+    pins dropped, `uv pip install --torch-backend cpu`). It **fails loudly**: any failed
+    package/venv/install step, or a venv whose python can't `import torch, transformer_lens`
+    afterwards, exits non-zero with the reason as its last line (`FAILED: …`) — a VM is never
+    reported set up without a working env. Re-runs skip the install only when that import
+    gate already passes.
     **VS Code warm-up** (last step, on every provider, `up`/`restart`/`replace` included):
     pre-installs what a participant's first Remote-SSH connect would otherwise download on
     the pod — the latest stable VS Code server for the pod's CPU (x64/arm64, resolved from

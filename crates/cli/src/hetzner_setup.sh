@@ -2,16 +2,23 @@
 # Provision a bare Hetzner Ubuntu 24.04 x86 VM to look like an ARENA pod:
 #   - system deps (build tools, ffmpeg, libosmesa6 for headless mujoco, zsh, …)
 #   - docker + docker compose
-#   - uv + a Python 3.11 venv with the ARENA packages (CPU substitutions)
+#   - uv + a Python 3.13 venv with the ARENA packages (CPU substitutions)
 #   - a ~/.zshrc / ~/.bashrc that auto-activates the venv, so `arena pods run`
 #     (which does `zsh -c 'source ~/.zshrc; …'`) lands in the right Python.
 #
 # The arena8 SSH key is attached at CREATE time by the provider (MACHINE_NAME_PREFIX),
 # so this script assumes you can already SSH in. Run as root on the pod:
 #   ssh arena8-<name> 'bash -s' < hetzner_setup.sh
-# Idempotent-ish: safe to re-run.
+# Idempotent: safe to re-run. The ARENA env is (re)installed unless it already passes the
+# gate below, and the script exits non-zero — with the reason as its last line — whenever the
+# env can't be made to pass it: a VM whose venv can't `import torch` is not set up, and must
+# never be reported as if it were (it once was: no `set -e`, so a failed install was a ✓).
+# Only the ARENA env is fatal; the shell niceties after it stay best-effort (WARN lines).
 set -uo pipefail
 export DEBIAN_FRONTEND=noninteractive
+
+# Stop with the reason as the last line of stderr (what `arena pods setup` shows).
+die() { echo "FAILED: $*" >&2; exit 1; }
 
 REPO_DIR="${REPO_DIR:-/root/ARENA_materials}"
 # If the repo isn't already present (e.g. rsync'd from the control plane), clone it.
@@ -19,17 +26,17 @@ REPO_URL="${REPO_URL:-https://github.com/ARENA-education/ARENA_materials.git}"
 VENV="$REPO_DIR/.venv"
 
 echo "### 1/5 system packages"
-apt-get update -qq
+apt-get update -qq || die "apt-get update failed"
 apt-get install -y --no-install-recommends \
     build-essential ffmpeg git curl wget ca-certificates libosmesa6 jq zsh tmux \
-    python3-dev pkg-config
+    python3-dev pkg-config || die "apt-get install of the system packages failed"
 
 echo "### 2/5 docker + docker compose"
 if ! command -v docker >/dev/null 2>&1; then
     curl -fsSL https://get.docker.com | sh
 fi
 systemctl enable --now docker 2>/dev/null || true
-docker --version
+docker --version || echo "WARN: docker missing (its installer failed?) — continuing; the ARENA env doesn't need it"
 docker compose version || echo "WARN: docker compose plugin missing"
 
 echo "### 3/5 uv"
@@ -37,7 +44,7 @@ if ! command -v uv >/dev/null 2>&1 && [ ! -x "$HOME/.local/bin/uv" ]; then
     curl -LsSf https://astral.sh/uv/install.sh | sh
 fi
 export PATH="$HOME/.local/bin:$PATH"
-uv --version
+uv --version || die "uv isn't installed (its installer failed?)"
 
 echo "### 4/5 ARENA repo + Python env"
 # If a git deploy key was provided (REPO_KEY), wire github.com to it so we can clone — and
@@ -53,30 +60,68 @@ if [ -n "${REPO_KEY:-}" ] && [ -f "$REPO_KEY" ]; then
         chmod 600 ~/.ssh/config
     fi
 fi
-[ -d "$REPO_DIR" ] || git clone "$REPO_URL" "$REPO_DIR"
-cd "$REPO_DIR"
-# Skip the slow (~4GB) install if the env is already baked in — e.g. the pod booted from a
-# pre-built snapshot. This is what makes snapshot-based pods come up in ~1 min instead of 10.
-if [ -d "$VENV" ] && "$VENV/bin/python" -c "import torch" >/dev/null 2>&1; then
-    echo "ARENA env already present — skipping uv install"
+[ -d "$REPO_DIR" ] || git clone "$REPO_URL" "$REPO_DIR" || die "couldn't clone $REPO_URL into $REPO_DIR"
+cd "$REPO_DIR" || die "no repo at $REPO_DIR"
+
+# The gate: the env is usable only if its python imports what the exercises need. It decides
+# both whether to skip the slow (~4GB) install — e.g. on a pod booted from a pre-built snapshot,
+# which is what makes those come up in ~1 min instead of 10 — and whether setup succeeded.
+env_ok() { [ -x "$VENV/bin/python" ] && "$VENV/bin/python" -c 'import torch, transformer_lens' >/dev/null 2>&1; }
+
+# The venv's Python: ARENA_PYTHON if set, else 3.13 — raised to the lower bound of the repo's
+# `requires-python` when that is newer. (3.11 broke: the requirements pin jax[cuda13]==0.11.2,
+# which needs >= 3.12, so uv found "No solution" — and the old script carried on regardless.)
+pick_python() {
+    if [ -n "${ARENA_PYTHON:-}" ]; then echo "$ARENA_PYTHON"; return; fi
+    local want=3.13 floor
+    floor=$(sed -nE "s/^[[:space:]]*requires-python[[:space:]]*=[[:space:]]*[\"']?[[:space:]]*>=?[[:space:]]*([0-9]+\.[0-9]+).*/\1/p" pyproject.toml 2>/dev/null | head -n1)
+    if [ -n "$floor" ] && [ "$(printf '%s\n%s\n' "$want" "$floor" | sort -V | tail -n1)" = "$floor" ]; then
+        want=$floor
+    fi
+    echo "$want"
+}
+
+if env_ok; then
+    echo "ARENA env already present (torch + transformer_lens import) — skipping uv install"
 else
-    # CPU substitutions: torch CPU wheels, jax[cpu]; drop bitsandbytes (CUDA-only — 176MB
-    # of GPU quantization kernels that are dead weight on a CPU box).
-    sed -e 's#https://download.pytorch.org/whl/cu118#https://download.pytorch.org/whl/cpu#' \
-        -e 's#^jax\[cuda12\]#jax[cpu]#' \
-        -e '/^bitsandbytes/d' \
-        requirements.txt > requirements.cpu.txt
+    [ -f requirements.txt ] || die "no requirements.txt in $REPO_DIR to install the ARENA env from"
+    PY=$(pick_python)
+    # CPU substitutions, by pattern rather than by exact upstream line (those drift: jax went
+    # cuda12 → cuda13, torch moved off the cu118 index): any `jax[cuda…]` extra → `jax[cpu]`;
+    # bitsandbytes and the nvidia-* CUDA runtime wheels dropped (GPU-only — dead weight on a CPU
+    # box); CUDA wheel indexes and `+cuNNN` local versions dropped — torch comes from the CPU
+    # index via `--torch-backend cpu`.
+    sed -E -e 's#^([[:space:]]*)jax\[cuda[^]]*\]#\1jax[cpu]#' \
+        -e '/^[[:space:]]*bitsandbytes([^A-Za-z0-9_.-]|$)/d' \
+        -e '/^[[:space:]]*nvidia-[A-Za-z0-9_.-]*cu[0-9]+/d' \
+        -e '/^[[:space:]]*--(extra-)?index-url[[:space:]=]+https?:\/\/download\.pytorch\.org\/whl\/cu/d' \
+        -e 's#\+cu[0-9]+##g' \
+        requirements.txt > requirements.cpu.txt || die "couldn't write requirements.cpu.txt"
     # transformer_lens pins numpy<2, which conflicts with jax (numpy>=2). That pin is stale —
     # override it so the resolve succeeds (TL runs fine on numpy 2.x).
-    printf 'numpy>=2.0\n' > overrides.txt
-    uv venv --python 3.11 "$VENV"
+    printf 'numpy>=2.0\n' > overrides.txt || die "couldn't write overrides.txt"
+    # A venv that fails the gate is rebuilt from scratch (it may be on the wrong Python).
+    rm -rf "$VENV"
+    uv venv --python "$PY" "$VENV" || die "uv couldn't create a Python $PY venv at $VENV"
     # shellcheck disable=SC1091
-    source "$VENV/bin/activate"
-    # --index-strategy unsafe-best-match: the torch CPU extra-index also carries some shared
-    # deps (e.g. importlib-metadata) at versions that conflict with PyPI pins (circuitsvis);
-    # this lets uv pick the best version across BOTH indexes instead of first-index-only.
-    uv pip install --no-cache-dir --index-strategy unsafe-best-match \
-        --override overrides.txt -r requirements.cpu.txt
+    source "$VENV/bin/activate" || die "couldn't activate $VENV"
+    # `--torch-backend cpu`: uv picks torch's CPU wheels itself (PyPI's default torch is now a
+    # CUDA build). An older uv without it gets the CPU index the old way —
+    # --index-strategy unsafe-best-match: that index also carries some shared deps (e.g.
+    # importlib-metadata) at versions that conflict with PyPI pins (circuitsvis); this lets uv
+    # pick the best version across BOTH indexes instead of first-index-only.
+    if uv pip install --help 2>/dev/null | grep -q -- '--torch-backend'; then
+        backend=(--torch-backend cpu)
+    else
+        backend=(--extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match)
+    fi
+    uv pip install --no-cache-dir "${backend[@]}" --override overrides.txt -r requirements.cpu.txt \
+        || die "installing the ARENA packages (requirements.cpu.txt) into the Python $PY venv failed — see uv's error above"
+fi
+# The final gate, also after an install that "succeeded": no torch / transformer_lens, no setup.
+if ! env_ok; then
+    why=$("$VENV/bin/python" -c 'import torch, transformer_lens' 2>&1 | tail -n1)
+    die "the ARENA env at $VENV can't import torch + transformer_lens (${why:-no python in it}) — not set up"
 fi
 # shellcheck disable=SC1091
 source "$VENV/bin/activate"

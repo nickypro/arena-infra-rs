@@ -4,8 +4,7 @@
 //! home directory to the operator's machine via rsync. It's a safety net for files that
 //! never made it into git before a pod is torn down.
 //!
-//! Mirrors the legacy flags: archive + compress, human-readable progress, prune empty
-//! dirs, and a per-file size cap so a stray multi-GB checkpoint doesn't blow up the
+//! Mirrors the legacy flags: archive + compress, prune empty dirs, and a per-file size cap so a stray multi-GB checkpoint doesn't blow up the
 //! backup. Dotfile *directories* (caches, `.git`, …), `site-packages/`, and common
 //! reconstructable/huge non-dot dirs (`hf_cache/`, `__pycache__/`, `venv/`,
 //! `node_modules/`) are excluded — they're either reconstructable or huge. The rsync arg
@@ -299,9 +298,11 @@ fn shell_quote(s: &str) -> String {
 /// The shared `rsync` flags + size filters + include/exclude rules (everything except the
 /// `-e` transport and the source/dest operands), so pull and push stay in lockstep.
 fn rsync_flags(pc: &PullConfig) -> Vec<String> {
+    // No `--human-readable`: with it rsync's `--stats` print sizes as `1.84G`, which the old
+    // digits-only parse read as 184 (live: "(6754 files, 184)" for a 1.8G pull). The default
+    // stats are plain (digit-grouped) byte counts; [`parse_rsync_stats`] reads every format.
     let mut a = vec![
         "-avz".to_string(),
-        "--human-readable".into(),
         "--info=progress2".into(),
         "--stats".into(), // emit a summary we parse to report files/bytes per pod
         "--prune-empty-dirs".into(),
@@ -329,22 +330,74 @@ fn rsync_flags(pc: &PullConfig) -> Vec<String> {
     a
 }
 
-/// Parse rsync `--stats` output into `(files_transferred, human-readable bytes)` so a
-/// pull reports what actually moved (not just "done"). `None` if the stats aren't found.
-pub fn parse_rsync_stats(stdout: &str) -> Option<(u64, String)> {
-    let mut files = None;
-    let mut bytes = None;
+/// What an rsync `--stats` summary says moved (see [`parse_rsync_stats`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RsyncStats {
+    /// Regular files sent, new or changed (`Number of regular files transferred`).
+    pub files_sent: u64,
+    /// Their size, in bytes (`Total transferred file size`; the files' size, not the wire's).
+    pub bytes_sent: u64,
+    /// Everything the transfer covered, sent or not (`Number of files`); `None` = not said.
+    pub files: Option<u64>,
+    /// Its size in bytes (`Total file size`).
+    pub bytes: Option<u64>,
+}
+
+impl RsyncStats {
+    /// `12 files, 3.4M` — what was sent (the old summary's shape).
+    pub fn sent(&self) -> String {
+        format!("{} files, {}", self.files_sent, human_bytes(self.bytes_sent))
+    }
+}
+
+/// Parse rsync `--stats` output so a pull reports what actually moved (not just "done").
+/// `None` if the stats aren't there. Reads every way rsync prints a number — plain
+/// (`1234567`), digit-grouped by locale (`1,234,567` / `1.234.567`), and human-readable with
+/// a unit (`1.84G`, `1,84G`: units of 1000, what one `--human-readable` gives) — so a size
+/// is never mistaken for its digits.
+pub fn parse_rsync_stats(stdout: &str) -> Option<RsyncStats> {
+    let mut s = RsyncStats::default();
+    let mut seen = false;
     for line in stdout.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("Number of regular files transferred:") {
-            files = rest.trim().replace(',', "").parse::<u64>().ok();
+            s.files_sent = rsync_number(rest)?;
+            seen = true;
         } else if let Some(rest) = line.strip_prefix("Total transferred file size:") {
-            // e.g. "Total transferred file size: 1,234,567 bytes"
-            let digits: String = rest.chars().filter(|c| c.is_ascii_digit()).collect();
-            bytes = digits.parse::<u64>().ok();
+            s.bytes_sent = rsync_number(rest).unwrap_or(0);
+        } else if let Some(rest) = line.strip_prefix("Number of files:") {
+            s.files = rsync_number(rest);
+        } else if let Some(rest) = line.strip_prefix("Total file size:") {
+            s.bytes = rsync_number(rest);
         }
     }
-    files.map(|f| (f, human_bytes(bytes.unwrap_or(0))))
+    seen.then_some(s)
+}
+
+/// The first number in an rsync stats value (`" 1,234,567 bytes"`, `" 6,754 (reg: …)"`,
+/// `" 1.84G bytes"`). See [`parse_rsync_stats`] for the formats.
+fn rsync_number(raw: &str) -> Option<u64> {
+    let tok = raw.split_whitespace().next()?;
+    let unit = |c: char| match c {
+        'K' => Some(1e3),
+        'M' => Some(1e6),
+        'G' => Some(1e9),
+        'T' => Some(1e12),
+        'P' => Some(1e15),
+        _ => None,
+    };
+    match tok.chars().last().and_then(unit) {
+        Some(scale) => {
+            let num = tok[..tok.len() - 1].replace(',', ".");
+            let v: f64 = num.parse().ok().filter(|v: &f64| v.is_finite() && *v >= 0.0)?;
+            Some((v * scale).round() as u64)
+        }
+        // Without a unit any `,`/`.` is a thousands separator (rsync prints no fractions here).
+        None if tok.chars().all(|c| c.is_ascii_digit() || c == ',' || c == '.') => {
+            tok.chars().filter(char::is_ascii_digit).collect::<String>().parse().ok()
+        }
+        None => None,
+    }
 }
 
 /// Bytes as a compact human string ("0", "12K", "3.4M", "1.2G").
@@ -358,17 +411,19 @@ pub fn human_bytes(b: u64) -> String {
     b.to_string()
 }
 
-/// Human-readable `rsync` command for dry-run output (the `-e` value is quoted since it
-/// contains spaces).
+/// The `rsync` command for dry-run output, every argument shell-quoted where a shell would
+/// change it ([`crate::ssh::shell_word`]) — the globs (`'**/.git/**'`, `'models--*/'`) and the
+/// `-e` transport — so it pastes into a shell as exactly the argv that would run.
 pub fn display_rsync(target: &SshTarget, pc: &PullConfig, local_dest: &str) -> String {
-    let args = rsync_args(target, pc, local_dest);
-    let mut out = String::from("rsync");
+    display_argv("rsync", &rsync_args(target, pc, local_dest))
+}
+
+/// `program` and `args` as one shell-ready line ([`crate::ssh::shell_word`] per argument).
+pub fn display_argv(program: &str, args: &[String]) -> String {
+    let mut out = String::from(program);
     for arg in args {
-        if arg.contains(' ') {
-            out.push_str(&format!(" '{}'", arg));
-        } else {
-            out.push_str(&format!(" {arg}"));
-        }
+        out.push(' ');
+        out.push_str(&crate::ssh::shell_word(arg));
     }
     out
 }
@@ -421,10 +476,42 @@ mod tests {
                    Number of files: 1,200\n\
                    Number of regular files transferred: 922\n\
                    Total transferred file size: 107,000,000 bytes\n";
-        let (files, size) = parse_rsync_stats(out).unwrap();
-        assert_eq!(files, 922);
-        assert_eq!(size, "102.0M");
+        let s = parse_rsync_stats(out).unwrap();
+        assert_eq!((s.files_sent, s.bytes_sent, s.files, s.bytes), (922, 107_000_000, Some(1200), None));
+        assert_eq!(s.sent(), "922 files, 102.0M");
         assert_eq!(parse_rsync_stats("nothing here"), None);
+    }
+
+    /// Every way rsync prints its numbers. The live bug: `--human-readable` stats said `1.84G`
+    /// and the digits-only parse reported `184` (bytes) for a 1.8G pull.
+    #[test]
+    fn rsync_numbers_in_every_format() {
+        let cases: &[(&str, Option<u64>)] = &[
+            (" 1234567 bytes", Some(1_234_567)),          // --no-human-readable / old rsync
+            (" 1,234,567 bytes", Some(1_234_567)),        // the default (level 1), `,` grouping
+            (" 1.234.567 bytes", Some(1_234_567)),        // level 1 in a `,`-decimal locale
+            (" 1.84G bytes", Some(1_840_000_000)),        // one --human-readable (units of 1000)
+            (" 1,84G bytes", Some(1_840_000_000)),        // …in a `,`-decimal locale
+            (" 102.00M bytes", Some(102_000_000)),
+            (" 3.50K bytes", Some(3_500)),
+            (" 0 bytes", Some(0)),
+            (" 6,754 (reg: 6,000, dir: 754)", Some(6_754)),
+            (" ", None),
+            (" lots", None),
+            (" -1G", None),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(rsync_number(raw), *want, "{raw:?}");
+        }
+        let human = "Number of files: 6,754 (reg: 6,000, dir: 754)\n\
+                     Number of regular files transferred: 6,754\n\
+                     Total file size: 1.84G bytes\n\
+                     Total transferred file size: 1.84G bytes\n";
+        let s = parse_rsync_stats(human).unwrap();
+        assert_eq!(s.sent(), "6754 files, 1.7G");
+        assert_eq!(s.bytes, Some(1_840_000_000));
+        // Our own flags don't ask for the unit format any more (it's still parsed).
+        assert!(!rsync_args(&target(), &PullConfig::default(), "./d/").iter().any(|a| a == "--human-readable"));
     }
 
     #[test]
@@ -562,5 +649,31 @@ mod tests {
         let s = display_rsync(&target(), &PullConfig::default(), "./out/");
         assert!(s.starts_with("rsync -avz"));
         assert!(s.contains("'ssh -p 22001"));
+        assert!(s.contains("--include '**/.git/**'") && s.contains("--exclude 'models--*/'"), "{s}");
+    }
+
+    /// The dry-run line pastes into a shell as exactly the argv that runs — in a directory where
+    /// the old unquoted globs (`**/.git/**`, `models--*/`, `*.arena-aside-*/`) would have
+    /// expanded into local file names.
+    #[cfg(unix)]
+    #[test]
+    fn a_displayed_rsync_pastes_back_as_its_argv() {
+        let dir = std::env::temp_dir().join(format!("arena-display-rsync-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for d in ["models--x", "a.arena-aside-1", "z/.git/objects", "venv"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        let pc = PullConfig { remote_path: "ARENA materials/".into(), ..PullConfig::small_tier("50M") };
+        let dest = "./backup/w0d4/devtest bravo/";
+        let line = display_rsync(&target(), &pc, dest);
+        let rest = line.strip_prefix("rsync ").unwrap();
+        let o = std::process::Command::new("bash")
+            .current_dir(&dir)
+            .args(["-O", "globstar", "-c", &format!("printf '%s\\n' {rest}")])
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let back: Vec<String> = String::from_utf8_lossy(&o.stdout).lines().map(String::from).collect();
+        assert_eq!(back, rsync_args(&target(), &pc, dest), "{line}");
     }
 }

@@ -21,6 +21,8 @@ use arena_core::ssh::SshTarget;
 use arena_core::volume::RepoSite;
 use arena_core::{Config, PodSpec};
 
+#[cfg(test)]
+mod hetzner_setup_tests;
 mod jobs;
 mod money;
 mod teardown;
@@ -692,13 +694,16 @@ enum PodCmd {
     /// that got no pod included) and exits non-zero unless every requested name is READY. A
     /// pod that fails is left running: one is only ever terminated by --check (below).
     ///
-    /// --check: a pod that FAILs the deep check (`pods test --deep`) is on a bad host — it
+    /// --check: a pod that FAILs the deep check (`pods test --deep`) on its HOST (driver,
+    /// CUDA, device count, a GPU's tensor op, peer copies, NCCL) is on a bad machine — it
     /// is TERMINATED and its name recreated from the same --gpu/--cloud/--max-price options
     /// (options that haven't failed first), up to --check-attempts placements per name; a
     /// replacement that lands on a machine IP that already failed is rejected the same way.
-    /// A check that can't run at all (SSH drops, times out) is retried once and never
-    /// counts against the host. A WARN counts as ready. Ctrl+C (also during the create's
-    /// retries): no new attempts, nothing terminated, report.
+    /// A FAIL that is only software/setup (torch missing or not importing, no python) is NOT
+    /// replaced — a new pod from the same image fails the same way: the name FAILs, the pod
+    /// is left running. A check that can't run at all (SSH drops, times out) is retried once
+    /// and never counts against the host. A WARN counts as ready. Ctrl+C (also during the
+    /// create's retries): no new attempts, nothing terminated, report.
     #[command(verbatim_doc_comment)]
     Up {
         /// Explicit machine names to create (e.g. `apple bloom`), like `pods create`.
@@ -2783,7 +2788,7 @@ async fn exec_each_pod<K>(
 /// non-zero exit (with its stderr), or why there was no answer (`timed out after Ns`, …).
 fn failure_line(done: usize, total: usize, name: &str, call: &PodCall) -> String {
     match call {
-        Ok(out) => format!("[{done}/{total}] ✗ {name} (exit {:?}): {}", out.code, out.stderr.trim()),
+        Ok(out) => format!("[{done}/{total}] ✗ {name} ({}): {}", out.exit_label(), out.stderr.trim()),
         Err(why) => format!("[{done}/{total}] ✗ {name}: {why}"),
     }
 }
@@ -4391,9 +4396,10 @@ async fn read_current_proxy(cfg: &Config, pxcfg: &arena_core::proxy::ProxyConfig
         Some(0) => Ok(Some(out.stdout)),
         Some(3) => Ok(None),
         code => anyhow::bail!(
-            "couldn't read the current proxy config {p} on {} (exit {code:?}): {} — refusing to write \
+            "couldn't read the current proxy config {p} on {} ({}): {} — refusing to write \
              one built without it",
             pxcfg.proxy_host,
+            arena_core::ssh::exit_label(code),
             out.stderr.trim()
         ),
     }
@@ -4954,8 +4960,9 @@ async fn write_proxy(cfg: &Config, p: &PreparedProxy) -> Result<Written> {
             pxcfg.reload_cmd
         ),
         code => anyhow::bail!(
-            "installing/reloading on {host} failed (exit {code:?}): {err} — the live config may not \
-             have changed; `arena proxy apply --dry-run` shows where it stands"
+            "installing/reloading on {host} failed ({}): {err} — the live config may not \
+             have changed; `arena proxy apply --dry-run` shows where it stands",
+            arena_core::ssh::exit_label(code)
         ),
     }
 }
@@ -5012,9 +5019,12 @@ async fn handle_plan(cmd: PlanCmd, provider: &dyn Provider, cfg: &Config) -> Res
                 ),
                 None => println!("window:     INVALID {:?} — fix HH:MM", plan.window),
             }
+            let cap = |v: Option<String>| v.unwrap_or_else(|| "unset".into());
             println!(
-                "caps:       max_total={:?}  max_hourly={:?}  max_replace={:?}",
-                plan.max_total, plan.max_hourly, plan.max_replace
+                "caps:       max_total={}  max_hourly={}  max_replace={}",
+                cap(plan.max_total.map(|n| n.to_string())),
+                cap(plan.max_hourly.map(|n| n.to_string())),
+                cap(plan.max_replace.map(|n| n.to_string()))
             );
             println!("gpus:       {}", plan.gpus.join(" > "));
             println!("providers:  {}", plan.providers.join(" > "));
@@ -5069,8 +5079,9 @@ async fn handle_plan(cmd: PlanCmd, provider: &dyn Provider, cfg: &Config) -> Res
             );
             if day.replace {
                 println!(
-                    "REPLACE: would back up, then terminate those {existing} pod(s) (cap max_replace={:?}), then create {} fresh.",
-                    plan.max_replace, day.count
+                    "REPLACE: would back up, then terminate those {existing} pod(s) (cap max_replace={}), then create {} fresh.",
+                    plan.max_replace.map_or_else(|| "unset".to_string(), |n| n.to_string()),
+                    day.count
                 );
             }
 
@@ -5988,8 +5999,30 @@ fn run_preview(dry_run: bool, cmd: &str, remote_cmd: &str, names: &[&str], timeo
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RunResult {
     name: String,
+    /// Everything it printed: stdout, then — on a failure — the exit and stderr.
     text: String,
     ok: bool,
+    /// A failure on one line, for the compact layout: `exit 1: <last stderr line>` (or the last
+    /// stdout line when stderr is empty), `timed out after 90s`. `None` = it worked.
+    why: Option<String>,
+}
+
+/// A failed command's [`RunResult`] text and one-line reason. stdout is kept — what a command
+/// printed before it failed is often what says why (a script's own progress, `grep`'s matches
+/// so far); the old report dropped it and showed only stderr.
+fn run_failure(out: &arena_core::ssh::SshOutput) -> (String, String) {
+    use arena_core::ssh::strip_interactive_noise;
+    let stdout = strip_interactive_noise(out.stdout.trim()).trim().to_string();
+    let stderr = strip_interactive_noise(out.stderr.trim()).trim().to_string();
+    let exit = if stderr.is_empty() { out.exit_label() } else { format!("{}: {stderr}", out.exit_label()) };
+    let text = if stdout.is_empty() { exit } else { format!("{stdout}\n{exit}") };
+    let last = |s: &str| s.lines().map(str::trim).filter(|l| !l.is_empty()).last().map(String::from);
+    let why = match (last(&stderr), last(&stdout)) {
+        (Some(e), _) => format!("{}: {e}", out.exit_label()),
+        (None, Some(o)) => format!("{} — last output: {o}", out.exit_label()),
+        (None, None) => out.exit_label(),
+    };
+    (text, why)
 }
 
 /// Run `remote_cmd` on every target concurrently over `remote`, each within `timeout`;
@@ -6006,14 +6039,15 @@ async fn run_fleet(
     let mut results = Vec::new();
     exec_each_pod(remote, jobs, timeout, |_, _, name, call| {
         // a no-PTY shell can emit harmless job-control chatter; strip it.
-        let (text, ok) = match call {
-            Ok(out) if out.success => (strip_interactive_noise(out.stdout.trim()).trim().to_string(), true),
+        let (text, why) = match call {
+            Ok(out) if out.success => (strip_interactive_noise(out.stdout.trim()).trim().to_string(), None),
             Ok(out) => {
-                (format!("exit {:?}: {}", out.code, strip_interactive_noise(out.stderr.trim()).trim()), false)
+                let (text, why) = run_failure(&out);
+                (text, Some(why))
             }
-            Err(why) => (why, false),
+            Err(why) => (why.clone(), Some(why)),
         };
-        results.push(RunResult { name: name.to_string(), text, ok });
+        results.push(RunResult { name: name.to_string(), text, ok: why.is_none(), why });
     })
     .await;
     results.sort_by(|a, b| a.name.cmp(&b.name));
@@ -6033,8 +6067,10 @@ fn render_run(results: &[RunResult], compact: bool) -> (Vec<String>, usize) {
             bad += 1
         }
         if compact {
-            let line = r.text.lines().last().unwrap_or("").trim();
-            let shown = if r.ok { line.to_string() } else { format!("✗ {line}") };
+            let shown = match &r.why {
+                None => r.text.lines().last().unwrap_or("").trim().to_string(),
+                Some(why) => format!("✗ {why}"),
+            };
             lines.push(format!("{:<22} {shown}", r.name));
         } else {
             lines.push(format!("\n── {} {}", r.name, if r.ok { "" } else { "(FAILED)" }));
@@ -9553,14 +9589,14 @@ async fn handle_pull(
             Ok(o) if o.success => {
                 // Report what actually moved, so a pull isn't "silent".
                 let summary = match pull::parse_rsync_stats(&o.stdout) {
-                    Some((files, size)) => format!("{files} files, {size}"),
+                    Some(s) => s.sent(),
                     None => "done".into(),
                 };
                 println!("[{done}/{jobs}] ✓ {name} [{tier}] ({summary})");
                 ok += 1;
             }
             Ok(o) => {
-                println!("[{done}/{jobs}] ✗ {name} [{tier}] (exit {:?}): {}", o.code, o.stderr.trim());
+                println!("[{done}/{jobs}] ✗ {name} [{tier}] (rsync {}): {}", o.exit_label(), o.stderr.trim());
                 failed += 1;
                 failures.push(format!("{name} [{tier}]"));
             }
@@ -9692,10 +9728,9 @@ async fn handle_restore(
         ssh.port,
     );
     if opts.dry_run {
-        let shown: Vec<String> = std::iter::once(rsync.to_string())
-            .chain(args.iter().map(|a| if a.contains(' ') { format!("'{a}'") } else { a.clone() }))
-            .collect();
-        println!("[dry-run] would {plan}\n  {}", shown.join(" "));
+        // Shell-quoted, so the line pastes as exactly this argv (the `.claude*` exclude unquoted
+        // would expand against the operator's directory).
+        println!("[dry-run] would {plan}\n  {}", pull::display_argv(rsync, &args));
         return Ok(());
     }
     if !confirm(opts.yes, &format!("Will {plan}"))? {
@@ -9706,9 +9741,9 @@ async fn handle_restore(
     let out = match arena_core::remote::run_local(rsync, &args, &what_run, Some(opts.timeout)).await {
         Ok(out) if out.success => out,
         Ok(out) => anyhow::bail!(
-            "restoring {} failed (rsync exit {:?}): {} — nothing on the pod was deleted; re-run to finish",
+            "restoring {} failed (rsync {}): {} — nothing on the pod was deleted; re-run to finish",
             pod.name,
-            out.code,
+            out.exit_label(),
             out.stderr.trim()
         ),
         Err(e) => anyhow::bail!(
@@ -9717,7 +9752,8 @@ async fn handle_restore(
             describe_error(&e)
         ),
     };
-    let moved = pull::parse_rsync_stats(&out.stdout).map_or_else(|| "done".into(), |(n, size)| format!("{n} file(s), {size} sent"));
+    let moved = pull::parse_rsync_stats(&out.stdout)
+        .map_or_else(|| "done".into(), |s| format!("{} file(s), {} sent", s.files_sent, pull::human_bytes(s.bytes_sent)));
     println!("✓ restored {} from {label} ({moved}); anything it replaced is under {kept} on the pod", pod.name);
     let kept_newer = restore::newer_on_pod(&out.stdout);
     if !kept_newer.is_empty() {
@@ -9739,7 +9775,7 @@ async fn handle_restore(
             ),
             other => {
                 let why = match other {
-                    Ok(o) => format!("exit {:?}", o.code),
+                    Ok(o) => o.exit_label(),
                     Err(e) => describe_error(&e),
                 };
                 println!("  ⚠ couldn't check {repo} on {} after pushing its .git ({why}) — run `git -C {repo} fsck` there", pod.name);
@@ -9964,7 +10000,8 @@ async fn handle_copy(
         println!("\nDry-run — would scp to {} pod(s):\n", targets.len());
         for (name, t) in &targets {
             println!("# {name}");
-            println!("scp {rflag}{}\n", t.scp_args(&local, &remote).join(" "));
+            let args: Vec<String> = t.scp_args(&local, &remote).iter().map(|a| arena_core::ssh::shell_word(a)).collect();
+            println!("scp {rflag}{}\n", args.join(" "));
         }
         println!("Preview only — run without --dry-run to copy.");
         return Ok(());
@@ -14027,7 +14064,7 @@ mod remote_tests {
         backup_fleet, copy_pod_files, copy_to_pod, cp_timeout, deep_check_fleet, duplicate_names, each_pod,
         handle_backup, handle_copy, handle_deep_test, handle_full_backup, handle_init_branches,
         handle_pods, handle_pull, handle_restore, handle_run, handle_set_branch, local_size, marker_present, probe_gpus,
-        proxy_reaches_pod, render_deep_test, render_run, replace_copy_failed, restore_note, restore_notes, run_fleet, run_preview, select,
+        proxy_reaches_pod, render_deep_test, render_run, replace_copy_failed, restore_note, restore_notes, run_failure, run_fleet, run_preview, select,
         target_is_pod, BackupTally, Cli, Cmd, CopyLeg, CopyPlan, PodCmd, RestoreOpts, RestoreSource, RunResult, Select, SelectByFlag, Selected,
         Unscoped, BACKUP_TIMEOUT, BRANCH_TIMEOUT, CP_BASE_TIMEOUT, POD_COPY_TIMEOUT, RUN_TIMEOUT_SECS, TEST_TIMEOUT,
     };
@@ -14183,15 +14220,16 @@ mod remote_tests {
         script(&fake);
         let remote: Arc<dyn Remote> = fake.clone();
         let results = run_fleet(&remote, targets(&fleet()), &wrapped, Duration::from_secs(60)).await;
-        let ok = |name: &str, text: &str| RunResult { name: name.into(), text: text.into(), ok: true };
+        let ok = |name: &str, text: &str| RunResult { name: name.into(), text: text.into(), ok: true, why: None };
         assert_eq!(
             results,
             [
                 ok("devtest-apple", "hello"),
                 RunResult {
                     name: "devtest-bloom".into(),
-                    text: "exit Some(127): zsh: command not found: nvidia-smi".into(),
-                    ok: false
+                    text: "exit 127: zsh: command not found: nvidia-smi".into(),
+                    ok: false,
+                    why: Some("exit 127: zsh: command not found: nvidia-smi".into()),
                 },
                 ok("devtest-cloud", ""),
             ]
@@ -14204,14 +14242,43 @@ mod remote_tests {
                 "\n── devtest-apple ",
                 "hello",
                 "\n── devtest-bloom (FAILED)",
-                "exit Some(127): zsh: command not found: nvidia-smi",
+                "exit 127: zsh: command not found: nvidia-smi",
                 "\n── devtest-cloud ",
                 "",
                 "\n2 ok, 1 failed",
             ]
         );
         let (lines, _) = render_run(&results, true);
-        assert_eq!(lines[1], "devtest-bloom          ✗ exit Some(127): zsh: command not found: nvidia-smi");
+        assert_eq!(lines[1], "devtest-bloom          ✗ exit 127: zsh: command not found: nvidia-smi");
+    }
+
+    /// A failing command's stdout is part of its report (live: `pods run` showed only stderr,
+    /// so a script's own output before it failed was lost), and no exit reads `Some(1)`.
+    #[test]
+    fn a_failed_run_keeps_its_stdout_and_says_exit_n() {
+        use arena_core::ssh::SshOutput;
+        let out = |code: Option<i32>, stdout: &str, stderr: &str| SshOutput {
+            success: false,
+            code,
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        };
+        // (output, full text, compact reason)
+        let cases: &[(SshOutput, &str, &str)] = &[
+            (out(Some(1), "step 1 ok\nstep 2 ok\n", "Traceback…\nValueError: bad\n"), "step 1 ok\nstep 2 ok\nexit 1: Traceback…\nValueError: bad", "exit 1: ValueError: bad"),
+            (out(Some(1), "3 matches so far\n", ""), "3 matches so far\nexit 1", "exit 1 — last output: 3 matches so far"),
+            (out(Some(2), "", "usage: x\n"), "exit 2: usage: x", "exit 2: usage: x"),
+            (out(None, "", ""), "killed by a signal", "killed by a signal"),
+        ];
+        for (o, text, why) in cases {
+            assert_eq!(run_failure(o), (text.to_string(), why.to_string()), "{o:?}");
+            assert!(!text.contains("Some(") && !why.contains("Some("));
+        }
+        let results = vec![RunResult { name: "devtest-bloom".into(), text: cases[0].1.into(), ok: false, why: Some(cases[0].2.into()) }];
+        let (full, bad) = render_run(&results, false);
+        assert_eq!((bad, full[1].as_str()), (1, "step 1 ok\nstep 2 ok\nexit 1: Traceback…\nValueError: bad"));
+        let (compact, _) = render_run(&results, true);
+        assert_eq!(compact[0], "devtest-bloom          ✗ exit 1: ValueError: bad");
     }
 
     /// A stand-in `rsync` (a shell script in a temp dir) that logs each call's destination —
@@ -14690,7 +14757,7 @@ mod remote_tests {
         };
         let failing = script("rsync-fails", "#!/bin/sh\necho 'rsync: connection unexpectedly closed' >&2\nexit 12\n");
         let e = handle_restore(&f, &remote, &cfg(), "apple", restore_opts(&dir), &failing, NOW).await.unwrap_err().to_string();
-        assert!(e.contains("exit Some(12)") && e.contains("connection unexpectedly closed") && e.contains("nothing on the pod was deleted"), "{e}");
+        assert!(e.contains("exit 12") && e.contains("connection unexpectedly closed") && e.contains("nothing on the pod was deleted"), "{e}");
         // Stuck: stopped at its budget, reported as such.
         let stuck = script("rsync-stuck", "#!/bin/sh\nexec sleep 30\n");
         let opts = RestoreOpts { timeout: Duration::from_millis(500), ..restore_opts(&dir) };
@@ -14953,7 +15020,7 @@ mod remote_tests {
                 "= devtest-cloud (no changes, on feature-y)",
                 "⊘ devtest-delta (skipped — on protected branch main)",
                 "✓ devtest-apple -> autocommit-x",
-                "✗ devtest-echo (exit Some(128)): fatal: Could not read from remote repository.",
+                "✗ devtest-echo (exit 128): fatal: Could not read from remote repository.",
             ]
         );
 
@@ -15605,7 +15672,7 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
                     "devtest-bloom",
                     Status::Fail,
                     "ssh",
-                    "exit Some(255): ssh: connect to host 10.0.0.1 port 22002: Connection refused"
+                    "exit 255: ssh: connect to host 10.0.0.1 port 22002: Connection refused"
                 ),
                 (
                     "devtest-cloud",

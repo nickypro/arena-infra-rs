@@ -313,7 +313,7 @@ pub fn restore_args(target: &SshTarget, src: &Path, subpath: Option<&str>, flags
         a.push("--update".into());
     }
     a.push(format!("--timeout={IO_TIMEOUT_SECS}"));
-    a.push("--human-readable".into());
+    // No `--human-readable`: the stats' sizes are parsed (`pull::parse_rsync_stats`).
     a.push("--stats".into());
     a.push("--info=skip1".into());
     for ex in EXCLUDES {

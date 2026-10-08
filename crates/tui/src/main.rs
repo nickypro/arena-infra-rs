@@ -1522,7 +1522,7 @@ async fn run_ssh_oneline(
             let line = out.stdout.lines().last().unwrap_or("").trim();
             format!("✓ {} {what}: {line}", pod.name)
         }
-        Ok(out) => format!("✗ {} {what} (exit {:?}): {}", pod.name, out.code, out.stderr.trim()),
+        Ok(out) => format!("✗ {} {what} ({}): {}", pod.name, out.exit_label(), out.stderr.trim()),
         Err(e) => format!("✗ {} {what} failed: {}", pod.name, describe_error(&e)),
     }
 }
@@ -1541,7 +1541,7 @@ async fn run_set_branch(remote: &dyn Remote, cfg: &Config, pod: &Pod, branch: &s
     let cmd = arena_core::backup::checkout_command(&repo_path, branch, cfg.get("GIT_SSH_KEY_REMOTE"), false);
     match remote.exec(&target, &cmd, Some(BRANCH_TIMEOUT)).await {
         Ok(out) if out.success => format!("✓ {} → {branch}", pod.name),
-        Ok(out) => format!("✗ {} set-branch (exit {:?}): {}", pod.name, out.code, out.stderr.trim()),
+        Ok(out) => format!("✗ {} set-branch ({}): {}", pod.name, out.exit_label(), out.stderr.trim()),
         Err(e) => format!("✗ {} set-branch failed: {}", pod.name, describe_error(&e)),
     }
 }
@@ -1563,7 +1563,7 @@ async fn run_backup(remote: &dyn Remote, cfg: &Config, pod: &Pod) -> String {
             Some((backup::BACKUP_SKIPPED, branch)) => format!("⊘ {} — skipped (on protected branch {branch})", pod.name),
             _ => format!("✓ backed up {}", pod.name),
         },
-        Ok(out) => format!("✗ backup {} (exit {:?}): {}", pod.name, out.code, out.stderr.trim()),
+        Ok(out) => format!("✗ backup {} ({}): {}", pod.name, out.exit_label(), out.stderr.trim()),
         Err(e) => format!("✗ backup {} failed: {}", pod.name, describe_error(&e)),
     }
 }
@@ -3827,7 +3827,7 @@ deep_check_end=1
             ("test", vec![FakeReply::stdout("noise\n2.9.0+cu130\n")], "✓ devtest-alpha torch: 2.9.0+cu130", vec![TEST_TIMEOUT]),
             ("test-hung", vec![FakeReply::hang()], "✗ devtest-alpha torch failed: timed out after 90s", vec![TEST_TIMEOUT]),
             ("run-hung", vec![FakeReply::hang()], "✗ devtest-alpha run failed: timed out after 1800s", vec![RUN_TIMEOUT]),
-            ("backup", vec![FakeReply::exit(1, "rejected")], "✗ backup devtest-alpha (exit Some(1)): rejected", vec![BACKUP_TIMEOUT]),
+            ("backup", vec![FakeReply::exit(1, "rejected")], "✗ backup devtest-alpha (exit 1): rejected", vec![BACKUP_TIMEOUT]),
             ("set-branch", vec![FakeReply::ok()], "✓ devtest-alpha → w1d2", vec![BRANCH_TIMEOUT]),
             ("setup", vec![FakeReply::ok(), FakeReply::ok(), FakeReply::ok()], "✓ set up devtest-alpha", vec![setup.copy, setup.relocate, setup.config]),
             (

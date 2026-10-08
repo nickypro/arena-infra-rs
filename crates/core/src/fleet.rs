@@ -127,6 +127,24 @@ pub(crate) fn clip(s: &str, max: usize) -> String {
     }
 }
 
+/// Shorten to at most `max` chars by cutting the **middle** (` … `), keeping the start and the
+/// end. For a message whose last words are the instruction — setup's warnings end with what to
+/// do (`… then re-run setup`) — where a plain [`clip`] cut exactly that (live).
+pub(crate) fn clip_middle(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    const GAP: &str = " … ";
+    let room = max.saturating_sub(GAP.chars().count());
+    // The end carries the instruction: give it the larger share.
+    let tail = room - room * 2 / 5;
+    let head = room - tail;
+    let start: String = s.chars().take(head).collect();
+    let end: String = s.chars().skip(n - tail).collect();
+    format!("{}{GAP}{}", start.trim_end(), end.trim_start())
+}
+
 /// The MAINT column: a compact host-maintenance window, e.g. `maint 10-09 02:00→06:00 UTC`
 /// (the end's date is dropped when it's the same day), with the provider's note appended
 /// (clipped). `-` when there's no window. Times are shown as the provider reports them;

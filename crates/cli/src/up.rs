@@ -8,12 +8,16 @@
 //!   endpoint → proxy sync → setup → [--check: deep check] → API keys → [--lock] → `[name] READY …`
 //!
 //! or `[name] FAILED <stage>: …` (left running). With `--check` a pod that FAILs the deep
-//! check is terminated — and confirmed gone, so a name never has two pods — then its name is
+//! check on its host (`health::FailureKind::Host`: driver, CUDA, GPUs, peer copies, NCCL) is
+//! terminated — and confirmed gone, so a name never has two pods — then its name is
 //! recreated from the confirmed options and the new pod runs the pipeline again; one that
 //! lands on a machine that already failed is rejected the same way (and terminated even with
 //! no attempt left to replace it: it was never set up, and its machine is known bad). Only a
 //! check whose script actually ran can condemn a host: one that couldn't run (SSH dropped,
-//! timed out) is retried once, then FAILs the name with the pod left running. Ctrl+C stops
+//! timed out) is retried once, then FAILs the name with the pod left running. A FAIL that is
+//! only software/setup (torch missing or not importing) is never replaced — the new pod would
+//! boot the same image and fail the same way — so the name FAILs at once, pod left running,
+//! its machine not counted as bad. Ctrl+C stops
 //! every pipeline where it is and launches nothing new; nothing is terminated because of it.
 //!
 //! Concurrency is cooperative, on this one task: the pipelines borrow the fleet provider,
@@ -132,8 +136,9 @@ pub(crate) fn pipeline_text(setup: bool, check: Option<u32>, keys: bool, lock: b
     }
     if let Some(n) = check {
         steps.push(format!(
-            "deep-check it — a pod that FAILs is TERMINATED and its name recreated (up to {n} placement(s) per \
-             name; options that haven't failed first; never on a machine IP that already failed)"
+            "deep-check it — a pod that FAILs on its host is TERMINATED and its name recreated (up to {n} \
+             placement(s) per name; options that haven't failed first; never on a machine IP that already \
+             failed); a software/setup FAIL (e.g. torch missing) is left running, not replaced"
         ));
     }
     if setup && keys {
@@ -555,9 +560,20 @@ impl Shared<'_, '_> {
                 }
                 h = again;
             }
-            let (status, notes) = (h.status, h.notes());
+            let (status, notes, kind) = (h.status, h.notes(), h.failure_kind());
             run.health = Some(h);
             match status {
+                // Every failure is about the software (torch missing, the check script not
+                // running): a new pod boots the same image and runs the same setup, so it would
+                // fail the same way — never replaced, and its machine isn't counted as bad.
+                Status::Fail if kind == Some(health::FailureKind::Software) => {
+                    say(To::Err, &format!("[{name}] check: FAIL (software/setup, not the host) — {notes}"));
+                    let reason = format!(
+                        "software/setup failure, not the host — {notes}. Not replaced: a new pod from the same image \
+                         fails the same way. Left running — fix the setup/image, then `arena pods test --deep {name}`"
+                    );
+                    return self.end(run, Verdict::Failed { stage: Stage::Check, reason });
+                }
                 Status::Fail => {
                     if let Some(ip) = &host {
                         self.failed_hosts.lock().unwrap().push(ip.clone());
@@ -566,8 +582,8 @@ impl Shared<'_, '_> {
                     if let Some(a) = run.attempts.last_mut() {
                         a.end = AttemptEnd::CheckFailed(notes.clone());
                     }
-                    say(To::Err, &format!("[{name}] check: FAIL — {notes}"));
-                    return self.replace(run, &pod, failed_options, format!("deep check failed: {notes}")).await;
+                    say(To::Err, &format!("[{name}] check: FAIL (host) — {notes}"));
+                    return self.replace(run, &pod, failed_options, format!("deep check failed (host): {notes}")).await;
                 }
                 Status::Warn => say(To::Out, &format!("[{name}] check: warn — {notes}")),
                 _ => say(To::Out, &format!("[{name}] check: pass")),
@@ -762,7 +778,7 @@ impl Shared<'_, '_> {
         loop {
             let why = match self.run.remote.exec(target, "true", Some(PROBE_TIMEOUT)).await {
                 Ok(o) if o.success => return Ok(()),
-                Ok(o) => format!("exit {:?}: {}", o.code, o.stderr.trim()),
+                Ok(o) => format!("{}: {}", o.exit_label(), o.stderr.trim()),
                 Err(e) => describe_error(&e),
             };
             if !looks_unreachable(&why) {
@@ -900,7 +916,7 @@ impl Shared<'_, '_> {
                 format!("[{name}] keys ✓ — broadcast tokens only: no per-host key in keys/*_api_keys.csv matched {name}"),
                 Some(fleet_ssh),
             )),
-            Ok(o) => Err(format!("copying its keys: exit {:?}: {}", o.code, o.stderr.trim())),
+            Ok(o) => Err(format!("copying its keys: {}: {}", o.exit_label(), o.stderr.trim())),
             Err(e) => Err(format!("copying its keys: {}", describe_error(&e))),
         }
     }
@@ -936,8 +952,8 @@ impl Shared<'_, '_> {
                 Ok(o) => (self.say)(
                     To::Err,
                     &format!(
-                        "[{name}] fleet SSH map NOT updated (exit {:?}: {}) — `arena pods copy-keys {name}`",
-                        o.code,
+                        "[{name}] fleet SSH map NOT updated ({}: {}) — `arena pods copy-keys {name}`",
+                        o.exit_label(),
                         one_line(&o.stderr)
                     ),
                 ),
@@ -1547,7 +1563,7 @@ mod tests {
             fleet.events(),
             [format!("create devtest-apple {A4000}"), "terminate id1".to_string(), format!("create devtest-apple {R3090}")]
         );
-        let (fail, _) = lines.find("[devtest-apple] check: FAIL — cuda: RuntimeError: Unexpected error from cudaGetDeviceCount()");
+        let (fail, _) = lines.find("[devtest-apple] check: FAIL (host) — cuda: RuntimeError: Unexpected error from cudaGetDeviceCount()");
         let (term, _) = lines.find("[devtest-apple] terminating id1 to recreate devtest-apple (attempt 2 of 2)");
         let (created, _) = lines.find("[created] devtest-apple id=id2 on 1×RTX 3090 COMMUNITY (~$0.22/h)");
         let (ready, _) = lines.find("[devtest-apple] READY after 30s — 1×RTX 3090 COMMUNITY, check pass");
@@ -1565,6 +1581,52 @@ mod tests {
         let summary = pipeline::render_up_summary(&rows);
         assert!(summary.contains("devtest-apple: #1 1×RTX A4000 COMMUNITY (id1, 10.0.0.1): check FAIL — cuda: "), "{summary}");
         assert!(summary.contains("; terminated → #2 1×RTX 3090 COMMUNITY (id2, 10.0.0.2): ready"), "{summary}");
+    }
+
+    /// A FAIL that is all software (here torch doesn't import — live: a Hetzner VM whose
+    /// install had failed) is never replaced: a new pod boots the same image and runs the same
+    /// setup. The name FAILs at once, saying so; the pod is left running, never terminated (and
+    /// its machine isn't counted as bad: another name's replacement may land there).
+    #[tokio::test(start_paused = true)]
+    async fn a_software_failure_is_not_replaced_and_says_why() {
+        let torch_missing = DEEP_HEALTHY
+            .lines()
+            .filter(|l| !["torch_", "cuda_", "device_count", "tensor.", "peer.", "nccl"].iter().any(|p| l.starts_with(p)))
+            .map(|l| if l == "torch=ok" { "torch=error: ModuleNotFoundError: No module named 'torch'".to_string() } else { l.to_string() })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 0), ("10.0.0.2", 22002, 30)])]);
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host("10.0.0.1", 22001), [FakeReply::ok(), FakeReply::ok(), FakeReply::stdout(&torch_missing)]);
+        let keys = keys_dir("software");
+        let cfg = cfg(None);
+        let run = up_run(&fleet, fake.clone(), &cfg, true, Some(3), Some(&keys.0)).await;
+        let made = make(&fleet, &["apple"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+
+        assert_eq!(fleet.events(), [format!("create devtest-apple {A4000}")], "never terminated nor recreated");
+        lines.find("[devtest-apple] check: FAIL (software/setup, not the host) — torch: ModuleNotFoundError: No module named 'torch'");
+        assert!(!lines.all().iter().any(|l| l.contains("terminating")), "{:#?}", lines.all());
+        let row = &rows[0];
+        match &row.verdict {
+            Verdict::Failed { stage: Stage::Check, reason } => assert!(
+                reason.starts_with("software/setup failure, not the host — torch: ModuleNotFoundError")
+                    && reason.contains("Not replaced: a new pod from the same image fails the same way")
+                    && reason.contains("Left running"),
+                "{reason}"
+            ),
+            other => panic!("expected FAILED check, got {other:?}"),
+        }
+        assert_eq!(row.attempts.len(), 1);
+        assert_eq!((row.attempts[0].end.clone(), row.attempts[0].terminated), (AttemptEnd::Kept, false));
+        // No replacement was ever placed (nothing ran on the second endpoint), and the pod got
+        // no keys (it isn't ready).
+        assert!(fake.calls_to(&host("10.0.0.2", 22002)).is_empty());
+        assert_eq!(execs_with(&fake, &host("10.0.0.1", 22001), "OPENAI_API_KEY"), 0);
+        let summary = pipeline::render_up_summary(&rows);
+        assert!(summary.contains("devtest-apple: FAILED check — software/setup failure, not the host — torch: "), "{summary}");
+        assert!(conclude(&rows, &|_, _| {}).is_err());
     }
 
     /// `up --check` records the standing pod's check for `arena snapshot`; the pod it
@@ -1741,7 +1803,7 @@ mod tests {
         let summary = pipeline::render_up_summary(&rows);
         assert!(summary.contains("devtest-apple: #1 1×RTX A4000 COMMUNITY (id1, 10.0.0.1): check FAIL — cuda: "), "{summary}");
         assert!(summary.contains("; terminated → #2 1×RTX 3090 COMMUNITY (id3, 10.0.0.2): check FAIL — cuda: "), "{summary}");
-        assert!(summary.contains("; left running\ndevtest-apple: FAILED check — deep check failed: cuda: "), "{summary}");
+        assert!(summary.contains("; left running\ndevtest-apple: FAILED check — deep check failed (host): cuda: "), "{summary}");
         assert!(summary.contains("devtest-apple  1×RTX A4000"), "the check's own GPU view: {summary}");
         assert!(summary.contains("1 ready, 1 failed (of 2)"), "{summary}");
         assert!(conclude(&rows, &|_, _| {}).is_err());
@@ -2105,11 +2167,11 @@ mod tests {
                 format!("create devtest-cloud {R3090}"),
             ]
         );
-        lines.find("[devtest-apple] check: couldn't run it (ssh: exit Some(255): kex_exchange_identification");
+        lines.find("[devtest-apple] check: couldn't run it (ssh: exit 255: kex_exchange_identification");
         assert_eq!((rows[0].verdict.clone(), rows[0].health), (Verdict::Ready, Some(Status::Pass)));
         match &rows[1].verdict {
             Verdict::Failed { stage: Stage::Check, reason } => assert!(
-                reason.starts_with("couldn't run the deep check twice (ssh: exit Some(255): kex_exchange_identification")
+                reason.starts_with("couldn't run the deep check twice (ssh: exit 255: kex_exchange_identification")
                     && reason.ends_with("— left running (`arena pods test --deep devtest-bloom`); its host isn't counted as bad"),
                 "{reason}"
             ),
@@ -2275,9 +2337,9 @@ mod tests {
         assert_eq!(
             pipeline_text(true, Some(2), true, false),
             "per pod, as soon as it can: wait for its SSH endpoint, sync the proxy (if nginx is set up), provision it, \
-             deep-check it — a pod that FAILs is TERMINATED and its name recreated (up to 2 placement(s) per name; \
-             options that haven't failed first; never on a machine IP that already failed), copy its API keys — then \
-             READY/FAILED per pod"
+             deep-check it — a pod that FAILs on its host is TERMINATED and its name recreated (up to 2 placement(s) \
+             per name; options that haven't failed first; never on a machine IP that already failed); a software/setup \
+             FAIL (e.g. torch missing) is left running, not replaced, copy its API keys — then READY/FAILED per pod"
         );
         assert_eq!(
             pipeline_text(false, None, true, false),

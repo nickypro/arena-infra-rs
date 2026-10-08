@@ -797,13 +797,19 @@ async fn provision_once(
     Pass::Final(ProvisionOutcome::Done { warnings })
 }
 
+/// The longest a setup warning gets before its middle is cut ([`crate::fleet::clip_middle`]).
+/// Generous: a warning is the one line that says what to do about a pod, and its end is the
+/// instruction (a 300-char cut from the end once dropped "… then re-run setup").
+pub const WARNING_MAX_CHARS: usize = 800;
+
 /// The warnings a provisioning command printed: its stdout lines starting with
-/// [`crate::volume::WARNING_PREFIX`], prefix stripped (clipped, so a runaway line stays one line).
+/// [`crate::volume::WARNING_PREFIX`], prefix stripped. Only a runaway line is shortened, and
+/// from the middle, so its instruction at the end stays.
 fn step_warnings(stdout: &str) -> impl Iterator<Item = String> + '_ {
     stdout
         .lines()
         .filter_map(|l| l.trim_end_matches('\r').strip_prefix(crate::volume::WARNING_PREFIX))
-        .map(|w| crate::fleet::clip(w.trim(), 300))
+        .map(|w| crate::fleet::clip_middle(w.trim(), WARNING_MAX_CHARS))
 }
 
 /// Why a best-effort step didn't work out (`None` = it did): the last stderr line of a
@@ -813,9 +819,9 @@ fn optional_failure(call: Result<crate::ssh::SshOutput>) -> Option<String> {
     match call {
         Ok(out) if out.success => None,
         Ok(out) => {
-            let exit = out.code.map(|c| format!("exit {c}")).unwrap_or_else(|| "killed".into());
+            let exit = out.exit_label();
             let last = out.stderr.lines().map(str::trim).filter(|l| !l.is_empty()).last().unwrap_or("");
-            Some(if last.is_empty() { exit } else { format!("{exit}: {}", crate::fleet::clip(last, 300)) })
+            Some(if last.is_empty() { exit } else { format!("{exit}: {}", crate::fleet::clip_middle(last, WARNING_MAX_CHARS)) })
         }
         Err(Error::Timeout { after, .. }) => Some(format!("timed out after {}", human_duration(&after))),
         Err(e) => Some(e.to_string()),
@@ -1335,6 +1341,33 @@ mod tests {
         fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::exit(1, "boom").with_stdout("arena-warning: x\n")]);
         let out = provision(&fake, &target(22), &image_steps(), BootRetry::default()).await;
         assert!(matches!(&out, ProvisionOutcome::Failed { detail, .. } if detail == "boom"), "{out:?}");
+    }
+
+    /// A long warning keeps its instruction: the live relocation warning (both copies exist,
+    /// with the uncommitted files listed) ran past the old 300-char cut, which dropped exactly
+    /// its last words — what to do. Now it's whole up to [`WARNING_MAX_CHARS`], and a runaway
+    /// one loses its middle, never its end.
+    #[tokio::test(start_paused = true)]
+    async fn a_long_warning_keeps_its_instruction_at_the_end() {
+        let files: Vec<String> = (0..12).map(|i| format!("M chapter1_transformer_interp/exercises/part{i}/solutions.py")).collect();
+        let long = format!(
+            "both /root/ARENA_materials (uncommitted changes: {}) and the volume copy /workspace/ARENA_materials exist - \
+             neither touched: work in /root/ARENA_materials is on the container disk. Copy what's needed from \
+             /root/ARENA_materials into /workspace/ARENA_materials, move /root/ARENA_materials away, then re-run setup",
+            files[..3].join(", ")
+        );
+        assert!(long.chars().count() > 300 && long.chars().count() < WARNING_MAX_CHARS, "{}", long.len());
+        let runaway = format!("both copies exist (uncommitted changes: {}) - move it away, then re-run setup", files.join(", ").repeat(3));
+        assert!(runaway.chars().count() > WARNING_MAX_CHARS);
+        let fake = FakeRemote::new();
+        let said = format!("arena-warning: {long}\narena-warning: {runaway}\n");
+        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::stdout(&said), FakeReply::ok()]);
+        let out = provision(&fake, &target(22), &image_steps(), BootRetry::default()).await;
+        let w = out.warnings();
+        assert_eq!(w[0], format!("repo onto volume: {long}"), "whole");
+        assert!(w[1].ends_with("- move it away, then re-run setup") && w[1].contains(" … "), "{}", w[1]);
+        assert!(w[1].starts_with("repo onto volume: both copies exist (uncommitted changes: M chapter1"), "{}", w[1]);
+        assert!(w[1].chars().count() <= WARNING_MAX_CHARS + "repo onto volume: ".len());
     }
 
     /// The relocation is best-effort: failing or running out of its own budget (a huge repo,
