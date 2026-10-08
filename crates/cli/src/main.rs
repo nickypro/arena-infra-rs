@@ -677,11 +677,12 @@ enum PodCmd {
     ///
     /// On RunPod (and Vast, unverified) a stopped pod keeps NO data: its container disk is
     /// discarded and it starts again as a fresh image — only a persistent volume at
-    /// /workspace survives. A pod with no volume (or none confirmed) needs --wipe-ok.
-    /// Hetzner VMs keep their disk.
+    /// /workspace survives. Unless the ARENA repo (BACKUP_REPO_PATH, default
+    /// /root/<ARENA_REPO_NAME>) is on such a volume, the pod needs --wipe-ok. Hetzner VMs
+    /// keep their disk.
     Stop {
-        /// Stop even pods whose container disk would be discarded with no volume to keep
-        /// anything (required for them, even with --yes). Back them up first.
+        /// Stop even pods whose container disk would be discarded with the participants'
+        /// work on it (required for them, even with --yes). Back them up first.
         #[arg(long)]
         wipe_ok: bool,
         /// Preview only: print what would happen, change nothing.
@@ -694,15 +695,17 @@ enum PodCmd {
     ///
     /// RunPod's restart resets the container to its image: everything outside a persistent
     /// volume (/workspace) is gone — participants' files, ~/.name, setup's git remote, the
-    /// distributed keys. A pod with no volume (or none confirmed) is refused unless
-    /// --wipe-ok (even with --yes); Vast (stop+start) is treated the same. Afterwards it
-    /// waits for the SSH endpoint, re-runs `setup` on the pod (--no-setup skips) and syncs
-    /// the proxy, so it comes back usable. Hetzner's hard reset keeps the VM disk.
+    /// distributed keys. Unless the ARENA repo (BACKUP_REPO_PATH, default
+    /// /root/<ARENA_REPO_NAME> — NOT on the volume) is on the pod's /workspace volume, it is
+    /// refused without --wipe-ok (even with --yes); Vast (stop+start) is treated the same.
+    /// Afterwards it waits for the SSH endpoint, re-runs `setup` on the pod (--no-setup
+    /// skips) and syncs the proxy, so it comes back usable. Hetzner's hard reset keeps the
+    /// VM disk.
     Restart {
         /// Machine name (e.g. arena8-apple) or raw provider id.
         target: String,
-        /// Restart even though the container disk is wiped and there's no volume to keep
-        /// anything (required then, even with --yes). Back the pod up first.
+        /// Restart even though the container disk is wiped with the participants' work on it
+        /// (required then, even with --yes). Back the pod up first.
         #[arg(long)]
         wipe_ok: bool,
         /// Don't re-run setup on the pod afterwards (it comes back as the bare image).
@@ -926,6 +929,8 @@ enum PodCmd {
     /// participants' python/packages and the token exports written by `setup`. Flags go
     /// BEFORE the command — everything after it is the command. Scope it with
     /// `-t <targets>` (names / ids / ranges) and the other selection flags; default: every pod.
+    /// A bare selection or --dry-run flag after the command is refused (it would widen the
+    /// run, or make the preview real); quote a command that takes one: `run 'ls -t'`.
     Run {
         /// The command to run (everything after `run`).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
@@ -2903,6 +2908,59 @@ async fn handle_backup(
     Ok(())
 }
 
+/// `pods backup`: git-push the selected pods' current branches, then (unless `no_pull`)
+/// rsync their homes — both over the SAME selection, resolved once by the caller.
+#[allow(clippy::too_many_arguments)]
+async fn handle_full_backup(
+    // How we reach pods for the git push: `SshRemote` for real, `FakeRemote` in tests.
+    remote: Arc<dyn Remote>,
+    cfg: &Config,
+    sel: &Selected,
+    no_pull: bool,
+    message: Option<String>,
+    dry_run: bool,
+    yes: bool,
+    // The rsync the pull runs: [`RSYNC`] for real, a recording stub in tests.
+    rsync: &str,
+) -> Result<()> {
+    if sel.pods.is_empty() {
+        println!("(no pods to back up)");
+        return Ok(());
+    }
+    let scope = format!("the ARENA tree of {} pod(s) ({})", sel.pods.len(), sel.names());
+    let what = if no_pull {
+        format!("commit + push {scope}, each on its current branch (main/master skipped)")
+    } else {
+        // Show the real destination subfolder (base/<wNdM>/<pod>) so it's clear where
+        // the rsync lands; fall back to just the base if the wNdM label can't be
+        // computed (e.g. ARENA_START_DATE unset).
+        let base = local_backup_dir(cfg);
+        let dest = match resolve_week_day(cfg, None, None) {
+            Ok((w, d)) => format!("{base}/w{w}d{d}/<pod> (snapshot) + {base}/big/<pod> (all files)"),
+            Err(_) => base,
+        };
+        format!("commit + push {scope} (git), then rsync the home(s) to {dest}")
+    };
+    if !dry_run && !confirm(yes, &format!("Will {what}."))? {
+        println!("aborted.");
+        return Ok(());
+    }
+    // 1) git push, then 2) rsync file backup (unless --no-pull). The file backup is
+    // INDEPENDENT of git, so a git failure on one pod (e.g. a missing repo, or a pod
+    // sitting on main) must NOT skip the rsync for the whole fleet. Capture the git
+    // result, always run the pull, then surface the git error at the end.
+    let git_result = handle_backup(remote, cfg, !dry_run, message, sel).await;
+    if !no_pull {
+        println!();
+        let dir = local_backup_dir(cfg);
+        handle_pull(cfg, None, &dir, None, None, false, false, sel, dry_run, true, rsync).await?;
+    }
+    git_result
+}
+
+/// The rsync binary `pull`/`backup` run (from PATH).
+const RSYNC: &str = "rsync";
+
 /// What a fleet `backup` did, per outcome.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct BackupTally {
@@ -4248,13 +4306,10 @@ async fn handle_pods(
             for p in &pods {
                 fates.push(disk_fate(provider, p).await);
             }
-            let lines: Vec<String> = pods
-                .iter()
-                .zip(&fates)
-                .map(|(p, f)| format!("  {} (id={}, {}): {}", p.name, p.id, p.provider, f.describe(DiskOp::Stop)))
-                .collect();
+            let repo = arena_core::backup::repo_path(cfg);
+            let lines = stop_lines(&pods, &fates, &repo);
             let blocked: Vec<&str> =
-                pods.iter().zip(&fates).filter(|(_, f)| f.needs_wipe_ok()).map(|(p, _)| p.name.as_str()).collect();
+                pods.iter().zip(&fates).filter(|(_, f)| f.needs_wipe_ok(&repo)).map(|(p, _)| p.name.as_str()).collect();
             if dry_run {
                 println!("[dry-run] would stop {} pod(s):\n{}", pods.len(), lines.join("\n"));
                 if !blocked.is_empty() && !wipe_ok {
@@ -4264,7 +4319,7 @@ async fn handle_pods(
                 return Ok(());
             }
             if !blocked.is_empty() && !wipe_ok {
-                anyhow::bail!("{}", wipe_refusal(DiskOp::Stop, &blocked));
+                anyhow::bail!("{}", wipe_refusal(DiskOp::Stop, &blocked, &repo));
             }
             if !confirm(yes, &format!("Will stop {} running pod(s):\n{}", pods.len(), lines.join("\n")))? {
                 println!("aborted.");
@@ -4296,7 +4351,7 @@ async fn handle_pods(
         PodCmd::Pull { label, dir, max_size, remote_path, no_git, no_big, sel, dry_run } => {
             let dir = dir.unwrap_or_else(|| local_backup_dir(cfg));
             let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
-            handle_pull(cfg, label, &dir, max_size, remote_path, no_git, no_big, &sel, dry_run, yes).await?;
+            handle_pull(cfg, label, &dir, max_size, remote_path, no_git, no_big, &sel, dry_run, yes, RSYNC).await?;
         }
 
         PodCmd::CopyKeys { sel, keys_dir, hf_token, cc_token, dry_run } => {
@@ -4370,39 +4425,7 @@ async fn handle_pods(
             // Resolved once, before the prompt (a typo fails before asking), and shared by the
             // git push and the pull.
             let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
-            if sel.pods.is_empty() {
-                println!("(no pods to back up)");
-                return Ok(());
-            }
-            let scope = format!("the ARENA tree of {} pod(s) ({})", sel.pods.len(), sel.names());
-            let what = if no_pull {
-                format!("commit + push {scope}, each on its current branch (main/master skipped)")
-            } else {
-                // Show the real destination subfolder (base/<wNdM>/<pod>) so it's clear where
-                // the rsync lands; fall back to just the base if the wNdM label can't be
-                // computed (e.g. ARENA_START_DATE unset).
-                let base = local_backup_dir(cfg);
-                let dest = match resolve_week_day(cfg, None, None) {
-                    Ok((w, d)) => format!("{base}/w{w}d{d}/<pod> (snapshot) + {base}/big/<pod> (all files)"),
-                    Err(_) => base,
-                };
-                format!("commit + push {scope} (git), then rsync the home(s) to {dest}")
-            };
-            if !dry_run && !confirm(yes, &format!("Will {what}."))? {
-                println!("aborted.");
-                return Ok(());
-            }
-            // 1) git push, then 2) rsync file backup (unless --no-pull). The file backup is
-            // INDEPENDENT of git, so a git failure on one pod (e.g. a missing repo, or a pod
-            // sitting on main) must NOT skip the rsync for the whole fleet. Capture the git
-            // result, always run the pull, then surface the git error at the end.
-            let git_result = handle_backup(remote, cfg, !dry_run, message, &sel).await;
-            if !no_pull {
-                println!();
-                let dir = local_backup_dir(cfg);
-                handle_pull(cfg, None, &dir, None, None, false, false, &sel, dry_run, true).await?;
-            }
-            git_result?;
+            handle_full_backup(remote, cfg, &sel, no_pull, message, dry_run, yes, RSYNC).await?;
         }
         PodCmd::Setup { sel, dry_run, force, hf_token, cc_token, zsh_install, timeout } => {
             // Budgets first: a malformed SETUP_TIMEOUT_SECS fails before anything else.
@@ -4431,6 +4454,9 @@ async fn handle_pods(
             handle_set_branch(remote, cfg, &branch, &sel, hard, dry_run, yes).await?;
         }
         PodCmd::Run { sel, command, timeout, dry_run } => {
+            if let Some(why) = misplaced_run_flags(&command) {
+                anyhow::bail!("{why}");
+            }
             let cmd = command.join(" ");
             let budget = Duration::from_secs(timeout);
             let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
@@ -4461,6 +4487,39 @@ async fn handle_pods(
         }
     }
     Ok(())
+}
+
+/// `run`'s flags that only mean something BEFORE the command. After it, clap hands them to
+/// the command (`trailing_var_arg`), so `run hostname -t apple` would run `hostname -t
+/// apple` on *every* pod, `--exclude`/`--on`/`--gpus` would stop narrowing, and a trailing
+/// `--dry-run` would make the preview real. (`--all` is left alone: misplaced, it changes
+/// nothing — `run` defaults to every pod.)
+const RUN_FLAGS_BEFORE_COMMAND: &[&str] =
+    &["-t", "--target", "--include", "--exclude", "--on", "--gpus", "--dry-run", "--dryrun", "--dry"];
+
+/// Why `run`'s command can't be taken as typed: it holds one of
+/// [`RUN_FLAGS_BEFORE_COMMAND`] as a bare word (or `--flag=value`). Only whole words count,
+/// so a quoted command (`run 'tmux kill-session -t lab'` → one word) passes. Pure, so
+/// table-tested.
+fn misplaced_run_flags(command: &[String]) -> Option<String> {
+    let hits: Vec<&str> = command
+        .iter()
+        .map(String::as_str)
+        .filter(|w| RUN_FLAGS_BEFORE_COMMAND.iter().any(|f| w == f || w.strip_prefix(f).is_some_and(|r| r.starts_with('='))))
+        .collect();
+    if hits.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "`{}` after the command would be part of the command — `pods run` takes its flags BEFORE \
+         the command, so as typed this runs `{}` on the whole selection (every pod, unless \
+         flags before it narrow it). Nothing was run. Put the flags first (`arena pods run -t \
+         apple <command>`), or — if the command itself takes that flag — quote the whole \
+         command: `arena pods run '{}'`.",
+        hits.join(" "),
+        command.join(" "),
+        command.join(" ")
+    ))
 }
 
 /// Run `cmd` on every selected pod with an SSH endpoint, concurrently, each pod within
@@ -4496,16 +4555,12 @@ async fn handle_run(
     let conda_env = cfg.get("CONDA_ENV").unwrap_or("arena-env");
     let remote_cmd = arena_core::ssh::login_shell_wrap(cmd, Some(conda_env));
 
-    let names = targets.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", ");
+    let names: Vec<&str> = targets.iter().map(|(n, _)| n.as_str()).collect();
     if dry_run {
-        println!(
-            "[dry-run] would run on {} pod(s) ({}s budget each): {names}\n  {remote_cmd}",
-            targets.len(),
-            timeout.as_secs()
-        );
+        println!("{}", run_preview(true, cmd, &remote_cmd, &names, timeout));
         return Ok(());
     }
-    if confirm_needed && !confirm(yes, &format!("Run `{cmd}` on {} pod(s) over SSH: {names}", targets.len()))? {
+    if confirm_needed && !confirm(yes, &run_preview(false, cmd, &remote_cmd, &names, timeout))? {
         println!("aborted.");
         return Ok(());
     }
@@ -4521,6 +4576,22 @@ async fn handle_run(
         anyhow::bail!("{bad} pod(s) failed");
     }
     Ok(())
+}
+
+/// What `run` says before it runs (pure, so tested): the dry-run preview (`dry_run`) or the
+/// confirm prompt — both name every resolved pod, so the operator sees exactly where an
+/// arbitrary command will go.
+fn run_preview(dry_run: bool, cmd: &str, remote_cmd: &str, names: &[&str], timeout: Duration) -> String {
+    if dry_run {
+        format!(
+            "[dry-run] would run on {} pod(s) ({}s budget each): {}\n  {remote_cmd}",
+            names.len(),
+            timeout.as_secs(),
+            names.join(", ")
+        )
+    } else {
+        format!("Run `{cmd}` on {} pod(s) over SSH: {}", names.len(), names.join(", "))
+    }
 }
 
 /// One pod's `pods run` / `pods test` outcome: its output (or why it failed).
@@ -4940,9 +5011,11 @@ fn openrouter_client(cfg: &Config) -> Option<arena_core::openrouter::OpenRouter>
 }
 
 /// `pods terminate <target>` / `--all`, optionally `--revoke-key`. Revocation runs only for
-/// pods that actually terminated (a pod still running keeps a working key), after the
-/// terminates and the proxy sync — a failed revoke is reported per machine and fails the
-/// exit, but never stands in the way of a terminate.
+/// pods that actually terminated, after the terminates and the proxy sync — a failed revoke
+/// is reported per machine and fails the exit, but never stands in the way of a terminate.
+/// Keys go by machine *name*, so a name still held by a pod that is NOT gone (the twin of a
+/// double create removed by id, or one whose terminate failed) keeps its key and row: a pod
+/// still running keeps a working key.
 #[allow(clippy::too_many_arguments)]
 async fn handle_terminate(
     provider: &dyn Provider,
@@ -4962,20 +5035,20 @@ async fn handle_terminate(
              provisioning API) — set it, or drop --revoke-key and `arena keys revoke` later"
         );
     }
+    let naming = Naming::from_config(cfg);
     let policy = arena_core::retry::RetryPolicy::default();
-    let mut listed = arena_core::retry::retrying(&policy, || provider.list_pods()).await.context("listing pods")?;
+    // The whole listing is kept: it says which names other pods still hold.
+    let listed = arena_core::retry::retrying(&policy, || provider.list_pods()).await.context("listing pods")?;
     let pods: Vec<arena_core::Pod> = match target {
         None => {
-            listed.sort_by(|a, b| a.name.cmp(&b.name));
-            listed
+            let mut all = listed.clone();
+            all.sort_by(|a, b| a.name.cmp(&b.name));
+            all
         }
         // One pod, matched like every other command's targets (the shared selector's
         // single-pod rule): a typo names the closest pods, a range/`all` is refused, and a
         // name two pods share is refused — pass the id.
-        Some(t) => {
-            let i = arena_core::selector::resolve_one(&Naming::from_config(cfg), &listed, t)?;
-            vec![listed.swap_remove(i)]
-        }
+        Some(t) => vec![listed[arena_core::selector::resolve_one(&naming, &listed, t)?].clone()],
     };
     if pods.is_empty() {
         println!("(no pods to terminate)");
@@ -4989,10 +5062,19 @@ async fn handle_terminate(
     };
     let then_sync = if skip_proxy { "" } else { ", then sync the proxy" };
     if dry_run {
+        let leaving: Vec<&str> = pods.iter().map(|p| p.id.as_str()).collect();
+        let staying = |p: &arena_core::Pod| shared_name_holder(&listed, &leaving, &p.name).map(|o| o.id.clone());
         for p in &pods {
             println!("[dry-run] would terminate {}", label(p));
             if revoke_key {
-                println!("[dry-run]   then revoke OpenRouter key(s) named {} and drop its row from {}", p.name, book.csv.display());
+                match staying(p) {
+                    Some(id) => println!("[dry-run]   key kept: pod id {id} (not being terminated) is also named {}", p.name),
+                    None => println!(
+                        "[dry-run]   then revoke OpenRouter key(s) named {} and drop its row from {}",
+                        machine_key_names(&naming, &p.name).join(" / "),
+                        book.csv.display()
+                    ),
+                }
             }
         }
         println!("\nDry-run only — would terminate {} pod(s){then_keys}{then_sync} (preview).", pods.len());
@@ -5007,12 +5089,12 @@ async fn handle_terminate(
         return Ok(());
     }
     // The fleet provider routes each terminate to the backend that owns the pod id.
-    let mut gone: Vec<String> = Vec::new();
+    let mut gone: Vec<&arena_core::Pod> = Vec::new();
     for p in &pods {
         match provider.terminate_pod(&p.id).await {
             Ok(()) => {
                 println!("[terminated] {}", if target.is_some() { label(p) } else { p.name.clone() });
-                gone.push(p.name.clone());
+                gone.push(p);
             }
             // One named pod: its failure is the command's error (nothing else to do).
             Err(e) if target.is_some() => return Err(e.into()),
@@ -5026,16 +5108,46 @@ async fn handle_terminate(
     if !gone.is_empty() && !skip_proxy {
         sync_proxy(cfg, provider, "terminate").await;
     }
-    let revoke_failed = if revoke_key && !gone.is_empty() { revoke_machine_keys(book, &gone).await } else { Vec::new() };
+    let mut revoked = KeyRevoke::default();
+    if revoke_key && !gone.is_empty() {
+        // Each machine name once (two pods sharing a name are one key), and none that a pod
+        // still standing holds — compared against the pre-terminate listing.
+        let leaving: Vec<&str> = gone.iter().map(|p| p.id.as_str()).collect();
+        let (mut seen, mut machines): (Vec<&str>, Vec<String>) = (Vec::new(), Vec::new());
+        for p in &gone {
+            if seen.contains(&p.name.as_str()) {
+                continue;
+            }
+            seen.push(&p.name);
+            match shared_name_holder(&listed, &leaving, &p.name) {
+                Some(other) => println!(
+                    "[keys] = {}: key and CSV row kept — pod id {} still has that name (not terminated)",
+                    p.name, other.id
+                ),
+                None => machines.push(p.name.clone()),
+            }
+        }
+        if !machines.is_empty() {
+            revoked = revoke_machine_keys(book, &naming, &machines).await;
+        }
+    }
     let mut problems = Vec::new();
     if gone.len() < pods.len() {
         problems.push(format!("{} pod(s) failed to terminate", pods.len() - gone.len()));
     }
-    if !revoke_failed.is_empty() {
+    if !revoked.failed.is_empty() {
         problems.push(format!(
             "revoking the OpenRouter key failed for {} — the pod(s) ARE terminated; retry with `arena keys revoke {}`",
-            revoke_failed.join(", "),
-            revoke_failed.join(" ")
+            revoked.failed.join(", "),
+            revoked.failed.join(" ")
+        ));
+    }
+    if let Some((names, why)) = &revoked.stale_rows {
+        problems.push(format!(
+            "the OpenRouter key(s) of {} ARE revoked (or were already gone), but their rows couldn't be \
+             removed from {} ({why}) — delete those rows by hand (they hold dead keys)",
+            names.join(", "),
+            book.csv.display()
         ));
     }
     if !problems.is_empty() {
@@ -5044,35 +5156,80 @@ async fn handle_terminate(
     Ok(())
 }
 
-/// Revoke every OpenRouter key named after each of `machines` (pods just terminated) and
-/// drop their rows from the keys CSV. One key listing for the batch. A machine with no key
-/// is said, not failed. Its CSV row goes only once nothing is left under its name on
-/// OpenRouter: a row whose key couldn't be deleted stays, as the record that it still works.
-/// Returns the machines whose revoke failed.
-async fn revoke_machine_keys(book: &KeyBook<'_>, machines: &[String]) -> Vec<String> {
-    let Some(api) = book.api else { return machines.to_vec() }; // the caller checked up front
+/// A pod in `listed` that is named `name` but isn't one of `leaving` (by id) — i.e. one that
+/// will still be there, and still using that machine's key, after `leaving` are terminated.
+fn shared_name_holder<'a>(listed: &'a [arena_core::Pod], leaving: &[&str], name: &str) -> Option<&'a arena_core::Pod> {
+    listed.iter().find(|p| p.name == name && !leaving.contains(&p.id.as_str()))
+}
+
+/// The OpenRouter key names that are `machine`'s: the name `keys gen` gives it
+/// ([`arena_core::openrouter::key_name`] — the pod name for a cohort pod, but
+/// `{prefix}-vast-777` for a pod off the prefix, like Vast's fallback name) and, when that
+/// differs, a key named exactly after the pod (minted under its own prefix). Looking only at
+/// the raw pod name missed the first kind: revoke then found "no key", dropped the CSV row
+/// and left the key working.
+fn machine_key_names(naming: &Naming, machine: &str) -> Vec<String> {
+    let minted = arena_core::openrouter::key_name(naming.prefix, naming.list, machine);
+    if minted == machine {
+        vec![minted]
+    } else {
+        vec![machine.to_string(), minted]
+    }
+}
+
+/// What [`revoke_machine_keys`] couldn't do.
+#[derive(Debug, Default)]
+struct KeyRevoke {
+    /// Machines whose key(s) couldn't be revoked (or listed); their CSV rows are kept.
+    failed: Vec<String>,
+    /// Machines whose keys ARE revoked but whose rows couldn't be removed from the CSV, and
+    /// why — a local-file problem, not something `keys revoke` can retry.
+    stale_rows: Option<(Vec<String>, String)>,
+}
+
+/// Revoke every OpenRouter key that is each of `machines`' (pods just terminated; see
+/// [`machine_key_names`]) and drop their rows from the keys CSV. One full key listing for
+/// the batch; each key deleted at most once. A machine with no key is said, not failed, and
+/// its row (a dead key, if any) is dropped. A row whose key couldn't be deleted stays, as
+/// the record that it still works.
+async fn revoke_machine_keys(book: &KeyBook<'_>, naming: &Naming<'_>, machines: &[String]) -> KeyRevoke {
+    let mut out = KeyRevoke::default();
+    let Some(api) = book.api else {
+        out.failed = machines.to_vec(); // the caller checked up front
+        return out;
+    };
     let keys = match api.list_keys().await {
         Ok(k) => k,
         Err(e) => {
             for m in machines {
                 eprintln!("[keys] ✗ {m}: listing OpenRouter keys failed: {e}");
             }
-            return machines.to_vec();
+            out.failed = machines.to_vec();
+            return out;
         }
     };
     let mut csv = book.read_csv();
-    let (mut failed, mut dropped) = (Vec::new(), Vec::new());
+    let mut dropped = Vec::new();
+    let mut deleted: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for m in machines {
-        let mine: Vec<&arena_core::openrouter::KeyInfo> = keys.iter().filter(|k| k.name.as_deref() == Some(m)).collect();
+        let names = machine_key_names(naming, m);
+        let mine: Vec<&arena_core::openrouter::KeyInfo> = keys
+            .iter()
+            .filter(|k| k.name.as_deref().is_some_and(|n| names.iter().any(|w| w == n)))
+            .filter(|k| !deleted.contains(k.hash.as_str()))
+            .collect();
         let mut errs = Vec::new();
         for k in &mine {
-            if let Err(e) = api.delete_key(&k.hash).await {
-                errs.push(e.to_string());
+            match api.delete_key(&k.hash).await {
+                Ok(()) => {
+                    deleted.insert(k.hash.as_str());
+                }
+                Err(e) => errs.push(e.to_string()),
             }
         }
         if !errs.is_empty() {
             eprintln!("[keys] ✗ {m}: revoke failed ({}) — its CSV row is kept", errs.join("; "));
-            failed.push(m.clone());
+            out.failed.push(m.clone());
             continue;
         }
         let row = match csv.as_deref().and_then(|t| arena_core::apikeys::remove_csv_host(t, m)) {
@@ -5084,22 +5241,34 @@ async fn revoke_machine_keys(book: &KeyBook<'_>, machines: &[String]) -> Vec<Str
             None => "",
         };
         match mine.len() {
-            0 if row.is_empty() => println!("[keys] = {m}: no OpenRouter key, no CSV row"),
-            0 => println!("[keys] ✓ {m}: no OpenRouter key{row}"),
+            0 if row.is_empty() => println!("[keys] = {m}: no OpenRouter key ({}), no CSV row", names.join(" / ")),
+            0 => println!("[keys] ✓ {m}: no OpenRouter key named {} (already revoked?){row}", names.join(" / ")),
             n => println!("[keys] ✓ {m}: revoked {n} OpenRouter key(s){row}"),
         }
     }
     if let (Some(text), false) = (&csv, dropped.is_empty()) {
         if let Err(e) = book.write_csv(text) {
             eprintln!("[keys] ✗ couldn't update {}: {e} — rows kept for {}", book.csv.display(), dropped.join(", "));
-            failed.extend(dropped);
+            out.stale_rows = Some((dropped, e.to_string()));
         }
     }
-    failed
+    out
+}
+
+/// One line per pod for `stop`'s dry run and prompt (pure, so tested): which pod, and what
+/// the stop does to its disk.
+fn stop_lines(pods: &[&arena_core::Pod], fates: &[DiskFate], repo: &str) -> Vec<String> {
+    pods.iter()
+        .zip(fates)
+        .map(|(p, f)| format!("  {} (id={}, {}): {}", p.name, p.id, p.provider, f.describe(DiskOp::Stop, repo)))
+        .collect()
 }
 
 /// What a restart (or a stop, then a start) does to one pod's files: what its confirm text
-/// says, and whether it needs `--wipe-ok`.
+/// says, and whether it needs `--wipe-ok`. Both also take the ARENA repo path
+/// (`arena_core::backup::repo_path`): the gate is about whether the participants' work
+/// survives, and with the default layout (`/root/<repo>`) it is NOT on the volume — a pod
+/// having a `/workspace` volume doesn't make a restart safe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiskFate {
     /// The backend keeps the disk (a Hetzner VM).
@@ -5117,36 +5286,58 @@ enum DiskOp {
 }
 
 impl DiskFate {
-    /// A wipe with nothing to keep the work — no volume, or none confirmed (an unreadable
-    /// spec counts as none: guessing "it has one" is the data-loss direction).
-    fn needs_wipe_ok(self) -> bool {
-        matches!(self, DiskFate::Wiped { volume_gb: None | Some(0) })
+    /// A wipe that the participants' work (the repo at `repo`) doesn't survive: no volume,
+    /// none confirmed (an unreadable spec counts as none: guessing "it has one" is the
+    /// data-loss direction), or a volume the repo isn't on.
+    fn needs_wipe_ok(self, repo: &str) -> bool {
+        match self {
+            DiskFate::Kept => false,
+            DiskFate::Wiped { volume_gb: Some(v) } if v > 0 => !repo_on_volume(repo),
+            DiskFate::Wiped { .. } => true,
+        }
     }
 
-    /// One line for the prompt / dry run: what's lost and what survives. Pure, so tested.
-    fn describe(self, op: DiskOp) -> String {
+    /// One line for the prompt / dry run: what's lost and what survives, naming where the
+    /// repo is. Pure, so tested.
+    fn describe(self, op: DiskOp, repo: &str) -> String {
         use arena_core::provider::runpod_v2::VOLUME_MOUNT_PATH as VOL;
         let wipe = match op {
             DiskOp::Restart => "⚠ WIPES the container disk (reset to the image)",
             DiskOp::Stop => "⚠ discards the container disk (it starts again as a fresh image)",
         };
-        let lost = "participants' files, ~/.name, setup's git remote, the distributed keys";
+        let rest = "~/.name, setup's git remote, the distributed keys";
+        let work = format!("the ARENA repo at {repo} (participants' work)");
         match self {
             DiskFate::Kept => match op {
                 DiskOp::Restart => "disk kept — a hard reset (power-cycle): running processes die, files stay".into(),
                 DiskOp::Stop => "disk kept — powered off, files stay".into(),
             },
-            DiskFate::Wiped { volume_gb: Some(v) } if v > 0 => {
-                format!("{wipe}: everything outside {VOL} is lost ({lost}); the {v} GB volume at {VOL} survives")
-            }
+            DiskFate::Wiped { volume_gb: Some(v) } if v > 0 && repo_on_volume(repo) => format!(
+                "{wipe}: everything outside {VOL} is lost ({rest}, files outside the repo); the repo at \
+                 {repo} is on the {v} GB volume at {VOL} and survives"
+            ),
+            DiskFate::Wiped { volume_gb: Some(v) } if v > 0 => format!(
+                "{wipe}: everything outside {VOL} is lost — {work} is NOT on the volume, and {rest}; \
+                 only the {v} GB volume at {VOL} survives"
+            ),
             DiskFate::Wiped { volume_gb: Some(_) } => {
-                format!("{wipe} and it has NO persistent volume: nothing survives — {lost}")
+                format!("{wipe} and it has NO persistent volume: nothing survives — {work}, {rest}")
             }
             DiskFate::Wiped { volume_gb: None } => {
-                format!("{wipe}; couldn't read whether it has a volume, so assume nothing survives — {lost}")
+                format!("{wipe}; couldn't read whether it has a volume, so assume nothing survives — {work}, {rest}")
             }
         }
     }
+}
+
+/// Is the repo at `repo` on the persistent volume (mounted at `/workspace` by every backend
+/// we create volumes on), i.e. does it survive a container-disk wipe? Only an absolute path
+/// at or under the mount counts — a `~`/relative path or one with `..` can't be judged, so
+/// it counts as off the volume (the safe direction: one `--wipe-ok` too many). Pure.
+fn repo_on_volume(repo: &str) -> bool {
+    use arena_core::provider::runpod_v2::VOLUME_MOUNT_PATH as VOL;
+    let under = repo == VOL || repo.strip_prefix(VOL).is_some_and(|rest| rest.starts_with('/'));
+    under && !repo.split('/').any(|c| c == "..")
 }
 
 /// A pod's [`DiskFate`]: the owning backend says whether a restart wipes; if it does, the
@@ -5164,9 +5355,9 @@ async fn disk_fate(provider: &dyn Provider, pod: &arena_core::Pod) -> DiskFate {
 }
 
 /// Why a restart/stop is refused without `--wipe-ok` (pure, so tested): it would destroy
-/// everything on these pods, and `--yes` is not an answer to that — the operator has to say
-/// so explicitly, after a backup.
-fn wipe_refusal(op: DiskOp, names: &[&str]) -> String {
+/// the participants' work on these pods, and `--yes` is not an answer to that — the
+/// operator has to say so explicitly, after a backup.
+fn wipe_refusal(op: DiskOp, names: &[&str], repo: &str) -> String {
     let (verb, done) = match op {
         DiskOp::Restart => ("restart", "resets the container disk to the image"),
         DiskOp::Stop => ("stop", "discards the container disk (a stopped RunPod pod keeps no data)"),
@@ -5176,9 +5367,10 @@ fn wipe_refusal(op: DiskOp, names: &[&str]) -> String {
         DiskOp::Stop => " If the group is done, terminate instead.",
     };
     format!(
-        "refusing to {verb} {} without --wipe-ok: this {done} and there's no persistent volume (or \
-         none could be confirmed), so nothing on it survives — participants' work included. Back up \
-         first (`arena pods backup {}`), then re-run with --wipe-ok (--yes alone isn't enough).{alt}",
+        "refusing to {verb} {} without --wipe-ok: this {done}, and the participants' work — the repo \
+         at {repo} — isn't on a confirmed persistent volume (there's no volume, none could be \
+         confirmed, or the repo lives outside /workspace), so it would be lost. Back up first \
+         (`arena pods backup {}`), then re-run with --wipe-ok (--yes alone isn't enough).{alt}",
         names.join(", "),
         names.join(" ")
     )
@@ -5209,8 +5401,8 @@ struct SettleWait {
 const RESTART_SETTLE: SettleWait = SettleWait { stable_secs: 30, timeout_secs: 600, poll: Duration::from_secs(15) };
 
 /// `pods restart <target>`. On a backend whose restart wipes the container disk (RunPod;
-/// Vast assumed) the prompt says plainly what's lost and what survives, a pod with no
-/// volume (or none confirmed) is refused without `--wipe-ok` — even with `--yes` — and
+/// Vast assumed) the prompt says plainly what's lost and what survives, a pod whose repo
+/// isn't on a confirmed volume is refused without `--wipe-ok` — even with `--yes` — and
 /// afterwards the pod is brought back usable: wait for its endpoint to settle, re-run setup
 /// on it (`~/.name`, deploy key + git remote, API keys; `--no-setup` skips), sync the
 /// proxy. A Hetzner reset keeps the disk: no gate, no re-setup, just the sync.
@@ -5236,6 +5428,7 @@ async fn handle_restart(
     let pod = pods[arena_core::selector::resolve_one(&Naming::from_config(cfg), &pods, target)?].clone();
     let label = format!("{} (id={}, {})", pod.name, pod.id, pod.provider);
     let fate = disk_fate(provider, &pod).await;
+    let repo = arena_core::backup::repo_path(cfg);
     let wiped = matches!(fate, DiskFate::Wiped { .. });
     let setup = wiped && !opts.no_setup;
     if setup {
@@ -5251,16 +5444,16 @@ async fn handle_restart(
         (false, _, false) => "then: sync the proxy",
         (false, _, true) => "then: nothing",
     };
-    let what = format!("restart {label}:\n  {}\n  {then}", fate.describe(DiskOp::Restart));
+    let what = format!("restart {label}:\n  {}\n  {then}", fate.describe(DiskOp::Restart, &repo));
     if opts.dry_run {
         println!("[dry-run] would {what}");
-        if fate.needs_wipe_ok() && !opts.wipe_ok {
+        if fate.needs_wipe_ok(&repo) && !opts.wipe_ok {
             println!("(would be refused without --wipe-ok)");
         }
         return Ok(());
     }
-    if fate.needs_wipe_ok() && !opts.wipe_ok {
-        anyhow::bail!("{}", wipe_refusal(DiskOp::Restart, &[pod.name.as_str()]));
+    if fate.needs_wipe_ok(&repo) && !opts.wipe_ok {
+        anyhow::bail!("{}", wipe_refusal(DiskOp::Restart, &[pod.name.as_str()], &repo));
     }
     if !confirm(opts.yes, &format!("Will {what}"))? {
         println!("aborted.");
@@ -5365,7 +5558,7 @@ async fn handle_rename(
     // The pods renamed so far get their ~/.name and key mapping even when the batch stopped:
     // a re-run renames only the rest, so these would otherwise keep the old ones for good.
     let missed = rewrite_name_files(remote, cfg, prefix, &done, &pods).await;
-    let key_warnings = move_key_mappings(book, &done).await;
+    let key_warnings = move_key_mappings(book, &Naming::from_config(cfg), &done, &pods).await;
     if let Some(failure) = failure {
         // Deliberately no sync on a partial batch: in a `--from-prefix` rename the pods not
         // renamed yet still carry the old prefix, which has no slot in the current list — a
@@ -5398,7 +5591,6 @@ fn rename_followup_steps(
     book: &KeyBook<'_>,
     skip_proxy: bool,
 ) -> Vec<String> {
-    use arena_core::apikeys::{rename_csv_host, CsvRename};
     use arena_core::setup::short_name;
     let mut out = Vec::new();
     let shorts: Vec<String> = plan.iter().map(|r| format!("{} ← '{}'", r.new, short_name(prefix, &r.new))).collect();
@@ -5418,21 +5610,23 @@ fn rename_followup_steps(
     match book.read_csv() {
         None => out.push(format!("  2. OpenRouter key mapping: no {csv} — nothing to move locally")),
         Some(text) => {
-            let (mut moves, mut taken) = (Vec::new(), Vec::new());
-            for r in plan {
-                match rename_csv_host(&text, &r.old, &r.new) {
-                    CsvRename::Renamed(_) => moves.push(format!("{} → {}", r.old, r.new)),
-                    CsvRename::Taken => taken.push(r.new.as_str()),
-                    CsvRename::NoRow => {}
-                }
-            }
-            out.push(if moves.is_empty() {
-                format!("  2. OpenRouter key mapping: no rows for these machines in {csv}")
-            } else {
-                format!("  2. OpenRouter key mapping: move rows in {csv}: {}", moves.join(", "))
+            let pairs: Vec<(&str, &str)> = plan.iter().map(|r| (r.old.as_str(), r.new.as_str())).collect();
+            let done: Vec<&PlannedRename> = plan.iter().collect();
+            let cross = cross_cohort_dst(book, prefix);
+            let mv = plan_csv_move(&text, cross.as_ref().map(|(_, t)| t.as_str()), &pairs, &names_after(pods, &done));
+            out.push(match (&cross, mv.moved.is_empty()) {
+                (_, true) => format!("  2. OpenRouter key mapping: no rows for these machines in {csv}"),
+                (None, false) => format!("  2. OpenRouter key mapping: move rows in {csv}: {}", mv.moved.join(", ")),
+                (Some((dst, _)), false) => format!(
+                    "  2. OpenRouter key mapping: move rows out of the previous cohort's file into {} and point {csv} \
+                     at it: {}{}",
+                    dst.display(),
+                    mv.moved.join(", "),
+                    if mv.carried.is_empty() { String::new() } else { format!(" (carrying along: {})", mv.carried.join(", ")) }
+                ),
             });
-            if !taken.is_empty() {
-                out.push(format!("     ⚠ already have their own row (left alone): {}", taken.join(", ")));
+            if !mv.taken.is_empty() {
+                out.push(format!("     ⚠ already have their own row (left alone): {}", mv.taken.join(", ")));
             }
         }
     }
@@ -5489,21 +5683,119 @@ async fn rewrite_name_files(
     missed
 }
 
+/// The keys CSV's side of moving key mappings after a rename (pure, so table-tested; the
+/// dry run and the real move share it).
+#[derive(Debug, Default, PartialEq)]
+struct CsvMove {
+    /// The new text of the file the rows end up in; `None`: nothing to write.
+    dst: Option<String>,
+    /// Cross-cohort only: the old cohort's file with the moved rows taken out.
+    src: Option<String>,
+    /// `old → new`, per moved row.
+    moved: Vec<String>,
+    /// New names that already have a row of their own: left alone (and, by the caller,
+    /// their OpenRouter key too — the two sides never disagree).
+    taken: Vec<String>,
+    /// Cross-cohort only: other current pods whose rows were copied into the new file, so
+    /// `copy-keys` (which reads through the link) still finds them.
+    carried: Vec<String>,
+}
+
+/// Plan the CSV half of a rename's key move. `src`: the file the `openrouter_api_keys.csv`
+/// link points at now. `dst`: `None` when that is already the current cohort's file — rows
+/// are renamed in place; else `Some(text)` of the current cohort's file (the seeded header
+/// when it doesn't exist yet): the link points at an *older* cohort's file (a
+/// `--from-prefix` rename after a prefix change), and the renamed rows move INTO the current
+/// one. Rewriting the old file instead would strand them: the next `keys gen` repoints the
+/// link to the current cohort's file and skips these machines (their keys already exist
+/// under the new names), so they'd never be delivered again. `live`: every current pod's
+/// name after the renames — their rows are carried along so the repointed link loses none.
+fn plan_csv_move(src: &str, dst: Option<&str>, pairs: &[(&str, &str)], live: &[String]) -> CsvMove {
+    use arena_core::apikeys::{parse_csv, remove_csv_host, rename_csv_host, upsert_csv, CsvRename};
+    let mut out = CsvMove::default();
+    let Some(dst) = dst else {
+        let mut text = src.to_string();
+        for (old, new) in pairs {
+            match rename_csv_host(&text, old, new) {
+                CsvRename::Renamed(t) => {
+                    text = t;
+                    out.moved.push(format!("{old} → {new}"));
+                }
+                CsvRename::Taken => out.taken.push(new.to_string()),
+                CsvRename::NoRow => {}
+            }
+        }
+        out.dst = (!out.moved.is_empty()).then_some(text);
+        return out;
+    };
+    // The last row wins, as when copy-keys exports them in order.
+    let key_of = |text: &str, host: &str| parse_csv(text).into_iter().rev().find(|(h, _)| h == host).map(|(_, k)| k);
+    let (mut d, mut s) = (dst.to_string(), src.to_string());
+    let mut new_names = Vec::new();
+    for (old, new) in pairs {
+        let Some(secret) = key_of(&s, old) else { continue };
+        if old != new && (key_of(&d, new).is_some() || key_of(&s, new).is_some()) {
+            out.taken.push(new.to_string());
+            continue;
+        }
+        d = upsert_csv(&d, new, &secret);
+        s = remove_csv_host(&s, old).unwrap_or(s);
+        out.moved.push(format!("{old} → {new}"));
+        new_names.push(new.to_string());
+    }
+    if out.moved.is_empty() {
+        return out; // nothing of ours in the old file: leave both files and the link alone
+    }
+    for host in live.iter().filter(|h| !new_names.contains(h)) {
+        if let (Some(secret), None) = (key_of(&s, host), key_of(&d, host)) {
+            d = upsert_csv(&d, host, &secret);
+            out.carried.push(host.clone());
+        }
+    }
+    out.dst = Some(d);
+    out.src = Some(s);
+    out
+}
+
+/// Where a rename's key rows go: `(the current cohort's file, its text or the seeded header)`
+/// when the keys link points at another cohort's file (see [`plan_csv_move`]), else `None`
+/// (rows move in place). A legacy regular file stays in place, as before.
+fn cross_cohort_dst(book: &KeyBook<'_>, prefix: &str) -> Option<(PathBuf, String)> {
+    let linked = std::fs::read_link(&book.csv).ok()?;
+    let file = cohort_keys_file(prefix);
+    if linked.file_name() == Some(std::ffi::OsStr::new(&file)) {
+        return None;
+    }
+    let path = book.csv.with_file_name(&file);
+    let text = std::fs::read_to_string(&path).ok().filter(|t| !t.trim().is_empty()).unwrap_or_else(|| cohort_keys_header(prefix));
+    Some((path, text))
+}
+
+/// Every current pod's name once the renames in `done` are applied (from the pre-rename
+/// listing) — whose rows a cross-cohort move carries along.
+fn names_after(pods: &[arena_core::Pod], done: &[&PlannedRename]) -> Vec<String> {
+    pods.iter().map(|p| done.iter().find(|r| r.id == p.id).map_or_else(|| p.name.clone(), |r| r.new.clone())).collect()
+}
+
 /// Move each renamed machine's OpenRouter key mapping to its new name: its row(s) in the
-/// keys CSV and its key's `name` on OpenRouter (with a provisioning key), so `copy-keys`,
-/// `keys rotate|revoke` and `terminate --revoke-key` — which all go by machine name — keep
-/// finding it. Quiet when there's nothing to move (no CSV or no row; no provisioning key or
-/// no key under the old name). A new name that already holds its own row or key is left
-/// alone and warned about — silently merging two machines' keys is worse than a manual fix —
-/// and then neither side moves, so the CSV and OpenRouter stay consistent. Never fails the
-/// rename: problems come back as warning lines.
-async fn move_key_mappings(book: &KeyBook<'_>, done: &[&PlannedRename]) -> Vec<String> {
-    use arena_core::apikeys::{rename_csv_host, CsvRename};
+/// keys CSV (into the current cohort's file — see [`plan_csv_move`]) and its key's `name`
+/// on OpenRouter (with a provisioning key; found by [`machine_key_names`], as `keys gen`
+/// named it), so `copy-keys`, `keys rotate|revoke` and `terminate --revoke-key` — which all
+/// go by machine name — keep finding it. Quiet when there's nothing to move (no CSV or no
+/// row; no provisioning key or no key under the old name). A new name that already holds
+/// its own row or key is left alone and warned about — silently merging two machines' keys
+/// is worse than a manual fix — and then neither side moves, so the CSV and OpenRouter stay
+/// consistent. Never fails the rename: problems come back as warning lines.
+async fn move_key_mappings(
+    book: &KeyBook<'_>,
+    naming: &Naming<'_>,
+    done: &[&PlannedRename],
+    pods: &[arena_core::Pod],
+) -> Vec<String> {
     let mut warnings = Vec::new();
     if done.is_empty() {
         return warnings;
     }
-    let csv_text = book.read_csv();
     let keys = match book.api {
         None => None,
         Some(api) => match api.list_keys().await {
@@ -5518,53 +5810,102 @@ async fn move_key_mappings(book: &KeyBook<'_>, done: &[&PlannedRename]) -> Vec<S
             }
         },
     };
-    let named = |name: &str| -> Vec<&arena_core::openrouter::KeyInfo> {
-        keys.iter().flatten().filter(|k| k.name.as_deref() == Some(name)).collect()
+    let named = |names: &[String]| -> Vec<&arena_core::openrouter::KeyInfo> {
+        keys.iter().flatten().filter(|k| k.name.as_deref().is_some_and(|n| names.iter().any(|w| w == n))).collect()
     };
-    // Decide per machine first, so a conflict on either side moves neither.
-    let mut csv_next = csv_text.clone();
-    let (mut csv_moved, mut renames) = (Vec::new(), Vec::new());
+    // Decide per machine, so a conflict on either side moves neither: OpenRouter first...
+    let mut pairs: Vec<(&str, &str)> = Vec::new();
     for r in done {
-        let csv_step = csv_text.as_deref().map(|t| rename_csv_host(t, &r.old, &r.new));
-        let mine = named(&r.old);
-        let key_taken = !mine.is_empty() && !named(&r.new).is_empty();
-        if matches!(csv_step, Some(CsvRename::Taken)) || key_taken {
+        let mine = named(&machine_key_names(naming, &r.old));
+        if !mine.is_empty() && !named(&machine_key_names(naming, &r.new)).is_empty() {
             warnings.push(format!(
-                "{} already has its own OpenRouter key{} — left {}'s key mapping as it was; keep one \
+                "{} already has its own OpenRouter key on OpenRouter — left {}'s key mapping as it was; keep one \
                  (`arena keys revoke`/`rotate`) and fix the other by hand",
-                r.new,
-                if key_taken { " on OpenRouter" } else { " row in the CSV" },
-                r.old
+                r.new, r.old
             ));
             continue;
         }
-        if let (Some(CsvRename::Renamed(_)), Some(text)) = (&csv_step, &csv_next) {
-            if let CsvRename::Renamed(t) = rename_csv_host(text, &r.old, &r.new) {
-                csv_next = Some(t);
-                csv_moved.push(format!("{} → {}", r.old, r.new));
-            }
-        }
-        renames.extend(mine.into_iter().map(|k| (k.hash.clone(), r.old.clone(), r.new.clone())));
+        pairs.push((r.old.as_str(), r.new.as_str()));
     }
-    if let (Some(text), false) = (&csv_next, csv_moved.is_empty()) {
-        match book.write_csv(text) {
-            Ok(()) => println!("[keys] {}: {}", book.csv.display(), csv_moved.join(", ")),
-            Err(e) => warnings.push(format!(
-                "couldn't update {} ({e}) — its rows still use the old names: {}",
-                book.csv.display(),
-                csv_moved.join(", ")
-            )),
-        }
+    // ...then the CSV.
+    let csv_text = book.read_csv();
+    let cross = csv_text.as_ref().and_then(|_| cross_cohort_dst(book, naming.prefix));
+    let plan = match &csv_text {
+        Some(src) => plan_csv_move(src, cross.as_ref().map(|(_, t)| t.as_str()), &pairs, &names_after(pods, done)),
+        None => CsvMove::default(),
+    };
+    for new in &plan.taken {
+        let old = pairs.iter().find(|(_, n)| n == new).map_or("", |(o, _)| *o);
+        warnings.push(format!(
+            "{new} already has its own OpenRouter key row in the CSV — left {old}'s key mapping as it was; keep one \
+             (`arena keys revoke`/`rotate`) and fix the other by hand"
+        ));
+    }
+    if let Some(e) = write_csv_move(book, naming.prefix, cross.as_ref().map(|(p, _)| p.as_path()), &plan) {
+        warnings.push(e);
     }
     if let Some(api) = book.api {
-        for (hash, old, new) in renames {
-            match api.rename_key(&hash, &new).await {
-                Ok(()) => println!("[keys] OpenRouter key {old} → {new}"),
-                Err(e) => warnings.push(format!("renaming the OpenRouter key {old} → {new} failed: {e}")),
+        for (old, new) in pairs.iter().filter(|(_, n)| !plan.taken.iter().any(|t| t == n)) {
+            for k in named(&machine_key_names(naming, old)) {
+                match api.rename_key(&k.hash, new).await {
+                    Ok(()) => println!("[keys] OpenRouter key {} → {new}", k.name.as_deref().unwrap_or(old)),
+                    Err(e) => warnings.push(format!("renaming the OpenRouter key {old} → {new} failed: {e}")),
+                }
             }
         }
     }
     warnings
+}
+
+/// Write a [`CsvMove`]: in place through the link, or — cross-cohort (`dst` = the current
+/// cohort's file) — the new file first (secrets in two places beats in none), then the link
+/// repointed at it, then the moved rows taken out of the old file. Each file keeps (a new
+/// one inherits) the old file's mode: they hold secrets. A failure stops there, and comes
+/// back as the warning saying what state it left.
+fn write_csv_move(book: &KeyBook<'_>, prefix: &str, dst: Option<&std::path::Path>, plan: &CsvMove) -> Option<String> {
+    let Some(text) = &plan.dst else { return None };
+    let moved = plan.moved.join(", ");
+    let Some(dst) = dst else {
+        return match book.write_csv(text) {
+            Ok(()) => {
+                println!("[keys] {}: {moved}", book.csv.display());
+                None
+            }
+            Err(e) => Some(format!("couldn't update {} ({e}) — its rows still use the old names: {moved}", book.csv.display())),
+        };
+    };
+    // Resolved before the link moves: afterwards the link leads to the new file.
+    let old_real = std::fs::canonicalize(&book.csv).unwrap_or_else(|_| book.csv.clone());
+    let created = !dst.exists();
+    if let Err(e) = replace_file(dst, text) {
+        return Some(format!("couldn't write {} ({e}) — key rows NOT moved (still under the old names in {}): {moved}", dst.display(), old_real.display()));
+    }
+    if created {
+        if let Ok(meta) = std::fs::metadata(&old_real) {
+            let _ = std::fs::set_permissions(dst, meta.permissions());
+        }
+    }
+    let dir = book.csv.parent().unwrap_or(std::path::Path::new("."));
+    if let Err(e) = ensure_cohort_keys_file(dir, prefix) {
+        return Some(format!(
+            "copied the key rows into {} but couldn't point {} at it ({e:#}) — copy-keys still reads {}; fix the link by hand",
+            dst.display(),
+            book.csv.display(),
+            old_real.display()
+        ));
+    }
+    let carried = if plan.carried.is_empty() { String::new() } else { format!(" (carried along: {})", plan.carried.join(", ")) };
+    println!("[keys] moved into {} (this cohort's keys file): {moved}{carried}", dst.display());
+    if let Some(src) = &plan.src {
+        if let Err(e) = replace_file(&old_real, src) {
+            return Some(format!(
+                "moved the key rows into {}, but couldn't take them out of {} ({e}) — harmless (copy-keys reads the new file), tidy it by hand",
+                dst.display(),
+                old_real.display()
+            ));
+        }
+    }
+    None
 }
 
 /// The closing lines of a rename (pure, so tested): the MACHINE_NAME note, the pods whose
@@ -6988,6 +7329,8 @@ async fn handle_pull(
     sel: &Selected,
     dry_run: bool,
     yes: bool,
+    // The rsync to run: [`RSYNC`] for real, a recording stub in tests.
+    rsync: &str,
 ) -> Result<()> {
     use arena_core::pull::{self, PullConfig};
 
@@ -7083,10 +7426,10 @@ async fn handle_pull(
                 continue;
             }
             let args = pull::rsync_args(t, pc, &dest);
-            let name = name.clone();
+            let (name, rsync) = (name.clone(), rsync.to_string());
             jobs += 1;
             set.spawn(async move {
-                let out = tokio::process::Command::new("rsync")
+                let out = tokio::process::Command::new(rsync)
                     .args(&args)
                     .stdin(std::process::Stdio::null())
                     .output()
@@ -7584,27 +7927,45 @@ async fn handle_copy_keys(
 
 /// Where generated OpenRouter keys are persisted (also where `copy-keys` reads them).
 const OPENROUTER_KEYS_CSV: &str = "./keys/openrouter_api_keys.csv";
+/// [`OPENROUTER_KEYS_CSV`]'s file name, inside whichever keys dir is in use.
+const OPENROUTER_KEYS_LINK: &str = "openrouter_api_keys.csv";
 
 /// Resolve which machines a `keys` action targets, with the shared selector. A key belongs
 /// to a *machine name*, which can exist before its pod (mint keys, then `up`) or after it
 /// (revoke a terminated pod's key) — so names and ranges resolve against the current pods
-/// **plus** every MACHINE_NAME_LIST name without a pod (a name in neither is still a typo
-/// error). `--all` keeps its meaning: every *current* pod. Returns the full machine names,
-/// and the selection of those that are pods (what `--copy` can reach).
-async fn keys_targets(provider: &dyn Provider, cfg: &Config, sel: &SelectArgs) -> Result<(Vec<String>, Selected)> {
+/// **plus** every MACHINE_NAME_LIST name without a pod **plus** `known`: machines that
+/// still have a key (an OpenRouter key under this cohort's naming, or a row in the keys
+/// CSV — see [`key_holders`]), so a lingering key whose name left the list can still be
+/// revoked by name. A name in none of them is still a typo error (with the closest of all
+/// of them suggested). `--all` keeps its meaning: every *current* pod. Returns the full
+/// machine names, and the selection of those that are pods (what `--copy` can reach).
+async fn keys_targets(
+    provider: &dyn Provider,
+    cfg: &Config,
+    sel: &SelectArgs,
+    known: &[String],
+) -> Result<(Vec<String>, Selected)> {
     let naming = Naming::from_config(cfg);
     let selector = Selector::parse(sel, &naming)?;
     if selector.is_unscoped() {
         anyhow::bail!("name the machines (names or a range like apple..mayor), or pass --all");
     }
     let policy = arena_core::retry::RetryPolicy::default();
-    let pods = arena_core::retry::retrying(&policy, || provider.list_pods()).await.context("listing pods")?;
+    let mut pods = arena_core::retry::retrying(&policy, || provider.list_pods()).await.context("listing pods")?;
+    // As in `select`: a listing may omit GPU counts, and an unknown count never matches —
+    // without this, `--gpus N` would silently skip such pods.
+    if selector.gpus.is_some() {
+        if let Some(warning) = enrich_best_effort(provider, &mut pods, ENRICH_TIMEOUT).await {
+            eprintln!("{warning}");
+        }
+    }
     let mut universe = pods.clone();
     if !selector.all {
-        // Spare list names, as pod-less stand-ins (no id, no provider: `--on`/`--gpus` skip them).
-        for entry in &cfg.machine_names {
-            let name = arena_core::naming::qualify(naming.prefix, entry);
-            if !pods.iter().any(|p| p.name == name) {
+        // Spare list names and key holders, as pod-less stand-ins (no id, no provider:
+        // `--on`/`--gpus` skip them).
+        let spare = cfg.machine_names.iter().map(|e| arena_core::naming::qualify(naming.prefix, e));
+        for name in spare.chain(known.iter().cloned()) {
+            if !universe.iter().any(|p| p.name == name) {
                 universe.push(arena_core::Pod { name, ..Default::default() });
             }
         }
@@ -7615,57 +7976,86 @@ async fn keys_targets(provider: &dyn Provider, cfg: &Config, sel: &SelectArgs) -
     Ok((names, Selected { pods: live, named: true }))
 }
 
+/// Machines that still hold a key, for [`keys_targets`]: every host in the keys CSV, and
+/// every OpenRouter key whose name is its own [`key_name`](arena_core::openrouter::key_name)
+/// — i.e. named under this cohort's prefix (or an absolute list entry), as `keys gen` would
+/// name it; another cohort's `arena7-x` is left out (under this prefix it would be looked
+/// up as `{prefix}-arena7-x`, a key that doesn't exist).
+fn key_holders(naming: &Naming, keys: &[arena_core::openrouter::KeyInfo], csv: Option<&str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let rows = csv.map(arena_core::apikeys::parse_csv).unwrap_or_default();
+    let named = keys
+        .iter()
+        .filter_map(|k| k.name.clone())
+        .filter(|n| arena_core::openrouter::key_name(naming.prefix, naming.list, n) == *n);
+    for name in rows.into_iter().map(|(h, _)| h).chain(named) {
+        if !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
+}
+
 /// `keys gen|rotate --copy`: push the fresh keys to the targeted machines that are pods
 /// (a name without a pod has nowhere to go yet — `setup`/`copy-keys` deliver it later).
-async fn copy_new_keys(remote: Arc<dyn Remote>, cfg: &Config, live: &Selected, yes: bool) -> Result<()> {
+async fn copy_new_keys(remote: Arc<dyn Remote>, cfg: &Config, dir: &std::path::Path, live: &Selected, yes: bool) -> Result<()> {
     if live.pods.is_empty() {
         println!("(--copy: none of these machines has a pod yet — run `arena pods copy-keys` once they're up)");
         return Ok(());
     }
-    handle_copy_keys(remote, cfg, KEYS_DIR, None, None, live, false, yes).await
+    handle_copy_keys(remote, cfg, &dir.display().to_string(), None, None, live, false, yes).await
 }
 
-/// Persist one machine's freshly minted OpenRouter key into the per-host CSV (upsert).
-/// A new file is seeded with a header naming the arena iteration (`prefix`) so the CSV
-/// is self-documenting about which cohort the keys belong to.
-fn write_openrouter_key(host: &str, secret: &str, prefix: &str) -> Result<()> {
-    std::fs::create_dir_all("./keys").context("creating ./keys")?;
-    let target = ensure_cohort_keys_file(prefix)?;
+/// Persist one machine's freshly minted OpenRouter key into the per-host CSV in `dir`
+/// (upsert). A new file is seeded with a header naming the arena iteration (`prefix`) so
+/// the CSV is self-documenting about which cohort the keys belong to.
+fn write_openrouter_key(dir: &std::path::Path, host: &str, secret: &str, prefix: &str) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let target = ensure_cohort_keys_file(dir, prefix)?;
     let mut existing = std::fs::read_to_string(&target).unwrap_or_default();
     if existing.trim().is_empty() {
-        existing = format!(
-            "# OpenRouter API keys — arena iteration: {prefix}\n# host,key (one runtime key per machine; managed by `arena keys`)\n"
-        );
+        existing = cohort_keys_header(prefix);
     }
     let updated = arena_core::apikeys::upsert_csv(&existing, host, secret);
     std::fs::write(&target, updated).with_context(|| format!("writing {}", target.display()))?;
     Ok(())
 }
 
-/// Keys live per cohort in `keys/<prefix>_openrouter_keys.csv`; the canonical
-/// `keys/openrouter_api_keys.csv` (what copy-keys reads) is a symlink to the current one.
+/// The first lines of a new cohort keys file.
+fn cohort_keys_header(prefix: &str) -> String {
+    format!("# OpenRouter API keys — arena iteration: {prefix}\n# host,key (one runtime key per machine; managed by `arena keys`)\n")
+}
+
+/// The per-cohort keys file's name for `prefix` (what the `openrouter_api_keys.csv` link
+/// points at while that prefix is current).
+fn cohort_keys_file(prefix: &str) -> String {
+    format!("{prefix}_openrouter_keys.csv")
+}
+
+/// Keys live per cohort in `<dir>/<prefix>_openrouter_keys.csv`; the canonical
+/// `<dir>/openrouter_api_keys.csv` (what copy-keys reads) is a symlink to the current one.
 /// Repoints the symlink when the prefix changes, so a new cohort's keys never get written
 /// into the previous cohort's file. A legacy regular file is moved aside to `.bak`.
-fn ensure_cohort_keys_file(prefix: &str) -> Result<PathBuf> {
-    let file = format!("{prefix}_openrouter_keys.csv");
-    let target = PathBuf::from("./keys").join(&file);
-    let link = std::path::Path::new(OPENROUTER_KEYS_CSV);
-    match std::fs::symlink_metadata(link) {
+fn ensure_cohort_keys_file(dir: &std::path::Path, prefix: &str) -> Result<PathBuf> {
+    let file = cohort_keys_file(prefix);
+    let target = dir.join(&file);
+    let link = dir.join(OPENROUTER_KEYS_LINK);
+    match std::fs::symlink_metadata(&link) {
         Ok(m) if m.file_type().is_symlink() => {
-            if std::fs::read_link(link)?.file_name() != Some(std::ffi::OsStr::new(&file)) {
-                std::fs::remove_file(link)?;
-                std::os::unix::fs::symlink(&file, link)?;
-                println!("(keys) {OPENROUTER_KEYS_CSV} now → {file}");
+            if std::fs::read_link(&link)?.file_name() != Some(std::ffi::OsStr::new(&file)) {
+                std::fs::remove_file(&link)?;
+                std::os::unix::fs::symlink(&file, &link)?;
+                println!("(keys) {} now → {file}", link.display());
             }
         }
         Ok(_) => {
-            let bak = format!("{OPENROUTER_KEYS_CSV}.pre-{prefix}.bak");
-            anyhow::ensure!(!std::path::Path::new(&bak).exists(), "{bak} already exists — sort out {OPENROUTER_KEYS_CSV} by hand");
-            std::fs::rename(link, &bak)?;
-            println!("(keys) moved old {OPENROUTER_KEYS_CSV} aside to {bak}");
-            std::os::unix::fs::symlink(&file, link)?;
+            let bak = PathBuf::from(format!("{}.pre-{prefix}.bak", link.display()));
+            anyhow::ensure!(!bak.exists(), "{} already exists — sort out {} by hand", bak.display(), link.display());
+            std::fs::rename(&link, &bak)?;
+            println!("(keys) moved old {} aside to {}", link.display(), bak.display());
+            std::os::unix::fs::symlink(&file, &link)?;
         }
-        Err(_) => std::os::unix::fs::symlink(&file, link)?,
+        Err(_) => std::os::unix::fs::symlink(&file, &link)?,
     }
     Ok(target)
 }
@@ -7682,7 +8072,7 @@ async fn handle_keys(
     cfg: &Config,
     yes: bool,
 ) -> Result<()> {
-    use arena_core::openrouter::{key_name, OpenRouter};
+    use arena_core::openrouter::OpenRouter;
 
     // `which` just reads the local CSV — no provisioning key / network needed.
     if let KeysCmd::Which = cmd {
@@ -7719,20 +8109,70 @@ async fn handle_keys(
             )
         })?;
     let or = OpenRouter::new(prov_key);
+    keys_with(cmd, provider, remote, cfg, &or, std::path::Path::new(KEYS_DIR), yes).await
+}
+
+/// What a `keys` dry run says it would do with one machine's key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeysAction {
+    Gen,
+    Rotate,
+    Revoke,
+}
+
+/// The `keys gen|rotate|revoke --dry-run` preview (pure, so tested): one line per resolved
+/// machine — the key name it goes by, and what happens to it given `existing` (how many
+/// keys already go by that name; disabled ones for `gen`'s skip excluded).
+fn keys_preview(action: KeysAction, limit: f64, rows: &[(String, String, usize)]) -> Vec<String> {
+    let n = rows.len();
+    let mut out = vec![match action {
+        KeysAction::Gen => format!("Dry-run — would mint a ${limit:.2}-cap key for {n} machine(s):"),
+        KeysAction::Rotate => format!("Dry-run — would delete + re-mint a key (cap ${limit:.2}) for {n} machine(s):"),
+        KeysAction::Revoke => format!("Dry-run — would revoke the key for {n} machine(s):"),
+    }];
+    for (host, kn, existing) in rows {
+        let note = match (action, existing) {
+            (KeysAction::Gen, 0) => String::new(),
+            (KeysAction::Gen, _) => format!(" — already exists, would skip (`arena keys rotate {host}` replaces it)"),
+            (KeysAction::Rotate, 0) => " — none yet, would just mint".into(),
+            (KeysAction::Rotate, k) => format!(" — deletes {k} existing"),
+            (KeysAction::Revoke, 0) => " — no such key, nothing to revoke".into(),
+            (KeysAction::Revoke, k) => format!(" — deletes {k}"),
+        };
+        out.push(format!("  {kn}{note}"));
+    }
+    out
+}
+
+/// `arena keys list|gen|rotate|revoke` against `api` (the OpenRouter provisioning API for
+/// real; a fake in tests), keeping the secrets in the per-cohort CSV in `dir` (`./keys`; a
+/// temp dir in tests). One full key listing up front serves the target resolution (machines
+/// that still hold a key are valid targets), the dry run, and the skip/delete decisions.
+async fn keys_with(
+    cmd: KeysCmd,
+    provider: &dyn Provider,
+    // How `--copy` reaches pods (via `copy-keys`): `SshRemote` for real.
+    remote: Arc<dyn Remote>,
+    cfg: &Config,
+    api: &dyn arena_core::openrouter::KeyApi,
+    dir: &std::path::Path,
+    yes: bool,
+) -> Result<()> {
+    use arena_core::openrouter::key_name;
     let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena").to_string();
     let default_limit = cfg.get_parsed::<f64>("OPENROUTER_KEY_LIMIT").unwrap_or(5.0);
-
-    match cmd {
+    let naming = Naming::from_config(cfg);
+    let csv_path = dir.join(OPENROUTER_KEYS_LINK);
+    let (action, sel, limit, copy, dry_run) = match cmd {
         KeysCmd::Which => unreachable!("handled before the provisioning-key check"),
         KeysCmd::List { all } => {
-            let mut keys = or.list_keys().await.context("listing OpenRouter keys")?;
+            let mut keys = api.list_keys().await.context("listing OpenRouter keys")?;
             keys.sort_by(|a, b| a.name.cmp(&b.name));
             if keys.is_empty() {
                 println!("(no provisioned OpenRouter keys)");
                 return Ok(());
             }
             // Default to this iteration's keys (named `<prefix>-…`); count the rest.
-            let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
             let needle = format!("{prefix}-");
             let total = keys.len();
             let shown: Vec<_> = if all {
@@ -7759,149 +8199,105 @@ async fn handle_keys(
             if !all && excluded > 0 {
                 println!("\n(excluded {excluded} non-{prefix} key(s) — use --all to show all)");
             }
+            return Ok(());
         }
-
-        KeysCmd::Gen { sel, limit, copy, dry_run } => {
-            let (names, live) = keys_targets(provider, cfg, &sel.args()).await?;
-            let limit = limit.unwrap_or(default_limit);
-            if names.is_empty() {
-                println!("(no target machines)");
-                return Ok(());
-            }
-            if dry_run {
-                println!("Dry-run — would mint a ${limit:.2}-cap key for {} machine(s):", names.len());
-                for h in &names {
-                    println!("  {}", key_name(&prefix, &cfg.machine_names, h));
-                }
-                return Ok(());
-            }
-            if !confirm(yes, &format!(
-                "Will mint {} OpenRouter key(s) (cap ${limit:.2} each) and write {OPENROUTER_KEYS_CSV}: {}",
-                names.len(),
-                names.join(", ")
-            ))? {
-                println!("aborted.");
-                return Ok(());
-            }
-            let existing = or.list_keys().await.context("listing existing keys")?;
-            let (mut made, mut skipped, mut failed) = (0, 0, 0);
-            for host in &names {
-                let kn = key_name(&prefix, &cfg.machine_names, host);
-                if existing.iter().any(|k| k.name.as_deref() == Some(&kn) && !k.disabled) {
-                    println!("= {host}: '{kn}' already exists — use `arena keys rotate {host}` to replace");
-                    skipped += 1;
-                    continue;
-                }
-                match or.create_key(&kn, Some(limit)).await {
-                    Ok(ck) => {
-                        write_openrouter_key(host, &ck.secret, &prefix)?;
-                        println!("✓ {host}: minted {}", &ck.hash[..ck.hash.len().min(12)]);
-                        made += 1;
-                    }
-                    Err(e) => {
-                        eprintln!("✗ {host}: {e}");
-                        failed += 1;
-                    }
-                }
-            }
-            println!("\nGenerated {made}, skipped {skipped}, failed {failed} → {OPENROUTER_KEYS_CSV}");
-            if copy && made > 0 {
-                println!();
-                copy_new_keys(remote.clone(), cfg, &live, yes).await?;
-            }
+        KeysCmd::Gen { sel, limit, copy, dry_run } => (KeysAction::Gen, sel, limit, copy, dry_run),
+        KeysCmd::Rotate { sel, limit, copy, dry_run } => (KeysAction::Rotate, sel, limit, copy, dry_run),
+        KeysCmd::Revoke { sel, dry_run } => (KeysAction::Revoke, sel, None, false, dry_run),
+    };
+    let limit = limit.unwrap_or(default_limit);
+    let existing = api.list_keys().await.context("listing OpenRouter keys")?;
+    let known = key_holders(&naming, &existing, std::fs::read_to_string(&csv_path).ok().as_deref());
+    let (names, live) = keys_targets(provider, cfg, &sel.args(), &known).await?;
+    if names.is_empty() {
+        println!("(no target machines)");
+        return Ok(());
+    }
+    // Per machine: the name its new key gets, and the existing keys that are its (gen skips
+    // only for an enabled one; rotate/revoke delete them all — a leaked duplicate must die).
+    let plan: Vec<(String, String, Vec<&arena_core::openrouter::KeyInfo>)> = names
+        .iter()
+        .map(|host| {
+            let theirs = machine_key_names(&naming, host);
+            let keys = existing
+                .iter()
+                .filter(|k| k.name.as_deref().is_some_and(|n| theirs.iter().any(|t| t == n)))
+                .filter(|k| action != KeysAction::Gen || !k.disabled)
+                .collect();
+            (host.clone(), key_name(&prefix, &cfg.machine_names, host), keys)
+        })
+        .collect();
+    if dry_run {
+        let rows: Vec<(String, String, usize)> = plan.iter().map(|(h, kn, ks)| (h.clone(), kn.clone(), ks.len())).collect();
+        for line in keys_preview(action, limit, &rows) {
+            println!("{line}");
         }
-
-        KeysCmd::Rotate { sel, limit, copy, dry_run } => {
-            let (names, live) = keys_targets(provider, cfg, &sel.args()).await?;
-            let limit = limit.unwrap_or(default_limit);
-            if dry_run {
-                println!("Dry-run — would delete + re-mint a key for {} machine(s):", names.len());
-                for h in &names {
-                    println!("  {}", key_name(&prefix, &cfg.machine_names, h));
-                }
-                return Ok(());
+        return Ok(());
+    }
+    let what = match action {
+        KeysAction::Gen => format!("Will mint {} OpenRouter key(s) (cap ${limit:.2} each) and write {}", names.len(), csv_path.display()),
+        KeysAction::Rotate => format!("Will DELETE + re-mint {} OpenRouter key(s) (cap ${limit:.2})", names.len()),
+        KeysAction::Revoke => format!("Will DELETE {} OpenRouter key(s) — no regenerate", names.len()),
+    };
+    if !confirm(yes, &format!("{what}: {}", names.join(", ")))? {
+        println!("aborted.");
+        return Ok(());
+    }
+    let (mut ok, mut skipped, mut failed) = (0, 0, 0);
+    for (host, kn, theirs) in &plan {
+        if action == KeysAction::Gen && !theirs.is_empty() {
+            println!("= {host}: '{kn}' already exists — use `arena keys rotate {host}` to replace");
+            skipped += 1;
+            continue;
+        }
+        if action != KeysAction::Gen {
+            if theirs.is_empty() && action == KeysAction::Revoke {
+                println!("= {host}: no key named '{kn}'");
+                skipped += 1;
+                continue;
             }
-            if !confirm(yes, &format!("Will DELETE + re-mint {} OpenRouter key(s) (cap ${limit:.2}): {}", names.len(), names.join(", ")))? {
-                println!("aborted.");
-                return Ok(());
-            }
-            let (mut ok, mut failed) = (0, 0);
-            for host in &names {
-                let kn = key_name(&prefix, &cfg.machine_names, host);
-                // Delete the existing key (by name) if present, then mint a fresh one.
-                match or.find_by_name(&kn).await {
-                    Ok(Some(k)) => {
-                        if let Err(e) = or.delete_key(&k.hash).await {
-                            eprintln!("✗ {host}: delete old: {e}");
-                            failed += 1;
-                            continue;
-                        }
-                    }
-                    Ok(None) => {} // nothing to delete; just create
-                    Err(e) => {
-                        eprintln!("✗ {host}: lookup: {e}");
-                        failed += 1;
-                        continue;
+            let errs: Vec<String> = {
+                let mut errs = Vec::new();
+                for k in theirs {
+                    if let Err(e) = api.delete_key(&k.hash).await {
+                        errs.push(e.to_string());
                     }
                 }
-                match or.create_key(&kn, Some(limit)).await {
-                    Ok(ck) => {
-                        write_openrouter_key(host, &ck.secret, &prefix)?;
-                        println!("✓ {host}: rotated");
-                        ok += 1;
-                    }
-                    Err(e) => {
-                        eprintln!("✗ {host}: create: {e}");
-                        failed += 1;
-                    }
-                }
+                errs
+            };
+            if !errs.is_empty() {
+                eprintln!("✗ {host}: delete: {}", errs.join("; "));
+                failed += 1;
+                continue;
             }
-            println!("\nRotated {ok}, failed {failed}.");
-            if copy && ok > 0 {
-                println!();
-                copy_new_keys(remote.clone(), cfg, &live, yes).await?;
+            if action == KeysAction::Revoke {
+                println!("✓ {host}: revoked");
+                ok += 1;
+                continue;
             }
         }
-
-        KeysCmd::Revoke { sel, dry_run } => {
-            let (names, _) = keys_targets(provider, cfg, &sel.args()).await?;
-            if dry_run {
-                println!("Dry-run — would revoke the key for {} machine(s):", names.len());
-                for h in &names {
-                    println!("  {}", key_name(&prefix, &cfg.machine_names, h));
-                }
-                return Ok(());
+        match api.create_key(kn, Some(limit)).await {
+            Ok(ck) => {
+                write_openrouter_key(dir, host, &ck.secret, &prefix)?;
+                println!("✓ {host}: {} {}", if action == KeysAction::Gen { "minted" } else { "rotated" }, &ck.hash[..ck.hash.len().min(12)]);
+                ok += 1;
             }
-            if !confirm(yes, &format!("Will DELETE {} OpenRouter key(s) — no regenerate: {}", names.len(), names.join(", ")))? {
-                println!("aborted.");
-                return Ok(());
+            Err(e) => {
+                eprintln!("✗ {host}: create: {e}");
+                failed += 1;
             }
-            let (mut ok, mut missing, mut failed) = (0, 0, 0);
-            for host in &names {
-                let kn = key_name(&prefix, &cfg.machine_names, host);
-                match or.find_by_name(&kn).await {
-                    Ok(Some(k)) => match or.delete_key(&k.hash).await {
-                        Ok(()) => {
-                            println!("✓ {host}: revoked");
-                            ok += 1;
-                        }
-                        Err(e) => {
-                            eprintln!("✗ {host}: {e}");
-                            failed += 1;
-                        }
-                    },
-                    Ok(None) => {
-                        println!("= {host}: no key named '{kn}'");
-                        missing += 1;
-                    }
-                    Err(e) => {
-                        eprintln!("✗ {host}: {e}");
-                        failed += 1;
-                    }
-                }
-            }
-            println!("\nRevoked {ok}, none-found {missing}, failed {failed}. (The CSV is left as-is; rotate to refresh.)");
         }
+    }
+    match action {
+        KeysAction::Gen => println!("\nGenerated {ok}, skipped {skipped}, failed {failed} → {}", csv_path.display()),
+        KeysAction::Rotate => println!("\nRotated {ok}, failed {failed}."),
+        KeysAction::Revoke => {
+            println!("\nRevoked {ok}, none-found {skipped}, failed {failed}. (The CSV is left as-is; rotate to refresh.)")
+        }
+    }
+    if copy && ok > 0 {
+        println!();
+        copy_new_keys(remote.clone(), cfg, dir, &live, yes).await?;
     }
     Ok(())
 }
@@ -7944,7 +8340,11 @@ async fn handle_ssh_config(
 /// commands that change pods demand names or `--all`, and every old spelling still parses.
 #[cfg(test)]
 mod selection_tests {
-    use super::{handle_keys, handle_pods, keys_targets, select, Cli, Cmd, KeysCmd, PodCmd, Unscoped};
+    use super::lifecycle_tests::FakeKeys;
+    use super::{
+        handle_keys, handle_pods, keys_preview, keys_targets, keys_with, misplaced_run_flags, select, Cli, Cmd, KeysAction,
+        KeysCmd, PodCmd, Unscoped,
+    };
     use arena_core::remote::FakeRemote;
     use arena_core::selector::SelectArgs;
     use arena_core::{Config, Pod, PodSpec, Provider, Result};
@@ -8236,30 +8636,145 @@ mod selection_tests {
     #[tokio::test]
     async fn keys_target_machine_names_with_or_without_a_pod() {
         let f = fleet();
-        let keys = |a: SelectArgs| {
+        let keys = |a: SelectArgs, known: Vec<String>| {
             let f = &f;
-            async move { keys_targets(f, &cfg(), &a).await.map(|(n, live)| (n, live.pods.len())).map_err(|e| e.to_string()) }
+            async move {
+                keys_targets(f, &cfg(), &a, &known).await.map(|(n, live)| (n, live.pods.len())).map_err(|e| e.to_string())
+            }
         };
         // A range spans list names without a pod (mayor): a key can precede its pod.
         assert_eq!(
-            keys(args(&["cloud..vm"])).await.unwrap(),
+            keys(args(&["cloud..vm"]), vec![]).await.unwrap(),
             (vec!["arena8-cloud".to_string(), "arena8-mayor".into(), "arena8-vm".into()], 2)
         );
         // A spare list name alone (revoke a terminated pod's key) is fine; a typo is not.
-        assert_eq!(keys(args(&["mayor"])).await.unwrap(), (vec!["arena8-mayor".to_string()], 0));
-        assert!(keys(args(&["mayr"])).await.unwrap_err().contains("did you mean arena8-mayor?"));
-        // --all = every current pod (not the spare names), narrowed as usual.
+        assert_eq!(keys(args(&["mayor"]), vec![]).await.unwrap(), (vec!["arena8-mayor".to_string()], 0));
+        assert!(keys(args(&["mayr"]), vec![]).await.unwrap_err().contains("did you mean arena8-mayor?"));
+        // A name that left the list but still holds a key (or a CSV row) can still be
+        // targeted; a near-miss of it is suggested.
+        let known = vec!["arena8-old".to_string()];
+        assert_eq!(keys(args(&["old"]), known.clone()).await.unwrap(), (vec!["arena8-old".to_string()], 0));
+        assert!(keys(args(&["olf"]), known.clone()).await.unwrap_err().contains("did you mean arena8-old?"));
+        assert!(keys(args(&["old"]), vec![]).await.unwrap_err().contains("no pod has that name"));
+        // --all = every current pod (not the spare names or key holders), narrowed as usual.
         let all = SelectArgs { all: true, exclude: vec!["vm".into()], ..Default::default() };
-        assert_eq!(keys(all).await.unwrap().0, ["arena8-apple", "arena8-bloom", "arena8-cloud", "arena8-zebra"]);
-        assert!(keys(SelectArgs::default()).await.unwrap_err().contains("name the machines"));
-        // Through the command (a dry run never reaches OpenRouter).
-        let cfg = Config::parse("MACHINE_NAME_PREFIX=arena8\nMACHINE_NAME_LIST=(apple bloom)\nOPENROUTER_PROVISIONING_KEY=test\n");
-        for argv in [&["keys", "gen", "apple..bloom", "--dry-run"][..], &["keys", "revoke", "--all", "--dry-run"]] {
-            let Cmd::Keys(k) = parse(argv).unwrap() else { unreachable!() };
-            handle_keys(k, &f, Arc::new(FakeRemote::new()), &cfg, true).await.unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+        assert_eq!(keys(all, known).await.unwrap().0, ["arena8-apple", "arena8-bloom", "arena8-cloud", "arena8-zebra"]);
+        assert!(keys(SelectArgs::default(), vec![]).await.unwrap_err().contains("name the machines"));
+        // --gpus fetches the details a listing omits, as `select` does (cloud's count).
+        let two = SelectArgs { all: true, gpus: Some(2), ..Default::default() };
+        assert_eq!(keys(two, vec![]).await.unwrap().0, ["arena8-bloom", "arena8-cloud"]);
+        // Without a provisioning key the command stops before anything (no network).
+        let Cmd::Keys(k) = parse(&["keys", "gen", "apple", "--dry-run"]).unwrap() else { unreachable!() };
+        let e = handle_keys(k, &f, Arc::new(FakeRemote::new()), &cfg(), true).await.unwrap_err().to_string();
+        assert!(e.contains("set OPENROUTER_PROVISIONING_KEY first"), "{e}");
+    }
+
+    /// A temp keys dir (per process + test), removed when dropped.
+    struct KeysDir(std::path::PathBuf);
+    impl Drop for KeysDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
         }
-        let Cmd::Keys(k) = parse(&["keys", "rotate", "aple", "--dry-run"]).unwrap() else { unreachable!() };
-        assert!(handle_keys(k, &f, Arc::new(FakeRemote::new()), &cfg, true).await.unwrap_err().to_string().contains("did you mean"));
+    }
+    fn keys_dir(tag: &str) -> KeysDir {
+        let d = std::env::temp_dir().join(format!("arena-keys-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        KeysDir(d)
+    }
+
+    /// `keys <argv…>` against the fleet, `api` and `dir`.
+    async fn keys_cmd(argv: &[&str], api: &FakeKeys, dir: &std::path::Path) -> std::result::Result<(), String> {
+        let Cmd::Keys(k) = parse(&[&["keys"][..], argv].concat()).unwrap_or_else(|e| panic!("{argv:?}: {e}")) else {
+            unreachable!()
+        };
+        keys_with(k, &fleet(), Arc::new(FakeRemote::new()), &cfg(), api, dir, true).await.map_err(|e| e.to_string())
+    }
+
+    #[tokio::test]
+    async fn keys_gen_rotate_revoke_act_on_exactly_the_resolved_machines() {
+        let dir = keys_dir("act");
+        // bloom already has a key; an old cohort's key and an unrelated one must be ignored.
+        let api = FakeKeys::with(&[("h-b", "arena8-bloom"), ("h-7", "arena7-apple"), ("h-x", "admin")]);
+        // gen: a range + a spare list name; bloom is skipped (exists), the rest minted.
+        keys_cmd(&["gen", "apple..cloud", "mayor", "--exclude", "cloud"], &api, &dir.0).await.unwrap();
+        assert_eq!(api.calls(), ["create arena8-apple", "create arena8-mayor"]);
+        let csv = std::fs::read_to_string(dir.0.join("openrouter_api_keys.csv")).unwrap();
+        let rows: Vec<String> = arena_core::apikeys::parse_csv(&csv).into_iter().map(|(h, _)| h).collect();
+        assert_eq!(rows, ["arena8-apple", "arena8-mayor"]);
+        assert_eq!(std::fs::read_link(dir.0.join("openrouter_api_keys.csv")).unwrap(), std::path::PathBuf::from("arena8_openrouter_keys.csv"));
+        // rotate: deletes each machine's key(s), mints fresh — only for the --on selection.
+        api.calls.lock().unwrap().clear();
+        keys_cmd(&["rotate", "--all", "--on", "runpod", "--gpus", "2"], &api, &dir.0).await.unwrap();
+        assert_eq!(api.calls(), ["delete h-b", "create arena8-bloom", "create arena8-cloud"]);
+        // revoke: exactly the named machine's key; the CSV is left as it was.
+        api.calls.lock().unwrap().clear();
+        keys_cmd(&["revoke", "mayor"], &api, &dir.0).await.unwrap();
+        assert_eq!(api.calls(), ["delete h-new-arena8-mayor"]);
+        assert!(std::fs::read_to_string(dir.0.join("openrouter_api_keys.csv")).unwrap().contains("arena8-mayor,"));
+        // A machine that left the list and has no pod, but still has a key: revocable by
+        // name (it's a key holder); a typo of it is still an error naming it.
+        let api = FakeKeys::with(&[("h-o", "arena8-oldbox")]);
+        keys_cmd(&["revoke", "oldbox"], &api, &dir.0).await.unwrap();
+        assert_eq!(api.calls(), ["delete h-o"]);
+        let e = keys_cmd(&["revoke", "oldbx"], &FakeKeys::with(&[("h-o", "arena8-oldbox")]), &dir.0).await.unwrap_err();
+        assert!(e.contains("did you mean arena8-oldbox?"), "{e}");
+        // Dry runs change nothing on either side.
+        let api = FakeKeys::with(&[("h-b", "arena8-bloom")]);
+        for argv in [&["gen", "--all", "--dry-run"][..], &["rotate", "apple", "--dry-run"], &["revoke", "--all", "--dry-run"]] {
+            keys_cmd(argv, &api, &dir.0).await.unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+        }
+        assert!(api.calls().is_empty());
+    }
+
+    #[test]
+    fn keys_dry_run_names_every_resolved_machine_and_what_happens() {
+        let rows = vec![("arena8-apple".to_string(), "arena8-apple".to_string(), 0), ("arena8-bloom".into(), "arena8-bloom".into(), 1)];
+        assert_eq!(
+            keys_preview(KeysAction::Gen, 5.0, &rows),
+            [
+                "Dry-run — would mint a $5.00-cap key for 2 machine(s):",
+                "  arena8-apple",
+                "  arena8-bloom — already exists, would skip (`arena keys rotate arena8-bloom` replaces it)",
+            ]
+        );
+        assert_eq!(keys_preview(KeysAction::Rotate, 2.5, &rows)[1..], ["  arena8-apple — none yet, would just mint", "  arena8-bloom — deletes 1 existing"]);
+        assert_eq!(keys_preview(KeysAction::Revoke, 5.0, &rows)[1..], ["  arena8-apple — no such key, nothing to revoke", "  arena8-bloom — deletes 1"]);
+    }
+
+    #[tokio::test]
+    async fn a_selection_flag_after_runs_command_is_refused_not_widened() {
+        // `run hostname -t apple` parses as the command `hostname -t apple` with NO targets
+        // (= every pod): refused before anything is listed or run.
+        for argv in [
+            &["run", "hostname", "-t", "apple"][..],
+            &["run", "-t", "apple", "hostname", "--exclude", "bloom"],
+            &["run", "uptime", "--on=vast"],
+            &["run", "rm", "-rf", "/tmp/x", "--dry-run"],
+        ] {
+            let (f, r) = run_pods(argv).await;
+            let e = r.unwrap_err();
+            assert!(e.contains("after the command would be part of the command") && e.contains("Nothing was run"), "{argv:?}: {e}");
+            assert_eq!(*f.lists.lock().unwrap(), 0, "{argv:?}");
+        }
+        let words = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for (cmd, bad) in [
+            (&["hostname", "-t", "apple"][..], Some("`-t`")),
+            (&["x", "--target=apple", "--gpus", "2"], Some("`--target=apple --gpus`")),
+            (&["x", "--include", "a", "--dryrun"], Some("`--include --dryrun`")),
+            // a quoted command is one word; flags that only look alike are left alone
+            (&["tmux kill-session -t lab"], None),
+            (&["tar", "-tvf", "x.tar"], None),
+            (&["git", "branch", "--all"], None),
+            (&["apt-get", "install", "-y", "jq"], None),
+            (&["ls", "--only-dirs"], None),
+        ] {
+            let got = misplaced_run_flags(&words(cmd));
+            match bad {
+                None => assert_eq!(got, None, "{cmd:?}"),
+                Some(b) => assert!(got.as_deref().is_some_and(|e| e.starts_with(b)), "{cmd:?}: {got:?}"),
+            }
+        }
     }
 
     #[test]
@@ -10143,9 +10658,9 @@ mod placement_cli_tests {
 mod remote_tests {
     use super::{
         backup_fleet, copy_pod_files, copy_to_pod, cp_timeout, deep_check_fleet, duplicate_names, each_pod,
-        handle_backup, handle_copy, handle_deep_test, handle_init_branches,
-        handle_pods, handle_run, handle_set_branch, local_size, marker_present, probe_gpus, proxy_reaches_pod,
-        render_deep_test, render_run, replace_copy_failed, run_fleet, select, target_is_pod, BackupTally, Cli, Cmd,
+        handle_backup, handle_copy, handle_deep_test, handle_full_backup, handle_init_branches,
+        handle_pods, handle_pull, handle_run, handle_set_branch, local_size, marker_present, probe_gpus, proxy_reaches_pod,
+        render_deep_test, render_run, replace_copy_failed, run_fleet, run_preview, select, target_is_pod, BackupTally, Cli, Cmd,
         CopyPlan, PodCmd, RunResult, Select, SelectByFlag, Selected, Unscoped, BACKUP_TIMEOUT, BRANCH_TIMEOUT,
         CP_BASE_TIMEOUT, POD_COPY_TIMEOUT, RUN_TIMEOUT_SECS, TEST_TIMEOUT,
     };
@@ -10332,6 +10847,97 @@ mod remote_tests {
         assert_eq!(lines[1], "devtest-bloom          ✗ exit Some(127): zsh: command not found: nvidia-smi");
     }
 
+    /// A stand-in `rsync` (a shell script in a temp dir) that logs each call's destination —
+    /// its last argument — so a pull is observable without touching the network.
+    struct StubRsync(std::path::PathBuf);
+
+    impl StubRsync {
+        fn new(tag: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = std::env::temp_dir().join(format!("arena-rsync-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let script = dir.join("rsync");
+            std::fs::write(&script, "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\necho \"$last\" >> \"$(dirname \"$0\")/calls.log\"\n").unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            StubRsync(dir)
+        }
+        fn path(&self) -> String {
+            self.0.join("rsync").display().to_string()
+        }
+        /// The destinations so far as `<tier dir>/<pod>`, sorted; the log is emptied.
+        fn take(&self) -> Vec<String> {
+            let log = self.0.join("calls.log");
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            let _ = std::fs::remove_file(&log);
+            let mut got: Vec<String> = text
+                .lines()
+                .map(|l| {
+                    let mut parts = l.trim_end_matches('/').rsplit('/');
+                    let pod = parts.next().unwrap_or("");
+                    format!("{}/{pod}", parts.next().unwrap_or(""))
+                })
+                .collect();
+            got.sort();
+            got
+        }
+    }
+
+    impl Drop for StubRsync {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn pull_and_backup_rsync_exactly_the_selected_pods() {
+        let stub = StubRsync::new("scoped");
+        let base = stub.0.join("backups");
+        let cfg = Config::parse(&format!(
+            "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple bloom cloud)\nBACKUP_REPO_PATH={REPO}\n\
+             GIT_SSH_KEY_REMOTE={KEY}\nSHARED_SSH_KEY_PATH=/nonexistent/devtest_key\nARENA_START_DATE=2026-01-05\n\
+             LOCAL_BACKUP_DIR={}\n",
+            base.display()
+        ));
+        let base = base.display().to_string();
+        // `pods pull w1d1 -t apple..cloud --exclude bloom`: exactly apple + cloud, both tiers,
+        // through the same selection the command resolves.
+        let PodCmd::Pull { sel, .. } = pods(&["pull", "w1d1", "-t", "apple..cloud", "--exclude", "bloom"]) else {
+            panic!("not pods pull")
+        };
+        let chosen = select(&fleet(), &cfg, &sel.args(), Unscoped::All).await.unwrap();
+        handle_pull(&cfg, Some("w1d1".into()), &base, None, None, false, false, &chosen, false, true, &stub.path()).await.unwrap();
+        assert_eq!(stub.take(), ["big/devtest-apple", "big/devtest-cloud", "w1d1/devtest-apple", "w1d1/devtest-cloud"]);
+        // `pods backup bloom` (with the pull): the git push AND the rsync reach bloom only.
+        let fake = Arc::new(FakeRemote::new());
+        let chosen = picked(&fleet(), &cfg, &["bloom"]).await;
+        handle_full_backup(fake.clone(), &cfg, &chosen, false, None, false, true, &stub.path()).await.unwrap();
+        assert_eq!(ports(&fake), [22002]);
+        let got = stub.take();
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(got.iter().all(|d| d.ends_with("/devtest-bloom")) && got.contains(&"big/devtest-bloom".to_string()), "{got:?}");
+        // --no-pull: git only. A dry run: neither.
+        let fake = Arc::new(FakeRemote::new());
+        handle_full_backup(fake.clone(), &cfg, &chosen, true, None, false, true, &stub.path()).await.unwrap();
+        assert_eq!((ports(&fake), stub.take()), (vec![22002], vec![]));
+        let fake = Arc::new(FakeRemote::new());
+        handle_full_backup(fake.clone(), &cfg, &chosen, false, None, true, true, &stub.path()).await.unwrap();
+        assert!(fake.calls().is_empty() && stub.take().is_empty());
+    }
+
+    #[test]
+    fn run_previews_name_every_resolved_pod() {
+        let names = ["devtest-apple", "devtest-cloud"];
+        assert_eq!(
+            run_preview(true, "hostname", "<wrapped>", &names, Duration::from_secs(60)),
+            "[dry-run] would run on 2 pod(s) (60s budget each): devtest-apple, devtest-cloud\n  <wrapped>"
+        );
+        assert_eq!(
+            run_preview(false, "hostname", "<wrapped>", &names, Duration::from_secs(60)),
+            "Run `hostname` on 2 pod(s) over SSH: devtest-apple, devtest-cloud"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn ssh_fleet_commands_reach_exactly_the_selected_pods() {
         // PLAN 1.C through each SSH command family: the shared selector decides which pods
@@ -10368,6 +10974,27 @@ mod remote_tests {
         ] {
             let fake = Arc::new(FakeRemote::new());
             assert!(handle_pods(pods(argv), &fleet(), fake.clone(), &cfg, true).await.is_err(), "{argv:?}");
+            assert!(fake.calls().is_empty(), "{argv:?}");
+        }
+        // An empty argument (a script's unset `$POD`) is an error — never "every pod".
+        for argv in [
+            &["run", "-t", "", "true"][..],
+            &["run", "-t", ",", "true"],
+            &["run", "--include", " ", "true"],
+            &["setup", ""],
+            &["setup", "--force", "--include", ""],
+            &["copy-keys", ""],
+            &["copy-keys", "--include", ""],
+            &["cp", "/nonexistent/f", "-t", ""],
+            &["test", ""],
+            &["test", "--deep", " , "],
+            &["backup", "", "--no-pull"],
+            &["init-branches", ""],
+            &["set-branch", "main", "--all", "--exclude", ""],
+        ] {
+            let fake = Arc::new(FakeRemote::new());
+            let e = handle_pods(pods(argv), &fleet(), fake.clone(), &cfg, true).await.unwrap_err().to_string();
+            assert!(e.contains("an empty target ("), "{argv:?}: {e}");
             assert!(fake.calls().is_empty(), "{argv:?}");
         }
         // A named pod without an endpoint fails the command; swept in by default, it's skipped.
@@ -11161,11 +11788,11 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
 #[cfg(test)]
 mod lifecycle_tests {
     use super::{
-        disk_fate, handle_pods, handle_rename, handle_restart, handle_terminate, rename_followup_steps,
-        rename_report, wipe_refusal, Cli, Cmd, DiskFate, DiskOp, KeyBook, PlannedRename, PodCmd, RenameRequest,
-        RestartOpts, SettleWait,
+        disk_fate, handle_pods, handle_rename, handle_restart, handle_terminate, plan_csv_move, rename_followup_steps,
+        rename_report, repo_on_volume, rewrite_name_files, stop_lines, wipe_refusal, Cli, Cmd, CsvMove, DiskFate,
+        DiskOp, KeyBook, PlannedRename, PodCmd, RenameRequest, RestartOpts, SettleWait,
     };
-    use arena_core::openrouter::{KeyApi, KeyInfo};
+    use arena_core::openrouter::{CreatedKey, KeyApi, KeyInfo};
     use arena_core::remote::{FakeRemote, FakeReply, RemoteCall, PROBE_TIMEOUT};
     use arena_core::setup::name_file_command;
     use arena_core::{Config, Error, Pod, PodSpec, Provider, Result};
@@ -11217,8 +11844,13 @@ mod lifecycle_tests {
             self.record(format!("stop {id}"));
             Ok(())
         }
+        /// Like a real container reset, the restarted pod comes back on a NEW endpoint (port
+        /// +1000): setup reaching the new one proves it ran after the restart, not before.
         async fn restart_pod(&self, id: &str) -> Result<()> {
             self.record(format!("restart {id}"));
+            for p in self.pods.lock().unwrap().iter_mut().filter(|p| p.id == id) {
+                p.ssh_port = p.ssh_port.map(|port| port + 1000);
+            }
             Ok(())
         }
         async fn terminate_pod(&self, id: &str) -> Result<()> {
@@ -11285,14 +11917,19 @@ mod lifecycle_tests {
         TmpDir(d)
     }
 
-    /// Setup + a write-only proxy in `dir` (never reloads nginx, never SSHes anywhere).
+    /// Setup + a write-only proxy in `dir` (never reloads nginx, never SSHes anywhere). The
+    /// repo is in its default place, /root/r — on the container disk.
     fn cfg(dir: &Path) -> Config {
-        Config::parse(&format!(
+        Config::parse(&cfg_text(dir))
+    }
+
+    fn cfg_text(dir: &Path) -> String {
+        format!(
             "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(alpha bravo charlie delta echo @solo-gpu)\n\
              ARENA_REPO_OWNER=o\nARENA_REPO_NAME=r\nGIT_SSH_KEY_LOCAL=/nonexistent/devtest_deploy_key\n\
              SSH_PROXY_HOST=localhost\nSSH_PROXY_NGINX_CONFIG_PATH={}\nSSH_PROXY_RELOAD_CMD=\"\"\n",
             dir.join("proxy.conf").display()
-        ))
+        )
     }
 
     fn proxy_file(dir: &Path) -> String {
@@ -11313,16 +11950,17 @@ mod lifecycle_tests {
         std::fs::read_to_string(dir.join("devtest_openrouter_keys.csv")).unwrap()
     }
 
-    /// The provisioning API: keys by name, recording deletes/renames; `broken` names fail.
+    /// The provisioning API: keys by name, recording creates/deletes/renames; deleting a
+    /// key whose name is in `broken` fails. Shared with `selection_tests` (`keys` commands).
     #[derive(Default)]
-    struct FakeKeys {
-        keys: Mutex<Vec<KeyInfo>>,
-        calls: Mutex<Vec<String>>,
-        broken: Vec<&'static str>,
+    pub(crate) struct FakeKeys {
+        pub(crate) keys: Mutex<Vec<KeyInfo>>,
+        pub(crate) calls: Mutex<Vec<String>>,
+        pub(crate) broken: Vec<&'static str>,
     }
 
     impl FakeKeys {
-        fn with(names: &[(&str, &str)]) -> Self {
+        pub(crate) fn with(names: &[(&str, &str)]) -> Self {
             let keys = names
                 .iter()
                 .map(|(hash, name)| KeyInfo {
@@ -11336,10 +11974,10 @@ mod lifecycle_tests {
                 .collect();
             Self { keys: Mutex::new(keys), ..Default::default() }
         }
-        fn calls(&self) -> Vec<String> {
+        pub(crate) fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
         }
-        fn names(&self) -> Vec<String> {
+        pub(crate) fn names(&self) -> Vec<String> {
             let mut n: Vec<String> = self.keys.lock().unwrap().iter().filter_map(|k| k.name.clone()).collect();
             n.sort();
             n
@@ -11350,6 +11988,13 @@ mod lifecycle_tests {
     impl KeyApi for FakeKeys {
         async fn list_keys(&self) -> Result<Vec<KeyInfo>> {
             Ok(self.keys.lock().unwrap().clone())
+        }
+        async fn create_key(&self, name: &str, limit: Option<f64>) -> Result<CreatedKey> {
+            self.calls.lock().unwrap().push(format!("create {name}"));
+            let hash = format!("h-new-{name}");
+            let info = KeyInfo { hash: hash.clone(), name: Some(name.into()), label: None, disabled: false, limit, usage: None };
+            self.keys.lock().unwrap().push(info);
+            Ok(CreatedKey { secret: format!("sk-new-{name}"), hash, name: name.into() })
         }
         async fn delete_key(&self, hash: &str) -> Result<()> {
             self.calls.lock().unwrap().push(format!("delete {hash}"));
@@ -11425,13 +12070,29 @@ mod lifecycle_tests {
         assert_eq!(f.calls(), ["rename r-bravo solo-gpu"]);
         // An absolute name is its own short name.
         assert_eq!(remote.calls(), [name_write("10.0.0.1:22002", "solo-gpu")]);
-        // What the operator is told about both.
-        let report = rename_report(
-            &[("solo-gpu".into(), "no SSH endpoint".into()), ("devtest-echo".into(), "exit 255: refused".into())],
-            &["devtest-echo already has its own OpenRouter key".into()],
+        // What rename hands its summary for both: exactly these pods, with why.
+        let (f, remote) = (fleet(), Arc::new(FakeRemote::new()));
+        remote.script("10.0.0.1:22002", [FakeReply::exit(255, "ssh: connect to host 10.0.0.1 port 22002: Connection refused")]);
+        let pods = f.pods.lock().unwrap().clone();
+        let plan = [
+            PlannedRename { id: "r-charlie".into(), old: "devtest-charlie".into(), new: "solo-gpu".into() },
+            PlannedRename { id: "r-bravo".into(), old: "devtest-bravo".into(), new: "devtest-echo".into() },
+            PlannedRename { id: "r-alpha".into(), old: "devtest-alpha".into(), new: "devtest-delta".into() },
+        ];
+        let done: Vec<&PlannedRename> = plan.iter().collect();
+        let mut missed = rewrite_name_files(remote.clone(), &cfg, "devtest", &done, &pods).await;
+        missed.sort();
+        assert_eq!(
+            missed,
+            [
+                ("devtest-echo".to_string(), "exit 255: ssh: connect to host 10.0.0.1 port 22002: Connection refused".to_string()),
+                ("solo-gpu".to_string(), "no SSH endpoint".to_string()),
+            ]
         );
+        // What the operator is told about them.
+        let report = rename_report(&missed, &["devtest-echo already has its own OpenRouter key".into()]);
         assert!(report[0].contains("MACHINE_NAME env var keeps the old name") && report[0].contains("reimage"), "{report:?}");
-        assert!(report[1].contains("re-run `arena pods setup solo-gpu devtest-echo`") && report[1].contains("no SSH endpoint"), "{report:?}");
+        assert!(report[1].contains("re-run `arena pods setup devtest-echo solo-gpu`") && report[1].contains("no SSH endpoint"), "{report:?}");
         assert_eq!(report[2], "⚠ keys: devtest-echo already has its own OpenRouter key");
         assert_eq!(rename_report(&[], &[]).len(), 1, "just the MACHINE_NAME note");
     }
@@ -11467,6 +12128,105 @@ mod lifecycle_tests {
         assert_eq!(keys.calls(), ["rename h-a devtest-alpha", "rename h-b devtest-bravo"]);
         let px = proxy_file(&dir.0);
         assert!(["devtest-alpha", "devtest-bravo", "devtest-charlie"].iter().all(|n| px.contains(&format!("name={n}"))), "{px}");
+    }
+
+    #[tokio::test]
+    async fn after_a_prefix_change_the_rows_move_into_the_current_cohorts_keys_file() {
+        // The link still points at the OLD cohort's file (keys were minted as arena8). The
+        // renamed rows must land in devtest's file, with the link pointing at it — else the
+        // next `keys gen` (which repoints the link and skips keys that exist by name) would
+        // leave these machines with no deliverable key.
+        let dir = tmpdir("rename-cross");
+        let cfg = cfg(&dir.0);
+        let old_file = dir.0.join("arena8_openrouter_keys.csv");
+        std::fs::write(&old_file, "# OpenRouter API keys — arena iteration: arena8\narena8-alpha,sk-a\narena8-bravo,sk-b\nsolo-gpu,sk-s\narena8-gone,sk-g\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&old_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let link = dir.0.join("openrouter_api_keys.csv");
+        std::os::unix::fs::symlink("arena8_openrouter_keys.csv", &link).unwrap();
+        let f = Fleet::new(vec![
+            pod("a", "arena8-alpha", "runpod", Some(("10.0.0.1", 22001))),
+            pod("b", "arena8-bravo", "runpod", Some(("10.0.0.1", 22002))),
+            pod("s", "solo-gpu", "vast", None),
+        ]);
+        let keys = FakeKeys::with(&[("h-a", "arena8-alpha"), ("h-b", "arena8-bravo")]);
+        let book = KeyBook::new(&link, Some(&keys));
+        // The dry run says where the rows go.
+        let pods = f.pods.lock().unwrap().clone();
+        let plan = vec![
+            PlannedRename { id: "a".into(), old: "arena8-alpha".into(), new: "devtest-alpha".into() },
+            PlannedRename { id: "b".into(), old: "arena8-bravo".into(), new: "devtest-bravo".into() },
+        ];
+        let steps = rename_followup_steps("devtest", &plan, &pods, &book, true).join("\n");
+        assert!(steps.contains("move rows out of the previous cohort's file into") && steps.contains("devtest_openrouter_keys.csv"), "{steps}");
+        assert!(steps.contains("arena8-alpha → devtest-alpha, arena8-bravo → devtest-bravo (carrying along: solo-gpu)"), "{steps}");
+        handle_rename(&f, Arc::new(FakeRemote::new()), &cfg, &book, RenameRequest::FromPrefix("arena8".into()), true, false, true)
+            .await
+            .unwrap();
+        // The current cohort's file: the moved rows + the other live pod's row, seeded header.
+        let new_text = std::fs::read_to_string(dir.0.join("devtest_openrouter_keys.csv")).unwrap();
+        assert!(new_text.starts_with("# OpenRouter API keys — arena iteration: devtest\n"), "{new_text}");
+        let rows = arena_core::apikeys::parse_csv(&new_text);
+        assert_eq!(rows, [("devtest-alpha".into(), "sk-a".into()), ("devtest-bravo".into(), "sk-b".into()), ("solo-gpu".to_string(), "sk-s".to_string())]);
+        // ...which copy-keys now reads through the link; a new file keeps the old one's mode.
+        assert_eq!(std::fs::read_link(&link).unwrap(), PathBuf::from("devtest_openrouter_keys.csv"));
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.0.join("devtest_openrouter_keys.csv")).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // The old file loses only the moved rows (the gone pod's record stays with its cohort).
+        let old_text = std::fs::read_to_string(&old_file).unwrap();
+        let old_rows: Vec<String> = arena_core::apikeys::parse_csv(&old_text).into_iter().map(|(h, _)| h).collect();
+        assert_eq!(old_rows, ["solo-gpu", "arena8-gone"]);
+        assert_eq!(keys.calls(), ["rename h-a devtest-alpha", "rename h-b devtest-bravo"]);
+    }
+
+    #[tokio::test]
+    async fn rename_moves_a_key_named_the_keys_gen_way() {
+        // vast-777 is off the prefix: its key is devtest-vast-777 (as `keys gen` named it).
+        let dir = tmpdir("rename-keyname");
+        let cfg = cfg(&dir.0);
+        let csv = keys_csv(&dir.0, "vast-777,sk-v\n");
+        let keys = FakeKeys::with(&[("h-v", "devtest-vast-777")]);
+        let f = Fleet::new(vec![pod("v-777", "vast-777", "vast", None)]);
+        handle_rename(&f, Arc::new(FakeRemote::new()), &cfg, &KeyBook::new(&csv, Some(&keys)), one("vast-777", "echo"), true, false, true)
+            .await
+            .unwrap();
+        assert_eq!(keys.calls(), ["rename h-v devtest-echo"]);
+        assert!(cohort_csv(&dir.0).contains("devtest-echo,sk-v"));
+    }
+
+    #[test]
+    fn csv_moves_in_place_or_into_the_current_cohort_file() {
+        let src = "# h\na,sk-a\nb,sk-b\nx,sk-x\ngone,sk-g\n";
+        let live = ["A".to_string(), "B".into(), "x".into()];
+        // In place (the link already points at this cohort's file): rows renamed there.
+        let mv = plan_csv_move(src, None, &[("a", "A"), ("b", "x")], &live);
+        assert_eq!(mv.dst.as_deref(), Some("# h\nA,sk-a\nb,sk-b\nx,sk-x\ngone,sk-g\n"));
+        assert_eq!((mv.moved, mv.taken, mv.src), (vec!["a → A".to_string()], vec!["x".to_string()], None));
+        // Cross-cohort: moved into dst (taken out of src), other live rows carried (copied).
+        let mv = plan_csv_move(src, Some("# new\n"), &[("a", "A"), ("b", "B"), ("nope", "N")], &live);
+        assert_eq!(
+            mv,
+            CsvMove {
+                dst: Some("# new\nA,sk-a\nB,sk-b\nx,sk-x\n".into()),
+                src: Some("# h\nx,sk-x\ngone,sk-g\n".into()),
+                moved: vec!["a → A".into(), "b → B".into()],
+                taken: vec![],
+                carried: vec!["x".into()],
+            }
+        );
+        // A new name with a row already (either file): left alone; dst rows never overwritten.
+        let mv = plan_csv_move(src, Some("# new\nA,sk-other\nx,sk-x2\n"), &[("a", "A"), ("b", "B")], &live);
+        assert_eq!(mv.taken, ["A"]);
+        assert_eq!(mv.dst.as_deref(), Some("# new\nA,sk-other\nx,sk-x2\nB,sk-b\n"));
+        assert!(mv.carried.is_empty());
+        // Nothing of ours in the old file: nothing written anywhere (the link stays put).
+        assert_eq!(plan_csv_move(src, Some("# new\n"), &[("q", "Q")], &live), CsvMove::default());
+        assert_eq!(plan_csv_move(src, None, &[("q", "Q")], &live), CsvMove::default());
     }
 
     #[tokio::test]
@@ -11586,6 +12346,89 @@ mod lifecycle_tests {
         assert!(f.calls().is_empty());
     }
 
+    #[tokio::test]
+    async fn a_name_another_pod_still_holds_keeps_its_key() {
+        // A double create left two pods named devtest-alpha. Removing the extra one by id
+        // (as the ambiguity error advises) must not revoke the key the survivor uses.
+        let dir = tmpdir("terminate-twin");
+        let cfg = cfg(&dir.0);
+        let csv = keys_csv(&dir.0, "devtest-alpha,sk-a\n");
+        let keys = FakeKeys::with(&[("h-a", "devtest-alpha")]);
+        let book = KeyBook::new(&csv, Some(&keys));
+        let twins = || {
+            let f = fleet();
+            f.pods.lock().unwrap().push(pod("r-alpha-dup", "devtest-alpha", "runpod", Some(("10.0.0.1", 22009))));
+            f
+        };
+        let f = twins();
+        handle_terminate(&f, &cfg, &book, Some("r-alpha-dup"), true, true, true, true).await.unwrap(); // dry run
+        assert!(f.calls().is_empty() && keys.calls().is_empty());
+        handle_terminate(&f, &cfg, &book, Some("r-alpha-dup"), true, true, false, true).await.unwrap();
+        assert_eq!(f.calls(), ["terminate r-alpha-dup"]);
+        assert!(keys.calls().is_empty(), "the survivor's key is kept: {:?}", keys.calls());
+        assert!(cohort_csv(&dir.0).contains("devtest-alpha,sk-a"), "and so is its row");
+        // --all with both twins going: the shared key is revoked ONCE (not a second delete
+        // of a hash already gone, which the real API would fail).
+        let f = twins();
+        handle_terminate(&f, &cfg, &book, None, true, true, false, true).await.unwrap();
+        assert_eq!(keys.calls(), ["delete h-a"]);
+        assert!(!cohort_csv(&dir.0).contains("devtest-alpha"));
+    }
+
+    #[tokio::test]
+    async fn revoke_finds_the_key_by_the_name_keys_gen_gave_it() {
+        // Vast's fallback name `vast-777` is off the prefix: `keys gen` named its key
+        // devtest-vast-777 (key_name), with the CSV row under the pod name.
+        let dir = tmpdir("terminate-keyname");
+        let cfg = cfg(&dir.0);
+        let csv = keys_csv(&dir.0, "vast-777,sk-v\ndevtest-bravo,sk-b\n");
+        let keys = FakeKeys::with(&[("h-v", "devtest-vast-777"), ("h-b", "devtest-bravo")]);
+        let book = KeyBook::new(&csv, Some(&keys));
+        let f = Fleet::new(vec![pod("v-777", "vast-777", "vast", None)]);
+        handle_terminate(&f, &cfg, &book, Some("vast-777"), true, true, false, true).await.unwrap();
+        assert_eq!(keys.calls(), ["delete h-v"]);
+        assert_eq!(cohort_csv(&dir.0), "# OpenRouter API keys — arena iteration: devtest\ndevtest-bravo,sk-b\n");
+    }
+
+    #[tokio::test]
+    async fn a_csv_row_whose_key_is_already_gone_is_dropped_quietly() {
+        // `keys revoke` leaves the CSV as-is; terminating the pod later finds no key under
+        // its name (the full listing) and drops the dead row — not a failure.
+        let dir = tmpdir("terminate-row-only");
+        let cfg = cfg(&dir.0);
+        let csv = keys_csv(&dir.0, "devtest-alpha,sk-dead\ndevtest-bravo,sk-b\n");
+        let keys = FakeKeys::with(&[("h-b", "devtest-bravo")]);
+        let book = KeyBook::new(&csv, Some(&keys));
+        let f = fleet();
+        handle_terminate(&f, &cfg, &book, Some("alpha"), true, true, false, true).await.unwrap();
+        assert!(keys.calls().is_empty());
+        assert_eq!(cohort_csv(&dir.0), "# OpenRouter API keys — arena iteration: devtest\ndevtest-bravo,sk-b\n");
+    }
+
+    #[tokio::test]
+    async fn a_csv_that_cant_be_rewritten_is_not_reported_as_a_failed_revoke() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmpdir("terminate-csv-ro");
+        let cfg = cfg(&dir.0);
+        let csv = keys_csv(&dir.0, "devtest-alpha,sk-a\n");
+        let keys = FakeKeys::with(&[("h-a", "devtest-alpha")]);
+        let book = KeyBook::new(&csv, Some(&keys));
+        // The keys file and its directory read-only: the revoke works, the row can't go.
+        let file = dir.0.join("devtest_openrouter_keys.csv");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
+        std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let f = fleet();
+        let r = handle_terminate(&f, &cfg, &book, Some("alpha"), true, true, false, true).await;
+        std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let e = r.unwrap_err().to_string();
+        assert_eq!(keys.calls(), ["delete h-a"]);
+        assert!(e.contains("devtest-alpha ARE revoked (or were already gone), but their rows couldn't be removed from"), "{e}");
+        assert!(e.contains("delete those rows by hand"), "{e}");
+        assert!(!e.contains("retry with `arena keys revoke"), "keys revoke can't fix a local file: {e}");
+        assert_eq!(f.calls(), ["terminate r-alpha"]);
+    }
+
     const FAST: SettleWait = SettleWait { stable_secs: 0, timeout_secs: 5, poll: Duration::ZERO };
 
     fn restart_opts(wipe_ok: bool) -> RestartOpts {
@@ -11623,28 +12466,44 @@ mod lifecycle_tests {
         let keys_dir = dir.0.display().to_string();
         handle_restart(&f, remote.clone(), &cfg, "alpha", restart_opts(true), FAST, &keys_dir).await.unwrap();
         assert_eq!(f.calls(), ["restart r-alpha"]);
-        // Setup ran again on alpha (and only alpha): deploy key, then the config command —
-        // which writes ~/.name again.
+        // Setup ran again on alpha (and only alpha) — on the endpoint it came back on (the
+        // fake moves it on restart), so setup ran AFTER the restart, not before: deploy key,
+        // then the config command, which writes ~/.name again.
         let calls = remote.calls();
-        assert!(calls.iter().all(|c| c.host() == "10.0.0.1:22001"), "{calls:?}");
+        assert!(!calls.is_empty() && calls.iter().all(|c| c.host() == "10.0.0.1:23001"), "{calls:?}");
         assert!(matches!(&calls[0], RemoteCall::Copy { remote, .. } if remote == "/root/.ssh/id_ed25519"), "{calls:?}");
         assert!(matches!(&calls[1], RemoteCall::Exec { cmd, .. } if cmd.contains(&name_file_command("alpha"))), "{calls:?}");
-        // …and the proxy was synced afterwards.
-        assert!(proxy_file(&dir.0).contains("name=devtest-alpha"));
+        // …and the proxy was synced afterwards, to the new endpoint.
+        let px = proxy_file(&dir.0);
+        assert!(px.contains("name=devtest-alpha") && px.contains("23001") && !px.contains("22001"), "{px}");
     }
 
     #[tokio::test]
-    async fn restart_needs_no_wipe_ok_when_something_survives() {
+    async fn restart_needs_no_wipe_ok_only_when_the_work_survives() {
         let dir = tmpdir("restart-volume");
         let cfg = cfg(&dir.0);
         let keys_dir = dir.0.display().to_string();
-        // A pod with a volume: its /workspace survives, so no --wipe-ok — still re-set-up.
+        // A pod WITH a volume but the repo in its default place (/root/r): the restart still
+        // wipes the participants' work — refused without --wipe-ok, even with --yes.
         let mut f = fleet();
         f.volumes = vec![("r-bravo", 50)];
         let remote = Arc::new(FakeRemote::new());
-        handle_restart(&f, remote.clone(), &cfg, "bravo", restart_opts(false), FAST, &keys_dir).await.unwrap();
+        let e = handle_restart(&f, remote.clone(), &cfg, "bravo", restart_opts(false), FAST, &keys_dir)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("refusing to restart devtest-bravo without --wipe-ok") && e.contains("the repo at /root/r"), "{e}");
+        assert!(f.calls().is_empty() && remote.calls().is_empty());
+        // The repo on the volume (BACKUP_REPO_PATH under /workspace): it survives, so no
+        // --wipe-ok — still re-set-up afterwards.
+        let on_volume = Config::parse(&format!("{}BACKUP_REPO_PATH=/workspace/r\n", cfg_text(&dir.0)));
+        handle_restart(&f, remote.clone(), &on_volume, "bravo", restart_opts(false), FAST, &keys_dir).await.unwrap();
         assert_eq!(f.calls(), ["restart r-bravo"]);
-        assert!(!remote.calls_to("10.0.0.1:22002").is_empty(), "setup ran");
+        assert!(!remote.calls_to("10.0.0.1:23002").is_empty(), "setup ran");
+        // ...but not on a volume-less pod, wherever the repo is.
+        let (g, remote) = (fleet(), Arc::new(FakeRemote::new()));
+        assert!(handle_restart(&g, remote.clone(), &on_volume, "bravo", restart_opts(false), FAST, &keys_dir).await.is_err());
+        assert!(g.calls().is_empty());
         // A Hetzner VM keeps its disk: not refused, nothing re-provisioned.
         let (f, remote) = (fleet(), Arc::new(FakeRemote::new()));
         handle_restart(&f, remote.clone(), &cfg, "delta", restart_opts(false), FAST, &keys_dir).await.unwrap();
@@ -11663,7 +12522,8 @@ mod lifecycle_tests {
         let dir = tmpdir("restart-setup-fails");
         let cfg = cfg(&dir.0);
         let (f, remote) = (fleet(), Arc::new(FakeRemote::new()));
-        remote.script("10.0.0.1:22001", [FakeReply::ok(), FakeReply::exit(1, "fatal: not a git repository")]);
+        // (on the endpoint the restart moved it to)
+        remote.script("10.0.0.1:23001", [FakeReply::ok(), FakeReply::exit(1, "fatal: not a git repository")]);
         let e = handle_restart(&f, remote.clone(), &cfg, "alpha", restart_opts(true), FAST, &dir.0.display().to_string())
             .await
             .unwrap_err()
@@ -11695,25 +12555,75 @@ mod lifecycle_tests {
 
     #[test]
     fn disk_fate_text_and_gate() {
-        let cases: &[(DiskFate, bool, &[&str])] = &[
-            (DiskFate::Kept, false, &["disk kept"]),
-            (DiskFate::Wiped { volume_gb: Some(50) }, false, &["WIPES the container disk", "everything outside /workspace is lost", "50 GB volume at /workspace survives"]),
-            (DiskFate::Wiped { volume_gb: Some(0) }, true, &["WIPES the container disk", "NO persistent volume", "~/.name"]),
-            (DiskFate::Wiped { volume_gb: None }, true, &["couldn't read whether it has a volume", "assume nothing survives"]),
+        // The gate follows the WORK (the repo), not just "is there a volume".
+        const ROOT: &str = "/root/ARENA_materials";
+        const VOL: &str = "/workspace/ARENA_materials";
+        let v50 = DiskFate::Wiped { volume_gb: Some(50) };
+        let cases: &[(DiskFate, &str, bool, &[&str])] = &[
+            (DiskFate::Kept, ROOT, false, &["disk kept"]),
+            // a volume, but the repo in the default place: lost — gated
+            (v50, ROOT, true, &["WIPES the container disk", "the ARENA repo at /root/ARENA_materials (participants' work) is NOT on the volume", "only the 50 GB volume at /workspace survives"]),
+            // the repo on the volume: survives — not gated
+            (v50, VOL, false, &["everything outside /workspace is lost", "the repo at /workspace/ARENA_materials is on the 50 GB volume at /workspace and survives"]),
+            (DiskFate::Wiped { volume_gb: Some(0) }, VOL, true, &["WIPES the container disk", "NO persistent volume", "~/.name", "repo at /workspace/ARENA_materials"]),
+            (DiskFate::Wiped { volume_gb: None }, ROOT, true, &["couldn't read whether it has a volume", "assume nothing survives"]),
+            (DiskFate::Wiped { volume_gb: None }, VOL, true, &["assume nothing survives"]),
         ];
-        for (fate, gated, says) in cases {
-            assert_eq!(fate.needs_wipe_ok(), *gated, "{fate:?}");
-            let text = fate.describe(DiskOp::Restart);
+        for (fate, repo, gated, says) in cases {
+            assert_eq!(fate.needs_wipe_ok(repo), *gated, "{fate:?} {repo}");
+            let text = fate.describe(DiskOp::Restart, repo);
             for s in *says {
-                assert!(text.contains(s), "{fate:?}: {text}");
+                assert!(text.contains(s), "{fate:?} {repo}: {text}");
             }
         }
-        assert!(DiskFate::Wiped { volume_gb: Some(0) }.describe(DiskOp::Stop).contains("starts again as a fresh image"));
-        assert!(DiskFate::Kept.describe(DiskOp::Stop).contains("powered off"));
-        let r = wipe_refusal(DiskOp::Restart, &["devtest-a", "devtest-b"]);
+        assert!(DiskFate::Wiped { volume_gb: Some(0) }.describe(DiskOp::Stop, ROOT).contains("starts again as a fresh image"));
+        assert!(DiskFate::Kept.describe(DiskOp::Stop, ROOT).contains("powered off"));
+        let r = wipe_refusal(DiskOp::Restart, &["devtest-a", "devtest-b"], ROOT);
         assert!(r.starts_with("refusing to restart devtest-a, devtest-b without --wipe-ok"), "{r}");
+        assert!(r.contains("the repo at /root/ARENA_materials") && r.contains("outside /workspace"), "{r}");
         assert!(r.contains("`arena pods backup devtest-a devtest-b`") && r.contains("--yes alone isn't enough"), "{r}");
-        assert!(wipe_refusal(DiskOp::Stop, &["x"]).contains("terminate instead"));
+        assert!(wipe_refusal(DiskOp::Stop, &["x"], ROOT).contains("terminate instead"));
+    }
+
+    #[test]
+    fn only_a_repo_at_or_under_the_mount_is_on_the_volume() {
+        for (repo, on) in [
+            ("/workspace", true),
+            ("/workspace/ARENA", true),
+            ("/workspace/ARENA/", true),
+            ("/root/ARENA_materials", false),
+            ("/workspacex/ARENA", false),
+            ("workspace/ARENA", false),
+            ("~/ARENA", false),
+            ("/workspace/../root/ARENA", false),
+            ("", false),
+        ] {
+            assert_eq!(repo_on_volume(repo), on, "{repo}");
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_follows_the_same_work_survives_rule() {
+        let dir = tmpdir("stop-volume");
+        let mut f = fleet();
+        f.volumes = vec![("r-bravo", 50)];
+        // bravo has a volume, but the repo (/root/r) isn't on it: refused without --wipe-ok.
+        let e = handle_pods(pods_cmd(&["stop", "bravo"]), &f, Arc::new(FakeRemote::new()), &cfg(&dir.0), true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("refusing to stop devtest-bravo without --wipe-ok") && e.contains("the repo at /root/r"), "{e}");
+        assert!(f.calls().is_empty());
+        // With the repo on the volume it goes ahead (and a Hetzner VM always does).
+        let on_volume = Config::parse(&format!("{}BACKUP_REPO_PATH=/workspace/r\n", cfg_text(&dir.0)));
+        handle_pods(pods_cmd(&["stop", "bravo", "delta"]), &f, Arc::new(FakeRemote::new()), &on_volume, true).await.unwrap();
+        assert_eq!(f.calls(), ["stop r-bravo", "stop h-delta"]);
+        // The prompt / dry-run line per pod names it and what happens to its disk.
+        let pods = f.pods.lock().unwrap().clone();
+        let lines = stop_lines(&[&pods[1], &pods[3]], &[DiskFate::Wiped { volume_gb: Some(50) }, DiskFate::Kept], "/root/r");
+        assert!(lines[0].starts_with("  devtest-bravo (id=r-bravo, runpod): ⚠ discards the container disk"), "{lines:?}");
+        assert!(lines[0].contains("the ARENA repo at /root/r (participants' work) is NOT on the volume"), "{lines:?}");
+        assert_eq!(lines[1], "  devtest-delta (id=h-delta, hetzner): disk kept — powered off, files stay");
     }
 
     fn pods_cmd(argv: &[&str]) -> PodCmd {

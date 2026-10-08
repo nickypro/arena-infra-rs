@@ -69,17 +69,20 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     outside a `/workspace` volume, `~/.name`, setup's git remote and keys are gone; Vast's
     stop+start is treated the same, unverified; a Hetzner hard reset keeps the VM disk). The
     prompt says what's lost and what survives (the volume size comes from the pod's spec);
-    a pod with **no volume, or none confirmed, is refused unless `--wipe-ok`** (even with
-    `--yes`). Afterwards it waits for the endpoint to settle, **re-runs `setup`** on the pod
+    unless the ARENA repo (`BACKUP_REPO_PATH`, default `/root/<ARENA_REPO_NAME>` — **not** on
+    the volume) sits on a confirmed `/workspace` volume, the restart is **refused unless
+    `--wipe-ok`** (even with `--yes`): a volume elsewhere doesn't save the participants' work. Afterwards it waits for the endpoint to settle, **re-runs `setup`** on the pod
     (`--no-setup` skips) and syncs the proxy (`--skip-proxy`), so it comes back usable; if
     that setup fails the error says to run `pods setup <name>`, not another restart. `stop`
     gets the same gate (`--wipe-ok`): a stopped RunPod pod keeps no data. `terminate
     --all` tears down the **whole fleet** (confirms first; `--dry-run` lists every
     pod without touching them) — for end-of-program teardown (`terminate <name> --all` is
     refused). `terminate … --revoke-key` also deletes each terminated machine's OpenRouter
-    key(s) (found by name; needs `OPENROUTER_PROVISIONING_KEY`) and drops its row from
-    `keys/openrouter_api_keys.csv` — only for pods that actually terminated; a failed revoke
-    keeps the row, is named, and makes the exit non-zero without stopping any terminate.
+    key(s) (found by the name `keys gen` gave it, over the full paginated key listing; needs
+    `OPENROUTER_PROVISIONING_KEY`) and drops its row from `keys/openrouter_api_keys.csv` —
+    only for pods that actually terminated, and never for a name another pod still holds (a
+    double create's twin removed by id keeps the survivor's key); a failed revoke keeps the
+    row, is named, and makes the exit non-zero without stopping any terminate.
     `stop apple..mayor` / `stop --all --exclude bloom` stops many at once (running
     pods only; needs targets or `--all`); `kill` is the stop→wait-for-
     EXITED→delete flow (`--timeout`; one target or `--all`).
@@ -87,7 +90,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     restart) and then brings along what's keyed by the name: rewrites `~/.name` over SSH
     (setup's exact `export MACHINE_NAME='<short>'` line; an unreachable pod is reported with
     a `pods setup <name>` hint, never fatal), moves the machine's row in the keys CSV (the
-    per-cohort file the symlink points at) and renames its key on OpenRouter in place
+    per-cohort file the symlink points at — or, after a prefix change, *into* the current
+    prefix's file, repointing the symlink and carrying the other live pods' rows, so the next
+    `keys gen` doesn't strand them) and renames its key on OpenRouter in place
     (`PATCH /keys/{hash}` `name`; skipped quietly with no CSV / no provisioning key; a new
     name that already has its own row or key is left alone and warned about), then syncs
     the proxy. The pod's `MACHINE_NAME` env var keeps the old name (env only changes with a
@@ -208,7 +213,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     budget per pod.
   - `pods run [-t <targets>] [--timeout <secs>] <cmd>` / `pods test [targets]` — run an
     arbitrary command on every (selected) pod (concurrent, confirms first naming the pods;
-    each pod gets `--timeout`, default 1800s = 30 min — flags go *before* the command; on a timeout the local ssh is killed, and the remote
+    each pod gets `--timeout`, default 1800s = 30 min — flags go *before* the command: a bare
+    `-t`/`--exclude`/`--on`/`--gpus`/`--dry-run` after it is refused rather than run on every
+    pod, so quote a command that takes one, `run 'tmux kill-session -t lab'`; on a timeout the local ssh is killed, and the remote
     command dies at its next write to the closed connection) / the read-only
     torch-version health check (90s per pod).
   - `pods test --deep [targets] [--json] [-v]` — the **is-this-pod-usable** check (read-only),
@@ -270,8 +277,10 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `--all` = every current pod). `rotate <targets|--all>` deletes + re-mints (leak
     recovery), `revoke` deletes only, `list` shows names/limits/usage for **this
     iteration's** `<prefix>-*` keys (noting how many others were hidden; `--all` shows
-    every key on the account). Keys are found by
-    name, so no local hash bookkeeping. `keys which` shows the local keys file. (`copy-keys`
+    every key on the account, disabled ones included — the listing walks every page). Keys
+    are found by name, so no local hash bookkeeping; a machine that left the list but still
+    has a key (or a CSV row) can still be targeted by name. Dry-runs show each key name and
+    whether it exists. `keys which` shows the local keys file. (`copy-keys`
     is the *distributor*; `keys` is the *generator*.)
   - `gpus` — list the GPU types for `--gpu`: RunPod's **full live catalog** (via GraphQL;
     on `RUNPOD_API=v2` via `GET /v2/catalog/gpus`, STOCK then for the configured cloud,
@@ -410,7 +419,9 @@ Every fleet command picks pods with **one selector syntax** (`arena_core::select
 - **names** — bare `apple`, full `arena8-apple`, absolute `@james-gpu` / `james-gpu` — or
   a provider **id**; several at once (`apple bloom`, or `apple,bloom`);
 - **ranges** `apple..mayor` — inclusive, in `MACHINE_NAME_LIST` order (the proxy-port
-  order); both ends must be list names, and a reversed range is an error;
+  order); both ends must be list names, and a reversed range is an error. Absolute `@`
+  entries *inside* a range are left out (personal boxes, not the cohort) — name one, or
+  make it an endpoint, to include it;
 - **`all`** / `--all` — every pod;
 - filters: `--exclude <targets>` (same syntax, ranges too; repeatable), `--gpus N` (exactly
   N GPUs by the provider's count — an unknown count never matches), `--on
@@ -419,7 +430,8 @@ Every fleet command picks pods with **one selector syntax** (`arena_core::select
 **Typos fail loudly**: a target *or* `--exclude` that matches no pod is an error naming it
 and the closest pod names, and a narrowed selection (names/filters) that ends up empty is an
 error saying how each step narrowed it — nothing is touched. Targets + `--all` together is
-refused. Dry-runs and prompts list the resolved pods. `--include X` is still accepted as an
+refused, and so is an empty argument (`""`, `" "`, `","` — e.g. an unset `$POD` in a
+script), which never means "the whole fleet". Dry-runs and prompts list the resolved pods. `--include X` is still accepted as an
 old spelling of a target (`stop --all --include X` keeps meaning "only X").
 
 | Command | Targets | Nothing given | Execution |

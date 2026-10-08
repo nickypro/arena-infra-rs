@@ -9,13 +9,18 @@
 //!   `@james-gpu` / `james-gpu` (an `@` list entry, see [`crate::naming`]), or a provider id;
 //! - **ranges** `apple..mayor`: every name from `apple` to `mayor` inclusive, in
 //!   `MACHINE_NAME_LIST` order (the order that also fixes the proxy ports). Both ends must be
-//!   list entries, and a reversed range is an error rather than an empty one;
+//!   list entries, and a reversed range is an error rather than an empty one. Absolute
+//!   (`@name`) entries *inside* a range are left out — they're personal/dev boxes that share
+//!   the list without joining the cohort, so `stop apple..zebra` must not sweep one in; one
+//!   is in a range only as an endpoint (or name it on its own);
 //! - **`all`** (or `--all`): every pod;
 //! - **filters**: `--exclude <token>` (same syntax, ranges too), `--gpus N` (exactly N GPUs
 //!   by the provider's count — an unknown count never matches, so `--gpus 1` can't sweep in
 //!   a pod whose size we don't know), `--on <provider>`.
 //!
-//! A comma also separates tokens (`apple,bloom`), so one `--exclude` can name several.
+//! A comma also separates tokens (`apple,bloom`), so one `--exclude` can name several. An
+//! argument with nothing in it (`""`, `" "`, `","`) is an error, not "no targets": a script's
+//! unset `$POD` must not turn `setup --force "$POD"` into a hard reset of the whole fleet.
 //!
 //! **Typos fail loudly.** A token — to include *or* to exclude — that matches no pod is an
 //! error naming it plus the closest existing names: a misspelt target would quietly act on
@@ -27,7 +32,7 @@
 
 use std::collections::HashSet;
 
-use crate::naming::{canonical_name, qualify, ABSOLUTE_MARKER};
+use crate::naming::{canonical_name, is_absolute, qualify, ABSOLUTE_MARKER};
 use crate::pod::Pod;
 
 /// The providers `--on` accepts (the `provider` tag each backend puts on its pods).
@@ -187,7 +192,11 @@ fn parse_token(piece: &str, naming: &Naming) -> Result<Token, String> {
             "`{piece}` is reversed: {to} comes before {from} in MACHINE_NAME_LIST — did you mean {to}..{from}?"
         ));
     }
-    let names = naming.list[a..=b].iter().map(|e| qualify(naming.prefix, e)).collect();
+    // Interior absolute entries are skipped (see the module doc); the endpoints never are.
+    let names = (a..=b)
+        .filter(|&i| i == a || i == b || !is_absolute(&naming.list[i]))
+        .map(|i| qualify(naming.prefix, &naming.list[i]))
+        .collect();
     Ok(Token::Range { from: from.to_string(), to: to.to_string(), names })
 }
 
@@ -207,20 +216,30 @@ impl Selector {
     /// Validate what was typed: token syntax, ranges against the list, `--on`, and the
     /// combinations that can't mean anything sensible. Every problem is reported at once.
     pub fn parse(args: &SelectArgs, naming: &Naming) -> Result<Selector, SelectError> {
-        fn tokens(raw: &[String], naming: &Naming, problems: &mut Vec<String>) -> Vec<Token> {
+        fn tokens(raw: &[String], flag: &str, naming: &Naming, problems: &mut Vec<String>) -> Vec<Token> {
             let mut out = Vec::new();
-            for piece in raw.iter().flat_map(|r| pieces(r)) {
-                match parse_token(piece, naming) {
-                    Ok(t) if !out.contains(&t) => out.push(t),
-                    Ok(_) => {} // a repeated token adds nothing
-                    Err(e) => problems.push(e),
+            for r in raw {
+                // An argument that holds no token at all is a mistake (an unset variable, a
+                // stray comma) — dropping it would widen the command to the whole fleet.
+                if pieces(r).next().is_none() {
+                    problems.push(format!(
+                        "{flag}an empty target ({r:?}) — name a pod, or leave the argument out{}",
+                        if flag.is_empty() { " for the whole fleet" } else { "" }
+                    ));
+                }
+                for piece in pieces(r) {
+                    match parse_token(piece, naming) {
+                        Ok(t) if !out.contains(&t) => out.push(t),
+                        Ok(_) => {} // a repeated token adds nothing
+                        Err(e) => problems.push(e),
+                    }
                 }
             }
             out
         }
         let mut problems = Vec::new();
-        let mut include = tokens(&args.targets, naming, &mut problems);
-        let exclude = tokens(&args.exclude, naming, &mut problems);
+        let mut include = tokens(&args.targets, "", naming, &mut problems);
+        let exclude = tokens(&args.exclude, "--exclude: ", naming, &mut problems);
 
         let all_token = include.contains(&Token::All);
         include.retain(|t| *t != Token::All);
@@ -557,10 +576,13 @@ mod tests {
         let cases: &[(&[&str], &[&str])] = &[
             // autumn has no pod: a range may span spare names
             (&["apple..bloom"], &["arena8-apple", "arena8-bloom"]),
-            // an absolute name inside the range, and as an endpoint (with or without `@`)
-            (&["bloom..cloud"], &["arena8-bloom", "james-gpu", "arena8-cloud"]),
+            // an absolute name INSIDE a range is left out (a personal box, not the cohort)...
+            (&["bloom..cloud"], &["arena8-bloom", "arena8-cloud"]),
+            (&["apple..zebra"], &["arena8-apple", "arena8-bloom", "arena8-cloud", "arena8-mayor", "arena8-zebra"]),
+            // ...but is in it as an endpoint (with or without `@`), or named on its own
             (&["james-gpu..mayor"], &["james-gpu", "arena8-cloud", "arena8-mayor"]),
             (&["@james-gpu..cloud"], &["james-gpu", "arena8-cloud"]),
+            (&["bloom..cloud", "james-gpu"], &["arena8-bloom", "james-gpu", "arena8-cloud"]),
             // full-name endpoints; a one-name range
             (&["arena8-cloud..arena8-mayor"], &["arena8-cloud", "arena8-mayor"]),
             (&["mayor..mayor"], &["arena8-mayor"]),
@@ -607,10 +629,11 @@ mod tests {
     #[test]
     fn exclude_takes_the_same_tokens_including_ranges() {
         let cases: &[(SelectArgs, &[&str])] = &[
-            (SelectArgs { all: true, exclude: vec!["apple..cloud".into()], ..Default::default() }, &["arena8-mayor", "arena8-zebra", "arena8-apple-old"]),
+            // (james-gpu sits inside apple..cloud but isn't part of the range: still selected)
+            (SelectArgs { all: true, exclude: vec!["apple..cloud".into()], ..Default::default() }, &["james-gpu", "arena8-mayor", "arena8-zebra", "arena8-apple-old"]),
             (SelectArgs { exclude: vec!["james-gpu,id-arena8-zebra".into(), "arena8-apple-old".into()], ..args(&["all"]) }, &["arena8-apple", "arena8-bloom", "arena8-cloud", "arena8-mayor"]),
             // exclude wins over include
-            (SelectArgs { exclude: vec!["bloom".into()], ..args(&["apple..cloud"]) }, &["arena8-apple", "james-gpu", "arena8-cloud"]),
+            (SelectArgs { exclude: vec!["bloom".into()], ..args(&["apple..cloud"]) }, &["arena8-apple", "arena8-cloud"]),
         ];
         for (a, want) in cases {
             assert_eq!(ok(a), *want, "{a:?}");
@@ -646,16 +669,41 @@ mod tests {
         assert!(e.contains("some targets matched no pod"), "{e}");
         assert!(e.contains("`nope`: no pod has that name or id\n"), "{e}");
         assert!(e.contains("--exclude `arena8-zebrra`: no pod has that name or id — did you mean arena8-zebra?"), "{e}");
-        // Several near names, closest first; nothing suggested for something far off.
+        // One near name; nothing suggested for something far off.
         let e = err(&args(&["aple"]));
         assert!(e.contains("did you mean arena8-apple?"), "{e}");
         assert!(!err(&args(&["xyzzy"])).contains("did you mean"));
+        // Several near names: closest first (then by name), at most three.
+        let l = list();
+        let naming = Naming { prefix: "arena8", list: &l };
+        let near = ["arena8-aloud", "arena8-cloudyyy", "arena8-clouds", "arena8-cloud", "arena8-zebra"]
+            .map(|n| pod(n, "runpod", None));
+        let e = Selector::parse(&args(&["cloudy"]), &naming).unwrap().resolve(&naming, &near).unwrap_err().0;
+        // cloud / clouds are 1 edit away, aloud / cloudyyy 2 (aloud first by name), zebra far.
+        assert!(e.contains("`cloudy`: no pod has that name or id — did you mean arena8-cloud or arena8-clouds or arena8-aloud?"), "{e}");
         // A list name with no pod right now is reported as such (not a typo).
         let e = err(&args(&["autumn"]));
         assert!(e.contains("`autumn`: no pod named arena8-autumn right now (it is a MACHINE_NAME_LIST name)"), "{e}");
         // A range with no pod in it.
         let e = err(&SelectArgs { exclude: vec!["autumn..autumn".into()], all: true, ..Default::default() });
         assert!(e.contains("--exclude `autumn..autumn`: no pod in that range (1 name: arena8-autumn … arena8-autumn)"), "{e}");
+    }
+
+    #[test]
+    fn an_empty_argument_is_an_error_not_the_whole_fleet() {
+        // An unset `$POD`, a stray comma or a blank must never read as "no targets" (= every
+        // pod for run/setup/…): each is refused, in targets and --exclude alike.
+        for raw in ["", " ", ",", " , ", "\u{a0}", "\t"] {
+            let e = err(&args(&[raw]));
+            assert!(e.starts_with("an empty target (") && e.contains("leave the argument out for the whole fleet"), "{raw:?}: {e}");
+            let e = err(&SelectArgs { exclude: vec![raw.into()], all: true, ..Default::default() });
+            assert!(e.starts_with("--exclude: an empty target ("), "{raw:?}: {e}");
+            // ...even next to a real target.
+            assert!(err(&args(&["apple", raw])).contains("an empty target"), "{raw:?}");
+        }
+        assert_eq!(err(&args(&[""])), "an empty target (\"\") — name a pod, or leave the argument out for the whole fleet");
+        // A trailing comma inside a real argument is just a separator.
+        assert_eq!(ok(&args(&["apple,"])), ["arena8-apple"]);
     }
 
     #[test]

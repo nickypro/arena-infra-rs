@@ -25,16 +25,23 @@ pub struct BackupConfig {
     pub git_ssh_key: Option<String>,
 }
 
+/// Where the ARENA checkout — the participants' work — lives on a pod: config
+/// `BACKUP_REPO_PATH`, else `/root/<ARENA_REPO_NAME>` (default `ARENA_materials`), matching
+/// the legacy layout. Note the default is on the container disk, *not* a `/workspace`
+/// volume — which is why a restart/stop gate can't take "the pod has a volume" to mean
+/// "the work survives".
+pub fn repo_path(cfg: &Config) -> String {
+    cfg.get("BACKUP_REPO_PATH").map(String::from).unwrap_or_else(|| {
+        let name = cfg.get("ARENA_REPO_NAME").unwrap_or("ARENA_materials");
+        format!("/root/{name}")
+    })
+}
+
 impl BackupConfig {
     /// Build from config plus the already-computed iteration `week`/`day`.
     pub fn from_config(cfg: &Config, week: u32, day: u32) -> Self {
-        // Default the repo path to /root/<ARENA_REPO_NAME>, matching the legacy layout.
-        let repo_path = cfg.get("BACKUP_REPO_PATH").map(String::from).unwrap_or_else(|| {
-            let name = cfg.get("ARENA_REPO_NAME").unwrap_or("ARENA_materials");
-            format!("/root/{name}")
-        });
         Self {
-            repo_path,
+            repo_path: repo_path(cfg),
             prefix: cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena").to_string(),
             week,
             day,
@@ -190,6 +197,18 @@ mod tests {
             week: 0,
             day: 1,
             git_ssh_key: Some("/root/.ssh/id_ed25519".into()),
+        }
+    }
+
+    #[test]
+    fn repo_path_is_the_config_path_else_root_repo_name() {
+        let cases = [
+            ("BACKUP_REPO_PATH=/workspace/ARENA\nARENA_REPO_NAME=r\n", "/workspace/ARENA"),
+            ("ARENA_REPO_NAME=r\n", "/root/r"),
+            ("", "/root/ARENA_materials"),
+        ];
+        for (text, want) in cases {
+            assert_eq!(repo_path(&Config::parse(text)), want, "{text:?}");
         }
     }
 
