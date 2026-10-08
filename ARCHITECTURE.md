@@ -96,7 +96,7 @@ flowchart TD
 | `provider::runpod` / `runpod_v2` | RunPod REST v1 (which RunPod retires on 2026-11-15) and REST v2 (`RUNPOD_API=v2`: paginated listing, real lifecycle statuses, explicit `cloud`, account SSH keys merged into `PUBLIC_KEY`). Rename, maintenance windows, the GPU catalog and network volumes use GraphQL (v2 also has a REST catalog and volume list) | builders/parsers pure |
 | `provider::vast`, `provider::hetzner` | Vast rents the cheapest matching *offer* (name carried as the instance label — its offer search still sends the flat query body Vast now rejects, see FEATURE_MAP); Hetzner creates CPU VMs sized by `HETZNER_*` | parsers pure |
 | `http`, `retry` | every response's **status is read before its body is parsed**, so a 401 with an HTML body is classified `Auth`, a 429/5xx transient, a capacity message `Capacity`; `retry` backs off on transient errors only | yes |
-| `remote` | the `Remote` trait (`exec`, `copy`, `copy_recursive`, each with a timeout): `SshRemote` stops a timed-out ssh/scp with SIGTERM then SIGKILL; `FakeRemote` (feature `test-util`) scripts replies, delays and failures per host | trait + I/O |
+| `remote` | the `Remote` trait (`exec`, `copy`, `copy_recursive`, each with a timeout): `SshRemote` stops a timed-out ssh/scp with SIGTERM then SIGKILL before returning the timeout (`run_local`: the same for rsync); `FakeRemote` (feature `test-util`) scripts replies, delays and failures per host | trait + I/O |
 | `selector` | one target syntax for every fleet command: bare/full/`@` names, ids, `a..b` ranges in list order, `all`, `--exclude`, `--gpus N`, `--on`; typos and empty selections are errors | yes |
 | `placement` | `--gpu A,B --cloud x,y --max-price P --order`: expand → price (`PriceBook`) → cap → order (`plan_options`, shared by `offers`, dry-runs and the prompt); `place()` fills names one create at a time, blocking an option for the round on capacity | planning pure; `place` generic over `&dyn Provider` |
 | `pipeline` | the pure half of `pods up`: stages, verdicts, `replacement_order`, `on_failed_host`, the summary table | yes |
@@ -163,8 +163,10 @@ flowchart TD
   pull`, `pods backup`'s file backup (every tick under `cron install --pull`) and the
   replace/migrate via-local copy — get rsync's `--timeout` (I/O silence) plus a wall-clock
   budget (`BACKUP_TIMEOUT_SECS` / 2 h per leg) through `remote::run_local`, which stops the
-  child the same SIGTERM-then-SIGKILL way; every cron line also runs under `flock -n`, so a
-  slow tick can't stack another on top of it.
+  child the same SIGTERM-then-SIGKILL way — finished before the timeout is returned, so a
+  CLI exiting right after can't cut the grace short and orphan rsync's ssh/receiver; every
+  cron line also runs under `flock -n` (the backup's `-o`, so only arena holds the lock),
+  so a slow tick can't stack another on top of it.
 - **Publishing is an allowlist**: `snapshot --public` serializes a separate struct with
   only list names, GPU, up/starting/down, health + a fixed-vocabulary reason and
   maintenance times — no IPs, ports, ids, providers, costs or keys (pinned by a leak test).

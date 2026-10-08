@@ -67,7 +67,7 @@ means this.
 | — | `gpus [--json]` | add-pod GPU list | ➕ | RunPod's live catalog (VRAM, community/secure $/h, stock), else presets. |
 | — | `config check / set / which` | — | ➕ | `check` shows set/missing only (and which RunPod API is active); `set` can read the value from stdin, keeping it out of `argv`. |
 | — | `plan check / show` (scheduled provisioning) | — | ➕ | Executor + arm/disarm still pending. |
-| — | `cron install/remove/show` (`--backup --pull --schedule --start-date --proxy --snapshot DIR`; `remove [--backup --proxy --snapshot]`) | — | ➕ | Edits only arena's block of the user's crontab, **line by line**: each line (backup / proxy / snapshot) has an identity, so `install` replaces only the lines its flags name and `remove --<kind>` drops only that one. Diff + confirm. Every line under `flock -n`. |
+| — | `cron install/remove/show` (`--backup --pull/--no-pull --schedule --start-date/--no-start-date --proxy --snapshot DIR`; `remove [--backup --proxy --snapshot]`) | — | ➕ | Edits only arena's block of the user's crontab, **line by line**: each line (backup / proxy / snapshot) has an identity, so `install` replaces only the lines its flags name and `remove --<kind>` drops only that one; a rewritten backup line keeps the installed one's `--pull`/start date/schedule unless a flag changes them; comments are never matched. Diff (every removed copy) + confirm. Every line under `flock -n`. |
 
 ## Config keys added in phases 0–4
 

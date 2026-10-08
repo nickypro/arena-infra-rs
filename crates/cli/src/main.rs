@@ -347,25 +347,36 @@ enum CronCmd {
     /// Add or replace arena cron lines, keeping the others. Each line has an identity —
     /// backup, proxy, snapshot — and only the ones named by these flags are (re)written:
     /// `cron install --proxy` leaves an installed backup line (its --pull, --start-date,
-    /// schedule) as it is. With no flag at all it installs the backup line. Shows the
-    /// before → after diff and confirms.
+    /// schedule) as it is. With no flag at all it installs the backup line. Rewriting the
+    /// backup line keeps the installed one's --pull, start date and schedule unless a flag
+    /// changes them (--no-pull, --no-start-date to drop one). Shows the before → after diff
+    /// and confirms.
     Install {
         /// The backup line: `pods backup` every 15 minutes (or --schedule), git-only unless
-        /// --pull. Implied by --pull, --start-date and --schedule, and by no flags at all.
+        /// --pull. Implied by any of the backup line's own flags below, and by no flags at all.
         #[arg(long)]
         backup: bool,
-        /// The backup line's cron schedule (default: every 15 minutes).
+        /// The backup line's cron schedule (default: the installed line's, else every 15
+        /// minutes).
         #[arg(long)]
         schedule: Option<String>,
         /// Bake `ARENA_START_DATE=YYYY-MM-DD` into the backup line, so the scheduled
         /// backup computes the right wNdM label without it being in config.env
-        /// (a crontab line doesn't inherit your shell environment).
+        /// (a crontab line doesn't inherit your shell environment). An installed line's
+        /// start date is kept unless this or --no-start-date is given.
         #[arg(long)]
         start_date: Option<String>,
+        /// Drop the installed backup line's `ARENA_START_DATE` (e.g. once it is in config.env).
+        #[arg(long, conflicts_with = "start_date")]
+        no_start_date: bool,
         /// The backup line also runs `pods pull` (the rsync file backup) each tick, after
-        /// the git backup.
+        /// the git backup. An installed line's --pull is kept unless --no-pull is given.
         #[arg(long)]
         pull: bool,
+        /// Make the backup line git-only (`pods backup --no-pull`), even if the installed
+        /// one also pulls.
+        #[arg(long, conflicts_with = "pull")]
+        no_pull: bool,
         /// The proxy line: re-sync the proxy every 5 minutes (`proxy apply --yes`, logged
         /// to ~/arena-proxy-cron.log): catches what the CLI didn't do itself — a pod
         /// terminated from the dashboard, a restart that moved an SSH endpoint.
@@ -2877,32 +2888,63 @@ async fn handle_cron(cmd: CronCmd, config_path: &std::path::Path, yes: bool, cro
             let kinds = CronKind::selected(backup, proxy, snapshot);
             // No flag: the whole block, hand edits inside it included (as always).
             let after = if kinds.is_empty() { Vec::new() } else { merge_cron_block(&before, &kinds, &[]) };
-            apply_cron_change(&current, &before, &after, None, dry_run, yes, crontab).await
+            apply_cron_change(&current, &before, &after, &[], dry_run, yes, crontab).await
         }
-        CronCmd::Install { backup, schedule, start_date, pull, proxy, snapshot, dry_run } => {
+        CronCmd::Install { backup, schedule, start_date, no_start_date, pull, no_pull, proxy, snapshot, dry_run } => {
             let exe = std::env::current_exe().context("finding the arena executable path")?;
             let cfg_abs = std::fs::canonicalize(config_path)
                 .unwrap_or_else(|_| config_path.to_path_buf());
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            // Optional inline env (cron runs the line via sh, so `VAR=val cmd` works).
-            let env_prefix = match &start_date {
-                Some(d) => {
-                    arena_core::schedule::parse_ymd(d)
-                        .context("--start-date must be YYYY-MM-DD")?;
-                    format!("ARENA_START_DATE={d} ")
-                }
-                None => String::new(),
-            };
+            let start_date = start_date.map(|d| d.trim().to_string());
+            if let Some(d) = &start_date {
+                arena_core::schedule::parse_ymd(d).context("--start-date must be YYYY-MM-DD")?;
+            }
             let snapshot_dir = snapshot.as_deref().map(snapshot_cron_dir).transpose()?;
-            let backup = install_backup_line(backup, schedule.is_some(), start_date.is_some(), pull, proxy, snapshot_dir.is_some());
+            let backup = install_backup_line(
+                backup,
+                schedule.is_some(),
+                start_date.is_some() || no_start_date,
+                pull || no_pull,
+                proxy,
+                snapshot_dir.is_some(),
+            );
+            let mut notes = Vec::new();
+            // The backup line's options: each flag, else the installed line's (so a
+            // re-install — e.g. to pick up the flock — never silently drops its --pull or
+            // start date), else the default.
+            let installed = before.iter().find(|l| CronKind::of(l) == Some(CronKind::Backup));
+            let read_back = installed.and_then(|l| BackupOpts::of_line(l));
+            if backup && installed.is_some() && read_back.is_none() {
+                notes.push(
+                    "note: couldn't read the installed backup line's options (hand-edited?) — it is rewritten from \
+                     these flags alone; check the diff"
+                        .to_string(),
+                );
+            }
+            let flags = BackupFlags {
+                schedule: schedule.as_deref(),
+                start_date: start_date.as_deref(),
+                no_start_date,
+                pull,
+                no_pull,
+            };
+            let (opts, kept) = resolve_backup_opts(read_back.as_ref(), &flags);
+            if backup && !kept.is_empty() {
+                notes.push(format!(
+                    "note: keeping the installed backup line's {} (--schedule / --no-pull / --no-start-date change them)",
+                    kept.join(", ")
+                ));
+            }
+            // Optional inline env (cron runs the line via sh, so `VAR=val cmd` works).
+            let env_prefix = opts.start_date.as_ref().map(|d| format!("ARENA_START_DATE={d} ")).unwrap_or_default();
             let lines = cron_lines(&CronJob {
-                schedule: schedule.as_deref().unwrap_or(BACKUP_CRON_SCHEDULE),
+                schedule: &opts.schedule,
                 env_prefix: &env_prefix,
                 exe: &exe.display().to_string(),
                 config: &cfg_abs.display().to_string(),
                 home: &home,
                 backup,
-                pull,
+                pull: opts.pull,
                 proxy,
                 snapshot_dir: snapshot_dir.as_deref(),
             });
@@ -2910,30 +2952,33 @@ async fn handle_cron(cmd: CronCmd, config_path: &std::path::Path, yes: bool, cro
             let after = merge_cron_block(&before, &kinds, &lines);
             // `--proxy`/`--snapshot` alone no longer bring a backup line along: say when
             // there will be none, so a fresh box doesn't silently go without backups.
-            let note = (!after.iter().any(|l| CronKind::of(l) == Some(CronKind::Backup))).then_some(
-                "note: no backup line — the scheduled backup is `arena cron install --backup` (add --pull for \
-                 the rsync file backup too)",
-            );
-            apply_cron_change(&current, &before, &after, note, dry_run, yes, crontab).await
+            if !after.iter().any(|l| CronKind::of(l) == Some(CronKind::Backup)) {
+                notes.push(
+                    "note: no backup line — the scheduled backup is `arena cron install --backup` (add --pull for \
+                     the rsync file backup too)"
+                        .to_string(),
+                );
+            }
+            apply_cron_change(&current, &before, &after, &notes, dry_run, yes, crontab).await
         }
     }
 }
 
 /// Show what a `cron install`/`remove` changes in arena's block — the [`cron_diff`], then
-/// `note` if any — then confirm and write the whole crontab back with only that block
+/// the `notes` — then confirm and write the whole crontab back with only that block
 /// changed. Nothing to change, or a dry run: say so and write nothing.
 async fn apply_cron_change(
     current: &str,
     before: &[String],
     after: &[String],
-    note: Option<&str>,
+    notes: &[String],
     dry_run: bool,
     yes: bool,
     crontab: &str,
 ) -> Result<()> {
     if before == after {
         println!("The arena cron lines are already as asked — nothing to change.");
-        if let Some(n) = note {
+        for n in notes {
             println!("{n}");
         }
         return Ok(());
@@ -2942,7 +2987,7 @@ async fn apply_cron_change(
     for l in cron_diff(before, after) {
         println!("  {l}");
     }
-    if let Some(n) = note {
+    for n in notes {
         println!("{n}");
     }
     if dry_run {
@@ -2994,8 +3039,13 @@ impl CronKind {
     /// apply`, `snapshot`. Read from the command itself rather than from a tag we add, so
     /// the lines every earlier `cron install` wrote are recognized too. A line that matches
     /// none — or more than one (a hand-edited `a && b`) — is `None`: kept as it is by a
-    /// targeted install/remove, never guessed at.
+    /// targeted install/remove, never guessed at. So is any comment: a paused (commented-out)
+    /// backup line isn't a backup, and an operator's note that mentions a snapshot isn't the
+    /// snapshot line — neither is replaced or removed by a targeted install/remove.
     fn of(line: &str) -> Option<CronKind> {
+        if line.trim_start().starts_with('#') {
+            return None;
+        }
         let words: Vec<&str> = line.split_whitespace().collect();
         let runs = |a: &str, b: Option<&str>| {
             words.iter().enumerate().any(|(i, w)| *w == a && b.is_none_or(|b| words.get(i + 1) == Some(&b)))
@@ -3016,11 +3066,108 @@ impl CronKind {
 }
 
 /// Whether `cron install` (re)writes the backup line: `--backup`, or any of the backup
-/// line's own options (`--schedule`, `--start-date`, `--pull`), or no line named at all —
-/// a bare `cron install` installs the backup, as it always has. `--proxy`/`--snapshot`
-/// alone leave it alone.
+/// line's own options (`--schedule`, `--start-date`/`--no-start-date`, `--pull`/`--no-pull`
+/// — the caller folds each pair into one), or no line named at all — a bare `cron install`
+/// installs the backup, as it always has. `--proxy`/`--snapshot` alone leave it alone.
 fn install_backup_line(backup: bool, schedule: bool, start_date: bool, pull: bool, proxy: bool, snapshot: bool) -> bool {
     backup || schedule || start_date || pull || !(proxy || snapshot)
+}
+
+/// The options a backup line is rendered with — and, read back from an installed line
+/// ([`BackupOpts::of_line`]), the ones a re-install keeps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BackupOpts {
+    schedule: String,
+    /// `ARENA_START_DATE=…` baked into the line.
+    start_date: Option<String>,
+    /// The line also runs the rsync file backup (no `--no-pull`).
+    pull: bool,
+}
+
+impl BackupOpts {
+    /// Read an installed backup line's options back — any version's: the schedule (five
+    /// fields, or one `@…` macro), an `ARENA_START_DATE=` among the inline env assignments
+    /// before the command (only a valid date), and whether it pulls (`pods backup` does
+    /// unless `--no-pull`). `None` for a line that isn't a backup line or has no readable
+    /// schedule. Pure.
+    fn of_line(line: &str) -> Option<BackupOpts> {
+        if CronKind::of(line) != Some(CronKind::Backup) {
+            return None;
+        }
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let n = if words.first()?.starts_with('@') { 1 } else { 5 };
+        if words.len() <= n {
+            return None;
+        }
+        let schedule = words[..n].join(" ");
+        let is_assignment = |w: &str| {
+            w.split_once('=').is_some_and(|(name, _)| {
+                name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            })
+        };
+        let start_date = words[n..]
+            .iter()
+            .copied()
+            .take_while(|w| is_assignment(w))
+            .filter_map(|w| w.strip_prefix("ARENA_START_DATE="))
+            .find(|d| arena_core::schedule::parse_ymd(d).is_some())
+            .map(String::from);
+        Some(BackupOpts { schedule, start_date, pull: !words.contains(&"--no-pull") })
+    }
+}
+
+/// `cron install`'s backup-line flags, as given.
+struct BackupFlags<'a> {
+    schedule: Option<&'a str>,
+    /// Already trimmed and validated.
+    start_date: Option<&'a str>,
+    no_start_date: bool,
+    pull: bool,
+    no_pull: bool,
+}
+
+/// The backup line to write: each option from its flag, else from the `installed` line, else
+/// the default (every 15 minutes, no start date, git-only). Also returns what was kept from
+/// the installed line that differs from the default — for a note, so the operator sees why
+/// the new line still pulls or still carries a start date. The fix for a re-install (`cron
+/// install --backup` to pick up the flock) silently dropping `ARENA_START_DATE` — every
+/// cron tick then failing to label its pull — or the `--pull`. Pure.
+fn resolve_backup_opts(installed: Option<&BackupOpts>, f: &BackupFlags) -> (BackupOpts, Vec<String>) {
+    let mut kept = Vec::new();
+    let schedule = match (f.schedule, installed) {
+        (Some(s), _) => s.to_string(),
+        (None, Some(i)) => {
+            if i.schedule != BACKUP_CRON_SCHEDULE {
+                kept.push(format!("schedule `{}`", i.schedule));
+            }
+            i.schedule.clone()
+        }
+        (None, None) => BACKUP_CRON_SCHEDULE.to_string(),
+    };
+    let start_date = match (f.start_date, f.no_start_date, installed) {
+        (Some(d), _, _) => Some(d.to_string()),
+        (None, true, _) => None,
+        (None, false, Some(i)) => {
+            if let Some(d) = &i.start_date {
+                kept.push(format!("ARENA_START_DATE={d}"));
+            }
+            i.start_date.clone()
+        }
+        (None, false, None) => None,
+    };
+    let pull = match (f.pull, f.no_pull, installed) {
+        (true, _, _) => true,
+        (false, true, _) => false,
+        (false, false, Some(i)) => {
+            if i.pull {
+                kept.push("--pull".to_string());
+            }
+            i.pull
+        }
+        (false, false, None) => false,
+    };
+    (BackupOpts { schedule, start_date, pull }, kept)
 }
 
 /// Arena's block after an install or a targeted remove. Every line of a kind in `touched`
@@ -3053,10 +3200,38 @@ fn merge_cron_block(current: &[String], touched: &[CronKind], add: &[(CronKind, 
 }
 
 /// The before → after preview of arena's block: `- line` for each line that goes, then the
-/// new block with `+ line` for each line that's new and `  line` for each that stays. Pure.
+/// new block with `+ line` for each line that's new and `  line` for each that stays.
+/// Counted per copy, not by membership: when duplicates collapse into one (the merge does
+/// that), each copy that goes is shown going — the preview never hides a line the write
+/// removes. Pure.
 fn cron_diff(before: &[String], after: &[String]) -> Vec<String> {
-    let mut out: Vec<String> = before.iter().filter(|l| !after.contains(l)).map(|l| format!("- {l}")).collect();
-    out.extend(after.iter().map(|l| if before.contains(l) { format!("  {l}") } else { format!("+ {l}") }));
+    use std::collections::HashMap;
+    let count = |lines: &[String]| {
+        let mut m: HashMap<String, usize> = HashMap::new();
+        for l in lines {
+            *m.entry(l.clone()).or_default() += 1;
+        }
+        m
+    };
+    // A copy in `before` stays if `after` still has an unclaimed copy of it.
+    let mut in_after = count(after);
+    let mut out = Vec::new();
+    for l in before {
+        match in_after.get_mut(l) {
+            Some(n) if *n > 0 => *n -= 1,
+            _ => out.push(format!("- {l}")),
+        }
+    }
+    let mut stays = count(before);
+    for l in after {
+        match stays.get_mut(l) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                out.push(format!("  {l}"));
+            }
+            _ => out.push(format!("+ {l}")),
+        }
+    }
     out
 }
 
@@ -3120,8 +3295,11 @@ const PROXY_CRON_PATH: &str = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/us
 ///   (`--no-pull`) unless `pull`. `flock -n` like the others: a tick that finds the previous
 ///   backup still running exits at once instead of stacking a second fleet-wide backup on
 ///   top of it (each pod's rsync is bounded by `BACKUP_TIMEOUT_SECS`, so a wedged pod
-///   delays the next backup by at most that, never forever). The inline env
-///   (`ARENA_START_DATE=…`) goes before `flock`, which hands it on to arena.
+///   delays the next backup by at most that, never forever). `-o` too, unlike the others:
+///   the lock is then held by flock itself for exactly as long as arena runs, instead of by
+///   an inherited fd — rsync (unlike ssh) doesn't close it, so a stray rsync outliving an
+///   arena that was itself killed would otherwise keep every later tick skipping. The
+///   inline env (`ARENA_START_DATE=…`) goes before `flock`, which hands it on to arena.
 /// - **proxy** (`proxy`): `proxy apply --yes` every 5 minutes. That's safe unattended
 ///   because the merge is sticky: a provider that fails to list never drops a forward, and
 ///   if none answers nothing is written. It has its own log so its every-5-minutes chatter
@@ -3142,7 +3320,7 @@ fn cron_lines(job: &CronJob) -> Vec<(CronKind, String)> {
         lines.push((
             CronKind::Backup,
             format!(
-                "{schedule} {env_prefix}flock -n {home}/.arena-backup-cron.lock {exe} --config {config} \
+                "{schedule} {env_prefix}flock -n -o {home}/.arena-backup-cron.lock {exe} --config {config} \
                  pods backup{no_pull} --yes >> {home}/arena-cron.log 2>&1"
             ),
         ));
@@ -10862,7 +11040,7 @@ mod tests {
         // (a wedged pod's rsync, up to BACKUP_TIMEOUT_SECS) exits instead of stacking.
         assert_eq!(
             cron_job(false, false),
-            ["*/15 * * * * flock -n /home/u/.arena-backup-cron.lock /opt/arena --config /srv/config.env \
+            ["*/15 * * * * flock -n -o /home/u/.arena-backup-cron.lock /opt/arena --config /srv/config.env \
               pods backup --no-pull --yes >> /home/u/arena-cron.log 2>&1"]
         );
         // The proxy line carries a PATH with /usr/sbin (cron's default lacks it, and that's
@@ -10871,7 +11049,7 @@ mod tests {
         assert_eq!(
             both,
             [
-                "*/15 * * * * flock -n /home/u/.arena-backup-cron.lock /opt/arena --config /srv/config.env \
+                "*/15 * * * * flock -n -o /home/u/.arena-backup-cron.lock /opt/arena --config /srv/config.env \
                  pods backup --yes >> /home/u/arena-cron.log 2>&1",
                 "*/5 * * * * PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
                  flock -n /home/u/.arena-proxy-cron.lock /opt/arena --config /srv/config.env proxy apply --yes \
@@ -10902,7 +11080,7 @@ mod tests {
             lines,
             [(
                 super::CronKind::Backup,
-                "0 * * * * ARENA_START_DATE=2026-10-05 flock -n /root/.arena-backup-cron.lock /opt/arena --config \
+                "0 * * * * ARENA_START_DATE=2026-10-05 flock -n -o /root/.arena-backup-cron.lock /opt/arena --config \
                  /srv/config.env pods backup --yes >> /root/arena-cron.log 2>&1"
                     .to_string()
             )]
@@ -10919,6 +11097,7 @@ mod tests {
             ("*/15 * * * * /usr/local/bin/arena --config /c pods backup --no-pull --yes >> /root/arena-cron.log 2>&1", Some(Backup)),
             ("*/15 * * * * ARENA_START_DATE=2026-01-05 /opt/arena --config /c pods backup --yes >> /h/arena-cron.log 2>&1", Some(Backup)),
             ("*/15 * * * * flock -n /h/.arena-backup-cron.lock /opt/arena --config /c pods backup --yes >> /h/arena-cron.log 2>&1", Some(Backup)),
+            ("*/15 * * * * flock -n -o /h/.arena-backup-cron.lock /opt/arena --config /c pods backup --yes >> /h/arena-cron.log 2>&1", Some(Backup)),
             ("*/5 * * * * PATH=/usr/sbin:/usr/bin flock -n /h/.arena-proxy-cron.lock /opt/arena --config /c proxy apply --yes >> /h/arena-proxy-cron.log 2>&1", Some(Proxy)),
             ("*/2 * * * * flock -n /h/.arena-snapshot-cron.lock /opt/arena --config /c snapshot --public --out '/w/fleet.json' >> /h/arena-snapshot-cron.log 2>&1", Some(Snapshot)),
             ("*/2\t*\t*\t*\t*\t/opt/arena --config /c snapshot --public", Some(Snapshot)), // tab-separated
@@ -10928,6 +11107,11 @@ mod tests {
             ("0 3 * * * /opt/arena --config /c pods list >> /h/.arena-proxy-cron.lock.snapshot", None),
             ("*/15 * * * * arena pods backup --yes && arena proxy apply --yes", None),
             ("# a note", None),
+            // Comments are never a kind: a paused (commented-out) line, a note naming one.
+            ("# */15 * * * * flock -n /h/.arena-backup-cron.lock /opt/arena --config /c pods backup --yes", None),
+            ("  #*/5 * * * * /opt/arena --config /c proxy apply --yes", None),
+            ("# snapshot page is served by caddy from /srv/www", None),
+            ("# run `arena pods backup` by hand before a reimage", None),
             ("MAILTO=ops@example.org", None),
         ];
         for (line, want) in cases {
@@ -11008,6 +11192,127 @@ mod tests {
         assert_eq!(with_arena_block(&tab, &merge_cron_block(&[backup[0].1.clone()], &[Backup], &[])), "0 9 * * * keep-me\n");
     }
 
+    /// Review finding: comments inside the block are nobody's line. A paused backup line and
+    /// a note that mentions the snapshot survive a targeted install/remove of that kind, and
+    /// a paused backup line doesn't count as "there is a backup".
+    #[test]
+    fn cron_merge_leaves_comments_alone() {
+        use super::{merge_cron_block, CronKind::*};
+        let paused = "# */15 * * * * flock -n /h/.arena-backup-cron.lock /opt/arena --config /c pods backup --yes";
+        let note = "# snapshot page is served by caddy from /srv/www";
+        let snap = cron_kinds(false, false, false, Some("/w")).remove(0);
+        let before: Vec<String> = vec![paused.into(), note.into(), snap.1.clone()];
+        // `cron remove --snapshot`: the real line goes, the note stays.
+        assert_eq!(merge_cron_block(&before, &[Snapshot], &[]), [paused, note]);
+        // `cron install --snapshot DIR` replaces the real line in place, not the note.
+        let snap2 = cron_kinds(false, false, false, Some("/w2")).remove(0);
+        assert_eq!(merge_cron_block(&before, &[Snapshot], std::slice::from_ref(&snap2)), [paused, note, snap2.1.as_str()]);
+        // `cron install --backup`: the paused line stays paused; the live one is added.
+        let backup = cron_kinds(true, false, false, None);
+        assert_eq!(merge_cron_block(&before, &[Backup], &backup), [paused, note, snap.1.as_str(), backup[0].1.as_str()]);
+        // `cron remove --backup` leaves the paused line (plain `remove` clears the block).
+        assert_eq!(merge_cron_block(&before, &[Backup], &[]), before);
+        assert!(!before.iter().any(|l| super::CronKind::of(l) == Some(Backup)), "a paused line isn't a backup");
+    }
+
+    /// Review finding: the preview counts copies. Identical duplicates collapsing into one
+    /// show the removed copy as `- line` — the write never removes a line the preview hid.
+    #[test]
+    fn cron_diff_shows_every_removed_copy() {
+        use super::{cron_diff, merge_cron_block, CronKind::*};
+        let a = cron_job(false, false).remove(0);
+        let doubled = vec![a.clone(), a.clone()];
+        let after = merge_cron_block(&doubled, &[Backup], &[(Backup, a.clone())]);
+        assert_eq!(after, [a.clone()]);
+        assert_eq!(cron_diff(&doubled, &after), [format!("- {a}"), format!("  {a}")]);
+        // (case, before, after, diff)
+        let l = |s: &str| s.to_string();
+        let cases: Vec<(&str, Vec<String>, Vec<String>, Vec<String>)> = vec![
+            ("unchanged", vec![l("A"), l("B")], vec![l("A"), l("B")], vec![l("  A"), l("  B")]),
+            ("replace in place", vec![l("A"), l("B")], vec![l("X"), l("B")], vec![l("- A"), l("+ X"), l("  B")]),
+            ("three copies to one", vec![l("A"), l("A"), l("A")], vec![l("A")], vec![l("- A"), l("- A"), l("  A")]),
+            ("a copy added", vec![l("A")], vec![l("A"), l("A")], vec![l("  A"), l("+ A")]),
+            ("all gone", vec![l("A"), l("B")], vec![], vec![l("- A"), l("- B")]),
+            ("from nothing", vec![], vec![l("A")], vec![l("+ A")]),
+        ];
+        for (case, before, after, want) in cases {
+            assert_eq!(cron_diff(&before, &after), want, "{case}");
+        }
+    }
+
+    /// An installed backup line's options read back, from every version's line shape.
+    #[test]
+    fn backup_opts_read_back_from_an_installed_line() {
+        use super::BackupOpts;
+        let o = |schedule: &str, start: Option<&str>, pull: bool| {
+            Some(BackupOpts { schedule: schedule.into(), start_date: start.map(String::from), pull })
+        };
+        let cases: &[(&str, Option<BackupOpts>)] = &[
+            // This version's line (flock -n -o), with the start date and --pull.
+            (
+                "*/15 * * * * ARENA_START_DATE=2026-01-05 flock -n -o /h/.arena-backup-cron.lock /opt/arena --config /c pods backup --yes >> /h/arena-cron.log 2>&1",
+                o("*/15 * * * *", Some("2026-01-05"), true),
+            ),
+            // K1's (flock -n), git-only, hourly.
+            ("0 * * * * flock -n /h/.arena-backup-cron.lock /opt/arena --config /c pods backup --no-pull --yes >> /h/arena-cron.log 2>&1", o("0 * * * *", None, false)),
+            // An earlier version's (no flock): env straight before the binary.
+            ("*/15 * * * * ARENA_START_DATE=2026-01-05 /usr/local/bin/arena --config /c pods backup --yes >> /root/arena-cron.log 2>&1", o("*/15 * * * *", Some("2026-01-05"), true)),
+            // Tabs, a macro schedule, another env var first.
+            ("@hourly\tPATH=/usr/bin ARENA_START_DATE=2026-02-02 /opt/arena pods backup --no-pull --yes", o("@hourly", Some("2026-02-02"), false)),
+            // A start date that isn't one, or one that isn't an env assignment, isn't read.
+            ("*/15 * * * * ARENA_START_DATE=soon /opt/arena pods backup --yes", o("*/15 * * * *", None, true)),
+            ("*/15 * * * * /opt/arena pods backup --yes # ARENA_START_DATE=2026-01-05", o("*/15 * * * *", None, true)),
+            // Not a backup line, a paused one, or no schedule to read.
+            ("*/5 * * * * /opt/arena proxy apply --yes", None),
+            ("# */15 * * * * /opt/arena pods backup --yes", None),
+            ("* * * pods backup", None),
+        ];
+        for (line, want) in cases {
+            assert_eq!(&BackupOpts::of_line(line), want, "{line}");
+        }
+    }
+
+    /// The backup line a (re-)install writes: each option from its flag, else the installed
+    /// line's, else the default — and what was kept, for the note. The review finding: a
+    /// re-install (`cron install --backup`, to pick up the flock) used to drop the installed
+    /// line's `ARENA_START_DATE` and `--pull`.
+    #[test]
+    fn resolve_backup_opts_keeps_what_the_flags_dont_change() {
+        use super::{resolve_backup_opts, BackupFlags, BackupOpts};
+        let installed = BackupOpts { schedule: "0 * * * *".into(), start_date: Some("2026-01-05".into()), pull: true };
+        let plain = BackupOpts { schedule: "*/15 * * * *".into(), start_date: None, pull: false };
+        let none = BackupFlags { schedule: None, start_date: None, no_start_date: false, pull: false, no_pull: false };
+        let want = |schedule: &str, start: Option<&str>, pull: bool| BackupOpts { schedule: schedule.into(), start_date: start.map(String::from), pull };
+        // (case, installed, flags, opts, kept)
+        let cases: Vec<(&str, Option<&BackupOpts>, BackupFlags, BackupOpts, Vec<&str>)> = vec![
+            ("fresh: the defaults", None, BackupFlags { ..none }, want("*/15 * * * *", None, false), vec![]),
+            ("fresh with flags", None, BackupFlags { pull: true, start_date: Some("2026-03-01"), ..none }, want("*/15 * * * *", Some("2026-03-01"), true), vec![]),
+            (
+                "`--backup` keeps everything",
+                Some(&installed),
+                BackupFlags { ..none },
+                want("0 * * * *", Some("2026-01-05"), true),
+                vec!["schedule `0 * * * *`", "ARENA_START_DATE=2026-01-05", "--pull"],
+            ),
+            ("--no-pull", Some(&installed), BackupFlags { no_pull: true, ..none }, want("0 * * * *", Some("2026-01-05"), false), vec!["schedule `0 * * * *`", "ARENA_START_DATE=2026-01-05"]),
+            ("--no-start-date", Some(&installed), BackupFlags { no_start_date: true, ..none }, want("0 * * * *", None, true), vec!["schedule `0 * * * *`", "--pull"]),
+            (
+                "flags win",
+                Some(&installed),
+                BackupFlags { schedule: Some("*/30 * * * *"), start_date: Some("2026-02-02"), pull: true, ..none },
+                want("*/30 * * * *", Some("2026-02-02"), true),
+                vec![],
+            ),
+            ("defaults kept aren't news", Some(&plain), BackupFlags { ..none }, plain.clone(), vec![]),
+            ("--pull on a git-only line", Some(&plain), BackupFlags { pull: true, ..none }, want("*/15 * * * *", None, true), vec![]),
+        ];
+        for (case, inst, flags, opts, kept) in cases {
+            let (got, got_kept) = resolve_backup_opts(inst, &flags);
+            assert_eq!(got, opts, "{case}");
+            assert_eq!(got_kept, kept, "{case}");
+        }
+    }
+
     /// `arena cron …` end to end against a stub `crontab` over a file (the real crontab is
     /// never touched): a later `--proxy` keeps the earlier `--pull --start-date` backup line
     /// byte for byte, `--snapshot` adds its line, `remove --proxy` drops only that one, a
@@ -11051,7 +11356,7 @@ mod tests {
         let backup = lines();
         assert_eq!(backup.len(), 1, "{backup:?}");
         assert!(
-            backup[0].starts_with("*/15 * * * * ARENA_START_DATE=2026-01-05 flock -n ")
+            backup[0].starts_with("*/15 * * * * ARENA_START_DATE=2026-01-05 flock -n -o ")
                 && backup[0].contains(" pods backup --yes >> "),
             "{backup:?}"
         );
@@ -11075,6 +11380,30 @@ mod tests {
         // Re-installing what's there is a no-op.
         run(args(&["install", "--snapshot", &www])).await;
         assert_eq!(lines(), [all[0].clone(), all[2].clone()]);
+
+        // Re-installing the backup line (to pick up a new line shape) keeps its --pull and
+        // start date — even from an older version's line, which it upgrades in place — and
+        // only the opposite flags drop them. The other lines never move.
+        let legacy = all[0].replace(" flock -n -o ", " flock -n ");
+        let tab_text = std::fs::read_to_string(&tab).unwrap().replace(&all[0], &legacy);
+        std::fs::write(&tab, tab_text).unwrap();
+        assert_eq!(lines()[0], legacy);
+        run(args(&["install", "--backup"])).await;
+        assert_eq!(lines(), [all[0].clone(), all[2].clone()], "the legacy line upgraded, --pull and the start date kept");
+        run(args(&["install", "--no-pull"])).await;
+        let git_only = lines();
+        assert!(
+            git_only[0].starts_with("*/15 * * * * ARENA_START_DATE=2026-01-05 flock -n -o ")
+                && git_only[0].contains(" pods backup --no-pull --yes >> "),
+            "{git_only:?}"
+        );
+        run(args(&["install", "--schedule", "0 * * * *"])).await;
+        let hourly = lines();
+        assert!(hourly[0].starts_with("0 * * * * ARENA_START_DATE=2026-01-05 flock") && hourly[0].contains("--no-pull"), "{hourly:?}");
+        run(args(&["install", "--no-start-date", "--pull"])).await;
+        let undated = lines();
+        assert!(undated[0].starts_with("0 * * * * flock -n -o ") && undated[0].contains(" pods backup --yes >> "), "{undated:?}");
+        assert_eq!(undated[1], all[2], "the snapshot line never moved");
 
         // Plain `remove`: the whole block goes; the user's entry stays.
         run(args(&["remove"])).await;
@@ -11100,6 +11429,14 @@ mod tests {
             cron(&["install", "--backup", "--schedule", "0 * * * *"]),
             CronCmd::Install { backup: true, schedule: Some(s), .. } if s == "0 * * * *"
         ));
+        assert!(matches!(
+            cron(&["install", "--no-pull", "--no-start-date"]),
+            CronCmd::Install { no_pull: true, no_start_date: true, pull: false, start_date: None, .. }
+        ));
+        // Each opposite pair is refused together.
+        for bad in [&["install", "--pull", "--no-pull"][..], &["install", "--start-date", "2026-01-05", "--no-start-date"]] {
+            assert!(Cli::try_parse_from(["arena", "cron"].iter().chain(bad).copied()).is_err(), "{bad:?}");
+        }
         assert!(matches!(cron(&["remove"]), CronCmd::Remove { backup: false, proxy: false, snapshot: false, dry_run: false }));
         assert!(matches!(cron(&["remove", "--snapshot", "--dry"]), CronCmd::Remove { snapshot: true, dry_run: true, .. }));
         assert_eq!(super::CronKind::selected(true, false, true), [super::CronKind::Backup, super::CronKind::Snapshot]);
@@ -12681,21 +13018,15 @@ mod remote_tests {
             assert!(err.contains(&format!("devtest-bloom [{tier}] (timed out after 3s)")), "{err}");
         }
         assert_eq!(stub.take(), ["big/devtest-apple", "big/devtest-cloud", "w1d1/devtest-apple", "w1d1/devtest-cloud"]);
-        // Both of bloom's rsyncs were stopped (gone, or a zombie awaiting the reaper).
+        // Both of bloom's rsyncs were stopped *before* the failure came back — not by a
+        // background task that `main` returning (the runtime dropped) would cut short.
         let pids = std::fs::read_to_string(stub.0.join("hung.pids")).unwrap();
         assert_eq!(pids.lines().count(), 2, "{pids}");
         for pid in pids.lines() {
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            loop {
-                let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
-                    .ok()
-                    .and_then(|s| s.rsplit(')').next().and_then(|r| r.split_whitespace().next()).map(String::from));
-                match state.as_deref() {
-                    None | Some("Z") | Some("X") => break,
-                    Some(st) if std::time::Instant::now() >= deadline => panic!("bloom's rsync {pid} still running ({st})"),
-                    Some(_) => tokio::time::sleep(Duration::from_millis(20)).await,
-                }
-            }
+            let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|s| s.rsplit(')').next().and_then(|r| r.split_whitespace().next()).map(String::from));
+            assert!(matches!(state.as_deref(), None | Some("Z") | Some("X")), "bloom's rsync {pid} still running ({state:?})");
         }
         // A budget that isn't whole seconds in range: refused up front, nothing copied.
         for bad in ["2h", "0", "86401"] {

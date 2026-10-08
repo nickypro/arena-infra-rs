@@ -61,6 +61,20 @@ pub const FIND_BUDGET_SECS: u32 = 20;
 /// note: a live notebook kernel with a model loaded is lost with the pod.
 const GPU_MEM_NOTE_MIB: u64 = 1024;
 
+/// At most this many socket lines are sent back (`/proc/net/tcp{,6}` ESTABLISHED + LISTEN),
+/// so a pod with a huge socket table can't flood the reply. Past it the probe says so
+/// (`ARENA_IDLE_TCP_TRUNCATED`) and the session counts are only a lower bound: unknown,
+/// never "no sessions" — a participant's connection may be among the lines not sent.
+pub const TCP_LINE_CAP: usize = 2000;
+
+/// The probe's socket-list cap as a filter: the first [`TCP_LINE_CAP`] lines through, then —
+/// only if any were left out — the truncation marker. (A bare `head -n` would cut silently.)
+fn tcp_cap_filter() -> String {
+    format!(
+        r#"awk -v cap={TCP_LINE_CAP} 'NR <= cap {{ print; next }} {{ cut = 1 }} END {{ if (cut) print "ARENA_IDLE_TCP_TRUNCATED" }}'"#
+    )
+}
+
 /// Directory names the file scan skips: git internals (our backup commits there), caches,
 /// editor servers (they write logs while merely connected), package trees and build caches.
 const PRUNE: &[&str] = &[
@@ -96,7 +110,7 @@ echo "ARENA_IDLE_UP ${{up:--}}"
 echo "ARENA_IDLE_SELF ${{SSH_CONNECTION:--}}"
 for f in /proc/net/tcp /proc/net/tcp6; do
   [ -r "$f" ] && awk 'FNR > 1 && $4 == "01" {{ print "ARENA_IDLE_TCP", $2, $3 }} FNR > 1 && $4 == "0A" {{ print "ARENA_IDLE_LISTEN", $2 }}' "$f"
-done | head -n 2000
+done | {tcp_cap}
 if command -v nvidia-smi >/dev/null 2>&1; then
   for i in 1 2 3; do
     out=$(t 10 nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader,nounits 2>&1)
@@ -127,6 +141,7 @@ echo "ARENA_IDLE_END"
 "#,
         budget = FIND_BUDGET_SECS,
         prune = prune.join(" -o "),
+        tcp_cap = tcp_cap_filter(),
     )
 }
 
@@ -172,6 +187,9 @@ pub struct Reading {
     pub self_found: bool,
     /// Established non-loopback connections to other listening ports.
     pub other_inbound: u32,
+    /// Whether every socket line was read. `false` past [`TCP_LINE_CAP`]: `ssh_sessions` and
+    /// `other_inbound` are then only a lower bound — enough to say "in use", never "idle".
+    pub connections_complete: bool,
     pub gpu: Gpu,
     /// Newest file mtime under the home and the repo (`None` = no file found).
     pub newest_file: Option<u64>,
@@ -289,7 +307,7 @@ pub fn parse_reply(stdout: &str) -> Result<Reading, String> {
     let (mut now, mut up, mut me, mut end) = (None, None, None, false);
     let (mut est, mut listen) = (Vec::new(), Vec::new());
     let (mut gpu_none, mut samples): (bool, Vec<(String, Vec<String>)>) = (false, Vec::new());
-    let (mut files, mut repo_present) = (None, false);
+    let (mut files, mut repo_present, mut tcp_truncated) = (None, false, false);
     for line in stdout.lines() {
         let line = line.trim_end();
         let Some((tag, rest)) = line.split_once(' ').or(Some((line, ""))) else { continue };
@@ -305,6 +323,7 @@ pub fn parse_reply(stdout: &str) -> Result<Reading, String> {
                 }
             }
             "ARENA_IDLE_LISTEN" => listen.extend(decode_proc_addr(rest.trim())),
+            "ARENA_IDLE_TCP_TRUNCATED" => tcp_truncated = true,
             "ARENA_IDLE_GPU_NONE" => gpu_none = true,
             "ARENA_IDLE_GPU_RC" => samples.push((rest.trim().to_string(), Vec::new())),
             "ARENA_IDLE_GPU" => {
@@ -339,6 +358,7 @@ pub fn parse_reply(stdout: &str) -> Result<Reading, String> {
         ssh_sessions,
         self_found,
         other_inbound,
+        connections_complete: !tcp_truncated,
         gpu: judge_gpu(gpu_none, &samples),
         newest_file: stamp(&files[0]),
         newest_repo_file: stamp(&files[1]).filter(|_| repo_present),
@@ -404,6 +424,9 @@ pub fn judge(pod: &Pod, probe: &Probe, threshold: u64) -> Verdict {
     }
     if r.other_inbound > 0 {
         busy.push(plural(r.other_inbound, "other inbound connection"));
+    }
+    if !r.connections_complete {
+        unknown.push(format!("over {TCP_LINE_CAP} sockets — not every connection was read"));
     }
     match &r.gpu {
         Gpu::Read { max_util, .. } if *max_util > IDLE_GPU_PCT => busy.push(format!("GPU {max_util}%")),
@@ -562,8 +585,10 @@ fn cells(row: &IdleRow) -> Vec<String> {
         }
         Some(r) => {
             let age = |t: Option<u64>| t.map(|t| fmt_age(r.now.saturating_sub(t)));
-            out.push(if r.self_found { r.ssh_sessions.to_string() } else { format!("{}?", r.ssh_sessions) });
-            out.push(r.other_inbound.to_string());
+            let unsure_conn = if r.connections_complete { "" } else { "?" };
+            let unsure_ssh = if r.self_found { unsure_conn } else { "?" };
+            out.push(format!("{}{unsure_ssh}", r.ssh_sessions));
+            out.push(format!("{}{unsure_conn}", r.other_inbound));
             let (util, mem) = match &r.gpu {
                 Gpu::Read { max_util, mem_used_mib, .. } => (format!("{max_util}%"), format!("{:.1}G", *mem_used_mib as f64 / 1024.0)),
                 Gpu::Absent => ("-".into(), "-".into()),
@@ -620,8 +645,8 @@ pub fn render(report: &IdleReport) -> String {
     let mut out = table::render(&headers, &align, &rows);
     let h = fmt_hours(report.hours);
     out.push_str(
-        "SSH/OTHER = live inbound connections (this probe's own left out; `?` = couldn't tell it apart) · GPU% = busiest of 3 \
-         samples · NEWEST FILE/REPO = age of the newest change (caches, .git and editor servers skipped)\n",
+        "SSH/OTHER = live inbound connections (this probe's own left out; `?` = couldn't tell it apart, or too many sockets \
+         to read them all) · GPU% = busiest of 3 samples · NEWEST FILE/REPO = age of the newest change (caches, .git and editor servers skipped)\n",
     );
     let idle: Vec<&IdleRow> = report.pods.iter().filter(|r| r.is_candidate()).collect();
     if idle.is_empty() {
@@ -699,6 +724,8 @@ pub mod fixture {
         pub newest_age: Option<u64>,
         pub repo_age: Option<u64>,
         pub find_rc: &'static str,
+        /// The socket list was cut at the cap (`ARENA_IDLE_TCP_TRUNCATED`).
+        pub tcp_truncated: bool,
     }
 
     impl Default for Reply {
@@ -712,6 +739,7 @@ pub mod fixture {
                 newest_age: Some(9 * 3600),
                 repo_age: Some(10 * 3600),
                 find_rc: "0",
+                tcp_truncated: false,
             }
         }
     }
@@ -733,6 +761,9 @@ pub mod fixture {
             }
             // A kernel talking to its server over loopback: plumbing, never a session.
             s.push_str(&format!("ARENA_IDLE_TCP {} {}\n", v4([127, 0, 0, 1], 8888), v4([127, 0, 0, 1], 52000)));
+            if self.tcp_truncated {
+                s.push_str("ARENA_IDLE_TCP_TRUNCATED\n");
+            }
             match &self.gpu {
                 None => s.push_str("ARENA_IDLE_GPU_NONE\n"),
                 Some(lines) => {
@@ -881,6 +912,62 @@ mod tests {
         assert_eq!(parse_reply("Permission denied (publickey).\n").unwrap_err(), "no reply from the probe");
         let nofiles = full.lines().filter(|l| !l.starts_with("ARENA_IDLE_FILES")).collect::<Vec<_>>().join("\n");
         assert_eq!(parse_reply(&nofiles).unwrap_err(), "the probe reported no file scan");
+        // Every socket line read, unless the probe says the list was cut.
+        assert!(r.connections_complete);
+        let cut = parse_reply(&Reply { tcp_truncated: true, ..Default::default() }.render()).unwrap();
+        assert!(!cut.connections_complete && cut.self_found, "{cut:?}");
+    }
+
+    /// Review finding: the socket list is capped, and a cut used to be silent — on a pod with
+    /// thousands of sockets a participant's session could fall past the cap while ours was
+    /// still read, so the pod looked idle. The cap now says so, and the counts are then a
+    /// lower bound: "in use" if they already show a session, else unknown — never idle.
+    #[test]
+    fn a_cut_socket_list_is_never_idle() {
+        let gpu_pod = pod("devtest-apple", "runpod", Some(0.25));
+        let read = |r: Reply| Probe::Read(parse_reply(&r.render()).unwrap());
+        assert_eq!(
+            judge(&gpu_pod, &read(Reply { tcp_truncated: true, ..Default::default() }), H6),
+            Verdict::Unknown { reasons: vec![format!("over {TCP_LINE_CAP} sockets — not every connection was read")] }
+        );
+        // What was read already shows a session: in use, which says more than "unknown".
+        assert_eq!(
+            judge(&gpu_pod, &read(Reply { tcp_truncated: true, sessions: vec![[198, 51, 100, 7]], ..Default::default() }), H6),
+            Verdict::NotIdle { reasons: vec!["1 SSH session".into()] }
+        );
+        // The table marks both counts as uncertain.
+        let list = list();
+        let naming = Naming { prefix: "devtest", list: &list };
+        let rep = report(&[gpu_pod], &[read(Reply { tcp_truncated: true, ..Default::default() })], 6.0, &naming);
+        assert_eq!(cells(&rep.pods[0])[3..5], ["0?", "0?"]);
+        assert!(rep.candidates.is_empty() && rep.unknown == 1, "{rep:?}");
+        let text = render(&rep);
+        assert!(text.contains("No cohort machine is idle") && !text.contains("arena pods terminate"), "{text}");
+    }
+
+    /// The cap filter itself, under a real `sh`/`awk`: up to the cap every line passes and
+    /// nothing is added; past it, exactly the cap's worth, then the marker.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_socket_cap_marks_a_cut() {
+        use std::process::Command;
+        let run = |n: usize| {
+            let out = Command::new("sh").arg("-c").arg(format!("seq 1 {n} | {}", tcp_cap_filter())).output().unwrap();
+            assert!(out.status.success(), "{out:?}");
+            String::from_utf8(out.stdout).unwrap().lines().map(String::from).collect::<Vec<_>>()
+        };
+        for n in [0, 5, TCP_LINE_CAP] {
+            let got = run(n);
+            assert_eq!(got.len(), n, "{n}");
+            assert!(!got.iter().any(|l| l == "ARENA_IDLE_TCP_TRUNCATED"), "{n}");
+        }
+        let got = run(TCP_LINE_CAP + 1);
+        assert_eq!(got.len(), TCP_LINE_CAP + 1);
+        assert_eq!(got[TCP_LINE_CAP - 1], TCP_LINE_CAP.to_string());
+        assert_eq!(got.last().map(String::as_str), Some("ARENA_IDLE_TCP_TRUNCATED"));
+        assert_eq!(run(3 * TCP_LINE_CAP).len(), TCP_LINE_CAP + 1);
+        // And the probe uses it (no silent `head` left).
+        assert!(script().contains(&tcp_cap_filter()) && !script().contains("head -n 2000"));
     }
 
     /// The verdict table: (case, reply, pod, verdict).

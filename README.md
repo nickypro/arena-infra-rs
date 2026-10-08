@@ -261,7 +261,10 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `install --proxy` no longer drops an earlier `--pull`/`--start-date`/`--snapshot`):
     `--backup` = `pods backup` every 15 min (`--schedule`), git-only unless `--pull` (git +
     rsync file backup each tick), `--start-date` bakes `ARENA_START_DATE` in — those three
-    imply `--backup`, and a bare `cron install` means `--backup`; `--proxy` = a `*/5 … proxy
+    (and `--no-pull`, `--no-start-date`) imply `--backup`, and a bare `cron install` means
+    `--backup`. Rewriting the backup line **keeps the installed one's `--pull`, start date and
+    schedule** unless a flag changes them (`--no-pull` / `--no-start-date` drop one; a note
+    says what was kept), so `cron install --backup` just upgrades the line; `--proxy` = a `*/5 … proxy
     apply --yes` line (log `~/arena-proxy-cron.log`; a `PATH` with `/usr/sbin` so cron finds
     nginx) that catches changes made outside the CLI (dashboard terminates, restarts that
     move an endpoint) — remove it before changing `MACHINE_NAME_PREFIX`/`_LIST`: a name that
@@ -269,10 +272,13 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     snapshot --public --out <DIR>/fleet.json` line (log `~/arena-snapshot-cron.log`) for the
     [fleet page](#publishing-the-fleet-page). Every line runs under `flock -n` (a tick that
     finds the previous one still running exits instead of stacking — the backup's lock is
-    `~/.arena-backup-cron.lock`). `remove --backup|--proxy|--snapshot` drops just those; plain
-    `remove` drops the whole block. Both print the block's before → after diff and confirm
-    (`--yes` for scripts, `--dry-run` to preview); `show` labels each line with its identity.
-    Lines written by older versions are recognized by the command they run.
+    `~/.arena-backup-cron.lock`, held by `flock -o` itself so no stray rsync can keep it).
+    `remove --backup|--proxy|--snapshot` drops just those; plain `remove` drops the whole
+    block. Both print the block's before → after diff (every removed copy of a duplicate
+    shown) and confirm (`--yes` for scripts, `--dry-run` to preview); `show` labels each line
+    with its identity. Lines written by older versions are recognized by the command they
+    run; comments in the block (a paused `# …` line, a note) are never matched, replaced or
+    removed by a targeted install/remove.
   - `pods backup [targets]` — the **full save**: git-push the ARENA tree **and** rsync the
     home to the local backups folder (`pull`). The git push is on **whatever branch the
     pod is on** (never switches/creates one, so bespoke branches are respected) and
@@ -426,8 +432,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     another prefix is named, never given a command) — with what they cost and the exact
     commands to run, **printed, not run**: `arena pods backup <name>` then `arena pods
     terminate <name>` (the id when a name is shared). Anything unreadable (no reply, a scan
-    that timed out, `[N/A]` GPU, our own connection not found) makes a pod `?`, never a
-    candidate. Not seen: sessions through RunPod's `ssh.runpod.io` proxy (not via sshd).
+    that timed out, `[N/A]` GPU, our own connection not found, more than 2000 sockets so not
+    every connection was read) makes a pod `?`, never a candidate. Not seen: sessions through RunPod's `ssh.runpod.io` proxy (not via sshd).
   - `pods pull [label]` — the **file** backup (complementing the git `backup`): rsyncs
     each pod's home into `<dir>/<label>/<pod>/`, reporting files/bytes moved per pod.
     **Keeps `.git`** (so the backup is a usable repo; `--no-git` to skip), size-caps with
@@ -437,9 +443,11 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     iteration. Confirms first; `--dry-run` prints the exact rsync commands. **Bounded**: rsync
     `--timeout=300` (gives up after 5 min without any I/O) and a wall-clock budget per pod,
     `BACKUP_TIMEOUT_SECS` (default 7200 = 2 h, max a day; settable from the environment) —
-    a pod that runs out is stopped (SIGTERM, so rsync takes its ssh down too) and named in
-    the failure (`✗ arena9-bloom [big]: timed out after 7200s`); the other pods finish, and
-    the next run continues incrementally.
+    a pod that runs out is stopped (SIGTERM, so rsync takes its ssh and receiver down too;
+    SIGKILL 2 s later) before the failure is reported — so nothing is left running even when
+    it was the last job and arena exits right after — and named in the failure (`✗
+    arena9-bloom [big]: timed out after 7200s`); the other pods finish, and the next run
+    continues incrementally.
   - `pods copy-keys` — distribute API keys into each pod's `~/.bashrc`/`~/.zshrc`
     (idempotent): per-host keys from `<keys-dir>/<provider>_api_keys.csv`
     (openai/anthropic/openrouter) **plus broadcast tokens** — a Hugging Face token
