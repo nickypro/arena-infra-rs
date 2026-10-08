@@ -471,15 +471,17 @@ enum PodCmd {
     /// sync the proxy → provision it (unless --no-setup) → [--check: deep-check it] → copy
     /// its API keys (when keys/*_api_keys.csv exist) → `[name] READY …` or `[name] FAILED
     /// <stage>: …`, printed the moment that pod is done; one slow pod never holds up another.
-    /// Ends with a NAME/GPU/$/H/PROXY PORT/HEALTH/STATUS/READY AFTER table and exits non-zero
-    /// if any pod isn't READY. A pod that fails is left running: one is only ever terminated
-    /// to make room for its --check replacement.
+    /// Ends with a NAME/GPU/$/H/PROXY PORT/HEALTH/STATUS/READY AFTER table (a requested name
+    /// that got no pod included) and exits non-zero unless every requested name is READY. A
+    /// pod that fails is left running: one is only ever terminated by --check (below).
     ///
     /// --check: a pod that FAILs the deep check (`pods test --deep`) is on a bad host — it
     /// is TERMINATED and its name recreated from the same --gpu/--cloud/--max-price options
     /// (options that haven't failed first), up to --check-attempts placements per name; a
     /// replacement that lands on a machine IP that already failed is rejected the same way.
-    /// A WARN counts as ready. Ctrl+C: no new attempts, nothing terminated, report.
+    /// A check that can't run at all (SSH drops, times out) is retried once and never
+    /// counts against the host. A WARN counts as ready. Ctrl+C (also during the create's
+    /// retries): no new attempts, nothing terminated, report.
     #[command(verbatim_doc_comment)]
     Up {
         /// Explicit machine names to create (e.g. `apple bloom`), like `pods create`.
@@ -555,7 +557,9 @@ enum PodCmd {
         #[arg(long)]
         check: bool,
         /// With --check: placements per name in total, the first create included (2 = one
-        /// replacement). A pod that fails its last attempt is left running, never terminated.
+        /// replacement). A pod that FAILs the check on its last attempt is left running for a
+        /// look; one that lands on a machine that already failed is terminated even then (it
+        /// was never set up, and its host is known bad).
         #[arg(long, default_value_t = 2, requires = "check", value_parser = clap::value_parser!(u32).range(1..=10))]
         check_attempts: u32,
         /// Per pod (and per replacement): how long it may take to come up — its SSH endpoint
@@ -1163,10 +1167,105 @@ impl CreateFailed {
     }
 }
 
+/// Ctrl+C for one command, latched: once pressed it stays pressed, and every phase of the
+/// command is handed the same one. `tokio::signal::ctrl_c()` alone only fires for a SIGINT
+/// that arrives after *that* listener started, so a Ctrl+C taken by one phase (`up`'s
+/// create retry wait) was invisible to the next (`up`'s pipelines, which then went on
+/// terminating and recreating pods under `--check` after the operator had said stop).
+///
+/// Armed lazily — the first time something waits on it — so until then SIGINT keeps its
+/// default (end the process), exactly as before. Once armed it stays armed for the process
+/// (tokio's handler can't be removed); from then on a Ctrl+C is only ever recorded here,
+/// which is why each phase after that must look at this latch rather than a fresh listener.
+#[derive(Clone)]
+struct Interrupt {
+    pressed: Arc<tokio::sync::watch::Sender<bool>>,
+    armed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Interrupt {
+    /// The terminal's Ctrl+C (SIGINT), not listened for until first waited on.
+    fn ctrl_c() -> Self {
+        Self {
+            pressed: Arc::new(tokio::sync::watch::channel(false).0),
+            armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// One nothing presses but [`Interrupt::press`] — no SIGINT handler is installed.
+    #[cfg(test)]
+    fn manual() -> Self {
+        let i = Self::ctrl_c();
+        i.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        i
+    }
+
+    #[cfg(test)]
+    fn press(&self) {
+        self.pressed.send_replace(true);
+    }
+
+    /// Start recording Ctrl+C (once). The SIGINT listener is registered right here, not on
+    /// a spawned task's first poll, so no press slips between arming and listening.
+    fn arm(&self) {
+        if self.armed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        use tokio::signal::unix::{signal, SignalKind};
+        // No handler (can't happen on unix): SIGINT keeps ending the process.
+        let Ok(mut sigint) = signal(SignalKind::interrupt()) else { return };
+        let pressed = self.pressed.clone();
+        tokio::spawn(async move {
+            if sigint.recv().await.is_some() {
+                pressed.send_replace(true);
+            }
+        });
+    }
+
+    fn is_set(&self) -> bool {
+        *self.pressed.borrow()
+    }
+
+    /// Resolves once Ctrl+C has been pressed — at once if it already was, in any phase.
+    fn wait(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        self.arm();
+        let mut rx = self.pressed.subscribe();
+        async move {
+            // `wait_for` looks at the current value first. It only errs once the latch
+            // itself is gone, and then nothing can press it any more.
+            if rx.wait_for(|p| *p).await.is_err() {
+                std::future::pending::<()>().await
+            }
+        }
+    }
+}
+
+/// The capacity wait an `up --check` replacement's placement gets — the one the first create
+/// had: `--retry-mins` (rounds every `--retry-secs`) when given; else `--keep-trying`'s own
+/// (a retry every [`CAPACITY_RETRY_SECS`], [`MAX_CAPACITY_ATTEMPTS`] of them after the first
+/// try, as `create_pods` waits); else one round. Without this a `--keep-trying` run's bad
+/// host was terminated and its replacement given a single try, so a momentary capacity gap
+/// left the name with no pod although the operator had asked to wait for one.
+fn replacement_rounds(keep_trying: bool, retry_mins: u64, retry_secs: u64) -> arena_core::placement::Rounds {
+    use arena_core::placement::Rounds;
+    if retry_mins > 0 {
+        Rounds { window: Duration::from_secs(retry_mins * 60), every: Duration::from_secs(retry_secs.max(1)) }
+    } else if keep_trying {
+        Rounds {
+            window: Duration::from_secs(CAPACITY_RETRY_SECS * u64::from(MAX_CAPACITY_ATTEMPTS)),
+            every: Duration::from_secs(CAPACITY_RETRY_SECS),
+        }
+    } else {
+        Rounds { window: Duration::ZERO, every: Duration::from_secs(retry_secs.max(1)) }
+    }
+}
+
 /// Top up toward the target, retrying for up to `retry_mins` (rounds every
-/// `retry_secs`) while capacity is short — Ctrl+C stops the loop early and keeps what
-/// was made. With `retry_mins == 0` it's a single attempt (honoring `keep_trying`).
+/// `retry_secs`) while capacity is short — Ctrl+C (`interrupt`, which stays pressed for
+/// whatever runs next) stops the loop early and keeps what was made. With
+/// `retry_mins == 0` it's a single attempt (honoring `keep_trying`).
 /// Returns every pod created across all rounds — on failure, inside [`CreateFailed`].
+#[allow(clippy::too_many_arguments)]
 async fn create_with_retry(
     provider: &dyn Provider,
     cfg: &Config,
@@ -1176,6 +1275,7 @@ async fn create_with_retry(
     keep_trying: bool,
     retry_mins: u64,
     retry_secs: u64,
+    interrupt: &Interrupt,
 ) -> std::result::Result<Vec<Made>, CreateFailed> {
     // Round 1 creates exactly the names that were previewed + confirmed, so the
     // `[created] …` output matches the `[y/N]` prompt. `target` (a provider-scoped total,
@@ -1221,10 +1321,10 @@ async fn create_with_retry(
         );
         let interrupted = tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_secs(retry_secs)) => false,
-            _ = tokio::signal::ctrl_c() => true,
+            _ = interrupt.wait() => true,
         };
         if interrupted {
-            eprintln!("interrupted — stopping retries with {} of {target}", all.len());
+            eprintln!("interrupted — stopping retries with {} of {shown}", all.len());
             break;
         }
         // Re-plan toward the SAME target so the next round only fills the shortfall.
@@ -1588,7 +1688,8 @@ fn placement_prompt(
 }
 
 /// Ordered placement for `names` (see `arena_core::placement::place`): progress lines as it
-/// goes, then the per-name summary. Same contract as [`create_with_retry`]: every pod made,
+/// goes, then the per-name summary. Same contract as [`create_with_retry`] (Ctrl+C between
+/// rounds via the command's `interrupt`, left pressed for what runs next): every pod made,
 /// or — on an auth/other failure — those pods inside [`CreateFailed`], so the caller still
 /// syncs the proxy for them. Each [`Made`] carries the option it landed on.
 #[allow(clippy::too_many_arguments)]
@@ -1601,6 +1702,7 @@ async fn place_names(
     plan: &arena_core::placement::OptionPlan,
     retry_mins: u64,
     retry_secs: u64,
+    interrupt: &Interrupt,
 ) -> std::result::Result<Vec<Made>, CreateFailed> {
     use arena_core::placement::{self, End, Outcome, Progress, Rounds, TopUp};
     let rounds = Rounds {
@@ -1620,11 +1722,9 @@ async fn place_names(
             eprintln!("{}", p.line());
         }
     };
-    let ctrl_c = || async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
     let start = tokio::time::Instant::now();
-    let run = placement::place(provider, base, &names, plan, rounds, topup.as_ref(), ctrl_c, &mut show).await;
+    let run =
+        placement::place(provider, base, &names, plan, rounds, topup.as_ref(), || interrupt.wait(), &mut show).await;
     print!("\n{}", placement::render_summary(plan, &run));
     let (placed, total) = (run.created.len(), names.len());
     // Each pod with its option and create time, from the attempt that made it.
@@ -4035,6 +4135,19 @@ async fn handle_pods(
     cfg: &Config,
     yes: bool,
 ) -> Result<()> {
+    handle_pods_with(cmd, provider, remote, cfg, yes, Interrupt::ctrl_c()).await
+}
+
+/// [`handle_pods`] with the command's Ctrl+C handed in — one latch for every phase of a
+/// `create`/`up` (tests press a manual one).
+async fn handle_pods_with(
+    cmd: PodCmd,
+    provider: &dyn Provider,
+    remote: Arc<dyn Remote>,
+    cfg: &Config,
+    yes: bool,
+    interrupt: Interrupt,
+) -> Result<()> {
     match cmd {
         PodCmd::List { json, probe, no_probe } => {
             // Fleet view across every configured provider (the aggregate provider), so
@@ -4125,8 +4238,13 @@ async fn handle_pods(
             // Explicit names retry just the names still missing; -n/-a re-plan toward the
             // total (topup_target == 0 marks the explicit case).
             let outcome = match &options {
-                Some(plan) => place_names(provider, cfg, names, topup_target, &spec, plan, retry_mins, retry_secs).await,
-                None => create_with_retry(provider, cfg, names, topup_target, &ov, keep_trying, retry_mins, retry_secs).await,
+                Some(plan) => {
+                    place_names(provider, cfg, names, topup_target, &spec, plan, retry_mins, retry_secs, &interrupt).await
+                }
+                None => {
+                    create_with_retry(provider, cfg, names, topup_target, &ov, keep_trying, retry_mins, retry_secs, &interrupt)
+                        .await
+                }
             };
             let (created, error) = match outcome {
                 Ok(created) => (created, None),
@@ -4200,11 +4318,17 @@ async fn handle_pods(
                 return Ok(());
             }
             // Provisioning settings too: a config without ARENA_REPO_* must fail before the
-            // create, not strand the new pods after it.
+            // create, not strand the new pods after it. Likewise the hetzner bare-VM script's
+            // temp file (an unwritable temp dir): staged after the create, its failure ended
+            // `up` with pods billing and no pipeline, proxy sync or summary for them. Creates
+            // go to the primary backend, so its name says whether a hetzner pod can result.
             let setup = if no_setup {
                 None
             } else {
-                Some(setup_config(cfg, None, None, false).context("provisioning settings (or pass --no-setup)")?)
+                let (scfg, tokens) =
+                    setup_config(cfg, None, None, false).context("provisioning settings (or pass --no-setup)")?;
+                let hetzner_script = stage_hetzner_script(provider.name() == "hetzner")?;
+                Some((up::SetupStage { scfg, timeouts: setup_timeouts, hetzner_script }, tokens))
             };
 
             let then = format!(
@@ -4222,12 +4346,20 @@ async fn handle_pods(
                 println!("aborted.");
                 return Ok(());
             }
+            // What the operator confirmed: a name of these that gets no pod is in the summary
+            // (and the exit status) too, not silently missing from it.
+            let confirmed = names.clone();
             // Create as many as capacity allows (retrying if requested); the pipelines run
             // on the ones we got. Explicit names create directly. A create that failed
             // part-way still syncs the proxy for the pods it made, then fails.
             let outcome = match &options {
-                Some(plan) => place_names(provider, cfg, names, topup_target, &spec, plan, retry_mins, retry_secs).await,
-                None => create_with_retry(provider, cfg, names, topup_target, &ov, keep_trying, retry_mins, retry_secs).await,
+                Some(plan) => {
+                    place_names(provider, cfg, names, topup_target, &spec, plan, retry_mins, retry_secs, &interrupt).await
+                }
+                None => {
+                    create_with_retry(provider, cfg, names, topup_target, &ov, keep_trying, retry_mins, retry_secs, &interrupt)
+                        .await
+                }
             };
             let created = match outcome {
                 Ok(created) => created,
@@ -4239,8 +4371,7 @@ async fn handle_pods(
                 }
             };
             if created.is_empty() {
-                eprintln!("no pods were created — nothing to wait for");
-                return Ok(());
+                anyhow::bail!("no pods were created — nothing to bring up");
             }
             if no_wait {
                 println!("\n--no-wait: not polling. Run `arena proxy apply` once endpoints are assigned.");
@@ -4251,14 +4382,10 @@ async fn handle_pods(
             // One independent pipeline per pod (see `up`). Replacements draw from the
             // confirmed options — on the single-spec path, that one spec as an option.
             let options = options.unwrap_or_else(|| single_option_plan(provider.name(), &spec));
-            let hetzner = provider.name() == "hetzner" || created.iter().any(|m| m.pod.provider == "hetzner");
-            let setup = match setup {
-                None => None,
-                Some((scfg, tokens)) => {
-                    println!("{tokens}");
-                    Some(up::SetupStage { scfg, timeouts: setup_timeouts, hetzner_script: stage_hetzner_script(hetzner)? })
-                }
-            };
+            let setup = setup.map(|(stage, tokens)| {
+                println!("{tokens}");
+                stage
+            });
             match &keys {
                 Some(k) => println!("API keys: {} — copied to each pod once it's set up", k.csv.join(", ")),
                 None if setup.is_some() => println!(
@@ -4273,10 +4400,7 @@ async fn handle_pods(
                 cfg,
                 options,
                 base: spec,
-                rounds: arena_core::placement::Rounds {
-                    window: Duration::from_secs(retry_mins * 60),
-                    every: Duration::from_secs(retry_secs.max(1)),
-                },
+                rounds: replacement_rounds(keep_trying, retry_mins, retry_secs),
                 timeout: Duration::from_secs(timeout),
                 interval: Duration::from_secs(interval.max(1)),
                 proxy: proxy_deployable(cfg).await,
@@ -4288,18 +4412,24 @@ async fn handle_pods(
                 }),
                 keys,
             };
-            println!(
-                "\nBringing up {} pod(s), each on its own (endpoint wait ≤{timeout}s per pod; Ctrl+C stops — \
-                 nothing is terminated by it)…",
-                created.len()
-            );
-            let interrupt = async {
-                // No handler (can't happen on unix): then there's nothing to wait for.
-                if tokio::signal::ctrl_c().await.is_err() {
-                    std::future::pending::<()>().await
-                }
-            };
-            let rows = up::run_up(&run, created, interrupt, &up::console).await;
+            let made: Vec<String> = created.iter().map(|m| m.pod.name.clone()).collect();
+            if interrupt.is_set() {
+                // Ctrl+C during the create: it still holds for the pipelines (they start
+                // stopped — nothing set up, terminated or recreated), so this is just the report.
+                eprintln!(
+                    "Ctrl+C during the create — the {} pod(s) made are left as they are, not set up \
+                     (`arena pods setup …` / `arena proxy apply` later)",
+                    created.len()
+                );
+            } else {
+                println!(
+                    "\nBringing up {} pod(s), each on its own (endpoint wait ≤{timeout}s per pod; Ctrl+C stops — \
+                     nothing is terminated by it)…",
+                    created.len()
+                );
+            }
+            let mut rows = up::run_up(&run, created, interrupt.wait(), &up::console).await;
+            rows.extend(up::not_created_rows(&confirmed, &made, interrupt.is_set()));
             up::conclude(&rows, &up::console)?;
         }
 
@@ -9377,6 +9507,48 @@ mod placement_cli_tests {
         assert_eq!(fake.calls(), [call("arena8-apple", "NVIDIA RTX A4000", "COMMUNITY")]);
     }
 
+    /// One press holds for every phase of the command — including one that only starts
+    /// waiting after it (a fresh `tokio::signal::ctrl_c()` there would never fire).
+    #[tokio::test(start_paused = true)]
+    async fn a_ctrl_c_stays_pressed_for_every_later_phase() {
+        let ctrl_c = Interrupt::manual();
+        let later = ctrl_c.clone();
+        assert!(!later.is_set());
+        let waiting = tokio::spawn(ctrl_c.wait());
+        ctrl_c.press();
+        waiting.await.unwrap();
+        assert!(later.is_set());
+        tokio::time::timeout(std::time::Duration::from_secs(1), later.wait()).await.expect("seen at once by a later phase");
+    }
+
+    /// An `up --check` replacement waits for capacity the way the first create did.
+    #[test]
+    fn replacement_rounds_follow_the_create_flags() {
+        use arena_core::placement::{next_round_in_window, Rounds};
+        let s = std::time::Duration::from_secs;
+        // (keep_trying, retry_mins, retry_secs) → rounds
+        let cases = [
+            ((false, 0, 60), Rounds { window: s(0), every: s(60) }),   // one try
+            ((false, 5, 30), Rounds { window: s(300), every: s(30) }), // --retry-mins
+            ((true, 5, 30), Rounds { window: s(300), every: s(30) }),  // --retry-mins wins, as in create_with_retry
+            ((true, 0, 60), Rounds { window: s(CAPACITY_RETRY_SECS * u64::from(MAX_CAPACITY_ATTEMPTS)), every: s(CAPACITY_RETRY_SECS) }),
+            ((false, 0, 0), Rounds { window: s(0), every: s(1) }),
+        ];
+        for ((kt, mins, secs), want) in cases {
+            let got = replacement_rounds(kt, mins, secs);
+            assert_eq!((got.window, got.every), (want.window, want.every), "keep_trying={kt} mins={mins} secs={secs}");
+        }
+        // --keep-trying: the first try + MAX_CAPACITY_ATTEMPTS retries, as `create_pods` makes.
+        let r = replacement_rounds(true, 0, 60);
+        let start = tokio::time::Instant::now();
+        let (mut now, mut rounds) = (start, 1);
+        while next_round_in_window(now, r.every, start + r.window) {
+            now += r.every;
+            rounds += 1;
+        }
+        assert_eq!(rounds, 1 + MAX_CAPACITY_ATTEMPTS);
+    }
+
     /// The single-option retry loop starts no round after `--retry-mins` (the multi-option
     /// executor's rule): it used to check the window only *before* sleeping, so with a
     /// `--retry-secs` longer than what was left it slept past the window and created anyway.
@@ -9386,7 +9558,7 @@ mod placement_cli_tests {
         for (mins, secs, want) in [(1, 600, 1), (1, 45, 2), (2, 60, 3), (1, 60, 2), (0, 30, 1)] {
             let fake = Recorder::dry(&["NVIDIA RTX A4000"]);
             let started = tokio::time::Instant::now();
-            let made = create_with_retry(&fake, &cfg(), vec!["arena8-apple".into()], 0, &SpecOverrides::default(), false, mins, secs)
+            let made = create_with_retry(&fake, &cfg(), vec!["arena8-apple".into()], 0, &SpecOverrides::default(), false, mins, secs, &Interrupt::manual())
                 .await
                 .unwrap();
             assert!(made.is_empty());

@@ -27,6 +27,10 @@ use crate::table::{self, Align};
 /// the final sync — or `arena proxy apply` — retries), so it's reported, not judged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
+    /// The name never got a pod: the create phase (capacity, its retry window, Ctrl+C)
+    /// ended without one. Not a pipeline stage — it's how a requested name that no pipeline
+    /// ran for still gets a row (and a non-zero exit) instead of vanishing from the report.
+    Create,
     /// Waiting for the provider to report the pod's SSH endpoint, and for sshd to answer on it.
     Endpoint,
     /// Provisioning over SSH (deploy key, repo, tokens — `pods setup`).
@@ -40,6 +44,7 @@ pub enum Stage {
 impl Stage {
     pub fn label(self) -> &'static str {
         match self {
+            Stage::Create => "create",
             Stage::Endpoint => "endpoint",
             Stage::Setup => "setup",
             Stage::Check => "check",
@@ -117,6 +122,15 @@ pub fn replacement_order(options: usize, failed: &[usize]) -> Vec<usize> {
 /// a false "same host" would throw away a good pod. Pure.
 pub fn on_failed_host(host: Option<&str>, failed_hosts: &[String]) -> bool {
     host.is_some_and(|h| !h.is_empty() && failed_hosts.iter().any(|f| f == h))
+}
+
+/// The confirmed names that got no pod in the create phase — each gets a row of its own in
+/// the report. At most as many as the create fell short by: a `-n`/`-a` retry round
+/// re-plans names (a confirmed one taken meanwhile is replaced by the next free one), and a
+/// name made in another's place is no shortfall. Pure.
+pub fn not_created(confirmed: &[String], created: &[String]) -> Vec<String> {
+    let short = confirmed.len().saturating_sub(created.len());
+    confirmed.iter().filter(|n| !created.contains(n)).take(short).cloned().collect()
 }
 
 /// A compact elapsed time for the READY lines and column: `45s`, `4m10s`, `1h02m`.
@@ -269,6 +283,23 @@ mod tests {
     }
 
     #[test]
+    fn names_without_a_pod_are_the_shortfall_only() {
+        let v = |s: &[&str]| s.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        // (confirmed, created, rows for)
+        let cases: &[(&[&str], &[&str], &[&str])] = &[
+            (&["a", "b"], &["a", "b"], &[]),
+            (&["a", "b"], &["a"], &["b"]),           // explicit names: the one missing
+            (&["a", "b", "c"], &[], &["a", "b", "c"]),
+            (&["a", "b"], &["a", "c"], &[]),         // a re-planned round made c for b: no shortfall
+            (&["a", "b", "c"], &["c", "d"], &["a"]), // short by one: the first one missing
+            (&[], &["a"], &[]),
+        ];
+        for (confirmed, created, want) in cases {
+            assert_eq!(not_created(&v(confirmed), &v(created)), v(want), "{confirmed:?} / {created:?}");
+        }
+    }
+
+    #[test]
     fn elapsed_is_compact() {
         let s = Duration::from_secs;
         for (d, want) in [
@@ -376,6 +407,7 @@ devtest-echo: stopped at endpoint (Ctrl+C) — left as it was
         assert_eq!(Verdict::Ready.status_label(), "READY");
         assert_eq!(Verdict::Failed { stage: Stage::Keys, reason: String::new() }.status_label(), "FAILED keys");
         assert_eq!(Verdict::Stopped { stage: Stage::Check }.status_label(), "STOPPED check");
+        assert_eq!(Verdict::Failed { stage: Stage::Create, reason: String::new() }.status_label(), "FAILED create");
         assert!(Verdict::Ready.is_ready() && !Verdict::Stopped { stage: Stage::Setup }.is_ready());
         let rows = vec![row("devtest-apple", Verdict::Failed { stage: Stage::Endpoint, reason: "no SSH endpoint after 600s".into() }, vec![])];
         let got = render_up_summary(&rows);

@@ -125,17 +125,24 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     serves every pod's endpoint wait. Ends with the usual one-line proxy sync and a `NAME
     GPU $/H PROXY PORT HEALTH STATUS READY AFTER` table (READY AFTER = first create →
     confirmed ready, replacements included: start participants' clocks at READY), plus a
-    line per name that failed, warned or was replaced; exits non-zero unless every pod is
-    READY. A pod that fails is left running — one is only ever terminated to make room for
-    its `--check` replacement.
+    line per name that failed, warned or was replaced — a requested name that got no pod is
+    a `FAILED create` row; exits non-zero unless every requested name is READY (and when
+    nothing was created at all). A pod that fails is left running — one is only ever
+    terminated by `--check`. Without a proxy layout, a READY pod's `~/.ssh/config` fleet map
+    is rewritten at the end if pods came up after it.
     **`--check`** deep-checks each pod after setup (`pods test --deep`). A FAIL is a bad
-    host: the pod is terminated, confirmed gone (never two pods per name), and the name
-    recreated from the same `--gpu/--cloud/--max-price` options (or the one configured spec)
-    — options that haven't failed first — and run through the pipeline again; a replacement
-    that lands on a machine IP that already failed (any name's) is rejected unseen. Up to
-    `--check-attempts N` placements per name (default 2); the last failing pod is left
-    running for a look. A WARN counts as ready (shown in HEALTH). **Ctrl+C** stops every
-    pipeline where it is, starts nothing new, terminates nothing, and reports.
+    host: the pod is terminated, confirmed gone from its own provider's listing (never two
+    pods per name), and the name recreated from the same `--gpu/--cloud/--max-price` options
+    (or the one configured spec) — options that haven't failed first, waiting for capacity
+    per `--retry-mins` or `--keep-trying` — and run through the pipeline again; a replacement
+    that lands on a machine IP that already failed (any name's) is rejected unseen and
+    terminated (even with no attempt left). Up to `--check-attempts N` placements per name
+    (default 2); the last pod that FAILed its check is left running for a look. Only a check
+    whose script ran can condemn a host: one that couldn't run (SSH dropped, timed out) is
+    rerun once SSH answers, and if it still can't run the name FAILs with the pod left
+    running. A WARN counts as ready (shown in HEALTH). **Ctrl+C** stops every pipeline where
+    it is, starts nothing new, terminates nothing, and reports — also when pressed during
+    the create's retry wait (the pipelines then start stopped).
     So `pods up -n 28 --gpu A40 --cloud SECURE --disk 200 --retry-mins 60 --check` is a full
     start-of-iteration spin-up. Confirms first (`--dry-run` previews the pipeline);
     `--no-wait` skips everything after the create (not with `--check`).

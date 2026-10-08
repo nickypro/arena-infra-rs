@@ -10,8 +10,11 @@
 //! or `[name] FAILED <stage>: …` (left running). With `--check` a pod that FAILs the deep
 //! check is terminated — and confirmed gone, so a name never has two pods — then its name is
 //! recreated from the confirmed options and the new pod runs the pipeline again; one that
-//! lands on a machine that already failed is rejected the same way. Ctrl+C stops every
-//! pipeline where it is and launches nothing new; nothing is terminated because of it.
+//! lands on a machine that already failed is rejected the same way (and terminated even with
+//! no attempt left to replace it: it was never set up, and its machine is known bad). Only a
+//! check whose script actually ran can condemn a host: one that couldn't run (SSH dropped,
+//! timed out) is retried once, then FAILs the name with the pod left running. Ctrl+C stops
+//! every pipeline where it is and launches nothing new; nothing is terminated because of it.
 //!
 //! Concurrency is cooperative, on this one task: the pipelines borrow the fleet provider,
 //! so they can't be spawned, and [`join_unordered`] drives them side by side instead —
@@ -147,6 +150,9 @@ struct NameRun {
     health: Option<PodHealth>,
     /// The proxy port its pipeline's sync routed to it.
     port: Option<u16>,
+    /// The fleet-SSH write its keys stage made (authorized keys + `~/.ssh/config` host map),
+    /// so the report can tell whether a map rendered from a since-grown listing is stale.
+    fleet_ssh: Option<String>,
     verdict: Verdict,
     ready_at: Option<Instant>,
 }
@@ -227,6 +233,30 @@ where
     };
     names.sort_by_key(|(i, _)| *i);
     shared.report(names.into_iter().map(|(_, n)| n).collect()).await
+}
+
+/// A row for each confirmed name the create phase made no pod for
+/// ([`pipeline::not_created`]): `FAILED create`, or `STOPPED create` after a Ctrl+C — so the
+/// summary covers every name the operator asked for, and [`conclude`] fails for it.
+pub(crate) fn not_created_rows(confirmed: &[String], made: &[String], interrupted: bool) -> Vec<UpRow> {
+    pipeline::not_created(confirmed, made)
+        .into_iter()
+        .map(|name| UpRow {
+            name,
+            gpu: "-".into(),
+            price: "-".into(),
+            proxy_port: None,
+            health: None,
+            health_notes: String::new(),
+            verdict: if interrupted {
+                Verdict::Stopped { stage: Stage::Create }
+            } else {
+                Verdict::Failed { stage: Stage::Create, reason: "no pod was created for it (the create output above says why)".into() }
+            },
+            ready_after: None,
+            attempts: Vec::new(),
+        })
+        .collect()
 }
 
 /// The summary table, then `Err` (non-zero exit) unless every pod is READY.
@@ -324,6 +354,7 @@ impl Shared<'_, '_> {
             option: 0,
             health: None,
             port: None,
+            fleet_ssh: None,
             verdict: Verdict::Stopped { stage: Stage::Endpoint },
             ready_at: None,
         };
@@ -357,6 +388,7 @@ impl Shared<'_, '_> {
         run.option = option;
         run.health = None;
         run.port = None;
+        run.fleet_ssh = None;
         run.pod = Some(pod.clone());
 
         // 1. Its SSH endpoint, within its own deadline.
@@ -442,9 +474,44 @@ impl Shared<'_, '_> {
                     Some(Ok(())) => {}
                 }
             }
-            let Some(h) = self.or_stop(self.deep_check(&name, &pod, &target, check)).await else {
+            let Some(mut h) = self.or_stop(self.deep_check(&name, &pod, &target, check)).await else {
                 return self.end(run, Verdict::Stopped { stage: Stage::Check });
             };
+            // Only a check whose script ran to the end can condemn the host (terminate it,
+            // count its IP against every name). One that couldn't run — the SSH session
+            // dropped, or the call timed out, moments after setup reached this very pod —
+            // says nothing about the machine ("confirm before alarming"): once SSH answers
+            // again it's run once more, and if that can't run either the name FAILs with the
+            // pod left running for a look.
+            if !script_ran(&h) {
+                say(To::Err, &format!("[{name}] check: couldn't run it ({}) — once more when SSH answers", h.notes()));
+                match self.or_stop(self.ssh_answers(&target, BootRetry::default())).await {
+                    None => return self.end(run, Verdict::Stopped { stage: Stage::Check }),
+                    Some(Err(why)) => {
+                        let reason = format!(
+                            "couldn't run the deep check ({}), then SSH didn't answer ({why}) — left running; its \
+                             host isn't counted as bad",
+                            h.notes()
+                        );
+                        run.health = Some(h);
+                        return self.end(run, Verdict::Failed { stage: Stage::Check, reason });
+                    }
+                    Some(Ok(())) => {}
+                }
+                let Some(again) = self.or_stop(self.deep_check(&name, &pod, &target, check)).await else {
+                    return self.end(run, Verdict::Stopped { stage: Stage::Check });
+                };
+                if !script_ran(&again) {
+                    let reason = format!(
+                        "couldn't run the deep check twice ({}) — left running (`arena pods test --deep {name}`); \
+                         its host isn't counted as bad",
+                        again.notes()
+                    );
+                    run.health = Some(again);
+                    return self.end(run, Verdict::Failed { stage: Stage::Check, reason });
+                }
+                h = again;
+            }
             let (status, notes) = (h.status, h.notes());
             run.health = Some(h);
             match status {
@@ -472,7 +539,10 @@ impl Shared<'_, '_> {
                     let reason = format!("{why} — left running (retry: `arena pods copy-keys {name}`)");
                     return self.end(run, Verdict::Failed { stage: Stage::Keys, reason });
                 }
-                Some(Ok((to, line))) => say(to, &line),
+                Some(Ok((to, line, fleet_ssh))) => {
+                    say(to, &line);
+                    run.fleet_ssh = fleet_ssh;
+                }
             }
         }
 
@@ -508,14 +578,19 @@ impl Shared<'_, '_> {
 
     /// Replace the name's pod: terminate it, wait until it's gone (never two pods under one
     /// name), then recreate the name through the placement executor — options that haven't
-    /// failed first. Only while attempts remain and Ctrl+C hasn't been pressed: otherwise the
-    /// pod is left running for a look and the name FAILs.
+    /// failed first. Only while attempts remain and Ctrl+C hasn't been pressed: otherwise a
+    /// pod that failed its check is left running for a look and the name FAILs. A pod
+    /// rejected for its machine is terminated even with no attempt left (unless Ctrl+C): it
+    /// was never set up and its host is known bad, so there's nothing to look at — kept, it
+    /// would only bill and take the name's proxy port.
     async fn replace(&self, run: &mut NameRun, pod: &Pod, failed_options: &[usize], why: String) -> Option<(Pod, usize)> {
         let say = self.say;
         let name = run.name.clone();
         let max = self.run.check.as_ref().map_or(1, |c| c.attempts) as usize;
         let n = run.attempts.len();
-        if n >= max {
+        let rejected = run.attempts.last().is_some_and(|a| a.end == AttemptEnd::SameHost);
+        let last = n >= max;
+        if last && !rejected {
             let reason = format!("{why} — no attempts left (--check-attempts {max}); left running");
             return self.end(run, Verdict::Failed { stage: Stage::Check, reason });
         }
@@ -523,9 +598,13 @@ impl Shared<'_, '_> {
             let reason = format!("{why} — not replaced (interrupted); left running");
             return self.end(run, Verdict::Failed { stage: Stage::Check, reason });
         }
-        say(To::Err, &format!("[{name}] terminating {} to recreate {name} (attempt {} of {max})", pod.id, n + 1));
+        if last {
+            say(To::Err, &format!("[{name}] terminating {} — no attempt left to replace it (--check-attempts {max})", pod.id));
+        } else {
+            say(To::Err, &format!("[{name}] terminating {} to recreate {name} (attempt {} of {max})", pod.id, n + 1));
+        }
         if let Err(e) = self.run.provider.terminate_pod(&pod.id).await {
-            let reason = format!("{why}; terminating it for a replacement failed: {e} — left running");
+            let reason = format!("{why}; terminating it failed: {e} — left running");
             return self.end(run, Verdict::Failed { stage: Stage::Check, reason });
         }
         if let Some(a) = run.attempts.last_mut() {
@@ -533,7 +612,19 @@ impl Shared<'_, '_> {
         }
         run.pod = None;
         run.port = None;
-        match self.or_stop(self.wait_gone(&pod.id)).await {
+        let gone = self.or_stop(self.wait_gone(pod)).await;
+        if last {
+            // Waited for all the same, so the final proxy sync doesn't route the name to it.
+            let listed = if gone == Some(false) {
+                format!(" ({} still listed after {}s: `arena proxy apply` once it's gone)", pod.id, GONE_TIMEOUT.as_secs())
+            } else {
+                String::new()
+            };
+            let reason =
+                format!("{why} — no attempts left (--check-attempts {max}); terminated it — {name} has no pod now{listed}");
+            return self.end(run, Verdict::Failed { stage: Stage::Check, reason });
+        }
+        match gone {
             None => {
                 let reason = format!("{why}; terminated it, then Ctrl+C before its replacement — {name} has no pod now");
                 return self.end(run, Verdict::Failed { stage: Stage::Check, reason });
@@ -638,15 +729,26 @@ impl Shared<'_, '_> {
         }
     }
 
-    /// Whether the terminated pod `id` has left the listing (or is listed as terminated)
-    /// within [`GONE_TIMEOUT`]. A failed list proves nothing, so it just counts as "not yet".
-    async fn wait_gone(&self, id: &str) -> bool {
+    /// Whether the terminated `pod` has left its provider's listing (or is listed as
+    /// terminated) within [`GONE_TIMEOUT`]. Asked of the backend that owns it, not the fleet
+    /// aggregate: that skips a backend that fails to list, and "not in RunPod's listing"
+    /// read off a listing RunPod isn't in would create the replacement next to the old pod.
+    /// So a failed (or absent) owner listing proves nothing — it just counts as "not yet".
+    async fn wait_gone(&self, pod: &Pod) -> bool {
         let every = self.run.interval.max(Duration::from_secs(1));
         let deadline = Instant::now() + GONE_TIMEOUT;
-        let provider = self.run.provider;
         loop {
-            if let Ok(pods) = bounded_list(provider.name(), provider.list_pods(), LIST_TIMEOUT).await {
-                if !pods.iter().any(|p| p.id == id && !p.status.eq_ignore_ascii_case("TERMINATED")) {
+            // Per backend, each list bounded (`list_by_provider`'s contract).
+            let listings = self.run.provider.list_by_provider().await;
+            let owner = match listings.iter().find(|(p, _)| *p == pod.provider) {
+                Some(l) => Some(l),
+                None => match &listings[..] {
+                    [only] => Some(only),
+                    _ => None,
+                },
+            };
+            if let Some((_, Ok(pods))) = owner {
+                if !pods.iter().any(|p| p.id == pod.id && !p.status.eq_ignore_ascii_case("TERMINATED")) {
                     return true;
                 }
             }
@@ -714,34 +816,81 @@ impl Shared<'_, '_> {
 
     /// This pod's API keys (its per-host CSV keys + the broadcast tokens) and the fleet SSH
     /// map, in one bounded exec — `pods copy-keys` for exactly this pod. `Ok` carries the
-    /// line to print.
+    /// line to print and the fleet-SSH write it made (none if there was nothing to send).
     async fn copy_keys(
         &self,
         name: &str,
         pod: &Pod,
         target: &SshTarget,
         keys: &KeySources,
-    ) -> std::result::Result<(To, String), String> {
+    ) -> std::result::Result<(To, String, Option<String>), String> {
         let (vars, matched) = keys.vars_for(&pod.name);
         if vars.is_empty() {
-            return Ok((To::Err, format!("[{name}] keys: none for it (no per-host key matched {name}, no broadcast token set)")));
+            let line = format!("[{name}] keys: none for it (no per-host key matched {name}, no broadcast token set)");
+            return Ok((To::Err, line, None));
         }
         let fleet_pods = self.listing.borrow().clone();
         let (fleet_ssh, _) = fleet_ssh_for(self.run.cfg, &fleet_pods);
         match self.run.remote.exec(target, &copy_keys_command(&vars, &fleet_ssh), Some(COPY_KEYS_TIMEOUT)).await {
-            Ok(o) if o.success && matched => Ok((To::Out, format!("[{name}] keys ✓"))),
+            Ok(o) if o.success && matched => Ok((To::Out, format!("[{name}] keys ✓"), Some(fleet_ssh))),
             Ok(o) if o.success => Ok((
                 To::Err,
                 format!("[{name}] keys ✓ — broadcast tokens only: no per-host key in keys/*_api_keys.csv matched {name}"),
+                Some(fleet_ssh),
             )),
             Ok(o) => Err(format!("copying its keys: exit {:?}: {}", o.code, o.stderr.trim())),
             Err(e) => Err(format!("copying its keys: {}", describe_error(&e))),
         }
     }
 
+    /// A READY pod's keys stage wrote its `~/.ssh/config` fleet map from the listing of that
+    /// moment. With a proxy layout that map is the stable port list and never changes; without
+    /// one it names only the pods that had an endpoint by then — so a pod READY early would
+    /// never learn of one whose endpoint came later (or of a replacement), where the batch flow
+    /// wrote every map after the last endpoint. So: re-render it from the final listing and
+    /// rewrite it (the fleet-SSH half only; one bounded exec each, side by side) on every READY
+    /// pod whose map that changes. Best effort — a failure is reported, the pod stays READY.
+    async fn refresh_fleet_ssh(&self, names: &[NameRun], pods: &[Pod]) {
+        let (fresh, _) = fleet_ssh_for(self.run.cfg, pods);
+        let stale: Vec<(&str, SshTarget)> = names
+            .iter()
+            .filter(|r| r.verdict.is_ready() && r.fleet_ssh.as_ref().is_some_and(|wrote| *wrote != fresh))
+            .filter_map(|r| {
+                let pod = r.pod.as_ref()?;
+                let now = pods.iter().find(|p| p.id == pod.id).unwrap_or(pod);
+                Some((r.name.as_str(), SshTarget::from_pod(now, self.run.cfg).ok()?))
+            })
+            .collect();
+        let fresh = &fresh;
+        let writes = stale
+            .iter()
+            .map(|(name, target)| async move { (*name, self.run.remote.exec(target, fresh, Some(COPY_KEYS_TIMEOUT)).await) })
+            .collect();
+        for (name, written) in join_unordered(writes).await {
+            match written {
+                Ok(o) if o.success => {
+                    (self.say)(To::Out, &format!("[{name}] fleet SSH map updated with the pods that came up after it"))
+                }
+                Ok(o) => (self.say)(
+                    To::Err,
+                    &format!(
+                        "[{name}] fleet SSH map NOT updated (exit {:?}: {}) — `arena pods copy-keys {name}`",
+                        o.code,
+                        one_line(&o.stderr)
+                    ),
+                ),
+                Err(e) => (self.say)(
+                    To::Err,
+                    &format!("[{name}] fleet SSH map NOT updated ({}) — `arena pods copy-keys {name}`", describe_error(&e)),
+                ),
+            }
+        }
+    }
+
     /// After the pipelines: one more proxy merge from a fresh listing (an endpoint can move
-    /// while setup runs; a replaced pod's forward follows its name), then the rows — GPU and
-    /// $/h from one listing with the provider's best-effort details.
+    /// while setup runs; a replaced pod's forward follows its name), the fleet SSH maps that
+    /// listing outdates, then the rows — GPU and $/h from one listing with the provider's
+    /// best-effort details.
     async fn report(&self, names: Vec<NameRun>) -> Vec<UpRow> {
         let say = self.say;
         let synced = match &self.run.proxy {
@@ -754,7 +903,15 @@ impl Shared<'_, '_> {
             _ => HashMap::new(),
         };
         let provider = self.run.provider;
-        let mut pods = bounded_list(provider.name(), provider.list_pods(), LIST_TIMEOUT).await.unwrap_or_default();
+        // Per backend (each list bounded): the rows take whatever answered; a fleet map is
+        // only rewritten from a listing every backend answered — one missing a backend would
+        // drop that backend's pods from maps that had them.
+        let listings = provider.list_by_provider().await;
+        let complete = listings.iter().all(|(_, l)| l.is_ok());
+        let mut pods: Vec<Pod> = listings.into_iter().filter_map(|(_, l)| l.ok()).flatten().collect();
+        if complete && !self.stopped() {
+            self.refresh_fleet_ssh(&names, &pods).await;
+        }
         if let Some(w) = enrich_best_effort(provider, &mut pods, ENRICH_TIMEOUT).await {
             say(To::Err, &w);
         }
@@ -803,6 +960,13 @@ fn one_line(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Whether a deep check's script ran start to end — the only kind of check that says
+/// anything about the machine. No facts (ssh failed, the call timed out), no header (it
+/// never started), or no trailer (the session was cut mid-run) is a check that couldn't run.
+fn script_ran(h: &PodHealth) -> bool {
+    h.facts.as_ref().is_some_and(|f| f.started && f.complete)
+}
+
 /// The pipelines end to end over a scripted fleet (`Fleet`) and `FakeRemote`, on a paused
 /// clock: every endpoint delay, budget and poll interval elapses instantly and exactly, so
 /// "A was READY before B's endpoint existed" is a statement about tokio time.
@@ -822,14 +986,13 @@ mod tests {
 
     /// A RunPod-like fleet: a create makes a pod with no endpoint, which gets the next
     /// endpoint scripted for its name once that endpoint's delay has passed; a terminated pod
-    /// leaves the listing at once. Records creates/terminates in order, counts list calls,
-    /// and how many proxy merges overlap (`list_by_provider` is only called by the proxy
-    /// sync, and takes 2s here so overlapping writers would show).
+    /// leaves the listing after `linger` (at once by default). Records creates/terminates in
+    /// order, counts list calls, and how many `list_by_provider` calls overlap (the proxy
+    /// test makes each take `sync_delay`, so overlapping proxy writers would show).
     #[derive(Default)]
     struct Fleet {
         endpoints: Mutex<HashMap<String, VecDeque<(String, u16, Duration)>>>,
-        /// (pod without endpoint, endpoint from, ip, port)
-        pods: Mutex<Vec<(Pod, Instant, String, u16)>>,
+        pods: Mutex<Vec<Slot>>,
         events: Mutex<Vec<String>>,
         next_id: AtomicUsize,
         lists: AtomicUsize,
@@ -838,6 +1001,26 @@ mod tests {
         /// `enrich` calls (RunPod: one GraphQL query each); it puts a maintenance window on
         /// `devtest-cloud`.
         enriched: AtomicUsize,
+        sync_delay: Duration,
+        /// How long a terminated pod stays listed.
+        linger: Duration,
+        /// After a terminate, RunPod's own listing fails for this long while a second
+        /// (empty) backend answers — a multi-provider fleet, whose aggregate `list_pods`
+        /// skips the failed backend. Non-zero also makes `list_by_provider` list both.
+        down_after_terminate: Duration,
+        down_until: Mutex<Option<Instant>>,
+        /// After a terminate, creating that name hits "no capacity" for this long.
+        dry_after_terminate: Duration,
+        dry_until: Mutex<Option<(String, Instant)>>,
+    }
+
+    /// A pod in the fake: its endpoint from `from`; listed until `gone_at`.
+    struct Slot {
+        pod: Pod,
+        from: Instant,
+        ip: String,
+        port: u16,
+        gone_at: Option<Instant>,
     }
 
     impl Fleet {
@@ -857,14 +1040,18 @@ mod tests {
             let now = Instant::now();
             let pods = self.pods.lock().unwrap();
             pods.iter()
-                .map(|(p, from, ip, port)| {
-                    let mut p = p.clone();
-                    if now >= *from {
-                        (p.ssh_ip, p.ssh_port) = (Some(ip.clone()), Some(*port));
+                .filter(|s| s.gone_at.is_none_or(|g| now < g))
+                .map(|s| {
+                    let mut p = s.pod.clone();
+                    if now >= s.from {
+                        (p.ssh_ip, p.ssh_port) = (Some(s.ip.clone()), Some(s.port));
                     }
                     p
                 })
                 .collect()
+        }
+        fn runpod_down(&self) -> bool {
+            self.down_until.lock().unwrap().is_some_and(|t| Instant::now() < t)
         }
     }
 
@@ -878,20 +1065,30 @@ mod tests {
         }
         async fn list_pods(&self) -> CoreResult<Vec<Pod>> {
             self.lists.fetch_add(1, Ordering::SeqCst);
-            Ok(self.listed())
+            // The aggregate skips a backend that failed: RunPod down → just the empty other one.
+            Ok(if self.runpod_down() { Vec::new() } else { self.listed() })
         }
         async fn list_by_provider(&self) -> Vec<(String, CoreResult<Vec<Pod>>)> {
             let now = self.syncing.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_syncing.fetch_max(now, Ordering::SeqCst);
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::time::sleep(self.sync_delay).await;
             self.syncing.fetch_sub(1, Ordering::SeqCst);
-            vec![("runpod".into(), Ok(self.listed()))]
+            let runpod = if self.runpod_down() { Err(Error::provider("runpod: HTTP 502 Bad Gateway")) } else { Ok(self.listed()) };
+            let mut out = vec![("runpod".to_string(), runpod)];
+            if !self.down_after_terminate.is_zero() {
+                out.push(("hetzner".into(), Ok(Vec::new())));
+            }
+            out
         }
         async fn create_pod(&self, spec: &PodSpec) -> CoreResult<Pod> {
             self.events.lock().unwrap().push(format!("create {} {}", spec.name, spec.gpu_type));
+            // The invariant `--check` must keep: a pod it terminated is gone from the listing
+            // before the name is created again — never two pods under one name.
+            assert!(!self.listed().iter().any(|p| p.name == spec.name), "a second pod named {} while one is listed", spec.name);
+            if self.dry_until.lock().unwrap().as_ref().is_some_and(|(n, t)| *n == spec.name && Instant::now() < *t) {
+                return Err(Error::capacity("create pod HTTP 500: There are no instances currently available"));
+            }
             let mut pods = self.pods.lock().unwrap();
-            // The invariant `--check` must keep: never two live pods under one name.
-            assert!(!pods.iter().any(|(p, ..)| p.name == spec.name), "a second pod named {} while one is live", spec.name);
             let Some((ip, port, after)) = self.endpoints.lock().unwrap().get_mut(&spec.name).and_then(VecDeque::pop_front) else {
                 return Err(Error::capacity("create pod HTTP 500: There are no instances currently available"));
             };
@@ -905,7 +1102,7 @@ mod tests {
                 cost_per_hr: Some(0.17),
                 ..Default::default()
             };
-            pods.push((pod.clone(), Instant::now() + after, ip, port));
+            pods.push(Slot { pod: pod.clone(), from: Instant::now() + after, ip, port, gone_at: None });
             Ok(pod)
         }
         async fn enrich(&self, pods: &mut [Pod]) -> CoreResult<()> {
@@ -927,7 +1124,17 @@ mod tests {
         }
         async fn terminate_pod(&self, id: &str) -> CoreResult<()> {
             self.events.lock().unwrap().push(format!("terminate {id}"));
-            self.pods.lock().unwrap().retain(|(p, ..)| p.id != id);
+            let now = Instant::now();
+            let mut pods = self.pods.lock().unwrap();
+            if let Some(s) = pods.iter_mut().find(|s| s.pod.id == id) {
+                s.gone_at = Some(now + self.linger);
+                if !self.dry_after_terminate.is_zero() {
+                    *self.dry_until.lock().unwrap() = Some((s.pod.name.clone(), now + self.dry_after_terminate));
+                }
+            }
+            if !self.down_after_terminate.is_zero() {
+                *self.down_until.lock().unwrap() = Some(now + self.down_after_terminate);
+            }
             Ok(())
         }
     }
@@ -1362,11 +1569,14 @@ mod tests {
         // Three endpoints at the same instant: three pipelines reach the proxy together.
         let dir = tmp_dir("proxy");
         let conf = dir.0.join("proxy.conf");
-        let fleet = Fleet::new(&[
-            ("apple", &[("10.0.0.1", 22001, 0)]),
-            ("bloom", &[("10.0.0.2", 22002, 0)]),
-            ("cloud", &[("10.0.0.3", 22003, 0)]),
-        ]);
+        let fleet = Fleet {
+            sync_delay: Duration::from_secs(2),
+            ..Fleet::new(&[
+                ("apple", &[("10.0.0.1", 22001, 0)]),
+                ("bloom", &[("10.0.0.2", 22002, 0)]),
+                ("cloud", &[("10.0.0.3", 22003, 0)]),
+            ])
+        };
         let fake = Arc::new(FakeRemote::new());
         let cfg = cfg(Some(&conf));
         let run = up_run(&fleet, fake.clone(), &cfg, false, None, None).await;
@@ -1461,6 +1671,285 @@ mod tests {
             [format!("create devtest-apple {A4000}"), "terminate id1".to_string(), format!("create devtest-apple {A4000}")]
         );
         assert_eq!(fake.calls_to(&host("10.0.0.2", 22002)).len(), 3, "setup (2) + check on the replacement");
+    }
+
+    /// `pods up <names> --check` as the command runs it, otherwise default flags.
+    fn up_cmd(names: &[&str]) -> crate::PodCmd {
+        crate::PodCmd::Up {
+            names: names.iter().map(|n| n.to_string()).collect(),
+            count: None,
+            add: None,
+            gpu: None,
+            gpus: None,
+            cloud: None,
+            max_price: None,
+            order: Order::Cheapest,
+            disk: None,
+            volume: None,
+            image: None,
+            bootstrap: false,
+            dry_run: false,
+            no_wait: false,
+            keep_trying: false,
+            retry_mins: 0,
+            retry_secs: 60,
+            no_setup: false,
+            check: true,
+            check_attempts: 2,
+            timeout: 600,
+            interval: 10,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ctrl_c_during_the_create_still_stops_the_pipelines() {
+        // apple is created on a bad host; bloom finds no capacity, so the create waits to
+        // retry — and Ctrl+C lands in that wait. The same press must hold for the pipelines:
+        // apple is not set up, checked, terminated or recreated. (A fresh Ctrl+C listener
+        // for the pipelines never saw it: apple was checked, terminated and recreated.)
+        // Both create paths: the single configured spec, and a `--gpu` option list.
+        for gpu in [None, Some("A4000,3090")] {
+            let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 0), ("10.0.0.2", 22002, 0)])]);
+            let fake = Arc::new(FakeRemote::new());
+            fake.script(&host("10.0.0.1", 22001), [FakeReply::ok(), FakeReply::ok(), bad_host()]);
+            let mut cmd = up_cmd(&["apple", "bloom"]);
+            if let crate::PodCmd::Up { gpu: g, retry_mins, retry_secs, .. } = &mut cmd {
+                (*g, *retry_mins, *retry_secs) = (gpu.map(String::from), 1, 30);
+            }
+            let ctrl_c = crate::Interrupt::manual();
+            let press = ctrl_c.clone();
+            let start = Instant::now();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                press.press();
+            });
+            let err = crate::handle_pods_with(cmd, &fleet, fake.clone(), &cfg(None), true, ctrl_c)
+                .await
+                .unwrap_err()
+                .to_string();
+            let creates: Vec<String> = fleet.events();
+            assert!(creates.iter().all(|e| e.starts_with("create ")), "{gpu:?}: nothing terminated: {creates:?}");
+            assert_eq!(creates.iter().filter(|e| e.starts_with("create devtest-apple")).count(), 1, "{gpu:?}: {creates:?}");
+            assert!(fake.calls().is_empty(), "{gpu:?}: apple was never set up or checked: {:?}", fake.calls());
+            assert_eq!(start.elapsed(), Duration::from_secs(2), "{gpu:?}: ends at the press, not the 30s retry wait");
+            assert_eq!(err, "2 of 2 pod(s) not ready: devtest-apple (STOPPED endpoint), devtest-bloom (STOPPED create)", "{gpu:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_name_that_got_no_pod_is_reported_and_fails_the_run() {
+        // bloom has no capacity (and no --retry-mins): apple comes up READY, bloom never got
+        // a pod — it's a row of its own and the exit is non-zero.
+        let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 0)])]);
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host("10.0.0.1", 22001), [FakeReply::ok(), FakeReply::ok(), healthy()]);
+        let err = crate::handle_pods_with(up_cmd(&["apple", "bloom"]), &fleet, fake.clone(), &cfg(None), true, crate::Interrupt::manual())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "1 of 2 pod(s) not ready: devtest-bloom (FAILED create)");
+
+        let rows = not_created_rows(&["devtest-apple".into(), "devtest-bloom".into()], &["devtest-apple".into()], false);
+        let summary = pipeline::render_up_summary(&rows);
+        let row = summary.lines().find(|l| l.starts_with("devtest-bloom ")).unwrap_or_else(|| panic!("{summary}"));
+        assert!(row.contains(" FAILED create ") && !row.contains("READY"), "{summary}");
+        assert!(summary.contains("devtest-bloom: FAILED create — no pod was created for it (the create output above says why)"), "{summary}");
+        let stopped = not_created_rows(&["devtest-bloom".into()], &[], true);
+        assert_eq!(stopped[0].verdict, Verdict::Stopped { stage: Stage::Create });
+
+        // Nothing created at all is a failed `up` too, not "nothing to wait for".
+        let fleet = Fleet::new(&[]);
+        let err = crate::handle_pods_with(up_cmd(&["apple"]), &fleet, fake, &cfg(None), true, crate::Interrupt::manual())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "no pods were created — nothing to bring up");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_replacement_on_the_failed_machine_with_no_attempt_left_is_terminated() {
+        // Default --check-attempts 2: #1 fails on 10.0.0.1, #2 lands on 10.0.0.1 again. With
+        // no attempt left it's still rejected — terminated, never set up, never routed.
+        let dir = tmp_dir("same-host-last");
+        let conf = dir.0.join("proxy.conf");
+        let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 0), ("10.0.0.1", 22002, 0)])]);
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host("10.0.0.1", 22001), [FakeReply::ok(), FakeReply::ok(), bad_host()]);
+        let cfg = cfg(Some(&conf));
+        let run = up_run(&fleet, fake.clone(), &cfg, true, Some(2), None).await;
+        let made = make(&fleet, &["apple"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+
+        assert_eq!(
+            fleet.events(),
+            [
+                format!("create devtest-apple {A4000}"),
+                "terminate id1".to_string(),
+                format!("create devtest-apple {R3090}"),
+                "terminate id2".to_string(),
+            ]
+        );
+        lines.find("[devtest-apple] terminating id2 — no attempt left to replace it (--check-attempts 2)");
+        assert!(fake.calls_to(&host("10.0.0.1", 22002)).is_empty(), "never set up or checked");
+        assert!(fleet.listed().is_empty(), "nothing of apple's left billing");
+        let row = &rows[0];
+        match &row.verdict {
+            Verdict::Failed { stage: Stage::Check, reason } => assert!(
+                reason.ends_with(
+                    "attempt 2 landed on 10.0.0.1, a machine that already failed the deep check — no attempts left \
+                     (--check-attempts 2); terminated it — devtest-apple has no pod now"
+                ),
+                "{reason}"
+            ),
+            other => panic!("expected FAILED check, got {other:?}"),
+        }
+        assert_eq!(row.proxy_port, None);
+        let text = std::fs::read_to_string(&conf).unwrap();
+        assert!(!text.contains("10.0.0.1:22002"), "the name isn't routed to the rejected pod: {text}");
+        let summary = pipeline::render_up_summary(&rows);
+        assert!(summary.contains("#2 1×RTX 3090 COMMUNITY (id2, 10.0.0.1): same host as a failed check — rejected; terminated"), "{summary}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_check_that_could_not_run_is_retried_and_never_condemns_its_host() {
+        let reset = || FakeReply::exit(255, "kex_exchange_identification: read: Connection reset by peer");
+        let fleet = Fleet::new(&[
+            ("apple", &[("10.0.0.1", 22001, 0)]),
+            ("bloom", &[("10.0.0.2", 22002, 0)]),
+            // cloud's replacement lands on bloom's machine, after bloom's checks.
+            ("cloud", &[("10.0.0.3", 22003, 0), ("10.0.0.2", 22004, 30)]),
+        ]);
+        let fake = Arc::new(FakeRemote::new());
+        // apple: the check's session drops once; SSH answers; the rerun is healthy.
+        fake.script(&host("10.0.0.1", 22001), [FakeReply::ok(), FakeReply::ok(), reset(), FakeReply::ok(), healthy()]);
+        // bloom: it can't run twice — FAILED, but kept, and its machine not condemned.
+        fake.script(&host("10.0.0.2", 22002), [FakeReply::ok(), FakeReply::ok(), reset(), FakeReply::ok(), reset()]);
+        // cloud: a real FAIL, replaced onto bloom's machine — which is fine to use.
+        fake.script(&host("10.0.0.3", 22003), [FakeReply::ok(), FakeReply::ok(), bad_host()]);
+        fake.script(&host("10.0.0.2", 22004), [FakeReply::ok(), FakeReply::ok(), healthy()]);
+        let cfg = cfg(None);
+        let run = up_run(&fleet, fake.clone(), &cfg, true, Some(2), None).await;
+        let made = make(&fleet, &["apple", "bloom", "cloud"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+
+        assert_eq!(
+            fleet.events(),
+            [
+                format!("create devtest-apple {A4000}"),
+                format!("create devtest-bloom {A4000}"),
+                format!("create devtest-cloud {A4000}"),
+                "terminate id3".to_string(), // only the pod whose check ran and failed
+                format!("create devtest-cloud {R3090}"),
+            ]
+        );
+        lines.find("[devtest-apple] check: couldn't run it (ssh: exit Some(255): kex_exchange_identification");
+        assert_eq!((rows[0].verdict.clone(), rows[0].health), (Verdict::Ready, Some(Status::Pass)));
+        match &rows[1].verdict {
+            Verdict::Failed { stage: Stage::Check, reason } => assert!(
+                reason.starts_with("couldn't run the deep check twice (ssh: exit Some(255): kex_exchange_identification")
+                    && reason.ends_with("— left running (`arena pods test --deep devtest-bloom`); its host isn't counted as bad"),
+                "{reason}"
+            ),
+            other => panic!("expected FAILED check, got {other:?}"),
+        }
+        assert_eq!(rows[2].verdict, Verdict::Ready, "{:#?}", lines.all());
+        assert_eq!(rows[2].attempts[1].host.as_deref(), Some("10.0.0.2"));
+        assert!(lines.all().iter().all(|l| !l.contains("a machine that already failed")), "{:#?}", lines.all());
+        // The rerun waited for SSH first: a probe between the two checks.
+        let apple = fake.calls_to(&host("10.0.0.1", 22001));
+        assert!(matches!(&apple[3], RemoteCall::Exec { cmd, .. } if cmd == "true"), "{apple:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_replacement_waits_until_the_owning_provider_lists_the_old_pod_gone() {
+        // A two-backend fleet: right after the terminate RunPod's listing fails for 60s while
+        // the (empty) other backend answers, and the old pod stays listed for 30s. The
+        // aggregate listing — without RunPod — would read "gone" at once and create the
+        // replacement next to the old pod (the fake refuses a second listed pod per name).
+        let fleet = Fleet {
+            linger: Duration::from_secs(30),
+            down_after_terminate: Duration::from_secs(60),
+            ..Fleet::new(&[("apple", &[("10.0.0.1", 22001, 0), ("10.0.0.2", 22002, 0)])])
+        };
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host("10.0.0.1", 22001), [FakeReply::ok(), FakeReply::ok(), bad_host()]);
+        fake.script(&host("10.0.0.2", 22002), [FakeReply::ok(), FakeReply::ok(), healthy()]);
+        let cfg = cfg(None);
+        let run = up_run(&fleet, fake.clone(), &cfg, true, Some(2), None).await;
+        let made = make(&fleet, &["apple"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+
+        assert_eq!(
+            fleet.events(),
+            [format!("create devtest-apple {A4000}"), "terminate id1".to_string(), format!("create devtest-apple {R3090}")]
+        );
+        let (_, at) = lines.find("[created] devtest-apple id=id2");
+        assert_eq!(at, Duration::from_secs(60), "created once RunPod itself listed id1 gone");
+        assert_eq!(rows[0].verdict, Verdict::Ready);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn keep_trying_waits_for_capacity_for_a_check_replacement_too() {
+        // After apple's bad host is terminated its type is out of stock for 60s. With
+        // --keep-trying the replacement waits it out (a try every 30s) like the first create
+        // would; without it, one try and the name has no pod.
+        for keep_trying in [true, false] {
+            let fleet = Fleet {
+                dry_after_terminate: Duration::from_secs(60),
+                ..Fleet::new(&[("apple", &[("10.0.0.1", 22001, 0), ("10.0.0.2", 22002, 0)])])
+            };
+            let fake = Arc::new(FakeRemote::new());
+            fake.script(&host("10.0.0.1", 22001), [FakeReply::ok(), FakeReply::ok(), bad_host()]);
+            fake.script(&host("10.0.0.2", 22002), [FakeReply::ok(), FakeReply::ok(), healthy()]);
+            let mut cmd = up_cmd(&["apple"]);
+            if let crate::PodCmd::Up { keep_trying: k, .. } = &mut cmd {
+                *k = keep_trying;
+            }
+            let done = crate::handle_pods_with(cmd, &fleet, fake.clone(), &cfg(None), true, crate::Interrupt::manual()).await;
+            let creates = fleet.events().iter().filter(|e| e.starts_with("create")).count();
+            if keep_trying {
+                done.unwrap();
+                assert_eq!(creates, 4, "the first, two dry tries (t=0, 30s), then t=60s: {:?}", fleet.events());
+            } else {
+                let err = done.unwrap_err().to_string();
+                assert_eq!(err, "1 of 1 pod(s) not ready: devtest-apple (FAILED check)");
+                assert_eq!(creates, 2, "{:?}", fleet.events());
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pod_ready_early_gets_the_fleet_map_of_pods_that_came_up_later() {
+        // No proxy layout: the fleet map in ~/.ssh/config is rendered from live endpoints.
+        // apple is READY long before bloom has one, so its keys write can't name bloom — the
+        // report rewrites apple's map once bloom is listed; bloom's was already complete.
+        let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 0)]), ("bloom", &[("10.0.0.2", 22002, 300)])]);
+        let fake = Arc::new(FakeRemote::new());
+        let keys = keys_dir("fleet-map");
+        let cfg = cfg(None);
+        let run = up_run(&fleet, fake.clone(), &cfg, true, None, Some(&keys.0)).await;
+        let made = make(&fleet, &["apple", "bloom"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+        assert!(rows.iter().all(|r| r.verdict == Verdict::Ready));
+
+        let execs = |h: &str| -> Vec<String> {
+            fake.calls_to(h).into_iter().filter_map(|c| if let RemoteCall::Exec { cmd, .. } = c { Some(cmd) } else { None }).collect()
+        };
+        let apple = execs(&host("10.0.0.1", 22001));
+        assert_eq!(apple.len(), 3, "config, keys, map refresh: {apple:#?}");
+        assert!(apple[1].contains("OPENAI_API_KEY") && !apple[1].contains("HostName 10.0.0.2"), "{}", apple[1]);
+        assert!(!apple[2].contains("OPENAI_API_KEY") && apple[2].contains("HostName 10.0.0.2"), "{}", apple[2]);
+        assert!(apple[2].contains("HostName 10.0.0.1"), "{}", apple[2]);
+        let bloom = execs(&host("10.0.0.2", 22002));
+        assert_eq!(bloom.len(), 2, "config, keys — its map was complete: {bloom:#?}");
+        assert!(bloom[1].contains("HostName 10.0.0.1") && bloom[1].contains("HostName 10.0.0.2"), "{}", bloom[1]);
+        let (refreshed, _) = lines.find("[devtest-apple] fleet SSH map updated");
+        let (bloom_ready, _) = lines.find("[devtest-bloom] READY");
+        assert!(bloom_ready < refreshed, "{:#?}", lines.all());
     }
 
     #[test]
