@@ -68,9 +68,10 @@ use arena_core::{Config, Pod, PodSpec};
 use prefs::Prefs;
 use arena_core::status::display_status;
 use state::{
-    capture_details, dashboard_snapshot, details_due, display_name, health_cell, overlay_details, proxy_cell,
-    proxy_detail, select_marks, short_branch, spark, summarize, summary_text, Action, Confirm, DeepChecks,
-    FleetSummary, History, NewPodForm, NpField, PodDetails, ProviderOpt, Tone,
+    capture_details, dashboard_snapshot, details_due, display_name, health_cell, mark_key, marked_pods,
+    marked_set_token, merge_details, names_preview, overlay_details, partial_notice, proxy_cell, proxy_detail,
+    select_marks, short_branch, spark, summarize, summary_text, Action, Confirm, DeepChecks, FleetSummary, History,
+    NewPodForm, NpField, PodDetails, ProviderOpt, Tone,
 };
 
 const DEFAULT_CONFIG: &str = "/home/dev/prod-ro/config.env";
@@ -122,7 +123,8 @@ enum Mode {
     /// marked set (`a` with marks); `sel` = highlighted row.
     FleetMenu { scope: Scope, sel: usize },
     /// A pending multi-pod action; requires typing the confirm token (`ALL` for the whole
-    /// fleet, the pod count for a marked set).
+    /// fleet, the pod count for a marked set — `ALL` again for terminate/restart on a big
+    /// one or one that is every listed pod: [`fleet_confirm_token`]).
     FleetConfirm { action: Action, typed: String, scope: Scope },
     /// Interactive add-pod form (↑↓ field, ←→ value).
     NewPod(NewPodForm),
@@ -226,7 +228,8 @@ struct Ui {
     mode: Mode,
     /// Cursor into `Shared::pods` (clamped to a valid row each frame).
     selected: usize,
-    /// Pod ids marked for a bulk action (multi-select via space).
+    /// Pods marked for a bulk action (space, a click, or `/`), by `state::mark_key`
+    /// (`provider:id` — a bare id can belong to two providers' pods).
     marked: std::collections::HashSet<String>,
     /// Scroll offset for the result modal (so long fleet outputs are readable).
     result_scroll: u16,
@@ -386,10 +389,9 @@ async fn refresh(
         let mut enriched = pods.clone();
         let (metrics, failed) =
             tokio::join!(fetch_metrics(remote, &pods, cfg, opts), enrich_bounded(provider, &mut enriched));
-        // A failed query keeps the last good details rather than forgetting them.
-        if failed.is_none() {
-            details.details = capture_details(&enriched);
-        }
+        // A query that failed part-way still shows what it filled (as `pods list` does),
+        // over the last good details rather than instead of them (`state::merge_details`).
+        merge_details(&mut details.details, capture_details(&enriched), failed.is_none());
         details.warning = failed;
         details.last = Some(tokio::time::Instant::now());
         metrics
@@ -558,19 +560,19 @@ fn handle_mouse(m: MouseEvent, ui: &mut Ui, shared: &Arc<Mutex<Shared>>) {
                 return; // click outside the table rows
             }
             let idx = offset + (my - rows_top) as usize;
-            let id = {
+            let key = {
                 let s = shared.lock().unwrap();
                 if idx >= s.pods.len() {
                     return;
                 }
-                s.pods[idx].id.clone()
+                mark_key(&s.pods[idx])
             };
             ui.selected = idx;
             // Far-left of the row, or shift-click, toggles the multi-select mark.
             let left_zone = mx < area.x.saturating_add(5);
             let shift = m.modifiers.contains(KeyModifiers::SHIFT);
-            if (left_zone || shift) && !ui.marked.remove(&id) {
-                ui.marked.insert(id);
+            if (left_zone || shift) && !ui.marked.remove(&key) {
+                ui.marked.insert(key);
             }
         }
         _ => {}
@@ -652,21 +654,36 @@ fn scope_pods(
     let s = shared.lock().unwrap();
     match scope {
         Scope::All => s.pods.clone(),
-        Scope::Marked => s.pods.iter().filter(|p| marked.contains(&p.id)).cloned().collect(),
+        Scope::Marked => marked_pods(&s.pods, marked).into_iter().cloned().collect(),
     }
 }
 
 /// The token the operator must type to confirm a multi-pod action: `ALL` for the whole
-/// fleet (a deliberate high bar), or the pod count for a marked set (which they chose).
+/// fleet (a deliberate high bar), and for terminate/restart on a marked set that is big or
+/// is every listed pod (`state::marked_set_token` — `/first..last` marks a cohort in one
+/// line); otherwise the pod count of the marked set (which they chose).
 fn fleet_confirm_token(
     shared: &Arc<Mutex<Shared>>,
     marked: &std::collections::HashSet<String>,
     scope: Scope,
+    action: Action,
 ) -> String {
-    match scope {
-        Scope::All => "ALL".to_string(),
-        Scope::Marked => scope_pods(shared, marked, scope).len().to_string(),
+    fleet_confirm_token_str(&shared.lock().unwrap(), marked, scope, action)
+}
+
+/// Enter in the `/` input: mark what `input` resolves to (`state::select_marks`), replacing
+/// the current marks — not adding to them, so the marked set is exactly what was typed —
+/// and say so in the footer. A typo marks nothing and leaves the existing marks as they
+/// were (the error in red). Either way back to the list.
+fn apply_select(ui: &mut Ui, shared: &mut Shared, input: &str) {
+    match select_marks(input, &Naming::from_config(&ui.cfg), &shared.pods) {
+        Ok((keys, msg)) => {
+            ui.marked = keys;
+            shared.notify(msg, false);
+        }
+        Err(e) => shared.notify(format!("✗ {e}"), true),
     }
+    ui.mode = Mode::List;
 }
 
 async fn run(
@@ -788,8 +805,9 @@ async fn run(
                     KeyCode::Char(' ') => {
                         // Toggle multi-select mark on the cursor pod.
                         if let Some(pod) = selected_pod(shared, ui.selected) {
-                            if !ui.marked.remove(&pod.id) {
-                                ui.marked.insert(pod.id);
+                            let key = mark_key(&pod);
+                            if !ui.marked.remove(&key) {
+                                ui.marked.insert(key);
                             }
                         }
                     }
@@ -874,7 +892,7 @@ async fn run(
                 }
             }
             Mode::FleetConfirm { action, mut typed, scope } => {
-                let token = fleet_confirm_token(shared, &ui.marked, scope);
+                let token = fleet_confirm_token(shared, &ui.marked, scope, action);
                 match code {
                     KeyCode::Esc => ui.mode = Mode::List,
                     KeyCode::Enter if typed == token => {
@@ -1020,19 +1038,7 @@ async fn run(
             },
             Mode::Select { mut value } => match code {
                 KeyCode::Esc => ui.mode = Mode::List,
-                KeyCode::Enter => {
-                    let naming = Naming::from_config(&ui.cfg);
-                    let mut s = shared.lock().unwrap();
-                    match select_marks(&value, &naming, &s.pods) {
-                        Ok((ids, msg)) => {
-                            ui.marked = ids;
-                            s.notify(msg, false);
-                        }
-                        // A typo marks nothing — and leaves the existing marks alone.
-                        Err(e) => s.notify(format!("✗ {e}"), true),
-                    }
-                    ui.mode = Mode::List;
-                }
+                KeyCode::Enter => apply_select(&mut ui, &mut shared.lock().unwrap(), &value),
                 KeyCode::Backspace => {
                     value.pop();
                     ui.mode = Mode::Select { value };
@@ -1781,10 +1787,18 @@ fn render_select(f: &mut Frame, value: &str) {
 }
 
 /// The summary bar (`state::summary_text`): counts, then the fleet's burn from the
-/// snapshot's core `FleetCost`, worded as `pods list`'s footer.
+/// snapshot's core `FleetCost`, worded as `pods list`'s footer — led, in yellow, by which
+/// provider failed to list when one did (the totals after it are then a floor).
 fn summary_line(s: &Shared) -> Paragraph<'static> {
-    Paragraph::new(summary_text(&s.summary, &s.snap.cost, &s.snap.partial))
-        .style(Style::default().add_modifier(Modifier::BOLD))
+    let text = summary_text(&s.summary, &s.snap.cost, &s.snap.partial);
+    let line = match partial_notice(&s.snap.partial) {
+        Some(warn) => {
+            let rest = text.strip_prefix(warn.as_str()).unwrap_or(&text).to_string();
+            Line::from(vec![Span::styled(warn, tone_style(Tone::Warn)), Span::raw(rest)])
+        }
+        None => Line::from(text),
+    };
+    Paragraph::new(line).style(Style::default().add_modifier(Modifier::BOLD))
 }
 
 /// A [`Tone`] as a colour.
@@ -1798,10 +1812,33 @@ fn tone_style(t: Tone) -> Style {
     }
 }
 
+/// The pods table's width for columns of these widths: their sum, one space between each,
+/// and 4 for the block's two borders and the `▶ ` highlight column.
+fn table_width(cols: &[usize]) -> usize {
+    cols.iter().sum::<usize>() + cols.len().saturating_sub(1) + 4
+}
+
+/// How many of `optional` (column widths, most wanted first) fit in a table `w` wide beside
+/// the `core` columns. Always a prefix, so widening the terminal only ever adds columns.
+fn columns_that_fit(w: usize, core: &[usize], optional: &[usize]) -> usize {
+    let mut cols = core.to_vec();
+    optional
+        .iter()
+        .take_while(|&&c| {
+            cols.push(c);
+            table_width(&cols) <= w
+        })
+        .count()
+}
+
 fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: bool) {
-    // Responsive: the essential columns (~92 wide) always show; the nice-to-haves
-    // (PROGRESS, then the GPU%/MEM% graphs) are dropped when the terminal is too narrow
-    // so the core data isn't crushed to one column each.
+    // Responsive. The essential columns — mark, P, NAME, STATUS, M, SET, GPU, GPU%, $/H,
+    // HEALTH, PROXY — always show and fit in 73 columns. Next come the mid columns, kept
+    // while they fit (`MID_W`, all of them from 105 columns), so a narrow terminal or the
+    // detail view's 55% split drops TEMP, MEM, BRANCH, DISK in turn instead of having
+    // ratatui shrink every column (NAME, the one that says which pod a row is, worst of
+    // all). Above that the nice-to-haves (SAVED, PROGRESS, host CPU/RAM, then the GPU%/MEM%
+    // graphs) come in as there's room. Below 73 columns the table is crushed as before.
     let w = area.width as usize;
     // The fleet columns from the core snapshot — M (maintenance badge), HEALTH (last deep
     // check) and PROXY — are essential and always shown, so every threshold below sits
@@ -1823,25 +1860,45 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
     let gpu_w = if narrow { 12 } else { 16 };
     let now = shared.snap.generated_at;
 
+    // mark, P, NAME, STATUS, M, SET, GPU, GPU%, $/H, HEALTH, PROXY.
+    let core = [1, 1, name_w, 4, 1, 4, gpu_w, 5, 7, HEALTH_W, proxy_w];
+    // DISK, BRANCH, MEM, TEMP — kept in this order: a disk filling up (coloured) breaks a
+    // participant's work, the branch says which iteration they're on, MEM/TEMP are in the
+    // detail pane's per-GPU table anyway.
+    const MID_W: [usize; 4] = [9, 6, 9, 4];
+    let mid = columns_that_fit(w, &core, &MID_W);
+    let (show_disk, show_branch, show_mem, show_temp) = (mid > 0, mid > 1, mid > 2, mid > 3);
+
     // Sparklines (GPU%/MEM% history) flex to fill whatever horizontal space is left after
     // the other columns — so they grow on a wide screen and simply vanish when there's no
     // room, rather than living behind a fixed threshold. PROGRESS gets a fixed budget when
     // sparks are present so the leftover math is stable.
     const PROGRESS_W: usize = 16;
-    let nonspark_cols = 15 + show_saved as usize + if show_host { 2 } else { 0 } + show_progress as usize;
-    let used = 1 + 1 + name_w + 4 + 1 + 4 + gpu_w + 5 + 9 + 4 + 9 + 7 + HEALTH_W + proxy_w + 6
-        + if show_saved { 6 } else { 0 }
-        + if show_host { 8 } else { 0 }
-        + if show_progress { PROGRESS_W } else { 0 }
-        + nonspark_cols.saturating_sub(1) // inter-column spacing
-        + 4; // the block's two borders + the `▶ ` highlight column
-    let leftover = w.saturating_sub(used);
+    let mut fixed: Vec<usize> = core.to_vec();
+    fixed.extend(&MID_W[..mid]);
+    if show_saved {
+        fixed.push(6);
+    }
+    if show_host {
+        fixed.extend([4, 4]);
+    }
+    if show_progress {
+        fixed.push(PROGRESS_W);
+    }
+    let leftover = w.saturating_sub(table_width(&fixed));
     let show_spark = with_spark && leftover >= 20; // ~2×9 + spacing
     let spark_w = if show_spark { (leftover.saturating_sub(3) / 2).clamp(9, 30) } else { 0 };
 
-    let mut header_cells = vec![
-        "", "P", "NAME", "STATUS", "M", "SET", "GPU", "GPU%", "MEM", "TEMP", "DISK", "$/H", "HEALTH", "PROXY", "BRANCH",
-    ];
+    let mut header_cells = vec!["", "P", "NAME", "STATUS", "M", "SET", "GPU", "GPU%"];
+    for (show, title) in [(show_mem, "MEM"), (show_temp, "TEMP"), (show_disk, "DISK")] {
+        if show {
+            header_cells.push(title);
+        }
+    }
+    header_cells.extend(["$/H", "HEALTH", "PROXY"]);
+    if show_branch {
+        header_cells.push("BRANCH");
+    }
     if show_saved {
         header_cells.push("SAVED");
     }
@@ -1921,7 +1978,7 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
             } else {
                 Cell::from(status_label)
             };
-            let mark = if ui.marked.contains(&p.id) {
+            let mark = if ui.marked.contains(&mark_key(p)) {
                 Cell::from("•").style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
             } else {
                 Cell::from(" ")
@@ -1940,14 +1997,24 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                 setup_cell(m),
                 Cell::from(gpu),
                 Cell::from(util_str).style(util_style(util, err)),
-                Cell::from(mem),
-                Cell::from(temp_str).style(temp_style(temp)),
-                Cell::from(disk).style(capacity_style(disk_pct)),
+            ];
+            if show_mem {
+                cells.push(Cell::from(mem));
+            }
+            if show_temp {
+                cells.push(Cell::from(temp_str).style(temp_style(temp)));
+            }
+            if show_disk {
+                cells.push(Cell::from(disk).style(capacity_style(disk_pct)));
+            }
+            cells.extend([
                 Cell::from(cost),
                 Cell::from(health).style(tone_style(health_tone)),
                 Cell::from(proxy).style(tone_style(proxy_tone)),
-                Cell::from(branch),
-            ];
+            ]);
+            if show_branch {
+                cells.push(Cell::from(branch));
+            }
             if show_saved {
                 // Time style: yellow when there's uncommitted work; grey when unknown OR
                 // when it's a clean tree that's been quiet for a day+ (nothing to do); plain
@@ -2013,14 +2080,24 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
         Constraint::Length(4),  // SET (.name/key/origin/api)
         Constraint::Length(gpu_w as u16), // GPU (+VRAM when wide)
         Constraint::Length(5),  // GPU%
-        Constraint::Length(9),  // MEM (e.g. "120/240G")
-        Constraint::Length(4),  // TEMP (e.g. "85C")
-        Constraint::Length(9),  // DISK (e.g. "12/100G")
-        Constraint::Length(7),  // $/H (e.g. "$0.17", "€0.006")
-        Constraint::Length(HEALTH_W as u16), // HEALTH (e.g. "pass 12m")
-        Constraint::Length(proxy_w as u16), // PROXY (":9500", or ":9500 stale" when wide)
-        Constraint::Length(6),  // BRANCH (e.g. "w1d2")
     ];
+    if show_mem {
+        widths.push(Constraint::Length(MID_W[2] as u16)); // MEM (e.g. "120/240G")
+    }
+    if show_temp {
+        widths.push(Constraint::Length(MID_W[3] as u16)); // TEMP (e.g. "85C")
+    }
+    if show_disk {
+        widths.push(Constraint::Length(MID_W[0] as u16)); // DISK (e.g. "12/100G")
+    }
+    widths.extend([
+        Constraint::Length(7),               // $/H (e.g. "$0.17", "€0.006")
+        Constraint::Length(HEALTH_W as u16), // HEALTH (e.g. "pass 12m")
+        Constraint::Length(proxy_w as u16),  // PROXY (":9500", or ":9500 stale" when wide)
+    ]);
+    if show_branch {
+        widths.push(Constraint::Length(MID_W[1] as u16)); // BRANCH (e.g. "w1d2")
+    }
     if show_saved {
         widths.push(Constraint::Length(6)); // SAVED (e.g. "3h", "↑2d")
     }
@@ -2493,11 +2570,16 @@ fn scope_label(shared: &Shared, marked: &std::collections::HashSet<String>, scop
             (n, format!("all {n} pods"))
         }
         Scope::Marked => {
-            let n = shared.pods.iter().filter(|p| marked.contains(&p.id)).count();
+            let n = marked_pods(&shared.pods, marked).len();
             (n, format!("{n} marked pod{}", if n == 1 { "" } else { "s" }))
         }
     }
 }
+
+/// How many marked pods a marked-set confirm names before `… and N more`: enough to see
+/// what a `/` selection caught (it can mark pods scrolled off screen) without pushing the
+/// token prompt out of the fixed-size popup.
+const CONFIRM_NAMES_MAX: usize = 10;
 
 fn render_fleet_menu(f: &mut Frame, shared: &Shared, ui: &Ui, scope: Scope, sel: usize) {
     let (_, who) = scope_label(shared, &ui.marked, scope);
@@ -2505,44 +2587,62 @@ fn render_fleet_menu(f: &mut Frame, shared: &Shared, ui: &Ui, scope: Scope, sel:
     render_action_menu(f, format!("Actions — {who}:"), &actions, sel);
 }
 
+/// The multi-pod confirm. What is about to happen (and, for a marked set, to which pods —
+/// `/` can mark pods scrolled off screen — up to [`CONFIRM_NAMES_MAX`] names) wraps in the
+/// top of the popup and is clipped if it must be; the token prompt and what has been typed
+/// sit in their own rows at the bottom, so they are always on screen.
 fn render_fleet_confirm(f: &mut Frame, shared: &Shared, ui: &Ui, action: Action, typed: &str, scope: Scope) {
-    let (_, who) = scope_label(shared, &ui.marked, scope);
-    let token = fleet_confirm_token_str(shared, &ui.marked, scope);
+    let (n, who) = scope_label(shared, &ui.marked, scope);
+    let token = fleet_confirm_token_str(shared, &ui.marked, scope, action);
     // Per-pod providers aren't known here: warn as if each one wipes (the safe side).
     let warn = action.warning(true).map(|w| format!("\n\n{w}")).unwrap_or_default();
-    // A marked set is spelled out: `/` can mark pods that are scrolled off screen.
     let names = match scope {
         Scope::All => String::new(),
         Scope::Marked => {
-            let names: Vec<String> =
-                shared.pods.iter().filter(|p| ui.marked.contains(&p.id)).map(|p| ui.shown_name(&p.name)).collect();
-            format!(": {}", names.join(", "))
+            let names: Vec<String> = marked_pods(&shared.pods, &ui.marked).iter().map(|p| ui.shown_name(&p.name)).collect();
+            format!(": {}", names_preview(&names, CONFIRM_NAMES_MAX))
         }
     };
-    let text = format!(
-        "{} {who}{names}.{warn}\n\nType {token} to confirm:\n\n  > {}\n\n[enter] apply  [esc] cancel",
-        action.label(),
-        typed
-    );
+    // Why a marked set asks for ALL rather than its count (`state::marked_set_token`).
+    let why = if scope == Scope::Marked && token == "ALL" {
+        let what = if n >= shared.pods.len() { "every listed pod" } else { "a big set" };
+        format!("\n\nThat is {what}: {} on it takes ALL, like the whole fleet.", action.label())
+    } else {
+        String::new()
+    };
     let border = if action.is_destructive() { Color::Red } else { Color::Yellow };
-    let area = centered_rect(64, 45, f.area());
+    let area = centered_rect(70, 60, f.area());
     f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border))
+        .title(format!(" confirm {} ", action.label()));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(5)])
+        .split(inner);
     f.render_widget(
-        Paragraph::new(text).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border))
-                .title(format!(" confirm {} ", action.label())),
-        ),
-        area,
+        Paragraph::new(format!("{} {who}{names}.{warn}{why}", action.label())).wrap(Wrap { trim: false }),
+        rows[0],
+    );
+    f.render_widget(
+        Paragraph::new(format!("Type {token} to confirm:\n\n  > {typed}\n\n[enter] apply  [esc] cancel")),
+        rows[1],
     );
 }
 
-/// Render-side confirm token (works off `&Shared`, mirroring `fleet_confirm_token`).
-fn fleet_confirm_token_str(shared: &Shared, marked: &std::collections::HashSet<String>, scope: Scope) -> String {
+/// Render-side confirm token (works off `&Shared`; `fleet_confirm_token` locks and calls it).
+fn fleet_confirm_token_str(
+    shared: &Shared,
+    marked: &std::collections::HashSet<String>,
+    scope: Scope,
+    action: Action,
+) -> String {
     match scope {
         Scope::All => "ALL".to_string(),
-        Scope::Marked => scope_label(shared, marked, scope).0.to_string(),
+        Scope::Marked => marked_set_token(action, scope_label(shared, marked, scope).0, shared.pods.len()),
     }
 }
 
@@ -2914,16 +3014,75 @@ deep_check_end=1
         assert!(all.contains("deep-checking 1"), "the footer counts running checks: {all}");
     }
 
-    /// A narrow terminal keeps HEALTH and PROXY (the port, coloured by state) and drops the
-    /// nice-to-haves first.
+    /// A narrow terminal — or the detail view's 55% split — keeps the essential columns
+    /// whole (NAME, HEALTH, PROXY as the port coloured by state, $/H) and drops the mid
+    /// columns in turn (TEMP, MEM, BRANCH, DISK) rather than letting every column be
+    /// crushed: at 80–100 columns the names still read `alpha`, not `al`/`alph`.
     #[test]
-    fn a_narrow_terminal_keeps_health_and_a_compact_proxy() {
+    fn a_narrow_terminal_drops_mid_columns_and_keeps_names_and_health_whole() {
         let shared = fixture_shared();
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        // (mode, terminal width, mid columns shown, mid columns dropped)
+        let cases: &[(Mode, u16, &[&str], &[&str])] = &[
+            (Mode::List, 80, &[], &["DISK", "BRANCH", "MEM", "TEMP"]),
+            (Mode::List, 92, &["DISK", "BRANCH"], &["MEM", "TEMP"]),
+            (Mode::List, 100, &["DISK", "BRANCH", "MEM"], &["TEMP"]),
+            (Mode::List, 120, &["DISK", "BRANCH", "MEM", "TEMP"], &[]),
+            // Detail: the table gets 55% of 160 = 88 columns.
+            (Mode::Detail, 160, &["DISK"], &["BRANCH", "MEM", "TEMP"]),
+        ];
+        ui.selected = 3; // delta: the detail pane's title (" delta ") isn't a row we look at
+        for (mode, w, shown, dropped) in cases {
+            ui.mode = mode.clone();
+            let lines = draw(*w, 12, &shared, &ui);
+            let all = lines.join("\n");
+            let header = lines.iter().find(|l| l.contains("HEALTH")).unwrap_or_else(|| panic!("{w}: {all}"));
+            for col in ["NAME", "STAT", "SET", "GPU%", "$/H", "HEALTH", "PROXY"].iter().chain(shown.iter()) {
+                assert!(header.contains(col), "{mode:?} {w}: {col} in {header}");
+            }
+            for col in *dropped {
+                assert!(!header.contains(col), "{mode:?} {w}: {col} dropped from {header}");
+            }
+            for (name, cells) in [
+                ("alpha", &["pass 12m", "$0.17", ":9500"][..]),
+                ("bravo", &["fail 2h", "$0.25", ":9501"]),
+                ("charlie", &["€0.006"]),
+            ] {
+                let r = row(&lines, name); // ` alpha ` — the whole short name
+                for c in cells {
+                    assert!(r.contains(c), "{mode:?} {w}: {name} shows {c:?}: {r}");
+                }
+            }
+            assert!(!row(&lines, "bravo").contains("stale"), "{w}: compact proxy, the colour says stale");
+        }
+    }
+
+    /// The pure column fit: always a prefix of the optional columns, so widening only adds.
+    #[test]
+    fn columns_that_fit_table() {
+        // 3 core columns 10 wide: 30 + 2 gaps + 4 = 36.
+        let core = [10, 10, 10];
+        assert_eq!(table_width(&core), 36);
+        // (width, how many of [5, 3, 9] fit)
+        for (w, want) in [(35, 0), (36, 0), (41, 0), (42, 1), (45, 1), (46, 2), (55, 2), (56, 3), (200, 3)] {
+            assert_eq!(columns_that_fit(w, &core, &[5, 3, 9]), want, "{w}");
+        }
+        // A later, narrower column doesn't jump the queue.
+        assert_eq!(columns_that_fit(45, &core, &[9, 1]), 0);
+    }
+
+    /// A provider that failed to list is said at the front of the summary bar, so it is on
+    /// screen at any common width — the bar is one unwrapped line and its tail gets cut.
+    #[test]
+    fn a_failed_listing_is_visible_on_a_narrow_terminal() {
+        let mut shared = fixture_shared();
+        shared.snap.partial = vec!["vast".into()];
         let ui = ui(cfg(""), Arc::new(FakeRemote::new()));
-        let lines = draw(120, 12, &shared, &ui);
-        let bravo = row(&lines, "bravo");
-        assert!(bravo.contains("fail 2h") && bravo.contains(":9501") && !bravo.contains("stale"), "{bravo}");
-        assert!(row(&lines, "alpha").contains("pass 12m"));
+        for w in [80, 100, 120] {
+            let lines = draw(w, 12, &shared, &ui);
+            let bar = lines.iter().find(|l| l.contains("failed to list")).unwrap_or_else(|| panic!("{w}:\n{}", lines.join("\n")));
+            assert!(bar.starts_with(" ⚠ vast failed to list — its pods (and their cost) are missing · 4 pods"), "{w}: {bar}");
+        }
     }
 
     /// The detail pane spells out what the row abbreviates: the proxy state, cost per hour
@@ -2964,7 +3123,7 @@ deep_check_end=1
     fn a_marked_set_confirm_names_its_pods_and_the_footer_shows_a_notice() {
         let mut shared = fixture_shared();
         let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
-        ui.marked = ["rp1", "rp2"].map(String::from).into_iter().collect();
+        ui.marked = ["runpod:rp1", "runpod:rp2"].map(String::from).into_iter().collect();
         ui.mode = Mode::FleetConfirm { action: Action::Terminate, typed: String::new(), scope: Scope::Marked };
         let all = draw(180, 30, &shared, &ui).join("\n");
         assert!(all.contains("terminate 2 marked pods: alpha, bravo."), "{all}");
@@ -2976,12 +3135,97 @@ deep_check_end=1
         assert!(footer.starts_with("✗ a target matched no pod"), "{footer}");
     }
 
+    /// `n` pods `devtest-m00…`, RunPod, published as the dashboard shows them.
+    fn cohort(n: usize) -> Shared {
+        let pods: Vec<Pod> = (0..n).map(|i| pod(&format!("m{i:02}"), "runpod", &format!("rp{i}"), 1, None)).collect();
+        let snap = dashboard_snapshot(&pods, &[], None, &HealthCache::new(), &Naming::from_config(&cfg("")), NOW);
+        let mut shared = Shared::default();
+        shared.publish(snap);
+        shared
+    }
+
+    /// However many pods are marked and however long the warning, the token prompt and
+    /// what has been typed stay on screen: the names are capped (`… and N more`) and the
+    /// prompt has its own rows at the bottom of the popup.
+    #[test]
+    fn a_big_marked_set_confirm_keeps_the_token_prompt_on_screen() {
+        let shared = cohort(20);
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        ui.short_names = false;
+        ui.marked = shared.pods.iter().map(mark_key).collect();
+        for (action, typed) in [(Action::Restart, "AL"), (Action::Terminate, "ALL"), (Action::Setup, "2")] {
+            ui.mode = Mode::FleetConfirm { action, typed: typed.into(), scope: Scope::Marked };
+            for (w, h) in [(100, 30), (80, 24)] {
+                let all = draw(w, h, &shared, &ui).join("\n");
+                let token = if action.is_destructive() { "ALL" } else { "20" };
+                assert!(all.contains(&format!("Type {token} to confirm:")), "{action:?} {w}x{h}:\n{all}");
+                assert!(all.contains(&format!("> {typed}")), "{action:?} {w}x{h}: the typed echo:\n{all}");
+                assert!(all.contains("[enter] apply"), "{action:?} {w}x{h}:\n{all}");
+            }
+            let wide = draw(160, 40, &shared, &ui).join("\n");
+            assert!(wide.contains("devtest-m00, devtest-m01") && wide.contains("… and 10 more"), "{wide}");
+        }
+    }
+
+    /// `/` then Enter, through the handler the key loop calls: a valid selection replaces the
+    /// marks (not adds to them) and says what it marked; a typo leaves the marks as they were
+    /// and says why in red; either way back to the list.
+    #[test]
+    fn select_enter_replaces_the_marks_and_a_typo_keeps_them() {
+        let mut shared = fixture_shared();
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        let before: HashSet<String> = ["runpod:rp1", "hetzner:88"].map(String::from).into();
+        ui.marked = before.clone();
+
+        ui.mode = Mode::Select { value: "alpah".into() };
+        apply_select(&mut ui, &mut shared, "alpah");
+        assert_eq!(ui.marked, before, "a typo marks nothing and unmarks nothing");
+        let n = shared.notice.clone().unwrap();
+        assert!(n.error && n.text.starts_with("✗ ") && n.text.contains("alpah"), "{n:?}");
+        assert!(matches!(ui.mode, Mode::List));
+
+        ui.mode = Mode::Select { value: "bravo".into() };
+        apply_select(&mut ui, &mut shared, "bravo");
+        assert_eq!(ui.marked, HashSet::from(["runpod:rp2".to_string()]), "replaced, not added to");
+        let n = shared.notice.clone().unwrap();
+        assert_eq!((n.text.as_str(), n.error), ("marked 1 pod: bravo", false));
+        assert!(matches!(ui.mode, Mode::List));
+    }
+
+    /// `/first..last` marks the whole cohort in one line, so the marked-set bar follows what
+    /// is marked: terminate/restart on it ask for `ALL` (as `A` would), not the count; a
+    /// small partial set keeps the count, and so do the safe actions.
+    #[test]
+    fn a_selector_marking_the_whole_fleet_needs_all_to_terminate() {
+        let mut shared = fixture_shared();
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        apply_select(&mut ui, &mut shared, "alpha..delta");
+        assert_eq!(ui.marked.len(), 4);
+        // The token is read off the shared state, as the key loop reads it.
+        let shared = Arc::new(Mutex::new(shared));
+        let token = |ui: &Ui, action| fleet_confirm_token(&shared, &ui.marked, Scope::Marked, action);
+        assert_eq!(token(&ui, Action::Terminate), "ALL");
+        assert_eq!(token(&ui, Action::Restart), "ALL");
+        assert_eq!(token(&ui, Action::Setup), "4");
+        assert_eq!(fleet_confirm_token(&shared, &ui.marked, Scope::All, Action::Setup), "ALL");
+        apply_select(&mut ui, &mut shared.lock().unwrap(), "alpha,bravo");
+        assert_eq!(token(&ui, Action::Terminate), "2");
+        // The popup says why it wants ALL.
+        apply_select(&mut ui, &mut shared.lock().unwrap(), "alpha..delta");
+        ui.mode = Mode::FleetConfirm { action: Action::Terminate, typed: String::new(), scope: Scope::Marked };
+        let all = draw(180, 30, &shared.lock().unwrap(), &ui).join("\n");
+        assert!(all.contains("That is every listed pod: terminate on it takes ALL") && all.contains("Type ALL"), "{all}");
+    }
+
     /// A pod-side fleet for [`refresh`]: lists runpod (two pods) and a vast that 429s,
     /// counts list and details calls, and panics on anything that would change the fleet.
     struct FakeFleet {
         pods: Vec<Pod>,
         lists: AtomicUsize,
         details: AtomicUsize,
+        /// Make the details query fail after filling rp1 (a GraphQL reply with data *and*
+        /// `errors`, or one backend of the fleet failing).
+        details_error: Option<&'static str>,
     }
 
     #[async_trait::async_trait]
@@ -3010,7 +3254,10 @@ deep_check_end=1
                 p.cost_per_hr = Some(0.17);
                 p.maintenance = Some(Maintenance { note: Some("host upgrade".into()), ..Default::default() });
             }
-            Ok(())
+            match self.details_error {
+                Some(e) => Err(arena_core::Error::provider(e)),
+                None => Ok(()),
+            }
         }
         async fn create_pod(&self, _spec: &PodSpec) -> arena_core::Result<Pod> {
             panic!("a refresh must never create a pod")
@@ -3060,7 +3307,12 @@ deep_check_end=1
         assert!(cache.starts_with(&dir.0), "never the real state dir: {}", cache.display());
         snapshot::record_health(&cache, &[verdict(&alpha, Status::Pass, None)], None, snapshot::unix_now() - 600).unwrap();
 
-        let provider = FakeFleet { pods: vec![bravo, alpha], lists: AtomicUsize::new(0), details: AtomicUsize::new(0) };
+        let provider = FakeFleet {
+            pods: vec![bravo, alpha],
+            lists: AtomicUsize::new(0),
+            details: AtomicUsize::new(0),
+            details_error: None,
+        };
         let fake = Arc::new(FakeRemote::new());
         let remote: Arc<dyn Remote> = fake.clone();
         let shared = Mutex::new(Shared::default());
@@ -3087,7 +3339,7 @@ deep_check_end=1
             assert_eq!(s.snap.partial, ["vast"]);
             let summary = summary_text(&s.summary, &s.snap.cost, &s.snap.partial);
             assert!(summary.contains("fleet: $0.17/h across 2 billing pod(s) (1 unpriced)"), "{summary}");
-            assert!(summary.ends_with("vast failed to list: its pods are missing"), "{summary}");
+            assert!(summary.starts_with(" ⚠ vast failed to list — its pods (and their cost) are missing"), "{summary}");
         }
         assert_eq!(alpha_row(&shared), ("$0.17".to_string(), true));
         assert_eq!(calls(), (1, 1), "the first refresh fills the details");
@@ -3110,6 +3362,31 @@ deep_check_end=1
         tokio::time::advance(state::DETAILS_EVERY).await;
         refresh(&provider, &remote, &cfg, &opts, &shared, &mut details, false).await;
         assert_eq!(calls(), (5, 3));
+    }
+
+    /// A details query that errs after filling some pods (GraphQL data + `errors`, one
+    /// backend failing) still shows what it filled — as `pods list` and `arena snapshot`
+    /// do, working on the pods in place — and the footer says the details are incomplete.
+    #[tokio::test(start_paused = true)]
+    async fn details_filled_before_a_query_error_still_show() {
+        let cfg = cfg("");
+        let provider = FakeFleet {
+            pods: vec![pod("alpha", "runpod", "rp1", 1, None), pod("bravo", "runpod", "rp2", 2, None)],
+            lists: AtomicUsize::new(0),
+            details: AtomicUsize::new(0),
+            details_error: Some("pod details: some field errored"),
+        };
+        let remote: Arc<dyn Remote> = Arc::new(FakeRemote::new());
+        let shared = Mutex::new(Shared::default());
+        let mut details = DetailsState::default();
+        refresh(&provider, &remote, &cfg, &ProbeOpts::default(), &shared, &mut details, false).await;
+        let s = shared.lock().unwrap();
+        let alpha = &s.snap.pods.iter().find(|p| p.pod.id == "rp1").unwrap().pod;
+        assert_eq!((fleet::price_label(alpha), state::has_maintenance(alpha)), ("$0.17".to_string(), true));
+        assert_eq!(alpha.gpu_type.as_deref(), Some("RTX A4000"));
+        assert!(s.status.contains("⚠ pod details incomplete: ") && s.status.contains("some field errored"), "{}", s.status);
+        // The fleet total counts the price it got.
+        assert!(summary_text(&s.summary, &s.snap.cost, &s.snap.partial).contains("$0.17/h"));
     }
 
     /// The dashboard's deep check is `pods test --deep`'s: the same script in one exec per

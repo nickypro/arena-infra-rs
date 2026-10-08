@@ -133,13 +133,23 @@ pub fn summarize(pods: &[Pod], metrics: &HashMap<String, PodMetrics>) -> FleetSu
     s
 }
 
-/// The summary bar: pod/GPU/util counts from the probes, then the fleet's burn exactly as
-/// `pods list`'s footer words it ([`fleet::fleet_footer`]: billing pods only, `$` and
-/// Hetzner's `€` kept apart, unpriced pods called out), the same per day, and — when a
-/// provider failed to list — that its pods (and their cost) are missing.
+/// The summary bar's warning when a provider failed to list: its pods are missing from the
+/// rows and their cost from the fleet total, so the numbers after it are a floor.
+pub fn partial_notice(partial: &[String]) -> Option<String> {
+    (!partial.is_empty())
+        .then(|| format!(" ⚠ {} failed to list — its pods (and their cost) are missing ·", partial.join(", ")))
+}
+
+/// The summary bar: when a provider failed to list, [`partial_notice`] **first** — the bar
+/// is one unwrapped line and its tail is cut on anything narrower than ~160 columns, so a
+/// warning at the end would be invisible exactly when it matters —, then pod/GPU/util
+/// counts from the probes, then the fleet's burn exactly as `pods list`'s footer words it
+/// ([`fleet::fleet_footer`]: billing pods only, `$` and Hetzner's `€` kept apart, unpriced
+/// pods called out), and the same per day.
 pub fn summary_text(s: &FleetSummary, cost: &FleetCost, partial: &[String]) -> String {
     let util = s.mean_util.map(|u| format!("{u}%")).unwrap_or_else(|| "-".into());
-    let mut out = format!(" {} pods · {} GPUs · mean util {util} · {}", s.pods, s.total_gpus, fleet::fleet_footer(cost));
+    let mut out = partial_notice(partial).unwrap_or_default();
+    out.push_str(&format!(" {} pods · {} GPUs · mean util {util} · {}", s.pods, s.total_gpus, fleet::fleet_footer(cost)));
     let mut per_day = Vec::new();
     if cost.priced_usd > 0 {
         per_day.push(format!("{}/day", fleet::fmt_money("$", cost.usd_per_hr * 24.0)));
@@ -152,9 +162,6 @@ pub fn summary_text(s: &FleetSummary, cost: &FleetCost, partial: &[String]) -> S
     }
     if s.unreachable > 0 {
         out.push_str(&format!("  ·  {} unreachable", s.unreachable));
-    }
-    if !partial.is_empty() {
-        out.push_str(&format!("  ·  {} failed to list: its pods are missing", partial.join(", ")));
     }
     out
 }
@@ -346,6 +353,32 @@ pub fn capture_details(enriched: &[Pod]) -> HashMap<String, PodDetails> {
         .collect()
 }
 
+/// Fold one details query's answer (`fresh`, [`capture_details`] of the pods it ran on) into
+/// what is kept between queries. A `complete` answer replaces everything — a maintenance
+/// window that ended is gone. An incomplete one (the query erred or timed out *after*
+/// filling some pods: a GraphQL reply carrying both data and `errors`, one backend of the
+/// fleet failing — `MultiProvider::enrich` writes back what it got, and `pods list` shows
+/// it) adds what it did fill, field by field, over the last good details: dropping it would
+/// leave the dashboard blank where `pods list` shows a GPU, $/h or maintenance badge, and a
+/// field it didn't fill can't be told from one that is really empty, so that keeps the
+/// last good value.
+pub fn merge_details(kept: &mut HashMap<String, PodDetails>, fresh: HashMap<String, PodDetails>, complete: bool) {
+    if complete {
+        *kept = fresh;
+        return;
+    }
+    for (key, new) in fresh {
+        let old = kept.remove(&key).unwrap_or_default();
+        let merged = PodDetails {
+            gpu_type: new.gpu_type.or(old.gpu_type),
+            gpu_count: new.gpu_count.or(old.gpu_count),
+            cost_per_hr: new.cost_per_hr.or(old.cost_per_hr),
+            maintenance: new.maintenance.or(old.maintenance),
+        };
+        kept.insert(key, merged);
+    }
+}
+
 /// Re-apply the last details to a fresh listing between queries, the way `enrich` merges
 /// them: fill the GPU type, $/h and maintenance window the cheap list call leaves out (a
 /// value the listing does report wins), and take the details' GPU count when it has one.
@@ -405,15 +438,58 @@ pub fn parse_select_input(input: &str) -> Result<SelectArgs, String> {
     Ok(args)
 }
 
+/// What a mark is keyed by: the pod's `provider:id` ([`cache_key`], as the health cache,
+/// the details and the deep-check claims are). Ids are only unique per provider — a Vast
+/// instance and a Hetzner server can share a number — so a bare id would mark (and hand
+/// to terminate/restart) a pod the operator never picked.
+pub fn mark_key(pod: &Pod) -> String {
+    cache_key(&pod.provider, &pod.id)
+}
+
+/// The listed pods that are marked, in row order — what a marked-set action acts on, counts
+/// and names.
+pub fn marked_pods<'a>(pods: &'a [Pod], marked: &HashSet<String>) -> Vec<&'a Pod> {
+    pods.iter().filter(|p| marked.contains(&mark_key(p))).collect()
+}
+
+/// The most pods a destructive action (terminate/restart) on a marked set confirms with
+/// just their count. Marks used to take a keypress per pod; `/` now marks a cohort in one
+/// short range (`/apple..zulu`), so the bar has to follow what is marked, not how: a
+/// bigger set — or every listed pod, however few — asks for `ALL`, the whole-fleet bar.
+pub const SET_COUNT_CONFIRM_MAX: usize = 5;
+
+/// The token a marked-set confirm asks to be typed, for `marked` of the `listed` pods: the
+/// count (which the operator chose), or `ALL` for a destructive action on more than
+/// [`SET_COUNT_CONFIRM_MAX`] pods or on the whole listed fleet. Non-destructive actions
+/// (backup/setup/run/set-branch) keep the count.
+pub fn marked_set_token(action: Action, marked: usize, listed: usize) -> String {
+    if action.is_destructive() && (marked > SET_COUNT_CONFIRM_MAX || marked >= listed) {
+        "ALL".into()
+    } else {
+        marked.to_string()
+    }
+}
+
+/// `names` for a confirm, at most `max` of them, then how many more (`… and 12 more`): the
+/// confirm popup has a fixed size and the token prompt must stay on screen below it.
+pub fn names_preview(names: &[String], max: usize) -> String {
+    match names.len().checked_sub(max) {
+        Some(more) if more > 0 => format!("{}, … and {more} more", names[..max].join(", ")),
+        _ => names.join(", "),
+    }
+}
+
 /// What `/` marks: the selection typed in the core selector syntax ([`parse_select_input`]),
 /// parsed and resolved by `arena_core::selector` exactly as the CLI does — so a typo (a
 /// name matching no pod, a reversed range, a misspelt `--exclude`) is an error and nothing
-/// is marked. Returns the marked pods' ids and the status line.
+/// is marked. Returns the marked pods' [`mark_key`]s and the status line.
 ///
 /// Marks feed the marked-set actions, terminate and restart among them, so two things the
 /// CLI's read-only commands accept are refused here: `all` (whole-fleet actions are `A`,
 /// which offers only the safe ones), and a selection naming no pod (`--on`/`--gpus`
-/// alone start from the whole fleet).
+/// alone start from the whole fleet). A selection that names every pod some other way
+/// (`first..last`) is marked, but terminate/restart on it ask for `ALL`
+/// ([`marked_set_token`]).
 pub fn select_marks(input: &str, naming: &Naming, pods: &[Pod]) -> Result<(HashSet<String>, String), String> {
     let one_line = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
     let args = parse_select_input(input)?;
@@ -427,9 +503,9 @@ pub fn select_marks(input: &str, naming: &Naming, pods: &[Pod]) -> Result<(HashS
         return Err("name pods, ids or a range (apple..delta) — -x, --on and --gpus only narrow a named set".into());
     }
     let picked = sel.resolve(naming, pods).map_err(|e| one_line(&e.0))?;
-    let ids: HashSet<String> = picked.iter().map(|&i| pods[i].id.clone()).collect();
+    let keys: HashSet<String> = picked.iter().map(|&i| mark_key(&pods[i])).collect();
     let n = picked.len();
-    Ok((ids, format!("marked {n} pod{}: {}", if n == 1 { "" } else { "s" }, sel.describe())))
+    Ok((keys, format!("marked {n} pod{}: {}", if n == 1 { "" } else { "s" }, sel.describe())))
 }
 
 /// How a pod name is shown: full (`arena8-apple`) or short (`apple`). Stripping the
@@ -861,8 +937,14 @@ mod tests {
             " 5 pods · 0 GPUs · mean util - · fleet: $0.60/h across 4 billing pod(s) + €0.006/h hetzner (1 unpriced) \
              ≈ $14.40/day + €0.13/day"
         );
-        let partial = summary_text(&s, &cost, &["vast".to_string()]);
-        assert!(partial.ends_with("·  vast failed to list: its pods are missing"), "{partial}");
+        // A provider that failed to list leads the bar (its tail is cut on narrow terminals).
+        let partial = summary_text(&s, &cost, &["vast".to_string(), "hetzner".to_string()]);
+        assert!(
+            partial.starts_with(" ⚠ vast, hetzner failed to list — its pods (and their cost) are missing · 5 pods · "),
+            "{partial}"
+        );
+        assert!(partial.ends_with(" ≈ $14.40/day + €0.13/day"), "{partial}");
+        assert_eq!(partial_notice(&[]), None);
         // Nothing billing: no per-day figure.
         let idle = summary_text(&FleetSummary::default(), &fleet::fleet_cost(&[]), &[]);
         assert_eq!(idle, " 0 pods · 0 GPUs · mean util - · fleet: $0.00/h across 0 billing pod(s)");
@@ -1299,17 +1381,18 @@ mod tests {
             at("delta", "runpod", "rp4", None),
             at("echo", "hetzner", "88", None),
         ];
+        // Marks are `provider:id` keys; the names they mark, in row order.
         let ids = |input: &str| {
-            let (ids, _) = select_marks(input, &naming, &pods).unwrap_or_else(|e| panic!("{input}: {e}"));
-            let mut v: Vec<String> = ids.into_iter().collect();
-            v.sort();
-            v
+            let (keys, _) = select_marks(input, &naming, &pods).unwrap_or_else(|e| panic!("{input}: {e}"));
+            marked_pods(&pods, &keys).iter().map(|p| p.id.clone()).collect::<Vec<_>>()
         };
-        assert_eq!(ids("alpha..delta"), ["77", "rp1", "rp2", "rp4"]);
-        assert_eq!(ids("alpha..echo -x charlie"), ["88", "rp1", "rp2", "rp4"]);
-        assert_eq!(ids("alpha..echo !charlie,delta"), ["88", "rp1", "rp2"]);
+        assert_eq!(ids("alpha..delta"), ["rp1", "rp2", "77", "rp4"]);
+        assert_eq!(ids("alpha..echo -x charlie"), ["rp1", "rp2", "rp4", "88"]);
+        assert_eq!(ids("alpha..echo !charlie,delta"), ["rp1", "rp2", "88"]);
         assert_eq!(ids("alpha..echo --on runpod"), ["rp1", "rp2", "rp4"]);
-        assert_eq!(ids("devtest-bravo 88"), ["88", "rp2"], "a full name and an id");
+        assert_eq!(ids("devtest-bravo 88"), ["rp2", "88"], "a full name and an id");
+        let (keys, _) = select_marks("echo", &naming, &pods).unwrap();
+        assert_eq!(keys, HashSet::from(["hetzner:88".to_string()]));
         let (_, msg) = select_marks("alpha..charlie", &naming, &pods).unwrap();
         assert_eq!(msg, "marked 3 pods: alpha..charlie");
         let (_, msg) = select_marks("echo", &naming, &pods).unwrap();
@@ -1330,5 +1413,94 @@ mod tests {
             assert!(err.contains(needle), "{input:?}: {err}");
             assert!(!err.contains('\n'), "{input:?}: one line for the status bar: {err}");
         }
+    }
+
+    /// Ids are unique only per provider: a Vast instance and a Hetzner server sharing a
+    /// number are two pods, and `/` marking one must not hand the other to terminate.
+    #[test]
+    fn a_mark_is_one_pod_even_when_another_provider_reuses_its_id() {
+        let cfg = fleet_cfg();
+        let naming = Naming::from_config(&cfg);
+        let pods = vec![
+            at("alpha", "vast", "88", None),
+            at("bravo", "hetzner", "88", None),
+            at("charlie", "runpod", "rp3", None),
+        ];
+        let (keys, msg) = select_marks("alpha", &naming, &pods).unwrap();
+        assert_eq!(msg, "marked 1 pod: alpha");
+        let marked: Vec<&str> = marked_pods(&pods, &keys).iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(marked, ["devtest-alpha"], "the hetzner server with the same id stays unmarked");
+        assert_eq!(mark_key(&pods[1]), "hetzner:88");
+    }
+
+    /// Terminate/restart on a marked set ask for the count only for a small, partial set;
+    /// a big one — or the whole listed fleet, however it was marked (`/first..last`, a comma
+    /// list, a space per pod) — asks for `ALL`, like `A`. Safe actions keep the count.
+    #[test]
+    fn a_destructive_marked_set_that_is_big_or_the_whole_fleet_asks_for_all() {
+        // (action, marked, listed, token)
+        let cases = [
+            (Action::Terminate, 3, 30, "3"),
+            (Action::Terminate, SET_COUNT_CONFIRM_MAX, 30, "5"),
+            (Action::Terminate, SET_COUNT_CONFIRM_MAX + 1, 30, "ALL"),
+            (Action::Terminate, 30, 30, "ALL"), // `/m00..m29`
+            (Action::Restart, 2, 2, "ALL"),     // a small fleet, all of it
+            (Action::Restart, 1, 2, "1"),
+            (Action::Restart, 29, 30, "ALL"),
+            (Action::Setup, 30, 30, "30"),
+            (Action::Backup, 12, 30, "12"),
+        ];
+        for (action, marked, listed, want) in cases {
+            assert_eq!(marked_set_token(action, marked, listed), want, "{action:?} {marked}/{listed}");
+        }
+    }
+
+    #[test]
+    fn names_preview_is_bounded() {
+        let names: Vec<String> = (0..14).map(|i| format!("m{i:02}")).collect();
+        assert_eq!(names_preview(&names[..3], 10), "m00, m01, m02");
+        assert_eq!(names_preview(&names[..10], 10), names[..10].join(", "));
+        assert_eq!(names_preview(&names, 10), format!("{}, … and 4 more", names[..10].join(", ")));
+        assert_eq!(names_preview(&[], 10), "");
+    }
+
+    /// A complete details answer replaces what was kept; an incomplete one (an error after
+    /// some pods were filled) adds what it filled, field by field, over the last good one.
+    #[test]
+    fn merge_details_table() {
+        let window = Maintenance { note: Some("host upgrade".into()), ..Default::default() };
+        let d = |ty: Option<&str>, cost: Option<f64>, m: Option<&Maintenance>| PodDetails {
+            gpu_type: ty.map(String::from),
+            gpu_count: ty.map(|_| 1),
+            cost_per_hr: cost,
+            maintenance: m.cloned(),
+        };
+        let kept0 = || {
+            HashMap::from([
+                ("runpod:rp1".to_string(), d(Some("RTX A4000"), Some(0.17), Some(&window))),
+                ("runpod:rp2".to_string(), d(Some("RTX 3090"), Some(0.22), None)),
+            ])
+        };
+        // This query filled rp1's price only (another field errored) and nothing for rp2.
+        let fresh = || {
+            HashMap::from([
+                ("runpod:rp1".to_string(), d(None, Some(0.19), None)),
+                ("runpod:rp2".to_string(), d(None, None, None)),
+                ("runpod:rp3".to_string(), d(Some("RTX A5000"), Some(0.30), None)),
+            ])
+        };
+        let mut partial = kept0();
+        merge_details(&mut partial, fresh(), false);
+        assert_eq!(partial["runpod:rp1"], d(Some("RTX A4000"), Some(0.19), Some(&window)), "new price, kept rest");
+        assert_eq!(partial["runpod:rp2"], d(Some("RTX 3090"), Some(0.22), None), "nothing filled: last good kept");
+        assert_eq!(partial["runpod:rp3"], d(Some("RTX A5000"), Some(0.30), None), "a new pod's fill is used");
+        // Nothing kept yet (the first query erred part-way): what it filled shows.
+        let mut first = HashMap::new();
+        merge_details(&mut first, fresh(), false);
+        assert_eq!(first["runpod:rp1"], d(None, Some(0.19), None));
+        // Complete: exactly the answer — a window that ended is gone.
+        let mut complete = kept0();
+        merge_details(&mut complete, fresh(), true);
+        assert_eq!(complete, fresh());
     }
 }
