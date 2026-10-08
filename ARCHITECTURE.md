@@ -148,7 +148,8 @@ flowchart TD
   container disk (participants' work) would be wiped, `terminate` takes one pod or `--all`
   (no ranges), and the TUI wants the pod's name (or `ALL`) typed back. A **locked** pod
   (`pods lock`, RunPod v2) is refused by every lifecycle command up front — and by RunPod
-  itself, for any client; only `terminate --unlock` lifts a lock, and says so.
+  itself, for any client; only `terminate --unlock` lifts a lock, and says so — with
+  `--all`, only the cohort's (`Naming::is_cohort`: a locked staff box is kept).
 - **Passthroughs are fenced**: `--api-json` can't override what the tool sets (refused
   before any call); `api get` is GET-only and can't send the key off the provider's API
   base, and redacts secrets unless `--raw` (the key itself never prints).

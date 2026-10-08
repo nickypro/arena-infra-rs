@@ -165,16 +165,21 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     the API's own `400 Pod is locked` (a pod locked since the listing) reads the same. Nothing
     unlocks on its own, except **`terminate --unlock`** (e.g. end of program: `pods terminate
     --all --unlock`), which says so in its confirm text and unlocks each locked pod right
-    before its terminate (a failed unlock = not terminated). `rename` is *not* refused: the
+    before its terminate (a failed unlock = not terminated; a pod locked since the listing is
+    unlocked and retried once). With `--all` it lifts **only the cohort's** locks
+    (`{prefix}-…`): a locked staff/personal box on the same account (`@` entry, or off the
+    list) is **kept** — not unlocked, not terminated — and the exit fails; to remove one, name
+    it alone (`pods terminate james-gpu --unlock`). `rename` is *not* refused: the
     spec only blocks stop/reset and a rename is restart-free (unverified on a locked pod —
     if RunPod refuses it, the same sentence says so). `teardown --check` marks locked pods
-    and puts `--unlock` in their fix.
+    and puts `--unlock` in their fix (on the `--all` line when any provider holds one).
   - `--api-json '<object>'` on `create`/`up` (plus config `CREATE_EXTRA_JSON`, single-quoted;
     the flag merges over it): extra fields **deep-merged** into the provider's create body
     for API options without a flag — e.g. RunPod v2 `{"dataCenterIds":["EU-RO-1"]}`,
     `{"globalNetworking":true}`, a network volume `{"mounts":{"network":[{"volumeId":"…",
-    "path":"/data"}]}}`, `{"gpu":{"minRamPerGpu":32}}`; v1 `interruptible`; Vast `price`;
-    Hetzner `labels`/`user_data`. Objects merge key by key (env adds variables), arrays and
+    "path":"/data"}]}}` (with `--volume 0`: RunPod takes a network volume *or* the pod
+    volume, so one next to `--volume`/`VOLUME_GB` > 0 is refused up front),
+    `{"gpu":{"minRamPerGpu":32}}`; v1 `interruptible`; Vast `price`; Hetzner `labels`/`user_data`. Objects merge key by key (env adds variables), arrays and
     scalars replace. Fields arena sets itself are **refused before any API call** with what
     sets them instead (name/label, image, GPU id/count, CUDA, cloud tier, disk,
     `mounts.persistent`/volume, `env.PUBLIC_KEY`/`MACHINE_NAME`, the start command, `startSsh`,
@@ -487,7 +492,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     relative to the provider's API base — absolute URLs, `//host`, `..` and `#` are refused
     before the key is read, redirects aren't followed — so the key only goes to the provider.
     Secrets are redacted (env values, key/token/password fields, `rpa_`/`sk-`/`hf_` tokens,
-    SSH key material) unless `--raw`; the API key itself is never printed, `--raw` included.
+    SSH key material) unless `--raw`; the API key itself is never printed, `--raw` included
+    (scrubbed from the body as received, before an error message clips it).
   - `gpus` — list the GPU types for `--gpu`: RunPod's **full live catalog** (via GraphQL;
     on `RUNPOD_API=v2` via `GET /v2/catalog/gpus`, STOCK then for the configured cloud, no
     GraphQL) when on RunPod with a key, else the local presets. Shows VRAM, **live**

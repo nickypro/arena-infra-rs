@@ -230,9 +230,24 @@ pub fn scrub(text: &str, api_key: &str) -> String {
 /// pretty; any other 2xx body as text; an empty one as nothing. Anything else — a 3xx
 /// included: redirects aren't followed — is the classified provider error. Unless `raw`,
 /// secrets are redacted; the API key never shows either way. Pure.
+///
+/// The key is scrubbed from the body **as received**, before anything else touches it, and
+/// again from what is printed. Scrubbing only the finished error message wasn't enough: the
+/// error clips its body to 300 characters, and a key the clip cut in two no longer matched —
+/// its head printed (`--raw`, or any key [`redact_text`] doesn't know by shape, like Vast's
+/// and Hetzner's). The second pass catches a key that only reads as one once a JSON body is
+/// decoded (`\u0071…` escapes) and re-encoded.
 pub fn render(status: StatusCode, body: &str, raw: bool, api_key: &str) -> Result<String> {
+    let body = scrub(body, api_key);
+    let json = serde_json::from_str::<Value>(&body).ok();
     if !status.is_success() {
-        let shown = if raw { body.to_string() } else { redact_text(body) };
+        let shown = match json {
+            // Compact, as the error prints a JSON body anyway — and scrubbed here, before
+            // the clip.
+            Some(v) => scrub(&(if raw { v } else { redact(&v) }).to_string(), api_key),
+            None if raw => body,
+            None => redact_text(&body),
+        };
         let mut e = status_error(status, &shown, "api get");
         if status.is_redirection() {
             e = Error::provider(format!("{e} — redirects aren't followed (the request stays on the API base)"));
@@ -242,11 +257,11 @@ pub fn render(status: StatusCode, body: &str, raw: bool, api_key: &str) -> Resul
             other => other,
         });
     }
-    let text = match serde_json::from_str::<Value>(body) {
-        Ok(v) => serde_json::to_string_pretty(&if raw { v } else { redact(&v) })
+    let text = match json {
+        Some(v) => serde_json::to_string_pretty(&if raw { v } else { redact(&v) })
             .map_err(|e| Error::provider(format!("api get: re-encoding the response: {e}")))?,
-        Err(_) if raw => body.to_string(),
-        Err(_) => redact_text(body),
+        None if raw => body,
+        None => redact_text(&body),
     };
     Ok(scrub(&text, api_key))
 }
@@ -413,8 +428,9 @@ mod tests {
         // --raw: the body as received — env and all — but the key itself still never shows.
         let raw = render(StatusCode::OK, &body, true, key).unwrap();
         assert!(raw.contains("\"A\": \"1\"") && raw.contains(KEY_SHOWN_AS) && !raw.contains("THEREALKEY"), "{raw}");
-        // Text bodies: redacted unless raw; the key never.
-        assert_eq!(render(StatusCode::OK, &format!("ok {key}"), false, key).unwrap(), "ok <redacted>");
+        // Text bodies: redacted unless raw; the key never (scrubbed first, so it reads as
+        // the key either way).
+        assert_eq!(render(StatusCode::OK, &format!("ok {key} hf_abcdefghijkl"), false, key).unwrap(), format!("ok {KEY_SHOWN_AS} <redacted>"));
         assert_eq!(render(StatusCode::OK, &format!("ok {key}"), true, key).unwrap(), format!("ok {KEY_SHOWN_AS}"));
         assert_eq!(render(StatusCode::NO_CONTENT, "", false, key).unwrap(), "");
         // Error statuses fail, classified, the key scrubbed from the message.
@@ -427,19 +443,68 @@ mod tests {
         assert_eq!(scrub("k in a word", "k"), "k in a word");
     }
 
-    /// End to end over a loopback socket: GET only, the bearer header, no redirect chased.
+    /// An error body is clipped to 300 characters in the message. A key echoed across that
+    /// cut must not print its head — `--raw`, or redacted with a key whose shape
+    /// `redact_text` doesn't know (Vast's and Hetzner's: 64 alphanumerics, no prefix) — nor
+    /// may a key escaped in a JSON body (`\u0071…`), which the error decodes.
+    #[test]
+    fn an_error_body_never_prints_part_of_the_key_at_the_clip() {
+        let runpod = "rpa_THEREALKEY0123456789ABCDEFGHIJ";
+        let hetzner = "q8Xv2LmN9pR4tZ7wK1yB6cD3fG5hJ0sQ2uE8iO4aV9nM7xL1kP3rT6yW0zC5bH8j";
+        assert_eq!(hetzner.len(), 64);
+        for key in [runpod, hetzner] {
+            let head = &key[..6];
+            // (case, body, raw)
+            let cases = [
+                ("text across the cut, raw", format!("{}{key} tail", "x".repeat(290)), true),
+                ("text across the cut", format!("{}{key} tail", "x".repeat(290)), false),
+                ("json across the cut, raw", json!({"error": format!("{}{key}", "x".repeat(280))}).to_string(), true),
+                ("json across the cut", json!({"error": format!("{}{key}", "x".repeat(280))}).to_string(), false),
+                ("json-escaped key", format!(r#"{{"error":"bad key \u{:04x}{}"}}"#, key.as_bytes()[0], &key[1..]), true),
+            ];
+            for (case, body, raw) in cases {
+                for status in [StatusCode::UNAUTHORIZED, StatusCode::FOUND] {
+                    let e = render(status, &body, raw, key).unwrap_err().to_string();
+                    assert!(!e.contains(head), "{case} ({status}, key {head}…): {e}");
+                    assert!(e.contains("api get HTTP"), "{case}: {e}");
+                }
+            }
+        }
+        // A 2xx body the same: whole, escaped or not, never the key.
+        let escaped = format!(r#"{{"echo":"\u{:04x}{}"}}"#, hetzner.as_bytes()[0], &hetzner[1..]);
+        for raw in [true, false] {
+            let out = render(StatusCode::OK, &escaped, raw, hetzner).unwrap();
+            assert!(!out.contains(&hetzner[..6]) && out.contains(KEY_SHOWN_AS), "{out}");
+        }
+    }
+
+    /// End to end over a loopback socket: GET only, the key as a bearer header (never in the
+    /// URL), and a redirect — with a `Location` pointing at a second server, as a real one
+    /// would — reported, not chased: the second server never sees a request (or the key).
+    /// (Without a `Location`, no client follows a 3xx, so a test without one proves nothing.)
     #[tokio::test]
     async fn get_sends_one_get_and_does_not_follow_a_redirect() {
         use crate::http::test_server::{canned, serve};
-        let srv = serve(vec![canned(200, "application/json", r#"{"pods":[]}"#), canned(302, "text/plain", "")]);
+        let elsewhere = serve(vec![canned(200, "application/json", r#"{"stolen":true}"#)]);
+        let srv = serve(vec![
+            canned(200, "application/json", r#"{"pods":[]}"#),
+            canned(302, "text/plain", "").header("Location", format!("{}/x", elsewhere.base)),
+        ]);
         let url = Url::parse(&format!("{}/v2/pods", srv.base)).unwrap();
         // The real builder, minus a system proxy (an HTTP_PROXY in the test env must not
         // route a loopback request elsewhere).
         let client = client_builder().no_proxy().build().unwrap();
-        let (status, body) = get_with(&client, url.clone(), "k").await.unwrap();
+        let (status, body) = get_with(&client, url.clone(), "k3y-material").await.unwrap();
         assert_eq!((status, body.as_str()), (StatusCode::OK, r#"{"pods":[]}"#));
-        let (status, _) = get_with(&client, url, "k").await.unwrap();
+        let (status, _) = get_with(&client, url, "k3y-material").await.unwrap();
         assert_eq!(status, StatusCode::FOUND, "reported, not followed");
         assert_eq!(*srv.requests.lock().unwrap(), ["GET /v2/pods HTTP/1.1", "GET /v2/pods HTTP/1.1"]);
+        for head in srv.headers.lock().unwrap().iter() {
+            let auth: Vec<&String> = head.iter().filter(|h| h.to_ascii_lowercase().starts_with("authorization:")).collect();
+            assert_eq!(auth.len(), 1, "{head:?}");
+            assert_eq!(auth[0].split_once(':').unwrap().1.trim(), "Bearer k3y-material", "{head:?}");
+        }
+        // A following client would have made that request inside `send` (and answered 200).
+        assert!(elsewhere.requests.lock().unwrap().is_empty(), "the redirect was followed: {:?}", elsewhere.requests.lock().unwrap());
     }
 }

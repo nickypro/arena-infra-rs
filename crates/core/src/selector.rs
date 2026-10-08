@@ -120,6 +120,21 @@ impl<'a> Naming<'a> {
         self.list.iter().position(|e| qualify(self.prefix, e) == name)
     }
 
+    /// Is `name` an absolute (`@name`) list entry's — a personal/staff box that shares the
+    /// list and the proxy without joining the cohort ([`crate::naming`]; `snapshot --public`
+    /// leaves them out for the same reason). The end of a cohort is not the end of those boxes.
+    pub fn is_staff(&self, name: &str) -> bool {
+        self.list.iter().any(|e| is_absolute(e) && qualify(self.prefix, e) == name)
+    }
+
+    /// Is `name` one of this cohort's machines: `{prefix}-…` (parked `-old`/`-new` twins
+    /// included), never a staff box ([`Naming::is_staff`]). What a fleet-wide destructive
+    /// step may act on without the pod being named: `teardown --check` prints a terminate
+    /// only for these, and `pods terminate --all --unlock` lifts only these pods' locks.
+    pub fn is_cohort(&self, name: &str) -> bool {
+        name.starts_with(&format!("{}-", self.prefix)) && !self.is_staff(name)
+    }
+
     /// A pod name as the operator would type it: without the fleet prefix.
     fn short<'n>(&self, name: &'n str) -> &'n str {
         name.strip_prefix(self.prefix).and_then(|r| r.strip_prefix('-')).unwrap_or(name)

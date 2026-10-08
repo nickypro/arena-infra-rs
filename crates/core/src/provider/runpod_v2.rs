@@ -500,8 +500,10 @@ pub(crate) const MANAGED: &[Managed] = &[
 /// - `volume_gb` > 0 → `mounts.persistent {size, path}`; 0 → no mount at all.
 /// - `startSsh: true`: with our `PUBLIC_KEY` set it injects nothing (the account keys are
 ///   merged into ours instead); without one it injects the account keys — v1's behaviour.
-/// - `spec.api_extra` (`--api-json`) is deep-merged in last, minus the [`MANAGED`] fields.
+/// - `spec.api_extra` (`--api-json`) is deep-merged in last, minus the [`MANAGED`] fields —
+///   and minus a network volume next to the pod volume ([`network_mount_conflict`]).
 fn create_payload(spec: &PodSpec, account_keys: &[String]) -> Result<Value> {
+    network_mount_conflict(spec)?;
     let cloud = normalize_cloud(&spec.cloud_type)?;
     let mut gpu = json!({ "id": spec.gpu_type, "count": spec.gpu_count });
     if !spec.allowed_cuda.is_empty() {
@@ -526,6 +528,32 @@ fn create_payload(spec: &PodSpec, account_keys: &[String]) -> Result<Value> {
     }
     apiextra::apply(&mut payload, spec.api_extra.as_ref(), MANAGED, Some("ports"))?;
     Ok(payload)
+}
+
+/// Refuse a network volume from `--api-json` (`mounts.network`) on a pod that also gets the
+/// pod volume (`--volume` / `VOLUME_GB` > 0 → `mounts.persistent`). The v2 schema allows
+/// "at most one of `persistent` or `network`" — the handler answers 400 when both are
+/// present — so the merge would build a body the API refuses only after planning and the
+/// confirm. Dropping our persistent mount instead would silently change what `--volume`
+/// promised (and what the restart gate reads), so the operator chooses: `--volume 0` with
+/// a network volume. Any `network` key counts, whatever its value. Pure.
+fn network_mount_conflict(spec: &PodSpec) -> Result<()> {
+    let network = spec
+        .api_extra
+        .as_ref()
+        .and_then(|x| x.get("mounts"))
+        .and_then(Value::as_object)
+        .is_some_and(|m| m.contains_key("network"));
+    if network && spec.volume_gb > 0 {
+        return Err(Error::Config(format!(
+            "{}: refused — `mounts.network` (a network volume) replaces the pod volume, and this pod \
+             also gets one ({} GB from --volume / VOLUME_GB): RunPod takes one or the other — pass \
+             --volume 0 (or set VOLUME_GB=0) with a network volume",
+            apiextra::SOURCES,
+            spec.volume_gb
+        )));
+    }
+    Ok(())
 }
 
 /// The `POST /v2/pods/{id}/action` body.
@@ -1435,6 +1463,42 @@ mod tests {
         let p = RunpodV2Provider::new("k");
         assert_eq!(p.preview_create_body(&s).unwrap(), create_payload(&s, &[]).unwrap());
         assert!(p.check_create_extra(s.api_extra.as_ref().unwrap()).is_ok());
+    }
+
+    /// The schema's Mounts: "at most one of `persistent` or `network`" (a 400 with both). A
+    /// network volume next to the pod volume (`--volume`/VOLUME_GB > 0) is refused before any
+    /// request, saying how to choose; with `--volume 0` it goes out alone; a pod volume
+    /// without one is unchanged. The preview (the dry run, and `create`/`up`'s up-front
+    /// check) refuses the same.
+    #[test]
+    fn a_network_volume_next_to_the_pod_volume_is_refused() {
+        let network = json!({"mounts": {"network": [{"volumeId": "v", "path": "/data"}]}});
+        // (case, volume_gb, extra, Ok(mounts) / Err(what the refusal says))
+        let cases: [(&str, u32, Option<Value>, std::result::Result<Option<Value>, &str>); 5] = [
+            ("network + pod volume", 20, Some(network.clone()), Err("pass --volume 0")),
+            ("network: null + pod volume", 20, Some(json!({"mounts": {"network": null}})), Err("replaces the pod volume")),
+            ("network alone", 0, Some(network.clone()), Ok(Some(json!({"network": [{"volumeId": "v", "path": "/data"}]})))),
+            ("pod volume alone", 20, Some(json!({"globalNetworking": true})), Ok(Some(json!({"persistent": {"size": 20, "path": "/workspace"}})))),
+            ("neither", 0, None, Ok(None)),
+        ];
+        let p = RunpodV2Provider::new("k");
+        for (case, volume_gb, extra, want) in cases {
+            let mut s = spec();
+            s.volume_gb = volume_gb;
+            s.api_extra = extra.map(|v| v.as_object().unwrap().clone());
+            match want {
+                Ok(mounts) => {
+                    let body = create_payload(&s, &[]).unwrap_or_else(|e| panic!("{case}: {e}"));
+                    assert_eq!(body.get("mounts").cloned(), mounts, "{case}");
+                }
+                Err(says) => {
+                    let e = create_payload(&s, &[]).unwrap_err();
+                    assert!(matches!(e, Error::Config(_)), "{case}: {e:?}");
+                    assert!(e.to_string().contains(says) && e.to_string().contains("20 GB"), "{case}: `{says}` in {e}");
+                    assert!(p.preview_create_body(&s).is_err(), "{case}: the preview refuses it too");
+                }
+            }
+        }
     }
 
     #[test]
