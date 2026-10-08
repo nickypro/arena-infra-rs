@@ -6386,13 +6386,19 @@ async fn deep_check_fleet(
     let mut jobs = Vec::new();
     let mut slots = Vec::with_capacity(pods.len());
     for (i, pod) in pods.iter().enumerate() {
-        slots.push(match SshTarget::from_pod(pod, cfg) {
-            Ok(t) => {
+        // A stopped pod's listed endpoint (if any) belongs to nothing: never probed.
+        let target = if arena_core::status::is_stopped(&pod.status) { None } else { SshTarget::from_pod(pod, cfg).ok() };
+        slots.push(match target {
+            Some(t) => {
                 jobs.push(((i, pod.name.clone()), t, cmd.clone()));
                 Slot::Probed
             }
-            Err(_) if sel.named => Slot::NoEndpoint,
-            Err(_) => {
+            None if sel.named => Slot::NoEndpoint,
+            None if arena_core::status::is_stopped(&pod.status) => {
+                eprintln!("{}", stopped_skip(pod));
+                Slot::Skipped
+            }
+            None => {
                 eprintln!("skip {} — no SSH endpoint yet", pod.name);
                 Slot::Skipped
             }
@@ -6424,6 +6430,11 @@ async fn deep_check_fleet(
     for (i, pod) in pods.iter().enumerate() {
         match slots[i] {
             Slot::Skipped => continue,
+            Slot::NoEndpoint if arena_core::status::is_stopped(&pod.status) => {
+                let why = format!("stopped ({}) — `arena pods start {}` brings it back", pod.status, pod.name);
+                results.push(PodHealth::unreachable(pod, why));
+                continue;
+            }
             Slot::NoEndpoint => {
                 results.push(PodHealth::unreachable(pod, format!("no SSH endpoint yet (status {})", pod.status)));
                 continue;
@@ -11246,6 +11257,11 @@ async fn handle_copy_keys(
         let (vars, matched_per_host) = keys.vars_for(&pod.name);
         if vars.is_empty() {
             continue; // nothing for this pod
+        }
+        if arena_core::status::is_stopped(&pod.status) {
+            eprintln!("{}", stopped_skip(pod));
+            unreachable += 1;
+            continue;
         }
         match SshTarget::from_pod(pod, cfg) {
             Ok(t) => {
@@ -16835,6 +16851,15 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
             ]
         );
         assert!(fake.calls_to(&host(22001)).is_empty());
+        // A named STOPPED pod (its last endpoint still listed) is never probed: a FAIL that
+        // says it's stopped and how to bring it back (live finding #15).
+        let mut f = fleet();
+        f.pods[0].status = "EXITED".into();
+        let fake = Arc::new(FakeRemote::new());
+        let sel = picked(&f, &deep_cfg(), &["apple"]).await;
+        let results = deep_check_fleet(&f, &remote(&fake), &deep_cfg(), &sel).await.unwrap();
+        assert_eq!(results[0].checks[0].detail, "stopped (EXITED) — `arena pods start devtest-apple` brings it back");
+        assert!(fake.calls().is_empty());
         // Without names, a pod without an endpoint is skipped (with a note), not failed.
         let fake = Arc::new(FakeRemote::new());
         let all: Vec<_> = (0..3).map(|_| FakeReply::stdout(DEEP_HEALTHY)).collect();
