@@ -74,9 +74,13 @@ pub const BACKUP_SKIPPED: &str = "SKIP";
 ///
 /// It refuses to push `main`/`master` (or a detached `HEAD`), printing `SKIP <branch>`
 /// and exiting 0 — so an automated backup never lands commits on the protected branch.
-/// Flow: resolve the current branch; skip if protected; ensure a git identity; stage; if
-/// the tree is clean print `NO_CHANGES <branch>` and exit 0; otherwise commit and
-/// `push -u origin <branch>`, then print `PUSHED <branch>`. `set -e` aborts on error.
+/// Flow: resolve the current branch; skip if protected; ensure a git identity; stage and
+/// commit if anything is staged; then push whenever the branch has **no upstream yet or is
+/// ahead of it** — not only when this run committed. A push that failed last tick (network
+/// blip, GitHub outage, a key briefly missing) leaves its commit local and the tree clean,
+/// so "nothing staged" must not read as "nothing to do": the next tick retries the push.
+/// Only a clean tree *and* `HEAD == @{u}` prints `NO_CHANGES <branch>` (exit 0); a push
+/// prints `PUSHED <branch>`. `set -e` aborts on error, so a rejected push is a failure.
 pub fn backup_command(repo_path: &str, git_ssh_key: Option<&str>, commit_msg: &str) -> String {
     let mut parts: Vec<String> =
         vec!["set -e".into(), format!("cd {}", shell_quote(repo_path))];
@@ -100,10 +104,15 @@ pub fn backup_command(repo_path: &str, git_ssh_key: Option<&str>, commit_msg: &s
             .into(),
     );
     parts.push("git add -A".into());
-    parts.push(format!(
-        "if git diff --cached --quiet; then echo \"{BACKUP_NO_CHANGES} $B\"; exit 0; fi"
-    ));
-    parts.push(format!("git commit -m {}", shell_quote(commit_msg)));
+    parts.push(format!("if ! git diff --cached --quiet; then git commit -q -m {}; fi", shell_quote(commit_msg)));
+    // Ahead of the upstream (or no upstream yet) → there is something to push, whether it
+    // was committed just now or by an earlier tick whose push failed.
+    parts.push(
+        "if git rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; \
+         then AHEAD=$(git rev-list --count '@{u}..HEAD'); else AHEAD=new; fi"
+            .into(),
+    );
+    parts.push(format!("if [ \"$AHEAD\" = 0 ]; then echo \"{BACKUP_NO_CHANGES} $B\"; exit 0; fi"));
     parts.push("git push -u origin \"$B\"".into());
     parts.push(format!("echo \"{BACKUP_PUSHED} $B\""));
     parts.join("; ")
@@ -226,7 +235,9 @@ mod tests {
         // Stage + clean-tree guard + commit + push the *current* branch.
         assert!(c.contains("git add -A"));
         assert!(c.contains("NO_CHANGES $B"));
-        assert!(c.contains("git commit -m 'arena backup'"));
+        assert!(c.contains("git commit -q -m 'arena backup'"));
+        // "Nothing staged" isn't "nothing to do": push whenever ahead of / without an upstream.
+        assert!(c.contains("git rev-list --count '@{u}..HEAD'"));
         assert!(c.contains(r#"git push -u origin "$B""#));
         assert!(c.contains("PUSHED $B"));
         assert!(c.contains("Arena Autocommit"));
@@ -242,6 +253,73 @@ mod tests {
     fn escapes_single_quotes_in_message() {
         let c = backup_command("/root/ARENA_3.0", None, "it's a backup");
         assert!(c.contains(r"'it'\''s a backup'"));
+    }
+
+    /// Run the rendered command for real against a local bare "origin" (no network, no
+    /// SSH): the live finding was a push that failed once and was then never retried,
+    /// because the next tick saw a clean tree and reported `NO_CHANGES` with exit 0.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_push_is_retried_on_the_next_tick_without_a_new_edit() {
+        use std::process::Command;
+        let base = std::env::temp_dir().join(format!("arena-backup-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let (origin, work) = (base.join("origin.git"), base.join("work"));
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let o = Command::new("git").current_dir(dir).args(args).output().expect("git");
+            assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        git(&base, &["init", "-q", "--bare", origin.to_str().unwrap()]);
+        git(&base, &["init", "-q", work.to_str().unwrap()]);
+        git(&work, &["config", "user.name", "t"]);
+        git(&work, &["config", "user.email", "t@t"]);
+        std::fs::write(work.join("a.txt"), "1").unwrap();
+        git(&work, &["add", "-A"]);
+        git(&work, &["commit", "-q", "-m", "init"]);
+        git(&work, &["checkout", "-q", "-b", "autocommit-x"]);
+        git(&work, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        let run = || {
+            let o = Command::new("bash")
+                .arg("-c")
+                .arg(backup_command(work.to_str().unwrap(), None, "arena backup"))
+                .output()
+                .expect("bash");
+            (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string())
+        };
+        let remote_head = || {
+            let o = Command::new("git")
+                .args(["--git-dir", origin.to_str().unwrap(), "rev-parse", "refs/heads/autocommit-x"])
+                .output()
+                .unwrap();
+            o.status.success().then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        };
+
+        // 1. No upstream yet, clean tree: the branch is still pushed (creates it upstream).
+        let (ok, out) = run();
+        assert!(ok && out.contains("PUSHED autocommit-x"), "{out}");
+        assert_eq!(remote_head().as_deref(), Some(git(&work, &["rev-parse", "HEAD"]).as_str()));
+
+        // 2. In sync and clean: the only case that may say NO_CHANGES.
+        let (ok, out) = run();
+        assert!(ok && out.contains("NO_CHANGES autocommit-x"), "{out}");
+
+        // 3. A new edit, but the push fails (origin unreachable): a loud failure, commit kept.
+        std::fs::write(work.join("b.txt"), "work").unwrap();
+        git(&work, &["remote", "set-url", "origin", base.join("missing.git").to_str().unwrap()]);
+        let (ok, out) = run();
+        assert!(!ok && !out.contains("NO_CHANGES"), "a failed push must fail: {out}");
+        let local = git(&work, &["rev-parse", "HEAD"]);
+        assert_ne!(remote_head().as_deref(), Some(local.as_str()));
+
+        // 4. Origin is back, nothing new edited: the next tick must push the stuck commit.
+        git(&work, &["remote", "set-url", "origin", origin.to_str().unwrap()]);
+        let (ok, out) = run();
+        assert!(ok && out.contains("PUSHED autocommit-x"), "the stuck commit must be retried: {out}");
+        assert_eq!(remote_head().as_deref(), Some(local.as_str()));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
