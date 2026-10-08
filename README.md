@@ -686,9 +686,15 @@ free name and back → `pods terminate` → `teardown --check` until nothing of 
 ```bash
 cd /home/dev/sandbox/arena-infra-rs
 ARENA_LIVE_SMOKE=1 ARENA_LIVE_CONFIG=/home/dev/sandbox/config.env \
+  ARENA_LIVE_BIN=/home/dev/sandbox/bin/arena-dev \
   cargo test --release -p arena-cli --test live_smoke -- --ignored --nocapture
 # also: RUNPOD_API=v2 (smoke the v2 backend) · ARENA_LIVE_GPU=3070 (the --gpu list)
 ```
+
+`ARENA_LIVE_BIN` (optional, recommended in the sandbox) runs the commands through a wrapper
+instead of the built binary — the sandbox's `bin/arena-dev` adds its own refusal of production
+keys/prefix and passes `--config` itself, so it must point at the same config as
+`ARENA_LIVE_CONFIG`. Build first (`cargo build --release`) so the wrapper runs this tree.
 
 It refuses to start unless both variables are set; the config (symlinks resolved) is not
 `/home/dev/prod-ro/config.env` or anything under `/home/dev/prod-ro` or `/root`; its

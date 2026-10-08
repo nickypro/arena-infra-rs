@@ -94,6 +94,10 @@ struct Settings {
     config: PathBuf,
     prefix_allow: Vec<String>,
     gpu: String,
+    /// `ARENA_LIVE_BIN`: run this wrapper instead of the built binary — e.g. the sandbox's
+    /// `bin/arena-dev`, whose own guard refuses production keys/prefix and which supplies
+    /// `--config` itself (so it must name the same config as `ARENA_LIVE_CONFIG`).
+    wrapper: Option<PathBuf>,
 }
 
 /// Read the opt-in variables. Nothing here has a default that could make the test run by
@@ -109,7 +113,8 @@ fn settings(var: impl Fn(&str) -> Option<String>) -> Result<Settings, String> {
         .map(|v| v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect())
         .unwrap_or_default();
     let gpu = set("ARENA_LIVE_GPU").unwrap_or_else(|| DEFAULT_GPU_LIST.to_string());
-    Ok(Settings { config: PathBuf::from(config), prefix_allow, gpu })
+    let wrapper = set("ARENA_LIVE_BIN").map(PathBuf::from);
+    Ok(Settings { config: PathBuf::from(config), prefix_allow, gpu, wrapper })
 }
 
 /// Refuse the production config and anything under a forbidden directory. `canonical` has
@@ -450,12 +455,14 @@ impl Ran {
     }
 }
 
-/// The built binary, aimed at the checked config.
+/// The built binary (or an `ARENA_LIVE_BIN` wrapper), aimed at the checked config.
 struct Arena {
     bin: PathBuf,
     config: PathBuf,
     cwd: PathBuf,
     state_dir: PathBuf,
+    /// False for a wrapper that passes `--config` itself (clap refuses it twice).
+    pass_config: bool,
 }
 
 impl Arena {
@@ -466,11 +473,11 @@ impl Arena {
     fn run(&self, args: &[&str], limit: Duration, capture: bool) -> Ran {
         eprintln!("[smoke] $ arena {}", args.join(" "));
         let mut cmd = Command::new(&self.bin);
-        cmd.env_clear()
-            .envs(child_env(|k| std::env::var_os(k), &self.state_dir))
-            .arg("--config")
-            .arg(&self.config)
-            .args(args)
+        cmd.env_clear().envs(child_env(|k| std::env::var_os(k), &self.state_dir));
+        if self.pass_config {
+            cmd.arg("--config").arg(&self.config);
+        }
+        cmd.args(args)
             .current_dir(&self.cwd)
             .stdin(Stdio::null())
             .stdout(if capture { Stdio::piped() } else { Stdio::inherit() })
@@ -749,7 +756,11 @@ fn preflight() -> Result<Plan, String> {
     let cwd = config.parent().ok_or("the config has no parent directory")?.to_path_buf();
     let proxy = check_proxy(&child, std::env::var("HOME").ok().as_deref(), &cwd)?;
 
-    let arena = Arena { bin: PathBuf::from(env!("CARGO_BIN_EXE_arena")), config, cwd, state_dir };
+    let (bin, pass_config) = match &s.wrapper {
+        Some(w) => (w.clone(), false),
+        None => (PathBuf::from(env!("CARGO_BIN_EXE_arena")), true),
+    };
+    let arena = Arena { bin, config, cwd, state_dir, pass_config };
     eprintln!(
         "[smoke] config {} · prefix {prefix} · proxy {} · health cache {}",
         arena.config.display(),
@@ -899,7 +910,7 @@ fn smoke_needs_both_opt_in_variables() {
         assert!(err.contains(refusal), "{env:?}: {err}");
     }
     let s = settings(vars(&[("ARENA_LIVE_SMOKE", " 1 "), cfg])).unwrap();
-    assert_eq!(s, Settings { config: cfg.1.into(), prefix_allow: vec![], gpu: DEFAULT_GPU_LIST.into() });
+    assert_eq!(s, Settings { config: cfg.1.into(), prefix_allow: vec![], gpu: DEFAULT_GPU_LIST.into(), wrapper: None });
     let s = settings(vars(&[
         ("ARENA_LIVE_SMOKE", "1"),
         cfg,
@@ -908,6 +919,9 @@ fn smoke_needs_both_opt_in_variables() {
     ]))
     .unwrap();
     assert_eq!((s.prefix_allow, s.gpu), (vec!["nick".to_string(), "lab".to_string()], "3070".to_string()));
+    assert_eq!(s.wrapper, None, "no wrapper unless asked: the built binary gets --config itself");
+    let w = settings(vars(&[("ARENA_LIVE_SMOKE", "1"), cfg, ("ARENA_LIVE_BIN", " /home/dev/sandbox/bin/arena-dev ")])).unwrap();
+    assert_eq!(w.wrapper, Some(PathBuf::from("/home/dev/sandbox/bin/arena-dev")));
 }
 
 #[test]
@@ -1252,7 +1266,7 @@ fn the_harness_clears_the_environment_and_kills_at_the_deadline() {
     ];
     std::fs::write(&stub, script.join("\n") + "\n").unwrap();
     std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let arena = Arena { bin: stub, config: dir.join("config.env"), cwd: dir.clone(), state_dir: dir.join("state") };
+    let arena = Arena { bin: stub, config: dir.join("config.env"), cwd: dir.clone(), state_dir: dir.join("state"), pass_config: true };
 
     let ran = arena.run(&["pods", "list"], Duration::from_secs(20), true);
     assert!(ran.ok(), "{}", ran.describe());
@@ -1265,6 +1279,14 @@ fn the_harness_clears_the_environment_and_kills_at_the_deadline() {
     assert!(ran.stdout.contains(&format!("ARGS --config {} pods list", dir.join("config.env").display())), "{}", ran.stdout);
     assert!(ran.stdout.contains(&format!("CWD {}", cwd.display())), "{}", ran.stdout);
     assert!(ran.stdout.contains("STDIN-CLOSED"), "a prompt must never wait on input: {}", ran.stdout);
+
+    // Through a wrapper (`ARENA_LIVE_BIN`, e.g. bin/arena-dev) that supplies --config itself:
+    // the harness must not pass it again (clap refuses a repeated --config).
+    let wrapped = Arena { pass_config: false, bin: arena.bin.clone(), config: arena.config.clone(), cwd: arena.cwd.clone(), state_dir: arena.state_dir.clone() };
+    let ran = wrapped.run(&["pods", "list"], Duration::from_secs(20), true);
+    assert!(ran.ok(), "{}", ran.describe());
+    assert!(ran.stdout.contains("ARGS pods list"), "{}", ran.stdout);
+    assert!(!ran.stdout.contains("--config"), "{}", ran.stdout);
 
     // Not captured (stdout shown): done as soon as the command is.
     let started = Instant::now();
@@ -1351,7 +1373,7 @@ fn the_cleanup_guard_terminates_through_outages_and_stops_only_on_a_complete_lis
         let stub = dir.0.join("arena-stub.sh");
         std::fs::write(&stub, script).unwrap();
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let arena = Arena { bin: stub, config: dir.0.join("config.env"), cwd: dir.0.clone(), state_dir: dir.0.join("state") };
+        let arena = Arena { bin: stub, config: dir.0.join("config.env"), cwd: dir.0.clone(), state_dir: dir.0.join("state"), pass_config: true };
         let run = || {
             let mut cleanup = Cleanup::new(&arena, names());
             cleanup.pause = Duration::ZERO;
