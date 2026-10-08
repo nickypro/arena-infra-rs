@@ -704,8 +704,13 @@ enum PodCmd {
         #[command(flatten)]
         sel: Select,
     },
-    /// Stop the selected running pods: names / ids / ranges, or --all (narrowed by
-    /// --exclude / --gpus / --on). Needs targets or --all.
+    /// Stop every selected pod that is billing: names / ids / ranges, or --all (narrowed
+    /// by --exclude / --gpus / --on). Needs targets or --all.
+    ///
+    /// "Billing" means running OR on its way up (starting / provisioning / pending /
+    /// initializing / loading / restarting …) OR in ERROR — all of these are stopped, so
+    /// they need --wipe-ok just like a running pod. Selected pods that are already stopped,
+    /// or in a state we don't know, are skipped with a note.
     ///
     /// On RunPod (and Vast, unverified) a stopped pod keeps NO data: its container disk is
     /// discarded and it starts again as a fresh image — only a persistent volume at
@@ -9239,6 +9244,22 @@ mod selection_tests {
             let got: Vec<String> = f.calls().into_iter().map(|(op, id)| format!("{op} {id}")).collect();
             let want: Vec<String> = ids(stopped).into_iter().map(|id| format!("stop {id}")).collect();
             assert_eq!(got, want, "{argv:?}");
+        }
+    }
+
+    /// `pods stop --help` states the rule the handler applies (`status::is_billing`), not
+    /// the old RUNNING-only one: an ERROR / PROVISIONING pod is stopped too, and needs
+    /// --wipe-ok like a running one — the help must not promise otherwise.
+    #[test]
+    fn stop_help_states_the_billing_rule() {
+        use clap::CommandFactory;
+        let cli = super::Cli::command();
+        let stop = cli.find_subcommand("pods").and_then(|p| p.find_subcommand("stop")).expect("pods stop");
+        let about = stop.get_about().map(|s| s.to_string()).unwrap_or_default();
+        let long = stop.get_long_about().map(|s| s.to_string()).unwrap_or_default();
+        assert!(about.contains("billing") && !about.contains("running pods"), "{about}");
+        for want in ["starting", "provisioning", "ERROR", "--wipe-ok", "skipped"] {
+            assert!(long.contains(want), "missing {want:?}: {long}");
         }
     }
 

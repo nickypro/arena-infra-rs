@@ -115,10 +115,13 @@ impl OpenRouter {
     /// One page of `GET /keys` from `offset` (disabled keys included: a disabled key still
     /// exists, still carries its machine's name, and revoke/rename must see it). Status
     /// first ([`send_json`]): a bad provisioning key's 401 is `Auth` whatever its body.
+    /// Only a `data` array counts as a page — [`collect_pages`] reads an empty page as "end
+    /// of listing", so an empty 2xx body (`send_json` gives `Null` for 200/204 with nothing)
+    /// or a JSON body without `data` must fail, not pass a truncated listing off as whole.
     async fn list_page(&self, offset: usize) -> Result<Vec<KeyInfo>> {
         let query = [("include_disabled", "true".to_string()), ("offset", offset.to_string())];
         let v = send_json(self.auth(self.client.get(&self.base)).query(&query), "openrouter list keys").await?;
-        let arr = v.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default();
+        let arr = page_data(&v)?;
         Ok(arr.iter().filter_map(|k| serde_json::from_value(k.clone()).ok()).collect())
     }
 
@@ -170,6 +173,15 @@ where
         all.extend(fresh);
     }
     Err(Error::provider(format!("openrouter list keys: more than {MAX_KEY_PAGES} pages — not a complete listing")))
+}
+
+/// The `data` array of one `GET /keys` page, or an error when there isn't one (an empty
+/// 2xx body arrives as `Null`, or JSON of another shape): never an empty page, which
+/// [`collect_pages`] would take for the end of the listing. Pure, for testing.
+pub fn page_data(v: &serde_json::Value) -> Result<&Vec<serde_json::Value>> {
+    v.get("data").and_then(|d| d.as_array()).ok_or_else(|| {
+        Error::provider("openrouter list keys: a page had no `data` array — not a complete listing")
+    })
 }
 
 /// The `PATCH /keys/{hash}` body for a rename: only `name`, so nothing else about the key
@@ -280,6 +292,39 @@ mod tests {
                 "PATCH /a HTTP/1.1",
             ]
         );
+    }
+
+    /// A 2xx page with no `data` array — an empty 200, a 204, JSON of another shape — fails
+    /// the listing. `send_json` reads an empty 2xx body as `Null`; were that an empty page,
+    /// [`collect_pages`] would stop there and return page 1 as the whole listing, and revoke
+    /// would drop the CSV row of a key past it that still works.
+    #[tokio::test]
+    async fn a_page_without_data_fails_the_listing_instead_of_ending_it() {
+        use crate::http::test_server::{canned, client, serve};
+        let json = "application/json";
+        let page1 = r#"{"data":[{"hash":"a","name":"devtest-apple"}]}"#;
+        for (case, second) in [
+            ("empty 200", canned(200, json, "")),
+            ("204", canned(204, json, "")),
+            ("json without data", canned(200, json, r#"{"keys":[]}"#)),
+            ("data not an array", canned(200, json, r#"{"data":null}"#)),
+        ] {
+            let srv = serve(vec![canned(200, json, page1), second]);
+            let or = OpenRouter { provisioning_key: "K".into(), client: client(), base: srv.base.clone() };
+            let e = or.list_keys().await.expect_err(case);
+            assert!(e.to_string().contains("no `data` array"), "{case}: {e}");
+            assert_eq!(srv.requests.lock().unwrap().len(), 2, "{case}: page 2 was asked for");
+        }
+    }
+
+    #[test]
+    fn page_data_needs_a_data_array() {
+        use serde_json::json;
+        assert_eq!(page_data(&json!({"data": [{"hash": "a"}]})).unwrap().len(), 1);
+        assert!(page_data(&json!({"data": []})).unwrap().is_empty(), "an explicit empty page is the end");
+        for bad in [json!(null), json!({}), json!({"data": null}), json!({"data": {}}), json!([])] {
+            assert!(page_data(&bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

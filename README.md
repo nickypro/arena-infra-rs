@@ -90,8 +90,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     double create's twin removed by id keeps the survivor's key); a failed revoke keeps the
     row, is named, and makes the exit non-zero without stopping any terminate.
     `stop apple..mayor` / `stop --all --exclude bloom` stops many at once (needs targets or
-    `--all`): every selected pod in a billing state (running *or* starting/provisioning) is
-    stopped, others are skipped with a note; `kill` is the stop→wait-for-
+    `--all`): every selected pod in a billing state (running, starting/provisioning/…, or
+    ERROR) is stopped, others are skipped with a note; `kill` is the stop→wait-for-
     EXITED→delete flow (`--timeout`; one target or `--all`).
   - `rename <old> <new>` / `rename --from-prefix <p>` renames the pod (metadata only, no
     restart) and then brings along what's keyed by the name: rewrites `~/.name` over SSH
