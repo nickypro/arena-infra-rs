@@ -14,16 +14,25 @@
 //! Nothing about a job lives on the control machine: `pods jobs` / `pods logs` read these
 //! files back, so a second operator — or this one after a laptop crash — sees the same state.
 //!
-//! **Detaching**: `setsid nohup sh run >log 2>&1 </dev/null &`. `setsid` gives the wrapper
+//! **Detaching**: `setsid -f nohup sh run >log 2>&1 </dev/null`. `setsid` gives the wrapper
 //! its own session and process group (no controlling terminal; the group is what `--kill`
-//! signals), `nohup` makes it immune to a hangup, and redirecting all three standard
-//! streams is what lets the SSH call return at once — sshd keeps the session open while
-//! anything still holds its pipes. The wrapper runs the command under the same
-//! login-shell/conda wrap as `pods run` ([`crate::ssh::login_shell_wrap`]), records its own
-//! pid first and the exit code last (each via a rename, so a reader never sees half a
-//! file), and traps TERM so that killing the group stops the *command* while the wrapper
-//! lives on to record `143`. `PYTHONUNBUFFERED=1`: python block-buffers a redirected
-//! stdout, so without it a job's log — and `logs --follow` — would sit silent for minutes.
+//! signals), `-f` forks it off so the start script carries on at once, `nohup` makes it
+//! immune to a hangup, and redirecting all three standard streams is what lets the SSH call
+//! return at once — sshd keeps the session open while anything still holds its pipes. Not
+//! `setsid … &`: a non-interactive shell starts an `&` list with SIGINT and SIGQUIT
+//! *ignored*, a shell can't undo an ignore it inherited, and so the command — python, its
+//! subprocesses — would run deaf to SIGINT (no `KeyboardInterrupt`, a test that interrupts
+//! a child hangs), unlike under a foreground `pods run`. Only a `setsid` without `-f`
+//! (util-linux < 2.31, busybox) falls back to `&`, with that limitation.
+//!
+//! The wrapper runs the command under the same login-shell/conda wrap as `pods run`
+//! ([`crate::ssh::login_shell_wrap`]), records its own pid first and the exit code last
+//! (each via a rename, so a reader never sees half a file), and traps TERM so that killing
+//! the group stops the *command* while the wrapper lives on to record `143`. If it can't
+//! record its pid it doesn't run the command at all (exit `125`): a job nobody can see
+//! running, or stop, is worse than one that didn't start. `PYTHONUNBUFFERED=1`: python
+//! block-buffers a redirected stdout, so without it a job's log — and `logs --follow` —
+//! would sit silent for minutes.
 //!
 //! **Quoting**: the command and the wrapper travel base64-encoded inside the start script
 //! (no quote, `$`, backslash or newline in a command can break out of anything), every
@@ -33,8 +42,12 @@
 //! **Status** is judged on the pod, by one shell function shared by every read: an `exit`
 //! file → exited with that code; else the recorded pid is alive *and is still this job's
 //! wrapper* (its cmdline names this job's `run` — a bare pid could have been recycled) →
-//! running; else a pid but no exit code → lost (SIGKILLed, OOM-killed, or the pod
-//! restarted); else starting.
+//! running; else the `exit` file is looked for *again* — the wrapper writes it just before
+//! it exits, so a job that ended between the two looks has it now and mustn't read as
+//! lost; else a pid but no exit code → lost (SIGKILLed, OOM-killed, or the pod restarted);
+//! else no pid yet → starting, for a minute or so — a wrapper records its pid first thing
+//! or not at all, so a job without one after that never will be tracked, and is lost too
+//! (else `logs -f` would follow it forever).
 //!
 //! **Logs** come back base64-encoded with their byte offsets, so `--follow` can ask for
 //! exactly the bytes it hasn't seen (no duplicated or dropped lines, whatever the log
@@ -178,39 +191,62 @@ fn sh_c(script: &str) -> String {
 }
 
 /// Shell functions every read shares. `ours PID ID`: is PID alive and still this job's
-/// wrapper? `info ID`: print the job's `ARENA_JOB` status line (and leave `$state`/`$pid`
-/// set for the caller). Each value is filtered to the characters it may contain, and the
-/// command is clipped and flattened to one line, so a damaged file can't break the reply.
+/// wrapper? `judge ID`: set `$state`/`$code`/`$pid`/`$started` (see the module doc for the
+/// order of the looks — the second `ended` closes the race with a wrapper that exits
+/// between the first look and the liveness check). `show ID`: print the judged job's
+/// `ARENA_JOB` status line; `info ID` = both. Each value is filtered to the characters it
+/// may contain, and the command is clipped and flattened to one line, so a damaged file
+/// can't break the reply. `find -mmin +1`: the job directory is over a minute old (GNU
+/// find; busybox rounds down, so two) — it last changed when the job was started, since a
+/// job without a pid wrote nothing after.
 /// `LC_ALL=C`: byte-wise globs, `tr` and `sort` (only the reads use this — never a job).
 const PRELUDE: &str = r#"LC_ALL=C; export LC_ALL
 J="$HOME/.arena/jobs"
 ours() {
   [ -r "/proc/$1/cmdline" ] && tr '\000' ' ' < "/proc/$1/cmdline" 2>/dev/null | grep -qF -- "/.arena/jobs/$2/run"
 }
-info() {
+ended() {
+  [ -f "$d/exit" ] || return 1
+  state=exit; code=$(head -c 20 "$d/exit" 2>/dev/null | tr -cd '0-9-')
+}
+judge() {
   d="$J/$1"
   started=$(head -c 40 "$d/started_at" 2>/dev/null | tr -cd '0-9TZ:-')
   pid=$(head -c 20 "$d/pid" 2>/dev/null | tr -cd '0-9')
   code=-
-  if [ -f "$d/exit" ]; then
-    state=exit; code=$(head -c 20 "$d/exit" 2>/dev/null | tr -cd '0-9-')
+  if ended; then
+    :
   elif [ -n "$pid" ] && ours "$pid" "$1"; then
     state=running
+  elif ended; then
+    :
   elif [ -n "$pid" ]; then
+    state=lost
+  elif [ -n "$(find "$d" -prune -mmin +1 2>/dev/null)" ]; then
     state=lost
   else
     state=starting
   fi
+}
+show() {
   cmd=$(head -c 300 "$d/cmd" 2>/dev/null | tr '\t\r\n' '   ')
   printf 'ARENA_JOB\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "${started:--}" "$state" "${code:--}" "${pid:--}" "$cmd"
+}
+info() {
+  judge "$1"; show "$1"
 }
 "#;
 
 /// Start a job (see the module doc). Refuses — before creating anything — when a tool it
 /// needs is missing, and never reuses a job directory (`mkdir` without `-p`): an id clash
 /// is an error, not an overwrite. The job's directory is private (umask 077: its log can
-/// hold tokens a test printed), but the job itself runs under the login's own umask. Waits
-/// up to 5s for the wrapper's pid.
+/// hold tokens a test printed), but the job itself runs under the login's own umask.
+/// Detaches with `setsid -f` where `setsid` has it (probed by running `true` with it), else
+/// `&` (see the module doc for why that's only the fallback). Waits up to 5s for the
+/// wrapper's pid — or its exit code, which without a pid means it refused to run the
+/// command. No pid and no exit code by then is *not* a clean failure: the wrapper may
+/// still be about to run it, so it is reported as `ARENA_JOB_UNSURE`, never as "didn't
+/// start" (a retry would run a second copy).
 const START: &str = r#"mask=$(umask); umask 077
 J="$HOME/.arena/jobs"; d="$J/@ID@"
 for t in setsid nohup base64 head tail; do
@@ -223,20 +259,34 @@ if ! { printf %s @CMD64@ | base64 -d > "$d/cmd" && printf %s @RUN64@ | base64 -d
 fi
 date -u +%Y-%m-%dT%H:%M:%SZ > "$d/started_at"
 umask "$mask"
-setsid nohup sh "$d/run" > "$d/log" 2>&1 < /dev/null &
+if setsid -f true > /dev/null 2>&1; then
+  setsid -f nohup sh "$d/run" > "$d/log" 2>&1 < /dev/null
+else
+  setsid nohup sh "$d/run" > "$d/log" 2>&1 < /dev/null &
+fi
 i=0
-while [ ! -s "$d/pid" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+while [ ! -s "$d/pid" ] && [ ! -f "$d/exit" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
 pid=$(head -c 20 "$d/pid" 2>/dev/null | tr -cd '0-9')
-[ -n "$pid" ] || { echo "ARENA_JOB_ERR the job reported no pid within 5s (see $d/log)"; exit 3; }
+if [ -z "$pid" ]; then
+  if [ -f "$d/exit" ]; then
+    echo "ARENA_JOB_ERR the job could not record its pid, so it did not run the command (see $d/log)"; exit 3
+  fi
+  echo "ARENA_JOB_UNSURE $d/log"; exit 3
+fi
 echo "ARENA_JOB_STARTED @ID@ $pid"
 "#;
 
-/// The wrapper (`run`): pid first, exit code last, TERM trapped (a handler, not ignored —
-/// an ignored signal would be inherited by the command and make it unkillable).
+/// The wrapper (`run`): pid first (one it can't record means exit `125` without running the
+/// command — see the module doc), exit code last, TERM trapped (a handler, not ignored: an
+/// ignored signal would be inherited by the command and make it unkillable).
 const RUN: &str = r#"# arena job @ID@ — started by `arena pods run --background`; see `arena pods logs @ID@`.
 d=$(dirname -- "$0")
 trap : INT TERM
-echo $$ > "$d/pid.tmp" && mv -f "$d/pid.tmp" "$d/pid"
+if ! { echo $$ > "$d/pid.tmp" && mv -f "$d/pid.tmp" "$d/pid"; }; then
+  echo "arena: could not record this job's pid in $d — not running it (exit 125)" >&2
+  echo 125 > "$d/exit.tmp" && mv -f "$d/exit.tmp" "$d/exit"
+  exit 125
+fi
 export PYTHONUNBUFFERED=1
 @WRAPPED@
 code=$?
@@ -279,24 +329,33 @@ echo
 echo ARENA_JOBS_END
 "#;
 
-/// SIGTERM to a running job's process group — only once `info` has confirmed the pid is
+/// SIGTERM to a running job's process group — only once `judge` has confirmed the pid is
 /// still this job's wrapper, and only if that pid leads its own group (`setsid` made it
-/// so; anything else means it isn't ours to signal).
+/// so; anything else means it isn't ours to signal). A job that wasn't signalled is judged
+/// again before that's called a failure: one that ended in between (its `/proc` entry gone,
+/// so no group to read, or nothing left to signal) was simply not running any more. The
+/// status line printed is the last judgement.
 const KILL: &str = r#"id=@ID@
 if [ ! -d "$J/$id" ]; then echo ARENA_JOB_MISSING; echo ARENA_JOBS_END; exit 0; fi
-info "$id"
-if [ "$state" != running ]; then
-  echo ARENA_KILL_SKIPPED
-else
+judge "$id"
+verdict=SKIPPED
+if [ "$state" = running ]; then
   pgrp=$(sed -e 's/^.*) //' "/proc/$pid/stat" 2>/dev/null | cut -d' ' -f3)
-  if [ "$pgrp" != "$pid" ]; then
-    echo ARENA_KILL_REFUSED
-  elif kill -s TERM -- "-$pid" 2>/dev/null; then
-    echo ARENA_KILL_SENT
+  if [ "$pgrp" = "$pid" ] && kill -s TERM -- "-$pid" 2>/dev/null; then
+    verdict=SENT
   else
-    echo ARENA_KILL_FAILED
+    judge "$id"
+    if [ "$state" != running ]; then
+      verdict=SKIPPED
+    elif [ "$pgrp" != "$pid" ]; then
+      verdict=REFUSED
+    else
+      verdict=FAILED
+    fi
   fi
 fi
+show "$id"
+echo "ARENA_KILL_$verdict"
 echo ARENA_JOBS_END
 "#;
 
@@ -362,12 +421,13 @@ fn kill_script(id: &JobId) -> String {
 /// Where a job is in its life, as the pod judged it (see the module doc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobState {
-    /// Started, but the wrapper hasn't recorded its pid yet.
+    /// Started, but the wrapper hasn't recorded its pid yet (for a minute or so; then lost).
     Starting,
     Running,
     /// Ended, with this exit code (`128 + n` = killed by signal `n`).
     Exited(i32),
-    /// Ended without an exit code: killed with SIGKILL, OOM-killed, or the pod restarted.
+    /// Ended without an exit code: killed with SIGKILL, OOM-killed, or the pod restarted —
+    /// or never tracked (no pid recorded a minute after the start).
     Lost,
 }
 
@@ -528,11 +588,20 @@ pub fn parse_read(stdout: &str) -> Result<ReadReply, String> {
 }
 
 /// [`start_command`]'s reply: the job's pid. The script's own complaint (`ARENA_JOB_ERR`)
-/// is the error when it has one; a reply naming a different id is refused.
+/// is the error when it has one, and a start it can't vouch for either way
+/// (`ARENA_JOB_UNSURE`) says the job may be running; a reply naming a different id is
+/// refused.
 pub fn parse_started(stdout: &str, id: &JobId) -> Result<u32, String> {
     for line in stdout.lines().map(|l| l.trim_end_matches('\r')) {
         if let Some(why) = line.strip_prefix("ARENA_JOB_ERR ") {
             return Err(sanitize(why));
+        }
+        if let Some(log) = line.strip_prefix("ARENA_JOB_UNSURE ") {
+            return Err(format!(
+                "no pid from the job within 5s — it may have started anyway: check `arena pods jobs` before \
+                 retrying (its log: {})",
+                sanitize(log)
+            ));
         }
         if let Some(rest) = line.strip_prefix("ARENA_JOB_STARTED ") {
             return match rest.split_once(' ') {
@@ -968,6 +1037,10 @@ mod tests {
         let run = run_script(&j, "pytest -x", Some("arena-env"));
         assert!(run.contains(&crate::ssh::login_shell_wrap("pytest -x", Some("arena-env"))), "{run}");
         assert!(run.contains("trap : INT TERM") && run.contains("PYTHONUNBUFFERED=1"), "{run}");
+        // Detached as a foreground `setsid -f` (an `&` list would start the job with SIGINT
+        // and SIGQUIT ignored) — `&` only where `setsid` has no `-f`.
+        let body = start_script(&j, "pytest", None);
+        assert!(body.contains("\n  setsid -f nohup sh \"$d/run\" > \"$d/log\" 2>&1 < /dev/null\nelse"), "{body}");
         // A read with no job/offset leaves both empty (newest job, last cap bytes).
         let r = read_command(None, None);
         assert!(r.contains("id=\nif") && r.contains("from=; cap=1048576"), "{r}");
@@ -1050,6 +1123,12 @@ mod tests {
         assert_eq!(parse_started("motd\nARENA_JOB_STARTED 20261008-142301-x 7\r\n", &j), Ok(7));
         for (out, want) in [
             ("ARENA_JOB_ERR setsid not found on the pod\n", "setsid not found on the pod"),
+            // No pid within 5s: never a plain failure — the job may be running.
+            (
+                "ARENA_JOB_UNSURE /root/.arena/jobs/20261008-142301-x/log\n",
+                "no pid from the job within 5s — it may have started anyway: check `arena pods jobs` before retrying \
+                 (its log: /root/.arena/jobs/20261008-142301-x/log)",
+            ),
             ("ARENA_JOB_STARTED 20261008-142301-y 7\n", "unexpected start reply"),
             ("ARENA_JOB_STARTED 20261008-142301-x seven\n", "bad pid"),
             ("", "no start confirmation from the pod: (no output)"),
@@ -1243,50 +1322,117 @@ mod tests {
         assert_eq!(f.finish(), None);
     }
 
-    /// The scripts for real, against a local `sh` with `$HOME` in a temp dir and a stub
-    /// `zsh` (the login-shell wrap runs `zsh -c`): start a job, list it, read its log from
-    /// an offset, see it finish with its exit code; start one that sleeps, kill it, see
-    /// 143. No ssh, no network — exactly the bytes a pod would run.
+    /// A pod stand-in for the real-shell tests: `$HOME` in a temp dir, a stub `zsh` (the
+    /// login-shell wrap runs `zsh -c`; this one hands the script to bash, so `source
+    /// ~/.zshrc` / `conda` just fail quietly), and each remote command run the way sshd
+    /// runs it — handed to a shell's `-c`. No ssh, no network: exactly the bytes a pod runs.
     #[cfg(target_os = "linux")]
-    #[test]
-    fn scripts_run_for_real_against_a_local_shell() {
-        use std::os::unix::fs::PermissionsExt;
-        use std::process::Command;
-        let have = |t: &str| Command::new("sh").arg("-c").arg(format!("command -v {t}")).output().is_ok_and(|o| o.status.success());
-        if !["setsid", "nohup", "base64", "bash", "head", "tail"].iter().all(|t| have(t)) {
-            eprintln!("setsid/nohup/base64/bash missing — skipping");
-            return;
+    struct LocalPod {
+        dir: std::path::PathBuf,
+        home: std::path::PathBuf,
+        bin: std::path::PathBuf,
+        path: String,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl LocalPod {
+        /// `None` (the test skips) where a tool the scripts need is missing.
+        fn new(tag: &str) -> Option<LocalPod> {
+            use std::process::Command;
+            let have = |t: &str| Command::new("sh").arg("-c").arg(format!("command -v {t}")).output().is_ok_and(|o| o.status.success());
+            if !["setsid", "nohup", "base64", "bash", "head", "tail", "find"].iter().all(|t| have(t)) {
+                eprintln!("setsid/nohup/base64/bash/find missing — skipping");
+                return None;
+            }
+            let dir = std::env::temp_dir().join(format!("arena-jobs-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let (home, bin) = (dir.join("home"), dir.join("bin"));
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::create_dir_all(&bin).unwrap();
+            let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+            let pod = LocalPod { dir, home, bin, path };
+            pod.stub("zsh", "[ \"$1\" = -c ] && shift\nexec bash -c \"$1\"");
+            Some(pod)
         }
-        let dir = std::env::temp_dir().join(format!("arena-jobs-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let (home, bin) = (dir.join("home"), dir.join("bin"));
-        std::fs::create_dir_all(&home).unwrap();
-        std::fs::create_dir_all(&bin).unwrap();
-        // `zsh -c '<script>'` → bash runs it (`source ~/.zshrc` / `conda` just fail quietly).
-        std::fs::write(bin.join("zsh"), "#!/bin/sh\n[ \"$1\" = -c ] && shift\nexec bash -c \"$1\"\n").unwrap();
-        std::fs::set_permissions(bin.join("zsh"), std::fs::Permissions::from_mode(0o755)).unwrap();
-        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
-        let run = |remote_cmd: &str| -> String {
-            // What sshd does with the remote command: hand it to the login shell's `-c`.
-            let out = Command::new("sh").arg("-c").arg(remote_cmd).env("HOME", &home).env("PATH", &path).output().unwrap();
+
+        /// An executable `name` on the pod's PATH, ahead of the real one.
+        fn stub(&self, name: &str, body: &str) {
+            use std::os::unix::fs::PermissionsExt;
+            let f = self.bin.join(name);
+            std::fs::write(&f, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        /// What sshd does with a remote command: hand it to the login shell's `-c`.
+        fn run(&self, remote_cmd: &str) -> String {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(remote_cmd)
+                .env("HOME", &self.home)
+                .env("PATH", &self.path)
+                .output()
+                .unwrap();
             String::from_utf8_lossy(&out.stdout).into_owned()
-        };
-        let wait_until = |what: &str, ok: &dyn Fn() -> bool| {
+        }
+
+        fn job_dir(&self, id: &JobId) -> std::path::PathBuf {
+            self.home.join(JOBS_DIR).join(id.as_str())
+        }
+
+        /// A job directory as `START` leaves it, with `pid` recorded or not — and no
+        /// wrapper actually running.
+        fn fake_job(&self, id: &JobId, pid: Option<&str>) -> std::path::PathBuf {
+            let d = self.job_dir(id);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("cmd"), "pytest").unwrap();
+            std::fs::write(d.join("started_at"), "2026-10-08T14:23:01Z\n").unwrap();
+            if let Some(pid) = pid {
+                std::fs::write(d.join("pid"), format!("{pid}\n")).unwrap();
+            }
+            d
+        }
+
+        fn wait_until(&self, what: &str, ok: &dyn Fn() -> bool) {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while !ok() {
                 assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-        };
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for LocalPod {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// The `SigIgn` mask from a `/proc/<pid>/status` text.
+    #[cfg(target_os = "linux")]
+    fn sig_ign(status: &str) -> u64 {
+        let hex = status.lines().find_map(|l| l.strip_prefix("SigIgn:")).expect("a SigIgn line");
+        u64::from_str_radix(hex.trim(), 16).expect("SigIgn is hex")
+    }
+
+    /// The scripts for real, against a [`LocalPod`]: start a job, list it, read its log from
+    /// an offset, see it finish with its exit code; start one that sleeps, kill it, see 143;
+    /// the job's command gets SIGINT/SIGQUIT as the operator's shell had them; a recycled pid
+    /// never passes for a running job (nor gets signalled).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scripts_run_for_real_against_a_local_shell() {
+        let Some(pod) = LocalPod::new("real") else { return };
+        let run = |c: &str| pod.run(c);
 
         // A command full of quoting traps; it prints two lines (one to stderr), then exits 7.
         let cmd = "x='it'\"'\"'s'; echo \"out $x \\$HOME\"; printf 'err\\t%s\\n' \"$((6*7))\" >&2\nexit 7";
         let j = JobId::generate(1_791_469_381, cmd);
         let pid = parse_started(&run(&start_command(&j, cmd, Some("arena-env"))), &j).unwrap();
         assert!(pid > 1);
-        let jobdir = home.join(JOBS_DIR).join(j.as_str());
+        let jobdir = pod.job_dir(&j);
         assert_eq!(std::fs::read_to_string(jobdir.join("cmd")).unwrap(), cmd, "the command is stored as typed");
-        wait_until("the job to exit", &|| jobdir.join("exit").exists());
+        pod.wait_until("the job to exit", &|| jobdir.join("exit").exists());
         let jobs = parse_list(&run(&list_command())).unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!((jobs[0].id.clone(), jobs[0].state, jobs[0].pid), (j.clone(), JobState::Exited(7), Some(pid)));
@@ -1314,16 +1460,117 @@ mod tests {
         let ReadReply::Job { info, .. } = parse_read(&run(&read_command(None, None))).unwrap() else { panic!() };
         assert_eq!((info.id.clone(), info.state, info.pid), (k.clone(), JobState::Running, Some(pid)), "newest = the sleeper");
         assert!(matches!(parse_kill(&run(&kill_command(&k))), Ok(KillReply::Sent(_))));
-        let kdir = home.join(JOBS_DIR).join(k.as_str());
-        wait_until("the killed job's exit code", &|| kdir.join("exit").exists());
+        let kdir = pod.job_dir(&k);
+        pod.wait_until("the killed job's exit code", &|| kdir.join("exit").exists());
         let jobs = parse_list(&run(&list_command())).unwrap();
         assert_eq!(jobs.iter().map(|j| (j.id.clone(), j.state)).collect::<Vec<_>>(), [(k.clone(), JobState::Exited(143)), (j, JobState::Exited(7))]);
         let ReadReply::Job { chunk, .. } = parse_read(&run(&read_command(Some(&k), None))).unwrap() else { panic!() };
         assert!(snapshot_lines(&chunk, 10).0.first().is_some_and(|l| l == "begin"), "{chunk:?}");
-        // The wrapper's pid no longer counts as the job (a recycled pid wouldn't either).
+        // The wrapper's pid no longer counts as the job once it has gone.
         std::fs::remove_file(kdir.join("exit")).unwrap();
         let ReadReply::Job { info, .. } = parse_read(&run(&read_command(Some(&k), None))).unwrap() else { panic!() };
         assert_eq!(info.state, JobState::Lost);
-        let _ = std::fs::remove_dir_all(&dir);
+
+        // The command's signal dispositions: SIGHUP ignored (nohup), SIGINT/SIGQUIT exactly
+        // as this test's own — a job started as an `&` list would have them ignored, so
+        // python would never raise KeyboardInterrupt.
+        let s = JobId::generate(1_791_469_383, "sigign");
+        parse_started(&run(&start_command(&s, "grep '^SigIgn:' /proc/self/status", Some("arena-env"))), &s).unwrap();
+        pod.wait_until("the signal job", &|| pod.job_dir(&s).join("exit").exists());
+        let job_ign = sig_ign(&std::fs::read_to_string(pod.job_dir(&s).join("log")).unwrap());
+        let own_ign = sig_ign(&std::fs::read_to_string("/proc/self/status").unwrap());
+        let (hup, int_quit) = (1 << (1 - 1), (1 << (2 - 1)) | (1 << (3 - 1)));
+        assert_eq!(job_ign & hup, hup, "nohup: SIGHUP ignored ({job_ign:#x})");
+        assert_eq!(job_ign & int_quit, own_ign & int_quit, "SIGINT/SIGQUIT as the caller had them ({job_ign:#x} vs {own_ign:#x})");
+
+        // A recycled pid: alive, but not this job's wrapper → lost, and never signalled.
+        let mut stranger = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let r = id("20261008-142304-recycled");
+        pod.fake_job(&r, Some(&stranger.id().to_string()));
+        let jobs = parse_list(&run(&list_command())).unwrap();
+        assert_eq!(jobs.iter().find(|x| x.id == r).map(|x| x.state), Some(JobState::Lost));
+        assert!(matches!(parse_kill(&run(&kill_command(&r))), Ok(KillReply::Skipped(ref i)) if i.state == JobState::Lost));
+        assert!(stranger.try_wait().unwrap().is_none(), "the unrelated process was not signalled");
+        let _ = stranger.kill();
+        let _ = stranger.wait();
+    }
+
+    /// The window between `judge`'s first look for `exit` and its liveness check, made
+    /// deterministic: a stand-in `ours` plays the wrapper finishing right then. A job that
+    /// ended in that window reads as exited (not `lost`, which `logs -f` would end on as a
+    /// failure), and one `kill` caught running reads as not running (not "refused").
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_job_ending_mid_read_is_exited_never_lost_or_refused() {
+        let Some(pod) = LocalPod::new("race") else { return };
+        let j = id("20261008-142301-pytest");
+        // No process has this pid (above any pid_max), so the real `ours` says "gone".
+        let d = pod.fake_job(&j, Some("999999999"));
+        // The real script, with `ours` replaced right after the prelude defines it.
+        let with = |ours: &str, script: String| sh_c(&script.replacen(PRELUDE, &format!("{PRELUDE}{ours}\n"), 1));
+
+        // `ours` writes the exit code (the wrapper finishing), then the pid is gone.
+        let finishing = r#"ours() { echo 0 > "$J/$2/exit"; return 1; }"#;
+        let jobs = parse_list(&pod.run(&with(finishing, list_script()))).unwrap();
+        assert_eq!(jobs[0].state, JobState::Exited(0));
+        let ReadReply::Job { info, .. } = parse_read(&pod.run(&with(finishing, read_script(Some(&j), None)))).unwrap() else {
+            panic!()
+        };
+        assert_eq!(info.state, JobState::Exited(0));
+
+        // `kill`: running at the first look (and finishing right after), so its process
+        // group is gone by the time it's read — skipped, with the job's final state.
+        std::fs::remove_file(d.join("exit")).unwrap();
+        let ends_now = r#"ours() { [ -f "$J/$2/exit" ] && return 1; echo 0 > "$J/$2/exit"; }"#;
+        match parse_kill(&pod.run(&with(ends_now, kill_script(&j)))) {
+            Ok(KillReply::Skipped(info)) => assert_eq!(info.state, JobState::Exited(0)),
+            other => panic!("{other:?}"),
+        }
+
+        // Without an exit code it is still lost — the second look adds nothing else.
+        std::fs::remove_file(d.join("exit")).unwrap();
+        assert_eq!(parse_list(&pod.run(&list_command())).unwrap()[0].state, JobState::Lost);
+    }
+
+    /// A job that never records its pid: `starting` while it is fresh, `lost` (over, so
+    /// `logs -f` ends) once its directory is over a minute old.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_job_without_a_pid_is_starting_then_lost() {
+        let Some(pod) = LocalPod::new("nopid") else { return };
+        let j = id("20261008-142301-pytest");
+        let d = pod.fake_job(&j, None);
+        assert_eq!(parse_list(&pod.run(&list_command())).unwrap()[0].state, JobState::Starting);
+        pod.run(&format!("touch -t 202001010000 '{}'", d.display()));
+        assert_eq!(parse_list(&pod.run(&list_command())).unwrap()[0].state, JobState::Lost);
+        assert!(matches!(parse_kill(&pod.run(&kill_command(&j))), Ok(KillReply::Skipped(ref i)) if i.state == JobState::Lost));
+    }
+
+    /// The start's two ways of not getting a pid. A wrapper that can't record it doesn't run
+    /// the command (and says so: exit 125) — a clean "did not start". One that hasn't even
+    /// begun within 5s may still run it, so it is reported as "may have started", never as
+    /// a plain failure an operator would retry.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_start_without_a_pid_never_runs_untracked_and_is_never_called_clean() {
+        let Some(pod) = LocalPod::new("start") else { return };
+        let real_mv = pod.run("command -v mv").trim().to_string();
+        assert!(real_mv.starts_with('/'), "{real_mv}");
+        // `mv` refuses to install the pid file (as a full disk would refuse to write it).
+        pod.stub("mv", &format!("for a; do last=$a; done\ncase \"$last\" in */pid) exit 1 ;; esac\nexec {real_mv} \"$@\""));
+        let j = id("20261008-142301-touch");
+        let e = parse_started(&pod.run(&start_command(&j, "touch \"$HOME/ran\"", None)), &j).unwrap_err();
+        assert!(e.contains("could not record its pid, so it did not run the command"), "{e}");
+        assert!(!pod.home.join("ran").exists(), "the command must not run untracked");
+        assert_eq!(parse_list(&pod.run(&list_command())).unwrap()[0].state, JobState::Exited(125));
+        let log = std::fs::read_to_string(pod.job_dir(&j).join("log")).unwrap();
+        assert!(log.contains("could not record this job's pid"), "{log}");
+
+        // A `setsid` that never starts anything: no pid and no exit code after 5s.
+        std::fs::remove_file(pod.bin.join("mv")).unwrap();
+        pod.stub("setsid", "exit 0");
+        let k = id("20261008-142302-slow");
+        let e = parse_started(&pod.run(&start_command(&k, "true", None)), &k).unwrap_err();
+        assert!(e.contains("may have started anyway: check `arena pods jobs` before retrying"), "{e}");
     }
 }

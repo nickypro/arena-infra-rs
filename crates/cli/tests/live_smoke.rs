@@ -13,8 +13,10 @@
 //! - the config's `MACHINE_NAME_PREFIX` starts with `devtest` (or is named in
 //!   `ARENA_LIVE_PREFIX_ALLOW`, comma-separated) and is never an `arenaN` cohort prefix,
 //!   whatever the allow list says;
-//! - a configured proxy is a *local* file outside `/etc`, and is only ever written — the
-//!   binary runs with `SSH_PROXY_RELOAD_CMD=` (empty = write-only), so nginx is never touched;
+//! - a configured proxy is a *local* file outside `/etc` — resolved the way the binary will
+//!   resolve it (relative to the config's directory, `..` and symlinks followed) — and is
+//!   only ever written: the binary runs with `SSH_PROXY_RELOAD_CMD=` (empty = write-only),
+//!   so nginx is never touched;
 //! - every configured provider lists (one that can't is not "empty"), and lists **only**
 //!   `{prefix}-…` pods: anything else means these keys reach another account (production's
 //!   staff boxes, a cohort) — stop before creating anything there.
@@ -27,9 +29,12 @@
 //! cache (`ARENA_STATE_DIR`) is a fresh directory under the cargo target dir.
 //!
 //! Whatever happens once the create starts — a failed assertion, a panic, a hung command
-//! killed at its deadline — the [`Cleanup`] guard terminates every pod holding a name this
-//! run used (both were free when it started) and re-lists until they are gone. Only Ctrl+C
-//! (or a SIGKILL) gets past it: after an interrupted run, run `arena teardown --check`.
+//! killed at its deadline — the [`Cleanup`] guard first terminates the pod ids the run
+//! recorded (no listing needed), then terminates every pod holding a name this run used
+//! (both were free when it started) on every provider that answers, and re-lists until a
+//! listing in which *every* provider answered shows none — so another provider's outage
+//! (a Vast 429) can delay its confirmation, never its terminates. Only Ctrl+C (or a
+//! SIGKILL) gets past it: after an interrupted run, run `arena teardown --check`.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -172,8 +177,11 @@ fn child_config(file_text: &str, state_dir: &Path, runpod_api: Option<&str>) -> 
 /// Lifecycle commands sync the proxy, so a configured one must be safe to write: local
 /// (a remote proxy is the shared production host, reached over SSH), outside `/etc`
 /// (production's nginx config lives there), and write-only (forced by [`child_env`];
-/// checked anyway). `Ok(None)`: no proxy configured, nothing is written.
-fn check_proxy(cfg: &Config, home: Option<&str>) -> Result<Option<String>, String> {
+/// checked anyway). "Outside `/etc`" is judged on where the write would really land
+/// ([`proxy_write_path`], then [`resolve_write_target`]), not on the configured text: a
+/// relative path, a `..` or a symlink can all lead into `/etc`. `Ok(None)`: no proxy
+/// configured, nothing is written; otherwise the resolved path.
+fn check_proxy(cfg: &Config, home: Option<&str>, cwd: &Path) -> Result<Option<PathBuf>, String> {
     let Ok(px) = ProxyConfig::from_config(cfg) else { return Ok(None) };
     if !px.local {
         return Err(format!(
@@ -184,14 +192,45 @@ fn check_proxy(cfg: &Config, home: Option<&str>) -> Result<Option<String>, Strin
     if !px.write_only() {
         return Err("SSH_PROXY_RELOAD_CMD isn't empty for the child — it would reload nginx".into());
     }
-    let path = match (px.nginx_path.strip_prefix("~/"), home) {
-        (Some(rest), Some(home)) => format!("{}/{rest}", home.trim_end_matches('/')),
-        _ => px.nginx_path.clone(),
-    };
-    if Path::new(&path).starts_with("/etc") {
-        return Err(format!("the proxy config is {path} — under /etc, that's a system nginx's; use a sandbox file"));
+    let configured = proxy_write_path(&px.nginx_path, home, cwd);
+    let real = resolve_write_target(&configured)?;
+    let etc: Vec<PathBuf> = std::iter::once(PathBuf::from("/etc")).chain(std::fs::canonicalize("/etc")).collect();
+    if etc.iter().any(|e| real.starts_with(e)) {
+        return Err(format!(
+            "the proxy config {} is {} — under /etc, that's a system nginx's; use a sandbox file",
+            px.nginx_path,
+            real.display()
+        ));
     }
-    Ok(Some(path))
+    Ok(Some(real))
+}
+
+/// The path the binary writes the proxy file at, as text: its `expand_tilde` (a leading
+/// `~/` is `$HOME`; nothing else is expanded — `~user/` stays a relative path), and a
+/// relative result is relative to the binary's working directory, the config's directory.
+fn proxy_write_path(configured: &str, home: Option<&str>, cwd: &Path) -> PathBuf {
+    let expanded = match (configured.strip_prefix("~/"), home) {
+        (Some(rest), Some(home)) => format!("{}/{rest}", home.trim_end_matches('/')),
+        _ => configured.to_string(),
+    };
+    cwd.join(expanded) // an absolute path replaces `cwd`
+}
+
+/// Where a write to `path` lands (the binary's `replace_file`: the existing file with its
+/// symlinks followed, else a new file in the parent directory), with every `..` and
+/// symlink resolved. Only stats; reads nothing. A path whose directory doesn't resolve is
+/// an error: the landing place can't be checked (and the binary couldn't write there).
+fn resolve_write_target(path: &Path) -> Result<PathBuf, String> {
+    if let Ok(real) = std::fs::canonicalize(path) {
+        return Ok(real);
+    }
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(format!("the proxy config path {} names no file", path.display()));
+    };
+    let dir = std::fs::canonicalize(dir).map_err(|e| {
+        format!("the proxy config's directory {} doesn't resolve ({e}) — can't tell where it would be written", dir.display())
+    })?;
+    Ok(dir.join(name))
 }
 
 /// A pod as `teardown --check --json` lists it (any state but TERMINATED).
@@ -206,21 +245,38 @@ struct Listed {
 /// What the run reads from `teardown --check --json`.
 #[derive(Debug, Clone, PartialEq)]
 struct Teardown {
-    /// Every pod on every configured provider.
+    /// Every pod on every provider that answered.
     pods: Vec<Listed>,
+    /// The providers that didn't (`scope: why`). Unknown is not empty: a listing with any of
+    /// these is no proof of anything's absence ([`Teardown::complete`]) — but the pods it
+    /// does show are real, and the cleanup still terminates its own among them.
+    unknown: Vec<String>,
     /// The names forwarded in the local proxy file; `None` when the check couldn't read it.
     forwards: Option<Vec<String>>,
 }
 
-/// Parse the teardown report, failing closed: a provider whose pods couldn't be listed is
-/// an error (unknown is not empty — that is the report's own rule), and so is any shape
-/// this doesn't recognise. Its exit status is ignored: it is non-zero whenever anything
-/// remains, which on a sandbox account is normal.
+impl Teardown {
+    /// Every configured provider answered — required wherever an *absence* is concluded
+    /// (no foreign pods: right account; none of ours: all gone).
+    fn complete(&self) -> Result<(), String> {
+        if self.unknown.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("{} — can't tell what is on that account", self.unknown.join("; ")))
+        }
+    }
+}
+
+/// Parse the teardown report. A provider whose pods couldn't be listed goes into
+/// `unknown` (its pods aren't "none"); a pods item with no providers at all, or any shape
+/// this doesn't recognise, is an error. Its exit status is ignored: it is non-zero
+/// whenever anything remains, which on a sandbox account is normal.
 fn parse_teardown(json: &str) -> Result<Teardown, String> {
     let v: Value = serde_json::from_str(json).map_err(|e| format!("teardown --check --json isn't JSON ({e})"))?;
     let items = v.get("items").and_then(Value::as_array).ok_or("teardown JSON has no `items` array")?;
     let text = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).map(String::from);
     let mut pods = Vec::new();
+    let mut unknown = Vec::new();
     let mut saw_pods = false;
     let mut forwards = None;
     for item in items {
@@ -233,10 +289,7 @@ fn parse_teardown(json: &str) -> Result<Teardown, String> {
                 saw_pods = true;
                 match verdict.as_str() {
                     "clear" | "remaining" | "skipped" => {}
-                    "unknown" => {
-                        let why = text(item, "summary").unwrap_or_default();
-                        return Err(format!("{scope}: {why} — can't tell what is on that account"));
-                    }
+                    "unknown" => unknown.push(format!("{scope}: {}", text(item, "summary").unwrap_or_default())),
                     other => return Err(format!("teardown pods verdict `{other}` isn't one this test knows")),
                 }
                 for e in entries.iter().filter(|e| e.get("kind").and_then(Value::as_str) == Some("pod")) {
@@ -269,7 +322,7 @@ fn parse_teardown(json: &str) -> Result<Teardown, String> {
     if !saw_pods {
         return Err("teardown JSON lists no pods item at all".into());
     }
-    Ok(Teardown { pods, forwards })
+    Ok(Teardown { pods, unknown, forwards })
 }
 
 /// The pods that aren't this fleet's (`{prefix}-…`): any one means the wrong account.
@@ -430,14 +483,19 @@ impl Arena {
         };
         // Drain stdout on its own thread: a child blocked on a full pipe would otherwise
         // look exactly like a hang. Its result comes back over a channel, so a grandchild
-        // still holding the pipe after the child is gone can't hang the run either.
+        // still holding the pipe after the child is gone can't hang the run either. With
+        // nothing captured the sender goes at once, so the wait below doesn't sit out its
+        // grace period for a reader that was never started.
         let (tx, rx) = std::sync::mpsc::channel();
-        if let Some(mut out) = child.stdout.take() {
-            std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                let _ = out.read_to_end(&mut buf);
-                let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
-            });
+        match child.stdout.take() {
+            Some(mut out) => {
+                std::thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    let _ = out.read_to_end(&mut buf);
+                    let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+                });
+            }
+            None => drop(tx),
         }
         let started = Instant::now();
         let mut killed = false;
@@ -513,63 +571,132 @@ fn poll_until<T>(limit: Duration, every: Duration, mut attempt: impl FnMut() -> 
     }
 }
 
+/// One cleanup round's reading of a listing. Pods holding one of the run's names or ids
+/// are terminated whatever else the listing says — a provider that didn't answer hides
+/// nothing on the ones that did. Only when there are none, and every provider answered,
+/// is the round clean.
+#[derive(Debug, PartialEq)]
+enum Sweep<'t> {
+    Terminate(Vec<&'t Listed>),
+    Unconfirmed(&'t [String]),
+    Clean,
+}
+
+fn sweep<'t>(t: &'t Teardown, names: &[String], ids: &BTreeSet<String>) -> Sweep<'t> {
+    let ours: Vec<&Listed> = t.pods.iter().filter(|p| names.contains(&p.name) || ids.contains(&p.id)).collect();
+    if !ours.is_empty() {
+        Sweep::Terminate(ours)
+    } else if !t.unknown.is_empty() {
+        Sweep::Unconfirmed(&t.unknown)
+    } else {
+        Sweep::Clean
+    }
+}
+
 /// The guard that makes sure nothing this run created outlives it — on success, on a
-/// failed assertion and on a panic alike (it runs from `Drop`). It terminates every pod
-/// holding one of the run's names (free when it started, so any holder is this run's) or
-/// one of the ids it saw, then re-lists. While unwinding it wants two clean listings
-/// [`SWEEP_PAUSE`] apart: a create killed mid-flight can surface a little later. It never
-/// panics itself (a panic in `Drop` while unwinding aborts the process); what it can't
-/// confirm it says loudly, with the commands to finish by hand.
+/// failed assertion and on a panic alike (it runs from `Drop`). First it terminates every
+/// pod id the run recorded and hasn't terminated itself — no listing needed, so another
+/// provider's outage can't stop it (`pods terminate <id>` finds the pod through whichever
+/// providers answer). Then each round it lists, terminates every pod holding one of the
+/// run's names (free when it started, so any holder is this run's) or ids on the providers
+/// that answered, and retries the recorded ids when the listing can't vouch for them. It
+/// stops at a clean round ([`sweep`]: nothing of ours, every provider answering) — while
+/// unwinding, two in a row [`SWEEP_PAUSE`] apart, as a create killed mid-flight can surface
+/// a little later. It never panics itself (a panic in `Drop` while unwinding aborts the
+/// process); what it can't confirm it says loudly, with the commands to finish by hand.
 struct Cleanup<'a> {
     arena: &'a Arena,
     names: Vec<String>,
+    /// Pod ids of this run's: recorded after the create, or seen holding one of its names.
     ids: RefCell<BTreeSet<String>>,
+    /// Ids whose terminate went through (the pod can stay listed for a while after).
+    terminated: RefCell<BTreeSet<String>>,
+    /// Between rounds ([`SWEEP_PAUSE`]; none in the guard's own test).
+    pause: Duration,
 }
 
 impl<'a> Cleanup<'a> {
     fn new(arena: &'a Arena, names: Vec<String>) -> Self {
-        Self { arena, names, ids: RefCell::new(BTreeSet::new()) }
+        let (ids, terminated) = (RefCell::new(BTreeSet::new()), RefCell::new(BTreeSet::new()));
+        Self { arena, names, ids, terminated, pause: SWEEP_PAUSE }
     }
 
     fn note(&self, id: &str) {
         self.ids.borrow_mut().insert(id.to_string());
     }
 
-    fn ours<'p>(&self, pods: &'p [Listed]) -> Vec<&'p Listed> {
-        let ids = self.ids.borrow();
-        pods.iter().filter(|p| self.names.contains(&p.name) || ids.contains(&p.id)).collect()
+    /// The run terminated `id` itself: no need to again.
+    fn terminated(&self, id: &str) {
+        self.note(id);
+        self.terminated.borrow_mut().insert(id.to_string());
+    }
+
+    /// Recorded ids not (yet) terminated.
+    fn pending(&self) -> Vec<String> {
+        let done = self.terminated.borrow();
+        self.ids.borrow().iter().filter(|id| !done.contains(*id)).cloned().collect()
+    }
+
+    fn terminate(&self, id: &str, what: &str) {
+        eprintln!("[smoke cleanup] terminating {id} ({what})");
+        let ran = self.arena.run(&["pods", "terminate", id, "-y"], MUTATE_LIMIT, false);
+        if ran.ok() {
+            self.terminated(id);
+        } else {
+            eprintln!("[smoke cleanup]   terminate {id}: {}", ran.describe());
+        }
+    }
+
+    fn sweep<'t>(&self, t: &'t Teardown) -> Sweep<'t> {
+        sweep(t, &self.names, &self.ids.borrow())
     }
 }
 
 impl Drop for Cleanup<'_> {
     fn drop(&mut self) {
         let unwinding = std::thread::panicking();
+        for id in self.pending() {
+            self.terminate(&id, "recorded by this run");
+        }
         let mut clean_in_a_row = 0;
         for round in 1..=SWEEP_ROUNDS {
-            match self.arena.teardown() {
-                Err(e) => eprintln!("[smoke cleanup] round {round}: couldn't list every provider ({e})"),
-                Ok(t) => {
-                    let ours = self.ours(&t.pods);
-                    if ours.is_empty() {
-                        clean_in_a_row += 1;
-                        if !unwinding || clean_in_a_row >= 2 {
-                            eprintln!("[smoke cleanup] nothing of this run is left");
-                            return;
-                        }
-                    } else {
-                        clean_in_a_row = 0;
+            // (clean round?, retry the recorded ids?)
+            let (clean, retry_recorded) = match self.arena.teardown() {
+                Err(e) => {
+                    eprintln!("[smoke cleanup] round {round}: no listing ({e})");
+                    (false, true)
+                }
+                Ok(t) => match self.sweep(&t) {
+                    Sweep::Clean => (true, false),
+                    Sweep::Unconfirmed(unknown) => {
+                        let unknown = unknown.join("; ");
+                        eprintln!("[smoke cleanup] round {round}: none of ours listed, but not every provider answered ({unknown})");
+                        (false, true)
+                    }
+                    Sweep::Terminate(ours) => {
                         for p in ours {
                             self.note(&p.id);
-                            eprintln!("[smoke cleanup] terminating {} ({}, {} {})", p.name, p.id, p.provider, p.status);
-                            let ran = self.arena.run(&["pods", "terminate", &p.id, "-y"], MUTATE_LIMIT, false);
-                            if !ran.ok() {
-                                eprintln!("[smoke cleanup]   terminate {}: {}", p.id, ran.describe());
-                            }
+                            self.terminate(&p.id, &format!("{}, {} {}", p.name, p.provider, p.status));
                         }
+                        (false, false)
                     }
+                },
+            };
+            if clean {
+                clean_in_a_row += 1;
+                if !unwinding || clean_in_a_row >= 2 {
+                    eprintln!("[smoke cleanup] nothing of this run is left");
+                    return;
+                }
+            } else {
+                clean_in_a_row = 0;
+            }
+            if retry_recorded {
+                for id in self.pending() {
+                    self.terminate(&id, "recorded by this run; retrying");
                 }
             }
-            std::thread::sleep(SWEEP_PAUSE);
+            std::thread::sleep(self.pause);
         }
         let ids: Vec<String> = self.ids.borrow().iter().cloned().collect();
         eprintln!(
@@ -619,20 +746,23 @@ fn preflight() -> Result<Plan, String> {
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let state_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("live-smoke-{stamp}"));
     let child = child_config(&text, &state_dir, std::env::var("RUNPOD_API").ok().as_deref());
-    let proxy = check_proxy(&child, std::env::var("HOME").ok().as_deref())?;
-
     let cwd = config.parent().ok_or("the config has no parent directory")?.to_path_buf();
+    let proxy = check_proxy(&child, std::env::var("HOME").ok().as_deref(), &cwd)?;
+
     let arena = Arena { bin: PathBuf::from(env!("CARGO_BIN_EXE_arena")), config, cwd, state_dir };
     eprintln!(
         "[smoke] config {} · prefix {prefix} · proxy {} · health cache {}",
         arena.config.display(),
-        proxy.as_deref().unwrap_or("none"),
+        proxy.as_deref().map_or_else(|| "none".to_string(), |p| p.display().to_string()),
         arena.state_dir.display()
     );
 
     // The wrong-account guard, over both views: teardown's (every provider must answer) and
     // the provider's own list (which also shows TERMINATED pods still holding a name).
-    let fleet = arena.teardown().map_err(|e| format!("can't confirm whose account this is: {e}"))?;
+    let fleet = arena
+        .teardown()
+        .and_then(|t| t.complete().map(|()| t))
+        .map_err(|e| format!("can't confirm whose account this is: {e}"))?;
     let listed = arena.pods().map_err(|e| format!("can't confirm whose account this is: {e}"))?;
     let all_names = fleet.pods.iter().map(|p| p.name.as_str()).chain(listed.iter().map(|p| p.name.as_str()));
     let strangers = foreign(all_names, &prefix);
@@ -714,11 +844,17 @@ fn live_smoke() {
     // 5. Terminate it, then the end-of-program audit must show nothing of it.
     let ran = arena.run(&["pods", "terminate", &pod.id, "-y"], MUTATE_LIMIT, false);
     assert!(ran.ok(), "terminate {}: {}", pod.id, ran.describe());
+    cleanup.terminated(&pod.id);
     let after = poll_until(SETTLE_LIMIT, SETTLE_EVERY, || {
         let t = arena.teardown()?;
-        let left: Vec<String> =
-            cleanup.ours(&t.pods).iter().map(|p| format!("{} ({}, {})", p.name, p.id, p.status)).collect();
-        if left.is_empty() { Ok(t) } else { Err(format!("teardown still lists {}", left.join(", "))) }
+        match cleanup.sweep(&t) {
+            Sweep::Clean => Ok(t.clone()),
+            Sweep::Unconfirmed(unknown) => Err(format!("not every provider answered: {}", unknown.join("; "))),
+            Sweep::Terminate(left) => Err(format!(
+                "teardown still lists {}",
+                left.iter().map(|p| format!("{} ({}, {})", p.name, p.id, p.status)).collect::<Vec<_>>().join(", ")
+            )),
+        }
     })
     .unwrap_or_else(|e| panic!("after terminate: {e}"));
     // Its proxy forward goes on the first sync after the provider stops listing the pod —
@@ -834,29 +970,82 @@ fn child_env_passes_only_the_allowlist_and_forces_write_only() {
     }
 }
 
+/// A scratch directory under the cargo target dir, removed on drop.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(tag: &str) -> Scratch {
+        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("live-smoke-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Scratch(std::fs::canonicalize(&dir).unwrap())
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(unix)]
 #[test]
 fn smoke_proxy_must_be_a_local_write_only_file_outside_etc() {
     let state = Path::new("/tmp/state");
     let px = |extra: &str| child_config(&format!("MACHINE_NAME_PREFIX=devtest\n{extra}"), state, None);
+    let local = |path: &str| px(&format!("SSH_PROXY_HOST=localhost\nSSH_PROXY_NGINX_CONFIG_PATH={path}\n"));
+    // The config's directory, as the binary's working directory: a sandbox with a proxy/
+    // directory, a symlink into /etc, and one to a file in /etc.
+    let cwd = Scratch::new("proxy");
+    let dir = &cwd.0;
+    std::fs::create_dir_all(dir.join("proxy")).unwrap();
+    std::os::unix::fs::symlink("/etc", dir.join("sys")).unwrap();
+    std::os::unix::fs::symlink("/etc/passwd", dir.join("passwd.conf")).unwrap();
+    let home = dir.display().to_string();
+    let check = |cfg: &Config| check_proxy(cfg, Some(&home), dir);
+
     // No proxy: nothing to write.
-    assert_eq!(check_proxy(&px(""), Some("/home/dev")), Ok(None));
-    // The sandbox's: a local file, reload forced off even though the file asks for one.
+    assert_eq!(check(&px("")), Ok(None));
+    // The sandbox's: a local file under the config's directory, reload forced off even
+    // though the file asks for one.
     let sandbox =
         px("SSH_PROXY_HOST=localhost\nSSH_PROXY_NGINX_CONFIG_PATH=proxy/proxy.conf\nSSH_PROXY_RELOAD_CMD=\"nginx -s reload\"\n");
-    assert_eq!(check_proxy(&sandbox, Some("/home/dev")), Ok(Some("proxy/proxy.conf".into())));
-    assert_eq!(check_proxy(&px("SSH_PROXY_HOST=localhost\n"), Some("/home/dev/")), Ok(Some("/home/dev/proxy.conf".into())));
-    // Production's nginx file, or a remote proxy host: refused.
-    let prod = px("SSH_PROXY_HOST=localhost\nSSH_PROXY_NGINX_CONFIG_PATH=/etc/nginx/streams-enabled/proxy.conf\n");
-    assert!(check_proxy(&prod, Some("/home/dev")).unwrap_err().contains("/etc"));
+    assert_eq!(check(&sandbox), Ok(Some(dir.join("proxy/proxy.conf"))));
+    assert_eq!(check(&px("SSH_PROXY_HOST=localhost\n")), Ok(Some(dir.join("proxy.conf"))), "~/proxy.conf, HOME = the dir");
+    assert_eq!(check(&local("./proxy/../proxy/p.conf")), Ok(Some(dir.join("proxy/p.conf"))));
+    // Into /etc, however it is spelled: refused.
+    let up = "../".repeat(dir.components().count() + 2);
+    for path in [
+        "/etc/nginx/streams-enabled/proxy.conf".to_string(), // production's (or an unresolvable dir under /etc)
+        "/etc/arena-smoke-proxy.conf".to_string(),
+        format!("{up}etc/arena-smoke-proxy.conf"),             // relative, climbing out of the config dir
+        format!("{}/{up}etc/arena-smoke-proxy.conf", dir.display()), // absolute, with `..`
+        "sys/arena-smoke-proxy.conf".to_string(),               // through a symlinked directory
+        "passwd.conf".to_string(),                              // a symlink to a file there
+    ] {
+        let e = check(&local(&path)).unwrap_err();
+        assert!(e.contains("/etc"), "{path}: {e}");
+    }
+    // A directory that doesn't resolve can't be checked: refused too (`~root/` isn't expanded
+    // by the binary — it is a relative path under the config's directory).
+    for path in ["nowhere/proxy.conf", "~root/../../etc/nginx/x.conf"] {
+        assert!(check(&local(path)).is_err(), "{path}");
+    }
+    // A remote proxy host: refused.
     let remote = px("SSH_PROXY_HOST=cute.sus.cat\nPROXY_LOCAL=false\n");
-    assert!(check_proxy(&remote, Some("/home/dev")).unwrap_err().contains("remote"));
+    assert!(check(&remote).unwrap_err().contains("remote"));
     // A child config without the forced empty reload would reload nginx: refused.
     let mut reloading = sandbox.clone();
     reloading.values.insert("SSH_PROXY_RELOAD_CMD".into(), "nginx -s reload".into());
-    assert!(check_proxy(&reloading, None).is_err());
+    assert!(check_proxy(&reloading, None, dir).is_err());
     // What the child sees is the file plus the forced values.
     let c = child_config("ARENA_STATE_DIR=/elsewhere\nRUNPOD_API=v1\n", state, Some("v2"));
     assert_eq!((c.get("ARENA_STATE_DIR"), c.get("RUNPOD_API")), (Some("/tmp/state"), Some("v2")));
+    // The binary's own spelling rules: only `~/` is expanded, and only with a HOME.
+    assert_eq!(proxy_write_path("~/p.conf", Some("/home/dev/"), Path::new("/cfg")), PathBuf::from("/home/dev/p.conf"));
+    assert_eq!(proxy_write_path("~/p.conf", None, Path::new("/cfg")), PathBuf::from("/cfg/~/p.conf"));
+    assert_eq!(proxy_write_path("~root/p.conf", Some("/home/dev"), Path::new("/cfg")), PathBuf::from("/cfg/~root/p.conf"));
+    assert_eq!(proxy_write_path("/srv/p.conf", Some("/home/dev"), Path::new("/cfg")), PathBuf::from("/srv/p.conf"));
 }
 
 /// A `teardown --check --json` report shaped as `arena_core::teardown::Report` serializes.
@@ -876,7 +1065,7 @@ fn pods_item(scope: &str, verdict: &str, pods: &[(&str, &str)]) -> Value {
 }
 
 #[test]
-fn teardown_listing_fails_closed() {
+fn teardown_listing_reads_what_answered_and_knows_it_is_incomplete() {
     let proxy = serde_json::json!({"area": "proxy", "scope": "proxy/proxy.conf", "verdict": "remaining", "summary": "1",
         "entries": [{"kind": "forward", "name": "devtest-echo", "public_port": 9504, "target": "1.2.3.4:10022", "provider": "runpod"}],
         "notes": [], "fix": []});
@@ -891,9 +1080,18 @@ fn teardown_listing_fails_closed() {
     assert_eq!(t.forwards, Some(vec!["devtest-echo".to_string()]));
     assert_eq!(foreign(t.pods.iter().map(|p| p.name.as_str()), "devtest"), ["james-gpu"]);
 
-    // A provider that couldn't list is not "no pods": refused, naming it.
-    let unknown = report(serde_json::json!([pods_item("runpod", "remaining", &[]), pods_item("vast", "unknown", &[])]));
-    assert!(parse_teardown(&unknown).unwrap_err().starts_with("vast"));
+    assert_eq!((t.unknown.clone(), t.complete()), (vec![], Ok(())));
+
+    // A provider that couldn't list is not "no pods": the listing is incomplete (naming it)
+    // — but what the others listed is still read.
+    let partial = report(serde_json::json!([
+        pods_item("runpod", "remaining", &[("r1", "devtest-echo")]),
+        pods_item("vast", "unknown", &[]),
+    ]));
+    let t = parse_teardown(&partial).unwrap();
+    assert_eq!(t.pods.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["r1"]);
+    assert_eq!(t.unknown, ["vast: …"]);
+    assert!(t.complete().unwrap_err().starts_with("vast: …"));
     // Shapes this test doesn't know are errors, never an empty fleet.
     for bad in [
         "".to_string(),
@@ -910,6 +1108,39 @@ fn teardown_listing_fails_closed() {
     let unread = report(serde_json::json!([pods_item("runpod", "clear", &[]),
         {"area": "proxy", "scope": "", "verdict": "unknown", "summary": "remote", "entries": [], "notes": [], "fix": []}]));
     assert_eq!(parse_teardown(&unread).unwrap().forwards, None);
+}
+
+/// The cleanup's reading of a round: its own pods are terminated even when another
+/// provider didn't answer (a Vast 429 must not leave a RunPod pod billing); "clean" needs
+/// none of them *and* every provider answering.
+#[test]
+fn cleanup_terminates_what_it_can_see_and_is_clean_only_on_a_complete_listing() {
+    let listed =
+        |id: &str, name: &str| Listed { id: id.into(), name: name.into(), provider: "runpod".into(), status: "RUNNING".into() };
+    let names = vec!["devtest-delta".to_string(), "devtest-charlie".to_string()];
+    let ids: BTreeSet<String> = ["r9".to_string()].into();
+    let td = |pods: Vec<Listed>, unknown: &[&str]| Teardown {
+        pods,
+        unknown: unknown.iter().map(|s| s.to_string()).collect(),
+        forwards: None,
+    };
+    let fleet = vec![listed("r1", "devtest-alpha"), listed("r2", "devtest-delta"), listed("r9", "devtest-zulu")];
+    for (t, want) in [
+        // Ours by name (r2) and by recorded id (r9, renamed since), on a complete listing…
+        (td(fleet.clone(), &[]), Some(vec!["r2", "r9"])),
+        // …and just the same with another provider down.
+        (td(fleet.clone(), &["vast: couldn't list (HTTP 429)"]), Some(vec!["r2", "r9"])),
+        (td(vec![listed("r1", "devtest-alpha")], &[]), None),
+    ] {
+        match (sweep(&t, &names, &ids), want) {
+            (Sweep::Terminate(got), Some(want)) => assert_eq!(got.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), want),
+            (Sweep::Clean, None) => {}
+            (got, want) => panic!("{t:?}: {got:?}, wanted {want:?}"),
+        }
+    }
+    // None of ours, but a provider didn't answer: not clean.
+    let t = td(vec![listed("r1", "devtest-alpha")], &["hetzner: couldn't list (timeout)"]);
+    assert_eq!(sweep(&t, &names, &ids), Sweep::Unconfirmed(&["hetzner: couldn't list (timeout)".to_string()]));
 }
 
 #[test]
@@ -1013,7 +1244,7 @@ fn the_harness_clears_the_environment_and_kills_at_the_deadline() {
     let stub = dir.join("arena-stub.sh");
     let script = [
         "#!/bin/sh",
-        "case \"$4\" in sleep) exec sleep 30;; esac",
+        "case \"$4\" in sleep) exec sleep 30;; quiet) exit 0;; esac",
         "env",
         "echo \"ARGS $*\"",
         "echo \"CWD $(pwd -P)\"",
@@ -1035,9 +1266,106 @@ fn the_harness_clears_the_environment_and_kills_at_the_deadline() {
     assert!(ran.stdout.contains(&format!("CWD {}", cwd.display())), "{}", ran.stdout);
     assert!(ran.stdout.contains("STDIN-CLOSED"), "a prompt must never wait on input: {}", ran.stdout);
 
+    // Not captured (stdout shown): done as soon as the command is.
+    let started = Instant::now();
+    assert!(arena.run(&["pods", "quiet"], Duration::from_secs(20), false).ok());
+    assert!(started.elapsed() < READ_GRACE / 2, "an uncaptured command returns at once: {:?}", started.elapsed());
+
     let started = Instant::now();
     let ran = arena.run(&["pods", "sleep"], Duration::from_millis(300), true);
     assert!(ran.status.as_ref().is_err_and(|e| e.contains("timed out")), "{}", ran.describe());
     assert!(started.elapsed() < Duration::from_secs(10), "the deadline must hold: {:?}", started.elapsed());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The cleanup guard itself, against a stub `arena` that answers `teardown --check --json`
+/// from canned reports (`teardown.<n>`; none = prints nothing) and records every call: what
+/// it terminates, and when it is satisfied.
+#[cfg(unix)]
+#[test]
+fn the_cleanup_guard_terminates_through_outages_and_stops_only_on_a_complete_listing() {
+    use std::os::unix::fs::PermissionsExt;
+    let pods = |scope: &str, verdict: &str, list: &[(&str, &str)]| pods_item(scope, verdict, list);
+    let complete = |list: &[(&str, &str)]| report(serde_json::json!([pods("runpod", "remaining", list), pods("vast", "clear", &[])]));
+    let vast_down = |list: &[(&str, &str)]| report(serde_json::json!([pods("runpod", "remaining", list), pods("vast", "unknown", &[])]));
+    let names = || vec!["devtest-delta".to_string(), "devtest-charlie".to_string()];
+
+    // Each scenario: canned reports, terminates that fail (id, attempt), unwinding?, then
+    // the calls the guard must make.
+    type Scenario<'a> = (&'a str, Vec<Option<String>>, &'a [(&'a str, u32)], bool, &'a [&'a str]);
+    let scenarios: Vec<Scenario> = vec![
+        // Vast is down for two rounds: the recorded id goes first, the pod holding one of
+        // the run's names on RunPod is terminated anyway, and "done" waits for Vast.
+        (
+            "outage",
+            vec![Some(vast_down(&[("r2", "devtest-delta"), ("r7", "devtest-alpha")])), Some(vast_down(&[])), Some(complete(&[]))],
+            &[],
+            false,
+            &["pods terminate r1 -y", "teardown --check --json", "pods terminate r2 -y", "teardown --check --json", "teardown --check --json"],
+        ),
+        // No listing at all, and the first terminate fails: the recorded id is retried.
+        (
+            "nolist",
+            vec![None, Some(complete(&[]))],
+            &[("r1", 1)],
+            false,
+            &["pods terminate r1 -y", "teardown --check --json", "pods terminate r1 -y", "teardown --check --json"],
+        ),
+        // Unwinding: two clean rounds in a row — a pod surfacing late starts the count over.
+        (
+            "unwinding",
+            vec![Some(complete(&[])), Some(complete(&[("r3", "devtest-charlie")])), Some(complete(&[])), Some(complete(&[]))],
+            &[],
+            true,
+            &[
+                "pods terminate r1 -y",
+                "teardown --check --json",
+                "teardown --check --json",
+                "pods terminate r3 -y",
+                "teardown --check --json",
+                "teardown --check --json",
+            ],
+        ),
+    ];
+    for (tag, reports, failing, unwinding, want) in scenarios {
+        let dir = Scratch::new(&format!("guard-{tag}"));
+        let s = dir.0.display().to_string();
+        for (i, r) in reports.iter().enumerate() {
+            if let Some(r) = r {
+                std::fs::write(dir.0.join(format!("teardown.{}", i + 1)), r).unwrap();
+            }
+        }
+        for (id, attempt) in failing {
+            std::fs::write(dir.0.join(format!("fail.{id}.{attempt}")), "").unwrap();
+        }
+        let script = format!(
+            "#!/bin/sh\nS='{s}'\nshift 2\necho \"$*\" >> \"$S/calls\"\n\
+             case \"$1\" in\n\
+             teardown) n=$(($(cat \"$S/n\" 2>/dev/null || echo 0) + 1)); echo \"$n\" > \"$S/n\"\n\
+               [ -f \"$S/teardown.$n\" ] && cat \"$S/teardown.$n\"; exit 1 ;;\n\
+             pods) [ \"$2\" = terminate ] || exit 2\n\
+               k=$(($(cat \"$S/t.$3\" 2>/dev/null || echo 0) + 1)); echo \"$k\" > \"$S/t.$3\"\n\
+               [ -f \"$S/fail.$3.$k\" ] && exit 1; exit 0 ;;\n\
+             esac\nexit 2\n"
+        );
+        let stub = dir.0.join("arena-stub.sh");
+        std::fs::write(&stub, script).unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let arena = Arena { bin: stub, config: dir.0.join("config.env"), cwd: dir.0.clone(), state_dir: dir.0.join("state") };
+        let run = || {
+            let mut cleanup = Cleanup::new(&arena, names());
+            cleanup.pause = Duration::ZERO;
+            cleanup.note("r1"); // the pod the run created
+            if unwinding {
+                panic!("an assertion failed mid-run (expected by this test)");
+            }
+        };
+        if unwinding {
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).is_err());
+        } else {
+            run();
+        }
+        let calls = std::fs::read_to_string(dir.0.join("calls")).unwrap();
+        assert_eq!(calls.lines().collect::<Vec<_>>(), want, "{tag}");
+    }
 }

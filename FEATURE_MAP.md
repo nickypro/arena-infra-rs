@@ -31,7 +31,7 @@ means this.
 
 | Legacy script | Rust CLI | TUI | Status | Notes |
 |---|---|---|---|---|
-| `sync_git.sh -m --exclude` (commit+push current branch) | `pods backup [selector] [--message --no-pull]` | Menu/Fleet→Backup `[b]` | ✅ | The full save: git-push **whatever branch the pod is on** (skips `main`/`master`, never switches) **and** the rsync file backup (`--no-pull` = git only). 5 min per pod's push. |
+| `sync_git.sh -m --exclude` (commit+push current branch) | `pods backup [selector] [--message --no-pull]` | Menu/Fleet→Backup `[b]` | ✅ | The full save: git-push **whatever branch the pod is on** (skips `main`/`master`, never switches) **and** the rsync file backup (`--no-pull` = git only). 5 min per pod's push; the rsync has no time budget yet. |
 | `init_branches.sh <day>` (make autocommit branch) | `pods init-branches [selector] [--week --day]` | — | ✅ | Creates + pushes each pod's `autocommit-{prefix}-wNdM-{name}` branch, no commit. |
 | `list_branches.sh` (table of current branch) | `pods run 'git -C … branch --show-current'` | BRANCH column | 🟡 | No dedicated command; the TUI shows it. |
 | `backup.sh <label>` (**rsync pod files → local**) | `pods pull [label] [-t … --dir --max-size --remote-path --no-git --no-big]` | — | ✅ | Rsync home → `<dir>/<label>/<pod>/` (size-capped) plus a complete `big/` mirror; keeps `.git`. No time budget yet. |
@@ -39,7 +39,7 @@ means this.
 | `test_em.sh` (torch version) | `pods test [selector]` | Menu→test `[e]` · Fleet→test | ✅ | 90 s per pod. |
 | — | `pods test --deep [selector] [--json -v]` | `d` (background) + HEALTH column | ➕ | Is-this-pod-usable: per-GPU tensor op, driver ≥ floor (`MIN_DRIVER_VERSION`, else from `ALLOWED_CUDA_VERSIONS`), device count, GPU↔GPU copy + NCCL (>1 GPU), HF download speed, disk, host load, maintenance. FAIL/WARN/PASS per pod, `same host?` grouping, non-zero exit on FAIL. Verdicts go to the health cache. |
 | `run_cmd.sh <cmd>` (sequential) | `pods run [-t …] [--timeout] <cmd>` (concurrent) | Menu→run `[x]` · Fleet→run | ✅ | Inside the conda env; 30 min per pod by default; a selection flag or `--dry-run` after the command is refused rather than run. |
-| — | `pods run --background <cmd>` · `pods jobs [JOB] [--kill JOB]` · `pods logs [JOB] [-n N] [-f]` | — | ➕ | Detached course-test runs: one job id, everything on the pod under `~/.arena/jobs/<id>/` (survives your SSH session, not a restart); `logs -f` follows by byte offset. |
+| — | `pods run --background <cmd>` · `pods jobs [JOB] [--kill JOB]` · `pods logs [JOB] [-n N] [-f]` | — | ➕ | Detached course-test runs: one job id, everything on the pod under `~/.arena/jobs/<id>/` (survives your SSH session, not a restart); started with `setsid -f`, so SIGINT reaches the command as in a foreground run; `logs -f` follows by byte offset. |
 | `names.sh` (write ~/.name) | folded into `pods setup` (and `rename`) | — | ✅ | |
 | — | `pods cp <file> [dest] [-r --timeout -t …]` | — | ➕ | scp to every pod, mirroring the repo path by default; verifies the file landed. |
 

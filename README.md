@@ -268,15 +268,20 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
   - `pods run --background [-t <targets>] <cmd>` / `pods jobs [targets] [JOB] [--kill JOB]` /
     `pods logs [targets] [JOB] [-n N] [-f]` — **detached course-test runs**. `--background`
     (confirms first; `--dry-run` shows the wrapper) starts the command on each pod with
-    `setsid nohup`, under `pods run`'s shell + conda env (plus `PYTHONUNBUFFERED=1`), and
-    returns at once: `[n/N] ✓ <pod>: job <id> (pid …)`. One id per run, e.g.
+    `setsid -f nohup` (not `&`, which would start it with SIGINT/SIGQUIT ignored — no
+    `KeyboardInterrupt`; only a `setsid` without `-f` falls back to that), under `pods
+    run`'s shell + conda env (plus `PYTHONUNBUFFERED=1`), and returns at once: `[n/N] ✓
+    <pod>: job <id> (pid …)`. A job that can't record its pid doesn't run (`exit 125`); no
+    pid within 5s is reported as "may have started anyway — check `arena pods jobs` before
+    retrying", never as a clean failure. One id per run, e.g.
     `20261008-142301-pytest-x` (UTC start + command slug); everything stays on the pod
     under `~/.arena/jobs/<id>/` (`cmd`, `run`, `log` = stdout+stderr, `pid`, `started_at`,
     `exit`), so it survives your SSH session and any operator can look — but not a pod
     restart (container disk), and logs are never rotated or pruned. No time limit;
     `--timeout` is refused with it. `pods jobs`: a table of each pod's jobs, newest first
     (`running (pid N)` — the pid must still be that job's wrapper, not a recycled one — /
-    `exit N` / `lost` = ended without an exit code). `pods logs`: per pod, the job's status
+    `exit N` / `lost` = ended without an exit code, or still no pid after a minute;
+    `starting` before that). `pods logs`: per pod, the job's status
     and its last `-n` lines (default 20, of at most the last 1 MiB; JOB defaults to each
     pod's newest; a JOB-shaped word among the targets is the job). `-f` re-reads every 3s
     from where it left off (exact byte offsets, lines printed once, `[pod]`-prefixed with
@@ -665,15 +670,19 @@ ARENA_LIVE_SMOKE=1 ARENA_LIVE_CONFIG=/home/dev/sandbox/config.env \
 It refuses to start unless both variables are set; the config (symlinks resolved) is not
 `/home/dev/prod-ro/config.env` or anything under `/home/dev/prod-ro` or `/root`; its
 `MACHINE_NAME_PREFIX` starts with `devtest` (or is named in `ARENA_LIVE_PREFIX_ALLOW`,
-comma-separated — never an `arenaN` prefix); a configured proxy is a local file outside `/etc`;
-and every configured provider lists, holding only `{prefix}-…` pods (anything else = the wrong
-account). The binary gets a cleared environment (only `PATH HOME USER LOGNAME LANG LC_ALL TZ
-RUNPOD_API`, so an exported key or prefix can't override the checked config) plus
+comma-separated — never an `arenaN` prefix); a configured proxy is a local file outside `/etc`
+(resolved as the binary will write it: relative to the config's directory, `..` and symlinks
+followed); and every configured provider lists, holding only `{prefix}-…` pods (anything else =
+the wrong account). The binary gets a cleared environment (only `PATH HOME USER LOGNAME LANG
+LC_ALL TZ RUNPOD_API`, so an exported key or prefix can't override the checked config) plus
 `SSH_PROXY_RELOAD_CMD=` (write-only proxy) and a fresh `ARENA_STATE_DIR`, and runs from the
-config's directory like `bin/arena-dev`. Whatever fails, a guard terminates every pod holding
-the run's two names and re-lists until they're gone — only Ctrl+C gets past it, so after an
-interrupted run check `teardown --check`. A COMMUNITY pod that never gets a public IP fails as
-`FAILED endpoint` (see `docs/TODO.md`); the guard still cleans it up.
+config's directory like `bin/arena-dev`. Whatever fails, a guard first terminates the pod id
+the run recorded (no listing needed), then each round terminates every pod holding the run's
+two names (or that id) on the providers that answer, until a listing where *every* provider
+answered shows none — so another provider's outage delays the all-clear, never a terminate;
+after 8 rounds without one it prints the commands to finish by hand. Only Ctrl+C gets past
+it, so after an interrupted run check `teardown --check`. A COMMUNITY pod that never gets a
+public IP fails as `FAILED endpoint` (see `docs/TODO.md`); the guard still cleans it up.
 
 ## Layout
 

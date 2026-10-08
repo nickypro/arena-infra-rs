@@ -18,7 +18,7 @@ use arena_core::remote::{describe_error, Remote};
 use arena_core::ssh::SshTarget;
 use arena_core::Config;
 
-use super::{confirm, exec_each_pod, PodCall, Selected};
+use super::{exec_each_pod, PodCall, Selected};
 
 /// Budget for starting a job on one pod: the ssh connect (10s), a few file writes, and up
 /// to 5s for the job to record its pid. Past this the pod is wedged — though the job may
@@ -42,6 +42,11 @@ pub(crate) const DEFAULT_TAIL: u64 = 20;
 
 /// Where a handler's lines go: stdout for real, a recorder in tests.
 pub(crate) type Say<'a> = &'a mut dyn FnMut(&str);
+
+/// How a handler asks before it acts: `confirm(yes, …)` for real (prompt at a terminal,
+/// refuse without one unless `--yes`), a canned answer in tests — so the decline path is
+/// tested the same way wherever the tests run.
+pub(crate) type Ask<'a> = &'a mut dyn FnMut(&str) -> Result<bool>;
 
 /// A pod's reply, parsed — or why there is none. A call that failed outright (non-zero
 /// exit and none of our marker lines: ssh couldn't connect, no `sh`) reads as its exit
@@ -104,6 +109,7 @@ fn start_preview(dry_run: bool, id: &JobId, cmd: &str, conda_env: &str, names: &
 }
 
 /// A failed start's report text. A start that timed out may still have launched the job.
+/// (One that got no pid in time says so itself: see `arena_core::jobs::parse_started`.)
 fn start_failure(why: &str) -> String {
     if why.starts_with("timed out after") {
         format!("{why} — the job may have started anyway: check `arena pods jobs`")
@@ -124,7 +130,7 @@ pub(crate) async fn handle_start(
     cmd: &str,
     now_unix: u64,
     dry_run: bool,
-    yes: bool,
+    ask: Ask<'_>,
     say: Say<'_>,
 ) -> Result<()> {
     if cmd.trim().is_empty() {
@@ -142,7 +148,7 @@ pub(crate) async fn handle_start(
         start_preview(true, &id, cmd, env, &names).iter().for_each(|l| say(l));
         return Ok(());
     }
-    if !confirm(yes, &start_preview(false, &id, cmd, env, &names).join("\n"))? {
+    if !ask(&start_preview(false, &id, cmd, env, &names).join("\n"))? {
         say("aborted.");
         return Ok(());
     }
@@ -200,7 +206,7 @@ pub(crate) async fn handle_kill(
     cfg: &Config,
     sel: &Selected,
     id: &JobId,
-    yes: bool,
+    ask: Ask<'_>,
     say: Say<'_>,
 ) -> Result<()> {
     let targets = sorted_targets(sel, cfg)?;
@@ -214,7 +220,7 @@ pub(crate) async fn handle_kill(
         names.len(),
         names.join(", ")
     );
-    if !confirm(yes, &prompt)? {
+    if !ask(&prompt)? {
         say("aborted.");
         return Ok(());
     }
@@ -535,6 +541,11 @@ mod tests {
         move |l: &str| said.0.lock().unwrap().push((start.elapsed(), l.to_string()))
     }
 
+    /// The operator's answer to every prompt: yes (as `--yes` would).
+    fn yes() -> impl FnMut(&str) -> Result<bool> {
+        |_| Ok(true)
+    }
+
     /// The (cmd, timeout) of every exec to one host, in order.
     fn execs(fake: &FakeRemote, port: u16) -> Vec<(String, Option<Duration>)> {
         fake.calls_to(&host(port))
@@ -565,7 +576,7 @@ mod tests {
         fake.script(&host(22002), [FakeReply::exit(255, "ssh: connect to host 10.0.0.1 port 22002: Connection refused")]);
         fake.script(&host(22003), [FakeReply::hang()]);
         let (said, start) = (Said::default(), Instant::now());
-        let err = handle_start(fake.clone(), &cfg(), &Selected::all(fleet()), cmd, T0, false, true, &mut recorder(&said, start))
+        let err = handle_start(fake.clone(), &cfg(), &Selected::all(fleet()), cmd, T0, false, &mut yes(), &mut recorder(&said, start))
             .await
             .unwrap_err();
         assert_eq!(err.to_string(), format!("2 pod(s) failed to start job {job}"));
@@ -595,16 +606,30 @@ mod tests {
         fake.script(&host(22001), [FakeReply::exit(3, "").with_stdout(&format!("ARENA_JOB_ERR job {job} already exists on this pod\n"))]);
         let said = Said::default();
         let one = Selected::all(vec![pod("apple", 22001)]);
-        let err = handle_start(fake.clone(), &cfg(), &one, "true", T0, false, true, &mut recorder(&said, Instant::now()))
+        let err = handle_start(fake.clone(), &cfg(), &one, "true", T0, false, &mut yes(), &mut recorder(&said, Instant::now()))
             .await
             .unwrap_err();
         assert!(err.to_string().starts_with("1 pod(s) failed"), "{err}");
         assert_eq!(said.lines()[0], format!("[1/1] ✗ devtest-apple: job {job} already exists on this pod"));
+        // No pid within 5s: a failure, but one that says the job may be running (a retry
+        // would start a second copy).
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [FakeReply::exit(3, "").with_stdout("ARENA_JOB_UNSURE /root/.arena/jobs/x/log\n")]);
+        let said = Said::default();
+        let err = handle_start(fake.clone(), &cfg(), &one, "true", T0, false, &mut yes(), &mut recorder(&said, Instant::now()))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().starts_with("1 pod(s) failed"), "{err}");
+        assert_eq!(
+            said.lines()[0],
+            "[1/1] ✗ devtest-apple: no pid from the job within 5s — it may have started anyway: check `arena pods jobs` \
+             before retrying (its log: /root/.arena/jobs/x/log)"
+        );
 
         // --dry-run: the preview names the pods and shows the wrapper; nothing is run.
         let fake = Arc::new(FakeRemote::new());
         let said = Said::default();
-        handle_start(fake.clone(), &cfg(), &Selected::all(fleet()), "nvidia-smi", T0, true, true, &mut recorder(&said, Instant::now()))
+        handle_start(fake.clone(), &cfg(), &Selected::all(fleet()), "nvidia-smi", T0, true, &mut yes(), &mut recorder(&said, Instant::now()))
             .await
             .unwrap();
         assert!(fake.calls().is_empty());
@@ -612,7 +637,7 @@ mod tests {
         assert_eq!(lines[0], "[dry-run] would start job 20261008-142301-nvidia-smi on 3 pod(s): devtest-apple, devtest-bloom, devtest-cloud");
         assert!(lines.iter().any(|l| l.contains("conda activate arena-env") && l.contains("nvidia-smi")), "{lines:?}");
         // An empty command is refused before anything.
-        let e = handle_start(fake.clone(), &cfg(), &Selected::all(fleet()), "  ", T0, false, true, &mut |_| {}).await.unwrap_err();
+        let e = handle_start(fake.clone(), &cfg(), &Selected::all(fleet()), "  ", T0, false, &mut yes(), &mut |_| {}).await.unwrap_err();
         assert_eq!(e.to_string(), "nothing to run: the command is empty");
         assert!(fake.calls().is_empty());
     }
@@ -660,7 +685,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn kill_signals_only_after_a_confirm_and_reports_per_pod() {
+    async fn kill_reports_each_pod_once_confirmed() {
         let job = id("20261008-142301-pytest");
         let fake = Arc::new(FakeRemote::new());
         let running = job_line(job.as_str(), "running", None, Some(812), "pytest");
@@ -668,7 +693,7 @@ mod tests {
         fake.script(&host(22002), [FakeReply::stdout("ARENA_JOB_MISSING\nARENA_JOBS_END\n")]);
         fake.script(&host(22003), [FakeReply::exit(255, "Connection refused")]);
         let said = Said::default();
-        let err = handle_kill(fake.clone(), &cfg(), &Selected::all(fleet()), &job, true, &mut recorder(&said, Instant::now()))
+        let err = handle_kill(fake.clone(), &cfg(), &Selected::all(fleet()), &job, &mut yes(), &mut recorder(&said, Instant::now()))
             .await
             .unwrap_err();
         assert_eq!(err.to_string(), "1 pod(s) failed");
@@ -683,6 +708,37 @@ mod tests {
         for port in [22001, 22002, 22003] {
             assert_eq!(execs(&fake, port), [(jobs::kill_command(&job), Some(READ_TIMEOUT))]);
         }
+    }
+
+    /// Starting and killing both ask first, naming every pod; a "no" (or a prompt that
+    /// failed) reaches no pod at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_declined_start_or_kill_reaches_no_pod() {
+        let job = id("20261008-142301-pytest");
+        let fake = Arc::new(FakeRemote::new());
+        let (said, asked) = (Said::default(), Mutex::new(Vec::<String>::new()));
+        let mut no = |what: &str| -> Result<bool> {
+            asked.lock().unwrap().push(what.to_string());
+            Ok(false)
+        };
+        let all = Selected::all(fleet());
+        handle_start(fake.clone(), &cfg(), &all, "pytest", T0, false, &mut no, &mut recorder(&said, Instant::now())).await.unwrap();
+        handle_kill(fake.clone(), &cfg(), &all, &job, &mut no, &mut recorder(&said, Instant::now())).await.unwrap();
+        assert_eq!(said.lines(), ["aborted.", "aborted."]);
+        assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+        let asked = asked.into_inner().unwrap();
+        let pods = "devtest-apple, devtest-bloom, devtest-cloud";
+        assert!(asked[0].starts_with(&format!("Start `pytest` in the background on 3 pod(s) as job {job}: {pods}")), "{asked:?}");
+        assert!(asked[1].starts_with(&format!("Stop job {job} — SIGTERM to its process group")), "{asked:?}");
+        assert!(asked[1].ends_with(pods), "{asked:?}");
+
+        // The prompt itself failing (the terminal went away) is the command's error.
+        let mut broken = |_: &str| -> Result<bool> { anyhow::bail!("reading the answer failed") };
+        let e = handle_kill(fake.clone(), &cfg(), &all, &job, &mut broken, &mut |_| {}).await.unwrap_err();
+        assert_eq!(e.to_string(), "reading the answer failed");
+        let e = handle_start(fake.clone(), &cfg(), &all, "pytest", T0, false, &mut broken, &mut |_| {}).await.unwrap_err();
+        assert_eq!(e.to_string(), "reading the answer failed");
+        assert!(fake.calls().is_empty());
     }
 
     #[tokio::test(start_paused = true)]

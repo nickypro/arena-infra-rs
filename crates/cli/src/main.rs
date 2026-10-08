@@ -4884,7 +4884,8 @@ async fn handle_pods_with(
             let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
             if background {
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-                jobs::handle_start(remote, cfg, &sel, &cmd, now, dry_run, yes, &mut |l| println!("{l}")).await?;
+                let ask = &mut |what: &str| confirm(yes, what);
+                jobs::handle_start(remote, cfg, &sel, &cmd, now, dry_run, ask, &mut |l| println!("{l}")).await?;
             } else {
                 handle_run(remote, cfg, &sel, &cmd, budget, dry_run, yes, /*confirm*/ true, /*compact*/ false).await?;
             }
@@ -4900,7 +4901,10 @@ async fn handle_pods_with(
             }
             let sel = select(provider, cfg, &Select { targets, opts: sel.opts }.args(), Unscoped::All).await?;
             match kill {
-                Some(id) => jobs::handle_kill(remote, cfg, &sel, &id, yes, &mut |l| println!("{l}")).await?,
+                Some(id) => {
+                    let ask = &mut |what: &str| confirm(yes, what);
+                    jobs::handle_kill(remote, cfg, &sel, &id, ask, &mut |l| println!("{l}")).await?
+                }
                 None => jobs::handle_list(remote, cfg, &sel, only.as_ref(), &mut |l| println!("{l}")).await?,
             }
         }

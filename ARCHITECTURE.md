@@ -152,8 +152,12 @@ flowchart TD
 - **The proxy is a merge**: a forward goes only when its pod is confirmed gone; writes are
   serialized and atomic, a failed reload restores the previous config, and
   `SSH_PROXY_RELOAD_CMD=` (empty) makes every write write-only.
-- **Everything is bounded**: each pod-SSH call has a budget, provider listings 60 s, so one
-  wedged pod or stalled API can't hang a fleet command or pile up cron runs.
+- **Bounded where it goes through the seams**: every `Remote` call (pod-SSH exec or copy)
+  has a budget and provider listings 60 s, so one wedged pod or stalled API can't hang those
+  fleet commands. Not yet bounded: the rsync transfers, which drive their own ssh outside
+  `Remote` — `pods pull`, `pods backup`'s file backup (every tick under `cron install
+  --pull`) and the replace/migrate via-local copy — so a pod that stalls mid-transfer can
+  still hold one up.
 - **Publishing is an allowlist**: `snapshot --public` serializes a separate struct with
   only list names, GPU, up/starting/down, health + a fixed-vocabulary reason and
   maintenance times — no IPs, ports, ids, providers, costs or keys (pinned by a leak test).
