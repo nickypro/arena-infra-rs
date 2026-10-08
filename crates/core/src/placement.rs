@@ -540,6 +540,16 @@ pub struct Rounds {
     pub every: Duration,
 }
 
+/// Whether another retry round — starting `every` from `now` — would still start inside the
+/// window that ends at `deadline` (a round exactly at the deadline is inside). Asked
+/// *before* the sleep, so a retry never creates (bills) after the window the operator agreed
+/// to, nor sleeps just to give up, and timer slack can't flip the answer. Shared by the
+/// placement executor ([`place`]) and the CLI's single-option retry loop, so both stop the
+/// same way. Pure.
+pub fn next_round_in_window(now: tokio::time::Instant, every: Duration, deadline: tokio::time::Instant) -> bool {
+    now < deadline && now + every <= deadline
+}
+
 /// The `-n`/`-a` bound: the provider-scoped total (`provider` pods named `{prefix}-…`) a
 /// top-up aims for. A retry round only fills what is still short of it.
 #[derive(Debug, Clone)]
@@ -758,8 +768,7 @@ where
         // so if that's past the deadline, end here — not sleep just to give up, nor create
         // (bill) up to `every` after the window the operator agreed to. (Decided before the
         // sleep, so timer slack can't flip it.)
-        let now = tokio::time::Instant::now();
-        if now >= deadline || now + rounds.every > deadline {
+        if !next_round_in_window(tokio::time::Instant::now(), rounds.every, deadline) {
             break End::WindowElapsed;
         }
         on_progress(&Progress::Waiting { round, unplaced: pending.len(), every: rounds.every });
@@ -1412,6 +1421,23 @@ note: ~ = preset estimate (no live price for that GPU); --max-price is checked a
         let last = out.log[0].attempts.iter().map(|a| a.at).max().unwrap();
         assert_eq!(last, Duration::from_secs(120));
         assert!(render_summary(&three(), &out).contains("capacity ×3"));
+    }
+
+    #[test]
+    fn next_round_in_window_table() {
+        let t0 = tokio::time::Instant::now();
+        let s = Duration::from_secs;
+        // (now offset, every, window, another round?)
+        for (now, every, window, want) in [
+            (0, 60, 120, true),   // t=60 is inside
+            (60, 60, 120, true),  // t=120: exactly at the deadline is still inside
+            (61, 60, 120, false), // t=121 would be past it
+            (0, 600, 60, false),  // interval longer than the window
+            (120, 0, 120, false), // already at the deadline: no new round
+            (0, 0, 0, false),     // zero window = one round only
+        ] {
+            assert_eq!(next_round_in_window(t0 + s(now), s(every), t0 + s(window)), want, "{now} {every} {window}");
+        }
     }
 
     /// Review fix: no round (no create, no bill) after the window closes — even when the

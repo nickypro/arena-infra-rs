@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 
 use crate::error::{Error, Result};
+use crate::http::{send_json, send_ok, status_error};
 
 const BASE: &str = "https://openrouter.ai/api/v1/keys";
 
@@ -19,6 +20,8 @@ const BASE: &str = "https://openrouter.ai/api/v1/keys";
 pub struct OpenRouter {
     provisioning_key: String,
     client: reqwest::Client,
+    /// The keys endpoint: [`BASE`], or a loopback test server.
+    base: String,
 }
 
 /// A freshly created runtime key — the only time the `secret` is available.
@@ -55,7 +58,7 @@ pub fn key_name(prefix: &str, candidates: &[String], machine: &str) -> String {
 
 impl OpenRouter {
     pub fn new(provisioning_key: impl Into<String>) -> Self {
-        Self { provisioning_key: provisioning_key.into(), client: reqwest::Client::new() }
+        Self { provisioning_key: provisioning_key.into(), client: reqwest::Client::new(), base: BASE.to_string() }
     }
 
     fn auth(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -68,12 +71,23 @@ impl OpenRouter {
         if let Some(l) = limit {
             body["limit"] = serde_json::json!(l);
         }
-        let resp = self.auth(self.client.post(BASE)).json(&body).send().await?;
+        // Status first (crate::http). Not `send_json`: its "isn't JSON" error quotes the
+        // start of the body, and a 2xx body here carries the new key's secret.
+        let resp = self.auth(self.client.post(&self.base)).json(&body).send().await?;
         let status = resp.status();
-        let v: serde_json::Value = resp.json().await?;
         if !status.is_success() {
-            return Err(Error::provider_http(status, &v, "openrouter create key"));
+            let text = resp.text().await.unwrap_or_default();
+            return Err(status_error(status, &text, "openrouter create key"));
         }
+        let unreadable = || {
+            Error::provider(format!(
+                "openrouter create key: HTTP {status} but the response couldn't be read (not shown: \
+                 it carries the secret) — the key may have been created: check `arena keys list` / the \
+                 OpenRouter dashboard before retrying"
+            ))
+        };
+        let text = resp.text().await.map_err(|_| unreadable())?;
+        let v: serde_json::Value = serde_json::from_str(&text).map_err(|_| unreadable())?;
         // The secret is the top-level `key`; metadata is under `data`.
         let secret = v
             .get("key")
@@ -99,28 +113,18 @@ impl OpenRouter {
     }
 
     /// One page of `GET /keys` from `offset` (disabled keys included: a disabled key still
-    /// exists, still carries its machine's name, and revoke/rename must see it).
+    /// exists, still carries its machine's name, and revoke/rename must see it). Status
+    /// first ([`send_json`]): a bad provisioning key's 401 is `Auth` whatever its body.
     async fn list_page(&self, offset: usize) -> Result<Vec<KeyInfo>> {
         let query = [("include_disabled", "true".to_string()), ("offset", offset.to_string())];
-        let resp = self.auth(self.client.get(BASE)).query(&query).send().await?;
-        let status = resp.status();
-        let v: serde_json::Value = resp.json().await?;
-        if !status.is_success() {
-            return Err(Error::provider_http(status, &v, "openrouter list keys"));
-        }
+        let v = send_json(self.auth(self.client.get(&self.base)).query(&query), "openrouter list keys").await?;
         let arr = v.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default();
         Ok(arr.iter().filter_map(|k| serde_json::from_value(k.clone()).ok()).collect())
     }
 
     /// Delete the key with `hash` (irreversible — the runtime key stops working).
     pub async fn delete_key(&self, hash: &str) -> Result<()> {
-        let resp = self.auth(self.client.delete(format!("{BASE}/{hash}"))).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(Error::provider_http(status, &body, "openrouter delete key"));
-        }
-        Ok(())
+        send_ok(self.auth(self.client.delete(format!("{}/{hash}", self.base))), "openrouter delete key").await
     }
 
     /// Find an existing key by exact `name` (latest match), or `None`.
@@ -132,13 +136,13 @@ impl OpenRouter {
     /// provisioning API's documented update; secret, limit and usage are untouched). How a
     /// machine's key follows a `pods rename`: rotate/revoke find keys by name.
     pub async fn rename_key(&self, hash: &str, new_name: &str) -> Result<()> {
-        let resp = self.auth(self.client.patch(format!("{BASE}/{hash}"))).json(&rename_body(new_name)).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(Error::provider_http(status, &body, "openrouter rename key"));
-        }
-        Ok(())
+        // Status only ([`send_ok`]): a rename that worked is never reported as failed
+        // because of its (unused) body.
+        send_ok(
+            self.auth(self.client.patch(format!("{}/{hash}", self.base))).json(&rename_body(new_name)),
+            "openrouter rename key",
+        )
+        .await
     }
 }
 
@@ -213,6 +217,69 @@ mod tests {
         assert_eq!(key_name("arena8", &cands, "arena8-nova"), "arena8-nova");
         // absolute machine keeps its bare label (matches the pod name)
         assert_eq!(key_name("arena8", &cands, "james-gpu"), "james-gpu");
+    }
+
+    /// Status first, then decode: a bad provisioning key's 401 is `Auth` whatever its body;
+    /// a 2xx create whose body can't be parsed says the key may exist — without quoting the
+    /// body, which would carry the secret.
+    #[tokio::test]
+    async fn error_statuses_are_classified_and_a_bad_create_body_is_never_echoed() {
+        use crate::error::ProviderErrorKind as K;
+        use crate::http::test_server::{canned, client, serve};
+        let srv = serve(vec![
+            canned(401, "text/html", "<html>Unauthorized</html>"),
+            canned(200, "application/json", r#"{"key":"sk-or-v1-SECRET","data":{"hash":"h"#), // truncated JSON
+            canned(200, "application/json", r#"{"key":"sk-or-v1-SECRET2","data":{"hash":"h2"}}"#),
+            canned(404, "application/json", r#"{"error":{"message":"not found"}}"#),
+        ]);
+        let or = OpenRouter { provisioning_key: "BOGUS".into(), client: client(), base: srv.base.clone() };
+        let e = or.list_keys().await.unwrap_err();
+        assert_eq!(e.kind(), Some(K::Auth), "{e}");
+        let e = or.create_key("devtest-apple", None).await.unwrap_err().to_string();
+        assert!(e.contains("may have been created") && !e.contains("SECRET"), "{e}");
+        let k = or.create_key("devtest-apple", Some(5.0)).await.unwrap();
+        assert_eq!((k.secret.as_str(), k.hash.as_str()), ("sk-or-v1-SECRET2", "h2"));
+        let e = or.delete_key("h2").await.unwrap_err();
+        assert!(e.to_string().contains("openrouter delete key HTTP 404"), "{e}");
+    }
+
+    /// The merged listing and rename on the wire: every page is read status-first (lane F)
+    /// with `include_disabled` and the running `offset` (lane E's pagination); a failing
+    /// later page fails the whole listing, classified by its status; a rename is a
+    /// status-only `PATCH` (a 2xx is success whatever its body).
+    #[tokio::test]
+    async fn paged_listing_and_rename_read_the_status_first() {
+        use crate::error::ProviderErrorKind as K;
+        use crate::http::test_server::{canned, client, serve};
+        let json = "application/json";
+        let srv = serve(vec![
+            canned(200, json, r#"{"data":[{"hash":"a","name":"devtest-apple"},{"hash":"b","name":"devtest-bloom","disabled":true}]}"#),
+            canned(200, json, r#"{"data":[]}"#),
+            canned(200, json, r#"{"data":[{"hash":"a"}]}"#),
+            canned(401, "text/html", "<html>Unauthorized</html>"),
+            canned(200, "text/plain", "ok (not json)"),
+            canned(403, "text/plain", "Forbidden"),
+        ]);
+        let or = OpenRouter { provisioning_key: "K".into(), client: client(), base: srv.base.clone() };
+        let keys = or.list_keys().await.unwrap();
+        assert_eq!(keys.iter().map(|k| (k.hash.as_str(), k.disabled)).collect::<Vec<_>>(), [("a", false), ("b", true)]);
+        let e = or.list_keys().await.unwrap_err();
+        assert_eq!(e.kind(), Some(K::Auth), "a failed later page fails the listing: {e}");
+        or.rename_key("a", "devtest-cloud").await.unwrap();
+        let e = or.rename_key("a", "devtest-cloud").await.unwrap_err();
+        assert_eq!(e.kind(), Some(K::Auth), "{e}");
+        assert!(e.to_string().contains("openrouter rename key HTTP 403"), "{e}");
+        assert_eq!(
+            *srv.requests.lock().unwrap(),
+            [
+                "GET /?include_disabled=true&offset=0 HTTP/1.1",
+                "GET /?include_disabled=true&offset=2 HTTP/1.1",
+                "GET /?include_disabled=true&offset=0 HTTP/1.1",
+                "GET /?include_disabled=true&offset=1 HTTP/1.1",
+                "PATCH /a HTTP/1.1",
+                "PATCH /a HTTP/1.1",
+            ]
+        );
     }
 
     #[test]

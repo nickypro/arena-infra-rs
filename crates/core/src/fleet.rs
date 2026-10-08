@@ -7,7 +7,7 @@
 
 use crate::metrics::normalize_gpu_name;
 use crate::pod::{Maintenance, Pod};
-use crate::status::short_status;
+use crate::status::{bills_hourly, short_status};
 use crate::table::{self, Align};
 
 /// The billing currency symbol for a provider. Hetzner bills in EUR; RunPod and Vast in
@@ -55,11 +55,15 @@ pub fn gpu_label(pod: &Pod) -> String {
     }
 }
 
-/// The $/H column: the pod's hourly price in its provider's currency, or `-` if unknown.
+/// The $/H column: the pod's hourly price in its provider's currency — `-` if unknown, or
+/// if the pod isn't billing ([`bills_hourly`]): a stopped RunPod pod still reports its
+/// GPU's rate (live: an EXITED v2 pod showed `$0.13`), which read as if it were costing
+/// that. `pods list --json` keeps the raw `cost_per_hr`.
 pub fn price_label(pod: &Pod) -> String {
-    pod.cost_per_hr
-        .map(|c| fmt_money(currency_symbol(&pod.provider), c))
-        .unwrap_or_else(|| "-".to_string())
+    match pod.cost_per_hr {
+        Some(c) if bills_hourly(&pod.provider, &pod.status) => fmt_money(currency_symbol(&pod.provider), c),
+        _ => "-".to_string(),
+    }
 }
 
 /// The ENDPOINT column: the pod's current direct SSH endpoint `ip:port`. An IP without a
@@ -166,23 +170,24 @@ pub fn maintenance_label(m: Option<&Maintenance>) -> String {
     out
 }
 
-/// What the fleet is costing right now. Only pods whose status is `RUNNING` count (that's
-/// what bills GPU time; a stopped RunPod pod only bills storage, which `costPerHr` doesn't
-/// describe). Hetzner's EUR is kept apart from the USD providers rather than summed with a
-/// made-up exchange rate.
+/// What the fleet is costing right now. Only billing pods count ([`bills_hourly`]: up or
+/// coming up — not just `RUNNING`, since RunPod v2 bills `PROVISIONING`/`STARTING` pods too
+/// — plus every existing Hetzner server); a stopped RunPod pod only bills storage, which
+/// `costPerHr` doesn't describe. Hetzner's EUR is kept apart from the USD providers rather
+/// than summed with a made-up exchange rate.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct FleetCost {
-    /// Σ $/h over RUNNING pods on USD providers (RunPod, Vast).
+    /// Σ $/h over billing pods on USD providers (RunPod, Vast).
     pub usd_per_hr: f64,
-    /// Σ €/h over RUNNING Hetzner servers.
+    /// Σ €/h over billing Hetzner servers.
     pub eur_per_hr: f64,
-    /// RUNNING pods, priced or not.
-    pub running: usize,
-    /// RUNNING pods with a USD price.
+    /// Billing pods, priced or not.
+    pub billing: usize,
+    /// Billing pods with a USD price.
     pub priced_usd: usize,
-    /// RUNNING pods with a EUR price.
+    /// Billing pods with a EUR price.
     pub priced_eur: usize,
-    /// RUNNING pods whose provider reported no price — the totals undercount by these.
+    /// Billing pods whose provider reported no price — the totals undercount by these.
     pub unpriced: usize,
 }
 
@@ -192,11 +197,11 @@ impl FleetCost {
     }
 }
 
-/// Sum the hourly cost of the RUNNING pods (see [`FleetCost`]).
+/// Sum the hourly cost of the billing pods (see [`FleetCost`]).
 pub fn fleet_cost(pods: &[Pod]) -> FleetCost {
     let mut c = FleetCost::default();
-    for p in pods.iter().filter(|p| p.status.eq_ignore_ascii_case("RUNNING")) {
-        c.running += 1;
+    for p in pods.iter().filter(|p| bills_hourly(&p.provider, &p.status)) {
+        c.billing += 1;
         match p.cost_per_hr {
             Some(v) if currency_symbol(&p.provider) == "€" => {
                 c.eur_per_hr += v;
@@ -213,10 +218,10 @@ pub fn fleet_cost(pods: &[Pod]) -> FleetCost {
 }
 
 /// The one-line footer under `pods list`, e.g.
-/// `fleet: $0.51/h across 3 running pod(s) + €0.006/h hetzner (1 unpriced)`.
+/// `fleet: $0.51/h across 3 billing pod(s) + €0.006/h hetzner (1 unpriced)`.
 /// The `(N unpriced)` note makes it obvious when the total is a lower bound.
 pub fn fleet_footer(c: &FleetCost) -> String {
-    let mut out = format!("fleet: {}/h across {} running pod(s)", fmt_money("$", c.usd_per_hr), c.running);
+    let mut out = format!("fleet: {}/h across {} billing pod(s)", fmt_money("$", c.usd_per_hr), c.billing);
     if c.priced_eur > 0 {
         out.push_str(&format!(" + {}/h hetzner", fmt_money("€", c.eur_per_hr)));
     }
@@ -364,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn fleet_cost_counts_running_only_and_splits_currency() {
+    fn fleet_cost_counts_billing_pods_only_and_splits_currency() {
         let priced = |mut p: Pod, c: f64| {
             p.cost_per_hr = Some(c);
             p
@@ -375,20 +380,50 @@ mod tests {
             priced(pod("c", "runpod", "EXITED"), 0.50), // stopped: not billed per hour
             priced(pod("d", "hetzner", "RUNNING"), 0.0056),
             pod("e", "runpod", "RUNNING"), // no price reported
+            priced(pod("f", "runpod", "STARTING"), 0.13), // v2: booting already bills
+            priced(pod("g", "runpod", "PROVISIONING"), 0.20),
+            priced(pod("h", "hetzner", "OFF"), 0.0056), // hetzner bills a powered-off server
+            priced(pod("i", "vast", "STOPPED"), 0.40),
         ];
         let c = fleet_cost(&pods);
-        assert!((c.usd_per_hr - 0.33).abs() < 1e-9, "{c:?}");
-        assert!((c.eur_per_hr - 0.0056).abs() < 1e-9);
-        assert_eq!((c.running, c.priced_usd, c.priced_eur, c.unpriced), (4, 2, 1, 1));
-        assert_eq!(c.priced(), 3);
-        assert_eq!(fleet_footer(&c), "fleet: $0.33/h across 4 running pod(s) + €0.006/h hetzner (1 unpriced)");
+        assert!((c.usd_per_hr - 0.66).abs() < 1e-9, "{c:?}");
+        assert!((c.eur_per_hr - 0.0112).abs() < 1e-9);
+        assert_eq!((c.billing, c.priced_usd, c.priced_eur, c.unpriced), (7, 4, 2, 1));
+        assert_eq!(c.priced(), 6);
+        assert_eq!(fleet_footer(&c), "fleet: $0.66/h across 7 billing pod(s) + €0.011/h hetzner (1 unpriced)");
+    }
+
+    /// Live finding: an EXITED v2 pod showed `$0.13` in the $/H column (the total was
+    /// right). A non-billing pod's price reads `-`; the raw cost stays on the pod (JSON).
+    #[test]
+    fn price_label_is_a_dash_for_non_billing_pods() {
+        let priced = |provider: &str, status: &str| {
+            let mut p = pod("x", provider, status);
+            p.cost_per_hr = Some(0.13);
+            p
+        };
+        for (provider, status, want) in [
+            ("runpod", "RUNNING", "$0.13"),
+            ("runpod", "STARTING", "$0.13"),
+            ("runpod", "PROVISIONING", "$0.13"),
+            ("runpod", "EXITED", "-"),
+            ("runpod", "TERMINATED", "-"),
+            ("vast", "STOPPED", "-"),
+            ("vast", "LOADING", "$0.13"),
+            ("hetzner", "OFF", "€0.13"),
+            ("hetzner", "INITIALIZING", "€0.13"),
+        ] {
+            let p = priced(provider, status);
+            assert_eq!(price_label(&p), want, "{provider} {status}");
+            assert_eq!(p.cost_per_hr, Some(0.13));
+        }
     }
 
     #[test]
     fn fleet_footer_plain_and_empty() {
-        let c = FleetCost { usd_per_hr: 2.5, running: 3, priced_usd: 3, ..Default::default() };
-        assert_eq!(fleet_footer(&c), "fleet: $2.50/h across 3 running pod(s)");
-        assert_eq!(fleet_footer(&fleet_cost(&[])), "fleet: $0.00/h across 0 running pod(s)");
+        let c = FleetCost { usd_per_hr: 2.5, billing: 3, priced_usd: 3, ..Default::default() };
+        assert_eq!(fleet_footer(&c), "fleet: $2.50/h across 3 billing pod(s)");
+        assert_eq!(fleet_footer(&fleet_cost(&[])), "fleet: $0.00/h across 0 billing pod(s)");
     }
 
     /// Snapshot of the whole `pods list` table + footer for a mixed fleet, so a column
@@ -437,9 +472,9 @@ mod tests {
         let want = "\
 NAME             PROVIDER  ID        STATUS  GPU             $/H  ENDPOINT       MAINT
 devtest-apple    runpod    abc123    run     1×RTX A4000   $0.17  1.2.3.4:10022  maint 10-09 02:00→06:00 UTC
-devtest-bloom    runpod    def456    exit    2×GPU         $0.34  -              -
+devtest-bloom    runpod    def456    exit    2×GPU             -  -              -
 devtest-flutter  hetzner   51234567  run     cx23         €0.006  5.6.7.8:22     -
-fleet: $0.17/h across 2 running pod(s) + €0.006/h hetzner
+fleet: $0.17/h across 2 billing pod(s) + €0.006/h hetzner
 ";
         assert_eq!(out, want, "\n--- got ---\n{out}");
     }

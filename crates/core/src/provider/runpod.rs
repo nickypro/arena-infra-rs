@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 
 use super::Provider;
 use crate::error::{Error, ProviderErrorKind, Result};
+use crate::http::{send_json, send_ok};
 use crate::pod::{Maintenance, Pod, PodSpec};
 
 const BASE: &str = "https://rest.runpod.io/v1";
@@ -31,19 +32,12 @@ fn graphql_request(client: &Client, api_key: &str, body: &Value) -> RequestBuild
     client.post(GRAPHQL).bearer_auth(api_key).json(body)
 }
 
-/// POST one GraphQL request and return the decoded body. Checks only the HTTP status: a
-/// GraphQL error still comes back as HTTP 200, and whether `errors` is fatal depends on
-/// the caller (a mutation must fail on any; a read query can use partial `data`) — see
-/// [`graphql_errors`].
+/// POST one GraphQL request and return the decoded body. Checks only the HTTP status
+/// (first, before decoding — see [`crate::http`]): a GraphQL error still comes back as HTTP
+/// 200, and whether `errors` is fatal depends on the caller (a mutation must fail on any; a
+/// read query can use partial `data`) — see [`graphql_errors`].
 async fn graphql(client: &Client, api_key: &str, body: &Value, ctx: &str) -> Result<Value> {
-    let resp = graphql_request(client, api_key, body).send().await?;
-    let status = resp.status();
-    if !status.is_success() {
-        // An error body may not be JSON (proxy HTML on a 502) — keep the status either way.
-        let v: Value = resp.json().await.unwrap_or(Value::Null);
-        return Err(Error::provider_http(status, &v, ctx));
-    }
-    Ok(resp.json().await?)
+    send_json(graphql_request(client, api_key, body), ctx).await
 }
 
 /// The GraphQL-level errors in a response, as one message (`None` when there are none —
@@ -65,6 +59,8 @@ fn graphql_errors(v: &Value) -> Option<String> {
 pub struct RunpodProvider {
     api_key: String,
     client: Client,
+    /// The REST base URL: [`BASE`], or a loopback test server (see `with_base`).
+    base: String,
 }
 
 impl RunpodProvider {
@@ -72,7 +68,15 @@ impl RunpodProvider {
         Self {
             api_key: api_key.into(),
             client: Client::new(),
+            base: BASE.to_string(),
         }
+    }
+
+    /// Point the REST calls at `base` with `client` — tests only, so the real
+    /// request/response path runs against a loopback server.
+    #[cfg(test)]
+    fn with_base(api_key: &str, base: &str, client: Client) -> Self {
+        Self { api_key: api_key.into(), client, base: base.to_string() }
     }
 
     fn auth(&self, rb: RequestBuilder) -> RequestBuilder {
@@ -188,12 +192,9 @@ impl Provider for RunpodProvider {
     }
 
     async fn list_pods(&self) -> Result<Vec<Pod>> {
-        let resp = self.auth(self.client.get(format!("{BASE}/pods"))).send().await?;
-        let status = resp.status();
-        let body: Value = resp.json().await?;
-        if !status.is_success() {
-            return Err(Error::provider_http(status, &body, "list pods"));
-        }
+        // Status first, then decode (crate::http): a bad key's 401 must read as Auth, not
+        // as "error decoding response body".
+        let body = send_json(self.auth(self.client.get(format!("{}/pods", self.base))), "list pods").await?;
         Ok(pods_array(&body)?.iter().map(parse_pod).collect())
     }
 
@@ -203,29 +204,13 @@ impl Provider for RunpodProvider {
 
     async fn create_pod(&self, spec: &PodSpec) -> Result<Pod> {
         let payload = create_payload(spec);
-        let resp = self
-            .auth(self.client.post(format!("{BASE}/pods")).json(&payload))
-            .send()
-            .await?;
-        let status = resp.status();
-        let body: Value = resp.json().await?;
-        if !status.is_success() {
-            return Err(Error::provider_http(status, &body, "create pod"));
-        }
+        let rb = self.auth(self.client.post(format!("{}/pods", self.base)).json(&payload));
+        let body = send_json(rb, "create pod").await?;
         Ok(parse_pod(&body))
     }
 
     async fn stop_pod(&self, id: &str) -> Result<()> {
-        let resp = self
-            .auth(self.client.post(format!("{BASE}/pods/{id}/stop")))
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body: Value = resp.json().await.unwrap_or(Value::Null);
-            return Err(Error::provider_http(status, &body, "stop pod"));
-        }
-        Ok(())
+        send_ok(self.auth(self.client.post(format!("{}/pods/{id}/stop", self.base))), "stop pod").await
     }
 
     fn restart_wipes_container_disk(&self, _pod: &Pod) -> bool {
@@ -238,29 +223,11 @@ impl Provider for RunpodProvider {
         // container disk: the container is reset to its image, so everything outside a
         // volume is wiped (RunPod documents the container disk as ephemeral; the same
         // action on v2 was live-verified to drop ~/.name and setup's git remote).
-        let resp = self
-            .auth(self.client.post(format!("{BASE}/pods/{id}/restart")))
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body: Value = resp.json().await.unwrap_or(Value::Null);
-            return Err(Error::provider_http(status, &body, "restart pod"));
-        }
-        Ok(())
+        send_ok(self.auth(self.client.post(format!("{}/pods/{id}/restart", self.base))), "restart pod").await
     }
 
     async fn terminate_pod(&self, id: &str) -> Result<()> {
-        let resp = self
-            .auth(self.client.delete(format!("{BASE}/pods/{id}")))
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body: Value = resp.json().await.unwrap_or(Value::Null);
-            return Err(Error::provider_http(status, &body, "terminate pod"));
-        }
-        Ok(())
+        send_ok(self.auth(self.client.delete(format!("{}/pods/{id}", self.base))), "terminate pod").await
     }
 
     async fn rename_pod(&self, id: &str, new_name: &str) -> Result<()> {
@@ -271,22 +238,11 @@ impl Provider for RunpodProvider {
         // REST `PATCH /pods/{id}` resets the container (see `rename_pod`): exactly what a
         // reimage wants. `env` replaces the pod's env wholesale, so pass everything to keep.
         let body = reimage_payload(image, env);
-        let resp = self.auth(self.client.patch(format!("{BASE}/pods/{id}"))).json(&body).send().await?;
-        let status = resp.status();
-        let v: Value = resp.json().await.unwrap_or(Value::Null);
-        if !status.is_success() {
-            return Err(Error::provider_http(status, &v, "reimage pod"));
-        }
-        Ok(())
+        send_ok(self.auth(self.client.patch(format!("{}/pods/{id}", self.base))).json(&body), "reimage pod").await
     }
 
     async fn pod_spec(&self, id: &str) -> Result<PodSpec> {
-        let resp = self.auth(self.client.get(format!("{BASE}/pods/{id}"))).send().await?;
-        let status = resp.status();
-        let body: Value = resp.json().await?;
-        if !status.is_success() {
-            return Err(Error::provider_http(status, &body, "get pod"));
-        }
+        let body = send_json(self.auth(self.client.get(format!("{}/pods/{id}", self.base))), "get pod").await?;
         Ok(parse_spec(&body))
     }
 }
@@ -658,12 +614,7 @@ pub async fn fetch_gpu_types(api_key: &str) -> Result<Vec<GpuType>> {
 /// one of …"). `arena gpus` intersects with this so it only advertises creatable types.
 pub async fn fetch_creatable_gpu_ids(api_key: &str) -> Result<Vec<String>> {
     let client = Client::new();
-    let resp = client.get(format!("{BASE}/openapi.json")).bearer_auth(api_key).send().await?;
-    let status = resp.status();
-    let spec: Value = resp.json().await?;
-    if !status.is_success() {
-        return Err(Error::provider_http(status, &spec, "fetch openapi"));
-    }
+    let spec = send_json(client.get(format!("{BASE}/openapi.json")).bearer_auth(api_key), "fetch openapi").await?;
     Ok(extract_gpu_enum(&spec))
 }
 
@@ -703,6 +654,53 @@ mod tests {
         assert_eq!(pods_array(&top).unwrap().len(), 1);
         let wrapped = json!({"pods": []});
         assert!(pods_array(&wrapped).unwrap().is_empty()); // a real, empty fleet is fine
+    }
+
+    /// Live repro (2026-10-07): a bogus key made `list_pods` fail with "http error: error
+    /// decoding response body" — the body was decoded before the status was looked at, so
+    /// the 401 was lost and the error wasn't `Auth`. Every v1 REST call, against a loopback
+    /// server: an error status is classified by status whatever the body is.
+    #[tokio::test]
+    async fn v1_rest_calls_classify_error_statuses_before_decoding() {
+        use crate::http::test_server::{canned, client, serve};
+        use ProviderErrorKind as K;
+        let srv = serve(vec![
+            canned(401, "text/plain", "Unauthorized"),
+            canned(403, "text/html", "<html>Forbidden</html>"),
+            canned(500, "application/json", r#"{"error":"create pod: There are no instances currently available"}"#),
+            canned(502, "text/html", "<html>Bad Gateway</html>"),
+            canned(404, "text/plain", "pod not found"),
+            canned(200, "application/json", r#"[{"id":"p1","name":"devtest-apple","desiredStatus":"RUNNING"}]"#),
+            canned(200, "text/plain", ""), // a stop that worked, with an empty/odd body
+        ]);
+        let p = RunpodProvider::with_base("rpa_BOGUS", &srv.base, client());
+        let e = p.list_pods().await.unwrap_err();
+        assert_eq!(e.kind(), Some(K::Auth), "{e}");
+        assert!(e.to_string().contains("list pods HTTP 401") && !e.to_string().contains("decoding"), "{e}");
+        let e = p.pod_spec("p1").await.unwrap_err();
+        assert_eq!(e.kind(), Some(K::Auth), "{e}");
+        let e = p.create_pod(&spec()).await.unwrap_err();
+        assert_eq!(e.kind(), Some(K::Capacity), "{e}");
+        let e = p.stop_pod("p1").await.unwrap_err();
+        assert_eq!(e.kind(), Some(K::Transient), "{e}");
+        let e = p.terminate_pod("p1").await.unwrap_err();
+        assert!(e.to_string().contains("terminate pod HTTP 404") && e.to_string().contains("pod not found"), "{e}");
+        let pods = p.list_pods().await.unwrap();
+        assert_eq!((pods[0].id.as_str(), pods[0].status.as_str()), ("p1", "RUNNING"));
+        p.stop_pod("p1").await.unwrap();
+        let seen = srv.requests.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            [
+                "GET /pods HTTP/1.1",
+                "GET /pods/p1 HTTP/1.1",
+                "POST /pods HTTP/1.1",
+                "POST /pods/p1/stop HTTP/1.1",
+                "DELETE /pods/p1 HTTP/1.1",
+                "GET /pods HTTP/1.1",
+                "POST /pods/p1/stop HTTP/1.1",
+            ]
+        );
     }
 
     #[test]

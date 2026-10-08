@@ -37,6 +37,7 @@ use serde_json::{json, Map, Value};
 use super::runpod::{self, loose_f64, loose_string, GpuType};
 use super::Provider;
 use crate::error::{Error, ProviderErrorKind, Result};
+use crate::http::{judge, send_json, send_ok};
 use crate::pod::{Pod, PodSpec};
 
 const BASE: &str = "https://api.runpod.io/v2";
@@ -143,39 +144,15 @@ fn catalog_request(client: &Client, api_key: &str, cloud: &str) -> RequestBuilde
         .query(&[("include", "AVAILABILITY"), ("product", "POD"), ("cloud", cloud)])
 }
 
-/// Send a request and [`judge`] its response.
+/// Send a request and [`judge`] its response (status first, then the body — shared with
+/// every backend in [`crate::http`]). For v2 that means: a 2xx with an empty body (`204`,
+/// terminate) is `Null`; a non-JSON 2xx is an `Other` error; any other status goes through
+/// [`Error::provider_http`] — 401/403 auth, 429 rate-limited, capacity sniffed from the
+/// message (v2 reports "no capacity" as a 400 whose only signal is the human-readable
+/// `detail`), other 5xx transient. Error bodies are problem+json (`{title, status, detail,
+/// errors}`); a proxy's HTML 502 isn't, so a non-JSON body is kept as raw text.
 async fn send(rb: RequestBuilder, ctx: &str) -> Result<Value> {
-    let resp = rb.send().await?;
-    let status = resp.status();
-    let text = resp.text().await?;
-    judge(status, &text, ctx)
-}
-
-/// Turn one response (status + raw body) into its JSON body or a classified error. Pure,
-/// so the status handling is table-tested.
-///
-/// - 2xx with an empty body (`204 No Content`: terminate) → `Null`.
-/// - 2xx with a body that isn't JSON → an `Other` error (not retried — a decode error
-///   would just fail again).
-/// - Anything else → [`Error::provider_http`], which classifies it: 401/403 auth, 429
-///   rate-limited, capacity sniffed from the message (v2 reports "no capacity" as a 400
-///   whose only signal is the human-readable `detail`), other 5xx transient. Error bodies
-///   are problem+json (`{title, status, detail, errors}`); a proxy's HTML 502 isn't, so a
-///   non-JSON body is kept as raw text (truncated by `provider_http`).
-fn judge(status: StatusCode, text: &str, ctx: &str) -> Result<Value> {
-    if status.is_success() {
-        if text.trim().is_empty() {
-            return Ok(Value::Null);
-        }
-        return serde_json::from_str(text).map_err(|e| {
-            let raw: String = text.chars().take(120).collect();
-            Error::provider(format!("{ctx}: HTTP {status} with a body that isn't JSON ({e}): {raw}"))
-        });
-    }
-    match serde_json::from_str::<Value>(text) {
-        Ok(v) => Err(Error::provider_http(status, &v, ctx)),
-        Err(_) => Err(Error::provider_http(status, &text, ctx)),
-    }
+    send_json(rb, ctx).await
 }
 
 /// [`judge`] for `POST /v2/pods`, whose error table gives 403 a meaning of its own: "Your
@@ -527,11 +504,17 @@ impl Provider for RunpodV2Provider {
         let payload = create_payload(spec, &keys)?;
         let resp = api_request(&self.client, &self.api_key, Method::POST, base_url("pods")).json(&payload).send().await?;
         let status = resp.status();
-        let text = resp.text().await?;
         // A 2xx we can't read still means a pod (that bills) probably exists: say so, so
         // nobody "retries" into a duplicate. Such errors are `Other`, which isn't retried.
         let may_exist = |e: Error| {
             Error::provider(format!("{e} — the pod may have been created: check `arena pods list` before retrying"))
+        };
+        // Status first: an error response's body is read best-effort, so its status
+        // (and with it the classification) survives a body that can't be read.
+        let text = if status.is_success() {
+            resp.text().await.map_err(|e| may_exist(Error::from(e)))?
+        } else {
+            resp.text().await.unwrap_or_default()
         };
         let body = judge_create(status, &text).map_err(|e| if status.is_success() { may_exist(e) } else { e })?;
         let pod = parse_pod(&body);
@@ -541,9 +524,11 @@ impl Provider for RunpodV2Provider {
         Ok(pod)
     }
 
+    // The mutating calls below don't use their success body, so only the status is
+    // judged (`send_ok`): one that worked is never reported as failed over its body.
     async fn stop_pod(&self, id: &str) -> Result<()> {
         let rb = api_request(&self.client, &self.api_key, Method::POST, pod_url(id, Some("action"))?);
-        send(rb.json(&action_body("stop")), "stop pod").await.map(drop)
+        send_ok(rb.json(&action_body("stop")), "stop pod").await
     }
 
     fn restart_wipes_container_disk(&self, _pod: &Pod) -> bool {
@@ -556,14 +541,14 @@ impl Provider for RunpodV2Provider {
         // to its image: everything outside a volume is WIPED (live-verified on a sandbox
         // pod — a marker file, ~/.name and setup's git remote were all gone afterwards).
         let rb = api_request(&self.client, &self.api_key, Method::POST, pod_url(id, Some("action"))?);
-        send(rb.json(&action_body("restart")), "restart pod").await.map(drop)
+        send_ok(rb.json(&action_body("restart")), "restart pod").await
     }
 
     async fn terminate_pod(&self, id: &str) -> Result<()> {
         // `DELETE /v2/pods/{id}` (documented as equivalent to the `terminate` action):
-        // 204 with no body, which `judge` reads as Null; a 200 with a body is fine too.
+        // 204 with no body; a 200 with a body is fine too.
         let rb = api_request(&self.client, &self.api_key, Method::DELETE, pod_url(id, None)?);
-        send(rb, "terminate pod").await.map(drop)
+        send_ok(rb, "terminate pod").await
     }
 
     async fn rename_pod(&self, id: &str, new_name: &str) -> Result<()> {
@@ -574,7 +559,7 @@ impl Provider for RunpodV2Provider {
         let url = pod_url(id, None)?;
         let keys = self.keys_to_merge(env).await?;
         let rb = api_request(&self.client, &self.api_key, Method::PATCH, url).json(&reimage_payload(image, env, &keys));
-        send(rb, "reimage pod").await.map(drop)
+        send_ok(rb, "reimage pod").await
     }
 
     async fn pod_spec(&self, id: &str) -> Result<PodSpec> {

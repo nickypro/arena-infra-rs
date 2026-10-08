@@ -25,6 +25,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `ssh.direct` only; create always sends `cloud` (v2 defaults to SECURE) and merges the
     account's registered SSH keys into `PUBLIC_KEY` (v2 skips them when it's set);
     `replace` recovers GPU type + cloud tier. Rename and maintenance still use GraphQL.
+    Neither API reports a pod's CUDA constraint, so `replace`/`migrate copy` re-apply the
+    configured `ALLOWED_CUDA_VERSIONS` to the replacement (as `create` does).
   - `provider::vast` — Vast.ai REST backend against the same trait. Vast rents
     *offers* rather than named pods, so `create_pod` searches the marketplace for
     the cheapest rentable offer matching the spec (GPU type/count, disk) and rents
@@ -59,8 +61,12 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `list` shows NAME PROVIDER ID STATUS GPU (`count×type`) $/H ENDPOINT MAINT (the
     host's RunPod maintenance window, e.g. `maint 10-09 02:00→06:00 UTC`; the host's
     free-text note is flattened onto one line) and a footer
-    `fleet: $X/h across N running pod(s)` summing RUNNING pods (Hetzner's € shown
-    separately, unpriced pods counted). GPU/$/maintenance come from one extra read-only
+    `fleet: $X/h across N billing pod(s)` summing the **billing** pods (Hetzner's € shown
+    separately, unpriced pods counted). "Billing" is one rule (`status::is_billing`):
+    running or on its way up — RunPod v2 `PROVISIONING`/`STARTING`/`ERROR` too, Hetzner
+    `initializing`, Vast `loading` — not `EXITED`/`STOPPED`/`TERMINATED`/`off`; a Hetzner
+    server bills while it exists, powered off included. A non-billing pod's `$/H` shows `-`
+    (`--json` keeps the raw `cost_per_hr`). GPU/$/maintenance come from one extra read-only
     RunPod GraphQL query per `list` (best-effort: if it fails you get one warning line and
     the list still renders); the `nvidia-smi` probe over SSH (default for the table,
     `--probe`/`--no-probe`) overrides the GPU when a pod answers. `list --json` emits the
@@ -83,8 +89,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     only for pods that actually terminated, and never for a name another pod still holds (a
     double create's twin removed by id keeps the survivor's key); a failed revoke keeps the
     row, is named, and makes the exit non-zero without stopping any terminate.
-    `stop apple..mayor` / `stop --all --exclude bloom` stops many at once (running
-    pods only; needs targets or `--all`); `kill` is the stop→wait-for-
+    `stop apple..mayor` / `stop --all --exclude bloom` stops many at once (needs targets or
+    `--all`): every selected pod in a billing state (running *or* starting/provisioning) is
+    stopped, others are skipped with a note; `kill` is the stop→wait-for-
     EXITED→delete flow (`--timeout`; one target or `--all`).
   - `rename <old> <new>` / `rename --from-prefix <p>` renames the pod (metadata only, no
     restart) and then brings along what's keyed by the name: rewrites `~/.name` over SSH
@@ -104,7 +111,15 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     topping up to the target** while capacity is short — one round per interval for up
     to M minutes, **Ctrl+C** stops early keeping what was made. A `no instances
     available` capacity error is recognized as such (it waits), not treated as fatal.
+    A round starts only while it still fits in the window (no create after it closes).
     The confirm prompt lists the exact pod names about to be created.
+  - **`--gpu` is checked** (`create`/`up`/`offers`/`replace`/`migrate copy`, RunPod only):
+    each token — an alias (`3070`, `4080super`, `L4`, `2000ada`, `A4500`, …), an exact id
+    (any case) or a unique catalog short name (`RTX 3070`, `H100 SXM`) — must be in RunPod's
+    live GPU catalog, else the command stops before anything is created: ``--gpu: `3070x`
+    isn't a RunPod GPU type — did you mean `NVIDIA GeForce RTX 3070` (RTX 3070)?``. If the
+    catalog can't be fetched it warns and passes the flag through unchecked. Vast/Hetzner:
+    passed through as before.
   - **Multi-option placement** (`create`/`up`): `--gpu A4000,4000Ada,3090 --cloud
     community,secure --max-price 0.5 [--order cheapest|listed]`. The gpu × cloud options
     are priced (RunPod's live catalog — v2 `/catalog/gpus` per tier on `RUNPOD_API=v2`, else
@@ -130,21 +145,46 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
   - `offers [--gpu …] [--cloud …] [--max-price …] [--gpus N] [--order …] [--json]` —
     read-only: the same option table (OPTION, CLOUD, $/H/POD, PRICE source, STOCK, plus what
     the cap dropped and why), i.e. what `create`/`up` would try. `--json` = the plan.
-  - `pods up -n N` — one-command spin-up: create, poll until each pod has an SSH
-    endpoint, then **wire the proxy**: if nginx is set up on the proxy host (or the proxy
-    is write-only) it deploys as endpoints appear, and ends with the same one-line sync
-    as the other lifecycle commands (below) — or a note saying why it skipped.
-    `--setup` also provisions each pod over SSH. So `pods up -n 28 --gpu A40 --cloud
-    SECURE --disk 200 --retry-mins 60 --setup` is a full start-of-iteration spin-up that
-    waits for capacity then wires everything. Confirms first (`--dry-run` previews);
-    `--no-wait` skips polling.
+  - `pods up -n N` — one-command spin-up: create, then **one independent pipeline per
+    pod** (never a batch): wait for *its* SSH endpoint and sshd answering (`--timeout`,
+    default 600s, per pod)
+    → sync the proxy (one writer at a time) → provision it (`--no-setup` skips) →
+    [`--check`: deep check] → copy its API keys (when `keys/*_api_keys.csv` exist) →
+    `[name] READY after 4m10s — …` or `[name] FAILED <stage>: …`, printed the moment that
+    pod is done — a slow pod never holds up another. One fleet listing per `--interval`
+    serves every pod's endpoint wait. Ends with the usual one-line proxy sync and a `NAME
+    GPU $/H PROXY PORT HEALTH STATUS READY AFTER` table (READY AFTER = first create →
+    confirmed ready, replacements included: start participants' clocks at READY), plus a
+    line per name that failed, warned or was replaced — a requested name that got no pod is
+    a `FAILED create` row; exits non-zero unless every requested name is READY (and when
+    nothing was created at all). A pod that fails is left running — one is only ever
+    terminated by `--check`. Without a proxy layout, a READY pod's `~/.ssh/config` fleet map
+    is rewritten at the end if pods came up after it.
+    **`--check`** deep-checks each pod after setup (`pods test --deep`). A FAIL is a bad
+    host: the pod is terminated, confirmed gone from its own provider's listing (never two
+    pods per name), and the name recreated from the same `--gpu/--cloud/--max-price` options
+    (or the one configured spec) — options that haven't failed first, waiting for capacity
+    per `--retry-mins` or `--keep-trying` — and run through the pipeline again; a replacement
+    that lands on a machine IP that already failed (any name's) is rejected unseen and
+    terminated (even with no attempt left). Up to `--check-attempts N` placements per name
+    (default 2); the last pod that FAILed its check is left running for a look. Only a check
+    whose script ran can condemn a host: one that couldn't run (SSH dropped, timed out) is
+    rerun once SSH answers, and if it still can't run the name FAILs with the pod left
+    running. A WARN counts as ready (shown in HEALTH). **Ctrl+C** stops every pipeline where
+    it is, starts nothing new, terminates nothing, and reports — also when pressed during
+    the create's retry wait (the pipelines then start stopped).
+    So `pods up -n 28 --gpu A40 --cloud SECURE --disk 200 --retry-mins 60 --check` is a full
+    start-of-iteration spin-up. Confirms first (`--dry-run` previews the pipeline);
+    `--no-wait` skips everything after the create (not with `--check`).
   - Batch create (`create`/`up`) uses **typed provider errors** (`ProviderErrorKind`):
     on **capacity** exhaustion it stops gracefully and keeps the pods it got (e.g.
     "created 6 of 10") rather than erroring — `--keep-trying` instead waits and
     retries; on **auth** failure it aborts immediately. Already-created pods are
     never rolled back. **Transient** failures (429 / 5xx / connect-timeout) are
     retried automatically with exponential backoff (`retry` module) around create
-    and list calls — so a throttle or blip doesn't fail the command.
+    and list calls — so a throttle or blip doesn't fail the command. Every backend reads a
+    response's **status before its body** (`http` module), so a bad key's `401` with an HTML
+    or empty body is `Auth` (`… HTTP 401 Unauthorized: …`), never "error decoding response body".
   - `proxy plan` — read-only; shows the merge against the current config (`+` added,
     `~` changed — including a kept entry whose port moved with the list —, `-` removed,
     `=` kept-stale, plus a `+N added, ~N changed, …` summary) and prints the nginx
@@ -301,14 +341,15 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     keys** if any
     `keys/*_api_keys.csv` exist (reporting what it added, or that none are set up) — to
     exactly the pods that just provisioned successfully, never one that failed or timed
-    out — so a `setup` (or `up --setup`) makes pods fully ready. Confirms first (`--dry-run` previews,
+    out — so a `setup` (or `up`, per pod) makes pods fully ready. Confirms first (`--dry-run` previews,
     token redacted). Uses `GIT_SSH_KEY_LOCAL/REMOTE`, `ARENA_REPO_OWNER/NAME`, `DEFAULT_BRANCH`.
     The repo update fetches **only the default branch, without tags** (a bare `git fetch`
     would pull every participant's autocommit branch); a tracked non-default branch pulls
     just its own upstream. Pods run in parallel and **every step has a time budget** —
     copies 60s, the image config step 300s, the hetzner bare-VM script 1800s; `--timeout
     <secs>` (or config `SETUP_TIMEOUT_SECS`, 1..86400; `up`/`replace`/`migrate copy` use the
-    config value and reject a bad one *before* creating anything) overrides the
+    config value and reject a bad one — and `up` missing `ARENA_REPO_*` unless `--no-setup`,
+    or with `--check` a bad `MIN_DRIVER_VERSION` — *before* creating anything) overrides the
     main-step budget. A wedged pod prints `✗ <name> (timed out at <step> after Ns)` and the
     others finish normally; a timed-out `ssh`/`scp` is stopped (SIGTERM, so scp also stops
     its ssh transport; SIGKILL 2s later). Connection refusals right after create are still

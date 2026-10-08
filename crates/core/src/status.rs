@@ -28,9 +28,93 @@ pub fn display_status(status: &str, reachable: Option<bool>) -> String {
     short_status(status)
 }
 
+/// Whether a pod in this state holds — and is billed for — its compute: up, on its way up,
+/// or stuck while still allocated. The one definition behind the fleet cost total, the
+/// `$/H` column and `pods stop --all`'s selection, so they can't disagree.
+///
+/// It's more than `RUNNING` because the providers don't all speak v1's `desiredStatus`:
+/// RunPod v2 reports real lifecycle states, and a `PROVISIONING`/`STARTING` pod already
+/// bills (as does `ERROR`: v2's `cost` is 0 only for `EXITED`/`TERMINATED`); Hetzner
+/// reports `initializing`/`starting`, Vast `loading`/`created`, and our own Vast create
+/// says `CREATING`. An allow-list on purpose: `pods stop --all` acts on it, and a state we
+/// don't know must not get a pod stopped (on RunPod a stop resets the container disk).
+/// Stopped/gone states (`EXITED`, `STOPPED`, `TERMINATED`, Hetzner `off`, …) are false.
+pub fn is_billing(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_uppercase().as_str(),
+        "RUNNING"
+            | "STARTING"
+            | "PROVISIONING"
+            | "PENDING"
+            | "CREATING"
+            | "CREATED"
+            | "INITIALIZING"
+            | "LOADING"
+            | "RESTARTING"
+            | "REBUILDING"
+            | "MIGRATING"
+            | "ERROR"
+    )
+}
+
+/// Whether a pod on `provider` is costing its hourly rate right now — what the fleet total
+/// and the `$/H` column count. [`is_billing`], except that Hetzner charges for a server for
+/// as long as it exists, powered off included (its resources stay reserved): an `off`
+/// Hetzner server still costs its full €/h, so leaving it out would understate the bill.
+pub fn bills_hourly(provider: &str, status: &str) -> bool {
+    if provider.eq_ignore_ascii_case("hetzner") {
+        return !matches!(status.trim().to_ascii_uppercase().as_str(), "DELETING" | "TERMINATED");
+    }
+    is_billing(status)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn billing_statuses_table() {
+        // (status as the providers spell it, is_billing)
+        let cases = [
+            ("RUNNING", true),    // v1 desiredStatus / v2 / everyone
+            ("running", true),    // vast/hetzner lowercase
+            ("PROVISIONING", true), // v2: being allocated — already billed
+            ("STARTING", true),   // v2 / hetzner `starting`
+            ("ERROR", true),      // v2: still allocated, `cost` > 0
+            ("CREATING", true),   // our synthesized vast create status
+            ("CREATED", true),
+            ("INITIALIZING", true), // hetzner right after create
+            ("LOADING", true),    // vast pulling the image
+            ("RESTARTING", true),
+            ("PENDING", true),
+            (" Running ", true),
+            ("EXITED", false),    // v1/v2 stopped
+            ("exited", false),
+            ("STOPPED", false),
+            ("TERMINATED", false),
+            ("OFF", false),       // hetzner powered off (see bills_hourly)
+            ("STOPPING", false),
+            ("DELETING", false),
+            ("UNKNOWN", false),   // unparseable: never a stop target
+            ("", false),
+        ];
+        for (status, want) in cases {
+            assert_eq!(is_billing(status), want, "{status:?}");
+        }
+    }
+
+    #[test]
+    fn hetzner_bills_while_the_server_exists() {
+        assert!(bills_hourly("hetzner", "OFF"));
+        assert!(bills_hourly("hetzner", "RUNNING"));
+        assert!(bills_hourly("hetzner", "STOPPING"));
+        assert!(!bills_hourly("hetzner", "DELETING"));
+        // Everyone else follows the status.
+        assert!(!bills_hourly("runpod", "EXITED"));
+        assert!(bills_hourly("runpod", "STARTING"));
+        assert!(!bills_hourly("vast", "STOPPED"));
+        assert!(!bills_hourly("vast", "OFF"));
+    }
 
     #[test]
     fn short_status_abbreviates_known_and_falls_back() {
