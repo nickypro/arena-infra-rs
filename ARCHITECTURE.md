@@ -173,7 +173,8 @@ flowchart TD
   fleet commands. The rsync transfers, which drive their own ssh outside `Remote` — `pods
   pull`, `pods backup`'s file backup (every tick under `cron install --pull`), `pods
   restore` and the replace/migrate via-local copy — get rsync's `--timeout` (I/O silence)
-  plus a wall-clock budget (`BACKUP_TIMEOUT_SECS` / restore's `--timeout` / 2 h per leg)
+  plus a wall-clock budget (`BACKUP_TIMEOUT_SECS` / restore's `--timeout` / 2 h per leg,
+  shared by the leg's rsyncs)
   through `remote::run_local`, which stops the child the same SIGTERM-then-SIGKILL way —
   finished before the timeout is returned, so a CLI exiting right after can't cut the grace
   short and orphan rsync's ssh/receiver; every cron line also runs under `flock -n` (the

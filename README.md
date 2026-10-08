@@ -868,7 +868,8 @@ Notes / sharp edges to know:
   restart/stop/pull 20s. rsync transfers, which drive their own ssh outside this seam, are
   bounded the same way: `--timeout=300` (I/O silence) everywhere, `BACKUP_TIMEOUT_SECS` per
   pod (default 2 h) for `pull` and `backup`'s file step, `restore` 2h (`--timeout`), 2 h per
-  leg for the replace/migrate via-local copy.
+  leg for the replace/migrate via-local copy (pull, then push — a leg's rsyncs, the home and
+  a linked repo, share it).
 - `copy-keys` warns by name about any reachable pod that matched no per-host key.
 
 ### Overriding config without editing it

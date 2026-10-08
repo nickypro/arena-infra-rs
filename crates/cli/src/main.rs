@@ -2718,7 +2718,7 @@ fn local_size(path: &std::path::Path) -> u64 {
 /// replace/migrate's direct pod-to-pod rsync of a home dir (caches/models excluded): a
 /// few GB, minutes pod-to-pod. Two hours means the transfer is wedged, and the pipeline
 /// must give the operator their terminal back instead of waiting forever. Each leg of the
-/// via-local fallback ([`run_rsync`]) gets the same budget.
+/// via-local fallback ([`CopyLeg`]) gets the same budget, for all of its rsyncs together.
 const POD_COPY_TIMEOUT: Duration = Duration::from_secs(2 * 3600);
 
 /// How one pod's SSH call ended, ready for its report line: the command's output (which
@@ -8896,8 +8896,8 @@ fn replace_copy_failed(canonical: &str, new_name: &str) -> String {
 ///    a stale endpoint fails this check, so we never swap in a pod that didn't get the data.
 ///
 /// The probes and the direct copy go through `remote`, each with a budget (the copy gets
-/// [`POD_COPY_TIMEOUT`]). The via-local fallback spawns `rsync` itself ([`run_rsync`]):
-/// rsync runs its own ssh transport, which is neither a `Remote` exec nor a copy.
+/// [`POD_COPY_TIMEOUT`]). The via-local fallback spawns `rsync` itself ([`CopyLeg`], the same
+/// budget per leg): rsync runs its own ssh transport, which is neither a `Remote` exec nor a copy.
 async fn copy_pod_files(
     cfg: &Config,
     provider: &dyn Provider,
@@ -8987,17 +8987,22 @@ async fn copy_pod_files(
             Ok(out) if out.success => volume::parse_probe(&out.stdout),
             _ => None,
         };
+        // Each leg's rsyncs (the home, then a split-out repo) share the leg's one budget.
+        let leg = CopyLeg::start(POD_COPY_TIMEOUT);
         for job in volume::pull_jobs(&pc, &stage_s, volume::repo_pull(&repo, &user, probe.as_ref()).as_ref()) {
             if job.repo {
                 clear_stale_link(&job.dest).with_context(|| format!("clearing an old link at {}", job.dest))?;
                 std::fs::create_dir_all(&job.dest).with_context(|| format!("creating {}", job.dest))?;
             }
-            run_rsync(&pull::rsync_args(&src_target, &job.config, &job.dest)).await.context("pull source -> staging")?;
+            leg.rsync(RSYNC, &pull::rsync_args(&src_target, &job.config, &job.dest))
+                .await
+                .context("pull source -> staging")?;
         }
         let dest_target = fresh_target(provider, dest_id, cfg).await?;
         let staged_repo = rel.as_ref().is_some_and(|r| std::fs::symlink_metadata(stage.join(r)).is_ok_and(|m| m.is_dir()));
+        let leg = CopyLeg::start(POD_COPY_TIMEOUT);
         for (src, pc) in volume::push_jobs(&pc, &stage_s, rel.as_deref(), staged_repo) {
-            run_rsync(&pull::push_rsync_args(&dest_target, &pc, &src)).await.context("push staging -> dest")?;
+            leg.rsync(RSYNC, &pull::push_rsync_args(&dest_target, &pc, &src)).await.context("push staging -> dest")?;
         }
         println!("      copied (via local staging {})", stage.display());
     }
@@ -9018,19 +9023,51 @@ async fn copy_pod_files(
     Ok(())
 }
 
-/// Run `rsync` with the given argv within [`POD_COPY_TIMEOUT`] (the direct copy's budget);
-/// error (with stderr) on a non-zero exit, `rsync timed out after …` when it runs out.
-/// Deliberately not a [`Remote`] call (like `pods pull`'s rsyncs): rsync drives its own ssh
-/// transport (`-e`), so it is neither an exec nor a single-file copy — but it is stopped the
-/// same way ([`arena_core::remote::run_local`]), and its `--timeout` gives up on a silent
-/// connection long before that. A stopped leg swaps nothing: the caller bails before the
-/// marker check, and rsync is incremental, so a re-run continues from what was copied.
-async fn run_rsync(args: &[String]) -> Result<()> {
-    let out = arena_core::remote::run_local(RSYNC, args, "rsync", Some(POD_COPY_TIMEOUT)).await?;
-    if !out.success {
-        anyhow::bail!("rsync failed: {}", out.stderr.trim());
+/// One leg of the via-local copy — the pull into staging, or the push out of it — and its
+/// clock. A leg is up to two rsyncs (the home, then a linked repo's tree, split out because a
+/// home copy alone would carry only the link), and they share ONE budget, as the direct
+/// copy's two rsyncs share its one exec: each gets what the ones before it left, and one that
+/// would start with nothing left doesn't start. A per-rsync budget would let a split leg run
+/// twice as long as the "2 h per leg" the operator is promised.
+///
+/// The rsyncs are deliberately not [`Remote`] calls (like `pods pull`'s): rsync drives its own
+/// ssh transport (`-e`), so it is neither an exec nor a single-file copy — but it is stopped
+/// the same way ([`arena_core::remote::run_local`]), and its `--timeout` gives up on a silent
+/// connection long before the budget does. A stopped leg swaps nothing: the caller bails
+/// before the marker check, and rsync is incremental, so a re-run continues from what was
+/// copied.
+struct CopyLeg {
+    budget: Duration,
+    deadline: tokio::time::Instant,
+}
+
+impl CopyLeg {
+    /// Start the leg's clock: `budget` ([`POD_COPY_TIMEOUT`]) for all of its rsyncs together.
+    fn start(budget: Duration) -> Self {
+        Self { budget, deadline: tokio::time::Instant::now() + budget }
     }
-    Ok(())
+
+    /// Run one of the leg's rsyncs (`program` + argv) within what is left of the leg's budget:
+    /// an error (with stderr) on a non-zero exit, `rsync timed out after <the leg's budget>`
+    /// when the leg runs out — mid-rsync, or before one that would start with nothing left.
+    async fn rsync(&self, program: &str, args: &[String]) -> Result<()> {
+        let spent = || {
+            anyhow::anyhow!(
+                "rsync timed out after {} (the copy leg's budget, for all its rsyncs together)",
+                arena_core::error::human_duration(&self.budget)
+            )
+        };
+        let left = self.deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return Err(spent());
+        }
+        match arena_core::remote::run_local(program, args, "rsync", Some(left)).await {
+            Ok(out) if out.success => Ok(()),
+            Ok(out) => anyhow::bail!("rsync failed: {}", out.stderr.trim()),
+            Err(arena_core::Error::Timeout { .. }) => Err(spent()),
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 /// Pre-swap health check: the replacement must answer over SSH (and report its GPU if it
@@ -13991,7 +14028,7 @@ mod remote_tests {
         handle_backup, handle_copy, handle_deep_test, handle_full_backup, handle_init_branches,
         handle_pods, handle_pull, handle_restore, handle_run, handle_set_branch, local_size, marker_present, probe_gpus,
         proxy_reaches_pod, render_deep_test, render_run, replace_copy_failed, restore_note, restore_notes, run_fleet, run_preview, select,
-        target_is_pod, BackupTally, Cli, Cmd, CopyPlan, PodCmd, RestoreOpts, RestoreSource, RunResult, Select, SelectByFlag, Selected,
+        target_is_pod, BackupTally, Cli, Cmd, CopyLeg, CopyPlan, PodCmd, RestoreOpts, RestoreSource, RunResult, Select, SelectByFlag, Selected,
         Unscoped, BACKUP_TIMEOUT, BRANCH_TIMEOUT, CP_BASE_TIMEOUT, POD_COPY_TIMEOUT, RUN_TIMEOUT_SECS, TEST_TIMEOUT,
     };
     use arena_core::selector::SelectArgs;
@@ -15246,6 +15283,35 @@ mod remote_tests {
         assert!(fake.calls_to(&host(22002)).is_empty(), "no via-local push, no delivery check");
         // It doesn't promise a plain re-run continues: `replace` refuses while `-new` exists.
         assert!(!msg.contains("Re-run"), "{msg}");
+    }
+
+    /// The via-local copy's "2 h per leg" is the LEG's budget, not each rsync's: a leg split
+    /// into the home and a linked repo's tree must not get the budget twice. Real children
+    /// (`sh -c sleep`, standing in for rsync) on a real clock, scaled down: a 2s leg whose
+    /// first rsync takes 0.8s leaves the second 1.2s — too little for its 1.6s, which a
+    /// per-rsync budget would have let finish (3 s for the leg) — and once the leg is spent
+    /// the next rsync isn't started at all.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_via_local_legs_rsyncs_share_one_budget() {
+        let nap = |secs: &str| vec!["-c".to_string(), format!("sleep {secs}")];
+        let leg = CopyLeg::start(Duration::from_secs(2));
+        let start = Instant::now();
+        leg.rsync("sh", &nap("0.8")).await.expect("the home fits in the leg");
+        let err = leg.rsync("sh", &nap("1.6")).await.unwrap_err().to_string();
+        assert_eq!(err, "rsync timed out after 2s (the copy leg's budget, for all its rsyncs together)");
+        let took = start.elapsed();
+        assert!(took >= Duration::from_secs(2), "stopped at the leg's deadline, not before: {took:?}");
+        assert!(took < Duration::from_millis(2800), "not the repo's own 1.6s on top of the home's: {took:?}");
+        // Spent: refused without spawning (a missing program would be a spawn error instead).
+        let err = leg.rsync("/nonexistent/rsync", &[]).await.unwrap_err().to_string();
+        assert!(err.starts_with("rsync timed out after 2s"), "{err}");
+        // A failed rsync is still its own error, with its stderr.
+        let err = CopyLeg::start(Duration::from_secs(5))
+            .rsync("sh", &["-c".into(), "echo nope >&2; exit 23".into()])
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "rsync failed: nope");
     }
 
     #[test]
