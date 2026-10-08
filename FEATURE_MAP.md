@@ -7,8 +7,8 @@ Parity tracker between the legacy Python/bash scripts and the Rust rewrite
 Every fleet command picks pods with **one selector syntax** (`arena_core::selector`): bare
 `apple`, full `arena8-apple`, absolute `@james-gpu`, provider ids, ranges `apple..mayor`
 (`MACHINE_NAME_LIST` order), `all`/`--all`, narrowed by `--exclude <targets>`, `--gpus N`,
-`--on <provider>`. Typos and selections that narrow to nothing are errors; `run`/`cp`/`pull`
-take the targets as `-t`. The TUI marks pods with the same syntax (`/`). "Selector" below
+`--on <provider>`. Typos and selections that narrow to nothing are errors; `run`/`cp`
+take the targets as `-t` (`pull` takes them positionally now, its label as `--label`). The TUI marks pods with the same syntax (`/`). "Selector" below
 means this.
 
 ## Pod lifecycle
@@ -32,7 +32,7 @@ means this.
 
 | Legacy script | Rust CLI | TUI | Status | Notes |
 |---|---|---|---|---|
-| `sync_git.sh -m --exclude` (commit+push current branch) | `pods backup [selector] [--message --no-pull]` | Menu/Fleet→Backup `[b]` | ✅ | The full save: git-push **whatever branch the pod is on** (skips `main`/`master`, never switches) **and** the rsync file backup (`--no-pull` = git only). 5 min per pod's push; the rsync is bounded like `pods pull`'s. |
+| `sync_git.sh -m --exclude` (commit+push current branch) | `pods backup [selector] [--message --no-pull]` | Menu/Fleet→Backup `[b]` | ✅ | The full save: git-push **whatever branch the pod is on** (skips `main`/`master`, never switches) **and** the rsync file backup (`--no-pull` = git only). 5 min per pod's push; the rsync is bounded like `pods pull`'s. Files over 95 MB stay out of git (reported; a branch already stuck with one fails with the exact `git reset` fix); nested clones are folded in once (`.git` → `.git.arena-nested`), other nested repos kept out and reported — never gitlinks. |
 | `init_branches.sh <day>` (make autocommit branch) | `pods init-branches [selector] [--week --day]` | — | ✅ | Creates + pushes each pod's `autocommit-{prefix}-wNdM-{name}` branch, no commit. |
 | `list_branches.sh` (table of current branch) | `pods run 'git -C … branch --show-current'` | BRANCH column | 🟡 | No dedicated command; the TUI shows it. |
 | `backup.sh <label>` (**rsync pod files → local**) | `pods pull [label] [-t … --dir --max-size --remote-path --no-git --no-big]` | — | ✅ | Rsync home → `<dir>/<label>/<pod>/` (size-capped) plus a complete `big/` mirror; keeps `.git`. A repo linked onto the volume is pulled as its tree, in the same place. Bounded: `--timeout=300` (I/O silence) + `BACKUP_TIMEOUT_SECS` per pod (default 2 h); a pod that runs out is stopped and named, the rest finish. |

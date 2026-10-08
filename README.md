@@ -366,13 +366,31 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `--no-pull` = git only; `--message` overrides the commit message. Confirms first
     (`--dry-run` previews both). Each pod's git push has a 5-min budget, its rsync the
     `pull` budgets below. To stage onto a dated autocommit branch, run `pods init-branches`
-    first.
+    first. Two things never go into the commits, because each once kept participants' work
+    off GitHub: **files over 95 MB** (GitHub refuses the push, and every later one — GH001)
+    are left out (never staged, so no blob is written), stay on disk and are reported per pod
+    (`skipped N file(s) > 95 MB: … covered by the rsync big tier`); a branch whose unpushed
+    commits already carry one fails with the exact fix (`arena pods run -t <pod> 'git -C
+    <repo> reset -q <sha>'` — keeps every file on disk; the next backup re-commits the work
+    without it), never the same opaque rejection every tick. And **nested repos are never
+    committed as gitlinks** (a commit id without its files): the image's nested clones
+    (no commits of their own) are **folded** into the course repo once per checkout — their
+    `.git` moved aside to `.git.arena-nested` (reversible: move it back; listed in
+    `.git/arena-nested`), so work inside them is committed like everything else; a nested repo
+    with its own history (a participant's project), or one cloned after that, is left exactly
+    as it is, kept out of the commit (a managed block in `.git/info/exclude`) and reported
+    every run (the rsync tiers have it). A gitlink an earlier backup committed is replaced by
+    the files. The script runs under `sh` whatever the login shell; `--dry-run` prints it
+    once plus each pod's exact arguments.
   - `pods set-branch <branch> <targets|--all> [--hard]` — switch pods' ARENA checkout to a
     branch. Gentle by default (fetch + checkout + ff-only pull — fails on a diverged/dirty
     tree rather than clobbering work). **`--hard` is destructive**: force the branch to
     match `origin/<branch>`, discarding local commits/changes (untracked files survive) —
     e.g. `set-branch main --all --hard` resets the fleet to `main`. Confirms first;
-    `--dry-run` previews. Pods switch concurrently, 2-min budget each.
+    `--dry-run` previews. Pods switch concurrently, 2-min budget each. A nested clone the
+    backup folded in (see `pods backup`) is tracked only on the autocommit branches, so a
+    switch to `main` would delete it from disk and break that exercise: it is put back from
+    the previous HEAD, **staged** (so switching back goes through), and named per pod.
   - `pods init-branches` — create each pod's `autocommit-…-wNdM-…` branch and push it
     upstream **without committing** (legacy `init_branches`), so a new day's branch
     exists before `backup` runs. `--week`/`--day` override; `--dry-run` previews. 2-min
@@ -861,7 +879,8 @@ old spelling of a target (`stop --all --include X` keeps meaning "only X").
 | `run` | `-t <targets>` (the command is positional) | every pod | parallel |
 | `test`, `test --deep` | positional | every pod | parallel |
 | `setup`, `copy-keys`, `backup`, `init-branches` | positional | every pod | parallel |
-| `cp`, `pull` | `-t <targets>` (file/label are positional) | every pod | parallel |
+| `cp` | `-t <targets>` (file/dest are positional) | every pod | parallel |
+| `pull` | positional (the label is `--label`; the old `-t`, and a lone `wNdM` that names no pod, still work) | every pod | parallel |
 | `set-branch <branch>` | positional after the branch | **refused** (targets or `--all`) | parallel |
 | `stop`, `reimage` | positional | **refused** (targets or `--all`) | serial (provider API) |
 | `keys gen/rotate/revoke` | positional (pods *or* list names) | **refused** (`--all` = current pods) | serial |

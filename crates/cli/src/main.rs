@@ -212,8 +212,10 @@ enum Cmd {
 // ranges `apple..mayor`, `all`/`--all`, filtered by `--exclude`, `--gpus N`, `--on
 // <provider>`. Typos fail loudly. The flags live in one struct (`SelectOpts`); the targets
 // themselves are positional (`Select`) except where a command's positionals are already
-// taken — `run`'s command, `cp`'s file/dest, `pull`'s label — which take `-t/--target`
-// (`SelectByFlag`). Plain `//` comments here: a doc comment on a flattened struct can leak
+// taken — `run`'s command, `cp`'s file/dest — which take `-t/--target` (`SelectByFlag`).
+// (`pull` took its label positionally and its pods by `-t` until a live `pods pull bravo`
+// meant "every pod, into backup/bravo/"; it is positional like the rest now — see
+// `pull_label_and_targets`.) Plain `//` comments here: a doc comment on a flattened struct can leak
 // into the subcommand's help text. Each command flattens its selection as its *last* field:
 // the "Target selection" help heading carries over to every arg declared after it.
 
@@ -1108,10 +1110,15 @@ enum PodCmd {
         #[command(flatten)]
         sel: Select,
     },
-    /// Rsync each pod's home to a local backup folder (the file backup). Each pod's rsync
-    /// is bounded: 5 min without I/O, and BACKUP_TIMEOUT_SECS of wall clock (default 2h).
+    /// Rsync each pod's home to a local backup folder (the file backup). Targets: names /
+    /// ids / ranges, like every other command (none = every pod with an SSH endpoint); the
+    /// snapshot's label goes behind --label. Each pod's rsync is bounded: 5 min without I/O,
+    /// and BACKUP_TIMEOUT_SECS of wall clock (default 2h).
     Pull {
-        /// Backup label, e.g. `w1d3`. Defaults to the computed `wNdM` iteration.
+        /// Snapshot label, e.g. `w1d3` (default: the computed `wNdM` iteration). The old
+        /// positional spelling (`pods pull w1d3`) still works — with a note — when the word
+        /// can't be a pod's name.
+        #[arg(long)]
         label: Option<String>,
         /// Local base directory for backups (default: config LOCAL_BACKUP_DIR, else ./backup).
         #[arg(long)]
@@ -1135,8 +1142,11 @@ enum PodCmd {
         /// Preview only: print the rsync commands, copy nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
+        /// The old spelling of the targets (`pods pull -t bravo`), still accepted.
+        #[arg(long = "target", short = 't', value_name = "TARGET", hide = true)]
+        target_flag: Vec<String>,
         #[command(flatten)]
-        sel: SelectByFlag,
+        sel: Select,
     },
     /// Push a local backup (what `pull` saved) back onto ONE pod — never deletes anything.
     ///
@@ -4128,15 +4138,19 @@ async fn handle_backup(
 
     if !apply {
         println!(
-            "Dry-run — would commit + push the current branch on {} pod(s) (skips main/master):\n",
-            targets.len()
+            "Dry-run — would commit + push the current branch on {} pod(s) (skips main/master; files over {} MB \
+             and nested repos with their own history stay out of git), running the backup script below on each:\n",
+            targets.len(),
+            backup::GIT_MAX_FILE_BYTES / (1024 * 1024)
         );
+        // The script is the same for every pod — printed once, at the end, rather than in each
+        // pod's line; the arguments are exact.
         for (name, target) in &targets {
-            let cmd = backup::backup_command(&repo_path, key.as_deref(), &msg_for(name));
             println!("# {name}");
-            println!("{}\n", target.display_command(&cmd));
+            println!("{}\n", target.display_command(&backup::backup_summary(&repo_path, key.as_deref(), &msg_for(name))));
         }
-        println!("Preview only — run without --dry-run to execute over SSH.");
+        println!("# $ARENA_BACKUP_SH (run under sh on the pod):\n{}", backup::BACKUP_SCRIPT.trim_end());
+        println!("\nPreview only — run without --dry-run to execute over SSH.");
         return Ok(());
     }
 
@@ -4153,7 +4167,7 @@ async fn handle_backup(
             (name, target, cmd)
         })
         .collect();
-    let t = backup_fleet(&remote, jobs, |line| println!("{line}")).await;
+    let t = backup_fleet(&remote, jobs, &repo_path, |line| println!("{line}")).await;
     println!(
         "\nDone: {} pushed, {} unchanged, {} skipped (main/master), {} failed.",
         t.pushed, t.unchanged, t.skipped, t.failed
@@ -4228,25 +4242,32 @@ struct BackupTally {
 
 /// Run each pod's backup command (`(name, target, cmd)`) concurrently over `remote`, each
 /// within [`BACKUP_TIMEOUT`], classifying its output by the sentinel it printed and
-/// emitting one `[done/total]` line per pod as it finishes. A non-zero exit, a timeout or a
-/// crashed task is a failure; the others still finish.
+/// emitting one `[done/total]` line per pod as it finishes — with what the run kept out of
+/// git (files over GitHub's limit, nested repos) or folded into it. A non-zero exit, a
+/// timeout or a crashed task is a failure; the others still finish. A pod whose unpushed
+/// commits already carry a file over the limit fails with the exact commands that fix it
+/// (`repo` is the checkout they run in), never as the same opaque push rejection every tick.
 async fn backup_fleet(
     remote: &Arc<dyn Remote>,
     jobs: Vec<(String, SshTarget, String)>,
+    repo: &str,
     mut emit: impl FnMut(&str),
 ) -> BackupTally {
-    use arena_core::backup::{self, parse_backup_output};
+    use arena_core::backup::{self, parse_backup_report};
     let mut t = BackupTally::default();
     exec_each_pod(remote, jobs, BACKUP_TIMEOUT, |done, total, name, call| {
+        let report = call.as_ref().map(|out| parse_backup_report(&out.stdout)).unwrap_or_default();
+        let notes = report.notes();
+        let also = if notes.is_empty() { String::new() } else { format!(" — {}", notes.join("; ")) };
         let line = match &call {
-            Ok(out) if out.success => match parse_backup_output(&out.stdout) {
+            Ok(out) if out.success => match &report.outcome {
                 Some((backup::BACKUP_PUSHED, branch)) => {
                     t.pushed += 1;
-                    format!("[{done}/{total}] ✓ {name} -> {branch}")
+                    format!("[{done}/{total}] ✓ {name} -> {branch}{also}")
                 }
                 Some((backup::BACKUP_NO_CHANGES, branch)) => {
                     t.unchanged += 1;
-                    format!("[{done}/{total}] = {name} (no changes, on {branch})")
+                    format!("[{done}/{total}] = {name} (no changes, on {branch}){also}")
                 }
                 Some((backup::BACKUP_SKIPPED, branch)) => {
                     t.skipped += 1;
@@ -4254,9 +4275,13 @@ async fn backup_fleet(
                 }
                 _ => {
                     t.pushed += 1;
-                    format!("[{done}/{total}] ✓ {name} (done)")
+                    format!("[{done}/{total}] ✓ {name} (done){also}")
                 }
             },
+            Ok(out) if out.code == Some(backup::BACKUP_STUCK_EXIT) && report.stuck_fix(repo, name).is_some() => {
+                t.failed += 1;
+                format!("[{done}/{total}] ✗ {name}: {}", report.stuck_fix(repo, name).unwrap_or_default())
+            }
             _ => {
                 t.failed += 1;
                 failure_line(done, total, name, &call)
@@ -5685,10 +5710,30 @@ async fn handle_pods_with(
             handle_init_branches(remote, cfg, week, day, &sel, dry_run, yes).await?;
         }
 
-        PodCmd::Pull { label, dir, max_size, remote_path, no_git, no_big, sel, dry_run } => {
+        PodCmd::Pull { label, dir, max_size, remote_path, no_git, no_big, target_flag, mut sel, dry_run } => {
             let dir = dir.unwrap_or_else(|| local_backup_dir(cfg));
-            let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
-            handle_pull(&remote, cfg, label, &dir, max_size, remote_path, no_git, no_big, &sel, dry_run, yes, RSYNC).await?;
+            // Only an old-style label-looking word needs the listing to be told apart from a pod.
+            let pods = if sel.targets.iter().any(|t| arena_core::restore::parse_label(t.trim()).is_some()) {
+                let policy = arena_core::retry::RetryPolicy::default();
+                arena_core::retry::retrying(&policy, || provider.list_pods()).await.context("listing pods")?
+            } else {
+                Vec::new()
+            };
+            let naming = Naming::from_config(cfg);
+            let split = pull_label_and_targets(label, &sel.targets, &target_flag, &naming, &pods).map_err(|e| anyhow::anyhow!(e))?;
+            if let Some(note) = &split.note {
+                eprintln!("{note}");
+            }
+            let positional = !sel.targets.is_empty();
+            sel.targets = split.targets;
+            let sel = select(provider, cfg, &sel.args(), Unscoped::All).await.map_err(|e| {
+                if positional && split.label.is_none() {
+                    e.context("`pods pull` takes pods as its arguments now (like every command); a snapshot label goes behind --label")
+                } else {
+                    e
+                }
+            })?;
+            handle_pull(&remote, cfg, split.label, &dir, max_size, remote_path, no_git, no_big, &sel, dry_run, yes, RSYNC).await?;
         }
 
         PodCmd::Restore { target, from, path, dir, timeout, overwrite_newer, with_git, dry_run } => {
@@ -6449,7 +6494,15 @@ async fn handle_set_branch(
     let (mut ok, mut failed) = (0, 0);
     exec_each_pod(&remote, jobs, BRANCH_TIMEOUT, |done, total, name, call| match &call {
         Ok(out) if out.success => {
-            println!("[{done}/{total}] ✓ {name} (on {branch})");
+            // Nested clones the backup folded in, which the new branch doesn't track: put back
+            // on disk (untracked) so their exercises keep working.
+            let restored: Vec<&str> = out.stdout.lines().filter_map(|l| l.trim_end_matches('\r').strip_prefix("RESTORED ")).collect();
+            let also = if restored.is_empty() {
+                String::new()
+            } else {
+                format!(" — kept {} folded nested clone(s) on disk (staged): {}", restored.len(), restored.join(", "))
+            };
+            println!("[{done}/{total}] ✓ {name} (on {branch}){also}");
             ok += 1;
         }
         _ => {
@@ -9616,6 +9669,64 @@ async fn handle_pull(
     Ok(())
 }
 
+/// `pods pull`'s arguments sorted out ([`pull_label_and_targets`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PullArgs {
+    /// The snapshot label (`None` = the computed `wNdM`).
+    label: Option<String>,
+    /// The targets, for the selector (positional ones first, then the old `-t` ones).
+    targets: Vec<String>,
+    /// The deprecation note for an old-style positional label.
+    note: Option<String>,
+}
+
+/// `pods pull`'s positionals are pods, like every other command's; the snapshot label goes
+/// behind `--label`. They used to be the label — and `pods pull bravo` pulled EVERY pod into
+/// `backup/bravo/` (live: ~18G on the host the cohort shares). An old invocation keeps working
+/// where it can only mean the label: a lone positional that looks like one (`w1d3`, see
+/// [`arena_core::restore::parse_label`]) and names no pod — none listed (`pods`), no
+/// `MACHINE_NAME_LIST` entry — is taken as the label, with a note. One that could be either is
+/// refused rather than guessed; so are two labels. `-t` (the old target flag) adds targets.
+fn pull_label_and_targets(
+    label: Option<String>,
+    positional: &[String],
+    flag_targets: &[String],
+    naming: &Naming,
+    pods: &[arena_core::Pod],
+) -> std::result::Result<PullArgs, String> {
+    let mut out = PullArgs { label, targets: Vec::new(), note: None };
+    for raw in positional {
+        let word = raw.trim();
+        if arena_core::restore::parse_label(word).is_none() {
+            out.targets.push(raw.clone());
+            continue;
+        }
+        let a_pod = pods.iter().any(|p| naming.matches(p, word)) || naming.names_list_entry(word);
+        match (a_pod, &out.label) {
+            // `--label` given: every positional is a pod.
+            (_, Some(_)) if out.note.is_none() => out.targets.push(raw.clone()),
+            (true, _) => {
+                return Err(format!(
+                    "`{word}` is both a snapshot label and a pod's name — write `--label {word}` for the label, or the \
+                     pod's full name or id for the pod"
+                ))
+            }
+            (false, Some(first)) => {
+                return Err(format!("two snapshot labels (`{first}`, `{word}`): pass one, with --label"));
+            }
+            (false, None) => {
+                out.note = Some(format!(
+                    "note: reading `{word}` as the snapshot label (the old spelling) — `pods pull` takes pods as its \
+                     arguments now; write `--label {word}`"
+                ));
+                out.label = Some(word.to_string());
+            }
+        }
+    }
+    out.targets.extend(flag_targets.iter().cloned());
+    Ok(out)
+}
+
 /// How `pods pull` says it's bounded, on its header line: the per-pod wall clock and the
 /// I/O-silence cut-off (see [`handle_pull`]).
 fn pull_budget_note(budget: Duration) -> String {
@@ -11489,6 +11600,8 @@ mod selection_tests {
             &["pods", "run", "--target", "apple,bloom", "--target", "cloud", "echo", "hi"],
             &["pods", "cp", "f.txt", "-t", "apple"],
             &["pods", "pull", "-t", "apple..bloom"],
+            &["pods", "pull", "apple..bloom", "--exclude", "cloud", "--label", "w1d2"],
+            &["pods", "pull", "bravo", "--dry-run"],
             &["pods", "test", "all", "--on", "vast"],
             &["pods", "init-branches", "apple", "bloom"],
             &["pods", "backup", "apple..cloud", "--exclude", "bloom"],
@@ -14062,13 +14175,13 @@ mod placement_cli_tests {
 mod remote_tests {
     use super::{
         backup_fleet, copy_pod_files, copy_to_pod, cp_timeout, deep_check_fleet, duplicate_names, each_pod,
-        handle_backup, handle_copy, handle_deep_test, handle_full_backup, handle_init_branches,
+        handle_backup, handle_copy, handle_deep_test, handle_full_backup, handle_init_branches, pull_label_and_targets,
         handle_pods, handle_pull, handle_restore, handle_run, handle_set_branch, local_size, marker_present, probe_gpus,
         proxy_reaches_pod, render_deep_test, render_run, replace_copy_failed, restore_note, restore_notes, run_failure, run_fleet, run_preview, select,
         target_is_pod, BackupTally, Cli, Cmd, CopyLeg, CopyPlan, PodCmd, RestoreOpts, RestoreSource, RunResult, Select, SelectByFlag, Selected,
         Unscoped, BACKUP_TIMEOUT, BRANCH_TIMEOUT, CP_BASE_TIMEOUT, POD_COPY_TIMEOUT, RUN_TIMEOUT_SECS, TEST_TIMEOUT,
     };
-    use arena_core::selector::SelectArgs;
+    use arena_core::selector::{Naming, SelectArgs};
     use arena_core::backup::{backup_command, checkout_command, init_branch_command, BackupConfig};
     use arena_core::remote::{FakeRemote, FakeReply, Remote, RemoteCall, PROBE_TIMEOUT};
     use arena_core::ssh::{login_shell_wrap, SshTarget};
@@ -14342,6 +14455,68 @@ mod remote_tests {
         }
     }
 
+    /// `pods pull bravo` meant "every pod, into backup/bravo/" (live). Positionals are pods now;
+    /// the old label spelling still works where it can't be a pod, and is refused where it
+    /// could be either.
+    #[test]
+    fn pull_takes_pods_and_its_label_behind_a_flag() {
+        let cfg = Config::parse("MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple bloom w2d2)\n");
+        let naming = Naming::from_config(&cfg);
+        let listed = vec![pod("bravo", 22001), pod("w9d9", 22002)];
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // (positionals, --label, -t, want: Ok((label, targets, noted)) or Err(tell))
+        type Want<'a> = std::result::Result<(Option<&'a str>, &'a [&'a str], bool), &'a str>;
+        let cases: &[(&[&str], Option<&str>, &[&str], Want)] = &[
+            (&["bravo"], None, &[], Ok((None, &["bravo"], false))),
+            (&["bravo", "apple..bloom"], Some("w1d3"), &[], Ok((Some("w1d3"), &["bravo", "apple..bloom"], false))),
+            (&[], None, &[], Ok((None, &[], false))),
+            // The old spelling, where it can only be the label: a note, and it still works.
+            (&["w1d3"], None, &[], Ok((Some("w1d3"), &[], true))),
+            (&["w1d3"], None, &["apple..bloom"], Ok((Some("w1d3"), &["apple..bloom"], true))),
+            (&["w1d3", "bravo"], None, &[], Ok((Some("w1d3"), &["bravo"], true))),
+            // With --label every positional is a pod (the selector judges it).
+            (&["w1d3"], Some("w2d1"), &[], Ok((Some("w2d1"), &["w1d3"], false))),
+            // Not label-shaped: a target — an old custom label fails in the selector, loudly.
+            (&["mylabel"], None, &[], Ok((None, &["mylabel"], false))),
+            (&["apple,w1d3"], None, &[], Ok((None, &["apple,w1d3"], false))),
+            // Either a label or a pod (listed, or a MACHINE_NAME_LIST entry): refused.
+            (&["w9d9"], None, &[], Err("is both a snapshot label and a pod's name")),
+            (&["devtest-w9d9"], None, &[], Ok((None, &["devtest-w9d9"], false))),
+            (&["w2d2"], None, &[], Err("`w2d2` is both")),
+            (&["w1d3", "w1d4"], None, &[], Err("two snapshot labels")),
+        ];
+        for (pos, label, flag, want) in cases {
+            let got = pull_label_and_targets(label.map(String::from), &s(pos), &s(flag), &naming, &listed);
+            match (got, want) {
+                (Ok(g), Ok((l, t, noted))) => {
+                    assert_eq!((g.label.as_deref(), g.targets.clone(), g.note.is_some()), (*l, s(t), *noted), "{pos:?} {label:?}");
+                    if let Some(n) = g.note {
+                        assert!(n.contains("write `--label w1d3`"), "{n}");
+                    }
+                }
+                (Err(e), Err(tell)) => assert!(e.contains(tell), "{pos:?}: {e}"),
+                (got, _) => panic!("{pos:?} {label:?}: got {got:?}, want {want:?}"),
+            }
+        }
+    }
+
+    /// Through the command (dry runs: nothing is copied, no pod is asked anything).
+    #[tokio::test]
+    async fn pods_pull_resolves_pods_and_says_where_a_label_goes() {
+        let fake = Arc::new(FakeRemote::new());
+        let cfg = Config::parse(&format!(
+            "MACHINE_NAME_PREFIX=devtest\nBACKUP_REPO_PATH={REPO}\nSHARED_SSH_KEY_PATH=/nonexistent/devtest_key\n\
+             ARENA_START_DATE=2026-01-05\n"
+        ));
+        handle_pods(pods(&["pull", "bloom", "--dry-run"]), &fleet(), fake.clone(), &cfg, true).await.unwrap();
+        handle_pods(pods(&["pull", "w1d3", "--dry-run"]), &fleet(), fake.clone(), &cfg, true).await.unwrap();
+        handle_pods(pods(&["pull", "-t", "bloom", "--label", "x", "--dry-run"]), &fleet(), fake.clone(), &cfg, true).await.unwrap();
+        let err = handle_pods(pods(&["pull", "mylabel", "--dry-run"]), &fleet(), fake.clone(), &cfg, true).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("takes pods as its arguments now") && msg.contains("--label") && msg.contains("mylabel"), "{msg}");
+        assert!(fake.calls().is_empty());
+    }
+
     #[tokio::test]
     async fn pull_and_backup_rsync_exactly_the_selected_pods() {
         let stub = StubRsync::new("scoped");
@@ -14353,12 +14528,21 @@ mod remote_tests {
             base.display()
         ));
         let base = base.display().to_string();
-        // `pods pull w1d1 -t apple..cloud --exclude bloom`: exactly apple + cloud, both tiers,
-        // through the same selection the command resolves.
-        let PodCmd::Pull { sel, .. } = pods(&["pull", "w1d1", "-t", "apple..cloud", "--exclude", "bloom"]) else {
-            panic!("not pods pull")
-        };
-        let chosen = select(&fleet(), &cfg, &sel.args(), Unscoped::All).await.unwrap();
+        // `pods pull apple..cloud --exclude bloom --label w1d1` — and its old spelling `pods pull
+        // w1d1 -t apple..cloud --exclude bloom`: exactly apple + cloud, both tiers, through the
+        // same selection the command resolves.
+        let listed = fleet().pods.clone();
+        let mut chosen_by = Vec::new();
+        for argv in [&["pull", "apple..cloud", "--exclude", "bloom", "--label", "w1d1"][..], &["pull", "w1d1", "-t", "apple..cloud", "--exclude", "bloom"]] {
+            let PodCmd::Pull { label, target_flag, mut sel, .. } = pods(argv) else { panic!("not pods pull") };
+            let split = pull_label_and_targets(label, &sel.targets, &target_flag, &Naming::from_config(&cfg), &listed).unwrap();
+            assert_eq!(split.label.as_deref(), Some("w1d1"), "{argv:?}");
+            sel.targets = split.targets;
+            let chosen = select(&fleet(), &cfg, &sel.args(), Unscoped::All).await.unwrap();
+            chosen_by.push(chosen.pods.iter().map(|p| p.name.clone()).collect::<Vec<_>>());
+        }
+        assert_eq!(chosen_by, [["devtest-apple", "devtest-cloud"], ["devtest-apple", "devtest-cloud"]]);
+        let chosen = picked(&fleet(), &cfg, &["apple", "cloud"]).await;
         // Each pod is asked where its repo is (a plain directory here: one job per tier).
         let fake = Arc::new(FakeRemote::new());
         for port in [22001, 22003] {
@@ -15007,7 +15191,7 @@ mod remote_tests {
         let jobs = targets(&f).into_iter().map(|(n, t)| (n, t, "backup".to_string())).collect();
         let mut lines = Vec::new();
         let start = Instant::now();
-        let tally = backup_fleet(&remote, jobs, |l| lines.push(l.to_string())).await;
+        let tally = backup_fleet(&remote, jobs, REPO, |l| lines.push(l.to_string())).await;
         assert_eq!(tally, BackupTally { pushed: 1, unchanged: 1, skipped: 1, failed: 2 });
         assert_eq!(start.elapsed(), BACKUP_TIMEOUT);
         // The wedged pod reports last, after its budget; the rest as soon as they answered.

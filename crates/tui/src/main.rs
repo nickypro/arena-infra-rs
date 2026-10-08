@@ -1550,20 +1550,29 @@ async fn run_set_branch(remote: &dyn Remote, cfg: &Config, pod: &Pod, branch: &s
 /// `arena backup` for a single pod): never switches/creates a branch, skips main/master.
 /// Within [`BACKUP_TIMEOUT`].
 async fn run_backup(remote: &dyn Remote, cfg: &Config, pod: &Pod) -> String {
-    use arena_core::backup::{self, parse_backup_output};
+    use arena_core::backup::{self, parse_backup_report};
     let target = match SshTarget::from_pod(pod, cfg) {
         Ok(t) => t,
         Err(e) => return format!("✗ {}: {e}", pod.name),
     };
-    let cmd = backup::backup_command(&backup_repo_path(cfg), cfg.get("GIT_SSH_KEY_REMOTE"), &format!("arena-tui backup {}", pod.name));
+    let repo = backup_repo_path(cfg);
+    let cmd = backup::backup_command(&repo, cfg.get("GIT_SSH_KEY_REMOTE"), &format!("arena-tui backup {}", pod.name));
     match remote.exec(&target, &cmd, Some(BACKUP_TIMEOUT)).await {
-        Ok(out) if out.success => match parse_backup_output(&out.stdout) {
-            Some((backup::BACKUP_PUSHED, branch)) => format!("✓ backed up {} → {branch}", pod.name),
-            Some((backup::BACKUP_NO_CHANGES, branch)) => format!("✓ {} — no changes (on {branch})", pod.name),
-            Some((backup::BACKUP_SKIPPED, branch)) => format!("⊘ {} — skipped (on protected branch {branch})", pod.name),
-            _ => format!("✓ backed up {}", pod.name),
+        Ok(out) if out.success => {
+            let report = parse_backup_report(&out.stdout);
+            let notes = report.notes();
+            let also = if notes.is_empty() { String::new() } else { format!(" — {}", notes.join("; ")) };
+            match &report.outcome {
+                Some((backup::BACKUP_PUSHED, branch)) => format!("✓ backed up {} → {branch}{also}", pod.name),
+                Some((backup::BACKUP_NO_CHANGES, branch)) => format!("✓ {} — no changes (on {branch}){also}", pod.name),
+                Some((backup::BACKUP_SKIPPED, branch)) => format!("⊘ {} — skipped (on protected branch {branch})", pod.name),
+                _ => format!("✓ backed up {}{also}", pod.name),
+            }
+        }
+        Ok(out) => match parse_backup_report(&out.stdout).stuck_fix(&repo, &pod.name) {
+            Some(fix) => format!("✗ backup {}: {fix}", pod.name),
+            None => format!("✗ backup {} ({}): {}", pod.name, out.exit_label(), out.stderr.trim()),
         },
-        Ok(out) => format!("✗ backup {} ({}): {}", pod.name, out.exit_label(), out.stderr.trim()),
         Err(e) => format!("✗ backup {} failed: {}", pod.name, describe_error(&e)),
     }
 }
@@ -1617,8 +1626,9 @@ fn build_preview(cfg: &Config, action: Action, pod: &Pod) -> Option<String> {
     match action {
         Action::Backup => Some(match &target {
             Ok(t) => {
+                // The script's arguments, not its ~100 lines (`arena pods backup --dry-run` prints it).
                 let msg = format!("arena-tui backup {}", pod.name);
-                t.display_command(&arena_core::backup::backup_command(
+                t.display_command(&arena_core::backup::backup_summary(
                     &backup_repo_path(cfg),
                     cfg.get("GIT_SSH_KEY_REMOTE"),
                     &msg,
