@@ -189,10 +189,15 @@ busy() {
   find /proc/[0-9]*/cwd /proc/[0-9]*/fd -maxdepth 1 \( -lname "$rg" -o -lname "$rg/*" -o -lname "$pg" -o -lname "$pg/*" \) -print 2>/dev/null |
     sed -n 's#^/proc/\([0-9][0-9]*\)/.*#\1#p' | sort -u | grep -vx "$$" | tr '\n' ' ' | sed 's/ $//'
 }
-# Why $R isn't the image's untouched checkout (empty = it is).
+# Why $R isn't the image's untouched checkout (empty = it is). Untracked entries are left to
+# the -cnewer scan below: the image itself ships untracked nested clones (arena-env:9.1 has 4
+# exercise dirs that are their own git repos), so `status --porcelain` counting them would
+# never call a pristine checkout untouched — and the volume copy would never be linked back
+# after a reset. Anything a participant creates, edits or deletes after the container started
+# is newer than $C and caught there (deletions via the parent dir's ctime).
 changed() {
   [ -e "$C" ] || { echo "no $C to tell when the container was created"; return; }
-  s=$(git -C "$R" --no-optional-locks status --porcelain 2>/dev/null) || { echo "a git status that fails"; return; }
+  s=$(git -C "$R" --no-optional-locks status --porcelain --untracked-files=no 2>/dev/null) || { echo "a git status that fails"; return; }
   [ -z "$s" ] || { echo "uncommitted changes"; return; }
   rg=$(glob "$R")
   n=$(find "$R" -path "$rg/.git" -prune -o -cnewer "$C" -print 2>/dev/null) || { echo "files that can't be checked"; return; }
@@ -1332,6 +1337,14 @@ mod tests {
                 for args in [&["init", "-q", "-b", "main"][..], &["add", "-A"], &["commit", "-q", "-m", "image"]] {
                     self.git(&r, args);
                 }
+                // Like the real image (arena-env:9.1): an exercise dir that is its own git
+                // clone, untracked in the parent checkout — present before the container starts.
+                let nested = r.join("chapter4/shutdown_avoidance");
+                std::fs::create_dir_all(&nested).unwrap();
+                std::fs::write(nested.join("env.py"), "upstream\n").unwrap();
+                for args in [&["init", "-q", "-b", "main"][..], &["add", "-A"], &["commit", "-q", "-m", "upstream"]] {
+                    self.git(&nested, args);
+                }
                 std::fs::write(self.mark(), "").unwrap();
             }
 
@@ -1468,7 +1481,11 @@ mod tests {
             assert_eq!(pod.read(&pod.vol_repo().join("chapter1/work.py")), "image\n");
             assert!(pod.vol_repo().join(".git/HEAD").is_file());
             assert_eq!(pod.read(&pod.repo().join("chapter1/work.py")), "image\n");
-            assert_eq!(pod.git(&pod.repo(), &["status", "--porcelain"]), "", "a working checkout through the link");
+            assert_eq!(
+                pod.git(&pod.repo(), &["status", "--porcelain", "--untracked-files=no"]),
+                "",
+                "a working checkout through the link"
+            );
             // The container-disk checkout was moved aside, not deleted; no partial copy left.
             let asides = pod.asides();
             assert_eq!(asides.len(), 1, "{asides:?}");
@@ -1508,7 +1525,9 @@ mod tests {
             type Work = fn(&Pod);
             let cases: &[(&str, Work, &str)] = &[
                 ("edit", |pod| pod.write(&pod.repo().join("chapter1/work.py"), "new work\n"), "uncommitted changes"),
-                ("untracked", |pod| pod.write(&pod.repo().join("chapter1/exercise_solution.py"), "new\n"), "uncommitted changes"),
+                ("untracked", |pod| pod.write(&pod.repo().join("chapter1/exercise_solution.py"), "new\n"), "changed since the container was created"),
+                // work inside an untracked nested clone (the image ships some) — also caught by the mark.
+                ("nested", |pod| pod.write(&pod.repo().join("chapter4/shutdown_avoidance/mine.py"), "work\n"), "changed since the container was created"),
                 // git doesn't see an ignored checkpoint — the container mark does.
                 ("ignored", |pod| pod.write(&pod.repo().join("chapter1/model.pt"), "weights\n"), "changed since the container was created"),
                 // committed (the */15 autocommit can run before setup): clean, but newer than the mark.
