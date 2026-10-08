@@ -39,6 +39,9 @@ pub enum Stage {
     Check,
     /// Distributing the per-host API keys (`pods copy-keys`).
     Keys,
+    /// `up --lock`: locking the pod, the last step (after any check — a pod `--check` must
+    /// replace has to stay terminable).
+    Lock,
 }
 
 impl Stage {
@@ -49,6 +52,7 @@ impl Stage {
             Stage::Setup => "setup",
             Stage::Check => "check",
             Stage::Keys => "keys",
+            Stage::Lock => "lock",
         }
     }
 }
@@ -409,6 +413,7 @@ devtest-echo: stopped at endpoint (Ctrl+C) — left as it was
         assert_eq!(Verdict::Ready.status_label(), "READY");
         assert_eq!(Verdict::Failed { stage: Stage::Keys, reason: String::new() }.status_label(), "FAILED keys");
         assert_eq!(Verdict::Stopped { stage: Stage::Check }.status_label(), "STOPPED check");
+        assert_eq!(Verdict::Failed { stage: Stage::Lock, reason: String::new() }.status_label(), "FAILED lock");
         assert_eq!(Verdict::Failed { stage: Stage::Create, reason: String::new() }.status_label(), "FAILED create");
         assert!(Verdict::Ready.is_ready() && !Verdict::Stopped { stage: Stage::Setup }.is_ready());
         let rows = vec![row("devtest-apple", Verdict::Failed { stage: Stage::Endpoint, reason: "no SSH endpoint after 600s".into() }, vec![])];

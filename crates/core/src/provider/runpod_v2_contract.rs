@@ -99,6 +99,8 @@ fn sandbox_pod(name: &str) -> Pod {
         ssh_port: Some(23924),
         maintenance: None,
         machine_id: None,
+        // Every recording but the lock PATCHes' answers is of the pod unlocked.
+        locked: Some(false),
     }
 }
 
@@ -216,18 +218,46 @@ fn rename_matches_the_recorded_name_only_patch() {
 /// `PATCH {"locked": …}` answers with the pod, `locked` flipped and nothing else about it
 /// changed. `actions` still offers stop/restart/terminate while locked (the API refuses
 /// them anyway — see `locked_refusals_are_locked_errors`), so lock state must be read from
-/// `locked`, never inferred from `actions`.
+/// `locked`, never inferred from `actions`. The lock/unlock the backend sends is exactly
+/// the recorded request, and the recorded answer is a success — for that request only.
 #[test]
 fn lock_patches_answer_with_the_pod() {
     for (name, locked) in [("patch_lock", true), ("patch_lock2", true), ("patch_unlock", false), ("patch_unlock2", false)] {
         let r = recorded(name);
         assert_eq!(r.request, json!({ "locked": locked }), "{name}");
-        assert_eq!(sent(api_request(&client(), "k", Method::PATCH, pod_url(POD_ID, None).unwrap())), (r.method.clone(), r.path.clone()));
+        assert_eq!(lock_payload(locked), r.request, "{name}");
+        assert_eq!(sent(lock_request(&client(), "k", POD_ID, locked).unwrap()), (r.method.clone(), r.path.clone()), "{name}");
+        assert_eq!(sent_body(lock_request(&client(), "k", POD_ID, locked).unwrap()), r.request, "{name}");
         let body = judge_v2(r.status, &r.text(), "lock pod").unwrap();
         assert_eq!(body["locked"], json!(locked), "{name}");
         assert_eq!(body["actions"], json!(["stop", "restart", "terminate"]), "{name}");
-        assert_eq!(parse_pod(&body), sandbox_pod("devtest-echo"), "{name}");
+        assert_eq!(parse_pod(&body), Pod { locked: Some(locked), ..sandbox_pod("devtest-echo") }, "{name}");
+        judge_lock(r.status, &r.text(), locked).unwrap();
+        // The same 200 for the opposite request: the pod didn't change — not a success.
+        let e = judge_lock(r.status, &r.text(), !locked).unwrap_err().to_string();
+        assert!(e.contains(&format!("still reports locked={locked}")), "{name}: {e}");
     }
+    // The list and the GET say which pods are locked (both recorded unlocked).
+    for name in ["list_one_running", "get_running"] {
+        let r = recorded(name);
+        let body = judge_v2(r.status, &r.text(), "list pods").unwrap();
+        let pod = body.get("pods").and_then(|p| p.get(0)).unwrap_or(&body);
+        assert_eq!(parse_pod(pod).locked, Some(false), "{name}");
+    }
+}
+
+/// A lock answered with an error reads as everywhere on v2: a locked-pod refusal stays
+/// `Locked`, a 401 stays `Auth` — and the context names which way it went.
+#[test]
+fn lock_errors_keep_their_meaning() {
+    let r = recorded("locked_stop_refused");
+    let e = judge_lock(r.status, &r.text(), false).unwrap_err();
+    assert!(e.is_locked() && e.to_string().contains("unlock pod HTTP 400"), "{e}");
+    let e = judge_lock(StatusCode::UNAUTHORIZED, "", true).unwrap_err();
+    assert_eq!(e.kind(), Some(ProviderErrorKind::Auth), "{e}");
+    assert!(e.to_string().contains("lock pod HTTP 401"), "{e}");
+    // A 2xx with no pod in it: the status is the contract.
+    judge_lock(StatusCode::NO_CONTENT, "", true).unwrap();
 }
 
 /// A locked pod's stop, restart and DELETE come back `400 {"detail": "Pod is locked"}`:
@@ -259,6 +289,9 @@ async fn locked_refusals_are_locked_errors() {
         assert_ne!(e.kind(), Some(ProviderErrorKind::Capacity), "{name}");
         let msg = e.to_string();
         assert!(msg.contains(&format!("{ctx} HTTP 400")) && msg.contains("Pod is locked"), "{name}: {msg}");
+        // What other crates' fakes replay (`recorded::locked_refusal`) reads the same.
+        let replayed = super::recorded::locked_refusal(ctx);
+        assert!(replayed.is_locked() && replayed.to_string() == msg, "{name}: {replayed} vs {msg}");
         // Not retried: one attempt, then the error.
         let attempts = std::sync::atomic::AtomicU32::new(0);
         let policy = crate::retry::RetryPolicy { max_retries: 3, base_delay: std::time::Duration::ZERO, max_delay: std::time::Duration::ZERO };
@@ -313,6 +346,7 @@ async fn unknown_gpu_create_is_a_config_error() {
         docker_args: None,
         allowed_cuda: Vec::new(),
         max_price: None,
+        api_extra: None,
     };
     let ours = create_payload(&spec, &[]).unwrap();
     for (k, v) in r.request.as_object().unwrap() {

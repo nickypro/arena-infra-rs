@@ -5,6 +5,8 @@
 //! existing bash/python tooling, and a safety posture where nothing here mutates
 //! remote state unless a caller explicitly asks it to.
 
+pub mod apiextra;
+pub mod apiget;
 pub mod apikeys;
 pub mod backup;
 pub(crate) mod base64;
@@ -15,6 +17,7 @@ pub mod gpu;
 pub mod health;
 pub(crate) mod http;
 pub mod jobs;
+pub mod lock;
 pub mod metrics;
 pub mod naming;
 pub mod openrouter;

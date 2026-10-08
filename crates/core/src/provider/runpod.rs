@@ -16,11 +16,12 @@ use reqwest::{Client, RequestBuilder};
 use serde_json::{json, Value};
 
 use super::Provider;
+use crate::apiextra::{self, managed, Extra, Managed};
 use crate::error::{Error, ProviderErrorKind, Result};
 use crate::http::{send_json, send_ok};
 use crate::pod::{Maintenance, Pod, PodSpec};
 
-const BASE: &str = "https://rest.runpod.io/v1";
+pub(crate) const BASE: &str = "https://rest.runpod.io/v1";
 
 /// RunPod's GraphQL endpoint. The key goes in the `Authorization: Bearer` header — NEVER
 /// the `?api_key=` query param RunPod also accepts: reqwest's error `Display` includes the
@@ -86,10 +87,36 @@ impl RunpodProvider {
     }
 }
 
+/// The REST v1 create-body fields the tool sets itself, refused in `--api-json` /
+/// `CREATE_EXTRA_JSON` (plus the `ports` rule: keep `22/tcp`). `volumeMountPath` is ours
+/// too: the restart/stop gate assumes a volume at /workspace. `templateId` is refused
+/// because a template fills in what the body leaves out — a start command, a volume path —
+/// i.e. exactly the fields above; `computeType` because `CPU` would make a pod with no GPU
+/// out of a GPU spec.
+const MANAGED: &[Managed] = &[
+    managed(&["name"], "the machine name"),
+    managed(&["imageName"], "--image / IMAGE"),
+    managed(&["gpuTypeIds"], "--gpu / GPU_TYPE"),
+    managed(&["gpuCount"], "--gpus / NUM_GPUS"),
+    managed(&["cloudType"], "--cloud / CLOUD_TYPE"),
+    managed(&["containerDiskInGb"], "--disk / DISK_GB"),
+    managed(&["volumeInGb"], "--volume / VOLUME_GB"),
+    managed(&["volumeMountPath"], "always /workspace"),
+    managed(&["allowedCudaVersions"], "ALLOWED_CUDA_VERSIONS"),
+    managed(&["env", "PUBLIC_KEY"], "the cohort SSH keys"),
+    managed(&["env", "MACHINE_NAME"], "the machine name"),
+    managed(&["dockerStartCmd"], "--bootstrap, else the image's own, which starts sshd"),
+    managed(&["dockerEntrypoint"], "the image's own, which starts sshd"),
+    managed(&["locked"], "`pods up --lock` (RUNPOD_API=v2)"),
+    managed(&["templateId"], "the flags above — a template would override the start command and volume arena sets"),
+    managed(&["computeType"], "--gpu / GPU_TYPE: arena makes GPU pods"),
+];
+
 /// Build the REST v1 `POST /pods` body from a spec. Pure (no I/O) so it's unit-testable —
 /// the field names must match the REST schema exactly (a stray key is a 400, e.g. the old
 /// GraphQL `dockerArgs` which REST rejects in favor of the `dockerStartCmd` argv).
-fn create_payload(spec: &PodSpec) -> Value {
+/// `spec.api_extra` (`--api-json`) is deep-merged in last, minus the [`MANAGED`] fields.
+fn create_payload(spec: &PodSpec) -> Result<Value> {
     let env: serde_json::Map<String, Value> = spec
         .env
         .iter()
@@ -117,7 +144,8 @@ fn create_payload(spec: &PodSpec) -> Value {
     if !spec.allowed_cuda.is_empty() {
         payload["allowedCudaVersions"] = json!(spec.allowed_cuda);
     }
-    payload
+    apiextra::apply(&mut payload, spec.api_extra.as_ref(), MANAGED, Some("ports"))?;
+    Ok(payload)
 }
 
 fn parse_pod(v: &Value) -> Pod {
@@ -166,6 +194,10 @@ fn parse_pod(v: &Value) -> Pod {
         ssh_port,
         maintenance: None,
         machine_id: None,
+        // REST v1's pod carries `locked` too, when it says (best-effort: v1 can't change
+        // it — `pods lock`/`unlock` need RUNPOD_API=v2 — but a lock set in the console is
+        // still shown, and still refused up front by stop/restart/terminate).
+        locked: v.get("locked").and_then(Value::as_bool),
     }
 }
 
@@ -206,7 +238,7 @@ impl Provider for RunpodProvider {
     }
 
     async fn create_pod(&self, spec: &PodSpec) -> Result<Pod> {
-        let payload = create_payload(spec);
+        let payload = create_payload(spec)?;
         let rb = self.auth(self.client.post(format!("{}/pods", self.base)).json(&payload));
         let body = send_json(rb, "create pod").await?;
         Ok(parse_pod(&body))
@@ -247,6 +279,24 @@ impl Provider for RunpodProvider {
     async fn pod_spec(&self, id: &str) -> Result<PodSpec> {
         let body = send_json(self.auth(self.client.get(format!("{}/pods/{id}", self.base))), "get pod").await?;
         Ok(parse_spec(&body))
+    }
+
+    fn lock_support(&self, _pod: &Pod) -> Result<()> {
+        // REST v1's only pod PATCH resets the container (see `reimage_pod`), so it can't be
+        // used to flip a lock; v2's PATCH can.
+        Err(Error::NotImplemented("not supported on RUNPOD_API=v1 — set RUNPOD_API=v2 to lock RunPod pods".into()))
+    }
+
+    async fn set_locked(&self, id: &str, _locked: bool) -> Result<()> {
+        self.lock_support(&Pod { id: id.into(), ..Default::default() })
+    }
+
+    fn check_create_extra(&self, extra: &Extra) -> Result<()> {
+        apiextra::check(extra, MANAGED, Some("ports"))
+    }
+
+    fn preview_create_body(&self, spec: &PodSpec) -> Result<Value> {
+        create_payload(spec)
     }
 }
 
@@ -380,6 +430,7 @@ fn parse_spec(v: &Value) -> PodSpec {
         docker_args: None,
         allowed_cuda: Vec::new(),
         max_price: None,
+        api_extra: None,
     }
 }
 
@@ -826,12 +877,13 @@ mod tests {
             docker_args: None,
             allowed_cuda: Vec::new(),
             max_price: None,
+            api_extra: None,
         }
     }
 
     #[test]
     fn payload_omits_start_cmd_without_bootstrap() {
-        let p = create_payload(&spec());
+        let p = create_payload(&spec()).unwrap();
         // No bootstrap => no start-command key at all (image's own CMD runs).
         assert!(p.get("dockerStartCmd").is_none());
         // And never the old GraphQL field name (that's what caused the 400).
@@ -844,7 +896,7 @@ mod tests {
     fn payload_sends_start_cmd_as_argv_array() {
         let mut s = spec();
         s.docker_args = Some(vec!["bash".into(), "-c".into(), "/usr/sbin/sshd -D".into()]);
-        let p = create_payload(&s);
+        let p = create_payload(&s).unwrap();
         // REST v1 wants an array of strings under `dockerStartCmd`, not a `dockerArgs` string.
         assert_eq!(p["dockerStartCmd"], json!(["bash", "-c", "/usr/sbin/sshd -D"]));
         assert!(p.get("dockerArgs").is_none());
@@ -877,9 +929,9 @@ mod tests {
     #[test]
     fn payload_sends_allowed_cuda_only_when_set() {
         let mut s = spec();
-        assert!(create_payload(&s).get("allowedCudaVersions").is_none());
+        assert!(create_payload(&s).unwrap().get("allowedCudaVersions").is_none());
         s.allowed_cuda = vec!["13.0".into()];
-        assert_eq!(create_payload(&s)["allowedCudaVersions"], json!(["13.0"]));
+        assert_eq!(create_payload(&s).unwrap()["allowedCudaVersions"], json!(["13.0"]));
     }
 
     #[test]

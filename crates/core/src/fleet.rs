@@ -241,6 +241,18 @@ pub const POD_HEADERS: [&str; 8] = ["NAME", "PROVIDER", "ID", "STATUS", "GPU", "
 pub const POD_ALIGN: [Align; 8] =
     [Align::Left, Align::Left, Align::Left, Align::Left, Align::Left, Align::Right, Align::Left, Align::Left];
 
+/// The STATUS column: the short status (`run`, `exit`…), plus ` locked` when the provider
+/// reports the pod locked ([`crate::lock`]) — a glance at `pods list` says which pods refuse
+/// stop, restart and terminate. A backend that doesn't report a lock adds nothing.
+pub fn status_label(p: &Pod) -> String {
+    let s = short_status(&p.status);
+    if crate::lock::is_locked(p) {
+        format!("{s} locked")
+    } else {
+        s
+    }
+}
+
 /// One pod's cells under [`POD_HEADERS`] — shared with `arena snapshot`'s table, which adds
 /// its own columns, so a pod's labels read the same in both.
 pub fn pod_cells(p: &Pod) -> Vec<String> {
@@ -248,7 +260,7 @@ pub fn pod_cells(p: &Pod) -> Vec<String> {
         p.name.clone(),
         p.provider.clone(),
         p.id.clone(),
-        short_status(&p.status),
+        status_label(p),
         gpu_label(p),
         price_label(p),
         endpoint_label(p),
@@ -305,6 +317,19 @@ mod tests {
         for (ty, n, want) in cases {
             assert_eq!(gpu_label(&mk(*ty, *n)), *want, "{ty:?} {n:?}");
         }
+    }
+
+    #[test]
+    fn status_label_says_locked_only_when_the_provider_does() {
+        let mut p = pod("a", "runpod", "RUNNING");
+        assert_eq!(status_label(&p), "run");
+        p.locked = Some(false);
+        assert_eq!(status_label(&p), "run");
+        p.locked = Some(true);
+        assert_eq!(status_label(&p), "run locked");
+        p.status = "EXITED".into();
+        assert_eq!(status_label(&p), "exit locked");
+        assert_eq!(pod_cells(&p)[3], "exit locked");
     }
 
     #[test]
@@ -453,6 +478,7 @@ mod tests {
                     None,
                 )),
                 machine_id: None,
+                locked: None,
             },
             Pod {
                 id: "def456".into(),

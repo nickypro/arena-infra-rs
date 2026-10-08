@@ -8,8 +8,10 @@
 //!   callers that must not mistake "that backend didn't answer" for "that backend has no
 //!   pods" — the proxy merge, which only drops a forward on a *successful* listing.
 //! - `create_pod` goes to the chosen primary (the `--provider` / `ARENA_PROVIDER`).
-//! - `stop`/`restart`/`terminate` route to whichever backend actually owns the pod id, and
-//!   so does `restart_wipes_container_disk` (by the pod's provider tag, then the id cache).
+//! - `stop`/`restart`/`terminate`/`set_locked` route to whichever backend actually owns the
+//!   pod id, and so do `restart_wipes_container_disk` and `lock_support` (by the pod's
+//!   provider tag, then the id cache).
+//! - `check_create_extra`/`preview_create_body` are the primary's, like `create_pod`.
 //! - `enrich` hands each pod to the backend that listed it; a failing backend is reported
 //!   (as one error naming it) without costing the other backends' pods their details.
 //!
@@ -18,6 +20,7 @@
 
 use async_trait::async_trait;
 
+use crate::apiextra::Extra;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::pod::{Pod, PodSpec};
@@ -39,6 +42,16 @@ pub struct MultiProvider {
 }
 
 impl MultiProvider {
+    /// The backend that listed `pod`, without a request: by its `provider` tag first (set by
+    /// that backend, so unambiguous even if two backends' numeric ids collide), else the
+    /// id→backend cache. `None` = no backend claims it.
+    fn owner_of(&self, pod: &Pod) -> Option<usize> {
+        self.backends
+            .iter()
+            .position(|b| b.name() == pod.provider)
+            .or_else(|| self.owner.lock().unwrap().get(&pod.id).copied())
+    }
+
     /// The backend that owns `id`, using the cache; on a miss, refresh via a full list.
     async fn backend_for(&self, id: &str) -> Result<&dyn Provider> {
         if let Some(i) = self.owner.lock().unwrap().get(id).copied() {
@@ -163,10 +176,22 @@ impl Provider for MultiProvider {
         // Ask the backend that owns the pod: by its `provider` tag first (as `enrich`),
         // else the id→backend cache. A pod no backend claims is assumed to wipe — the
         // answer only ever adds a confirmation, never removes one.
-        let owner = self.backends.iter().position(|b| b.name() == pod.provider).or_else(|| {
-            self.owner.lock().unwrap().get(&pod.id).copied()
-        });
-        owner.map_or(true, |i| self.backends[i].restart_wipes_container_disk(pod))
+        self.owner_of(pod).map_or(true, |i| self.backends[i].restart_wipes_container_disk(pod))
+    }
+    fn lock_support(&self, pod: &Pod) -> Result<()> {
+        match self.owner_of(pod) {
+            Some(i) => self.backends[i].lock_support(pod),
+            None => Err(Error::NotImplemented(format!("no configured provider owns pod `{}` — can't lock it", pod.name))),
+        }
+    }
+    async fn set_locked(&self, id: &str, locked: bool) -> Result<()> {
+        self.backend_for(id).await?.set_locked(id, locked).await
+    }
+    fn check_create_extra(&self, extra: &Extra) -> Result<()> {
+        self.backends[self.primary].check_create_extra(extra)
+    }
+    fn preview_create_body(&self, spec: &PodSpec) -> Result<serde_json::Value> {
+        self.backends[self.primary].preview_create_body(spec)
     }
     async fn terminate_pod(&self, id: &str) -> Result<()> {
         self.backend_for(id).await?.terminate_pod(id).await
@@ -452,6 +477,69 @@ mod tests {
         let e = m.authorize_ssh_keys(&tagged_pod("7", "runpod"), &[]).await.unwrap_err();
         assert!(matches!(e, Error::NotImplemented(_)), "{e}");
         assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    /// A backend that can lock (like RunPod v2), recording each (id, locked) it was asked.
+    struct Locks {
+        seen: Arc<Mutex<Vec<(String, bool)>>>,
+    }
+
+    #[async_trait]
+    impl Provider for Locks {
+        fn name(&self) -> &'static str {
+            "runpod"
+        }
+        fn describe(&self, _spec: &PodSpec) -> String {
+            String::new()
+        }
+        async fn list_pods(&self) -> Result<Vec<Pod>> {
+            Ok(vec![tagged_pod("r1", "runpod")])
+        }
+        async fn create_pod(&self, _spec: &PodSpec) -> Result<Pod> {
+            unimplemented!("not exercised")
+        }
+        async fn stop_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn restart_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn terminate_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        fn lock_support(&self, _pod: &Pod) -> Result<()> {
+            Ok(())
+        }
+        async fn set_locked(&self, id: &str, locked: bool) -> Result<()> {
+            self.seen.lock().unwrap().push((id.to_string(), locked));
+            Ok(())
+        }
+        fn check_create_extra(&self, _extra: &Extra) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Lock questions and calls go to the pod's own backend; a backend that can't lock
+    /// (the default) says so, and a pod nobody owns is refused — never sent anywhere. The
+    /// create passthrough is the primary's, as the create is.
+    #[tokio::test]
+    async fn locks_route_to_the_owning_backend() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut m = multi(vec![Fake { name: "vast", pods: Some(vec![pod("v1", "arena8-bloom")]) }]);
+        m.backends.push(Box::new(Locks { seen: seen.clone() }));
+        assert!(m.lock_support(&tagged_pod("r1", "runpod")).is_ok());
+        let e = m.lock_support(&tagged_pod("v1", "vast")).unwrap_err().to_string();
+        assert!(e.contains("not supported on vast") && e.contains("RUNPOD_API=v2"), "{e}");
+        assert!(m.lock_support(&tagged_pod("x1", "lambda")).unwrap_err().to_string().contains("no configured provider owns"));
+        m.set_locked("r1", true).await.unwrap();
+        m.set_locked("r1", false).await.unwrap();
+        assert!(m.set_locked("v1", true).await.is_err(), "vast can't lock");
+        assert_eq!(*seen.lock().unwrap(), [("r1".to_string(), true), ("r1".to_string(), false)]);
+        // The primary (vast, the default impl) refuses an extra; it's the primary's call.
+        let extra: Extra = serde_json::from_str(r#"{"price": 0.1}"#).unwrap();
+        assert!(m.check_create_extra(&extra).unwrap_err().to_string().contains("isn't supported on provider `vast`"));
+        m.primary = 1;
+        assert!(m.check_create_extra(&extra).is_ok());
     }
 
     #[tokio::test]

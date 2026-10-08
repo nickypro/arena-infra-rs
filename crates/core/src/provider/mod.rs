@@ -4,6 +4,7 @@
 
 use async_trait::async_trait;
 
+use crate::apiextra::{Extra, SOURCES};
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::pod::{Pod, PodSpec};
@@ -248,6 +249,38 @@ pub trait Provider: Send + Sync {
         )))
     }
 
+    /// Whether `pod`'s backend can lock and unlock it ([`Self::set_locked`]); `Err` says why
+    /// not, in the operator's words. Pure: `pods lock`/`unlock` sort a selection with it
+    /// before anything is asked, and `up --lock` checks its create target before creating.
+    /// Takes the pod so the fleet provider can route the question to the pod's backend.
+    /// Default: unsupported — RunPod REST v2 is the only API here with a pod lock.
+    fn lock_support(&self, _pod: &Pod) -> Result<()> {
+        Err(lock_unsupported(self.name()))
+    }
+
+    /// Mutating, idempotent. Lock (`true`) or unlock a pod in place. A locked pod refuses
+    /// stop, restart and terminate — from any client, the provider's console included (see
+    /// [`crate::lock`]); nothing else about it changes. Default: unsupported.
+    async fn set_locked(&self, _id: &str, _locked: bool) -> Result<()> {
+        Err(lock_unsupported(self.name()))
+    }
+
+    /// Pure. Check `--api-json` / `CREATE_EXTRA_JSON` against this backend's create request
+    /// before anything is listed or created: the fields the tool sets itself are refused
+    /// ([`crate::apiextra`]). Default: refused outright — a backend whose create doesn't
+    /// merge the extra fields must not silently drop them.
+    fn check_create_extra(&self, _extra: &Extra) -> Result<()> {
+        Err(Error::Config(format!("{SOURCES} isn't supported on provider `{}`", self.name())))
+    }
+
+    /// Pure. The create request body this backend would send for `spec`, with
+    /// `spec.api_extra` merged in — for `create`/`up --dry-run` to show exactly what goes
+    /// out. Without what the create itself looks up first (RunPod v2's account SSH keys,
+    /// Vast's offer). Default: not available.
+    fn preview_create_body(&self, _spec: &PodSpec) -> Result<serde_json::Value> {
+        Err(Error::NotImplemented(format!("no create-body preview on provider `{}`", self.name())))
+    }
+
     /// Read-only. Best-effort recovery of the spec needed to recreate this pod — the
     /// "same spec by default" half of `replace`. `name` is returned empty for the caller
     /// to fill; fields the provider can't recover are left at their spec defaults (the
@@ -258,6 +291,14 @@ pub trait Provider: Send + Sync {
             self.name()
         )))
     }
+}
+
+/// Why a backend can't lock a pod (the [`Provider::lock_support`] default). RunPod pods can
+/// be locked only through REST v2; on v1 the RunPod backend says so itself.
+pub(crate) fn lock_unsupported(provider: &str) -> Error {
+    Error::NotImplemented(format!(
+        "not supported on {provider} — only RunPod pods can be locked, with RUNPOD_API=v2"
+    ))
 }
 
 #[cfg(test)]
@@ -278,6 +319,138 @@ mod tests {
             docker_args: None,
             allowed_cuda: Vec::new(),
             max_price: None,
+            api_extra: None,
+        }
+    }
+
+    /// Locking is RunPod v2's alone; every other backend says why not, before any request.
+    #[test]
+    fn only_runpod_v2_can_lock() {
+        let keys = "RUNPOD_API_KEY=k\nVAST_API_KEY=v\nHETZNER_API_KEY=h\n";
+        for (name, api, ok, why) in [
+            ("runpod", "v2", true, ""),
+            ("runpod", "v1", false, "RUNPOD_API=v2"),
+            ("vast", "v1", false, "not supported on vast"),
+            ("hetzner", "v2", false, "not supported on hetzner"),
+        ] {
+            let p = build(name, &Config::parse(&format!("{keys}RUNPOD_API={api}"))).unwrap();
+            let pod = Pod { provider: name.into(), ..Default::default() };
+            match p.lock_support(&pod) {
+                Ok(()) => assert!(ok, "{name} {api}"),
+                Err(e) => {
+                    assert!(!ok, "{name} {api}");
+                    assert!(e.to_string().contains(why), "{name} {api}: {e}");
+                }
+            }
+        }
+    }
+
+    /// Every backend merges `--api-json` into the body it would send and refuses the name
+    /// field it sets itself (each spells it its own way) — checked up front and again when
+    /// the body is built.
+    #[test]
+    fn every_backend_takes_api_extra_and_refuses_its_own_fields() {
+        let keys = "RUNPOD_API_KEY=k\nVAST_API_KEY=v\nHETZNER_API_KEY=h\n";
+        // (backend, RUNPOD_API, a field it passes through, its name field)
+        for (name, api, pass, own) in [
+            ("runpod", "v1", "interruptible", "name"),
+            ("runpod", "v2", "dataCenterIds", "name"),
+            ("vast", "v1", "price", "label"),
+            ("hetzner", "v1", "labels", "name"),
+        ] {
+            let p = build(name, &Config::parse(&format!("{keys}RUNPOD_API={api}"))).unwrap();
+            let ok: Extra = serde_json::from_str(&format!(r#"{{"{pass}": {{"x": 1}}}}"#)).unwrap();
+            let bad: Extra = serde_json::from_str(&format!(r#"{{"{own}": "other"}}"#)).unwrap();
+            p.check_create_extra(&ok).unwrap_or_else(|e| panic!("{name} {api}: {e}"));
+            let e = p.check_create_extra(&bad).unwrap_err().to_string();
+            assert!(e.contains(&format!("`{own}` is set by arena")), "{name} {api}: {e}");
+            let mut s = spec();
+            s.api_extra = Some(ok);
+            let body = p.preview_create_body(&s).unwrap_or_else(|e| panic!("{name} {api}: {e}"));
+            assert_eq!(body[pass], serde_json::json!({"x": 1}), "{name} {api}");
+            assert_eq!(body[own], "devtest-apple", "{name} {api}: ours kept");
+            s.api_extra = Some(bad);
+            assert!(p.preview_create_body(&s).is_err(), "{name} {api}");
+        }
+    }
+
+    /// The fields each backend sets itself, in its own spelling — the spec's list (name/label,
+    /// GPU, tier, image, PUBLIC_KEY, MACHINE_NAME, dropping 22/tcp) plus what would set them
+    /// indirectly (a template; v1's CPU compute type) — are refused up front with a config
+    /// error naming the field; what the tool doesn't set passes.
+    #[test]
+    fn each_backend_refuses_its_managed_fields_by_their_own_names() {
+        let keys = "RUNPOD_API_KEY=k\nVAST_API_KEY=v\nHETZNER_API_KEY=h\n";
+        // (backend, RUNPOD_API, refused extras, accepted extras)
+        let cases: &[(&str, &str, &[&str], &[&str])] = &[
+            (
+                "runpod",
+                "v1",
+                &[
+                    r#"{"name":"x"}"#,
+                    r#"{"gpuTypeIds":["NVIDIA H100"]}"#,
+                    r#"{"gpuCount":8}"#,
+                    r#"{"cloudType":"SECURE"}"#,
+                    r#"{"imageName":"x"}"#,
+                    r#"{"env":{"PUBLIC_KEY":"k"}}"#,
+                    r#"{"env":{"MACHINE_NAME":"x"}}"#,
+                    r#"{"ports":["8888/http"]}"#,
+                    r#"{"templateId":"t1"}"#,
+                    r#"{"computeType":"CPU"}"#,
+                    r#"{"locked":true}"#,
+                ],
+                &[r#"{"dataCenterIds":["EU-RO-1"],"interruptible":true,"env":{"FOO":"1"},"networkVolumeId":"v1"}"#],
+            ),
+            (
+                "runpod",
+                "v2",
+                &[
+                    r#"{"name":"x"}"#,
+                    r#"{"gpu":{"id":"NVIDIA H100"}}"#,
+                    r#"{"gpu":{"count":8}}"#,
+                    r#"{"cloud":"SECURE"}"#,
+                    r#"{"image":"x"}"#,
+                    r#"{"env":{"PUBLIC_KEY":"k"}}"#,
+                    r#"{"env":{"MACHINE_NAME":"x"}}"#,
+                    r#"{"ports":["8888/http"]}"#,
+                    r#"{"templateId":"t1"}"#,
+                    r#"{"locked":true}"#,
+                ],
+                &[r#"{"dataCenterIds":["EU-RO-1"],"globalNetworking":true,"gpu":{"minRamPerGpu":32},"startJupyter":true}"#],
+            ),
+            (
+                "vast",
+                "v1",
+                &[
+                    r#"{"label":"x"}"#,
+                    r#"{"image":"x"}"#,
+                    r#"{"env":{"PUBLIC_KEY":"k"}}"#,
+                    r#"{"env":{"MACHINE_NAME":"x"}}"#,
+                    r#"{"runtype":"jupyter"}"#,
+                    r#"{"onstart":"true"}"#,
+                    r#"{"template_hash_id":"abc"}"#,
+                ],
+                &[r#"{"price":0.2,"env":{"FOO":"1"}}"#],
+            ),
+            (
+                "hetzner",
+                "v1",
+                &[r#"{"name":"x"}"#, r#"{"server_type":"cx53"}"#, r#"{"image":"debian-12"}"#, r#"{"ssh_keys":["other"]}"#],
+                &[r##"{"labels":{"cohort":"devtest"},"user_data":"#cloud-config"}"##],
+            ),
+        ];
+        for (name, api, refused, accepted) in cases {
+            let p = build(name, &Config::parse(&format!("{keys}RUNPOD_API={api}"))).unwrap();
+            for text in *refused {
+                let extra: Extra = serde_json::from_str(text).unwrap();
+                let e = p.check_create_extra(&extra).unwrap_err();
+                assert!(matches!(e, Error::Config(_)), "{name} {api} {text}: {e:?}");
+                assert!(e.to_string().contains("set by arena") || e.to_string().contains("22/tcp"), "{name} {api} {text}: {e}");
+            }
+            for text in *accepted {
+                let extra: Extra = serde_json::from_str(text).unwrap();
+                p.check_create_extra(&extra).unwrap_or_else(|e| panic!("{name} {api} {text}: {e}"));
+            }
         }
     }
 

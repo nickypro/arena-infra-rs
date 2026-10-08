@@ -15,12 +15,13 @@ means this.
 
 | Legacy script | Rust CLI | TUI | Status | Notes |
 |---|---|---|---|---|
-| `create_new_pods.py -n/-a/<names>` `--gpu-type --gpu-count --cloud-type --docker-image --disk-space-in-gb --volume-space-in-gb` | `pods create [names…] -n/-a --gpu --gpus --cloud --disk --volume --image [--bootstrap]` (+ `--keep-trying --retry-mins --retry-secs`) | `n` add-pod form | ✅ | Plus **multi-option placement**: `--gpu A4000,3090 --cloud community,secure --max-price X --order cheapest\|listed` — one create at a time per name, capacity blocks an option for the round. `--gpu` is checked against RunPod's live catalog (aliases `3070`, `L4`, …; "did you mean"). Ends with a proxy sync (`--skip-proxy`). |
-| — | `pods up [names…] -n/-a …` (create's flags) `--check --check-attempts --timeout --interval --no-setup --no-wait` | — | ➕ | One-command spin-up as **one pipeline per pod**: endpoint → proxy → setup → [`--check`: deep check; a FAIL host is terminated and the name recreated, never on a host that already failed] → API keys → `[name] READY`/`FAILED <stage>`; summary table; non-zero exit unless every name is READY. |
+| `create_new_pods.py -n/-a/<names>` `--gpu-type --gpu-count --cloud-type --docker-image --disk-space-in-gb --volume-space-in-gb` | `pods create [names…] -n/-a --gpu --gpus --cloud --disk --volume --image [--bootstrap]` (+ `--keep-trying --retry-mins --retry-secs`) | `n` add-pod form | ✅ | Plus **multi-option placement**: `--gpu A4000,3090 --cloud community,secure --max-price X --order cheapest\|listed` — one create at a time per name, capacity blocks an option for the round. `--gpu` is checked against RunPod's live catalog (aliases `3070`, `L4`, …; "did you mean"). Ends with a proxy sync (`--skip-proxy`). `--api-json '<object>'` (+ config `CREATE_EXTRA_JSON`) deep-merges API options without a flag into the create body; fields arena sets are refused before any call; `--dry-run` prints the merged body (secrets redacted). |
+| — | `pods up [names…] -n/-a …` (create's flags) `--check --check-attempts --lock --timeout --interval --no-setup --no-wait` | — | ➕ | One-command spin-up as **one pipeline per pod**: endpoint → proxy → setup → [`--check`: deep check; a FAIL host is terminated and the name recreated, never on a host that already failed] → API keys → [`--lock`: lock it] → `[name] READY`/`FAILED <stage>`; summary table; non-zero exit unless every name is READY. |
+| — | `pods lock <selector>/--all` · `pods unlock <selector>/--all` | `L` badge; restart/stop/terminate on a locked pod refused | ➕ | RunPod v2 pod lock: RunPod refuses stop/restart/terminate on a locked pod from **any** client (its console included). stop/restart/reimage/terminate/replace/migrate refuse a locked pod up front ("… is locked — `arena pods unlock …` first"); only `terminate --unlock` lifts a lock itself. v1/Vast/Hetzner: "not supported", non-zero exit. |
 | — | `offers [--gpu --cloud --max-price --gpus --order --json]` | — | ➕ | Read-only: the option plan `create`/`up` would try ($/h per pod, price source, stock hint, what the cap dropped). |
-| `list_pods.py` | `pods list` (`--json --probe --no-probe`) | List view | ✅ | NAME PROVIDER ID STATUS GPU $/H ENDPOINT MAINT + `fleet: $X/h across N billing pod(s)` footer (billing per `status::bills_hourly`: up or on its way up, or any existing Hetzner server; € kept apart). GPU/$/maintenance from one read-only GraphQL query (on `RUNPOD_API=v2` GPU/$ come with the REST list; GraphQL adds only maintenance); GPU confirmed over SSH (`nvidia-smi`) for the table. |
+| `list_pods.py` | `pods list` (`--json --probe --no-probe`) | List view | ✅ | NAME PROVIDER ID STATUS (`run locked`) GPU $/H ENDPOINT MAINT + `fleet: $X/h across N billing pod(s)` footer (billing per `status::bills_hourly`: up or on its way up, or any existing Hetzner server; € kept apart). GPU/$/maintenance from one read-only GraphQL query (on `RUNPOD_API=v2` GPU/$ come with the REST list; GraphQL adds only maintenance); GPU confirmed over SSH (`nvidia-smi`) for the table. |
 | `stop_pods.py --include --exclude` (bulk, all RUNNING) | `pods stop <selector> / --all [--wipe-ok]` | Menu→Stop `[s]` (typed name) | ✅ | Stops every selected **billing** pod. A stopped RunPod pod keeps no container disk, so it needs `--wipe-ok` unless the repo is on a `/workspace` volume. |
-| `delete_pods.py --include --exclude` (EXITED only) | `pods terminate <one pod> / --all [--revoke-key]` | Menu→Terminate `[t]` · `/`-marked set via `A` | ✅ | One pod (name/id; a shared name is refused) or the whole fleet — no ranges, it's irreversible. `--revoke-key` also deletes its OpenRouter key(s). Ends with a proxy sync. |
+| `delete_pods.py --include --exclude` (EXITED only) | `pods terminate <one pod> / --all [--revoke-key] [--unlock]` | Menu→Terminate `[t]` · `/`-marked set via `A` | ✅ | One pod (name/id; a shared name is refused) or the whole fleet — no ranges, it's irreversible. `--revoke-key` also deletes its OpenRouter key(s). Ends with a proxy sync. |
 | `kill_pods.py --timeout` (stop→wait→delete) | — | — | ❌ | `pods kill` was dropped (3604c0c): `terminate` deletes directly; use `stop` first if you want the old sequence. |
 | `setup_em.sh --force` | `pods setup [selector] [--force --timeout --hf-token --cc-token --zsh-install]` | Menu/Fleet→Setup `[p]` | ✅ | Every step on a budget (copies 60 s, config 300 s, Hetzner script 1800 s; `--timeout`/`SETUP_TIMEOUT_SECS`); a wedged pod reports `timed out at <step>`, the rest carry on. Fetches only the default branch. Distributes per-host API keys to the pods that set up OK. |
 | — | `pods restart <one pod> [--wipe-ok --no-setup --skip-proxy]` | Menu→Restart `[r]` · marked set | ➕ | **Wipes the container disk** on RunPod (Vast treated the same): refused without `--wipe-ok` unless the repo is on a `/workspace` volume; afterwards re-runs `setup` and syncs the proxy. Hetzner keeps its disk. |
@@ -63,6 +64,7 @@ means this.
 | `copy_api_keys.py` (CSV → pod `~/.bashrc`/`~/.zshrc`) | `pods copy-keys [selector] [--keys-dir --hf-token --cc-token]` | — | ✅ | Per-host CSVs (openai/anthropic/openrouter) + broadcast Hugging Face and Claude Code tokens. Idempotent; 60 s per pod. |
 | — | `keys gen/list/rotate/revoke/which` | — | ➕ | OpenRouter runtime keys via the provisioning API (one per machine, USD cap), written to `keys/openrouter_api_keys.csv`. |
 | — | `gpus [--json]` | add-pod GPU list | ➕ | RunPod's live catalog (VRAM, community/secure $/h, stock), else presets. |
+| — | `api get <runpod\|runpod-v1\|runpod-v2\|vast\|hetzner> <path> [--raw]` | — | ➕ | Read-only GET passthrough to the provider's API (no other verb): relative paths only (absolute URLs/`//host`/`..` refused, no redirects followed), pretty JSON with secrets redacted unless `--raw`; the API key is never printed. |
 | — | `config check / set / which` | — | ➕ | `check` shows set/missing only (and which RunPod API is active); `set` can read the value from stdin, keeping it out of `argv`. |
 | — | `plan check / show` (scheduled provisioning) | — | ➕ | Executor + arm/disarm still pending. |
 | — | `cron install/remove/show` (`--pull --proxy --snapshot DIR --start-date`) | — | ➕ | Edits only arena's block of the user's crontab. |
@@ -75,6 +77,7 @@ means this.
 | `SSH_PROXY_RELOAD_CMD` | absent → `nginx -t && nginx -s reload` | Run after a proxy write; **empty = write-only** (never reloads nginx). Settable (empty) from the environment, as the sandbox wrapper does. |
 | `SETUP_TIMEOUT_SECS` | 300 (image pods) / 1800 (Hetzner script) | The main setup step's budget, 1..86400, for `setup`, `up`, `restart`, `replace`, `migrate copy`; `setup --timeout` wins. Checked before `up` creates anything. |
 | `ARENA_STATE_DIR` | `${XDG_STATE_HOME:-~/.local/state}/arena` | Root of the health cache, `<dir>/<prefix>/health.json` (absolute path). Settable from the environment, so a cron job and the operator can share one. |
+| `CREATE_EXTRA_JSON` | unset | One JSON object (single-quoted) deep-merged into every create request body — `create`/`up` (`--api-json` merges over it), the TUI's add-pod form, `replace`/`migrate copy`'s replacement. Fields arena sets itself (and templates) are refused before any call. |
 | `MIN_DRIVER_VERSION` | derived from `ALLOWED_CUDA_VERSIONS` (13.x → 580, 12.8 → 570, …) | The deep check's driver floor (`580` or `580.65.06`; `none` = no check). A malformed value fails `up --check` before anything is created. |
 
 ## Provider status
@@ -82,7 +85,7 @@ means this.
 | Provider | Status | Notes |
 |---|---|---|
 | RunPod REST v1 | ✅ | Default until the switch; retired by RunPod on 2026-11-15. |
-| RunPod REST v2 (`RUNPOD_API=v2`) | ✅ | Live-verified on a sandbox pod (list/create/setup/proxy/rename/reimage/stop/terminate). Rename is a name-only `PATCH` (live-verified restart-free); GPU catalog/prices/stock and the `--gpu` check use `/v2/catalog/gpus`. GraphQL left only for maintenance (best-effort), balance and a volume-listing fallback ("GraphQL dependency inventory", `runpod_v2.rs`). 422 → config error; 400 "Pod is locked" → `Locked`. Contract tests replay recorded v2 responses. |
+| RunPod REST v2 (`RUNPOD_API=v2`) | ✅ | Live-verified on a sandbox pod (list/create/setup/proxy/rename/reimage/stop/terminate). Rename is a name-only `PATCH` (live-verified restart-free); GPU catalog/prices/stock and the `--gpu` check use `/v2/catalog/gpus`. GraphQL left only for maintenance (best-effort), balance and a volume-listing fallback ("GraphQL dependency inventory", `runpod_v2.rs`). 422 → config error; 400 "Pod is locked" → `Locked`. Locks (`pods lock`/`unlock`, `up --lock`) are a `{"locked"}`-only PATCH. Contract tests replay recorded v2 responses. |
 | Vast | 🟡 | Listing works (live-checked 2026-10-08); **create is broken against today's API** — the offer search sends a flat body that Vast now rejects (it wants `{"q": {…}}`, and `gpu_name` with spaces); PLAN "Later / maybe". No live prices before create. |
 | Hetzner | ✅ | CPU VMs (`cx23` by default); restart keeps the disk. |
 
@@ -95,10 +98,12 @@ TUI fleet menu (`A`): the same minus stop; restart and terminate only for a **ma
 (`/` + selector; `x` clears marks), which needs its count — or `ALL` for more than 5 pods or
 the whole fleet — typed back. `d` deep-checks the cursor pod or the marked set in the
 background; `n` adds pods. Every fleet datum (cost, maintenance badge, proxy port + state,
-last health) comes from the same core `FleetSnapshot` as `arena snapshot`.
+last health) comes from the same core `FleetSnapshot` as `arena snapshot`. A locked pod shows an
+`L` badge (when no `M`), and restart/stop/terminate on it are refused with the unlock hint — the
+TUI never unlocks (`arena pods unlock`).
 
 Deliberately CLI-only (awkward or risky in a live dashboard): `up`/`create` placement flags,
-`rename`/`reimage`/`replace`/`migrate`, `run --background`/`jobs`/`logs`, `pull` (local file
+`--api-json`, `lock`/`unlock`, `rename`/`reimage`/`replace`/`migrate`, `api get`, `run --background`/`jobs`/`logs`, `pull` (local file
 IO), `copy-keys` (reads local CSVs), `cp`, `keys`, `ssh-config` (prints a file),
 `snapshot --public`/`teardown --check`, `config`/`cron`/`plan`. In the TUI, stop stays
 per-pod by design, and restart/terminate on many pods need an explicit marked set (no "stop

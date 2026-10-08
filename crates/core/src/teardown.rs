@@ -18,6 +18,7 @@
 use serde::Serialize;
 
 use crate::fleet::{currency_symbol, fmt_money};
+use crate::lock::is_locked;
 use crate::naming::{is_absolute, qualify};
 use crate::openrouter::{key_name, KeyInfo};
 use crate::pod::Pod;
@@ -171,6 +172,9 @@ pub enum Entry {
         /// An absolute (`@name`) `MACHINE_NAME_LIST` entry: a personal/staff box sharing the
         /// list (see `naming`) — never this cohort's, and never in a printed fix.
         staff: bool,
+        /// The provider reports it locked ([`crate::lock`]): `pods terminate` refuses it
+        /// unless `--unlock` — which the printed fix carries for it.
+        locked: bool,
     },
     Volume {
         id: String,
@@ -357,20 +361,32 @@ pub fn pods_item(provider: &str, listing: Result<&[Pod], &String>, naming: &Nami
                 cost_per_hr: p.cost_per_hr,
                 cohort: is_cohort_pod(naming, &p.name),
                 staff: is_staff(naming, &p.name),
+                locked: is_locked(p),
             })
             .collect();
         // `pods terminate --all` takes every pod on every configured provider, so it's printed
         // only when that is exactly this cohort's: pasted on an account that also holds a
         // staff box, it would destroy that box. Otherwise one command per cohort pod (by id:
         // a name can be held by two pods), and the rest are left to the operator.
+        // A locked pod is refused by `pods terminate` (and by the provider itself), so its fix
+        // carries `--unlock`, which lifts the lock as part of the terminate — said in a note.
         let (ours, others): (Vec<&&Pod>, Vec<&&Pod>) = left.iter().partition(|p| is_cohort_pod(naming, &p.name));
+        let unlock = |locked: bool| if locked { " --unlock" } else { "" };
+        let locked: Vec<&str> = left.iter().filter(|p| is_locked(p)).map(|p| p.name.as_str()).collect();
+        if !locked.is_empty() {
+            item.notes.push(format!(
+                "{} locked ({}) — `pods terminate` refuses a locked pod; the fix's --unlock lifts the lock as part of it",
+                locked.len(),
+                locked.join(", ")
+            ));
+        }
         if fleet_all_ours && others.is_empty() {
-            item.fix.push(
-                "arena pods terminate --all  # every pod on every configured provider, stopped ones included (--dry-run lists them first)"
-                    .into(),
-            );
+            item.fix.push(format!(
+                "arena pods terminate --all{}  # every pod on every configured provider, stopped ones included (--dry-run lists them first)",
+                unlock(!locked.is_empty())
+            ));
         } else {
-            item.fix.extend(ours.iter().map(|p| format!("arena pods terminate {}", sh_word(&p.id))));
+            item.fix.extend(ours.iter().map(|p| format!("arena pods terminate {}{}", sh_word(&p.id), unlock(is_locked(p)))));
             if others.is_empty() {
                 item.notes.push(
                     "one command per pod, not `arena pods terminate --all`: that would also reach pods on another provider \
@@ -874,7 +890,7 @@ fn entry_lines(entries: &[Entry]) -> Vec<String> {
         .map(|e| {
             let k = format!("{:<w$}", key(e));
             let line = match e {
-                Entry::Pod { id, provider, status, billing, cost_per_hr, cohort, staff, .. } => {
+                Entry::Pod { id, provider, status, billing, cost_per_hr, cohort, staff, locked, .. } => {
                     let cost = match (billing, cost_per_hr) {
                         (true, Some(c)) => format!("billing {}/h", fmt_money(currency_symbol(provider), *c)),
                         (true, None) => "billing".to_string(),
@@ -885,7 +901,8 @@ fn entry_lines(entries: &[Entry]) -> Vec<String> {
                         (false, false) => "  (not this cohort's)",
                         (true, false) => "",
                     };
-                    format!("{k}  id={id}  {status}  {cost}{other}")
+                    let lock = if *locked { "  locked" } else { "" };
+                    format!("{k}  id={id}  {status}{lock}  {cost}{other}")
                 }
                 Entry::Volume { name, size_gb, data_center, tier, est_usd_per_month, .. } => {
                     let size = size_gb.map_or("? GB".to_string(), |g| format!("{g} GB"));
@@ -1143,6 +1160,40 @@ mod tests {
         let item = pods_item("runpod", Ok(&gone), &naming, true);
         assert_eq!((item.verdict, item.summary.as_str()), (Verdict::Clear, "none"));
         assert_eq!(item.notes.len(), 1);
+    }
+
+    /// A locked pod is still there (and billing), its line says so, and its fix carries
+    /// `--unlock` — per pod, or on `--all` — with a note saying why.
+    #[test]
+    fn locked_pods_get_an_unlocking_fix() {
+        let names = list();
+        let naming = Naming { prefix: "arena8", list: &names };
+        let mut apple = pod("arena8-apple", "RUNNING", Some(0.17));
+        apple.locked = Some(true);
+        let bloom = pod("arena8-bloom", "RUNNING", Some(0.17));
+        let item = pods_item("runpod", Ok(&[apple.clone(), bloom.clone()]), &naming, true);
+        assert_eq!(item.verdict, Verdict::Remaining);
+        assert!(item.fix[0].starts_with("arena pods terminate --all --unlock  #"), "{:?}", item.fix);
+        assert_eq!(
+            item.notes,
+            ["1 locked (arena8-apple) — `pods terminate` refuses a locked pod; the fix's --unlock lifts the lock as part of it"]
+        );
+        assert_eq!(
+            entry_lines(&item.entries),
+            [
+                "arena8-apple  id=id-arena8-apple  RUNNING  locked  billing $0.17/h",
+                "arena8-bloom  id=id-arena8-bloom  RUNNING  billing $0.17/h",
+            ]
+        );
+        // Per pod: only the locked one's command unlocks.
+        let item = pods_item("runpod", Ok(&[apple, bloom, pod("james-gpu", "RUNNING", None)]), &naming, false);
+        assert_eq!(item.fix, ["arena pods terminate id-arena8-apple --unlock", "arena pods terminate id-arena8-bloom"]);
+        // Nothing locked: no flag, no note.
+        let item = pods_item("runpod", Ok(&[pod("arena8-bloom", "RUNNING", None)]), &naming, true);
+        assert!(!item.fix[0].contains("--unlock") && item.notes.is_empty(), "{:?} {:?}", item.fix, item.notes);
+        // The JSON says it per pod.
+        let json = serde_json::to_value(&item.entries).unwrap();
+        assert_eq!(json[0]["locked"], false);
     }
 
     /// `--all` reaches every provider, so one provider holding only the cohort's pods still

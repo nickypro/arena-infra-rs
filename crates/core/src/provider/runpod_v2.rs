@@ -26,6 +26,12 @@
 //! - **Error bodies are read once more** ([`v2_error`]): a `422` is a request the API
 //!   rejected as invalid (an unknown GPU type, a schema violation) — a config error, never
 //!   capacity, never retried; a `400 "Pod is locked"` is [`ProviderErrorKind::Locked`].
+//! - **Locks** ([`crate::lock`]) are `PATCH /v2/pods/{id}` with `{"locked": bool}` and
+//!   nothing else ([`lock_payload`], live-verified: the container is untouched). A locked
+//!   pod's stop, restart and DELETE answer `400 "Pod is locked"`; the pod's `locked` field
+//!   says which pods are, `actions` doesn't (it still lists them).
+//! - **`--api-json`** is deep-merged into the create body last ([`create_payload`]), after
+//!   refusing the fields listed in [`MANAGED`].
 //!
 //! ## GraphQL dependency inventory
 //!
@@ -62,11 +68,12 @@ use serde_json::{json, Map, Value};
 
 use super::runpod::{self, loose_f64, loose_string, GpuType};
 use super::Provider;
+use crate::apiextra::{self, managed, Extra, Managed};
 use crate::error::{Error, ProviderErrorKind, Result};
 use crate::http::{judge, status_error};
 use crate::pod::{Pod, PodSpec};
 
-const BASE: &str = "https://api.runpod.io/v2";
+pub(crate) const BASE: &str = "https://api.runpod.io/v2";
 
 /// Page size for `GET /v2/pods` (the API's maximum, and its default). A cohort is a few
 /// dozen pods, so this is one page in practice; the loop exists for correctness.
@@ -246,6 +253,23 @@ fn v2_error(status: StatusCode, text: &str, ctx: &str) -> Error {
     Error::Provider { kind, message }
 }
 
+/// Recorded live v2 responses replayed for fakes in other crates' tests, so a fake provider
+/// returns exactly the error the real backend would. Test-only.
+#[cfg(any(test, feature = "test-util"))]
+pub mod recorded {
+    use super::*;
+
+    /// `fixtures/runpod_v2/locked_stop_refused.json` (live 2026-10-08: a locked pod's stop,
+    /// answered `400 {"detail": "Pod is locked"}`), classified by this backend under `ctx`
+    /// — a [`ProviderErrorKind::Locked`] error.
+    pub fn locked_refusal(ctx: &str) -> Error {
+        let rec: Value =
+            serde_json::from_str(include_str!("fixtures/runpod_v2/locked_stop_refused.json")).expect("fixture is JSON");
+        let status = rec["status"].as_u64().and_then(|s| u16::try_from(s).ok()).and_then(|s| StatusCode::from_u16(s).ok());
+        v2_error(status.expect("fixture has a status"), &rec["body"].to_string(), ctx)
+    }
+}
+
 /// [`judge_v2`] for `POST /v2/pods`, whose error table gives 403 a meaning of its own: "Your
 /// account cannot access the requested pool. | Skip this candidate, keep going." So a 403
 /// here is [`ProviderErrorKind::Denied`] (placement skips that option and tries the next),
@@ -371,6 +395,9 @@ fn parse_pod(v: &Value) -> Pod {
         ssh_port,
         maintenance: None, // GraphQL-only, see `enrich`
         machine_id: None,
+        // `locked` (a bool on every v2 pod): stop/restart/terminate refused while true —
+        // read from here, never inferred from `actions`, which still lists them.
+        locked: v.get("locked").and_then(Value::as_bool),
     }
 }
 
@@ -435,6 +462,33 @@ fn env_object(env: &[(String, String)], account_keys: &[String]) -> Map<String, 
         .collect()
 }
 
+/// The create-body fields the tool sets itself, refused in `--api-json` /
+/// `CREATE_EXTRA_JSON` ([`apiextra::check`]); plus the `ports` rule (keep `22/tcp`). The
+/// start command (`cmd`/`args`/`entrypoint` — one field in three spellings) is the image's
+/// own, which starts sshd, or `--bootstrap`'s. `locked` isn't a create field at all; it's
+/// refused with a pointer to `up --lock` rather than left to a 422. `templateId` is refused
+/// because the template fills in what the body leaves out (its `args`, a persistent mount,
+/// CUDA versions — per the API reference only `env` is merged, body winning), i.e. fields
+/// this table manages, without naming them.
+pub(crate) const MANAGED: &[Managed] = &[
+    managed(&["name"], "the machine name"),
+    managed(&["image"], "--image / IMAGE"),
+    managed(&["cloud"], "--cloud / CLOUD_TYPE"),
+    managed(&["gpu", "id"], "--gpu / GPU_TYPE"),
+    managed(&["gpu", "count"], "--gpus / NUM_GPUS"),
+    managed(&["gpu", "allowedCudaVersions"], "ALLOWED_CUDA_VERSIONS"),
+    managed(&["disk"], "--disk / DISK_GB"),
+    managed(&["mounts", "persistent"], "--volume / VOLUME_GB, at /workspace"),
+    managed(&["env", "PUBLIC_KEY"], "the cohort SSH keys"),
+    managed(&["env", "MACHINE_NAME"], "the machine name"),
+    managed(&["startSsh"], "always on: it's how the pod gets SSH"),
+    managed(&["cmd"], "--bootstrap, else the image's own, which starts sshd"),
+    managed(&["args"], "--bootstrap, else the image's own, which starts sshd"),
+    managed(&["entrypoint"], "the image's own, which starts sshd"),
+    managed(&["locked"], "`pods up --lock`, which locks each pod once it's READY"),
+    managed(&["templateId"], "the flags above — a template would override the start command and volume arena sets"),
+];
+
 /// Build the `POST /v2/pods` body. Pure, so every field rule is unit-tested — the schema
 /// rejects unknown keys (422), so names must match exactly:
 /// - `cloud` is ALWAYS present (omitted = SECURE on v2) and must be COMMUNITY/SECURE.
@@ -446,6 +500,7 @@ fn env_object(env: &[(String, String)], account_keys: &[String]) -> Map<String, 
 /// - `volume_gb` > 0 → `mounts.persistent {size, path}`; 0 → no mount at all.
 /// - `startSsh: true`: with our `PUBLIC_KEY` set it injects nothing (the account keys are
 ///   merged into ours instead); without one it injects the account keys — v1's behaviour.
+/// - `spec.api_extra` (`--api-json`) is deep-merged in last, minus the [`MANAGED`] fields.
 fn create_payload(spec: &PodSpec, account_keys: &[String]) -> Result<Value> {
     let cloud = normalize_cloud(&spec.cloud_type)?;
     let mut gpu = json!({ "id": spec.gpu_type, "count": spec.gpu_count });
@@ -469,6 +524,7 @@ fn create_payload(spec: &PodSpec, account_keys: &[String]) -> Result<Value> {
     if spec.volume_gb > 0 {
         payload["mounts"] = json!({ "persistent": { "size": spec.volume_gb, "path": VOLUME_MOUNT_PATH } });
     }
+    apiextra::apply(&mut payload, spec.api_extra.as_ref(), MANAGED, Some("ports"))?;
     Ok(payload)
 }
 
@@ -521,6 +577,37 @@ fn judge_rename(status: StatusCode, text: &str, new_name: &str) -> Result<()> {
     }
 }
 
+/// The `PATCH /v2/pods/{id}` body for a lock or unlock: `locked` and NOTHING else — the
+/// same PATCH carrying `image`/`env` resets the container ([`reimage_payload`]).
+/// Live-verified with exactly this body (the container untouched).
+fn lock_payload(locked: bool) -> Value {
+    json!({ "locked": locked })
+}
+
+/// The lock/unlock request — built, not sent, so a test pins its method, URL and body
+/// against the recording.
+fn lock_request(client: &Client, api_key: &str, id: &str, locked: bool) -> Result<RequestBuilder> {
+    Ok(api_request(client, api_key, Method::PATCH, pod_url(id, None)?).json(&lock_payload(locked)))
+}
+
+/// Judge a lock/unlock response. Pure. An error status reads as everywhere on v2
+/// ([`v2_error`]). A 2xx is success — unless its body is the pod (the live API answers with
+/// it) still in the other state: then the lock didn't take, and reporting "locked" would
+/// leave a participant's pod unprotected while the operator thinks it isn't. A 2xx body
+/// without a `locked` bool is still success: the status is the contract.
+fn judge_lock(status: StatusCode, text: &str, locked: bool) -> Result<()> {
+    let ctx = if locked { "lock pod" } else { "unlock pod" };
+    if !status.is_success() {
+        return Err(v2_error(status, text, ctx));
+    }
+    match serde_json::from_str::<Value>(text).ok().and_then(|v| v.get("locked").and_then(Value::as_bool)) {
+        Some(got) if got != locked => {
+            Err(Error::provider(format!("{ctx}: HTTP {status}, but the pod still reports locked={got} — it didn't take")))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Recover a recreate-able `PodSpec` from `GET /v2/pods/{id}`. Pure, for fixture tests.
 /// Unlike v1 (whose `machine` came back empty), v2 reports `gpu` and `cloud`, so the GPU
 /// type, count and tier ARE recovered. Best-effort elsewhere: a field RunPod doesn't send
@@ -569,6 +656,7 @@ fn parse_spec(v: &Value) -> PodSpec {
         docker_args,
         allowed_cuda: Vec::new(),
         max_price: None,
+        api_extra: None,
     }
 }
 
@@ -781,6 +869,28 @@ impl Provider for RunpodV2Provider {
         let body = send(api_request(&self.client, &self.api_key, Method::GET, pod_url(id, None)?), "get pod").await?;
         Ok(parse_spec(&body))
     }
+
+    fn lock_support(&self, _pod: &Pod) -> Result<()> {
+        Ok(())
+    }
+
+    async fn set_locked(&self, id: &str, locked: bool) -> Result<()> {
+        let resp = lock_request(&self.client, &self.api_key, id, locked)?.send().await?;
+        let status = resp.status();
+        // Read best-effort: a 2xx whose body can't be read is still a lock that took.
+        let text = resp.text().await.unwrap_or_default();
+        judge_lock(status, &text, locked)
+    }
+
+    fn check_create_extra(&self, extra: &Extra) -> Result<()> {
+        apiextra::check(extra, MANAGED, Some("ports"))
+    }
+
+    fn preview_create_body(&self, spec: &PodSpec) -> Result<Value> {
+        // Without the account keys `create_pod` merges into PUBLIC_KEY (a request); the
+        // preview redacts env values anyway.
+        create_payload(spec, &[])
+    }
 }
 
 /// Contract tests against recorded live responses (`fixtures/runpod_v2/`).
@@ -866,6 +976,7 @@ mod tests {
                 ssh_port: Some(34446),
                 maintenance: None,
                 machine_id: None,
+                locked: Some(false),
             }
         );
     }
@@ -1193,6 +1304,7 @@ mod tests {
             docker_args: None,
             allowed_cuda: Vec::new(),
             max_price: None,
+            api_extra: None,
         }
     }
 
@@ -1266,6 +1378,63 @@ mod tests {
         // CMD only: the image's ENTRYPOINT is kept, as v1's dockerStartCmd did.
         assert!(p.get("entrypoint").is_none() && p.get("args").is_none());
         assert!(create_payload(&spec(), &[]).unwrap().get("cmd").is_none());
+    }
+
+    /// `--api-json` options the tool has no flag for go out merged (objects key by key: our
+    /// env and GPU stay); the fields it sets itself are refused, naming what sets them; a
+    /// refused extra fails the create before any request (the payload is built first).
+    #[test]
+    fn create_payload_merges_api_extra_and_refuses_managed_fields() {
+        let extra = |v: Value| Some(v.as_object().unwrap().clone());
+        let mut s = spec();
+        s.api_extra = extra(json!({
+            "dataCenterIds": ["EU-RO-1"],
+            "globalNetworking": true,
+            "gpu": {"minRamPerGpu": 32},
+            "env": {"JUPYTER_PASSWORD": "pw"},
+            "mounts": {"network": [{"volumeId": "vol1", "path": "/data"}]},
+            "ports": ["8888/http", "22/tcp", "6006/http"],
+        }));
+        let p = create_payload(&s, &[]).unwrap();
+        assert_eq!(p["dataCenterIds"], json!(["EU-RO-1"]));
+        assert_eq!(p["globalNetworking"], true);
+        assert_eq!(p["gpu"], json!({"id": "NVIDIA RTX A4000", "count": 1, "minRamPerGpu": 32}));
+        assert_eq!(p["env"]["MACHINE_NAME"], "devtest-apple");
+        assert_eq!(p["env"]["JUPYTER_PASSWORD"], "pw");
+        assert_eq!(p["mounts"], json!({"network": [{"volumeId": "vol1", "path": "/data"}]}));
+        assert_eq!(p["ports"], json!(["8888/http", "22/tcp", "6006/http"]));
+        assert_eq!((p["name"].as_str(), p["cloud"].as_str(), p["startSsh"].as_bool()), (Some("devtest-apple"), Some("COMMUNITY"), Some(true)));
+
+        // (extra, what the refusal names)
+        for (bad, names) in [
+            (json!({"name": "x"}), "`name` is set by arena (the machine name)"),
+            (json!({"image": "x"}), "--image / IMAGE"),
+            (json!({"gpu": {"id": "NVIDIA H100"}}), "`gpu.id`"),
+            (json!({"gpu": {"count": 8}}), "`gpu.count`"),
+            (json!({"cloud": "SECURE"}), "--cloud / CLOUD_TYPE"),
+            (json!({"disk": 500}), "--disk / DISK_GB"),
+            (json!({"mounts": {"persistent": {"size": 10, "path": "/x"}}}), "--volume / VOLUME_GB"),
+            (json!({"env": {"PUBLIC_KEY": "ssh-ed25519 AAAA evil"}}), "`env.PUBLIC_KEY`"),
+            (json!({"env": {"MACHINE_NAME": "x"}}), "`env.MACHINE_NAME`"),
+            (json!({"env": "A=1"}), "`env.PUBLIC_KEY`"),
+            (json!({"startSsh": false}), "`startSsh`"),
+            (json!({"cmd": ["sleep", "inf"]}), "--bootstrap"),
+            (json!({"entrypoint": ["/bin/sh"]}), "`entrypoint`"),
+            (json!({"locked": true}), "pods up --lock"),
+            (json!({"ports": ["8888/http"]}), "must keep \"22/tcp\""),
+        ] {
+            let mut s = spec();
+            s.api_extra = extra(bad.clone());
+            let e = create_payload(&s, &[]).unwrap_err();
+            assert!(matches!(e, Error::Config(_)), "{bad}: {e:?}");
+            assert!(e.to_string().contains(names), "{bad}: `{names}` in {e}");
+            let p = RunpodV2Provider::new("k");
+            assert!(p.check_create_extra(bad.as_object().unwrap()).is_err(), "{bad}: the up-front check agrees");
+        }
+        // The preview is the same body (no account keys: those are fetched at create).
+        let p = RunpodV2Provider::new("k");
+        assert_eq!(p.preview_create_body(&s).unwrap(), create_payload(&s, &[]).unwrap());
+        assert!(p.check_create_extra(s.api_extra.as_ref().unwrap()).is_ok());
     }
 
     #[test]

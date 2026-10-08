@@ -33,6 +33,13 @@ pub struct Pod {
     /// JSON when unknown, so other providers' `pods list --json` is unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine_id: Option<String>,
+    /// Whether the provider has the pod **locked** (RunPod REST v2's `locked`; see
+    /// [`crate::lock`]): stop, restart and terminate are refused for it by the provider
+    /// itself — from any client, RunPod's own console included. `Some(false)` = reported
+    /// unlocked; `None` = the backend doesn't report a lock (Vast, Hetzner), which is never
+    /// read as "locked". Left out of the JSON when unknown, like `machine_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locked: Option<bool>,
 }
 
 /// A provider-reported maintenance window for the host a pod runs on. Times are kept as
@@ -73,6 +80,11 @@ pub struct PodSpec {
     /// cost more than the one the plan quoted, so it must honour the cap itself (RunPod's
     /// price is fixed per GPU type and tier, already checked). `None` = no cap.
     pub max_price: Option<f64>,
+    /// `--api-json` / `CREATE_EXTRA_JSON`: extra fields deep-merged into the provider's
+    /// create request body, for API options the tool has no flag for (`dataCenterIds`,
+    /// `globalNetworking`, a network volume mount…). Each backend refuses the fields it sets
+    /// itself before any request ([`crate::apiextra`]). `None` = nothing extra.
+    pub api_extra: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl PodSpec {
@@ -112,6 +124,7 @@ impl PodSpec {
                 .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
                 .unwrap_or_default(),
             max_price: None,
+            api_extra: None,
         }
     }
 }
@@ -141,6 +154,7 @@ mod tests {
                     note: Some("host upgrade".into()),
                 }),
                 machine_id: None,
+                locked: Some(true),
             },
             Pod { id: "1".into(), name: "devtest-flutter".into(), provider: "hetzner".into(), ..Default::default() },
         ];
@@ -152,6 +166,10 @@ mod tests {
         assert_eq!(v[0]["gpu_count"], 2);
         assert_eq!(v[0]["maintenance"]["start"], "2026-10-09T02:00:00Z");
         assert!(v[1]["maintenance"].is_null());
+        // The lock state rides along where the backend reports it, and is absent (not
+        // `false`) where it doesn't — "unknown" must never read as "unlocked" to a script.
+        assert_eq!(v[0]["locked"], true);
+        assert!(v[1].get("locked").is_none(), "{}", v[1]);
     }
 
     /// JSON written before gpu_count/maintenance existed must still load (`#[serde(default)]`).
@@ -162,6 +180,7 @@ mod tests {
         let p: Pod = serde_json::from_str(old).unwrap();
         assert_eq!(p.gpu_count, None);
         assert_eq!(p.maintenance, None);
+        assert_eq!(p.locked, None);
         assert_eq!(p.cost_per_hr, Some(0.2));
     }
 }
