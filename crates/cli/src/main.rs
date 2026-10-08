@@ -700,6 +700,12 @@ enum PodCmd {
     ///
     /// Per pod, in order:
     ///   1. copy the git deploy key (scp) and chmod it;
+    ///   1b. (image-based pods, best-effort, its own 900s budget) when /workspace is a
+    ///      mounted volume, move the repo onto it: BACKUP_REPO_PATH becomes a link to
+    ///      /workspace/<repo dir>, so a restart keeps the work; after a reset the volume
+    ///      copy is linked back over the image's untouched checkout (kept aside). Work in
+    ///      the checkout, a repo in use, too little room: left alone, with a warning — never
+    ///      a failed setup. REPO_ON_VOLUME=0 turns it off;
     ///   2. add a github.com block to ~/.ssh/config pointing at that key;
     ///   3. add the shared + deploy public keys to ~/.ssh/authorized_keys;
     ///   4. point the ARENA repo's origin at GitHub, fetch the default branch only (no
@@ -988,14 +994,20 @@ enum PodCmd {
     },
     /// Push a local backup (what `pull` saved) back onto ONE pod — never deletes anything.
     ///
-    /// From `<dir>/<label>/<pod>/` (a dated snapshot: the files under the size cap) or
-    /// `<dir>/big/<pod>/` (`--from big`: every file); default: that pod's newest wNdM
-    /// snapshot. Rsync over the pod's direct SSH endpoint into its home — through the repo's
-    /// link onto the /workspace volume when setup made one, so the work lands on the volume.
-    /// Files on the pod that the backup doesn't have stay; a file it replaces is kept under
-    /// ~/.arena-restore/<UTC time>/. ~/.ssh, the shell rc files and histories, ~/.name and
-    /// .claude* are never pushed (they belong to the pod). Confirms first, showing source,
-    /// destination and size. Refused when that backup doesn't exist or is empty.
+    /// From `<dir>/<label>/<pod>/` (a dated snapshot: the files under the size cap; or a
+    /// custom `pull --label`) or `<dir>/big/<pod>/` (`--from big`: every file); default: that
+    /// pod's newest wNdM snapshot. Rsync over the pod's direct SSH endpoint into its home —
+    /// through the repo's link onto the /workspace volume when setup made one, so the work
+    /// lands on the volume. Files on the pod that the backup doesn't have stay; files on the
+    /// pod NEWER than the backup's copy stay too (reported; --overwrite-newer replaces them); a
+    /// file it replaces is kept under /workspace/.arena-restore/<UTC time>/ when the pod has
+    /// its volume mounted, else ~/.arena-restore/<UTC time>/ (pulls don't back that dir up).
+    /// ~/.ssh, the shell rc files and histories, ~/.name and .claude* are never pushed (they
+    /// belong to the pod); nor is .git from a snapshot (--with-git), which can lack objects
+    /// over the size cap — the repo is checked after any restore that pushed its .git.
+    /// Confirms first, showing source, destination and size, and warns when the snapshot was
+    /// written after the pod's disk was last reset. Refused when that backup doesn't exist or
+    /// is empty.
     Restore {
         /// Machine name (e.g. arena8-apple) or raw provider id.
         target: String,
@@ -1012,6 +1024,14 @@ enum PodCmd {
         /// gives up after 300 s without any I/O.
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..=arena_core::setup::MAX_STEP_TIMEOUT_SECS))]
         timeout: Option<u64>,
+        /// Also replace files on the pod that are NEWER than the backup's copy (default: they
+        /// stay; the replaced copies are kept either way).
+        #[arg(long)]
+        overwrite_newer: bool,
+        /// Push .git dirs from a snapshot too (the big tier always carries them): a snapshot
+        /// drops files over its size cap, git packs included.
+        #[arg(long)]
+        with_git: bool,
         /// Preview only: print the plan and the rsync command, copy nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
@@ -4973,11 +4993,11 @@ async fn handle_pods_with(
             handle_pull(&remote, cfg, label, &dir, max_size, remote_path, no_git, no_big, &sel, dry_run, yes, RSYNC).await?;
         }
 
-        PodCmd::Restore { target, from, path, dir, timeout, dry_run } => {
+        PodCmd::Restore { target, from, path, dir, timeout, overwrite_newer, with_git, dry_run } => {
             let dir = dir.unwrap_or_else(|| local_backup_dir(cfg));
             let timeout = timeout.map_or(arena_core::restore::DEFAULT_TIMEOUT, Duration::from_secs);
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-            let opts = RestoreOpts { from, path, dir, timeout, dry_run, yes };
+            let opts = RestoreOpts { from, path, dir, timeout, overwrite_newer, with_git, dry_run, yes };
             handle_restore(provider, &remote, cfg, &target, opts, RSYNC, now).await?;
         }
 
@@ -8183,8 +8203,9 @@ async fn handle_init_branches(
 ///
 /// A repo that setup moved onto the `/workspace` volume is a symlink in the home, and rsync
 /// `-a` copies a symlink as a symlink — so each pod is first asked (read-only, bounded, over
-/// `remote`) where its repo really is, and a symlinked one is pulled from its real path into
-/// the same place in the backup (`arena_core::volume::repo_pull`).
+/// `remote`) where its repo really is, and a symlinked one inside the pull (the home, or a
+/// `--remote-path` / `BACKUP_REMOTE_PATH` holding or naming it) is pulled from its real path
+/// into the same place in the backup (`arena_core::volume::repo_pull_from`).
 #[allow(clippy::too_many_arguments)]
 async fn handle_pull(
     // How the pods are asked where their repo is: `SshRemote` for real, `FakeRemote` in tests.
@@ -8271,11 +8292,17 @@ async fn handle_pull(
             }
             println!();
         }
-        if remote_path.is_empty() {
+        // What the pods would be asked, judged from the configured paths alone.
+        let guessed: Vec<_> =
+            targets.iter().map(|(_, t)| arena_core::volume::repo_pull_from(&remote_path, &repo, &t.user, None)).collect();
+        if guessed.iter().any(|g| matches!(g, Ok(Some(_)))) {
             println!(
                 "(each pod is first asked where {repo} really is: if it's a link — onto the /workspace \
-                 volume — the link is left out of the home job and its tree pulled into the same place)"
+                 volume — the link is left out of the pull and its tree pulled into the same place)"
             );
+        }
+        if let Some(Err(why)) = guessed.iter().find(|g| g.is_err()) {
+            println!("⚠ {why}: where {repo} is a link (setup links it onto the /workspace volume), this pull would hold only the link");
         }
         println!("Preview only — run without --dry-run to copy.");
         return Ok(());
@@ -8292,24 +8319,36 @@ async fn handle_pull(
     }
 
     let total_pods = targets.len();
-    // Where each pod's repo really is (a home pull only: a --remote-path pull names its own
-    // source). `None` = the pod didn't answer: the repo is then pulled through its home path,
-    // which follows a link if there is one.
+    // Where each pod's repo really is: rsync -a copies a symlink as a symlink, so a repo setup
+    // linked onto the volume would be backed up as a dangling link wherever it sits in the pull
+    // — a home pull, `BACKUP_REMOTE_PATH=~/` or `/root`, the repo named without a trailing
+    // slash (`arena_core::volume::repo_pull_from`). `None` = the pod didn't answer: the repo is
+    // then pulled through its configured path, which follows a link if there is one.
     let mut splits: std::collections::HashMap<String, arena_core::volume::RepoPull> = Default::default();
-    if remote_path.is_empty() {
-        let probe = arena_core::volume::probe_command(&repo);
-        let jobs = targets.iter().map(|(name, t)| ((name.clone(), t.user.clone()), t.clone(), probe.clone())).collect();
-        exec_each_pod(remote, jobs, PROBE_TIMEOUT, |_, _, (name, user), call| {
-            let answer = match &call {
-                Ok(out) if out.success => arena_core::volume::parse_probe(&out.stdout),
-                _ => None,
-            };
-            if let Some(split) = arena_core::volume::repo_pull(&repo, user, answer.as_ref()) {
+    let probe = arena_core::volume::probe_command(&repo);
+    let jobs = targets.iter().map(|(name, t)| ((name.clone(), t.user.clone()), t.clone(), probe.clone())).collect();
+    exec_each_pod(remote, jobs, PROBE_TIMEOUT, |_, _, (name, user), call| {
+        let answer = match &call {
+            Ok(out) if out.success => arena_core::volume::parse_probe(&out.stdout),
+            _ => None,
+        };
+        match arena_core::volume::repo_pull_from(&remote_path, &repo, user, answer.as_ref()) {
+            Ok(Some(split)) => {
                 splits.insert(name.clone(), split);
             }
-        })
-        .await;
-    }
+            Ok(None) => {}
+            Err(why) => {
+                let linked = answer.as_ref().and_then(|p| p.real.as_deref()).filter(|r| r.trim_end_matches('/') != repo.trim_end_matches('/'));
+                if let Some(real) = linked {
+                    println!(
+                        "⚠ {name}: {repo} is a link to {real} and {why} — this pull may hold only the link: \
+                         pull the home (no --remote-path), or --remote-path {real}/"
+                    );
+                }
+            }
+        }
+    })
+    .await;
     println!("Pulling {total_pods} pod(s) into {dest_msg}…");
     // Every rsync: per pod, per tier, the home job — plus the repo job when it's split out.
     let mut planned = Vec::new();
@@ -8409,18 +8448,24 @@ struct RestoreOpts {
     path: Option<String>,
     dir: String,
     timeout: Duration,
+    overwrite_newer: bool,
+    with_git: bool,
     dry_run: bool,
     yes: bool,
 }
 
 /// `pods restore <pod>`: push one of the pod's local backups back onto it (see
-/// `arena_core::restore` for why each rsync flag is there — never `--delete`, replaced files
-/// kept, written through the repo's link onto the volume). Everything that can be refused is
-/// refused before the pod is touched: no such backup, an empty one, a `--path` that isn't in
+/// `arena_core::restore` for why each rsync flag is there — never `--delete`, files newer on
+/// the pod left alone, replaced files kept (on the volume when there is one), written through
+/// the repo's link onto the volume, no `.git` from a snapshot). Everything that can be refused
+/// is refused before the pod is touched: no such backup, an empty one, a `--path` that isn't in
 /// it, a pod without an endpoint. The pod is then asked (read-only, bounded) where its repo
-/// lives, so the confirmation can say where the work lands. The rsync runs over the pod's
-/// direct endpoint within `opts.timeout` (stopped like a timed-out ssh); `rsync` is the
-/// program (a stub in tests), `now` the UNIX time naming the kept-files dir.
+/// lives, whether its volume is mounted and when its container was created, so the
+/// confirmation can say where the work lands, where replaced files are kept, and whether the
+/// snapshot was written after the pod's disk was reset. The rsync runs over the pod's direct
+/// endpoint within `opts.timeout` (stopped like a timed-out ssh); after one that pushed the
+/// repo's `.git`, the repo is checked (bounded). `rsync` is the program (a stub in tests),
+/// `now` the UNIX time naming the kept-files dir.
 async fn handle_restore(
     provider: &dyn Provider,
     remote: &Arc<dyn Remote>,
@@ -8434,15 +8479,16 @@ async fn handle_restore(
     let policy = arena_core::retry::RetryPolicy::default();
     let pods = arena_core::retry::retrying(&policy, || provider.list_pods()).await.context("listing pods")?;
     let pod = pods[arena_core::selector::resolve_one(&Naming::from_config(cfg), &pods, target)?].clone();
-    let (label, src) = restore::resolve_source(std::path::Path::new(&opts.dir), &pod.name, opts.from.as_deref())
+    let base = std::path::Path::new(&opts.dir);
+    let (label, src) = restore::resolve_source(base, &pod.name, opts.from.as_deref())
         .map_err(|e| anyhow::anyhow!("refusing to restore {}: {e}", pod.name))?;
     let sub = opts.path.as_deref().map(restore::check_subpath).transpose().map_err(|e| anyhow::anyhow!(e))?;
     let what = sub.as_ref().map_or_else(|| src.clone(), |p| src.join(p));
     if std::fs::symlink_metadata(&what).is_err() {
         anyhow::bail!("refusing to restore {}: {} isn't in that backup", pod.name, what.display());
     }
-    let (files, bytes) = restore::tree_size(&what).with_context(|| format!("reading {}", what.display()))?;
-    if files == 0 {
+    let stats = restore::tree_stats(&what).with_context(|| format!("reading {}", what.display()))?;
+    if stats.files == 0 {
         anyhow::bail!("refusing to restore {}: {} holds no files", pod.name, what.display());
     }
     let ssh = SshTarget::from_pod(&pod, cfg).with_context(|| format!("refusing to restore {}: no SSH endpoint", pod.name))?;
@@ -8452,25 +8498,37 @@ async fn handle_restore(
         _ => None,
     };
     let stamp = restore::stamp(now);
-    let args = restore::restore_args(&ssh, &src, sub.as_deref(), &stamp);
+    // .git from the big tier (every file); from a snapshot only when asked.
+    let git = label == restore::BIG || opts.with_git;
+    let flags = restore::RestoreFlags {
+        kept: restore::kept_dir(probe.as_ref().is_some_and(|p| p.volume_mounted), &stamp),
+        overwrite_newer: opts.overwrite_newer,
+        git,
+    };
+    let args = restore::restore_args(&ssh, &src, sub.as_deref(), &flags);
+    let kept = restore::kept_dir_display(&flags.kept);
     let tier = if label == restore::BIG { "the all-files tier" } else { "a snapshot: files under the size cap" };
     let into = sub.as_ref().map_or_else(|| "~/".to_string(), |p| format!("~/{p}"));
-    let note = restore_note(&repo, &ssh.user, probe.as_ref(), &src, sub.as_deref())
-        .map(|n| format!("\n         {n}"))
-        .unwrap_or_default();
+    let backup = RestoreSource { base, pod: &pod.name, label: &label, src: &src, sub: sub.as_deref(), last_written: stats.last_written };
+    let note = restore_notes(&repo, &ssh.user, probe.as_ref(), &backup, git).iter().map(|n| format!("\n         {n}")).collect::<String>();
+    let newer = if opts.overwrite_newer {
+        "files on the pod newer than the backup's ARE replaced"
+    } else {
+        "files on the pod newer than the backup's stay"
+    };
     let plan = format!(
-        "restore {} (id={}, {}):\n  from:  {} ({label}, {tier}) — {files} file(s), {}\n  to:    {}:{into} over {}:{}{note}\n  \
-         never deletes; files it replaces are kept on the pod under ~/{}/{stamp}/; ~/.ssh, the shell rc files, \
-         ~/.name and .claude* are not pushed",
+        "restore {} (id={}, {}):\n  from:  {} ({label}, {tier}) — {} file(s), {}\n  to:    {}:{into} over {}:{}{note}\n  \
+         never deletes; {newer}; files it replaces are kept on the pod under {kept} (pulls don't back that up); \
+         ~/.ssh, the shell rc files, ~/.name and .claude* are not pushed",
         pod.name,
         pod.id,
         pod.provider,
         what.display(),
-        pull::human_bytes(bytes),
+        stats.files,
+        pull::human_bytes(stats.bytes),
         pod.name,
         ssh.host,
         ssh.port,
-        restore::KEPT_DIR,
     );
     if opts.dry_run {
         let shown: Vec<String> = std::iter::once(rsync.to_string())
@@ -8484,12 +8542,8 @@ async fn handle_restore(
         return Ok(());
     }
     let what_run = format!("rsync to {}", pod.name);
-    match arena_core::remote::run_local(rsync, &args, &what_run, Some(opts.timeout)).await {
-        Ok(out) if out.success => {
-            let moved = pull::parse_rsync_stats(&out.stdout).map_or_else(|| "done".into(), |(n, size)| format!("{n} file(s), {size} sent"));
-            println!("✓ restored {} from {label} ({moved}); anything it replaced is under ~/{}/{stamp}/ on the pod", pod.name, restore::KEPT_DIR);
-            Ok(())
-        }
+    let out = match arena_core::remote::run_local(rsync, &args, &what_run, Some(opts.timeout)).await {
+        Ok(out) if out.success => out,
         Ok(out) => anyhow::bail!(
             "restoring {} failed (rsync exit {:?}): {} — nothing on the pod was deleted; re-run to finish",
             pod.name,
@@ -8501,7 +8555,75 @@ async fn handle_restore(
             pod.name,
             describe_error(&e)
         ),
+    };
+    let moved = pull::parse_rsync_stats(&out.stdout).map_or_else(|| "done".into(), |(n, size)| format!("{n} file(s), {size} sent"));
+    println!("✓ restored {} from {label} ({moved}); anything it replaced is under {kept} on the pod", pod.name);
+    let kept_newer = restore::newer_on_pod(&out.stdout);
+    if !kept_newer.is_empty() {
+        let shown: Vec<&str> = kept_newer.iter().take(10).map(String::as_str).collect();
+        let more = if kept_newer.len() > shown.len() { format!(" (+{} more)", kept_newer.len() - shown.len()) } else { String::new() };
+        println!(
+            "  {} file(s) on the pod are newer than the backup's and were left as they are{more}: {} — --overwrite-newer replaces them",
+            kept_newer.len(),
+            shown.join(", ")
+        );
     }
+    if restore::pushes_repo_git(&src, sub.as_deref(), &repo_rel(&repo, &ssh.user), git) {
+        match remote.exec(&ssh, &restore::git_check_command(&repo), Some(restore::GIT_CHECK_TIMEOUT)).await {
+            Ok(o) if o.success && restore::parse_git_check(&o.stdout) == Some(true) => {}
+            Ok(o) if o.success && restore::parse_git_check(&o.stdout) == Some(false) => anyhow::bail!(
+                "restored {}, but git can't read {repo} on it any more (the backup's .git lacks objects its refs need?): the \
+                 .git files it replaced are under {kept} — copy them back, or restore --from big",
+                pod.name
+            ),
+            other => {
+                let why = match other {
+                    Ok(o) => format!("exit {:?}", o.code),
+                    Err(e) => describe_error(&e),
+                };
+                println!("  ⚠ couldn't check {repo} on {} after pushing its .git ({why}) — run `git -C {repo} fsck` there", pod.name);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The backup a restore pushes, for [`restore_notes`].
+struct RestoreSource<'a> {
+    /// The backups dir (`--dir`).
+    base: &'a std::path::Path,
+    pod: &'a str,
+    label: &'a str,
+    /// `<base>/<label>/<pod>`.
+    src: &'a std::path::Path,
+    /// `--path`.
+    sub: Option<&'a str>,
+    /// When a pull last wrote into what's restored ([`arena_core::restore::TreeStats`]).
+    last_written: Option<u64>,
+}
+
+/// The confirmation's notes for a restore (reads the backups dir; pure otherwise): where the
+/// repo lands ([`restore_note`]); a warning when the backup was written after the pod's disk was
+/// last reset and an older snapshot predates that ([`arena_core::restore::clobber_warning`]); and
+/// that a snapshot's `.git` stays behind unless `git`.
+fn restore_notes(repo: &str, user: &str, probe: Option<&arena_core::volume::RepoProbe>, b: &RestoreSource, git: bool) -> Vec<String> {
+    use arena_core::restore;
+    let mut notes: Vec<String> = restore_note(repo, user, probe, b.src, b.sub).into_iter().collect();
+    let container = probe.and_then(|p| p.container_created);
+    if let Some(reset) = container.filter(|&c| b.last_written.is_some_and(|w| w > c)) {
+        let earlier = restore::snapshot_written_before(b.base, b.pod, reset);
+        notes.extend(restore::clobber_warning(b.label, b.last_written, container, earlier.as_deref()).map(|w| format!("⚠ {w}")));
+    }
+    if !git && restore::pushes_repo_git(b.src, b.sub, &repo_rel(repo, user), true) {
+        notes.push("(.git isn't restored from a snapshot — it can lack objects over the size cap; --with-git or --from big)".into());
+    }
+    notes
+}
+
+/// The repo's path relative to the login home of `user` (the place it has in a backup), or
+/// the configured path itself when it isn't under the home.
+fn repo_rel(repo: &str, user: &str) -> String {
+    arena_core::volume::repo_pull(repo, user, None).map_or_else(|| repo.trim_start_matches('/').to_string(), |p| p.rel)
 }
 
 /// The confirmation's line about the repo, when the restore carries it (pure, so tested): the
@@ -10237,6 +10359,8 @@ mod setup_tests {
             broadcast_exports: vec![],
             zsh_install: false,
             vscode: None,
+            // The fleet runner is under test here, not the move onto the volume.
+            relocate: false,
         }
     }
 
@@ -10336,7 +10460,7 @@ mod setup_tests {
     fn setup_cfg(extra: &str) -> Config {
         Config::parse(&format!(
             "MACHINE_NAME_PREFIX=devtest\nARENA_REPO_OWNER=o\nARENA_REPO_NAME=r\n\
-             GIT_SSH_KEY_LOCAL=/nonexistent/devtest_deploy_key\nVSCODE_PREINSTALL=0\n{extra}"
+             GIT_SSH_KEY_LOCAL=/nonexistent/devtest_deploy_key\nVSCODE_PREINSTALL=0\nREPO_ON_VOLUME=0\n{extra}"
         ))
     }
 
@@ -10653,18 +10777,24 @@ mod setup_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `pods setup` with the warm-up on (the default): it runs last on every pod, on its own
-    /// 300s budget; a pod whose warm-up fails or hangs is still provisioned (and gets its
-    /// keys) — the command succeeds; `--no-vscode` leaves it out.
+    /// `pods setup` with the defaults — the move onto the volume and the warm-up on: the move
+    /// runs before the config step and the warm-up last, each on its own budget; a pod whose
+    /// move or warm-up fails or hangs is still provisioned (and gets its keys) — the command
+    /// succeeds; `--no-vscode` leaves the warm-up out.
     #[tokio::test(start_paused = true)]
     async fn the_vscode_warm_up_runs_last_and_never_fails_setup() {
         let dir = keys_dir("vscode");
         let keys = dir.to_string_lossy().into_owned();
         let cfg = vscode_cfg("");
         let fake = Arc::new(FakeRemote::new());
-        // apple: the script reports a problem; bloom: it hangs; cloud: all well.
-        fake.script("10.0.0.1:22001", [FakeReply::ok(), FakeReply::ok(), FakeReply::exit(3, "vscode warm-up incomplete: server: checksum mismatch")]);
-        fake.script("10.0.0.1:22002", [FakeReply::ok(), FakeReply::ok(), FakeReply::hang()]);
+        // apple: the warm-up reports a problem; bloom: it hangs; cloud: the move onto the
+        // volume reports one.
+        fake.script(
+            "10.0.0.1:22001",
+            [FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::exit(3, "vscode warm-up incomplete: server: checksum mismatch")],
+        );
+        fake.script("10.0.0.1:22002", [FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::hang()]);
+        fake.script("10.0.0.1:22003", [FakeReply::ok(), FakeReply::stdout("arena-warning: repo not moved onto the /workspace volume: in use (pid 7)\n")]);
         let start = Instant::now();
         handle_setup(fake.clone(), &cfg, true, false, None, None, false, false, budgets(&cfg, None), &everyone(), &keys, None)
             .await
@@ -10673,8 +10803,9 @@ mod setup_tests {
         for port in [22001, 22002, 22003] {
             let calls = fake.calls_to(&format!("10.0.0.1:{port}"));
             assert!(
-                matches!(&calls[..], [RemoteCall::Copy { .. }, RemoteCall::Exec { cmd: config, .. }, RemoteCall::Exec { cmd, timeout, .. }, RemoteCall::Exec { cmd: keys, .. }]
-                    if config.contains("git fetch")
+                matches!(&calls[..], [RemoteCall::Copy { .. }, RemoteCall::Exec { cmd: reloc, timeout: t, .. }, RemoteCall::Exec { cmd: config, .. }, RemoteCall::Exec { cmd, timeout, .. }, RemoteCall::Exec { cmd: keys, .. }]
+                    if reloc.contains("arena-aside") && *t == Some(Duration::from_secs(900))
+                        && config.contains("git fetch")
                         && cmd.contains("arena-vscode-warmup")
                         && cmd.contains("ARENA_VSCODE_EXTENSIONS='ms-python.python,ms-python.vscode-pylance,ms-toolsai.jupyter'")
                         && *timeout == Some(Duration::from_secs(300))
@@ -10690,7 +10821,7 @@ mod setup_tests {
             .unwrap();
         for port in [22001, 22002, 22003] {
             let calls = fake.calls_to(&format!("10.0.0.1:{port}"));
-            assert_eq!(calls.len(), 2, "port {port}: {calls:?}");
+            assert_eq!(calls.len(), 3, "port {port}: {calls:?}");
             assert!(!format!("{calls:?}").contains("arena-vscode-warmup"));
         }
         // A bad extension list fails before any pod is touched.
@@ -10709,16 +10840,20 @@ mod setup_tests {
         use arena_core::setup::SetupTimeouts;
         let mut sc = scfg();
         sc.vscode = arena_core::vscode::VscodeSetup::from_config(&vscode_cfg(""), &sc.repo_path).unwrap();
+        sc.relocate = true;
         let steps = provisioning_steps("runpod", &sc, "devtest-apple", false, "", &SetupTimeouts::default());
         let lines: Vec<String> = steps.iter().flat_map(|s| super::step_preview(s, &target(22001))).collect();
-        assert_eq!(lines.len(), 6, "{lines:#?}");
+        assert_eq!(lines.len(), 8, "{lines:#?}");
         assert_eq!(lines[0], "## copy deploy key (timeout 60s)");
         assert!(lines[1].starts_with("scp "), "{}", lines[1]);
-        assert_eq!(lines[2], "## repo + keys config (timeout 300s)");
-        assert!(lines[3].starts_with("ssh ") && lines[3].contains("git fetch"), "{}", lines[3]);
-        assert_eq!(lines[4], "## vscode warm-up (timeout 300s, best-effort: a failure is a warning, never a failed setup)");
-        assert!(lines[5].starts_with("latest stable VS Code server") && lines[5].contains("ms-toolsai.jupyter"), "{}", lines[5]);
-        assert!(lines[5].contains("/opt/arena-env/bin/python") && !lines[5].contains("base64"), "{}", lines[5]);
+        // The move onto the volume: what it does, not its script.
+        assert_eq!(lines[2], "## repo onto volume (timeout 900s, best-effort: a failure is a warning, never a failed setup)");
+        assert!(lines[3].starts_with("if /workspace is a mounted volume: move /root/ARENA_materials onto it"), "{}", lines[3]);
+        assert_eq!(lines[4], "## repo + keys config (timeout 300s)");
+        assert!(lines[5].starts_with("ssh ") && lines[5].contains("git fetch"), "{}", lines[5]);
+        assert_eq!(lines[6], "## vscode warm-up (timeout 300s, best-effort: a failure is a warning, never a failed setup)");
+        assert!(lines[7].starts_with("latest stable VS Code server") && lines[7].contains("ms-toolsai.jupyter"), "{}", lines[7]);
+        assert!(lines[7].contains("/opt/arena-env/bin/python") && !lines[7].contains("base64"), "{}", lines[7]);
     }
 
     #[test]
@@ -12250,8 +12385,8 @@ mod remote_tests {
         backup_fleet, copy_pod_files, copy_to_pod, cp_timeout, deep_check_fleet, duplicate_names, each_pod,
         handle_backup, handle_copy, handle_deep_test, handle_full_backup, handle_init_branches,
         handle_pods, handle_pull, handle_restore, handle_run, handle_set_branch, local_size, marker_present, probe_gpus,
-        proxy_reaches_pod, render_deep_test, render_run, replace_copy_failed, restore_note, run_fleet, run_preview, select,
-        target_is_pod, BackupTally, Cli, Cmd, CopyPlan, PodCmd, RestoreOpts, RunResult, Select, SelectByFlag, Selected,
+        proxy_reaches_pod, render_deep_test, render_run, replace_copy_failed, restore_note, restore_notes, run_fleet, run_preview, select,
+        target_is_pod, BackupTally, Cli, Cmd, CopyPlan, PodCmd, RestoreOpts, RestoreSource, RunResult, Select, SelectByFlag, Selected,
         Unscoped, BACKUP_TIMEOUT, BRANCH_TIMEOUT, CP_BASE_TIMEOUT, POD_COPY_TIMEOUT, RUN_TIMEOUT_SECS, TEST_TIMEOUT,
     };
     use arena_core::selector::SelectArgs;
@@ -12551,10 +12686,11 @@ mod remote_tests {
     async fn a_pull_follows_a_repo_linked_onto_the_volume() {
         let stub = StubRsync::new("volume");
         let base = stub.0.join("backups").display().to_string();
-        let cfg = Config::parse(&format!(
+        let text = format!(
             "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple bloom cloud)\nBACKUP_REPO_PATH={REPO}\n\
              SHARED_SSH_KEY_PATH=/nonexistent/devtest_key\n"
-        ));
+        );
+        let cfg = Config::parse(&text);
         let fake = Arc::new(FakeRemote::new());
         fake.script(&host(22001), [FakeReply::stdout("arena-repo-home=/root\narena-repo-real=/workspace/ARENA_materials\narena-repo-mount=yes\n")]);
         fake.script(&host(22002), [FakeReply::error("ssh: connect to host 10.0.0.1 port 22002: Connection refused")]);
@@ -12587,12 +12723,39 @@ mod remote_tests {
         let remote: Arc<dyn Remote> = fake.clone();
         handle_pull(&remote, &cfg, Some("w1d1".into()), &base, None, None, false, false, &all, true, true, &stub.path()).await.unwrap();
         assert!(fake.calls().is_empty() && stub.take_args().is_empty());
-        // A --remote-path pull names its own source: nobody asked either.
+        // A --remote-path inside the repo: the pod resolves the link on the way — one job per
+        // tier, as given (the pods are still asked: only their answer can say).
         handle_pull(&remote, &cfg, Some("w1d2".into()), &base, None, Some("ARENA_materials/results".into()), false, false, &all, false, true, &stub.path())
             .await
             .unwrap();
-        assert!(fake.calls().is_empty());
+        assert_eq!(fake.calls().len(), 3);
         assert_eq!(stub.take_args().len(), 6);
+        // BACKUP_REMOTE_PATH=~/ (the README's default, what the */15 cron reads) used to skip
+        // the question and back up the link alone; it's the home: split like one.
+        let linked = || FakeReply::stdout("arena-repo-home=/root\narena-repo-real=/workspace/ARENA_materials\narena-repo-mount=yes\n");
+        let cron = Config::parse(&format!("{text}BACKUP_REMOTE_PATH=~/\n"));
+        let fake = Arc::new(FakeRemote::new());
+        for port in [22001, 22002, 22003] {
+            fake.script(&host(port), [linked()]);
+        }
+        let remote: Arc<dyn Remote> = fake.clone();
+        handle_pull(&remote, &cron, Some("w1d3".into()), &base, None, None, false, false, &all, false, true, &stub.path()).await.unwrap();
+        let args = stub.take_args();
+        assert_eq!(args.len(), 12, "home + repo job, two tiers, three pods: {args:#?}");
+        assert_eq!(args.iter().filter(|a| a.contains("root@10.0.0.1:~/ ") && a.contains("--exclude /ARENA_materials ")).count(), 6, "{args:#?}");
+        assert_eq!(args.iter().filter(|a| a.contains("root@10.0.0.1:/workspace/ARENA_materials/ ")).count(), 6, "{args:#?}");
+        // --remote-path naming the repo without a slash: the tree from its real path, into
+        // <dest>/ARENA_materials/ where rsync would have put the link.
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [linked()]);
+        let remote: Arc<dyn Remote> = fake.clone();
+        let one = Selected::all(all.pods.iter().filter(|p| p.name == "devtest-apple").cloned().collect());
+        handle_pull(&remote, &cfg, Some("w1d4".into()), &base, None, Some("ARENA_materials".into()), false, true, &one, false, true, &stub.path())
+            .await
+            .unwrap();
+        let args = stub.take_args();
+        assert_eq!(args.len(), 1, "{args:#?}");
+        assert!(args[0].contains("root@10.0.0.1:/workspace/ARENA_materials/ ") && args[0].ends_with("/w1d4/devtest-apple/ARENA_materials/"), "{args:#?}");
     }
 
     /// A backups dir with pull's layout for apple: two snapshots and the big tier.
@@ -12611,7 +12774,16 @@ mod remote_tests {
     }
 
     fn restore_opts(dir: &str) -> RestoreOpts {
-        RestoreOpts { from: None, path: None, dir: dir.into(), timeout: Duration::from_secs(60), dry_run: false, yes: true }
+        RestoreOpts {
+            from: None,
+            path: None,
+            dir: dir.into(),
+            timeout: Duration::from_secs(60),
+            overwrite_newer: false,
+            with_git: false,
+            dry_run: false,
+            yes: true,
+        }
     }
 
     /// 2026-10-08T05:06:40Z — names the kept-files dir.
@@ -12660,12 +12832,32 @@ mod remote_tests {
         assert_eq!(args.len(), 1, "{args:?}");
         let a = &args[0];
         assert!(a.ends_with(&format!("{dir}/w1d2/devtest-apple/ root@10.0.0.1:")), "{a}");
-        for flag in ["--keep-dirlinks", "--no-owner", "--no-group", "--chmod=go-w", "--backup-dir=.arena-restore/20261008T050640Z", "--timeout=300", "-p 22001"] {
+        // The volume is mounted there: what it replaces is kept ON it; newer files and .git
+        // (a snapshot) stay as they are.
+        for flag in [
+            "--keep-dirlinks",
+            "--no-owner",
+            "--no-group",
+            "--chmod=go-w",
+            "--backup-dir=/workspace/.arena-restore/20261008T050640Z",
+            "--update",
+            "--exclude .git/",
+            "--timeout=300",
+            "-p 22001",
+        ] {
             assert!(a.contains(flag), "missing {flag}: {a}");
         }
         assert!(!a.contains("--delete") && !a.contains("--force"), "{a}");
         // The pod was asked (read-only) where its repo is — once, before the rsync.
         assert!(matches!(&fake.calls()[..], [RemoteCall::Exec { cmd, timeout, .. }] if cmd.contains("arena-repo-real") && *timeout == Some(PROBE_TIMEOUT)));
+        // No volume (or no answer): kept in the home; --overwrite-newer / --with-git as asked.
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [FakeReply::stdout("arena-repo-home=/root\narena-repo-real=/root/ARENA_materials\narena-repo-mount=no\n")]);
+        let remote2: Arc<dyn Remote> = fake.clone();
+        let opts = RestoreOpts { overwrite_newer: true, with_git: true, ..restore_opts(&dir) };
+        handle_restore(&f, &remote2, &cfg(), "apple", opts, &stub.path(), NOW).await.unwrap();
+        let a = stub.take_args().remove(0);
+        assert!(a.contains("--backup-dir=.arena-restore/20261008T050640Z") && !a.contains("--update") && !a.contains(".git/"), "{a}");
         // --from big, only a path: the all-files tier, `--relative` from its root.
         let opts = RestoreOpts { from: Some("big".into()), path: Some("model.bin".into()), ..restore_opts(&dir) };
         handle_restore(&f, &remote, &cfg(), "apple", opts, &stub.path(), NOW).await.unwrap();
@@ -12678,6 +12870,52 @@ mod remote_tests {
         handle_restore(&f, &remote, &cfg(), "apple", opts, &stub.path(), NOW).await.unwrap();
         assert!(stub.take_args().is_empty());
         assert_eq!(fake.calls().len(), 1);
+        // …and with a pod whose disk was reset after the snapshot was written (the plan warns;
+        // nothing else changes).
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [FakeReply::stdout(&format!("{linked}arena-repo-container=1\n"))]);
+        let remote: Arc<dyn Remote> = fake.clone();
+        let opts = RestoreOpts { dry_run: true, yes: false, ..restore_opts(&dir) };
+        handle_restore(&f, &remote, &cfg(), "apple", opts, &stub.path(), NOW).await.unwrap();
+        assert!(stub.take_args().is_empty());
+    }
+
+    /// A restore that pushed the repo's `.git` (the big tier) checks the repo afterwards: a
+    /// repo git can't read any more fails the command, saying where the replaced files are.
+    #[tokio::test]
+    async fn a_restore_that_pushed_git_checks_the_repo() {
+        let stub = StubRsync::new("restore-git");
+        let dir = backups(&stub.0);
+        std::fs::create_dir_all(stub.0.join("backups/big/devtest-apple/ARENA_materials/.git")).unwrap();
+        std::fs::write(stub.0.join("backups/big/devtest-apple/ARENA_materials/.git/HEAD"), "ref\n").unwrap();
+        let f = fleet();
+        let linked = "arena-repo-home=/root\narena-repo-real=/workspace/ARENA_materials\narena-repo-mount=yes\n";
+        let big = || RestoreOpts { from: Some("big".into()), ..restore_opts(&dir) };
+        // Reads fine: done.
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [FakeReply::stdout(linked), FakeReply::stdout("arena-git=ok\n")]);
+        let remote: Arc<dyn Remote> = fake.clone();
+        handle_restore(&f, &remote, &cfg(), "apple", big(), &stub.path(), NOW).await.unwrap();
+        let calls = fake.calls();
+        assert!(
+            matches!(&calls[..], [_, RemoteCall::Exec { cmd, timeout, .. }] if cmd.contains("fsck --connectivity-only") && *timeout == Some(arena_core::restore::GIT_CHECK_TIMEOUT)),
+            "{calls:?}"
+        );
+        assert!(!stub.take_args()[0].contains(".git/"), "the big tier carries .git");
+        // Broken: the command fails and says where the replaced .git files are.
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [FakeReply::stdout(linked), FakeReply::stdout("arena-git=broken\n")]);
+        let remote: Arc<dyn Remote> = fake.clone();
+        let e = handle_restore(&f, &remote, &cfg(), "apple", big(), &stub.path(), NOW).await.unwrap_err().to_string();
+        assert!(e.contains("git can't read") && e.contains("/workspace/.arena-restore/20261008T050640Z/"), "{e}");
+        // A snapshot without --with-git pushes no .git: nothing to check.
+        std::fs::create_dir_all(stub.0.join("backups/w1d2/devtest-apple/ARENA_materials/.git")).unwrap();
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [FakeReply::stdout(linked)]);
+        let remote: Arc<dyn Remote> = fake.clone();
+        handle_restore(&f, &remote, &cfg(), "apple", restore_opts(&dir), &stub.path(), NOW).await.unwrap();
+        assert_eq!(fake.calls().len(), 1, "only the probe");
+        stub.take_args();
     }
 
     #[tokio::test]
@@ -12714,6 +12952,7 @@ mod remote_tests {
             home: Some("/root".into()),
             real: Some(real.into()),
             volume_mounted: mounted,
+            ..Default::default()
         };
         let note = |p: Option<&arena_core::volume::RepoProbe>, sub: Option<&str>| restore_note(REPO, "root", p, &src, sub);
         let linked = probe("/workspace/ARENA_materials", true);
@@ -12728,12 +12967,56 @@ mod remote_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The plan's notes: a snapshot written after the pod's disk was reset is flagged, with the
+    /// newest snapshot from before that; a snapshot's .git staying behind is said.
+    #[test]
+    fn restore_warns_about_a_snapshot_written_after_the_reset() {
+        let root = std::env::temp_dir().join(format!("arena-restore-notes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let put = |rel: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, rel).unwrap();
+        };
+        put("w1d1/devtest-apple/ARENA_materials/.git/HEAD");
+        put("w1d1/devtest-apple/ARENA_materials/work.py");
+        let secs = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        // The pod's disk is reset after w1d1 was written; the */15 pull then writes w1d2.
+        std::thread::sleep(Duration::from_millis(1100));
+        let reset = secs();
+        std::thread::sleep(Duration::from_millis(1100));
+        put("w1d2/devtest-apple/ARENA_materials/.git/HEAD");
+        put("w1d2/devtest-apple/ARENA_materials/work.py");
+        let src = root.join("w1d2/devtest-apple");
+        let written = arena_core::restore::tree_stats(&src).unwrap().last_written;
+        let probe = arena_core::volume::RepoProbe {
+            home: Some("/root".into()),
+            real: Some("/workspace/ARENA_materials".into()),
+            volume_mounted: true,
+            container_created: Some(reset),
+        };
+        let b = RestoreSource { base: &root, pod: "devtest-apple", label: "w1d2", src: &src, sub: None, last_written: written };
+        let notes = restore_notes(REPO, "root", Some(&probe), &b, false);
+        assert!(notes.iter().any(|n| n.starts_with("⚠ w1d2 was last written") && n.contains("--from w1d1")), "{notes:#?}");
+        assert!(notes.iter().any(|n| n.contains(".git isn't restored")), "{notes:#?}");
+        // The pod's container is older than every backup: nothing to flag; .git pushed: not said.
+        let old = arena_core::volume::RepoProbe { container_created: Some(1), ..probe.clone() };
+        let notes = restore_notes(REPO, "root", Some(&old), &b, true);
+        assert!(!notes.iter().any(|n| n.starts_with('⚠') || n.contains(".git")), "{notes:#?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn restore_parses() {
         match pods(&["restore", "apple", "--from", "big", "--path", "ARENA_materials", "--dir", "/b", "--timeout", "60", "--dry-run"]) {
-            PodCmd::Restore { target, from, path, dir, timeout, dry_run } => {
+            PodCmd::Restore { target, from, path, dir, timeout, overwrite_newer, with_git, dry_run } => {
                 assert_eq!((target.as_str(), from.as_deref(), path.as_deref(), dir.as_deref(), timeout, dry_run), ("apple", Some("big"), Some("ARENA_materials"), Some("/b"), Some(60), true));
+                assert!(!overwrite_newer && !with_git, "both off by default");
             }
+            _ => panic!("not restore"),
+        }
+        match pods(&["restore", "apple", "--overwrite-newer", "--with-git"]) {
+            PodCmd::Restore { overwrite_newer, with_git, .. } => assert!(overwrite_newer && with_git),
             _ => panic!("not restore"),
         }
         assert!(Cli::try_parse_from(["arena", "pods", "restore", "apple", "--timeout", "0"]).is_err());
@@ -13796,7 +14079,7 @@ mod lifecycle_tests {
         format!(
             "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(alpha bravo charlie delta echo @solo-gpu)\n\
              ARENA_REPO_OWNER=o\nARENA_REPO_NAME=r\nGIT_SSH_KEY_LOCAL=/nonexistent/devtest_deploy_key\n\
-             SSH_PROXY_HOST=localhost\nSSH_PROXY_NGINX_CONFIG_PATH={}\nSSH_PROXY_RELOAD_CMD=\"\"\nVSCODE_PREINSTALL=0\n",
+             SSH_PROXY_HOST=localhost\nSSH_PROXY_NGINX_CONFIG_PATH={}\nSSH_PROXY_RELOAD_CMD=\"\"\nVSCODE_PREINSTALL=0\nREPO_ON_VOLUME=0\n",
             dir.join("proxy.conf").display()
         )
     }

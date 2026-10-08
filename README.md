@@ -392,25 +392,42 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     iteration. Confirms first; `--dry-run` prints the exact rsync commands. A repo that
     setup **linked onto the `/workspace` volume** is still backed up as its tree (rsync `-a`
     copies a link as a link): each pod is first asked (20s) where its repo really is, and a
-    linked one is left out of the home job and pulled from its real path into the same place
+    linked one is left out of the pull and pulled from its real path into the same place
     (`<dir>/<label>/<pod>/ARENA_materials/`), so the backup looks as it always did; a pod that
-    doesn't answer gets its repo pulled through the home path (`ARENA_materials/`, which
-    follows a link). The image's checkout that setup moved aside (`*.arena-aside-*`) isn't
-    backed up. `pods replace`/`migrate copy` carry the repo the same way (direct and via
+    doesn't answer gets its repo pulled through its configured path (`ARENA_materials/`, which
+    follows a link). The same holds for a `--remote-path`/`BACKUP_REMOTE_PATH` that is the
+    home (`~/`, `/root/`, `.`), holds the repo (`/root` → `<pod>/root/ARENA_materials/`) or
+    names it without a trailing slash (`ARENA_materials`); one that can't be judged (`$VAR`,
+    a glob, `..` — rsync escapes `$`, so `$HOME/` never meant the home) is pulled as given,
+    with a warning for each pod whose repo is a link. The image's checkout that setup moved
+    aside (`*.arena-aside-*`) isn't backed up — only an untouched image checkout is ever moved
+    aside after a reset (see `pods setup`). `pods replace`/`migrate copy` carry the repo the same way (direct and via
     local staging), into the new pod's own volume copy when it has one.
-  - `pods restore <pod> [--from <wNdM>|big] [--path <subdir>] [--dir] [--timeout] [--dry-run]`
-    — push a backup (pull's layout) back onto **one** pod over its direct endpoint: by default
-    its newest `wNdM` snapshot (files under the size cap); `--from big` = the all-files tier;
-    `--path` restores just that part (e.g. `ARENA_materials/chapter1`). **Never deletes**
-    (no `--delete`), and a file it replaces is kept under `~/.arena-restore/<UTC time>/` on
-    the pod; rsync `--keep-dirlinks` writes **through** the repo's link onto the volume (a
-    plain push would replace the link with a directory on the container disk). Never pushes
-    `~/.ssh`, the shell rc files/histories (they hold the pod's own API keys), `~/.name` or
-    `.claude*`; never chowns the home. Refuses before touching the pod when the backup
-    doesn't exist or is empty, or `--path` isn't in it. Confirms first with source,
-    destination (where the repo lands, from a read-only question to the pod) and size; 2h
-    budget (`--timeout`), and gives up after 300s without I/O — a stopped restore deletes
-    nothing, re-run to finish.
+  - `pods restore <pod> [--from <label>|big] [--path <subdir>] [--dir] [--timeout]
+    [--overwrite-newer] [--with-git] [--dry-run]` — push a backup (pull's layout) back onto
+    **one** pod over its direct endpoint: by default its newest `wNdM` snapshot (files under
+    the size cap); `--from big` = the all-files tier, `--from <label>` any other (`pull
+    --label`; a refusal lists every backup there is); `--path` restores just that part (e.g.
+    `ARENA_materials/chapter1`). **Never deletes** (no `--delete`), and **never reverts newer
+    work**: a file on the pod newer than the backup's copy stays (rsync `--update`; each is
+    named afterwards; `--overwrite-newer` replaces them too). A file it does replace is kept on
+    the pod — under `/workspace/.arena-restore/<UTC time>/` when the pod has its volume
+    mounted (a restart can't wipe it there), else `~/.arena-restore/<UTC time>/`; pulls
+    don't back that dot-dir up. rsync `--keep-dirlinks` writes **through** the repo's link
+    onto the volume (a plain push would replace the link with a directory on the container
+    disk). Never pushes `~/.ssh`, the shell rc files/histories (they hold the pod's own API
+    keys), `~/.name` or `.claude*`; never chowns the home; never pushes `.git` from a snapshot
+    (it can lack git packs over the size cap — refs to missing objects break the repo;
+    `--with-git` to push it anyway, or `--from big`). After a restore that pushed the repo's
+    `.git`, the repo is checked (`git fsck --connectivity-only`, 120s) and a broken one fails
+    the command, saying where the replaced files are. Refuses before touching the pod when
+    the backup doesn't exist or is empty, or `--path` isn't in it. Confirms first with
+    source, destination (where the repo lands, from a read-only question to the pod) and
+    size — and **warns when the snapshot was written after the pod's disk was last reset**
+    (the container's creation time, from `/.dockerenv`) while an older snapshot predates it:
+    the */15 pull of a wiped pod overwrites the snapshot's copies of the work with the
+    image's files, so it names the older one (`--from …`). 2h budget (`--timeout`), and gives
+    up after 300s without I/O — a stopped restore deletes nothing, re-run to finish.
   - `pods copy-keys` — distribute API keys into each pod's `~/.bashrc`/`~/.zshrc`
     (idempotent): per-host keys from `<keys-dir>/<provider>_api_keys.csv`
     (openai/anthropic/openrouter) **plus broadcast tokens** — a Hugging Face token
@@ -494,23 +511,35 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     vscode warm-up: …)`) and the pod still counts as set up. `--no-vscode` skips it for a
     run, `VSCODE_PREINSTALL=0` everywhere. (`~/.vscode-server` is a dot-dir, so `pods pull`
     and replace's home copy already skip it.)
-    **Repo on the volume** (image-based pods, before the repo update): when `/workspace` is a
-    real mount (`mountpoint`, else `/proc/self/mountinfo`) the repo lives at
-    `/workspace/<repo dir name>` and `BACKUP_REPO_PATH` becomes a symlink to it, so a restart
-    or stop keeps the participants' work and every git operation (setup's fetch/reset,
-    `backup`, `set-branch`) acts on the volume copy. A fresh volume: the checkout is copied
-    there (complete before it counts — an interrupted copy is redone) and the original moved
-    aside to `<repo>.arena-aside-<UTC time>` on the container disk (a reset clears it; on an
-    overlay root `mv` may have to copy it — one more checkout's time and space).
-    After a reset (the volume kept a copy): the **volume copy wins** — the image's fresh
-    checkout is moved aside, never deleted, the volume copy never overwritten — and the link
-    is recreated (the restart flow's re-setup does this). Idempotent, under a lock. Without a
-    volume nothing changes. Anything odd — `/workspace/<repo>` that isn't a git checkout, the
-    path linking elsewhere, the copy failing (volume full), or a shell/kernel working inside
-    the repo (it would keep writing into the moved-aside copy) — leaves everything as it is
-    and shows as `✓ name (warning: repo + keys config: …)`; the restart gate then stays
-    closed. A pod restarted by its provider (or a stopped pod started again) shows the image's
-    checkout until `pods setup` re-links it.
+    **Repo on the volume** (image-based pods; its own best-effort step `repo onto volume`
+    before the config step, 900s budget, never a failed setup; `REPO_ON_VOLUME=0` turns it
+    off): when `/workspace` is a real mount (`mountpoint`, else `/proc/self/mountinfo`) the
+    repo lives at `/workspace/<repo dir name>` and `BACKUP_REPO_PATH` becomes a symlink to it,
+    so a restart or stop keeps the participants' work and every git operation (setup's
+    fetch/reset, `backup`, `set-branch`) acts on the volume copy. A fresh volume: refused
+    while the repo is in use (a process's working directory **or an open file** in it) or
+    either disk lacks the room; the checkout is copied there (complete before it counts, the
+    copy stopped at 360s), refused if anything in it changed meanwhile, then the original is
+    moved aside to `<repo>.arena-aside-<UTC time>` on the container disk (a reset clears it;
+    on an overlay root `mv` may have to copy it — one more checkout's time and space) and
+    only then is the copy put in place and linked; any failure puts the checkout back. After
+    a reset (the volume kept a copy): the **volume copy wins** — but only over the image's
+    **untouched** checkout (`git status` clean and nothing in it changed since the container
+    was created, `/.dockerenv`'s time): it's moved aside, never deleted, the volume copy never
+    overwritten, and the link recreated (the restart flow's re-setup does this). If
+    participants already worked in the checkout (a provider restart, a stop + start, before
+    setup ran), **neither is touched** and the warning says to copy their changes into the
+    volume copy, move the checkout away and re-run setup — moving it aside would hide that
+    work where no pull looks. Idempotent, under a lock (a setup whose relocation timed out
+    may still be copying on the pod: the next waits 120s, and the config step waits for it
+    before the repo update). Without a volume nothing changes. Anything odd —
+    `/workspace/<repo>` that isn't a git checkout, the path linking elsewhere, the copy
+    failing — leaves everything as it is and shows as `✓ name (warning: repo onto volume:
+    …)` (the TUI's setup line too); the restart gate then stays closed. A pod restarted by its
+    provider (or a stopped pod started again) shows the image's checkout until `pods setup`
+    re-links it. **Rolling this out to a live fleet:** the first setup copies each repo (and,
+    on an overlay root, a second time to keep the original) — run it while participants are
+    idle; a save that lands mid-move is caught and the move undone, but only between checks.
   - `config check | set | which` — `check` is the read-only doctor (keys + setup
     readiness); `config set KEY VALUE` writes a key (e.g. an API key) into config.env —
     or give just `KEY` and **pipe the value on stdin** (`printf %s "$TOK" | arena config

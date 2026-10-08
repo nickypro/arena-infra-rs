@@ -1509,32 +1509,39 @@ fn backup_repo_path(cfg: &Config) -> String {
     })
 }
 
-/// Provision the pod over SSH: copy the deploy key, then run the setup script (mirrors
-/// `arena setup --apply` for a single pod; non-force, matching the CLI default). Each step
-/// within the CLI's per-step budgets (core `SetupTimeouts`: `SETUP_TIMEOUT_SECS` honoured).
+/// Provision the pod over SSH — the image-based steps of `arena pods setup` (non-force,
+/// matching the CLI default): copy the deploy key, move the repo onto the pod's volume when it
+/// has one, run the config. Through core's runner, so each step keeps its own budget (core
+/// `SetupTimeouts`: `SETUP_TIMEOUT_SECS` honoured) and a step's `arena-warning:` lines — the
+/// only sign that the repo did NOT go onto the volume, and why — reach the result line
+/// (`✓ set up <pod> (warning: …)`) instead of being dropped with its stdout.
 async fn run_setup(remote: &dyn Remote, cfg: &Config, pod: &Pod) -> String {
+    use arena_core::setup::{provision, BootRetry, ProvisionOutcome};
     let target = match SshTarget::from_pod(pod, cfg) {
         Ok(t) => t,
         Err(e) => return format!("✗ {}: {e}", pod.name),
     };
-    let scfg = match arena_core::setup::SetupConfig::from_config(cfg) {
+    let steps = match setup_steps(cfg, pod) {
         Ok(s) => s,
         Err(e) => return format!("✗ {}: {e}", pod.name),
     };
-    let budget = match arena_core::setup::SetupTimeouts::from_config(cfg, None) {
-        Ok(b) => b,
-        Err(e) => return format!("✗ {}: {e}", pod.name),
-    };
-    match remote.copy(&target, &scfg.key_local, &scfg.key_remote, Some(budget.copy)).await {
-        Ok(out) if out.success => {}
-        Ok(out) => return format!("✗ setup {} (scp key): {}", pod.name, out.stderr.trim()),
-        Err(e) => return format!("✗ setup {} (scp key): {}", pod.name, describe_error(&e)),
+    // No boot-race retries: the operator presses Setup on a pod that is already up.
+    let no_wait = BootRetry { window: Duration::ZERO, every: Duration::ZERO };
+    match provision(remote, &target, &steps, no_wait).await {
+        ProvisionOutcome::Done { warnings } if warnings.is_empty() => format!("✓ set up {}", pod.name),
+        ProvisionOutcome::Done { warnings } => format!("✓ set up {} (warning: {})", pod.name, warnings.join("; ")),
+        failed => format!("✗ setup {}: {}", pod.name, failed.describe()),
     }
-    match remote.exec(&target, &scfg.remote_command(&pod.name, false), Some(budget.config)).await {
-        Ok(out) if out.success => format!("✓ set up {}", pod.name),
-        Ok(out) => format!("✗ setup {} (exit {:?}): {}", pod.name, out.code, out.stderr.trim()),
-        Err(e) => format!("✗ setup {} failed: {}", pod.name, describe_error(&e)),
-    }
+}
+
+/// The TUI's setup steps: core's image-based list (as before: no hetzner script, and no VS
+/// Code warm-up — that's `arena pods setup`'s).
+fn setup_steps(cfg: &Config, pod: &Pod) -> arena_core::Result<Vec<arena_core::setup::ProvisionStep>> {
+    use arena_core::setup::{provisioning_steps, SetupConfig, SetupTimeouts};
+    let mut scfg = SetupConfig::from_config(cfg)?;
+    scfg.vscode = None;
+    let budget = SetupTimeouts::from_config(cfg, None)?;
+    Ok(provisioning_steps("image", &scfg, &pod.name, false, "", &budget))
 }
 
 /// The exact command(s) a safe (non-typed) action will run, for the confirm modal.
@@ -1553,12 +1560,19 @@ fn build_preview(cfg: &Config, action: Action, pod: &Pod) -> Option<String> {
             }
             Err(e) => format!("⚠ {e}"),
         }),
-        Action::Setup => Some(match (&target, arena_core::setup::SetupConfig::from_config(cfg)) {
-            (Ok(t), Ok(scfg)) => format!(
-                "{}\n{}",
-                t.display_scp(&scfg.key_local, &scfg.key_remote),
-                t.display_command(&scfg.remote_command(&pod.name, false))
-            ),
+        Action::Setup => Some(match (&target, setup_steps(cfg, pod)) {
+            (Ok(t), Ok(steps)) => steps
+                .iter()
+                .map(|step| {
+                    use arena_core::setup::ProvisionStep;
+                    match step {
+                        ProvisionStep::Scp { local, remote, .. } => t.display_scp(local, remote),
+                        ProvisionStep::Run { cmd, .. } => t.display_command(cmd),
+                        ProvisionStep::Optional { label, summary, .. } => format!("# {label} (best-effort): {summary}"),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
             (Err(e), _) => format!("⚠ {e}"),
             (_, Err(e)) => format!("⚠ {e}"),
         }),
@@ -3536,8 +3550,31 @@ deep_check_end=1
             ("run-hung", vec![FakeReply::hang()], "✗ devtest-alpha run failed: timed out after 1800s", vec![RUN_TIMEOUT]),
             ("backup", vec![FakeReply::exit(1, "rejected")], "✗ backup devtest-alpha (exit Some(1)): rejected", vec![BACKUP_TIMEOUT]),
             ("set-branch", vec![FakeReply::ok()], "✓ devtest-alpha → w1d2", vec![BRANCH_TIMEOUT]),
-            ("setup", vec![FakeReply::ok(), FakeReply::ok()], "✓ set up devtest-alpha", vec![setup.copy, setup.config]),
-            ("setup-hung", vec![FakeReply::ok(), FakeReply::hang()], "✗ setup devtest-alpha failed: timed out after 300s", vec![setup.copy, setup.config]),
+            ("setup", vec![FakeReply::ok(), FakeReply::ok(), FakeReply::ok()], "✓ set up devtest-alpha", vec![setup.copy, setup.relocate, setup.config]),
+            (
+                "setup-hung",
+                vec![FakeReply::ok(), FakeReply::ok(), FakeReply::hang()],
+                "✗ setup devtest-alpha: timed out at repo + keys config after 300s",
+                vec![setup.copy, setup.relocate, setup.config],
+            ),
+            // What the relocation says reaches the line: the repo did NOT go onto the volume.
+            (
+                "setup-warns",
+                vec![
+                    FakeReply::ok(),
+                    FakeReply::stdout("arena-warning: repo not moved onto the /workspace volume: in use (pid 42) - re-run setup when it is idle\n"),
+                    FakeReply::ok(),
+                ],
+                "✓ set up devtest-alpha (warning: repo onto volume: repo not moved onto the /workspace volume: in use (pid 42) - re-run setup when it is idle)",
+                vec![setup.copy, setup.relocate, setup.config],
+            ),
+            // …and so does what the config step says.
+            (
+                "setup-config-warns",
+                vec![FakeReply::ok(), FakeReply::ok(), FakeReply::stdout("arena-warning: another setup is still moving the repo onto the volume - the update ran anyway\n")],
+                "✓ set up devtest-alpha (warning: repo + keys config: another setup is still moving the repo onto the volume - the update ran anyway)",
+                vec![setup.copy, setup.relocate, setup.config],
+            ),
         ];
         for (what, replies, want, budget) in cases {
             let fake = FakeRemote::new();

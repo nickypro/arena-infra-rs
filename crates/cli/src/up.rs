@@ -486,7 +486,8 @@ impl Shared<'_, '_> {
                 }
                 Some(outcome) => {
                     say(To::Out, &format!("[{name}] setup ✓ ({})", pipeline::fmt_elapsed(t.elapsed())));
-                    // A best-effort step (the VS Code warm-up) that didn't work out: said, not fatal.
+                    // A best-effort step (the move onto the volume, the VS Code warm-up) that didn't
+                    // work out: said, not fatal.
                     for w in outcome.warnings() {
                         say(To::Err, &format!("[{name}] setup warning: {w}"));
                     }
@@ -1246,7 +1247,7 @@ mod tests {
         let mut text = "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(\n  \"apple\"\n  \"bloom\"\n  \"cloud\"\n)\n\
                         ARENA_REPO_OWNER=o\nARENA_REPO_NAME=r\nGIT_SSH_KEY_LOCAL=/nonexistent/devtest_deploy_key\n\
                         SHARED_SSH_KEY_PATH=/nonexistent/devtest_key\nALLOWED_CUDA_VERSIONS=\"13.0\"\n\
-                        GPU_TYPE=\"NVIDIA RTX A4000\"\nCLOUD_TYPE=COMMUNITY\nVSCODE_PREINSTALL=0\n"
+                        GPU_TYPE=\"NVIDIA RTX A4000\"\nCLOUD_TYPE=COMMUNITY\nVSCODE_PREINSTALL=0\nREPO_ON_VOLUME=0\n"
             .to_string();
         if let Some(p) = proxy {
             text.push_str(&format!(
