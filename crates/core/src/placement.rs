@@ -73,7 +73,8 @@ impl std::fmt::Display for Order {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PriceSource {
-    /// RunPod's live catalog (GraphQL `gpuTypes`, or REST v2 `/catalog/gpus`).
+    /// RunPod's live catalog (GraphQL `gpuTypes`, or REST v2 `/catalog/gpus`), or Vast's
+    /// cheapest matching offer at plan time.
     Live,
     /// The local [`gpu::PRESETS`] (no live price for this GPU) — shown with `~`.
     Estimate,
@@ -185,19 +186,32 @@ pub struct PriceBook {
     /// Back unpriced GPUs with the [`gpu::PRESETS`] estimates. Only for RunPod: the presets
     /// *are* RunPod prices, so on another provider they'd be fiction.
     estimates: bool,
+    /// Marketplace quotes (Vast): `(gpu, $/h per GPU)` from the cheapest matching offer when
+    /// the plan was made. A GPU with no offer then isn't here — unpriced.
+    offers: Vec<(String, f64)>,
 }
 
 impl PriceBook {
     /// RunPod: `catalogs` may be empty (no key / fetch failed) — then every known GPU is
     /// priced from the presets, marked as an estimate.
     pub fn runpod(catalogs: Vec<(Option<String>, Vec<GpuType>)>) -> Self {
-        Self { catalogs, estimates: true }
+        Self { catalogs, estimates: true, offers: Vec::new() }
     }
 
-    /// No quote before create: Vast's marketplace prices per offer at create time, Hetzner
-    /// creates CPU VMs. Every option is unpriced.
+    /// No quote before create (Hetzner creates CPU VMs; Vast without an API key to search
+    /// with). Every option is unpriced.
     pub fn unpriced() -> Self {
         Self::default()
+    }
+
+    /// Vast: `per_pod` = each GPU option's cheapest matching offer right now, $/h for the
+    /// whole pod (the search asks for exactly `gpu_count` GPUs, and the offer's `dph_total`
+    /// includes the disk asked for). Kept per GPU like the catalog prices, so `plan_options`
+    /// prices and caps it the same way. Live, but a snapshot: each create searches again and
+    /// rents the cheapest offer *then* — never above `--max-price` ([`PodSpec::max_price`]).
+    pub fn offers(per_pod: Vec<(String, f64)>, gpu_count: u32) -> Self {
+        let n = f64::from(gpu_count.max(1));
+        Self { offers: per_pod.into_iter().map(|(gpu, p)| (gpu, p / n)).collect(), ..Self::default() }
     }
 
     /// The price and stock hint for `gpu` on `cloud` (`None` = a provider without tiers).
@@ -206,6 +220,10 @@ impl PriceBook {
     /// offered there", and is *not* back-filled with a preset (same rule as `arena gpus`).
     /// Only a GPU with no live price at all falls back to the preset estimate.
     pub fn quote(&self, gpu: &str, cloud: Option<&str>) -> Quote {
+        if let Some((_, p)) = self.offers.iter().find(|(g, _)| g == gpu) {
+            let price_per_gpu = Some(*p).filter(|p| p.is_finite() && *p > 0.0);
+            return Quote { price_per_gpu, source: price_per_gpu.map(|_| PriceSource::Live), stock: None };
+        }
         let secure = cloud.is_some_and(|c| c.eq_ignore_ascii_case("SECURE"));
         let tier = |community: Option<f64>, secure_p: Option<f64>| if secure { secure_p } else { community };
         let rows = || self.catalogs.iter().flat_map(|(tag, rows)| rows.iter().map(move |r| (tag, r)));
@@ -304,8 +322,9 @@ pub struct OptionPlan {
 }
 
 /// Prices compared in tenths of a cent: `0.17 × 3` is `0.51000000000000001` in f64 and must
-/// still fit under a `0.51` cap (and tie with a `0.51` option).
-fn milli(p: f64) -> i64 {
+/// still fit under a `0.51` cap (and tie with a `0.51` option). Also how a marketplace
+/// backend checks an offer against the cap at create, so plan and create agree at the edge.
+pub(crate) fn milli(p: f64) -> i64 {
     (p * 1000.0).round() as i64
 }
 
@@ -663,7 +682,8 @@ impl Progress<'_> {
 /// the fleet is re-listed first ([`still_needed`]) — a failed list ends the run rather than
 /// risk a duplicate. `interrupt` makes a fresh "stop" future per wait (Ctrl+C in the CLI): it
 /// ends the run between rounds, keeping what was made. The option order is the confirmed
-/// plan's — fixed for the run.
+/// plan's — fixed for the run — and every create carries its `--max-price`
+/// ([`PodSpec::max_price`]), which a marketplace backend enforces on the offer it rents.
 pub async fn place<W, F>(
     provider: &dyn Provider,
     base: &PodSpec,
@@ -703,7 +723,9 @@ where
                 if blocked[k] || denied[k] {
                     continue;
                 }
-                let spec = spec_for(base, &name, option);
+                // The cap travels with the spec: a marketplace backend (Vast) picks the
+                // machine, and so the price, only now — the plan's quote may be gone.
+                let spec = PodSpec { max_price: plan.max_price, ..spec_for(base, &name, option) };
                 let result = retrying(&policy, || provider.create_pod(&spec)).await;
                 let at = start.elapsed();
                 let (outcome, stop) = match result {
@@ -878,6 +900,7 @@ mod tests {
             env: Vec::new(),
             docker_args: None,
             allowed_cuda: Vec::new(),
+            max_price: None,
         }
     }
 
@@ -1084,6 +1107,34 @@ mod tests {
         assert_eq!(capped.dropped.len(), 1);
     }
 
+    /// Vast: each option priced at its cheapest matching offer (per pod: the offer is for
+    /// exactly `gpu_count` GPUs), live — so `--max-price` and `cheapest` work there too.
+    #[test]
+    fn vast_options_are_priced_from_the_cheapest_offer() {
+        // (label, $/h per pod in tenths of a cent) in plan order.
+        let priced = |p: &OptionPlan| -> Vec<(String, Option<i64>)> {
+            p.options.iter().map(|o| (o.label.clone(), o.price_per_pod.map(milli))).collect()
+        };
+        let row = |label: &str, m: Option<i64>| (label.to_string(), m);
+        let book = PriceBook::offers(vec![(R3090.into(), 0.105_78), (A4000.into(), 0.20)], 1);
+        let plan = plan_options(&req(&[A4000, R3090, ADA], &["COMMUNITY"], 1, None, Order::Cheapest), "vast", &book);
+        assert_eq!(
+            priced(&plan),
+            [row("1×RTX 3090", Some(106)), row("1×RTX A4000", Some(200)), row("1×RTX 4000 Ada", None)],
+            "cheapest first; no offer = unpriced, last"
+        );
+        assert_eq!(plan.options[0].price_source, Some(PriceSource::Live));
+        assert_eq!(plan.options[0].price_label(), "$0.11/h");
+        // The cap drops the dearer option and the unpriced one, with reasons.
+        let capped = plan_options(&req(&[A4000, R3090, ADA], &["COMMUNITY"], 1, Some(0.15), Order::Cheapest), "vast", &book);
+        assert_eq!(priced(&capped), [row("1×RTX 3090", Some(106))]);
+        let reasons: Vec<&str> = capped.dropped.iter().map(|d| d.reason.as_str()).collect();
+        assert_eq!(reasons, ["$0.20/h > cap $0.15/h per pod", "no known price, so --max-price can't be checked"]);
+        // A 2-GPU offer's price is the pod's: kept per GPU, multiplied back.
+        let two = plan_options(&req(&[R3090], &["COMMUNITY"], 2, Some(0.25), Order::Cheapest), "vast", &PriceBook::offers(vec![(R3090.into(), 0.25)], 2));
+        assert_eq!(priced(&two), [row("2×RTX 3090", Some(250))]);
+    }
+
     #[test]
     fn plan_table_and_json_snapshot() {
         let r = req(&[A4000, "NVIDIA A40"], &["COMMUNITY", "SECURE"], 1, Some(0.40), Order::Cheapest);
@@ -1128,13 +1179,22 @@ note: ~ = preset estimate (no live price for that GPU); --max-price is checked a
         script: Mutex<HashMap<(String, String), VecDeque<Reply>>>,
         fallback: Reply,
         calls: Mutex<Vec<(String, String, String, u32)>>,
+        /// `max_price` per create call.
+        caps: Mutex<Vec<Option<f64>>>,
         fleet: Mutex<Vec<Pod>>,
         list_fails: bool,
     }
 
     impl Fake {
         fn new(fallback: Reply) -> Self {
-            Fake { script: Default::default(), fallback, calls: Default::default(), fleet: Default::default(), list_fails: false }
+            Fake {
+                script: Default::default(),
+                fallback,
+                calls: Default::default(),
+                caps: Default::default(),
+                fleet: Default::default(),
+                list_fails: false,
+            }
         }
         fn script(self, gpu: &str, cloud: &str, replies: &[Reply]) -> Self {
             self.script.lock().unwrap().insert((gpu.into(), cloud.into()), replies.iter().copied().collect());
@@ -1162,6 +1222,7 @@ note: ~ = preset estimate (no live price for that GPU); --max-price is checked a
         }
         async fn create_pod(&self, spec: &PodSpec) -> Result<Pod> {
             self.calls.lock().unwrap().push((spec.name.clone(), spec.gpu_type.clone(), spec.cloud_type.clone(), spec.gpu_count));
+            self.caps.lock().unwrap().push(spec.max_price);
             let key = (spec.gpu_type.clone(), spec.cloud_type.clone());
             let reply = self.script.lock().unwrap().get_mut(&key).and_then(VecDeque::pop_front).unwrap_or(self.fallback);
             match reply {
@@ -1534,6 +1595,20 @@ note: ~ = preset estimate (no live price for that GPU); --max-price is checked a
         assert!(matches!(out.end, End::Interrupted), "{:?}", out.end);
         assert_eq!(out.created.len(), 1);
         assert_eq!(out.rounds, 1);
+    }
+
+    /// The cap reaches every create: a marketplace backend picks the machine (and price)
+    /// only then, and must not rent above what the operator agreed to.
+    #[tokio::test]
+    async fn every_create_carries_the_plans_cap() {
+        let fake = Fake::new(Reply::Ok).script(A4000, "COMMUNITY", &[Reply::Capacity]);
+        let (out, _) = run(&fake, &three(), &["arena8-apple", "arena8-bloom"], ONE_ROUND, None).await;
+        assert!(matches!(out.end, End::Filled), "{:?}", out.end);
+        assert_eq!(*fake.caps.lock().unwrap(), [Some(0.30), Some(0.30), Some(0.30)]);
+        let uncapped = plan_options(&req(&[A4000], &["COMMUNITY"], 1, None, Order::Cheapest), "runpod", &book());
+        let fake = Fake::new(Reply::Ok);
+        run(&fake, &uncapped, &["arena8-apple"], ONE_ROUND, None).await;
+        assert_eq!(*fake.caps.lock().unwrap(), [None]);
     }
 
     #[test]

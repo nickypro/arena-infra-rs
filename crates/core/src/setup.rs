@@ -594,6 +594,44 @@ pub async fn provision(
     }
 }
 
+/// Whether a provisioning failure is the pod refusing our SSH key — `Permission denied
+/// (publickey…)`, from ssh or scp — the one failure a provider-side key repair
+/// ([`crate::provider::Provider::authorize_ssh_keys`], Vast's per-instance attach) can fix.
+/// A *file* permission error on the pod (`scp: …: Permission denied`) is not it. Pure.
+pub fn key_rejected(outcome: &ProvisionOutcome) -> bool {
+    matches!(outcome, ProvisionOutcome::Failed { detail, .. }
+        if detail.to_lowercase().contains("permission denied (publickey"))
+}
+
+/// After a key repair, setup runs again up to this many times…
+pub const KEY_REPAIR_TRIES: u32 = 3;
+/// …this far apart (the first after one wait), while the pod still refuses the key: a
+/// provider applies a key attached through its API to the running container on its own
+/// schedule (Vast: asynchronously), not by the time the API call returns.
+pub const KEY_REPAIR_EVERY: Duration = Duration::from_secs(20);
+
+/// Re-run a pod's provisioning after its provider re-authorized our keys: wait
+/// [`KEY_REPAIR_EVERY`], [`provision`], and repeat while the pod still refuses the key — at
+/// most [`KEY_REPAIR_TRIES`] times. Every step is idempotent (the runner already re-runs the
+/// sequence from the top on a connection failure), so running it again is safe. Returns the
+/// last outcome; never errors.
+pub async fn provision_after_key_repair(
+    remote: &dyn Remote,
+    target: &SshTarget,
+    steps: &[ProvisionStep],
+    boot: BootRetry,
+) -> ProvisionOutcome {
+    let mut tries = 0;
+    loop {
+        tokio::time::sleep(KEY_REPAIR_EVERY).await;
+        let outcome = provision(remote, target, steps, boot).await;
+        tries += 1;
+        if tries >= KEY_REPAIR_TRIES || !key_rejected(&outcome) {
+            return outcome;
+        }
+    }
+}
+
 async fn provision_once(
     remote: &dyn Remote,
     target: &SshTarget,
@@ -1037,6 +1075,45 @@ mod tests {
         );
         assert_eq!(fake.calls().len(), 1, "an auth failure is never retried");
         assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    #[test]
+    fn key_rejected_means_the_pod_refused_our_key() {
+        let failed = |detail: &str| ProvisionOutcome::Failed { step: "copy deploy key", code: Some(255), detail: detail.into() };
+        assert!(key_rejected(&failed("root@10.0.0.1: Permission denied (publickey).\nscp: Connection closed")));
+        assert!(key_rejected(&failed("root@10.0.0.1: permission denied (publickey,password).")));
+        // A file permission on the pod, a timeout, success: not a key problem.
+        assert!(!key_rejected(&failed("scp: /root/.ssh/id_ed25519: Permission denied")));
+        assert!(!key_rejected(&failed("ssh: connect to host 10.0.0.1 port 22: Connection refused")));
+        assert!(!key_rejected(&ProvisionOutcome::TimedOut { step: "copy deploy key", after: secs(60) }));
+        assert!(!key_rejected(&ProvisionOutcome::Done));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn after_a_key_repair_setup_reruns_until_the_key_is_accepted() {
+        let denied = "root@10.0.0.1: Permission denied (publickey).\nscp: Connection closed\r\n";
+        // Still refused 20s after the repair, accepted at 40s.
+        let fake = FakeRemote::new();
+        fake.script("10.0.0.1:22", [FakeReply::exit(255, denied), FakeReply::ok(), FakeReply::ok()]);
+        let start = tokio::time::Instant::now();
+        let out = provision_after_key_repair(&fake, &target(22), &image_steps(), BootRetry::default()).await;
+        assert_eq!(out, ProvisionOutcome::Done);
+        assert_eq!(start.elapsed(), secs(40));
+        assert_eq!(fake.calls().len(), 3, "refused copy, then copy + config");
+        // Never accepted: bounded — the refusal stands after the last try.
+        let fake = FakeRemote::new();
+        fake.script("10.0.0.1:22", (0..10).map(|_| FakeReply::exit(255, denied)));
+        let start = tokio::time::Instant::now();
+        let out = provision_after_key_repair(&fake, &target(22), &image_steps(), BootRetry::default()).await;
+        assert!(key_rejected(&out), "{out:?}");
+        assert_eq!(start.elapsed(), KEY_REPAIR_EVERY * KEY_REPAIR_TRIES);
+        assert_eq!(fake.calls().len(), KEY_REPAIR_TRIES as usize);
+        // Any other failure ends it at once — the key was the only thing to wait for.
+        let fake = FakeRemote::new();
+        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::exit(128, "fatal: couldn't find remote ref")]);
+        let out = provision_after_key_repair(&fake, &target(22), &image_steps(), BootRetry::default()).await;
+        assert!(matches!(&out, ProvisionOutcome::Failed { step: "repo + keys config", .. }), "{out:?}");
+        assert_eq!(fake.calls().len(), 2);
     }
 
     #[tokio::test(start_paused = true)]

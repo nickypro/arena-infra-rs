@@ -180,6 +180,14 @@ impl Provider for MultiProvider {
     async fn pod_spec(&self, id: &str) -> Result<PodSpec> {
         self.backend_for(id).await?.pod_spec(id).await
     }
+    async fn authorize_ssh_keys(&self, pod: &Pod, keys: &[String]) -> Result<()> {
+        // By the pod's `provider` tag first (as `enrich`): Vast and Hetzner ids are both
+        // numeric, so the id cache alone could hand a Vast pod to Hetzner. Else the cache.
+        match self.backends.iter().find(|b| b.name() == pod.provider) {
+            Some(b) => b.authorize_ssh_keys(pod, keys).await,
+            None => self.backend_for(&pod.id).await?.authorize_ssh_keys(pod, keys).await,
+        }
+    }
 }
 
 /// Build the fleet-wide provider: the chosen `primary` (required, for create) plus every
@@ -394,6 +402,56 @@ mod tests {
         assert!(m.restart_wipes_container_disk(&pod("r1", "arena8-apple")));
         // Nobody owns it: assume it wipes (the safe answer).
         assert!(m.restart_wipes_container_disk(&tagged_pod("x1", "lambda")));
+    }
+
+    /// A backend that can re-attach SSH keys (like Vast), recording which pods it was asked to.
+    struct Attaches {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl Provider for Attaches {
+        fn name(&self) -> &'static str {
+            "vast"
+        }
+        fn describe(&self, _spec: &PodSpec) -> String {
+            String::new()
+        }
+        async fn list_pods(&self) -> Result<Vec<Pod>> {
+            Ok(vec![])
+        }
+        async fn create_pod(&self, _spec: &PodSpec) -> Result<Pod> {
+            unimplemented!("not exercised")
+        }
+        async fn stop_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn restart_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn terminate_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn authorize_ssh_keys(&self, pod: &Pod, _keys: &[String]) -> Result<()> {
+            self.seen.lock().unwrap().push(pod.id.clone());
+            Ok(())
+        }
+    }
+
+    /// The key repair goes to the backend that owns the pod — by its provider tag first, so
+    /// a Vast pod whose numeric id another backend also uses still reaches Vast.
+    #[tokio::test]
+    async fn authorize_ssh_keys_goes_to_the_owning_backend() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut m = multi(vec![Fake { name: "runpod", pods: Some(vec![pod("7", "arena8-apple")]) }]);
+        m.backends.push(Box::new(Attaches { seen: seen.clone() }));
+        m.list_pods().await.unwrap(); // the id cache now says "7" is runpod's
+        m.authorize_ssh_keys(&tagged_pod("7", "vast"), &["ssh-ed25519 AAAA k".into()]).await.unwrap();
+        assert_eq!(*seen.lock().unwrap(), ["7"]);
+        // RunPod can't: NotImplemented, which callers read as "leave the failure as it is".
+        let e = m.authorize_ssh_keys(&tagged_pod("7", "runpod"), &[]).await.unwrap_err();
+        assert!(matches!(e, Error::NotImplemented(_)), "{e}");
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

@@ -863,14 +863,12 @@ pub struct PodHealth {
 }
 
 /// The IP that identifies the machine a pod runs on, for the same-host summary: its SSH
-/// IP, but only where that is the machine's own address. Vast pods are reached through
-/// Vast's shared SSH proxy (`ssh4.vast.ai`), which says nothing about the machine, so
-/// they — and any endpoint that isn't an IP literal — are never grouped: a false "same
-/// host?" would send the operator to switch GPU type for nothing.
+/// IP, but only where that is the machine's own address — an IP literal. A hostname never
+/// groups: that's what a shared proxy looks like (Vast's `sshN.vast.ai`, which says nothing
+/// about the machine), and a false "same host?" would send the operator to switch GPU type
+/// for nothing. Vast pods are listed with their host's own public IP when they have direct
+/// SSH (`provider::vast`), and only fall back to the proxy hostname without it.
 pub fn host_ip(pod: &Pod) -> Option<String> {
-    if pod.provider.eq_ignore_ascii_case("vast") {
-        return None;
-    }
     pod.ssh_ip.as_deref().filter(|ip| ip.parse::<std::net::IpAddr>().is_ok()).map(String::from)
 }
 
@@ -1692,13 +1690,16 @@ devtest-echo   fail    -            -          -             -  ssh: exit Some(2
     fn same_host_groups_only_real_machine_ips() {
         let failing = |p: &Pod| PodHealth::unreachable(p, "timed out after 150s");
         let vast = |name: &str, host: &str| Pod { provider: "vast".into(), ..pod(name, host) };
-        // Two Vast pods behind the same SSH proxy are not "the same host".
+        // Two Vast pods behind the same SSH proxy hostname are not "the same host".
         let results = vec![failing(&vast("apple", "ssh4.vast.ai")), failing(&vast("bloom", "ssh4.vast.ai"))];
         assert!(same_host_failures(&results).is_empty());
         assert_eq!(render_summary(&results), ["0 pass, 0 warn, 2 fail"]);
-        // ...even if Vast hands out an IP-literal proxy address.
+        // Two on the same direct host IP are (Vast lists the host's public IP for direct SSH).
         let results = vec![failing(&vast("apple", "203.0.113.9")), failing(&vast("bloom", "203.0.113.9"))];
-        assert!(same_host_failures(&results).is_empty());
+        assert_eq!(
+            same_host_failures(&results),
+            [("203.0.113.9".to_string(), vec!["devtest-apple".to_string(), "devtest-bloom".to_string()])]
+        );
         // A hostname (not an IP) never groups, on any provider.
         let results = vec![failing(&pod("apple", "proxy.example")), failing(&pod("bloom", "proxy.example"))];
         assert!(same_host_failures(&results).is_empty());

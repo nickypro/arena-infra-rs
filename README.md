@@ -28,10 +28,20 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     Neither API reports a pod's CUDA constraint, so `replace`/`migrate copy` re-apply the
     configured `ALLOWED_CUDA_VERSIONS` to the replacement (as `create` does).
   - `provider::vast` — Vast.ai REST backend against the same trait. Vast rents
-    *offers* rather than named pods, so `create_pod` searches the marketplace for
-    the cheapest rentable offer matching the spec (GPU type/count, disk) and rents
-    it, carrying the machine name as the instance `label`. GPU-name matching is
-    normalized so the same `RUNPOD_GPU_TYPE` value works across both providers.
+    *offers* rather than named pods, so `create_pod` searches the marketplace
+    (`PUT /search/asks/`, filters wrapped in `{"q": …}`) for the cheapest rentable offer
+    matching the spec — exact GPU count, disk, CUDA floor from `ALLOWED_CUDA_VERSIONS`, open
+    ports, and `--max-price` (checked again at create: offers move) — and rents it with
+    runtype `ssh_direct`, carrying the machine name as the instance `label`. GPU types map
+    to Vast's spaced display names (`NVIDIA GeForce RTX 3090` → `RTX 3090`, `RTX 4000 Ada
+    Generation` → `RTX 4000Ada`; `RTX_3090` finds nothing). Vast's SSH launcher replaces
+    the image's entrypoint; the cohort keys are attached to **each instance**
+    (`POST /instances/{id}/ssh/`, idempotent) and written by its `onstart` (which also
+    turns off Vast's auto-tmux) — never registered on the Vast account. Pods are listed
+    with the **direct** SSH endpoint (host IP + mapped 22), falling back to Vast's SSH proxy
+    only for a running instance without one. A taken offer (`no_such_ask`, 410, already
+    rented) is capacity, so placement moves on; a rent whose outcome is unclear (5xx, no
+    instance id) stops the run rather than risk a second instance.
   - `provider::hetzner` — Hetzner Cloud backend for **CPU-only** VMs. Not a GPU
     container host, so it ignores the GPU-centric `PodSpec` fields and takes its
     sizing/OS/location/SSH-keys from `HETZNER_*` config. VMs come up on a real public
@@ -141,7 +151,10 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     round would still start inside the window; Ctrl+C between rounds keeps what was made. Ends with a per-name table: `created on 1×RTX 3090 COMMUNITY
     ($0.22/h) (after 1×RTX A4000 COMMUNITY: capacity)` or `not placed (tried: …)`. Cloud
     tiers exist only on RunPod (Vast/Hetzner collapse them, and Hetzner the GPU list too,
-    with a note); Vast/Hetzner quote no price before create, so their options are unpriced.
+    with a note). Vast options are priced **live**: one marketplace search per GPU (needs
+    `VAST_API_KEY`), the cheapest fitting offer's `dph_total` for the disk asked for — a
+    snapshot, since each create searches again (never above `--max-price`); a GPU with no
+    offer right now is unpriced, with a note. Hetzner's option is unpriced.
     `--keep-trying` stays single-option (use `--retry-mins`). One `--gpu`, one `--cloud` and
     no `--max-price` is exactly the old single-spec path; a list that collapses to one
     option (`--gpu A4000,a4000`, `--cloud community,`) takes it too, creating the parsed
@@ -283,7 +296,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `provider` warning). Output: a
     `NAME RESULT GPUS DRIVER CUDA NET NOTES` table, `-v` lists every check, and a `same
     host?` line when ≥2 failing pods share a machine IP (a bad host breaks every pod on it;
-    Vast pods sit behind a shared SSH proxy, so they're never grouped).
+    Vast pods count by their host's direct IP — one reached only through Vast's SSH proxy
+    hostname is never grouped).
     `--json` prints per-pod `{id, name, provider, status, checks, facts}` (no IPs) — `[]`
     when no pod could be checked; summary/notes go to stderr. Exits
     non-zero if any pod FAILs; warnings don't. Targets scope the run (a named pod with no SSH
@@ -389,7 +403,10 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     keys** if any
     `keys/*_api_keys.csv` exist (reporting what it added, or that none are set up) — to
     exactly the pods that just provisioned successfully, never one that failed or timed
-    out — so a `setup` (or `up`, per pod) makes pods fully ready. Confirms first (`--dry-run` previews,
+    out — so a `setup` (or `up`, per pod) makes pods fully ready. A pod that refuses our key
+    (`Permission denied (publickey)`) on a provider with a key API (Vast) gets the cohort keys
+    re-attached to it and is set up again (up to 3×, 20s apart); elsewhere the refusal is
+    reported as before. Confirms first (`--dry-run` previews,
     token redacted). Uses `GIT_SSH_KEY_LOCAL/REMOTE`, `ARENA_REPO_OWNER/NAME`, `DEFAULT_BRANCH`.
     The repo update fetches **only the default branch, without tags** (a bare `git fetch`
     would pull every participant's autocommit branch); a tracked non-default branch pulls

@@ -118,8 +118,8 @@ pub fn replacement_order(options: usize, failed: &[usize]) -> Vec<usize> {
 
 /// Whether a pod on `host` sits on a machine that already failed the deep check this run —
 /// any name's, since a bad host breaks every pod on it. An unknown host (no endpoint yet,
-/// or one that isn't the machine's own IP, like Vast's shared SSH proxy) is never rejected:
-/// a false "same host" would throw away a good pod. Pure.
+/// or one that isn't the machine's own IP, like a Vast pod reached through Vast's shared SSH
+/// proxy) is never rejected: a false "same host" would throw away a good pod. Pure.
 pub fn on_failed_host(host: Option<&str>, failed_hosts: &[String]) -> bool {
     host.is_some_and(|h| !h.is_empty() && failed_hosts.iter().any(|f| f == h))
 }

@@ -234,6 +234,20 @@ pub trait Provider: Send + Sync {
         )))
     }
 
+    /// Mutating, idempotent. Authorize `keys` (OpenSSH public keys, one per entry) for SSH on
+    /// `pod` through the provider's API — the repair path when a pod refuses the cohort key
+    /// (setup and `up` call it once on a `Permission denied (publickey)`, then retry). Only
+    /// adds: keys already authorized stay, and so do any others.
+    ///
+    /// Default: unsupported. RunPod and Hetzner authorize keys only at create (`PUBLIC_KEY`,
+    /// the project key), so for them a refused key stays a setup failure for the operator.
+    async fn authorize_ssh_keys(&self, _pod: &Pod, _keys: &[String]) -> Result<()> {
+        Err(Error::NotImplemented(format!(
+            "re-authorizing SSH keys isn't supported on provider `{}`",
+            self.name()
+        )))
+    }
+
     /// Read-only. Best-effort recovery of the spec needed to recreate this pod — the
     /// "same spec by default" half of `replace`. `name` is returned empty for the caller
     /// to fill; fields the provider can't recover are left at their spec defaults (the
@@ -263,6 +277,7 @@ mod tests {
             env: Vec::new(),
             docker_args: None,
             allowed_cuda: Vec::new(),
+            max_price: None,
         }
     }
 

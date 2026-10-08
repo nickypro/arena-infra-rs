@@ -376,6 +376,7 @@ fn parse_spec(v: &Value) -> PodSpec {
         env,
         docker_args: None,
         allowed_cuda: Vec::new(),
+        max_price: None,
     }
 }
 
@@ -821,6 +822,7 @@ mod tests {
             env: vec![("PUBLIC_KEY".into(), "ssh-ed25519 AAAA test".into())],
             docker_args: None,
             allowed_cuda: Vec::new(),
+            max_price: None,
         }
     }
 

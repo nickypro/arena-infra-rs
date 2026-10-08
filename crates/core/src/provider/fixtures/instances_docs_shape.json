@@ -1,0 +1,93 @@
+{
+  "instances_found": 5,
+  "instances": [
+    {
+      "id": 26001001,
+      "label": "devtest-apple",
+      "actual_status": "running",
+      "cur_state": "running",
+      "intended_status": "running",
+      "next_state": "running",
+      "status_msg": "success, running vastai/base-image",
+      "image_runtype": "ssh_direct",
+      "gpu_name": "RTX 3090",
+      "num_gpus": 1,
+      "dph_total": 0.11466666666666667,
+      "public_ipaddr": "124.123.111.26\n",
+      "ports": {
+        "22/tcp": [{"HostIp": "0.0.0.0", "HostPort": "40112"}, {"HostIp": "::", "HostPort": "40112"}],
+        "8080/tcp": [{"HostIp": "0.0.0.0", "HostPort": "40113"}]
+      },
+      "ssh_host": "ssh5.vast.ai",
+      "ssh_idx": "5",
+      "ssh_port": 21000,
+      "direct_port_start": 40112,
+      "direct_port_end": 40367,
+      "machine_dir_ssh_port": 40111,
+      "machine_id": 31540
+    },
+    {
+      "id": 26001002,
+      "label": "devtest-bloom",
+      "actual_status": "running",
+      "cur_state": "running",
+      "intended_status": "running",
+      "image_runtype": "ssh_proxy",
+      "gpu_name": "RTX A4000",
+      "num_gpus": 1,
+      "dph_total": 0.16,
+      "public_ipaddr": "98.142.241.142",
+      "ports": {},
+      "ssh_host": "ssh2.vast.ai",
+      "ssh_idx": "2",
+      "ssh_port": 31002
+    },
+    {
+      "id": 26001003,
+      "label": "devtest-cloud",
+      "actual_status": "loading",
+      "cur_state": "running",
+      "intended_status": "running",
+      "status_msg": "Pulling image",
+      "image_runtype": "ssh_direct",
+      "gpu_name": "RTX 3090",
+      "num_gpus": 2,
+      "dph_total": 0.22,
+      "public_ipaddr": "77.48.24.203",
+      "ports": null,
+      "ssh_host": "ssh7.vast.ai",
+      "ssh_idx": "7",
+      "ssh_port": 31003
+    },
+    {
+      "id": 26001004,
+      "label": "",
+      "actual_status": "running",
+      "cur_state": "running",
+      "intended_status": "running",
+      "image_runtype": "jupyter_proxy ssh_proxy",
+      "gpu_name": "RTX 4000Ada",
+      "num_gpus": 1,
+      "dph_total": 0.19,
+      "public_ipaddr": "203.0.113.40",
+      "ssh_host": "ssh4.vast.ai",
+      "ssh_idx": "4",
+      "ssh_port": 31004
+    },
+    {
+      "id": 26001005,
+      "label": "devtest-dune",
+      "actual_status": "exited",
+      "cur_state": "stopped",
+      "intended_status": "stopped",
+      "image_runtype": "ssh_direct",
+      "gpu_name": "RTX 3090",
+      "num_gpus": 1,
+      "dph_total": 0.004,
+      "public_ipaddr": "124.123.111.26",
+      "ports": {"22/tcp": [{"HostIp": "0.0.0.0", "HostPort": 40200}]},
+      "ssh_host": "ssh5.vast.ai",
+      "ssh_port": 21005
+    }
+  ]
+}

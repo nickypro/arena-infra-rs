@@ -60,6 +60,12 @@ pub struct PodSpec {
     /// Host CUDA versions the pod may land on (RunPod `allowedCudaVersions`, e.g. "13.0").
     /// Empty = any host. The cu130 arena image needs a CUDA 13 driver (>= 580).
     pub allowed_cuda: Vec<String>,
+    /// `--max-price`: the most this pod may cost, $/h for the whole pod. Placement checks
+    /// it against the plan's prices, but only a marketplace backend picks the machine — and
+    /// so the price — *at* create: Vast rents the cheapest offer it finds then, which may
+    /// cost more than the one the plan quoted, so it must honour the cap itself (RunPod's
+    /// price is fixed per GPU type and tier, already checked). `None` = no cap.
+    pub max_price: Option<f64>,
 }
 
 impl PodSpec {
@@ -98,6 +104,7 @@ impl PodSpec {
             allowed_cuda: first(&["ALLOWED_CUDA_VERSIONS", "RUNPOD_ALLOWED_CUDA_VERSIONS"])
                 .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
                 .unwrap_or_default(),
+            max_price: None,
         }
     }
 }

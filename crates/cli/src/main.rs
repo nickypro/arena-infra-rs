@@ -1711,14 +1711,26 @@ async fn checked_gpu(cfg: &Config, provider_name: &str, gpu: Option<String>) -> 
 /// The prices placement can see (read-only), plus notes on where they came from. RunPod:
 /// the live catalog — on `RUNPOD_API=v2` one `/v2/catalog/gpus` per requested tier (its stock
 /// is per tier), else / failing that the GraphQL `gpuTypes` (Phase 0.D) — backed by the preset
-/// estimates. Vast/Hetzner quote nothing before create.
+/// estimates. Vast: the cheapest offer fitting `base` (disk, CUDA floor) per GPU option, one
+/// marketplace search per card, each bounded by [`PRICE_TIMEOUT`]. Hetzner quotes nothing.
 async fn fetch_price_book(
     cfg: &Config,
     provider_name: &str,
-    clouds: &[String],
+    req: &arena_core::placement::Request,
+    base: &PodSpec,
 ) -> Result<(arena_core::placement::PriceBook, Vec<String>)> {
     use arena_core::placement::PriceBook;
-    use arena_core::provider::{runpod, runpod_v2, RunpodApi};
+    use arena_core::provider::{runpod, runpod_v2, vast, RunpodApi};
+    let clouds = &req.clouds;
+    if provider_name == "vast" {
+        let Some(key) = cfg.get("VAST_API_KEY").filter(|s| !s.is_empty()) else {
+            let note = "no VAST_API_KEY — vast options are unpriced (--max-price can't check them)";
+            return Ok((PriceBook::unpriced(), vec![note.into()]));
+        };
+        let spec = PodSpec { gpu_count: req.gpu_count, ..base.clone() };
+        let quotes = vast::VastProvider::new(key).quote(&req.gpus, &spec, PRICE_TIMEOUT).await;
+        return Ok(vast::price_book(&quotes, req.gpu_count));
+    }
     if provider_name != "runpod" {
         let note = format!(
             "{provider_name} quotes no price before create — options are unpriced, tried as listed \
@@ -1757,14 +1769,17 @@ async fn fetch_price_book(
 }
 
 /// Price and order the options for `req` on `provider_name` — read-only. The one planner
-/// behind `arena offers`, the create/up dry-runs and their confirm prompt.
+/// behind `arena offers`, the create/up dry-runs and their confirm prompt. `base` is the spec
+/// the options are layered on (config + overrides): a marketplace's price depends on more
+/// than the GPU — Vast prices the disk asked for and only offers hosts above the CUDA floor.
 async fn plan_placement(
     cfg: &Config,
     provider_name: &str,
     req: &arena_core::placement::Request,
+    base: &PodSpec,
 ) -> Result<arena_core::placement::OptionPlan> {
     req.validate_for(provider_name)?;
-    let (book, notes) = fetch_price_book(cfg, provider_name, &req.clouds).await?;
+    let (book, notes) = fetch_price_book(cfg, provider_name, req, base).await?;
     let mut plan = arena_core::placement::plan_options(req, provider_name, &book);
     plan.notes.splice(0..0, notes);
     Ok(plan)
@@ -2089,7 +2104,7 @@ async fn handle_offers(
     let gpu = checked_gpu(cfg, provider_name, gpu).await?;
     let base = spec_with_overrides(cfg, &SpecOverrides { gpus, ..Default::default() });
     let req = arena_core::placement::Request::from_flags(gpu.as_deref(), cloud.as_deref(), &base, max_price, order)?;
-    let plan = plan_placement(cfg, provider_name, &req).await?;
+    let plan = plan_placement(cfg, provider_name, &req, &base).await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&plan)?);
         return Ok(());
@@ -2151,6 +2166,41 @@ struct SetupJob {
     name: String,
     target: arena_core::ssh::SshTarget,
     steps: Vec<arena_core::setup::ProvisionStep>,
+    /// The pod refused our key and its provider has just re-attached it: run the steps
+    /// through [`arena_core::setup::provision_after_key_repair`] (waits, bounded retries).
+    after_repair: bool,
+}
+
+/// How long one provider call re-attaching a pod's keys may take ([`repair_pod_keys`]). The
+/// HTTP client has no timeout of its own; the attach is idempotent, so giving up is safe.
+const KEY_REPAIR_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The repair for a pod that refused our SSH key during setup: have its provider
+/// re-authorize the cohort keys (`ssh::authorized_pubkeys`, what create authorized) through
+/// its API — Vast's per-instance attach. `Ok(n)`: `n` keys re-attached, so re-run setup.
+/// `Err(Some(why))`: it couldn't, and the report should say why. `Err(None)`: the provider
+/// has no such API (RunPod, Hetzner authorize keys only at create) — the failure stands.
+async fn repair_pod_keys(
+    provider: &dyn Provider,
+    cfg: &Config,
+    pod: &arena_core::Pod,
+) -> std::result::Result<usize, Option<String>> {
+    let keys = arena_core::ssh::authorized_pubkeys(cfg);
+    // Asked even with no key to send (it then sends nothing): the answer still says whether
+    // this provider could repair at all — `NotImplemented` keeps a RunPod pod's report as is.
+    let attach = provider.authorize_ssh_keys(pod, &keys);
+    match tokio::time::timeout(KEY_REPAIR_TIMEOUT, attach).await {
+        Err(_) => {
+            let after = KEY_REPAIR_TIMEOUT.as_secs();
+            Err(Some(format!("re-attaching our keys via the {} API timed out after {after}s", pod.provider)))
+        }
+        Ok(Err(arena_core::Error::NotImplemented(_))) => Err(None),
+        Ok(Err(e)) => Err(Some(format!("re-attaching our keys via the {} API failed: {e}", pod.provider))),
+        Ok(Ok(())) if keys.is_empty() => {
+            Err(Some("no public key to re-attach (SHARED_SSH_KEY_PATH / GIT_SSH_KEY_LOCAL not readable)".into()))
+        }
+        Ok(Ok(())) => Ok(keys.len()),
+    }
 }
 
 /// Provision every job concurrently over `remote`, emitting a `[done/total] ✓/✗ name`
@@ -2159,15 +2209,17 @@ struct SetupJob {
 /// `timed out at <step>` and never holds up the others — the whole run takes as long as
 /// the slowest pod's budget, not forever. The flow is *data* (`provisioning_steps`) run
 /// by a generic runner — nothing here names a provider. Returns the names of the pods
-/// that were fully provisioned (in finishing order) and the number that failed — the
-/// caller only follows up (API keys) on the former, never on a pod that just timed out.
+/// that were fully provisioned (in finishing order), the number that failed — the
+/// caller only follows up (API keys) on the former, never on a pod that just timed out —
+/// and the names of those whose failure was the pod refusing our key (a provider may be
+/// able to repair that: [`repair_pod_keys`]).
 async fn provision_fleet(
     remote: std::sync::Arc<dyn arena_core::remote::Remote>,
     jobs: Vec<SetupJob>,
     boot: arena_core::setup::BootRetry,
     mut emit: impl FnMut(&str),
-) -> (Vec<String>, usize) {
-    use arena_core::setup::{progress_line, provision};
+) -> (Vec<String>, usize, Vec<String>) {
+    use arena_core::setup::{key_rejected, progress_line, provision, provision_after_key_repair};
     let total = jobs.len();
     let mut set = tokio::task::JoinSet::new();
     // Task id -> pod name, so even a task that panicked is reported by name.
@@ -2176,12 +2228,16 @@ async fn provision_fleet(
         let remote = remote.clone();
         let name = job.name.clone();
         let handle = set.spawn(async move {
-            let outcome = provision(remote.as_ref(), &job.target, &job.steps, boot).await;
+            let outcome = if job.after_repair {
+                provision_after_key_repair(remote.as_ref(), &job.target, &job.steps, boot).await
+            } else {
+                provision(remote.as_ref(), &job.target, &job.steps, boot).await
+            };
             (job.name, outcome)
         });
         names.insert(handle.id(), name);
     }
-    let (mut provisioned, mut failed, mut done) = (Vec::new(), 0, 0);
+    let (mut provisioned, mut failed, mut rejected, mut done) = (Vec::new(), 0, Vec::new(), 0);
     while let Some(joined) = set.join_next().await {
         done += 1;
         match joined {
@@ -2191,6 +2247,9 @@ async fn provision_fleet(
                     provisioned.push(name);
                 } else {
                     failed += 1;
+                    if key_rejected(&outcome) {
+                        rejected.push(name);
+                    }
                 }
             }
             // A panicked task still counts — as a failure, never silently.
@@ -2201,7 +2260,7 @@ async fn provision_fleet(
             }
         }
     }
-    (provisioned, failed)
+    (provisioned, failed, rejected)
 }
 
 /// How long one pod gets for the post-setup API-key + fleet-SSH write (`copy-keys`): a
@@ -2413,6 +2472,10 @@ async fn handle_setup(
     sel: &Selected,
     // Where the per-host API-key CSVs live (`KEYS_DIR`; a temp dir in tests).
     keys_dir: &str,
+    // The fleet provider, for the one repair setup can make itself: a pod that refuses our
+    // key gets it re-attached through its provider's API (Vast), then setup re-runs on it.
+    // `None` = no repair (tests that don't exercise it).
+    repair: Option<&dyn Provider>,
 ) -> Result<()> {
     use arena_core::setup::{provisioning_steps, BootRetry, ProvisionStep};
     use arena_core::ssh::SshTarget;
@@ -2476,16 +2539,49 @@ async fn handle_setup(
         timeouts.config.as_secs(),
         timeouts.bare_vm.as_secs()
     );
-    let jobs = targets
-        .into_iter()
-        .map(|(name, provider_name, target)| SetupJob {
-            steps: provisioning_steps(&provider_name, &scfg, &name, force, &hetzner_script, &timeouts),
-            name,
-            target,
-        })
-        .collect();
-    let (provisioned, failed) =
+    let job = |(name, provider_name, target): (String, String, SshTarget), after_repair: bool| SetupJob {
+        steps: provisioning_steps(&provider_name, &scfg, &name, force, &hetzner_script, &timeouts),
+        name,
+        target,
+        after_repair,
+    };
+    let jobs = targets.iter().cloned().map(|t| job(t, false)).collect();
+    let (mut provisioned, mut failed, rejected) =
         provision_fleet(remote.clone(), jobs, BootRetry::default(), |line| println!("{line}")).await;
+
+    // A pod that refused our key: its provider may re-attach the keys (Vast). Then those pods
+    // run setup again, waiting for the attach to land (bounded); the rest stand as reported.
+    if let Some(provider) = repair.filter(|_| !rejected.is_empty()) {
+        let mut retry = Vec::new();
+        for (name, provider_name, target) in targets.iter().filter(|(n, _, _)| rejected.contains(n)) {
+            // The pod behind this target (by its endpoint: two pods may share a name).
+            let Some(pod) = sel.pods.iter().find(|p| {
+                &p.name == name && p.ssh_ip.as_deref() == Some(target.host.as_str()) && p.ssh_port == Some(target.port)
+            }) else {
+                continue;
+            };
+            match repair_pod_keys(provider, cfg, pod).await {
+                Ok(n) => {
+                    println!("  {name} refused our SSH key — re-attached {n} key(s) through the {} API", pod.provider);
+                    retry.push(job((name.clone(), provider_name.clone(), target.clone()), true));
+                }
+                Err(Some(why)) => println!("  {name} refused our SSH key; {why}"),
+                Err(None) => {}
+            }
+        }
+        if !retry.is_empty() {
+            println!(
+                "Retrying setup on {} pod(s) whose keys were re-attached (up to {}×, {}s apart)…",
+                retry.len(),
+                arena_core::setup::KEY_REPAIR_TRIES,
+                arena_core::setup::KEY_REPAIR_EVERY.as_secs()
+            );
+            let (fixed, _, _) =
+                provision_fleet(remote.clone(), retry, BootRetry::default(), |line| println!("{line}")).await;
+            failed = failed.saturating_sub(fixed.len());
+            provisioned.extend(fixed);
+        }
+    }
     println!("\nDone: {} provisioned, {failed} failed.", provisioned.len());
 
     // Auto-handle API keys: if per-host CSVs have been generated, distribute them and say
@@ -4435,7 +4531,10 @@ async fn handle_pods_with(
                 return Ok(());
             }
             let (spec, options) = match placing {
-                Some((req, base)) => (base, Some(plan_placement(cfg, provider.name(), &req).await?)),
+                Some((req, base)) => {
+                    let plan = plan_placement(cfg, provider.name(), &req, &base).await?;
+                    (base, Some(plan))
+                }
                 None => (spec_with_overrides(cfg, &ov), None),
             };
             if dry_run {
@@ -4523,7 +4622,10 @@ async fn handle_pods_with(
             };
             let policy = if check { Some(arena_core::health::HealthPolicy::from_config(cfg)?) } else { None };
             let (spec, options) = match placing {
-                Some((req, base)) => (base, Some(plan_placement(cfg, provider.name(), &req).await?)),
+                Some((req, base)) => {
+                    let plan = plan_placement(cfg, provider.name(), &req, &base).await?;
+                    (base, Some(plan))
+                }
                 None => (spec_with_overrides(cfg, &ov), None),
             };
             let keys = (!no_setup).then(|| KeySources::load(cfg, KEYS_DIR, None, None)).filter(|k| !k.csv.is_empty());
@@ -4825,7 +4927,8 @@ async fn handle_pods_with(
                 println!("aborted.");
                 return Ok(());
             }
-            handle_setup(remote, cfg, !dry_run, force, hf_token, cc_token, zsh_install, timeouts, &sel, KEYS_DIR).await?;
+            handle_setup(remote, cfg, !dry_run, force, hf_token, cc_token, zsh_install, timeouts, &sel, KEYS_DIR, Some(provider))
+                .await?;
         }
         PodCmd::SetBranch { branch, sel, hard, dry_run } => {
             let sel = select(provider, cfg, &sel.args(), Unscoped::Refuse("switch")).await?;
@@ -5977,7 +6080,9 @@ async fn handle_restart(
             Ok(_) if setup => {
                 println!("\nRe-provisioning {} (the restart reset it to the image)…", pod.name);
                 outcome = match just_these(provider, std::slice::from_ref(&pod.id)).await {
-                    Ok(sel) => handle_setup(remote, cfg, true, false, None, None, false, timeouts, &sel, keys_dir).await,
+                    Ok(sel) => {
+                        handle_setup(remote, cfg, true, false, None, None, false, timeouts, &sel, keys_dir, Some(provider)).await
+                    }
                     Err(e) => Err(e),
                 };
             }
@@ -6713,7 +6818,7 @@ async fn handle_migrate_copy(
         println!("      provisioning {new_name}…");
         // By id (a fresh listing, for the settled endpoint): the pod we just made.
         let new = just_these(owner.as_ref(), std::slice::from_ref(&created.id)).await?;
-        handle_setup(remote.clone(), cfg, true, false, None, None, false, setup_timeouts, &new, KEYS_DIR)
+        handle_setup(remote.clone(), cfg, true, false, None, None, false, setup_timeouts, &new, KEYS_DIR, Some(owner.as_ref()))
             .await
             .with_context(|| format!("provisioning {new_name}"))?;
         created.id
@@ -7117,7 +7222,7 @@ async fn handle_replace(
         println!("[3/7] provisioning {new_name}… (attempt {attempt}/{copy_attempts})");
         // By id (a fresh listing each attempt, for the current endpoint): the pod we made.
         let new = just_these(owner.as_ref(), std::slice::from_ref(&created.id)).await?;
-        handle_setup(remote.clone(), cfg, true, false, None, None, false, setup_timeouts, &new, KEYS_DIR)
+        handle_setup(remote.clone(), cfg, true, false, None, None, false, setup_timeouts, &new, KEYS_DIR, Some(owner.as_ref()))
             .await
             .with_context(|| format!("provisioning {new_name}"))?;
         println!("[4/7] copying {canonical} → {new_name} (excludes caches, HF models, .claude, .ssh, shell-rc keys)…");
@@ -8942,6 +9047,7 @@ mod replacement_spec_tests {
             env: Vec::new(),
             docker_args: None,
             allowed_cuda: allowed_cuda.iter().map(|s| s.to_string()).collect(),
+            max_price: None,
         }
     }
 
@@ -9693,6 +9799,7 @@ mod setup_tests {
             name: name.into(),
             target: target(port),
             steps: provisioning_steps("runpod", &scfg(), name, false, "", &SetupTimeouts::default()),
+            after_repair: false,
         }
     }
 
@@ -9704,7 +9811,7 @@ mod setup_tests {
         let jobs = vec![job("devtest-apple", 22001), job("devtest-bloom", 22002), job("devtest-cloud", 22003)];
         let mut lines = Vec::new();
         let start = Instant::now();
-        let (mut provisioned, failed) =
+        let (mut provisioned, failed, _) =
             provision_fleet(fake.clone(), jobs, BootRetry::default(), |l| lines.push(l.to_string())).await;
 
         provisioned.sort();
@@ -9727,7 +9834,7 @@ mod setup_tests {
         let fake = Arc::new(FakeRemote::new());
         fake.script("10.0.0.1:22001", [FakeReply::exit(1, "scp: /root/.ssh: Permission denied")]);
         let mut lines = Vec::new();
-        let (provisioned, failed) =
+        let (provisioned, failed, _) =
             provision_fleet(fake, vec![job("devtest-apple", 22001)], BootRetry::default(), |l| lines.push(l.to_string())).await;
         assert_eq!((provisioned.len(), failed), (0, 1));
         assert_eq!(lines, ["[1/1] ✗ devtest-apple (failed at copy deploy key, exit 1): scp: /root/.ssh: Permission denied"]);
@@ -9804,7 +9911,7 @@ mod setup_tests {
     #[tokio::test]
     async fn a_crashed_setup_task_is_a_named_failure() {
         let mut lines = Vec::new();
-        let (provisioned, failed) = provision_fleet(
+        let (provisioned, failed, _) = provision_fleet(
             Arc::new(PanickyRemote),
             vec![job("devtest-apple", 22001)],
             BootRetry::default(),
@@ -9832,7 +9939,7 @@ mod setup_tests {
         fake.script("10.0.0.1:22002", [FakeReply::ok(), FakeReply::hang()]);
         let start = Instant::now();
         let cfg = setup_cfg("SETUP_TIMEOUT_SECS=120");
-        let err = handle_setup(fake.clone(), &cfg, true, false, None, None, false, budgets(&cfg, None), &everyone(), NO_KEYS)
+        let err = handle_setup(fake.clone(), &cfg, true, false, None, None, false, budgets(&cfg, None), &everyone(), NO_KEYS, None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("1 pod(s) failed to set up"), "{err}");
@@ -9854,12 +9961,91 @@ mod setup_tests {
         let fake = Arc::new(FakeRemote::new());
         let only = Selected { pods: vec![fleet().0.remove(0)], named: true };
         let cfg = setup_cfg("SETUP_TIMEOUT_SECS=120");
-        handle_setup(fake.clone(), &cfg, true, false, None, None, false, budgets(&cfg, Some(45)), &only, NO_KEYS)
+        handle_setup(fake.clone(), &cfg, true, false, None, None, false, budgets(&cfg, Some(45)), &only, NO_KEYS, None)
             .await
             .unwrap();
         let calls = fake.calls();
         assert!(calls.iter().all(|c| c.host() == "10.0.0.1:22001"), "only the named pod: {calls:?}");
         assert!(matches!(calls.last(), Some(RemoteCall::Exec { timeout, .. }) if *timeout == Some(Duration::from_secs(45))));
+    }
+
+    /// The test fleet behind a provider with a key API (like Vast): records which pods it
+    /// was asked to re-attach keys to.
+    #[derive(Default)]
+    struct KeyApi {
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl Provider for KeyApi {
+        fn name(&self) -> &'static str {
+            "vast"
+        }
+        fn describe(&self, _spec: &PodSpec) -> String {
+            String::new()
+        }
+        async fn list_pods(&self) -> Result<Vec<Pod>> {
+            Ok(fleet().0)
+        }
+        async fn create_pod(&self, _spec: &PodSpec) -> Result<Pod> {
+            unimplemented!("not exercised")
+        }
+        async fn stop_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn restart_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn terminate_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn authorize_ssh_keys(&self, pod: &Pod, _keys: &[String]) -> Result<()> {
+            self.seen.lock().unwrap().push(pod.id.clone());
+            Ok(())
+        }
+    }
+
+    /// A temp dir holding a readable cohort key with its `.pub` — something to re-attach.
+    fn pubkey_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("arena-setup-pubkey-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("devtest_key"), "not a real key").unwrap();
+        std::fs::write(d.join("devtest_key.pub"), "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAbc devtest\n").unwrap();
+        d
+    }
+
+    /// `pods setup`: a pod that refuses our key gets it re-attached through its provider's
+    /// API, then only that pod runs setup again — once the key lands, it's provisioned.
+    #[tokio::test(start_paused = true)]
+    async fn handle_setup_reattaches_a_refused_key_and_reruns_that_pod() {
+        let denied = "root@10.0.0.1: Permission denied (publickey).\nscp: Connection closed\r\n";
+        let fake = Arc::new(FakeRemote::new());
+        fake.script("10.0.0.1:22002", [FakeReply::exit(255, denied)]);
+        let dir = pubkey_dir("repair");
+        let cfg = setup_cfg(&format!("SHARED_SSH_KEY_PATH={}/devtest_key", dir.display()));
+        let api = KeyApi::default();
+        let start = Instant::now();
+        handle_setup(fake.clone(), &cfg, true, false, None, None, false, budgets(&cfg, None), &everyone(), NO_KEYS, Some(&api))
+            .await
+            .unwrap();
+        assert_eq!(*api.seen.lock().unwrap(), ["id-devtest-bloom"], "only the pod that refused");
+        assert_eq!(start.elapsed(), arena_core::setup::KEY_REPAIR_EVERY, "one wait, then it took the key");
+        assert_eq!(fake.calls_to("10.0.0.1:22002").len(), 3, "refused copy, then copy + config");
+        for port in [22001, 22003] {
+            assert_eq!(fake.calls_to(&format!("10.0.0.1:{port}")).len(), 2, "port {port}: set up once");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A provider without a key API: the refusal stands, nothing is retried.
+        let fake = Arc::new(FakeRemote::new());
+        fake.script("10.0.0.1:22002", [FakeReply::exit(255, denied)]);
+        let runpod = fleet();
+        let err = handle_setup(fake.clone(), &cfg, true, false, None, None, false, budgets(&cfg, None), &everyone(), NO_KEYS, Some(&runpod))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("1 pod(s) failed to set up"), "{err}");
+        assert_eq!(fake.calls_to("10.0.0.1:22002").len(), 1);
     }
 
     /// A temp keys dir holding an OpenAI per-host CSV for the whole test fleet.
@@ -9888,7 +10074,7 @@ mod setup_tests {
         let cfg = setup_cfg("SETUP_TIMEOUT_SECS=120");
         let start = Instant::now();
         let keys = dir.to_string_lossy();
-        let err = handle_setup(fake.clone(), &cfg, true, false, None, None, false, budgets(&cfg, None), &everyone(), &keys)
+        let err = handle_setup(fake.clone(), &cfg, true, false, None, None, false, budgets(&cfg, None), &everyone(), &keys, None)
             .await
             .unwrap_err();
         let _ = std::fs::remove_dir_all(&dir);
@@ -9916,7 +10102,7 @@ mod setup_tests {
         let cfg = setup_cfg("");
         let start = Instant::now();
         let keys = dir.to_string_lossy().into_owned();
-        handle_setup(fake.clone(), &cfg, true, false, None, None, false, budgets(&cfg, None), &everyone(), &keys)
+        handle_setup(fake.clone(), &cfg, true, false, None, None, false, budgets(&cfg, None), &everyone(), &keys, None)
             .await
             .unwrap();
         assert_eq!(start.elapsed(), COPY_KEYS_TIMEOUT);
@@ -11479,13 +11665,17 @@ mod placement_cli_tests {
         assert!(handle_offers(&cfg(), "lambda", None, None, None, None, Order::Cheapest, false).await.is_err());
         let base = spec_with_overrides(&cfg(), &SpecOverrides { gpus: Some(2), ..Default::default() });
         let req = arena_core::placement::Request::from_flags(Some("3090,A4000"), None, &base, Some(0.40), Order::Cheapest).unwrap();
-        let plan = plan_placement(&cfg(), "runpod", &req).await.unwrap();
+        let plan = plan_placement(&cfg(), "runpod", &req, &base).await.unwrap();
         assert_eq!(plan.options.len(), 1);
         assert_eq!(plan.notes[0], "no RUNPOD_API_KEY — prices are preset estimates (~)");
         assert_eq!(
             plan_header(&plan),
             "Placement options on runpod (2 GPU(s) per pod, cheapest first, max $0.40/h per pod):"
         );
+        // Vast without a key can't search: unpriced (so a cap leaves nothing), and it says why.
+        let vast = plan_placement(&cfg(), "vast", &req, &base).await.unwrap();
+        assert!(vast.options.is_empty() && vast.dropped.len() == 2, "{vast:?}");
+        assert_eq!(vast.notes[0], "no VAST_API_KEY — vast options are unpriced (--max-price can't check them)");
     }
 
     #[test]

@@ -428,6 +428,7 @@ fn parse_spec(v: &Value) -> PodSpec {
         env,
         docker_args,
         allowed_cuda: Vec::new(),
+        max_price: None,
     }
 }
 
@@ -885,6 +886,7 @@ mod tests {
             ],
             docker_args: None,
             allowed_cuda: Vec::new(),
+            max_price: None,
         }
     }
 

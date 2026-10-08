@@ -39,15 +39,18 @@ use arena_core::pod::Maintenance;
 use arena_core::provider::{bounded_list, LIST_TIMEOUT};
 use arena_core::proxy::Listing;
 use arena_core::remote::{describe_error, Remote, PROBE_TIMEOUT};
-use arena_core::setup::{looks_unreachable, provision, provisioning_steps, BootRetry, SetupConfig, SetupTimeouts};
+use arena_core::setup::{
+    key_rejected, looks_unreachable, provision, provision_after_key_repair, provisioning_steps, BootRetry, SetupConfig,
+    SetupTimeouts,
+};
 use arena_core::ssh::SshTarget;
 use arena_core::{Config, Pod, PodSpec, Provider};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
 use super::{
-    copy_keys_command, enrich_best_effort, fleet_ssh_for, judge_deep_call, proxy_sync_now, record_health, sync_line,
-    KeySources, Made, ProxySync, COPY_KEYS_TIMEOUT, ENRICH_TIMEOUT,
+    copy_keys_command, enrich_best_effort, fleet_ssh_for, judge_deep_call, proxy_sync_now, record_health, repair_pod_keys,
+    sync_line, KeySources, Made, ProxySync, COPY_KEYS_TIMEOUT, ENRICH_TIMEOUT,
 };
 
 /// How long a pod we terminated (to replace it) may stay listed before we give up on the
@@ -451,7 +454,29 @@ impl Shared<'_, '_> {
         if let Some(setup) = &self.run.setup {
             let steps = provisioning_steps(&pod.provider, &setup.scfg, &name, false, &setup.hetzner_script, &setup.timeouts);
             let t = Instant::now();
-            match self.or_stop(provision(self.run.remote.as_ref(), &target, &steps, boot)).await {
+            let mut outcome = self.or_stop(provision(self.run.remote.as_ref(), &target, &steps, boot)).await;
+            // The pod refused our key: its provider may re-attach it (Vast's per-instance
+            // attach); then setup runs again, waiting (bounded) for the attach to land.
+            if outcome.as_ref().is_some_and(key_rejected) {
+                match self.or_stop(repair_pod_keys(self.run.provider, self.run.cfg, &pod)).await {
+                    None => return self.end(run, Verdict::Stopped { stage: Stage::Setup }),
+                    Some(Ok(n)) => {
+                        say(
+                            To::Err,
+                            &format!(
+                                "[{name}] setup: the pod refused our SSH key — re-attached {n} key(s) through the {} API; \
+                                 retrying setup",
+                                pod.provider
+                            ),
+                        );
+                        let remote = self.run.remote.as_ref();
+                        outcome = self.or_stop(provision_after_key_repair(remote, &target, &steps, boot)).await;
+                    }
+                    Some(Err(Some(why))) => say(To::Err, &format!("[{name}] setup: the pod refused our SSH key; {why}")),
+                    Some(Err(None)) => {}
+                }
+            }
+            match outcome {
                 None => return self.end(run, Verdict::Stopped { stage: Stage::Setup }),
                 Some(outcome) if !outcome.is_done() => {
                     let reason = format!("{} — left running", outcome.describe());
@@ -1023,6 +1048,8 @@ mod tests {
         /// After a terminate, creating that name hits "no capacity" for this long.
         dry_after_terminate: Duration,
         dry_until: Mutex<Option<(String, Instant)>>,
+        /// Can re-attach SSH keys through its API (like Vast); records `authorize <id> <n>`.
+        attaches: bool,
     }
 
     /// A pod in the fake: its endpoint from `from`; listed until `gone_at`.
@@ -1133,6 +1160,13 @@ mod tests {
         async fn restart_pod(&self, _id: &str) -> CoreResult<()> {
             Ok(())
         }
+        async fn authorize_ssh_keys(&self, pod: &Pod, keys: &[String]) -> CoreResult<()> {
+            if !self.attaches {
+                return Err(Error::NotImplemented("no key API".into()));
+            }
+            self.events.lock().unwrap().push(format!("authorize {} {}", pod.id, keys.len()));
+            Ok(())
+        }
         async fn terminate_pod(&self, id: &str) -> CoreResult<()> {
             self.events.lock().unwrap().push(format!("terminate {id}"));
             let now = Instant::now();
@@ -1191,6 +1225,10 @@ mod tests {
     /// Setup + check settings, and (with `proxy`) a write-only proxy config — tests never
     /// reload nginx.
     fn cfg(proxy: Option<&Path>) -> Config {
+        Config::parse(&cfg_text(proxy))
+    }
+
+    fn cfg_text(proxy: Option<&Path>) -> String {
         let mut text = "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(\n  \"apple\"\n  \"bloom\"\n  \"cloud\"\n)\n\
                         ARENA_REPO_OWNER=o\nARENA_REPO_NAME=r\nGIT_SSH_KEY_LOCAL=/nonexistent/devtest_deploy_key\n\
                         SHARED_SSH_KEY_PATH=/nonexistent/devtest_key\nALLOWED_CUDA_VERSIONS=\"13.0\"\n\
@@ -1202,7 +1240,7 @@ mod tests {
                 p.display()
             ));
         }
-        Config::parse(&text)
+        text
     }
 
     /// A4000 then 3090, community, as listed (prices: the preset estimates).
@@ -1315,6 +1353,62 @@ mod tests {
         let lists = fleet.lists.load(Ordering::SeqCst);
         assert!(lists <= 33, "{lists} list calls for 300s of polling every 10s");
         assert!(conclude(&rows, &|_, _| {}).is_ok());
+    }
+
+    /// [`cfg`] with a readable cohort key (its `.pub` beside it) and a deploy key that has
+    /// none — so exactly one public key is there to re-attach.
+    fn cfg_with_pubkey(dir: &Path) -> Config {
+        std::fs::write(dir.join("devtest_key"), "not a real key").unwrap();
+        std::fs::write(dir.join("devtest_key.pub"), "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAbc devtest\n").unwrap();
+        let text = cfg_text(None)
+            .replace("/nonexistent/devtest_key", &dir.join("devtest_key").to_string_lossy())
+            .replace("/nonexistent/devtest_deploy_key", &dir.join("no-such-deploy-key-for-up-tests").to_string_lossy());
+        Config::parse(&text)
+    }
+
+    const DENIED: &str = "root@10.0.0.1: Permission denied (publickey).\nscp: Connection closed\r\n";
+
+    /// A pod that refuses our key (a Vast instance whose key attach hadn't landed): its
+    /// provider re-attaches the cohort key, and setup runs again until the pod takes it.
+    #[tokio::test(start_paused = true)]
+    async fn a_pod_refusing_our_key_gets_it_reattached_and_setup_reruns() {
+        let fleet = Fleet { attaches: true, ..Fleet::new(&[("apple", &[("10.0.0.1", 22001, 0)])]) };
+        let fake = Arc::new(FakeRemote::new());
+        // Refused at first, and still 20s after the re-attach; accepted at 40s.
+        fake.script(&host("10.0.0.1", 22001), [FakeReply::exit(255, DENIED), FakeReply::exit(255, DENIED)]);
+        let dir = tmp_dir("key-repair");
+        let cfg = cfg_with_pubkey(&dir.0);
+        let run = up_run(&fleet, fake.clone(), &cfg, true, None, None).await;
+        let made = make(&fleet, &["apple"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+
+        assert_eq!(rows[0].verdict, Verdict::Ready, "{:#?}", lines.all());
+        assert!(fleet.events().contains(&"authorize id1 1".to_string()), "{:?}", fleet.events());
+        let (said, at) = lines.find("[devtest-apple] setup: the pod refused our SSH key — re-attached 1 key(s)");
+        assert_eq!(at, Duration::ZERO);
+        let (ready, ready_at) = lines.find("[devtest-apple] READY after ");
+        assert!(said < ready && ready_at >= Duration::from_secs(40), "{:#?}", lines.all());
+        // Refused copy, refused copy (20s), then copy + config (40s).
+        assert_eq!(fake.calls_to(&host("10.0.0.1", 22001)).len(), 4);
+    }
+
+    /// A provider without a key API (RunPod): the refusal is the setup failure, as before —
+    /// reported at once, not retried.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_key_without_a_key_api_fails_setup_as_before() {
+        let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 0)])]);
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host("10.0.0.1", 22001), [FakeReply::exit(255, DENIED)]);
+        let dir = tmp_dir("key-repair-none");
+        let cfg = cfg_with_pubkey(&dir.0);
+        let run = up_run(&fleet, fake.clone(), &cfg, true, None, None).await;
+        let made = make(&fleet, &["apple"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+        assert!(matches!(&rows[0].verdict, Verdict::Failed { stage: Stage::Setup, reason } if reason.contains("Permission denied (publickey)")), "{:?}", rows[0].verdict);
+        assert!(lines.all().iter().all(|l| !l.contains("re-attach")), "{:#?}", lines.all());
+        assert_eq!(fake.calls_to(&host("10.0.0.1", 22001)).len(), 1);
     }
 
     #[tokio::test(start_paused = true)]
