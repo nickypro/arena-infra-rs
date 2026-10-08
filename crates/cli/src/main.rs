@@ -516,13 +516,14 @@ enum MigrateCmd {
     Copy {
         /// Machine name (or id) to migrate.
         target: String,
-        /// GPU type for the new pod (default: same as the source).
+        /// GPU type for the new pod (default: same as the source) — or a comma list of
+        /// fallbacks (`3070,A4000`), tried one create at a time in --order, as `pods up` does.
         #[arg(long)]
         gpu: Option<String>,
         /// GPUs per pod (default: same as the source).
         #[arg(long)]
         gpus: Option<u32>,
-        /// Cloud tier COMMUNITY/SECURE (default: same as the source).
+        /// Cloud tier COMMUNITY/SECURE (default: same as the source) — or a comma list.
         #[arg(long)]
         cloud: Option<String>,
         /// Container disk GB (default: same as the source).
@@ -538,6 +539,8 @@ enum MigrateCmd {
         /// (non-arena, non-RunPod) base image that doesn't already run sshd.
         #[arg(long)]
         bootstrap: bool,
+        #[command(flatten)]
+        place: PlaceFlags,
         /// Preview only.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
@@ -555,11 +558,21 @@ enum MigrateCmd {
         /// Don't touch the proxy at all (just swap names); you run `arena proxy apply`.
         #[arg(long)]
         skip_proxy: bool,
+        /// Skip the final sync and cut over to the copy already on `<name>-new` — for when
+        /// the original is stopped or unreachable and can't be synced from. Anything changed
+        /// on the original since the last `migrate copy` stays behind on it (the plan says
+        /// when that sync ran).
+        #[arg(long)]
+        no_final_sync: bool,
         /// Preview only.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
     /// Delete the parked `<name>-old` pod (run once you've confirmed the new pod is good).
+    ///
+    /// Syncs the proxy first and refuses while it can't confirm that `<name>`'s stable port
+    /// routes to the live pod — terminating `-old` would otherwise leave the participant's
+    /// port pointing at a dead pod.
     Finish {
         /// Machine name (or id) that was migrated.
         target: String,
@@ -571,6 +584,10 @@ enum MigrateCmd {
         dry_run: bool,
     },
     /// Roll a cutover back: swap `<name>`↔`<name>-old` and re-point the proxy to the original.
+    ///
+    /// Work done on the new pod since the cutover is NOT on the original: it stays on
+    /// `<name>-new`. A later `migrate copy` never destroys it — whatever the copy replaces or
+    /// deletes there is moved aside (and listed) — but it isn't merged back either.
     Revert {
         /// Machine name (or id) to roll back.
         target: String,
@@ -880,9 +897,8 @@ enum PodCmd {
     /// discarded and it starts again as a fresh image — only a persistent volume at
     /// /workspace survives. Setup moves the ARENA repo onto the volume when a pod has one
     /// (BACKUP_REPO_PATH becomes a link to /workspace/<repo>); each such pod is asked where its
-    /// repo really is, and unless it is on the volume the pod needs --wipe-ok. After starting a
-    /// stopped pod again, run `pods setup` on it (re-links the repo). Hetzner VMs keep their
-    /// disk.
+    /// repo really is, and unless it is on the volume the pod needs --wipe-ok. `pods start`
+    /// brings a stopped pod back (and sets it up again). Hetzner VMs keep their disk.
     Stop {
         /// Stop even pods whose container disk would be discarded with the participants'
         /// work on it (required for them, even with --yes). Back them up first.
@@ -904,8 +920,9 @@ enum PodCmd {
     /// volume the restart is refused without --wipe-ok (even with --yes); Vast (stop+start) is
     /// treated the same. The re-setup afterwards re-links the repo to the volume copy.
     /// Afterwards it waits for the SSH endpoint, re-runs `setup` on the pod (--no-setup
-    /// skips) and syncs the proxy, so it comes back usable. Hetzner's hard reset keeps the
-    /// VM disk.
+    /// skips) and syncs the proxy once the endpoint has settled, so it comes back usable.
+    /// Hetzner's hard reset keeps the VM disk. A STOPPED pod is refused: a restart needs a
+    /// running one — `pods start` brings a stopped pod back.
     Restart {
         /// Machine name (e.g. arena8-apple) or raw provider id.
         target: String,
@@ -922,6 +939,31 @@ enum PodCmd {
         /// Preview only: print what would happen, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
+    },
+    /// Start stopped pods again (RunPod `start`, Vast state `running`, Hetzner `poweron`).
+    ///
+    /// The way back from `pods stop`. A RunPod (or Vast) pod comes back as a FRESH image — its
+    /// container disk went at the stop; only a /workspace volume survived — so afterwards
+    /// each started pod's SSH endpoint is waited for until it settles, `setup` runs on it
+    /// again (~/.name, deploy key + git remote, API keys, the repo re-linked onto its
+    /// volume; --no-setup skips) and the proxy is synced. A Hetzner VM kept its disk: no
+    /// setup. Pods that aren't stopped are skipped with a note. The provider can refuse a
+    /// start when the pod's host has no free GPU left — then the pod stays stopped (terminate
+    /// it and create a new one, or retry later).
+    ///
+    /// Targets: names / ids / ranges, or --all (narrowed by --exclude / --gpus / --on).
+    Start {
+        /// Don't re-run setup on the started pods (they come back as the bare image).
+        #[arg(long)]
+        no_setup: bool,
+        /// Don't sync the proxy afterwards.
+        #[arg(long)]
+        skip_proxy: bool,
+        /// Preview only: print what would happen, change nothing.
+        #[arg(long, visible_aliases = ["dryrun", "dry"])]
+        dry_run: bool,
+        #[command(flatten)]
+        sel: Select,
     },
     /// Rename a pod (metadata only — the container is NOT restarted), then re-point the proxy.
     ///
@@ -984,13 +1026,25 @@ enum PodCmd {
     /// Same host/id/name, fresh container from `--image` (default RUNPOD_DOCKER_IMAGE).
     /// PUBLIC_KEY is re-seeded from the current config keys and MACHINE_NAME set to the
     /// pod's name; other env is kept. Nothing is copied over — use `replace` to keep files.
-    /// Afterwards waits for SSH endpoints and redeploys the proxy (ports can change).
+    ///
+    /// The same gate as restart/stop: everything outside a /workspace volume is lost, so a
+    /// pod whose ARENA repo isn't on a confirmed volume is refused without --wipe-ok (even
+    /// with --yes; the dry run says so). Afterwards each reimaged pod's endpoint is waited
+    /// for until it settles, `setup` runs on it again (~/.name, deploy key + git remote,
+    /// API keys; --no-setup skips) and the proxy is synced (ports change).
     ///
     /// Targets: names / ids / ranges, or --all (narrowed by --exclude / --gpus / --on).
     Reimage {
         /// Image to use (default: RUNPOD_DOCKER_IMAGE from config).
         #[arg(long)]
         image: Option<String>,
+        /// Reimage even pods whose participants' work isn't on a confirmed volume (required
+        /// for them, even with --yes). Back them up first.
+        #[arg(long)]
+        wipe_ok: bool,
+        /// Don't re-run setup on the reimaged pods (they come back as the bare image).
+        #[arg(long)]
+        no_setup: bool,
         /// Don't wait for endpoints / redeploy the proxy afterwards.
         #[arg(long)]
         skip_proxy: bool,
@@ -1010,13 +1064,14 @@ enum PodCmd {
     Replace {
         /// Machine name (e.g. arena8-apple) or raw provider id to replace.
         target: String,
-        /// GPU type for the replacement (default: same as the source).
+        /// GPU type for the replacement (default: same as the source) — or a comma list of
+        /// fallbacks (`3070,A4000`), tried one create at a time in --order, as `pods up` does.
         #[arg(long)]
         gpu: Option<String>,
         /// GPUs per pod (default: same as the source).
         #[arg(long)]
         gpus: Option<u32>,
-        /// RunPod cloud tier COMMUNITY/SECURE (default: same as the source).
+        /// RunPod cloud tier COMMUNITY/SECURE (default: same as the source) — or a comma list.
         #[arg(long)]
         cloud: Option<String>,
         /// Container disk GB (default: same as the source).
@@ -1028,6 +1083,8 @@ enum PodCmd {
         /// Docker image (default: same as the source, else config IMAGE).
         #[arg(long)]
         image: Option<String>,
+        #[command(flatten)]
+        place: PlaceFlags,
         /// Don't terminate the parked `<name>-old` pod at the end — leave it for manual
         /// teardown once you've confirmed the replacement is healthy.
         #[arg(long)]
@@ -1543,6 +1600,38 @@ struct SpecOverrides {
     bootstrap: bool,
     /// `--api-json` over `CREATE_EXTRA_JSON`, already checked ([`create_extra`]).
     api_extra: Option<arena_core::apiextra::Extra>,
+}
+
+/// Where `replace` / `migrate copy` may land the new pod beyond `--gpu` / `--cloud` (live
+/// finding #19: a `--gpu A,B` list went to the API as one invalid id, with no capacity
+/// retry): the same placement as `create` / `up` — each option tried one create at a time,
+/// cheapest first (or as listed), with a retry window while capacity is short.
+#[derive(clap::Args, Debug, Clone, Default)]
+struct PlaceFlags {
+    /// Max $/h for the new pod (per-GPU price × --gpus). Options above it, or with no known
+    /// price, are not tried.
+    #[arg(long, value_parser = parse_max_price)]
+    max_price: Option<f64>,
+    /// Order to try several --gpu/--cloud options in: `cheapest` or `listed`.
+    #[arg(long, default_value = "cheapest")]
+    order: arena_core::placement::Order,
+    /// Keep re-trying every option for up to this many minutes while capacity is short
+    /// (0 = one round). Ctrl+C stops early; nothing is touched until the new pod exists.
+    #[arg(long, default_value_t = 0)]
+    retry_mins: u64,
+    /// Seconds between retry rounds.
+    #[arg(long, default_value_t = 60)]
+    retry_secs: u64,
+}
+
+impl PlaceFlags {
+    /// The retry window these flags ask for (zero = one round).
+    fn rounds(&self) -> arena_core::placement::Rounds {
+        arena_core::placement::Rounds {
+            window: Duration::from_secs(self.retry_mins * 60),
+            every: Duration::from_secs(self.retry_secs.max(1)),
+        }
+    }
 }
 
 /// The base spec from config, with any command-line overrides applied.
@@ -4644,7 +4733,10 @@ fn sync_line(why: &str, s: &ProxySync) -> String {
 /// itself; a failure is a warning naming `arena proxy apply`.
 ///
 /// `fleet` must span every configured provider (the `build_fleet` provider the pods
-/// commands get); a flow holding one backend uses [`sync_proxy_via`].
+/// commands get — `replace` / `migrate`, which act through the pod's own backend, are
+/// handed it too): a single-provider listing would leave the others "not queried" and —
+/// for legacy entries with no recorded owner — could even read as "every provider listed
+/// OK without them", dropping their forwards.
 ///
 /// A just-terminated pod can still be listed for a while (RunPod/Vast report it exited or
 /// terminating), so the sync right after `terminate` may keep its forward (R1/R2). That's
@@ -4692,18 +4784,6 @@ fn report_sync(why: &str, outcome: ProxySync) -> ProxySync {
         println!("{line}");
     }
     outcome
-}
-
-/// [`sync_proxy`] for flows that hold a single backend (replace/migrate get the pod's
-/// `owner`): rebuild the fleet from its name first, so every configured provider is
-/// listed. A single-provider listing would leave the others "not queried" and — for legacy
-/// entries with no recorded owner — could even read as "every provider listed OK without
-/// them", dropping their forwards.
-async fn sync_proxy_via(cfg: &Config, owner: &dyn Provider, why: &str) -> ProxySync {
-    match arena_core::provider::build_fleet(owner.name(), cfg, true) {
-        Ok(fleet) => sync_proxy(cfg, fleet.as_ref(), why).await,
-        Err(e) => report_sync(why, ProxySync::Failed(format!("building the fleet provider: {e}"))),
-    }
 }
 
 /// Another arena process (the proxy cron, a lifecycle sync, an interactive apply) changed
@@ -5676,7 +5756,8 @@ async fn handle_pods_with(
 
         PodCmd::Pull { label, dir, max_size, remote_path, no_git, no_big, sel, dry_run } => {
             let dir = dir.unwrap_or_else(|| local_backup_dir(cfg));
-            let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
+            let mut sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
+            refresh_missing_endpoints(provider, &mut sel, ENDPOINT_RETRY).await;
             handle_pull(&remote, cfg, label, &dir, max_size, remote_path, no_git, no_big, &sel, dry_run, yes, RSYNC).await?;
         }
 
@@ -5704,6 +5785,12 @@ async fn handle_pods_with(
             handle_restart(provider, remote, cfg, &target, opts, RESTART_SETTLE, KEYS_DIR).await?;
         }
 
+        PodCmd::Start { no_setup, skip_proxy, dry_run, sel } => {
+            let sel = select(provider, cfg, &sel.args(), Unscoped::Refuse("start")).await?;
+            let opts = RestartOpts { wipe_ok: false, no_setup, skip_proxy, dry_run, yes };
+            handle_start(provider, remote, cfg, &sel, opts, RESTART_SETTLE, KEYS_DIR).await?;
+        }
+
         PodCmd::Rename { target, new_name, from_prefix, skip_proxy, dry_run } => {
             let or = openrouter_client(cfg);
             let book = KeyBook::new(OPENROUTER_KEYS_CSV, or.as_ref());
@@ -5725,29 +5812,32 @@ async fn handle_pods_with(
             handle_lock(provider, &sel, false, dry_run, yes).await?;
         }
 
-        PodCmd::Reimage { sel, image, skip_proxy, dry_run } => {
+        PodCmd::Reimage { sel, image, wipe_ok, no_setup, skip_proxy, dry_run } => {
             let sel = select(provider, cfg, &sel.args(), Unscoped::Refuse("reimage")).await?;
-            handle_reimage(provider, cfg, &sel, image, skip_proxy, dry_run, yes).await?;
+            let opts = RestartOpts { wipe_ok, no_setup, skip_proxy, dry_run, yes };
+            handle_reimage(provider, remote, cfg, &sel, image, opts, RESTART_SETTLE, KEYS_DIR).await?;
         }
 
-        PodCmd::Replace { target, gpu, gpus, cloud, disk, volume, image, keep_old, skip_proxy, dry_run } => {
+        PodCmd::Replace { target, gpu, gpus, cloud, disk, volume, image, place, keep_old, skip_proxy, dry_run } => {
             let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap: false, api_extra: None };
-            handle_replace(remote, cfg, &target, &ov, keep_old, skip_proxy, dry_run, yes).await?;
+            let opts = ReplaceOpts { keep_old, skip_proxy, dry_run, yes };
+            handle_replace(remote, provider, cfg, &target, &ov, &place, opts, &interrupt).await?;
         }
 
         PodCmd::Migrate { cmd } => match cmd {
-            MigrateCmd::Copy { target, gpu, gpus, cloud, disk, volume, image, bootstrap, dry_run } => {
+            MigrateCmd::Copy { target, gpu, gpus, cloud, disk, volume, image, bootstrap, place, dry_run } => {
                 let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap, api_extra: None };
-                handle_migrate_copy(remote, cfg, &target, &ov, dry_run, yes).await?;
+                handle_migrate_copy(remote, cfg, &target, &ov, &place, dry_run, yes, &interrupt).await?;
             }
-            MigrateCmd::Cutover { target, yes: y, skip_proxy, dry_run } => {
-                handle_migrate_cutover(remote.as_ref(), cfg, &target, skip_proxy, dry_run, yes || y).await?;
+            MigrateCmd::Cutover { target, yes: y, skip_proxy, no_final_sync, dry_run } => {
+                let opts = CutoverOpts { skip_proxy, no_final_sync, dry_run, yes: yes || y };
+                handle_migrate_cutover(remote, provider, cfg, &target, opts).await?;
             }
             MigrateCmd::Finish { target, yes: y, dry_run } => {
-                handle_migrate_finish(cfg, &target, dry_run, yes || y).await?;
+                handle_migrate_finish(provider, cfg, &target, dry_run, yes || y).await?;
             }
             MigrateCmd::Revert { target, yes: y, skip_proxy, dry_run } => {
-                handle_migrate_revert(cfg, &target, skip_proxy, dry_run, yes || y).await?;
+                handle_migrate_revert(remote.as_ref(), provider, cfg, &target, skip_proxy, dry_run, yes || y).await?;
             }
             MigrateCmd::Status { target } => {
                 handle_migrate_status(cfg, &target).await?;
@@ -5769,7 +5859,8 @@ async fn handle_pods_with(
         PodCmd::Backup { sel, no_pull, dry_run, message } => {
             // Resolved once, before the prompt (a typo fails before asking), and shared by the
             // git push and the pull.
-            let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
+            let mut sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
+            refresh_missing_endpoints(provider, &mut sel, ENDPOINT_RETRY).await;
             handle_full_backup(remote, cfg, &sel, no_pull, message, dry_run, yes, RSYNC).await?;
         }
         PodCmd::Setup { sel, dry_run, force, hf_token, cc_token, zsh_install, no_vscode, timeout } => {
@@ -5809,7 +5900,8 @@ async fn handle_pods_with(
             }
             let cmd = command.join(" ");
             let budget = Duration::from_secs(timeout);
-            let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
+            let mut sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
+            refresh_missing_endpoints(provider, &mut sel, ENDPOINT_RETRY).await;
             if background {
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
                 let ask = &mut |what: &str| confirm(yes, what);
@@ -6540,18 +6632,31 @@ async fn handle_lock(provider: &dyn Provider, sel: &Selected, lock: bool, dry_ru
     Ok(())
 }
 
-/// `pods reimage`: swap image + re-seed keys in place (disk wiped), then re-point the proxy.
+/// `pods reimage`: swap image + re-seed keys in place — a fresh container, so its disk is
+/// wiped — then bring the pods back usable like a restart does ([`come_back`]): settled
+/// endpoints, setup again, the proxy.
+///
+/// Gated exactly like restart/stop (live finding #2: a reimage wiped participants' files
+/// with only `-y`, and `--all -y` would wipe the cohort): each pod's fate is judged by where
+/// its repo really is ([`repo_sites`]), and a pod whose work isn't on a confirmed volume is
+/// refused without `--wipe-ok`; the dry run says so. And it re-runs setup afterwards (live
+/// finding #8: a reimaged pod was left with no `~/.name`, the public git remote and no
+/// deploy key — backups then silently couldn't push).
 #[allow(clippy::too_many_arguments)]
 async fn handle_reimage(
     provider: &dyn Provider,
+    // How the reimaged pods are set up again: `SshRemote` for real, `FakeRemote` in tests.
+    remote: Arc<dyn Remote>,
     cfg: &Config,
     // The pods to reimage, resolved by the caller (which demands names or --all).
     sel: &Selected,
     image: Option<String>,
-    skip_proxy: bool,
-    dry_run: bool,
-    yes: bool,
+    opts: RestartOpts,
+    settle: SettleWait,
+    // Where the per-host API-key CSVs live (`KEYS_DIR`; a temp dir in tests).
+    keys_dir: &str,
 ) -> Result<()> {
+    let RestartOpts { wipe_ok, no_setup, skip_proxy, dry_run, yes } = opts;
     let pods = &sel.pods;
     if pods.is_empty() {
         println!("(no pods to reimage)");
@@ -6573,16 +6678,51 @@ async fn handle_reimage(
     if pubkeys.is_empty() {
         anyhow::bail!("no readable public keys from SHARED_SSH_KEY_PATH/GIT_SSH_KEY_LOCAL — refusing to lock pods out");
     }
-    let names: Vec<&str> = pods.iter().map(|p| p.name.as_str()).collect();
+    // Setup is what brings a reimaged pod back: make sure it can run before wiping one (and a
+    // malformed SETUP_TIMEOUT_SECS fails now, as in `up`).
+    let setup = !no_setup;
+    let timeouts = if setup {
+        arena_core::setup::SetupConfig::from_config(cfg)
+            .context("re-running setup after the reimage needs the setup config — fix it, or pass --no-setup")?;
+        arena_core::setup::SetupTimeouts::from_config(cfg, None)?
+    } else {
+        arena_core::setup::SetupTimeouts::default()
+    };
+    // What the reimage costs each pod, by where its repo really is (asked of pods with a
+    // volume only, bounded, all at once).
+    let mut fates = Vec::with_capacity(pods.len());
+    for p in pods {
+        fates.push(reimage_fate(provider, p).await);
+    }
+    let repo = arena_core::backup::repo_path(cfg);
+    let sites = repo_sites(&remote, cfg, &refs, &fates, &repo).await;
+    let lines: Vec<String> = pods
+        .iter()
+        .zip(fates.iter().zip(&sites))
+        .map(|(p, (f, site))| format!("  {} (id={}, {}): {}", p.name, p.id, p.provider, f.describe(DiskOp::Reimage, site)))
+        .collect();
+    let blocked: Vec<&str> = pods
+        .iter()
+        .zip(fates.iter().zip(&sites))
+        .filter(|(_, (f, site))| f.needs_wipe_ok(site))
+        .map(|(p, _)| p.name.as_str())
+        .collect();
+    let then = afterwards_line(true, setup, skip_proxy);
     println!("image: {image}\nkeys:  {}", pubkeys.iter().map(|k| k.split_whitespace().last().unwrap_or("?")).collect::<Vec<_>>().join(", "));
     if dry_run {
-        println!("[dry-run] would reimage {} pod(s): {}", pods.len(), names.join(" "));
+        println!("[dry-run] would reimage {} pod(s):\n{}\n  {then}", pods.len(), lines.join("\n"));
         if let Some(r) = &locked {
             print_would_refuse(r);
         }
+        if !blocked.is_empty() && !wipe_ok {
+            print_would_refuse(&wipe_refusal(DiskOp::Reimage, &blocked, &repo));
+        }
         return Ok(());
     }
-    if !confirm(yes, &format!("Will reimage {} pod(s), WIPING their disks: {}", pods.len(), names.join(" ")))? {
+    if !blocked.is_empty() && !wipe_ok {
+        anyhow::bail!("{}", wipe_refusal(DiskOp::Reimage, &blocked, &repo));
+    }
+    if !confirm(yes, &format!("Will reimage {} pod(s) onto {image}:\n{}\n  {then}", pods.len(), lines.join("\n")))? {
         println!("aborted.");
         return Ok(());
     }
@@ -6608,21 +6748,107 @@ async fn handle_reimage(
             }
         }
     }
-    // A reimaged pod comes back on a new SSH port, so wait for it to settle before the
-    // sync (nothing to sync if every reimage failed).
-    if !skip_proxy && failed.len() < pods.len() {
-        println!("waiting for SSH endpoints…");
-        for pod in pods.iter().filter(|p| !failed.contains(&p.name)) {
-            if let Err(e) = wait_for_stable_endpoint(provider, &pod.id, 30, 600).await {
-                eprintln!("warning: {} has no endpoint yet ({e})", pod.name);
-            }
-        }
-        sync_proxy(cfg, provider, "reimage").await;
-    }
+    // The reimaged pods come back on a new SSH port: settle, set up, sync (nothing to do
+    // if every reimage failed).
+    let done: Vec<arena_core::Pod> = pods.iter().filter(|p| !failed.contains(&p.name)).cloned().collect();
+    let back = Comeback { setup, sync: !skip_proxy, settle, timeouts };
+    let outcome = come_back(provider, remote, cfg, &done, back, keys_dir, "reimage").await;
     if !failed.is_empty() {
+        if let Err(e) = &outcome {
+            eprintln!("{e:#}");
+        }
         anyhow::bail!("{} pod(s) failed to reimage: {}", failed.len(), failed.join(" "));
     }
-    Ok(())
+    outcome
+}
+
+/// `pods start`: start the selected STOPPED pods again ([`Provider::start_pod`]), then bring
+/// them back usable ([`come_back`]): a RunPod/Vast pod's container disk went at the stop,
+/// so it's set up again (unless `--no-setup`) once its endpoint settles, and the proxy is
+/// synced. A Hetzner VM kept its disk: only the sync. Pods that aren't stopped are said and
+/// left alone. A start the provider refuses (e.g. its host has no free GPU left) is
+/// reported per pod and fails the exit; the others carry on.
+async fn handle_start(
+    provider: &dyn Provider,
+    // How the started pods are set up again: `SshRemote` for real, `FakeRemote` in tests.
+    remote: Arc<dyn Remote>,
+    cfg: &Config,
+    sel: &Selected,
+    opts: RestartOpts,
+    settle: SettleWait,
+    // Where the per-host API-key CSVs live (`KEYS_DIR`; a temp dir in tests).
+    keys_dir: &str,
+) -> Result<()> {
+    let RestartOpts { no_setup, skip_proxy, dry_run, yes, .. } = opts;
+    for p in sel.pods.iter().filter(|p| !arena_core::status::is_stopped(&p.status)) {
+        eprintln!("skip {} — not stopped ({})", p.name, p.status);
+    }
+    let pods: Vec<arena_core::Pod> = sel.pods.iter().filter(|p| arena_core::status::is_stopped(&p.status)).cloned().collect();
+    if pods.is_empty() {
+        println!("(no stopped pods to start)");
+        return Ok(());
+    }
+    let setup = !no_setup;
+    let timeouts = if setup && pods.iter().any(|p| provider.restart_wipes_container_disk(p)) {
+        arena_core::setup::SetupConfig::from_config(cfg)
+            .context("setting the started pods up again needs the setup config — fix it, or pass --no-setup")?;
+        arena_core::setup::SetupTimeouts::from_config(cfg, None)?
+    } else {
+        arena_core::setup::SetupTimeouts::default()
+    };
+    let lines: Vec<String> = pods
+        .iter()
+        .map(|p| {
+            let comes = if provider.restart_wipes_container_disk(p) {
+                "comes back as a fresh image (its disk went at the stop); only a /workspace volume kept its files"
+            } else {
+                "disk kept"
+            };
+            format!("  {} (id={}, {}): {comes}", p.name, p.id, p.provider)
+        })
+        .collect();
+    let wiped = pods.iter().any(|p| provider.restart_wipes_container_disk(p));
+    let then = afterwards_line(wiped, setup, skip_proxy);
+    if dry_run {
+        println!("[dry-run] would start {} pod(s):\n{}\n  {then}", pods.len(), lines.join("\n"));
+        return Ok(());
+    }
+    if !confirm(yes, &format!("Will start {} stopped pod(s):\n{}\n  {then}", pods.len(), lines.join("\n")))? {
+        println!("aborted.");
+        return Ok(());
+    }
+    let (mut started, mut failed) = (Vec::new(), Vec::new());
+    for p in &pods {
+        match provider.start_pod(&p.id).await {
+            Ok(()) => {
+                println!("[started] {}", p.name);
+                started.push(p.clone());
+            }
+            Err(e) => {
+                eprintln!("[FAILED] {}: {}", p.name, arena_core::lock::explain(&p.name, &e));
+                failed.push(p.name.clone());
+            }
+        }
+    }
+    let (fresh, kept): (Vec<arena_core::Pod>, Vec<arena_core::Pod>) =
+        started.into_iter().partition(|p| provider.restart_wipes_container_disk(p));
+    let back = Comeback { setup, sync: !skip_proxy, settle, timeouts };
+    let outcome = come_back(provider, remote, cfg, &fresh, back, keys_dir, "start").await;
+    if !kept.is_empty() && fresh.is_empty() && !skip_proxy {
+        settled_sync(cfg, provider, &kept, settle, "start").await;
+    }
+    if !failed.is_empty() {
+        if let Err(e) = &outcome {
+            eprintln!("{e:#}");
+        }
+        anyhow::bail!(
+            "{} pod(s) failed to start: {} — still stopped (a host with no free GPU left can't start it: \
+             retry later, or terminate it and create a new one)",
+            failed.len(),
+            failed.join(" ")
+        );
+    }
+    outcome
 }
 
 /// Where a machine's OpenRouter key lives, for the lifecycle commands that move or drop it
@@ -7064,11 +7290,13 @@ enum DiskFate {
     Wiped { volume_gb: Option<u32> },
 }
 
-/// The two operations that reset a container disk.
+/// The operations that reset a container disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiskOp {
     Restart,
     Stop,
+    /// A fresh container from an image (`pods reimage`) — a wipe on every backend.
+    Reimage,
 }
 
 impl DiskFate {
@@ -7090,19 +7318,21 @@ impl DiskFate {
         let wipe = match op {
             DiskOp::Restart => "⚠ WIPES the container disk (reset to the image)",
             DiskOp::Stop => "⚠ discards the container disk (it starts again as a fresh image)",
+            DiskOp::Reimage => "⚠ WIPES the container disk (a fresh container from the image)",
         };
         let rest = "~/.name, setup's git remote, the distributed keys";
         let repo = site.describe();
         let work = format!("the ARENA repo at {repo} (participants' work)");
         // A stopped pod comes back only when someone starts it — no automatic re-setup then.
         let relink = match op {
-            DiskOp::Restart => "",
-            DiskOp::Stop => " (after starting it again, `arena pods setup` re-links the repo)",
+            DiskOp::Restart | DiskOp::Reimage => "",
+            DiskOp::Stop => " (`arena pods start` brings it back and re-links the repo)",
         };
         match self {
             DiskFate::Kept => match op {
                 DiskOp::Restart => "disk kept — a hard reset (power-cycle): running processes die, files stay".into(),
                 DiskOp::Stop => "disk kept — powered off, files stay".into(),
+                DiskOp::Reimage => "disk kept".into(),
             },
             DiskFate::Wiped { volume_gb: Some(v) } if v > 0 && site.on_volume() => format!(
                 "{wipe}: everything outside {VOL} is lost ({rest}, files outside the repo); the repo at \
@@ -7170,6 +7400,17 @@ async fn disk_fate(provider: &dyn Provider, pod: &arena_core::Pod) -> DiskFate {
     } }
 }
 
+/// What a reimage does to a pod's disk: on every backend a fresh container (a VM would be
+/// rebuilt), so only a persistent volume survives — whatever `restart_wipes_container_disk`
+/// says about a restart. The volume is read from the pod's spec (bounded; unknown = none).
+async fn reimage_fate(provider: &dyn Provider, pod: &arena_core::Pod) -> DiskFate {
+    let spec = tokio::time::timeout(arena_core::provider::LIST_TIMEOUT, provider.pod_spec(&pod.id)).await;
+    DiskFate::Wiped { volume_gb: match spec {
+        Ok(Ok(s)) => Some(s.volume_gb),
+        _ => None,
+    } }
+}
+
 /// Why a restart/stop is refused without `--wipe-ok` (pure, so tested): it would destroy
 /// the participants' work on these pods, and `--yes` is not an answer to that — the
 /// operator has to say so explicitly, after a backup.
@@ -7177,9 +7418,10 @@ fn wipe_refusal(op: DiskOp, names: &[&str], repo: &str) -> String {
     let (verb, done) = match op {
         DiskOp::Restart => ("restart", "resets the container disk to the image"),
         DiskOp::Stop => ("stop", "discards the container disk (a stopped RunPod pod keeps no data)"),
+        DiskOp::Reimage => ("reimage", "replaces the container — and its disk — with a fresh one from the image"),
     };
     let alt = match op {
-        DiskOp::Restart => "",
+        DiskOp::Restart | DiskOp::Reimage => "",
         DiskOp::Stop => " If the group is done, terminate instead.",
     };
     format!(
@@ -7243,6 +7485,17 @@ async fn handle_restart(
     let pods = arena_core::retry::retrying(&policy, || provider.list_pods()).await.context("listing pods")?;
     let pod = pods[arena_core::selector::resolve_one(&Naming::from_config(cfg), &pods, target)?].clone();
     let label = format!("{} (id={}, {})", pod.name, pod.id, pod.provider);
+    // A restart needs a running pod: RunPod v2 answers 409 for a stopped one, v1 answered
+    // 2xx and left it stopped (then a 10-min endpoint wait) — live finding #15.
+    if arena_core::status::is_stopped(&pod.status) {
+        anyhow::bail!(
+            "{} is stopped ({}) — a restart needs a running pod. Start it with `arena pods start {}` \
+             (it comes back as a fresh image and is set up again).",
+            pod.name,
+            pod.status,
+            pod.name
+        );
+    }
     // A locked pod refuses a restart (RunPod itself does): say so before anything is read.
     let locked = arena_core::lock::refusal("restart", &[&pod], "");
     if let (Some(r), false) = (&locked, opts.dry_run) {
@@ -7258,14 +7511,7 @@ async fn handle_restart(
         arena_core::setup::SetupConfig::from_config(cfg)
             .context("re-running setup after the restart needs the setup config — fix it, or pass --no-setup")?;
     }
-    let then = match (wiped, setup, opts.skip_proxy) {
-        (true, true, false) => "then: wait for its SSH endpoint, re-run setup on it (~/.name, deploy key + git remote, API keys), sync the proxy",
-        (true, true, true) => "then: wait for its SSH endpoint, re-run setup on it (~/.name, deploy key + git remote, API keys)",
-        (true, false, false) => "then: wait for its SSH endpoint and sync the proxy (no setup: it comes back as the bare image)",
-        (true, false, true) => "then: nothing (no setup, no proxy sync: it comes back as the bare image)",
-        (false, _, false) => "then: sync the proxy",
-        (false, _, true) => "then: nothing",
-    };
+    let then = afterwards_line(wiped, setup, opts.skip_proxy);
     let what = format!("restart {label}:\n  {}\n  {then}", fate.describe(DiskOp::Restart, &site));
     if opts.dry_run {
         println!("[dry-run] would {what}");
@@ -7288,40 +7534,168 @@ async fn handle_restart(
     provider.restart_pod(&pod.id).await.map_err(|e| anyhow::anyhow!("{}", arena_core::lock::explain(&pod.name, &e)))?;
     println!("[restarted] {label}");
 
-    let mut outcome: Result<()> = Ok(());
-    if wiped && (setup || !opts.skip_proxy) {
+    let back = Comeback { setup, sync: !opts.skip_proxy, settle, timeouts };
+    if wiped {
+        come_back(provider, remote, cfg, std::slice::from_ref(&pod), back, keys_dir, "restart").await
+    } else {
+        // A Hetzner reset keeps the VM (and its address): no setup, just the sync.
+        if back.sync {
+            sync_proxy(cfg, provider, "restart").await;
+        }
+        Ok(())
+    }
+}
+
+/// What a lifecycle command that resets containers says it does afterwards (pure, tested
+/// through the commands' dry runs).
+fn afterwards_line(wiped: bool, setup: bool, skip_proxy: bool) -> &'static str {
+    match (wiped, setup, skip_proxy) {
+        (true, true, false) => "then: wait for its SSH endpoint to settle, re-run setup on it (~/.name, deploy key + git remote, API keys), sync the proxy",
+        (true, true, true) => "then: wait for its SSH endpoint to settle, re-run setup on it (~/.name, deploy key + git remote, API keys)",
+        (true, false, false) => "then: wait for its SSH endpoint to settle and sync the proxy (no setup: it comes back as the bare image)",
+        (true, false, true) => "then: nothing (no setup, no proxy sync: it comes back as the bare image)",
+        (false, _, false) => "then: sync the proxy",
+        (false, _, true) => "then: nothing",
+    }
+}
+
+/// How [`come_back`] brings reset pods back.
+#[derive(Debug, Clone, Copy)]
+struct Comeback {
+    /// Re-run setup on them (they're back as the bare image otherwise).
+    setup: bool,
+    /// Sync the proxy afterwards.
+    sync: bool,
+    settle: SettleWait,
+    timeouts: arena_core::setup::SetupTimeouts,
+}
+
+/// After a container reset — `restart`, `reimage`, `start` — bring the pods back usable:
+/// wait for each one's SSH endpoint to settle (so setup lands on the NEW container, not the
+/// one going away), re-run setup on them (`~/.name`, deploy key + git remote, API keys, the
+/// repo re-linked onto its volume), then sync the proxy once their endpoints have settled
+/// again ([`settled_sync`]). The proxy is synced whatever setup did: the reset happened
+/// either way. `Err` = some pod isn't set up again, with the command that fixes it — and a
+/// warning not to reset it again, which would only wipe it once more.
+async fn come_back(
+    provider: &dyn Provider,
+    remote: Arc<dyn Remote>,
+    cfg: &Config,
+    pods: &[arena_core::Pod],
+    how: Comeback,
+    keys_dir: &str,
+    why: &'static str,
+) -> Result<()> {
+    if pods.is_empty() || !(how.setup || how.sync) {
+        if !how.setup && !pods.is_empty() {
+            no_setup_note(pods);
+        }
+        return Ok(());
+    }
+    let s = how.settle;
+    let mut settled = Vec::new();
+    let mut problems: Vec<String> = Vec::new();
+    for pod in pods {
         println!("waiting for {}'s SSH endpoint to settle…", pod.name);
-        match wait_for_stable_endpoint_every(provider, &pod.id, settle.stable_secs, settle.timeout_secs, settle.poll).await {
-            Err(e) => outcome = Err(anyhow::anyhow!("no SSH endpoint ({e})")),
-            Ok(_) if setup => {
-                println!("\nRe-provisioning {} (the restart reset it to the image)…", pod.name);
-                outcome = match just_these(provider, std::slice::from_ref(&pod.id)).await {
-                    Ok(sel) => {
-                        handle_setup(remote, cfg, true, false, None, None, false, false, timeouts, &sel, keys_dir, Some(provider)).await
-                    }
-                    Err(e) => Err(e),
-                };
-            }
-            Ok(_) => {}
+        match wait_for_stable_endpoint_every(provider, &pod.id, s.stable_secs, s.timeout_secs, s.poll).await {
+            Ok(_) => settled.push(pod.id.clone()),
+            Err(e) => problems.push(format!("{}: no SSH endpoint ({e})", pod.name)),
         }
     }
-    // Runs whatever happened to setup: the restart happened either way.
-    if !opts.skip_proxy {
-        sync_proxy(cfg, provider, "restart").await;
+    if how.setup && !settled.is_empty() {
+        println!("\nRe-provisioning {} pod(s) (the {why} reset them to the image)…", settled.len());
+        let setup = match just_these(provider, &settled).await {
+            Ok(sel) => handle_setup(remote, cfg, true, false, None, None, false, false, how.timeouts, &sel, keys_dir, Some(provider)).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = setup {
+            problems.push(format!("{e:#}"));
+        }
     }
-    if wiped && !setup {
-        println!(
-            "(--no-setup: {0} is back as the bare image — `arena pods setup {0}` restores ~/.name, the git remote and keys)",
-            pod.name
+    if how.sync {
+        settled_sync(cfg, provider, pods, s, why).await;
+    }
+    if !how.setup {
+        no_setup_note(pods);
+    }
+    if problems.is_empty() {
+        return Ok(());
+    }
+    let names: Vec<&str> = pods.iter().map(|p| p.name.as_str()).collect();
+    let (past, again) = match why {
+        "restart" => ("restarted", "not another restart"),
+        "reimage" => ("reimaged", "not another reimage"),
+        _ => ("started", "not a restart"),
+    };
+    let it = if pods.len() == 1 { "it is" } else { "they are" };
+    anyhow::bail!(
+        "{} {past}, but {it} NOT set up again: {}\n  → run `arena pods setup {}` once it answers \
+         ({again} — that would wipe it again)",
+        names.join(", "),
+        problems.join("; "),
+        names.join(" ")
+    )
+}
+
+/// `--no-setup`'s reminder after a reset.
+fn no_setup_note(pods: &[arena_core::Pod]) {
+    let names: Vec<&str> = pods.iter().map(|p| p.name.as_str()).collect();
+    println!(
+        "(--no-setup: {} back as the bare image — `arena pods setup {}` restores ~/.name, the git remote and keys)",
+        names.join(", "),
+        names.join(" ")
+    );
+}
+
+/// Whether `name` has a stable port on a configured proxy (a MACHINE_NAME_LIST name) — the
+/// pods whose forward a sync is expected to route.
+fn proxied_name(cfg: &Config, name: &str) -> bool {
+    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
+    arena_core::proxy::ProxyConfig::from_config(cfg).is_ok()
+        && cfg.machine_names.iter().any(|m| arena_core::naming::qualify(prefix, m) == name)
+}
+
+/// The pods of `pods` (with a stable port) whose forward `sync` didn't route to them — kept
+/// on an old endpoint because the listing showed them without one. Empty when the sync
+/// wasn't made (skipped / failed: its own line said so).
+fn unrouted<'a>(cfg: &Config, sync: &ProxySync, pods: &'a [arena_core::Pod]) -> Vec<&'a arena_core::Pod> {
+    let ProxySync::Synced { routed, .. } = sync else { return Vec::new() };
+    pods.iter()
+        .filter(|p| proxied_name(cfg, &p.name))
+        .filter(|p| !routed.iter().any(|f| f.name == p.name && f.pod_id.as_deref() == Some(p.id.as_str())))
+        .collect()
+}
+
+/// The proxy sync after a container reset, made once the pods' endpoints have SETTLED: a
+/// reset container's endpoint can flap after it first settles (live: the post-restart sync
+/// hit a moment the listing showed the pod without one, so its forward stayed on the dead
+/// old endpoint). Waits for each pod to hold one endpoint for `settle.stable_secs`
+/// (bounded), syncs, and if a pod's forward still isn't routed to it, waits and syncs once
+/// more; one still not routed is named with the command to run later.
+async fn settled_sync(cfg: &Config, provider: &dyn Provider, pods: &[arena_core::Pod], settle: SettleWait, why: &str) -> ProxySync {
+    let wait = || async {
+        for pod in pods {
+            if let Err(e) =
+                wait_for_stable_endpoint_every(provider, &pod.id, settle.stable_secs, settle.timeout_secs, settle.poll).await
+            {
+                eprintln!("warning: {} has no settled SSH endpoint ({e})", pod.name);
+            }
+        }
+    };
+    wait().await;
+    let mut sync = sync_proxy(cfg, provider, why).await;
+    if !unrouted(cfg, &sync, pods).is_empty() {
+        wait().await;
+        sync = sync_proxy(cfg, provider, why).await;
+    }
+    let missing: Vec<&str> = unrouted(cfg, &sync, pods).iter().map(|p| p.name.as_str()).collect();
+    if !missing.is_empty() {
+        eprintln!(
+            "warning: the proxy doesn't route {} to the new endpoint yet (listed without one) — run `arena proxy apply` once it answers",
+            missing.join(", ")
         );
     }
-    outcome.map_err(|e| {
-        anyhow::anyhow!(
-            "{0} restarted, but it is NOT set up again: {e:#}\n  → run `arena pods setup {0}` once it answers \
-             (not another restart — that would wipe it again)",
-            pod.name
-        )
-    })
+    sync
 }
 
 /// Printed by every rename: the one thing that can't follow a name.
@@ -7850,11 +8224,14 @@ fn replace_stage_names(canonical: &str) -> (String, String) {
     (format!("{canonical}-new"), format!("{canonical}-old"))
 }
 
-/// Build the spec for a replacement pod: snapshot the source's spec, fall GPU/cloud/image
-/// back to config (the REST API can't report GPU type or cloud tier — empty `machine`
-/// object), re-apply the configured CUDA constraint, re-seed the shared SSH key, then apply
-/// CLI overrides. disk/volume/ports/env come from the snapshot so per-pod differences are
-/// preserved. Errors if no GPU type is known.
+/// Build the base spec for a replacement pod: snapshot the source's spec, fall back for what
+/// it doesn't report — the GPU type to the source's own (enriched) listing first
+/// (`listed_gpu`, see [`source_gpu_from_listing`]), then config; the cloud tier and image to
+/// config — re-apply the configured CUDA constraint, re-seed the shared SSH key, then apply
+/// the CLI overrides EXCEPT `--gpu` / `--cloud`, which [`plan_replacement`] places (they
+/// can be lists). disk/volume/ports/env come from the snapshot so per-pod differences are
+/// preserved. Also returns notes for the plan: where the GPU type / tier came from when the
+/// source's spec didn't say (`GPU …` / `tier …`).
 ///
 /// The CUDA constraint (`ALLOWED_CUDA_VERSIONS`) can't come from the snapshot — neither
 /// RunPod API reports it back — so without re-applying it a replacement was created
@@ -7865,22 +8242,39 @@ async fn build_replacement_spec(
     owner: &dyn Provider,
     src_id: &str,
     src_label: &str,
+    listed_gpu: Option<&str>,
     ov: &SpecOverrides,
-) -> Result<PodSpec> {
-    // `--gpu` is checked against the owner's catalog first (RunPod), as on create.
-    let ov = &SpecOverrides { gpu: checked_gpu(cfg, owner.name(), ov.gpu.clone()).await?, ..ov.clone() };
+) -> Result<(PodSpec, Vec<String>)> {
     let mut spec = owner
         .pod_spec(src_id)
         .await
         .with_context(|| format!("snapshotting spec of {src_label}"))?;
     let base = PodSpec::from_config(cfg);
+    let mut notes = Vec::new();
     if spec.image.is_empty() {
         spec.image = base.image;
     }
     if spec.gpu_type.is_empty() {
-        spec.gpu_type = base.gpu_type;
+        match listed_gpu {
+            Some(g) => {
+                notes.push(format!("GPU {g}: the source's, from its listing (its spec snapshot doesn't report one)"));
+                spec.gpu_type = g.to_string();
+            }
+            None if !base.gpu_type.is_empty() => {
+                notes.push(format!(
+                    "GPU {}: config GPU_TYPE — the source's couldn't be read (pass --gpu to choose)",
+                    base.gpu_type
+                ));
+                spec.gpu_type = base.gpu_type;
+            }
+            None => {}
+        }
     }
     if spec.cloud_type.is_empty() {
+        notes.push(format!(
+            "tier {}: config CLOUD_TYPE — the API doesn't report the source's (pass --cloud to choose)",
+            base.cloud_type
+        ));
         spec.cloud_type = base.cloud_type;
     }
     if spec.allowed_cuda.is_empty() {
@@ -7891,13 +8285,7 @@ async fn build_replacement_spec(
         spec.env.retain(|(k, _)| k != "PUBLIC_KEY");
         spec.env.push(("PUBLIC_KEY".to_string(), pubkeys.join("\n")));
     }
-    apply_spec_overrides(&mut spec, ov);
-    if spec.gpu_type.is_empty() {
-        anyhow::bail!(
-            "couldn't determine a GPU type for the replacement (the API doesn't report it and \
-             no GPU_TYPE is configured) — pass --gpu <type> (see `arena gpus`)"
-        );
-    }
+    apply_spec_overrides(&mut spec, &SpecOverrides { gpu: None, cloud: None, ..ov.clone() });
     // Config CREATE_EXTRA_JSON is the cohort's create default, like GPU_TYPE: the
     // replacement's create carries it too — checked against the owner's own fields now,
     // before anything is created. (`--api-json` itself is create/up only.)
@@ -7905,7 +8293,284 @@ async fn build_replacement_spec(
         spec.api_extra = create_extra(owner, cfg, None)?;
     }
     check_create_body(owner, &spec)?;
-    Ok(spec)
+    Ok((spec, notes))
+}
+
+/// The source pod's GPU type as a create id, from its (enriched) listing — for when its spec
+/// snapshot doesn't say: RunPod v1's REST returns an empty `machine` (live finding #17: a
+/// 3070 pod's replacement silently became config's A4000, and a MIG or multi-GPU pod would
+/// have become the config default too). The listing's GraphQL details name the card the way
+/// RunPod displays it; [`gpu_id_from_listing`] maps that back to an id. Best-effort and
+/// bounded; `None` = unknown (the caller falls back to config, and says so).
+async fn source_gpu_from_listing(cfg: &Config, owner: &dyn Provider, src: &arena_core::Pod) -> Option<String> {
+    let mut pods = vec![src.clone()];
+    if pods[0].gpu_type.is_none() {
+        let _ = tokio::time::timeout(ENRICH_TIMEOUT, owner.enrich(&mut pods)).await;
+    }
+    let shown = pods.into_iter().next()?.gpu_type?;
+    let catalog = if owner.name() == "runpod" { live_gpu_catalog(cfg).await } else { Err(format!("{} has no catalog", owner.name())) };
+    gpu_id_from_listing(&shown, catalog)
+}
+
+/// The create id for a GPU as a listing shows it (`RTX 3070`, `B300 MIG 34GB`), pure: with
+/// RunPod's catalog, the one GPU whose id or display name it is ([`arena_core::gpu::check_gpu_flag`]
+/// — an ambiguous one is no answer); without, a known preset only (an alias, `RTX 3070` →
+/// `NVIDIA GeForce RTX 3070`). Never a guess: `None` sends the caller to config, saying so.
+fn gpu_id_from_listing(shown: &str, catalog: std::result::Result<Vec<arena_core::provider::runpod::GpuType>, String>) -> Option<String> {
+    match catalog {
+        Ok(types) => arena_core::gpu::check_gpu_flag(shown, &types).ok().filter(|id| !id.trim().is_empty() && !id.contains(',')),
+        Err(_) => {
+            let id = arena_core::gpu::resolve(shown);
+            (id != shown.trim() || arena_core::gpu::find(&id).is_some()).then_some(id)
+        }
+    }
+}
+
+/// A replacement pod's spec and where it may land (`replace`, `migrate copy`).
+struct Replacement {
+    /// What every option is layered on ([`build_replacement_spec`]).
+    base: PodSpec,
+    /// The options, in the order they're tried: one, unless `--gpu` / `--cloud` list several
+    /// or `--max-price` is set — then the same plan `create`/`up` would make.
+    plan: arena_core::placement::OptionPlan,
+    /// Where the GPU type / tier came from when not from the source's spec.
+    notes: Vec<String>,
+}
+
+impl Replacement {
+    /// The spec `name` is created from on the first option.
+    fn first_spec(&self, name: &str) -> PodSpec {
+        first_create_spec(&self.base, Some(&self.plan), name)
+    }
+
+    /// More than one option, or priced against a cap: shown as the option table.
+    fn is_placement(&self) -> bool {
+        self.plan.options.len() > 1 || self.plan.max_price.is_some()
+    }
+}
+
+/// Plan a replacement for `src` (read-only): its base spec, then where it may land. `--gpu`
+/// is checked against the owner's catalog first (RunPod) and, like `--cloud`, may be a list:
+/// the options go through the same planner as `create`/`up` (live finding #19: `--gpu
+/// 3070,A4000` went to the API as ONE invalid id). Without a list or a cap it's the single
+/// option — the source's GPU and tier, or the override.
+async fn plan_replacement(
+    cfg: &Config,
+    owner: &dyn Provider,
+    src: &arena_core::Pod,
+    ov: &SpecOverrides,
+    place: &PlaceFlags,
+) -> Result<Replacement> {
+    use arena_core::placement::Request;
+    let gpu = checked_gpu(cfg, owner.name(), ov.gpu.clone()).await?;
+    let listed = if gpu.is_none() { source_gpu_from_listing(cfg, owner, src).await } else { None };
+    let label = format!("{} (id={})", src.name, src.id);
+    let (base, mut notes) = build_replacement_spec(cfg, owner, &src.id, &label, listed.as_deref(), ov).await?;
+    if gpu.is_some() {
+        notes.retain(|n| !n.starts_with("GPU "));
+    }
+    if ov.cloud.is_some() {
+        notes.retain(|n| !n.starts_with("tier "));
+    }
+    let req = Request::from_flags(gpu.as_deref(), ov.cloud.as_deref(), &base, place.max_price, place.order)?;
+    if owner.name() != "hetzner" && req.gpus.iter().any(|g| g.trim().is_empty()) {
+        anyhow::bail!(
+            "couldn't determine a GPU type for the replacement (the API doesn't report it and \
+             no GPU_TYPE is configured) — pass --gpu <type> (see `arena gpus`)"
+        );
+    }
+    let plan = if req.is_single() {
+        let one = PodSpec { gpu_type: req.gpus[0].clone(), cloud_type: req.clouds[0].clone(), ..base.clone() };
+        single_option_plan(owner.name(), &one)
+    } else {
+        plan_placement(cfg, owner.name(), &req, &base).await?
+    };
+    Ok(Replacement { base, plan, notes })
+}
+
+/// The replacement's target in a plan: the spec of a single option, or the option table.
+fn print_replacement_plan(owner: &dyn Provider, rep: &Replacement, name: &str) {
+    if rep.is_placement() {
+        println!("  {}", plan_header(&rep.plan));
+        for line in arena_core::placement::render_plan(&rep.plan).lines() {
+            println!("    {line}");
+        }
+    } else {
+        println!("  target spec: {}", owner.describe(&rep.first_spec(name)));
+    }
+    for n in &rep.notes {
+        println!("  note: {n}");
+    }
+    if let Some(line) = extra_keys_line(&rep.base) {
+        println!("               {line}");
+    }
+}
+
+/// Create `name` from the replacement's options ([`arena_core::placement::place`], as
+/// `create`/`up` do): one create at a time, the first option with capacity wins, retried in
+/// rounds while `--retry-mins` allows (Ctrl+C stops between rounds). Nothing else has been
+/// touched before it exists; on failure nothing was created.
+async fn create_replacement(
+    owner: &dyn Provider,
+    rep: &Replacement,
+    name: &str,
+    place: &PlaceFlags,
+    interrupt: &Interrupt,
+) -> Result<arena_core::Pod> {
+    use arena_core::placement::{self, End, Progress};
+    let mut show = |p: &Progress| {
+        if p.is_created() {
+            println!("      {}", p.line());
+        } else {
+            eprintln!("      {}", p.line());
+        }
+    };
+    let names = [name.to_string()];
+    let run = placement::place(owner, &rep.base, &names, &rep.plan, place.rounds(), None, || interrupt.wait(), &mut show).await;
+    if let Some(pod) = run.created.into_iter().next() {
+        return Ok(pod);
+    }
+    let (why, hint) = match run.end {
+        End::Exhausted => (
+            "no capacity on any option right now".to_string(),
+            " Re-run with --retry-mins N to wait for it, or with other --gpu/--cloud options (see `arena offers`).",
+        ),
+        End::WindowElapsed => (format!("no capacity within the {}-minute retry window", place.retry_mins), ""),
+        End::Interrupted => ("interrupted".to_string(), ""),
+        End::Aborted { error, .. } | End::Failed { error, .. } => (error.to_string(), ""),
+        End::Filled => ("no pod came back".to_string(), ""),
+    };
+    anyhow::bail!("creating {name}: {why} — nothing was created, the original is untouched.{hint}")
+}
+
+/// The short machine name of `name` (`devtest-apple` → `apple`).
+fn short_of<'a>(cfg: &Config, name: &'a str) -> &'a str {
+    arena_core::setup::short_name(cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena"), name)
+}
+
+/// Write `~/.name` on pod `id` for the machine `name`, in setup's own format
+/// ([`arena_core::setup::name_file_command`], trailing newline included — live finding #26:
+/// the swap hand-rolled one without it). Re-resolves the endpoint first (within
+/// `wait_secs`). `false` = it couldn't.
+async fn write_name_file(remote: &dyn Remote, cfg: &Config, provider: &dyn Provider, id: &str, name: &str, wait_secs: u64) -> bool {
+    let cmd = arena_core::setup::name_file_command(short_of(cfg, name));
+    match wait_for_endpoint(provider, id, wait_secs).await {
+        Ok(p) => match SshTarget::from_pod(&p, cfg) {
+            Ok(t) => remote.exec(&t, &cmd, Some(PROBE_TIMEOUT)).await.is_ok_and(|o| o.success),
+            Err(_) => false,
+        },
+        Err(_) => false,
+    }
+}
+
+/// Everything keyed by the machine name, after a swap made `promoted` (pod `new_id`) the
+/// canonical `canonical` and parked `parked` (pod `old_id`): `~/.name` on both — so they
+/// don't both claim the name (#26) — the promoted pod's per-host API keys under its final
+/// name (#5), and the note that its `MACHINE_NAME` env var can't follow. Best-effort, every
+/// miss said with the command that fixes it.
+#[allow(clippy::too_many_arguments)]
+async fn after_swap(
+    remote: Arc<dyn Remote>,
+    cfg: &Config,
+    owner: &dyn Provider,
+    canonical: &str,
+    new_id: &str,
+    staging: &str,
+    parked: &str,
+    old_id: &str,
+    keys_dir: &str,
+) {
+    if !write_name_file(remote.as_ref(), cfg, owner, new_id, canonical, 60).await {
+        eprintln!(
+            "      warning: couldn't update ~/.name on {canonical} — `arena pods setup {canonical}` writes it \
+             (until then backups/metrics label it {})",
+            short_of(cfg, staging)
+        );
+    }
+    // The parked original still says the canonical name; a stopped one can't be reached
+    // (and is about to be terminated anyway), so it's only asked when it's up.
+    let old_up = owner
+        .list_pods()
+        .await
+        .ok()
+        .and_then(|ps| ps.into_iter().find(|p| p.id == old_id))
+        .is_some_and(|p| !arena_core::status::is_stopped(&p.status) && p.ssh_ip.is_some());
+    if old_up && !write_name_file(remote.as_ref(), cfg, owner, old_id, parked, 30).await {
+        eprintln!("      note: {parked}'s ~/.name still says {} (harmless once it's terminated)", short_of(cfg, canonical));
+    }
+    println!(
+        "      note: {canonical}'s MACHINE_NAME env var still says {staging} — env is fixed at create (only a \
+         reimage, which wipes the disk, resets it); ~/.name carries {}.",
+        short_of(cfg, canonical)
+    );
+    rekey_promoted(remote, cfg, owner, new_id, canonical, keys_dir).await;
+}
+
+/// Give the promoted pod its per-host API keys under its FINAL name (live finding #5: setup
+/// ran while it was `<name>-new`, keys are matched on the exact name, and the copy
+/// deliberately leaves the rc files they live in behind — so it silently had none). The
+/// keys CSVs are re-distributed to it as `copy-keys <name>` would; when that fails, the
+/// command to run is said. Nothing to carry without key files.
+async fn rekey_promoted(remote: Arc<dyn Remote>, cfg: &Config, owner: &dyn Provider, id: &str, canonical: &str, keys_dir: &str) {
+    let keys = KeySources::load(cfg, keys_dir, None, None);
+    if keys.per_host.is_empty() && keys.broadcast.is_empty() {
+        return;
+    }
+    println!("      giving {canonical} its API keys under its new name…");
+    let sel = match just_these(owner, &[id.to_string()]).await {
+        Ok(mut sel) => {
+            // Whatever the listing says this instant: the keys are for the canonical name.
+            for p in &mut sel.pods {
+                p.name = canonical.to_string();
+            }
+            sel
+        }
+        Err(e) => {
+            eprintln!("      warning: {canonical}'s API keys weren't re-distributed ({e:#}) — run `arena pods copy-keys {canonical}`");
+            return;
+        }
+    };
+    if let Err(e) = handle_copy_keys(remote, cfg, keys_dir, None, None, &sel, false, true).await {
+        eprintln!("      warning: {canonical}'s API keys weren't re-distributed ({e:#}) — run `arena pods copy-keys {canonical}`");
+    }
+}
+
+/// The new pod's host maintenance window, when its provider reports one (best-effort,
+/// bounded): a host going into maintenance stops its pods — on RunPod that wipes the
+/// container disk — so a replacement landing on one is no replacement (live finding #28).
+async fn maintenance_window(owner: &dyn Provider, id: &str) -> Option<String> {
+    let pods = tokio::time::timeout(arena_core::provider::LIST_TIMEOUT, owner.list_pods()).await.ok()?.ok()?;
+    let mut mine: Vec<arena_core::Pod> = pods.into_iter().filter(|p| p.id == id).collect();
+    if mine.is_empty() {
+        return None;
+    }
+    let _ = tokio::time::timeout(ENRICH_TIMEOUT, owner.enrich(&mut mine)).await;
+    let label = arena_core::fleet::maintenance_label(mine[0].maintenance.as_ref());
+    (label != "-").then_some(label)
+}
+
+/// The proxy is write-only (`SSH_PROXY_RELOAD_CMD=""`): arena writes the forwards but never
+/// reloads nginx, so nothing can be verified *through* it (live finding #29: the cutover
+/// waited 45 s "for nginx", then blamed the new pod). The proxy's file, for the message.
+fn write_only_proxy(cfg: &Config) -> Option<String> {
+    arena_core::proxy::ProxyConfig::from_config(cfg).ok().filter(|p| p.reload_cmd.trim().is_empty()).map(|p| p.nginx_path)
+}
+
+/// The config line a plan prints for the copy: what it carries and what it leaves (#27).
+fn copy_scope_line() -> String {
+    format!("copies {}; {}", arena_core::pull::REPLICATION_KEEPS, arena_core::pull::REPLICATION_SKIPS)
+}
+
+/// The plan / confirm note on a locked original: copying only reads it, but what retires it
+/// will be refused until it's unlocked (never unlocked here).
+fn locked_original_note(src: &arena_core::Pod) -> Option<String> {
+    arena_core::lock::is_locked(src).then(|| {
+        format!(
+            "note: {0} is locked — the copy only reads it, but the cutover will be refused until \
+             `arena pods unlock {0}` (arena never unlocks it by itself)",
+            src.name
+        )
+    })
 }
 
 /// The plan line for a create carrying `--api-json` / `CREATE_EXTRA_JSON`: its top-level
@@ -7992,14 +8657,19 @@ async fn proxy_reaches_pod(remote: &dyn Remote, cfg: &Config, name: &str, expect
 
 /// `migrate copy`: build + set up `<name>-new` (or reuse it) and sync `<name>`'s files onto
 /// it. No rename, no proxy — the participant keeps using `<name>` and can test the new pod.
+/// The sync is a replica's ([`copy_pod_files`]): deletions on the original propagate, and
+/// whatever it replaces or deletes on `-new` is moved aside there, never lost.
+#[allow(clippy::too_many_arguments)]
 async fn handle_migrate_copy(
     // How we reach pods: `SshRemote` for real, `FakeRemote` in tests.
     remote: Arc<dyn Remote>,
     cfg: &Config,
     target: &str,
     ov: &SpecOverrides,
+    place: &PlaceFlags,
     dry_run: bool,
     yes: bool,
+    interrupt: &Interrupt,
 ) -> Result<()> {
     // Setup runs after the create below: a malformed SETUP_TIMEOUT_SECS must fail now,
     // before anything is created (and billed) — not after a ~15 min wait for the new pod,
@@ -8007,78 +8677,97 @@ async fn handle_migrate_copy(
     // re-sync that won't run setup (it's a config error either way; fix it once).
     let setup_timeouts = arena_core::setup::SetupTimeouts::from_config(cfg, None)?;
     let (owner, canonical, pods) = resolve_migration(cfg, target).await?;
-    let src_id = pods.iter().find(|p| p.name == canonical).unwrap().id.clone();
+    let owner = owner.as_ref();
+    let src = pods.iter().find(|p| p.name == canonical).expect("the canonical pod is listed").clone();
     let new_name = format!("{canonical}-new");
     let existing_new = pods.iter().find(|p| p.name == new_name).cloned();
+    let lock_note = locked_original_note(&src);
 
     if dry_run {
         println!("migrate copy {canonical} (dry-run):");
         if existing_new.is_some() {
-            println!("  - {new_name} exists → incremental re-sync {canonical} → {new_name}");
+            println!(
+                "  - {new_name} exists → incremental re-sync {canonical} → {new_name} (deletions mirrored; anything \
+                 it replaces or deletes on {new_name} is moved aside there, never lost)"
+            );
         } else {
-            let spec = build_replacement_spec(cfg, owner.as_ref(), &src_id, &canonical, ov).await?;
-            println!("  - create {new_name} ({})", owner.describe(&spec));
-            if let Some(line) = extra_keys_line(&spec) {
-                println!("    {line}");
-            }
-            println!("  - wait for it to stabilize, then set it up");
-            println!("  - sync {canonical} → {new_name}");
+            let rep = plan_replacement(cfg, owner, &src, ov, place).await?;
+            println!("  - create {new_name}:");
+            print_replacement_plan(owner, &rep, &new_name);
+            println!("  - wait for it to stabilize, then set it up (~/.name={} until the cutover)", short_of(cfg, &new_name));
+            println!("  - sync {canonical} → {new_name}: {}", copy_scope_line());
+        }
+        if let Some(n) = &lock_note {
+            println!("  {n}");
         }
         println!("  (no rename, no proxy change)\n[dry-run] nothing changed.");
         return Ok(());
     }
 
-    let new_id = if let Some(np) = existing_new {
+    let (new_id, fresh) = if let Some(np) = existing_new {
         println!("Re-using existing {new_name} (id={}) — incremental re-sync.", np.id);
-        np.id
+        let shaping = ov.gpu.is_some() || ov.gpus.is_some() || ov.cloud.is_some() || ov.disk.is_some() || ov.volume.is_some()
+            || ov.image.is_some() || ov.bootstrap || place.max_price.is_some() || place.retry_mins > 0;
+        if shaping {
+            eprintln!(
+                "note: the spec/placement flags only shape a NEW pod — {new_name} exists and is re-synced as it is \
+                 (terminate it first to build it differently)"
+            );
+        }
+        (np.id, false)
     } else {
-        let spec = build_replacement_spec(cfg, owner.as_ref(), &src_id, &canonical, ov).await?;
+        let rep = plan_replacement(cfg, owner, &src, ov, place).await?;
+        println!("migrate copy {canonical} → {new_name}:");
+        print_replacement_plan(owner, &rep, &new_name);
+        if rep.plan.options.is_empty() {
+            anyhow::bail!("nothing to create: no option left to try (see the table above, or `arena offers`)");
+        }
+        if let Some(n) = &lock_note {
+            println!("  {n}");
+        }
         if !confirm(
             yes,
             &format!(
-                "Will create {new_name} ({}) and sync {canonical}'s files onto it — no rename, \
-                 no proxy change.",
-                owner.describe(&spec)
+                "Will create {new_name} and sync {canonical}'s files onto it — no rename, no proxy change. ({})",
+                copy_scope_line()
             ),
         )? {
             println!("aborted.");
             return Ok(());
         }
-        let mut nspec = spec.clone();
-        nspec.name = new_name.clone();
-        nspec.env.push(("MACHINE_NAME".to_string(), new_name.clone()));
-        println!("[1/3] creating {new_name} ({})…", owner.describe(&nspec));
-        let policy = arena_core::retry::RetryPolicy::default();
-        let created = arena_core::retry::retrying(&policy, || owner.create_pod(&nspec))
-            .await
-            .with_context(|| format!("creating {new_name}"))?;
+        println!("[1/3] creating {new_name}…");
+        let created = create_replacement(owner, &rep, &new_name, place, interrupt).await?;
         println!("      created id={}", created.id);
         println!("[2/3] waiting for {new_name} to come up and stabilize…");
-        wait_for_endpoint(owner.as_ref(), &created.id, 900)
+        wait_for_endpoint(owner, &created.id, 900)
             .await
             .with_context(|| format!("{new_name} never came up"))?;
-        wait_for_stable_endpoint(owner.as_ref(), &created.id, 90, 600)
+        wait_for_stable_endpoint(owner, &created.id, 90, 600)
             .await
             .with_context(|| format!("{new_name} never stabilized"))?;
-        println!("      provisioning {new_name}…");
+        println!("      provisioning {new_name} (its per-host API keys follow at the cutover, under {canonical})…");
         // By id (a fresh listing, for the settled endpoint): the pod we just made.
-        let new = just_these(owner.as_ref(), std::slice::from_ref(&created.id)).await?;
-        handle_setup(remote.clone(), cfg, true, false, None, None, false, false, setup_timeouts, &new, KEYS_DIR, Some(owner.as_ref()))
+        let new = just_these(owner, std::slice::from_ref(&created.id)).await?;
+        handle_setup(remote.clone(), cfg, true, false, None, None, false, false, setup_timeouts, &new, KEYS_DIR, Some(owner))
             .await
             .with_context(|| format!("provisioning {new_name}"))?;
-        created.id
+        (created.id, true)
     };
 
     println!("[3/3] syncing {canonical} → {new_name}…");
-    copy_pod_files(cfg, owner.as_ref(), remote.as_ref(), &src_id, &new_id)
+    copy_pod_files(cfg, owner, remote.as_ref(), &src.id, &new_id, &CopyOpts::new(fresh))
         .await
         .with_context(|| format!("syncing {canonical} -> {new_name}"))?;
-    clean_marker(owner.as_ref(), remote.as_ref(), &new_id, cfg).await;
+    clean_marker(owner, remote.as_ref(), &new_id, cfg).await;
 
     println!("\n✓ {new_name} is built and synced (participant still on {canonical}, untouched).");
-    if let Ok(Some(p)) =
-        owner.list_pods().await.map(|ps| ps.into_iter().find(|p| p.id == new_id))
-    {
+    if let Some(window) = maintenance_window(owner, &new_id).await {
+        eprintln!(
+            "  ⚠ {new_name}'s host has a scheduled maintenance window ({window}): the provider will stop it then, \
+             wiping its container disk. Consider `arena pods terminate {new_name}` and copying again."
+        );
+    }
+    if let Ok(Some(p)) = owner.list_pods().await.map(|ps| ps.into_iter().find(|p| p.id == new_id)) {
         if let (Some(ip), Some(port)) = (p.ssh_ip.as_deref(), p.ssh_port) {
             println!("  Test it directly:  ssh -p {port} root@{ip}  (use a fleet key)");
         }
@@ -8090,37 +8779,72 @@ async fn handle_migrate_copy(
     Ok(())
 }
 
+/// `migrate cutover`'s switches, passed through as one value.
+#[derive(Debug, Clone, Copy, Default)]
+struct CutoverOpts {
+    skip_proxy: bool,
+    /// Cut over to the copy already on `-new` without syncing from the original first.
+    no_final_sync: bool,
+    dry_run: bool,
+    yes: bool,
+}
+
 /// `migrate cutover`: final delta sync, swap names, re-point + VERIFY the proxy, auto-revert
 /// if the new pod isn't reachable through the proxy. Keeps `<name>-old`.
 async fn handle_migrate_cutover(
     // How we reach pods: `SshRemote` for real, `FakeRemote` in tests.
-    remote: &dyn Remote,
+    remote: Arc<dyn Remote>,
+    // The fleet (every configured provider), for the proxy syncs.
+    fleet: &dyn Provider,
     cfg: &Config,
     target: &str,
-    skip_proxy: bool,
-    dry_run: bool,
-    yes: bool,
+    opts: CutoverOpts,
 ) -> Result<()> {
     let (owner, canonical, pods) = resolve_migration(cfg, target).await?;
-    migrate_cutover_on(remote, cfg, owner.as_ref(), &canonical, &pods, skip_proxy, dry_run, yes).await
+    migrate_cutover_on(remote, fleet, cfg, owner.as_ref(), &canonical, &pods, opts, KEYS_DIR).await
+}
+
+/// When `<name>-new` was last synced, as the plan says it: `2026-10-08 11:02 UTC (3h ago)`,
+/// or that it can't tell. Read from the pod (bounded).
+async fn last_sync_label(remote: &dyn Remote, cfg: &Config, owner: &dyn Provider, id: &str) -> String {
+    let stamp = match wait_for_endpoint(owner, id, 30).await.ok().and_then(|p| SshTarget::from_pod(&p, cfg).ok()) {
+        Some(t) => match remote.exec(&t, &arena_core::replica::last_sync_command(), Some(PROBE_TIMEOUT)).await {
+            Ok(o) if o.success => arena_core::replica::parse_last_sync(&o.stdout),
+            _ => None,
+        },
+        None => None,
+    };
+    let Some(at) = stamp else { return "an unknown time (no sync stamp on it)".to_string() };
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let day = arena_core::schedule::ymd_string((at / 86_400) as i64);
+    let ago = now.saturating_sub(at);
+    format!(
+        "{day} {:02}:{:02} UTC ({} ago)",
+        at % 86_400 / 3600,
+        at % 3600 / 60,
+        arena_core::error::human_duration(&Duration::from_secs(ago - ago % 60))
+    )
 }
 
 /// [`handle_migrate_cutover`] once the owner and its listing are known ([`resolve_migration`])
-/// — the seam tests drive with a fake owner.
+/// — the seam tests drive with a fake owner (and fleet).
 #[allow(clippy::too_many_arguments)]
 async fn migrate_cutover_on(
-    remote: &dyn Remote,
+    remote: Arc<dyn Remote>,
+    fleet: &dyn Provider,
     cfg: &Config,
     owner: &dyn Provider,
     canonical: &str,
     pods: &[arena_core::Pod],
-    skip_proxy: bool,
-    dry_run: bool,
-    yes: bool,
+    opts: CutoverOpts,
+    // Where the per-host API-key CSVs live (`KEYS_DIR`; a temp dir in tests).
+    keys_dir: &str,
 ) -> Result<()> {
+    let CutoverOpts { skip_proxy, no_final_sync, dry_run, yes } = opts;
     let new_name = format!("{canonical}-new");
     let old_name = format!("{canonical}-old");
-    let src_id = pods.iter().find(|p| p.name == canonical).unwrap().id.clone();
+    let src = pods.iter().find(|p| p.name == canonical).expect("the canonical pod is listed").clone();
+    let src_id = src.id.clone();
     let new_id = pods
         .iter()
         .find(|p| p.name == new_name)
@@ -8131,24 +8855,39 @@ async fn migrate_cutover_on(
     }
     // The cutover moves the participant off the pod (renamed to -old, then `finish`
     // terminates it): a locked original is refused here, at the step that starts that.
-    let src = pods.iter().find(|p| p.id == src_id).expect("found by id above");
-    let locked = arena_core::lock::refusal("cut over", &[src], LOCKED_REPLACEMENT_NOTE);
+    let locked = arena_core::lock::refusal("cut over", &[&src], LOCKED_REPLACEMENT_NOTE);
     if let (Some(r), false) = (&locked, dry_run) {
         anyhow::bail!("{r}");
     }
+    let write_only = if skip_proxy { None } else { write_only_proxy(cfg) };
+    let sync_line = if no_final_sync {
+        format!(
+            "final sync SKIPPED (--no-final-sync): {new_name} keeps the copy from its last sync, {} — \
+             anything changed on {canonical} since stays behind on it",
+            last_sync_label(remote.as_ref(), cfg, owner, &new_id).await
+        )
+    } else {
+        format!("final delta sync {canonical} → {new_name}")
+    };
+    let verify_line = match &write_only {
+        Some(path) => format!(
+            "proxy apply (write-only: {path} is written, nginx is NOT reloaded by arena — so nothing can be \
+             verified through it; the new pod's own health check stands, and nothing auto-reverts)"
+        ),
+        None => "proxy apply, then SSH through the proxy to confirm it works (auto-revert if not)".to_string(),
+    };
 
     if dry_run {
         if let Some(r) = &locked {
             print_would_refuse(r);
         }
         println!("migrate cutover {canonical} (dry-run):");
-        println!("  1. final delta sync {canonical} → {new_name}");
-        println!("  2. rename {canonical} → {old_name}, then {new_name} → {canonical}");
+        println!("  1. {sync_line}");
+        println!("  2. rename {canonical} → {old_name}, then {new_name} → {canonical} (+ ~/.name on both, API keys under {canonical})");
         if skip_proxy {
             println!("  3. proxy SKIPPED — run `arena proxy apply` yourself");
         } else {
-            println!("  3. proxy apply, then SSH through the proxy to confirm {canonical} works");
-            println!("  4. if unreachable → auto-revert names + proxy (participant stays put)");
+            println!("  3. {verify_line}");
         }
         println!("  {old_name} kept (delete later with `migrate finish {canonical}`).\n[dry-run] nothing changed.");
         return Ok(());
@@ -8157,9 +8896,8 @@ async fn migrate_cutover_on(
     if !confirm(
         yes,
         &format!(
-            "Cut over {canonical} to {new_name}: final sync, then swap names{} and verify. \
-             {old_name} kept.",
-            if skip_proxy { " (no proxy)" } else { " + proxy" }
+            "Cut over {canonical} to {new_name}: {sync_line}; then swap names and {}. {old_name} kept.",
+            if skip_proxy { "leave the proxy alone".to_string() } else { verify_line.clone() }
         ),
     )? {
         println!("aborted.");
@@ -8167,13 +8905,20 @@ async fn migrate_cutover_on(
     }
 
     // 1. final delta sync + verify it landed.
-    println!("[1/4] final delta sync {canonical} → {new_name}…");
-    copy_pod_files(cfg, owner, remote, &src_id, &new_id)
-        .await
-        .with_context(|| format!("final sync {canonical} -> {new_name}"))?;
-    clean_marker(owner, remote, &new_id, cfg).await;
+    if no_final_sync {
+        println!("[1/4] {sync_line}.");
+    } else {
+        println!("[1/4] final delta sync {canonical} → {new_name}…");
+        copy_pod_files(cfg, owner, remote.as_ref(), &src_id, &new_id, &CopyOpts::new(false)).await.with_context(|| {
+            format!(
+                "final sync {canonical} -> {new_name} — nothing was swapped. If {canonical} is down for good, cut over \
+                 to the copy already on {new_name}: `arena pods migrate cutover {canonical} --no-final-sync`"
+            )
+        })?;
+        clean_marker(owner, remote.as_ref(), &new_id, cfg).await;
+    }
     println!("[2/4] verifying {new_name} health…");
-    verify_replacement(owner, remote, &new_id, cfg).await?;
+    verify_replacement(owner, remote.as_ref(), &new_id, cfg).await?;
 
     // 3. swap names (old-first so the canonical name is never on two pods).
     println!("[3/4] swapping names…");
@@ -8182,20 +8927,13 @@ async fn migrate_cutover_on(
         .await
         .with_context(|| format!("renaming {canonical} -> {old_name}"))?;
     if let Err(e) =
-        arena_core::retry::retrying(&policy, || owner.rename_pod(&new_id, &canonical)).await
+        arena_core::retry::retrying(&policy, || owner.rename_pod(&new_id, canonical)).await
     {
         eprintln!("      promote failed ({e}); rolling back {old_name} -> {canonical}");
-        let _ = owner.rename_pod(&src_id, &canonical).await;
+        let _ = owner.rename_pod(&src_id, canonical).await;
         return Err(e).context("promoting new pod (rolled back; original intact)");
     }
-    // set ~/.name on the now-canonical pod
-    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
-    let short = canonical.strip_prefix(&format!("{prefix}-")).unwrap_or(&canonical);
-    if let Ok(t) = fresh_target(owner, &new_id, cfg).await {
-        let name_cmd =
-            format!("printf %s {} > \"$HOME/.name\"", shell_quote(&format!("export MACHINE_NAME='{short}'")));
-        let _ = remote.exec(&t, &name_cmd, Some(PROBE_TIMEOUT)).await;
-    }
+    after_swap(remote.clone(), cfg, owner, canonical, &new_id, &new_name, &old_name, &src_id, keys_dir).await;
 
     // 4. proxy apply + verify through the proxy; auto-revert on failure.
     if skip_proxy {
@@ -8203,37 +8941,50 @@ async fn migrate_cutover_on(
     } else {
         println!("[4/4] re-pointing proxy and verifying {canonical} through it…");
         // Unlike the other lifecycle commands, the cutover *depends* on the proxy: a sync
-        // that was skipped or failed means nobody can reach the new pod, so revert now.
-        if !matches!(sync_proxy_via(cfg, owner, "migrate cutover").await, ProxySync::Synced { .. }) {
-            eprintln!("      the proxy wasn't re-pointed — auto-reverting.");
-            cutover_revert(cfg, owner, &canonical, &new_id, &src_id, true).await;
-            anyhow::bail!("cutover reverted: proxy sync failed. {canonical} is back on the original.");
+        // that was skipped or failed — or one that didn't route the name to the new pod —
+        // means nobody can reach the new pod, so revert now.
+        let sync = sync_proxy(cfg, fleet, "migrate cutover").await;
+        let not_routed = replace_cleanup_blocker(&sync, proxied_name(cfg, canonical), canonical, owner.name(), &new_id);
+        if !matches!(sync, ProxySync::Synced { .. }) || not_routed.is_some() {
+            let why = not_routed.unwrap_or_else(|| "the proxy wasn't re-pointed".to_string());
+            eprintln!("      {why} — auto-reverting.");
+            cutover_revert(remote.as_ref(), cfg, fleet, owner, canonical, &new_id, &src_id, true).await;
+            anyhow::bail!("cutover reverted: {why}. {canonical} is back on the original.");
         }
-        // `nginx -s reload` is GRACEFUL: for a few seconds after the reload, existing worker
-        // processes keep serving the OLD config, so a fresh connection can still be routed to
-        // the OLD pod. A single immediate probe therefore reads the old pod's id and false-
-        // fails. Wait for the reload to settle and retry the through-proxy identity check —
-        // succeed as soon as the proxy actually reaches the new pod (up to ~45s).
-        let settle_tries = 15;
-        let mut reached = false;
-        for attempt in 1..=settle_tries {
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-            if proxy_reaches_pod(remote, cfg, &canonical, &new_id).await.unwrap_or(false) {
-                reached = true;
-                println!("      ✓ {canonical} reachable through the proxy on the new pod (after ~{}s).", attempt * 3);
-                break;
-            }
-            if attempt % 3 == 0 {
-                eprintln!("      waiting for nginx to finish cutting over to the new pod ({}s)…", attempt * 3);
-            }
-        }
-        if !reached {
-            eprintln!("      ✗ {canonical} NOT reachable through the proxy after ~{}s — auto-reverting.", settle_tries * 3);
-            cutover_revert(cfg, owner, &canonical, &new_id, &src_id, true).await;
-            anyhow::bail!(
-                "cutover reverted: the new pod wasn't reachable through the proxy. {canonical} is \
-                 back on the original (untouched). Check the new pod, then retry."
+        if let Some(path) = &write_only {
+            println!(
+                "      [proxy] write-only: {canonical}'s forward to the new pod is written to {path}, but arena doesn't \
+                 reload nginx — reload it yourself, then check {canonical}'s port reaches the new pod (roll back with \
+                 `arena pods migrate revert {canonical}`)."
             );
+        } else {
+            // `nginx -s reload` is GRACEFUL: for a few seconds after the reload, existing worker
+            // processes keep serving the OLD config, so a fresh connection can still be routed to
+            // the OLD pod. A single immediate probe therefore reads the old pod's id and false-
+            // fails. Wait for the reload to settle and retry the through-proxy identity check —
+            // succeed as soon as the proxy actually reaches the new pod (up to ~45s).
+            let settle_tries = 15;
+            let mut reached = false;
+            for attempt in 1..=settle_tries {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                if proxy_reaches_pod(remote.as_ref(), cfg, canonical, &new_id).await.unwrap_or(false) {
+                    reached = true;
+                    println!("      ✓ {canonical} reachable through the proxy on the new pod (after ~{}s).", attempt * 3);
+                    break;
+                }
+                if attempt % 3 == 0 {
+                    eprintln!("      waiting for nginx to finish cutting over to the new pod ({}s)…", attempt * 3);
+                }
+            }
+            if !reached {
+                eprintln!("      ✗ {canonical} NOT reachable through the proxy after ~{}s — auto-reverting.", settle_tries * 3);
+                cutover_revert(remote.as_ref(), cfg, fleet, owner, canonical, &new_id, &src_id, true).await;
+                anyhow::bail!(
+                    "cutover reverted: the new pod wasn't reachable through the proxy (it passed its own SSH \
+                     health check, so look at the proxy host first). {canonical} is back on the original \
+                     (untouched); retry once the proxy answers."
+                );
+            }
         }
     }
 
@@ -8245,11 +8996,14 @@ async fn migrate_cutover_on(
     Ok(())
 }
 
-/// Roll a cutover back: rename `<name>` → `<name>-new`, `<name>-old` → `<name>`, and (unless
-/// `skip_proxy`) re-point the proxy to the restored original. Shared by the cutover's
-/// auto-revert and the manual `migrate revert`.
+/// Roll a cutover back: rename `<name>` → `<name>-new`, `<name>-old` → `<name>`, put each
+/// pod's `~/.name` back, and (unless `apply_px` is false) re-point the proxy to the restored
+/// original. Shared by the cutover's auto-revert and the manual `migrate revert`.
+#[allow(clippy::too_many_arguments)]
 async fn cutover_revert(
+    remote: &dyn Remote,
     cfg: &Config,
+    fleet: &dyn Provider,
     owner: &dyn Provider,
     canonical: &str,
     new_id: &str,
@@ -8263,13 +9017,22 @@ async fn cutover_revert(
     if let Err(e) = owner.rename_pod(old_id, canonical).await {
         eprintln!("  REVERT WARNING: couldn't restore {canonical} ({e}) — fix names manually!");
     }
-    if apply_px && !matches!(sync_proxy_via(cfg, owner, "migrate revert").await, ProxySync::Synced { .. }) {
+    // Best-effort, short: the names are what matter; `pods setup` rewrites either file.
+    let _ = write_name_file(remote, cfg, owner, new_id, &new_name, 30).await;
+    let _ = write_name_file(remote, cfg, owner, old_id, canonical, 30).await;
+    if apply_px && !matches!(sync_proxy(cfg, fleet, "migrate revert").await, ProxySync::Synced { .. }) {
         eprintln!("  REVERT WARNING: the proxy wasn't re-pointed — run `arena proxy apply`.");
     }
 }
 
 /// `migrate revert`: manual rollback of a cutover (swap `<name>` ↔ `<name>-old` + proxy).
+/// Work done on the new pod since the cutover stays on it (now `<name>-new`) — the confirm
+/// and the summary say so (live finding #7); a later `migrate copy` moves aside, never
+/// destroys, whatever of it the copy replaces.
+#[allow(clippy::too_many_arguments)]
 async fn handle_migrate_revert(
+    remote: &dyn Remote,
+    fleet: &dyn Provider,
     cfg: &Config,
     target: &str,
     skip_proxy: bool,
@@ -8278,46 +9041,74 @@ async fn handle_migrate_revert(
 ) -> Result<()> {
     let (owner, canonical, pods) = resolve_migration(cfg, target).await?;
     let old_name = format!("{canonical}-old");
-    let new_id = pods.iter().find(|p| p.name == canonical).unwrap().id.clone();
+    let new_name = format!("{canonical}-new");
+    let new_id = pods.iter().find(|p| p.name == canonical).expect("the canonical pod is listed").id.clone();
     let old_id = pods
         .iter()
         .find(|p| p.name == old_name)
         .map(|p| p.id.clone())
         .ok_or_else(|| anyhow::anyhow!("no {old_name} to revert to (nothing to roll back)"))?;
+    let stays = format!(
+        "work done on the new pod since the cutover is NOT on the original: it stays on {new_name} (a later \
+         `migrate copy` moves aside — never destroys — whatever of it the copy replaces; it isn't merged back)"
+    );
 
     if dry_run {
         println!("migrate revert {canonical} (dry-run):");
-        println!("  rename {canonical} → {canonical}-new, {old_name} → {canonical}");
+        println!("  rename {canonical} → {new_name}, {old_name} → {canonical}");
         println!("  {}", if skip_proxy { "(no proxy)" } else { "then proxy apply (route back to the original)" });
+        println!("  note: {stays}");
         println!("[dry-run] nothing changed.");
         return Ok(());
     }
-    if !confirm(yes, &format!("Roll {canonical} back to the original ({old_name}){}.", if skip_proxy { "" } else { " + proxy" }))? {
+    if !confirm(
+        yes,
+        &format!("Roll {canonical} back to the original ({old_name}){}. Note: {stays}.", if skip_proxy { "" } else { " + proxy" }),
+    )? {
         println!("aborted.");
         return Ok(());
     }
-    cutover_revert(cfg, owner.as_ref(), &canonical, &new_id, &old_id, !skip_proxy).await;
-    println!("✓ Reverted: {canonical} is the original again; the new pod is parked as {canonical}-new.");
+    cutover_revert(remote, cfg, fleet, owner.as_ref(), &canonical, &new_id, &old_id, !skip_proxy).await;
+    println!("✓ Reverted: {canonical} is the original again; the new pod is parked as {new_name}.");
+    println!("  Its work since the cutover stays there — copy what's wanted back to {canonical} by hand (e.g. `arena pods pull {new_name}`).");
     Ok(())
 }
 
-/// `migrate finish`: terminate the parked `<name>-old` pod.
-async fn handle_migrate_finish(cfg: &Config, target: &str, dry_run: bool, yes: bool) -> Result<()> {
+/// `migrate finish`: terminate the parked `<name>-old` pod, once the proxy routes the
+/// participant's port to the live pod ([`migrate_finish_on`]).
+async fn handle_migrate_finish(fleet: &dyn Provider, cfg: &Config, target: &str, dry_run: bool, yes: bool) -> Result<()> {
     let (owner, canonical, pods) = resolve_migration(cfg, target).await?;
-    migrate_finish_on(owner.as_ref(), &canonical, &pods, dry_run, yes).await
+    migrate_finish_on(fleet, cfg, owner.as_ref(), &canonical, &pods, dry_run, yes).await
 }
 
 /// [`handle_migrate_finish`] once the owner and its listing are known — the seam tests drive
-/// with a fake owner.
-async fn migrate_finish_on(owner: &dyn Provider, canonical: &str, pods: &[arena_core::Pod], dry_run: bool, yes: bool) -> Result<()> {
+/// with a fake owner. Live finding #6: finish terminated `-old` while the proxy still routed
+/// the participant's port to it (a `--skip-proxy` cutover) — the port then pointed at a dead
+/// pod. Now the proxy is synced first, and the terminate refused unless that sync ROUTED
+/// `<name>`'s stable port to the live pod ([`replace_cleanup_blocker`], the same rule as
+/// `pods replace`). Without a proxy (or a name with no stable port) nothing can route to
+/// `-old`, and it goes as before.
+#[allow(clippy::too_many_arguments)]
+async fn migrate_finish_on(
+    fleet: &dyn Provider,
+    cfg: &Config,
+    owner: &dyn Provider,
+    canonical: &str,
+    pods: &[arena_core::Pod],
+    dry_run: bool,
+    yes: bool,
+) -> Result<()> {
     let old_name = format!("{canonical}-old");
     let old = pods
         .iter()
         .find(|p| p.name == old_name)
         .ok_or_else(|| anyhow::anyhow!("no {old_name} to remove (nothing to finish)"))?;
+    let live = pods.iter().find(|p| p.name == canonical);
+    let proxied = proxied_name(cfg, canonical);
     let locked = arena_core::lock::refusal("terminate", &[old], "");
     if dry_run {
-        println!("migrate finish {canonical} (dry-run): would terminate {old_name} (id={}).", old.id);
+        let first = if proxied { format!("sync the proxy, confirm {canonical}'s port routes to the live pod, then ") } else { String::new() };
+        println!("migrate finish {canonical} (dry-run): would {first}terminate {old_name} (id={}).", old.id);
         if let Some(r) = &locked {
             print_would_refuse(r);
         }
@@ -8330,11 +9121,25 @@ async fn migrate_finish_on(owner: &dyn Provider, canonical: &str, pods: &[arena_
         println!("aborted.");
         return Ok(());
     }
+    if proxied {
+        let sync = sync_proxy(cfg, fleet, "migrate finish").await;
+        let blocker = match live {
+            Some(live) => replace_cleanup_blocker(&sync, true, canonical, owner.name(), &live.id),
+            None => Some(format!("no pod is named {canonical} now")),
+        };
+        if let Some(why) = blocker {
+            anyhow::bail!(
+                "NOT terminating {old_name}: {why} — {canonical}'s stable port may still lead to {old_name}. Make the \
+                 proxy route it to the live pod (`arena proxy apply`), then re-run `arena pods migrate finish {canonical}`."
+            );
+        }
+    }
     owner
         .terminate_pod(&old.id)
         .await
         .map_err(|e| anyhow::anyhow!("terminating {old_name}: {}", arena_core::lock::explain(&old_name, &e)))?;
     println!("✓ Terminated {old_name}. Migration of {canonical} complete.");
+    remove_staging_for(&std::env::temp_dir(), &old.id);
     Ok(())
 }
 
@@ -8384,13 +9189,14 @@ async fn handle_migrate_status(cfg: &Config, target: &str) -> Result<()> {
 async fn handle_replace(
     // How we reach pods: `SshRemote` for real, `FakeRemote` in tests.
     remote: Arc<dyn Remote>,
+    // The fleet (every configured provider), for the proxy sync.
+    fleet: &dyn Provider,
     cfg: &Config,
     target: &str,
     ov: &SpecOverrides,
-    keep_old: bool,
-    skip_proxy: bool,
-    dry_run: bool,
-    yes: bool,
+    place: &PlaceFlags,
+    opts: ReplaceOpts,
+    interrupt: &Interrupt,
 ) -> Result<()> {
     // Setup runs after the create (step 3/7): a malformed SETUP_TIMEOUT_SECS must fail
     // now, before anything is created (and billed) — not after the new pod has come up,
@@ -8400,8 +9206,8 @@ async fn handle_replace(
     // name or a raw id, so read the canonical name back from the fleet rather than trusting
     // the argument (a user may pass an id).
     let (owner, src_id, src_label) = resolve_target_any(cfg, target).await?;
-    let opts = ReplaceOpts { keep_old, skip_proxy, dry_run, yes };
-    replace_on(remote, cfg, owner.as_ref(), src_id, src_label, setup_timeouts, ov, opts).await
+    let job = ReplaceJob { setup_timeouts, ov, place, opts, interrupt, keys_dir: KEYS_DIR };
+    replace_on(remote, fleet, cfg, owner.as_ref(), src_id, src_label, job).await
 }
 
 /// `pods replace`'s switches, passed through to [`replace_on`] as one value.
@@ -8413,25 +9219,35 @@ struct ReplaceOpts {
     yes: bool,
 }
 
+/// Everything [`replace_on`] needs besides the pods and providers.
+struct ReplaceJob<'a> {
+    setup_timeouts: arena_core::setup::SetupTimeouts,
+    ov: &'a SpecOverrides,
+    place: &'a PlaceFlags,
+    opts: ReplaceOpts,
+    interrupt: &'a Interrupt,
+    /// Where the per-host API-key CSVs live (`KEYS_DIR`; a temp dir in tests).
+    keys_dir: &'a str,
+}
+
 /// [`handle_replace`] once the source pod (`src_id`) and the backend that owns it are
 /// known — the seam tests drive with a fake owner.
-#[allow(clippy::too_many_arguments)]
 async fn replace_on(
     remote: Arc<dyn Remote>,
+    fleet: &dyn Provider,
     cfg: &Config,
     owner: &dyn Provider,
     src_id: String,
     src_label: String,
-    setup_timeouts: arena_core::setup::SetupTimeouts,
-    ov: &SpecOverrides,
-    opts: ReplaceOpts,
+    job: ReplaceJob<'_>,
 ) -> Result<()> {
-    let ReplaceOpts { keep_old, skip_proxy, dry_run, yes } = opts;
+    let ReplaceOpts { keep_old, skip_proxy, dry_run, yes } = job.opts;
     let pods = owner.list_pods().await.context("listing pods for replace")?;
     let src = pods
         .iter()
         .find(|p| p.id == src_id)
-        .ok_or_else(|| anyhow::anyhow!("source pod {src_label} vanished while planning"))?;
+        .ok_or_else(|| anyhow::anyhow!("source pod {src_label} vanished while planning"))?
+        .clone();
     let canonical = src.name.clone();
     if canonical.ends_with("-new") || canonical.ends_with("-old") {
         anyhow::bail!(
@@ -8441,13 +9257,13 @@ async fn replace_on(
     }
     let (new_name, old_name) = replace_stage_names(&canonical);
     // Replace renames the pod and (unless --keep-old) terminates it: a locked one is refused
-    // before anything is read or created.
-    let locked = arena_core::lock::refusal("replace", &[src], LOCKED_REPLACEMENT_NOTE);
+    // before anything is read or created — never unlocked here.
+    let locked = arena_core::lock::refusal("replace", &[&src], LOCKED_REPLACEMENT_NOTE);
     if let (Some(r), false) = (&locked, dry_run) {
         anyhow::bail!("{r}");
     }
 
-    let spec = build_replacement_spec(cfg, owner, &src_id, &src_label, ov).await?;
+    let rep = plan_replacement(cfg, owner, &src, job.ov, job.place).await?;
 
     // Pre-flight: a leftover -new/-old from a prior aborted run is a resume signal, not a
     // fresh start — flag it so the operator cleans up rather than colliding.
@@ -8463,17 +9279,14 @@ async fn replace_on(
 
     // Print the plan.
     println!("Replace {canonical}  (id={src_id}, {})", owner.name());
-    println!("  target spec: {}", owner.describe(&spec));
-    if let Some(line) = extra_keys_line(&spec) {
-        println!("               {line}");
-    }
+    print_replacement_plan(owner, &rep, &new_name);
     println!("  pipeline:");
-    println!("    1. create   {new_name}   ({})", owner.describe(&spec));
-    println!("    2. setup    {new_name}   (deploy key, ssh config, repo, ~/.name={canonical})");
-    println!("    3. copy     {canonical} -> {new_name}   (home dir, pod-to-pod rsync)");
-    println!("    4. verify   {new_name}   (ssh health check + copied-size sanity)");
+    println!("    1. create   {new_name}");
+    println!("    2. setup    {new_name}   (deploy key, ssh config, repo, ~/.name={} until the swap)", short_of(cfg, &new_name));
+    println!("    3. copy     {canonical} -> {new_name}   ({})", copy_scope_line());
+    println!("    4. verify   {new_name}   (the copy read back on the right pod, ssh + GPU health check, maintenance window)");
     println!(
-        "    5. swap     rename {canonical} -> {old_name}, then {new_name} -> {canonical}"
+        "    5. swap     rename {canonical} -> {old_name}, then {new_name} -> {canonical} (+ ~/.name, API keys under {canonical})"
     );
     if skip_proxy {
         println!("    6. proxy    SKIPPED (--skip-proxy) — run `arena proxy apply` yourself");
@@ -8483,7 +9296,7 @@ async fn replace_on(
     if keep_old {
         println!("    7. cleanup  keep {old_name} (--keep-old) — terminate it yourself once happy");
     } else {
-        println!("    7. cleanup  terminate {old_name} after the swap verifies");
+        println!("    7. cleanup  terminate {old_name} once the proxy routes {canonical} to the new pod");
     }
 
     if dry_run {
@@ -8502,6 +9315,9 @@ async fn replace_on(
              before running again (`arena pods terminate <name>`)"
         );
     }
+    if rep.plan.options.is_empty() {
+        anyhow::bail!("nothing to create: no option left to try (see the table above, or `arena offers`)");
+    }
     if !confirm(
         yes,
         &format!(
@@ -8516,14 +9332,10 @@ async fn replace_on(
 
     let policy = arena_core::retry::RetryPolicy::default();
 
-    // [1/7] create the replacement under the staging name.
-    let mut new_spec = spec.clone();
-    new_spec.name = new_name.clone();
-    new_spec.env.push(("MACHINE_NAME".to_string(), new_name.clone()));
-    println!("[1/7] creating {new_name} ({})…", owner.describe(&new_spec));
-    let created = arena_core::retry::retrying(&policy, || owner.create_pod(&new_spec))
-        .await
-        .with_context(|| format!("creating {new_name}"))?;
+    // [1/7] create the replacement under the staging name — on the first option with
+    // capacity (several with a --gpu/--cloud list), retried while --retry-mins allows.
+    println!("[1/7] creating {new_name}…");
+    let created = create_replacement(owner, &rep, &new_name, job.place, job.interrupt).await?;
     println!("      created {new_name} id={}", created.id);
 
     // [2/7] wait for an SSH endpoint, then for it to STABILIZE. A freshly-created pod's
@@ -8546,14 +9358,15 @@ async fn replace_on(
     let copy_attempts = 3;
     let mut persisted = false;
     for attempt in 1..=copy_attempts {
-        println!("[3/7] provisioning {new_name}… (attempt {attempt}/{copy_attempts})");
+        println!("[3/7] provisioning {new_name}… (attempt {attempt}/{copy_attempts}; its per-host API keys follow at the swap)");
         // By id (a fresh listing each attempt, for the current endpoint): the pod we made.
         let new = just_these(owner, std::slice::from_ref(&created.id)).await?;
-        handle_setup(remote.clone(), cfg, true, false, None, None, false, false, setup_timeouts, &new, KEYS_DIR, Some(owner))
+        handle_setup(remote.clone(), cfg, true, false, None, None, false, false, job.setup_timeouts, &new, job.keys_dir, Some(owner))
             .await
             .with_context(|| format!("provisioning {new_name}"))?;
-        println!("[4/7] copying {canonical} → {new_name} (excludes caches, HF models, .claude, .ssh, shell-rc keys)…");
-        copy_pod_files(cfg, owner, remote.as_ref(), &src_id, &created.id)
+        println!("[4/7] copying {canonical} → {new_name} ({})…", copy_scope_line());
+        // A pod made for this replace: its copy baseline starts now.
+        copy_pod_files(cfg, owner, remote.as_ref(), &src_id, &created.id, &CopyOpts::new(true))
             .await
             .with_context(|| replace_copy_failed(&canonical, &new_name))?;
         println!("[5/7] confirming the copy persists (~90s — pods can reset while still settling)…");
@@ -8579,13 +9392,23 @@ async fn replace_on(
     verify_replacement(owner, remote.as_ref(), &created.id, cfg)
         .await
         .with_context(|| format!("verifying {new_name}"))?;
+    // A host going into maintenance will stop the new pod (wiping it): say so before the
+    // swap, and keep the original rather than terminate it.
+    let maintenance = maintenance_window(owner, &created.id).await;
+    if let Some(w) = &maintenance {
+        eprintln!(
+            "      ⚠ {new_name}'s host has a scheduled maintenance window ({w}): the provider will stop it \
+             then, wiping its container disk. {old_name} will be KEPT after the swap."
+        );
+    }
 
     // Manual gate: nothing destructive has happened yet. A "no" leaves the built+copied
     // replacement in place under its staging name for inspection.
+    let warn = maintenance.as_ref().map(|w| format!(" ⚠ Its host has a maintenance window ({w}).")).unwrap_or_default();
     if !confirm(
         yes,
         &format!(
-            "{new_name} is built, copied and verified. Swap it in as {canonical} now? \
+            "{new_name} is built, copied and verified.{warn} Swap it in as {canonical} now? \
              (renames {canonical} -> {old_name}, then {new_name} -> {canonical})"
         ),
     )? {
@@ -8614,42 +9437,22 @@ async fn replace_on(
         });
     }
     println!("      {new_name} -> {canonical}");
-    // Make the promoted pod's `~/.name` match its new (canonical) name. The copy overwrote
-    // whatever setup wrote (with the *source's* file), so re-assert it here — in the same
-    // `export MACHINE_NAME='<short>'` form setup uses, so the rest of the tooling reads it
-    // consistently. Re-resolve the endpoint first (it can churn) and warn (don't swallow) on
-    // failure, since a wrong `~/.name` mislabels the pod in backups/metrics.
-    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
-    let short = canonical.strip_prefix(&format!("{prefix}-")).unwrap_or(&canonical);
-    let dotname = format!("export MACHINE_NAME='{short}'");
-    let name_cmd = format!("printf %s {} > \"$HOME/.name\"", shell_quote(&dotname));
-    let name_written = match wait_for_endpoint(owner, &created.id, 60).await {
-        Ok(p) => match SshTarget::from_pod(&p, cfg) {
-            Ok(t) => remote.exec(&t, &name_cmd, Some(PROBE_TIMEOUT)).await.map(|o| o.success).unwrap_or(false),
-            Err(_) => false,
-        },
-        Err(_) => false,
-    };
-    if !name_written {
-        eprintln!(
-            "      warning: couldn't update ~/.name on {canonical} — set it later with \
-             `arena pods setup {canonical}` (or `echo \"{dotname}\" > ~/.name` on the pod)."
-        );
-    }
+    after_swap(remote.clone(), cfg, owner, &canonical, &created.id, &new_name, &old_name, &src_id, job.keys_dir).await;
 
     // [7/7] proxy + cleanup.
-    let blocker = if skip_proxy {
+    let mut blocker = if skip_proxy {
         println!("[7/7] proxy skipped (--skip-proxy) — run `arena proxy apply` to repoint nginx.");
         None
     } else {
         println!("[7/7] re-pointing proxy…");
         // Fleet-wide (not just `owner`'s pods): a single-provider list here used to drop
         // every other provider's forwards, and a failed list (`unwrap_or_default`) all of them.
-        let sync = sync_proxy_via(cfg, owner, "replace").await;
-        let proxied = arena_core::proxy::ProxyConfig::from_config(cfg).is_ok()
-            && cfg.machine_names.iter().any(|m| arena_core::naming::qualify(prefix, m) == canonical);
-        replace_cleanup_blocker(&sync, proxied, &canonical, owner.name(), &created.id)
+        let sync = sync_proxy(cfg, fleet, "replace").await;
+        replace_cleanup_blocker(&sync, proxied_name(cfg, &canonical), &canonical, owner.name(), &created.id)
     };
+    if let (None, Some(w)) = (&blocker, &maintenance) {
+        blocker = Some(format!("the new pod's host has a maintenance window ({w}) — keep the original until it's past"));
+    }
     if keep_old {
         println!(
             "done — {canonical} is the fresh pod. {old_name} kept (--keep-old); terminate it with \
@@ -8657,9 +9460,8 @@ async fn replace_on(
         );
     } else if let Some(why) = blocker {
         eprintln!(
-            "{canonical} is the fresh pod, but {old_name} is NOT terminated: {why}. Its stable port \
-             would point at a dead pod. Once `arena proxy apply` routes {canonical} to the new pod, \
-             remove it with `arena pods terminate {old_name}`."
+            "{canonical} is the fresh pod, but {old_name} is NOT terminated: {why}. Once {canonical} is safely \
+             on the new pod (`arena proxy apply` routes it there), remove it with `arena pods terminate {old_name}`."
         );
     } else {
         println!("terminating parked {old_name}…");
@@ -8667,6 +9469,7 @@ async fn replace_on(
             eprintln!("      couldn't terminate {old_name}: {} — remove it manually.", arena_core::lock::explain(&old_name, &e));
         } else {
             println!("done — {canonical} replaced; {old_name} terminated.");
+            remove_staging_for(&std::env::temp_dir(), &src_id);
         }
     }
     Ok(())
@@ -8716,7 +9519,8 @@ async fn wait_for_endpoint(
     timeout_secs: u64,
 ) -> Result<arena_core::Pod> {
     let policy = arena_core::retry::RetryPolicy::default();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    // tokio's clock (the real one in production): paused-clock tests run these waits instantly.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {
         let pods =
             arena_core::retry::retrying(&policy, || provider.list_pods()).await.unwrap_or_default();
@@ -8725,7 +9529,7 @@ async fn wait_for_endpoint(
                 return Ok(p);
             }
         }
-        if std::time::Instant::now() >= deadline {
+        if tokio::time::Instant::now() >= deadline {
             anyhow::bail!("timed out after {timeout_secs}s");
         }
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -8833,9 +9637,10 @@ async fn wait_for_stable_endpoint_every(
     poll: Duration,
 ) -> Result<arena_core::Pod> {
     let policy = arena_core::retry::RetryPolicy::default();
-    let start = std::time::Instant::now();
+    // tokio's clock (the real one in production): paused-clock tests run these waits instantly.
+    let start = tokio::time::Instant::now();
     let mut last: Option<(String, u16)> = None;
-    let mut stable_since = std::time::Instant::now();
+    let mut stable_since = tokio::time::Instant::now();
     let mut latest: Option<arena_core::Pod> = None;
     loop {
         let pods =
@@ -8847,14 +9652,14 @@ async fn wait_for_stable_endpoint_every(
             Some(cur) => {
                 if last.as_ref() != Some(&cur) {
                     last = Some(cur);
-                    stable_since = std::time::Instant::now();
+                    stable_since = tokio::time::Instant::now();
                 } else if stable_since.elapsed().as_secs() >= stable_secs {
                     return Ok(latest.unwrap());
                 }
             }
             None => {
                 last = None;
-                stable_since = std::time::Instant::now();
+                stable_since = tokio::time::Instant::now();
             }
         }
         if start.elapsed().as_secs() >= timeout_secs {
@@ -8878,25 +9683,104 @@ fn replace_copy_failed(canonical: &str, new_name: &str) -> String {
     )
 }
 
-/// Copy the source pod's home onto the destination pod for a replace. Tries a **direct**
-/// pod-to-pod rsync (run on the source, pushing to the dest endpoint with the deploy key
-/// both pods hold); on any failure falls back to **via-local** (pull the source home into a
-/// control-side staging dir, then push it up to the dest). Both use the replication exclude
-/// set (caches, HF models, `.claude`, `.ssh`), and both carry the ARENA repo as its tree
-/// (`arena_core::volume::pod_to_pod_copy` / `push_jobs`): on a pod with a volume the repo is
-/// a link onto /workspace, and copying the link alone would leave the work behind.
+/// How [`copy_pod_files`] runs: whether the destination is a pod this command just created
+/// (its replica baseline starts now — [`arena_core::replica::baseline_command`]) and, so
+/// tests can drive the via-local copy with the real rsync, which rsync runs and where its
+/// staging dir goes.
+struct CopyOpts {
+    fresh: bool,
+    rsync: String,
+    stage_root: PathBuf,
+}
+
+impl CopyOpts {
+    fn new(fresh: bool) -> Self {
+        Self { fresh, rsync: RSYNC.to_string(), stage_root: std::env::temp_dir() }
+    }
+}
+
+/// The via-local copy's staging dir for source pod `src_id` under `root`.
+fn staging_dir(root: &std::path::Path, src_id: &str) -> PathBuf {
+    root.join(format!("arena-replace-{src_id}"))
+}
+
+/// Remove a leftover via-local staging copy of `src_id` (the participant's whole home), once
+/// it can't be needed again: the source pod is gone. Says so when there was one.
+fn remove_staging_for(root: &std::path::Path, src_id: &str) {
+    let stage = staging_dir(root, src_id);
+    if stage.exists() {
+        let size = arena_core::pull::human_bytes(local_size(&stage));
+        match std::fs::remove_dir_all(&stage) {
+            Ok(()) => println!("      removed the leftover local staging copy {} ({size})", stage.display()),
+            Err(e) => eprintln!("      warning: couldn't remove the local staging copy {} ({size}): {e}", stage.display()),
+        }
+    }
+}
+
+/// Whether `dir` holds any file (at any depth; links not followed) — a staging dir with none
+/// has nothing worth keeping.
+fn holds_files(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries.flatten().any(|e| match e.file_type() {
+            Ok(t) if t.is_dir() => holds_files(&e.path()),
+            Ok(_) => true,
+            Err(_) => true,
+        })
+    })
+}
+
+/// The last non-empty stderr line of a failed command, clipped — what a fallback's note
+/// quotes as the reason.
+fn last_line(stderr: &str) -> String {
+    let line = stderr.lines().rev().map(str::trim).find(|l| !l.is_empty()).unwrap_or("no error output");
+    if line.chars().count() > 160 {
+        format!("{}…", line.chars().take(159).collect::<String>())
+    } else {
+        line.to_string()
+    }
+}
+
+/// Copy the source pod's home onto the destination pod (`replace`, `migrate copy` /
+/// `cutover`). Tries a **direct** pod-to-pod rsync (run on the source, pushing to the dest
+/// endpoint with the deploy key both pods hold); on failure falls back to **via-local** (pull
+/// the source home into a control-side staging dir, then push it up to the dest). Both use
+/// the replication filters (`arena_core::pull::PullConfig::replication`: caches, HF models,
+/// `.claude`, `.ssh`, shell rc files, `~/.name` stay behind), and both carry the ARENA repo as
+/// its tree (`arena_core::volume::pod_to_pod_copy` / `push_jobs`): on a pod with a volume the
+/// repo is a link onto /workspace, and copying the link alone would leave the work behind.
 ///
-/// Two correctness guards, both learned the hard way against churning pods:
-/// 1. **Fresh endpoints per transfer** — `src`/`dest` SSH ip:port are re-resolved
+/// The copy is a REPLICA ([`arena_core::replica`]): a file deleted on the source is deleted
+/// on the destination too (live finding #20), but whatever the sync overwrites or deletes on
+/// the destination is moved aside there, never destroyed — the destination may hold work of
+/// its own (live finding #7: a cutover, work, a revert, then a copy that overwrote it). After
+/// the sync the destination sorts what was moved: copies of what an earlier sync put there
+/// go, files changed on the destination since are KEPT and listed. Never `--delete` on the
+/// source, which is only read, nor on any backup.
+///
+/// Correctness guards, learned the hard way against churning pods:
+/// 1. **The source must be up** — a stopped source is said as such (not as a "reassigned
+///    endpoint", which read as "re-run" — live finding #16), and an endpoint that doesn't
+///    answer as that pod is refused (a recycled ip:port would copy a STRANGER's home).
+/// 2. **Fresh endpoints per transfer** — `src`/`dest` SSH ip:port are re-resolved
 ///    immediately before each rsync. An endpoint captured before a multi-GB pull can go
 ///    stale mid-pull, sending the push to a since-reassigned port (which silently delivers
 ///    nothing).
-/// 2. **Delivery is verified, not assumed** — a marker is planted on the source, carried by
+/// 3. **Delivery is verified, not assumed** — a marker is planted on the source, carried by
 ///    the copy, and read back from a freshly-resolved dest. A push that "succeeded" against
 ///    a stale endpoint fails this check, so we never swap in a pod that didn't get the data.
 ///
+/// The direct copy is skipped when both pods share a public IP — a pod can't reach its
+/// neighbour through it, and the hairpin connect just hangs (live finding #30) — and its
+/// ssh gives up connecting after seconds; when it fails, the reason printed is its own.
+///
+/// The via-local copy checks first (an rsync dry run) that the staging fits on the local
+/// disk with room to spare — this box is shared with the live cohort — keeps the stage
+/// private (0700: it is a participant's home), and removes it once the copy has landed; a
+/// failed copy keeps it (a re-run continues from it), saying where and how big (live
+/// finding #13: 3.1 GB per pod was left in /tmp, forever).
+///
 /// The probes and the direct copy go through `remote`, each with a budget (the copy gets
-/// [`POD_COPY_TIMEOUT`]). The via-local fallback spawns `rsync` itself ([`CopyLeg`], the same
+/// [`POD_COPY_TIMEOUT`]). The via-local legs spawn `rsync` itself ([`CopyLeg`], the same
 /// budget per leg): rsync runs its own ssh transport, which is neither a `Remote` exec nor a copy.
 async fn copy_pod_files(
     cfg: &Config,
@@ -8904,10 +9788,11 @@ async fn copy_pod_files(
     remote: &dyn Remote,
     src_id: &str,
     dest_id: &str,
+    opts: &CopyOpts,
 ) -> Result<()> {
-    use arena_core::pull::{self, PullConfig};
+    use arena_core::pull::{self, Mirror, PullConfig};
+    use arena_core::replica::{self, SettleMode};
     use arena_core::volume;
-    let pc = PullConfig::replication();
     let remote_key = cfg.get("GIT_SSH_KEY_REMOTE").unwrap_or("/root/.ssh/id_ed25519").to_string();
     let user = cfg.get("SSH_USER").unwrap_or("root").to_string();
     // The repo's place in the home, carried as a TREE: on a pod with a volume it is a link
@@ -8916,6 +9801,12 @@ async fn copy_pod_files(
     let repo = arena_core::backup::repo_path(cfg);
     let rel = volume::repo_pull(&repo, &user, None).map(|p| p.rel);
 
+    // 1. The source must be up to be read.
+    if let Ok(listed) = provider.list_pods().await {
+        if let Some(p) = listed.iter().find(|p| p.id == src_id).filter(|p| arena_core::status::is_stopped(&p.status)) {
+            anyhow::bail!("the source {} is stopped ({}) — there is nothing running to sync from", p.name, p.status);
+        }
+    }
     // Plant a delivery marker on the source (a dotfile the copy carries, not matched by any
     // exclude). It's verified on the dest after the copy; the dest copy is left in place for
     // the caller's persistence re-check (then cleaned up there). Source copy is cleaned here.
@@ -8927,8 +9818,8 @@ async fn copy_pod_files(
     // marker check would still pass, since the marker rides along). Fail closed.
     if !target_is_pod(remote, &src_target, src_id, provider).await {
         anyhow::bail!(
-            "source {src_id}'s SSH endpoint doesn't resolve to that pod (its ip:port was likely \
-             reassigned to a different pod) — refusing to copy from the wrong pod. Re-run."
+            "the source {src_id}'s SSH endpoint doesn't answer as that pod (it's down, or its ip:port was \
+             reassigned to another pod) — refusing to copy from it"
         );
     }
     let unmark = format!("rm -f \"{marker}\"");
@@ -8937,82 +9828,175 @@ async fn copy_pod_files(
         .await
         .context("planting copy marker on source")?;
 
-    // --- direct attempt: rsync ON the source, pushing to the dest's fresh endpoint ---
+    // A pod made for this copy: what's on it now is image + setup — the replica baseline.
     let dest_pod = wait_for_endpoint(provider, dest_id, 120).await.context("resolving dest endpoint")?;
-    let direct = volume::pod_to_pod_copy(
-        dest_pod.ssh_ip.as_deref().unwrap_or_default(),
-        dest_pod.ssh_port.unwrap_or(22),
-        &user,
-        &remote_key,
-        &pc,
-        rel.as_deref(),
-    );
-    let direct_ok = match remote.exec(&src_target, &direct, Some(POD_COPY_TIMEOUT)).await {
-        Ok(o) => o.success,
-        // A copy that ran out of its budget was under way (a missing pod-to-pod key fails at
-        // once), so the via-local fallback would only repeat it, slower: stop here instead.
-        // Nothing has been swapped, and rsync is incremental — copying onto the SAME dest
-        // again continues from here. How to do that depends on the caller (`migrate copy`
-        // re-uses `-new`; `replace` refuses while it exists), so the caller says it.
-        Err(e @ arena_core::Error::Timeout { .. }) => {
-            let _ = remote.exec(&src_target, &unmark, Some(PROBE_TIMEOUT)).await;
-            anyhow::bail!(
-                "direct pod-to-pod copy {} — NOT swapping; the original is untouched. What was \
-                 copied stays on the new pod: copying onto it again continues from there.",
-                describe_error(&e)
-            );
+    if opts.fresh {
+        if let Ok(t) = SshTarget::from_pod(&dest_pod, cfg) {
+            let _ = remote.exec(&t, &replica::baseline_command(), Some(PROBE_TIMEOUT)).await;
         }
-        Err(_) => false,
-    };
-    if direct_ok {
-        println!("      copied (direct pod-to-pod)");
-    } else {
-        eprintln!("      direct copy unavailable (source lacks pod-to-pod key) — using via-local staging…");
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let stamp = replica::sync_stamp(now);
+    let pc = PullConfig { mirror: replica::home_mirror(&stamp), ..PullConfig::replication() };
+
+    let transfer = async {
+        // --- direct attempt: rsync ON the source, pushing to the dest's fresh endpoint ---
+        let dest_ip = dest_pod.ssh_ip.clone().unwrap_or_default();
+        let direct_ok = if dest_ip == src_target.host {
+            eprintln!(
+                "      both pods are behind {dest_ip} — a pod can't reach its neighbour through their shared IP, \
+                 so copying via local staging…"
+            );
+            false
+        } else {
+            let direct = volume::pod_to_pod_copy(&dest_ip, dest_pod.ssh_port.unwrap_or(22), &user, &remote_key, &pc, rel.as_deref());
+            match remote.exec(&src_target, &direct, Some(POD_COPY_TIMEOUT)).await {
+                Ok(o) if o.success => true,
+                Ok(o) => {
+                    eprintln!("      direct pod-to-pod copy failed ({}) — copying via local staging…", last_line(&o.stderr));
+                    false
+                }
+                // A copy that ran out of its budget was under way (a missing pod-to-pod key fails at
+                // once), so the via-local fallback would only repeat it, slower: stop here instead.
+                // Nothing has been swapped, and rsync is incremental — copying onto the SAME dest
+                // again continues from here. How to do that depends on the caller (`migrate copy`
+                // re-uses `-new`; `replace` refuses while it exists), so the caller says it.
+                Err(e @ arena_core::Error::Timeout { .. }) => anyhow::bail!(
+                    "direct pod-to-pod copy {} — NOT swapping; the original is untouched. What was \
+                     copied stays on the new pod: copying onto it again continues from there.",
+                    describe_error(&e)
+                ),
+                Err(e) => {
+                    eprintln!("      direct pod-to-pod copy couldn't run ({}) — copying via local staging…", describe_error(&e));
+                    false
+                }
+            }
+        };
+        if direct_ok {
+            println!("      copied (direct pod-to-pod)");
+            return Ok(());
+        }
         // pull source -> staging (fresh source), then push staging -> dest (FRESH dest, right
         // before the push — this is the endpoint most likely to have gone stale during the pull).
-        let stage = std::env::temp_dir().join(format!("arena-replace-{src_id}"));
-        std::fs::create_dir_all(&stage)
-            .with_context(|| format!("creating staging dir {}", stage.display()))?;
-        let stage_s = format!("{}/", stage.to_string_lossy());
-        let src_target = fresh_target(provider, src_id, cfg).await?;
-        if !target_is_pod(remote, &src_target, src_id, provider).await {
-            anyhow::bail!(
-                "source {src_id}'s endpoint resolved to a different pod before the pull — \
-                 refusing to copy the wrong pod's data. Re-run."
-            );
+        let stage = staging_dir(&opts.stage_root, src_id);
+        std::fs::create_dir_all(&stage).with_context(|| format!("creating staging dir {}", stage.display()))?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("making the staging dir {} private", stage.display()))?;
         }
-        // Where the source's repo really is (read-only, bounded): a link is pulled as its tree,
-        // into its place in the staging dir — as `pods pull` does.
-        let probe = match remote.exec(&src_target, &volume::probe_command(&repo), Some(PROBE_TIMEOUT)).await {
-            Ok(out) if out.success => volume::parse_probe(&out.stdout),
-            _ => None,
+        let stage_s = format!("{}/", stage.to_string_lossy());
+        let kept_note = |stage: &std::path::Path| {
+            format!(
+                "the local staging copy is kept at {} ({}) so a re-run continues from it — `rm -rf {}` if you won't re-run",
+                stage.display(),
+                arena_core::pull::human_bytes(local_size(stage)),
+                stage.display()
+            )
         };
-        // Each leg's rsyncs (the home, then a split-out repo) share the leg's one budget.
-        let leg = CopyLeg::start(POD_COPY_TIMEOUT);
-        for job in volume::pull_jobs(&pc, &stage_s, volume::repo_pull(&repo, &user, probe.as_ref()).as_ref()) {
-            if job.repo {
+        let staged = async {
+            let src_target = fresh_target(provider, src_id, cfg).await?;
+            if !target_is_pod(remote, &src_target, src_id, provider).await {
+                anyhow::bail!(
+                    "the source {src_id}'s endpoint answered as a different pod before the pull — refusing to copy \
+                     the wrong pod's data. Re-run."
+                );
+            }
+            // Where the source's repo really is (read-only, bounded): a link is pulled as its tree,
+            // into its place in the staging dir — as `pods pull` does. The stage is the tool's own
+            // scratch copy: an exact mirror, so nothing deleted on the source rides back through it.
+            let probe = match remote.exec(&src_target, &volume::probe_command(&repo), Some(PROBE_TIMEOUT)).await {
+                Ok(out) if out.success => volume::parse_probe(&out.stdout),
+                _ => None,
+            };
+            let staging_pc = PullConfig { mirror: Mirror::Exact, ..PullConfig::replication() };
+            let jobs = volume::pull_jobs(&staging_pc, &stage_s, volume::repo_pull(&repo, &user, probe.as_ref()).as_ref());
+            // Room first: what the pull would add to the stage (an rsync dry run), against the
+            // free space this shared disk must keep.
+            let mut needed = 0u64;
+            for job in &jobs {
+                let mut args = pull::rsync_args(&src_target, &job.config, &job.dest);
+                args.insert(0, "--dry-run".into());
+                let out = arena_core::remote::run_local(&opts.rsync, &args, "rsync", Some(POD_COPY_TIMEOUT))
+                    .await
+                    .context("sizing the local staging (rsync --dry-run)")?;
+                if !out.success {
+                    anyhow::bail!("sizing the local staging (rsync --dry-run) failed: {}", out.stderr.trim());
+                }
+                needed += arena_core::replica::transfer_bytes(&out.stdout)
+                    .ok_or_else(|| anyhow::anyhow!("sizing the local staging: rsync --dry-run reported no size"))?;
+            }
+            let (free, total) = arena_core::replica::disk_space(&opts.stage_root)
+                .ok_or_else(|| anyhow::anyhow!("can't read the free space of {}", opts.stage_root.display()))?;
+            arena_core::replica::staging_room(needed, free, total).map_err(|why| {
+                anyhow::anyhow!(
+                    "not copying via local staging: {why} ({}). Free space there, or point TMPDIR at a bigger disk.",
+                    opts.stage_root.display()
+                )
+            })?;
+            for job in jobs.iter().filter(|j| j.repo) {
                 clear_stale_link(&job.dest).with_context(|| format!("clearing an old link at {}", job.dest))?;
                 std::fs::create_dir_all(&job.dest).with_context(|| format!("creating {}", job.dest))?;
             }
-            leg.rsync(RSYNC, &pull::rsync_args(&src_target, &job.config, &job.dest))
-                .await
-                .context("pull source -> staging")?;
+            // Each leg's rsyncs (the home, then a split-out repo) share the leg's one budget.
+            let leg = CopyLeg::start(POD_COPY_TIMEOUT);
+            for job in &jobs {
+                leg.rsync(&opts.rsync, &pull::rsync_args(&src_target, &job.config, &job.dest))
+                    .await
+                    .context("pull source -> staging")?;
+            }
+            let dest_target = fresh_target(provider, dest_id, cfg).await?;
+            let staged_repo = rel.as_ref().is_some_and(|r| std::fs::symlink_metadata(stage.join(r)).is_ok_and(|m| m.is_dir()));
+            let leg = CopyLeg::start(POD_COPY_TIMEOUT);
+            for (src, pc) in volume::push_jobs(&pc, &stage_s, rel.as_deref(), staged_repo) {
+                leg.rsync(&opts.rsync, &pull::push_rsync_args(&dest_target, &pc, &src)).await.context("push staging -> dest")?;
+            }
+            anyhow::Ok(())
         }
-        let dest_target = fresh_target(provider, dest_id, cfg).await?;
-        let staged_repo = rel.as_ref().is_some_and(|r| std::fs::symlink_metadata(stage.join(r)).is_ok_and(|m| m.is_dir()));
-        let leg = CopyLeg::start(POD_COPY_TIMEOUT);
-        for (src, pc) in volume::push_jobs(&pc, &stage_s, rel.as_deref(), staged_repo) {
-            leg.rsync(RSYNC, &pull::push_rsync_args(&dest_target, &pc, &src)).await.context("push staging -> dest")?;
+        .await;
+        match staged {
+            Ok(()) => {
+                let size = arena_core::pull::human_bytes(local_size(&stage));
+                match std::fs::remove_dir_all(&stage) {
+                    Ok(()) => println!("      copied (via local staging; the staging copy, {size}, is removed)"),
+                    Err(e) => eprintln!("      copied via local staging, but couldn't remove {} ({size}): {e}", stage.display()),
+                }
+                Ok(())
+            }
+            // Nothing staged (refused before the pull, or it failed at once): no copy to keep.
+            Err(e) if !holds_files(&stage) => {
+                let _ = std::fs::remove_dir_all(&stage);
+                Err(e)
+            }
+            Err(e) => Err(e.context(kept_note(&stage))),
         }
-        println!("      copied (via local staging {})", stage.display());
     }
+    .await;
 
     // Verify the data actually landed on the RIGHT pod (identity + marker). `marker_present`
     // re-resolves the endpoint fresh and confirms `RUNPOD_POD_ID` matches, so a push that
     // "succeeded" against a since-reassigned port (a different pod) is caught.
-    let landed = marker_present(provider, remote, dest_id, cfg).await;
+    let landed = transfer.is_ok() && marker_present(provider, remote, dest_id, cfg).await;
     // Clean the SOURCE marker now; leave the DEST marker for the caller's persistence re-check.
     let _ = remote.exec(&src_target, &unmark, Some(PROBE_TIMEOUT)).await;
+    // Sort what the sync moved aside on the destination — always, so even a partial sync's
+    // tidy-up and report happen; only a complete one moves the baseline on.
+    let mode = if landed { SettleMode::Advance } else { SettleMode::Keep };
+    match fresh_target(provider, dest_id, cfg).await {
+        Ok(t) => match remote.exec(&t, &replica::settle_command(&stamp, rel.as_deref(), mode), Some(PROBE_TIMEOUT)).await {
+            Ok(o) if o.success => match replica::parse_settle(&o.stdout) {
+                Some(s) => {
+                    for line in replica::settle_lines(&dest_pod.name, &s) {
+                        eprintln!("      {line}");
+                    }
+                }
+                None => eprintln!("      warning: couldn't read what the sync moved aside on {} (see ~/{}/{stamp} there)", dest_pod.name, replica::REPLACED_DIR),
+            },
+            _ => eprintln!("      warning: couldn't sort what the sync moved aside on {} (it's in ~/{}/{stamp} there)", dest_pod.name, replica::REPLACED_DIR),
+        },
+        Err(_) => eprintln!("      warning: couldn't reach {} to sort what the sync moved aside (~/{}/{stamp})", dest_pod.name, replica::REPLACED_DIR),
+    }
+    transfer?;
     if !landed {
         anyhow::bail!(
             "copy verification failed — the data didn't reach the intended new pod ({dest_id}) \
@@ -9151,6 +10135,40 @@ async fn resolve_target_any(
     Ok((owner, id, label))
 }
 
+/// The line an SSH command prints for a stopped pod it can't reach.
+fn stopped_skip(pod: &arena_core::Pod) -> String {
+    format!("skip {} — stopped ({}); `arena pods start {}` brings it back", pod.name, pod.status, pod.name)
+}
+
+/// How long `run` / `pull` / `backup` wait before asking once more for a running pod the
+/// listing showed without an SSH endpoint ([`refresh_missing_endpoints`]).
+const ENDPOINT_RETRY: Duration = Duration::from_secs(20);
+
+/// A RUNNING pod listed without an SSH endpoint is usually a passing glitch: RunPod v1 once
+/// listed one that way for ~20 s, and `pull` skipped it and exited 1 — so a backup cron tick
+/// silently missed that pod. Ask once more, `wait` later, and fill in the endpoints that
+/// came back (by id). Only RUNNING pods: one still provisioning or stopped has no endpoint
+/// for a reason, and isn't worth the wait. Best-effort: a failed re-list changes nothing.
+async fn refresh_missing_endpoints(provider: &dyn Provider, sel: &mut Selected, wait: Duration) {
+    let missing = |p: &arena_core::Pod| p.status.eq_ignore_ascii_case("RUNNING") && (p.ssh_ip.is_none() || p.ssh_port.is_none());
+    let names: Vec<String> = sel.pods.iter().filter(|p| missing(p)).map(|p| p.name.clone()).collect();
+    if names.is_empty() {
+        return;
+    }
+    eprintln!("{} listed running without an SSH endpoint — asking again in {}s…", names.join(", "), wait.as_secs());
+    tokio::time::sleep(wait).await;
+    let Ok(Ok(fresh)) = tokio::time::timeout(arena_core::provider::LIST_TIMEOUT, provider.list_pods()).await else {
+        return;
+    };
+    for pod in sel.pods.iter_mut().filter(|p| missing(p)) {
+        if let Some(now) = fresh.iter().find(|f| f.id == pod.id && f.ssh_ip.is_some() && f.ssh_port.is_some()) {
+            pod.ssh_ip = now.ssh_ip.clone();
+            pod.ssh_port = now.ssh_port;
+            eprintln!("  {} has an endpoint now", pod.name);
+        }
+    }
+}
+
 /// What a fleet command does when the operator names no pods (no targets, no `--all`).
 #[derive(Debug, Clone, Copy)]
 enum Unscoped {
@@ -9187,16 +10205,28 @@ impl Selected {
     /// Every selected pod with an SSH endpoint, with its target, in selection order. A pod
     /// without one is reported (`skip <name> — no SSH endpoint yet`), never silently dropped;
     /// when the operator named pods and *none* is reachable, that's an error — not a quiet
-    /// "nothing to do" that reads like success.
+    /// "nothing to do" that reads like success. A STOPPED pod is skipped saying so, with the
+    /// way back (`pods start`), even if the listing still shows its last endpoint — that
+    /// belongs to nothing now (live finding #15: "no SSH endpoint yet" read like a pod
+    /// still booting).
     fn ssh_targets(&self, cfg: &Config) -> Result<Vec<(&arena_core::Pod, SshTarget)>> {
         let mut targets = Vec::new();
+        let mut stopped = Vec::new();
         for pod in &self.pods {
+            if arena_core::status::is_stopped(&pod.status) {
+                eprintln!("{}", stopped_skip(pod));
+                stopped.push(pod.name.as_str());
+                continue;
+            }
             match SshTarget::from_pod(pod, cfg) {
                 Ok(t) => targets.push((pod, t)),
                 Err(_) => eprintln!("skip {} — no SSH endpoint yet", pod.name),
             }
         }
         if targets.is_empty() && self.named {
+            if stopped.len() == self.pods.len() {
+                anyhow::bail!("the selected pod(s) are stopped ({}) — `arena pods start {}` first", stopped.join(", "), stopped.join(" "));
+            }
             anyhow::bail!("none of the selected pods ({}) has an SSH endpoint yet — check `arena pods list`", self.names());
         }
         Ok(targets)
@@ -10719,7 +11749,7 @@ async fn handle_ssh_config(
 /// provider (no network: the configs carry no RUNPOD_API_KEY, so no catalog is fetched).
 #[cfg(test)]
 mod replacement_spec_tests {
-    use super::{build_replacement_spec, gpu_flag_or_warning, SpecOverrides};
+    use super::{build_replacement_spec, gpu_flag_or_warning, gpu_id_from_listing, plan_replacement, PlaceFlags, SpecOverrides};
     use arena_core::provider::runpod::GpuType;
     use arena_core::{Config, Pod, PodSpec, Provider, Result};
     use async_trait::async_trait;
@@ -10783,6 +11813,11 @@ mod replacement_spec_tests {
         ))
     }
 
+    /// The source pod as the owner lists it.
+    fn src() -> Pod {
+        Pod { id: "id-1".into(), name: "devtest-apple".into(), provider: "runpod".into(), status: "RUNNING".into(), ..Default::default() }
+    }
+
     /// Review finding: the replacement never got `ALLOWED_CUDA_VERSIONS` back (the API
     /// doesn't report it), so a cu130 image could land on a CUDA 12 host.
     #[tokio::test]
@@ -10796,18 +11831,21 @@ mod replacement_spec_tests {
             ("RUNPOD_ALLOWED_CUDA_VERSIONS=13.0\n", vec!["13.0"]), // the legacy key, as create reads it
             ("", vec![]),                                          // unconfigured: any host, as before
         ] {
-            let spec = build_replacement_spec(&cfg(extra), &owner, "id-1", "devtest-apple", &ov).await.unwrap();
+            let (spec, notes) = build_replacement_spec(&cfg(extra), &owner, "id-1", "devtest-apple", None, &ov).await.unwrap();
             assert_eq!(spec.allowed_cuda, want, "{extra:?}");
+            assert!(notes.iter().any(|n| n.starts_with("GPU NVIDIA RTX A4000: config GPU_TYPE")), "{notes:?}");
             assert_eq!((spec.gpu_type.as_str(), spec.disk_gb), ("NVIDIA RTX A4000", 40), "snapshot + config fallback");
         }
         // A snapshot that does carry a constraint keeps it.
         let pinned = Snapshot { name: "runpod", spec: snapshot(&["12.8"]) };
-        let spec = build_replacement_spec(&cfg("ALLOWED_CUDA_VERSIONS=13.0\n"), &pinned, "id-1", "x", &ov).await.unwrap();
+        let (spec, _) = build_replacement_spec(&cfg("ALLOWED_CUDA_VERSIONS=13.0\n"), &pinned, "id-1", "x", None, &ov).await.unwrap();
         assert_eq!(spec.allowed_cuda, ["12.8"]);
-        // --gpu still applies on top (unchecked here: no key → no catalog).
+        // --gpu still applies on top (unchecked here: no key → no catalog) — through the plan.
         let ov = SpecOverrides { gpu: Some("3070".into()), ..Default::default() };
-        let spec = build_replacement_spec(&cfg("ALLOWED_CUDA_VERSIONS=13.0\n"), &owner, "id-1", "x", &ov).await.unwrap();
+        let rep = plan_replacement(&cfg("ALLOWED_CUDA_VERSIONS=13.0\n"), &owner, &src(), &ov, &PlaceFlags::default()).await.unwrap();
+        let spec = rep.first_spec("devtest-apple-new");
         assert_eq!((spec.gpu_type.as_str(), spec.allowed_cuda.clone()), ("NVIDIA GeForce RTX 3070", vec!["13.0".to_string()]));
+        assert!(rep.notes.iter().all(|n| !n.starts_with("GPU ")), "--gpu given: no note on where the GPU came from: {:?}", rep.notes);
     }
 
     /// Config CREATE_EXTRA_JSON reaches a replacement's (and `migrate copy`'s) create like
@@ -10849,9 +11887,9 @@ mod replacement_spec_tests {
         }
         let owner = V2Owner(Snapshot { name: "runpod", spec: snapshot(&[]) });
         let ov = SpecOverrides::default();
-        let spec = build_replacement_spec(&cfg(""), &owner, "id-1", "x", &ov).await.unwrap();
+        let (spec, _) = build_replacement_spec(&cfg(""), &owner, "id-1", "x", None, &ov).await.unwrap();
         assert_eq!((spec.api_extra.as_ref(), super::extra_keys_line(&spec)), (None, None));
-        let spec = build_replacement_spec(&cfg(r#"CREATE_EXTRA_JSON='{"dataCenterIds":["EU-RO-1"],"env":{"A":"hf_x"}}'"#), &owner, "id-1", "x", &ov)
+        let (spec, _) = build_replacement_spec(&cfg(r#"CREATE_EXTRA_JSON='{"dataCenterIds":["EU-RO-1"],"env":{"A":"hf_x"}}'"#), &owner, "id-1", "x", None, &ov)
             .await
             .unwrap();
         assert_eq!(spec.api_extra.as_ref().unwrap()["dataCenterIds"], serde_json::json!(["EU-RO-1"]));
@@ -10863,13 +11901,109 @@ mod replacement_spec_tests {
             (r#"CREATE_EXTRA_JSON='{"gpu":{"id":"x"}}'"#, "`gpu.id` is set by arena"),
             ("CREATE_EXTRA_JSON='nope'", "CREATE_EXTRA_JSON: not valid JSON"),
         ] {
-            let e = build_replacement_spec(&cfg(line), &owner, "id-1", "x", &ov).await.unwrap_err().to_string();
+            let e = build_replacement_spec(&cfg(line), &owner, "id-1", "x", None, &ov).await.unwrap_err().to_string();
             assert!(e.contains(want), "{line}: {e}");
         }
         // The plain snapshot backend merges no extras: refused, not silently dropped.
         let plain = Snapshot { name: "vast", spec: snapshot(&[]) };
-        let e = build_replacement_spec(&cfg(r#"CREATE_EXTRA_JSON='{"price":0.1}'"#), &plain, "id-1", "x", &ov).await.unwrap_err();
+        let e = build_replacement_spec(&cfg(r#"CREATE_EXTRA_JSON='{"price":0.1}'"#), &plain, "id-1", "x", None, &ov).await.unwrap_err();
         assert!(e.to_string().contains("isn't supported on provider `vast`"), "{e}");
+    }
+
+    /// Live finding #17: on RunPod v1 the source's spec has no GPU type, so a replacement of a
+    /// 1×RTX 3070 pod was created on config's A4000. The source's own GPU comes from its
+    /// (enriched) listing first — mapped to a create id through the catalog, or through the
+    /// known aliases without one — and config only when that can't be read (said in a note).
+    #[tokio::test]
+    async fn a_replacement_keeps_the_sources_gpu_from_its_listing() {
+        let catalog = || {
+            Ok(vec![
+                GpuType { id: "NVIDIA GeForce RTX 3070".into(), display_name: "RTX 3070".into(), memory_gb: 8, ..Default::default() },
+                GpuType { id: "NVIDIA B300 MIG 34GB".into(), display_name: "B300 MIG 34GB".into(), memory_gb: 34, ..Default::default() },
+            ])
+        };
+        // (as the listing shows it, the catalog?, the create id)
+        let cases: [(&str, bool, Option<&str>); 6] = [
+            ("RTX 3070", true, Some("NVIDIA GeForce RTX 3070")),
+            ("B300 MIG 34GB", true, Some("NVIDIA B300 MIG 34GB")),
+            ("NVIDIA GeForce RTX 3070", true, Some("NVIDIA GeForce RTX 3070")),
+            ("RTX 3070", false, Some("NVIDIA GeForce RTX 3070")), // a known alias, no catalog needed
+            ("B300 MIG 34GB", false, None),                       // no catalog, no alias: no guess
+            ("Mystery GPU", true, None),
+        ];
+        for (shown, with_catalog, want) in cases {
+            let cat = if with_catalog { catalog() } else { Err("offline".to_string()) };
+            assert_eq!(gpu_id_from_listing(shown, cat).as_deref(), want, "{shown} (catalog: {with_catalog})");
+        }
+
+        /// v1's shape: no GPU in the spec snapshot, the listing's details name it.
+        struct V1Owner;
+        #[async_trait]
+        impl Provider for V1Owner {
+            fn name(&self) -> &'static str {
+                "runpod"
+            }
+            fn describe(&self, _spec: &PodSpec) -> String {
+                String::new()
+            }
+            async fn list_pods(&self) -> Result<Vec<Pod>> {
+                Ok(Vec::new())
+            }
+            async fn enrich(&self, pods: &mut [Pod]) -> Result<()> {
+                for p in pods.iter_mut() {
+                    p.gpu_type = Some("RTX 3070".into());
+                }
+                Ok(())
+            }
+            async fn create_pod(&self, _spec: &PodSpec) -> Result<Pod> {
+                unimplemented!("not exercised")
+            }
+            async fn stop_pod(&self, _id: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn restart_pod(&self, _id: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn terminate_pod(&self, _id: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn pod_spec(&self, _id: &str) -> Result<PodSpec> {
+                Ok(snapshot(&[]))
+            }
+        }
+        let rep = plan_replacement(&cfg(""), &V1Owner, &src(), &SpecOverrides::default(), &PlaceFlags::default()).await.unwrap();
+        assert_eq!(rep.first_spec("devtest-apple-new").gpu_type, "NVIDIA GeForce RTX 3070", "not config's A4000");
+        assert!(rep.notes.iter().any(|n| n.starts_with("GPU NVIDIA GeForce RTX 3070: the source's, from its listing")), "{:?}", rep.notes);
+        assert!(rep.notes.iter().any(|n| n.starts_with("tier COMMUNITY: config CLOUD_TYPE")), "{:?}", rep.notes);
+        // A listing that can't say: config, with a note telling the operator to choose.
+        let blank = Snapshot { name: "runpod", spec: snapshot(&[]) };
+        let rep = plan_replacement(&cfg(""), &blank, &src(), &SpecOverrides::default(), &PlaceFlags::default()).await.unwrap();
+        assert_eq!(rep.first_spec("x").gpu_type, "NVIDIA RTX A4000");
+        assert!(rep.notes.iter().any(|n| n.contains("config GPU_TYPE") && n.contains("pass --gpu")), "{:?}", rep.notes);
+    }
+
+    /// Live finding #19: `--gpu 3070,A4000` reached the API as ONE id
+    /// (`NVIDIA GeForce RTX 3070,NVIDIA RTX A4000`, a 400). A list is placement options now —
+    /// one create at a time, in order — each a real id; a single `--gpu` stays one option.
+    #[tokio::test]
+    async fn a_replacement_gpu_list_is_placement_options_not_one_id() {
+        let owner = Snapshot { name: "runpod", spec: snapshot(&[]) };
+        let ov = SpecOverrides { gpu: Some("3070,A4000".into()), ..Default::default() };
+        let place = PlaceFlags { order: arena_core::placement::Order::Listed, ..Default::default() };
+        let rep = plan_replacement(&cfg(""), &owner, &src(), &ov, &place).await.unwrap();
+        let gpus: Vec<&str> = rep.plan.options.iter().map(|o| o.gpu.as_str()).collect();
+        assert_eq!(gpus, ["NVIDIA GeForce RTX 3070", "NVIDIA RTX A4000"]);
+        assert!(rep.is_placement());
+        assert!(!rep.first_spec("x").gpu_type.contains(','), "never a comma-joined id");
+        let one = plan_replacement(&cfg(""), &owner, &src(), &SpecOverrides { gpu: Some("3070".into()), ..Default::default() }, &PlaceFlags::default())
+            .await
+            .unwrap();
+        assert_eq!((one.plan.options.len(), one.is_placement()), (1, false));
+        // A list on the cloud too: gpu × cloud, as `up` expands it.
+        let ov = SpecOverrides { gpu: Some("3070".into()), cloud: Some("community,secure".into()), ..Default::default() };
+        let rep = plan_replacement(&cfg(""), &owner, &src(), &ov, &place).await.unwrap();
+        let tiers: Vec<Option<&str>> = rep.plan.options.iter().map(|o| o.cloud.as_deref()).collect();
+        assert_eq!(tiers, [Some("COMMUNITY"), Some("SECURE")]);
     }
 
     #[test]
@@ -11165,9 +12299,9 @@ mod selection_tests {
             dir.join("k").display()
         ));
         let cases: &[(&[&str], &[&str])] = &[
-            (&["reimage", "bloom", "zebra", "--skip-proxy"], &["bloom", "zebra"]),
-            (&["reimage", "--all", "--exclude", "apple..cloud", "--skip-proxy"], &["vm", "zebra"]),
-            (&["reimage", "apple..bloom", "--dry-run"], &[]),
+            (&["reimage", "bloom", "zebra", "--skip-proxy", "--wipe-ok", "--no-setup"], &["bloom", "zebra"]),
+            (&["reimage", "--all", "--exclude", "apple..cloud", "--skip-proxy", "--wipe-ok", "--no-setup"], &["vm", "zebra"]),
+            (&["reimage", "apple..bloom", "--dry-run", "--no-setup"], &[]),
         ];
         for (argv, reimaged) in cases {
             let f = fleet();
@@ -11951,10 +13085,11 @@ mod setup_tests {
         let ov = super::SpecOverrides::default();
         for dry_run in [true, false] {
             let fake = Arc::new(FakeRemote::new());
-            let err =
-                super::handle_replace(fake.clone(), &cfg, "apple", &ov, false, true, dry_run, true).await.unwrap_err();
+            let (place, interrupt) = (super::PlaceFlags::default(), super::Interrupt::manual());
+            let opts = super::ReplaceOpts { keep_old: false, skip_proxy: true, dry_run, yes: true };
+            let err = super::handle_replace(fake.clone(), &fleet(), &cfg, "apple", &ov, &place, opts, &interrupt).await.unwrap_err();
             assert!(err.to_string().contains("SETUP_TIMEOUT_SECS"), "replace (dry_run={dry_run}): {err}");
-            let err = super::handle_migrate_copy(fake.clone(), &cfg, "apple", &ov, dry_run, true).await.unwrap_err();
+            let err = super::handle_migrate_copy(fake.clone(), &cfg, "apple", &ov, &place, dry_run, true, &interrupt).await.unwrap_err();
             assert!(fake.calls().is_empty(), "nothing reached a pod");
             assert!(err.to_string().contains("SETUP_TIMEOUT_SECS"), "migrate copy (dry_run={dry_run}): {err}");
         }
@@ -15263,14 +16398,92 @@ mod remote_tests {
         assert!(fake.calls().iter().all(|c| matches!(c, RemoteCall::Exec { timeout, .. } if *timeout == Some(PROBE_TIMEOUT))));
     }
 
+    /// The via-local copy (live findings #13 and #30), driven through `copy_pod_files` with a
+    /// stand-in rsync: two pods behind one public IP skip the direct copy (it hangs on the
+    /// hairpin) instead of losing minutes to it; a direct copy that fails says its own reason
+    /// and falls back; the staging copy — a participant's whole home on a shared box — is
+    /// private, REMOVED once the copy landed, KEPT (with where and how big) when it didn't so
+    /// a re-run continues, and never started when the disk can't take it.
+    #[tokio::test]
+    async fn the_via_local_copy_cleans_up_its_staging_and_never_fills_the_disk() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("arena-via-local-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // A stand-in rsync: a dry run reports `size`; a pull writes a file into the stage; a
+        // push (to `user@host:`) exits `push`.
+        let stub = |name: &str, size: &str, push: u8| {
+            let path = root.join(name);
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\ndry=; for a in \"$@\"; do last=$a; [ \"$a\" = --dry-run ] && dry=1; done\n\
+                     if [ -n \"$dry\" ]; then printf 'Number of files: 3\\nTotal transferred file size: {size} bytes\\n'; exit 0; fi\n\
+                     case \"$last\" in\n  *@*) [ {push} = 0 ] || echo 'rsync: connection unexpectedly closed' >&2; exit {push};;\n\
+                     \x20 *) mkdir -p \"$last\" && printf 'work\\n' > \"$last/work.py\";;\nesac\n"
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path.display().to_string()
+        };
+        let (free, total) = arena_core::replica::disk_space(&root).unwrap();
+        if arena_core::replica::staging_room(1_000, free, total).is_err() {
+            eprintln!("not enough free disk to stage even 1 KB here — skipping");
+            return;
+        }
+        let (src, dest) = ("id-devtest-apple", "id-devtest-apple-new");
+        let fake_for = |dest_host: &str| {
+            let fake = FakeRemote::new();
+            fake.on(&host(22001), "RUNPOD_POD_ID", FakeReply::stdout(src));
+            fake.on(&host(22001), "rsync", FakeReply::exit(255, "ssh: connect to host 10.0.0.2 port 22002: Connection timed out"));
+            fake.on(dest_host, "MARK=", FakeReply::stdout(&format!("ID={dest}\nMARK=arena-replace-{dest}\n")));
+            fake
+        };
+        let opts = |rsync: String| super::CopyOpts { fresh: false, rsync, stage_root: root.clone() };
+        let stage = root.join(format!("arena-replace-{src}"));
+
+        // Same public IP: no direct attempt; the copy lands and the stage is gone.
+        let f = fleet_of(&[("apple", 22001), ("apple-new", 22002)]);
+        let fake = fake_for(&host(22002));
+        copy_pod_files(&cfg(), &f, &fake, src, dest, &opts(stub("ok", "1,000", 0))).await.unwrap();
+        assert!(!execs(&fake, 22001).iter().any(|(c, _)| c.starts_with("rsync ")), "no direct copy through a shared IP");
+        assert!(!stage.exists(), "the staging copy is removed once the copy landed");
+
+        // Its own IP: the direct copy is tried, fails, falls back; the push fails — the stage
+        // is kept, private, and the error says where it is and how big.
+        let mut f = fleet_of(&[("apple", 22001), ("apple-new", 22002)]);
+        f.pods[1].ssh_ip = Some("10.0.0.2".into());
+        let fake = fake_for("10.0.0.2:22002");
+        let e = copy_pod_files(&cfg(), &f, &fake, src, dest, &opts(stub("push-fails", "1,000", 12))).await.unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(execs(&fake, 22001).iter().filter(|(c, _)| c.starts_with("rsync ")).count() == 1, "one direct attempt");
+        assert!(msg.contains(&format!("kept at {}", stage.display())) && msg.contains("rm -rf"), "{msg}");
+        assert!(msg.contains("connection unexpectedly closed"), "{msg}");
+        assert!(stage.join("work.py").exists());
+        assert_eq!(std::fs::metadata(&stage).unwrap().permissions().mode() & 0o777, 0o700, "a participant's home: private");
+        std::fs::remove_dir_all(&stage).unwrap();
+
+        // More than the disk can spare: refused before anything is staged.
+        let fake = fake_for("10.0.0.2:22002");
+        let e = copy_pod_files(&cfg(), &f, &fake, src, dest, &opts(stub("huge", "999.00P", 0))).await.unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(msg.contains("not copying via local staging") && msg.contains("must stay free"), "{msg}");
+        assert!(!stage.exists(), "nothing staged, nothing left behind");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_direct_pod_copy_that_times_out_stops_instead_of_falling_back() {
-        let f = fleet_of(&[("apple", 22001), ("apple-new", 22002)]);
+        let mut f = fleet_of(&[("apple", 22001), ("apple-new", 22002)]);
+        f.pods[1].ssh_ip = Some("10.0.0.2".into()); // its own host: the direct copy is tried
         let fake = FakeRemote::new();
         // identity check, plant the marker, the direct rsync (wedged), clean the marker.
         fake.script(&host(22001), [FakeReply::stdout("id-devtest-apple"), FakeReply::ok(), FakeReply::hang()]);
         let start = Instant::now();
-        let err = copy_pod_files(&cfg(), &f, &fake, "id-devtest-apple", "id-devtest-apple-new").await.unwrap_err();
+        let err = copy_pod_files(&cfg(), &f, &fake, "id-devtest-apple", "id-devtest-apple-new", &super::CopyOpts::new(false))
+            .await
+            .unwrap_err();
         let msg = err.to_string();
         assert!(msg.starts_with("direct pod-to-pod copy timed out after 7200s — NOT swapping"), "{msg}");
         assert_eq!(start.elapsed(), POD_COPY_TIMEOUT);
@@ -15278,9 +16491,15 @@ mod remote_tests {
         assert_eq!(src.len(), 4, "{src:?}");
         assert!(src[2].0.starts_with("rsync ") && src[2].1 == Some(POD_COPY_TIMEOUT), "{src:?}");
         // The repo goes as its tree (a link onto a volume on either pod is resolved, not copied).
-        assert!(src[2].0.contains("'/ARENA_materials'") && src[2].0.contains("'root@10.0.0.1:ARENA_materials/'"), "{src:?}");
+        assert!(src[2].0.contains("'/ARENA_materials'") && src[2].0.contains("'root@10.0.0.2:ARENA_materials/'"), "{src:?}");
         assert!(src[3].0.starts_with("rm -f ") && src[3].1 == Some(PROBE_TIMEOUT), "source marker cleaned: {src:?}");
-        assert!(fake.calls_to(&host(22002)).is_empty(), "no via-local push, no delivery check");
+        // On the destination: no via-local push, no delivery check — only the tidy-up of what
+        // the partial sync moved aside, which keeps the old baseline.
+        let dest = fake.calls_to("10.0.0.2:22002");
+        assert!(
+            matches!(&dest[..], [RemoteCall::Exec { cmd, .. }] if cmd.contains(arena_core::replica::REPLACED_DIR) && !cmd.contains("touch")),
+            "{dest:?}"
+        );
         // It doesn't promise a plain re-run continues: `replace` refuses while `-new` exists.
         assert!(!msg.contains("Re-run"), "{msg}");
     }
@@ -15727,9 +16946,11 @@ mod lifecycle_tests {
     use super::{
         disk_fate, handle_pods, handle_rename, handle_restart, handle_terminate, migrate_cutover_on, migrate_finish_on,
         plan_csv_move, rename_followup_steps, rename_report, replace_on, rewrite_name_files, stop_lines,
-        take_would_refuse, wipe_refusal, Cli, Cmd, CsvMove, DiskFate, DiskOp, KeyBook, PlannedRename, PodCmd,
-        RenameRequest, ReplaceOpts, RestartOpts, SettleWait, SpecOverrides, TerminateOpts, LOCKED_REPLACEMENT_NOTE,
+        take_would_refuse, wipe_refusal, Cli, Cmd, CsvMove, CutoverOpts, DiskFate, DiskOp, Interrupt, KeyBook, PlaceFlags,
+        PlannedRename, PodCmd, RenameRequest, ReplaceJob, ReplaceOpts, RestartOpts, Selected, SettleWait, SpecOverrides,
+        TerminateOpts, LOCKED_REPLACEMENT_NOTE,
     };
+    use super::{handle_reimage, handle_start};
     use arena_core::volume::{probe_command, RepoSite};
     use arena_core::openrouter::{CreatedKey, KeyApi, KeyInfo};
     use arena_core::remote::{FakeRemote, FakeReply, RemoteCall, PROBE_TIMEOUT};
@@ -15764,6 +16985,15 @@ mod lifecycle_tests {
         rename_locked: Vec<&'static str>,
         /// Pod ids whose unlock fails.
         fail_unlock: Vec<&'static str>,
+        /// What `create_pod` hands out, in order (and adds to the listing); none left = the
+        /// test didn't expect a create.
+        to_create: Mutex<Vec<Pod>>,
+        /// `list_pods` calls so far, and the calls (1-based) that list every pod WITHOUT its
+        /// endpoint — RunPod's passing "running, no endpoint" glitch.
+        lists: Mutex<usize>,
+        blank_lists: Vec<usize>,
+        /// Host maintenance windows `enrich` reports, by pod id.
+        maintenance: Vec<(&'static str, arena_core::pod::Maintenance)>,
     }
 
     impl Fleet {
@@ -15778,6 +17008,17 @@ mod lifecycle_tests {
                 server_locked,
                 rename_locked: vec![],
                 fail_unlock: vec![],
+                to_create: Mutex::default(),
+                lists: Mutex::default(),
+                blank_lists: vec![],
+                maintenance: vec![],
+            }
+        }
+        /// A container reset as the providers do it: the pod comes back on a NEW endpoint
+        /// (port +1000), so a setup that reaches the new one ran after the reset.
+        fn reset(&self, id: &str) {
+            for p in self.pods.lock().unwrap().iter_mut().filter(|p| p.id == id) {
+                p.ssh_port = p.ssh_port.map(|port| port + 1000);
             }
         }
         /// Refuse `ctx` on `id` as the API does a locked pod's.
@@ -15804,10 +17045,35 @@ mod lifecycle_tests {
             String::new()
         }
         async fn list_pods(&self) -> Result<Vec<Pod>> {
-            Ok(self.pods.lock().unwrap().clone())
+            let n = {
+                let mut lists = self.lists.lock().unwrap();
+                *lists += 1;
+                *lists
+            };
+            let mut pods = self.pods.lock().unwrap().clone();
+            if self.blank_lists.contains(&n) {
+                for p in &mut pods {
+                    (p.ssh_ip, p.ssh_port) = (None, None);
+                }
+            }
+            Ok(pods)
         }
-        async fn create_pod(&self, _spec: &PodSpec) -> Result<Pod> {
-            unimplemented!("not exercised by lifecycle tests")
+        async fn enrich(&self, pods: &mut [Pod]) -> Result<()> {
+            for p in pods.iter_mut() {
+                if let Some((_, m)) = self.maintenance.iter().find(|(id, _)| *id == p.id) {
+                    p.maintenance = Some(m.clone());
+                }
+            }
+            Ok(())
+        }
+        async fn create_pod(&self, spec: &PodSpec) -> Result<Pod> {
+            let mut queue = self.to_create.lock().unwrap();
+            assert!(!queue.is_empty(), "not exercised by this test: create {}", spec.name);
+            let mut pod = queue.remove(0);
+            pod.name = spec.name.clone();
+            self.record(format!("create {} {}", spec.name, spec.gpu_type));
+            self.pods.lock().unwrap().push(pod.clone());
+            Ok(pod)
         }
         async fn stop_pod(&self, id: &str) -> Result<()> {
             self.refuse_locked(id, "stop pod")?;
@@ -15819,9 +17085,21 @@ mod lifecycle_tests {
         async fn restart_pod(&self, id: &str) -> Result<()> {
             self.refuse_locked(id, "restart pod")?;
             self.record(format!("restart {id}"));
+            self.reset(id);
+            Ok(())
+        }
+        /// A stopped pod comes back running, as a fresh container on a new endpoint.
+        async fn start_pod(&self, id: &str) -> Result<()> {
+            self.record(format!("start {id}"));
             for p in self.pods.lock().unwrap().iter_mut().filter(|p| p.id == id) {
-                p.ssh_port = p.ssh_port.map(|port| port + 1000);
+                p.status = "RUNNING".into();
             }
+            self.reset(id);
+            Ok(())
+        }
+        async fn reimage_pod(&self, id: &str, image: &str, _env: &[(String, String)]) -> Result<()> {
+            self.record(format!("reimage {id} {image}"));
+            self.reset(id);
             Ok(())
         }
         async fn terminate_pod(&self, id: &str) -> Result<()> {
@@ -16661,7 +17939,7 @@ mod lifecycle_tests {
         assert!(DiskFate::Wiped { volume_gb: Some(0) }.describe(DiskOp::Stop, &cfg_only(ROOT)).contains("starts again as a fresh image"));
         assert!(DiskFate::Kept.describe(DiskOp::Stop, &cfg_only(ROOT)).contains("powered off"));
         // A stopped pod comes back only when started — the prompt says to re-run setup then.
-        assert!(v50.describe(DiskOp::Stop, &linked).contains("`arena pods setup` re-links the repo"));
+        assert!(v50.describe(DiskOp::Stop, &linked).contains("`arena pods start` brings it back and re-links the repo"));
         assert!(!v50.describe(DiskOp::Restart, &linked).contains("re-links"));
         let r = wipe_refusal(DiskOp::Restart, &["devtest-a", "devtest-b"], ROOT);
         assert!(r.starts_with("refusing to restart devtest-a, devtest-b without --wipe-ok"), "{r}");
@@ -16731,6 +18009,251 @@ mod lifecycle_tests {
             Ok(Cmd::Pods(p)) => p,
             other => panic!("{argv:?}: {:?}", other.err()),
         }
+    }
+
+    /// `cfg` plus a readable public key (reimage re-seeds PUBLIC_KEY and refuses without
+    /// one), an image and a GPU type (a replacement spec needs one: the fakes report none).
+    fn keyed_cfg(dir: &Path, extra: &str) -> Config {
+        std::fs::write(dir.join("k"), "private").unwrap();
+        std::fs::write(dir.join("k.pub"), "ssh-ed25519 AAAAtest devtest-test").unwrap();
+        Config::parse(&format!(
+            "{}SHARED_SSH_KEY_PATH={}\nIMAGE=img:9\nGPU_TYPE=\"NVIDIA RTX A4000\"\n{extra}",
+            cfg_text(dir),
+            dir.join("k").display()
+        ))
+    }
+
+    fn named(pods: &[Pod]) -> Selected {
+        Selected { pods: pods.to_vec(), named: true }
+    }
+
+    /// Live findings #2 + #8: `reimage` wiped a volume-less pod with only `-y` (stop and
+    /// restart beside it refused), and left it unprovisioned (no ~/.name, the public git
+    /// remote, no deploy key). Now the same `--wipe-ok` gate — refused up front, the dry run
+    /// says so, a repo on the volume passes — and afterwards it settles, runs setup again ON
+    /// THE NEW CONTAINER and syncs the proxy to it.
+    #[tokio::test]
+    async fn reimage_is_gated_like_restart_and_sets_the_pod_up_again() {
+        let dir = tmpdir("reimage");
+        let cfg = keyed_cfg(&dir.0, "");
+        let keys_dir = dir.0.display().to_string();
+        // Refused without --wipe-ok, even with --yes (handle_pods passes it): nothing reimaged.
+        let (f, remote) = (fleet(), Arc::new(FakeRemote::new()));
+        let e = handle_pods(pods_cmd(&["reimage", "alpha", "bravo"]), &f, remote.clone(), &cfg, true).await.unwrap_err().to_string();
+        assert!(e.contains("refusing to reimage devtest-alpha, devtest-bravo without --wipe-ok"), "{e}");
+        assert!(e.contains("--yes alone isn't enough") && e.contains("`arena pods backup devtest-alpha devtest-bravo`"), "{e}");
+        assert!(f.calls().is_empty() && remote.calls().is_empty());
+        // The dry run says it would be refused (and changes nothing).
+        take_would_refuse();
+        let dry = RestartOpts { dry_run: true, yes: true, ..Default::default() };
+        let pods = f.pods.lock().unwrap().clone();
+        handle_reimage(&f, remote.clone(), &cfg, &named(&pods[..1]), None, dry, FAST, &keys_dir).await.unwrap();
+        let notes = take_would_refuse();
+        assert!(notes.len() == 1 && notes[0].contains("refusing to reimage devtest-alpha without --wipe-ok"), "{notes:?}");
+        assert!(f.calls().is_empty());
+        // --wipe-ok: reimaged, set up again on the endpoint it came back on, proxied there.
+        let opts = RestartOpts { wipe_ok: true, yes: true, ..Default::default() };
+        handle_reimage(&f, remote.clone(), &cfg, &named(&pods[..1]), None, opts, FAST, &keys_dir).await.unwrap();
+        assert_eq!(f.calls(), ["reimage r-alpha img:9"]);
+        let calls = remote.calls();
+        assert!(!calls.is_empty() && calls.iter().all(|c| c.host() == "10.0.0.1:23001"), "{calls:?}");
+        assert!(calls.iter().any(|c| matches!(c, RemoteCall::Exec { cmd, .. } if cmd.contains(&name_file_command("alpha")))), "{calls:?}");
+        let px = proxy_file(&dir.0);
+        assert!(px.contains("name=devtest-alpha") && px.contains("23001") && !px.contains("22001"), "{px}");
+        // The repo on a volume survives a reimage: no --wipe-ok needed.
+        let mut g = fleet();
+        g.volumes = vec![("r-bravo", 50)];
+        let on_volume = keyed_cfg(&dir.0, "BACKUP_REPO_PATH=/workspace/r\n");
+        let bravo = g.pods.lock().unwrap()[1].clone();
+        let opts = RestartOpts { no_setup: true, skip_proxy: true, yes: true, ..Default::default() };
+        handle_reimage(&g, Arc::new(FakeRemote::new()), &on_volume, &named(&[bravo]), None, opts, FAST, &keys_dir).await.unwrap();
+        assert_eq!(g.calls(), ["reimage r-bravo img:9"]);
+    }
+
+    /// Live finding #15: a stopped pod had no way back — `restart` answered a raw 409 (v2)
+    /// or "restarted" it without starting it (v1), and `run` said "no SSH endpoint yet". Now
+    /// `restart` points at `pods start`, which starts it, sets it up again (it's a fresh
+    /// image) and syncs the proxy; the SSH commands say it's stopped.
+    #[tokio::test]
+    async fn a_stopped_pod_is_started_set_up_and_proxied() {
+        let dir = tmpdir("start");
+        let cfg = cfg(&dir.0);
+        let keys_dir = dir.0.display().to_string();
+        let f = fleet();
+        f.pods.lock().unwrap()[0].status = "EXITED".into(); // alpha (its last endpoint still listed)
+        let remote = Arc::new(FakeRemote::new());
+        let e = handle_restart(&f, remote.clone(), &cfg, "alpha", restart_opts(true), FAST, &keys_dir).await.unwrap_err().to_string();
+        assert!(e.contains("devtest-alpha is stopped (EXITED)") && e.contains("`arena pods start devtest-alpha`"), "{e}");
+        let e = handle_pods(pods_cmd(&["run", "-t", "alpha", "hostname"]), &f, remote.clone(), &cfg, true).await.unwrap_err().to_string();
+        assert!(e.contains("stopped (devtest-alpha)") && e.contains("arena pods start devtest-alpha"), "{e}");
+        assert!(f.calls().is_empty() && remote.calls().is_empty(), "nothing restarted, nothing reached");
+        // Start: the stopped one only (bravo is running: skipped).
+        let pods = f.pods.lock().unwrap().clone();
+        let opts = RestartOpts { yes: true, ..Default::default() };
+        handle_start(&f, remote.clone(), &cfg, &named(&pods[..2]), opts, FAST, &keys_dir).await.unwrap();
+        assert_eq!(f.calls(), ["start r-alpha"]);
+        let calls = remote.calls();
+        assert!(!calls.is_empty() && calls.iter().all(|c| c.host() == "10.0.0.1:23001"), "set up on the new container: {calls:?}");
+        assert!(proxy_file(&dir.0).contains("23001"));
+        // Through the command line: needs targets; `--dry-run` starts nothing.
+        assert!(handle_pods(pods_cmd(&["start"]), &f, remote.clone(), &cfg, true).await.is_err());
+        let g = fleet();
+        g.pods.lock().unwrap()[1].status = "EXITED".into();
+        handle_pods(pods_cmd(&["start", "bravo", "--dry-run"]), &g, remote.clone(), &cfg, true).await.unwrap();
+        assert!(g.calls().is_empty());
+    }
+
+    /// Live (wave 6): after a restart the endpoint flapped — the proxy sync right after setup
+    /// caught a moment the listing showed the pod with no endpoint, and its forward stayed
+    /// on the dead one. The sync now waits for a settled endpoint (and re-syncs once).
+    #[tokio::test]
+    async fn the_post_restart_proxy_sync_waits_for_a_settled_endpoint() {
+        let dir = tmpdir("restart-flap");
+        let cfg = cfg(&dir.0);
+        let mut f = fleet();
+        // List calls: 1 the restart's lookup, 2-3 the settle wait, 4 setup's listing — so 5 is
+        // the first listing after setup: the one the sync used to take as it came.
+        f.blank_lists = vec![5];
+        let remote = Arc::new(FakeRemote::new());
+        handle_restart(&f, remote, &cfg, "alpha", restart_opts(true), FAST, &dir.0.display().to_string()).await.unwrap();
+        let px = proxy_file(&dir.0);
+        assert!(px.contains("name=devtest-alpha") && px.contains("23001") && !px.contains("22001"), "{px}");
+    }
+
+    /// Live: RunPod listed a running pod without an endpoint for ~20 s, `pull` skipped it and
+    /// exited 1 — a backup cron tick silently missed that pod. `run` / `pull` / `backup` ask
+    /// once more first.
+    #[tokio::test(start_paused = true)]
+    async fn run_and_backup_ask_again_for_a_running_pod_listed_without_an_endpoint() {
+        let dir = tmpdir("endpoint-retry");
+        let cfg = cfg(&dir.0);
+        for argv in [&["run", "-t", "alpha", "hostname"][..], &["backup", "alpha", "--no-pull"]] {
+            let mut f = fleet();
+            f.blank_lists = vec![1]; // the selection's listing
+            let remote = Arc::new(FakeRemote::new());
+            handle_pods(pods_cmd(argv), &f, remote.clone(), &cfg, true).await.unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            assert_eq!(remote.calls().len(), 1, "{argv:?}: {:?}", remote.calls());
+            assert_eq!(remote.calls()[0].host(), "10.0.0.1:22001", "{argv:?}");
+        }
+    }
+
+    /// Live finding #6: `migrate finish` terminated `<name>-old` while the proxy still routed
+    /// the participant's port to it (after a `--skip-proxy` cutover). Now it syncs first and
+    /// refuses unless the name's stable port routes to the live pod.
+    #[tokio::test]
+    async fn finish_keeps_old_until_the_proxy_routes_the_name_to_the_live_pod() {
+        let dir = tmpdir("finish-proxy");
+        let cfg = cfg(&dir.0);
+        let pods = |live_endpoint: Option<(&str, u16)>| {
+            vec![
+                pod("r-bravo-new", "devtest-bravo", "runpod", live_endpoint),
+                pod("r-bravo", "devtest-bravo-old", "runpod", Some(("10.0.0.1", 22002))),
+            ]
+        };
+        // The live pod has no endpoint yet: the sync can't route bravo to it.
+        let f = Fleet::new(pods(None));
+        let listed = f.pods.lock().unwrap().clone();
+        let e = migrate_finish_on(&f, &cfg, &f, "devtest-bravo", &listed, false, true).await.unwrap_err().to_string();
+        assert!(e.contains("NOT terminating devtest-bravo-old") && e.contains("arena proxy apply"), "{e}");
+        assert!(f.calls().is_empty(), "{:?}", f.calls());
+        // Routed: it goes.
+        let f = Fleet::new(pods(Some(("10.0.0.3", 22009))));
+        let listed = f.pods.lock().unwrap().clone();
+        migrate_finish_on(&f, &cfg, &f, "devtest-bravo", &listed, false, true).await.unwrap();
+        assert_eq!(f.calls(), ["terminate r-bravo"]);
+        assert!(proxy_file(&dir.0).contains("10.0.0.3"));
+    }
+
+    /// The cutover's live findings, on a STOPPED original: #16 — the final sync is refused
+    /// saying the source is stopped and offering `--no-final-sync`, which then cuts over to
+    /// the copy already on `-new`; #26 — `~/.name` on the promoted pod in setup's own format;
+    /// #5 — its per-host API keys re-distributed under the canonical name; #29 — a write-only
+    /// proxy honoured up front: no 45 s wait "for nginx", no probe through it, no revert.
+    #[tokio::test(start_paused = true)]
+    async fn cutover_onto_the_copy_of_a_stopped_original() {
+        let dir = tmpdir("cutover");
+        let cfg = cfg(&dir.0);
+        std::fs::write(dir.0.join("openai_api_keys.csv"), "devtest-alpha,sk-openai-alpha\n").unwrap();
+        let keys_dir = dir.0.display().to_string();
+        let mut src = pod("r-alpha", "devtest-alpha", "runpod", Some(("10.0.0.1", 22001)));
+        src.status = "EXITED".into();
+        let f = Fleet::new(vec![src, pod("r-alpha-new", "devtest-alpha-new", "runpod", Some(("10.0.0.2", 22001)))]);
+        let new_host = "10.0.0.2:22001";
+        let remote = Arc::new(FakeRemote::new());
+        remote.on(new_host, "SSH_OK", FakeReply::stdout("NVIDIA RTX A4000\nSSH_OK\n"));
+        remote.on(new_host, "arena-last-sync", FakeReply::stdout("arena-last-sync=1791457323\n"));
+        let pods = f.pods.lock().unwrap().clone();
+        let opts = |no_final_sync| CutoverOpts { skip_proxy: false, no_final_sync, dry_run: false, yes: true };
+        let e = migrate_cutover_on(remote.clone(), &f, &cfg, &f, "devtest-alpha", &pods, opts(false), &keys_dir).await.unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(msg.contains("the source devtest-alpha is stopped (EXITED)") && msg.contains("--no-final-sync"), "{msg}");
+        assert!(f.calls().is_empty() && remote.calls().is_empty(), "nothing swapped, nothing reached");
+
+        let start = tokio::time::Instant::now();
+        migrate_cutover_on(remote.clone(), &f, &cfg, &f, "devtest-alpha", &pods, opts(true), &keys_dir).await.unwrap();
+        assert_eq!(f.calls(), ["rename r-alpha devtest-alpha-old", "rename r-alpha-new devtest-alpha"]);
+        assert!(start.elapsed() < Duration::from_secs(45), "no wait for an nginx arena doesn't reload: {:?}", start.elapsed());
+        assert!(remote.calls_to("10.0.0.1:22001").is_empty(), "the stopped original isn't contacted");
+        assert!(remote.calls().iter().all(|c| c.host() == new_host), "nothing probed through the proxy: {:?}", remote.calls());
+        let on_new: Vec<String> = remote
+            .calls_to(new_host)
+            .into_iter()
+            .filter_map(|c| match c {
+                RemoteCall::Exec { cmd, .. } => Some(cmd),
+                RemoteCall::Copy { .. } => None,
+            })
+            .collect();
+        assert!(on_new.contains(&name_file_command("alpha")), "~/.name in setup's format: {on_new:?}");
+        assert!(on_new.iter().any(|c| c.contains("OPENAI_API_KEY") && c.contains("sk-openai-alpha")), "keys under the canonical name: {on_new:?}");
+        let px = proxy_file(&dir.0);
+        assert!(px.contains("name=devtest-alpha ") || px.contains("name=devtest-alpha\n") || px.contains("10.0.0.2"), "{px}");
+        assert!(px.contains("10.0.0.2") && !px.contains("10.0.0.1"), "routed to the new pod: {px}");
+    }
+
+    /// `pods replace` end to end on fakes: the new pod's host has a maintenance window (live
+    /// finding #28) — said before the swap, and the original is KEPT, not terminated; the
+    /// promoted pod gets `~/.name` and its API keys under the canonical name (#26, #5), the
+    /// parked one its `-old` name; the copy is a replica's (deletions mirrored, moved aside).
+    #[tokio::test(start_paused = true)]
+    async fn replace_onto_a_host_with_maintenance_keeps_the_original() {
+        let dir = tmpdir("replace-maint");
+        let cfg = keyed_cfg(&dir.0, "");
+        std::fs::write(dir.0.join("openai_api_keys.csv"), "devtest-alpha,sk-openai-alpha\n").unwrap();
+        let keys_dir = dir.0.display().to_string();
+        let mut f = fleet();
+        *f.to_create.lock().unwrap() = vec![pod("r-new", "", "runpod", Some(("10.0.0.2", 22001)))];
+        f.maintenance = vec![(
+            "r-new",
+            arena_core::pod::Maintenance { start: Some("2026-10-12T04:00:00Z".into()), end: Some("2026-10-12T12:00:00Z".into()), note: None },
+        )];
+        let (old_host, new_host) = ("10.0.0.1:22001", "10.0.0.2:22001");
+        let remote = Arc::new(FakeRemote::new());
+        remote.on(old_host, "RUNPOD_POD_ID", FakeReply::stdout("r-alpha"));
+        remote.on(new_host, "MARK=", FakeReply::stdout("ID=r-new\nMARK=arena-replace-r-new\n"));
+        remote.on(new_host, "SSH_OK", FakeReply::stdout("NVIDIA RTX A4000\nSSH_OK\n"));
+        let (ov, place, interrupt) = (SpecOverrides::default(), PlaceFlags::default(), Interrupt::manual());
+        let opts = ReplaceOpts { keep_old: false, skip_proxy: false, dry_run: false, yes: true };
+        let timeouts = arena_core::setup::SetupTimeouts::from_config(&cfg, None).unwrap();
+        let job = ReplaceJob { setup_timeouts: timeouts, ov: &ov, place: &place, opts, interrupt: &interrupt, keys_dir: &keys_dir };
+        replace_on(remote.clone(), &f, &cfg, &f, "r-alpha".into(), "devtest-alpha".into(), job).await.unwrap();
+        assert_eq!(
+            f.calls(),
+            ["create devtest-alpha-new NVIDIA RTX A4000", "rename r-alpha devtest-alpha-old", "rename r-new devtest-alpha"],
+            "swapped, but the original NOT terminated"
+        );
+        let execs = |host: &str| -> Vec<String> {
+            remote.calls_to(host).into_iter().filter_map(|c| if let RemoteCall::Exec { cmd, .. } = c { Some(cmd) } else { None }).collect()
+        };
+        let (on_old, on_new) = (execs(old_host), execs(new_host));
+        assert!(on_new.contains(&name_file_command("alpha")) && on_old.contains(&name_file_command("alpha-old")), "{on_new:?} {on_old:?}");
+        assert!(on_new.iter().any(|c| c.contains("OPENAI_API_KEY") && c.contains("sk-openai-alpha")), "{on_new:?}");
+        // The copy ran on the original, as a replica: deletions mirrored into a moved-aside folder.
+        assert!(on_old.iter().any(|c| c.starts_with("rsync ") && c.contains("'--delete'") && c.contains("--backup-dir=.arena-sync-replaced/")), "{on_old:?}");
+        // …and the new pod's baseline was started before it, then sorted after.
+        let baseline = on_new.iter().position(|c| *c == arena_core::replica::baseline_command()).expect("baseline");
+        let settle = on_new.iter().position(|c| c.contains("arena-replica-kept")).expect("settle");
+        assert!(baseline < settle);
+        assert!(proxy_file(&dir.0).contains("10.0.0.2"), "the proxy routes alpha to the new pod");
     }
 
     #[test]
@@ -16829,7 +18352,9 @@ mod lifecycle_tests {
             let timeouts = arena_core::setup::SetupTimeouts::from_config(cfg, None).unwrap();
             let opts = ReplaceOpts { keep_old, skip_proxy: true, dry_run, yes: true };
             let id = f.pods.lock().unwrap().iter().find(|p| p.name == src).unwrap().id.clone();
-            replace_on(Arc::new(FakeRemote::new()), cfg, f, id, src.to_string(), timeouts, &SpecOverrides::default(), opts).await
+            let (ov, place, interrupt) = (SpecOverrides::default(), PlaceFlags::default(), Interrupt::manual());
+            let job = ReplaceJob { setup_timeouts: timeouts, ov: &ov, place: &place, opts, interrupt: &interrupt, keys_dir: "/nonexistent" };
+            replace_on(Arc::new(FakeRemote::new()), f, cfg, f, id, src.to_string(), job).await
         }
         let want = format!("refusing to replace: {}{LOCKED_REPLACEMENT_NOTE}", hint("devtest-alpha"));
         for keep_old in [false, true] {
@@ -16853,12 +18378,13 @@ mod lifecycle_tests {
         f.pods.lock().unwrap().push(pod("r-alpha-new", "devtest-alpha-new", "runpod", Some(("10.0.0.2", 22001))));
         let pods = f.pods.lock().unwrap().clone();
         let want = format!("refusing to cut over: {}{LOCKED_REPLACEMENT_NOTE}", hint("devtest-alpha"));
-        let e = migrate_cutover_on(&FakeRemote::new(), &cfg, &f, "devtest-alpha", &pods, true, false, true)
+        let opts = |dry_run| CutoverOpts { skip_proxy: true, no_final_sync: false, dry_run, yes: true };
+        let e = migrate_cutover_on(Arc::new(FakeRemote::new()), &f, &cfg, &f, "devtest-alpha", &pods, opts(false), "/nonexistent")
             .await
             .unwrap_err()
             .to_string();
         assert_eq!(e, want);
-        migrate_cutover_on(&FakeRemote::new(), &cfg, &f, "devtest-alpha", &pods, true, true, true).await.unwrap();
+        migrate_cutover_on(Arc::new(FakeRemote::new()), &f, &cfg, &f, "devtest-alpha", &pods, opts(true), "/nonexistent").await.unwrap();
         assert_eq!(take_would_refuse(), [format!("(without --dry-run: {want})")]);
         assert!(f.calls().is_empty(), "{:?}", f.calls());
 
@@ -16869,20 +18395,20 @@ mod lifecycle_tests {
         pods.push(old);
         let f = Fleet::new(pods.clone());
         let want = format!("refusing to terminate: {}", hint("devtest-bravo-old"));
-        let e = migrate_finish_on(&f, "devtest-bravo", &pods, false, true).await.unwrap_err().to_string();
+        let e = migrate_finish_on(&f, &cfg, &f, "devtest-bravo", &pods, false, true).await.unwrap_err().to_string();
         assert_eq!(e, want);
-        migrate_finish_on(&f, "devtest-bravo", &pods, true, true).await.unwrap();
+        migrate_finish_on(&f, &cfg, &f, "devtest-bravo", &pods, true, true).await.unwrap();
         assert_eq!(take_would_refuse(), [format!("(without --dry-run: {want})")]);
         assert!(f.calls().is_empty(), "{:?}", f.calls());
         // Locked since it was listed: the API's refusal reads as the same sentence.
         let mut unlisted = pods.clone();
         unlisted.last_mut().unwrap().locked = None;
-        let e = migrate_finish_on(&f, "devtest-bravo", &unlisted, false, true).await.unwrap_err().to_string();
+        let e = migrate_finish_on(&f, &cfg, &f, "devtest-bravo", &unlisted, false, true).await.unwrap_err().to_string();
         assert_eq!(e, format!("terminating devtest-bravo-old: {}", hint("devtest-bravo-old")));
         assert!(f.calls().is_empty());
         // Unlocked: it goes.
         f.server_locked.lock().unwrap().clear();
-        migrate_finish_on(&f, "devtest-bravo", &unlisted, false, true).await.unwrap();
+        migrate_finish_on(&f, &cfg, &f, "devtest-bravo", &unlisted, false, true).await.unwrap();
         assert_eq!(f.calls(), ["terminate r-bravo-old"]);
     }
 
