@@ -466,18 +466,31 @@ fn closest<'c>(token: &str, candidates: impl Iterator<Item = &'c str>, naming: &
     scored.into_iter().take(3).map(|(_, n)| n).collect()
 }
 
-/// Levenshtein distance (insert/delete/substitute = 1), over chars.
+/// Optimal-string-alignment distance over chars: insert/delete/substitute = 1, and swapping
+/// two adjacent chars = 1. The swap matters because it is the commonest typo (`alpah` for
+/// `alpha`), which plain Levenshtein scores as 2 — over the 1-edit allowance short names get.
 fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
-    for (i, ca) in a.chars().enumerate() {
-        let mut cur = vec![i + 1; b.len() + 1];
-        for (j, cb) in b.iter().enumerate() {
-            cur[j + 1] = (prev[j] + usize::from(ca != *cb)).min(prev[j + 1] + 1).min(cur[j] + 1);
-        }
-        prev = cur;
+    // d[i][j] = distance between a[..i] and b[..j]; three rows suffice for the swap rule.
+    let mut d = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for (i, row) in d.iter_mut().enumerate() {
+        row[0] = i;
     }
-    prev[b.len()]
+    for j in 0..=b.len() {
+        d[0][j] = j;
+    }
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            let mut v = (d[i - 1][j - 1] + cost).min(d[i - 1][j] + 1).min(d[i][j - 1] + 1);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                v = v.min(d[i - 2][j - 2] + 1);
+            }
+            d[i][j] = v;
+        }
+    }
+    d[a.len()][b.len()]
 }
 
 #[cfg(test)]
@@ -672,6 +685,9 @@ mod tests {
         // One near name; nothing suggested for something far off.
         let e = err(&args(&["aple"]));
         assert!(e.contains("did you mean arena8-apple?"), "{e}");
+        // Swapped letters are one edit, so a short name still gets its hint.
+        let e = err(&args(&["blomo"]));
+        assert!(e.contains("did you mean arena8-bloom?"), "{e}");
         assert!(!err(&args(&["xyzzy"])).contains("did you mean"));
         // Several near names: closest first (then by name), at most three.
         let l = list();
@@ -814,5 +830,9 @@ mod tests {
         assert_eq!(edit_distance("zebrra", "zebra"), 1);
         assert_eq!(edit_distance("", "abc"), 3);
         assert_eq!(edit_distance("kitten", "sitting"), 3);
+        // An adjacent swap is one edit (live: `alpah` for `alpha` got no suggestion).
+        assert_eq!(edit_distance("alpah", "alpha"), 1);
+        assert_eq!(edit_distance("ab", "ba"), 1);
+        assert_eq!(edit_distance("abc", "ca"), 3);
     }
 }
