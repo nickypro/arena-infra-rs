@@ -2539,11 +2539,12 @@ fn footer_hint(shared: &Shared, ui: &Ui, secs: u64) -> Line<'static> {
         0 => String::new(),
         n => format!(" · deep-checking {n}"),
     };
-    let keys = match ui.mode {
+    let keys = match &ui.mode {
         Mode::List => "[enter] detail  [c] ssh  [space] mark  [/] select  [x] unmark all  [a] act  [A] all  [d] deep check  [n] new  [r] refresh",
         Mode::Detail => "[c] ssh  [space] mark  [/] select  [x] unmark all  [a] act  [A] all  [d] deep check  [n] new  [r] refresh  [esc] back",
         Mode::Menu { .. } => "[↑↓] move  [enter] choose  [letter] pick  [esc] cancel",
-        Mode::Confirm(_) => "type to confirm  [enter] apply  [esc] cancel",
+        Mode::Confirm(c) if c.action.requires_typed_name() => "type the pod's name  [enter] apply  [esc] cancel",
+        Mode::Confirm(_) => "[y] apply  [n/esc] cancel",
         Mode::FleetMenu { .. } => "[↑↓] move  [enter] choose  [letter] pick  [esc] cancel",
         Mode::FleetConfirm { .. } => "type the token to confirm  [enter] apply  [esc] cancel",
         Mode::NewPod { .. } => "[↑↓] pods  [+-] gpus  [←→] type  [enter] create  [esc] cancel",
@@ -2622,40 +2623,71 @@ fn render_menu(f: &mut Frame, shared: &Shared, ui: &Ui, sel: usize) {
     render_action_menu(f, format!("Actions for {name}:"), Action::MENU, sel);
 }
 
+/// The single-pod confirm. What is about to happen — the action, its warning, and for a
+/// safe action the exact commands it runs — fills the top of the popup; the prompt (`[y]
+/// apply`, or the typed-name field) sits in its own rows at the bottom, so it is always on
+/// screen. Live (wave 6): Setup's preview — several long commands — wrapped past the popup's
+/// bottom and took the `[y] apply` line with it. Each command now takes one line, clipped to
+/// the popup's width, and a preview too long for the popup says how many lines it left out.
 fn render_confirm(f: &mut Frame, c: &Confirm) {
-    let mut text = String::new();
-    if c.action.requires_typed_name() {
-        let warn = c.warning().map(|w| format!("\n\n{w}")).unwrap_or_default();
-        text.push_str(&format!(
-            "{} pod '{}'{}\n\nType the pod name to confirm:\n\n  > {}\n\n[enter] apply  [esc] cancel",
-            c.action.label(),
-            c.pod_name,
-            warn,
-            c.typed,
-        ));
-    } else {
-        text.push_str(&format!("{} pod '{}'\n\n", c.action.label(), c.pod_name));
-        if let Some(p) = &c.preview {
-            text.push_str("Will run:\n");
-            text.push_str(p);
-            text.push_str("\n\n");
-        }
-        text.push_str("[y] apply   [n/esc] cancel");
-    }
     let border = if c.action.is_destructive() { Color::Red } else { Color::Yellow };
-    let area = centered_rect(70, 55, f.area());
+    let area = centered_rect(80, 70, f.area());
     f.render_widget(Clear, area);
-    f.render_widget(
-        Paragraph::new(text)
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(border))
-                    .title(format!(" confirm {} ", c.action.label())),
-            ),
-        area,
-    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border))
+        .title(format!(" confirm {} ", c.action.label()));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let prompt = confirm_prompt(c);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(prompt.len() as u16)])
+        .split(inner);
+    let body = confirm_body(c, rows[0].width as usize, rows[0].height as usize);
+    f.render_widget(Paragraph::new(body.join("\n")).wrap(Wrap { trim: false }), rows[0]);
+    f.render_widget(Paragraph::new(prompt.join("\n")), rows[1]);
+}
+
+/// The confirm's bottom rows: the typed-name field, or the `[y]` keys. Pure.
+fn confirm_prompt(c: &Confirm) -> Vec<String> {
+    if c.action.requires_typed_name() {
+        vec![
+            "Type the pod name to confirm:".to_string(),
+            format!("  > {}", c.typed),
+            String::new(),
+            "[enter] apply  [esc] cancel".to_string(),
+        ]
+    } else {
+        vec![String::new(), "[y] apply   [n/esc] cancel".to_string()]
+    }
+}
+
+/// The confirm's body for an area `width` × `rows` (pure, so tested): `<Action> pod '<name>'`,
+/// the warning (wrapped by the widget), then — for a safe action — `Will run:` and one line
+/// per command, clipped to `width`; when the commands don't fit in the rows left, the last
+/// row says how many were left out.
+fn confirm_body(c: &Confirm, width: usize, rows: usize) -> Vec<String> {
+    let mut out = vec![format!("{} pod '{}'", c.action.label(), c.pod_name)];
+    if let Some(w) = c.warning() {
+        out.push(String::new());
+        out.push(w.to_string());
+    }
+    let Some(p) = &c.preview else { return out };
+    out.push(String::new());
+    out.push("Will run:".to_string());
+    // Rows the warning takes once wrapped (it's the only long text above the commands).
+    let used: usize = out.iter().map(|l| l.chars().count().max(1).div_ceil(width.max(1))).sum();
+    let room = rows.saturating_sub(used);
+    let lines: Vec<&str> = p.lines().collect();
+    let fits = if lines.len() <= room { lines.len() } else { room.saturating_sub(1) };
+    for l in &lines[..fits] {
+        out.push(truncate(l, width.max(2)));
+    }
+    if fits < lines.len() {
+        out.push(format!("… {} more line(s) not shown", lines.len() - fits));
+    }
+    out
 }
 
 /// `(count, human label)` for a scope, e.g. `(19, "all 19 pods")` / `(3, "3 marked pods")`.
@@ -3073,6 +3105,37 @@ deep_check_end=1
     /// The rows read the core snapshot: $/h in each provider's currency (`-` when not
     /// billing), the maintenance badge, the last deep check + its age (or `checking`), the
     /// proxy port + state; the summary bar the fleet total with € kept apart.
+    /// Live (wave 6): the Setup confirm's preview — several long commands — wrapped past the
+    /// popup and clipped its `[y] apply` line, and the footer said "type to confirm" for a
+    /// `[y]` prompt. The prompt has its own rows now, each command one clipped line (the rest
+    /// counted), and the footer names the keys the prompt takes.
+    #[test]
+    fn the_setup_confirm_always_shows_its_prompt() {
+        let shared = Shared::default();
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        let long: Vec<String> = (0..30).map(|i| format!("ssh -p 22001 root@10.0.0.1 'step {i}: {}'", "x".repeat(200))).collect();
+        ui.mode = Mode::Confirm(Confirm::new(Action::Setup, "devtest-alpha".into(), "id".into(), Some(long.join("\n"))));
+        for (w, h) in [(120, 40), (80, 24), (60, 16)] {
+            let all = draw(w, h, &shared, &ui).join("\n");
+            assert!(all.contains("[y] apply") && all.contains("[n/esc] cancel"), "{w}x{h}:\n{all}");
+            assert!(all.contains("more line(s) not shown") && all.contains("step 0:"), "{w}x{h}:\n{all}");
+            assert!(!all.contains("type to confirm"), "{w}x{h}: the footer offers [y]:\n{all}");
+        }
+        // A short preview is shown whole.
+        ui.mode = Mode::Confirm(Confirm::new(Action::Setup, "devtest-alpha".into(), "id".into(), Some("echo one\necho two".into())));
+        let all = draw(120, 40, &shared, &ui).join("\n");
+        assert!(all.contains("echo two") && !all.contains("not shown") && all.contains("[y] apply"), "{all}");
+        // A typed-name action keeps its field at the bottom, and its footer says so.
+        ui.mode = Mode::Confirm(Confirm::new(Action::Terminate, "devtest-alpha".into(), "id".into(), None));
+        let all = draw(100, 30, &shared, &ui).join("\n");
+        assert!(all.contains("Type the pod name to confirm") && all.contains("type the pod's name"), "{all}");
+        // The body (pure): commands clipped to the width, the overflow counted.
+        let c = Confirm::new(Action::Setup, "p".into(), "id".into(), Some(long.join("\n")));
+        let body = confirm_body(&c, 40, 10);
+        assert!(body.len() <= 10 && body.iter().all(|l| l.chars().count() <= 40), "{body:?}");
+        assert_eq!(body.last().unwrap(), "… 24 more line(s) not shown");
+    }
+
     #[test]
     fn rows_show_cost_maintenance_health_and_proxy_from_the_snapshot() {
         let shared = fixture_shared();
