@@ -48,6 +48,10 @@ impl Config {
         // Where the health cache lives (`snapshot::health_cache_path`): lets the sandbox, a
         // cron job or a test point it somewhere explicit without editing the shared config.
         "ARENA_STATE_DIR",
+        // The per-pod wall-clock budget of a backup rsync (`pull::backup_timeout`): an
+        // operator can give one big first pull longer (or a test less) without editing the
+        // shared config.
+        "BACKUP_TIMEOUT_SECS",
     ];
 
     /// Let environment variables override values from the file: any key already in the
@@ -264,6 +268,10 @@ MACHINE_NAME_LIST=(
         let mut c = Config::parse("IMAGE=base:1");
         c.apply_overrides(|k| (k == "ARENA_STATE_DIR").then(|| "/srv/arena-state".to_string()));
         assert_eq!(c.get("ARENA_STATE_DIR"), Some("/srv/arena-state"));
+        // Likewise the backup rsync's per-pod budget.
+        let mut c = Config::parse("IMAGE=base:1");
+        c.apply_overrides(|k| (k == "BACKUP_TIMEOUT_SECS").then(|| "600".to_string()));
+        assert_eq!(c.get("BACKUP_TIMEOUT_SECS"), Some("600"));
     }
 
     #[test]

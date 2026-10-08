@@ -12,6 +12,14 @@
   `arena snapshot --public --out <dir>/fleet.json` (see `arena cron install --snapshot`) —
   and renders it. Every value from the JSON goes into the page through textContent, never
   innerHTML, so nothing in the data can become markup.
+
+  Status is one of exactly three words (`arena_core::snapshot::PublicStatus`; anything else
+  shows unstyled):
+    up        running, and its SSH port answered when the snapshot was taken — you can log in
+    starting  billing but not answering yet: being created, booting, or listed running while
+              its SSH port is silent (usually sshd still starting; rarely a stuck machine —
+              the health column says more once a check has run)
+    down      stopped, exited, or in an error state
 -->
 <style>
   :root {
@@ -122,7 +130,7 @@
     <tbody id="rows"></tbody>
   </table>
   <p id="empty" hidden>No machines.</p>
-  <footer>Health is the last deep check (GPU, driver, network, disk, load), with its age. Refreshes every minute.</footer>
+  <footer>Status: <b>up</b> = running and answering SSH; <b>starting</b> = on its way up (or not answering yet); <b>down</b> = stopped. Health is the last deep check (GPU, driver, network, disk, load), with its age. Refreshes every minute.</footer>
 </main>
 <script>
 "use strict";

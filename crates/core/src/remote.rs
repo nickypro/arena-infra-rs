@@ -7,9 +7,11 @@
 //! never in a release build) scripts per-host replies, delays and failures and records
 //! every call, so fleet behaviour can be tested with paused time. Every pod-SSH path in
 //! the CLI goes through it, each call with a budget, so one wedged pod can't hang a fleet
-//! command. Outside it on purpose: rsync transfers (`pods pull`, the replace/migrate
-//! via-local file copy) — rsync drives its own ssh transport (`-e`), which is neither an
-//! exec nor a single-file copy — and the proxy host's nginx deploy, which isn't a pod.
+//! command. Outside it on purpose: rsync transfers (`pods pull`, `pods backup`'s file step,
+//! the replace/migrate via-local file copy) — rsync drives its own ssh transport (`-e`),
+//! which is neither an exec nor a single-file copy — and the proxy host's nginx deploy,
+//! which isn't a pod. The rsyncs still get the same budget and child discipline through
+//! [`run_local`]: one wedged pod must not hold a backup (or the cron behind it) forever.
 //!
 //! Timeouts: `timeout` bounds the whole call (connect + transfer/remote run). On expiry
 //! the call returns [`Error::Timeout`] — a distinct variant, so a caller never mistakes
@@ -18,7 +20,10 @@
 //! default is to leave a dropped child *running*, so without this every "timed out" step
 //! would keep a stray ssh process (and its remote command) alive behind the operator's
 //! back. Stopping is SIGTERM first, SIGKILL after a short grace ([`TERM_GRACE`], plus
-//! `kill_on_drop` as the backstop): `scp` runs its own `ssh` transport as a child, and
+//! `kill_on_drop` as the backstop). On a timeout the stop is over before the call returns
+//! (so a timed-out call takes up to [`TERM_GRACE`] longer than its budget): a CLI whose
+//! last job just timed out exits at once, and a grace left running in the background would
+//! die with the runtime. Why SIGTERM first: `scp` runs its own `ssh` transport as a child, and
 //! only a catchable signal lets scp take that transport down with it — a bare SIGKILL of
 //! scp orphans the transport, which then lingers on a wedged pod. (Deliberately not a
 //! separate process group + `killpg`: that would take the children out of the terminal's
@@ -143,6 +148,23 @@ impl Remote for SshRemote {
     }
 }
 
+/// Run the local `program` with `args` to completion within `timeout`, capturing its
+/// output — for a transfer that drives its own ssh transport and so can't be a [`Remote`]
+/// call (rsync's `-e ssh …`). Same child discipline as [`SshRemote`]: stdin closed, and on
+/// expiry SIGTERM, then SIGKILL after [`TERM_GRACE`], finished before the timeout is
+/// returned (if the caller drops this future instead, the same in the background).
+/// SIGTERM-first matters doubly for rsync: like scp, it runs `ssh` as a child — and, pulling,
+/// a forked receiver — and only takes them down on a catchable signal: a SIGKILLed rsync
+/// leaves its ssh and receiver transferring from the wedged pod, the receiver holding the
+/// backup cron's lock and a partial temp file. `what` names the call in a timeout/spawn
+/// error. Same `Ok`/`Err` contract as [`Remote::exec`]: a non-zero exit is `Ok` with
+/// `success == false`; `Err` is a spawn error or [`Error::Timeout`].
+pub async fn run_local(program: &str, args: &[String], what: &str, timeout: Option<Duration>) -> Result<SshOutput> {
+    let mut c = child(program);
+    c.args(args);
+    output_within(c, what, timeout).await
+}
+
 /// A child process that can't wedge on a prompt (stdin closed) and dies with its future
 /// (`kill_on_drop`) — the property the per-step timeouts depend on.
 fn child(program: &str) -> Command {
@@ -151,17 +173,29 @@ fn child(program: &str) -> Command {
     c
 }
 
-/// How long an abandoned child gets to exit on SIGTERM before it is SIGKILLed. scp/ssh
-/// exit at once on SIGTERM; this only matters for one that ignores it.
+/// How long a stopped child gets to exit on SIGTERM before it is SIGKILLed. scp/ssh exit at
+/// once on SIGTERM; rsync takes ~400 ms (its handler waits before signalling its ssh
+/// transport and forked receiver), so this must stay well above that — a SIGKILL inside
+/// that window orphans both.
 pub const TERM_GRACE: Duration = Duration::from_secs(2);
 
-/// Run `cmd` to completion (capturing stdout/stderr) within `timeout`. On timeout (or if
-/// this future is dropped) the child is stopped by [`Stopper`].
+/// Run `cmd` to completion (capturing stdout/stderr) within `timeout`. On timeout the child
+/// is stopped *before* this returns ([`Stopper::stop`]); if this future is dropped instead,
+/// [`Stopper`]'s `Drop` does it in the background.
 async fn output_within(mut cmd: Command, what: &str, timeout: Option<Duration>) -> Result<SshOutput> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let spawned = cmd.spawn().map_err(|e| Error::provider(format!("spawning {what}: {e}")))?;
     let mut child = Stopper(Some(spawned));
-    let (status, stdout, stderr) = within(what, timeout, child.output(what)).await?;
+    let result = within(what, timeout, child.output(what)).await;
+    if result.is_err() {
+        // Timed out (or the wait itself failed): finish the stop here, not in a detached
+        // task. The caller often returns at once — a wedged pod's rsync is usually a
+        // backup's last job, so `main` exits and drops the runtime, which would cancel a
+        // background grace and leave only `kill_on_drop`'s bare SIGKILL, orphaning the
+        // transport and receiver (still transferring, still holding the cron's flock).
+        child.stop().await;
+    }
+    let (status, stdout, stderr) = result?;
     Ok(SshOutput {
         success: status.success(),
         code: status.code(),
@@ -170,9 +204,10 @@ async fn output_within(mut cmd: Command, what: &str, timeout: Option<Duration>) 
     })
 }
 
-/// Owns a running child; if dropped before the child finished, stops it gracefully (see
-/// the module doc): SIGTERM now, then SIGKILL (`kill_on_drop`) once it has had
-/// [`TERM_GRACE`] to exit. Holding the `Child` — rather than handing it to
+/// Owns a running child and stops it gracefully (see the module doc): SIGTERM, then SIGKILL
+/// once it has had [`TERM_GRACE`] to exit. On a timeout [`Stopper::stop`] does that inline;
+/// `Drop` is the backstop for a caller that abandons the call (drops the future), where
+/// nothing can be awaited. Holding the `Child` — rather than handing it to
 /// `wait_with_output`, whose drop SIGKILLs at once — is what makes SIGTERM-first possible.
 struct Stopper(Option<Child>);
 
@@ -180,10 +215,25 @@ impl Stopper {
     /// Wait for exit while draining stdout/stderr (concurrently, so a chatty child can't
     /// block on a full pipe).
     async fn output(&mut self, what: &str) -> Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
-        let child = self.0.as_mut().expect("the child is only taken on drop");
+        let child = self.0.as_mut().expect("the child is only taken when stopping");
         let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
         tokio::try_join!(child.wait(), read_all(stdout), read_all(stderr))
             .map_err(|e| Error::provider(format!("waiting for {what}: {e}")))
+    }
+
+    /// Stop the child and wait until it is gone: SIGTERM, up to [`TERM_GRACE`] for it to
+    /// exit (rsync/scp take their ssh transport down meanwhile), then SIGKILL and reap.
+    /// Awaited, so when it returns the stop is over — whatever the caller does next.
+    async fn stop(&mut self) {
+        let Some(mut child) = self.0.take() else { return };
+        // Already reaped (it finished as the clock ran out): nothing to stop, and the pid
+        // may belong to another process by now — never signal it.
+        let Some(pid) = child.id() else { return };
+        terminate(pid);
+        if tokio::time::timeout(TERM_GRACE, child.wait()).await.is_err() {
+            // Ignored SIGTERM: SIGKILL, and reap it.
+            let _ = child.kill().await;
+        }
     }
 }
 
@@ -196,7 +246,9 @@ impl Drop for Stopper {
         terminate(pid);
         match tokio::runtime::Handle::try_current() {
             // Let it exit on SIGTERM (scp first takes its ssh transport down); if it is
-            // still running after the grace, dropping `child` SIGKILLs it.
+            // still running after the grace, dropping `child` SIGKILLs it. Best effort: a
+            // runtime shut down meanwhile cancels this and SIGKILLs at once — which is why
+            // the timeout path stops the child inline instead.
             Ok(rt) => {
                 rt.spawn(async move {
                     let _ = tokio::time::timeout(TERM_GRACE, child.wait()).await;
@@ -605,7 +657,169 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A child that ignores SIGTERM is still SIGKILLed once the grace has passed.
+    /// The same for rsync (`pods pull`, `pods backup`'s file step, the via-local copy): a
+    /// timed-out [`run_local`] rsync takes its ssh transport down with it. Real `rsync`, a
+    /// fake transport (`-e`) that records its pid and hangs like a wedged pod — no network.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn timed_out_rsync_takes_its_ssh_transport_down_too() {
+        if std::process::Command::new("rsync").arg("--version").output().is_err() {
+            eprintln!("rsync not installed — skipping");
+            return;
+        }
+        let dir = scratch("rsync");
+        let pidfile = dir.join("transport.pid");
+        let transport = dir.join("fake-ssh.sh");
+        std::fs::write(&transport, format!("#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n", pidfile.display())).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&transport, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let dest = format!("{}/", dir.join("dest").display());
+        let args: Vec<String> =
+            ["-a", "--timeout=300", "-e", &transport.display().to_string(), "root@10.0.0.1:", &dest].map(String::from).into();
+        let started = std::time::Instant::now();
+        let err = run_local("rsync", &args, "rsync of devtest-apple", Some(Duration::from_millis(700))).await.unwrap_err();
+        assert!(matches!(&err, Error::Timeout { what, .. } if what == "rsync of devtest-apple"), "{err}");
+        assert_eq!(describe_error(&err), "timed out after 700ms");
+        assert!(started.elapsed() < Duration::from_secs(10), "returned at the budget, not at the transport's exit");
+
+        let pid = std::fs::read_to_string(&pidfile).expect("transport wrote its pid").trim().to_string();
+        assert_dies(&pid, Duration::from_secs(5), "rsync's ssh transport").await;
+        // A finished run is captured like any other call; a missing binary is a spawn error.
+        let out = run_local("sh", &["-c".into(), "echo moved; exit 23".into()], "rsync", None).await.unwrap();
+        assert_eq!((out.success, out.code, out.stdout.as_str()), (false, Some(23), "moved\n"));
+        let err = run_local("/nonexistent/arena-no-rsync", &[], "rsync of x", None).await.unwrap_err();
+        assert!(err.to_string().contains("spawning rsync of x"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Live processes (other than this test) whose argv mentions `needle` — the rsync client,
+    /// its forked receiver and the local "remote" server all carry the scratch dir. Zombies
+    /// have no argv, so they don't count.
+    #[cfg(target_os = "linux")]
+    fn live_procs_mentioning(needle: &str) -> Vec<u32> {
+        let me = std::process::id();
+        let Ok(entries) = std::fs::read_dir("/proc") else { return Vec::new() };
+        entries
+            .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
+            .filter(|pid| *pid != me)
+            .filter(|pid| {
+                std::fs::read(format!("/proc/{pid}/cmdline"))
+                    .is_ok_and(|c| String::from_utf8_lossy(&c).replace('\0', " ").contains(needle))
+            })
+            .collect()
+    }
+
+    /// The exit path the CLI actually takes (review finding): the wedged pod's rsync is the
+    /// last job, so the timeout comes back and `main` returns, dropping the runtime at once.
+    /// The stop must be over by then — a grace left to a background task dies with the
+    /// runtime, and the bare SIGKILL that follows (`kill_on_drop`) lands inside rsync's
+    /// ~400 ms SIGTERM handling, orphaning its ssh transport and its forked receiver, which
+    /// go on transferring (holding the cron's flock, leaving a `.big.bin.XXXXXX` temp file)
+    /// after arena has exited. Real rsync pulls an incompressible file, throttled by
+    /// `--bwlimit`, through a fake transport that runs the `rsync --server` here (as sshd
+    /// would on the pod), so a receiver is forked and a temp file is mid-write when the
+    /// budget runs out; the call has its own runtime, dropped right after. No network.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_timed_out_rsync_is_fully_stopped_before_the_runtime_goes() {
+        use std::io::Read;
+        use std::os::unix::fs::PermissionsExt;
+        if std::process::Command::new("rsync").arg("--version").output().is_err() {
+            eprintln!("rsync not installed — skipping");
+            return;
+        }
+        let dir = scratch("rsync-exit");
+        let (src, dest) = (dir.join("src"), dir.join("dest"));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        // 4 MiB of random bytes: -z can't shrink them, so --bwlimit=256 (KiB/s) keeps the
+        // transfer going for ~16 s — far past the budget and the checks below.
+        let mut data = vec![0u8; 4 << 20];
+        std::fs::File::open("/dev/urandom").unwrap().read_exact(&mut data).unwrap();
+        std::fs::write(src.join("big.bin"), &data).unwrap();
+        let pidfile = dir.join("transport.pid");
+        let transport = dir.join("fake-ssh.sh");
+        // rsync runs `<transport> [-l user] host rsync --server --sender …`: skip to the
+        // remote command and run it locally.
+        std::fs::write(
+            &transport,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\nwhile [ $# -gt 0 ] && [ \"$1\" != rsync ]; do shift; done\nexec \"$@\"\n",
+                pidfile.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&transport, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let args: Vec<String> = vec![
+            "-avz".into(),
+            "--timeout=300".into(),
+            "--bwlimit=256".into(),
+            "-e".into(),
+            transport.display().to_string(),
+            format!("root@10.0.0.1:{}/", src.display()),
+            format!("{}/", dest.display()),
+        ];
+        let temp_files = || -> Vec<String> {
+            std::fs::read_dir(&dest)
+                .map(|d| d.filter_map(|e| e.ok()?.file_name().into_string().ok()).filter(|n| n.starts_with(".big.bin.")).collect())
+                .unwrap_or_default()
+        };
+        // Watch for the receiver's temp file while the call runs: proof the budget ran out
+        // mid-transfer, with a receiver forked.
+        let stop_watch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher = {
+            let (stop, dest) = (stop_watch.clone(), dest.clone());
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let mid = std::fs::read_dir(&dest)
+                        .is_ok_and(|mut d| d.any(|e| e.is_ok_and(|e| e.file_name().to_string_lossy().starts_with(".big.bin."))));
+                    if mid {
+                        return true;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                false
+            })
+        };
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let err = rt
+            .block_on(run_local("rsync", &args, "rsync of devtest-bloom [big]", Some(Duration::from_secs(2))))
+            .unwrap_err();
+        drop(rt); // what returning from `#[tokio::main]` does
+        stop_watch.store(true, std::sync::atomic::Ordering::Relaxed);
+        let saw_temp = watcher.join().unwrap();
+        assert!(matches!(err, Error::Timeout { .. }), "{err}");
+        assert!(saw_temp, "the budget should have run out mid-transfer (no temp file seen)");
+        assert!(pidfile.exists(), "the transport ran");
+
+        // Within a few seconds nothing of the transfer is left: no transport/server, no
+        // receiver, no partial temp file.
+        let needle = dir.display().to_string();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let (alive, temps) = (live_procs_mentioning(&needle), temp_files());
+            if alive.is_empty() && temps.is_empty() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                for pid in &alive {
+                    // Clean up before failing, so a regression doesn't leave a transfer running.
+                    if let Ok(p) = libc::pid_t::try_from(*pid) {
+                        // SAFETY: kill(2) on a test-owned stray; no memory involved.
+                        unsafe {
+                            libc::kill(p, libc::SIGKILL);
+                        }
+                    }
+                }
+                panic!("left behind after the runtime was dropped: processes {alive:?}, temp files {temps:?}");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A child that ignores SIGTERM is still SIGKILLed once the grace has passed — and the
+    /// timed-out call returns only after that: the stop is finished inline.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn child_ignoring_sigterm_is_killed_after_the_grace() {
@@ -613,13 +827,30 @@ mod tests {
         let pidfile = dir.join("pid");
         let mut c = child("sh");
         c.arg("-c").arg(format!("trap '' TERM; echo $$ > '{}'; while :; do sleep 0.2; done", pidfile.display()));
+        let started = std::time::Instant::now();
         let err = output_within(c, "sh", Some(Duration::from_millis(500))).await.unwrap_err();
         assert!(matches!(err, Error::Timeout { .. }), "{err}");
         let pid = std::fs::read_to_string(&pidfile).expect("child wrote its pid").trim().to_string();
-        // SIGTERM came first (ignored here), so it is not dead yet…
-        assert!(matches!(proc_state(&pid).as_deref(), Some(s) if s != "Z" && s != "X"), "killed without a grace");
-        // …but it is once the grace is over.
-        assert_dies(&pid, TERM_GRACE + Duration::from_secs(5), "sh ignoring SIGTERM").await;
+        // SIGTERM came first (ignored here) and it got the whole grace…
+        assert!(started.elapsed() >= Duration::from_millis(500) + TERM_GRACE, "killed without a grace");
+        // …and it was gone by the time the timeout came back.
+        assert!(matches!(proc_state(&pid).as_deref(), None | Some("Z") | Some("X")), "still alive after the call returned");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The backstop: a caller that abandons the call (drops the future — no timeout of the
+    /// call's own) still gets its child stopped, in the background.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_abandoned_call_still_stops_its_child() {
+        let dir = scratch("abandon");
+        let pidfile = dir.join("pid");
+        let mut c = child("sh");
+        c.arg("-c").arg(format!("echo $$ > '{}'; exec sleep 30", pidfile.display()));
+        let gave_up = tokio::time::timeout(Duration::from_millis(500), output_within(c, "sh", None)).await;
+        assert!(gave_up.is_err(), "the caller gave up first");
+        let pid = std::fs::read_to_string(&pidfile).expect("child wrote its pid").trim().to_string();
+        assert_dies(&pid, Duration::from_secs(5), "an abandoned call's child").await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -7,6 +7,7 @@
 
 pub mod apikeys;
 pub mod backup;
+pub mod balance;
 pub(crate) mod base64;
 pub mod config;
 pub mod error;
@@ -14,6 +15,7 @@ pub mod fleet;
 pub mod gpu;
 pub mod health;
 pub(crate) mod http;
+pub mod idle;
 pub mod jobs;
 pub mod metrics;
 pub mod naming;

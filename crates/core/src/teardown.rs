@@ -293,8 +293,8 @@ fn is_staff(naming: &Naming, name: &str) -> bool {
 /// Is `name` one of this cohort's machines: `{prefix}-…` (parked `-old`/`-new` twins
 /// included), never a staff box ([`is_staff`]). Every pod on the account still counts as
 /// remaining — the account pays for all of them — but only cohort pods get a ready-to-paste
-/// terminate command.
-fn is_cohort_pod(naming: &Naming, name: &str) -> bool {
+/// terminate command (`pods idle` suggests commands for the same pods only).
+pub(crate) fn is_cohort_pod(naming: &Naming, name: &str) -> bool {
     name.starts_with(&format!("{}-", naming.prefix)) && !is_staff(naming, name)
 }
 

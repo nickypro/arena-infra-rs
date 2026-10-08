@@ -58,6 +58,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     pod, and the allowlisted `PublicSnapshot` for the web page.
   - `teardown` — the pure judge behind `teardown --check`: listings, volumes, keys, cron/`at`
     and proxy inputs in, a `✓ ✗ ? –` checklist with fix commands out (unknown ≠ empty).
+  - `balance` — provider account balances (RunPod GraphQL `myself`, Vast `users/current`;
+    Hetzner postpaid) judged against the burn into a runway; `idle` — the read-only
+    `pods idle` probe script, its reply parser and the verdict/report (unknown ≠ idle).
   - `proxy` — port-forwarding planner. Pods are reached over SSH (VS Code
     Remote-SSH), and the provider reassigns a pod's SSH endpoint on restart, so the
     proxy host gives each machine a *stable* public port (`cute.sus.cat:7000`, …)
@@ -87,7 +90,10 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     running or on its way up — RunPod v2 `PROVISIONING`/`STARTING`/`ERROR` too, Hetzner
     `initializing`, Vast `loading` — not `EXITED`/`STOPPED`/`TERMINATED`/`off`; a Hetzner
     server bills while it exists, powered off included. A non-billing pod's `$/H` shows `-`
-    (`--json` keeps the raw `cost_per_hr`). GPU/$/maintenance come from one extra read-only
+    (`--json` keeps the raw `cost_per_hr`). Under the footer (table only) one
+    `balance: runpod $32.54 ~65h · vast $136.87 no billing pods · hetzner postpaid` line plus
+    any ⚠ (see `balance`), read while the list runs — best-effort, each account within 15 s,
+    never failing the list. GPU/$/maintenance come from one extra read-only
     RunPod GraphQL query per `list` (best-effort: if it fails you get one warning line and
     the list still renders); the `nvidia-smi` probe over SSH (default for the table,
     `--probe`/`--no-probe`) overrides the GPU when a pod answers. `list --json` emits the
@@ -249,24 +255,38 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
   - `config check` — validate that the keys the selected provider + proxy + backup
     need are present (never prints secret values; exits non-zero if a required key is
     missing). Copy `config.env.example` to get started.
-  - `cron install|remove|show` — manage a crontab schedule for `arena pods backup`
-    (default every 15 min, git-only; `--pull` runs the full backup — git + rsync file
-    backup — each tick; `--start-date` bakes `ARENA_START_DATE` into the line); edits only
-    arena-managed lines, leaving other entries intact. `--proxy` adds a `*/5 … proxy apply
-    --yes` line (log: `~/arena-proxy-cron.log`; sets a `PATH` with `/usr/sbin` so cron
-    finds nginx, and `flock -n` so a slow tick never piles up) that catches changes made outside the CLI
-    (dashboard terminates, restarts that move an endpoint); re-running `install` without
-    it removes that line. Remove it before changing `MACHINE_NAME_PREFIX`/`_LIST`: a name
-    that leaves the list loses its forward on the next tick. `--snapshot <DIR>` adds a
-    `*/2 … snapshot --public --out <DIR>/fleet.json` line (`flock -n`, log
-    `~/arena-snapshot-cron.log`) for the [fleet page](#publishing-the-fleet-page).
+  - `cron install|remove|show` — manage arena's lines in your crontab (other entries are
+    never touched). Each line has an identity — **backup**, **proxy**, **snapshot** — and
+    `install` adds/replaces **only the lines its flags name**, keeping the rest (a later
+    `install --proxy` no longer drops an earlier `--pull`/`--start-date`/`--snapshot`):
+    `--backup` = `pods backup` every 15 min (`--schedule`), git-only unless `--pull` (git +
+    rsync file backup each tick), `--start-date` bakes `ARENA_START_DATE` in — those three
+    (and `--no-pull`, `--no-start-date`) imply `--backup`, and a bare `cron install` means
+    `--backup`. Rewriting the backup line **keeps the installed one's `--pull`, start date and
+    schedule** unless a flag changes them (`--no-pull` / `--no-start-date` drop one; a note
+    says what was kept), so `cron install --backup` just upgrades the line; `--proxy` = a `*/5 … proxy
+    apply --yes` line (log `~/arena-proxy-cron.log`; a `PATH` with `/usr/sbin` so cron finds
+    nginx) that catches changes made outside the CLI (dashboard terminates, restarts that
+    move an endpoint) — remove it before changing `MACHINE_NAME_PREFIX`/`_LIST`: a name that
+    leaves the list loses its forward on the next tick; `--snapshot <DIR>` = a `*/2 …
+    snapshot --public --out <DIR>/fleet.json` line (log `~/arena-snapshot-cron.log`) for the
+    [fleet page](#publishing-the-fleet-page). Every line runs under `flock -n` (a tick that
+    finds the previous one still running exits instead of stacking — the backup's lock is
+    `~/.arena-backup-cron.lock`, held by `flock -o` itself so no stray rsync can keep it).
+    `remove --backup|--proxy|--snapshot` drops just those; plain `remove` drops the whole
+    block. Both print the block's before → after diff (every removed copy of a duplicate
+    shown) and confirm (`--yes` for scripts, `--dry-run` to preview); `show` labels each line
+    with its identity. Lines written by older versions are recognized by the command they
+    run; comments in the block (a paused `# …` line, a note) are never matched, replaced or
+    removed by a targeted install/remove.
   - `pods backup [targets]` — the **full save**: git-push the ARENA tree **and** rsync the
     home to the local backups folder (`pull`). The git push is on **whatever branch the
     pod is on** (never switches/creates one, so bespoke branches are respected) and
     **skips `main`/`master`**; clean trees report `NO_CHANGES`. Selected pods, or all.
     `--no-pull` = git only; `--message` overrides the commit message. Confirms first
-    (`--dry-run` previews both). Each pod's git push has a 5-min budget. To stage onto a
-    dated autocommit branch, run `pods init-branches` first.
+    (`--dry-run` previews both). Each pod's git push has a 5-min budget, its rsync the
+    `pull` budgets below. To stage onto a dated autocommit branch, run `pods init-branches`
+    first.
   - `pods set-branch <branch> <targets|--all> [--hard]` — switch pods' ARENA checkout to a
     branch. Gentle by default (fetch + checkout + ff-only pull — fails on a diverged/dirty
     tree rather than clobbering work). **`--hard` is destructive**: force the branch to
@@ -340,13 +360,20 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `MACHINE_NAME_PREFIX`, so the sandbox and prod never share one; owner-only, written
     atomically under a lock, keyed by provider + pod id; records of pods their provider
     listed OK without are dropped. A corrupt file is one warning and gets replaced.
-  - `snapshot [--json] [--public] [--out FILE]` — the fleet in one **read-only** picture
-    (one list per provider + the details query, the local proxy file, the health cache; **no
-    SSH, no checks**): `pods list`'s columns plus `PROXY` (`:9500`, `:9500 stale`, `?` =
-    remote proxy) and `HEALTH` (`fail 2h GPU error`). `--json` = the internal snapshot (ids,
-    endpoints, costs — never publish it). `--public` = the dashboard JSON, an **allowlist by
-    construction**: only *prefixed* `MACHINE_NAME_LIST` pods (`@` staff boxes and off-list
-    pods are left out) by short name, with GPU, `up|starting|down`, health + age + a reason
+  - `snapshot [--json] [--public] [--out FILE] [--no-probe]` — the fleet in one **read-only**
+    picture (one list per provider + the details query, the local proxy file, the health
+    cache, and a **reachability probe**: a TCP connect to the SSH endpoint of each billing
+    machine on the prefixed `MACHINE_NAME_LIST` — never staff `@` boxes or off-list pods —
+    all at once, ≤ 3 s, waiting only for sshd's `SSH-…` greeting — nothing sent, no login, no
+    command; **no checks**): `pods list`'s columns plus `SSH` (`ok`/`down`/`-` = not
+    probed), `PROXY` (`:9500`, `:9500 stale`, `?` = remote proxy) and `HEALTH` (`fail 2h
+    GPU error`). Public `up` needs the probe's answer: a pod listed running whose SSH port
+    is silent reads `starting` (the vocabulary stays `up|starting|down`, documented in
+    `web/fleet.html`); `--no-probe` skips it (then running + endpoint = `up`). `--json` =
+    the internal snapshot (ids, endpoints, costs — never publish it). `--public` = the
+    dashboard JSON, an **allowlist by construction**: only *prefixed* `MACHINE_NAME_LIST`
+    pods (`@` staff boxes and off-list pods are left out) by short name, with GPU,
+    `up|starting|down`, health + age + a reason
     from a fixed vocabulary (never check text), maintenance start/end (only a complete RFC
     3339 time, re-printed in UTC — anything else is dropped), `updated_at`, `complete`. No
     IPs, hosts, ports, ids, providers, costs or keys (pinned by a leak test). `--out` is
@@ -376,13 +403,51 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     are read (not root's, not `/etc/cron.d`); shown commands have secret-looking values
     redacted (`NAME=…`, `--flag=…`/`--flag …` named key/token/secret/pass, `sk-`/`rpa_`/`hf_`
     words; tab-separated fields too). `--json` = the same checklist for scripts.
+    After the checklist (text only) come the provider account balances — informational, never
+    part of the verdict or the exit: what's left, and whether RunPod still reports spend.
+  - `balance [--json]` — money left on each provider account and how long it lasts
+    (read-only). **RunPod** via GraphQL `myself { clientBalance currentSpendPerHr spendLimit
+    underBalance }` (REST v2 has billing history only; if GraphQL goes away the balance reads
+    "unavailable" and nothing else breaks); **Vast** `GET /api/v0/users/current/` → `credit`
+    (the prepaid amount the console shows; a negative `balance` is shown as possibly owed,
+    never folded in; that body carries the email and API key, so only those two fields are
+    read and it is never quoted); **Hetzner** is postpaid — said, no number. Burn = the higher
+    of the provider's own rate and this fleet's billing pods there (a provider that failed to
+    list, with no rate of its own, is `?` — never "not burning"); runway = balance ÷ burn, with
+    the date it runs out. Below `BALANCE_WARN_HOURS` (default 48; `0` = runway warning off; a
+    malformed value is an error here, the default elsewhere) — or at zero, or RunPod's
+    `underBalance` — a row is a ⚠ (`top up … before it stops every pod`). Exits non-zero when
+    an account needs a top-up or couldn't be read (`arena balance || <alert>` from cron).
+    Never shows account ids or emails. Each account read ≤ 20 s, status-first.
+  - `pods idle [targets] [--hours N] [--json]` — which pods look abandoned: a **read-only
+    report that never acts**. One bounded probe per billing pod (60 s; POSIX `sh`, writes
+    nothing): established inbound connections from `/proc/net/tcp{,6}` — SSH sessions on
+    sshd's port (VS Code Remote-SSH counts; the probe's own, identified by `$SSH_CONNECTION`,
+    is left out) and non-loopback ones to any other listening port (Jupyter through the
+    provider's proxy) —, GPU util (busiest of 3 `nvidia-smi` samples) + memory, the newest
+    file mtime under the home and `BACKUP_REPO_PATH` (`find` ≤ 20 s, skipping `.git`, caches,
+    editor servers, package dirs) and PID 1's age, all on the pod's own clock. A table, then
+    the **candidates** — idle by every measure for `--hours` (default 6: no connection, GPU
+    ≤ 5 %, no file change, up that long), this cohort's machines only (a staff `@` box or
+    another prefix is named, never given a command) — with what they cost and the exact
+    commands to run, **printed, not run**: `arena pods backup <name>` then `arena pods
+    terminate <name>` (the id when a name is shared). Anything unreadable (no reply, a scan
+    that timed out, `[N/A]` GPU, our own connection not found, more than 2000 sockets so not
+    every connection was read) makes a pod `?`, never a candidate. Not seen: sessions through RunPod's `ssh.runpod.io` proxy (not via sshd).
   - `pods pull [label]` — the **file** backup (complementing the git `backup`): rsyncs
     each pod's home into `<dir>/<label>/<pod>/`, reporting files/bytes moved per pod.
     **Keeps `.git`** (so the backup is a usable repo; `--no-git` to skip), size-caps with
     `--max-size`, excludes other dotfile dirs + `site-packages`. Knobs come from flags
     else config: `LOCAL_BACKUP_DIR` (`--dir`), `BACKUP_MAX_SIZE` (`--max-size`),
     `BACKUP_REMOTE_PATH` (`--remote-path`, default `~/`). Label defaults to the `wNdM`
-    iteration. Confirms first; `--dry-run` prints the exact rsync commands.
+    iteration. Confirms first; `--dry-run` prints the exact rsync commands. **Bounded**: rsync
+    `--timeout=300` (gives up after 5 min without any I/O) and a wall-clock budget per pod,
+    `BACKUP_TIMEOUT_SECS` (default 7200 = 2 h, max a day; settable from the environment) —
+    a pod that runs out is stopped (SIGTERM, so rsync takes its ssh and receiver down too;
+    SIGKILL 2 s later) before the failure is reported — so nothing is left running even when
+    it was the last job and arena exits right after — and named in the failure (`✗
+    arena9-bloom [big]: timed out after 7200s`); the other pods finish, and the next run
+    continues incrementally.
   - `pods copy-keys` — distribute API keys into each pod's `~/.bashrc`/`~/.zshrc`
     (idempotent): per-host keys from `<keys-dir>/<provider>_api_keys.csv`
     (openai/anthropic/openrouter) **plus broadcast tokens** — a Hugging Face token
@@ -483,7 +548,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     no forward, `?` remote proxy. The **summary bar** is `pods list`'s footer (`$` and
     Hetzner `€` kept apart, unpriced pods counted) plus per day, **led** by a yellow
     `⚠ vast failed to list — its pods (and their cost) are missing` when a provider didn't
-    answer (first, so a narrow terminal can't cut it off). API calls per refresh are
+    answer (first, so a narrow terminal can't cut it off), and ending with the account
+    balance (`arena balance`'s one-liner, read every 5 min in its own task; when an account
+    needs a top-up it moves to the front, in red). API calls per refresh are
     unchanged (one list per provider); the details query (GPU/$/maintenance) runs every
     60 s or on `r` (≥10 s apart); one that fails part-way still shows what it filled (as
     `pods list` does) over the last good answer, with a footer warning.
@@ -539,7 +606,8 @@ Hetzner), commit/backup, the GPU/progress dashboard, and proxy/port-forwarding.
 - **Mutating commands act, but confirm first.** `create`/`stop`/`terminate`/… print
   what they'll do and prompt `Proceed? [y/N]` at a terminal. `-y`/`--yes` skips the
   prompt. With **no terminal** (cron, pipes) they *refuse* unless `--yes` is given — so
-  nothing mutates non-interactively by accident. (`cron install` bakes `--yes` in.)
+  nothing mutates non-interactively by accident. (`cron install`/`remove` confirm too, and
+  bake `--yes` into the lines they install.)
 - **`--dry-run` previews** any mutating command (also `--dry`/`--dryrun`): prints exactly
   what would happen and changes nothing.
 
@@ -628,8 +696,10 @@ Notes / sharp edges to know:
   runs out stops rather than redo it via local staging — nothing swapped; re-running
   `migrate copy` continues it, and a stopped `replace` leaves `<name>-new` running: continue
   with `migrate copy <name>` + `migrate cutover <name>`, or terminate it);
-  `setup`/`copy-keys` as described above. rsync transfers (`pull`, the replace/migrate
-  via-local copy) have no budget yet.
+  `setup`/`copy-keys` as described above. rsync transfers, which drive their own ssh
+  outside this seam, are bounded the same way: `--timeout=300` (I/O silence) everywhere,
+  `BACKUP_TIMEOUT_SECS` per pod (default 2 h) for `pull` and `backup`'s file step, 2 h per
+  leg for the replace/migrate via-local copy.
 - `copy-keys` warns by name about any reachable pod that matched no per-host key.
 
 ### Overriding config without editing it
@@ -657,11 +727,13 @@ dark-mode-friendly) that reads `fleet.json` from its own directory every minute 
 sortable table — machine, GPU, up/starting/down, last health check + age + reason,
 maintenance window — with "updated N min ago" and a banner once the data is over 10 minutes
 old (the cron stopped) or a provider didn't answer. It only displays; it can't change anything.
+`up` means the machine's SSH port answered when the snapshot was taken (every 2 min), so a
+machine that's listed running but not accepting logins shows `starting`, not `up`.
 
 ```bash
 mkdir -p /srv/arena-fleet && cp web/fleet.html /srv/arena-fleet/index.html
 arena --config /path/to/config.env snapshot --public --out /srv/arena-fleet/fleet.json  # try it once
-arena --config /path/to/config.env cron install --proxy --snapshot /srv/arena-fleet      # then every 2 min
+arena --config /path/to/config.env cron install --snapshot /srv/arena-fleet  # then every 2 min (other arena lines kept)
 ```
 
 Then serve `/srv/arena-fleet` with any static host (an existing web server's directory, a

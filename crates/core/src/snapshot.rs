@@ -1,9 +1,9 @@
 //! One read-only picture of the fleet (PLAN Phase 3/4): every pod with its cost labels,
-//! proxy port + whether that forward is live, and its last `pods test --deep` verdict —
-//! built by one pure function ([`build`]) so the CLI (`arena snapshot`), the TUI and the
-//! public dashboard all read the same thing.
+//! proxy port + whether that forward is live, its last `pods test --deep` verdict and
+//! whether its SSH port answers right now — built by one pure function ([`build`]) so the
+//! CLI (`arena snapshot`), the TUI and the public dashboard all read the same thing.
 //!
-//! Three pieces, split so most of it is pure and table-tested:
+//! Four pieces, split so most of it is pure and table-tested:
 //!
 //! 1. **The health cache** ([`HealthCache`]): a deep check takes minutes and SSHes into
 //!    every pod, so `snapshot` never runs one — it reads what the last `pods test --deep` /
@@ -13,7 +13,13 @@
 //!    empty cache plus one warning — it's a convenience, never a reason to fail).
 //! 2. **[`FleetSnapshot`]**: the internal view (ids, endpoints, costs, raw check reasons).
 //!    For the operator only.
-//! 3. **[`PublicSnapshot`]**: what may be published with no auth. An **allowlist by
+//! 3. **The reachability probe** ([`probe_reachability`]): a provider lists a pod
+//!    `RUNNING` with an endpoint well before (and long after) anyone can log in — booting,
+//!    sshd not up yet, a wedged host. So the snapshot dials each billing cohort machine's
+//!    SSH port (concurrently, a few seconds at most, no auth, no command —
+//!    [`SshPortProbe`]; staff boxes and off-list pods are never dialed) and the public `up`
+//!    needs that answer. Behind a seam ([`Reach`]) so tests never dial out.
+//! 4. **[`PublicSnapshot`]**: what may be published with no auth. An **allowlist by
 //!    construction**, not redaction: a separate struct with only name / GPU / up-starting-
 //!    down / health verdict + age + a reason from a *fixed* vocabulary ([`Issue`]) /
 //!    maintenance start+end, for pods on `MACHINE_NAME_LIST` only. A new internal field
@@ -23,7 +29,10 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
@@ -452,6 +461,12 @@ pub struct SnapshotPod {
     /// absolute entry); `None` for a pod that isn't on the list.
     pub list_entry: Option<String>,
     pub in_name_list: bool,
+    /// Whether the pod's SSH port answered ([`probe_reachability`]): `Some(true)` an SSH
+    /// server greeted us, `Some(false)` it didn't within the probe's few seconds (refused,
+    /// silent, closed on us), `None` not probed — not a cohort machine, no endpoint, not
+    /// billing, or `--no-probe` ([`reach_targets`]).
+    /// [`build`] leaves it `None`; the probe fills it in.
+    pub reachable: Option<bool>,
 }
 
 /// The whole fleet at one moment. See the module docs. (`Default` = the empty fleet at the
@@ -519,6 +534,7 @@ pub fn build(
                 health: health.get(pod).cloned(),
                 in_name_list: entry.is_some(),
                 list_entry: entry,
+                reachable: None,
             }
         })
         .collect();
@@ -528,6 +544,128 @@ pub fn build(
         pods: pods_out,
         cost: fleet::fleet_cost(pods),
         partial: partial.to_vec(),
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Reachability
+// ---------------------------------------------------------------------------------------
+
+/// How the snapshot asks "does this pod's SSH port answer?" — a seam, like `Remote`, so
+/// tests (here and the CLI's) script the answers and never dial out. [`SshPortProbe`] is
+/// the real one.
+#[async_trait]
+pub trait Reach: Send + Sync {
+    async fn answers(&self, host: &str, port: u16) -> bool;
+}
+
+/// How long [`SshPortProbe`] waits for a pod: the TCP connect plus the server's greeting.
+/// A healthy sshd greets within milliseconds of the connect; 3 seconds also covers a pod
+/// across an ocean or a busy host, and keeps a snapshot of a fleet with dead pods (every
+/// probe runs at once) at a few seconds.
+pub const REACH_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The most a probe reads while looking for the greeting. RFC 4253 lets a server send other
+/// lines before its `SSH-` line; anything that hasn't greeted within this much isn't sshd.
+const GREETING_MAX: usize = 1024;
+
+/// The real [`Reach`]: a TCP connect to the pod's SSH endpoint, then wait for the server's
+/// identification line (`SSH-2.0-…`), which sshd sends unprompted the moment a client
+/// connects. We send **nothing** — no version string, no key exchange, no auth, no command
+/// — and close at once. Reading the greeting rather than trusting the connect alone matters
+/// wherever something other than the pod's sshd may accept the TCP connection (a provider's
+/// SSH relay port, a host-side port mapping whose container is down): an accept followed by
+/// a close or by silence is not a pod anyone can log in to. sshd logs each probe as a
+/// pre-auth disconnect — one per pod per snapshot (every 2 minutes under the cron).
+#[derive(Debug, Clone, Copy)]
+pub struct SshPortProbe {
+    pub timeout: Duration,
+}
+
+impl Default for SshPortProbe {
+    fn default() -> Self {
+        Self { timeout: REACH_TIMEOUT }
+    }
+}
+
+#[async_trait]
+impl Reach for SshPortProbe {
+    async fn answers(&self, host: &str, port: u16) -> bool {
+        use tokio::io::AsyncReadExt;
+        // An IPv6 literal may come bracketed; the socket API wants it bare.
+        let host = host.trim().trim_start_matches('[').trim_end_matches(']').to_string();
+        let greet = async move {
+            let mut stream = tokio::net::TcpStream::connect((host.as_str(), port)).await.ok()?;
+            let mut buf = Vec::with_capacity(256);
+            let mut chunk = [0u8; 256];
+            while buf.len() < GREETING_MAX {
+                let n = stream.read(&mut chunk).await.ok()?;
+                if n == 0 {
+                    return None; // closed without greeting
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if greets(&buf) {
+                    return Some(());
+                }
+            }
+            None
+        };
+        matches!(tokio::time::timeout(self.timeout, greet).await, Ok(Some(())))
+    }
+}
+
+/// Whether `received` holds an SSH identification line: a line starting `SSH-` (at the very
+/// start, or after a pre-banner line). Its first four bytes are enough — the rest of the
+/// line may still be in flight.
+fn greets(received: &[u8]) -> bool {
+    received.starts_with(b"SSH-") || received.windows(5).any(|w| w == b"\nSSH-")
+}
+
+/// Which pods the probe dials: the cohort's machines — pods on a *prefixed*
+/// `MACHINE_NAME_LIST` entry, exactly the ones the public page can show — that bill
+/// ([`is_billing`]) and have an SSH endpoint; by index into `snap.pods` (two pods can share
+/// a name, so never by name) with that endpoint. Everything else stays `None`: a stopped
+/// pod's endpoint is stale, one without an endpoint has nothing to dial, and staff boxes
+/// (`@` entries) and pods off the list are never dialed at all — the probe exists to gate
+/// the public `up`, and it has no business knocking on machines that aren't the cohort's.
+/// Pure.
+pub fn reach_targets(snap: &FleetSnapshot) -> Vec<(usize, String, u16)> {
+    snap.pods
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.list_entry.as_deref().is_some_and(|e| !is_absolute(e)))
+        .filter(|(_, p)| is_billing(&p.pod.status))
+        .filter_map(|(i, p)| endpoint(&p.pod).map(|(host, port)| (i, host.to_string(), port)))
+        .collect()
+}
+
+/// Probe every [`reach_targets`] pod at once over `reach` and record the answers in
+/// [`SnapshotPod::reachable`]; the rest stay `None`. As long as the slowest probe — with
+/// [`SshPortProbe`], at most its timeout — however many pods are dead. Read-only: a
+/// connect and a read, nothing sent. A probe task that panicked leaves its pod `None`
+/// (unknown), never "unreachable".
+pub async fn probe_reachability(snap: &mut FleetSnapshot, reach: Arc<dyn Reach>) {
+    let mut set = tokio::task::JoinSet::new();
+    for (i, host, port) in reach_targets(snap) {
+        let reach = reach.clone();
+        set.spawn(async move { (i, reach.answers(&host, port).await) });
+    }
+    while let Some(joined) = set.join_next().await {
+        if let Ok((i, answered)) = joined {
+            if let Some(p) = snap.pods.get_mut(i) {
+                p.reachable = Some(answered);
+            }
+        }
+    }
+}
+
+/// The SSH column of `arena snapshot`'s table: `ok` (answered), `down` (probed, no answer),
+/// `-` (not probed).
+pub fn reach_label(reachable: Option<bool>) -> &'static str {
+    match reachable {
+        Some(true) => "ok",
+        Some(false) => "down",
+        None => "-",
     }
 }
 
@@ -584,8 +722,9 @@ pub fn health_label(h: Option<&HealthRecord>, now: u64) -> String {
     out
 }
 
-/// `arena snapshot`'s table: `pods list`'s columns with PROXY and HEALTH before MAINT, then
-/// the fleet cost footer and, for a partial listing, which providers are missing.
+/// `arena snapshot`'s table: `pods list`'s columns with SSH ([`reach_label`]), PROXY and
+/// HEALTH before MAINT, then the fleet cost footer and, for a partial listing, which
+/// providers are missing.
 pub fn render_table(snap: &FleetSnapshot) -> String {
     if snap.pods.is_empty() && snap.partial.is_empty() {
         return "(no pods)\n".into();
@@ -596,6 +735,7 @@ pub fn render_table(snap: &FleetSnapshot) -> String {
         .map(|p| {
             let mut cells = fleet::pod_cells(&p.pod);
             let maint = cells.pop().unwrap_or_default();
+            cells.push(reach_label(p.reachable).to_string());
             cells.push(proxy_label(p));
             cells.push(health_label(p.health.as_ref(), snap.generated_at));
             cells.push(maint);
@@ -605,8 +745,8 @@ pub fn render_table(snap: &FleetSnapshot) -> String {
     let mut headers: Vec<&str> = fleet::POD_HEADERS.to_vec();
     let mut align: Vec<Align> = fleet::POD_ALIGN.to_vec();
     let (maint_h, maint_a) = (headers.pop().unwrap_or("MAINT"), align.pop().unwrap_or(Align::Left));
-    headers.extend(["PROXY", "HEALTH", maint_h]);
-    align.extend([Align::Left, Align::Left, maint_a]);
+    headers.extend(["SSH", "PROXY", "HEALTH", maint_h]);
+    align.extend([Align::Left, Align::Left, Align::Left, maint_a]);
     let mut out = table::render(&headers, &align, &rows);
     out.push_str(&fleet::fleet_footer(&snap.cost));
     out.push('\n');
@@ -653,13 +793,18 @@ pub struct PublicMachine {
     pub maintenance: Option<PublicMaintenance>,
 }
 
-/// Up / coming up / not usable.
+/// Up / coming up / not usable — the page's whole status vocabulary, kept to these three
+/// (`web/fleet.html` documents and styles exactly them; a new value is a deliberate change
+/// to both).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PublicStatus {
-    /// Running with an SSH endpoint.
+    /// Running, with an SSH endpoint whose sshd answered the snapshot's probe (with
+    /// `--no-probe`: any endpoint) — someone can log in.
     Up,
-    /// Billing but not yet reachable (provisioning, booting, no endpoint yet).
+    /// Billing but not answering yet: provisioning, booting, no endpoint yet, or listed
+    /// running while its SSH port doesn't answer (usually sshd still starting; rarely a
+    /// wedged host — the health column says more once a deep check has run).
     Starting,
     /// Stopped, exited, or in an error state.
     Down,
@@ -696,14 +841,17 @@ pub struct PublicMaintenance {
     pub end: Option<String>,
 }
 
-/// `up` / `starting` / `down` from the provider status and the endpoint: down unless
-/// billing ([`is_billing`]) — and `ERROR`, which bills but isn't usable, is down too; up
-/// only when `RUNNING` with an SSH endpoint; anything else billing is starting.
-pub fn public_status(pod: &Pod) -> PublicStatus {
+/// `up` / `starting` / `down` from the provider status, the endpoint and the probe: down
+/// unless billing ([`is_billing`]) — and `ERROR`, which bills but isn't usable, is down
+/// too; up only when `RUNNING` with an SSH endpoint that didn't fail the probe
+/// (`reachable` is `Some(true)`, or `None` when nothing was probed); anything else billing
+/// is starting. A listed-running pod whose port is silent reads `starting`, not a fourth
+/// word: the public vocabulary stays the three the page knows.
+pub fn public_status(pod: &Pod, reachable: Option<bool>) -> PublicStatus {
     let s = pod.status.trim().to_ascii_uppercase();
     if !is_billing(&s) || s == "ERROR" {
         PublicStatus::Down
-    } else if s == "RUNNING" && endpoint(pod).is_some() {
+    } else if s == "RUNNING" && endpoint(pod).is_some() && reachable != Some(false) {
         PublicStatus::Up
     } else {
         PublicStatus::Starting
@@ -880,7 +1028,7 @@ pub fn public_snapshot(snap: &FleetSnapshot, naming: &Naming) -> PublicSnapshot 
         let Some(slot) = naming.list.iter().position(|e| e == entry && qualify(naming.prefix, e) == p.pod.name) else {
             continue;
         };
-        let status = public_status(&p.pod);
+        let status = public_status(&p.pod, p.reachable);
         let gpu = match fleet::gpu_label(&p.pod) {
             g if g != "-" => g,
             _ => p.health.as_ref().and_then(|h| h.gpu.clone()).unwrap_or_else(|| "-".into()),
@@ -1386,12 +1534,15 @@ mod tests {
         cache.merge(&[health(&apple, Status::Pass, vec![])], NOW - 720);
         cache.merge(&[health(&bloom, Status::Fail, vec![check("cuda", Status::Fail, "Error 999")])], NOW - 7300);
         let text = proxy_text();
-        let out = render_table(&build(&[cloud, bloom, apple], &[], Some(&text), &cache, &naming, NOW));
+        let mut snap = build(&[cloud, bloom, apple], &[], Some(&text), &cache, &naming, NOW);
+        snap.pods[0].reachable = Some(true); // apple answered; bloom didn't; cloud wasn't probed
+        snap.pods[1].reachable = Some(false);
+        let out = render_table(&snap);
         let want = "\
-NAME           PROVIDER  ID   STATUS  GPU            $/H  ENDPOINT        PROXY        HEALTH             MAINT
-devtest-apple  runpod    rp1  run     1×RTX A4000  $0.17  10.0.0.1:22001  :9500        pass 12m           -
-devtest-bloom  runpod    rp2  run     -                -  10.0.0.2:22002  :9501 stale  fail 2h GPU error  -
-devtest-cloud  runpod    rp3  exit    -                -  -               :9502 stale  -                  -
+NAME           PROVIDER  ID   STATUS  GPU            $/H  ENDPOINT        SSH   PROXY        HEALTH             MAINT
+devtest-apple  runpod    rp1  run     1×RTX A4000  $0.17  10.0.0.1:22001  ok    :9500        pass 12m           -
+devtest-bloom  runpod    rp2  run     -                -  10.0.0.2:22002  down  :9501 stale  fail 2h GPU error  -
+devtest-cloud  runpod    rp3  exit    -                -  -               -     :9502 stale  -                  -
 fleet: $0.17/h across 2 billing pod(s) (1 unpriced)
 ";
         assert_eq!(out, want, "\n--- got ---\n{out}");
@@ -1405,21 +1556,26 @@ fleet: $0.17/h across 2 billing pod(s) (1 unpriced)
             p.status = status.into();
             p
         };
+        // (provider status, has an endpoint, probe answer, public status)
         let cases = [
-            ("RUNNING", true, PublicStatus::Up),
-            ("running", true, PublicStatus::Up), // vast/hetzner spell it lowercase
-            ("RUNNING", false, PublicStatus::Starting), // v1 says RUNNING the moment it's asked for
-            ("PROVISIONING", false, PublicStatus::Starting),
-            ("STARTING", true, PublicStatus::Starting),
-            ("LOADING", false, PublicStatus::Starting),
-            ("ERROR", true, PublicStatus::Down), // bills, but isn't usable
-            ("EXITED", true, PublicStatus::Down),
-            ("STOPPED", false, PublicStatus::Down),
-            ("OFF", true, PublicStatus::Down),
-            ("WHATEVER", true, PublicStatus::Down),
+            ("RUNNING", true, Some(true), PublicStatus::Up),
+            ("running", true, Some(true), PublicStatus::Up), // vast/hetzner spell it lowercase
+            ("RUNNING", true, None, PublicStatus::Up),       // `--no-probe`: the endpoint is all we know
+            // Listed running with an endpoint, but sshd didn't answer: not up — and not a
+            // fourth public word either.
+            ("RUNNING", true, Some(false), PublicStatus::Starting),
+            ("RUNNING", false, None, PublicStatus::Starting), // v1 says RUNNING the moment it's asked for
+            ("PROVISIONING", false, None, PublicStatus::Starting),
+            ("STARTING", true, Some(true), PublicStatus::Starting),
+            ("LOADING", false, None, PublicStatus::Starting),
+            ("ERROR", true, Some(true), PublicStatus::Down), // bills, but isn't usable
+            ("EXITED", true, None, PublicStatus::Down),
+            ("STOPPED", false, None, PublicStatus::Down),
+            ("OFF", true, Some(true), PublicStatus::Down),
+            ("WHATEVER", true, Some(true), PublicStatus::Down),
         ];
-        for (status, ep, want) in cases {
-            assert_eq!(public_status(&mk(status, ep)), want, "{status} endpoint={ep}");
+        for (status, ep, reachable, want) in cases {
+            assert_eq!(public_status(&mk(status, ep), reachable), want, "{status} endpoint={ep} reachable={reachable:?}");
         }
     }
 
@@ -1663,6 +1819,134 @@ fleet: $0.17/h across 2 billing pod(s) (1 unpriced)
         for (text, want) in cases {
             assert_eq!(ip_literals(text), *want, "{text}");
         }
+    }
+
+    /// A scripted [`Reach`]: the endpoints that answer, and every endpoint asked about.
+    struct Answers {
+        up: Vec<(&'static str, u16)>,
+        asked: std::sync::Mutex<Vec<(String, u16)>>,
+    }
+
+    #[async_trait]
+    impl Reach for Answers {
+        async fn answers(&self, host: &str, port: u16) -> bool {
+            self.asked.lock().unwrap().push((host.to_string(), port));
+            self.up.iter().any(|(h, p)| *h == host && *p == port)
+        }
+    }
+
+    /// The probe dials exactly the cohort's billing machines with an endpoint — each twin
+    /// on its own endpoint, joined back by position, not name; never a stopped twin, a staff
+    /// box or an off-list pod — and the public page then reads a listed-running machine that
+    /// didn't answer as `starting`.
+    #[tokio::test]
+    async fn probe_reaches_billing_cohort_pods_by_endpoint_and_gates_public_up() {
+        let cfg = cfg();
+        let naming = Naming::from_config(&cfg);
+        let apple = at(pod("devtest-apple", "runpod", "rp1"), "10.0.0.1", 22001);
+        let bloom = at(pod("devtest-bloom", "runpod", "rp2"), "10.0.0.2", 22002); // listed running, sshd silent
+        let cloud = pod("devtest-cloud", "runpod", "rp3"); // no endpoint yet
+        let mut stopped = at(pod("devtest-apple", "runpod", "rp-old"), "10.0.0.8", 22008); // an old twin
+        stopped.status = "EXITED".into();
+        let staff = at(pod("james-gpu", "runpod", "rp-staff"), "10.0.0.9", 22009); // an `@` entry
+        let mut stray = at(pod("devtest-mayor", "hetzner", "51"), "2001:db8::5", 22); // off the list
+        stray.status = "starting".into();
+        let mut booting = at(pod("devtest-cloud", "hetzner", "52"), "2001:db8::6", 22); // cloud's twin, booting
+        booting.status = "starting".into();
+        let pods = [apple, bloom, cloud, stopped, staff, stray, booting];
+        let mut snap = build(&pods, &[], None, &HealthCache::new(), &naming, NOW);
+
+        let targets: Vec<(String, u16)> = reach_targets(&snap).into_iter().map(|(_, h, p)| (h, p)).collect();
+        assert_eq!(targets, [("2001:db8::6".into(), 22), ("10.0.0.1".into(), 22001), ("10.0.0.2".into(), 22002)]);
+
+        let answers = Arc::new(Answers { up: vec![("10.0.0.1", 22001), ("2001:db8::6", 22)], asked: Default::default() });
+        probe_reachability(&mut snap, answers.clone()).await;
+        let mut asked = answers.asked.lock().unwrap().clone();
+        asked.sort();
+        assert_eq!(asked.len(), 3, "one probe per target, no more: {asked:?}");
+        let reach = |id: &str| snap.pods.iter().find(|p| p.pod.id == id).unwrap().reachable;
+        assert_eq!(
+            [reach("rp1"), reach("rp2"), reach("rp3"), reach("rp-old"), reach("rp-staff"), reach("51"), reach("52")],
+            [Some(true), Some(false), None, None, None, None, Some(true)]
+        );
+        let public = public_snapshot(&snap, &naming);
+        let rows: Vec<(&str, PublicStatus)> = public.machines.iter().map(|m| (m.name.as_str(), m.status)).collect();
+        assert_eq!(rows, [("apple", PublicStatus::Up), ("bloom", PublicStatus::Starting), ("cloud", PublicStatus::Starting)]);
+        // The internal JSON carries the answer; the public one only the status word.
+        assert!(serde_json::to_string(&snap).unwrap().contains("\"reachable\":false"));
+        assert!(!public_json(&public).contains("reachable"));
+    }
+
+    #[test]
+    fn greeting_detection_table() {
+        let cases: &[(&[u8], bool)] = &[
+            (b"SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13\r\n", true),
+            (b"SSH-", true), // the rest of the line may still be in flight
+            (b"SSH-1.99-dropbear\r\n", true),
+            (b"Welcome to the jump host\r\nSSH-2.0-OpenSSH_8.9\r\n", true), // RFC 4253 pre-banner lines
+            (b"", false),
+            (b"SSH", false),
+            (b"HTTP/1.1 400 Bad Request\r\n", false),
+            (b"xSSH-2.0", false),
+            (b"\x00\x00\x00\x0c", false),
+        ];
+        for (bytes, want) in cases {
+            assert_eq!(greets(bytes), *want, "{:?}", String::from_utf8_lossy(bytes));
+        }
+    }
+
+    /// The real probe against local sockets — nothing leaves the machine: an sshd-like
+    /// listener answers; a closed port, a relay that accepts then hangs up, one that
+    /// accepts and says nothing, and one that greets with something else don't.
+    #[tokio::test]
+    async fn ssh_port_probe_against_local_listeners() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+        // A listener that answers every connection with `greeting` (None = says nothing,
+        // holding the connection open; Some(b"") = closes at once).
+        async fn serve(greeting: Option<&'static [u8]>) -> u16 {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = l.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                while let Ok((mut sock, _)) = l.accept().await {
+                    tokio::spawn(async move {
+                        match greeting {
+                            Some(g) => {
+                                let _ = sock.write_all(g).await;
+                            }
+                            None => tokio::time::sleep(Duration::from_secs(30)).await,
+                        }
+                        drop(sock);
+                    });
+                }
+            });
+            port
+        }
+        let sshd = serve(Some(b"SSH-2.0-OpenSSH_9.6\r\n")).await;
+        let pre_banner = serve(Some(b"notice: maintenance at 02:00\r\nSSH-2.0-OpenSSH_9.6\r\n")).await;
+        let hangs_up = serve(Some(b"")).await;
+        let silent = serve(None).await;
+        let http = serve(Some(b"HTTP/1.1 400 Bad Request\r\n\r\n")).await;
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port() // dropped: nothing listens there now
+        };
+        let probe = SshPortProbe { timeout: Duration::from_secs(1) };
+        for (what, host, port, want) in [
+            ("sshd", "127.0.0.1", sshd, true),
+            ("sshd, bracketed host", "[127.0.0.1]", sshd, true),
+            ("pre-banner line", "127.0.0.1", pre_banner, true),
+            ("closed port", "127.0.0.1", closed, false),
+            ("accepts then hangs up", "127.0.0.1", hangs_up, false),
+            ("accepts, says nothing", "127.0.0.1", silent, false),
+            ("not ssh", "127.0.0.1", http, false),
+        ] {
+            let started = std::time::Instant::now();
+            assert_eq!(probe.answers(host, port).await, want, "{what}");
+            assert!(started.elapsed() < Duration::from_secs(5), "{what}: bounded by the probe's timeout");
+        }
+        // The default budget is the documented few seconds.
+        assert_eq!(SshPortProbe::default().timeout, REACH_TIMEOUT);
     }
 
     /// PLAN Phase 4's leak test: a fleet stuffed with everything that must never be
