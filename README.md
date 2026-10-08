@@ -58,7 +58,7 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     (e.g. a Vast 429), keeps its forward, and if no provider answers nothing is written.
     Provider list responses with an unexpected shape are errors, never "zero pods".
 - `arena` (CLI):
-  - `pods list | create | stop | restart | terminate | kill` (`--provider
+  - `pods list | create | stop | restart | terminate` (`--provider
     runpod|vast|hetzner`; Vast reads `VAST_API_KEY`, Hetzner reads `HETZNER_API_KEY`
     + `HETZNER_*`). `restart`/`terminate` take **one** pod (name, bare name, `@name` or id —
     a name two pods share is refused: pass the id); `stop` takes the shared
@@ -96,8 +96,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     row, is named, and makes the exit non-zero without stopping any terminate.
     `stop apple..mayor` / `stop --all --exclude bloom` stops many at once (needs targets or
     `--all`): every selected pod in a billing state (running, starting/provisioning/…, or
-    ERROR) is stopped, others are skipped with a note; `kill` is the stop→wait-for-
-    EXITED→delete flow (`--timeout`; one target or `--all`).
+    ERROR) is stopped, others are skipped with a note. (The legacy stop→wait→delete
+    `kill` is gone: `terminate` deletes directly.)
   - `rename <old> <new>` / `rename --from-prefix <p>` renames the pod (metadata only, no
     restart) and then brings along what's keyed by the name: rewrites `~/.name` over SSH
     (setup's exact `export MACHINE_NAME='<short>'` line; an unreachable pod is reported with
@@ -642,13 +642,47 @@ construction, so no auth is needed; health shows `unknown` until a `pods test --
 `up --check` has run under the same user (the cache lives in that user's state dir — set
 `ARENA_STATE_DIR` for both if the cron runs as someone else).
 
+## Testing
+
+```bash
+cargo test --release   # everything offline: pure planners, fake providers, FakeRemote, fixtures
+```
+
+`crates/cli/tests/live_smoke.rs` is the **opt-in live smoke test** (`#[ignore]`d; one ≤ $0.30/h
+community pod for a few minutes — run it before each cohort). It drives the built `arena` binary:
+`pods up <free name> --gpu A4000,3070 --gpus 1 --cloud community --max-price 0.30 --retry-mins 5
+--check` → `pods test --deep --json` (parses, not FAIL) → `snapshot --public` (the machine is up
+with its cached health; no IPv4 literal, SSH host, pod id or prefix) → `pods rename` to a second
+free name and back → `pods terminate` → `teardown --check` until nothing of it is left.
+
+```bash
+cd /home/dev/sandbox/arena-infra-rs
+ARENA_LIVE_SMOKE=1 ARENA_LIVE_CONFIG=/home/dev/sandbox/config.env \
+  cargo test --release -p arena-cli --test live_smoke -- --ignored --nocapture
+# also: RUNPOD_API=v2 (smoke the v2 backend) · ARENA_LIVE_GPU=3070 (the --gpu list)
+```
+
+It refuses to start unless both variables are set; the config (symlinks resolved) is not
+`/home/dev/prod-ro/config.env` or anything under `/home/dev/prod-ro` or `/root`; its
+`MACHINE_NAME_PREFIX` starts with `devtest` (or is named in `ARENA_LIVE_PREFIX_ALLOW`,
+comma-separated — never an `arenaN` prefix); a configured proxy is a local file outside `/etc`;
+and every configured provider lists, holding only `{prefix}-…` pods (anything else = the wrong
+account). The binary gets a cleared environment (only `PATH HOME USER LOGNAME LANG LC_ALL TZ
+RUNPOD_API`, so an exported key or prefix can't override the checked config) plus
+`SSH_PROXY_RELOAD_CMD=` (write-only proxy) and a fresh `ARENA_STATE_DIR`, and runs from the
+config's directory like `bin/arena-dev`. Whatever fails, a guard terminates every pod holding
+the run's two names and re-lists until they're gone — only Ctrl+C gets past it, so after an
+interrupted run check `teardown --check`. A COMMUNITY pod that never gets a public IP fails as
+`FAILED endpoint` (see `docs/TODO.md`); the guard still cleans it up.
+
 ## Layout
 
 ```
 crates/
-  core/   library: config, provider trait + impls, pod model, naming
-  cli/    `arena` binary (clap)
+  core/   library: config, provider trait + impls, Remote, planners/judges (see ARCHITECTURE.md)
+  cli/    `arena` binary (clap); tests/live_smoke.rs = the opt-in live smoke test
   tui/    `arena-tui` binary (ratatui)
 web/
   fleet.html  the public fleet page (reads fleet.json next to it)
+docs/     RunPod API notes, known issues
 ```
