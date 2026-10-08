@@ -526,7 +526,7 @@ pub fn report(pods: &[Pod], probes: &[Probe], hours: f64, naming: &Naming) -> Id
     let mut idle_pods = Vec::new();
     for (pod, probe) in pods.iter().zip(probes) {
         let verdict = judge(pod, probe, threshold);
-        let cohort = crate::teardown::is_cohort_pod(naming, &pod.name);
+        let cohort = naming.is_cohort(&pod.name);
         let candidate = cohort && matches!(verdict, Verdict::Idle { .. });
         if candidate {
             idle_pods.push(pod.clone());

@@ -7,6 +7,9 @@
 //! only the `name`. VMs come up on a real public IP with SSH on `:22`, so they slot
 //! straight into the same proxy/`pods up` flow as the GPU providers.
 //!
+//! `--api-json` merges into the create body ([`create_payload`]) — `labels`, `user_data`
+//! (cloud-init), `firewalls`, `networks`… — minus the fields this module sets ([`MANAGED`]).
+//!
 //! Responses are parsed defensively from `serde_json::Value`, as with the others.
 
 use async_trait::async_trait;
@@ -14,11 +17,12 @@ use reqwest::{Client, RequestBuilder};
 use serde_json::{json, Value};
 
 use super::Provider;
+use crate::apiextra::{self, managed, Extra, Managed};
 use crate::error::{Error, Result};
 use crate::http::{send_json, send_ok};
 use crate::pod::{Pod, PodSpec};
 
-const BASE: &str = "https://api.hetzner.cloud/v1";
+pub(crate) const BASE: &str = "https://api.hetzner.cloud/v1";
 
 /// Hetzner-specific creation options, sourced from `HETZNER_*` config keys.
 #[derive(Debug, Clone)]
@@ -92,6 +96,42 @@ impl HetznerProvider {
     }
 }
 
+/// The create-body fields this backend sets itself, refused in `--api-json` /
+/// `CREATE_EXTRA_JSON` (Hetzner takes the VM's shape from its `HETZNER_*` config).
+const MANAGED: &[Managed] = &[
+    managed(&["name"], "the machine name"),
+    managed(&["server_type"], "HETZNER_SERVER_TYPE"),
+    managed(&["image"], "HETZNER_IMAGE"),
+    managed(&["location"], "HETZNER_LOCATION"),
+    managed(&["ssh_keys"], "HETZNER_SSH_KEY (the cohort key)"),
+    managed(&["start_after_create"], "always on"),
+];
+
+/// The `POST /servers` body. Pure. Hetzner's `image` is an ID *or* a name: a system image is
+/// a name ("ubuntu-24.04"), but a snapshot has no name — it's referenced by numeric id. Send
+/// all-digits as an int so HETZNER_IMAGE can be a snapshot id. `spec.api_extra` is
+/// deep-merged in last, minus [`MANAGED`].
+fn create_payload(opts: &HetznerOpts, spec: &PodSpec) -> Result<Value> {
+    let image = match opts.image.parse::<u64>() {
+        Ok(id) => json!(id),
+        Err(_) => json!(opts.image),
+    };
+    let mut payload = json!({
+        "name": spec.name,
+        "server_type": opts.server_type,
+        "image": image,
+        "start_after_create": true,
+    });
+    if let Some(loc) = &opts.location {
+        payload["location"] = json!(loc);
+    }
+    if !opts.ssh_keys.is_empty() {
+        payload["ssh_keys"] = json!(opts.ssh_keys);
+    }
+    apiextra::apply(&mut payload, spec.api_extra.as_ref(), MANAGED, None)?;
+    Ok(payload)
+}
+
 fn parse_server(v: &Value) -> Pod {
     Pod {
         id: v
@@ -145,6 +185,9 @@ fn parse_server(v: &Value) -> Pod {
         gpu_count: None,
         maintenance: None,
         machine_id: None,
+        // Hetzner's delete/rebuild *protection* is a different thing; `pods lock` is
+        // RunPod v2 only.
+        locked: None,
     }
 }
 
@@ -219,25 +262,7 @@ impl Provider for HetznerProvider {
     }
 
     async fn create_pod(&self, spec: &PodSpec) -> Result<Pod> {
-        // Hetzner's `image` is an ID *or* a name: a system image is a name ("ubuntu-24.04"),
-        // but a snapshot has no name — it's referenced by numeric id. Send all-digits as an
-        // int so HETZNER_IMAGE can be a snapshot id.
-        let image = match self.opts.image.parse::<u64>() {
-            Ok(id) => json!(id),
-            Err(_) => json!(self.opts.image),
-        };
-        let mut payload = json!({
-            "name": spec.name,
-            "server_type": self.opts.server_type,
-            "image": image,
-            "start_after_create": true,
-        });
-        if let Some(loc) = &self.opts.location {
-            payload["location"] = json!(loc);
-        }
-        if !self.opts.ssh_keys.is_empty() {
-            payload["ssh_keys"] = json!(self.opts.ssh_keys);
-        }
+        let payload = create_payload(&self.opts, spec)?;
         let body = send_json(self.auth(self.client.post(format!("{}/servers", self.base)).json(&payload)), "hetzner create").await?;
         // The created server is under `server`; parse what's there (IP may not be
         // populated until it finishes provisioning — `pods up` polls for that).
@@ -268,6 +293,14 @@ impl Provider for HetznerProvider {
 
     async fn terminate_pod(&self, id: &str) -> Result<()> {
         send_ok(self.auth(self.client.delete(format!("{}/servers/{}", self.base, id))), "hetzner terminate").await
+    }
+
+    fn check_create_extra(&self, extra: &Extra) -> Result<()> {
+        apiextra::check(extra, MANAGED, None)
+    }
+
+    fn preview_create_body(&self, spec: &PodSpec) -> Result<Value> {
+        create_payload(&self.opts, spec)
     }
 }
 

@@ -1,0 +1,11 @@
+{
+ "request": {
+  "method": "GET",
+  "path": "/v2/network-volumes",
+  "body": null
+ },
+ "status": 200,
+ "body": {
+  "networkVolumes": []
+ }
+}

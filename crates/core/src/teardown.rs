@@ -18,7 +18,7 @@
 use serde::Serialize;
 
 use crate::fleet::{currency_symbol, fmt_money};
-use crate::naming::{is_absolute, qualify};
+use crate::lock::is_locked;
 use crate::openrouter::{key_name, KeyInfo};
 use crate::pod::Pod;
 use crate::provider::runpod::NetworkVolume;
@@ -171,6 +171,9 @@ pub enum Entry {
         /// An absolute (`@name`) `MACHINE_NAME_LIST` entry: a personal/staff box sharing the
         /// list (see `naming`) — never this cohort's, and never in a printed fix.
         staff: bool,
+        /// The provider reports it locked ([`crate::lock`]): `pods terminate` refuses it
+        /// unless `--unlock` — which the printed fix carries for it.
+        locked: bool,
     },
     Volume {
         id: String,
@@ -254,23 +257,16 @@ pub struct Report {
 /// a missing one is "not configured"), volumes, keys, cron, at, proxy.
 pub fn build(inputs: &Inputs, naming: &Naming) -> Report {
     let mut items: Vec<Item> = Vec::new();
-    // `pods terminate --all` reaches every pod on every configured provider, so whether it
-    // may be printed is decided over the whole fleet: every listing answered, and every pod
-    // in them (TERMINATED aside) is this cohort's.
-    let fleet_all_ours = inputs.listings.iter().all(|(_, listing)| {
-        listing.as_ref().is_ok_and(|pods| pods.iter().filter(|p| !is_terminated(p)).all(|p| is_cohort_pod(naming, &p.name)))
-    });
+    let all = AllScope::of(&inputs.listings, naming);
     for (provider, key) in PROVIDER_KEYS {
         match inputs.listings.iter().find(|(p, _)| p == provider) {
-            Some((_, listing)) => {
-                items.push(pods_item(provider, listing.as_ref().map(Vec::as_slice), naming, fleet_all_ours))
-            }
+            Some((_, listing)) => items.push(pods_item(provider, listing.as_ref().map(Vec::as_slice), naming, &all)),
             None => items.push(Item::new(Area::Pods, provider, Verdict::Skipped, format!("not configured (no {key}) — not checked"))),
         }
     }
     // A backend outside the known three (only fakes today) is still reported, never dropped.
     for (provider, listing) in inputs.listings.iter().filter(|(p, _)| !PROVIDER_KEYS.iter().any(|(k, _)| *k == p.as_str())) {
-        items.push(pods_item(provider, listing.as_ref().map(Vec::as_slice), naming, fleet_all_ours));
+        items.push(pods_item(provider, listing.as_ref().map(Vec::as_slice), naming, &all));
     }
     items.push(volumes_item(&inputs.volumes));
     items.push(keys_item(&inputs.keys, naming));
@@ -283,26 +279,45 @@ pub fn build(inputs: &Inputs, naming: &Naming) -> Report {
     Report { cohort: naming.prefix.to_string(), clear: remaining == 0 && unknown == 0, remaining, unknown, items }
 }
 
-/// Is `name` an absolute (`@name`) list entry's — a personal/staff box that shares the list
-/// and the proxy without joining the cohort (`naming`; `snapshot --public` leaves them out
-/// for the same reason). The end of a cohort is not the end of those boxes.
-fn is_staff(naming: &Naming, name: &str) -> bool {
-    naming.list.iter().any(|e| is_absolute(e) && qualify(naming.prefix, e) == name)
-}
-
-/// Is `name` one of this cohort's machines: `{prefix}-…` (parked `-old`/`-new` twins
-/// included), never a staff box ([`is_staff`]). Every pod on the account still counts as
-/// remaining — the account pays for all of them — but only cohort pods get a ready-to-paste
-/// terminate command (`pods idle` suggests commands for the same pods only).
-pub(crate) fn is_cohort_pod(naming: &Naming, name: &str) -> bool {
-    name.starts_with(&format!("{}-", naming.prefix)) && !is_staff(naming, name)
-}
-
 /// Is `name` a key `keys gen` would have minted for this cohort's machines: its own
 /// canonical key name (`{prefix}-…`; the rule `keys revoke` targets by, so the printed fix
 /// revokes exactly these) — but not a staff box's (an absolute entry's bare name).
 fn is_cohort_key(naming: &Naming, name: &str) -> bool {
-    key_name(naming.prefix, naming.list, name) == name && !is_staff(naming, name)
+    key_name(naming.prefix, naming.list, name) == name && !naming.is_staff(name)
+}
+
+/// What `arena pods terminate --all` would reach — every pod on every configured provider —
+/// worked out once over all the listings ([`AllScope::of`]) and handed to each provider's
+/// [`pods_item`], so every provider prints the same `--all` line. Deciding it per provider
+/// printed a line that fails when pasted: a provider with no locked pod of its own printed
+/// `--all` without `--unlock`, which `pods terminate` then refused over another provider's
+/// locked pod.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AllScope {
+    /// Every configured provider listed, and every pod in them (TERMINATED aside) is this
+    /// cohort's ([`Naming::is_cohort`]) — the one case where the fix may be `pods terminate
+    /// --all`: pasted on an account that also holds a staff box, it would destroy that box.
+    pub ours: bool,
+    /// The locked pods in those listings, by name: `--all` refuses a locked pod anywhere in
+    /// the fleet unless `--unlock`, so the `--all` line carries the flag when any is listed.
+    pub locked: Vec<String>,
+}
+
+impl AllScope {
+    /// Judge the configured providers' listings ([`Inputs::listings`]). Pure.
+    pub fn of(listings: &[(String, Result<Vec<Pod>, String>)], naming: &Naming) -> AllScope {
+        let ours = listings.iter().all(|(_, listing)| {
+            listing.as_ref().is_ok_and(|pods| pods.iter().filter(|p| !is_terminated(p)).all(|p| naming.is_cohort(&p.name)))
+        });
+        let locked = listings
+            .iter()
+            .filter_map(|(_, listing)| listing.as_ref().ok())
+            .flatten()
+            .filter(|p| !is_terminated(p) && is_locked(p))
+            .map(|p| p.name.clone())
+            .collect();
+        AllScope { ours, locked }
+    }
 }
 
 /// Whether the provider itself reports the pod deleted (billing nothing).
@@ -313,10 +328,11 @@ fn is_terminated(p: &Pod) -> bool {
 /// One provider's pods: every pod in any state counts — a stopped RunPod pod keeps its name
 /// and still bills its disk; a powered-off Hetzner server bills in full. Only a pod the
 /// provider itself reports as `TERMINATED` (deleted, billing nothing) is left out, with a
-/// note. A failed listing is UNKNOWN: never "no pods". `fleet_all_ours`: every configured
-/// provider listed and holds only this cohort's pods (see [`build`]) — the one case where
-/// the fix may be `pods terminate --all`.
-pub fn pods_item(provider: &str, listing: Result<&[Pod], &String>, naming: &Naming, fleet_all_ours: bool) -> Item {
+/// note. A failed listing is UNKNOWN: never "no pods". Every pod on the account counts as
+/// remaining — the account pays for all of them — but only cohort pods
+/// ([`Naming::is_cohort`]) get a ready-to-paste terminate command; `all` says whether that
+/// may be `pods terminate --all`, and with `--unlock` ([`AllScope`]).
+pub fn pods_item(provider: &str, listing: Result<&[Pod], &String>, naming: &Naming, all: &AllScope) -> Item {
     let pods = match listing {
         Err(e) => {
             let mut item = Item::new(Area::Pods, provider, Verdict::Unknown, format!("couldn't list ({e}) — NOT known to be empty"));
@@ -355,22 +371,46 @@ pub fn pods_item(provider: &str, listing: Result<&[Pod], &String>, naming: &Nami
                 status: p.status.clone(),
                 billing: bills_hourly(provider, &p.status),
                 cost_per_hr: p.cost_per_hr,
-                cohort: is_cohort_pod(naming, &p.name),
-                staff: is_staff(naming, &p.name),
+                cohort: naming.is_cohort(&p.name),
+                staff: naming.is_staff(&p.name),
+                locked: is_locked(p),
             })
             .collect();
         // `pods terminate --all` takes every pod on every configured provider, so it's printed
         // only when that is exactly this cohort's: pasted on an account that also holds a
         // staff box, it would destroy that box. Otherwise one command per cohort pod (by id:
         // a name can be held by two pods), and the rest are left to the operator.
-        let (ours, others): (Vec<&&Pod>, Vec<&&Pod>) = left.iter().partition(|p| is_cohort_pod(naming, &p.name));
-        if fleet_all_ours && others.is_empty() {
-            item.fix.push(
-                "arena pods terminate --all  # every pod on every configured provider, stopped ones included (--dry-run lists them first)"
-                    .into(),
-            );
+        // A locked pod is refused by `pods terminate` (and by the provider itself), so its fix
+        // carries `--unlock`, which lifts the lock as part of the terminate — said in a note.
+        let (ours, others): (Vec<&&Pod>, Vec<&&Pod>) = left.iter().partition(|p| naming.is_cohort(&p.name));
+        let unlock = |locked: bool| if locked { " --unlock" } else { "" };
+        let locked: Vec<&str> = left.iter().filter(|p| is_locked(p)).map(|p| p.name.as_str()).collect();
+        if !locked.is_empty() {
+            item.notes.push(format!(
+                "{} locked ({}) — `pods terminate` refuses a locked pod; the fix's --unlock lifts the lock as part of it",
+                locked.len(),
+                locked.join(", ")
+            ));
+        }
+        if all.ours && others.is_empty() {
+            // Locked pods on other providers: `--all` takes those too, so one locked anywhere
+            // needs the flag on this provider's line as well. (`--all --unlock` lifts only
+            // cohort pods' locks — and `--all` is printed only when every pod is the cohort's.)
+            let elsewhere: Vec<&str> =
+                all.locked.iter().map(String::as_str).filter(|n| !locked.contains(n)).collect();
+            if !elsewhere.is_empty() {
+                item.notes.push(format!(
+                    "the --all fix carries --unlock for {} (locked, on another provider) — `pods terminate --all` \
+                     reaches those too and refuses a locked pod without it",
+                    elsewhere.join(", ")
+                ));
+            }
+            item.fix.push(format!(
+                "arena pods terminate --all{}  # every pod on every configured provider, stopped ones included (--dry-run lists them first)",
+                unlock(!locked.is_empty() || !elsewhere.is_empty())
+            ));
         } else {
-            item.fix.extend(ours.iter().map(|p| format!("arena pods terminate {}", sh_word(&p.id))));
+            item.fix.extend(ours.iter().map(|p| format!("arena pods terminate {}{}", sh_word(&p.id), unlock(is_locked(p)))));
             if others.is_empty() {
                 item.notes.push(
                     "one command per pod, not `arena pods terminate --all`: that would also reach pods on another provider \
@@ -380,7 +420,7 @@ pub fn pods_item(provider: &str, listing: Result<&[Pod], &String>, naming: &Nami
             } else {
                 let named: Vec<String> = others
                     .iter()
-                    .map(|p| if is_staff(naming, &p.name) { format!("{} (staff box: `@` list entry)", p.name) } else { p.name.clone() })
+                    .map(|p| if naming.is_staff(&p.name) { format!("{} (staff box: `@` list entry)", p.name) } else { p.name.clone() })
                     .collect();
                 item.notes.push(format!(
                     "{} not this cohort's ({}) — decide by hand, no command printed for them; don't use `arena pods terminate --all`: \
@@ -460,7 +500,7 @@ pub fn keys_item(keys: &Probe<Vec<KeyInfo>>, naming: &Naming) -> Item {
     };
     let cohort: Vec<&KeyInfo> = all.iter().filter(|k| k.name.as_deref().is_some_and(|n| is_cohort_key(naming, n))).collect();
     let mut staff: Vec<&str> =
-        all.iter().filter(|k| !k.disabled).filter_map(|k| k.name.as_deref()).filter(|n| is_staff(naming, n)).collect();
+        all.iter().filter(|k| !k.disabled).filter_map(|k| k.name.as_deref()).filter(|n| naming.is_staff(n)).collect();
     staff.sort_unstable();
     let mut enabled: Vec<&KeyInfo> = cohort.iter().copied().filter(|k| !k.disabled).collect();
     enabled.sort_by(|a, b| a.name.cmp(&b.name));
@@ -874,7 +914,7 @@ fn entry_lines(entries: &[Entry]) -> Vec<String> {
         .map(|e| {
             let k = format!("{:<w$}", key(e));
             let line = match e {
-                Entry::Pod { id, provider, status, billing, cost_per_hr, cohort, staff, .. } => {
+                Entry::Pod { id, provider, status, billing, cost_per_hr, cohort, staff, locked, .. } => {
                     let cost = match (billing, cost_per_hr) {
                         (true, Some(c)) => format!("billing {}/h", fmt_money(currency_symbol(provider), *c)),
                         (true, None) => "billing".to_string(),
@@ -885,7 +925,8 @@ fn entry_lines(entries: &[Entry]) -> Vec<String> {
                         (false, false) => "  (not this cohort's)",
                         (true, false) => "",
                     };
-                    format!("{k}  id={id}  {status}  {cost}{other}")
+                    let lock = if *locked { "  locked" } else { "" };
+                    format!("{k}  id={id}  {status}{lock}  {cost}{other}")
                 }
                 Entry::Volume { name, size_gb, data_center, tier, est_usd_per_month, .. } => {
                     let size = size_gb.map_or("? GB".to_string(), |g| format!("{g} GB"));
@@ -992,6 +1033,11 @@ mod tests {
         }
     }
 
+    /// What `--all` reaches, with no locked pod listed elsewhere.
+    fn scope(ours: bool) -> AllScope {
+        AllScope { ours, locked: Vec::new() }
+    }
+
     fn key(name: &str, disabled: bool, usage: Option<f64>, limit: Option<f64>) -> KeyInfo {
         KeyInfo { hash: format!("h-{name}"), name: Some(name.into()), label: None, disabled, limit, usage }
     }
@@ -1081,7 +1127,7 @@ mod tests {
             pod("someone-else", "RUNNING", None),
             pod("arena8-cloud", "TERMINATED", None),
         ];
-        let item = pods_item("runpod", Ok(&pods), &naming, false);
+        let item = pods_item("runpod", Ok(&pods), &naming, &scope(false));
         assert_eq!(item.verdict, Verdict::Remaining);
         assert_eq!(
             item.summary,
@@ -1116,7 +1162,7 @@ mod tests {
         // Only stopped pods: still remaining — the whole point of the check — and, every pod
         // being the cohort's, `--all` is the fix.
         let stopped = [pod("arena8-bloom", "EXITED", Some(0.17))];
-        let item = pods_item("runpod", Ok(&stopped), &naming, true);
+        let item = pods_item("runpod", Ok(&stopped), &naming, &scope(true));
         assert_eq!(item.verdict, Verdict::Remaining);
         assert!(item.summary.starts_with("1 remains — 0 billing, 1 stopped"), "{}", item.summary);
         assert!(!item.summary.contains("burning"), "a stopped pod's rate isn't burning: {}", item.summary);
@@ -1124,25 +1170,111 @@ mod tests {
         assert!(item.fix[0].starts_with("arena pods terminate --all  #"), "{:?}", item.fix);
         // Only a staff box left: it remains (it bills), but no command is printed for it.
         let staff = [pod("james-gpu", "RUNNING", Some(0.44))];
-        let item = pods_item("runpod", Ok(&staff), &naming, false);
+        let item = pods_item("runpod", Ok(&staff), &naming, &scope(false));
         assert_eq!(item.verdict, Verdict::Remaining);
         assert!(item.fix.is_empty(), "{:?}", item.fix);
         assert!(item.notes[0].starts_with("1 not this cohort's (james-gpu (staff box"), "{:?}", item.notes);
         // An id that isn't shell-plain is quoted in its command.
         let mut odd = pod("arena8-x", "RUNNING", None);
         odd.id = "a b;rm".into();
-        let item = pods_item("runpod", Ok(&[odd, pod("someone-else", "RUNNING", None)]), &naming, false);
+        let item = pods_item("runpod", Ok(&[odd, pod("someone-else", "RUNNING", None)]), &naming, &scope(false));
         assert_eq!(item.fix, ["arena pods terminate 'a b;rm'"]);
         // A powered-off Hetzner server bills in full, in €.
         let mut off = pod("arena8-vm", "off", Some(0.006));
         off.provider = "hetzner".into();
-        let item = pods_item("hetzner", Ok(std::slice::from_ref(&off)), &naming, true);
+        let item = pods_item("hetzner", Ok(std::slice::from_ref(&off)), &naming, &scope(true));
         assert_eq!(item.summary, "1 remains, all billing; burning €0.006/h");
         // Only TERMINATED left: clear, with the note.
         let gone = [pod("arena8-cloud", "TERMINATED", None)];
-        let item = pods_item("runpod", Ok(&gone), &naming, true);
+        let item = pods_item("runpod", Ok(&gone), &naming, &scope(true));
         assert_eq!((item.verdict, item.summary.as_str()), (Verdict::Clear, "none"));
         assert_eq!(item.notes.len(), 1);
+    }
+
+    /// A locked pod is still there (and billing), its line says so, and its fix carries
+    /// `--unlock` — per pod, or on `--all` — with a note saying why.
+    #[test]
+    fn locked_pods_get_an_unlocking_fix() {
+        let names = list();
+        let naming = Naming { prefix: "arena8", list: &names };
+        let mut apple = pod("arena8-apple", "RUNNING", Some(0.17));
+        apple.locked = Some(true);
+        let bloom = pod("arena8-bloom", "RUNNING", Some(0.17));
+        let item = pods_item("runpod", Ok(&[apple.clone(), bloom.clone()]), &naming, &scope(true));
+        assert_eq!(item.verdict, Verdict::Remaining);
+        assert!(item.fix[0].starts_with("arena pods terminate --all --unlock  #"), "{:?}", item.fix);
+        assert_eq!(
+            item.notes,
+            ["1 locked (arena8-apple) — `pods terminate` refuses a locked pod; the fix's --unlock lifts the lock as part of it"]
+        );
+        assert_eq!(
+            entry_lines(&item.entries),
+            [
+                "arena8-apple  id=id-arena8-apple  RUNNING  locked  billing $0.17/h",
+                "arena8-bloom  id=id-arena8-bloom  RUNNING  billing $0.17/h",
+            ]
+        );
+        // Per pod: only the locked one's command unlocks.
+        let item = pods_item("runpod", Ok(&[apple, bloom, pod("james-gpu", "RUNNING", None)]), &naming, &scope(false));
+        assert_eq!(item.fix, ["arena pods terminate id-arena8-apple --unlock", "arena pods terminate id-arena8-bloom"]);
+        // Nothing locked: no flag, no note.
+        let item = pods_item("runpod", Ok(&[pod("arena8-bloom", "RUNNING", None)]), &naming, &scope(true));
+        assert!(!item.fix[0].contains("--unlock") && item.notes.is_empty(), "{:?} {:?}", item.fix, item.notes);
+        // The JSON says it per pod.
+        let json = serde_json::to_value(&item.entries).unwrap();
+        assert_eq!(json[0]["locked"], false);
+    }
+
+    /// `pods terminate --all` spans every provider and refuses a locked pod on any of them,
+    /// so every provider's `--all` line carries `--unlock` when one is locked anywhere — a
+    /// provider with no locked pod of its own used to print the bare `--all`, which was then
+    /// refused when pasted. Per-pod lines stay per pod.
+    #[test]
+    fn the_all_fix_unlocks_when_any_provider_holds_a_locked_pod() {
+        let names = list();
+        let naming = Naming { prefix: "arena8", list: &names };
+        let mut apple = pod("arena8-apple", "RUNNING", Some(0.17));
+        apple.locked = Some(true);
+        let mut bloom = pod("arena8-bloom", "running", Some(0.01));
+        bloom.provider = "hetzner".into();
+        let mut gone = pod("arena8-cloud", "TERMINATED", None);
+        gone.locked = Some(true); // deleted: not something `--all` meets
+        let mut i = inputs();
+        i.listings = vec![("runpod".into(), Ok(vec![apple.clone(), gone])), ("hetzner".into(), Ok(vec![bloom.clone()]))];
+        assert_eq!(AllScope::of(&i.listings, &naming), AllScope { ours: true, locked: vec!["arena8-apple".into()] });
+        let report = build(&i, &naming);
+        let pods: Vec<&Item> = report.items.iter().filter(|it| it.area == Area::Pods && it.verdict == Verdict::Remaining).collect();
+        assert_eq!(pods.len(), 2);
+        for item in &pods {
+            assert_eq!(item.fix.len(), 1, "{}: {:?}", item.scope, item.fix);
+            assert!(item.fix[0].starts_with("arena pods terminate --all --unlock  #"), "{}: {:?}", item.scope, item.fix);
+        }
+        let hetzner = pods.iter().find(|it| it.scope == "hetzner").unwrap();
+        assert!(
+            hetzner.notes.iter().any(|n| n.starts_with("the --all fix carries --unlock for arena8-apple (locked, on another provider)")),
+            "{:?}",
+            hetzner.notes
+        );
+        let runpod = pods.iter().find(|it| it.scope == "runpod").unwrap();
+        assert!(runpod.notes[0].starts_with("1 locked (arena8-apple)"), "{:?}", runpod.notes);
+        assert!(!runpod.notes.iter().any(|n| n.contains("on another provider")), "{:?}", runpod.notes);
+        // Nothing locked anywhere: the bare `--all` on both.
+        apple.locked = Some(false);
+        i.listings = vec![("runpod".into(), Ok(vec![apple])), ("hetzner".into(), Ok(vec![bloom.clone()]))];
+        let report = build(&i, &naming);
+        for item in report.items.iter().filter(|it| it.area == Area::Pods && it.verdict == Verdict::Remaining) {
+            assert!(item.fix[0].starts_with("arena pods terminate --all  #"), "{:?}", item.fix);
+        }
+        // Not all the cohort's (a staff box on RunPod): per-pod lines, the flag only on a
+        // locked pod's own — never `--all`.
+        let mut staff = pod("james-gpu", "RUNNING", None);
+        staff.locked = Some(true);
+        i.listings = vec![("runpod".into(), Ok(vec![staff])), ("hetzner".into(), Ok(vec![bloom]))];
+        let report = build(&i, &naming);
+        let hetzner = report.items.iter().find(|it| it.area == Area::Pods && it.scope == "hetzner").unwrap();
+        assert_eq!(hetzner.fix, ["arena pods terminate id-arena8-bloom"]);
+        let runpod = report.items.iter().find(|it| it.area == Area::Pods && it.scope == "runpod").unwrap();
+        assert!(runpod.fix.is_empty(), "a staff box gets no command: {:?}", runpod.fix);
     }
 
     /// `--all` reaches every provider, so one provider holding only the cohort's pods still

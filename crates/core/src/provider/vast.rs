@@ -52,6 +52,7 @@ use reqwest::{Client, RequestBuilder, StatusCode};
 use serde_json::{json, Value};
 
 use super::Provider;
+use crate::apiextra::{self, managed, Extra, Managed};
 use crate::config::Config;
 use crate::error::{Error, ProviderErrorKind, Result};
 use crate::fleet::fmt_money;
@@ -196,7 +197,7 @@ impl VastProvider {
     /// One rent: `PUT /asks/{id}/` for `offer`, and what the answer means ([`rent_outcome`];
     /// a transport failure: [`rent_send_error`]). Mutating — it may create a billing instance.
     async fn rent(&self, offer: &Offer, spec: &PodSpec, keys: &[String]) -> Result<u64> {
-        let rb = self.client.put(format!("{}/asks/{}/", self.base, offer.id)).json(&create_body(spec, keys));
+        let rb = self.client.put(format!("{}/asks/{}/", self.base, offer.id)).json(&create_body(spec, keys)?);
         let resp = self.auth(rb).send().await.map_err(|e| rent_send_error(e, offer.id, &spec.name))?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -511,19 +512,38 @@ fn onstart_script(keys: &[String]) -> String {
     script
 }
 
+/// The create-body fields the tool sets itself, refused in `--api-json` /
+/// `CREATE_EXTRA_JSON`: `runtype` and `onstart` are how the instance gets SSH and the cohort
+/// keys, `cancel_unavail` keeps a taken offer from becoming a stopped instance; a template
+/// (`template_hash_id`/`template_id`) would bring its own image, runtype and onstart. (No
+/// ports list on Vast: SSH comes from the runtype.)
+const MANAGED: &[Managed] = &[
+    managed(&["image"], "--image / IMAGE"),
+    managed(&["disk"], "--disk / DISK_GB"),
+    managed(&["label"], "the machine name"),
+    managed(&["runtype"], "always direct SSH"),
+    managed(&["onstart"], "it writes the cohort keys"),
+    managed(&["cancel_unavail"], "always on: no stopped-instance fallback"),
+    managed(&["env", "PUBLIC_KEY"], "the cohort SSH keys"),
+    managed(&["env", "MACHINE_NAME"], "the machine name"),
+    managed(&["template_hash_id"], "the flags above — a template would override the image, runtype and onstart arena sets"),
+    managed(&["template_id"], "the flags above — a template would override the image, runtype and onstart arena sets"),
+];
+
 /// The `PUT /asks/{id}/` body, every field one docs.vast.ai documents for create (no
 /// `client_id`: the search endpoint now refuses fields it doesn't know, so create may too).
 /// `env` is a JSON object (Vast's create guide: a docker-flag *string* fails), minus
 /// `PUBLIC_KEY`: the keys travel by the attach API and `onstart`, and a multi-line value
-/// is a needless risk in a field Vast turns into `docker -e` flags. Pure.
-fn create_body(spec: &PodSpec, keys: &[String]) -> Value {
+/// is a needless risk in a field Vast turns into `docker -e` flags. `spec.api_extra`
+/// (`--api-json`, e.g. a `price` bid) is deep-merged in last, minus [`MANAGED`]. Pure.
+fn create_body(spec: &PodSpec, keys: &[String]) -> Result<Value> {
     let env: serde_json::Map<String, Value> = spec
         .env
         .iter()
         .filter(|(k, _)| k != "PUBLIC_KEY")
         .map(|(k, v)| (k.clone(), Value::String(v.clone())))
         .collect();
-    json!({
+    let mut body = json!({
         "image": spec.image,
         "disk": spec.disk_gb,
         "label": spec.name,
@@ -531,7 +551,9 @@ fn create_body(spec: &PodSpec, keys: &[String]) -> Value {
         "env": env,
         "onstart": onstart_script(keys),
         "cancel_unavail": true,
-    })
+    });
+    apiextra::apply(&mut body, spec.api_extra.as_ref(), MANAGED, None)?;
+    Ok(body)
 }
 
 /// The `POST /instances/{id}/ssh/` body: one key (docs.vast.ai's attach reference and the
@@ -743,6 +765,7 @@ fn parse_instance(v: &Value) -> Pod {
         ssh_port,
         maintenance: None,
         machine_id: machine_of(v),
+        locked: None, // Vast has no pod lock
     }
 }
 
@@ -798,6 +821,10 @@ impl Provider for VastProvider {
     /// writes the same keys, and setup re-attaches them ([`Provider::authorize_ssh_keys`]) if
     /// the pod still refuses ours.
     async fn create_pod(&self, spec: &PodSpec) -> Result<Pod> {
+        // A refused `--api-json` fails before the search, not at the rent.
+        if let Some(extra) = &spec.api_extra {
+            self.check_create_extra(extra)?;
+        }
         let offers = self.search(spec).await?;
         let keys = spec_pubkeys(spec);
         let mut gone = None;
@@ -825,6 +852,7 @@ impl Provider for VastProvider {
                 ssh_port: None,
                 maintenance: None,
                 machine_id: None,
+                locked: None,
             });
         }
         Err(gone.unwrap_or_else(|| {
@@ -877,6 +905,14 @@ impl Provider for VastProvider {
     async fn authorize_ssh_keys(&self, pod: &Pod, keys: &[String]) -> Result<()> {
         self.attach_keys(&pod.id, keys).await
     }
+
+    fn check_create_extra(&self, extra: &Extra) -> Result<()> {
+        apiextra::check(extra, MANAGED, None)
+    }
+
+    fn preview_create_body(&self, spec: &PodSpec) -> Result<Value> {
+        create_body(spec, &spec_pubkeys(spec))
+    }
 }
 
 #[cfg(test)]
@@ -913,6 +949,7 @@ mod tests {
             docker_args: None,
             allowed_cuda: Vec::new(),
             max_price: None,
+            api_extra: None,
         }
     }
 
@@ -1191,7 +1228,7 @@ mod tests {
         s.env = vec![("PUBLIC_KEY".into(), format!("{KEY_A}\n{KEY_B}\n")), ("MACHINE_NAME".into(), "arena8-apple".into())];
         let keys = spec_pubkeys(&s);
         assert_eq!(keys, [KEY_A, KEY_B]);
-        let body = create_body(&s, &keys);
+        let body = create_body(&s, &keys).unwrap();
         let mut fields: Vec<&String> = body.as_object().unwrap().keys().collect();
         fields.sort();
         assert_eq!(fields, ["cancel_unavail", "disk", "env", "image", "label", "onstart", "runtype"]);

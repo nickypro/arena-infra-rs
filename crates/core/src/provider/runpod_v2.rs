@@ -18,15 +18,47 @@
 //!   request doesn't set one** — and we always set it (the cohort keys). So the account's
 //!   keys are fetched (`GET /v2/account/ssh-keys`) and merged in here, which keeps the
 //!   admin key working exactly as on v1, where RunPod added it on its own.
-//! - **Rename and maintenance stay on GraphQL** (shared with `runpod.rs`): v2 has no
-//!   maintenance field, and its `PATCH name` isn't documented as restart-free (v1's PATCH
-//!   restarted the container, wiping its disk).
+//! - **Rename is `PATCH /v2/pods/{id}` with `{"name"}` and nothing else.** Live-verified
+//!   restart-free (2026-10-08: PID 1's age kept counting, a marker file in `/root` and the
+//!   SSH endpoint survived) — unlike v1's REST PATCH, which restarted the container. Any
+//!   other PATCH field (`image`, `env`) DOES reset the container: that's [`reimage_payload`],
+//!   so the rename body is built by its own function and pinned by a test.
+//! - **Error bodies are read once more** ([`v2_error`]): a `422` is a request the API
+//!   rejected as invalid (an unknown GPU type, a schema violation) — a config error, never
+//!   capacity, never retried; a `400 "Pod is locked"` is [`ProviderErrorKind::Locked`].
+//! - **Locks** ([`crate::lock`]) are `PATCH /v2/pods/{id}` with `{"locked": bool}` and
+//!   nothing else ([`lock_payload`], live-verified: the container is untouched). A locked
+//!   pod's stop, restart and DELETE answer `400 "Pod is locked"`; the pod's `locked` field
+//!   says which pods are, `actions` doesn't (it still lists them).
+//! - **`--api-json`** is deep-merged into the create body last ([`create_payload`]), after
+//!   refusing the fields listed in [`MANAGED`].
 //!
-//! Requests and responses go through small pure functions (URL/body builders, [`judge`],
-//! [`parse_page`], [`parse_pod`], [`parse_spec`]) so all of it is tested against
-//! schema-shaped fixtures from RunPod's v2 OpenAPI document without a network call.
+//! ## GraphQL dependency inventory
+//!
+//! RunPod's GraphQL API is reportedly being retired as well ("early 2027" — unverified). On
+//! `RUNPOD_API=v2` it is left only where REST v2 has no equivalent, and each use degrades
+//! instead of breaking when GraphQL goes:
+//! - **Maintenance windows** — [`Provider::enrich`] (`myself.pods.machine.maintenance*`,
+//!   shared with v1 as `runpod::enrich_via_graphql`): v2 has no such field. Best-effort at
+//!   every caller (`pods list`, `up`, the TUI — bounded, one warning line); GPU, count and
+//!   $/h already come from REST v2, so only the maintenance column goes blank.
+//! - **Account balance** — GraphQL `myself { clientBalance … }`: v2 has billing *history*
+//!   only (live-checked 2026-10-08). Read-only.
+//! - **Network volumes, as a fallback only** — `teardown --check` lists them with `GET
+//!   /v2/network-volumes` ([`fetch_network_volumes`]) and asks GraphQL only if that fails.
+//!
+//! No longer GraphQL on v2: rename (above), and the GPU catalog — prices, stock and the
+//! `--gpu` check come from `GET /v2/catalog/gpus` ([`fetch_gpu_types`], fetched once per
+//! tier per run through a [`CatalogCache`]). On v1 all of the above stay on GraphQL (REST
+//! v1 has no catalog and no restart-free rename).
+//!
+//! Requests and responses go through small pure functions (URL/body builders, [`judge_v2`],
+//! [`parse_page`], [`parse_pod`], [`parse_spec`], [`parse_catalog`]) so all of it is tested
+//! without a network call — against schema-shaped fixtures from RunPod's v2 OpenAPI
+//! document, and against scrubbed recorded responses from the live API
+//! (`fixtures/runpod_v2/*.json`, contract tests in `runpod_v2_contract.rs`).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Mutex;
 
@@ -36,11 +68,12 @@ use serde_json::{json, Map, Value};
 
 use super::runpod::{self, loose_f64, loose_string, GpuType};
 use super::Provider;
+use crate::apiextra::{self, managed, Extra, Managed};
 use crate::error::{Error, ProviderErrorKind, Result};
-use crate::http::{judge, send_json, send_ok};
+use crate::http::{judge, status_error};
 use crate::pod::{Pod, PodSpec};
 
-const BASE: &str = "https://api.runpod.io/v2";
+pub(crate) const BASE: &str = "https://api.runpod.io/v2";
 
 /// Page size for `GET /v2/pods` (the API's maximum, and its default). A cohort is a few
 /// dozen pods, so this is one page in practice; the loop exists for correctness.
@@ -144,24 +177,106 @@ fn catalog_request(client: &Client, api_key: &str, cloud: &str) -> RequestBuilde
         .query(&[("include", "AVAILABILITY"), ("product", "POD"), ("cloud", cloud)])
 }
 
-/// Send a request and [`judge`] its response (status first, then the body — shared with
-/// every backend in [`crate::http`]). For v2 that means: a 2xx with an empty body (`204`,
-/// terminate) is `Null`; a non-JSON 2xx is an `Other` error; any other status goes through
-/// [`Error::provider_http`] — 401/403 auth, 429 rate-limited, capacity sniffed from the
-/// message (v2 reports "no capacity" as a 400 whose only signal is the human-readable
-/// `detail`), other 5xx transient. Error bodies are problem+json (`{title, status, detail,
-/// errors}`); a proxy's HTML 502 isn't, so a non-JSON body is kept as raw text.
+/// Send a request and judge its response by [`crate::http`]'s rule — the status first, then
+/// the body, and an error status's body read best-effort so the status survives a body that
+/// can't be read — with v2's own reading of error bodies ([`judge_v2`]).
 async fn send(rb: RequestBuilder, ctx: &str) -> Result<Value> {
-    send_json(rb, ctx).await
+    let resp = rb.send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(v2_error(status, &text, ctx));
+    }
+    judge_v2(status, &resp.text().await?, ctx)
 }
 
-/// [`judge`] for `POST /v2/pods`, whose error table gives 403 a meaning of its own: "Your
+/// [`send`] for calls whose success body we don't use (stop, restart, terminate, reimage):
+/// only the status is judged, so one that worked is never reported as failed over its body.
+async fn send_ok(rb: RequestBuilder, ctx: &str) -> Result<()> {
+    let resp = rb.send().await?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let text = resp.text().await.unwrap_or_default();
+    Err(v2_error(status, &text, ctx))
+}
+
+/// One v2 response (status + raw body) as its JSON body or a classified error. Pure, so it's
+/// table-tested — including against recorded live responses. A 2xx is [`judge`]'s (an empty
+/// body, `204` terminate, is `Null`; a non-JSON one an `Other` error); anything else is
+/// [`v2_error`].
+fn judge_v2(status: StatusCode, text: &str, ctx: &str) -> Result<Value> {
+    if status.is_success() {
+        judge(status, text, ctx)
+    } else {
+        Err(v2_error(status, text, ctx))
+    }
+}
+
+/// The problem+json `detail` of a v2 error body (`{title, status, detail, errors}`), or the
+/// raw text when the body isn't problem+json (a proxy's HTML page, a bare string).
+fn problem_detail(text: &str) -> String {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|v| v.get("detail").and_then(Value::as_str).map(String::from))
+        .unwrap_or_else(|| text.trim().to_string())
+}
+
+/// The error for a non-2xx v2 response. Starts from the shared classification
+/// ([`status_error`]: 401/403 auth, 429 rate-limited, capacity sniffed from the message —
+/// v2 reports "no capacity" as a 400 whose only signal is the human-readable `detail` —
+/// other 5xx transient), then reads what v2 itself says. The message, problem body
+/// included (`errors` too), is kept as is either way. Pure.
+/// - A 4xx whose `detail` says "Pod is locked" (live: a 400 to stop, restart and DELETE on a
+///   `locked` pod) → [`ProviderErrorKind::Locked`]. 401/403/429 keep their status's meaning.
+/// - `422` → [`Error::Config`]: the API rejected the request itself as invalid. Live
+///   wordings: "Unknown GPU type: NVIDIA NOT A GPU" (a bad `--gpu`/`GPU_TYPE` — the same
+///   class of error the pre-create `--gpu` check raises) and "Request validation failed."
+///   with `errors` naming the fields. Not capacity whatever the words (waiting for a GPU
+///   that doesn't exist would never end) and not retried.
+fn v2_error(status: StatusCode, text: &str, ctx: &str) -> Error {
+    let (kind, message) = match status_error(status, text, ctx) {
+        Error::Provider { kind, message } => (kind, message),
+        other => return other,
+    };
+    let code = status.as_u16();
+    let locked = status.is_client_error()
+        && !matches!(code, 401 | 403 | 429)
+        && problem_detail(text).to_lowercase().contains("pod is locked");
+    if locked {
+        return Error::Provider { kind: ProviderErrorKind::Locked, message };
+    }
+    if code == 422 {
+        return Error::Config(message);
+    }
+    Error::Provider { kind, message }
+}
+
+/// Recorded live v2 responses replayed for fakes in other crates' tests, so a fake provider
+/// returns exactly the error the real backend would. Test-only.
+#[cfg(any(test, feature = "test-util"))]
+pub mod recorded {
+    use super::*;
+
+    /// `fixtures/runpod_v2/locked_stop_refused.json` (live 2026-10-08: a locked pod's stop,
+    /// answered `400 {"detail": "Pod is locked"}`), classified by this backend under `ctx`
+    /// — a [`ProviderErrorKind::Locked`] error.
+    pub fn locked_refusal(ctx: &str) -> Error {
+        let rec: Value =
+            serde_json::from_str(include_str!("fixtures/runpod_v2/locked_stop_refused.json")).expect("fixture is JSON");
+        let status = rec["status"].as_u64().and_then(|s| u16::try_from(s).ok()).and_then(|s| StatusCode::from_u16(s).ok());
+        v2_error(status.expect("fixture has a status"), &rec["body"].to_string(), ctx)
+    }
+}
+
+/// [`judge_v2`] for `POST /v2/pods`, whose error table gives 403 a meaning of its own: "Your
 /// account cannot access the requested pool. | Skip this candidate, keep going." So a 403
 /// here is [`ProviderErrorKind::Denied`] (placement skips that option and tries the next),
 /// not `Auth` (which aborts the whole run on one restricted pool). 401 stays `Auth`, and a
 /// 403 anywhere else (e.g. the ssh-keys read) stays `Auth` too. Pure.
 fn judge_create(status: StatusCode, text: &str) -> Result<Value> {
-    judge(status, text, "create pod").map_err(|e| match e {
+    judge_v2(status, text, "create pod").map_err(|e| match e {
         Error::Provider { message, .. } if status == StatusCode::FORBIDDEN => {
             Error::Provider { kind: ProviderErrorKind::Denied, message }
         }
@@ -280,6 +395,21 @@ fn parse_pod(v: &Value) -> Pod {
         ssh_port,
         maintenance: None, // GraphQL-only, see `enrich`
         machine_id: None,
+        // `locked` (a bool on every v2 pod): stop/restart/terminate refused while true —
+        // read from here, never inferred from `actions`, which still lists them.
+        locked: v.get("locked").and_then(Value::as_bool),
+    }
+}
+
+/// What a failed v2 [`Provider::enrich`] reports: only the maintenance windows are missing
+/// (GPU, count and $/h came with the REST v2 list), so the warning callers print says that
+/// rather than "details incomplete". The kind is kept; nothing else changes. Pure.
+fn enrich_error(e: Error) -> Error {
+    let what = "maintenance windows unavailable (RunPod GraphQL; GPU and $/h are from REST v2)";
+    match e {
+        Error::Provider { kind, message } => Error::Provider { kind, message: format!("{what}: {message}") },
+        Error::Http(e) => Error::provider(format!("{what}: http error: {e}")),
+        other => other,
     }
 }
 
@@ -332,6 +462,33 @@ fn env_object(env: &[(String, String)], account_keys: &[String]) -> Map<String, 
         .collect()
 }
 
+/// The create-body fields the tool sets itself, refused in `--api-json` /
+/// `CREATE_EXTRA_JSON` ([`apiextra::check`]); plus the `ports` rule (keep `22/tcp`). The
+/// start command (`cmd`/`args`/`entrypoint` — one field in three spellings) is the image's
+/// own, which starts sshd, or `--bootstrap`'s. `locked` isn't a create field at all; it's
+/// refused with a pointer to `up --lock` rather than left to a 422. `templateId` is refused
+/// because the template fills in what the body leaves out (its `args`, a persistent mount,
+/// CUDA versions — per the API reference only `env` is merged, body winning), i.e. fields
+/// this table manages, without naming them.
+pub(crate) const MANAGED: &[Managed] = &[
+    managed(&["name"], "the machine name"),
+    managed(&["image"], "--image / IMAGE"),
+    managed(&["cloud"], "--cloud / CLOUD_TYPE"),
+    managed(&["gpu", "id"], "--gpu / GPU_TYPE"),
+    managed(&["gpu", "count"], "--gpus / NUM_GPUS"),
+    managed(&["gpu", "allowedCudaVersions"], "ALLOWED_CUDA_VERSIONS"),
+    managed(&["disk"], "--disk / DISK_GB"),
+    managed(&["mounts", "persistent"], "--volume / VOLUME_GB, at /workspace"),
+    managed(&["env", "PUBLIC_KEY"], "the cohort SSH keys"),
+    managed(&["env", "MACHINE_NAME"], "the machine name"),
+    managed(&["startSsh"], "always on: it's how the pod gets SSH"),
+    managed(&["cmd"], "--bootstrap, else the image's own, which starts sshd"),
+    managed(&["args"], "--bootstrap, else the image's own, which starts sshd"),
+    managed(&["entrypoint"], "the image's own, which starts sshd"),
+    managed(&["locked"], "`pods up --lock`, which locks each pod once it's READY"),
+    managed(&["templateId"], "the flags above — a template would override the start command and volume arena sets"),
+];
+
 /// Build the `POST /v2/pods` body. Pure, so every field rule is unit-tested — the schema
 /// rejects unknown keys (422), so names must match exactly:
 /// - `cloud` is ALWAYS present (omitted = SECURE on v2) and must be COMMUNITY/SECURE.
@@ -343,7 +500,10 @@ fn env_object(env: &[(String, String)], account_keys: &[String]) -> Map<String, 
 /// - `volume_gb` > 0 → `mounts.persistent {size, path}`; 0 → no mount at all.
 /// - `startSsh: true`: with our `PUBLIC_KEY` set it injects nothing (the account keys are
 ///   merged into ours instead); without one it injects the account keys — v1's behaviour.
+/// - `spec.api_extra` (`--api-json`) is deep-merged in last, minus the [`MANAGED`] fields —
+///   and minus a network volume next to the pod volume ([`network_mount_conflict`]).
 fn create_payload(spec: &PodSpec, account_keys: &[String]) -> Result<Value> {
+    network_mount_conflict(spec)?;
     let cloud = normalize_cloud(&spec.cloud_type)?;
     let mut gpu = json!({ "id": spec.gpu_type, "count": spec.gpu_count });
     if !spec.allowed_cuda.is_empty() {
@@ -366,7 +526,34 @@ fn create_payload(spec: &PodSpec, account_keys: &[String]) -> Result<Value> {
     if spec.volume_gb > 0 {
         payload["mounts"] = json!({ "persistent": { "size": spec.volume_gb, "path": VOLUME_MOUNT_PATH } });
     }
+    apiextra::apply(&mut payload, spec.api_extra.as_ref(), MANAGED, Some("ports"))?;
     Ok(payload)
+}
+
+/// Refuse a network volume from `--api-json` (`mounts.network`) on a pod that also gets the
+/// pod volume (`--volume` / `VOLUME_GB` > 0 → `mounts.persistent`). The v2 schema allows
+/// "at most one of `persistent` or `network`" — the handler answers 400 when both are
+/// present — so the merge would build a body the API refuses only after planning and the
+/// confirm. Dropping our persistent mount instead would silently change what `--volume`
+/// promised (and what the restart gate reads), so the operator chooses: `--volume 0` with
+/// a network volume. Any `network` key counts, whatever its value. Pure.
+fn network_mount_conflict(spec: &PodSpec) -> Result<()> {
+    let network = spec
+        .api_extra
+        .as_ref()
+        .and_then(|x| x.get("mounts"))
+        .and_then(Value::as_object)
+        .is_some_and(|m| m.contains_key("network"));
+    if network && spec.volume_gb > 0 {
+        return Err(Error::Config(format!(
+            "{}: refused — `mounts.network` (a network volume) replaces the pod volume, and this pod \
+             also gets one ({} GB from --volume / VOLUME_GB): RunPod takes one or the other — pass \
+             --volume 0 (or set VOLUME_GB=0) with a network volume",
+            apiextra::SOURCES,
+            spec.volume_gb
+        )));
+    }
+    Ok(())
 }
 
 /// The `POST /v2/pods/{id}/action` body.
@@ -380,6 +567,73 @@ fn action_body(action: &str) -> Value {
 /// exactly as on create (`startSsh` is create-only, so nothing would re-add them).
 fn reimage_payload(image: &str, env: &[(String, String)], account_keys: &[String]) -> Value {
     json!({ "image": image, "env": env_object(env, account_keys) })
+}
+
+/// The `PATCH /v2/pods/{id}` body for a rename: `name` and NOTHING else. Live-verified
+/// restart-free with exactly this body; the same PATCH carrying `image`/`env` resets the
+/// container (that's [`reimage_payload`]), so nothing may ever be added here.
+fn rename_payload(new_name: &str) -> Value {
+    json!({ "name": new_name })
+}
+
+/// The rename request — built, not sent, so a test pins its method, URL and exact body. A
+/// blank name is refused before any request (the API might accept it and leave the pod
+/// nameless, which no selector could address).
+fn rename_request(client: &Client, api_key: &str, id: &str, new_name: &str) -> Result<RequestBuilder> {
+    if new_name.trim().is_empty() {
+        return Err(Error::Config("rename pod: the new name is empty".into()));
+    }
+    Ok(api_request(client, api_key, Method::PATCH, pod_url(id, None)?).json(&rename_payload(new_name)))
+}
+
+/// Judge a rename's response. Pure. An error status reads as everywhere on v2 ([`v2_error`]:
+/// a locked pod is `Locked`, a rejected name a config error). A 2xx is success — unless its
+/// body is the pod (the live API answers with it) under some other name: then the rename
+/// didn't take, and reporting success would rename `~/.name`, the keys CSV and the proxy
+/// around a pod that kept its old name. A 2xx body that isn't a named pod (empty, not
+/// JSON) is still success: the status is the contract, as for every mutating call.
+fn judge_rename(status: StatusCode, text: &str, new_name: &str) -> Result<()> {
+    if !status.is_success() {
+        return Err(v2_error(status, text, "rename pod"));
+    }
+    let named = serde_json::from_str::<Value>(text).ok().and_then(|v| v.get("name").and_then(Value::as_str).map(String::from));
+    match named {
+        Some(got) if got.trim() != new_name.trim() => Err(Error::provider(format!(
+            "rename pod: HTTP {status}, but the pod is still named `{got}`, not `{new_name}` — the rename didn't take"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// The `PATCH /v2/pods/{id}` body for a lock or unlock: `locked` and NOTHING else — the
+/// same PATCH carrying `image`/`env` resets the container ([`reimage_payload`]).
+/// Live-verified with exactly this body (the container untouched).
+fn lock_payload(locked: bool) -> Value {
+    json!({ "locked": locked })
+}
+
+/// The lock/unlock request — built, not sent, so a test pins its method, URL and body
+/// against the recording.
+fn lock_request(client: &Client, api_key: &str, id: &str, locked: bool) -> Result<RequestBuilder> {
+    Ok(api_request(client, api_key, Method::PATCH, pod_url(id, None)?).json(&lock_payload(locked)))
+}
+
+/// Judge a lock/unlock response. Pure. An error status reads as everywhere on v2
+/// ([`v2_error`]). A 2xx is success — unless its body is the pod (the live API answers with
+/// it) still in the other state: then the lock didn't take, and reporting "locked" would
+/// leave a participant's pod unprotected while the operator thinks it isn't. A 2xx body
+/// without a `locked` bool is still success: the status is the contract.
+fn judge_lock(status: StatusCode, text: &str, locked: bool) -> Result<()> {
+    let ctx = if locked { "lock pod" } else { "unlock pod" };
+    if !status.is_success() {
+        return Err(v2_error(status, text, ctx));
+    }
+    match serde_json::from_str::<Value>(text).ok().and_then(|v| v.get("locked").and_then(Value::as_bool)) {
+        Some(got) if got != locked => {
+            Err(Error::provider(format!("{ctx}: HTTP {status}, but the pod still reports locked={got} — it didn't take")))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Recover a recreate-able `PodSpec` from `GET /v2/pods/{id}`. Pure, for fixture tests.
@@ -430,6 +684,7 @@ fn parse_spec(v: &Value) -> PodSpec {
         docker_args,
         allowed_cuda: Vec::new(),
         max_price: None,
+        api_extra: None,
     }
 }
 
@@ -466,11 +721,52 @@ fn parse_catalog(body: &Value) -> Result<Vec<GpuType>> {
 }
 
 /// RunPod's GPU catalog from REST v2, with list prices for both tiers and pod stock for
-/// `cloud` (COMMUNITY/SECURE). The v2 counterpart of [`runpod::fetch_gpu_types`]: `arena
-/// gpus` uses it when `RUNPOD_API=v2` and falls back to GraphQL if it fails.
+/// `cloud` (COMMUNITY/SECURE). The v2 counterpart of [`runpod::fetch_gpu_types`]; on
+/// `RUNPOD_API=v2` it is the only catalog source (`arena gpus`, `offers`, placement prices,
+/// the `--gpu` check — no GraphQL fallback, see the module's GraphQL inventory). Every
+/// tier's answer lists every GPU (the recorded COMMUNITY answer includes secure-only cards),
+/// so any one tier's catalog serves the `--gpu` check.
 pub async fn fetch_gpu_types(api_key: &str, cloud: &str) -> Result<Vec<GpuType>> {
     let body = send(catalog_request(&Client::new(), api_key, normalize_cloud(cloud)?), "gpu catalog").await?;
     parse_catalog(&body)
+}
+
+/// One run's v2 catalog lookups, by tier: each tier is fetched at most once, however many
+/// readers ask (the `--gpu` check, then the placement plan's price book, per tier). Failures
+/// are kept too — a catalog that just timed out is not asked again for the next reader,
+/// which would only double the wait before the same fallback (preset prices, an unchecked
+/// `--gpu`). An empty catalog counts as a failure: no reader can use one.
+///
+/// Readers take turns (the CLI asks sequentially); two concurrent first lookups of one tier
+/// would both fetch, and the later answer wins — harmless for a read-only hint. No `Debug`:
+/// the keys include the API key, and must never be printed.
+#[derive(Default)]
+pub struct CatalogCache {
+    entries: Mutex<HashMap<(String, &'static str), std::result::Result<Vec<GpuType>, String>>>,
+}
+
+impl CatalogCache {
+    /// The catalog for `cloud` with this `api_key`: cached, or `fetch(tier)`'s answer
+    /// (`tier` = the normalized spelling). An unknown tier is refused without a fetch, as
+    /// [`fetch_gpu_types`] would. `Err` is the reason, ready to print.
+    pub async fn get_or_fetch<F, Fut>(&self, api_key: &str, cloud: &str, fetch: F) -> std::result::Result<Vec<GpuType>, String>
+    where
+        F: FnOnce(&'static str) -> Fut,
+        Fut: Future<Output = Result<Vec<GpuType>>>,
+    {
+        let tier = normalize_cloud(cloud).map_err(|e| e.to_string())?;
+        let key = (api_key.to_string(), tier);
+        if let Some(hit) = self.entries.lock().unwrap().get(&key) {
+            return hit.clone();
+        }
+        let answer = match fetch(tier).await {
+            Ok(types) if types.is_empty() => Err("empty catalog".to_string()),
+            Ok(types) => Ok(types),
+            Err(e) => Err(e.to_string()),
+        };
+        self.entries.lock().unwrap().insert(key, answer.clone());
+        answer
+    }
 }
 
 /// `GET /v2/network-volumes` (`listNetworkVolumes` in the v2 OpenAPI document): every network
@@ -520,8 +816,10 @@ impl Provider for RunpodV2Provider {
     }
 
     async fn enrich(&self, pods: &mut [Pod]) -> Result<()> {
-        // v2 already reports GPU type/count and $/h; GraphQL adds the maintenance window.
-        runpod::enrich_via_graphql(&self.client, &self.api_key, pods).await
+        // v2 already reports GPU type/count and $/h; GraphQL adds only the maintenance
+        // window (the first item of the GraphQL dependency inventory, module doc). Its
+        // failure stays harmless — every caller is best-effort — and says what's missing.
+        runpod::enrich_via_graphql(&self.client, &self.api_key, pods).await.map_err(enrich_error)
     }
 
     async fn create_pod(&self, spec: &PodSpec) -> Result<Pod> {
@@ -579,7 +877,13 @@ impl Provider for RunpodV2Provider {
     }
 
     async fn rename_pod(&self, id: &str, new_name: &str) -> Result<()> {
-        runpod::rename_via_graphql(&self.client, &self.api_key, id, new_name).await
+        // REST v2, not GraphQL's `podEditName` (v1 keeps that): a name-only PATCH, which
+        // leaves the running container alone (see `rename_payload`).
+        let resp = rename_request(&self.client, &self.api_key, id, new_name)?.send().await?;
+        let status = resp.status();
+        // Read best-effort: a 2xx whose body can't be read is still a rename that worked.
+        let text = resp.text().await.unwrap_or_default();
+        judge_rename(status, &text, new_name)
     }
 
     async fn reimage_pod(&self, id: &str, image: &str, env: &[(String, String)]) -> Result<()> {
@@ -593,7 +897,34 @@ impl Provider for RunpodV2Provider {
         let body = send(api_request(&self.client, &self.api_key, Method::GET, pod_url(id, None)?), "get pod").await?;
         Ok(parse_spec(&body))
     }
+
+    fn lock_support(&self, _pod: &Pod) -> Result<()> {
+        Ok(())
+    }
+
+    async fn set_locked(&self, id: &str, locked: bool) -> Result<()> {
+        let resp = lock_request(&self.client, &self.api_key, id, locked)?.send().await?;
+        let status = resp.status();
+        // Read best-effort: a 2xx whose body can't be read is still a lock that took.
+        let text = resp.text().await.unwrap_or_default();
+        judge_lock(status, &text, locked)
+    }
+
+    fn check_create_extra(&self, extra: &Extra) -> Result<()> {
+        apiextra::check(extra, MANAGED, Some("ports"))
+    }
+
+    fn preview_create_body(&self, spec: &PodSpec) -> Result<Value> {
+        // Without the account keys `create_pod` merges into PUBLIC_KEY (a request); the
+        // preview redacts env values anyway.
+        create_payload(spec, &[])
+    }
 }
+
+/// Contract tests against recorded live responses (`fixtures/runpod_v2/`).
+#[cfg(test)]
+#[path = "runpod_v2_contract.rs"]
+mod contract;
 
 #[cfg(test)]
 mod tests {
@@ -673,6 +1004,7 @@ mod tests {
                 ssh_port: Some(34446),
                 maintenance: None,
                 machine_id: None,
+                locked: Some(false),
             }
         );
     }
@@ -823,7 +1155,7 @@ mod tests {
         let problem = |status: u16, detail: &str| {
             json!({"title": "x", "status": status, "detail": detail}).to_string()
         };
-        // (case, status, body, Ok?, error kind)
+        // (case, status, body, Ok?, error kind — `None` for an error = a config error)
         let cases: Vec<(&str, u16, String, bool, Option<K>)> = vec![
             ("201 created pod", 201, pod.clone(), true, None),
             ("200 action pod", 200, pod, true, None),
@@ -832,21 +1164,36 @@ mod tests {
             ("400 capacity (v1 wording)", 400, problem(400, "There are no instances currently available"), false, Some(K::Capacity)),
             ("400 capacity (placement)", 400, problem(400, "this GPU and data center combination could not be placed"), false, Some(K::Capacity)),
             ("400 rule violation", 400, problem(400, "allowedCudaVersions and minCudaVersion are mutually exclusive"), false, Some(K::Other)),
+            ("400 pod locked", 400, problem(400, "Pod is locked"), false, Some(K::Locked)),
+            ("409 pod locked", 409, problem(409, "pod is locked"), false, Some(K::Locked)),
+            ("400 locked, plain text", 400, "Pod is locked".into(), false, Some(K::Locked)),
+            ("400 unlocked is not locked", 400, problem(400, "Pod is unlocked"), false, Some(K::Other)),
             ("402 balance is not capacity", 402, problem(402, "Insufficient balance"), false, Some(K::Other)),
             ("401", 401, problem(401, "missing bearer token"), false, Some(K::Auth)),
+            ("401 locked wording stays auth", 401, problem(401, "Pod is locked"), false, Some(K::Auth)),
             ("403 (key lacks access)", 403, problem(403, "access denied"), false, Some(K::Auth)),
             ("409 bad action", 409, problem(409, "action not valid for current pod status"), false, Some(K::Other)),
-            ("422", 422, problem(422, "Request validation failed."), false, Some(K::Other)),
+            ("422 validation", 422, problem(422, "Request validation failed."), false, None),
+            ("422 unknown gpu", 422, problem(422, "Unknown GPU type: NVIDIA NOT A GPU"), false, None),
+            ("422 capacity words are still invalid", 422, problem(422, "no instances available"), false, None),
             ("429", 429, problem(429, "rate limit exceeded for the minute window"), false, Some(K::RateLimited)),
             ("502 html", 502, "<html>Bad Gateway</html>".into(), false, Some(K::Transient)),
             ("500 capacity", 500, problem(500, "no instances available"), false, Some(K::Capacity)),
+            ("500 locked wording is a server error", 500, problem(500, "Pod is locked"), false, Some(K::Transient)),
         ];
+        let check = |case: &str, e: &Error, want: Option<K>, ctx: &str| {
+            assert_eq!(e.kind(), want, "{case}: {e}");
+            if want.is_none() {
+                assert!(matches!(e, Error::Config(_)), "{case}: {e}");
+            }
+            assert!(e.to_string().contains(&format!("{ctx} HTTP")) || e.to_string().contains(&format!("{ctx}: HTTP")), "{case}: {e}");
+            assert!(!crate::retry::is_retryable(e) || matches!(want, Some(K::Transient | K::RateLimited)), "{case}");
+        };
         for (case, code, body, ok, kind) in &cases {
-            let r = judge(StatusCode::from_u16(*code).unwrap(), body, "get pod");
+            let r = judge_v2(StatusCode::from_u16(*code).unwrap(), body, "get pod");
             assert_eq!(r.is_ok(), *ok, "{case}: {r:?}");
             if let Err(e) = r {
-                assert_eq!(e.kind(), *kind, "{case}: {e}");
-                assert!(!crate::retry::is_retryable(&e) || matches!(kind, Some(K::Transient | K::RateLimited)), "{case}");
+                check(case, &e, *kind, "get pod");
             }
         }
         // `POST /v2/pods` reads every response the same, except its documented 403 ("Your
@@ -857,19 +1204,115 @@ mod tests {
             let r = judge_create(StatusCode::from_u16(*code).unwrap(), body);
             assert_eq!(r.is_ok(), *ok, "create {case}: {r:?}");
             if let Err(e) = r {
-                assert_eq!(e.kind(), want, "create {case}: {e}");
-                assert!(e.to_string().contains("create pod"), "create {case}: {e}");
-                assert!(!crate::retry::is_retryable(&e) || matches!(want, Some(K::Transient | K::RateLimited)), "{case}");
+                check(case, &e, want, "create pod");
             }
         }
         let pool = problem(403, "your account cannot access the requested pool");
         let e = judge_create(StatusCode::FORBIDDEN, &pool).unwrap_err();
         assert_eq!(e.kind(), Some(K::Denied));
         assert!(e.to_string().contains("cannot access the requested pool"), "{e}");
-        assert_eq!(judge(StatusCode::NO_CONTENT, "", "terminate pod").unwrap(), Value::Null);
+        assert_eq!(judge_v2(StatusCode::NO_CONTENT, "", "terminate pod").unwrap(), Value::Null);
         // The problem's `detail` makes it into the message.
-        let e = judge(StatusCode::NOT_FOUND, &problem(404, "pod not found"), "get pod").unwrap_err();
+        let e = judge_v2(StatusCode::NOT_FOUND, &problem(404, "pod not found"), "get pod").unwrap_err();
         assert!(e.to_string().contains("get pod HTTP 404") && e.to_string().contains("pod not found"), "{e}");
+    }
+
+    #[test]
+    fn problem_detail_reads_problem_json_or_the_raw_text() {
+        assert_eq!(problem_detail(r#"{"detail":"Pod is locked","status":400,"title":"Bad Request"}"#), "Pod is locked");
+        assert_eq!(problem_detail("  <html>Bad Gateway</html>\n"), "<html>Bad Gateway</html>");
+        assert_eq!(problem_detail(r#"{"error":"x"}"#), r#"{"error":"x"}"#); // not problem+json: as is
+        assert_eq!(problem_detail(""), "");
+    }
+
+    #[test]
+    fn rename_is_a_name_only_patch() {
+        let rb = rename_request(&Client::new(), "rpa_SECRET", "7h9k2m4n6p", "devtest-bravo").unwrap();
+        let req = rb.build().unwrap();
+        assert_eq!(req.method(), Method::PATCH);
+        assert_eq!(req.url().as_str(), "https://api.runpod.io/v2/pods/7h9k2m4n6p");
+        assert_eq!(req.headers()["authorization"], "Bearer rpa_SECRET");
+        let body: Value = serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap();
+        // Exactly `name`: an `image`/`env` beside it would reset the container.
+        assert_eq!(body, json!({"name": "devtest-bravo"}));
+        assert_eq!(rename_payload("x").as_object().unwrap().len(), 1);
+        // A blank name or a bad id is refused before any request.
+        for blank in ["", "  "] {
+            assert!(matches!(rename_request(&Client::new(), "k", "p1", blank), Err(Error::Config(_))), "{blank:?}");
+        }
+        assert!(rename_request(&Client::new(), "k", "..", "devtest-bravo").is_err());
+        assert!(rename_request(&Client::new(), "k", "", "devtest-bravo").is_err());
+    }
+
+    #[test]
+    fn judge_rename_checks_the_returned_name() {
+        let pod = |name: &str| {
+            let mut v = running_pod();
+            v["name"] = json!(name);
+            v.to_string()
+        };
+        let ok = StatusCode::OK;
+        judge_rename(ok, &pod("devtest-bravo"), "devtest-bravo").unwrap();
+        // The pod came back under another name: the rename didn't take.
+        let e = judge_rename(ok, &pod("devtest-apple"), "devtest-bravo").unwrap_err().to_string();
+        assert!(e.contains("still named `devtest-apple`") && e.contains("devtest-bravo"), "{e}");
+        assert!(!e.contains("MODEL_NAME") && !e.contains("195.26"), "never the pod's other fields: {e}");
+        // A 2xx we can't read as a named pod: the status is the contract.
+        for body in ["", "<html>ok</html>", "{}", r#"{"id":"x"}"#] {
+            judge_rename(ok, body, "devtest-bravo").unwrap();
+        }
+        judge_rename(StatusCode::NO_CONTENT, "", "devtest-bravo").unwrap();
+        // Errors read as everywhere on v2.
+        let locked = json!({"detail": "Pod is locked", "status": 400, "title": "Bad Request"}).to_string();
+        let e = judge_rename(StatusCode::BAD_REQUEST, &locked, "devtest-bravo").unwrap_err();
+        assert!(e.is_locked() && e.to_string().contains("rename pod HTTP 400"), "{e}");
+        let e = judge_rename(StatusCode::UNPROCESSABLE_ENTITY, r#"{"detail":"name too long"}"#, "x").unwrap_err();
+        assert!(matches!(e, Error::Config(_)) && e.to_string().contains("name too long"), "{e}");
+        let e = judge_rename(StatusCode::BAD_GATEWAY, "<html>Bad Gateway</html>", "x").unwrap_err();
+        assert!(crate::retry::is_retryable(&e), "{e}"); // a name-only PATCH is safe to repeat
+    }
+
+    #[test]
+    fn enrich_error_says_only_maintenance_is_missing_and_keeps_the_kind() {
+        let e = enrich_error(Error::provider_http(StatusCode::NOT_FOUND, &"Not Found", "pod details"));
+        let m = e.to_string();
+        assert!(m.contains("maintenance windows unavailable") && m.contains("pod details HTTP 404"), "{m}");
+        assert_eq!(e.kind(), Some(ProviderErrorKind::Other));
+        let auth = enrich_error(Error::provider_http(StatusCode::UNAUTHORIZED, &"", "pod details"));
+        assert_eq!(auth.kind(), Some(ProviderErrorKind::Auth));
+        let t = Error::Timeout { what: "x".into(), after: std::time::Duration::from_secs(1) };
+        assert!(matches!(enrich_error(t), Error::Timeout { .. }));
+    }
+
+    /// Drive a [`CatalogCache`] with a counting fetch.
+    #[tokio::test]
+    async fn catalog_cache_fetches_each_tier_once_per_run() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cache = CatalogCache::default();
+        let calls = AtomicUsize::new(0);
+        let a4000 = || vec![GpuType { id: "NVIDIA RTX A4000".into(), community_price: Some(0.17), ..Default::default() }];
+        let fetch = |answer: Result<Vec<GpuType>>| {
+            let calls = &calls;
+            move |tier: &'static str| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                assert!(tier == "COMMUNITY" || tier == "SECURE", "{tier}");
+                async move { answer }
+            }
+        };
+        // First ask fetches; the next ones (any spelling of the tier) are served from memory.
+        assert_eq!(cache.get_or_fetch("k", "COMMUNITY", fetch(Ok(a4000()))).await.unwrap(), a4000());
+        assert_eq!(cache.get_or_fetch("k", " community ", fetch(Ok(vec![]))).await.unwrap(), a4000());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // Another tier is its own fetch; a failure is remembered (no second wait for it).
+        let e = cache.get_or_fetch("k", "secure", fetch(Err(Error::provider("timed out after 30s")))).await.unwrap_err();
+        assert!(e.contains("timed out"), "{e}");
+        let again = cache.get_or_fetch("k", "SECURE", fetch(Ok(a4000()))).await.unwrap_err();
+        assert_eq!(again, e);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // An empty catalog is a failure; an unknown tier is refused without a fetch.
+        assert_eq!(cache.get_or_fetch("k2", "COMMUNITY", fetch(Ok(vec![]))).await.unwrap_err(), "empty catalog");
+        assert!(cache.get_or_fetch("k", "ALL", fetch(Ok(a4000()))).await.unwrap_err().contains("CLOUD_TYPE"));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
     fn spec() -> PodSpec {
@@ -889,6 +1332,7 @@ mod tests {
             docker_args: None,
             allowed_cuda: Vec::new(),
             max_price: None,
+            api_extra: None,
         }
     }
 
@@ -962,6 +1406,99 @@ mod tests {
         // CMD only: the image's ENTRYPOINT is kept, as v1's dockerStartCmd did.
         assert!(p.get("entrypoint").is_none() && p.get("args").is_none());
         assert!(create_payload(&spec(), &[]).unwrap().get("cmd").is_none());
+    }
+
+    /// `--api-json` options the tool has no flag for go out merged (objects key by key: our
+    /// env and GPU stay); the fields it sets itself are refused, naming what sets them; a
+    /// refused extra fails the create before any request (the payload is built first).
+    #[test]
+    fn create_payload_merges_api_extra_and_refuses_managed_fields() {
+        let extra = |v: Value| Some(v.as_object().unwrap().clone());
+        let mut s = spec();
+        s.api_extra = extra(json!({
+            "dataCenterIds": ["EU-RO-1"],
+            "globalNetworking": true,
+            "gpu": {"minRamPerGpu": 32},
+            "env": {"JUPYTER_PASSWORD": "pw"},
+            "mounts": {"network": [{"volumeId": "vol1", "path": "/data"}]},
+            "ports": ["8888/http", "22/tcp", "6006/http"],
+        }));
+        let p = create_payload(&s, &[]).unwrap();
+        assert_eq!(p["dataCenterIds"], json!(["EU-RO-1"]));
+        assert_eq!(p["globalNetworking"], true);
+        assert_eq!(p["gpu"], json!({"id": "NVIDIA RTX A4000", "count": 1, "minRamPerGpu": 32}));
+        assert_eq!(p["env"]["MACHINE_NAME"], "devtest-apple");
+        assert_eq!(p["env"]["JUPYTER_PASSWORD"], "pw");
+        assert_eq!(p["mounts"], json!({"network": [{"volumeId": "vol1", "path": "/data"}]}));
+        assert_eq!(p["ports"], json!(["8888/http", "22/tcp", "6006/http"]));
+        assert_eq!((p["name"].as_str(), p["cloud"].as_str(), p["startSsh"].as_bool()), (Some("devtest-apple"), Some("COMMUNITY"), Some(true)));
+
+        // (extra, what the refusal names)
+        for (bad, names) in [
+            (json!({"name": "x"}), "`name` is set by arena (the machine name)"),
+            (json!({"image": "x"}), "--image / IMAGE"),
+            (json!({"gpu": {"id": "NVIDIA H100"}}), "`gpu.id`"),
+            (json!({"gpu": {"count": 8}}), "`gpu.count`"),
+            (json!({"cloud": "SECURE"}), "--cloud / CLOUD_TYPE"),
+            (json!({"disk": 500}), "--disk / DISK_GB"),
+            (json!({"mounts": {"persistent": {"size": 10, "path": "/x"}}}), "--volume / VOLUME_GB"),
+            (json!({"env": {"PUBLIC_KEY": "ssh-ed25519 AAAA evil"}}), "`env.PUBLIC_KEY`"),
+            (json!({"env": {"MACHINE_NAME": "x"}}), "`env.MACHINE_NAME`"),
+            (json!({"env": "A=1"}), "`env.PUBLIC_KEY`"),
+            (json!({"startSsh": false}), "`startSsh`"),
+            (json!({"cmd": ["sleep", "inf"]}), "--bootstrap"),
+            (json!({"entrypoint": ["/bin/sh"]}), "`entrypoint`"),
+            (json!({"locked": true}), "pods up --lock"),
+            (json!({"ports": ["8888/http"]}), "must keep \"22/tcp\""),
+        ] {
+            let mut s = spec();
+            s.api_extra = extra(bad.clone());
+            let e = create_payload(&s, &[]).unwrap_err();
+            assert!(matches!(e, Error::Config(_)), "{bad}: {e:?}");
+            assert!(e.to_string().contains(names), "{bad}: `{names}` in {e}");
+            let p = RunpodV2Provider::new("k");
+            assert!(p.check_create_extra(bad.as_object().unwrap()).is_err(), "{bad}: the up-front check agrees");
+        }
+        // The preview is the same body (no account keys: those are fetched at create).
+        let p = RunpodV2Provider::new("k");
+        assert_eq!(p.preview_create_body(&s).unwrap(), create_payload(&s, &[]).unwrap());
+        assert!(p.check_create_extra(s.api_extra.as_ref().unwrap()).is_ok());
+    }
+
+    /// The schema's Mounts: "at most one of `persistent` or `network`" (a 400 with both). A
+    /// network volume next to the pod volume (`--volume`/VOLUME_GB > 0) is refused before any
+    /// request, saying how to choose; with `--volume 0` it goes out alone; a pod volume
+    /// without one is unchanged. The preview (the dry run, and `create`/`up`'s up-front
+    /// check) refuses the same.
+    #[test]
+    fn a_network_volume_next_to_the_pod_volume_is_refused() {
+        let network = json!({"mounts": {"network": [{"volumeId": "v", "path": "/data"}]}});
+        // (case, volume_gb, extra, Ok(mounts) / Err(what the refusal says))
+        let cases: [(&str, u32, Option<Value>, std::result::Result<Option<Value>, &str>); 5] = [
+            ("network + pod volume", 20, Some(network.clone()), Err("pass --volume 0")),
+            ("network: null + pod volume", 20, Some(json!({"mounts": {"network": null}})), Err("replaces the pod volume")),
+            ("network alone", 0, Some(network.clone()), Ok(Some(json!({"network": [{"volumeId": "v", "path": "/data"}]})))),
+            ("pod volume alone", 20, Some(json!({"globalNetworking": true})), Ok(Some(json!({"persistent": {"size": 20, "path": "/workspace"}})))),
+            ("neither", 0, None, Ok(None)),
+        ];
+        let p = RunpodV2Provider::new("k");
+        for (case, volume_gb, extra, want) in cases {
+            let mut s = spec();
+            s.volume_gb = volume_gb;
+            s.api_extra = extra.map(|v| v.as_object().unwrap().clone());
+            match want {
+                Ok(mounts) => {
+                    let body = create_payload(&s, &[]).unwrap_or_else(|e| panic!("{case}: {e}"));
+                    assert_eq!(body.get("mounts").cloned(), mounts, "{case}");
+                }
+                Err(says) => {
+                    let e = create_payload(&s, &[]).unwrap_err();
+                    assert!(matches!(e, Error::Config(_)), "{case}: {e:?}");
+                    assert!(e.to_string().contains(says) && e.to_string().contains("20 GB"), "{case}: `{says}` in {e}");
+                    assert!(p.preview_create_body(&s).is_err(), "{case}: the preview refuses it too");
+                }
+            }
+        }
     }
 
     #[test]

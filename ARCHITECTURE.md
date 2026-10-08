@@ -25,7 +25,7 @@ flowchart TD
 
     subgraph core[arena-core · library · all logic + safety]
         Config["config<br/>config.env + env overrides"]
-        Fleet{{"Provider (trait)<br/>provider::build_fleet → MultiProvider<br/>list · list_by_provider · enrich · create · stop<br/>restart · terminate · rename · reimage · pod_spec"}}
+        Fleet{{"Provider (trait)<br/>provider::build_fleet → MultiProvider<br/>list · list_by_provider · enrich · create · stop<br/>restart · terminate · rename · reimage · pod_spec · set_locked"}}
         RP1["runpod<br/>REST v1 + GraphQL"]
         RP2["runpod_v2<br/>REST v2 (RUNPOD_API=v2)"]
         Vast["vast<br/>(offer-search rent)"]
@@ -93,7 +93,7 @@ flowchart TD
 |--------|------|-------|
 | `config` | tolerant `config.env` parser (`KEY=val` + the `MACHINE_NAME_LIST` bash array); any present key can be overridden from the environment, and a short allowlist (`ARENA_START_DATE`, `EXTRA_SSH_KEYS`, `HF_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `SSH_PROXY_RELOAD_CMD`, `RUNPOD_API`, `ARENA_STATE_DIR`) may be introduced from it | parse: yes |
 | `provider` | the `Provider` trait, `build` (one backend by name) and `build_fleet` (`MultiProvider`: lists every configured backend, creates on the `--provider` one, routes per-pod calls to the owner). `list_by_provider` keeps each backend's own Ok/Err — a failed listing is never "no pods". List calls bounded at 60 s (`LIST_TIMEOUT`); mutating calls deliberately aren't | trait + I/O |
-| `provider::runpod` / `runpod_v2` | RunPod REST v1 (which RunPod retires on 2026-11-15) and REST v2 (`RUNPOD_API=v2`: paginated listing, real lifecycle statuses, explicit `cloud`, account SSH keys merged into `PUBLIC_KEY`). Rename, maintenance windows, the GPU catalog and network volumes use GraphQL (v2 also has a REST catalog and volume list) | builders/parsers pure |
+| `provider::runpod` / `runpod_v2` | RunPod REST v1 (which RunPod retires on 2026-11-15) and REST v2 (`RUNPOD_API=v2`: paginated listing, real lifecycle statuses, explicit `cloud`, account SSH keys merged into `PUBLIC_KEY`). v1 uses GraphQL for rename, maintenance windows, the GPU catalog and network volumes; v2 renames (name-only `PATCH`), locks/unlocks (`{"locked"}`-only `PATCH`) and reads the catalog over REST, keeping GraphQL only for maintenance windows, the balance and a volume-listing fallback (the "GraphQL dependency inventory" in `runpod_v2.rs`); contract tests replay recorded v2 responses (`provider/fixtures/runpod_v2/`) | builders/parsers pure |
 | `provider::vast`, `provider::hetzner` | Vast rents the cheapest matching *offer* (name carried as the instance label — its offer search still sends the flat query body Vast now rejects, see FEATURE_MAP); Hetzner creates CPU VMs sized by `HETZNER_*` | parsers pure |
 | `http`, `retry` | every response's **status is read before its body is parsed**, so a 401 with an HTML body is classified `Auth`, a 429/5xx transient, a capacity message `Capacity`; `retry` backs off on transient errors only | yes |
 | `remote` | the `Remote` trait (`exec`, `copy`, `copy_recursive`, each with a timeout): `SshRemote` stops a timed-out ssh/scp with SIGTERM then SIGKILL before returning the timeout (`run_local`: the same for rsync); `FakeRemote` (feature `test-util`) scripts replies, delays and failures per host | trait + I/O |
@@ -106,6 +106,8 @@ flowchart TD
 | `fleet`, `status` | the one place a pod's labels (GPU, `$/H`, endpoint, maintenance) and the fleet cost are computed; `is_billing`/`bills_hourly` decide what counts as billing | yes |
 | `snapshot` | `FleetSnapshot` (`build`: pods + proxy state + last health), the SSH-port reachability probe behind the `Reach` seam (`SshPortProbe`: TCP connect + sshd's greeting, nothing sent), the prefix-scoped health cache (atomic, locked, 0600), and `PublicSnapshot` — a separate allowlisted struct for publishing (`up` needs the probe's answer) | build + targets pure; probe and cache I/O |
 | `teardown` | turns listings, volumes, OpenRouter keys, cron/`at` lines and the proxy file into a ✓ ✗ ? – checklist with fix commands (unknown ≠ empty) | yes |
+| `lock` | pod locks (`Pod::locked`, RunPod v2): the up-front refusal of a locked pod for every lifecycle command, the API's `Locked` error read as the same `… is locked — arena pods unlock … first`, `pods lock`/`unlock`'s plan | yes |
+| `apiextra`, `apiget` | `--api-json`/`CREATE_EXTRA_JSON` (parse, deep-merge into a backend's create body, refuse its `MANAGED` fields and a `ports` list without `22/tcp`); `arena api get` (path guard: relative to the provider's API base only; secret redaction; no redirects) | yes (one GET in `apiget::get`) |
 | `jobs` | detached runs (`pods run --background`): the on-pod wrapper, ids, status, log reads by byte offset | yes |
 | `balance` | provider account reads (RunPod GraphQL `myself`, Vast `users/current` — only the balance fields; Hetzner postpaid), the burn (max of the provider's rate and the fleet's billing pods; a failed listing = unknown), runway + ⚠ under `BALANCE_WARN_HOURS`, the table / one-liner / teardown lines | judge + render pure; two bounded, status-first reads |
 | `idle` | `pods idle`: the read-only probe script (`/proc/net/tcp` sessions minus our own, `nvidia-smi` ×3, bounded `find`, PID 1 age), its reply parser, the verdict (candidate only when every reading is known and idle; cohort machines only) and the report with printed — never run — commands | yes (script runs over `Remote`) |
@@ -149,7 +151,13 @@ flowchart TD
   prompt; with no terminal they refuse unless `-y`. `--dry-run` previews and changes
   nothing. Destructive ones say so: `restart`/`stop` refuse without `--wipe-ok` when the
   container disk (participants' work) would be wiped, `terminate` takes one pod or `--all`
-  (no ranges), and the TUI wants the pod's name (or `ALL`) typed back.
+  (no ranges), and the TUI wants the pod's name (or `ALL`) typed back. A **locked** pod
+  (`pods lock`, RunPod v2) is refused by every lifecycle command up front — and by RunPod
+  itself, for any client; only `terminate --unlock` lifts a lock, and says so — with
+  `--all`, only the cohort's (`Naming::is_cohort`: a locked staff box is kept).
+- **Passthroughs are fenced**: `--api-json` can't override what the tool sets (refused
+  before any call); `api get` is GET-only and can't send the key off the provider's API
+  base, and redacts secrets unless `--raw` (the key itself never prints).
 - **Unknown is not empty**: a provider that failed to list keeps its proxy forwards,
   fails `teardown --check` as `?` and marks a snapshot partial; with no provider answering,
   `create`/`up` won't allocate names and the proxy isn't written. Unexpected API shapes

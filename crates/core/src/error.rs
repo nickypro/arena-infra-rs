@@ -24,6 +24,13 @@ pub enum ProviderErrorKind {
     /// change it). Never produced by [`ProviderErrorKind::classify`] — only a backend that
     /// knows an endpoint means this re-tags its error.
     Denied,
+    /// The pod refuses lifecycle changes because it is locked: RunPod v2 answers stop,
+    /// restart and terminate on a pod with `locked: true` with a 400 "Pod is locked"
+    /// (live-verified 2026-10-08), leaving the container untouched. Kept apart from `Other`
+    /// so a caller can say "unlock it first" instead of "failed" — and never retried: the
+    /// lock is deliberate, so waiting won't lift it. Like `Denied`, never produced by
+    /// [`ProviderErrorKind::classify`]; only the backend that knows the wording tags it.
+    Locked,
     /// Anything else.
     Other,
 }
@@ -164,6 +171,11 @@ impl Error {
             _ => None,
         }
     }
+
+    /// Whether the provider refused because the pod is locked ([`ProviderErrorKind::Locked`]).
+    pub fn is_locked(&self) -> bool {
+        self.kind() == Some(ProviderErrorKind::Locked)
+    }
 }
 
 #[cfg(test)]
@@ -265,5 +277,13 @@ mod tests {
         assert_eq!(Error::capacity("no rentable offer").kind(), Some(ProviderErrorKind::Capacity));
         assert_eq!(Error::provider("ssh failed").kind(), Some(ProviderErrorKind::Other));
         assert_eq!(Error::Config("x".into()).kind(), None);
+        let locked = Error::Provider { kind: ProviderErrorKind::Locked, message: "stop pod HTTP 400: Pod is locked".into() };
+        assert!(locked.is_locked() && !crate::retry::is_retryable(&locked));
+        // Only the tag counts, never the wording: classify() doesn't produce Locked.
+        assert!(!Error::provider("Pod is locked").is_locked());
+        assert_ne!(
+            ProviderErrorKind::classify(reqwest::StatusCode::BAD_REQUEST, r#"{"detail":"Pod is locked"}"#),
+            ProviderErrorKind::Locked
+        );
     }
 }

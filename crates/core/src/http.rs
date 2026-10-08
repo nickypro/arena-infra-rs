@@ -109,10 +109,20 @@ pub(crate) mod test_server {
         pub content_type: &'static str,
         pub body: String,
         pub then: Then,
+        /// Extra response headers (`Location` for a redirect…), sent as given.
+        pub headers: Vec<(&'static str, String)>,
     }
 
     pub fn canned(status: u16, content_type: &'static str, body: &str) -> Canned {
-        Canned { status, content_type, body: body.to_string(), then: Then::Reply }
+        Canned { status, content_type, body: body.to_string(), then: Then::Reply, headers: Vec::new() }
+    }
+
+    impl Canned {
+        /// The same response with one more header.
+        pub fn header(mut self, name: &'static str, value: impl Into<String>) -> Canned {
+            self.headers.push((name, value.into()));
+            self
+        }
     }
 
     /// Read the request, then close the connection without answering.
@@ -125,11 +135,13 @@ pub(crate) mod test_server {
         Canned { then: Then::Stall, ..canned(0, "", "") }
     }
 
-    /// A running server: its base URL, the request lines it has seen (`GET /pods`), and each
-    /// request's body (as text, `""` for none), in the same order.
+    /// A running server: its base URL, the request lines it has seen (`GET /pods`), each
+    /// request's headers (lines as sent, e.g. `authorization: Bearer k`) and body (as text,
+    /// `""` for none), in the same order.
     pub struct Server {
         pub base: String,
         pub requests: Arc<Mutex<Vec<String>>>,
+        pub headers: Arc<Mutex<Vec<Vec<String>>>>,
         pub bodies: Arc<Mutex<Vec<String>>>,
         /// Stalled connections, held open for as long as the server lives.
         _held: Arc<Mutex<Vec<TcpStream>>>,
@@ -140,9 +152,10 @@ pub(crate) mod test_server {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
         let base = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let headers = Arc::new(Mutex::new(Vec::new()));
         let bodies = Arc::new(Mutex::new(Vec::new()));
         let held = Arc::new(Mutex::new(Vec::new()));
-        let (seen, seen_bodies, holding) = (requests.clone(), bodies.clone(), held.clone());
+        let (seen, seen_headers, seen_bodies, holding) = (requests.clone(), headers.clone(), bodies.clone(), held.clone());
         std::thread::spawn(move || {
             for r in responses {
                 let Ok((stream, _)) = listener.accept() else { return };
@@ -152,6 +165,7 @@ pub(crate) mod test_server {
                 let _ = reader.read_line(&mut line);
                 seen.lock().unwrap().push(line.trim().to_string());
                 let mut len = 0usize;
+                let mut head = Vec::new();
                 loop {
                     let mut h = String::new();
                     if reader.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
@@ -160,7 +174,9 @@ pub(crate) mod test_server {
                     if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
                         len = v.trim().parse().unwrap_or(0);
                     }
+                    head.push(h.trim_end().to_string());
                 }
+                seen_headers.lock().unwrap().push(head);
                 let mut body = vec![0u8; len];
                 let _ = reader.read_exact(&mut body);
                 seen_bodies.lock().unwrap().push(String::from_utf8_lossy(&body).into_owned());
@@ -169,8 +185,9 @@ pub(crate) mod test_server {
                     Then::HangUp => drop(stream),
                     Then::Stall => holding.lock().unwrap().push(stream),
                     Then::Reply => {
+                        let extra: String = r.headers.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect();
                         let reply = format!(
-                            "HTTP/1.1 {} X\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            "HTTP/1.1 {} X\r\nContent-Type: {}\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n{}",
                             r.status,
                             r.content_type,
                             r.body.len(),
@@ -182,7 +199,7 @@ pub(crate) mod test_server {
                 }
             }
         });
-        Server { base, requests, bodies, _held: held }
+        Server { base, requests, headers, bodies, _held: held }
     }
 
     /// A client that never uses a system proxy (an `HTTP_PROXY` in the test environment

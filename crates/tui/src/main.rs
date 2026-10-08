@@ -1223,8 +1223,19 @@ fn build_new_pod_form(cfg: &Config, launch_provider: &str, existing: &[Pod]) -> 
     }
 }
 
+/// Config `CREATE_EXTRA_JSON` for a create on `provider`, as `arena pods create` takes it:
+/// parsed and checked against that backend's own fields before anything is created.
+fn create_extra(provider: &dyn Provider, cfg: &Config) -> arena_core::Result<Option<arena_core::apiextra::Extra>> {
+    let extra = arena_core::apiextra::combine(cfg.get("CREATE_EXTRA_JSON"), None)?;
+    if let Some(x) = &extra {
+        provider.check_create_extra(x)?;
+    }
+    Ok(extra)
+}
+
 /// Create the named pods (sequentially, no capacity-wait), returning a summary line.
-/// Each create is gated by the add-pod form's Enter, mirroring `arena pods create`.
+/// Each create is gated by the add-pod form's Enter, mirroring `arena pods create` —
+/// config `CREATE_EXTRA_JSON` included (a bad one creates nothing and says why).
 async fn create_pods(
     provider: &Arc<dyn Provider>,
     cfg: &Config,
@@ -1236,6 +1247,10 @@ async fn create_pods(
     volume_gb: Option<u32>,
 ) -> (String, Vec<Pod>) {
     let mut base = PodSpec::from_config(cfg);
+    base.api_extra = match create_extra(provider.as_ref(), cfg) {
+        Ok(extra) => extra,
+        Err(e) => return (format!("created 0/{}\n✗ {e}", names.len()), Vec::new()),
+    };
     base.gpu_type = gpu_type.to_string();
     base.gpu_count = gpu_count;
     if let Some(c) = cloud_type {
@@ -1436,6 +1451,11 @@ async fn finish_deep_check(
 /// Perform one action against a pod, returning a one-line human-readable outcome.
 /// This is the *only* place the dashboard mutates anything. `arg` carries the typed
 /// command (`Run`) or branch (`SetBranch`); it's `None` for the other actions.
+///
+/// A pod the listing reports locked ([`arena_core::lock`]) is refused restart, stop and
+/// terminate here, before any call — as RunPod itself would refuse them, and as the CLI does;
+/// a refusal the listing didn't predict reads the same way ([`arena_core::lock::explain`]).
+/// The dashboard never unlocks: that's `arena pods unlock`, on purpose.
 async fn execute(
     provider: &dyn Provider,
     remote: &dyn Remote,
@@ -1444,22 +1464,26 @@ async fn execute(
     pod: &Pod,
     arg: Option<&str>,
 ) -> String {
+    use arena_core::lock;
     let name = &pod.name;
+    if matches!(action, Action::Restart | Action::Stop | Action::Terminate) && lock::is_locked(pod) {
+        return format!("✗ {} {name} refused: {}", action.label(), lock::unlock_hint(&[name]));
+    }
     match action {
         Action::Restart => match provider.restart_pod(&pod.id).await {
             Ok(()) if provider.restart_wipes_container_disk(pod) => {
                 format!("✓ restarted {name} — reset to the image: run setup (p) once it's up")
             }
             Ok(()) => format!("✓ restarted {name}"),
-            Err(e) => format!("✗ restart {name} failed: {e}"),
+            Err(e) => format!("✗ restart {name} failed: {}", lock::explain(name, &e)),
         },
         Action::Stop => match provider.stop_pod(&pod.id).await {
             Ok(()) => format!("✓ stopped {name}"),
-            Err(e) => format!("✗ stop {name} failed: {e}"),
+            Err(e) => format!("✗ stop {name} failed: {}", lock::explain(name, &e)),
         },
         Action::Terminate => match provider.terminate_pod(&pod.id).await {
             Ok(()) => format!("✓ terminated {name}"),
-            Err(e) => format!("✗ terminate {name} failed: {e}"),
+            Err(e) => format!("✗ terminate {name} failed: {}", lock::explain(name, &e)),
         },
         Action::Backup => run_backup(remote, cfg, pod).await,
         Action::Setup => run_setup(remote, cfg, pod).await,
@@ -1990,8 +2014,12 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
             let temp_str = temp.map(|t| format!("{t}C")).unwrap_or_else(|| "-".into());
             // As `pods list` shows it: the provider's currency, `-` unless billing.
             let cost = fleet::price_label(p);
+            // The one-letter badge: M = host maintenance on record (the more urgent, so it
+            // wins), else L = locked (stop/restart/terminate refused; the detail pane says so).
             let maint = if state::has_maintenance(p) {
                 Cell::from("M").style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+            } else if arena_core::lock::is_locked(p) {
+                Cell::from("L").style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
             } else {
                 Cell::from(" ")
             };
@@ -2122,7 +2150,7 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
         Constraint::Length(1),  // P (provider glyph)
         Constraint::Length(name_w as u16), // NAME (auto-short when cramped)
         Constraint::Length(4),  // STATUS (abbreviated: run/exit/stop…)
-        Constraint::Length(1),  // M (host maintenance badge)
+        Constraint::Length(1),  // M (host maintenance badge; L = locked)
         Constraint::Length(4),  // SET (.name/key/origin/api)
         Constraint::Length(gpu_w as u16), // GPU (+VRAM when wide)
         Constraint::Length(5),  // GPU%
@@ -2344,7 +2372,15 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     };
     let facts = format!(
         "status:   {}\ngpu:      {}\nendpoint: {}\nproxy:    {}\ncost:     {}\nmaint:    {}\nhealth:   {}\nreason:   {}\ndisk:     {}\nhost:     {}\nbranch:   {}\nbackup:   {}\nsync:     {}\norigin:   {} {}\nsetup:    .name {}   deploy-key {}   origin→gh {}   api-key {}\ntokens:   HF {}   Claude-Code {}\nprogress: {}",
-        display_status(&pod.status, m.map(|m| m.error.is_none())),
+        {
+            let status = display_status(&pod.status, m.map(|m| m.error.is_none()));
+            if arena_core::lock::is_locked(pod) {
+                // One row (the facts block has a fixed height): `pods unlock` is in the docs.
+                format!("{status} · locked (stop/restart/terminate refused)")
+            } else {
+                status
+            }
+        },
         gpu,
         endpoint,
         proxy,
@@ -2975,6 +3011,7 @@ deep_check_end=1
         });
         let mut bravo = pod("bravo", "runpod", "rp2", 2, Some(22002));
         bravo.cost_per_hr = Some(0.25);
+        bravo.locked = Some(true);
         let mut charlie = pod("charlie", "hetzner", "88", 3, Some(22));
         charlie.status = "running".into();
         charlie.gpu_type = Some("cx23".into());
@@ -3039,8 +3076,8 @@ deep_check_end=1
         // (row, must show, must not show)
         let cases: &[(&str, &[&str], &[&str])] = &[
             ("alpha", &["init M", "$0.17", "pass 12m", ":9500"], &["stale"]),
-            ("bravo", &["$0.25", "fail 2h", ":9501 stale"], &["init M"]),
-            ("charlie", &["€0.006"], &["$0.0", "init M", "pass", "fail", ":95"]),
+            ("bravo", &["init L", "$0.25", "fail 2h", ":9501 stale"], &["init M"]),
+            ("charlie", &["€0.006"], &["$0.0", "init M", "init L", "pass", "fail", ":95"]),
             ("delta", &["exit", "checking"], &["$0.13", "exit M"]),
         ];
         for (name, shows, hides) in cases {
@@ -3228,10 +3265,12 @@ deep_check_end=1
             "health:   fail 2h GPU error",
             "reason:   cuda: RuntimeError: Error 999",
             "maint:    -",
+            "status:   init · locked (stop/restart/terminate refused)",
             "progress: -", // the snapshot lines don't push the rest out of the facts block
         ] {
             assert!(bravo.contains(want), "{want:?} in\n{bravo}");
         }
+        assert!(!alpha.contains("locked"), "{alpha}");
         ui.selected = 3; // delta
         let delta = draw(160, 40, &shared, &ui).join("\n");
         assert!(delta.contains("health:   checking…") && delta.contains("cost:     -"), "{delta}");
@@ -3334,6 +3373,122 @@ deep_check_end=1
         ui.mode = Mode::FleetConfirm { action: Action::Terminate, typed: String::new(), scope: Scope::Marked };
         let all = draw(180, 30, &shared.lock().unwrap(), &ui).join("\n");
         assert!(all.contains("That is every listed pod: terminate on it takes ALL") && all.contains("Type ALL"), "{all}");
+    }
+
+    /// The add-pod form applies config `CREATE_EXTRA_JSON` as `arena pods create` does: carried
+    /// on each create's spec, or — not one object, or a field arena sets — nothing created and
+    /// the reason shown.
+    #[tokio::test]
+    async fn add_pod_form_creates_with_config_create_extra_json_or_not_at_all() {
+        /// A RunPod v2-shaped backend that records each create's spec (rules: the real v2's).
+        struct Records {
+            rules: arena_core::provider::runpod_v2::RunpodV2Provider,
+            specs: Mutex<Vec<PodSpec>>,
+        }
+        #[async_trait::async_trait]
+        impl Provider for Records {
+            fn name(&self) -> &'static str {
+                "runpod"
+            }
+            fn describe(&self, _spec: &PodSpec) -> String {
+                String::new()
+            }
+            async fn list_pods(&self) -> arena_core::Result<Vec<Pod>> {
+                Ok(vec![])
+            }
+            async fn create_pod(&self, spec: &PodSpec) -> arena_core::Result<Pod> {
+                self.specs.lock().unwrap().push(spec.clone());
+                Ok(Pod { id: format!("id-{}", spec.name), name: spec.name.clone(), provider: "runpod".into(), ..Default::default() })
+            }
+            async fn stop_pod(&self, _id: &str) -> arena_core::Result<()> {
+                unimplemented!()
+            }
+            async fn restart_pod(&self, _id: &str) -> arena_core::Result<()> {
+                unimplemented!()
+            }
+            async fn terminate_pod(&self, _id: &str) -> arena_core::Result<()> {
+                unimplemented!()
+            }
+            fn check_create_extra(&self, extra: &arena_core::apiextra::Extra) -> arena_core::Result<()> {
+                self.rules.check_create_extra(extra)
+            }
+        }
+        // (CREATE_EXTRA_JSON line, Ok(the extra the create carries) | Err(why nothing was created))
+        let cases: [(&str, std::result::Result<Option<&str>, &str>); 4] = [
+            ("", Ok(None)),
+            (r#"CREATE_EXTRA_JSON='{"dataCenterIds":["EU-RO-1"]}'"#, Ok(Some(r#"{"dataCenterIds":["EU-RO-1"]}"#))),
+            (r#"CREATE_EXTRA_JSON='{"name":"x"}'"#, Err("`name` is set by arena")),
+            ("CREATE_EXTRA_JSON='[1]'", Err("must be a JSON object")),
+        ];
+        for (line, want) in cases {
+            let rec = Arc::new(Records { rules: arena_core::provider::runpod_v2::RunpodV2Provider::new("k"), specs: Mutex::new(Vec::new()) });
+            let p: Arc<dyn Provider> = rec.clone();
+            let names = ["devtest-alpha".to_string()];
+            let (msg, created) = create_pods(&p, &cfg(line), &names, Some("COMMUNITY"), "NVIDIA RTX A4000", 1, Some(40), Some(0)).await;
+            let specs = rec.specs.lock().unwrap();
+            match want {
+                Ok(extra) => {
+                    assert_eq!((msg.as_str(), created.len()), ("created 1/1", 1), "{line}");
+                    let want = extra.map(|t| arena_core::apiextra::parse(t, "test").unwrap());
+                    assert_eq!(specs[0].api_extra, want, "{line}");
+                }
+                Err(why) => {
+                    assert!(msg.starts_with("created 0/1\n✗ ") && msg.contains(why), "{line}: {msg}");
+                    assert!(created.is_empty() && specs.is_empty(), "{line}: nothing created");
+                }
+            }
+        }
+    }
+
+    /// The dashboard refuses restart/stop/terminate on a pod the listing reports locked —
+    /// before any call (this fleet panics on one) — saying how to unlock it; a refusal the
+    /// listing didn't predict (the provider's `Locked` error) reads the same way.
+    #[tokio::test]
+    async fn lifecycle_actions_on_a_locked_pod_are_refused_with_the_unlock_hint() {
+        let fleet = FakeFleet { pods: vec![], lists: AtomicUsize::new(0), details: AtomicUsize::new(0), details_error: None };
+        let remote = FakeRemote::new();
+        let cfg = cfg("");
+        let mut bravo = pod("bravo", "runpod", "rp2", 2, Some(22002));
+        bravo.locked = Some(true);
+        for action in [Action::Restart, Action::Stop, Action::Terminate] {
+            let out = execute(&fleet, &remote, &cfg, action, &bravo, None).await;
+            assert_eq!(
+                out,
+                format!("✗ {} devtest-bravo refused: devtest-bravo is locked — `arena pods unlock devtest-bravo` first", action.label())
+            );
+        }
+
+        /// Locked since it was listed: the provider refuses, tagged `Locked`.
+        struct Refuses;
+        #[async_trait::async_trait]
+        impl Provider for Refuses {
+            fn name(&self) -> &'static str {
+                "runpod"
+            }
+            fn describe(&self, _spec: &PodSpec) -> String {
+                String::new()
+            }
+            async fn list_pods(&self) -> arena_core::Result<Vec<Pod>> {
+                Ok(vec![])
+            }
+            async fn create_pod(&self, _spec: &PodSpec) -> arena_core::Result<Pod> {
+                unimplemented!()
+            }
+            /// The recorded live refusal, through the v2 backend's own classification.
+            async fn stop_pod(&self, _id: &str) -> arena_core::Result<()> {
+                Err(arena_core::provider::runpod_v2::recorded::locked_refusal("stop pod"))
+            }
+            async fn restart_pod(&self, _id: &str) -> arena_core::Result<()> {
+                Ok(())
+            }
+            async fn terminate_pod(&self, _id: &str) -> arena_core::Result<()> {
+                Ok(())
+            }
+        }
+        bravo.locked = Some(false);
+        let out = execute(&Refuses, &remote, &cfg, Action::Stop, &bravo, None).await;
+        assert_eq!(out, "✗ stop devtest-bravo failed: devtest-bravo is locked — `arena pods unlock devtest-bravo` first");
+        assert_eq!(execute(&Refuses, &remote, &cfg, Action::Terminate, &bravo, None).await, "✓ terminated devtest-bravo");
     }
 
     /// A pod-side fleet for [`refresh`]: lists runpod (two pods) and a vast that 429s,

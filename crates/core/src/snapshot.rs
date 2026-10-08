@@ -1579,6 +1579,26 @@ fleet: $0.17/h across 2 billing pod(s) (1 unpriced)
         }
     }
 
+    /// The lock state is in the internal snapshot (its JSON and its table's STATUS) — it's
+    /// the operator's — and in nothing published: the public allowlist has no such field.
+    #[test]
+    fn lock_state_is_internal_only() {
+        let cfg = cfg();
+        let naming = Naming::from_config(&cfg);
+        let mut apple = at(pod("devtest-apple", "runpod", "rp1"), "10.0.0.1", 22001);
+        apple.locked = Some(true);
+        let mut bloom = at(pod("devtest-bloom", "runpod", "rp2"), "10.0.0.2", 22002);
+        bloom.locked = Some(false);
+        let snap = build(&[apple, bloom], &[], None, &HealthCache::new(), &naming, NOW);
+        let internal: serde_json::Value = serde_json::to_value(&snap).unwrap();
+        let locked: Vec<&serde_json::Value> = internal["pods"].as_array().unwrap().iter().map(|p| &p["pod"]["locked"]).collect();
+        assert_eq!(locked, [&serde_json::json!(true), &serde_json::json!(false)]);
+        let table = render_table(&snap);
+        assert!(table.lines().any(|l| l.starts_with("devtest-apple") && l.contains("run locked")), "{table}");
+        let public = public_json(&public_snapshot(&snap, &naming));
+        assert!(!public.contains("lock"), "{public}");
+    }
+
     #[test]
     fn public_keeps_one_row_per_listed_name_in_list_order() {
         let cfg = cfg();

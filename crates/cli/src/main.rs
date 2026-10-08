@@ -172,6 +172,9 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Read-only passthrough to a provider's REST API, for what no command covers (GET only).
+    #[command(subcommand, infer_subcommands = true)]
+    Api(ApiCmd),
     /// The fleet in one read-only picture: `pods list`'s columns plus whether each cohort
     /// machine's SSH port answers, its proxy port (live/stale) and its last `pods test --deep`
     /// / `up --check` verdict with its age (from the local health cache). Lists pods, reads
@@ -284,6 +287,30 @@ impl SelectByFlag {
     fn args(&self) -> SelectArgs {
         self.opts.args(&self.targets)
     }
+}
+
+#[derive(Subcommand)]
+enum ApiCmd {
+    /// GET one path from a provider's API and print the response (pretty JSON). Read-only:
+    /// GET is the only verb there is.
+    ///
+    /// PROVIDER: runpod (follows RUNPOD_API), runpod-v1, runpod-v2, vast or hetzner. PATH is
+    /// relative to that API's base — e.g. `pods`, `pods/<id>`, `catalog/datacenters`,
+    /// `network-volumes`, `billing/pods` (RunPod v2); `instances/`, `users/current/` (Vast);
+    /// `servers`, `locations` (Hetzner). Absolute URLs, `//host`, `..` and `#` are refused and
+    /// redirects aren't followed, so the configured key only ever goes to the provider (in
+    /// the Authorization header). Secrets — env values, keys, tokens (`rpa_…`, `sk-…`,
+    /// `hf_…`), SSH key material — are redacted unless --raw; the API key itself never prints.
+    #[command(verbatim_doc_comment)]
+    Get {
+        /// runpod, runpod-v1, runpod-v2, vast or hetzner.
+        provider: String,
+        /// Path under the provider's API base, e.g. `pods` (a query string is fine).
+        path: String,
+        /// Print the body as received — env values, keys and all — except the API key.
+        #[arg(long)]
+        raw: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -627,6 +654,13 @@ enum PodCmd {
         /// doesn't need this.
         #[arg(long)]
         bootstrap: bool,
+        /// Extra fields for the provider's create request: one JSON object, deep-merged into
+        /// the body (over config CREATE_EXTRA_JSON) — API options without a flag, e.g.
+        /// '{"dataCenterIds":["EU-RO-1"]}' or '{"globalNetworking":true}' on RunPod v2. Fields
+        /// arena sets itself (name, image, GPU, tier, disk, SSH keys, 22/tcp…) are refused;
+        /// --dry-run prints the merged body.
+        #[arg(long, value_name = "JSON")]
+        api_json: Option<String>,
         /// Don't sync the proxy afterwards. By default `create` re-syncs it once the pods
         /// exist (best-effort; pods still booting get their forward on a later sync).
         #[arg(long)]
@@ -711,6 +745,13 @@ enum PodCmd {
         /// doesn't need this.
         #[arg(long)]
         bootstrap: bool,
+        /// Extra fields for the provider's create request: one JSON object, deep-merged into
+        /// the body (over config CREATE_EXTRA_JSON) — API options without a flag, e.g.
+        /// '{"dataCenterIds":["EU-RO-1"]}' or '{"globalNetworking":true}' on RunPod v2. Fields
+        /// arena sets itself (name, image, GPU, tier, disk, SSH keys, 22/tcp…) are refused;
+        /// --dry-run prints the merged body.
+        #[arg(long, value_name = "JSON")]
+        api_json: Option<String>,
         /// Preview only: print what would happen, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
@@ -744,6 +785,12 @@ enum PodCmd {
         /// was never set up, and its host is known bad).
         #[arg(long, default_value_t = 2, requires = "check", value_parser = clap::value_parser!(u32).range(1..=10))]
         check_attempts: u32,
+        /// Lock each pod once it's READY (the pipeline's last step; RunPod with RUNPOD_API=v2):
+        /// RunPod then refuses stop, restart and terminate on it — from any client, its web
+        /// console included — until `arena pods unlock`. Refused up front where pods can't be
+        /// locked. A pod whose lock fails is `FAILED lock`, left running, unlocked.
+        #[arg(long, conflicts_with = "no_wait")]
+        lock: bool,
         /// Per pod (and per replacement): how long it may take to come up — its SSH endpoint
         /// to appear, then sshd to answer on it. Past that it's `FAILED endpoint`, left running.
         #[arg(long, default_value_t = 600)]
@@ -885,6 +932,33 @@ enum PodCmd {
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
+    /// Lock pods (RunPod, RUNPOD_API=v2): RunPod refuses stop, restart and terminate on a locked
+    /// pod — from ANY client, its web console included — until it's unlocked. The protection
+    /// for a running cohort's pods; setup, backups, `run` and SSH are unaffected. `pods up
+    /// --lock` locks new pods once they're READY.
+    ///
+    /// While locked, arena's own stop / restart / reimage / terminate / replace / migrate
+    /// cutover|finish refuse the pod up front ("… is locked — `arena pods unlock …` first");
+    /// `terminate --unlock` is the one command that lifts a lock itself. Pods on a backend
+    /// that can't lock (RUNPOD_API=v1, Vast, Hetzner) are reported and make the exit non-zero.
+    ///
+    /// Targets: names / ids / ranges, or --all (narrowed by --exclude / --gpus / --on).
+    Lock {
+        /// Preview only: print what would happen, change nothing.
+        #[arg(long, visible_aliases = ["dryrun", "dry"])]
+        dry_run: bool,
+        #[command(flatten)]
+        sel: Select,
+    },
+    /// Unlock pods locked with `pods lock` / `up --lock` (or in RunPod's console): stop,
+    /// restart and terminate work on them again — from any client. Same targets as `lock`.
+    Unlock {
+        /// Preview only: print what would happen, change nothing.
+        #[arg(long, visible_aliases = ["dryrun", "dry"])]
+        dry_run: bool,
+        #[command(flatten)]
+        sel: Select,
+    },
     /// Reimage pods in place: swap the image + re-seed SSH keys, WIPING the container disk.
     ///
     /// Same host/id/name, fresh container from `--image` (default RUNPOD_DOCKER_IMAGE).
@@ -971,6 +1045,14 @@ enum PodCmd {
         /// Terminate every pod the provider reports (the whole fleet).
         #[arg(long, conflicts_with = "target")]
         all: bool,
+        /// Unlock locked pods, then terminate them — without it a locked pod is refused (as RunPod
+        /// itself refuses it). With --all it lifts only the cohort's locks (`{prefix}-…`): a
+        /// locked staff/personal box (`@name` entry, or off the list) is KEPT and the exit fails
+        /// — name it alone to unlock it. For the end of the program: `pods terminate --all
+        /// --unlock`. The confirm text names the pods it unlocks. A pod whose unlock fails isn't
+        /// terminated.
+        #[arg(long)]
+        unlock: bool,
         /// Also revoke each terminated machine's OpenRouter key (every key named after it)
         /// and drop its row from keys/openrouter_api_keys.csv. Needs
         /// OPENROUTER_PROVISIONING_KEY. A failed revoke is reported and makes the exit
@@ -1395,6 +1477,8 @@ struct SpecOverrides {
     /// Set the `--bootstrap` start command (`dockerArgs`) so a non-arena base image
     /// brings up sshd on boot. Off => use the image's own entrypoint.
     bootstrap: bool,
+    /// `--api-json` over `CREATE_EXTRA_JSON`, already checked ([`create_extra`]).
+    api_extra: Option<arena_core::apiextra::Extra>,
 }
 
 /// The base spec from config, with any command-line overrides applied.
@@ -1429,6 +1513,57 @@ fn apply_spec_overrides(spec: &mut PodSpec, ov: &SpecOverrides) {
     if ov.bootstrap {
         spec.docker_args =
             Some(vec!["bash".to_string(), "-c".to_string(), BOOTSTRAP_SCRIPT.to_string()]);
+    }
+    if let Some(extra) = &ov.api_extra {
+        spec.api_extra = Some(extra.clone());
+    }
+}
+
+/// `--api-json` over config `CREATE_EXTRA_JSON`, parsed and checked against the create
+/// target's own fields ([`Provider::check_create_extra`]) — before anything is listed,
+/// priced or created, so a typo'd JSON or a refused field costs no API call.
+fn create_extra(provider: &dyn Provider, cfg: &Config, flag: Option<&str>) -> Result<Option<arena_core::apiextra::Extra>> {
+    let extra = arena_core::apiextra::combine(cfg.get("CREATE_EXTRA_JSON"), flag)?;
+    if let Some(x) = &extra {
+        provider.check_create_extra(x)?;
+    }
+    Ok(extra)
+}
+
+/// The dry run's look at the create request when extra fields are merged in: the body the
+/// backend would send for `spec` (one name, on one option), secrets — env values, keys —
+/// redacted. `None` without extra fields: the body is then just the flags shown above.
+fn create_body_text(provider: &dyn Provider, spec: &PodSpec) -> Option<String> {
+    spec.api_extra.as_ref()?;
+    Some(match provider.preview_create_body(spec) {
+        Ok(body) => format!(
+            "[dry-run] create request for {} with {} merged (secrets redacted):\n{}",
+            spec.name,
+            arena_core::apiextra::SOURCES,
+            serde_json::to_string_pretty(&arena_core::apiget::redact(&body)).unwrap_or_default()
+        ),
+        Err(e) => format!("[dry-run] (no create-request preview: {e})"),
+    })
+}
+
+fn print_create_body(provider: &dyn Provider, spec: &PodSpec) {
+    if let Some(text) = create_body_text(provider, spec) {
+        println!("{text}");
+    }
+}
+
+/// The half of the `--api-json` / `CREATE_EXTRA_JSON` check that needs the spec: the
+/// backend builds the create body (as the dry run shows it) and a refusal in building it —
+/// e.g. RunPod v2's network volume next to `--volume` — fails the command now, before
+/// anything is created or confirmed, instead of at each create. Other errors (a backend with
+/// no preview) are left to the create itself. A no-op without extra fields.
+fn check_create_body(provider: &dyn Provider, spec: &PodSpec) -> Result<()> {
+    if spec.api_extra.is_none() {
+        return Ok(());
+    }
+    match provider.preview_create_body(spec) {
+        Err(e @ arena_core::Error::Config(_)) => Err(e.into()),
+        _ => Ok(()),
     }
 }
 
@@ -1774,31 +1909,46 @@ where
     }
 }
 
+/// RunPod's REST v2 GPU catalog for one tier (read-only, bounded by [`PRICE_TIMEOUT`]),
+/// fetched at most once per tier per run: the `--gpu` check and the placement plan's price
+/// book share the answer (or the failure — see [`arena_core::provider::runpod_v2::CatalogCache`]).
+async fn v2_catalog(key: &str, cloud: &str) -> std::result::Result<Vec<arena_core::provider::runpod::GpuType>, String> {
+    use arena_core::provider::runpod_v2;
+    static CACHE: std::sync::OnceLock<runpod_v2::CatalogCache> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(runpod_v2::CatalogCache::default)
+        .get_or_fetch(key, cloud, |tier| bounded_catalog(runpod_v2::fetch_gpu_types(key, tier)))
+        .await
+}
+
+/// The tier whose v2 catalog answers questions that aren't about a tier (the `--gpu`
+/// check, `arena gpus`): the configured `CLOUD_TYPE`, or COMMUNITY. Every tier's catalog
+/// lists every GPU, so this only picks which tier's stock a reader sees — and with the
+/// configured tier, a plain `create` reuses the check's fetch for its prices.
+fn v2_default_cloud(cfg: &Config) -> &'static str {
+    arena_core::provider::runpod_v2::normalize_cloud(&PodSpec::from_config(cfg).cloud_type).unwrap_or("COMMUNITY")
+}
+
 /// RunPod's live GPU catalog, for checking `--gpu` (read-only; each fetch bounded by
-/// [`PRICE_TIMEOUT`]). The GraphQL `gpuTypes` first, on either API generation: it's the
-/// full catalog whatever the tier (a superset of what create accepts, so checking against it
-/// never refuses a creatable id); on `RUNPOD_API=v2` the REST v2 catalog is the fallback.
+/// [`PRICE_TIMEOUT`]): on `RUNPOD_API=v2` the REST v2 catalog — the one v2's create
+/// validates `gpu.id` against — and nothing else (no GraphQL, see `runpod_v2`'s GraphQL
+/// inventory); otherwise the GraphQL `gpuTypes`, the full catalog whatever the tier (a
+/// superset of what create accepts, so checking against it never refuses a creatable id).
 /// `Err` says why there's no catalog (no key, unreachable, empty).
 async fn live_gpu_catalog(cfg: &Config) -> std::result::Result<Vec<arena_core::provider::runpod::GpuType>, String> {
-    use arena_core::provider::{runpod, runpod_v2, RunpodApi};
+    use arena_core::provider::{runpod, RunpodApi};
     let Some(key) = cfg.get("RUNPOD_API_KEY").filter(|s| !s.is_empty()) else {
         return Err("no RUNPOD_API_KEY".into());
     };
-    let mut errs = Vec::new();
-    match bounded_catalog(runpod::fetch_gpu_types(key)).await {
-        Ok(types) if !types.is_empty() => return Ok(types),
-        Ok(_) => errs.push("GraphQL catalog: empty".to_string()),
-        Err(e) => errs.push(format!("GraphQL catalog: {e}")),
-    }
     if matches!(RunpodApi::from_config(cfg), Ok(RunpodApi::V2)) {
-        let cloud = runpod_v2::normalize_cloud(&PodSpec::from_config(cfg).cloud_type).unwrap_or("COMMUNITY");
-        match bounded_catalog(runpod_v2::fetch_gpu_types(key, cloud)).await {
-            Ok(types) if !types.is_empty() => return Ok(types),
-            Ok(_) => errs.push(format!("v2 catalog ({cloud}): empty")),
-            Err(e) => errs.push(format!("v2 catalog ({cloud}): {e}")),
-        }
+        let cloud = v2_default_cloud(cfg);
+        return v2_catalog(key, cloud).await.map_err(|e| format!("v2 catalog ({cloud}): {e}"));
     }
-    Err(errs.join("; "))
+    match bounded_catalog(runpod::fetch_gpu_types(key)).await {
+        Ok(types) if !types.is_empty() => Ok(types),
+        Ok(_) => Err("GraphQL catalog: empty".to_string()),
+        Err(e) => Err(format!("GraphQL catalog: {e}")),
+    }
 }
 
 /// What to do with a `--gpu` value given the catalog fetch's outcome. Pure (the policy is
@@ -1839,9 +1989,10 @@ async fn checked_gpu(cfg: &Config, provider_name: &str, gpu: Option<String>) -> 
 
 /// The prices placement can see (read-only), plus notes on where they came from. RunPod:
 /// the live catalog — on `RUNPOD_API=v2` one `/v2/catalog/gpus` per requested tier (its stock
-/// is per tier), else / failing that the GraphQL `gpuTypes` (Phase 0.D) — backed by the preset
-/// estimates. Vast: the cheapest offer fitting `base` (disk, CUDA floor) per GPU option, one
-/// marketplace search per card, each bounded by [`PRICE_TIMEOUT`]. Hetzner quotes nothing.
+/// is per tier; each tier fetched once per run, see [`v2_catalog`]) and no GraphQL; on v1 the
+/// GraphQL `gpuTypes` (Phase 0.D) — backed by the preset estimates. Vast: the cheapest offer
+/// fitting `base` (disk, CUDA floor) per GPU option, one marketplace search per card, each
+/// bounded by [`PRICE_TIMEOUT`]. Hetzner quotes nothing.
 async fn fetch_price_book(
     cfg: &Config,
     provider_name: &str,
@@ -1849,7 +2000,7 @@ async fn fetch_price_book(
     base: &PodSpec,
 ) -> Result<(arena_core::placement::PriceBook, Vec<String>)> {
     use arena_core::placement::PriceBook;
-    use arena_core::provider::{runpod, runpod_v2, vast, RunpodApi};
+    use arena_core::provider::{runpod, vast, RunpodApi};
     let clouds = &req.clouds;
     if provider_name == "vast" {
         if cfg.get("VAST_API_KEY").is_none_or(str::is_empty) {
@@ -1877,14 +2028,12 @@ async fn fetch_price_book(
     let mut errs = Vec::new();
     if RunpodApi::from_config(cfg)? == RunpodApi::V2 {
         for cloud in clouds {
-            match bounded_catalog(runpod_v2::fetch_gpu_types(key, cloud)).await {
-                Ok(types) if !types.is_empty() => catalogs.push((Some(cloud.clone()), types)),
-                Ok(_) => errs.push(format!("v2 catalog ({cloud}): empty")),
+            match v2_catalog(key, cloud).await {
+                Ok(types) => catalogs.push((Some(cloud.clone()), types)),
                 Err(e) => errs.push(format!("v2 catalog ({cloud}): {e}")),
             }
         }
-    }
-    if catalogs.is_empty() {
+    } else {
         match bounded_catalog(runpod::fetch_gpu_types(key)).await {
             Ok(types) if !types.is_empty() => catalogs.push((None, types)),
             Ok(_) => errs.push("GraphQL catalog: empty".into()),
@@ -1930,6 +2079,20 @@ fn single_option_plan(provider_name: &str, spec: &PodSpec) -> arena_core::placem
         order: Order::Listed,
     };
     plan_options(&req, provider_name, &PriceBook::unpriced())
+}
+
+/// The spec the first create would use: the first name, on placement's first option (or the
+/// single spec) — what [`print_create_body`] shows. As `create_pods`/`spec_for` build it.
+fn first_create_spec(base: &PodSpec, options: Option<&arena_core::placement::OptionPlan>, name: &str) -> PodSpec {
+    match options.and_then(|plan| plan.options.first()) {
+        Some(first) => arena_core::placement::spec_for(base, name, first),
+        None => {
+            let mut spec = base.clone();
+            spec.name = name.to_string();
+            spec.env.push(("MACHINE_NAME".into(), name.to_string()));
+            spec
+        }
+    }
 }
 
 /// The line above an option table: provider, GPUs per pod, order, cap.
@@ -2091,7 +2254,7 @@ async fn main() -> Result<()> {
     // `config check` must work even when a provider key is missing (that's what it's
     // for), so build the provider lazily — only for commands that actually talk to one.
     let provider = match cli.cmd {
-        Cmd::Config(_) | Cmd::Cron(_) | Cmd::Tui | Cmd::Gpus { .. } | Cmd::Offers { .. } => None,
+        Cmd::Config(_) | Cmd::Cron(_) | Cmd::Tui | Cmd::Gpus { .. } | Cmd::Offers { .. } | Cmd::Api(_) => None,
         // Fleet-wide: every command spans all configured providers (create still targets
         // --provider). One configured backend behaves like that single provider.
         _ => Some(arena_core::provider::build_fleet(&cli.provider, &cfg, true)?),
@@ -2121,8 +2284,32 @@ async fn main() -> Result<()> {
         Cmd::Teardown { check, json } => teardown::handle_teardown(provider.unwrap().as_ref(), &cfg, check, json).await,
         Cmd::Balance { json } => money::handle_balance(provider.unwrap().as_ref(), &cfg, json).await,
         Cmd::Gpus { json } => handle_gpus(&cfg, &cli.provider, json).await,
+        Cmd::Api(c) => handle_api(c, &cfg).await,
         Cmd::Offers { gpu, cloud, max_price, gpus, order, json } => {
             handle_offers(&cfg, &cli.provider, gpu, cloud, max_price, gpus, order, json).await
+        }
+    }
+}
+
+/// `arena api get <provider> <path>`: one read-only GET (see [`arena_core::apiget`]). The
+/// path is checked before the key is even read; the URL printed to stderr carries no key.
+async fn handle_api(cmd: ApiCmd, cfg: &Config) -> Result<()> {
+    use arena_core::apiget;
+    match cmd {
+        ApiCmd::Get { provider, path, raw } => {
+            let base = apiget::api_base(&provider, cfg)?;
+            let url = apiget::resolve_url(base.url, &path)?;
+            let key = cfg
+                .get(base.key)
+                .filter(|k| !k.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("{} isn't set (see `arena config check`)", base.key))?;
+            eprintln!("GET {url} ({}{})", base.provider, if raw { ", raw" } else { ", secrets redacted" });
+            let (status, body) = apiget::get(url, key).await?;
+            let out = apiget::render(status, &body, raw, key)?;
+            if !out.is_empty() {
+                println!("{out}");
+            }
+            Ok(())
         }
     }
 }
@@ -2130,13 +2317,13 @@ async fn main() -> Result<()> {
 /// `arena gpus`: list the GPU types you can pass to `--gpu`. Fetches RunPod's **full,
 /// live** catalog with live community/secure prices + stock when on RunPod with a key —
 /// via GraphQL on `RUNPOD_API=v1`, via REST `GET /v2/catalog/gpus` (stock for the configured
-/// cloud tier) on `v2`, falling back to GraphQL if that fails; otherwise falls back to the
-/// local curated presets. `--json` emits the same rows machine-readably
-/// (`arena_core::gpu::GpuRow`). Diagnostics go to stderr so the JSON on stdout stays
-/// parseable.
+/// cloud tier) on `v2`, with no GraphQL fallback there (see `runpod_v2`'s GraphQL
+/// inventory); otherwise, or when that fails, falls back to the local curated presets.
+/// `--json` emits the same rows machine-readably (`arena_core::gpu::GpuRow`). Diagnostics
+/// go to stderr so the JSON on stdout stays parseable.
 async fn handle_gpus(cfg: &Config, provider_name: &str, json: bool) -> Result<()> {
     use arena_core::gpu;
-    use arena_core::provider::{runpod, runpod_v2, RunpodApi};
+    use arena_core::provider::{runpod, RunpodApi};
 
     // (rows, whether the create-API enum was available to flag `creatable`)
     let mut live: Option<(Vec<gpu::GpuRow>, bool)> = None;
@@ -2146,20 +2333,11 @@ async fn handle_gpus(cfg: &Config, provider_name: &str, json: bool) -> Result<()
         if let Some(key) = cfg.get("RUNPOD_API_KEY").filter(|s| !s.is_empty()) {
             let api = RunpodApi::from_config(cfg)?;
             let fetched = match api {
-                RunpodApi::V1 => runpod::fetch_gpu_types(key).await,
+                RunpodApi::V1 => runpod::fetch_gpu_types(key).await.map_err(|e| e.to_string()),
                 RunpodApi::V2 => {
-                    let cloud = runpod_v2::normalize_cloud(&PodSpec::from_config(cfg).cloud_type).unwrap_or("COMMUNITY");
-                    match runpod_v2::fetch_gpu_types(key, cloud).await {
-                        Ok(types) if !types.is_empty() => {
-                            stock_cloud = Some(cloud);
-                            Ok(types)
-                        }
-                        other => {
-                            let why = other.err().map_or_else(|| "empty catalog".to_string(), |e| e.to_string());
-                            eprintln!("(v2 GPU catalog unavailable: {why} — trying the GraphQL catalog)\n");
-                            runpod::fetch_gpu_types(key).await
-                        }
-                    }
+                    let cloud = v2_default_cloud(cfg);
+                    stock_cloud = Some(cloud);
+                    v2_catalog(key, cloud).await.map_err(|e| format!("v2 catalog ({cloud}): {e}"))
                 }
             };
             match fetched {
@@ -3570,6 +3748,25 @@ fn config_which(cfg: &Config, provider_name: &str, config_path: &std::path::Path
     Ok(())
 }
 
+/// The `config check` row for `CREATE_EXTRA_JSON` (`None` when unset), and whether it
+/// parses: its top-level keys only — never the values, which may carry a token. Whether a key
+/// is one arena sets itself depends on the provider, so that's checked at create. Pure.
+fn create_extra_row(cfg: &Config) -> Option<(String, bool)> {
+    let key = "CREATE_EXTRA_JSON";
+    cfg.get(key)?;
+    Some(match arena_core::apiextra::combine(cfg.get(key), None) {
+        Ok(None) => (format!("  · {key:<28} (empty)"), true),
+        Ok(Some(extra)) => (
+            format!(
+                "  ✓ {key:<28} keys [{}] — merged into every create body (fields arena sets are refused at create)",
+                extra.keys().map(String::as_str).collect::<Vec<_>>().join(", ")
+            ),
+            true,
+        ),
+        Err(e) => (format!("  ✗ {key:<28} {}", e.to_string().trim_start_matches("config error: ")), false),
+    })
+}
+
 /// The `config check` row for `RUNPOD_API`, and whether it's valid. Pure, for testing.
 /// v1 gets a warning with the retirement date: past it, every RunPod call fails.
 fn runpod_api_row(cfg: &Config) -> (String, bool) {
@@ -3667,6 +3864,12 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
         println!("  resolved disk                {}GB", spec.disk_gb);
         if spec.volume_gb == 0 {
             println!("  ⚠ persistent volume          0GB — work is lost on pod restart");
+        }
+    }
+    if let Some((line, ok)) = create_extra_row(cfg) {
+        println!("{line}");
+        if !ok {
+            missing.push("CREATE_EXTRA_JSON (must be one JSON object)".into());
         }
     }
 
@@ -5033,10 +5236,12 @@ async fn handle_pods_with(
             footer.iter().for_each(|l| println!("{l}"));
         }
 
-        PodCmd::Create { names, count, add, gpu, gpus, cloud, max_price, order, disk, volume, image, bootstrap, skip_proxy, dry_run, keep_trying, retry_mins, retry_secs } => {
+        PodCmd::Create { names, count, add, gpu, gpus, cloud, max_price, order, disk, volume, image, bootstrap, api_json, skip_proxy, dry_run, keep_trying, retry_mins, retry_secs } => {
+            // Bad extra JSON (or a field arena sets itself) fails before any API call.
+            let api_extra = create_extra(provider, cfg, api_json.as_deref())?;
             // A typo'd --gpu fails here, before anything is listed or created.
             let gpu = checked_gpu(cfg, provider.name(), gpu).await?;
-            let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap };
+            let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap, api_extra };
             // Several --gpu/--cloud options or a --max-price → ordered placement; otherwise
             // the single-spec path below, unchanged. Decided before anything is listed.
             let (ov, placing) = placement_request(cfg, provider.name(), ov, max_price, order, keep_trying)?;
@@ -5064,6 +5269,7 @@ async fn handle_pods_with(
                 }
                 None => (spec_with_overrides(cfg, &ov), None),
             };
+            check_create_body(provider, &first_create_spec(&spec, options.as_ref(), &names[0]))?;
             if dry_run {
                 match &options {
                     Some(plan) => print_placement_preview(provider, plan, &spec, &names),
@@ -5074,6 +5280,7 @@ async fn handle_pods_with(
                         }
                     }
                 }
+                print_create_body(provider, &first_create_spec(&spec, options.as_ref(), &names[0]));
                 warn_no_volume(provider, &spec);
                 println!("\nDry-run only — no pods created (this is a preview).");
                 return Ok(());
@@ -5117,9 +5324,15 @@ async fn handle_pods_with(
             }
         }
 
-        PodCmd::Up { names, count, add, gpu, gpus, cloud, max_price, order, disk, volume, image, bootstrap, dry_run, no_wait, keep_trying, retry_mins, retry_secs, no_setup, check, check_attempts, timeout, interval } => {
+        PodCmd::Up { names, count, add, gpu, gpus, cloud, max_price, order, disk, volume, image, bootstrap, api_json, dry_run, no_wait, keep_trying, retry_mins, retry_secs, no_setup, check, check_attempts, lock, timeout, interval } => {
+            let api_extra = create_extra(provider, cfg, api_json.as_deref())?;
+            // --lock where pods can't be locked fails now, not after pods were made.
+            if lock {
+                let target = arena_core::Pod { provider: provider.name().to_string(), ..Default::default() };
+                provider.lock_support(&target).map_err(|e| anyhow::anyhow!("--lock: {}", lock_why(e)))?;
+            }
             let gpu = checked_gpu(cfg, provider.name(), gpu).await?;
-            let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap };
+            let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap, api_extra };
             // Several --gpu/--cloud options or a --max-price → ordered placement (as `create`).
             let (ov, placing) = placement_request(cfg, provider.name(), ov, max_price, order, keep_trying)?;
             // Like `create`: explicit names take the direct path; -n/-a top up by count.
@@ -5155,8 +5368,9 @@ async fn handle_pods_with(
                 }
                 None => (spec_with_overrides(cfg, &ov), None),
             };
+            check_create_body(provider, &first_create_spec(&spec, options.as_ref(), &names[0]))?;
             let keys = (!no_setup).then(|| KeySources::load(cfg, KEYS_DIR, None, None)).filter(|k| !k.csv.is_empty());
-            let per_pod = up::pipeline_text(!no_setup, check.then_some(check_attempts), keys.is_some());
+            let per_pod = up::pipeline_text(!no_setup, check.then_some(check_attempts), keys.is_some(), lock);
             if dry_run {
                 match &options {
                     Some(plan) => print_placement_preview(provider, plan, &spec, &names),
@@ -5167,6 +5381,7 @@ async fn handle_pods_with(
                         }
                     }
                 }
+                print_create_body(provider, &first_create_spec(&spec, options.as_ref(), &names[0]));
                 warn_no_volume(provider, &spec);
                 let retry = if retry_mins > 0 { format!(" (retrying up to {retry_mins}m for capacity)") } else { String::new() };
                 println!(
@@ -5269,6 +5484,7 @@ async fn handle_pods_with(
                     cmd: arena_core::health::deep_check_command(Some(cfg.get("CONDA_ENV").unwrap_or("arena-env"))),
                 }),
                 keys,
+                lock,
             };
             let made: Vec<String> = created.iter().map(|m| m.pod.name.clone()).collect();
             if interrupt.is_set() {
@@ -5317,13 +5533,22 @@ async fn handle_pods_with(
             let lines = stop_lines(&pods, &fates, &repo);
             let blocked: Vec<&str> =
                 pods.iter().zip(&fates).filter(|(_, f)| f.needs_wipe_ok(&repo)).map(|(p, _)| p.name.as_str()).collect();
+            // A locked pod refuses a stop (RunPod itself does): the whole batch is refused up
+            // front, before anything stops, rather than half-run.
+            let locked = arena_core::lock::refusal("stop", &pods, "");
             if dry_run {
                 println!("[dry-run] would stop {} pod(s):\n{}", pods.len(), lines.join("\n"));
+                if let Some(r) = &locked {
+                    print_would_refuse(r);
+                }
                 if !blocked.is_empty() && !wipe_ok {
                     println!("(would be refused without --wipe-ok: {})", blocked.join(", "));
                 }
                 println!("\nDry-run only — would stop {} pod(s).", pods.len());
                 return Ok(());
+            }
+            if let Some(r) = locked {
+                anyhow::bail!("{r}");
             }
             if !blocked.is_empty() && !wipe_ok {
                 anyhow::bail!("{}", wipe_refusal(DiskOp::Stop, &blocked, &repo));
@@ -5340,7 +5565,7 @@ async fn handle_pods_with(
                         println!("[stopped] {}", p.name);
                         ok += 1;
                     }
-                    Err(e) => eprintln!("[FAILED] {}: {e}", p.name),
+                    Err(e) => eprintln!("[FAILED] {}: {}", p.name, arena_core::lock::explain(&p.name, &e)),
                 }
             }
             println!("\nstopped {ok}/{total}");
@@ -5388,19 +5613,29 @@ async fn handle_pods_with(
             handle_rename(provider, remote, cfg, &book, request, skip_proxy, dry_run, yes).await?;
         }
 
+        PodCmd::Lock { dry_run, sel } => {
+            let sel = select(provider, cfg, &sel.args(), Unscoped::Refuse("lock")).await?;
+            handle_lock(provider, &sel, true, dry_run, yes).await?;
+        }
+
+        PodCmd::Unlock { dry_run, sel } => {
+            let sel = select(provider, cfg, &sel.args(), Unscoped::Refuse("unlock")).await?;
+            handle_lock(provider, &sel, false, dry_run, yes).await?;
+        }
+
         PodCmd::Reimage { sel, image, skip_proxy, dry_run } => {
             let sel = select(provider, cfg, &sel.args(), Unscoped::Refuse("reimage")).await?;
             handle_reimage(provider, cfg, &sel, image, skip_proxy, dry_run, yes).await?;
         }
 
         PodCmd::Replace { target, gpu, gpus, cloud, disk, volume, image, keep_old, skip_proxy, dry_run } => {
-            let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap: false };
+            let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap: false, api_extra: None };
             handle_replace(remote, cfg, &target, &ov, keep_old, skip_proxy, dry_run, yes).await?;
         }
 
         PodCmd::Migrate { cmd } => match cmd {
             MigrateCmd::Copy { target, gpu, gpus, cloud, disk, volume, image, bootstrap, dry_run } => {
-                let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap };
+                let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap, api_extra: None };
                 handle_migrate_copy(remote, cfg, &target, &ov, dry_run, yes).await?;
             }
             MigrateCmd::Cutover { target, yes: y, skip_proxy, dry_run } => {
@@ -5417,7 +5652,7 @@ async fn handle_pods_with(
             }
         },
 
-        PodCmd::Terminate { target, all, revoke_key, skip_proxy, dry_run } => {
+        PodCmd::Terminate { target, all, unlock, revoke_key, skip_proxy, dry_run } => {
             let or = openrouter_client(cfg);
             let book = KeyBook::new(OPENROUTER_KEYS_CSV, or.as_ref());
             let target = match (all, target) {
@@ -5425,7 +5660,8 @@ async fn handle_pods_with(
                 (false, Some(t)) => Some(t),
                 (false, None) => anyhow::bail!("specify a pod (name or id) to terminate, or pass --all"),
             };
-            handle_terminate(provider, cfg, &book, target.as_deref(), revoke_key, skip_proxy, dry_run, yes).await?;
+            let opts = TerminateOpts { unlock, revoke_key, skip_proxy, dry_run, yes };
+            handle_terminate(provider, cfg, &book, target.as_deref(), opts).await?;
         }
 
         PodCmd::Backup { sel, no_pull, dry_run, message } => {
@@ -6087,6 +6323,117 @@ async fn handle_set_branch(
     Ok(())
 }
 
+/// Why a pod can't be locked, in the backend's own words (without the `not implemented:`
+/// prefix its error type prints).
+fn lock_why(e: arena_core::Error) -> String {
+    match e {
+        arena_core::Error::NotImplemented(why) => why,
+        other => other.to_string(),
+    }
+}
+
+/// Appended to a replace/cutover refused over a lock: the replacement isn't locked by itself.
+/// (Worded for all three: `replace --keep-old` and `migrate cutover` leave the terminate to
+/// a later step, but they still retire the locked pod.)
+const LOCKED_REPLACEMENT_NOTE: &str = " (it retires this pod — renamed to <name>-old, then terminated — for a new one; \
+     lock the replacement with `arena pods lock` once it's in)";
+
+/// A dry run's note that the real run would be refused or fail (a locked pod: the same
+/// sentence the real run fails with). One helper so every command's dry run says it the same
+/// way — and, under test, keeps the line, so a test can see it was printed
+/// ([`take_would_refuse`]).
+fn print_would_refuse(r: &str) {
+    let line = format!("(without --dry-run: {r})");
+    #[cfg(test)]
+    WOULD_REFUSE.with(|n| n.borrow_mut().push(line.clone()));
+    println!("{line}");
+}
+
+#[cfg(test)]
+thread_local! {
+    static WOULD_REFUSE: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Under test: the [`print_would_refuse`] lines printed on this thread so far (taken). A
+/// `#[tokio::test]` runs the command on its own thread, so these are that test's.
+#[cfg(test)]
+fn take_would_refuse() -> Vec<String> {
+    WOULD_REFUSE.with(|n| std::mem::take(&mut *n.borrow_mut()))
+}
+
+/// `pods lock` / `pods unlock` (`lock` says which). The selection is sorted first
+/// ([`arena_core::lock::plan`]): pods already in that state are said and left alone; pods
+/// whose backend can't lock (RUNPOD_API=v1, Vast, Hetzner) are reported one by one and make
+/// the exit non-zero — the operator asked for them to be (un)protected and they aren't; the
+/// rest are set one at a time after one confirm, a failure reported and carried on from.
+async fn handle_lock(provider: &dyn Provider, sel: &Selected, lock: bool, dry_run: bool, yes: bool) -> Result<()> {
+    use arena_core::lock;
+    let (verb, done) = if lock { ("lock", "locked") } else { ("unlock", "unlocked") };
+    let plan = lock::plan(&sel.pods, lock, |p| provider.lock_support(p).map_err(lock_why));
+    for p in &plan.already {
+        println!("= {} already {done}", p.name);
+    }
+    for (p, why) in &plan.unsupported {
+        eprintln!("✗ {} can't be {done}: {why}", p.name);
+    }
+    let unsupported: Vec<&str> = plan.unsupported.iter().map(|(p, _)| p.name.as_str()).collect();
+    // The command fails for these: they were asked to be (un)protected and can't be. Other
+    // providers' pods in a broad selection can be left out with `--on runpod`.
+    let others_only = plan.unsupported.iter().all(|(p, _)| p.provider != "runpod");
+    let cant = (!unsupported.is_empty()).then(|| {
+        format!(
+            "{} pod(s) can't be {done}: {}{}",
+            unsupported.len(),
+            unsupported.join(", "),
+            if others_only { " (leave other providers' pods out with --on runpod)" } else { "" }
+        )
+    });
+    let names: Vec<&str> = plan.act.iter().map(|p| p.name.as_str()).collect();
+    let what = format!("{verb} {} pod(s): {}\n  ({})", names.len(), names.join(", "), lock::consequence(lock));
+    if dry_run {
+        if !names.is_empty() {
+            println!("[dry-run] would {what}");
+        }
+        if let Some(c) = &cant {
+            println!("(without --dry-run this fails: {c})");
+        }
+        println!("\nDry-run only — nothing {done}.");
+        return Ok(());
+    }
+    if names.is_empty() {
+        if let Some(c) = cant {
+            anyhow::bail!("{c}");
+        }
+        println!("nothing to {verb}.");
+        return Ok(());
+    }
+    if !confirm(yes, &format!("Will {what}"))? {
+        println!("aborted.");
+        return Ok(());
+    }
+    let policy = arena_core::retry::RetryPolicy::default();
+    let mut failed: Vec<&str> = Vec::new();
+    for p in &plan.act {
+        match arena_core::retry::retrying(&policy, || provider.set_locked(&p.id, lock)).await {
+            Ok(()) => println!("[{done}] {}", p.name),
+            Err(e) => {
+                eprintln!("[FAILED] {}: {e}", p.name);
+                failed.push(p.name.as_str());
+            }
+        }
+    }
+    println!("\n{done} {}/{}", names.len() - failed.len(), names.len());
+    let mut problems = Vec::new();
+    if !failed.is_empty() {
+        problems.push(format!("{} pod(s) failed to {verb}: {}", failed.len(), failed.join(", ")));
+    }
+    problems.extend(cant);
+    if !problems.is_empty() {
+        anyhow::bail!("{}", problems.join("; "));
+    }
+    Ok(())
+}
+
 /// `pods reimage`: swap image + re-seed keys in place (disk wiped), then re-point the proxy.
 #[allow(clippy::too_many_arguments)]
 async fn handle_reimage(
@@ -6104,6 +6451,14 @@ async fn handle_reimage(
         println!("(no pods to reimage)");
         return Ok(());
     }
+    // A reimage resets the container — exactly what a lock is for ("cannot be stopped or
+    // reset"). Refused here, up front, rather than left to an API refusal nobody has
+    // verified for the reimage PATCH.
+    let refs: Vec<&arena_core::Pod> = pods.iter().collect();
+    let locked = arena_core::lock::refusal("reimage", &refs, "");
+    if let (Some(r), false) = (&locked, dry_run) {
+        anyhow::bail!("{r}");
+    }
     let image = image.unwrap_or_else(|| PodSpec::from_config(cfg).image);
     if image.is_empty() {
         anyhow::bail!("no image: pass --image or set RUNPOD_DOCKER_IMAGE");
@@ -6116,6 +6471,9 @@ async fn handle_reimage(
     println!("image: {image}\nkeys:  {}", pubkeys.iter().map(|k| k.split_whitespace().last().unwrap_or("?")).collect::<Vec<_>>().join(", "));
     if dry_run {
         println!("[dry-run] would reimage {} pod(s): {}", pods.len(), names.join(" "));
+        if let Some(r) = &locked {
+            print_would_refuse(r);
+        }
         return Ok(());
     }
     if !confirm(yes, &format!("Will reimage {} pod(s), WIPING their disks: {}", pods.len(), names.join(" ")))? {
@@ -6139,7 +6497,7 @@ async fn handle_reimage(
         match arena_core::retry::retrying(&policy, || provider.reimage_pod(&pod.id, &image, &env)).await {
             Ok(()) => println!("[reimaged] {}", pod.name),
             Err(e) => {
-                eprintln!("[failed] {}: {e}", pod.name);
+                eprintln!("[failed] {}: {}", pod.name, arena_core::lock::explain(&pod.name, &e));
                 failed.push(pod.name.clone());
             }
         }
@@ -6196,24 +6554,44 @@ fn openrouter_client(cfg: &Config) -> Option<arena_core::openrouter::OpenRouter>
     cfg.get("OPENROUTER_PROVISIONING_KEY").filter(|s| !s.is_empty()).map(arena_core::openrouter::OpenRouter::new)
 }
 
+/// `pods terminate`'s switches, passed through to [`handle_terminate`] as one value.
+#[derive(Debug, Clone, Copy, Default)]
+struct TerminateOpts {
+    unlock: bool,
+    revoke_key: bool,
+    skip_proxy: bool,
+    dry_run: bool,
+    yes: bool,
+}
+
 /// `pods terminate <target>` / `--all`, optionally `--revoke-key`. Revocation runs only for
 /// pods that actually terminated, after the terminates and the proxy sync — a failed revoke
 /// is reported per machine and fails the exit, but never stands in the way of a terminate.
 /// Keys go by machine *name*, so a name still held by a pod that is NOT gone (the twin of a
 /// double create removed by id, or one whose terminate failed) keeps its key and row: a pod
 /// still running keeps a working key.
-#[allow(clippy::too_many_arguments)]
+///
+/// A locked pod ([`arena_core::lock`]) is refused — the whole command, before anything is
+/// terminated — unless `--unlock`, which unlocks each locked pod right before its terminate
+/// (and says so in the confirm text). One whose unlock fails isn't terminated; one unlocked
+/// whose terminate then fails is reported as left UNLOCKED. A pod locked since the listing
+/// (the API refuses its terminate as locked) is, under `--unlock`, unlocked and retried once.
+///
+/// With `--all`, `--unlock` lifts only this cohort's locks ([`Naming::is_cohort`]): a staff or
+/// personal box on the same account (an `@` list entry, or a pod off the list) is often
+/// locked precisely so that a fleet-wide command can't take it — RunPod's own refusal kept it
+/// alive through `terminate --all` — and the end-of-program one-liner mustn't undo that. Such
+/// a pod is KEPT (not unlocked, not terminated) and the exit fails; naming it as the one
+/// target (`pods terminate <it> --unlock`) is the operator choosing to.
 async fn handle_terminate(
     provider: &dyn Provider,
     cfg: &Config,
     book: &KeyBook<'_>,
     // One pod (the shared single-pod matcher), or `None` = the whole fleet (`--all`).
     target: Option<&str>,
-    revoke_key: bool,
-    skip_proxy: bool,
-    dry_run: bool,
-    yes: bool,
+    opts: TerminateOpts,
 ) -> Result<()> {
+    let TerminateOpts { unlock, revoke_key, skip_proxy, dry_run, yes } = opts;
     // Before anything is listed or touched: revoking needs the provisioning API.
     if revoke_key && book.api.is_none() {
         anyhow::bail!(
@@ -6240,7 +6618,46 @@ async fn handle_terminate(
         println!("(no pods to terminate)");
         return Ok(());
     }
+    // Whose lock `--unlock` may lift: the one named pod, or (`--all`) a cohort pod's.
+    let may_unlock = |p: &arena_core::Pod| target.is_some() || naming.is_cohort(&p.name);
+    let foreign_locked: Vec<String> =
+        pods.iter().filter(|p| arena_core::lock::is_locked(p) && !may_unlock(p)).map(|p| p.name.clone()).collect();
+    let kept_why = |names: &[String]| {
+        format!(
+            "{} KEPT, not terminated: locked, and not this cohort's (`{}-…`) — `--all --unlock` lifts only the \
+             cohort's locks (a staff box's lock is what protects it); if it really should go, name it: \
+             `arena pods terminate {} --unlock`",
+            names.join(", "),
+            naming.prefix,
+            names.first().map_or("<name>", String::as_str)
+        )
+    };
+    let (kept, pods): (Vec<arena_core::Pod>, Vec<arena_core::Pod>) =
+        pods.into_iter().partition(|p| unlock && arena_core::lock::is_locked(p) && !may_unlock(p));
+    let kept_names: Vec<String> = kept.iter().map(|p| p.name.clone()).collect();
+    if pods.is_empty() {
+        // Only kept pods were selected: nothing to do, and the operator asked for more.
+        if dry_run {
+            print_would_refuse(&kept_why(&kept_names));
+            return Ok(());
+        }
+        anyhow::bail!("{}", kept_why(&kept_names));
+    }
     let label = |p: &arena_core::Pod| format!("{} (id={}, {})", p.name, p.id, p.provider);
+    let refs: Vec<&arena_core::Pod> = pods.iter().collect();
+    let locked: Vec<&str> = arena_core::lock::locked(refs.iter().copied()).iter().map(|p| p.name.as_str()).collect();
+    let refused = if unlock {
+        None
+    } else {
+        let mut extra = " — or pass --unlock to lift the lock as part of the terminate".to_string();
+        if !foreign_locked.is_empty() {
+            extra.push_str(&format!(
+                " (with --all it unlocks only the cohort's: {} would be KEPT, locked — not this cohort's)",
+                foreign_locked.join(", ")
+            ));
+        }
+        arena_core::lock::refusal("terminate", &refs, &extra)
+    };
     let then_keys = if revoke_key {
         format!(", revoke the OpenRouter key(s) named after each and drop their rows from {}", book.csv.display())
     } else {
@@ -6251,7 +6668,8 @@ async fn handle_terminate(
         let leaving: Vec<&str> = pods.iter().map(|p| p.id.as_str()).collect();
         let staying = |p: &arena_core::Pod| shared_name_holder(&listed, &leaving, &p.name).map(|o| o.id.clone());
         for p in &pods {
-            println!("[dry-run] would terminate {}", label(p));
+            let how = if unlock && arena_core::lock::is_locked(p) { "unlock, then terminate" } else { "terminate" };
+            println!("[dry-run] would {how} {}", label(p));
             if revoke_key {
                 match staying(p) {
                     Some(id) => println!("[dry-run]   key kept: pod id {id} (not being terminated) is also named {}", p.name),
@@ -6263,32 +6681,102 @@ async fn handle_terminate(
                 }
             }
         }
+        if let Some(r) = &refused {
+            print_would_refuse(r);
+        }
+        for p in &kept {
+            println!("[dry-run] would KEEP {} — locked, not this cohort's", label(p));
+        }
+        if !kept.is_empty() {
+            print_would_refuse(&format!("{} — the exit fails", kept_why(&kept_names)));
+        }
         println!("\nDry-run only — would terminate {} pod(s){then_keys}{then_sync} (preview).", pods.len());
         return Ok(());
     }
+    if let Some(r) = refused {
+        anyhow::bail!("{r}");
+    }
+    // `--unlock` is named in the prompt, with the pods it unlocks — a lock is lifted only on
+    // that explicit yes.
+    let unlocking = if unlock && !locked.is_empty() {
+        format!("UNLOCK {} (locked), then ", locked.join(", "))
+    } else {
+        String::new()
+    };
+    let keeping = if kept.is_empty() {
+        String::new()
+    } else {
+        format!(" KEEPING {} (locked, not this cohort's — not unlocked).", kept_names.join(", "))
+    };
     let what = match target {
-        None => format!("Will TERMINATE ALL {} pod(s) — irreversible{then_keys}{then_sync}.", pods.len()),
-        Some(_) => format!("Will TERMINATE {} — irreversible{then_keys}{then_sync}.", label(&pods[0])),
+        None => format!("Will {unlocking}TERMINATE ALL {} pod(s) — irreversible{then_keys}{then_sync}.{keeping}", pods.len()),
+        Some(_) => format!("Will {unlocking}TERMINATE {} — irreversible{then_keys}{then_sync}.", label(&pods[0])),
     };
     if !confirm(yes, &what)? {
         println!("aborted.");
         return Ok(());
     }
-    // The fleet provider routes each terminate to the backend that owns the pod id.
+    // The fleet provider routes each terminate (and unlock) to the backend that owns the pod.
     let mut gone: Vec<&arena_core::Pod> = Vec::new();
     for p in &pods {
-        match provider.terminate_pod(&p.id).await {
+        let mut unlocked = false;
+        if unlock && arena_core::lock::is_locked(p) {
+            if let Err(e) = arena_core::retry::retrying(&policy, || provider.set_locked(&p.id, false)).await {
+                let why = format!("{}: unlocking failed, so it was NOT terminated: {e}", p.name);
+                if target.is_some() {
+                    anyhow::bail!("{why}");
+                }
+                eprintln!("[FAILED] {why}");
+                continue;
+            }
+            println!("[unlocked] {}", p.name);
+            unlocked = true;
+        }
+        let outcome: std::result::Result<(), String> = match provider.terminate_pod(&p.id).await {
+            Ok(()) => Ok(()),
+            // Locked since the listing (which said unlocked, or didn't say): under --unlock
+            // that is the lock the operator asked to lift — once, then one more terminate.
+            // (Not a pod `--all --unlock` may not unlock: that one reads as the hint.)
+            Err(e) if e.is_locked() && unlock && !unlocked && may_unlock(p) => {
+                match arena_core::retry::retrying(&policy, || provider.set_locked(&p.id, false)).await {
+                    Err(ue) => Err(format!(
+                        "{}: locked since it was listed, and unlocking failed, so it was NOT terminated: {ue}",
+                        p.name
+                    )),
+                    Ok(()) => {
+                        println!("[unlocked] {} (locked since it was listed)", p.name);
+                        unlocked = true;
+                        provider.terminate_pod(&p.id).await.map_err(|e| format!("{}: {}", p.name, arena_core::lock::explain(&p.name, &e)))
+                    }
+                }
+            }
+            Err(e) => Err(format!("{}: {}", p.name, arena_core::lock::explain(&p.name, &e))),
+        };
+        match outcome {
             Ok(()) => {
                 println!("[terminated] {}", if target.is_some() { label(p) } else { p.name.clone() });
                 gone.push(p);
             }
-            // One named pod: its failure is the command's error (nothing else to do).
-            Err(e) if target.is_some() => return Err(e.into()),
-            Err(e) => eprintln!("[FAILED] {}: {e}", p.name),
+            Err(mut why) => {
+                if unlocked {
+                    why.push_str(&format!(
+                        " — it is now UNLOCKED: `arena pods lock {}` to protect it again, or retry the terminate",
+                        p.name
+                    ));
+                }
+                // One named pod: its failure is the command's error (nothing else to do).
+                if target.is_some() {
+                    anyhow::bail!("{why}");
+                }
+                eprintln!("[FAILED] {why}");
+            }
         }
     }
+    for p in &kept {
+        eprintln!("[KEPT] {} — locked, not this cohort's: not unlocked, not terminated", p.name);
+    }
     if target.is_none() {
-        println!("\nterminated {}/{}", gone.len(), pods.len());
+        println!("\nterminated {}/{}", gone.len(), pods.len() + kept.len());
     }
     // Sync whatever did go (the merge only drops what the providers confirm gone).
     if !gone.is_empty() && !skip_proxy {
@@ -6320,6 +6808,9 @@ async fn handle_terminate(
     let mut problems = Vec::new();
     if gone.len() < pods.len() {
         problems.push(format!("{} pod(s) failed to terminate", pods.len() - gone.len()));
+    }
+    if !kept.is_empty() {
+        problems.push(kept_why(&kept_names));
     }
     if !revoked.failed.is_empty() {
         problems.push(format!(
@@ -6613,6 +7104,11 @@ async fn handle_restart(
     let pods = arena_core::retry::retrying(&policy, || provider.list_pods()).await.context("listing pods")?;
     let pod = pods[arena_core::selector::resolve_one(&Naming::from_config(cfg), &pods, target)?].clone();
     let label = format!("{} (id={}, {})", pod.name, pod.id, pod.provider);
+    // A locked pod refuses a restart (RunPod itself does): say so before anything is read.
+    let locked = arena_core::lock::refusal("restart", &[&pod], "");
+    if let (Some(r), false) = (&locked, opts.dry_run) {
+        anyhow::bail!("{r}");
+    }
     let fate = disk_fate(provider, &pod).await;
     let repo = arena_core::backup::repo_path(cfg);
     let wiped = matches!(fate, DiskFate::Wiped { .. });
@@ -6633,6 +7129,9 @@ async fn handle_restart(
     let what = format!("restart {label}:\n  {}\n  {then}", fate.describe(DiskOp::Restart, &repo));
     if opts.dry_run {
         println!("[dry-run] would {what}");
+        if let Some(r) = &locked {
+            print_would_refuse(r);
+        }
         if fate.needs_wipe_ok(&repo) && !opts.wipe_ok {
             println!("(would be refused without --wipe-ok)");
         }
@@ -6646,7 +7145,7 @@ async fn handle_restart(
         return Ok(());
     }
     // The fleet provider routes it to the backend that owns the pod id.
-    provider.restart_pod(&pod.id).await?;
+    provider.restart_pod(&pod.id).await.map_err(|e| anyhow::anyhow!("{}", arena_core::lock::explain(&pod.name, &e)))?;
     println!("[restarted] {label}");
 
     let mut outcome: Result<()> = Ok(());
@@ -6733,9 +7232,10 @@ async fn handle_rename(
     for (i, r) in plan.iter().enumerate() {
         if let Err(e) = arena_core::retry::retrying(&policy, || provider.rename_pod(&r.id, &r.new)).await {
             failure = Some(format!(
-                "renaming {} → {} failed: {e}\n{}",
+                "renaming {} → {} failed: {}\n{}",
                 r.old,
                 r.new,
+                arena_core::lock::explain(&r.old, &e),
                 rename_failure_hint(&request, i, plan.len())
             ));
             break;
@@ -7258,7 +7758,25 @@ async fn build_replacement_spec(
              no GPU_TYPE is configured) — pass --gpu <type> (see `arena gpus`)"
         );
     }
+    // Config CREATE_EXTRA_JSON is the cohort's create default, like GPU_TYPE: the
+    // replacement's create carries it too — checked against the owner's own fields now,
+    // before anything is created. (`--api-json` itself is create/up only.)
+    if spec.api_extra.is_none() {
+        spec.api_extra = create_extra(owner, cfg, None)?;
+    }
+    check_create_body(owner, &spec)?;
     Ok(spec)
+}
+
+/// The plan line for a create carrying `--api-json` / `CREATE_EXTRA_JSON`: its top-level
+/// keys only (values may hold a token). `None` without extra fields.
+fn extra_keys_line(spec: &PodSpec) -> Option<String> {
+    let extra = spec.api_extra.as_ref()?;
+    Some(format!(
+        "+ {} [{}] merged into the create request",
+        arena_core::apiextra::SOURCES,
+        extra.keys().map(String::as_str).collect::<Vec<_>>().join(", ")
+    ))
 }
 
 /// Resolve a migration's canonical name + the owning provider, rejecting a `-new`/`-old`
@@ -7268,6 +7786,13 @@ async fn resolve_migration(
     target: &str,
 ) -> Result<(Box<dyn Provider>, String, Vec<arena_core::Pod>)> {
     let (owner, src_id, src_label) = resolve_target_any(cfg, target).await?;
+    let (canonical, pods) = migration_pods(owner.as_ref(), &src_id, &src_label).await?;
+    Ok((owner, canonical, pods))
+}
+
+/// The migration's canonical name (the source pod's, never a `-new`/`-old` staging name)
+/// and the owner's listing — [`resolve_migration`] once the owner is known.
+async fn migration_pods(owner: &dyn Provider, src_id: &str, src_label: &str) -> Result<(String, Vec<arena_core::Pod>)> {
     let pods = owner.list_pods().await.context("listing pods")?;
     let canonical = pods
         .iter()
@@ -7283,7 +7808,7 @@ async fn resolve_migration(
             "{canonical} is a migration staging pod — pass the live machine name `{bare}` instead"
         );
     }
-    Ok((owner, canonical, pods))
+    Ok((canonical, pods))
 }
 
 /// Can we reach pod `expected_id` *through the proxy*? Computes the machine's stable proxy
@@ -7353,6 +7878,9 @@ async fn handle_migrate_copy(
         } else {
             let spec = build_replacement_spec(cfg, owner.as_ref(), &src_id, &canonical, ov).await?;
             println!("  - create {new_name} ({})", owner.describe(&spec));
+            if let Some(line) = extra_keys_line(&spec) {
+                println!("    {line}");
+            }
             println!("  - wait for it to stabilize, then set it up");
             println!("  - sync {canonical} → {new_name}");
         }
@@ -7434,6 +7962,22 @@ async fn handle_migrate_cutover(
     yes: bool,
 ) -> Result<()> {
     let (owner, canonical, pods) = resolve_migration(cfg, target).await?;
+    migrate_cutover_on(remote, cfg, owner.as_ref(), &canonical, &pods, skip_proxy, dry_run, yes).await
+}
+
+/// [`handle_migrate_cutover`] once the owner and its listing are known ([`resolve_migration`])
+/// — the seam tests drive with a fake owner.
+#[allow(clippy::too_many_arguments)]
+async fn migrate_cutover_on(
+    remote: &dyn Remote,
+    cfg: &Config,
+    owner: &dyn Provider,
+    canonical: &str,
+    pods: &[arena_core::Pod],
+    skip_proxy: bool,
+    dry_run: bool,
+    yes: bool,
+) -> Result<()> {
     let new_name = format!("{canonical}-new");
     let old_name = format!("{canonical}-old");
     let src_id = pods.iter().find(|p| p.name == canonical).unwrap().id.clone();
@@ -7445,8 +7989,18 @@ async fn handle_migrate_cutover(
     if pods.iter().any(|p| p.name == old_name) {
         anyhow::bail!("{old_name} already exists — finish/revert the previous migration first");
     }
+    // The cutover moves the participant off the pod (renamed to -old, then `finish`
+    // terminates it): a locked original is refused here, at the step that starts that.
+    let src = pods.iter().find(|p| p.id == src_id).expect("found by id above");
+    let locked = arena_core::lock::refusal("cut over", &[src], LOCKED_REPLACEMENT_NOTE);
+    if let (Some(r), false) = (&locked, dry_run) {
+        anyhow::bail!("{r}");
+    }
 
     if dry_run {
+        if let Some(r) = &locked {
+            print_would_refuse(r);
+        }
         println!("migrate cutover {canonical} (dry-run):");
         println!("  1. final delta sync {canonical} → {new_name}");
         println!("  2. rename {canonical} → {old_name}, then {new_name} → {canonical}");
@@ -7474,12 +8028,12 @@ async fn handle_migrate_cutover(
 
     // 1. final delta sync + verify it landed.
     println!("[1/4] final delta sync {canonical} → {new_name}…");
-    copy_pod_files(cfg, owner.as_ref(), remote, &src_id, &new_id)
+    copy_pod_files(cfg, owner, remote, &src_id, &new_id)
         .await
         .with_context(|| format!("final sync {canonical} -> {new_name}"))?;
-    clean_marker(owner.as_ref(), remote, &new_id, cfg).await;
+    clean_marker(owner, remote, &new_id, cfg).await;
     println!("[2/4] verifying {new_name} health…");
-    verify_replacement(owner.as_ref(), remote, &new_id, cfg).await?;
+    verify_replacement(owner, remote, &new_id, cfg).await?;
 
     // 3. swap names (old-first so the canonical name is never on two pods).
     println!("[3/4] swapping names…");
@@ -7497,7 +8051,7 @@ async fn handle_migrate_cutover(
     // set ~/.name on the now-canonical pod
     let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
     let short = canonical.strip_prefix(&format!("{prefix}-")).unwrap_or(&canonical);
-    if let Ok(t) = fresh_target(owner.as_ref(), &new_id, cfg).await {
+    if let Ok(t) = fresh_target(owner, &new_id, cfg).await {
         let name_cmd =
             format!("printf %s {} > \"$HOME/.name\"", shell_quote(&format!("export MACHINE_NAME='{short}'")));
         let _ = remote.exec(&t, &name_cmd, Some(PROBE_TIMEOUT)).await;
@@ -7510,9 +8064,9 @@ async fn handle_migrate_cutover(
         println!("[4/4] re-pointing proxy and verifying {canonical} through it…");
         // Unlike the other lifecycle commands, the cutover *depends* on the proxy: a sync
         // that was skipped or failed means nobody can reach the new pod, so revert now.
-        if !matches!(sync_proxy_via(cfg, owner.as_ref(), "migrate cutover").await, ProxySync::Synced { .. }) {
+        if !matches!(sync_proxy_via(cfg, owner, "migrate cutover").await, ProxySync::Synced { .. }) {
             eprintln!("      the proxy wasn't re-pointed — auto-reverting.");
-            cutover_revert(cfg, owner.as_ref(), &canonical, &new_id, &src_id, true).await;
+            cutover_revert(cfg, owner, &canonical, &new_id, &src_id, true).await;
             anyhow::bail!("cutover reverted: proxy sync failed. {canonical} is back on the original.");
         }
         // `nginx -s reload` is GRACEFUL: for a few seconds after the reload, existing worker
@@ -7535,7 +8089,7 @@ async fn handle_migrate_cutover(
         }
         if !reached {
             eprintln!("      ✗ {canonical} NOT reachable through the proxy after ~{}s — auto-reverting.", settle_tries * 3);
-            cutover_revert(cfg, owner.as_ref(), &canonical, &new_id, &src_id, true).await;
+            cutover_revert(cfg, owner, &canonical, &new_id, &src_id, true).await;
             anyhow::bail!(
                 "cutover reverted: the new pod wasn't reachable through the proxy. {canonical} is \
                  back on the original (untouched). Check the new pod, then retry."
@@ -7610,20 +8164,36 @@ async fn handle_migrate_revert(
 /// `migrate finish`: terminate the parked `<name>-old` pod.
 async fn handle_migrate_finish(cfg: &Config, target: &str, dry_run: bool, yes: bool) -> Result<()> {
     let (owner, canonical, pods) = resolve_migration(cfg, target).await?;
+    migrate_finish_on(owner.as_ref(), &canonical, &pods, dry_run, yes).await
+}
+
+/// [`handle_migrate_finish`] once the owner and its listing are known — the seam tests drive
+/// with a fake owner.
+async fn migrate_finish_on(owner: &dyn Provider, canonical: &str, pods: &[arena_core::Pod], dry_run: bool, yes: bool) -> Result<()> {
     let old_name = format!("{canonical}-old");
     let old = pods
         .iter()
         .find(|p| p.name == old_name)
         .ok_or_else(|| anyhow::anyhow!("no {old_name} to remove (nothing to finish)"))?;
+    let locked = arena_core::lock::refusal("terminate", &[old], "");
     if dry_run {
         println!("migrate finish {canonical} (dry-run): would terminate {old_name} (id={}).", old.id);
+        if let Some(r) = &locked {
+            print_would_refuse(r);
+        }
         return Ok(());
+    }
+    if let Some(r) = locked {
+        anyhow::bail!("{r}");
     }
     if !confirm(yes, &format!("Permanently terminate {old_name} (id={})? This deletes the original pod.", old.id))? {
         println!("aborted.");
         return Ok(());
     }
-    owner.terminate_pod(&old.id).await.with_context(|| format!("terminating {old_name}"))?;
+    owner
+        .terminate_pod(&old.id)
+        .await
+        .map_err(|e| anyhow::anyhow!("terminating {old_name}: {}", arena_core::lock::explain(&old_name, &e)))?;
     println!("✓ Terminated {old_name}. Migration of {canonical} complete.");
     Ok(())
 }
@@ -7690,6 +8260,33 @@ async fn handle_replace(
     // name or a raw id, so read the canonical name back from the fleet rather than trusting
     // the argument (a user may pass an id).
     let (owner, src_id, src_label) = resolve_target_any(cfg, target).await?;
+    let opts = ReplaceOpts { keep_old, skip_proxy, dry_run, yes };
+    replace_on(remote, cfg, owner.as_ref(), src_id, src_label, setup_timeouts, ov, opts).await
+}
+
+/// `pods replace`'s switches, passed through to [`replace_on`] as one value.
+#[derive(Debug, Clone, Copy, Default)]
+struct ReplaceOpts {
+    keep_old: bool,
+    skip_proxy: bool,
+    dry_run: bool,
+    yes: bool,
+}
+
+/// [`handle_replace`] once the source pod (`src_id`) and the backend that owns it are
+/// known — the seam tests drive with a fake owner.
+#[allow(clippy::too_many_arguments)]
+async fn replace_on(
+    remote: Arc<dyn Remote>,
+    cfg: &Config,
+    owner: &dyn Provider,
+    src_id: String,
+    src_label: String,
+    setup_timeouts: arena_core::setup::SetupTimeouts,
+    ov: &SpecOverrides,
+    opts: ReplaceOpts,
+) -> Result<()> {
+    let ReplaceOpts { keep_old, skip_proxy, dry_run, yes } = opts;
     let pods = owner.list_pods().await.context("listing pods for replace")?;
     let src = pods
         .iter()
@@ -7703,8 +8300,14 @@ async fn handle_replace(
         );
     }
     let (new_name, old_name) = replace_stage_names(&canonical);
+    // Replace renames the pod and (unless --keep-old) terminates it: a locked one is refused
+    // before anything is read or created.
+    let locked = arena_core::lock::refusal("replace", &[src], LOCKED_REPLACEMENT_NOTE);
+    if let (Some(r), false) = (&locked, dry_run) {
+        anyhow::bail!("{r}");
+    }
 
-    let spec = build_replacement_spec(cfg, owner.as_ref(), &src_id, &src_label, ov).await?;
+    let spec = build_replacement_spec(cfg, owner, &src_id, &src_label, ov).await?;
 
     // Pre-flight: a leftover -new/-old from a prior aborted run is a resume signal, not a
     // fresh start — flag it so the operator cleans up rather than colliding.
@@ -7721,6 +8324,9 @@ async fn handle_replace(
     // Print the plan.
     println!("Replace {canonical}  (id={src_id}, {})", owner.name());
     println!("  target spec: {}", owner.describe(&spec));
+    if let Some(line) = extra_keys_line(&spec) {
+        println!("               {line}");
+    }
     println!("  pipeline:");
     println!("    1. create   {new_name}   ({})", owner.describe(&spec));
     println!("    2. setup    {new_name}   (deploy key, ssh config, repo, ~/.name={canonical})");
@@ -7741,6 +8347,10 @@ async fn handle_replace(
     }
 
     if dry_run {
+        if let Some(r) = &locked {
+            println!();
+            print_would_refuse(r);
+        }
         println!("\n[dry-run] nothing changed.");
         return Ok(());
     }
@@ -7782,10 +8392,10 @@ async fn handle_replace(
     println!("[2/7] waiting for {new_name} to come up and stabilize…");
     // RunPod can be slow to assign a fresh pod's SSH endpoint — 5+ min is not unusual,
     // especially on the secure tier — so give it a generous window before giving up.
-    wait_for_endpoint(owner.as_ref(), &created.id, 900)
+    wait_for_endpoint(owner, &created.id, 900)
         .await
         .with_context(|| format!("{new_name} never came up — left in place for inspection"))?;
-    wait_for_stable_endpoint(owner.as_ref(), &created.id, 90, 600)
+    wait_for_stable_endpoint(owner, &created.id, 90, 600)
         .await
         .with_context(|| format!("{new_name}'s endpoint never stabilized"))?;
 
@@ -7798,22 +8408,22 @@ async fn handle_replace(
     for attempt in 1..=copy_attempts {
         println!("[3/7] provisioning {new_name}… (attempt {attempt}/{copy_attempts})");
         // By id (a fresh listing each attempt, for the current endpoint): the pod we made.
-        let new = just_these(owner.as_ref(), std::slice::from_ref(&created.id)).await?;
-        handle_setup(remote.clone(), cfg, true, false, None, None, false, setup_timeouts, &new, KEYS_DIR, Some(owner.as_ref()))
+        let new = just_these(owner, std::slice::from_ref(&created.id)).await?;
+        handle_setup(remote.clone(), cfg, true, false, None, None, false, setup_timeouts, &new, KEYS_DIR, Some(owner))
             .await
             .with_context(|| format!("provisioning {new_name}"))?;
         println!("[4/7] copying {canonical} → {new_name} (excludes caches, HF models, .claude, .ssh, shell-rc keys)…");
-        copy_pod_files(cfg, owner.as_ref(), remote.as_ref(), &src_id, &created.id)
+        copy_pod_files(cfg, owner, remote.as_ref(), &src_id, &created.id)
             .await
             .with_context(|| replace_copy_failed(&canonical, &new_name))?;
         println!("[5/7] confirming the copy persists (~90s — pods can reset while still settling)…");
         tokio::time::sleep(std::time::Duration::from_secs(90)).await;
-        if marker_present(owner.as_ref(), remote.as_ref(), &created.id, cfg).await {
+        if marker_present(owner, remote.as_ref(), &created.id, cfg).await {
             persisted = true;
             break;
         }
         eprintln!("      {new_name} reset to image state (lost setup+copy) — re-provisioning…");
-        let _ = wait_for_stable_endpoint(owner.as_ref(), &created.id, 90, 600).await;
+        let _ = wait_for_stable_endpoint(owner, &created.id, 90, 600).await;
     }
     if !persisted {
         anyhow::bail!(
@@ -7822,11 +8432,11 @@ async fn handle_replace(
              less contended, or terminate {new_name} with `arena pods terminate {new_name}`."
         );
     }
-    clean_marker(owner.as_ref(), remote.as_ref(), &created.id, cfg).await;
+    clean_marker(owner, remote.as_ref(), &created.id, cfg).await;
 
     // Health check before the swap (re-resolves the endpoint fresh and retries).
     println!("      verifying health of {new_name}…");
-    verify_replacement(owner.as_ref(), remote.as_ref(), &created.id, cfg)
+    verify_replacement(owner, remote.as_ref(), &created.id, cfg)
         .await
         .with_context(|| format!("verifying {new_name}"))?;
 
@@ -7873,7 +8483,7 @@ async fn handle_replace(
     let short = canonical.strip_prefix(&format!("{prefix}-")).unwrap_or(&canonical);
     let dotname = format!("export MACHINE_NAME='{short}'");
     let name_cmd = format!("printf %s {} > \"$HOME/.name\"", shell_quote(&dotname));
-    let name_written = match wait_for_endpoint(owner.as_ref(), &created.id, 60).await {
+    let name_written = match wait_for_endpoint(owner, &created.id, 60).await {
         Ok(p) => match SshTarget::from_pod(&p, cfg) {
             Ok(t) => remote.exec(&t, &name_cmd, Some(PROBE_TIMEOUT)).await.map(|o| o.success).unwrap_or(false),
             Err(_) => false,
@@ -7895,7 +8505,7 @@ async fn handle_replace(
         println!("[7/7] re-pointing proxy…");
         // Fleet-wide (not just `owner`'s pods): a single-provider list here used to drop
         // every other provider's forwards, and a failed list (`unwrap_or_default`) all of them.
-        let sync = sync_proxy_via(cfg, owner.as_ref(), "replace").await;
+        let sync = sync_proxy_via(cfg, owner, "replace").await;
         let proxied = arena_core::proxy::ProxyConfig::from_config(cfg).is_ok()
             && cfg.machine_names.iter().any(|m| arena_core::naming::qualify(prefix, m) == canonical);
         replace_cleanup_blocker(&sync, proxied, &canonical, owner.name(), &created.id)
@@ -7914,7 +8524,7 @@ async fn handle_replace(
     } else {
         println!("terminating parked {old_name}…");
         if let Err(e) = arena_core::retry::retrying(&policy, || owner.terminate_pod(&src_id)).await {
-            eprintln!("      couldn't terminate {old_name}: {e} — remove it manually.");
+            eprintln!("      couldn't terminate {old_name}: {} — remove it manually.", arena_core::lock::explain(&old_name, &e));
         } else {
             println!("done — {canonical} replaced; {old_name} terminated.");
         }
@@ -9655,6 +10265,7 @@ mod replacement_spec_tests {
             docker_args: None,
             allowed_cuda: allowed_cuda.iter().map(|s| s.to_string()).collect(),
             max_price: None,
+            api_extra: None,
         }
     }
 
@@ -9691,6 +10302,68 @@ mod replacement_spec_tests {
         assert_eq!((spec.gpu_type.as_str(), spec.allowed_cuda.clone()), ("NVIDIA GeForce RTX 3070", vec!["13.0".to_string()]));
     }
 
+    /// Config CREATE_EXTRA_JSON reaches a replacement's (and `migrate copy`'s) create like
+    /// any create's, checked against the owner's own fields — refused before anything is
+    /// created; a backend that can't merge extras refuses it outright.
+    #[tokio::test]
+    async fn replacement_carries_config_create_extra_json_checked_against_the_owner() {
+        /// The snapshot backend with RunPod v2's create rules.
+        struct V2Owner(Snapshot);
+        #[async_trait]
+        impl Provider for V2Owner {
+            fn name(&self) -> &'static str {
+                "runpod"
+            }
+            fn describe(&self, _spec: &PodSpec) -> String {
+                String::new()
+            }
+            async fn list_pods(&self) -> Result<Vec<Pod>> {
+                Ok(Vec::new())
+            }
+            async fn create_pod(&self, _spec: &PodSpec) -> Result<Pod> {
+                unimplemented!("not exercised")
+            }
+            async fn stop_pod(&self, _id: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn restart_pod(&self, _id: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn terminate_pod(&self, _id: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn pod_spec(&self, id: &str) -> Result<PodSpec> {
+                self.0.pod_spec(id).await
+            }
+            fn check_create_extra(&self, extra: &arena_core::apiextra::Extra) -> Result<()> {
+                arena_core::provider::runpod_v2::RunpodV2Provider::new("k").check_create_extra(extra)
+            }
+        }
+        let owner = V2Owner(Snapshot { name: "runpod", spec: snapshot(&[]) });
+        let ov = SpecOverrides::default();
+        let spec = build_replacement_spec(&cfg(""), &owner, "id-1", "x", &ov).await.unwrap();
+        assert_eq!((spec.api_extra.as_ref(), super::extra_keys_line(&spec)), (None, None));
+        let spec = build_replacement_spec(&cfg(r#"CREATE_EXTRA_JSON='{"dataCenterIds":["EU-RO-1"],"env":{"A":"hf_x"}}'"#), &owner, "id-1", "x", &ov)
+            .await
+            .unwrap();
+        assert_eq!(spec.api_extra.as_ref().unwrap()["dataCenterIds"], serde_json::json!(["EU-RO-1"]));
+        assert_eq!(
+            super::extra_keys_line(&spec).unwrap(),
+            "+ --api-json / CREATE_EXTRA_JSON [dataCenterIds, env] merged into the create request"
+        );
+        for (line, want) in [
+            (r#"CREATE_EXTRA_JSON='{"gpu":{"id":"x"}}'"#, "`gpu.id` is set by arena"),
+            ("CREATE_EXTRA_JSON='nope'", "CREATE_EXTRA_JSON: not valid JSON"),
+        ] {
+            let e = build_replacement_spec(&cfg(line), &owner, "id-1", "x", &ov).await.unwrap_err().to_string();
+            assert!(e.contains(want), "{line}: {e}");
+        }
+        // The plain snapshot backend merges no extras: refused, not silently dropped.
+        let plain = Snapshot { name: "vast", spec: snapshot(&[]) };
+        let e = build_replacement_spec(&cfg(r#"CREATE_EXTRA_JSON='{"price":0.1}'"#), &plain, "id-1", "x", &ov).await.unwrap_err();
+        assert!(e.to_string().contains("isn't supported on provider `vast`"), "{e}");
+    }
+
     #[test]
     fn gpu_flag_policy_checks_with_a_catalog_and_warns_without_one() {
         let catalog = || {
@@ -9720,6 +10393,19 @@ mod replacement_spec_tests {
         assert_eq!(super::checked_gpu(&c, "vast", Some("RTX 3070 typo".into())).await.unwrap().as_deref(), Some("RTX 3070 typo"));
         assert_eq!(super::checked_gpu(&c, "hetzner", None).await.unwrap(), None);
         assert_eq!(super::checked_gpu(&c, "runpod", Some("3070".into())).await.unwrap().as_deref(), Some("3070"));
+        let v2 = cfg("RUNPOD_API=v2\n");
+        assert_eq!(super::live_gpu_catalog(&v2).await.unwrap_err(), "no RUNPOD_API_KEY");
+        assert_eq!(super::checked_gpu(&v2, "runpod", Some("3070".into())).await.unwrap().as_deref(), Some("3070"));
+    }
+
+    /// The tier whose v2 catalog serves the `--gpu` check and `arena gpus`: the configured
+    /// one (any spelling) — so a plain create's price book reuses that fetch — else COMMUNITY.
+    #[test]
+    fn v2_catalog_tier_follows_the_configured_cloud() {
+        assert_eq!(super::v2_default_cloud(&cfg("")), "COMMUNITY");
+        assert_eq!(super::v2_default_cloud(&cfg("CLOUD_TYPE=secure\n")), "SECURE");
+        assert_eq!(super::v2_default_cloud(&cfg("RUNPOD_CLOUD_TYPE=COMMUNITY\n")), "COMMUNITY");
+        assert_eq!(super::v2_default_cloud(&cfg("CLOUD_TYPE=ALL\n")), "COMMUNITY");
     }
 }
 
@@ -10844,6 +11530,20 @@ mod tests {
         // `config check` never shows secret values — not even a key pasted into RUNPOD_API.
         let (line, ok) = runpod_api_row(&Config::parse("RUNPOD_API=rpa_SECRETKEY123"));
         assert!(!ok && line.contains("✗") && !line.contains("SECRETKEY"), "{line}");
+    }
+
+    /// `config check` shows CREATE_EXTRA_JSON's keys (never its values) and fails a value
+    /// that isn't one JSON object.
+    #[test]
+    fn config_check_create_extra_row() {
+        use super::{create_extra_row, Config};
+        assert_eq!(create_extra_row(&Config::parse("RUNPOD_API_KEY=k")), None);
+        let (line, ok) = create_extra_row(&Config::parse(r#"CREATE_EXTRA_JSON='{"dataCenterIds":["EU-RO-1"],"env":{"T":"hf_SECRET"}}'"#)).unwrap();
+        assert!(ok && line.contains("✓") && line.contains("keys [dataCenterIds, env]") && !line.contains("SECRET"), "{line}");
+        let (line, ok) = create_extra_row(&Config::parse("CREATE_EXTRA_JSON='[\"hf_SECRET\"]'")).unwrap();
+        assert!(!ok && line.contains("✗") && line.contains("must be a JSON object") && !line.contains("SECRET"), "{line}");
+        let (line, ok) = create_extra_row(&Config::parse("CREATE_EXTRA_JSON=")).unwrap();
+        assert!(ok && line.contains("(empty)"), "{line}");
     }
 
     #[test]
@@ -12300,6 +13000,7 @@ mod proxy_deploy_tests {
             volume: None,
             image: None,
             bootstrap: false,
+            api_json: None,
             skip_proxy: false,
             dry_run: false,
             keep_trying: false,
@@ -12401,6 +13102,7 @@ mod placement_cli_tests {
             volume: None,
             image: None,
             bootstrap: false,
+            api_json: None,
             skip_proxy: true,
             dry_run: false,
             keep_trying: false,
@@ -12612,6 +13314,7 @@ mod placement_cli_tests {
             volume: None,
             image: None,
             bootstrap: false,
+            api_json: None,
             dry_run: true,
             no_wait: false,
             keep_trying: false,
@@ -12620,6 +13323,7 @@ mod placement_cli_tests {
             no_setup: false,
             check: true,
             check_attempts: 2,
+            lock: false,
             timeout: 600,
             interval: 12,
         };
@@ -12643,6 +13347,7 @@ mod placement_cli_tests {
             volume: None,
             image: None,
             bootstrap: false,
+            api_json: None,
             dry_run: false,
             no_wait: true,
             keep_trying: false,
@@ -12651,6 +13356,7 @@ mod placement_cli_tests {
             no_setup: true,
             check: false,
             check_attempts: 2,
+            lock: false,
             timeout: 600,
             interval: 12,
         };
@@ -13953,9 +14659,10 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
 #[cfg(test)]
 mod lifecycle_tests {
     use super::{
-        disk_fate, handle_pods, handle_rename, handle_restart, handle_terminate, plan_csv_move, rename_followup_steps,
-        rename_report, repo_on_volume, rewrite_name_files, stop_lines, wipe_refusal, Cli, Cmd, CsvMove, DiskFate,
-        DiskOp, KeyBook, PlannedRename, PodCmd, RenameRequest, RestartOpts, SettleWait,
+        disk_fate, handle_pods, handle_rename, handle_restart, handle_terminate, migrate_cutover_on, migrate_finish_on,
+        plan_csv_move, rename_followup_steps, rename_report, replace_on, repo_on_volume, rewrite_name_files, stop_lines,
+        take_would_refuse, wipe_refusal, Cli, Cmd, CsvMove, DiskFate, DiskOp, KeyBook, PlannedRename, PodCmd,
+        RenameRequest, ReplaceOpts, RestartOpts, SettleWait, SpecOverrides, TerminateOpts, LOCKED_REPLACEMENT_NOTE,
     };
     use arena_core::openrouter::{CreatedKey, KeyApi, KeyInfo};
     use arena_core::remote::{FakeRemote, FakeReply, RemoteCall, PROBE_TIMEOUT};
@@ -13967,6 +14674,11 @@ mod lifecycle_tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    /// `pods terminate`'s switches without `--unlock` (most tests), positionally as before.
+    fn topts(revoke_key: bool, skip_proxy: bool, dry_run: bool, yes: bool) -> TerminateOpts {
+        TerminateOpts { unlock: false, revoke_key, skip_proxy, dry_run, yes }
+    }
+
     /// A fleet that records every mutation and applies renames/terminates to its listing.
     struct Fleet {
         pods: Mutex<Vec<Pod>>,
@@ -13977,11 +14689,36 @@ mod lifecycle_tests {
         no_spec: Vec<&'static str>,
         /// Pod ids whose provider rename fails (stopping a batch part-way).
         fail_rename: Vec<&'static str>,
+        /// Pod ids the API holds locked — what it refuses stop/restart/terminate on with the
+        /// recorded 400. Starts as the listing's locked pods; a test adds one the listing
+        /// doesn't show (locked since). `set_locked` keeps both in step.
+        server_locked: Mutex<Vec<String>>,
+        /// Pod ids whose rename the API refuses as locked (unverified live — see `lock`).
+        rename_locked: Vec<&'static str>,
+        /// Pod ids whose unlock fails.
+        fail_unlock: Vec<&'static str>,
     }
 
     impl Fleet {
         fn new(pods: Vec<Pod>) -> Self {
-            Self { pods: Mutex::new(pods), calls: Mutex::default(), volumes: vec![], no_spec: vec![], fail_rename: vec![] }
+            let server_locked = Mutex::new(pods.iter().filter(|p| p.locked == Some(true)).map(|p| p.id.clone()).collect());
+            Self {
+                pods: Mutex::new(pods),
+                calls: Mutex::default(),
+                volumes: vec![],
+                no_spec: vec![],
+                fail_rename: vec![],
+                server_locked,
+                rename_locked: vec![],
+                fail_unlock: vec![],
+            }
+        }
+        /// Refuse `ctx` on `id` as the API does a locked pod's.
+        fn refuse_locked(&self, id: &str, ctx: &str) -> Result<()> {
+            if self.server_locked.lock().unwrap().iter().any(|l| l == id) {
+                return Err(recorded_locked(ctx));
+            }
+            Ok(())
         }
         fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
@@ -14006,12 +14743,14 @@ mod lifecycle_tests {
             unimplemented!("not exercised by lifecycle tests")
         }
         async fn stop_pod(&self, id: &str) -> Result<()> {
+            self.refuse_locked(id, "stop pod")?;
             self.record(format!("stop {id}"));
             Ok(())
         }
         /// Like a real container reset, the restarted pod comes back on a NEW endpoint (port
         /// +1000): setup reaching the new one proves it ran after the restart, not before.
         async fn restart_pod(&self, id: &str) -> Result<()> {
+            self.refuse_locked(id, "restart pod")?;
             self.record(format!("restart {id}"));
             for p in self.pods.lock().unwrap().iter_mut().filter(|p| p.id == id) {
                 p.ssh_port = p.ssh_port.map(|port| port + 1000);
@@ -14019,13 +14758,38 @@ mod lifecycle_tests {
             Ok(())
         }
         async fn terminate_pod(&self, id: &str) -> Result<()> {
+            self.refuse_locked(id, "terminate pod")?;
             self.record(format!("terminate {id}"));
             self.pods.lock().unwrap().retain(|p| p.id != id);
+            Ok(())
+        }
+        fn lock_support(&self, pod: &Pod) -> Result<()> {
+            match pod.provider.as_str() {
+                "runpod" => Ok(()),
+                other => Err(Error::NotImplemented(format!("not supported on {other} — only RunPod pods can be locked, with RUNPOD_API=v2"))),
+            }
+        }
+        async fn set_locked(&self, id: &str, locked: bool) -> Result<()> {
+            if !locked && self.fail_unlock.contains(&id) {
+                return Err(Error::provider("unlock pod HTTP 500 Internal Server Error: boom"));
+            }
+            self.record(format!("lock {id} {locked}"));
+            let mut server = self.server_locked.lock().unwrap();
+            server.retain(|l| l != id);
+            if locked {
+                server.push(id.to_string());
+            }
+            for p in self.pods.lock().unwrap().iter_mut().filter(|p| p.id == id) {
+                p.locked = Some(locked);
+            }
             Ok(())
         }
         async fn rename_pod(&self, id: &str, new_name: &str) -> Result<()> {
             if self.fail_rename.contains(&id) {
                 return Err(Error::provider("rename refused"));
+            }
+            if self.rename_locked.contains(&id) {
+                return Err(recorded_locked("rename pod"));
             }
             self.record(format!("rename {id} {new_name}"));
             for p in self.pods.lock().unwrap().iter_mut().filter(|p| p.id == id) {
@@ -14454,20 +15218,20 @@ mod lifecycle_tests {
         let keys = FakeKeys::with(&[("h-a", "devtest-alpha"), ("h-a2", "devtest-alpha"), ("h-b", "devtest-bravo")]);
         let book = KeyBook::new(&csv, Some(&keys));
         let f = fleet();
-        handle_terminate(&f, &cfg, &book, Some("alpha"), true, true, false, true).await.unwrap();
+        handle_terminate(&f, &cfg, &book, Some("alpha"), topts(true, true, false, true)).await.unwrap();
         assert_eq!(f.calls(), ["terminate r-alpha"]);
         // Every key named after the machine is revoked; its row dropped, the others kept.
         assert_eq!(keys.calls(), ["delete h-a", "delete h-a2"]);
         assert_eq!(cohort_csv(&dir.0), "# OpenRouter API keys — arena iteration: devtest\ndevtest-bravo,sk-b\n");
         // A machine with no key and no row: terminated, nothing to revoke — not a failure.
-        handle_terminate(&f, &cfg, &book, Some("charlie"), true, true, false, true).await.unwrap();
+        handle_terminate(&f, &cfg, &book, Some("charlie"), topts(true, true, false, true)).await.unwrap();
         assert_eq!(f.calls(), ["terminate r-alpha", "terminate r-charlie"]);
         assert_eq!(keys.calls().len(), 2);
         // A dry run touches nothing, on either side.
-        handle_terminate(&f, &cfg, &book, Some("bravo"), true, true, true, true).await.unwrap();
+        handle_terminate(&f, &cfg, &book, Some("bravo"), topts(true, true, true, true)).await.unwrap();
         assert_eq!((f.calls().len(), keys.calls().len()), (2, 2));
         // Without --revoke-key the key and row stay.
-        handle_terminate(&f, &cfg, &book, Some("bravo"), false, true, false, true).await.unwrap();
+        handle_terminate(&f, &cfg, &book, Some("bravo"), topts(false, true, false, true)).await.unwrap();
         assert!(cohort_csv(&dir.0).contains("devtest-bravo,sk-b") && keys.names() == ["devtest-bravo"]);
     }
 
@@ -14481,7 +15245,7 @@ mod lifecycle_tests {
         let f = fleet();
         super::sync_proxy(&cfg, &f, "test setup").await; // forwards for the fleet, to see them go
         assert!(proxy_file(&dir.0).contains("name=devtest-alpha"));
-        let e = handle_terminate(&f, &cfg, &book, None, true, false, false, true).await.unwrap_err().to_string();
+        let e = handle_terminate(&f, &cfg, &book, None, topts(true, false, false, true)).await.unwrap_err().to_string();
         // Every pod went, bravo's revoke failed: named, non-zero, and its row is kept as the
         // record that the key still works.
         assert_eq!(f.calls().len(), 4, "{:?}", f.calls());
@@ -14499,7 +15263,7 @@ mod lifecycle_tests {
     async fn revoke_key_without_a_provisioning_key_is_refused_before_anything() {
         let dir = tmpdir("terminate-nokey");
         let f = fleet();
-        let e = handle_terminate(&f, &cfg(&dir.0), &no_api(&dir.0.join("k.csv")), Some("alpha"), true, true, false, true)
+        let e = handle_terminate(&f, &cfg(&dir.0), &no_api(&dir.0.join("k.csv")), Some("alpha"), topts(true, true, false, true))
             .await
             .unwrap_err()
             .to_string();
@@ -14526,16 +15290,16 @@ mod lifecycle_tests {
             f
         };
         let f = twins();
-        handle_terminate(&f, &cfg, &book, Some("r-alpha-dup"), true, true, true, true).await.unwrap(); // dry run
+        handle_terminate(&f, &cfg, &book, Some("r-alpha-dup"), topts(true, true, true, true)).await.unwrap(); // dry run
         assert!(f.calls().is_empty() && keys.calls().is_empty());
-        handle_terminate(&f, &cfg, &book, Some("r-alpha-dup"), true, true, false, true).await.unwrap();
+        handle_terminate(&f, &cfg, &book, Some("r-alpha-dup"), topts(true, true, false, true)).await.unwrap();
         assert_eq!(f.calls(), ["terminate r-alpha-dup"]);
         assert!(keys.calls().is_empty(), "the survivor's key is kept: {:?}", keys.calls());
         assert!(cohort_csv(&dir.0).contains("devtest-alpha,sk-a"), "and so is its row");
         // --all with both twins going: the shared key is revoked ONCE (not a second delete
         // of a hash already gone, which the real API would fail).
         let f = twins();
-        handle_terminate(&f, &cfg, &book, None, true, true, false, true).await.unwrap();
+        handle_terminate(&f, &cfg, &book, None, topts(true, true, false, true)).await.unwrap();
         assert_eq!(keys.calls(), ["delete h-a"]);
         assert!(!cohort_csv(&dir.0).contains("devtest-alpha"));
     }
@@ -14550,7 +15314,7 @@ mod lifecycle_tests {
         let keys = FakeKeys::with(&[("h-v", "devtest-vast-777"), ("h-b", "devtest-bravo")]);
         let book = KeyBook::new(&csv, Some(&keys));
         let f = Fleet::new(vec![pod("v-777", "vast-777", "vast", None)]);
-        handle_terminate(&f, &cfg, &book, Some("vast-777"), true, true, false, true).await.unwrap();
+        handle_terminate(&f, &cfg, &book, Some("vast-777"), topts(true, true, false, true)).await.unwrap();
         assert_eq!(keys.calls(), ["delete h-v"]);
         assert_eq!(cohort_csv(&dir.0), "# OpenRouter API keys — arena iteration: devtest\ndevtest-bravo,sk-b\n");
     }
@@ -14565,7 +15329,7 @@ mod lifecycle_tests {
         let keys = FakeKeys::with(&[("h-b", "devtest-bravo")]);
         let book = KeyBook::new(&csv, Some(&keys));
         let f = fleet();
-        handle_terminate(&f, &cfg, &book, Some("alpha"), true, true, false, true).await.unwrap();
+        handle_terminate(&f, &cfg, &book, Some("alpha"), topts(true, true, false, true)).await.unwrap();
         assert!(keys.calls().is_empty());
         assert_eq!(cohort_csv(&dir.0), "# OpenRouter API keys — arena iteration: devtest\ndevtest-bravo,sk-b\n");
     }
@@ -14583,7 +15347,7 @@ mod lifecycle_tests {
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
         std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o555)).unwrap();
         let f = fleet();
-        let r = handle_terminate(&f, &cfg, &book, Some("alpha"), true, true, false, true).await;
+        let r = handle_terminate(&f, &cfg, &book, Some("alpha"), topts(true, true, false, true)).await;
         std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
         let e = r.unwrap_err().to_string();
@@ -14808,6 +15572,379 @@ mod lifecycle_tests {
         assert!(matches!(pods_cmd(&["stop", "alpha", "--wipe-ok"]), PodCmd::Stop { wipe_ok: true, .. }));
         assert!(matches!(pods_cmd(&["terminate", "alpha", "--revoke-key"]), PodCmd::Terminate { revoke_key: true, all: false, .. }));
         assert!(matches!(pods_cmd(&["terminate", "--all", "--revoke-key"]), PodCmd::Terminate { revoke_key: true, all: true, .. }));
+        assert!(matches!(pods_cmd(&["terminate", "--all", "--unlock"]), PodCmd::Terminate { unlock: true, all: true, .. }));
+        assert!(matches!(pods_cmd(&["terminate", "alpha"]), PodCmd::Terminate { unlock: false, .. }));
+        assert!(matches!(pods_cmd(&["lock", "alpha", "--dry-run"]), PodCmd::Lock { dry_run: true, .. }));
+        assert!(matches!(pods_cmd(&["unlock", "--all"]), PodCmd::Unlock { dry_run: false, .. }));
+    }
+
+    /// The recorded refusal of a locked pod (`locked_stop_refused.json`, live 2026-10-08),
+    /// replayed through the v2 backend's own error classification — exactly what the real
+    /// backend returns for it (`Locked`).
+    fn recorded_locked(ctx: &str) -> Error {
+        let e = arena_core::provider::runpod_v2::recorded::locked_refusal(ctx);
+        assert!(e.is_locked() && e.to_string().contains("HTTP 400") && e.to_string().contains("Pod is locked"), "{e:?}");
+        e
+    }
+
+    /// The fleet with alpha locked (as the v2 listing reports it).
+    fn locked_fleet() -> Fleet {
+        let f = fleet();
+        let mut pods = f.pods.lock().unwrap().clone();
+        pods[0].locked = Some(true);
+        for p in pods.iter_mut().skip(1).filter(|p| p.provider == "runpod") {
+            p.locked = Some(false);
+        }
+        Fleet::new(pods)
+    }
+
+    /// Every lifecycle command refuses a pod the listing reports locked — up front, the
+    /// whole command, before any call (a batch never half-runs) — with the one sentence that
+    /// says how to unlock it. A dry run says it would be refused, and does nothing.
+    #[tokio::test]
+    async fn every_mutating_command_refuses_a_locked_pod_up_front() {
+        let dir = tmpdir("locked-refusals");
+        let cfg = cfg(&dir.0);
+        let hint = "devtest-alpha is locked — `arena pods unlock devtest-alpha` first";
+        // (argv, the refusal)
+        let cases: &[(&[&str], String)] = &[
+            (&["stop", "alpha", "--wipe-ok"], format!("refusing to stop: {hint}")),
+            (&["stop", "--all", "--wipe-ok"], format!("refusing to stop: {hint}")),
+            (&["restart", "alpha", "--wipe-ok"], format!("refusing to restart: {hint}")),
+            (&["reimage", "alpha", "bravo"], format!("refusing to reimage: {hint}")),
+            (&["terminate", "alpha"], format!("refusing to terminate: {hint} — or pass --unlock to lift the lock as part of the terminate")),
+            (&["terminate", "--all"], format!("refusing to terminate: {hint} — or pass --unlock")),
+        ];
+        for (argv, want) in cases {
+            let f = locked_fleet();
+            let e = handle_pods(pods_cmd(argv), &f, Arc::new(FakeRemote::new()), &cfg, true).await.unwrap_err().to_string();
+            assert!(e.contains(want.as_str()), "{argv:?}: `{want}` in {e}");
+            assert!(f.calls().is_empty(), "{argv:?}: nothing touched: {:?}", f.calls());
+            // The dry run says so and changes nothing. (Reimage's needs an image and keys
+            // from config first; its refusal comes before those, as checked above.)
+            if argv[0] == "reimage" {
+                continue;
+            }
+            let mut dry = argv.to_vec();
+            dry.push("--dry-run");
+            take_would_refuse();
+            handle_pods(pods_cmd(&dry), &f, Arc::new(FakeRemote::new()), &cfg, true).await.unwrap();
+            assert!(f.calls().is_empty(), "{dry:?}");
+            let notes = take_would_refuse();
+            assert!(
+                notes.len() == 1 && notes[0].starts_with("(without --dry-run: ") && notes[0].contains(want.as_str()),
+                "{dry:?}: the dry run says it would be refused: {notes:?}"
+            );
+        }
+        // Unlocked pods next to it go ahead as before.
+        let f = locked_fleet();
+        handle_pods(pods_cmd(&["stop", "bravo", "--wipe-ok"]), &f, Arc::new(FakeRemote::new()), &cfg, true).await.unwrap();
+        assert_eq!(f.calls(), ["stop r-bravo"]);
+    }
+
+    /// `replace` (with and without `--keep-old`), `migrate cutover` of a locked original and
+    /// `migrate finish` of a locked `-old`: refused up front with the unlock sentence (plus,
+    /// for the two that retire the pod for a new one, that the new one isn't locked by
+    /// itself) — nothing created, renamed or terminated. The dry run prints the plan and
+    /// says it would be refused, touching nothing either.
+    #[tokio::test]
+    async fn replace_and_migrate_refuse_a_locked_pod() {
+        let dir = tmpdir("locked-replace");
+        // A GPU type for the replacement spec (the fake's pod_spec reports none).
+        let cfg = Config::parse(&format!("{}GPU_TYPE=\"NVIDIA RTX A4000\"\n", cfg_text(&dir.0)));
+        let hint = |name: &str| format!("{name} is locked — `arena pods unlock {name}` first");
+        /// `pods replace <src>` on `f`, `-y`, no proxy.
+        async fn replace(f: &Fleet, cfg: &Config, src: &str, keep_old: bool, dry_run: bool) -> anyhow::Result<()> {
+            let timeouts = arena_core::setup::SetupTimeouts::from_config(cfg, None).unwrap();
+            let opts = ReplaceOpts { keep_old, skip_proxy: true, dry_run, yes: true };
+            let id = f.pods.lock().unwrap().iter().find(|p| p.name == src).unwrap().id.clone();
+            replace_on(Arc::new(FakeRemote::new()), cfg, f, id, src.to_string(), timeouts, &SpecOverrides::default(), opts).await
+        }
+        let want = format!("refusing to replace: {}{LOCKED_REPLACEMENT_NOTE}", hint("devtest-alpha"));
+        for keep_old in [false, true] {
+            // Fleet::create_pod panics: reaching a create fails the test.
+            let f = locked_fleet();
+            let e = replace(&f, &cfg, "devtest-alpha", keep_old, false).await.unwrap_err().to_string();
+            assert_eq!(e, want, "--keep-old={keep_old}");
+            assert!(f.calls().is_empty(), "--keep-old={keep_old}: {:?}", f.calls());
+            take_would_refuse();
+            replace(&f, &cfg, "devtest-alpha", keep_old, true).await.unwrap();
+            assert!(f.calls().is_empty(), "--keep-old={keep_old} (dry run): {:?}", f.calls());
+            assert_eq!(take_would_refuse(), [format!("(without --dry-run: {want})")], "--keep-old={keep_old}");
+        }
+        // An unlocked source gets past the lock check (to the plan; dry run: nothing else).
+        let f = locked_fleet();
+        replace(&f, &cfg, "devtest-bravo", false, true).await.unwrap();
+        assert!(take_would_refuse().is_empty() && f.calls().is_empty());
+
+        // migrate cutover: the original (alpha) locked, its -new built.
+        let f = locked_fleet();
+        f.pods.lock().unwrap().push(pod("r-alpha-new", "devtest-alpha-new", "runpod", Some(("10.0.0.2", 22001))));
+        let pods = f.pods.lock().unwrap().clone();
+        let want = format!("refusing to cut over: {}{LOCKED_REPLACEMENT_NOTE}", hint("devtest-alpha"));
+        let e = migrate_cutover_on(&FakeRemote::new(), &cfg, &f, "devtest-alpha", &pods, true, false, true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(e, want);
+        migrate_cutover_on(&FakeRemote::new(), &cfg, &f, "devtest-alpha", &pods, true, true, true).await.unwrap();
+        assert_eq!(take_would_refuse(), [format!("(without --dry-run: {want})")]);
+        assert!(f.calls().is_empty(), "{:?}", f.calls());
+
+        // migrate finish: the parked -old locked (the live pod isn't).
+        let mut pods = fleet().pods.lock().unwrap().clone();
+        let mut old = pod("r-bravo-old", "devtest-bravo-old", "runpod", None);
+        old.locked = Some(true);
+        pods.push(old);
+        let f = Fleet::new(pods.clone());
+        let want = format!("refusing to terminate: {}", hint("devtest-bravo-old"));
+        let e = migrate_finish_on(&f, "devtest-bravo", &pods, false, true).await.unwrap_err().to_string();
+        assert_eq!(e, want);
+        migrate_finish_on(&f, "devtest-bravo", &pods, true, true).await.unwrap();
+        assert_eq!(take_would_refuse(), [format!("(without --dry-run: {want})")]);
+        assert!(f.calls().is_empty(), "{:?}", f.calls());
+        // Locked since it was listed: the API's refusal reads as the same sentence.
+        let mut unlisted = pods.clone();
+        unlisted.last_mut().unwrap().locked = None;
+        let e = migrate_finish_on(&f, "devtest-bravo", &unlisted, false, true).await.unwrap_err().to_string();
+        assert_eq!(e, format!("terminating devtest-bravo-old: {}", hint("devtest-bravo-old")));
+        assert!(f.calls().is_empty());
+        // Unlocked: it goes.
+        f.server_locked.lock().unwrap().clear();
+        migrate_finish_on(&f, "devtest-bravo", &unlisted, false, true).await.unwrap();
+        assert_eq!(f.calls(), ["terminate r-bravo-old"]);
+    }
+
+    /// A pod locked since it was listed (or on a backend whose listing doesn't say): the
+    /// API's recorded 400 reads as the same sentence — for restart, terminate and rename.
+    #[tokio::test]
+    async fn the_apis_locked_refusal_reads_as_the_unlock_hint() {
+        let dir = tmpdir("locked-api");
+        let cfg = cfg(&dir.0);
+        let hint = "devtest-bravo is locked — `arena pods unlock devtest-bravo` first";
+        let f = fleet();
+        f.server_locked.lock().unwrap().push("r-bravo".into());
+        let e = handle_pods(pods_cmd(&["terminate", "bravo", "--skip-proxy"]), &f, Arc::new(FakeRemote::new()), &cfg, true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains(hint), "{e}");
+        let restart = handle_pods(
+            pods_cmd(&["restart", "bravo", "--wipe-ok", "--no-setup", "--skip-proxy"]),
+            &f,
+            Arc::new(FakeRemote::new()),
+            &cfg,
+            true,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(restart.contains(hint), "{restart}");
+        let e = handle_pods(pods_cmd(&["stop", "bravo", "--wipe-ok"]), &f, Arc::new(FakeRemote::new()), &cfg, true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("1 pod(s) failed to stop"), "{e}");
+        assert!(f.calls().is_empty(), "{:?}", f.calls());
+        // Rename: allowed on a locked pod by the spec's wording (assumed — see `lock`), so
+        // it isn't refused up front; if the API refuses it after all, it reads the same.
+        let f = locked_fleet();
+        let book = no_api(&dir.0.join("none.csv"));
+        handle_rename(&f, Arc::new(FakeRemote::new()), &cfg, &book, one("alpha", "echo"), true, false, true).await.unwrap();
+        assert_eq!(f.calls(), ["rename r-alpha devtest-echo"]);
+        let mut f = locked_fleet();
+        f.rename_locked = vec!["r-bravo"];
+        let e = handle_rename(&f, Arc::new(FakeRemote::new()), &cfg, &book, one("bravo", "echo"), true, false, true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains(hint), "{e}");
+    }
+
+    /// `terminate --unlock` (the end-of-program `--all --unlock`): each locked pod is
+    /// unlocked right before its own terminate, the others just terminated; one whose unlock
+    /// fails is NOT terminated. Never without the flag (see the refusals above).
+    #[tokio::test]
+    async fn terminate_unlock_lifts_each_lock_right_before_its_terminate() {
+        let dir = tmpdir("terminate-unlock");
+        let cfg = cfg(&dir.0);
+        let f = locked_fleet();
+        handle_pods(pods_cmd(&["terminate", "--all", "--unlock", "--skip-proxy"]), &f, Arc::new(FakeRemote::new()), &cfg, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            f.calls(),
+            ["lock r-alpha false", "terminate r-alpha", "terminate r-bravo", "terminate r-charlie", "terminate h-delta"]
+        );
+        // A failed unlock: that pod stays (locked), and the command says so.
+        let mut f = locked_fleet();
+        f.fail_unlock = vec!["r-alpha"];
+        let e = handle_pods(pods_cmd(&["terminate", "alpha", "--unlock", "--skip-proxy"]), &f, Arc::new(FakeRemote::new()), &cfg, true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("devtest-alpha: unlocking failed, so it was NOT terminated"), "{e}");
+        assert!(f.calls().is_empty(), "{:?}", f.calls());
+        // --unlock on a pod that isn't locked: just the terminate.
+        let f = locked_fleet();
+        handle_pods(pods_cmd(&["terminate", "bravo", "--unlock", "--skip-proxy"]), &f, Arc::new(FakeRemote::new()), &cfg, true)
+            .await
+            .unwrap();
+        assert_eq!(f.calls(), ["terminate r-bravo"]);
+    }
+
+    /// The fleet with alpha locked, plus two locked boxes that aren't the cohort's on the same
+    /// account: `solo-gpu` (the `@solo-gpu` staff entry) and `james-gpu` (off the list).
+    fn fleet_with_locked_staff() -> Fleet {
+        let mut pods = locked_fleet().pods.lock().unwrap().clone();
+        for (id, name) in [("r-solo", "solo-gpu"), ("r-james", "james-gpu")] {
+            let mut p = pod(id, name, "runpod", Some(("10.0.0.1", 22009)));
+            p.locked = Some(true);
+            pods.push(p);
+        }
+        Fleet::new(pods)
+    }
+
+    /// `--all --unlock` (the end-of-program one-liner) lifts only the cohort's locks: a locked
+    /// staff box and a locked pod off the list are KEPT — never unlocked, never terminated —
+    /// the cohort goes, and the exit fails naming them. Said up front in the dry run. Named
+    /// alone, a staff box is the operator's explicit choice: unlocked and terminated.
+    #[tokio::test]
+    async fn terminate_all_unlock_never_unlocks_a_box_that_isnt_the_cohorts() {
+        let dir = tmpdir("terminate-unlock-staff");
+        let cfg = cfg(&dir.0);
+        let f = fleet_with_locked_staff();
+        let e = handle_pods(pods_cmd(&["terminate", "--all", "--unlock", "--skip-proxy"]), &f, Arc::new(FakeRemote::new()), &cfg, true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            f.calls(),
+            ["lock r-alpha false", "terminate r-alpha", "terminate r-bravo", "terminate r-charlie", "terminate h-delta"],
+            "the staff box and the off-list pod: no unlock, no terminate"
+        );
+        assert!(
+            e.contains("james-gpu, solo-gpu KEPT, not terminated: locked, and not this cohort's (`devtest-…`)")
+                && e.contains("`arena pods terminate james-gpu --unlock`"),
+            "{e}"
+        );
+        let left: Vec<String> = f.pods.lock().unwrap().iter().map(|p| p.name.clone()).collect();
+        assert_eq!(left, ["solo-gpu", "james-gpu"]);
+        assert_eq!(*f.server_locked.lock().unwrap(), ["r-solo", "r-james"], "still locked");
+
+        // The dry run says so, and does nothing.
+        let f = fleet_with_locked_staff();
+        take_would_refuse();
+        handle_pods(pods_cmd(&["terminate", "--all", "--unlock", "--dry-run"]), &f, Arc::new(FakeRemote::new()), &cfg, true)
+            .await
+            .unwrap();
+        assert!(f.calls().is_empty(), "{:?}", f.calls());
+        let notes = take_would_refuse();
+        assert!(
+            notes.len() == 1 && notes[0].contains("james-gpu, solo-gpu KEPT, not terminated") && notes[0].ends_with("the exit fails)"),
+            "{notes:?}"
+        );
+
+        // Without --unlock the whole command is refused, and the refusal says --unlock
+        // wouldn't take those two either.
+        let e = handle_pods(pods_cmd(&["terminate", "--all"]), &f, Arc::new(FakeRemote::new()), &cfg, true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("refusing to terminate: devtest-alpha, james-gpu, solo-gpu are locked"), "{e}");
+        assert!(e.contains("(with --all it unlocks only the cohort's: james-gpu, solo-gpu would be KEPT, locked"), "{e}");
+        assert!(f.calls().is_empty());
+
+        // Only kept pods left: nothing is touched, and it fails.
+        let f = fleet_with_locked_staff();
+        f.pods.lock().unwrap().retain(|p| !p.name.starts_with("devtest-"));
+        let e = handle_pods(pods_cmd(&["terminate", "--all", "--unlock"]), &f, Arc::new(FakeRemote::new()), &cfg, true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("KEPT, not terminated"), "{e}");
+        assert!(f.calls().is_empty());
+
+        // Named on its own: the operator's choice — unlocked, then terminated.
+        for target in ["solo-gpu", "james-gpu"] {
+            let f = fleet_with_locked_staff();
+            handle_pods(pods_cmd(&["terminate", target, "--unlock", "--skip-proxy"]), &f, Arc::new(FakeRemote::new()), &cfg, true)
+                .await
+                .unwrap();
+            let id = if target == "solo-gpu" { "r-solo" } else { "r-james" };
+            assert_eq!(f.calls(), [format!("lock {id} false"), format!("terminate {id}")]);
+        }
+    }
+
+    /// A pod locked after the listing (it said unlocked): under `--unlock` the API's Locked
+    /// refusal is the lock the operator asked to lift — unlocked, terminated on the one retry.
+    /// Never for a box `--all --unlock` mustn't unlock, and never without the flag (the hint).
+    #[tokio::test]
+    async fn terminate_unlock_lifts_a_lock_taken_since_the_listing() {
+        let dir = tmpdir("terminate-unlock-race");
+        let cfg = cfg(&dir.0);
+        let f = fleet();
+        f.server_locked.lock().unwrap().push("r-bravo".into());
+        handle_pods(pods_cmd(&["terminate", "bravo", "--unlock", "--skip-proxy"]), &f, Arc::new(FakeRemote::new()), &cfg, true)
+            .await
+            .unwrap();
+        assert_eq!(f.calls(), ["lock r-bravo false", "terminate r-bravo"]);
+
+        // --all --unlock: the cohort pod is unlocked and goes; an off-list box locked since
+        // the listing is NOT unlocked — it fails with the hint, the rest still go.
+        let f = fleet();
+        f.pods.lock().unwrap().push(pod("r-james", "james-gpu", "runpod", None));
+        f.server_locked.lock().unwrap().extend(["r-bravo".to_string(), "r-james".to_string()]);
+        let e = handle_pods(pods_cmd(&["terminate", "--all", "--unlock", "--skip-proxy"]), &f, Arc::new(FakeRemote::new()), &cfg, true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("1 pod(s) failed to terminate"), "{e}");
+        assert_eq!(
+            f.calls(),
+            ["terminate r-alpha", "lock r-bravo false", "terminate r-bravo", "terminate r-charlie", "terminate h-delta"],
+        );
+        assert!(f.pods.lock().unwrap().iter().any(|p| p.name == "james-gpu"));
+
+        // The retried unlock fails: not terminated, said so.
+        let mut f = fleet();
+        f.fail_unlock = vec!["r-bravo"];
+        f.server_locked.lock().unwrap().push("r-bravo".into());
+        let e = handle_pods(pods_cmd(&["terminate", "bravo", "--unlock", "--skip-proxy"]), &f, Arc::new(FakeRemote::new()), &cfg, true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("devtest-bravo: locked since it was listed, and unlocking failed, so it was NOT terminated"), "{e}");
+        assert!(f.calls().is_empty(), "{:?}", f.calls());
+    }
+
+    /// `pods lock`/`unlock`: the lockable pods are (un)locked, one already in that state is
+    /// left alone, one on a backend that can't lock is reported and fails the exit. A dry
+    /// run and an unscoped selection change nothing.
+    #[tokio::test]
+    async fn lock_and_unlock_act_on_what_can_be_locked_and_fail_on_the_rest() {
+        let dir = tmpdir("lock-cmd");
+        let cfg = cfg(&dir.0);
+        let f = locked_fleet();
+        let run = |argv: &'static [&'static str]| handle_pods(pods_cmd(argv), &f, Arc::new(FakeRemote::new()), &cfg, true);
+        let e = run(&["lock", "alpha", "bravo", "delta"]).await.unwrap_err().to_string();
+        assert!(e.contains("1 pod(s) can't be locked: devtest-delta"), "{e}");
+        assert_eq!(f.calls(), ["lock r-bravo true"], "alpha already was; delta can't be");
+        run(&["lock", "bravo"]).await.unwrap();
+        assert_eq!(f.calls().len(), 1, "already locked: nothing sent");
+        run(&["unlock", "bravo", "--dry-run"]).await.unwrap();
+        assert_eq!(f.calls().len(), 1);
+        run(&["unlock", "alpha", "bravo"]).await.unwrap();
+        assert_eq!(f.calls(), ["lock r-bravo true", "lock r-alpha false", "lock r-bravo false"]);
+        let e = run(&["lock", "delta"]).await.unwrap_err().to_string();
+        assert!(e.contains("can't be locked: devtest-delta (leave other providers' pods out with --on runpod)"), "{e}");
+        run(&["lock", "delta", "--dry-run"]).await.unwrap(); // says it would fail; changes nothing
+        let e = run(&["lock"]).await.unwrap_err().to_string();
+        assert!(e.contains("name the pods to lock"), "{e}");
+        assert_eq!(f.calls().len(), 3);
+        // The listing now says unlocked: a stop goes through again.
+        run(&["stop", "alpha", "--wipe-ok"]).await.unwrap();
+        assert_eq!(f.calls().last().unwrap(), "stop r-alpha");
     }
 }
 
@@ -15169,5 +16306,250 @@ mod snapshot_tests {
         cfg.values.insert("SSH_PROXY_HOST".into(), "proxy.example".into());
         let (snap, _) = collect_snapshot(&fleet(), &cfg, 1_791_460_800, all_up()).await.unwrap();
         assert!(snap.pods.iter().all(|p| p.proxy == ProxyState::Unknown));
+    }
+}
+
+/// `--api-json` / `CREATE_EXTRA_JSON` on `create`/`up`, and `arena api get`: everything is
+/// checked before any API call, against the real RunPod v2 rules (pure), and the dry run
+/// shows the merged body with its secrets redacted.
+#[cfg(test)]
+mod passthrough_tests {
+    use super::{create_body_text, first_create_spec, handle_api, handle_pods, spec_with_overrides, ApiCmd, Cli, Cmd, PodCmd, SpecOverrides};
+    use arena_core::provider::runpod_v2::RunpodV2Provider;
+    use arena_core::remote::FakeRemote;
+    use arena_core::{Config, Pod, PodSpec, Provider, Result};
+    use async_trait::async_trait;
+    use clap::Parser;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// A RunPod v2 account with no pods: the create-body rules and preview are the real v2
+    /// backend's (pure — no request), lists are counted, creates are recorded (with the body
+    /// the real backend would build for them), and anything else that would change the fleet
+    /// panics.
+    struct V2Shape {
+        rules: RunpodV2Provider,
+        lists: AtomicUsize,
+        bodies: std::sync::Mutex<Vec<serde_json::Value>>,
+    }
+
+    impl V2Shape {
+        fn new() -> Self {
+            Self { rules: RunpodV2Provider::new("k"), lists: AtomicUsize::new(0), bodies: Default::default() }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for V2Shape {
+        fn name(&self) -> &'static str {
+            "runpod"
+        }
+        fn describe(&self, spec: &PodSpec) -> String {
+            self.rules.describe(spec)
+        }
+        async fn list_pods(&self) -> Result<Vec<Pod>> {
+            self.lists.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+        async fn create_pod(&self, spec: &PodSpec) -> Result<Pod> {
+            self.bodies.lock().unwrap().push(self.rules.preview_create_body(spec)?);
+            Ok(Pod { id: format!("id-{}", spec.name), name: spec.name.clone(), provider: "runpod".into(), ..Default::default() })
+        }
+        async fn stop_pod(&self, _id: &str) -> Result<()> {
+            panic!("no stop")
+        }
+        async fn restart_pod(&self, _id: &str) -> Result<()> {
+            panic!("no restart")
+        }
+        async fn terminate_pod(&self, _id: &str) -> Result<()> {
+            panic!("no terminate")
+        }
+        fn check_create_extra(&self, extra: &arena_core::apiextra::Extra) -> Result<()> {
+            self.rules.check_create_extra(extra)
+        }
+        fn preview_create_body(&self, spec: &PodSpec) -> Result<serde_json::Value> {
+            self.rules.preview_create_body(spec)
+        }
+    }
+
+    fn cfg(extra: &str) -> Config {
+        Config::parse(&format!(
+            "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(alpha bravo echo)\nIMAGE=nickypro/arena-env:9.1\n\
+             GPU_TYPE=\"NVIDIA RTX A4000\"\nCLOUD_TYPE=COMMUNITY\nDISK_GB=60\n{extra}"
+        ))
+    }
+
+    fn pods_cmd(argv: &[&str]) -> PodCmd {
+        match Cli::try_parse_from(["arena", "pods"].iter().chain(argv).copied()).map(|c| c.cmd) {
+            Ok(Cmd::Pods(p)) => p,
+            other => panic!("{argv:?}: {:?}", other.err()),
+        }
+    }
+
+    /// A network volume (`mounts.network`) next to the pod volume (`--volume`/VOLUME_GB > 0)
+    /// is a body RunPod v2 answers 400 to: `create`/`up` refuse it once the spec is known —
+    /// the dry run too — before any create or confirm; with `--volume 0` it goes out.
+    #[tokio::test]
+    async fn a_network_volume_next_to_the_pod_volume_is_refused_before_any_create() {
+        let network = r#"{"mounts":{"network":[{"volumeId":"v","path":"/data"}]}}"#;
+        for argv in [
+            &["create", "echo", "--skip-proxy", "--volume", "20", "--api-json", network][..],
+            &["create", "echo", "--dry-run", "--volume", "20", "--api-json", network],
+            &["up", "echo", "--no-setup", "--volume", "20", "--api-json", network],
+            &["up", "echo", "--dry-run", "--volume", "20", "--api-json", network],
+        ] {
+            let fleet = V2Shape::new();
+            let e = handle_pods(pods_cmd(argv), &fleet, Arc::new(FakeRemote::new()), &cfg(""), true)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("replaces the pod volume") && e.contains("pass --volume 0"), "{argv:?}: {e}");
+            assert!(fleet.bodies.lock().unwrap().is_empty(), "{argv:?}: nothing created");
+        }
+        // From config the same (VOLUME_GB under CREATE_EXTRA_JSON).
+        let fleet = V2Shape::new();
+        let line = format!("VOLUME_GB=20\nCREATE_EXTRA_JSON='{network}'");
+        let e = handle_pods(pods_cmd(&["create", "echo", "--skip-proxy"]), &fleet, Arc::new(FakeRemote::new()), &cfg(&line), true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("pass --volume 0"), "{e}");
+        // `--volume 0`: the network volume alone goes out.
+        let fleet = V2Shape::new();
+        handle_pods(
+            pods_cmd(&["create", "echo", "--skip-proxy", "--volume", "0", "--api-json", network]),
+            &fleet,
+            Arc::new(FakeRemote::new()),
+            &cfg("VOLUME_GB=20"),
+            true,
+        )
+        .await
+        .unwrap();
+        let bodies = fleet.bodies.lock().unwrap();
+        assert_eq!(bodies[0]["mounts"], serde_json::json!({"network": [{"volumeId": "v", "path": "/data"}]}));
+    }
+
+    /// Bad JSON, a non-object, or a field arena sets itself — from the flag or from config —
+    /// fails before the fleet is even listed (so before anything is priced or created).
+    #[tokio::test]
+    async fn api_json_is_parsed_and_checked_before_any_api_call() {
+        // (command, config line, the error)
+        let cases: &[(&[&str], &str, &str)] = &[
+            (&["create", "echo", "--api-json", "[1]"], "", "--api-json: must be a JSON object"),
+            (&["up", "echo", "--api-json", "{"], "", "--api-json: not valid JSON"),
+            (&["create", "echo", "--api-json", r#"{"gpu":{"id":"NVIDIA H100"}}"#], "", "`gpu.id` is set by arena (--gpu / GPU_TYPE)"),
+            (&["up", "echo", "--api-json", r#"{"ports":["8888/http"]}"#], "", "must keep \"22/tcp\""),
+            (&["up", "echo", "--api-json", r#"{"locked":true}"#], "", "`pods up --lock`"),
+            (&["create", "echo"], r#"CREATE_EXTRA_JSON='{"name":"x"}'"#, "`name` is set by arena (the machine name)"),
+            (&["create", "echo"], "CREATE_EXTRA_JSON='not json'", "CREATE_EXTRA_JSON: not valid JSON"),
+        ];
+        for (argv, line, want) in cases {
+            let fleet = V2Shape::new();
+            let e = handle_pods(pods_cmd(argv), &fleet, Arc::new(FakeRemote::new()), &cfg(line), true)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(want), "{argv:?} {line}: `{want}` in {e}");
+            assert_eq!(fleet.lists.load(Ordering::SeqCst), 0, "{argv:?}: refused before any API call");
+            assert!(fleet.bodies.lock().unwrap().is_empty(), "{argv:?}: nothing created");
+        }
+        // `up --lock` where the create target can't lock: refused before anything, too.
+        let fleet = V2Shape::new();
+        let e = handle_pods(pods_cmd(&["up", "echo", "--lock"]), &fleet, Arc::new(FakeRemote::new()), &cfg(""), true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.starts_with("--lock: not supported on runpod"), "{e}");
+        assert_eq!(fleet.lists.load(Ordering::SeqCst), 0);
+        // Accepted: listed, previewed, nothing created (dry run).
+        let fleet = V2Shape::new();
+        let ok = r#"{"dataCenterIds":["EU-RO-1"],"globalNetworking":true}"#;
+        handle_pods(pods_cmd(&["up", "echo", "--dry-run", "--api-json", ok]), &fleet, Arc::new(FakeRemote::new()), &cfg(""), true)
+            .await
+            .unwrap();
+        assert_eq!(fleet.lists.load(Ordering::SeqCst), 1);
+    }
+
+    /// A real (confirmed) create sends the backend's body with the extra merged — config
+    /// under the flag, objects key by key (our env and GPU kept) — for every name.
+    #[tokio::test]
+    async fn create_sends_the_merged_body_for_every_name() {
+        let cfg = cfg(r#"CREATE_EXTRA_JSON='{"dataCenterIds":["EU-RO-1"],"env":{"FROM_CFG":"1"}}'"#);
+        let fleet = V2Shape::new();
+        let flag = r#"{"globalNetworking":true,"gpu":{"minRamPerGpu":32}}"#;
+        handle_pods(pods_cmd(&["create", "echo", "bravo", "--skip-proxy", "--api-json", flag]), &fleet, Arc::new(FakeRemote::new()), &cfg, true)
+            .await
+            .unwrap();
+        let bodies = fleet.bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        for (body, name) in bodies.iter().zip(["devtest-echo", "devtest-bravo"]) {
+            assert_eq!(body["name"], name);
+            assert_eq!(body["env"]["MACHINE_NAME"], name, "ours kept");
+            assert_eq!(body["env"]["FROM_CFG"], "1");
+            assert_eq!(body["dataCenterIds"], serde_json::json!(["EU-RO-1"]));
+            assert_eq!(body["globalNetworking"], true);
+            assert_eq!(body["gpu"], serde_json::json!({"id": "NVIDIA RTX A4000", "count": 1, "minRamPerGpu": 32}));
+            assert_eq!(body["cloud"], "COMMUNITY");
+        }
+    }
+
+    /// The dry run's create request: the backend's body with the extra merged — the flag
+    /// over config — and every env value redacted (PUBLIC_KEY's keys, MACHINE_NAME, an extra
+    /// one); nothing at all without extra fields.
+    #[test]
+    fn the_dry_run_shows_the_merged_body_with_secrets_redacted() {
+        let cfg = cfg(r#"CREATE_EXTRA_JSON='{"dataCenterIds":["EU-RO-1"],"env":{"FROM_CFG":"1"}}'"#);
+        let flag = r#"{"dataCenterIds":["US-KS-2"],"env":{"JUPYTER_PASSWORD":"hunter2"},"gpu":{"minRamPerGpu":32}}"#;
+        let extra = arena_core::apiextra::combine(cfg.get("CREATE_EXTRA_JSON"), Some(flag)).unwrap();
+        let mut base = spec_with_overrides(&cfg, &SpecOverrides { api_extra: extra, ..Default::default() });
+        base.env.push(("PUBLIC_KEY".into(), "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAbcdefghijklmnopqrstuvwxyz0123456789 devtest".into()));
+        let spec = first_create_spec(&base, None, "devtest-echo");
+        let text = create_body_text(&V2Shape::new(), &spec).unwrap();
+        for want in [
+            "[dry-run] create request for devtest-echo with --api-json / CREATE_EXTRA_JSON merged",
+            "\"dataCenterIds\": [\n    \"US-KS-2\"\n  ]",
+            "\"minRamPerGpu\": 32",
+            "\"id\": \"NVIDIA RTX A4000\"",
+            "\"FROM_CFG\": \"<redacted>\"",
+            "\"JUPYTER_PASSWORD\": \"<redacted>\"",
+            "\"MACHINE_NAME\": \"<redacted>\"",
+            "\"PUBLIC_KEY\": \"<redacted>\"",
+            "\"cloud\": \"COMMUNITY\"",
+        ] {
+            assert!(text.contains(want), "`{want}` in\n{text}");
+        }
+        assert!(!text.contains("hunter2") && !text.contains("AAAAC3"), "{text}");
+        let plain = spec_with_overrides(&cfg, &SpecOverrides::default());
+        assert_eq!(create_body_text(&V2Shape::new(), &first_create_spec(&plain, None, "devtest-echo")), None);
+    }
+
+    /// `api get`: the path is checked before the key is even read (so before any request),
+    /// an unknown provider and a missing key are refused, and the flags parse.
+    #[tokio::test]
+    async fn api_get_refuses_before_any_request() {
+        let get = |provider: &str, path: &str| ApiCmd::Get { provider: provider.into(), path: path.into(), raw: false };
+        let no_key = cfg("");
+        // (provider, path, the error)
+        for (provider, path, want) in [
+            ("runpod", "https://evil.example/x", "absolute URLs are refused"),
+            ("runpod-v2", "//evil.example/pods", "absolute URLs are refused"),
+            ("vast", "../users/current/", "path segments are refused"),
+            ("lambda", "pods", "unknown provider `lambda`"),
+            ("runpod", "pods", "RUNPOD_API_KEY isn't set"),
+            ("hetzner", "servers", "HETZNER_API_KEY isn't set"),
+        ] {
+            let e = handle_api(get(provider, path), &no_key).await.unwrap_err().to_string();
+            assert!(e.contains(want), "{provider} {path}: `{want}` in {e}");
+        }
+        let with_key = cfg("RUNPOD_API_KEY=rpa_TESTKEY0123456789\n");
+        let e = handle_api(get("runpod", "http://api.runpod.io/v2/pods"), &with_key).await.unwrap_err().to_string();
+        assert!(e.contains("absolute URLs are refused") && !e.contains("rpa_"), "{e}");
+        match Cli::try_parse_from(["arena", "api", "get", "runpod-v2", "pods?limit=5", "--raw"]).unwrap().cmd {
+            Cmd::Api(ApiCmd::Get { provider, path, raw }) => assert_eq!((provider.as_str(), path.as_str(), raw), ("runpod-v2", "pods?limit=5", true)),
+            _ => panic!("not api get"),
+        }
+        // GET is the only verb: there is nothing else to parse.
+        assert!(Cli::try_parse_from(["arena", "api", "post", "runpod", "pods"]).is_err());
+        assert!(Cli::try_parse_from(["arena", "api", "get", "runpod", "pods", "--method", "DELETE"]).is_err());
     }
 }

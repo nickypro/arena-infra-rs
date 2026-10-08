@@ -5,7 +5,7 @@
 //! independent pipelines, never as a batch". Here each pod advances the moment it is
 //! individually ready, and says so:
 //!
-//!   endpoint → proxy sync → setup → [--check: deep check] → API keys → `[name] READY …`
+//!   endpoint → proxy sync → setup → [--check: deep check] → API keys → [--lock] → `[name] READY …`
 //!
 //! or `[name] FAILED <stage>: …` (left running). With `--check` a pod that FAILs the deep
 //! check is terminated — and confirmed gone, so a name never has two pods — then its name is
@@ -120,10 +120,12 @@ pub(crate) struct UpRun<'a> {
     pub check: Option<CheckStage>,
     /// The per-host keys to hand out — only when setup runs and a keys CSV has rows.
     pub keys: Option<KeySources>,
+    /// `--lock`: lock each pod as its last step (checked lockable before the create).
+    pub lock: bool,
 }
 
 /// The per-pod part of `up`'s plan, for the dry-run and the confirm prompt.
-pub(crate) fn pipeline_text(setup: bool, check: Option<u32>, keys: bool) -> String {
+pub(crate) fn pipeline_text(setup: bool, check: Option<u32>, keys: bool, lock: bool) -> String {
     let mut steps = vec!["wait for its SSH endpoint".to_string(), "sync the proxy (if nginx is set up)".to_string()];
     if setup {
         steps.push("provision it".into());
@@ -136,6 +138,9 @@ pub(crate) fn pipeline_text(setup: bool, check: Option<u32>, keys: bool) -> Stri
     }
     if setup && keys {
         steps.push("copy its API keys".into());
+    }
+    if lock {
+        steps.push("lock it (RunPod then refuses stop/restart/terminate until `arena pods unlock`)".into());
     }
     format!("per pod, as soon as it can: {} — then READY/FAILED per pod", steps.join(", "))
 }
@@ -159,6 +164,8 @@ struct NameRun {
     fleet_ssh: Option<String>,
     verdict: Verdict,
     ready_at: Option<Instant>,
+    /// `--lock` locked its pod.
+    locked: bool,
 }
 
 /// Counts a pipeline as waiting on the endpoint poller for as long as it's alive.
@@ -361,6 +368,7 @@ impl Shared<'_, '_> {
             fleet_ssh: None,
             verdict: Verdict::Stopped { stage: Stage::Endpoint },
             ready_at: None,
+            locked: false,
         };
         // Options whose pods failed a check for this name — a replacement tries them last.
         let mut failed_options = Vec::new();
@@ -574,6 +582,22 @@ impl Shared<'_, '_> {
             }
         }
 
+        // 6. --lock: last, once nothing in this run will want to stop or replace the pod —
+        // a lock refuses terminate, which a failed check's replacement needs. Idempotent, so a
+        // throttled or transient failure is retried; a lock that doesn't take fails the name
+        // (the operator asked for a protected pod), the pod left running, unlocked.
+        if self.run.lock {
+            let policy = arena_core::retry::RetryPolicy::default();
+            match self.or_stop(arena_core::retry::retrying(&policy, || self.run.provider.set_locked(&pod.id, true))).await {
+                None => return self.end(run, Verdict::Stopped { stage: Stage::Lock }),
+                Some(Err(e)) => {
+                    let reason = format!("{e} — left running, NOT locked (retry: `arena pods lock {name}`)");
+                    return self.end(run, Verdict::Failed { stage: Stage::Lock, reason });
+                }
+                Some(Ok(())) => run.locked = true,
+            }
+        }
+
         run.ready_at = Some(Instant::now());
         self.end(run, Verdict::Ready)
     }
@@ -590,6 +614,9 @@ impl Shared<'_, '_> {
                 }
                 if let Some(h) = &run.health {
                     what.push(format!("check {}", h.status.label()));
+                }
+                if run.locked {
+                    what.push("locked".into());
                 }
                 let after = run.ready_at.map(|t| pipeline::fmt_elapsed(t - run.first_at)).unwrap_or_default();
                 what.retain(|w| !w.is_empty());
@@ -1055,6 +1082,8 @@ mod tests {
         /// Vast-like machines: while any are left, each create takes the next machine id and
         /// its pod is tagged `vast` (so only that id names its machine, never its IP).
         machines: Mutex<VecDeque<String>>,
+        /// Pod ids whose lock fails (a 500 the retry gives up on would look the same).
+        lock_refused: Mutex<Vec<String>>,
     }
 
     /// A pod in the fake: its endpoint from `from`; listed until `gone_at`.
@@ -1173,6 +1202,13 @@ mod tests {
                 return Err(Error::NotImplemented("no key API".into()));
             }
             self.events.lock().unwrap().push(format!("authorize {} {}", pod.id, keys.len()));
+            Ok(())
+        }
+        async fn set_locked(&self, id: &str, locked: bool) -> CoreResult<()> {
+            if self.lock_refused.lock().unwrap().iter().any(|r| r == id) {
+                return Err(Error::provider("lock pod HTTP 404 Not Found: pod not found"));
+            }
+            self.events.lock().unwrap().push(format!("lock {id} {locked}"));
             Ok(())
         }
         async fn terminate_pod(&self, id: &str) -> CoreResult<()> {
@@ -1300,6 +1336,7 @@ mod tests {
                 cmd: health::deep_check_command(Some("arena-env")),
             }),
             keys: keys.map(|d| KeySources::load(cfg, &d.to_string_lossy(), None, None)).filter(|k| !k.csv.is_empty()),
+            lock: false,
         }
     }
 
@@ -1834,6 +1871,7 @@ mod tests {
             volume: None,
             image: None,
             bootstrap: false,
+            api_json: None,
             dry_run: false,
             no_wait: false,
             keep_trying: false,
@@ -1842,6 +1880,7 @@ mod tests {
             no_setup: false,
             check: true,
             check_attempts: 2,
+            lock: false,
             timeout: 600,
             interval: 10,
         };
@@ -1868,6 +1907,7 @@ mod tests {
             volume: None,
             image: None,
             bootstrap: false,
+            api_json: None,
             dry_run: false,
             no_wait: false,
             keep_trying: false,
@@ -1876,6 +1916,7 @@ mod tests {
             no_setup: false,
             check: true,
             check_attempts: 2,
+            lock: false,
             timeout: 600,
             interval: 10,
         }
@@ -2132,17 +2173,74 @@ mod tests {
         assert!(bloom_ready < refreshed, "{:#?}", lines.all());
     }
 
+    /// `--lock` is the last step: a pod that fails its check is replaced (it was never
+    /// locked, so it could be terminated), and only the pod that ends READY is locked — once.
+    #[tokio::test(start_paused = true)]
+    async fn with_lock_only_the_pod_that_ends_ready_is_locked_after_its_check() {
+        let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 0), ("10.0.0.2", 22002, 30)])]);
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host("10.0.0.1", 22001), [FakeReply::ok(), FakeReply::ok(), bad_host()]);
+        fake.script(&host("10.0.0.2", 22002), [FakeReply::ok(), FakeReply::ok(), healthy()]);
+        let cfg = cfg(None);
+        let mut run = up_run(&fleet, fake.clone(), &cfg, true, Some(2), None).await;
+        run.lock = true;
+        let made = make(&fleet, &["apple"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+        assert_eq!(
+            fleet.events(),
+            [
+                format!("create devtest-apple {A4000}"),
+                "terminate id1".to_string(),
+                format!("create devtest-apple {R3090}"),
+                "lock id2 true".to_string(),
+            ]
+        );
+        lines.find("[devtest-apple] READY after 30s — 1×RTX 3090 COMMUNITY, check pass, locked");
+        assert_eq!(rows[0].verdict, Verdict::Ready);
+    }
+
+    /// A lock that doesn't take fails the name — the operator asked for a protected pod —
+    /// with the pod left running (never terminated over it) and the retry command named.
+    #[tokio::test(start_paused = true)]
+    async fn a_lock_that_fails_fails_the_name_and_leaves_the_pod_running() {
+        let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 0)]), ("bloom", &[("10.0.0.2", 22002, 0)])]);
+        fleet.lock_refused.lock().unwrap().push("id1".into());
+        let fake = Arc::new(FakeRemote::new());
+        let cfg = cfg(None);
+        let mut run = up_run(&fleet, fake.clone(), &cfg, true, None, None).await;
+        run.lock = true;
+        let made = make(&fleet, &["apple", "bloom"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+        match &rows[0].verdict {
+            Verdict::Failed { stage: Stage::Lock, reason } => {
+                assert!(reason.contains("pod not found") && reason.contains("NOT locked"), "{reason}");
+                assert!(reason.contains("`arena pods lock devtest-apple`"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(rows[1].verdict, Verdict::Ready, "bloom is locked and ready on its own");
+        assert!(!fleet.events().iter().any(|e| e.starts_with("terminate")), "{:?}", fleet.events());
+        assert!(fleet.events().contains(&"lock id2 true".to_string()), "{:?}", fleet.events());
+        lines.find("[devtest-apple] FAILED lock: ");
+        assert!(conclude(&rows, &|_, _| {}).is_err(), "a FAILED lock is a non-zero exit");
+    }
+
     #[test]
     fn the_plan_text_names_every_stage_it_will_run() {
+        assert!(pipeline_text(true, None, false, true).contains(
+            "provision it, lock it (RunPod then refuses stop/restart/terminate until `arena pods unlock`) — then READY/FAILED"
+        ));
         assert_eq!(
-            pipeline_text(true, Some(2), true),
+            pipeline_text(true, Some(2), true, false),
             "per pod, as soon as it can: wait for its SSH endpoint, sync the proxy (if nginx is set up), provision it, \
              deep-check it — a pod that FAILs is TERMINATED and its name recreated (up to 2 placement(s) per name; \
              options that haven't failed first; never on a machine IP that already failed), copy its API keys — then \
              READY/FAILED per pod"
         );
         assert_eq!(
-            pipeline_text(false, None, true),
+            pipeline_text(false, None, true, false),
             "per pod, as soon as it can: wait for its SSH endpoint, sync the proxy (if nginx is set up) — then READY/FAILED per pod"
         );
     }
@@ -2156,6 +2254,12 @@ mod tests {
             Cmd::Pods(PodCmd::Up { check, check_attempts, .. }) => assert_eq!((check, check_attempts), (true, 2)),
             _ => panic!("not up"),
         }
+        // --lock needs the pipeline it ends: refused with --no-wait.
+        match parse(&["arena", "pods", "up", "-n", "2", "--lock", "--check"]).unwrap() {
+            Cmd::Pods(PodCmd::Up { lock, .. }) => assert!(lock),
+            _ => panic!("not up"),
+        }
+        assert!(parse(&["arena", "pods", "up", "-n", "2", "--lock", "--no-wait"]).is_err());
         match parse(&["arena", "pods", "up", "-n", "2", "--check", "--check-attempts", "3"]).unwrap() {
             Cmd::Pods(PodCmd::Up { check_attempts, .. }) => assert_eq!(check_attempts, 3),
             _ => panic!("not up"),

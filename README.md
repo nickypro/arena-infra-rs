@@ -24,7 +24,21 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     (`PROVISIONING`/`STARTING`/`RUNNING`/`EXITED`/`ERROR`); the SSH endpoint comes from
     `ssh.direct` only; create always sends `cloud` (v2 defaults to SECURE) and merges the
     account's registered SSH keys into `PUBLIC_KEY` (v2 skips them when it's set);
-    `replace` recovers GPU type + cloud tier. Rename and maintenance still use GraphQL.
+    `replace` recovers GPU type + cloud tier. Rename is `PATCH /v2/pods/{id}` with only
+    `{"name"}` (live-verified restart-free — PID 1, a `/root` marker and the endpoint
+    survive); the GPU catalog, prices, stock and the `--gpu` check come from `GET
+    /v2/catalog/gpus` (each tier fetched once per run). Error bodies: a `422` (e.g.
+    `Unknown GPU type: …`, `Request validation failed.`) is a config error — never capacity,
+    never retried, message kept; a `400 Pod is locked` (stop/restart/terminate on a
+    `locked` pod) is its own `Locked` kind. **Locks** are `PATCH /v2/pods/{id}` with only
+    `{"locked": bool}` (live-verified: the container is untouched); the pod's `locked`
+    field (in every list/GET) says which pods are — `actions` still lists stop/restart/
+    terminate while locked, so it's never read for that. **GraphQL dependency inventory** (GraphQL is
+    reportedly retiring too, "early 2027", unverified) — on v2 it is left only for the
+    maintenance window (`enrich`, best-effort: a failure is one warning line, GPU/$ still
+    shown), the account balance (v2 has billing history only) and, as a fallback after
+    REST v2, `teardown --check`'s volume listing; see the module doc of `runpod_v2.rs`.
+    Contract tests replay scrubbed recorded v2 responses (`provider/fixtures/runpod_v2/`).
     Neither API reports a pod's CUDA constraint, so `replace`/`migrate copy` re-apply the
     configured `ALLOWED_CUDA_VERSIONS` to the replacement (as `create` does).
   - `provider::vast` — Vast.ai REST backend against the same trait. Vast rents
@@ -61,6 +75,16 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
   - `balance` — provider account balances (RunPod GraphQL `myself`, Vast `users/current`;
     Hetzner postpaid) judged against the burn into a runway; `idle` — the read-only
     `pods idle` probe script, its reply parser and the verdict/report (unknown ≠ idle).
+  - `lock` — pod locks (RunPod v2, `Pod::locked`): the one refusal sentence (`devtest-x is
+    locked — `arena pods unlock devtest-x` first`), the up-front refusal over a selection,
+    the mapping of the API's `Locked` error to it, and `pods lock`/`unlock`'s plan.
+  - `apiextra` — `--api-json` / `CREATE_EXTRA_JSON`: parse (one JSON object), deep-merge
+    into a backend's create body, and refuse the fields each backend sets itself (its
+    `MANAGED` table + "ports must keep `22/tcp`").
+  - `apiget` — `arena api get`: the provider API bases, the path guard (relative only;
+    absolute URLs, `//host`, `..`, `#` refused; the built URL re-checked against the base)
+    and secret redaction (env blocks, key/token/password-named fields, `rpa_`/`sk-`/`hf_`
+    tokens, SSH key material, PEM blocks; the API key itself never printed).
   - `proxy` — port-forwarding planner. Pods are reached over SSH (VS Code
     Remote-SSH), and the provider reassigns a pod's SSH endpoint on restart, so the
     proxy host gives each machine a *stable* public port (`cute.sus.cat:7000`, …)
@@ -82,7 +106,7 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     + `HETZNER_*`). `restart`/`terminate` take **one** pod (name, bare name, `@name` or id —
     a name two pods share is refused: pass the id); `stop` takes the shared
     [target selection](#targeting--concurrency).
-    `list` shows NAME PROVIDER ID STATUS GPU (`count×type`) $/H ENDPOINT MAINT (the
+    `list` shows NAME PROVIDER ID STATUS (`run locked` for a locked pod) GPU (`count×type`) $/H ENDPOINT MAINT (the
     host's RunPod maintenance window, e.g. `maint 10-09 02:00→06:00 UTC`; the host's
     free-text note is flattened onto one line) and a footer
     `fleet: $X/h across N billing pod(s)` summing the **billing** pods (Hetzner's € shown
@@ -94,7 +118,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `balance: runpod $32.54 ~65h · vast $136.87 no billing pods · hetzner postpaid` line plus
     any ⚠ (see `balance`), read while the list runs — best-effort, each account within 15 s,
     never failing the list. GPU/$/maintenance come from one extra read-only
-    RunPod GraphQL query per `list` (best-effort: if it fails you get one warning line and
+    RunPod GraphQL query per `list` (on `RUNPOD_API=v2` the REST list already has GPU and $,
+    so GraphQL adds only maintenance) (best-effort: if it fails you get one warning line and
     the list still renders); the `nvidia-smi` probe over SSH (default for the table,
     `--probe`/`--no-probe`) overrides the GPU when a pod answers. `list --json` emits the
     pods incl. `gpu_count`/`cost_per_hr`/`maintenance`. **`restart` WIPES a RunPod pod's
@@ -131,6 +156,48 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     name that already has its own row or key is left alone and warned about), then syncs
     the proxy. The pod's `MACHINE_NAME` env var keeps the old name (env only changes with a
     reimage) — the output says so. `--dry-run` lists every step.
+  - `pods lock [targets]` / `pods unlock [targets]` (targets or `--all`; RunPod with
+    `RUNPOD_API=v2`) — a **locked** pod is refused stop, restart and terminate by RunPod
+    itself, from **any** client (this tool, scripts, RunPod's web console; live-verified
+    2026-10-08) — the protection for a running cohort. Setup, backups, `run` and SSH are
+    unaffected. Already-locked pods are left alone; a pod on a backend that can't lock
+    (v1, Vast, Hetzner) is reported (`not supported — … RUNPOD_API=v2`) and makes the exit
+    non-zero. `pods up --lock` locks each pod as the pipeline's **last** step (after
+    `--check`, whose replacement needs to terminate; a lock that fails is `FAILED lock`, the
+    pod left running, unlocked); `--lock` is refused up front where pods can't be locked.
+    While a pod is locked, `stop` / `restart` / `reimage` / `terminate` / `replace` /
+    `migrate cutover` / `migrate finish` refuse it **up front** — the whole command, before
+    anything is touched — with `devtest-x is locked — `arena pods unlock devtest-x` first`;
+    the API's own `400 Pod is locked` (a pod locked since the listing) reads the same. Nothing
+    unlocks on its own, except **`terminate --unlock`** (e.g. end of program: `pods terminate
+    --all --unlock`), which says so in its confirm text and unlocks each locked pod right
+    before its terminate (a failed unlock = not terminated; a pod locked since the listing is
+    unlocked and retried once). With `--all` it lifts **only the cohort's** locks
+    (`{prefix}-…`): a locked staff/personal box on the same account (`@` entry, or off the
+    list) is **kept** — not unlocked, not terminated — and the exit fails; to remove one, name
+    it alone (`pods terminate james-gpu --unlock`). `rename` is *not* refused: the
+    spec only blocks stop/reset and a rename is restart-free (unverified on a locked pod —
+    if RunPod refuses it, the same sentence says so). `teardown --check` marks locked pods
+    and puts `--unlock` in their fix (on the `--all` line when any provider holds one).
+  - `--api-json '<object>'` on `create`/`up` (plus config `CREATE_EXTRA_JSON`, single-quoted;
+    the flag merges over it): extra fields **deep-merged** into the provider's create body
+    for API options without a flag — e.g. RunPod v2 `{"dataCenterIds":["EU-RO-1"]}`,
+    `{"globalNetworking":true}`, a network volume `{"mounts":{"network":[{"volumeId":"…",
+    "path":"/data"}]}}` (with `--volume 0`: RunPod takes a network volume *or* the pod
+    volume, so one next to `--volume`/`VOLUME_GB` > 0 is refused up front),
+    `{"gpu":{"minRamPerGpu":32}}`; v1 `interruptible`; Vast `price`; Hetzner `labels`/`user_data`. Objects merge key by key (env adds variables), arrays and
+    scalars replace. Fields arena sets itself are **refused before any API call** with what
+    sets them instead (name/label, image, GPU id/count, CUDA, cloud tier, disk,
+    `mounts.persistent`/volume, `env.PUBLIC_KEY`/`MACHINE_NAME`, the start command, `startSsh`,
+    `locked` → `up --lock`, Vast `runtype`/`onstart`, Hetzner type/image/location/keys) — and a
+    template (`templateId`, Vast `template_hash_id`), which would fill those in behind the
+    tool's back, and v1 `computeType` — and so is a `ports` list without `22/tcp`; invalid JSON
+    or a non-object too. `--dry-run` prints the merged body (env values and keys redacted).
+    `config check` shows `CREATE_EXTRA_JSON`'s keys. The **flag** is `create`/`up` only; the
+    **config key** is a create default like `GPU_TYPE`, so it also reaches the TUI's add-pod
+    form and the replacement pod of `replace` / `migrate copy` (their plans list its keys; a
+    refused one stops them before anything is created). It applies to whichever provider
+    creates, so keep it to fields that provider takes (an unknown field is the API's error).
   - `create` also takes **explicit names** (`pods create apple bloom`) and an
     **`--image`** override, alongside `-n`(target total) / `-a`(add). Bare names get
     the configured prefix; names already present are skipped.
@@ -143,15 +210,17 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
   - **`--gpu` is checked** (`create`/`up`/`offers`/`replace`/`migrate copy`, RunPod only):
     each token — an alias (`3070`, `4080super`, `L4`, `2000ada`, `A4500`, …), an exact id
     (any case) or a unique catalog short name (`RTX 3070`, `H100 SXM`) — must be in RunPod's
-    live GPU catalog, else the command stops before anything is created: ``--gpu: `3070x`
+    live GPU catalog (GraphQL on v1, `GET /v2/catalog/gpus` on `RUNPOD_API=v2`), else the
+    command stops before anything is created: ``--gpu: `3070x`
     isn't a RunPod GPU type — did you mean `NVIDIA GeForce RTX 3070` (RTX 3070)?``. If the
     catalog can't be fetched it warns and passes the flag through unchecked. Vast/Hetzner:
     passed through as before.
   - **Multi-option placement** (`create`/`up`): `--gpu A4000,4000Ada,3090 --cloud
     community,secure --max-price 0.5 [--order cheapest|listed]`. The gpu × cloud options
-    are priced (RunPod's live catalog — v2 `/catalog/gpus` per tier on `RUNPOD_API=v2`, else
-    GraphQL — falling back to preset estimates, shown `~`), capped per pod (price × `--gpus`;
-    with a cap an option with no known price is dropped, not risked) and ordered: `cheapest`
+    are priced (RunPod's live catalog — v2 `/catalog/gpus` per tier on `RUNPOD_API=v2`, once
+    per tier per run, GraphQL on v1 — falling back to preset estimates, shown `~`), capped
+    per pod (price × `--gpus`; with a cap an option with no known price is dropped, not
+    risked) and ordered: `cheapest`
     (default; a price tie goes to the better stock hint, then the listed order) or `listed`
     (GPU-major). Stock never filters — creating is the truth. Per name the options are tried
     **one create at a time** (never two creates for one name); a capacity error skips that
@@ -481,11 +550,20 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     has a key (or a CSV row) can still be targeted by name. Dry-runs show each key name and
     whether it exists. `keys which` shows the local keys file. (`copy-keys`
     is the *distributor*; `keys` is the *generator*.)
+  - `api get <runpod|runpod-v1|runpod-v2|vast|hetzner> <path> [--raw]` — **read-only**
+    passthrough for what no command covers (`pods/<id>`, `catalog/datacenters`,
+    `network-volumes`, `billing/pods`; Vast `users/current/`; Hetzner `locations`): one GET
+    (there is no other verb) with the configured key, printed as pretty JSON. The path is
+    relative to the provider's API base — absolute URLs, `//host`, `..` and `#` are refused
+    before the key is read, redirects aren't followed — so the key only goes to the provider.
+    Secrets are redacted (env values, key/token/password fields, `rpa_`/`sk-`/`hf_` tokens,
+    SSH key material) unless `--raw`; the API key itself is never printed, `--raw` included
+    (scrubbed from the body as received, before an error message clips it).
   - `gpus` — list the GPU types for `--gpu`: RunPod's **full live catalog** (via GraphQL;
-    on `RUNPOD_API=v2` via `GET /v2/catalog/gpus`, STOCK then for the configured cloud,
-    falling back to GraphQL) when on RunPod with a key, else the local presets. Shows
-    VRAM, **live** community/secure $/hr and RunPod's 1-GPU stock hint (`~` marks a preset estimate). If RunPod rejects
-    the priced query (HTTP 200 with errors, or a non-auth 4xx/5xx), the plain catalog
+    on `RUNPOD_API=v2` via `GET /v2/catalog/gpus`, STOCK then for the configured cloud, no
+    GraphQL) when on RunPod with a key, else the local presets. Shows VRAM, **live**
+    community/secure $/hr and RunPod's 1-GPU stock hint (`~` marks a preset estimate). On
+    v1, if RunPod rejects the priced query (HTTP 200 with errors, or a non-auth 4xx/5xx), the plain catalog
     query is tried before falling back to presets. `--json` emits rows
     `{id, display_name, memory_gb, community_price, secure_price, stock_status, creatable,
     source, price_source}` (incl. catalog entries the create API rejects, `creatable: false`).
@@ -542,7 +620,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `snapshot::build` (`arena snapshot`'s builder) over the per-provider listing, the
     local proxy file and the health cache, so these read exactly as the CLI prints them:
     `$/H` (provider currency, `-` unless billing), an **M** badge for a host maintenance
-    window (detail pane: window + note), **HEALTH** = the last `pods test --deep` verdict
+    window (detail pane: window + note) — else **L** for a locked pod (detail pane: `status:
+    … · locked`; restart/stop/terminate on it are refused with the unlock hint, and the
+    dashboard never unlocks), **HEALTH** = the last `pods test --deep` verdict
     + age (`pass 12m`, `fail 2h`; detail pane: worst issue + the failing check's text),
     **PROXY** = the stable port, green live / yellow stale (`:9501 stale` when wide), `-`
     no forward, `?` remote proxy. The **summary bar** is `pods list`'s footer (`$` and
