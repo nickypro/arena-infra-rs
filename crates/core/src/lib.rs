@@ -36,6 +36,7 @@ pub mod ssh;
 pub mod status;
 pub mod table;
 pub mod teardown;
+pub mod vscode;
 
 pub use config::Config;
 pub use error::{Error, ProviderErrorKind, Result};

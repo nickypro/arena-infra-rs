@@ -317,7 +317,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     tensor op on **every GPU** (catches `cuInit` 999 / `CUDA error: unknown error`); with >1
     GPU a GPU→GPU copy that must arrive intact and an NCCL `all_reduce` across the GPUs
     (else `skipped (1 GPU)`); a 32 MiB Hugging Face download (no token sent); free disk on
-    `/` and `/workspace`; host load + uptime. The provider's maintenance window comes from
+    `/` and `/workspace`; host load + uptime; what setup's VS Code warm-up left (newest
+    server, extensions, default interpreter — an informational `vscode` line, Pass or Skip,
+    never WARN/FAIL). The provider's maintenance window comes from
     the API. **FAIL**: any CUDA/tensor/copy/NCCL error, count mismatch, missing
     torch/nvidia-smi, driver below the floor, unreachable/timed out. **WARN**: download
     < 2 MB/s or unreachable, < 10 GB free, host load above max(32, host CPUs), a
@@ -452,6 +454,19 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     its ssh transport; SIGKILL 2s later). Connection refusals right after create are still
     retried for ~150s (sshd booting); an auth failure (`Permission denied (publickey)`)
     fails at once.
+    **VS Code warm-up** (last step, on every provider, `up`/`restart`/`replace` included):
+    pre-installs what a participant's first Remote-SSH connect would otherwise download on
+    the pod — the latest stable VS Code server for the pod's CPU (x64/arm64, resolved from
+    the update API on the pod; checksum-verified) in the layout Remote-SSH looks for
+    (`~/.vscode-server/code-<commit>` + `cli/servers/Stable-<commit>/server`, plus the legacy
+    `bin/<commit>`), the extensions (`VSCODE_EXTENSIONS`, default Python + Pylance +
+    Jupyter; shared by every server version, so they help even when a client is another
+    release), and the conda env as `python.defaultInterpreterPath` in the machine settings
+    (added only if unset; other keys kept). Skips whatever is already there; its own 300s
+    budget; **best-effort** — a failure or timeout prints a warning (`✓ name (warning:
+    vscode warm-up: …)`) and the pod still counts as set up. `--no-vscode` skips it for a
+    run, `VSCODE_PREINSTALL=0` everywhere. (`~/.vscode-server` is a dot-dir, so `pods pull`
+    and replace's home copy already skip it.)
   - `config check | set | which` — `check` is the read-only doctor (keys + setup
     readiness); `config set KEY VALUE` writes a key (e.g. an API key) into config.env —
     or give just `KEY` and **pipe the value on stdin** (`printf %s "$TOK" | arena config

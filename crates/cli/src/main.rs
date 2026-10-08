@@ -709,7 +709,12 @@ enum PodCmd {
     ///   6. write ~/.name (export MACHINE_NAME=…);
     ///   7. (optional) export any broadcast tokens that are set — Hugging Face
     ///      (HF_TOKEN + HUGGING_FACE_HUB_TOKEN) and Claude Code (CLAUDE_CODE_OAUTH_TOKEN)
-    ///      — into ~/.bashrc & ~/.zshrc; tokens not set are skipped.
+    ///      — into ~/.bashrc & ~/.zshrc; tokens not set are skipped;
+    ///   8. (best-effort, last) warm up VS Code Remote-SSH: the latest stable VS Code
+    ///      server + extensions (VSCODE_EXTENSIONS, default Python, Pylance, Jupyter) into
+    ///      ~/.vscode-server, and the arena env as python.defaultInterpreterPath (if unset).
+    ///      Skips what's already there; its own 300s budget; if it fails the pod is still
+    ///      set up, with a warning. --no-vscode / VSCODE_PREINSTALL=0 turn it off.
     ///
     /// Pods run in parallel, each step on a time budget (copies 60s; the config step
     /// 300s, the hetzner bare-VM script 1800s — see --timeout / SETUP_TIMEOUT_SECS). A
@@ -738,6 +743,10 @@ enum PodCmd {
         /// bare / non-arena base images — the prebuilt arena image already has this.
         #[arg(long)]
         zsh_install: bool,
+        /// Skip the VS Code warm-up (server + extensions + default interpreter) this time
+        /// (config VSCODE_PREINSTALL=0 turns it off everywhere, `up` included).
+        #[arg(long)]
+        no_vscode: bool,
         /// Per-pod budget in seconds for the main provisioning command (default 300 for
         /// image-based pods, 1800 for the hetzner bare-VM script; overrides config
         /// SETUP_TIMEOUT_SECS; at most 86400). A pod that runs over reports `timed out at
@@ -2457,13 +2466,14 @@ fn failure_line(done: usize, total: usize, name: &str, call: &PodCall) -> String
 
 /// The provisioning settings `pods setup` (and `up`'s per-pod setup) run with: config's,
 /// plus the broadcast tokens — `--hf-token`/`--cc-token` over config, so a token can be
-/// supplied without editing the read-only prod config — and `--zsh-install`. Also returns
-/// the `Broadcast tokens: …` line saying which will be exported.
+/// supplied without editing the read-only prod config — `--zsh-install` and `--no-vscode`.
+/// Also returns the `Broadcast tokens: …` line saying which will be exported.
 fn setup_config(
     cfg: &Config,
     hf_token: Option<String>,
     cc_token: Option<String>,
     zsh_install: bool,
+    no_vscode: bool,
 ) -> Result<(arena_core::setup::SetupConfig, String)> {
     let token_value = |k: &str| -> Option<String> {
         let flag = match k {
@@ -2476,6 +2486,9 @@ fn setup_config(
     let mut scfg = arena_core::setup::SetupConfig::from_config(cfg)?;
     scfg.broadcast_exports = arena_core::apikeys::broadcast_env_vars(&token_value);
     scfg.zsh_install = zsh_install;
+    if no_vscode {
+        scfg.vscode = None;
+    }
     // Which broadcast tokens (HF, Claude Code) will be exported (an optional step).
     let token_summary: Vec<String> = arena_core::apikeys::BROADCAST_TOKENS
         .iter()
@@ -2499,6 +2512,21 @@ fn stage_hetzner_script(needed: bool) -> Result<String> {
     Ok(p.to_string_lossy().into_owned())
 }
 
+/// The dry-run's two lines for one provisioning step: `## <label> (timeout Ns…)`, then
+/// the exact scp/ssh command — or, for the best-effort warm-up, what it does (its command
+/// is a base64 blob nobody can review).
+fn step_preview(step: &arena_core::setup::ProvisionStep, target: &arena_core::ssh::SshTarget) -> [String; 2] {
+    use arena_core::setup::ProvisionStep;
+    let head = |label: &str, extra: &str| format!("## {label} (timeout {}s{extra})", step.timeout().as_secs());
+    match step {
+        ProvisionStep::Scp { label, local, remote, .. } => [head(label, ""), target.display_scp(local, remote)],
+        ProvisionStep::Run { label, cmd, .. } => [head(label, ""), target.display_command(cmd)],
+        ProvisionStep::Optional { label, summary, .. } => {
+            [head(label, ", best-effort: a failure is a warning, never a failed setup"), summary.clone()]
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_setup(
     // How we reach pods: `SshRemote` for real, `FakeRemote` in tests.
@@ -2509,6 +2537,8 @@ async fn handle_setup(
     hf_token: Option<String>,
     cc_token: Option<String>,
     zsh_install: bool,
+    // `--no-vscode`: skip the VS Code warm-up step (config may already have it off).
+    no_vscode: bool,
     // Per-step budgets, resolved by the caller (`SetupTimeouts::from_config`) *before* it
     // does anything costly: `up` / `replace` / `migrate copy` create (billing) pods before
     // they get here, so a malformed SETUP_TIMEOUT_SECS must fail before the create, not
@@ -2524,10 +2554,10 @@ async fn handle_setup(
     // `None` = no repair (tests that don't exercise it).
     repair: Option<&dyn Provider>,
 ) -> Result<()> {
-    use arena_core::setup::{provisioning_steps, BootRetry, ProvisionStep};
+    use arena_core::setup::{provisioning_steps, BootRetry};
     use arena_core::ssh::SshTarget;
 
-    let (scfg, tokens_line) = setup_config(cfg, hf_token, cc_token, zsh_install)?;
+    let (scfg, tokens_line) = setup_config(cfg, hf_token, cc_token, zsh_install, no_vscode)?;
     println!("{tokens_line}");
     // Carry each pod's provider so we can pick bare-VM vs image-based provisioning. A named
     // pod without an endpoint is reported; if none of the named pods is reachable, it fails.
@@ -2552,10 +2582,8 @@ async fn handle_setup(
         for (name, provider_name, target) in &targets {
             println!("# {name}");
             for step in provisioning_steps(provider_name, &display_scfg, name, force, &hetzner_script, &timeouts) {
-                println!("  ## {} (timeout {}s)", step.label(), step.timeout().as_secs());
-                match step {
-                    ProvisionStep::Scp { local, remote, .. } => println!("  {}", target.display_scp(&local, &remote)),
-                    ProvisionStep::Run { cmd, .. } => println!("  {}", target.display_command(&cmd)),
+                for line in step_preview(&step, target) {
+                    println!("  {line}");
                 }
             }
             println!();
@@ -2580,8 +2608,12 @@ async fn handle_setup(
     // Provision concurrently across the fleet, one line per pod as it finishes; a stuck
     // pod times out at its step and never blocks the rest.
     let total = targets.len();
+    let vscode = match &scfg.vscode {
+        Some(_) => format!(", vscode warm-up {}s", timeouts.vscode.as_secs()),
+        None => String::new(),
+    };
     println!(
-        "Provisioning {total} pod(s) over SSH (budgets: copy {}s, config {}s, hetzner script {}s)…",
+        "Provisioning {total} pod(s) over SSH (budgets: copy {}s, config {}s, hetzner script {}s{vscode})…",
         timeouts.copy.as_secs(),
         timeouts.config.as_secs(),
         timeouts.bare_vm.as_secs()
@@ -4722,7 +4754,7 @@ async fn handle_pods_with(
                 None
             } else {
                 let (scfg, tokens) =
-                    setup_config(cfg, None, None, false).context("provisioning settings (or pass --no-setup)")?;
+                    setup_config(cfg, None, None, false, false).context("provisioning settings (or pass --no-setup)")?;
                 let hetzner_script = stage_hetzner_script(provider.name() == "hetzner")?;
                 Some((up::SetupStage { scfg, timeouts: setup_timeouts, hetzner_script }, tokens))
             };
@@ -4972,9 +5004,12 @@ async fn handle_pods_with(
             let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
             handle_full_backup(remote, cfg, &sel, no_pull, message, dry_run, yes, RSYNC).await?;
         }
-        PodCmd::Setup { sel, dry_run, force, hf_token, cc_token, zsh_install, timeout } => {
+        PodCmd::Setup { sel, dry_run, force, hf_token, cc_token, zsh_install, no_vscode, timeout } => {
             // Budgets first: a malformed SETUP_TIMEOUT_SECS fails before anything else.
             let timeouts = arena_core::setup::SetupTimeouts::from_config(cfg, timeout)?;
+            // Likewise the VS Code warm-up's settings (VSCODE_PREINSTALL / VSCODE_EXTENSIONS).
+            arena_core::vscode::expected_extensions(cfg)?;
+            let vscode = !no_vscode && arena_core::vscode::preinstall_enabled(cfg.get("VSCODE_PREINSTALL"))?;
             // Resolved before the prompt, so a typo fails before asking and the prompt names
             // exactly the pods that will be provisioned.
             let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
@@ -4983,8 +5018,9 @@ async fn handle_pods_with(
                 && !confirm(
                     yes,
                     &format!(
-                        "Will provision {} pod(s) over SSH (deploy key, ~/.name, repo): {}",
+                        "Will provision {} pod(s) over SSH (deploy key, ~/.name, repo{}): {}",
                         sel.pods.len(),
+                        if vscode { ", VS Code warm-up" } else { "" },
                         sel.names()
                     ),
                 )?
@@ -4992,7 +5028,7 @@ async fn handle_pods_with(
                 println!("aborted.");
                 return Ok(());
             }
-            handle_setup(remote, cfg, !dry_run, force, hf_token, cc_token, zsh_install, timeouts, &sel, KEYS_DIR, Some(provider))
+            handle_setup(remote, cfg, !dry_run, force, hf_token, cc_token, zsh_install, no_vscode, timeouts, &sel, KEYS_DIR, Some(provider))
                 .await?;
         }
         PodCmd::SetBranch { branch, sel, hard, dry_run } => {
@@ -6181,7 +6217,7 @@ async fn handle_restart(
                 println!("\nRe-provisioning {} (the restart reset it to the image)…", pod.name);
                 outcome = match just_these(provider, std::slice::from_ref(&pod.id)).await {
                     Ok(sel) => {
-                        handle_setup(remote, cfg, true, false, None, None, false, timeouts, &sel, keys_dir, Some(provider)).await
+                        handle_setup(remote, cfg, true, false, None, None, false, false, timeouts, &sel, keys_dir, Some(provider)).await
                     }
                     Err(e) => Err(e),
                 };
@@ -6918,7 +6954,7 @@ async fn handle_migrate_copy(
         println!("      provisioning {new_name}…");
         // By id (a fresh listing, for the settled endpoint): the pod we just made.
         let new = just_these(owner.as_ref(), std::slice::from_ref(&created.id)).await?;
-        handle_setup(remote.clone(), cfg, true, false, None, None, false, setup_timeouts, &new, KEYS_DIR, Some(owner.as_ref()))
+        handle_setup(remote.clone(), cfg, true, false, None, None, false, false, setup_timeouts, &new, KEYS_DIR, Some(owner.as_ref()))
             .await
             .with_context(|| format!("provisioning {new_name}"))?;
         created.id
@@ -7322,7 +7358,7 @@ async fn handle_replace(
         println!("[3/7] provisioning {new_name}… (attempt {attempt}/{copy_attempts})");
         // By id (a fresh listing each attempt, for the current endpoint): the pod we made.
         let new = just_these(owner.as_ref(), std::slice::from_ref(&created.id)).await?;
-        handle_setup(remote.clone(), cfg, true, false, None, None, false, setup_timeouts, &new, KEYS_DIR, Some(owner.as_ref()))
+        handle_setup(remote.clone(), cfg, true, false, None, None, false, false, setup_timeouts, &new, KEYS_DIR, Some(owner.as_ref()))
             .await
             .with_context(|| format!("provisioning {new_name}"))?;
         println!("[4/7] copying {canonical} → {new_name} (excludes caches, HF models, .claude, .ssh, shell-rc keys)…");
@@ -9894,6 +9930,7 @@ mod setup_tests {
             authorized_pubkeys: vec![],
             broadcast_exports: vec![],
             zsh_install: false,
+            vscode: None,
         }
     }
 
@@ -9988,7 +10025,17 @@ mod setup_tests {
         Selected::all(fleet().0)
     }
 
+    /// Setup's config, VS Code warm-up off: these tests script each pod's exact replies
+    /// (the warm-up has its own, below — `vscode_cfg`).
     fn setup_cfg(extra: &str) -> Config {
+        Config::parse(&format!(
+            "MACHINE_NAME_PREFIX=devtest\nARENA_REPO_OWNER=o\nARENA_REPO_NAME=r\n\
+             GIT_SSH_KEY_LOCAL=/nonexistent/devtest_deploy_key\nVSCODE_PREINSTALL=0\n{extra}"
+        ))
+    }
+
+    /// `setup_cfg` as shipped: the VS Code warm-up on (the default).
+    fn vscode_cfg(extra: &str) -> Config {
         Config::parse(&format!(
             "MACHINE_NAME_PREFIX=devtest\nARENA_REPO_OWNER=o\nARENA_REPO_NAME=r\n\
              GIT_SSH_KEY_LOCAL=/nonexistent/devtest_deploy_key\n{extra}"
@@ -10042,7 +10089,7 @@ mod setup_tests {
         fake.script("10.0.0.1:22002", [FakeReply::ok(), FakeReply::hang()]);
         let start = Instant::now();
         let cfg = setup_cfg("SETUP_TIMEOUT_SECS=120");
-        let err = handle_setup(fake.clone(), &cfg, true, false, None, None, false, budgets(&cfg, None), &everyone(), NO_KEYS, None)
+        let err = handle_setup(fake.clone(), &cfg, true, false, None, None, false, false, budgets(&cfg, None), &everyone(), NO_KEYS, None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("1 pod(s) failed to set up"), "{err}");
@@ -10064,7 +10111,7 @@ mod setup_tests {
         let fake = Arc::new(FakeRemote::new());
         let only = Selected { pods: vec![fleet().0.remove(0)], named: true };
         let cfg = setup_cfg("SETUP_TIMEOUT_SECS=120");
-        handle_setup(fake.clone(), &cfg, true, false, None, None, false, budgets(&cfg, Some(45)), &only, NO_KEYS, None)
+        handle_setup(fake.clone(), &cfg, true, false, None, None, false, false, budgets(&cfg, Some(45)), &only, NO_KEYS, None)
             .await
             .unwrap();
         let calls = fake.calls();
@@ -10129,7 +10176,7 @@ mod setup_tests {
         let cfg = setup_cfg(&format!("SHARED_SSH_KEY_PATH={}/devtest_key", dir.display()));
         let api = KeyApi::default();
         let start = Instant::now();
-        handle_setup(fake.clone(), &cfg, true, false, None, None, false, budgets(&cfg, None), &everyone(), NO_KEYS, Some(&api))
+        handle_setup(fake.clone(), &cfg, true, false, None, None, false, false, budgets(&cfg, None), &everyone(), NO_KEYS, Some(&api))
             .await
             .unwrap();
         assert_eq!(*api.seen.lock().unwrap(), ["id-devtest-bloom"], "only the pod that refused");
@@ -10144,7 +10191,7 @@ mod setup_tests {
         let fake = Arc::new(FakeRemote::new());
         fake.script("10.0.0.1:22002", [FakeReply::exit(255, denied)]);
         let runpod = fleet();
-        let err = handle_setup(fake.clone(), &cfg, true, false, None, None, false, budgets(&cfg, None), &everyone(), NO_KEYS, Some(&runpod))
+        let err = handle_setup(fake.clone(), &cfg, true, false, None, None, false, false, budgets(&cfg, None), &everyone(), NO_KEYS, Some(&runpod))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("1 pod(s) failed to set up"), "{err}");
@@ -10177,7 +10224,7 @@ mod setup_tests {
         let cfg = setup_cfg("SETUP_TIMEOUT_SECS=120");
         let start = Instant::now();
         let keys = dir.to_string_lossy();
-        let err = handle_setup(fake.clone(), &cfg, true, false, None, None, false, budgets(&cfg, None), &everyone(), &keys, None)
+        let err = handle_setup(fake.clone(), &cfg, true, false, None, None, false, false, budgets(&cfg, None), &everyone(), &keys, None)
             .await
             .unwrap_err();
         let _ = std::fs::remove_dir_all(&dir);
@@ -10205,7 +10252,7 @@ mod setup_tests {
         let cfg = setup_cfg("");
         let start = Instant::now();
         let keys = dir.to_string_lossy().into_owned();
-        handle_setup(fake.clone(), &cfg, true, false, None, None, false, budgets(&cfg, None), &everyone(), &keys, None)
+        handle_setup(fake.clone(), &cfg, true, false, None, None, false, false, budgets(&cfg, None), &everyone(), &keys, None)
             .await
             .unwrap();
         assert_eq!(start.elapsed(), COPY_KEYS_TIMEOUT);
@@ -10298,6 +10345,81 @@ mod setup_tests {
             assert!(fake.calls().is_empty(), "{args:?}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `pods setup` with the warm-up on (the default): it runs last on every pod, on its own
+    /// 300s budget; a pod whose warm-up fails or hangs is still provisioned (and gets its
+    /// keys) — the command succeeds; `--no-vscode` leaves it out.
+    #[tokio::test(start_paused = true)]
+    async fn the_vscode_warm_up_runs_last_and_never_fails_setup() {
+        let dir = keys_dir("vscode");
+        let keys = dir.to_string_lossy().into_owned();
+        let cfg = vscode_cfg("");
+        let fake = Arc::new(FakeRemote::new());
+        // apple: the script reports a problem; bloom: it hangs; cloud: all well.
+        fake.script("10.0.0.1:22001", [FakeReply::ok(), FakeReply::ok(), FakeReply::exit(3, "vscode warm-up incomplete: server: checksum mismatch")]);
+        fake.script("10.0.0.1:22002", [FakeReply::ok(), FakeReply::ok(), FakeReply::hang()]);
+        let start = Instant::now();
+        handle_setup(fake.clone(), &cfg, true, false, None, None, false, false, budgets(&cfg, None), &everyone(), &keys, None)
+            .await
+            .unwrap();
+        assert_eq!(start.elapsed(), Duration::from_secs(300), "the hung warm-up costs its own budget, no more");
+        for port in [22001, 22002, 22003] {
+            let calls = fake.calls_to(&format!("10.0.0.1:{port}"));
+            assert!(
+                matches!(&calls[..], [RemoteCall::Copy { .. }, RemoteCall::Exec { cmd: config, .. }, RemoteCall::Exec { cmd, timeout, .. }, RemoteCall::Exec { cmd: keys, .. }]
+                    if config.contains("git fetch")
+                        && cmd.contains("arena-vscode-warmup")
+                        && cmd.contains("ARENA_VSCODE_EXTENSIONS='ms-python.python,ms-python.vscode-pylance,ms-toolsai.jupyter'")
+                        && *timeout == Some(Duration::from_secs(300))
+                        && keys.contains("OPENAI_API_KEY")),
+                "port {port}: every pod is set up and gets its keys: {calls:?}"
+            );
+        }
+
+        // --no-vscode: the step is gone.
+        let fake = Arc::new(FakeRemote::new());
+        handle_setup(fake.clone(), &cfg, true, false, None, None, false, true, budgets(&cfg, None), &everyone(), NO_KEYS, None)
+            .await
+            .unwrap();
+        for port in [22001, 22002, 22003] {
+            let calls = fake.calls_to(&format!("10.0.0.1:{port}"));
+            assert_eq!(calls.len(), 2, "port {port}: {calls:?}");
+            assert!(!format!("{calls:?}").contains("arena-vscode-warmup"));
+        }
+        // A bad extension list fails before any pod is touched.
+        let fake = Arc::new(FakeRemote::new());
+        let bad = vscode_cfg("VSCODE_EXTENSIONS=ms-python.python;reboot");
+        let err = handle_setup(fake.clone(), &bad, true, false, None, None, false, false, budgets(&bad, None), &everyone(), NO_KEYS, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("VSCODE_EXTENSIONS"), "{err}");
+        assert!(fake.calls().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_dry_run_shows_what_the_warm_up_does_not_its_blob() {
+        use arena_core::setup::SetupTimeouts;
+        let mut sc = scfg();
+        sc.vscode = arena_core::vscode::VscodeSetup::from_config(&vscode_cfg(""), &sc.repo_path).unwrap();
+        let steps = provisioning_steps("runpod", &sc, "devtest-apple", false, "", &SetupTimeouts::default());
+        let lines: Vec<String> = steps.iter().flat_map(|s| super::step_preview(s, &target(22001))).collect();
+        assert_eq!(lines.len(), 6, "{lines:#?}");
+        assert_eq!(lines[0], "## copy deploy key (timeout 60s)");
+        assert!(lines[1].starts_with("scp "), "{}", lines[1]);
+        assert_eq!(lines[2], "## repo + keys config (timeout 300s)");
+        assert!(lines[3].starts_with("ssh ") && lines[3].contains("git fetch"), "{}", lines[3]);
+        assert_eq!(lines[4], "## vscode warm-up (timeout 300s, best-effort: a failure is a warning, never a failed setup)");
+        assert!(lines[5].starts_with("latest stable VS Code server") && lines[5].contains("ms-toolsai.jupyter"), "{}", lines[5]);
+        assert!(lines[5].contains("/opt/arena-env/bin/python") && !lines[5].contains("base64"), "{}", lines[5]);
+    }
+
+    #[test]
+    fn setup_takes_no_vscode() {
+        let parsed = pods(&["setup", "apple", "--no-vscode"]);
+        assert!(matches!(parsed, super::PodCmd::Setup { no_vscode: true, .. }));
+        assert!(matches!(pods(&["setup"]), super::PodCmd::Setup { no_vscode: false, .. }));
     }
 
     #[test]
@@ -13140,7 +13262,7 @@ mod lifecycle_tests {
         format!(
             "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(alpha bravo charlie delta echo @solo-gpu)\n\
              ARENA_REPO_OWNER=o\nARENA_REPO_NAME=r\nGIT_SSH_KEY_LOCAL=/nonexistent/devtest_deploy_key\n\
-             SSH_PROXY_HOST=localhost\nSSH_PROXY_NGINX_CONFIG_PATH={}\nSSH_PROXY_RELOAD_CMD=\"\"\n",
+             SSH_PROXY_HOST=localhost\nSSH_PROXY_NGINX_CONFIG_PATH={}\nSSH_PROXY_RELOAD_CMD=\"\"\nVSCODE_PREINSTALL=0\n",
             dir.join("proxy.conf").display()
         )
     }

@@ -147,6 +147,14 @@ pub struct DeepFacts {
     pub net_error: Option<String>,
     pub disk_root_avail_kb: Option<u64>,
     pub disk_workspace_avail_kb: Option<u64>,
+    /// The newest pre-installed VS Code server's commit (`none` = none), and how many there
+    /// are (setup's warm-up; informational).
+    pub vscode_server: Option<String>,
+    pub vscode_servers: Option<u32>,
+    /// Extensions in `~/.vscode-server/extensions`: lowercased id → version.
+    pub vscode_extensions: BTreeMap<String, String>,
+    /// `python.defaultInterpreterPath` in the machine settings (`unset` = absent).
+    pub vscode_python: Option<String>,
     /// Any other `key=value` the script printed (a newer script, an `error=`): kept for
     /// `--json` rather than dropped.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -282,6 +290,9 @@ pub fn parse_deep(stdout: &str) -> DeepFacts {
             "net.error" => f.net_error = text(),
             "disk.root_avail_kb" => f.disk_root_avail_kb = int(),
             "disk.workspace_avail_kb" => f.disk_workspace_avail_kb = int(),
+            "vscode.server" => f.vscode_server = text(),
+            "vscode.servers" => f.vscode_servers = small(),
+            "vscode.python" => f.vscode_python = text(),
             _ => {
                 if let Some(v) = text() {
                     if !indexed_fact(&mut f, &mut gpus, key, v.clone()) {
@@ -320,6 +331,13 @@ fn indexed_fact(f: &mut DeepFacts, gpus: &mut BTreeMap<u32, GpuFact>, key: &str,
         }
         return false;
     }
+    if let Some(id) = key.strip_prefix("vscode.ext.") {
+        let valid = !id.is_empty();
+        if valid {
+            f.vscode_extensions.insert(id.to_ascii_lowercase(), value);
+        }
+        return valid;
+    }
     if let Some(pair) = key.strip_prefix("peer.") {
         let valid = pair.split_once('-').is_some_and(|(a, b)| a.parse::<u32>().is_ok() && b.parse::<u32>().is_ok());
         if valid {
@@ -356,6 +374,9 @@ pub struct HealthPolicy {
     /// everything on it slows down. The floor keeps small boxes quiet and matches the ops
     /// playbook's experience — single digits normal, ~40 oversubscribed.
     pub load_floor: f64,
+    /// The extensions setup's VS Code warm-up installs (`VSCODE_EXTENSIONS`; none when
+    /// `VSCODE_PREINSTALL=0`), for the informational `vscode` line.
+    pub vscode_extensions: Vec<String>,
 }
 
 impl Default for HealthPolicy {
@@ -365,6 +386,7 @@ impl Default for HealthPolicy {
             min_hf_mbps: DEFAULT_MIN_HF_MBPS,
             min_free_gb: DEFAULT_MIN_FREE_GB,
             load_floor: DEFAULT_LOAD_FLOOR,
+            vscode_extensions: crate::vscode::DEFAULT_EXTENSIONS.iter().map(|s| s.to_string()).collect(),
         }
     }
 }
@@ -375,9 +397,10 @@ impl HealthPolicy {
     /// versions pods are created on (`ALLOWED_CUDA_VERSIONS`, else
     /// `RUNPOD_ALLOWED_CUDA_VERSIONS` — the same keys `PodSpec` reads), see
     /// [`driver_floor_for_cuda`]. A malformed `MIN_DRIVER_VERSION` is an error, not a
-    /// silently skipped check.
+    /// silently skipped check. The `vscode` line expects what setup's warm-up installs
+    /// (`VSCODE_PREINSTALL` / `VSCODE_EXTENSIONS`, validated the same way).
     pub fn from_config(cfg: &Config) -> Result<Self> {
-        let mut policy = Self::default();
+        let mut policy = Self { vscode_extensions: crate::vscode::expected_extensions(cfg)?, ..Self::default() };
         if let Some(raw) = cfg.get("MIN_DRIVER_VERSION").map(str::trim).filter(|s| !s.is_empty()) {
             if raw.eq_ignore_ascii_case("none") {
                 return Ok(policy);
@@ -624,7 +647,55 @@ fn evaluate_as(f: &DeepFacts, p: &HealthPolicy, maintenance: Option<&Maintenance
         "-" => Check::new("maintenance", Pass, "none reported"),
         window => Check::new("maintenance", Warn, window),
     });
+    out.push(vscode_check(f, p));
     out
+}
+
+/// Setup's VS Code warm-up, as found: the newest server, the expected extensions, the
+/// default interpreter. **Informational only** — Pass when it's all there, else Skip with
+/// what's missing; never Warn or Fail. A missing pre-install only means the participant's
+/// first connect is slower, which is no reason to doubt (or `up --check`-replace) a pod.
+fn vscode_check(f: &DeepFacts, p: &HealthPolicy) -> Check {
+    use Status::*;
+    let Some(server) = f.vscode_server.as_deref() else {
+        return Check::new("vscode", Skip, "not reported");
+    };
+    let server = Some(server).filter(|s| *s != "none");
+    let python = f.vscode_python.as_deref().filter(|p| *p != "unset");
+    if server.is_none() && f.vscode_extensions.is_empty() && python.is_none() {
+        return Check::new(
+            "vscode",
+            Skip,
+            "not pre-installed (the first Remote-SSH connect downloads the server + extensions)",
+        );
+    }
+    let missing: Vec<&str> = p
+        .vscode_extensions
+        .iter()
+        .map(String::as_str)
+        .filter(|id| !f.vscode_extensions.contains_key(*id))
+        .collect();
+    let mut parts = vec![match server {
+        Some(c) => {
+            let older = f.vscode_servers.unwrap_or(1).saturating_sub(1);
+            let more = if older > 0 { format!(" (+{older} other)") } else { String::new() };
+            format!("server {}{more}", c.get(..7).unwrap_or(c))
+        }
+        None => "no server".into(),
+    }];
+    if !p.vscode_extensions.is_empty() {
+        parts.push(if missing.is_empty() {
+            format!("{} extensions", p.vscode_extensions.len())
+        } else {
+            format!("missing {}", missing.join(", "))
+        });
+    }
+    parts.push(match python {
+        Some(py) => format!("python {py}"),
+        None => "no default interpreter".into(),
+    });
+    let status = if server.is_some() && missing.is_empty() { Pass } else { Skip };
+    Check::new("vscode", status, parts.join("; "))
 }
 
 fn smi_check(f: &DeepFacts) -> Check {
@@ -1253,7 +1324,7 @@ deep_check_end=1
             names,
             [
                 "nvidia-smi", "driver", "torch", "cuda", "device_count", "gpu0", "gpu1", "peer_copy", "nccl",
-                "network", "disk", "load", "maintenance"
+                "network", "disk", "load", "maintenance", "vscode"
             ]
         );
         assert_eq!(check(&checks, "nvidia-smi").detail, "2×RTX A4000");
@@ -1266,6 +1337,7 @@ deep_check_end=1
         assert_eq!(check(&checks, "disk").detail, "/ 107 GB, /workspace 54 GB free");
         assert_eq!(check(&checks, "load").detail, "load 0.8 on 64 CPUs, host up 14d");
         assert_eq!(check(&checks, "maintenance").detail, "none reported");
+        assert_eq!(check(&checks, "vscode"), &Check::new("vscode", Status::Skip, "not reported"));
 
         // One GPU: nothing to copy between or reduce across — skipped, still a pass.
         let checks = evaluate(&parse_deep(&one_gpu()), &cuda13(), None);
@@ -1490,6 +1562,60 @@ deep_check_end=1
         // An empty window is no window.
         let checks = evaluate(&parse_deep(HEALTHY_2GPU), &cuda13(), Some(&Maintenance::default()));
         assert_eq!(check(&checks, "maintenance").status, Pass);
+    }
+
+    #[test]
+    fn vscode_line_is_informational_only() {
+        use Status::*;
+        const C: &str = "2a59476c9bfcb90b3ddc372c36762471b7dfad1c";
+        let all = [
+            ("vscode.ext.ms-python.python", Some("2026.1.0")),
+            ("vscode.ext.ms-python.vscode-pylance", Some("2026.1.1")),
+            ("vscode.ext.ms-toolsai.jupyter", Some("2026.2.0")),
+        ];
+        let with = |extra: &[(&str, Option<&str>)]| edit(HEALTHY_2GPU, extra);
+        let full: Vec<(&str, Option<&str>)> =
+            [("vscode.server", Some(C)), ("vscode.servers", Some("2")), ("vscode.python", Some("/opt/arena-env/bin/python"))]
+                .into_iter()
+                .chain(all)
+                .collect();
+        let no_jupyter: Vec<(&str, Option<&str>)> = full.iter().copied().filter(|(k, _)| !k.ends_with("jupyter")).collect();
+        let off = HealthPolicy { vscode_extensions: vec![], ..cuda13() };
+        // (label, script output, policy, status, detail)
+        let cases: Vec<(&str, String, HealthPolicy, Status, &str)> = vec![
+            ("all there", with(&full), cuda13(), Pass, "server 2a59476 (+1 other); 3 extensions; python /opt/arena-env/bin/python"),
+            ("one missing", with(&no_jupyter), cuda13(), Skip, "server 2a59476 (+1 other); missing ms-toolsai.jupyter; python"),
+            (
+                "nothing installed",
+                with(&[("vscode.server", Some("none")), ("vscode.servers", Some("0")), ("vscode.python", Some("unset"))]),
+                cuda13(),
+                Skip,
+                "not pre-installed (the first Remote-SSH connect downloads",
+            ),
+            (
+                "extensions only (e.g. the server download failed)",
+                with(&[("vscode.server", Some("none")), all[0], all[1], all[2], ("vscode.python", Some("unset"))]),
+                cuda13(),
+                Skip,
+                "no server; 3 extensions; no default interpreter",
+            ),
+            ("pre-install off", with(&[("vscode.server", Some(C)), ("vscode.python", Some("unset"))]), off, Pass, "server 2a59476; no default interpreter"),
+            ("older script", HEALTHY_2GPU.to_string(), cuda13(), Skip, "not reported"),
+        ];
+        for (label, out, policy, status, detail) in cases {
+            let checks = evaluate(&parse_deep(&out), &policy, None);
+            let c = check(&checks, "vscode");
+            assert_eq!(c.status, status, "{label}: {c:?}");
+            assert!(c.detail.contains(detail), "{label}: {:?} lacks {detail:?}", c.detail);
+            // Never moves the pod's verdict.
+            assert_eq!(overall(&checks), Pass, "{label}");
+        }
+        // The policy's expectations come from the same config as setup's warm-up.
+        assert_eq!(HealthPolicy::default().vscode_extensions, crate::vscode::DEFAULT_EXTENSIONS);
+        let cfg = |s: &str| Config::parse(s);
+        assert!(HealthPolicy::from_config(&cfg("VSCODE_PREINSTALL=0\nMIN_DRIVER_VERSION=580")).unwrap().vscode_extensions.is_empty());
+        assert_eq!(HealthPolicy::from_config(&cfg("VSCODE_EXTENSIONS=a.b")).unwrap().vscode_extensions, ["a.b"]);
+        assert!(HealthPolicy::from_config(&cfg("VSCODE_EXTENSIONS=a")).is_err());
     }
 
     #[test]
@@ -1819,11 +1945,27 @@ devtest-echo   fail    -            -          -             -  ssh: exit Some(2
              printf 'torch=ok\\ntorch_version=2.9.0+cu130\\ntorch_cuda=13.0\\ncuda_available=true\\ndevice_count=2\\n'\n\
              printf 'tensor.0=ok\\ntensor.1=ok\\npeer.0-1=ok\\npeer.1-0=ok\\nnccl_ranks=2\\nnccl=ok\\npy_done=1\\n'\n",
         );
+        // A home with what setup's VS Code warm-up leaves behind (not the operator's own).
+        let home = dir.join("home");
+        let vs = home.join(".vscode-server");
+        let server = vs.join("cli/servers/Stable-2a59476c9bfcb90b3ddc372c36762471b7dfad1c/server/bin");
+        std::fs::create_dir_all(&server).unwrap();
+        stub("home/.vscode-server/cli/servers/Stable-2a59476c9bfcb90b3ddc372c36762471b7dfad1c/server/bin/code-server", "");
+        for ext in ["ms-python.python-2026.1.0", "ms-python.vscode-pylance-2026.1.1", "ms-toolsai.jupyter-2026.2.0", "MS-Python.debugpy-2025.10.0-linux-x64", "not-an-extension"] {
+            std::fs::create_dir_all(vs.join("extensions").join(ext)).unwrap();
+        }
+        std::fs::create_dir_all(vs.join("data/Machine")).unwrap();
+        std::fs::write(
+            vs.join("data/Machine/settings.json"),
+            "{\n    \"editor.fontSize\": 13,\n    \"python.defaultInterpreterPath\": \"/opt/arena-env/bin/python\"\n}\n",
+        )
+        .unwrap();
         let path = format!("{}:{}", dir.display(), std::env::var("PATH").unwrap_or_default());
         let out = std::process::Command::new("sh")
             .arg("-c")
             .arg(deep_check_inner_command())
             .env("PATH", path)
+            .env("HOME", &home)
             .output()
             .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -1844,9 +1986,24 @@ devtest-echo   fail    -            -          -             -  ssh: exit Some(2
         assert!(f.load1.is_some() && f.cpus.is_some() && f.uptime_secs.is_some(), "{f:?}");
         assert!(f.disk_root_avail_kb.is_some(), "{f:?}");
 
+        assert_eq!(f.vscode_server.as_deref(), Some("2a59476c9bfcb90b3ddc372c36762471b7dfad1c"));
+        assert_eq!(f.vscode_servers, Some(1));
+        assert_eq!(f.vscode_python.as_deref(), Some("/opt/arena-env/bin/python"));
+        let exts: Vec<(&str, &str)> = f.vscode_extensions.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert_eq!(
+            exts,
+            [
+                ("ms-python.debugpy", "2025.10.0-linux-x64"),
+                ("ms-python.python", "2026.1.0"),
+                ("ms-python.vscode-pylance", "2026.1.1"),
+                ("ms-toolsai.jupyter", "2026.2.0"),
+            ]
+        );
+
         let checks = evaluate(&f, &cuda13(), None);
-        for name in ["nvidia-smi", "driver", "torch", "cuda", "device_count", "gpu0", "gpu1", "peer_copy", "nccl", "network"] {
+        for name in ["nvidia-smi", "driver", "torch", "cuda", "device_count", "gpu0", "gpu1", "peer_copy", "nccl", "network", "vscode"] {
             assert_eq!(check(&checks, name).status, Status::Pass, "{name}: {checks:#?}");
         }
+        assert_eq!(check(&checks, "vscode").detail, "server 2a59476; 3 extensions; python /opt/arena-env/bin/python");
     }
 }

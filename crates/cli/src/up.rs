@@ -484,7 +484,13 @@ impl Shared<'_, '_> {
                     let reason = format!("{} — left running", outcome.describe());
                     return self.end(run, Verdict::Failed { stage: Stage::Setup, reason });
                 }
-                Some(_) => say(To::Out, &format!("[{name}] setup ✓ ({})", pipeline::fmt_elapsed(t.elapsed()))),
+                Some(outcome) => {
+                    say(To::Out, &format!("[{name}] setup ✓ ({})", pipeline::fmt_elapsed(t.elapsed())));
+                    // A best-effort step (the VS Code warm-up) that didn't work out: said, not fatal.
+                    for w in outcome.warnings() {
+                        say(To::Err, &format!("[{name}] setup warning: {w}"));
+                    }
+                }
             }
         }
 
@@ -1240,7 +1246,7 @@ mod tests {
         let mut text = "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(\n  \"apple\"\n  \"bloom\"\n  \"cloud\"\n)\n\
                         ARENA_REPO_OWNER=o\nARENA_REPO_NAME=r\nGIT_SSH_KEY_LOCAL=/nonexistent/devtest_deploy_key\n\
                         SHARED_SSH_KEY_PATH=/nonexistent/devtest_key\nALLOWED_CUDA_VERSIONS=\"13.0\"\n\
-                        GPU_TYPE=\"NVIDIA RTX A4000\"\nCLOUD_TYPE=COMMUNITY\n"
+                        GPU_TYPE=\"NVIDIA RTX A4000\"\nCLOUD_TYPE=COMMUNITY\nVSCODE_PREINSTALL=0\n"
             .to_string();
         if let Some(p) = proxy {
             text.push_str(&format!(
@@ -1361,6 +1367,39 @@ mod tests {
         let lists = fleet.lists.load(Ordering::SeqCst);
         assert!(lists <= 33, "{lists} list calls for 300s of polling every 10s");
         assert!(conclude(&rows, &|_, _| {}).is_ok());
+    }
+
+    /// With the VS Code warm-up on (the default outside these tests): it runs after the
+    /// required setup steps and before the check; a warm-up that fails is a warning line,
+    /// and the pod is checked and READY as usual.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_vscode_warm_up_is_a_warning_and_the_pod_is_still_ready() {
+        let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 0)])]);
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(
+            &host("10.0.0.1", 22001),
+            [
+                FakeReply::ok(),
+                FakeReply::ok(),
+                FakeReply::exit(3, "vscode warm-up incomplete: update API for server-linux-x64: curl: (6) Could not resolve host"),
+                healthy(),
+            ],
+        );
+        let cfg = Config::parse(&cfg_text(None).replace("VSCODE_PREINSTALL=0\n", ""));
+        let run = up_run(&fleet, fake.clone(), &cfg, true, Some(2), None).await;
+        let made = make(&fleet, &["apple"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+
+        assert_eq!(rows[0].verdict, Verdict::Ready, "{:#?}", lines.all());
+        let (ok, _) = lines.find("[devtest-apple] setup ✓");
+        let (warned, _) = lines.find(
+            "[devtest-apple] setup warning: vscode warm-up: exit 3: vscode warm-up incomplete: update API for \
+             server-linux-x64: curl: (6) Could not resolve host",
+        );
+        assert!(ok < warned, "{:#?}", lines.all());
+        assert_eq!(execs_with(&fake, &host("10.0.0.1", 22001), "arena-vscode-warmup"), 1);
+        assert_eq!(fleet.events().len(), 1, "never replaced: {:?}", fleet.events());
     }
 
     /// [`cfg`] with a readable cohort key (its `.pub` beside it) and a deploy key that has
