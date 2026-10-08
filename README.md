@@ -135,9 +135,26 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     is — `readlink -f` + is `/workspace` mounted — and lets a repo linked onto the mounted
     volume through without `--wipe-ok`; no answer → judged by the configured path, as before
     (refused). Pods without a volume are never asked. Afterwards it waits for the endpoint to settle, **re-runs `setup`** on the pod
-    (`--no-setup` skips) and syncs the proxy (`--skip-proxy`), so it comes back usable; if
-    that setup fails the error says to run `pods setup <name>`, not another restart. `stop`
-    gets the same gate (`--wipe-ok`): a stopped RunPod pod keeps no data. `terminate
+    (`--no-setup` skips) and syncs the proxy (`--skip-proxy`) once the endpoint has settled
+    **again** (a reset container's endpoint can flap after it first settles; a forward the sync
+    still couldn't route is re-synced once, then named with `arena proxy apply`), so it comes
+    back usable; if that setup fails the error says to run `pods setup <name>`, not another
+    restart. A **stopped** pod is refused (`… is stopped (EXITED) — … arena pods start …`: a
+    restart needs a running pod). `stop` gets the same gate (`--wipe-ok`): a stopped RunPod
+    pod keeps no data. **`pods start <targets>`** (targets or `--all`) is the way back from a
+    stop (RunPod v1 `POST /pods/{id}/start`, v2 action `start`, Vast state `running`, Hetzner
+    `poweron`): only stopped pods are started (others skipped with a note), each comes back as
+    a fresh image, so it waits for its endpoint to settle, **re-runs setup** (`--no-setup`)
+    and syncs the proxy (`--skip-proxy`); a Hetzner VM kept its disk (no setup). A start the
+    provider refuses (no free GPU left on the host) is reported per pod, exit non-zero. The SSH
+    commands (`run`, `test`, `setup`, `backup`, `pull`…) skip a stopped pod saying so — `skip X
+    — stopped (EXITED); arena pods start X brings it back` — even when the listing still shows
+    its last endpoint. `run` / `pull` / `backup` ask the provider **once more** (after 20 s)
+    for a RUNNING pod listed without an endpoint (RunPod v1 once listed one that way for ~20 s,
+    and a backup tick skipped it). **`reimage`** gets the same `--wipe-ok` gate as
+    restart/stop (a reimage is a fresh container on every backend; the dry run says when it
+    would be refused) and the same come-back: settled endpoint, **setup again** (`--no-setup`),
+    proxy sync. `terminate
     --all` tears down the **whole fleet** (confirms first; `--dry-run` lists every
     pod without touching them) — for end-of-program teardown (`terminate <name> --all` is
     refused). `terminate … --revoke-key` also deletes each terminated machine's OpenRouter
@@ -315,10 +332,14 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `create`/`up` that fails part-way still syncs for the pods it made. A partly failed
     `rename` batch doesn't sync: with `--from-prefix`, re-run the rename *before* any
     `proxy apply`/lifecycle command/proxy cron tick, which would drop the not-yet-renamed
-    pods' forwards. `migrate cutover` still treats a sync that didn't land as a failure and
-    auto-reverts; `replace` only terminates the old pod once the sync routed the name to
-    the new one (else it keeps it and says why). Provider list calls are bounded (60s),
-    so a stalled API reads as "failed to list" (forwards kept), not a hang.
+    pods' forwards. `migrate cutover` still treats a sync that didn't land (or didn't route the
+    name to the new pod) as a failure and auto-reverts — except on a **write-only** proxy
+    (`SSH_PROXY_RELOAD_CMD=""`), where nothing can be verified through nginx: said up front,
+    the forward written, no 45 s probe, no revert; `replace` only terminates the old pod once
+    the sync routed the name to the new one (else it keeps it and says why), and **`migrate
+    finish`** now syncs first and refuses to terminate `<name>-old` until `<name>`'s port
+    routes to the live pod. Provider list calls are bounded (60s), so a stalled API reads as
+    "failed to list" (forwards kept), not a hang.
   - `plan check | show` — a scheduled provisioning plan (`arena-plan.json`, see
     `arena-plan.example.json`): per-day target fleets with **GPU-first fallback chains**
     (e.g. `A4000` across community→secure→vast, then `3090`, then `A5000`) and a night
@@ -537,6 +558,42 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     aside (`*.arena-aside-*`) isn't backed up — only an untouched image checkout is ever moved
     aside after a reset (see `pods setup`). `pods replace`/`migrate copy` carry the repo the same way (direct and via
     local staging), into the new pod's own volume copy when it has one.
+  - **`pods replace` / `pods migrate`** — what the copy onto `<name>-new` does (live campaign
+    1, findings #5–#7, #13, #16, #17, #19, #20, #26–#30):
+    - It's a **replica**: a file deleted on the original is deleted on `-new` too, but
+      nothing on `-new` is ever destroyed by a sync — whatever it overwrites or deletes there
+      is **moved** to `~/.arena-sync-replaced/<UTC stamp>/` (the repo's files beside the
+      repo's real directory, on its volume). After each sync `-new` sorts that folder against
+      its last-sync stamp (`~/.arena-last-sync`): copies of what an earlier sync put there go;
+      files **changed on `-new` itself** since (work done there after a cutover + revert, or a
+      test run) are **kept and listed**. The original is only ever read; backups never mirror.
+    - It carries the home incl. `.git`, `~/.config`, `~/.jupyter`, `~/.ipython`, `~/.local`
+      (bin, share) — and says what it skips (caches and other dot-dirs, venvs, site-packages
+      and `~/.local/lib`, HF caches, uv's Pythons, shell rc files + history, `.claude*`, `.ssh`,
+      `~/.name`). The plans no longer promise a "copied-size sanity" check: what's verified is
+      the delivery marker read back from the right pod, then an SSH + GPU health check.
+    - The **direct** pod-to-pod copy is skipped when both pods share a public IP (a pod can't
+      reach its neighbour through it) and gives up connecting after 15 s; when it fails the
+      fallback names its real reason. The **via-local** fallback first sizes the staging (an
+      rsync dry run) and refuses when the local disk would keep less than a tenth of itself
+      (≥ 5 GB) free; the stage (`$TMPDIR/arena-replace-<id>`, mode 0700) is **removed** once
+      the copy landed, and kept — with its path, size and the `rm -rf` — only when it failed
+      (a re-run continues from it); `migrate finish` / a finished `replace` remove a leftover.
+    - The source's **GPU type** comes from its own listing when its spec doesn't say (RunPod
+      v1), before config's `GPU_TYPE` (the plan says where it came from). `--gpu`/`--cloud`
+      take **lists** and go through the same placement as `up` (`--max-price`, `--order`,
+      `--retry-mins`/`--retry-secs`): one create at a time, the first option with capacity.
+    - After the swap the promoted pod gets `~/.name` in setup's format and its **per-host API
+      keys under the canonical name** (setup ran while it was `-new`, which no key row
+      matches); the parked one gets `<name>-old` in its `~/.name`; the `MACHINE_NAME` env note
+      is printed. A new host with a **maintenance window** is warned about before the swap,
+      and `replace` then keeps `-old`.
+    - `migrate cutover --no-final-sync` cuts over to the copy already on `-new` when the
+      original is stopped/unreachable (a stopped source is refused by the final sync *saying
+      so*, with that flag); the plan says when `-new` was last synced. `migrate revert` says
+      that the new pod's work since the cutover stays on `-new`. `migrate copy` of a **locked**
+      original is allowed (it only reads it) with a note; cutover / replace / finish refuse a
+      locked pod with the unlock command — nothing here ever unlocks.
   - `pods restore <pod> [--from <label>|big] [--path <subdir>] [--dir] [--timeout]
     [--overwrite-newer] [--with-git] [--dry-run]` — push a backup (pull's layout) back onto
     **one** pod over its direct endpoint: by default its newest `wNdM` snapshot (files under
