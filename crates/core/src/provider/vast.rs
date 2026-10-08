@@ -896,6 +896,15 @@ impl Provider for VastProvider {
         Ok(())
     }
 
+    async fn start_pod(&self, id: &str) -> Result<()> {
+        // The second half of `restart_pod`'s stop+start: the desired state back to running.
+        send_ok(
+            self.auth(self.client.put(format!("{}/instances/{}/", self.base, id)).json(&json!({"state": "running"}))),
+            "vast start",
+        )
+        .await
+    }
+
     async fn terminate_pod(&self, id: &str) -> Result<()> {
         send_ok(self.auth(self.client.delete(format!("{}/instances/{}/", self.base, id))), "vast terminate").await
     }

@@ -57,6 +57,16 @@ pub fn is_billing(status: &str) -> bool {
     )
 }
 
+/// Whether a pod in this state is **stopped** — there, but powered off until someone starts
+/// it (`pods start`): RunPod/Vast `EXITED`, `STOPPED`, Hetzner `off`. An allow-list, like
+/// [`is_billing`]: a state we don't know (or one on its way somewhere, `STOPPING`) is not
+/// "stopped", so it's never told to start. A stopped pod has no live SSH endpoint — a
+/// listing may still show its last one, which belongs to nothing now — so the SSH commands
+/// skip it saying so, and `restart` (which needs a running pod) points at `pods start`.
+pub fn is_stopped(status: &str) -> bool {
+    matches!(status.trim().to_ascii_uppercase().as_str(), "EXITED" | "STOPPED" | "OFF")
+}
+
 /// Whether a pod on `provider` is costing its hourly rate right now — what the fleet total
 /// and the `$/H` column count. [`is_billing`], except that Hetzner charges for a server for
 /// as long as it exists, powered off included (its resources stay reserved): an `off`
@@ -100,6 +110,26 @@ mod tests {
         ];
         for (status, want) in cases {
             assert_eq!(is_billing(status), want, "{status:?}");
+        }
+    }
+
+    #[test]
+    fn stopped_statuses_table() {
+        for (status, stopped) in [
+            ("EXITED", true),
+            ("exited", true),
+            ("STOPPED", true),
+            ("off", true),
+            (" Off ", true),
+            ("RUNNING", false),
+            ("STOPPING", false), // on its way: not startable yet
+            ("TERMINATED", false),
+            ("PROVISIONING", false),
+            ("UNKNOWN", false),
+            ("", false),
+        ] {
+            assert_eq!(is_stopped(status), stopped, "{status:?}");
+            assert!(!(is_stopped(status) && is_billing(status)), "{status:?}: never both");
         }
     }
 

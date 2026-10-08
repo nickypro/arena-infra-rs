@@ -392,10 +392,13 @@ mod fake {
 
     /// Per-host (`host:port`) queues of replies, consumed one per call (exec or copy, in
     /// call order). An unscripted or exhausted host answers every call with success, so a
-    /// test only scripts the interesting part.
+    /// test only scripts the interesting part. Standing answers ([`FakeRemote::on`]) cover a
+    /// long scenario whose exact call order isn't the point: an exec whose command contains a
+    /// rule's text gets that rule's reply whenever the host's queue is empty.
     #[derive(Debug, Default)]
     pub struct FakeRemote {
         script: Mutex<HashMap<String, VecDeque<FakeReply>>>,
+        rules: Mutex<Vec<(String, String, FakeReply)>>,
         calls: Mutex<Vec<RemoteCall>>,
     }
 
@@ -410,6 +413,13 @@ mod fake {
             self
         }
 
+        /// A standing answer for `host`: every exec whose command contains `needle` (and that
+        /// no queued reply answers) gets `reply`. The first matching rule wins.
+        pub fn on(&self, host: &str, needle: &str, reply: FakeReply) -> &Self {
+            self.rules.lock().unwrap().push((host.to_string(), needle.to_string(), reply));
+            self
+        }
+
         /// Every call so far, in the order they started.
         pub fn calls(&self) -> Vec<RemoteCall> {
             self.calls.lock().unwrap().clone()
@@ -420,16 +430,22 @@ mod fake {
             self.calls().into_iter().filter(|c| c.host() == host).collect()
         }
 
-        /// Record the call (at its *start*, so a hung call is visible) and pop its reply.
+        /// Record the call (at its *start*, so a hung call is visible) and pop its reply —
+        /// else a standing rule's ([`FakeRemote::on`]), else success.
         fn begin(&self, call: RemoteCall) -> FakeReply {
             let host = call.host().to_string();
+            let cmd = match &call {
+                RemoteCall::Exec { cmd, .. } => Some(cmd.clone()),
+                RemoteCall::Copy { .. } => None,
+            };
             self.calls.lock().unwrap().push(call);
-            self.script
-                .lock()
-                .unwrap()
-                .get_mut(&host)
-                .and_then(VecDeque::pop_front)
-                .unwrap_or_else(FakeReply::ok)
+            if let Some(reply) = self.script.lock().unwrap().get_mut(&host).and_then(VecDeque::pop_front) {
+                return reply;
+            }
+            cmd.and_then(|cmd| {
+                self.rules.lock().unwrap().iter().find(|(h, needle, _)| *h == host && cmd.contains(needle.as_str())).map(|(_, _, r)| r.clone())
+            })
+            .unwrap_or_else(FakeReply::ok)
         }
 
         async fn answer(what: &str, reply: FakeReply, timeout: Option<Duration>) -> Result<SshOutput> {
@@ -919,6 +935,23 @@ mod tests {
             ]
         );
         assert_eq!(fake.calls().len(), 5);
+    }
+
+    /// Standing answers: by command text, per host, after the queue — and never for a copy.
+    #[tokio::test]
+    async fn fake_remote_rules_answer_by_command_text_when_nothing_is_queued() {
+        let fake = FakeRemote::new();
+        let t = target();
+        fake.on("1.2.3.4:22001", "SSH_OK", FakeReply::stdout("GPU\nSSH_OK\n"));
+        fake.on("1.2.3.4:22001", "", FakeReply::exit(9, "anything else"));
+        fake.script("1.2.3.4:22001", [FakeReply::stdout("queued first")]);
+        assert_eq!(fake.exec(&t, "echo SSH_OK", None).await.unwrap().stdout, "queued first");
+        assert_eq!(fake.exec(&t, "echo SSH_OK", None).await.unwrap().stdout, "GPU\nSSH_OK\n");
+        assert_eq!(fake.exec(&t, "true", None).await.unwrap().code, Some(9), "first matching rule wins");
+        assert!(fake.copy(&t, "/a", "/b", None).await.unwrap().success, "rules are for execs");
+        let mut other = target();
+        other.port = 22002;
+        assert!(fake.exec(&other, "echo SSH_OK", None).await.unwrap().stdout.is_empty(), "rules are per host");
     }
 
     #[tokio::test(start_paused = true)]

@@ -172,6 +172,9 @@ impl Provider for MultiProvider {
     async fn restart_pod(&self, id: &str) -> Result<()> {
         self.backend_for(id).await?.restart_pod(id).await
     }
+    async fn start_pod(&self, id: &str) -> Result<()> {
+        self.backend_for(id).await?.start_pod(id).await
+    }
     fn restart_wipes_container_disk(&self, pod: &Pod) -> bool {
         // Ask the backend that owns the pod: by its `provider` tag first (as `enrich`),
         // else the id→backend cache. A pod no backend claims is assumed to wipe — the

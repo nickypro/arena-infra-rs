@@ -31,6 +31,7 @@ pub mod provider;
 pub mod proxy;
 pub mod pull;
 pub mod remote;
+pub mod replica;
 pub mod restore;
 pub mod retry;
 pub mod schedule;

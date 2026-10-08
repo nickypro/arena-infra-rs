@@ -41,6 +41,36 @@ pub struct PullConfig {
     /// keep-alives while either side is busy checksumming a big file. `None` = no limit.
     /// The wall-clock bound on a whole transfer is the caller's (`BACKUP_TIMEOUT_SECS`).
     pub io_timeout_secs: Option<u64>,
+    /// Excludes that win over [`Self::includes`] (emitted before them): a path inside an
+    /// included tree that must still never be copied. Empty for the backup tiers.
+    pub first_excludes: Vec<String>,
+    /// What the transfer may do to the receiver's own files ([`Mirror`]). Every backup tier
+    /// accumulates (never deletes); only a pod-to-pod replication mirrors, and only when it
+    /// says so per transfer.
+    pub mirror: Mirror,
+}
+
+/// What a transfer may do to files on the RECEIVING side that the sender doesn't have (or
+/// has a different version of) — the one switch between a backup and a replica, so a
+/// deletion can only ever be asked for by name, never inherited from a shared default.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Mirror {
+    /// Never delete on the receiver: every backup tier (`pods pull`/`backup`), restore, and
+    /// any copy that doesn't say otherwise. What was copied before stays, even once it's gone
+    /// from the source.
+    #[default]
+    Accumulate,
+    /// `--delete`: the receiver becomes an exact copy. Only for a scratch copy the tool owns
+    /// outright and nothing else writes — the via-local staging dir of a pod-to-pod copy —
+    /// so a file deleted on the source can't come back through a stale stage.
+    Exact,
+    /// `--delete --backup --backup-dir=<dir>`: a replica on another *pod* (`replace` /
+    /// `migrate` into `<name>-new`). Deletions propagate (a file the participant deleted
+    /// mustn't reappear on the new pod), but whatever the transfer overwrites or deletes on
+    /// the receiver is MOVED into `dir` (relative to the receiving directory), never
+    /// destroyed: the new pod may hold work of its own — after a cutover then a revert, or a
+    /// test run on it ([`crate::replica`] reports and tidies what was moved).
+    Replica { backup_dir: String },
 }
 
 /// The default [`PullConfig::io_timeout_secs`]: 5 minutes without a byte means the
@@ -93,9 +123,20 @@ impl Default for PullConfig {
             ],
             remote_path: String::new(),
             io_timeout_secs: Some(RSYNC_IO_TIMEOUT_SECS),
+            first_excludes: Vec::new(),
+            mirror: Mirror::Accumulate,
         }
     }
 }
+
+/// What the pod-to-pod replication ([`PullConfig::replication`]) leaves behind, for the
+/// `replace` / `migrate copy` output — what the copy really drops, not "caches".
+pub const REPLICATION_SKIPS: &str = "skips caches and other dot-dirs (.cache, .venv, .vscode-server, .ssh, .claude), \
+     venvs, site-packages and ~/.local/lib (pip --user), HF caches, ~/.local/share/uv, shell rc files + \
+     history (the API keys follow by name), ~/.name";
+
+/// What it does carry besides the plain files: for the same output.
+pub const REPLICATION_KEEPS: &str = "the home incl. .git, ~/.config, ~/.jupyter, ~/.ipython, ~/.local (bin, share)";
 
 impl PullConfig {
     /// Drop the `.git` includes (so `.git` is excluded by `**/.*/` like other dotdirs).
@@ -117,9 +158,37 @@ impl PullConfig {
     ///
     /// `.cache` and the HuggingFace model/dataset caches are already excluded by the shared
     /// defaults, and `.git` is still kept so the new pod inherits branch/commit state.
+    ///
+    /// The participant's small config dot-dirs ARE carried (live finding #27: every hidden
+    /// dir was dropped, `~/.config` with wandb's settings among them): `~/.config`,
+    /// `~/.jupyter`, `~/.ipython`, `~/.local` (its `bin/` and `share/`; `lib/` — pip
+    /// `--user` installs — and uv's managed Pythons are reconstructable and stay behind).
+    /// `~/.name` is not carried: it names the pod it's on, and setup / the swap write it.
+    /// [`REPLICATION_KEEPS`] / [`REPLICATION_SKIPS`] say so in the output.
+    ///
+    /// It accumulates ([`Mirror::Accumulate`]) unless the caller asks for a mirror per
+    /// transfer: deletion is never a default.
     pub fn replication() -> Self {
         let mut s = Self { max_size: None, ..Self::default() };
         s.includes.retain(|i| !i.contains(".claude"));
+        // Root-anchored (the home's own): the dir, then (where wanted whole) its contents.
+        for dir in [".config", ".jupyter", ".ipython"] {
+            s.includes.push(format!("/{dir}/"));
+            s.includes.push(format!("/{dir}/**"));
+        }
+        // `.local` itself only: its non-dot children are copied by default, minus the
+        // excludes below.
+        s.includes.push("/.local/".to_string());
+        s.excludes.push("/.local/lib/".to_string());
+        s.excludes.push("/.local/share/uv/".to_string());
+        s.excludes.push("/.local/share/Trash/".to_string());
+        // Never Claude Code state, even inside an included tree (ToS, see above).
+        s.first_excludes.push("/.config/claude*".to_string());
+        s.first_excludes.push("/.config/anthropic*".to_string());
+        // The receiver's own: its name, and the replica bookkeeping (`crate::replica`) — an
+        // exclude also keeps a mirroring transfer from deleting them there.
+        s.excludes.push("/.name".to_string());
+        s.excludes.push(format!("/{}", crate::replica::LAST_SYNC));
         // Exclude the whole `.claude` family — both the `.claude/` dir AND the `.claude.json`
         // credential *file* in the home root. The default `**/.*/` only drops dot-*dirs*, so
         // `.claude.json` (a file) would otherwise be replicated, leaking Claude Code creds.
@@ -271,9 +340,13 @@ pub fn pod_to_pod_command_into(
     // `push_rsync_args` — the `.`-entry chown of `/root` is what locks sshd out).
     parts.push("--no-owner".into());
     parts.push("--no-group".into());
+    // ConnectTimeout: a destination the source can't reach (two pods behind one public IP:
+    // the hairpin connect just hangs) must fail in seconds — the caller then copies via the
+    // control machine — not after the kernel's ~2 min SYN timeout (live finding #30).
     let ssh = format!(
         "ssh -p {dest_port} -o BatchMode=yes -o StrictHostKeyChecking=no \
-         -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -i {remote_key}"
+         -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout={POD_TO_POD_CONNECT_TIMEOUT_SECS} \
+         -o ServerAliveInterval=30 -i {remote_key}"
     );
     parts.push("-e".into());
     parts.push(shell_quote(&ssh));
@@ -290,6 +363,10 @@ pub fn pod_to_pod_command_into(
     });
     parts.join(" ")
 }
+
+/// How long the source pod's ssh may take to connect to the destination in a direct
+/// pod-to-pod copy ([`pod_to_pod_command`]).
+pub const POD_TO_POD_CONNECT_TIMEOUT_SECS: u64 = 15;
 
 /// Single-quote a value for safe inclusion in a remote `sh -c` string (POSIX `'\''`).
 fn shell_quote(s: &str) -> String {
@@ -309,6 +386,15 @@ fn rsync_flags(pc: &PullConfig) -> Vec<String> {
     if let Some(t) = pc.io_timeout_secs {
         a.push(format!("--timeout={t}"));
     }
+    match &pc.mirror {
+        Mirror::Accumulate => {}
+        Mirror::Exact => a.push("--delete".into()),
+        Mirror::Replica { backup_dir } => {
+            a.push("--delete".into());
+            a.push("--backup".into());
+            a.push(format!("--backup-dir={backup_dir}"));
+        }
+    }
     // `--max-size` keeps the snapshot tier small (the big tier leaves it `None` to take
     // everything). `--min-size` is currently unused but honored if a caller sets it.
     if let Some(m) = &pc.max_size {
@@ -317,7 +403,12 @@ fn rsync_flags(pc: &PullConfig) -> Vec<String> {
     if let Some(m) = &pc.min_size {
         a.push(format!("--min-size={m}"));
     }
-    // Includes first (they win over a later exclude), then excludes.
+    // Excludes that must win even inside an included tree, then includes (they win over a
+    // later exclude), then excludes.
+    for ex in &pc.first_excludes {
+        a.push("--exclude".into());
+        a.push(ex.clone());
+    }
     for inc in &pc.includes {
         a.push("--include".into());
         a.push(inc.clone());

@@ -208,6 +208,19 @@ pub trait Provider: Send + Sync {
         true
     }
 
+    /// Mutating. Start a stopped pod again (same id): RunPod's `start` (REST v1 `POST
+    /// /pods/{id}/start`, v2 action `start`), Vast's desired state `running`, Hetzner's
+    /// `poweron`. Where [`Self::restart_wipes_container_disk`] holds, the pod comes back as
+    /// a fresh image — its container disk went at the stop — so callers re-run setup.
+    ///
+    /// Separate from [`Self::restart_pod`] because the providers keep them apart: a RunPod
+    /// restart needs a running pod (v2 answers 409 for an `EXITED` one; v1 answered 2xx and
+    /// left it stopped). Default: unsupported, so a backend that can't start is said, never
+    /// silently restarted instead.
+    async fn start_pod(&self, _id: &str) -> Result<()> {
+        Err(Error::NotImplemented(format!("starting a stopped pod isn't supported on provider `{}`", self.name())))
+    }
+
     /// Mutating and irreversible.
     async fn terminate_pod(&self, id: &str) -> Result<()>;
 

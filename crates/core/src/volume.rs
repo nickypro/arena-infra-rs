@@ -674,13 +674,13 @@ pub fn pod_to_pod_copy(
     pc: &crate::pull::PullConfig,
     rel: Option<&str>,
 ) -> String {
-    use crate::pull::{pod_to_pod_command, pod_to_pod_command_into, PullConfig};
+    use crate::pull::{pod_to_pod_command, pod_to_pod_command_into};
     let Some(rel) = rel else {
         return pod_to_pod_command(dest_ip, dest_port, dest_user, remote_key, pc);
     };
     let mut home = pc.clone();
     home.excludes.push(format!("/{rel}"));
-    let tree = PullConfig { remote_path: format!("{rel}/"), ..pc.clone() };
+    let tree = tree_config(pc, rel);
     format!(
         "{} && if [ -d \"$HOME\"/{} ]; then {}; fi",
         pod_to_pod_command(dest_ip, dest_port, dest_user, remote_key, &home),
@@ -706,10 +706,25 @@ pub fn push_jobs(
         Some(rel) => {
             let mut home = pc.clone();
             home.excludes.push(format!("/{rel}"));
-            let tree = crate::pull::PullConfig { remote_path: format!("{rel}/"), ..pc.clone() };
-            vec![(stage.clone(), home), (format!("{stage}{rel}/"), tree)]
+            vec![(stage.clone(), home), (format!("{stage}{rel}/"), tree_config(pc, rel))]
         }
     }
+}
+
+/// The config for carrying the repo's tree into `<rel>/` on its own, from the home copy's:
+/// the same filters, and — for a replica — its own `--backup-dir` beside the repo's real
+/// directory ([`crate::replica::tree_backup_dir`]). A `rel` that can't name one gets no
+/// mirror at all: a deletion is never made without somewhere to move the file to.
+fn tree_config(pc: &crate::pull::PullConfig, rel: &str) -> crate::pull::PullConfig {
+    use crate::pull::Mirror;
+    let mirror = match &pc.mirror {
+        Mirror::Replica { backup_dir } => match crate::replica::tree_backup_dir(backup_dir, rel) {
+            Some(backup_dir) => Mirror::Replica { backup_dir },
+            None => Mirror::Accumulate,
+        },
+        other => other.clone(),
+    };
+    crate::pull::PullConfig { remote_path: format!("{rel}/"), mirror, ..pc.clone() }
 }
 
 /// Single-quote for a POSIX `sh -c` string (`'\''` escaping).
@@ -1203,6 +1218,108 @@ mod tests {
         assert!(!is_link("plain/home/ARENA_materials"), "replaced by a directory");
         assert_eq!(read("plain/ws/ARENA_materials/chapter1/work.py"), "image\n", "the volume copy never got the work");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A replica sync (live findings #7 and #20) through both copies, real rsync, the repo a
+    /// link onto each pod's volume: a file the participant deleted on the original is gone
+    /// from the new pod — in the home and in the repo — but MOVED aside, not destroyed: the
+    /// home's into `~/.arena-sync-replaced/<stamp>/`, the repo's beside its real directory
+    /// (on the volume, so the move is a rename). The tidy-up then finds both folders through
+    /// the link. Never `--delete` on the source: it's only ever read.
+    #[cfg(unix)]
+    #[test]
+    fn a_replica_copy_moves_what_it_deletes_beside_each_tree() {
+        use crate::pull::{push_rsync_args, PullConfig};
+        use crate::replica::{home_mirror, parse_settle, settle_command, SettleMode, REPLACED_DIR};
+        if !fake_ssh::have_rsync() {
+            eprintln!("rsync not installed — skipping");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("arena-volume-replica-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let put = |rel: &str, body: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        let exists = |rel: &str| root.join(rel).exists();
+        let pod = |name: &str| {
+            put(&format!("{name}/ws/ARENA_materials/chapter1/work.py"), "work\n");
+            std::fs::create_dir_all(root.join(format!("{name}/home"))).unwrap();
+            std::os::unix::fs::symlink(root.join(format!("{name}/ws/ARENA_materials")), root.join(format!("{name}/home/ARENA_materials"))).unwrap();
+        };
+        pod("old");
+        put("old/home/notes.txt", "notes\n");
+        let pc = PullConfig { mirror: home_mirror("S1"), ..PullConfig::replication() };
+        let source_before: Vec<_> = walk(&root.join("old"));
+
+        // Direct, run on the "source".
+        pod("new");
+        put("new/ws/ARENA_materials/deleted_on_original.py", "old copy\n");
+        put("new/home/gone.txt", "old copy\n");
+        put("new/home/.name", "export MACHINE_NAME='a-new'\n");
+        let bin = fake_ssh::install_as_ssh(&root);
+        let cmd = pod_to_pod_copy("10.0.0.2", 22, "root", "/k", &pc, Some("ARENA_materials"));
+        assert!(cmd.contains("--delete") && cmd.contains("ConnectTimeout="), "{cmd}");
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .env("HOME", root.join("old/home"))
+            .env("PATH", path)
+            .env("FAKE_HOME", root.join("new/home"))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(!exists("new/ws/ARENA_materials/deleted_on_original.py") && !exists("new/home/gone.txt"));
+        assert!(exists(&format!("new/ws/{REPLACED_DIR}/S1/ARENA_materials/deleted_on_original.py")), "beside the real repo, on the volume");
+        assert!(exists(&format!("new/home/{REPLACED_DIR}/S1/gone.txt")));
+        assert!(exists("new/home/ARENA_materials/chapter1/work.py") && exists("new/home/notes.txt"));
+        assert_eq!(std::fs::read_to_string(root.join("new/home/.name")).unwrap(), "export MACHINE_NAME='a-new'\n", "~/.name stays the pod's own");
+        assert_eq!(walk(&root.join("old")), source_before, "the source is only read");
+        // The tidy-up finds both folders (no stamp: it keeps everything and says so).
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(settle_command("S1", Some("ARENA_materials"), SettleMode::Keep))
+            .env("HOME", root.join("new/home"))
+            .output()
+            .unwrap();
+        let s = parse_settle(&String::from_utf8_lossy(&out.stdout)).unwrap();
+        assert_eq!((s.kept, s.dirs.len()), (2, 2), "{s:?}");
+
+        // Via local staging: the push leg, the same way.
+        pod("via");
+        put("via/ws/ARENA_materials/deleted_on_original.py", "old copy\n");
+        let stage = format!("{}/", root.join("stage").display());
+        put("stage/notes.txt", "notes\n");
+        put("stage/ARENA_materials/chapter1/work.py", "work\n");
+        let fake = fake_ssh::install(&root);
+        let target = crate::ssh::SshTarget { user: "root".into(), host: "10.0.0.2".into(), port: 22, key_paths: vec![], connect_timeout_secs: 10 };
+        for (src, cfg) in push_jobs(&pc, &stage, Some("ARENA_materials"), true) {
+            fake_ssh::rsync(&fake_ssh::swap_transport(&push_rsync_args(&target, &cfg, &src), &fake), &root.join("via/home"));
+        }
+        assert!(!exists("via/ws/ARENA_materials/deleted_on_original.py"));
+        assert!(exists(&format!("via/ws/{REPLACED_DIR}/S1/ARENA_materials/deleted_on_original.py")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every file under `dir` with its contents, sorted — to show a tree is untouched.
+    #[cfg(unix)]
+    fn walk(dir: &std::path::Path) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap().flatten() {
+                let ft = e.file_type().unwrap();
+                if ft.is_dir() {
+                    stack.push(e.path());
+                } else if ft.is_file() {
+                    out.push((e.path().display().to_string(), std::fs::read_to_string(e.path()).unwrap_or_default()));
+                }
+            }
+        }
+        out.sort();
+        out
     }
 
     /// `--remote-path` / `BACKUP_REMOTE_PATH` pulls through the real rsync (fake transport):

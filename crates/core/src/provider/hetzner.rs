@@ -291,6 +291,11 @@ impl Provider for HetznerProvider {
         }
     }
 
+    async fn start_pod(&self, id: &str) -> Result<()> {
+        // A powered-off VM keeps its disk: poweron is all a start is.
+        self.power_action(id, "poweron").await
+    }
+
     async fn terminate_pod(&self, id: &str) -> Result<()> {
         send_ok(self.auth(self.client.delete(format!("{}/servers/{}", self.base, id))), "hetzner terminate").await
     }

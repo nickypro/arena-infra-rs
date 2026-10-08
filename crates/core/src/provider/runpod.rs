@@ -261,6 +261,12 @@ impl Provider for RunpodProvider {
         send_ok(self.auth(self.client.post(format!("{}/pods/{id}/restart", self.base))), "restart pod").await
     }
 
+    async fn start_pod(&self, id: &str) -> Result<()> {
+        // "Start or resume a Pod" — the way back from a stop. Not `/restart`: on an EXITED
+        // pod that answered 2xx and left it stopped (live 2026-10-08).
+        send_ok(self.auth(self.client.post(format!("{}/pods/{id}/start", self.base))), "start pod").await
+    }
+
     async fn terminate_pod(&self, id: &str) -> Result<()> {
         send_ok(self.auth(self.client.delete(format!("{}/pods/{id}", self.base))), "terminate pod").await
     }
@@ -851,6 +857,23 @@ mod tests {
                 "POST /pods/p1/stop HTTP/1.1",
             ]
         );
+    }
+
+    /// `pods start` (live finding #15): v1 starts a stopped pod with `POST /pods/{id}/start`
+    /// — not `/restart`, which answered 2xx on an EXITED pod and left it stopped. A refusal
+    /// (e.g. no free GPU left on the host) keeps the provider's words.
+    #[tokio::test]
+    async fn v1_start_posts_the_start_endpoint() {
+        use crate::http::test_server::{canned, client, serve};
+        let srv = serve(vec![
+            canned(200, "application/json", "{}"),
+            canned(500, "application/json", r#"{"error":"There are not enough free GPUs on the host machine to start this pod."}"#),
+        ]);
+        let p = RunpodProvider::with_base("rpa_K", &srv.base, client());
+        p.start_pod("p1").await.unwrap();
+        let e = p.start_pod("p1").await.unwrap_err().to_string();
+        assert!(e.contains("start pod HTTP 500") && e.contains("not enough free GPUs"), "{e}");
+        assert_eq!(*srv.requests.lock().unwrap(), ["POST /pods/p1/start HTTP/1.1", "POST /pods/p1/start HTTP/1.1"]);
     }
 
     #[test]

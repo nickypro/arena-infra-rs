@@ -561,6 +561,12 @@ fn action_body(action: &str) -> Value {
     json!({ "action": action })
 }
 
+/// A pod action (`stop`, `restart`, `start`) — built, not sent, so a test pins its method,
+/// URL and body.
+fn action_request(client: &Client, api_key: &str, id: &str, action: &str) -> Result<RequestBuilder> {
+    Ok(api_request(client, api_key, Method::POST, pod_url(id, Some("action"))?).json(&action_body(action)))
+}
+
 /// The `PATCH /v2/pods/{id}` body for a reimage: new image + the env, which REPLACES the
 /// pod's env wholesale (PATCH semantics on `env`, same contract as v1's reimage) — so the
 /// caller passes everything to keep, and the account keys are merged into `PUBLIC_KEY`
@@ -852,8 +858,7 @@ impl Provider for RunpodV2Provider {
     // The mutating calls below don't use their success body, so only the status is
     // judged (`send_ok`): one that worked is never reported as failed over its body.
     async fn stop_pod(&self, id: &str) -> Result<()> {
-        let rb = api_request(&self.client, &self.api_key, Method::POST, pod_url(id, Some("action"))?);
-        send_ok(rb.json(&action_body("stop")), "stop pod").await
+        send_ok(action_request(&self.client, &self.api_key, id, "stop")?, "stop pod").await
     }
 
     fn restart_wipes_container_disk(&self, _pod: &Pod) -> bool {
@@ -865,8 +870,12 @@ impl Provider for RunpodV2Provider {
         // unlike stop/start. A pod in any other state answers 409. It resets the container
         // to its image: everything outside a volume is WIPED (live-verified on a sandbox
         // pod — a marker file, ~/.name and setup's git remote were all gone afterwards).
-        let rb = api_request(&self.client, &self.api_key, Method::POST, pod_url(id, Some("action"))?);
-        send_ok(rb.json(&action_body("restart")), "restart pod").await
+        send_ok(action_request(&self.client, &self.api_key, id, "restart")?, "restart pod").await
+    }
+
+    async fn start_pod(&self, id: &str) -> Result<()> {
+        // The `start` action an EXITED pod lists in its `actions` (restart answers 409 there).
+        send_ok(action_request(&self.client, &self.api_key, id, "start")?, "start pod").await
     }
 
     async fn terminate_pod(&self, id: &str) -> Result<()> {
@@ -1541,9 +1550,16 @@ mod tests {
 
     #[test]
     fn action_and_reimage_bodies() {
-        for a in ["stop", "restart", "terminate"] {
+        for a in ["stop", "restart", "terminate", "start"] {
             assert_eq!(action_body(a), json!({"action": a}));
         }
+        // `pods start` (live finding #15): the `start` action an EXITED pod lists, POSTed to
+        // the pod's action endpoint — never `restart` (409 on an EXITED pod).
+        let req = action_request(&Client::new(), "rpa_K", "p3", "start").unwrap().build().unwrap();
+        assert_eq!((req.method(), req.url().as_str()), (&Method::POST, "https://api.runpod.io/v2/pods/p3/action"));
+        let body: Value = serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(body, json!({"action": "start"}));
+        assert!(action_request(&Client::new(), "rpa_K", " ", "start").is_err());
         let env = vec![("MACHINE_NAME".into(), "devtest-apple".into()), ("PUBLIC_KEY".into(), "ssh-ed25519 K1 k1".into())];
         let v = reimage_payload("img:9", &env, &["ssh-ed25519 ADMIN admin".into()]);
         assert_eq!(
