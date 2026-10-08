@@ -19,6 +19,7 @@ use arena_core::selector::{Naming, SelectArgs, Selector};
 use arena_core::ssh::SshTarget;
 use arena_core::{Config, PodSpec};
 
+mod teardown;
 mod up;
 
 const DEFAULT_CONFIG: &str = "/home/dev/prod-ro/config.env";
@@ -136,6 +137,41 @@ enum Cmd {
         proxy: bool,
         /// Also write the rendered config to this local path (else just prints it).
         #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// End-of-program teardown check (read-only): is anything still billing, or scheduled to
+    /// recreate something? Every pod on every configured provider in any state (a stopped pod
+    /// keeps its name and still bills its disk), RunPod network volumes (size, ~$/month), this
+    /// user's arena cron lines and `at` jobs, this cohort's enabled OpenRouter keys (with
+    /// usage) and the forwards left in the local proxy config — as a ✓/✗/? checklist with the
+    /// exact command that cleans up each item. Deletes nothing. Exits non-zero unless all is
+    /// clear; a source that couldn't be read is `?` (unknown), never "empty".
+    Teardown {
+        /// Run the check. Required: `teardown` itself tears nothing down — the checklist
+        /// prints the commands that do.
+        #[arg(long)]
+        check: bool,
+        /// Print the checklist as JSON (for scripts); the exit status is the same.
+        #[arg(long)]
+        json: bool,
+    },
+    /// The fleet in one read-only picture: `pods list`'s columns plus each pod's proxy port
+    /// (live/stale) and its last `pods test --deep` / `up --check` verdict with its age (from
+    /// the local health cache). Lists pods and reads local files only: never SSHes, never
+    /// runs a check, changes nothing.
+    Snapshot {
+        /// The full internal snapshot as JSON (ids, endpoints, costs, check reasons) — for
+        /// scripts and the operator, never for publishing.
+        #[arg(long)]
+        json: bool,
+        /// The public, allowlisted JSON for the web dashboard (`web/fleet.html`): only
+        /// MACHINE_NAME_LIST machines, only name / GPU / up-starting-down / health + age +
+        /// a fixed-vocabulary reason / maintenance times. No IPs, ports, ids, keys, costs.
+        #[arg(long)]
+        public: bool,
+        /// Write to this file instead of stdout, atomically (temp + rename), so a web server
+        /// never serves a half-written file.
+        #[arg(long, value_name = "FILE")]
         out: Option<PathBuf>,
     },
 }
@@ -303,6 +339,11 @@ enum CronCmd {
         /// terminated from the dashboard, a restart that moved an SSH endpoint.
         #[arg(long)]
         proxy: bool,
+        /// Also write the public dashboard JSON every 2 minutes: `snapshot --public --out
+        /// <DIR>/fleet.json` (atomic; logged to ~/arena-snapshot-cron.log). Put
+        /// `web/fleet.html` in the same directory and serve it with any static host.
+        #[arg(long, value_name = "DIR")]
+        snapshot: Option<PathBuf>,
     },
     /// Remove the arena-managed cron lines.
     Remove,
@@ -1921,7 +1962,11 @@ async fn main() -> Result<()> {
         Cmd::SshConfig { proxy, out } => {
             handle_ssh_config(provider.unwrap().as_ref(), &cfg, proxy, out.as_deref()).await
         }
+        Cmd::Snapshot { json, public, out } => {
+            handle_snapshot(provider.unwrap().as_ref(), &cfg, json, public, out.as_deref()).await
+        }
         Cmd::Keys(k) => handle_keys(k, provider.unwrap().as_ref(), remote, &cfg, cli.yes).await,
+        Cmd::Teardown { check, json } => teardown::handle_teardown(provider.unwrap().as_ref(), &cfg, check, json).await,
         Cmd::Gpus { json } => handle_gpus(&cfg, &cli.provider, json).await,
         Cmd::Offers { gpu, cloud, max_price, gpus, order, json } => {
             handle_offers(&cfg, &cli.provider, gpu, cloud, max_price, gpus, order, json).await
@@ -2533,6 +2578,25 @@ fn strip_arena_block(existing: &str) -> String {
     s
 }
 
+/// The crontab's arena lines, for `cron show` and `teardown --check`: every line inside
+/// arena's managed block(s) — what `cron remove` clears — and every job line outside them that
+/// mentions arena anyway (hand-added, so `cron remove` won't touch it).
+fn arena_cron_lines(crontab: &str) -> arena_core::teardown::CronLines {
+    let mut out = arena_core::teardown::CronLines::default();
+    let mut in_block = false;
+    for line in crontab.lines() {
+        match line.trim() {
+            CRON_BEGIN => in_block = true,
+            CRON_END => in_block = false,
+            "" => {}
+            _ if in_block => out.managed.push(line.to_string()),
+            _ if arena_core::teardown::cron_line_is_arena_job(line) => out.unmanaged.push(line.to_string()),
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Build new crontab text = existing (minus old arena block) + the new arena block
 /// (empty `lines` => just remove). Other entries are preserved untouched.
 fn with_arena_block(existing: &str, lines: &[String]) -> String {
@@ -2569,12 +2633,7 @@ async fn handle_cron(cmd: CronCmd, config_path: &std::path::Path) -> Result<()> 
 
     match cmd {
         CronCmd::Show => {
-            let arena: Vec<&str> = current
-                .lines()
-                .skip_while(|l| l.trim() != CRON_BEGIN)
-                .take_while(|l| l.trim() != CRON_END)
-                .filter(|l| l.trim() != CRON_BEGIN)
-                .collect();
+            let arena = arena_cron_lines(&current).managed;
             if arena.is_empty() {
                 println!("(no arena-managed cron lines)");
             } else {
@@ -2590,7 +2649,7 @@ async fn handle_cron(cmd: CronCmd, config_path: &std::path::Path) -> Result<()> 
             println!("Removed arena-managed cron lines.");
             return Ok(());
         }
-        CronCmd::Install { schedule, start_date, pull, proxy } => {
+        CronCmd::Install { schedule, start_date, pull, proxy, snapshot } => {
             let exe = std::env::current_exe().context("finding the arena executable path")?;
             let cfg_abs = std::fs::canonicalize(config_path)
                 .unwrap_or_else(|_| config_path.to_path_buf());
@@ -2604,6 +2663,7 @@ async fn handle_cron(cmd: CronCmd, config_path: &std::path::Path) -> Result<()> 
                 }
                 None => String::new(),
             };
+            let snapshot_dir = snapshot.as_deref().map(snapshot_cron_dir).transpose()?;
             let lines = cron_lines(&CronJob {
                 schedule: &schedule,
                 env_prefix: &env_prefix,
@@ -2612,6 +2672,7 @@ async fn handle_cron(cmd: CronCmd, config_path: &std::path::Path) -> Result<()> 
                 home: &home,
                 pull,
                 proxy,
+                snapshot_dir: snapshot_dir.as_deref(),
             });
             let new = with_arena_block(&current, &lines);
             write_crontab(&new).await?;
@@ -2635,6 +2696,28 @@ struct CronJob<'a> {
     home: &'a str,
     pull: bool,
     proxy: bool,
+    /// `--snapshot`: the (absolute, validated) directory `fleet.json` is written to.
+    snapshot_dir: Option<&'a str>,
+}
+
+/// How often the optional public snapshot is rewritten: often enough that the page's
+/// "updated N min ago" stays small, cheap (one list call per provider + one details query,
+/// no SSH), and well inside the page's 10-minute stale banner, so one slow tick never trips it.
+const SNAPSHOT_CRON_SCHEDULE: &str = "*/2 * * * *";
+
+/// `cron install --snapshot DIR`'s directory as it goes into the crontab: absolute (cron
+/// runs in `$HOME`), an existing directory, and free of `%` and newlines — crontab turns a
+/// `%` into a newline, which would silently cut the command short.
+fn snapshot_cron_dir(dir: &std::path::Path) -> Result<String> {
+    let abs = std::fs::canonicalize(dir).with_context(|| format!("--snapshot {}", dir.display()))?;
+    if !abs.is_dir() {
+        anyhow::bail!("--snapshot {}: not a directory", dir.display());
+    }
+    let s = abs.to_str().context("--snapshot: the directory path isn't UTF-8")?.to_string();
+    if s.contains('%') || s.contains('\n') {
+        anyhow::bail!("--snapshot {s}: a crontab line can't hold `%` or a newline — pick another directory");
+    }
+    Ok(s)
 }
 
 /// How often the optional proxy re-sync runs. Each tick is one list call per provider plus
@@ -2659,7 +2742,7 @@ const PROXY_CRON_PATH: &str = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/us
 /// write and the reload would leave a file nginx never loaded, which later ticks would
 /// read as up to date.
 fn cron_lines(job: &CronJob) -> Vec<String> {
-    let CronJob { schedule, env_prefix, exe, config, home, pull, proxy } = job;
+    let CronJob { schedule, env_prefix, exe, config, home, pull, proxy, snapshot_dir } = job;
     // `pods backup` now also rsyncs the home (the file backup); default the cron to
     // git-only (`--no-pull`) since it runs frequently, and let `--pull` opt into the
     // full backup each tick (rsync is incremental, so repeats only move deltas).
@@ -2673,6 +2756,17 @@ fn cron_lines(job: &CronJob) -> Vec<String> {
         lines.push(format!(
             "{PROXY_CRON_SCHEDULE} {PROXY_CRON_PATH} flock -n {home}/.arena-proxy-cron.lock \
              {exe} --config {config} proxy apply --yes >> {home}/arena-proxy-cron.log 2>&1"
+        ));
+    }
+    // The public dashboard JSON. Read-only (lists pods, reads local files), so safe
+    // unattended; `flock -n` as above so a tick stuck on a slow provider never piles up, and
+    // the write is atomic, so the page always reads a whole file (a killed tick just leaves
+    // the previous one, which the page then shows as stale).
+    if let Some(dir) = snapshot_dir {
+        let out = shell_quote(&format!("{}/fleet.json", dir.trim_end_matches('/')));
+        lines.push(format!(
+            "{SNAPSHOT_CRON_SCHEDULE} flock -n {home}/.arena-snapshot-cron.lock \
+             {exe} --config {config} snapshot --public --out {out} >> {home}/arena-snapshot-cron.log 2>&1"
         ));
     }
     lines
@@ -4958,11 +5052,184 @@ async fn handle_deep_test(
     for line in stderr {
         eprintln!("{line}");
     }
+    // For `arena snapshot` (and the dashboard): remember each verdict with its time. One more
+    // read-only list (each backend bounded) lets the cache drop pods since terminated.
+    if !results.is_empty() && health_cache_path(cfg).is_some() {
+        let listing = arena_core::proxy::Listing::from_results(provider.list_by_provider().await);
+        if let Some(warning) = record_health(cfg, &results, Some(&listing)) {
+            eprintln!("{warning}");
+        }
+    }
     let failed = results.iter().filter(|h| h.status == Status::Fail).count();
     if failed > 0 {
         anyhow::bail!("{failed} pod(s) failed the deep check");
     }
     Ok(())
+}
+
+/// Where this fleet's health cache lives ([`arena_core::snapshot::health_cache_path`]):
+/// under `ARENA_STATE_DIR` (config.env or the environment), else the XDG state dir — per
+/// `MACHINE_NAME_PREFIX`. `None` in this crate's unit tests unless the test's config sets
+/// `ARENA_STATE_DIR`: a test must never read or write the developer's real
+/// `~/.local/state`.
+fn health_cache_path(cfg: &Config) -> Option<std::result::Result<PathBuf, String>> {
+    if cfg!(test) && cfg.get("ARENA_STATE_DIR").is_none() {
+        return None;
+    }
+    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
+    // ARENA_STATE_DIR via the config (which also takes it from the environment); the XDG
+    // fallbacks straight from the environment.
+    Some(arena_core::snapshot::health_cache_path(prefix, |k| match k {
+        "ARENA_STATE_DIR" => cfg.get(k).map(String::from),
+        _ => std::env::var(k).ok(),
+    }))
+}
+
+/// Record deep-check verdicts in the health cache that `arena snapshot` reads, dropping the
+/// pods `listing` confirms gone. Best effort: a warning line, never an error — the verdicts
+/// were already printed and decided the exit status; the cache only feeds the snapshot.
+fn record_health(
+    cfg: &Config,
+    results: &[arena_core::health::PodHealth],
+    listing: Option<&arena_core::proxy::Listing>,
+) -> Option<String> {
+    let path = match health_cache_path(cfg)? {
+        Ok(p) => p,
+        Err(e) => return Some(format!("warning: deep-check results not cached for `arena snapshot`: {e}")),
+    };
+    match arena_core::snapshot::record_health(&path, results, listing, arena_core::snapshot::unix_now()) {
+        Ok(warning) => warning,
+        Err(e) => Some(format!("warning: couldn't write the health cache {}: {e}", path.display())),
+    }
+}
+
+/// `arena snapshot`: see [`collect_snapshot`] for what it reads, [`render_snapshot`] for the
+/// three outputs. `--out` replaces the file atomically — owner-only unless it's the public
+/// JSON (which a web server has to read) — and warns when it isn't the public JSON. A
+/// public file is kept (and the exit is non-zero) when the new one would show no machines
+/// only because a provider failed to list ([`arena_core::snapshot::would_blank_the_page`]).
+async fn handle_snapshot(
+    provider: &dyn Provider,
+    cfg: &Config,
+    json: bool,
+    public: bool,
+    out: Option<&std::path::Path>,
+) -> Result<()> {
+    let (snap, warnings) = collect_snapshot(provider, cfg, arena_core::snapshot::unix_now()).await?;
+    for w in warnings {
+        eprintln!("{w}");
+    }
+    let naming = Naming::from_config(cfg);
+    let text = render_snapshot(&snap, &naming, json, public)?;
+    match out {
+        None => print!("{text}"),
+        Some(path) => {
+            if !public {
+                eprintln!(
+                    "warning: {} gets the INTERNAL snapshot (ids, endpoints, costs) — publish only `--public` output",
+                    path.display()
+                );
+            } else if let Ok(previous) = std::fs::read_to_string(path) {
+                let next = arena_core::snapshot::public_snapshot(&snap, &naming);
+                if arena_core::snapshot::would_blank_the_page(&previous, &next) {
+                    anyhow::bail!(
+                        "{} failed to list and nothing else listed a machine — kept {} as it was rather than \
+                         publish an empty fleet (the page shows it going stale); re-run once it answers",
+                        snap.partial.join(", "),
+                        path.display()
+                    );
+                }
+            }
+            let mode = if public { 0o644 } else { 0o600 };
+            arena_core::snapshot::write_atomic(path, text.as_bytes(), mode)
+                .with_context(|| format!("writing {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Gather a [`arena_core::snapshot::FleetSnapshot`] — read-only by construction: one list
+/// call per provider (each bounded), the best-effort details query `pods list` makes, the
+/// local proxy config file and the health cache. No `Remote` is even in reach: no SSH, no
+/// deep check, no proxy over SSH. A provider that fails to list makes the snapshot partial
+/// (and the public one `complete: false`); if none answers it's an error and nothing is
+/// written — a page going stale says more than a page that shows an empty fleet. Returns
+/// the snapshot and the warning lines to print.
+async fn collect_snapshot(
+    provider: &dyn Provider,
+    cfg: &Config,
+    now: u64,
+) -> Result<(arena_core::snapshot::FleetSnapshot, Vec<String>)> {
+    use arena_core::snapshot::{self, HealthCache};
+    let listing = arena_core::proxy::Listing::from_results(provider.list_by_provider().await);
+    if !listing.any_ok() {
+        let errs: Vec<String> = listing.errors().iter().map(|(p, e)| format!("{p}: {e}")).collect();
+        anyhow::bail!("no provider listed its pods ({}) — nothing written", errs.join("; "));
+    }
+    let mut warnings = Vec::new();
+    let mut partial = Vec::new();
+    for (p, e) in listing.errors() {
+        warnings.push(format!("warning: {p} failed to list ({e}) — its pods are missing from the snapshot"));
+        partial.push(p.to_string());
+    }
+    let mut pods = listing.pods();
+    if let Some(w) = enrich_best_effort(provider, &mut pods, ENRICH_TIMEOUT).await {
+        warnings.push(w);
+    }
+    let (proxy, w) = snapshot_proxy_text(cfg);
+    warnings.extend(w);
+    let health = match health_cache_path(cfg) {
+        None => HealthCache::new(),
+        Some(Err(e)) => {
+            warnings.push(format!("warning: no health cache to read: {e}"));
+            HealthCache::new()
+        }
+        Some(Ok(path)) => {
+            let (cache, w) = HealthCache::load(&path);
+            warnings.extend(w);
+            cache
+        }
+    };
+    let snap = snapshot::build(&pods, &partial, proxy.as_deref(), &health, &Naming::from_config(cfg), now);
+    Ok((snap, warnings))
+}
+
+/// The proxy config the snapshot judges forwards by — never fetched over SSH: the local file
+/// when the proxy is local (`Some("")` when it doesn't exist yet), `Some("")` with no proxy
+/// configured at all (there are no forwards), `None` = unknown for a remote proxy or an
+/// unreadable file (with a warning for the latter).
+fn snapshot_proxy_text(cfg: &Config) -> (Option<String>, Option<String>) {
+    let Ok(px) = arena_core::proxy::ProxyConfig::from_config(cfg) else {
+        return (Some(String::new()), None);
+    };
+    if !px.local {
+        return (None, None);
+    }
+    let path = expand_tilde(&px.nginx_path);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => (Some(text), None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Some(String::new()), None),
+        Err(e) => (None, Some(format!("warning: can't read the proxy config {path} ({e}) — PROXY shows `?`"))),
+    }
+}
+
+/// What `arena snapshot` prints (or writes): the public allowlisted JSON with `--public`
+/// (whatever else is passed — it's the only form fit to publish), else the full internal
+/// JSON with `--json`, else the table. Pure.
+fn render_snapshot(
+    snap: &arena_core::snapshot::FleetSnapshot,
+    naming: &Naming,
+    json: bool,
+    public: bool,
+) -> Result<String> {
+    use arena_core::snapshot;
+    Ok(if public {
+        snapshot::public_json(&snapshot::public_snapshot(snap, naming))
+    } else if json {
+        format!("{}\n", serde_json::to_string_pretty(snap)?)
+    } else {
+        snapshot::render_table(snap)
+    })
 }
 
 /// What `pods test --deep` prints: (stdout, stderr lines). With `json`, stdout is always
@@ -9938,7 +10205,31 @@ mod tests {
         assert_eq!(strip_arena_block("a\nb"), "a\nb");
     }
 
+    /// What `cron show` and `teardown --check` read: the block's lines (every block, blank
+    /// lines dropped), and outside it only *job* lines that mention arena — not comments,
+    /// not `NAME=value` settings, not other jobs.
+    #[test]
+    fn arena_cron_lines_reads_the_block_and_hand_added_arena_jobs() {
+        let tab = format!(
+            "MAILTO=ops@example.org\nPATH=/home/dev/arena/bin:/usr/bin\n# old arena job, disabled\n\
+             0 3 * * * /usr/bin/certbot renew\n{CRON_BEGIN}\n*/15 * * * * arena pods backup --yes\n\n{CRON_END}\n\
+             0 9 * * * /usr/local/bin/arena pods up -n 2 --yes\n30 2 * * * destroy_pods --yes apple\n"
+        );
+        let lines = super::arena_cron_lines(&tab);
+        assert_eq!(lines.managed, ["*/15 * * * * arena pods backup --yes"]);
+        assert_eq!(lines.unmanaged, ["0 9 * * * /usr/local/bin/arena pods up -n 2 --yes", "30 2 * * * destroy_pods --yes apple"]);
+        let none = super::arena_cron_lines("0 3 * * * /usr/bin/certbot renew\n");
+        assert!(none.managed.is_empty() && none.unmanaged.is_empty());
+        // `cron install` output reads back as exactly its lines.
+        let installed = with_arena_block("keep-me\n", &["A arena".to_string(), "B arena".to_string()]);
+        assert_eq!(super::arena_cron_lines(&installed).managed, ["A arena", "B arena"]);
+    }
+
     fn cron_job(pull: bool, proxy: bool) -> Vec<String> {
+        cron_job_with(pull, proxy, None)
+    }
+
+    fn cron_job_with(pull: bool, proxy: bool, snapshot_dir: Option<&str>) -> Vec<String> {
         super::cron_lines(&super::CronJob {
             schedule: "*/15 * * * *",
             env_prefix: "",
@@ -9947,7 +10238,45 @@ mod tests {
             home: "/home/u",
             pull,
             proxy,
+            snapshot_dir,
         })
+    }
+
+    #[test]
+    fn cron_lines_add_the_public_snapshot_only_when_asked() {
+        assert!(!cron_job(true, true).iter().any(|l| l.contains("snapshot")));
+        let lines = cron_job_with(false, true, Some("/var/www/fleet/"));
+        assert_eq!(lines.len(), 3, "{lines:#?}");
+        // Every 2 minutes, flock'd like the proxy line, public JSON only, atomically to DIR/fleet.json.
+        assert_eq!(
+            lines[2],
+            "*/2 * * * * flock -n /home/u/.arena-snapshot-cron.lock /opt/arena --config /srv/config.env \
+             snapshot --public --out '/var/www/fleet/fleet.json' >> /home/u/arena-snapshot-cron.log 2>&1"
+        );
+        // A quote in the directory can't break out of the shell word.
+        let odd = cron_job_with(false, false, Some("/srv/it's"));
+        assert!(odd[1].contains("--out '/srv/it'\\''s/fleet.json' >>"), "{}", odd[1]);
+        // It lives in the arena block, and re-installing without --snapshot drops it.
+        let tab = with_arena_block("0 9 * * * keep-me\n", &lines);
+        assert_eq!(tab.matches("snapshot --public").count(), 1);
+        let tab = with_arena_block(&tab, &cron_job(false, false));
+        assert!(tab.contains("keep-me") && !tab.contains("snapshot"), "{tab}");
+    }
+
+    #[test]
+    fn snapshot_cron_dir_must_be_an_existing_plain_directory() {
+        use super::snapshot_cron_dir;
+        let base = std::env::temp_dir().join(format!("arena-cron-snap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("www")).unwrap();
+        std::fs::create_dir_all(base.join("50%off")).unwrap();
+        std::fs::write(base.join("file"), "x").unwrap();
+        let got = snapshot_cron_dir(&base.join("www").join("..").join("www")).unwrap();
+        assert_eq!(std::path::Path::new(&got), std::fs::canonicalize(base.join("www")).unwrap(), "absolute + normalized");
+        assert!(snapshot_cron_dir(&base.join("missing")).is_err());
+        assert!(snapshot_cron_dir(&base.join("file")).unwrap_err().to_string().contains("not a directory"));
+        assert!(snapshot_cron_dir(&base.join("50%off")).unwrap_err().to_string().contains("`%`"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -12229,6 +12558,40 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
         assert!(fake.calls().is_empty());
     }
 
+    /// `pods test --deep` leaves each verdict in the health cache `arena snapshot` reads —
+    /// keyed by provider + id — and drops the record of a pod the listing no longer has.
+    #[tokio::test(start_paused = true)]
+    async fn pods_test_deep_records_verdicts_in_the_health_cache() {
+        use arena_core::health::{PodHealth, Status};
+        use arena_core::snapshot::{HealthCache, Issue};
+        let dir = std::env::temp_dir().join(format!("arena-deep-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cfg = deep_cfg();
+        cfg.values.insert("ARENA_STATE_DIR".into(), dir.display().to_string());
+        let path = dir.join("devtest").join("health.json");
+        // A record of a pod since terminated (runpod now lists without it).
+        let gone = Pod { id: "id-gone".into(), name: "devtest-gone".into(), provider: "runpod".into(), ..Default::default() };
+        let mut seed = HealthCache::new();
+        seed.merge(&[PodHealth::unreachable(&gone, "timed out")], 1);
+        seed.save(&path).unwrap();
+
+        let fake = Arc::new(FakeRemote::new());
+        script_deep(&fake);
+        let err = handle_deep_test(&fleet(), fake.clone(), &cfg, &everyone(&fleet()), true, false).await.unwrap_err();
+        assert_eq!(err.to_string(), "2 pod(s) failed the deep check", "recording never changes the verdict");
+
+        let (cache, warning) = HealthCache::load(&path);
+        assert_eq!(warning, None);
+        let rec = |name: &str| cache.get(&pod(name, 0)).unwrap_or_else(|| panic!("{name}: {cache:#?}"));
+        assert_eq!((rec("apple").status, rec("apple").issues.len()), (Status::Pass, 0));
+        assert_eq!((rec("bloom").status, rec("bloom").issues.first()), (Status::Fail, Some(&Issue::GpuError)));
+        assert_eq!((rec("cloud").status, rec("cloud").issues.as_slice()), (Status::Fail, &[Issue::Unreachable][..]));
+        assert_eq!(rec("apple").gpu.as_deref(), Some("2×RTX A4000"), "the machine's own GPU view");
+        assert!(cache.get(&gone).is_none(), "pruned: runpod listed OK without it");
+        assert_eq!(cache.pods.len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn pods_test_deep_names_scope_the_run_and_report_unreachable_pods() {
         use arena_core::health::Status;
@@ -13246,5 +13609,315 @@ mod lifecycle_tests {
         assert!(matches!(pods_cmd(&["stop", "alpha", "--wipe-ok"]), PodCmd::Stop { wipe_ok: true, .. }));
         assert!(matches!(pods_cmd(&["terminate", "alpha", "--revoke-key"]), PodCmd::Terminate { revoke_key: true, all: false, .. }));
         assert!(matches!(pods_cmd(&["terminate", "--all", "--revoke-key"]), PodCmd::Terminate { revoke_key: true, all: true, .. }));
+    }
+}
+
+/// `arena snapshot`: read-only end to end (a provider that panics on any mutation, no
+/// `Remote` in reach), the health cache written by `pods test --deep` read back, the
+/// public JSON written atomically and allowlisted.
+#[cfg(test)]
+mod snapshot_tests {
+    use super::{collect_snapshot, handle_snapshot, record_health, render_snapshot, Cli, Cmd};
+    use arena_core::health::{Check, PodHealth, Status};
+    use arena_core::selector::Naming;
+    use arena_core::snapshot::{Issue, ProxyState, PublicHealthStatus, PublicSnapshot, PublicStatus};
+    use arena_core::{Config, Error, Pod, PodSpec, Provider, Result};
+    use async_trait::async_trait;
+    use clap::Parser;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A fleet whose listing is scripted per backend (`Err` = that backend failed to list).
+    /// Every mutating call panics: `snapshot` must never make one.
+    struct Fleet {
+        backends: Vec<(&'static str, std::result::Result<Vec<Pod>, &'static str>)>,
+        enriched: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Provider for Fleet {
+        fn name(&self) -> &'static str {
+            "runpod"
+        }
+        fn describe(&self, _spec: &PodSpec) -> String {
+            String::new()
+        }
+        async fn list_pods(&self) -> Result<Vec<Pod>> {
+            Ok(self.backends.iter().filter_map(|(_, r)| r.clone().ok()).flatten().collect())
+        }
+        async fn list_by_provider(&self) -> Vec<(String, Result<Vec<Pod>>)> {
+            self.backends.iter().map(|(n, r)| (n.to_string(), r.clone().map_err(Error::provider))).collect()
+        }
+        /// The details query: fills RunPod's GPU and price, as the real one does.
+        async fn enrich(&self, pods: &mut [Pod]) -> Result<()> {
+            self.enriched.fetch_add(1, Ordering::SeqCst);
+            for p in pods.iter_mut().filter(|p| p.provider == "runpod") {
+                p.gpu_type = Some("NVIDIA RTX A4000".into());
+                p.gpu_count = Some(1);
+                p.cost_per_hr = Some(0.17);
+            }
+            Ok(())
+        }
+        async fn create_pod(&self, _spec: &PodSpec) -> Result<Pod> {
+            panic!("snapshot must not create")
+        }
+        async fn stop_pod(&self, _id: &str) -> Result<()> {
+            panic!("snapshot must not stop")
+        }
+        async fn restart_pod(&self, _id: &str) -> Result<()> {
+            panic!("snapshot must not restart")
+        }
+        async fn terminate_pod(&self, _id: &str) -> Result<()> {
+            panic!("snapshot must not terminate")
+        }
+    }
+
+    fn pod(name: &str, provider: &str, id: &str, ip: &str, port: u16) -> Pod {
+        Pod {
+            id: id.into(),
+            name: name.into(),
+            provider: provider.into(),
+            status: "RUNNING".into(),
+            ssh_ip: Some(ip.into()),
+            ssh_port: Some(port),
+            ..Default::default()
+        }
+    }
+
+    fn apple() -> Pod {
+        pod("devtest-apple", "runpod", "rpapple0001", "203.0.113.7", 22001)
+    }
+    fn bloom() -> Pod {
+        pod("devtest-bloom", "runpod", "rpbloom0002", "203.0.113.8", 22002)
+    }
+    fn james() -> Pod {
+        pod("james-gpu", "runpod", "rpstaff0003", "203.0.113.9", 22003)
+    }
+
+    /// runpod lists apple, bloom and a staff box; vast (with cloud on it) failed to list.
+    fn fleet() -> Fleet {
+        Fleet {
+            backends: vec![("runpod", Ok(vec![bloom(), james(), apple()])), ("vast", Err("list pods HTTP 429"))],
+            enriched: AtomicUsize::new(0),
+        }
+    }
+
+    struct Tmp(PathBuf);
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn tmp(tag: &str) -> Tmp {
+        let d = std::env::temp_dir().join(format!("arena-snapshot-cli-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        Tmp(d)
+    }
+
+    /// A local proxy (forwards: apple to its endpoint, bloom to an old one) and a state dir
+    /// in `dir`, plus a key that must never surface.
+    fn cfg(dir: &Path) -> Config {
+        use arena_core::proxy::{render_nginx, Forward};
+        let fwd = |name: &str, port: u16, ip: &str, tport: u16| Forward {
+            name: name.into(),
+            public_port: port,
+            target_ip: ip.into(),
+            target_port: tport,
+            provider: Some("runpod".into()),
+            pod_id: None,
+        };
+        let proxy = dir.join("proxy.conf");
+        std::fs::write(
+            &proxy,
+            render_nginx(&[fwd("devtest-apple", 9500, "203.0.113.7", 22001), fwd("devtest-bloom", 9501, "198.51.100.1", 40000)]),
+        )
+        .unwrap();
+        Config::parse(&format!(
+            "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(\n \"apple\"\n \"bloom\"\n \"cloud\"\n \"@james-gpu\"\n)\n\
+             RUNPOD_API_KEY=rpa_TESTSECRETKEY\nSSH_PROXY_HOST=localhost\nSSH_PROXY_NGINX_CONFIG_PATH={}\n\
+             SSH_PROXY_RELOAD_CMD=\"\"\nSSH_PROXY_STARTING_PORT=9500\nARENA_STATE_DIR={}\n",
+            proxy.display(),
+            dir.join("state").display()
+        ))
+    }
+
+    fn checked(p: &Pod, status: Status, checks: &[(&str, Status, &str)]) -> PodHealth {
+        PodHealth {
+            id: p.id.clone(),
+            name: p.name.clone(),
+            provider: p.provider.clone(),
+            status,
+            checks: checks.iter().map(|(n, s, d)| Check { name: n.to_string(), status: *s, detail: d.to_string() }).collect(),
+            facts: None,
+            host: None,
+        }
+    }
+
+    #[test]
+    fn snapshot_flags_parse() {
+        let parse = |argv: &[&str]| Cli::try_parse_from(["arena"].iter().chain(argv).copied()).map(|c| c.cmd);
+        match parse(&["snapshot", "--public", "--out", "/tmp/x/fleet.json"]).unwrap() {
+            Cmd::Snapshot { json: false, public: true, out: Some(p) } => assert_eq!(p, Path::new("/tmp/x/fleet.json")),
+            _ => panic!("wrong parse"),
+        }
+        assert!(matches!(parse(&["snapshot"]).unwrap(), Cmd::Snapshot { json: false, public: false, out: None }));
+        assert!(matches!(parse(&["snap", "--json"]).unwrap(), Cmd::Snapshot { json: true, .. }));
+    }
+
+    #[tokio::test]
+    async fn snapshot_joins_listing_proxy_and_cached_health_without_touching_anything() {
+        let dir = tmp("collect");
+        let cfg = cfg(&dir.0);
+        let warn = record_health(
+            &cfg,
+            &[
+                checked(&apple(), Status::Pass, &[]),
+                checked(&bloom(), Status::Fail, &[("cuda", Status::Fail, "Error 999 on 203.0.113.8")]),
+            ],
+            None,
+        );
+        assert_eq!(warn, None);
+        let f = fleet();
+        let (snap, warnings) = collect_snapshot(&f, &cfg, arena_core::snapshot::unix_now()).await.unwrap();
+        assert_eq!(f.enriched.load(Ordering::SeqCst), 1, "one details query, like `pods list`");
+        assert_eq!(snap.partial, ["vast"]);
+        assert!(warnings.iter().any(|w| w.contains("vast failed to list (provider error: list pods HTTP 429)")), "{warnings:?}");
+        let row = |n: &str| snap.pods.iter().find(|p| p.pod.name == n).unwrap();
+        assert_eq!((row("devtest-apple").proxy, row("devtest-apple").proxy_port), (ProxyState::Live, Some(9500)));
+        assert_eq!((row("devtest-bloom").proxy, row("devtest-bloom").proxy_port), (ProxyState::Stale, Some(9501)));
+        assert_eq!(row("james-gpu").proxy, ProxyState::None);
+        assert_eq!(row("devtest-apple").health.as_ref().unwrap().status, Status::Pass);
+        assert_eq!(row("devtest-bloom").health.as_ref().unwrap().issues, [Issue::GpuError]);
+        assert!(row("james-gpu").health.is_none());
+        assert_eq!(snap.cost.billing, 3);
+
+        // The table: pods list's columns + PROXY and HEALTH, and the missing provider named.
+        let table = render_snapshot(&snap, &Naming::from_config(&cfg), false, false).unwrap();
+        assert!(table.contains("devtest-apple  runpod    rpapple0001  run     1×RTX A4000  $0.17  203.0.113.7:22001  :9500  "), "{table}");
+        let bloom_row = table.lines().find(|l| l.starts_with("devtest-bloom")).unwrap();
+        assert!(bloom_row.contains(":9501 stale  fail ") && bloom_row.contains("s GPU error"), "{table}");
+        assert!(table.ends_with("partial: vast failed to list — its pods are missing above\n"), "{table}");
+        // --json is the internal view (ids and endpoints included — never published).
+        let json = render_snapshot(&snap, &Naming::from_config(&cfg), true, false).unwrap();
+        assert!(json.contains("\"proxy\": \"live\"") && json.contains("rpapple0001"), "{json}");
+        // --public wins over --json.
+        let public = render_snapshot(&snap, &Naming::from_config(&cfg), true, true).unwrap();
+        assert!(public.contains("\"machines\"") && !public.contains("rpapple0001"), "{public}");
+    }
+
+    #[tokio::test]
+    async fn snapshot_public_out_is_written_atomically_and_holds_only_allowlisted_facts() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp("public");
+        let cfg = cfg(&dir.0);
+        record_health(
+            &cfg,
+            &[checked(&bloom(), Status::Fail, &[("ssh", Status::Fail, "exit 255: connect to host 203.0.113.8 port 22002")])],
+            None,
+        );
+        let www = dir.0.join("www");
+        std::fs::create_dir(&www).unwrap();
+        let out = www.join("fleet.json");
+        std::fs::write(&out, "{\"old\": true}").unwrap();
+        handle_snapshot(&fleet(), &cfg, false, true, Some(&out)).await.unwrap();
+
+        let text = std::fs::read_to_string(&out).unwrap();
+        let public: PublicSnapshot = serde_json::from_str(&text).unwrap();
+        assert!(!public.complete, "vast didn't answer");
+        let rows: Vec<(&str, &str, PublicStatus, PublicHealthStatus, Option<Issue>)> =
+            public.machines.iter().map(|m| (m.name.as_str(), m.gpu.as_str(), m.status, m.health.status, m.health.reason)).collect();
+        assert_eq!(
+            rows,
+            [
+                ("apple", "1×RTX A4000", PublicStatus::Up, PublicHealthStatus::Unknown, None),
+                ("bloom", "1×RTX A4000", PublicStatus::Up, PublicHealthStatus::Fail, Some(Issue::Unreachable)),
+            ]
+        );
+        for needle in ["203.0.113", "198.51.100", "rpa_", "rpapple", "rpbloom", "rpstaff", "james", "devtest", "runpod", "vast", "22001", "9500", "0.17"] {
+            assert!(!text.contains(needle), "`{needle}` in {text}");
+        }
+        // Readable by a web server; no temp file left next to it.
+        assert_eq!(std::fs::metadata(&out).unwrap().permissions().mode() & 0o777, 0o644);
+        assert_eq!(std::fs::read_dir(&www).unwrap().count(), 1);
+
+        // The internal JSON to a file is owner-only.
+        let internal = www.join("internal.json");
+        handle_snapshot(&fleet(), &cfg, true, false, Some(&internal)).await.unwrap();
+        assert_eq!(std::fs::metadata(&internal).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[tokio::test]
+    async fn snapshot_with_no_provider_answering_fails_and_leaves_the_old_file() {
+        let dir = tmp("down");
+        let cfg = cfg(&dir.0);
+        let out = dir.0.join("fleet.json");
+        std::fs::write(&out, "previous").unwrap();
+        let down = Fleet {
+            backends: vec![("runpod", Err("list pods HTTP 502")), ("vast", Err("list pods HTTP 429"))],
+            enriched: AtomicUsize::new(0),
+        };
+        let err = handle_snapshot(&down, &cfg, false, true, Some(&out)).await.unwrap_err();
+        assert!(err.to_string().contains("no provider listed its pods"), "{err}");
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "previous", "the page goes stale rather than empty");
+    }
+
+    /// The provider holding every machine fails while another configured one answers empty
+    /// (a Hetzner set up but unused): the page keeps its machines and goes stale instead of
+    /// reading "No machines." — while a real teardown (everyone answered, nothing listed)
+    /// and a partial listing that still shows machines are published as usual.
+    #[tokio::test]
+    async fn snapshot_never_blanks_the_page_when_the_provider_with_the_machines_fails() {
+        let dir = tmp("blank");
+        let cfg = cfg(&dir.0);
+        let out = dir.0.join("fleet.json");
+        let fleet_of = |runpod: std::result::Result<Vec<Pod>, &'static str>| Fleet {
+            backends: vec![("runpod", runpod), ("hetzner", Ok(vec![]))],
+            enriched: AtomicUsize::new(0),
+        };
+        handle_snapshot(&fleet_of(Ok(vec![apple()])), &cfg, false, true, Some(&out)).await.unwrap();
+        let good = std::fs::read_to_string(&out).unwrap();
+        assert!(good.contains("\"apple\""), "{good}");
+
+        let err = handle_snapshot(&fleet_of(Err("list pods HTTP 429")), &cfg, false, true, Some(&out)).await.unwrap_err();
+        assert!(err.to_string().starts_with("runpod failed to list and nothing else listed a machine — kept "), "{err}");
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), good, "the old page is kept");
+
+        // Printing (no file to protect) still works, flagged incomplete.
+        handle_snapshot(&fleet_of(Err("list pods HTTP 429")), &cfg, false, true, None).await.unwrap();
+        // A partial listing that still shows a machine is published, flagged incomplete.
+        let partial = Fleet {
+            backends: vec![("runpod", Ok(vec![apple()])), ("vast", Err("list pods HTTP 429"))],
+            enriched: AtomicUsize::new(0),
+        };
+        handle_snapshot(&partial, &cfg, false, true, Some(&out)).await.unwrap();
+        let public: PublicSnapshot = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!((public.complete, public.machines.len()), (false, 1));
+        // Everyone answered and nothing is left: the empty page is the truth.
+        handle_snapshot(&fleet_of(Ok(vec![])), &cfg, false, true, Some(&out)).await.unwrap();
+        let public: PublicSnapshot = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!((public.complete, public.machines.len()), (true, 0));
+        // And from there, an outage has nothing to blank: published, flagged incomplete.
+        handle_snapshot(&fleet_of(Err("list pods HTTP 429")), &cfg, false, true, Some(&out)).await.unwrap();
+        let public: PublicSnapshot = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!((public.complete, public.machines.len()), (false, 0));
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_health_cache_or_missing_proxy_file_is_a_warning_not_a_failure() {
+        let dir = tmp("corrupt");
+        let mut cfg = cfg(&dir.0);
+        let state = dir.0.join("state").join("devtest");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("health.json"), "{truncated").unwrap();
+        std::fs::remove_file(dir.0.join("proxy.conf")).unwrap();
+        let (snap, warnings) = collect_snapshot(&fleet(), &cfg, 1_791_460_800).await.unwrap();
+        assert!(snap.pods.iter().all(|p| p.health.is_none() && p.proxy == ProxyState::None), "{snap:#?}");
+        assert_eq!(warnings.iter().filter(|w| w.contains("ignoring the health cache")).count(), 1, "{warnings:?}");
+        // A remote proxy is never fetched (no SSH): its forwards are unknown.
+        cfg.values.insert("PROXY_LOCAL".into(), "false".into());
+        cfg.values.insert("SSH_PROXY_HOST".into(), "proxy.example".into());
+        let (snap, _) = collect_snapshot(&fleet(), &cfg, 1_791_460_800).await.unwrap();
+        assert!(snap.pods.iter().all(|p| p.proxy == ProxyState::Unknown));
     }
 }

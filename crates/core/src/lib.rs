@@ -28,10 +28,12 @@ pub mod retry;
 pub mod schedule;
 pub mod selector;
 pub mod setup;
+pub mod snapshot;
 pub mod sshconfig;
 pub mod ssh;
 pub mod status;
 pub mod table;
+pub mod teardown;
 
 pub use config::Config;
 pub use error::{Error, ProviderErrorKind, Result};

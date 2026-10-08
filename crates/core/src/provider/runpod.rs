@@ -644,9 +644,104 @@ fn extract_gpu_enum(spec: &Value) -> Vec<String> {
     search(spec).unwrap_or_default()
 }
 
+/// One RunPod network volume: persistent storage billed per GB per month for as long as it
+/// exists, whether or not a pod uses it — the bill that outlives a program (ops playbook §5).
+/// Read by `teardown --check`, from GraphQL here or from REST v2 ([`super::runpod_v2`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkVolume {
+    pub id: String,
+    pub name: String,
+    /// Allocated GB (what's billed). `None` if the API didn't say — then no estimate.
+    pub size_gb: Option<u32>,
+    pub data_center: Option<String>,
+    /// v2's storage tier (`STANDARD` / `HIGH_PERFORMANCE`); the GraphQL query doesn't ask.
+    pub tier: Option<String>,
+}
+
+/// The account's network volumes over GraphQL — the only listing on `RUNPOD_API=v1` (REST v1
+/// has no volumes route). Not live-verified (no live calls while a cohort runs); the field
+/// names come from existing clients of this API: dstack's `getMyVolumes` query reads
+/// `myself { networkVolumes { id name size dataCenter { id name } } }`, and SkyPilot reads
+/// `networkVolumes[].dataCenterId` from runpod-python's `get_user()` (`myself`) result. If a
+/// field is ever rejected, the query fails as a whole and the check says it couldn't look.
+const NETWORK_VOLUMES_QUERY: &str = "{ myself { networkVolumes { id name size dataCenterId } } }";
+
+/// One volume object (GraphQL or REST v2 — same `id`/`name`/`size`; the data center under
+/// `dc_key`, v2's tier under `type`). An entry without an id fails the listing: it's a volume
+/// we'd otherwise not report, and a teardown check must not under-count.
+pub(super) fn parse_volume(v: &Value, dc_key: &str) -> Result<NetworkVolume> {
+    let id = v
+        .get("id")
+        .and_then(loose_string)
+        .ok_or_else(|| Error::provider("list network volumes: a volume without an id — not a complete listing"))?;
+    Ok(NetworkVolume {
+        id,
+        name: v.get("name").and_then(loose_string).unwrap_or_default(),
+        size_gb: v.get("size").and_then(loose_f64).filter(|s| s.is_finite() && *s >= 0.0).map(|s| s.round() as u32),
+        data_center: v.get(dc_key).and_then(loose_string),
+        tier: v.get("type").and_then(loose_string),
+    })
+}
+
+/// Parse the GraphQL answer. Fails closed: any GraphQL error, or no `networkVolumes` array
+/// (absent *or* `null` — GraphQL's null is "no answer", not "none"), is an error rather than
+/// an empty list, because "no volumes" is exactly what a teardown check must not guess.
+fn parse_network_volumes(v: &Value) -> Result<Vec<NetworkVolume>> {
+    if let Some(err) = graphql_errors(v) {
+        return Err(Error::provider(format!("list network volumes: {err}")));
+    }
+    v.pointer("/data/myself/networkVolumes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::provider("list network volumes: no data.myself.networkVolumes array in the response"))?
+        .iter()
+        .map(|x| parse_volume(x, "dataCenterId"))
+        .collect()
+}
+
+/// Read-only: every network volume on the account (GraphQL; see [`NETWORK_VOLUMES_QUERY`]).
+pub async fn fetch_network_volumes(api_key: &str) -> Result<Vec<NetworkVolume>> {
+    let body = graphql(&Client::new(), api_key, &json!({ "query": NETWORK_VOLUMES_QUERY }), "list network volumes").await?;
+    parse_network_volumes(&body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The GraphQL volume listing: sizes and data centers read, and every way of not
+    /// answering — errors, a missing or null list, an entry without an id — is an error,
+    /// never "no volumes".
+    #[test]
+    fn network_volumes_parse_and_fail_closed() {
+        let ok = json!({ "data": { "myself": { "networkVolumes": [
+            { "id": "vol1", "name": "group-a", "size": 100, "dataCenterId": "EU-RO-1" },
+            { "id": "vol2", "name": null, "size": "2048", "dataCenterId": null }
+        ] } } });
+        let vols = parse_network_volumes(&ok).unwrap();
+        assert_eq!(
+            vols[0],
+            NetworkVolume {
+                id: "vol1".into(),
+                name: "group-a".into(),
+                size_gb: Some(100),
+                data_center: Some("EU-RO-1".into()),
+                tier: None
+            }
+        );
+        assert_eq!((vols[1].name.as_str(), vols[1].size_gb, vols[1].data_center.as_deref()), ("", Some(2048), None));
+        assert!(parse_network_volumes(&json!({ "data": { "myself": { "networkVolumes": [] } } })).unwrap().is_empty());
+        for (bad, why) in [
+            (json!({ "errors": [{ "message": "Cannot query field \"dataCenterId\"" }] }), "dataCenterId"),
+            (json!({ "data": { "myself": { "networkVolumes": null } } }), "no data.myself.networkVolumes"),
+            (json!({ "data": { "myself": {} } }), "no data.myself.networkVolumes"),
+            (json!(null), "no data.myself.networkVolumes"),
+            (json!({ "data": { "myself": { "networkVolumes": [{ "name": "x", "size": 10 }] } } }), "without an id"),
+        ] {
+            let e = parse_network_volumes(&bad).unwrap_err().to_string();
+            assert!(e.contains(why), "{bad}: {e}");
+        }
+        assert!(NETWORK_VOLUMES_QUERY.contains("networkVolumes { id name size dataCenterId }"));
+    }
 
     #[test]
     fn pods_array_accepts_both_list_shapes() {

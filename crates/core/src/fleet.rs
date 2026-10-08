@@ -5,6 +5,8 @@
 //! (Phase 3) and the public snapshot (Phase 4) are meant to reuse these exact functions so
 //! a pod reads the same on every surface — no surface re-derives a label on its own.
 
+use serde::Serialize;
+
 use crate::metrics::normalize_gpu_name;
 use crate::pod::{Maintenance, Pod};
 use crate::status::{bills_hourly, short_status};
@@ -78,8 +80,9 @@ pub fn endpoint_label(pod: &Pod) -> String {
 
 /// Split an ISO-8601-ish timestamp (`2026-10-09T02:00:00Z`, or with a space instead of
 /// `T`) into its compact `("MM-DD", "HH:MM")` parts. `None` for anything else, so an
-/// unexpected format is shown raw rather than mangled.
-fn iso_parts(s: &str) -> Option<(&str, &str)> {
+/// unexpected format is shown raw rather than mangled. (Also the public snapshot's test of
+/// "is this a timestamp at all".)
+pub(crate) fn iso_parts(s: &str) -> Option<(&str, &str)> {
     let b = s.as_bytes();
     let digits = |r: std::ops::Range<usize>| b[r].iter().all(u8::is_ascii_digit);
     let ok = b.len() >= 16
@@ -175,7 +178,7 @@ pub fn maintenance_label(m: Option<&Maintenance>) -> String {
 /// — plus every existing Hetzner server); a stopped RunPod pod only bills storage, which
 /// `costPerHr` doesn't describe. Hetzner's EUR is kept apart from the USD providers rather
 /// than summed with a made-up exchange rate.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct FleetCost {
     /// Σ $/h over billing pods on USD providers (RunPod, Vast).
     pub usd_per_hr: f64,
@@ -231,30 +234,33 @@ pub fn fleet_footer(c: &FleetCost) -> String {
     out
 }
 
+/// The `pods list` columns, in order (MAINT last: it's the long, free-text one).
+pub const POD_HEADERS: [&str; 8] = ["NAME", "PROVIDER", "ID", "STATUS", "GPU", "$/H", "ENDPOINT", "MAINT"];
+
+/// How each of [`POD_HEADERS`] is aligned.
+pub const POD_ALIGN: [Align; 8] =
+    [Align::Left, Align::Left, Align::Left, Align::Left, Align::Left, Align::Right, Align::Left, Align::Left];
+
+/// One pod's cells under [`POD_HEADERS`] — shared with `arena snapshot`'s table, which adds
+/// its own columns, so a pod's labels read the same in both.
+pub fn pod_cells(p: &Pod) -> Vec<String> {
+    vec![
+        p.name.clone(),
+        p.provider.clone(),
+        p.id.clone(),
+        short_status(&p.status),
+        gpu_label(p),
+        price_label(p),
+        endpoint_label(p),
+        maintenance_label(p.maintenance.as_ref()),
+    ]
+}
+
 /// The `pods list` table: NAME PROVIDER ID STATUS GPU $/H ENDPOINT MAINT, one row per pod
 /// in the given order (the caller sorts).
 pub fn render_pods_table(pods: &[Pod]) -> String {
-    use Align::{Left, Right};
-    let rows: Vec<Vec<String>> = pods
-        .iter()
-        .map(|p| {
-            vec![
-                p.name.clone(),
-                p.provider.clone(),
-                p.id.clone(),
-                short_status(&p.status),
-                gpu_label(p),
-                price_label(p),
-                endpoint_label(p),
-                maintenance_label(p.maintenance.as_ref()),
-            ]
-        })
-        .collect();
-    table::render(
-        &["NAME", "PROVIDER", "ID", "STATUS", "GPU", "$/H", "ENDPOINT", "MAINT"],
-        &[Left, Left, Left, Left, Left, Right, Left, Left],
-        &rows,
-    )
+    let rows: Vec<Vec<String>> = pods.iter().map(pod_cells).collect();
+    table::render(&POD_HEADERS, &POD_ALIGN, &rows)
 }
 
 #[cfg(test)]

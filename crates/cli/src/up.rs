@@ -37,6 +37,7 @@ use arena_core::pipeline::{self, Attempt, AttemptEnd, Stage, UpRow, Verdict};
 use arena_core::placement::{self, End, OptionPlan, PlacementOption, PriceSource, Progress, Rounds};
 use arena_core::pod::Maintenance;
 use arena_core::provider::{bounded_list, LIST_TIMEOUT};
+use arena_core::proxy::Listing;
 use arena_core::remote::{describe_error, Remote, PROBE_TIMEOUT};
 use arena_core::setup::{looks_unreachable, provision, provisioning_steps, BootRetry, SetupConfig, SetupTimeouts};
 use arena_core::ssh::SshTarget;
@@ -45,8 +46,8 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 
 use super::{
-    copy_keys_command, enrich_best_effort, fleet_ssh_for, judge_deep_call, proxy_sync_now, sync_line, KeySources,
-    Made, ProxySync, COPY_KEYS_TIMEOUT, ENRICH_TIMEOUT,
+    copy_keys_command, enrich_best_effort, fleet_ssh_for, judge_deep_call, proxy_sync_now, record_health, sync_line,
+    KeySources, Made, ProxySync, COPY_KEYS_TIMEOUT, ENRICH_TIMEOUT,
 };
 
 /// How long a pod we terminated (to replace it) may stay listed before we give up on the
@@ -906,11 +907,21 @@ impl Shared<'_, '_> {
         // Per backend (each list bounded): the rows take whatever answered; a fleet map is
         // only rewritten from a listing every backend answered — one missing a backend would
         // drop that backend's pods from maps that had them.
-        let listings = provider.list_by_provider().await;
-        let complete = listings.iter().all(|(_, l)| l.is_ok());
-        let mut pods: Vec<Pod> = listings.into_iter().filter_map(|(_, l)| l.ok()).flatten().collect();
-        if complete && !self.stopped() {
+        let listing = Listing::from_results(provider.list_by_provider().await);
+        let mut pods: Vec<Pod> = listing.pods();
+        if listing.all_ok() && !self.stopped() {
             self.refresh_fleet_ssh(&names, &pods).await;
+        }
+        // The standing pods' checks, for `arena snapshot` (a pod terminated for its FAIL is
+        // gone — the listing prunes any record of it).
+        if self.run.check.is_some() {
+            let checked: Vec<PodHealth> =
+                names.iter().filter(|r| r.pod.is_some()).filter_map(|r| r.health.clone()).collect();
+            if !checked.is_empty() {
+                if let Some(warning) = record_health(self.run.cfg, &checked, Some(&listing)) {
+                    say(To::Err, &warning);
+                }
+            }
         }
         if let Some(w) = enrich_best_effort(provider, &mut pods, ENRICH_TIMEOUT).await {
             say(To::Err, &w);
@@ -1375,6 +1386,32 @@ mod tests {
         let summary = pipeline::render_up_summary(&rows);
         assert!(summary.contains("devtest-apple: #1 1×RTX A4000 COMMUNITY (id1, 10.0.0.1): check FAIL — cuda: "), "{summary}");
         assert!(summary.contains("; terminated → #2 1×RTX 3090 COMMUNITY (id2, 10.0.0.2): ready"), "{summary}");
+    }
+
+    /// `up --check` records the standing pod's check for `arena snapshot`; the pod it
+    /// terminated for its FAIL leaves no record behind.
+    #[tokio::test(start_paused = true)]
+    async fn up_check_records_the_standing_pods_health_for_snapshot() {
+        use arena_core::snapshot::HealthCache;
+        let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 0), ("10.0.0.2", 22002, 30)])]);
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host("10.0.0.1", 22001), [FakeReply::ok(), FakeReply::ok(), bad_host()]);
+        fake.script(&host("10.0.0.2", 22002), [FakeReply::ok(), FakeReply::ok(), healthy()]);
+        let state = tmp_dir("health-cache");
+        let mut cfg = cfg(None);
+        cfg.values.insert("ARENA_STATE_DIR".into(), state.0.display().to_string());
+        let run = up_run(&fleet, fake.clone(), &cfg, true, Some(2), None).await;
+        let made = make(&fleet, &["apple"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+        assert_eq!(rows[0].verdict, Verdict::Ready);
+
+        let (cache, warning) = HealthCache::load(&state.0.join("devtest").join("health.json"));
+        assert_eq!(warning, None);
+        let ids: Vec<&str> = cache.pods.values().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["id2"], "{cache:#?}");
+        assert_eq!(cache.pods.values().next().unwrap().status, Status::Pass);
+        assert!(!lines.all().iter().any(|l| l.contains("health cache")), "{:#?}", lines.all());
     }
 
     #[tokio::test(start_paused = true)]
