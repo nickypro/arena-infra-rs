@@ -101,7 +101,7 @@ flowchart TD
 | `health` | `pods test --deep`: the embedded `deep_check.sh` only measures (key=value facts); `parse_deep` + `evaluate` judge them against `HealthPolicy` (driver floor from `MIN_DRIVER_VERSION` or `ALLOWED_CUDA_VERSIONS`, network/disk/load thresholds, maintenance) | yes (script runs over `Remote`) |
 | `proxy` | the nginx `stream` config: stable port = `MACHINE_NAME_LIST` index; `plan_forwards` **merges** the previous config with a per-provider listing and removes a forward only when its pod is confirmed gone; render ↔ parse round-trip | yes |
 | `fleet`, `status` | the one place a pod's labels (GPU, `$/H`, endpoint, maintenance) and the fleet cost are computed; `is_billing`/`bills_hourly` decide what counts as billing | yes |
-| `snapshot` | `FleetSnapshot` (`build`: pods + proxy state + last health), the prefix-scoped health cache (atomic, locked, 0600), and `PublicSnapshot` — a separate allowlisted struct for publishing | build pure; cache I/O |
+| `snapshot` | `FleetSnapshot` (`build`: pods + proxy state + last health), the SSH-port reachability probe behind the `Reach` seam (`SshPortProbe`: TCP connect + sshd's greeting, nothing sent), the prefix-scoped health cache (atomic, locked, 0600), and `PublicSnapshot` — a separate allowlisted struct for publishing (`up` needs the probe's answer) | build + targets pure; probe and cache I/O |
 | `teardown` | turns listings, volumes, OpenRouter keys, cron/`at` lines and the proxy file into a ✓ ✗ ? – checklist with fix commands (unknown ≠ empty) | yes |
 | `jobs` | detached runs (`pods run --background`): the on-pod wrapper, ids, status, log reads by byte offset | yes |
 | `naming`, `gpu`, `openrouter`, `apikeys`, `backup`, `pull`, `sshconfig`, `metrics`, `plan`, `schedule`, `ssh`, `table` | name allocation (`@` absolute entries), GPU aliases + catalog check, OpenRouter provisioning API, key distribution, git backup / rsync commands, participant `~/.ssh/config`, TUI probe, scheduled plans, `wNdM` labels, ssh/scp argv, table layout | mostly |
@@ -152,12 +152,14 @@ flowchart TD
 - **The proxy is a merge**: a forward goes only when its pod is confirmed gone; writes are
   serialized and atomic, a failed reload restores the previous config, and
   `SSH_PROXY_RELOAD_CMD=` (empty) makes every write write-only.
-- **Bounded where it goes through the seams**: every `Remote` call (pod-SSH exec or copy)
-  has a budget and provider listings 60 s, so one wedged pod or stalled API can't hang those
-  fleet commands. Not yet bounded: the rsync transfers, which drive their own ssh outside
-  `Remote` — `pods pull`, `pods backup`'s file backup (every tick under `cron install
-  --pull`) and the replace/migrate via-local copy — so a pod that stalls mid-transfer can
-  still hold one up.
+- **Bounded everywhere a pod is reached**: every `Remote` call (pod-SSH exec or copy) has a
+  budget and provider listings 60 s, so one wedged pod or stalled API can't hang those
+  fleet commands. The rsync transfers, which drive their own ssh outside `Remote` — `pods
+  pull`, `pods backup`'s file backup (every tick under `cron install --pull`) and the
+  replace/migrate via-local copy — get rsync's `--timeout` (I/O silence) plus a wall-clock
+  budget (`BACKUP_TIMEOUT_SECS` / 2 h per leg) through `remote::run_local`, which stops the
+  child the same SIGTERM-then-SIGKILL way; every cron line also runs under `flock -n`, so a
+  slow tick can't stack another on top of it.
 - **Publishing is an allowlist**: `snapshot --public` serializes a separate struct with
   only list names, GPU, up/starting/down, health + a fixed-vocabulary reason and
   maintenance times — no IPs, ports, ids, providers, costs or keys (pinned by a leak test).

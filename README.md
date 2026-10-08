@@ -249,24 +249,32 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
   - `config check` — validate that the keys the selected provider + proxy + backup
     need are present (never prints secret values; exits non-zero if a required key is
     missing). Copy `config.env.example` to get started.
-  - `cron install|remove|show` — manage a crontab schedule for `arena pods backup`
-    (default every 15 min, git-only; `--pull` runs the full backup — git + rsync file
-    backup — each tick; `--start-date` bakes `ARENA_START_DATE` into the line); edits only
-    arena-managed lines, leaving other entries intact. `--proxy` adds a `*/5 … proxy apply
-    --yes` line (log: `~/arena-proxy-cron.log`; sets a `PATH` with `/usr/sbin` so cron
-    finds nginx, and `flock -n` so a slow tick never piles up) that catches changes made outside the CLI
-    (dashboard terminates, restarts that move an endpoint); re-running `install` without
-    it removes that line. Remove it before changing `MACHINE_NAME_PREFIX`/`_LIST`: a name
-    that leaves the list loses its forward on the next tick. `--snapshot <DIR>` adds a
-    `*/2 … snapshot --public --out <DIR>/fleet.json` line (`flock -n`, log
-    `~/arena-snapshot-cron.log`) for the [fleet page](#publishing-the-fleet-page).
+  - `cron install|remove|show` — manage arena's lines in your crontab (other entries are
+    never touched). Each line has an identity — **backup**, **proxy**, **snapshot** — and
+    `install` adds/replaces **only the lines its flags name**, keeping the rest (a later
+    `install --proxy` no longer drops an earlier `--pull`/`--start-date`/`--snapshot`):
+    `--backup` = `pods backup` every 15 min (`--schedule`), git-only unless `--pull` (git +
+    rsync file backup each tick), `--start-date` bakes `ARENA_START_DATE` in — those three
+    imply `--backup`, and a bare `cron install` means `--backup`; `--proxy` = a `*/5 … proxy
+    apply --yes` line (log `~/arena-proxy-cron.log`; a `PATH` with `/usr/sbin` so cron finds
+    nginx) that catches changes made outside the CLI (dashboard terminates, restarts that
+    move an endpoint) — remove it before changing `MACHINE_NAME_PREFIX`/`_LIST`: a name that
+    leaves the list loses its forward on the next tick; `--snapshot <DIR>` = a `*/2 …
+    snapshot --public --out <DIR>/fleet.json` line (log `~/arena-snapshot-cron.log`) for the
+    [fleet page](#publishing-the-fleet-page). Every line runs under `flock -n` (a tick that
+    finds the previous one still running exits instead of stacking — the backup's lock is
+    `~/.arena-backup-cron.lock`). `remove --backup|--proxy|--snapshot` drops just those; plain
+    `remove` drops the whole block. Both print the block's before → after diff and confirm
+    (`--yes` for scripts, `--dry-run` to preview); `show` labels each line with its identity.
+    Lines written by older versions are recognized by the command they run.
   - `pods backup [targets]` — the **full save**: git-push the ARENA tree **and** rsync the
     home to the local backups folder (`pull`). The git push is on **whatever branch the
     pod is on** (never switches/creates one, so bespoke branches are respected) and
     **skips `main`/`master`**; clean trees report `NO_CHANGES`. Selected pods, or all.
     `--no-pull` = git only; `--message` overrides the commit message. Confirms first
-    (`--dry-run` previews both). Each pod's git push has a 5-min budget. To stage onto a
-    dated autocommit branch, run `pods init-branches` first.
+    (`--dry-run` previews both). Each pod's git push has a 5-min budget, its rsync the
+    `pull` budgets below. To stage onto a dated autocommit branch, run `pods init-branches`
+    first.
   - `pods set-branch <branch> <targets|--all> [--hard]` — switch pods' ARENA checkout to a
     branch. Gentle by default (fetch + checkout + ff-only pull — fails on a diverged/dirty
     tree rather than clobbering work). **`--hard` is destructive**: force the branch to
@@ -340,13 +348,20 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `MACHINE_NAME_PREFIX`, so the sandbox and prod never share one; owner-only, written
     atomically under a lock, keyed by provider + pod id; records of pods their provider
     listed OK without are dropped. A corrupt file is one warning and gets replaced.
-  - `snapshot [--json] [--public] [--out FILE]` — the fleet in one **read-only** picture
-    (one list per provider + the details query, the local proxy file, the health cache; **no
-    SSH, no checks**): `pods list`'s columns plus `PROXY` (`:9500`, `:9500 stale`, `?` =
-    remote proxy) and `HEALTH` (`fail 2h GPU error`). `--json` = the internal snapshot (ids,
-    endpoints, costs — never publish it). `--public` = the dashboard JSON, an **allowlist by
-    construction**: only *prefixed* `MACHINE_NAME_LIST` pods (`@` staff boxes and off-list
-    pods are left out) by short name, with GPU, `up|starting|down`, health + age + a reason
+  - `snapshot [--json] [--public] [--out FILE] [--no-probe]` — the fleet in one **read-only**
+    picture (one list per provider + the details query, the local proxy file, the health
+    cache, and a **reachability probe**: a TCP connect to the SSH endpoint of each billing
+    machine on the prefixed `MACHINE_NAME_LIST` — never staff `@` boxes or off-list pods —
+    all at once, ≤ 3 s, waiting only for sshd's `SSH-…` greeting — nothing sent, no login, no
+    command; **no checks**): `pods list`'s columns plus `SSH` (`ok`/`down`/`-` = not
+    probed), `PROXY` (`:9500`, `:9500 stale`, `?` = remote proxy) and `HEALTH` (`fail 2h
+    GPU error`). Public `up` needs the probe's answer: a pod listed running whose SSH port
+    is silent reads `starting` (the vocabulary stays `up|starting|down`, documented in
+    `web/fleet.html`); `--no-probe` skips it (then running + endpoint = `up`). `--json` =
+    the internal snapshot (ids, endpoints, costs — never publish it). `--public` = the
+    dashboard JSON, an **allowlist by construction**: only *prefixed* `MACHINE_NAME_LIST`
+    pods (`@` staff boxes and off-list pods are left out) by short name, with GPU,
+    `up|starting|down`, health + age + a reason
     from a fixed vocabulary (never check text), maintenance start/end (only a complete RFC
     3339 time, re-printed in UTC — anything else is dropped), `updated_at`, `complete`. No
     IPs, hosts, ports, ids, providers, costs or keys (pinned by a leak test). `--out` is
@@ -382,7 +397,12 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `--max-size`, excludes other dotfile dirs + `site-packages`. Knobs come from flags
     else config: `LOCAL_BACKUP_DIR` (`--dir`), `BACKUP_MAX_SIZE` (`--max-size`),
     `BACKUP_REMOTE_PATH` (`--remote-path`, default `~/`). Label defaults to the `wNdM`
-    iteration. Confirms first; `--dry-run` prints the exact rsync commands.
+    iteration. Confirms first; `--dry-run` prints the exact rsync commands. **Bounded**: rsync
+    `--timeout=300` (gives up after 5 min without any I/O) and a wall-clock budget per pod,
+    `BACKUP_TIMEOUT_SECS` (default 7200 = 2 h, max a day; settable from the environment) —
+    a pod that runs out is stopped (SIGTERM, so rsync takes its ssh down too) and named in
+    the failure (`✗ arena9-bloom [big]: timed out after 7200s`); the other pods finish, and
+    the next run continues incrementally.
   - `pods copy-keys` — distribute API keys into each pod's `~/.bashrc`/`~/.zshrc`
     (idempotent): per-host keys from `<keys-dir>/<provider>_api_keys.csv`
     (openai/anthropic/openrouter) **plus broadcast tokens** — a Hugging Face token
@@ -539,7 +559,8 @@ Hetzner), commit/backup, the GPU/progress dashboard, and proxy/port-forwarding.
 - **Mutating commands act, but confirm first.** `create`/`stop`/`terminate`/… print
   what they'll do and prompt `Proceed? [y/N]` at a terminal. `-y`/`--yes` skips the
   prompt. With **no terminal** (cron, pipes) they *refuse* unless `--yes` is given — so
-  nothing mutates non-interactively by accident. (`cron install` bakes `--yes` in.)
+  nothing mutates non-interactively by accident. (`cron install`/`remove` confirm too, and
+  bake `--yes` into the lines they install.)
 - **`--dry-run` previews** any mutating command (also `--dry`/`--dryrun`): prints exactly
   what would happen and changes nothing.
 
@@ -628,8 +649,10 @@ Notes / sharp edges to know:
   runs out stops rather than redo it via local staging — nothing swapped; re-running
   `migrate copy` continues it, and a stopped `replace` leaves `<name>-new` running: continue
   with `migrate copy <name>` + `migrate cutover <name>`, or terminate it);
-  `setup`/`copy-keys` as described above. rsync transfers (`pull`, the replace/migrate
-  via-local copy) have no budget yet.
+  `setup`/`copy-keys` as described above. rsync transfers, which drive their own ssh
+  outside this seam, are bounded the same way: `--timeout=300` (I/O silence) everywhere,
+  `BACKUP_TIMEOUT_SECS` per pod (default 2 h) for `pull` and `backup`'s file step, 2 h per
+  leg for the replace/migrate via-local copy.
 - `copy-keys` warns by name about any reachable pod that matched no per-host key.
 
 ### Overriding config without editing it
@@ -657,11 +680,13 @@ dark-mode-friendly) that reads `fleet.json` from its own directory every minute 
 sortable table — machine, GPU, up/starting/down, last health check + age + reason,
 maintenance window — with "updated N min ago" and a banner once the data is over 10 minutes
 old (the cron stopped) or a provider didn't answer. It only displays; it can't change anything.
+`up` means the machine's SSH port answered when the snapshot was taken (every 2 min), so a
+machine that's listed running but not accepting logins shows `starting`, not `up`.
 
 ```bash
 mkdir -p /srv/arena-fleet && cp web/fleet.html /srv/arena-fleet/index.html
 arena --config /path/to/config.env snapshot --public --out /srv/arena-fleet/fleet.json  # try it once
-arena --config /path/to/config.env cron install --proxy --snapshot /srv/arena-fleet      # then every 2 min
+arena --config /path/to/config.env cron install --snapshot /srv/arena-fleet  # then every 2 min (other arena lines kept)
 ```
 
 Then serve `/srv/arena-fleet` with any static host (an existing web server's directory, a

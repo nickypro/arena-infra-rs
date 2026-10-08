@@ -7,9 +7,11 @@
 //! never in a release build) scripts per-host replies, delays and failures and records
 //! every call, so fleet behaviour can be tested with paused time. Every pod-SSH path in
 //! the CLI goes through it, each call with a budget, so one wedged pod can't hang a fleet
-//! command. Outside it on purpose: rsync transfers (`pods pull`, the replace/migrate
-//! via-local file copy) — rsync drives its own ssh transport (`-e`), which is neither an
-//! exec nor a single-file copy — and the proxy host's nginx deploy, which isn't a pod.
+//! command. Outside it on purpose: rsync transfers (`pods pull`, `pods backup`'s file step,
+//! the replace/migrate via-local file copy) — rsync drives its own ssh transport (`-e`),
+//! which is neither an exec nor a single-file copy — and the proxy host's nginx deploy,
+//! which isn't a pod. The rsyncs still get the same budget and child discipline through
+//! [`run_local`]: one wedged pod must not hold a backup (or the cron behind it) forever.
 //!
 //! Timeouts: `timeout` bounds the whole call (connect + transfer/remote run). On expiry
 //! the call returns [`Error::Timeout`] — a distinct variant, so a caller never mistakes
@@ -141,6 +143,21 @@ impl Remote for SshRemote {
         let what = format!("scp -r to {}:{}", t.host, t.port);
         output_within(Self::copy_recursive_command(t, local, remote), &what, timeout).await
     }
+}
+
+/// Run the local `program` with `args` to completion within `timeout`, capturing its
+/// output — for a transfer that drives its own ssh transport and so can't be a [`Remote`]
+/// call (rsync's `-e ssh …`). Same child discipline as [`SshRemote`]: stdin closed, and on
+/// expiry (or if the caller drops this future) SIGTERM, then SIGKILL after [`TERM_GRACE`].
+/// SIGTERM-first matters doubly for rsync: like scp, it runs `ssh` as a child and only takes
+/// it down on a catchable signal — a SIGKILLed rsync leaves its ssh running against the
+/// wedged pod. `what` names the call in a timeout/spawn error. Same `Ok`/`Err` contract as
+/// [`Remote::exec`]: a non-zero exit is `Ok` with `success == false`; `Err` is a spawn
+/// error or [`Error::Timeout`].
+pub async fn run_local(program: &str, args: &[String], what: &str, timeout: Option<Duration>) -> Result<SshOutput> {
+    let mut c = child(program);
+    c.args(args);
+    output_within(c, what, timeout).await
 }
 
 /// A child process that can't wedge on a prompt (stdin closed) and dies with its future
@@ -602,6 +619,41 @@ mod tests {
 
         let pid = std::fs::read_to_string(&pidfile).expect("transport wrote its pid").trim().to_string();
         assert_dies(&pid, Duration::from_secs(5), "scp's ssh transport").await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same for rsync (`pods pull`, `pods backup`'s file step, the via-local copy): a
+    /// timed-out [`run_local`] rsync takes its ssh transport down with it. Real `rsync`, a
+    /// fake transport (`-e`) that records its pid and hangs like a wedged pod — no network.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn timed_out_rsync_takes_its_ssh_transport_down_too() {
+        if std::process::Command::new("rsync").arg("--version").output().is_err() {
+            eprintln!("rsync not installed — skipping");
+            return;
+        }
+        let dir = scratch("rsync");
+        let pidfile = dir.join("transport.pid");
+        let transport = dir.join("fake-ssh.sh");
+        std::fs::write(&transport, format!("#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n", pidfile.display())).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&transport, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let dest = format!("{}/", dir.join("dest").display());
+        let args: Vec<String> =
+            ["-a", "--timeout=300", "-e", &transport.display().to_string(), "root@10.0.0.1:", &dest].map(String::from).into();
+        let started = std::time::Instant::now();
+        let err = run_local("rsync", &args, "rsync of devtest-apple", Some(Duration::from_millis(700))).await.unwrap_err();
+        assert!(matches!(&err, Error::Timeout { what, .. } if what == "rsync of devtest-apple"), "{err}");
+        assert_eq!(describe_error(&err), "timed out after 700ms");
+        assert!(started.elapsed() < Duration::from_secs(10), "returned at the budget, not at the transport's exit");
+
+        let pid = std::fs::read_to_string(&pidfile).expect("transport wrote its pid").trim().to_string();
+        assert_dies(&pid, Duration::from_secs(5), "rsync's ssh transport").await;
+        // A finished run is captured like any other call; a missing binary is a spawn error.
+        let out = run_local("sh", &["-c".into(), "echo moved; exit 23".into()], "rsync", None).await.unwrap();
+        assert_eq!((out.success, out.code, out.stdout.as_str()), (false, Some(23), "moved\n"));
+        let err = run_local("/nonexistent/arena-no-rsync", &[], "rsync of x", None).await.unwrap_err();
+        assert!(err.to_string().contains("spawning rsync of x"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -31,10 +31,10 @@ means this.
 
 | Legacy script | Rust CLI | TUI | Status | Notes |
 |---|---|---|---|---|
-| `sync_git.sh -m --exclude` (commit+push current branch) | `pods backup [selector] [--message --no-pull]` | Menu/Fleet→Backup `[b]` | ✅ | The full save: git-push **whatever branch the pod is on** (skips `main`/`master`, never switches) **and** the rsync file backup (`--no-pull` = git only). 5 min per pod's push; the rsync has no time budget yet. |
+| `sync_git.sh -m --exclude` (commit+push current branch) | `pods backup [selector] [--message --no-pull]` | Menu/Fleet→Backup `[b]` | ✅ | The full save: git-push **whatever branch the pod is on** (skips `main`/`master`, never switches) **and** the rsync file backup (`--no-pull` = git only). 5 min per pod's push; the rsync is bounded like `pods pull`'s. |
 | `init_branches.sh <day>` (make autocommit branch) | `pods init-branches [selector] [--week --day]` | — | ✅ | Creates + pushes each pod's `autocommit-{prefix}-wNdM-{name}` branch, no commit. |
 | `list_branches.sh` (table of current branch) | `pods run 'git -C … branch --show-current'` | BRANCH column | 🟡 | No dedicated command; the TUI shows it. |
-| `backup.sh <label>` (**rsync pod files → local**) | `pods pull [label] [-t … --dir --max-size --remote-path --no-git --no-big]` | — | ✅ | Rsync home → `<dir>/<label>/<pod>/` (size-capped) plus a complete `big/` mirror; keeps `.git`. No time budget yet. |
+| `backup.sh <label>` (**rsync pod files → local**) | `pods pull [label] [-t … --dir --max-size --remote-path --no-git --no-big]` | — | ✅ | Rsync home → `<dir>/<label>/<pod>/` (size-capped) plus a complete `big/` mirror; keeps `.git`. Bounded: `--timeout=300` (I/O silence) + `BACKUP_TIMEOUT_SECS` per pod (default 2 h); a pod that runs out is stopped and named, the rest finish. |
 | — | `pods set-branch <branch> <selector>/--all [--hard]` | Menu→set-branch `[g]` · Fleet | ➕✅ | Gentle ff-only by default; `--hard` resets to `origin/<branch>`. |
 | `test_em.sh` (torch version) | `pods test [selector]` | Menu→test `[e]` · Fleet→test | ✅ | 90 s per pod. |
 | — | `pods test --deep [selector] [--json -v]` | `d` (background) + HEALTH column | ➕ | Is-this-pod-usable: per-GPU tensor op, driver ≥ floor (`MIN_DRIVER_VERSION`, else from `ALLOWED_CUDA_VERSIONS`), device count, GPU↔GPU copy + NCCL (>1 GPU), HF download speed, disk, host load, maintenance. FAIL/WARN/PASS per pod, `same host?` grouping, non-zero exit on FAIL. Verdicts go to the health cache. |
@@ -58,14 +58,14 @@ means this.
 | Legacy script | Rust CLI | TUI | Status | Notes |
 |---|---|---|---|---|
 | `gpu-top.sh [interval]` (live nvidia-smi dashboard) | — | dashboard + sparklines | ✅ | The TUI is the live monitor (per-pod probe over `Remote`, 20 s budget). |
-| — | `snapshot [--json] [--public] [--out FILE]` + `web/fleet.html` + `cron install --snapshot DIR` | every refresh is one `snapshot::build` | ➕ | Read-only fleet picture (list columns + proxy port live/stale + last deep-check verdict and age). `--public` = an allowlisted JSON (list names, GPU, up/starting/down, health + fixed-vocabulary reason, maintenance times — no IPs, ports, ids, costs) for the static page. |
+| — | `snapshot [--json] [--public] [--out FILE]` + `web/fleet.html` + `cron install --snapshot DIR` | every refresh is one `snapshot::build` | ➕ | Read-only fleet picture (list columns + SSH port answers ok/down + proxy port live/stale + last deep-check verdict and age; the SSH probe is a TCP connect + sshd's greeting, ≤ 3 s, cohort machines only, `--no-probe` to skip). Public `up` needs the probe's answer (silent → `starting`). `--public` = an allowlisted JSON (list names, GPU, up/starting/down, health + fixed-vocabulary reason, maintenance times — no IPs, ports, ids, costs) for the static page. |
 | — | `teardown --check [--json]` | — | ➕ | End-of-program audit: pods on every provider in any state, RunPod network volumes, enabled OpenRouter keys, arena cron lines, `at` jobs, proxy forwards — ✓ ✗ ? – with fix commands; unknown is never "empty"; non-zero unless all clear. Deletes nothing. |
 | `copy_api_keys.py` (CSV → pod `~/.bashrc`/`~/.zshrc`) | `pods copy-keys [selector] [--keys-dir --hf-token --cc-token]` | — | ✅ | Per-host CSVs (openai/anthropic/openrouter) + broadcast Hugging Face and Claude Code tokens. Idempotent; 60 s per pod. |
 | — | `keys gen/list/rotate/revoke/which` | — | ➕ | OpenRouter runtime keys via the provisioning API (one per machine, USD cap), written to `keys/openrouter_api_keys.csv`. |
 | — | `gpus [--json]` | add-pod GPU list | ➕ | RunPod's live catalog (VRAM, community/secure $/h, stock), else presets. |
 | — | `config check / set / which` | — | ➕ | `check` shows set/missing only (and which RunPod API is active); `set` can read the value from stdin, keeping it out of `argv`. |
 | — | `plan check / show` (scheduled provisioning) | — | ➕ | Executor + arm/disarm still pending. |
-| — | `cron install/remove/show` (`--pull --proxy --snapshot DIR --start-date`) | — | ➕ | Edits only arena's block of the user's crontab. |
+| — | `cron install/remove/show` (`--backup --pull --schedule --start-date --proxy --snapshot DIR`; `remove [--backup --proxy --snapshot]`) | — | ➕ | Edits only arena's block of the user's crontab, **line by line**: each line (backup / proxy / snapshot) has an identity, so `install` replaces only the lines its flags name and `remove --<kind>` drops only that one. Diff + confirm. Every line under `flock -n`. |
 
 ## Config keys added in phases 0–4
 
@@ -75,6 +75,7 @@ means this.
 | `SSH_PROXY_RELOAD_CMD` | absent → `nginx -t && nginx -s reload` | Run after a proxy write; **empty = write-only** (never reloads nginx). Settable (empty) from the environment, as the sandbox wrapper does. |
 | `SETUP_TIMEOUT_SECS` | 300 (image pods) / 1800 (Hetzner script) | The main setup step's budget, 1..86400, for `setup`, `up`, `restart`, `replace`, `migrate copy`; `setup --timeout` wins. Checked before `up` creates anything. |
 | `ARENA_STATE_DIR` | `${XDG_STATE_HOME:-~/.local/state}/arena` | Root of the health cache, `<dir>/<prefix>/health.json` (absolute path). Settable from the environment, so a cron job and the operator can share one. |
+| `BACKUP_TIMEOUT_SECS` | 7200 (2 h) | Wall-clock budget per pod for the backup rsyncs (`pods pull`, `pods backup`'s file step), 1..86400; on top of rsync's `--timeout=300` (I/O silence). A pod that runs out is stopped and named; the others finish. A malformed value fails the command before anything is copied. Settable from the environment. |
 | `MIN_DRIVER_VERSION` | derived from `ALLOWED_CUDA_VERSIONS` (13.x → 580, 12.8 → 570, …) | The deep check's driver floor (`580` or `580.65.06`; `none` = no check). A malformed value fails `up --check` before anything is created. |
 
 ## Provider status

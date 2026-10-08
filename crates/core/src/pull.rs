@@ -11,6 +11,10 @@
 //! `node_modules/`) are excluded — they're either reconstructable or huge. The rsync arg
 //! vector is built purely here so it's unit-tested; the process spawn lives in the caller.
 
+use std::time::Duration;
+
+use crate::error::{Error, Result};
+use crate::setup::MAX_STEP_TIMEOUT_SECS;
 use crate::ssh::SshTarget;
 
 /// Options for a pull, defaulting to the legacy `backup.sh` behavior.
@@ -30,7 +34,18 @@ pub struct PullConfig {
     pub excludes: Vec<String>,
     /// Remote path to pull from, relative to the SSH login dir. Empty = the home dir.
     pub remote_path: String,
+    /// rsync `--timeout`: give up after this many seconds with **no I/O at all**. Without
+    /// it, a pod that stops answering mid-transfer (a wedged host, a dropped NAT mapping)
+    /// leaves rsync waiting forever — and the */15 backup cron stacking up behind it. It
+    /// only fires on silence: a slow transfer keeps moving bytes, and rsync sends
+    /// keep-alives while either side is busy checksumming a big file. `None` = no limit.
+    /// The wall-clock bound on a whole transfer is the caller's (`BACKUP_TIMEOUT_SECS`).
+    pub io_timeout_secs: Option<u64>,
 }
+
+/// The default [`PullConfig::io_timeout_secs`]: 5 minutes without a byte means the
+/// connection is dead, not slow.
+pub const RSYNC_IO_TIMEOUT_SECS: u64 = 300;
 
 impl Default for PullConfig {
     fn default() -> Self {
@@ -73,6 +88,7 @@ impl Default for PullConfig {
                 "TEMP_FOLDER_FOR_SWEEPS/".to_string(),
             ],
             remote_path: String::new(),
+            io_timeout_secs: Some(RSYNC_IO_TIMEOUT_SECS),
         }
     }
 }
@@ -136,6 +152,33 @@ impl PullConfig {
     pub fn big_tier() -> Self {
         Self { max_size: None, min_size: None, ..Self::default() }
     }
+}
+
+/// The default wall-clock budget for one pod's backup rsync (`BACKUP_TIMEOUT_SECS`): 2 hours.
+/// A first big-tier pull of a full home over a slow uplink takes tens of minutes, so this
+/// only trips on a transfer that is stuck while still trickling bytes — a silent one is
+/// already stopped by the I/O timeout ([`RSYNC_IO_TIMEOUT_SECS`]). Either way the pod is
+/// reported as a named failure and the rest of the fleet's backup carries on.
+pub const DEFAULT_BACKUP_TIMEOUT_SECS: u64 = 2 * 3600;
+
+/// The per-pod budget for a backup rsync, from the `BACKUP_TIMEOUT_SECS` config value:
+/// unset/empty = [`DEFAULT_BACKUP_TIMEOUT_SECS`]; otherwise whole seconds,
+/// 1..=[`MAX_STEP_TIMEOUT_SECS`] (a day). Anything else is a config error naming the value
+/// — a typo must not quietly become "no limit" (an unbounded backup is what stacks the
+/// cron) or the default.
+pub fn backup_timeout(config_value: Option<&str>) -> Result<Duration> {
+    let Some(raw) = config_value.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(Duration::from_secs(DEFAULT_BACKUP_TIMEOUT_SECS));
+    };
+    raw.parse::<u64>()
+        .ok()
+        .filter(|n| (1..=MAX_STEP_TIMEOUT_SECS).contains(n))
+        .map(Duration::from_secs)
+        .ok_or_else(|| {
+            Error::Config(format!(
+                "BACKUP_TIMEOUT_SECS must be a whole number of seconds, 1..={MAX_STEP_TIMEOUT_SECS} (got `{raw}`)"
+            ))
+        })
 }
 
 /// The local destination for a pod's backup: `<base>/<label>/<pod-name>/`. The trailing
@@ -241,6 +284,9 @@ fn rsync_flags(pc: &PullConfig) -> Vec<String> {
         "--stats".into(), // emit a summary we parse to report files/bytes per pod
         "--prune-empty-dirs".into(),
     ];
+    if let Some(t) = pc.io_timeout_secs {
+        a.push(format!("--timeout={t}"));
+    }
     // `--max-size` keeps the snapshot tier small (the big tier leaves it `None` to take
     // everything). `--min-size` is currently unused but honored if a caller sets it.
     if let Some(m) = &pc.max_size {
@@ -320,6 +366,34 @@ mod tests {
     }
 
     #[test]
+    fn backup_timeout_table() {
+        // (config value, budget in seconds or the error's tell)
+        let cases: &[(Option<&str>, std::result::Result<u64, &str>)] = &[
+            (None, Ok(DEFAULT_BACKUP_TIMEOUT_SECS)),
+            (Some(""), Ok(7200)),
+            (Some("  "), Ok(7200)),
+            (Some("600"), Ok(600)),
+            (Some(" 1 "), Ok(1)),
+            (Some("86400"), Ok(86_400)),
+            (Some("86401"), Err("got `86401`")),
+            (Some("0"), Err("got `0`")),
+            (Some("-5"), Err("got `-5`")),
+            (Some("2h"), Err("got `2h`")),
+            (Some("18446744073709551616"), Err("1..=86400")),
+        ];
+        for (raw, want) in cases {
+            match (backup_timeout(*raw), want) {
+                (Ok(d), Ok(secs)) => assert_eq!(d, Duration::from_secs(*secs), "{raw:?}"),
+                (Err(e), Err(tell)) => {
+                    let e = e.to_string();
+                    assert!(e.contains("BACKUP_TIMEOUT_SECS") && e.contains(tell), "{raw:?}: {e}");
+                }
+                (got, _) => panic!("{raw:?}: got {got:?}, want {want:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn parses_rsync_stats() {
         let out = "sent 18 bytes  received 102000000 bytes\n\
                    Number of files: 1,200\n\
@@ -346,6 +420,8 @@ mod tests {
         assert!(joined.contains("-avz"));
         assert!(joined.contains("--max-size=50M"));
         assert!(joined.contains("--prune-empty-dirs"));
+        // A transfer that goes silent gives up instead of hanging the backup forever.
+        assert!(a.contains(&"--timeout=300".to_string()), "{joined}");
         // default excludes present as separate args (dotdirs, site-packages, and the
         // non-dot caches/envs that would otherwise bloat the backup)
         for ex in ["**/.*/", ".cache/", "site-packages/", "__pycache__/", "hf_cache/", "huggingface/", "venv/", "node_modules/", "models--*/", "datasets--*/"] {
@@ -422,6 +498,8 @@ mod tests {
         // …glob excludes are single-quoted so the source shell doesn't expand them…
         assert!(cmd.contains("'**/.*/'"));
         assert!(cmd.contains("'.claude*'"));
+        // …a stalled copy gives up (the source pod's rsync, too)…
+        assert!(cmd.contains(" '--timeout=300' "), "{cmd}");
         // …$HOME stays unquoted (remote shell expands it), dest is endpoint:home.
         assert!(cmd.contains(" $HOME/ "));
         assert!(cmd.trim_end().ends_with("root@5.6.7.8:"));
@@ -440,6 +518,10 @@ mod tests {
         // owner/group preservation is OFF on a push, so the dest home isn't chowned to the
         // control user (which would lock sshd out).
         assert!(a.contains(&"--no-owner".to_string()) && a.contains(&"--no-group".to_string()));
+        assert!(a.contains(&"--timeout=300".to_string()));
+        // `None` drops the I/O timeout entirely.
+        let unbounded = PullConfig { io_timeout_secs: None, ..PullConfig::replication() };
+        assert!(!push_rsync_args(&target(), &unbounded, "/tmp/s/").iter().any(|x| x.starts_with("--timeout")));
         // transport still carries port + key
         let e = a.iter().position(|x| x == "-e").unwrap();
         assert!(a[e + 1].contains("-p 22001") && a[e + 1].contains("-i /root/.ssh/arena8_key"));
