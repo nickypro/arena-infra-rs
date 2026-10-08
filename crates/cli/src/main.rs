@@ -1689,31 +1689,46 @@ where
     }
 }
 
+/// RunPod's REST v2 GPU catalog for one tier (read-only, bounded by [`PRICE_TIMEOUT`]),
+/// fetched at most once per tier per run: the `--gpu` check and the placement plan's price
+/// book share the answer (or the failure — see [`arena_core::provider::runpod_v2::CatalogCache`]).
+async fn v2_catalog(key: &str, cloud: &str) -> std::result::Result<Vec<arena_core::provider::runpod::GpuType>, String> {
+    use arena_core::provider::runpod_v2;
+    static CACHE: std::sync::OnceLock<runpod_v2::CatalogCache> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(runpod_v2::CatalogCache::default)
+        .get_or_fetch(key, cloud, |tier| bounded_catalog(runpod_v2::fetch_gpu_types(key, tier)))
+        .await
+}
+
+/// The tier whose v2 catalog answers questions that aren't about a tier (the `--gpu`
+/// check, `arena gpus`): the configured `CLOUD_TYPE`, or COMMUNITY. Every tier's catalog
+/// lists every GPU, so this only picks which tier's stock a reader sees — and with the
+/// configured tier, a plain `create` reuses the check's fetch for its prices.
+fn v2_default_cloud(cfg: &Config) -> &'static str {
+    arena_core::provider::runpod_v2::normalize_cloud(&PodSpec::from_config(cfg).cloud_type).unwrap_or("COMMUNITY")
+}
+
 /// RunPod's live GPU catalog, for checking `--gpu` (read-only; each fetch bounded by
-/// [`PRICE_TIMEOUT`]). The GraphQL `gpuTypes` first, on either API generation: it's the
-/// full catalog whatever the tier (a superset of what create accepts, so checking against it
-/// never refuses a creatable id); on `RUNPOD_API=v2` the REST v2 catalog is the fallback.
+/// [`PRICE_TIMEOUT`]): on `RUNPOD_API=v2` the REST v2 catalog — the one v2's create
+/// validates `gpu.id` against — and nothing else (no GraphQL, see `runpod_v2`'s GraphQL
+/// inventory); otherwise the GraphQL `gpuTypes`, the full catalog whatever the tier (a
+/// superset of what create accepts, so checking against it never refuses a creatable id).
 /// `Err` says why there's no catalog (no key, unreachable, empty).
 async fn live_gpu_catalog(cfg: &Config) -> std::result::Result<Vec<arena_core::provider::runpod::GpuType>, String> {
-    use arena_core::provider::{runpod, runpod_v2, RunpodApi};
+    use arena_core::provider::{runpod, RunpodApi};
     let Some(key) = cfg.get("RUNPOD_API_KEY").filter(|s| !s.is_empty()) else {
         return Err("no RUNPOD_API_KEY".into());
     };
-    let mut errs = Vec::new();
-    match bounded_catalog(runpod::fetch_gpu_types(key)).await {
-        Ok(types) if !types.is_empty() => return Ok(types),
-        Ok(_) => errs.push("GraphQL catalog: empty".to_string()),
-        Err(e) => errs.push(format!("GraphQL catalog: {e}")),
-    }
     if matches!(RunpodApi::from_config(cfg), Ok(RunpodApi::V2)) {
-        let cloud = runpod_v2::normalize_cloud(&PodSpec::from_config(cfg).cloud_type).unwrap_or("COMMUNITY");
-        match bounded_catalog(runpod_v2::fetch_gpu_types(key, cloud)).await {
-            Ok(types) if !types.is_empty() => return Ok(types),
-            Ok(_) => errs.push(format!("v2 catalog ({cloud}): empty")),
-            Err(e) => errs.push(format!("v2 catalog ({cloud}): {e}")),
-        }
+        let cloud = v2_default_cloud(cfg);
+        return v2_catalog(key, cloud).await.map_err(|e| format!("v2 catalog ({cloud}): {e}"));
     }
-    Err(errs.join("; "))
+    match bounded_catalog(runpod::fetch_gpu_types(key)).await {
+        Ok(types) if !types.is_empty() => Ok(types),
+        Ok(_) => Err("GraphQL catalog: empty".to_string()),
+        Err(e) => Err(format!("GraphQL catalog: {e}")),
+    }
 }
 
 /// What to do with a `--gpu` value given the catalog fetch's outcome. Pure (the policy is
@@ -1754,9 +1769,10 @@ async fn checked_gpu(cfg: &Config, provider_name: &str, gpu: Option<String>) -> 
 
 /// The prices placement can see (read-only), plus notes on where they came from. RunPod:
 /// the live catalog — on `RUNPOD_API=v2` one `/v2/catalog/gpus` per requested tier (its stock
-/// is per tier), else / failing that the GraphQL `gpuTypes` (Phase 0.D) — backed by the preset
-/// estimates. Vast: the cheapest offer fitting `base` (disk, CUDA floor) per GPU option, one
-/// marketplace search per card, each bounded by [`PRICE_TIMEOUT`]. Hetzner quotes nothing.
+/// is per tier; each tier fetched once per run, see [`v2_catalog`]) and no GraphQL; on v1 the
+/// GraphQL `gpuTypes` (Phase 0.D) — backed by the preset estimates. Vast: the cheapest offer
+/// fitting `base` (disk, CUDA floor) per GPU option, one marketplace search per card, each
+/// bounded by [`PRICE_TIMEOUT`]. Hetzner quotes nothing.
 async fn fetch_price_book(
     cfg: &Config,
     provider_name: &str,
@@ -1764,7 +1780,7 @@ async fn fetch_price_book(
     base: &PodSpec,
 ) -> Result<(arena_core::placement::PriceBook, Vec<String>)> {
     use arena_core::placement::PriceBook;
-    use arena_core::provider::{runpod, runpod_v2, vast, RunpodApi};
+    use arena_core::provider::{runpod, vast, RunpodApi};
     let clouds = &req.clouds;
     if provider_name == "vast" {
         if cfg.get("VAST_API_KEY").is_none_or(str::is_empty) {
@@ -1792,14 +1808,12 @@ async fn fetch_price_book(
     let mut errs = Vec::new();
     if RunpodApi::from_config(cfg)? == RunpodApi::V2 {
         for cloud in clouds {
-            match bounded_catalog(runpod_v2::fetch_gpu_types(key, cloud)).await {
-                Ok(types) if !types.is_empty() => catalogs.push((Some(cloud.clone()), types)),
-                Ok(_) => errs.push(format!("v2 catalog ({cloud}): empty")),
+            match v2_catalog(key, cloud).await {
+                Ok(types) => catalogs.push((Some(cloud.clone()), types)),
                 Err(e) => errs.push(format!("v2 catalog ({cloud}): {e}")),
             }
         }
-    }
-    if catalogs.is_empty() {
+    } else {
         match bounded_catalog(runpod::fetch_gpu_types(key)).await {
             Ok(types) if !types.is_empty() => catalogs.push((None, types)),
             Ok(_) => errs.push("GraphQL catalog: empty".into()),
@@ -2040,13 +2054,13 @@ async fn main() -> Result<()> {
 /// `arena gpus`: list the GPU types you can pass to `--gpu`. Fetches RunPod's **full,
 /// live** catalog with live community/secure prices + stock when on RunPod with a key —
 /// via GraphQL on `RUNPOD_API=v1`, via REST `GET /v2/catalog/gpus` (stock for the configured
-/// cloud tier) on `v2`, falling back to GraphQL if that fails; otherwise falls back to the
-/// local curated presets. `--json` emits the same rows machine-readably
-/// (`arena_core::gpu::GpuRow`). Diagnostics go to stderr so the JSON on stdout stays
-/// parseable.
+/// cloud tier) on `v2`, with no GraphQL fallback there (see `runpod_v2`'s GraphQL
+/// inventory); otherwise, or when that fails, falls back to the local curated presets.
+/// `--json` emits the same rows machine-readably (`arena_core::gpu::GpuRow`). Diagnostics
+/// go to stderr so the JSON on stdout stays parseable.
 async fn handle_gpus(cfg: &Config, provider_name: &str, json: bool) -> Result<()> {
     use arena_core::gpu;
-    use arena_core::provider::{runpod, runpod_v2, RunpodApi};
+    use arena_core::provider::{runpod, RunpodApi};
 
     // (rows, whether the create-API enum was available to flag `creatable`)
     let mut live: Option<(Vec<gpu::GpuRow>, bool)> = None;
@@ -2056,20 +2070,11 @@ async fn handle_gpus(cfg: &Config, provider_name: &str, json: bool) -> Result<()
         if let Some(key) = cfg.get("RUNPOD_API_KEY").filter(|s| !s.is_empty()) {
             let api = RunpodApi::from_config(cfg)?;
             let fetched = match api {
-                RunpodApi::V1 => runpod::fetch_gpu_types(key).await,
+                RunpodApi::V1 => runpod::fetch_gpu_types(key).await.map_err(|e| e.to_string()),
                 RunpodApi::V2 => {
-                    let cloud = runpod_v2::normalize_cloud(&PodSpec::from_config(cfg).cloud_type).unwrap_or("COMMUNITY");
-                    match runpod_v2::fetch_gpu_types(key, cloud).await {
-                        Ok(types) if !types.is_empty() => {
-                            stock_cloud = Some(cloud);
-                            Ok(types)
-                        }
-                        other => {
-                            let why = other.err().map_or_else(|| "empty catalog".to_string(), |e| e.to_string());
-                            eprintln!("(v2 GPU catalog unavailable: {why} — trying the GraphQL catalog)\n");
-                            runpod::fetch_gpu_types(key).await
-                        }
-                    }
+                    let cloud = v2_default_cloud(cfg);
+                    stock_cloud = Some(cloud);
+                    v2_catalog(key, cloud).await.map_err(|e| format!("v2 catalog ({cloud}): {e}"))
                 }
             };
             match fetched {
@@ -9213,6 +9218,19 @@ mod replacement_spec_tests {
         assert_eq!(super::checked_gpu(&c, "vast", Some("RTX 3070 typo".into())).await.unwrap().as_deref(), Some("RTX 3070 typo"));
         assert_eq!(super::checked_gpu(&c, "hetzner", None).await.unwrap(), None);
         assert_eq!(super::checked_gpu(&c, "runpod", Some("3070".into())).await.unwrap().as_deref(), Some("3070"));
+        let v2 = cfg("RUNPOD_API=v2\n");
+        assert_eq!(super::live_gpu_catalog(&v2).await.unwrap_err(), "no RUNPOD_API_KEY");
+        assert_eq!(super::checked_gpu(&v2, "runpod", Some("3070".into())).await.unwrap().as_deref(), Some("3070"));
+    }
+
+    /// The tier whose v2 catalog serves the `--gpu` check and `arena gpus`: the configured
+    /// one (any spelling) — so a plain create's price book reuses that fetch — else COMMUNITY.
+    #[test]
+    fn v2_catalog_tier_follows_the_configured_cloud() {
+        assert_eq!(super::v2_default_cloud(&cfg("")), "COMMUNITY");
+        assert_eq!(super::v2_default_cloud(&cfg("CLOUD_TYPE=secure\n")), "SECURE");
+        assert_eq!(super::v2_default_cloud(&cfg("RUNPOD_CLOUD_TYPE=COMMUNITY\n")), "COMMUNITY");
+        assert_eq!(super::v2_default_cloud(&cfg("CLOUD_TYPE=ALL\n")), "COMMUNITY");
     }
 }
 

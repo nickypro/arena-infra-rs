@@ -2,7 +2,9 @@
 //! the few things REST can't do (restart-free rename, GPU catalog/prices, host details).
 //!
 //! RunPod retires REST v1 on 2026-11-15; its replacement is [`super::runpod_v2`], picked
-//! with `RUNPOD_API=v2`. The GraphQL helpers here (rename, pod details) are shared with it.
+//! with `RUNPOD_API=v2`. Of the GraphQL helpers here only the pod details (maintenance
+//! windows) are shared with it, plus the network-volume listing as its fallback — v2 renames
+//! and reads the GPU catalog over REST (see "GraphQL dependency inventory" in `runpod_v2`).
 //!
 //! Responses are parsed defensively from `serde_json::Value` so a schema tweak on
 //! RunPod's side degrades a field to `None` rather than crashing the tool.
@@ -289,9 +291,9 @@ pub(super) async fn enrich_via_graphql(client: &Client, api_key: &str, pods: &mu
 /// documented as "Update a Pod, potentially triggering a reset", and empirically it RESTARTS
 /// the container, which wipes the container disk (everything not on a network volume) —
 /// i.e. silent data loss. `podEditName` is a pure metadata rename: verified (via `/proc/1`
-/// start time before/after) to leave the running container completely untouched. Shared
-/// with the v2 backend, whose `PATCH name` isn't documented as restart-free either.
-pub(super) async fn rename_via_graphql(client: &Client, api_key: &str, id: &str, new_name: &str) -> Result<()> {
+/// start time before/after) to leave the running container completely untouched. v1 only:
+/// v2 renames with a name-only REST PATCH, live-verified restart-free (`runpod_v2`).
+async fn rename_via_graphql(client: &Client, api_key: &str, id: &str, new_name: &str) -> Result<()> {
     let body = json!({
         "query": "mutation editPodName($input: PodEditNameInput!) { \
                   podEditName(input: $input) { id name } }",
