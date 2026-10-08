@@ -5105,7 +5105,9 @@ fn record_health(
 
 /// `arena snapshot`: see [`collect_snapshot`] for what it reads, [`render_snapshot`] for the
 /// three outputs. `--out` replaces the file atomically — owner-only unless it's the public
-/// JSON (which a web server has to read) — and warns when it isn't the public JSON.
+/// JSON (which a web server has to read) — and warns when it isn't the public JSON. A
+/// public file is kept (and the exit is non-zero) when the new one would show no machines
+/// only because a provider failed to list ([`arena_core::snapshot::would_blank_the_page`]).
 async fn handle_snapshot(
     provider: &dyn Provider,
     cfg: &Config,
@@ -5117,7 +5119,8 @@ async fn handle_snapshot(
     for w in warnings {
         eprintln!("{w}");
     }
-    let text = render_snapshot(&snap, &Naming::from_config(cfg), json, public)?;
+    let naming = Naming::from_config(cfg);
+    let text = render_snapshot(&snap, &naming, json, public)?;
     match out {
         None => print!("{text}"),
         Some(path) => {
@@ -5126,6 +5129,16 @@ async fn handle_snapshot(
                     "warning: {} gets the INTERNAL snapshot (ids, endpoints, costs) — publish only `--public` output",
                     path.display()
                 );
+            } else if let Ok(previous) = std::fs::read_to_string(path) {
+                let next = arena_core::snapshot::public_snapshot(&snap, &naming);
+                if arena_core::snapshot::would_blank_the_page(&previous, &next) {
+                    anyhow::bail!(
+                        "{} failed to list and nothing else listed a machine — kept {} as it was rather than \
+                         publish an empty fleet (the page shows it going stale); re-run once it answers",
+                        snap.partial.join(", "),
+                        path.display()
+                    );
+                }
             }
             let mode = if public { 0o644 } else { 0o600 };
             arena_core::snapshot::write_atomic(path, text.as_bytes(), mode)
@@ -13847,6 +13860,47 @@ mod snapshot_tests {
         let err = handle_snapshot(&down, &cfg, false, true, Some(&out)).await.unwrap_err();
         assert!(err.to_string().contains("no provider listed its pods"), "{err}");
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "previous", "the page goes stale rather than empty");
+    }
+
+    /// The provider holding every machine fails while another configured one answers empty
+    /// (a Hetzner set up but unused): the page keeps its machines and goes stale instead of
+    /// reading "No machines." — while a real teardown (everyone answered, nothing listed)
+    /// and a partial listing that still shows machines are published as usual.
+    #[tokio::test]
+    async fn snapshot_never_blanks_the_page_when_the_provider_with_the_machines_fails() {
+        let dir = tmp("blank");
+        let cfg = cfg(&dir.0);
+        let out = dir.0.join("fleet.json");
+        let fleet_of = |runpod: std::result::Result<Vec<Pod>, &'static str>| Fleet {
+            backends: vec![("runpod", runpod), ("hetzner", Ok(vec![]))],
+            enriched: AtomicUsize::new(0),
+        };
+        handle_snapshot(&fleet_of(Ok(vec![apple()])), &cfg, false, true, Some(&out)).await.unwrap();
+        let good = std::fs::read_to_string(&out).unwrap();
+        assert!(good.contains("\"apple\""), "{good}");
+
+        let err = handle_snapshot(&fleet_of(Err("list pods HTTP 429")), &cfg, false, true, Some(&out)).await.unwrap_err();
+        assert!(err.to_string().starts_with("runpod failed to list and nothing else listed a machine — kept "), "{err}");
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), good, "the old page is kept");
+
+        // Printing (no file to protect) still works, flagged incomplete.
+        handle_snapshot(&fleet_of(Err("list pods HTTP 429")), &cfg, false, true, None).await.unwrap();
+        // A partial listing that still shows a machine is published, flagged incomplete.
+        let partial = Fleet {
+            backends: vec![("runpod", Ok(vec![apple()])), ("vast", Err("list pods HTTP 429"))],
+            enriched: AtomicUsize::new(0),
+        };
+        handle_snapshot(&partial, &cfg, false, true, Some(&out)).await.unwrap();
+        let public: PublicSnapshot = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!((public.complete, public.machines.len()), (false, 1));
+        // Everyone answered and nothing is left: the empty page is the truth.
+        handle_snapshot(&fleet_of(Ok(vec![])), &cfg, false, true, Some(&out)).await.unwrap();
+        let public: PublicSnapshot = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!((public.complete, public.machines.len()), (true, 0));
+        // And from there, an outage has nothing to blank: published, flagged incomplete.
+        handle_snapshot(&fleet_of(Err("list pods HTTP 429")), &cfg, false, true, Some(&out)).await.unwrap();
+        let public: PublicSnapshot = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!((public.complete, public.machines.len()), (false, 0));
     }
 
     #[tokio::test]

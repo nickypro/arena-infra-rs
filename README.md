@@ -301,28 +301,35 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     endpoints, costs — never publish it). `--public` = the dashboard JSON, an **allowlist by
     construction**: only *prefixed* `MACHINE_NAME_LIST` pods (`@` staff boxes and off-list
     pods are left out) by short name, with GPU, `up|starting|down`, health + age + a reason
-    from a fixed vocabulary (never check text), maintenance start/end, `updated_at`,
-    `complete`. No IPs, hosts, ports, ids, providers, costs or keys (pinned by a leak test).
-    `--out` is atomic; if no provider answers, it fails and leaves the old file.
+    from a fixed vocabulary (never check text), maintenance start/end (only a complete RFC
+    3339 time, re-printed in UTC — anything else is dropped), `updated_at`, `complete`. No
+    IPs, hosts, ports, ids, providers, costs or keys (pinned by a leak test). `--out` is
+    atomic and the public file is 0644 whatever the umask; if no provider answers — or the
+    one that failed leaves no machine to show over a page that listed some — it fails and
+    leaves the old file (the page shows it going stale, never "No machines.").
   - `teardown --check [--json]` — the **end-of-program audit** (read-only; deletes nothing):
     a `✓ ✗ ? –` checklist of what is still billing or scheduled, each with the exact command
     that cleans it up. Every pod on every configured provider in **any** state (a stopped pod
     keeps its name and still bills its disk; only `TERMINATED` is left out) — fix `pods
-    terminate --all`; RunPod **network volumes** (REST v2 `GET /v2/network-volumes`, else
+    terminate --all` only when every listing answered and every pod is this cohort's
+    (`{prefix}-…`), else one `pods terminate <id>` per cohort pod; staff boxes (`@` list
+    entries) and other pods are labelled and left to you, never in a fix; RunPod **network volumes** (REST v2 `GET /v2/network-volumes`, else
     GraphQL `myself.networkVolumes`; GraphQL field names taken from existing clients, not
     live-verified) with size and an **estimated** ~$/month at $0.07/GB/month — fix a `curl -X
     DELETE …/v2/network-volumes/<id>` (irreversible); this cohort's **enabled OpenRouter
     keys** with usage — fix `keys revoke <names>` (by name: `--all` only reaches machines
-    that still have a pod); this user's crontab — arena's block (`cron remove`) and
+    that still have a pod; staff boxes' keys are only named in a note); this user's crontab — arena's block (`cron remove`) and
     hand-added lines mentioning arena (`crontab -e`); pending **`at` jobs** whose command
     (from `at -c`, never its environment) mentions arena or a legacy fleet script
     (`destroy_pods`, …) — fix `atrm <ids>` (`at` not installed is said, not failed); and
     forwards left in the **local** proxy file — fix `proxy apply`. A source that couldn't be
-    read (a provider's 429, a remote proxy, an unreadable `at` job) is `?` — **never
+    read (a provider's 429, a remote proxy, an unreadable `at` job, a proxy `server` block
+    arena can't parse) is `?` — **never
     "empty"** — and, like anything remaining, makes the exit non-zero; a provider with no key
     is `–` (not checked). Exit 0 only when all clear. Only this user's crontab/`at` queue
     are read (not root's, not `/etc/cron.d`); shown commands have secret-looking values
-    redacted. `--json` = the same checklist for scripts.
+    redacted (`NAME=…`, `--flag=…`/`--flag …` named key/token/secret/pass, `sk-`/`rpa_`/`hf_`
+    words; tab-separated fields too). `--json` = the same checklist for scripts.
   - `pods pull [label]` — the **file** backup (complementing the git `backup`): rsyncs
     each pod's home into `<dir>/<label>/<pod>/`, reporting files/bytes moved per pod.
     **Keeps `.git`** (so the backup is a usable repo; `--no-git` to skip), size-caps with

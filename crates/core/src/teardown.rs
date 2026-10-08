@@ -18,11 +18,11 @@
 use serde::Serialize;
 
 use crate::fleet::{currency_symbol, fmt_money};
-use crate::naming::qualify;
+use crate::naming::{is_absolute, qualify};
 use crate::openrouter::{key_name, KeyInfo};
 use crate::pod::Pod;
 use crate::provider::runpod::NetworkVolume;
-use crate::proxy::parse_nginx;
+use crate::proxy::parse_nginx_detailed;
 use crate::selector::Naming;
 use crate::status::bills_hourly;
 
@@ -166,8 +166,11 @@ pub enum Entry {
         /// Costing its hourly rate now ([`bills_hourly`]); a stopped pod still bills its disk.
         billing: bool,
         cost_per_hr: Option<f64>,
-        /// Named like this cohort's machines (`{prefix}-…` or on `MACHINE_NAME_LIST`).
+        /// Named like this cohort's machines (`{prefix}-…`, parked twins included).
         cohort: bool,
+        /// An absolute (`@name`) `MACHINE_NAME_LIST` entry: a personal/staff box sharing the
+        /// list (see `naming`) — never this cohort's, and never in a printed fix.
+        staff: bool,
     },
     Volume {
         id: String,
@@ -251,15 +254,23 @@ pub struct Report {
 /// a missing one is "not configured"), volumes, keys, cron, at, proxy.
 pub fn build(inputs: &Inputs, naming: &Naming) -> Report {
     let mut items: Vec<Item> = Vec::new();
+    // `pods terminate --all` reaches every pod on every configured provider, so whether it
+    // may be printed is decided over the whole fleet: every listing answered, and every pod
+    // in them (TERMINATED aside) is this cohort's.
+    let fleet_all_ours = inputs.listings.iter().all(|(_, listing)| {
+        listing.as_ref().is_ok_and(|pods| pods.iter().filter(|p| !is_terminated(p)).all(|p| is_cohort_pod(naming, &p.name)))
+    });
     for (provider, key) in PROVIDER_KEYS {
         match inputs.listings.iter().find(|(p, _)| p == provider) {
-            Some((_, listing)) => items.push(pods_item(provider, listing.as_ref().map(Vec::as_slice), naming)),
+            Some((_, listing)) => {
+                items.push(pods_item(provider, listing.as_ref().map(Vec::as_slice), naming, fleet_all_ours))
+            }
             None => items.push(Item::new(Area::Pods, provider, Verdict::Skipped, format!("not configured (no {key}) — not checked"))),
         }
     }
     // A backend outside the known three (only fakes today) is still reported, never dropped.
     for (provider, listing) in inputs.listings.iter().filter(|(p, _)| !PROVIDER_KEYS.iter().any(|(k, _)| *k == p.as_str())) {
-        items.push(pods_item(provider, listing.as_ref().map(Vec::as_slice), naming));
+        items.push(pods_item(provider, listing.as_ref().map(Vec::as_slice), naming, fleet_all_ours));
     }
     items.push(volumes_item(&inputs.volumes));
     items.push(keys_item(&inputs.keys, naming));
@@ -272,25 +283,40 @@ pub fn build(inputs: &Inputs, naming: &Naming) -> Report {
     Report { cohort: naming.prefix.to_string(), clear: remaining == 0 && unknown == 0, remaining, unknown, items }
 }
 
-/// Is `name` one of this cohort's machines: `{prefix}-…` (parked `-old`/`-new` twins
-/// included), or an absolute (`@name`) entry on the list. Only labels pods — every pod on the
-/// account counts as remaining, since the account pays for all of them.
-fn is_cohort_pod(naming: &Naming, name: &str) -> bool {
-    name.starts_with(&format!("{}-", naming.prefix)) || naming.list.iter().any(|e| qualify(naming.prefix, e) == name)
+/// Is `name` an absolute (`@name`) list entry's — a personal/staff box that shares the list
+/// and the proxy without joining the cohort (`naming`; `snapshot --public` leaves them out
+/// for the same reason). The end of a cohort is not the end of those boxes.
+fn is_staff(naming: &Naming, name: &str) -> bool {
+    naming.list.iter().any(|e| is_absolute(e) && qualify(naming.prefix, e) == name)
 }
 
-/// Is `name` a key `keys gen` would have minted for this cohort — its own canonical key name
-/// (`{prefix}-…`, or an absolute list entry's bare name). The rule `keys revoke` targets by,
-/// so the printed fix revokes exactly these.
+/// Is `name` one of this cohort's machines: `{prefix}-…` (parked `-old`/`-new` twins
+/// included), never a staff box ([`is_staff`]). Every pod on the account still counts as
+/// remaining — the account pays for all of them — but only cohort pods get a ready-to-paste
+/// terminate command.
+fn is_cohort_pod(naming: &Naming, name: &str) -> bool {
+    name.starts_with(&format!("{}-", naming.prefix)) && !is_staff(naming, name)
+}
+
+/// Is `name` a key `keys gen` would have minted for this cohort's machines: its own
+/// canonical key name (`{prefix}-…`; the rule `keys revoke` targets by, so the printed fix
+/// revokes exactly these) — but not a staff box's (an absolute entry's bare name).
 fn is_cohort_key(naming: &Naming, name: &str) -> bool {
-    key_name(naming.prefix, naming.list, name) == name
+    key_name(naming.prefix, naming.list, name) == name && !is_staff(naming, name)
+}
+
+/// Whether the provider itself reports the pod deleted (billing nothing).
+fn is_terminated(p: &Pod) -> bool {
+    p.status.trim().eq_ignore_ascii_case("TERMINATED")
 }
 
 /// One provider's pods: every pod in any state counts — a stopped RunPod pod keeps its name
 /// and still bills its disk; a powered-off Hetzner server bills in full. Only a pod the
 /// provider itself reports as `TERMINATED` (deleted, billing nothing) is left out, with a
-/// note. A failed listing is UNKNOWN: never "no pods".
-pub fn pods_item(provider: &str, listing: Result<&[Pod], &String>, naming: &Naming) -> Item {
+/// note. A failed listing is UNKNOWN: never "no pods". `fleet_all_ours`: every configured
+/// provider listed and holds only this cohort's pods (see [`build`]) — the one case where
+/// the fix may be `pods terminate --all`.
+pub fn pods_item(provider: &str, listing: Result<&[Pod], &String>, naming: &Naming, fleet_all_ours: bool) -> Item {
     let pods = match listing {
         Err(e) => {
             let mut item = Item::new(Area::Pods, provider, Verdict::Unknown, format!("couldn't list ({e}) — NOT known to be empty"));
@@ -299,7 +325,7 @@ pub fn pods_item(provider: &str, listing: Result<&[Pod], &String>, naming: &Nami
         }
         Ok(pods) => pods,
     };
-    let (gone, mut left): (Vec<&Pod>, Vec<&Pod>) = pods.iter().partition(|p| p.status.trim().eq_ignore_ascii_case("TERMINATED"));
+    let (gone, mut left): (Vec<&Pod>, Vec<&Pod>) = pods.iter().partition(|p| is_terminated(p));
     left.sort_by(|a, b| (&a.name, &a.id).cmp(&(&b.name, &b.id)));
     let mut item = if left.is_empty() {
         Item::new(Area::Pods, provider, Verdict::Clear, "none")
@@ -330,19 +356,39 @@ pub fn pods_item(provider: &str, listing: Result<&[Pod], &String>, naming: &Nami
                 billing: bills_hourly(provider, &p.status),
                 cost_per_hr: p.cost_per_hr,
                 cohort: is_cohort_pod(naming, &p.name),
+                staff: is_staff(naming, &p.name),
             })
             .collect();
-        item.fix.push(
-            "arena pods terminate --all  # every pod on every configured provider, stopped ones included (--dry-run lists them first)"
-                .into(),
-        );
-        let others: Vec<&str> = left.iter().filter(|p| !is_cohort_pod(naming, &p.name)).map(|p| p.name.as_str()).collect();
-        if !others.is_empty() {
-            item.notes.push(format!(
-                "{} not named like this cohort's machines ({}) — `--all` terminates them too; to keep one, terminate the others one at a time: `arena pods terminate <id>`",
-                others.len(),
-                others.join(", ")
-            ));
+        // `pods terminate --all` takes every pod on every configured provider, so it's printed
+        // only when that is exactly this cohort's: pasted on an account that also holds a
+        // staff box, it would destroy that box. Otherwise one command per cohort pod (by id:
+        // a name can be held by two pods), and the rest are left to the operator.
+        let (ours, others): (Vec<&&Pod>, Vec<&&Pod>) = left.iter().partition(|p| is_cohort_pod(naming, &p.name));
+        if fleet_all_ours && others.is_empty() {
+            item.fix.push(
+                "arena pods terminate --all  # every pod on every configured provider, stopped ones included (--dry-run lists them first)"
+                    .into(),
+            );
+        } else {
+            item.fix.extend(ours.iter().map(|p| format!("arena pods terminate {}", sh_word(&p.id))));
+            if others.is_empty() {
+                item.notes.push(
+                    "one command per pod, not `arena pods terminate --all`: that would also reach pods on another provider \
+                     that aren't this cohort's (or that couldn't be listed)"
+                        .into(),
+                );
+            } else {
+                let named: Vec<String> = others
+                    .iter()
+                    .map(|p| if is_staff(naming, &p.name) { format!("{} (staff box: `@` list entry)", p.name) } else { p.name.clone() })
+                    .collect();
+                item.notes.push(format!(
+                    "{} not this cohort's ({}) — decide by hand, no command printed for them; don't use `arena pods terminate --all`: \
+                     it would terminate them too",
+                    others.len(),
+                    named.join(", ")
+                ));
+            }
         }
         item
     };
@@ -413,6 +459,9 @@ pub fn keys_item(keys: &Probe<Vec<KeyInfo>>, naming: &Naming) -> Item {
         Probe::Got(k) => k,
     };
     let cohort: Vec<&KeyInfo> = all.iter().filter(|k| k.name.as_deref().is_some_and(|n| is_cohort_key(naming, n))).collect();
+    let mut staff: Vec<&str> =
+        all.iter().filter(|k| !k.disabled).filter_map(|k| k.name.as_deref()).filter(|n| is_staff(naming, n)).collect();
+    staff.sort_unstable();
     let mut enabled: Vec<&KeyInfo> = cohort.iter().copied().filter(|k| !k.disabled).collect();
     enabled.sort_by(|a, b| a.name.cmp(&b.name));
     let disabled = cohort.len() - enabled.len();
@@ -440,6 +489,14 @@ pub fn keys_item(keys: &Probe<Vec<KeyInfo>>, naming: &Naming) -> Item {
     };
     if disabled > 0 {
         item.notes.push(format!("{disabled} disabled `{}` key(s) can't spend — not counted", naming.prefix));
+    }
+    if !staff.is_empty() {
+        item.notes.push(format!(
+            "{} enabled key(s) of staff boxes (`@` list entries, not this cohort's) left out: {} — if a box is done too, \
+             revoke its key by hand (`arena keys revoke <name>`)",
+            staff.len(),
+            staff.join(", ")
+        ));
     }
     item
 }
@@ -547,19 +604,37 @@ pub fn at_item(at: &Probe<Vec<AtJob>>, user: &str) -> Item {
 
 /// Forwards still in the local proxy config. `arena proxy apply` drops each one once its
 /// provider lists without its pod; a forward owned by a provider that isn't configured here
-/// is never confirmed gone, so `apply` keeps it — that one goes by hand.
+/// is never confirmed gone, so `apply` keeps it — that one goes by hand. A `server` block
+/// arena can't read back (one-line, unnamed, an upstream name for a target, unterminated)
+/// may still be a forward nginx runs: never "none" — UNKNOWN on its own, and named in a
+/// note next to forwards that do remain.
 pub fn proxy_item(proxy: &Probe<ProxyFile>, configured: &[&str]) -> Item {
     let file = match proxy {
         Probe::Skipped(why) => return Item::new(Area::Proxy, "", Verdict::Skipped, why.clone()),
         Probe::Failed(e) => return Item::new(Area::Proxy, "", Verdict::Unknown, e.clone()),
         Probe::Got(f) => f,
     };
-    let mut forwards = parse_nginx(&file.text);
+    let parsed = parse_nginx_detailed(&file.text);
+    let unread = (parsed.ignored_blocks > 0).then(|| {
+        format!(
+            "{} `server` block(s) in {} aren't in a form arena reads back — check them by hand: `arena proxy apply` \
+             drops them when it rewrites the file, or delete them yourself",
+            parsed.ignored_blocks, file.path
+        )
+    });
+    let mut forwards = parsed.forwards;
     forwards.sort_by_key(|f| f.public_port);
     if forwards.is_empty() {
-        return Item::new(Area::Proxy, file.path.clone(), Verdict::Clear, "none");
+        let Some(note) = unread else {
+            return Item::new(Area::Proxy, file.path.clone(), Verdict::Clear, "none");
+        };
+        let summary = format!("{} server block(s) couldn't be read — NOT known to be empty", parsed.ignored_blocks);
+        let mut item = Item::new(Area::Proxy, file.path.clone(), Verdict::Unknown, summary);
+        item.notes.push(note);
+        return item;
     }
     let mut item = Item::new(Area::Proxy, file.path.clone(), Verdict::Remaining, format!("{} still in the config", forwards.len()));
+    item.notes.extend(unread);
     item.fix.push(
         "arena proxy apply  # after the pods are gone: drops each forward once its provider lists without its pod".into(),
     );
@@ -639,27 +714,109 @@ pub fn at_command(script: &str) -> Option<String> {
     Some(body.iter().map(|l| l.trim()).collect::<Vec<_>>().join("; "))
 }
 
-/// Hide what looks like a secret in a command we print (a crontab line, an `at` job): the
-/// value of a `NAME=value` word whose NAME says key/token/secret/password, and words shaped
-/// like provider keys (`sk-…`, `rpa_…`). A command is shown to say *what* is scheduled.
+/// Hide what looks like a secret in a command we print (a crontab line, an `at` job), so the
+/// line still says *what* is scheduled but not with which credentials:
+/// - the value of a `NAME=value` or `--flag=value` word whose name says key / token /
+///   secret / pass(word) — a quoted value whole, spaces and all;
+/// - the word after such a flag written `--flag value` (unless it's another flag or a
+///   shell operator);
+/// - any word, or `=` value, shaped like a provider key (`sk-…`, `rpa_…`, `hf_…`).
+///
+/// Words are split on **any** whitespace — crontab fields are often tab-separated, and a
+/// split on spaces alone glued `*\tHF_TOKEN=…` into one word that matched nothing — and
+/// every separator is kept as it was. Over-hiding a harmless value is fine; this only
+/// feeds a display.
 pub fn redact(cmd: &str) -> String {
-    const SECRET_NAMES: [&str; 5] = ["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD"];
-    cmd.split(' ')
-        .map(|w| {
-            if let Some((name, _)) = w.split_once('=') {
-                let bare = name.trim_start_matches(|c| c == '\'' || c == '"');
-                if is_identifier(bare) && SECRET_NAMES.iter().any(|s| bare.to_ascii_uppercase().contains(s)) {
-                    return format!("{name}=…");
-                }
+    let toks = runs(cmd);
+    let mut out = String::with_capacity(cmd.len());
+    let mut hide_next = false;
+    let mut i = 0;
+    while i < toks.len() {
+        let w = toks[i];
+        i += 1;
+        if w.starts_with(char::is_whitespace) {
+            out.push_str(w);
+            continue;
+        }
+        if std::mem::take(&mut hide_next) && !w.starts_with(['-', '>', '<', '|', '&', ';']) {
+            out.push('…');
+            i = past_quoted(&toks, i, w);
+            continue;
+        }
+        if let Some((name, value)) = w.split_once('=') {
+            if secret_name(name) || key_shaped(value) {
+                out.push_str(name);
+                out.push_str("=…");
+                i = past_quoted(&toks, i, w);
+                continue;
             }
-            let v = w.trim_matches(|c| c == '\'' || c == '"');
-            if (v.starts_with("sk-") || v.starts_with("rpa_")) && v.len() > 8 {
-                return "…".to_string();
-            }
-            w.to_string()
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+        } else if w.starts_with('-') && secret_name(w) {
+            hide_next = true;
+        }
+        out.push_str(if key_shaped(w) { "…" } else { w });
+    }
+    out
+}
+
+/// `s` as alternating runs of whitespace and non-whitespace, which concatenate back to `s`.
+fn runs(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut start, mut prev) = (0, None);
+    for (i, c) in s.char_indices() {
+        let ws = c.is_whitespace();
+        if prev.is_some_and(|p| p != ws) {
+            out.push(&s[start..i]);
+            start = i;
+        }
+        prev = Some(ws);
+    }
+    if start < s.len() {
+        out.push(&s[start..]);
+    }
+    out
+}
+
+/// Whether the name before a `=` (or a `--flag`) says its value is a secret: its trailing
+/// run of `[A-Za-z0-9_-]` — so `'HF_TOKEN`, `--openrouter-key` and a URL's `?token` all
+/// count — contains KEY, TOKEN, SECRET or PASS (any case).
+fn secret_name(name: &str) -> bool {
+    let tail = name
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !(c.is_ascii_alphanumeric() || *c == '_' || *c == '-'))
+        .map_or(0, |(at, c)| at + c.len_utf8());
+    let upper = name[tail..].to_ascii_uppercase();
+    ["KEY", "TOKEN", "SECRET", "PASS"].iter().any(|s| upper.contains(s))
+}
+
+/// A word (quotes aside) shaped like an OpenRouter/Anthropic (`sk-`), RunPod (`rpa_`) or
+/// Hugging Face (`hf_`) key.
+fn key_shaped(word: &str) -> bool {
+    let v = word.trim_matches(|c| c == '\'' || c == '"');
+    v.len() > 8 && ["sk-", "rpa_", "hf_"].iter().any(|p| v.starts_with(p))
+}
+
+/// Where [`redact`] resumes after hiding the word `w` (just before `toks[i]`): right there,
+/// unless `w` opens a quote it doesn't close — then past the word that closes it (or at
+/// the end), so a quoted value with spaces in it is hidden whole, not just its first word.
+fn past_quoted(toks: &[&str], i: usize, w: &str) -> usize {
+    let Some((at, q)) = w.char_indices().find(|(_, c)| *c == '\'' || *c == '"') else {
+        return i;
+    };
+    if closes(&w[at + 1..], q) {
+        return i;
+    }
+    toks[i..].iter().position(|t| closes(t, q)).map_or(toks.len(), |k| i + k + 1)
+}
+
+/// Whether `s` holds the closing quote `q` (a `"` escaped with `\` doesn't close).
+fn closes(s: &str, q: char) -> bool {
+    let mut prev = None;
+    s.chars().any(|c| {
+        let hit = c == q && !(q == '"' && prev == Some('\\'));
+        prev = Some(c);
+        hit
+    })
 }
 
 /// `N remain`, or `1 remains`.
@@ -717,13 +874,17 @@ fn entry_lines(entries: &[Entry]) -> Vec<String> {
         .map(|e| {
             let k = format!("{:<w$}", key(e));
             let line = match e {
-                Entry::Pod { id, provider, status, billing, cost_per_hr, cohort, .. } => {
+                Entry::Pod { id, provider, status, billing, cost_per_hr, cohort, staff, .. } => {
                     let cost = match (billing, cost_per_hr) {
                         (true, Some(c)) => format!("billing {}/h", fmt_money(currency_symbol(provider), *c)),
                         (true, None) => "billing".to_string(),
                         (false, _) => "stopped — still bills its disk".to_string(),
                     };
-                    let other = if *cohort { "" } else { "  (not this cohort's)" };
+                    let other = match (cohort, staff) {
+                        (_, true) => "  (staff box — not this cohort's)",
+                        (false, false) => "  (not this cohort's)",
+                        (true, false) => "",
+                    };
                     format!("{k}  id={id}  {status}  {cost}{other}")
                 }
                 Entry::Volume { name, size_gb, data_center, tier, est_usd_per_month, .. } => {
@@ -905,8 +1066,9 @@ mod tests {
     }
 
     /// Every pod in any state counts — a stopped pod keeps its name and bills its disk; only a
-    /// pod reported TERMINATED (deleted) is left out, with a note. Off-cohort pods count too
-    /// (the account pays for them) but are named, since `--all` would take them as well.
+    /// pod reported TERMINATED (deleted) is left out, with a note. Off-cohort pods and staff
+    /// boxes (`@` entries) count too (the account pays for them) but are labelled and left
+    /// out of the fix: with one on the account, `--all` isn't printed at all.
     #[test]
     fn stopped_pods_count_as_remaining() {
         let names = list();
@@ -919,7 +1081,7 @@ mod tests {
             pod("someone-else", "RUNNING", None),
             pod("arena8-cloud", "TERMINATED", None),
         ];
-        let item = pods_item("runpod", Ok(&pods), &naming);
+        let item = pods_item("runpod", Ok(&pods), &naming, false);
         assert_eq!(item.verdict, Verdict::Remaining);
         assert_eq!(
             item.summary,
@@ -932,30 +1094,79 @@ mod tests {
                 "arena8-apple      id=id-arena8-apple  RUNNING  billing $0.17/h",
                 "arena8-apple-old  id=id-arena8-apple-old  EXITED  stopped — still bills its disk",
                 "arena8-bloom      id=id-arena8-bloom  EXITED  stopped — still bills its disk",
-                "james-gpu         id=id-james-gpu  RUNNING  billing $0.44/h",
+                "james-gpu         id=id-james-gpu  RUNNING  billing $0.44/h  (staff box — not this cohort's)",
                 "someone-else      id=id-someone-else  RUNNING  billing  (not this cohort's)",
             ]
         );
-        assert_eq!(item.fix.len(), 1);
-        assert!(item.fix[0].starts_with("arena pods terminate --all  #"), "{:?}", item.fix);
-        assert!(item.notes[0].starts_with("1 not named like this cohort's machines (someone-else)"), "{:?}", item.notes);
+        // Not `--all` (it would take james-gpu and someone-else too): the cohort's, by id.
+        assert_eq!(
+            item.fix,
+            ["arena pods terminate id-arena8-apple", "arena pods terminate id-arena8-apple-old", "arena pods terminate id-arena8-bloom"]
+        );
+        assert!(
+            item.notes[0].starts_with("2 not this cohort's (james-gpu (staff box: `@` list entry), someone-else) — decide by hand"),
+            "{:?}",
+            item.notes
+        );
+        assert!(item.notes[0].contains("don't use `arena pods terminate --all`"), "{:?}", item.notes);
         assert_eq!(item.notes[1], "1 listed as TERMINATED — already deleted, not counted: arena8-cloud");
-        // Only stopped pods: still remaining — the whole point of the check.
+        let flags: Vec<(bool, bool)> =
+            item.entries.iter().map(|e| if let Entry::Pod { cohort, staff, .. } = e { (*cohort, *staff) } else { panic!() }).collect();
+        assert_eq!(flags, [(true, false), (true, false), (true, false), (false, true), (false, false)]);
+        // Only stopped pods: still remaining — the whole point of the check — and, every pod
+        // being the cohort's, `--all` is the fix.
         let stopped = [pod("arena8-bloom", "EXITED", Some(0.17))];
-        let item = pods_item("runpod", Ok(&stopped), &naming);
+        let item = pods_item("runpod", Ok(&stopped), &naming, true);
         assert_eq!(item.verdict, Verdict::Remaining);
         assert!(item.summary.starts_with("1 remains — 0 billing, 1 stopped"), "{}", item.summary);
         assert!(!item.summary.contains("burning"), "a stopped pod's rate isn't burning: {}", item.summary);
+        assert_eq!(item.fix.len(), 1);
+        assert!(item.fix[0].starts_with("arena pods terminate --all  #"), "{:?}", item.fix);
+        // Only a staff box left: it remains (it bills), but no command is printed for it.
+        let staff = [pod("james-gpu", "RUNNING", Some(0.44))];
+        let item = pods_item("runpod", Ok(&staff), &naming, false);
+        assert_eq!(item.verdict, Verdict::Remaining);
+        assert!(item.fix.is_empty(), "{:?}", item.fix);
+        assert!(item.notes[0].starts_with("1 not this cohort's (james-gpu (staff box"), "{:?}", item.notes);
+        // An id that isn't shell-plain is quoted in its command.
+        let mut odd = pod("arena8-x", "RUNNING", None);
+        odd.id = "a b;rm".into();
+        let item = pods_item("runpod", Ok(&[odd, pod("someone-else", "RUNNING", None)]), &naming, false);
+        assert_eq!(item.fix, ["arena pods terminate 'a b;rm'"]);
         // A powered-off Hetzner server bills in full, in €.
         let mut off = pod("arena8-vm", "off", Some(0.006));
         off.provider = "hetzner".into();
-        let item = pods_item("hetzner", Ok(std::slice::from_ref(&off)), &naming);
+        let item = pods_item("hetzner", Ok(std::slice::from_ref(&off)), &naming, true);
         assert_eq!(item.summary, "1 remains, all billing; burning €0.006/h");
         // Only TERMINATED left: clear, with the note.
         let gone = [pod("arena8-cloud", "TERMINATED", None)];
-        let item = pods_item("runpod", Ok(&gone), &naming);
+        let item = pods_item("runpod", Ok(&gone), &naming, true);
         assert_eq!((item.verdict, item.summary.as_str()), (Verdict::Clear, "none"));
         assert_eq!(item.notes.len(), 1);
+    }
+
+    /// `--all` reaches every provider, so one provider holding only the cohort's pods still
+    /// gets per-pod commands when another holds a staff box — or couldn't be listed.
+    #[test]
+    fn terminate_all_is_offered_only_when_the_whole_fleet_is_the_cohorts() {
+        let names = list();
+        let naming = Naming { prefix: "arena8", list: &names };
+        let fixes = |vast: Result<Vec<Pod>, String>| {
+            let mut i = inputs();
+            i.listings[0].1 = Ok(vec![pod("arena8-apple", "RUNNING", None), pod("arena8-old", "TERMINATED", None)]);
+            i.listings.push(("vast".into(), vast));
+            let r = build(&i, &naming);
+            let runpod = r.items.iter().find(|it| it.scope == "runpod" && it.area == Area::Pods).unwrap().clone();
+            (runpod.fix, runpod.notes)
+        };
+        let (fix, notes) = fixes(Ok(vec![pod("arena8-bloom", "EXITED", None), pod("someone-old", "TERMINATED", None)]));
+        assert!(fix[0].starts_with("arena pods terminate --all  #"), "all the cohort's: {fix:?}");
+        assert_eq!(notes, ["1 listed as TERMINATED — already deleted, not counted: arena8-old"]);
+        for vast in [Ok(vec![pod("james-gpu", "RUNNING", None)]), Err("vast list HTTP 429".to_string())] {
+            let (fix, notes) = fixes(vast.clone());
+            assert_eq!(fix, ["arena pods terminate id-arena8-apple"], "{vast:?}");
+            assert!(notes[0].starts_with("one command per pod, not `arena pods terminate --all`"), "{notes:?}");
+        }
     }
 
     #[test]
@@ -1004,8 +1215,9 @@ mod tests {
         assert!(item.summary.starts_with("1 remains, 0 GB — ~$0.00/month (~$0.00/day)"), "{}", item.summary);
     }
 
-    /// Enabled keys of this cohort remain, with usage; disabled ones and other cohorts' don't
-    /// count. The fix names them (`--all` would only reach machines that still have a pod).
+    /// Enabled keys of this cohort remain, with usage; disabled ones, other cohorts' and staff
+    /// boxes' (`@` entries) don't count, and staff keys are never in the fix — only named in a
+    /// note. The fix names them (`--all` would only reach machines that still have a pod).
     #[test]
     fn enabled_cohort_keys_remain_with_usage() {
         let names = list();
@@ -1020,13 +1232,19 @@ mod tests {
         ];
         let item = keys_item(&Probe::Got(keys), &naming);
         assert_eq!(item.verdict, Verdict::Remaining);
-        assert_eq!(item.summary, "3 enabled `arena8` key(s), $1.75 spent so far (limits total $15.00)");
-        assert_eq!(
-            entry_lines(&item.entries),
-            ["arena8-apple  $0.50 used, no limit", "arena8-bloom  $1.25 used, limit $5.00", "james-gpu     $? used, limit $10.00"]
+        assert_eq!(item.summary, "2 enabled `arena8` key(s), $1.75 spent so far (limits total $5.00)");
+        assert_eq!(entry_lines(&item.entries), ["arena8-apple  $0.50 used, no limit", "arena8-bloom  $1.25 used, limit $5.00"]);
+        assert!(item.fix[0].starts_with("arena keys revoke arena8-apple arena8-bloom  #"), "{:?}", item.fix);
+        assert_eq!(item.notes[0], "1 disabled `arena8` key(s) can't spend — not counted");
+        assert!(
+            item.notes[1].starts_with("1 enabled key(s) of staff boxes (`@` list entries, not this cohort's) left out: james-gpu — "),
+            "{:?}",
+            item.notes
         );
-        assert!(item.fix[0].starts_with("arena keys revoke arena8-apple arena8-bloom james-gpu  #"), "{:?}", item.fix);
-        assert_eq!(item.notes, ["1 disabled `arena8` key(s) can't spend — not counted"]);
+        // Only a staff key enabled: clear for the cohort, and still named.
+        let only = keys_item(&Probe::Got(vec![key("james-gpu", false, None, None)]), &naming);
+        assert_eq!((only.verdict, only.fix.len()), (Verdict::Clear, 0));
+        assert!(only.notes[0].contains("left out: james-gpu"), "{:?}", only.notes);
         // No usage or limit reported: said by omission, never as `$0.00` (or `$-0.00`).
         let bare = keys_item(&Probe::Got(vec![key("arena8-apple", false, None, None)]), &naming);
         assert_eq!(bare.summary, "1 enabled `arena8` key(s)");
@@ -1170,11 +1388,88 @@ mod tests {
         assert_eq!(proxy_item(&Probe::Skipped("no proxy".into()), &[]).verdict, Verdict::Skipped);
     }
 
+    /// `server` blocks arena can't read back are still forwards nginx runs: never "none".
+    #[test]
+    fn unreadable_proxy_blocks_are_never_clear() {
+        let file = |text: &str| Probe::Got(ProxyFile { path: "/srv/proxy.conf".into(), text: text.into() });
+        // An upstream-name target, and an unnamed one-line block nginx forwards 9501 with.
+        let only_unread = "# devtest-apple\nserver {\n    listen 9500;\n    proxy_pass backend_apple;\n}\n\
+                           server { listen 9501; proxy_pass 10.0.0.1:22; }\n";
+        let item = proxy_item(&file(only_unread), &["runpod"]);
+        assert_eq!(
+            (item.verdict, item.summary.as_str()),
+            (Verdict::Unknown, "2 server block(s) couldn't be read — NOT known to be empty")
+        );
+        assert!(item.notes[0].starts_with("2 `server` block(s) in /srv/proxy.conf aren't in a form arena reads back"), "{:?}", item.notes);
+        // Unterminated, inside a `stream {}` wrapper.
+        let cut = "stream {\n# devtest-apple\nserver {\n listen 9500;\n proxy_pass 203.0.113.7:22001;\n";
+        assert_eq!(proxy_item(&file(cut), &["runpod"]).verdict, Verdict::Unknown);
+        // Next to readable forwards: remaining, with the same note.
+        let mixed = format!("{}server {{ listen 9509; proxy_pass 10.0.0.9:22; }}\n", crate::proxy::render_nginx(&[crate::proxy::Forward {
+            name: "devtest-bloom".into(),
+            public_port: 9501,
+            target_ip: "203.0.113.8".into(),
+            target_port: 22002,
+            provider: Some("runpod".into()),
+            pod_id: None,
+        }]));
+        let item = proxy_item(&file(&mixed), &["runpod"]);
+        assert_eq!((item.verdict, item.summary.as_str()), (Verdict::Remaining, "1 still in the config"));
+        assert!(item.notes.iter().any(|n| n.starts_with("1 `server` block(s) in /srv/proxy.conf")), "{:?}", item.notes);
+        // An empty file, and arena's own render of no forwards, are clear.
+        assert_eq!(proxy_item(&file(""), &[]).verdict, Verdict::Clear);
+        assert_eq!(proxy_item(&file(&crate::proxy::render_nginx(&[])), &[]).verdict, Verdict::Clear);
+    }
+
     #[test]
     fn redact_hides_secret_looking_values_only() {
-        assert_eq!(redact("HF_TOKEN=hf_x RUNPOD_API_KEY='rpa' arena pods up"), "HF_TOKEN=… RUNPOD_API_KEY=… arena pods up");
-        assert_eq!(redact("curl -H 'Bearer sk-or-v1-abcdef' x"), "curl -H 'Bearer … x");
-        assert_eq!(redact("ARENA_START_DATE=2026-10-01 arena  pods backup"), "ARENA_START_DATE=2026-10-01 arena  pods backup");
+        for (raw, want) in [
+            ("HF_TOKEN=hf_x RUNPOD_API_KEY='rpa' arena pods up", "HF_TOKEN=… RUNPOD_API_KEY=… arena pods up"),
+            ("curl -H 'Bearer sk-or-v1-abcdef' x", "curl -H 'Bearer … x"),
+            // Tab-separated crontab fields: each tab kept, the secret still found.
+            (
+                "*/15\t*\t*\t*\t*\tRUNPOD_API_KEY=rpa_REALSECRET123 /usr/local/bin/arena pods backup --yes",
+                "*/15\t*\t*\t*\t*\tRUNPOD_API_KEY=… /usr/local/bin/arena pods backup --yes",
+            ),
+            ("0 9 * * *\tHF_TOKEN=hf_SECRETVALUE /bin/arena pods copy-keys --yes", "0 9 * * *\tHF_TOKEN=… /bin/arena pods copy-keys --yes"),
+            ("0 9 * * * arena pods up\tRUNPOD_API_KEY=rpa_TABSECRET", "0 9 * * * arena pods up\tRUNPOD_API_KEY=…"),
+            // `--flag=value` and `--flag value` forms.
+            ("0 9 * * * arena --openrouter-key=sk-or-v1-REALSECRET123 keys gen", "0 9 * * * arena --openrouter-key=… keys gen"),
+            ("x --api-key plainvalue123 --yes", "x --api-key … --yes"),
+            ("x --token hf_SECRETVALUE", "x --token …"),
+            ("x --password 'two words' y", "x --password … y"),
+            ("arena pods terminate apple --revoke-key --yes", "arena pods terminate apple --revoke-key --yes"),
+            ("x --skip-keys >> /h/log 2>&1", "x --skip-keys >> /h/log 2>&1"),
+            // A key-shaped value behind a name that doesn't say so.
+            ("X=sk-or-v1-abcdef y", "X=… y"),
+            ("x --cache=hf_abcdefghij", "x --cache=…"),
+            ("curl 'https://h/x?token=abc123' y", "curl 'https://h/x?token=… y"),
+            // A quoted value with spaces is hidden whole.
+            ("RUNPOD_API_KEY=\"rpa_SECRET VALUE2\" arena", "RUNPOD_API_KEY=… arena"),
+            ("'HF_TOKEN=abc def' arena", "'HF_TOKEN=… arena"),
+            ("A_SECRET='x y z", "A_SECRET=…"),
+            // Left alone.
+            ("ARENA_START_DATE=2026-10-01 arena  pods backup", "ARENA_START_DATE=2026-10-01 arena  pods backup"),
+            ("*/15 * * * * /usr/local/bin/arena --config /c pods backup --no-pull --yes >> /h/arena-cron.log 2>&1", "*/15 * * * * /usr/local/bin/arena --config /c pods backup --no-pull --yes >> /h/arena-cron.log 2>&1"),
+            ("", ""),
+            ("  \t ", "  \t "),
+        ] {
+            assert_eq!(redact(raw), want, "{raw:?}");
+        }
+    }
+
+    /// End to end: a tab-separated crontab line with a key in it never reaches the checklist
+    /// or the JSON.
+    #[test]
+    fn cron_secrets_stay_out_of_text_and_json() {
+        let line = "0 9 * * *\tOPENROUTER_PROVISIONING_KEY=sk-or-v1-abcdefSECRET\t/usr/local/bin/arena keys gen --yes";
+        let item = cron_item(&Probe::Got(CronLines { managed: vec![], unmanaged: vec![line.into()] }), "dev");
+        let json = serde_json::to_string(&item).unwrap();
+        let text = entry_lines(&item.entries).join("\n");
+        for out in [&json, &text] {
+            assert!(!out.contains("SECRET") && !out.contains("sk-or"), "{out}");
+        }
+        assert!(text.contains("OPENROUTER_PROVISIONING_KEY=…\t/usr/local/bin/arena keys gen --yes"), "{text}");
     }
 
     /// The JSON scripts read: verdict per item, typed entries, the counts.

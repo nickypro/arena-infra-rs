@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::fleet::{self, clip, iso_parts, FleetCost};
+use crate::fleet::{self, clip, FleetCost};
 use crate::health::{Check, PodHealth, Status};
 use crate::naming::{is_absolute, qualify};
 use crate::pod::Pod;
@@ -366,7 +366,8 @@ pub fn record_health(
 /// Replace `path` with `bytes` so a reader (a web server serving `fleet.json`, a
 /// `snapshot` reading the cache) sees the old file or the new one, never a half-written
 /// one: write a hidden temp sibling (same directory, so the rename is atomic), flush it to
-/// disk, rename it over. The temp file is removed if anything fails.
+/// disk, rename it over. The file gets exactly `mode`, whatever the umask. The temp file is
+/// removed if anything fails.
 pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let name = path
@@ -385,6 +386,14 @@ pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()>
         #[cfg(not(unix))]
         let _ = mode;
         let mut f = opts.open(&tmp)?;
+        // The open mode above is masked by the umask — under `umask 077` (a hardened cron)
+        // a public fleet.json would land 0600 and the web server would get 403s. fchmod
+        // isn't masked, so the file gets exactly `mode`.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
         f.write_all(bytes)?;
         f.sync_all()?;
         drop(f);
@@ -635,6 +644,8 @@ pub struct PublicHealth {
     pub reason: Option<Issue>,
 }
 
+/// A maintenance window's ends, each RFC 3339 UTC re-printed from the parsed instant
+/// ([`public_time`]) — `None` when the provider's value wasn't a complete timestamp.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublicMaintenance {
@@ -707,14 +718,80 @@ fn public_gpu(label: &str) -> String {
     }
 }
 
-/// A maintenance timestamp, only if it is one: ISO-8601-shaped (`YYYY-MM-DD[T ]HH:MM…`),
-/// short, and made of timestamp characters. Anything else is dropped, not shown raw.
+/// A maintenance timestamp fit to publish, **rebuilt, never copied**: the value comes from a
+/// provider API whose type isn't pinned down (`runpod::loose_time` passes any non-numeric
+/// string through), so a shape check on its first characters would let whatever follows
+/// them (`2026-10-09T02:00 203.0.113.7:10022`) onto the page. Instead it must be one
+/// complete RFC 3339 date-time ([`parse_rfc3339`]) — and hold no IP literal, as a second
+/// guard — and what's published is that instant re-printed by [`rfc3339`] (UTC, `Z`), so
+/// only digits the parser produced can reach the page. Anything else — no zone (the
+/// browser would guess local time), an impossible date, trailing text — is dropped.
 fn public_time(s: Option<&str>) -> Option<String> {
     let s = s?.trim();
-    let ok = s.len() <= 40
-        && iso_parts(s).is_some()
-        && s.chars().all(|c| c.is_ascii_digit() || matches!(c, '-' | ':' | 'T' | 'Z' | '.' | '+' | ' '));
-    ok.then(|| s.to_string())
+    if s.len() > 40 || !ip_literals(s).is_empty() {
+        return None;
+    }
+    parse_rfc3339(s).map(rfc3339)
+}
+
+/// Unix seconds for a complete RFC 3339 date-time: `YYYY-MM-DD`, `T` (or `t` / a space),
+/// `HH:MM`, optional `:SS` and `.fraction` (dropped), then `Z` or `±HH:MM` — and nothing
+/// after it. Field ranges are checked (no Feb 30, no 24:00); a leap second `:60` is read
+/// as the next minute. `None` for anything else, including an instant before 1970 (which
+/// [`rfc3339`] can't print).
+fn parse_rfc3339(s: &str) -> Option<u64> {
+    let b = s.as_bytes();
+    let num = |r: std::ops::Range<usize>| -> Option<i64> {
+        let d = b.get(r)?;
+        d.iter().all(u8::is_ascii_digit).then(|| d.iter().fold(0, |n, c| n * 10 + i64::from(c - b'0')))
+    };
+    let is = |i: usize, set: &[u8]| b.get(i).is_some_and(|c| set.contains(c));
+    if !(is(4, b"-") && is(7, b"-") && is(10, b"Tt ") && is(13, b":")) {
+        return None;
+    }
+    let (year, month, day, hour, minute) = (num(0..4)?, num(5..7)?, num(8..10)?, num(11..13)?, num(14..16)?);
+    let (mut i, mut second) = (16, 0);
+    if is(i, b":") {
+        second = num(i + 1..i + 3)?;
+        i += 3;
+        if is(i, b".") {
+            let digits = b[i + 1..].iter().take_while(|c| c.is_ascii_digit()).count();
+            if digits == 0 {
+                return None;
+            }
+            i += 1 + digits;
+        }
+    }
+    let offset = match b.get(i) {
+        Some(b'Z' | b'z') if i + 1 == b.len() => 0,
+        Some(&sign @ (b'+' | b'-')) if i + 6 == b.len() && is(i + 3, b":") => {
+            let (oh, om) = (num(i + 1..i + 3)?, num(i + 4..i + 6)?);
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            let o = oh * 3_600 + om * 60;
+            if sign == b'+' {
+                o
+            } else {
+                -o
+            }
+        }
+        _ => return None,
+    };
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if !(1..=days_in_month).contains(&day) || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    // In range by the checks above (month 1–12, day 1–31), so the casts are exact.
+    let days = crate::schedule::days_from_civil(year, month as u32, day as u32);
+    u64::try_from(days * 86_400 + hour * 3_600 + minute * 60 + second - offset).ok()
 }
 
 fn public_health(h: Option<&HealthRecord>, now: u64) -> PublicHealth {
@@ -743,15 +820,16 @@ fn public_health(h: Option<&HealthRecord>, now: u64) -> PublicHealth {
 /// entry appear: off-list pods (`james-gpu`, `registered_pink_prawn`, …) never do, and
 /// neither do absolute (`@name`) entries — those are the personal/staff boxes sharing the
 /// list (see `naming`), not cohort machines. A name held by two pods (a double create) is
-/// shown once, by its most usable pod (up, then starting, then down; then the one with a
-/// health record). Ordered by list position.
+/// shown once, by its most usable pod: up, then starting, then down; then the one the proxy
+/// forwards to (the twin participants actually reach — never one borrowing its twin's
+/// PASS); then the one with a health record. Ordered by list position.
 pub fn public_snapshot(snap: &FleetSnapshot, naming: &Naming) -> PublicSnapshot {
     let rank = |s: PublicStatus| match s {
         PublicStatus::Up => 0,
         PublicStatus::Starting => 1,
         PublicStatus::Down => 2,
     };
-    let mut best: BTreeMap<usize, (PublicMachine, (u8, bool))> = BTreeMap::new();
+    let mut best: BTreeMap<usize, (PublicMachine, (u8, bool, bool))> = BTreeMap::new();
     for p in &snap.pods {
         let Some(entry) = p.list_entry.as_deref().filter(|e| !is_absolute(e)) else { continue };
         let Some(name) = public_name(entry) else { continue };
@@ -774,7 +852,7 @@ pub fn public_snapshot(snap: &FleetSnapshot, naming: &Naming) -> PublicSnapshot 
             health: public_health(p.health.as_ref(), snap.generated_at),
             maintenance,
         };
-        let key = (rank(status), p.health.is_none());
+        let key = (rank(status), p.proxy != ProxyState::Live, p.health.is_none());
         match best.get(&slot) {
             Some((_, have)) if *have <= key => {}
             _ => {
@@ -787,6 +865,20 @@ pub fn public_snapshot(snap: &FleetSnapshot, naming: &Naming) -> PublicSnapshot 
         complete: snap.partial.is_empty(),
         machines: best.into_values().map(|(m, _)| m).collect(),
     }
+}
+
+/// Whether publishing `next` over the file `previous` would blank the page because of an
+/// outage: `next` is partial (a provider failed to list) and shows no machine, while
+/// `previous` — the public JSON written last time — showed some. That is the provider
+/// holding every machine failing while another configured one answers empty: published, the
+/// page would read "No machines." for as long as the outage lasts. Keeping the old file
+/// instead lets the page go visibly stale (its banner), as when no provider answers at all.
+/// A partial snapshot that still shows machines is published (flagged `complete: false`),
+/// and a complete empty one — a fleet really torn down — always is.
+pub fn would_blank_the_page(previous: &str, next: &PublicSnapshot) -> bool {
+    !next.complete
+        && next.machines.is_empty()
+        && serde_json::from_str::<PublicSnapshot>(previous).is_ok_and(|p| !p.machines.is_empty())
 }
 
 /// [`public_snapshot`] as the JSON written to `fleet.json`.
@@ -1074,6 +1166,39 @@ mod tests {
         assert_eq!(names, ["fleet.json", "taken"]);
     }
 
+    /// The mode is exact whatever the umask: a cron under `umask 077` must still publish a
+    /// world-readable fleet.json. The umask is process-wide — changing it here would race
+    /// every other test thread — so this re-runs itself in a child copy of the test binary
+    /// started under `umask 077`, which writes the files this parent then checks.
+    #[test]
+    fn write_atomic_sets_the_mode_even_under_a_restrictive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "ARENA_TEST_WRITE_ATOMIC_UMASK_DIR";
+        if let Some(dir) = std::env::var_os(CHILD) {
+            let dir = PathBuf::from(dir);
+            std::fs::write(dir.join("control"), "x").unwrap();
+            write_atomic(&dir.join("fleet.json"), b"{}", 0o644).unwrap();
+            write_atomic(&dir.join("health.json"), b"{}", 0o600).unwrap();
+            return;
+        }
+        let dir = tmp("umask");
+        let out = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "umask 077 && exec \"$0\" --exact --test-threads=1 \
+                 snapshot::tests::write_atomic_sets_the_mode_even_under_a_restrictive_umask",
+            ])
+            .arg(std::env::current_exe().unwrap())
+            .env(CHILD, &dir.0)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        let mode = |n: &str| std::fs::metadata(dir.0.join(n)).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode("control"), 0o600, "the child really ran under umask 077");
+        assert_eq!(mode("fleet.json"), 0o644);
+        assert_eq!(mode("health.json"), 0o600);
+    }
+
     #[test]
     fn prune_drops_only_pods_their_own_provider_confirmed_gone() {
         use crate::error::Error;
@@ -1358,19 +1483,92 @@ fleet: $0.17/h across 2 billing pod(s) (1 unpriced)
         }
     }
 
+    /// Only a complete RFC 3339 date-time survives, and what's published is the instant
+    /// re-printed in UTC — never the provider's string, so nothing riding after a valid
+    /// prefix (an `ip:port`, a path) can reach the page.
     #[test]
     fn public_time_accepts_timestamps_only() {
         for (raw, want) in [
             (Some("2026-10-09T02:00:00Z"), Some("2026-10-09T02:00:00Z")),
-            (Some(" 2026-10-09 02:00:00+02:00 "), Some("2026-10-09 02:00:00+02:00")),
-            (Some("2026-10-09T02:00:00.000Z"), Some("2026-10-09T02:00:00.000Z")),
-            (Some("soon"), None),
+            (Some(" 2026-10-09 02:00:00+02:00 "), Some("2026-10-09T00:00:00Z")),
+            (Some("2026-10-09T23:30:00-01:15"), Some("2026-10-10T00:45:00Z")),
+            (Some("2026-10-09T02:00:00.000Z"), Some("2026-10-09T02:00:00Z")),
+            (Some("2026-10-09t02:00:00.123456789z"), Some("2026-10-09T02:00:00Z")),
+            (Some("2026-10-09T02:00Z"), Some("2026-10-09T02:00:00Z")),
+            (Some("2028-02-29T00:00:00Z"), Some("2028-02-29T00:00:00Z")),
+            (Some("2026-12-31T23:59:60Z"), Some("2027-01-01T00:00:00Z")), // a leap second
+            // An address after a timestamp-shaped start: the probe that got through before.
+            (Some("2026-10-09T02:00 203.0.113.7:10022"), None),
+            (Some("2026-10-09T06:00 2001::42"), None),
+            (Some("2026-10-09T02:00:00Z 203.0.113.7"), None),
+            (Some("2026-10-09T02:00:00+02:00:10022"), None),
             (Some("2026-10-09T02:00 call 10.0.0.1"), None),
             (Some("2026-10-09T02:00:00Z/../../etc"), None),
+            // Not a complete, real instant.
+            (Some("2026-10-09T02:00:00"), None), // no zone: the browser would guess
+            (Some("2026-10-09"), None),
+            (Some("2026-02-30T02:00:00Z"), None),
+            (Some("2027-02-29T02:00:00Z"), None),
+            (Some("2026-13-01T02:00:00Z"), None),
+            (Some("2026-10-09T24:00:00Z"), None),
+            (Some("2026-10-09T02:60:00Z"), None),
+            (Some("2026-10-09T02:00:00.Z"), None),
+            (Some("2026-10-09T02:00:00+24:00"), None),
+            (Some("2026-10-09T02:00:00+0200"), None),
+            (Some("1969-12-31T23:59:59Z"), None), // before what the page can print
+            (Some("２０２６-10-09T02:00:00Z"), None),
+            (Some("soon"), None),
+            (Some(""), None),
             (None, None),
         ] {
             assert_eq!(public_time(raw).as_deref(), want, "{raw:?}");
         }
+    }
+
+    /// A page blanked by an outage is worse than a stale one: an empty *partial* snapshot
+    /// never replaces a file that listed machines; anything else is published.
+    #[test]
+    fn an_empty_partial_snapshot_never_replaces_a_page_that_listed_machines() {
+        let cfg = cfg();
+        let naming = Naming::from_config(&cfg);
+        let apple = at(pod("devtest-apple", "runpod", "rp1"), "10.0.0.1", 22001);
+        let full = public_json(&public_snapshot(&build(&[apple.clone()], &[], None, &HealthCache::new(), &naming, NOW), &naming));
+        let none_listed = public_json(&public_snapshot(&build(&[], &[], None, &HealthCache::new(), &naming, NOW), &naming));
+        let snap = |pods: &[Pod], partial: &[&str]| {
+            let partial: Vec<String> = partial.iter().map(|p| p.to_string()).collect();
+            public_snapshot(&build(pods, &partial, None, &HealthCache::new(), &naming, NOW), &naming)
+        };
+        let empty_partial = snap(&[], &["runpod"]);
+        assert!(would_blank_the_page(&full, &empty_partial), "runpod failed, hetzner answered empty");
+        // Published: a partial one that still shows machines, a complete empty one (a real
+        // teardown), and an empty partial one over a page that had nothing / isn't ours.
+        assert!(!would_blank_the_page(&full, &snap(std::slice::from_ref(&apple), &["vast"])));
+        assert!(!would_blank_the_page(&full, &snap(&[], &[])));
+        for previous in [none_listed.as_str(), "", "{not json", "{\"old\": true}"] {
+            assert!(!would_blank_the_page(previous, &empty_partial), "{previous:?}");
+        }
+    }
+
+    /// Two pods holding one name (a double create, a replacement left running): the public
+    /// row is the twin the proxy forwards to — it must not borrow the other one's PASS.
+    #[test]
+    fn a_twin_never_lends_its_pass_to_the_pod_the_proxy_forwards_to() {
+        let cfg = cfg();
+        let naming = Naming::from_config(&cfg);
+        let old = at(pod("devtest-apple", "runpod", "rp-old"), "10.0.0.8", 22008);
+        let live = at(pod("devtest-apple", "runpod", "rp1"), "10.0.0.1", 22001); // proxy_text() forwards here
+        let mut cache = HealthCache::new();
+        cache.merge(&[health(&old, Status::Pass, vec![])], NOW - 60);
+        let text = proxy_text();
+        for pods in [[old.clone(), live.clone()], [live.clone(), old.clone()]] {
+            let snap = build(&pods, &[], Some(&text), &cache, &naming, NOW);
+            let m = &public_snapshot(&snap, &naming).machines;
+            assert_eq!(m.len(), 1);
+            assert_eq!(m[0].health.status, PublicHealthStatus::Unknown, "the live twin was never checked");
+        }
+        // With the proxy unread, the checked twin is still preferred over an unchecked one.
+        let snap = build(&[live.clone(), old.clone()], &[], None, &cache, &naming, NOW);
+        assert_eq!(public_snapshot(&snap, &naming).machines[0].health.status, PublicHealthStatus::Pass);
     }
 
     #[test]
@@ -1419,7 +1617,13 @@ fleet: $0.17/h across 2 billing pod(s) (1 unpriced)
             note: Some("host 198.51.100.9 reboot; token rpa_NOTEKEYNOTEKEY; see admin@runpod.io".into()),
         });
         let bloom = priced(at(pod("devtest-bloom", "vast", "31415926"), "ssh4.vast.ai", 40022), "RTX 3090", 2, 0.33);
-        let cloud = priced(at(pod("devtest-cloud", "runpod", "q9w8e7r6t5y4"), "2001:db8::42", 2222), "RTX 4090", 1, 0.44);
+        let mut cloud = priced(at(pod("devtest-cloud", "runpod", "q9w8e7r6t5y4"), "2001:db8::42", 2222), "RTX 4090", 1, 0.44);
+        // Timestamp-shaped starts with an address after them (RunPod's raw strings pass through).
+        cloud.maintenance = Some(Maintenance {
+            start: Some("2026-10-09T02:00 203.0.113.7:10022".into()),
+            end: Some("2026-10-09T06:00 2001::42".into()),
+            note: None,
+        });
         // A GPU name carrying junk (untrusted provider text): only the safe characters survive.
         let dune = priced(at(pod("devtest-dune", "hetzner", "51234567"), "192.0.2.77", 22), "cx23 <img src=x onerror=alert(1)> 10.9.8.7", 0, 0.0056);
         // Off-list / staff / absolute-entry pods.
@@ -1481,5 +1685,6 @@ fleet: $0.17/h across 2 billing pod(s) (1 unpriced)
         assert!(!public.complete);
         assert!(public.machines.iter().all(|m| m.health.reason == Some(Issue::Unreachable)));
         assert_eq!(public.machines[0].maintenance, Some(PublicMaintenance { start: Some("2026-10-09T02:00:00Z".into()), end: None }));
+        assert_eq!(public.machines[2].maintenance, Some(PublicMaintenance { start: None, end: None }));
     }
 }

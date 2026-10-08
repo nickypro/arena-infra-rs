@@ -51,11 +51,18 @@ pub(crate) async fn teardown_with(
     json: bool,
 ) -> Result<()> {
     let report = collect(provider, cfg, volumes, keys, sched).await;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        print!("{}", report.render());
-    }
+    print!("{}", render_output(&report, json)?);
+    exit_status(&report)
+}
+
+/// What the check prints: the checklist, or with `--json` the report as JSON. Pure, so
+/// both forms are tested without capturing stdout.
+pub(crate) fn render_output(report: &Report, json: bool) -> Result<String> {
+    Ok(if json { format!("{}\n", serde_json::to_string_pretty(report)?) } else { report.render() })
+}
+
+/// The exit: `Ok` only when everything is clear — something remaining *or* unknown fails.
+fn exit_status(report: &Report) -> Result<()> {
     if report.clear {
         Ok(())
     } else {
@@ -498,7 +505,8 @@ mod tests {
         for needle in [
             "✗ pods (runpod): 1 remains — 0 billing, 1 stopped",
             "? pods (vast): couldn't list (provider error: list pods HTTP 429) — NOT known to be empty",
-            "fix:  arena pods terminate --all",
+            // Not `--all`: vast couldn't be listed, so what `--all` would reach there is unknown.
+            "fix:  arena pods terminate id-devtest-bloom",
             "fix:  arena cron remove",
             "fix:  atrm 3",
             "fix:  arena keys revoke devtest-apple",
@@ -509,14 +517,40 @@ mod tests {
             assert!(text.contains(needle), "`{needle}` missing:\n{text}");
         }
         assert!(!text.contains("SECRET"), "{text}");
-        // --json: the same report, machine-readable, the same exit.
-        let json = teardown_with(&fleet, &cfg, std::future::ready(Probe::Got(vec![])), Some(&keys), &sched, true).await;
-        assert!(json.is_err());
+        assert_eq!(render_output(&report, false).unwrap(), text, "the text form is the checklist");
+        // --json: the same report from the same inputs, machine-readable, the same exit.
+        let printed = render_output(&report, true).unwrap();
+        assert!(!printed.contains("SECRET"), "{printed}");
+        let v: serde_json::Value = serde_json::from_str(&printed).unwrap_or_else(|e| panic!("{e}: {printed}"));
+        assert_eq!(v, serde_json::to_value(&report).unwrap());
+        assert_eq!((v["clear"].as_bool(), v["remaining"].as_u64(), v["unknown"].as_u64()), (Some(false), Some(6), Some(1)));
+        let verdict = |area: &str, scope: &str| {
+            v["items"].as_array().unwrap().iter().find(|i| i["area"] == area && i["scope"] == scope).map(|i| i["verdict"].clone())
+        };
+        assert_eq!(verdict("pods", "vast"), Some("unknown".into()));
+        assert_eq!(verdict("volumes", "runpod"), Some("remaining".into()));
+        let exit_json = teardown_with(&fleet, &cfg, std::future::ready(Probe::Got(vec![vol("vol1", 100)])), Some(&keys), &sched, true)
+            .await
+            .map_err(|e| e.to_string());
+        assert_eq!(exit_json, exit, "--json exits like the checklist");
+        assert!(keys.calls().is_empty(), "keys are only listed");
+    }
+
+    /// The `arena …` fix lines of a report, as argv.
+    fn arena_fixes(report: &Report) -> Vec<Vec<String>> {
+        report
+            .items
+            .iter()
+            .flat_map(|i| i.fix.iter())
+            .filter(|f| f.starts_with("arena "))
+            .map(|f| f.split("  #").next().unwrap().split_whitespace().map(String::from).collect())
+            .collect()
     }
 
     /// Every `arena …` fix line the checklist prints is a real command line — and the keys
     /// one really revokes this cohort's keys once every pod is gone (where `keys revoke
-    /// --all` would revoke nothing: it targets current pods).
+    /// --all` would revoke nothing: it targets current pods), never a staff box's
+    /// (`@james-gpu`) or another cohort's.
     #[tokio::test]
     async fn the_printed_fixes_parse_and_the_keys_fix_works_with_no_pods_left() {
         let dir = tmp("fixes");
@@ -525,23 +559,58 @@ mod tests {
         let keys = FakeKeys::with(&[("h-a", "devtest-apple"), ("h-j", "james-gpu"), ("h-7", "arena7-apple")]);
         let sched = FakeSched::with(&[("crontab -l", ran(&crontab_with_block())), ("atq", ran(""))]);
         let (report, _) = check(&fleet, &cfg, Probe::Got(vec![]), Some(&keys), &sched).await;
-        let fixes: Vec<Vec<String>> = report
-            .items
-            .iter()
-            .flat_map(|i| i.fix.iter())
-            .filter(|f| f.starts_with("arena "))
-            .map(|f| f.split("  #").next().unwrap().split_whitespace().map(String::from).collect())
-            .collect();
+        let fixes = arena_fixes(&report);
         assert_eq!(fixes.len(), 3, "{fixes:?}"); // pods, keys, cron
         for argv in &fixes {
             Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
         }
+        assert_eq!(fixes[0], ["arena", "pods", "terminate", "--all"], "only the cohort's pods are left");
         let revoke = fixes.iter().find(|a| a[1] == "keys").unwrap();
-        assert_eq!(revoke, &["arena", "keys", "revoke", "devtest-apple", "james-gpu"]);
+        assert_eq!(revoke, &["arena", "keys", "revoke", "devtest-apple"]);
         let Cmd::Keys(k) = Cli::try_parse_from(revoke).unwrap().cmd else { unreachable!() };
         let gone = Fleet { backends: vec![("runpod", Ok(vec![]))] };
         keys_with(k, &gone, Arc::new(FakeRemote::new()), &cfg, &keys, &dir.0, true).await.unwrap();
-        assert_eq!(keys.calls(), ["delete h-a", "delete h-j"]);
-        assert_eq!(keys.names(), ["arena7-apple"], "another cohort's key is left alone");
+        assert_eq!(keys.calls(), ["delete h-a"]);
+        assert_eq!(keys.names(), ["arena7-apple", "james-gpu"], "another cohort's and the staff box's keys are left alone");
+    }
+
+    /// With a staff box (`@james-gpu`) or a stranger anywhere on the account, the pods fix is
+    /// one `terminate <id>` per cohort pod — each a real command line — and never `--all`,
+    /// which would destroy them too (even when printed under a provider that holds only the
+    /// cohort's pods: `--all` reaches every provider); they're named for the operator.
+    #[tokio::test]
+    async fn the_pods_fix_never_sweeps_in_a_staff_box() {
+        let dir = tmp("staff");
+        let cfg = cfg(&dir.0);
+        let fleet = Fleet {
+            backends: vec![
+                ("runpod", Ok(vec![pod("devtest-bloom", "EXITED")])),
+                ("vast", Ok(vec![pod("devtest-apple", "RUNNING"), pod("james-gpu", "RUNNING"), pod("registered_pink_prawn", "RUNNING")])),
+            ],
+        };
+        let sched = FakeSched::with(&[("crontab -l", ran("")), ("atq", ran(""))]);
+        let (report, exit) = check(&fleet, &cfg, Probe::Got(vec![]), None, &sched).await;
+        assert!(exit.is_err(), "they all still bill");
+        let text = report.render();
+        assert!(report.items.iter().flat_map(|i| &i.fix).all(|f| !f.contains("--all")), "{text}");
+        let fixes = arena_fixes(&report);
+        assert_eq!(
+            fixes,
+            [["arena", "pods", "terminate", "id-devtest-bloom"], ["arena", "pods", "terminate", "id-devtest-apple"]],
+            "{text}"
+        );
+        for argv in &fixes {
+            let Cmd::Pods(_) = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}")).cmd else {
+                panic!("{argv:?}")
+            };
+        }
+        for needle in [
+            "james-gpu              id=id-james-gpu  RUNNING  billing  (staff box — not this cohort's)",
+            "registered_pink_prawn  id=id-registered_pink_prawn  RUNNING  billing  (not this cohort's)",
+            "note: 2 not this cohort's (james-gpu (staff box: `@` list entry), registered_pink_prawn) — decide by hand",
+            "note: one command per pod, not `arena pods terminate --all`",
+        ] {
+            assert!(text.contains(needle), "`{needle}` missing:\n{text}");
+        }
     }
 }
