@@ -60,7 +60,7 @@ use crate::placement::{milli, PriceBook};
 use crate::pod::{Pod, PodSpec};
 use crate::retry::{retrying, RetryPolicy};
 
-const BASE: &str = "https://console.vast.ai/api/v0";
+pub(crate) const BASE: &str = "https://console.vast.ai/api/v0";
 
 /// Offers per search, cheapest first: plenty to re-filter client-side and still find one.
 const SEARCH_LIMIT: u32 = 64;

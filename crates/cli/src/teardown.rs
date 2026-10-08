@@ -4,7 +4,9 @@
 //! Read-only by construction: provider *list* calls, the RunPod volume listing, the
 //! OpenRouter key listing, the local proxy file, and three local commands that only read
 //! (`crontab -l`, `atq`, `at -c <id>`). Nothing here can delete, stop or edit anything; the
-//! checklist prints the commands that would, for the operator to run.
+//! checklist prints the commands that would, for the operator to run. After the checklist
+//! (text only) come the provider account balances (`arena_core::balance`) — informational,
+//! never part of the verdict.
 
 use std::future::Future;
 use std::time::Duration;
@@ -36,7 +38,19 @@ pub(crate) async fn handle_teardown(provider: &dyn Provider, cfg: &Config, check
     }
     let or = openrouter_client(cfg);
     let keys = or.as_ref().map(|o| o as &dyn KeyApi);
-    teardown_with(provider, cfg, read_volumes(cfg), keys, &SystemSched, json).await
+    let check = teardown_with(provider, cfg, read_volumes(cfg), keys, &SystemSched, json);
+    if json {
+        return check.await;
+    }
+    // The account balances, read alongside and printed after the checklist: informational
+    // only (what's left, and whether RunPod still reports spend) — never part of the verdict
+    // or the exit status, and left out of `--json`, whose shape scripts rely on.
+    let (result, balances) =
+        tokio::join!(check, arena_core::balance::fetch_all(cfg, arena_core::balance::FETCH_TIMEOUT));
+    for line in super::money::teardown_lines(&balances, cfg, arena_core::snapshot::unix_now()) {
+        println!("{line}");
+    }
+    result
 }
 
 /// The check against these sources (the real ones, or fakes in tests): print the checklist

@@ -21,6 +21,7 @@ use arena_core::ssh::SshTarget;
 use arena_core::{Config, PodSpec};
 
 mod jobs;
+mod money;
 mod teardown;
 mod up;
 
@@ -154,6 +155,20 @@ enum Cmd {
         #[arg(long)]
         check: bool,
         /// Print the checklist as JSON (for scripts); the exit status is the same.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Money left on each provider account and how long it lasts (read-only).
+    ///
+    /// RunPod (GraphQL `clientBalance`, `currentSpendPerHr`, `spendLimit`, `underBalance`) and
+    /// Vast (`credit`) are prepaid — at zero the provider stops every pod; Hetzner is postpaid.
+    /// Burn = the higher of the provider's own rate and this fleet's billing pods there;
+    /// runway = balance ÷ burn, with the date it runs out. Below BALANCE_WARN_HOURS (default
+    /// 48) — or at zero, or flagged by RunPod — a row is a ⚠. Exits non-zero when any account
+    /// needs a top-up or couldn't be read (`arena balance || <alert>` from cron). Never shows
+    /// account ids or emails.
+    Balance {
+        /// Print the report as JSON (for scripts); the exit status is the same.
         #[arg(long)]
         json: bool,
     },
@@ -1123,6 +1138,32 @@ enum PodCmd {
         #[command(flatten)]
         sel: Select,
     },
+    /// Which pods look abandoned — a read-only REPORT; it never stops or terminates anything.
+    ///
+    /// One bounded probe per billing pod (60s budget; nothing written): live inbound
+    /// connections — SSH sessions (VS Code Remote-SSH counts; this probe's own is left out)
+    /// and others from off the pod (a Jupyter tab through the provider's proxy) — GPU
+    /// utilization (busiest of 3 samples) and memory, the newest file change under the home
+    /// and the repo (BACKUP_REPO_PATH; .git, caches and editor servers skipped; 20s scan), and
+    /// the container's uptime. A pod idle by EVERY measure for --hours (no connection, GPU
+    /// ≤5%, no file change, up that long) is listed as a candidate with the commands an
+    /// operator could run — `pods backup` first, then `pods terminate` — printed, not run.
+    /// Only this cohort's machines get commands (a staff `@` box or another prefix's pod is
+    /// named, nothing more). Anything that can't be read makes a pod unknown, never a
+    /// candidate. Not seen: sessions through RunPod's ssh.runpod.io proxy (they don't come
+    /// in over the pod's sshd) — check with the group before acting.
+    ///
+    /// Targets: names / ids / ranges (none = every pod).
+    Idle {
+        /// How long a pod must have been idle by every measure (hours, default 6).
+        #[arg(long, default_value_t = arena_core::idle::DEFAULT_HOURS, value_parser = money::parse_hours)]
+        hours: f64,
+        /// Print the report as JSON (verdicts, readings, suggested commands).
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        sel: Select,
+    },
     /// Distribute API keys to pods' shells (per-host CSVs + broadcast HF token). Targets:
     /// names / ids / ranges (none = every reachable pod).
     CopyKeys {
@@ -2067,6 +2108,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Keys(k) => handle_keys(k, provider.unwrap().as_ref(), remote, &cfg, cli.yes).await,
         Cmd::Teardown { check, json } => teardown::handle_teardown(provider.unwrap().as_ref(), &cfg, check, json).await,
+        Cmd::Balance { json } => money::handle_balance(provider.unwrap().as_ref(), &cfg, json).await,
         Cmd::Gpus { json } => handle_gpus(&cfg, &cli.provider, json).await,
         Cmd::Offers { gpu, cloud, max_price, gpus, order, json } => {
             handle_offers(&cfg, &cli.provider, gpu, cloud, max_price, gpus, order, json).await
@@ -4766,33 +4808,51 @@ async fn handle_pods_with(
         PodCmd::List { json, probe, no_probe } => {
             // Fleet view across every configured provider (the aggregate provider), so
             // e.g. hetzner CPU pods show up alongside the GPU fleet. Grouped by provider.
-            let mut pods = provider.list_pods().await?;
-            pods.sort_by(|a, b| a.provider.cmp(&b.provider).then(a.name.cmp(&b.name)));
-            // Best-effort details the list API omits (RunPod: GPU, $/h, host maintenance
-            // window) — one extra read-only query. Never fatal: on failure or a hang the
-            // list still renders, just with fewer columns filled, after one warning line.
-            if let Some(warning) = enrich_best_effort(provider, &mut pods, ENRICH_TIMEOUT).await {
-                eprintln!("{warning}");
-            }
-            // Probe GPU by default for the human table; JSON stays fast/scriptable unless
-            // asked. `--no-probe` always wins.
-            let probe = !no_probe && (probe || !json);
-            if probe {
-                // nvidia-smi over SSH (same source as the TUI), concurrently, bounded per pod.
-                probe_gpus(&remote, cfg, &mut pods).await;
-            }
+            let listing = async {
+                let (mut pods, failed) = money::list_noting_failures(provider).await?;
+                pods.sort_by(|a, b| a.provider.cmp(&b.provider).then(a.name.cmp(&b.name)));
+                // Best-effort details the list API omits (RunPod: GPU, $/h, host maintenance
+                // window) — one extra read-only query. Never fatal: on failure or a hang the
+                // list still renders, just with fewer columns filled, after one warning line.
+                if let Some(warning) = enrich_best_effort(provider, &mut pods, ENRICH_TIMEOUT).await {
+                    eprintln!("{warning}");
+                }
+                // Probe GPU by default for the human table; JSON stays fast/scriptable unless
+                // asked. `--no-probe` always wins.
+                if !no_probe && (probe || !json) {
+                    // nvidia-smi over SSH (same source as the TUI), concurrently, bounded per pod.
+                    probe_gpus(&remote, cfg, &mut pods).await;
+                }
+                anyhow::Ok((pods, failed))
+            };
+            // The account balances for the footer, read while the listing runs (table only;
+            // each read within FOOTER_TIMEOUT, best-effort — they never fail the list, and
+            // hold it up at most until that budget runs out).
+            let balances = async {
+                if json {
+                    None
+                } else {
+                    Some(arena_core::balance::fetch_all(cfg, money::FOOTER_TIMEOUT).await)
+                }
+            };
+            let (listed, balances) = tokio::join!(listing, balances);
+            let (pods, failed) = listed?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&pods)?);
                 return Ok(());
             }
+            let footer = balances
+                .map(|b| money::list_footer(&b, &pods, &failed, cfg, arena_core::snapshot::unix_now()))
+                .unwrap_or_default();
             if pods.is_empty() {
                 println!("(no pods)");
-                return Ok(());
+            } else {
+                // Columns + footer come from arena_core::fleet so the TUI/snapshot reuse them.
+                use arena_core::fleet;
+                print!("{}", fleet::render_pods_table(&pods));
+                println!("{}", fleet::fleet_footer(&fleet::fleet_cost(&pods)));
             }
-            // Columns + footer come from arena_core::fleet so the TUI/snapshot reuse them.
-            use arena_core::fleet;
-            print!("{}", fleet::render_pods_table(&pods));
-            println!("{}", fleet::fleet_footer(&fleet::fleet_cost(&pods)));
+            footer.iter().for_each(|l| println!("{l}"));
         }
 
         PodCmd::Create { names, count, add, gpu, gpus, cloud, max_price, order, disk, volume, image, bootstrap, skip_proxy, dry_run, keep_trying, retry_mins, retry_secs } => {
@@ -5264,6 +5324,11 @@ async fn handle_pods_with(
             let tail = usize::try_from(tail).unwrap_or(usize::MAX);
             jobs::handle_logs(remote, cfg, &sel, job.as_ref(), tail, follow, jobs::FOLLOW_INTERVAL, stop, &mut |l| println!("{l}"))
                 .await?;
+        }
+        PodCmd::Idle { hours, json, sel } => {
+            // Read-only: no confirm. The report prints commands; it never runs them.
+            let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
+            money::handle_idle(provider, remote, cfg, &sel, hours, json, &mut |l| println!("{l}")).await?;
         }
         PodCmd::Test { deep: true, sel, json, verbose } => {
             // Read-only: no confirm. Config first: a malformed MIN_DRIVER_VERSION fails before

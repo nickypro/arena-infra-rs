@@ -59,6 +59,8 @@ means this.
 |---|---|---|---|---|
 | `gpu-top.sh [interval]` (live nvidia-smi dashboard) | — | dashboard + sparklines | ✅ | The TUI is the live monitor (per-pod probe over `Remote`, 20 s budget). |
 | — | `snapshot [--json] [--public] [--out FILE]` + `web/fleet.html` + `cron install --snapshot DIR` | every refresh is one `snapshot::build` | ➕ | Read-only fleet picture (list columns + SSH port answers ok/down + proxy port live/stale + last deep-check verdict and age; the SSH probe is a TCP connect + sshd's greeting, ≤ 3 s, cohort machines only, `--no-probe` to skip). Public `up` needs the probe's answer (silent → `starting`). `--public` = an allowlisted JSON (list names, GPU, up/starting/down, health + fixed-vocabulary reason, maintenance times — no IPs, ports, ids, costs) for the static page. |
+| — | `balance [--json]` + a `pods list` footer line, `teardown --check` lines, the TUI summary bar | summary bar (every 5 min) | ➕ | Prepaid RunPod (GraphQL `clientBalance`/`currentSpendPerHr`/`spendLimit`/`underBalance`) and Vast (`credit`) balances; Hetzner postpaid. Runway = balance ÷ max(provider's rate, fleet's billing pods there), with the date; ⚠ under `BALANCE_WARN_HOURS`, at zero or on `underBalance`. Unknown is `?`, never "not burning". Non-zero exit on a ⚠ or an unreadable account. No ids/emails. |
+| — | `pods idle [targets] [--hours N] [--json]` | — | ➕ | Read-only report, never acts: per billing pod one bounded probe (SSH sessions excluding ours — VS Code counts —, other inbound connections, GPU util ×3, newest file under home + repo, uptime); candidates idle by every measure for N h (default 6), cohort machines only, with `pods backup` then `pods terminate` **printed**. Unknown is never a candidate. |
 | — | `teardown --check [--json]` | — | ➕ | End-of-program audit: pods on every provider in any state, RunPod network volumes, enabled OpenRouter keys, arena cron lines, `at` jobs, proxy forwards — ✓ ✗ ? – with fix commands; unknown is never "empty"; non-zero unless all clear. Deletes nothing. |
 | `copy_api_keys.py` (CSV → pod `~/.bashrc`/`~/.zshrc`) | `pods copy-keys [selector] [--keys-dir --hf-token --cc-token]` | — | ✅ | Per-host CSVs (openai/anthropic/openrouter) + broadcast Hugging Face and Claude Code tokens. Idempotent; 60 s per pod. |
 | — | `keys gen/list/rotate/revoke/which` | — | ➕ | OpenRouter runtime keys via the provisioning API (one per machine, USD cap), written to `keys/openrouter_api_keys.csv`. |
@@ -76,6 +78,7 @@ means this.
 | `SETUP_TIMEOUT_SECS` | 300 (image pods) / 1800 (Hetzner script) | The main setup step's budget, 1..86400, for `setup`, `up`, `restart`, `replace`, `migrate copy`; `setup --timeout` wins. Checked before `up` creates anything. |
 | `ARENA_STATE_DIR` | `${XDG_STATE_HOME:-~/.local/state}/arena` | Root of the health cache, `<dir>/<prefix>/health.json` (absolute path). Settable from the environment, so a cron job and the operator can share one. |
 | `BACKUP_TIMEOUT_SECS` | 7200 (2 h) | Wall-clock budget per pod for the backup rsyncs (`pods pull`, `pods backup`'s file step), 1..86400; on top of rsync's `--timeout=300` (I/O silence). A pod that runs out is stopped and named; the others finish. A malformed value fails the command before anything is copied. Settable from the environment. |
+| `BALANCE_WARN_HOURS` | 48 | `balance`/footers warn when an account's runway is under this many hours (`0` = off; zero balance and RunPod's `underBalance` still warn). Malformed: `arena balance` fails, the footers/TUI use 48 and say so. |
 | `MIN_DRIVER_VERSION` | derived from `ALLOWED_CUDA_VERSIONS` (13.x → 580, 12.8 → 570, …) | The deep check's driver floor (`580` or `580.65.06`; `none` = no check). A malformed value fails `up --check` before anything is created. |
 
 ## Provider status
@@ -101,6 +104,6 @@ last health) comes from the same core `FleetSnapshot` as `arena snapshot`.
 Deliberately CLI-only (awkward or risky in a live dashboard): `up`/`create` placement flags,
 `rename`/`reimage`/`replace`/`migrate`, `run --background`/`jobs`/`logs`, `pull` (local file
 IO), `copy-keys` (reads local CSVs), `cp`, `keys`, `ssh-config` (prints a file),
-`snapshot --public`/`teardown --check`, `config`/`cron`/`plan`. In the TUI, stop stays
+`snapshot --public`/`teardown --check`, `pods idle` and `balance`'s full table (the TUI shows its one-liner), `config`/`cron`/`plan`. In the TUI, stop stays
 per-pod by design, and restart/terminate on many pods need an explicit marked set (no "stop
 everything" footgun).

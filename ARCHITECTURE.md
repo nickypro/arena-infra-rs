@@ -14,7 +14,7 @@ flowchart TD
     viewer([anyone with the page URL])
 
     subgraph present[presentation layer · thin, swappable]
-        CLI["arena (CLI) · crates/cli<br/>main.rs: clap + handlers · up.rs: per-pod pipelines<br/>jobs.rs: run --background / jobs / logs · teardown.rs"]
+        CLI["arena (CLI) · crates/cli<br/>main.rs: clap + handlers · up.rs: per-pod pipelines<br/>jobs.rs: run --background / jobs / logs · teardown.rs<br/>money.rs: balance · pods idle"]
         TUI["arena-tui · crates/tui<br/>ratatui dashboard · state.rs (pure)"]
         WEB["web/fleet.html<br/>static page, read-only"]
     end
@@ -40,6 +40,7 @@ flowchart TD
         Proxy["proxy<br/>sticky merge · nginx render/parse"]
         Snap["snapshot<br/>FleetSnapshot · health cache · PublicSnapshot"]
         Tear["teardown<br/>checklist judge"]
+        Money["balance + idle<br/>runway judge · idle probe + verdicts"]
         Labels["fleet + status<br/>labels · billing · cost"]
         Jobs["jobs<br/>detached runs on pods"]
         Misc["naming · gpu · openrouter · apikeys · backup<br/>pull · sshconfig · metrics · plan · schedule"]
@@ -53,12 +54,14 @@ flowchart TD
         Snap --> Labels
         Snap --> Proxy
         Tear --> Proxy
+        Money --> Http
+        Money --> Labels
     end
 
     CLI --> Config
     TUI --> Config
-    CLI --> Sel & Place & Pipe & Setup & Health & Proxy & Snap & Tear & Jobs & Misc
-    TUI --> Snap & Sel & Setup & Health & Misc
+    CLI --> Sel & Place & Pipe & Setup & Health & Proxy & Snap & Tear & Jobs & Money & Misc
+    TUI --> Snap & Sel & Setup & Health & Money & Misc
     CLI --> Remote
     TUI --> Remote
 
@@ -77,9 +80,9 @@ flowchart TD
 
 | crate | binary | role |
 |-------|--------|------|
-| `arena-core` | — | config parsing, the `Provider` trait + RunPod v1/v2, Vast, Hetzner backends + `build`/`build_fleet` factories, the `Remote` SSH seam, every planner and judge (selector, placement, pipeline, proxy merge, health, snapshot, teardown, jobs), the `Pod`/`PodSpec` model, errors |
-| `arena-cli` | `arena` | clap CLI over the library: `pods …` (list/create/up/setup/stop/restart/rename/reimage/replace/migrate/terminate/backup/pull/init-branches/set-branch/run/jobs/logs/test/copy-keys/cp), `proxy plan/apply`, `snapshot`, `teardown --check`, `offers`, `gpus`, `keys`, `ssh-config`, `config`, `cron`, `plan`, `tui`. Owns the I/O: the `up` executor (`up.rs`), the job fan-out (`jobs.rs`), the teardown readers (`teardown.rs`), proxy deploys |
-| `arena-tui` | `arena-tui` | ratatui dashboard: each refresh is one `snapshot::build`; per-pod and marked-set actions behind confirmation modals; background deep checks into the shared health cache |
+| `arena-core` | — | config parsing, the `Provider` trait + RunPod v1/v2, Vast, Hetzner backends + `build`/`build_fleet` factories, the `Remote` SSH seam, every planner and judge (selector, placement, pipeline, proxy merge, health, snapshot, teardown, jobs, balance, idle), the `Pod`/`PodSpec` model, errors |
+| `arena-cli` | `arena` | clap CLI over the library: `pods …` (list/create/up/setup/stop/restart/rename/reimage/replace/migrate/terminate/backup/pull/init-branches/set-branch/run/jobs/logs/test/copy-keys/cp), `pods idle`, `proxy plan/apply`, `snapshot`, `teardown --check`, `balance`, `offers`, `gpus`, `keys`, `ssh-config`, `config`, `cron`, `plan`, `tui`. Owns the I/O: the `up` executor (`up.rs`), the job fan-out (`jobs.rs`), the teardown readers (`teardown.rs`), the account reads and idle probes (`money.rs`), proxy deploys |
+| `arena-tui` | `arena-tui` | ratatui dashboard: each refresh is one `snapshot::build`; per-pod and marked-set actions behind confirmation modals; background deep checks into the shared health cache; the account balance in the summary bar (its own task, every 5 min) |
 
 `web/fleet.html` is not a crate: a self-contained page that renders `fleet.json`
 (`arena snapshot --public`) and can't change anything.
@@ -104,6 +107,8 @@ flowchart TD
 | `snapshot` | `FleetSnapshot` (`build`: pods + proxy state + last health), the SSH-port reachability probe behind the `Reach` seam (`SshPortProbe`: TCP connect + sshd's greeting, nothing sent), the prefix-scoped health cache (atomic, locked, 0600), and `PublicSnapshot` — a separate allowlisted struct for publishing (`up` needs the probe's answer) | build + targets pure; probe and cache I/O |
 | `teardown` | turns listings, volumes, OpenRouter keys, cron/`at` lines and the proxy file into a ✓ ✗ ? – checklist with fix commands (unknown ≠ empty) | yes |
 | `jobs` | detached runs (`pods run --background`): the on-pod wrapper, ids, status, log reads by byte offset | yes |
+| `balance` | provider account reads (RunPod GraphQL `myself`, Vast `users/current` — only the balance fields; Hetzner postpaid), the burn (max of the provider's rate and the fleet's billing pods; a failed listing = unknown), runway + ⚠ under `BALANCE_WARN_HOURS`, the table / one-liner / teardown lines | judge + render pure; two bounded, status-first reads |
+| `idle` | `pods idle`: the read-only probe script (`/proc/net/tcp` sessions minus our own, `nvidia-smi` ×3, bounded `find`, PID 1 age), its reply parser, the verdict (candidate only when every reading is known and idle; cohort machines only) and the report with printed — never run — commands | yes (script runs over `Remote`) |
 | `naming`, `gpu`, `openrouter`, `apikeys`, `backup`, `pull`, `sshconfig`, `metrics`, `plan`, `schedule`, `ssh`, `table` | name allocation (`@` absolute entries), GPU aliases + catalog check, OpenRouter provisioning API, key distribution, git backup / rsync commands, participant `~/.ssh/config`, TUI probe, scheduled plans, `wNdM` labels, ssh/scp argv, table layout | mostly |
 
 ## Request flow (example: `arena pods up apple --gpu A4000,3070 --cloud community --max-price 0.30 --check`)
@@ -137,7 +142,7 @@ flowchart TD
 ## Safety model (cross-cutting)
 
 - **Read-only commands read**: `pods list`, `gpus`, `offers`, `snapshot`, `teardown
-  --check`, `proxy plan`, `pods test`, `pods logs` and `pods jobs` (without `--kill`) only
+  --check`, `balance`, `proxy plan`, `pods test`, `pods idle`, `pods logs` and `pods jobs` (without `--kill`) only
   list, query (GraphQL queries, never mutations) or run read-only commands on pods. Keys travel as `Authorization` headers,
   never in URLs that errors would print.
 - **Mutations confirm first**: they print what they'll do and prompt; `-y` skips the

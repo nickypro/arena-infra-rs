@@ -16,7 +16,8 @@
 //! deep-checks the cursor pod (or the marked set) in the background and records the
 //! verdicts in that cache; `/` marks pods by the CLI's selector syntax (`apple..delta`).
 //! Every pod SSH call goes through `arena_core::remote::Remote` with a time budget, so a
-//! wedged pod can't hang an action.
+//! wedged pod can't hang an action. The summary bar also carries the provider accounts'
+//! balance and runway (`arena balance`'s, read every 5 min in a task of its own).
 //!
 //! Safety against live prod is built into the *interaction*, not bolted on: a mutating
 //! action always pops a confirmation modal. Lifecycle actions (restart/stop/terminate)
@@ -53,6 +54,7 @@ use ratatui::{
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
+use arena_core::balance::{self, AccountProbe, Burns};
 use arena_core::fleet;
 use arena_core::health::{deep_check_command, judge_deep_call, HealthPolicy, PodHealth, DEEP_CHECK_TIMEOUT};
 use arena_core::metrics::{self, PodMetrics, ProbeOpts};
@@ -70,8 +72,8 @@ use arena_core::status::display_status;
 use state::{
     capture_details, dashboard_snapshot, details_due, display_name, health_cell, mark_key, marked_pods,
     marked_set_token, merge_details, names_preview, overlay_details, partial_notice, proxy_cell, proxy_detail,
-    select_marks, short_branch, spark, summarize, summary_text, Action, Confirm, DeepChecks, FleetSummary, History,
-    NewPodForm, NpField, PodDetails, ProviderOpt, Tone,
+    select_marks, short_branch, spark, summarize, summary_text, Action, BalanceRead, Confirm, DeepChecks, FleetSummary,
+    History, NewPodForm, NpField, PodDetails, ProviderOpt, Tone,
 };
 
 const DEFAULT_CONFIG: &str = "/home/dev/prod-ro/config.env";
@@ -189,6 +191,12 @@ struct Shared {
     action_result: Option<String>,
     /// True while a background action is in flight (so new triggers are ignored).
     action_running: bool,
+    /// The provider accounts as last read by [`balance_loop`] (`None` until the first read).
+    balance: Option<BalanceRead>,
+    /// The fleet's burn per provider from the last listing (billing pods; a provider that
+    /// failed to list is unknown), which the balance's runway is judged against. `None`
+    /// before the first listing.
+    fleet_burns: Option<Burns>,
 }
 
 impl Shared {
@@ -274,6 +282,20 @@ async fn main() -> Result<()> {
     let details_wanted = Arc::new(AtomicBool::new(false));
     let remote: Arc<dyn Remote> = Arc::new(SshRemote);
 
+    // The account balances for the summary bar, on their own slow cadence and in their own
+    // task: a stalled billing API never holds up a refresh. A bad BALANCE_WARN_HOURS falls
+    // back to the default here (`arena balance` is the place that refuses it).
+    let (warn_hours, _) = balance::warn_hours_or_default(&cfg);
+    let balance_cfg = cfg.clone();
+    tokio::spawn(balance_loop(
+        move || {
+            let cfg = balance_cfg.clone();
+            async move { balance::fetch_all(&cfg, balance::FETCH_TIMEOUT).await }
+        },
+        warn_hours,
+        shared.clone(),
+    ));
+
     // Background fetcher: keeps `shared` fresh without blocking the UI.
     tokio::spawn(fetch_loop(
         provider.clone(),
@@ -346,6 +368,22 @@ async fn fetch_loop(
     }
 }
 
+/// The summary bar's account balances: read at once, then every [`state::BALANCE_EVERY`]
+/// (`read` is `balance::fetch_all` for real, each provider within its `FETCH_TIMEOUT`;
+/// scripted in tests). Read-only API calls only, and none at all when no provider key is
+/// configured.
+async fn balance_loop<F, Fut>(read: F, warn_hours: f64, shared: Arc<Mutex<Shared>>)
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Vec<AccountProbe>>,
+{
+    loop {
+        let probes = read().await;
+        shared.lock().unwrap().balance = Some(BalanceRead { probes, warn_hours });
+        tokio::time::sleep(state::BALANCE_EVERY).await;
+    }
+}
+
 /// What the refresh remembers between rounds about the provider's details query.
 #[derive(Default)]
 struct DetailsState {
@@ -399,6 +437,9 @@ async fn refresh(
         fetch_metrics(remote, &pods, cfg, opts).await
     };
     overlay_details(&mut pods, &details.details);
+    // The balance's runway is judged against what is billing as listed (not the pending
+    // placeholders), a provider that failed to list counting as unknown.
+    let burns = balance::burns(&pods, &partial);
     let (proxy, proxy_warning) = snapshot::local_proxy_text(cfg);
     let (file_health, health_warning) = load_health(cfg);
     let now = snapshot::unix_now();
@@ -429,6 +470,7 @@ async fn refresh(
         [&details.warning, &proxy_warning, &health_warning].into_iter().flatten().map(String::as_str).collect();
     s.status = status_line(&s.summary, &warnings);
     s.metrics = metrics;
+    s.fleet_burns = Some(burns);
     s.publish(snap);
     s.last_refresh = Some(Instant::now());
     s.refreshing = false;
@@ -1787,18 +1829,22 @@ fn render_select(f: &mut Frame, value: &str) {
 }
 
 /// The summary bar (`state::summary_text`): counts, then the fleet's burn from the
-/// snapshot's core `FleetCost`, worded as `pods list`'s footer — led, in yellow, by which
-/// provider failed to list when one did (the totals after it are then a floor).
+/// snapshot's core `FleetCost`, worded as `pods list`'s footer, then the account balance —
+/// led, in yellow, by which provider failed to list when one did (the totals after it are
+/// then a floor), and, in red, by the balance when an account needs a top-up.
 fn summary_line(s: &Shared) -> Paragraph<'static> {
-    let text = summary_text(&s.summary, &s.snap.cost, &s.snap.partial);
-    let line = match partial_notice(&s.snap.partial) {
-        Some(warn) => {
-            let rest = text.strip_prefix(warn.as_str()).unwrap_or(&text).to_string();
-            Line::from(vec![Span::styled(warn, tone_style(Tone::Warn)), Span::raw(rest)])
+    let balance = s.balance.as_ref().and_then(|b| b.line(s.fleet_burns.as_ref(), snapshot::unix_now()));
+    let text = summary_text(&s.summary, &s.snap.cost, &s.snap.partial, balance.as_ref());
+    let mut rest = text.as_str();
+    let mut spans = Vec::new();
+    for (notice, tone) in [(partial_notice(&s.snap.partial), Tone::Warn), (state::balance_notice(balance.as_ref()), Tone::Bad)] {
+        if let Some(n) = notice.filter(|n| rest.starts_with(n.as_str())) {
+            rest = &rest[n.len()..];
+            spans.push(Span::styled(n, tone_style(tone)));
         }
-        None => Line::from(text),
-    };
-    Paragraph::new(line).style(Style::default().add_modifier(Modifier::BOLD))
+    }
+    spans.push(Span::raw(rest.to_string()));
+    Paragraph::new(Line::from(spans)).style(Style::default().add_modifier(Modifier::BOLD))
 }
 
 /// A [`Tone`] as a colour.
@@ -3071,6 +3117,79 @@ deep_check_end=1
         assert_eq!(columns_that_fit(45, &core, &[9, 1]), 0);
     }
 
+    /// The account balance in the summary bar: at its end while it needs nothing; in red
+    /// right at its front when an account needs a top-up, so a narrow terminal still shows
+    /// it. Judged against the fleet as listed (alpha $0.17 + bravo $0.25 billing on RunPod).
+    #[test]
+    fn the_summary_bar_shows_the_balance_and_leads_with_a_top_up_warning() {
+        use arena_core::balance::Account;
+        let mut shared = fixture_shared();
+        shared.fleet_burns = Some(balance::burns(&shared.pods, &[]));
+        let read = |b: f64| BalanceRead {
+            probes: vec![
+                AccountProbe {
+                    provider: "runpod".into(),
+                    account: Ok(Account::Prepaid { balance: b, provider_per_hr: Some(0.0), spend_limit_per_hr: None, under_balance: None, owed: None }),
+                },
+                AccountProbe { provider: "hetzner".into(), account: Ok(Account::Postpaid) },
+            ],
+            warn_hours: 48.0,
+        };
+        let ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        // No read yet: no balance at all.
+        let bar = |shared: &Shared, w: u16| draw(w, 12, shared, &ui).into_iter().find(|l| l.contains(" pods · ")).unwrap();
+        assert!(!bar(&shared, 240).contains("balance"));
+        shared.balance = Some(read(100.0)); // 100 / 0.42 = 238h
+        let wide = bar(&shared, 240);
+        assert!(wide.contains("€0.13/day  ·  balance: runpod $100.00 ~9.9d · hetzner postpaid"), "{wide}");
+        shared.balance = Some(read(10.0)); // ~23h, under 48
+        for w in [80, 120] {
+            let narrow = bar(&shared, w);
+            assert!(narrow.starts_with(" balance: ⚠ runpod $10.00 ~23h · hetzner postpaid · 4 pods"), "{w}: {narrow}");
+        }
+        // Red, as a ⚠ that stops every pod deserves.
+        let mut t = Terminal::new(TestBackend::new(120, 12)).unwrap();
+        t.draw(|f| view(f, &shared, &ui, 5)).unwrap();
+        let buf = t.backend().buffer();
+        let y = (0..12).find(|&y| (0..120).map(|x| buf[(x, y)].symbol()).collect::<String>().contains(" pods · ")).unwrap();
+        assert_eq!(buf[(3, y)].fg, Color::Red, "the warning is red");
+    }
+
+    /// The balances are read at once, then every BALANCE_EVERY — not on each refresh.
+    #[tokio::test(start_paused = true)]
+    async fn balances_are_read_on_their_own_slow_cadence() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let counter = reads.clone();
+        let task = tokio::spawn(balance_loop(
+            move || {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    vec![AccountProbe { provider: "runpod".into(), account: Err(format!("read {n}")) }]
+                }
+            },
+            12.0,
+            shared.clone(),
+        ));
+        let settle = || async {
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+        };
+        settle().await;
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "read at start");
+        let got = shared.lock().unwrap().balance.clone().unwrap();
+        assert_eq!((got.warn_hours, got.probes[0].account.clone()), (12.0, Err("read 0".to_string())));
+        tokio::time::advance(state::BALANCE_EVERY - Duration::from_secs(1)).await;
+        settle().await;
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "not before BALANCE_EVERY");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        settle().await;
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        assert_eq!(shared.lock().unwrap().balance.as_ref().unwrap().probes[0].account, Err("read 1".to_string()));
+        task.abort();
+    }
+
     /// A provider that failed to list is said at the front of the summary bar, so it is on
     /// screen at any common width — the bar is one unwrapped line and its tail gets cut.
     #[test]
@@ -3337,9 +3456,14 @@ deep_check_end=1
             assert_eq!(health_cell(a.health.as_ref(), false, s.snap.generated_at).0, "pass 10m");
             assert!(b.health.is_none());
             assert_eq!(s.snap.partial, ["vast"]);
-            let summary = summary_text(&s.summary, &s.snap.cost, &s.snap.partial);
+            let summary = summary_text(&s.summary, &s.snap.cost, &s.snap.partial, None);
             assert!(summary.contains("fleet: $0.17/h across 2 billing pod(s) (1 unpriced)"), "{summary}");
             assert!(summary.starts_with(" ⚠ vast failed to list — its pods (and their cost) are missing"), "{summary}");
+            // The balance's runway is judged against the same listing: RunPod's billing
+            // pods, and Vast — which failed to list — unknown rather than idle.
+            let burns = s.fleet_burns.as_ref().expect("set by the refresh");
+            assert_eq!(burns.of("runpod").map(|b| b.billing), Some(2));
+            assert_eq!(burns.of("vast"), None);
         }
         assert_eq!(alpha_row(&shared), ("$0.17".to_string(), true));
         assert_eq!(calls(), (1, 1), "the first refresh fills the details");
@@ -3386,7 +3510,7 @@ deep_check_end=1
         assert_eq!(alpha.gpu_type.as_deref(), Some("RTX A4000"));
         assert!(s.status.contains("⚠ pod details incomplete: ") && s.status.contains("some field errored"), "{}", s.status);
         // The fleet total counts the price it got.
-        assert!(summary_text(&s.summary, &s.snap.cost, &s.snap.partial).contains("$0.17/h"));
+        assert!(summary_text(&s.summary, &s.snap.cost, &s.snap.partial, None).contains("$0.17/h"));
     }
 
     /// The dashboard's deep check is `pods test --deep`'s: the same script in one exec per

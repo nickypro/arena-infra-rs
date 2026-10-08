@@ -9,11 +9,13 @@
 //! `arena_core`'s [`FleetSnapshot`] builder and its labels — the same ones `pods list` and
 //! `arena snapshot` print. What lives here is only what is the dashboard's own: which cell
 //! gets which colour, how a background deep check's results fold into what is on screen,
-//! how often the provider's slower details query may run, and what `/` marks.
+//! how often the provider's slower details query may run, and what `/` marks. The account
+//! balance in the summary bar is `arena_core::balance`'s, judged against the fleet as listed.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
+use arena_core::balance::{self, AccountProbe, Burns};
 use arena_core::fleet::{self, FleetCost};
 use arena_core::health::{render_summary, PodHealth, Status};
 use arena_core::metrics::PodMetrics;
@@ -140,15 +142,46 @@ pub fn partial_notice(partial: &[String]) -> Option<String> {
         .then(|| format!(" ⚠ {} failed to list — its pods (and their cost) are missing ·", partial.join(", ")))
 }
 
+/// How often the summary bar's account balances are read: balances move slowly, and each
+/// read is an extra API call per provider on top of the per-refresh listing.
+pub const BALANCE_EVERY: Duration = Duration::from_secs(5 * 60);
+
+/// The last read of the provider accounts (every [`BALANCE_EVERY`]) and the warning
+/// threshold it is judged against.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BalanceRead {
+    pub probes: Vec<AccountProbe>,
+    pub warn_hours: f64,
+}
+
+impl BalanceRead {
+    /// The summary bar's balance — `pods list`'s footer line ([`balance::compact`]) — and
+    /// whether an account needs a top-up. The runway is judged against `burns`, the fleet
+    /// as last listed (`None` before the first listing: unknown, never "not burning").
+    /// `None` when no provider account is configured.
+    pub fn line(&self, burns: Option<&Burns>, now: u64) -> Option<(String, bool)> {
+        let unknown = Burns::unknown();
+        balance::compact(&balance::report(&self.probes, burns.unwrap_or(&unknown), self.warn_hours, now))
+    }
+}
+
+/// The summary bar's balance when an account needs a top-up: said right after any
+/// [`partial_notice`], ahead of the counts, so a narrow terminal can't cut it off.
+pub fn balance_notice(balance: Option<&(String, bool)>) -> Option<String> {
+    balance.filter(|(_, warn)| *warn).map(|(line, _)| format!(" {line} ·"))
+}
+
 /// The summary bar: when a provider failed to list, [`partial_notice`] **first** — the bar
 /// is one unwrapped line and its tail is cut on anything narrower than ~160 columns, so a
-/// warning at the end would be invisible exactly when it matters —, then pod/GPU/util
-/// counts from the probes, then the fleet's burn exactly as `pods list`'s footer words it
-/// ([`fleet::fleet_footer`]: billing pods only, `$` and Hetzner's `€` kept apart, unpriced
-/// pods called out), and the same per day.
-pub fn summary_text(s: &FleetSummary, cost: &FleetCost, partial: &[String]) -> String {
+/// warning at the end would be invisible exactly when it matters —, then a [`balance_notice`]
+/// when an account is about to run dry, then pod/GPU/util counts from the probes, then the
+/// fleet's burn exactly as `pods list`'s footer words it ([`fleet::fleet_footer`]: billing
+/// pods only, `$` and Hetzner's `€` kept apart, unpriced pods called out), the same per
+/// day, and last the balance when it needs nothing (`balance: runpod $32.54 ~65h · …`).
+pub fn summary_text(s: &FleetSummary, cost: &FleetCost, partial: &[String], balance: Option<&(String, bool)>) -> String {
     let util = s.mean_util.map(|u| format!("{u}%")).unwrap_or_else(|| "-".into());
     let mut out = partial_notice(partial).unwrap_or_default();
+    out.push_str(&balance_notice(balance).unwrap_or_default());
     out.push_str(&format!(" {} pods · {} GPUs · mean util {util} · {}", s.pods, s.total_gpus, fleet::fleet_footer(cost)));
     let mut per_day = Vec::new();
     if cost.priced_usd > 0 {
@@ -162,6 +195,9 @@ pub fn summary_text(s: &FleetSummary, cost: &FleetCost, partial: &[String]) -> S
     }
     if s.unreachable > 0 {
         out.push_str(&format!("  ·  {} unreachable", s.unreachable));
+    }
+    if let Some((line, false)) = balance {
+        out.push_str(&format!("  ·  {line}"));
     }
     out
 }
@@ -933,12 +969,12 @@ mod tests {
         let s = summarize(&pods, &HashMap::new());
         let cost = fleet::fleet_cost(&pods);
         assert_eq!(
-            summary_text(&s, &cost, &[]),
+            summary_text(&s, &cost, &[], None),
             " 5 pods · 0 GPUs · mean util - · fleet: $0.60/h across 4 billing pod(s) + €0.006/h hetzner (1 unpriced) \
              ≈ $14.40/day + €0.13/day"
         );
         // A provider that failed to list leads the bar (its tail is cut on narrow terminals).
-        let partial = summary_text(&s, &cost, &["vast".to_string(), "hetzner".to_string()]);
+        let partial = summary_text(&s, &cost, &["vast".to_string(), "hetzner".to_string()], None);
         assert!(
             partial.starts_with(" ⚠ vast, hetzner failed to list — its pods (and their cost) are missing · 5 pods · "),
             "{partial}"
@@ -946,8 +982,55 @@ mod tests {
         assert!(partial.ends_with(" ≈ $14.40/day + €0.13/day"), "{partial}");
         assert_eq!(partial_notice(&[]), None);
         // Nothing billing: no per-day figure.
-        let idle = summary_text(&FleetSummary::default(), &fleet::fleet_cost(&[]), &[]);
+        let idle = summary_text(&FleetSummary::default(), &fleet::fleet_cost(&[]), &[], None);
         assert_eq!(idle, " 0 pods · 0 GPUs · mean util - · fleet: $0.00/h across 0 billing pod(s)");
+    }
+
+    /// The account balance in the summary bar: at the end while it needs nothing, right after
+    /// a failed-listing notice (ahead of the counts) when an account needs a top-up — and
+    /// judged against the fleet as listed: unknown until there is a listing, a failed
+    /// provider's runway unknown, never "not burning".
+    #[test]
+    fn the_balance_sits_at_the_end_until_it_needs_a_top_up() {
+        use arena_core::balance::Account;
+        let prepaid = |provider: &str, b: f64, rate: Option<f64>| AccountProbe {
+            provider: provider.into(),
+            account: Ok(Account::Prepaid { balance: b, provider_per_hr: rate, spend_limit_per_hr: None, under_balance: None, owed: None }),
+        };
+        const NOW: u64 = 1_791_460_800;
+        let pods = [pod("arena8-apple", Some(0.40)), pod("arena8-bloom", Some(0.10))];
+        let burns = balance::burns(&pods, &[]);
+        let read = |b: f64| BalanceRead { probes: vec![prepaid("runpod", b, Some(0.0)), prepaid("vast", 90.0, None)], warn_hours: 48.0 };
+        // (balance, burns, line, needs a top-up)
+        let cases = [
+            (500.0, Some(&burns), "balance: runpod $500.00 ~41d · vast $90.00 no billing pods", false),
+            (10.0, Some(&burns), "balance: ⚠ runpod $10.00 ~20h · vast $90.00 no billing pods", true),
+            // No listing yet: RunPod's own rate (0) says it isn't burning; Vast's is unknown.
+            (500.0, None, "balance: runpod $500.00 not burning · vast $90.00 ?", false),
+        ];
+        for (b, burns, want, warn) in cases {
+            assert_eq!(read(b).line(burns, NOW), Some((want.to_string(), warn)), "{b}");
+        }
+        let failed = balance::burns(&pods, &["vast".to_string()]);
+        assert_eq!(read(500.0).line(Some(&failed), NOW).unwrap().0, "balance: runpod $500.00 ~41d · vast $90.00 ?");
+        assert_eq!(BalanceRead { probes: Vec::new(), warn_hours: 48.0 }.line(Some(&burns), NOW), None, "no keys, no balance");
+
+        let s = summarize(&pods, &HashMap::new());
+        let cost = fleet::fleet_cost(&pods);
+        let fine = read(500.0).line(Some(&burns), NOW);
+        let text = summary_text(&s, &cost, &[], fine.as_ref());
+        assert!(text.starts_with(" 2 pods · ") && text.ends_with("  ·  balance: runpod $500.00 ~41d · vast $90.00 no billing pods"), "{text}");
+        let low = read(10.0).line(Some(&burns), NOW);
+        let text = summary_text(&s, &cost, &["hetzner".to_string()], low.as_ref());
+        assert!(
+            text.starts_with(
+                " ⚠ hetzner failed to list — its pods (and their cost) are missing · balance: ⚠ runpod $10.00 ~20h · vast $90.00 \
+                 no billing pods · 2 pods · "
+            ),
+            "{text}"
+        );
+        assert!(!text.ends_with("no billing pods"), "said once, at the front: {text}");
+        assert_eq!(balance_notice(fine.as_ref()), None);
     }
 
     #[test]

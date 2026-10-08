@@ -24,7 +24,7 @@ const BASE: &str = "https://rest.runpod.io/v1";
 /// the `?api_key=` query param RunPod also accepts: reqwest's error `Display` includes the
 /// request URL, so with the key in the URL any network error (timeout, DNS, TLS, a bad
 /// JSON body) would print the secret verbatim to the terminal/cron logs.
-const GRAPHQL: &str = "https://api.runpod.io/graphql";
+pub(crate) const GRAPHQL: &str = "https://api.runpod.io/graphql";
 
 /// Build a GraphQL POST (bearer auth, key never in the URL). Separate from sending so a
 /// test can assert on the built request without a network call.
@@ -43,7 +43,7 @@ async fn graphql(client: &Client, api_key: &str, body: &Value, ctx: &str) -> Res
 /// The GraphQL-level errors in a response, as one message (`None` when there are none —
 /// absent, `null`, or an empty array). Messages are joined; anything unexpected is shown
 /// raw, clipped, so a long error body can't flood the terminal.
-fn graphql_errors(v: &Value) -> Option<String> {
+pub(crate) fn graphql_errors(v: &Value) -> Option<String> {
     let errors = v.get("errors").filter(|e| !e.is_null())?;
     if errors.as_array().is_some_and(|a| a.is_empty()) {
         return None;
@@ -408,7 +408,7 @@ pub(super) fn loose_string(v: &Value) -> Option<String> {
 /// A number from a JSON number or numeric string. RunPod doesn't document these GraphQL
 /// scalar types (some APIs send decimals as strings), so accept either rather than lose
 /// a price to a representation change.
-pub(super) fn loose_f64(v: &Value) -> Option<f64> {
+pub(crate) fn loose_f64(v: &Value) -> Option<f64> {
     match v {
         Value::Number(n) => n.as_f64(),
         Value::String(s) => s.trim().parse().ok(),

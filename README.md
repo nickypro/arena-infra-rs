@@ -58,6 +58,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     pod, and the allowlisted `PublicSnapshot` for the web page.
   - `teardown` — the pure judge behind `teardown --check`: listings, volumes, keys, cron/`at`
     and proxy inputs in, a `✓ ✗ ? –` checklist with fix commands out (unknown ≠ empty).
+  - `balance` — provider account balances (RunPod GraphQL `myself`, Vast `users/current`;
+    Hetzner postpaid) judged against the burn into a runway; `idle` — the read-only
+    `pods idle` probe script, its reply parser and the verdict/report (unknown ≠ idle).
   - `proxy` — port-forwarding planner. Pods are reached over SSH (VS Code
     Remote-SSH), and the provider reassigns a pod's SSH endpoint on restart, so the
     proxy host gives each machine a *stable* public port (`cute.sus.cat:7000`, …)
@@ -87,7 +90,10 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     running or on its way up — RunPod v2 `PROVISIONING`/`STARTING`/`ERROR` too, Hetzner
     `initializing`, Vast `loading` — not `EXITED`/`STOPPED`/`TERMINATED`/`off`; a Hetzner
     server bills while it exists, powered off included. A non-billing pod's `$/H` shows `-`
-    (`--json` keeps the raw `cost_per_hr`). GPU/$/maintenance come from one extra read-only
+    (`--json` keeps the raw `cost_per_hr`). Under the footer (table only) one
+    `balance: runpod $32.54 ~65h · vast $136.87 no billing pods · hetzner postpaid` line plus
+    any ⚠ (see `balance`), read while the list runs — best-effort, each account within 15 s,
+    never failing the list. GPU/$/maintenance come from one extra read-only
     RunPod GraphQL query per `list` (best-effort: if it fails you get one warning line and
     the list still renders); the `nvidia-smi` probe over SSH (default for the table,
     `--probe`/`--no-probe`) overrides the GPU when a pod answers. `list --json` emits the
@@ -391,6 +397,37 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     are read (not root's, not `/etc/cron.d`); shown commands have secret-looking values
     redacted (`NAME=…`, `--flag=…`/`--flag …` named key/token/secret/pass, `sk-`/`rpa_`/`hf_`
     words; tab-separated fields too). `--json` = the same checklist for scripts.
+    After the checklist (text only) come the provider account balances — informational, never
+    part of the verdict or the exit: what's left, and whether RunPod still reports spend.
+  - `balance [--json]` — money left on each provider account and how long it lasts
+    (read-only). **RunPod** via GraphQL `myself { clientBalance currentSpendPerHr spendLimit
+    underBalance }` (REST v2 has billing history only; if GraphQL goes away the balance reads
+    "unavailable" and nothing else breaks); **Vast** `GET /api/v0/users/current/` → `credit`
+    (the prepaid amount the console shows; a negative `balance` is shown as possibly owed,
+    never folded in; that body carries the email and API key, so only those two fields are
+    read and it is never quoted); **Hetzner** is postpaid — said, no number. Burn = the higher
+    of the provider's own rate and this fleet's billing pods there (a provider that failed to
+    list, with no rate of its own, is `?` — never "not burning"); runway = balance ÷ burn, with
+    the date it runs out. Below `BALANCE_WARN_HOURS` (default 48; `0` = runway warning off; a
+    malformed value is an error here, the default elsewhere) — or at zero, or RunPod's
+    `underBalance` — a row is a ⚠ (`top up … before it stops every pod`). Exits non-zero when
+    an account needs a top-up or couldn't be read (`arena balance || <alert>` from cron).
+    Never shows account ids or emails. Each account read ≤ 20 s, status-first.
+  - `pods idle [targets] [--hours N] [--json]` — which pods look abandoned: a **read-only
+    report that never acts**. One bounded probe per billing pod (60 s; POSIX `sh`, writes
+    nothing): established inbound connections from `/proc/net/tcp{,6}` — SSH sessions on
+    sshd's port (VS Code Remote-SSH counts; the probe's own, identified by `$SSH_CONNECTION`,
+    is left out) and non-loopback ones to any other listening port (Jupyter through the
+    provider's proxy) —, GPU util (busiest of 3 `nvidia-smi` samples) + memory, the newest
+    file mtime under the home and `BACKUP_REPO_PATH` (`find` ≤ 20 s, skipping `.git`, caches,
+    editor servers, package dirs) and PID 1's age, all on the pod's own clock. A table, then
+    the **candidates** — idle by every measure for `--hours` (default 6: no connection, GPU
+    ≤ 5 %, no file change, up that long), this cohort's machines only (a staff `@` box or
+    another prefix is named, never given a command) — with what they cost and the exact
+    commands to run, **printed, not run**: `arena pods backup <name>` then `arena pods
+    terminate <name>` (the id when a name is shared). Anything unreadable (no reply, a scan
+    that timed out, `[N/A]` GPU, our own connection not found) makes a pod `?`, never a
+    candidate. Not seen: sessions through RunPod's `ssh.runpod.io` proxy (not via sshd).
   - `pods pull [label]` — the **file** backup (complementing the git `backup`): rsyncs
     each pod's home into `<dir>/<label>/<pod>/`, reporting files/bytes moved per pod.
     **Keeps `.git`** (so the backup is a usable repo; `--no-git` to skip), size-caps with
@@ -503,7 +540,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     no forward, `?` remote proxy. The **summary bar** is `pods list`'s footer (`$` and
     Hetzner `€` kept apart, unpriced pods counted) plus per day, **led** by a yellow
     `⚠ vast failed to list — its pods (and their cost) are missing` when a provider didn't
-    answer (first, so a narrow terminal can't cut it off). API calls per refresh are
+    answer (first, so a narrow terminal can't cut it off), and ending with the account
+    balance (`arena balance`'s one-liner, read every 5 min in its own task; when an account
+    needs a top-up it moves to the front, in red). API calls per refresh are
     unchanged (one list per provider); the details query (GPU/$/maintenance) runs every
     60 s or on `r` (≥10 s apart); one that fails part-way still shows what it filled (as
     `pods list` does) over the last good answer, with a footer warning.
