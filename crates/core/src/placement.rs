@@ -205,8 +205,8 @@ impl PriceBook {
     }
 
     /// Vast: `per_pod` = each GPU option's cheapest matching offer right now, $/h for the
-    /// whole pod (the search asks for exactly `gpu_count` GPUs, and the offer's `dph_total`
-    /// includes the disk asked for). Kept per GPU like the catalog prices, so `plan_options`
+    /// whole pod (the search asks for exactly `gpu_count` GPUs, and the offer's price
+    /// includes the disk asked for: `provider::vast::Offer::price`). Kept per GPU like the catalog prices, so `plan_options`
     /// prices and caps it the same way. Live, but a snapshot: each create searches again and
     /// rents the cheapest offer *then* — never above `--max-price` ([`PodSpec::max_price`]).
     pub fn offers(per_pod: Vec<(String, f64)>, gpu_count: u32) -> Self {

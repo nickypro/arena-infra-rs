@@ -163,6 +163,7 @@ fn parse_pod(v: &Value) -> Pod {
         ssh_ip,
         ssh_port,
         maintenance: None,
+        machine_id: None,
     }
 }
 

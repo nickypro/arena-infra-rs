@@ -9,7 +9,7 @@
       "intended_status": "running",
       "next_state": "running",
       "status_msg": "success, running vastai/base-image",
-      "image_runtype": "ssh_direct",
+      "image_runtype": "ssh_direc ssh_proxy",
       "gpu_name": "RTX 3090",
       "num_gpus": 1,
       "dph_total": 0.11466666666666667,
@@ -49,7 +49,7 @@
       "cur_state": "running",
       "intended_status": "running",
       "status_msg": "Pulling image",
-      "image_runtype": "ssh_direct",
+      "image_runtype": "ssh_direc ssh_proxy",
       "gpu_name": "RTX 3090",
       "num_gpus": 2,
       "dph_total": 0.22,
@@ -57,7 +57,8 @@
       "ports": null,
       "ssh_host": "ssh7.vast.ai",
       "ssh_idx": "7",
-      "ssh_port": 31003
+      "ssh_port": 31003,
+      "machine_id": "31542"
     },
     {
       "id": 26001004,
@@ -80,14 +81,17 @@
       "actual_status": "exited",
       "cur_state": "stopped",
       "intended_status": "stopped",
-      "image_runtype": "ssh_direct",
+      "image_runtype": "ssh_direc ssh_proxy",
       "gpu_name": "RTX 3090",
       "num_gpus": 1,
       "dph_total": 0.004,
       "public_ipaddr": "124.123.111.26",
       "ports": {"22/tcp": [{"HostIp": "0.0.0.0", "HostPort": 40200}]},
       "ssh_host": "ssh5.vast.ai",
-      "ssh_port": 21005
+      "ssh_port": 21005,
+      "direct_port_start": 40200,
+      "direct_port_end": 40455,
+      "machine_id": 31541
     }
   ]
 }

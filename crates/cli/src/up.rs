@@ -189,8 +189,8 @@ struct Shared<'r, 'a> {
     waiters: AtomicUsize,
     /// One proxy writer at a time.
     proxy_gate: tokio::sync::Mutex<()>,
-    /// Machine IPs that failed the deep check this run (any name's: a bad host breaks every
-    /// pod on it).
+    /// Machines ([`health::host_key`]) that failed the deep check this run (any name's: a bad
+    /// host breaks every pod on it).
     failed_hosts: Mutex<Vec<String>>,
     /// The provider's pod details for the deep checks, and when they were fetched.
     details: tokio::sync::Mutex<Option<(Instant, Vec<Pod>)>>,
@@ -408,7 +408,7 @@ impl Shared<'_, '_> {
             }
             Some(Some(pod)) => pod,
         };
-        let host = health::host_ip(&pod);
+        let host = health::host_key(&pod);
         if let Some(a) = run.attempts.last_mut() {
             a.host = host.clone();
         }
@@ -422,8 +422,10 @@ impl Shared<'_, '_> {
             ),
         );
 
-        // A replacement on a machine that already failed the check: "same IP → same machine,
-        // the rebuild fixed nothing" — reject it before spending setup and a check on it.
+        // A replacement on a machine that already failed the check: "same machine, the
+        // rebuild fixed nothing" — reject it before spending setup and a check on it. Only a
+        // real machine identity counts (`host_key`: never a Vast IP, which several machines
+        // can share).
         if n > 1 && pipeline::on_failed_host(host.as_deref(), &self.failed_hosts.lock().unwrap()) {
             let ip = host.unwrap_or_default();
             if let Some(a) = run.attempts.last_mut() {
@@ -1050,6 +1052,9 @@ mod tests {
         dry_until: Mutex<Option<(String, Instant)>>,
         /// Can re-attach SSH keys through its API (like Vast); records `authorize <id> <n>`.
         attaches: bool,
+        /// Vast-like machines: while any are left, each create takes the next machine id and
+        /// its pod is tagged `vast` (so only that id names its machine, never its IP).
+        machines: Mutex<VecDeque<String>>,
     }
 
     /// A pod in the fake: its endpoint from `from`; listed until `gone_at`.
@@ -1130,7 +1135,7 @@ mod tests {
             let Some((ip, port, after)) = self.endpoints.lock().unwrap().get_mut(&spec.name).and_then(VecDeque::pop_front) else {
                 return Err(Error::capacity("create pod HTTP 500: There are no instances currently available"));
             };
-            let pod = Pod {
+            let mut pod = Pod {
                 id: format!("id{}", self.next_id.fetch_add(1, Ordering::SeqCst) + 1),
                 name: spec.name.clone(),
                 provider: "runpod".into(),
@@ -1140,6 +1145,9 @@ mod tests {
                 cost_per_hr: Some(0.17),
                 ..Default::default()
             };
+            if let Some(machine) = self.machines.lock().unwrap().pop_front() {
+                (pod.provider, pod.machine_id) = ("vast".into(), Some(machine));
+            }
             pods.push(Slot { pod: pod.clone(), from: Instant::now() + after, ip, port, gone_at: None });
             Ok(pod)
         }
@@ -1540,6 +1548,47 @@ mod tests {
         let ends: Vec<(AttemptEnd, bool)> = row.attempts.iter().map(|a| (a.end.clone(), a.terminated)).collect();
         assert!(matches!(&ends[..], [(AttemptEnd::CheckFailed(_), true), (AttemptEnd::SameHost, true), (AttemptEnd::Kept, false)]), "{ends:?}");
         assert_eq!(row.attempts[1].host.as_deref(), Some("10.0.0.1"));
+    }
+
+    /// Vast: the machine id, not the IP, says which machine a replacement landed on. A host
+    /// often runs several machines behind one public IP — a replacement there on another
+    /// machine is kept and checked; one back on the failed machine, whatever its IP, is not.
+    #[tokio::test(start_paused = true)]
+    async fn on_vast_the_machine_id_not_the_ip_names_the_failed_machine() {
+        let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 0), ("10.0.0.1", 22002, 0)])]);
+        fleet.machines.lock().unwrap().extend(["100".to_string(), "200".to_string()]);
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host("10.0.0.1", 22001), [FakeReply::ok(), FakeReply::ok(), bad_host()]);
+        fake.script(&host("10.0.0.1", 22002), [FakeReply::ok(), FakeReply::ok(), healthy()]);
+        let cfg = cfg(None);
+        let run = up_run(&fleet, fake.clone(), &cfg, true, Some(3), None).await;
+        let made = make(&fleet, &["apple"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+        assert_eq!(
+            fleet.events(),
+            [format!("create devtest-apple {A4000}"), "terminate id1".to_string(), format!("create devtest-apple {R3090}")],
+            "the same IP on another machine is no reason to reject"
+        );
+        assert_eq!(rows[0].verdict, Verdict::Ready);
+        let hosts: Vec<Option<&str>> = rows[0].attempts.iter().map(|a| a.host.as_deref()).collect();
+        assert_eq!(hosts, [Some("vast machine 100"), Some("vast machine 200")]);
+        assert!(!fake.calls_to(&host("10.0.0.1", 22002)).is_empty(), "set up and checked");
+
+        // Back on machine 100 behind another IP: rejected unseen.
+        let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 0), ("10.0.0.9", 22009, 0), ("10.0.0.3", 22003, 0)])]);
+        fleet.machines.lock().unwrap().extend(["100", "100", "300"].map(String::from));
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host("10.0.0.1", 22001), [FakeReply::ok(), FakeReply::ok(), bad_host()]);
+        fake.script(&host("10.0.0.3", 22003), [FakeReply::ok(), FakeReply::ok(), healthy()]);
+        let run = up_run(&fleet, fake.clone(), &cfg, true, Some(3), None).await;
+        let made = make(&fleet, &["apple"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+        assert_eq!(fleet.events()[3], "terminate id2");
+        lines.find("[devtest-apple] landed on vast machine 100, a machine that already failed the deep check — rejecting it");
+        assert!(fake.calls_to(&host("10.0.0.9", 22009)).is_empty(), "the rejected pod is never set up or checked");
+        assert_eq!(rows[0].verdict, Verdict::Ready);
     }
 
     #[tokio::test(start_paused = true)]

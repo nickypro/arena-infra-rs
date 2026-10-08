@@ -26,6 +26,13 @@ pub struct Pod {
     /// maintenance will be stopped by the provider, so this is surfaced in `pods list`.
     #[serde(default)]
     pub maintenance: Option<Maintenance>,
+    /// The provider's id for the physical machine the pod runs on, where it reports one
+    /// (Vast's `machine_id`). What names the host for the same-host checks
+    /// ([`crate::health::host_key`]) where the IP can't: several Vast machines can sit behind
+    /// one public IP, each with its own port range. `None` = not reported. Left out of the
+    /// JSON when unknown, so other providers' `pods list --json` is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
 }
 
 /// A provider-reported maintenance window for the host a pod runs on. Times are kept as
@@ -133,6 +140,7 @@ mod tests {
                     end: Some("2026-10-09T06:00:00Z".into()),
                     note: Some("host upgrade".into()),
                 }),
+                machine_id: None,
             },
             Pod { id: "1".into(), name: "devtest-flutter".into(), provider: "hetzner".into(), ..Default::default() },
         ];

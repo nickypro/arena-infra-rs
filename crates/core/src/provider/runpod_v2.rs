@@ -279,6 +279,7 @@ fn parse_pod(v: &Value) -> Pod {
         ssh_ip,
         ssh_port,
         maintenance: None, // GraphQL-only, see `enrich`
+        machine_id: None,
     }
 }
 
@@ -671,6 +672,7 @@ mod tests {
                 ssh_ip: Some("195.26.233.3".into()),
                 ssh_port: Some(34446),
                 maintenance: None,
+                machine_id: None,
             }
         );
     }

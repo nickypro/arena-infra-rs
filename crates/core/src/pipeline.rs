@@ -98,7 +98,8 @@ pub struct Attempt {
     /// The option it was created on, e.g. `1×RTX A4000 COMMUNITY`.
     pub option: String,
     pub pod_id: String,
-    /// The machine IP ([`crate::health::host_ip`]) once its endpoint was known.
+    /// The machine ([`crate::health::host_key`]: its IP, or the provider's machine id) once
+    /// its endpoint was known.
     pub host: Option<String>,
     pub end: AttemptEnd,
     /// We terminated it (only ever to make room for its replacement).
@@ -117,9 +118,10 @@ pub fn replacement_order(options: usize, failed: &[usize]) -> Vec<usize> {
 }
 
 /// Whether a pod on `host` sits on a machine that already failed the deep check this run —
-/// any name's, since a bad host breaks every pod on it. An unknown host (no endpoint yet,
-/// or one that isn't the machine's own IP, like a Vast pod reached through Vast's shared SSH
-/// proxy) is never rejected: a false "same host" would throw away a good pod. Pure.
+/// any name's, since a bad host breaks every pod on it. An unknown host (no endpoint yet, or
+/// nothing that names the machine — a proxy hostname, a Vast IP without Vast's machine id;
+/// see [`crate::health::host_key`]) is never rejected: a false "same host" would throw away
+/// a good pod. Pure.
 pub fn on_failed_host(host: Option<&str>, failed_hosts: &[String]) -> bool {
     host.is_some_and(|h| !h.is_empty() && failed_hosts.iter().any(|f| f == h))
 }
@@ -276,7 +278,7 @@ mod tests {
         assert!(on_failed_host(Some("10.0.0.1"), &failed));
         assert!(on_failed_host(Some("10.0.0.7"), &failed));
         assert!(!on_failed_host(Some("10.0.0.2"), &failed));
-        // Unknown (no endpoint, or not the machine's IP — `host_ip` gives None) is never a match.
+        // Unknown (no endpoint, or nothing naming the machine — `host_key` gives None) never matches.
         assert!(!on_failed_host(None, &failed));
         assert!(!on_failed_host(Some(""), &["".to_string()]));
         assert!(!on_failed_host(Some("10.0.0.1"), &[]));

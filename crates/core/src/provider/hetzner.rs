@@ -144,6 +144,7 @@ fn parse_server(v: &Value) -> Pod {
         // CPU VMs: no GPUs, and Hetzner has no per-server maintenance window in the API.
         gpu_count: None,
         maintenance: None,
+        machine_id: None,
     }
 }
 

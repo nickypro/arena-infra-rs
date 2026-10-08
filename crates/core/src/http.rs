@@ -83,12 +83,24 @@ pub(crate) fn status_error(status: StatusCode, text: &str, ctx: &str) -> Error {
 /// A tiny one-shot HTTP server on 127.0.0.1 for tests: answers each connection with the next
 /// canned response, so a backend's real request/response path (status-first reading) runs
 /// end to end without leaving the machine. std-only (a thread + `TcpListener`) — no extra
-/// tokio features, no mock-server crate.
+/// tokio features, no mock-server crate. It records each request's line and body, and can
+/// also misbehave the ways a network does ([`hang_up`], [`stall`]).
 #[cfg(test)]
 pub(crate) mod test_server {
     use std::io::{BufRead, BufReader, Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
+
+    /// What the server does once it has read a request.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Then {
+        /// Send the canned response.
+        Reply,
+        /// Close the connection without a word: the request was sent, its answer never comes.
+        HangUp,
+        /// Keep the connection open and never answer (until the [`Server`] is dropped).
+        Stall,
+    }
 
     /// One canned response.
     #[derive(Clone)]
@@ -96,16 +108,31 @@ pub(crate) mod test_server {
         pub status: u16,
         pub content_type: &'static str,
         pub body: String,
+        pub then: Then,
     }
 
     pub fn canned(status: u16, content_type: &'static str, body: &str) -> Canned {
-        Canned { status, content_type, body: body.to_string() }
+        Canned { status, content_type, body: body.to_string(), then: Then::Reply }
     }
 
-    /// A running server: its base URL, and the request lines it has seen (`GET /pods`).
+    /// Read the request, then close the connection without answering.
+    pub fn hang_up() -> Canned {
+        Canned { then: Then::HangUp, ..canned(0, "", "") }
+    }
+
+    /// Read the request, then never answer.
+    pub fn stall() -> Canned {
+        Canned { then: Then::Stall, ..canned(0, "", "") }
+    }
+
+    /// A running server: its base URL, the request lines it has seen (`GET /pods`), and each
+    /// request's body (as text, `""` for none), in the same order.
     pub struct Server {
         pub base: String,
         pub requests: Arc<Mutex<Vec<String>>>,
+        pub bodies: Arc<Mutex<Vec<String>>>,
+        /// Stalled connections, held open for as long as the server lives.
+        _held: Arc<Mutex<Vec<TcpStream>>>,
     }
 
     /// Serve `responses` in order, one per connection, then stop accepting.
@@ -113,7 +140,9 @@ pub(crate) mod test_server {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
         let base = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let seen = requests.clone();
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let held = Arc::new(Mutex::new(Vec::new()));
+        let (seen, seen_bodies, holding) = (requests.clone(), bodies.clone(), held.clone());
         std::thread::spawn(move || {
             for r in responses {
                 let Ok((stream, _)) = listener.accept() else { return };
@@ -134,19 +163,26 @@ pub(crate) mod test_server {
                 }
                 let mut body = vec![0u8; len];
                 let _ = reader.read_exact(&mut body);
-                let reply = format!(
-                    "HTTP/1.1 {} X\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    r.status,
-                    r.content_type,
-                    r.body.len(),
-                    r.body
-                );
+                seen_bodies.lock().unwrap().push(String::from_utf8_lossy(&body).into_owned());
                 let mut stream = reader.into_inner();
-                let _ = stream.write_all(reply.as_bytes());
-                let _ = stream.flush();
+                match r.then {
+                    Then::HangUp => drop(stream),
+                    Then::Stall => holding.lock().unwrap().push(stream),
+                    Then::Reply => {
+                        let reply = format!(
+                            "HTTP/1.1 {} X\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            r.status,
+                            r.content_type,
+                            r.body.len(),
+                            r.body
+                        );
+                        let _ = stream.write_all(reply.as_bytes());
+                        let _ = stream.flush();
+                    }
+                }
             }
         });
-        Server { base, requests }
+        Server { base, requests, bodies, _held: held }
     }
 
     /// A client that never uses a system proxy (an `HTTP_PROXY` in the test environment

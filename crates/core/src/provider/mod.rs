@@ -82,7 +82,7 @@ pub fn build(name: &str, cfg: &Config) -> Result<Box<dyn Provider>> {
                 RunpodApi::V2 => Box::new(runpod_v2::RunpodV2Provider::new(key)),
             })
         }
-        "vast" => Ok(Box::new(vast::VastProvider::new(cfg.require("VAST_API_KEY")?))),
+        "vast" => Ok(Box::new(vast::VastProvider::from_config(cfg)?)),
         "hetzner" => {
             let opts = hetzner::HetznerOpts {
                 // cx23: newest Intel x86 shared gen (the old cx/cax lines had poor

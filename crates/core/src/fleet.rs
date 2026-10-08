@@ -452,6 +452,7 @@ mod tests {
                     Some("2026-10-09T06:00:00Z"),
                     None,
                 )),
+                machine_id: None,
             },
             Pod {
                 id: "def456".into(),

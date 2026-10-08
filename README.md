@@ -31,17 +31,23 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     *offers* rather than named pods, so `create_pod` searches the marketplace
     (`PUT /search/asks/`, filters wrapped in `{"q": …}`) for the cheapest rentable offer
     matching the spec — exact GPU count, disk, CUDA floor from `ALLOWED_CUDA_VERSIONS`, open
-    ports, and `--max-price` (checked again at create: offers move) — and rents it with
-    runtype `ssh_direct`, carrying the machine name as the instance `label`. GPU types map
+    ports, **verified hosts only** (the vast CLI's base filters; `VAST_ALLOW_UNVERIFIED=1`
+    admits unverified/deverified hosts — the verified market for a card can be empty), and
+    `--max-price` (checked again at create: offers move) — and rents it with runtype
+    `ssh_direc ssh_proxy` (what the vast CLI sends for `--ssh --direct`), carrying the machine
+    name as the instance `label`. An offer's price is what it bills with *our* disk: the
+    larger of `dph_total` and `dph_base` + `storage_cost` for `DISK_GB`. GPU types map
     to Vast's spaced display names (`NVIDIA GeForce RTX 3090` → `RTX 3090`, `RTX 4000 Ada
     Generation` → `RTX 4000Ada`; `RTX_3090` finds nothing). Vast's SSH launcher replaces
     the image's entrypoint; the cohort keys are attached to **each instance**
     (`POST /instances/{id}/ssh/`, idempotent) and written by its `onstart` (which also
     turns off Vast's auto-tmux) — never registered on the Vast account. Pods are listed
     with the **direct** SSH endpoint (host IP + mapped 22), falling back to Vast's SSH proxy
-    only for a running instance without one. A taken offer (`no_such_ask`, 410, already
-    rented) is capacity, so placement moves on; a rent whose outcome is unclear (5xx, no
-    instance id) stops the run rather than risk a second instance.
+    only for a running instance without one, and carry Vast's `machine_id`. A taken offer
+    (`no_such_ask`, 410, "not your own") rents nothing, so the next fitting offer is tried
+    (3 at most), then placement moves on; any other refusal stops, and so does a rent whose
+    outcome is unclear (any 5xx, no instance id, the connection lost after sending) — rather
+    than risk a second instance. The key attach after a rent is bounded (60s).
   - `provider::hetzner` — Hetzner Cloud backend for **CPU-only** VMs. Not a GPU
     container host, so it ignores the GPU-centric `PodSpec` fields and takes its
     sizing/OS/location/SSH-keys from `HETZNER_*` config. VMs come up on a real public
@@ -152,7 +158,7 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     ($0.22/h) (after 1×RTX A4000 COMMUNITY: capacity)` or `not placed (tried: …)`. Cloud
     tiers exist only on RunPod (Vast/Hetzner collapse them, and Hetzner the GPU list too,
     with a note). Vast options are priced **live**: one marketplace search per GPU (needs
-    `VAST_API_KEY`), the cheapest fitting offer's `dph_total` for the disk asked for — a
+    `VAST_API_KEY`), the cheapest fitting offer's price for the disk asked for — a
     snapshot, since each create searches again (never above `--max-price`); a GPU with no
     offer right now is unpriced, with a note. Hetzner's option is unpriced.
     `--keep-trying` stays single-option (use `--retry-mins`). One `--gpu`, one `--cloud` and
@@ -295,9 +301,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     provider only: a RunPod/Vast pod the API reports with 0 GPUs still gets them, plus a
     `provider` warning). Output: a
     `NAME RESULT GPUS DRIVER CUDA NET NOTES` table, `-v` lists every check, and a `same
-    host?` line when ≥2 failing pods share a machine IP (a bad host breaks every pod on it;
-    Vast pods count by their host's direct IP — one reached only through Vast's SSH proxy
-    hostname is never grouped).
+    host?` line when ≥2 failing pods share a machine (a bad host breaks every pod on it): its
+    IP, or on Vast its `machine_id` — never a Vast IP, which several machines can share; `up
+    --check` rejects a replacement on a failed machine by the same rule).
     `--json` prints per-pod `{id, name, provider, status, checks, facts}` (no IPs) — `[]`
     when no pod could be checked; summary/notes go to stderr. Exits
     non-zero if any pod FAILs; warnings don't. Targets scope the run (a named pod with no SSH

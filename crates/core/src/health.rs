@@ -856,19 +856,31 @@ pub struct PodHealth {
     pub checks: Vec<Check>,
     /// `None` when the pod couldn't be checked at all (unreachable, timed out).
     pub facts: Option<DeepFacts>,
-    /// The pod's machine IP, for the same-host summary only (see [`host_ip`]). Not
+    /// The pod's machine, for the same-host summary only (see [`host_key`]). Not
     /// serialized: the JSON is per-pod health, and IPs are already in `pods list --json`.
     #[serde(skip)]
     pub host: Option<String>,
 }
 
-/// The IP that identifies the machine a pod runs on, for the same-host summary: its SSH
-/// IP, but only where that is the machine's own address — an IP literal. A hostname never
-/// groups: that's what a shared proxy looks like (Vast's `sshN.vast.ai`, which says nothing
-/// about the machine), and a false "same host?" would send the operator to switch GPU type
-/// for nothing. Vast pods are listed with their host's own public IP when they have direct
-/// SSH (`provider::vast`), and only fall back to the proxy hostname without it.
-pub fn host_ip(pod: &Pod) -> Option<String> {
+/// What names the machine a pod runs on, for the same-host summary and `up --check`'s
+/// rejection of a replacement that lands on a machine that already failed — `None` when
+/// nothing does. A false "same host" is the costly mistake (it sends the operator to switch
+/// GPU type for nothing, and `up` terminates a good pod), so only a real machine identity
+/// counts:
+/// - The provider's own machine id ([`Pod::machine_id`]), where it reports one — as
+///   `vast machine 31540`, so ids never collide across providers or with an IP.
+/// - Vast without one: nothing. Its IPs don't name a machine — a host often runs several
+///   machines behind one public IP, each with its own direct port range — and an endpoint
+///   on Vast's SSH proxy says nothing about the machine at all.
+/// - Elsewhere, the SSH IP where it is the machine's own address — an IP literal (RunPod's
+///   public IP). A hostname never groups: that's what a shared proxy looks like.
+pub fn host_key(pod: &Pod) -> Option<String> {
+    if let Some(id) = pod.machine_id.as_deref().map(str::trim).filter(|id| !id.is_empty()) {
+        return Some(format!("{} machine {id}", pod.provider.to_ascii_lowercase()));
+    }
+    if pod.provider.eq_ignore_ascii_case("vast") {
+        return None;
+    }
     pod.ssh_ip.as_deref().filter(|ip| ip.parse::<std::net::IpAddr>().is_ok()).map(String::from)
 }
 
@@ -893,7 +905,7 @@ impl PodHealth {
             status: overall(&checks),
             checks,
             facts: Some(facts),
-            host: host_ip(pod),
+            host: host_key(pod),
         }
     }
 
@@ -906,7 +918,7 @@ impl PodHealth {
             status: Status::Fail,
             checks: vec![Check::new("ssh", Status::Fail, why)],
             facts: None,
-            host: host_ip(pod),
+            host: host_key(pod),
         }
     }
 
@@ -1694,12 +1706,24 @@ devtest-echo   fail    -            -          -             -  ssh: exit Some(2
         let results = vec![failing(&vast("apple", "ssh4.vast.ai")), failing(&vast("bloom", "ssh4.vast.ai"))];
         assert!(same_host_failures(&results).is_empty());
         assert_eq!(render_summary(&results), ["0 pass, 0 warn, 2 fail"]);
-        // Two on the same direct host IP are (Vast lists the host's public IP for direct SSH).
+        // Nor two on one public IP: a Vast host often runs several machines behind it (each
+        // with its own port range), and a proxy address can be an IP literal too.
         let results = vec![failing(&vast("apple", "203.0.113.9")), failing(&vast("bloom", "203.0.113.9"))];
+        assert!(same_host_failures(&results).is_empty());
+        // Vast's machine id is what names the machine: same id groups (whatever the IPs),
+        // different ids behind one IP don't.
+        let on = |p: Pod, m: &str| Pod { machine_id: Some(m.into()), ..p };
+        let results = vec![
+            failing(&on(vast("apple", "203.0.113.9"), "31540")),
+            failing(&on(vast("bloom", "198.51.100.4"), "31540")),
+            failing(&on(vast("cloud", "203.0.113.9"), "31541")),
+        ];
         assert_eq!(
             same_host_failures(&results),
-            [("203.0.113.9".to_string(), vec!["devtest-apple".to_string(), "devtest-bloom".to_string()])]
+            [("vast machine 31540".to_string(), vec!["devtest-apple".to_string(), "devtest-bloom".to_string()])]
         );
+        assert_eq!(render_summary(&results)[1].split(':').next(), Some("same host? vast machine 31540"));
+        assert_eq!(host_key(&on(vast("apple", "ssh4.vast.ai"), "31540")).as_deref(), Some("vast machine 31540"));
         // A hostname (not an IP) never groups, on any provider.
         let results = vec![failing(&pod("apple", "proxy.example")), failing(&pod("bloom", "proxy.example"))];
         assert!(same_host_failures(&results).is_empty());
@@ -1709,8 +1733,9 @@ devtest-echo   fail    -            -          -             -  ssh: exit Some(2
             same_host_failures(&results),
             [("2001:db8::7".to_string(), vec!["devtest-apple".to_string(), "devtest-bloom".to_string()])]
         );
-        assert_eq!(host_ip(&pod("apple", "1.2.3.4")).as_deref(), Some("1.2.3.4"));
-        assert_eq!(host_ip(&Pod { ssh_ip: None, ..pod("apple", "") }), None);
+        assert_eq!(host_key(&pod("apple", "1.2.3.4")).as_deref(), Some("1.2.3.4"));
+        assert_eq!(host_key(&Pod { ssh_ip: None, ..pod("apple", "") }), None);
+        assert_eq!(host_key(&Pod { machine_id: Some(" ".into()), ..pod("apple", "1.2.3.4") }).as_deref(), Some("1.2.3.4"));
     }
 
     #[test]

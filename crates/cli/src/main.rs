@@ -1723,13 +1723,16 @@ async fn fetch_price_book(
     use arena_core::provider::{runpod, runpod_v2, vast, RunpodApi};
     let clouds = &req.clouds;
     if provider_name == "vast" {
-        let Some(key) = cfg.get("VAST_API_KEY").filter(|s| !s.is_empty()) else {
+        if cfg.get("VAST_API_KEY").is_none_or(str::is_empty) {
             let note = "no VAST_API_KEY — vast options are unpriced (--max-price can't check them)";
             return Ok((PriceBook::unpriced(), vec![note.into()]));
-        };
+        }
         let spec = PodSpec { gpu_count: req.gpu_count, ..base.clone() };
-        let quotes = vast::VastProvider::new(key).quote(&req.gpus, &spec, PRICE_TIMEOUT).await;
-        return Ok(vast::price_book(&quotes, req.gpu_count));
+        // Built as create builds it (`provider::build`), so the plan quotes only hosts create
+        // would rent (verified-only unless VAST_ALLOW_UNVERIFIED).
+        let vast = vast::VastProvider::from_config(cfg)?;
+        let quotes = vast.quote(&req.gpus, &spec, PRICE_TIMEOUT).await;
+        return Ok(vast::price_book(&quotes, req.gpu_count, vast.verified_only()));
     }
     if provider_name != "runpod" {
         let note = format!(
@@ -3107,6 +3110,17 @@ fn runpod_api_row(cfg: &Config) -> (String, bool) {
     }
 }
 
+/// The `config check` row for `VAST_ALLOW_UNVERIFIED`, and whether it's valid. Pure, for
+/// testing. Allowing unverified hosts is a warning: they're the flakier part of the market.
+fn vast_hosts_row(cfg: &Config) -> (String, bool) {
+    let key = "VAST_ALLOW_UNVERIFIED";
+    match arena_core::provider::vast::unverified_allowed(cfg) {
+        Ok(false) => (format!("  ✓ {key:<24} no (vast rents verified hosts only)"), true),
+        Ok(true) => (format!("  ⚠ {key:<24} yes (vast may rent unverified/deverified hosts)"), true),
+        Err(e) => (format!("  ✗ {key:<24} {e}"), false),
+    }
+}
+
 /// Print a config checklist for the selected provider + proxy + backup, never showing
 /// secret values. Returns an error if a required key is missing.
 fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
@@ -3139,6 +3153,13 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
         println!("{line}");
         if !ok {
             missing.push("RUNPOD_API (must be v1 or v2)".into());
+        }
+    }
+    if provider_name == "vast" || cfg.get("VAST_API_KEY").is_some_and(|v| !v.is_empty()) || cfg.get("VAST_ALLOW_UNVERIFIED").is_some() {
+        let (line, ok) = vast_hosts_row(cfg);
+        println!("{line}");
+        if !ok {
+            missing.push("VAST_ALLOW_UNVERIFIED (must be 1/true/yes or 0/false/no)".into());
         }
     }
     if provider_name == "hetzner" {
@@ -10234,6 +10255,17 @@ mod tests {
         // `config check` never shows secret values — not even a key pasted into RUNPOD_API.
         let (line, ok) = runpod_api_row(&Config::parse("RUNPOD_API=rpa_SECRETKEY123"));
         assert!(!ok && line.contains("✗") && !line.contains("SECRETKEY"), "{line}");
+    }
+
+    #[test]
+    fn config_check_vast_hosts_row() {
+        use super::{vast_hosts_row, Config};
+        let (line, ok) = vast_hosts_row(&Config::parse("VAST_API_KEY=k"));
+        assert!(ok && line.contains("✓") && line.contains("verified hosts only"), "{line}");
+        let (line, ok) = vast_hosts_row(&Config::parse("VAST_ALLOW_UNVERIFIED=1"));
+        assert!(ok && line.contains("⚠") && line.contains("unverified"), "{line}");
+        let (line, ok) = vast_hosts_row(&Config::parse("VAST_ALLOW_UNVERIFIED=on"));
+        assert!(!ok && line.contains("✗") && line.contains("must be"), "{line}");
     }
 
     /// `--json` on `gpus` and `pods list` is a scripting contract — pin the flag parsing
