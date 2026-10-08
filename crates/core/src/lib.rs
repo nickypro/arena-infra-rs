@@ -33,6 +33,7 @@ pub mod sshconfig;
 pub mod ssh;
 pub mod status;
 pub mod table;
+pub mod teardown;
 
 pub use config::Config;
 pub use error::{Error, ProviderErrorKind, Result};

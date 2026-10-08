@@ -19,6 +19,7 @@ use arena_core::selector::{Naming, SelectArgs, Selector};
 use arena_core::ssh::SshTarget;
 use arena_core::{Config, PodSpec};
 
+mod teardown;
 mod up;
 
 const DEFAULT_CONFIG: &str = "/home/dev/prod-ro/config.env";
@@ -137,6 +138,22 @@ enum Cmd {
         /// Also write the rendered config to this local path (else just prints it).
         #[arg(long)]
         out: Option<PathBuf>,
+    },
+    /// End-of-program teardown check (read-only): is anything still billing, or scheduled to
+    /// recreate something? Every pod on every configured provider in any state (a stopped pod
+    /// keeps its name and still bills its disk), RunPod network volumes (size, ~$/month), this
+    /// user's arena cron lines and `at` jobs, this cohort's enabled OpenRouter keys (with
+    /// usage) and the forwards left in the local proxy config — as a ✓/✗/? checklist with the
+    /// exact command that cleans up each item. Deletes nothing. Exits non-zero unless all is
+    /// clear; a source that couldn't be read is `?` (unknown), never "empty".
+    Teardown {
+        /// Run the check. Required: `teardown` itself tears nothing down — the checklist
+        /// prints the commands that do.
+        #[arg(long)]
+        check: bool,
+        /// Print the checklist as JSON (for scripts); the exit status is the same.
+        #[arg(long)]
+        json: bool,
     },
     /// The fleet in one read-only picture: `pods list`'s columns plus each pod's proxy port
     /// (live/stale) and its last `pods test --deep` / `up --check` verdict with its age (from
@@ -1949,6 +1966,7 @@ async fn main() -> Result<()> {
             handle_snapshot(provider.unwrap().as_ref(), &cfg, json, public, out.as_deref()).await
         }
         Cmd::Keys(k) => handle_keys(k, provider.unwrap().as_ref(), remote, &cfg, cli.yes).await,
+        Cmd::Teardown { check, json } => teardown::handle_teardown(provider.unwrap().as_ref(), &cfg, check, json).await,
         Cmd::Gpus { json } => handle_gpus(&cfg, &cli.provider, json).await,
         Cmd::Offers { gpu, cloud, max_price, gpus, order, json } => {
             handle_offers(&cfg, &cli.provider, gpu, cloud, max_price, gpus, order, json).await
@@ -2560,6 +2578,25 @@ fn strip_arena_block(existing: &str) -> String {
     s
 }
 
+/// The crontab's arena lines, for `cron show` and `teardown --check`: every line inside
+/// arena's managed block(s) — what `cron remove` clears — and every job line outside them that
+/// mentions arena anyway (hand-added, so `cron remove` won't touch it).
+fn arena_cron_lines(crontab: &str) -> arena_core::teardown::CronLines {
+    let mut out = arena_core::teardown::CronLines::default();
+    let mut in_block = false;
+    for line in crontab.lines() {
+        match line.trim() {
+            CRON_BEGIN => in_block = true,
+            CRON_END => in_block = false,
+            "" => {}
+            _ if in_block => out.managed.push(line.to_string()),
+            _ if arena_core::teardown::cron_line_is_arena_job(line) => out.unmanaged.push(line.to_string()),
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Build new crontab text = existing (minus old arena block) + the new arena block
 /// (empty `lines` => just remove). Other entries are preserved untouched.
 fn with_arena_block(existing: &str, lines: &[String]) -> String {
@@ -2596,12 +2633,7 @@ async fn handle_cron(cmd: CronCmd, config_path: &std::path::Path) -> Result<()> 
 
     match cmd {
         CronCmd::Show => {
-            let arena: Vec<&str> = current
-                .lines()
-                .skip_while(|l| l.trim() != CRON_BEGIN)
-                .take_while(|l| l.trim() != CRON_END)
-                .filter(|l| l.trim() != CRON_BEGIN)
-                .collect();
+            let arena = arena_cron_lines(&current).managed;
             if arena.is_empty() {
                 println!("(no arena-managed cron lines)");
             } else {
@@ -10158,6 +10190,26 @@ mod tests {
     #[test]
     fn strip_handles_no_block() {
         assert_eq!(strip_arena_block("a\nb"), "a\nb");
+    }
+
+    /// What `cron show` and `teardown --check` read: the block's lines (every block, blank
+    /// lines dropped), and outside it only *job* lines that mention arena — not comments,
+    /// not `NAME=value` settings, not other jobs.
+    #[test]
+    fn arena_cron_lines_reads_the_block_and_hand_added_arena_jobs() {
+        let tab = format!(
+            "MAILTO=ops@example.org\nPATH=/home/dev/arena/bin:/usr/bin\n# old arena job, disabled\n\
+             0 3 * * * /usr/bin/certbot renew\n{CRON_BEGIN}\n*/15 * * * * arena pods backup --yes\n\n{CRON_END}\n\
+             0 9 * * * /usr/local/bin/arena pods up -n 2 --yes\n30 2 * * * destroy_pods --yes apple\n"
+        );
+        let lines = super::arena_cron_lines(&tab);
+        assert_eq!(lines.managed, ["*/15 * * * * arena pods backup --yes"]);
+        assert_eq!(lines.unmanaged, ["0 9 * * * /usr/local/bin/arena pods up -n 2 --yes", "30 2 * * * destroy_pods --yes apple"]);
+        let none = super::arena_cron_lines("0 3 * * * /usr/bin/certbot renew\n");
+        assert!(none.managed.is_empty() && none.unmanaged.is_empty());
+        // `cron install` output reads back as exactly its lines.
+        let installed = with_arena_block("keep-me\n", &["A arena".to_string(), "B arena".to_string()]);
+        assert_eq!(super::arena_cron_lines(&installed).managed, ["A arena", "B arena"]);
     }
 
     fn cron_job(pull: bool, proxy: bool) -> Vec<String> {

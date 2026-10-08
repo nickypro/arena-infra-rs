@@ -471,6 +471,31 @@ pub async fn fetch_gpu_types(api_key: &str, cloud: &str) -> Result<Vec<GpuType>>
     parse_catalog(&body)
 }
 
+/// `GET /v2/network-volumes` (`listNetworkVolumes` in the v2 OpenAPI document): every network
+/// volume the account owns, in one unpaginated `{networkVolumes: [...]}`.
+fn volumes_request(client: &Client, api_key: &str) -> RequestBuilder {
+    api_request(client, api_key, Method::GET, base_url("network-volumes"))
+}
+
+/// Parse a `ListNetworkVolumesResponse` (`{networkVolumes: [{id, name, size, dataCenter,
+/// type}]}`). No `networkVolumes` array is an error — described by shape only, as every v2
+/// shape error — never an empty list: "no volumes" is what `teardown --check` must not guess.
+fn parse_network_volumes(body: &Value) -> Result<Vec<runpod::NetworkVolume>> {
+    body.get("networkVolumes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::provider(format!("list network volumes: unexpected response shape: {}", shape_of(body))))?
+        .iter()
+        .map(|v| runpod::parse_volume(v, "dataCenter"))
+        .collect()
+}
+
+/// Read-only: the account's network volumes over REST v2, with size, data center and tier.
+/// The v2 counterpart of [`runpod::fetch_network_volumes`] (GraphQL), which `teardown
+/// --check` falls back to if this fails.
+pub async fn fetch_network_volumes(api_key: &str) -> Result<Vec<runpod::NetworkVolume>> {
+    parse_network_volumes(&send(volumes_request(&Client::new(), api_key), "list network volumes").await?)
+}
+
 #[async_trait]
 impl Provider for RunpodV2Provider {
     fn name(&self) -> &'static str {
@@ -1094,6 +1119,36 @@ mod tests {
             Method::GET,
             "https://api.runpod.io/v2/catalog/gpus?include=AVAILABILITY&product=POD&cloud=COMMUNITY",
         );
+        check(volumes_request(&c, "rpa_SECRET"), Method::GET, "https://api.runpod.io/v2/network-volumes");
+    }
+
+    /// The `listNetworkVolumes` example from the v2 OpenAPI document, plus a standard-tier
+    /// volume; any other shape is an error (named by shape, values never echoed).
+    #[test]
+    fn network_volumes_parse_the_spec_example_and_fail_closed() {
+        let body = json!({"networkVolumes": [
+            {"id": "2q9m7x4c", "name": "training-dataset", "size": 100, "dataCenter": "US-KS-2", "type": "HIGH_PERFORMANCE"},
+            {"id": "agv6w2qcg7", "name": "my-dataset", "size": 50, "dataCenter": "EU-RO-1", "type": "STANDARD"}
+        ]});
+        let v = parse_network_volumes(&body).unwrap();
+        assert_eq!(
+            v[0],
+            runpod::NetworkVolume {
+                id: "2q9m7x4c".into(),
+                name: "training-dataset".into(),
+                size_gb: Some(100),
+                data_center: Some("US-KS-2".into()),
+                tier: Some("HIGH_PERFORMANCE".into()),
+            }
+        );
+        assert_eq!((v[1].size_gb, v[1].tier.as_deref()), (Some(50), Some("STANDARD")));
+        assert!(parse_network_volumes(&json!({"networkVolumes": []})).unwrap().is_empty());
+        for bad in [json!(null), json!([]), json!({"volumes": [{"id": "SECRETVOL"}]}), json!({"networkVolumes": null})] {
+            let e = parse_network_volumes(&bad).unwrap_err().to_string();
+            assert!(e.contains("unexpected response shape") && !e.contains("SECRETVOL"), "{bad}: {e}");
+        }
+        let e = parse_network_volumes(&json!({"networkVolumes": [{"name": "x", "size": 10}]})).unwrap_err();
+        assert!(e.to_string().contains("without an id"), "{e}");
     }
 
     #[test]

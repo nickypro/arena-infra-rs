@@ -40,6 +40,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
   - `snapshot` — one read-only picture of the fleet (`FleetSnapshot`, built by one pure
     `build` for the CLI now and the TUI next), the **health cache** of the last deep check per
     pod, and the allowlisted `PublicSnapshot` for the web page.
+  - `teardown` — the pure judge behind `teardown --check`: listings, volumes, keys, cron/`at`
+    and proxy inputs in, a `✓ ✗ ? –` checklist with fix commands out (unknown ≠ empty).
   - `proxy` — port-forwarding planner. Pods are reached over SSH (VS Code
     Remote-SSH), and the provider reassigns a pod's SSH endpoint on restart, so the
     proxy host gives each machine a *stable* public port (`cute.sus.cat:7000`, …)
@@ -302,6 +304,25 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     from a fixed vocabulary (never check text), maintenance start/end, `updated_at`,
     `complete`. No IPs, hosts, ports, ids, providers, costs or keys (pinned by a leak test).
     `--out` is atomic; if no provider answers, it fails and leaves the old file.
+  - `teardown --check [--json]` — the **end-of-program audit** (read-only; deletes nothing):
+    a `✓ ✗ ? –` checklist of what is still billing or scheduled, each with the exact command
+    that cleans it up. Every pod on every configured provider in **any** state (a stopped pod
+    keeps its name and still bills its disk; only `TERMINATED` is left out) — fix `pods
+    terminate --all`; RunPod **network volumes** (REST v2 `GET /v2/network-volumes`, else
+    GraphQL `myself.networkVolumes`; GraphQL field names taken from existing clients, not
+    live-verified) with size and an **estimated** ~$/month at $0.07/GB/month — fix a `curl -X
+    DELETE …/v2/network-volumes/<id>` (irreversible); this cohort's **enabled OpenRouter
+    keys** with usage — fix `keys revoke <names>` (by name: `--all` only reaches machines
+    that still have a pod); this user's crontab — arena's block (`cron remove`) and
+    hand-added lines mentioning arena (`crontab -e`); pending **`at` jobs** whose command
+    (from `at -c`, never its environment) mentions arena or a legacy fleet script
+    (`destroy_pods`, …) — fix `atrm <ids>` (`at` not installed is said, not failed); and
+    forwards left in the **local** proxy file — fix `proxy apply`. A source that couldn't be
+    read (a provider's 429, a remote proxy, an unreadable `at` job) is `?` — **never
+    "empty"** — and, like anything remaining, makes the exit non-zero; a provider with no key
+    is `–` (not checked). Exit 0 only when all clear. Only this user's crontab/`at` queue
+    are read (not root's, not `/etc/cron.d`); shown commands have secret-looking values
+    redacted. `--json` = the same checklist for scripts.
   - `pods pull [label]` — the **file** backup (complementing the git `backup`): rsyncs
     each pod's home into `<dir>/<label>/<pod>/`, reporting files/bytes moved per pod.
     **Keeps `.git`** (so the backup is a usable repo; `--no-git` to skip), size-caps with
