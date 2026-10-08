@@ -42,7 +42,7 @@ flowchart TD
         Tear["teardown<br/>checklist judge"]
         Labels["fleet + status<br/>labels · billing · cost"]
         Jobs["jobs<br/>detached runs on pods"]
-        Misc["naming · gpu · openrouter · apikeys · backup<br/>pull · sshconfig · metrics · plan · schedule"]
+        Misc["naming · gpu · openrouter · apikeys · backup<br/>pull · restore · volume · sshconfig · metrics · plan · schedule"]
 
         Config --> Fleet
         Fleet --> RP1 & RP2 & Vast & Hz
@@ -78,7 +78,7 @@ flowchart TD
 | crate | binary | role |
 |-------|--------|------|
 | `arena-core` | — | config parsing, the `Provider` trait + RunPod v1/v2, Vast, Hetzner backends + `build`/`build_fleet` factories, the `Remote` SSH seam, every planner and judge (selector, placement, pipeline, proxy merge, health, snapshot, teardown, jobs), the `Pod`/`PodSpec` model, errors |
-| `arena-cli` | `arena` | clap CLI over the library: `pods …` (list/create/up/setup/stop/restart/rename/reimage/replace/migrate/terminate/backup/pull/init-branches/set-branch/run/jobs/logs/test/copy-keys/cp), `proxy plan/apply`, `snapshot`, `teardown --check`, `offers`, `gpus`, `keys`, `ssh-config`, `config`, `cron`, `plan`, `tui`. Owns the I/O: the `up` executor (`up.rs`), the job fan-out (`jobs.rs`), the teardown readers (`teardown.rs`), proxy deploys |
+| `arena-cli` | `arena` | clap CLI over the library: `pods …` (list/create/up/setup/stop/restart/rename/reimage/replace/migrate/terminate/backup/pull/restore/init-branches/set-branch/run/jobs/logs/test/copy-keys/cp), `proxy plan/apply`, `snapshot`, `teardown --check`, `offers`, `gpus`, `keys`, `ssh-config`, `config`, `cron`, `plan`, `tui`. Owns the I/O: the `up` executor (`up.rs`), the job fan-out (`jobs.rs`), the teardown readers (`teardown.rs`), proxy deploys |
 | `arena-tui` | `arena-tui` | ratatui dashboard: each refresh is one `snapshot::build`; per-pod and marked-set actions behind confirmation modals; background deep checks into the shared health cache |
 
 `web/fleet.html` is not a crate: a self-contained page that renders `fleet.json`
@@ -98,6 +98,8 @@ flowchart TD
 | `placement` | `--gpu A,B --cloud x,y --max-price P --order`: expand → price (`PriceBook`) → cap → order (`plan_options`, shared by `offers`, dry-runs and the prompt); `place()` fills names one create at a time, blocking an option for the round on capacity | planning pure; `place` generic over `&dyn Provider` |
 | `pipeline` | the pure half of `pods up`: stages, verdicts, `replacement_order`, `on_failed_host`, the summary table | yes |
 | `setup` | provisioning as data (`provisioning_steps`: image pods = copy deploy key + config command; Hetzner = key + script + run; both + an `Optional` VS Code warm-up whose failure is a warning on a `Done` pod) and a runner (`provision`) with a budget per step (`SetupTimeouts`, `SETUP_TIMEOUT_SECS`) and a boot-race retry | steps pure; runner over `Remote` |
+| `volume` | the repo on the persistent volume: setup's relocation script (`/workspace/<repo>`, configured path → symlink; after a reset the volume copy wins; warnings, never a failed setup), the read-only "where is the repo really?" probe, `RepoSite` (what the restart/stop gate judges), and the pull/replace plans that carry a linked repo as its tree | yes (script tested on a temp-dir pod, rsync plans through the real rsync) |
+| `restore` | `pods restore`: which backup (`wNdM`/`big`, newest snapshot by default), `--path` checks, and the rsync argv (never `--delete`, `--backup-dir`, `--keep-dirlinks`, no owner/group, no keys/rc files) | yes |
 | `vscode` | the warm-up's config (`VSCODE_PREINSTALL`, `VSCODE_EXTENSIONS`, interpreter candidates) and its one-exec command; the embedded `vscode_setup.sh` installs the Remote-SSH server layout, extensions and machine settings (idempotent, checksum-verified, fail closed) | config pure; script tested on a fake pod |
 | `health` | `pods test --deep`: the embedded `deep_check.sh` only measures (key=value facts); `parse_deep` + `evaluate` judge them against `HealthPolicy` (driver floor from `MIN_DRIVER_VERSION` or `ALLOWED_CUDA_VERSIONS`, network/disk/load thresholds, maintenance) | yes (script runs over `Remote`) |
 | `proxy` | the nginx `stream` config: stable port = `MACHINE_NAME_LIST` index; `plan_forwards` **merges** the previous config with a per-provider listing and removes a forward only when its pod is confirmed gone; render ↔ parse round-trip | yes |
@@ -155,10 +157,16 @@ flowchart TD
   `SSH_PROXY_RELOAD_CMD=` (empty) makes every write write-only.
 - **Bounded where it goes through the seams**: every `Remote` call (pod-SSH exec or copy)
   has a budget and provider listings 60 s, so one wedged pod or stalled API can't hang those
-  fleet commands. Not yet bounded: the rsync transfers, which drive their own ssh outside
-  `Remote` — `pods pull`, `pods backup`'s file backup (every tick under `cron install
-  --pull`) and the replace/migrate via-local copy — so a pod that stalls mid-transfer can
-  still hold one up.
+  fleet commands. `pods restore`'s rsync runs through `remote::run_local` (its own budget,
+  stopped like a timed-out ssh). Not yet bounded: the other rsync transfers, which drive
+  their own ssh outside `Remote` — `pods pull`, `pods backup`'s file backup (every tick under
+  `cron install --pull`) and the replace/migrate via-local copy — so a pod that stalls
+  mid-transfer can still hold one up.
+- **The work survives a container reset only on the volume**: setup puts the repo there
+  (`volume`), and everything that reasons about "where is the work" — the restart/stop gate,
+  `pull`, `replace`, `restore` — asks the pod for the repo's real path instead of trusting
+  the configured one (a symlink), falling back to the configured path (the safe side) when
+  the pod doesn't answer.
 - **Publishing is an allowlist**: `snapshot --public` serializes a separate struct with
   only list names, GPU, up/starting/down, health + a fixed-vocabulary reason and
   maintenance times — no IPs, ports, ids, providers, costs or keys (pinned by a leak test).

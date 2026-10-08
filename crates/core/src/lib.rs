@@ -26,6 +26,7 @@ pub mod provider;
 pub mod proxy;
 pub mod pull;
 pub mod remote;
+pub mod restore;
 pub mod retry;
 pub mod schedule;
 pub mod selector;
@@ -36,6 +37,7 @@ pub mod ssh;
 pub mod status;
 pub mod table;
 pub mod teardown;
+pub mod volume;
 pub mod vscode;
 
 pub use config::Config;

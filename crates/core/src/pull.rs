@@ -71,6 +71,10 @@ impl Default for PullConfig {
                 // outputs are large + reproducible/wandb-logged). zebra's orchestrator is
                 // told to do all its run work here.
                 "TEMP_FOLDER_FOR_SWEEPS/".to_string(),
+                // Where setup moved the image's checkout aside when the repo went onto the
+                // `/workspace` volume (`crate::volume`): a second full copy of the repo, from the
+                // image — the work is in the volume copy, which the pull captures.
+                "*.arena-aside-*/".to_string(),
             ],
             remote_path: String::new(),
         }
@@ -202,6 +206,20 @@ pub fn pod_to_pod_command(
     remote_key: &str,
     pc: &PullConfig,
 ) -> String {
+    pod_to_pod_command_into(dest_ip, dest_port, dest_user, remote_key, pc, "")
+}
+
+/// [`pod_to_pod_command`] into `dest_path` on the destination (relative to its home; empty =
+/// the home) — e.g. the repo's tree into `ARENA_materials/`, which the destination resolves
+/// through a symlink there (its repo on the `/workspace` volume) instead of replacing the link.
+pub fn pod_to_pod_command_into(
+    dest_ip: &str,
+    dest_port: u16,
+    dest_user: &str,
+    remote_key: &str,
+    pc: &PullConfig,
+    dest_path: &str,
+) -> String {
     let mut parts = vec!["rsync".to_string()];
     for a in rsync_flags(pc) {
         parts.push(shell_quote(&a));
@@ -222,7 +240,11 @@ pub fn pod_to_pod_command(
         format!("$HOME/{}", pc.remote_path)
     };
     parts.push(src);
-    parts.push(format!("{dest_user}@{dest_ip}:"));
+    parts.push(if dest_path.is_empty() {
+        format!("{dest_user}@{dest_ip}:")
+    } else {
+        shell_quote(&format!("{dest_user}@{dest_ip}:{dest_path}"))
+    });
     parts.join(" ")
 }
 

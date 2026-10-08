@@ -7,6 +7,10 @@
 //!   3. add the deploy key's *public* half to `~/.ssh/authorized_keys` (idempotent),
 //!      so anyone holding that key can also SSH into the pod — derived on the pod via
 //!      `ssh-keygen -y` from the key we just copied, so no extra file is shipped,
+//!   3b. when `/workspace` is a real mount (a persistent volume), put the repo ON it —
+//!      `/workspace/<repo dir>`, with the configured path a symlink to it; after a reset the
+//!      volume copy wins ([`crate::volume::relocation_command`]) — so a restart keeps the
+//!      participants' work and everything below acts on the volume copy,
 //!   4. point the ARENA repo's `origin` at the GitHub SSH URL, fetch *only the default
 //!      branch* (no tags), and update (default: stay on the current branch, pull /
 //!      reset-if-on-main; `--force`: check out the default branch and `reset --hard`),
@@ -132,14 +136,13 @@ impl SetupConfig {
         ));
         let authorized_keys = ak;
 
-        let mut steps = vec![
-            "set -e".to_string(),
-            format!("chmod 600 {}", q(key)),
-            ssh_config,
-            authorized_keys,
-            self.repo_update_command(force),
-            name_file_command(self.short_name(machine_name)),
-        ];
+        let mut steps = vec!["set -e".to_string(), format!("chmod 600 {}", q(key)), ssh_config, authorized_keys];
+        // The repo onto the persistent volume, when the pod has one — before the update, so
+        // the fetch/reset below (and every later git operation) acts on the volume copy.
+        // Never fails setup itself: anything odd is an `arena-warning:` line (see `provision`).
+        steps.extend(crate::volume::relocation_command(&self.repo_path));
+        steps.push(self.repo_update_command(force));
+        steps.push(name_file_command(self.short_name(machine_name)));
         // Coding agents (claude code + codex) + tmux. All idempotent; the whole block runs in
         // a `set +e` subshell ending in `|| true`, so a flaky installer never aborts setup.
         // Node-free curl installers drop into ~/.local/bin; symlink into /usr/local/bin since
@@ -703,7 +706,17 @@ async fn provision_once(
             ProvisionStep::Scp { local, remote: dst, timeout, .. } => {
                 remote.copy(target, local, dst, Some(*timeout)).await
             }
-            ProvisionStep::Run { cmd, timeout, .. } => remote.exec(target, cmd, Some(*timeout)).await,
+            ProvisionStep::Run { cmd, timeout, .. } => {
+                let call = remote.exec(target, cmd, Some(*timeout)).await;
+                // A required step that worked can still have something to say (the repo
+                // couldn't go onto the volume, and why): its `arena-warning:` lines.
+                if let Ok(out) = &call {
+                    if out.success {
+                        warnings.extend(step_warnings(&out.stdout).map(|w| format!("{step_label}: {w}")));
+                    }
+                }
+                call
+            }
             ProvisionStep::Optional { cmd, timeout, .. } => {
                 // The required steps are done: whatever happens here, the pod is set up.
                 let call = remote.exec(target, cmd, Some(*timeout)).await;
@@ -743,6 +756,15 @@ async fn provision_once(
         }
     }
     Pass::Final(ProvisionOutcome::Done { warnings })
+}
+
+/// The warnings a provisioning command printed: its stdout lines starting with
+/// [`crate::volume::WARNING_PREFIX`], prefix stripped (clipped, so a runaway line stays one line).
+fn step_warnings(stdout: &str) -> impl Iterator<Item = String> + '_ {
+    stdout
+        .lines()
+        .filter_map(|l| l.trim_end_matches('\r').strip_prefix(crate::volume::WARNING_PREFIX))
+        .map(|w| crate::fleet::clip(w.trim(), 300))
 }
 
 /// Why a best-effort step didn't work out (`None` = it did): the last stderr line of a
@@ -825,6 +847,20 @@ mod tests {
         // non-force stays on current branch
         assert!(c.contains("git rev-parse --abbrev-ref HEAD"));
         assert!(!c.contains("git checkout 'main'"));
+    }
+
+    /// With a volume the repo moves onto it BEFORE the update (so the fetch/reset act on the
+    /// volume copy); a path that can't be relocated (already on /workspace) gets no block.
+    #[test]
+    fn the_repo_goes_onto_the_volume_before_it_is_updated() {
+        let c = cfg().remote_command("arena8-apple", false);
+        let reloc = crate::volume::relocation_command("/root/ARENA_3.0").unwrap();
+        let at = |needle: &str| c.find(needle).unwrap_or_else(|| panic!("missing {needle}"));
+        assert!(at("ssh-keygen -y") < at(&reloc), "after the keys");
+        assert!(at(&reloc) < at("git remote set-url"), "before the repo update");
+        let mut on_volume = cfg();
+        on_volume.repo_path = "/workspace/ARENA_3.0".into();
+        assert!(!on_volume.remote_command("arena8-apple", false).contains("arena-aside"));
     }
 
     #[test]
@@ -1200,6 +1236,27 @@ mod tests {
         let out = provision_after_key_repair(&fake, &target(22), &image_steps(), BootRetry::default()).await;
         assert!(matches!(&out, ProvisionOutcome::Failed { step: "repo + keys config", .. }), "{out:?}");
         assert_eq!(fake.calls().len(), 2);
+    }
+
+    /// The relocation reports a repo it couldn't put on the volume as an `arena-warning:` line:
+    /// the pod is set up, with the warning — never a failed setup, never silent.
+    #[tokio::test(start_paused = true)]
+    async fn a_required_step_that_worked_can_still_warn() {
+        let fake = FakeRemote::new();
+        let said = "arena-volume: nothing\narena-warning: repo not moved onto the /workspace volume: in use (working directory of pid 42) - re-run setup when it is idle\r\n";
+        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::stdout(said)]);
+        let out = provision(&fake, &target(22), &image_steps(), BootRetry::default()).await;
+        assert_eq!(
+            out,
+            ProvisionOutcome::Done {
+                warnings: vec!["repo + keys config: repo not moved onto the /workspace volume: in use (working directory of pid 42) - re-run setup when it is idle".into()]
+            }
+        );
+        // A failed step's stdout isn't mined for warnings: the failure is the report.
+        let fake = FakeRemote::new();
+        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::exit(1, "boom").with_stdout("arena-warning: x\n")]);
+        let out = provision(&fake, &target(22), &image_steps(), BootRetry::default()).await;
+        assert!(matches!(&out, ProvisionOutcome::Failed { detail, .. } if detail == "boom"), "{out:?}");
     }
 
     #[tokio::test(start_paused = true)]
@@ -1634,6 +1691,40 @@ mod tests {
             let (main, _) = f.advance_origin();
             f.run_update(true);
             assert_eq!(f.head(), ("main".into(), main));
+            f.assert_narrow();
+        }
+
+        /// On a pod with a volume: setup's relocation puts the clone on the (fake) volume and
+        /// the repo update that follows acts on THAT copy, through the symlink — the configured
+        /// path stays a link, the volume copy gets the new commits.
+        #[test]
+        fn the_update_acts_on_the_volume_copy_through_the_link() {
+            use std::os::unix::fs::PermissionsExt;
+            let Some(f) = Fixture::new("volume") else { return };
+            f.clone_pod(&[]);
+            let (ws, bin) = (f.root.join("workspace"), f.root.join("bin"));
+            std::fs::create_dir_all(&ws).unwrap();
+            std::fs::create_dir_all(&bin).unwrap();
+            let stub = bin.join("mountpoint");
+            std::fs::write(&stub, format!("#!/bin/sh\n[ \"$2\" = '{}' ]\n", ws.display())).unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let reloc = crate::volume::relocation_script(
+                &f.pod.display().to_string(),
+                &ws.display().to_string(),
+                &f.root.join("lock").display().to_string(),
+            )
+            .unwrap();
+            let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+            let mut c = Command::new("sh");
+            c.arg("-c").arg(reloc).env("PATH", path);
+            isolated(&mut c, &f.root);
+            assert!(c.output().unwrap().status.success());
+            let on_volume = ws.join("pod");
+            assert_eq!(std::fs::read_link(&f.pod).unwrap(), on_volume);
+            let (main, _) = f.advance_origin();
+            f.run_update(false);
+            assert!(std::fs::symlink_metadata(&f.pod).unwrap().file_type().is_symlink(), "still a link");
+            assert_eq!(f.git(&on_volume, &["rev-parse", "HEAD"]), main, "the volume copy was updated");
             f.assert_narrow();
         }
 

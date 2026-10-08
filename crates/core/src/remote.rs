@@ -143,6 +143,21 @@ impl Remote for SshRemote {
     }
 }
 
+/// Run the local `program` with `args` to completion within `timeout`, capturing its output
+/// — for a transfer that drives its own ssh transport and so can't be a [`Remote`] call
+/// (rsync's `-e ssh …`). Same child discipline as [`SshRemote`]: stdin closed, and on expiry
+/// (or if the caller drops this future) SIGTERM, then SIGKILL after [`TERM_GRACE`].
+/// SIGTERM-first matters doubly for rsync: like scp, it runs `ssh` as a child and only takes
+/// it down on a catchable signal — a SIGKILLed rsync leaves its ssh running against the
+/// wedged pod. `what` names the call in a timeout/spawn error. Same `Ok`/`Err` contract as
+/// [`Remote::exec`]: a non-zero exit is `Ok` with `success == false`; `Err` is a spawn error
+/// or [`Error::Timeout`].
+pub async fn run_local(program: &str, args: &[String], what: &str, timeout: Option<Duration>) -> Result<SshOutput> {
+    let mut c = child(program);
+    c.args(args);
+    output_within(c, what, timeout).await
+}
+
 /// A child process that can't wedge on a prompt (stdin closed) and dies with its future
 /// (`kill_on_drop`) — the property the per-step timeouts depend on.
 fn child(program: &str) -> Command {
