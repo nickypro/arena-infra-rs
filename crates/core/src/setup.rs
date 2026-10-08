@@ -13,6 +13,17 @@
 //!      then update submodules,
 //!   5. write `~/.name` as `export MACHINE_NAME='<short>'`.
 //!
+//! Before that script, on image-based pods, a best-effort step of its own (its own budget —
+//! a first move copies the whole repo — and never a failed setup): when `/workspace` is a real
+//! mount (a persistent volume), put the repo ON it — `/workspace/<repo dir>`, with the
+//! configured path a symlink to it; after a reset the volume copy wins over the image's
+//! untouched checkout ([`crate::volume::relocation_command`]) — so a restart keeps the
+//! participants' work and the repo update acts on the volume copy.
+//!
+//! Then, best-effort (never failing a pod's setup), the VS Code Remote-SSH warm-up
+//! ([`crate::vscode`]): server + course extensions pre-installed, the arena env as the
+//! default interpreter.
+//!
 //! Renders the on-pod shell command (pure, unit-tested). The per-provider step list
 //! ([`provisioning_steps`]) is data, and [`provision`] runs it over a [`Remote`] with a
 //! time budget per step — so one wedged pod reports `timed out at <step>` instead of
@@ -50,6 +61,11 @@ pub struct SetupConfig {
     /// `.zshrc` that activates the arena env. Off by default (the prebuilt arena image
     /// already ships zsh); useful on a bare/non-arena base image.
     pub zsh_install: bool,
+    /// The VS Code warm-up (on by default; `None` = `VSCODE_PREINSTALL=0` / `--no-vscode`).
+    pub vscode: Option<crate::vscode::VscodeSetup>,
+    /// Move the repo onto the pod's volume (image-based pods; on by default, `REPO_ON_VOLUME=0`
+    /// turns it off).
+    pub relocate: bool,
 }
 
 impl SetupConfig {
@@ -68,6 +84,8 @@ impl SetupConfig {
             .get("BACKUP_REPO_PATH")
             .map(String::from)
             .unwrap_or_else(|| format!("/root/{name}"));
+        let vscode = crate::vscode::VscodeSetup::from_config(cfg, &repo_path)?;
+        let relocate = crate::volume::relocation_enabled(cfg.get("REPO_ON_VOLUME"))?;
         Ok(Self {
             // Resolve to a readable copy (prefer ~/.ssh/<name> if the configured path
             // isn't readable), same as the shared key — so `setup` works when run as a
@@ -81,6 +99,8 @@ impl SetupConfig {
             authorized_pubkeys: crate::ssh::authorized_pubkeys(cfg),
             broadcast_exports: crate::apikeys::broadcast_env_vars(|k| cfg.get(k).map(String::from)),
             zsh_install: false,
+            vscode,
+            relocate,
         })
     }
 
@@ -124,14 +144,12 @@ impl SetupConfig {
         ));
         let authorized_keys = ak;
 
-        let mut steps = vec![
-            "set -e".to_string(),
-            format!("chmod 600 {}", q(key)),
-            ssh_config,
-            authorized_keys,
-            self.repo_update_command(force),
-            name_file_command(self.short_name(machine_name)),
-        ];
+        let mut steps = vec!["set -e".to_string(), format!("chmod 600 {}", q(key)), ssh_config, authorized_keys];
+        // The relocation onto the volume is its own step, before this one; one whose ssh client
+        // timed out can still be copying on the pod — wait for it (bounded) before the update.
+        steps.push(crate::volume::relocation_wait_command());
+        steps.push(self.repo_update_command(force));
+        steps.push(name_file_command(self.short_name(machine_name)));
         // Coding agents (claude code + codex) + tmux. All idempotent; the whole block runs in
         // a `set +e` subshell ending in `|| true`, so a flaky installer never aborts setup.
         // Node-free curl installers drop into ~/.local/bin; symlink into /usr/local/bin since
@@ -287,6 +305,12 @@ pub struct SetupTimeouts {
     pub config: Duration,
     /// The hetzner bare-VM setup script.
     pub bare_vm: Duration,
+    /// The best-effort VS Code warm-up — its own budget, untouched by `--timeout` /
+    /// `SETUP_TIMEOUT_SECS` (those size the main step).
+    pub vscode: Duration,
+    /// The best-effort move of the repo onto the volume (image-based pods) — its own budget
+    /// too: a first move copies the whole repo, which mustn't eat the config step's.
+    pub relocate: Duration,
 }
 
 impl Default for SetupTimeouts {
@@ -295,6 +319,8 @@ impl Default for SetupTimeouts {
             copy: Duration::from_secs(60),
             config: Duration::from_secs(300),
             bare_vm: Duration::from_secs(1800),
+            vscode: crate::vscode::WARMUP_TIMEOUT,
+            relocate: crate::volume::RELOCATE_TIMEOUT,
         }
     }
 }
@@ -351,20 +377,30 @@ impl SetupTimeouts {
 pub enum ProvisionStep {
     Scp { label: &'static str, local: String, remote: String, timeout: Duration },
     Run { label: &'static str, cmd: String, timeout: Duration },
+    /// A best-effort extra (the repo onto the volume, the VS Code warm-up): run like `Run`, but
+    /// when it fails or runs out of time the pod is still set up — the outcome carries a
+    /// warning instead (as it does for the `arena-warning:` lines it prints). The required
+    /// steps after one still run. `summary` is what the dry-run prints in place of the command
+    /// (a base64 blob, or a long script).
+    Optional { label: &'static str, cmd: String, summary: String, timeout: Duration },
 }
 
 impl ProvisionStep {
     /// Short human name, e.g. "copy deploy key" — used in `timed out at <label>`.
     pub fn label(&self) -> &'static str {
         match self {
-            ProvisionStep::Scp { label, .. } | ProvisionStep::Run { label, .. } => label,
+            ProvisionStep::Scp { label, .. } | ProvisionStep::Run { label, .. } | ProvisionStep::Optional { label, .. } => {
+                label
+            }
         }
     }
 
     /// This step's time budget.
     pub fn timeout(&self) -> Duration {
         match self {
-            ProvisionStep::Scp { timeout, .. } | ProvisionStep::Run { timeout, .. } => *timeout,
+            ProvisionStep::Scp { timeout, .. }
+            | ProvisionStep::Run { timeout, .. }
+            | ProvisionStep::Optional { timeout, .. } => *timeout,
         }
     }
 }
@@ -374,6 +410,13 @@ impl ProvisionStep {
 /// steps here; the runner and the dry-run preview stay generic.
 ///   - bare-VM (hetzner): push the deploy key + the full setup script, then run it.
 ///   - image-based (runpod/vast): push the git deploy key, then the post-image config.
+///
+/// Image-based pods move the repo onto their volume first (unless `REPO_ON_VOLUME=0`, and when
+/// the configured path can be relocated — see [`crate::volume::volume_repo_path`]; the script
+/// itself checks the pod has a volume), best-effort on its own budget, before the config step
+/// updates the repo. Both then get the VS Code warm-up (unless `scfg.vscode` is off) as a
+/// best-effort last step on its own budget: on hetzner it runs after the script has built the
+/// venv it points VS Code at.
 pub fn provisioning_steps(
     provider: &str,
     scfg: &SetupConfig,
@@ -388,7 +431,7 @@ pub fn provisioning_steps(
         remote: scfg.key_remote.clone(),
         timeout: timeouts.copy,
     };
-    match provider {
+    let mut steps = match provider {
         "hetzner" => vec![
             // Copy the git deploy key first, so the script can clone (and later push to)
             // the PRIVATE cohort repo over SSH — not just the public mirror.
@@ -410,16 +453,38 @@ pub fn provisioning_steps(
                 timeout: timeouts.bare_vm,
             },
         ],
-        _ => vec![
-            copy_key,
-            ProvisionStep::Run {
+        _ => {
+            let mut v = vec![copy_key];
+            let relocation = scfg.relocate.then(|| crate::volume::relocation_command(&scfg.repo_path, timeouts.relocate));
+            if let Some(cmd) = relocation.flatten() {
+                v.push(ProvisionStep::Optional {
+                    label: RELOCATE_LABEL,
+                    cmd,
+                    summary: crate::volume::relocation_summary(&scfg.repo_path),
+                    timeout: timeouts.relocate,
+                });
+            }
+            v.push(ProvisionStep::Run {
                 label: "repo + keys config",
                 cmd: scfg.remote_command(name, force),
                 timeout: timeouts.config,
-            },
-        ],
+            });
+            v
+        }
+    };
+    if let Some(vscode) = &scfg.vscode {
+        steps.push(ProvisionStep::Optional {
+            label: "vscode warm-up",
+            cmd: vscode.remote_command(timeouts.vscode),
+            summary: vscode.summary(),
+            timeout: timeouts.vscode,
+        });
     }
+    steps
 }
+
+/// The relocation step's label (what its warnings are prefixed with).
+pub const RELOCATE_LABEL: &str = "repo onto volume";
 
 /// How [`provision`] rides out the create-vs-sshd-up boot race: a just-created VM can
 /// report an SSH endpoint before sshd answers (hetzner assigns the IP at create), so a
@@ -454,8 +519,9 @@ pub fn pod_budget(steps: &[ProvisionStep], boot: BootRetry) -> Duration {
 /// How one pod's provisioning ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProvisionOutcome {
-    /// Every step succeeded.
-    Done,
+    /// Every required step succeeded. `warnings`: the best-effort steps that didn't
+    /// (`<label>: <why>`) — reported, never a failure.
+    Done { warnings: Vec<String> },
     /// A step failed: non-zero exit (`code`), a failed copy, or the call itself erroring.
     Failed { step: &'static str, code: Option<i32>, detail: String },
     /// A step (or, defensively, the whole pod budget) ran out of time.
@@ -463,16 +529,30 @@ pub enum ProvisionOutcome {
 }
 
 impl ProvisionOutcome {
-    pub fn is_done(&self) -> bool {
-        matches!(self, ProvisionOutcome::Done)
+    /// Set up, with nothing to report.
+    pub fn done() -> Self {
+        ProvisionOutcome::Done { warnings: Vec::new() }
     }
 
-    /// What happened, without the pod's name: `done`, `timed out at <step> after Ns`, or
-    /// `failed at <step>, exit N: <stderr>` — for a line that already names the pod (the
-    /// fleet runner's, or `up`'s per-pod `[name] FAILED setup: …`).
+    pub fn is_done(&self) -> bool {
+        matches!(self, ProvisionOutcome::Done { .. })
+    }
+
+    /// The best-effort steps that didn't work out on a pod that is set up (else none).
+    pub fn warnings(&self) -> &[String] {
+        match self {
+            ProvisionOutcome::Done { warnings } => warnings,
+            _ => &[],
+        }
+    }
+
+    /// What happened, without the pod's name: `done` (`done (warning: …)`), `timed out at
+    /// <step> after Ns`, or `failed at <step>, exit N: <stderr>` — for a line that already
+    /// names the pod (the fleet runner's, or `up`'s per-pod `[name] FAILED setup: …`).
     pub fn describe(&self) -> String {
         match self {
-            ProvisionOutcome::Done => "done".to_string(),
+            ProvisionOutcome::Done { warnings } if warnings.is_empty() => "done".to_string(),
+            ProvisionOutcome::Done { warnings } => format!("done (warning: {})", warnings.join("; ")),
             ProvisionOutcome::TimedOut { step, after } => format!("timed out at {step} after {}", human_duration(after)),
             ProvisionOutcome::Failed { step, code, detail } => {
                 let exit = code.map(|c| format!(", exit {c}")).unwrap_or_default();
@@ -483,12 +563,14 @@ impl ProvisionOutcome {
     }
 }
 
-/// The fleet runner's per-pod progress line: `[done/total] ✓ name`, or
+/// The fleet runner's per-pod progress line: `[done/total] ✓ name` (`… ✓ name (warning:
+/// <step>: <why>)` when a best-effort step didn't work out), or
 /// `[done/total] ✗ name (timed out at <step> after Ns)` /
 /// `[done/total] ✗ name (failed at <step>, exit N): <stderr>`.
 pub fn progress_line(done: usize, total: usize, name: &str, outcome: &ProvisionOutcome) -> String {
     match outcome {
-        ProvisionOutcome::Done => format!("[{done}/{total}] ✓ {name}"),
+        ProvisionOutcome::Done { warnings } if warnings.is_empty() => format!("[{done}/{total}] ✓ {name}"),
+        ProvisionOutcome::Done { warnings } => format!("[{done}/{total}] ✓ {name} (warning: {})", warnings.join("; ")),
         ProvisionOutcome::TimedOut { .. } => format!("[{done}/{total}] ✗ {name} ({})", outcome.describe()),
         ProvisionOutcome::Failed { step, code, detail } => {
             let exit = code.map(|c| format!(", exit {c}")).unwrap_or_default();
@@ -587,10 +669,20 @@ pub async fn provision(
     let budget = pod_budget(steps, boot);
     match tokio::time::timeout(budget, attempts).await {
         Ok(outcome) => outcome,
-        Err(_) => ProvisionOutcome::TimedOut {
-            step: steps[at.load(Ordering::Relaxed).min(steps.len() - 1)].label(),
-            after: budget,
-        },
+        Err(_) => {
+            let i = at.load(Ordering::Relaxed).min(steps.len() - 1);
+            let step = &steps[i];
+            // Stuck in the best-effort tail: every required step is done, so the pod is
+            // set up — the same as that step timing out on its own. (A best-effort step with
+            // required ones after it — the relocation — is a timeout like any other: they
+            // never ran.)
+            let tail = steps[i..].iter().all(|s| matches!(s, ProvisionStep::Optional { .. }));
+            if let (ProvisionStep::Optional { label, .. }, true) = (step, tail) {
+                let why = format!("{label}: timed out after {}", human_duration(&budget));
+                return ProvisionOutcome::Done { warnings: vec![why] };
+            }
+            ProvisionOutcome::TimedOut { step: step.label(), after: budget }
+        }
     }
 }
 
@@ -638,6 +730,7 @@ async fn provision_once(
     steps: &[ProvisionStep],
     at: &AtomicUsize,
 ) -> Pass {
+    let mut warnings = Vec::new();
     for (i, step) in steps.iter().enumerate() {
         at.store(i, Ordering::Relaxed);
         let step_label = step.label();
@@ -645,7 +738,32 @@ async fn provision_once(
             ProvisionStep::Scp { local, remote: dst, timeout, .. } => {
                 remote.copy(target, local, dst, Some(*timeout)).await
             }
-            ProvisionStep::Run { cmd, timeout, .. } => remote.exec(target, cmd, Some(*timeout)).await,
+            ProvisionStep::Run { cmd, timeout, .. } => {
+                let call = remote.exec(target, cmd, Some(*timeout)).await;
+                // A required step that worked can still have something to say (the repo
+                // couldn't go onto the volume, and why): its `arena-warning:` lines.
+                if let Ok(out) = &call {
+                    if out.success {
+                        warnings.extend(step_warnings(&out.stdout).map(|w| format!("{step_label}: {w}")));
+                    }
+                }
+                call
+            }
+            ProvisionStep::Optional { cmd, timeout, .. } => {
+                // Best-effort: whatever happens here, setup carries on — a failure, a timeout or
+                // what the step says (`arena-warning:` lines) is a warning on the pod.
+                match remote.exec(target, cmd, Some(*timeout)).await {
+                    Ok(out) if out.success => {
+                        warnings.extend(step_warnings(&out.stdout).map(|w| format!("{step_label}: {w}")));
+                    }
+                    call => {
+                        if let Some(why) = optional_failure(call) {
+                            warnings.push(format!("{step_label}: {why}"));
+                        }
+                    }
+                }
+                continue;
+            }
         };
         match result {
             Ok(out) if out.success => {}
@@ -676,11 +794,36 @@ async fn provision_once(
             }
         }
     }
-    Pass::Final(ProvisionOutcome::Done)
+    Pass::Final(ProvisionOutcome::Done { warnings })
+}
+
+/// The warnings a provisioning command printed: its stdout lines starting with
+/// [`crate::volume::WARNING_PREFIX`], prefix stripped (clipped, so a runaway line stays one line).
+fn step_warnings(stdout: &str) -> impl Iterator<Item = String> + '_ {
+    stdout
+        .lines()
+        .filter_map(|l| l.trim_end_matches('\r').strip_prefix(crate::volume::WARNING_PREFIX))
+        .map(|w| crate::fleet::clip(w.trim(), 300))
+}
+
+/// Why a best-effort step didn't work out (`None` = it did): the last stderr line of a
+/// non-zero exit (where the warm-up script puts its one-line reason, after any ssh
+/// chatter), clipped; a timeout; or the call's own error.
+fn optional_failure(call: Result<crate::ssh::SshOutput>) -> Option<String> {
+    match call {
+        Ok(out) if out.success => None,
+        Ok(out) => {
+            let exit = out.code.map(|c| format!("exit {c}")).unwrap_or_else(|| "killed".into());
+            let last = out.stderr.lines().map(str::trim).filter(|l| !l.is_empty()).last().unwrap_or("");
+            Some(if last.is_empty() { exit } else { format!("{exit}: {}", crate::fleet::clip(last, 300)) })
+        }
+        Err(Error::Timeout { after, .. }) => Some(format!("timed out after {}", human_duration(&after))),
+        Err(e) => Some(e.to_string()),
+    }
 }
 
 /// Single-quote for safe inclusion in a `sh -c` string (POSIX `'\''` escaping).
-fn shell_quote(s: &str) -> String {
+pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
@@ -699,6 +842,8 @@ mod tests {
             authorized_pubkeys: vec!["ssh-ed25519 AAAASHARED shared".into()],
             broadcast_exports: Vec::new(),
             zsh_install: false,
+            vscode: None,
+            relocate: true,
         }
     }
 
@@ -742,6 +887,45 @@ mod tests {
         // non-force stays on current branch
         assert!(c.contains("git rev-parse --abbrev-ref HEAD"));
         assert!(!c.contains("git checkout 'main'"));
+    }
+
+    /// With a volume the repo moves onto it BEFORE the update (so the fetch/reset act on the
+    /// volume copy): its own best-effort step, on its own budget, before the config step —
+    /// which waits for a relocation still running on the pod. A path that can't be relocated
+    /// (already on /workspace) gets no step; hetzner (no volume) none either.
+    #[test]
+    fn the_repo_goes_onto_the_volume_before_it_is_updated() {
+        let t = SetupTimeouts::default();
+        assert_eq!(t.relocate, secs(900));
+        let steps = provisioning_steps("runpod", &cfg(), "arena8-apple", false, "", &t);
+        let labels: Vec<&str> = steps.iter().map(ProvisionStep::label).collect();
+        assert_eq!(labels, ["copy deploy key", RELOCATE_LABEL, "repo + keys config"]);
+        let ProvisionStep::Optional { cmd, summary, timeout, .. } = &steps[1] else { panic!("{steps:?}") };
+        assert_eq!(*cmd, crate::volume::relocation_command("/root/ARENA_3.0", secs(900)).unwrap());
+        assert_eq!(*timeout, secs(900));
+        assert!(summary.contains("/workspace/ARENA_3.0") && summary.contains("never a failed setup"), "{summary}");
+        // --timeout / SETUP_TIMEOUT_SECS size the config step, not the relocation.
+        let short = SetupTimeouts::resolve(None, Some(45)).unwrap();
+        assert_eq!((short.config, short.relocate), (secs(45), secs(900)));
+        // The config step waits for a relocation still running, then updates the repo.
+        let c = cfg().remote_command("arena8-apple", false);
+        let at = |needle: &str| c.find(needle).unwrap_or_else(|| panic!("missing {needle}"));
+        assert!(at(&crate::volume::relocation_wait_command()) < at("git remote set-url"), "{c}");
+        assert!(!c.contains("arena-aside"), "the move itself isn't in the config step");
+        let mut on_volume = cfg();
+        on_volume.repo_path = "/workspace/ARENA_3.0".into();
+        let labels: Vec<&str> =
+            provisioning_steps("runpod", &on_volume, "arena8-apple", false, "", &t).iter().map(ProvisionStep::label).collect();
+        assert_eq!(labels, ["copy deploy key", "repo + keys config"]);
+        assert!(!provisioning_steps("hetzner", &cfg(), "a", false, "/h.sh", &t).iter().any(|s| s.label() == RELOCATE_LABEL));
+        // REPO_ON_VOLUME=0: no step (the config step's wait is a no-op without a lock file).
+        let off = SetupConfig { relocate: false, ..cfg() };
+        let labels: Vec<&str> = provisioning_steps("runpod", &off, "a", false, "", &t).iter().map(ProvisionStep::label).collect();
+        assert_eq!(labels, ["copy deploy key", "repo + keys config"]);
+        let from = |extra: &str| SetupConfig::from_config(&Config::parse(&format!("ARENA_REPO_OWNER=o\nARENA_REPO_NAME=r\nGIT_SSH_KEY_LOCAL=/k\n{extra}")));
+        assert!(from("").unwrap().relocate);
+        assert!(!from("REPO_ON_VOLUME=0").unwrap().relocate);
+        assert!(from("REPO_ON_VOLUME=sometimes").is_err());
     }
 
     #[test]
@@ -832,6 +1016,8 @@ mod tests {
             authorized_pubkeys: vec![],
             broadcast_exports: vec![],
             zsh_install: false,
+            vscode: None,
+            relocate: true,
         }
     }
 
@@ -877,15 +1063,18 @@ mod tests {
                 },
             ]
         );
-        // image-based (runpod/vast): scp the deploy key, then a config command that
-        // re-points origin — i.e. the post-image flow, not the bare-VM script.
+        // image-based (runpod/vast): scp the deploy key, move the repo onto the volume (best-
+        // effort), then a config command that re-points origin — i.e. the post-image flow, not
+        // the bare-VM script.
         for provider in ["runpod", "vast"] {
             let r = provisioning_steps(provider, &scfg, "arena8-apple", false, "/tmp/h.sh", &t);
-            assert_eq!(r.len(), 2);
+            assert_eq!(r.len(), 3);
             assert!(matches!(&r[0], ProvisionStep::Scp { local, remote, .. } if local == "/local/key" && remote == "/root/.ssh/id_ed25519"));
-            assert!(matches!(&r[1], ProvisionStep::Run { cmd, .. } if cmd.contains("git remote set-url")));
-            assert_eq!(r[1].label(), "repo + keys config");
-            assert_eq!(r[1].timeout(), secs(300));
+            assert!(matches!(&r[1], ProvisionStep::Optional { label: RELOCATE_LABEL, cmd, .. } if cmd.contains("arena-aside")));
+            assert_eq!(r[1].timeout(), secs(900));
+            assert!(matches!(&r[2], ProvisionStep::Run { cmd, .. } if cmd.contains("git remote set-url")));
+            assert_eq!(r[2].label(), "repo + keys config");
+            assert_eq!(r[2].timeout(), secs(300));
         }
     }
 
@@ -965,7 +1154,7 @@ mod tests {
     #[test]
     fn progress_lines() {
         use ProvisionOutcome::*;
-        assert_eq!(progress_line(1, 3, "arena8-apple", &Done), "[1/3] ✓ arena8-apple");
+        assert_eq!(progress_line(1, 3, "arena8-apple", &ProvisionOutcome::done()), "[1/3] ✓ arena8-apple");
         assert_eq!(
             progress_line(2, 3, "arena8-bloom", &TimedOut { step: "repo + keys config", after: secs(300) }),
             "[2/3] ✗ arena8-bloom (timed out at repo + keys config after 300s)"
@@ -979,7 +1168,7 @@ mod tests {
             "[3/3] ✗ c (failed at repo + keys config)"
         );
         // The same reasons without the name/counter, for a line that already names the pod.
-        assert_eq!(Done.describe(), "done");
+        assert_eq!(ProvisionOutcome::done().describe(), "done");
         assert_eq!(
             TimedOut { step: "repo + keys config", after: secs(300) }.describe(),
             "timed out at repo + keys config after 300s"
@@ -993,8 +1182,8 @@ mod tests {
     #[test]
     fn pod_budget_is_steps_plus_boot_window() {
         let steps = provisioning_steps("runpod", &steps_cfg(), "arena8-apple", false, "", &SetupTimeouts::default());
-        // 60 (key) + 300 (config) + 150 (boot window) + 6 (one retry pause)
-        assert_eq!(pod_budget(&steps, BootRetry::default()), secs(516));
+        // 60 (key) + 900 (repo onto volume) + 300 (config) + 150 (boot window) + 6 (one retry pause)
+        assert_eq!(pod_budget(&steps, BootRetry::default()), secs(1416));
     }
 
     #[test]
@@ -1003,7 +1192,9 @@ mod tests {
         let mut steps = image_steps();
         for s in &mut steps {
             match s {
-                ProvisionStep::Scp { timeout, .. } | ProvisionStep::Run { timeout, .. } => *timeout = Duration::MAX,
+                ProvisionStep::Scp { timeout, .. }
+                | ProvisionStep::Run { timeout, .. }
+                | ProvisionStep::Optional { timeout, .. } => *timeout = Duration::MAX,
             }
         }
         assert_eq!(pod_budget(&steps, BootRetry::default()), Duration::MAX);
@@ -1017,7 +1208,7 @@ mod tests {
         if let ProvisionStep::Run { timeout, .. } = &mut steps[1] {
             *timeout = Duration::MAX;
         }
-        assert_eq!(provision(&FakeRemote::new(), &target(22), &steps, BootRetry::default()).await, ProvisionOutcome::Done);
+        assert_eq!(provision(&FakeRemote::new(), &target(22), &steps, BootRetry::default()).await, ProvisionOutcome::done());
     }
 
     fn image_steps() -> Vec<ProvisionStep> {
@@ -1030,7 +1221,7 @@ mod tests {
         let fake = FakeRemote::new();
         let steps = provisioning_steps("hetzner", &steps_cfg(), "arena8-flutter", false, "/tmp/h.sh", &SetupTimeouts::default());
         let out = provision(&fake, &target(22), &steps, BootRetry::default()).await;
-        assert_eq!(out, ProvisionOutcome::Done);
+        assert_eq!(out, ProvisionOutcome::done());
         let calls = fake.calls();
         assert_eq!(calls.len(), 3);
         assert!(matches!(&calls[0], RemoteCall::Copy { local, timeout, .. } if local == "/local/key" && *timeout == Some(secs(60))));
@@ -1038,9 +1229,13 @@ mod tests {
         assert!(matches!(&calls[2], RemoteCall::Exec { cmd, timeout, .. } if cmd.ends_with("bash /root/hetzner_setup.sh") && *timeout == Some(secs(1800))));
 
         let fake = FakeRemote::new();
-        assert_eq!(provision(&fake, &target(22), &image_steps(), BootRetry::default()).await, ProvisionOutcome::Done);
+        assert_eq!(provision(&fake, &target(22), &image_steps(), BootRetry::default()).await, ProvisionOutcome::done());
         let calls = fake.calls();
-        assert!(matches!(&calls[..], [RemoteCall::Copy { .. }, RemoteCall::Exec { cmd, .. }] if cmd.contains("git remote set-url")));
+        assert!(
+            matches!(&calls[..], [RemoteCall::Copy { .. }, RemoteCall::Exec { cmd: reloc, timeout: t1, .. }, RemoteCall::Exec { cmd, timeout: t2, .. }]
+                if reloc.contains("arena-aside") && *t1 == Some(secs(900)) && cmd.contains("git remote set-url") && *t2 == Some(secs(300))),
+            "{calls:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1086,7 +1281,7 @@ mod tests {
         assert!(!key_rejected(&failed("scp: /root/.ssh/id_ed25519: Permission denied")));
         assert!(!key_rejected(&failed("ssh: connect to host 10.0.0.1 port 22: Connection refused")));
         assert!(!key_rejected(&ProvisionOutcome::TimedOut { step: "copy deploy key", after: secs(60) }));
-        assert!(!key_rejected(&ProvisionOutcome::Done));
+        assert!(!key_rejected(&ProvisionOutcome::done()));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1094,12 +1289,12 @@ mod tests {
         let denied = "root@10.0.0.1: Permission denied (publickey).\nscp: Connection closed\r\n";
         // Still refused 20s after the repair, accepted at 40s.
         let fake = FakeRemote::new();
-        fake.script("10.0.0.1:22", [FakeReply::exit(255, denied), FakeReply::ok(), FakeReply::ok()]);
+        fake.script("10.0.0.1:22", [FakeReply::exit(255, denied), FakeReply::ok(), FakeReply::ok(), FakeReply::ok()]);
         let start = tokio::time::Instant::now();
         let out = provision_after_key_repair(&fake, &target(22), &image_steps(), BootRetry::default()).await;
-        assert_eq!(out, ProvisionOutcome::Done);
+        assert_eq!(out, ProvisionOutcome::done());
         assert_eq!(start.elapsed(), secs(40));
-        assert_eq!(fake.calls().len(), 3, "refused copy, then copy + config");
+        assert_eq!(fake.calls().len(), 4, "refused copy, then copy + relocation + config");
         // Never accepted: bounded — the refusal stands after the last try.
         let fake = FakeRemote::new();
         fake.script("10.0.0.1:22", (0..10).map(|_| FakeReply::exit(255, denied)));
@@ -1110,30 +1305,75 @@ mod tests {
         assert_eq!(fake.calls().len(), KEY_REPAIR_TRIES as usize);
         // Any other failure ends it at once — the key was the only thing to wait for.
         let fake = FakeRemote::new();
-        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::exit(128, "fatal: couldn't find remote ref")]);
+        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::exit(128, "fatal: couldn't find remote ref")]);
         let out = provision_after_key_repair(&fake, &target(22), &image_steps(), BootRetry::default()).await;
         assert!(matches!(&out, ProvisionOutcome::Failed { step: "repo + keys config", .. }), "{out:?}");
-        assert_eq!(fake.calls().len(), 2);
+        assert_eq!(fake.calls().len(), 3);
+    }
+
+    /// The relocation reports a repo it couldn't put on the volume as an `arena-warning:` line:
+    /// the pod is set up, with the warning — never a failed setup, never silent. So does a
+    /// required step (the config step's wait for a relocation still running).
+    #[tokio::test(start_paused = true)]
+    async fn a_step_that_worked_can_still_warn() {
+        let fake = FakeRemote::new();
+        let said = "arena-volume: nothing\narena-warning: repo not moved onto the /workspace volume: in use (pid 42) - re-run setup when it is idle\r\n";
+        let waited = "arena-warning: another setup is still moving the repo onto the volume - the update ran anyway\n";
+        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::stdout(said), FakeReply::stdout(waited)]);
+        let out = provision(&fake, &target(22), &image_steps(), BootRetry::default()).await;
+        assert_eq!(
+            out,
+            ProvisionOutcome::Done {
+                warnings: vec![
+                    "repo onto volume: repo not moved onto the /workspace volume: in use (pid 42) - re-run setup when it is idle".into(),
+                    "repo + keys config: another setup is still moving the repo onto the volume - the update ran anyway".into(),
+                ]
+            }
+        );
+        // A failed required step's stdout isn't mined for warnings: the failure is the report.
+        let fake = FakeRemote::new();
+        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::exit(1, "boom").with_stdout("arena-warning: x\n")]);
+        let out = provision(&fake, &target(22), &image_steps(), BootRetry::default()).await;
+        assert!(matches!(&out, ProvisionOutcome::Failed { detail, .. } if detail == "boom"), "{out:?}");
+    }
+
+    /// The relocation is best-effort: failing or running out of its own budget (a huge repo,
+    /// a slow volume) is a warning, and the config step still runs — with its own budget.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_or_slow_relocation_never_fails_setup() {
+        let fake = FakeRemote::new();
+        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::hang(), FakeReply::ok()]);
+        let start = tokio::time::Instant::now();
+        let out = provision(&fake, &target(22), &image_steps(), BootRetry::default()).await;
+        assert_eq!(out, ProvisionOutcome::Done { warnings: vec!["repo onto volume: timed out after 900s".into()] });
+        assert_eq!(start.elapsed(), secs(900));
+        let calls = fake.calls();
+        assert!(matches!(&calls[2], RemoteCall::Exec { cmd, timeout, .. } if cmd.contains("git remote set-url") && *timeout == Some(secs(300))));
+        let fake = FakeRemote::new();
+        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::exit(2, "sh: 1: find: not found")]);
+        let out = provision(&fake, &target(22), &image_steps(), BootRetry::default()).await;
+        assert_eq!(out, ProvisionOutcome::Done { warnings: vec!["repo onto volume: exit 2: sh: 1: find: not found".into()] });
+        assert_eq!(fake.calls().len(), 3, "the config step still ran");
     }
 
     #[tokio::test(start_paused = true)]
     async fn failing_command_is_reported_not_retried() {
         let fake = FakeRemote::new();
-        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::exit(128, "fatal: couldn't find remote ref")]);
+        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::exit(128, "fatal: couldn't find remote ref")]);
         let out = provision(&fake, &target(22), &image_steps(), BootRetry::default()).await;
         assert!(matches!(&out, ProvisionOutcome::Failed { step: "repo + keys config", code: Some(128), .. }), "{out:?}");
-        assert_eq!(fake.calls().len(), 2);
+        assert_eq!(fake.calls().len(), 3);
     }
 
     #[tokio::test(start_paused = true)]
     async fn hung_step_times_out_naming_the_step() {
         let fake = FakeRemote::new();
-        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::hang()]);
+        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::hang()]);
         let start = tokio::time::Instant::now();
         let out = provision(&fake, &target(22), &image_steps(), BootRetry::default()).await;
         assert_eq!(out, ProvisionOutcome::TimedOut { step: "repo + keys config", after: secs(300) });
         assert_eq!(start.elapsed(), secs(300));
-        assert_eq!(fake.calls().len(), 2, "a timeout is never retried as a connection error");
+        assert_eq!(fake.calls().len(), 3, "a timeout is never retried as a connection error");
     }
 
     #[tokio::test(start_paused = true)]
@@ -1141,17 +1381,17 @@ mod tests {
         // (d) sshd not up yet: scp exits 255 with ssh's connect error twice, then works.
         let refused = || FakeReply::exit(255, "ssh: connect to host 10.0.0.1 port 22: Connection refused");
         let fake = FakeRemote::new();
-        fake.script("10.0.0.1:22", [refused(), FakeReply::error("ssh: connect to host 10.0.0.1 port 22: No route to host"), FakeReply::ok(), FakeReply::ok()]);
+        fake.script("10.0.0.1:22", [refused(), FakeReply::error("ssh: connect to host 10.0.0.1 port 22: No route to host"), FakeReply::ok(), FakeReply::ok(), FakeReply::ok()]);
         let start = tokio::time::Instant::now();
         let out = provision(&fake, &target(22), &image_steps(), BootRetry::default()).await;
-        assert_eq!(out, ProvisionOutcome::Done);
+        assert_eq!(out, ProvisionOutcome::done());
         assert_eq!(start.elapsed(), secs(12), "two 6s retry pauses");
         let kinds: Vec<&str> = fake
             .calls()
             .iter()
             .map(|c| if matches!(c, RemoteCall::Copy { .. }) { "copy" } else { "exec" })
             .collect();
-        assert_eq!(kinds, ["copy", "copy", "copy", "exec"], "restarts from the first step");
+        assert_eq!(kinds, ["copy", "copy", "copy", "exec", "exec"], "restarts from the first step");
     }
 
     #[tokio::test(start_paused = true)]
@@ -1204,8 +1444,150 @@ mod tests {
         let steps = image_steps();
         let start = tokio::time::Instant::now();
         let out = provision(&DeafRemote, &target(22), &steps, BootRetry::default()).await;
-        assert_eq!(out, ProvisionOutcome::TimedOut { step: "copy deploy key", after: secs(516) });
-        assert_eq!(start.elapsed(), secs(516));
+        assert_eq!(out, ProvisionOutcome::TimedOut { step: "copy deploy key", after: secs(1416) });
+        assert_eq!(start.elapsed(), secs(1416));
+    }
+
+    /// `steps_cfg` with the VS Code warm-up on, as config enables it by default.
+    fn vscode_cfg() -> SetupConfig {
+        let mut c = steps_cfg();
+        c.vscode = crate::vscode::VscodeSetup::from_config(&Config::parse(""), &c.repo_path).unwrap();
+        assert!(c.vscode.is_some(), "on by default");
+        c
+    }
+
+    #[test]
+    fn the_vscode_warm_up_is_the_last_step_everywhere_unless_off() {
+        let t = SetupTimeouts::default();
+        assert_eq!(t.vscode, secs(300));
+        for (provider, before) in [("runpod", 3), ("vast", 3), ("hetzner", 3)] {
+            let steps = provisioning_steps(provider, &vscode_cfg(), "arena8-apple", false, "/tmp/h.sh", &t);
+            assert_eq!(steps.len(), before + 1, "{provider}");
+            let ProvisionStep::Optional { label, cmd, summary, timeout } = steps.last().unwrap() else {
+                panic!("{provider}: {steps:?}")
+            };
+            assert_eq!((*label, *timeout), ("vscode warm-up", secs(300)));
+            assert!(cmd.contains("arena-vscode-warmup") && cmd.starts_with("ARENA_VSCODE_BUDGET=270 "), "{cmd}");
+            // Hetzner's interpreter is the venv its script builds under the repo.
+            assert!(cmd.contains("'/root/ARENA_3.0/.venv/bin/python'"), "{cmd}");
+            assert!(summary.contains("ms-python.vscode-pylance"), "{summary}");
+            // The required steps are exactly what they were without it.
+            assert_eq!(steps[..before], provisioning_steps(provider, &steps_cfg(), "arena8-apple", false, "/tmp/h.sh", &t)[..]);
+        }
+        // --timeout / SETUP_TIMEOUT_SECS size the main step, not the warm-up.
+        let t = SetupTimeouts::resolve(Some("900"), Some(45)).unwrap();
+        assert_eq!((t.config, t.vscode), (secs(45), secs(300)));
+        // Its budget counts toward the pod's ceiling: 60 + 900 + 300 + 300 + 150 + 6.
+        let steps = provisioning_steps("runpod", &vscode_cfg(), "arena8-apple", false, "", &SetupTimeouts::default());
+        assert_eq!(pod_budget(&steps, BootRetry::default()), secs(1716));
+        // From config: on unless VSCODE_PREINSTALL=0; a bad extension list fails setup's config.
+        let cfg = |extra: &str| {
+            Config::parse(&format!("ARENA_REPO_OWNER=o\nARENA_REPO_NAME=r\nGIT_SSH_KEY_LOCAL=/k\n{extra}"))
+        };
+        assert!(SetupConfig::from_config(&cfg("")).unwrap().vscode.is_some());
+        assert!(SetupConfig::from_config(&cfg("VSCODE_PREINSTALL=0")).unwrap().vscode.is_none());
+        let e = SetupConfig::from_config(&cfg("VSCODE_EXTENSIONS=ms-python.python;true")).unwrap_err();
+        assert!(e.to_string().contains("VSCODE_EXTENSIONS"), "{e}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_or_hung_warm_up_is_a_warning_on_a_set_up_pod() {
+        let steps = provisioning_steps("runpod", &vscode_cfg(), "arena8-apple", false, "", &SetupTimeouts::default());
+        let warned = |w: &str| ProvisionOutcome::Done { warnings: vec![w.to_string()] };
+
+        // The script's own report: exit 3, its reason on the last stderr line (after ssh chatter).
+        let fake = FakeRemote::new();
+        fake.script(
+            "10.0.0.1:22",
+            [
+                FakeReply::ok(),
+                FakeReply::ok(),
+                FakeReply::ok(),
+                FakeReply::exit(3, "Warning: Permanently added '[10.0.0.1]:22'\nvscode warm-up incomplete: server: checksum mismatch\n"),
+            ],
+        );
+        let out = provision(&fake, &target(22), &steps, BootRetry::default()).await;
+        assert_eq!(out, warned("vscode warm-up: exit 3: vscode warm-up incomplete: server: checksum mismatch"));
+        assert!(out.is_done());
+        assert_eq!(out.warnings().len(), 1);
+        assert_eq!(
+            progress_line(1, 1, "arena8-apple", &out),
+            "[1/1] ✓ arena8-apple (warning: vscode warm-up: exit 3: vscode warm-up incomplete: server: checksum mismatch)"
+        );
+        assert_eq!(
+            out.describe(),
+            "done (warning: vscode warm-up: exit 3: vscode warm-up incomplete: server: checksum mismatch)"
+        );
+        assert!(matches!(&fake.calls()[3], RemoteCall::Exec { timeout, .. } if *timeout == Some(secs(300))));
+
+        // Hung: its own budget runs out, the pod is still set up.
+        let fake = FakeRemote::new();
+        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::hang()]);
+        let start = tokio::time::Instant::now();
+        let out = provision(&fake, &target(22), &steps, BootRetry::default()).await;
+        assert_eq!(out, warned("vscode warm-up: timed out after 300s"));
+        assert_eq!(start.elapsed(), secs(300));
+
+        // The connection dropping under it: a warning too — never a retry of the whole pod.
+        let fake = FakeRemote::new();
+        fake.script(
+            "10.0.0.1:22",
+            [FakeReply::ok(), FakeReply::ok(), FakeReply::ok(), FakeReply::error("ssh: connect to host 10.0.0.1 port 22: Connection refused")],
+        );
+        let out = provision(&fake, &target(22), &steps, BootRetry::default()).await;
+        assert!(out.is_done() && out.warnings()[0].contains("Connection refused"), "{out:?}");
+        assert_eq!(fake.calls().len(), 4);
+
+        // A failure before it is the pod's failure, as ever — the warm-up never runs.
+        let fake = FakeRemote::new();
+        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::exit(128, "fatal: couldn't find remote ref")]);
+        let out = provision(&fake, &target(22), &steps, BootRetry::default()).await;
+        assert!(matches!(&out, ProvisionOutcome::Failed { step: "repo + keys config", .. }), "{out:?}");
+        assert!(out.warnings().is_empty());
+        assert_eq!(fake.calls().len(), 3);
+
+        // All well: no warnings.
+        let fake = FakeRemote::new();
+        assert_eq!(provision(&fake, &target(22), &steps, BootRetry::default()).await, ProvisionOutcome::done());
+        assert_eq!(fake.calls().len(), 4);
+    }
+
+    /// Answers the first `ok` calls, then never returns — ignoring its timeout.
+    struct DeafAfter {
+        ok: usize,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Remote for DeafAfter {
+        async fn exec(&self, _: &SshTarget, _: &str, _: Option<Duration>) -> Result<crate::ssh::SshOutput> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) < self.ok {
+                return Ok(crate::ssh::SshOutput { stdout: String::new(), stderr: String::new(), code: Some(0), success: true });
+            }
+            std::future::pending().await
+        }
+        async fn copy(&self, t: &SshTarget, _: &str, _: &str, d: Option<Duration>) -> Result<crate::ssh::SshOutput> {
+            self.exec(t, "", d).await
+        }
+        async fn copy_recursive(&self, t: &SshTarget, _: &str, _: &str, d: Option<Duration>) -> Result<crate::ssh::SshOutput> {
+            self.exec(t, "", d).await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_pod_budget_never_turns_a_stuck_warm_up_into_a_failure() {
+        let steps = provisioning_steps("runpod", &vscode_cfg(), "arena8-apple", false, "", &SetupTimeouts::default());
+        let stuck_in_warm_up = DeafAfter { ok: 3, calls: AtomicUsize::new(0) };
+        let out = provision(&stuck_in_warm_up, &target(22), &steps, BootRetry::default()).await;
+        assert_eq!(out, ProvisionOutcome::Done { warnings: vec!["vscode warm-up: timed out after 1716s".into()] });
+        // Stuck before it: still the failure it always was.
+        let stuck_in_config = DeafAfter { ok: 2, calls: AtomicUsize::new(0) };
+        let out = provision(&stuck_in_config, &target(22), &steps, BootRetry::default()).await;
+        assert_eq!(out, ProvisionOutcome::TimedOut { step: "repo + keys config", after: secs(1716) });
+        // Stuck in the best-effort relocation: the required config never ran — not "set up".
+        let stuck_in_relocation = DeafAfter { ok: 1, calls: AtomicUsize::new(0) };
+        let out = provision(&stuck_in_relocation, &target(22), &steps, BootRetry::default()).await;
+        assert_eq!(out, ProvisionOutcome::TimedOut { step: RELOCATE_LABEL, after: secs(1716) });
     }
 
     #[tokio::test]
@@ -1411,6 +1793,42 @@ mod tests {
             let (main, _) = f.advance_origin();
             f.run_update(true);
             assert_eq!(f.head(), ("main".into(), main));
+            f.assert_narrow();
+        }
+
+        /// On a pod with a volume: setup's relocation puts the clone on the (fake) volume and
+        /// the repo update that follows acts on THAT copy, through the symlink — the configured
+        /// path stays a link, the volume copy gets the new commits.
+        #[test]
+        fn the_update_acts_on_the_volume_copy_through_the_link() {
+            use std::os::unix::fs::PermissionsExt;
+            let Some(f) = Fixture::new("volume") else { return };
+            f.clone_pod(&[]);
+            let (ws, bin) = (f.root.join("workspace"), f.root.join("bin"));
+            std::fs::create_dir_all(&ws).unwrap();
+            std::fs::create_dir_all(&bin).unwrap();
+            let stub = bin.join("mountpoint");
+            std::fs::write(&stub, format!("#!/bin/sh\n[ \"$2\" = '{}' ]\n", ws.display())).unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let site = crate::volume::RelocationSite {
+                volume: ws.display().to_string(),
+                lock: f.root.join("lock").display().to_string(),
+                container_mark: f.root.join("dockerenv").display().to_string(),
+                copy_secs: 60,
+                lock_wait_secs: 1,
+            };
+            let reloc = crate::volume::relocation_script(&f.pod.display().to_string(), &site).unwrap();
+            let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+            let mut c = Command::new("sh");
+            c.arg("-c").arg(reloc).env("PATH", path);
+            isolated(&mut c, &f.root);
+            assert!(c.output().unwrap().status.success());
+            let on_volume = ws.join("pod");
+            assert_eq!(std::fs::read_link(&f.pod).unwrap(), on_volume);
+            let (main, _) = f.advance_origin();
+            f.run_update(false);
+            assert!(std::fs::symlink_metadata(&f.pod).unwrap().file_type().is_symlink(), "still a link");
+            assert_eq!(f.git(&on_volume, &["rev-parse", "HEAD"]), main, "the volume copy was updated");
             f.assert_narrow();
         }
 

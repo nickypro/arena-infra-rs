@@ -331,6 +331,37 @@ if [ -d /workspace ]; then
   kv disk.workspace_avail_kb "${v:-unknown}"
 fi
 
+# ---- VS Code Remote-SSH pre-install (setup's warm-up; informational, local reads only) ----
+# The newest installed server (exec-server layout) and how many; each extension in the
+# shared dir as `vscode.ext.<id>=<version>` (one line each: a joined list would be clipped);
+# the machine-settings default interpreter.
+vs="$HOME/.vscode-server"
+newest="" count=0
+for d in "$vs"/cli/servers/Stable-*/server; do
+  [ -x "$d/bin/code-server" ] || continue
+  count=$((count + 1))
+  if [ -z "$newest" ] || [ "$d" -nt "$newest" ]; then newest=$d; fi
+done
+commit=${newest%/server}
+commit=${commit##*/Stable-}
+kv vscode.server "${commit:-none}"
+kv vscode.servers "$count"
+n=0
+for d in "$vs"/extensions/*/; do
+  [ -d "$d" ] || continue
+  [ "$n" -lt 60 ] || break
+  b=${d%/}
+  b=${b##*/}
+  idver=$(printf '%s\n' "$b" | sed -nE 's/^([A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)-([0-9]+\.[0-9][^ ]*)$/\1 \2/p')
+  [ -n "$idver" ] || continue
+  kv "vscode.ext.$(printf '%s' "${idver% *}" | tr '[:upper:]' '[:lower:]')" "${idver#* }"
+  n=$((n + 1))
+done
+v=$(tr -d '\r\n' <"$vs/data/Machine/settings.json" 2>/dev/null |
+  grep -oE '"python\.defaultInterpreterPath"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n 1 |
+  sed -E 's/.*"([^"]*)"$/\1/')
+kv vscode.python "${v:-unset}"
+
 # ---- network result (the probe has been running all along; bounded at 40s) ----
 if [ -n "$net_pid" ]; then
   wait "$net_pid" 2>/dev/null
