@@ -20,6 +20,7 @@ use arena_core::selector::{Naming, SelectArgs, Selector};
 use arena_core::ssh::SshTarget;
 use arena_core::{Config, PodSpec};
 
+mod jobs;
 mod teardown;
 mod up;
 
@@ -1010,10 +1011,20 @@ enum PodCmd {
     /// `-t <targets>` (names / ids / ranges) and the other selection flags; default: every pod.
     /// A bare selection or --dry-run flag after the command is refused (it would widen the
     /// run, or make the preview real); quote a command that takes one: `run 'ls -t'`.
+    ///
+    /// `--background`: start it detached instead (a course-test run that outlasts your SSH
+    /// session) and return at once with a job id — see `pods jobs` and `pods logs`.
     Run {
         /// The command to run (everything after `run`).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
+        /// Start the command detached on each pod (same shell + conda env) and return at
+        /// once: one job id for the whole run, its files (log = stdout+stderr, pid, exit
+        /// code) under `~/.arena/jobs/<id>/` on each pod. It keeps running after this
+        /// command — and your connection — ends; no time limit (stop it with `pods jobs
+        /// --kill <id>`). Pods' files live on the container disk: a restart wipes them.
+        #[arg(long, visible_alias = "bg", conflicts_with = "timeout")]
+        background: bool,
         /// Per-pod budget in seconds (default 1800 = 30 min; at most 86400). A pod that
         /// runs over reports `✗ timed out after Ns` and counts as failed; the others carry on.
         #[arg(long, default_value_t = RUN_TIMEOUT_SECS, value_parser = clap::value_parser!(u64).range(1..=arena_core::setup::MAX_STEP_TIMEOUT_SECS))]
@@ -1023,6 +1034,39 @@ enum PodCmd {
         dry_run: bool,
         #[command(flatten)]
         sel: SelectByFlag,
+    },
+    /// Background jobs (`pods run --background`) on each pod, newest first: id, start time
+    /// (UTC), `running (pid N)` / `exit N` / `lost`, command. Read-only, except `--kill`.
+    ///
+    /// Targets: names / ids / ranges (none = every pod). A job id among them (it's told
+    /// apart by its shape, `20261008-142301-…`) shows just that job.
+    Jobs {
+        /// Stop job JOB on the selected pods (confirms first): SIGTERM to the job's process
+        /// group, only where it is still running and the pod confirms the pid is still that
+        /// job. It then reads `exit 143 (SIGTERM)`. A program that ignores SIGTERM keeps
+        /// running (no SIGKILL follow-up).
+        #[arg(long, value_name = "JOB")]
+        kill: Option<String>,
+        #[command(flatten)]
+        sel: Select,
+    },
+    /// A background job's log on each pod: its status and the last `--tail` lines.
+    ///
+    /// JOB is an id from `pods jobs` (default: each pod's newest job); it can go anywhere
+    /// among the targets — it's told apart by its shape (`20261008-142301-…`). `--follow`
+    /// keeps printing new lines (every 3s) until every followed job has ended, then exits
+    /// non-zero if any ended other than `exit 0`; Ctrl+C stops following, never the job.
+    /// Read-only. Targets: names / ids / ranges (none = every pod).
+    Logs {
+        /// Lines to show per pod (from at most the last 1 MiB of its log).
+        #[arg(short = 'n', long, default_value_t = jobs::DEFAULT_TAIL, value_parser = clap::value_parser!(u64).range(0..=100_000))]
+        tail: u64,
+        /// Keep printing new output until every followed job has ended (Ctrl+C stops
+        /// following; the jobs keep running).
+        #[arg(short = 'f', long)]
+        follow: bool,
+        #[command(flatten)]
+        sel: Select,
     },
     /// Health check (read-only). Plain: torch version on every pod (90s budget per pod).
     ///
@@ -4955,14 +4999,47 @@ async fn handle_pods_with(
             let sel = select(provider, cfg, &sel.args(), Unscoped::Refuse("switch")).await?;
             handle_set_branch(remote, cfg, &branch, &sel, hard, dry_run, yes).await?;
         }
-        PodCmd::Run { sel, command, timeout, dry_run } => {
+        PodCmd::Run { sel, command, timeout, dry_run, background } => {
             if let Some(why) = misplaced_run_flags(&command) {
                 anyhow::bail!("{why}");
             }
             let cmd = command.join(" ");
             let budget = Duration::from_secs(timeout);
             let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
-            handle_run(remote, cfg, &sel, &cmd, budget, dry_run, yes, /*confirm*/ true, /*compact*/ false).await?;
+            if background {
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+                let ask = &mut |what: &str| confirm(yes, what);
+                jobs::handle_start(remote, cfg, &sel, &cmd, now, dry_run, ask, &mut |l| println!("{l}")).await?;
+            } else {
+                handle_run(remote, cfg, &sel, &cmd, budget, dry_run, yes, /*confirm*/ true, /*compact*/ false).await?;
+            }
+        }
+        PodCmd::Jobs { kill, sel } => {
+            // Ids are checked before anything is listed: one goes into a remote path.
+            let (targets, only) = arena_core::jobs::split_job_arg(&sel.targets).map_err(anyhow::Error::msg)?;
+            let kill = kill.as_deref().map(arena_core::jobs::JobId::parse).transpose().map_err(anyhow::Error::msg)?;
+            if let (Some(k), Some(o)) = (&kill, &only) {
+                if k != o {
+                    anyhow::bail!("--kill {k} and job {o}: name one job");
+                }
+            }
+            let sel = select(provider, cfg, &Select { targets, opts: sel.opts }.args(), Unscoped::All).await?;
+            match kill {
+                Some(id) => {
+                    let ask = &mut |what: &str| confirm(yes, what);
+                    jobs::handle_kill(remote, cfg, &sel, &id, ask, &mut |l| println!("{l}")).await?
+                }
+                None => jobs::handle_list(remote, cfg, &sel, only.as_ref(), &mut |l| println!("{l}")).await?,
+            }
+        }
+        PodCmd::Logs { tail, follow, sel } => {
+            let (targets, job) = arena_core::jobs::split_job_arg(&sel.targets).map_err(anyhow::Error::msg)?;
+            let sel = select(provider, cfg, &Select { targets, opts: sel.opts }.args(), Unscoped::All).await?;
+            // Ctrl+C is only taken over once following starts; until then it ends the command.
+            let stop = || interrupt.wait();
+            let tail = usize::try_from(tail).unwrap_or(usize::MAX);
+            jobs::handle_logs(remote, cfg, &sel, job.as_ref(), tail, follow, jobs::FOLLOW_INTERVAL, stop, &mut |l| println!("{l}"))
+                .await?;
         }
         PodCmd::Test { deep: true, sel, json, verbose } => {
             // Read-only: no confirm. Config first: a malformed MIN_DRIVER_VERSION fails before
@@ -4995,9 +5072,11 @@ async fn handle_pods_with(
 /// the command (`trailing_var_arg`), so `run hostname -t apple` would run `hostname -t
 /// apple` on *every* pod, `--exclude`/`--on`/`--gpus` would stop narrowing, and a trailing
 /// `--dry-run` would make the preview real. (`--all` is left alone: misplaced, it changes
-/// nothing — `run` defaults to every pod.)
-const RUN_FLAGS_BEFORE_COMMAND: &[&str] =
-    &["-t", "--target", "--include", "--exclude", "--on", "--gpus", "--dry-run", "--dryrun", "--dry"];
+/// nothing — `run` defaults to every pod.) A trailing `--background` would run the command
+/// in the foreground, to be cut off at the timeout.
+const RUN_FLAGS_BEFORE_COMMAND: &[&str] = &[
+    "-t", "--target", "--include", "--exclude", "--on", "--gpus", "--dry-run", "--dryrun", "--dry", "--background", "--bg",
+];
 
 /// Why `run`'s command can't be taken as typed: it holds one of
 /// [`RUN_FLAGS_BEFORE_COMMAND`] as a bare word (or `--flag=value`). Only whole words count,
@@ -9620,6 +9699,9 @@ mod selection_tests {
             (&["hostname", "-t", "apple"][..], Some("`-t`")),
             (&["x", "--target=apple", "--gpus", "2"], Some("`--target=apple --gpus`")),
             (&["x", "--include", "a", "--dryrun"], Some("`--include --dryrun`")),
+            (&["pytest", "-x", "--background"], Some("`--background`")),
+            (&["pytest", "--bg"], Some("`--bg`")),
+            (&["sleep", "--bgcolor"], None),
             // a quoted command is one word; flags that only look alike are left alone
             (&["tmux kill-session -t lab"], None),
             (&["tar", "-tvf", "x.tar"], None),
@@ -12119,14 +12201,14 @@ mod remote_tests {
 
         // `pods run --timeout 45`.
         let fake = Arc::new(FakeRemote::new());
-        let run = PodCmd::Run { sel: SelectByFlag::default(), command: vec!["nvidia-smi".into()], timeout: 45, dry_run: false };
+        let run = PodCmd::Run { sel: SelectByFlag::default(), command: vec!["nvidia-smi".into()], timeout: 45, dry_run: false, background: false };
         handle_pods(run, &fleet(), fake.clone(), &cfg(), true).await.unwrap();
         assert_eq!(fake.calls().len(), 3);
         assert!(fake.calls().iter().all(|c| matches!(c, RemoteCall::Exec { timeout, .. } if *timeout == Some(Duration::from_secs(45)))));
 
         // A dry run reaches no pod.
         let fake = Arc::new(FakeRemote::new());
-        let run = PodCmd::Run { sel: SelectByFlag::default(), command: vec!["reboot".into()], timeout: 45, dry_run: true };
+        let run = PodCmd::Run { sel: SelectByFlag::default(), command: vec!["reboot".into()], timeout: 45, dry_run: true, background: false };
         handle_pods(run, &fleet(), fake.clone(), &cfg(), true).await.unwrap();
         assert!(fake.calls().is_empty());
     }

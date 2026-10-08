@@ -74,7 +74,7 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     (e.g. a Vast 429), keeps its forward, and if no provider answers nothing is written.
     Provider list responses with an unexpected shape are errors, never "zero pods".
 - `arena` (CLI):
-  - `pods list | create | stop | restart | terminate | kill` (`--provider
+  - `pods list | create | stop | restart | terminate` (`--provider
     runpod|vast|hetzner`; Vast reads `VAST_API_KEY`, Hetzner reads `HETZNER_API_KEY`
     + `HETZNER_*`). `restart`/`terminate` take **one** pod (name, bare name, `@name` or id —
     a name two pods share is refused: pass the id); `stop` takes the shared
@@ -112,8 +112,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     row, is named, and makes the exit non-zero without stopping any terminate.
     `stop apple..mayor` / `stop --all --exclude bloom` stops many at once (needs targets or
     `--all`): every selected pod in a billing state (running, starting/provisioning/…, or
-    ERROR) is stopped, others are skipped with a note; `kill` is the stop→wait-for-
-    EXITED→delete flow (`--timeout`; one target or `--all`).
+    ERROR) is stopped, others are skipped with a note. (The legacy stop→wait→delete
+    `kill` is gone: `terminate` deletes directly.)
   - `rename <old> <new>` / `rename --from-prefix <p>` renames the pod (metadata only, no
     restart) and then brings along what's keyed by the name: rewrites `~/.name` over SSH
     (setup's exact `export MACHINE_NAME='<short>'` line; an unreachable pod is reported with
@@ -284,6 +284,32 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     pod, so quote a command that takes one, `run 'tmux kill-session -t lab'`; on a timeout the local ssh is killed, and the remote
     command dies at its next write to the closed connection) / the read-only
     torch-version health check (90s per pod).
+  - `pods run --background [-t <targets>] <cmd>` / `pods jobs [targets] [JOB] [--kill JOB]` /
+    `pods logs [targets] [JOB] [-n N] [-f]` — **detached course-test runs**. `--background`
+    (confirms first; `--dry-run` shows the wrapper) starts the command on each pod with
+    `setsid -f nohup` (not `&`, which would start it with SIGINT/SIGQUIT ignored — no
+    `KeyboardInterrupt`; only a `setsid` without `-f` falls back to that), under `pods
+    run`'s shell + conda env (plus `PYTHONUNBUFFERED=1`), and returns at once: `[n/N] ✓
+    <pod>: job <id> (pid …)`. A job that can't record its pid doesn't run (`exit 125`); no
+    pid within 5s is reported as "may have started anyway — check `arena pods jobs` before
+    retrying", never as a clean failure. One id per run, e.g.
+    `20261008-142301-pytest-x` (UTC start + command slug); everything stays on the pod
+    under `~/.arena/jobs/<id>/` (`cmd`, `run`, `log` = stdout+stderr, `pid`, `started_at`,
+    `exit`), so it survives your SSH session and any operator can look — but not a pod
+    restart (container disk), and logs are never rotated or pruned. No time limit;
+    `--timeout` is refused with it. `pods jobs`: a table of each pod's jobs, newest first
+    (`running (pid N)` — the pid must still be that job's wrapper, not a recycled one — /
+    `exit N` / `lost` = ended without an exit code, or still no pid after a minute;
+    `starting` before that). `pods logs`: per pod, the job's status
+    and its last `-n` lines (default 20, of at most the last 1 MiB; JOB defaults to each
+    pod's newest; a JOB-shaped word among the targets is the job). `-f` re-reads every 3s
+    from where it left off (exact byte offsets, lines printed once, `[pod]`-prefixed with
+    several pods) until every job has ended, then exits non-zero unless all were `exit 0`;
+    a pod that fails 5 reads in a row is given up on; Ctrl+C stops following, never a job.
+    `pods jobs --kill JOB` (confirms) sends SIGTERM to the job's process group where it is
+    running (→ `exit 143 (SIGTERM)`); no SIGKILL follow-up. Log text is stripped of
+    escape sequences/control characters before printing. Calls are bounded (30s per pod;
+    the start may have happened if it timed out — the report says so).
   - `pods test --deep [targets] [--json] [-v]` — the **is-this-pod-usable** check (read-only),
     for what a plain `import torch` misses on a bad host. One embedded script per pod
     (one SSH exec, 150s budget, inside the conda env) measures: nvidia-smi GPUs + driver +
@@ -644,13 +670,51 @@ construction, so no auth is needed; health shows `unknown` until a `pods test --
 `up --check` has run under the same user (the cache lives in that user's state dir — set
 `ARENA_STATE_DIR` for both if the cron runs as someone else).
 
+## Testing
+
+```bash
+cargo test --release   # everything offline: pure planners, fake providers, FakeRemote, fixtures
+```
+
+`crates/cli/tests/live_smoke.rs` is the **opt-in live smoke test** (`#[ignore]`d; one ≤ $0.30/h
+community pod for a few minutes — run it before each cohort). It drives the built `arena` binary:
+`pods up <free name> --gpu A4000,3070 --gpus 1 --cloud community --max-price 0.30 --retry-mins 5
+--check` → `pods test --deep --json` (parses, not FAIL) → `snapshot --public` (the machine is up
+with its cached health; no IPv4 literal, SSH host, pod id or prefix) → `pods rename` to a second
+free name and back → `pods terminate` → `teardown --check` until nothing of it is left.
+
+```bash
+cd /home/dev/sandbox/arena-infra-rs
+ARENA_LIVE_SMOKE=1 ARENA_LIVE_CONFIG=/home/dev/sandbox/config.env \
+  cargo test --release -p arena-cli --test live_smoke -- --ignored --nocapture
+# also: RUNPOD_API=v2 (smoke the v2 backend) · ARENA_LIVE_GPU=3070 (the --gpu list)
+```
+
+It refuses to start unless both variables are set; the config (symlinks resolved) is not
+`/home/dev/prod-ro/config.env` or anything under `/home/dev/prod-ro` or `/root`; its
+`MACHINE_NAME_PREFIX` starts with `devtest` (or is named in `ARENA_LIVE_PREFIX_ALLOW`,
+comma-separated — never an `arenaN` prefix); a configured proxy is a local file outside `/etc`
+(resolved as the binary will write it: relative to the config's directory, `..` and symlinks
+followed); and every configured provider lists, holding only `{prefix}-…` pods (anything else =
+the wrong account). The binary gets a cleared environment (only `PATH HOME USER LOGNAME LANG
+LC_ALL TZ RUNPOD_API`, so an exported key or prefix can't override the checked config) plus
+`SSH_PROXY_RELOAD_CMD=` (write-only proxy) and a fresh `ARENA_STATE_DIR`, and runs from the
+config's directory like `bin/arena-dev`. Whatever fails, a guard first terminates the pod id
+the run recorded (no listing needed), then each round terminates every pod holding the run's
+two names (or that id) on the providers that answer, until a listing where *every* provider
+answered shows none — so another provider's outage delays the all-clear, never a terminate;
+after 8 rounds without one it prints the commands to finish by hand. Only Ctrl+C gets past
+it, so after an interrupted run check `teardown --check`. A COMMUNITY pod that never gets a
+public IP fails as `FAILED endpoint` (see `docs/TODO.md`); the guard still cleans it up.
+
 ## Layout
 
 ```
 crates/
-  core/   library: config, provider trait + impls, pod model, naming
-  cli/    `arena` binary (clap)
+  core/   library: config, provider trait + impls, Remote, planners/judges (see ARCHITECTURE.md)
+  cli/    `arena` binary (clap); tests/live_smoke.rs = the opt-in live smoke test
   tui/    `arena-tui` binary (ratatui)
 web/
   fleet.html  the public fleet page (reads fleet.json next to it)
+docs/     RunPod API notes, known issues
 ```
