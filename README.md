@@ -265,6 +265,27 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     pod, so quote a command that takes one, `run 'tmux kill-session -t lab'`; on a timeout the local ssh is killed, and the remote
     command dies at its next write to the closed connection) / the read-only
     torch-version health check (90s per pod).
+  - `pods run --background [-t <targets>] <cmd>` / `pods jobs [targets] [JOB] [--kill JOB]` /
+    `pods logs [targets] [JOB] [-n N] [-f]` — **detached course-test runs**. `--background`
+    (confirms first; `--dry-run` shows the wrapper) starts the command on each pod with
+    `setsid nohup`, under `pods run`'s shell + conda env (plus `PYTHONUNBUFFERED=1`), and
+    returns at once: `[n/N] ✓ <pod>: job <id> (pid …)`. One id per run, e.g.
+    `20261008-142301-pytest-x` (UTC start + command slug); everything stays on the pod
+    under `~/.arena/jobs/<id>/` (`cmd`, `run`, `log` = stdout+stderr, `pid`, `started_at`,
+    `exit`), so it survives your SSH session and any operator can look — but not a pod
+    restart (container disk), and logs are never rotated or pruned. No time limit;
+    `--timeout` is refused with it. `pods jobs`: a table of each pod's jobs, newest first
+    (`running (pid N)` — the pid must still be that job's wrapper, not a recycled one — /
+    `exit N` / `lost` = ended without an exit code). `pods logs`: per pod, the job's status
+    and its last `-n` lines (default 20, of at most the last 1 MiB; JOB defaults to each
+    pod's newest; a JOB-shaped word among the targets is the job). `-f` re-reads every 3s
+    from where it left off (exact byte offsets, lines printed once, `[pod]`-prefixed with
+    several pods) until every job has ended, then exits non-zero unless all were `exit 0`;
+    a pod that fails 5 reads in a row is given up on; Ctrl+C stops following, never a job.
+    `pods jobs --kill JOB` (confirms) sends SIGTERM to the job's process group where it is
+    running (→ `exit 143 (SIGTERM)`); no SIGKILL follow-up. Log text is stripped of
+    escape sequences/control characters before printing. Calls are bounded (30s per pod;
+    the start may have happened if it timed out — the report says so).
   - `pods test --deep [targets] [--json] [-v]` — the **is-this-pod-usable** check (read-only),
     for what a plain `import torch` misses on a bad host. One embedded script per pod
     (one SSH exec, 150s budget, inside the conda env) measures: nvidia-smi GPUs + driver +

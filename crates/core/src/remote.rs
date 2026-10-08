@@ -278,11 +278,16 @@ mod fake {
 
         /// Exit 0 with `stdout`.
         pub fn stdout(stdout: &str) -> Self {
-            let mut r = Self::ok();
-            if let Ok(o) = &mut r.result {
+            Self::ok().with_stdout(stdout)
+        }
+
+        /// This reply's stdout set to `stdout` — for a failed call that still printed
+        /// something (`exit(3, "").with_stdout(…)`: a remote script explaining a refusal).
+        pub fn with_stdout(mut self, stdout: &str) -> Self {
+            if let Ok(o) = &mut self.result {
                 o.stdout = stdout.to_string();
             }
-            r
+            self
         }
 
         /// Exit `code` with `stderr` (e.g. `exit(255, "ssh: connect to host … Connection
