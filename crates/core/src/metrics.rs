@@ -14,7 +14,7 @@
 //! `FakeRemote`) and is bounded by [`PROBE_TIMEOUT`], so a wedged pod shows as an error
 //! row instead of stalling a `pods list` or a dashboard refresh.
 
-use crate::remote::{Remote, SshRemote, PROBE_TIMEOUT};
+use crate::remote::{Remote, PROBE_TIMEOUT};
 use crate::ssh::SshTarget;
 
 /// Separates the `nvidia-smi` block from the key=value health block in the probe's
@@ -389,12 +389,6 @@ pub async fn fetch_with(remote: &dyn Remote, target: &SshTarget, opts: &ProbeOpt
         Err(e) => m.error = Some(e.to_string()),
     }
     m
-}
-
-/// [`fetch_with`] over real SSH ([`SshRemote`]) — the TUI's entry point until it is handed
-/// a `Remote` too (PLAN Phase 3).
-pub async fn fetch(target: &SshTarget, opts: &ProbeOpts) -> PodMetrics {
-    fetch_with(&SshRemote, target, opts).await
 }
 
 /// Single-quote for safe inclusion in a `sh -c` string (POSIX `'\''` escaping).

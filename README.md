@@ -38,7 +38,7 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     IP with SSH on `:22`, so they use the same proxy/`pods up` flow as GPU providers.
   - `naming` — next-free machine-name allocation, mirroring the legacy logic.
   - `snapshot` — one read-only picture of the fleet (`FleetSnapshot`, built by one pure
-    `build` for the CLI now and the TUI next), the **health cache** of the last deep check per
+    `build` that the CLI and the TUI share), the **health cache** of the last deep check per
     pod, and the allowlisted `PublicSnapshot` for the web page.
   - `proxy` — port-forwarding planner. Pods are reached over SSH (VS Code
     Remote-SSH), and the provider reassigns a pod's SSH endpoint on restart, so the
@@ -392,10 +392,29 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `s` toggles full `arena8-apple` and the choice persists to
     `~/.config/arena-tui/prefs`), STATUS, a **SET** health glyph (`✓/✗/·` for `~/.name`,
     the deploy key, git origin→GitHub), GPU (live from `nvidia-smi`, e.g. `2×RTX A4000`
-    — the provider list API omits this), GPU%/MEM/TEMP, `$/HR`, **BRANCH** (autocommit
+    — the provider list API omits this), GPU%/MEM/TEMP, **BRANCH** (autocommit
     branches shortened to their `w1d2` label; `main`/others shown as-is), and progress.
-    The **fleet summary bar** shows total GPUs, mean util, memory, and burn as both
-    `$/hr` and `$/day`.
+  - **Fleet columns from the core snapshot** — every refresh is one
+    `snapshot::build` (`arena snapshot`'s builder) over the per-provider listing, the
+    local proxy file and the health cache, so these read exactly as the CLI prints them:
+    `$/H` (provider currency, `-` unless billing), an **M** badge for a host maintenance
+    window (detail pane: window + note), **HEALTH** = the last `pods test --deep` verdict
+    + age (`pass 12m`, `fail 2h`; detail pane: worst issue + the failing check's text),
+    **PROXY** = the stable port, green live / yellow stale (`:9501 stale` when wide), `-`
+    no forward, `?` remote proxy. The **summary bar** is `pods list`'s footer (`$` and
+    Hetzner `€` kept apart, unpriced pods counted) plus per day, and names a provider
+    that failed to list. API calls per refresh are unchanged (one list per provider); the
+    details query (GPU/$/maintenance) runs every 60 s or on `r` (≥10 s apart).
+  - **`d`** deep-checks the cursor pod (or the marked set) **in the background** — no
+    modal; the row says `checking`, the footer reports the tally when done, and the
+    verdicts go to the same health cache `arena snapshot` reads. **`/`** marks pods with
+    the CLI's selector syntax (`alpha..delta`, ids, `-x`/`!name`, `--on`, `--gpus`); a
+    typo marks nothing and says why in the footer (`all` is refused: marks feed
+    terminate/restart). A marked-set confirm lists the pods by name.
+  - Every pod SSH call (metrics, test/run/backup/set-branch/setup, deep check) goes
+    through `Remote` with a budget (90 s / 30 min / 5 min / 2 min / setup's per-step /
+    150 s), so a wedged pod ends an action with `timed out after …`; only `c` (your
+    interactive shell) is a plain `ssh`.
   - **Navigate** with `↑/↓`/`j/k`; `enter` opens a per-pod detail pane (per-GPU
     breakdown, full branch/origin/health, util/temp **sparklines**). `Ctrl-C`/`q` quit.
   - **Act** on the selected pod with `a` (restart / stop / terminate / backup / setup /

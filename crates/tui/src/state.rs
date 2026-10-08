@@ -4,10 +4,22 @@
 //! the terminal, the provider calls, and the SSH; this module just decides *what*
 //! should be shown and *when* a confirmation is satisfied, so the risky bits (e.g.
 //! "a destructive action needs the exact pod name typed back") are testable offline.
+//!
+//! Every fleet datum (cost, maintenance, proxy port + state, last deep check) comes from
+//! `arena_core`'s [`FleetSnapshot`] builder and its labels — the same ones `pods list` and
+//! `arena snapshot` print. What lives here is only what is the dashboard's own: which cell
+//! gets which colour, how a background deep check's results fold into what is on screen,
+//! how often the provider's slower details query may run, and what `/` marks.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Duration;
 
+use arena_core::fleet::{self, FleetCost};
+use arena_core::health::{render_summary, PodHealth, Status};
 use arena_core::metrics::PodMetrics;
+use arena_core::pod::Maintenance;
+use arena_core::selector::{Naming, SelectArgs, Selector};
+use arena_core::snapshot::{self, cache_key, fmt_age, FleetSnapshot, HealthCache, HealthRecord, ProxyState, SnapshotPod};
 use arena_core::Pod;
 
 /// How many recent samples we keep per pod for the sparklines.
@@ -84,12 +96,10 @@ pub struct FleetSummary {
     pub mean_util: Option<u32>,
     pub mem_used_mb: u32,
     pub mem_total_mb: u32,
-    /// Summed $/hr over billing pods that report a cost (a stopped pod's reported rate
-    /// isn't being charged — `arena_core::status::bills_hourly`, as `pods list` counts).
-    pub total_cost: f64,
 }
 
-/// Compute the fleet summary from the current pods + their metrics.
+/// Compute the fleet summary from the current pods + their metrics. (Cost isn't here: it
+/// is the snapshot's [`FleetCost`], which keeps Hetzner's € apart from the $ providers.)
 pub fn summarize(pods: &[Pod], metrics: &HashMap<String, PodMetrics>) -> FleetSummary {
     let mut s = FleetSummary {
         pods: pods.len(),
@@ -98,9 +108,6 @@ pub fn summarize(pods: &[Pod], metrics: &HashMap<String, PodMetrics>) -> FleetSu
     let mut util_sum = 0u64;
     let mut util_n = 0u64;
     for pod in pods {
-        if let Some(c) = pod.cost_per_hr.filter(|_| arena_core::status::bills_hourly(&pod.provider, &pod.status)) {
-            s.total_cost += c;
-        }
         let Some(m) = metrics.get(&pod.name) else { continue };
         if m.error.is_some() {
             s.unreachable += 1;
@@ -124,6 +131,305 @@ pub fn summarize(pods: &[Pod], metrics: &HashMap<String, PodMetrics>) -> FleetSu
         s.mean_util = Some((util_sum / util_n) as u32);
     }
     s
+}
+
+/// The summary bar: pod/GPU/util counts from the probes, then the fleet's burn exactly as
+/// `pods list`'s footer words it ([`fleet::fleet_footer`]: billing pods only, `$` and
+/// Hetzner's `€` kept apart, unpriced pods called out), the same per day, and — when a
+/// provider failed to list — that its pods (and their cost) are missing.
+pub fn summary_text(s: &FleetSummary, cost: &FleetCost, partial: &[String]) -> String {
+    let util = s.mean_util.map(|u| format!("{u}%")).unwrap_or_else(|| "-".into());
+    let mut out = format!(" {} pods · {} GPUs · mean util {util} · {}", s.pods, s.total_gpus, fleet::fleet_footer(cost));
+    let mut per_day = Vec::new();
+    if cost.priced_usd > 0 {
+        per_day.push(format!("{}/day", fleet::fmt_money("$", cost.usd_per_hr * 24.0)));
+    }
+    if cost.priced_eur > 0 {
+        per_day.push(format!("{}/day", fleet::fmt_money("€", cost.eur_per_hr * 24.0)));
+    }
+    if !per_day.is_empty() {
+        out.push_str(&format!(" ≈ {}", per_day.join(" + ")));
+    }
+    if s.unreachable > 0 {
+        out.push_str(&format!("  ·  {} unreachable", s.unreachable));
+    }
+    if !partial.is_empty() {
+        out.push_str(&format!("  ·  {} failed to list: its pods are missing", partial.join(", ")));
+    }
+    out
+}
+
+/// How a cell should read at a glance; `main` maps it to a colour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    Good,
+    Warn,
+    Bad,
+    /// Work in flight (a deep check running).
+    Busy,
+    /// Nothing to say (never checked, no forward, unknown).
+    Dim,
+}
+
+/// The HEALTH cell: `checking` while a deep check of this pod runs, else the last cached
+/// verdict and its age (`pass 12m`, `fail 2h` — `Status::label` + `snapshot::fmt_age`,
+/// as `arena snapshot` words them; the worst issue is left to the detail pane, it doesn't
+/// fit a column), or `-` for a pod never checked. `now` is the snapshot's clock.
+pub fn health_cell(h: Option<&HealthRecord>, checking: bool, now: u64) -> (String, Tone) {
+    if checking {
+        return ("checking".into(), Tone::Busy);
+    }
+    let Some(h) = h else { return ("-".into(), Tone::Dim) };
+    let tone = match h.status {
+        Status::Pass => Tone::Good,
+        Status::Warn => Tone::Warn,
+        Status::Fail => Tone::Bad,
+        Status::Skip => Tone::Dim,
+    };
+    (format!("{} {}", h.status.label(), fmt_age(now.saturating_sub(h.checked_at))), tone)
+}
+
+/// The PROXY cell: [`snapshot::proxy_label`] (`:9500`, `:9500 stale`, `-`, `?`), or with
+/// `compact` (a narrow terminal) just the port — the tone still tells live from stale.
+pub fn proxy_cell(p: &SnapshotPod, compact: bool) -> (String, Tone) {
+    let tone = match p.proxy {
+        ProxyState::Live => Tone::Good,
+        ProxyState::Stale => Tone::Warn,
+        ProxyState::None | ProxyState::Unknown => Tone::Dim,
+    };
+    let text = match (compact, p.proxy_port) {
+        (true, Some(port)) if matches!(p.proxy, ProxyState::Live | ProxyState::Stale) => format!(":{port}"),
+        _ => snapshot::proxy_label(p),
+    };
+    (text, tone)
+}
+
+/// The detail pane's proxy line, spelling out what the state means for the operator.
+pub fn proxy_detail(p: &SnapshotPod) -> String {
+    let label = snapshot::proxy_label(p);
+    match p.proxy {
+        ProxyState::Live => format!("{label} (live)"),
+        ProxyState::Stale => format!("{label} (`arena proxy apply` re-points it)"),
+        ProxyState::None => "- (no forward for this name)".into(),
+        ProxyState::Unknown => "? (remote/unreadable proxy config)".into(),
+    }
+}
+
+/// Whether the pod's host has a maintenance window (or note) on record — the badge. Same
+/// test as `pods list`'s MAINT column: [`fleet::maintenance_label`] says something.
+pub fn has_maintenance(pod: &Pod) -> bool {
+    fleet::maintenance_label(pod.maintenance.as_ref()) != "-"
+}
+
+/// The dashboard's rows for one refresh: [`snapshot::build`] over what was listed, ordered
+/// by name as the dashboard always has been (the builder groups by provider for `pods
+/// list`; a stable sort keeps that order between pods sharing a name).
+pub fn dashboard_snapshot(
+    pods: &[Pod],
+    partial: &[String],
+    proxy_file: Option<&str>,
+    health: &HealthCache,
+    naming: &Naming,
+    now: u64,
+) -> FleetSnapshot {
+    let mut snap = snapshot::build(pods, partial, proxy_file, health, naming, now);
+    snap.pods.sort_by(|a, b| a.pod.name.cmp(&b.pod.name));
+    snap
+}
+
+/// Deep checks started from the dashboard: which pods are being checked now (so a second
+/// `d` doesn't double up and the row can say `checking`), and the verdicts this session
+/// produced. Those are also written to the shared health cache file, but kept here too so
+/// a result shows even when that write failed, and isn't lost when the next refresh
+/// re-reads the file — [`DeepChecks::layer`] puts them on top of it, newest wins.
+#[derive(Debug, Clone, Default)]
+pub struct DeepChecks {
+    running: HashSet<String>,
+    session: HealthCache,
+}
+
+impl DeepChecks {
+    pub fn is_running(&self, pod: &Pod) -> bool {
+        self.running.contains(&cache_key(&pod.provider, &pod.id))
+    }
+
+    /// How many pods are being checked right now.
+    pub fn running(&self) -> usize {
+        self.running.len()
+    }
+
+    /// Claim `pods` for a check: returns those not already being checked, now marked
+    /// running (the caller checks exactly these, then hands them back to [`Self::finish`]).
+    pub fn begin(&mut self, pods: Vec<Pod>) -> Vec<Pod> {
+        pods.into_iter().filter(|p| self.running.insert(cache_key(&p.provider, &p.id))).collect()
+    }
+
+    /// Fold a finished check in: release every claimed pod (`claimed`, even one that got
+    /// no result), record the verdicts (checked at `now`), show them on the rows of `snap`
+    /// right away, and return the line for the status bar — the tally as `pods test
+    /// --deep` prints it, plus which pods failed.
+    pub fn finish(&mut self, claimed: &[Pod], results: &[PodHealth], now: u64, snap: &mut FleetSnapshot) -> String {
+        for p in claimed {
+            self.running.remove(&cache_key(&p.provider, &p.id));
+        }
+        self.session.merge(results, now);
+        for row in &mut snap.pods {
+            if let Some(r) = self.session.get(&row.pod) {
+                if row.health.as_ref().is_none_or(|h| h.checked_at <= r.checked_at) {
+                    row.health = Some(r.clone());
+                }
+            }
+        }
+        let tally = render_summary(results).into_iter().next().unwrap_or_default();
+        let failed: Vec<&str> = results.iter().filter(|h| h.status == Status::Fail).map(|h| h.name.as_str()).collect();
+        if failed.is_empty() {
+            format!("deep check: {tally}")
+        } else {
+            format!("deep check: {tally} — failed: {}", failed.join(", "))
+        }
+    }
+
+    /// The cache to show: `file` (what every `arena` command recorded) with this session's
+    /// verdicts on top wherever they are at least as new.
+    pub fn layer(&self, mut file: HealthCache) -> HealthCache {
+        for (k, r) in &self.session.pods {
+            if file.pods.get(k).is_none_or(|f| f.checked_at <= r.checked_at) {
+                file.pods.insert(k.clone(), r.clone());
+            }
+        }
+        file
+    }
+}
+
+/// How often the provider's details query (`Provider::enrich`: RunPod's GraphQL for GPU,
+/// $/h and the host maintenance window) runs at most, unprompted. The pod list is polled
+/// every few seconds; the details change rarely, and doubling the call volume against a
+/// rate-limited API would cost more than a minute-old maintenance window.
+pub const DETAILS_EVERY: Duration = Duration::from_secs(60);
+
+/// The shortest gap between two details queries even when `r` asks for one, so holding the
+/// key can't hammer the API.
+pub const DETAILS_MIN_GAP: Duration = Duration::from_secs(10);
+
+/// Whether this refresh should also run the details query: never run yet, the last one
+/// [`DETAILS_EVERY`] ago, or asked for (`forced`, the `r` key) at least
+/// [`DETAILS_MIN_GAP`] after the last.
+pub fn details_due(since_last: Option<Duration>, forced: bool) -> bool {
+    match since_last {
+        None => true,
+        Some(d) => d >= DETAILS_EVERY || (forced && d >= DETAILS_MIN_GAP),
+    }
+}
+
+/// What the details query told us about one pod, kept between queries.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PodDetails {
+    pub gpu_type: Option<String>,
+    pub gpu_count: Option<u32>,
+    pub cost_per_hr: Option<f64>,
+    pub maintenance: Option<Maintenance>,
+}
+
+/// The details of every pod just enriched, keyed like the health cache (`provider:id`).
+pub fn capture_details(enriched: &[Pod]) -> HashMap<String, PodDetails> {
+    enriched
+        .iter()
+        .map(|p| {
+            let d = PodDetails {
+                gpu_type: p.gpu_type.clone(),
+                gpu_count: p.gpu_count,
+                cost_per_hr: p.cost_per_hr,
+                maintenance: p.maintenance.clone(),
+            };
+            (cache_key(&p.provider, &p.id), d)
+        })
+        .collect()
+}
+
+/// Re-apply the last details to a fresh listing between queries, the way `enrich` merges
+/// them: fill the GPU type, $/h and maintenance window the cheap list call leaves out (a
+/// value the listing does report wins), and take the details' GPU count when it has one.
+/// A pod the details never covered (created since) is left as listed.
+pub fn overlay_details(pods: &mut [Pod], details: &HashMap<String, PodDetails>) {
+    for p in pods.iter_mut() {
+        let Some(d) = details.get(&cache_key(&p.provider, &p.id)) else { continue };
+        if p.gpu_type.is_none() {
+            p.gpu_type = d.gpu_type.clone();
+        }
+        p.gpu_count = d.gpu_count.or(p.gpu_count);
+        if p.cost_per_hr.is_none() {
+            p.cost_per_hr = d.cost_per_hr;
+        }
+        if p.maintenance.is_none() {
+            p.maintenance = d.maintenance.clone();
+        }
+    }
+}
+
+/// Split what was typed at `/` into the core selector's arguments: plain tokens are
+/// targets (names, ids, ranges `a..b`, comma lists); `-x`/`--exclude TOKEN` or `!TOKEN`
+/// leave pods out; `--on PROVIDER` and `--gpus N` narrow (both also as `--flag=value`).
+pub fn parse_select_input(input: &str) -> Result<SelectArgs, String> {
+    let mut args = SelectArgs::default();
+    let mut words = input.split_whitespace();
+    while let Some(w) = words.next() {
+        let (flag, inline) = match w.split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f, Some(v.to_string())),
+            _ => (w, None),
+        };
+        let takes_value = matches!(flag, "-x" | "--exclude" | "--on" | "--gpus");
+        let value = if takes_value {
+            match inline.or_else(|| words.next().map(String::from)) {
+                Some(v) => v,
+                None => return Err(format!("{flag} needs a value")),
+            }
+        } else {
+            String::new()
+        };
+        match flag {
+            "-x" | "--exclude" => args.exclude.push(value),
+            "--on" => args.on = Some(value),
+            "--gpus" => {
+                args.gpus = Some(value.parse().map_err(|_| format!("--gpus wants a number of GPUs (got `{value}`)"))?)
+            }
+            "--all" => args.all = true,
+            _ if w.len() > 1 && w.starts_with('!') => args.exclude.push(w[1..].to_string()),
+            _ if w.starts_with('-') => {
+                return Err(format!(
+                    "unknown option `{w}` — type names, ids or ranges (apple..delta), -x/!NAME to leave one out, --on PROVIDER, --gpus N"
+                ))
+            }
+            _ => args.targets.push(w.to_string()),
+        }
+    }
+    Ok(args)
+}
+
+/// What `/` marks: the selection typed in the core selector syntax ([`parse_select_input`]),
+/// parsed and resolved by `arena_core::selector` exactly as the CLI does — so a typo (a
+/// name matching no pod, a reversed range, a misspelt `--exclude`) is an error and nothing
+/// is marked. Returns the marked pods' ids and the status line.
+///
+/// Marks feed the marked-set actions, terminate and restart among them, so two things the
+/// CLI's read-only commands accept are refused here: `all` (whole-fleet actions are `A`,
+/// which offers only the safe ones), and a selection naming no pod (`--on`/`--gpus`
+/// alone start from the whole fleet).
+pub fn select_marks(input: &str, naming: &Naming, pods: &[Pod]) -> Result<(HashSet<String>, String), String> {
+    let one_line = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let args = parse_select_input(input)?;
+    let sel = Selector::parse(&args, naming).map_err(|e| one_line(&e.0))?;
+    if sel.all {
+        return Err("`all` isn't taken here — marks feed terminate/restart; name pods or a range \
+                    (A acts on the whole fleet with the safe actions)"
+            .into());
+    }
+    if sel.is_unscoped() {
+        return Err("name pods, ids or a range (apple..delta) — -x, --on and --gpus only narrow a named set".into());
+    }
+    let picked = sel.resolve(naming, pods).map_err(|e| one_line(&e.0))?;
+    let ids: HashSet<String> = picked.iter().map(|&i| pods[i].id.clone()).collect();
+    let n = picked.len();
+    Ok((ids, format!("marked {n} pod{}: {}", if n == 1 { "" } else { "s" }, sel.describe())))
 }
 
 /// How a pod name is shown: full (`arena8-apple`) or short (`apple`). Stripping the
@@ -532,18 +838,34 @@ mod tests {
         assert_eq!(s.total_gpus, 2);
         assert_eq!(s.mean_util, Some(50)); // (100 + 0) / 2 GPUs
         assert_eq!((s.mem_used_mb, s.mem_total_mb), (9000, 32000));
-        assert!((s.total_cost - 1.09).abs() < 1e-9);
     }
 
+    /// The summary bar's burn is the core `FleetCost`, worded as `pods list`'s footer:
+    /// billing pods only, Hetzner's € kept apart from $ (the bar used to add them up), the
+    /// unpriced called out, the same per day — and a provider that failed to list named.
     #[test]
-    fn summary_cost_counts_billing_pods_only() {
+    fn summary_text_shows_the_core_fleet_cost() {
         let mut exited = pod("arena8-zebra", Some(0.13));
         exited.status = "EXITED".into();
         let mut starting = pod("arena8-yak", Some(0.20));
         starting.status = "STARTING".into();
-        let s = summarize(&[pod("arena8-apple", Some(0.40)), exited, starting], &HashMap::new());
-        assert!((s.total_cost - 0.60).abs() < 1e-9, "{}", s.total_cost);
-        assert_eq!(s.pods, 3);
+        let mut hetzner = pod("arena8-cpu", Some(0.0056));
+        hetzner.provider = "hetzner".into();
+        hetzner.status = "off".into(); // a powered-off server still bills
+        let unpriced = pod("arena8-new", None);
+        let pods = [pod("arena8-apple", Some(0.40)), exited, starting, hetzner, unpriced];
+        let s = summarize(&pods, &HashMap::new());
+        let cost = fleet::fleet_cost(&pods);
+        assert_eq!(
+            summary_text(&s, &cost, &[]),
+            " 5 pods · 0 GPUs · mean util - · fleet: $0.60/h across 4 billing pod(s) + €0.006/h hetzner (1 unpriced) \
+             ≈ $14.40/day + €0.13/day"
+        );
+        let partial = summary_text(&s, &cost, &["vast".to_string()]);
+        assert!(partial.ends_with("·  vast failed to list: its pods are missing"), "{partial}");
+        // Nothing billing: no per-day figure.
+        let idle = summary_text(&FleetSummary::default(), &fleet::fleet_cost(&[]), &[]);
+        assert_eq!(idle, " 0 pods · 0 GPUs · mean util - · fleet: $0.00/h across 0 billing pod(s)");
     }
 
     #[test]
@@ -697,5 +1019,316 @@ mod tests {
         // non-autocommit branches are untouched
         assert_eq!(short_branch("main", "arena8"), "main");
         assert_eq!(short_branch("feature/foo", "arena8"), "feature/foo");
+    }
+
+    // -- The core snapshot on the dashboard --------------------------------------------
+
+    use arena_core::health::Check;
+    use arena_core::snapshot::Issue;
+
+    const NOW: u64 = 1_791_460_800; // 2026-10-08T12:00:00Z
+
+    fn fleet_cfg() -> arena_core::Config {
+        arena_core::Config::parse(
+            "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(\n \"alpha\"\n \"bravo\"\n \"charlie\"\n \"delta\"\n \"echo\"\n)\n",
+        )
+    }
+
+    /// `devtest-<name>` on `provider` with id `id`, RUNNING, at `endpoint` if given.
+    fn at(name: &str, provider: &str, id: &str, endpoint: Option<(&str, u16)>) -> Pod {
+        Pod {
+            id: id.into(),
+            name: format!("devtest-{name}"),
+            provider: provider.into(),
+            status: "RUNNING".into(),
+            ssh_ip: endpoint.map(|(ip, _)| ip.into()),
+            ssh_port: endpoint.map(|(_, port)| port),
+            ..Default::default()
+        }
+    }
+
+    /// A deep-check verdict for `p`, with one check of that status per name in `failing`.
+    fn verdict(p: &Pod, status: Status, failing: &[&str]) -> PodHealth {
+        PodHealth {
+            id: p.id.clone(),
+            name: p.name.clone(),
+            provider: p.provider.clone(),
+            status,
+            checks: failing.iter().map(|n| Check { name: n.to_string(), status, detail: "x".into() }).collect(),
+            facts: None,
+            host: None,
+        }
+    }
+
+    /// Forwards alpha → its endpoint (live) and bravo → an old one (stale).
+    fn proxy_file() -> String {
+        use arena_core::proxy::{render_nginx, Forward};
+        let fwd = |name: &str, port: u16, ip: &str, tport: u16| Forward {
+            name: format!("devtest-{name}"),
+            public_port: port,
+            target_ip: ip.into(),
+            target_port: tport,
+            provider: Some("runpod".into()),
+            pod_id: None,
+        };
+        render_nginx(&[fwd("alpha", 9500, "10.0.0.1", 22001), fwd("bravo", 9501, "10.0.0.9", 22999)])
+    }
+
+    #[test]
+    fn health_cell_table() {
+        let p = at("alpha", "runpod", "rp1", None);
+        let rec = |status, ago: u64| HealthRecord::from_health(&verdict(&p, status, &[]), NOW - ago);
+        // (cached record, a check running, text, tone)
+        let cases = [
+            (None, false, "-", Tone::Dim),
+            (None, true, "checking", Tone::Busy),
+            (Some(rec(Status::Pass, 720)), false, "pass 12m", Tone::Good),
+            (Some(rec(Status::Warn, 59)), false, "warn 59s", Tone::Warn),
+            (Some(rec(Status::Fail, 7_300)), false, "fail 2h", Tone::Bad),
+            (Some(rec(Status::Fail, 3 * 86_400)), false, "fail 3d", Tone::Bad),
+            // A re-check in flight says so over the old verdict.
+            (Some(rec(Status::Fail, 60)), true, "checking", Tone::Busy),
+        ];
+        for (r, checking, text, tone) in cases {
+            assert_eq!(health_cell(r.as_ref(), checking, NOW), (text.to_string(), tone), "{r:?} {checking}");
+        }
+        // A verdict newer than the snapshot's clock (it landed after the refresh) is 0s old.
+        assert_eq!(health_cell(Some(&rec(Status::Pass, 0)), false, NOW - 5).0, "pass 0s");
+    }
+
+    #[test]
+    fn proxy_cell_table() {
+        let cfg = fleet_cfg();
+        let naming = Naming::from_config(&cfg);
+        let pods = [
+            at("alpha", "runpod", "rp1", Some(("10.0.0.1", 22001))),
+            at("bravo", "runpod", "rp2", Some(("10.0.0.2", 22002))), // moved since the proxy wrote
+            at("charlie", "runpod", "rp3", None),
+        ];
+        let text = proxy_file();
+        let read = dashboard_snapshot(&pods, &[], Some(&text), &HealthCache::new(), &naming, NOW);
+        let unread = dashboard_snapshot(&pods, &[], None, &HealthCache::new(), &naming, NOW);
+        // (row, compact, text, tone)
+        let cases = [
+            (&read.pods[0], false, ":9500", Tone::Good),
+            (&read.pods[0], true, ":9500", Tone::Good),
+            (&read.pods[1], false, ":9501 stale", Tone::Warn),
+            (&read.pods[1], true, ":9501", Tone::Warn), // narrow: the colour says stale
+            (&read.pods[2], false, "-", Tone::Dim),
+            (&read.pods[2], true, "-", Tone::Dim),
+            (&unread.pods[0], false, "?", Tone::Dim),
+            (&unread.pods[0], true, "?", Tone::Dim),
+        ];
+        for (row, compact, text, tone) in cases {
+            assert_eq!(proxy_cell(row, compact), (text.to_string(), tone), "{} compact={compact}", row.pod.name);
+        }
+        assert_eq!(proxy_detail(&read.pods[0]), ":9500 (live)");
+        assert_eq!(proxy_detail(&read.pods[1]), ":9501 stale (`arena proxy apply` re-points it)");
+        assert_eq!(proxy_detail(&read.pods[2]), "- (no forward for this name)");
+        assert_eq!(proxy_detail(&unread.pods[0]), "? (remote/unreadable proxy config)");
+    }
+
+    /// The badge shows exactly when `pods list`'s MAINT column says something.
+    #[test]
+    fn maintenance_badge_follows_the_pods_list_column() {
+        let mut p = at("alpha", "runpod", "rp1", None);
+        let cases = [
+            (None, false),
+            (Some(Maintenance::default()), false), // nothing in it
+            (Some(Maintenance { note: Some("  ".into()), ..Default::default() }), false),
+            (Some(Maintenance { note: Some("GPU swap".into()), ..Default::default() }), true),
+            (Some(Maintenance { start: Some("2026-10-09T02:00:00Z".into()), ..Default::default() }), true),
+        ];
+        for (m, want) in cases {
+            p.maintenance = m.clone();
+            assert_eq!(has_maintenance(&p), want, "{m:?}");
+        }
+    }
+
+    #[test]
+    fn dashboard_rows_are_the_core_snapshot_ordered_by_name() {
+        let cfg = fleet_cfg();
+        let naming = Naming::from_config(&cfg);
+        let alpha = at("alpha", "vast", "77", Some(("10.0.0.1", 22001)));
+        let bravo = at("bravo", "hetzner", "88", None);
+        let charlie = at("charlie", "runpod", "rp3", None);
+        let mut cache = HealthCache::new();
+        cache.merge(&[verdict(&alpha, Status::Warn, &["load"])], NOW - 600);
+        let text = proxy_file();
+        let snap = dashboard_snapshot(&[charlie, alpha, bravo], &["runpod".into()], Some(&text), &cache, &naming, NOW);
+        // The builder groups by provider (hetzner, runpod, vast); the dashboard reads by name.
+        let names: Vec<&str> = snap.pods.iter().map(|p| p.pod.name.as_str()).collect();
+        assert_eq!(names, ["devtest-alpha", "devtest-bravo", "devtest-charlie"]);
+        // Everything else is the builder's: health joined by provider:id, proxy, list entry, cost.
+        let a = &snap.pods[0];
+        assert_eq!(a.health.as_ref().map(|h| (h.status, h.issues.clone())), Some((Status::Warn, vec![Issue::BusyHost])));
+        assert_eq!((a.proxy, a.proxy_port, a.list_entry.as_deref()), (ProxyState::Live, Some(9500), Some("alpha")));
+        assert_eq!((snap.cost.billing, snap.partial.as_slice(), snap.generated_at), (3, &["runpod".to_string()][..], NOW));
+    }
+
+    /// The pure half of a background deep check: `d` claims pods (a second `d` doesn't
+    /// double up), the results land on the rows at once, every claimed pod is released —
+    /// even one whose check produced nothing — and the session's verdicts survive the next
+    /// refresh re-reading an older cache file, until something newer is recorded.
+    #[test]
+    fn deep_check_results_fold_into_the_rows_and_outlive_a_refresh() {
+        let cfg = fleet_cfg();
+        let naming = Naming::from_config(&cfg);
+        let alpha = at("alpha", "runpod", "rp1", Some(("10.0.0.1", 22001)));
+        let bravo = at("bravo", "runpod", "rp2", Some(("10.0.0.2", 22002)));
+        let charlie = at("charlie", "vast", "77", None);
+        let pods = [alpha.clone(), bravo.clone(), charlie.clone()];
+        let mut file = HealthCache::new();
+        file.merge(&[verdict(&alpha, Status::Pass, &[])], NOW - 3_600);
+
+        let mut deep = DeepChecks::default();
+        let mut snap = dashboard_snapshot(&pods, &[], None, &deep.layer(file.clone()), &naming, NOW);
+        let claimed = deep.begin(vec![alpha.clone(), bravo.clone()]);
+        assert_eq!(claimed, [alpha.clone(), bravo.clone()]);
+        assert!(deep.is_running(&alpha) && deep.is_running(&bravo) && !deep.is_running(&charlie));
+        let second = deep.begin(vec![bravo.clone(), charlie.clone()]);
+        assert_eq!(second, [charlie.clone()], "bravo is already being checked");
+        assert_eq!(deep.running(), 3);
+
+        // The first check lands: alpha fails on its GPU; bravo got no result at all.
+        let line = deep.finish(&claimed, &[verdict(&alpha, Status::Fail, &["cuda"])], NOW + 100, &mut snap);
+        assert_eq!(line, "deep check: 0 pass, 0 warn, 1 fail — failed: devtest-alpha");
+        assert!(!deep.is_running(&alpha) && !deep.is_running(&bravo) && deep.is_running(&charlie));
+        let h = snap.pods[0].health.as_ref().unwrap();
+        assert_eq!((h.status, h.checked_at, h.issues.as_slice()), (Status::Fail, NOW + 100, &[Issue::GpuError][..]));
+        assert_eq!(health_cell(Some(h), false, NOW + 100).0, "fail 0s");
+        assert!(snap.pods[1].health.is_none());
+
+        // The next refresh re-reads the file (still the old pass): the newer verdict stays…
+        assert_eq!(deep.layer(file.clone()).get(&alpha).unwrap().status, Status::Fail);
+        // …until a later `pods test --deep` records something newer.
+        file.merge(&[verdict(&alpha, Status::Pass, &[])], NOW + 200);
+        assert_eq!(deep.layer(file).get(&alpha).unwrap().status, Status::Pass);
+
+        // All passing: no "failed" tail; nothing left running.
+        let done = deep.finish(&second, &[verdict(&charlie, Status::Pass, &[])], NOW + 300, &mut snap);
+        assert_eq!(done, "deep check: 1 pass, 0 warn, 0 fail");
+        assert_eq!(deep.running(), 0);
+    }
+
+    #[test]
+    fn details_due_table() {
+        let s = Duration::from_secs;
+        // (since the last query, `r` pressed, run it now?)
+        let cases = [
+            (None, false, true), // never ran: the first refresh fills the details
+            (None, true, true),
+            (Some(s(5)), false, false),
+            (Some(s(5)), true, false), // `r` again within the minimum gap: no
+            (Some(DETAILS_MIN_GAP), true, true),
+            (Some(s(59)), false, false),
+            (Some(DETAILS_EVERY), false, true),
+        ];
+        for (since, forced, want) in cases {
+            assert_eq!(details_due(since, forced), want, "{since:?} forced={forced}");
+        }
+    }
+
+    #[test]
+    fn details_are_reapplied_between_queries_as_enrich_merges_them() {
+        let window = Maintenance { start: Some("2026-10-09T02:00:00Z".into()), end: None, note: Some("host upgrade".into()) };
+        let enriched = |id: &str, ty: &str, n: u32, cost: f64, m: Option<Maintenance>| Pod {
+            id: id.into(),
+            provider: "runpod".into(),
+            gpu_type: Some(ty.into()),
+            gpu_count: Some(n),
+            cost_per_hr: Some(cost),
+            maintenance: m,
+            ..Default::default()
+        };
+        let details = capture_details(&[
+            enriched("rp1", "RTX A4000", 2, 0.17, Some(window.clone())),
+            enriched("rp2", "RTX A4000", 2, 0.20, None),
+        ]);
+        let listed = |provider: &str, id: &str| Pod { id: id.into(), provider: provider.into(), ..Default::default() };
+        let mut fresh = vec![
+            listed("runpod", "rp1"), // the cheap list: no machine details at all
+            Pod { gpu_type: Some("RTX 3090".into()), gpu_count: Some(1), cost_per_hr: Some(0.30), ..listed("runpod", "rp2") },
+            listed("vast", "rp1"), // same id, another provider: not the same pod
+            listed("runpod", "rp9"), // created since the last query
+        ];
+        overlay_details(&mut fresh, &details);
+        let row = |p: &Pod| (p.gpu_type.clone(), p.gpu_count, p.cost_per_hr, p.maintenance.clone());
+        assert_eq!(row(&fresh[0]), (Some("RTX A4000".into()), Some(2), Some(0.17), Some(window)));
+        // What the listing reports wins, except the count (the details' is the machine's).
+        assert_eq!(row(&fresh[1]), (Some("RTX 3090".into()), Some(2), Some(0.30), None));
+        assert_eq!(fresh[2], listed("vast", "rp1"));
+        assert_eq!(fresh[3], listed("runpod", "rp9"));
+    }
+
+    #[test]
+    fn select_input_parsing_table() {
+        let ok = |input: &str| parse_select_input(input).unwrap();
+        assert_eq!(ok("alpha..charlie  echo").targets, ["alpha..charlie", "echo"]);
+        assert_eq!(ok("alpha,bravo").targets, ["alpha,bravo"], "comma lists are the core's to split");
+        let a = ok("alpha..echo -x bravo !delta --exclude=charlie --on runpod --gpus 2");
+        assert_eq!(a.targets, ["alpha..echo"]);
+        assert_eq!(a.exclude, ["bravo", "delta", "charlie"]);
+        assert_eq!((a.on.as_deref(), a.gpus, a.all), (Some("runpod"), Some(2), false));
+        assert!(ok("--all").all);
+        assert_eq!(ok("   "), SelectArgs::default());
+        for (bad, why) in [
+            ("--gpus two", "wants a number"),
+            ("alpha -x", "-x needs a value"),
+            ("--on", "--on needs a value"),
+            ("--force alpha", "unknown option `--force`"),
+            ("-v", "unknown option"),
+        ] {
+            let err = parse_select_input(bad).unwrap_err();
+            assert!(err.contains(why), "{bad}: {err}");
+        }
+    }
+
+    /// `/` resolves exactly as the CLI's selector does (ranges by MACHINE_NAME_LIST order,
+    /// names, ids, exclusions, filters), and a typo marks nothing: the core's error, on
+    /// one line for the status bar. `all` and filter-only selections are refused, since
+    /// marks feed terminate/restart.
+    #[test]
+    fn selector_marks_resolve_like_the_cli_and_a_typo_marks_nothing() {
+        let cfg = fleet_cfg();
+        let naming = Naming::from_config(&cfg);
+        let pods = vec![
+            at("alpha", "runpod", "rp1", None),
+            at("bravo", "runpod", "rp2", None),
+            at("charlie", "vast", "77", None),
+            at("delta", "runpod", "rp4", None),
+            at("echo", "hetzner", "88", None),
+        ];
+        let ids = |input: &str| {
+            let (ids, _) = select_marks(input, &naming, &pods).unwrap_or_else(|e| panic!("{input}: {e}"));
+            let mut v: Vec<String> = ids.into_iter().collect();
+            v.sort();
+            v
+        };
+        assert_eq!(ids("alpha..delta"), ["77", "rp1", "rp2", "rp4"]);
+        assert_eq!(ids("alpha..echo -x charlie"), ["88", "rp1", "rp2", "rp4"]);
+        assert_eq!(ids("alpha..echo !charlie,delta"), ["88", "rp1", "rp2"]);
+        assert_eq!(ids("alpha..echo --on runpod"), ["rp1", "rp2", "rp4"]);
+        assert_eq!(ids("devtest-bravo 88"), ["88", "rp2"], "a full name and an id");
+        let (_, msg) = select_marks("alpha..charlie", &naming, &pods).unwrap();
+        assert_eq!(msg, "marked 3 pods: alpha..charlie");
+        let (_, msg) = select_marks("echo", &naming, &pods).unwrap();
+        assert_eq!(msg, "marked 1 pod: echo");
+
+        for (input, needle) in [
+            ("alpah", "alpah"),
+            ("alpha..zulu", "`zulu` is not a MACHINE_NAME_LIST name"),
+            ("delta..alpha", "reversed"),
+            ("alpha..echo -x brovo", "brovo"),
+            ("alpha --on aws", "not a provider"),
+            ("all", "`all` isn't taken here"),
+            ("--all", "`all` isn't taken here"),
+            ("--on runpod", "name pods, ids or a range"),
+            ("", "name pods, ids or a range"),
+        ] {
+            let err = select_marks(input, &naming, &pods).unwrap_err();
+            assert!(err.contains(needle), "{input:?}: {err}");
+            assert!(!err.contains('\n'), "{input:?}: one line for the status bar: {err}");
+        }
     }
 }

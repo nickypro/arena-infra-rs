@@ -9,6 +9,15 @@
 //! pod with `a` (restart / stop / terminate / backup / setup / test / run / set-branch),
 //! `f` cycles the refresh cadence, `r` refreshes now.
 //!
+//! Each refresh is one `arena_core::snapshot` [`FleetSnapshot`] — the pods as listed, the
+//! local proxy config and the health cache, joined by the same builder `arena snapshot`
+//! uses — so $/h and the fleet total, the maintenance badge, the proxy port + live/stale
+//! state and the last `pods test --deep` verdict read exactly as the CLI prints them. `d`
+//! deep-checks the cursor pod (or the marked set) in the background and records the
+//! verdicts in that cache; `/` marks pods by the CLI's selector syntax (`apple..delta`).
+//! Every pod SSH call goes through `arena_core::remote::Remote` with a time budget, so a
+//! wedged pod can't hang an action.
+//!
 //! Safety against live prod is built into the *interaction*, not bolted on: a mutating
 //! action always pops a confirmation modal. Lifecycle actions (restart/stop/terminate)
 //! make you type the pod's exact name back before they apply; backup/setup show the
@@ -24,7 +33,7 @@ mod state;
 use std::collections::HashMap;
 use std::io::{stdout, Stdout};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -44,17 +53,24 @@ use ratatui::{
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
+use arena_core::fleet;
+use arena_core::health::{deep_check_command, judge_deep_call, HealthPolicy, PodHealth, DEEP_CHECK_TIMEOUT};
 use arena_core::metrics::{self, PodMetrics, ProbeOpts};
 use arena_core::provider::Provider;
-use arena_core::ssh::{self, SshTarget};
+use arena_core::proxy::Listing;
+use arena_core::remote::{describe_error, Remote, SshRemote};
+use arena_core::selector::Naming;
+use arena_core::snapshot::{self, FleetSnapshot, HealthCache};
+use arena_core::ssh::SshTarget;
 use arena_core::naming;
 use arena_core::{Config, Pod, PodSpec};
 
 use prefs::Prefs;
 use arena_core::status::display_status;
 use state::{
-    display_name, short_branch, spark, summarize, Action, Confirm, FleetSummary, History,
-    NewPodForm, NpField, ProviderOpt,
+    capture_details, dashboard_snapshot, details_due, display_name, health_cell, overlay_details, proxy_cell,
+    proxy_detail, select_marks, short_branch, spark, summarize, summary_text, Action, Confirm, DeepChecks,
+    FleetSummary, History, NewPodForm, NpField, PodDetails, ProviderOpt, Tone,
 };
 
 const DEFAULT_CONFIG: &str = "/home/dev/prod-ro/config.env";
@@ -62,6 +78,34 @@ const DEFAULT_CONFIG: &str = "/home/dev/prod-ro/config.env";
 const METRICS_CONNECT_TIMEOUT: u32 = 4;
 /// The cadences `f` cycles through (seconds).
 const REFRESH_STEPS: &[u64] = &[2, 5, 10, 20, 60];
+
+// Per-call SSH budgets for the actions (every pod call goes through `Remote` with one, so
+// a wedged pod ends its action with `timed out after Ns` instead of a `working…` modal
+// that never closes). The metrics probe uses core's `PROBE_TIMEOUT`, setup core's
+// `SetupTimeouts` and the deep check core's `DEEP_CHECK_TIMEOUT`; the rest mirror the
+// CLI's budgets for the same commands, which live in its binary, not in core.
+
+/// `test` (import torch): a cold import takes 10–30s, so 90s means wedged — as `pods test`.
+const TEST_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// `run`: an arbitrary command can legitimately take a while (a download, a test suite),
+/// but never forever — the CLI's `pods run` default, 30 min.
+const RUN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// `backup`: git add + commit + push — seconds normally, a first push of notebooks can take
+/// minutes. 5 min, as `pods backup`.
+const BACKUP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// `set-branch`: fetch + checkout + ff-pull against GitHub — 2 min means stuck, as `pods
+/// set-branch`.
+const BRANCH_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+
+/// How long one details query (`Provider::enrich`) may take before the refresh carries on
+/// without it — the HTTP client has no timeout of its own (`pods list` uses the same 20s).
+const ENRICH_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long a footer notice (a selector result, a finished deep check) stays up.
+const NOTICE_FOR: Duration = Duration::from_secs(12);
 
 /// What the UI is currently showing. `List`/`Detail` are the normal views; the rest
 /// are modal (the background fetch keeps running, but a modal can't be acted on by a
@@ -85,6 +129,9 @@ enum Mode {
     /// Collect a free-text argument (a command, or a branch) for `Run`/`SetBranch`,
     /// against one pod or a multi-pod scope, then execute on Enter.
     Input { action: Action, scope: InputScope, value: String },
+    /// `/`: type a selection in the CLI's selector syntax; Enter marks what it resolves to
+    /// (a typo marks nothing and says why in the footer).
+    Select { value: String },
     /// A background action is in flight (the SSH work runs off the UI thread so the
     /// dashboard stays live); replaced by `Result` when it finishes. Keys are ignored.
     Working(String),
@@ -113,7 +160,16 @@ enum InputScope {
 /// across an `.await`, so the fetcher and the UI never deadlock.
 #[derive(Default)]
 struct Shared {
+    /// The rows, in display order: always `snap.pods`' pods, set together by
+    /// [`Shared::publish`] — so a row index means the same pod in both.
     pods: Vec<Pod>,
+    /// This refresh's core snapshot: per pod its proxy port + state and last deep check,
+    /// plus the fleet cost and which providers failed to list.
+    snap: FleetSnapshot,
+    /// Deep checks started from the dashboard (running ones, and this session's verdicts).
+    deep: DeepChecks,
+    /// The footer's one-line message, if any (see [`Notice`]).
+    notice: Option<Notice>,
     metrics: HashMap<String, PodMetrics>,
     history: HashMap<String, History>,
     summary: FleetSummary,
@@ -133,12 +189,36 @@ struct Shared {
     action_running: bool,
 }
 
+impl Shared {
+    /// Show `snap`: its pods become the rows, in its order.
+    fn publish(&mut self, snap: FleetSnapshot) {
+        self.pods = snap.pods.iter().map(|p| p.pod.clone()).collect();
+        self.snap = snap;
+    }
+
+    fn notify(&mut self, text: impl Into<String>, error: bool) {
+        self.notice = Some(Notice { text: text.into(), error, at: Instant::now() });
+    }
+}
+
+/// A one-line message in the footer — a selector's result or typo, a deep check starting
+/// or finishing — shown for [`NOTICE_FOR`] (or until the next one) instead of the refresh
+/// status. Not a modal: nothing waits on the operator to dismiss it.
+#[derive(Debug, Clone)]
+struct Notice {
+    text: String,
+    error: bool,
+    at: Instant,
+}
+
 /// UI-thread-only state: what the operator is looking at / interacting with. Kept
 /// separate from `Shared` so key handling never contends with the fetcher.
 struct Ui {
     provider_name: String,
     config_path: String,
     cfg: Config,
+    /// How the dashboard reaches pods: [`SshRemote`] for real (a fake in tests).
+    remote: Arc<dyn Remote>,
     /// `MACHINE_NAME_PREFIX`, for shortening names/branches.
     prefix: String,
     /// Show short pod names (`apple`) instead of full (`arena8-apple`). Persisted.
@@ -188,21 +268,24 @@ async fn main() -> Result<()> {
     }));
     let interval = Arc::new(AtomicU64::new(initial_secs));
     let nudge = Arc::new(Notify::new());
+    let details_wanted = Arc::new(AtomicBool::new(false));
+    let remote: Arc<dyn Remote> = Arc::new(SshRemote);
 
     // Background fetcher: keeps `shared` fresh without blocking the UI.
     tokio::spawn(fetch_loop(
         provider.clone(),
+        remote.clone(),
         cfg.clone(),
         progress_cmd,
         shared.clone(),
-        interval.clone(),
-        nudge.clone(),
+        Cadence { interval: interval.clone(), nudge: nudge.clone(), details_wanted: details_wanted.clone() },
     ));
 
     let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena").to_string();
     let ui = Ui {
         provider_name,
         config_path,
+        remote,
         prefix,
         short_names: Prefs::load().short_names,
         cfg,
@@ -214,21 +297,28 @@ async fn main() -> Result<()> {
     };
 
     let mut terminal = setup_terminal()?;
-    let res = run(&mut terminal, &shared, &provider, &interval, &nudge, ui).await;
+    let res = run(&mut terminal, &shared, &provider, &interval, &nudge, &details_wanted, ui).await;
     restore_terminal(&mut terminal)?;
     res
 }
 
-/// The background refresh loop: list pods, fetch their metrics concurrently, publish to
-/// `shared`, then wait for the cadence to elapse *or* a manual nudge (`r`/`f`/action),
-/// whichever comes first.
+/// When the background refresh runs: every `interval` seconds, or at once on `nudge`;
+/// `details_wanted` (the `r` key) asks for the provider's details query too.
+struct Cadence {
+    interval: Arc<AtomicU64>,
+    nudge: Arc<Notify>,
+    details_wanted: Arc<AtomicBool>,
+}
+
+/// The background refresh loop: one [`refresh`] per cadence tick, waiting for the
+/// cadence to elapse *or* a manual nudge (`r`/`f`/action), whichever comes first.
 async fn fetch_loop(
     provider: Arc<dyn Provider>,
+    remote: Arc<dyn Remote>,
     cfg: Config,
     progress_cmd: Option<String>,
     shared: Arc<Mutex<Shared>>,
-    interval: Arc<AtomicU64>,
-    nudge: Arc<Notify>,
+    cadence: Cadence,
 ) {
     // The per-pod probe gathers GPU stats + branch + setup health in one SSH call.
     let repo_path = cfg.get("BACKUP_REPO_PATH").map(String::from).unwrap_or_else(|| {
@@ -239,60 +329,146 @@ async fn fetch_loop(
         repo_path: Some(repo_path),
         key_remote: Some(cfg.get("GIT_SSH_KEY_REMOTE").unwrap_or("/root/.ssh/id_ed25519").to_string()),
     };
-
+    let mut details = DetailsState::default();
     loop {
         shared.lock().unwrap().refreshing = true;
+        let forced = cadence.details_wanted.swap(false, Ordering::Relaxed);
+        refresh(provider.as_ref(), &remote, &cfg, &opts, &shared, &mut details, forced).await;
 
-        match provider.list_pods().await {
-            Err(e) => {
-                // Keep the last known pods on screen; just report the error.
-                let mut s = shared.lock().unwrap();
-                s.status = format!("list error: {e}");
-                s.refreshing = false;
-            }
-            Ok(mut pods) => {
-                pods.sort_by(|a, b| a.name.cmp(&b.name));
-                let metrics = fetch_metrics(&pods, &cfg, &opts).await;
-
-                let mut s = shared.lock().unwrap();
-                // Drop optimistic placeholders the provider now reports, then show the
-                // real fleet plus any still-pending placeholders.
-                s.pending.retain(|pp| !pods.iter().any(|r| r.name == pp.name));
-                let mut display = pods;
-                display.extend(s.pending.iter().cloned());
-                display.sort_by(|a, b| a.name.cmp(&b.name));
-
-                for pod in &display {
-                    let m = metrics.get(&pod.name);
-                    let mem_pct = m.and_then(|m| m.mem_summary()).map(|(u, t)| {
-                        if t > 0 { (u as u64 * 100 / t as u64) as u32 } else { 0 }
-                    });
-                    s.history.entry(pod.name.clone()).or_default().push(
-                        m.and_then(|m| m.mean_util()),
-                        m.and_then(|m| m.max_temp()),
-                        mem_pct,
-                    );
-                }
-                s.summary = summarize(&display, &metrics);
-                s.status = status_line(&s.summary);
-                s.metrics = metrics;
-                s.pods = display;
-                s.last_refresh = Some(Instant::now());
-                s.refreshing = false;
-            }
-        }
-
-        let secs = interval.load(Ordering::Relaxed).max(1);
+        let secs = cadence.interval.load(Ordering::Relaxed).max(1);
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(secs)) => {}
-            _ = nudge.notified() => {}
+            _ = cadence.nudge.notified() => {}
         }
     }
 }
 
-/// Fan metric fetches out across the fleet concurrently, with a short connect timeout
-/// so a single unreachable pod can't hold up the sweep.
+/// What the refresh remembers between rounds about the provider's details query.
+#[derive(Default)]
+struct DetailsState {
+    /// The last good answer, re-applied to every listing until the next one.
+    details: HashMap<String, PodDetails>,
+    /// When the query last ran (tokio's clock, so tests can step it).
+    last: Option<tokio::time::Instant>,
+    /// Why the last query's answer is incomplete, if it is.
+    warning: Option<String>,
+}
+
+/// One refresh: list pods (per provider, so a provider that failed is known — not just
+/// missing), probe them concurrently, build the core snapshot and publish it to `shared`.
+///
+/// API calls per refresh are what they always were — one list per provider. The details
+/// query (`Provider::enrich`: RunPod's GraphQL for GPU, $/h and the host maintenance
+/// window) runs alongside the probes only when `state::details_due` says so (every
+/// [`state::DETAILS_EVERY`], or on `r` = `forced`), and its answer is re-applied to the
+/// listings in between. The proxy config and the health cache are local file reads.
+async fn refresh(
+    provider: &dyn Provider,
+    remote: &Arc<dyn Remote>,
+    cfg: &Config,
+    opts: &ProbeOpts,
+    shared: &Mutex<Shared>,
+    details: &mut DetailsState,
+    forced: bool,
+) {
+    let listing = Listing::from_results(provider.list_by_provider().await);
+    if !listing.any_ok() {
+        // Keep the last known pods on screen; just report the error.
+        let errs: Vec<String> = listing.errors().iter().map(|(p, e)| format!("{p}: {e}")).collect();
+        let mut s = shared.lock().unwrap();
+        s.status = format!("list error: {}", errs.join("; "));
+        s.refreshing = false;
+        return;
+    }
+    let partial: Vec<String> = listing.errors().iter().map(|(p, _)| p.to_string()).collect();
+    let mut pods = listing.pods();
+    let metrics = if details_due(details.last.map(|t| t.elapsed()), forced) {
+        let mut enriched = pods.clone();
+        let (metrics, failed) =
+            tokio::join!(fetch_metrics(remote, &pods, cfg, opts), enrich_bounded(provider, &mut enriched));
+        // A failed query keeps the last good details rather than forgetting them.
+        if failed.is_none() {
+            details.details = capture_details(&enriched);
+        }
+        details.warning = failed;
+        details.last = Some(tokio::time::Instant::now());
+        metrics
+    } else {
+        fetch_metrics(remote, &pods, cfg, opts).await
+    };
+    overlay_details(&mut pods, &details.details);
+    let (proxy, proxy_warning) = snapshot::local_proxy_text(cfg);
+    let (file_health, health_warning) = load_health(cfg);
+    let now = snapshot::unix_now();
+
+    let mut guard = shared.lock().unwrap();
+    let s = &mut *guard;
+    // Drop optimistic placeholders the provider now reports, then show the
+    // real fleet plus any still-pending placeholders.
+    s.pending.retain(|pp| !pods.iter().any(|r| r.name == pp.name));
+    let mut display = pods;
+    display.extend(s.pending.iter().cloned());
+    let health = s.deep.layer(file_health);
+    let snap = dashboard_snapshot(&display, &partial, proxy.as_deref(), &health, &Naming::from_config(cfg), now);
+
+    for pod in &display {
+        let m = metrics.get(&pod.name);
+        let mem_pct = m.and_then(|m| m.mem_summary()).map(|(u, t)| {
+            if t > 0 { (u as u64 * 100 / t as u64) as u32 } else { 0 }
+        });
+        s.history.entry(pod.name.clone()).or_default().push(
+            m.and_then(|m| m.mean_util()),
+            m.and_then(|m| m.max_temp()),
+            mem_pct,
+        );
+    }
+    s.summary = summarize(&display, &metrics);
+    let warnings: Vec<&str> =
+        [&details.warning, &proxy_warning, &health_warning].into_iter().flatten().map(String::as_str).collect();
+    s.status = status_line(&s.summary, &warnings);
+    s.metrics = metrics;
+    s.publish(snap);
+    s.last_refresh = Some(Instant::now());
+    s.refreshing = false;
+}
+
+/// The provider's best-effort details query, bounded by [`ENRICH_TIMEOUT`]. `Some(why)`
+/// when the details are incomplete (the pods keep whatever was filled before a failure).
+async fn enrich_bounded(provider: &dyn Provider, pods: &mut [Pod]) -> Option<String> {
+    match tokio::time::timeout(ENRICH_TIMEOUT, provider.enrich(pods)).await {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => Some(format!("pod details incomplete: {e}")),
+        Err(_) => Some(format!("pod details timed out after {}s", ENRICH_TIMEOUT.as_secs())),
+    }
+}
+
+/// Where the dashboard reads — and its deep checks write — the health cache: the CLI's
+/// path ([`snapshot::health_cache_path_for`]), so `pods test --deep`'s verdicts show here
+/// and the dashboard's show in `arena snapshot`. `None` in this crate's unit tests unless
+/// the test's config sets `ARENA_STATE_DIR`: a test must never touch the developer's real
+/// `~/.local/state`.
+fn health_cache_path(cfg: &Config) -> Option<std::result::Result<PathBuf, String>> {
+    if cfg!(test) && cfg.get("ARENA_STATE_DIR").is_none() {
+        return None;
+    }
+    Some(snapshot::health_cache_path_for(cfg))
+}
+
+/// The health cache as it stands (an empty one when there is none or it can't be read),
+/// plus the warning to show when it was unusable. Never fails: health is a convenience.
+fn load_health(cfg: &Config) -> (HealthCache, Option<String>) {
+    match health_cache_path(cfg) {
+        None => (HealthCache::new(), None),
+        Some(Err(e)) => (HealthCache::new(), Some(format!("no health cache: {e}"))),
+        Some(Ok(path)) => HealthCache::load(&path),
+    }
+}
+
+/// Fan metric fetches out across the fleet concurrently over `remote` — each probe bounded
+/// by core's `PROBE_TIMEOUT` and a short connect timeout, so a single unreachable pod
+/// can't hold up the sweep.
 async fn fetch_metrics(
+    remote: &Arc<dyn Remote>,
     pods: &[Pod],
     cfg: &Config,
     opts: &ProbeOpts,
@@ -303,7 +479,8 @@ async fn fetch_metrics(
             target.connect_timeout_secs = METRICS_CONNECT_TIMEOUT;
             let name = pod.name.clone();
             let opts = opts.clone();
-            set.spawn(async move { (name, metrics::fetch(&target, &opts).await) });
+            let remote = remote.clone();
+            set.spawn(async move { (name, metrics::fetch_with(remote.as_ref(), &target, &opts).await) });
         }
     }
     let mut fresh = HashMap::new();
@@ -315,17 +492,17 @@ async fn fetch_metrics(
     fresh
 }
 
-fn status_line(s: &FleetSummary) -> String {
-    // Pod count lives in the top summary bar — keep the footer to liveness only.
-    format!(
-        "{} reporting{}",
-        s.reporting,
-        if s.unreachable > 0 {
-            format!(" · {} unreachable", s.unreachable)
-        } else {
-            String::new()
-        }
-    )
+/// The footer's refresh status: liveness (the pod count lives in the summary bar), then
+/// any warning from this refresh's reads (details query, proxy file, health cache).
+fn status_line(s: &FleetSummary, warnings: &[&str]) -> String {
+    let mut out = format!("{} reporting", s.reporting);
+    if s.unreachable > 0 {
+        out.push_str(&format!(" · {} unreachable", s.unreachable));
+    }
+    for w in warnings {
+        out.push_str(&format!(" · ⚠ {}", w.strip_prefix("warning: ").unwrap_or(w)));
+    }
+    out
 }
 
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
@@ -406,7 +583,9 @@ fn selected_pod(shared: &Arc<Mutex<Shared>>, idx: usize) -> Option<Pod> {
 }
 
 /// Open an interactive SSH shell to the selected pod: suspend the dashboard (leave the
-/// alternate screen + raw mode), hand the terminal to `ssh`, then restore on exit.
+/// alternate screen + raw mode), hand the terminal to `ssh`, then restore on exit. The one
+/// SSH call that doesn't go through `Remote`, on purpose: it's the operator's own shell —
+/// it needs the terminal (a PTY, stdin) and has no time budget.
 fn connect_ssh(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     shared: &Arc<Mutex<Shared>>,
@@ -496,6 +675,7 @@ async fn run(
     provider: &Arc<dyn Provider>,
     interval: &AtomicU64,
     nudge: &Notify,
+    details_wanted: &AtomicBool,
     mut ui: Ui,
 ) -> Result<()> {
     loop {
@@ -564,7 +744,25 @@ async fn run(
                             ui.mode = Mode::Detail;
                         }
                     }
-                    KeyCode::Char('r') => nudge.notify_one(),
+                    KeyCode::Char('r') => {
+                        // A manual refresh also re-reads the provider's details (maintenance
+                        // windows, $/h) — rate-limited by `state::details_due`.
+                        details_wanted.store(true, Ordering::Relaxed);
+                        nudge.notify_one();
+                    }
+                    KeyCode::Char('d') => {
+                        // Deep-check the marked set if any are marked, else the cursor pod —
+                        // in the background; the rows say `checking` until it lands.
+                        let pods = if ui.marked.is_empty() {
+                            selected_pod(shared, ui.selected).into_iter().collect()
+                        } else {
+                            scope_pods(shared, &ui.marked, Scope::Marked)
+                        };
+                        if !pods.is_empty() {
+                            start_deep_check(shared, &ui, pods);
+                        }
+                    }
+                    KeyCode::Char('/') => ui.mode = Mode::Select { value: String::new() },
                     KeyCode::Char('s') => {
                         // Toggle short/full names and persist the choice.
                         ui.short_names = !ui.short_names;
@@ -681,10 +879,10 @@ async fn run(
                     KeyCode::Esc => ui.mode = Mode::List,
                     KeyCode::Enter if typed == token => {
                         let pods = scope_pods(shared, &ui.marked, scope);
-                        let (provider, cfg) = (provider.clone(), ui.cfg.clone());
+                        let (provider, remote, cfg) = (provider.clone(), ui.remote.clone(), ui.cfg.clone());
                         ui.mode = Mode::Working(format!("running {} on {} pod(s)…", action.label(), pods.len()));
                         start_action(shared, async move {
-                            execute_fleet(&provider, &cfg, action, pods, None).await
+                            execute_fleet(&provider, &remote, &cfg, action, pods, None).await
                         });
                     }
                     KeyCode::Backspace => {
@@ -784,7 +982,7 @@ async fn run(
             Mode::Input { action, scope, mut value } => match code {
                 KeyCode::Esc => ui.mode = Mode::List,
                 KeyCode::Enter if !value.trim().is_empty() => {
-                    let (provider, cfg) = (provider.clone(), ui.cfg.clone());
+                    let (provider, remote, cfg) = (provider.clone(), ui.remote.clone(), ui.cfg.clone());
                     match scope {
                         InputScope::Pod { name, id } => {
                             let pod = {
@@ -796,7 +994,7 @@ async fn run(
                                 Some(pod) => {
                                     ui.mode = Mode::Working(format!("{} on {name}…", action.label()));
                                     start_action(shared, async move {
-                                        execute(provider.as_ref(), &cfg, action, &pod, Some(&value)).await
+                                        execute(provider.as_ref(), remote.as_ref(), &cfg, action, &pod, Some(&value)).await
                                     });
                                 }
                             }
@@ -805,7 +1003,7 @@ async fn run(
                             let pods = scope_pods(shared, &ui.marked, sc);
                             ui.mode = Mode::Working(format!("{} on {} pod(s)…", action.label(), pods.len()));
                             start_action(shared, async move {
-                                execute_fleet(&provider, &cfg, action, pods, Some(value)).await
+                                execute_fleet(&provider, &remote, &cfg, action, pods, Some(value)).await
                             });
                         }
                     }
@@ -819,6 +1017,31 @@ async fn run(
                     ui.mode = Mode::Input { action, scope, value };
                 }
                 _ => ui.mode = Mode::Input { action, scope, value },
+            },
+            Mode::Select { mut value } => match code {
+                KeyCode::Esc => ui.mode = Mode::List,
+                KeyCode::Enter => {
+                    let naming = Naming::from_config(&ui.cfg);
+                    let mut s = shared.lock().unwrap();
+                    match select_marks(&value, &naming, &s.pods) {
+                        Ok((ids, msg)) => {
+                            ui.marked = ids;
+                            s.notify(msg, false);
+                        }
+                        // A typo marks nothing — and leaves the existing marks alone.
+                        Err(e) => s.notify(format!("✗ {e}"), true),
+                    }
+                    ui.mode = Mode::List;
+                }
+                KeyCode::Backspace => {
+                    value.pop();
+                    ui.mode = Mode::Select { value };
+                }
+                KeyCode::Char(ch) => {
+                    value.push(ch);
+                    ui.mode = Mode::Select { value };
+                }
+                _ => ui.mode = Mode::Select { value },
             },
             // A background action is running — ignore keys (Ctrl+C still quits, above).
             Mode::Working(_) => {}
@@ -848,6 +1071,7 @@ async fn run(
 /// restart / terminate on a marked set).
 async fn execute_fleet(
     provider: &Arc<dyn Provider>,
+    remote: &Arc<dyn Remote>,
     cfg: &Config,
     action: Action,
     pods: Vec<Pod>,
@@ -857,9 +1081,10 @@ async fn execute_fleet(
     let mut set = JoinSet::new();
     for pod in pods {
         let provider = provider.clone();
+        let remote = remote.clone();
         let cfg = cfg.clone();
         let arg = arg.clone();
-        set.spawn(async move { execute(provider.as_ref(), &cfg, action, &pod, arg.as_deref()).await });
+        set.spawn(async move { execute(provider.as_ref(), remote.as_ref(), &cfg, action, &pod, arg.as_deref()).await });
     }
     let mut ok = 0usize;
     let mut lines: Vec<String> = Vec::new();
@@ -1022,10 +1247,10 @@ fn choose_fleet_action(
     match action {
         Action::Test => {
             let pods = scope_pods(shared, &ui.marked, scope);
-            let (provider, cfg) = (provider.clone(), ui.cfg.clone());
+            let (provider, remote, cfg) = (provider.clone(), ui.remote.clone(), ui.cfg.clone());
             ui.mode = Mode::Working(format!("testing torch on {} pod(s)…", pods.len()));
             start_action(shared, async move {
-                execute_fleet(&provider, &cfg, Action::Test, pods, None).await
+                execute_fleet(&provider, &remote, &cfg, Action::Test, pods, None).await
             });
         }
         Action::Run | Action::SetBranch => {
@@ -1044,16 +1269,133 @@ fn apply_action(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, provider: &Arc<dyn Pro
         return;
     };
     ui.mode = Mode::Working(format!("{}ing {}…", c.action.label(), pod.name));
-    let (provider, cfg, action) = (provider.clone(), ui.cfg.clone(), c.action);
+    let (provider, remote, cfg, action) = (provider.clone(), ui.remote.clone(), ui.cfg.clone(), c.action);
     start_action(shared, async move {
-        execute(provider.as_ref(), &cfg, action, &pod, None).await
+        execute(provider.as_ref(), remote.as_ref(), &cfg, action, &pod, None).await
     });
+}
+
+/// Deep-check `pods` (the cursor pod or the marked set) **in the background** — no modal:
+/// the dashboard stays live, the rows say `checking`, and the footer says when it's done.
+/// Pods already being checked are skipped. The verdicts are written to the health cache
+/// (where `arena snapshot` and the next refresh read them) and shown at once.
+fn start_deep_check(shared: &Arc<Mutex<Shared>>, ui: &Ui, pods: Vec<Pod>) {
+    // Config first: a malformed MIN_DRIVER_VERSION is said before any pod is touched.
+    let policy = match HealthPolicy::from_config(&ui.cfg) {
+        Ok(p) => p,
+        Err(e) => {
+            shared.lock().unwrap().notify(format!("✗ deep check: {e}"), true);
+            return;
+        }
+    };
+    let claimed = {
+        let mut s = shared.lock().unwrap();
+        let claimed = s.deep.begin(pods);
+        match claimed.len() {
+            0 => s.notify("already being deep-checked", false),
+            n => s.notify(
+                format!(
+                    "deep-checking {n} pod{} in the background (up to {}s)…",
+                    if n == 1 { "" } else { "s" },
+                    DEEP_CHECK_TIMEOUT.as_secs()
+                ),
+                false,
+            ),
+        }
+        claimed
+    };
+    if claimed.is_empty() {
+        return;
+    }
+    let (shared, remote, cfg) = (shared.clone(), ui.remote.clone(), ui.cfg.clone());
+    tokio::spawn(async move {
+        let results = deep_check_pods(&remote, &cfg, &policy, &claimed).await;
+        finish_deep_check(&shared, health_cache_path(&cfg), &claimed, results, snapshot::unix_now()).await;
+    });
+}
+
+/// Run the deep check on each pod concurrently over `remote` — the script `pods test
+/// --deep` runs, one exec within [`DEEP_CHECK_TIMEOUT`], judged by the same core function
+/// (`health::judge_deep_call`). A pod with no SSH endpoint is a FAIL: it was asked for. A
+/// pod whose check task died is a FAIL too, never dropped. Results in `pods` order.
+async fn deep_check_pods(remote: &Arc<dyn Remote>, cfg: &Config, policy: &HealthPolicy, pods: &[Pod]) -> Vec<PodHealth> {
+    // `CONDA_ENV=""` disables activation, as for the CLI.
+    let cmd = deep_check_command(Some(cfg.get("CONDA_ENV").unwrap_or("arena-env")));
+    let jobs: Vec<_> = pods
+        .iter()
+        .map(|pod| {
+            SshTarget::from_pod(pod, cfg).ok().map(|target| {
+                let (remote, cmd) = (remote.clone(), cmd.clone());
+                tokio::spawn(async move {
+                    remote.exec(&target, &cmd, Some(DEEP_CHECK_TIMEOUT)).await.map_err(|e| describe_error(&e))
+                })
+            })
+        })
+        .collect();
+    let mut results = Vec::with_capacity(pods.len());
+    for (pod, job) in pods.iter().zip(jobs) {
+        results.push(match job {
+            None => PodHealth::unreachable(pod, format!("no SSH endpoint yet (status {})", pod.status)),
+            Some(handle) => match handle.await {
+                Ok(call) => judge_deep_call(pod, call, policy),
+                Err(e) => PodHealth::unreachable(pod, format!("the check task failed: {e}")),
+            },
+        });
+    }
+    results
+}
+
+/// The I/O tail of a background deep check: record the verdicts in the health cache file
+/// (off the async workers — it takes a lock), then fold them into what's on screen and say
+/// so in the footer. A cache that can't be written costs only the persistence: the
+/// session keeps the verdicts (see `state::DeepChecks`) and the footer says why.
+async fn finish_deep_check(
+    shared: &Arc<Mutex<Shared>>,
+    cache: Option<std::result::Result<PathBuf, String>>,
+    claimed: &[Pod],
+    results: Vec<PodHealth>,
+    now: u64,
+) {
+    let (results, warning) = match cache {
+        None => (results, None),
+        Some(Err(e)) => (results, Some(format!("not cached: {e}"))),
+        Some(Ok(path)) => {
+            let written = tokio::task::spawn_blocking(move || {
+                let w = match snapshot::record_health(&path, &results, None, now) {
+                    Ok(w) => w,
+                    Err(e) => Some(format!("couldn't write the health cache {}: {e}", path.display())),
+                };
+                (results, w)
+            })
+            .await;
+            match written {
+                Ok(done) => done,
+                // The write task itself died: the verdicts went with it — still release the pods.
+                Err(e) => (Vec::new(), Some(format!("recording the results failed: {e}"))),
+            }
+        }
+    };
+    let mut guard = shared.lock().unwrap();
+    let s = &mut *guard;
+    let mut line = s.deep.finish(claimed, &results, now, &mut s.snap);
+    if let Some(w) = warning {
+        line.push_str(&format!(" ({})", w.strip_prefix("warning: ").unwrap_or(&w)));
+    }
+    let failed = results.iter().any(|h| h.status == arena_core::health::Status::Fail);
+    s.notify(line, failed);
 }
 
 /// Perform one action against a pod, returning a one-line human-readable outcome.
 /// This is the *only* place the dashboard mutates anything. `arg` carries the typed
 /// command (`Run`) or branch (`SetBranch`); it's `None` for the other actions.
-async fn execute(provider: &dyn Provider, cfg: &Config, action: Action, pod: &Pod, arg: Option<&str>) -> String {
+async fn execute(
+    provider: &dyn Provider,
+    remote: &dyn Remote,
+    cfg: &Config,
+    action: Action,
+    pod: &Pod,
+    arg: Option<&str>,
+) -> String {
     let name = &pod.name;
     match action {
         Action::Restart => match provider.restart_pod(&pod.id).await {
@@ -1071,15 +1413,15 @@ async fn execute(provider: &dyn Provider, cfg: &Config, action: Action, pod: &Po
             Ok(()) => format!("✓ terminated {name}"),
             Err(e) => format!("✗ terminate {name} failed: {e}"),
         },
-        Action::Backup => run_backup(cfg, pod).await,
-        Action::Setup => run_setup(cfg, pod).await,
-        Action::Test => run_ssh_oneline(cfg, pod, TORCH_TEST_CMD, "torch").await,
+        Action::Backup => run_backup(remote, cfg, pod).await,
+        Action::Setup => run_setup(remote, cfg, pod).await,
+        Action::Test => run_ssh_oneline(remote, cfg, pod, TORCH_TEST_CMD, "torch", TEST_TIMEOUT).await,
         Action::Run => match arg {
-            Some(cmd) if !cmd.trim().is_empty() => run_ssh_oneline(cfg, pod, cmd, "run").await,
+            Some(cmd) if !cmd.trim().is_empty() => run_ssh_oneline(remote, cfg, pod, cmd, "run", RUN_TIMEOUT).await,
             _ => format!("✗ {name}: no command given"),
         },
         Action::SetBranch => match arg {
-            Some(branch) if !branch.trim().is_empty() => run_set_branch(cfg, pod, branch.trim()).await,
+            Some(branch) if !branch.trim().is_empty() => run_set_branch(remote, cfg, pod, branch.trim()).await,
             _ => format!("✗ {name}: no branch given"),
         },
     }
@@ -1089,24 +1431,33 @@ async fn execute(provider: &dyn Provider, cfg: &Config, action: Action, pod: &Po
 const TORCH_TEST_CMD: &str =
     "python -c 'import torch; print(torch.__version__)' 2>&1 || python3 -c 'import torch; print(torch.__version__)'";
 
-/// Run a command over SSH and report its last output line (read-only flows: test / run).
-async fn run_ssh_oneline(cfg: &Config, pod: &Pod, cmd: &str, what: &str) -> String {
+/// Run a command over SSH (within `timeout`) and report its last output line (read-only
+/// flows: test / run).
+async fn run_ssh_oneline(
+    remote: &dyn Remote,
+    cfg: &Config,
+    pod: &Pod,
+    cmd: &str,
+    what: &str,
+    timeout: Duration,
+) -> String {
     let target = match SshTarget::from_pod(pod, cfg) {
         Ok(t) => t,
         Err(e) => return format!("✗ {}: {e}", pod.name),
     };
-    match ssh::run(&target, cmd).await {
+    match remote.exec(&target, cmd, Some(timeout)).await {
         Ok(out) if out.success => {
             let line = out.stdout.lines().last().unwrap_or("").trim();
             format!("✓ {} {what}: {line}", pod.name)
         }
         Ok(out) => format!("✗ {} {what} (exit {:?}): {}", pod.name, out.code, out.stderr.trim()),
-        Err(e) => format!("✗ {} {what} failed: {e}", pod.name),
+        Err(e) => format!("✗ {} {what} failed: {}", pod.name, describe_error(&e)),
     }
 }
 
-/// Gently switch a pod's ARENA checkout to `branch` (mirrors `arena pods set-branch`).
-async fn run_set_branch(cfg: &Config, pod: &Pod, branch: &str) -> String {
+/// Gently switch a pod's ARENA checkout to `branch` (mirrors `arena pods set-branch`),
+/// within [`BRANCH_TIMEOUT`].
+async fn run_set_branch(remote: &dyn Remote, cfg: &Config, pod: &Pod, branch: &str) -> String {
     let target = match SshTarget::from_pod(pod, cfg) {
         Ok(t) => t,
         Err(e) => return format!("✗ {}: {e}", pod.name),
@@ -1116,23 +1467,24 @@ async fn run_set_branch(cfg: &Config, pod: &Pod, branch: &str) -> String {
     });
     // The TUI set-branch is gentle (ff-only); the destructive --hard reset is CLI-only.
     let cmd = arena_core::backup::checkout_command(&repo_path, branch, cfg.get("GIT_SSH_KEY_REMOTE"), false);
-    match ssh::run(&target, &cmd).await {
+    match remote.exec(&target, &cmd, Some(BRANCH_TIMEOUT)).await {
         Ok(out) if out.success => format!("✓ {} → {branch}", pod.name),
         Ok(out) => format!("✗ {} set-branch (exit {:?}): {}", pod.name, out.code, out.stderr.trim()),
-        Err(e) => format!("✗ {} set-branch failed: {e}", pod.name),
+        Err(e) => format!("✗ {} set-branch failed: {}", pod.name, describe_error(&e)),
     }
 }
 
 /// Commit + push the pod's ARENA tree over SSH **on its current branch** (mirrors
 /// `arena backup` for a single pod): never switches/creates a branch, skips main/master.
-async fn run_backup(cfg: &Config, pod: &Pod) -> String {
+/// Within [`BACKUP_TIMEOUT`].
+async fn run_backup(remote: &dyn Remote, cfg: &Config, pod: &Pod) -> String {
     use arena_core::backup::{self, parse_backup_output};
     let target = match SshTarget::from_pod(pod, cfg) {
         Ok(t) => t,
         Err(e) => return format!("✗ {}: {e}", pod.name),
     };
     let cmd = backup::backup_command(&backup_repo_path(cfg), cfg.get("GIT_SSH_KEY_REMOTE"), &format!("arena-tui backup {}", pod.name));
-    match ssh::run(&target, &cmd).await {
+    match remote.exec(&target, &cmd, Some(BACKUP_TIMEOUT)).await {
         Ok(out) if out.success => match parse_backup_output(&out.stdout) {
             Some((backup::BACKUP_PUSHED, branch)) => format!("✓ backed up {} → {branch}", pod.name),
             Some((backup::BACKUP_NO_CHANGES, branch)) => format!("✓ {} — no changes (on {branch})", pod.name),
@@ -1140,7 +1492,7 @@ async fn run_backup(cfg: &Config, pod: &Pod) -> String {
             _ => format!("✓ backed up {}", pod.name),
         },
         Ok(out) => format!("✗ backup {} (exit {:?}): {}", pod.name, out.code, out.stderr.trim()),
-        Err(e) => format!("✗ backup {} failed: {e}", pod.name),
+        Err(e) => format!("✗ backup {} failed: {}", pod.name, describe_error(&e)),
     }
 }
 
@@ -1152,8 +1504,9 @@ fn backup_repo_path(cfg: &Config) -> String {
 }
 
 /// Provision the pod over SSH: copy the deploy key, then run the setup script (mirrors
-/// `arena setup --apply` for a single pod; non-force, matching the CLI default).
-async fn run_setup(cfg: &Config, pod: &Pod) -> String {
+/// `arena setup --apply` for a single pod; non-force, matching the CLI default). Each step
+/// within the CLI's per-step budgets (core `SetupTimeouts`: `SETUP_TIMEOUT_SECS` honoured).
+async fn run_setup(remote: &dyn Remote, cfg: &Config, pod: &Pod) -> String {
     let target = match SshTarget::from_pod(pod, cfg) {
         Ok(t) => t,
         Err(e) => return format!("✗ {}: {e}", pod.name),
@@ -1162,15 +1515,19 @@ async fn run_setup(cfg: &Config, pod: &Pod) -> String {
         Ok(s) => s,
         Err(e) => return format!("✗ {}: {e}", pod.name),
     };
-    match ssh::scp(&target, &scfg.key_local, &scfg.key_remote).await {
+    let budget = match arena_core::setup::SetupTimeouts::from_config(cfg, None) {
+        Ok(b) => b,
+        Err(e) => return format!("✗ {}: {e}", pod.name),
+    };
+    match remote.copy(&target, &scfg.key_local, &scfg.key_remote, Some(budget.copy)).await {
         Ok(out) if out.success => {}
         Ok(out) => return format!("✗ setup {} (scp key): {}", pod.name, out.stderr.trim()),
-        Err(e) => return format!("✗ setup {} (scp key): {e}", pod.name),
+        Err(e) => return format!("✗ setup {} (scp key): {}", pod.name, describe_error(&e)),
     }
-    match ssh::run(&target, &scfg.remote_command(&pod.name, false)).await {
+    match remote.exec(&target, &scfg.remote_command(&pod.name, false), Some(budget.config)).await {
         Ok(out) if out.success => format!("✓ set up {}", pod.name),
         Ok(out) => format!("✗ setup {} (exit {:?}): {}", pod.name, out.code, out.stderr.trim()),
-        Err(e) => format!("✗ setup {} failed: {e}", pod.name),
+        Err(e) => format!("✗ setup {} failed: {}", pod.name, describe_error(&e)),
     }
 }
 
@@ -1262,12 +1619,10 @@ fn provider_cell(provider: &str) -> Cell<'static> {
     ))
 }
 
-/// The compact setup-health cell: three glyphs for `~/.name`, the deploy key, and the
-/// git origin pointing at GitHub. ✓ green / ✗ red / · gray (unknown or unreachable).
-/// The compact health cluster: four glyphs for `~/.name`, the deploy key, the git
+/// The compact setup cluster (SET): four glyphs for `~/.name`, the deploy key, the git
 /// origin→GitHub, and an API key — `.name`/key/origin/api. ✓ green / ✗ red / · gray.
-/// (Detail pane spells them out.)
-fn health_cell(m: Option<&PodMetrics>) -> Cell<'static> {
+/// (Detail pane spells them out. Not to be confused with HEALTH, the deep check.)
+fn setup_cell(m: Option<&PodMetrics>) -> Cell<'static> {
     let glyph = |ok: Option<bool>| match ok {
         Some(true) => Span::styled("✓", Style::default().fg(Color::Green)),
         Some(false) => Span::styled("✗", Style::default().fg(Color::Red)),
@@ -1354,7 +1709,7 @@ fn view(f: &mut Frame, shared: &Shared, ui: &Ui, secs: u64) {
     .block(Block::default().borders(Borders::ALL));
     f.render_widget(title, chunks[0]);
 
-    f.render_widget(summary_line(&shared.summary), chunks[1]);
+    f.render_widget(summary_line(shared), chunks[1]);
 
     if matches!(ui.mode, Mode::Detail) {
         let cols = Layout::default()
@@ -1377,6 +1732,7 @@ fn view(f: &mut Frame, shared: &Shared, ui: &Ui, secs: u64) {
         Mode::FleetConfirm { action, typed, scope } => render_fleet_confirm(f, shared, ui, *action, typed, *scope),
         Mode::NewPod(form) => render_new_pod(f, form),
         Mode::Input { action, scope, value } => render_input(f, shared, ui, *action, scope, value),
+        Mode::Select { value } => render_select(f, value),
         Mode::Working(msg) => render_result(f, msg, 0),
         Mode::Result(msg) => render_result(f, msg, ui.result_scroll),
         _ => {}
@@ -1409,23 +1765,37 @@ fn render_input(f: &mut Frame, shared: &Shared, ui: &Ui, action: Action, scope: 
     );
 }
 
-fn summary_line(s: &FleetSummary) -> Paragraph<'static> {
-    let util = s.mean_util.map(|u| format!("{u}%")).unwrap_or_else(|| "-".into());
-    let unreachable = if s.unreachable > 0 {
-        format!("  ·  {} unreachable", s.unreachable)
-    } else {
-        String::new()
-    };
-    Paragraph::new(format!(
-        " fleet: {} pods · {} GPUs · mean util {} · ${:.2}/hr (${:.0}/day){}",
-        s.pods,
-        s.total_gpus,
-        util,
-        s.total_cost,
-        s.total_cost * 24.0,
-        unreachable
-    ))
-    .style(Style::default().add_modifier(Modifier::BOLD))
+/// The `/` modal: type a selection in the CLI's selector syntax.
+fn render_select(f: &mut Frame, value: &str) {
+    let text = format!(
+        "mark pods by selector — the CLI's syntax:\n\n  names or ids     apple bloom   (or apple,bloom)\n  a range          apple..delta   (MACHINE_NAME_LIST order)\n  leave out        -x cloud   or   !cloud\n  narrow           --on runpod   --gpus 2\n\nReplaces the current marks; a typo marks nothing.\n\n  > {value}\n\n[enter] mark  [esc] cancel"
+    );
+    let area = centered_rect(64, 50, f.area());
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(text).wrap(Wrap { trim: false }).block(
+            Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)).title(" select "),
+        ),
+        area,
+    );
+}
+
+/// The summary bar (`state::summary_text`): counts, then the fleet's burn from the
+/// snapshot's core `FleetCost`, worded as `pods list`'s footer.
+fn summary_line(s: &Shared) -> Paragraph<'static> {
+    Paragraph::new(summary_text(&s.summary, &s.snap.cost, &s.snap.partial))
+        .style(Style::default().add_modifier(Modifier::BOLD))
+}
+
+/// A [`Tone`] as a colour.
+fn tone_style(t: Tone) -> Style {
+    match t {
+        Tone::Good => Style::default().fg(Color::Green),
+        Tone::Warn => Style::default().fg(Color::Yellow),
+        Tone::Bad => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        Tone::Busy => Style::default().fg(Color::Cyan),
+        Tone::Dim => Style::default().fg(Color::DarkGray),
+    }
 }
 
 fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: bool) {
@@ -1433,34 +1803,45 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
     // (PROGRESS, then the GPU%/MEM% graphs) are dropped when the terminal is too narrow
     // so the core data isn't crushed to one column each.
     let w = area.width as usize;
-    let show_saved = w >= 96;
-    let show_host = w >= 134; // host CPU% + RAM (extra, only when there's room)
-    let show_progress = w >= 110;
+    // The fleet columns from the core snapshot — M (maintenance badge), HEALTH (last deep
+    // check) and PROXY — are essential and always shown, so every threshold below sits
+    // `FLEET_W` further out than it did before they existed. PROXY is just the port
+    // (coloured live/stale) unless there's room for the full `:9500 stale` label.
+    const HEALTH_W: usize = 8; // "fail 23h", "checking"
+    let full_proxy = w >= 160;
+    let proxy_w = if full_proxy { 11 } else { 6 };
+    const FLEET_W: usize = 1 + HEALTH_W + 6 + 3; // + their inter-column spacing
+    let show_saved = w >= 96 + FLEET_W;
+    let show_host = w >= 134 + FLEET_W; // host CPU% + RAM (extra, only when there's room)
+    let show_progress = w >= 110 + FLEET_W;
     // When cramped, names compress (arena8-apple→apple) and the GPU drops the "RTX "
     // noise. Names compact a bit earlier (so you see "jack", not a truncated
     // "arena8-ja"); GPU always carries count + VRAM ("2×A4000 16G"), truncated if tight.
-    let compact_names = w < 116;
-    let narrow = w < 100;
+    let compact_names = w < 116 + FLEET_W;
+    let narrow = w < 100 + FLEET_W;
     let name_w = if compact_names { 10 } else { 16 };
     let gpu_w = if narrow { 12 } else { 16 };
+    let now = shared.snap.generated_at;
 
     // Sparklines (GPU%/MEM% history) flex to fill whatever horizontal space is left after
     // the other columns — so they grow on a wide screen and simply vanish when there's no
     // room, rather than living behind a fixed threshold. PROGRESS gets a fixed budget when
     // sparks are present so the leftover math is stable.
     const PROGRESS_W: usize = 16;
-    let nonspark_cols = 12 + show_saved as usize + if show_host { 2 } else { 0 } + show_progress as usize;
-    let used = 1 + 1 + name_w + 4 + 4 + gpu_w + 5 + 9 + 4 + 9 + 7 + 6
+    let nonspark_cols = 15 + show_saved as usize + if show_host { 2 } else { 0 } + show_progress as usize;
+    let used = 1 + 1 + name_w + 4 + 1 + 4 + gpu_w + 5 + 9 + 4 + 9 + 7 + HEALTH_W + proxy_w + 6
         + if show_saved { 6 } else { 0 }
         + if show_host { 8 } else { 0 }
         + if show_progress { PROGRESS_W } else { 0 }
-        + nonspark_cols.saturating_sub(1); // inter-column spacing
+        + nonspark_cols.saturating_sub(1) // inter-column spacing
+        + 4; // the block's two borders + the `▶ ` highlight column
     let leftover = w.saturating_sub(used);
     let show_spark = with_spark && leftover >= 20; // ~2×9 + spacing
     let spark_w = if show_spark { (leftover.saturating_sub(3) / 2).clamp(9, 30) } else { 0 };
 
-    let mut header_cells =
-        vec!["", "P", "NAME", "STATUS", "SET", "GPU", "GPU%", "MEM", "TEMP", "DISK", "$/HR", "BRANCH"];
+    let mut header_cells = vec![
+        "", "P", "NAME", "STATUS", "M", "SET", "GPU", "GPU%", "MEM", "TEMP", "DISK", "$/H", "HEALTH", "PROXY", "BRANCH",
+    ];
     if show_saved {
         header_cells.push("SAVED");
     }
@@ -1480,8 +1861,11 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
     let rows: Vec<Row> = shared
         .pods
         .iter()
-        .map(|p| {
+        .enumerate()
+        .map(|(i, p)| {
             let m = shared.metrics.get(&p.name);
+            // This row's snapshot entry (same index: `Shared::publish`).
+            let sp = shared.snap.pods.get(i);
             let util = m.and_then(|m| m.mean_util());
             let err = m.map(|m| m.error.is_some()).unwrap_or(false);
             let util_str = match (util, err) {
@@ -1501,12 +1885,16 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
             };
             let temp = m.and_then(|m| m.max_temp());
             let temp_str = temp.map(|t| format!("{t}C")).unwrap_or_else(|| "-".into());
-            // A stopped pod's reported rate isn't being billed: `-`, as in `pods list`.
-            let cost = p
-                .cost_per_hr
-                .filter(|_| arena_core::status::bills_hourly(&p.provider, &p.status))
-                .map(|c| format!("${c:.2}"))
-                .unwrap_or_else(|| "-".into());
+            // As `pods list` shows it: the provider's currency, `-` unless billing.
+            let cost = fleet::price_label(p);
+            let maint = if state::has_maintenance(p) {
+                Cell::from("M").style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+            } else {
+                Cell::from(" ")
+            };
+            let (health, health_tone) =
+                health_cell(sp.and_then(|sp| sp.health.as_ref()), shared.deep.is_running(p), now);
+            let (proxy, proxy_tone) = sp.map(|sp| proxy_cell(sp, !full_proxy)).unwrap_or(("?".into(), Tone::Dim));
             // GPU now comes from the live nvidia-smi readout (provider list omits it).
             // Append VRAM when wide; drop the "RTX " noise when the table is cramped.
             let mut gpu = m
@@ -1548,13 +1936,16 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
                     ui.shown_name(&p.name)
                 }),
                 status_cell,
-                health_cell(m),
+                maint,
+                setup_cell(m),
                 Cell::from(gpu),
                 Cell::from(util_str).style(util_style(util, err)),
                 Cell::from(mem),
                 Cell::from(temp_str).style(temp_style(temp)),
                 Cell::from(disk).style(capacity_style(disk_pct)),
                 Cell::from(cost),
+                Cell::from(health).style(tone_style(health_tone)),
+                Cell::from(proxy).style(tone_style(proxy_tone)),
                 Cell::from(branch),
             ];
             if show_saved {
@@ -1618,13 +2009,16 @@ fn pods_table(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect, with_spark: b
         Constraint::Length(1),  // P (provider glyph)
         Constraint::Length(name_w as u16), // NAME (auto-short when cramped)
         Constraint::Length(4),  // STATUS (abbreviated: run/exit/stop…)
+        Constraint::Length(1),  // M (host maintenance badge)
         Constraint::Length(4),  // SET (.name/key/origin/api)
         Constraint::Length(gpu_w as u16), // GPU (+VRAM when wide)
         Constraint::Length(5),  // GPU%
         Constraint::Length(9),  // MEM (e.g. "120/240G")
         Constraint::Length(4),  // TEMP (e.g. "85C")
         Constraint::Length(9),  // DISK (e.g. "12/100G")
-        Constraint::Length(7),  // $/HR
+        Constraint::Length(7),  // $/H (e.g. "$0.17", "€0.006")
+        Constraint::Length(HEALTH_W as u16), // HEALTH (e.g. "pass 12m")
+        Constraint::Length(proxy_w as u16), // PROXY (":9500", or ":9500 stale" when wide)
         Constraint::Length(6),  // BRANCH (e.g. "w1d2")
     ];
     if show_saved {
@@ -1710,7 +2104,11 @@ fn rel_time_short(m: Option<&PodMetrics>) -> String {
     }
 }
 
-/// The per-pod detail pane (shown in Detail mode): identity + endpoint, a per-GPU
+/// Lines in the detail pane's facts block (see `detail_pane`'s `facts`).
+const FACT_LINES: u16 = 17;
+
+/// The per-pod detail pane (shown in Detail mode): identity + endpoint, proxy forward,
+/// cost, the host maintenance window + note, the last deep check (and why), a per-GPU
 /// table, full progress text, and util/temp sparklines from the rolling history.
 fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     let Some(pod) = shared.pods.get(ui.selected) else { return };
@@ -1729,11 +2127,11 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     let commits_h = if n_commits > 0 { n_commits as u16 + 1 } else { 0 };
     // History graphs are a nice-to-have; show them only if the pane is still tall enough
     // once the facts, per-GPU table, and the extra sections have taken their space.
-    let show_graphs = inner.height >= 13 + 3 + procs_h + commits_h + 6;
+    let show_graphs = inner.height >= FACT_LINES + 3 + procs_h + commits_h + 6;
 
     let mut constraints: Vec<Constraint> = vec![
-        Constraint::Length(13), // header facts
-        Constraint::Min(3),     // per-GPU table
+        Constraint::Length(FACT_LINES), // header facts
+        Constraint::Min(3),             // per-GPU table
     ];
     let mut idx = 2;
     let procs_idx = (procs_h > 0).then(|| {
@@ -1766,11 +2164,35 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
         .and_then(|m| m.gpu_summary())
         .or_else(|| pod.gpu_type.clone())
         .unwrap_or_else(|| "-".into());
-    let cost = pod
-        .cost_per_hr
-        .filter(|_| arena_core::status::bills_hourly(&pod.provider, &pod.status))
-        .map(|c| format!("${c:.2}/hr  (${:.2}/day)", c * 24.0))
-        .unwrap_or_else(|| "-".into());
+    // `pods list`'s $/H label (the provider's currency; `-` unless billing), plus per day.
+    let cost = match fleet::price_label(pod).as_str() {
+        "-" => "-".to_string(),
+        label => {
+            let day = pod.cost_per_hr.map(|c| fleet::fmt_money(fleet::currency_symbol(&pod.provider), c * 24.0));
+            format!("{label}/h  ({}/day)", day.unwrap_or_default())
+        }
+    };
+    let sp = shared.snap.pods.get(ui.selected);
+    // The snapshot lines are clipped to one row each (after the 10-column label), so a long
+    // reason or note can't wrap and push the rest of the facts out of their block.
+    let fit = |s: String| truncate(&s, (inner.width as usize).saturating_sub(10).max(8));
+    let proxy = fit(sp.map(proxy_detail).unwrap_or_else(|| "?".into()));
+    // The last deep check: verdict + age + worst issue as `arena snapshot` words it, and
+    // the first failing/warning check's own words (the operator's view, so the raw text).
+    let health = match sp.and_then(|sp| sp.health.as_ref()) {
+        _ if shared.deep.is_running(pod) => "checking… (deep check running in the background)".to_string(),
+        None => "- (never deep-checked — d runs one)".to_string(),
+        Some(h) => format!(
+            "{}  (checked {})",
+            snapshot::health_label(Some(h), shared.snap.generated_at),
+            snapshot::rfc3339(h.checked_at)
+        ),
+    };
+    let health = fit(health);
+    let why = fit(
+        sp.and_then(|sp| sp.health.as_ref()).and_then(|h| h.reasons.first().cloned()).unwrap_or_else(|| "-".into()),
+    );
+    let maint = fit(fleet::maintenance_label(pod.maintenance.as_ref()));
     let disk = match m.and_then(|m| m.disk_summary()) {
         Some((u, t)) => {
             let pct = if t > 0 { u as f64 / t as f64 * 100.0 } else { 0.0 };
@@ -1798,11 +2220,15 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
         format!("{cpu}   {ram}")
     };
     let facts = format!(
-        "status:   {}\ngpu:      {}\nendpoint: {}\ncost:     {}\ndisk:     {}\nhost:     {}\nbranch:   {}\nbackup:   {}\nsync:     {}\norigin:   {} {}\nsetup:    .name {}   deploy-key {}   origin→gh {}   api-key {}\ntokens:   HF {}   Claude-Code {}\nprogress: {}",
+        "status:   {}\ngpu:      {}\nendpoint: {}\nproxy:    {}\ncost:     {}\nmaint:    {}\nhealth:   {}\nreason:   {}\ndisk:     {}\nhost:     {}\nbranch:   {}\nbackup:   {}\nsync:     {}\norigin:   {} {}\nsetup:    .name {}   deploy-key {}   origin→gh {}   api-key {}\ntokens:   HF {}   Claude-Code {}\nprogress: {}",
         display_status(&pod.status, m.map(|m| m.error.is_none())),
         gpu,
         endpoint,
+        proxy,
         cost,
+        maint,
+        health,
+        why,
         disk,
         host,
         m.and_then(|m| m.branch.clone()).unwrap_or_else(|| "-".into()),
@@ -1928,25 +2354,38 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
     }
 }
 
-fn footer_hint(shared: &Shared, ui: &Ui, secs: u64) -> String {
+/// The footer: a live [`Notice`] if there is one (else the refresh status and its age),
+/// how many deep checks are running, then the keys for the current mode.
+fn footer_hint(shared: &Shared, ui: &Ui, secs: u64) -> Line<'static> {
     let age = match shared.last_refresh {
         Some(t) => format!("updated {}s ago", t.elapsed().as_secs()),
         None => "never updated".into(),
     };
     let spin = if shared.refreshing { " ⟳" } else { "" };
+    let checking = match shared.deep.running() {
+        0 => String::new(),
+        n => format!(" · deep-checking {n}"),
+    };
     let keys = match ui.mode {
-        Mode::List => "[enter] detail  [c] ssh  [space] mark / [x] unmark all  [a] act  [A] all  [n] new  [r] refresh",
-        Mode::Detail => "[c] ssh  [space] mark / [x] unmark all  [a] act  [A] all  [n] new  [r] refresh  [esc] back",
+        Mode::List => "[enter] detail  [c] ssh  [space] mark  [/] select  [x] unmark all  [a] act  [A] all  [d] deep check  [n] new  [r] refresh",
+        Mode::Detail => "[c] ssh  [space] mark  [/] select  [x] unmark all  [a] act  [A] all  [d] deep check  [n] new  [r] refresh  [esc] back",
         Mode::Menu { .. } => "[↑↓] move  [enter] choose  [letter] pick  [esc] cancel",
         Mode::Confirm(_) => "type to confirm  [enter] apply  [esc] cancel",
         Mode::FleetMenu { .. } => "[↑↓] move  [enter] choose  [letter] pick  [esc] cancel",
         Mode::FleetConfirm { .. } => "type the token to confirm  [enter] apply  [esc] cancel",
         Mode::NewPod { .. } => "[↑↓] pods  [+-] gpus  [←→] type  [enter] create  [esc] cancel",
         Mode::Input { .. } => "type the value  [enter] run  [esc] cancel",
+        Mode::Select { .. } => "type a selection  [enter] mark  [esc] cancel",
         Mode::Working(_) => "working… (background) — please wait",
         Mode::Result(_) => "[↑↓] scroll  ·  [any other key] dismiss",
     };
-    format!("{}{} · {} · every {}s · {}", shared.status, spin, age, secs, keys)
+    match shared.notice.as_ref().filter(|n| n.at.elapsed() < NOTICE_FOR) {
+        Some(n) => {
+            let style = if n.error { tone_style(Tone::Bad) } else { tone_style(Tone::Busy) };
+            Line::from(vec![Span::styled(n.text.clone(), style), Span::raw(format!("{checking} · {keys}"))])
+        }
+        None => Line::from(format!("{}{}{checking} · {} · every {}s · {}", shared.status, spin, age, secs, keys)),
+    }
 }
 
 /// A centered popup rect `pct_x` × `pct_y` percent of the screen.
@@ -2071,8 +2510,17 @@ fn render_fleet_confirm(f: &mut Frame, shared: &Shared, ui: &Ui, action: Action,
     let token = fleet_confirm_token_str(shared, &ui.marked, scope);
     // Per-pod providers aren't known here: warn as if each one wipes (the safe side).
     let warn = action.warning(true).map(|w| format!("\n\n{w}")).unwrap_or_default();
+    // A marked set is spelled out: `/` can mark pods that are scrolled off screen.
+    let names = match scope {
+        Scope::All => String::new(),
+        Scope::Marked => {
+            let names: Vec<String> =
+                shared.pods.iter().filter(|p| ui.marked.contains(&p.id)).map(|p| ui.shown_name(&p.name)).collect();
+            format!(": {}", names.join(", "))
+        }
+    };
     let text = format!(
-        "{} {who}.{warn}\n\nType {token} to confirm:\n\n  > {}\n\n[enter] apply  [esc] cancel",
+        "{} {who}{names}.{warn}\n\nType {token} to confirm:\n\n  > {}\n\n[enter] apply  [esc] cancel",
         action.label(),
         typed
     );
@@ -2248,4 +2696,589 @@ fn render_result(f: &mut Frame, msg: &str, scroll: u16) {
             ),
         area,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::sync::atomic::AtomicUsize;
+
+    use arena_core::health::{Check, Status};
+    use arena_core::pod::Maintenance;
+    use arena_core::remote::{FakeRemote, FakeReply, RemoteCall};
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+
+    const NOW: u64 = 1_791_460_800; // 2026-10-08T12:00:00Z
+
+    /// A healthy 2×A4000 pod as the deep-check script prints it (login-shell chatter first).
+    const DEEP_HEALTHY: &str = "\
+Welcome back! conda env: arena-env
+deep_check=1
+load1=0.84
+cpus=64
+nproc=16
+uptime_secs=1209600
+smi=ok
+smi_cuda=13.0
+gpu.0.name=NVIDIA RTX A4000
+gpu.0.driver=580.65.06
+gpu.1.name=NVIDIA RTX A4000
+gpu.1.driver=580.65.06
+smi_gpus=2
+python=/root/miniconda3/envs/arena-env/bin/python
+torch=ok
+torch_version=2.9.0+cu130
+torch_cuda=13.0
+cuda_available=true
+device_count=2
+tensor.0=ok
+tensor.1=ok
+peer.0-1=ok
+peer.1-0=ok
+nccl_ranks=2
+nccl=ok
+py_done=1
+py_exit=0
+disk.root_avail_kb=104857600
+net.curl_exit=0
+net.http=206
+net.bytes=33554432
+net.secs=0.712
+deep_check_end=1
+";
+
+    fn cfg(extra: &str) -> Config {
+        Config::parse(&format!(
+            "MACHINE_NAME_PREFIX=devtest\nSHARED_SSH_KEY_PATH=/nonexistent/devtest_key\nALLOWED_CUDA_VERSIONS=\"13.0\"\n\
+             MACHINE_NAME_LIST=(\n \"alpha\"\n \"bravo\"\n \"charlie\"\n \"delta\"\n)\n{extra}"
+        ))
+    }
+
+    /// `devtest-<name>`, RUNNING, at `10.0.0.<n>:<port>` when `port` is given.
+    fn pod(name: &str, provider: &str, id: &str, n: u8, port: Option<u16>) -> Pod {
+        Pod {
+            id: id.into(),
+            name: format!("devtest-{name}"),
+            provider: provider.into(),
+            status: "RUNNING".into(),
+            ssh_ip: port.map(|_| format!("10.0.0.{n}")),
+            ssh_port: port,
+            ..Default::default()
+        }
+    }
+
+    fn verdict(p: &Pod, status: Status, check: Option<(&str, &str)>) -> PodHealth {
+        PodHealth {
+            id: p.id.clone(),
+            name: p.name.clone(),
+            provider: p.provider.clone(),
+            status,
+            checks: check.map(|(name, detail)| Check { name: name.into(), status, detail: detail.into() }).into_iter().collect(),
+            facts: None,
+            host: None,
+        }
+    }
+
+    fn ui(cfg: Config, remote: Arc<dyn Remote>) -> Ui {
+        Ui {
+            provider_name: "runpod".into(),
+            config_path: "/test/config.env".into(),
+            prefix: cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena").to_string(),
+            cfg,
+            remote,
+            short_names: true,
+            mode: Mode::List,
+            selected: 0,
+            marked: HashSet::new(),
+            result_scroll: 0,
+            last_table: std::cell::Cell::new((Rect::default(), 0)),
+        }
+    }
+
+    /// Forwards alpha → its endpoint (live) and bravo → an old one (stale).
+    fn proxy_file() -> String {
+        use arena_core::proxy::{render_nginx, Forward};
+        let fwd = |name: &str, port: u16, ip: &str, tport: u16| Forward {
+            name: format!("devtest-{name}"),
+            public_port: port,
+            target_ip: ip.into(),
+            target_port: tport,
+            provider: Some("runpod".into()),
+            pod_id: None,
+        };
+        render_nginx(&[fwd("alpha", 9500, "10.0.0.1", 22001), fwd("bravo", 9501, "10.0.0.9", 22999)])
+    }
+
+    /// The fixed fleet the rendering tests draw:
+    /// - alpha: RunPod 1×A4000 at $0.17, a host maintenance window, passed a check 12m ago,
+    ///   proxied live on :9500;
+    /// - bravo: RunPod at $0.25, failed its check (GPU) 2h ago, proxy forward stale;
+    /// - charlie: a Hetzner cx23 at €0.0056, never checked, no forward;
+    /// - delta: a stopped RunPod pod (its $0.13 isn't billing), being deep-checked now.
+    fn fixture_pods() -> Vec<Pod> {
+        let mut alpha = pod("alpha", "runpod", "rp1", 1, Some(22001));
+        alpha.gpu_type = Some("RTX A4000".into());
+        alpha.gpu_count = Some(1);
+        alpha.cost_per_hr = Some(0.17);
+        alpha.maintenance = Some(Maintenance {
+            start: Some("2026-10-09T02:00:00Z".into()),
+            end: Some("2026-10-09T06:00:00Z".into()),
+            note: Some("host upgrade".into()),
+        });
+        let mut bravo = pod("bravo", "runpod", "rp2", 2, Some(22002));
+        bravo.cost_per_hr = Some(0.25);
+        let mut charlie = pod("charlie", "hetzner", "88", 3, Some(22));
+        charlie.status = "running".into();
+        charlie.gpu_type = Some("cx23".into());
+        charlie.cost_per_hr = Some(0.0056);
+        let mut delta = pod("delta", "runpod", "rp4", 4, None);
+        delta.status = "EXITED".into();
+        delta.cost_per_hr = Some(0.13);
+        vec![delta, charlie, bravo, alpha]
+    }
+
+    fn fixture_shared() -> Shared {
+        let cfg = cfg("");
+        let pods = fixture_pods();
+        let by = |id: &str| pods.iter().find(|p| p.id == id).unwrap().clone();
+        let mut cache = HealthCache::new();
+        cache.merge(&[verdict(&by("rp1"), Status::Pass, None)], NOW - 720);
+        cache.merge(&[verdict(&by("rp2"), Status::Fail, Some(("cuda", "RuntimeError: Error 999: unknown error")))], NOW - 7_300);
+        let text = proxy_file();
+        let snap = dashboard_snapshot(&pods, &[], Some(&text), &cache, &Naming::from_config(&cfg), NOW);
+        let mut shared = Shared::default();
+        shared.deep.begin(vec![by("rp4")]);
+        shared.summary = summarize(&pods, &HashMap::new());
+        shared.publish(snap);
+        shared
+    }
+
+    fn screen(buf: &Buffer) -> Vec<String> {
+        (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()).collect()
+    }
+
+    fn draw(width: u16, height: u16, shared: &Shared, ui: &Ui) -> Vec<String> {
+        let mut t = Terminal::new(TestBackend::new(width, height)).unwrap();
+        t.draw(|f| view(f, shared, ui, 5)).unwrap();
+        screen(t.backend().buffer())
+    }
+
+    /// The row of the pod whose short name is `name`.
+    fn row<'a>(lines: &'a [String], name: &str) -> &'a str {
+        lines
+            .iter()
+            .find(|l| l.contains(&format!(" {name} ")))
+            .unwrap_or_else(|| panic!("no {name} row in\n{}", lines.join("\n")))
+    }
+
+    /// The rows read the core snapshot: $/h in each provider's currency (`-` when not
+    /// billing), the maintenance badge, the last deep check + its age (or `checking`), the
+    /// proxy port + state; the summary bar the fleet total with € kept apart.
+    #[test]
+    fn rows_show_cost_maintenance_health_and_proxy_from_the_snapshot() {
+        let shared = fixture_shared();
+        let ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        let lines = draw(180, 12, &shared, &ui);
+        let all = lines.join("\n");
+        let header = lines.iter().find(|l| l.contains("HEALTH")).unwrap_or_else(|| panic!("{all}"));
+        for col in ["$/H", "HEALTH", "PROXY", " M "] {
+            assert!(header.contains(col), "{col} in {header}");
+        }
+        // Rows by name, whatever order the providers listed them in.
+        let order: Vec<usize> = ["alpha", "bravo", "charlie", "delta"].iter().map(|n| all.find(&format!(" {n} ")).unwrap()).collect();
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{all}");
+
+        // (row, must show, must not show)
+        let cases: &[(&str, &[&str], &[&str])] = &[
+            ("alpha", &["init M", "$0.17", "pass 12m", ":9500"], &["stale"]),
+            ("bravo", &["$0.25", "fail 2h", ":9501 stale"], &["init M"]),
+            ("charlie", &["€0.006"], &["$0.0", "init M", "pass", "fail", ":95"]),
+            ("delta", &["exit", "checking"], &["$0.13", "exit M"]),
+        ];
+        for (name, shows, hides) in cases {
+            let r = row(&lines, name);
+            for s in *shows {
+                assert!(r.contains(s), "{name} shows {s:?}: {r}");
+            }
+            for s in *hides {
+                assert!(!r.contains(s), "{name} hides {s:?}: {r}");
+            }
+        }
+        let summary = lines.iter().find(|l| l.contains("fleet:")).unwrap_or_else(|| panic!("{all}"));
+        assert!(
+            summary.contains(" 4 pods · 0 GPUs · mean util - · fleet: $0.42/h across 3 billing pod(s) + €0.006/h hetzner ≈ $10.08/day + €0.13/day"),
+            "{summary}"
+        );
+        assert!(all.contains("deep-checking 1"), "the footer counts running checks: {all}");
+    }
+
+    /// A narrow terminal keeps HEALTH and PROXY (the port, coloured by state) and drops the
+    /// nice-to-haves first.
+    #[test]
+    fn a_narrow_terminal_keeps_health_and_a_compact_proxy() {
+        let shared = fixture_shared();
+        let ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        let lines = draw(120, 12, &shared, &ui);
+        let bravo = row(&lines, "bravo");
+        assert!(bravo.contains("fail 2h") && bravo.contains(":9501") && !bravo.contains("stale"), "{bravo}");
+        assert!(row(&lines, "alpha").contains("pass 12m"));
+    }
+
+    /// The detail pane spells out what the row abbreviates: the proxy state, cost per hour
+    /// and day, the maintenance window + note, the last check with its worst issue and the
+    /// failing check's own words.
+    #[test]
+    fn detail_pane_spells_out_proxy_cost_maintenance_and_health() {
+        let shared = fixture_shared();
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        ui.mode = Mode::Detail;
+        let alpha = draw(160, 40, &shared, &ui).join("\n");
+        for want in [
+            "proxy:    :9500 (live)",
+            "cost:     $0.17/h  ($4.08/day)",
+            "maint:    maint 10-09 02:00→06:00 UTC · host upgrade",
+            "health:   pass 12m  (checked 2026-10-08T11:48:00Z)",
+        ] {
+            assert!(alpha.contains(want), "{want:?} in\n{alpha}");
+        }
+        ui.selected = 1; // bravo
+        let bravo = draw(160, 40, &shared, &ui).join("\n");
+        for want in [
+            "proxy:    :9501 stale (`arena proxy apply` re-points it)",
+            "health:   fail 2h GPU error",
+            "reason:   cuda: RuntimeError: Error 999",
+            "maint:    -",
+            "progress: -", // the snapshot lines don't push the rest out of the facts block
+        ] {
+            assert!(bravo.contains(want), "{want:?} in\n{bravo}");
+        }
+        ui.selected = 3; // delta
+        let delta = draw(160, 40, &shared, &ui).join("\n");
+        assert!(delta.contains("health:   checking…") && delta.contains("cost:     -"), "{delta}");
+    }
+
+    /// A marked set's confirm names the pods — `/` can mark ones scrolled off screen.
+    #[test]
+    fn a_marked_set_confirm_names_its_pods_and_the_footer_shows_a_notice() {
+        let mut shared = fixture_shared();
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        ui.marked = ["rp1", "rp2"].map(String::from).into_iter().collect();
+        ui.mode = Mode::FleetConfirm { action: Action::Terminate, typed: String::new(), scope: Scope::Marked };
+        let all = draw(180, 30, &shared, &ui).join("\n");
+        assert!(all.contains("terminate 2 marked pods: alpha, bravo."), "{all}");
+        assert!(all.contains("Type 2 to confirm"), "{all}");
+
+        ui.mode = Mode::List;
+        shared.notify("✗ a target matched no pod — nothing was done: `alpah` …", true);
+        let footer = draw(180, 12, &shared, &ui).pop().unwrap();
+        assert!(footer.starts_with("✗ a target matched no pod"), "{footer}");
+    }
+
+    /// A pod-side fleet for [`refresh`]: lists runpod (two pods) and a vast that 429s,
+    /// counts list and details calls, and panics on anything that would change the fleet.
+    struct FakeFleet {
+        pods: Vec<Pod>,
+        lists: AtomicUsize,
+        details: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for FakeFleet {
+        fn name(&self) -> &'static str {
+            "fleet"
+        }
+        fn describe(&self, _spec: &PodSpec) -> String {
+            String::new()
+        }
+        async fn list_pods(&self) -> arena_core::Result<Vec<Pod>> {
+            panic!("the dashboard lists per provider, so a failed one is known")
+        }
+        async fn list_by_provider(&self) -> Vec<(String, arena_core::Result<Vec<Pod>>)> {
+            self.lists.fetch_add(1, Ordering::SeqCst);
+            vec![
+                ("runpod".into(), Ok(self.pods.clone())),
+                ("vast".into(), Err(arena_core::Error::provider("vast list HTTP 429 Too Many Requests"))),
+            ]
+        }
+        async fn enrich(&self, pods: &mut [Pod]) -> arena_core::Result<()> {
+            self.details.fetch_add(1, Ordering::SeqCst);
+            for p in pods.iter_mut().filter(|p| p.id == "rp1") {
+                p.gpu_type = Some("RTX A4000".into());
+                p.gpu_count = Some(1);
+                p.cost_per_hr = Some(0.17);
+                p.maintenance = Some(Maintenance { note: Some("host upgrade".into()), ..Default::default() });
+            }
+            Ok(())
+        }
+        async fn create_pod(&self, _spec: &PodSpec) -> arena_core::Result<Pod> {
+            panic!("a refresh must never create a pod")
+        }
+        async fn stop_pod(&self, _id: &str) -> arena_core::Result<()> {
+            panic!("a refresh must never stop a pod")
+        }
+        async fn restart_pod(&self, _id: &str) -> arena_core::Result<()> {
+            panic!("a refresh must never restart a pod")
+        }
+        async fn terminate_pod(&self, _id: &str) -> arena_core::Result<()> {
+            panic!("a refresh must never terminate a pod")
+        }
+    }
+
+    /// A fresh temp directory, removed at the end of the test.
+    struct Tmp(PathBuf);
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn tmp(tag: &str) -> Tmp {
+        let d = std::env::temp_dir().join(format!("arena-tui-test-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        Tmp(d)
+    }
+
+    /// One refresh = the core snapshot over the per-provider listing, the local proxy file
+    /// and the health cache (a failed provider named, not silently missing); one list call
+    /// per refresh as before, the details query only on its slower cadence or on `r` (and
+    /// its answer kept on the rows in between); over SSH only the metrics probe.
+    #[tokio::test(start_paused = true)]
+    async fn a_refresh_is_the_core_snapshot_with_details_on_a_slower_cadence() {
+        let dir = tmp("refresh");
+        let proxy_path = dir.0.join("proxy.conf");
+        std::fs::write(&proxy_path, proxy_file()).unwrap();
+        let cfg = cfg(&format!(
+            "SSH_PROXY_HOST=proxy.example.com\nSSH_PROXY_NGINX_CONFIG_PATH={}\nARENA_STATE_DIR={}\n",
+            proxy_path.display(),
+            dir.0.join("state").display()
+        ));
+        let alpha = pod("alpha", "runpod", "rp1", 1, Some(22001));
+        let bravo = pod("bravo", "runpod", "rp2", 2, Some(22002));
+        let cache = health_cache_path(&cfg).unwrap().unwrap();
+        assert!(cache.starts_with(&dir.0), "never the real state dir: {}", cache.display());
+        snapshot::record_health(&cache, &[verdict(&alpha, Status::Pass, None)], None, snapshot::unix_now() - 600).unwrap();
+
+        let provider = FakeFleet { pods: vec![bravo, alpha], lists: AtomicUsize::new(0), details: AtomicUsize::new(0) };
+        let fake = Arc::new(FakeRemote::new());
+        let remote: Arc<dyn Remote> = fake.clone();
+        let shared = Mutex::new(Shared::default());
+        let mut details = DetailsState::default();
+        let opts = ProbeOpts::default();
+        let calls = || (provider.lists.load(Ordering::SeqCst), provider.details.load(Ordering::SeqCst));
+        let alpha_row = |shared: &Mutex<Shared>| {
+            let s = shared.lock().unwrap();
+            let a = s.snap.pods.iter().find(|p| p.pod.id == "rp1").unwrap().clone();
+            (fleet::price_label(&a.pod), state::has_maintenance(&a.pod))
+        };
+
+        refresh(&provider, &remote, &cfg, &opts, &shared, &mut details, false).await;
+        {
+            let s = shared.lock().unwrap();
+            let names: Vec<&str> = s.pods.iter().map(|p| p.name.as_str()).collect();
+            assert_eq!(names, ["devtest-alpha", "devtest-bravo"]);
+            assert_eq!(s.snap.pods.len(), 2, "rows and snapshot stay in step");
+            let (a, b) = (&s.snap.pods[0], &s.snap.pods[1]);
+            assert_eq!((a.proxy, a.proxy_port), (snapshot::ProxyState::Live, Some(9500)));
+            assert_eq!((b.proxy, b.proxy_port), (snapshot::ProxyState::Stale, Some(9501)));
+            assert_eq!(health_cell(a.health.as_ref(), false, s.snap.generated_at).0, "pass 10m");
+            assert!(b.health.is_none());
+            assert_eq!(s.snap.partial, ["vast"]);
+            let summary = summary_text(&s.summary, &s.snap.cost, &s.snap.partial);
+            assert!(summary.contains("fleet: $0.17/h across 2 billing pod(s) (1 unpriced)"), "{summary}");
+            assert!(summary.ends_with("vast failed to list: its pods are missing"), "{summary}");
+        }
+        assert_eq!(alpha_row(&shared), ("$0.17".to_string(), true));
+        assert_eq!(calls(), (1, 1), "the first refresh fills the details");
+        // Over SSH: one metrics probe per pod, nothing else.
+        let probes: Vec<String> = fake.calls().iter().map(|c| c.host().to_string()).collect();
+        assert_eq!(probes.len(), 2);
+        assert!(fake.calls().iter().all(|c| matches!(c, RemoteCall::Exec { timeout: Some(t), .. } if *t == arena_core::remote::PROBE_TIMEOUT)));
+
+        // Right away again: one more list, no details query — the details stay on the row.
+        refresh(&provider, &remote, &cfg, &opts, &shared, &mut details, false).await;
+        assert_eq!(calls(), (2, 1));
+        assert_eq!(alpha_row(&shared), ("$0.17".to_string(), true));
+        // `r` within the minimum gap: still none; once it has passed: one.
+        refresh(&provider, &remote, &cfg, &opts, &shared, &mut details, true).await;
+        assert_eq!(calls(), (3, 1));
+        tokio::time::advance(state::DETAILS_MIN_GAP).await;
+        refresh(&provider, &remote, &cfg, &opts, &shared, &mut details, true).await;
+        assert_eq!(calls(), (4, 2));
+        // Unprompted, once a DETAILS_EVERY has gone by.
+        tokio::time::advance(state::DETAILS_EVERY).await;
+        refresh(&provider, &remote, &cfg, &opts, &shared, &mut details, false).await;
+        assert_eq!(calls(), (5, 3));
+    }
+
+    /// The dashboard's deep check is `pods test --deep`'s: the same script in one exec per
+    /// pod within DEEP_CHECK_TIMEOUT, judged by core — a hung pod is a FAIL at the budget, a
+    /// pod without an endpoint a FAIL without any SSH.
+    #[tokio::test(start_paused = true)]
+    async fn deep_check_pods_runs_the_clis_check_over_remote_within_its_budget() {
+        let fake = Arc::new(FakeRemote::new());
+        fake.script("10.0.0.1:22001", [FakeReply::stdout(DEEP_HEALTHY).after(Duration::from_secs(40))]);
+        fake.script("10.0.0.2:22002", [FakeReply::hang()]);
+        let remote: Arc<dyn Remote> = fake.clone();
+        let cfg = cfg("");
+        let policy = HealthPolicy::from_config(&cfg).unwrap();
+        let pods = [
+            pod("alpha", "runpod", "rp1", 1, Some(22001)),
+            pod("bravo", "runpod", "rp2", 2, Some(22002)),
+            pod("charlie", "runpod", "rp3", 3, None),
+        ];
+        let start = tokio::time::Instant::now();
+        let results = deep_check_pods(&remote, &cfg, &policy, &pods).await;
+        assert_eq!(start.elapsed(), DEEP_CHECK_TIMEOUT, "ends at the hung pod's budget");
+
+        let got: Vec<(&str, Status, String)> = results
+            .iter()
+            .map(|h| (h.name.as_str(), h.status, h.checks.iter().find(|c| c.status == Status::Fail).map(|c| c.detail.clone()).unwrap_or_default()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("devtest-alpha", Status::Pass, String::new()),
+                ("devtest-bravo", Status::Fail, "timed out after 150s".to_string()),
+                ("devtest-charlie", Status::Fail, "no SSH endpoint yet (status RUNNING)".to_string()),
+            ]
+        );
+        let want = RemoteCall::Exec {
+            host: String::new(),
+            cmd: deep_check_command(Some("arena-env")),
+            timeout: Some(DEEP_CHECK_TIMEOUT),
+        };
+        for host in ["10.0.0.1:22001", "10.0.0.2:22002"] {
+            let calls = fake.calls_to(host);
+            assert_eq!(calls.len(), 1, "{host}");
+            assert!(matches!((&calls[0], &want), (RemoteCall::Exec { cmd, timeout, .. }, RemoteCall::Exec { cmd: w, timeout: wt, .. }) if cmd == w && timeout == wt));
+        }
+        assert_eq!(fake.calls().len(), 2, "no SSH for the pod without an endpoint");
+    }
+
+    /// `d` never blocks: the call returns at once with the rows saying `checking`, a second
+    /// `d` on a pod being checked does nothing, and the verdicts land on the rows (and in
+    /// the footer) when the background task finishes.
+    #[tokio::test(start_paused = true)]
+    async fn d_checks_in_the_background_and_the_verdicts_land_on_the_rows() {
+        let fake = Arc::new(FakeRemote::new());
+        fake.script("10.0.0.1:22001", [FakeReply::stdout(DEEP_HEALTHY).after(Duration::from_secs(30))]);
+        fake.script("10.0.0.2:22002", [FakeReply::exit(255, "ssh: connect to host 10.0.0.2 port 22002: Connection refused").after(Duration::from_secs(5))]);
+        let ui = ui(cfg(""), fake.clone());
+        let pods = vec![pod("alpha", "runpod", "rp1", 1, Some(22001)), pod("bravo", "runpod", "rp2", 2, Some(22002))];
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        {
+            let mut s = shared.lock().unwrap();
+            let snap = dashboard_snapshot(&pods, &[], None, &HealthCache::new(), &Naming::from_config(&ui.cfg), NOW);
+            s.publish(snap);
+        }
+
+        start_deep_check(&shared, &ui, pods.clone());
+        {
+            let s = shared.lock().unwrap();
+            assert_eq!(s.deep.running(), 2);
+            assert!(s.pods.iter().all(|p| health_cell(None, s.deep.is_running(p), NOW).0 == "checking"));
+            assert_eq!(s.notice.as_ref().unwrap().text, "deep-checking 2 pods in the background (up to 150s)…");
+        }
+        start_deep_check(&shared, &ui, vec![pods[0].clone()]);
+        assert_eq!(shared.lock().unwrap().notice.as_ref().unwrap().text, "already being deep-checked");
+
+        // Let the background task run to completion (the paused clock jumps ahead).
+        for _ in 0..100 {
+            if shared.lock().unwrap().deep.running() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        let s = shared.lock().unwrap();
+        assert_eq!(s.deep.running(), 0);
+        let status = |id: &str| s.snap.pods.iter().find(|p| p.pod.id == id).and_then(|p| p.health.as_ref()).map(|h| h.status);
+        assert_eq!((status("rp1"), status("rp2")), (Some(Status::Pass), Some(Status::Fail)));
+        let notice = s.notice.as_ref().unwrap();
+        assert_eq!(notice.text, "deep check: 1 pass, 0 warn, 1 fail — failed: devtest-bravo");
+        assert!(notice.error);
+        assert_eq!(fake.calls().len(), 2, "one check per pod, not two");
+    }
+
+    /// The verdicts go to the same health cache `pods test --deep` writes (owner-only), where
+    /// `arena snapshot` and the next refresh read them; a cache that can't be written still
+    /// leaves them on screen and says why.
+    #[tokio::test]
+    async fn finished_checks_are_recorded_in_the_shared_health_cache() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp("deepcache");
+        let cfg = cfg(&format!("ARENA_STATE_DIR={}\n", dir.0.display()));
+        let alpha = pod("alpha", "runpod", "rp1", 1, Some(22001));
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let claimed = shared.lock().unwrap().deep.begin(vec![alpha.clone()]);
+        let results = vec![verdict(&alpha, Status::Warn, Some(("network", "0.4 MB/s from huggingface.co")))];
+        finish_deep_check(&shared, health_cache_path(&cfg), &claimed, results.clone(), NOW).await;
+        let path = dir.0.join("devtest").join(snapshot::HEALTH_CACHE_FILE);
+        let (cache, warning) = HealthCache::load(&path);
+        assert_eq!(warning, None);
+        let rec = cache.get(&alpha).unwrap();
+        assert_eq!((rec.status, rec.checked_at), (Status::Warn, NOW));
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        {
+            let s = shared.lock().unwrap();
+            assert_eq!(s.deep.running(), 0);
+            assert_eq!(s.notice.as_ref().unwrap().text, "deep check: 0 pass, 1 warn, 0 fail");
+        }
+
+        // No usable state dir: still shown (session), and the footer says it wasn't cached.
+        let claimed = shared.lock().unwrap().deep.begin(vec![alpha.clone()]);
+        let unusable = Some(Err("ARENA_STATE_DIR must be an absolute path (got state)".to_string()));
+        finish_deep_check(&shared, unusable, &claimed, results, NOW + 60).await;
+        let s = shared.lock().unwrap();
+        assert!(s.notice.as_ref().unwrap().text.ends_with("(not cached: ARENA_STATE_DIR must be an absolute path (got state))"));
+        assert_eq!(s.deep.layer(HealthCache::new()).get(&alpha).unwrap().checked_at, NOW + 60);
+    }
+
+    /// Every action's SSH goes through `Remote` with its budget, so a wedged pod ends the
+    /// action with `timed out after …` instead of a `working…` modal that never closes.
+    #[tokio::test(start_paused = true)]
+    async fn actions_go_through_remote_with_their_budgets() {
+        let host = "10.0.0.1:22001";
+        let cfg = cfg("ARENA_REPO_OWNER=nickypro\nARENA_REPO_NAME=arena-sandbox-materials\nGIT_SSH_KEY_LOCAL=/nonexistent/deploy_key\n");
+        let alpha = pod("alpha", "runpod", "rp1", 1, Some(22001));
+        let budgets = |fake: &FakeRemote| -> Vec<Option<Duration>> {
+            fake.calls()
+                .into_iter()
+                .map(|c| match c {
+                    RemoteCall::Exec { timeout, .. } | RemoteCall::Copy { timeout, .. } => timeout,
+                })
+                .collect()
+        };
+        // (what, the scripted replies, the outcome line starts with, budgets used)
+        let setup = arena_core::setup::SetupTimeouts::default();
+        type Case = (&'static str, Vec<FakeReply>, &'static str, Vec<Duration>);
+        let cases: Vec<Case> = vec![
+            ("test", vec![FakeReply::stdout("noise\n2.9.0+cu130\n")], "✓ devtest-alpha torch: 2.9.0+cu130", vec![TEST_TIMEOUT]),
+            ("test-hung", vec![FakeReply::hang()], "✗ devtest-alpha torch failed: timed out after 90s", vec![TEST_TIMEOUT]),
+            ("run-hung", vec![FakeReply::hang()], "✗ devtest-alpha run failed: timed out after 1800s", vec![RUN_TIMEOUT]),
+            ("backup", vec![FakeReply::exit(1, "rejected")], "✗ backup devtest-alpha (exit Some(1)): rejected", vec![BACKUP_TIMEOUT]),
+            ("set-branch", vec![FakeReply::ok()], "✓ devtest-alpha → w1d2", vec![BRANCH_TIMEOUT]),
+            ("setup", vec![FakeReply::ok(), FakeReply::ok()], "✓ set up devtest-alpha", vec![setup.copy, setup.config]),
+            ("setup-hung", vec![FakeReply::ok(), FakeReply::hang()], "✗ setup devtest-alpha failed: timed out after 300s", vec![setup.copy, setup.config]),
+        ];
+        for (what, replies, want, budget) in cases {
+            let fake = FakeRemote::new();
+            fake.script(host, replies);
+            let line = match what {
+                "test" | "test-hung" => run_ssh_oneline(&fake, &cfg, &alpha, TORCH_TEST_CMD, "torch", TEST_TIMEOUT).await,
+                "run-hung" => run_ssh_oneline(&fake, &cfg, &alpha, "sleep 99999", "run", RUN_TIMEOUT).await,
+                "backup" => run_backup(&fake, &cfg, &alpha).await,
+                "set-branch" => run_set_branch(&fake, &cfg, &alpha, "w1d2").await,
+                _ => run_setup(&fake, &cfg, &alpha).await,
+            };
+            assert_eq!(line, want, "{what}");
+            assert_eq!(budgets(&fake), budget.into_iter().map(Some).collect::<Vec<_>>(), "{what}");
+        }
+        // No endpoint: said, and nothing is attempted.
+        let fake = FakeRemote::new();
+        let charlie = pod("charlie", "runpod", "rp3", 3, None);
+        assert!(run_backup(&fake, &cfg, &charlie).await.starts_with("✗ devtest-charlie: "));
+        assert!(fake.calls().is_empty());
+    }
 }

@@ -30,6 +30,7 @@ use crate::error::{Error, Result};
 use crate::fleet::{clip, maintenance_label};
 use crate::metrics::normalize_gpu_name;
 use crate::pod::{Maintenance, Pod};
+use crate::ssh::SshOutput;
 use crate::table::{self, Align};
 
 /// The on-pod fact gatherer. Embedded (like `hetzner_setup.sh`) so the binary is all an
@@ -920,6 +921,36 @@ impl PodHealth {
     }
 }
 
+/// One pod's deep-check call → its verdict: the script's facts judged by `policy`, or a
+/// FAIL saying why there are none (no answer, ssh itself failed, the script never
+/// started). `call` is the [`crate::remote::Remote::exec`] outcome with a failed call
+/// already described (`remote::describe_error`, e.g. `timed out after 150s`). Shared by
+/// `pods test --deep`, `up --check` and the dashboard, so a pod is judged the same way by
+/// all three.
+pub fn judge_deep_call(pod: &Pod, call: std::result::Result<SshOutput, String>, policy: &HealthPolicy) -> PodHealth {
+    match call {
+        Err(why) => PodHealth::unreachable(pod, why),
+        Ok(out) => {
+            let facts = parse_deep(&out.stdout);
+            let stderr = out.stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+            if !facts.started && !out.success {
+                // ssh itself failed (255 = refused/auth/…): say that, not "no output".
+                PodHealth::unreachable(pod, format!("exit {:?}: {stderr}", out.code))
+            } else {
+                let started = facts.started;
+                let mut health = PodHealth::checked(pod, facts, policy);
+                // The script never started (e.g. no `base64` on the pod): stderr says why.
+                if !started && !stderr.is_empty() {
+                    for c in health.checks.iter_mut().filter(|c| c.name == "script") {
+                        c.detail = format!("{} ({stderr})", c.detail);
+                    }
+                }
+                health
+            }
+        }
+    }
+}
+
 /// `NAME  RESULT  GPUS  DRIVER  CUDA  NET  NOTES`, one row per pod in the given order.
 pub fn render_health_table(results: &[PodHealth]) -> String {
     let rows: Vec<Vec<String>> = results
@@ -1579,6 +1610,34 @@ deep_check_end=1
             ssh_ip: Some(ip.into()),
             ssh_port: Some(22),
             ..Default::default()
+        }
+    }
+
+    /// Every way a deep-check call can end, judged once for all three callers (`pods test
+    /// --deep`, `up --check`, the dashboard): facts → their verdict; no answer, or ssh
+    /// itself failing → a FAIL saying so; a script that never started → why, from stderr.
+    #[test]
+    fn judge_deep_call_table() {
+        let p = pod("apple", "1.1.1.1");
+        let out = |success: bool, code: i32, stdout: &str, stderr: &str| SshOutput {
+            success,
+            code: Some(code),
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        };
+        // (call, verdict, the check that says why, its detail contains)
+        let cases: Vec<(std::result::Result<SshOutput, String>, Status, &str, &str)> = vec![
+            (Ok(out(true, 0, HEALTHY_2GPU, "")), Status::Pass, "cuda", ""),
+            (Err("timed out after 150s".into()), Status::Fail, "ssh", "timed out after 150s"),
+            (Ok(out(false, 255, "", "\nssh: connect to host 1.1.1.1 port 22: Connection refused\n")), Status::Fail, "ssh", "exit Some(255): ssh: connect to host"),
+            (Ok(out(true, 0, "", "bash: base64: command not found")), Status::Fail, "script", "(bash: base64: command not found)"),
+        ];
+        for (call, want, name, detail) in cases {
+            let what = format!("{call:?}");
+            let h = judge_deep_call(&p, call, &cuda13());
+            assert_eq!(h.status, want, "{what}: {:#?}", h.checks);
+            assert!(check(&h.checks, name).detail.contains(detail), "{what}: {:#?}", h.checks);
+            assert_eq!((h.name.as_str(), h.provider.as_str()), ("devtest-apple", "runpod"));
         }
     }
 
