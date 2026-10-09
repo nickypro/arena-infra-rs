@@ -45,7 +45,10 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     capacity"). REST v1 has no floor and its schema stops at 13.0: it sends every listed
     version ≥ the floor (13.1+ hosts unreachable; a 13.1+ floor or `EXACT_CUDA_VERSIONS`
     entry is refused before the request, naming `RUNPOD_API=v2`). `EXACT_CUDA_VERSIONS` is
-    the opt-in exact set (`allowedCudaVersions`; never sent with a floor). v1 creates also
+    the opt-in exact set (`allowedCudaVersions`; never sent with a floor). A value that isn't
+    a version (`13.x`, `newest`) fails closed everywhere — every create (RunPod and Vast) is
+    refused and the deep check won't derive a driver floor from it — never read as "no floor".
+    v1 creates also
     send `supportPublicIp: true` (some community hosts have no public IP, leaving only
     RunPod's SSH proxy). Neither API reports a pod's CUDA constraint, so
     `replace`/`migrate copy` re-apply the configured one to the replacement (as `create` does).
@@ -225,12 +228,19 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     is named too), since a name a pod there holds would read as free and be created twice
     (live: a bogus `VAST_API_KEY` had `create delta` plan a duplicate of Vast's
     `devtest-delta`). `pods list` still shows what answered, its footer marked `PARTIAL`.
+    Between `--retry-mins` rounds, a backend that is only throttled or erroring (429/5xx,
+    past the listing's own retries) or whose list stalled past its 60 s bound skips that
+    round — nothing is created from the partial listing — and the next round lists again;
+    a rejected key ends the run.
   - `create`/`up` take `--retry-mins <M>` (`--retry-secs`, default 60) to **keep
     topping up to the target** while capacity is short — one round per interval for up
     to M minutes, **Ctrl+C** stops early keeping what was made. A `no instances
     available` capacity error is recognized as such (it waits), not treated as fatal.
     A round starts only while it still fits in the window (no create after it closes).
-    The confirm prompt lists the exact pod names about to be created.
+    The confirm prompt lists the exact pod names about to be created, and a later round
+    only retries those not made yet (after a whole-fleet listing: one that exists now is
+    skipped, a met `-n` target stops it) — never a name picked afresh, which under `up`
+    could be one whose pod `--check` is replacing right then.
   - **`--gpu` is checked** (`create`/`up`/`offers`/`replace`/`migrate copy`, RunPod only):
     each token — an exact id (any case), the catalog's display name as `arena gpus` prints it
     (`RTX PRO 6000`, `B300 MIG 34GB` — checked before the aliases, so `RTX PRO 6000` is the
@@ -255,8 +265,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     skips it for the whole run (`[no access]`), and if *every* option is refused the run
     aborts as an access problem; an option whose request the API rejects as invalid (v1's
     `400 … schema requirements`, v2's `422 Unknown GPU type`) is skipped for the run too
-    (`[rejected]`; the error keeps v1's `problems` list) and the run fails only once every
-    option is refused; auth aborts, any other error stops as before.
+    (`[rejected]`; the error keeps v1's `problems` list) and the run fails once every
+    option is refused (rejected or denied, in any mix — at once, not after idling out the
+    window); auth aborts, any other error stops as before.
     `--retry-mins` re-runs rounds (blocks cleared, fleet re-listed first so a name that
     appeared meanwhile — or a met `-n` target — isn't created again) only while the next
     round would still start inside the window; Ctrl+C between rounds keeps what was made. Ends with a per-name table: `created on 1×RTX 3090 COMMUNITY
@@ -280,7 +291,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     billing, until the window ended): wait for *its* SSH endpoint and sshd answering
     (`--timeout`, default 600s, per pod; a pod up for 5 minutes with only RunPod's SSH proxy
     — a host with no public IP — is a host failure: `FAILED endpoint`, or replaced under
-    `--check`)
+    `--check`; so is one still up behind the proxy only when a shorter `--timeout` ends, and
+    a listing that momentarily lacks the pod doesn't restart those 5 minutes)
     → sync the proxy (one writer at a time) → provision it (`--no-setup` skips) →
     [`--check`: deep check] → copy its API keys (when `keys/*_api_keys.csv` exist) →
     `[name] READY after 4m10s — …` or `[name] FAILED <stage>: …`, printed the moment that
@@ -295,7 +307,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     is rewritten at the end if pods came up after it.
     **`--check`** deep-checks each pod after setup (`pods test --deep`). A FAIL is a bad
     host: the pod is terminated, confirmed gone from its own provider's listing (never two
-    pods per name), and the name recreated from the same `--gpu/--cloud/--max-price` options
+    pods per name — and no replacement if another pod has taken the name meanwhile), and the
+    name recreated from the same `--gpu/--cloud/--max-price` options
     (or the one configured spec) — options that haven't failed first, waiting for capacity
     per `--retry-mins` or `--keep-trying` — and run through the pipeline again; a replacement
     that lands on a machine that already failed (any name's; by the provider's machine id —
@@ -450,7 +463,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     < 2 MB/s or unreachable, < 10 GB free, host load above max(32, host CPUs), a
     maintenance window. Driver floor: `MIN_DRIVER_VERSION` (`none` = off), else derived from
     the create's CUDA floor — `MIN_CUDA_VERSION`, else the lowest of `ALLOWED_CUDA_VERSIONS`
-    / `EXACT_CUDA_VERSIONS` (13.x → 580, 12.8 → 570, 12.4 → 550, …) — else no driver check. Hetzner CPU VMs skip the GPU checks (decided by
+    / `EXACT_CUDA_VERSIONS` (13.x → 580, 12.8 → 570, 12.4 → 550, …; one that isn't a version
+    is an error, as a malformed `MIN_DRIVER_VERSION` is) — else no driver check. Hetzner CPU VMs skip the GPU checks (decided by
     provider only: a RunPod/Vast pod the API reports with 0 GPUs still gets them, plus a
     `provider` warning). Output: a
     `NAME RESULT GPUS DRIVER CUDA NET NOTES` table, `-v` lists every check, and a `same

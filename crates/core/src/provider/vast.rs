@@ -151,6 +151,11 @@ impl VastProvider {
     /// Search the marketplace: the offers that fit `spec` right now, cheapest first (empty:
     /// nothing suitable is rentable). Read-only.
     async fn search(&self, spec: &PodSpec) -> Result<Vec<Offer>> {
+        // A CUDA value that isn't a version would read as "no floor" here (`cuda_floor`) and
+        // rent any host: refused before the request, as RunPod's creates refuse it.
+        if let Some(bad) = spec.bad_cuda() {
+            return Err(crate::pod::bad_cuda_error(bad));
+        }
         // Status first, then decode (crate::http): an auth/HTML error stays classified.
         let body = send_json(
             self.auth(
@@ -333,7 +338,8 @@ fn gpu_key(name: &str) -> String {
 
 /// The spec's CUDA floor ([`PodSpec::cuda_floor`]: `MIN_CUDA_VERSION` / the lowest of
 /// `ALLOWED_CUDA_VERSIONS`, or the lowest of an exact set): a host must support at least it
-/// (Vast's `cuda_max_good`). `None` = no floor.
+/// (Vast's `cuda_max_good`). `None` = no floor — or one that isn't a version, which
+/// [`VastProvider::search`] refuses before anything reads this ([`PodSpec::bad_cuda`]).
 fn cuda_floor(spec: &PodSpec) -> Option<f64> {
     spec.cuda_floor().and_then(|v| v.trim().parse::<f64>().ok()).filter(|v| v.is_finite())
 }
@@ -797,7 +803,11 @@ impl Provider for VastProvider {
     }
 
     fn describe(&self, spec: &PodSpec) -> String {
-        let cuda = cuda_floor(spec).map(|v| format!(", CUDA ≥ {v:.1}")).unwrap_or_default();
+        let cuda = match (spec.bad_cuda(), cuda_floor(spec)) {
+            (Some(bad), _) => format!(", CUDA `{bad}` — not a version: creates are refused"),
+            (None, Some(v)) => format!(", CUDA ≥ {v:.1}"),
+            (None, None) => String::new(),
+        };
         let cap = spec.max_price.map(|c| format!(", ≤ {}/h", fmt_money("$", c))).unwrap_or_default();
         // `--bootstrap` brings up sshd on an image without one; Vast's launcher does that.
         let bootstrap = if spec.docker_args.is_some() { " (--bootstrap not needed: ignored)" } else { "" };
@@ -1622,6 +1632,33 @@ mod tests {
         assert_eq!(body(&srv, 5)["q"]["verified"], json!({"eq": true}));
         // Nothing was attached: no instance came of it.
         assert!(srv.requests.lock().unwrap().iter().all(|r| !r.contains("/ssh/")));
+    }
+
+    /// Review fix: a CUDA value that isn't a version is kept as the floor so every create
+    /// refuses it (`ALLOWED_CUDA_VERSIONS="13.0, 13.x"` → `13.x`) — but here it read as "no
+    /// floor": the search dropped `cuda_max_good` and Vast rented any host (a cu130 image on a
+    /// CUDA 12 host can't use its GPU). Now the search — the create, the plan's quote — is
+    /// refused before any request, and the dry run says why.
+    #[tokio::test]
+    async fn a_cuda_value_that_is_not_a_version_is_refused_before_any_request() {
+        let srv = serve(vec![canned(200, "application/json", SEARCH_3090)]);
+        let p = provider(&srv.base).allow_unverified(true);
+        let mut s = spec(R3090, 1, 50);
+        s.min_cuda = crate::pod::cuda_from_config(&crate::config::Config::parse("ALLOWED_CUDA_VERSIONS=\"13.0, 13.x\"")).floor;
+        assert_eq!(s.min_cuda.as_deref(), Some("13.x"));
+        let e = p.create_pod(&s).await.unwrap_err();
+        assert!(matches!(e, Error::Config(_)) && e.to_string().contains("`13.x`"), "{e}");
+        let quoted = p.quote(&[R3090.to_string()], &s, Duration::from_secs(5)).await;
+        assert!(quoted[0].1.as_ref().is_err_and(|e| e.contains("`13.x`")), "{quoted:?}");
+        assert!(p.describe(&s).contains("CUDA `13.x` — not a version: creates are refused"), "{}", p.describe(&s));
+        // A junk entry in an exact set too (its lowest good entry used to stand in silently).
+        s.min_cuda = None;
+        s.allowed_cuda = vec!["13.0".into(), "x".into()];
+        assert!(matches!(p.create_pod(&s).await, Err(Error::Config(_))));
+        assert!(srv.requests.lock().unwrap().is_empty(), "nothing searched, nothing rented");
+        // A good floor still filters (and describes) as before.
+        s.allowed_cuda = vec!["13.0".into()];
+        assert!(p.describe(&s).contains("CUDA ≥ 13.0"), "{}", p.describe(&s));
     }
 
     /// The repair path: the same idempotent attach, for an existing pod.

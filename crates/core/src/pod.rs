@@ -150,6 +150,27 @@ impl PodSpec {
     pub fn cuda_floor(&self) -> Option<String> {
         self.min_cuda.clone().or_else(|| lowest_cuda(&self.allowed_cuda))
     }
+
+    /// The first CUDA constraint value that isn't a version ([`cuda_key`]), if any. Every
+    /// backend refuses to create with one (and the deep check to run): dropping it — as a
+    /// marketplace filter reading it as "no floor" would — admits any host, and a cu130 image
+    /// on a CUDA 12 host can't use its GPU. Pure.
+    pub fn bad_cuda(&self) -> Option<&str> {
+        bad_cuda_value(&self.allowed_cuda, self.min_cuda.as_ref())
+    }
+}
+
+/// The first of `exact` / `floor` that isn't a CUDA version. Pure.
+fn bad_cuda_value<'a>(exact: &'a [String], floor: Option<&'a String>) -> Option<&'a str> {
+    exact.iter().chain(floor).find(|v| cuda_key(v).is_none()).map(String::as_str)
+}
+
+/// The refusal for a CUDA value that isn't a version ([`PodSpec::bad_cuda`]). Pure.
+pub fn bad_cuda_error(bad: &str) -> crate::Error {
+    crate::Error::Config(format!(
+        "CUDA version `{bad}` isn't a version like 13.0 (MIN_CUDA_VERSION / ALLOWED_CUDA_VERSIONS / EXACT_CUDA_VERSIONS) \
+         — refusing rather than admitting any host"
+    ))
 }
 
 /// The CUDA host constraint config asks for (see [`cuda_from_config`]).
@@ -164,6 +185,13 @@ pub struct CudaConfig {
     pub source: Option<&'static str>,
     /// Every key that was set, the winner first (`config check` flags shadowed ones).
     pub set: Vec<&'static str>,
+}
+
+impl CudaConfig {
+    /// The first configured value that isn't a CUDA version, if any ([`PodSpec::bad_cuda`]).
+    pub fn bad_value(&self) -> Option<&str> {
+        bad_cuda_value(&self.exact, self.floor.as_ref())
+    }
 }
 
 /// The config keys that constrain host CUDA, in precedence order.
@@ -293,6 +321,12 @@ mod tests {
         assert_eq!(spec("EXACT_CUDA_VERSIONS=13,12.8").allowed_cuda, ["13.0", "12.8"]);
         assert_eq!(spec("MIN_CUDA_VERSION=newest").min_cuda.as_deref(), Some("newest"));
         assert_eq!(spec("ALLOWED_CUDA_VERSIONS=13.0,x").min_cuda.as_deref(), Some("x"));
+        // …and named, for the backends and checks that must refuse it (never read as "no floor").
+        assert_eq!(spec("ALLOWED_CUDA_VERSIONS=\"13.0, 13.x\"").bad_cuda(), Some("13.x"));
+        assert_eq!(spec("EXACT_CUDA_VERSIONS=13.0,x").bad_cuda(), Some("x"));
+        assert_eq!(spec("ALLOWED_CUDA_VERSIONS=13.0,12.8").bad_cuda(), None);
+        assert_eq!(cuda_from_config(&Config::parse("MIN_CUDA_VERSION=newest")).bad_value(), Some("newest"));
+        assert_eq!(cuda_from_config(&Config::parse("MIN_CUDA_VERSION=13")).bad_value(), None);
         for (text, exact, floor) in cases {
             let s = spec(text);
             assert_eq!(s.allowed_cuda, exact, "{text:?}");

@@ -1793,10 +1793,11 @@ fn replacement_rounds(keep_trying: bool, retry_mins: u64, retry_secs: u64) -> ar
     }
 }
 
-/// Top up toward the target, retrying for up to `retry_mins` (rounds every
-/// `retry_secs`) while capacity is short — Ctrl+C (`interrupt`, which stays pressed for
-/// whatever runs next) stops the loop early and keeps what was made. With
-/// `retry_mins == 0` it's a single attempt (honoring `keep_trying`).
+/// Create the confirmed names (`initial`), retrying the ones not made yet for up to
+/// `retry_mins` (rounds every `retry_secs`) while capacity is short — each round after a
+/// whole-fleet listing ([`arena_core::placement::relist`]), never past `target` on a top-up —
+/// Ctrl+C (`interrupt`, which stays pressed for whatever runs next) stops the loop early and
+/// keeps what was made. With `retry_mins == 0` it's a single attempt (honoring `keep_trying`).
 /// Returns every pod created across all rounds — on failure, inside [`CreateFailed`].
 #[allow(clippy::too_many_arguments)]
 async fn create_with_retry(
@@ -1811,18 +1812,29 @@ async fn create_with_retry(
     interrupt: &Interrupt,
     on_made: OnMade<'_>,
 ) -> std::result::Result<Vec<Made>, CreateFailed> {
+    use arena_core::placement::{next_round_in_window, relist, still_needed, Relisted, TopUp};
     // Round 1 creates exactly the names that were previewed + confirmed, so the
-    // `[created] …` output matches the `[y/N]` prompt. `target` (a provider-scoped total,
-    // computed once in plan_create) bounds the whole operation: retries only ever re-plan
-    // toward it, so a top-up can never balloon past what the operator agreed to.
+    // `[created] …` output matches the `[y/N]` prompt — and a later round only ever retries
+    // the confirmed names it hasn't created yet, never picks new ones. `up` brings each pod
+    // up while this loop still runs (finding #14), so a name it made may be momentarily
+    // absent from a listing while `up --check` replaces its pod: a re-plan from free names
+    // (as this loop once did) read that name as free and created a second pod under it next
+    // to the replacement. `target` (a provider-scoped total, computed once in plan_create)
+    // still bounds the whole operation: a top-up never balloons past what was agreed to.
     let retry_secs = retry_secs.max(1);
+    let every = std::time::Duration::from_secs(retry_secs);
     // tokio's clock (not std's), so the paused-clock tests drive the window.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(retry_mins * 60);
+    let topup = (target > 0).then(|| TopUp {
+        target,
+        provider: provider.name().to_string(),
+        prefix: cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena").to_string(),
+    });
     let mut all: Vec<Made> = Vec::new();
     let mut names = initial;
     let shown = if target == 0 { names.len() } else { target };
     let mut round = 0u32;
-    loop {
+    'rounds: loop {
         round += 1;
         if names.is_empty() {
             break; // target reached (or no free names left)
@@ -1841,36 +1853,60 @@ async fn create_with_retry(
         if got == names.len() || retry_mins == 0 {
             break; // filled what this round needed, or no retry requested
         }
-        // A round starts only inside the window: if the next one (`retry_secs` from now)
-        // would start past it, stop here — not sleep, then create (bill) after the window
-        // the operator agreed to. Decided before the sleep, as the placement executor does.
-        let every = std::time::Duration::from_secs(retry_secs);
-        if !arena_core::placement::next_round_in_window(tokio::time::Instant::now(), every, deadline) {
-            eprintln!("retry window ({retry_mins}m) has no room for another round — have {} of {shown}", all.len());
-            break;
-        }
-        eprintln!(
-            "round {round}: {} short of target {shown} (capacity); retrying in {retry_secs}s (Ctrl+C to stop)…",
-            names.len() - got
-        );
-        let interrupted = tokio::select! {
-            _ = tokio::time::sleep(std::time::Duration::from_secs(retry_secs)) => false,
-            _ = interrupt.wait() => true,
-        };
-        if interrupted {
-            eprintln!("interrupted — stopping retries with {} of {shown}", all.len());
-            break;
-        }
-        // Re-plan toward the SAME target so the next round only fills the shortfall.
-        // Explicit names (target == 0) just retry the ones not created yet.
-        names = if target == 0 {
-            names.into_iter().filter(|n| !all.iter().any(|m| &m.pod.name == n)).collect()
-        } else {
-            match plan_create(provider, cfg, Want::Total(target)).await {
-                Ok(plan) => plan.names,
-                Err(e) => return Err(CreateFailed::new(all, e)),
+        names.retain(|n| !all.iter().any(|m| &m.pod.name == n));
+        let mut listing_missing = false;
+        loop {
+            // A round starts only inside the window: if the next one (`retry_secs` from now)
+            // would start past it, stop here — not sleep, then create (bill) after the window
+            // the operator agreed to. Decided before the sleep, as the placement executor does.
+            if !next_round_in_window(tokio::time::Instant::now(), every, deadline) {
+                eprintln!("retry window ({retry_mins}m) has no room for another round — have {} of {shown}", all.len());
+                break 'rounds;
             }
-        };
+            let why = if listing_missing { "fleet listing incomplete" } else { "capacity" };
+            eprintln!(
+                "round {round}: {} short of target {shown} ({why}); retrying in {retry_secs}s (Ctrl+C to stop)…",
+                names.len()
+            );
+            let interrupted = tokio::select! {
+                _ = tokio::time::sleep(every) => false,
+                _ = interrupt.wait() => true,
+            };
+            if interrupted {
+                eprintln!("interrupted — stopping retries with {} of {shown}", all.len());
+                break 'rounds;
+            }
+            // The whole fleet first (as placement's rounds do): a confirmed name that exists
+            // now — made meanwhile, on any backend — is dropped, and a top-up is cut to what
+            // the target still lacks. A listing missing a backend that may answer again
+            // skips this round; one that won't ends the run.
+            match relist(provider).await {
+                Relisted::Whole(fleet) => {
+                    if tokio::time::Instant::now() > deadline {
+                        eprintln!("retry window ({retry_mins}m) elapsed while listing — have {} of {shown}", all.len());
+                        break 'rounds;
+                    }
+                    let (keep, dropped) = still_needed(&names, &fleet, topup.as_ref());
+                    for (name, why) in dropped {
+                        eprintln!("skip {name} — {why}");
+                    }
+                    names = keep;
+                    break;
+                }
+                Relisted::Partial(e) => {
+                    round += 1;
+                    listing_missing = true;
+                    eprintln!("round {round}: nothing created — {e}");
+                }
+                Relisted::Failed(e) => {
+                    let error = anyhow::anyhow!(
+                        "listing pods before retry round {} (refusing to create — a failed list could duplicate pods): {e}",
+                        round + 1
+                    );
+                    return Err(CreateFailed::new(all, error));
+                }
+            }
+        }
     }
     Ok(all)
 }
@@ -2029,7 +2065,9 @@ where
 async fn v2_catalog(cfg: &Config, key: &str, cloud: &str) -> std::result::Result<Vec<arena_core::provider::runpod::GpuType>, String> {
     use arena_core::provider::runpod_v2;
     static CACHE: std::sync::OnceLock<runpod_v2::CatalogCache> = std::sync::OnceLock::new();
-    let floor = PodSpec::from_config(cfg).cuda_floor();
+    // A floor that isn't a version isn't sent to the read-only catalog (the create refuses it
+    // with a clear error; a junk query parameter would only fail the `--gpu` check obscurely).
+    let floor = PodSpec::from_config(cfg).cuda_floor().filter(|f| arena_core::pod::cuda_key(f).is_some());
     CACHE
         .get_or_init(runpod_v2::CatalogCache::default)
         .get_or_fetch(key, cloud, |tier| bounded_catalog(runpod_v2::fetch_gpu_types(key, tier, floor.as_deref())))
@@ -5567,8 +5605,8 @@ async fn handle_pods_with(
                 println!("aborted.");
                 return Ok(());
             }
-            // Explicit names retry just the names still missing; -n/-a re-plan toward the
-            // total (topup_target == 0 marks the explicit case).
+            // Retry rounds only retry the confirmed names still missing; -n/-a also stop once
+            // the provider-scoped total is met (topup_target == 0 marks the explicit case).
             let outcome = match &options {
                 Some(plan) => {
                     place_names(provider, cfg, names, topup_target, &spec, plan, retry_mins, retry_secs, &interrupt, NO_STREAM)
@@ -14262,6 +14300,115 @@ mod placement_cli_tests {
             // It gave up right after the last round — no sleep just to give up.
             assert_eq!(started.elapsed(), std::time::Duration::from_secs(secs * (want as u64 - 1)), "{mins}/{secs}");
         }
+    }
+
+    /// RunPod with every create dry until `wet_at`, next to a Vast that's throttled for the
+    /// next `vast_throttled` listings (a 429, retryable) — or, `vast_refused`, rejects its key.
+    struct Flaky {
+        wet_at: tokio::time::Instant,
+        made: Mutex<Vec<Pod>>,
+        calls: Mutex<Vec<String>>,
+        vast_throttled: AtomicUsize,
+        vast_refused: bool,
+    }
+
+    impl Flaky {
+        fn new(dry_for: u64) -> Self {
+            Flaky {
+                wet_at: tokio::time::Instant::now() + std::time::Duration::from_secs(dry_for),
+                made: Mutex::new(Vec::new()),
+                calls: Mutex::new(Vec::new()),
+                vast_throttled: AtomicUsize::new(0),
+                vast_refused: false,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for Flaky {
+        fn name(&self) -> &'static str {
+            "runpod"
+        }
+        fn describe(&self, _spec: &PodSpec) -> String {
+            String::new()
+        }
+        async fn list_pods(&self) -> CoreResult<Vec<Pod>> {
+            Ok(self.made.lock().unwrap().clone())
+        }
+        async fn list_by_provider(&self) -> Vec<(String, CoreResult<Vec<Pod>>)> {
+            let vast = if self.vast_refused {
+                Err(Error::Provider { kind: arena_core::ProviderErrorKind::Auth, message: "vast list HTTP 401".into() })
+            } else if self.vast_throttled.load(Ordering::SeqCst) > 0 {
+                self.vast_throttled.fetch_sub(1, Ordering::SeqCst);
+                Err(Error::Provider { kind: arena_core::ProviderErrorKind::RateLimited, message: "vast list HTTP 429".into() })
+            } else {
+                Ok(Vec::new())
+            };
+            vec![("runpod".to_string(), self.list_pods().await), ("vast".to_string(), vast)]
+        }
+        async fn create_pod(&self, spec: &PodSpec) -> CoreResult<Pod> {
+            self.calls.lock().unwrap().push(spec.name.clone());
+            if tokio::time::Instant::now() < self.wet_at {
+                return Err(Error::capacity("create pod HTTP 500: There are no instances currently available"));
+            }
+            let pod = Pod { id: format!("id-{}", spec.name), name: spec.name.clone(), provider: "runpod".into(), ..Default::default() };
+            self.made.lock().unwrap().push(pod.clone());
+            Ok(pod)
+        }
+        async fn stop_pod(&self, _id: &str) -> CoreResult<()> {
+            Ok(())
+        }
+        async fn restart_pod(&self, _id: &str) -> CoreResult<()> {
+            Ok(())
+        }
+        async fn terminate_pod(&self, _id: &str) -> CoreResult<()> {
+            Ok(())
+        }
+    }
+
+    /// Review fix: the single-option retry loop (`create`/`up -n` without a `--gpu` list)
+    /// re-lists like placement's rounds do — a round retries only the confirmed names not made
+    /// yet (one that exists now is skipped), a listing missing a backend that may answer again
+    /// skips the round instead of ending the run, and one that won't (a rejected key) ends it.
+    #[tokio::test(start_paused = true)]
+    async fn single_option_retry_rounds_relist_and_ride_out_a_throttled_backend() {
+        let s = std::time::Duration::from_secs;
+        let names = || vec!["arena8-apple".to_string(), "arena8-bloom".to_string()];
+        // Dry until t=100. Round 2 (t=60): Vast is throttled through the re-list's retries
+        // (15s) — skipped. Meanwhile someone else made arena8-bloom. Round 3 (t=135): apple only.
+        let fake = Flaky::new(100);
+        fake.vast_throttled.store(5, Ordering::SeqCst);
+        let started = tokio::time::Instant::now();
+        let other = async {
+            tokio::time::sleep(s(30)).await;
+            let bloom = Pod { id: "theirs".into(), name: "arena8-bloom".into(), provider: "runpod".into(), ..Default::default() };
+            fake.made.lock().unwrap().push(bloom);
+        };
+        let (config, ov, ctrl_c) = (cfg(), SpecOverrides::default(), Interrupt::manual());
+        let (made, ()) =
+            tokio::join!(create_with_retry(&fake, &config, names(), 2, &ov, false, 10, 60, &ctrl_c, NO_STREAM), other);
+        let made: Vec<String> = made.unwrap().into_iter().map(|m| m.pod.name).collect();
+        assert_eq!(made, ["arena8-apple"]);
+        assert_eq!(*fake.calls.lock().unwrap(), ["arena8-apple", "arena8-apple"], "t=0 (dry, the round stops), then t=135");
+        assert_eq!(started.elapsed(), s(60 + 15 + 60));
+
+        // Vast throttled for good: the window ends the run, with no create after round 1.
+        let fake = Flaky::new(0);
+        fake.vast_throttled.store(usize::MAX, Ordering::SeqCst);
+        let dry = Flaky { wet_at: tokio::time::Instant::now() + s(3600), ..fake };
+        let made = create_with_retry(&dry, &cfg(), names(), 2, &SpecOverrides::default(), false, 3, 60, &Interrupt::manual(), NO_STREAM)
+            .await
+            .unwrap();
+        assert!(made.is_empty());
+        assert_eq!(dry.calls.lock().unwrap().len(), 1, "only round 1 created");
+
+        // Vast's key rejected: no round runs on a listing that won't become whole.
+        let refused = Flaky { vast_refused: true, ..Flaky::new(3600) };
+        let err = create_with_retry(&refused, &cfg(), names(), 0, &SpecOverrides::default(), false, 3, 60, &Interrupt::manual(), NO_STREAM)
+            .await
+            .unwrap_err();
+        assert!(err.error.to_string().contains("refusing to create") && err.error.to_string().contains("vast failed to list"), "{}", err.error);
+        assert_eq!(refused.calls.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

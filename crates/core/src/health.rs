@@ -438,6 +438,15 @@ impl HealthPolicy {
         // floor, or the lowest of an exact set), so the check never fails a host the
         // config deliberately admits.
         let cuda = crate::pod::cuda_from_config(cfg);
+        // One that isn't a version fails closed, like a malformed MIN_DRIVER_VERSION: read as
+        // "no floor" the check would stop holding hosts to any driver (every create refuses it).
+        if let Some(bad) = cuda.bad_value() {
+            return Err(Error::Config(format!(
+                "{}: `{bad}` isn't a CUDA version like 13.0, so the deep check has no driver floor to derive \
+                 (fix it, or set MIN_DRIVER_VERSION)",
+                cuda.source.unwrap_or("ALLOWED_CUDA_VERSIONS")
+            )));
+        }
         let floor = cuda.floor.or_else(|| crate::pod::lowest_cuda(&cuda.exact));
         policy.min_driver = floor.as_deref().and_then(|f| driver_floor_for_cuda(&[f]));
         Ok(policy)
@@ -1390,6 +1399,15 @@ deep_check_end=1
         }
         let err = HealthPolicy::from_config(&cfg("MIN_DRIVER_VERSION=latest")).unwrap_err();
         assert!(err.to_string().contains("MIN_DRIVER_VERSION=\"latest\""), "{err}");
+        // Review fix: a CUDA value that isn't a version fails closed, as every create refuses
+        // it — it used to leave the check with no driver floor at all (`"13.0, x"` gave none,
+        // where before finding #10's floor it gave 580).
+        for text in ["ALLOWED_CUDA_VERSIONS=\"13.0, x\"", "MIN_CUDA_VERSION=newest", "EXACT_CUDA_VERSIONS=13.0,13.x"] {
+            let err = HealthPolicy::from_config(&cfg(text)).unwrap_err().to_string();
+            assert!(err.contains("isn't a CUDA version like 13.0") && err.contains("MIN_DRIVER_VERSION"), "{text}: {err}");
+        }
+        // An explicit driver floor doesn't need one.
+        assert_eq!(floor("MIN_DRIVER_VERSION=580\nALLOWED_CUDA_VERSIONS=x"), Some(DriverFloor { version: vec![580], why: "MIN_DRIVER_VERSION".into() }));
     }
 
     #[test]

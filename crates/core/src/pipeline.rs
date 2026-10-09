@@ -134,9 +134,9 @@ pub fn on_failed_host(host: Option<&str>, failed_hosts: &[String]) -> bool {
 }
 
 /// The confirmed names that got no pod in the create phase — each gets a row of its own in
-/// the report. At most as many as the create fell short by: a `-n`/`-a` retry round
-/// re-plans names (a confirmed one taken meanwhile is replaced by the next free one), and a
-/// name made in another's place is no shortfall. Pure.
+/// the report (a retry round only ever retries confirmed names, so one dropped as taken
+/// meanwhile, or past a met `-n` target, is listed too). At most as many as the create fell
+/// short by: should a name be made in another's place, that is no shortfall. Pure.
 pub fn not_created(confirmed: &[String], created: &[String]) -> Vec<String> {
     let short = confirmed.len().saturating_sub(created.len());
     confirmed.iter().filter(|n| !created.contains(n)).take(short).cloned().collect()
@@ -300,7 +300,7 @@ mod tests {
             (&["a", "b"], &["a", "b"], &[]),
             (&["a", "b"], &["a"], &["b"]),           // explicit names: the one missing
             (&["a", "b", "c"], &[], &["a", "b", "c"]),
-            (&["a", "b"], &["a", "c"], &[]),         // a re-planned round made c for b: no shortfall
+            (&["a", "b"], &["a", "c"], &[]),         // c made in b's place: no shortfall
             (&["a", "b", "c"], &["c", "d"], &["a"]), // short by one: the first one missing
             (&[], &["a"], &[]),
         ];

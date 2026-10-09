@@ -127,14 +127,17 @@ pub fn build(name: &str, cfg: &Config) -> Result<Box<dyn Provider>> {
 /// duplicate (billed) pod.
 pub const LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Await a backend's list call, failing as that backend's error once `limit` passes.
+/// Await a backend's list call, failing as that backend's error once `limit` passes — an
+/// [`Error::Timeout`] (`vast list timed out after 60s`): never retried in place (it already
+/// took the whole bound), but told apart from a refusal, so a retry round can wait out a
+/// stalled backend as it does a throttled one ([`crate::placement::relist`]).
 pub async fn bounded_list<F>(name: &str, list: F, limit: std::time::Duration) -> Result<Vec<Pod>>
 where
     F: std::future::Future<Output = Result<Vec<Pod>>>,
 {
     match tokio::time::timeout(limit, list).await {
         Ok(res) => res,
-        Err(_) => Err(Error::provider(format!("{name} list timed out after {}s", limit.as_secs_f64()))),
+        Err(_) => Err(Error::Timeout { what: format!("{name} list"), after: limit }),
     }
 }
 

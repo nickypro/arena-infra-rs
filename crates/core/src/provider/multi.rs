@@ -346,6 +346,8 @@ mod tests {
         assert_eq!(got[0].1.as_ref().unwrap().len(), 1, "the healthy backend still answers");
         let err = got[1].1.as_ref().unwrap_err().to_string();
         assert!(got[1].0 == "vast" && err.contains("vast list timed out"), "{err}");
+        // A stall, told apart from a refusal (a retry round waits it out — placement::relist).
+        assert!(matches!(got[1].1, Err(Error::Timeout { .. })), "{:?}", got[1].1);
         // A single backend's default list_by_provider is bounded the same way.
         let err = crate::provider::bounded_list("vast", Stalled.list_pods(), std::time::Duration::from_millis(20))
             .await
