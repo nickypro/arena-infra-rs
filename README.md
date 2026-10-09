@@ -713,7 +713,12 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     - The source's **GPU type** comes from its own listing when its spec doesn't say (RunPod
       v1), before config's `GPU_TYPE` (the plan says where it came from). `--gpu`/`--cloud`
       take **lists** and go through the same placement as `up` (`--max-price`, `--order`,
-      `--retry-mins`/`--retry-secs`): one create at a time, the first option with capacity.
+      `--retry-mins`/`--retry-secs`): one create at a time, the first option with capacity —
+      with `up`'s rules (the config's CUDA floor, v1's creatable-GPU check, an option the API
+      rejects skipped). A new pod that stays up behind RunPod's SSH proxy only (no public IP)
+      is given up on after `up`'s 5-minute grace, named as such and left in place, rather
+      than after the whole 15-minute wait; so is a pod `start`/`restart`/`reimage` brings back
+      that way.
     - After the swap the promoted pod gets `~/.name` in setup's format and its **per-host API
       keys under the canonical name** (setup ran while it was `-new`, which no key row
       matches); the parked one gets `<name>-old` in its `~/.name`; the `MACHINE_NAME` env note

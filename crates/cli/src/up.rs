@@ -62,8 +62,9 @@ use super::{
 /// SSH proxy ([`Pod::proxy_only`]) — before `up` calls its host bad. Live (2026-10-08) such
 /// community hosts never got a public endpoint (15+ minutes); a healthy pod has one within
 /// seconds of its container starting. With `--check` the pod is replaced (bounded by
-/// `--check-attempts`), else the name FAILs at `endpoint` with the pod left running.
-const NO_PUBLIC_IP_GRACE: Duration = Duration::from_secs(300);
+/// `--check-attempts`), else the name FAILs at `endpoint` with the pod left running. The
+/// endpoint waits of `replace`/`migrate`/`start`/`reimage` give up on such a pod after it too.
+pub(crate) const NO_PUBLIC_IP_GRACE: Duration = Duration::from_secs(300);
 
 /// What waiting for a pod's SSH endpoint came to.
 enum EndpointWait {

@@ -10054,7 +10054,9 @@ fn replace_cleanup_blocker(
 }
 
 /// Poll `provider` until the pod `id` has an SSH endpoint (ip + port), or `timeout_secs`
-/// elapses. Returns the ready pod.
+/// elapses. Returns the ready pod. A pod up behind RunPod's SSH proxy only is given up on
+/// after `up`'s grace ([`ProxyOnlyClock`]): its host has no public IP, and a longer wait
+/// won't give it one. A timeout says why the listing shows no endpoint when it can.
 async fn wait_for_endpoint(
     provider: &dyn Provider,
     id: &str,
@@ -10063,18 +10065,68 @@ async fn wait_for_endpoint(
     let policy = arena_core::retry::RetryPolicy::default();
     // tokio's clock (the real one in production): paused-clock tests run these waits instantly.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let mut proxy_only = ProxyOnlyClock::default();
+    let mut last: Option<arena_core::Pod> = None;
     loop {
         let pods =
             arena_core::retry::retrying(&policy, || provider.list_pods()).await.unwrap_or_default();
-        if let Some(p) = pods.into_iter().find(|p| p.id == id) {
-            if p.ssh_ip.is_some() && p.ssh_port.is_some() {
-                return Ok(p);
-            }
+        let pod = pods.into_iter().find(|p| p.id == id);
+        if let Some(p) = pod.as_ref().filter(|p| p.ssh_ip.is_some() && p.ssh_port.is_some()) {
+            return Ok(p.clone());
         }
+        if let Some(why) = proxy_only.seen(pod.as_ref()) {
+            anyhow::bail!("{why}");
+        }
+        last = pod.or(last);
         if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!("timed out after {timeout_secs}s");
+            anyhow::bail!("timed out after {timeout_secs}s{}", endpoint_gap(last.as_ref()));
         }
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+}
+
+/// How long a pod has been listed as up behind RunPod's SSH proxy only
+/// ([`arena_core::Pod::proxy_only`]), for the endpoint waits outside `up` (`replace`/`migrate`'s
+/// new pod, `start`/`reimage`/`restart`'s settle). Lane P made such a pod a host failure in `up`
+/// after [`up::NO_PUBLIC_IP_GRACE`]: no public IP, so no scp, rsync or port-forward. These
+/// waits used to run their whole window (up to 15 min) and then say only "timed out". As in
+/// `up`, a listing that lacks the pod proves nothing and keeps the clock going (one failed
+/// backend call drops all its pods from the aggregate listing). Only a listing that shows the
+/// pod not proxy-only resets it.
+#[derive(Debug, Default)]
+struct ProxyOnlyClock(Option<tokio::time::Instant>);
+
+impl ProxyOnlyClock {
+    /// A listing's view of the pod (`None`: not in it). `Some(why)` once it has been proxy-only
+    /// for the whole grace.
+    fn seen(&mut self, pod: Option<&arena_core::Pod>) -> Option<String> {
+        match pod {
+            Some(p) if p.proxy_only && (p.ssh_ip.is_none() || p.ssh_port.is_none()) => {
+                let since = *self.0.get_or_insert_with(tokio::time::Instant::now);
+                (since.elapsed() >= up::NO_PUBLIC_IP_GRACE).then(|| {
+                    format!(
+                        "{} for {} — its host has no public IP (no scp/rsync/port-forwards)",
+                        arena_core::fleet::PROXY_ONLY,
+                        arena_core::pipeline::fmt_elapsed(since.elapsed())
+                    )
+                })
+            }
+            Some(_) => {
+                self.0 = None;
+                None
+            }
+            None => None,
+        }
+    }
+}
+
+/// Why the last listing showed `pod` without an endpoint, as a suffix for a wait's timeout:
+/// proxy-only, or stopped; empty when there's nothing more to say (still coming up).
+fn endpoint_gap(pod: Option<&arena_core::Pod>) -> String {
+    match pod {
+        Some(p) if p.proxy_only => format!(" — {} (its host has no public IP)", arena_core::fleet::PROXY_ONLY),
+        Some(p) => arena_core::fleet::no_endpoint_reason(p).map(|w| format!(" — {w}")).unwrap_or_default(),
+        None => String::new(),
     }
 }
 
@@ -10184,10 +10236,14 @@ async fn wait_for_stable_endpoint_every(
     let mut last: Option<(String, u16)> = None;
     let mut stable_since = tokio::time::Instant::now();
     let mut latest: Option<arena_core::Pod> = None;
+    let mut proxy_only = ProxyOnlyClock::default();
     loop {
         let pods =
             arena_core::retry::retrying(&policy, || provider.list_pods()).await.unwrap_or_default();
         let pod = pods.into_iter().find(|p| p.id == id);
+        if let Some(why) = proxy_only.seen(pod.as_ref()) {
+            anyhow::bail!("{why}");
+        }
         let ep = pod.as_ref().and_then(|p| p.ssh_ip.clone().zip(p.ssh_port));
         latest = pod.or(latest);
         match ep {
@@ -10205,9 +10261,10 @@ async fn wait_for_stable_endpoint_every(
             }
         }
         if start.elapsed().as_secs() >= timeout_secs {
+            let gap = endpoint_gap(latest.as_ref());
             return latest
                 .filter(|p| p.ssh_ip.is_some() && p.ssh_port.is_some())
-                .ok_or_else(|| anyhow::anyhow!("endpoint never stabilized within {timeout_secs}s"));
+                .ok_or_else(|| anyhow::anyhow!("endpoint never stabilized within {timeout_secs}s{gap}"));
         }
         tokio::time::sleep(poll).await;
     }
@@ -18558,7 +18615,7 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
         let sel = picked(&f, &deep_cfg(), &["apple", "bloom"]).await;
         let results = deep_check_fleet(&f, &remote(&fake), &deep_cfg(), &sel).await.unwrap();
         let why: Vec<&str> = results.iter().map(|h| h.checks[0].detail.as_str()).collect();
-        assert_eq!(why[0], "stopped (EXITED) — no SSH while it's stopped");
+        assert_eq!(why[0], "stopped (EXITED) — `arena pods start devtest-apple` brings it back");
         assert!(why[1].starts_with("no public endpoint (RunPod ssh proxy only)"), "{why:?}");
         assert!(fake.calls().is_empty());
     }
@@ -20123,6 +20180,66 @@ mod lifecycle_tests {
         assert!(e.contains("NOT set up again") && e.contains("never stabilized within 600s"), "{e}");
         let took = start.elapsed();
         assert!(took >= Duration::from_secs(600) && took < Duration::from_secs(700), "one wait, not three: {took:?}");
+    }
+
+    /// Lane P × lane R: `up` calls a pod that stays up behind RunPod's SSH proxy only (no public
+    /// IP) a host failure after its 5-min grace. `replace`'s new pod used to wait its whole
+    /// 900 s window for an endpoint such a host never gives, then say only "timed out". It
+    /// now gives up at the grace, naming the host's problem, with `-new` left in place and
+    /// nothing renamed or copied.
+    #[tokio::test(start_paused = true)]
+    async fn a_replacement_behind_the_ssh_proxy_only_is_given_up_on_after_ups_grace() {
+        let dir = tmpdir("replace-proxy-only");
+        let cfg = keyed_cfg(&dir.0, "");
+        let f = fleet();
+        let mut new = pod("r-new", "", "runpod", None);
+        new.proxy_only = true;
+        *f.to_create.lock().unwrap() = vec![new];
+        let remote = Arc::new(FakeRemote::new());
+        let (ov, place, interrupt) = (SpecOverrides::default(), PlaceFlags::default(), Interrupt::manual());
+        let opts = ReplaceOpts { keep_old: false, skip_proxy: true, dry_run: false, yes: true };
+        let timeouts = arena_core::setup::SetupTimeouts::from_config(&cfg, None).unwrap();
+        let job = ReplaceJob { setup_timeouts: timeouts, ov: &ov, place: &place, opts, interrupt: &interrupt, keys_dir: "/nonexistent" };
+        let start = tokio::time::Instant::now();
+        let e = replace_on(remote.clone(), &f, &cfg, &f, "r-alpha".into(), "devtest-alpha".into(), job).await.unwrap_err();
+        let e = format!("{e:#}");
+        let took = start.elapsed();
+        assert!(e.contains("devtest-alpha-new never came up") && e.contains(arena_core::fleet::PROXY_ONLY) && e.contains("no public IP"), "{e}");
+        assert!(took >= Duration::from_secs(300) && took < Duration::from_secs(400), "up's grace, not the 900 s window: {took:?}");
+        assert_eq!(f.calls(), ["create devtest-alpha-new NVIDIA RTX A4000"], "nothing renamed, nothing terminated");
+        assert!(remote.calls().is_empty(), "nothing copied: {:?}", remote.calls());
+    }
+
+    /// The same for the settle of `start`/`restart`/`reimage`: a pod that comes back behind the
+    /// SSH proxy only is named as such after the grace, not after the whole settle window as a
+    /// bare "never stabilized". A listing that lacks the pod meanwhile doesn't restart the clock.
+    #[tokio::test(start_paused = true)]
+    async fn a_pod_started_behind_the_ssh_proxy_only_is_named_after_ups_grace() {
+        let dir = tmpdir("start-proxy-only");
+        let cfg = cfg(&dir.0);
+        let f = fleet();
+        {
+            let mut pods = f.pods.lock().unwrap();
+            pods[0].status = "EXITED".into();
+            (pods[0].ssh_ip, pods[0].ssh_port, pods[0].proxy_only) = (None, None, true);
+        }
+        let pods = f.pods.lock().unwrap().clone();
+        let settle = SettleWait { stable_secs: 30, timeout_secs: 600, poll: Duration::from_secs(15) };
+        let gap = async {
+            // A listing gap two minutes in (the aggregate list drops a failed backend's pods).
+            tokio::time::sleep(Duration::from_secs(120)).await;
+            let gone = f.pods.lock().unwrap().remove(0);
+            tokio::time::sleep(Duration::from_secs(40)).await;
+            f.pods.lock().unwrap().insert(0, gone);
+        };
+        let start = tokio::time::Instant::now();
+        let opts = RestartOpts { yes: true, ..Default::default() };
+        let (sel, keys_dir) = (named(&pods[..1]), dir.0.display().to_string());
+        let (res, ()) = tokio::join!(handle_start(&f, Arc::new(FakeRemote::new()), &cfg, &sel, opts, settle, &keys_dir), gap);
+        let e = res.unwrap_err().to_string();
+        assert!(e.contains("NOT set up again") && e.contains(arena_core::fleet::PROXY_ONLY) && e.contains("no public IP"), "{e}");
+        let took = start.elapsed();
+        assert!(took >= Duration::from_secs(300) && took < Duration::from_secs(400), "the grace, through the gap: {took:?}");
     }
 
     /// The endpoint-flap fix's second half (review: no test held it): when the listing the
