@@ -10,12 +10,12 @@
 //! `arena snapshot` print. What lives here is only what is the dashboard's own: which cell
 //! gets which colour, how a background deep check's results fold into what is on screen,
 //! how often the provider's slower details query may run, and what `/` marks. The account
-//! balance in the summary bar is `arena_core::balance`'s, judged against the fleet as listed.
+//! balance in the summary bar is `arena_core::balance_v6`'s, judged against the fleet as listed.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
-use arena_core::balance::{self, AccountProbe, Burns};
+use arena_core::balance_v6::{self as balance, AccountProbe, Burns};
 use arena_core::fleet::{self, FleetCost};
 use arena_core::health::{render_summary, PodHealth, Status};
 use arena_core::metrics::PodMetrics;
@@ -992,7 +992,7 @@ mod tests {
     /// provider's runway unknown, never "not burning".
     #[test]
     fn the_balance_sits_at_the_end_until_it_needs_a_top_up() {
-        use arena_core::balance::Account;
+        use arena_core::balance_v6::Account;
         let prepaid = |provider: &str, b: f64, rate: Option<f64>| AccountProbe {
             provider: provider.into(),
             account: Ok(Account::Prepaid { balance: b, provider_per_hr: rate, spend_limit_per_hr: None, under_balance: None, owed: None }),

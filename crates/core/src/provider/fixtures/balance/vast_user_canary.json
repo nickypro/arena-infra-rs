@@ -1,0 +1,18 @@
+{
+  "id": 4242424,
+  "username": "canary-user",
+  "email": "canary.owner@example.invalid",
+  "fullname": "Canary Owner",
+  "api_key": "CANARYVASTKEY0123456789abcdef",
+  "sid": "CANARYSESSIONID",
+  "credit": 136.87,
+  "balance": 0,
+  "balance_threshold": 0,
+  "balance_threshold_enabled": false,
+  "billed_expected": 0,
+  "billaddress_line1": "1 Canary Street",
+  "billaddress_city": "Canaryville",
+  "ssh_key": "ssh-ed25519 AAAACANARYSSHKEY canary@host",
+  "has_billing": true,
+  "user": "canary-user"
+}

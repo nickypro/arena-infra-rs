@@ -10,6 +10,8 @@ pub mod apiget;
 pub mod apikeys;
 pub mod backup;
 pub mod balance;
+/// The wave-6 live-only balance reads, kept only until every surface moves to [`balance`].
+pub mod balance_v6;
 pub(crate) mod base64;
 pub mod config;
 pub mod error;

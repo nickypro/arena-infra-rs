@@ -2,7 +2,7 @@
 //! one-line balance under `pods list`, the informational lines under `teardown --check`, and
 //! `pods idle` (which pods look abandoned — a report, never an action).
 //!
-//! Judging and rendering live in `arena_core::balance` / `arena_core::idle` (pure, tested on
+//! Judging and rendering live in `arena_core::balance_v6` / `arena_core::idle` (pure, tested on
 //! fixture-shaped replies). Here is only the reading: provider accounts and listings, each
 //! bounded, and one bounded read-only SSH probe per pod.
 
@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use arena_core::balance::{self, AccountProbe, Burns};
+use arena_core::balance_v6::{self as balance, AccountProbe, Burns};
 use arena_core::idle::{self, Probe};
 use arena_core::remote::Remote;
 use arena_core::ssh::SshTarget;
@@ -203,7 +203,7 @@ pub(crate) async fn handle_idle(
 mod tests {
     use super::*;
     use crate::{handle_pods, Cli, Cmd, PodCmd, Select};
-    use arena_core::balance::Account;
+    use arena_core::balance_v6::Account;
     use arena_core::idle::fixture::Reply;
     use arena_core::remote::{FakeRemote, FakeReply, RemoteCall};
     use arena_core::PodSpec;

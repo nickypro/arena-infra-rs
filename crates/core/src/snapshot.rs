@@ -238,15 +238,18 @@ fn path_component(prefix: &str) -> String {
     }
 }
 
-/// Where the health cache lives: `$ARENA_STATE_DIR/<prefix>/health.json`, else
-/// `$XDG_STATE_HOME/arena/<prefix>/health.json`, else
-/// `~/.local/state/arena/<prefix>/health.json`. Scoped by `MACHINE_NAME_PREFIX` so the
-/// sandbox (`devtest`) and production (`arena9`) never read or prune each other's records,
-/// even with one state directory. `lookup` reads a variable (the CLI: config, then the
-/// environment), so this is pure. A relative `XDG_STATE_HOME` is ignored (the XDG spec
-/// says so); a relative `ARENA_STATE_DIR` is refused — a cron job and a shell would
-/// resolve it to different places.
-pub fn health_cache_path(prefix: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
+/// The balance state's file name (`crate::balance`), next to the health cache.
+pub const BALANCE_FILE: &str = "balance.json";
+
+/// Where a per-fleet state file lives: `$ARENA_STATE_DIR/<prefix>/<file>`, else
+/// `$XDG_STATE_HOME/arena/<prefix>/<file>`, else `~/.local/state/arena/<prefix>/<file>`.
+/// Scoped by `MACHINE_NAME_PREFIX` so the sandbox (`devtest`) and production (`arena9`)
+/// never read or prune each other's records, even with one state directory. `lookup` reads
+/// a variable (the CLI: config, then the environment), so this is pure. A relative
+/// `XDG_STATE_HOME` is ignored (the XDG spec says so); a relative `ARENA_STATE_DIR` is
+/// refused — a cron job and a shell would resolve it to different places. `file` is one of
+/// this crate's own names ([`HEALTH_CACHE_FILE`], [`BALANCE_FILE`]), never user input.
+pub fn state_file_path(prefix: &str, file: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
     let set = |k: &str| lookup(k).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
     let root = if let Some(dir) = set("ARENA_STATE_DIR") {
         let dir = PathBuf::from(dir);
@@ -260,19 +263,29 @@ pub fn health_cache_path(prefix: &str, lookup: impl Fn(&str) -> Option<String>) 
         let home = set("HOME").ok_or("no ARENA_STATE_DIR, XDG_STATE_HOME or HOME to keep it in")?;
         PathBuf::from(home).join(".local").join("state").join("arena")
     };
-    Ok(root.join(path_component(prefix)).join(HEALTH_CACHE_FILE))
+    Ok(root.join(path_component(prefix)).join(path_component(file)))
 }
 
-/// [`health_cache_path`] for a loaded config, as every surface resolves it: the fleet
-/// prefix and `ARENA_STATE_DIR` from the config (which also takes it from the
-/// environment), the XDG/`HOME` fallbacks from the environment. One function, so the CLI
-/// that writes the cache and the dashboard that reads it can't look in different places.
-pub fn health_cache_path_for(cfg: &Config) -> Result<PathBuf, String> {
+/// [`state_file_path`] for a loaded config, as every surface resolves it: the fleet prefix
+/// and `ARENA_STATE_DIR` from the config (which also takes it from the environment), the
+/// XDG/`HOME` fallbacks from the environment. One function, so the CLI that writes a state
+/// file and the dashboard that reads it can't look in different places.
+pub fn state_file_path_for(cfg: &Config, file: &str) -> Result<PathBuf, String> {
     let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
-    health_cache_path(prefix, |k| match k {
+    state_file_path(prefix, file, |k| match k {
         "ARENA_STATE_DIR" => cfg.get(k).map(String::from),
         _ => std::env::var(k).ok(),
     })
+}
+
+/// Where the health cache lives ([`state_file_path`] with [`HEALTH_CACHE_FILE`]).
+pub fn health_cache_path(prefix: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
+    state_file_path(prefix, HEALTH_CACHE_FILE, lookup)
+}
+
+/// [`health_cache_path`] for a loaded config ([`state_file_path_for`]).
+pub fn health_cache_path_for(cfg: &Config) -> Result<PathBuf, String> {
+    state_file_path_for(cfg, HEALTH_CACHE_FILE)
 }
 
 impl HealthCache {
@@ -350,13 +363,13 @@ impl HealthCache {
 }
 
 #[cfg(unix)]
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
 }
 
 #[cfg(not(unix))]
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)
 }
 
@@ -930,7 +943,7 @@ fn public_time(s: Option<&str>) -> Option<String> {
 /// after it. Field ranges are checked (no Feb 30, no 24:00); a leap second `:60` is read
 /// as the next minute. `None` for anything else, including an instant before 1970 (which
 /// [`rfc3339`] can't print).
-fn parse_rfc3339(s: &str) -> Option<u64> {
+pub(crate) fn parse_rfc3339(s: &str) -> Option<u64> {
     let b = s.as_bytes();
     let num = |r: std::ops::Range<usize>| -> Option<i64> {
         let d = b.get(r)?;
@@ -1228,7 +1241,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_path_resolution_table() {
+    fn state_file_path_table() {
         let env = |pairs: &'static [(&'static str, &'static str)]| move |k: &str| {
             pairs.iter().find(|(key, _)| *key == k).map(|(_, v)| v.to_string())
         };
@@ -1254,7 +1267,18 @@ mod tests {
                 (Err(needle), Err(e)) => assert!(e.contains(needle), "{e}"),
                 _ => panic!("{vars:?} {prefix}: got {got:?}"),
             }
+            // The balance state (`balance.json`) resolves the same way, beside it: same
+            // directory, same prefix scoping, same refusals.
+            let balance = state_file_path(prefix, BALANCE_FILE, env(vars));
+            match (want, &balance) {
+                (Ok(p), Ok(g)) => assert_eq!(g, &Path::new(p).with_file_name(BALANCE_FILE), "{vars:?} {prefix}"),
+                (Err(needle), Err(e)) => assert!(e.contains(needle), "{e}"),
+                _ => panic!("{vars:?} {prefix}: got {balance:?}"),
+            }
         }
+        // A file name can't climb out either (only constants are passed, but still).
+        let lookup = |k: &str| (k == "ARENA_STATE_DIR").then(|| "/s".to_string());
+        assert_eq!(state_file_path("p", "../x", lookup).unwrap(), Path::new("/s/p/.._x"));
     }
 
     /// A fresh temp directory, removed at the end of the test.
@@ -1515,6 +1539,7 @@ mod tests {
     fn health_cache_path_for_takes_the_state_dir_and_prefix_from_config() {
         let cfg = Config::parse("MACHINE_NAME_PREFIX=devtest\nARENA_STATE_DIR=/srv/arena-state\n");
         assert_eq!(health_cache_path_for(&cfg).unwrap(), Path::new("/srv/arena-state/devtest/health.json"));
+        assert_eq!(state_file_path_for(&cfg, BALANCE_FILE).unwrap(), Path::new("/srv/arena-state/devtest/balance.json"));
         let rel = Config::parse("ARENA_STATE_DIR=state\n");
         assert!(health_cache_path_for(&rel).unwrap_err().contains("absolute"));
     }

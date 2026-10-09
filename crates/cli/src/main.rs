@@ -5465,7 +5465,7 @@ async fn handle_pods_with(
                 if json {
                     None
                 } else {
-                    Some(arena_core::balance::fetch_all(cfg, money::FOOTER_TIMEOUT).await)
+                    Some(arena_core::balance_v6::fetch_all(cfg, money::FOOTER_TIMEOUT).await)
                 }
             };
             let (listed, balances) = tokio::join!(listing, balances);

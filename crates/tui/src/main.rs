@@ -54,7 +54,7 @@ use ratatui::{
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
-use arena_core::balance::{self, AccountProbe, Burns};
+use arena_core::balance_v6::{self as balance, AccountProbe, Burns};
 use arena_core::fleet;
 use arena_core::health::{deep_check_command, judge_deep_call, HealthPolicy, PodHealth, DEEP_CHECK_TIMEOUT};
 use arena_core::metrics::{self, PodMetrics, ProbeOpts};
@@ -3243,7 +3243,7 @@ deep_check_end=1
     /// it. Judged against the fleet as listed (alpha $0.17 + bravo $0.25 billing on RunPod).
     #[test]
     fn the_summary_bar_shows_the_balance_and_leads_with_a_top_up_warning() {
-        use arena_core::balance::Account;
+        use arena_core::balance_v6::Account;
         let mut shared = fixture_shared();
         shared.fleet_burns = Some(balance::burns(&shared.pods, &[]));
         let read = |b: f64| BalanceRead {

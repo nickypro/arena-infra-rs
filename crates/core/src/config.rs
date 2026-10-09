@@ -52,6 +52,11 @@ impl Config {
         // operator can give one big first pull longer (or a test less) without editing the
         // shared config.
         "BACKUP_TIMEOUT_SECS",
+        // How many hours of runway an account may have before `arena balance` and the
+        // footers warn (`balance::BalancePolicy`): `BALANCE_WARN_HOURS=100000 arena balance
+        // --check` tries the alarm path, `=0` silences it for one run, without editing the
+        // shared config.
+        "BALANCE_WARN_HOURS",
     ];
 
     /// Let environment variables override values from the file: any key already in the
@@ -272,6 +277,10 @@ MACHINE_NAME_LIST=(
         let mut c = Config::parse("IMAGE=base:1");
         c.apply_overrides(|k| (k == "BACKUP_TIMEOUT_SECS").then(|| "600".to_string()));
         assert_eq!(c.get("BACKUP_TIMEOUT_SECS"), Some("600"));
+        // And the balance warning threshold (`BALANCE_WARN_HOURS=100000 arena balance --check`).
+        let mut c = Config::parse("IMAGE=base:1");
+        c.apply_overrides(|k| (k == "BALANCE_WARN_HOURS").then(|| "100000".to_string()));
+        assert_eq!(c.get("BALANCE_WARN_HOURS"), Some("100000"));
     }
 
     #[test]
