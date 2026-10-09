@@ -18,6 +18,7 @@
 //! And its `.git` is complete: the size cap applies to the files, never to `.git` (a second,
 //! uncapped pass — [`PullConfig::passes`]).
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -58,6 +59,18 @@ pub struct PullConfig {
     /// Only the `.git` dirs, nothing else — the size-capped tier's second pass
     /// ([`PullConfig::passes`]).
     pub git_only: bool,
+    /// The destination already holds this snapshot from an earlier pull (the */15 cron pulls
+    /// into the day's label all day), and its files may be hard links shared with older
+    /// snapshots and the fleet baseline: never change an existing file's attributes in place
+    /// (`--no-perms --no-owner --no-group`). rsync applies a mode or owner change that comes
+    /// without a content change to the existing file — i.e. to the inode every linked snapshot
+    /// shares (its man page: "existing files may get their attributes tweaked, and that can
+    /// affect alternate destination files via hard-links") — so one `chmod` on a pod rewrote the
+    /// mode in every earlier snapshot, and through the baseline in other pods'. A changed file
+    /// is still written anew (a new inode; the old ones untouched). The cost: a mode-only change
+    /// made after the day's first pull shows in the next day's snapshot, not this one.
+    /// ([`snapshot_tier_for`] sets it.)
+    pub linked_dest: bool,
 }
 
 /// The default [`PullConfig::io_timeout_secs`]: 5 minutes without a byte means the
@@ -112,6 +125,7 @@ impl Default for PullConfig {
             io_timeout_secs: Some(RSYNC_IO_TIMEOUT_SECS),
             link_dest: Vec::new(),
             git_only: false,
+            linked_dest: false,
         }
     }
 }
@@ -359,6 +373,11 @@ fn rsync_flags(pc: &PullConfig) -> Vec<String> {
     if let Some(m) = &pc.min_size {
         a.push(format!("--min-size={m}"));
     }
+    // After `-a`, so they win: an existing (possibly hard-linked) file's mode/owner never
+    // changes in place ([`PullConfig::linked_dest`]).
+    if pc.linked_dest {
+        a.extend(["--no-perms", "--no-owner", "--no-group"].map(String::from));
+    }
     // `--prune-empty-dirs` must not prune inside a kept `.git`: a repo whose refs are all packed
     // has an empty `.git/refs/heads/`, and git doesn't take a `.git` without `refs/` for a
     // repository at all ("not a git repository") — the copy would be no repo.
@@ -436,6 +455,18 @@ pub fn snapshot_link_dests(base: &Path, label: &str, pod: &str) -> Vec<String> {
     out.into_iter().map(|p| p.display().to_string()).collect()
 }
 
+/// The snapshot tier's config for `<base>/<label>/<pod>/`: `small` with its link-dests
+/// ([`snapshot_link_dests`]) and, when that snapshot already has files — an earlier pull of the
+/// same label — [`PullConfig::linked_dest`], so this pull can't change the files it shares with
+/// other snapshots.
+pub fn snapshot_tier_for(base: &Path, label: &str, pod: &str, small: &PullConfig) -> PullConfig {
+    PullConfig {
+        link_dest: snapshot_link_dests(base, label, pod),
+        linked_dest: non_empty_dir(&base.join(label).join(pod)),
+        ..small.clone()
+    }
+}
+
 /// What a backup tree takes on disk ([`disk_use`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DiskUse {
@@ -492,7 +523,9 @@ pub struct PruneStats {
 
 /// Reduce a baseline freshly pulled from one pod to **the image's own files**: remove every
 /// file and symlink last modified at or after `since` (UNIX seconds: the pod's container
-/// creation), then the directories that leaves empty.
+/// creation), and every one in `copied` (home-relative paths: what was written onto the pod
+/// since then with an older mtime — [`copied_in_command`]), then the directories that leaves
+/// empty.
 ///
 /// Why: rsync's `--link-dest` takes a file as "the same" when its size, mtime and permissions
 /// match — it never compares contents. Within one pod's history that's safe. Across pods it is
@@ -500,21 +533,25 @@ pub struct PruneStats {
 /// image's mtimes on every pod, while a file written at setup or later (`~/.name`, the API keys
 /// in `.bashrc`, a script's output written on several pods in the same second) can match
 /// another pod's in size and mtime with different contents — and a snapshot would then hold
-/// the wrong pod's file. So the baseline keeps only what predates the container.
-pub fn prune_baseline(dir: &Path, since: u64) -> std::io::Result<PruneStats> {
+/// the wrong pod's file. So the baseline keeps only what predates the container. The mtime
+/// alone can't tell a file *copied* onto the pod later with its old mtime kept — a whole home
+/// by `pods replace`/`migrate` (`rsync -a`), files pushed back by `pods restore`, `~/.name`
+/// among them — from the image's: the pod's ctimes can, hence `copied`.
+pub fn prune_baseline(dir: &Path, since: u64, copied: &BTreeSet<PathBuf>) -> std::io::Result<PruneStats> {
     let mut s = PruneStats::default();
-    prune_dir(dir, since, &mut s)?;
+    prune_dir(dir, Path::new(""), since, copied, &mut s)?;
     Ok(s)
 }
 
-/// [`prune_baseline`] below `dir`; whether `dir` is now empty.
-fn prune_dir(dir: &Path, since: u64, s: &mut PruneStats) -> std::io::Result<bool> {
+/// [`prune_baseline`] below `dir` (`rel` below the baseline's root); whether `dir` is now empty.
+fn prune_dir(dir: &Path, rel: &Path, since: u64, copied: &BTreeSet<PathBuf>, s: &mut PruneStats) -> std::io::Result<bool> {
     let mut empty = true;
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let m = entry.metadata()?; // not following symlinks
+        let rel = rel.join(entry.file_name());
         if m.is_dir() {
-            if prune_dir(&entry.path(), since, s)? {
+            if prune_dir(&entry.path(), &rel, since, copied, s)? {
                 std::fs::remove_dir(entry.path())?;
             } else {
                 empty = false;
@@ -523,7 +560,7 @@ fn prune_dir(dir: &Path, since: u64, s: &mut PruneStats) -> std::io::Result<bool
         }
         let mtime = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs());
         let size = if m.is_file() { m.len() } else { 0 };
-        if mtime.map_or(true, |t| t >= since) {
+        if mtime.map_or(true, |t| t >= since) || copied.contains(&rel) {
             std::fs::remove_file(entry.path())?;
             s.removed_files += 1;
             s.removed_bytes += size;
@@ -534,6 +571,58 @@ fn prune_dir(dir: &Path, since: u64, s: &mut PruneStats) -> std::io::Result<bool
         }
     }
     Ok(empty)
+}
+
+/// The records [`copied_in_script`]'s output is framed by: whatever a shell rc file prints
+/// comes before the first; a listing without the last didn't finish.
+const COPIED_BEGIN: &str = "arena-copied-begin";
+const COPIED_END: &str = "arena-copied-end";
+
+/// The pod-side listing behind [`prune_baseline`]'s `copied` (`mark`: the container mark,
+/// [`crate::volume::CONTAINER_MARK`] — a parameter for tests). Every non-directory under the
+/// home whose **ctime** is after the container's creation while its **mtime** is not: written
+/// onto the pod since, with an older mtime kept — `pods replace`/`migrate` copy a home with
+/// `rsync -a`, `pods restore` pushes files back, setup unpacks archives. An image file keeps the
+/// ctime its layer was unpacked with, before the container. Dot-dirs the baseline never holds
+/// are skipped (all but `.git` and `.claude`). NUL-separated `./<path>` records between
+/// [`COPIED_BEGIN`] and [`COPIED_END`]; GNU find's `-newerXY` — a find without it fails, and the
+/// capture is refused.
+pub fn copied_in_script(mark: &str) -> String {
+    format!(
+        "C={c}\n[ -e \"$C\" ] && cd \"$HOME\" || exit 1\nprintf '{COPIED_BEGIN}\\0'\n\
+         find . -xdev \\( -type d -name '.?*' ! -name .git ! -name .claude -prune \\) \
+         -o \\( ! -type d -newercm \"$C\" ! -newermm \"$C\" -print0 \\) || exit 1\nprintf '{COPIED_END}\\0'\n",
+        c = shell_quote(mark)
+    )
+}
+
+/// [`copied_in_script`] for the real container mark, as one `sh -c` command.
+pub fn copied_in_command() -> String {
+    format!("sh -c {}", shell_quote(&copied_in_script(crate::volume::CONTAINER_MARK)))
+}
+
+/// Parse [`copied_in_command`]'s output into home-relative paths — or why it can't be trusted
+/// (the capture is then refused, never made without it): the listing didn't finish, a record
+/// isn't a `./` path, a name isn't UTF-8 (it couldn't be matched to its file here).
+pub fn parse_copied_in(stdout: &str) -> std::result::Result<BTreeSet<PathBuf>, String> {
+    let records: Vec<&str> = stdout.split('\0').collect();
+    let start = records.iter().position(|r| r.ends_with(COPIED_BEGIN)).ok_or("the listing never started")?;
+    let mut out = BTreeSet::new();
+    for r in &records[start + 1..] {
+        if *r == COPIED_END {
+            return Ok(out);
+        }
+        // find never prints an empty path: this is the end of a listing cut short.
+        if r.is_empty() {
+            break;
+        }
+        let rel = r.strip_prefix("./").filter(|p| !p.is_empty()).ok_or_else(|| format!("an unexpected record {r:?}"))?;
+        if rel.contains('\u{FFFD}') {
+            return Err(format!("a file name that isn't UTF-8 ({rel}) can't be matched to its file"));
+        }
+        out.insert(PathBuf::from(rel));
+    }
+    Err("the listing didn't finish".into())
 }
 
 /// What an rsync `--stats` summary says moved (see [`parse_rsync_stats`]).
@@ -935,7 +1024,8 @@ mod tests {
     }
 
     /// Only the image's files survive into a baseline: a file (or link) written at or after the
-    /// container's creation is dropped, then the directories left empty.
+    /// container's creation is dropped, and one the pod listed as copied in since (an old mtime
+    /// kept), then the directories left empty.
     #[cfg(unix)]
     #[test]
     fn a_baseline_keeps_only_what_predates_the_container() {
@@ -956,10 +1046,15 @@ mod tests {
         put(".name", 30, created); // at setup, the same second: dropped
         put("setup_only/out.log", 10, created + 5); // a whole dir written since: gone
         std::os::unix::fs::symlink("/workspace/ARENA_materials", dir.join("linked")).unwrap(); // made now
-        let s = prune_baseline(&dir, created).unwrap();
-        assert_eq!(s, PruneStats { kept_files: 2, kept_bytes: 1200, removed_files: 4, removed_bytes: 90 });
+        // Copied onto the pod after the container with old mtimes (the pod's listing says so):
+        // the mtime alone takes them for the image's.
+        put("ARENA_materials/chapter2/carried_over.py", 70, created - 86_400 * 2);
+        put("ARENA_materials/chapter2/.name", 13, created - 600);
+        let copied: BTreeSet<PathBuf> = ["ARENA_materials/chapter2/carried_over.py", "ARENA_materials/chapter2/.name"].map(PathBuf::from).into();
+        let s = prune_baseline(&dir, created, &copied).unwrap();
+        assert_eq!(s, PruneStats { kept_files: 2, kept_bytes: 1200, removed_files: 6, removed_bytes: 173 });
         assert!(dir.join("arena-llm-context/model.txt").is_file() && dir.join("ARENA_materials/chapter1/solutions.py").is_file());
-        for gone in ["ARENA_materials/chapter1/my_answers.py", ".name", "setup_only", "linked"] {
+        for gone in ["ARENA_materials/chapter1/my_answers.py", ".name", "setup_only", "linked", "ARENA_materials/chapter2"] {
             assert!(std::fs::symlink_metadata(dir.join(gone)).is_err(), "{gone}");
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -1050,7 +1145,7 @@ mod tests {
         // A baseline from pod-a (container created after the image, before the work)…
         let created = image_time.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 3600;
         let b = pull(&home, "w0-capture", "devtest-a");
-        prune_baseline(&b, created).unwrap();
+        prune_baseline(&b, created, &BTreeSet::new()).unwrap();
         std::fs::create_dir_all(baseline_dir(&base, 0).parent().unwrap()).unwrap();
         std::fs::rename(&b, baseline_dir(&base, 0)).unwrap();
         assert!(baseline_dir(&base, 0).join("arena-llm-context/doc.txt").is_file());
@@ -1062,6 +1157,128 @@ mod tests {
         assert_eq!(std::fs::read_to_string(first.join("work/notes.md")).unwrap(), "b's work\n");
         assert_eq!(disk_use(&first).unwrap().own_bytes, "b's work\n".len() as u64);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Review: a hard-linked file is one inode in every snapshot that shares it, and rsync applies
+    /// a mode change (no content change) to an existing destination file in place — so
+    /// re-pulling the day's label after a `chmod` on the pod rewrote the mode in yesterday's
+    /// snapshot too (and, through the fleet baseline, in other pods'). A re-pull now never
+    /// changes an existing file's attributes; the change shows from the next label on.
+    #[cfg(unix)]
+    #[test]
+    fn re_pulling_a_label_never_changes_the_snapshots_it_shares_files_with() {
+        use crate::volume::fake_ssh;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if !fake_ssh::have_rsync() {
+            eprintln!("rsync not installed — skipping");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("arena-pull-repull-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("pod");
+        std::fs::create_dir_all(home.join("work")).unwrap();
+        let script = home.join("work/run.sh");
+        std::fs::write(&script, "echo hi\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let fake = fake_ssh::install(&root);
+        let base = root.join("backup");
+        let small = PullConfig::small_tier("2K");
+        let pull = |label: &str| {
+            let pc = snapshot_tier_for(&base, label, "devtest-a", &small); // before the dest exists, as the CLI does
+            let dest = local_dest(&base.display().to_string(), label, "devtest-a");
+            std::fs::create_dir_all(&dest).unwrap();
+            for pass in pc.passes() {
+                fake_ssh::rsync(&fake_ssh::swap_transport(&rsync_args(&target(), &pass, &dest), &fake), &home);
+            }
+            base.join(label).join("devtest-a/work/run.sh")
+        };
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let ino = |p: &std::path::Path| std::fs::metadata(p).unwrap().ino();
+        let (d1, d2) = (pull("w0d1"), pull("w0d2"));
+        assert_eq!(ino(&d1), ino(&d2), "linked");
+        // Only a pull into a snapshot that already has files holds attributes still.
+        let flags = |label: &str| rsync_args(&target(), &snapshot_tier_for(&base, label, "devtest-a", &small), "./d/");
+        assert!(flags("w0d2").windows(3).any(|w| w == ["--no-perms", "--no-owner", "--no-group"]), "{:?}", flags("w0d2"));
+        assert!(!flags("w0d3").iter().any(|a| a.starts_with("--no-")), "a new label is a plain -a pull");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        pull("w0d2"); // the */15 cron, later the same day
+        assert_eq!(mode(&d1), 0o644, "yesterday's snapshot is as it was");
+        assert_eq!(mode(&d2), 0o644, "(today's shows it from the next label)");
+        let d3 = pull("w0d3");
+        assert_eq!((mode(&d3), mode(&d1)), (0o755, 0o644));
+        assert_ne!(ino(&d3), ino(&d2));
+        // A content change on a re-pull is a new file, as ever: the earlier snapshots keep theirs.
+        std::fs::write(&script, "echo changed\n").unwrap();
+        pull("w0d3");
+        assert_eq!(std::fs::read_to_string(&d3).unwrap(), "echo changed\n");
+        assert_eq!(std::fs::read_to_string(&d2).unwrap(), "echo hi\n");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The pod-side listing for the baseline, run for real: what was written under the home after
+    /// the container was created with an older mtime kept (a `pods replace` copy, a restore) — and
+    /// only that: not the image's files, not what was written since with a new mtime (the mtime
+    /// prune drops those), not the dot-dirs the baseline never holds (but `.git`).
+    #[cfg(unix)]
+    #[test]
+    fn the_copied_in_listing_finds_old_mtimes_written_after_the_container() {
+        let root = std::env::temp_dir().join(format!("arena-pull-copied-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let put = |rel: &str, mtime: Option<std::time::SystemTime>| {
+            let p = home.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, rel).unwrap();
+            if let Some(t) = mtime {
+                std::fs::File::options().write(true).open(&p).unwrap().set_modified(t).unwrap();
+            }
+        };
+        let old = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        // The image's files: here before the container (their ctime too).
+        put("arena-llm-context/doc.txt", Some(old));
+        put("ARENA_materials/.git/objects/pack/image.pack", Some(old));
+        // The container is created (ctime granularity is coarse: keep the steps apart).
+        std::thread::sleep(Duration::from_millis(50));
+        let mark = root.join("dockerenv");
+        std::fs::write(&mark, "").unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        // Copied in since, old mtimes kept — a replace's rsync -a, a restore.
+        put(".name", Some(old));
+        put("ARENA_materials/chapter1/my answers.py", Some(old));
+        put("ARENA_materials/.git/objects/pack/copied.pack", Some(old));
+        put(".cache/pip/wheel.whl", Some(old)); // a dot-dir the baseline never has
+        put("ARENA_materials/notes.md", None); // written since: the mtime prune's
+        let o = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(copied_in_script(mark.to_str().unwrap()))
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let got = parse_copied_in(&format!("motd from a chatty .bashrc\n{}", String::from_utf8_lossy(&o.stdout))).unwrap();
+        let want: BTreeSet<PathBuf> =
+            [".name", "ARENA_materials/.git/objects/pack/copied.pack", "ARENA_materials/chapter1/my answers.py"].map(PathBuf::from).into();
+        assert_eq!(got, want);
+        // No container mark: a failure, never an empty list.
+        let o = std::process::Command::new("sh").arg("-c").arg(copied_in_script("/nonexistent/mark")).env("HOME", &home).output().unwrap();
+        assert!(!o.status.success());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_copied_in_listing_is_trusted_only_when_complete() {
+        let ok = parse_copied_in("hi from .bashrc\narena-copied-begin\0./.name\0./a b/c.py\0arena-copied-end\0").unwrap();
+        assert_eq!(ok, [".name", "a b/c.py"].map(PathBuf::from).into());
+        assert!(parse_copied_in("arena-copied-begin\0arena-copied-end\0").unwrap().is_empty());
+        for (out, why) in [
+            ("", "never started"),
+            ("arena-copied-begin\0./a\0", "didn't finish"),
+            ("arena-copied-begin\0a\0arena-copied-end\0", "unexpected record"),
+            ("arena-copied-begin\0./\u{FFFD}x\0arena-copied-end\0", "isn't UTF-8"),
+        ] {
+            let e = parse_copied_in(out).unwrap_err();
+            assert!(e.contains(why), "{out:?}: {e}");
+        }
     }
 
     #[test]

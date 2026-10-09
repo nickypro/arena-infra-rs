@@ -1626,13 +1626,10 @@ fn build_preview(cfg: &Config, action: Action, pod: &Pod) -> Option<String> {
     match action {
         Action::Backup => Some(match &target {
             Ok(t) => {
-                // The script's arguments, not its ~100 lines (`arena pods backup --dry-run` prints it).
+                // The script's arguments, not its ~170 lines (`arena pods backup --dry-run` prints it,
+                // as the here-doc that writes the file this line reads).
                 let msg = format!("arena-tui backup {}", pod.name);
-                t.display_command(&arena_core::backup::backup_summary(
-                    &backup_repo_path(cfg),
-                    cfg.get("GIT_SSH_KEY_REMOTE"),
-                    &msg,
-                ))
+                arena_core::backup::backup_dry_run_line(t, &backup_repo_path(cfg), cfg.get("GIT_SSH_KEY_REMOTE"), &msg)
             }
             Err(e) => format!("⚠ {e}"),
         }),

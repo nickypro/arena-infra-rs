@@ -275,11 +275,14 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     (default 2); the last pod that FAILed its check is left running for a look. Only a check
     whose script ran can condemn a host: one that couldn't run (SSH dropped, timed out) is
     rerun once SSH answers, and if it still can't run the name FAILs with the pod left
-    running. A FAIL that is only **software/setup** (torch missing or not importing, no
-    python) is never replaced — a new pod boots the same image and runs the same setup, so it
+    running. A FAIL that is only **software/setup** — as the facts show it: no python, python
+    reporting that `import torch` fails, a CPU-only torch (`+cpu`, no CUDA in it) on a GPU pod
+    — is never replaced — a new pod boots the same image and runs the same setup, so it
     would fail the same way: the name FAILs at once (`FAILED check — software/setup failure,
     not the host — …`), the pod is left running and its machine isn't counted as bad
-    (`pods test --deep` says the same under its table). A WARN counts as ready (shown in
+    (`pods test --deep` says the same under its table). Python dying before it could report
+    (killed by its 75 s timeout or the OOM killer, SIGILL on an old CPU, a segfault, output
+    cut off) is a host failure, replaced as before. A WARN counts as ready (shown in
     HEALTH). **Ctrl+C** stops every pipeline where
     it is, starts nothing new, terminates nothing, and reports — also when pressed during
     the create's retry wait (the pipelines then start stopped).
@@ -370,28 +373,33 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     off GitHub: **files over 95 MB** (GitHub refuses the push, and every later one — GH001)
     are left out (never staged, so no blob is written), stay on disk and are reported per pod
     (`skipped N file(s) > 95 MB: … covered by the rsync big tier`); a branch whose unpushed
-    commits already carry one fails with the exact fix (`arena pods run -t <pod> 'git -C
-    <repo> reset -q <sha>'` — keeps every file on disk; the next backup re-commits the work
-    without it), never the same opaque rejection every tick. And **nested repos are never
-    committed as gitlinks** (a commit id without its files): the image's nested clones
-    (no commits of their own) are **folded** into the course repo once per checkout — their
-    `.git` moved aside to `.git.arena-nested` (reversible: move it back; listed in
-    `.git/arena-nested`), so work inside them is committed like everything else; a nested repo
-    with its own history (a participant's project), or one cloned after that, is left exactly
-    as it is, kept out of the commit (a managed block in `.git/info/exclude`) and reported
-    every run (the rsync tiers have it). A gitlink an earlier backup committed is replaced by
-    the files; a folded clone that has a `.git` again (the image's, after `pods replace`
-    copied the checkout to a new pod) is folded again — to undo a fold for good, move the
-    `.git` back and delete its line from `.git/arena-nested`. A file over the limit staged by
-    hand (`git add`) is taken back out of the index the same way. The script runs under `sh` whatever the login shell; `--dry-run` prints it
-    once plus each pod's exact arguments.
+    commits already carry a file over GitHub's own 100 MiB limit fails with the exact fix
+    (`arena pods run -t <pod> 'git -C <repo> reset -q <sha>'` — keeps every file on disk; the
+    next backup re-commits the work without it), never the same opaque rejection every tick (a
+    95–100 MB file committed by hand is one GitHub takes: it's pushed). And **nested repos are
+    never committed as gitlinks** (a commit id without its files): the image's nested clones
+    (no commits of their own) are **adopted** once per checkout — the course repo tracks their
+    files where they are (listed in `.git/arena-nested`), so work inside them is committed like
+    everything else, while each clone keeps its own `.git` untouched: git run inside an
+    exercise still works on that clone alone (never on the whole course repo), and its stashes,
+    branches and reflog stay in it, backed up by the rsync tiers like every `.git` (and carried
+    by `pods replace`). Nothing on disk changes; to undo, `git rm -r -q --cached <dir>` and
+    delete its line from `.git/arena-nested`. A nested repo with its own history (a
+    participant's project), or one cloned after that, is left exactly as it is, kept out of
+    the commit (a managed block in `.git/info/exclude`) and reported every run (the rsync tiers
+    have it). A gitlink an earlier backup committed is replaced by the files. A file over the
+    limit staged by hand (`git add`) is taken back out of the index the same way. The script
+    runs under `sh` whatever the login shell; `--dry-run` prints each pod's line — `ssh …
+    'sh -s <exact arguments>' < arena-backup.sh` — and, once, the here-doc that writes
+    `arena-backup.sh`: paste that first and every line runs as the backup would (without it the
+    shell refuses to start, never a silent no-op).
   - `pods set-branch <branch> <targets|--all> [--hard]` — switch pods' ARENA checkout to a
     branch. Gentle by default (fetch + checkout + ff-only pull — fails on a diverged/dirty
     tree rather than clobbering work). **`--hard` is destructive**: force the branch to
     match `origin/<branch>`, discarding local commits/changes (untracked files survive) —
     e.g. `set-branch main --all --hard` resets the fleet to `main`. Confirms first;
     `--dry-run` previews. Pods switch concurrently, 2-min budget each. A nested clone the
-    backup folded in (see `pods backup`) is tracked only on the autocommit branches, so a
+    backup adopted (see `pods backup`) is tracked only on the autocommit branches, so a
     switch to `main` would delete it from disk and break that exercise: it is put back from
     the previous HEAD, **staged** (so switching back goes through), and named per pod.
   - `pods init-branches` — create each pod's `autocommit-…-wNdM-…` branch and push it
@@ -554,7 +562,13 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     but files unchanged since this pod's previous snapshot, or identical to the week's **fleet
     baseline** (`pods baseline`), are hard links (`rsync --link-dest`, absolute paths, same
     filesystem — all under `<dir>`), not copies: a day's snapshot costs only what changed, a
-    new or replaced pod's first one only what isn't the image's. The run ends with each
+    new or replaced pod's first one only what isn't the image's. A linked file is one inode in
+    every snapshot sharing it, so a pull into a label that already has files (the */15 cron
+    pulls into the day's label all day) never changes an existing file's mode or owner in
+    place (`--no-perms --no-owner --no-group`): a `chmod` on the pod used to rewrite the mode in
+    every earlier snapshot (and, through the baseline, other pods'); now a mode-only change
+    made after the day's first pull shows from the next label on, and earlier snapshots stay
+    exactly as they were (a changed file is always a new file). The run ends with each
     snapshot's real cost (`1.8G in 6754 files, 12.0M of it new on disk`); `du -sh <dir>/*` in
     one invocation counts a hard-linked file once. Knobs come from flags
     else config: `LOCAL_BACKUP_DIR` (`--dir`), `BACKUP_MAX_SIZE` (`--max-size`),
@@ -589,9 +603,14 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     (linked to last week's baseline), then **keeps only the files older than the container**:
     a hard link is made on equal size + mtime + permissions, contents are never compared, so a
     file written at setup or later (`~/.name`, the API keys in `.bashrc`, a script's output on
-    several pods in one second) could otherwise stand in for another pod's different file. A
-    repo on the `/workspace` volume is left out (a volume can hold work older than the
-    container). Captured into a partial dir and moved into place only when complete; an
+    several pods in one second) could otherwise stand in for another pod's different file.
+    Nor any file **copied onto the pod since** with an older mtime kept — a `pods replace`/
+    `migrate` copy of another pod's home (`rsync -a`), a `pods restore`, an archive setup
+    unpacked: the pod lists them first (`find` for a ctime after the container's creation with
+    an mtime before it — an image file's ctime is its layer's unpacking), and they're left out
+    too, so even a replaced pod gives a clean baseline; a listing that fails or is cut short
+    refuses the capture. A repo on the `/workspace` volume is left out (a volume can hold work
+    older than the container). Captured into a partial dir and moved into place only when complete; an
     existing baseline needs `--replace`, which moves it aside (`fleet.replaced-<time>/`) —
     nothing is deleted. Chosen over an automatic "first snapshot of the week": a pod in use
     can hold work with pre-container mtimes, so which pod is pristine is the operator's call.

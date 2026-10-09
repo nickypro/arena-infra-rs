@@ -16,7 +16,8 @@ impl Drop for Tmp {
 
 /// The stubs. `uv` logs its argv to `$STUBS/uv.log`; `uv venv … DIR` makes a venv whose
 /// `python` "imports" only once `$STUBS/torch-ok` exists; `uv pip install` exits
-/// `$UV_INSTALL_EXIT` (default 0) and, when `$UV_INSTALL_MAKES_TORCH` is set, "installs" torch.
+/// `$UV_INSTALL_EXIT` (default 0) and, when `$UV_INSTALL_MAKES_TORCH` is set, "installs" torch;
+/// its `--help` lists `--torch-backend` unless `$UV_OLD` is set (an older uv).
 fn install_stubs(dir: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let stub = |name: &str, body: &str| {
@@ -44,7 +45,7 @@ case "$1" in
     chmod 755 "$d/bin/python"
     printf 'export PATH="%s/bin:$PATH"\n' "$d" > "$d/bin/activate";;
   pip)
-    if [ "$2" = install ] && [ "$3" = --help ]; then echo "  --torch-backend <BACKEND>"; exit 0; fi
+    if [ "$2" = install ] && [ "$3" = --help ]; then [ -n "${UV_OLD:-}" ] || echo "  --torch-backend <BACKEND>"; exit 0; fi
     [ "$2" = install ] && [ "${UV_INSTALL_EXIT:-0}" != 0 ] && { echo "  x No solution found when resolving dependencies" >&2; exit "$UV_INSTALL_EXIT"; }
     [ "$2" = install ] && [ -n "${UV_INSTALL_MAKES_TORCH:-}" ] && touch "$S/torch-ok"
     exit 0;;
@@ -162,4 +163,30 @@ fn the_venv_python_follows_a_newer_requires_python_and_the_override() {
     std::fs::write(stubs.join("uv.log"), "").unwrap();
     let r = run(&stubs, &home, &repo, &[("UV_INSTALL_MAKES_TORCH", "1"), ("ARENA_PYTHON", "3.12")]);
     assert!(r.ok && r.uv_log.contains("uv venv --python 3.12 "), "{}", r.uv_log);
+}
+
+/// The install line the script ran (not its `--help` probe).
+fn install_line(uv_log: &str) -> &str {
+    uv_log.lines().find(|l| l.starts_with("uv pip install --no-cache-dir")).unwrap_or_else(|| panic!("no install in:\n{uv_log}"))
+}
+
+#[test]
+fn an_older_uv_without_torch_backend_installs_from_the_cpu_index() {
+    let (_t, stubs, home, repo) = setup("old-uv");
+    let r = run(&stubs, &home, &repo, &[("UV_INSTALL_MAKES_TORCH", "1"), ("UV_OLD", "1")]);
+    assert!(r.ok, "{}", r.stderr);
+    let install = install_line(&r.uv_log);
+    assert!(
+        install.contains(
+            " --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match --override overrides.txt \
+             -r requirements.cpu.txt"
+        ),
+        "{install}"
+    );
+    assert!(!install.contains("--torch-backend"), "{install}");
+    // A current uv: the backend flag, and no extra index.
+    let (_t, stubs, home, repo) = setup("new-uv");
+    let r = run(&stubs, &home, &repo, &[("UV_INSTALL_MAKES_TORCH", "1")]);
+    let install = install_line(&r.uv_log);
+    assert!(r.ok && install.contains(" --torch-backend cpu --override overrides.txt") && !install.contains("--extra-index-url"), "{install}");
 }

@@ -701,9 +701,11 @@ enum PodCmd {
     /// is TERMINATED and its name recreated from the same --gpu/--cloud/--max-price options
     /// (options that haven't failed first), up to --check-attempts placements per name; a
     /// replacement that lands on a machine IP that already failed is rejected the same way.
-    /// A FAIL that is only software/setup (torch missing or not importing, no python) is NOT
-    /// replaced — a new pod from the same image fails the same way: the name FAILs, the pod
-    /// is left running. A check that can't run at all (SSH drops, times out) is retried once
+    /// A FAIL that is only software/setup (no python, python reporting that torch is missing
+    /// or doesn't import, a CPU-only torch on a GPU pod) is NOT replaced — a new pod from the
+    /// same image fails the same way: the name FAILs, the pod is left running. Python killed
+    /// or crashed before it could report (timeout, OOM, SIGILL) counts as the host's.
+    /// A check that can't run at all (SSH drops, times out) is retried once
     /// and never counts against the host. A WARN counts as ready. Ctrl+C (also during the
     /// create's retries): no new attempts, nothing terminated, report.
     #[command(verbatim_doc_comment)]
@@ -1157,10 +1159,13 @@ enum PodCmd {
     /// <dir>/baseline/w<N>/fleet/, then KEEPS ONLY THE FILES OLDER THAN THE POD'S CONTAINER —
     /// the image's: a hard link is made when size, mtime and permissions match, contents are
     /// never compared, and a file written at setup or later (~/.name, the API keys in .bashrc,
-    /// anyone's work) can match another pod's that way with different contents. A repo on the
-    /// /workspace volume is left out (a volume can hold work from before the container).
-    /// Refused when the container's creation time is unknown or over a day old, and when the
-    /// week already has a baseline (--replace moves the old one aside; nothing is deleted).
+    /// anyone's work) can match another pod's that way with different contents. Nor anything
+    /// copied onto the pod since with an older mtime kept (a `pods replace`/`migrate` copy of
+    /// another pod's home, a `pods restore`): the pod lists those first (ctime after its
+    /// container's creation, mtime before). A repo on the /workspace volume is left out (a
+    /// volume can hold work from before the container). Refused when the container's creation
+    /// time is unknown or over a day old, when that listing fails, and when the week already
+    /// has a baseline (--replace moves the old one aside; nothing is deleted).
     #[command(verbatim_doc_comment)]
     Baseline {
         /// The pod: machine name (e.g. arena8-apple), bare name, @name or provider id.
@@ -4176,13 +4181,17 @@ async fn handle_backup(
             targets.len(),
             backup::GIT_MAX_FILE_BYTES / (1024 * 1024)
         );
-        // The script is the same for every pod — printed once, at the end, rather than in each
-        // pod's line; the arguments are exact.
+        // The script is the same for every pod — printed once, at the end, as a here-doc that
+        // writes the file each pod's line reads (so both paste); the arguments are exact.
         for (name, target) in &targets {
             println!("# {name}");
-            println!("{}\n", target.display_command(&backup::backup_summary(&repo_path, key.as_deref(), &msg_for(name))));
+            println!("{}\n", backup::backup_dry_run_line(target, &repo_path, key.as_deref(), &msg_for(name)));
         }
-        println!("# $ARENA_BACKUP_SH (run under sh on the pod):\n{}", backup::BACKUP_SCRIPT.trim_end());
+        println!(
+            "# The backup script, run under sh on each pod — paste this first: it writes ./{}, which the lines above read\n{}",
+            backup::BACKUP_SCRIPT_FILE,
+            backup::backup_script_heredoc()
+        );
         println!("\nPreview only — run without --dry-run to execute over SSH.");
         return Ok(());
     }
@@ -4276,9 +4285,9 @@ struct BackupTally {
 /// Run each pod's backup command (`(name, target, cmd)`) concurrently over `remote`, each
 /// within [`BACKUP_TIMEOUT`], classifying its output by the sentinel it printed and
 /// emitting one `[done/total]` line per pod as it finishes — with what the run kept out of
-/// git (files over GitHub's limit, nested repos) or folded into it. A non-zero exit, a
+/// git (files over GitHub's limit, nested repos) or adopted into it. A non-zero exit, a
 /// timeout or a crashed task is a failure; the others still finish. A pod whose unpushed
-/// commits already carry a file over the limit fails with the exact commands that fix it
+/// commits already carry a file over GitHub's limit fails with the exact commands that fix it
 /// (`repo` is the checkout they run in), never as the same opaque push rejection every tick.
 async fn backup_fleet(
     remote: &Arc<dyn Remote>,
@@ -5743,30 +5752,13 @@ async fn handle_pods_with(
             handle_init_branches(remote, cfg, week, day, &sel, dry_run, yes).await?;
         }
 
-        PodCmd::Pull { label, dir, max_size, remote_path, no_git, no_big, target_flag, mut sel, dry_run } => {
+        PodCmd::Pull { label, dir, max_size, remote_path, no_git, no_big, target_flag, sel, dry_run } => {
             let dir = dir.unwrap_or_else(|| local_backup_dir(cfg));
-            // Only an old-style label-looking word needs the listing to be told apart from a pod.
-            let pods = if sel.targets.iter().any(|t| arena_core::restore::parse_label(t.trim()).is_some()) {
-                let policy = arena_core::retry::RetryPolicy::default();
-                arena_core::retry::retrying(&policy, || provider.list_pods()).await.context("listing pods")?
-            } else {
-                Vec::new()
-            };
-            let naming = Naming::from_config(cfg);
-            let split = pull_label_and_targets(label, &sel.targets, &target_flag, &naming, &pods).map_err(|e| anyhow::anyhow!(e))?;
-            if let Some(note) = &split.note {
+            let (label, sel, note) = resolve_pull(provider, cfg, label, sel, &target_flag).await?;
+            if let Some(note) = &note {
                 eprintln!("{note}");
             }
-            let positional = !sel.targets.is_empty();
-            sel.targets = split.targets;
-            let sel = select(provider, cfg, &sel.args(), Unscoped::All).await.map_err(|e| {
-                if positional && split.label.is_none() {
-                    e.context("`pods pull` takes pods as its arguments now (like every command); a snapshot label goes behind --label")
-                } else {
-                    e
-                }
-            })?;
-            handle_pull(&remote, cfg, split.label, &dir, max_size, remote_path, no_git, no_big, &sel, dry_run, yes, RSYNC).await?;
+            handle_pull(&remote, cfg, label, &dir, max_size, remote_path, no_git, no_big, &sel, dry_run, yes, RSYNC).await?;
         }
 
         PodCmd::Baseline { target, week, dir, replace, dry_run } => {
@@ -6533,13 +6525,13 @@ async fn handle_set_branch(
     let (mut ok, mut failed) = (0, 0);
     exec_each_pod(&remote, jobs, BRANCH_TIMEOUT, |done, total, name, call| match &call {
         Ok(out) if out.success => {
-            // Nested clones the backup folded in, which the new branch doesn't track: put back
-            // on disk (untracked) so their exercises keep working.
+            // Nested clones the backup adopted, which the new branch doesn't track: put back on
+            // disk (staged) so their exercises keep working.
             let restored: Vec<&str> = out.stdout.lines().filter_map(|l| l.trim_end_matches('\r').strip_prefix("RESTORED ")).collect();
             let also = if restored.is_empty() {
                 String::new()
             } else {
-                format!(" — kept {} folded nested clone(s) on disk (staged): {}", restored.len(), restored.join(", "))
+                format!(" — kept {} adopted nested clone(s) on disk (staged): {}", restored.len(), restored.join(", "))
             };
             println!("[{done}/{total}] ✓ {name} (on {branch}){also}");
             ok += 1;
@@ -9544,7 +9536,7 @@ async fn handle_pull(
     // hard-links what didn't change to the pod's previous snapshot and the fleet baseline.
     let base = std::path::Path::new(dir);
     let tiers_for = |name: &str| -> Vec<(&'static str, String, PullConfig)> {
-        let snapshot = PullConfig { link_dest: pull::snapshot_link_dests(base, &label, name), ..small.clone() };
+        let snapshot = pull::snapshot_tier_for(base, &label, name, &small);
         let mut v = vec![("snapshot", pull::local_dest(dir, &label, name), snapshot)];
         if !no_big {
             v.push(("big", pull::big_dest(dir, name), big.clone()));
@@ -9816,6 +9808,37 @@ fn pull_label_and_targets(
     Ok(out)
 }
 
+/// `pods pull`'s label, pods and deprecation note, as the command resolves them: the fleet
+/// listing (only when a positional looks like a label — it's what tells one from a pod),
+/// [`pull_label_and_targets`], then the selector. Returned rather than acted on, so a test sees
+/// exactly what an invocation means.
+async fn resolve_pull(
+    provider: &dyn Provider,
+    cfg: &Config,
+    label: Option<String>,
+    mut sel: Select,
+    target_flag: &[String],
+) -> Result<(Option<String>, Selected, Option<String>)> {
+    let pods = if sel.targets.iter().any(|t| arena_core::restore::parse_label(t.trim()).is_some()) {
+        let policy = arena_core::retry::RetryPolicy::default();
+        arena_core::retry::retrying(&policy, || provider.list_pods()).await.context("listing pods")?
+    } else {
+        Vec::new()
+    };
+    let naming = Naming::from_config(cfg);
+    let split = pull_label_and_targets(label, &sel.targets, target_flag, &naming, &pods).map_err(|e| anyhow::anyhow!(e))?;
+    let positional = !sel.targets.is_empty();
+    sel.targets = split.targets;
+    let chosen = select(provider, cfg, &sel.args(), Unscoped::All).await.map_err(|e| {
+        if positional && split.label.is_none() {
+            e.context("`pods pull` takes pods as its arguments now (like every command); a snapshot label goes behind --label")
+        } else {
+            e
+        }
+    })?;
+    Ok((split.label, chosen, split.note))
+}
+
 /// How `pods pull` says it's bounded, on its header line: the per-pod wall clock and the
 /// I/O-silence cut-off (see [`handle_pull`]).
 fn pull_budget_note(budget: Duration) -> String {
@@ -9842,6 +9865,10 @@ fn clear_stale_link(dest: &str) -> std::io::Result<bool> {
 /// it: the pod should come straight from `up`, before anyone has used it.
 const BASELINE_MAX_AGE: Duration = Duration::from_secs(24 * 3600);
 
+/// The budget for listing what was copied onto a baseline's source pod
+/// ([`arena_core::pull::copied_in_command`]: one `find` over its home).
+const COPIED_IN_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Whether a pod can be the fleet baseline's source, from what it said about itself
 /// ([`arena_core::volume::parse_probe`]) at `now` (UNIX seconds): `Ok(container creation time)`
 /// — the line [`arena_core::pull::prune_baseline`] keeps the image's files by — or why not.
@@ -9866,9 +9893,10 @@ fn baseline_source(probe: Option<&arena_core::volume::RepoProbe>, now: u64, pod:
 
 /// `pods baseline <pod>`: capture the week's fleet baseline (see the command's help and
 /// [`arena_core::pull::prune_baseline`] for why only files older than the container are
-/// kept). Everything refusable is refused before the rsync: an existing baseline without
+/// kept — and none copied onto the pod since with an old mtime, as `pods replace` and `pods
+/// restore` do). Everything refusable is refused before the rsync: an existing baseline without
 /// `--replace`, a pod that can't say when its container was created or whose container is over
-/// [`BASELINE_MAX_AGE`] old. The rsync goes into a partial dir next to the destination
+/// [`BASELINE_MAX_AGE`] old, one whose copied-in files can't be listed. The rsync goes into a partial dir next to the destination
 /// (bounded like a pull: `BACKUP_TIMEOUT_SECS`, 5 min without I/O), is pruned, and only then
 /// takes the destination's place — a failed or stopped capture leaves no half baseline.
 #[allow(clippy::too_many_arguments)]
@@ -9909,6 +9937,28 @@ async fn handle_baseline(
         _ => None,
     };
     let created = baseline_source(probe.as_ref(), now, &pod.name).map_err(|e| anyhow::anyhow!("refusing the baseline: {e}"))?;
+    // What was written onto it since with an older mtime — a `pods replace`/`migrate` copy of
+    // another pod's home, a `pods restore`, an archive unpacked at setup: not the image's, though
+    // the mtime prune alone would keep it (fail closed: no listing, no capture).
+    let copied = match remote.exec(&ssh, &pull::copied_in_command(), Some(COPIED_IN_TIMEOUT)).await {
+        Ok(out) if out.success => pull::parse_copied_in(&out.stdout),
+        Ok(out) => Err(format!("{}: {}", out.exit_label(), out.stderr.trim())),
+        Err(e) => Err(describe_error(&e)),
+    }
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "refusing the baseline: couldn't list what was copied onto {} since its container was created ({e})",
+            pod.name
+        )
+    })?;
+    let copied_note = if copied.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " — and none of the {} file(s) copied onto it since with an older mtime (`pods replace`/`restore`, setup)",
+            copied.len()
+        )
+    };
     let threshold =
         cfg.get("BACKUP_MAX_SIZE").filter(|s| !s.is_empty()).map(String::from).unwrap_or_else(|| "50M".to_string());
     let mut pc = pull::PullConfig::small_tier(threshold.as_str());
@@ -9930,7 +9980,7 @@ async fn handle_baseline(
     let plan = format!(
         "capture week {week}'s fleet baseline from {} (id={}, container created {}, {}h{:02}m ago) into {}: rsync its home \
          (the snapshot tier's filters, .git complete{note}), then keep only the files older than the container — the \
-         image's own — for every pod's snapshots to hard-link to{}",
+         image's own{copied_note} — for every pod's snapshots to hard-link to{}",
         pod.name,
         pod.id,
         arena_core::restore::stamp(created),
@@ -9966,7 +10016,7 @@ async fn handle_baseline(
             anyhow::bail!("capturing the baseline from {} failed ({why}) — nothing changed under {}", pod.name, dest.display());
         }
     }
-    let kept = match pull::prune_baseline(&partial, created) {
+    let kept = match pull::prune_baseline(&partial, created, &copied) {
         Ok(k) => k,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&partial);
@@ -9981,7 +10031,7 @@ async fn handle_baseline(
     std::fs::rename(&partial, &dest).with_context(|| format!("moving the baseline into {}", dest.display()))?;
     println!(
         "✓ week {week}'s baseline from {}: {} files, {} that came with the image (in {}); left out {} files, {} written \
-         since the container was created. Snapshots from now on hard-link to it.",
+         or copied onto it since the container was created. Snapshots from now on hard-link to it.",
         pod.name,
         kept.kept_files,
         pull::human_bytes(kept.kept_bytes),
@@ -14418,7 +14468,7 @@ mod placement_cli_tests {
 mod remote_tests {
     use super::{
         backup_fleet, copy_pod_files, copy_to_pod, cp_timeout, deep_check_fleet, duplicate_names, each_pod,
-        handle_backup, handle_baseline, handle_copy, handle_deep_test, handle_full_backup, handle_init_branches, pull_label_and_targets,
+        handle_backup, handle_baseline, handle_copy, handle_deep_test, handle_full_backup, handle_init_branches, pull_label_and_targets, resolve_pull,
         handle_pods, handle_pull, handle_restore, handle_run, handle_set_branch, local_size, marker_present, probe_gpus,
         proxy_reaches_pod, render_deep_test, render_run, replace_copy_failed, restore_note, restore_notes, run_failure, run_fleet, run_preview, select,
         target_is_pod, BackupTally, Cli, Cmd, CopyLeg, CopyPlan, PodCmd, RestoreOpts, RestoreSource, RunResult, Select, SelectByFlag, Selected,
@@ -14743,7 +14793,9 @@ mod remote_tests {
         }
     }
 
-    /// Through the command (dry runs: nothing is copied, no pod is asked anything).
+    /// Through the command: what each spelling resolves to — the label, every pod it reaches,
+    /// the deprecation note — exactly as the `pods pull` arm hands them on (then the dry runs
+    /// themselves: nothing copied, no pod asked anything).
     #[tokio::test]
     async fn pods_pull_resolves_pods_and_says_where_a_label_goes() {
         let fake = Arc::new(FakeRemote::new());
@@ -14751,12 +14803,41 @@ mod remote_tests {
             "MACHINE_NAME_PREFIX=devtest\nBACKUP_REPO_PATH={REPO}\nSHARED_SSH_KEY_PATH=/nonexistent/devtest_key\n\
              ARENA_START_DATE=2026-01-05\n"
         ));
-        handle_pods(pods(&["pull", "bloom", "--dry-run"]), &fleet(), fake.clone(), &cfg, true).await.unwrap();
-        handle_pods(pods(&["pull", "w1d3", "--dry-run"]), &fleet(), fake.clone(), &cfg, true).await.unwrap();
-        handle_pods(pods(&["pull", "-t", "bloom", "--label", "x", "--dry-run"]), &fleet(), fake.clone(), &cfg, true).await.unwrap();
-        let err = handle_pods(pods(&["pull", "mylabel", "--dry-run"]), &fleet(), fake.clone(), &cfg, true).await.unwrap_err();
-        let msg = format!("{err:#}");
+        let every: Vec<String> = fleet().pods.iter().map(|p| p.name.clone()).collect();
+        assert!(every.len() > 1);
+        let resolve = |argv: &'static [&'static str]| {
+            let cfg = cfg.clone();
+            async move {
+                let PodCmd::Pull { label, target_flag, sel, .. } = pods(argv) else { panic!("not pods pull") };
+                resolve_pull(&fleet(), &cfg, label, sel, &target_flag)
+                    .await
+                    .map(|(label, sel, note)| (label, sel.pods.iter().map(|p| p.name.clone()).collect::<Vec<_>>(), note))
+            }
+        };
+        // A pod, positional: that pod, the computed label, no note.
+        assert_eq!(resolve(&["pull", "bloom"]).await.unwrap(), (None, vec!["devtest-bloom".to_string()], None));
+        // The old spelling — a lone wNdM naming no pod: the label, EVERY pod (as it always meant),
+        // and the note saying how to write it now.
+        let (label, chosen, note) = resolve(&["pull", "w1d3"]).await.unwrap();
+        assert_eq!((label.as_deref(), &chosen), (Some("w1d3"), &every));
+        let note = note.expect("the deprecation note");
+        assert!(note.contains("reading `w1d3` as the snapshot label") && note.contains("--label w1d3"), "{note}");
+        // --label with the old -t: that pod, that label, no note.
+        assert_eq!(resolve(&["pull", "-t", "bloom", "--label", "x"]).await.unwrap(), (Some("x".into()), vec!["devtest-bloom".into()], None));
+        assert_eq!(resolve(&["pull", "bloom", "--label", "w1d3"]).await.unwrap(), (Some("w1d3".into()), vec!["devtest-bloom".into()], None));
+        // A word that is no pod and no label: the error says how the command reads now.
+        let msg = format!("{:#}", resolve(&["pull", "mylabel"]).await.unwrap_err());
         assert!(msg.contains("takes pods as its arguments now") && msg.contains("--label") && msg.contains("mylabel"), "{msg}");
+        // The w1d3 dry run puts every pod under w1d3/ (the same resolution, through the arm).
+        let base = std::env::temp_dir().join(format!("arena-pull-oldlabel-{}", std::process::id()));
+        let PodCmd::Pull { label, target_flag, sel, .. } = pods(&["pull", "w1d3"]) else { panic!("not pods pull") };
+        let (label, chosen, _) = resolve_pull(&fleet(), &cfg, label, sel, &target_flag).await.unwrap();
+        handle_pull(&(fake.clone() as Arc<dyn Remote>), &cfg, label, &base.display().to_string(), None, None, false, false, &chosen, true, true, "rsync")
+            .await
+            .unwrap();
+        assert!(!base.exists(), "a dry run writes nothing");
+        handle_pods(pods(&["pull", "w1d3", "--dry-run"]), &fleet(), fake.clone(), &cfg, true).await.unwrap();
+        handle_pods(pods(&["pull", "bloom", "--dry-run"]), &fleet(), fake.clone(), &cfg, true).await.unwrap();
         assert!(fake.calls().is_empty());
     }
 
@@ -15024,7 +15105,8 @@ mod remote_tests {
             stub.0.join("rsync"),
             "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\necho \"$*\" >> \"$(dirname \"$0\")/args.log\"\n\
              mkdir -p \"$last\" && printf img > \"$last/image.txt\" && touch -d @1000000000 \"$last/image.txt\" && \
-             printf work > \"$last/work.txt\"\n",
+             printf work > \"$last/work.txt\" && printf carried > \"$last/carried.txt\" && \
+             touch -d @1000000000 \"$last/carried.txt\"\n",
         )
         .unwrap();
         std::fs::set_permissions(stub.0.join("rsync"), std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -15041,7 +15123,7 @@ mod remote_tests {
         let cfg = Config::parse("MACHINE_NAME_PREFIX=devtest\nSHARED_SSH_KEY_PATH=/nonexistent/devtest_key\n");
         let one = Selected::all(fleet().pods.into_iter().filter(|p| p.name == "devtest-apple").collect());
         let fake = Arc::new(FakeRemote::new());
-        fake.script(&host(22001), [repo_in_place(), repo_in_place()]);
+        fake.script(&host(22001), [repo_in_place(), repo_in_place(), repo_in_place()]);
         let remote: Arc<dyn Remote> = fake.clone();
         handle_pull(&remote, &cfg, Some("w1d1".into()), &base, None, None, false, false, &one, false, true, &stub.path()).await.unwrap();
         assert!(!stub.take_args().iter().any(|a| a.contains("--link-dest")), "nothing to link to yet");
@@ -15052,6 +15134,15 @@ mod remote_tests {
         assert_eq!(linked.len(), 2, "{args:#?}");
         assert!(linked.iter().all(|a| a.ends_with("/w1d2/devtest-apple/")), "{linked:#?}");
         assert!(args.iter().filter(|a| a.ends_with("/big/devtest-apple/")).all(|a| !a.contains("--link-dest")), "{args:#?}");
+        assert!(!args.iter().any(|a| a.contains("--no-perms")), "a new snapshot is a plain -a pull: {args:#?}");
+        // The same label again (the */15 cron, later that day): its files may be links into the
+        // first snapshot, so their attributes are never changed in place. big isn't linked.
+        handle_pull(&remote, &cfg, Some("w1d2".into()), &base, None, None, false, false, &one, false, true, &stub.path()).await.unwrap();
+        let args = stub.take_args();
+        let snap: Vec<&String> = args.iter().filter(|a| a.ends_with("/w1d2/devtest-apple/")).collect();
+        assert_eq!(snap.len(), 2, "{args:#?}");
+        assert!(snap.iter().all(|a| a.contains("--no-perms --no-owner --no-group")), "{snap:#?}");
+        assert!(args.iter().filter(|a| a.ends_with("/big/devtest-apple/")).all(|a| !a.contains("--no-perms")), "{args:#?}");
         // A label that is one of the backup dir's own folders is refused.
         for bad in ["big", "baseline", "a/b"] {
             let err = handle_pull(&remote, &cfg, Some(bad.into()), &base, None, None, false, false, &one, true, true, &stub.path()).await.unwrap_err();
@@ -15060,8 +15151,9 @@ mod remote_tests {
     }
 
     /// `pods baseline`: from a fresh pod only (its container's age known, under a day), into
-    /// baseline/w<N>/fleet/ holding only the files older than the container; an existing one
-    /// needs --replace, which moves it aside. A dry run writes nothing.
+    /// baseline/w<N>/fleet/ holding only the files older than the container — and none the pod
+    /// lists as copied onto it since with an old mtime (a `pods replace` copy: `carried.txt`);
+    /// an existing one needs --replace, which moves it aside. A dry run writes nothing.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_baseline_comes_from_a_fresh_pod_and_keeps_only_the_image() {
@@ -15077,6 +15169,11 @@ mod remote_tests {
             let c = created.map(|t| format!("arena-repo-container={t}\n")).unwrap_or_default();
             FakeReply::stdout(&format!("arena-repo-home=/root\narena-repo-real={REPO}\narena-repo-mount=no\n{c}"))
         };
+        // The pod's listing of what was copied onto it since its container was created.
+        let copied = |paths: &[&str]| {
+            let records: String = paths.iter().map(|p| format!("./{p}\0")).collect();
+            FakeReply::stdout(&format!("arena-copied-begin\0{records}arena-copied-end\0"))
+        };
         let run = |fake: &Arc<FakeRemote>, week: u32, replace: bool, dry: bool| {
             let remote: Arc<dyn Remote> = fake.clone();
             let (dir, stub) = (dir.clone(), stub.path());
@@ -15091,18 +15188,28 @@ mod remote_tests {
             assert!(err.starts_with("refusing the baseline: devtest-apple"), "{err}");
             assert!(stub.take_args().is_empty());
         }
+        // Refused: what was copied onto it can't be listed (cut short, or find failed).
+        for listing in [FakeReply::stdout("arena-copied-begin\0./carried.txt\0"), FakeReply::exit(1, "find: unknown predicate `-newercm'")] {
+            let fake = Arc::new(FakeRemote::new());
+            fake.script(&host(22001), [probe(Some(now - 600)), listing]);
+            let err = run(&fake, 0, false, false).await.unwrap_err().to_string();
+            assert!(err.starts_with("refusing the baseline: couldn't list what was copied onto devtest-apple"), "{err}");
+            assert!(stub.take_args().is_empty() && !base.join("baseline").exists());
+        }
         // A dry run: asked, nothing written.
         let fake = Arc::new(FakeRemote::new());
-        fake.script(&host(22001), [probe(Some(now - 600))]);
+        fake.script(&host(22001), [probe(Some(now - 600)), copied(&["carried.txt"])]);
         run(&fake, 0, false, true).await.unwrap();
         assert!(stub.take_args().is_empty() && !base.join("baseline").exists());
-        // The capture: both passes, then only the image's file stays.
+        // The capture: both passes, then only the image's file stays — not what was written
+        // since, nor what was copied in with its old mtime.
         let fake = Arc::new(FakeRemote::new());
-        fake.script(&host(22001), [probe(Some(now - 600))]);
+        fake.script(&host(22001), [probe(Some(now - 600)), copied(&["carried.txt"])]);
         run(&fake, 0, false, false).await.unwrap();
         assert_eq!(stub.take_args().len(), 2);
         let fleet0 = base.join("baseline/w0/fleet");
         assert!(fleet0.join("image.txt").is_file() && !fleet0.join("work.txt").exists());
+        assert!(!fleet0.join("carried.txt").exists(), "copied onto the pod after its container: not the image's");
         let leftovers: Vec<_> = std::fs::read_dir(base.join("baseline/w0")).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
         assert_eq!(leftovers, ["fleet"], "no partial dir left");
         // Again: refused without --replace (nothing run); with it, the old one moved aside.
@@ -15110,7 +15217,7 @@ mod remote_tests {
         let err = run(&fake, 0, false, false).await.unwrap_err().to_string();
         assert!(err.contains("already holds week 0's baseline") && err.contains("--replace"), "{err}");
         assert!(fake.calls().is_empty() && stub.take_args().is_empty());
-        fake.script(&host(22001), [probe(Some(now - 600))]);
+        fake.script(&host(22001), [probe(Some(now - 600)), copied(&[])]);
         run(&fake, 0, true, false).await.unwrap();
         let mut names: Vec<String> =
             std::fs::read_dir(base.join("baseline/w0")).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect();
@@ -15119,7 +15226,7 @@ mod remote_tests {
         stub.take_args();
         // Week 1's links to week 0's.
         let fake = Arc::new(FakeRemote::new());
-        fake.script(&host(22001), [probe(Some(now - 600))]);
+        fake.script(&host(22001), [probe(Some(now - 600)), copied(&[])]);
         run(&fake, 1, false, false).await.unwrap();
         let w0 = std::fs::canonicalize(&fleet0).unwrap();
         assert!(stub.take_args().iter().all(|a| a.contains(&format!("--link-dest={}", w0.display()))));

@@ -9,8 +9,9 @@
 //! Two things never go into those commits, because each once stopped participants' work from
 //! reaching GitHub: a file over [`GIT_MAX_FILE_BYTES`] (GitHub refuses the push — then every
 //! push after it), and a nested repo as a gitlink (a commit id without its files). The image's
-//! nested clones are folded into the course repo instead (their `.git` moved aside, once);
-//! other nested repos are kept out and reported. The script is [`BACKUP_SCRIPT`].
+//! nested clones are adopted instead — the course repo tracks their files where they are, their
+//! own `.git` untouched — once; other nested repos are kept out and reported. The script is
+//! [`BACKUP_SCRIPT`].
 //!
 //! This module only *renders* the command (pure, unit-tested). Running it — and thus
 //! mutating remote git state — is gated behind the CLI's `--apply`.
@@ -73,17 +74,19 @@ pub const BACKUP_NO_CHANGES: &str = "NO_CHANGES";
 pub const BACKUP_SKIPPED: &str = "SKIP";
 
 /// The largest file the git backup commits. GitHub refuses a push carrying any file over
-/// 100 MiB (`GH001 … pre-receive hook declined`) — and then every later push of the branch,
-/// since the blob stays in the unpushed history even after the file is deleted (live: one
-/// 110 MB checkpoint stopped a pod's git backup for good). Files above this (with headroom
-/// under the limit) are left out of the commit and reported; the rsync big tier keeps them.
+/// [`GITHUB_FILE_LIMIT_BYTES`] (`GH001 … pre-receive hook declined`) — and then every later
+/// push of the branch, since the blob stays in the unpushed history even after the file is
+/// deleted (live: one 110 MB checkpoint stopped a pod's git backup for good). Files above this
+/// (with headroom under the limit) are left out of the commit and reported; the rsync big tier
+/// keeps them.
 pub const GIT_MAX_FILE_BYTES: u64 = 95 * 1024 * 1024;
 
-/// Where a nested clone's own `.git` is moved when the backup folds the clone into the course
-/// repo (move it back to undo). Kept out of every commit and every rsync tier.
-pub const NESTED_GIT_ASIDE: &str = ".git.arena-nested";
+/// GitHub's own per-file limit (100 MiB): a push carrying a bigger blob is refused. What the
+/// backup judges a branch *stuck* by ([`BACKUP_STUCK_EXIT`]) — never [`GIT_MAX_FILE_BYTES`]: a
+/// file between the two, committed by hand, is one GitHub takes, so its push must go ahead.
+pub const GITHUB_FILE_LIMIT_BYTES: u64 = 100 * 1024 * 1024;
 
-/// The exit status of a backup that found a file over the limit already in the branch's
+/// The exit status of a backup that found a file over GitHub's limit already in the branch's
 /// unpushed commits — no push can succeed until they're rewritten ([`BackupReport::stuck_fix`]).
 pub const BACKUP_STUCK_EXIT: i32 = 3;
 
@@ -96,48 +99,77 @@ pub const BACKUP_SCRIPT: &str = include_str!("backup.sh");
 /// participant's bespoke branch is respected (matching legacy `sync_git.sh`, not
 /// `init_branches.sh`). To stage work on a dedicated autocommit branch, put the pod there
 /// first with `init-branches`/`set-branch`. It runs [`BACKUP_SCRIPT`] under `sh` with the
-/// repo, message, size limit ([`GIT_MAX_FILE_BYTES`]) and push key as arguments.
+/// repo, message, size limits ([`GIT_MAX_FILE_BYTES`], [`GITHUB_FILE_LIMIT_BYTES`]) and push key
+/// as arguments.
 ///
 /// It refuses to push `main`/`master` (or a detached `HEAD`), printing `SKIP <branch>`
 /// and exiting 0 — so an automated backup never lands commits on the protected branch.
-/// Flow: resolve the current branch; skip if protected; ensure a git identity; fold the
-/// image's nested clones into the repo once, keep any other nested repo out of the commit
-/// (never a gitlink); stage everything but files over the limit; commit if anything is
+/// Flow: resolve the current branch; skip if protected; ensure a git identity; adopt the
+/// image's nested clones into the repo once (their files tracked in place, their own `.git`
+/// untouched), keep any other nested repo out of the commit (never a gitlink); stage everything but files over the limit; commit if anything is
 /// staged; then push whenever the branch has **no upstream yet or is ahead of it** — not
 /// only when this run committed. A push that failed last tick (network blip, GitHub outage,
 /// a key briefly missing) leaves its commit local and the tree clean, so "nothing staged"
 /// must not read as "nothing to do": the next tick retries the push. Only a clean tree *and*
 /// `HEAD == @{u}` prints `NO_CHANGES <branch>` (exit 0); a push prints `PUSHED <branch>`. A
-/// file over the limit already in the unpushed commits fails it with
+/// file over GitHub's limit already in the unpushed commits fails it with
 /// [`BACKUP_STUCK_EXIT`] and what to reset to — before a push GitHub would refuse.
 /// `set -e` aborts on any other error, so a rejected push is a failure.
 pub fn backup_command(repo_path: &str, git_ssh_key: Option<&str>, commit_msg: &str) -> String {
-    backup_command_limited(repo_path, git_ssh_key, commit_msg, GIT_MAX_FILE_BYTES)
+    backup_command_limited(repo_path, git_ssh_key, commit_msg, GIT_MAX_FILE_BYTES, GITHUB_FILE_LIMIT_BYTES)
 }
 
-/// [`backup_command`] with the size limit as a parameter (tests simulate GitHub's limit with
-/// a few-byte one).
-pub fn backup_command_limited(repo_path: &str, git_ssh_key: Option<&str>, commit_msg: &str, max_file_bytes: u64) -> String {
+/// [`backup_command`] with the size limits as parameters — the largest file committed, and the
+/// largest a push may carry — so tests simulate GitHub's limit with a few-byte one.
+pub fn backup_command_limited(
+    repo_path: &str,
+    git_ssh_key: Option<&str>,
+    commit_msg: &str,
+    max_file_bytes: u64,
+    push_limit_bytes: u64,
+) -> String {
+    format!("sh -c {} arena-backup {}", shell_quote(BACKUP_SCRIPT), script_args(repo_path, git_ssh_key, commit_msg, max_file_bytes, push_limit_bytes))
+}
+
+/// [`BACKUP_SCRIPT`]'s arguments, shell-quoted.
+fn script_args(repo_path: &str, git_ssh_key: Option<&str>, commit_msg: &str, max_file_bytes: u64, push_limit_bytes: u64) -> String {
     format!(
-        "sh -c {} arena-backup {} {} {max_file_bytes} {}",
-        shell_quote(BACKUP_SCRIPT),
+        "{} {} {max_file_bytes} {push_limit_bytes} {}",
         shell_quote(repo_path),
         shell_quote(commit_msg),
         shell_quote(git_ssh_key.unwrap_or("")),
     )
 }
 
-/// [`backup_command`] with [`BACKUP_SCRIPT`] shown as `"$ARENA_BACKUP_SH"`: the exact
-/// arguments without the script's text — for a dry run's per-pod line (which prints the script
-/// once) and the TUI's confirm modal.
+/// The file a dry run's per-pod line reads [`BACKUP_SCRIPT`] from ([`backup_dry_run_line`]);
+/// [`backup_script_heredoc`] writes it.
+pub const BACKUP_SCRIPT_FILE: &str = "arena-backup.sh";
+
+/// [`backup_command`] as the remote half of a pasteable line: the same script and arguments,
+/// the script read from stdin (`sh -s`) instead of carried in the command — for a dry run's
+/// per-pod line and the TUI's confirm modal, which show the arguments without the script's
+/// ~150 lines.
 pub fn backup_summary(repo_path: &str, git_ssh_key: Option<&str>, commit_msg: &str) -> String {
-    format!(
-        "sh -c \"$ARENA_BACKUP_SH\" arena-backup {} {} {GIT_MAX_FILE_BYTES} {}",
-        shell_quote(repo_path),
-        shell_quote(commit_msg),
-        shell_quote(git_ssh_key.unwrap_or("")),
-    )
+    format!("sh -s {}", script_args(repo_path, git_ssh_key, commit_msg, GIT_MAX_FILE_BYTES, GITHUB_FILE_LIMIT_BYTES))
 }
+
+/// One pod's backup as a dry run prints it: `ssh … 'sh -s <args>' < arena-backup.sh`. Pasted
+/// into a shell next to the file ([`backup_script_heredoc`] writes it), it runs exactly what the
+/// backup runs; without the file the local shell refuses to start it at all. (It used to show
+/// the script as `"$ARENA_BACKUP_SH"`, which the pod's shell expanded to nothing: `sh -c ""`
+/// did nothing and exited 0 — a paste that looked like a successful backup.)
+pub fn backup_dry_run_line(target: &crate::ssh::SshTarget, repo_path: &str, git_ssh_key: Option<&str>, commit_msg: &str) -> String {
+    format!("{} < {BACKUP_SCRIPT_FILE}", target.display_command(&backup_summary(repo_path, git_ssh_key, commit_msg)))
+}
+
+/// The here-doc that writes [`BACKUP_SCRIPT`] to [`BACKUP_SCRIPT_FILE`] — pasteable, printed once
+/// by a dry run for its per-pod lines ([`backup_dry_run_line`]).
+pub fn backup_script_heredoc() -> String {
+    format!("cat > {BACKUP_SCRIPT_FILE} <<'{HEREDOC_END}'\n{}\n{HEREDOC_END}", BACKUP_SCRIPT.trim_end())
+}
+
+/// [`backup_script_heredoc`]'s delimiter: a line the script never has.
+const HEREDOC_END: &str = "ARENA_BACKUP_SH_END";
 
 /// Classify a backup command's stdout: `(sentinel, branch)`. Returns the matched
 /// `BACKUP_*` sentinel and the branch it reported, or `None` if neither appeared
@@ -153,13 +185,13 @@ pub struct BackupReport {
     pub outcome: Option<(&'static str, String)>,
     /// Files over the limit left out of this commit: `(bytes, path)`.
     pub big_skipped: Vec<(u64, String)>,
-    /// Files over the limit already in the unpushed commits: `(bytes, path)`.
+    /// Files over GitHub's limit already in the unpushed commits: `(bytes, path)`.
     pub big_stuck: Vec<(u64, String)>,
     /// What to `git reset` to, to rewrite those commits without them (`None`: nothing to say,
     /// or no pushed commit to go back to).
     pub stuck_base: Option<String>,
-    /// Nested clones folded into the repo this run (their `.git` moved aside).
-    pub folded: Vec<String>,
+    /// Nested clones adopted this run: the repo tracks their files now (their `.git` untouched).
+    pub adopted: Vec<String>,
     /// Nested repos left as they are and kept out of the commit.
     pub kept: Vec<String>,
 }
@@ -179,7 +211,7 @@ pub fn parse_backup_report(stdout: &str) -> BackupReport {
             "BIGSKIP" => r.big_skipped.extend(sized(rest)),
             "BIGSTUCK" => r.big_stuck.extend(sized(rest)),
             "BIGSTUCK_BASE" => r.stuck_base = Some(rest.trim()).filter(|b| !b.is_empty() && *b != "none").map(String::from),
-            "NESTED_FOLDED" if !rest.is_empty() => r.folded.push(rest.to_string()),
+            "NESTED_ADOPTED" if !rest.is_empty() => r.adopted.push(rest.to_string()),
             "NESTED_KEPT" if !rest.is_empty() => r.kept.push(rest.to_string()),
             _ if r.outcome.is_none() => {
                 for sentinel in [BACKUP_PUSHED, BACKUP_NO_CHANGES, BACKUP_SKIPPED] {
@@ -210,7 +242,7 @@ fn some_of(items: &[String], max: usize) -> String {
 
 impl BackupReport {
     /// What a run that worked has to say besides its outcome: files kept out of git, nested
-    /// repos folded or kept out. One phrase each; empty when there's nothing.
+    /// repos adopted or kept out. One phrase each; empty when there's nothing.
     pub fn notes(&self) -> Vec<String> {
         let mut notes = Vec::new();
         if !self.big_skipped.is_empty() {
@@ -222,11 +254,11 @@ impl BackupReport {
                 some_of(&files, 3)
             ));
         }
-        if !self.folded.is_empty() {
+        if !self.adopted.is_empty() {
             notes.push(format!(
-                "folded {} nested clone(s) into the repo (their .git is now {NESTED_GIT_ASIDE}/): {}",
-                self.folded.len(),
-                some_of(&self.folded, 4)
+                "now tracking the files of {} nested clone(s) in the repo (their own .git left as it is): {}",
+                self.adopted.len(),
+                some_of(&self.adopted, 4)
             ));
         }
         if !self.kept.is_empty() {
@@ -239,7 +271,7 @@ impl BackupReport {
         notes
     }
 
-    /// For a run that found files over the limit in the unpushed commits: why nothing can be
+    /// For a run that found files over GitHub's limit in the unpushed commits: why nothing can be
     /// pushed, and the exact commands that fix it — rewrite those commits without the files
     /// (they stay on disk), then back up again. `None` for any other run.
     pub fn stuck_fix(&self, repo: &str, pod: &str) -> Option<String> {
@@ -250,7 +282,7 @@ impl BackupReport {
         let why = format!(
             "{} file(s) over {} MB in unpushed commits — GitHub refuses every push of the branch until they're rewritten: {}",
             files.len(),
-            GIT_MAX_FILE_BYTES / (1024 * 1024),
+            GITHUB_FILE_LIMIT_BYTES / (1024 * 1024),
             some_of(&files, 3)
         );
         Some(match &self.stuck_base {
@@ -298,10 +330,10 @@ pub fn init_branch_command(cfg: &BackupConfig, machine_name: &str) -> String {
 /// **discarding any local commits/changes on it** (untracked files are left in place).
 /// Used by `pods set-branch [--hard]` (e.g. reset everyone back to `main`).
 ///
-/// A nested clone the backup folded into the repo ([`NESTED_GIT_ASIDE`]) is tracked on the
+/// A nested clone the backup adopted (its files tracked by the course repo) is tracked on the
 /// autocommit branches only — the course's `main` doesn't have it — so switching to such a
 /// branch would delete its files from disk and break that exercise. After the switch, each
-/// folded clone the old HEAD had and the new one doesn't is put back from the old HEAD
+/// adopted clone the old HEAD had and the new one doesn't is put back from the old HEAD
 /// (`RESTORED <path>` on stdout), **staged**: as untracked files they would block a switch
 /// back to a branch that tracks them ("untracked working tree files would be overwritten"),
 /// staged they ride along with it. A backup never commits on `main`, and the next
@@ -327,7 +359,7 @@ pub fn checkout_command(repo_path: &str, branch: &str, git_ssh_key: Option<&str>
         parts.push(format!("git checkout {}", shell_quote(branch)));
         parts.push("git pull --ff-only".into());
     }
-    // The folded clones (listed by the backup in `$G/arena-nested`) the switch removed: back
+    // The adopted clones (listed by the backup in `$G/arena-nested`) the switch removed: back
     // from the old HEAD, staged.
     parts.push(
         "G=$(git rev-parse --absolute-git-dir); if [ -n \"$OLD\" ] && [ -s \"$G/arena-nested\" ]; then \
@@ -376,7 +408,12 @@ mod tests {
         let c = backup_command("/root/ARENA_3.0", Some("/root/.ssh/id_ed25519"), "arena backup");
         // The script under sh (whatever the login shell), its arguments exact.
         assert!(c.starts_with("sh -c '"), "{c}");
-        assert!(c.ends_with(&format!(" arena-backup '/root/ARENA_3.0' 'arena backup' {GIT_MAX_FILE_BYTES} '/root/.ssh/id_ed25519'")), "{c}");
+        assert!(
+            c.ends_with(&format!(
+                " arena-backup '/root/ARENA_3.0' 'arena backup' {GIT_MAX_FILE_BYTES} {GITHUB_FILE_LIMIT_BYTES} '/root/.ssh/id_ed25519'"
+            )),
+            "{c}"
+        );
         let s = BACKUP_SCRIPT;
         // Never switches/creates a branch — works on whatever HEAD is on.
         assert!(!s.contains("git checkout"));
@@ -393,12 +430,13 @@ mod tests {
         assert!(s.contains("Arena Autocommit"));
         assert!(s.contains(r#"export GIT_SSH_COMMAND="ssh -i $KEY"#));
         assert_eq!(GIT_MAX_FILE_BYTES, 99_614_720, "95 MiB: headroom under GitHub's 100 MiB");
+        assert_eq!(GITHUB_FILE_LIMIT_BYTES, 104_857_600, "GitHub's GH001 limit");
     }
 
     #[test]
     fn omits_git_ssh_command_without_key() {
         // An empty key argument: the script exports no GIT_SSH_COMMAND for it.
-        assert!(backup_command("/root/ARENA_3.0", None, "m").ends_with(" 'm' 99614720 ''"));
+        assert!(backup_command("/root/ARENA_3.0", None, "m").ends_with(" 'm' 99614720 104857600 ''"));
         assert!(BACKUP_SCRIPT.contains(r#"if [ -n "$KEY" ]; then"#));
     }
 
@@ -412,12 +450,12 @@ mod tests {
 
     #[test]
     fn the_report_reads_every_line_and_says_what_to_do() {
-        let out = "NESTED_FOLDED chapter4/exercises/shutdown_avoidance\nNESTED_FOLDED Grokking\n\
+        let out = "NESTED_ADOPTED chapter4/exercises/shutdown_avoidance\nNESTED_ADOPTED Grokking\n\
                    NESTED_KEPT projects/my repo\nBIGSKIP 115343360 exercises/devtest_ckpt.pt\n\
                    [autocommit-x 1a2b3c] arena backup\nPUSHED autocommit-x\n";
         let r = parse_backup_report(out);
         assert_eq!(r.outcome, Some((BACKUP_PUSHED, "autocommit-x".into())));
-        assert_eq!(r.folded, ["chapter4/exercises/shutdown_avoidance", "Grokking"]);
+        assert_eq!(r.adopted, ["chapter4/exercises/shutdown_avoidance", "Grokking"]);
         assert_eq!(r.kept, ["projects/my repo"]);
         assert_eq!(r.big_skipped, [(115_343_360, "exercises/devtest_ckpt.pt".to_string())]);
         assert_eq!(r.stuck_fix("/root/ARENA_materials", "devtest-bravo"), None);
@@ -425,7 +463,8 @@ mod tests {
             r.notes(),
             [
                 "skipped 1 file(s) > 95 MB: exercises/devtest_ckpt.pt (110.0 MB) — GitHub refuses them; covered by the rsync big tier (`pods pull`)",
-                "folded 2 nested clone(s) into the repo (their .git is now .git.arena-nested/): chapter4/exercises/shutdown_avoidance, Grokking",
+                "now tracking the files of 2 nested clone(s) in the repo (their own .git left as it is): \
+                 chapter4/exercises/shutdown_avoidance, Grokking",
                 "1 nested repo(s) with their own history kept out of git (the rsync tiers have them): projects/my repo",
             ]
         );
@@ -433,7 +472,7 @@ mod tests {
         let stuck = parse_backup_report("BIGSTUCK 115343360 exercises/devtest_ckpt.pt\nBIGSTUCK_BASE 65ea2a3f\n");
         assert_eq!(stuck.outcome, None);
         let fix = stuck.stuck_fix("/root/ARENA_materials", "devtest-bravo").unwrap();
-        assert!(fix.starts_with("1 file(s) over 95 MB in unpushed commits — GitHub refuses every push"), "{fix}");
+        assert!(fix.starts_with("1 file(s) over 100 MB in unpushed commits — GitHub refuses every push"), "{fix}");
         assert!(fix.contains("exercises/devtest_ckpt.pt (110.0 MB)"), "{fix}");
         assert!(
             fix.ends_with(
@@ -454,12 +493,15 @@ mod tests {
 
     /// A real repo and a local bare "origin" whose pre-receive hook refuses any blob over
     /// `limit` bytes — GitHub's GH001, scaled down — for the backup command to run against.
+    /// The backup keeps files over `skip` out of its commits (`limit` unless a test sets it
+    /// lower, as [`GIT_MAX_FILE_BYTES`] is) and judges a branch stuck by `limit`.
     #[cfg(unix)]
     struct GitSandbox {
         base: std::path::PathBuf,
         origin: std::path::PathBuf,
         work: std::path::PathBuf,
         limit: u64,
+        skip: u64,
     }
 
     #[cfg(unix)]
@@ -471,7 +513,7 @@ mod tests {
             let base = std::env::temp_dir().join(format!("arena-backup-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&base);
             std::fs::create_dir_all(&base).unwrap();
-            let s = GitSandbox { origin: base.join("origin.git"), work: base.join("work"), base, limit };
+            let s = GitSandbox { origin: base.join("origin.git"), work: base.join("work"), base, limit, skip: limit };
             s.git(&s.base, &["init", "-q", "--bare", s.origin.to_str().unwrap()]);
             let hook = s.origin.join("hooks/pre-receive");
             std::fs::write(
@@ -514,7 +556,7 @@ mod tests {
 
         /// One backup run: (exit code, report, stderr).
         fn backup(&self) -> (Option<i32>, BackupReport, String) {
-            let cmd = backup_command_limited(self.work.to_str().unwrap(), None, "arena backup", self.limit);
+            let cmd = backup_command_limited(self.work.to_str().unwrap(), None, "arena backup", self.skip, self.limit);
             let o = std::process::Command::new("bash").arg("-c").arg(cmd).output().expect("bash");
             (o.status.code(), parse_backup_report(&String::from_utf8_lossy(&o.stdout)), String::from_utf8_lossy(&o.stderr).into_owned())
         }
@@ -528,6 +570,25 @@ mod tests {
                     (meta.split(' ').next().unwrap().to_string(), path.to_string())
                 })
                 .collect()
+        }
+
+        /// An upstream repo (one commit, `u.py`) for clones the image's way.
+        fn upstream(&self) -> std::path::PathBuf {
+            let upstream = self.base.join("upstream");
+            if !upstream.exists() {
+                self.git(&self.base, &["init", "-q", "-b", "main", upstream.to_str().unwrap()]);
+                std::fs::write(upstream.join("u.py"), "upstream\n").unwrap();
+                self.git(&upstream, &["-c", "user.name=u", "-c", "user.email=u@u", "add", "-A"]);
+                self.git(&upstream, &["-c", "user.name=u", "-c", "user.email=u@u", "commit", "-q", "-m", "u"]);
+            }
+            upstream
+        }
+
+        /// A clone of [`Self::upstream`] at `rel` in the work tree, untracked.
+        fn clone_upstream(&self, rel: &str) -> std::path::PathBuf {
+            let clone = self.work.join(rel);
+            self.git(&self.base, &["clone", "-q", self.upstream().to_str().unwrap(), clone.to_str().unwrap()]);
+            clone
         }
 
         fn origin_blob_size(&self, branch: &str, path: &str) -> u64 {
@@ -623,20 +684,15 @@ mod tests {
 
     /// The image ships clones of upstream repos inside the exercises; `git add -A` committed
     /// them as gitlinks, so the participants' work in them never reached GitHub (live). They
-    /// are folded in once — their `.git` moved aside, reversibly — while a repo with history of
-    /// its own (a participant's project) is kept out, never a gitlink, and reported every run.
+    /// are adopted once — the course repo tracks their files where they are, their own `.git`
+    /// untouched — while a repo with history of its own (a participant's project) is kept out,
+    /// never a gitlink, and reported every run.
     #[cfg(unix)]
     #[test]
-    fn nested_clones_are_folded_once_and_repos_with_their_own_history_kept_out() {
+    fn nested_clones_are_adopted_once_and_repos_with_their_own_history_kept_out() {
         let s = GitSandbox::new("nested", 1_000_000);
-        // An upstream repo, cloned into the exercises (the image's case).
-        let upstream = s.base.join("upstream");
-        s.git(&s.base, &["init", "-q", "-b", "main", upstream.to_str().unwrap()]);
-        std::fs::write(upstream.join("u.py"), "upstream\n").unwrap();
-        s.git(&upstream, &["-c", "user.name=u", "-c", "user.email=u@u", "add", "-A"]);
-        s.git(&upstream, &["-c", "user.name=u", "-c", "user.email=u@u", "commit", "-q", "-m", "u"]);
-        let clone = s.work.join("exercises/shutdown_avoidance");
-        s.git(&s.base, &["clone", "-q", upstream.to_str().unwrap(), clone.to_str().unwrap()]);
+        let upstream = s.upstream();
+        let clone = s.clone_upstream("exercises/shutdown_avoidance");
         // The participant's work inside it.
         std::fs::write(clone.join("devtest_participant_work.py"), "work\n").unwrap();
         std::fs::write(clone.join("u.py"), "edited\n").unwrap();
@@ -649,88 +705,143 @@ mod tests {
 
         let (code, r, err) = s.backup();
         assert_eq!((code, r.outcome.clone()), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into()))), "{err}");
-        assert_eq!(r.folded, ["exercises/shutdown_avoidance"]);
+        assert_eq!(r.adopted, ["exercises/shutdown_avoidance"]);
         assert_eq!(r.kept, ["projects/my repo"]);
         let tree = s.origin_tree("autocommit-x");
         assert!(!tree.iter().any(|(mode, _)| mode == "160000"), "no gitlinks: {tree:?}");
         let paths: Vec<&str> = tree.iter().map(|(_, p)| p.as_str()).collect();
         assert!(paths.contains(&"exercises/shutdown_avoidance/devtest_participant_work.py"), "{paths:?}");
         assert!(paths.contains(&"exercises/shutdown_avoidance/u.py"), "{paths:?}");
-        assert!(!paths.iter().any(|p| p.contains(NESTED_GIT_ASIDE) || p.starts_with("projects/")), "{paths:?}");
+        assert!(!paths.iter().any(|p| p.contains("/.git") || p.starts_with("projects/")), "{paths:?}");
         let edited = s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "show", "autocommit-x:exercises/shutdown_avoidance/u.py"]);
         assert_eq!(edited, "edited");
-        // Folded = its .git moved aside (nothing deleted); the kept repo untouched.
-        assert!(clone.join(NESTED_GIT_ASIDE).join("HEAD").is_file() && !clone.join(".git").exists());
+        // Adopted in place: the clone's own .git is where it was, untouched; the kept repo too.
+        assert_eq!(s.git(&clone, &["rev-parse", "HEAD"]), s.git(&upstream, &["rev-parse", "HEAD"]));
         assert!(mine.join(".git/HEAD").is_file());
         let exclude = std::fs::read_to_string(s.work.join(".git/info/exclude")).unwrap();
-        assert!(exclude.contains("# BEGIN arena-backup\n.git.arena-nested/\n/projects/my repo/\n# END arena-backup\n"), "{exclude}");
+        assert!(exclude.contains("# BEGIN arena-backup\n/projects/my repo/\n# END arena-backup\n"), "{exclude}");
 
-        // Once per checkout: a clone appearing later isn't folded — it's kept out, and said.
-        let later = s.work.join("exercises/later_clone");
-        s.git(&s.base, &["clone", "-q", upstream.to_str().unwrap(), later.to_str().unwrap()]);
+        // Later work in it — a new file in a new directory — goes in with the next backup.
+        std::fs::create_dir_all(clone.join("results")).unwrap();
+        std::fs::write(clone.join("results/run2.txt"), "r\n").unwrap();
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome.clone()), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into()))), "{err}");
+        assert!(r.adopted.is_empty(), "once: {:?}", r.adopted);
+        assert!(s.origin_tree("autocommit-x").iter().any(|(_, p)| p == "exercises/shutdown_avoidance/results/run2.txt"));
+
+        // Once per checkout: a clone appearing later isn't adopted — it's kept out, and said.
+        let later = s.clone_upstream("exercises/later_clone");
         let (code, r, _) = s.backup();
         assert_eq!((code, r.outcome.clone()), (Some(0), Some((BACKUP_NO_CHANGES, "autocommit-x".into()))));
-        assert!(r.folded.is_empty());
+        assert!(r.adopted.is_empty());
         assert_eq!(r.kept, ["exercises/later_clone", "projects/my repo"]);
         assert!(later.join(".git/HEAD").is_file());
-        assert_eq!(exclude.matches("# BEGIN arena-backup").count(), 1);
+        let exclude = std::fs::read_to_string(s.work.join(".git/info/exclude")).unwrap();
+        assert_eq!(exclude.matches("# BEGIN arena-backup").count(), 1, "{exclude}");
 
-        // Reversible: moving the .git back gives the clone its own history again.
-        std::fs::rename(clone.join(NESTED_GIT_ASIDE), clone.join(".git")).unwrap();
-        assert_eq!(s.git(&clone, &["rev-parse", "HEAD"]), s.git(&upstream, &["rev-parse", "HEAD"]));
-
-        // A clone folded before with a .git again — what `pods replace` leaves: the copy carries
-        // this checkout (index, folded files, the list) but not .git.arena-nested, and the new
-        // pod's image has the clone's .git — is folded again, never kept as a nested repo.
-        let (code, r, err) = s.backup();
-        assert_eq!((code, r.folded.clone()), (Some(0), vec!["exercises/shutdown_avoidance".to_string()]), "{err}");
-        assert!(!r.kept.contains(&"exercises/shutdown_avoidance".to_string()), "{:?}", r.kept);
-        assert!(clone.join(NESTED_GIT_ASIDE).is_dir() && !clone.join(".git").exists());
-        assert!(!s.origin_tree("autocommit-x").iter().any(|(mode, _)| mode == "160000"));
+        // Undone as the script says — out of the index; nothing on disk changes.
+        s.git(&s.work, &["rm", "-r", "-q", "--cached", "exercises/shutdown_avoidance"]);
+        assert!(clone.join("devtest_participant_work.py").is_file() && clone.join(".git/HEAD").is_file());
     }
 
-    /// Pods backed up before this fix carry gitlinks in their history: folding such a clone
+    /// Review of the first design, which folded a clone by moving its `.git` aside
+    /// (`.git.arena-nested`): every rsync tier drops that dot-dir, so the participant's stash and
+    /// side branches in it lived only on the pod (gone on teardown or `pods replace`), and git run
+    /// inside the exercise then worked on the whole course repo — a `git reset --hard` there
+    /// reverted work across the checkout. Adopted in place, neither happens.
+    #[cfg(unix)]
+    #[test]
+    fn an_adopted_clone_keeps_its_own_git_and_git_inside_it_stays_inside_it() {
+        use crate::volume::fake_ssh;
+        let s = GitSandbox::new("adopt-state", 1_000_000);
+        let clone = s.clone_upstream("ex/clone");
+        let g = |dir: &std::path::Path, args: &[&str]| {
+            let mut a = vec!["-c", "user.name=p", "-c", "user.email=p@p"];
+            a.extend_from_slice(args);
+            s.git(dir, &a)
+        };
+        // The participant's git state in it: a stash and a side-branch commit — HEAD back on main
+        // (= origin/main), so it reads as the image's clone and is adopted.
+        std::fs::write(clone.join("u.py"), "stashed edit\n").unwrap();
+        g(&clone, &["stash", "-q"]);
+        g(&clone, &["checkout", "-q", "-b", "side"]);
+        std::fs::write(clone.join("side.py"), "side\n").unwrap();
+        g(&clone, &["add", "side.py"]);
+        g(&clone, &["commit", "-q", "-m", "side work"]);
+        let side = g(&clone, &["rev-parse", "HEAD"]);
+        g(&clone, &["checkout", "-q", "main"]);
+        std::fs::write(clone.join("work.py"), "w\n").unwrap();
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.adopted.clone()), (Some(0), vec!["ex/clone".to_string()]), "{err}");
+        assert!(s.origin_tree("autocommit-x").iter().any(|(_, p)| p == "ex/clone/work.py"));
+        // Its git state is where it was…
+        assert!(g(&clone, &["stash", "list"]).contains("stash@{0}"));
+        assert_eq!(g(&clone, &["rev-parse", "side"]), side);
+        // …and the rsync tiers carry it: the big tier, the snapshot's (two passes), and the
+        // `pods replace` copy onto a new pod.
+        if fake_ssh::have_rsync() {
+            let fake = fake_ssh::install(&s.base);
+            let target =
+                crate::ssh::SshTarget { user: "root".into(), host: "pod".into(), port: 22, key_paths: vec![], connect_timeout_secs: 5 };
+            for (tier, pc) in [
+                ("big", crate::pull::PullConfig::big_tier()),
+                ("snapshot", crate::pull::PullConfig::small_tier("50M")),
+                ("replication", crate::pull::PullConfig::replication()),
+            ] {
+                let dest = s.base.join(format!("backup-{tier}"));
+                for pass in pc.passes() {
+                    let args = crate::pull::rsync_args(&target, &pass, &format!("{}/", dest.display()));
+                    fake_ssh::rsync(&fake_ssh::swap_transport(&args, &fake), &s.work);
+                }
+                let copy = dest.join("ex/clone");
+                let read = |args: &[&str]| {
+                    let o = std::process::Command::new("git").current_dir(&copy).args(args).output().unwrap();
+                    String::from_utf8_lossy(&o.stdout).trim().to_string()
+                };
+                assert!(read(&["stash", "list"]).contains("stash@{0}"), "{tier}: the stash is backed up");
+                assert_eq!(read(&["rev-parse", "side"]), side, "{tier}: the side branch is backed up");
+            }
+        }
+        // git run inside the exercise works on the clone, never on the course repo: a hard reset
+        // there leaves an uncommitted edit at the course repo's root alone.
+        let top = g(&clone, &["rev-parse", "--show-toplevel"]);
+        assert_eq!(std::fs::canonicalize(top).unwrap(), std::fs::canonicalize(&clone).unwrap());
+        std::fs::write(s.work.join("README.md"), "an uncommitted course-repo edit\n").unwrap();
+        g(&clone, &["reset", "-q", "--hard"]);
+        assert_eq!(std::fs::read_to_string(s.work.join("README.md")).unwrap(), "an uncommitted course-repo edit\n");
+    }
+
+    /// Pods backed up before this fix carry gitlinks in their history: adopting such a clone
     /// replaces the gitlink with its files.
     #[cfg(unix)]
     #[test]
     fn an_earlier_backups_gitlink_is_replaced_by_the_files() {
         let s = GitSandbox::new("gitlink", 1_000_000);
-        let upstream = s.base.join("upstream");
-        s.git(&s.base, &["init", "-q", upstream.to_str().unwrap()]);
-        std::fs::write(upstream.join("u.py"), "u\n").unwrap();
-        s.git(&upstream, &["-c", "user.name=u", "-c", "user.email=u@u", "add", "-A"]);
-        s.git(&upstream, &["-c", "user.name=u", "-c", "user.email=u@u", "commit", "-q", "-m", "u"]);
-        let clone = s.work.join("Grokking");
-        s.git(&s.base, &["clone", "-q", upstream.to_str().unwrap(), clone.to_str().unwrap()]);
+        let clone = s.clone_upstream("Grokking");
         s.git(&s.work, &["add", "-A"]); // the old backup: a gitlink
         s.git(&s.work, &["commit", "-q", "-m", "old backup"]);
         s.git(&s.work, &["push", "-q"]);
         assert!(s.origin_tree("autocommit-x").iter().any(|(m, p)| m == "160000" && p == "Grokking"));
         std::fs::write(clone.join("work.py"), "w\n").unwrap();
         let (code, r, err) = s.backup();
-        assert_eq!((code, r.folded.clone()), (Some(0), vec!["Grokking".to_string()]), "{err}");
+        assert_eq!((code, r.adopted.clone()), (Some(0), vec!["Grokking".to_string()]), "{err}");
         let tree = s.origin_tree("autocommit-x");
         assert!(!tree.iter().any(|(m, _)| m == "160000"), "{tree:?}");
         assert!(tree.iter().any(|(_, p)| p == "Grokking/work.py") && tree.iter().any(|(_, p)| p == "Grokking/u.py"), "{tree:?}");
+        assert!(clone.join(".git/HEAD").is_file());
     }
 
-    /// `set-branch main` would delete a folded clone's files (main doesn't track them) and break
+    /// `set-branch main` would delete an adopted clone's files (main doesn't track them) and break
     /// that exercise: they're put back, staged — and the switch back to the autocommit branch
-    /// goes through (untracked, they'd block it).
+    /// goes through (untracked, they'd block it). The clone's own repo never notices.
     #[cfg(unix)]
     #[test]
-    fn set_branch_keeps_folded_clones_on_disk_and_can_switch_back() {
+    fn set_branch_keeps_adopted_clones_on_disk_and_can_switch_back() {
         let s = GitSandbox::new("setbranch", 1_000_000);
-        let upstream = s.base.join("upstream");
-        s.git(&s.base, &["init", "-q", upstream.to_str().unwrap()]);
-        std::fs::write(upstream.join("u.py"), "u\n").unwrap();
-        s.git(&upstream, &["-c", "user.name=u", "-c", "user.email=u@u", "add", "-A"]);
-        s.git(&upstream, &["-c", "user.name=u", "-c", "user.email=u@u", "commit", "-q", "-m", "u"]);
-        let clone = s.work.join("exercises/solver");
-        s.git(&s.base, &["clone", "-q", upstream.to_str().unwrap(), clone.to_str().unwrap()]);
+        let clone = s.clone_upstream("exercises/solver");
         std::fs::write(clone.join("work.py"), "w\n").unwrap();
         let (code, r, err) = s.backup();
-        assert_eq!((code, r.folded.len()), (Some(0), 1), "{err}");
+        assert_eq!((code, r.adopted.len()), (Some(0), 1), "{err}");
         let run = |cmd: String| {
             let o = std::process::Command::new("bash").arg("-c").arg(cmd).output().unwrap();
             assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
@@ -743,12 +854,77 @@ mod tests {
             assert_eq!(std::fs::read_to_string(clone.join("work.py")).unwrap(), "w\n", "hard={hard}");
             assert!(clone.join("u.py").is_file());
             assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+            // The clone's own view: its files all there, its one untracked file the work.
+            assert_eq!(s.git(&clone, &["status", "--porcelain"]), "?? work.py", "hard={hard}");
             // …and back: the staged files ride along.
             let back = run(checkout_command(repo, "autocommit-x", None, false));
             assert!(!back.contains("RESTORED"), "{back}");
             assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "autocommit-x");
             assert!(s.git(&s.work, &["status", "--porcelain"]).is_empty(), "hard={hard}");
         }
+    }
+
+    /// GitHub refuses files over 100 MiB; the backup keeps files over 95 MiB out of its commits
+    /// (headroom). A file between the two committed by hand is one GitHub takes: the backup
+    /// pushes it — it used to call the branch stuck (judged by 95) and stop its git backup
+    /// until someone rewrote valid history. Over the real limit it's still stuck.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_between_the_skip_size_and_githubs_limit_committed_by_hand_is_pushed() {
+        let mut s = GitSandbox::new("between", 2000);
+        s.skip = 1000;
+        s.put("model_97mb.bin", 1500);
+        s.git(&s.work, &["add", "model_97mb.bin"]);
+        s.git(&s.work, &["commit", "-q", "-m", "by hand"]);
+        s.put("exercises/new_97mb.bin", 1500); // not committed: kept out (the headroom)
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome.clone()), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into()))), "{err}");
+        assert!(r.big_stuck.is_empty(), "{:?}", r.big_stuck);
+        assert_eq!(s.origin_blob_size("autocommit-x", "model_97mb.bin"), 1500);
+        assert_eq!(r.big_skipped, [(1500, "exercises/new_97mb.bin".to_string())]);
+        // Over GitHub's limit: stuck, as before.
+        s.put("huge.bin", 2500);
+        s.git(&s.work, &["add", "huge.bin"]);
+        s.git(&s.work, &["commit", "-q", "-m", "too big"]);
+        let (code, r, err) = s.backup();
+        assert_eq!(code, Some(BACKUP_STUCK_EXIT), "{err}");
+        assert_eq!(r.big_stuck, [(2500, "huge.bin".to_string())]);
+        assert!(err.contains("GH001"), "{err}");
+    }
+
+    /// The dry run's per-pod line pastes: next to the file its here-doc writes, it runs the
+    /// backup (here through a stand-in `ssh` running the remote command locally); without the
+    /// file the shell refuses to start it. The old line (`sh -c "$ARENA_BACKUP_SH" …`) expanded
+    /// to `sh -c ""` on the pod: nothing done, exit 0 — a paste that looked like a backup.
+    #[cfg(unix)]
+    #[test]
+    fn the_dry_run_line_pastes_and_fails_loudly_without_the_script() {
+        let s = GitSandbox::new("paste", 1_000_000);
+        s.put("exercises/notes.md", 20);
+        let target = crate::ssh::SshTarget {
+            user: "root".into(),
+            host: "1.2.3.4".into(),
+            port: 22001,
+            key_paths: vec!["/root/.ssh/devtest key".into()],
+            connect_timeout_secs: 10,
+        };
+        let line = backup_dry_run_line(&target, s.work.to_str().unwrap(), None, "arena backup");
+        // The stand-in: ssh's last argument is the remote command; stdin passes through.
+        let ssh = "ssh() { for a; do last=$a; done; sh -c \"$last\"; }";
+        let dir = s.base.join("paste");
+        std::fs::create_dir_all(&dir).unwrap();
+        let paste = |text: String| std::process::Command::new("bash").current_dir(&dir).arg("-c").arg(text).output().unwrap();
+        let o = paste(format!("{ssh}\n{line}"));
+        assert!(!o.status.success(), "no script file: must fail, not look like a backup");
+        assert!(String::from_utf8_lossy(&o.stderr).contains("arena-backup.sh"), "{}", String::from_utf8_lossy(&o.stderr));
+        assert!(!s.origin_tree("autocommit-x").iter().any(|(_, p)| p == "exercises/notes.md"));
+        let o = paste(format!("{ssh}\n{}\n{line}", backup_script_heredoc()));
+        let out = String::from_utf8_lossy(&o.stdout);
+        assert!(o.status.success() && out.contains("PUSHED autocommit-x"), "{out}{}", String::from_utf8_lossy(&o.stderr));
+        assert!(s.origin_tree("autocommit-x").iter().any(|(_, p)| p == "exercises/notes.md"));
+        assert!(line.starts_with("ssh ") && line.ends_with(" < arena-backup.sh"), "{line}");
+        assert!(line.contains(&format!("{GIT_MAX_FILE_BYTES} {GITHUB_FILE_LIMIT_BYTES}")), "{line}");
+        assert!(!BACKUP_SCRIPT.lines().any(|l| l == HEREDOC_END));
     }
 
     #[test]

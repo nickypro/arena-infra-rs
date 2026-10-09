@@ -213,6 +213,11 @@ impl DeepFacts {
         self.smi_gpus.or_else(|| (!self.gpus.is_empty()).then_some(self.gpus.len() as u32))
     }
 
+    /// torch imported, built without CUDA (`torch.version.cuda` is None: `torch_cuda=none`).
+    fn cpu_only_torch(&self) -> bool {
+        self.torch.as_deref() == Some("ok") && self.torch_cuda.as_deref() == Some("none")
+    }
+
     /// Why python facts may be missing: the step timed out / crashed / was cut off.
     fn python_cut(&self) -> String {
         match self.py_exit {
@@ -537,11 +542,12 @@ impl Check {
 #[serde(rename_all = "lowercase")]
 pub enum FailureKind {
     /// The machine: no driver / `nvidia-smi`, a driver below the floor, CUDA unavailable, the
-    /// wrong device count, a failing tensor op, broken peer copies or NCCL. Another host may
-    /// well pass.
+    /// wrong device count, a failing tensor op, broken peer copies or NCCL — and python dying
+    /// before it could say anything (timed out, OOM-killed, crashed). Another host may well pass.
     Host,
-    /// The software on it (image or setup): no python, torch missing or not importing, the
-    /// check script itself not running. A new pod from the same image fails the same way.
+    /// The software on it (image or setup), as the facts show it: no python, `import torch`
+    /// failing (python said so), a CPU-only torch on a GPU pod, the check script itself not
+    /// running. A new pod from the same image fails the same way.
     Software,
 }
 
@@ -554,14 +560,29 @@ impl FailureKind {
     }
 }
 
-/// The kind of failure a FAILed check named `name` reports ([`FailureKind`]). Only the checks
-/// that judge the image/setup are `Software`; everything else — the GPU/driver/CUDA checks, and
-/// any check this function doesn't know (a new one keeps the old "a FAIL is a bad host"
-/// meaning) — is `Host`.
-pub fn failure_kind_of(name: &str) -> FailureKind {
-    match name {
-        "torch" | "script" => FailureKind::Software,
-        _ => FailureKind::Host,
+/// The kind of failure a FAILed check named `name` reports ([`FailureKind`]), from the facts it
+/// was judged by. `Software` only where those facts put it on the image/setup:
+/// - `script`: the check script never started.
+/// - `torch`: python said so itself — no python on PATH, or `import torch` raised. When python
+///   never got to say (killed by its timeout or the OOM killer, a crash — SIGILL on a CPU
+///   without the instructions torch was built for, a segfault — or its output cut off), the
+///   machine is as likely as the image: `Host`, replaced like any bad host.
+/// - `cuda`: torch imported but is a CPU-only build (`torch.version.cuda` is None) — on a GPU
+///   pod every pod from that image fails the same way.
+///
+/// Everything else — the GPU/driver/CUDA checks, and any check this function doesn't know (a new
+/// one keeps the old "a FAIL is a bad host" meaning) — is `Host`.
+pub fn failure_kind_of(name: &str, facts: Option<&DeepFacts>) -> FailureKind {
+    let software = match (name, facts) {
+        ("script", _) => true,
+        ("torch", Some(f)) => f.python.as_deref() == Some("missing") || f.torch.as_deref().is_some_and(|t| t != "ok"),
+        ("cuda", Some(f)) => f.cpu_only_torch(),
+        _ => false,
+    };
+    if software {
+        FailureKind::Software
+    } else {
+        FailureKind::Host
     }
 }
 
@@ -661,6 +682,14 @@ fn evaluate_as(f: &DeepFacts, p: &HealthPolicy, maintenance: Option<&Maintenance
         out.push(match f.cuda_available {
             _ if !torch_ok => Check::new("cuda", Skip, "needs torch"),
             Some(true) => Check::new("cuda", Pass, "available"),
+            Some(false) if f.cpu_only_torch() => Check::new(
+                "cuda",
+                Fail,
+                format!(
+                    "torch {} is a CPU-only build (no CUDA in it) — the image/setup installed the wrong torch",
+                    f.torch_version.as_deref().unwrap_or("?")
+                ),
+            ),
             Some(false) => Check::new(
                 "cuda",
                 Fail,
@@ -1017,7 +1046,9 @@ impl PodHealth {
     /// `None` when nothing failed. A pod that couldn't be checked at all (`ssh`) is `Host` here
     /// — `up --check` never judges such a pod by its checks (it re-runs the check instead).
     pub fn failure_kind(&self) -> Option<FailureKind> {
-        let mut kinds = self.checks.iter().filter(|c| c.status == Status::Fail).map(|c| failure_kind_of(&c.name)).peekable();
+        let facts = self.facts.as_ref();
+        let mut kinds =
+            self.checks.iter().filter(|c| c.status == Status::Fail).map(|c| failure_kind_of(&c.name, facts)).peekable();
         kinds.peek()?;
         Some(if kinds.any(|k| k == FailureKind::Host) { FailureKind::Host } else { FailureKind::Software })
     }
@@ -1478,6 +1509,33 @@ deep_check_end=1
             &without(HEALTHY_2GPU, &["torch", "cuda_", "device_count", "tensor.", "peer.", "nccl", "py_"]),
             &[("python", Some("missing"))],
         );
+        // python gone before `import torch` could report (no torch line at all): killed by its
+        // 75s timeout (124) or the OOM killer (137), SIGILL (132), a segfault (139), cut off.
+        let py_died = |code: &str, stderr: &str| {
+            edit(
+                &without(HEALTHY_2GPU, &["torch", "cuda_", "device_count", "tensor.", "peer.", "nccl", "py_done"]),
+                &[("py_exit", Some(code)), ("py_stderr", Some(stderr))],
+            )
+        };
+        let (py_timeout_early, py_oom, py_sigill, py_segv, py_cut) = (
+            py_died("124", ""),
+            py_died("137", ""),
+            py_died("132", "Illegal instruction (core dumped)"),
+            py_died("139", "Segmentation fault (core dumped)"),
+            py_died("0", ""),
+        );
+        // A CPU-only torch on a GPU pod (the wrong wheel in the image/setup): with or without the
+        // error `torch.cuda.init()` raises.
+        let cpu_torch = edit(
+            &without(HEALTHY_2GPU, &["device_count", "tensor.", "peer.", "nccl"]),
+            &[
+                ("torch_version", Some("2.9.0+cpu")),
+                ("torch_cuda", Some("none")),
+                ("cuda_available", Some("false")),
+                ("cuda_error", Some("error: AssertionError: Torch not compiled with CUDA enabled")),
+            ],
+        );
+        let cpu_torch_quiet = edit(&cpu_torch, &[("cuda_error", None)]);
         let smi_missing = edit(
             &without(HEALTHY_2GPU, &["smi_", "gpu.", "tensor.", "peer.", "nccl"]),
             &[
@@ -1518,6 +1576,11 @@ deep_check_end=1
             ("torch missing: cuda unknown", &torch_missing, "cuda", Skip, "needs torch"),
             ("torch missing: nccl unknown", &torch_missing, "nccl", Skip, "needs CUDA"),
             ("no python", &no_python, "torch", Fail, "no python on PATH"),
+            ("python timed out before torch", &py_timeout_early, "torch", Fail, "python checks timed out"),
+            ("python SIGILL", &py_sigill, "torch", Fail, "python exited 132: Illegal instruction"),
+            ("python output cut", &py_cut, "torch", Fail, "python output cut off"),
+            ("cpu-only torch", &cpu_torch, "cuda", Fail, "torch 2.9.0+cpu is a CPU-only build"),
+            ("cpu-only torch, no error", &cpu_torch_quiet, "cuda", Fail, "CPU-only build"),
             ("nvidia-smi missing", &smi_missing, "nvidia-smi", Fail, "not found"),
             ("nvidia-smi missing: driver", &smi_missing, "driver", Skip, "needs nvidia-smi"),
             ("nvidia-smi missing: cuda", &smi_missing, "cuda", Fail, "Found no NVIDIA driver"),
@@ -1574,6 +1637,16 @@ deep_check_end=1
             ("torch missing on a CPU VM", &torch_missing, "hetzner", Software),
             ("no python", &no_python, "runpod", Software),
             ("no python on a CPU VM", &no_python, "hetzner", Software),
+            // python never said: the machine as likely as the image — replaced, as before.
+            ("python timed out before torch", &py_timeout_early, "runpod", Host),
+            ("python OOM-killed", &py_oom, "runpod", Host),
+            ("python SIGILL (old CPU)", &py_sigill, "runpod", Host),
+            ("python segfault", &py_segv, "runpod", Host),
+            ("python output cut off", &py_cut, "runpod", Host),
+            ("python timed out on a CPU VM", &py_timeout_early, "hetzner", Host),
+            // A CPU-only torch on a GPU pod: the image's, not the host's.
+            ("cpu-only torch", &cpu_torch, "runpod", Software),
+            ("cpu-only torch, no error", &cpu_torch_quiet, "vast", Software),
         ];
         for (label, out, provider, kind) in kinds {
             let p = Pod { provider: provider.to_string(), ..pod("apple", "1.2.3.4") };
@@ -1586,7 +1659,7 @@ deep_check_end=1
         assert_eq!(PodHealth::checked(&pod("apple", "1.2.3.4"), parse_deep(HEALTHY_2GPU), &cuda13()).failure_kind(), None);
         assert_eq!(PodHealth::unreachable(&pod("apple", "1.2.3.4"), "timed out").failure_kind(), Some(Host));
         // Unknown check names keep the old meaning of a FAIL (the machine).
-        assert_eq!(failure_kind_of("some_future_check"), Host);
+        assert_eq!(failure_kind_of("some_future_check", Some(&parse_deep(&torch_missing))), Host);
     }
 
     #[test]

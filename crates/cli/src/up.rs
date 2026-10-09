@@ -15,10 +15,11 @@
 //! no attempt left to replace it: it was never set up, and its machine is known bad). Only a
 //! check whose script actually ran can condemn a host: one that couldn't run (SSH dropped,
 //! timed out) is retried once, then FAILs the name with the pod left running. A FAIL that is
-//! only software/setup (torch missing or not importing) is never replaced — the new pod would
-//! boot the same image and fail the same way — so the name FAILs at once, pod left running,
-//! its machine not counted as bad. Ctrl+C stops
-//! every pipeline where it is and launches nothing new; nothing is terminated because of it.
+//! only software/setup (python reporting that torch is missing or doesn't import, a CPU-only
+//! torch) is never replaced — the new pod would boot the same image and fail the same way — so
+//! the name FAILs at once, pod left running, its machine not counted as bad; python dying
+//! before it could report (timeout, OOM, crash) is a host failure. Ctrl+C stops every
+//! pipeline where it is and launches nothing new; nothing is terminated because of it.
 //!
 //! Concurrency is cooperative, on this one task: the pipelines borrow the fleet provider,
 //! so they can't be spawned, and [`join_unordered`] drives them side by side instead —
@@ -1627,6 +1628,39 @@ mod tests {
         let summary = pipeline::render_up_summary(&rows);
         assert!(summary.contains("devtest-apple: FAILED check — software/setup failure, not the host — torch: "), "{summary}");
         assert!(conclude(&rows, &|_, _| {}).is_err());
+    }
+
+    /// python killed by its 75s timeout before `import torch` could report (a hung or overloaded
+    /// host as likely as the image; OOM kills and SIGILL on an old CPU look the same): a host
+    /// failure, so the pod is replaced — it used to count as software (torch FAILed) and was left
+    /// running, billed, with "replacing it won't help".
+    #[tokio::test(start_paused = true)]
+    async fn python_dying_before_torch_reports_is_a_host_failure_and_replaced() {
+        let timed_out = DEEP_HEALTHY
+            .lines()
+            .filter(|l| !["torch", "cuda_", "device_count", "tensor.", "peer.", "nccl", "py_"].iter().any(|p| l.starts_with(p)))
+            .map(|l| if l == "deep_check_end=1" { "py_exit=124\ndeep_check_end=1".to_string() } else { l.to_string() })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 0), ("10.0.0.2", 22002, 30)])]);
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host("10.0.0.1", 22001), [FakeReply::ok(), FakeReply::ok(), FakeReply::stdout(&timed_out)]);
+        fake.script(&host("10.0.0.2", 22002), [FakeReply::ok(), FakeReply::ok(), healthy()]);
+        let keys = keys_dir("pydied");
+        let cfg = cfg(None);
+        let run = up_run(&fleet, fake.clone(), &cfg, true, Some(2), Some(&keys.0)).await;
+        let made = make(&fleet, &["apple"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+
+        assert_eq!(
+            fleet.events(),
+            [format!("create devtest-apple {A4000}"), "terminate id1".to_string(), format!("create devtest-apple {R3090}")]
+        );
+        lines.find("[devtest-apple] check: FAIL (host) — torch: python checks timed out");
+        assert!(!lines.all().iter().any(|l| l.contains("software/setup")), "{:#?}", lines.all());
+        assert_eq!(rows[0].verdict, Verdict::Ready);
+        assert_eq!(rows[0].attempts.len(), 2);
     }
 
     /// `up --check` records the standing pod's check for `arena snapshot`; the pod it
