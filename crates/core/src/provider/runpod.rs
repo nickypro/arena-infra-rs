@@ -35,6 +35,24 @@ fn graphql_request(client: &Client, api_key: &str, body: &Value) -> RequestBuild
     client.post(GRAPHQL).bearer_auth(api_key).json(body)
 }
 
+/// The account-balance query ([`crate::balance`]): only the numeric and boolean balance
+/// fields, each checked live — no id, no email. Kept apart from `POD_DETAILS_QUERY`:
+/// GraphQL rejects a whole query over one unknown field, so balance drift must never blank
+/// the maintenance column, nor the reverse.
+pub(crate) const BALANCE_QUERY_FULL: &str = "{ myself { clientBalance currentSpendPerHr spendLimit underBalance } }";
+
+/// The fallback when [`BALANCE_QUERY_FULL`] is rejected over a field RunPod dropped: the
+/// balance alone, so a schema trim costs the extras, never the balance.
+pub(crate) const BALANCE_QUERY_MINIMAL: &str = "{ myself { clientBalance } }";
+
+/// The balance query as a request to `url` (the GraphQL endpoint, or a loopback test
+/// server): a POST with bearer auth — the key never in the URL — and a *query*, never a
+/// mutation. Built apart from sending so a test pins all of that without a network call.
+pub(crate) fn balance_request(client: &Client, url: &str, api_key: &str, minimal: bool) -> RequestBuilder {
+    let query = if minimal { BALANCE_QUERY_MINIMAL } else { BALANCE_QUERY_FULL };
+    client.post(url).bearer_auth(api_key).json(&json!({ "query": query }))
+}
+
 /// POST one GraphQL request and return the decoded body. Checks only the HTTP status
 /// (first, before decoding — see [`crate::http`]): a GraphQL error still comes back as HTTP
 /// 200, and whether `errors` is fatal depends on the caller (a mutation must fail on any; a
@@ -1005,6 +1023,22 @@ mod tests {
         assert!(req.url().query().is_none());
         assert_eq!(req.headers()["authorization"], "Bearer rpa_SECRET");
         assert_eq!(req.method(), reqwest::Method::POST);
+    }
+
+    /// The balance query is built the same way: key in the header only, a query (never a
+    /// mutation), the full or the minimal field set.
+    #[test]
+    fn balance_request_keeps_key_out_of_url() {
+        for (minimal, query) in [(false, BALANCE_QUERY_FULL), (true, BALANCE_QUERY_MINIMAL)] {
+            let req = balance_request(&Client::new(), GRAPHQL, "rpa_SECRET", minimal).build().unwrap();
+            assert_eq!(req.url().as_str(), "https://api.runpod.io/graphql");
+            assert!(!req.url().as_str().contains("SECRET") && req.url().query().is_none());
+            assert_eq!(req.headers()["authorization"], "Bearer rpa_SECRET");
+            assert_eq!(req.method(), reqwest::Method::POST);
+            let body: Value = serde_json::from_slice(req.body().and_then(|b| b.as_bytes()).unwrap()).unwrap();
+            assert_eq!(body, json!({ "query": query }));
+            assert!(!query.contains("mutation") && query.contains("clientBalance"));
+        }
     }
 
     #[test]

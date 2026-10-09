@@ -52,6 +52,8 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use async_trait::async_trait;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -1782,6 +1784,451 @@ pub fn save(state: &BalanceState, path: &Path) -> std::io::Result<()> {
     crate::snapshot::write_atomic(path, to_json(state).as_bytes(), 0o600)
 }
 
+/// Record into the state file at `path`: reload it under an exclusive `flock` on the state
+/// directory (the lock the health cache takes too), apply `f`, save atomically (0600). So
+/// the TUI and a CLI recording at once merge rather than overwrite each other — at worst
+/// one sample is lost. `Ok` carries the state written and the load warning, if the old
+/// file had to be ignored.
+pub fn record(path: &Path, f: impl FnOnce(BalanceState) -> BalanceState) -> std::io::Result<(BalanceState, Option<String>)> {
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    crate::snapshot::create_private_dir(dir)?;
+    // Best effort: a filesystem without flock still gets the atomic write.
+    let lock = std::fs::File::open(dir).ok().filter(|f| f.lock().is_ok());
+    let (state, warning) = load(path);
+    let next = f(state);
+    let saved = save(&next, path);
+    drop(lock);
+    saved.map(|()| (next, warning))
+}
+
+/// `arena balance set`: a manual anchor for `account`, scoped by the key's fingerprint (an
+/// entry for another key is replaced, never edited). Returns the anchor it replaced, for
+/// "old → new". The next live reading replaces it in turn.
+pub fn record_manual(
+    path: &Path,
+    account: Account,
+    key_fp: &str,
+    usd: f64,
+    now: u64,
+) -> std::io::Result<(Option<Anchor>, BalanceState, Option<String>)> {
+    let mut old = None;
+    let (state, warning) = record(path, |mut s| {
+        s.version = STATE_VERSION;
+        let st = s.accounts.entry(account).or_insert_with(|| AccountState::new(key_fp));
+        if st.key_fp != key_fp {
+            *st = AccountState::new(key_fp);
+        }
+        old = st.anchor;
+        st.anchor = Some(Anchor { usd, at: now, source: AnchorSource::Manual });
+        st.billed_max = None;
+        s
+    })?;
+    Ok((old, state, warning))
+}
+
+/// After an observation: record it (modes that write, with a state file) and return the
+/// state to build views from. Without a state file, or when the write fails, it is applied
+/// in memory — the surface still shows what it saw — and the second value is the warning
+/// (which only `arena balance` prints: everywhere else a balance problem is silent).
+pub fn commit(
+    path: Option<&Path>,
+    loaded: BalanceState,
+    fetched: &[Fetched],
+    burns: &Burns,
+    mode: Mode,
+    now: u64,
+) -> (BalanceState, Option<String>) {
+    if !mode.writes() {
+        return (loaded, None);
+    }
+    let Some(path) = path else {
+        return (apply(loaded, fetched, burns, mode, now), None);
+    };
+    match record(path, |s| apply(s, fetched, burns, mode, now)) {
+        Ok(done) => done,
+        Err(e) => (
+            apply(loaded, fetched, burns, mode, now),
+            Some(format!("warning: couldn't save the balance state {}: {e}", path.display())),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// The balance API
+// ---------------------------------------------------------------------------------------
+
+/// The reads, behind a seam: [`HttpBalanceApi`] for real, [`FakeBalanceApi`] in tests.
+#[async_trait]
+pub trait BalanceApi: Send + Sync {
+    /// The prepaid accounts with a configured key, and their fingerprints. Makes no request.
+    fn accounts(&self) -> Vec<(Account, String)>;
+    /// One live reading. RunPod: the full query, then the minimal one when a field was
+    /// dropped (`reduced`). (A future REST balance endpoint goes here, tried first — the
+    /// chain doesn't change.)
+    async fn live(&self, account: Account) -> Result<Live, Fail>;
+    /// RunPod's hourly billing history from `from_hour` to `to`.
+    async fn billed(&self, from_hour: u64, to: u64) -> Result<Billed, Fail>;
+}
+
+/// The real reads: one GraphQL *query* (never a mutation) and two GETs, the keys in the
+/// bearer header only, to fixed hosts — redirecting a key elsewhere is never configurable.
+pub struct HttpBalanceApi {
+    client: Client,
+    runpod_key: Option<String>,
+    vast_key: Option<String>,
+    graphql_url: String,
+    v2_base: String,
+    vast_base: String,
+}
+
+impl HttpBalanceApi {
+    pub fn from_config(cfg: &Config) -> Self {
+        let key = |a: Account| cfg.get(a.key_name()).map(str::trim).filter(|k| !k.is_empty()).map(String::from);
+        HttpBalanceApi {
+            client: Client::new(),
+            runpod_key: key(Account::Runpod),
+            vast_key: key(Account::Vast),
+            graphql_url: crate::provider::runpod::GRAPHQL.to_string(),
+            v2_base: crate::provider::runpod_v2::BASE.to_string(),
+            vast_base: crate::provider::vast::BASE.to_string(),
+        }
+    }
+
+    /// The same reads against loopback test servers (one per endpoint, so concurrent
+    /// requests can't take each other's canned answers).
+    #[cfg(test)]
+    fn with_bases(graphql_url: &str, v2_base: &str, vast_base: &str, runpod_key: Option<&str>, vast_key: Option<&str>) -> Self {
+        HttpBalanceApi {
+            client: crate::http::test_server::client(),
+            runpod_key: runpod_key.map(String::from),
+            vast_key: vast_key.map(String::from),
+            graphql_url: graphql_url.into(),
+            v2_base: v2_base.into(),
+            vast_base: vast_base.into(),
+        }
+    }
+
+    fn key(&self, a: Account) -> Option<&str> {
+        match a {
+            Account::Runpod => self.runpod_key.as_deref(),
+            Account::Vast => self.vast_key.as_deref(),
+        }
+    }
+
+    async fn runpod_myself(&self, key: &str, minimal: bool) -> Result<Live, Fail> {
+        let rb = crate::provider::runpod::balance_request(&self.client, &self.graphql_url, key, minimal);
+        fetch(rb).await.and_then(|v| parse_runpod_myself(&v))
+    }
+}
+
+/// Send, then [`classify`]. A transport failure is transient, in our words (reqwest's own
+/// message names the URL — no key there, but no reason to print it either).
+async fn fetch(rb: reqwest::RequestBuilder) -> Result<Value, Fail> {
+    match crate::http::send_text(rb).await {
+        Ok((status, text)) => classify(status.as_u16(), &text),
+        Err(_) => Err(Fail::transient("no answer (network error)")),
+    }
+}
+
+#[async_trait]
+impl BalanceApi for HttpBalanceApi {
+    fn accounts(&self) -> Vec<(Account, String)> {
+        Account::ALL.into_iter().filter_map(|a| self.key(a).map(|k| (a, key_fp(k)))).collect()
+    }
+
+    async fn live(&self, account: Account) -> Result<Live, Fail> {
+        let Some(key) = self.key(account) else {
+            return Err(Fail::new(FailKind::Auth, None, "no API key configured"));
+        };
+        match account {
+            Account::Runpod => match self.runpod_myself(key, false).await {
+                Err(f) if wants_minimal_retry(&f) => {
+                    self.runpod_myself(key, true).await.map(|l| Live { reduced: true, ..l })
+                }
+                r => r,
+            },
+            Account::Vast => {
+                let rb = crate::provider::vast::user_request(&self.client, &self.vast_base, key);
+                // Vast's body is never quoted: an error status keeps its kind and code only.
+                fetch(rb)
+                    .await
+                    .map_err(|f| match f.http {
+                        Some(h) if !(200..300).contains(&h) => Fail { detail: None, ..f },
+                        _ => f,
+                    })
+                    .and_then(|v| parse_vast_user(&v))
+            }
+        }
+    }
+
+    async fn billed(&self, from_hour: u64, to: u64) -> Result<Billed, Fail> {
+        let Some(key) = self.runpod_key.as_deref() else {
+            return Err(Fail::new(FailKind::Auth, None, "no API key configured"));
+        };
+        let rb = crate::provider::runpod_v2::billing_request(&self.client, &self.v2_base, key, from_hour, to);
+        fetch(rb).await.and_then(|v| parse_billing(&v))
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Observing
+// ---------------------------------------------------------------------------------------
+
+/// Whether an inline surface should try live now: never tried, the last attempt (success
+/// or failure) at least [`FRESH`] ago, or one from the future (the clock went back).
+fn live_due(st: Option<&AccountState>, now: u64) -> bool {
+    match st.and_then(AccountState::last_live_attempt) {
+        None => true,
+        Some(t) => t > now.saturating_add(CLOCK_SKEW) || now.saturating_sub(t) >= FRESH,
+    }
+}
+
+/// Where RunPod's billing history is needed from: the hour of the usable anchor — and, for
+/// `arena balance`, of the check anchor too. `None`: nothing to count down from.
+fn billing_from(account: Account, st: Option<&AccountState>, mode: Mode, now: u64) -> Option<u64> {
+    if account != Account::Runpod {
+        return None;
+    }
+    let st = st?;
+    let check = if mode == Mode::Full { st.check_anchor } else { None };
+    [st.anchor, check].into_iter().flatten().filter(|a| a.usable(now)).map(|a| a.at.min(now)).min().map(floor_hour)
+}
+
+/// `fut`, or a transient failure once `deadline` passes.
+async fn within<T>(deadline: tokio::time::Instant, fut: impl std::future::Future<Output = Result<T, Fail>>) -> Result<T, Fail> {
+    match tokio::time::timeout_at(deadline, fut).await {
+        Ok(r) => r,
+        Err(_) => Err(Fail::transient("no answer in time")),
+    }
+}
+
+/// Observe every configured account at once, the whole of it within `limit`, as `mode`
+/// says: **inline** — live only when the last attempt is [`FRESH`] old, billing only while
+/// live is failing (alongside it when it was already failing, after it when it just
+/// failed); **full** — live, with billing alongside whenever there is an anchor; **no-live**
+/// — billing only; **cache-only** — nothing (configured accounts, nothing fetched). Never
+/// fails: whatever didn't answer in time is a transient failure.
+pub async fn observe(api: &dyn BalanceApi, state: &BalanceState, mode: Mode, limit: std::time::Duration, now: u64) -> Vec<Fetched> {
+    let deadline = tokio::time::Instant::now() + limit;
+    let accounts = api.accounts();
+    let one = |a: Account| {
+        let found = accounts.iter().find(|(x, _)| *x == a).cloned();
+        async move {
+            let (a, fp) = found?;
+            let st = state.get(a, &fp);
+            Some(observe_one(api, a, fp.clone(), st, mode, deadline, now).await)
+        }
+    };
+    let (runpod, vast) = tokio::join!(one(Account::Runpod), one(Account::Vast));
+    [runpod, vast].into_iter().flatten().collect()
+}
+
+/// [`observe`] for one account (the `create`/`up` preflight, which concerns only the target
+/// provider's): `None` when it isn't configured.
+pub async fn observe_account(
+    api: &dyn BalanceApi,
+    state: &BalanceState,
+    account: Account,
+    mode: Mode,
+    limit: std::time::Duration,
+    now: u64,
+) -> Option<Fetched> {
+    let deadline = tokio::time::Instant::now() + limit;
+    let (a, fp) = api.accounts().into_iter().find(|(a, _)| *a == account)?;
+    let st = state.get(a, &fp);
+    Some(observe_one(api, a, fp.clone(), st, mode, deadline, now).await)
+}
+
+async fn observe_one(
+    api: &dyn BalanceApi,
+    account: Account,
+    key_fp: String,
+    st: Option<&AccountState>,
+    mode: Mode,
+    deadline: tokio::time::Instant,
+    now: u64,
+) -> Fetched {
+    let mut f = Fetched::nothing(account, key_fp);
+    let from = billing_from(account, st, mode, now);
+    let live = || within(deadline, api.live(account));
+    let billed = |from: u64| within(deadline, api.billed(from, now));
+    match mode {
+        Mode::CacheOnly => {}
+        Mode::NoLive => {
+            if let Some(from) = from {
+                f.billed = Some(billed(from).await);
+            }
+        }
+        Mode::Full => match from {
+            Some(from) => {
+                let (l, b) = tokio::join!(live(), billed(from));
+                (f.live, f.billed) = (Some(l), Some(b));
+            }
+            None => f.live = Some(live().await),
+        },
+        Mode::Inline => {
+            let failing = st.is_some_and(|s| s.live_fail.is_some());
+            match (live_due(st, now), from) {
+                // Within FRESH of a failed attempt: the estimate needs billing, not live.
+                (false, Some(from)) if failing => f.billed = Some(billed(from).await),
+                (false, _) => {}
+                (true, Some(from)) if failing => {
+                    let (l, b) = tokio::join!(live(), billed(from));
+                    (f.live, f.billed) = (Some(l), Some(b));
+                }
+                (true, from) => {
+                    let l = live().await;
+                    let failed = l.is_err();
+                    f.live = Some(l);
+                    if let (true, Some(from)) = (failed, from) {
+                        if tokio::time::Instant::now() < deadline {
+                            f.billed = Some(billed(from).await);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    f
+}
+
+// ---------------------------------------------------------------------------------------
+// The fake
+// ---------------------------------------------------------------------------------------
+
+#[cfg(any(test, feature = "test-util"))]
+pub use fake::FakeBalanceApi;
+
+#[cfg(any(test, feature = "test-util"))]
+mod fake {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    #[derive(Clone)]
+    enum Answer<T> {
+        Give(Result<T, Fail>),
+        Stall,
+    }
+
+    /// A scripted [`BalanceApi`] for tests (here and, via the `test-util` feature, in the CLI
+    /// and TUI): standing answers per account, call counts — and [`FakeBalanceApi::panicking`]
+    /// for surfaces that must make no call at all.
+    #[derive(Default)]
+    pub struct FakeBalanceApi {
+        accounts: Vec<(Account, String)>,
+        live: Mutex<BTreeMap<Account, Answer<Live>>>,
+        billed: Mutex<Option<Answer<Billed>>>,
+        live_calls: AtomicUsize,
+        billed_calls: AtomicUsize,
+        billed_args: Mutex<Vec<(u64, u64)>>,
+        panics: bool,
+    }
+
+    impl FakeBalanceApi {
+        /// No account configured.
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// The fingerprint a fake account's key has.
+        pub fn fp(account: Account) -> String {
+            key_fp(&format!("fake-{}-key", account.name()))
+        }
+
+        /// `account` configured (its live answer unscripted: a transient failure).
+        pub fn with(mut self, account: Account) -> Self {
+            if !self.accounts.iter().any(|(a, _)| *a == account) {
+                self.accounts.push((account, Self::fp(account)));
+                self.accounts.sort();
+            }
+            self
+        }
+
+        fn answer_live(self, account: Account, a: Answer<Live>) -> Self {
+            self.live.lock().unwrap().insert(account, a);
+            self.with(account)
+        }
+
+        pub fn live_ok(self, account: Account, live: Live) -> Self {
+            self.answer_live(account, Answer::Give(Ok(live)))
+        }
+
+        pub fn live_err(self, account: Account, fail: Fail) -> Self {
+            self.answer_live(account, Answer::Give(Err(fail)))
+        }
+
+        /// Live never answers.
+        pub fn live_stall(self, account: Account) -> Self {
+            self.answer_live(account, Answer::Stall)
+        }
+
+        pub fn billed_ok(self, b: Billed) -> Self {
+            *self.billed.lock().unwrap() = Some(Answer::Give(Ok(b)));
+            self
+        }
+
+        pub fn billed_err(self, fail: Fail) -> Self {
+            *self.billed.lock().unwrap() = Some(Answer::Give(Err(fail)));
+            self
+        }
+
+        pub fn billed_stall(self) -> Self {
+            *self.billed.lock().unwrap() = Some(Answer::Stall);
+            self
+        }
+
+        /// Any live or billing call panics: the surface must make none.
+        pub fn panicking(mut self) -> Self {
+            self.panics = true;
+            self
+        }
+
+        pub fn live_calls(&self) -> usize {
+            self.live_calls.load(Ordering::SeqCst)
+        }
+
+        pub fn billed_calls(&self) -> usize {
+            self.billed_calls.load(Ordering::SeqCst)
+        }
+
+        /// Each billing call's `(from_hour, to)`.
+        pub fn billed_args(&self) -> Vec<(u64, u64)> {
+            self.billed_args.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl BalanceApi for FakeBalanceApi {
+        fn accounts(&self) -> Vec<(Account, String)> {
+            self.accounts.clone()
+        }
+
+        async fn live(&self, account: Account) -> Result<Live, Fail> {
+            assert!(!self.panics, "this surface must make no balance call (live {account:?})");
+            self.live_calls.fetch_add(1, Ordering::SeqCst);
+            let answer = self.live.lock().unwrap().get(&account).cloned();
+            match answer {
+                Some(Answer::Give(r)) => r,
+                Some(Answer::Stall) => std::future::pending().await,
+                None => Err(Fail::transient("no answer scripted")),
+            }
+        }
+
+        async fn billed(&self, from_hour: u64, to: u64) -> Result<Billed, Fail> {
+            assert!(!self.panics, "this surface must make no balance call (billing)");
+            self.billed_calls.fetch_add(1, Ordering::SeqCst);
+            self.billed_args.lock().unwrap().push((from_hour, to));
+            let answer = self.billed.lock().unwrap().clone();
+            match answer {
+                Some(Answer::Give(r)) => r,
+                Some(Answer::Stall) => std::future::pending().await,
+                None => Err(Fail::transient("no answer scripted")),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2749,5 +3196,393 @@ mod tests {
         // Unsorted samples from a hand edit are put back in order.
         std::fs::write(&path, r#"{"version":1,"accounts":{"vast":{"key_fp":"x","samples":[[5,1.0],[2,0.5],[5,9.0]]}}}"#).unwrap();
         assert_eq!(load(&path).0.accounts[&Account::Vast].samples, vec![(2, 0.5), (5, 1.0)]);
+    }
+
+    // ---- I/O: the HTTP reads over a loopback server, observe, record ----
+
+    use crate::http::test_server::{canned, hang_up, serve, stall, Server};
+    use crate::provider::runpod::{BALANCE_QUERY_FULL, BALANCE_QUERY_MINIMAL};
+
+    const RP_KEY: &str = "rpa_SECRETKEY0123";
+    const VAST_KEY: &str = "VASTSECRETKEY0123";
+    const JSON: &str = "application/json";
+
+    /// One server per endpoint, so concurrent requests can't take each other's answers.
+    fn api_at(gql: &Server, v2: &Server, vast: &Server) -> HttpBalanceApi {
+        HttpBalanceApi::with_bases(
+            &format!("{}/graphql", gql.base),
+            &format!("{}/v2", v2.base),
+            &format!("{}/api/v0", vast.base),
+            Some(RP_KEY),
+            Some(VAST_KEY),
+        )
+    }
+
+    fn bodies(s: &Server) -> Vec<Value> {
+        s.bodies.lock().unwrap().iter().map(|b| serde_json::from_str(b).unwrap_or(Value::Null)).collect()
+    }
+
+    fn minimal_body(usd: &str) -> String {
+        json!({"data": {"myself": {"clientBalance": usd}}}).to_string()
+    }
+
+    /// A state where RunPod (this API's key) has a usable anchor — and a check anchor.
+    fn anchored_for(api: &dyn BalanceApi, age: u64) -> BalanceState {
+        let mut s = BalanceState::default();
+        for (a, fp) in api.accounts() {
+            let anchor = Some(Anchor { usd: 50.0, at: NOW - age, source: AnchorSource::Live });
+            s.accounts.insert(a, AccountState { key_fp: fp, anchor, check_anchor: anchor, ..Default::default() });
+        }
+        s
+    }
+
+    #[tokio::test]
+    async fn runpod_full_then_minimal_on_unknown_field() {
+        // The validation error as HTTP 400 (and as a 200 with `errors`, the other form).
+        for status in [400, 200] {
+            let gql = serve(vec![
+                canned(status, JSON, &fixture("runpod_myself_unknown_field").to_string()),
+                canned(200, JSON, &minimal_body("32.54")),
+            ]);
+            let (v2, vast) = (serve(vec![]), serve(vec![]));
+            let l = api_at(&gql, &v2, &vast).live(Account::Runpod).await.unwrap();
+            assert_eq!(l, Live { reduced: true, ..live(32.54, None) }, "{status}");
+            let sent = bodies(&gql);
+            assert_eq!(sent, [json!({"query": BALANCE_QUERY_FULL}), json!({"query": BALANCE_QUERY_MINIMAL})], "exactly two requests, the second minimal");
+        }
+        // The full query working: one request, every field.
+        let gql = serve(vec![canned(200, JSON, &fixture("runpod_myself").to_string())]);
+        let (v2, vast) = (serve(vec![]), serve(vec![]));
+        let l = api_at(&gql, &v2, &vast).live(Account::Runpod).await.unwrap();
+        assert_eq!((l.usd, l.provider_burn_per_hr, l.reduced), (32.54, Some(0.47), false));
+        assert_eq!(bodies(&gql).len(), 1);
+        // Any other failure isn't retried with the minimal query.
+        let gql = serve(vec![canned(502, "text/html", "<html>Bad Gateway</html>"), canned(200, JSON, &minimal_body("1"))]);
+        let (v2, vast) = (serve(vec![]), serve(vec![]));
+        let f = api_at(&gql, &v2, &vast).live(Account::Runpod).await.unwrap_err();
+        assert_eq!((f.kind, f.http, f.detail), (FailKind::Transient, Some(502), None));
+        assert_eq!(bodies(&gql).len(), 1);
+        // The minimal query failing too: its failure is the answer.
+        let gone_too = json!({"errors": [{"message": "Cannot query field \"clientBalance\" on type \"User\"."}]}).to_string();
+        let gql = serve(vec![canned(400, JSON, &gone_too), canned(400, JSON, &gone_too)]);
+        let (v2, vast) = (serve(vec![]), serve(vec![]));
+        let f = api_at(&gql, &v2, &vast).live(Account::Runpod).await.unwrap_err();
+        assert!(f.kind == FailKind::Drift && f.detail.unwrap().contains("clientBalance"));
+        assert_eq!(bodies(&gql).len(), 2);
+    }
+
+    #[test]
+    fn billing_and_user_requests_keep_keys_out_of_urls() {
+        let c = reqwest::Client::new();
+        let req = crate::provider::runpod_v2::billing_request(&c, "https://api.runpod.io/v2/", "rpa_SECRET", NOW - 2 * H, NOW + 5)
+            .build()
+            .unwrap();
+        assert_eq!(req.method(), reqwest::Method::GET);
+        assert_eq!(
+            req.url().as_str(),
+            "https://api.runpod.io/v2/billing?bucketSize=hour&startTime=2026-10-08T10%3A00%3A00Z&endTime=2026-10-08T12%3A00%3A05Z"
+        );
+        assert_eq!(req.headers()["authorization"], "Bearer rpa_SECRET");
+        let req = crate::provider::vast::user_request(&c, "https://console.vast.ai/api/v0", "VSECRET").build().unwrap();
+        assert_eq!((req.method(), req.url().as_str()), (&reqwest::Method::GET, "https://console.vast.ai/api/v0/users/current/"));
+        assert_eq!(req.headers()["authorization"], "Bearer VSECRET");
+        for r in [&req] {
+            assert!(!r.url().as_str().contains("SECRET") && r.body().is_none());
+        }
+    }
+
+    /// Invariant 1: every request the HTTP API sends is a GraphQL POST of a *query* (no
+    /// `mutation`), or one of the two GETs — keys only in the header.
+    #[tokio::test]
+    async fn only_reads() {
+        let gql = serve(vec![
+            canned(400, JSON, &fixture("runpod_myself_unknown_field").to_string()),
+            canned(200, JSON, &minimal_body("5")),
+            canned(200, JSON, &fixture("runpod_myself").to_string()),
+        ]);
+        let v2 = serve(vec![canned(200, JSON, &fixture("billing_hourly_openapi").to_string())]);
+        let vast = serve(vec![canned(200, JSON, &fixture("vast_user_canary").to_string())]);
+        let api = api_at(&gql, &v2, &vast);
+        api.live(Account::Runpod).await.unwrap();
+        api.live(Account::Runpod).await.unwrap();
+        api.billed(NOW - 2 * H, NOW).await.unwrap();
+        api.live(Account::Vast).await.unwrap();
+        let lines = |s: &Server| s.requests.lock().unwrap().clone();
+        assert!(lines(&gql).iter().all(|l| l == "POST /graphql HTTP/1.1"), "{:?}", lines(&gql));
+        for b in bodies(&gql) {
+            let q = b.as_object().filter(|o| o.len() == 1).and_then(|o| o["query"].as_str()).unwrap_or_else(|| panic!("{b}"));
+            assert!(q.trim_start().starts_with('{') && !q.contains("mutation"), "{q}");
+        }
+        assert!(lines(&v2).iter().all(|l| l.starts_with("GET /v2/billing?bucketSize=hour&")), "{:?}", lines(&v2));
+        assert_eq!(lines(&vast), ["GET /api/v0/users/current/ HTTP/1.1"]);
+        for s in [&gql, &v2, &vast] {
+            assert!(lines(s).iter().all(|l| !l.contains("SECRET")));
+            for h in s.headers.lock().unwrap().iter() {
+                assert!(h.iter().any(|l| l.to_ascii_lowercase().starts_with("authorization: bearer ")), "{h:?}");
+            }
+        }
+        assert!(bodies(&v2).iter().chain(bodies(&vast).iter()).all(Value::is_null), "the GETs carry no body");
+    }
+
+    /// Invariant 3: with servers that never answer, an inline observation returns within
+    /// INLINE_TIMEOUT + 1 s and `arena balance`'s within COMMAND_TIMEOUT + 1 s, every read a
+    /// transient failure.
+    #[tokio::test]
+    async fn stall_is_transient_within_limit() {
+        let stalled = || (serve(vec![stall(), stall()]), serve(vec![stall()]), serve(vec![stall()]));
+        let (g1, b1, v1) = stalled();
+        let (g2, b2, v2) = stalled();
+        let (inline_api, full_api) = (api_at(&g1, &b1, &v1), api_at(&g2, &b2, &v2));
+        let full_state = anchored_for(&full_api, 2 * H);
+        async fn timed(api: &HttpBalanceApi, state: BalanceState, mode: Mode, limit: std::time::Duration) -> (Vec<Fetched>, std::time::Duration) {
+            let t = std::time::Instant::now();
+            let got = observe(api, &state, mode, limit, NOW).await;
+            (got, t.elapsed())
+        }
+        let ((inline, ti), (full, tf)) = tokio::join!(
+            timed(&inline_api, BalanceState::default(), Mode::Inline, INLINE_TIMEOUT),
+            timed(&full_api, full_state, Mode::Full, COMMAND_TIMEOUT),
+        );
+        let second = std::time::Duration::from_secs(1);
+        assert!(ti < INLINE_TIMEOUT + second, "inline took {ti:?}");
+        assert!(tf < COMMAND_TIMEOUT + second, "full took {tf:?}");
+        assert_eq!(inline.len(), 2);
+        assert!(full.iter().any(|f| f.billed.is_some()), "the full run fetched billing too");
+        for f in inline.iter().chain(full.iter()) {
+            for r in [f.live.as_ref().map(|r| r.as_ref().err()), f.billed.as_ref().map(|r| r.as_ref().err())].into_iter().flatten() {
+                assert_eq!(r.map(|e| e.kind), Some(FailKind::Transient), "{f:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn hang_up_is_transient() {
+        let (gql, v2, vast) = (serve(vec![hang_up()]), serve(vec![hang_up()]), serve(vec![hang_up()]));
+        let api = api_at(&gql, &v2, &vast);
+        for f in [api.live(Account::Runpod).await.unwrap_err(), api.live(Account::Vast).await.unwrap_err(), api.billed(NOW - H, NOW).await.unwrap_err()] {
+            assert_eq!((f.kind, f.http), (FailKind::Transient, None), "{f:?}");
+            assert!(!format!("{f:?}").contains("127.0.0.1"), "our words, not reqwest's: {f:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn inline_skips_live_when_fresh() {
+        let fp = FakeBalanceApi::fp(Account::Runpod);
+        let fresh = |st: AccountState| {
+            let mut s = BalanceState::default();
+            s.accounts.insert(Account::Runpod, AccountState { key_fp: fp.clone(), ..st });
+            s
+        };
+        // A success 100 s ago: no request at all.
+        let api = FakeBalanceApi::new().live_ok(Account::Runpod, live(1.0, None));
+        let s = fresh(AccountState { live_ok_at: Some(NOW - 100), ..anchored(5.0, 100, AnchorSource::Live) });
+        let got = observe(&api, &s, Mode::Inline, INLINE_TIMEOUT, NOW).await;
+        assert_eq!((api.live_calls(), api.billed_calls()), (0, 0));
+        assert_eq!(got, [Fetched::nothing(Account::Runpod, fp.clone())]);
+        // A failure 100 s ago: no live call either (the estimate needs billing, not live).
+        let failed = FailRecord { kind: FailKind::Gone, http: Some(404), detail: None, since: NOW - 3 * H, last: NOW - 100 };
+        let s = fresh(AccountState { live_fail: Some(failed), ..anchored(5.0, 4 * H, AnchorSource::Live) });
+        observe(&api, &s, Mode::Inline, INLINE_TIMEOUT, NOW).await;
+        assert_eq!((api.live_calls(), api.billed_calls()), (0, 1));
+        // FRESH old: live again.
+        let s = fresh(AccountState { live_ok_at: Some(NOW - FRESH), ..anchored(5.0, FRESH, AnchorSource::Live) });
+        observe(&api, &s, Mode::Inline, INLINE_TIMEOUT, NOW).await;
+        assert_eq!(api.live_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn inline_billing_only_while_live_failing() {
+        let fp = FakeBalanceApi::fp(Account::Runpod);
+        let state = |fail: bool| {
+            let lf = fail.then(|| FailRecord { kind: FailKind::Gone, http: Some(410), detail: None, since: NOW - 3 * H, last: NOW - H });
+            let mut s = BalanceState::default();
+            s.accounts.insert(
+                Account::Runpod,
+                AccountState { key_fp: fp.clone(), live_ok_at: Some(NOW - 4 * H), live_fail: lf, ..anchored(5.0, 4 * H, AnchorSource::Live) },
+            );
+            s
+        };
+        let bill = Billed { buckets: vec![], from: floor_hour(NOW - 4 * H), to: NOW };
+        // Live works: no billing.
+        let api = FakeBalanceApi::new().live_ok(Account::Runpod, live(4.0, None)).billed_ok(bill.clone());
+        let got = observe(&api, &state(false), Mode::Inline, INLINE_TIMEOUT, NOW).await;
+        assert_eq!((api.live_calls(), api.billed_calls(), got[0].billed.is_none()), (1, 0, true));
+        // Live fails now (it was fine before): billing after it.
+        let api = FakeBalanceApi::new().live_err(Account::Runpod, gone()).billed_ok(bill.clone());
+        let got = observe(&api, &state(false), Mode::Inline, INLINE_TIMEOUT, NOW).await;
+        assert_eq!((api.live_calls(), api.billed_calls()), (1, 1));
+        assert_eq!(got[0].billed, Some(Ok(bill.clone())));
+        // Live was already failing: both at once.
+        let api = FakeBalanceApi::new().live_err(Account::Runpod, gone()).billed_ok(bill.clone());
+        observe(&api, &state(true), Mode::Inline, INLINE_TIMEOUT, NOW).await;
+        assert_eq!((api.live_calls(), api.billed_calls()), (1, 1));
+        assert_eq!(api.billed_args(), [(floor_hour(NOW - 4 * H), NOW)]);
+        // No usable anchor: nothing to count down from, so no billing.
+        let api = FakeBalanceApi::new().live_err(Account::Runpod, gone());
+        observe(&api, &BalanceState::default(), Mode::Inline, INLINE_TIMEOUT, NOW).await;
+        assert_eq!(api.billed_calls(), 0);
+        // Vast has no billing history: never asked.
+        let api = FakeBalanceApi::new().live_err(Account::Vast, gone());
+        observe(&api, &BalanceState::default(), Mode::Inline, INLINE_TIMEOUT, NOW).await;
+        assert_eq!((api.live_calls(), api.billed_calls()), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn full_fetches_billing_for_check() {
+        let api = FakeBalanceApi::new().live_ok(Account::Runpod, live(40.0, None)).live_ok(Account::Vast, live(9.0, None));
+        let mut s = anchored_for(&api, H);
+        // The check anchor is older than the anchor: billing from its hour.
+        s.accounts.get_mut(&Account::Runpod).unwrap().check_anchor = Some(Anchor { usd: 60.0, at: NOW - 26 * H, source: AnchorSource::Live });
+        let got = observe(&api, &s, Mode::Full, COMMAND_TIMEOUT, NOW).await;
+        assert_eq!((api.live_calls(), api.billed_calls()), (2, 1), "live for both, billing for RunPod");
+        assert_eq!(api.billed_args(), [(floor_hour(NOW - 26 * H), NOW)]);
+        assert!(got.iter().all(|f| f.live.is_some()));
+        // No anchor yet: live only.
+        let api = FakeBalanceApi::new().live_ok(Account::Runpod, live(40.0, None));
+        observe(&api, &BalanceState::default(), Mode::Full, COMMAND_TIMEOUT, NOW).await;
+        assert_eq!((api.live_calls(), api.billed_calls()), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn no_live_makes_no_live_call() {
+        let api = FakeBalanceApi::new()
+            .live_ok(Account::Runpod, live(40.0, None))
+            .billed_ok(Billed { buckets: vec![], from: floor_hour(NOW - H), to: NOW });
+        let s = anchored_for(&api, H);
+        let got = observe(&api, &s, Mode::NoLive, COMMAND_TIMEOUT, NOW).await;
+        assert_eq!((api.live_calls(), api.billed_calls()), (0, 1));
+        assert!(got[0].live.is_none() && got[0].billed.is_some());
+        assert_eq!(apply(s.clone(), &got, &burns_of(burn(1.0), None), Mode::NoLive, NOW), s, "and records nothing");
+        // Cache-only: no call of any kind, every configured account listed.
+        let api = FakeBalanceApi::new().with(Account::Runpod).with(Account::Vast).panicking();
+        let got = observe(&api, &s, Mode::CacheOnly, COMMAND_TIMEOUT, NOW).await;
+        assert_eq!(got.iter().map(|f| f.account).collect::<Vec<_>>(), [Account::Runpod, Account::Vast]);
+        assert!(got.iter().all(|f| f.live.is_none() && f.billed.is_none()));
+    }
+
+    #[tokio::test]
+    async fn vast_2xx_without_credit_is_drift_and_unquoted() {
+        let mut no_credit = fixture("vast_user_canary");
+        no_credit.as_object_mut().unwrap().remove("credit");
+        let canary_err = json!({"errors": [{"message": format!("bad key {}", CANARIES[0])}]}).to_string();
+        let vast = serve(vec![
+            canned(200, JSON, &no_credit.to_string()),
+            canned(400, JSON, &canary_err),
+            canned(200, "text/html", &format!("<html>{}</html>", CANARIES[1])),
+        ]);
+        let (gql, v2) = (serve(vec![]), serve(vec![]));
+        let api = api_at(&gql, &v2, &vast);
+        let f = api.live(Account::Vast).await.unwrap_err();
+        assert_eq!((f.kind, f.detail.as_deref()), (FailKind::Drift, Some(VAST_NO_CREDIT)));
+        // A Vast error body is never quoted — even one shaped like a GraphQL error.
+        let f = api.live(Account::Vast).await.unwrap_err();
+        assert_eq!((f.kind, f.http, f.detail.as_deref()), (FailKind::Drift, Some(400), None));
+        let f = api.live(Account::Vast).await.unwrap_err();
+        assert_eq!(f.kind, FailKind::Gone);
+        assert!(!format!("{f:?}").contains(CANARIES[1]));
+    }
+
+    /// Two writers at once (the TUI and a CLI): each one's update survives.
+    #[test]
+    fn record_merges_concurrent_writers() {
+        let dir = tmp("concurrent");
+        let path = dir.0.join("devtest").join(crate::snapshot::BALANCE_FILE);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let writers: Vec<_> = Account::ALL
+            .into_iter()
+            .map(|a| {
+                let (path, barrier) = (path.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for i in 0..25u64 {
+                        let f = Fetched { account: a, key_fp: FP.into(), live: Some(Ok(live(100.0 + i as f64, None))), billed: None };
+                        record(&path, |s| apply(s, &[f], &BTreeMap::new(), Mode::Inline, NOW + i)).unwrap();
+                    }
+                })
+            })
+            .collect();
+        writers.into_iter().for_each(|w| w.join().unwrap());
+        let (s, warn) = load(&path);
+        assert_eq!(warn, None);
+        for a in Account::ALL {
+            assert_eq!(s.accounts[&a].anchor.map(|x| (x.usd, x.at)), Some((124.0, NOW + 24)), "{a:?}");
+        }
+        // `balance set` goes through the same lock and replaces only the anchor.
+        let (old, s, _) = record_manual(&path, Account::Runpod, FP, 250.0, NOW + 100).unwrap();
+        assert_eq!(old.map(|a| (a.usd, a.source)), Some((124.0, AnchorSource::Live)));
+        let st = &s.accounts[&Account::Runpod];
+        assert_eq!(st.anchor, Some(Anchor { usd: 250.0, at: NOW + 100, source: AnchorSource::Manual }));
+        assert_eq!(st.live_ok_at, Some(NOW + 24), "the rest is kept");
+        // Another key's `set` starts that account over.
+        let (old, s, _) = record_manual(&path, Account::Vast, "deadbeef", 5.0, NOW + 100).unwrap();
+        assert_eq!((old, s.accounts[&Account::Vast].live_ok_at), (None, None));
+    }
+
+    #[test]
+    fn commit_records_or_falls_back_to_memory() {
+        let dir = tmp("commit");
+        let path = dir.0.join("p").join(crate::snapshot::BALANCE_FILE);
+        let f = [fetched(Account::Runpod, Some(Ok(live(7.0, None))), None)];
+        let b = burns_of(burn(0.1), None);
+        let (s, warn) = commit(Some(&path), BalanceState::default(), &f, &b, Mode::Inline, NOW);
+        assert_eq!((warn, load(&path).0), (None, s.clone()));
+        // --no-live / cache-only: nothing written, the loaded state handed back.
+        std::fs::remove_file(&path).unwrap();
+        for mode in [Mode::NoLive, Mode::CacheOnly] {
+            assert_eq!(commit(Some(&path), BalanceState::default(), &f, &b, mode, NOW), (BalanceState::default(), None));
+            assert!(!path.exists(), "{mode:?} wrote");
+        }
+        // No state file: applied in memory. An unwritable one: in memory, plus the warning.
+        assert_eq!(commit(None, BalanceState::default(), &f, &b, Mode::Inline, NOW).0, s);
+        let blocked = dir.0.join("file");
+        std::fs::write(&blocked, "x").unwrap();
+        let (s2, warn) = commit(Some(&blocked.join("balance.json")), BalanceState::default(), &f, &b, Mode::Inline, NOW);
+        assert_eq!(s2, s);
+        assert!(warn.unwrap().starts_with("warning: couldn't save the balance state"));
+    }
+
+    /// Invariant 8: the canary key, email and address in Vast's answer — and the API keys
+    /// themselves — never reach a failure, a `Debug`, a rendered line, JSON or the saved state.
+    #[tokio::test]
+    async fn no_secret_anywhere() {
+        let canary = fixture("vast_user_canary").to_string();
+        let mut no_credit = fixture("vast_user_canary");
+        no_credit.as_object_mut().unwrap().remove("credit");
+        let dir = tmp("secrets");
+        let path = dir.0.join("devtest").join(crate::snapshot::BALANCE_FILE);
+        let mut seen = String::new();
+        let rounds = [
+            canned(200, JSON, &canary),
+            canned(200, JSON, &no_credit.to_string()),
+            canned(401, "text/html", &format!("<html>{canary}</html>")),
+            canned(500, JSON, &canary),
+        ];
+        let mut now = NOW;
+        for reply in rounds {
+            let (gql, v2, vast) = (serve(vec![canned(200, JSON, &fixture("runpod_myself").to_string())]), serve(vec![canned(200, JSON, &fixture("billing_hourly_openapi").to_string())]), serve(vec![reply]));
+            let api = api_at(&gql, &v2, &vast);
+            let (state, _) = load(&path);
+            let fetched = observe(&api, &state, Mode::Full, COMMAND_TIMEOUT, now).await;
+            let b = burns_of(burn(0.5), burn(0.5));
+            let (state, _) = commit(Some(&path), state, &fetched, &b, Mode::Full, now);
+            let v = views(&state, &fetched, &b, &policy(), Mode::Full, now);
+            seen.push_str(&format!("{fetched:?}\n{state:?}\n{v:?}\n{}\n", serde_json::to_string(&v).unwrap()));
+            seen.push_str(&std::fs::read_to_string(&path).unwrap());
+            seen.push_str(&footer_line(&v, &policy(), now).unwrap_or_default());
+            seen.push_str(&super::render_table(&v, now));
+            seen.push_str(&notes(&v, &policy(), now).join("\n"));
+            seen.push_str(&verbose_lines(&v, &state, &fetched, Some(&path), now).join("\n"));
+            seen.push_str(&config_rows(&Config::parse(""), &state, &api.accounts(), now).join("\n"));
+            seen.push_str(&teardown_info(&v, now).join("\n"));
+            seen.push_str(&format!("{:?}", tui_parts(&v)));
+            for view in &v {
+                seen.push_str(&preflight_lines(view, 2, Some(0.2), &policy(), now).join("\n"));
+            }
+            now += 2 * FRESH;
+        }
+        assert!(seen.contains("136.87") && seen.contains("vast"), "the run did read Vast: {seen}");
+        for secret in CANARIES.iter().chain(&[RP_KEY, VAST_KEY, "canary-user", "Canary Owner"]) {
+            assert!(!seen.contains(secret), "{secret} leaked");
+        }
     }
 }

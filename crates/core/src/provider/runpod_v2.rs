@@ -171,6 +171,17 @@ fn list_request(client: &Client, api_key: &str, cursor: Option<&str>) -> Request
     api_request(client, api_key, Method::GET, base_url("pods")).query(&query)
 }
 
+/// The account's spend history ([`crate::balance`]): `GET {base}/billing` in hourly buckets
+/// from `from` to `to` (Unix seconds, sent as RFC 3339; RunPod snaps the start down and the
+/// end up to the hour). Every billable resource on the account — pods, disks, volumes,
+/// serverless — which is what lets an estimate see spend arena doesn't list. Read-only, key
+/// in the header only. `base` is [`BASE`] or a loopback test server.
+pub(crate) fn billing_request(client: &Client, base: &str, api_key: &str, from: u64, to: u64) -> RequestBuilder {
+    let url = format!("{}/billing", base.trim_end_matches('/'));
+    let (start, end) = (crate::snapshot::rfc3339(from), crate::snapshot::rfc3339(to));
+    client.get(url).bearer_auth(api_key).query(&[("bucketSize", "hour"), ("startTime", &start), ("endTime", &end)])
+}
+
 /// The GPU catalog with prices and pod stock for one cloud tier.
 fn catalog_request(client: &Client, api_key: &str, cloud: &str) -> RequestBuilder {
     api_request(client, api_key, Method::GET, base_url("catalog/gpus"))
