@@ -9,7 +9,8 @@
 //!      `ssh-keygen -y` from the key we just copied, so no extra file is shipped,
 //!   4. point the ARENA repo's `origin` at the GitHub SSH URL, fetch *only the default
 //!      branch* (no tags), and update (default: stay on the current branch, pull /
-//!      reset-if-on-main; `--force`: check out the default branch and `reset --hard`),
+//!      fast-forward a clean main — one with its own changes or commits is left as it is,
+//!      with a warning; `--force`: check out the default branch and `reset --hard`),
 //!      then update submodules,
 //!   5. write `~/.name` as `export MACHINE_NAME='<short>'`.
 //!
@@ -240,17 +241,35 @@ ZSH_BIN=$(command -v zsh); [ -n "$ZSH_BIN" ] && chsh -s "$ZSH_BIN" "$(id -un)" >
                 b = q(branch)
             )
         } else {
-            // Stay on the current branch. On the default branch, hard-reset to origin;
-            // otherwise (e.g. an autocommit-wNdM branch with no upstream) only fast-
-            // forward if it actually tracks a remote — never fail the whole setup. The
-            // pull names the upstream (remote + ref) explicitly: a bare `git pull` runs a
-            // bare `git fetch`, i.e. exactly the all-branches-and-tags fetch avoided above.
+            // Stay on the current branch. On the default branch, move up to origin — but only
+            // a checkout with nothing of its own: no tracked change (staged or not) and no
+            // commit origin lacks, and then only as a fast-forward (which also refuses to
+            // overwrite an untracked file). Anything else is the participant's work — setup
+            // re-runs by itself after a reset (`restart`/`reimage`/`start`, on the repo the
+            // volume kept), and a `reset --hard` there reverted their edits and dropped their
+            // commits (review finding) — so it is left as it is, with a warning on the pod's
+            // line. Otherwise (e.g. an autocommit-wNdM branch with no upstream) only fast-
+            // forward if it actually tracks a remote — never fail the whole setup. The pull
+            // names the upstream (remote + ref) explicitly: a bare `git pull` runs a bare
+            // `git fetch`, i.e. exactly the all-branches-and-tags fetch avoided above.
             format!(
                 "CUR=$(git rev-parse --abbrev-ref HEAD); \
-                 if [ \"$CUR\" = {b} ]; then git reset --hard origin/{b}; \
+                 if [ \"$CUR\" = {b} ]; then \
+                 if git diff --quiet HEAD -- && git merge-base --is-ancestor HEAD origin/{b}; then \
+                 git merge --ff-only --quiet origin/{b} || echo {ff_failed}; \
+                 else echo {own_work}; fi; \
                  else (R=$(git config \"branch.$CUR.remote\") && M=$(git config \"branch.$CUR.merge\") && \
                  git pull --ff-only --no-tags \"$R\" \"$M\") || true; fi",
-                b = q(branch)
+                b = q(branch),
+                ff_failed = q(&format!(
+                    "{}the repo couldn't fast-forward to origin/{branch} (an untracked file in the way?) - left as it was",
+                    crate::volume::WARNING_PREFIX
+                )),
+                own_work = q(&format!(
+                    "{}the repo on {branch} has its own changes or commits - left as it is, not reset to origin/{branch} \
+                     (`pods setup --force` resets it)",
+                    crate::volume::WARNING_PREFIX
+                )),
             )
         };
 
@@ -1739,6 +1758,37 @@ mod tests {
             assert_eq!(f.head(), ("main".into(), main.clone()));
             assert_eq!(f.rev("origin/main"), main);
             f.assert_narrow();
+        }
+
+        /// Review finding: setup re-runs by itself after a reset (`restart`, `reimage`, `pods
+        /// start`) on the repo the volume kept, and on the default branch it `reset --hard` —
+        /// reverting the participant's edits and dropping their commits. Their work is kept
+        /// now, with a warning; a clean checkout still moves up.
+        #[test]
+        fn on_default_branch_never_discards_the_participants_work() {
+            let Some(f) = Fixture::new("default-work") else { return };
+            f.clone_pod(&[]);
+            let (main, _) = f.advance_origin();
+            // A tracked edit, uncommitted: kept, not updated, and said.
+            std::fs::write(f.pod.join("a"), "my edit").unwrap();
+            let before = f.head();
+            let out = f.run_update(false);
+            assert_eq!(std::fs::read_to_string(f.pod.join("a")).unwrap(), "my edit");
+            assert_eq!(f.head(), before);
+            let said = String::from_utf8_lossy(&out.stdout);
+            assert!(said.contains("arena-warning: the repo on main has its own changes or commits"), "{said}");
+            // A local commit on main: kept too.
+            f.git(&f.pod, &["commit", "-q", "-am", "mine"]);
+            let mine = f.rev("HEAD");
+            f.run_update(false);
+            assert_eq!(f.rev("HEAD"), mine, "a commit origin lacks is never dropped");
+            assert_eq!(f.rev("origin/main"), main, "the fetch still happened");
+            // A staged-only change counts as work as well.
+            f.git(&f.pod, &["reset", "-q", "--hard", "origin/main"]);
+            std::fs::write(f.pod.join("a"), "staged").unwrap();
+            f.git(&f.pod, &["add", "a"]);
+            f.run_update(false);
+            assert_eq!(f.git(&f.pod, &["diff", "--cached", "--name-only"]), "a");
         }
 
         #[test]

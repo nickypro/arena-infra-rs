@@ -690,10 +690,14 @@ pub fn pod_to_pod_copy(
 }
 
 /// The pushes of a via-local copy's staging dir (`stage`, trailing `/`) onto the destination:
-/// `(local source, config)` per rsync. When the staged home holds the repo at `rel`
-/// (`stage_has_repo`), it goes up as its own push into `<rel>/` (resolved through a link on
-/// the destination) and the home push leaves it out — a plain push would replace the
-/// destination's link with a directory on its container disk. Pure.
+/// `(local source, config)` per rsync. With the repo at `rel`, the home push ALWAYS leaves
+/// `<rel>` out — as the direct copy does — and the repo goes up as its own push into `<rel>/`
+/// (resolved through a link on the destination) only when it was staged as a directory
+/// (`stage_has_repo`). A plain push would replace the destination's link with a directory on
+/// its container disk; and when the source's repo is missing or a dangling link (staged as a
+/// link), a mirroring home push would replace the destination's whole repo with that link —
+/// its files moved aside, then tidied away (review finding). Then the destination's repo is
+/// left alone, as the direct copy leaves it. Pure.
 pub fn push_jobs(
     pc: &crate::pull::PullConfig,
     stage: &str,
@@ -701,14 +705,16 @@ pub fn push_jobs(
     stage_has_repo: bool,
 ) -> Vec<(String, crate::pull::PullConfig)> {
     let stage = format!("{}/", stage.trim_end_matches('/'));
-    match rel.filter(|_| stage_has_repo) {
-        None => vec![(stage, pc.clone())],
-        Some(rel) => {
-            let mut home = pc.clone();
-            home.excludes.push(format!("/{rel}"));
-            vec![(stage.clone(), home), (format!("{stage}{rel}/"), tree_config(pc, rel))]
-        }
+    let Some(rel) = rel else {
+        return vec![(stage, pc.clone())];
+    };
+    let mut home = pc.clone();
+    home.excludes.push(format!("/{rel}"));
+    let mut jobs = vec![(stage.clone(), home)];
+    if stage_has_repo {
+        jobs.push((format!("{stage}{rel}/"), tree_config(pc, rel)));
     }
+    jobs
 }
 
 /// The config for carrying the repo's tree into `<rel>/` on its own, from the home copy's:
@@ -1130,6 +1136,7 @@ mod tests {
         let one = push_jobs(&pc, "/stage", Some("ARENA_materials"), false);
         assert_eq!(one.len(), 1);
         assert_eq!((one[0].0.as_str(), one[0].1.remote_path.as_str()), ("/stage/", ""));
+        assert_eq!(one[0].1.excludes.last().map(String::as_str), Some("/ARENA_materials"), "never the repo's place, staged or not");
         let two = push_jobs(&pc, "/stage/", Some("ARENA_materials"), true);
         assert_eq!(two.len(), 2);
         assert_eq!(two[0].0, "/stage/");
@@ -1223,14 +1230,14 @@ mod tests {
     /// A replica sync (live findings #7 and #20) through both copies, real rsync, the repo a
     /// link onto each pod's volume: a file the participant deleted on the original is gone
     /// from the new pod — in the home and in the repo — but MOVED aside, not destroyed: the
-    /// home's into `~/.arena-sync-replaced/<stamp>/`, the repo's beside its real directory
+    /// home's into `~/arena-sync-kept/<stamp>/`, the repo's beside its real directory
     /// (on the volume, so the move is a rename). The tidy-up then finds both folders through
     /// the link. Never `--delete` on the source: it's only ever read.
     #[cfg(unix)]
     #[test]
     fn a_replica_copy_moves_what_it_deletes_beside_each_tree() {
         use crate::pull::{push_rsync_args, PullConfig};
-        use crate::replica::{home_mirror, parse_settle, settle_command, SettleMode, REPLACED_DIR};
+        use crate::replica::{home_mirror, parse_settle, settle_command, SettleMode, KEPT_DIR};
         if !fake_ssh::have_rsync() {
             eprintln!("rsync not installed — skipping");
             return;
@@ -1272,20 +1279,23 @@ mod tests {
             .unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         assert!(!exists("new/ws/ARENA_materials/deleted_on_original.py") && !exists("new/home/gone.txt"));
-        assert!(exists(&format!("new/ws/{REPLACED_DIR}/S1/ARENA_materials/deleted_on_original.py")), "beside the real repo, on the volume");
-        assert!(exists(&format!("new/home/{REPLACED_DIR}/S1/gone.txt")));
+        assert!(exists(&format!("new/ws/{KEPT_DIR}/S1/ARENA_materials/deleted_on_original.py")), "beside the real repo, on the volume");
+        assert!(exists(&format!("new/home/{KEPT_DIR}/S1/gone.txt")));
         assert!(exists("new/home/ARENA_materials/chapter1/work.py") && exists("new/home/notes.txt"));
         assert_eq!(std::fs::read_to_string(root.join("new/home/.name")).unwrap(), "export MACHINE_NAME='a-new'\n", "~/.name stays the pod's own");
         assert_eq!(walk(&root.join("old")), source_before, "the source is only read");
-        // The tidy-up finds both folders (no stamp: it keeps everything and says so).
+        // The tidy-up finds both folders (no stamp: it keeps everything and says so), and
+        // brings the repo's off the volume into the home's.
         let out = std::process::Command::new("sh")
             .arg("-c")
-            .arg(settle_command("S1", Some("ARENA_materials"), SettleMode::Keep))
+            .arg(settle_command(None, "S1", Some("ARENA_materials"), SettleMode::Keep))
             .env("HOME", root.join("new/home"))
             .output()
             .unwrap();
         let s = parse_settle(&String::from_utf8_lossy(&out.stdout)).unwrap();
-        assert_eq!((s.kept, s.dirs.len()), (2, 2), "{s:?}");
+        assert_eq!((s.kept, s.dirs.len()), (2, 1), "{s:?}");
+        assert!(exists(&format!("new/home/{KEPT_DIR}/S1/ARENA_materials/deleted_on_original.py")));
+        assert!(!exists(&format!("new/ws/{KEPT_DIR}")));
 
         // Via local staging: the push leg, the same way.
         pod("via");
@@ -1299,7 +1309,46 @@ mod tests {
             fake_ssh::rsync(&fake_ssh::swap_transport(&push_rsync_args(&target, &cfg, &src), &fake), &root.join("via/home"));
         }
         assert!(!exists("via/ws/ARENA_materials/deleted_on_original.py"));
-        assert!(exists(&format!("via/ws/{REPLACED_DIR}/S1/ARENA_materials/deleted_on_original.py")));
+        assert!(exists(&format!("via/ws/{KEPT_DIR}/S1/ARENA_materials/deleted_on_original.py")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Review finding: when the source's repo is missing or a dangling link (so it was staged
+    /// as a link, not a tree), the via-local home push mirrored (`--delete`) WITHOUT leaving the
+    /// repo's place out: the destination's repo directory was replaced by that link, its files
+    /// moved aside and then tidied away. The direct copy skips the tree then (`[ -d ]`); the
+    /// via-local one now leaves the destination's repo alone the same way.
+    #[cfg(unix)]
+    #[test]
+    fn a_via_local_replica_never_replaces_the_destinations_repo_with_a_link() {
+        use crate::pull::{push_rsync_args, PullConfig};
+        if !fake_ssh::have_rsync() {
+            eprintln!("rsync not installed — skipping");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("arena-volume-dangling-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let put = |rel: &str, body: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        put("stage/notes.txt", "notes\n");
+        std::os::unix::fs::symlink("/workspace/ARENA_materials_missing", root.join("stage/ARENA_materials")).unwrap();
+        put("dest/ARENA_materials/solution.py", "the participant's work\n");
+        let pc = PullConfig { mirror: crate::replica::home_mirror("S2"), ..PullConfig::replication() };
+        let stage = format!("{}/", root.join("stage").display());
+        let staged_repo = std::fs::symlink_metadata(root.join("stage/ARENA_materials")).is_ok_and(|m| m.is_dir());
+        assert!(!staged_repo);
+        let fake = fake_ssh::install(&root);
+        let target = crate::ssh::SshTarget { user: "root".into(), host: "10.0.0.2".into(), port: 22, key_paths: vec![], connect_timeout_secs: 10 };
+        for (src, cfg) in push_jobs(&pc, &stage, Some("ARENA_materials"), staged_repo) {
+            fake_ssh::rsync(&fake_ssh::swap_transport(&push_rsync_args(&target, &cfg, &src), &fake), &root.join("dest"));
+        }
+        let repo = std::fs::symlink_metadata(root.join("dest/ARENA_materials")).unwrap();
+        assert!(repo.is_dir(), "still the destination's own directory, not the source's dangling link");
+        assert_eq!(std::fs::read_to_string(root.join("dest/ARENA_materials/solution.py")).unwrap(), "the participant's work\n");
+        assert_eq!(std::fs::read_to_string(root.join("dest/notes.txt")).unwrap(), "notes\n", "the rest of the home still goes");
         let _ = std::fs::remove_dir_all(&root);
     }
 

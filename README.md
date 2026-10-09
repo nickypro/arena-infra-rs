@@ -137,9 +137,13 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     (refused). Pods without a volume are never asked. Afterwards it waits for the endpoint to settle, **re-runs `setup`** on the pod
     (`--no-setup` skips) and syncs the proxy (`--skip-proxy`) once the endpoint has settled
     **again** (a reset container's endpoint can flap after it first settles; a forward the sync
-    still couldn't route is re-synced once, then named with `arena proxy apply`), so it comes
+    still couldn't route is re-synced once, then named with `arena proxy apply`; a pod that
+    never got an endpoint back is waited for once, not again by the sync), so it comes
     back usable; if that setup fails the error says to run `pods setup <name>`, not another
-    restart. A **stopped** pod is refused (`… is stopped (EXITED) — … arena pods start …`: a
+    restart. The re-run setup moves a repo on the default branch up to origin only as a
+    fast-forward of a **clean** checkout: one with tracked changes or commits of its own (the
+    participant's, on the volume) is left as it is, with a warning on the pod's line —
+    `pods setup --force` is the only thing that resets it. A **stopped** pod is refused (`… is stopped (EXITED) — … arena pods start …`: a
     restart needs a running pod). `stop` gets the same gate (`--wipe-ok`): a stopped RunPod
     pod keeps no data. **`pods start <targets>`** (targets or `--all`) is the way back from a
     stop (RunPod v1 `POST /pods/{id}/start`, v2 action `start`, Vast state `running`, Hetzner
@@ -560,17 +564,38 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     local staging), into the new pod's own volume copy when it has one.
   - **`pods replace` / `pods migrate`** — what the copy onto `<name>-new` does (live campaign
     1, findings #5–#7, #13, #16, #17, #19, #20, #26–#30):
-    - It's a **replica**: a file deleted on the original is deleted on `-new` too, but
-      nothing on `-new` is ever destroyed by a sync — whatever it overwrites or deletes there
-      is **moved** to `~/.arena-sync-replaced/<UTC stamp>/` (the repo's files beside the
-      repo's real directory, on its volume). After each sync `-new` sorts that folder against
-      its last-sync stamp (`~/.arena-last-sync`): copies of what an earlier sync put there go;
-      files **changed on `-new` itself** since (work done there after a cutover + revert, or a
-      test run) are **kept and listed**. The original is only ever read; backups never mirror.
+    - It's a **replica**: a file deleted on the original is deleted on `-new` too, but the
+      transfer destroys nothing on `-new` — whatever it overwrites or deletes there is
+      **moved** into `~/arena-sync-kept/<UTC stamp>/` (a *visible* folder: `pods pull` backs it
+      up and a later replace/migrate of that pod carries it; a mirror never deletes it; the
+      repo's files land beside the repo's real directory first, on its volume, and are then
+      brought into that folder under `ARENA_materials/`). Before each sync `-new` lists every
+      file that **changed on it** since its last sync (`~/.arena-last-sync`) by **ctime** —
+      created, edited, extracted, copied or renamed there; a user tool can't set a ctime, while
+      `tar`/`unzip`/`cp -p`/`mv`/`wget` all leave old *mtimes*. After a **verified** sync it
+      drops only the moved files on neither side of that line (an earlier sync's copies the
+      original has since deleted or changed); everything else is **kept and listed**. A sync
+      that didn't complete drops nothing. The original is only ever read; backups never mirror.
+    - **A mirror only from an unchanged original**: onto a `-new` that was synced before, the
+      original must still be what that sync copied — its container not created since (a
+      reset: RunPod's own, a stop, a `pods start`) and its record of that sync
+      (`~/.arena-sync/sent-to`, a dot-dir that's never backed up or restored, so it goes with
+      the home on a reset) still there. Otherwise `migrate copy` / the cutover's final sync is
+      **refused before anything moves** (mirroring a reset pod's bare image would delete the
+      participant's files from `-new`), pointing at `cutover --no-final-sync`.
+    - **Every step on a pod runs on that pod**: on RunPod each one — the source's prepare and
+      the direct copy run on it; `-new`'s prepare, the transfer's remote rsync
+      (`--rsync-path`) and the tidy-up — first checks `RUNPOD_POD_ID` in the same SSH session
+      and does nothing on any other pod (a reassigned endpoint). A stopped `-new` is refused
+      like a stopped original; so is a stopped original by `replace` / `migrate copy` *while
+      planning*, before anything is created and billed. When the original's repo is missing
+      or a dangling link, the via-local copy leaves `-new`'s repo alone, as the direct one does.
     - It carries the home incl. `.git`, `~/.config`, `~/.jupyter`, `~/.ipython`, `~/.local`
-      (bin, share) — and says what it skips (caches and other dot-dirs, venvs, site-packages
-      and `~/.local/lib`, HF caches, uv's Pythons, shell rc files + history, `.claude*`, `.ssh`,
-      `~/.name`). The plans no longer promise a "copied-size sanity" check: what's verified is
+      (bin, share) — and says what it skips (caches and other dot-dirs — `.cache/` and
+      `__pycache__/` inside `~/.config` too —, venvs, site-packages and `~/.local/lib`, HF
+      caches, uv's Pythons, the `claude`/`codex` setup installs in `~/.local/bin` (never
+      deleted on `-new` either) and Claude Code's state under `~/.local`, shell rc files +
+      history, `.claude*`, `.ssh`, `~/.name`). The plans no longer promise a "copied-size sanity" check: what's verified is
       the delivery marker read back from the right pod, then an SSH + GPU health check.
     - The **direct** pod-to-pod copy is skipped when both pods share a public IP (a pod can't
       reach its neighbour through it) and gives up connecting after 15 s; when it fails the
@@ -591,9 +616,13 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     - `migrate cutover --no-final-sync` cuts over to the copy already on `-new` when the
       original is stopped/unreachable (a stopped source is refused by the final sync *saying
       so*, with that flag); the plan says when `-new` was last synced. `migrate revert` says
-      that the new pod's work since the cutover stays on `-new`. `migrate copy` of a **locked**
-      original is allowed (it only reads it) with a note; cutover / replace / finish refuse a
-      locked pod with the unlock command — nothing here ever unlocks.
+      that the new pod's work since the cutover stays on `-new` (back it up with `pods pull -t
+      <name>-new`); a revert never writes `~/.name` through a stopped pod's stale endpoint.
+      `migrate finish` keeps a **stopped** `-old` — nothing was synced from it since `-new`'s
+      last sync, and its volume may hold what changed since — saying so (volume, last sync)
+      unless `--discard-stopped`. `migrate copy` of a **locked** original is allowed (it only
+      reads it) with a note; cutover / replace / finish refuse a locked pod with the unlock
+      command — nothing here ever unlocks.
   - `pods restore <pod> [--from <label>|big] [--path <subdir>] [--dir] [--timeout]
     [--overwrite-newer] [--with-git] [--dry-run]` — push a backup (pull's layout) back onto
     **one** pod over its direct endpoint: by default its newest `wNdM` snapshot (files under
@@ -688,7 +717,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     token redacted). Uses `GIT_SSH_KEY_LOCAL/REMOTE`, `ARENA_REPO_OWNER/NAME`, `DEFAULT_BRANCH`.
     The repo update fetches **only the default branch, without tags** (a bare `git fetch`
     would pull every participant's autocommit branch); a tracked non-default branch pulls
-    just its own upstream. Pods run in parallel and **every step has a time budget** —
+    just its own upstream; the default branch is fast-forwarded only when the checkout has
+    no tracked change and no commit of its own — otherwise it's left as it is with a warning
+    (`--force` checks out the default branch and resets it). Pods run in parallel and **every step has a time budget** —
     copies 60s, the image config step 300s, the hetzner bare-VM script 1800s; `--timeout
     <secs>` (or config `SETUP_TIMEOUT_SECS`, 1..86400; `up`/`replace`/`migrate copy` use the
     config value and reject a bad one — and `up` missing `ARENA_REPO_*` unless `--no-setup`,

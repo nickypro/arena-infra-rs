@@ -48,6 +48,10 @@ pub struct PullConfig {
     /// accumulates (never deletes); only a pod-to-pod replication mirrors, and only when it
     /// says so per transfer.
     pub mirror: Mirror,
+    /// rsync `--rsync-path`: what starts rsync on the REMOTE side. `None` = plain `rsync`. A
+    /// pod-to-pod copy sets [`crate::replica::guarded_rsync_path`], so a transfer that reaches
+    /// a reassigned endpoint starts nothing there.
+    pub rsync_path: Option<String>,
 }
 
 /// What a transfer may do to files on the RECEIVING side that the sender doesn't have (or
@@ -69,8 +73,22 @@ pub enum Mirror {
     /// mustn't reappear on the new pod), but whatever the transfer overwrites or deletes on
     /// the receiver is MOVED into `dir` (relative to the receiving directory), never
     /// destroyed: the new pod may hold work of its own — after a cutover then a revert, or a
-    /// test run on it ([`crate::replica`] reports and tidies what was moved).
+    /// test run on it ([`crate::replica`] reports and tidies what was moved). The folder the
+    /// moved files go to ([`Mirror::backup_root`]) is protected from the deletion — this
+    /// sync's and every earlier one's, wherever it appears — even when the sender has one too.
     Replica { backup_dir: String },
+}
+
+impl Mirror {
+    /// The top folder a [`Mirror::Replica`] moves files into: its `backup_dir`'s first
+    /// component past any `..` (`arena-sync-kept/S` and `../arena-sync-kept/S/repo` →
+    /// `arena-sync-kept`). `None` for the other mirrors.
+    pub fn backup_root(&self) -> Option<&str> {
+        match self {
+            Mirror::Replica { backup_dir } => backup_dir.split('/').find(|c| !c.is_empty() && *c != "." && *c != ".."),
+            _ => None,
+        }
+    }
 }
 
 /// The default [`PullConfig::io_timeout_secs`]: 5 minutes without a byte means the
@@ -125,6 +143,7 @@ impl Default for PullConfig {
             io_timeout_secs: Some(RSYNC_IO_TIMEOUT_SECS),
             first_excludes: Vec::new(),
             mirror: Mirror::Accumulate,
+            rsync_path: None,
         }
     }
 }
@@ -132,8 +151,8 @@ impl Default for PullConfig {
 /// What the pod-to-pod replication ([`PullConfig::replication`]) leaves behind, for the
 /// `replace` / `migrate copy` output — what the copy really drops, not "caches".
 pub const REPLICATION_SKIPS: &str = "skips caches and other dot-dirs (.cache, .venv, .vscode-server, .ssh, .claude), \
-     venvs, site-packages and ~/.local/lib (pip --user), HF caches, ~/.local/share/uv, shell rc files + \
-     history (the API keys follow by name), ~/.name";
+     venvs, site-packages and ~/.local/lib (pip --user), HF caches, ~/.local/share/uv, the claude/codex that \
+     setup installs and Claude Code's own state, shell rc files + history (the API keys follow by name), ~/.name";
 
 /// What it does carry besides the plain files: for the same output.
 pub const REPLICATION_KEEPS: &str = "the home incl. .git, ~/.config, ~/.jupyter, ~/.ipython, ~/.local (bin, share)";
@@ -182,9 +201,19 @@ impl PullConfig {
         s.excludes.push("/.local/lib/".to_string());
         s.excludes.push("/.local/share/uv/".to_string());
         s.excludes.push("/.local/share/Trash/".to_string());
-        // Never Claude Code state, even inside an included tree (ToS, see above).
-        s.first_excludes.push("/.config/claude*".to_string());
-        s.first_excludes.push("/.config/anthropic*".to_string());
+        // Never Claude Code state, even inside an included tree (ToS, see above) — its config
+        // and the state its installer keeps under ~/.local.
+        for p in ["/.config/claude*", "/.config/anthropic*", "/.local/share/claude/", "/.local/state/claude/"] {
+            s.first_excludes.push(p.to_string());
+        }
+        // What setup installs on every pod (the receiver has its own before the copy): never
+        // carried, and never deleted there when the original lacks it (an exclude protects it
+        // from a mirror) — else the receiver's /usr/local/bin links would dangle.
+        s.first_excludes.push("/.local/bin/claude".to_string());
+        s.first_excludes.push("/.local/bin/codex".to_string());
+        // The caches inside an included tree (`/.config/**` would otherwise win over them).
+        s.first_excludes.push(".cache/".to_string());
+        s.first_excludes.push("__pycache__/".to_string());
         // The receiver's own: its name, and the replica bookkeeping (`crate::replica`) — an
         // exclude also keeps a mirroring transfer from deleting them there.
         s.excludes.push("/.name".to_string());
@@ -386,6 +415,9 @@ fn rsync_flags(pc: &PullConfig) -> Vec<String> {
     if let Some(t) = pc.io_timeout_secs {
         a.push(format!("--timeout={t}"));
     }
+    if let Some(path) = &pc.rsync_path {
+        a.push(format!("--rsync-path={path}"));
+    }
     match &pc.mirror {
         Mirror::Accumulate => {}
         Mirror::Exact => a.push("--delete".into()),
@@ -394,6 +426,13 @@ fn rsync_flags(pc: &PullConfig) -> Vec<String> {
             a.push("--backup".into());
             a.push(format!("--backup-dir={backup_dir}"));
         }
+    }
+    // A replica's moved-aside folder is never deleted on the receiver: protect rules, first
+    // (the first matching rule wins), for the folder and everything in it — the folder alone
+    // wouldn't keep its contents once the sender has a folder of that name too.
+    if let Some(root) = pc.mirror.backup_root() {
+        a.push(format!("--filter=P {root}/"));
+        a.push(format!("--filter=P {root}/**"));
     }
     // `--max-size` keeps the snapshot tier small (the big tier leaves it `None` to take
     // everything). `--min-size` is currently unused but honored if a caller sets it.
@@ -599,6 +638,100 @@ mod tests {
         }
         // full tree — no size cap for a replacement.
         assert!(!a.iter().any(|x| x.starts_with("--max-size")));
+    }
+
+    /// Live finding #27 through the real rsync (review: it had no test): what the
+    /// replication carries of the dot-dirs it now includes, and what it still drops inside
+    /// them — Claude Code's state (ToS) wherever it lives, the claude/codex binaries setup
+    /// installs on every pod, caches inside an included tree, pip `--user` and uv — plus the
+    /// rest of the drop list. The `first_excludes` must win over the `/.config/**` include.
+    #[cfg(unix)]
+    #[test]
+    fn replication_carries_the_config_dot_dirs_and_nothing_it_must_not() {
+        if std::process::Command::new("rsync").arg("--version").output().is_err() {
+            eprintln!("rsync not installed — skipping");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("arena-pull-replication-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (src, dst) = (root.join("src"), root.join("dst"));
+        let carried = [
+            "notes.txt",
+            "ARENA_materials/.git/HEAD",
+            ".config/wandb/settings",
+            ".jupyter/jupyter_server_config.py",
+            ".ipython/profile_default/startup/00.py",
+            ".local/bin/mytool",
+            ".local/share/jupyter/kernels/k.json",
+            ".arena_replace_marker",
+            "arena-sync-kept/S/work.py",
+        ];
+        let dropped = [
+            ".config/claude/settings.json",
+            ".config/anthropic/key",
+            ".local/share/claude/versions/2.0.1",
+            ".local/state/claude/locks/l",
+            ".local/bin/claude",
+            ".local/bin/codex",
+            ".config/wandb/.cache/big",
+            ".config/x/__pycache__/m.pyc",
+            ".local/lib/python3.11/site-packages/x.py",
+            ".local/share/uv/python/p",
+            ".local/share/Trash/files/t",
+            ".claude.json",
+            ".claude/projects/p.jsonl",
+            ".ssh/id_ed25519",
+            ".bashrc",
+            ".zsh_history",
+            ".name",
+            ".arena-last-sync",
+            ".arena-sync/sent-to",
+            ".cache/huggingface/x",
+            ".vscode-server/data/x",
+            "ARENA_materials/__pycache__/m.pyc",
+            "hf_cache/models--x/blob",
+        ];
+        for f in carried.iter().chain(&dropped) {
+            let p = src.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, f).unwrap();
+        }
+        std::fs::create_dir_all(&dst).unwrap();
+        let mut args = push_rsync_args(&target(), &PullConfig::replication(), &format!("{}/", src.display()));
+        let e = args.iter().position(|a| a == "-e").unwrap();
+        args.drain(e..e + 2);
+        *args.last_mut().unwrap() = format!("{}/", dst.display());
+        let out = std::process::Command::new("rsync").args(&args).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        for f in carried {
+            assert!(dst.join(f).is_file(), "should be carried: {f}");
+        }
+        for f in dropped {
+            assert!(!dst.join(f).exists(), "should stay behind: {f}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A replica's moved-aside folder is protected (first, so no include can override it),
+    /// the guarded `--rsync-path` goes through, and a backup tier carries neither.
+    #[test]
+    fn a_replica_protects_its_kept_folder_and_can_guard_the_remote_rsync() {
+        let pc = PullConfig {
+            mirror: Mirror::Replica { backup_dir: "arena-sync-kept/S".into() },
+            rsync_path: Some("check && rsync".into()),
+            ..PullConfig::replication()
+        };
+        let a = push_rsync_args(&target(), &pc, "/tmp/s/");
+        let at = |x: &str| a.iter().position(|y| y == x).unwrap_or_else(|| panic!("{x} missing: {a:?}"));
+        assert!(at("--filter=P arena-sync-kept/") < at("--filter=P arena-sync-kept/**"));
+        assert!(at("--filter=P arena-sync-kept/**") < a.iter().position(|x| x == "--exclude" || x == "--include").unwrap());
+        assert!(a.contains(&"--rsync-path=check && rsync".to_string()));
+        assert_eq!(Mirror::Replica { backup_dir: "../arena-sync-kept/S/ARENA_materials".into() }.backup_root(), Some("arena-sync-kept"));
+        assert_eq!(Mirror::Exact.backup_root(), None);
+        for tier in [PullConfig::big_tier(), PullConfig::small_tier("50M"), PullConfig::replication()] {
+            let a = rsync_args(&target(), &tier, "./d/").join(" ");
+            assert!(!a.contains("--filter") && !a.contains("--rsync-path") && !a.contains("--delete"), "{a}");
+        }
     }
 
     #[test]
