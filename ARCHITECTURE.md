@@ -92,20 +92,20 @@ flowchart TD
 | module | role | pure? |
 |--------|------|-------|
 | `config` | tolerant `config.env` parser (`KEY=val` + the `MACHINE_NAME_LIST` bash array); any present key can be overridden from the environment, and a short allowlist (`ARENA_START_DATE`, `EXTRA_SSH_KEYS`, `HF_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `SSH_PROXY_RELOAD_CMD`, `RUNPOD_API`, `ARENA_STATE_DIR`) may be introduced from it | parse: yes |
-| `provider` | the `Provider` trait, `build` (one backend by name) and `build_fleet` (`MultiProvider`: lists every configured backend, creates on the `--provider` one, routes per-pod calls to the owner). `list_by_provider` keeps each backend's own Ok/Err — a failed listing is never "no pods". List calls bounded at 60 s (`LIST_TIMEOUT`); mutating calls deliberately aren't | trait + I/O |
+| `provider` | the `Provider` trait, `build` (one backend by name) and `build_fleet` (`MultiProvider`: lists every configured backend, creates on the `--provider` one, routes per-pod calls to the owner). `list_by_provider` keeps each backend's own Ok/Err — a failed listing is never "no pods"; `list_complete` (every name-picking caller: create/up, placement retry rounds, rename, the TUI's add form) fails if any backend didn't answer — between retry rounds (`placement::relist`, both create paths) a recoverable failure (429/5xx, or a list stalled past its bound) skips that round instead of ending the run. List calls bounded at 60 s (`LIST_TIMEOUT`, an `Error::Timeout`); mutating calls deliberately aren't | trait + I/O |
 | `provider::runpod` / `runpod_v2` | RunPod REST v1 (which RunPod retires on 2026-11-15) and REST v2 (`RUNPOD_API=v2`: paginated listing, real lifecycle statuses, explicit `cloud`, account SSH keys merged into `PUBLIC_KEY`). v1 uses GraphQL for rename, maintenance windows, the GPU catalog and network volumes; v2 renames (name-only `PATCH`), locks/unlocks (`{"locked"}`-only `PATCH`) and reads the catalog over REST, keeping GraphQL only for maintenance windows, the balance and a volume-listing fallback (the "GraphQL dependency inventory" in `runpod_v2.rs`); contract tests replay recorded v2 responses (`provider/fixtures/runpod_v2/`) | builders/parsers pure |
 | `provider::vast`, `provider::hetzner` | Vast rents the cheapest matching *offer* (name carried as the instance label — its offer search still sends the flat query body Vast now rejects, see FEATURE_MAP); Hetzner creates CPU VMs sized by `HETZNER_*` | parsers pure |
 | `http`, `retry` | every response's **status is read before its body is parsed**, so a 401 with an HTML body is classified `Auth`, a 429/5xx transient, a capacity message `Capacity`; `retry` backs off on transient errors only | yes |
 | `remote` | the `Remote` trait (`exec`, `copy`, `copy_recursive`, each with a timeout): `SshRemote` stops a timed-out ssh/scp with SIGTERM then SIGKILL before returning the timeout (`run_local`: the same for rsync); `FakeRemote` (feature `test-util`) scripts replies, delays and failures per host | trait + I/O |
 | `selector` | one target syntax for every fleet command: bare/full/`@` names, ids, `a..b` ranges in list order, `all`, `--exclude`, `--gpus N`, `--on`; typos and empty selections are errors | yes |
-| `placement` | `--gpu A,B --cloud x,y --max-price P --order`: expand → price (`PriceBook`) → cap → order (`plan_options`, shared by `offers`, dry-runs and the prompt); `place()` fills names one create at a time, blocking an option for the round on capacity | planning pure; `place` generic over `&dyn Provider` |
+| `placement` | `--gpu A,B --cloud x,y --max-price P --order`: expand → price (`PriceBook`) → cap → order (`plan_options`, shared by `offers`, dry-runs and the prompt); `place()` fills names one create at a time, blocking an option for the round on capacity (for the run on `Denied`/`Rejected`; once every option is out, in any mix, the run ends), and hands each created pod to the caller as it lands (`up` starts its pipeline then); a later round only retries the confirmed names still unplaced (`still_needed`), never picks new ones — the single-option loop in `create_with_retry` too, so it can't re-pick a name whose pod `up --check` is replacing | planning pure; `place` generic over `&dyn Provider` |
 | `pipeline` | the pure half of `pods up`: stages, verdicts, `replacement_order`, `on_failed_host`, the summary table | yes |
 | `setup` | provisioning as data (`provisioning_steps`: image pods = copy deploy key + config command; Hetzner = key + script + run; both + an `Optional` VS Code warm-up whose failure is a warning on a `Done` pod) and a runner (`provision`) with a budget per step (`SetupTimeouts`, `SETUP_TIMEOUT_SECS`) and a boot-race retry | steps pure; runner over `Remote` |
 | `volume` | the repo on the persistent volume: setup's relocation script (its own best-effort step; `/workspace/<repo>`, configured path → symlink, published only once the original is out of the way; after a reset the volume copy wins over an *untouched* image checkout only; in-use/space/changed-meanwhile checks; warnings, never a failed setup), the read-only "where is the repo really?" probe (+ the container's creation time), `RepoSite` (what the restart/stop gate judges), and the pull/replace plans that carry a linked repo as its tree — for any pull source (`resolve_remote_path`) | yes (script tested on a temp-dir pod with real git and stubbed failures, rsync plans through the real rsync) |
 | `replica` | the replace/migrate copy as a REPLICA: the per-sync `--backup-dir` (the visible `~/arena-sync-kept/<stamp>/`, protected from every mirror; the repo's beside its real dir, brought home by the tidy-up), the receiver's last-sync stamp and its pre-sync list of what changed on it (ctime), the on-pod tidy-up that drops only unchanged replica copies after a verified sync and keeps + lists the rest, the source's record of its syncs and the reset guard (`mirror_refusal`), and the same-session identity check every step runs behind (`guarded`, `--rsync-path`); plus the via-local staging's size (rsync dry-run stats) and free-space check | yes (real rsync + the real scripts on temp-dir pods) |
 | `restore` | `pods restore`: which backup (`wNdM`/custom/`big`, newest snapshot by default), `--path` checks, the rsync argv (never `--delete`, `--update` unless asked, `--backup-dir` on the volume when mounted, `--keep-dirlinks`, no owner/group, no keys/rc files, no snapshot `.git`), the post-push git check, and the "written after the reset" warning | yes |
 | `vscode` | the warm-up's config (`VSCODE_PREINSTALL`, `VSCODE_EXTENSIONS`, interpreter candidates) and its one-exec command; the embedded `vscode_setup.sh` installs the Remote-SSH server layout, extensions and machine settings (idempotent, checksum-verified, fail closed) | config pure; script tested on a fake pod |
-| `health` | `pods test --deep`: the embedded `deep_check.sh` only measures (key=value facts); `parse_deep` + `evaluate` judge them against `HealthPolicy` (driver floor from `MIN_DRIVER_VERSION` or `ALLOWED_CUDA_VERSIONS`, network/disk/load thresholds, maintenance); `FailureKind` says, from the facts, whether a FAIL is the host's (replace it) or the software's (`up --check` leaves it: python said torch won't import, a CPU-only torch) | yes (script runs over `Remote`) |
+| `health` | `pods test --deep`: the embedded `deep_check.sh` only measures (key=value facts); `parse_deep` + `evaluate` judge them against `HealthPolicy` (driver floor from `MIN_DRIVER_VERSION` or the create's CUDA floor, network/disk/load thresholds, maintenance); `FailureKind` says, from the facts, whether a FAIL is the host's (replace it) or the software's (`up --check` leaves it: python said torch won't import, a CPU-only torch) | yes (script runs over `Remote`) |
 | `proxy` | the nginx `stream` config: stable port = `MACHINE_NAME_LIST` index; `plan_forwards` **merges** the previous config with a per-provider listing and removes a forward only when its pod is confirmed gone; render ↔ parse round-trip | yes |
 | `fleet`, `status` | the one place a pod's labels (GPU, `$/H`, endpoint, maintenance) and the fleet cost are computed; `is_billing`/`bills_hourly` decide what counts as billing | yes |
 | `snapshot` | `FleetSnapshot` (`build`: pods + proxy state + last health), the SSH-port reachability probe behind the `Reach` seam (`SshPortProbe`: TCP connect + sshd's greeting, nothing sent), the prefix-scoped health cache (atomic, locked, 0600), and `PublicSnapshot` — a separate allowlisted struct for publishing (`up` needs the probe's answer) | build + targets pure; probe and cache I/O |
@@ -123,11 +123,11 @@ flowchart TD
    environment overrides.
 2. `provider::build_fleet("runpod", cfg)` builds the RunPod backend (v1 or v2 per
    `RUNPOD_API`, validated up front) plus every other provider that has credentials.
-3. `--gpu` is checked against RunPod's live GPU catalog (`gpu::check_gpu_flag`): a typo
-   stops here, before anything is listed or created.
-4. The fleet is listed (transient errors retried; if no provider answers it aborts rather
-   than read the fleet as empty and create duplicates) and `apple` is skipped if a pod
-   already holds the name.
+3. `--gpu` is checked against RunPod's live GPU catalog (`gpu::check_gpu_flag`; on v1 also
+   its create enum): a typo stops here, before anything is listed or created.
+4. The fleet is listed (`provider::list_complete`, transient errors retried; if *any*
+   provider doesn't answer it aborts rather than read a name a pod there holds as free and
+   create a duplicate) and `apple` is skipped if a pod already holds the name.
 5. Everything the pipelines need is validated *before* anything bills:
    `SETUP_TIMEOUT_SECS`, `MIN_DRIVER_VERSION`, the `ARENA_REPO_*` settings.
 6. `placement::plan_options` prices and orders the gpu × cloud options (RunPod's live
@@ -135,12 +135,14 @@ flowchart TD
    same plan `arena offers` and `--dry-run` print.
 7. `confirm` prompts (or `-y`; with no terminal and no `-y` it refuses).
 8. `placement::place` creates `apple` one option at a time; capacity blocks an option for
-   the round, `--retry-mins` adds rounds.
+   the round, `--retry-mins` adds rounds. Each created pod goes straight to step 9 while
+   placement goes on for the other names (`up::run_up_streaming`).
 9. `up` runs one independent pipeline per pod: wait for its SSH endpoint (one shared list
-   per `--interval`) → proxy sync (`proxy::plan_forwards` under a mutex and a file lock;
+   per `--interval`; 5 minutes up behind RunPod's SSH proxy only is a host failure) → proxy sync (`proxy::plan_forwards` under a mutex and a file lock;
    write; `SSH_PROXY_RELOAD_CMD`) → `setup::provision` over `Remote` → the deep check over
    `Remote` (`--check`; a FAIL terminates the pod, confirms it gone and recreates the
-   name, rejecting a host that already failed) → API keys → `[apple] READY after …`.
+   name, rejecting a machine — by provider machine id, else IP — that already failed) →
+   API keys → `[apple] READY after …`.
 10. Verdicts go to the health cache, the proxy is synced once more, and
     `pipeline::render_up_summary` prints the table; the exit is non-zero unless every
     requested name is READY.

@@ -151,6 +151,11 @@ impl VastProvider {
     /// Search the marketplace: the offers that fit `spec` right now, cheapest first (empty:
     /// nothing suitable is rentable). Read-only.
     async fn search(&self, spec: &PodSpec) -> Result<Vec<Offer>> {
+        // A CUDA value that isn't a version would read as "no floor" here (`cuda_floor`) and
+        // rent any host: refused before the request, as RunPod's creates refuse it.
+        if let Some(bad) = spec.bad_cuda() {
+            return Err(crate::pod::bad_cuda_error(bad));
+        }
         // Status first, then decode (crate::http): an auth/HTML error stays classified.
         let body = send_json(
             self.auth(
@@ -331,10 +336,12 @@ fn gpu_key(name: &str) -> String {
     name.chars().filter(char::is_ascii_alphanumeric).map(|c| c.to_ascii_lowercase()).collect()
 }
 
-/// The lowest CUDA version `ALLOWED_CUDA_VERSIONS` lists: a host must support at least it
-/// (Vast's `cuda_max_good`). `None` = no floor.
-fn cuda_floor(allowed: &[String]) -> Option<f64> {
-    allowed.iter().filter_map(|v| v.trim().parse::<f64>().ok()).filter(|v| v.is_finite()).reduce(f64::min)
+/// The spec's CUDA floor ([`PodSpec::cuda_floor`]: `MIN_CUDA_VERSION` / the lowest of
+/// `ALLOWED_CUDA_VERSIONS`, or the lowest of an exact set): a host must support at least it
+/// (Vast's `cuda_max_good`). `None` = no floor — or one that isn't a version, which
+/// [`VastProvider::search`] refuses before anything reads this ([`PodSpec::bad_cuda`]).
+fn cuda_floor(spec: &PodSpec) -> Option<f64> {
+    spec.cuda_floor().and_then(|v| v.trim().parse::<f64>().ok()).filter(|v| v.is_finite())
 }
 
 /// The `PUT /search/asks/` body for `spec`: Vast's filters, wrapped in `{"q": …}` (the flat
@@ -366,7 +373,7 @@ fn search_body(spec: &PodSpec, verified_only: bool) -> Value {
     if verified_only {
         q["verified"] = json!({"eq": true});
     }
-    if let Some(floor) = cuda_floor(&spec.allowed_cuda) {
+    if let Some(floor) = cuda_floor(spec) {
         q["cuda_max_good"] = json!({ "gte": floor });
     }
     if let Some(cap) = spec.max_price {
@@ -422,7 +429,7 @@ fn fitting_offer(v: &Value, spec: &PodSpec, verified_only: bool) -> Option<Offer
         && flag("external") != Some(true)
         && (verified || !verified_only)
         && v.get("direct_port_count").and_then(Value::as_u64) != Some(0)
-        && cuda_floor(&spec.allowed_cuda).is_none_or(|floor| offer.cuda_max_good.is_some_and(|c| c + 1e-9 >= floor))
+        && cuda_floor(spec).is_none_or(|floor| offer.cuda_max_good.is_some_and(|c| c + 1e-9 >= floor))
         && spec.max_price.is_none_or(|cap| milli(offer.price) <= milli(cap));
     fits.then_some(offer)
 }
@@ -601,7 +608,8 @@ fn rent_unsure(ask: u64, label: &str, why: &str) -> Error {
 /// What a `PUT /asks/{id}/` answer means. Pure, table-tested.
 /// - 2xx `{"success": true, "new_contract": <id>}` → the new instance's id.
 /// - 401/429 (and a 403 that isn't about the offer) → Auth/RateLimited by status, whatever
-///   the body says — as everywhere ([`crate::error::ProviderErrorKind::classify`]).
+///   the body says — as everywhere ([`crate::error::ProviderErrorKind::classify`]); so is
+///   Vast's bad-key answer, a 404 `{"error": "auth_error"}`.
 /// - A 5xx → [`rent_unsure`], whatever its body says: the contract may exist (a scheduling
 ///   error *after* the rent reads like capacity), so it is never capacity, never retried.
 /// - The offer is gone ([`offer_gone`], `410 Gone`, the docs' `403` "… is not your own") →
@@ -613,7 +621,9 @@ fn rent_outcome(status: StatusCode, text: &str, ask: u64, label: &str) -> Result
     let ctx = format!("vast create (offer {ask})");
     if !status.is_success() {
         let not_ours = status == StatusCode::FORBIDDEN && text.to_lowercase().contains("not your own");
-        if matches!(status.as_u16(), 401 | 429) || (status == StatusCode::FORBIDDEN && !not_ours) {
+        // A bad key (Vast's 404 `auth_error`, finding #33) is Auth here too: the run aborts.
+        let bad_key = status.is_client_error() && crate::error::looks_like_auth_error(text);
+        if matches!(status.as_u16(), 401 | 429) || (status == StatusCode::FORBIDDEN && !not_ours) || bad_key {
             return Err(status_error(status, text, &ctx));
         }
         if status.is_server_error() {
@@ -766,6 +776,7 @@ fn parse_instance(v: &Value) -> Pod {
         maintenance: None,
         machine_id: machine_of(v),
         locked: None, // Vast has no pod lock
+        proxy_only: false,
     }
 }
 
@@ -792,7 +803,11 @@ impl Provider for VastProvider {
     }
 
     fn describe(&self, spec: &PodSpec) -> String {
-        let cuda = cuda_floor(&spec.allowed_cuda).map(|v| format!(", CUDA ≥ {v:.1}")).unwrap_or_default();
+        let cuda = match (spec.bad_cuda(), cuda_floor(spec)) {
+            (Some(bad), _) => format!(", CUDA `{bad}` — not a version: creates are refused"),
+            (None, Some(v)) => format!(", CUDA ≥ {v:.1}"),
+            (None, None) => String::new(),
+        };
         let cap = spec.max_price.map(|c| format!(", ≤ {}/h", fmt_money("$", c))).unwrap_or_default();
         // `--bootstrap` brings up sshd on an image without one; Vast's launcher does that.
         let bootstrap = if spec.docker_args.is_some() { " (--bootstrap not needed: ignored)" } else { "" };
@@ -853,6 +868,7 @@ impl Provider for VastProvider {
                 maintenance: None,
                 machine_id: None,
                 locked: None,
+                proxy_only: false,
             });
         }
         Err(gone.unwrap_or_else(|| {
@@ -957,6 +973,7 @@ mod tests {
             env: vec![],
             docker_args: None,
             allowed_cuda: Vec::new(),
+            min_cuda: None,
             max_price: None,
             api_extra: None,
         }
@@ -1079,6 +1096,10 @@ mod tests {
         assert_eq!(q["dph_total"], json!({"lte": 0.15}));
         assert!(q.get("cuda_max_good").is_none());
         assert!(q.get("verified").is_none(), "unverified allowed: no verified filter");
+        // The floor config now gives (`min_cuda`, finding #10) filters the same way.
+        s.min_cuda = Some("13.0".into());
+        assert_eq!(search_body(&s, true)["q"]["cuda_max_good"], json!({"gte": 13.0}));
+        s.min_cuda = None;
         assert_eq!((&q["rented"], &q["external"]), (&json!({"eq": false}), &json!({"eq": false})));
     }
 
@@ -1284,6 +1305,8 @@ mod tests {
             ("already rented", 400, r#"{"success": false, "msg": "ask already rented"}"#, Err(Some(K::Capacity))),
             ("someone's private offer (docs' 403)", 403, not_ours, Err(Some(K::Capacity))),
             ("bad key", 401, "Unauthorized", Err(Some(K::Auth))),
+            // Vast's own bad-key answer (finding #33): a 404 with `auth_error`.
+            ("bad key, vast's 404", 404, r#"{"success": false, "error": "auth_error", "msg": "Invalid user key"}"#, Err(Some(K::Auth))),
             ("forbidden", 403, "Forbidden", Err(Some(K::Auth))),
             ("throttled", 429, "slow down", Err(Some(K::RateLimited))),
             ("throttled, whatever the body", 429, r#"{"msg": "no_such_ask"}"#, Err(Some(K::RateLimited))),
@@ -1618,6 +1641,33 @@ mod tests {
         assert_eq!(body(&srv, 5)["q"]["verified"], json!({"eq": true}));
         // Nothing was attached: no instance came of it.
         assert!(srv.requests.lock().unwrap().iter().all(|r| !r.contains("/ssh/")));
+    }
+
+    /// Review fix: a CUDA value that isn't a version is kept as the floor so every create
+    /// refuses it (`ALLOWED_CUDA_VERSIONS="13.0, 13.x"` → `13.x`) — but here it read as "no
+    /// floor": the search dropped `cuda_max_good` and Vast rented any host (a cu130 image on a
+    /// CUDA 12 host can't use its GPU). Now the search — the create, the plan's quote — is
+    /// refused before any request, and the dry run says why.
+    #[tokio::test]
+    async fn a_cuda_value_that_is_not_a_version_is_refused_before_any_request() {
+        let srv = serve(vec![canned(200, "application/json", SEARCH_3090)]);
+        let p = provider(&srv.base).allow_unverified(true);
+        let mut s = spec(R3090, 1, 50);
+        s.min_cuda = crate::pod::cuda_from_config(&crate::config::Config::parse("ALLOWED_CUDA_VERSIONS=\"13.0, 13.x\"")).floor;
+        assert_eq!(s.min_cuda.as_deref(), Some("13.x"));
+        let e = p.create_pod(&s).await.unwrap_err();
+        assert!(matches!(e, Error::Config(_)) && e.to_string().contains("`13.x`"), "{e}");
+        let quoted = p.quote(&[R3090.to_string()], &s, Duration::from_secs(5)).await;
+        assert!(quoted[0].1.as_ref().is_err_and(|e| e.contains("`13.x`")), "{quoted:?}");
+        assert!(p.describe(&s).contains("CUDA `13.x` — not a version: creates are refused"), "{}", p.describe(&s));
+        // A junk entry in an exact set too (its lowest good entry used to stand in silently).
+        s.min_cuda = None;
+        s.allowed_cuda = vec!["13.0".into(), "x".into()];
+        assert!(matches!(p.create_pod(&s).await, Err(Error::Config(_))));
+        assert!(srv.requests.lock().unwrap().is_empty(), "nothing searched, nothing rented");
+        // A good floor still filters (and describes) as before.
+        s.allowed_cuda = vec!["13.0".into()];
+        assert!(p.describe(&s).contains("CUDA ≥ 13.0"), "{}", p.describe(&s));
     }
 
     /// The repair path: the same idempotent attach, for an existing pod.

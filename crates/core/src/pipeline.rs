@@ -95,6 +95,9 @@ pub enum AttemptEnd {
     /// A replacement that landed on a machine IP that had already failed the deep check:
     /// rejected before it was set up or checked.
     SameHost,
+    /// Up, but reachable only through RunPod's SSH proxy for the grace period — a host with no
+    /// public IP: a host failure, like a failed check.
+    NoPublicIp,
 }
 
 /// One placement of a name — its first create or a replacement.
@@ -132,9 +135,9 @@ pub fn on_failed_host(host: Option<&str>, failed_hosts: &[String]) -> bool {
 }
 
 /// The confirmed names that got no pod in the create phase — each gets a row of its own in
-/// the report. At most as many as the create fell short by: a `-n`/`-a` retry round
-/// re-plans names (a confirmed one taken meanwhile is replaced by the next free one), and a
-/// name made in another's place is no shortfall. Pure.
+/// the report (a retry round only ever retries confirmed names, so one dropped as taken
+/// meanwhile, or past a met `-n` target, is listed too). At most as many as the create fell
+/// short by: should a name be made in another's place, that is no shortfall. Pure.
 pub fn not_created(confirmed: &[String], created: &[String]) -> Vec<String> {
     let short = confirmed.len().saturating_sub(created.len());
     confirmed.iter().filter(|n| !created.contains(n)).take(short).cloned().collect()
@@ -181,6 +184,7 @@ fn attempt_line(n: usize, a: &Attempt, verdict: &Verdict) -> String {
     let what = match &a.end {
         AttemptEnd::CheckFailed(notes) => format!("check FAIL — {notes}{fate}"),
         AttemptEnd::SameHost => format!("same host as a failed check — rejected{fate}"),
+        AttemptEnd::NoPublicIp => format!("no public SSH endpoint (RunPod ssh proxy only){fate}"),
         AttemptEnd::Kept => match verdict {
             Verdict::Ready => "ready".to_string(),
             Verdict::Failed { stage, .. } => format!("FAILED {}", stage.label()),
@@ -297,7 +301,7 @@ mod tests {
             (&["a", "b"], &["a", "b"], &[]),
             (&["a", "b"], &["a"], &["b"]),           // explicit names: the one missing
             (&["a", "b", "c"], &[], &["a", "b", "c"]),
-            (&["a", "b"], &["a", "c"], &[]),         // a re-planned round made c for b: no shortfall
+            (&["a", "b"], &["a", "c"], &[]),         // c made in b's place: no shortfall
             (&["a", "b", "c"], &["c", "d"], &["a"]), // short by one: the first one missing
             (&[], &["a"], &[]),
         ];

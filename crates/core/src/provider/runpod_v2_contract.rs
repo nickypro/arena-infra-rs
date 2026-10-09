@@ -101,6 +101,7 @@ fn sandbox_pod(name: &str) -> Pod {
         machine_id: None,
         // Every recording but the lock PATCHes' answers is of the pod unlocked.
         locked: Some(false),
+        proxy_only: false,
     }
 }
 
@@ -345,6 +346,7 @@ async fn unknown_gpu_create_is_a_config_error() {
         env: Vec::new(),
         docker_args: None,
         allowed_cuda: Vec::new(),
+        min_cuda: None,
         max_price: None,
         api_extra: None,
     };
@@ -376,10 +378,12 @@ fn validation_errors_keep_their_field_list() {
 #[test]
 fn catalog_parses_prices_stock_and_placeholders() {
     let r = recorded("catalog_community_cuda13");
-    let (method, ours) = sent(catalog_request(&client(), "k", "COMMUNITY"));
+    let (method, ours) = sent(catalog_request(&client(), "k", "COMMUNITY", None));
     assert_eq!(method, r.method);
     assert!(r.path.starts_with(&ours), "recorded {} vs ours {ours}", r.path);
     assert_eq!(ours, "/v2/catalog/gpus?include=AVAILABILITY&product=POD&cloud=COMMUNITY");
+    // With a CUDA floor the request is exactly the recorded one (finding #31).
+    assert_eq!(sent(catalog_request(&client(), "k", "COMMUNITY", Some("13"))).1, r.path);
 
     let types = parse_catalog(&judge_v2(r.status, &r.text(), "gpu catalog").unwrap()).unwrap();
     assert_eq!(types.len(), r.body["gpus"].as_array().unwrap().len());

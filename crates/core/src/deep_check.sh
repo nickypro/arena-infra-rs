@@ -106,6 +106,14 @@ GPUS
       msg=$(first_line "$q")
       kv smi_query "error: ${msg:-exit $rc}"
     fi
+    # MIG: the pod gets a slice ("  MIG 1g.34gb  Device 0: (UUID: MIG-…)" under its parent
+    # in `nvidia-smi -L`); --query-gpu names only the parent card.
+    lst=$(bounded 10 nvidia-smi -L 2>/dev/null)
+    mig=$(printf '%s\n' "$lst" | grep -c '^[[:space:]]*MIG [^[:space:]]')
+    if [ "${mig:-0}" -gt 0 ] 2>/dev/null; then
+      kv mig_devices "$mig"
+      kv mig_profile "$(printf '%s\n' "$lst" | sed -n 's/^[[:space:]]*MIG \([^[:space:]]*\).*/\1/p' | head -n 1)"
+    fi
   elif [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
     kv smi "error: nvidia-smi timed out after 10s"
   else

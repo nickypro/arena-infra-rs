@@ -6,7 +6,7 @@ use async_trait::async_trait;
 
 use crate::apiextra::{Extra, SOURCES};
 use crate::config::Config;
-use crate::error::{Error, Result};
+use crate::error::{Error, ProviderErrorKind as ErrorKind, Result};
 use crate::pod::{Pod, PodSpec};
 
 pub mod hetzner;
@@ -127,14 +127,73 @@ pub fn build(name: &str, cfg: &Config) -> Result<Box<dyn Provider>> {
 /// duplicate (billed) pod.
 pub const LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Await a backend's list call, failing as that backend's error once `limit` passes.
+/// Await a backend's list call, failing as that backend's error once `limit` passes — an
+/// [`Error::Timeout`] (`vast list timed out after 60s`): never retried in place (it already
+/// took the whole bound), but told apart from a refusal, so a retry round can wait out a
+/// stalled backend as it does a throttled one ([`crate::placement::relist`]).
 pub async fn bounded_list<F>(name: &str, list: F, limit: std::time::Duration) -> Result<Vec<Pod>>
 where
     F: std::future::Future<Output = Result<Vec<Pod>>>,
 {
     match tokio::time::timeout(limit, list).await {
         Ok(res) => res,
-        Err(_) => Err(Error::provider(format!("{name} list timed out after {}s", limit.as_secs_f64()))),
+        Err(_) => Err(Error::Timeout { what: format!("{name} list"), after: limit }),
+    }
+}
+
+/// Every configured backend's pods — or, if **any** backend didn't answer, an error naming
+/// it. For the callers that decide a machine name is free: create/up's name allocation
+/// (`-n`/`-a` and explicit names), placement's retry rounds, rename.
+///
+/// The fleet provider's `list_pods` skips a backend that failed (one warning line) — right
+/// for a dashboard, wrong here: "not in a listing Vast wasn't in" is not "free". Live, a bad
+/// `VAST_API_KEY` had `create delta` plan a second `devtest-delta` on RunPod next to Vast's
+/// running one (a duplicate name, billed twice), and `up -n 4` count a 4-pod fleet as 3. So
+/// this fails closed on one failed backend. The error is retryable (for
+/// [`crate::retry::retrying`]) only when every failure is — a 429/5xx passes; a rejected key
+/// doesn't, and the message then points at that backend's key.
+pub async fn list_complete(provider: &dyn Provider) -> Result<Vec<Pod>> {
+    let mut pods = Vec::new();
+    let mut failed: Vec<(String, Error)> = Vec::new();
+    for (name, listed) in provider.list_by_provider().await {
+        match listed {
+            Ok(p) => pods.extend(p),
+            Err(e) => failed.push((name, e)),
+        }
+    }
+    if failed.is_empty() {
+        return Ok(pods);
+    }
+    Err(partial_listing_error(&failed))
+}
+
+/// The refusal [`list_complete`] fails with: which backends didn't answer and why, what that
+/// means (no name can be known free), and what to do. Pure.
+pub(crate) fn partial_listing_error(failed: &[(String, Error)]) -> Error {
+    let names: Vec<&str> = failed.iter().map(|(n, _)| n.as_str()).collect();
+    let why: Vec<String> = failed.iter().map(|(n, e)| format!("{n}: {e}")).collect();
+    let keys: Vec<&str> = failed
+        .iter()
+        .filter(|(_, e)| e.kind() == Some(ErrorKind::Auth))
+        .filter_map(|(n, _)| crate::teardown::PROVIDER_KEYS.iter().find(|(p, _)| p == n).map(|(_, k)| *k))
+        .collect();
+    let fix = if keys.is_empty() {
+        format!("retry once {} answers again (`arena pods list` warns while it doesn't)", names.join(" and "))
+    } else {
+        format!(
+            "{} was rejected — fix it (or remove it from the config to leave that provider out of the fleet), then retry",
+            keys.join(" / ")
+        )
+    };
+    let retryable = failed.iter().all(|(_, e)| crate::retry::is_retryable(e));
+    Error::Provider {
+        kind: if retryable { ErrorKind::Transient } else { ErrorKind::Other },
+        message: format!(
+            "{} failed to list ({}) — refusing to pick machine names from a partial fleet listing: a pod \
+             there may already hold the name, and creating it again would duplicate it (billed twice). {fix}",
+            names.join(", "),
+            why.join("; ")
+        ),
     }
 }
 
@@ -331,6 +390,7 @@ mod tests {
             env: Vec::new(),
             docker_args: None,
             allowed_cuda: Vec::new(),
+            min_cuda: None,
             max_price: None,
             api_extra: None,
         }

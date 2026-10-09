@@ -74,8 +74,25 @@ pub fn endpoint_label(pod: &Pod) -> String {
     match (pod.ssh_ip.as_deref().filter(|s| !s.is_empty()), pod.ssh_port) {
         (Some(ip), Some(port)) => format!("{ip}:{port}"),
         (Some(ip), None) => format!("{ip}:?"),
+        _ if pod.proxy_only => PROXY_ONLY.to_string(),
         _ => "-".to_string(),
     }
+}
+
+/// How a pod up without a direct SSH endpoint ([`Pod::proxy_only`]) reads, wherever it shows.
+pub const PROXY_ONLY: &str = "no public endpoint (RunPod ssh proxy only)";
+
+/// Why `pod` can't be reached over SSH, when there's more to say than "no endpoint yet": it
+/// is stopped (live: `run`/`test` said "no SSH endpoint yet" for an EXITED pod, as if it
+/// were still coming up), or it is up with no public endpoint ([`PROXY_ONLY`]). `None` =
+/// the plain case (still coming up) — callers keep their own wording. Pure.
+pub fn no_endpoint_reason(pod: &Pod) -> Option<String> {
+    if pod.proxy_only {
+        return Some(format!("{PROXY_ONLY} — its host has no public IP; terminate it and create it again"));
+    }
+    let st = pod.status.trim().to_ascii_uppercase();
+    matches!(st.as_str(), "EXITED" | "STOPPED" | "STOPPING" | "OFF" | "TERMINATED" | "DELETING")
+        .then(|| format!("stopped ({}) — no SSH while it's stopped", pod.status.trim()))
 }
 
 /// Split an ISO-8601-ish timestamp (`2026-10-09T02:00:00Z`, or with a space instead of
@@ -250,6 +267,28 @@ pub fn fleet_footer(c: &FleetCost) -> String {
         out.push_str(&format!(" ({} unpriced)", c.unpriced));
     }
     out
+}
+
+/// `pods list`'s footer: [`fleet_footer`], marked as a lower bound when some providers
+/// didn't answer (`failed`) — their pods aren't in the table, so neither is their burn. Live
+/// (finding #9), a bogus `VAST_API_KEY` showed `fleet: $0.61/h across 3 billing pod(s)` for a
+/// fleet of 4 at $0.71/h, with nothing on that line saying a provider was missing. Pure.
+pub fn listing_footer(c: &FleetCost, failed: &[String]) -> String {
+    let line = fleet_footer(c);
+    if failed.is_empty() {
+        return line;
+    }
+    format!("{line} — PARTIAL: {} didn't answer, so its pods and their cost are missing", failed.join(", "))
+}
+
+/// What `pods list` prints instead of a table when nothing was listed — "(no pods)" only
+/// when every provider answered; otherwise the fleet is unknown, not empty. Pure.
+pub fn empty_listing_line(failed: &[String]) -> String {
+    if failed.is_empty() {
+        "(no pods)".to_string()
+    } else {
+        format!("(no pods listed — {} didn't answer, so this is NOT known to be empty)", failed.join(", "))
+    }
 }
 
 /// The `pods list` columns, in order (MAINT last: it's the long, free-text one).
@@ -468,6 +507,35 @@ mod tests {
         }
     }
 
+    /// A pod up with no direct endpoint says so in the ENDPOINT column, and a stopped or
+    /// proxy-only pod gets a reason of its own instead of "no SSH endpoint yet".
+    #[test]
+    fn endpoint_label_and_reason_name_proxy_only_and_stopped_pods() {
+        let mut p = pod("devtest-alpha", "runpod", "RUNNING");
+        assert_eq!((endpoint_label(&p), no_endpoint_reason(&p)), ("-".to_string(), None));
+        p.proxy_only = true;
+        assert_eq!(endpoint_label(&p), "no public endpoint (RunPod ssh proxy only)");
+        assert!(no_endpoint_reason(&p).unwrap().contains("no public IP"));
+        assert!(render_pods_table(std::slice::from_ref(&p)).contains("no public endpoint (RunPod ssh proxy only)"));
+        let stopped = pod("devtest-bravo", "runpod", "EXITED");
+        assert_eq!(no_endpoint_reason(&stopped).as_deref(), Some("stopped (EXITED) — no SSH while it's stopped"));
+        assert!(no_endpoint_reason(&pod("devtest-h", "hetzner", "off")).unwrap().starts_with("stopped (off)"));
+    }
+
+    /// Finding #9: a listing some provider didn't answer says so on the total, and an empty
+    /// one isn't "no pods".
+    #[test]
+    fn a_partial_listing_marks_its_footer_and_its_empty_line() {
+        let c = FleetCost { usd_per_hr: 0.61, billing: 3, priced_usd: 3, ..Default::default() };
+        assert_eq!(listing_footer(&c, &[]), "fleet: $0.61/h across 3 billing pod(s)");
+        assert_eq!(
+            listing_footer(&c, &["vast".to_string()]),
+            "fleet: $0.61/h across 3 billing pod(s) — PARTIAL: vast didn't answer, so its pods and their cost are missing"
+        );
+        assert_eq!(empty_listing_line(&[]), "(no pods)");
+        assert!(empty_listing_line(&["vast".into(), "hetzner".into()]).contains("vast, hetzner didn't answer"));
+    }
+
     #[test]
     fn fleet_footer_plain_and_empty() {
         let c = FleetCost { usd_per_hr: 2.5, billing: 3, priced_usd: 3, ..Default::default() };
@@ -497,6 +565,7 @@ mod tests {
                 )),
                 machine_id: None,
                 locked: None,
+                proxy_only: false,
             },
             Pod {
                 id: "def456".into(),

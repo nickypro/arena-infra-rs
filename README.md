@@ -39,12 +39,23 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     shown), the account balance (v2 has billing history only) and, as a fallback after
     REST v2, `teardown --check`'s volume listing; see the module doc of `runpod_v2.rs`.
     Contract tests replay scrubbed recorded v2 responses (`provider/fixtures/runpod_v2/`).
-    Neither API reports a pod's CUDA constraint, so `replace`/`migrate copy` re-apply the
-    configured `ALLOWED_CUDA_VERSIONS` to the replacement (as `create` does).
+    **Host CUDA is a floor**: `MIN_CUDA_VERSION` (or `ALLOWED_CUDA_VERSIONS`, now read as a
+    floor — its lowest version) goes out as v2's `gpu.minCudaVersion`, so any newer host
+    qualifies (an exact `["13.0"]` had made every 13.1/13.2 host — all B300 MIG ones — "no
+    capacity"). REST v1 has no floor and its schema stops at 13.0: it sends every listed
+    version ≥ the floor (13.1+ hosts unreachable; a 13.1+ floor or `EXACT_CUDA_VERSIONS`
+    entry is refused before the request, naming `RUNPOD_API=v2`). `EXACT_CUDA_VERSIONS` is
+    the opt-in exact set (`allowedCudaVersions`; never sent with a floor). A value that isn't
+    a version (`13.x`, `newest`) fails closed everywhere — every create (RunPod and Vast) is
+    refused and the deep check won't derive a driver floor from it — never read as "no floor".
+    v1 creates also
+    send `supportPublicIp: true` (some community hosts have no public IP, leaving only
+    RunPod's SSH proxy). Neither API reports a pod's CUDA constraint, so
+    `replace`/`migrate copy` re-apply the configured one to the replacement (as `create` does).
   - `provider::vast` — Vast.ai REST backend against the same trait. Vast rents
     *offers* rather than named pods, so `create_pod` searches the marketplace
     (`PUT /search/asks/`, filters wrapped in `{"q": …}`) for the cheapest rentable offer
-    matching the spec — exact GPU count, disk, CUDA floor from `ALLOWED_CUDA_VERSIONS`, open
+    matching the spec — exact GPU count, disk, CUDA floor (`MIN_CUDA_VERSION` / `ALLOWED_CUDA_VERSIONS`), open
     ports, **verified hosts only** (the vast CLI's base filters; `VAST_ALLOW_UNVERIFIED=1`
     admits unverified/deverified hosts — the verified market for a card can be empty), and
     `--max-price` (checked again at create: offers move) — and rents it with runtype
@@ -106,11 +117,16 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     + `HETZNER_*`). `restart`/`terminate` take **one** pod (name, bare name, `@name` or id —
     a name two pods share is refused: pass the id); `stop` takes the shared
     [target selection](#targeting--concurrency).
-    `list` shows NAME PROVIDER ID STATUS (`run locked` for a locked pod) GPU (`count×type`) $/H ENDPOINT MAINT (the
+    `list` shows NAME PROVIDER ID STATUS (`run locked` for a locked pod) GPU (`count×type`;
+    a MIG slice as the slice — `1×B300 MIG 34GB`, never the parent card nvidia-smi names;
+    RunPod's GPU is its display name on v1 and v2 alike, so `--json`'s `gpu_type` doesn't
+    change with `RUNPOD_API`) $/H ENDPOINT (`no public endpoint (RunPod ssh proxy only)` for
+    a pod up without a public IP) MAINT (the
     host's RunPod maintenance window, e.g. `maint 10-09 02:00→06:00 UTC`; the host's
     free-text note is flattened onto one line) and a footer
     `fleet: $X/h across N billing pod(s)` summing the **billing** pods (Hetzner's € shown
-    separately, unpriced pods counted). "Billing" is one rule (`status::is_billing`):
+    separately, unpriced pods counted; `— PARTIAL: vast didn't answer …` when a provider
+    failed to list, and no "(no pods)" claim then). "Billing" is one rule (`status::is_billing`):
     running or on its way up — RunPod v2 `PROVISIONING`/`STARTING`/`ERROR` too, Hetzner
     `initializing`, Vast `loading` — not `EXITED`/`STOPPED`/`TERMINATED`/`off`; a Hetzner
     server bills while it exists, powered off included. A non-billing pod's `$/H` shows `-`
@@ -225,22 +241,38 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     refused one stops them before anything is created). It applies to whichever provider
     creates, so keep it to fields that provider takes (an unknown field is the API's error).
   - `create` also takes **explicit names** (`pods create apple bloom`) and an
-    **`--image`** override, alongside `-n`(target total) / `-a`(add). Bare names get
-    the configured prefix; names already present are skipped.
+    **`--image`** override, alongside `-n` (target number on `--provider`; pods on other
+    providers don't count) / `-a` (add). Bare names get the configured prefix; names already
+    present are skipped. Every name-picking listing — `-n`/`-a`, explicit names, placement's
+    retry rounds, `rename`, the TUI's add-pod form — must come from **every** configured
+    provider: if one fails to list, the command refuses (naming the provider; a rejected key
+    is named too), since a name a pod there holds would read as free and be created twice
+    (live: a bogus `VAST_API_KEY` had `create delta` plan a duplicate of Vast's
+    `devtest-delta`). `pods list` still shows what answered, its footer marked `PARTIAL`.
+    Between `--retry-mins` rounds, a backend that is only throttled or erroring (429/5xx,
+    past the listing's own retries) or whose list stalled past its 60 s bound skips that
+    round — nothing is created from the partial listing — and the next round lists again;
+    a rejected key ends the run.
   - `create`/`up` take `--retry-mins <M>` (`--retry-secs`, default 60) to **keep
     topping up to the target** while capacity is short — one round per interval for up
     to M minutes, **Ctrl+C** stops early keeping what was made. A `no instances
     available` capacity error is recognized as such (it waits), not treated as fatal.
     A round starts only while it still fits in the window (no create after it closes).
-    The confirm prompt lists the exact pod names about to be created.
+    The confirm prompt lists the exact pod names about to be created, and a later round
+    only retries those not made yet (after a whole-fleet listing: one that exists now is
+    skipped, a met `-n` target stops it) — never a name picked afresh, which under `up`
+    could be one whose pod `--check` is replacing right then.
   - **`--gpu` is checked** (`create`/`up`/`offers`/`replace`/`migrate copy`, RunPod only):
-    each token — an alias (`3070`, `4080super`, `L4`, `2000ada`, `A4500`, …), an exact id
-    (any case) or a unique catalog short name (`RTX 3070`, `H100 SXM`) — must be in RunPod's
+    each token — an exact id (any case), the catalog's display name as `arena gpus` prints it
+    (`RTX PRO 6000`, `B300 MIG 34GB` — checked before the aliases, so `RTX PRO 6000` is the
+    Server Edition, as listed), an alias (`3070`, `4080super`, `L4`, `2000ada`, `A4500`, …)
+    or a unique catalog short name (`RTX 3070`, `H100 SXM`) — must be in RunPod's
     live GPU catalog (GraphQL on v1, `GET /v2/catalog/gpus` on `RUNPOD_API=v2`), else the
     command stops before anything is created: ``--gpu: `3070x`
     isn't a RunPod GPU type — did you mean `NVIDIA GeForce RTX 3070` (RTX 3070)?``. If the
-    catalog can't be fetched it warns and passes the flag through unchecked. Vast/Hetzner:
-    passed through as before.
+    catalog can't be fetched it warns and passes the flag through unchecked. On REST v1 an
+    id outside v1's create enum (it lags the catalog — the PRO 6000 MIG slices) is refused
+    too, pointing at `RUNPOD_API=v2`. Vast/Hetzner: passed through as before.
   - **Multi-option placement** (`create`/`up`): `--gpu A4000,4000Ada,3090 --cloud
     community,secure --max-price 0.5 [--order cheapest|listed]`. The gpu × cloud options
     are priced (RunPod's live catalog — v2 `/catalog/gpus` per tier on `RUNPOD_API=v2`, once
@@ -252,7 +284,11 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     **one create at a time** (never two creates for one name); a capacity error skips that
     option for the rest of the round; a v2 create `403` ("no access to the requested pool")
     skips it for the whole run (`[no access]`), and if *every* option is refused the run
-    aborts as an access problem; auth aborts, any other error stops as before.
+    aborts as an access problem; an option whose request the API rejects as invalid (v1's
+    `400 … schema requirements`, v2's `422 Unknown GPU type`) is skipped for the run too
+    (`[rejected]`; the error keeps v1's `problems` list) and the run fails once every
+    option is refused (rejected or denied, in any mix — at once, not after idling out the
+    window); auth aborts, any other error stops as before.
     `--retry-mins` re-runs rounds (blocks cleared, fleet re-listed first so a name that
     appeared meanwhile — or a met `-n` target — isn't created again) only while the next
     round would still start inside the window; Ctrl+C between rounds keeps what was made. Ends with a per-name table: `created on 1×RTX 3090 COMMUNITY
@@ -271,8 +307,13 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     read-only: the same option table (OPTION, CLOUD, $/H/POD, PRICE source, STOCK, plus what
     the cap dropped and why), i.e. what `create`/`up` would try. `--json` = the plan.
   - `pods up -n N` — one-command spin-up: create, then **one independent pipeline per
-    pod** (never a batch): wait for *its* SSH endpoint and sshd answering (`--timeout`,
-    default 600s, per pod)
+    pod** (never a batch), each started **the moment its create returns** — while placement
+    may still be retrying for other names under `--retry-mins` (placed pods used to sit idle,
+    billing, until the window ended): wait for *its* SSH endpoint and sshd answering
+    (`--timeout`, default 600s, per pod; a pod up for 5 minutes with only RunPod's SSH proxy
+    — a host with no public IP — is a host failure: `FAILED endpoint`, or replaced under
+    `--check`; so is one still up behind the proxy only when a shorter `--timeout` ends, and
+    a listing that momentarily lacks the pod doesn't restart those 5 minutes)
     → sync the proxy (one writer at a time) → provision it (`--no-setup` skips) →
     [`--check`: deep check] → copy its API keys (when `keys/*_api_keys.csv` exist) →
     `[name] READY after 4m10s — …` or `[name] FAILED <stage>: …`, printed the moment that
@@ -288,10 +329,13 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     **`--check`** deep-checks each pod after setup (`pods test --deep`). A FAIL on the host
     (driver, CUDA, device count, a GPU's tensor op, peer copies, NCCL) is a bad machine: the
     pod is terminated, confirmed gone from its own provider's listing (never two
-    pods per name), and the name recreated from the same `--gpu/--cloud/--max-price` options
+    pods per name — and no replacement if another pod has taken the name meanwhile), and the
+    name recreated from the same `--gpu/--cloud/--max-price` options
     (or the one configured spec) — options that haven't failed first, waiting for capacity
     per `--retry-mins` or `--keep-trying` — and run through the pipeline again; a replacement
-    that lands on a machine IP that already failed (any name's) is rejected unseen and
+    that lands on a machine that already failed (any name's; by the provider's machine id —
+    RunPod's `machineId` from REST v1 or GraphQL — before the IP, which several RunPod hosts
+    share) is rejected unseen and
     terminated (even with no attempt left). Up to `--check-attempts N` placements per name
     (default 2); the last pod that FAILed its check is left running for a look. Only a check
     whose script ran can condemn a host: one that couldn't run (SSH dropped, timed out) is
@@ -481,8 +525,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     torch/nvidia-smi, driver below the floor, unreachable/timed out. **WARN**: download
     < 2 MB/s or unreachable, < 10 GB free, host load above max(32, host CPUs), a
     maintenance window. Driver floor: `MIN_DRIVER_VERSION` (`none` = off), else derived from
-    `ALLOWED_CUDA_VERSIONS` (13.x → 580, 12.8 → 570, 12.4 → 550, …; the lowest listed
-    version wins), else no driver check. Hetzner CPU VMs skip the GPU checks (decided by
+    the create's CUDA floor — `MIN_CUDA_VERSION`, else the lowest of `ALLOWED_CUDA_VERSIONS`
+    / `EXACT_CUDA_VERSIONS` (13.x → 580, 12.8 → 570, 12.4 → 550, …; one that isn't a version
+    is an error, as a malformed `MIN_DRIVER_VERSION` is) — else no driver check. Hetzner CPU VMs skip the GPU checks (decided by
     provider only: a RunPod/Vast pod the API reports with 0 GPUs still gets them, plus a
     `provider` warning). Output: a
     `NAME RESULT GPUS DRIVER CUDA NET NOTES` table, `-v` lists every check, and a `same
@@ -768,17 +813,24 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     (there is no other verb) with the configured key, printed as pretty JSON. The path is
     relative to the provider's API base — absolute URLs, `//host`, `..` and `#` are refused
     before the key is read, redirects aren't followed — so the key only goes to the provider.
+    A leading copy of the base's own path is dropped (`/v2/pods` on v2 is `pods`, not
+    `…/v2/v2/pods`); another version (`v1/…` against v2) is refused, naming `runpod-v1`.
     Secrets are redacted (env values, key/token/password fields, `rpa_`/`sk-`/`hf_` tokens,
     SSH key material) unless `--raw`; the API key itself is never printed, `--raw` included
     (scrubbed from the body as received, before an error message clips it).
   - `gpus` — list the GPU types for `--gpu`: RunPod's **full live catalog** (via GraphQL;
-    on `RUNPOD_API=v2` via `GET /v2/catalog/gpus`, STOCK then for the configured cloud, no
-    GraphQL) when on RunPod with a key, else the local presets. Shows VRAM, **live**
-    community/secure $/hr and RunPod's 1-GPU stock hint (`~` marks a preset estimate). On
+    on `RUNPOD_API=v2` via `GET /v2/catalog/gpus` for both tiers — STOCK shown as
+    `community/secure`, counted over hosts at or above the CUDA floor, and the best signal the
+    answer carries (a data center's level, a CUDA version tagged available) — no GraphQL)
+    when on RunPod with a key, else the local presets. Shows VRAM, **live**
+    community/secure $/hr (a tier that doesn't offer the card shows `-`: v1's GraphQL quotes
+    phantom prices for those, dropped by its `secureCloud`/`communityCloud` flags) and
+    RunPod's stock hint (`~` marks a preset estimate). On
     v1, if RunPod rejects the priced query (HTTP 200 with errors, or a non-auth 4xx/5xx), the plain catalog
     query is tried before falling back to presets. `--json` emits rows
     `{id, display_name, memory_gb, community_price, secure_price, stock_status, creatable,
-    source, price_source}` (incl. catalog entries the create API rejects, `creatable: false`).
+    source, price_source}` (+ `secure_stock_status` on v2; incl. catalog entries v1's create
+    API rejects, `creatable: false`; on v2 every row is creatable).
   - `ssh-config [--proxy] [--out]` — emit the **participant-facing `~/.ssh/config`**:
     direct pod endpoints by default, or stable proxy ports (`--proxy`) anchored to each
     machine's `MACHINE_NAME_LIST` index. Read-only.
@@ -952,7 +1004,8 @@ Hetzner), commit/backup, the GPU/progress dashboard, and proxy/port-forwarding.
 - **Mutating commands act, but confirm first.** `create`/`stop`/`terminate`/… print
   what they'll do and prompt `Proceed? [y/N]` at a terminal. `-y`/`--yes` skips the
   prompt. With **no terminal** (cron, pipes) they *refuse* unless `--yes` is given — so
-  nothing mutates non-interactively by accident. (`cron install`/`remove` confirm too, and
+  nothing mutates non-interactively by accident — and exit with status **2** (a declined
+  prompt at a terminal is `aborted.`, status 0). (`cron install`/`remove` confirm too, and
   bake `--yes` into the lines they install.)
 - **`--dry-run` previews** any mutating command (also `--dry`/`--dryrun`): prints exactly
   what would happen and changes nothing.

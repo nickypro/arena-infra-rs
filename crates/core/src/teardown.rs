@@ -320,6 +320,10 @@ impl AllScope {
     }
 }
 
+/// What the CLI appends to a listing error that is an authentication failure
+/// ([`crate::ProviderErrorKind::Auth`]): the listings reach [`build`] as text.
+pub const KEY_REJECTED: &str = "the API key was rejected";
+
 /// Whether the provider itself reports the pod deleted (billing nothing).
 fn is_terminated(p: &Pod) -> bool {
     p.status.trim().eq_ignore_ascii_case("TERMINATED")
@@ -336,7 +340,13 @@ pub fn pods_item(provider: &str, listing: Result<&[Pod], &String>, naming: &Nami
     let pods = match listing {
         Err(e) => {
             let mut item = Item::new(Area::Pods, provider, Verdict::Unknown, format!("couldn't list ({e}) — NOT known to be empty"));
-            item.notes.push(format!("re-run the check (a rate limit or outage passes); if it keeps failing, look in the {provider} console"));
+            // A rejected key won't pass by re-running (finding #33: Vast's bogus key read as
+            // "re-run"); say which key.
+            let note = match PROVIDER_KEYS.iter().find(|(p, _)| *p == provider).filter(|_| e.contains(KEY_REJECTED)) {
+                Some((_, key)) => format!("{provider} rejected {key} — fix it in the config, then re-run the check"),
+                None => format!("re-run the check (a rate limit or outage passes); if it keeps failing, look in the {provider} console"),
+            };
+            item.notes.push(note);
             return item;
         }
         Ok(pods) => pods,
@@ -1109,6 +1119,15 @@ mod tests {
         assert!(vast.summary.contains("HTTP 429") && vast.summary.contains("NOT known to be empty"), "{}", vast.summary);
         assert!(r.render().contains("? pods (vast): couldn't list"), "{}", r.render());
         assert_eq!(r.verdict_line(), "NOT CLEAR: 0 item(s) still remain, 1 couldn't be checked.");
+        assert!(vast.notes[0].starts_with("re-run the check"), "{:?}", vast.notes);
+        // Finding #33: a rejected key isn't something re-running fixes — the note names it.
+        let mut i = inputs();
+        let auth = format!("provider error: list instances HTTP 404 Not Found: {{\"error\":\"auth_error\"}} — {KEY_REJECTED}");
+        i.listings.push(("vast".into(), Err(auth)));
+        let r = build(&i, &naming);
+        let vast = r.items.iter().find(|it| it.scope == "vast").unwrap();
+        assert_eq!(vast.verdict, Verdict::Unknown);
+        assert_eq!(vast.notes, ["vast rejected VAST_API_KEY — fix it in the config, then re-run the check"]);
     }
 
     /// Every pod in any state counts — a stopped pod keeps its name and bills its disk; only a

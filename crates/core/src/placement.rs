@@ -492,6 +492,10 @@ pub enum Outcome {
     /// This account may not use this option (RunPod v2's 403 on create: no access to the
     /// pool): skipped for the rest of the run — waiting won't grant access.
     Denied(String),
+    /// The API refused this option's request as invalid (RunPod v1's schema 400 — a GPU type
+    /// its create enum lacks — or v2's 422 "Unknown GPU type"): skipped for the rest of the
+    /// run, like `Denied`. Another option may be fine; this one won't become fine by waiting.
+    Rejected(String),
     /// Credentials rejected: the run aborts.
     Auth(String),
     /// Anything else: the run stops, as a single-option create does.
@@ -625,12 +629,22 @@ pub enum Progress<'a> {
     Attempt {
         name: &'a str,
         option: &'a PlacementOption,
+        /// Its index in the plan's options.
+        index: usize,
         outcome: &'a Outcome,
         /// After a capacity error: another option is still open for this name this round.
         next: bool,
+        /// The pod this attempt created (with [`Outcome::Created`]) — so a caller can start on
+        /// it at once, while the run goes on placing the other names (`up`'s pipelines).
+        pod: Option<&'a Pod>,
     },
-    Waiting { round: u32, unplaced: usize, every: Duration },
+    /// Between rounds. `listing_missing`: the last round was skipped ([`Progress::Unlisted`]),
+    /// not short of capacity.
+    Waiting { round: u32, unplaced: usize, every: Duration, listing_missing: bool },
     Skipped { name: &'a str, why: &'a str },
+    /// Round `round` ran no create: the fleet listing before it was missing a backend that may
+    /// answer again ([`Relisted::Partial`]).
+    Unlisted { round: u32, error: &'a Error },
 }
 
 impl Progress<'_> {
@@ -641,7 +655,7 @@ impl Progress<'_> {
 
     pub fn line(&self) -> String {
         match self {
-            Progress::Attempt { name, option, outcome, next } => {
+            Progress::Attempt { name, option, outcome, next, .. } => {
                 let on = option.describe();
                 match outcome {
                     Outcome::Created { pod_id } => {
@@ -655,15 +669,21 @@ impl Progress<'_> {
                         "[no access] {name} on {on}: {e}{}",
                         if *next { " — skipping this option, trying the next" } else { " — skipping this option" }
                     ),
+                    Outcome::Rejected(e) => format!(
+                        "[rejected] {name} on {on}: {e}{}",
+                        if *next { " — skipping this option, trying the next" } else { " — skipping this option" }
+                    ),
                     Outcome::Auth(e) => format!("[auth failed] {name} on {on}: {e}"),
                     Outcome::Failed(e) => format!("[failed] {name} on {on}: {e}"),
                 }
             }
-            Progress::Waiting { round, unplaced, every } => format!(
-                "round {round}: {unplaced} name(s) not placed (no capacity); retrying in {}s (Ctrl+C to stop)…",
+            Progress::Waiting { round, unplaced, every, listing_missing } => format!(
+                "round {round}: {unplaced} name(s) not placed ({}); retrying in {}s (Ctrl+C to stop)…",
+                if *listing_missing { "fleet listing incomplete" } else { "no capacity" },
                 every.as_secs()
             ),
             Progress::Skipped { name, why } => format!("skip {name} — {why}"),
+            Progress::Unlisted { round, error } => format!("round {round}: nothing created — {error}"),
         }
     }
 }
@@ -679,8 +699,13 @@ impl Progress<'_> {
 ///
 /// With a retry window, unplaced names get another round every `rounds.every` while that
 /// round would still start inside the window; capacity blocks are cleared each round, and
-/// the fleet is re-listed first ([`still_needed`]) — a failed list ends the run rather than
-/// risk a duplicate. `interrupt` makes a fresh "stop" future per wait (Ctrl+C in the CLI): it
+/// the fleet is re-listed first ([`relist`], then [`still_needed`]). No round creates from a
+/// listing with any backend missing ([`crate::provider::list_complete`]): one that may
+/// recover (throttled, 5xx, stalled) skips that round — the next lists again, inside the same window —
+/// and any other failure ends the run rather than risk a duplicate. A round whose listing
+/// outlasted the window doesn't run. Finally, once every option is out for good (denied or
+/// rejected, in any mix), the run ends at once instead of idling out its window.
+/// `interrupt` makes a fresh "stop" future per wait (Ctrl+C in the CLI): it
 /// ends the run between rounds, keeping what was made. The option order is the confirmed
 /// plan's — fixed for the run — and every create carries its `--max-price`
 /// ([`PodSpec::max_price`]), which a marketplace backend enforces on the offer it rents.
@@ -705,8 +730,10 @@ where
         names.iter().map(|n| NameLog { name: n.clone(), turns: 0, attempts: Vec::new(), placed: None, skipped: None }).collect();
     let mut created = Vec::new();
     let mut pending: Vec<usize> = (0..log.len()).collect();
-    // Options this account can't use: unlike capacity blocks, never cleared.
+    // Options this account can't use (`Denied`) or the API refuses as invalid (`Rejected`):
+    // unlike capacity blocks, never cleared.
     let mut denied = vec![false; plan.options.len()];
+    let mut rejected = vec![false; plan.options.len()];
     let mut round = 0u32;
     let end = 'run: loop {
         if pending.is_empty() {
@@ -720,7 +747,7 @@ where
             let name = log[i].name.clone();
             let mut placed = false;
             for (k, option) in plan.options.iter().enumerate() {
-                if blocked[k] || denied[k] {
+                if blocked[k] || denied[k] || rejected[k] {
                     continue;
                 }
                 // The cap travels with the spec: a marketplace backend (Vast) picks the
@@ -753,6 +780,11 @@ where
                                     ),
                                 };
                                 (outcome, Some(End::Aborted { name: name.clone(), error }))
+                            } else if refused_all(&denied, &rejected) {
+                                // Some rejected as invalid, the rest denied: nothing is left to try
+                                // ever again, whichever kind of refusal came last — without this the
+                                // run idled out its whole window making no create ("no capacity").
+                                (outcome, Some(End::Failed { name: Some(name.clone()), error: every_option_refused(&e) }))
                             } else {
                                 (outcome, None)
                             }
@@ -760,11 +792,25 @@ where
                         Some(ProviderErrorKind::Auth) => {
                             (Outcome::Auth(e.to_string()), Some(End::Aborted { name: name.clone(), error: e }))
                         }
+                        // Invalid for this option only (finding #22: one v1 schema 400 on the
+                        // first option left four good ones untried). Once nothing usable is
+                        // left, the run ends as failed — a request every option refuses is the
+                        // spec's fault, not the pools'.
+                        _ if is_rejected(&e) => {
+                            rejected[k] = true;
+                            let outcome = Outcome::Rejected(e.to_string());
+                            if refused_all(&denied, &rejected) {
+                                (outcome, Some(End::Failed { name: Some(name.clone()), error: every_option_refused(&e) }))
+                            } else {
+                                (outcome, None)
+                            }
+                        }
                         _ => (Outcome::Failed(e.to_string()), Some(End::Failed { name: Some(name.clone()), error: e })),
                     },
                 };
-                let next = (k + 1..plan.options.len()).any(|j| !blocked[j] && !denied[j]);
-                on_progress(&Progress::Attempt { name: &name, option, outcome: &outcome, next });
+                let next = (k + 1..plan.options.len()).any(|j| !blocked[j] && !denied[j] && !rejected[j]);
+                let pod = placed.then(|| created.last()).flatten();
+                on_progress(&Progress::Attempt { name: &name, option, index: k, outcome: &outcome, next, pod });
                 log[i].attempts.push(Attempt { option: k, round, at, outcome });
                 if placed {
                     log[i].placed = Some(k);
@@ -786,40 +832,127 @@ where
         if rounds.window.is_zero() || plan.options.is_empty() {
             break End::Exhausted;
         }
-        // A round starts only inside the window. The next one would start `every` from now,
-        // so if that's past the deadline, end here — not sleep just to give up, nor create
-        // (bill) up to `every` after the window the operator agreed to. (Decided before the
-        // sleep, so timer slack can't flip it.)
-        if !next_round_in_window(tokio::time::Instant::now(), rounds.every, deadline) {
-            break End::WindowElapsed;
-        }
-        on_progress(&Progress::Waiting { round, unplaced: pending.len(), every: rounds.every });
-        tokio::select! {
-            _ = tokio::time::sleep(rounds.every) => {}
-            _ = interrupt() => break End::Interrupted,
-        }
-        match retrying(&policy, || provider.list_pods()).await {
-            Ok(fleet) => {
-                let names: Vec<String> = pending.iter().map(|&i| log[i].name.clone()).collect();
-                let (keep, dropped) = still_needed(&names, &fleet, topup);
-                for (name, why) in dropped {
-                    on_progress(&Progress::Skipped { name: &name, why: &why });
-                    if let Some(l) = log.iter_mut().find(|l| l.name == name) {
-                        l.skipped = Some(why);
-                    }
-                }
-                pending.retain(|&i| keep.contains(&log[i].name));
+        // Wait for the next round. The whole fleet is listed first, every backend: a name on a
+        // backend that didn't answer isn't free. A listing that may recover skips that round
+        // (nothing created) and the wait starts over, inside the same window.
+        let mut listing_missing = false;
+        loop {
+            // A round starts only inside the window. The next one would start `every` from
+            // now, so if that's past the deadline, end here — not sleep just to give up, nor
+            // create (bill) up to `every` after the window the operator agreed to. (Decided
+            // before the sleep, so timer slack can't flip it.)
+            if !next_round_in_window(tokio::time::Instant::now(), rounds.every, deadline) {
+                break 'run End::WindowElapsed;
             }
-            Err(e) => {
-                let error = Error::provider(format!(
-                    "listing pods before retry round {} (refusing to create — a failed list could duplicate pods): {e}",
-                    round + 1
-                ));
-                break End::Failed { name: None, error };
+            on_progress(&Progress::Waiting { round, unplaced: pending.len(), every: rounds.every, listing_missing });
+            tokio::select! {
+                _ = tokio::time::sleep(rounds.every) => {}
+                _ = interrupt() => break 'run End::Interrupted,
+            }
+            match relist(provider).await {
+                Relisted::Whole(fleet) => {
+                    // The listing (retried with backoff) can outlast the window: no round after it.
+                    if tokio::time::Instant::now() > deadline {
+                        break 'run End::WindowElapsed;
+                    }
+                    let names: Vec<String> = pending.iter().map(|&i| log[i].name.clone()).collect();
+                    let (keep, dropped) = still_needed(&names, &fleet, topup);
+                    for (name, why) in dropped {
+                        on_progress(&Progress::Skipped { name: &name, why: &why });
+                        if let Some(l) = log.iter_mut().find(|l| l.name == name) {
+                            l.skipped = Some(why);
+                        }
+                    }
+                    pending.retain(|&i| keep.contains(&log[i].name));
+                    break;
+                }
+                Relisted::Partial(error) => {
+                    round += 1;
+                    listing_missing = true;
+                    on_progress(&Progress::Unlisted { round, error: &error });
+                }
+                Relisted::Failed(e) => {
+                    let error = Error::provider(format!(
+                        "listing pods before retry round {} (refusing to create — a failed list could duplicate pods): {e}",
+                        round + 1
+                    ));
+                    break 'run End::Failed { name: None, error };
+                }
             }
         }
     };
     Placement { log, created, rounds: round, end }
+}
+
+/// Whether a create error means "this option's request is invalid" — skip the option, try
+/// the next ([`Outcome::Rejected`]): RunPod v1's schema 400 ([`ProviderErrorKind::Rejected`])
+/// or a config-level refusal such as v2's 422 "Unknown GPU type" ([`Error::Config`]).
+fn is_rejected(e: &Error) -> bool {
+    matches!(e, Error::Config(_)) || e.kind() == Some(ProviderErrorKind::Rejected)
+}
+
+/// Whether every option is out for the rest of the run — each one denied or rejected, in
+/// whatever mix and order. (Capacity blocks don't count: a later round clears them.) Pure.
+fn refused_all(denied: &[bool], rejected: &[bool]) -> bool {
+    denied.iter().zip(rejected).all(|(d, r)| *d || *r)
+}
+
+/// The error a run fails with once [`refused_all`] holds and not every refusal was a `Denied`
+/// (that one is an access problem with the key: `End::Aborted`).
+fn every_option_refused(last: &Error) -> Error {
+    Error::provider(format!("every option was refused as an invalid request (or not accessible) — last: {last}"))
+}
+
+/// What the fleet listing before a retry round came to ([`relist`]).
+#[derive(Debug)]
+pub enum Relisted {
+    /// Every backend answered: the round may run.
+    Whole(Vec<Pod>),
+    /// A backend didn't answer, but may yet — every failure throttled, a 5xx or unreachable
+    /// (already retried with backoff), or a list that stalled past its bound
+    /// ([`crate::provider::LIST_TIMEOUT`]). This round creates nothing; the next lists again.
+    Partial(Error),
+    /// A failure waiting won't fix (a rejected key, an unreadable answer): the run ends — no
+    /// round runs without knowing what exists.
+    Failed(Error),
+}
+
+/// The whole fleet before a retry round — what [`crate::provider::list_complete`] gives,
+/// retried with backoff the same way ([`RetryPolicy::default`]) — shared by the placement
+/// executor and the CLI's single-option loop. A partial listing never lets a round create —
+/// a name held on the backend that didn't answer would read as free — but one that may
+/// recover only skips that round: an outage of an unrelated provider (Vast throttling while
+/// placing on RunPod) used to end a `--retry-mins` cohort start for every unplaced name, and
+/// an `up --check` replacement after its old pod was already terminated.
+///
+/// A stalled backend ([`Error::Timeout`] from the listing's bound) counts as one that may
+/// recover, like a 504 would, but isn't re-listed in place: each try already took the whole
+/// bound, so the next round's listing is its retry.
+pub async fn relist(provider: &dyn Provider) -> Relisted {
+    let policy = RetryPolicy::default();
+    let mut retries = 0u32;
+    loop {
+        let mut fleet = Vec::new();
+        let mut failed: Vec<(String, Error)> = Vec::new();
+        for (name, listed) in provider.list_by_provider().await {
+            match listed {
+                Ok(pods) => fleet.extend(pods),
+                Err(e) => failed.push((name, e)),
+            }
+        }
+        if failed.is_empty() {
+            return Relisted::Whole(fleet);
+        }
+        let error = crate::provider::partial_listing_error(&failed);
+        // Every failure throttled/5xx: retried with backoff, as `retrying` does.
+        if crate::retry::is_retryable(&error) && retries < policy.max_retries {
+            retries += 1;
+            tokio::time::sleep(policy.backoff(retries)).await;
+            continue;
+        }
+        let may_recover = failed.iter().all(|(_, e)| crate::retry::is_retryable(e) || matches!(e, Error::Timeout { .. }));
+        return if may_recover { Relisted::Partial(error) } else { Relisted::Failed(error) };
+    }
 }
 
 /// The end-of-run table: each name → where it was created, or why not. Pure.
@@ -832,6 +965,7 @@ pub fn render_summary(plan: &OptionPlan, run: &Placement) -> String {
                 Outcome::Created { .. } => continue,
                 Outcome::Capacity(_) => "capacity",
                 Outcome::Denied(_) => "no access",
+                Outcome::Rejected(_) => "rejected",
                 Outcome::Auth(_) => "auth failed",
                 Outcome::Failed(_) => "failed",
             };
@@ -848,7 +982,8 @@ pub fn render_summary(plan: &OptionPlan, run: &Placement) -> String {
             .collect::<Vec<_>>()
             .join("; ")
     };
-    let any_denied = run.log.iter().flat_map(|l| &l.attempts).any(|a| matches!(a.outcome, Outcome::Denied(_)));
+    let any_denied =
+        run.log.iter().flat_map(|l| &l.attempts).any(|a| matches!(a.outcome, Outcome::Denied(_) | Outcome::Rejected(_)));
     let rows: Vec<Vec<String>> = run
         .log
         .iter()
@@ -900,6 +1035,7 @@ mod tests {
             env: Vec::new(),
             docker_args: None,
             allowed_cuda: Vec::new(),
+            min_cuda: None,
             max_price: None,
             api_extra: None,
         }
@@ -1172,6 +1308,10 @@ note: ~ = preset estimate (no live price for that GPU); --max-price is checked a
         Denied,
         Auth,
         Bad,
+        /// RunPod v1's schema 400 (a GPU its create enum lacks), as the backend classifies it.
+        Schema,
+        /// RunPod v2's 422 "Unknown GPU type" — a config error.
+        Unknown,
     }
 
     /// A provider whose create answers per (gpu, cloud) from a script (then `fallback`), and
@@ -1184,6 +1324,13 @@ note: ~ = preset estimate (no live price for that GPU); --max-price is checked a
         caps: Mutex<Vec<Option<f64>>>,
         fleet: Mutex<Vec<Pod>>,
         list_fails: bool,
+        /// A second backend (Vast) that fails to list while this one answers: the aggregate
+        /// `list_pods` (like the fleet provider's) skips it, `list_by_provider` says so.
+        vast_down: bool,
+        /// How many more `list_by_provider` calls find Vast throttled (a 429 — retryable).
+        vast_throttled: Mutex<u32>,
+        /// How many more `list_by_provider` calls find Vast's list stalled past its bound.
+        vast_stalled: Mutex<u32>,
     }
 
     impl Fake {
@@ -1195,6 +1342,9 @@ note: ~ = preset estimate (no live price for that GPU); --max-price is checked a
                 caps: Default::default(),
                 fleet: Default::default(),
                 list_fails: false,
+                vast_down: false,
+                vast_throttled: Mutex::new(0),
+                vast_stalled: Mutex::new(0),
             }
         }
         fn script(self, gpu: &str, cloud: &str, replies: &[Reply]) -> Self {
@@ -1221,6 +1371,34 @@ note: ~ = preset estimate (no live price for that GPU); --max-price is checked a
             }
             Ok(self.fleet.lock().unwrap().clone())
         }
+        async fn list_by_provider(&self) -> Vec<(String, Result<Vec<Pod>>)> {
+            let mut out = vec![("runpod".to_string(), self.list_pods().await)];
+            if self.vast_down {
+                out.push(("vast".into(), Err(Error::provider("vast list HTTP 404: {\"error\": \"auth_error\"}"))));
+            }
+            let throttled = {
+                let mut left = self.vast_throttled.lock().unwrap();
+                let was = *left;
+                *left = was.saturating_sub(1);
+                was > 0
+            };
+            if throttled {
+                let e = Error::Provider { kind: ProviderErrorKind::RateLimited, message: "vast list HTTP 429 Too Many Requests".into() };
+                out.push(("vast".into(), Err(e)));
+            }
+            let stalled = {
+                let mut left = self.vast_stalled.lock().unwrap();
+                let was = *left;
+                *left = was.saturating_sub(1);
+                was > 0
+            };
+            if stalled {
+                // The real bound, on a list that never answers (the paused clock runs it out).
+                let listed = crate::provider::bounded_list("vast", std::future::pending(), crate::provider::LIST_TIMEOUT).await;
+                out.push(("vast".into(), listed));
+            }
+            out
+        }
         async fn create_pod(&self, spec: &PodSpec) -> Result<Pod> {
             self.calls.lock().unwrap().push((spec.name.clone(), spec.gpu_type.clone(), spec.cloud_type.clone(), spec.gpu_count));
             self.caps.lock().unwrap().push(spec.max_price);
@@ -1246,6 +1424,13 @@ note: ~ = preset estimate (no live price for that GPU); --max-price is checked a
                 }),
                 Reply::Auth => Err(Error::Provider { kind: ProviderErrorKind::Auth, message: "create pod HTTP 401".into() }),
                 Reply::Bad => Err(Error::provider("create pod HTTP 400: bad image")),
+                Reply::Schema => Err(Error::provider_http(
+                    reqwest::StatusCode::BAD_REQUEST,
+                    &serde_json::json!([{"error": "At #/paths/pods/post …, it does not meet the schema requirements of the specification. Suggestion: …",
+                                         "problems": ["At /pods/properties/gpuTypeIds/items: value must be one of …"]}]),
+                    "create pod",
+                )),
+                Reply::Unknown => Err(Error::Config("create pod HTTP 422: {\"detail\":\"Unknown GPU type: NVIDIA X\"}".into())),
             }
         }
         async fn stop_pod(&self, _id: &str) -> Result<()> {
@@ -1423,6 +1608,73 @@ note: ~ = preset estimate (no live price for that GPU); --max-price is checked a
         assert_eq!(fake.calls().len(), 1);
     }
 
+    /// Finding #22: a per-option 400 (v1's schema refusal of a GPU its enum lacks, v2's 422
+    /// "Unknown GPU type") skips that option — for the rest of the run — instead of stopping
+    /// with the other options untried; once every option is refused the run fails.
+    #[tokio::test(start_paused = true)]
+    async fn an_option_the_api_rejects_is_skipped_not_fatal() {
+        for bad in [Reply::Schema, Reply::Unknown] {
+            let fake = Fake::new(Reply::Ok).script(A4000, "COMMUNITY", &[bad, bad, bad]);
+            let (out, lines) = run(&fake, &three(), &["arena8-apple", "arena8-bloom"], ONE_ROUND, None).await;
+            assert!(matches!(out.end, End::Filled), "{bad:?}: {:?}", out.end);
+            assert_eq!(
+                fake.calls(),
+                [
+                    call("arena8-apple", A4000, "COMMUNITY"),
+                    call("arena8-apple", R3090, "COMMUNITY"),
+                    call("arena8-bloom", R3090, "COMMUNITY"), // the rejected option isn't tried again
+                ],
+                "{bad:?}"
+            );
+            assert!(lines[0].starts_with("[rejected] arena8-apple on 1×RTX A4000 COMMUNITY: "), "{}", lines[0]);
+            assert!(lines[0].ends_with("— skipping this option, trying the next"), "{}", lines[0]);
+            let summary = render_summary(&three(), &out);
+            assert!(summary.contains("(after 1×RTX A4000 COMMUNITY: rejected)"), "{summary}");
+        }
+        // Every option refused: the run fails, naming the last refusal — never a hang or a retry.
+        let fake = Fake::new(Reply::Schema);
+        let rounds = Rounds { window: Duration::from_secs(600), every: Duration::from_secs(60) };
+        let (out, _) = run(&fake, &three(), &["arena8-apple"], rounds, None).await;
+        match &out.end {
+            End::Failed { name: Some(n), error } => {
+                assert_eq!(n, "arena8-apple");
+                assert!(error.to_string().contains("every option was refused") && error.to_string().contains("problems:"), "{error}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(fake.calls().len(), 3, "each option once");
+    }
+
+    /// Review fix: the end-of-options check ran on a `Rejected` refusal only, so with the last
+    /// open option refused as `Denied` (the others rejected) the run went on — and idled out
+    /// its whole `--retry-mins` window with no create, saying "no capacity" every round.
+    #[tokio::test(start_paused = true)]
+    async fn rejected_and_denied_options_in_any_order_end_the_run_at_once() {
+        let rounds = Rounds { window: Duration::from_secs(600), every: Duration::from_secs(60) };
+        for replies in [
+            [Reply::Schema, Reply::Denied, Reply::Denied],
+            [Reply::Denied, Reply::Schema, Reply::Denied],
+            [Reply::Denied, Reply::Denied, Reply::Schema],
+            [Reply::Unknown, Reply::Denied, Reply::Unknown],
+        ] {
+            let fake = Fake::new(Reply::Ok)
+                .script(A4000, "COMMUNITY", &[replies[0]])
+                .script(R3090, "COMMUNITY", &[replies[1]])
+                .script(A4000, "SECURE", &[replies[2]]);
+            let started = tokio::time::Instant::now();
+            let (out, _) = run(&fake, &three(), &["arena8-apple", "arena8-bloom"], rounds, None).await;
+            match &out.end {
+                End::Failed { name: Some(n), error } => {
+                    assert_eq!(n, "arena8-apple", "{replies:?}");
+                    assert!(error.to_string().contains("every option was refused"), "{replies:?}: {error}");
+                }
+                other => panic!("{replies:?}: {other:?}"),
+            }
+            assert_eq!((out.rounds, fake.calls().len()), (1, 3), "{replies:?}: each option once, then stop");
+            assert_eq!(started.elapsed(), Duration::ZERO, "{replies:?}: no wait for a window nothing can use");
+        }
+    }
+
     #[tokio::test]
     async fn no_option_to_try_ends_at_once_even_with_a_retry_window() {
         let empty = plan_options(&req(&[A4000], &["COMMUNITY"], 1, Some(0.01), Order::Cheapest), "runpod", &book());
@@ -1584,6 +1836,93 @@ note: ~ = preset estimate (no live price for that GPU); --max-price is checked a
         let summary = render_summary(&three(), &out);
         assert!(summary.contains("arena8-apple  not placed (tried: "), "{summary}");
         assert!(summary.contains("arena8-bloom  not placed (every option ran out of capacity before its turn)"), "{summary}");
+    }
+
+    /// Finding #9: a retry round re-plans from a listing — with one backend not answering,
+    /// a name held there would read as free. The round must not run.
+    #[tokio::test(start_paused = true)]
+    async fn a_relist_missing_a_provider_ends_the_run_instead_of_risking_a_duplicate() {
+        let mut fake = Fake::new(Reply::Capacity);
+        fake.vast_down = true;
+        let rounds = Rounds { window: Duration::from_secs(600), every: Duration::from_secs(60) };
+        let (out, _) = run(&fake, &three(), &["arena8-apple"], rounds, None).await;
+        match &out.end {
+            End::Failed { name: None, error } => {
+                let e = error.to_string();
+                assert!(e.contains("vast failed to list") && e.contains("refusing to create"), "{e}");
+            }
+            other => panic!("expected the partial relist to end the run, got {other:?}"),
+        }
+        assert_eq!(fake.calls().len(), 3, "only round 1 ran");
+    }
+
+    /// Review fix: a backend throttled (or 5xx-ing) past the re-list's own retries used to end
+    /// the run — every unplaced name of a `--retry-mins` cohort start, or an `up --check`
+    /// replacement whose old pod was already gone. It skips that round instead (nothing is
+    /// created from the partial listing) and the next round lists again; throttled for the
+    /// whole window, the run just ends with it.
+    #[tokio::test(start_paused = true)]
+    async fn a_relist_missing_a_provider_that_may_recover_skips_the_round() {
+        let dry = || {
+            Fake::new(Reply::Ok)
+                .script(A4000, "COMMUNITY", &[Reply::Capacity])
+                .script(R3090, "COMMUNITY", &[Reply::Capacity])
+                .script(A4000, "SECURE", &[Reply::Capacity])
+        };
+        let rounds = Rounds { window: Duration::from_secs(600), every: Duration::from_secs(60) };
+        // The first re-list and its 4 retries (1+2+4+8 = 15s of backoff) find Vast throttled.
+        let fake = dry();
+        *fake.vast_throttled.lock().unwrap() = 5;
+        let (out, lines) = run(&fake, &three(), &["arena8-apple"], rounds, None).await;
+        assert!(matches!(out.end, End::Filled), "{:?}", out.end);
+        assert_eq!(out.rounds, 3, "round 2 was skipped, round 3 placed it");
+        assert_eq!(fake.calls().len(), 4, "round 1's three tries, then one create in round 3");
+        let placed = out.log[0].attempts.last().unwrap();
+        assert_eq!((placed.round, placed.at), (3, Duration::from_secs(60 + 15 + 60)), "{:?}", out.log[0].attempts);
+        let skipped = lines.iter().find(|l| l.starts_with("round 2: nothing created — ")).unwrap_or_else(|| panic!("{lines:#?}"));
+        assert!(skipped.contains("vast failed to list") && skipped.contains("429"), "{skipped}");
+        assert!(lines.contains(&"round 2: 1 name(s) not placed (fleet listing incomplete); retrying in 60s (Ctrl+C to stop)…".to_string()), "{lines:#?}");
+
+        // Throttled for good: no create after round 1, and the window — not the outage — ends it.
+        let fake = dry();
+        *fake.vast_throttled.lock().unwrap() = u32::MAX;
+        let (out, _) = run(&fake, &three(), &["arena8-apple"], rounds, None).await;
+        assert!(matches!(out.end, End::WindowElapsed), "{:?}", out.end);
+        assert_eq!(fake.calls().len(), 3, "only round 1 created");
+    }
+
+    /// Review fix: a backend whose list stalls past its bound (`LIST_TIMEOUT`) isn't a refusal
+    /// either — it used to end the run like a rejected key. It skips that round like a
+    /// throttled backend, and isn't re-listed in place (each try already took the whole bound):
+    /// the next round's listing is its retry.
+    #[tokio::test(start_paused = true)]
+    async fn a_relist_with_a_stalled_provider_skips_the_round() {
+        let fake = Fake::new(Reply::Ok)
+            .script(A4000, "COMMUNITY", &[Reply::Capacity])
+            .script(R3090, "COMMUNITY", &[Reply::Capacity])
+            .script(A4000, "SECURE", &[Reply::Capacity]);
+        *fake.vast_stalled.lock().unwrap() = 1;
+        let rounds = Rounds { window: Duration::from_secs(600), every: Duration::from_secs(60) };
+        let (out, lines) = run(&fake, &three(), &["arena8-apple"], rounds, None).await;
+        assert!(matches!(out.end, End::Filled), "{:?}", out.end);
+        assert_eq!((out.rounds, fake.calls().len()), (3, 4), "round 2 skipped, round 3 placed it");
+        let placed = out.log[0].attempts.last().unwrap();
+        assert_eq!((placed.round, placed.at), (3, Duration::from_secs(60 + 60 + 60)), "one 60s stall, not five");
+        let skipped = lines.iter().find(|l| l.starts_with("round 2: nothing created — ")).unwrap_or_else(|| panic!("{lines:#?}"));
+        assert!(skipped.contains("vast list timed out after 60s"), "{skipped}");
+    }
+
+    /// Review fix: a listing slow enough to outlast the window (its retries' backoff) runs no
+    /// round after it — a round starts only inside the window.
+    #[tokio::test(start_paused = true)]
+    async fn no_round_runs_after_a_relist_that_outlasted_the_window() {
+        let fake = Fake::new(Reply::Ok).script(A4000, "COMMUNITY", &[Reply::Capacity]).script(R3090, "COMMUNITY", &[Reply::Capacity]).script(A4000, "SECURE", &[Reply::Capacity]);
+        // Round 2 may start at t=60 (window 62s); its re-list takes 3s more (two throttled tries).
+        *fake.vast_throttled.lock().unwrap() = 2;
+        let rounds = Rounds { window: Duration::from_secs(62), every: Duration::from_secs(60) };
+        let (out, _) = run(&fake, &three(), &["arena8-apple"], rounds, None).await;
+        assert!(matches!(out.end, End::WindowElapsed), "{:?}", out.end);
+        assert_eq!(fake.calls().len(), 3, "no create at t=63, past the 62s window");
     }
 
     #[tokio::test(start_paused = true)]

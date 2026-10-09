@@ -84,6 +84,16 @@ fn exit_status(report: &Report) -> Result<()> {
     }
 }
 
+/// A failed listing as `teardown::build` reads it: the error, marked when it is a rejected key
+/// (so the check points at that key instead of saying "re-run").
+fn listing_error_text(e: &arena_core::Error) -> String {
+    if e.kind() == Some(arena_core::ProviderErrorKind::Auth) {
+        format!("{e} — {}", arena_core::teardown::KEY_REJECTED)
+    } else {
+        e.to_string()
+    }
+}
+
 /// Read every source concurrently and judge them.
 async fn collect(
     provider: &dyn Provider,
@@ -97,7 +107,7 @@ async fn collect(
     let (listings, volumes, keys, cron, at) =
         tokio::join!(provider.list_by_provider(), volumes, read_keys(keys), read_cron(sched), read_at(sched));
     let inputs = Inputs {
-        listings: listings.into_iter().map(|(p, r)| (p, r.map_err(|e| e.to_string()))).collect(),
+        listings: listings.into_iter().map(|(p, r)| (p, r.map_err(|e| listing_error_text(&e)))).collect(),
         volumes,
         keys,
         cron,
@@ -548,6 +558,21 @@ mod tests {
             .map_err(|e| e.to_string());
         assert_eq!(exit_json, exit, "--json exits like the checklist");
         assert!(keys.calls().is_empty(), "keys are only listed");
+    }
+
+    /// Finding #33: a listing that failed on a rejected key (Vast's 404 `auth_error`, now
+    /// `Auth`) reaches the checklist marked, so its note names the key instead of "re-run".
+    #[test]
+    fn a_rejected_key_is_marked_for_the_checklist() {
+        use arena_core::{Error, ProviderErrorKind as K};
+        let auth = Error::Provider {
+            kind: K::Auth,
+            message: r#"list instances HTTP 404 Not Found: {"error":"auth_error","msg":"Invalid user key"}"#.into(),
+        };
+        let text = listing_error_text(&auth);
+        assert!(text.ends_with(arena_core::teardown::KEY_REJECTED), "{text}");
+        let throttled = Error::Provider { kind: K::RateLimited, message: "list HTTP 429".into() };
+        assert!(!listing_error_text(&throttled).contains(arena_core::teardown::KEY_REJECTED));
     }
 
     /// The `arena …` fix lines of a report, as argv.

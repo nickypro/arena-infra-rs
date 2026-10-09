@@ -115,6 +115,7 @@ pub fn resolve_url(base: &str, path: &str) -> Result<Url> {
         return Err(refuse("`.`/`..` path segments are refused"));
     }
     let base_url = Url::parse(base).map_err(|e| Error::Config(format!("api get: bad base {base}: {e}")))?;
+    let rel = strip_version_prefix(base_url.path(), rel).map_err(|why| refuse(&why))?;
     let url = Url::parse(&format!("{}/{rel}", base.trim_end_matches('/'))).map_err(|e| refuse(&format!("not a valid path ({e})")))?;
     let under = format!("{}/", base_url.path().trim_end_matches('/'));
     let same_origin = url.scheme() == base_url.scheme()
@@ -126,6 +127,39 @@ pub fn resolve_url(base: &str, path: &str) -> Result<Url> {
         return Err(refuse("the path leaves the API base"));
     }
     Ok(url)
+}
+
+/// `rel` without a leading copy of the base's own path (`/v2/pods` on `…/v2` → `pods`;
+/// Vast's `api/v0/instances/` on `…/api/v0` → `instances/`): pasted from RunPod's docs, such
+/// a path was appended to the base as `…/v2/v2/pods` — a 404 that didn't say why (wave-6
+/// live finding). A leading *other* version segment (`v1/…` against v2) is refused, naming
+/// the base and the provider name that reaches that version — never silently sent to
+/// `…/v2/v1/…`. Pure.
+fn strip_version_prefix<'a>(base_path: &str, rel: &'a str) -> std::result::Result<&'a str, String> {
+    let base = base_path.trim_matches('/');
+    if !base.is_empty() {
+        if rel == base {
+            return Ok("");
+        }
+        if let Some(rest) = rel.strip_prefix(base).and_then(|r| r.strip_prefix('/')) {
+            return Ok(rest);
+        }
+    }
+    let first = rel.split(['/', '?']).next().unwrap_or("");
+    let versionish = |seg: &str| {
+        seg.len() >= 2 && seg.starts_with(['v', 'V']) && seg[1..].chars().all(|c| c.is_ascii_digit())
+    };
+    if versionish(first) && !base.split('/').any(|b| b.eq_ignore_ascii_case(first)) {
+        let hint = match first.to_ascii_lowercase().as_str() {
+            "v1" if base.ends_with("v2") => " — for RunPod's v1 API use `arena api get runpod-v1 …`",
+            "v2" if base.ends_with("v1") => " — for RunPod's v2 API use `arena api get runpod-v2 …`",
+            _ => "",
+        };
+        return Err(format!(
+            "the path starts with `{first}/`, but paths are relative to this API's base (it would go to /{base}/{rel}){hint}"
+        ));
+    }
+    Ok(rel)
 }
 
 /// Object keys whose value is secret as a whole — an `env` block, keys, tokens, passwords.
@@ -312,6 +346,26 @@ mod tests {
             let url = resolve_url(base, path).unwrap_or_else(|e| panic!("{path}: {e}"));
             assert_eq!(url.as_str(), want, "{path}");
         }
+    }
+
+    /// Wave-6 live finding: `arena api get runpod-v2 /v2/pods` went to `…/v2/v2/pods` (404).
+    /// A leading copy of the base's own path is dropped; another version is refused with a
+    /// pointer, the base named.
+    #[test]
+    fn a_leading_version_prefix_is_the_bases_own_or_refused() {
+        let ok = |base: &str, path: &str| resolve_url(base, path).unwrap_or_else(|e| panic!("{path}: {e}")).to_string();
+        assert_eq!(ok(V2, "/v2/pods"), "https://api.runpod.io/v2/pods");
+        assert_eq!(ok(V2, "v2/pods/abc?x=1"), "https://api.runpod.io/v2/pods/abc?x=1");
+        assert_eq!(ok(V2, "/v2"), "https://api.runpod.io/v2/");
+        assert_eq!(ok(VAST, "/api/v0/instances/"), "https://console.vast.ai/api/v0/instances/");
+        assert_eq!(ok("https://rest.runpod.io/v1", "/v1/pods"), "https://rest.runpod.io/v1/pods");
+        assert_eq!(ok(V2, "v2pods"), "https://api.runpod.io/v2/v2pods", "only a whole segment");
+        let e = resolve_url(V2, "/v1/pods").unwrap_err().to_string();
+        assert!(e.contains("starts with `v1/`") && e.contains("runpod-v1") && e.contains(V2), "{e}");
+        let e = resolve_url("https://rest.runpod.io/v1", "v2/pods").unwrap_err().to_string();
+        assert!(e.contains("runpod-v2"), "{e}");
+        let e = resolve_url(VAST, "v1/instances").unwrap_err().to_string();
+        assert!(e.contains("starts with `v1/`") && e.contains(VAST), "{e}");
     }
 
     /// Anything that could send the key somewhere else — or leave the API base — is refused

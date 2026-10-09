@@ -349,6 +349,8 @@ mod tests {
         assert_eq!(got[0].1.as_ref().unwrap().len(), 1, "the healthy backend still answers");
         let err = got[1].1.as_ref().unwrap_err().to_string();
         assert!(got[1].0 == "vast" && err.contains("vast list timed out"), "{err}");
+        // A stall, told apart from a refusal (a retry round waits it out — placement::relist).
+        assert!(matches!(got[1].1, Err(Error::Timeout { .. })), "{:?}", got[1].1);
         // A single backend's default list_by_provider is bounded the same way.
         let err = crate::provider::bounded_list("vast", Stalled.list_pods(), std::time::Duration::from_millis(20))
             .await
@@ -384,6 +386,43 @@ mod tests {
         let total = multi(vec![Fake { name: "runpod", pods: None }, Fake { name: "vast", pods: None }]);
         let err = total.list_pods().await.unwrap_err().to_string();
         assert!(err.contains("all providers failed"), "{err}");
+    }
+
+    /// Live finding #9: with Vast's key bogus, `create`/`up` read the fleet's partial listing
+    /// as complete and planned a second `devtest-delta` next to Vast's running one. The
+    /// name-picking listing fails on ANY failed backend — naming it — while the aggregate
+    /// `list_pods` keeps its dashboard behaviour.
+    #[tokio::test]
+    async fn list_complete_refuses_a_partial_fleet_listing() {
+        let partial = multi(vec![
+            Fake { name: "runpod", pods: Some(vec![pod("r1", "devtest-alpha")]) },
+            Fake { name: "vast", pods: None },
+        ]);
+        assert_eq!(partial.list_pods().await.unwrap().len(), 1, "the dashboard listing still shows what answered");
+        let e = crate::provider::list_complete(&partial).await.unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("vast failed to list") && msg.contains("429"), "{msg}");
+        assert!(msg.contains("refusing to pick machine names") && msg.contains("retry once vast answers"), "{msg}");
+        // Retryable only when every failure is (a 429 passes: the caller's retry may still get
+        // a whole listing); this fake's failure is unclassified, so it isn't.
+        assert!(!crate::retry::is_retryable(&e));
+        let throttled = Error::Provider { kind: crate::error::ProviderErrorKind::RateLimited, message: "HTTP 429".into() };
+        assert!(crate::retry::is_retryable(&crate::provider::partial_listing_error(&[("vast".into(), throttled)])));
+
+        let whole = multi(vec![
+            Fake { name: "runpod", pods: Some(vec![pod("r1", "devtest-alpha")]) },
+            Fake { name: "vast", pods: Some(vec![pod("v1", "devtest-delta")]) },
+        ]);
+        let names: Vec<String> = crate::provider::list_complete(&whole).await.unwrap().into_iter().map(|p| p.name).collect();
+        assert_eq!(names, ["devtest-alpha", "devtest-delta"]);
+
+        // A rejected key isn't retried, and the message names the key to fix.
+        let e = crate::provider::partial_listing_error(&[(
+            "vast".to_string(),
+            Error::Provider { kind: crate::error::ProviderErrorKind::Auth, message: "list HTTP 404: auth_error".into() },
+        )]);
+        assert!(!crate::retry::is_retryable(&e), "{e}");
+        assert!(e.to_string().contains("VAST_API_KEY was rejected"), "{e}");
     }
 
     /// A backend whose restart keeps the disk (like Hetzner's reset).

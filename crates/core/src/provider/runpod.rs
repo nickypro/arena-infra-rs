@@ -102,7 +102,8 @@ const MANAGED: &[Managed] = &[
     managed(&["containerDiskInGb"], "--disk / DISK_GB"),
     managed(&["volumeInGb"], "--volume / VOLUME_GB"),
     managed(&["volumeMountPath"], "always /workspace"),
-    managed(&["allowedCudaVersions"], "ALLOWED_CUDA_VERSIONS"),
+    managed(&["allowedCudaVersions"], "MIN_CUDA_VERSION / ALLOWED_CUDA_VERSIONS (a floor) or EXACT_CUDA_VERSIONS"),
+    managed(&["supportPublicIp"], "always true: setup, backups and the proxy need the pod's own SSH endpoint"),
     managed(&["env", "PUBLIC_KEY"], "the cohort SSH keys"),
     managed(&["env", "MACHINE_NAME"], "the machine name"),
     managed(&["dockerStartCmd"], "--bootstrap, else the image's own, which starts sshd"),
@@ -111,6 +112,54 @@ const MANAGED: &[Managed] = &[
     managed(&["templateId"], "the flags above — a template would override the start command and volume arena sets"),
     managed(&["computeType"], "--gpu / GPU_TYPE: arena makes GPU pods"),
 ];
+
+/// The host CUDA versions REST v1's create accepts: its OpenAPI `allowedCudaVersions` item
+/// enum (docs.runpod.io "Create a Pod", checked 2026-10-09), newest first. It stops at 13.0 —
+/// live, `13.1`/`13.2` were refused with `400 … does not meet the schema requirements`. v1
+/// has no `minCudaVersion`, so a floor is sent as every version here at or above it — which
+/// can't reach a 13.1+ host (RUNPOD_API=v2 sends a real floor).
+pub const V1_CUDA_VERSIONS: [&str; 12] = ["13.0", "12.9", "12.8", "12.7", "12.6", "12.5", "12.4", "12.3", "12.2", "12.1", "12.0", "11.8"];
+
+/// The `allowedCudaVersions` REST v1 should send for `spec`: its exact set (every entry must
+/// be in [`V1_CUDA_VERSIONS`]), else every enum value at or above its floor, else none. A
+/// constraint v1 can't express is a config error before any request — never a silently
+/// dropped constraint (a cu130 image on a CUDA 12 host can't use its GPU). Pure.
+pub fn v1_cuda_versions(spec: &PodSpec) -> Result<Option<Vec<String>>> {
+    use crate::pod::cuda_key;
+    let accepted = || V1_CUDA_VERSIONS.join(", ");
+    if !spec.allowed_cuda.is_empty() {
+        let bad: Vec<&str> = spec
+            .allowed_cuda
+            .iter()
+            .map(|v| v.trim())
+            .filter(|v| !V1_CUDA_VERSIONS.iter().any(|ok| cuda_key(ok) == cuda_key(v) && cuda_key(v).is_some()))
+            .collect();
+        if !bad.is_empty() {
+            return Err(Error::Config(format!(
+                "EXACT_CUDA_VERSIONS {}: RunPod REST v1 accepts only {} — set RUNPOD_API=v2 for newer hosts",
+                bad.join(", "),
+                accepted()
+            )));
+        }
+        let versions = spec.allowed_cuda.iter().filter_map(|v| {
+            V1_CUDA_VERSIONS.iter().find(|ok| cuda_key(ok) == cuda_key(v)).map(|ok| ok.to_string())
+        });
+        return Ok(Some(versions.collect()));
+    }
+    let Some(floor) = spec.min_cuda.as_deref() else { return Ok(None) };
+    let Some(min) = cuda_key(floor) else {
+        return Err(Error::Config(format!("CUDA floor `{floor}` isn't a version like 13.0 (MIN_CUDA_VERSION / ALLOWED_CUDA_VERSIONS)")));
+    };
+    let at_least: Vec<String> =
+        V1_CUDA_VERSIONS.iter().filter(|v| cuda_key(v).is_some_and(|k| k >= min)).map(|v| v.to_string()).collect();
+    if at_least.is_empty() {
+        return Err(Error::Config(format!(
+            "CUDA floor {floor}: RunPod REST v1 can't ask for it (its newest is {}) — set RUNPOD_API=v2, which sends a real minimum",
+            V1_CUDA_VERSIONS[0]
+        )));
+    }
+    Ok(Some(at_least))
+}
 
 /// Build the REST v1 `POST /pods` body from a spec. Pure (no I/O) so it's unit-testable —
 /// the field names must match the REST schema exactly (a stray key is a 400, e.g. the old
@@ -141,9 +190,14 @@ fn create_payload(spec: &PodSpec) -> Result<Value> {
     if let Some(args) = &spec.docker_args {
         payload["dockerStartCmd"] = Value::Array(args.iter().map(|s| Value::String(s.clone())).collect());
     }
-    if !spec.allowed_cuda.is_empty() {
-        payload["allowedCudaVersions"] = json!(spec.allowed_cuda);
+    if let Some(versions) = v1_cuda_versions(spec)? {
+        payload["allowedCudaVersions"] = json!(versions);
     }
+    // Always ask for a host with a public IP: some community hosts have none, and a pod on
+    // one is reachable only through RunPod's SSH proxy (no scp/rsync/port-forwards) — live,
+    // such pods sat RUNNING with no direct endpoint for 15+ minutes. dstack and SkyPilot send
+    // the same flag on every create.
+    payload["supportPublicIp"] = json!(true);
     apiextra::apply(&mut payload, spec.api_extra.as_ref(), MANAGED, Some("ports"))?;
     Ok(payload)
 }
@@ -193,11 +247,16 @@ fn parse_pod(v: &Value) -> Pod {
         ssh_ip,
         ssh_port,
         maintenance: None,
-        machine_id: None,
+        // The host machine (REST v1 documents `machineId`): what names it for the same-host
+        // checks — several RunPod hosts share one public IP (finding #23).
+        machine_id: v.get("machineId").and_then(loose_string),
         // REST v1's pod carries `locked` too, when it says (best-effort: v1 can't change
         // it — `pods lock`/`unlock` need RUNPOD_API=v2 — but a lock set in the console is
         // still shown, and still refused up front by stop/restart/terminate).
         locked: v.get("locked").and_then(Value::as_bool),
+        // REST v1 can't tell a host without a public IP from one still booting; v1 creates
+        // ask for a public IP instead (`supportPublicIp`).
+        proxy_only: false,
     }
 }
 
@@ -223,7 +282,16 @@ impl Provider for RunpodProvider {
     }
 
     fn describe(&self, spec: &PodSpec) -> String {
-        describe_spec(spec)
+        // v1 can't send a floor: say what its version list leaves out (finding #10).
+        let note = match (spec.allowed_cuda.is_empty(), v1_cuda_versions(spec)) {
+            (true, Ok(Some(_))) => format!(
+                " (REST v1 sends its list's versions ≥ the floor, up to {} — newer hosts aren't eligible; RUNPOD_API=v2 sends a real floor)",
+                V1_CUDA_VERSIONS[0]
+            ),
+            (_, Err(e)) => format!(" (refused: {e})"),
+            _ => String::new(),
+        };
+        format!("{}{note}", describe_spec(spec))
     }
 
     async fn list_pods(&self) -> Result<Vec<Pod>> {
@@ -314,10 +382,10 @@ pub(super) fn describe_spec(spec: &PodSpec) -> String {
         String::new()
     };
     let bootstrap = if spec.docker_args.is_some() { ", +bootstrap start script" } else { "" };
-    let cuda = if spec.allowed_cuda.is_empty() {
-        String::new()
-    } else {
-        format!(", CUDA {}", spec.allowed_cuda.join("/"))
+    let cuda = match (&spec.min_cuda, spec.allowed_cuda.is_empty()) {
+        (_, false) => format!(", CUDA exactly {}", spec.allowed_cuda.join("/")),
+        (Some(floor), true) => format!(", CUDA ≥ {floor}"),
+        (None, true) => String::new(),
     };
     format!(
         "{} x{}, {}, disk {}GB{volume}, image {}{bootstrap}{cuda}",
@@ -435,6 +503,7 @@ fn parse_spec(v: &Value) -> PodSpec {
         env,
         docker_args: None,
         allowed_cuda: Vec::new(),
+        min_cuda: None,
         max_price: None,
         api_extra: None,
     }
@@ -443,7 +512,11 @@ fn parse_spec(v: &Value) -> PodSpec {
 /// The per-pod details the REST list leaves out (its `machine` object comes back empty).
 /// One query for the whole account — not one per pod — so `pods list` costs exactly one
 /// extra request. Field names validated against the live API (2026-10-07).
-const POD_DETAILS_QUERY: &str = "{ myself { pods { id gpuCount costPerHr \
+///
+/// `machineId` (the host machine; read by dstack's and SkyPilot's RunPod clients from this
+/// same `myself.pods` object) names the machine for `up --check`'s same-host rejection —
+/// several RunPod hosts share one public IP (finding #23), and REST v2 reports no machine.
+const POD_DETAILS_QUERY: &str = "{ myself { pods { id gpuCount costPerHr machineId \
      machine { gpuDisplayName maintenanceStart maintenanceEnd maintenanceNote } } } }";
 
 /// What GraphQL `myself.pods` adds for one pod (see [`merge_pod_details`]).
@@ -453,6 +526,7 @@ struct PodDetail {
     gpu_count: Option<u32>,
     cost_per_hr: Option<f64>,
     maintenance: Option<Maintenance>,
+    machine_id: Option<String>,
 }
 
 /// A non-empty string from a JSON string or number (`null`/other → `None`).
@@ -531,6 +605,7 @@ fn parse_pod_details(v: &Value) -> HashMap<String, PodDetail> {
                 gpu_count: p.get("gpuCount").and_then(loose_f64).filter(|n| *n >= 0.0).map(|n| n as u32),
                 cost_per_hr: p.get("costPerHr").and_then(loose_f64).filter(|c| *c >= 0.0),
                 maintenance: has_window.then_some(maintenance),
+                machine_id: p.get("machineId").and_then(loose_string),
             };
             Some((id, detail))
         })
@@ -538,14 +613,20 @@ fn parse_pod_details(v: &Value) -> HashMap<String, PodDetail> {
 }
 
 /// Fold GraphQL details into REST-listed pods, matched by id. REST stays authoritative
-/// for what it does return (GPU type, $/h); GraphQL fills the gaps, owns `gpu_count` when
-/// it has one, and is the only source of `maintenance` (set only when a window exists).
-/// Pods GraphQL doesn't mention are untouched.
+/// for $/h when it returns one; GraphQL fills the gaps, owns `gpu_count` when it has one,
+/// fills the machine id where REST had none, and is the only source of `maintenance` (set
+/// only when a window exists). The GPU is GraphQL's display name whenever it has one — the
+/// name v1 always showed (`RTX 3070`, `B300 MIG 34GB`): REST v2 reports the catalog id
+/// (`NVIDIA GeForce RTX 3070`), and `pods list --json` must not change its strings when the
+/// fleet moves to v2 (finding #32). Pods GraphQL doesn't mention are untouched.
 fn merge_pod_details(pods: &mut [Pod], details: &HashMap<String, PodDetail>) {
     for p in pods.iter_mut() {
         let Some(d) = details.get(&p.id) else { continue };
-        if p.gpu_type.is_none() {
+        if d.gpu_type.is_some() {
             p.gpu_type = d.gpu_type.clone();
+        }
+        if p.machine_id.is_none() {
+            p.machine_id = d.machine_id.clone();
         }
         p.gpu_count = d.gpu_count.or(p.gpu_count);
         if p.cost_per_hr.is_none() {
@@ -575,18 +656,29 @@ pub struct GpuType {
 }
 
 /// The catalog with live prices + stock (fields validated against the live API 2026-10-07,
-/// e.g. A4000 → communityPrice 0.17, securePrice 0.25, stockStatus "Low").
+/// e.g. A4000 → communityPrice 0.17, securePrice 0.25, stockStatus "Low"), plus whether
+/// each tier offers the GPU at all (`secureCloud`/`communityCloud` — the flags gpuhunt, dstack's
+/// catalog, reads from this same query): the prices alone can't say, since GraphQL quotes a
+/// price for a tier that doesn't offer the card (finding #21: `B300 MIG 34GB` COMMUNITY $0.50,
+/// ~15 such cells, where v2's catalog says `community: false`).
 const GPU_TYPES_QUERY: &str = "{ gpuTypes { id displayName memoryInGb securePrice communityPrice \
-     lowestPrice(input: {gpuCount: 1}) { stockStatus } } }";
+     secureCloud communityCloud lowestPrice(input: {gpuCount: 1}) { stockStatus } } }";
 /// The plain catalog, kept as a fallback: if RunPod ever rejects the pricing sub-fields,
 /// `arena gpus` still lists live names (prices then come from the local presets).
 const GPU_TYPES_BASIC_QUERY: &str = "{ gpuTypes { id displayName memoryInGb } }";
 
 /// Parse a `gpuTypes` response. Pure, for fixture tests. Entries without an id are
-/// skipped; non-positive prices are `None` (RunPod sends 0/null for an unoffered tier).
+/// skipped; non-positive prices are `None` (RunPod sends 0/null for an unoffered tier), and
+/// so is a tier whose `secureCloud`/`communityCloud` flag is `false` — GraphQL still quotes
+/// a price for it (a phantom placement would try first). An absent flag (the plain query)
+/// leaves the price as quoted.
 fn parse_gpu_types(v: &Value) -> Vec<GpuType> {
     let arr = v.pointer("/data/gpuTypes").and_then(Value::as_array).cloned().unwrap_or_default();
-    let price = |x: &Value, k: &str| x.get(k).and_then(loose_f64).filter(|p| *p > 0.0);
+    let tier_flag = |k: &str| if k == "communityPrice" { "communityCloud" } else { "secureCloud" };
+    let price = |x: &Value, k: &str| {
+        let offered = x.get(tier_flag(k)).and_then(Value::as_bool).unwrap_or(true);
+        x.get(k).and_then(loose_f64).filter(|p| offered && *p > 0.0)
+    };
     arr.iter()
         .filter_map(|x| {
             Some(GpuType {
@@ -804,6 +896,18 @@ mod tests {
         assert!(NETWORK_VOLUMES_QUERY.contains("networkVolumes { id name size dataCenterId }"));
     }
 
+    /// Finding #23: REST v1's pod carries `machineId` (the host machine) — what the same-host
+    /// checks go by before the public IP, which several RunPod hosts share.
+    #[test]
+    fn parse_pod_reads_the_machine_id() {
+        let p = parse_pod(&json!({"id": "a", "name": "devtest-alpha", "desiredStatus": "RUNNING",
+                                  "publicIp": "87.197.146.56", "portMappings": {"22": 40702}, "machineId": "m8x2k"}));
+        assert_eq!(p.machine_id.as_deref(), Some("m8x2k"));
+        assert_eq!(crate::health::host_key(&p).as_deref(), Some("runpod machine m8x2k"));
+        let p = parse_pod(&json!({"id": "a", "publicIp": "87.197.146.56", "portMappings": {"22": 40702}}));
+        assert_eq!((p.machine_id.as_deref(), crate::health::host_key(&p).as_deref()), (None, Some("87.197.146.56")), "no id: the IP, as before");
+    }
+
     #[test]
     fn pods_array_accepts_both_list_shapes() {
         let top = json!([{"id": "a", "name": "arena8-apple"}]);
@@ -899,6 +1003,7 @@ mod tests {
             env: vec![("PUBLIC_KEY".into(), "ssh-ed25519 AAAA test".into())],
             docker_args: None,
             allowed_cuda: Vec::new(),
+            min_cuda: None,
             max_price: None,
             api_extra: None,
         }
@@ -955,6 +1060,40 @@ mod tests {
         assert!(create_payload(&s).unwrap().get("allowedCudaVersions").is_none());
         s.allowed_cuda = vec!["13.0".into()];
         assert_eq!(create_payload(&s).unwrap()["allowedCudaVersions"], json!(["13.0"]));
+    }
+
+    /// Finding #10 on v1: a floor goes out as every schema version at or above it (v1 has no
+    /// `minCudaVersion`); its schema stops at 13.0, so 13.1/13.2 — live 400s — are refused
+    /// before the request, with RUNPOD_API=v2 named; the dry-run says what v1 can't reach.
+    #[test]
+    fn v1_sends_a_floor_as_its_enum_values_at_or_above_it() {
+        let mut s = spec();
+        s.min_cuda = Some("13.0".into());
+        assert_eq!(create_payload(&s).unwrap()["allowedCudaVersions"], json!(["13.0"]));
+        s.min_cuda = Some("12.8".into());
+        assert_eq!(create_payload(&s).unwrap()["allowedCudaVersions"], json!(["13.0", "12.9", "12.8"]));
+        let d = RunpodProvider::new("k").describe(&s);
+        assert!(d.contains("CUDA ≥ 12.8") && d.contains("newer hosts aren't eligible") && d.contains("RUNPOD_API=v2"), "{d}");
+        s.min_cuda = Some("13.1".into());
+        let e = create_payload(&s).unwrap_err().to_string();
+        assert!(e.contains("can't ask for it") && e.contains("RUNPOD_API=v2"), "{e}");
+        s.min_cuda = None;
+        s.allowed_cuda = vec!["13.0".into(), "13.1".into(), "13.2".into()];
+        let e = create_payload(&s).unwrap_err().to_string();
+        assert!(e.contains("EXACT_CUDA_VERSIONS 13.1, 13.2") && e.contains("RUNPOD_API=v2"), "{e}");
+        assert!(RunpodProvider::new("k").describe(&s).contains("refused"), "the dry run says so too");
+        s.allowed_cuda = vec!["12.8".into()];
+        assert_eq!(create_payload(&s).unwrap()["allowedCudaVersions"], json!(["12.8"]));
+        assert!(!RunpodProvider::new("k").describe(&s).contains("aren't eligible"), "an exact set is what it says");
+    }
+
+    /// No-public-IP hosts (live: RUNNING, only RunPod's SSH proxy, for 15+ min): v1 asks for
+    /// a public IP on every create, and `--api-json` can't turn that off.
+    #[test]
+    fn v1_always_asks_for_a_public_ip() {
+        assert_eq!(create_payload(&spec()).unwrap()["supportPublicIp"], json!(true));
+        let extra: Extra = serde_json::from_str(r#"{"supportPublicIp": false}"#).unwrap();
+        assert!(RunpodProvider::new("k").check_create_extra(&extra).is_err());
     }
 
     #[test]
@@ -1034,7 +1173,7 @@ mod tests {
     /// strings, empty strings and null.
     fn pod_details_fixture() -> Value {
         json!({ "data": { "myself": { "pods": [
-            { "id": "pa", "gpuCount": 1, "costPerHr": 0.17,
+            { "id": "pa", "gpuCount": 1, "costPerHr": 0.17, "machineId": "m-host1",
               "machine": { "gpuDisplayName": "RTX A4000",
                            "maintenanceStart": "2026-10-09T02:00:00.000Z",
                            "maintenanceEnd": "2026-10-09T06:00:00.000Z",
@@ -1068,6 +1207,7 @@ mod tests {
                     end: Some("2026-10-09T06:00:00.000Z".into()),
                     note: Some("host upgrade".into()),
                 }),
+                machine_id: Some("m-host1".into()),
             }
         );
         // Epoch ms / s numbers normalize to ISO UTC; an empty note is no note.
@@ -1093,7 +1233,8 @@ mod tests {
         let mut pods = vec![
             // REST list shape: no machine info at all.
             Pod { id: "pa".into(), provider: "runpod".into(), ..Default::default() },
-            // REST already had type + price: kept; GraphQL count wins.
+            // REST already had type + price: the price is kept, GraphQL's display name and
+            // count win (v2 reports the catalog id; finding #32).
             Pod {
                 id: "pb".into(),
                 gpu_type: Some("NVIDIA GeForce RTX 3090".into()),
@@ -1115,8 +1256,9 @@ mod tests {
         assert_eq!(pods[0].gpu_count, Some(1));
         assert_eq!(pods[0].cost_per_hr, Some(0.17));
         assert_eq!(pods[0].maintenance.as_ref().unwrap().note.as_deref(), Some("host upgrade"));
-        assert_eq!(pods[1].gpu_type.as_deref(), Some("NVIDIA GeForce RTX 3090"));
+        assert_eq!(pods[1].gpu_type.as_deref(), Some("RTX 3090"));
         assert_eq!(pods[1].gpu_count, Some(2));
+        assert_eq!((pods[0].machine_id.as_deref(), pods[1].machine_id.as_deref()), (Some("m-host1"), None));
         assert_eq!(pods[1].cost_per_hr, Some(0.30));
         assert_eq!(pods[2].maintenance.as_ref().unwrap().note.as_deref(), Some("keep"));
         assert_eq!(pods[3], Pod { id: "zz".into(), ..Default::default() });
@@ -1153,6 +1295,31 @@ mod tests {
         // Basic-query shape (no price fields at all) parses with prices None.
         assert_eq!((t[2].community_price, t[2].secure_price, t[2].stock_status.clone()), (None, None, None));
         assert_eq!(t[3].id, "unknown"); // filtering placeholders is the caller's policy
+    }
+
+    /// Finding #21: v1's GraphQL quotes prices for tiers that don't offer the GPU (live: B300
+    /// MIG 34GB and MI300X at COMMUNITY $0.50, PRO 6000 MaxQ at SECURE $0.50 — v2 shows "-"),
+    /// and placement tried those phantom options first. A tier flagged off has no price.
+    #[test]
+    fn a_tier_that_does_not_offer_the_gpu_has_no_price() {
+        let v = json!({ "data": { "gpuTypes": [
+            { "id": "NVIDIA B300 SXM6 AC MIG 1g.34gb", "displayName": "B300 MIG 34GB", "memoryInGb": 34,
+              "securePrice": 0.5, "communityPrice": 0.5, "secureCloud": true, "communityCloud": false,
+              "lowestPrice": { "stockStatus": null } },
+            { "id": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition", "displayName": "RTX PRO 6000 MaxQ",
+              "memoryInGb": 96, "securePrice": 0.5, "communityPrice": 1.64, "secureCloud": false, "communityCloud": true },
+            { "id": "NVIDIA RTX A4000", "displayName": "RTX A4000", "memoryInGb": 16,
+              "securePrice": 0.25, "communityPrice": 0.17, "secureCloud": true, "communityCloud": true }
+        ] } });
+        let t = parse_gpu_types(&v);
+        assert_eq!((t[0].community_price, t[0].secure_price), (None, Some(0.5)));
+        assert_eq!((t[1].community_price, t[1].secure_price), (Some(1.64), None));
+        assert_eq!((t[2].community_price, t[2].secure_price), (Some(0.17), Some(0.25)));
+        assert!(GPU_TYPES_QUERY.contains("secureCloud communityCloud"), "the flags are asked for");
+        // So placement never plans the phantom tier as a priced, live option.
+        let book = crate::placement::PriceBook::runpod(vec![(None, t)]);
+        let q = book.quote("NVIDIA B300 SXM6 AC MIG 1g.34gb", Some("COMMUNITY"));
+        assert_eq!(q.price_per_gpu, None, "{q:?}");
     }
 
     /// Review finding: a non-2xx rejection of the priced query (GraphQL validation errors

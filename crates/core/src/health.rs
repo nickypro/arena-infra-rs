@@ -115,6 +115,15 @@ pub struct DeepFacts {
     pub smi_query: Option<String>,
     pub smi_gpus: Option<u32>,
     pub gpus: Vec<GpuFact>,
+    /// MIG slices `nvidia-smi -L` lists (`MIG 1g.34gb Device 0`), and the first one's
+    /// profile: under MIG the pod gets a slice, and `--query-gpu` names only the parent card.
+    pub mig_devices: Option<u32>,
+    pub mig_profile: Option<String>,
+    /// Not measured: what the provider calls this pod's MIG slice (`B300 MIG 34GB`, from its
+    /// listing — see [`mig_slice_name`]), so every label names the slice, not the parent
+    /// (finding #24). Set by [`PodHealth::checked`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slice: Option<String>,
     /// The python found on PATH (in the conda env), or `missing`.
     pub python: Option<String>,
     /// The python step's exit status (124/137 = killed by its `timeout`).
@@ -183,8 +192,20 @@ impl DeepFacts {
     }
 
     /// GPUs as the machine sees them — `2×RTX A4000`, `1×A100 80GB PCIe+1×H100` for a
-    /// mixed box — else torch's count (`2×GPU`), else `-`.
+    /// mixed box — else torch's count (`2×GPU`), else `-`. A MIG slice is labelled as the
+    /// slice (finding #24): the provider's name for it when known (`1×B300 MIG 34GB`), else
+    /// the parent plus the profile `nvidia-smi -L` shows (`1×B300 SXM6 AC MIG 1g.34gb`) —
+    /// never the bare parent card, which is not what the pod has.
     pub fn gpu_label(&self) -> String {
+        let slices = self.mig_devices.filter(|&n| n > 0);
+        if let Some(slice) = self.slice.as_deref().filter(|s| !s.trim().is_empty()) {
+            let n = slices.or(self.device_count.filter(|&n| n > 0)).unwrap_or(1);
+            return format!("{n}×{slice}");
+        }
+        if let (Some(n), Some(parent)) = (slices, self.gpus.first().and_then(|g| g.name.as_deref())) {
+            let profile = self.mig_profile.as_deref().map(|p| format!(" {p}")).unwrap_or_default();
+            return format!("{n}×{} MIG{profile}", normalize_gpu_name(parent));
+        }
         let mut groups: Vec<(String, usize)> = Vec::new();
         for g in &self.gpus {
             let name = g.name.as_deref().map(normalize_gpu_name).unwrap_or_else(|| "GPU".into());
@@ -268,6 +289,8 @@ pub fn parse_deep(stdout: &str) -> DeepFacts {
             "smi_cuda" => f.smi_cuda = text(),
             "smi_query" => f.smi_query = text(),
             "smi_gpus" => f.smi_gpus = small(),
+            "mig_devices" => f.mig_devices = small(),
+            "mig_profile" => f.mig_profile = text(),
             "python" => f.python = text(),
             "py_exit" => f.py_exit = value.parse().ok(),
             "py_stderr" => f.py_stderr = text(),
@@ -398,10 +421,10 @@ impl Default for HealthPolicy {
 
 impl HealthPolicy {
     /// The policy from config: `MIN_DRIVER_VERSION` (e.g. `580` or `580.65.06`; `none`
-    /// turns the check off) wins; otherwise the floor is derived from the host CUDA
-    /// versions pods are created on (`ALLOWED_CUDA_VERSIONS`, else
-    /// `RUNPOD_ALLOWED_CUDA_VERSIONS` — the same keys `PodSpec` reads), see
-    /// [`driver_floor_for_cuda`]. A malformed `MIN_DRIVER_VERSION` is an error, not a
+    /// turns the check off) wins; otherwise the floor is derived from the host CUDA floor
+    /// pods are created with (`MIN_CUDA_VERSION`, else the lowest of `ALLOWED_CUDA_VERSIONS` /
+    /// `RUNPOD_ALLOWED_CUDA_VERSIONS`, or of `EXACT_CUDA_VERSIONS` — what `PodSpec` reads),
+    /// see [`driver_floor_for_cuda`]. A malformed `MIN_DRIVER_VERSION` is an error, not a
     /// silently skipped check. The `vscode` line expects what setup's warm-up installs
     /// (`VSCODE_PREINSTALL` / `VSCODE_EXTENSIONS`, validated the same way).
     pub fn from_config(cfg: &Config) -> Result<Self> {
@@ -416,12 +439,21 @@ impl HealthPolicy {
             policy.min_driver = Some(DriverFloor { version, why: "MIN_DRIVER_VERSION".into() });
             return Ok(policy);
         }
-        let allowed = ["ALLOWED_CUDA_VERSIONS", "RUNPOD_ALLOWED_CUDA_VERSIONS"]
-            .iter()
-            .find_map(|k| cfg.get(k).filter(|v| !v.trim().is_empty()))
-            .unwrap_or("");
-        let versions: Vec<&str> = allowed.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
-        policy.min_driver = driver_floor_for_cuda(&versions);
+        // The same host CUDA floor creates ask for (`crate::pod::cuda_from_config`: the
+        // floor, or the lowest of an exact set), so the check never fails a host the
+        // config deliberately admits.
+        let cuda = crate::pod::cuda_from_config(cfg);
+        // One that isn't a version fails closed, like a malformed MIN_DRIVER_VERSION: read as
+        // "no floor" the check would stop holding hosts to any driver (every create refuses it).
+        if let Some(bad) = cuda.bad_value() {
+            return Err(Error::Config(format!(
+                "{}: `{bad}` isn't a CUDA version like 13.0, so the deep check has no driver floor to derive \
+                 (fix it, or set MIN_DRIVER_VERSION)",
+                cuda.source.unwrap_or("ALLOWED_CUDA_VERSIONS")
+            )));
+        }
+        let floor = cuda.floor.or_else(|| crate::pod::lowest_cuda(&cuda.exact));
+        policy.min_driver = floor.as_deref().and_then(|f| driver_floor_for_cuda(&[f]));
         Ok(policy)
     }
 }
@@ -771,7 +803,15 @@ fn smi_check(f: &DeepFacts) -> Check {
             Some(e) => Check::new("nvidia-smi", Fail, reason(e)),
             None => Check::new("nvidia-smi", Fail, "lists no GPUs"),
         },
-        Some("ok") => Check::new("nvidia-smi", Pass, f.gpu_label()),
+        Some("ok") => {
+            // Under MIG, say what the slice is cut from (the parent nvidia-smi names).
+            let parent = f.gpus.first().and_then(|g| g.name.as_deref()).map(normalize_gpu_name);
+            let detail = match (f.mig_devices.filter(|&n| n > 0).or(f.slice.as_ref().map(|_| 1)), parent) {
+                (Some(_), Some(parent)) => format!("{} (MIG slice of {parent})", f.gpu_label()),
+                _ => f.gpu_label(),
+            };
+            Check::new("nvidia-smi", Pass, detail)
+        }
         Some("missing") => Check::new("nvidia-smi", Fail, "not found (no NVIDIA driver in the container)"),
         Some(e) => Check::new("nvidia-smi", Fail, reason(e)),
         None => Check::new("nvidia-smi", Fail, "not reported"),
@@ -981,6 +1021,14 @@ pub struct PodHealth {
     pub host: Option<String>,
 }
 
+/// The provider's name for `pod`'s GPU when it is a MIG slice (`B300 MIG 34GB`, `NVIDIA B300
+/// SXM6 AC MIG 1g.34gb` → `B300 SXM6 AC MIG 1g.34gb`) — the word `MIG` in its GPU type —
+/// else `None`. What labels show instead of the parent card nvidia-smi names. Pure.
+pub fn mig_slice_name(pod: &Pod) -> Option<String> {
+    let ty = pod.gpu_type.as_deref()?.trim();
+    ty.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| w.eq_ignore_ascii_case("mig")).then(|| normalize_gpu_name(ty))
+}
+
 /// What names the machine a pod runs on, for the same-host summary and `up --check`'s
 /// rejection of a replacement that lands on a machine that already failed — `None` when
 /// nothing does. A false "same host" is the costly mistake (it sends the operator to switch
@@ -1006,7 +1054,10 @@ pub fn host_key(pod: &Pod) -> Option<String> {
 impl PodHealth {
     /// A pod whose script ran: its facts judged by `policy` (GPU or CPU rules per
     /// [`expects_gpu`]), with the pod's maintenance window.
-    pub fn checked(pod: &Pod, facts: DeepFacts, policy: &HealthPolicy) -> Self {
+    pub fn checked(pod: &Pod, mut facts: DeepFacts, policy: &HealthPolicy) -> Self {
+        if facts.slice.is_none() {
+            facts.slice = mig_slice_name(pod);
+        }
         let mut checks = if expects_gpu(pod) {
             evaluate(&facts, policy, pod.maintenance.as_ref())
         } else {
@@ -1299,6 +1350,35 @@ deep_check_end=1
         )
     }
 
+    /// Finding #24 (live B300 MIG pod, 2026-10-08): nvidia-smi names the parent card (`NVIDIA
+    /// B300 SXM6 AC`) and the summary/deep check said `1×B300 SXM6 AC` — not what the pod has.
+    /// Labels name the slice: the provider's name for it, else parent + `-L`'s profile.
+    #[test]
+    fn a_mig_slice_is_labelled_as_the_slice() {
+        let mig = edit(
+            &one_gpu(),
+            &[("gpu.0.name", Some("NVIDIA B300 SXM6 AC")), ("mig_devices", Some("1")), ("mig_profile", Some("1g.34gb"))],
+        );
+        let f = parse_deep(&mig);
+        assert_eq!((f.mig_devices, f.mig_profile.as_deref()), (Some(1), Some("1g.34gb")));
+        assert_eq!(f.gpu_label(), "1×B300 SXM6 AC MIG 1g.34gb", "no provider name: parent + profile");
+        // With the provider's name for the slice (v1's display name, or v2's id).
+        for (gpu_type, want) in [("B300 MIG 34GB", "1×B300 MIG 34GB"), ("NVIDIA B300 SXM6 AC MIG 1g.34gb", "1×B300 SXM6 AC MIG 1g.34gb")] {
+            let p = Pod { gpu_type: Some(gpu_type.into()), gpu_count: Some(1), ..pod("delta", "1.2.3.4") };
+            let h = PodHealth::checked(&p, parse_deep(&mig), &cuda13());
+            assert_eq!(h.facts.as_ref().unwrap().gpu_label(), want);
+            assert_eq!(check(&h.checks, "nvidia-smi").detail, format!("{want} (MIG slice of B300 SXM6 AC)"));
+            assert!(render_health_table(&[h.clone()]).contains(want), "GPUS column");
+            assert_eq!(h.status, Status::Pass);
+        }
+        // Not MIG: unchanged.
+        let a4000 = Pod { gpu_type: Some("RTX A4000".into()), ..pod("apple", "1.2.3.4") };
+        assert_eq!(mig_slice_name(&a4000), None);
+        assert_eq!(PodHealth::checked(&a4000, parse_deep(&one_gpu()), &cuda13()).facts.unwrap().gpu_label(), "1×RTX A4000");
+        assert_eq!(mig_slice_name(&Pod { gpu_type: Some("PRO 6000 MIG 24GB".into()), ..Default::default() }).as_deref(), Some("PRO 6000 MIG 24GB"));
+        assert_eq!(mig_slice_name(&Pod { gpu_type: Some("NVIDIA Migrator X".into()), ..Default::default() }), None, "a word, not a substring");
+    }
+
     #[test]
     fn parse_reads_a_full_run() {
         let f = parse_deep(HEALTHY_2GPU);
@@ -1400,12 +1480,27 @@ deep_check_end=1
             })),
             ("MIN_DRIVER_VERSION=none\nALLOWED_CUDA_VERSIONS=13.0", None),
             ("MIN_DRIVER_VERSION=\nALLOWED_CUDA_VERSIONS=13.0", v(580, "CUDA 13.0")),
+            // Finding #10: the floor keys follow the create's floor — MIN_CUDA_VERSION wins,
+            // an exact set's lowest version counts.
+            ("MIN_CUDA_VERSION=12.8\nALLOWED_CUDA_VERSIONS=13.0", v(570, "CUDA 12.8")),
+            ("MIN_CUDA_VERSION=13.0", v(580, "CUDA 13.0")),
+            ("EXACT_CUDA_VERSIONS=\"13.1, 13.2\"", v(580, "CUDA 13.1")),
+            ("EXACT_CUDA_VERSIONS=12.8,13.0\nMIN_CUDA_VERSION=12.4", v(570, "CUDA 12.8")),
         ];
         for (text, want) in cases {
             assert_eq!(&floor(text), want, "{text:?}");
         }
         let err = HealthPolicy::from_config(&cfg("MIN_DRIVER_VERSION=latest")).unwrap_err();
         assert!(err.to_string().contains("MIN_DRIVER_VERSION=\"latest\""), "{err}");
+        // Review fix: a CUDA value that isn't a version fails closed, as every create refuses
+        // it — it used to leave the check with no driver floor at all (`"13.0, x"` gave none,
+        // where before finding #10's floor it gave 580).
+        for text in ["ALLOWED_CUDA_VERSIONS=\"13.0, x\"", "MIN_CUDA_VERSION=newest", "EXACT_CUDA_VERSIONS=13.0,13.x"] {
+            let err = HealthPolicy::from_config(&cfg(text)).unwrap_err().to_string();
+            assert!(err.contains("isn't a CUDA version like 13.0") && err.contains("MIN_DRIVER_VERSION"), "{text}: {err}");
+        }
+        // An explicit driver floor doesn't need one.
+        assert_eq!(floor("MIN_DRIVER_VERSION=580\nALLOWED_CUDA_VERSIONS=x"), Some(DriverFloor { version: vec![580], why: "MIN_DRIVER_VERSION".into() }));
     }
 
     #[test]
@@ -2102,6 +2197,47 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
                 .unwrap();
             assert_eq!(String::from_utf8_lossy(&decoded.stdout), DEEP_CHECK_SCRIPT);
         }
+    }
+
+    /// Finding #24: the script reads the MIG slice from `nvidia-smi -L` (the recorded live
+    /// output of a B300 MIG pod), run for real against a stub nvidia-smi.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn script_reports_a_mig_slice_from_nvidia_smi_l() {
+        use std::os::unix::fs::PermissionsExt;
+        if !(have("bash") && have("timeout") && have("base64")) {
+            eprintln!("bash/timeout/base64 missing — skipping");
+            return;
+        }
+        let dir = scratch("stubs-mig");
+        let stub = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        stub(
+            "nvidia-smi",
+            "case \"$*\" in\n\
+             *--query-gpu*) printf '0, NVIDIA B300 SXM6 AC, 595.91.07, [Insufficient Permissions], [N/A]\\n' ;;\n\
+             -L) printf 'GPU 0: NVIDIA B300 SXM6 AC (UUID: GPU-03979fe0)\\n  MIG 1g.34gb     Device  0: (UUID: MIG-c121b7f0)\\n' ;;\n\
+             *) echo '| NVIDIA-SMI 595.91.07    Driver Version: 595.91.07    CUDA Version: 13.2     |' ;;\n\
+             esac\n",
+        );
+        // No network, no python: only the GPU facts matter here.
+        stub("curl", "exit 3\n");
+        stub("python", "exit 0\n");
+        let path = format!("{}:{}", dir.display(), std::env::var("PATH").unwrap_or_default());
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(deep_check_inner_command())
+            .env("PATH", path)
+            .env("HOME", &dir)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let f = parse_deep(&String::from_utf8_lossy(&out.stdout));
+        assert_eq!((f.mig_devices, f.mig_profile.as_deref()), (Some(1), Some("1g.34gb")), "{}", String::from_utf8_lossy(&out.stdout));
+        assert_eq!(f.gpu_label(), "1×B300 SXM6 AC MIG 1g.34gb");
     }
 
     /// The delivered command, run for real against stub `nvidia-smi` / `curl` / `python`
