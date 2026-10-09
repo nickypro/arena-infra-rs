@@ -778,6 +778,7 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `--from big`). After a restore that pushed the repo's
     `.git`, the repo is checked (`git fsck --connectivity-only`, 120s) and a broken one fails
     the command, saying where the replaced files are. Refuses before touching the pod when
+    the pod is stopped (its listed endpoint is stale — `pods start` it first; the dry run too),
     the backup doesn't exist or is empty, or `--path` isn't in it. Confirms first with
     source, destination (where the repo lands, from a read-only question to the pod) and
     size — and **warns when the snapshot was written after the pod's disk was last reset**

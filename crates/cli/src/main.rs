@@ -11792,8 +11792,8 @@ struct RestoreOpts {
 /// `arena_core::restore` for why each rsync flag is there — never `--delete`, files newer on
 /// the pod left alone, replaced files kept (on the volume when there is one), written through
 /// the repo's link onto the volume, no `.git` from a snapshot). Everything that can be refused
-/// is refused before the pod is touched: no such backup, an empty one, a `--path` that isn't in
-/// it, a pod without an endpoint. The pod is then asked (read-only, bounded) where its repo
+/// is refused before the pod is touched: a stopped pod (its listed endpoint is stale), no such
+/// backup, an empty one, a `--path` that isn't in it, a pod without an endpoint. The pod is then asked (read-only, bounded) where its repo
 /// lives, whether its volume is mounted and when its container was created, so the
 /// confirmation can say where the work lands, where replaced files are kept, and whether the
 /// snapshot was written after the pod's disk was reset. The rsync runs over the pod's direct
@@ -11813,6 +11813,13 @@ async fn handle_restore(
     let policy = arena_core::retry::RetryPolicy::default();
     let pods = arena_core::retry::retrying(&policy, || provider.list_pods()).await.context("listing pods")?;
     let pod = pods[arena_core::selector::resolve_one(&Naming::from_config(cfg), &pods, target)?].clone();
+    // A stopped pod's listed endpoint belongs to nothing now: whatever answers there may be
+    // another pod, and the push would write this pod's backup into a stranger's home. Refused
+    // before anything else, dry run included (it probes the pod), as every SSH command
+    // refuses one (live finding #15).
+    if arena_core::status::is_stopped(&pod.status) {
+        anyhow::bail!("refusing to restore {}: it is stopped ({}) — `arena pods start {}` brings it back", pod.name, pod.status, pod.name);
+    }
     let base = std::path::Path::new(&opts.dir);
     let (label, src) = restore::resolve_source(base, &pod.name, opts.from.as_deref())
         .map_err(|e| anyhow::anyhow!("refusing to restore {}: {e}", pod.name))?;
@@ -17455,6 +17462,26 @@ mod remote_tests {
             let e = handle_restore(&f, &remote, &cfg(), pod, opts.clone(), &stub.path(), NOW).await.unwrap_err();
             assert!(format!("{e:#}").contains(says), "{pod} {opts:?}: {e:#}");
             assert!(fake.calls().is_empty() && stub.take_args().is_empty(), "{pod} {opts:?}");
+        }
+    }
+
+    /// A STOPPED pod is never restored onto, dry run included: the listing may still show its
+    /// last endpoint, which belongs to nothing now — whatever answers there could be another
+    /// pod, and the push would put this pod's backup into its home. Refused before any probe.
+    #[tokio::test]
+    async fn a_stopped_pod_is_never_restored_onto() {
+        let stub = StubRsync::new("restore-stopped");
+        let dir = backups(&stub.0);
+        let mut f = fleet();
+        f.pods[0].status = "EXITED".into(); // its last endpoint still listed
+        for dry_run in [false, true] {
+            let fake = Arc::new(FakeRemote::new());
+            fake.script(&host(22001), [FakeReply::stdout("arena-repo-home=/root\narena-repo-real=/root/ARENA_materials\n")]);
+            let remote: Arc<dyn Remote> = fake.clone();
+            let opts = RestoreOpts { dry_run, ..restore_opts(&dir) };
+            let e = handle_restore(&f, &remote, &cfg(), "apple", opts, &stub.path(), NOW).await.unwrap_err().to_string();
+            assert!(e.contains("devtest-apple: it is stopped (EXITED)") && e.contains("`arena pods start devtest-apple`"), "{e}");
+            assert!(fake.calls().is_empty() && stub.take_args().is_empty(), "dry run {dry_run}: {:?}", fake.calls());
         }
     }
 
