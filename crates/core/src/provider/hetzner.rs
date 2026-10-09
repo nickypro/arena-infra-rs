@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use reqwest::{Client, RequestBuilder};
 use serde_json::{json, Value};
 
-use super::Provider;
+use super::{Provider, StopOutcome};
 use crate::apiextra::{self, managed, Extra, Managed};
 use crate::error::{Error, Result};
 use crate::http::{send_json, send_ok};
@@ -49,11 +49,31 @@ impl Default for HetznerOpts {
     }
 }
 
+/// How long `stop` waits for a VM to shut itself down before powering it off: `polls`
+/// status reads, `every` apart.
+#[derive(Debug, Clone, Copy)]
+pub struct ShutdownWait {
+    pub polls: u32,
+    pub every: std::time::Duration,
+}
+
+/// 90 s, read every 5 s: an Ubuntu VM shuts down in seconds; one that hasn't by then is hung
+/// (the case `reset` is for in `restart_pod`), and waiting longer only holds up the command.
+pub const SHUTDOWN_WAIT: ShutdownWait = ShutdownWait { polls: 18, every: std::time::Duration::from_secs(5) };
+
+impl ShutdownWait {
+    /// The whole wait, as the fallback's note says it.
+    fn total(self) -> std::time::Duration {
+        self.every * self.polls
+    }
+}
+
 pub struct HetznerProvider {
     api_key: String,
     client: Client,
     base: String,
     opts: HetznerOpts,
+    shutdown: ShutdownWait,
 }
 
 impl HetznerProvider {
@@ -63,6 +83,7 @@ impl HetznerProvider {
             client: Client::new(),
             base: BASE.to_string(),
             opts,
+            shutdown: SHUTDOWN_WAIT,
         }
     }
 
@@ -86,7 +107,7 @@ impl HetznerProvider {
             .to_string())
     }
 
-    /// POST a power action (`reset`/`poweron`/`reboot`/`poweroff`) to a server.
+    /// POST a power action (`reset`/`poweron`/`reboot`/`shutdown`/`poweroff`) to a server.
     async fn power_action(&self, id: &str, action: &str) -> Result<()> {
         send_ok(
             self.auth(self.client.post(format!("{}/servers/{}/actions/{}", self.base, id, action))),
@@ -271,7 +292,25 @@ impl Provider for HetznerProvider {
     }
 
     async fn stop_pod(&self, id: &str) -> Result<()> {
-        self.power_action(id, "poweroff").await
+        self.stop_pod_outcome(id).await.map(|_| ())
+    }
+
+    async fn stop_pod_outcome(&self, id: &str) -> Result<StopOutcome> {
+        // `poweroff` pulls the plug: a file written just before the stop was lost (live R,
+        // 2026-10-09), and a hard power-off risks the filesystem too. `shutdown` asks the OS
+        // (ACPI) to shut down, flushing its writes; a hung OS ignores it, so after a bounded
+        // wait the VM is powered off after all — and the caller is told it was forced.
+        self.power_action(id, "shutdown").await?;
+        let wait = self.shutdown;
+        for _ in 0..wait.polls {
+            tokio::time::sleep(wait.every).await;
+            // A failed read is "not off yet": the power-off fallback still bounds the stop.
+            if self.server_status(id).await.is_ok_and(|s| s == "off") {
+                return Ok(StopOutcome::Stopped);
+            }
+        }
+        self.power_action(id, "poweroff").await?;
+        Ok(StopOutcome::ForcedOff { waited: wait.total() })
     }
 
     fn restart_wipes_container_disk(&self, _pod: &Pod) -> bool {
@@ -326,7 +365,13 @@ mod tests {
             canned(200, "application/json", r#"{"server":{"id":5,"status":"off"}}"#),
             canned(403, "text/plain", "Forbidden"),
         ]);
-        let p = HetznerProvider { api_key: "BOGUS".into(), client: client(), base: srv.base.clone(), opts: HetznerOpts::default() };
+        let p = HetznerProvider {
+            api_key: "BOGUS".into(),
+            client: client(),
+            base: srv.base.clone(),
+            opts: HetznerOpts::default(),
+            shutdown: SHUTDOWN_WAIT,
+        };
         let e = p.list_pods().await.unwrap_err();
         assert_eq!(e.kind(), Some(K::Auth), "{e}");
         assert!(e.to_string().contains("hetzner list HTTP 401") && e.to_string().contains("unable to authenticate"), "{e}");
@@ -337,6 +382,49 @@ mod tests {
         assert!(e.to_string().contains("hetzner poweron HTTP 403"), "{e}");
         assert_eq!(e.kind(), Some(K::Auth));
         assert_eq!(srv.requests.lock().unwrap().last().unwrap(), "POST /servers/5/actions/poweron HTTP/1.1");
+    }
+
+    /// Live R (2026-10-09): `stop` was a hard `poweroff` and an unsynced file was lost. Now
+    /// it asks the VM to shut down and waits for `off`; only a VM that doesn't get there in
+    /// the bounded wait is powered off — and the outcome says so, for the output.
+    #[tokio::test]
+    async fn stop_shuts_down_gracefully_and_forces_a_power_off_only_after_the_wait() {
+        use crate::http::test_server::{canned, client, serve};
+        let action = || canned(201, "application/json", r#"{"action":{"id":1,"status":"running"}}"#);
+        let status = |s: &str| canned(200, "application/json", &format!(r#"{{"server":{{"id":5,"status":"{s}"}}}}"#));
+        let provider = |base: &str| HetznerProvider {
+            api_key: "k".into(),
+            client: client(),
+            base: base.to_string(),
+            opts: HetznerOpts::default(),
+            shutdown: ShutdownWait { polls: 3, every: std::time::Duration::ZERO },
+        };
+        // Shuts down within the wait (a failed read on the way is just "not yet"): stopped,
+        // never powered off.
+        let srv = serve(vec![action(), status("running"), canned(503, "text/html", "<html>busy</html>"), status("off")]);
+        assert_eq!(provider(&srv.base).stop_pod_outcome("5").await.unwrap(), StopOutcome::Stopped);
+        assert_eq!(
+            *srv.requests.lock().unwrap(),
+            ["POST /servers/5/actions/shutdown HTTP/1.1", "GET /servers/5 HTTP/1.1", "GET /servers/5 HTTP/1.1", "GET /servers/5 HTTP/1.1"]
+        );
+        // Still running after every read: powered off, and the outcome says it was forced.
+        let srv = serve(vec![action(), status("running"), status("stopping"), status("running"), action()]);
+        let p = provider(&srv.base);
+        let out = p.stop_pod_outcome("5").await.unwrap();
+        assert_eq!(out, StopOutcome::ForcedOff { waited: std::time::Duration::ZERO });
+        assert_eq!(srv.requests.lock().unwrap().last().unwrap(), "POST /servers/5/actions/poweroff HTTP/1.1");
+        assert_eq!(srv.requests.lock().unwrap().len(), 5);
+        // `stop_pod` is the same graceful stop (the TUI and every other caller get it too).
+        let srv = serve(vec![action(), status("off")]);
+        provider(&srv.base).stop_pod("5").await.unwrap();
+        assert_eq!(srv.requests.lock().unwrap()[0], "POST /servers/5/actions/shutdown HTTP/1.1");
+        // A refused shutdown is the stop's error; nothing is forced.
+        let srv = serve(vec![canned(403, "application/json", r#"{"error":{"code":"forbidden","message":"no"}}"#)]);
+        let e = provider(&srv.base).stop_pod_outcome("5").await.unwrap_err();
+        assert!(e.to_string().contains("hetzner shutdown HTTP 403"), "{e}");
+        assert_eq!(srv.requests.lock().unwrap().len(), 1);
+        // The real wait is 90 s, read every 5 s.
+        assert_eq!(SHUTDOWN_WAIT.total(), std::time::Duration::from_secs(90));
     }
 
     #[test]

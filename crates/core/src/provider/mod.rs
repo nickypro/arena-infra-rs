@@ -117,6 +117,51 @@ pub fn build(name: &str, cfg: &Config) -> Result<Box<dyn Provider>> {
     }
 }
 
+/// What a restart is known to do to a pod's container disk ([`Provider::restart_resets_container`]).
+/// Three answers, not a bool, because "gate it as a wipe" and "say it was wiped" are two
+/// different claims: a backend can be worth gating without being known to reset (RunPod v1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerReset {
+    /// It resets the container to its image (verified): only a volume survives.
+    Yes,
+    /// It keeps the disk (a Hetzner VM).
+    No,
+    /// Not known to reset every time: gated and set up again as if it did — the safe side —
+    /// but nothing may say it happened.
+    Unknown,
+}
+
+impl ContainerReset {
+    /// Whether the work outside a volume may be gone afterwards: what the `--wipe-ok` gate
+    /// and the re-setup go by.
+    pub fn may_wipe(self) -> bool {
+        self != Self::No
+    }
+}
+
+/// How a stop ended ([`Provider::stop_pod_outcome`]), for the line that reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopOutcome {
+    /// Stopped the way the backend stops a pod (a Hetzner VM: it shut itself down).
+    Stopped,
+    /// The VM didn't shut down within `waited`, so it was powered off (Hetzner): what it
+    /// hadn't written to disk yet may be lost.
+    ForcedOff { waited: std::time::Duration },
+}
+
+impl StopOutcome {
+    /// What the operator must hear about this stop beyond "stopped", if anything.
+    pub fn note(self) -> Option<String> {
+        match self {
+            StopOutcome::Stopped => None,
+            StopOutcome::ForcedOff { waited } => Some(format!(
+                "it didn't shut down within {}s, so it was powered off — writes not yet on its disk may be lost",
+                waited.as_secs()
+            )),
+        }
+    }
+}
+
 /// Upper bound on one backend's list call in [`Provider::list_by_provider`]. The HTTP
 /// clients have no timeout of their own, so a provider API that accepts the connection
 /// and then stalls would hang the caller forever — and a `*/5` `proxy apply` cron would
@@ -245,19 +290,29 @@ pub trait Provider: Send + Sync {
     /// keeps no data" — only a volume survives), so callers gate it like a restart.
     async fn stop_pod(&self, id: &str) -> Result<()>;
 
+    /// Mutating: [`Self::stop_pod`], saying how it ended — what `pods stop` and the TUI
+    /// report. Default: the backend's stop, [`StopOutcome::Stopped`]. Hetzner overrides it:
+    /// its stop is a graceful shutdown that falls back to a power-off, and the fallback must
+    /// be said (it can lose writes).
+    async fn stop_pod_outcome(&self, id: &str) -> Result<StopOutcome> {
+        self.stop_pod(id).await.map(|()| StopOutcome::Stopped)
+    }
+
     /// Mutating, and on most backends DESTRUCTIVE: restart in place (same id, same
-    /// machine), for when a pod is wedged. It is *not* a reboot that keeps files: on
-    /// RunPod (REST v1 and v2) the container is reset to its image, so the container disk
-    /// — everything outside a persistent/network volume: participants' work, `~/.name`,
-    /// setup's git remote, distributed keys — is wiped (live-verified on v2, 2026-10-07;
-    /// RunPod documents the container disk as ephemeral). Hetzner's hard reset keeps the
-    /// VM disk. Callers ask [`Self::restart_wipes_container_disk`] and confirm (and re-run
-    /// setup) accordingly.
+    /// machine), for when a pod is wedged. Don't count on it keeping files: on RunPod REST
+    /// v2 the container is reset to its image, so the container disk — everything outside a
+    /// persistent/network volume: participants' work, `~/.name`, setup's git remote,
+    /// distributed keys — is wiped (live-verified 2026-10-07 and 2026-10-09; RunPod
+    /// documents the container disk as ephemeral). REST v1's restart was seen keeping it
+    /// (twice, 2026-10-09), so it may or may not. Hetzner's hard reset keeps the VM disk.
+    /// Callers ask [`Self::restart_resets_container`] and confirm, re-run setup and word
+    /// their output accordingly.
     async fn restart_pod(&self, id: &str) -> Result<()>;
 
-    /// Whether restarting `pod` — or stopping it and starting it again — resets its
+    /// Whether restarting `pod` — or stopping it and starting it again — MAY reset its
     /// container disk to the image, leaving only a persistent volume (if it has one).
-    /// Drives the restart/stop confirm text and the `--wipe-ok` gate.
+    /// Drives the stop/start confirm text and the `--wipe-ok` gate; for a restart, what is
+    /// known (and so may be said) is [`Self::restart_resets_container`].
     ///
     /// Default **true**: a backend that hasn't said otherwise is assumed to wipe, so a new
     /// provider can only err towards one confirmation too many, never towards silent data
@@ -265,6 +320,21 @@ pub trait Provider: Send + Sync {
     /// to the backend that owns it, like every per-pod call.
     fn restart_wipes_container_disk(&self, _pod: &Pod) -> bool {
         true
+    }
+
+    /// What a restart of `pod` is known to do to its container disk: drives the restart's
+    /// `--wipe-ok` gate and re-setup ([`ContainerReset::may_wipe`]) and what the restart says
+    /// afterwards — "reset to the image" only on [`ContainerReset::Yes`].
+    ///
+    /// Default: [`ContainerReset::Unknown`] where [`Self::restart_wipes_container_disk`]
+    /// holds (gated, never claimed), [`ContainerReset::No`] where it doesn't — so the two
+    /// can't disagree about the gate unless a backend overrides one of them.
+    fn restart_resets_container(&self, pod: &Pod) -> ContainerReset {
+        if self.restart_wipes_container_disk(pod) {
+            ContainerReset::Unknown
+        } else {
+            ContainerReset::No
+        }
     }
 
     /// Mutating. Start a stopped pod again (same id): RunPod's `start` (REST v1 `POST
@@ -527,6 +597,14 @@ mod tests {
         }
     }
 
+    /// Only a forced power-off has something to add to "stopped" — and says what it risked.
+    #[test]
+    fn only_a_forced_stop_has_a_note() {
+        assert_eq!(StopOutcome::Stopped.note(), None);
+        let n = StopOutcome::ForcedOff { waited: std::time::Duration::from_secs(90) }.note().unwrap();
+        assert!(n.contains("didn't shut down within 90s") && n.contains("powered off") && n.contains("may be lost"), "{n}");
+    }
+
     #[test]
     fn runpod_api_parses_known_values_and_rejects_the_rest() {
         let api = |text: &str| RunpodApi::from_config(&Config::parse(text));
@@ -552,16 +630,26 @@ mod tests {
         assert!(api("RUNPOD_API=rpa_SECRETKEY123").unwrap_err().to_string().contains("of 16 chars"));
     }
 
-    /// Restart safety (live finding 2026-10-07): RunPod's restart resets the container to
-    /// its image, on both API generations; Vast's stop+start is unverified and treated the
-    /// same; only Hetzner's VM disk survives. The CLI/TUI gate restart/stop on this answer.
+    /// Restart safety (live findings 2026-10-07 and 2026-10-09): RunPod v2's restart resets
+    /// the container to its image; v1's was seen keeping it, so it's gated as a wipe but
+    /// never said to be one; Vast's stop+start is unverified and treated the same; only
+    /// Hetzner's VM disk survives. The CLI/TUI gate restart/stop on these answers — and the
+    /// two never disagree about the gate.
     #[test]
     fn only_hetzner_keeps_the_disk_across_a_restart() {
+        use ContainerReset::{No, Unknown, Yes};
         let any = Pod::default();
         let keys = "RUNPOD_API_KEY=k\nVAST_API_KEY=v\nHETZNER_API_KEY=h\n";
-        for (name, api, wipes) in [("runpod", "v1", true), ("runpod", "v2", true), ("vast", "v1", true), ("hetzner", "v1", false)] {
+        for (name, api, wipes, resets) in [
+            ("runpod", "v1", true, Unknown),
+            ("runpod", "v2", true, Yes),
+            ("vast", "v1", true, Unknown),
+            ("hetzner", "v1", false, No),
+        ] {
             let p = build(name, &Config::parse(&format!("{keys}RUNPOD_API={api}"))).unwrap();
             assert_eq!(p.restart_wipes_container_disk(&any), wipes, "{name} {api}");
+            assert_eq!(p.restart_resets_container(&any), resets, "{name} {api}");
+            assert_eq!(resets.may_wipe(), wipes, "{name} {api}: the gate is the same either way");
         }
     }
 

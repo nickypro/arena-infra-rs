@@ -164,6 +164,8 @@ pub(crate) fn pipeline_text(setup: bool, check: Option<u32>, keys: bool, lock: b
     let mut steps = vec!["wait for its SSH endpoint".to_string(), "sync the proxy (if nginx is set up)".to_string()];
     if setup {
         steps.push("provision it".into());
+    } else {
+        steps.push("wait for SSH to answer".into());
     }
     if let Some(n) = check {
         steps.push(format!(
@@ -641,20 +643,23 @@ impl Shared<'_, '_> {
             }
         }
 
+        // Without setup nothing has waited out the boot race yet: a pod whose sshd is still
+        // starting must not be judged by the check (unreachable = FAIL) and replaced for it —
+        // nor called READY (live R: a Hetzner `up --no-setup` said READY after 1 s, while the
+        // VM was still initializing). Bounded like setup's wait for it.
+        if self.run.setup.is_none() {
+            match self.or_stop(self.ssh_answers(&target, boot)).await {
+                None => return self.end(run, Verdict::Stopped { stage: Stage::Endpoint }),
+                Some(Err(why)) => {
+                    let reason = format!("SSH never answered ({why}) — left running");
+                    return self.end(run, Verdict::Failed { stage: Stage::Endpoint, reason });
+                }
+                Some(Ok(())) => {}
+            }
+        }
+
         // 4. The deep check: a FAIL is a bad host — replace it while attempts remain.
         if let Some(check) = &self.run.check {
-            // Without setup nothing has waited out the boot race yet: a pod whose sshd is still
-            // starting must not be judged (unreachable = FAIL) and replaced for it.
-            if self.run.setup.is_none() {
-                match self.or_stop(self.ssh_answers(&target, boot)).await {
-                    None => return self.end(run, Verdict::Stopped { stage: Stage::Endpoint }),
-                    Some(Err(why)) => {
-                        let reason = format!("SSH never answered ({why}) — left running");
-                        return self.end(run, Verdict::Failed { stage: Stage::Endpoint, reason });
-                    }
-                    Some(Ok(())) => {}
-                }
-            }
             let Some(mut h) = self.or_stop(self.deep_check(&name, &pod, &target, check)).await else {
                 return self.end(run, Verdict::Stopped { stage: Stage::Check });
             };
@@ -2373,7 +2378,61 @@ mod tests {
         }
         let ports: Vec<Option<u16>> = rows.iter().map(|r| r.proxy_port).collect();
         assert_eq!(ports, [Some(9500), Some(9501), Some(9502)]);
-        assert!(fake.calls().is_empty(), "--no-setup without --check: nothing over SSH");
+        // --no-setup without --check: over SSH only the "does it answer?" before READY.
+        for c in fake.calls() {
+            assert!(matches!(&c, RemoteCall::Exec { cmd, .. } if cmd == "true"), "{c:?}");
+        }
+        assert_eq!(fake.calls().len(), 3);
+    }
+
+    /// Live R: `up --no-setup` on Hetzner said READY after 1 s, while the VM was still
+    /// initializing — the endpoint (its IP) is known long before sshd answers. Without setup,
+    /// READY now waits for SSH to answer, within the pod's `--timeout`; one that never does
+    /// FAILs (left running), and a refused key is an answer, not a wait.
+    #[tokio::test(start_paused = true)]
+    async fn without_setup_ready_waits_for_ssh_to_answer() {
+        let cfg = cfg(None);
+        let refused = || FakeReply::exit(255, "ssh: connect to host 10.0.0.1 port 22001: Connection refused");
+        // sshd refuses for 2+ min (booting; one try every 6 s), then answers: READY only then.
+        let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 0)])]);
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host("10.0.0.1", 22001), (0..24).map(|_| refused()));
+        let run = up_run(&fleet, fake.clone(), &cfg, false, None, None).await;
+        let made = make(&fleet, &["apple"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+        assert_eq!(rows[0].verdict, Verdict::Ready);
+        let (_, at) = lines.find("[devtest-apple] READY after ");
+        assert!(at >= Duration::from_secs(24 * 6), "READY only once SSH answered: {at:?}");
+        assert_eq!(fake.calls().len(), 25, "24 refusals, then the answer");
+
+        // Never answers within --timeout: FAILED at the endpoint stage, left running.
+        let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 0)])]);
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host("10.0.0.1", 22001), (0..1000).map(|_| refused()));
+        let run = up_run(&fleet, fake.clone(), &cfg, false, None, None).await;
+        let made = make(&fleet, &["apple"]).await;
+        let rows = run_up(&run, made, std::future::pending(), &|_, _| {}).await;
+        match &rows[0].verdict {
+            Verdict::Failed { stage: Stage::Endpoint, reason } => {
+                assert!(reason.contains("SSH never answered") && reason.contains("still unreachable after 600s"), "{reason}");
+                assert!(reason.contains("left running"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(!fleet.events().iter().any(|e| e.starts_with("terminate")), "{:?}", fleet.events());
+
+        // Our key refused: that's an answer — FAILED at once, not after the whole wait.
+        let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 0)])]);
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host("10.0.0.1", 22001), [FakeReply::exit(255, "root@10.0.0.1: Permission denied (publickey).")]);
+        let run = up_run(&fleet, fake.clone(), &cfg, false, None, None).await;
+        let made = make(&fleet, &["apple"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+        assert!(matches!(&rows[0].verdict, Verdict::Failed { stage: Stage::Endpoint, reason } if reason.contains("Permission denied")));
+        let (_, at) = lines.find("[devtest-apple] FAILED ");
+        assert!(at < Duration::from_secs(5), "{at:?}");
     }
 
     #[tokio::test(start_paused = true)]
@@ -2906,7 +2965,8 @@ mod tests {
         );
         assert_eq!(
             pipeline_text(false, None, true, false),
-            "per pod, as soon as it can: wait for its SSH endpoint, sync the proxy (if nginx is set up) — then READY/FAILED per pod"
+            "per pod, as soon as it can: wait for its SSH endpoint, sync the proxy (if nginx is set up), wait for SSH to \
+             answer — then READY/FAILED per pod"
         );
     }
 

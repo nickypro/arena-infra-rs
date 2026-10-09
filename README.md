@@ -139,9 +139,11 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     the list still renders); the `nvidia-smi` probe over SSH (default for the table,
     `--probe`/`--no-probe`) overrides the GPU when a pod answers. `list --json` emits the
     pods incl. `gpu_count`/`cost_per_hr`/`maintenance`. **`restart` WIPES a RunPod pod's
-    container disk** (live finding: the container is reset to its image — everything
-    outside a `/workspace` volume, `~/.name`, setup's git remote and keys are gone; Vast's
-    stop+start is treated the same, unverified; a Hetzner hard reset keeps the VM disk). The
+    container disk** (live finding: on `RUNPOD_API=v2` the container is reset to its image —
+    everything outside a `/workspace` volume, `~/.name`, setup's git remote and keys are gone;
+    a v1 restart was seen keeping it, so on v1 it is gated and set up again the same way, but
+    the output only ever says it *may* have reset; Vast's stop+start is treated the same,
+    unverified; a Hetzner hard reset keeps the VM disk). The
     prompt says what's lost and what survives (the volume size comes from the pod's spec);
     unless the ARENA repo sits on a confirmed `/workspace` volume, the restart is **refused
     unless `--wipe-ok`** (even with `--yes`): a volume elsewhere doesn't save the
@@ -161,7 +163,10 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     participant's, on the volume) is left as it is, with a warning on the pod's line —
     `pods setup --force` is the only thing that resets it. A **stopped** pod is refused (`… is stopped (EXITED) — … arena pods start …`: a
     restart needs a running pod). `stop` gets the same gate (`--wipe-ok`): a stopped RunPod
-    pod keeps no data. **`pods start <targets>`** (targets or `--all`) is the way back from a
+    pod keeps no data. A Hetzner `stop` asks the VM to shut down (ACPI, so it flushes its
+    writes) and waits up to 90 s for it to be off; only one that isn't is powered off, and
+    the output says so (`⚠ … powered off — writes not yet on its disk may be lost`).
+    **`pods start <targets>`** (targets or `--all`) is the way back from a
     stop (RunPod v1 `POST /pods/{id}/start`, v2 action `start`, Vast state `running`, Hetzner
     `poweron`): only stopped pods are started (others skipped with a note), each comes back as
     a fresh image, so it waits for its endpoint to settle, **re-runs setup** (`--no-setup`)
@@ -701,7 +706,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
       `__pycache__/` inside `~/.config` too —, venvs, site-packages and `~/.local/lib`, HF
       caches, uv's Pythons, the `claude`/`codex` setup installs in `~/.local/bin` (never
       deleted on `-new` either) and Claude Code's state under `~/.local`, shell rc files +
-      history, `.claude*`, `.ssh`, `~/.name`). The plans no longer promise a "copied-size sanity" check: what's verified is
+      history, zsh's completion cache (`.zcompdump*`, never deleted on `-new` either),
+      `.claude*`, `.ssh`, `~/.name`). The plans no longer promise a "copied-size sanity" check: what's verified is
       the delivery marker read back from the right pod, then an SSH + GPU health check.
     - The **direct** pod-to-pod copy is skipped when both pods share a public IP (a pod can't
       reach its neighbour through it) and gives up connecting after 15 s; when it fails the

@@ -67,7 +67,7 @@ use reqwest::{Client, Method, RequestBuilder, StatusCode, Url};
 use serde_json::{json, Map, Value};
 
 use super::runpod::{self, loose_f64, loose_string, GpuType};
-use super::Provider;
+use super::{ContainerReset, Provider};
 use crate::apiextra::{self, managed, Extra, Managed};
 use crate::error::{Error, ProviderErrorKind, Result};
 use crate::http::{judge, status_error};
@@ -911,6 +911,12 @@ impl Provider for RunpodV2Provider {
 
     fn restart_wipes_container_disk(&self, _pod: &Pod) -> bool {
         true // live-verified 2026-10-07: restart resets the container to its image
+    }
+
+    fn restart_resets_container(&self, _pod: &Pod) -> ContainerReset {
+        // Live-verified twice (2026-10-07, 2026-10-09): the marker gone, a new `/.dockerenv`,
+        // a new port — what the restart then says, and what the replica's reset guard sees.
+        ContainerReset::Yes
     }
 
     async fn restart_pod(&self, id: &str) -> Result<()> {

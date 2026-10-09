@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use reqwest::{Client, RequestBuilder};
 use serde_json::{json, Value};
 
-use super::Provider;
+use super::{ContainerReset, Provider};
 use crate::apiextra::{self, managed, Extra, Managed};
 use crate::error::{Error, ProviderErrorKind, Result};
 use crate::http::{send_json, send_ok};
@@ -317,15 +317,21 @@ impl Provider for RunpodProvider {
     }
 
     fn restart_wipes_container_disk(&self, _pod: &Pod) -> bool {
-        true // the container is reset to its image; only a volume survives (see restart_pod)
+        true // a stop keeps no data ("Stopping a pod keeps no data"); a restart: see below
+    }
+
+    fn restart_resets_container(&self, _pod: &Pod) -> ContainerReset {
+        // Live 2026-10-09, twice (with and without a volume): a v1 restart kept the container
+        // disk — marker files survived and `/.dockerenv` was unchanged while PID 1 restarted.
+        // RunPod still documents the container disk as ephemeral and v2's restart does reset
+        // it, so it stays gated like a wipe (v1 retires 2026-11-15) — but nothing says it was.
+        ContainerReset::Unknown
     }
 
     async fn restart_pod(&self, id: &str) -> Result<()> {
         // Dedicated restart endpoint: restarts the container on the same pod/machine
-        // (same id and GPU), unlike stop/start which deallocates. It does NOT keep the
-        // container disk: the container is reset to its image, so everything outside a
-        // volume is wiped (RunPod documents the container disk as ephemeral; the same
-        // action on v2 was live-verified to drop ~/.name and setup's git remote).
+        // (same id and GPU), unlike stop/start which deallocates. Whether it keeps the
+        // container disk isn't something to rely on (see `restart_resets_container`).
         send_ok(self.auth(self.client.post(format!("{}/pods/{id}/restart", self.base))), "restart pod").await
     }
 
