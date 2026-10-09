@@ -87,6 +87,18 @@ if [ ! -e "$G/arena-nested" ]; then
     mv -f "$T.folded" "$G/arena-nested"
     sed 's/^/NESTED_FOLDED /' "$G/arena-nested"
 fi
+# A clone folded before that has a .git again — the image's own, after `pods replace` copied
+# this checkout (its index, the folded files and this list) onto a new pod — is folded again:
+# this repo tracks its files already, and must not see them inside a nested repo. (To undo a
+# fold for good: move the .git back and delete its line from $G/arena-nested.)
+if [ -s "$G/arena-nested" ]; then
+    while IFS= read -r d; do
+        if [ -n "$d" ] && [ -d "$d/.git" ] && [ ! -e "$d/$ASIDE" ] && mv "$d/.git" "$d/$ASIDE"; then
+            unlink_gitlink "$d"
+            echo "NESTED_FOLDED $d"
+        fi
+    done < "$G/arena-nested"
+fi
 nested > "$T.kept"
 while IFS= read -r d; do
     unlink_gitlink "$d"
@@ -120,6 +132,16 @@ while IFS= read -r f; do
     echo "BIGSKIP $(stat -c %s -- "$f" 2>/dev/null || echo 0) $f"
 done < "$T.big"
 git add -A -- "$@"
+# One staged by hand (`git add` of a checkpoint) is taken back out of the index, before it's
+# committed — the file itself untouched.
+git diff --cached --name-only -z --diff-filter=AMT | sed -z 's#^#./#' \
+    | xargs -0 -r sh -c 'find "$@" -prune -type f -size +"$0"c -print0 2>/dev/null; exit 0' "$MAX" \
+    | tr '\0' '\n' > "$T.staged"
+while IFS= read -r f; do
+    f=${f#./}
+    git reset -q -- ":(literal)$f"
+    if ! grep -qxF -- "./$f" "$T.big"; then echo "BIGSKIP $(stat -c %s -- "$f" 2>/dev/null || echo 0) $f"; fi
+done < "$T.staged"
 if ! git diff --cached --quiet; then git commit -q -m "$MSG"; fi
 
 # --- Push -----------------------------------------------------------------------------------

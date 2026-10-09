@@ -554,15 +554,20 @@ mod tests {
         s.put("data.bin", 3000); // tracked, grown over it
         s.put("exercises/notes.md", 200); // new work, small
         s.put("exercises/at_the_limit.bin", 1000); // exactly the limit: fine
+        s.put("exercises/staged_by_hand.pt", 4000); // `git add`ed by the participant
+        s.git(&s.work, &["add", "exercises/staged_by_hand.pt"]);
         let (code, r, err) = s.backup();
         assert_eq!(code, Some(0), "{err}");
         assert_eq!(r.outcome, Some((BACKUP_PUSHED, "autocommit-x".into())));
         let mut skipped = r.big_skipped.clone();
         skipped.sort();
-        assert_eq!(skipped, [(3000, "data.bin".to_string()), (5000, "exercises/devtest_ckpt.pt".to_string())]);
+        assert_eq!(
+            skipped,
+            [(3000, "data.bin".to_string()), (4000, "exercises/staged_by_hand.pt".to_string()), (5000, "exercises/devtest_ckpt.pt".to_string())]
+        );
         let tree: Vec<String> = s.origin_tree("autocommit-x").into_iter().map(|(_, p)| p).collect();
         assert!(tree.contains(&"exercises/notes.md".to_string()) && tree.contains(&"exercises/at_the_limit.bin".to_string()), "{tree:?}");
-        assert!(!tree.contains(&"exercises/devtest_ckpt.pt".to_string()), "{tree:?}");
+        assert!(!tree.contains(&"exercises/devtest_ckpt.pt".to_string()) && !tree.contains(&"exercises/staged_by_hand.pt".to_string()), "{tree:?}");
         assert_eq!(s.origin_blob_size("autocommit-x", "data.bin"), 10, "the grown file's last good version stays");
         assert!(s.work.join("exercises/devtest_ckpt.pt").exists(), "never touched on disk");
         // Its blob was never even written (a 2 GB checkpoint staged every tick would fill the disk).
@@ -573,7 +578,7 @@ mod tests {
         // Next run: nothing new — and it says so, still naming what it keeps out.
         let (code, r, _) = s.backup();
         assert_eq!((code, r.outcome.clone()), (Some(0), Some((BACKUP_NO_CHANGES, "autocommit-x".into()))));
-        assert_eq!(r.big_skipped.len(), 2);
+        assert_eq!(r.big_skipped.len(), 3);
     }
 
     /// A pod already stuck (the blob was committed before this guard): a clear failure with the
@@ -673,6 +678,15 @@ mod tests {
         // Reversible: moving the .git back gives the clone its own history again.
         std::fs::rename(clone.join(NESTED_GIT_ASIDE), clone.join(".git")).unwrap();
         assert_eq!(s.git(&clone, &["rev-parse", "HEAD"]), s.git(&upstream, &["rev-parse", "HEAD"]));
+
+        // A clone folded before with a .git again — what `pods replace` leaves: the copy carries
+        // this checkout (index, folded files, the list) but not .git.arena-nested, and the new
+        // pod's image has the clone's .git — is folded again, never kept as a nested repo.
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.folded.clone()), (Some(0), vec!["exercises/shutdown_avoidance".to_string()]), "{err}");
+        assert!(!r.kept.contains(&"exercises/shutdown_avoidance".to_string()), "{:?}", r.kept);
+        assert!(clone.join(NESTED_GIT_ASIDE).is_dir() && !clone.join(".git").exists());
+        assert!(!s.origin_tree("autocommit-x").iter().any(|(mode, _)| mode == "160000"));
     }
 
     /// Pods backed up before this fix carry gitlinks in their history: folding such a clone

@@ -380,7 +380,10 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     with its own history (a participant's project), or one cloned after that, is left exactly
     as it is, kept out of the commit (a managed block in `.git/info/exclude`) and reported
     every run (the rsync tiers have it). A gitlink an earlier backup committed is replaced by
-    the files. The script runs under `sh` whatever the login shell; `--dry-run` prints it
+    the files; a folded clone that has a `.git` again (the image's, after `pods replace`
+    copied the checkout to a new pod) is folded again — to undo a fold for good, move the
+    `.git` back and delete its line from `.git/arena-nested`. A file over the limit staged by
+    hand (`git add`) is taken back out of the index the same way. The script runs under `sh` whatever the login shell; `--dry-run` prints it
     once plus each pod's exact arguments.
   - `pods set-branch <branch> <targets|--all> [--hard]` — switch pods' ARENA checkout to a
     branch. Gentle by default (fetch + checkout + ff-only pull — fails on a diverged/dirty
@@ -537,13 +540,27 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     terminate <name>` (the id when a name is shared). Anything unreadable (no reply, a scan
     that timed out, `[N/A]` GPU, our own connection not found, more than 2000 sockets so not
     every connection was read) makes a pod `?`, never a candidate. Not seen: sessions through RunPod's `ssh.runpod.io` proxy (not via sshd).
-  - `pods pull [label]` — the **file** backup (complementing the git `backup`): rsyncs
-    each pod's home into `<dir>/<label>/<pod>/`, reporting files/bytes moved per pod.
-    **Keeps `.git`** (so the backup is a usable repo; `--no-git` to skip), size-caps with
-    `--max-size`, excludes other dotfile dirs + `site-packages`. Knobs come from flags
+  - `pods pull [targets] [--label <label>]` — the **file** backup (complementing the git
+    `backup`): rsyncs each pod's home into `<dir>/<label>/<pod>/`, reporting per pod what was
+    sent and what the snapshot holds (`12 files, 3.4M sent of 6754, 1.8G` — sizes parsed in
+    every format rsync prints). Targets are positional like every command's (the old `-t`
+    still works, and so does `pods pull w1d3` — read as the label, with a note — when `w1d3`
+    names no pod). **Keeps `.git`, complete** (`--no-git` to skip): the size cap
+    (`--max-size`) applies to the files, then a second pass copies every kept `.git` uncapped
+    — a repo's big pack used to be dropped, leaving refs to missing objects — and the empty
+    dirs inside a `.git` (`refs/heads/` once refs are packed) are kept, so each snapshot (and
+    `big/`) is a repo git reads. Excludes other dotfile dirs + `site-packages`. **Hard-linked
+    snapshots**: each dated snapshot is still a complete tree (restore/pull layout unchanged),
+    but files unchanged since this pod's previous snapshot, or identical to the week's **fleet
+    baseline** (`pods baseline`), are hard links (`rsync --link-dest`, absolute paths, same
+    filesystem — all under `<dir>`), not copies: a day's snapshot costs only what changed, a
+    new or replaced pod's first one only what isn't the image's. The run ends with each
+    snapshot's real cost (`1.8G in 6754 files, 12.0M of it new on disk`); `du -sh <dir>/*` in
+    one invocation counts a hard-linked file once. Knobs come from flags
     else config: `LOCAL_BACKUP_DIR` (`--dir`), `BACKUP_MAX_SIZE` (`--max-size`),
     `BACKUP_REMOTE_PATH` (`--remote-path`, default `~/`). Label defaults to the `wNdM`
-    iteration. Confirms first; `--dry-run` prints the exact rsync commands. **Bounded**: rsync
+    iteration (`big`/`baseline` are refused). Confirms first; `--dry-run` prints the exact
+    rsync commands, shell-quoted. **Bounded**: rsync
     `--timeout=300` (gives up after 5 min without any I/O) and a wall-clock budget per pod,
     `BACKUP_TIMEOUT_SECS` (default 7200 = 2 h, max a day; settable from the environment) —
     a pod that runs out is stopped (SIGTERM, so rsync takes its ssh and receiver down too;
@@ -564,6 +581,20 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     aside (`*.arena-aside-*`) isn't backed up — only an untouched image checkout is ever moved
     aside after a reset (see `pods setup`). `pods replace`/`migrate copy` carry the repo the same way (direct and via
     local staging), into the new pod's own volume copy when it has one.
+  - `pods baseline <pod> [--week N] [--dir] [--replace] [--dry-run]` — capture the week's
+    **fleet baseline** into `<dir>/baseline/w<N>/fleet/`: the image's own files, which every
+    pod's snapshots hard-link to (see `pods pull`). Run it once a week (or after an image
+    change) on a pod `up` just made — its container must say when it was created and be under
+    a day old, else it's refused. It rsyncs the pod's home with the snapshot tier's filters
+    (linked to last week's baseline), then **keeps only the files older than the container**:
+    a hard link is made on equal size + mtime + permissions, contents are never compared, so a
+    file written at setup or later (`~/.name`, the API keys in `.bashrc`, a script's output on
+    several pods in one second) could otherwise stand in for another pod's different file. A
+    repo on the `/workspace` volume is left out (a volume can hold work older than the
+    container). Captured into a partial dir and moved into place only when complete; an
+    existing baseline needs `--replace`, which moves it aside (`fleet.replaced-<time>/`) —
+    nothing is deleted. Chosen over an automatic "first snapshot of the week": a pod in use
+    can hold work with pre-container mtimes, so which pod is pristine is the operator's call.
   - `pods restore <pod> [--from <label>|big] [--path <subdir>] [--dir] [--timeout]
     [--overwrite-newer] [--with-git] [--dry-run]` — push a backup (pull's layout) back onto
     **one** pod over its direct endpoint: by default its newest `wNdM` snapshot (files under
@@ -578,8 +609,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     onto the volume (a plain push would replace the link with a directory on the container
     disk). Never pushes `~/.ssh`, the shell rc files/histories (they hold the pod's own API
     keys), `~/.name` or `.claude*`; never chowns the home; never pushes `.git` from a snapshot
-    (it can lack git packs over the size cap — refs to missing objects break the repo;
-    `--with-git` to push it anyway, or `--from big`). After a restore that pushed the repo's
+    by default (a snapshot pulled before `.git` got its own uncapped pass can lack git packs
+    over the size cap — refs to missing objects break the repo; `--with-git` to push it, or
+    `--from big`). After a restore that pushed the repo's
     `.git`, the repo is checked (`git fsck --connectivity-only`, 120s) and a broken one fails
     the command, saying where the replaced files are. Refuses before touching the pod when
     the backup doesn't exist or is empty, or `--path` isn't in it. Confirms first with

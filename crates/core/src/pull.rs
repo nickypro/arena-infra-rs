@@ -9,7 +9,16 @@
 //! reconstructable/huge non-dot dirs (`hf_cache/`, `__pycache__/`, `venv/`,
 //! `node_modules/`) are excluded — they're either reconstructable or huge. The rsync arg
 //! vector is built purely here so it's unit-tested; the process spawn lives in the caller.
+//!
+//! The dated snapshot tier is **deduplicated with hard links** (`--link-dest`): unchanged files
+//! are linked to this pod's previous snapshot and to the week's **fleet baseline** — the
+//! image's own files, captured once from a fresh pod (`pods baseline`, see
+//! [`prune_baseline`]) — instead of copied again (live: every day's snapshot was a full ~1.8G
+//! per pod, almost all of it image content). Each snapshot stays a complete, restorable tree.
+//! And its `.git` is complete: the size cap applies to the files, never to `.git` (a second,
+//! uncapped pass — [`PullConfig::passes`]).
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::error::{Error, Result};
@@ -40,6 +49,15 @@ pub struct PullConfig {
     /// keep-alives while either side is busy checksumming a big file. `None` = no limit.
     /// The wall-clock bound on a whole transfer is the caller's (`BACKUP_TIMEOUT_SECS`).
     pub io_timeout_secs: Option<u64>,
+    /// Complete earlier trees whose identical files are hard-linked instead of copied (rsync
+    /// `--link-dest`, absolute paths, tried in order; "identical" = same size, mtime and
+    /// permissions): this pod's previous snapshot and the fleet baseline
+    /// ([`snapshot_link_dests`]). They must be on the destination's filesystem (they are: all
+    /// under the backup dir). Empty = no dedup.
+    pub link_dest: Vec<String>,
+    /// Only the `.git` dirs, nothing else — the size-capped tier's second pass
+    /// ([`PullConfig::passes`]).
+    pub git_only: bool,
 }
 
 /// The default [`PullConfig::io_timeout_secs`]: 5 minutes without a byte means the
@@ -92,6 +110,8 @@ impl Default for PullConfig {
             ],
             remote_path: String::new(),
             io_timeout_secs: Some(RSYNC_IO_TIMEOUT_SECS),
+            link_dest: Vec::new(),
+            git_only: false,
         }
     }
 }
@@ -101,6 +121,27 @@ impl PullConfig {
     pub fn without_git(mut self) -> Self {
         self.includes.retain(|i| !i.contains(".git"));
         self
+    }
+
+    /// The rsyncs that make this tier, run one after the other into the same destination. A
+    /// size-capped tier that keeps `.git` is two: everything but `.git` under the cap, then
+    /// only the `.git` dirs with no cap — the cap used to drop a repo's big pack, leaving a
+    /// `.git` whose refs point at objects that never arrived (live: a 232M pack missing, `git
+    /// fsck` failing). With `--link-dest` the second pass costs little on disk: a pack doesn't
+    /// change, so each snapshot hard-links the previous one's. Everything else is one pass.
+    pub fn passes(&self) -> Vec<PullConfig> {
+        let keeps_git = self.includes.iter().any(|i| i.contains(".git"));
+        if self.git_only || self.max_size.is_none() || !keeps_git {
+            return vec![self.clone()];
+        }
+        let git = PullConfig {
+            max_size: None,
+            min_size: None,
+            includes: self.includes.iter().filter(|i| i.contains(".git")).cloned().collect(),
+            git_only: true,
+            ..self.clone()
+        };
+        vec![self.clone().without_git(), git]
     }
 
     /// Pod-to-pod **replication** profile (the `pods replace` copy), as opposed to the
@@ -318,6 +359,12 @@ fn rsync_flags(pc: &PullConfig) -> Vec<String> {
     if let Some(m) = &pc.min_size {
         a.push(format!("--min-size={m}"));
     }
+    // `--prune-empty-dirs` must not prune inside a kept `.git`: a repo whose refs are all packed
+    // has an empty `.git/refs/heads/`, and git doesn't take a `.git` without `refs/` for a
+    // repository at all ("not a git repository") — the copy would be no repo.
+    if pc.includes.iter().any(|i| i.contains(".git")) {
+        a.push("--filter=protect **/.git/**/".into());
+    }
     // Includes first (they win over a later exclude), then excludes.
     for inc in &pc.includes {
         a.push("--include".into());
@@ -327,7 +374,166 @@ fn rsync_flags(pc: &PullConfig) -> Vec<String> {
         a.push("--exclude".into());
         a.push(ex.clone());
     }
+    // The `.git` pass: whatever the rules above haven't decided — every other directory (to
+    // reach the `.git`s inside it; `--prune-empty-dirs` drops the ones that hold none) and every
+    // other file (dropped) — so it carries exactly the `.git` dirs the tier keeps, the dirs it
+    // excludes (caches, venvs) never entered.
+    if pc.git_only {
+        a.extend(["--include", "*/", "--exclude", "*"].map(String::from));
+    }
+    for d in &pc.link_dest {
+        a.push(format!("--link-dest={d}"));
+    }
     a
+}
+
+/// The directory under the backup dir that holds the fleet baselines (`<dir>/baseline/`); never
+/// a snapshot label.
+pub const BASELINE_DIR: &str = "baseline";
+
+/// A week's fleet baseline: `<base>/baseline/w<week>/fleet/` — the image's own files from one
+/// freshly set-up pod, for every pod's snapshots of that week (and later, until a newer one)
+/// to hard-link to ([`snapshot_link_dests`]).
+pub fn baseline_dir(base: &Path, week: u32) -> PathBuf {
+    base.join(BASELINE_DIR).join(format!("w{week}")).join("fleet")
+}
+
+/// The newest non-empty fleet baseline of `week` or before (any week when `None`).
+pub fn newest_baseline(base: &Path, week: Option<u32>) -> Option<PathBuf> {
+    let mut weeks: Vec<u32> = std::fs::read_dir(base.join(BASELINE_DIR))
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().to_str()?.strip_prefix('w')?.parse::<u32>().ok())
+        .filter(|w| week.map_or(true, |max| *w <= max))
+        .collect();
+    weeks.sort_unstable();
+    weeks.into_iter().rev().map(|w| baseline_dir(base, w)).find(|d| non_empty_dir(d))
+}
+
+fn non_empty_dir(dir: &Path) -> bool {
+    std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) && std::fs::read_dir(dir).is_ok_and(|mut e| e.next().is_some())
+}
+
+/// What a new snapshot `<base>/<label>/<pod>/` hard-links its unchanged files to, as absolute
+/// paths (rsync takes a relative `--link-dest` relative to the destination — absolute leaves no
+/// doubt), most likely match first: this pod's newest other `wNdM` snapshot (day-to-day: the
+/// files setup touched differ per pod, so only the pod's own history has them), then the
+/// newest fleet baseline of the label's week or before (the image's files, the same on every
+/// pod — what a new or replaced pod's first snapshot shares). Only directories that exist; none
+/// at all when `base` doesn't exist yet.
+pub fn snapshot_link_dests(base: &Path, label: &str, pod: &str) -> Vec<String> {
+    let Ok(base) = std::fs::canonicalize(base) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if let Some(prev) = crate::restore::snapshot_labels(&base, pod).into_iter().find(|l| l != label) {
+        out.push(base.join(prev).join(pod));
+    }
+    if let Some(b) = newest_baseline(&base, crate::restore::parse_label(label).map(|(w, _)| w)) {
+        out.push(b);
+    }
+    out.into_iter().map(|p| p.display().to_string()).collect()
+}
+
+/// What a backup tree takes on disk ([`disk_use`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiskUse {
+    /// Regular files in it, and their bytes (what `du` of this tree alone says).
+    pub files: u64,
+    pub bytes: u64,
+    /// The bytes of the files no other tree shares (link count 1): what keeping this tree
+    /// costs on top of the others — `du` over all the snapshots counts a hard-linked file once,
+    /// so this is the tree's share of that.
+    pub own_bytes: u64,
+}
+
+/// [`DiskUse`] of the tree at `path` (symlinks aren't followed or counted).
+pub fn disk_use(path: &Path) -> std::io::Result<DiskUse> {
+    let mut d = DiskUse::default();
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let m = entry.metadata()?;
+            if m.is_dir() {
+                stack.push(entry.path());
+            } else if m.is_file() {
+                d.files += 1;
+                d.bytes += m.len();
+                if links(&m) <= 1 {
+                    d.own_bytes += m.len();
+                }
+            }
+        }
+    }
+    Ok(d)
+}
+
+#[cfg(unix)]
+fn links(m: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    m.nlink()
+}
+
+#[cfg(not(unix))]
+fn links(_: &std::fs::Metadata) -> u64 {
+    1
+}
+
+/// What [`prune_baseline`] kept and removed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PruneStats {
+    pub kept_files: u64,
+    pub kept_bytes: u64,
+    pub removed_files: u64,
+    pub removed_bytes: u64,
+}
+
+/// Reduce a baseline freshly pulled from one pod to **the image's own files**: remove every
+/// file and symlink last modified at or after `since` (UNIX seconds: the pod's container
+/// creation), then the directories that leaves empty.
+///
+/// Why: rsync's `--link-dest` takes a file as "the same" when its size, mtime and permissions
+/// match — it never compares contents. Within one pod's history that's safe. Across pods it is
+/// only safe for files nobody wrote after the image was built: the image's files carry the
+/// image's mtimes on every pod, while a file written at setup or later (`~/.name`, the API keys
+/// in `.bashrc`, a script's output written on several pods in the same second) can match
+/// another pod's in size and mtime with different contents — and a snapshot would then hold
+/// the wrong pod's file. So the baseline keeps only what predates the container.
+pub fn prune_baseline(dir: &Path, since: u64) -> std::io::Result<PruneStats> {
+    let mut s = PruneStats::default();
+    prune_dir(dir, since, &mut s)?;
+    Ok(s)
+}
+
+/// [`prune_baseline`] below `dir`; whether `dir` is now empty.
+fn prune_dir(dir: &Path, since: u64, s: &mut PruneStats) -> std::io::Result<bool> {
+    let mut empty = true;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let m = entry.metadata()?; // not following symlinks
+        if m.is_dir() {
+            if prune_dir(&entry.path(), since, s)? {
+                std::fs::remove_dir(entry.path())?;
+            } else {
+                empty = false;
+            }
+            continue;
+        }
+        let mtime = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs());
+        let size = if m.is_file() { m.len() } else { 0 };
+        if mtime.map_or(true, |t| t >= since) {
+            std::fs::remove_file(entry.path())?;
+            s.removed_files += 1;
+            s.removed_bytes += size;
+        } else {
+            s.kept_files += 1;
+            s.kept_bytes += size;
+            empty = false;
+        }
+    }
+    Ok(empty)
 }
 
 /// What an rsync `--stats` summary says moved (see [`parse_rsync_stats`]).
@@ -348,6 +554,29 @@ impl RsyncStats {
     pub fn sent(&self) -> String {
         format!("{} files, {}", self.files_sent, human_bytes(self.bytes_sent))
     }
+
+    /// Two passes into one destination as one ([`PullConfig::passes`]).
+    pub fn add(self, o: RsyncStats) -> RsyncStats {
+        let sum = |a: Option<u64>, b: Option<u64>| match (a, b) {
+            (None, None) => None,
+            (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+        };
+        RsyncStats {
+            files_sent: self.files_sent + o.files_sent,
+            bytes_sent: self.bytes_sent + o.bytes_sent,
+            files: sum(self.files, o.files),
+            bytes: sum(self.bytes, o.bytes),
+        }
+    }
+
+    /// `12 files, 3.4M sent of 6754, 1.8G` — what moved, and what the tree it made holds (with
+    /// `--link-dest` the rest was hard-linked, not sent).
+    pub fn summary(&self) -> String {
+        match (self.files, self.bytes) {
+            (Some(n), Some(b)) => format!("{} sent of {n}, {}", self.sent(), human_bytes(b)),
+            _ => self.sent(),
+        }
+    }
 }
 
 /// Parse rsync `--stats` output so a pull reports what actually moved (not just "done").
@@ -366,7 +595,8 @@ pub fn parse_rsync_stats(stdout: &str) -> Option<RsyncStats> {
         } else if let Some(rest) = line.strip_prefix("Total transferred file size:") {
             s.bytes_sent = rsync_number(rest).unwrap_or(0);
         } else if let Some(rest) = line.strip_prefix("Number of files:") {
-            s.files = rsync_number(rest);
+            // `6,754 (reg: 6,000, dir: 754)`: the regular files, to compare with those sent.
+            s.files = rest.split_once("reg:").map_or_else(|| rsync_number(rest), |(_, reg)| rsync_number(reg.trim_end_matches(')')));
         } else if let Some(rest) = line.strip_prefix("Total file size:") {
             s.bytes = rsync_number(rest);
         }
@@ -642,6 +872,196 @@ mod tests {
         pc.remote_path = "ARENA_3.0/results".into();
         let a = rsync_args(&target(), &pc, "./out/");
         assert_eq!(a[a.len() - 2], "root@1.2.3.4:ARENA_3.0/results");
+    }
+
+    /// The snapshot tier is two passes when it keeps `.git` (the files under the cap, then every
+    /// `.git` uncapped); every other tier is one. Link-dests ride along on both.
+    #[test]
+    fn a_capped_tier_keeping_git_is_two_passes() {
+        let snap = PullConfig { link_dest: vec!["/b/w1d1/devtest-a".into()], ..PullConfig::small_tier("50M") };
+        let p = snap.passes();
+        assert_eq!(p.len(), 2);
+        let files = rsync_args(&target(), &p[0], "./d/");
+        assert!(files.contains(&"--max-size=50M".to_string()) && !files.iter().any(|a| a.contains(".git")), "{files:?}");
+        assert!(files.contains(&"--include".to_string()), "the .claude includes stay: {files:?}");
+        let git = rsync_args(&target(), &p[1], "./d/");
+        let joined = git.join(" ");
+        assert!(!joined.contains("--max-size") && !joined.contains(".claude"), "{joined}");
+        assert!(joined.contains("--include **/.git/ --include **/.git/** --exclude **/.*/"), "{joined}");
+        // Its last rules: every other dir (to reach the .gits in it), no other file.
+        let tail: Vec<&str> = git.iter().map(String::as_str).skip_while(|a| *a != "*/").take(3).collect();
+        assert_eq!(tail, ["*/", "--exclude", "*"], "{joined}");
+        for args in [&files, &git] {
+            assert!(args.contains(&"--link-dest=/b/w1d1/devtest-a".to_string()), "{args:?}");
+        }
+        // One pass: the big tier, --no-git, the replication profile, a pass of a pass.
+        for one in [PullConfig::big_tier(), PullConfig::small_tier("50M").without_git(), PullConfig::replication(), p[1].clone()] {
+            assert_eq!(one.passes().len(), 1);
+        }
+        assert!(!rsync_args(&target(), &PullConfig::big_tier(), "./d/").iter().any(|a| a.starts_with("--link-dest")));
+    }
+
+    #[test]
+    fn snapshots_link_to_their_previous_one_and_the_weeks_baseline() {
+        let base = std::env::temp_dir().join(format!("arena-pull-linkdests-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let put = |rel: &str| {
+            let p = base.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "x").unwrap();
+        };
+        for rel in ["w0d1/devtest-a/f", "w0d3/devtest-a/f", "w1d1/devtest-b/f", "custom/devtest-a/f", "big/devtest-a/f"] {
+            put(rel);
+        }
+        put("baseline/w0/fleet/img");
+        put("baseline/w2/fleet/img");
+        std::fs::create_dir_all(base.join("baseline/w1/fleet")).unwrap(); // empty: not a baseline
+        let abs = std::fs::canonicalize(&base).unwrap();
+        let at = |rel: &str| abs.join(rel).display().to_string();
+        // (label, pod, link-dests)
+        let cases: &[(&str, &str, Vec<String>)] = &[
+            ("w1d2", "devtest-a", vec![at("w0d3/devtest-a"), at("baseline/w0/fleet")]),
+            ("w0d3", "devtest-a", vec![at("w0d1/devtest-a"), at("baseline/w0/fleet")]),
+            ("w2d1", "devtest-a", vec![at("w0d3/devtest-a"), at("baseline/w2/fleet")]),
+            ("w1d2", "devtest-new", vec![at("baseline/w0/fleet")]), // a new pod: the image's files
+            ("custom2", "devtest-a", vec![at("w0d3/devtest-a"), at("baseline/w2/fleet")]),
+        ];
+        for (label, pod, want) in cases {
+            assert_eq!(&snapshot_link_dests(&base, label, pod), want, "{label} {pod}");
+        }
+        assert_eq!(baseline_dir(&base, 3), base.join("baseline/w3/fleet"));
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(snapshot_link_dests(&base, "w0d1", "devtest-a").is_empty(), "no backup dir yet");
+    }
+
+    /// Only the image's files survive into a baseline: a file (or link) written at or after the
+    /// container's creation is dropped, then the directories left empty.
+    #[cfg(unix)]
+    #[test]
+    fn a_baseline_keeps_only_what_predates_the_container() {
+        let dir = std::env::temp_dir().join(format!("arena-pull-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let at = |secs: u64| std::time::UNIX_EPOCH + Duration::from_secs(secs);
+        let put = |rel: &str, n: usize, mtime: u64| {
+            let p = dir.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, vec![b'x'; n]).unwrap();
+            std::fs::File::options().write(true).open(&p).unwrap().set_modified(at(mtime)).unwrap();
+        };
+        // A container created a minute ago: the symlink made just now is newer.
+        let created = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() - 60;
+        put("arena-llm-context/model.txt", 1000, created - 86_400 * 30); // the image's
+        put("ARENA_materials/chapter1/solutions.py", 200, created - 86_400); // the image's
+        put("ARENA_materials/chapter1/my_answers.py", 50, created + 3600); // written since
+        put(".name", 30, created); // at setup, the same second: dropped
+        put("setup_only/out.log", 10, created + 5); // a whole dir written since: gone
+        std::os::unix::fs::symlink("/workspace/ARENA_materials", dir.join("linked")).unwrap(); // made now
+        let s = prune_baseline(&dir, created).unwrap();
+        assert_eq!(s, PruneStats { kept_files: 2, kept_bytes: 1200, removed_files: 4, removed_bytes: 90 });
+        assert!(dir.join("arena-llm-context/model.txt").is_file() && dir.join("ARENA_materials/chapter1/solutions.py").is_file());
+        for gone in ["ARENA_materials/chapter1/my_answers.py", ".name", "setup_only", "linked"] {
+            assert!(std::fs::symlink_metadata(dir.join(gone)).is_err(), "{gone}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The live problem, end to end with a real rsync: every day's snapshot was a full copy, and
+    /// its `.git` lacked the pack over the size cap. Now each snapshot is still a complete tree —
+    /// the same layout, its repo fsck-clean — but unchanged files are hard links: to the pod's
+    /// previous snapshot, and (for a pod with no snapshot yet) to the fleet baseline captured
+    /// from another pod. `disk_use` says what a snapshot really adds.
+    #[cfg(unix)]
+    #[test]
+    fn snapshots_are_hard_linked_complete_trees_with_a_complete_git() {
+        use crate::volume::fake_ssh;
+        use std::os::unix::fs::MetadataExt;
+        if !fake_ssh::have_rsync() {
+            eprintln!("rsync not installed — skipping");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("arena-pull-dedup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let image_time = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        // A pod's home: an image file (its mtime the image's), work, and a repo whose pack is far
+        // over the 2K cap.
+        let home_of = |pod: &str, work: &str| {
+            let h = root.join(pod);
+            let img = h.join("arena-llm-context/doc.txt");
+            std::fs::create_dir_all(img.parent().unwrap()).unwrap();
+            std::fs::write(&img, "the image's own file\n".repeat(50)).unwrap();
+            std::fs::File::options().write(true).open(&img).unwrap().set_modified(image_time).unwrap();
+            std::fs::create_dir_all(h.join("work")).unwrap();
+            std::fs::write(h.join("work/notes.md"), work).unwrap();
+            h
+        };
+        let home = home_of("pod-a", "day 1\n");
+        let repo = home.join("ARENA_materials");
+        let git = |args: &[&str]| {
+            let o = std::process::Command::new("git").current_dir(&repo).args(args).output().unwrap();
+            assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&["init", "-q"]);
+        let noise: Vec<u8> = (0..60_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        std::fs::write(repo.join("data.bin"), &noise).unwrap();
+        git(&["add", "-A"]);
+        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "data"]);
+        git(&["gc", "-q"]);
+        let fake = fake_ssh::install(&root);
+        let base = root.join("backup");
+        let pull = |pod_home: &std::path::Path, label: &str, pod: &str| {
+            let dest = local_dest(&base.display().to_string(), label, pod);
+            std::fs::create_dir_all(&dest).unwrap();
+            let pc = PullConfig { link_dest: snapshot_link_dests(&base, label, pod), ..PullConfig::small_tier("2K") };
+            for pass in pc.passes() {
+                fake_ssh::rsync(&fake_ssh::swap_transport(&rsync_args(&target(), &pass, &dest), &fake), pod_home);
+            }
+            base.join(label).join(pod)
+        };
+        let ino = |p: std::path::PathBuf| std::fs::metadata(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display())).ino();
+        let pack = |snap: &std::path::Path| {
+            std::fs::read_dir(snap.join("ARENA_materials/.git/objects/pack"))
+                .unwrap()
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .find(|p| p.extension().is_some_and(|x| x == "pack"))
+                .expect("the pack")
+        };
+
+        // Day 1: a complete repo — the pack over the cap included — and the cap still applies to files.
+        let d1 = pull(&home, "w0d1", "devtest-a");
+        assert!(std::fs::metadata(pack(&d1)).unwrap().len() > 2048);
+        assert!(!d1.join("ARENA_materials/data.bin").exists(), "the files over the cap stay in big/");
+        let fsck = std::process::Command::new("git").current_dir(d1.join("ARENA_materials")).args(["fsck", "--no-progress"]).output().unwrap();
+        assert!(fsck.status.success(), "the snapshot's repo reads: {}", String::from_utf8_lossy(&fsck.stderr));
+        assert_eq!(disk_use(&d1).unwrap().own_bytes, disk_use(&d1).unwrap().bytes, "nothing to link to yet");
+
+        // Day 2: only the edited note is new on disk; the rest are links to day 1.
+        std::fs::write(home.join("work/notes.md"), "day 2, longer\n").unwrap();
+        let d2 = pull(&home, "w0d2", "devtest-a");
+        assert_eq!(ino(d2.join("arena-llm-context/doc.txt")), ino(d1.join("arena-llm-context/doc.txt")));
+        assert_eq!(ino(pack(&d2)), ino(pack(&d1)), "the pack is linked, not copied again");
+        assert_ne!(ino(d2.join("work/notes.md")), ino(d1.join("work/notes.md")));
+        assert_eq!(std::fs::read_to_string(d1.join("work/notes.md")).unwrap(), "day 1\n", "day 1 kept as it was");
+        let u = disk_use(&d2).unwrap();
+        assert_eq!(u.own_bytes, "day 2, longer\n".len() as u64, "{u:?}");
+        assert_eq!(u.files, disk_use(&d1).unwrap().files, "a complete tree, the same layout");
+
+        // A baseline from pod-a (container created after the image, before the work)…
+        let created = image_time.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 3600;
+        let b = pull(&home, "w0-capture", "devtest-a");
+        prune_baseline(&b, created).unwrap();
+        std::fs::create_dir_all(baseline_dir(&base, 0).parent().unwrap()).unwrap();
+        std::fs::rename(&b, baseline_dir(&base, 0)).unwrap();
+        assert!(baseline_dir(&base, 0).join("arena-llm-context/doc.txt").is_file());
+        assert!(!baseline_dir(&base, 0).join("work").exists(), "pod-a's work isn't in it");
+        // …and a new pod's first snapshot: the image's file is the baseline's, its work its own.
+        let home_b = home_of("pod-b", "b's work\n");
+        let first = pull(&home_b, "w0d2", "devtest-b");
+        assert_eq!(ino(first.join("arena-llm-context/doc.txt")), ino(baseline_dir(&base, 0).join("arena-llm-context/doc.txt")));
+        assert_eq!(std::fs::read_to_string(first.join("work/notes.md")).unwrap(), "b's work\n");
+        assert_eq!(disk_use(&first).unwrap().own_bytes, "b's work\n".len() as u64);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
