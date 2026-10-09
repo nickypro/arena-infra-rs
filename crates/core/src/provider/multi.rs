@@ -8,9 +8,9 @@
 //!   callers that must not mistake "that backend didn't answer" for "that backend has no
 //!   pods" — the proxy merge, which only drops a forward on a *successful* listing.
 //! - `create_pod` goes to the chosen primary (the `--provider` / `ARENA_PROVIDER`).
-//! - `stop`/`restart`/`terminate`/`set_locked` route to whichever backend actually owns the
-//!   pod id, and so do `restart_wipes_container_disk` and `lock_support` (by the pod's
-//!   provider tag, then the id cache).
+//! - `stop` (and its outcome)/`restart`/`terminate`/`set_locked` route to whichever backend actually owns the
+//!   pod id, and so do `restart_wipes_container_disk`, `restart_resets_container` and
+//!   `lock_support` (by the pod's provider tag, then the id cache).
 //! - `check_create_extra`/`preview_create_body` are the primary's, like `create_pod`.
 //! - `enrich` hands each pod to the backend that listed it; a failing backend is reported
 //!   (as one error naming it) without costing the other backends' pods their details.
@@ -24,7 +24,7 @@ use crate::apiextra::Extra;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::pod::{Pod, PodSpec};
-use crate::provider::{build, Provider};
+use crate::provider::{build, ContainerReset, Provider, StopOutcome};
 
 /// The known backends, in the order they're listed/built.
 const KNOWN: [&str; 3] = ["runpod", "vast", "hetzner"];
@@ -169,6 +169,9 @@ impl Provider for MultiProvider {
     async fn stop_pod(&self, id: &str) -> Result<()> {
         self.backend_for(id).await?.stop_pod(id).await
     }
+    async fn stop_pod_outcome(&self, id: &str) -> Result<StopOutcome> {
+        self.backend_for(id).await?.stop_pod_outcome(id).await
+    }
     async fn restart_pod(&self, id: &str) -> Result<()> {
         self.backend_for(id).await?.restart_pod(id).await
     }
@@ -180,6 +183,11 @@ impl Provider for MultiProvider {
         // else the id→backend cache. A pod no backend claims is assumed to wipe — the
         // answer only ever adds a confirmation, never removes one.
         self.owner_of(pod).map_or(true, |i| self.backends[i].restart_wipes_container_disk(pod))
+    }
+    fn restart_resets_container(&self, pod: &Pod) -> ContainerReset {
+        // The owner's answer too (RunPod v2's verified reset vs v1's unknown); no owner:
+        // gated as a wipe but never claimed.
+        self.owner_of(pod).map_or(ContainerReset::Unknown, |i| self.backends[i].restart_resets_container(pod))
     }
     fn lock_support(&self, pod: &Pod) -> Result<()> {
         match self.owner_of(pod) {
@@ -386,7 +394,8 @@ mod tests {
         assert!(err.contains("all providers failed"), "{err}");
     }
 
-    /// A backend whose restart keeps the disk (like Hetzner's reset).
+    /// A backend whose restart keeps the disk (like Hetzner's reset), and whose stop had to
+    /// be forced (like a Hetzner VM that didn't shut down).
     struct Keeps;
 
     #[async_trait]
@@ -415,6 +424,19 @@ mod tests {
         fn restart_wipes_container_disk(&self, _pod: &Pod) -> bool {
             false
         }
+        async fn stop_pod_outcome(&self, _id: &str) -> Result<StopOutcome> {
+            Ok(StopOutcome::ForcedOff { waited: std::time::Duration::from_secs(90) })
+        }
+    }
+
+    /// How a stop ended is the owning backend's answer: a forced Hetzner power-off isn't
+    /// flattened into a plain "stopped" on the way through the fleet.
+    #[tokio::test]
+    async fn the_stop_outcome_comes_from_the_owning_backend() {
+        let mut m = multi(vec![Fake { name: "runpod", pods: Some(vec![pod("r1", "arena8-apple")]) }]);
+        m.backends.push(Box::new(Keeps));
+        assert!(matches!(m.stop_pod_outcome("h1").await.unwrap(), StopOutcome::ForcedOff { .. }));
+        assert_eq!(m.stop_pod_outcome("r1").await.unwrap(), StopOutcome::Stopped);
     }
 
     #[tokio::test]
@@ -430,6 +452,14 @@ mod tests {
         assert!(m.restart_wipes_container_disk(&pod("r1", "arena8-apple")));
         // Nobody owns it: assume it wipes (the safe answer).
         assert!(m.restart_wipes_container_disk(&tagged_pod("x1", "lambda")));
+        // What a restart is known to do is the owner's answer too — a v2 backend's verified
+        // reset included (the fleet's own default would only say "unknown").
+        let mut m = multi(vec![]);
+        m.backends.push(Box::new(crate::provider::runpod_v2::RunpodV2Provider::new("k")));
+        m.backends.push(Box::new(Keeps));
+        assert_eq!(m.restart_resets_container(&tagged_pod("r1", "runpod")), ContainerReset::Yes);
+        assert_eq!(m.restart_resets_container(&tagged_pod("h1", "hetzner")), ContainerReset::No);
+        assert_eq!(m.restart_resets_container(&tagged_pod("x1", "lambda")), ContainerReset::Unknown);
     }
 
     /// A backend that can re-attach SSH keys (like Vast), recording which pods it was asked to.

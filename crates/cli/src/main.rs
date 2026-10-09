@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use arena_core::health::judge_deep_call;
-use arena_core::provider::Provider;
+use arena_core::provider::{ContainerReset, Provider};
 use arena_core::remote::{describe_error, Remote, PROBE_TIMEOUT};
 use arena_core::selector::{Naming, SelectArgs, Selector};
 use arena_core::ssh::SshTarget;
@@ -5732,18 +5732,22 @@ async fn handle_pods_with(
                 return Ok(());
             }
             if !blocked.is_empty() && !wipe_ok {
-                anyhow::bail!("{}", wipe_refusal(DiskOp::Stop, &blocked, &repo));
+                anyhow::bail!("{}", wipe_refusal(DiskOp::Stop, false, &blocked, &repo));
             }
             if !confirm(yes, &format!("Will stop {} running/starting pod(s):\n{}", pods.len(), lines.join("\n")))? {
                 println!("aborted.");
                 return Ok(());
             }
-            // The fleet provider routes each stop to the backend that owns the pod id.
+            // The fleet provider routes each stop to the backend that owns the pod id. A Hetzner
+            // VM shuts down gracefully; one that had to be powered off after all is said.
             let (mut ok, total) = (0, pods.len());
             for p in &pods {
-                match provider.stop_pod(&p.id).await {
-                    Ok(()) => {
+                match provider.stop_pod_outcome(&p.id).await {
+                    Ok(outcome) => {
                         println!("[stopped] {}", p.name);
+                        if let Some(note) = outcome.note() {
+                            eprintln!("  ⚠ {}: {note}", p.name);
+                        }
                         ok += 1;
                     }
                     Err(e) => eprintln!("[FAILED] {}: {}", p.name, arena_core::lock::explain(&p.name, &e)),
@@ -6726,7 +6730,7 @@ async fn handle_reimage(
         .filter(|(_, (f, site))| f.needs_wipe_ok(site))
         .map(|(p, _)| p.name.as_str())
         .collect();
-    let then = afterwards_line(true, setup, skip_proxy);
+    let then = afterwards_line(ContainerReset::Yes, setup, skip_proxy);
     println!("image: {image}\nkeys:  {}", pubkeys.iter().map(|k| k.split_whitespace().last().unwrap_or("?")).collect::<Vec<_>>().join(", "));
     if dry_run {
         println!("[dry-run] would reimage {} pod(s):\n{}\n  {then}", pods.len(), lines.join("\n"));
@@ -6734,12 +6738,12 @@ async fn handle_reimage(
             print_would_refuse(r);
         }
         if !blocked.is_empty() && !wipe_ok {
-            print_would_refuse(&wipe_refusal(DiskOp::Reimage, &blocked, &repo));
+            print_would_refuse(&wipe_refusal(DiskOp::Reimage, false, &blocked, &repo));
         }
         return Ok(());
     }
     if !blocked.is_empty() && !wipe_ok {
-        anyhow::bail!("{}", wipe_refusal(DiskOp::Reimage, &blocked, &repo));
+        anyhow::bail!("{}", wipe_refusal(DiskOp::Reimage, false, &blocked, &repo));
     }
     if !confirm(yes, &format!("Will reimage {} pod(s) onto {image}:\n{}\n  {then}", pods.len(), lines.join("\n")))? {
         println!("aborted.");
@@ -6770,7 +6774,7 @@ async fn handle_reimage(
     // The reimaged pods come back on a new SSH port: settle, set up, sync (nothing to do
     // if every reimage failed).
     let done: Vec<arena_core::Pod> = pods.iter().filter(|p| !failed.contains(&p.name)).cloned().collect();
-    let back = Comeback { setup, sync: !skip_proxy, settle, timeouts };
+    let back = Comeback { setup, sync: !skip_proxy, settle, timeouts, reset: ContainerReset::Yes };
     let outcome = come_back(provider, remote, cfg, &done, back, keys_dir, "reimage").await;
     if !failed.is_empty() {
         if let Err(e) = &outcome {
@@ -6827,7 +6831,7 @@ async fn handle_start(
         })
         .collect();
     let wiped = pods.iter().any(|p| provider.restart_wipes_container_disk(p));
-    let then = afterwards_line(wiped, setup, skip_proxy);
+    let then = afterwards_line(if wiped { ContainerReset::Yes } else { ContainerReset::No }, setup, skip_proxy);
     if dry_run {
         println!("[dry-run] would start {} pod(s):\n{}\n  {then}", pods.len(), lines.join("\n"));
         return Ok(());
@@ -6851,7 +6855,7 @@ async fn handle_start(
     }
     let (fresh, kept): (Vec<arena_core::Pod>, Vec<arena_core::Pod>) =
         started.into_iter().partition(|p| provider.restart_wipes_container_disk(p));
-    let back = Comeback { setup, sync: !skip_proxy, settle, timeouts };
+    let back = Comeback { setup, sync: !skip_proxy, settle, timeouts, reset: ContainerReset::Yes };
     let outcome = come_back(provider, remote, cfg, &fresh, back, keys_dir, "start").await;
     if !kept.is_empty() && fresh.is_empty() && !skip_proxy {
         settled_sync(cfg, provider, &kept, settle, "start").await;
@@ -7307,6 +7311,10 @@ enum DiskFate {
     /// The container is reset to its image. `volume_gb`: the persistent volume (at
     /// /workspace) that survives — `Some(0)` = none, `None` = couldn't be read.
     Wiped { volume_gb: Option<u32> },
+    /// A restart that isn't known to reset the container ([`ContainerReset::Unknown`]: RunPod
+    /// v1's was seen keeping it, live 2026-10-09): gated and set up again exactly like
+    /// [`DiskFate::Wiped`], but only ever said to be a possible wipe.
+    MayWipe { volume_gb: Option<u32> },
 }
 
 /// The operations that reset a container disk.
@@ -7325,8 +7333,18 @@ impl DiskFate {
     fn needs_wipe_ok(self, site: &RepoSite) -> bool {
         match self {
             DiskFate::Kept => false,
-            DiskFate::Wiped { volume_gb: Some(v) } if v > 0 => !site.on_volume(),
-            DiskFate::Wiped { .. } => true,
+            DiskFate::Wiped { volume_gb: Some(v) } | DiskFate::MayWipe { volume_gb: Some(v) } if v > 0 => !site.on_volume(),
+            DiskFate::Wiped { .. } | DiskFate::MayWipe { .. } => true,
+        }
+    }
+
+    /// What the operation is known to have done to the container disk, for what the command
+    /// says afterwards ([`come_back`]).
+    fn reset(self) -> ContainerReset {
+        match self {
+            DiskFate::Kept => ContainerReset::No,
+            DiskFate::Wiped { .. } => ContainerReset::Yes,
+            DiskFate::MayWipe { .. } => ContainerReset::Unknown,
         }
     }
 
@@ -7335,6 +7353,10 @@ impl DiskFate {
     fn describe(self, op: DiskOp, site: &RepoSite) -> String {
         use arena_core::provider::runpod_v2::VOLUME_MOUNT_PATH as VOL;
         let wipe = match op {
+            DiskOp::Restart if matches!(self, DiskFate::MayWipe { .. }) => {
+                "⚠ may WIPE the container disk (this backend's restart isn't known to reset it to the image \
+                 every time — counted as if it does)"
+            }
             DiskOp::Restart => "⚠ WIPES the container disk (reset to the image)",
             DiskOp::Stop => "⚠ discards the container disk (it starts again as a fresh image)",
             DiskOp::Reimage => "⚠ WIPES the container disk (a fresh container from the image)",
@@ -7350,21 +7372,21 @@ impl DiskFate {
         match self {
             DiskFate::Kept => match op {
                 DiskOp::Restart => "disk kept — a hard reset (power-cycle): running processes die, files stay".into(),
-                DiskOp::Stop => "disk kept — powered off, files stay".into(),
+                DiskOp::Stop => "disk kept — shut down (powered off only if it hangs), files stay".into(),
                 DiskOp::Reimage => "disk kept".into(),
             },
-            DiskFate::Wiped { volume_gb: Some(v) } if v > 0 && site.on_volume() => format!(
+            DiskFate::Wiped { volume_gb: Some(v) } | DiskFate::MayWipe { volume_gb: Some(v) } if v > 0 && site.on_volume() => format!(
                 "{wipe}: everything outside {VOL} is lost ({rest}, files outside the repo); the repo at \
                  {repo} is on the {v} GB volume at {VOL} and survives{relink}"
             ),
-            DiskFate::Wiped { volume_gb: Some(v) } if v > 0 => format!(
+            DiskFate::Wiped { volume_gb: Some(v) } | DiskFate::MayWipe { volume_gb: Some(v) } if v > 0 => format!(
                 "{wipe}: everything outside {VOL} is lost — {work} is NOT on the volume, and {rest}; \
                  only the {v} GB volume at {VOL} survives"
             ),
-            DiskFate::Wiped { volume_gb: Some(_) } => {
+            DiskFate::Wiped { volume_gb: Some(_) } | DiskFate::MayWipe { volume_gb: Some(_) } => {
                 format!("{wipe} and it has NO persistent volume: nothing survives — {work}, {rest}")
             }
-            DiskFate::Wiped { volume_gb: None } => {
+            DiskFate::Wiped { volume_gb: None } | DiskFate::MayWipe { volume_gb: None } => {
                 format!("{wipe}; couldn't read whether it has a volume, so assume nothing survives — {work}, {rest}")
             }
         }
@@ -7390,7 +7412,7 @@ async fn repo_sites(
         .iter()
         .zip(fates)
         .enumerate()
-        .filter(|(_, (_, fate))| matches!(fate, DiskFate::Wiped { volume_gb: Some(v) } if *v > 0))
+        .filter(|(_, (_, fate))| matches!(fate, DiskFate::Wiped { volume_gb: Some(v) } | DiskFate::MayWipe { volume_gb: Some(v) } if *v > 0))
         .filter_map(|(i, (pod, _))| SshTarget::from_pod(pod, cfg).ok().map(|t| (i, t, probe.clone())))
         .collect();
     exec_each_pod(remote, jobs, PROBE_TIMEOUT, |_, _, &i, call| {
@@ -7419,6 +7441,17 @@ async fn disk_fate(provider: &dyn Provider, pod: &arena_core::Pod) -> DiskFate {
     } }
 }
 
+/// A restart's [`DiskFate`]: [`disk_fate`], except that a backend whose restart isn't known to
+/// reset the container ([`ContainerReset::Unknown`]: RunPod v1, Vast) gives
+/// [`DiskFate::MayWipe`] — the same gate and re-setup, without the claim. The two provider
+/// answers agree on what is gated (`ContainerReset::may_wipe`, by the trait's default).
+async fn restart_fate(provider: &dyn Provider, pod: &arena_core::Pod) -> DiskFate {
+    match (disk_fate(provider, pod).await, provider.restart_resets_container(pod)) {
+        (DiskFate::Wiped { volume_gb }, ContainerReset::Unknown) => DiskFate::MayWipe { volume_gb },
+        (fate, _) => fate,
+    }
+}
+
 /// What a reimage does to a pod's disk: on every backend a fresh container (a VM would be
 /// rebuilt), so only a persistent volume survives — whatever `restart_wipes_container_disk`
 /// says about a restart. The volume is read from the pod's spec (bounded; unknown = none).
@@ -7432,9 +7465,14 @@ async fn reimage_fate(provider: &dyn Provider, pod: &arena_core::Pod) -> DiskFat
 
 /// Why a restart/stop is refused without `--wipe-ok` (pure, so tested): it would destroy
 /// the participants' work on these pods, and `--yes` is not an answer to that — the
-/// operator has to say so explicitly, after a backup.
-fn wipe_refusal(op: DiskOp, names: &[&str], repo: &str) -> String {
+/// operator has to say so explicitly, after a backup. `maybe`: a restart that isn't known to
+/// reset ([`DiskFate::MayWipe`]) — refused all the same, but said as a possibility.
+fn wipe_refusal(op: DiskOp, maybe: bool, names: &[&str], repo: &str) -> String {
     let (verb, done) = match op {
+        DiskOp::Restart if maybe => (
+            "restart",
+            "may reset the container disk to the image (this backend's restart isn't known to reset it every time, so it counts as one that does)",
+        ),
         DiskOp::Restart => ("restart", "resets the container disk to the image"),
         DiskOp::Stop => ("stop", "discards the container disk (a stopped RunPod pod keeps no data)"),
         DiskOp::Reimage => ("reimage", "replaces the container — and its disk — with a fresh one from the image"),
@@ -7477,12 +7515,13 @@ struct SettleWait {
 /// on the *new* container, not the one being torn down — up to 10 min.
 const RESTART_SETTLE: SettleWait = SettleWait { stable_secs: 30, timeout_secs: 600, poll: Duration::from_secs(15) };
 
-/// `pods restart <target>`. On a backend whose restart wipes the container disk (RunPod;
-/// Vast assumed) the prompt says plainly what's lost and what survives, a pod whose repo
-/// isn't on a confirmed volume is refused without `--wipe-ok` — even with `--yes` — and
-/// afterwards the pod is brought back usable: wait for its endpoint to settle, re-run setup
-/// on it (`~/.name`, deploy key + git remote, API keys; `--no-setup` skips), sync the
-/// proxy. A Hetzner reset keeps the disk: no gate, no re-setup, just the sync.
+/// `pods restart <target>`. On a backend whose restart wipes the container disk (RunPod v2)
+/// or may (RunPod v1, Vast: [`restart_fate`]) the prompt says plainly what's lost and what
+/// survives, a pod whose repo isn't on a confirmed volume is refused without `--wipe-ok` —
+/// even with `--yes` — and afterwards the pod is brought back usable: wait for its endpoint
+/// to settle, re-run setup on it (`~/.name`, deploy key + git remote, API keys; `--no-setup`
+/// skips), sync the proxy. Only a reset known to happen is said to have. A Hetzner reset
+/// keeps the disk: no gate, no re-setup, just the sync.
 async fn handle_restart(
     provider: &dyn Provider,
     // How we reach the pod for the re-setup: `SshRemote` for real, `FakeRemote` in tests.
@@ -7507,30 +7546,24 @@ async fn handle_restart(
     // A restart needs a running pod: RunPod v2 answers 409 for a stopped one, v1 answered
     // 2xx and left it stopped (then a 10-min endpoint wait) — live finding #15.
     if arena_core::status::is_stopped(&pod.status) {
-        anyhow::bail!(
-            "{} is stopped ({}) — a restart needs a running pod. Start it with `arena pods start {}` \
-             (it comes back as a fresh image and is set up again).",
-            pod.name,
-            pod.status,
-            pod.name
-        );
+        anyhow::bail!("{}", stopped_restart_refusal(&pod, provider.restart_wipes_container_disk(&pod)));
     }
     // A locked pod refuses a restart (RunPod itself does): say so before anything is read.
     let locked = arena_core::lock::refusal("restart", &[&pod], "");
     if let (Some(r), false) = (&locked, opts.dry_run) {
         anyhow::bail!("{r}");
     }
-    let fate = disk_fate(provider, &pod).await;
+    let fate = restart_fate(provider, &pod).await;
     let repo = arena_core::backup::repo_path(cfg);
     let site = repo_sites(&remote, cfg, &[&pod], &[fate], &repo).await.remove(0);
-    let wiped = matches!(fate, DiskFate::Wiped { .. });
+    let wiped = fate.reset().may_wipe();
     let setup = wiped && !opts.no_setup;
     if setup {
         // Setup is what brings a wiped pod back: make sure it can run before wiping one.
         arena_core::setup::SetupConfig::from_config(cfg)
             .context("re-running setup after the restart needs the setup config — fix it, or pass --no-setup")?;
     }
-    let then = afterwards_line(wiped, setup, opts.skip_proxy);
+    let then = afterwards_line(fate.reset(), setup, opts.skip_proxy);
     let what = format!("restart {label}:\n  {}\n  {then}", fate.describe(DiskOp::Restart, &site));
     if opts.dry_run {
         println!("[dry-run] would {what}");
@@ -7543,7 +7576,8 @@ async fn handle_restart(
         return Ok(());
     }
     if fate.needs_wipe_ok(&site) && !opts.wipe_ok {
-        anyhow::bail!("{}", wipe_refusal(DiskOp::Restart, &[pod.name.as_str()], &repo));
+        let maybe = matches!(fate, DiskFate::MayWipe { .. });
+        anyhow::bail!("{}", wipe_refusal(DiskOp::Restart, maybe, &[pod.name.as_str()], &repo));
     }
     if !confirm(opts.yes, &format!("Will {what}"))? {
         println!("aborted.");
@@ -7553,7 +7587,7 @@ async fn handle_restart(
     provider.restart_pod(&pod.id).await.map_err(|e| anyhow::anyhow!("{}", arena_core::lock::explain(&pod.name, &e)))?;
     println!("[restarted] {label}");
 
-    let back = Comeback { setup, sync: !opts.skip_proxy, settle, timeouts };
+    let back = Comeback { setup, sync: !opts.skip_proxy, settle, timeouts, reset: fate.reset() };
     if wiped {
         come_back(provider, remote, cfg, std::slice::from_ref(&pod), back, keys_dir, "restart").await
     } else {
@@ -7565,16 +7599,37 @@ async fn handle_restart(
     }
 }
 
-/// What a lifecycle command that resets containers says it does afterwards (pure, tested
-/// through the commands' dry runs).
-fn afterwards_line(wiped: bool, setup: bool, skip_proxy: bool) -> &'static str {
-    match (wiped, setup, skip_proxy) {
-        (true, true, false) => "then: wait for its SSH endpoint to settle, re-run setup on it (~/.name, deploy key + git remote, API keys; a repo with changes or commits of its own is left as it is), sync the proxy",
-        (true, true, true) => "then: wait for its SSH endpoint to settle, re-run setup on it (~/.name, deploy key + git remote, API keys; a repo with changes or commits of its own is left as it is)",
-        (true, false, false) => "then: wait for its SSH endpoint to settle and sync the proxy (no setup: it comes back as the bare image)",
-        (true, false, true) => "then: nothing (no setup, no proxy sync: it comes back as the bare image)",
-        (false, _, false) => "then: sync the proxy",
-        (false, _, true) => "then: nothing",
+/// Why `restart` refuses a stopped pod, and the way back (pure, tested): `pods start` — which
+/// brings back a pod whose container disk went at the stop (`start_wipes`: RunPod, Vast) as a
+/// fresh image, set up again, but a Hetzner VM with its disk as it was (live R: the Hetzner
+/// refusal promised a fresh image).
+fn stopped_restart_refusal(pod: &arena_core::Pod, start_wipes: bool) -> String {
+    let comes = if start_wipes {
+        "it comes back as a fresh image and is set up again"
+    } else {
+        "its disk was kept: it comes back as it was, with nothing set up again"
+    };
+    format!(
+        "{} is stopped ({}) — a restart needs a running pod. Start it with `arena pods start {}` ({comes}).",
+        pod.name, pod.status, pod.name
+    )
+}
+
+/// What a lifecycle command that resets containers says it does afterwards (pure, tested):
+/// `reset` is what the operation does to the container disk — a possible reset
+/// ([`ContainerReset::Unknown`]) is set up again like a certain one, but never said to have
+/// left a bare image.
+fn afterwards_line(reset: ContainerReset, setup: bool, skip_proxy: bool) -> &'static str {
+    use ContainerReset::{No, Unknown, Yes};
+    match (reset, setup, skip_proxy) {
+        (Yes | Unknown, true, false) => "then: wait for its SSH endpoint to settle, re-run setup on it (~/.name, deploy key + git remote, API keys; a repo with changes or commits of its own is left as it is), sync the proxy",
+        (Yes | Unknown, true, true) => "then: wait for its SSH endpoint to settle, re-run setup on it (~/.name, deploy key + git remote, API keys; a repo with changes or commits of its own is left as it is)",
+        (Yes, false, false) => "then: wait for its SSH endpoint to settle and sync the proxy (no setup: it comes back as the bare image)",
+        (Yes, false, true) => "then: nothing (no setup, no proxy sync: it comes back as the bare image)",
+        (Unknown, false, false) => "then: wait for its SSH endpoint to settle and sync the proxy (no setup: if it was reset, it comes back as the bare image)",
+        (Unknown, false, true) => "then: nothing (no setup, no proxy sync: if it was reset, it comes back as the bare image)",
+        (No, _, false) => "then: sync the proxy",
+        (No, _, true) => "then: nothing",
     }
 }
 
@@ -7587,6 +7642,9 @@ struct Comeback {
     sync: bool,
     settle: SettleWait,
     timeouts: arena_core::setup::SetupTimeouts,
+    /// What the operation did to their container disks: `Yes` (a reimage, a start, a RunPod v2
+    /// restart) or `Unknown` (a restart that may have kept it) — what the output may claim.
+    reset: ContainerReset,
 }
 
 /// After a container reset — `restart`, `reimage`, `start` — bring the pods back usable:
@@ -7607,7 +7665,7 @@ async fn come_back(
 ) -> Result<()> {
     if pods.is_empty() || !(how.setup || how.sync) {
         if !how.setup && !pods.is_empty() {
-            no_setup_note(pods);
+            no_setup_note(pods, how.reset);
         }
         return Ok(());
     }
@@ -7622,7 +7680,7 @@ async fn come_back(
         }
     }
     if how.setup && !settled.is_empty() {
-        println!("\nRe-provisioning {} pod(s) (the {why} reset them to the image)…", settled.len());
+        println!("\n{}", reprovision_line(settled.len(), why, how.reset));
         let setup = match just_these(provider, &settled).await {
             Ok(sel) => handle_setup(remote, cfg, true, false, None, None, false, false, how.timeouts, &sel, keys_dir, Some(provider)).await,
             Err(e) => Err(e),
@@ -7639,7 +7697,7 @@ async fn come_back(
         settled_sync(cfg, provider, &back, s, why).await;
     }
     if !how.setup {
-        no_setup_note(pods);
+        no_setup_note(pods, how.reset);
     }
     if problems.is_empty() {
         return Ok(());
@@ -7651,23 +7709,39 @@ async fn come_back(
         _ => ("started", "not a restart"),
     };
     let it = if pods.len() == 1 { "it is" } else { "they are" };
+    let wipes = if how.reset == ContainerReset::Unknown { "that may wipe it" } else { "that would wipe it again" };
     anyhow::bail!(
         "{} {past}, but {it} NOT set up again: {}\n  → run `arena pods setup {}` once it answers \
-         ({again} — that would wipe it again)",
+         ({again} — {wipes})",
         names.join(", "),
         problems.join("; "),
         names.join(" ")
     )
 }
 
-/// `--no-setup`'s reminder after a reset.
-fn no_setup_note(pods: &[arena_core::Pod]) {
+/// The line before [`come_back`] re-runs setup (pure, tested): a reset is said to have
+/// happened only when it is known to (a RunPod v1 restart may have kept the disk).
+fn reprovision_line(n: usize, why: &str, reset: ContainerReset) -> String {
+    match reset {
+        ContainerReset::Unknown => format!("Re-provisioning {n} pod(s) (in case the {why} reset them to the image — it may not have)…"),
+        _ => format!("Re-provisioning {n} pod(s) (the {why} reset them to the image)…"),
+    }
+}
+
+/// `--no-setup`'s reminder after a reset (or a possible one: `reset`).
+fn no_setup_note(pods: &[arena_core::Pod], reset: ContainerReset) {
+    println!("{}", no_setup_line(pods, reset));
+}
+
+/// [`no_setup_note`]'s words (pure, tested).
+fn no_setup_line(pods: &[arena_core::Pod], reset: ContainerReset) -> String {
     let names: Vec<&str> = pods.iter().map(|p| p.name.as_str()).collect();
-    println!(
-        "(--no-setup: {} back as the bare image — `arena pods setup {}` restores ~/.name, the git remote and keys)",
+    let back = if reset == ContainerReset::Unknown { "may be back" } else { "back" };
+    format!(
+        "(--no-setup: {} {back} as the bare image — `arena pods setup {}` restores ~/.name, the git remote and keys)",
         names.join(", "),
         names.join(" ")
-    );
+    )
 }
 
 /// Whether `name` has a stable port on a configured proxy (a MACHINE_NAME_LIST name) — the
@@ -8906,14 +8980,16 @@ async fn last_sync_label(remote: &dyn Remote, cfg: &Config, owner: &dyn Provider
     };
     let Some(at) = stamp else { return "an unknown time (no sync stamp on it)".to_string() };
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    sync_time_label(at, now)
+}
+
+/// [`last_sync_label`]'s words for a sync at `at`, seen at `now` (pure, tested): the minute
+/// it happened and exactly how long ago, as `up` says it (`3m55s`) — live R printed "(180s
+/// ago)" for 235 s: the age was floored to whole minutes, then printed in seconds.
+fn sync_time_label(at: u64, now: u64) -> String {
     let day = arena_core::schedule::ymd_string((at / 86_400) as i64);
-    let ago = now.saturating_sub(at);
-    format!(
-        "{day} {:02}:{:02} UTC ({} ago)",
-        at % 86_400 / 3600,
-        at % 3600 / 60,
-        arena_core::error::human_duration(&Duration::from_secs(ago - ago % 60))
-    )
+    let ago = Duration::from_secs(now.saturating_sub(at));
+    format!("{day} {:02}:{:02} UTC ({} ago)", at % 86_400 / 3600, at % 3600 / 60, arena_core::pipeline::fmt_elapsed(ago))
 }
 
 /// [`handle_migrate_cutover`] once the owner and its listing are known ([`resolve_migration`])
@@ -9901,6 +9977,23 @@ fn last_line(stderr: &str) -> String {
     }
 }
 
+/// Why an rsync over ssh failed, for the fallback's note (pure, tested): the last stderr line
+/// that isn't rsync's own epilogue — its `rsync error: … (code 255)` summary and "connection
+/// unexpectedly closed" say only that the transport died, and live R printed just that for a
+/// missing pod-to-pod key, hiding ssh's `Permission denied (publickey)` above it. ssh's
+/// known-hosts notice isn't a reason either. With nothing else there, rsync's own last line.
+fn copy_failure_reason(stderr: &str) -> String {
+    let generic = |l: &str| {
+        l.starts_with("rsync error:")
+            || l.contains("connection unexpectedly closed")
+            || l.starts_with("Warning: Permanently added")
+    };
+    match stderr.lines().rev().map(str::trim).find(|l| !l.is_empty() && !generic(l)) {
+        Some(line) => last_line(line),
+        None => last_line(stderr),
+    }
+}
+
 /// The identity check that every replica step on pod `id` runs first, in the same session
 /// ([`arena_core::replica::identity_condition`]): on RunPod, PID 1's `RUNPOD_POD_ID` must be
 /// `id`. Other providers expose no such id: `None` (as [`target_is_pod`]).
@@ -9912,9 +10005,11 @@ fn pod_guard(provider: &dyn Provider, id: &str) -> Option<String> {
 /// the reset guard found ([`arena_core::replica::mirror_refusal`]) and what's still possible.
 fn mirror_refusal_text(r: &arena_core::replica::MirrorRefusal, src: &str, dest: &str) -> String {
     use arena_core::replica::MirrorRefusal;
+    // To the second: a reset and a sync in the same minute read as contradictory to the
+    // minute ("container from 14:54, sync from 14:54" — live R, 2026-10-09).
     let when = |t: u64| {
         let day = arena_core::schedule::ymd_string((t / 86_400) as i64);
-        format!("{day} {:02}:{:02} UTC", t % 86_400 / 3600, t % 3600 / 60)
+        format!("{day} {:02}:{:02}:{:02} UTC", t % 86_400 / 3600, t % 3600 / 60, t % 60)
     };
     let why = match r {
         MirrorRefusal::SourceReset { container, last_sync } => format!(
@@ -10114,7 +10209,7 @@ async fn copy_pod_files(
             match remote.exec(&src_target, &direct, Some(POD_COPY_TIMEOUT)).await {
                 Ok(o) if o.success => true,
                 Ok(o) => {
-                    eprintln!("      direct pod-to-pod copy failed ({}) — copying via local staging…", last_line(&o.stderr));
+                    eprintln!("      direct pod-to-pod copy failed ({}) — copying via local staging…", copy_failure_reason(&o.stderr));
                     false
                 }
                 // A copy that ran out of its budget was under way (a missing pod-to-pod key fails at
@@ -10413,6 +10508,12 @@ fn stopped_skip(pod: &arena_core::Pod) -> String {
     format!("skip {} — stopped ({}); `arena pods start {}` brings it back", pod.name, pod.status, pod.name)
 }
 
+/// The error an SSH command ends with when every pod it was told to reach is stopped —
+/// one wording for all of them (live R: `copy-keys` said "has an SSH endpoint yet" instead).
+fn all_stopped_error(names: &[&str]) -> String {
+    format!("the selected pod(s) are stopped ({}) — `arena pods start {}` first", names.join(", "), names.join(" "))
+}
+
 /// How long `run` / `pull` / `backup` wait before asking once more for a running pod the
 /// listing showed without an SSH endpoint ([`refresh_missing_endpoints`]).
 const ENDPOINT_RETRY: Duration = Duration::from_secs(20);
@@ -10498,7 +10599,7 @@ impl Selected {
         }
         if targets.is_empty() && self.named {
             if stopped.len() == self.pods.len() {
-                anyhow::bail!("the selected pod(s) are stopped ({}) — `arena pods start {}` first", stopped.join(", "), stopped.join(" "));
+                anyhow::bail!("{}", all_stopped_error(&stopped));
             }
             anyhow::bail!("none of the selected pods ({}) has an SSH endpoint yet — check `arena pods list`", self.names());
         }
@@ -11515,6 +11616,7 @@ async fn handle_copy_keys(
     // hides behind a per-pod ✓, so nobody notices the per-host keys never landed.
     let mut broadcast_only: Vec<String> = Vec::new();
     let mut unreachable = 0;
+    let mut stopped: Vec<&str> = Vec::new();
     for pod in pods {
         let (vars, matched_per_host) = keys.vars_for(&pod.name);
         if vars.is_empty() {
@@ -11523,6 +11625,7 @@ async fn handle_copy_keys(
         if arena_core::status::is_stopped(&pod.status) {
             eprintln!("{}", stopped_skip(pod));
             unreachable += 1;
+            stopped.push(pod.name.as_str());
             continue;
         }
         match SshTarget::from_pod(pod, cfg) {
@@ -11539,8 +11642,12 @@ async fn handle_copy_keys(
         }
     }
     if jobs.is_empty() {
-        // Pods the operator named, all without an endpoint: a failure, not "nothing to do".
+        // Pods the operator named, all without an endpoint: a failure, not "nothing to do" —
+        // said as "stopped" when that's why, as every SSH command says it.
         if sel.named && unreachable > 0 {
+            if stopped.len() == unreachable {
+                anyhow::bail!("{}", all_stopped_error(&stopped));
+            }
             anyhow::bail!("none of the selected pods ({}) has an SSH endpoint yet — check `arena pods list`", sel.names());
         }
         println!("(no reachable pods matched any keys)");
@@ -15444,6 +15551,7 @@ mod remote_tests {
         target_is_pod, BackupTally, Cli, Cmd, CopyLeg, CopyPlan, PodCmd, RestoreOpts, RestoreSource, RunResult, Select, SelectByFlag, Selected,
         Unscoped, BACKUP_TIMEOUT, BRANCH_TIMEOUT, CP_BASE_TIMEOUT, POD_COPY_TIMEOUT, RUN_TIMEOUT_SECS, TEST_TIMEOUT,
     };
+    use super::{copy_failure_reason, mirror_refusal_text, sync_time_label};
     use arena_core::selector::SelectArgs;
     use arena_core::backup::{backup_command, checkout_command, init_branch_command, BackupConfig};
     use arena_core::remote::{FakeRemote, FakeReply, Remote, RemoteCall, PROBE_TIMEOUT};
@@ -16830,6 +16938,57 @@ mod remote_tests {
         assert!(execs(&fake, 22001).iter().any(|(c, _)| c.contains("\nrsync ") && c.contains("--delete")));
     }
 
+    /// Live R: a failed direct copy printed rsync's `code 255` summary, not why — the ssh line
+    /// above it (here a missing pod-to-pod key) is the reason.
+    #[test]
+    fn a_failed_copy_names_the_ssh_error_not_rsyncs_summary() {
+        let epilogue = "rsync: connection unexpectedly closed (0 bytes received so far) [sender]\n\
+                        rsync error: unexplained error (code 255) at io.c(232) [sender=3.2.7]\n";
+        for (stderr, want) in [
+            (format!("Permission denied (publickey).\r\n{epilogue}"), "Permission denied (publickey)."),
+            (format!("Warning: Identity file /root/.ssh/id_ed25519 not accessible: No such file or directory.\nPermission denied (publickey).\n{epilogue}"), "Permission denied (publickey)."),
+            (format!("ssh: connect to host 10.0.0.2 port 22002: Connection timed out\n{epilogue}"), "ssh: connect to host 10.0.0.2 port 22002: Connection timed out"),
+            (format!("Warning: Permanently added '10.0.0.2' (ED25519) to the list of known hosts.\nHost key verification failed.\n{epilogue}"), "Host key verification failed."),
+            // rsync's own complaint is the reason when it is one…
+            ("rsync: [receiver] mkdir \"/root/x\" failed: No space left on device (28)\nrsync error: error in file IO (code 11) at main.c(791)\n".into(), "rsync: [receiver] mkdir \"/root/x\" failed: No space left on device (28)"),
+            // …and with nothing but the epilogue (and the known-hosts notice), it's what there is.
+            (format!("Warning: Permanently added '10.0.0.2' (ED25519) to the list of known hosts.\n{epilogue}"), "rsync error: unexplained error (code 255) at io.c(232) [sender=3.2.7]"),
+            (String::new(), "no error output"),
+        ] {
+            assert_eq!(copy_failure_reason(&stderr), want, "{stderr:?}");
+        }
+    }
+
+    /// Live R: the reset refusal gave both times to the minute ("its container dates from
+    /// 14:54 UTC, the sync from 14:54 UTC"), which reads as no reset at all. To the second now.
+    #[test]
+    fn the_reset_refusal_gives_its_times_to_the_second() {
+        use arena_core::replica::MirrorRefusal;
+        // A sync at 11:02:03, the container reset 20 s later — the same minute.
+        let r = MirrorRefusal::SourceReset { container: 1_791_457_343, last_sync: 1_791_457_323 };
+        let e = mirror_refusal_text(&r, "devtest-apple", "devtest-apple-new");
+        assert!(e.contains("(its container dates from 2026-10-08 11:02:23 UTC, the sync from 2026-10-08 11:02:03 UTC)"), "{e}");
+        let e = mirror_refusal_text(&MirrorRefusal::NoRecord { last_sync: 1_791_457_323 }, "a", "b");
+        assert!(e.contains("has no record of b's last sync (2026-10-08 11:02:03 UTC)"), "{e}");
+    }
+
+    /// Live R: `cutover --no-final-sync` said "(180s ago)" of a sync 235 s old — the age was
+    /// floored to minutes and printed in seconds. Now exact, in `up`'s format.
+    #[test]
+    fn the_last_sync_age_is_exact() {
+        let at = 1_791_457_323; // 2026-10-08 11:02:03 UTC
+        for (ago, want) in [
+            (0, "2026-10-08 11:02 UTC (0s ago)"),
+            (59, "2026-10-08 11:02 UTC (59s ago)"),
+            (235, "2026-10-08 11:02 UTC (3m55s ago)"),
+            (3 * 3600 + 120, "2026-10-08 11:02 UTC (3h02m ago)"),
+        ] {
+            assert_eq!(sync_time_label(at, at + ago), want, "{ago}");
+        }
+        // A clock behind the stamp is "0s", never an underflow.
+        assert_eq!(sync_time_label(at, at - 5), "2026-10-08 11:02 UTC (0s ago)");
+    }
+
     /// Review finding (critical): the destination's endpoint was used with no identity check
     /// before the mirroring push and the tidy-up — a recycled endpoint would have another
     /// pod's home mirrored over and its files tidied away — and a stopped `-new` (listed with
@@ -17333,6 +17492,8 @@ mod lifecycle_tests {
         TerminateOpts, LOCKED_REPLACEMENT_NOTE,
     };
     use super::{cutover_revert, handle_reimage, handle_start, migrate_copy_on, revert_followup, stopped_old_refusal, MigrateCmd, MigrateCopyJob};
+    use super::{afterwards_line, handle_copy_keys, no_setup_line, reprovision_line, restart_fate, staging_dir, stopped_restart_refusal};
+    use arena_core::provider::ContainerReset;
     use arena_core::volume::{probe_command, RepoSite};
     use arena_core::openrouter::{CreatedKey, KeyApi, KeyInfo};
     use arena_core::remote::{FakeRemote, FakeReply, RemoteCall, PROBE_TIMEOUT};
@@ -17376,6 +17537,9 @@ mod lifecycle_tests {
         blank_lists: Vec<usize>,
         /// Host maintenance windows `enrich` reports, by pod id.
         maintenance: Vec<(&'static str, arena_core::pod::Maintenance)>,
+        /// What a GPU pod's restart is known to do: `Yes` as RunPod v2 (the default),
+        /// `Unknown` as v1 — whose restart was seen keeping the disk (live 2026-10-09).
+        restart_resets: ContainerReset,
     }
 
     impl Fleet {
@@ -17394,6 +17558,7 @@ mod lifecycle_tests {
                 lists: Mutex::default(),
                 blank_lists: vec![],
                 maintenance: vec![],
+                restart_resets: ContainerReset::Yes,
             }
         }
         /// A container reset as the providers do it: the pod comes back on a NEW endpoint
@@ -17534,6 +17699,13 @@ mod lifecycle_tests {
         }
         fn restart_wipes_container_disk(&self, pod: &Pod) -> bool {
             pod.provider != "hetzner" // as the fleet provider routes it
+        }
+        fn restart_resets_container(&self, pod: &Pod) -> ContainerReset {
+            if pod.provider == "hetzner" {
+                ContainerReset::No
+            } else {
+                self.restart_resets
+            }
         }
     }
 
@@ -18284,6 +18456,80 @@ mod lifecycle_tests {
         assert_eq!(fate(3).await, DiskFate::Kept);
     }
 
+    /// Live R (2026-10-09): a RunPod v1 restart kept the container disk (marker files and
+    /// `/.dockerenv` survived), while the output said "the restart reset them to the image".
+    /// v1 stays gated (cheap safety; v1 retires 2026-11-15) and is set up again in case — but
+    /// nothing says a reset happened. v2's restart, which does reset, still says so.
+    #[tokio::test]
+    async fn a_restart_not_known_to_reset_is_gated_and_set_up_again_but_never_said_to_reset() {
+        let dir = tmpdir("restart-v1");
+        let cfg = cfg(&dir.0);
+        let keys_dir = dir.0.display().to_string();
+        let mut f = fleet();
+        f.restart_resets = ContainerReset::Unknown;
+        f.volumes = vec![("r-bravo", 50)];
+        let pods = f.pods.lock().unwrap().clone();
+        // The fate: gated like a wipe, with or without a volume; a VM is still kept.
+        assert_eq!(restart_fate(&f, &pods[0]).await, DiskFate::MayWipe { volume_gb: Some(0) });
+        assert_eq!(restart_fate(&f, &pods[1]).await, DiskFate::MayWipe { volume_gb: Some(50) });
+        assert_eq!(restart_fate(&f, &pods[3]).await, DiskFate::Kept);
+        // The gate holds (--yes alone isn't enough), worded as a possibility.
+        let remote = Arc::new(FakeRemote::new());
+        let e = handle_restart(&f, remote.clone(), &cfg, "alpha", restart_opts(false), FAST, &keys_dir).await.unwrap_err().to_string();
+        assert!(e.contains("refusing to restart devtest-alpha without --wipe-ok: this may reset the container disk"), "{e}");
+        assert!(f.calls().is_empty() && remote.calls().is_empty());
+        // With --wipe-ok: restarted, and set up again on the endpoint it came back on.
+        handle_restart(&f, remote.clone(), &cfg, "alpha", restart_opts(true), FAST, &keys_dir).await.unwrap();
+        assert_eq!(f.calls(), ["restart r-alpha"]);
+        assert!(!remote.calls_to("10.0.0.1:23001").is_empty(), "set up again, in case");
+        // What it says, before and after — never that the reset happened.
+        let may = DiskFate::MayWipe { volume_gb: Some(0) };
+        let text = may.describe(DiskOp::Restart, &RepoSite::configured("/root/r"));
+        assert!(text.starts_with("⚠ may WIPE the container disk") && text.contains("NO persistent volume"), "{text}");
+        assert_eq!(may.reset(), ContainerReset::Unknown);
+        let line = reprovision_line(1, "restart", ContainerReset::Unknown);
+        assert_eq!(line, "Re-provisioning 1 pod(s) (in case the restart reset them to the image — it may not have)…");
+        assert!(afterwards_line(ContainerReset::Unknown, false, false).contains("(no setup: if it was reset, it comes back as the bare image)"));
+        assert!(afterwards_line(ContainerReset::Unknown, false, true).contains("if it was reset"));
+        assert_eq!(afterwards_line(ContainerReset::Unknown, true, false), afterwards_line(ContainerReset::Yes, true, false));
+        assert!(no_setup_line(&pods[..1], ContainerReset::Unknown).starts_with("(--no-setup: devtest-alpha may be back as the bare image"));
+        // A known reset (v2, reimage, start) still says it plainly.
+        assert_eq!(reprovision_line(2, "restart", ContainerReset::Yes), "Re-provisioning 2 pod(s) (the restart reset them to the image)…");
+        assert!(no_setup_line(&pods[..1], ContainerReset::Yes).starts_with("(--no-setup: devtest-alpha back as the bare image"));
+        let v2 = DiskFate::Wiped { volume_gb: Some(0) }.describe(DiskOp::Restart, &RepoSite::configured("/root/r"));
+        assert!(v2.starts_with("⚠ WIPES the container disk (reset to the image)"), "{v2}");
+        let r = wipe_refusal(DiskOp::Restart, false, &["devtest-a"], "/root/r");
+        assert!(r.contains("this resets the container disk to the image"), "{r}");
+        // A restart whose setup fails: don't restart again — it "may" wipe, not "would again".
+        let mut g = fleet();
+        g.restart_resets = ContainerReset::Unknown;
+        let remote = Arc::new(FakeRemote::new());
+        remote.script("10.0.0.1:23001", [FakeReply::ok(), FakeReply::exit(1, "fatal: not a git repository")]);
+        let e = handle_restart(&g, remote, &cfg, "alpha", restart_opts(true), FAST, &keys_dir).await.unwrap_err().to_string();
+        assert!(e.contains("not another restart — that may wipe it)") && !e.contains("wipe it again"), "{e}");
+    }
+
+    /// Live R: `restart` on a stopped Hetzner VM said `pods start` brings it back "as a fresh
+    /// image and is set up again" — a VM keeps its disk and isn't set up again.
+    #[tokio::test]
+    async fn restart_on_a_stopped_pod_says_what_a_start_brings_back() {
+        let dir = tmpdir("restart-stopped-vm");
+        let cfg = cfg(&dir.0);
+        let f = fleet();
+        f.pods.lock().unwrap()[3].status = "OFF".into(); // delta, the Hetzner VM
+        let remote = Arc::new(FakeRemote::new());
+        let e = handle_restart(&f, remote.clone(), &cfg, "delta", restart_opts(false), FAST, &dir.0.display().to_string())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("devtest-delta is stopped (OFF)") && e.contains("`arena pods start devtest-delta`"), "{e}");
+        assert!(e.contains("its disk was kept") && !e.contains("fresh image"), "{e}");
+        assert!(f.calls().is_empty() && remote.calls().is_empty());
+        // A RunPod pod's start does bring it back as a fresh image.
+        let gpu = pod("r-x", "devtest-x", "runpod", None);
+        assert!(stopped_restart_refusal(&gpu, true).contains("(it comes back as a fresh image and is set up again)"));
+    }
+
     #[test]
     fn disk_fate_text_and_gate() {
         // The gate follows the WORK (the repo), not just "is there a volume".
@@ -18323,11 +18569,11 @@ mod lifecycle_tests {
         // A stopped pod comes back only when started — the prompt says to re-run setup then.
         assert!(v50.describe(DiskOp::Stop, &linked).contains("`arena pods start` brings it back and re-links the repo"));
         assert!(!v50.describe(DiskOp::Restart, &linked).contains("re-links"));
-        let r = wipe_refusal(DiskOp::Restart, &["devtest-a", "devtest-b"], ROOT);
+        let r = wipe_refusal(DiskOp::Restart, false, &["devtest-a", "devtest-b"], ROOT);
         assert!(r.starts_with("refusing to restart devtest-a, devtest-b without --wipe-ok"), "{r}");
         assert!(r.contains("the repo at /root/ARENA_materials") && r.contains("outside /workspace"), "{r}");
         assert!(r.contains("`arena pods backup devtest-a devtest-b`") && r.contains("--yes alone isn't enough"), "{r}");
-        assert!(wipe_refusal(DiskOp::Stop, &["x"], ROOT).contains("terminate instead"));
+        assert!(wipe_refusal(DiskOp::Stop, false, &["x"], ROOT).contains("terminate instead"));
     }
 
     #[test]
@@ -18383,7 +18629,8 @@ mod lifecycle_tests {
         let lines = stop_lines(&[&pods[1], &pods[3]], &[DiskFate::Wiped { volume_gb: Some(50) }, DiskFate::Kept], &sites);
         assert!(lines[0].starts_with("  devtest-bravo (id=r-bravo, runpod): ⚠ discards the container disk"), "{lines:?}");
         assert!(lines[0].contains("the ARENA repo at /root/r (participants' work) is NOT on the volume"), "{lines:?}");
-        assert_eq!(lines[1], "  devtest-delta (id=h-delta, hetzner): disk kept — powered off, files stay");
+        // (a VM is shut down gracefully now — powered off only if it hangs: live R)
+        assert_eq!(lines[1], "  devtest-delta (id=h-delta, hetzner): disk kept — shut down (powered off only if it hangs), files stay");
     }
 
     fn pods_cmd(argv: &[&str]) -> PodCmd {
@@ -18483,6 +18730,31 @@ mod lifecycle_tests {
         g.pods.lock().unwrap()[1].status = "EXITED".into();
         handle_pods(pods_cmd(&["start", "bravo", "--dry-run"]), &g, remote.clone(), &cfg, true).await.unwrap();
         assert!(g.calls().is_empty());
+    }
+
+    /// Live R: `copy-keys` on a stopped pod printed the right skip line, then failed with
+    /// "none of the selected pods … has an SSH endpoint yet"; every other SSH command says
+    /// the pods are stopped, and how to start them.
+    #[tokio::test]
+    async fn copy_keys_on_a_stopped_pod_says_it_is_stopped() {
+        let dir = tmpdir("copy-keys-stopped");
+        let cfg = cfg(&dir.0);
+        std::fs::write(dir.0.join("openai_api_keys.csv"), "host,key\ndevtest-alpha,sk-a\ndevtest-charlie,sk-c\n").unwrap();
+        let keys_dir = dir.0.display().to_string();
+        let f = fleet();
+        f.pods.lock().unwrap()[0].status = "EXITED".into(); // alpha
+        let pods = f.pods.lock().unwrap().clone();
+        let remote = Arc::new(FakeRemote::new());
+        let e = handle_copy_keys(remote.clone(), &cfg, &keys_dir, None, None, &named(&pods[..1]), false, true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(e, "the selected pod(s) are stopped (devtest-alpha) — `arena pods start devtest-alpha` first");
+        // With a pod that has no endpoint yet among them (charlie), that is what's said.
+        let both = named(&[pods[0].clone(), pods[2].clone()]);
+        let e = handle_copy_keys(remote.clone(), &cfg, &keys_dir, None, None, &both, false, true).await.unwrap_err().to_string();
+        assert!(e.starts_with("none of the selected pods (devtest-alpha, devtest-charlie) has an SSH endpoint yet"), "{e}");
+        assert!(remote.calls().is_empty(), "nothing reached");
     }
 
     /// Live (wave 6): after a restart the endpoint flapped — the proxy sync right after setup
@@ -18669,9 +18941,11 @@ mod lifecycle_tests {
         remote.on(new_host, "arena-replica-ready", FakeReply::stdout("arena-replica-ready\n"));
         remote.on(new_host, "MARK=", FakeReply::stdout("ID=r-new\nMARK=arena-replace-r-new\n"));
         remote.on(new_host, "SSH_OK", FakeReply::stdout("NVIDIA RTX A4000\nSSH_OK\n"));
-        let stage = std::env::temp_dir().join(format!("arena-replace-{src_id}"));
-        std::fs::create_dir_all(stage.join("ARENA_materials")).unwrap();
-        std::fs::write(stage.join("ARENA_materials/work.py"), "an earlier failed copy's stage").unwrap();
+        // Where `replace` looks for it (the system temp dir), removed by the guard even if an
+        // assertion fails first — a failed or mutated run leaked these (live R, S11).
+        let stage = TmpDir(staging_dir(&std::env::temp_dir(), src_id));
+        std::fs::create_dir_all(stage.0.join("ARENA_materials")).unwrap();
+        std::fs::write(stage.0.join("ARENA_materials/work.py"), "an earlier failed copy's stage").unwrap();
         let (ov, place, interrupt) = (SpecOverrides::default(), PlaceFlags::default(), Interrupt::manual());
         let opts = ReplaceOpts { keep_old: false, skip_proxy: false, dry_run: false, yes: true };
         let timeouts = arena_core::setup::SetupTimeouts::from_config(&cfg, None).unwrap();
@@ -18686,7 +18960,7 @@ mod lifecycle_tests {
                 format!("terminate {src_id}")
             ]
         );
-        assert!(!stage.exists(), "removed once the original is gone");
+        assert!(!stage.0.exists(), "removed once the original is gone");
     }
 
     /// Review finding: `replace` / `migrate copy` created (and billed) the new pod, set it up,
@@ -18859,7 +19133,8 @@ mod lifecycle_tests {
         let dir = tmpdir("finish-stopped");
         let cfg = cfg(&dir.0);
         let old_id: &'static str = Box::leak(format!("r-finish-{}", std::process::id()).into_boxed_str());
-        let stage = std::env::temp_dir().join(format!("arena-replace-{old_id}"));
+        // (removed by the guard even if an assertion fails first — see the replace test)
+        let stage = TmpDir(staging_dir(&std::env::temp_dir(), old_id));
         let mut old = pod(old_id, "devtest-bravo-old", "runpod", Some(("10.0.0.1", 22002)));
         old.status = "EXITED".into();
         let mut f = Fleet::new(vec![pod("r-bravo-new", "devtest-bravo", "runpod", Some(("10.0.0.3", 22009))), old]);
@@ -18878,12 +19153,12 @@ mod lifecycle_tests {
         migrate_finish_on(&remote, &f, &cfg, &f, "devtest-bravo", &listed, FinishOpts { dry_run: true, yes: true, ..Default::default() }).await.unwrap();
         assert!(take_would_refuse().iter().any(|r| r.contains("it is stopped")));
         // --discard-stopped: it goes, and the leftover staging copy of its home with it.
-        std::fs::create_dir_all(stage.join("ARENA_materials")).unwrap();
-        std::fs::write(stage.join("ARENA_materials/work.py"), "a participant's home").unwrap();
+        std::fs::create_dir_all(stage.0.join("ARENA_materials")).unwrap();
+        std::fs::write(stage.0.join("ARENA_materials/work.py"), "a participant's home").unwrap();
         let opts = FinishOpts { discard_stopped: true, yes: true, ..Default::default() };
         migrate_finish_on(&remote, &f, &cfg, &f, "devtest-bravo", &listed, opts).await.unwrap();
         assert_eq!(f.calls(), [format!("terminate {old_id}")]);
-        assert!(!stage.exists(), "the leftover staging copy is removed once its source is gone");
+        assert!(!stage.0.exists(), "the leftover staging copy is removed once its source is gone");
         // The refusal's words for the volume it may (not) have.
         assert!(stopped_old_refusal("o", "EXITED", "c", Some(0), "t").contains("--discard-stopped is safe"));
         assert!(stopped_old_refusal("o", "EXITED", "c", None, "t").contains("couldn't read whether it has a volume"));

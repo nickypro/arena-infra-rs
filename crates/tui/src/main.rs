@@ -58,7 +58,7 @@ use arena_core::balance::{self, AccountProbe, Burns};
 use arena_core::fleet;
 use arena_core::health::{deep_check_command, judge_deep_call, HealthPolicy, PodHealth, DEEP_CHECK_TIMEOUT};
 use arena_core::metrics::{self, PodMetrics, ProbeOpts};
-use arena_core::provider::Provider;
+use arena_core::provider::{ContainerReset, Provider};
 use arena_core::proxy::Listing;
 use arena_core::remote::{describe_error, Remote, SshRemote};
 use arena_core::selector::Naming;
@@ -1470,15 +1470,23 @@ async fn execute(
         return format!("✗ {} {name} refused: {}", action.label(), lock::unlock_hint(&[name]));
     }
     match action {
+        // Only a backend known to reset on restart (RunPod v2) is said to have; one that may
+        // not have (RunPod v1, live 2026-10-09) gets the same advice, without the claim.
         Action::Restart => match provider.restart_pod(&pod.id).await {
-            Ok(()) if provider.restart_wipes_container_disk(pod) => {
-                format!("✓ restarted {name} — reset to the image: run setup (p) once it's up")
-            }
-            Ok(()) => format!("✓ restarted {name}"),
+            Ok(()) => match provider.restart_resets_container(pod) {
+                ContainerReset::Yes => format!("✓ restarted {name} — reset to the image: run setup (p) once it's up"),
+                ContainerReset::Unknown => {
+                    format!("✓ restarted {name} — it may have been reset to the image: run setup (p) once it's up")
+                }
+                ContainerReset::No => format!("✓ restarted {name}"),
+            },
             Err(e) => format!("✗ restart {name} failed: {}", lock::explain(name, &e)),
         },
-        Action::Stop => match provider.stop_pod(&pod.id).await {
-            Ok(()) => format!("✓ stopped {name}"),
+        Action::Stop => match provider.stop_pod_outcome(&pod.id).await {
+            Ok(outcome) => match outcome.note() {
+                Some(note) => format!("✓ stopped {name} — ⚠ {note}"),
+                None => format!("✓ stopped {name}"),
+            },
             Err(e) => format!("✗ stop {name} failed: {}", lock::explain(name, &e)),
         },
         Action::Terminate => match provider.terminate_pod(&pod.id).await {
@@ -3566,6 +3574,61 @@ deep_check_end=1
         let out = execute(&Refuses, &remote, &cfg, Action::Stop, &bravo, None).await;
         assert_eq!(out, "✗ stop devtest-bravo failed: devtest-bravo is locked — `arena pods unlock devtest-bravo` first");
         assert_eq!(execute(&Refuses, &remote, &cfg, Action::Terminate, &bravo, None).await, "✓ terminated devtest-bravo");
+    }
+
+    /// The result line says only what the backend knows: "reset to the image" after a restart
+    /// that resets (RunPod v2), "may have been" after one that may not (RunPod v1, live
+    /// 2026-10-09: marker files survived), nothing for a kept disk — and a Hetzner stop that
+    /// had to be forced says so.
+    #[tokio::test]
+    async fn restart_and_stop_lines_say_only_what_happened() {
+        use arena_core::provider::StopOutcome;
+        struct Says(ContainerReset, StopOutcome);
+        #[async_trait::async_trait]
+        impl Provider for Says {
+            fn name(&self) -> &'static str {
+                "runpod"
+            }
+            fn describe(&self, _spec: &PodSpec) -> String {
+                String::new()
+            }
+            async fn list_pods(&self) -> arena_core::Result<Vec<Pod>> {
+                Ok(vec![])
+            }
+            async fn create_pod(&self, _spec: &PodSpec) -> arena_core::Result<Pod> {
+                unimplemented!()
+            }
+            async fn stop_pod(&self, _id: &str) -> arena_core::Result<()> {
+                unimplemented!("the dashboard asks for the stop's outcome")
+            }
+            async fn stop_pod_outcome(&self, _id: &str) -> arena_core::Result<StopOutcome> {
+                Ok(self.1)
+            }
+            async fn restart_pod(&self, _id: &str) -> arena_core::Result<()> {
+                Ok(())
+            }
+            async fn terminate_pod(&self, _id: &str) -> arena_core::Result<()> {
+                unimplemented!()
+            }
+            fn restart_resets_container(&self, _pod: &Pod) -> ContainerReset {
+                self.0
+            }
+        }
+        let (remote, cfg) = (FakeRemote::new(), cfg(""));
+        let bravo = pod("bravo", "runpod", "rp2", 2, Some(22002));
+        for (reset, want) in [
+            (ContainerReset::Yes, "✓ restarted devtest-bravo — reset to the image: run setup (p) once it's up"),
+            (ContainerReset::Unknown, "✓ restarted devtest-bravo — it may have been reset to the image: run setup (p) once it's up"),
+            (ContainerReset::No, "✓ restarted devtest-bravo"),
+        ] {
+            let p = Says(reset, StopOutcome::Stopped);
+            assert_eq!(execute(&p, &remote, &cfg, Action::Restart, &bravo, None).await, want, "{reset:?}");
+        }
+        let plain = Says(ContainerReset::No, StopOutcome::Stopped);
+        assert_eq!(execute(&plain, &remote, &cfg, Action::Stop, &bravo, None).await, "✓ stopped devtest-bravo");
+        let forced = Says(ContainerReset::No, StopOutcome::ForcedOff { waited: Duration::from_secs(90) });
+        let out = execute(&forced, &remote, &cfg, Action::Stop, &bravo, None).await;
+        assert!(out.starts_with("✓ stopped devtest-bravo — ⚠ it didn't shut down within 90s, so it was powered off"), "{out}");
     }
 
     /// A pod-side fleet for [`refresh`]: lists runpod (two pods) and a vast that 429s,

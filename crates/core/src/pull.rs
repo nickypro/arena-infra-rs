@@ -152,7 +152,8 @@ impl Default for PullConfig {
 /// `replace` / `migrate copy` output — what the copy really drops, not "caches".
 pub const REPLICATION_SKIPS: &str = "skips caches and other dot-dirs (.cache, .venv, .vscode-server, .ssh, .claude), \
      venvs, site-packages and ~/.local/lib (pip --user), HF caches, ~/.local/share/uv, the claude/codex that \
-     setup installs and Claude Code's own state, shell rc files + history (the API keys follow by name), ~/.name";
+     setup installs and Claude Code's own state, shell rc files + history (the API keys follow by name), zsh's \
+     completion cache, ~/.name";
 
 /// What it does carry besides the plain files: for the same output.
 pub const REPLICATION_KEEPS: &str = "the home incl. .git, ~/.config, ~/.jupyter, ~/.ipython, ~/.local (bin, share)";
@@ -237,6 +238,12 @@ impl PullConfig {
             s.excludes.push(f.to_string());
             s.excludes.push(format!("**/{f}"));
         }
+        // zsh's completion cache (`.zcompdump-<host>-<version>` and its compiled `.zwc`), which
+        // compinit rebuilds on every pod and names after the pod's own hostname: the receiver
+        // has its own after any login, the source's is useless there, and mirroring it away
+        // reported those caches as KEPT changes on every sync (live R, 2026-10-09), burying real
+        // work in the list. Excluded, so it is neither carried nor deleted on the receiver.
+        s.excludes.push(".zcompdump*".to_string());
         s
     }
 
@@ -683,6 +690,8 @@ mod tests {
             ".ssh/id_ed25519",
             ".bashrc",
             ".zsh_history",
+            ".zcompdump-a1b2c3d4e5f6-5.8.1",
+            ".zcompdump-a1b2c3d4e5f6-5.8.1.zwc",
             ".name",
             ".arena-last-sync",
             ".arena-sync/sent-to",
@@ -710,6 +719,52 @@ mod tests {
             assert!(!dst.join(f).exists(), "should stay behind: {f}");
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Live R (2026-10-09): every sync after a login on the receiver reported its own zsh
+    /// completion caches as KEPT changes — mirrored away (the source has none by that name)
+    /// and moved into the kept folder. Through the real rsync with the replica's mirror: the
+    /// receiver's caches stay where they are and nothing is moved aside; a real deletion still
+    /// propagates and is kept.
+    #[cfg(unix)]
+    #[test]
+    fn a_replica_leaves_the_receivers_zsh_completion_cache_alone() {
+        if std::process::Command::new("rsync").arg("--version").output().is_err() {
+            eprintln!("rsync not installed — skipping");
+            return;
+        }
+        struct Gone(std::path::PathBuf);
+        impl Drop for Gone {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = Gone(std::env::temp_dir().join(format!("arena-pull-zcompdump-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&root.0);
+        let (src, dst) = (root.0.join("src"), root.0.join("dst"));
+        for (dir, f) in [
+            (&src, ".zcompdump-srchost-5.8.1"),
+            (&src, "work.py"),
+            (&dst, ".zcompdump-dsthost-5.8.1"),
+            (&dst, ".zcompdump-dsthost-5.8.1.zwc"),
+            (&dst, "work.py"),
+            (&dst, "deleted-on-source.txt"),
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join(f), f).unwrap();
+        }
+        let pc = PullConfig { mirror: Mirror::Replica { backup_dir: "arena-sync-kept/S".into() }, ..PullConfig::replication() };
+        let mut args = push_rsync_args(&target(), &pc, &format!("{}/", src.display()));
+        let e = args.iter().position(|a| a == "-e").unwrap();
+        args.drain(e..e + 2);
+        *args.last_mut().unwrap() = format!("{}/", dst.display());
+        let out = std::process::Command::new("rsync").args(&args).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(dst.join(".zcompdump-dsthost-5.8.1").is_file() && dst.join(".zcompdump-dsthost-5.8.1.zwc").is_file());
+        assert!(!dst.join(".zcompdump-srchost-5.8.1").exists(), "the source's cache isn't carried");
+        let kept = dst.join("arena-sync-kept/S");
+        assert!(!kept.join(".zcompdump-dsthost-5.8.1").exists() && !kept.join(".zcompdump-dsthost-5.8.1.zwc").exists());
+        assert!(kept.join("deleted-on-source.txt").is_file() && !dst.join("deleted-on-source.txt").exists());
     }
 
     /// A replica's moved-aside folder is protected (first, so no include can override it),
