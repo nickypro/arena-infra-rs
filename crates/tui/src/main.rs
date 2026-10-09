@@ -981,8 +981,8 @@ async fn run(
                     let pname = form.provider_name().to_string();
                     match build_provider(&ui.cfg, &pname) {
                         Err(e) => ui.mode = Mode::Result(format!("✗ {pname}: {e}")),
-                        Ok(prov) => match prov.list_pods().await {
-                            Err(e) => ui.mode = Mode::Result(format!("✗ list {pname}: {e}")),
+                        Ok(prov) => match list_whole_fleet(&ui.cfg, &pname).await {
+                            Err(e) => ui.mode = Mode::Result(format!("✗ listing the fleet: {e}")),
                             Ok(existing) => {
                                 let prefix = ui.cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
                                 let free = naming::next_free_names(
@@ -1175,10 +1175,19 @@ fn build_provider(cfg: &Config, name: &str) -> Result<Arc<dyn Provider>> {
     Ok(Arc::from(arena_core::provider::build(name, cfg)?))
 }
 
-/// List a provider's pods and compute the free machine names. None on any failure.
+/// Every configured provider's pods — the whole fleet, as the CLI's create lists it — or why
+/// not: a name is free only if no provider holds it, and a provider that didn't answer might
+/// ([`arena_core::provider::list_complete`]). Listing just the chosen provider reused a name
+/// a pod on another provider held (finding #9's class of duplicate). `provider_name` is the
+/// fleet's primary, as on the CLI.
+async fn list_whole_fleet(cfg: &Config, provider_name: &str) -> arena_core::Result<Vec<Pod>> {
+    let fleet = arena_core::provider::build_fleet(provider_name, cfg, false)?;
+    arena_core::provider::list_complete(fleet.as_ref()).await
+}
+
+/// The free machine names across the whole fleet ([`list_whole_fleet`]). None on any failure.
 async fn relist_free(cfg: &Config, provider_name: &str) -> Option<Vec<String>> {
-    let prov = build_provider(cfg, provider_name).ok()?;
-    let existing = prov.list_pods().await.ok()?;
+    let existing = list_whole_fleet(cfg, provider_name).await.ok()?;
     let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
     Some(naming::next_free_names(prefix, &cfg.machine_names, &existing, usize::MAX))
 }

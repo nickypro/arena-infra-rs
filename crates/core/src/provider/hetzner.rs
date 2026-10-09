@@ -188,6 +188,7 @@ fn parse_server(v: &Value) -> Pod {
         // Hetzner's delete/rebuild *protection* is a different thing; `pods lock` is
         // RunPod v2 only.
         locked: None,
+        proxy_only: false,
     }
 }
 

@@ -35,7 +35,10 @@ pub const PRESETS: &[Gpu] = &[
     Gpu { api: "NVIDIA L40", label: "L40", vram_gb: 48, community: 0.69, secure: 0.99 },
     Gpu { api: "NVIDIA GeForce RTX 5090", label: "RTX 5090", vram_gb: 32, community: 0.89, secure: 1.29 },
     Gpu { api: "NVIDIA RTX 6000 Ada Generation", label: "RTX 6000 Ada", vram_gb: 48, community: 0.77, secure: 1.03 },
-    Gpu { api: "NVIDIA RTX PRO 6000 Blackwell Workstation Edition", label: "RTX PRO 6000", vram_gb: 96, community: 1.79, secure: 2.49 },
+    // RunPod's display names: "RTX PRO 6000" is the Server Edition, "RTX PRO 6000 WK" the
+    // Workstation Edition (finding #36 — the label here used to name the WK card).
+    Gpu { api: "NVIDIA RTX PRO 6000 Blackwell Server Edition", label: "RTX PRO 6000", vram_gb: 96, community: 1.69, secure: 2.09 },
+    Gpu { api: "NVIDIA RTX PRO 6000 Blackwell Workstation Edition", label: "RTX PRO 6000 WK", vram_gb: 96, community: 1.69, secure: 2.19 },
 ];
 
 /// The known GPU matching a provider type string, if any.
@@ -92,7 +95,15 @@ pub fn resolve(s: &str) -> String {
         "l40" => "NVIDIA L40",
         "5090" | "rtx5090" => "NVIDIA GeForce RTX 5090",
         "rtx6000ada" | "6000ada" | "a6000ada" => "NVIDIA RTX 6000 Ada Generation",
-        "rtxpro6000" | "pro6000" | "rtx6000pro" => "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+        // As RunPod's catalog names them (`arena gpus`): "RTX PRO 6000" is the Server
+        // Edition; the Workstation (WK) and Max-Q cards have names of their own.
+        "rtxpro6000" | "pro6000" | "rtx6000pro" | "rtxpro6000server" | "pro6000server" => {
+            "NVIDIA RTX PRO 6000 Blackwell Server Edition"
+        }
+        "rtxpro6000wk" | "pro6000wk" | "rtxpro6000workstation" | "pro6000workstation" => {
+            "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+        }
+        "rtxpro6000maxq" | "pro6000maxq" => "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
         _ => return s.to_string(),
     };
     api.to_string()
@@ -181,8 +192,11 @@ fn describe_gpu(g: &GpuType) -> String {
 /// policy is table-tested; the CLI fetches the catalog and decides what to do when it
 /// can't (warn and pass the flag through).
 ///
-/// Per token: its alias ([`resolve`]) if that's a catalog id; else a case-insensitive id
-/// match; else the one GPU whose short name is exactly the token (`RTX 3070`, `H100 SXM`).
+/// Per token: a catalog id (any case); else the one GPU whose catalog **display name** is the
+/// token (`RTX PRO 6000`, `B300 MIG 34GB` — what `arena gpus` prints, so it means what the
+/// operator just read: finding #36, where the hard-coded alias picked another card); else its
+/// alias ([`resolve`]) if that's a catalog id; else the one GPU whose short name is exactly
+/// the token (`RTX 3070`, `H100 SXM`).
 /// Anything else is refused — before, an unknown token went to the provider as-is and
 /// failed late and vaguely ("no known price", a 400 at create) — with "did you mean"
 /// suggestions, and so is a token that names several GPUs. A value with no tokens at all
@@ -195,11 +209,23 @@ pub fn check_gpu_flag(raw: &str, catalog: &[GpuType]) -> Result<String> {
     let mut ids = Vec::new();
     let mut problems = Vec::new();
     for token in &tokens {
+        // The catalog's own names first: an exact id, then an exact display name — unique.
+        let by_id = real_gpus(catalog).find(|g| g.id.eq_ignore_ascii_case(token.trim()));
+        let shown = alnum_key(token);
+        let mut by_display = real_gpus(catalog).filter(|g| !shown.is_empty() && alnum_key(&g.display_name) == shown);
+        let by_display = match (by_display.next(), by_display.next()) {
+            (Some(one), None) => Some(one),
+            _ => None,
+        };
+        if let Some(g) = by_id.or(by_display) {
+            ids.push(g.id.clone());
+            continue;
+        }
         let resolved = resolve(token);
-        let by_id = real_gpus(catalog)
+        let by_alias = real_gpus(catalog)
             .find(|g| g.id == resolved)
             .or_else(|| real_gpus(catalog).find(|g| g.id.eq_ignore_ascii_case(resolved.trim())));
-        if let Some(g) = by_id {
+        if let Some(g) = by_alias {
             ids.push(g.id.clone());
             continue;
         }
@@ -273,8 +299,13 @@ pub struct GpuRow {
     /// $/h per GPU on the community / secure cloud; `None` = not offered / unknown.
     pub community_price: Option<f64>,
     pub secure_price: Option<f64>,
-    /// RunPod's 1-GPU stock hint ("Low"/"Medium"/"High"); `None` = unreported.
+    /// RunPod's stock hint ("Low"/"Medium"/"High"/"None"; `None` = unreported): GraphQL's
+    /// 1-GPU figure on v1, the COMMUNITY tier's on v2.
     pub stock_status: Option<String>,
+    /// v2 only: the SECURE tier's stock hint ([`add_secure_stock`]) — v2's availability is
+    /// per tier, and a secure-only card read "None" from the community figure alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secure_stock_status: Option<String>,
     /// Whether RunPod's create API accepts this id (its OpenAPI enum can lag the catalog).
     /// `None` = couldn't determine (enum unavailable, or a preset row).
     pub creatable: Option<bool>,
@@ -310,6 +341,7 @@ pub fn rows_from_live(types: &[GpuType], creatable: Option<&[String]>) -> Vec<Gp
                 community_price,
                 secure_price,
                 stock_status: t.stock_status.clone(),
+                secure_stock_status: None,
                 creatable: creatable.map(|ok| ok.iter().any(|c| c == &t.id)),
                 source: Source::Live,
                 price_source,
@@ -318,6 +350,13 @@ pub fn rows_from_live(types: &[GpuType], creatable: Option<&[String]>) -> Vec<Gp
         .collect();
     rows.sort_by(|a, b| a.memory_gb.cmp(&b.memory_gb).then_with(|| a.display_name.cmp(&b.display_name)));
     rows
+}
+
+/// v2: fill each row's SECURE stock from that tier's catalog (matched by id). Pure.
+pub fn add_secure_stock(rows: &mut [GpuRow], secure: &[GpuType]) {
+    for r in rows.iter_mut() {
+        r.secure_stock_status = secure.iter().find(|t| t.id == r.id).and_then(|t| t.stock_status.clone());
+    }
 }
 
 /// Rows from the local presets, in their preference order.
@@ -331,6 +370,7 @@ pub fn rows_from_presets() -> Vec<GpuRow> {
             community_price: Some(g.community),
             secure_price: Some(g.secure),
             stock_status: None,
+            secure_stock_status: None,
             creatable: None,
             source: Source::Presets,
             price_source: Some(Source::Presets),
@@ -355,7 +395,11 @@ pub fn render_gpu_table(rows: &[GpuRow]) -> String {
                 format!("{}G", r.memory_gb),
                 price(r.community_price, r.price_source),
                 price(r.secure_price, r.price_source),
-                r.stock_status.clone().unwrap_or_else(|| "-".to_string()),
+                match (&r.stock_status, &r.secure_stock_status) {
+                    (c, Some(sec)) => format!("{}/{sec}", c.as_deref().unwrap_or("-")),
+                    (Some(c), None) => c.clone(),
+                    (None, None) => "-".to_string(),
+                },
                 r.id.clone(),
             ]
         })
@@ -407,6 +451,33 @@ mod tests {
         assert_eq!((rows[0].community_price, rows[0].price_source), (None, None));
         // Enum unavailable => creatable unknown, not false.
         assert!(rows_from_live(&types, None).iter().all(|r| r.creatable.is_none()));
+    }
+
+    /// Finding #31: on v2 the STOCK column was the community figure alone, so a secure-only
+    /// card read "None"; each tier's stock is shown now (and `--json` adds the secure one).
+    #[test]
+    fn v2_rows_carry_each_tiers_stock() {
+        let comm = vec![
+            live("NVIDIA B300 SXM6 AC MIG 1g.34gb", "B300 MIG 34GB", 34, None, Some(0.5), Some("None")),
+            live("NVIDIA RTX A4000", "RTX A4000", 16, Some(0.17), Some(0.25), Some("Low")),
+        ];
+        let secure = vec![
+            live("NVIDIA B300 SXM6 AC MIG 1g.34gb", "B300 MIG 34GB", 34, None, Some(0.5), Some("Low")),
+            live("NVIDIA RTX A4000", "RTX A4000", 16, Some(0.17), Some(0.25), Some("None")),
+        ];
+        let ids: Vec<String> = comm.iter().map(|t| t.id.clone()).collect();
+        let mut rows = rows_from_live(&comm, Some(&ids));
+        add_secure_stock(&mut rows, &secure);
+        assert!(rows.iter().all(|r| r.creatable == Some(true)));
+        let out = render_gpu_table(&rows);
+        let line = |name: &str| out.lines().find(|l| l.starts_with(name)).unwrap().to_string();
+        assert!(line("RTX A4000").contains(" Low/None "), "{out}");
+        assert!(line("B300 MIG 34GB").contains(" None/Low "), "{out}");
+        let v = serde_json::to_value(&rows).unwrap();
+        assert_eq!(v[0]["secure_stock_status"], "None");
+        // v1 rows (no secure figure) keep the old JSON shape.
+        let v1 = serde_json::to_value(rows_from_live(&comm, None)).unwrap();
+        assert!(v1[0].get("secure_stock_status").is_none(), "{v1}");
     }
 
     #[test]
@@ -520,6 +591,45 @@ H100        80G          -     $2.69  High   NVIDIA H100 80GB HBM3
         assert!(matches!(check_gpu_flag("3070x", &c), Err(Error::Config(_))));
     }
 
+    /// Finding #36: `--gpu 'RTX PRO 6000'` — the name `arena gpus` prints for the Server
+    /// Edition — created a Workstation Edition, because the hard-coded alias won. The live
+    /// catalog's display names come first now (recorded rows from `arena gpus --json`,
+    /// 2026-10-08); the alias table agrees with them for when there's no catalog.
+    #[test]
+    fn check_gpu_flag_follows_the_catalogs_display_names_before_aliases() {
+        let mut c = catalog();
+        for (id, name) in [
+            ("NVIDIA RTX PRO 6000 Blackwell Server Edition", "RTX PRO 6000"),
+            ("NVIDIA RTX PRO 6000 Blackwell Workstation Edition", "RTX PRO 6000 WK"),
+            ("NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition", "RTX PRO 6000 MaxQ"),
+            ("NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 1g.24gb", "PRO 6000 MIG 24GB"),
+            ("NVIDIA B300 SXM6 AC MIG 1g.34gb", "B300 MIG 34GB"),
+        ] {
+            c.push(live(id, name, 96, None, None, None));
+        }
+        for (flag, want) in [
+            ("RTX PRO 6000", "NVIDIA RTX PRO 6000 Blackwell Server Edition"),
+            ("rtx pro 6000", "NVIDIA RTX PRO 6000 Blackwell Server Edition"),
+            ("RTX PRO 6000 WK", "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"),
+            ("RTX PRO 6000 MaxQ", "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition"),
+            ("PRO 6000 MIG 24GB", "NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 1g.24gb"),
+            ("b300 mig 34gb", "NVIDIA B300 SXM6 AC MIG 1g.34gb"),
+            ("A4000", "NVIDIA RTX A4000"), // aliases still work where no display name matches
+        ] {
+            assert_eq!(check_gpu_flag(flag, &c).unwrap(), want, "{flag}");
+        }
+        // Where a display name and an alias disagree, the catalog's name wins: here the card
+        // shown as `H100` is the NVL, while the alias `h100` means the SXM (also listed).
+        let mut c2 = catalog();
+        c2.push(live("NVIDIA H100 NVL", "H100", 94, None, None, None));
+        assert_eq!(resolve("H100"), "NVIDIA H100 80GB HBM3");
+        assert_eq!(check_gpu_flag("H100", &c2).unwrap(), "NVIDIA H100 NVL");
+        // No catalog: the alias table now means what the catalog does.
+        assert_eq!(resolve("RTX PRO 6000"), "NVIDIA RTX PRO 6000 Blackwell Server Edition");
+        assert_eq!(find("NVIDIA RTX PRO 6000 Blackwell Server Edition").map(|g| g.label), Some("RTX PRO 6000"));
+        assert_eq!(find("NVIDIA RTX PRO 6000 Blackwell Workstation Edition").map(|g| g.label), Some("RTX PRO 6000 WK"));
+    }
+
     #[test]
     fn check_gpu_flag_refuses_a_short_name_that_means_several_gpus() {
         let mut c = catalog();
@@ -557,7 +667,9 @@ H100        80G          -     $2.69  High   NVIDIA H100 80GB HBM3
         assert_eq!(resolve("3090"), "NVIDIA GeForce RTX 3090");
         assert_eq!(resolve("5090"), "NVIDIA GeForce RTX 5090");
         assert_eq!(resolve("A6000 Ada"), "NVIDIA RTX 6000 Ada Generation");
-        assert_eq!(resolve("pro 6000"), "NVIDIA RTX PRO 6000 Blackwell Workstation Edition");
+        assert_eq!(resolve("pro 6000"), "NVIDIA RTX PRO 6000 Blackwell Server Edition");
+        assert_eq!(resolve("RTX PRO 6000 WK"), "NVIDIA RTX PRO 6000 Blackwell Workstation Edition");
+        assert_eq!(resolve("pro6000 maxq"), "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition");
         assert_eq!(resolve("L40"), "NVIDIA L40");
         // The cheap/common community cards (live finding: `--gpu 3070` was passed through
         // as the invalid id "3070").

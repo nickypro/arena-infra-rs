@@ -94,6 +94,9 @@ pub enum AttemptEnd {
     /// A replacement that landed on a machine IP that had already failed the deep check:
     /// rejected before it was set up or checked.
     SameHost,
+    /// Up, but reachable only through RunPod's SSH proxy for the grace period — a host with no
+    /// public IP: a host failure, like a failed check.
+    NoPublicIp,
 }
 
 /// One placement of a name — its first create or a replacement.
@@ -180,6 +183,7 @@ fn attempt_line(n: usize, a: &Attempt, verdict: &Verdict) -> String {
     let what = match &a.end {
         AttemptEnd::CheckFailed(notes) => format!("check FAIL — {notes}{fate}"),
         AttemptEnd::SameHost => format!("same host as a failed check — rejected{fate}"),
+        AttemptEnd::NoPublicIp => format!("no public SSH endpoint (RunPod ssh proxy only){fate}"),
         AttemptEnd::Kept => match verdict {
             Verdict::Ready => "ready".to_string(),
             Verdict::Failed { stage, .. } => format!("FAILED {}", stage.label()),

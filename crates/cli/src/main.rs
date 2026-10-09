@@ -56,23 +56,51 @@ struct Cli {
 }
 
 /// Ask the operator to confirm a mutating action. `--yes` proceeds without asking. At
-/// an interactive terminal, prompts y/N. With **no terminal** (cron/pipes) and no
-/// `--yes`, it *refuses* — automation must opt in explicitly with `--yes`, so nothing
-/// mutates non-interactively by accident.
+/// an interactive terminal, prompts y/N (`Ok(false)` = they said no: "aborted.", exit 0).
+/// With **no terminal** (cron/pipes) and no `--yes`, it *refuses* — automation must opt in
+/// explicitly with `--yes`, so nothing mutates non-interactively by accident — and the
+/// refusal is an error ([`NoTerminal`], exit status 2): it used to exit 0 after "aborted.",
+/// so a script or cron job couldn't tell "refused" from "done" (finding #25).
 fn confirm(assume_yes: bool, what: &str) -> Result<bool> {
     use std::io::{IsTerminal, Write};
     if assume_yes {
         return Ok(true);
     }
     if !std::io::stdin().is_terminal() {
-        eprintln!("{what}\nRefusing to proceed without a terminal — pass --yes to confirm non-interactively.");
-        return Ok(false);
+        eprintln!("{what}");
+        return Err(NoTerminal.into());
     }
     eprint!("{what}\nProceed? [y/N] ");
     std::io::stderr().flush().ok();
     let mut line = String::new();
     std::io::stdin().read_line(&mut line)?;
     Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+}
+
+/// The refusal [`confirm`] fails with when there's no terminal to ask at and no `--yes`.
+/// `main` exits with [`NO_TERMINAL_EXIT`] for it (after printing it), never 0.
+#[derive(Debug)]
+struct NoTerminal;
+
+impl std::fmt::Display for NoTerminal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("refusing to proceed without a terminal — pass --yes to confirm non-interactively")
+    }
+}
+
+impl std::error::Error for NoTerminal {}
+
+/// The exit status for a [`NoTerminal`] refusal: 2, apart from a failed command's 1.
+const NO_TERMINAL_EXIT: u8 = 2;
+
+/// What `main` ends with for `result`: success, [`NO_TERMINAL_EXIT`] for a refused
+/// confirmation, else 1. Pure, so the mapping is tested.
+fn exit_code(result: &Result<()>) -> std::process::ExitCode {
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) if e.downcast_ref::<NoTerminal>().is_some() => std::process::ExitCode::from(NO_TERMINAL_EXIT),
+        Err(_) => std::process::ExitCode::FAILURE,
+    }
 }
 
 #[derive(Subcommand)]
@@ -82,7 +110,8 @@ enum Cmd {
     Pods(PodCmd),
     /// Launch the interactive dashboard (arena-tui), inheriting --provider/--config.
     Tui,
-    /// Plan port-forwarding/proxy wiring (read-only; prints config to apply).
+    /// The SSH proxy's port forwards: `plan` previews (read-only), `apply` writes the
+    /// config and reloads nginx (confirms first).
     #[command(subcommand, infer_subcommands = true)]
     Proxy(ProxyCmd),
     /// View/preview a scheduled provisioning plan (arena-plan.json). Read-only for now;
@@ -613,10 +642,11 @@ enum PodCmd {
         /// Explicit machine names to create (e.g. `apple bloom`). Bare names get the
         /// configured prefix. Mutually exclusive with -n/-a.
         names: Vec<String>,
-        /// Target TOTAL number of pods — tops up to this many (mutually exclusive with -a).
+        /// Target number of pods ON --provider (the create target) — tops up to this many;
+        /// pods on other providers don't count (mutually exclusive with -a).
         #[arg(short = 'n', long)]
         count: Option<usize>,
-        /// Number of pods to ADD (mutually exclusive with -n).
+        /// Number of pods to ADD on --provider (mutually exclusive with -n).
         #[arg(short = 'a', long)]
         add: Option<usize>,
         /// GPU type, e.g. `A4000`, `3090`, `A100`, `A100 SXM` (or a full provider name) — or
@@ -704,10 +734,11 @@ enum PodCmd {
         /// Explicit machine names to create (e.g. `apple bloom`), like `pods create`.
         /// Bare names get the configured prefix. Mutually exclusive with -n/-a.
         names: Vec<String>,
-        /// Target TOTAL number of pods — tops up to this many (mutually exclusive with -a).
+        /// Target number of pods ON --provider (the create target) — tops up to this many;
+        /// pods on other providers don't count (mutually exclusive with -a).
         #[arg(short = 'n', long)]
         count: Option<usize>,
-        /// Number of pods to ADD (mutually exclusive with -n).
+        /// Number of pods to ADD on --provider (mutually exclusive with -n).
         #[arg(short = 'a', long)]
         add: Option<usize>,
         /// GPU type, e.g. `A4000`, `3090`, `A100`, `A100 SXM` (or a full provider name) — or
@@ -1436,10 +1467,12 @@ struct CreatePlan {
 
 /// Resolve a `-n`/`-a` request into a concrete [`CreatePlan`] against the current fleet.
 /// Lists pods (failing closed — a failed list could otherwise duplicate pods) and picks
-/// the next free machine names for the shortfall.
+/// the next free machine names for the shortfall. The listing must be whole
+/// ([`arena_core::provider::list_complete`]): with one provider down, its pods' names would
+/// read as free and its pods wouldn't count toward `-n`.
 async fn plan_create(provider: &dyn Provider, cfg: &Config, want: Want) -> Result<CreatePlan> {
     let policy = arena_core::retry::RetryPolicy::default();
-    let existing = arena_core::retry::retrying(&policy, || provider.list_pods())
+    let existing = arena_core::retry::retrying(&policy, || arena_core::provider::list_complete(provider))
         .await
         .context(
             "listing existing pods (refusing to allocate names — a failed list could \
@@ -1468,7 +1501,8 @@ async fn plan_create(provider: &dyn Provider, cfg: &Config, want: Want) -> Resul
 /// Resolve operator-supplied machine names for `create <names…>`: prefix bare names
 /// with `MACHINE_NAME_PREFIX`, warn about any not in the configured `MACHINE_NAME_LIST`
 /// (allowed, but usually a typo), and drop any that already exist (so re-running is
-/// safe). Propagates a list failure rather than risking a duplicate create.
+/// safe). Propagates a list failure — any provider's ([`arena_core::provider::list_complete`])
+/// — rather than risking a duplicate create.
 async fn resolve_explicit_names(
     provider: &dyn Provider,
     cfg: &Config,
@@ -1476,7 +1510,7 @@ async fn resolve_explicit_names(
 ) -> Result<Vec<String>> {
     let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
     let policy = arena_core::retry::RetryPolicy::default();
-    let existing = arena_core::retry::retrying(&policy, || provider.list_pods())
+    let existing = arena_core::retry::retrying(&policy, || arena_core::provider::list_complete(provider))
         .await
         .context("listing existing pods (refusing to allocate names — a failed list could create duplicates)")?;
     // `existing` spans every provider, so the same name can't be live on two backends.
@@ -1635,12 +1669,21 @@ fn check_create_body(provider: &dyn Provider, spec: &PodSpec) -> Result<()> {
 /// create→ready from it, not from when a batch of creates finished), and which placement
 /// option it landed on (`None` = the single-spec path), so `up --check` knows what a
 /// replacement should try first.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Made {
     pod: arena_core::Pod,
     at: tokio::time::Instant,
     option: Option<usize>,
 }
+
+/// Where the create phase reports each pod the moment its create returns — `up` starts that
+/// pod's pipeline then, while placement may still be retrying for the others (finding #14:
+/// placed pods sat idle, billing, until a 6-minute `--retry-mins` window ended). `create`
+/// passes [`NO_STREAM`].
+type OnMade<'a> = &'a (dyn Fn(&Made) + Sync);
+
+/// An [`OnMade`] that does nothing (`pods create`, which has no pipelines).
+const NO_STREAM: OnMade<'static> = &|_| {};
 
 /// A create that failed part-way. `created` are the pods made before the failure: they
 /// exist (and bill) whatever happened next, so the caller still finishes its job for them
@@ -1766,6 +1809,7 @@ async fn create_with_retry(
     retry_mins: u64,
     retry_secs: u64,
     interrupt: &Interrupt,
+    on_made: OnMade<'_>,
 ) -> std::result::Result<Vec<Made>, CreateFailed> {
     // Round 1 creates exactly the names that were previewed + confirmed, so the
     // `[created] …` output matches the `[y/N]` prompt. `target` (a provider-scoped total,
@@ -1785,7 +1829,7 @@ async fn create_with_retry(
         }
         // In retry mode the *loop* is the keep-trying, so each round is one-shot.
         let kt = retry_mins == 0 && keep_trying;
-        let made = match create_pods(provider, cfg, &names, kt, ov).await {
+        let made = match create_pods(provider, cfg, &names, kt, ov, on_made).await {
             Ok(made) => made,
             Err(CreateFailed { created, error }) => {
                 all.extend(created);
@@ -1837,6 +1881,7 @@ async fn create_pods(
     names: &[String],
     keep_trying: bool,
     ov: &SpecOverrides,
+    on_made: OnMade<'_>,
 ) -> std::result::Result<Vec<Made>, CreateFailed> {
     use arena_core::ProviderErrorKind as K;
 
@@ -1856,7 +1901,9 @@ async fn create_pods(
             match arena_core::retry::retrying(&policy, || provider.create_pod(&spec)).await {
                 Ok(pod) => {
                     println!("[created] {} id={}", pod.name, pod.id);
-                    created.push(Made { pod, at: tokio::time::Instant::now(), option: None });
+                    let made = Made { pod, at: tokio::time::Instant::now(), option: None };
+                    on_made(&made);
+                    created.push(made);
                     continue 'names;
                 }
                 Err(e) => match e.kind() {
@@ -1976,12 +2023,16 @@ where
 /// RunPod's REST v2 GPU catalog for one tier (read-only, bounded by [`PRICE_TIMEOUT`]),
 /// fetched at most once per tier per run: the `--gpu` check and the placement plan's price
 /// book share the answer (or the failure — see [`arena_core::provider::runpod_v2::CatalogCache`]).
-async fn v2_catalog(key: &str, cloud: &str) -> std::result::Result<Vec<arena_core::provider::runpod::GpuType>, String> {
+///
+/// Stock is counted over the hosts a create would accept: the config's CUDA floor goes along
+/// as `minCudaVersion` (one floor per run, so the cache key needn't carry it).
+async fn v2_catalog(cfg: &Config, key: &str, cloud: &str) -> std::result::Result<Vec<arena_core::provider::runpod::GpuType>, String> {
     use arena_core::provider::runpod_v2;
     static CACHE: std::sync::OnceLock<runpod_v2::CatalogCache> = std::sync::OnceLock::new();
+    let floor = PodSpec::from_config(cfg).cuda_floor();
     CACHE
         .get_or_init(runpod_v2::CatalogCache::default)
-        .get_or_fetch(key, cloud, |tier| bounded_catalog(runpod_v2::fetch_gpu_types(key, tier)))
+        .get_or_fetch(key, cloud, |tier| bounded_catalog(runpod_v2::fetch_gpu_types(key, tier, floor.as_deref())))
         .await
 }
 
@@ -2006,7 +2057,7 @@ async fn live_gpu_catalog(cfg: &Config) -> std::result::Result<Vec<arena_core::p
     };
     if matches!(RunpodApi::from_config(cfg), Ok(RunpodApi::V2)) {
         let cloud = v2_default_cloud(cfg);
-        return v2_catalog(key, cloud).await.map_err(|e| format!("v2 catalog ({cloud}): {e}"));
+        return v2_catalog(cfg, key, cloud).await.map_err(|e| format!("v2 catalog ({cloud}): {e}"));
     }
     match bounded_catalog(runpod::fetch_gpu_types(key)).await {
         Ok(types) if !types.is_empty() => Ok(types),
@@ -2040,15 +2091,53 @@ fn gpu_flag_or_warning(
 /// providers name GPUs their own way (Vast matches loosely; Hetzner has none): passed
 /// through. Read-only, before anything is listed or created.
 async fn checked_gpu(cfg: &Config, provider_name: &str, gpu: Option<String>) -> Result<Option<String>> {
+    use arena_core::provider::{runpod, RunpodApi};
     let Some(raw) = gpu else { return Ok(None) };
     if provider_name != "runpod" {
         return Ok(Some(raw));
     }
-    let (gpu, warning) = gpu_flag_or_warning(raw, live_gpu_catalog(cfg).await)?;
+    let catalog = live_gpu_catalog(cfg).await;
+    let types = catalog.as_ref().ok().cloned();
+    let (gpu, warning) = gpu_flag_or_warning(raw, catalog)?;
     if let Some(w) = warning {
         eprintln!("{w}");
     }
+    // REST v1 only: its create validates against an OpenAPI enum that lags the catalog.
+    let v1 = matches!(RunpodApi::from_config(cfg), Ok(RunpodApi::V1));
+    if let (true, Some(types), Some(key)) = (v1, types, cfg.get("RUNPOD_API_KEY").filter(|k| !k.is_empty())) {
+        if let Ok(Ok(creatable)) = tokio::time::timeout(PRICE_TIMEOUT, runpod::fetch_creatable_gpu_ids(key)).await {
+            v1_creatable_check(&gpu, &types, &creatable)?;
+        }
+    }
     Ok(Some(gpu))
+}
+
+/// RunPod REST v1 validates a create's `gpuTypeIds` against its OpenAPI enum, which lags the
+/// live catalog: live (finding #22), `PRO 6000 MIG 24GB` passed the catalog check, ranked
+/// first in `offers`, and its create was a `400 … schema requirements`. So on v1, with the
+/// enum at hand, a `--gpu` id outside it is refused before anything is listed or created —
+/// naming RUNPOD_API=v2, whose create takes it. An empty enum (couldn't be read) refuses
+/// nothing: placement then skips an option the API rejects. Pure.
+fn v1_creatable_check(ids: &str, catalog: &[arena_core::provider::runpod::GpuType], creatable: &[String]) -> Result<()> {
+    if creatable.is_empty() {
+        return Ok(());
+    }
+    let bad: Vec<String> = arena_core::placement::split_list(ids)
+        .into_iter()
+        .filter(|id| !creatable.iter().any(|c| c == id))
+        .map(|id| match catalog.iter().find(|g| g.id == id && !g.display_name.is_empty()) {
+            Some(g) => format!("`{}` ({id})", g.display_name),
+            None => format!("`{id}`"),
+        })
+        .collect();
+    if bad.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "--gpu {}: in RunPod's catalog, but REST v1's create API rejects it (not in its gpuTypeIds list) — \
+         set RUNPOD_API=v2 (which creates it), or pick another --gpu (`arena gpus` hides what v1 can't create)",
+        bad.join(", ")
+    )
 }
 
 /// The prices placement can see (read-only), plus notes on where they came from. RunPod:
@@ -2092,7 +2181,7 @@ async fn fetch_price_book(
     let mut errs = Vec::new();
     if RunpodApi::from_config(cfg)? == RunpodApi::V2 {
         for cloud in clouds {
-            match v2_catalog(key, cloud).await {
+            match v2_catalog(cfg, key, cloud).await {
                 Ok(types) => catalogs.push((Some(cloud.clone()), types)),
                 Err(e) => errs.push(format!("v2 catalog ({cloud}): {e}")),
             }
@@ -2239,6 +2328,7 @@ async fn place_names(
     retry_mins: u64,
     retry_secs: u64,
     interrupt: &Interrupt,
+    on_made: OnMade<'_>,
 ) -> std::result::Result<Vec<Made>, CreateFailed> {
     use arena_core::placement::{self, End, Outcome, Progress, Rounds, TopUp};
     let rounds = Rounds {
@@ -2256,6 +2346,10 @@ async fn place_names(
             println!("{}", p.line());
         } else {
             eprintln!("{}", p.line());
+        }
+        // Hand the pod on the moment it exists (`up` starts its pipeline now).
+        if let Progress::Attempt { pod: Some(pod), index, .. } = p {
+            on_made(&Made { pod: (*pod).clone(), at: tokio::time::Instant::now(), option: Some(*index) });
         }
     };
     let start = tokio::time::Instant::now();
@@ -2310,7 +2404,16 @@ async fn place_names(
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> std::process::ExitCode {
+    let result = run().await;
+    if let Err(e) = &result {
+        // As `fn main() -> Result` printed it (the error and its causes).
+        eprintln!("Error: {e:?}");
+    }
+    exit_code(&result)
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
     let cfg = Config::load(&cli.config)
         .with_context(|| format!("loading config {}", cli.config.display()))?;
@@ -2391,32 +2494,39 @@ async fn handle_gpus(cfg: &Config, provider_name: &str, json: bool) -> Result<()
 
     // (rows, whether the create-API enum was available to flag `creatable`)
     let mut live: Option<(Vec<gpu::GpuRow>, bool)> = None;
-    // Which cloud the STOCK column describes (v2's availability is per tier).
-    let mut stock_cloud: Option<&str> = None;
+    // v2: the other tier's catalog, for its stock (v2's availability is per tier).
+    let mut secure_stock: Option<Vec<arena_core::provider::runpod::GpuType>> = None;
+    let mut v2 = false;
     if provider_name == "runpod" {
         if let Some(key) = cfg.get("RUNPOD_API_KEY").filter(|s| !s.is_empty()) {
             let api = RunpodApi::from_config(cfg)?;
             let fetched = match api {
                 RunpodApi::V1 => runpod::fetch_gpu_types(key).await.map_err(|e| e.to_string()),
                 RunpodApi::V2 => {
-                    let cloud = v2_default_cloud(cfg);
-                    stock_cloud = Some(cloud);
-                    v2_catalog(key, cloud).await.map_err(|e| format!("v2 catalog ({cloud}): {e}"))
+                    // Both tiers (finding #31: STOCK was always the community figure, so a
+                    // secure-only card read "None"). Rows and prices from COMMUNITY's answer
+                    // (every tier's lists every GPU); SECURE's adds its stock.
+                    v2 = true;
+                    secure_stock = v2_catalog(cfg, key, "SECURE").await.ok();
+                    v2_catalog(cfg, key, "COMMUNITY").await.map_err(|e| format!("v2 catalog (COMMUNITY): {e}"))
                 }
             };
             match fetched {
                 Ok(types) if !types.is_empty() => {
-                    // v1 only: RunPod's v1 create-validation enum can be NARROWER than the
-                    // gpuTypes catalog — listing a GPU that `--gpu` then gets a 400 for. Flag
-                    // rows against it (the table hides rejected ones). If the enum can't be
-                    // fetched, `creatable` stays unknown and everything is shown. v2's
-                    // `gpu.id` has no such enum (and the v1 document is retiring), so on v2
-                    // `creatable` is unknown.
+                    // v1: RunPod's v1 create-validation enum can be NARROWER than the gpuTypes
+                    // catalog — listing a GPU that `--gpu` then gets a 400 for. Flag rows
+                    // against it (the table hides rejected ones). If the enum can't be
+                    // fetched, `creatable` stays unknown and everything is shown. v2's create
+                    // validates `gpu.id` against this very catalog: every row is creatable.
                     let creatable = match api {
                         RunpodApi::V1 => runpod::fetch_creatable_gpu_ids(key).await.ok().filter(|v| !v.is_empty()),
-                        RunpodApi::V2 => None,
+                        RunpodApi::V2 => Some(types.iter().map(|t| t.id.clone()).collect()),
                     };
-                    live = Some((gpu::rows_from_live(&types, creatable.as_deref()), creatable.is_some()));
+                    let mut rows = gpu::rows_from_live(&types, creatable.as_deref());
+                    if let Some(secure) = &secure_stock {
+                        gpu::add_secure_stock(&mut rows, secure);
+                    }
+                    live = Some((rows, creatable.is_some()));
                 }
                 Ok(_) => {}
                 Err(e) => eprintln!("(couldn't fetch the live GPU list: {e} — showing local presets)\n"),
@@ -2435,12 +2545,16 @@ async fn handle_gpus(cfg: &Config, provider_name: &str, json: bool) -> Result<()
             let (shown, hidden): (Vec<_>, Vec<_>) = rows.into_iter().partition(|r| r.creatable != Some(false));
             print!("{}", gpu::render_gpu_table(&shown));
             println!(
-                "\n{} GPU types {}. Pass the API name (or a short alias like \
+                "\n{} GPU types {}. Pass the GPU name (or the API name, or a short alias like \
                  A4000 / 3090) to --gpu. Prices are RunPod's live $/hr per GPU (~ = preset \
-                 estimate, - = not offered); STOCK is RunPod's 1-GPU stock hint{}.",
+                 estimate, - = not offered); STOCK is RunPod's stock hint{}.",
                 shown.len(),
                 if creatable_known { "(live from RunPod, creatable via the create API)" } else { "(live from RunPod)" },
-                stock_cloud.map(|c| format!(" on the {c} cloud")).unwrap_or_default()
+                match (v2, secure_stock.is_some()) {
+                    (true, true) => " as community/secure (over hosts at or above the CUDA floor, if one is set)",
+                    (true, false) => " on the community cloud (secure's couldn't be read)",
+                    _ => " for a 1-GPU pod (either tier)",
+                }
             );
             if !hidden.is_empty() {
                 println!(
@@ -3873,6 +3987,63 @@ fn runpod_api_row(cfg: &Config) -> (String, bool) {
     }
 }
 
+/// The `config check` lines for the host CUDA constraint (finding #10), and whether it's
+/// usable on the RunPod generation in use. Pure, for testing.
+/// - What creates send: a floor (`≥ 13.0`, from `MIN_CUDA_VERSION` or the lowest of
+///   `ALLOWED_CUDA_VERSIONS`) or an exact set (`EXACT_CUDA_VERSIONS`).
+/// - ⚠ an exact set — RunPod matches it exactly, so a host on a newer CUDA is "no capacity";
+///   ⚠ an `ALLOWED_CUDA_VERSIONS` list (it used to be an exact set; now only its lowest
+///   version counts); ⚠ keys shadowed by a stronger one.
+/// - ✗ (not ok) on RunPod v1 when its schema can't express the constraint (13.1+).
+fn cuda_rows(cfg: &Config, runpod_v1: bool) -> (Vec<String>, bool) {
+    let key = "host CUDA";
+    let cuda = arena_core::pod::cuda_from_config(cfg);
+    let mut out = Vec::new();
+    match (&cuda.floor, cuda.exact.is_empty()) {
+        (_, false) => out.push(format!(
+            "  ⚠ {key:<27}exactly {} ({}) — RunPod matches this exactly: hosts on a newer CUDA are \"no capacity\"; \
+             MIN_CUDA_VERSION sets a floor instead",
+            cuda.exact.join(", "),
+            cuda.source.unwrap_or_default()
+        )),
+        (Some(floor), true) => out.push(format!("  ✓ {key:<27}≥ {floor} (a floor, from {})", cuda.source.unwrap_or_default())),
+        (None, true) => out.push(format!("  · {key:<27}any (no MIN_CUDA_VERSION / ALLOWED_CUDA_VERSIONS)")),
+    }
+    if cuda.source.is_some_and(|s| s.ends_with("ALLOWED_CUDA_VERSIONS")) {
+        let raw = cfg.get(cuda.source.unwrap_or_default()).unwrap_or_default();
+        if raw.split(',').filter(|v| !v.trim().is_empty()).count() > 1 {
+            out.push(format!(
+                "      └ {} lists several versions: only the lowest counts now (a floor) — EXACT_CUDA_VERSIONS for an exact set",
+                cuda.source.unwrap_or_default()
+            ));
+        }
+    }
+    for shadowed in cuda.set.iter().skip(1) {
+        out.push(format!("      └ {shadowed} is ignored: {} takes precedence", cuda.set[0]));
+    }
+    let mut ok = true;
+    if let Some(bad) = cuda.exact.iter().chain(&cuda.floor).find(|v| arena_core::pod::cuda_key(v).is_none()) {
+        out.push(format!("  ✗ {key:<27}`{bad}` isn't a version like 13.0 — every create would be refused"));
+        ok = false;
+    }
+    if runpod_v1 {
+        let spec = PodSpec { allowed_cuda: cuda.exact.clone(), min_cuda: cuda.floor.clone(), ..PodSpec::from_config(cfg) };
+        match arena_core::provider::runpod::v1_cuda_versions(&spec) {
+            Ok(Some(_)) if cuda.exact.is_empty() => out.push(format!(
+                "      └ RUNPOD_API=v1 has no real floor: it sends its list's versions ≥ the floor, newest {} — \
+                 RUNPOD_API=v2 reaches newer hosts",
+                arena_core::provider::runpod::V1_CUDA_VERSIONS[0]
+            )),
+            Ok(_) => {}
+            Err(e) => {
+                out.push(format!("  ✗ {key:<27}{e}"));
+                ok = false;
+            }
+        }
+    }
+    (out, ok)
+}
+
 /// The `config check` row for `VAST_ALLOW_UNVERIFIED`, and whether it's valid. Pure, for
 /// testing. Allowing unverified hosts is a warning: they're the flakier part of the market.
 fn vast_hosts_row(cfg: &Config) -> (String, bool) {
@@ -3951,6 +4122,13 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
         println!("  resolved disk                {}GB", spec.disk_gb);
         if spec.volume_gb == 0 {
             println!("  ⚠ persistent volume          0GB — work is lost on pod restart");
+        }
+        let v1 = provider_name == "runpod"
+            && matches!(arena_core::provider::RunpodApi::from_config(cfg), Ok(arena_core::provider::RunpodApi::V1));
+        let (lines, ok) = cuda_rows(cfg, v1);
+        lines.iter().for_each(|l| println!("{l}"));
+        if !ok {
+            missing.push("a host CUDA constraint RunPod v1 can express (or RUNPOD_API=v2)".into());
         }
     }
     if let Some((line, ok)) = create_extra_row(cfg) {
@@ -4082,7 +4260,7 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
                 let v = f.version.iter().map(u32::to_string).collect::<Vec<_>>().join(".");
                 println!("  · deep-check driver floor   ≥ {v} ({})", f.why)
             }
-            None => println!("  · deep-check driver floor   none (no MIN_DRIVER_VERSION / ALLOWED_CUDA_VERSIONS)"),
+            None => println!("  · deep-check driver floor   none (no MIN_DRIVER_VERSION / MIN_CUDA_VERSION / ALLOWED_CUDA_VERSIONS)"),
         },
         Err(e) => println!("  ✗ deep-check driver floor   {e}"),
     }
@@ -5245,7 +5423,11 @@ async fn probe_gpus(remote: &Arc<dyn Remote>, cfg: &Config, pods: &mut [arena_co
     .await;
     for (i, p) in pods.iter_mut().enumerate() {
         if let Some((g, n)) = gpus.remove(&i) {
-            p.gpu_type = Some(g);
+            // A MIG slice keeps the provider's name for it: nvidia-smi names the parent card
+            // (`B300 SXM6 AC`), which is not what the pod has (finding #24).
+            if arena_core::health::mig_slice_name(p).is_none() {
+                p.gpu_type = Some(g);
+            }
             p.gpu_count = Some(n);
         }
     }
@@ -5312,13 +5494,14 @@ async fn handle_pods_with(
             let footer = balances
                 .map(|b| money::list_footer(&b, &pods, &failed, cfg, arena_core::snapshot::unix_now()))
                 .unwrap_or_default();
+            // Columns + footer come from arena_core::fleet so the TUI/snapshot reuse them. A
+            // provider that didn't answer makes the total a lower bound — said on the line.
+            use arena_core::fleet;
             if pods.is_empty() {
-                println!("(no pods)");
+                println!("{}", fleet::empty_listing_line(&failed));
             } else {
-                // Columns + footer come from arena_core::fleet so the TUI/snapshot reuse them.
-                use arena_core::fleet;
                 print!("{}", fleet::render_pods_table(&pods));
-                println!("{}", fleet::fleet_footer(&fleet::fleet_cost(&pods)));
+                println!("{}", fleet::listing_footer(&fleet::fleet_cost(&pods), &failed));
             }
             footer.iter().for_each(|l| println!("{l}"));
         }
@@ -5388,11 +5571,14 @@ async fn handle_pods_with(
             // total (topup_target == 0 marks the explicit case).
             let outcome = match &options {
                 Some(plan) => {
-                    place_names(provider, cfg, names, topup_target, &spec, plan, retry_mins, retry_secs, &interrupt).await
+                    place_names(provider, cfg, names, topup_target, &spec, plan, retry_mins, retry_secs, &interrupt, NO_STREAM)
+                        .await
                 }
                 None => {
-                    create_with_retry(provider, cfg, names, topup_target, &ov, keep_trying, retry_mins, retry_secs, &interrupt)
-                        .await
+                    create_with_retry(
+                        provider, cfg, names, topup_target, &ov, keep_trying, retry_mins, retry_secs, &interrupt, NO_STREAM,
+                    )
+                    .await
                 }
             };
             let (created, error) = match outcome {
@@ -5509,39 +5695,43 @@ async fn handle_pods_with(
             // What the operator confirmed: a name of these that gets no pod is in the summary
             // (and the exit status) too, not silently missing from it.
             let confirmed = names.clone();
-            // Create as many as capacity allows (retrying if requested); the pipelines run
-            // on the ones we got. Explicit names create directly. A create that failed
-            // part-way still syncs the proxy for the pods it made, then fails.
-            let outcome = match &options {
-                Some(plan) => {
-                    place_names(provider, cfg, names, topup_target, &spec, plan, retry_mins, retry_secs, &interrupt).await
-                }
-                None => {
-                    create_with_retry(provider, cfg, names, topup_target, &ov, keep_trying, retry_mins, retry_secs, &interrupt)
-                        .await
-                }
-            };
-            let created = match outcome {
-                Ok(created) => created,
-                Err(CreateFailed { created, error }) => {
-                    if !created.is_empty() {
-                        sync_proxy(cfg, provider, "up").await;
-                    }
-                    return Err(error);
-                }
-            };
-            if created.is_empty() {
-                anyhow::bail!("no pods were created — nothing to bring up");
-            }
             if no_wait {
+                // No pipelines: create (retrying if asked), sync the proxy for what was made.
+                let outcome = match &options {
+                    Some(plan) => {
+                        place_names(provider, cfg, names, topup_target, &spec, plan, retry_mins, retry_secs, &interrupt, NO_STREAM)
+                            .await
+                    }
+                    None => {
+                        create_with_retry(
+                            provider, cfg, names, topup_target, &ov, keep_trying, retry_mins, retry_secs, &interrupt, NO_STREAM,
+                        )
+                        .await
+                    }
+                };
+                let (created, error) = match outcome {
+                    Ok(created) => (created, None),
+                    Err(CreateFailed { created, error }) => (created, Some(error)),
+                };
+                if !created.is_empty() {
+                    sync_proxy(cfg, provider, "up").await;
+                }
+                if let Some(e) = error {
+                    return Err(e);
+                }
+                if created.is_empty() {
+                    anyhow::bail!("no pods were created — nothing to bring up");
+                }
                 println!("\n--no-wait: not polling. Run `arena proxy apply` once endpoints are assigned.");
-                sync_proxy(cfg, provider, "up").await;
                 return Ok(());
             }
 
-            // One independent pipeline per pod (see `up`). Replacements draw from the
-            // confirmed options — on the single-spec path, that one spec as an option.
-            let options = options.unwrap_or_else(|| single_option_plan(provider.name(), &spec));
+            // One independent pipeline per pod (see `up`), each started the moment its create
+            // returns — while placement may still be retrying for the other names (finding
+            // #14: a `--retry-mins` window used to hold every placed pod idle, billing, until it
+            // ended). Replacements draw from the confirmed options — on the single-spec path,
+            // that one spec as an option.
+            let plan_for_run = options.clone().unwrap_or_else(|| single_option_plan(provider.name(), &spec));
             let setup = setup.map(|(stage, tokens)| {
                 println!("{tokens}");
                 stage
@@ -5558,8 +5748,8 @@ async fn handle_pods_with(
                 provider,
                 remote: remote.clone(),
                 cfg,
-                options,
-                base: spec,
+                options: plan_for_run,
+                base: spec.clone(),
                 rounds: replacement_rounds(keep_trying, retry_mins, retry_secs),
                 timeout: Duration::from_secs(timeout),
                 interval: Duration::from_secs(interval.max(1)),
@@ -5573,25 +5763,52 @@ async fn handle_pods_with(
                 keys,
                 lock,
             };
-            let made: Vec<String> = created.iter().map(|m| m.pod.name.clone()).collect();
-            if interrupt.is_set() {
-                // Ctrl+C during the create: it still holds for the pipelines (they start
-                // stopped — nothing set up, terminated or recreated), so this is just the report.
-                eprintln!(
-                    "Ctrl+C during the create — the {} pod(s) made are left as they are, not set up \
-                     (`arena pods setup …` / `arena proxy apply` later)",
-                    created.len()
-                );
-            } else {
-                println!(
-                    "\nBringing up {} pod(s), each on its own (endpoint wait ≤{timeout}s per pod; Ctrl+C stops — \
-                     nothing is terminated by it)…",
-                    created.len()
-                );
+            println!(
+                "\nEach pod is brought up on its own the moment it's created (endpoint wait ≤{timeout}s per pod; \
+                 Ctrl+C stops — nothing is terminated by it)…"
+            );
+            let (made_tx, made_rx) = tokio::sync::mpsc::unbounded_channel::<Made>();
+            let creating = async {
+                // Owned here, so the channel closes — and the pipelines can finish — once the
+                // create phase is over.
+                let made_tx = made_tx;
+                let on_made = move |m: &Made| {
+                    let _ = made_tx.send(m.clone());
+                };
+                match &options {
+                    Some(plan) => {
+                        place_names(provider, cfg, names, topup_target, &spec, plan, retry_mins, retry_secs, &interrupt, &on_made)
+                            .await
+                    }
+                    None => {
+                        create_with_retry(
+                            provider, cfg, names, topup_target, &ov, keep_trying, retry_mins, retry_secs, &interrupt, &on_made,
+                        )
+                        .await
+                    }
+                }
+            };
+            let (outcome, mut rows) =
+                tokio::join!(creating, up::run_up_streaming(&run, made_rx, interrupt.wait(), &up::console));
+            // A create that failed part-way still had its pods brought up (and the proxy synced
+            // by the pipelines' final sync); the failure is reported after their summary.
+            let (created, error) = match outcome {
+                Ok(created) => (created, None),
+                Err(CreateFailed { created, error }) => (created, Some(error)),
+            };
+            if created.is_empty() {
+                if let Some(e) = error {
+                    return Err(e);
+                }
+                anyhow::bail!("no pods were created — nothing to bring up");
             }
-            let mut rows = up::run_up(&run, created, interrupt.wait(), &up::console).await;
+            let made: Vec<String> = created.iter().map(|m| m.pod.name.clone()).collect();
             rows.extend(up::not_created_rows(&confirmed, &made, interrupt.is_set()));
-            up::conclude(&rows, &up::console)?;
+            let concluded = up::conclude(&rows, &up::console);
+            if let Some(e) = error {
+                return Err(e);
+            }
+            concluded?;
         }
 
         PodCmd::Stop { sel, wipe_ok, dry_run } => {
@@ -6301,7 +6518,8 @@ async fn deep_check_fleet(
             }
             Err(_) if sel.named => Slot::NoEndpoint,
             Err(_) => {
-                eprintln!("skip {} — no SSH endpoint yet", pod.name);
+                let why = arena_core::fleet::no_endpoint_reason(pod).unwrap_or_else(|| "no SSH endpoint yet".into());
+                eprintln!("skip {} — {why}", pod.name);
                 Slot::Skipped
             }
         });
@@ -6333,7 +6551,9 @@ async fn deep_check_fleet(
         match slots[i] {
             Slot::Skipped => continue,
             Slot::NoEndpoint => {
-                results.push(PodHealth::unreachable(pod, format!("no SSH endpoint yet (status {})", pod.status)));
+                let why = arena_core::fleet::no_endpoint_reason(pod)
+                    .unwrap_or_else(|| format!("no SSH endpoint yet (status {})", pod.status));
+                results.push(PodHealth::unreachable(pod, why));
                 continue;
             }
             Slot::Probed => {}
@@ -7347,7 +7567,8 @@ async fn handle_rename(
     yes: bool,
 ) -> Result<()> {
     let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
-    let pods = provider.list_pods().await.context("listing pods")?;
+    // Whole-fleet: a new name held by a pod on a provider that didn't answer isn't free.
+    let pods = arena_core::provider::list_complete(provider).await.context("listing pods")?;
     let plan = plan_renames(prefix, &cfg.machine_names, &pods, &request)?;
     if plan.is_empty() {
         println!("nothing to rename.");
@@ -7856,7 +8077,8 @@ fn replace_stage_names(canonical: &str) -> (String, String) {
 /// CLI overrides. disk/volume/ports/env come from the snapshot so per-pod differences are
 /// preserved. Errors if no GPU type is known.
 ///
-/// The CUDA constraint (`ALLOWED_CUDA_VERSIONS`) can't come from the snapshot — neither
+/// The CUDA constraint (the floor from `MIN_CUDA_VERSION` / `ALLOWED_CUDA_VERSIONS`, or
+/// `EXACT_CUDA_VERSIONS`) can't come from the snapshot — neither
 /// RunPod API reports it back — so without re-applying it a replacement was created
 /// unconstrained and could land the cu130 image on a CUDA 12 host (a pod whose torch can't
 /// use its GPU). A snapshot that did carry one keeps it.
@@ -7883,8 +8105,9 @@ async fn build_replacement_spec(
     if spec.cloud_type.is_empty() {
         spec.cloud_type = base.cloud_type;
     }
-    if spec.allowed_cuda.is_empty() {
+    if spec.allowed_cuda.is_empty() && spec.min_cuda.is_none() {
         spec.allowed_cuda = base.allowed_cuda;
+        spec.min_cuda = base.min_cuda;
     }
     let pubkeys = arena_core::ssh::authorized_pubkeys(cfg);
     if !pubkeys.is_empty() {
@@ -9193,7 +9416,12 @@ impl Selected {
         for pod in &self.pods {
             match SshTarget::from_pod(pod, cfg) {
                 Ok(t) => targets.push((pod, t)),
-                Err(_) => eprintln!("skip {} — no SSH endpoint yet", pod.name),
+                // A stopped or proxy-only pod says so, not "yet" (it won't get one by waiting).
+                Err(_) => eprintln!(
+                    "skip {} — {}",
+                    pod.name,
+                    arena_core::fleet::no_endpoint_reason(pod).unwrap_or_else(|| "no SSH endpoint yet".into())
+                ),
             }
         }
         if targets.is_empty() && self.named {
@@ -10225,7 +10453,8 @@ async fn handle_copy_keys(
                 jobs.push((pod.name.clone(), t, vars));
             }
             Err(_) => {
-                eprintln!("skip {} — no SSH endpoint yet", pod.name);
+                let why = arena_core::fleet::no_endpoint_reason(pod).unwrap_or_else(|| "no SSH endpoint yet".into());
+                eprintln!("skip {} — {why}", pod.name);
                 unreachable += 1;
             }
         }
@@ -10772,6 +11001,7 @@ mod replacement_spec_tests {
             env: Vec::new(),
             docker_args: None,
             allowed_cuda: allowed_cuda.iter().map(|s| s.to_string()).collect(),
+            min_cuda: None,
             max_price: None,
             api_extra: None,
         }
@@ -10790,24 +11020,28 @@ mod replacement_spec_tests {
         let owner = Snapshot { name: "runpod", spec: snapshot(&[]) };
         let ov = SpecOverrides::default();
         // (config, what the replacement is constrained to)
-        for (extra, want) in [
-            ("ALLOWED_CUDA_VERSIONS=\"13.0\"\n", vec!["13.0"]),
-            ("ALLOWED_CUDA_VERSIONS=\"13.0, 12.8\"\n", vec!["13.0", "12.8"]),
-            ("RUNPOD_ALLOWED_CUDA_VERSIONS=13.0\n", vec!["13.0"]), // the legacy key, as create reads it
-            ("", vec![]),                                          // unconfigured: any host, as before
+        // (config, exact set, floor) — ALLOWED_CUDA_VERSIONS is a floor now (finding #10).
+        let none: Vec<&str> = vec![];
+        for (extra, exact, floor) in [
+            ("ALLOWED_CUDA_VERSIONS=\"13.0\"\n", none.clone(), Some("13.0")),
+            ("ALLOWED_CUDA_VERSIONS=\"13.0, 12.8\"\n", none.clone(), Some("12.8")),
+            ("RUNPOD_ALLOWED_CUDA_VERSIONS=13.0\n", none.clone(), Some("13.0")), // the legacy key, as create reads it
+            ("MIN_CUDA_VERSION=13.0\n", none.clone(), Some("13.0")),
+            ("EXACT_CUDA_VERSIONS=13.0,13.1\n", vec!["13.0", "13.1"], None),
+            ("", none.clone(), None), // unconfigured: any host, as before
         ] {
             let spec = build_replacement_spec(&cfg(extra), &owner, "id-1", "devtest-apple", &ov).await.unwrap();
-            assert_eq!(spec.allowed_cuda, want, "{extra:?}");
+            assert_eq!((spec.allowed_cuda.clone(), spec.min_cuda.as_deref()), (exact.iter().map(|s| s.to_string()).collect(), floor), "{extra:?}");
             assert_eq!((spec.gpu_type.as_str(), spec.disk_gb), ("NVIDIA RTX A4000", 40), "snapshot + config fallback");
         }
-        // A snapshot that does carry a constraint keeps it.
+        // A snapshot that does carry a constraint keeps it (and gets no floor beside it).
         let pinned = Snapshot { name: "runpod", spec: snapshot(&["12.8"]) };
         let spec = build_replacement_spec(&cfg("ALLOWED_CUDA_VERSIONS=13.0\n"), &pinned, "id-1", "x", &ov).await.unwrap();
-        assert_eq!(spec.allowed_cuda, ["12.8"]);
+        assert_eq!((spec.allowed_cuda.clone(), spec.min_cuda), (vec!["12.8".to_string()], None));
         // --gpu still applies on top (unchecked here: no key → no catalog).
         let ov = SpecOverrides { gpu: Some("3070".into()), ..Default::default() };
         let spec = build_replacement_spec(&cfg("ALLOWED_CUDA_VERSIONS=13.0\n"), &owner, "id-1", "x", &ov).await.unwrap();
-        assert_eq!((spec.gpu_type.as_str(), spec.allowed_cuda.clone()), ("NVIDIA GeForce RTX 3070", vec!["13.0".to_string()]));
+        assert_eq!((spec.gpu_type.as_str(), spec.min_cuda.as_deref()), ("NVIDIA GeForce RTX 3070", Some("13.0")));
     }
 
     /// Config CREATE_EXTRA_JSON reaches a replacement's (and `migrate copy`'s) create like
@@ -10870,6 +11104,25 @@ mod replacement_spec_tests {
         let plain = Snapshot { name: "vast", spec: snapshot(&[]) };
         let e = build_replacement_spec(&cfg(r#"CREATE_EXTRA_JSON='{"price":0.1}'"#), &plain, "id-1", "x", &ov).await.unwrap_err();
         assert!(e.to_string().contains("isn't supported on provider `vast`"), "{e}");
+    }
+
+    /// Finding #22: on REST v1 a catalog GPU its create enum lacks (the PRO 6000 MIG slices)
+    /// is refused before any create, by its display name, pointing at RUNPOD_API=v2; an
+    /// unreadable enum refuses nothing.
+    #[test]
+    fn v1_refuses_a_gpu_its_create_api_rejects() {
+        use super::v1_creatable_check;
+        let mig = "NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 1g.24gb";
+        let catalog = vec![
+            GpuType { id: mig.into(), display_name: "PRO 6000 MIG 24GB".into(), memory_gb: 24, ..Default::default() },
+            GpuType { id: "NVIDIA RTX A4000".into(), display_name: "RTX A4000".into(), memory_gb: 16, ..Default::default() },
+        ];
+        let creatable = vec!["NVIDIA RTX A4000".to_string(), "NVIDIA B300 SXM6 AC MIG 1g.34gb".to_string()];
+        assert!(v1_creatable_check("NVIDIA RTX A4000", &catalog, &creatable).is_ok());
+        let e = v1_creatable_check(&format!("NVIDIA RTX A4000,{mig}"), &catalog, &creatable).unwrap_err().to_string();
+        assert!(e.contains("`PRO 6000 MIG 24GB`") && e.contains("REST v1's create API rejects it") && e.contains("RUNPOD_API=v2"), "{e}");
+        assert!(!e.contains("`RTX A4000`"), "only the bad token: {e}");
+        assert!(v1_creatable_check(mig, &catalog, &[]).is_ok(), "no enum: nothing refused");
     }
 
     #[test]
@@ -11378,6 +11631,28 @@ mod selection_tests {
         for want in ["starting", "provisioning", "ERROR", "--wipe-ok", "skipped"] {
             assert!(long.contains(want), "missing {want:?}: {long}");
         }
+    }
+
+    /// Finding #37: `-n` counts only --provider's pods (`provider_pod_count`), so "TOTAL
+    /// number of pods" read as a fleet total — `-n 4` on a mixed fleet would leave 5 — and the
+    /// `proxy` group called itself read-only although `proxy apply` writes and reloads nginx.
+    #[test]
+    fn help_says_what_n_counts_and_that_proxy_apply_writes() {
+        use clap::CommandFactory;
+        let cli = super::Cli::command();
+        let pods = cli.find_subcommand("pods").expect("pods");
+        for sub in ["create", "up"] {
+            let cmd = pods.find_subcommand(sub).expect(sub);
+            let arg = |id: &str| {
+                cmd.get_arguments().find(|a| a.get_id() == id).and_then(|a| a.get_help()).map(|h| h.to_string()).unwrap()
+            };
+            let n = arg("count");
+            assert!(!n.contains("TOTAL") && n.contains("ON --provider") && n.contains("other providers don't count"), "{sub}: {n}");
+            assert!(arg("add").contains("--provider"), "{sub}");
+        }
+        let proxy = cli.find_subcommand("proxy").expect("proxy");
+        let about = proxy.get_about().map(|s| s.to_string()).unwrap_or_default();
+        assert!(!about.contains("read-only;") && about.contains("`apply` writes"), "{about}");
     }
 
     #[tokio::test]
@@ -12139,6 +12414,38 @@ mod tests {
         assert!(!ok && line.contains("✗") && !line.contains("SECRETKEY"), "{line}");
     }
 
+    /// Finding #10: `config check` says whether creates ask for a CUDA floor or an exact set,
+    /// flags an exact set (a newer host is "no capacity"), an old multi-version
+    /// ALLOWED_CUDA_VERSIONS, shadowed keys, and — on RunPod v1 — a constraint its schema can't
+    /// express (13.1+), which fails the check.
+    #[test]
+    fn config_check_cuda_rows() {
+        use super::{cuda_rows, Config};
+        let rows = |text: &str, v1: bool| {
+            let (lines, ok) = cuda_rows(&Config::parse(text), v1);
+            (lines.join("\n"), ok)
+        };
+        let (l, ok) = rows("ALLOWED_CUDA_VERSIONS=\"13.0\"", false);
+        assert!(ok && l.contains("✓") && l.contains("≥ 13.0 (a floor, from ALLOWED_CUDA_VERSIONS)") && !l.contains("└"), "{l}");
+        let (l, ok) = rows("ALLOWED_CUDA_VERSIONS=\"13.0\"", true);
+        assert!(ok && l.contains("has no real floor") && l.contains("RUNPOD_API=v2"), "{l}");
+        let (l, _) = rows("ALLOWED_CUDA_VERSIONS=\"13.0, 12.8\"", false);
+        assert!(l.contains("≥ 12.8") && l.contains("lists several versions"), "{l}");
+        let (l, ok) = rows("EXACT_CUDA_VERSIONS=13.0", false);
+        assert!(ok && l.contains("⚠") && l.contains("exactly 13.0") && l.contains("no capacity"), "{l}");
+        let (l, _) = rows("MIN_CUDA_VERSION=13.0\nALLOWED_CUDA_VERSIONS=12.8", false);
+        assert!(l.contains("≥ 13.0 (a floor, from MIN_CUDA_VERSION)") && l.contains("ALLOWED_CUDA_VERSIONS is ignored"), "{l}");
+        let (l, ok) = rows("MIN_CUDA_VERSION=13.1", true);
+        assert!(!ok && l.contains("✗") && l.contains("RUNPOD_API=v2"), "{l}");
+        assert!(rows("MIN_CUDA_VERSION=13.1", false).1, "v2 sends any floor");
+        let (l, ok) = rows("EXACT_CUDA_VERSIONS=13.0,13.2", true);
+        assert!(!ok && l.contains("13.2"), "{l}");
+        let (l, ok) = rows("", true);
+        assert!(ok && l.contains("any"), "{l}");
+        let (l, ok) = rows("MIN_CUDA_VERSION=newest", false);
+        assert!(!ok && l.contains("`newest` isn't a version"), "{l}");
+    }
+
     /// `config check` shows CREATE_EXTRA_JSON's keys (never its values) and fails a value
     /// that isn't one JSON object.
     #[test]
@@ -12366,6 +12673,33 @@ mod tests {
         // Without the backup line selected, only the asked-for lines render.
         let kinds: Vec<super::CronKind> = cron_kinds(false, false, true, Some("/w")).into_iter().map(|(k, _)| k).collect();
         assert_eq!(kinds, [super::CronKind::Proxy, super::CronKind::Snapshot]);
+    }
+
+    /// Finding #25: a refusal for lack of a terminal (no --yes) exits 2 — it exited 0 after
+    /// "aborted.", indistinguishable from success for a script. Cron runs without a terminal,
+    /// so every mutating cron line must carry --yes (the read-only snapshot needs none).
+    #[test]
+    fn no_terminal_refusal_exits_2_and_every_mutating_cron_line_says_yes() {
+        use super::{exit_code, NoTerminal};
+        use std::process::ExitCode;
+        assert_eq!(exit_code(&Ok(())), ExitCode::SUCCESS);
+        assert_eq!(exit_code(&Err(anyhow::anyhow!("boom"))), ExitCode::FAILURE);
+        assert_eq!(exit_code(&Err(NoTerminal.into())), ExitCode::from(2));
+        // Still 2 when a caller added context on the way up.
+        assert_eq!(exit_code(&Err(anyhow::Error::new(NoTerminal).context("stopping pods"))), ExitCode::from(2));
+        // Without a terminal (as under cargo test, or cron), `confirm` refuses with it.
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            let e = super::confirm(false, "Will do a thing.").unwrap_err();
+            assert!(e.downcast_ref::<NoTerminal>().is_some() && e.to_string().contains("pass --yes"), "{e}");
+            assert!(super::confirm(true, "Will do a thing.").unwrap());
+        }
+        for (backup, pull, proxy, snapshot) in [(true, false, true, Some("/w")), (true, true, false, None)] {
+            for (kind, line) in cron_kinds(backup, pull, proxy, snapshot) {
+                let mutating = !matches!(kind, super::CronKind::Snapshot);
+                assert_eq!(line.contains(" --yes "), mutating, "{line}");
+            }
+        }
     }
 
     /// `--start-date` goes before `flock` (an inline env assignment applies to the command it
@@ -13643,6 +13977,9 @@ mod placement_cli_tests {
         calls: Mutex<Vec<(String, String, String)>>,
         made: Mutex<Vec<Pod>>,
         lists: AtomicUsize,
+        /// A second backend that fails to list (a bogus `VAST_API_KEY`), holding a pod nobody
+        /// can see: the aggregate `list_pods` skips it, as the fleet provider's does.
+        vast_down: bool,
     }
 
     impl Recorder {
@@ -13665,6 +14002,17 @@ mod placement_cli_tests {
         async fn list_pods(&self) -> CoreResult<Vec<Pod>> {
             self.lists.fetch_add(1, Ordering::SeqCst);
             Ok(self.made.lock().unwrap().clone())
+        }
+        async fn list_by_provider(&self) -> Vec<(String, CoreResult<Vec<Pod>>)> {
+            let mut out = vec![("runpod".to_string(), self.list_pods().await)];
+            if self.vast_down {
+                let e = Error::Provider {
+                    kind: arena_core::ProviderErrorKind::Auth,
+                    message: r#"list instances HTTP 404 Not Found: {"error":"auth_error","msg":"Invalid user key"}"#.into(),
+                };
+                out.push(("vast".into(), Err(e)));
+            }
+            out
         }
         async fn create_pod(&self, spec: &PodSpec) -> CoreResult<Pod> {
             self.calls.lock().unwrap().push((spec.name.clone(), spec.gpu_type.clone(), spec.cloud_type.clone()));
@@ -13720,6 +14068,75 @@ mod placement_cli_tests {
 
     fn call(name: &str, gpu: &str, cloud: &str) -> (String, String, String) {
         (name.into(), gpu.into(), cloud.into())
+    }
+
+    /// Live finding #9 (fleet-mixed): with Vast's key bogus, `create delta`, `up -n 4` and the
+    /// `--provider vast` runs all planned names a failed provider might hold — a duplicate pod
+    /// billed twice. Every name-picking path — explicit names, `-n`, `-a`, dry run or not,
+    /// `create` and `up`, single spec or placement — now refuses, naming the provider and its
+    /// key, before any create.
+    #[tokio::test]
+    async fn create_and_up_refuse_while_any_provider_fails_to_list() {
+        let up = |names: &[&str], count: Option<usize>, gpu: Option<&str>, dry_run: bool| PodCmd::Up {
+            names: names.iter().map(|s| s.to_string()).collect(),
+            count,
+            add: None,
+            gpu: gpu.map(String::from),
+            gpus: None,
+            cloud: None,
+            max_price: None,
+            order: Order::Cheapest,
+            disk: None,
+            volume: None,
+            image: None,
+            bootstrap: false,
+            api_json: None,
+            dry_run,
+            no_wait: false,
+            keep_trying: false,
+            retry_mins: 0,
+            retry_secs: 60,
+            no_setup: true,
+            check: false,
+            check_attempts: 2,
+            lock: false,
+            timeout: 60,
+            interval: 10,
+        };
+        let mut cmds = Vec::new();
+        for dry_run in [true, false] {
+            for gpu in [None, Some("A4000,3090")] {
+                let mut c = create(&["delta"], gpu, None, None);
+                if let PodCmd::Create { dry_run: d, .. } = &mut c {
+                    *d = dry_run;
+                }
+                cmds.push(c);
+                let mut c = create(&[], gpu, None, None);
+                if let PodCmd::Create { count, dry_run: d, .. } = &mut c {
+                    (*count, *d) = (Some(4), dry_run);
+                }
+                cmds.push(c);
+                let mut c = create(&[], gpu, None, None);
+                if let PodCmd::Create { add, dry_run: d, .. } = &mut c {
+                    (*add, *d) = (Some(1), dry_run);
+                }
+                cmds.push(c);
+                cmds.push(up(&["alpha"], None, gpu, dry_run));
+                cmds.push(up(&[], Some(4), gpu, dry_run));
+            }
+        }
+        for cmd in cmds {
+            let rec = Recorder { vast_down: true, ..Default::default() };
+            let e = handle_pods(cmd, &rec, fake_remote(), &cfg(), true).await.unwrap_err();
+            let msg = format!("{e:#}");
+            assert!(msg.contains("vast failed to list") && msg.contains("refusing to pick machine names"), "{msg}");
+            assert!(msg.contains("VAST_API_KEY was rejected"), "{msg}");
+            assert!(rec.calls().is_empty(), "nothing created: {:?}", rec.calls());
+        }
+        // The same commands with every provider answering go ahead.
+        let rec = Recorder::default();
+        handle_pods(create(&["delta"], None, None, None), &rec, fake_remote(), &cfg(), true).await.unwrap();
+        assert_eq!(rec.calls().len(), 1);
     }
 
     #[test]
@@ -13837,7 +14254,7 @@ mod placement_cli_tests {
         for (mins, secs, want) in [(1, 600, 1), (1, 45, 2), (2, 60, 3), (1, 60, 2), (0, 30, 1)] {
             let fake = Recorder::dry(&["NVIDIA RTX A4000"]);
             let started = tokio::time::Instant::now();
-            let made = create_with_retry(&fake, &cfg(), vec!["arena8-apple".into()], 0, &SpecOverrides::default(), false, mins, secs, &Interrupt::manual())
+            let made = create_with_retry(&fake, &cfg(), vec!["arena8-apple".into()], 0, &SpecOverrides::default(), false, mins, secs, &Interrupt::manual(), NO_STREAM)
                 .await
                 .unwrap();
             assert!(made.is_empty());
@@ -15216,6 +15633,23 @@ mod remote_tests {
         assert!(fake.calls().iter().all(|c| matches!(c, RemoteCall::Exec { timeout, .. } if *timeout == Some(PROBE_TIMEOUT))));
     }
 
+    /// Finding #24: under MIG nvidia-smi names the parent card (`NVIDIA B300 SXM6 AC`), so
+    /// the table showed `1×B300 SXM6 AC`; a pod the provider lists as a MIG slice keeps the
+    /// slice's name (the count still comes from the probe).
+    #[tokio::test]
+    async fn list_probe_keeps_a_mig_slices_name() {
+        let fake = Arc::new(FakeRemote::new());
+        let smi = format!("NVIDIA B300 SXM6 AC, 0, 16, 31232, 43\n{}\n", arena_core::metrics::SENTINEL);
+        fake.script(&host(22001), [FakeReply::stdout(&smi)]);
+        let remote: Arc<dyn Remote> = fake.clone();
+        let mut mig = pod("apple", 22001);
+        mig.gpu_type = Some("B300 MIG 34GB".into());
+        let mut pods = vec![mig];
+        probe_gpus(&remote, &cfg(), &mut pods).await;
+        assert_eq!((pods[0].gpu_type.as_deref(), pods[0].gpu_count), (Some("B300 MIG 34GB"), Some(1)));
+        assert_eq!(arena_core::fleet::gpu_label(&pods[0]), "1×B300 MIG 34GB");
+    }
+
     /// Two pods with one name (e.g. a half-finished replace) each keep their own GPU: the
     /// probe used to key results by name, so one pod's readout landed on both rows.
     #[tokio::test]
@@ -15624,6 +16058,19 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
         }
         let results = deep_check_fleet(&f, &remote(&fake), &deep_cfg(), &everyone(&f)).await.unwrap();
         assert_eq!(results.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(), ["devtest-bloom", "devtest-cloud"]);
+
+        // A stopped pod, or one up with only RunPod's SSH proxy, says so — not "yet" (live:
+        // `test`/`run` said "no SSH endpoint yet" for an EXITED pod).
+        let mut f = fleet();
+        (f.pods[0].ssh_ip, f.pods[0].ssh_port, f.pods[0].status) = (None, None, "EXITED".into());
+        (f.pods[1].ssh_ip, f.pods[1].ssh_port, f.pods[1].proxy_only) = (None, None, true);
+        let fake = Arc::new(FakeRemote::new());
+        let sel = picked(&f, &deep_cfg(), &["apple", "bloom"]).await;
+        let results = deep_check_fleet(&f, &remote(&fake), &deep_cfg(), &sel).await.unwrap();
+        let why: Vec<&str> = results.iter().map(|h| h.checks[0].detail.as_str()).collect();
+        assert_eq!(why[0], "stopped (EXITED) — no SSH while it's stopped");
+        assert!(why[1].starts_with("no public endpoint (RunPod ssh proxy only)"), "{why:?}");
+        assert!(fake.calls().is_empty());
     }
 
     #[tokio::test(start_paused = true)]

@@ -171,10 +171,15 @@ fn list_request(client: &Client, api_key: &str, cursor: Option<&str>) -> Request
     api_request(client, api_key, Method::GET, base_url("pods")).query(&query)
 }
 
-/// The GPU catalog with prices and pod stock for one cloud tier.
-fn catalog_request(client: &Client, api_key: &str, cloud: &str) -> RequestBuilder {
-    api_request(client, api_key, Method::GET, base_url("catalog/gpus"))
-        .query(&[("include", "AVAILABILITY"), ("product", "POD"), ("cloud", cloud)])
+/// The GPU catalog with prices and pod stock for one cloud tier — the stock counted over
+/// hosts at or above `min_cuda` when there is a floor (the hosts a create would accept,
+/// finding #31: a stock hint over hosts we'd never be placed on misleads).
+fn catalog_request(client: &Client, api_key: &str, cloud: &str, min_cuda: Option<&str>) -> RequestBuilder {
+    let mut query = vec![("include", "AVAILABILITY"), ("product", "POD"), ("cloud", cloud)];
+    if let Some(floor) = min_cuda {
+        query.push(("minCudaVersion", floor));
+    }
+    api_request(client, api_key, Method::GET, base_url("catalog/gpus")).query(&query)
 }
 
 /// Send a request and judge its response by [`crate::http`]'s rule — the status first, then
@@ -380,6 +385,10 @@ fn parse_pod(v: &Value) -> Pod {
         (Some(h), Some(p)) => (Some(h), Some(p)),
         _ => (None, None),
     };
+    // Up (RUNNING, a live `runtime`) but no direct endpoint: only RunPod's SSH proxy — a
+    // host without a public IP (live: 15+ minutes like this; `dataCenterId` null too).
+    let running = s("status").is_some_and(|st| st.eq_ignore_ascii_case("RUNNING"));
+    let proxy_only = running && v.get("runtime").is_some_and(Value::is_object) && ssh_ip.is_none();
     Pod {
         id: s("id").unwrap_or_default(),
         name: s("name").unwrap_or_default(),
@@ -398,6 +407,7 @@ fn parse_pod(v: &Value) -> Pod {
         // `locked` (a bool on every v2 pod): stop/restart/terminate refused while true —
         // read from here, never inferred from `actions`, which still lists them.
         locked: v.get("locked").and_then(Value::as_bool),
+        proxy_only,
     }
 }
 
@@ -476,7 +486,8 @@ pub(crate) const MANAGED: &[Managed] = &[
     managed(&["cloud"], "--cloud / CLOUD_TYPE"),
     managed(&["gpu", "id"], "--gpu / GPU_TYPE"),
     managed(&["gpu", "count"], "--gpus / NUM_GPUS"),
-    managed(&["gpu", "allowedCudaVersions"], "ALLOWED_CUDA_VERSIONS"),
+    managed(&["gpu", "allowedCudaVersions"], "EXACT_CUDA_VERSIONS"),
+    managed(&["gpu", "minCudaVersion"], "MIN_CUDA_VERSION / ALLOWED_CUDA_VERSIONS (a floor)"),
     managed(&["disk"], "--disk / DISK_GB"),
     managed(&["mounts", "persistent"], "--volume / VOLUME_GB, at /workspace"),
     managed(&["env", "PUBLIC_KEY"], "the cohort SSH keys"),
@@ -492,8 +503,11 @@ pub(crate) const MANAGED: &[Managed] = &[
 /// Build the `POST /v2/pods` body. Pure, so every field rule is unit-tested — the schema
 /// rejects unknown keys (422), so names must match exactly:
 /// - `cloud` is ALWAYS present (omitted = SECURE on v2) and must be COMMUNITY/SECURE.
-/// - CUDA: `spec.allowed_cuda` → `gpu.allowedCudaVersions` (an exact set; it lives under
-///   `gpu` in v2). `minCudaVersion` is never sent — the two together are a 400.
+/// - CUDA (finding #10): the floor (`spec.min_cuda`) → `gpu.minCudaVersion`, so any newer
+///   host qualifies (live: an exact `["13.0"]` made every B300 MIG host — all on 13.2 — "no
+///   capacity"); an exact set (`spec.allowed_cuda`, `EXACT_CUDA_VERSIONS` only) →
+///   `gpu.allowedCudaVersions`. Never both — the two together are a 400 — and the exact set
+///   wins if a spec somehow carries both.
 /// - `--bootstrap` (`docker_args`) → `cmd`: like v1's `dockerStartCmd` it replaces the
 ///   image's CMD and keeps its ENTRYPOINT. Omitted otherwise, so the image's own CMD runs
 ///   (the arena image starts sshd itself). `entrypoint`/`args` are never sent.
@@ -506,8 +520,16 @@ fn create_payload(spec: &PodSpec, account_keys: &[String]) -> Result<Value> {
     network_mount_conflict(spec)?;
     let cloud = normalize_cloud(&spec.cloud_type)?;
     let mut gpu = json!({ "id": spec.gpu_type, "count": spec.gpu_count });
+    let bad = spec.allowed_cuda.iter().chain(&spec.min_cuda).find(|v| crate::pod::cuda_key(v).is_none());
+    if let Some(bad) = bad {
+        return Err(Error::Config(format!(
+            "CUDA version `{bad}` isn't a version like 13.0 (MIN_CUDA_VERSION / ALLOWED_CUDA_VERSIONS / EXACT_CUDA_VERSIONS)"
+        )));
+    }
     if !spec.allowed_cuda.is_empty() {
         gpu["allowedCudaVersions"] = json!(spec.allowed_cuda);
+    } else if let Some(floor) = &spec.min_cuda {
+        gpu["minCudaVersion"] = json!(floor);
     }
     let ports: Vec<&str> = spec.ports.split(',').map(str::trim).filter(|p| !p.is_empty()).collect();
     let mut payload = json!({
@@ -683,6 +705,7 @@ fn parse_spec(v: &Value) -> PodSpec {
         env,
         docker_args,
         allowed_cuda: Vec::new(),
+        min_cuda: None,
         max_price: None,
         api_extra: None,
     }
@@ -705,6 +728,31 @@ fn parse_catalog(body: &Value) -> Result<Vec<GpuType>> {
         let mut c = s.chars();
         c.next().map(|f| f.to_uppercase().chain(c.flat_map(char::to_lowercase)).collect::<String>())
     };
+    // Stock: the best signal the answer carries (finding #31 — `availability` read "NONE"
+    // for an A4000 pool a pod was created on seconds later). The overall level, any data
+    // center's level, and a CUDA version tagged available (which is at least "Low").
+    let rank = |s: &str| match s.to_ascii_uppercase().as_str() {
+        "HIGH" => 3,
+        "MEDIUM" => 2,
+        "LOW" => 1,
+        _ => 0,
+    };
+    let stock = |g: &Value| -> Option<String> {
+        let overall = g.get("availability").and_then(Value::as_str);
+        let dcs = g.get("dataCenters").and_then(Value::as_array).into_iter().flatten();
+        let by_dc = dcs.filter_map(|d| d.get("availability").and_then(Value::as_str));
+        let best = overall.into_iter().chain(by_dc).max_by_key(|s| rank(s));
+        let cuda_up = g
+            .get("cudaVersions")
+            .and_then(Value::as_array)
+            .is_some_and(|vs| vs.iter().any(|v| v.get("available").and_then(Value::as_bool) == Some(true)));
+        match best {
+            Some(b) if rank(b) == 0 && cuda_up => Some("Low".to_string()),
+            Some(b) => title(b),
+            None if cuda_up => Some("Low".to_string()),
+            None => None,
+        }
+    };
     Ok(gpus
         .iter()
         .filter_map(|g| {
@@ -714,7 +762,7 @@ fn parse_catalog(body: &Value) -> Result<Vec<GpuType>> {
                 memory_gb: g.get("memory").and_then(loose_f64).map_or(0, |n| n.max(0.0) as u32),
                 community_price: price(g, "community"),
                 secure_price: price(g, "secure"),
-                stock_status: g.get("availability").and_then(Value::as_str).and_then(title),
+                stock_status: stock(g),
             })
         })
         .collect())
@@ -726,8 +774,8 @@ fn parse_catalog(body: &Value) -> Result<Vec<GpuType>> {
 /// the `--gpu` check — no GraphQL fallback, see the module's GraphQL inventory). Every
 /// tier's answer lists every GPU (the recorded COMMUNITY answer includes secure-only cards),
 /// so any one tier's catalog serves the `--gpu` check.
-pub async fn fetch_gpu_types(api_key: &str, cloud: &str) -> Result<Vec<GpuType>> {
-    let body = send(catalog_request(&Client::new(), api_key, normalize_cloud(cloud)?), "gpu catalog").await?;
+pub async fn fetch_gpu_types(api_key: &str, cloud: &str, min_cuda: Option<&str>) -> Result<Vec<GpuType>> {
+    let body = send(catalog_request(&Client::new(), api_key, normalize_cloud(cloud)?, min_cuda), "gpu catalog").await?;
     parse_catalog(&body)
 }
 
@@ -987,6 +1035,24 @@ mod tests {
         json!({ "pods": pods, "pagination": { "nextCursor": next, "hasNextPage": next.is_some() } })
     }
 
+    /// No-public-IP hosts (live 2026-10-08): RUNNING with a runtime, `ssh.direct` null,
+    /// only the proxy — flagged, so `up` can fail/replace it and `pods list` can say so. A
+    /// pod still provisioning (no runtime) or stopped isn't.
+    #[test]
+    fn parse_pod_flags_a_running_pod_reachable_only_through_the_proxy() {
+        let mut v = running_pod();
+        v["ssh"]["direct"] = Value::Null;
+        v["dataCenterId"] = Value::Null;
+        let p = parse_pod(&v);
+        assert!(p.proxy_only && p.ssh_ip.is_none(), "{p:?}");
+        assert!(!parse_pod(&running_pod()).proxy_only);
+        assert!(!parse_pod(&provisioning_pod()).proxy_only, "no runtime yet: still coming up");
+        assert!(!parse_pod(&exited_pod()).proxy_only, "stopped");
+        // The JSON only carries it when set.
+        assert!(serde_json::to_value(parse_pod(&running_pod())).unwrap().get("proxy_only").is_none());
+        assert_eq!(serde_json::to_value(&p).unwrap()["proxy_only"], true);
+    }
+
     #[test]
     fn parse_pod_running_uses_ssh_direct_never_the_proxy() {
         let p = parse_pod(&running_pod());
@@ -1005,6 +1071,7 @@ mod tests {
                 maintenance: None,
                 machine_id: None,
                 locked: Some(false),
+                proxy_only: false,
             }
         );
     }
@@ -1331,6 +1398,7 @@ mod tests {
             ],
             docker_args: None,
             allowed_cuda: Vec::new(),
+            min_cuda: None,
             max_price: None,
             api_extra: None,
         }
@@ -1384,6 +1452,23 @@ mod tests {
         assert_eq!(p["gpu"]["allowedCudaVersions"], json!(["13.0", "12.9"]));
         assert!(p["gpu"].get("minCudaVersion").is_none());
         assert!(p.get("allowedCudaVersions").is_none() && p.get("minCudaVersion").is_none());
+        // Finding #10: the floor (the default reading of ALLOWED_CUDA_VERSIONS) is sent as
+        // `minCudaVersion`, alone; an exact set beside it wins and the floor isn't sent.
+        s.min_cuda = Some("13.0".into());
+        let p = create_payload(&s, &[]).unwrap();
+        assert!(p["gpu"].get("minCudaVersion").is_none(), "never both: {p}");
+        s.allowed_cuda.clear();
+        let p = create_payload(&s, &[]).unwrap();
+        assert_eq!(p["gpu"]["minCudaVersion"], json!("13.0"));
+        assert!(p["gpu"].get("allowedCudaVersions").is_none(), "{p}");
+        let cfg = crate::config::Config::parse("RUNPOD_API_KEY=k\nGPU_TYPE=\"NVIDIA RTX A4000\"\nALLOWED_CUDA_VERSIONS=\"13.0\"\nIMAGE=img");
+        let p = create_payload(&PodSpec { name: "devtest-a".into(), ..PodSpec::from_config(&cfg) }, &[]).unwrap();
+        assert_eq!((p["gpu"].get("allowedCudaVersions"), &p["gpu"]["minCudaVersion"]), (None, &json!("13.0")), "{p}");
+        let extra: Extra = serde_json::from_str(r#"{"gpu": {"minCudaVersion": "12.0"}}"#).unwrap();
+        assert!(apiextra::check(&extra, MANAGED, Some("ports")).is_err(), "the floor is arena's to set");
+        // A floor that isn't a version is refused before any request, never dropped.
+        s.min_cuda = Some("newest".into());
+        assert!(matches!(create_payload(&s, &[]), Err(Error::Config(_))));
     }
 
     #[test]
@@ -1656,9 +1741,14 @@ mod tests {
             "https://api.runpod.io/v2/account/ssh-keys",
         );
         check(
-            catalog_request(&c, "rpa_SECRET", "COMMUNITY"),
+            catalog_request(&c, "rpa_SECRET", "COMMUNITY", None),
             Method::GET,
             "https://api.runpod.io/v2/catalog/gpus?include=AVAILABILITY&product=POD&cloud=COMMUNITY",
+        );
+        check(
+            catalog_request(&c, "rpa_SECRET", "SECURE", Some("13.0")),
+            Method::GET,
+            "https://api.runpod.io/v2/catalog/gpus?include=AVAILABILITY&product=POD&cloud=SECURE&minCudaVersion=13.0",
         );
         check(volumes_request(&c, "rpa_SECRET"), Method::GET, "https://api.runpod.io/v2/network-volumes");
     }
@@ -1745,6 +1835,20 @@ mod tests {
         assert_eq!((t[1].community_price, t[1].secure_price, t[1].stock_status.as_deref()), (None, Some(2.69), Some("None")));
         // A 0 price is "not offered", and no availability (not requested) is no hint.
         assert_eq!((t[2].community_price, t[2].stock_status.clone()), (None, None));
+        // Finding #31: "NONE" overall is not the last word — a data center with stock, or a
+        // CUDA version tagged available, is stock (the A4000 pool that read "None" took a pod
+        // seconds later).
+        let v = json!({"gpus": [
+            {"id": "a", "name": "A", "memory": 16, "availability": "NONE",
+             "dataCenters": [{"id": "EU-RO-1", "availability": "NONE"}, {"id": "US-KS-2", "availability": "MEDIUM"}]},
+            {"id": "b", "name": "B", "memory": 16, "availability": "NONE",
+             "cudaVersions": [{"version": "13.0", "available": false}, {"version": "13.1", "available": true}]},
+            {"id": "c", "name": "C", "memory": 16, "availability": "NONE",
+             "cudaVersions": [{"version": "13.0", "available": false}]},
+            {"id": "d", "name": "D", "memory": 16, "cudaVersions": [{"version": "13.2", "available": true}]}
+        ]});
+        let stock: Vec<Option<String>> = parse_catalog(&v).unwrap().into_iter().map(|t| t.stock_status).collect();
+        assert_eq!(stock, [Some("Medium".into()), Some("Low".into()), Some("None".into()), Some("Low".into())]);
         assert!(parse_catalog(&json!({"data": []})).is_err());
         assert!(parse_catalog(&json!({"gpus": []})).unwrap().is_empty());
     }

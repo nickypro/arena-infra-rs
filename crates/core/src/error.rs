@@ -31,6 +31,13 @@ pub enum ProviderErrorKind {
     /// lock is deliberate, so waiting won't lift it. Like `Denied`, never produced by
     /// [`ProviderErrorKind::classify`]; only the backend that knows the wording tags it.
     Locked,
+    /// The API refused this request as invalid — schema validation, a GPU type its create
+    /// doesn't take — so the same request again won't work, but another option (another GPU
+    /// type, tier) may: placement skips the option for the rest of the run instead of stopping
+    /// (finding #22: one v1 `400 … does not meet the schema requirements` on the first option
+    /// left 4 good options untried). Never retried. [`ProviderErrorKind::classify`] tags RunPod
+    /// v1's schema wording; RunPod v2's `422` is an [`Error::Config`], read the same way.
+    Rejected,
     /// Anything else.
     Other,
 }
@@ -48,14 +55,31 @@ impl ProviderErrorKind {
             429 => return Self::RateLimited,
             _ => {}
         }
+        // Vast answers a bad API key with a 404 `{"error": "auth_error", "msg": "Invalid user
+        // key"}` (finding #33): an auth failure whatever the status, so callers abort and
+        // point at the key instead of saying "re-run".
+        if status.is_client_error() && looks_like_auth_error(message) {
+            return Self::Auth;
+        }
         if looks_like_capacity(message) {
             return Self::Capacity;
+        }
+        if matches!(status.as_u16(), 400 | 422) && message.contains("does not meet the schema requirements") {
+            return Self::Rejected;
         }
         match status.as_u16() {
             500..=599 => Self::Transient,
             _ => Self::Other,
         }
     }
+}
+
+/// Whether an error body is Vast's "your API key is wrong" (`"error": "auth_error"`, which it
+/// sends with a 404). Matched on the error code, not on words like "invalid key" — Vast's
+/// SSH-key attach says that about an SSH key, which is no auth failure.
+pub fn looks_like_auth_error(message: &str) -> bool {
+    let compact: String = message.chars().filter(|c| !c.is_whitespace()).collect();
+    compact.contains(r#""error":"auth_error""#)
 }
 
 /// Heuristic: does this message read like "no machines available"? Providers don't
@@ -119,6 +143,47 @@ pub enum Error {
     Timeout { what: String, after: Duration },
 }
 
+/// How much of an error body a message keeps.
+const MAX_BODY: usize = 300;
+
+/// What an error message shows of a response body: the first [`MAX_BODY`] characters — except
+/// for a validation error that lists its `problems` (RunPod REST v1's schema middleware:
+/// `[{"error": "At #/paths/pods/post … However, it does not meet the schema requirements …
+/// Suggestion: …", "problems": ["At /pods/properties/…: …"]}]`). Cut at 300 that kept only
+/// the boilerplate and lost the part naming the bad field (finding #22), so there the
+/// error's first sentence and the problems themselves are kept (each clipped, at most four).
+/// Pure.
+pub fn body_excerpt(raw: &str) -> String {
+    let clip = |s: &str, n: usize| -> String {
+        if s.chars().count() > n {
+            format!("{}…", s.chars().take(n).collect::<String>())
+        } else {
+            s.to_string()
+        }
+    };
+    let problems = serde_json::from_str::<serde_json::Value>(raw).ok().and_then(|v| {
+        let obj = if v.is_array() { v.get(0).cloned() } else { Some(v) }?;
+        let list: Vec<String> = obj.get("problems")?.as_array()?.iter().map(|p| match p.as_str() {
+            Some(s) => s.to_string(),
+            None => p.to_string(),
+        }).collect();
+        let head = obj.get("error").and_then(|e| e.as_str()).map(|e| {
+            let rest = e.split_once("However, ").map_or(e, |(_, r)| r);
+            clip(rest.split(". ").next().unwrap_or(rest).trim(), 120)
+        });
+        (!list.is_empty()).then_some((head, list))
+    });
+    match problems {
+        Some((head, list)) => {
+            let shown: Vec<String> = list.iter().take(4).map(|p| clip(p, 240)).collect();
+            let more = if list.len() > 4 { format!(" (+{} more)", list.len() - 4) } else { String::new() };
+            let head = head.map(|h| format!("{h} — ")).unwrap_or_default();
+            format!("{head}problems: {}{more}", shown.join("; "))
+        }
+        None => clip(raw, MAX_BODY),
+    }
+}
+
 /// Render a duration for humans: whole seconds as `300s`, sub-second as `50ms`, else
 /// one decimal (`1.5s`). Used in timeout messages, where the budget is usually whole
 /// seconds but tests use short ones.
@@ -140,17 +205,10 @@ impl Error {
     /// these errors get logged/printed, and an unbounded response body is both noisy
     /// and a needless place for sensitive echoed request context to land.
     pub fn provider_http(status: reqwest::StatusCode, body: &dyn std::fmt::Display, ctx: &str) -> Self {
-        const MAX_BODY: usize = 300;
         let raw = body.to_string();
-        let body = if raw.chars().count() > MAX_BODY {
-            let mut s: String = raw.chars().take(MAX_BODY).collect();
-            s.push('…');
-            s
-        } else {
-            raw
-        };
-        let message = format!("{ctx} HTTP {status}: {body}");
-        let kind = ProviderErrorKind::classify(status, &message);
+        // Classified on the body as received (the excerpt may drop the words that tell).
+        let kind = ProviderErrorKind::classify(status, &format!("{ctx} HTTP {status}: {raw}"));
+        let message = format!("{ctx} HTTP {status}: {}", body_excerpt(&raw));
         Error::Provider { kind, message }
     }
 
@@ -260,6 +318,54 @@ mod tests {
         assert_eq!(
             ProviderErrorKind::classify(StatusCode::INTERNAL_SERVER_ERROR, "boom"),
             ProviderErrorKind::Transient
+        );
+    }
+
+    /// Finding #22: v1's schema 400 was cut at 300 characters, inside the boilerplate, before
+    /// the part naming the bad property — and it stopped placement. The excerpt keeps the
+    /// problems; the kind is `Rejected` (skip that option), from the full body.
+    #[test]
+    fn a_schema_400_keeps_its_problems_and_reads_as_rejected() {
+        // The live body's shape (mig/v1-create-noncreatable.txt, 2026-10-08); the problems
+        // text past the recorded cut-off is illustrative.
+        let body = serde_json::json!([{
+            "error": "At #/paths/pods/post for POST https://rest.runpod.io/v1/pods, The request body is defined as an object. \
+                      However, it does not meet the schema requirements of the specification. Suggestion: Ensure that the \
+                      object being submitted, matches the schema correctly",
+            "problems": ["At /pods/properties/gpuTypeIds/items: value must be one of 'NVIDIA A40', 'NVIDIA RTX A4000'"]
+        }]);
+        let e = Error::provider_http(StatusCode::BAD_REQUEST, &body, "create pod");
+        assert_eq!(e.kind(), Some(ProviderErrorKind::Rejected));
+        let msg = e.to_string();
+        assert!(msg.contains("problems: At /pods/properties/gpuTypeIds/items: value must be one of"), "{msg}");
+        assert!(msg.contains("it does not meet the schema requirements of the specification —"), "{msg}");
+        assert!(!msg.contains("Suggestion"), "the boilerplate goes: {msg}");
+        // Many long problems stay bounded.
+        let many: Vec<String> = (0..9).map(|i| format!("At /pods/properties/p{i}: {}", "x".repeat(400))).collect();
+        let e = Error::provider_http(StatusCode::BAD_REQUEST, &serde_json::json!({"error": "bad", "problems": many}), "create pod");
+        let msg = e.to_string();
+        assert!(msg.contains("(+5 more)") && msg.chars().count() < 1300, "{}", msg.chars().count());
+        // Anything else keeps the plain 300-character cut.
+        let long = "y".repeat(500);
+        let msg = Error::provider_http(StatusCode::BAD_REQUEST, &long, "create pod").to_string();
+        assert!(msg.ends_with('…') && msg.matches('y').count() == 300, "{msg}");
+        // A 400 that isn't schema validation stays Other (placement still stops on it).
+        assert_eq!(ProviderErrorKind::classify(StatusCode::BAD_REQUEST, "create pod HTTP 400: bad image"), ProviderErrorKind::Other);
+    }
+
+    /// Finding #33: Vast's bogus-key answer is a 404 `auth_error` — Auth, so callers point at
+    /// VAST_API_KEY instead of "re-run". An SSH key called "invalid" is not an auth failure.
+    #[test]
+    fn vast_auth_error_is_auth_whatever_the_status() {
+        let body = serde_json::json!({"success": false, "error": "auth_error", "msg": "Invalid user key"});
+        let e = Error::provider_http(StatusCode::NOT_FOUND, &body, "list instances");
+        assert_eq!(e.kind(), Some(ProviderErrorKind::Auth), "{e}");
+        assert!(!crate::retry::is_retryable(&e));
+        let other = serde_json::json!({"success": false, "msg": "invalid key"});
+        assert_eq!(Error::provider_http(StatusCode::BAD_REQUEST, &other, "attach").kind(), Some(ProviderErrorKind::Other));
+        assert_eq!(
+            Error::provider_http(StatusCode::NOT_FOUND, &serde_json::json!({"error": "no_such_instance"}), "x").kind(),
+            Some(ProviderErrorKind::Other)
         );
     }
 

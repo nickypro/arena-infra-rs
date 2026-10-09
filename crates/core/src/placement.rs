@@ -492,6 +492,10 @@ pub enum Outcome {
     /// This account may not use this option (RunPod v2's 403 on create: no access to the
     /// pool): skipped for the rest of the run — waiting won't grant access.
     Denied(String),
+    /// The API refused this option's request as invalid (RunPod v1's schema 400 — a GPU type
+    /// its create enum lacks — or v2's 422 "Unknown GPU type"): skipped for the rest of the
+    /// run, like `Denied`. Another option may be fine; this one won't become fine by waiting.
+    Rejected(String),
     /// Credentials rejected: the run aborts.
     Auth(String),
     /// Anything else: the run stops, as a single-option create does.
@@ -625,9 +629,14 @@ pub enum Progress<'a> {
     Attempt {
         name: &'a str,
         option: &'a PlacementOption,
+        /// Its index in the plan's options.
+        index: usize,
         outcome: &'a Outcome,
         /// After a capacity error: another option is still open for this name this round.
         next: bool,
+        /// The pod this attempt created (with [`Outcome::Created`]) — so a caller can start on
+        /// it at once, while the run goes on placing the other names (`up`'s pipelines).
+        pod: Option<&'a Pod>,
     },
     Waiting { round: u32, unplaced: usize, every: Duration },
     Skipped { name: &'a str, why: &'a str },
@@ -641,7 +650,7 @@ impl Progress<'_> {
 
     pub fn line(&self) -> String {
         match self {
-            Progress::Attempt { name, option, outcome, next } => {
+            Progress::Attempt { name, option, outcome, next, .. } => {
                 let on = option.describe();
                 match outcome {
                     Outcome::Created { pod_id } => {
@@ -653,6 +662,10 @@ impl Progress<'_> {
                     ),
                     Outcome::Denied(e) => format!(
                         "[no access] {name} on {on}: {e}{}",
+                        if *next { " — skipping this option, trying the next" } else { " — skipping this option" }
+                    ),
+                    Outcome::Rejected(e) => format!(
+                        "[rejected] {name} on {on}: {e}{}",
                         if *next { " — skipping this option, trying the next" } else { " — skipping this option" }
                     ),
                     Outcome::Auth(e) => format!("[auth failed] {name} on {on}: {e}"),
@@ -679,8 +692,8 @@ impl Progress<'_> {
 ///
 /// With a retry window, unplaced names get another round every `rounds.every` while that
 /// round would still start inside the window; capacity blocks are cleared each round, and
-/// the fleet is re-listed first ([`still_needed`]) — a failed list ends the run rather than
-/// risk a duplicate. `interrupt` makes a fresh "stop" future per wait (Ctrl+C in the CLI): it
+/// the fleet is re-listed first ([`still_needed`]) — a failed list, or one with any backend
+/// missing ([`crate::provider::list_complete`]), ends the run rather than risk a duplicate. `interrupt` makes a fresh "stop" future per wait (Ctrl+C in the CLI): it
 /// ends the run between rounds, keeping what was made. The option order is the confirmed
 /// plan's — fixed for the run — and every create carries its `--max-price`
 /// ([`PodSpec::max_price`]), which a marketplace backend enforces on the offer it rents.
@@ -705,8 +718,10 @@ where
         names.iter().map(|n| NameLog { name: n.clone(), turns: 0, attempts: Vec::new(), placed: None, skipped: None }).collect();
     let mut created = Vec::new();
     let mut pending: Vec<usize> = (0..log.len()).collect();
-    // Options this account can't use: unlike capacity blocks, never cleared.
+    // Options this account can't use (`Denied`) or the API refuses as invalid (`Rejected`):
+    // unlike capacity blocks, never cleared.
     let mut denied = vec![false; plan.options.len()];
+    let mut rejected = vec![false; plan.options.len()];
     let mut round = 0u32;
     let end = 'run: loop {
         if pending.is_empty() {
@@ -720,7 +735,7 @@ where
             let name = log[i].name.clone();
             let mut placed = false;
             for (k, option) in plan.options.iter().enumerate() {
-                if blocked[k] || denied[k] {
+                if blocked[k] || denied[k] || rejected[k] {
                     continue;
                 }
                 // The cap travels with the spec: a marketplace backend (Vast) picks the
@@ -760,11 +775,28 @@ where
                         Some(ProviderErrorKind::Auth) => {
                             (Outcome::Auth(e.to_string()), Some(End::Aborted { name: name.clone(), error: e }))
                         }
+                        // Invalid for this option only (finding #22: one v1 schema 400 on the
+                        // first option left four good ones untried). Once nothing usable is
+                        // left, the run ends as failed — a request every option refuses is the
+                        // spec's fault, not the pools'.
+                        _ if is_rejected(&e) => {
+                            rejected[k] = true;
+                            let outcome = Outcome::Rejected(e.to_string());
+                            if (0..plan.options.len()).all(|j| denied[j] || rejected[j]) {
+                                let error = Error::provider(format!(
+                                    "every option was refused as an invalid request (or not accessible) — last: {e}"
+                                ));
+                                (outcome, Some(End::Failed { name: Some(name.clone()), error }))
+                            } else {
+                                (outcome, None)
+                            }
+                        }
                         _ => (Outcome::Failed(e.to_string()), Some(End::Failed { name: Some(name.clone()), error: e })),
                     },
                 };
-                let next = (k + 1..plan.options.len()).any(|j| !blocked[j] && !denied[j]);
-                on_progress(&Progress::Attempt { name: &name, option, outcome: &outcome, next });
+                let next = (k + 1..plan.options.len()).any(|j| !blocked[j] && !denied[j] && !rejected[j]);
+                let pod = placed.then(|| created.last()).flatten();
+                on_progress(&Progress::Attempt { name: &name, option, index: k, outcome: &outcome, next, pod });
                 log[i].attempts.push(Attempt { option: k, round, at, outcome });
                 if placed {
                     log[i].placed = Some(k);
@@ -798,7 +830,8 @@ where
             _ = tokio::time::sleep(rounds.every) => {}
             _ = interrupt() => break End::Interrupted,
         }
-        match retrying(&policy, || provider.list_pods()).await {
+        // The whole fleet, every backend: a name on a backend that didn't answer isn't free.
+        match retrying(&policy, || crate::provider::list_complete(provider)).await {
             Ok(fleet) => {
                 let names: Vec<String> = pending.iter().map(|&i| log[i].name.clone()).collect();
                 let (keep, dropped) = still_needed(&names, &fleet, topup);
@@ -822,6 +855,13 @@ where
     Placement { log, created, rounds: round, end }
 }
 
+/// Whether a create error means "this option's request is invalid" — skip the option, try
+/// the next ([`Outcome::Rejected`]): RunPod v1's schema 400 ([`ProviderErrorKind::Rejected`])
+/// or a config-level refusal such as v2's 422 "Unknown GPU type" ([`Error::Config`]).
+fn is_rejected(e: &Error) -> bool {
+    matches!(e, Error::Config(_)) || e.kind() == Some(ProviderErrorKind::Rejected)
+}
+
 /// The end-of-run table: each name → where it was created, or why not. Pure.
 pub fn render_summary(plan: &OptionPlan, run: &Placement) -> String {
     let tried = |l: &NameLog| -> String {
@@ -832,6 +872,7 @@ pub fn render_summary(plan: &OptionPlan, run: &Placement) -> String {
                 Outcome::Created { .. } => continue,
                 Outcome::Capacity(_) => "capacity",
                 Outcome::Denied(_) => "no access",
+                Outcome::Rejected(_) => "rejected",
                 Outcome::Auth(_) => "auth failed",
                 Outcome::Failed(_) => "failed",
             };
@@ -848,7 +889,8 @@ pub fn render_summary(plan: &OptionPlan, run: &Placement) -> String {
             .collect::<Vec<_>>()
             .join("; ")
     };
-    let any_denied = run.log.iter().flat_map(|l| &l.attempts).any(|a| matches!(a.outcome, Outcome::Denied(_)));
+    let any_denied =
+        run.log.iter().flat_map(|l| &l.attempts).any(|a| matches!(a.outcome, Outcome::Denied(_) | Outcome::Rejected(_)));
     let rows: Vec<Vec<String>> = run
         .log
         .iter()
@@ -900,6 +942,7 @@ mod tests {
             env: Vec::new(),
             docker_args: None,
             allowed_cuda: Vec::new(),
+            min_cuda: None,
             max_price: None,
             api_extra: None,
         }
@@ -1172,6 +1215,10 @@ note: ~ = preset estimate (no live price for that GPU); --max-price is checked a
         Denied,
         Auth,
         Bad,
+        /// RunPod v1's schema 400 (a GPU its create enum lacks), as the backend classifies it.
+        Schema,
+        /// RunPod v2's 422 "Unknown GPU type" — a config error.
+        Unknown,
     }
 
     /// A provider whose create answers per (gpu, cloud) from a script (then `fallback`), and
@@ -1184,6 +1231,9 @@ note: ~ = preset estimate (no live price for that GPU); --max-price is checked a
         caps: Mutex<Vec<Option<f64>>>,
         fleet: Mutex<Vec<Pod>>,
         list_fails: bool,
+        /// A second backend (Vast) that fails to list while this one answers: the aggregate
+        /// `list_pods` (like the fleet provider's) skips it, `list_by_provider` says so.
+        vast_down: bool,
     }
 
     impl Fake {
@@ -1195,6 +1245,7 @@ note: ~ = preset estimate (no live price for that GPU); --max-price is checked a
                 caps: Default::default(),
                 fleet: Default::default(),
                 list_fails: false,
+                vast_down: false,
             }
         }
         fn script(self, gpu: &str, cloud: &str, replies: &[Reply]) -> Self {
@@ -1221,6 +1272,13 @@ note: ~ = preset estimate (no live price for that GPU); --max-price is checked a
             }
             Ok(self.fleet.lock().unwrap().clone())
         }
+        async fn list_by_provider(&self) -> Vec<(String, Result<Vec<Pod>>)> {
+            let mut out = vec![("runpod".to_string(), self.list_pods().await)];
+            if self.vast_down {
+                out.push(("vast".into(), Err(Error::provider("vast list HTTP 404: {\"error\": \"auth_error\"}"))));
+            }
+            out
+        }
         async fn create_pod(&self, spec: &PodSpec) -> Result<Pod> {
             self.calls.lock().unwrap().push((spec.name.clone(), spec.gpu_type.clone(), spec.cloud_type.clone(), spec.gpu_count));
             self.caps.lock().unwrap().push(spec.max_price);
@@ -1246,6 +1304,13 @@ note: ~ = preset estimate (no live price for that GPU); --max-price is checked a
                 }),
                 Reply::Auth => Err(Error::Provider { kind: ProviderErrorKind::Auth, message: "create pod HTTP 401".into() }),
                 Reply::Bad => Err(Error::provider("create pod HTTP 400: bad image")),
+                Reply::Schema => Err(Error::provider_http(
+                    reqwest::StatusCode::BAD_REQUEST,
+                    &serde_json::json!([{"error": "At #/paths/pods/post …, it does not meet the schema requirements of the specification. Suggestion: …",
+                                         "problems": ["At /pods/properties/gpuTypeIds/items: value must be one of …"]}]),
+                    "create pod",
+                )),
+                Reply::Unknown => Err(Error::Config("create pod HTTP 422: {\"detail\":\"Unknown GPU type: NVIDIA X\"}".into())),
             }
         }
         async fn stop_pod(&self, _id: &str) -> Result<()> {
@@ -1423,6 +1488,43 @@ note: ~ = preset estimate (no live price for that GPU); --max-price is checked a
         assert_eq!(fake.calls().len(), 1);
     }
 
+    /// Finding #22: a per-option 400 (v1's schema refusal of a GPU its enum lacks, v2's 422
+    /// "Unknown GPU type") skips that option — for the rest of the run — instead of stopping
+    /// with the other options untried; once every option is refused the run fails.
+    #[tokio::test(start_paused = true)]
+    async fn an_option_the_api_rejects_is_skipped_not_fatal() {
+        for bad in [Reply::Schema, Reply::Unknown] {
+            let fake = Fake::new(Reply::Ok).script(A4000, "COMMUNITY", &[bad, bad, bad]);
+            let (out, lines) = run(&fake, &three(), &["arena8-apple", "arena8-bloom"], ONE_ROUND, None).await;
+            assert!(matches!(out.end, End::Filled), "{bad:?}: {:?}", out.end);
+            assert_eq!(
+                fake.calls(),
+                [
+                    call("arena8-apple", A4000, "COMMUNITY"),
+                    call("arena8-apple", R3090, "COMMUNITY"),
+                    call("arena8-bloom", R3090, "COMMUNITY"), // the rejected option isn't tried again
+                ],
+                "{bad:?}"
+            );
+            assert!(lines[0].starts_with("[rejected] arena8-apple on 1×RTX A4000 COMMUNITY: "), "{}", lines[0]);
+            assert!(lines[0].ends_with("— skipping this option, trying the next"), "{}", lines[0]);
+            let summary = render_summary(&three(), &out);
+            assert!(summary.contains("(after 1×RTX A4000 COMMUNITY: rejected)"), "{summary}");
+        }
+        // Every option refused: the run fails, naming the last refusal — never a hang or a retry.
+        let fake = Fake::new(Reply::Schema);
+        let rounds = Rounds { window: Duration::from_secs(600), every: Duration::from_secs(60) };
+        let (out, _) = run(&fake, &three(), &["arena8-apple"], rounds, None).await;
+        match &out.end {
+            End::Failed { name: Some(n), error } => {
+                assert_eq!(n, "arena8-apple");
+                assert!(error.to_string().contains("every option was refused") && error.to_string().contains("problems:"), "{error}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(fake.calls().len(), 3, "each option once");
+    }
+
     #[tokio::test]
     async fn no_option_to_try_ends_at_once_even_with_a_retry_window() {
         let empty = plan_options(&req(&[A4000], &["COMMUNITY"], 1, Some(0.01), Order::Cheapest), "runpod", &book());
@@ -1584,6 +1686,24 @@ note: ~ = preset estimate (no live price for that GPU); --max-price is checked a
         let summary = render_summary(&three(), &out);
         assert!(summary.contains("arena8-apple  not placed (tried: "), "{summary}");
         assert!(summary.contains("arena8-bloom  not placed (every option ran out of capacity before its turn)"), "{summary}");
+    }
+
+    /// Finding #9: a retry round re-plans from a listing — with one backend not answering,
+    /// a name held there would read as free. The round must not run.
+    #[tokio::test(start_paused = true)]
+    async fn a_relist_missing_a_provider_ends_the_run_instead_of_risking_a_duplicate() {
+        let mut fake = Fake::new(Reply::Capacity);
+        fake.vast_down = true;
+        let rounds = Rounds { window: Duration::from_secs(600), every: Duration::from_secs(60) };
+        let (out, _) = run(&fake, &three(), &["arena8-apple"], rounds, None).await;
+        match &out.end {
+            End::Failed { name: None, error } => {
+                let e = error.to_string();
+                assert!(e.contains("vast failed to list") && e.contains("refusing to create"), "{e}");
+            }
+            other => panic!("expected the partial relist to end the run, got {other:?}"),
+        }
+        assert_eq!(fake.calls().len(), 3, "only round 1 ran");
     }
 
     #[tokio::test(start_paused = true)]
