@@ -285,8 +285,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     nothing was created at all). A pod that fails is left running — one is only ever
     terminated by `--check`. Without a proxy layout, a READY pod's `~/.ssh/config` fleet map
     is rewritten at the end if pods came up after it.
-    **`--check`** deep-checks each pod after setup (`pods test --deep`). A FAIL is a bad
-    host: the pod is terminated, confirmed gone from its own provider's listing (never two
+    **`--check`** deep-checks each pod after setup (`pods test --deep`). A FAIL on the host
+    (driver, CUDA, device count, a GPU's tensor op, peer copies, NCCL) is a bad machine: the
+    pod is terminated, confirmed gone from its own provider's listing (never two
     pods per name), and the name recreated from the same `--gpu/--cloud/--max-price` options
     (or the one configured spec) — options that haven't failed first, waiting for capacity
     per `--retry-mins` or `--keep-trying` — and run through the pipeline again; a replacement
@@ -295,7 +296,15 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     (default 2); the last pod that FAILed its check is left running for a look. Only a check
     whose script ran can condemn a host: one that couldn't run (SSH dropped, timed out) is
     rerun once SSH answers, and if it still can't run the name FAILs with the pod left
-    running. A WARN counts as ready (shown in HEALTH). **Ctrl+C** stops every pipeline where
+    running. A FAIL that is only **software/setup** — as the facts show it: no python, python
+    reporting that `import torch` fails, a CPU-only torch (`+cpu`, no CUDA in it) on a GPU pod
+    — is never replaced — a new pod boots the same image and runs the same setup, so it
+    would fail the same way: the name FAILs at once (`FAILED check — software/setup failure,
+    not the host — …`), the pod is left running and its machine isn't counted as bad
+    (`pods test --deep` says the same under its table). Python dying before it could report
+    (killed by its 75 s timeout or the OOM killer, SIGILL on an old CPU, a segfault, output
+    cut off) is a host failure, replaced as before. A WARN counts as ready (shown in
+    HEALTH). **Ctrl+C** stops every pipeline where
     it is, starts nothing new, terminates nothing, and reports — also when pressed during
     the create's retry wait (the pipelines then start stopped).
     So `pods up -n 28 --gpu A40 --cloud SECURE --disk 200 --retry-mins 60 --check` is a full
@@ -385,13 +394,39 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `--no-pull` = git only; `--message` overrides the commit message. Confirms first
     (`--dry-run` previews both). Each pod's git push has a 5-min budget, its rsync the
     `pull` budgets below. To stage onto a dated autocommit branch, run `pods init-branches`
-    first.
+    first. Two things never go into the commits, because each once kept participants' work
+    off GitHub: **files over 95 MB** (GitHub refuses the push, and every later one — GH001)
+    are left out (never staged, so no blob is written), stay on disk and are reported per pod
+    (`skipped N file(s) > 95 MB: … covered by the rsync big tier`); a branch whose unpushed
+    commits already carry a file over GitHub's own 100 MiB limit fails with the exact fix
+    (`arena pods run -t <pod> 'git -C <repo> reset -q <sha>'` — keeps every file on disk; the
+    next backup re-commits the work without it), never the same opaque rejection every tick (a
+    95–100 MB file committed by hand is one GitHub takes: it's pushed). And **nested repos are
+    never committed as gitlinks** (a commit id without its files): the image's nested clones
+    (no commits of their own) are **adopted** once per checkout — the course repo tracks their
+    files where they are (listed in `.git/arena-nested`), so work inside them is committed like
+    everything else, while each clone keeps its own `.git` untouched: git run inside an
+    exercise still works on that clone alone (never on the whole course repo), and its stashes,
+    branches and reflog stay in it, backed up by the rsync tiers like every `.git` (and carried
+    by `pods replace`). Nothing on disk changes; to undo, `git rm -r -q --cached <dir>` and
+    delete its line from `.git/arena-nested`. A nested repo with its own history (a
+    participant's project), or one cloned after that, is left exactly as it is, kept out of
+    the commit (a managed block in `.git/info/exclude`) and reported every run (the rsync tiers
+    have it). A gitlink an earlier backup committed is replaced by the files. A file over the
+    limit staged by hand (`git add`) is taken back out of the index the same way. The script
+    runs under `sh` whatever the login shell; `--dry-run` prints each pod's line — `ssh …
+    'sh -s <exact arguments>' < arena-backup.sh` — and, once, the here-doc that writes
+    `arena-backup.sh`: paste that first and every line runs as the backup would (without it the
+    shell refuses to start, never a silent no-op).
   - `pods set-branch <branch> <targets|--all> [--hard]` — switch pods' ARENA checkout to a
     branch. Gentle by default (fetch + checkout + ff-only pull — fails on a diverged/dirty
     tree rather than clobbering work). **`--hard` is destructive**: force the branch to
     match `origin/<branch>`, discarding local commits/changes (untracked files survive) —
     e.g. `set-branch main --all --hard` resets the fleet to `main`. Confirms first;
-    `--dry-run` previews. Pods switch concurrently, 2-min budget each.
+    `--dry-run` previews. Pods switch concurrently, 2-min budget each. A nested clone the
+    backup adopted (see `pods backup`) is tracked only on the autocommit branches, so a
+    switch to `main` would delete it from disk and break that exercise: it is put back from
+    the previous HEAD, **staged** (so switching back goes through), and named per pod.
   - `pods init-branches` — create each pod's `autocommit-…-wNdM-…` branch and push it
     upstream **without committing** (legacy `init_branches`), so a new day's branch
     exists before `backup` runs. `--week`/`--day` override; `--dry-run` previews. 2-min
@@ -401,8 +436,11 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     each pod gets `--timeout`, default 1800s = 30 min — flags go *before* the command: a bare
     `-t`/`--exclude`/`--on`/`--gpus`/`--dry-run` after it is refused rather than run on every
     pod, so quote a command that takes one, `run 'tmux kill-session -t lab'`; on a timeout the local ssh is killed, and the remote
-    command dies at its next write to the closed connection) / the read-only
-    torch-version health check (90s per pod).
+    command dies at its next write to the closed connection; a pod whose command fails
+    shows what it printed on stdout too, then `exit N: <stderr>` — never `Some(N)`) / the
+    read-only torch-version health check (90s per pod). Every dry run's `ssh`/`scp`/`rsync`
+    line is shell-quoted, so it pastes as exactly what would run (globs like `'**/.git/**'`
+    don't expand).
   - `pods run --background [-t <targets>] <cmd>` / `pods jobs [targets] [JOB] [--kill JOB]` /
     `pods logs [targets] [JOB] [-n N] [-f]` — **detached course-test runs**. `--background`
     (confirms first; `--dry-run` shows the wrapper) starts the command on each pod with
@@ -535,13 +573,33 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     terminate <name>` (the id when a name is shared). Anything unreadable (no reply, a scan
     that timed out, `[N/A]` GPU, our own connection not found, more than 2000 sockets so not
     every connection was read) makes a pod `?`, never a candidate. Not seen: sessions through RunPod's `ssh.runpod.io` proxy (not via sshd).
-  - `pods pull [label]` — the **file** backup (complementing the git `backup`): rsyncs
-    each pod's home into `<dir>/<label>/<pod>/`, reporting files/bytes moved per pod.
-    **Keeps `.git`** (so the backup is a usable repo; `--no-git` to skip), size-caps with
-    `--max-size`, excludes other dotfile dirs + `site-packages`. Knobs come from flags
+  - `pods pull [targets] [--label <label>]` — the **file** backup (complementing the git
+    `backup`): rsyncs each pod's home into `<dir>/<label>/<pod>/`, reporting per pod what was
+    sent and what the snapshot holds (`12 files, 3.4M sent of 6754, 1.8G` — sizes parsed in
+    every format rsync prints). Targets are positional like every command's (the old `-t`
+    still works, and so does `pods pull w1d3` — read as the label, with a note — when `w1d3`
+    names no pod). **Keeps `.git`, complete** (`--no-git` to skip): the size cap
+    (`--max-size`) applies to the files, then a second pass copies every kept `.git` uncapped
+    — a repo's big pack used to be dropped, leaving refs to missing objects — and the empty
+    dirs inside a `.git` (`refs/heads/` once refs are packed) are kept, so each snapshot (and
+    `big/`) is a repo git reads. Excludes other dotfile dirs + `site-packages`. **Hard-linked
+    snapshots**: each dated snapshot is still a complete tree (restore/pull layout unchanged),
+    but files unchanged since this pod's previous snapshot, or identical to the week's **fleet
+    baseline** (`pods baseline`), are hard links (`rsync --link-dest`, absolute paths, same
+    filesystem — all under `<dir>`), not copies: a day's snapshot costs only what changed, a
+    new or replaced pod's first one only what isn't the image's. A linked file is one inode in
+    every snapshot sharing it, so a pull into a label that already has files (the */15 cron
+    pulls into the day's label all day) never changes an existing file's mode or owner in
+    place (`--no-perms --no-owner --no-group`): a `chmod` on the pod used to rewrite the mode in
+    every earlier snapshot (and, through the baseline, other pods'); now a mode-only change
+    made after the day's first pull shows from the next label on, and earlier snapshots stay
+    exactly as they were (a changed file is always a new file). The run ends with each
+    snapshot's real cost (`1.8G in 6754 files, 12.0M of it new on disk`); `du -sh <dir>/*` in
+    one invocation counts a hard-linked file once. Knobs come from flags
     else config: `LOCAL_BACKUP_DIR` (`--dir`), `BACKUP_MAX_SIZE` (`--max-size`),
     `BACKUP_REMOTE_PATH` (`--remote-path`, default `~/`). Label defaults to the `wNdM`
-    iteration. Confirms first; `--dry-run` prints the exact rsync commands. **Bounded**: rsync
+    iteration (`big`/`baseline` are refused). Confirms first; `--dry-run` prints the exact
+    rsync commands, shell-quoted. **Bounded**: rsync
     `--timeout=300` (gives up after 5 min without any I/O) and a wall-clock budget per pod,
     `BACKUP_TIMEOUT_SECS` (default 7200 = 2 h, max a day; settable from the environment) —
     a pod that runs out is stopped (SIGTERM, so rsync takes its ssh and receiver down too;
@@ -623,6 +681,25 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
       unless `--discard-stopped`. `migrate copy` of a **locked** original is allowed (it only
       reads it) with a note; cutover / replace / finish refuse a locked pod with the unlock
       command — nothing here ever unlocks.
+  - `pods baseline <pod> [--week N] [--dir] [--replace] [--dry-run]` — capture the week's
+    **fleet baseline** into `<dir>/baseline/w<N>/fleet/`: the image's own files, which every
+    pod's snapshots hard-link to (see `pods pull`). Run it once a week (or after an image
+    change) on a pod `up` just made — its container must say when it was created and be under
+    a day old, else it's refused. It rsyncs the pod's home with the snapshot tier's filters
+    (linked to last week's baseline), then **keeps only the files older than the container**:
+    a hard link is made on equal size + mtime + permissions, contents are never compared, so a
+    file written at setup or later (`~/.name`, the API keys in `.bashrc`, a script's output on
+    several pods in one second) could otherwise stand in for another pod's different file.
+    Nor any file **copied onto the pod since** with an older mtime kept — a `pods replace`/
+    `migrate` copy of another pod's home (`rsync -a`), a `pods restore`, an archive setup
+    unpacked: the pod lists them first (`find` for a ctime after the container's creation with
+    an mtime before it — an image file's ctime is its layer's unpacking), and they're left out
+    too, so even a replaced pod gives a clean baseline; a listing that fails or is cut short
+    refuses the capture. A repo on the `/workspace` volume is left out (a volume can hold work
+    older than the container). Captured into a partial dir and moved into place only when complete; an
+    existing baseline needs `--replace`, which moves it aside (`fleet.replaced-<time>/`) —
+    nothing is deleted. Chosen over an automatic "first snapshot of the week": a pod in use
+    can hold work with pre-container mtimes, so which pod is pristine is the operator's call.
   - `pods restore <pod> [--from <label>|big] [--path <subdir>] [--dir] [--timeout]
     [--overwrite-newer] [--with-git] [--dry-run]` — push a backup (pull's layout) back onto
     **one** pod over its direct endpoint: by default its newest `wNdM` snapshot (files under
@@ -637,8 +714,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     onto the volume (a plain push would replace the link with a directory on the container
     disk). Never pushes `~/.ssh`, the shell rc files/histories (they hold the pod's own API
     keys), `~/.name` or `.claude*`; never chowns the home; never pushes `.git` from a snapshot
-    (it can lack git packs over the size cap — refs to missing objects break the repo;
-    `--with-git` to push it anyway, or `--from big`). After a restore that pushed the repo's
+    by default (a snapshot pulled before `.git` got its own uncapped pass can lack git packs
+    over the size cap — refs to missing objects break the repo; `--with-git` to push it, or
+    `--from big`). After a restore that pushed the repo's
     `.git`, the repo is checked (`git fsck --connectivity-only`, 120s) and a broken one fails
     the command, saying where the replaced files are. Refuses before touching the pod when
     the backup doesn't exist or is empty, or `--path` isn't in it. Confirms first with
@@ -729,6 +807,15 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     its ssh transport; SIGKILL 2s later). Connection refusals right after create are still
     retried for ~150s (sshd booting); an auth failure (`Permission denied (publickey)`)
     fails at once.
+    **Hetzner (bare VM):** the embedded `hetzner_setup.sh` builds the ARENA env with uv on
+    **Python 3.13** (the repo's `requires-python` lower bound when newer; `ARENA_PYTHON`
+    overrides) with CPU substitutions by pattern, not by exact upstream line (`jax[cuda…]` →
+    `jax[cpu]`, bitsandbytes and `nvidia-*cuNN` wheels dropped, CUDA indexes and `+cuNNN`
+    pins dropped, `uv pip install --torch-backend cpu`). It **fails loudly**: any failed
+    package/venv/install step, or a venv whose python can't `import torch, transformer_lens`
+    afterwards, exits non-zero with the reason as its last line (`FAILED: …`) — a VM is never
+    reported set up without a working env. Re-runs skip the install only when that import
+    gate already passes.
     **VS Code warm-up** (last step, on every provider, `up`/`restart`/`replace` included):
     pre-installs what a participant's first Remote-SSH connect would otherwise download on
     the pod — the latest stable VS Code server for the pod's CPU (x64/arm64, resolved from
@@ -931,7 +1018,8 @@ old spelling of a target (`stop --all --include X` keeps meaning "only X").
 | `run` | `-t <targets>` (the command is positional) | every pod | parallel |
 | `test`, `test --deep` | positional | every pod | parallel |
 | `setup`, `copy-keys`, `backup`, `init-branches` | positional | every pod | parallel |
-| `cp`, `pull` | `-t <targets>` (file/label are positional) | every pod | parallel |
+| `cp` | `-t <targets>` (file/dest are positional) | every pod | parallel |
+| `pull` | positional (the label is `--label`; the old `-t`, and a lone `wNdM` that names no pod, still work) | every pod | parallel |
 | `set-branch <branch>` | positional after the branch | **refused** (targets or `--all`) | parallel |
 | `stop`, `reimage` | positional | **refused** (targets or `--all`) | serial (provider API) |
 | `keys gen/rotate/revoke` | positional (pods *or* list names) | **refused** (`--all` = current pods) | serial |

@@ -416,7 +416,7 @@ fn describe_failure(code: Option<i32>, stderr: &str) -> String {
         };
         format!("ssh connect failed: {stderr}{hint}")
     } else {
-        format!("probe exit {code:?}: {stderr}")
+        format!("probe {}: {stderr}", crate::ssh::exit_label(code))
     }
 }
 
@@ -437,7 +437,7 @@ mod tests {
     #[test]
     fn non_ssh_exit_is_not_relabeled_as_ssh() {
         let e = describe_failure(Some(1), "boom");
-        assert!(e.starts_with("probe exit Some(1)"));
+        assert_eq!(e, "probe exit 1: boom");
     }
 
     #[test]

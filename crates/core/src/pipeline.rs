@@ -6,8 +6,9 @@
 //! fleet up as independent pipelines, never as a batch": one slow pod never gates the
 //! others, and the per-pod line is the honest progress report.
 //!
-//! With `--check` a pod that FAILs the deep check is on a bad host ("it will not fix
-//! itself"): it is terminated and its name recreated from the confirmed placement options —
+//! With `--check` a pod that FAILs the deep check on its host ([`crate::health::FailureKind`])
+//! is on a bad machine ("it will not fix itself"): it is terminated and its name recreated
+//! from the confirmed placement options —
 //! the ones that haven't failed first ([`replacement_order`]) — and a replacement that lands
 //! on a host that already failed is rejected ([`on_failed_host`]: "same IP → same machine,
 //! the rebuild fixed nothing"). Bounded by `--check-attempts` placements per name.

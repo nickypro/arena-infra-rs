@@ -115,6 +115,11 @@ impl<'a> Naming<'a> {
         self.list.iter().position(|e| qualify(self.prefix, e) == want)
     }
 
+    /// Does `token` name a `MACHINE_NAME_LIST` entry (bare, full or absolute)?
+    pub fn names_list_entry(&self, token: &str) -> bool {
+        self.slot_of_token(token).is_some()
+    }
+
     /// The `MACHINE_NAME_LIST` slot of a pod name, if it holds one.
     fn slot_of_name(&self, name: &str) -> Option<usize> {
         self.list.iter().position(|e| qualify(self.prefix, e) == name)

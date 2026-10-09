@@ -25,10 +25,11 @@
 //! - `.ssh/`, the shell rc files and histories, `~/.name` and `.claude*` are not pushed: keys,
 //!   the per-pod API keys in the rc files, the machine name and Claude Code state belong to the
 //!   pod (setup / copy-keys write them) — the same line `pods replace`'s copy draws;
-//! - from a snapshot tier, `.git/` dirs aren't pushed (unless `--with-git`): the tier drops
-//!   files over its size cap, a git pack among them, and refs pointing at objects that never
-//!   arrived break the repo. The big tier carries every file; after any restore that pushed a
-//!   repo's `.git`, the CLI checks the repo still reads ([`git_check_command`]);
+//! - from a snapshot tier, `.git/` dirs aren't pushed (unless `--with-git`): a snapshot pulled
+//!   before `.git` got its own uncapped pass (`pull::PullConfig::passes`) can lack a git pack
+//!   over the size cap, and refs pointing at objects that never arrived break the repo. The big
+//!   tier carries every file; after any restore that pushed a repo's `.git`, the CLI checks the
+//!   repo still reads ([`git_check_command`]);
 //! - `--timeout=300`: a transfer that goes silent gives up (the CLI bounds the whole run too).
 
 use std::path::{Path, PathBuf};
@@ -313,7 +314,7 @@ pub fn restore_args(target: &SshTarget, src: &Path, subpath: Option<&str>, flags
         a.push("--update".into());
     }
     a.push(format!("--timeout={IO_TIMEOUT_SECS}"));
-    a.push("--human-readable".into());
+    // No `--human-readable`: the stats' sizes are parsed (`pull::parse_rsync_stats`).
     a.push("--stats".into());
     a.push("--info=skip1".into());
     for ex in EXCLUDES {

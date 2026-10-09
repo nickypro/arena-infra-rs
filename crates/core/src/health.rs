@@ -213,6 +213,11 @@ impl DeepFacts {
         self.smi_gpus.or_else(|| (!self.gpus.is_empty()).then_some(self.gpus.len() as u32))
     }
 
+    /// torch imported, built without CUDA (`torch.version.cuda` is None: `torch_cuda=none`).
+    fn cpu_only_torch(&self) -> bool {
+        self.torch.as_deref() == Some("ok") && self.torch_cuda.as_deref() == Some("none")
+    }
+
     /// Why python facts may be missing: the step timed out / crashed / was cut off.
     fn python_cut(&self) -> String {
         match self.py_exit {
@@ -528,6 +533,59 @@ impl Check {
     }
 }
 
+/// What a failed check says is broken — which decides whether `up --check` replaces the pod.
+/// A fresh pod lands on another machine but boots the **same image** and runs the **same
+/// setup**: it cures a bad host, never a bad image. Replacing a pod whose venv can't `import
+/// torch` (live: a Hetzner VM whose install had failed) only bills a second pod to fail the
+/// same way, and counts a good machine as bad.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FailureKind {
+    /// The machine: no driver / `nvidia-smi`, a driver below the floor, CUDA unavailable, the
+    /// wrong device count, a failing tensor op, broken peer copies or NCCL — and python dying
+    /// before it could say anything (timed out, OOM-killed, crashed). Another host may well pass.
+    Host,
+    /// The software on it (image or setup), as the facts show it: no python, `import torch`
+    /// failing (python said so), a CPU-only torch on a GPU pod, the check script itself not
+    /// running. A new pod from the same image fails the same way.
+    Software,
+}
+
+impl FailureKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            FailureKind::Host => "host",
+            FailureKind::Software => "software/setup",
+        }
+    }
+}
+
+/// The kind of failure a FAILed check named `name` reports ([`FailureKind`]), from the facts it
+/// was judged by. `Software` only where those facts put it on the image/setup:
+/// - `script`: the check script never started.
+/// - `torch`: python said so itself — no python on PATH, or `import torch` raised. When python
+///   never got to say (killed by its timeout or the OOM killer, a crash — SIGILL on a CPU
+///   without the instructions torch was built for, a segfault — or its output cut off), the
+///   machine is as likely as the image: `Host`, replaced like any bad host.
+/// - `cuda`: torch imported but is a CPU-only build (`torch.version.cuda` is None) — on a GPU
+///   pod every pod from that image fails the same way.
+///
+/// Everything else — the GPU/driver/CUDA checks, and any check this function doesn't know (a new
+/// one keeps the old "a FAIL is a bad host" meaning) — is `Host`.
+pub fn failure_kind_of(name: &str, facts: Option<&DeepFacts>) -> FailureKind {
+    let software = match (name, facts) {
+        ("script", _) => true,
+        ("torch", Some(f)) => f.python.as_deref() == Some("missing") || f.torch.as_deref().is_some_and(|t| t != "ok"),
+        ("cuda", Some(f)) => f.cpu_only_torch(),
+        _ => false,
+    };
+    if software {
+        FailureKind::Software
+    } else {
+        FailureKind::Host
+    }
+}
+
 /// The pod's verdict from its checks (see [`Status`]).
 pub fn overall(checks: &[Check]) -> Status {
     if checks.iter().any(|c| c.status == Status::Fail) {
@@ -624,6 +682,14 @@ fn evaluate_as(f: &DeepFacts, p: &HealthPolicy, maintenance: Option<&Maintenance
         out.push(match f.cuda_available {
             _ if !torch_ok => Check::new("cuda", Skip, "needs torch"),
             Some(true) => Check::new("cuda", Pass, "available"),
+            Some(false) if f.cpu_only_torch() => Check::new(
+                "cuda",
+                Fail,
+                format!(
+                    "torch {} is a CPU-only build (no CUDA in it) — the image/setup installed the wrong torch",
+                    f.torch_version.as_deref().unwrap_or("?")
+                ),
+            ),
             Some(false) => Check::new(
                 "cuda",
                 Fail,
@@ -975,6 +1041,18 @@ impl PodHealth {
         }
     }
 
+    /// What its failures say is broken: `Host` as soon as one failed check is about the
+    /// machine, `Software` when every one is about the image/setup ([`failure_kind_of`]),
+    /// `None` when nothing failed. A pod that couldn't be checked at all (`ssh`) is `Host` here
+    /// — `up --check` never judges such a pod by its checks (it re-runs the check instead).
+    pub fn failure_kind(&self) -> Option<FailureKind> {
+        let facts = self.facts.as_ref();
+        let mut kinds =
+            self.checks.iter().filter(|c| c.status == Status::Fail).map(|c| failure_kind_of(&c.name, facts)).peekable();
+        kinds.peek()?;
+        Some(if kinds.any(|k| k == FailureKind::Host) { FailureKind::Host } else { FailureKind::Software })
+    }
+
     /// The NOTES column: failures first, then warnings, as `check: detail`.
     pub fn notes(&self) -> String {
         let pick = |s: Status| self.checks.iter().filter(move |c| c.status == s);
@@ -998,7 +1076,7 @@ pub fn judge_deep_call(pod: &Pod, call: std::result::Result<SshOutput, String>, 
             let stderr = out.stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
             if !facts.started && !out.success {
                 // ssh itself failed (255 = refused/auth/…): say that, not "no output".
-                PodHealth::unreachable(pod, format!("exit {:?}: {stderr}", out.code))
+                PodHealth::unreachable(pod, format!("{}: {stderr}", out.exit_label()))
             } else {
                 let started = facts.started;
                 let mut health = PodHealth::checked(pod, facts, policy);
@@ -1055,7 +1133,9 @@ pub fn render_checks(h: &PodHealth) -> String {
 /// right back on it. Sorted by IP; names keep the input order.
 pub fn same_host_failures(results: &[PodHealth]) -> Vec<(String, Vec<String>)> {
     let mut by_ip: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    for h in results.iter().filter(|h| h.status == Status::Fail) {
+    // Only a failure about the machine says anything about the host: two pods of one image
+    // failing `import torch` on a shared IP is the image, not that host.
+    for h in results.iter().filter(|h| h.status == Status::Fail && h.failure_kind() == Some(FailureKind::Host)) {
         if let Some(ip) = h.host.as_deref().filter(|ip| !ip.is_empty()) {
             by_ip.entry(ip).or_default().push(h.name.clone());
         }
@@ -1063,7 +1143,8 @@ pub fn same_host_failures(results: &[PodHealth]) -> Vec<(String, Vec<String>)> {
     by_ip.into_iter().filter(|(_, names)| names.len() >= 2).map(|(ip, names)| (ip.to_string(), names)).collect()
 }
 
-/// The lines under the table: the tally, then one `same host?` line per shared-IP group.
+/// The lines under the table: the tally, one `same host?` line per shared-IP group of host
+/// failures, then the pods whose failures are all software/setup ([`FailureKind`]).
 pub fn render_summary(results: &[PodHealth]) -> Vec<String> {
     let count = |s: Status| results.iter().filter(|h| h.status == s).count();
     let mut lines = vec![format!(
@@ -1078,6 +1159,18 @@ pub fn render_summary(results: &[PodHealth]) -> Vec<String> {
              a different GPU type draws a different host.",
             names.len(),
             names.join(", ")
+        ));
+    }
+    let software: Vec<&str> = results
+        .iter()
+        .filter(|h| h.failure_kind() == Some(FailureKind::Software))
+        .map(|h| h.name.as_str())
+        .collect();
+    if !software.is_empty() {
+        lines.push(format!(
+            "software/setup failure, not the host: {} — a new pod from the same image fails the same way \
+             (re-run `arena pods setup`, or fix the image), so replacing it won't help.",
+            software.join(", ")
         ));
     }
     lines
@@ -1416,6 +1509,33 @@ deep_check_end=1
             &without(HEALTHY_2GPU, &["torch", "cuda_", "device_count", "tensor.", "peer.", "nccl", "py_"]),
             &[("python", Some("missing"))],
         );
+        // python gone before `import torch` could report (no torch line at all): killed by its
+        // 75s timeout (124) or the OOM killer (137), SIGILL (132), a segfault (139), cut off.
+        let py_died = |code: &str, stderr: &str| {
+            edit(
+                &without(HEALTHY_2GPU, &["torch", "cuda_", "device_count", "tensor.", "peer.", "nccl", "py_done"]),
+                &[("py_exit", Some(code)), ("py_stderr", Some(stderr))],
+            )
+        };
+        let (py_timeout_early, py_oom, py_sigill, py_segv, py_cut) = (
+            py_died("124", ""),
+            py_died("137", ""),
+            py_died("132", "Illegal instruction (core dumped)"),
+            py_died("139", "Segmentation fault (core dumped)"),
+            py_died("0", ""),
+        );
+        // A CPU-only torch on a GPU pod (the wrong wheel in the image/setup): with or without the
+        // error `torch.cuda.init()` raises.
+        let cpu_torch = edit(
+            &without(HEALTHY_2GPU, &["device_count", "tensor.", "peer.", "nccl"]),
+            &[
+                ("torch_version", Some("2.9.0+cpu")),
+                ("torch_cuda", Some("none")),
+                ("cuda_available", Some("false")),
+                ("cuda_error", Some("error: AssertionError: Torch not compiled with CUDA enabled")),
+            ],
+        );
+        let cpu_torch_quiet = edit(&cpu_torch, &[("cuda_error", None)]);
         let smi_missing = edit(
             &without(HEALTHY_2GPU, &["smi_", "gpu.", "tensor.", "peer.", "nccl"]),
             &[
@@ -1456,6 +1576,11 @@ deep_check_end=1
             ("torch missing: cuda unknown", &torch_missing, "cuda", Skip, "needs torch"),
             ("torch missing: nccl unknown", &torch_missing, "nccl", Skip, "needs CUDA"),
             ("no python", &no_python, "torch", Fail, "no python on PATH"),
+            ("python timed out before torch", &py_timeout_early, "torch", Fail, "python checks timed out"),
+            ("python SIGILL", &py_sigill, "torch", Fail, "python exited 132: Illegal instruction"),
+            ("python output cut", &py_cut, "torch", Fail, "python output cut off"),
+            ("cpu-only torch", &cpu_torch, "cuda", Fail, "torch 2.9.0+cpu is a CPU-only build"),
+            ("cpu-only torch, no error", &cpu_torch_quiet, "cuda", Fail, "CPU-only build"),
             ("nvidia-smi missing", &smi_missing, "nvidia-smi", Fail, "not found"),
             ("nvidia-smi missing: driver", &smi_missing, "driver", Skip, "needs nvidia-smi"),
             ("nvidia-smi missing: cuda", &smi_missing, "cuda", Fail, "Found no NVIDIA driver"),
@@ -1490,6 +1615,77 @@ deep_check_end=1
             "RuntimeError: The NVIDIA driver on your system is too old (found version 12020)."
         );
         assert!(parse_deep(&cuinit_999).cuda_error.unwrap().contains("Did you run some cuda functions"));
+
+        // What each failure says is broken: `up --check` replaces a pod only for its machine — a
+        // new pod from the same image can't fix a missing torch (live: a Hetzner VM whose
+        // install failed was recreated, and failed the same way).
+        use FailureKind::{Host, Software};
+        let kinds: &[(&str, &str, &str, FailureKind)] = &[
+            ("cuInit 999", &cuinit_999, "runpod", Host),
+            ("unknown error on gpu1", &unknown_error, "runpod", Host),
+            ("insufficient driver", &insufficient, "runpod", Host),
+            ("peer copy wrong", &peer_mismatch, "runpod", Host),
+            ("old driver", &old_driver, "runpod", Host),
+            ("nccl timeout", &nccl_timeout, "runpod", Host),
+            ("nccl error", &nccl_error, "runpod", Host),
+            ("nvidia-smi missing", &smi_missing, "runpod", Host),
+            ("nvidia-smi error", &smi_error, "runpod", Host),
+            ("nvidia-smi query error", &smi_query_error, "vast", Host),
+            ("device_count mismatch", &count_mismatch, "runpod", Host),
+            ("python timed out mid-GPU", &py_timeout, "runpod", Host),
+            ("torch missing", &torch_missing, "runpod", Software),
+            ("torch missing on a CPU VM", &torch_missing, "hetzner", Software),
+            ("no python", &no_python, "runpod", Software),
+            ("no python on a CPU VM", &no_python, "hetzner", Software),
+            // python never said: the machine as likely as the image — replaced, as before.
+            ("python timed out before torch", &py_timeout_early, "runpod", Host),
+            ("python OOM-killed", &py_oom, "runpod", Host),
+            ("python SIGILL (old CPU)", &py_sigill, "runpod", Host),
+            ("python segfault", &py_segv, "runpod", Host),
+            ("python output cut off", &py_cut, "runpod", Host),
+            ("python timed out on a CPU VM", &py_timeout_early, "hetzner", Host),
+            // A CPU-only torch on a GPU pod: the image's, not the host's.
+            ("cpu-only torch", &cpu_torch, "runpod", Software),
+            ("cpu-only torch, no error", &cpu_torch_quiet, "vast", Software),
+        ];
+        for (label, out, provider, kind) in kinds {
+            let p = Pod { provider: provider.to_string(), ..pod("apple", "1.2.3.4") };
+            let h = PodHealth::checked(&p, parse_deep(out), &cuda13());
+            assert_eq!(h.failure_kind(), Some(*kind), "{label}: {:?}", h.checks);
+        }
+        // A host failure next to a software one is still a host failure (it may be the cause).
+        let both = edit(&smi_missing, &[("torch", Some("error: ImportError: libcuda.so.1: cannot open shared object file"))]);
+        assert_eq!(PodHealth::checked(&pod("apple", "1.2.3.4"), parse_deep(&both), &cuda13()).failure_kind(), Some(Host));
+        assert_eq!(PodHealth::checked(&pod("apple", "1.2.3.4"), parse_deep(HEALTHY_2GPU), &cuda13()).failure_kind(), None);
+        assert_eq!(PodHealth::unreachable(&pod("apple", "1.2.3.4"), "timed out").failure_kind(), Some(Host));
+        // Unknown check names keep the old meaning of a FAIL (the machine).
+        assert_eq!(failure_kind_of("some_future_check", Some(&parse_deep(&torch_missing))), Host);
+    }
+
+    #[test]
+    fn software_failures_are_summarised_apart_and_never_group_a_host() {
+        let torch_missing = edit(
+            &without(HEALTHY_2GPU, &["torch_", "cuda_", "device_count", "tensor.", "peer.", "nccl"]),
+            &[("torch", Some("error: ModuleNotFoundError: No module named 'torch'"))],
+        );
+        let sick = |name: &str| PodHealth::checked(&pod(name, "1.2.3.4"), parse_deep(&torch_missing), &cuda13());
+        // Two pods of one image failing `import torch` on one IP: the image, not that host.
+        let results = vec![sick("apple"), sick("bloom")];
+        assert!(same_host_failures(&results).is_empty());
+        let lines = render_summary(&results);
+        assert_eq!(lines[0], "0 pass, 0 warn, 2 fail");
+        assert!(
+            lines[1].starts_with("software/setup failure, not the host: devtest-apple, devtest-bloom")
+                && lines[1].contains("replacing it won't help"),
+            "{lines:?}"
+        );
+        // Host failures on a shared IP still group (and aren't called software).
+        let results = vec![
+            PodHealth::unreachable(&pod("apple", "1.2.3.4"), "x"),
+            PodHealth::unreachable(&pod("bloom", "1.2.3.4"), "x"),
+        ];
+        assert_eq!(render_summary(&results).len(), 2);
+        assert!(render_summary(&results)[1].starts_with("same host? 1.2.3.4"));
     }
 
     #[test]
@@ -1731,7 +1927,7 @@ deep_check_end=1
         let cases: Vec<(std::result::Result<SshOutput, String>, Status, &str, &str)> = vec![
             (Ok(out(true, 0, HEALTHY_2GPU, "")), Status::Pass, "cuda", ""),
             (Err("timed out after 150s".into()), Status::Fail, "ssh", "timed out after 150s"),
-            (Ok(out(false, 255, "", "\nssh: connect to host 1.1.1.1 port 22: Connection refused\n")), Status::Fail, "ssh", "exit Some(255): ssh: connect to host"),
+            (Ok(out(false, 255, "", "\nssh: connect to host 1.1.1.1 port 22: Connection refused\n")), Status::Fail, "ssh", "exit 255: ssh: connect to host"),
             (Ok(out(true, 0, "", "bash: base64: command not found")), Status::Fail, "script", "(bash: base64: command not found)"),
         ];
         for (call, want, name, detail) in cases {
@@ -1752,7 +1948,7 @@ deep_check_end=1
             PodHealth::checked(&pod("bloom", "2.2.2.2"), parse_deep(&slow), &cuda13()),
             PodHealth::checked(&pod("cloud", "3.3.3.3"), parse_deep(&peer), &cuda13()),
             PodHealth::unreachable(&pod("dune", "3.3.3.3"), "timed out after 150s"),
-            PodHealth::unreachable(&pod("echo", "4.4.4.4"), "exit Some(255): Connection refused"),
+            PodHealth::unreachable(&pod("echo", "4.4.4.4"), "exit 255: Connection refused"),
         ];
         assert_eq!(
             render_health_table(&results),
@@ -1762,7 +1958,7 @@ devtest-apple  pass    2×RTX A4000  580.65.06  13.0  47.1 MB/s
 devtest-bloom  warn    2×RTX A4000  580.65.06  13.0   0.4 MB/s  network: 0.4 MB/s from huggingface.co (< 2 MB/s)
 devtest-cloud  fail    2×RTX A4000  580.65.06  13.0  47.1 MB/s  peer_copy: 1→0 mismatch
 devtest-dune   fail    -            -          -             -  ssh: timed out after 150s
-devtest-echo   fail    -            -          -             -  ssh: exit Some(255): Connection refused
+devtest-echo   fail    -            -          -             -  ssh: exit 255: Connection refused
 "
         );
         // Two failing pods on one IP: probably the machine.

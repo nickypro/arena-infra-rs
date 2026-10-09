@@ -21,6 +21,8 @@ use arena_core::ssh::SshTarget;
 use arena_core::volume::RepoSite;
 use arena_core::{Config, PodSpec};
 
+#[cfg(test)]
+mod hetzner_setup_tests;
 mod jobs;
 mod money;
 mod teardown;
@@ -210,8 +212,10 @@ enum Cmd {
 // ranges `apple..mayor`, `all`/`--all`, filtered by `--exclude`, `--gpus N`, `--on
 // <provider>`. Typos fail loudly. The flags live in one struct (`SelectOpts`); the targets
 // themselves are positional (`Select`) except where a command's positionals are already
-// taken — `run`'s command, `cp`'s file/dest, `pull`'s label — which take `-t/--target`
-// (`SelectByFlag`). Plain `//` comments here: a doc comment on a flattened struct can leak
+// taken — `run`'s command, `cp`'s file/dest — which take `-t/--target` (`SelectByFlag`).
+// (`pull` took its label positionally and its pods by `-t` until a live `pods pull bravo`
+// meant "every pod, into backup/bravo/"; it is positional like the rest now — see
+// `pull_label_and_targets`.) Plain `//` comments here: a doc comment on a flattened struct can leak
 // into the subcommand's help text. Each command flattens its selection as its *last* field:
 // the "Target selection" help heading carries over to every arg declared after it.
 
@@ -716,13 +720,18 @@ enum PodCmd {
     /// that got no pod included) and exits non-zero unless every requested name is READY. A
     /// pod that fails is left running: one is only ever terminated by --check (below).
     ///
-    /// --check: a pod that FAILs the deep check (`pods test --deep`) is on a bad host — it
+    /// --check: a pod that FAILs the deep check (`pods test --deep`) on its HOST (driver,
+    /// CUDA, device count, a GPU's tensor op, peer copies, NCCL) is on a bad machine — it
     /// is TERMINATED and its name recreated from the same --gpu/--cloud/--max-price options
     /// (options that haven't failed first), up to --check-attempts placements per name; a
     /// replacement that lands on a machine IP that already failed is rejected the same way.
-    /// A check that can't run at all (SSH drops, times out) is retried once and never
-    /// counts against the host. A WARN counts as ready. Ctrl+C (also during the create's
-    /// retries): no new attempts, nothing terminated, report.
+    /// A FAIL that is only software/setup (no python, python reporting that torch is missing
+    /// or doesn't import, a CPU-only torch on a GPU pod) is NOT replaced — a new pod from the
+    /// same image fails the same way: the name FAILs, the pod is left running. Python killed
+    /// or crashed before it could report (timeout, OOM, SIGILL) counts as the host's.
+    /// A check that can't run at all (SSH drops, times out) is retried once
+    /// and never counts against the host. A WARN counts as ready. Ctrl+C (also during the
+    /// create's retries): no new attempts, nothing terminated, report.
     #[command(verbatim_doc_comment)]
     Up {
         /// Explicit machine names to create (e.g. `apple bloom`), like `pods create`.
@@ -1167,10 +1176,15 @@ enum PodCmd {
         #[command(flatten)]
         sel: Select,
     },
-    /// Rsync each pod's home to a local backup folder (the file backup). Each pod's rsync
-    /// is bounded: 5 min without I/O, and BACKUP_TIMEOUT_SECS of wall clock (default 2h).
+    /// Rsync each pod's home to a local backup folder (the file backup). Targets: names /
+    /// ids / ranges, like every other command (none = every pod with an SSH endpoint); the
+    /// snapshot's label goes behind --label. Each pod's rsync is bounded: 5 min without I/O,
+    /// and BACKUP_TIMEOUT_SECS of wall clock (default 2h).
     Pull {
-        /// Backup label, e.g. `w1d3`. Defaults to the computed `wNdM` iteration.
+        /// Snapshot label, e.g. `w1d3` (default: the computed `wNdM` iteration). The old
+        /// positional spelling (`pods pull w1d3`) still works — with a note — when the word
+        /// can't be a pod's name.
+        #[arg(long)]
         label: Option<String>,
         /// Local base directory for backups (default: config LOCAL_BACKUP_DIR, else ./backup).
         #[arg(long)]
@@ -1194,8 +1208,46 @@ enum PodCmd {
         /// Preview only: print the rsync commands, copy nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
+        /// The old spelling of the targets (`pods pull -t bravo`), still accepted.
+        #[arg(long = "target", short = 't', value_name = "TARGET", hide = true)]
+        target_flag: Vec<String>,
         #[command(flatten)]
-        sel: SelectByFlag,
+        sel: Select,
+    },
+    /// Capture the week's FLEET BASELINE from ONE freshly set-up pod: the image's own files,
+    /// which every pod's dated snapshots then hard-link to instead of copying them again (a new
+    /// or replaced pod's first snapshot included; each pod's later snapshots also link to its
+    /// previous one). Run it once a week, or when the image changes, on a pod `up` just made.
+    ///
+    /// It rsyncs the pod's home with the snapshot tier's filters (its .git complete) into
+    /// <dir>/baseline/w<N>/fleet/, then KEEPS ONLY THE FILES OLDER THAN THE POD'S CONTAINER —
+    /// the image's: a hard link is made when size, mtime and permissions match, contents are
+    /// never compared, and a file written at setup or later (~/.name, the API keys in .bashrc,
+    /// anyone's work) can match another pod's that way with different contents. Nor anything
+    /// copied onto the pod since with an older mtime kept (a `pods replace`/`migrate` copy of
+    /// another pod's home, a `pods restore`): the pod lists those first (ctime after its
+    /// container's creation, mtime before). A repo on the /workspace volume is left out (a
+    /// volume can hold work from before the container). Refused when the container's creation
+    /// time is unknown or over a day old, when that listing fails, and when the week already
+    /// has a baseline (--replace moves the old one aside; nothing is deleted).
+    #[command(verbatim_doc_comment)]
+    Baseline {
+        /// The pod: machine name (e.g. arena8-apple), bare name, @name or provider id.
+        target: String,
+        /// The week it is for (default: the current one, from ARENA_START_DATE).
+        #[arg(long)]
+        week: Option<u32>,
+        /// Local base directory of the backups (default: config LOCAL_BACKUP_DIR, else ./backup).
+        #[arg(long)]
+        dir: Option<String>,
+        /// Capture it again: the week's current baseline is moved aside to
+        /// fleet.replaced-<UTC time>/ (delete it yourself once no snapshot needs it — snapshots
+        /// keep their own links either way).
+        #[arg(long)]
+        replace: bool,
+        /// Preview only: ask the pod (read-only) and print the plan and the rsync commands.
+        #[arg(long, visible_aliases = ["dryrun", "dry"])]
+        dry_run: bool,
     },
     /// Push a local backup (what `pull` saved) back onto ONE pod — never deletes anything.
     ///
@@ -1208,8 +1260,9 @@ enum PodCmd {
     /// file it replaces is kept under /workspace/.arena-restore/<UTC time>/ when the pod has
     /// its volume mounted, else ~/.arena-restore/<UTC time>/ (pulls don't back that dir up).
     /// ~/.ssh, the shell rc files and histories, ~/.name and .claude* are never pushed (they
-    /// belong to the pod); nor is .git from a snapshot (--with-git), which can lack objects
-    /// over the size cap — the repo is checked after any restore that pushed its .git.
+    /// belong to the pod); nor, by default, is .git from a snapshot (--with-git): one pulled
+    /// before .git got its own uncapped pass can lack objects over the size cap — the repo is
+    /// checked after any restore that pushed its .git.
     /// Confirms first, showing source, destination and size, and warns when the snapshot was
     /// written after the pod's disk was last reset. Refused when that backup doesn't exist or
     /// is empty.
@@ -2879,7 +2932,7 @@ async fn exec_each_pod<K>(
 /// non-zero exit (with its stderr), or why there was no answer (`timed out after Ns`, …).
 fn failure_line(done: usize, total: usize, name: &str, call: &PodCall) -> String {
     match call {
-        Ok(out) => format!("[{done}/{total}] ✗ {name} (exit {:?}): {}", out.code, out.stderr.trim()),
+        Ok(out) => format!("[{done}/{total}] ✗ {name} ({}): {}", out.exit_label(), out.stderr.trim()),
         Err(why) => format!("[{done}/{total}] ✗ {name}: {why}"),
     }
 }
@@ -4219,15 +4272,23 @@ async fn handle_backup(
 
     if !apply {
         println!(
-            "Dry-run — would commit + push the current branch on {} pod(s) (skips main/master):\n",
-            targets.len()
+            "Dry-run — would commit + push the current branch on {} pod(s) (skips main/master; files over {} MB \
+             and nested repos with their own history stay out of git), running the backup script below on each:\n",
+            targets.len(),
+            backup::GIT_MAX_FILE_BYTES / (1024 * 1024)
         );
+        // The script is the same for every pod — printed once, at the end, as a here-doc that
+        // writes the file each pod's line reads (so both paste); the arguments are exact.
         for (name, target) in &targets {
-            let cmd = backup::backup_command(&repo_path, key.as_deref(), &msg_for(name));
             println!("# {name}");
-            println!("{}\n", target.display_command(&cmd));
+            println!("{}\n", backup::backup_dry_run_line(target, &repo_path, key.as_deref(), &msg_for(name)));
         }
-        println!("Preview only — run without --dry-run to execute over SSH.");
+        println!(
+            "# The backup script, run under sh on each pod — paste this first: it writes ./{}, which the lines above read\n{}",
+            backup::BACKUP_SCRIPT_FILE,
+            backup::backup_script_heredoc()
+        );
+        println!("\nPreview only — run without --dry-run to execute over SSH.");
         return Ok(());
     }
 
@@ -4244,7 +4305,7 @@ async fn handle_backup(
             (name, target, cmd)
         })
         .collect();
-    let t = backup_fleet(&remote, jobs, |line| println!("{line}")).await;
+    let t = backup_fleet(&remote, jobs, &repo_path, |line| println!("{line}")).await;
     println!(
         "\nDone: {} pushed, {} unchanged, {} skipped (main/master), {} failed.",
         t.pushed, t.unchanged, t.skipped, t.failed
@@ -4319,25 +4380,32 @@ struct BackupTally {
 
 /// Run each pod's backup command (`(name, target, cmd)`) concurrently over `remote`, each
 /// within [`BACKUP_TIMEOUT`], classifying its output by the sentinel it printed and
-/// emitting one `[done/total]` line per pod as it finishes. A non-zero exit, a timeout or a
-/// crashed task is a failure; the others still finish.
+/// emitting one `[done/total]` line per pod as it finishes — with what the run kept out of
+/// git (files over GitHub's limit, nested repos) or adopted into it. A non-zero exit, a
+/// timeout or a crashed task is a failure; the others still finish. A pod whose unpushed
+/// commits already carry a file over GitHub's limit fails with the exact commands that fix it
+/// (`repo` is the checkout they run in), never as the same opaque push rejection every tick.
 async fn backup_fleet(
     remote: &Arc<dyn Remote>,
     jobs: Vec<(String, SshTarget, String)>,
+    repo: &str,
     mut emit: impl FnMut(&str),
 ) -> BackupTally {
-    use arena_core::backup::{self, parse_backup_output};
+    use arena_core::backup::{self, parse_backup_report};
     let mut t = BackupTally::default();
     exec_each_pod(remote, jobs, BACKUP_TIMEOUT, |done, total, name, call| {
+        let report = call.as_ref().map(|out| parse_backup_report(&out.stdout)).unwrap_or_default();
+        let notes = report.notes();
+        let also = if notes.is_empty() { String::new() } else { format!(" — {}", notes.join("; ")) };
         let line = match &call {
-            Ok(out) if out.success => match parse_backup_output(&out.stdout) {
+            Ok(out) if out.success => match &report.outcome {
                 Some((backup::BACKUP_PUSHED, branch)) => {
                     t.pushed += 1;
-                    format!("[{done}/{total}] ✓ {name} -> {branch}")
+                    format!("[{done}/{total}] ✓ {name} -> {branch}{also}")
                 }
                 Some((backup::BACKUP_NO_CHANGES, branch)) => {
                     t.unchanged += 1;
-                    format!("[{done}/{total}] = {name} (no changes, on {branch})")
+                    format!("[{done}/{total}] = {name} (no changes, on {branch}){also}")
                 }
                 Some((backup::BACKUP_SKIPPED, branch)) => {
                     t.skipped += 1;
@@ -4345,9 +4413,13 @@ async fn backup_fleet(
                 }
                 _ => {
                     t.pushed += 1;
-                    format!("[{done}/{total}] ✓ {name} (done)")
+                    format!("[{done}/{total}] ✓ {name} (done){also}")
                 }
             },
+            Ok(out) if out.code == Some(backup::BACKUP_STUCK_EXIT) && report.stuck_fix(repo, name).is_some() => {
+                t.failed += 1;
+                format!("[{done}/{total}] ✗ {name}: {}", report.stuck_fix(repo, name).unwrap_or_default())
+            }
             _ => {
                 t.failed += 1;
                 failure_line(done, total, name, &call)
@@ -4487,9 +4559,10 @@ async fn read_current_proxy(cfg: &Config, pxcfg: &arena_core::proxy::ProxyConfig
         Some(0) => Ok(Some(out.stdout)),
         Some(3) => Ok(None),
         code => anyhow::bail!(
-            "couldn't read the current proxy config {p} on {} (exit {code:?}): {} — refusing to write \
+            "couldn't read the current proxy config {p} on {} ({}): {} — refusing to write \
              one built without it",
             pxcfg.proxy_host,
+            arena_core::ssh::exit_label(code),
             out.stderr.trim()
         ),
     }
@@ -5041,8 +5114,9 @@ async fn write_proxy(cfg: &Config, p: &PreparedProxy) -> Result<Written> {
             pxcfg.reload_cmd
         ),
         code => anyhow::bail!(
-            "installing/reloading on {host} failed (exit {code:?}): {err} — the live config may not \
-             have changed; `arena proxy apply --dry-run` shows where it stands"
+            "installing/reloading on {host} failed ({}): {err} — the live config may not \
+             have changed; `arena proxy apply --dry-run` shows where it stands",
+            arena_core::ssh::exit_label(code)
         ),
     }
 }
@@ -5099,9 +5173,12 @@ async fn handle_plan(cmd: PlanCmd, provider: &dyn Provider, cfg: &Config) -> Res
                 ),
                 None => println!("window:     INVALID {:?} — fix HH:MM", plan.window),
             }
+            let cap = |v: Option<String>| v.unwrap_or_else(|| "unset".into());
             println!(
-                "caps:       max_total={:?}  max_hourly={:?}  max_replace={:?}",
-                plan.max_total, plan.max_hourly, plan.max_replace
+                "caps:       max_total={}  max_hourly={}  max_replace={}",
+                cap(plan.max_total.map(|n| n.to_string())),
+                cap(plan.max_hourly.map(|n| n.to_string())),
+                cap(plan.max_replace.map(|n| n.to_string()))
             );
             println!("gpus:       {}", plan.gpus.join(" > "));
             println!("providers:  {}", plan.providers.join(" > "));
@@ -5156,8 +5233,9 @@ async fn handle_plan(cmd: PlanCmd, provider: &dyn Provider, cfg: &Config) -> Res
             );
             if day.replace {
                 println!(
-                    "REPLACE: would back up, then terminate those {existing} pod(s) (cap max_replace={:?}), then create {} fresh.",
-                    plan.max_replace, day.count
+                    "REPLACE: would back up, then terminate those {existing} pod(s) (cap max_replace={}), then create {} fresh.",
+                    plan.max_replace.map_or_else(|| "unset".to_string(), |n| n.to_string()),
+                    day.count
                 );
             }
 
@@ -5761,11 +5839,20 @@ async fn handle_pods_with(
             handle_init_branches(remote, cfg, week, day, &sel, dry_run, yes).await?;
         }
 
-        PodCmd::Pull { label, dir, max_size, remote_path, no_git, no_big, sel, dry_run } => {
+        PodCmd::Pull { label, dir, max_size, remote_path, no_git, no_big, target_flag, sel, dry_run } => {
             let dir = dir.unwrap_or_else(|| local_backup_dir(cfg));
-            let mut sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
+            let (label, mut sel, note) = resolve_pull(provider, cfg, label, sel, &target_flag).await?;
+            if let Some(note) = &note {
+                eprintln!("{note}");
+            }
             refresh_missing_endpoints(provider, &mut sel, ENDPOINT_RETRY).await;
             handle_pull(&remote, cfg, label, &dir, max_size, remote_path, no_git, no_big, &sel, dry_run, yes, RSYNC).await?;
+        }
+
+        PodCmd::Baseline { target, week, dir, replace, dry_run } => {
+            let dir = dir.unwrap_or_else(|| local_backup_dir(cfg));
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            handle_baseline(provider, &remote, cfg, &target, week, &dir, replace, dry_run, yes, RSYNC, now).await?;
         }
 
         PodCmd::Restore { target, from, path, dir, timeout, overwrite_newer, with_git, dry_run } => {
@@ -6088,8 +6175,30 @@ fn run_preview(dry_run: bool, cmd: &str, remote_cmd: &str, names: &[&str], timeo
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RunResult {
     name: String,
+    /// Everything it printed: stdout, then — on a failure — the exit and stderr.
     text: String,
     ok: bool,
+    /// A failure on one line, for the compact layout: `exit 1: <last stderr line>` (or the last
+    /// stdout line when stderr is empty), `timed out after 90s`. `None` = it worked.
+    why: Option<String>,
+}
+
+/// A failed command's [`RunResult`] text and one-line reason. stdout is kept — what a command
+/// printed before it failed is often what says why (a script's own progress, `grep`'s matches
+/// so far); the old report dropped it and showed only stderr.
+fn run_failure(out: &arena_core::ssh::SshOutput) -> (String, String) {
+    use arena_core::ssh::strip_interactive_noise;
+    let stdout = strip_interactive_noise(out.stdout.trim()).trim().to_string();
+    let stderr = strip_interactive_noise(out.stderr.trim()).trim().to_string();
+    let exit = if stderr.is_empty() { out.exit_label() } else { format!("{}: {stderr}", out.exit_label()) };
+    let text = if stdout.is_empty() { exit } else { format!("{stdout}\n{exit}") };
+    let last = |s: &str| s.lines().map(str::trim).filter(|l| !l.is_empty()).last().map(String::from);
+    let why = match (last(&stderr), last(&stdout)) {
+        (Some(e), _) => format!("{}: {e}", out.exit_label()),
+        (None, Some(o)) => format!("{} — last output: {o}", out.exit_label()),
+        (None, None) => out.exit_label(),
+    };
+    (text, why)
 }
 
 /// Run `remote_cmd` on every target concurrently over `remote`, each within `timeout`;
@@ -6106,14 +6215,15 @@ async fn run_fleet(
     let mut results = Vec::new();
     exec_each_pod(remote, jobs, timeout, |_, _, name, call| {
         // a no-PTY shell can emit harmless job-control chatter; strip it.
-        let (text, ok) = match call {
-            Ok(out) if out.success => (strip_interactive_noise(out.stdout.trim()).trim().to_string(), true),
+        let (text, why) = match call {
+            Ok(out) if out.success => (strip_interactive_noise(out.stdout.trim()).trim().to_string(), None),
             Ok(out) => {
-                (format!("exit {:?}: {}", out.code, strip_interactive_noise(out.stderr.trim()).trim()), false)
+                let (text, why) = run_failure(&out);
+                (text, Some(why))
             }
-            Err(why) => (why, false),
+            Err(why) => (why.clone(), Some(why)),
         };
-        results.push(RunResult { name: name.to_string(), text, ok });
+        results.push(RunResult { name: name.to_string(), text, ok: why.is_none(), why });
     })
     .await;
     results.sort_by(|a, b| a.name.cmp(&b.name));
@@ -6133,8 +6243,10 @@ fn render_run(results: &[RunResult], compact: bool) -> (Vec<String>, usize) {
             bad += 1
         }
         if compact {
-            let line = r.text.lines().last().unwrap_or("").trim();
-            let shown = if r.ok { line.to_string() } else { format!("✗ {line}") };
+            let shown = match &r.why {
+                None => r.text.lines().last().unwrap_or("").trim().to_string(),
+                Some(why) => format!("✗ {why}"),
+            };
             lines.push(format!("{:<22} {shown}", r.name));
         } else {
             lines.push(format!("\n── {} {}", r.name, if r.ok { "" } else { "(FAILED)" }));
@@ -6524,7 +6636,15 @@ async fn handle_set_branch(
     let (mut ok, mut failed) = (0, 0);
     exec_each_pod(&remote, jobs, BRANCH_TIMEOUT, |done, total, name, call| match &call {
         Ok(out) if out.success => {
-            println!("[{done}/{total}] ✓ {name} (on {branch})");
+            // Nested clones the backup adopted, which the new branch doesn't track: put back on
+            // disk (staged) so their exercises keep working.
+            let restored: Vec<&str> = out.stdout.lines().filter_map(|l| l.trim_end_matches('\r').strip_prefix("RESTORED ")).collect();
+            let also = if restored.is_empty() {
+                String::new()
+            } else {
+                format!(" — kept {} adopted nested clone(s) on disk (staged): {}", restored.len(), restored.join(", "))
+            };
+            println!("[{done}/{total}] ✓ {name} (on {branch}){also}");
             ok += 1;
         }
         _ => {
@@ -10664,7 +10784,8 @@ async fn handle_pull(
     // Read (and validate) the budget first: a bad value fails before anything is asked or copied.
     let budget = pull::backup_timeout(cfg.get("BACKUP_TIMEOUT_SECS"))?;
 
-    // Label: explicit, else the computed wNdM iteration.
+    // Label: explicit, else the computed wNdM iteration. Never one of the backup dir's own
+    // folders (the all-files tier, the baselines) or a path.
     let label = match label {
         Some(l) => l,
         None => {
@@ -10672,6 +10793,9 @@ async fn handle_pull(
             format!("w{w}d{d}")
         }
     };
+    if label.is_empty() || label.contains('/') || [".", "..", arena_core::restore::BIG, pull::BASELINE_DIR].contains(&label.as_str()) {
+        anyhow::bail!("`{label}` can't be a snapshot label (a name like w1d3; not `big`, `baseline` or a path)");
+    }
     // Knobs come from flags, else config (BACKUP_MAX_SIZE / BACKUP_REMOTE_PATH), else
     // sensible defaults. `.git` is kept by default unless --no-git.
     let threshold = max_size
@@ -10711,11 +10835,14 @@ async fn handle_pull(
         return Ok(());
     }
 
-    // Per-pod tiers: (tier name, dest, config). `big` is dropped when --no-big.
-    let tiers_for = |name: &str| -> Vec<(&'static str, String, &PullConfig)> {
-        let mut v = vec![("snapshot", pull::local_dest(dir, &label, name), &small)];
+    // Per-pod tiers: (tier name, dest, config). `big` is dropped when --no-big. The snapshot
+    // hard-links what didn't change to the pod's previous snapshot and the fleet baseline.
+    let base = std::path::Path::new(dir);
+    let tiers_for = |name: &str| -> Vec<(&'static str, String, PullConfig)> {
+        let snapshot = pull::snapshot_tier_for(base, &label, name, &small);
+        let mut v = vec![("snapshot", pull::local_dest(dir, &label, name), snapshot)];
         if !no_big {
-            v.push(("big", pull::big_dest(dir, name), &big));
+            v.push(("big", pull::big_dest(dir, name), big.clone()));
         }
         v
     };
@@ -10727,7 +10854,10 @@ async fn handle_pull(
         for (name, t) in &targets {
             println!("# {name}");
             for (tier, dest, pc) in tiers_for(name) {
-                println!("  [{tier}] {}", pull::display_rsync(t, pc, &dest));
+                for pass in pc.passes() {
+                    let tier = if pass.git_only { format!("{tier} .git") } else { tier.to_string() };
+                    println!("  [{tier}] {}", pull::display_rsync(t, &pass, &dest));
+                }
             }
             println!();
         }
@@ -10793,7 +10923,7 @@ async fn handle_pull(
     let mut planned = Vec::new();
     for (name, t) in &targets {
         for (tier, dest, pc) in tiers_for(name) {
-            for job in arena_core::volume::pull_jobs(pc, &dest, splits.get(name)) {
+            for job in arena_core::volume::pull_jobs(&pc, &dest, splits.get(name)) {
                 let tier = match (job.repo, tier) {
                     (false, tier) => tier,
                     (true, "big") => "big repo",
@@ -10829,14 +10959,36 @@ async fn handle_pull(
             continue;
         }
         // The repo job's config is the tier's with the repo's paths swapped in
-        // (`volume::pull_jobs`), so it carries the tier's `--timeout` too.
-        let args = pull::rsync_args(t, &job.config, dest);
+        // (`volume::pull_jobs`), so it carries the tier's `--timeout` too. A job's passes (the
+        // snapshot's files, then its `.git`) run one after the other, within one budget.
+        let passes: Vec<(bool, Vec<String>)> =
+            job.config.passes().iter().map(|pc| (pc.git_only, pull::rsync_args(t, pc, dest))).collect();
         let (name, rsync) = (name.clone(), rsync.to_string());
         jobs += 1;
         set.spawn(async move {
-            let what = format!("rsync of {name} [{tier}]");
-            let out = arena_core::remote::run_local(&rsync, &args, &what, Some(budget)).await;
-            (name, tier, out)
+            let started = tokio::time::Instant::now();
+            let mut stats: Option<pull::RsyncStats> = None;
+            for (i, (git, args)) in passes.into_iter().enumerate() {
+                let what = format!("rsync of {name} [{tier}{}]", if git { ", .git" } else { "" });
+                // The first pass gets the whole budget; a later one what's left of it (whole
+                // seconds, at least one).
+                let left = if i == 0 {
+                    budget
+                } else {
+                    Duration::from_secs(budget.saturating_sub(started.elapsed()).as_secs().max(1))
+                };
+                match arena_core::remote::run_local(&rsync, &args, &what, Some(left)).await {
+                    Ok(o) if o.success => {
+                        let s = pull::parse_rsync_stats(&o.stdout);
+                        stats = match (stats, s) {
+                            (Some(a), Some(b)) => Some(a.add(b)),
+                            (a, b) => a.or(b),
+                        };
+                    }
+                    failed => return (name, tier, Err((git, failed))),
+                }
+            }
+            (name, tier, Ok(stats))
         });
     }
     let (mut ok, mut done) = (0, 0);
@@ -10853,34 +11005,141 @@ async fn handle_pull(
             }
         };
         match out {
-            Ok(o) if o.success => {
+            Ok(stats) => {
                 // Report what actually moved, so a pull isn't "silent".
-                let summary = match pull::parse_rsync_stats(&o.stdout) {
-                    Some((files, size)) => format!("{files} files, {size}"),
-                    None => "done".into(),
-                };
+                let summary = stats.map_or_else(|| "done".into(), |s| s.summary());
                 println!("[{done}/{jobs}] ✓ {name} [{tier}] ({summary})");
                 ok += 1;
             }
-            Ok(o) => {
-                println!("[{done}/{jobs}] ✗ {name} [{tier}] (exit {:?}): {}", o.code, o.stderr.trim());
+            Err((git, Ok(o))) => {
+                let pass = if git { ", .git" } else { "" };
+                println!("[{done}/{jobs}] ✗ {name} [{tier}{pass}] (rsync {}): {}", o.exit_label(), o.stderr.trim());
                 failed += 1;
                 failures.push(format!("{name} [{tier}]"));
             }
             // Timed out (`timed out after 7200s` — what was copied so far stays, and the next
             // run continues incrementally), or rsync couldn't be started.
-            Err(e) => {
-                println!("[{done}/{jobs}] ✗ {name} [{tier}]: {}", describe_error(&e));
+            Err((git, Err(e))) => {
+                let pass = if git { ", .git" } else { "" };
+                println!("[{done}/{jobs}] ✗ {name} [{tier}{pass}]: {}", describe_error(&e));
                 failed += 1;
                 failures.push(format!("{name} [{tier}] ({})", describe_error(&e)));
             }
         }
+    }
+    // What the new snapshots really take: hard-linked files are shared with the earlier
+    // snapshots and the baseline, so `du` of one snapshot alone overstates it.
+    let mut used = Vec::new();
+    for (name, _) in &targets {
+        if let Ok(d) = pull::disk_use(std::path::Path::new(&pull::local_dest(dir, &label, name))) {
+            if d.files > 0 {
+                used.push(format!(
+                    "  {name}: {} in {} files, {} of it new on disk{}",
+                    pull::human_bytes(d.bytes),
+                    d.files,
+                    pull::human_bytes(d.own_bytes),
+                    if d.own_bytes < d.bytes { " (the rest hard-linked to an earlier snapshot or the baseline)" } else { "" }
+                ));
+            }
+        }
+    }
+    if !used.is_empty() {
+        println!("\nSnapshot {label} on disk (`du` over every snapshot counts a hard-linked file once):\n{}", used.join("\n"));
     }
     println!("\nDone: {ok} rsync job(s) ok, {failed} failed across {total_pods} pod(s).");
     if failed > 0 {
         anyhow::bail!("{failed} rsync job(s) failed: {}", failures.join(", "));
     }
     Ok(())
+}
+
+/// `pods pull`'s arguments sorted out ([`pull_label_and_targets`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PullArgs {
+    /// The snapshot label (`None` = the computed `wNdM`).
+    label: Option<String>,
+    /// The targets, for the selector (positional ones first, then the old `-t` ones).
+    targets: Vec<String>,
+    /// The deprecation note for an old-style positional label.
+    note: Option<String>,
+}
+
+/// `pods pull`'s positionals are pods, like every other command's; the snapshot label goes
+/// behind `--label`. They used to be the label — and `pods pull bravo` pulled EVERY pod into
+/// `backup/bravo/` (live: ~18G on the host the cohort shares). An old invocation keeps working
+/// where it can only mean the label: a lone positional that looks like one (`w1d3`, see
+/// [`arena_core::restore::parse_label`]) and names no pod — none listed (`pods`), no
+/// `MACHINE_NAME_LIST` entry — is taken as the label, with a note. One that could be either is
+/// refused rather than guessed; so are two labels. `-t` (the old target flag) adds targets.
+fn pull_label_and_targets(
+    label: Option<String>,
+    positional: &[String],
+    flag_targets: &[String],
+    naming: &Naming,
+    pods: &[arena_core::Pod],
+) -> std::result::Result<PullArgs, String> {
+    let mut out = PullArgs { label, targets: Vec::new(), note: None };
+    for raw in positional {
+        let word = raw.trim();
+        if arena_core::restore::parse_label(word).is_none() {
+            out.targets.push(raw.clone());
+            continue;
+        }
+        let a_pod = pods.iter().any(|p| naming.matches(p, word)) || naming.names_list_entry(word);
+        match (a_pod, &out.label) {
+            // `--label` given: every positional is a pod.
+            (_, Some(_)) if out.note.is_none() => out.targets.push(raw.clone()),
+            (true, _) => {
+                return Err(format!(
+                    "`{word}` is both a snapshot label and a pod's name — write `--label {word}` for the label, or the \
+                     pod's full name or id for the pod"
+                ))
+            }
+            (false, Some(first)) => {
+                return Err(format!("two snapshot labels (`{first}`, `{word}`): pass one, with --label"));
+            }
+            (false, None) => {
+                out.note = Some(format!(
+                    "note: reading `{word}` as the snapshot label (the old spelling) — `pods pull` takes pods as its \
+                     arguments now; write `--label {word}`"
+                ));
+                out.label = Some(word.to_string());
+            }
+        }
+    }
+    out.targets.extend(flag_targets.iter().cloned());
+    Ok(out)
+}
+
+/// `pods pull`'s label, pods and deprecation note, as the command resolves them: the fleet
+/// listing (only when a positional looks like a label — it's what tells one from a pod),
+/// [`pull_label_and_targets`], then the selector. Returned rather than acted on, so a test sees
+/// exactly what an invocation means.
+async fn resolve_pull(
+    provider: &dyn Provider,
+    cfg: &Config,
+    label: Option<String>,
+    mut sel: Select,
+    target_flag: &[String],
+) -> Result<(Option<String>, Selected, Option<String>)> {
+    let pods = if sel.targets.iter().any(|t| arena_core::restore::parse_label(t.trim()).is_some()) {
+        let policy = arena_core::retry::RetryPolicy::default();
+        arena_core::retry::retrying(&policy, || provider.list_pods()).await.context("listing pods")?
+    } else {
+        Vec::new()
+    };
+    let naming = Naming::from_config(cfg);
+    let split = pull_label_and_targets(label, &sel.targets, target_flag, &naming, &pods).map_err(|e| anyhow::anyhow!(e))?;
+    let positional = !sel.targets.is_empty();
+    sel.targets = split.targets;
+    let chosen = select(provider, cfg, &sel.args(), Unscoped::All).await.map_err(|e| {
+        if positional && split.label.is_none() {
+            e.context("`pods pull` takes pods as its arguments now (like every command); a snapshot label goes behind --label")
+        } else {
+            e
+        }
+    })?;
+    Ok((split.label, chosen, split.note))
 }
 
 /// How `pods pull` says it's bounded, on its header line: the per-pod wall clock and the
@@ -10903,6 +11162,187 @@ fn clear_stale_link(dest: &str) -> std::io::Result<bool> {
         Ok(m) if m.file_type().is_symlink() => std::fs::remove_file(link).map(|()| true),
         _ => Ok(false),
     }
+}
+
+/// The oldest a pod's container may be for `pods baseline` to capture the fleet baseline from
+/// it: the pod should come straight from `up`, before anyone has used it.
+const BASELINE_MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+
+/// The budget for listing what was copied onto a baseline's source pod
+/// ([`arena_core::pull::copied_in_command`]: one `find` over its home).
+const COPIED_IN_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Whether a pod can be the fleet baseline's source, from what it said about itself
+/// ([`arena_core::volume::parse_probe`]) at `now` (UNIX seconds): `Ok(container creation time)`
+/// — the line [`arena_core::pull::prune_baseline`] keeps the image's files by — or why not.
+/// Fails closed: no answer, or no creation time, is a refusal.
+fn baseline_source(probe: Option<&arena_core::volume::RepoProbe>, now: u64, pod: &str) -> std::result::Result<u64, String> {
+    let Some(created) = probe.and_then(|p| p.container_created) else {
+        return Err(format!(
+            "{pod} didn't say when its container was created (no /.dockerenv, or no answer) — so which of its files \
+             came with the image can't be told; pick another pod"
+        ));
+    };
+    let age = now.saturating_sub(created);
+    if age > BASELINE_MAX_AGE.as_secs() {
+        return Err(format!(
+            "{pod}'s container was created {}h ago — a baseline must come from a pod `up` made today, before anyone \
+             used it (bring one up, capture, terminate it)",
+            age / 3600
+        ));
+    }
+    Ok(created)
+}
+
+/// `pods baseline <pod>`: capture the week's fleet baseline (see the command's help and
+/// [`arena_core::pull::prune_baseline`] for why only files older than the container are
+/// kept — and none copied onto the pod since with an old mtime, as `pods replace` and `pods
+/// restore` do). Everything refusable is refused before the rsync: an existing baseline without
+/// `--replace`, a pod that can't say when its container was created or whose container is over
+/// [`BASELINE_MAX_AGE`] old, one whose copied-in files can't be listed. The rsync goes into a partial dir next to the destination
+/// (bounded like a pull: `BACKUP_TIMEOUT_SECS`, 5 min without I/O), is pruned, and only then
+/// takes the destination's place — a failed or stopped capture leaves no half baseline.
+#[allow(clippy::too_many_arguments)]
+async fn handle_baseline(
+    provider: &dyn Provider,
+    remote: &Arc<dyn Remote>,
+    cfg: &Config,
+    target: &str,
+    week: Option<u32>,
+    dir: &str,
+    replace: bool,
+    dry_run: bool,
+    yes: bool,
+    // The rsync to run: [`RSYNC`] for real, a stub in tests.
+    rsync: &str,
+    now: u64,
+) -> Result<()> {
+    use arena_core::{pull, volume};
+    let (week, _) = resolve_week_day(cfg, week, Some(1))?;
+    let budget = pull::backup_timeout(cfg.get("BACKUP_TIMEOUT_SECS"))?;
+    let policy = arena_core::retry::RetryPolicy::default();
+    let pods = arena_core::retry::retrying(&policy, || provider.list_pods()).await.context("listing pods")?;
+    let pod = pods[arena_core::selector::resolve_one(&Naming::from_config(cfg), &pods, target)?].clone();
+    let ssh = SshTarget::from_pod(&pod, cfg).with_context(|| format!("{}: no SSH endpoint", pod.name))?;
+    let base = std::path::Path::new(dir);
+    let dest = pull::baseline_dir(base, week);
+    let exists = std::fs::read_dir(&dest).is_ok_and(|mut e| e.next().is_some());
+    if exists && !replace {
+        anyhow::bail!(
+            "{} already holds week {week}'s baseline — pass --replace to capture it again (the old one is moved aside, \
+             not deleted)",
+            dest.display()
+        );
+    }
+    let repo = arena_core::backup::repo_path(cfg);
+    let probe = match remote.exec(&ssh, &volume::probe_command(&repo), Some(PROBE_TIMEOUT)).await {
+        Ok(out) if out.success => volume::parse_probe(&out.stdout),
+        _ => None,
+    };
+    let created = baseline_source(probe.as_ref(), now, &pod.name).map_err(|e| anyhow::anyhow!("refusing the baseline: {e}"))?;
+    // What was written onto it since with an older mtime — a `pods replace`/`migrate` copy of
+    // another pod's home, a `pods restore`, an archive unpacked at setup: not the image's, though
+    // the mtime prune alone would keep it (fail closed: no listing, no capture).
+    let copied = match remote.exec(&ssh, &pull::copied_in_command(), Some(COPIED_IN_TIMEOUT)).await {
+        Ok(out) if out.success => pull::parse_copied_in(&out.stdout),
+        Ok(out) => Err(format!("{}: {}", out.exit_label(), out.stderr.trim())),
+        Err(e) => Err(describe_error(&e)),
+    }
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "refusing the baseline: couldn't list what was copied onto {} since its container was created ({e})",
+            pod.name
+        )
+    })?;
+    let copied_note = if copied.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " — and none of the {} file(s) copied onto it since with an older mtime (`pods replace`/`restore`, setup)",
+            copied.len()
+        )
+    };
+    let threshold =
+        cfg.get("BACKUP_MAX_SIZE").filter(|s| !s.is_empty()).map(String::from).unwrap_or_else(|| "50M".to_string());
+    let mut pc = pull::PullConfig::small_tier(threshold.as_str());
+    // Last week's baseline: what didn't change in the image is linked, not copied again.
+    if week > 0 {
+        if let Some(prev) = pull::newest_baseline(base, Some(week - 1)).and_then(|p| std::fs::canonicalize(p).ok()) {
+            pc.link_dest.push(prev.display().to_string());
+        }
+    }
+    let mut note = String::new();
+    if let Ok(Some(split)) = volume::repo_pull_from("", &repo, &ssh.user, probe.as_ref()) {
+        pc.excludes.push(split.home_exclude());
+        note = format!("; its repo is on the /workspace volume, so it's left out ({} isn't in the baseline)", split.rel);
+    }
+    let partial = dest.with_file_name(format!(".fleet.partial-{}", std::process::id()));
+    let partial_dir = format!("{}/", partial.display());
+    let passes: Vec<Vec<String>> = pc.passes().iter().map(|p| pull::rsync_args(&ssh, p, &partial_dir)).collect();
+    let age = now.saturating_sub(created);
+    let plan = format!(
+        "capture week {week}'s fleet baseline from {} (id={}, container created {}, {}h{:02}m ago) into {}: rsync its home \
+         (the snapshot tier's filters, .git complete{note}), then keep only the files older than the container — the \
+         image's own{copied_note} — for every pod's snapshots to hard-link to{}",
+        pod.name,
+        pod.id,
+        arena_core::restore::stamp(created),
+        age / 3600,
+        age % 3600 / 60,
+        dest.display(),
+        if exists { format!(" (the current one is moved aside to {}/fleet.replaced-<time>/)", dest.parent().unwrap_or(base).display()) } else { String::new() },
+    );
+    if dry_run {
+        println!("[dry-run] would {plan}");
+        for args in &passes {
+            println!("  {}", pull::display_argv(rsync, args));
+        }
+        return Ok(());
+    }
+    if !confirm(yes, &format!("Will {plan}."))? {
+        println!("aborted.");
+        return Ok(());
+    }
+    std::fs::create_dir_all(&partial).with_context(|| format!("creating {}", partial.display()))?;
+    let started = tokio::time::Instant::now();
+    for args in passes {
+        let left = budget.saturating_sub(started.elapsed()).max(Duration::from_secs(1));
+        let what = format!("rsync of {} [baseline]", pod.name);
+        let failed = match arena_core::remote::run_local(rsync, &args, &what, Some(left)).await {
+            Ok(o) if o.success => None,
+            Ok(o) => Some(format!("rsync {}: {}", o.exit_label(), o.stderr.trim())),
+            Err(e) => Some(describe_error(&e)),
+        };
+        if let Some(why) = failed {
+            // Only the partial dir this run made; the week's baseline (if any) is untouched.
+            let _ = std::fs::remove_dir_all(&partial);
+            anyhow::bail!("capturing the baseline from {} failed ({why}) — nothing changed under {}", pod.name, dest.display());
+        }
+    }
+    let kept = match pull::prune_baseline(&partial, created, &copied) {
+        Ok(k) => k,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&partial);
+            anyhow::bail!("pruning the baseline failed ({e}) — nothing changed under {}", dest.display());
+        }
+    };
+    if exists {
+        let aside = dest.with_file_name(format!("fleet.replaced-{}", arena_core::restore::stamp(now)));
+        std::fs::rename(&dest, &aside).with_context(|| format!("moving the old baseline aside to {}", aside.display()))?;
+        println!("(the previous baseline is now {} — delete it yourself when you like)", aside.display());
+    }
+    std::fs::rename(&partial, &dest).with_context(|| format!("moving the baseline into {}", dest.display()))?;
+    println!(
+        "✓ week {week}'s baseline from {}: {} files, {} that came with the image (in {}); left out {} files, {} written \
+         or copied onto it since the container was created. Snapshots from now on hard-link to it.",
+        pod.name,
+        kept.kept_files,
+        pull::human_bytes(kept.kept_bytes),
+        dest.display(),
+        kept.removed_files,
+        pull::human_bytes(kept.removed_bytes),
+    );
+    Ok(())
 }
 
 /// `pods restore`'s switches, resolved (the backup dir and budget defaulted).
@@ -10995,10 +11435,9 @@ async fn handle_restore(
         ssh.port,
     );
     if opts.dry_run {
-        let shown: Vec<String> = std::iter::once(rsync.to_string())
-            .chain(args.iter().map(|a| if a.contains(' ') { format!("'{a}'") } else { a.clone() }))
-            .collect();
-        println!("[dry-run] would {plan}\n  {}", shown.join(" "));
+        // Shell-quoted, so the line pastes as exactly this argv (the `.claude*` exclude unquoted
+        // would expand against the operator's directory).
+        println!("[dry-run] would {plan}\n  {}", pull::display_argv(rsync, &args));
         return Ok(());
     }
     if !confirm(opts.yes, &format!("Will {plan}"))? {
@@ -11009,9 +11448,9 @@ async fn handle_restore(
     let out = match arena_core::remote::run_local(rsync, &args, &what_run, Some(opts.timeout)).await {
         Ok(out) if out.success => out,
         Ok(out) => anyhow::bail!(
-            "restoring {} failed (rsync exit {:?}): {} — nothing on the pod was deleted; re-run to finish",
+            "restoring {} failed (rsync {}): {} — nothing on the pod was deleted; re-run to finish",
             pod.name,
-            out.code,
+            out.exit_label(),
             out.stderr.trim()
         ),
         Err(e) => anyhow::bail!(
@@ -11020,7 +11459,8 @@ async fn handle_restore(
             describe_error(&e)
         ),
     };
-    let moved = pull::parse_rsync_stats(&out.stdout).map_or_else(|| "done".into(), |(n, size)| format!("{n} file(s), {size} sent"));
+    let moved = pull::parse_rsync_stats(&out.stdout)
+        .map_or_else(|| "done".into(), |s| format!("{} file(s), {} sent", s.files_sent, pull::human_bytes(s.bytes_sent)));
     println!("✓ restored {} from {label} ({moved}); anything it replaced is under {kept} on the pod", pod.name);
     let kept_newer = restore::newer_on_pod(&out.stdout);
     if !kept_newer.is_empty() {
@@ -11042,7 +11482,7 @@ async fn handle_restore(
             ),
             other => {
                 let why = match other {
-                    Ok(o) => format!("exit {:?}", o.code),
+                    Ok(o) => o.exit_label(),
                     Err(e) => describe_error(&e),
                 };
                 println!("  ⚠ couldn't check {repo} on {} after pushing its .git ({why}) — run `git -C {repo} fsck` there", pod.name);
@@ -11267,7 +11707,8 @@ async fn handle_copy(
         println!("\nDry-run — would scp to {} pod(s):\n", targets.len());
         for (name, t) in &targets {
             println!("# {name}");
-            println!("scp {rflag}{}\n", t.scp_args(&local, &remote).join(" "));
+            let args: Vec<String> = t.scp_args(&local, &remote).iter().map(|a| arena_core::ssh::shell_word(a)).collect();
+            println!("scp {rflag}{}\n", args.join(" "));
         }
         println!("Preview only — run without --dry-run to copy.");
         return Ok(());
@@ -12864,6 +13305,8 @@ mod selection_tests {
             &["pods", "run", "--target", "apple,bloom", "--target", "cloud", "echo", "hi"],
             &["pods", "cp", "f.txt", "-t", "apple"],
             &["pods", "pull", "-t", "apple..bloom"],
+            &["pods", "pull", "apple..bloom", "--exclude", "cloud", "--label", "w1d2"],
+            &["pods", "pull", "bravo", "--dry-run"],
             &["pods", "test", "all", "--on", "vast"],
             &["pods", "init-branches", "apple", "bloom"],
             &["pods", "backup", "apple..cloud", "--exclude", "bloom"],
@@ -15438,13 +15881,13 @@ mod placement_cli_tests {
 mod remote_tests {
     use super::{
         backup_fleet, copy_pod_files, copy_to_pod, cp_timeout, deep_check_fleet, duplicate_names, each_pod,
-        handle_backup, handle_copy, handle_deep_test, handle_full_backup, handle_init_branches,
+        handle_backup, handle_baseline, handle_copy, handle_deep_test, handle_full_backup, handle_init_branches, pull_label_and_targets, resolve_pull,
         handle_pods, handle_pull, handle_restore, handle_run, handle_set_branch, local_size, marker_present, probe_gpus,
-        proxy_reaches_pod, render_deep_test, render_run, replace_copy_failed, restore_note, restore_notes, run_fleet, run_preview, select,
+        proxy_reaches_pod, render_deep_test, render_run, replace_copy_failed, restore_note, restore_notes, run_failure, run_fleet, run_preview, select,
         target_is_pod, BackupTally, Cli, Cmd, CopyLeg, CopyPlan, PodCmd, RestoreOpts, RestoreSource, RunResult, Select, SelectByFlag, Selected,
         Unscoped, BACKUP_TIMEOUT, BRANCH_TIMEOUT, CP_BASE_TIMEOUT, POD_COPY_TIMEOUT, RUN_TIMEOUT_SECS, TEST_TIMEOUT,
     };
-    use arena_core::selector::SelectArgs;
+    use arena_core::selector::{Naming, SelectArgs};
     use arena_core::backup::{backup_command, checkout_command, init_branch_command, BackupConfig};
     use arena_core::remote::{FakeRemote, FakeReply, Remote, RemoteCall, PROBE_TIMEOUT};
     use arena_core::ssh::{login_shell_wrap, SshTarget};
@@ -15596,15 +16039,16 @@ mod remote_tests {
         script(&fake);
         let remote: Arc<dyn Remote> = fake.clone();
         let results = run_fleet(&remote, targets(&fleet()), &wrapped, Duration::from_secs(60)).await;
-        let ok = |name: &str, text: &str| RunResult { name: name.into(), text: text.into(), ok: true };
+        let ok = |name: &str, text: &str| RunResult { name: name.into(), text: text.into(), ok: true, why: None };
         assert_eq!(
             results,
             [
                 ok("devtest-apple", "hello"),
                 RunResult {
                     name: "devtest-bloom".into(),
-                    text: "exit Some(127): zsh: command not found: nvidia-smi".into(),
-                    ok: false
+                    text: "exit 127: zsh: command not found: nvidia-smi".into(),
+                    ok: false,
+                    why: Some("exit 127: zsh: command not found: nvidia-smi".into()),
                 },
                 ok("devtest-cloud", ""),
             ]
@@ -15617,14 +16061,43 @@ mod remote_tests {
                 "\n── devtest-apple ",
                 "hello",
                 "\n── devtest-bloom (FAILED)",
-                "exit Some(127): zsh: command not found: nvidia-smi",
+                "exit 127: zsh: command not found: nvidia-smi",
                 "\n── devtest-cloud ",
                 "",
                 "\n2 ok, 1 failed",
             ]
         );
         let (lines, _) = render_run(&results, true);
-        assert_eq!(lines[1], "devtest-bloom          ✗ exit Some(127): zsh: command not found: nvidia-smi");
+        assert_eq!(lines[1], "devtest-bloom          ✗ exit 127: zsh: command not found: nvidia-smi");
+    }
+
+    /// A failing command's stdout is part of its report (live: `pods run` showed only stderr,
+    /// so a script's own output before it failed was lost), and no exit reads `Some(1)`.
+    #[test]
+    fn a_failed_run_keeps_its_stdout_and_says_exit_n() {
+        use arena_core::ssh::SshOutput;
+        let out = |code: Option<i32>, stdout: &str, stderr: &str| SshOutput {
+            success: false,
+            code,
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        };
+        // (output, full text, compact reason)
+        let cases: &[(SshOutput, &str, &str)] = &[
+            (out(Some(1), "step 1 ok\nstep 2 ok\n", "Traceback…\nValueError: bad\n"), "step 1 ok\nstep 2 ok\nexit 1: Traceback…\nValueError: bad", "exit 1: ValueError: bad"),
+            (out(Some(1), "3 matches so far\n", ""), "3 matches so far\nexit 1", "exit 1 — last output: 3 matches so far"),
+            (out(Some(2), "", "usage: x\n"), "exit 2: usage: x", "exit 2: usage: x"),
+            (out(None, "", ""), "killed by a signal", "killed by a signal"),
+        ];
+        for (o, text, why) in cases {
+            assert_eq!(run_failure(o), (text.to_string(), why.to_string()), "{o:?}");
+            assert!(!text.contains("Some(") && !why.contains("Some("));
+        }
+        let results = vec![RunResult { name: "devtest-bloom".into(), text: cases[0].1.into(), ok: false, why: Some(cases[0].2.into()) }];
+        let (full, bad) = render_run(&results, false);
+        assert_eq!((bad, full[1].as_str()), (1, "step 1 ok\nstep 2 ok\nexit 1: Traceback…\nValueError: bad"));
+        let (compact, _) = render_run(&results, true);
+        assert_eq!(compact[0], "devtest-bloom          ✗ exit 1: ValueError: bad");
     }
 
     /// A stand-in `rsync` (a shell script in a temp dir) that logs each call's destination —
@@ -15688,6 +16161,99 @@ mod remote_tests {
         }
     }
 
+    /// `pods pull bravo` meant "every pod, into backup/bravo/" (live). Positionals are pods now;
+    /// the old label spelling still works where it can't be a pod, and is refused where it
+    /// could be either.
+    #[test]
+    fn pull_takes_pods_and_its_label_behind_a_flag() {
+        let cfg = Config::parse("MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple bloom w2d2)\n");
+        let naming = Naming::from_config(&cfg);
+        let listed = vec![pod("bravo", 22001), pod("w9d9", 22002)];
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // (positionals, --label, -t, want: Ok((label, targets, noted)) or Err(tell))
+        type Want<'a> = std::result::Result<(Option<&'a str>, &'a [&'a str], bool), &'a str>;
+        let cases: &[(&[&str], Option<&str>, &[&str], Want)] = &[
+            (&["bravo"], None, &[], Ok((None, &["bravo"], false))),
+            (&["bravo", "apple..bloom"], Some("w1d3"), &[], Ok((Some("w1d3"), &["bravo", "apple..bloom"], false))),
+            (&[], None, &[], Ok((None, &[], false))),
+            // The old spelling, where it can only be the label: a note, and it still works.
+            (&["w1d3"], None, &[], Ok((Some("w1d3"), &[], true))),
+            (&["w1d3"], None, &["apple..bloom"], Ok((Some("w1d3"), &["apple..bloom"], true))),
+            (&["w1d3", "bravo"], None, &[], Ok((Some("w1d3"), &["bravo"], true))),
+            // With --label every positional is a pod (the selector judges it).
+            (&["w1d3"], Some("w2d1"), &[], Ok((Some("w2d1"), &["w1d3"], false))),
+            // Not label-shaped: a target — an old custom label fails in the selector, loudly.
+            (&["mylabel"], None, &[], Ok((None, &["mylabel"], false))),
+            (&["apple,w1d3"], None, &[], Ok((None, &["apple,w1d3"], false))),
+            // Either a label or a pod (listed, or a MACHINE_NAME_LIST entry): refused.
+            (&["w9d9"], None, &[], Err("is both a snapshot label and a pod's name")),
+            (&["devtest-w9d9"], None, &[], Ok((None, &["devtest-w9d9"], false))),
+            (&["w2d2"], None, &[], Err("`w2d2` is both")),
+            (&["w1d3", "w1d4"], None, &[], Err("two snapshot labels")),
+        ];
+        for (pos, label, flag, want) in cases {
+            let got = pull_label_and_targets(label.map(String::from), &s(pos), &s(flag), &naming, &listed);
+            match (got, want) {
+                (Ok(g), Ok((l, t, noted))) => {
+                    assert_eq!((g.label.as_deref(), g.targets.clone(), g.note.is_some()), (*l, s(t), *noted), "{pos:?} {label:?}");
+                    if let Some(n) = g.note {
+                        assert!(n.contains("write `--label w1d3`"), "{n}");
+                    }
+                }
+                (Err(e), Err(tell)) => assert!(e.contains(tell), "{pos:?}: {e}"),
+                (got, _) => panic!("{pos:?} {label:?}: got {got:?}, want {want:?}"),
+            }
+        }
+    }
+
+    /// Through the command: what each spelling resolves to — the label, every pod it reaches,
+    /// the deprecation note — exactly as the `pods pull` arm hands them on (then the dry runs
+    /// themselves: nothing copied, no pod asked anything).
+    #[tokio::test]
+    async fn pods_pull_resolves_pods_and_says_where_a_label_goes() {
+        let fake = Arc::new(FakeRemote::new());
+        let cfg = Config::parse(&format!(
+            "MACHINE_NAME_PREFIX=devtest\nBACKUP_REPO_PATH={REPO}\nSHARED_SSH_KEY_PATH=/nonexistent/devtest_key\n\
+             ARENA_START_DATE=2026-01-05\n"
+        ));
+        let every: Vec<String> = fleet().pods.iter().map(|p| p.name.clone()).collect();
+        assert!(every.len() > 1);
+        let resolve = |argv: &'static [&'static str]| {
+            let cfg = cfg.clone();
+            async move {
+                let PodCmd::Pull { label, target_flag, sel, .. } = pods(argv) else { panic!("not pods pull") };
+                resolve_pull(&fleet(), &cfg, label, sel, &target_flag)
+                    .await
+                    .map(|(label, sel, note)| (label, sel.pods.iter().map(|p| p.name.clone()).collect::<Vec<_>>(), note))
+            }
+        };
+        // A pod, positional: that pod, the computed label, no note.
+        assert_eq!(resolve(&["pull", "bloom"]).await.unwrap(), (None, vec!["devtest-bloom".to_string()], None));
+        // The old spelling — a lone wNdM naming no pod: the label, EVERY pod (as it always meant),
+        // and the note saying how to write it now.
+        let (label, chosen, note) = resolve(&["pull", "w1d3"]).await.unwrap();
+        assert_eq!((label.as_deref(), &chosen), (Some("w1d3"), &every));
+        let note = note.expect("the deprecation note");
+        assert!(note.contains("reading `w1d3` as the snapshot label") && note.contains("--label w1d3"), "{note}");
+        // --label with the old -t: that pod, that label, no note.
+        assert_eq!(resolve(&["pull", "-t", "bloom", "--label", "x"]).await.unwrap(), (Some("x".into()), vec!["devtest-bloom".into()], None));
+        assert_eq!(resolve(&["pull", "bloom", "--label", "w1d3"]).await.unwrap(), (Some("w1d3".into()), vec!["devtest-bloom".into()], None));
+        // A word that is no pod and no label: the error says how the command reads now.
+        let msg = format!("{:#}", resolve(&["pull", "mylabel"]).await.unwrap_err());
+        assert!(msg.contains("takes pods as its arguments now") && msg.contains("--label") && msg.contains("mylabel"), "{msg}");
+        // The w1d3 dry run puts every pod under w1d3/ (the same resolution, through the arm).
+        let base = std::env::temp_dir().join(format!("arena-pull-oldlabel-{}", std::process::id()));
+        let PodCmd::Pull { label, target_flag, sel, .. } = pods(&["pull", "w1d3"]) else { panic!("not pods pull") };
+        let (label, chosen, _) = resolve_pull(&fleet(), &cfg, label, sel, &target_flag).await.unwrap();
+        handle_pull(&(fake.clone() as Arc<dyn Remote>), &cfg, label, &base.display().to_string(), None, None, false, false, &chosen, true, true, "rsync")
+            .await
+            .unwrap();
+        assert!(!base.exists(), "a dry run writes nothing");
+        handle_pods(pods(&["pull", "w1d3", "--dry-run"]), &fleet(), fake.clone(), &cfg, true).await.unwrap();
+        handle_pods(pods(&["pull", "bloom", "--dry-run"]), &fleet(), fake.clone(), &cfg, true).await.unwrap();
+        assert!(fake.calls().is_empty());
+    }
+
     #[tokio::test]
     async fn pull_and_backup_rsync_exactly_the_selected_pods() {
         let stub = StubRsync::new("scoped");
@@ -15699,12 +16265,21 @@ mod remote_tests {
             base.display()
         ));
         let base = base.display().to_string();
-        // `pods pull w1d1 -t apple..cloud --exclude bloom`: exactly apple + cloud, both tiers,
-        // through the same selection the command resolves.
-        let PodCmd::Pull { sel, .. } = pods(&["pull", "w1d1", "-t", "apple..cloud", "--exclude", "bloom"]) else {
-            panic!("not pods pull")
-        };
-        let chosen = select(&fleet(), &cfg, &sel.args(), Unscoped::All).await.unwrap();
+        // `pods pull apple..cloud --exclude bloom --label w1d1` — and its old spelling `pods pull
+        // w1d1 -t apple..cloud --exclude bloom`: exactly apple + cloud, both tiers, through the
+        // same selection the command resolves.
+        let listed = fleet().pods.clone();
+        let mut chosen_by = Vec::new();
+        for argv in [&["pull", "apple..cloud", "--exclude", "bloom", "--label", "w1d1"][..], &["pull", "w1d1", "-t", "apple..cloud", "--exclude", "bloom"]] {
+            let PodCmd::Pull { label, target_flag, mut sel, .. } = pods(argv) else { panic!("not pods pull") };
+            let split = pull_label_and_targets(label, &sel.targets, &target_flag, &Naming::from_config(&cfg), &listed).unwrap();
+            assert_eq!(split.label.as_deref(), Some("w1d1"), "{argv:?}");
+            sel.targets = split.targets;
+            let chosen = select(&fleet(), &cfg, &sel.args(), Unscoped::All).await.unwrap();
+            chosen_by.push(chosen.pods.iter().map(|p| p.name.clone()).collect::<Vec<_>>());
+        }
+        assert_eq!(chosen_by, [["devtest-apple", "devtest-cloud"], ["devtest-apple", "devtest-cloud"]]);
+        let chosen = picked(&fleet(), &cfg, &["apple", "cloud"]).await;
         // Each pod is asked where its repo is (a plain directory here: one job per tier).
         let fake = Arc::new(FakeRemote::new());
         for port in [22001, 22003] {
@@ -15712,7 +16287,7 @@ mod remote_tests {
         }
         let remote: Arc<dyn Remote> = fake.clone();
         handle_pull(&remote, &cfg, Some("w1d1".into()), &base, None, None, false, false, &chosen, false, true, &stub.path()).await.unwrap();
-        assert_eq!(stub.take(), ["big/devtest-apple", "big/devtest-cloud", "w1d1/devtest-apple", "w1d1/devtest-cloud"]);
+        assert_eq!(stub.take(), ["big/devtest-apple", "big/devtest-cloud", "w1d1/devtest-apple", "w1d1/devtest-apple", "w1d1/devtest-cloud", "w1d1/devtest-cloud"]);
         assert_eq!(ports(&fake), [22001, 22003], "only the selected pods were asked");
         // `pods backup bloom` (with the pull): the git push AND the rsync reach bloom only.
         let fake = Arc::new(FakeRemote::new());
@@ -15721,7 +16296,7 @@ mod remote_tests {
         handle_full_backup(fake.clone(), &cfg, &chosen, false, None, false, true, &stub.path()).await.unwrap();
         assert_eq!(ports(&fake), [22002]);
         let got = stub.take();
-        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got.len(), 3, "the snapshot's two passes and big: {got:?}");
         assert!(got.iter().all(|d| d.ends_with("/devtest-bloom")) && got.contains(&"big/devtest-bloom".to_string()), "{got:?}");
         // --no-pull: git only. A dry run: neither.
         let fake = Arc::new(FakeRemote::new());
@@ -15776,7 +16351,7 @@ mod remote_tests {
         for tier in ["snapshot", "big"] {
             assert!(err.contains(&format!("devtest-bloom [{tier}] (timed out after 3s)")), "{err}");
         }
-        assert_eq!(stub.take(), ["big/devtest-apple", "big/devtest-cloud", "w1d1/devtest-apple", "w1d1/devtest-cloud"]);
+        assert_eq!(stub.take(), ["big/devtest-apple", "big/devtest-cloud", "w1d1/devtest-apple", "w1d1/devtest-apple", "w1d1/devtest-cloud", "w1d1/devtest-cloud"]);
         // Both of bloom's rsyncs were stopped *before* the failure came back — not by a
         // background task that `main` returning (the runtime dropped) would cut short.
         let pids = std::fs::read_to_string(stub.0.join("hung.pids")).unwrap();
@@ -15836,7 +16411,7 @@ mod remote_tests {
         for tier in ["snapshot", "snapshot repo", "big", "big repo"] {
             assert!(err.contains(&format!("devtest-bloom [{tier}] (timed out after 3s)")), "{err}");
         }
-        assert_eq!(stub.take(), ["big/devtest-apple", "big/devtest-cloud", "w1d1/devtest-apple", "w1d1/devtest-cloud"]);
+        assert_eq!(stub.take(), ["big/devtest-apple", "big/devtest-cloud", "w1d1/devtest-apple", "w1d1/devtest-apple", "w1d1/devtest-cloud", "w1d1/devtest-cloud"]);
         let pids = std::fs::read_to_string(stub.0.join("hung.pids")).unwrap();
         assert_eq!(pids.lines().count(), 4, "{pids}");
         for pid in pids.lines() {
@@ -15870,23 +16445,28 @@ mod remote_tests {
         handle_pull(&remote, &cfg, Some("w1d1".into()), &base, None, None, false, false, &all, false, true, &stub.path()).await.unwrap();
         let args = stub.take_args();
         let of = |port: u16| -> Vec<&String> { args.iter().filter(|a| a.contains(&format!("-p {port} "))).collect() };
-        // apple: home job without the link + the tree from the volume, per tier.
+        // apple: home job without the link + the tree from the volume, per tier — the snapshot's
+        // jobs each two passes (its files under the cap, then its .git uncapped).
         let apple = of(22001);
-        assert_eq!(apple.len(), 4, "{apple:#?}");
+        assert_eq!(apple.len(), 6, "{apple:#?}");
         let homes: Vec<&&String> = apple.iter().filter(|a| a.contains("root@10.0.0.1: ")).collect();
-        assert_eq!(homes.len(), 2, "{apple:#?}");
+        assert_eq!(homes.len(), 3, "{apple:#?}");
         assert!(homes.iter().all(|a| a.contains("--exclude /ARENA_materials ")), "{homes:#?}");
         let trees: Vec<&&String> = apple.iter().filter(|a| a.contains("root@10.0.0.1:/workspace/ARENA_materials/ ")).collect();
-        assert_eq!(trees.len(), 2, "{apple:#?}");
+        assert_eq!(trees.len(), 3, "{apple:#?}");
         assert!(trees.iter().any(|a| a.ends_with("/w1d1/devtest-apple/ARENA_materials/") && a.contains("--max-size=50M")), "{trees:#?}");
+        assert!(
+            trees.iter().any(|a| a.ends_with("/w1d1/devtest-apple/ARENA_materials/") && !a.contains("--max-size") && a.contains("--include */ --exclude *")),
+            "the tree's .git pass: {trees:#?}"
+        );
         assert!(trees.iter().any(|a| a.ends_with("/big/devtest-apple/ARENA_materials/") && !a.contains("--max-size")), "{trees:#?}");
         // bloom didn't answer: its repo comes through the home path (trailing slash follows a link).
         let bloom = of(22002);
-        assert_eq!(bloom.len(), 4, "{bloom:#?}");
-        assert_eq!(bloom.iter().filter(|a| a.contains("root@10.0.0.1:ARENA_materials/ ")).count(), 2, "{bloom:#?}");
+        assert_eq!(bloom.len(), 6, "{bloom:#?}");
+        assert_eq!(bloom.iter().filter(|a| a.contains("root@10.0.0.1:ARENA_materials/ ")).count(), 3, "{bloom:#?}");
         // cloud: a plain directory — one home job per tier, no exclude.
         let cloud = of(22003);
-        assert_eq!(cloud.len(), 2, "{cloud:#?}");
+        assert_eq!(cloud.len(), 3, "{cloud:#?}");
         assert!(cloud.iter().all(|a| !a.contains("--exclude /ARENA_materials")), "{cloud:#?}");
         // A dry run: nobody asked, nothing run.
         let fake = Arc::new(FakeRemote::new());
@@ -15899,7 +16479,7 @@ mod remote_tests {
             .await
             .unwrap();
         assert_eq!(fake.calls().len(), 3);
-        assert_eq!(stub.take_args().len(), 6);
+        assert_eq!(stub.take_args().len(), 9);
         // BACKUP_REMOTE_PATH=~/ (the README's default, what the */15 cron reads) used to skip
         // the question and back up the link alone; it's the home: split like one.
         let linked = || FakeReply::stdout("arena-repo-home=/root\narena-repo-real=/workspace/ARENA_materials\narena-repo-mount=yes\n");
@@ -15911,9 +16491,9 @@ mod remote_tests {
         let remote: Arc<dyn Remote> = fake.clone();
         handle_pull(&remote, &cron, Some("w1d3".into()), &base, None, None, false, false, &all, false, true, &stub.path()).await.unwrap();
         let args = stub.take_args();
-        assert_eq!(args.len(), 12, "home + repo job, two tiers, three pods: {args:#?}");
-        assert_eq!(args.iter().filter(|a| a.contains("root@10.0.0.1:~/ ") && a.contains("--exclude /ARENA_materials ")).count(), 6, "{args:#?}");
-        assert_eq!(args.iter().filter(|a| a.contains("root@10.0.0.1:/workspace/ARENA_materials/ ")).count(), 6, "{args:#?}");
+        assert_eq!(args.len(), 18, "home + repo job, two tiers (the snapshot's in two passes), three pods: {args:#?}");
+        assert_eq!(args.iter().filter(|a| a.contains("root@10.0.0.1:~/ ") && a.contains("--exclude /ARENA_materials ")).count(), 9, "{args:#?}");
+        assert_eq!(args.iter().filter(|a| a.contains("root@10.0.0.1:/workspace/ARENA_materials/ ")).count(), 9, "{args:#?}");
         // --remote-path naming the repo without a slash: the tree from its real path, into
         // <dest>/ARENA_materials/ where rsync would have put the link.
         let fake = Arc::new(FakeRemote::new());
@@ -15924,8 +16504,145 @@ mod remote_tests {
             .await
             .unwrap();
         let args = stub.take_args();
-        assert_eq!(args.len(), 1, "{args:#?}");
-        assert!(args[0].contains("root@10.0.0.1:/workspace/ARENA_materials/ ") && args[0].ends_with("/w1d4/devtest-apple/ARENA_materials/"), "{args:#?}");
+        assert_eq!(args.len(), 2, "{args:#?}");
+        assert!(args.iter().all(|a| a.contains("root@10.0.0.1:/workspace/ARENA_materials/ ") && a.ends_with("/w1d4/devtest-apple/ARENA_materials/")), "{args:#?}");
+    }
+
+    /// A stand-in rsync that also writes into its destination: `image.txt` with an old mtime
+    /// (the image's), `work.txt` with a new one — so a snapshot exists afterwards, and a
+    /// baseline has something to keep and something to drop. Logs every argv.
+    fn writing_rsync(tag: &str) -> StubRsync {
+        use std::os::unix::fs::PermissionsExt;
+        let stub = StubRsync::new(tag);
+        std::fs::write(
+            stub.0.join("rsync"),
+            "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\necho \"$*\" >> \"$(dirname \"$0\")/args.log\"\n\
+             mkdir -p \"$last\" && printf img > \"$last/image.txt\" && touch -d @1000000000 \"$last/image.txt\" && \
+             printf work > \"$last/work.txt\" && printf carried > \"$last/carried.txt\" && \
+             touch -d @1000000000 \"$last/carried.txt\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(stub.0.join("rsync"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        stub
+    }
+
+    /// The second day's snapshot hard-links to the first (and big never does); both of the
+    /// snapshot's passes carry the link-dest.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_second_snapshot_links_to_the_first() {
+        let stub = writing_rsync("linkdest");
+        let base = stub.0.join("backups").display().to_string();
+        let cfg = Config::parse("MACHINE_NAME_PREFIX=devtest\nSHARED_SSH_KEY_PATH=/nonexistent/devtest_key\n");
+        let one = Selected::all(fleet().pods.into_iter().filter(|p| p.name == "devtest-apple").collect());
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [repo_in_place(), repo_in_place(), repo_in_place()]);
+        let remote: Arc<dyn Remote> = fake.clone();
+        handle_pull(&remote, &cfg, Some("w1d1".into()), &base, None, None, false, false, &one, false, true, &stub.path()).await.unwrap();
+        assert!(!stub.take_args().iter().any(|a| a.contains("--link-dest")), "nothing to link to yet");
+        handle_pull(&remote, &cfg, Some("w1d2".into()), &base, None, None, false, false, &one, false, true, &stub.path()).await.unwrap();
+        let args = stub.take_args();
+        let first = std::fs::canonicalize(stub.0.join("backups/w1d1/devtest-apple")).unwrap();
+        let linked: Vec<&String> = args.iter().filter(|a| a.contains(&format!("--link-dest={}", first.display()))).collect();
+        assert_eq!(linked.len(), 2, "{args:#?}");
+        assert!(linked.iter().all(|a| a.ends_with("/w1d2/devtest-apple/")), "{linked:#?}");
+        assert!(args.iter().filter(|a| a.ends_with("/big/devtest-apple/")).all(|a| !a.contains("--link-dest")), "{args:#?}");
+        assert!(!args.iter().any(|a| a.contains("--no-perms")), "a new snapshot is a plain -a pull: {args:#?}");
+        // The same label again (the */15 cron, later that day): its files may be links into the
+        // first snapshot, so their attributes are never changed in place. big isn't linked.
+        handle_pull(&remote, &cfg, Some("w1d2".into()), &base, None, None, false, false, &one, false, true, &stub.path()).await.unwrap();
+        let args = stub.take_args();
+        let snap: Vec<&String> = args.iter().filter(|a| a.ends_with("/w1d2/devtest-apple/")).collect();
+        assert_eq!(snap.len(), 2, "{args:#?}");
+        assert!(snap.iter().all(|a| a.contains("--no-perms --no-owner --no-group")), "{snap:#?}");
+        assert!(args.iter().filter(|a| a.ends_with("/big/devtest-apple/")).all(|a| !a.contains("--no-perms")), "{args:#?}");
+        // A label that is one of the backup dir's own folders is refused.
+        for bad in ["big", "baseline", "a/b"] {
+            let err = handle_pull(&remote, &cfg, Some(bad.into()), &base, None, None, false, false, &one, true, true, &stub.path()).await.unwrap_err();
+            assert!(err.to_string().contains("can't be a snapshot label"), "{bad}: {err}");
+        }
+    }
+
+    /// `pods baseline`: from a fresh pod only (its container's age known, under a day), into
+    /// baseline/w<N>/fleet/ holding only the files older than the container — and none the pod
+    /// lists as copied onto it since with an old mtime (a `pods replace` copy: `carried.txt`);
+    /// an existing one needs --replace, which moves it aside. A dry run writes nothing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_baseline_comes_from_a_fresh_pod_and_keeps_only_the_image() {
+        let stub = writing_rsync("baseline");
+        let base = stub.0.join("backups");
+        let dir = base.display().to_string();
+        let cfg = Config::parse(&format!(
+            "MACHINE_NAME_PREFIX=devtest\nSHARED_SSH_KEY_PATH=/nonexistent/devtest_key\nBACKUP_REPO_PATH={REPO}\n"
+        ));
+        // Real time: the stub's `work.txt` is written now, after the container's creation.
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let probe = |created: Option<u64>| {
+            let c = created.map(|t| format!("arena-repo-container={t}\n")).unwrap_or_default();
+            FakeReply::stdout(&format!("arena-repo-home=/root\narena-repo-real={REPO}\narena-repo-mount=no\n{c}"))
+        };
+        // The pod's listing of what was copied onto it since its container was created.
+        let copied = |paths: &[&str]| {
+            let records: String = paths.iter().map(|p| format!("./{p}\0")).collect();
+            FakeReply::stdout(&format!("arena-copied-begin\0{records}arena-copied-end\0"))
+        };
+        let run = |fake: &Arc<FakeRemote>, week: u32, replace: bool, dry: bool| {
+            let remote: Arc<dyn Remote> = fake.clone();
+            let (dir, stub) = (dir.clone(), stub.path());
+            let cfg = cfg.clone();
+            async move { handle_baseline(&fleet(), &remote, &cfg, "apple", Some(week), &dir, replace, dry, true, &stub, now).await }
+        };
+        // Refused: no creation time; a container two days old.
+        for created in [None, Some(now - 2 * 86_400)] {
+            let fake = Arc::new(FakeRemote::new());
+            fake.script(&host(22001), [probe(created)]);
+            let err = run(&fake, 0, false, false).await.unwrap_err().to_string();
+            assert!(err.starts_with("refusing the baseline: devtest-apple"), "{err}");
+            assert!(stub.take_args().is_empty());
+        }
+        // Refused: what was copied onto it can't be listed (cut short, or find failed).
+        for listing in [FakeReply::stdout("arena-copied-begin\0./carried.txt\0"), FakeReply::exit(1, "find: unknown predicate `-newercm'")] {
+            let fake = Arc::new(FakeRemote::new());
+            fake.script(&host(22001), [probe(Some(now - 600)), listing]);
+            let err = run(&fake, 0, false, false).await.unwrap_err().to_string();
+            assert!(err.starts_with("refusing the baseline: couldn't list what was copied onto devtest-apple"), "{err}");
+            assert!(stub.take_args().is_empty() && !base.join("baseline").exists());
+        }
+        // A dry run: asked, nothing written.
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [probe(Some(now - 600)), copied(&["carried.txt"])]);
+        run(&fake, 0, false, true).await.unwrap();
+        assert!(stub.take_args().is_empty() && !base.join("baseline").exists());
+        // The capture: both passes, then only the image's file stays — not what was written
+        // since, nor what was copied in with its old mtime.
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [probe(Some(now - 600)), copied(&["carried.txt"])]);
+        run(&fake, 0, false, false).await.unwrap();
+        assert_eq!(stub.take_args().len(), 2);
+        let fleet0 = base.join("baseline/w0/fleet");
+        assert!(fleet0.join("image.txt").is_file() && !fleet0.join("work.txt").exists());
+        assert!(!fleet0.join("carried.txt").exists(), "copied onto the pod after its container: not the image's");
+        let leftovers: Vec<_> = std::fs::read_dir(base.join("baseline/w0")).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
+        assert_eq!(leftovers, ["fleet"], "no partial dir left");
+        // Again: refused without --replace (nothing run); with it, the old one moved aside.
+        let fake = Arc::new(FakeRemote::new());
+        let err = run(&fake, 0, false, false).await.unwrap_err().to_string();
+        assert!(err.contains("already holds week 0's baseline") && err.contains("--replace"), "{err}");
+        assert!(fake.calls().is_empty() && stub.take_args().is_empty());
+        fake.script(&host(22001), [probe(Some(now - 600)), copied(&[])]);
+        run(&fake, 0, true, false).await.unwrap();
+        let mut names: Vec<String> =
+            std::fs::read_dir(base.join("baseline/w0")).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        assert_eq!(names, ["fleet".to_string(), format!("fleet.replaced-{}", arena_core::restore::stamp(now))]);
+        stub.take_args();
+        // Week 1's links to week 0's.
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [probe(Some(now - 600)), copied(&[])]);
+        run(&fake, 1, false, false).await.unwrap();
+        let w0 = std::fs::canonicalize(&fleet0).unwrap();
+        assert!(stub.take_args().iter().all(|a| a.contains(&format!("--link-dest={}", w0.display()))));
     }
 
     /// A backups dir with pull's layout for apple: two snapshots and the big tier.
@@ -16103,7 +16820,7 @@ mod remote_tests {
         };
         let failing = script("rsync-fails", "#!/bin/sh\necho 'rsync: connection unexpectedly closed' >&2\nexit 12\n");
         let e = handle_restore(&f, &remote, &cfg(), "apple", restore_opts(&dir), &failing, NOW).await.unwrap_err().to_string();
-        assert!(e.contains("exit Some(12)") && e.contains("connection unexpectedly closed") && e.contains("nothing on the pod was deleted"), "{e}");
+        assert!(e.contains("exit 12") && e.contains("connection unexpectedly closed") && e.contains("nothing on the pod was deleted"), "{e}");
         // Stuck: stopped at its budget, reported as such.
         let stuck = script("rsync-stuck", "#!/bin/sh\nexec sleep 30\n");
         let opts = RestoreOpts { timeout: Duration::from_millis(500), ..restore_opts(&dir) };
@@ -16353,7 +17070,7 @@ mod remote_tests {
         let jobs = targets(&f).into_iter().map(|(n, t)| (n, t, "backup".to_string())).collect();
         let mut lines = Vec::new();
         let start = Instant::now();
-        let tally = backup_fleet(&remote, jobs, |l| lines.push(l.to_string())).await;
+        let tally = backup_fleet(&remote, jobs, REPO, |l| lines.push(l.to_string())).await;
         assert_eq!(tally, BackupTally { pushed: 1, unchanged: 1, skipped: 1, failed: 2 });
         assert_eq!(start.elapsed(), BACKUP_TIMEOUT);
         // The wedged pod reports last, after its budget; the rest as soon as they answered.
@@ -16366,7 +17083,7 @@ mod remote_tests {
                 "= devtest-cloud (no changes, on feature-y)",
                 "⊘ devtest-delta (skipped — on protected branch main)",
                 "✓ devtest-apple -> autocommit-x",
-                "✗ devtest-echo (exit Some(128)): fatal: Could not read from remote repository.",
+                "✗ devtest-echo (exit 128): fatal: Could not read from remote repository.",
             ]
         );
 
@@ -17197,7 +17914,7 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
                     "devtest-bloom",
                     Status::Fail,
                     "ssh",
-                    "exit Some(255): ssh: connect to host 10.0.0.1 port 22002: Connection refused"
+                    "exit 255: ssh: connect to host 10.0.0.1 port 22002: Connection refused"
                 ),
                 (
                     "devtest-cloud",

@@ -646,10 +646,13 @@ pub fn pull_jobs(pc: &crate::pull::PullConfig, dest: &str, split: Option<&RepoPu
     let Some(split) = split else {
         return vec![PullJob { repo: false, dest: dest.to_string(), config: pc.clone() }];
     };
+    // The repo's tree lands at `<dest>/<rel>/`, so the trees it hard-links to are the same
+    // place in each of them.
+    let link_dest = pc.link_dest.iter().map(|d| format!("{}/{}", d.trim_end_matches('/'), split.rel)).collect();
     let repo = PullJob {
         repo: true,
         dest: format!("{}/{}/", dest.trim_end_matches('/'), split.rel),
-        config: crate::pull::PullConfig { remote_path: split.source.clone(), ..pc.clone() },
+        config: crate::pull::PullConfig { remote_path: split.source.clone(), link_dest, ..pc.clone() },
     };
     if split.whole {
         return vec![repo];
