@@ -110,6 +110,13 @@ pub enum Mirror {
 }
 
 impl Mirror {
+    /// Whether the transfer deletes on the receiver (`--delete`): [`Mirror::Exact`] and
+    /// [`Mirror::Replica`]. Such a transfer carries empty dirs and protects nothing inside a
+    /// `.git` (see [`rsync_args`]), so the receiver's tree ends up exactly the sender's.
+    pub fn deletes(&self) -> bool {
+        !matches!(self, Mirror::Accumulate)
+    }
+
     /// The top folder a [`Mirror::Replica`] moves files into: its `backup_dir`'s first
     /// component past any `..` (`arena-sync-kept/S` and `../arena-sync-kept/S/repo` →
     /// `arena-sync-kept`). `None` for the other mirrors.
@@ -466,8 +473,17 @@ fn rsync_flags(pc: &PullConfig) -> Vec<String> {
         "-avz".to_string(),
         "--info=progress2".into(),
         "--stats".into(), // emit a summary we parse to report files/bytes per pod
-        "--prune-empty-dirs".into(),
     ];
+    // Only a copy that never deletes prunes empty dirs ([`Mirror::deletes`]): a mirror carries
+    // the tree as it is, empty dirs too. Pruned from a mirror's file list, a source's empty dir
+    // is "gone" to `--delete`, which then removes the receiver's — a `.git/refs/` whose refs
+    // are all packed, and the copy is no repo at all. The rule that keeps such dirs in an
+    // accumulating tier's list (the `.git` protect below) can't do it here: a protect rule is
+    // also the receiver's, so it would keep the receiver's own git state the source doesn't
+    // have — a deleted branch's ref, a stale `rebase-merge/` — in the replica.
+    if !pc.mirror.deletes() {
+        a.push("--prune-empty-dirs".into());
+    }
     if let Some(t) = pc.io_timeout_secs {
         a.push(format!("--timeout={t}"));
     }
@@ -511,8 +527,9 @@ fn rsync_flags(pc: &PullConfig) -> Vec<String> {
     }
     // `--prune-empty-dirs` must not prune inside a kept `.git`: a repo whose refs are all packed
     // has an empty `.git/refs/heads/`, and git doesn't take a `.git` without `refs/` for a
-    // repository at all ("not a git repository") — the copy would be no repo.
-    if pc.includes.iter().any(|i| i.contains(".git")) {
+    // repository at all ("not a git repository") — the copy would be no repo. (A mirror doesn't
+    // prune, and mustn't protect: see above.)
+    if !pc.mirror.deletes() && pc.includes.iter().any(|i| i.contains(".git")) {
         a.push("--filter=protect **/.git/**/".into());
     }
     // Includes first (they win over a later exclude), then excludes.
@@ -1135,9 +1152,33 @@ mod tests {
         assert!(a.contains(&"--rsync-path=check && rsync".to_string()));
         assert_eq!(Mirror::Replica { backup_dir: "../arena-sync-kept/S/ARENA_materials".into() }.backup_root(), Some("arena-sync-kept"));
         assert_eq!(Mirror::Exact.backup_root(), None);
-        for tier in [PullConfig::big_tier(), PullConfig::small_tier("50M"), PullConfig::replication()] {
+        // A backup tier carries no kept-folder protect, no guard and no deletion — including the
+        // snapshot tier as the pull really runs it (linked to earlier snapshots, two passes).
+        // Its only filter is the `.git` protect that keeps a complete `.git` (in a pass that has
+        // one: a capped tier's first pass leaves `.git` to the second).
+        let base = std::env::temp_dir().join(format!("arena-pull-tiers-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("w1d1/devtest-a")).unwrap();
+        std::fs::write(base.join("w1d1/devtest-a/f"), "x").unwrap();
+        let linked = snapshot_tier_for(&base, "w1d1", "devtest-a", &PullConfig::small_tier("50M"));
+        assert!(linked.linked_dest);
+        let tiers = [PullConfig::big_tier(), PullConfig::small_tier("50M"), PullConfig::replication()];
+        for tier in tiers.iter().chain(&[linked]).flat_map(|t| t.passes()) {
             let a = rsync_args(&target(), &tier, "./d/").join(" ");
-            assert!(!a.contains("--filter") && !a.contains("--rsync-path") && !a.contains("--delete"), "{a}");
+            assert!(!a.contains("--filter=P ") && !a.contains("--rsync-path") && !a.contains("--delete") && !a.contains("--backup"), "{a}");
+            assert!(a.contains("--prune-empty-dirs"), "{a}");
+            assert_eq!(a.contains("--filter=protect **/.git/**/"), tier.includes.iter().any(|i| i.contains(".git")), "{a}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+        // …and a mirror (the replica's push, its via-local staging pull) carries none of the
+        // backups' own flags: no hard links, no frozen attributes, no `.git` protect (it would
+        // keep the receiver's stale git state) and no pruning (a pruned dir is a deleted one).
+        let staging = PullConfig { mirror: Mirror::Exact, ..PullConfig::replication() };
+        for a in [push_rsync_args(&target(), &pc, "/tmp/s/"), rsync_args(&target(), &staging, "./stage/")] {
+            let a = a.join(" ");
+            assert!(a.contains("--delete"), "{a}");
+            for leak in ["--link-dest", "--no-perms", "--filter=protect **/.git", "--prune-empty-dirs"] {
+                assert!(!a.contains(leak), "{leak}: {a}");
+            }
         }
     }
 

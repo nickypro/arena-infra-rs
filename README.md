@@ -648,7 +648,10 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
       like a stopped original; so is a stopped original by `replace` / `migrate copy` *while
       planning*, before anything is created and billed. When the original's repo is missing
       or a dangling link, the via-local copy leaves `-new`'s repo alone, as the direct one does.
-    - It carries the home incl. `.git`, `~/.config`, `~/.jupyter`, `~/.ipython`, `~/.local`
+    - It carries the home incl. `.git` (every one: a nested clone's too, its stashes and
+      branches; and each exactly as on the original — empty dirs included, so a repo whose
+      refs are all packed stays a repo, and `-new`'s own git state the original lacks is moved
+      aside like any file), `~/.config`, `~/.jupyter`, `~/.ipython`, `~/.local`
       (bin, share) — and says what it skips (caches and other dot-dirs — `.cache/` and
       `__pycache__/` inside `~/.config` too —, venvs, site-packages and `~/.local/lib`, HF
       caches, uv's Pythons, the `claude`/`codex` setup installs in `~/.local/bin` (never
@@ -674,7 +677,7 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     - `migrate cutover --no-final-sync` cuts over to the copy already on `-new` when the
       original is stopped/unreachable (a stopped source is refused by the final sync *saying
       so*, with that flag); the plan says when `-new` was last synced. `migrate revert` says
-      that the new pod's work since the cutover stays on `-new` (back it up with `pods pull -t
+      that the new pod's work since the cutover stays on `-new` (back it up with `pods pull
       <name>-new`); a revert never writes `~/.name` through a stopped pod's stale endpoint.
       `migrate finish` keeps a **stopped** `-old` — nothing was synced from it since `-new`'s
       last sync, and its volume may hold what changed since — saying so (volume, last sync)
@@ -685,7 +688,7 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     **fleet baseline** into `<dir>/baseline/w<N>/fleet/`: the image's own files, which every
     pod's snapshots hard-link to (see `pods pull`). Run it once a week (or after an image
     change) on a pod `up` just made — its container must say when it was created and be under
-    a day old, else it's refused. It rsyncs the pod's home with the snapshot tier's filters
+    a day old, else it's refused (so is a stopped pod: its listed endpoint is stale). It rsyncs the pod's home with the snapshot tier's filters
     (linked to last week's baseline), then **keeps only the files older than the container**:
     a hard link is made on equal size + mtime + permissions, contents are never compared, so a
     file written at setup or later (`~/.name`, the API keys in `.bashrc`, a script's output on

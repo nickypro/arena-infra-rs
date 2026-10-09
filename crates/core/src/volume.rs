@@ -1355,6 +1355,150 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The replica meets complete `.git` copies and nested clones adopted in place (their own
+    /// `.git` where it was), through the real rsync and git, both ways a replica is made: direct,
+    /// and via a local stage kept from an earlier run. The new pod's repo
+    /// - is still a repo when the original's refs are all packed: its `.git/refs/` then holds
+    ///   only empty dirs, which `--prune-empty-dirs` dropped from a mirror's file list, so the
+    ///   `--delete` moved `-new`'s whole `refs/` aside — "not a git repository";
+    /// - has exactly the original's git state: a branch deleted on the original is gone, and
+    ///   `-new`'s own `rebase-merge/` is moved aside, not left in place — the backups' `.git`
+    ///   protect rule, applied to a mirror, kept both (on `-new`, and in the stage);
+    /// - carries the nested clone's `.git`: the stash and side branch made in it.
+    #[cfg(unix)]
+    #[test]
+    fn a_replica_carries_the_originals_git_state_exactly_nested_clones_too() {
+        use crate::pull::{push_rsync_args, rsync_args, Mirror, PullConfig};
+        use crate::replica::{home_mirror, KEPT_DIR};
+        use std::path::Path;
+        if !fake_ssh::have_rsync() {
+            eprintln!("rsync not installed — skipping");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("arena-volume-replica-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let git = |dir: &Path, args: &[&str]| {
+            let o = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(["-c", "user.name=p", "-c", "user.email=p@p", "-c", "init.defaultBranch=main"])
+                .args(args)
+                .output()
+                .unwrap();
+            let out = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+            assert!(o.status.success(), "git {args:?} in {}: {out}", dir.display());
+            out.trim().to_string()
+        };
+        let write = |p: &Path, body: &str| {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        // A pod: its repo on its volume (`ws/`), linked from its home.
+        let link_home = |name: &str| {
+            std::fs::create_dir_all(root.join(format!("{name}/home"))).unwrap();
+            std::os::unix::fs::symlink(root.join(format!("{name}/ws/ARENA_materials")), root.join(format!("{name}/home/ARENA_materials"))).unwrap();
+        };
+        let repo = root.join("old/ws/ARENA_materials");
+        write(&repo.join("a.py"), "a\n");
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["add", "a.py"]);
+        git(&repo, &["commit", "-qm", "a"]);
+        git(&repo, &["branch", "feature/x"]);
+        git(&repo, &["tag", "t1"]);
+        let upstream = root.join("upstream");
+        write(&upstream.join("u.py"), "u\n");
+        git(&upstream, &["init", "-q"]);
+        git(&upstream, &["add", "u.py"]);
+        git(&upstream, &["commit", "-qm", "u"]);
+        git(&repo, &["clone", "-q", &upstream.display().to_string(), "ex/clone"]);
+        link_home("old");
+        write(&root.join("old/home/notes.txt"), "notes\n");
+
+        // The earlier sync: both new pods hold the original as it was (the image's clone, the
+        // branch and tag), and so does the stage an earlier via-local run kept.
+        for name in ["direct", "via"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+            let out = std::process::Command::new("cp").arg("-a").arg(root.join("old/ws")).arg(root.join(name)).output().unwrap();
+            assert!(out.status.success());
+            link_home(name);
+            assert!(root.join(format!("{name}/home/ARENA_materials/.git/refs/heads/feature/x")).is_file());
+            assert!(root.join(format!("{name}/home/ARENA_materials/ex/clone/.git")).is_dir());
+        }
+        let fake = fake_ssh::install(&root);
+        let target = crate::ssh::SshTarget { user: "root".into(), host: "10.0.0.2".into(), port: 22, key_paths: vec![], connect_timeout_secs: 10 };
+        let stage = format!("{}/", root.join("stage").display());
+        let split = RepoPull { rel: "ARENA_materials".into(), source: format!("{}/", repo.display()), whole: false };
+        let staging_pc = PullConfig { mirror: Mirror::Exact, ..PullConfig::replication() };
+        let stage_pull = || {
+            for job in pull_jobs(&staging_pc, &stage, Some(&split)) {
+                std::fs::create_dir_all(&job.dest).unwrap();
+                fake_ssh::rsync(&fake_ssh::swap_transport(&rsync_args(&target, &job.config, &job.dest), &fake), &root.join("old/home"));
+            }
+        };
+        stage_pull();
+        assert!(root.join("stage/ARENA_materials/.git/refs/heads/feature/x").is_file());
+
+        // Since: on the original the branch and tag are deleted and every ref is packed (its
+        // `.git/refs/` holds no file); the participant stashes and commits a side branch in the
+        // nested clone. On each new pod, a rebase of its own was left half-done.
+        git(&repo, &["branch", "-qD", "feature/x"]);
+        git(&repo, &["tag", "-d", "t1"]);
+        git(&repo, &["pack-refs", "--all"]);
+        let clone = repo.join("ex/clone");
+        write(&clone.join("u.py"), "stashed edit\n");
+        git(&clone, &["stash", "-q"]);
+        git(&clone, &["checkout", "-q", "-b", "side"]);
+        write(&clone.join("side.py"), "side\n");
+        git(&clone, &["add", "side.py"]);
+        git(&clone, &["commit", "-qm", "side work"]);
+        let side = git(&clone, &["rev-parse", "HEAD"]);
+        git(&clone, &["checkout", "-q", "main"]);
+        assert_eq!(git(&repo, &["for-each-ref", "--format=%(refname)"]), "refs/heads/main");
+        assert!(walk(&repo.join(".git/refs")).is_empty(), "every ref packed");
+        for name in ["direct", "via"] {
+            write(&root.join(format!("{name}/ws/ARENA_materials/.git/rebase-merge/head-name")), "refs/heads/stale\n");
+        }
+
+        let pc = PullConfig { mirror: home_mirror("S1"), ..PullConfig::replication() };
+        // Direct, run on the "source".
+        let bin = fake_ssh::install_as_ssh(&root);
+        let cmd = pod_to_pod_copy("10.0.0.2", 22, "root", "/k", &pc, Some("ARENA_materials"));
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .env("HOME", root.join("old/home"))
+            .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default()))
+            .env("FAKE_HOME", root.join("direct/home"))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        // Via local staging: the kept stage is brought up to date (an exact mirror), then pushed.
+        stage_pull();
+        for (src, cfg) in push_jobs(&pc, &stage, Some("ARENA_materials"), true) {
+            fake_ssh::rsync(&fake_ssh::swap_transport(&push_rsync_args(&target, &cfg, &src), &fake), &root.join("via/home"));
+        }
+
+        for name in ["direct", "via"] {
+            let new = root.join(format!("{name}/home/ARENA_materials"));
+            git(&new, &["rev-parse", "--git-dir"]);
+            assert_eq!(git(&new, &["for-each-ref", "--format=%(refname)"]), "refs/heads/main", "{name}: the original's refs, no more");
+            assert!(!new.join(".git/rebase-merge").exists(), "{name}: -new's own git state isn't left in the replica");
+            assert!(
+                root.join(format!("{name}/ws/{KEPT_DIR}/S1/ARENA_materials/.git/rebase-merge/head-name")).is_file(),
+                "{name}: …it's moved aside, beside the repo"
+            );
+            assert_eq!(git(&new, &["status", "--porcelain", "--untracked-files=no"]), "", "{name}");
+            let clone = new.join("ex/clone");
+            assert!(git(&clone, &["stash", "list"]).contains("stash@{0}"), "{name}: the nested clone's stash");
+            assert_eq!(git(&clone, &["rev-parse", "side"]), side, "{name}: the nested clone's side branch");
+            assert_eq!(
+                std::fs::canonicalize(git(&clone, &["rev-parse", "--show-toplevel"])).unwrap(),
+                std::fs::canonicalize(&clone).unwrap(),
+                "{name}: still its own repo"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Every file under `dir` with its contents, sorted — to show a tree is untouched.
     #[cfg(unix)]
     fn walk(dir: &std::path::Path) -> Vec<(String, String)> {

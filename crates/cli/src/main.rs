@@ -9292,13 +9292,13 @@ async fn handle_migrate_revert(
 }
 
 /// What `migrate revert` says about the new pod's work (pure, tested): it stays there, and
-/// how to get it — `pods pull -t <new>` backs up THAT pod only (a positional argument to
-/// `pull` is the backup's label, so `pods pull <new>` would pull every pod's home into a
-/// folder named after it, onto the disk the live cohort shares).
+/// how to get it — `pods pull <new>` backs up THAT pod only (`pull`'s positionals are pods,
+/// like every command's; it once read one as the backup's label and pulled every pod's home
+/// into a folder named after it, onto the disk the live cohort shares).
 fn revert_followup(canonical: &str, new_name: &str) -> String {
     format!(
         "  Its work since the cutover stays there — copy what's wanted back to {canonical} by hand (back it up \
-         first with `arena pods pull -t {new_name}`)."
+         first with `arena pods pull {new_name}`)."
     )
 }
 
@@ -9333,7 +9333,7 @@ fn stopped_old_refusal(old_name: &str, status: &str, canonical: &str, volume_gb:
     format!(
         "NOT terminating {old_name}: it is stopped ({status}), so nothing was synced from it after {canonical}'s last \
          sync ({last_sync}) — whatever the participant changed on it since (e.g. before a `cutover --no-final-sync`) \
-         was never copied, and {holds}. Start it (`arena pods start {old_name}`) and back it up (`arena pods pull -t \
+         was never copied, and {holds}. Start it (`arena pods start {old_name}`) and back it up (`arena pods pull \
          {old_name}`) first, or re-run with --discard-stopped to terminate it anyway."
     )
 }
@@ -11223,6 +11223,12 @@ async fn handle_baseline(
     let policy = arena_core::retry::RetryPolicy::default();
     let pods = arena_core::retry::retrying(&policy, || provider.list_pods()).await.context("listing pods")?;
     let pod = pods[arena_core::selector::resolve_one(&Naming::from_config(cfg), &pods, target)?].clone();
+    // A stopped pod's listed endpoint belongs to nothing now — whatever answers there may be
+    // another pod, whose home every snapshot would then link to — so it's refused before any
+    // probe, as every SSH command refuses one (live finding #15).
+    if arena_core::status::is_stopped(&pod.status) {
+        anyhow::bail!("refusing the baseline: {} is stopped ({}) — `arena pods start {}` brings it back", pod.name, pod.status, pod.name);
+    }
     let ssh = SshTarget::from_pod(&pod, cfg).with_context(|| format!("{}: no SSH endpoint", pod.name))?;
     let base = std::path::Path::new(dir);
     let dest = pull::baseline_dir(base, week);
@@ -16563,6 +16569,25 @@ mod remote_tests {
         }
     }
 
+    /// `pods baseline` never reads a STOPPED pod: its listed endpoint may answer as another pod
+    /// now. Refused before anything is asked of it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stopped_pod_is_never_the_baseline_source() {
+        let stub = writing_rsync("baseline-stopped");
+        let dir = stub.0.join("backups").display().to_string();
+        let mut f = fleet();
+        f.pods[0].status = "EXITED".into();
+        let fake = Arc::new(FakeRemote::new());
+        let remote: Arc<dyn Remote> = fake.clone();
+        let err = handle_baseline(&f, &remote, &cfg(), "apple", Some(0), &dir, false, false, true, &stub.path(), 1_791_000_000)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("devtest-apple is stopped (EXITED)") && err.contains("arena pods start devtest-apple"), "{err}");
+        assert!(fake.calls().is_empty() && stub.take_args().is_empty(), "{:?}", fake.calls());
+    }
+
     /// `pods baseline`: from a fresh pod only (its container's age known, under a day), into
     /// baseline/w<N>/fleet/ holding only the files older than the container — and none the pod
     /// lists as copied onto it since with an old mtime (a `pods replace` copy: `carried.txt`);
@@ -19445,15 +19470,20 @@ mod lifecycle_tests {
         assert!(f.calls().is_empty() && remote.calls().is_empty(), "{:?} {:?}", f.calls(), remote.calls());
     }
 
-    /// Review finding: after a revert the summary said `arena pods pull <new>` — but pull's
-    /// positional argument is the backup LABEL, so that pulls EVERY pod's home into a folder
-    /// named after the new pod, onto the disk the live cohort shares. It says `-t` now.
+    /// Review finding: after a revert the summary said `arena pods pull <new>` while pull's
+    /// positional argument was the backup LABEL — that pulled EVERY pod's home into a folder
+    /// named after the new pod, onto the disk the live cohort shares. Positionals are pods now
+    /// (`--label` takes the label; `-t` is the hidden old spelling), and the hint names the pod
+    /// that way: it resolves to that pod alone, with no label read from it.
     #[test]
     fn the_revert_followup_backs_up_only_the_new_pod() {
         let line = revert_followup("devtest-alpha", "devtest-alpha-new");
-        assert!(line.contains("`arena pods pull -t devtest-alpha-new`"), "{line}");
-        assert!(!line.contains("pods pull devtest-alpha-new"), "{line}");
-        assert!(matches!(pods_cmd(&["pull", "-t", "devtest-alpha-new"]), PodCmd::Pull { label: None, .. }));
+        assert!(line.contains("`arena pods pull devtest-alpha-new`"), "{line}");
+        let PodCmd::Pull { label, sel, target_flag, .. } = pods_cmd(&["pull", "devtest-alpha-new"]) else { panic!("not a pull") };
+        let cfg = Config::parse("MACHINE_NAME_PREFIX=devtest\n");
+        let naming = arena_core::selector::Naming::from_config(&cfg);
+        let args = crate::pull_label_and_targets(label, &sel.targets, &target_flag, &naming, &[]).unwrap();
+        assert_eq!(args, crate::PullArgs { label: None, targets: vec!["devtest-alpha-new".to_string()], note: None });
     }
 
     /// Review finding: a revert wrote `~/.name` through the listed endpoint of a STOPPED
@@ -19589,7 +19619,7 @@ mod lifecycle_tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("NOT terminating devtest-bravo-old: it is stopped (EXITED)") && e.contains("its 20 GB volume"), "{e}");
-        assert!(e.contains("2026-10-08 11:02 UTC") && e.contains("--discard-stopped") && e.contains("`arena pods pull -t devtest-bravo-old`"), "{e}");
+        assert!(e.contains("2026-10-08 11:02 UTC") && e.contains("--discard-stopped") && e.contains("`arena pods pull devtest-bravo-old`"), "{e}");
         assert!(f.calls().is_empty());
         take_would_refuse();
         migrate_finish_on(&remote, &f, &cfg, &f, "devtest-bravo", &listed, FinishOpts { dry_run: true, yes: true, ..Default::default() }).await.unwrap();
