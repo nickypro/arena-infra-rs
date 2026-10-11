@@ -247,6 +247,15 @@ fn path_component(prefix: &str) -> String {
 /// says so); a relative `ARENA_STATE_DIR` is refused — a cron job and a shell would
 /// resolve it to different places.
 pub fn health_cache_path(prefix: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
+    Ok(state_dir(prefix, lookup)?.join(HEALTH_CACHE_FILE))
+}
+
+/// This fleet's state directory, `<root>/<prefix>/`, the root resolved as for
+/// [`health_cache_path`] (which lives in it): `$ARENA_STATE_DIR`, else
+/// `$XDG_STATE_HOME/arena`, else `~/.local/state/arena`; a relative `ARENA_STATE_DIR` is
+/// refused. Also where the backup archive keeps its keys and sync state (`archive/`), so a
+/// cron job and an interactive run that agree on `ARENA_STATE_DIR` share them. Pure.
+pub fn state_dir(prefix: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
     let set = |k: &str| lookup(k).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
     let root = if let Some(dir) = set("ARENA_STATE_DIR") {
         let dir = PathBuf::from(dir);
@@ -260,7 +269,16 @@ pub fn health_cache_path(prefix: &str, lookup: impl Fn(&str) -> Option<String>) 
         let home = set("HOME").ok_or("no ARENA_STATE_DIR, XDG_STATE_HOME or HOME to keep it in")?;
         PathBuf::from(home).join(".local").join("state").join("arena")
     };
-    Ok(root.join(path_component(prefix)).join(HEALTH_CACHE_FILE))
+    Ok(root.join(path_component(prefix)))
+}
+
+/// [`state_dir`] for a loaded config, resolved exactly like [`health_cache_path_for`].
+pub fn state_dir_for(cfg: &Config) -> Result<PathBuf, String> {
+    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
+    state_dir(prefix, |k| match k {
+        "ARENA_STATE_DIR" => cfg.get(k).map(String::from),
+        _ => std::env::var(k).ok(),
+    })
 }
 
 /// [`health_cache_path`] for a loaded config, as every surface resolves it: the fleet
@@ -349,14 +367,15 @@ impl HealthCache {
     }
 }
 
+/// Create `dir` (and its parents) owner-only (0700) if missing.
 #[cfg(unix)]
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
 }
 
 #[cfg(not(unix))]
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)
 }
 
@@ -1249,6 +1268,13 @@ mod tests {
         ];
         for (vars, prefix, want) in cases {
             let got = health_cache_path(prefix, env(vars));
+            // The state dir follows the same rules: the cache's directory, or the same refusal.
+            let dir = state_dir(prefix, env(vars));
+            match (&got, &dir) {
+                (Ok(g), Ok(d)) => assert_eq!(g.parent(), Some(d.as_path()), "{vars:?} {prefix}"),
+                (Err(a), Err(b)) => assert_eq!(a, b),
+                _ => panic!("{vars:?} {prefix}: {got:?} vs {dir:?}"),
+            }
             match (want, &got) {
                 (Ok(p), Ok(g)) => assert_eq!(g, Path::new(p), "{vars:?} {prefix}"),
                 (Err(needle), Err(e)) => assert!(e.contains(needle), "{e}"),
@@ -1515,8 +1541,10 @@ mod tests {
     fn health_cache_path_for_takes_the_state_dir_and_prefix_from_config() {
         let cfg = Config::parse("MACHINE_NAME_PREFIX=devtest\nARENA_STATE_DIR=/srv/arena-state\n");
         assert_eq!(health_cache_path_for(&cfg).unwrap(), Path::new("/srv/arena-state/devtest/health.json"));
+        assert_eq!(state_dir_for(&cfg).unwrap(), Path::new("/srv/arena-state/devtest"));
         let rel = Config::parse("ARENA_STATE_DIR=state\n");
         assert!(health_cache_path_for(&rel).unwrap_err().contains("absolute"));
+        assert!(state_dir_for(&rel).unwrap_err().contains("absolute"));
     }
 
     #[test]

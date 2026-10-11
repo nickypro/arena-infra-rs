@@ -384,6 +384,7 @@ mod tests {
             port: 22001,
             key_paths: vec!["/k/devtest_key".into()],
             connect_timeout_secs: 10,
+            host_keys: Default::default(),
         }
     }
 

@@ -1053,6 +1053,7 @@ mod tests {
             port,
             key_paths: vec![],
             connect_timeout_secs: 10,
+            host_keys: Default::default(),
         }
     }
 

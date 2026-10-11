@@ -21,6 +21,7 @@ use arena_core::ssh::SshTarget;
 use arena_core::volume::RepoSite;
 use arena_core::{Config, PodSpec};
 
+mod archive;
 #[cfg(test)]
 mod hetzner_setup_tests;
 mod jobs;
@@ -178,6 +179,11 @@ enum Cmd {
     /// Read-only passthrough to a provider's REST API, for what no command covers (GET only).
     #[command(subcommand, infer_subcommands = true)]
     Api(ApiCmd),
+    /// The backup archive: an always-on Hetzner VM with two volumes (dated snapshots, all files)
+    /// that keeps copy #2 of the cohort's backups, pushed from LOCAL_BACKUP_DIR by cron, readable
+    /// (when you say so) by participants over sftp. Never part of the fleet.
+    #[command(subcommand, infer_subcommands = true)]
+    Archive(archive::ArchiveCmd),
     /// The fleet in one read-only picture: `pods list`'s columns plus whether each cohort
     /// machine's SSH port answers, its proxy port (live/stale) and its last `pods test --deep`
     /// / `up --check` verdict with its age (from the local health cache). Lists pods, reads
@@ -377,7 +383,8 @@ enum KeysCmd {
 #[derive(Subcommand)]
 enum CronCmd {
     /// Add or replace arena cron lines, keeping the others. Each line has an identity —
-    /// backup, proxy, snapshot — and only the ones named by these flags are (re)written:
+    /// backup, proxy, snapshot, the two archive lines — and only the ones named by these flags
+    /// are (re)written:
     /// `cron install --proxy` leaves an installed backup line (its --pull, --start-date,
     /// schedule) as it is. With no flag at all it installs the backup line. Rewriting the
     /// backup line keeps the installed one's --pull, start date and schedule unless a flag
@@ -419,12 +426,18 @@ enum CronCmd {
         /// Put `web/fleet.html` in the same directory and serve it with any static host.
         #[arg(long, value_name = "DIR")]
         snapshot: Option<PathBuf>,
+        /// The backup archive's two lines (`arena archive up` first): `archive sync --tier snap`
+        /// at :07/:22/:37/:52 (7 minutes after each */15 backup tick) and `--tier big` hourly at
+        /// :40, logged to ~/arena-archive-cron.log. Needs an absolute LOCAL_BACKUP_DIR, this
+        /// user's archive state, and a start date (--start-date or ARENA_START_DATE).
+        #[arg(long)]
+        archive: bool,
         /// Preview only: print the diff, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// Remove arena cron lines: just the backup / proxy / snapshot line with those flags,
-    /// else every arena-managed line. Shows the diff and confirms.
+    /// Remove arena cron lines: just the backup / proxy / snapshot / archive lines with those
+    /// flags, else every arena-managed line. Shows the diff and confirms.
     Remove {
         /// Remove the backup line.
         #[arg(long)]
@@ -435,6 +448,9 @@ enum CronCmd {
         /// Remove the public snapshot line.
         #[arg(long)]
         snapshot: bool,
+        /// Remove the backup archive's two push lines.
+        #[arg(long)]
+        archive: bool,
         /// Preview only: print the diff, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
@@ -2467,7 +2483,8 @@ async fn main() -> Result<()> {
     // `config check` must work even when a provider key is missing (that's what it's
     // for), so build the provider lazily — only for commands that actually talk to one.
     let provider = match cli.cmd {
-        Cmd::Config(_) | Cmd::Cron(_) | Cmd::Tui | Cmd::Gpus { .. } | Cmd::Offers { .. } | Cmd::Api(_) => None,
+        // The archive builds its own Hetzner client (its own token), and its cron path none.
+        Cmd::Config(_) | Cmd::Cron(_) | Cmd::Tui | Cmd::Gpus { .. } | Cmd::Offers { .. } | Cmd::Api(_) | Cmd::Archive(_) => None,
         // Fleet-wide: every command spans all configured providers (create still targets
         // --provider). One configured backend behaves like that single provider.
         _ => Some(arena_core::provider::build_fleet(&cli.provider, &cfg, true)?),
@@ -2480,7 +2497,8 @@ async fn main() -> Result<()> {
         Cmd::Tui => launch_tui(&cli.provider, &cli.config),
         Cmd::Plan(c) => handle_plan(c, provider.unwrap().as_ref(), &cfg).await,
         Cmd::Config(c) => handle_config(c, &cfg, &cli.provider, &cli.config),
-        Cmd::Cron(c) => handle_cron(c, &cli.config, cli.yes, CRONTAB).await,
+        Cmd::Cron(c) => handle_cron(c, &cfg, &cli.config, cli.yes, CRONTAB).await,
+        Cmd::Archive(c) => archive::handle_archive(c, &cfg, remote.as_ref(), cli.yes).await,
         Cmd::Pods(p) => handle_pods(p, provider.unwrap().as_ref(), remote, &cfg, cli.yes).await,
         Cmd::Proxy(p) => handle_proxy(p, provider.unwrap().as_ref(), &cfg, cli.yes).await,
         Cmd::SshConfig { proxy, out } => {
@@ -3274,7 +3292,7 @@ const CRONTAB: &str = "crontab";
 
 /// `arena cron …`. `crontab` is the program that reads (`-l`) and replaces (`-`) the user's
 /// crontab: [`CRONTAB`] for real, a stub over a file in tests.
-async fn handle_cron(cmd: CronCmd, config_path: &std::path::Path, yes: bool, crontab: &str) -> Result<()> {
+async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::path::Path, yes: bool, crontab: &str) -> Result<()> {
     use tokio::process::Command;
 
     // Read the current crontab (no crontab installed => empty, not an error).
@@ -3298,13 +3316,13 @@ async fn handle_cron(cmd: CronCmd, config_path: &std::path::Path, yes: bool, cro
             }
             Ok(())
         }
-        CronCmd::Remove { backup, proxy, snapshot, dry_run } => {
-            let kinds = CronKind::selected(backup, proxy, snapshot);
+        CronCmd::Remove { backup, proxy, snapshot, archive, dry_run } => {
+            let kinds = CronKind::selected(backup, proxy, snapshot, archive);
             // No flag: the whole block, hand edits inside it included (as always).
             let after = if kinds.is_empty() { Vec::new() } else { merge_cron_block(&before, &kinds, &[]) };
             apply_cron_change(&current, &before, &after, &[], dry_run, yes, crontab).await
         }
-        CronCmd::Install { backup, schedule, start_date, no_start_date, pull, no_pull, proxy, snapshot, dry_run } => {
+        CronCmd::Install { backup, schedule, start_date, no_start_date, pull, no_pull, proxy, snapshot, archive, dry_run } => {
             let exe = std::env::current_exe().context("finding the arena executable path")?;
             let cfg_abs = std::fs::canonicalize(config_path)
                 .unwrap_or_else(|_| config_path.to_path_buf());
@@ -3320,7 +3338,7 @@ async fn handle_cron(cmd: CronCmd, config_path: &std::path::Path, yes: bool, cro
                 start_date.is_some() || no_start_date,
                 pull || no_pull,
                 proxy,
-                snapshot_dir.is_some(),
+                snapshot_dir.is_some() || archive,
             );
             let mut notes = Vec::new();
             // The backup line's options: each flag, else the installed line's (so a
@@ -3349,6 +3367,14 @@ async fn handle_cron(cmd: CronCmd, config_path: &std::path::Path, yes: bool, cro
                     kept.join(", ")
                 ));
             }
+            // The archive's lines need this user's archive state, an absolute backup dir and a
+            // start date — checked before anything is shown or written (§7.1).
+            if archive {
+                let refusals = archive::cron_refusals(cfg, opts.start_date.is_some());
+                if !refusals.is_empty() {
+                    anyhow::bail!("cron install --archive refused:\n  - {}", refusals.join("\n  - "));
+                }
+            }
             // Optional inline env (cron runs the line via sh, so `VAR=val cmd` works).
             let env_prefix = opts.start_date.as_ref().map(|d| format!("ARENA_START_DATE={d} ")).unwrap_or_default();
             let lines = cron_lines(&CronJob {
@@ -3361,9 +3387,19 @@ async fn handle_cron(cmd: CronCmd, config_path: &std::path::Path, yes: bool, cro
                 pull: opts.pull,
                 proxy,
                 snapshot_dir: snapshot_dir.as_deref(),
+                archive,
             });
             let kinds: Vec<CronKind> = lines.iter().map(|(k, _)| *k).collect();
             let after = merge_cron_block(&before, &kinds, &lines);
+            // The archive pushes what the backup line's `--pull` writes: without it there is
+            // nothing new to push.
+            if archive && !after.iter().any(|l| BackupOpts::of_line(l).is_some_and(|o| o.pull)) {
+                notes.push(
+                    "warning: no backup line runs the rsync file backup (`--pull`) — the archive only pushes what that writes \
+                     (`arena cron install --backup --pull`)"
+                        .to_string(),
+                );
+            }
             // `--proxy`/`--snapshot` alone no longer bring a backup line along: say when
             // there will be none, so a fresh box doesn't silently go without backups.
             if !after.iter().any(|l| CronKind::of(l) == Some(CronKind::Backup)) {
@@ -3429,6 +3465,10 @@ enum CronKind {
     Proxy,
     /// `snapshot --public --out …`, the dashboard JSON.
     Snapshot,
+    /// `archive sync --tier snap`, the archive's snapshot push.
+    ArchiveSnap,
+    /// `archive sync --tier big`, the archive's all-files push.
+    ArchiveBig,
 }
 
 impl CronKind {
@@ -3437,13 +3477,21 @@ impl CronKind {
             CronKind::Backup => "backup",
             CronKind::Proxy => "proxy",
             CronKind::Snapshot => "snapshot",
+            CronKind::ArchiveSnap => "archive-snap",
+            CronKind::ArchiveBig => "archive-big",
         }
     }
 
-    /// The kinds named by `cron remove`'s flags, in a fixed order.
-    fn selected(backup: bool, proxy: bool, snapshot: bool) -> Vec<CronKind> {
-        [(backup, CronKind::Backup), (proxy, CronKind::Proxy), (snapshot, CronKind::Snapshot)]
-            .into_iter()
+    /// The kinds named by `cron remove`'s flags, in a fixed order (`--archive` is both of its lines).
+    fn selected(backup: bool, proxy: bool, snapshot: bool, archive: bool) -> Vec<CronKind> {
+        [
+            (backup, CronKind::Backup),
+            (proxy, CronKind::Proxy),
+            (snapshot, CronKind::Snapshot),
+            (archive, CronKind::ArchiveSnap),
+            (archive, CronKind::ArchiveBig),
+        ]
+        .into_iter()
             .filter_map(|(on, k)| on.then_some(k))
             .collect()
     }
@@ -3468,6 +3516,8 @@ impl CronKind {
             (runs("pods", Some("backup")), CronKind::Backup),
             (runs("proxy", Some("apply")), CronKind::Proxy),
             (runs("snapshot", None), CronKind::Snapshot),
+            (runs("archive", Some("sync")) && runs("--tier", Some("snap")), CronKind::ArchiveSnap),
+            (runs("archive", Some("sync")) && runs("--tier", Some("big")), CronKind::ArchiveBig),
         ]
         .into_iter()
         .filter_map(|(hit, k)| hit.then_some(k))
@@ -3483,8 +3533,8 @@ impl CronKind {
 /// line's own options (`--schedule`, `--start-date`/`--no-start-date`, `--pull`/`--no-pull`
 /// — the caller folds each pair into one), or no line named at all — a bare `cron install`
 /// installs the backup, as it always has. `--proxy`/`--snapshot` alone leave it alone.
-fn install_backup_line(backup: bool, schedule: bool, start_date: bool, pull: bool, proxy: bool, snapshot: bool) -> bool {
-    backup || schedule || start_date || pull || !(proxy || snapshot)
+fn install_backup_line(backup: bool, schedule: bool, start_date: bool, pull: bool, proxy: bool, others: bool) -> bool {
+    backup || schedule || start_date || pull || !(proxy || others)
 }
 
 /// The options a backup line is rendered with — and, read back from an installed line
@@ -3665,6 +3715,8 @@ struct CronJob<'a> {
     proxy: bool,
     /// `--snapshot`: the (absolute, validated) directory `fleet.json` is written to.
     snapshot_dir: Option<&'a str>,
+    /// `--archive`: the backup archive's two push lines.
+    archive: bool,
 }
 
 /// The backup line's default schedule: every 15 minutes.
@@ -3724,7 +3776,7 @@ const PROXY_CRON_PATH: &str = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/us
 ///   which later ticks would read as up to date.
 /// - **snapshot** (`snapshot_dir`): the public dashboard JSON every 2 minutes.
 fn cron_lines(job: &CronJob) -> Vec<(CronKind, String)> {
-    let CronJob { schedule, env_prefix, exe, config, home, backup, pull, proxy, snapshot_dir } = job;
+    let CronJob { schedule, env_prefix, exe, config, home, backup, pull, proxy, snapshot_dir, archive } = job;
     let mut lines = Vec::new();
     if *backup {
         // `pods backup` also rsyncs the home (the file backup); default the cron to git-only
@@ -3762,8 +3814,29 @@ fn cron_lines(job: &CronJob) -> Vec<(CronKind, String)> {
             ),
         ));
     }
+    // The backup archive's pushes (`archive sync`): snap 7 minutes after each */15 backup tick
+    // (the newest work is on the archive ≤ ~30 min after it was written), big hourly. No flock:
+    // each tier takes its own lock in-process, so a tick that finds its tier running skips that
+    // tier only (and a manual sync is just as safe). `nice`: the control box is also the
+    // participants' SSH proxy. Never in the backup line's path: an archive outage can't delay a
+    // backup.
+    if *archive {
+        for (kind, sched, tier) in [(CronKind::ArchiveSnap, ARCHIVE_SNAP_CRON_SCHEDULE, "snap"), (CronKind::ArchiveBig, ARCHIVE_BIG_CRON_SCHEDULE, "big")] {
+            lines.push((
+                kind,
+                format!(
+                    "{sched} {env_prefix}nice -n 10 {exe} --config {config} archive sync --tier {tier} >> {home}/arena-archive-cron.log 2>&1"
+                ),
+            ));
+        }
+    }
     lines
 }
+
+/// When the archive's snap push runs: 7 minutes after each */15 backup tick.
+const ARCHIVE_SNAP_CRON_SCHEDULE: &str = "7,22,37,52 * * * *";
+/// When the archive's big push runs: hourly — its cadence is this line.
+const ARCHIVE_BIG_CRON_SCHEDULE: &str = "40 * * * *";
 
 /// Replace the crontab with `content` via `crontab -` (reads from stdin).
 async fn write_crontab(content: &str, crontab: &str) -> Result<()> {
@@ -3854,6 +3927,9 @@ const SETTABLE_KEYS: &[(&str, bool)] = &[
     ("ARENA_START_DATE", false),
     ("MACHINE_NAME_PREFIX", false),
     ("SHARED_SSH_KEY_PATH", false),
+    ("ARCHIVE_HETZNER_API_KEY", true), // the backup archive's own Hetzner project (`arena archive`)
+    ("ARCHIVE_KEEP_UNTIL", false),
+    ("ARCHIVE_HOST", false),
 ];
 
 /// How a key currently reads for the picker: "not set", "set" (secret), or its value.
@@ -4167,6 +4243,11 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
             if cfg.get("BACKUP_TIMEOUT_SECS").is_some_and(|v| !v.trim().is_empty()) { "" } else { " (default)" }
         ),
         Err(e) => println!("  ✗ pull time budget per pod   {e}"),
+    }
+
+    println!("\nBackup archive (optional, `arena archive`):");
+    for line in archive::config_check_lines(cfg) {
+        println!("{line}");
     }
 
     println!("\nDashboard (optional):");
@@ -8811,6 +8892,7 @@ async fn proxy_reaches_pod(remote: &dyn Remote, cfg: &Config, name: &str, expect
         port,
         key_paths: arena_core::ssh::config_ssh_keys(cfg),
         connect_timeout_secs: 15,
+        host_keys: Default::default(),
     };
     let probe = "tr '\\0' '\\n' < /proc/1/environ 2>/dev/null | sed -n 's/^RUNPOD_POD_ID=//p'";
     match remote.exec(&target, probe, Some(PROBE_TIMEOUT)).await {
@@ -10816,6 +10898,11 @@ async fn handle_pull(
         small = small.without_git();
         big = big.without_git();
     }
+    // rsync's temp files go to `<dir>/.rsync-tmp/`, outside every tree the backup archive's
+    // push reads (`pull::PullConfig::temp_dir`): created below, once confirmed.
+    let temp_dir = pull_temp_dir(dir);
+    small.temp_dir = Some(temp_dir.clone());
+    big.temp_dir = Some(temp_dir.clone());
 
     let src = if remote_path.is_empty() { "~/ (home)".to_string() } else { remote_path.clone() };
     let big_note = if no_big {
@@ -10886,6 +10973,11 @@ async fn handle_pull(
         println!("aborted.");
         return Ok(());
     }
+
+    // The backup dir as before (plain `mkdir -p`), then the temp dir in it owner-only: what's in
+    // flight is a pod's files (its rc files carry its API keys).
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {dir}"))?;
+    create_private_dir(std::path::Path::new(&temp_dir)).with_context(|| format!("creating {temp_dir}"))?;
 
     let total_pods = targets.len();
     // Where each pod's repo really is: rsync -a copies a symlink as a symlink, so a repo setup
@@ -11051,6 +11143,26 @@ async fn handle_pull(
         anyhow::bail!("{failed} rsync job(s) failed: {}", failures.join(", "));
     }
     Ok(())
+}
+
+/// Where a pull into `dir` has rsync write its temp files: `<dir>/.rsync-tmp`, absolute (the
+/// canonical path once `dir` exists; before the first pull, `dir` made absolute against the
+/// working directory — the same place).
+fn pull_temp_dir(dir: &str) -> String {
+    let base = std::path::Path::new(dir);
+    let abs = std::fs::canonicalize(base).or_else(|_| std::path::absolute(base)).unwrap_or_else(|_| base.to_path_buf());
+    arena_core::pull::temp_dir_for(&abs)
+}
+
+/// `mkdir -p` with mode 0700 for any directory it creates (an existing one is left as it is).
+fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir)
 }
 
 /// `pods pull`'s arguments sorted out ([`pull_label_and_targets`]).
@@ -11909,7 +12021,15 @@ fn fleet_ssh_for(cfg: &Config, pods: &[arena_core::Pod]) -> (String, usize) {
         ),
         _ => arena_core::sshconfig::render_manual(prefix, ssh_user, pod_identity, pods),
     };
-    (fleet_ssh_command(&fleet_pubkeys, &fleet_cfg), fleet_pubkeys.len())
+    // The backup archive (when this user has one): its block in the same managed block, and its
+    // pinned host key in its own file. The read key itself goes by scp ([`archive::install_read_key`]).
+    match archive::pod_access(cfg) {
+        Some(a) => {
+            let cfg_text = format!("{fleet_cfg}\n{}", a.block);
+            (format!("{}{}", fleet_ssh_command(&fleet_pubkeys, &cfg_text), archive::pod_known_hosts_command(&a)), fleet_pubkeys.len())
+        }
+        None => (fleet_ssh_command(&fleet_pubkeys, &fleet_cfg), fleet_pubkeys.len()),
+    }
 }
 
 /// One pod's key write: the token export lines + the fleet SSH (authorized_keys +
@@ -12013,6 +12133,16 @@ async fn handle_copy_keys(
         fleet_keys
     );
 
+    let archive_access = archive::pod_access(cfg);
+    if let Some(a) = &archive_access {
+        println!(
+            "Also the backup archive's access on each: the `{}` ssh block, its pinned host key, and the read key \
+             (copied by scp to ~/{}).",
+            a.block.lines().next().unwrap_or("Host archive").trim_start_matches("Host "),
+            arena_core::archive::render::POD_KEY
+        );
+    }
+
     if dry_run {
         println!("Dry-run — would set on {} pod(s) (values redacted):\n", jobs.len());
         for (name, _, vars) in &jobs {
@@ -12033,7 +12163,19 @@ async fn handle_copy_keys(
     for (name, t, vars) in jobs {
         let cmd = copy_keys_command(&vars, &fleet_ssh);
         let remote = remote.clone();
-        set.spawn(async move { (name, remote.exec(&t, &cmd, Some(COPY_KEYS_TIMEOUT)).await) });
+        let access = archive_access.clone();
+        set.spawn(async move {
+            let res = remote.exec(&t, &cmd, Some(COPY_KEYS_TIMEOUT)).await;
+            // The archive's read key, by scp, once the keys write (which makes ~/.ssh) went through.
+            let res = match (res, access) {
+                (Ok(o), Some(a)) if o.success => match archive::install_read_key(remote.as_ref(), &t, &a, COPY_KEYS_TIMEOUT).await {
+                    Ok(()) => Ok(o),
+                    Err(e) => Ok(arena_core::ssh::SshOutput { success: false, code: None, stdout: o.stdout, stderr: e }),
+                },
+                (res, _) => res,
+            };
+            (name, res)
+        });
     }
     let (mut ok, mut failed, mut done) = (0, 0, 0);
     while let Some(joined) = set.join_next().await {
@@ -12460,6 +12602,12 @@ async fn handle_ssh_config(
     } else {
         let pods = provider.list_pods().await.context("listing pods for ssh-config")?;
         sshconfig::render_manual(prefix, user, identity, &pods)
+    };
+    // The backup archive's block, when this user has one (`arena archive up`): its own alias,
+    // which no block above matches.
+    let rendered = match archive::laptop_block_for(cfg) {
+        Some(block) => format!("{rendered}\n{block}"),
+        None => rendered,
     };
 
     print!("{rendered}");
@@ -13442,7 +13590,7 @@ mod setup_tests {
     use tokio::time::Instant;
 
     fn target(port: u16) -> SshTarget {
-        SshTarget { user: "root".into(), host: "10.0.0.1".into(), port, key_paths: vec![], connect_timeout_secs: 10 }
+        SshTarget { user: "root".into(), host: "10.0.0.1".into(), port, key_paths: vec![], connect_timeout_secs: 10, host_keys: Default::default() }
     }
 
     fn scfg() -> SetupConfig {
@@ -14164,6 +14312,7 @@ mod tests {
             pull,
             proxy,
             snapshot_dir,
+            archive: false,
         })
     }
 
@@ -14244,6 +14393,7 @@ mod tests {
             pull: true,
             proxy: false,
             snapshot_dir: None,
+            archive: false,
         });
         assert_eq!(
             lines,
@@ -14514,7 +14664,7 @@ mod tests {
             async move {
                 let argv = ["arena".to_string(), "cron".to_string()].into_iter().chain(args);
                 let Cmd::Cron(c) = Cli::try_parse_from(argv).unwrap().cmd else { unreachable!() };
-                handle_cron(c, &config, true, &stub).await.unwrap();
+                handle_cron(c, &arena_core::Config::default(), &config, true, &stub).await.unwrap();
             }
         };
         let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -14606,9 +14756,10 @@ mod tests {
         for bad in [&["install", "--pull", "--no-pull"][..], &["install", "--start-date", "2026-01-05", "--no-start-date"]] {
             assert!(Cli::try_parse_from(["arena", "cron"].iter().chain(bad).copied()).is_err(), "{bad:?}");
         }
-        assert!(matches!(cron(&["remove"]), CronCmd::Remove { backup: false, proxy: false, snapshot: false, dry_run: false }));
+        assert!(matches!(cron(&["remove"]), CronCmd::Remove { backup: false, proxy: false, snapshot: false, archive: false, dry_run: false }));
         assert!(matches!(cron(&["remove", "--snapshot", "--dry"]), CronCmd::Remove { snapshot: true, dry_run: true, .. }));
-        assert_eq!(super::CronKind::selected(true, false, true), [super::CronKind::Backup, super::CronKind::Snapshot]);
+        assert_eq!(super::CronKind::selected(true, false, true, false), [super::CronKind::Backup, super::CronKind::Snapshot]);
+        assert_eq!(super::CronKind::selected(false, false, false, true), [super::CronKind::ArchiveSnap, super::CronKind::ArchiveBig]);
     }
 
     #[test]
@@ -16311,6 +16462,35 @@ mod remote_tests {
         let fake = Arc::new(FakeRemote::new());
         handle_full_backup(fake.clone(), &cfg, &chosen, false, None, true, true, &stub.path()).await.unwrap();
         assert!(fake.calls().is_empty() && stub.take().is_empty());
+    }
+
+    /// S17: every pull rsync writes its temp files to `<abs backup dir>/.rsync-tmp` — outside
+    /// every label and `big/`, which the archive push reads — created owner-only once confirmed;
+    /// a dry run shows it and creates nothing. The destinations are as before.
+    #[tokio::test]
+    async fn the_pull_writes_its_temp_files_outside_every_pushed_tree() {
+        use std::os::unix::fs::PermissionsExt;
+        let stub = StubRsync::new("tempdir");
+        let base = stub.0.join("backups");
+        let cfg = Config::parse("MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple bloom cloud)\nSHARED_SSH_KEY_PATH=/nonexistent/k\n");
+        let chosen = picked(&fleet(), &cfg, &["apple"]).await;
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [repo_in_place()]);
+        let remote: Arc<dyn Remote> = fake.clone();
+        let base_s = base.display().to_string();
+        handle_pull(&remote, &cfg, Some("w1d1".into()), &base_s, None, None, false, false, &chosen, true, true, &stub.path()).await.unwrap();
+        assert!(!base.exists(), "a dry run creates nothing");
+        handle_pull(&remote, &cfg, Some("w1d1".into()), &base_s, None, None, false, false, &chosen, false, true, &stub.path()).await.unwrap();
+        let tmp = std::fs::canonicalize(&base).unwrap().join(".rsync-tmp");
+        assert!(tmp.is_dir());
+        assert_eq!(std::fs::metadata(&tmp).unwrap().permissions().mode() & 0o777, 0o700);
+        let args = stub.take_args();
+        assert_eq!(args.len(), 3, "{args:?}");
+        for a in &args {
+            assert!(a.contains(&format!("--temp-dir={}", tmp.display())), "{a}");
+        }
+        assert_eq!(stub.take(), ["big/devtest-apple", "w1d1/devtest-apple", "w1d1/devtest-apple"], "destinations unchanged");
+        assert!(arena_core::archive::sync::sort_labels([".rsync-tmp", "w1d1", "big"]).iter().all(|l| l != ".rsync-tmp"));
     }
 
     /// One wedged pod can't hold the backup (or the cron behind it): its rsyncs are stopped

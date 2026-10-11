@@ -36,6 +36,68 @@ pub struct SshTarget {
     /// whichever key a pod authorizes (handy for a mixed fleet across cohorts).
     pub key_paths: Vec<String>,
     pub connect_timeout_secs: u32,
+    /// How the server's host key is checked. Every pod path uses [`HostKeyPolicy::Unchecked`]
+    /// (see the module doc: pod IPs are recycled); only the backup archive pins its key.
+    pub host_keys: HostKeyPolicy,
+}
+
+/// How an [`SshTarget`] treats the server's host key.
+///
+/// Pods churn host keys constantly, so their checking is off ([`HostKeyPolicy::Unchecked`],
+/// the default — every pod caller's argv is exactly what it always was). The backup archive
+/// (`arena archive`) is one long-lived VM holding every participant's files, reached with keys
+/// that can write to it or administer it: a MITM there would get the cohort's data, so its key
+/// is **pinned** in arena's own `known_hosts` file. The pinned modes also make the connection
+/// hermetic: `-F /dev/null` (no `~/.ssh/config` or `/etc/ssh/ssh_config` — no stray `Host *`
+/// identity, `HashKnownHosts` or proxy), `IdentitiesOnly=yes` (only the one `-i` key is offered,
+/// never an agent's or a default identity) and `GlobalKnownHostsFile=/dev/null` (only arena's
+/// pin counts). Keep-alives, because a push can sit on one big file for minutes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum HostKeyPolicy {
+    /// `StrictHostKeyChecking=no` + `UserKnownHostsFile=/dev/null` (pods).
+    #[default]
+    Unchecked,
+    /// Trust on first use into `known_hosts` (`StrictHostKeyChecking=accept-new`): only for the
+    /// first connection to a server this run just created, or when the operator asked to
+    /// re-pin (`archive up --accept-new-host-key`).
+    PinFirstUse { known_hosts: String },
+    /// Only the key already in `known_hosts` is accepted (`StrictHostKeyChecking=yes`).
+    Pinned { known_hosts: String },
+}
+
+impl HostKeyPolicy {
+    /// The `-F`/`-o` options this policy puts between `-p <port>` and the `-i` keys (the
+    /// connect timeout last, as it always was).
+    fn options(&self, connect_timeout_secs: u32) -> Vec<String> {
+        let mut a: Vec<String> = Vec::new();
+        let mut opt = |s: String| {
+            a.push("-o".into());
+            a.push(s);
+        };
+        match self {
+            HostKeyPolicy::Unchecked => {
+                opt("BatchMode=yes".into());
+                opt("StrictHostKeyChecking=no".into());
+                opt("UserKnownHostsFile=/dev/null".into());
+            }
+            HostKeyPolicy::PinFirstUse { known_hosts } | HostKeyPolicy::Pinned { known_hosts } => {
+                let strict = if matches!(self, HostKeyPolicy::Pinned { .. }) { "yes" } else { "accept-new" };
+                opt("BatchMode=yes".into());
+                opt(format!("StrictHostKeyChecking={strict}"));
+                opt(format!("UserKnownHostsFile={known_hosts}"));
+                opt("GlobalKnownHostsFile=/dev/null".into());
+                opt("IdentitiesOnly=yes".into());
+                opt("ServerAliveInterval=30".into());
+                opt("ServerAliveCountMax=4".into());
+            }
+        }
+        opt("LogLevel=ERROR".into());
+        opt(format!("ConnectTimeout={connect_timeout_secs}"));
+        if !matches!(self, HostKeyPolicy::Unchecked) {
+            a.splice(0..0, ["-F".to_string(), "/dev/null".to_string()]);
+        }
+        a
+    }
 }
 
 impl SshTarget {
@@ -56,6 +118,7 @@ impl SshTarget {
             port,
             key_paths: config_ssh_keys(cfg),
             connect_timeout_secs: 10,
+            host_keys: HostKeyPolicy::Unchecked,
         })
     }
 
@@ -68,25 +131,14 @@ impl SshTarget {
             port,
             key_paths: key_path.map(resolve_key_path).into_iter().collect(),
             connect_timeout_secs: 10,
+            host_keys: HostKeyPolicy::Unchecked,
         }
     }
 
     /// The `ssh` argv *before* the remote command — non-interactive, fail-fast.
     pub fn ssh_args(&self) -> Vec<String> {
-        let mut a = vec![
-            "-p".into(),
-            self.port.to_string(),
-            "-o".into(),
-            "BatchMode=yes".into(),
-            "-o".into(),
-            "StrictHostKeyChecking=no".into(),
-            "-o".into(),
-            "UserKnownHostsFile=/dev/null".into(),
-            "-o".into(),
-            "LogLevel=ERROR".into(),
-            "-o".into(),
-            format!("ConnectTimeout={}", self.connect_timeout_secs),
-        ];
+        let mut a = vec!["-p".into(), self.port.to_string()];
+        a.extend(self.host_keys.options(self.connect_timeout_secs));
         for key in &self.key_paths {
             a.push("-i".into());
             a.push(key.clone());
@@ -109,21 +161,8 @@ impl SshTarget {
     /// itself, so handing it the full `ssh_args` (which end in `user@host`) would be
     /// wrong. Returns a single shell-ready string.
     pub fn rsh_command(&self) -> String {
-        let mut parts = vec![
-            "ssh".to_string(),
-            "-p".into(),
-            self.port.to_string(),
-            "-o".into(),
-            "BatchMode=yes".into(),
-            "-o".into(),
-            "StrictHostKeyChecking=no".into(),
-            "-o".into(),
-            "UserKnownHostsFile=/dev/null".into(),
-            "-o".into(),
-            "LogLevel=ERROR".into(),
-            "-o".into(),
-            format!("ConnectTimeout={}", self.connect_timeout_secs),
-        ];
+        let mut parts = vec!["ssh".to_string(), "-p".into(), self.port.to_string()];
+        parts.extend(self.host_keys.options(self.connect_timeout_secs));
         for key in &self.key_paths {
             parts.push("-i".into());
             parts.push(key.clone());
@@ -134,20 +173,8 @@ impl SshTarget {
     /// The `scp` argv to copy `local` -> `host:remote`. scp uses `-P` for the port
     /// (capital, unlike ssh's `-p`) and the same non-interactive/fail-fast options.
     pub fn scp_args(&self, local: &str, remote: &str) -> Vec<String> {
-        let mut a = vec![
-            "-P".into(),
-            self.port.to_string(),
-            "-o".into(),
-            "BatchMode=yes".into(),
-            "-o".into(),
-            "StrictHostKeyChecking=no".into(),
-            "-o".into(),
-            "UserKnownHostsFile=/dev/null".into(),
-            "-o".into(),
-            "LogLevel=ERROR".into(),
-            "-o".into(),
-            format!("ConnectTimeout={}", self.connect_timeout_secs),
-        ];
+        let mut a = vec!["-P".into(), self.port.to_string()];
+        a.extend(self.host_keys.options(self.connect_timeout_secs));
         for key in &self.key_paths {
             a.push("-i".into());
             a.push(key.clone());
@@ -401,6 +428,7 @@ mod tests {
             port: 22001,
             key_paths: vec!["/root/.ssh/arena8_key".into()],
             connect_timeout_secs: 10,
+            host_keys: Default::default(),
         }
     }
 
@@ -415,6 +443,53 @@ mod tests {
         assert!(joined.contains("ConnectTimeout=10"));
         assert!(joined.contains("-i /root/.ssh/arena8_key"));
         assert!(joined.ends_with("root@1.2.3.4"));
+    }
+
+    /// Regression for every existing caller (spec §14 item 12): the default policy's argv is
+    /// byte for byte what `SshTarget` built before host-key policies existed.
+    #[test]
+    fn unchecked_targets_build_exactly_the_old_argv() {
+        let t = target();
+        assert_eq!(t.host_keys, HostKeyPolicy::Unchecked);
+        let old_opts = [
+            "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o",
+            "LogLevel=ERROR", "-o", "ConnectTimeout=10",
+        ];
+        let mut want: Vec<String> = ["-p", "22001"].iter().chain(old_opts.iter()).map(|s| s.to_string()).collect();
+        want.extend(["-i".to_string(), "/root/.ssh/arena8_key".into(), "root@1.2.3.4".into()]);
+        assert_eq!(t.ssh_args(), want);
+        assert_eq!(
+            t.rsh_command(),
+            format!("ssh -p 22001 {} -i /root/.ssh/arena8_key", old_opts.join(" "))
+        );
+        let mut want_scp: Vec<String> = ["-P", "22001"].iter().chain(old_opts.iter()).map(|s| s.to_string()).collect();
+        want_scp.extend(["-i".to_string(), "/root/.ssh/arena8_key".into(), "/a".into(), "root@1.2.3.4:/b".into()]);
+        assert_eq!(t.scp_args("/a", "/b"), want_scp);
+        // `for_host` / `from_pod` start unchecked too.
+        assert_eq!(SshTarget::for_host("root", "h", 22, None).host_keys, HostKeyPolicy::Unchecked);
+    }
+
+    /// The archive's modes (S3): pinned to arena's own known_hosts, hermetic (no ssh config, no
+    /// global known_hosts), only the given key offered; first use only accepts a NEW key.
+    #[test]
+    fn pinned_policies_are_strict_hermetic_and_offer_one_key() {
+        let mut t = target();
+        for (policy, strict) in [
+            (HostKeyPolicy::Pinned { known_hosts: "/st/known_hosts".into() }, "StrictHostKeyChecking=yes"),
+            (HostKeyPolicy::PinFirstUse { known_hosts: "/st/known_hosts".into() }, "StrictHostKeyChecking=accept-new"),
+        ] {
+            t.host_keys = policy;
+            for argv in [t.ssh_args(), t.scp_args("/a", "/b"), t.rsh_command().split(' ').map(String::from).collect()] {
+                let has = |o: &str| argv.windows(2).any(|w| w[0] == "-o" && w[1] == o);
+                assert!(has(strict), "{argv:?}");
+                for o in ["UserKnownHostsFile=/st/known_hosts", "GlobalKnownHostsFile=/dev/null", "IdentitiesOnly=yes", "BatchMode=yes"] {
+                    assert!(has(o), "{o}: {argv:?}");
+                }
+                assert!(!argv.iter().any(|a| a.contains("StrictHostKeyChecking=no") || a == "UserKnownHostsFile=/dev/null"), "{argv:?}");
+                assert!(argv.windows(2).any(|w| w[0] == "-F" && w[1] == "/dev/null"), "{argv:?}");
+                assert_eq!(argv.iter().filter(|a| *a == "-i").count(), 1, "exactly one identity: {argv:?}");
+            }
+        }
     }
 
     #[test]

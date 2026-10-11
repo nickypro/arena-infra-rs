@@ -6,6 +6,7 @@
 //! remote state unless a caller explicitly asks it to.
 
 pub mod apiextra;
+pub mod archive;
 pub mod apiget;
 pub mod apikeys;
 pub mod backup;

@@ -52,6 +52,15 @@ impl Config {
         // operator can give one big first pull longer (or a test less) without editing the
         // shared config.
         "BACKUP_TIMEOUT_SECS",
+        // The backup archive's per-run knobs (`archive::ArchiveSettings`): sizes for one `archive
+        // up`, a retention date, push bandwidth and budgets — none of them secret. (Its token,
+        // ARCHIVE_HETZNER_API_KEY, belongs in the config file.)
+        "ARCHIVE_SNAP_GB",
+        "ARCHIVE_BIG_GB",
+        "ARCHIVE_KEEP_UNTIL",
+        "ARCHIVE_BWLIMIT",
+        "ARCHIVE_SNAP_TIMEOUT_SECS",
+        "ARCHIVE_BIG_TIMEOUT_SECS",
     ];
 
     /// Let environment variables override values from the file: any key already in the

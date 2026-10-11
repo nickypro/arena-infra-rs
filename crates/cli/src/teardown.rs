@@ -12,6 +12,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use anyhow::Result;
+use arena_core::archive::{ArchiveCloud, Inventory};
 use arena_core::openrouter::{KeyApi, KeyInfo};
 use arena_core::provider::runpod::NetworkVolume;
 use arena_core::provider::{runpod, runpod_v2, RunpodApi, LIST_TIMEOUT};
@@ -38,7 +39,10 @@ pub(crate) async fn handle_teardown(provider: &dyn Provider, cfg: &Config, check
     }
     let or = openrouter_client(cfg);
     let keys = or.as_ref().map(|o| o as &dyn KeyApi);
-    let check = teardown_with(provider, cfg, read_volumes(cfg), keys, &SystemSched, json);
+    // The backup archive's own project (its token, else the fleet's): a list call, nothing else.
+    let cloud = arena_core::archive::archive_token(cfg).map(|(t, _)| arena_core::archive::HetznerArchiveCloud::new(t));
+    let archive = read_archive(cloud.as_ref().map(|c| c as &dyn ArchiveCloud));
+    let check = teardown_with(provider, cfg, read_volumes(cfg), archive, keys, &SystemSched, json);
     if json {
         return check.await;
     }
@@ -60,11 +64,12 @@ pub(crate) async fn teardown_with(
     provider: &dyn Provider,
     cfg: &Config,
     volumes: impl Future<Output = Probe<Vec<NetworkVolume>>>,
+    archive: impl Future<Output = Probe<Inventory>>,
     keys: Option<&dyn KeyApi>,
     sched: &dyn Sched,
     json: bool,
 ) -> Result<()> {
-    let report = collect(provider, cfg, volumes, keys, sched).await;
+    let report = collect(provider, cfg, volumes, archive, keys, sched).await;
     print!("{}", render_output(&report, json)?);
     exit_status(&report)
 }
@@ -89,13 +94,19 @@ async fn collect(
     provider: &dyn Provider,
     cfg: &Config,
     volumes: impl Future<Output = Probe<Vec<NetworkVolume>>>,
+    archive: impl Future<Output = Probe<Inventory>>,
     keys: Option<&dyn KeyApi>,
     sched: &dyn Sched,
 ) -> Report {
     // `list_by_provider`, not `list_pods`: the fleet's `list_pods` drops a backend that
     // failed, which here would read as "that provider has no pods".
-    let (listings, volumes, keys, cron, at) =
-        tokio::join!(provider.list_by_provider(), volumes, read_keys(keys), read_cron(sched), read_at(sched));
+    let (listings, volumes, archive, keys, cron, at) =
+        tokio::join!(provider.list_by_provider(), volumes, archive, read_keys(keys), read_cron(sched), read_at(sched));
+    // A malformed ARCHIVE_KEEP_UNTIL keeps nothing (the archive then shows as remaining).
+    let archive_keep_until = arena_core::archive::keep_until_from_config(cfg).unwrap_or_else(|e| {
+        eprintln!("warning: {e} — the archive is judged as if no retention date were set");
+        None
+    });
     let inputs = Inputs {
         listings: listings.into_iter().map(|(p, r)| (p, r.map_err(|e| e.to_string()))).collect(),
         volumes,
@@ -104,6 +115,9 @@ async fn collect(
         at,
         proxy: read_proxy(cfg),
         user: current_user(),
+        archive,
+        archive_keep_until,
+        today_days: arena_core::schedule::days_from_unix(arena_core::snapshot::unix_now()),
     };
     teardown::build(&inputs, &Naming::from_config(cfg))
 }
@@ -127,6 +141,19 @@ async fn read_volumes(cfg: &Config) -> Probe<Vec<NetworkVolume>> {
     };
     match tokio::time::timeout(LIST_TIMEOUT, fetch).await {
         Ok(Ok(v)) => Probe::Got(v),
+        Ok(Err(e)) => Probe::Failed(e.to_string()),
+        Err(_) => Probe::Failed(format!("timed out after {}s", LIST_TIMEOUT.as_secs())),
+    }
+}
+
+/// Every backup archive in the archive's Hetzner project (any cohort's: `label_selector=
+/// arena-archive`) — one bounded LIST, never anything else (S16). No token at all: not checked.
+pub(crate) async fn read_archive(cloud: Option<&dyn ArchiveCloud>) -> Probe<Inventory> {
+    let Some(cloud) = cloud else {
+        return Probe::Skipped("no ARCHIVE_HETZNER_API_KEY or HETZNER_API_KEY — the backup archive wasn't checked".into());
+    };
+    match tokio::time::timeout(LIST_TIMEOUT, cloud.inventory(None)).await {
+        Ok(Ok(inv)) => Probe::Got(inv),
         Ok(Err(e)) => Probe::Failed(e.to_string()),
         Err(_) => Probe::Failed(format!("timed out after {}s", LIST_TIMEOUT.as_secs())),
     }
@@ -385,6 +412,33 @@ mod tests {
         Pod { id: format!("id-{name}"), name: name.into(), provider: "runpod".into(), status: status.into(), ..Default::default() }
     }
 
+    fn no_archive() -> Probe<Inventory> {
+        Probe::Skipped("no token".into())
+    }
+
+    /// S16 / S8: teardown's archive read is one LIST — no mutation, whatever it finds — and a
+    /// failed listing is unknown, never "no archive".
+    #[tokio::test]
+    async fn the_archive_check_only_lists_and_a_failed_list_is_unknown() {
+        use arena_core::archive::cloud::FakeArchiveCloud;
+        let n = arena_core::archive::ArchiveNames::new("devtest").unwrap();
+        let fake = FakeArchiveCloud::new();
+        // Something there: an up'd archive (made through the fake itself).
+        let key = fake.create_ssh_key(&n.ssh_key(), "ssh-ed25519 AAAA", &n.labels()).await.unwrap();
+        let (srv, _) = fake.create_server(&arena_core::archive::cloud::server_body(&n, "cx23", "nbg1", key.id)).await.unwrap();
+        fake.create_volume(&arena_core::archive::cloud::volume_body(&n, arena_core::archive::Tier::Snap, 10, srv.id)).await.unwrap();
+        fake.clear_calls();
+        match read_archive(Some(&fake)).await {
+            Probe::Got(inv) => assert_eq!((inv.servers.len(), inv.volumes.len(), inv.ssh_keys.len()), (1, 1, 1)),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(fake.calls(), [arena_core::archive::cloud::CloudCall::Inventory(None)]);
+        fake.fail_inventory(Some("hetzner archive list servers HTTP 503"));
+        assert!(matches!(read_archive(Some(&fake)).await, Probe::Failed(e) if e.contains("503")));
+        assert!(fake.mutations().is_empty());
+        assert!(matches!(read_archive(None).await, Probe::Skipped(_)));
+    }
+
     fn vol(id: &str, gb: u32) -> NetworkVolume {
         NetworkVolume { id: id.into(), name: format!("{id}-data"), size_gb: Some(gb), data_center: None, tier: None }
     }
@@ -397,8 +451,8 @@ mod tests {
         sched: &FakeSched,
     ) -> (Report, std::result::Result<(), String>) {
         let keys = keys.map(|k| k as &dyn KeyApi);
-        let report = collect(fleet, cfg, std::future::ready(volumes.clone()), keys, sched).await;
-        let exit = teardown_with(fleet, cfg, std::future::ready(volumes), keys, sched, false).await.map_err(|e| e.to_string());
+        let report = collect(fleet, cfg, std::future::ready(volumes.clone()), std::future::ready(no_archive()), keys, sched).await;
+        let exit = teardown_with(fleet, cfg, std::future::ready(volumes), std::future::ready(no_archive()), keys, sched, false).await.map_err(|e| e.to_string());
         (report, exit)
     }
 
@@ -543,7 +597,7 @@ mod tests {
         };
         assert_eq!(verdict("pods", "vast"), Some("unknown".into()));
         assert_eq!(verdict("volumes", "runpod"), Some("remaining".into()));
-        let exit_json = teardown_with(&fleet, &cfg, std::future::ready(Probe::Got(vec![vol("vol1", 100)])), Some(&keys), &sched, true)
+        let exit_json = teardown_with(&fleet, &cfg, std::future::ready(Probe::Got(vec![vol("vol1", 100)])), std::future::ready(no_archive()), Some(&keys), &sched, true)
             .await
             .map_err(|e| e.to_string());
         assert_eq!(exit_json, exit, "--json exits like the checklist");

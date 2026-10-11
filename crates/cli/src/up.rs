@@ -910,7 +910,18 @@ impl Shared<'_, '_> {
         }
         let fleet_pods = self.listing.borrow().clone();
         let (fleet_ssh, _) = fleet_ssh_for(self.run.cfg, &fleet_pods);
-        match self.run.remote.exec(target, &copy_keys_command(&vars, &fleet_ssh), Some(COPY_KEYS_TIMEOUT)).await {
+        let written = self.run.remote.exec(target, &copy_keys_command(&vars, &fleet_ssh), Some(COPY_KEYS_TIMEOUT)).await;
+        // The backup archive's read key (when this user has an archive), by scp — as `copy-keys`.
+        let archive_note = match (&written, super::archive::pod_access(self.run.cfg)) {
+            (Ok(o), Some(a)) if o.success => {
+                super::archive::install_read_key(self.run.remote.as_ref(), target, &a, COPY_KEYS_TIMEOUT).await.err()
+            }
+            _ => None,
+        };
+        if let Some(e) = archive_note {
+            return Ok((To::Err, format!("[{name}] keys ✓ — but the backup archive's read key wasn't installed: {e} (`arena pods copy-keys {name}`)"), Some(fleet_ssh)));
+        }
+        match written {
             Ok(o) if o.success && matched => Ok((To::Out, format!("[{name}] keys ✓"), Some(fleet_ssh))),
             Ok(o) if o.success => Ok((
                 To::Err,
