@@ -1646,6 +1646,36 @@ pub fn teardown_info(views: &[AccountView], now: u64) -> Vec<String> {
     out
 }
 
+/// What `arena balance set` prints: old → new, then the account as the footers will now
+/// show it — and, while a live reading younger than [`FRESH`] exists, that live wins: a
+/// manual value is used only while live is unavailable.
+pub fn set_lines(old: Option<Anchor>, state: &BalanceState, account: Account, key_fp: &str, policy: &BalancePolicy, now: u64) -> Vec<String> {
+    let was = match old {
+        Some(a) => format!(
+            "{} ({}, {} ago)",
+            usd(a.usd),
+            if a.source == AnchorSource::Live { "live" } else { "manual" },
+            fmt_age(now.saturating_sub(a.at))
+        ),
+        None => "no reading".into(),
+    };
+    let st = state.get(account, key_fp);
+    let new = st.and_then(|s| s.anchor).map_or_else(|| "?".to_string(), |a| usd(a.usd));
+    let mut out = vec![format!("{}: {was} → {new} (manual)", account.name())];
+    let f = Fetched::nothing(account, key_fp);
+    let v = views(state, std::slice::from_ref(&f), &Burns::new(), policy, Mode::Inline, now).remove(0);
+    if v.source == Source::Unknown {
+        // No burn known yet (no listing here): the next listing's burn counts it down.
+        out.push(format!("now: {} ~{new} est. (manual) — counted down at the fleet's burn from the next listing", account.name()));
+    } else {
+        out.push(format!("now: {}", footer_part(&v, policy, now)));
+    }
+    if let Some(p) = st.and_then(|s| s.fresh_facts(now)) {
+        out.push(format!("note: live is {}; a manual value is used only while live is unavailable", usd(p.usd)));
+    }
+    out
+}
+
 /// `24`→`1d`, `72`→`3d`, `30`→`30h`.
 fn fmt_threshold(h: f64) -> String {
     if h > 0.0 && h % 24.0 == 0.0 {
@@ -3083,6 +3113,35 @@ mod tests {
         assert_eq!(tui_parts(&[low.clone()]), (Some(" ⚠ runpod balance ≈45h ·".into()), None, Level::Low));
         assert_eq!(tui_parts(&[low, crit]), (Some(" ⚠ runpod balance ≈45h · ‼ vast balance ≈6.0h ·".into()), None, Level::Critical));
         assert_eq!(tui_parts(&[]), (None, None, Level::Ok));
+    }
+
+    #[test]
+    fn set_lines_table() {
+        let p = policy();
+        // First ever, no burn known: said plainly.
+        let s = state_with(anchored(250.0, 0, AnchorSource::Manual));
+        assert_eq!(
+            set_lines(None, &s, Account::Runpod, FP, &p, NOW),
+            [
+                "runpod: no reading → $250.00 (manual)",
+                "now: runpod ~$250.00 est. (manual) — counted down at the fleet's burn from the next listing",
+            ]
+        );
+        // With samples: the footer's own words (the last sample stands in for the burn: `≤`).
+        let s = state_with(AccountState { samples: vec![(NOW - H, 0.5)], ..anchored(250.0, 0, AnchorSource::Manual) });
+        let old = Some(Anchor { usd: 31.0, at: NOW - 3 * H, source: AnchorSource::Live });
+        assert_eq!(
+            set_lines(old, &s, Account::Runpod, FP, &p, NOW),
+            ["runpod: $31.00 (live, 3h ago) → $250.00 (manual)", "now: runpod ~$250.00 est. ≤20.8d"]
+        );
+        // A live reading younger than FRESH: it wins for now, and that is said.
+        let s = state_with(AccountState {
+            provider: Some(ProviderFacts { usd: 31.0, burn_per_hr: Some(0.5), spend_limit_per_hr: None, under_balance: None, at: NOW - 60 }),
+            ..anchored(250.0, 0, AnchorSource::Manual)
+        });
+        let lines = set_lines(old, &s, Account::Runpod, FP, &p, NOW);
+        assert_eq!(lines[1], "now: ⚠ runpod $31.00 live 1m ≈2.5d < 72h");
+        assert_eq!(lines[2], "note: live is $31.00; a manual value is used only while live is unavailable");
     }
 
     #[test]

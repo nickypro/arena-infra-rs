@@ -4,21 +4,24 @@
 //! Read-only by construction: provider *list* calls, the RunPod volume listing, the
 //! OpenRouter key listing, the local proxy file, and three local commands that only read
 //! (`crontab -l`, `atq`, `at -c <id>`). Nothing here can delete, stop or edit anything; the
-//! checklist prints the commands that would, for the operator to run. After the checklist
-//! (text only) come the provider account balances (`arena_core::balance_v6`) — informational,
-//! never part of the verdict.
+//! checklist prints the commands that would, for the operator to run. After the verdict come
+//! the prepaid account balances (`arena_core::balance`, observed inline alongside the
+//! listing) — informational: never part of the verdict or the exit status.
 
 use std::future::Future;
 use std::time::Duration;
 
 use anyhow::Result;
+use arena_core::balance;
 use arena_core::openrouter::{KeyApi, KeyInfo};
 use arena_core::provider::runpod::NetworkVolume;
 use arena_core::provider::{runpod, runpod_v2, RunpodApi, LIST_TIMEOUT};
+use arena_core::proxy::Listing;
 use arena_core::selector::Naming;
 use arena_core::teardown::{self, AtJob, CronLines, Inputs, Probe, ProxyFile, Report};
 use arena_core::{Config, Provider};
 
+use super::money::{listed_views, BalanceCtx};
 use super::{arena_cron_lines, expand_tilde, openrouter_client};
 
 /// Budget for each local scheduler command. They read local files and answer at once; the
@@ -38,24 +41,14 @@ pub(crate) async fn handle_teardown(provider: &dyn Provider, cfg: &Config, check
     }
     let or = openrouter_client(cfg);
     let keys = or.as_ref().map(|o| o as &dyn KeyApi);
-    let check = teardown_with(provider, cfg, read_volumes(cfg), keys, &SystemSched, json);
-    if json {
-        return check.await;
-    }
-    // The account balances, read alongside and printed after the checklist: informational
-    // only (what's left, and whether RunPod still reports spend) — never part of the verdict
-    // or the exit status, and left out of `--json`, whose shape scripts rely on.
-    let (result, balances) =
-        tokio::join!(check, arena_core::balance_v6::fetch_all(cfg, arena_core::balance_v6::FETCH_TIMEOUT));
-    for line in super::money::teardown_lines(&balances, cfg, arena_core::snapshot::unix_now()) {
-        println!("{line}");
-    }
-    result
+    let bal = BalanceCtx::from_config(cfg);
+    teardown_with(provider, cfg, read_volumes(cfg), keys, &SystemSched, json, &bal).await
 }
 
 /// The check against these sources (the real ones, or fakes in tests): print the checklist
 /// (or `--json`), then fail unless everything is clear — something remaining *or* unknown
-/// makes the exit non-zero.
+/// makes the exit non-zero. The balance (`bal`) is information only: whatever it says, or
+/// however it fails, the items and the exit are the same.
 pub(crate) async fn teardown_with(
     provider: &dyn Provider,
     cfg: &Config,
@@ -63,8 +56,9 @@ pub(crate) async fn teardown_with(
     keys: Option<&dyn KeyApi>,
     sched: &dyn Sched,
     json: bool,
+    bal: &BalanceCtx,
 ) -> Result<()> {
-    let report = collect(provider, cfg, volumes, keys, sched).await;
+    let report = collect(provider, cfg, volumes, keys, sched, bal).await;
     print!("{}", render_output(&report, json)?);
     exit_status(&report)
 }
@@ -84,20 +78,25 @@ fn exit_status(report: &Report) -> Result<()> {
     }
 }
 
-/// Read every source concurrently and judge them.
+/// Read every source concurrently — the prepaid balances inline among them — and judge them.
 async fn collect(
     provider: &dyn Provider,
     cfg: &Config,
     volumes: impl Future<Output = Probe<Vec<NetworkVolume>>>,
     keys: Option<&dyn KeyApi>,
     sched: &dyn Sched,
+    bal: &BalanceCtx,
 ) -> Report {
+    let now = arena_core::snapshot::unix_now();
+    let (state, _) = balance::load_opt(bal.state_path());
+    let observing = balance::observe(bal.api.as_ref(), &state, balance::Mode::Inline, balance::INLINE_TIMEOUT, now);
     // `list_by_provider`, not `list_pods`: the fleet's `list_pods` drops a backend that
     // failed, which here would read as "that provider has no pods".
-    let (listings, volumes, keys, cron, at) =
-        tokio::join!(provider.list_by_provider(), volumes, read_keys(keys), read_cron(sched), read_at(sched));
+    let (listings, volumes, keys, cron, at, fetched) =
+        tokio::join!(provider.list_by_provider(), volumes, read_keys(keys), read_cron(sched), read_at(sched), observing);
+    let listing = Listing::from_results(listings);
     let inputs = Inputs {
-        listings: listings.into_iter().map(|(p, r)| (p, r.map_err(|e| e.to_string()))).collect(),
+        listings: listing.providers.iter().map(|pl| (pl.provider.clone(), pl.pods.clone())).collect(),
         volumes,
         keys,
         cron,
@@ -105,7 +104,14 @@ async fn collect(
         proxy: read_proxy(cfg),
         user: current_user(),
     };
-    teardown::build(&inputs, &Naming::from_config(cfg))
+    let mut report = teardown::build(&inputs, &Naming::from_config(cfg));
+    if !fetched.is_empty() {
+        // Burns from this listing (no details: an unpriced pod makes the burn a floor).
+        let (policy, _) = balance::BalancePolicy::from_config(cfg);
+        report.balance = listed_views(bal, state, &fetched, &listing, &listing.pods(), &policy, now);
+        report.balance_at = now;
+    }
+    report
 }
 
 /// RunPod's network volumes: REST v2 on `RUNPOD_API=v2` (falling back to GraphQL once), else
@@ -396,9 +402,21 @@ mod tests {
         keys: Option<&FakeKeys>,
         sched: &FakeSched,
     ) -> (Report, std::result::Result<(), String>) {
+        check_with(fleet, cfg, volumes, keys, sched, &BalanceCtx::from_config(cfg)).await
+    }
+
+    /// [`check`] with the balance reads handed in.
+    async fn check_with(
+        fleet: &Fleet,
+        cfg: &Config,
+        volumes: Probe<Vec<NetworkVolume>>,
+        keys: Option<&FakeKeys>,
+        sched: &FakeSched,
+        bal: &BalanceCtx,
+    ) -> (Report, std::result::Result<(), String>) {
         let keys = keys.map(|k| k as &dyn KeyApi);
-        let report = collect(fleet, cfg, std::future::ready(volumes.clone()), keys, sched).await;
-        let exit = teardown_with(fleet, cfg, std::future::ready(volumes), keys, sched, false).await.map_err(|e| e.to_string());
+        let report = collect(fleet, cfg, std::future::ready(volumes.clone()), keys, sched, bal).await;
+        let exit = teardown_with(fleet, cfg, std::future::ready(volumes), keys, sched, false, bal).await.map_err(|e| e.to_string());
         (report, exit)
     }
 
@@ -478,6 +496,49 @@ mod tests {
         assert!(report.render().contains("✓ proxy forwards"), "a missing proxy file has no forwards: {}", report.render());
     }
 
+    /// Invariant 2 for teardown: a critical prepaid balance — or a balance source failing
+    /// every way it can — changes neither the items nor the exit of an ALL CLEAR check; the
+    /// balance is `info:` lines after the verdict, and a top-level `balance` in the JSON.
+    #[tokio::test]
+    async fn teardown_exit_unchanged_by_balance() {
+        use arena_core::balance::{Account, FakeBalanceApi, Fail, FailKind, Live};
+        let dir = tmp("balance");
+        let cfg = cfg(&dir.0);
+        let fleet = || Fleet { backends: vec![("runpod", Ok(vec![pod("devtest-old", "TERMINATED")])), ("hetzner", Ok(vec![]))] };
+        let sched = || FakeSched::with(&[("crontab -l", ran("")), ("atq", ran(""))]);
+        let (baseline, exit) = check(&fleet(), &cfg, Probe::Got(vec![]), None, &sched()).await;
+        assert_eq!(exit, Ok(()));
+        assert!(baseline.balance.is_empty());
+        // RunPod at $1 while still reporting $0.35/h of spend: critical — and still ALL CLEAR.
+        let critical = Live { usd: 1.0, provider_burn_per_hr: Some(0.35), spend_limit_per_hr: None, under_balance: Some(false), reduced: false };
+        let fails = [
+            Fail { kind: FailKind::Transient, http: Some(503), detail: None },
+            Fail { kind: FailKind::Auth, http: Some(401), detail: None },
+            Fail { kind: FailKind::Gone, http: Some(404), detail: None },
+            Fail { kind: FailKind::Drift, http: None, detail: Some("data.myself is null".into()) },
+        ];
+        let mut apis = vec![FakeBalanceApi::new().live_ok(Account::Runpod, critical.clone()), FakeBalanceApi::new().live_stall(Account::Runpod)];
+        apis.extend(fails.into_iter().map(|f| FakeBalanceApi::new().live_err(Account::Runpod, f)));
+        for (i, api) in apis.into_iter().enumerate() {
+            let bal = BalanceCtx { api: Arc::new(api), path: None };
+            let (report, exit) = check_with(&fleet(), &cfg, Probe::Got(vec![]), None, &sched(), &bal).await;
+            assert_eq!(exit, Ok(()), "#{i}: {}", report.render());
+            assert_eq!((report.clear, report.remaining, report.unknown), (true, 0, 0), "#{i}");
+            assert_eq!(report.items, baseline.items, "#{i}: the checklist is the balance's business in no way");
+            assert_eq!(report.balance.len(), 1, "#{i}");
+            let v = serde_json::to_value(&report).unwrap();
+            assert_eq!(v["balance"][0]["account"], "runpod", "#{i}: JSON carries the balance");
+        }
+        // The critical one, rendered: after the verdict line, informational.
+        let bal = BalanceCtx { api: Arc::new(FakeBalanceApi::new().live_ok(Account::Runpod, critical)), path: None };
+        let (report, _) = check_with(&fleet(), &cfg, Probe::Got(vec![]), None, &sched(), &bal).await;
+        let text = report.render();
+        let verdict = text.find("ALL CLEAR").unwrap();
+        let info = text.find("info: prepaid balance — ‼ runpod $1.00 live (not part of the verdict)").unwrap_or_else(|| panic!("{text}"));
+        assert!(info > verdict, "{text}");
+        assert!(text.contains("info: RunPod reports $0.35/h more than arena lists"), "{text}");
+    }
+
     /// A stopped pod, a failed provider, a volume, a key, the cron block, an arena `at` job and
     /// a forward: every one reported, the exit non-zero — and still nothing mutated.
     #[tokio::test]
@@ -543,7 +604,7 @@ mod tests {
         };
         assert_eq!(verdict("pods", "vast"), Some("unknown".into()));
         assert_eq!(verdict("volumes", "runpod"), Some("remaining".into()));
-        let exit_json = teardown_with(&fleet, &cfg, std::future::ready(Probe::Got(vec![vol("vol1", 100)])), Some(&keys), &sched, true)
+        let exit_json = teardown_with(&fleet, &cfg, std::future::ready(Probe::Got(vec![vol("vol1", 100)])), Some(&keys), &sched, true, &BalanceCtx::from_config(&cfg))
             .await
             .map_err(|e| e.to_string());
         assert_eq!(exit_json, exit, "--json exits like the checklist");

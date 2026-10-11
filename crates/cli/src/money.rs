@@ -1,28 +1,31 @@
-//! Money: `arena balance` (what's left on each provider account and how long it lasts), the
-//! one-line balance under `pods list`, the informational lines under `teardown --check`, and
-//! `pods idle` (which pods look abandoned — a report, never an action).
+//! Money: `arena balance` (what's left on each prepaid account, how long it lasts and where
+//! the number comes from), `balance set`, the balance line under `pods list`, the
+//! `create`/`up` preflight, the `config check` rows — and `pods idle` (which pods look
+//! abandoned — a report, never an action).
 //!
-//! Judging and rendering live in `arena_core::balance_v6` / `arena_core::idle` (pure, tested on
-//! fixture-shaped replies). Here is only the reading: provider accounts and listings, each
-//! bounded, and one bounded read-only SSH probe per pod.
+//! Judging and rendering live in `arena_core::balance` / `arena_core::idle` (pure, tested on
+//! fixture-shaped replies). Here is only the reading: the balance reads (behind
+//! [`BalanceApi`]), the listings, each bounded, and one bounded read-only SSH probe per pod.
+//! Every balance surface but `arena balance` itself is **quiet**: a failing source changes a
+//! label, never stderr or an exit code.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use arena_core::balance_v6::{self as balance, AccountProbe, Burns};
+use arena_core::balance::{self, Account, BalanceApi, BalancePolicy, Fetched, HttpBalanceApi, Mode};
 use arena_core::idle::{self, Probe};
+use arena_core::placement::OptionPlan;
+use arena_core::proxy::Listing;
 use arena_core::remote::Remote;
+use arena_core::snapshot::unix_now;
 use arena_core::ssh::SshTarget;
 use arena_core::status::bills_hourly;
 use arena_core::{Config, Pod, Provider};
 
 use super::jobs::Say;
 use super::{exec_each_pod, PodCall, Selected, ENRICH_TIMEOUT};
-
-/// How long `pods list` waits for the balances (read alongside the listing, so usually not
-/// at all): the list never waits longer than this for its footer.
-pub(crate) const FOOTER_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Budget for one pod's idle probe: the ssh connect (10 s), three GPU samples a second
 /// apart, and the file scan (20 s at most) — a healthy pod answers in a few seconds.
@@ -38,101 +41,181 @@ pub(crate) fn parse_hours(s: &str) -> std::result::Result<f64, String> {
     }
 }
 
-/// The lines under `pods list`'s fleet footer: one balance line, then any ⚠. Burn per
-/// provider comes from this same listing; a provider whose listing `failed` (already warned
-/// about above) has an unknown fleet cost — `?`, never "no billing pods". Pure.
-pub(crate) fn list_footer(probes: &[AccountProbe], pods: &[Pod], failed: &[String], cfg: &Config, now: u64) -> Vec<String> {
-    let (warn_hours, bad_config) = balance::warn_hours_or_default(cfg);
-    let report = balance::report(probes, &balance::burns(pods, failed), warn_hours, now);
-    let mut out: Vec<String> = balance::compact(&report).map(|(line, _)| line).into_iter().collect();
-    out.extend(balance::warn_lines(&report));
-    out.extend(bad_config);
-    out
+/// What the balance surfaces read with: the reads (`HttpBalanceApi` for real, a fake in
+/// tests) and where the state file lives (`None`: no state directory — live readings only;
+/// `Err`: why there is none).
+pub(crate) struct BalanceCtx {
+    pub api: Arc<dyn BalanceApi>,
+    pub path: Option<std::result::Result<PathBuf, String>>,
 }
 
-/// The lines `teardown --check` prints after its checklist (informational: its verdict and
-/// exit don't depend on them). No fleet costs here — the check reads no pod details — so
-/// they show what's left and what the provider itself still reports spending.
-pub(crate) fn teardown_lines(probes: &[AccountProbe], cfg: &Config, now: u64) -> Vec<String> {
-    let (warn_hours, bad_config) = balance::warn_hours_or_default(cfg);
-    let mut out = balance::teardown_lines(&balance::report(probes, &Burns::unknown(), warn_hours, now));
-    out.extend(bad_config);
-    out
+impl BalanceCtx {
+    /// The real reads and this fleet's state file — except in this crate's unit tests, where
+    /// no account is configured and there is no state file unless the test's config sets
+    /// `ARENA_STATE_DIR`: a stray key in a test config must never reach the network, and a
+    /// test never touches the developer's `~/.local/state`. Tests that want balances hand
+    /// in a fake.
+    pub(crate) fn from_config(cfg: &Config) -> Self {
+        let api_cfg = if cfg!(test) { Config::parse("") } else { cfg.clone() };
+        let path = (!cfg!(test) || cfg.get("ARENA_STATE_DIR").is_some())
+            .then(|| arena_core::snapshot::state_file_path_for(cfg, arena_core::snapshot::BALANCE_FILE));
+        BalanceCtx { api: Arc::new(HttpBalanceApi::from_config(&api_cfg)), path }
+    }
+
+    /// The state file, when there is one.
+    pub(crate) fn state_path(&self) -> Option<&Path> {
+        self.path.as_ref().and_then(|p| p.as_ref().ok()).map(PathBuf::as_path)
+    }
 }
 
-/// `pods list`'s listing, as `Provider::list_pods` on the fleet provider gives it — every
-/// provider's pods, a partial failure one warning line, only a total failure an error (same
-/// words) — plus the providers that failed, so the balance footer can call their fleet cost
-/// unknown instead of zero. (`list_pods` itself swallows which ones failed.)
-pub(crate) async fn list_noting_failures(provider: &dyn Provider) -> Result<(Vec<Pod>, Vec<String>)> {
-    let mut pods = Vec::new();
-    let (mut failed, mut errs) = (Vec::new(), Vec::new());
-    let mut any_ok = false;
-    for (name, listed) in provider.list_by_provider().await {
-        match listed {
-            Ok(p) => {
-                any_ok = true;
-                pods.extend(p);
-            }
-            Err(e) => {
-                errs.push(format!("{name}: {e}"));
-                failed.push(name);
+/// The flags of a plain `arena balance`.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct BalanceFlags {
+    pub json: bool,
+    pub check: bool,
+    pub no_live: bool,
+    pub verbose: bool,
+}
+
+/// What a command prints: stdout, the stderr lines, and the exit code.
+#[derive(Debug)]
+pub(crate) struct Printed {
+    pub stdout: String,
+    pub stderr: Vec<String>,
+    pub code: i32,
+}
+
+/// `arena balance [--json] [--check] [--no-live] [-v]`: list the fleet (bounded, no
+/// details) while observing every configured account (live always; billing when there is an
+/// anchor; `--no-live`: billing only — the estimate tier forced, nothing written), record
+/// it, then print the table and notes (or JSON). Exit 0 — or with `--check` 2 critical, 3
+/// unknown while burning, 1 low. A provider that fails to list makes its burn unknown;
+/// it never fails the command.
+pub(crate) async fn balance_report(
+    provider: &dyn Provider,
+    cfg: &Config,
+    bal: &BalanceCtx,
+    flags: BalanceFlags,
+    now: u64,
+) -> Result<Printed> {
+    let (policy, policy_warning) = BalancePolicy::from_config(cfg);
+    let mut stderr: Vec<String> = Vec::new();
+    if let Some(Err(e)) = &bal.path {
+        stderr.push(format!("warning: no balance state ({e}) — live readings only"));
+    }
+    let path = bal.state_path();
+    let (state, load_warning) = balance::load_opt(path);
+    let mode = if flags.no_live { Mode::NoLive } else { Mode::Full };
+    let (listed, fetched) =
+        tokio::join!(provider.list_by_provider(), balance::observe(bal.api.as_ref(), &state, mode, balance::COMMAND_TIMEOUT, now));
+    let listing = Listing::from_results(listed);
+    for (p, e) in listing.errors() {
+        stderr.push(format!("warning: {p} failed to list ({e}) — its burn is unknown"));
+    }
+    let pods = listing.pods();
+    let burns = balance::burns(&listing, &pods);
+    let (state, save_warning) = balance::commit(path, state, &fetched, &burns, mode, now);
+    let mut views = balance::views(&state, &fetched, &burns, &policy, mode, now);
+    views.extend(balance::postpaid_view(&listing, &pods));
+    stderr.extend([policy_warning, load_warning, save_warning].into_iter().flatten());
+    let stdout = if flags.json {
+        format!("{}\n", serde_json::to_string_pretty(&views)?)
+    } else {
+        let mut out = balance::render_table(&views, now);
+        if flags.no_live {
+            out.push_str("  --no-live: no live call — this is what the fallback estimate says (nothing was written)\n");
+        }
+        for n in balance::notes(&views, &policy, now) {
+            out.push_str(&format!("  {n}\n"));
+        }
+        if flags.verbose {
+            for l in balance::verbose_lines(&views, &state, &fetched, path, now) {
+                out.push_str(&format!("{l}\n"));
             }
         }
-    }
-    if !any_ok && !errs.is_empty() {
-        anyhow::bail!("all providers failed to list: {}", errs.join("; "));
-    }
-    if !errs.is_empty() {
-        eprintln!("warning: some providers failed to list ({})", errs.join("; "));
-    }
-    Ok((pods, failed))
+        out
+    };
+    let code = if flags.check { balance::check_exit(&views) } else { 0 };
+    Ok(Printed { stdout, stderr, code })
 }
 
-/// Every provider's pods (each listing bounded) with their details filled where the
-/// provider can (RunPod's $/h comes from the details query; best-effort, bounded), and the
-/// providers whose listing failed — their burn is unknown, never zero.
-async fn fleet_pods(provider: &dyn Provider) -> (Vec<Pod>, Vec<String>, Option<String>) {
-    let mut pods = Vec::new();
-    let mut failed = Vec::new();
-    for (name, listed) in provider.list_by_provider().await {
-        match listed {
-            Ok(p) => pods.extend(p),
-            Err(_) => failed.push(name),
-        }
+/// `arena balance set <runpod|vast> <USD>`: record the balance read off the provider's
+/// console as a manual anchor — the escape hatch when every API is dead. A local write (no
+/// confirm), scoped by the configured key's fingerprint; the next live reading replaces it.
+pub(crate) fn balance_set(cfg: &Config, bal: &BalanceCtx, account: Account, usd: f64, now: u64) -> Result<String> {
+    let Some((_, fp)) = bal.api.accounts().into_iter().find(|(a, _)| *a == account) else {
+        anyhow::bail!(
+            "{} isn't set — `balance set {}` records the balance of the account that key reaches (its fingerprint \
+             scopes the value)",
+            account.key_name(),
+            account.name()
+        );
+    };
+    let path = match &bal.path {
+        Some(Ok(p)) => p.clone(),
+        Some(Err(e)) => anyhow::bail!("nowhere to record it: {e}"),
+        None => anyhow::bail!("nowhere to record it: no state directory"),
+    };
+    let (old, state, _) = balance::record_manual(&path, account, &fp, usd, now)
+        .map_err(|e| anyhow::anyhow!("couldn't write {}: {e}", path.display()))?;
+    let (policy, _) = BalancePolicy::from_config(cfg);
+    let mut out = String::new();
+    for l in balance::set_lines(old, &state, account, &fp, &policy, now) {
+        out.push_str(&l);
+        out.push('\n');
     }
-    let note = super::enrich_best_effort(provider, &mut pods, ENRICH_TIMEOUT).await;
-    (pods, failed, note)
+    Ok(out)
 }
 
-/// `arena balance [--json]`: read every configured account and the fleet at once, print
-/// the table (or JSON). Exits non-zero when any account needs a top-up (⚠) or couldn't be
-/// read — so `arena balance || <alert>` works from cron.
-pub(crate) async fn handle_balance(provider: &dyn Provider, cfg: &Config, json: bool) -> Result<()> {
-    let warn_hours = balance::warn_hours(cfg).map_err(anyhow::Error::msg)?;
-    let (probes, (pods, failed, note)) = tokio::join!(balance::fetch_all(cfg, balance::FETCH_TIMEOUT), fleet_pods(provider));
-    if let Some(n) = note {
-        eprintln!("{n}");
-    }
-    if !failed.is_empty() {
-        eprintln!("warning: {} failed to list — their fleet cost is unknown", failed.join(", "));
-    }
-    let report = balance::report(&probes, &balance::burns(&pods, &failed), warn_hours, arena_core::snapshot::unix_now());
-    print!("{}", balance_output(&report, json)?);
-    balance_exit(&report)
+/// `config check`'s balance rows: the threshold and how each account's sources stand —
+/// from the state file alone. `api` only says which accounts are configured: no request.
+pub(crate) fn balance_config_rows(cfg: &Config, bal: &BalanceCtx, now: u64) -> Vec<String> {
+    let (state, _) = balance::load_opt(bal.state_path());
+    balance::config_rows(cfg, &state, &bal.api.accounts(), now)
 }
 
-/// What `arena balance` prints. Pure.
-pub(crate) fn balance_output(report: &balance::Report, json: bool) -> Result<String> {
-    Ok(if json { format!("{}\n", serde_json::to_string_pretty(report)?) } else { balance::render(report) })
+/// The views for a surface that already listed (`pods list`, teardown): record what was
+/// observed against the listing's burns and judge it. Quiet: a write that fails is dropped
+/// (only `arena balance` says so).
+pub(crate) fn listed_views(
+    bal: &BalanceCtx,
+    state: balance::BalanceState,
+    fetched: &[Fetched],
+    listing: &Listing,
+    pods: &[Pod],
+    policy: &BalancePolicy,
+    now: u64,
+) -> Vec<balance::AccountView> {
+    let burns = balance::burns(listing, pods);
+    let (state, _) = balance::commit(bal.state_path(), state, fetched, &burns, Mode::Inline, now);
+    balance::views(&state, fetched, &burns, policy, Mode::Inline, now)
 }
 
-/// `Ok` unless an account needs a top-up or couldn't be read.
-fn balance_exit(report: &balance::Report) -> Result<()> {
-    match (report.warnings, report.unknown) {
-        (0, 0) => Ok(()),
-        (w, u) => anyhow::bail!("balance: {w} account(s) below BALANCE_WARN_HOURS or out of funds, {u} couldn't be read"),
-    }
+/// The `create`/`up` preflight: the target provider's account only, observed inline (no
+/// extra listing: the burn is the provider's or the last recorded sample), with the new
+/// pods priced at the dearest placement option (`None` on the single-spec path: price
+/// unknown). Advisory and quiet: lines to print, never an error.
+pub(crate) async fn balance_preflight(
+    provider: &dyn Provider,
+    cfg: &Config,
+    bal: &BalanceCtx,
+    new_pods: usize,
+    options: Option<&OptionPlan>,
+) -> Vec<String> {
+    let Some(account) = Account::from_name(provider.name()) else { return Vec::new() };
+    let now = unix_now();
+    let (state, _) = balance::load_opt(bal.state_path());
+    let Some(fetched) = balance::observe_account(bal.api.as_ref(), &state, account, Mode::Inline, balance::INLINE_TIMEOUT, now).await
+    else {
+        return Vec::new();
+    };
+    let fetched = [fetched];
+    let burns = balance::Burns::new();
+    let (state, _) = balance::commit(bal.state_path(), state, &fetched, &burns, Mode::Inline, now);
+    let (policy, _) = BalancePolicy::from_config(cfg);
+    let views = balance::views(&state, &fetched, &burns, &policy, Mode::Inline, now);
+    let price = options.and_then(|p| p.options.iter().filter_map(|o| o.price_per_pod).reduce(f64::max));
+    views.first().map(|v| balance::preflight_lines(v, new_pods, price, &policy, now)).unwrap_or_default()
 }
 
 /// One pod's probe call, read: the reply, or why there is none. A call that failed outright
@@ -202,8 +285,7 @@ pub(crate) async fn handle_idle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{handle_pods, Cli, Cmd, PodCmd, Select};
-    use arena_core::balance_v6::Account;
+    use crate::{handle_pods, BalanceCmd, Cli, Cmd, PodCmd, Select};
     use arena_core::idle::fixture::Reply;
     use arena_core::remote::{FakeRemote, FakeReply, RemoteCall};
     use arena_core::PodSpec;
@@ -289,8 +371,6 @@ mod tests {
             _ => panic!("wrong parse"),
         }
         assert!(parse(&["pods", "idle", "--hours", "0"]).is_err());
-        assert!(matches!(parse(&["balance"]).unwrap(), Cmd::Balance { json: false }));
-        assert!(matches!(parse(&["balance", "--json"]).unwrap(), Cmd::Balance { json: true }));
     }
 
     /// The scenario end to end through `pods idle`'s dispatch: an idle pod, one with a VS Code
@@ -377,93 +457,360 @@ mod tests {
         assert!(matches!(read_probe(out(false, 1, &Reply::default().render(), "")), Probe::Read(_)));
     }
 
+    // ---- `arena balance`, `balance set`, `config check` (a FakeBalanceApi; no network) ----
+
+    use arena_core::balance::{FakeBalanceApi, Fail, FailKind, Live};
+    use arena_core::snapshot::BALANCE_FILE;
+
+    const T0: u64 = 1_791_460_800;
+
+    fn rp_live(usd: f64, rate: f64) -> Live {
+        Live { usd, provider_burn_per_hr: Some(rate), spend_limit_per_hr: Some(80.0), under_balance: Some(false), reduced: false }
+    }
+
+    fn vast_live(usd: f64) -> Live {
+        Live { usd, provider_burn_per_hr: None, spend_limit_per_hr: None, under_balance: None, reduced: false }
+    }
+
+    /// A temp state directory (removed at the end), with this fleet's balance file in it.
+    struct StateDir(PathBuf);
+    impl Drop for StateDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    impl StateDir {
+        fn new(tag: &str) -> Self {
+            let d = std::env::temp_dir().join(format!("arena-money-test-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            StateDir(d)
+        }
+        fn file(&self) -> PathBuf {
+            self.0.join("devtest").join(BALANCE_FILE)
+        }
+        fn cfg(&self, extra: &str) -> Config {
+            Config::parse(&format!("MACHINE_NAME_PREFIX=devtest\nARENA_STATE_DIR={}\n{extra}", self.0.display()))
+        }
+    }
+
+    fn ctx(api: FakeBalanceApi, dir: Option<&StateDir>) -> (Arc<FakeBalanceApi>, BalanceCtx) {
+        let api = Arc::new(api);
+        (api.clone(), BalanceCtx { api, path: dir.map(|d| Ok(d.file())) })
+    }
+
+    fn mixed_fleet() -> Fleet {
+        Fleet {
+            backends: vec![
+                ("runpod", Ok(vec![pod("devtest-apple", "RUNNING", 0.25, 1)])),
+                ("vast", Err("list instances HTTP 429")),
+                ("hetzner", Ok(vec![Pod { provider: "hetzner".into(), status: "running".into(), cost_per_hr: Some(0.006), ..Default::default() }])),
+            ],
+        }
+    }
+
     #[test]
-    fn the_list_footer_is_one_line_plus_any_warning() {
-        let probes = vec![
-            AccountProbe {
-                provider: "runpod".into(),
-                account: Ok(Account::Prepaid {
-                    balance: 10.0,
-                    provider_per_hr: Some(0.0),
-                    spend_limit_per_hr: None,
-                    under_balance: None,
-                    owed: None,
-                }),
-            },
-            AccountProbe { provider: "vast".into(), account: Err("vast balance HTTP 429 Too Many Requests: {}".into()) },
+    fn balance_flags_and_set_parse() {
+        let parse = |argv: &[&str]| Cli::try_parse_from(["arena"].iter().chain(argv).copied()).map(|c| c.cmd);
+        assert!(matches!(
+            parse(&["balance"]).unwrap(),
+            Cmd::Balance { cmd: None, json: false, check: false, no_live: false, verbose: false }
+        ));
+        assert!(matches!(parse(&["balance", "--check", "--json"]).unwrap(), Cmd::Balance { cmd: None, json: true, check: true, .. }));
+        assert!(matches!(parse(&["balance", "--no-live", "-v"]).unwrap(), Cmd::Balance { no_live: true, verbose: true, .. }));
+        match parse(&["balance", "set", "runpod", "12.5"]).unwrap() {
+            Cmd::Balance { cmd: Some(BalanceCmd::Set { account, usd }), .. } => assert_eq!((account, usd), (Account::Runpod, 12.5)),
+            _ => panic!("wrong parse"),
+        }
+        match parse(&["balance", "set", "vast", "-3"]).unwrap() {
+            Cmd::Balance { cmd: Some(BalanceCmd::Set { account, usd }), .. } => assert_eq!((account, usd), (Account::Vast, -3.0)),
+            _ => panic!("wrong parse"),
+        }
+        for bad in [
+            &["balance", "set", "hetzner", "5"][..],
+            &["balance", "set", "runpod", "NaN"],
+            &["balance", "set", "runpod", "inf"],
+            &["balance", "set", "runpod", "2e7"],
+            &["balance", "set", "runpod"],
+            &["balance", "--json", "set", "runpod", "5"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn balance_table_and_json() {
+        let dir = StateDir::new("table");
+        let api = FakeBalanceApi::new().live_ok(Account::Runpod, rp_live(32.54, 0.47)).live_ok(Account::Vast, vast_live(136.87));
+        let (api, bal) = ctx(api, Some(&dir));
+        let out = balance_report(&mixed_fleet(), &dir.cfg(""), &bal, BalanceFlags::default(), T0).await.unwrap();
+        assert_eq!(out.code, 0, "a plain `arena balance` exits 0 whatever it found");
+        assert_eq!(out.stderr, ["warning: vast failed to list (provider error: list instances HTTP 429) — its burn is unknown"]);
+        for needle in [
+            "ACCOUNT   BALANCE  SOURCE        BURN  RUNWAY  RUNS OUT (UTC)    LEVEL",
+            "runpod     $32.54  live       $0.47/h  ≈2.8d   2026-10-11 09:14  ⚠ low",
+            "vast      $136.87  live             ?  ?       -                 ok",
+            "hetzner  postpaid  postpaid  €0.006/h  -       -                 -",
+            "  ⚠ runpod: ≈2.8d of runway at $0.47/h (≈ 2026-10-11 09:14 UTC), under BALANCE_WARN_HOURS=72",
+            "  runpod: RunPod reports $0.22/h more than arena lists",
+            "  hetzner: postpaid",
+        ] {
+            assert!(out.stdout.contains(needle), "`{needle}` missing:\n{}", out.stdout);
+        }
+        assert_eq!(api.live_calls(), 2);
+        // Recorded: the anchors are there for the fallback.
+        let (state, _) = arena_core::balance::load(&dir.file());
+        assert_eq!(state.accounts.len(), 2);
+        // -v: the parts behind the numbers.
+        let v = balance_report(&mixed_fleet(), &dir.cfg(""), &bal, BalanceFlags { verbose: true, ..Default::default() }, T0 + 600)
+            .await
+            .unwrap();
+        for needle in ["  burn: provider $0.47/h · listed $0.25/h — gap $0.22/h not in the listing", "  spendLimit $80.00/h · underBalance false", "state file: ", "  postpaid €0.006/h — servers only: volumes not counted"] {
+            assert!(v.stdout.contains(needle), "`{needle}` missing:\n{}", v.stdout);
+        }
+        // --json: one object per account, the source always there.
+        let j = balance_report(&mixed_fleet(), &dir.cfg(""), &bal, BalanceFlags { json: true, ..Default::default() }, T0 + 700)
+            .await
+            .unwrap();
+        let rows: serde_json::Value = serde_json::from_str(&j.stdout).unwrap();
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!((rows[0]["account"].as_str(), rows[0]["source"].as_str(), rows[0]["balance"].as_f64()), (Some("runpod"), Some("live"), Some(32.54)));
+        assert_eq!((rows[1]["account"].as_str(), rows[1]["burn"].is_null()), (Some("vast"), true), "a failed listing: burn unknown, not $0");
+        assert_eq!((rows[2]["source"].as_str(), rows[2]["currency"].as_str()), (Some("postpaid"), Some("EUR")));
+        // A bad threshold: the default is used, and said — never a failure.
+        let out = balance_report(&mixed_fleet(), &dir.cfg("BALANCE_WARN_HOURS=soon\n"), &bal, BalanceFlags::default(), T0 + 800).await.unwrap();
+        assert!(out.stderr.iter().any(|l| l.contains("BALANCE_WARN_HOURS must be a number") && l.ends_with("using 72")), "{:?}", out.stderr);
+    }
+
+    #[tokio::test]
+    async fn balance_check_exit_codes() {
+        let fleet = || Fleet { backends: vec![("runpod", Ok(vec![pod("devtest-apple", "RUNNING", 0.5, 1)])), ("vast", Ok(vec![]))] };
+        let check = BalanceFlags { check: true, ..Default::default() };
+        let gone = || Fail { kind: FailKind::Gone, http: Some(404), detail: None };
+        // (case, runpod live, vast live, exit)
+        let cases: Vec<(&str, std::result::Result<Live, Fail>, std::result::Result<Live, Fail>, i32)> = vec![
+            ("all fine", Ok(rp_live(500.0, 0.5)), Ok(vast_live(10.0)), 0),
+            ("low", Ok(rp_live(30.0, 0.5)), Ok(vast_live(10.0)), 1),
+            ("critical", Ok(rp_live(5.0, 0.5)), Ok(vast_live(10.0)), 2),
+            ("unknown while burning", Err(gone()), Ok(vast_live(10.0)), 3),
+            ("unknown but idle (vast)", Ok(rp_live(500.0, 0.5)), Err(gone()), 0),
+            ("worst wins: critical over unknown", Ok(rp_live(5.0, 0.5)), Err(gone()), 2),
+            ("worst wins: unknown over low", Err(gone()), Ok(Live { under_balance: None, ..vast_live(10.0) }), 3),
         ];
-        let pods = vec![pod("devtest-apple", "RUNNING", 0.5, 1), pod("devtest-bloom", "RUNNING", 0.5, 2)];
+        for (case, rp, vast, want) in cases {
+            let mut api = FakeBalanceApi::new();
+            api = match rp {
+                Ok(l) => api.live_ok(Account::Runpod, l),
+                Err(f) => api.live_err(Account::Runpod, f),
+            };
+            api = match vast {
+                Ok(l) => api.live_ok(Account::Vast, l),
+                Err(f) => api.live_err(Account::Vast, f),
+            };
+            let (_, bal) = ctx(api, None);
+            let out = balance_report(&fleet(), &cfg(), &bal, check, T0).await.unwrap();
+            assert_eq!(out.code, want, "{case}:\n{}", out.stdout);
+            // --check combines with --json: same code, JSON out.
+            let j = balance_report(&fleet(), &cfg(), &bal, BalanceFlags { json: true, ..check }, T0).await.unwrap();
+            assert_eq!(j.code, want, "{case} --json");
+            assert!(serde_json::from_str::<serde_json::Value>(&j.stdout).is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn balance_set_records_manual() {
+        let dir = StateDir::new("set");
+        let api = FakeBalanceApi::new().live_err(Account::Runpod, Fail { kind: FailKind::Gone, http: Some(410), detail: None });
+        let (_, bal) = ctx(api, Some(&dir));
+        let out = balance_set(&dir.cfg(""), &bal, Account::Runpod, 250.0, T0).unwrap();
+        assert!(out.starts_with("runpod: no reading → $250.00 (manual)\n"), "{out}");
+        let (state, _) = arena_core::balance::load(&dir.file());
+        let st = state.accounts.get(&Account::Runpod).unwrap();
+        assert_eq!(st.anchor.map(|a| (a.usd, a.at)), Some((250.0, T0)));
+        assert_eq!(st.key_fp, FakeBalanceApi::fp(Account::Runpod), "scoped by the configured key");
+        // With live down, the estimate counts down from it.
+        let fleet = Fleet { backends: vec![("runpod", Ok(vec![pod("devtest-apple", "RUNNING", 0.5, 1)]))] };
+        let out = balance_report(&fleet, &dir.cfg(""), &bal, BalanceFlags { no_live: true, ..Default::default() }, T0 + 3_600).await.unwrap();
+        assert!(out.stdout.contains("~$249.50") && out.stdout.contains("est. (manual 1h, metered)"), "{}", out.stdout);
+        // Live back: it wins, and replaces the manual anchor.
+        let api = FakeBalanceApi::new().live_ok(Account::Runpod, rp_live(31.0, 0.5));
+        let (_, live_bal) = ctx(api, Some(&dir));
+        let out = balance_report(&fleet, &dir.cfg(""), &live_bal, BalanceFlags::default(), T0 + 7_200).await.unwrap();
+        assert!(out.stdout.contains("$31.00  live"), "{}", out.stdout);
+        // `set` right after a live reading: recorded, but live is said to win for now.
+        let out = balance_set(&dir.cfg(""), &live_bal, Account::Runpod, 40.0, T0 + 7_260).unwrap();
+        assert!(out.starts_with("runpod: $31.00 (live, 1m ago) → $40.00 (manual)\n"), "{out}");
+        assert!(out.contains("note: live is $31.00; a manual value is used only while live is unavailable"), "{out}");
+    }
+
+    #[test]
+    fn balance_set_refuses_unconfigured() {
+        let dir = StateDir::new("set-refused");
+        let (_, bal) = ctx(FakeBalanceApi::new().with(Account::Runpod), Some(&dir));
+        let e = balance_set(&dir.cfg(""), &bal, Account::Vast, 5.0, T0).unwrap_err().to_string();
+        assert!(e.starts_with("VAST_API_KEY isn't set"), "{e}");
+        assert!(!dir.file().exists(), "nothing written");
+        let (_, nowhere) = ctx(FakeBalanceApi::new().with(Account::Runpod), None);
+        assert!(balance_set(&cfg(), &nowhere, Account::Runpod, 5.0, T0).unwrap_err().to_string().contains("nowhere to record it"));
+    }
+
+    /// Invariant 13: `--no-live` makes no live call and writes nothing (nor do the
+    /// cache-only rows of `config check`).
+    #[tokio::test]
+    async fn no_live_writes_nothing() {
+        let dir = StateDir::new("nolive");
+        let fleet = Fleet { backends: vec![("runpod", Ok(vec![pod("devtest-apple", "RUNNING", 0.5, 1)]))] };
+        // No file yet: still none after.
+        let (api, bal) = ctx(FakeBalanceApi::new().live_ok(Account::Runpod, rp_live(31.0, 0.5)), Some(&dir));
+        balance_report(&fleet, &dir.cfg(""), &bal, BalanceFlags { no_live: true, ..Default::default() }, T0).await.unwrap();
+        assert!(!dir.file().exists());
+        assert_eq!(api.live_calls(), 0);
+        // A file: byte for byte the same after.
+        balance_report(&fleet, &dir.cfg(""), &bal, BalanceFlags::default(), T0).await.unwrap();
+        let before = std::fs::read(dir.file()).unwrap();
+        let out = balance_report(&fleet, &dir.cfg(""), &bal, BalanceFlags { no_live: true, ..Default::default() }, T0 + 3_600).await.unwrap();
+        assert!(out.stdout.contains("est. (from live 1h, metered)") && out.stdout.contains("--no-live: no live call"), "{}", out.stdout);
+        assert_eq!(std::fs::read(dir.file()).unwrap(), before);
+        assert_eq!(api.live_calls(), 1, "only the plain run called live");
+        let _ = balance_config_rows(&dir.cfg(""), &bal, T0 + 3_600);
+        assert_eq!(std::fs::read(dir.file()).unwrap(), before);
+    }
+
+    /// `config check` reads the state file only: the fake panics on any call.
+    #[tokio::test]
+    async fn config_check_rows_from_cache() {
+        let dir = StateDir::new("config");
+        let fleet = Fleet { backends: vec![("runpod", Ok(vec![]))] };
+        let (_, bal) = ctx(FakeBalanceApi::new().live_ok(Account::Runpod, rp_live(31.0, 0.0)), Some(&dir));
+        balance_report(&fleet, &dir.cfg(""), &bal, BalanceFlags::default(), T0).await.unwrap();
+        let panicking = BalanceCtx {
+            api: Arc::new(FakeBalanceApi::new().with(Account::Runpod).with(Account::Vast).panicking()),
+            path: Some(Ok(dir.file())),
+        };
         assert_eq!(
-            list_footer(&probes, &pods, &[], &cfg(), NOW),
+            balance_config_rows(&dir.cfg(""), &panicking, T0 + 240),
             [
-                "balance: ⚠ runpod $10.00 ~10h · vast ?",
-                "⚠ runpod: $10.00 left at $1.00/h — runs out in ~10h (≈ 2026-10-08 22:00 UTC), under BALANCE_WARN_HOURS=48 — top up (or set up auto-pay) before it stops every pod",
+                "  ✓ BALANCE_WARN_HOURS         72 (default) — warn below 3d of runway",
+                "  ✓ runpod                     live 4m ago",
+                "  · vast                       no reading yet — run `arena balance`",
             ]
         );
-        // A threshold of 5h: no warning; a bad value: the default, said once.
-        let lines = list_footer(&probes, &pods, &[], &Config::parse("BALANCE_WARN_HOURS=5"), NOW);
-        assert_eq!(lines, ["balance: runpod $10.00 ~10h · vast ?"]);
-        let lines = list_footer(&probes, &pods, &[], &Config::parse("BALANCE_WARN_HOURS=soon"), NOW);
-        assert_eq!(lines.last().unwrap(), "warning: BALANCE_WARN_HOURS must be a number of hours ≥ 0 (got `soon`) — using 48");
-        assert!(list_footer(&[], &pods, &[], &cfg(), NOW).is_empty(), "no keys, no line");
     }
 
-    /// `pods list`'s footer knows which listings failed: Vast reports no rate of its own, so
-    /// with its listing gone its runway is `?` — never "no billing pods" off a missing list.
+    // ---- `pods list`: the balance line, and everything else unchanged ----
+
+    fn no_remote() -> Arc<dyn Remote> {
+        Arc::new(FakeRemote::new())
+    }
+
+    /// No balance reads at all: what `pods list` printed before this wave.
+    fn no_balance() -> BalanceCtx {
+        BalanceCtx { api: Arc::new(FakeBalanceApi::new()), path: None }
+    }
+
+    /// Every way a balance source fails, as fakes (the stall costs INLINE_TIMEOUT).
+    fn failing_apis() -> Vec<(&'static str, FakeBalanceApi)> {
+        let f = |kind, http| Fail { kind, http, detail: None };
+        vec![
+            ("transient", FakeBalanceApi::new().live_err(Account::Runpod, f(FailKind::Transient, Some(503)))),
+            ("auth", FakeBalanceApi::new().live_err(Account::Runpod, f(FailKind::Auth, Some(401)))),
+            ("gone", FakeBalanceApi::new().live_err(Account::Runpod, f(FailKind::Gone, Some(404)))),
+            ("drift", FakeBalanceApi::new().live_err(Account::Vast, f(FailKind::Drift, None))),
+            ("stall", FakeBalanceApi::new().live_stall(Account::Runpod).live_stall(Account::Vast)),
+        ]
+    }
+
+    fn two_providers() -> Fleet {
+        Fleet { backends: vec![("runpod", Ok(vec![pod("devtest-apple", "RUNNING", 0.5, 1)])), ("vast", Ok(vec![]))] }
+    }
+
     #[tokio::test]
-    async fn a_failed_listing_makes_the_footer_runway_unknown_not_idle() {
-        let vast = || AccountProbe {
-            provider: "vast".into(),
-            account: Ok(Account::Prepaid { balance: 40.0, provider_per_hr: None, spend_limit_per_hr: None, under_balance: None, owed: None }),
-        };
-        let fleet = Fleet {
-            backends: vec![("runpod", Ok(vec![pod("devtest-apple", "RUNNING", 0.25, 1)])), ("vast", Err("list pods HTTP 429"))],
-        };
-        let (pods, failed) = list_noting_failures(&fleet).await.unwrap();
-        assert_eq!((pods.len(), failed.as_slice()), (1, &["vast".to_string()][..]));
-        assert_eq!(list_footer(&[vast()], &pods, &failed, &cfg(), NOW), ["balance: vast $40.00 ?"]);
-        // The same pods with Vast listed fine (no pods there): nothing billing, said so.
-        assert_eq!(list_footer(&[vast()], &pods, &[], &cfg(), NOW), ["balance: vast $40.00 no billing pods"]);
-        // Every listing failed: the list fails, as `list_pods` would.
+    async fn pods_list_footer_shows_balance() {
+        let dir = StateDir::new("list-footer");
+        let api = FakeBalanceApi::new().live_ok(Account::Runpod, rp_live(48.0, 0.0)).live_ok(Account::Vast, vast_live(136.87));
+        let (api, bal) = ctx(api, Some(&dir));
+        let (out, err) = crate::list_with(&two_providers(), &no_remote(), &dir.cfg(""), &bal, false, false).await.unwrap();
+        assert!(err.is_empty(), "{err:?}");
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[lines.len() - 2].starts_with("fleet: $0.50/h across 1 billing pod(s)"), "{out}");
+        assert_eq!(lines.last().unwrap(), &"balance: runpod $48.00 live ≈4.0d · vast $136.87 live no burn", "{out}");
+        assert_eq!(api.live_calls(), 2);
+        assert!(dir.file().exists(), "recorded for the fallback");
+        // `(no pods)` gets the line too.
+        let dir = StateDir::new("list-empty");
+        let (_, bal) = ctx(FakeBalanceApi::new().live_ok(Account::Runpod, rp_live(48.0, 0.0)), Some(&dir));
+        let empty = Fleet { backends: vec![("runpod", Ok(vec![]))] };
+        let (out, _) = crate::list_with(&empty, &no_remote(), &dir.cfg(""), &bal, false, false).await.unwrap();
+        assert_eq!(out, "(no pods)\nbalance: runpod $48.00 live no burn\n");
+        // No prepaid account configured: no line at all, as before.
+        let (out, _) = crate::list_with(&empty, &no_remote(), &cfg(), &no_balance(), false, false).await.unwrap();
+        assert_eq!(out, "(no pods)\n");
+    }
+
+    /// Invariant 2 for `pods list --json`: byte for byte the same whatever the balance does —
+    /// it makes no balance call and writes no state.
+    #[tokio::test(start_paused = true)]
+    async fn pods_list_json_identical() {
+        let (baseline, base_err) = crate::list_with(&two_providers(), &no_remote(), &cfg(), &no_balance(), true, false).await.unwrap();
+        let mut apis = failing_apis();
+        apis.push(("ok", FakeBalanceApi::new().live_ok(Account::Runpod, rp_live(1.0, 9.0))));
+        for (case, api) in apis {
+            let dir = StateDir::new(&format!("json-{case}"));
+            let (api, bal) = ctx(api, Some(&dir));
+            let (out, err) = crate::list_with(&two_providers(), &no_remote(), &dir.cfg(""), &bal, true, false).await.unwrap();
+            assert_eq!((&out, &err), (&baseline, &base_err), "{case}");
+            assert_eq!((api.live_calls(), api.billed_calls()), (0, 0), "{case}");
+            assert!(!dir.file().exists(), "{case}");
+        }
+        let pods: Vec<Pod> = serde_json::from_str(&baseline).unwrap();
+        assert_eq!(pods.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pods_list_partial_warning_unchanged() {
+        let fleet = Fleet { backends: vec![("runpod", Ok(vec![pod("devtest-apple", "RUNNING", 0.25, 1)])), ("vast", Err("list pods HTTP 429"))] };
+        let want = ["warning: some providers failed to list (vast: provider error: list pods HTTP 429)"];
+        let (_, err) = crate::list_with(&fleet, &no_remote(), &cfg(), &no_balance(), false, false).await.unwrap();
+        assert_eq!(err, want);
+        // With balances: the same one warning — and Vast's burn is unknown, never $0/h.
+        let (_, bal) = ctx(FakeBalanceApi::new().live_ok(Account::Vast, vast_live(40.0)), None);
+        let (out, err) = crate::list_with(&fleet, &no_remote(), &cfg(), &bal, false, false).await.unwrap();
+        assert_eq!(err, want);
+        assert_eq!(out.lines().last().unwrap(), "balance: vast $40.00 live ?", "{out}");
+    }
+
+    #[tokio::test]
+    async fn pods_list_all_failed_still_errors() {
         let down = Fleet { backends: vec![("runpod", Err("HTTP 500")), ("vast", Err("HTTP 429"))] };
-        let e = list_noting_failures(&down).await.unwrap_err().to_string();
-        assert!(e.starts_with("all providers failed to list: runpod: ") && e.contains("vast: "), "{e}");
+        for bal in [no_balance(), ctx(FakeBalanceApi::new().live_ok(Account::Runpod, rp_live(5.0, 1.0)), None).1] {
+            let e = crate::list_with(&down, &no_remote(), &cfg(), &bal, false, false).await.unwrap_err().to_string();
+            assert!(e.starts_with("all providers failed to list: runpod: ") && e.contains("vast: "), "{e}");
+        }
+        // Nothing configured at all is no error (and no line).
+        let none = Fleet { backends: vec![] };
+        assert_eq!(crate::list_with(&none, &no_remote(), &cfg(), &no_balance(), false, false).await.unwrap(), ("(no pods)\n".into(), vec![]));
     }
 
-    #[test]
-    fn balance_output_and_exit_follow_the_report() {
-        let ok = vec![AccountProbe { provider: "hetzner".into(), account: Ok(Account::Postpaid) }];
-        let r = balance::report(&ok, &balance::burns(&[], &[]), 48.0, NOW);
-        assert!(balance_exit(&r).is_ok());
-        assert!(balance_output(&r, false).unwrap().contains("hetzner   postpaid"));
-        let v: serde_json::Value = serde_json::from_str(&balance_output(&r, true).unwrap()).unwrap();
-        assert_eq!(v["rows"][0]["billing"], "postpaid");
-        let bad = vec![AccountProbe { provider: "runpod".into(), account: Err("runpod balance HTTP 401".into()) }];
-        let r = balance::report(&bad, &balance::burns(&[], &[]), 48.0, NOW);
-        assert_eq!(
-            balance_exit(&r).unwrap_err().to_string(),
-            "balance: 0 account(s) below BALANCE_WARN_HOURS or out of funds, 1 couldn't be read"
-        );
-        assert_eq!(teardown_lines(&bad, &cfg(), NOW)[1], "  ? runpod: balance unavailable — runpod balance HTTP 401");
-    }
-
-    /// `arena balance` reads the fleet per provider: a failed listing makes that provider's
-    /// fleet cost unknown (`?`), never zero — and nothing is mutated.
+    /// Invariant 11: a failing balance source never reaches stderr on an inline surface — the
+    /// `pods list` warnings are exactly the baseline's, and the preflight only returns lines
+    /// to print with the rest of the plan (a label: `?` or `est.`), never an error.
     #[tokio::test]
-    async fn the_fleet_cost_comes_from_every_listing_that_answered() {
-        let fleet = Fleet {
-            backends: vec![("runpod", Ok(vec![pod("devtest-apple", "RUNNING", 0.25, 1)])), ("vast", Err("list pods HTTP 429"))],
-        };
-        let (pods, failed, note) = fleet_pods(&fleet).await;
-        assert_eq!((pods.len(), failed.as_slice(), note), (1, &["vast".to_string()][..], None));
-        let probes = vec![
-            AccountProbe {
-                provider: "vast".into(),
-                account: Ok(Account::Prepaid { balance: 100.0, provider_per_hr: None, spend_limit_per_hr: None, under_balance: None, owed: None }),
-            },
-        ];
-        let r = balance::report(&probes, &balance::burns(&pods, &failed), 48.0, NOW);
-        let text = balance_output(&r, false).unwrap();
-        assert!(text.contains("vast      $100.00              -      ?  ?"), "{text}");
+    async fn inline_surfaces_silent() {
+        let fleet = || Fleet { backends: vec![("runpod", Ok(vec![pod("devtest-apple", "RUNNING", 0.25, 1)])), ("vast", Err("HTTP 429"))] };
+        let (base_out, base_err) = crate::list_with(&fleet(), &no_remote(), &cfg(), &no_balance(), false, false).await.unwrap();
+        for (case, api) in failing_apis() {
+            let dir = StateDir::new(&format!("silent-{case}"));
+            let (_, bal) = ctx(api, Some(&dir));
+            let started = std::time::Instant::now();
+            let (out, err) = crate::list_with(&fleet(), &no_remote(), &dir.cfg(""), &bal, false, false).await.unwrap();
+            assert!(started.elapsed() < balance::INLINE_TIMEOUT + Duration::from_secs(1), "{case}");
+            assert_eq!(err, base_err, "{case}: stderr is the listing's, never the balance's");
+            let (table, footer) = out.rsplit_once("balance: ").unwrap_or_else(|| panic!("{case}: {out}"));
+            assert_eq!(table, base_out, "{case}");
+            assert!(footer.contains('?') || footer.contains("est."), "{case}: {footer}");
+            let lines = balance_preflight(&fleet(), &dir.cfg(""), &bal, 1, None).await;
+            assert!(lines.iter().all(|l| !l.to_lowercase().contains("error")), "{case}: {lines:?}");
+        }
     }
 }
