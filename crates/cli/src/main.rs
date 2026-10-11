@@ -6461,7 +6461,8 @@ async fn handle_snapshot(
     // `--no-probe`.
     reach: Option<Arc<dyn arena_core::snapshot::Reach>>,
 ) -> Result<()> {
-    let (snap, warnings) = collect_snapshot(provider, cfg, arena_core::snapshot::unix_now(), reach).await?;
+    let bal = money::BalanceCtx::from_config(cfg);
+    let (snap, warnings) = collect_snapshot(provider, cfg, arena_core::snapshot::unix_now(), reach, &bal).await?;
     for w in warnings {
         eprintln!("{w}");
     }
@@ -6503,12 +6504,15 @@ async fn handle_snapshot(
 /// session, no deep check, no proxy over SSH. A provider that fails to list makes the
 /// snapshot partial (and the public one `complete: false`); if none answers it's an error
 /// and nothing is written — a page going stale says more than a page that shows an empty
-/// fleet. Returns the snapshot and the warning lines to print.
+/// fleet. The prepaid balances come from the balance state file alone (`bal` only says
+/// which accounts are configured): no balance call, nothing written — a cron's snapshot
+/// never observes. Returns the snapshot and the warning lines to print.
 async fn collect_snapshot(
     provider: &dyn Provider,
     cfg: &Config,
     now: u64,
     reach: Option<Arc<dyn arena_core::snapshot::Reach>>,
+    bal: &money::BalanceCtx,
 ) -> Result<(arena_core::snapshot::FleetSnapshot, Vec<String>)> {
     use arena_core::snapshot::{self, HealthCache};
     let listing = arena_core::proxy::Listing::from_results(provider.list_by_provider().await);
@@ -6541,6 +6545,15 @@ async fn collect_snapshot(
         }
     };
     let mut snap = snapshot::build(&pods, &partial, proxy.as_deref(), &health, &Naming::from_config(cfg), now);
+    let accounts = bal.api.accounts();
+    if !accounts.is_empty() {
+        use arena_core::balance::{self, BalancePolicy, Fetched, Mode};
+        let (state, _) = balance::load_opt(bal.state_path());
+        let fetched: Vec<Fetched> = accounts.into_iter().map(|(a, fp)| Fetched::nothing(a, fp)).collect();
+        let (policy, _) = BalancePolicy::from_config(cfg);
+        snap.balance = balance::views(&state, &fetched, &balance::burns(&listing, &pods), &policy, Mode::CacheOnly, now);
+        snap.balance_policy = policy;
+    }
     if let Some(reach) = reach {
         snapshot::probe_reachability(&mut snap, reach).await;
     }
@@ -20414,6 +20427,11 @@ mod snapshot_tests {
         ))
     }
 
+    /// No prepaid account configured: no balance in the snapshot.
+    fn no_balance() -> crate::money::BalanceCtx {
+        crate::money::BalanceCtx { api: Arc::new(arena_core::balance::FakeBalanceApi::new()), path: None }
+    }
+
     fn checked(p: &Pod, status: Status, checks: &[(&str, Status, &str)]) -> PodHealth {
         PodHealth {
             id: p.id.clone(),
@@ -20440,6 +20458,40 @@ mod snapshot_tests {
         assert!(matches!(parse(&["snap", "--json"]).unwrap(), Cmd::Snapshot { json: true, .. }));
     }
 
+    /// Invariant 9: the snapshot's balance comes from the state file — the fake panics on
+    /// any balance call — and only the internal forms show it; `--public` has none of it.
+    #[tokio::test]
+    async fn snapshot_makes_no_balance_calls() {
+        use arena_core::balance::{self, Account, FakeBalanceApi, Fetched, Live, Mode};
+        let dir = tmp("balance");
+        let cfg = cfg(&dir.0);
+        let state_file = dir.0.join("state").join("devtest").join(arena_core::snapshot::BALANCE_FILE);
+        // A reading recorded earlier (as `arena balance` would have).
+        let fp = FakeBalanceApi::fp(Account::Runpod);
+        let live = Live { usd: 512.34, provider_burn_per_hr: Some(0.5), spend_limit_per_hr: None, under_balance: None, reduced: false };
+        let at = arena_core::snapshot::unix_now() - 3_600;
+        let f = Fetched { account: Account::Runpod, key_fp: fp, live: Some(Ok(live)), billed: None };
+        balance::record(&state_file, |s| balance::apply(s, &[f], &balance::Burns::new(), Mode::Full, at)).unwrap();
+        let before = std::fs::read(&state_file).unwrap();
+        let bal = crate::money::BalanceCtx {
+            api: Arc::new(FakeBalanceApi::new().with(Account::Runpod).panicking()),
+            path: Some(Ok(state_file.clone())),
+        };
+        let (snap, _) = collect_snapshot(&fleet(), &cfg, arena_core::snapshot::unix_now(), None, &bal).await.unwrap();
+        assert_eq!(std::fs::read(&state_file).unwrap(), before, "nothing written");
+        assert_eq!(snap.balance.len(), 1);
+        assert_eq!(snap.balance[0].source, balance::Source::Estimate, "an hour-old reading is an estimate");
+        let naming = Naming::from_config(&cfg);
+        let table = render_snapshot(&snap, &naming, false, false).unwrap();
+        assert!(table.lines().last().unwrap().starts_with("balance: runpod ~$511."), "{table}");
+        let json = render_snapshot(&snap, &naming, true, false).unwrap();
+        assert!(json.contains("\"balance\"") && json.contains("\"source\": \"estimate\""), "{json}");
+        let public = render_snapshot(&snap, &naming, false, true).unwrap();
+        for needle in ["balance", "credit", "runway", "511.", "512."] {
+            assert!(!public.contains(needle), "`{needle}` in the public snapshot: {public}");
+        }
+    }
+
     #[tokio::test]
     async fn snapshot_joins_listing_proxy_and_cached_health_without_touching_anything() {
         let dir = tmp("collect");
@@ -20456,7 +20508,7 @@ mod snapshot_tests {
         let f = fleet();
         // apple's (and the staff box's) sshd answer; bloom's doesn't.
         let probe = answering(&[22001, 22003]);
-        let (snap, warnings) = collect_snapshot(&f, &cfg, arena_core::snapshot::unix_now(), Some(probe.clone())).await.unwrap();
+        let (snap, warnings) = collect_snapshot(&f, &cfg, arena_core::snapshot::unix_now(), Some(probe.clone()), &no_balance()).await.unwrap();
         assert_eq!(f.enriched.load(Ordering::SeqCst), 1, "one details query, like `pods list`");
         let mut asked = probe.asked.lock().unwrap().clone();
         asked.sort();
@@ -20497,7 +20549,7 @@ mod snapshot_tests {
         assert_eq!(status, [("apple", PublicStatus::Up), ("bloom", PublicStatus::Starting)]);
 
         // `--no-probe`: nothing probed (SSH `-`), and a listed-running pod with an endpoint is up.
-        let (snap, _) = collect_snapshot(&fleet(), &cfg, arena_core::snapshot::unix_now(), None).await.unwrap();
+        let (snap, _) = collect_snapshot(&fleet(), &cfg, arena_core::snapshot::unix_now(), None, &no_balance()).await.unwrap();
         assert!(snap.pods.iter().all(|p| p.reachable.is_none()));
         let public = arena_core::snapshot::public_snapshot(&snap, &Naming::from_config(&cfg));
         assert!(public.machines.iter().all(|m| m.status == PublicStatus::Up), "{public:?}");
@@ -20608,13 +20660,13 @@ mod snapshot_tests {
         std::fs::create_dir_all(&state).unwrap();
         std::fs::write(state.join("health.json"), "{truncated").unwrap();
         std::fs::remove_file(dir.0.join("proxy.conf")).unwrap();
-        let (snap, warnings) = collect_snapshot(&fleet(), &cfg, 1_791_460_800, all_up()).await.unwrap();
+        let (snap, warnings) = collect_snapshot(&fleet(), &cfg, 1_791_460_800, all_up(), &no_balance()).await.unwrap();
         assert!(snap.pods.iter().all(|p| p.health.is_none() && p.proxy == ProxyState::None), "{snap:#?}");
         assert_eq!(warnings.iter().filter(|w| w.contains("ignoring the health cache")).count(), 1, "{warnings:?}");
         // A remote proxy is never fetched (no SSH): its forwards are unknown.
         cfg.values.insert("PROXY_LOCAL".into(), "false".into());
         cfg.values.insert("SSH_PROXY_HOST".into(), "proxy.example".into());
-        let (snap, _) = collect_snapshot(&fleet(), &cfg, 1_791_460_800, all_up()).await.unwrap();
+        let (snap, _) = collect_snapshot(&fleet(), &cfg, 1_791_460_800, all_up(), &no_balance()).await.unwrap();
         assert!(snap.pods.iter().all(|p| p.proxy == ProxyState::Unknown));
     }
 }

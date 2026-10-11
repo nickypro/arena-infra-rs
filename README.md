@@ -36,7 +36,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     terminate while locked, so it's never read for that. **GraphQL dependency inventory** (GraphQL is
     reportedly retiring too, "early 2027", unverified) — on v2 it is left only for the
     maintenance window (`enrich`, best-effort: a failure is one warning line, GPU/$ still
-    shown), the account balance (v2 has billing history only) and, as a fallback after
+    shown), the live account balance (v2 has billing *history* only — which `balance`'s
+    estimates use once GraphQL is gone) and, as a fallback after
     REST v2, `teardown --check`'s volume listing; see the module doc of `runpod_v2.rs`.
     Contract tests replay scrubbed recorded v2 responses (`provider/fixtures/runpod_v2/`).
     Neither API reports a pod's CUDA constraint, so `replace`/`migrate copy` re-apply the
@@ -72,8 +73,10 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     pod, and the allowlisted `PublicSnapshot` for the web page.
   - `teardown` — the pure judge behind `teardown --check`: listings, volumes, keys, cron/`at`
     and proxy inputs in, a `✓ ✗ ? –` checklist with fix commands out (unknown ≠ empty).
-  - `balance` — provider account balances (RunPod GraphQL `myself`, Vast `users/current`;
-    Hetzner postpaid) judged against the burn into a runway; `idle` — the read-only
+  - `balance` — prepaid account balances and the fallback chain: live (RunPod GraphQL
+    `myself`, Vast `users/current`), else an estimate from the last reading minus max(billed,
+    metered) spend, else `?`; burn, runway, levels, the `balance.json` state and every
+    surface's rendering (Hetzner postpaid); `idle` — the read-only
     `pods idle` probe script, its reply parser and the verdict/report (unknown ≠ idle).
   - `lock` — pod locks (RunPod v2, `Pod::locked`): the one refusal sentence (`devtest-x is
     locked — `arena pods unlock devtest-x` first`), the up-front refusal over a selection,
@@ -114,10 +117,11 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     running or on its way up — RunPod v2 `PROVISIONING`/`STARTING`/`ERROR` too, Hetzner
     `initializing`, Vast `loading` — not `EXITED`/`STOPPED`/`TERMINATED`/`off`; a Hetzner
     server bills while it exists, powered off included. A non-billing pod's `$/H` shows `-`
-    (`--json` keeps the raw `cost_per_hr`). Under the footer (table only) one
-    `balance: runpod $32.54 ~65h · vast $136.87 no billing pods · hetzner postpaid` line plus
-    any ⚠ (see `balance`), read while the list runs — best-effort, each account within 15 s,
-    never failing the list. GPU/$/maintenance come from one extra read-only
+    (`--json` keeps the raw `cost_per_hr`). Under the footer (table only, `(no pods)` too)
+    one `balance: runpod $32.54 live ≈4.0d · vast ~$118.30 est. ≈49.2d` line (see `balance`;
+    `⚠`/`‼` with the threshold or the consequence when low/critical, `?` with the `set`
+    nudge when unknown), observed while the list runs — within 5 s, a live read only when
+    the last one is 5 min old, silent whatever happens; `--json` reads no balance at all. GPU/$/maintenance come from one extra read-only
     RunPod GraphQL query per `list` (on `RUNPOD_API=v2` the REST list already has GPU and $,
     so GraphQL adds only maintenance) (best-effort: if it fails you get one warning line and
     the list still renders); the `nvidia-smi` probe over SSH (default for the table,
@@ -542,22 +546,42 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     are read (not root's, not `/etc/cron.d`); shown commands have secret-looking values
     redacted (`NAME=…`, `--flag=…`/`--flag …` named key/token/secret/pass, `sk-`/`rpa_`/`hf_`
     words; tab-separated fields too). `--json` = the same checklist for scripts.
-    After the checklist (text only) come the provider account balances — informational, never
-    part of the verdict or the exit: what's left, and whether RunPod still reports spend.
-  - `balance [--json]` — money left on each provider account and how long it lasts
-    (read-only). **RunPod** via GraphQL `myself { clientBalance currentSpendPerHr spendLimit
-    underBalance }` (REST v2 has billing history only; if GraphQL goes away the balance reads
-    "unavailable" and nothing else breaks); **Vast** `GET /api/v0/users/current/` → `credit`
-    (the prepaid amount the console shows; a negative `balance` is shown as possibly owed,
-    never folded in; that body carries the email and API key, so only those two fields are
-    read and it is never quoted); **Hetzner** is postpaid — said, no number. Burn = the higher
-    of the provider's own rate and this fleet's billing pods there (a provider that failed to
-    list, with no rate of its own, is `?` — never "not burning"); runway = balance ÷ burn, with
-    the date it runs out. Below `BALANCE_WARN_HOURS` (default 48; `0` = runway warning off; a
-    malformed value is an error here, the default elsewhere) — or at zero, or RunPod's
-    `underBalance` — a row is a ⚠ (`top up … before it stops every pod`). Exits non-zero when
-    an account needs a top-up or couldn't be read (`arena balance || <alert>` from cron).
-    Never shows account ids or emails. Each account read ≤ 20 s, status-first.
+    After the verdict come `info:` lines with the prepaid balances (and the spend RunPod
+    reports that arena doesn't list: volumes, stopped disks, serverless) — informational,
+    never part of the verdict or the exit; `--json` carries them as a top-level `balance`.
+  - `balance [--json] [--check] [--no-live] [-v]` — money left on each prepaid account, how
+    long it lasts and **where the number comes from** (read-only). A balance is **live** —
+    **RunPod** GraphQL `myself { clientBalance currentSpendPerHr spendLimit underBalance }`
+    (a field RunPod drops costs that field: the query is retried with `clientBalance` alone),
+    **Vast** `GET /api/v0/users/current/` → `credit` (that body carries the email and API
+    key: only `credit` is read, and it is never quoted) — when read now or under 5 min ago;
+    else **est.**: the last live reading (or `balance set`) minus max(billed, metered)
+    spend since — *billed* from RunPod's REST v2 hourly billing history (every resource on
+    the account, but it lags), *metered* from arena's own burn samples (each step charged at
+    its higher end) — shown `~$X est. (live n/a 2d, billed)`, for up to 14 days; else `?`
+    with `arena balance set <acct> <USD>`. Estimates err low (they warn early, never late)
+    and never rise between readings. **Hetzner** is postpaid: €/h, no runway, never a
+    warning; volumes aren't counted. Burn = the higher of the provider's own rate and this
+    fleet's billing pods there (a provider that failed to list is an unknown burn — never
+    $0/h); runway = balance ÷ burn. Levels: **critical** under 24 h, at ≤ $0, or on RunPod's
+    `underBalance` (at $0 RunPod *terminates* pods without a network volume); **low** under
+    `BALANCE_WARN_HOURS` (default 72, `0` = runway levels off; malformed → 72 and a
+    warning). Lists the fleet (no details) while reading every account (≤ 10 s), records the
+    reading in `balance.json` (0600, next to the health cache, per prefix, scoped by a
+    32-bit key fingerprint), then runs the **fallback check**: the estimate from a reading
+    30 min–~1 day old against the live truth (`fallback check ✓ over 26h (read $0.40
+    low)`), so a broken fallback shows up while GraphQL still works. `--no-live` shows what
+    the fallback says (no live call, nothing written); `-v` adds the burn's parts, spend
+    limit, anchors, billing buckets, last failures and the state file. Exit 0; with
+    `--check` 2 if any account is critical, else 3 if any is unknown while burning, else 1
+    if any is low. A failing source is one note here and a ⚠ row in `config check` —
+    nowhere else does it print or change an exit.
+  - `balance set <runpod|vast> <USD>` — record the balance read off the console when every
+    API is dead (a manual anchor; a local write, scoped to the configured key; the next live
+    reading replaces it). `create`/`up` print the target account's balance next to the plan
+    — the runway after the new pods (`n ×` the dearest option), and RunPod's refusals ahead
+    of time: under an hour's credit for them, over the spend limit, `underBalance` — never
+    blocking.
   - `pods idle [targets] [--hours N] [--json]` — which pods look abandoned: a **read-only
     report that never acts**. One bounded probe per billing pod (60 s; POSIX `sh`, writes
     nothing): established inbound connections from `/proc/net/tcp{,6}` — SSH sessions on
@@ -895,8 +919,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     Hetzner `€` kept apart, unpriced pods counted) plus per day, **led** by a yellow
     `⚠ vast failed to list — its pods (and their cost) are missing` when a provider didn't
     answer (first, so a narrow terminal can't cut it off), and ending with the account
-    balance (`arena balance`'s one-liner, read every 5 min in its own task; when an account
-    needs a top-up it moves to the front, in red). API calls per refresh are
+    prepaid balances (`arena balance`'s views, observed in the details round — at most one
+    live read per account per 5 min — and recorded in the CLI's state file; a low account
+    moves to the front in yellow, a critical one in red). API calls per refresh are
     unchanged (one list per provider); the details query (GPU/$/maintenance) runs every
     60 s or on `r` (≥10 s apart); one that fails part-way still shows what it filled (as
     `pods list` does) over the last good answer, with a footer warning.

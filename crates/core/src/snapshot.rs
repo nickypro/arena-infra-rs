@@ -494,6 +494,14 @@ pub struct FleetSnapshot {
     pub cost: FleetCost,
     /// Providers that failed to list: their pods are missing from `pods` (and `cost`).
     pub partial: Vec<String>,
+    /// The prepaid accounts as the balance state file last saw them (`crate::balance`,
+    /// cache only — building a snapshot makes no balance call). Filled by the caller;
+    /// internal only: [`PublicSnapshot`] has no such field.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub balance: Vec<crate::balance::AccountView>,
+    /// The threshold the balance was judged against (for its footer's words).
+    #[serde(skip)]
+    pub balance_policy: crate::balance::BalancePolicy,
 }
 
 /// The MACHINE_NAME_LIST entry whose qualified name is `name` (first one, like the proxy's
@@ -557,6 +565,8 @@ pub fn build(
         pods: pods_out,
         cost: fleet::fleet_cost(pods),
         partial: partial.to_vec(),
+        balance: Vec::new(),
+        balance_policy: Default::default(),
     }
 }
 
@@ -739,8 +749,11 @@ pub fn health_label(h: Option<&HealthRecord>, now: u64) -> String {
 /// HEALTH before MAINT, then the fleet cost footer and, for a partial listing, which
 /// providers are missing.
 pub fn render_table(snap: &FleetSnapshot) -> String {
+    let balance = crate::balance::footer_line(&snap.balance, &snap.balance_policy, snap.generated_at)
+        .map(|l| format!("{l}\n"))
+        .unwrap_or_default();
     if snap.pods.is_empty() && snap.partial.is_empty() {
-        return "(no pods)\n".into();
+        return format!("(no pods)\n{balance}");
     }
     let rows: Vec<Vec<String>> = snap
         .pods
@@ -769,6 +782,7 @@ pub fn render_table(snap: &FleetSnapshot) -> String {
             snap.partial.join(", ")
         ));
     }
+    out.push_str(&balance);
     out
 }
 
@@ -1992,6 +2006,35 @@ fleet: $0.17/h across 2 billing pod(s) (1 unpriced)
         }
         // The default budget is the documented few seconds.
         assert_eq!(SshPortProbe::default().timeout, REACH_TIMEOUT);
+    }
+
+    /// Invariant 9: a snapshot carrying prepaid balances (amounts, runways, a failing source)
+    /// publishes none of it — no `balance`, `credit` or `runway`, no amount — while the
+    /// internal table and JSON do show it.
+    #[test]
+    fn snapshot_public_has_no_balance() {
+        use crate::balance::{self, Account, Fetched, Live};
+        let cfg = cfg();
+        let naming = Naming::from_config(&cfg);
+        let pods = vec![at(pod("devtest-apple", "runpod", "rp1"), "203.0.113.7", 10022)];
+        let mut snap = build(&pods, &[], Some(&proxy_text()), &HealthCache::new(), &naming, NOW);
+        let live = |usd: f64| Live { usd, provider_burn_per_hr: Some(0.47), spend_limit_per_hr: Some(80.0), under_balance: Some(false), reduced: false };
+        let fetched = [
+            Fetched { account: Account::Runpod, key_fp: "fp".into(), live: Some(Ok(live(32.54))), billed: None },
+            Fetched { account: Account::Vast, key_fp: "fp".into(), live: Some(Ok(Live { provider_burn_per_hr: None, ..live(136.87) })), billed: None },
+        ];
+        snap.balance = balance::views(&balance::BalanceState::default(), &fetched, &balance::Burns::new(), &snap.balance_policy, balance::Mode::Inline, NOW);
+        let internal = format!("{}{}", serde_json::to_string(&snap).unwrap(), render_table(&snap));
+        for needle in ["32.54", "136.87", "runway", "balance: ⚠ runpod $32.54 live"] {
+            assert!(internal.contains(needle), "fixture sanity: {needle}");
+        }
+        let json = public_json(&public_snapshot(&snap, &naming));
+        let lower = json.to_lowercase();
+        for needle in ["balance", "credit", "runway", "32.54", "136.87", "0.47", "80.0", "spend", "burn", "$"] {
+            assert!(!lower.contains(needle), "`{needle}` leaked into {json}");
+        }
+        // The pinned public shape still parses (deny_unknown_fields): nothing was added.
+        let _: PublicSnapshot = serde_json::from_str(&json).unwrap();
     }
 
     /// PLAN Phase 4's leak test: a fleet stuffed with everything that must never be

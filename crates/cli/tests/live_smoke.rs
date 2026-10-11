@@ -330,6 +330,23 @@ fn parse_teardown(json: &str) -> Result<Teardown, String> {
     Ok(Teardown { pods, unknown, forwards })
 }
 
+/// The pre-cohort balance assertion on `balance --json`: RunPod's balance is read **live**
+/// (GraphQL still answers — when it doesn't, the estimates are carrying the footers and
+/// someone should know before a cohort), and a fallback check, when one has run, didn't
+/// overstate (the estimate would have shown more money than there was).
+fn balance_ok(json: &str) -> Result<(), String> {
+    let v: Value = serde_json::from_str(json).map_err(|e| format!("balance --json isn't JSON ({e})"))?;
+    let rows = v.as_array().ok_or("balance --json isn't an array of accounts")?;
+    let rp = rows.iter().find(|r| r["account"] == "runpod").ok_or("balance --json has no runpod row")?;
+    if rp["source"] != "live" {
+        return Err(format!("runpod's balance is `{}`, not live — failing: {}", rp["source"], rp["live_failing"]));
+    }
+    if rp["check"]["verdict"] == "overstates" {
+        return Err(format!("the fallback check overstated: {}", rp["check"]));
+    }
+    Ok(())
+}
+
 /// The pods that aren't this fleet's (`{prefix}-…`): any one means the wrong account.
 fn foreign<'a>(names: impl IntoIterator<Item = &'a str>, prefix: &str) -> Vec<&'a str> {
     let ours = format!("{prefix}-");
@@ -840,6 +857,12 @@ fn live_smoke() {
     );
     let leaks = public_leaks(&snap.stdout, &prefix, &pod);
     assert!(leaks.is_empty(), "the public snapshot leaks: {leaks:?}");
+
+    // 3b. The balance (read-only): RunPod's is read live, and the fallback check (if one
+    //     has run against this state dir) didn't overstate.
+    let bal = arena.run(&["balance", "--json"], LIST_LIMIT, true);
+    assert!(bal.ok(), "balance --json: {}", bal.describe());
+    balance_ok(&bal.stdout).unwrap_or_else(|e| panic!("balance: {e}"));
 
     // 4. Rename there and back (metadata only: same pod id, ~/.name + proxy follow).
     for (from, to) in [(&create, &rename_to), (&rename_to, &create)] {
@@ -1390,4 +1413,15 @@ fn the_cleanup_guard_terminates_through_outages_and_stops_only_on_a_complete_lis
         let calls = std::fs::read_to_string(dir.0.join("calls")).unwrap();
         assert_eq!(calls.lines().collect::<Vec<_>>(), want, "{tag}");
     }
+}
+
+#[test]
+fn balance_assertion_wants_runpod_live_and_no_overstating_check() {
+    let row = |source: &str, check: Value| serde_json::json!([{ "account": "runpod", "source": source, "check": check, "live_failing": null }]);
+    assert_eq!(balance_ok(&row("live", Value::Null).to_string()), Ok(()));
+    assert_eq!(balance_ok(&row("live", serde_json::json!({ "verdict": "safe" })).to_string()), Ok(()));
+    assert!(balance_ok(&row("estimate", Value::Null).to_string()).unwrap_err().contains("not live"));
+    assert!(balance_ok(&row("live", serde_json::json!({ "verdict": "overstates" })).to_string()).unwrap_err().contains("overstated"));
+    assert!(balance_ok(r#"[{"account": "vast", "source": "live"}]"#).unwrap_err().contains("no runpod row"));
+    assert!(balance_ok("{}").is_err() && balance_ok("nope").is_err());
 }
