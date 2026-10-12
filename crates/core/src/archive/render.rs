@@ -67,12 +67,14 @@ pub fn probe_command(snap_dev: &str, big_dev: &str) -> String {
 
 /// The push key's line in `/etc/ssh/arena-keys/arena-push` (S5): `restrict` (no pty, no
 /// forwarding, no agent, no X11, no user rc) and a forced command — rrsync, write-only, no
-/// deletes, no lock (snap and big push at once), rooted at the push dir. Whatever the client
-/// asks to run, this runs. The key is re-rendered from its type and blob only: a comment can't
-/// smuggle anything in.
+/// deletes, no lock (snap and big push at once), rooted at the push dir, and `-munge`: the
+/// receiving rsync stores every symlink defanged (`/rsyncd-munged/<target>`) and never follows
+/// one, so a link a participant planted can't steer a write anywhere — whatever arena's argv
+/// (ARCH-SEC-1/3). Whatever the client asks to run, this runs. The key is re-rendered from its
+/// type and blob only: a comment can't smuggle anything in.
 pub fn render_push_key_line(rrsync: &str, push_pub: &str) -> Result<String, String> {
     let (ty, blob) = key_type_and_blob(push_pub).ok_or("the push key's .pub isn't an OpenSSH public key")?;
-    Ok(format!("restrict,command=\"{rrsync} -wo -no-del -no-lock {PUSH_ROOT}\" {ty} {blob} arena-archive-push\n"))
+    Ok(format!("restrict,command=\"{rrsync} -munge -wo -no-del -no-lock {PUSH_ROOT}\" {ty} {blob} arena-archive-push\n"))
 }
 
 /// The `backups` key file (S5): the cohort key (laptops) and the per-cohort read key (pods),
@@ -177,6 +179,7 @@ pub fn render_readme(r: &ReadmeInputs) -> String {
          \x20                     shared between days, so each day costs only what changed.\n\
          \x20 big/<pod>/          every file, large ones too (checkpoints…), the latest copy; nothing is ever\n\
          \x20                     deleted from it, even after it's gone from the pod.\n\
+         \x20 snap/baseline/      the course image's own files, which every snapshot shares.\n\
          \n\
          Getting files back (laptop: the cohort key; on a pod it's already set up) — host `{a}`\n\
          \x20 sftp {a}            then: ls snap ; cd snap/w2d5/{p}-apple ; get -r ARENA_materials/chapter1\n\
@@ -184,12 +187,18 @@ pub fn render_readme(r: &ReadmeInputs) -> String {
          \x20 scp -r {a}:snap/w2d5/{p}-apple/ARENA_materials/chapter1 ./restore\n\
          \x20 scp -r {a}:big/{p}-apple/checkpoints ./restore\n\
          \x20 (scp needs OpenSSH 9 or newer; with an older one use `scp -s`.)\n\
+         \x20 Symbolic links are kept defanged: `ls -l` shows them pointing at /rsyncd-munged/<target>,\n\
+         \x20 and they don't resolve here, so a download skips them or fails on them. Copy the files,\n\
+         \x20 then re-create a link you need with `ln -s <target> <name>` (target = the part after\n\
+         \x20 /rsyncd-munged/).\n\
          \n\
          Not copied here — secrets stay on the organisers' machine:\n\
          \x20 shell rc files (.bashrc, .zshrc, .profile …), shell and REPL histories, .env files, .netrc,\n\
-         \x20 .git-credentials, .pypirc, .npmrc, .ssh/, .gnupg/, .aws/, .docker/, .kaggle/, .config/,\n\
-         \x20 .huggingface/, .claude*, private keys named id_rsa/id_ecdsa/id_ed25519/id_dsa, and each repo's\n\
-         \x20 .git/config (git works without it; add the remote back with `git remote add origin <url>`).{extra}\n\
+         \x20 .gitconfig, .git-credentials, .pypirc, .npmrc, .pgpass, .s3cfg, .boto, .rclone.conf, .ssh/,\n\
+         \x20 .gnupg/, .aws/, .docker/, .kaggle/ and kaggle.json, .config/, .cache/, .huggingface/ and HF\n\
+         \x20 token files, .claude*, private keys (id_rsa/id_ecdsa/id_ed25519/id_dsa, *.pem, *.key), and each\n\
+         \x20 repo's .git/config files (git works without them; add the remote back with\n\
+         \x20 `git remote add origin <url>`).{extra}\n\
          \x20 Anything else in your home IS copied: don't keep other secrets there.\n\
          \n\
          Your repo's history is on GitHub too: the autocommit branches, pushed every 15 minutes.\n",
@@ -289,7 +298,7 @@ mod tests {
         let line = render_push_key_line("/usr/bin/rrsync", PUB).unwrap();
         assert_eq!(
             line,
-            "restrict,command=\"/usr/bin/rrsync -wo -no-del -no-lock /srv/arena/push\" ssh-ed25519 \
+            "restrict,command=\"/usr/bin/rrsync -munge -wo -no-del -no-lock /srv/arena/push\" ssh-ed25519 \
              AAAAC3NzaC1lZDI1NTE5AAAAIPushPushPushPushPushPushPushPushPushPus1 arena-archive-push\n"
         );
         assert!(render_push_key_line("x", "command=\"evil\" not-a-key").is_err());
@@ -370,7 +379,7 @@ mod tests {
             snap_max_size: "50M".into(),
             extra_excludes: vec!["*.ckpt".into()],
         });
-        for needle in ["EVERYONE IN YOUR COHORT CAN READ EVERYTHING HERE", "Kept until: 2027-01-31", "sftp archive-arena9", ".bashrc", ".git/config", "*.ckpt", "w0d1", "autocommit"] {
+        for needle in ["EVERYONE IN YOUR COHORT CAN READ EVERYTHING HERE", "Kept until: 2027-01-31", "sftp archive-arena9", ".bashrc", ".git/config", "*.ckpt", "w0d1", "autocommit", "/rsyncd-munged/", ".gitconfig"] {
             assert!(r.contains(needle), "{needle}");
         }
         let none = render_readme(&ReadmeInputs {

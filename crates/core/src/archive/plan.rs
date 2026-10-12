@@ -351,8 +351,17 @@ pub struct ResizePlan {
     pub linux_device: String,
 }
 
+impl ResizePlan {
+    /// No API resize: the volume already has the size, only the filesystem is grown to it.
+    pub fn filesystem_only(&self) -> bool {
+        self.from_gb == self.to_gb
+    }
+}
+
 /// Plan `archive resize` — grow only (a volume can't shrink), and only a volume attached to the
-/// archive's server (the filesystem is grown there, online).
+/// archive's server (the filesystem is grown there, online). The volume's current size is allowed
+/// too: it then only grows the filesystem — how a resize whose `resize2fs` step failed after the
+/// API resize went through is finished (`ResizePlan::filesystem_only`).
 pub fn plan_resize(inv: &Inventory, names: &ArchiveNames, tier: Tier, to_gb: u32) -> Result<ResizePlan, String> {
     if !(MIN_GB..=MAX_GB).contains(&to_gb) {
         return Err(format!("{} {to_gb}: a volume is {MIN_GB}..={MAX_GB} GB", tier.gb_flag()));
@@ -362,7 +371,7 @@ pub fn plan_resize(inv: &Inventory, names: &ArchiveNames, tier: Tier, to_gb: u32
     if v.server != Some(server.id) {
         return Err(format!("{} isn't attached to {} — run `arena archive up` first (it re-attaches it)", v.name, server.name));
     }
-    if to_gb <= v.size_gb {
+    if to_gb < v.size_gb {
         return Err(format!("{} is {} GB: a volume can only grow (asked for {to_gb} GB)", v.name, v.size_gb));
     }
     Ok(ResizePlan { tier, volume_id: v.id, from_gb: v.size_gb, to_gb, linux_device: v.linux_device.clone() })
@@ -633,7 +642,9 @@ mod tests {
             plan_resize(&inv, &names(), Tier::Big, 300).unwrap(),
             ResizePlan { tier: Tier::Big, volume_id: 3, from_gb: 200, to_gb: 300, linux_device: "/dev/disk/by-id/scsi-0HC_Volume_3".into() }
         );
-        assert!(plan_resize(&inv, &names(), Tier::Big, 200).unwrap_err().contains("only grow"));
+        // The current size: the filesystem only (AD6 — finishing a resize whose resize2fs failed).
+        let fs = plan_resize(&inv, &names(), Tier::Big, 200).unwrap();
+        assert!(fs.filesystem_only() && !plan_resize(&inv, &names(), Tier::Big, 300).unwrap().filesystem_only());
         assert!(plan_resize(&inv, &names(), Tier::Snap, 40).unwrap_err().contains("only grow"));
         assert!(plan_resize(&inv, &names(), Tier::Snap, 99999).unwrap_err().contains("10..=10240"));
         let mut detached = inv.clone();

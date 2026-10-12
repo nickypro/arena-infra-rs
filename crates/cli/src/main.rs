@@ -3368,13 +3368,36 @@ async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::path::Path, 
                 ));
             }
             // The archive's lines need this user's archive state, an absolute backup dir and a
-            // start date — checked before anything is shown or written (§7.1).
+            // start date — checked before anything is shown or written (§7.1). They're also
+            // re-rendered whenever the backup line is, so both always carry the same start date
+            // (AD3): a stale one would seal the pull's label two hours into its own day.
+            let installed_archive: Vec<&String> =
+                before.iter().filter(|l| matches!(CronKind::of(l), Some(CronKind::ArchiveSnap) | Some(CronKind::ArchiveBig))).collect();
+            let rerender_archive = !archive && backup && !installed_archive.is_empty();
             if archive {
                 let refusals = archive::cron_refusals(cfg, opts.start_date.is_some());
                 if !refusals.is_empty() {
                     anyhow::bail!("cron install --archive refused:\n  - {}", refusals.join("\n  - "));
                 }
             }
+            if rerender_archive && opts.start_date.is_none() && cfg.get("ARENA_START_DATE").and_then(arena_core::schedule::parse_ymd).is_none() {
+                anyhow::bail!(
+                    "the archive's cron lines need a start date too: keep one on the backup line, set ARENA_START_DATE in config, \
+                     or `arena cron remove --archive` first"
+                );
+            }
+            // The state dir the archive lines use, in the lines themselves (AD10): what this shell
+            // resolves (env included) is what cron must resolve — or, re-rendering, what they had.
+            let archive_state_dir = if archive || rerender_archive {
+                let installed = installed_archive.iter().find_map(|l| env_assignment(l, "ARENA_STATE_DIR"));
+                match (archive, installed, archive::cron_state_root(cfg)) {
+                    (false, Some(dir), _) => Some(dir),
+                    (_, _, Ok(dir)) => Some(dir),
+                    (_, _, Err(e)) => anyhow::bail!("the archive's cron lines: {e}"),
+                }
+            } else {
+                None
+            };
             // Optional inline env (cron runs the line via sh, so `VAR=val cmd` works).
             let env_prefix = opts.start_date.as_ref().map(|d| format!("ARENA_START_DATE={d} ")).unwrap_or_default();
             let lines = cron_lines(&CronJob {
@@ -3387,7 +3410,8 @@ async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::path::Path, 
                 pull: opts.pull,
                 proxy,
                 snapshot_dir: snapshot_dir.as_deref(),
-                archive,
+                archive: archive || rerender_archive,
+                archive_state_dir: archive_state_dir.as_deref(),
             });
             let kinds: Vec<CronKind> = lines.iter().map(|(k, _)| *k).collect();
             let after = merge_cron_block(&before, &kinds, &lines);
@@ -3717,6 +3741,8 @@ struct CronJob<'a> {
     snapshot_dir: Option<&'a str>,
     /// `--archive`: the backup archive's two push lines.
     archive: bool,
+    /// The state root (`ARENA_STATE_DIR`) those lines run with.
+    archive_state_dir: Option<&'a str>,
 }
 
 /// The backup line's default schedule: every 15 minutes.
@@ -3776,7 +3802,7 @@ const PROXY_CRON_PATH: &str = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/us
 ///   which later ticks would read as up to date.
 /// - **snapshot** (`snapshot_dir`): the public dashboard JSON every 2 minutes.
 fn cron_lines(job: &CronJob) -> Vec<(CronKind, String)> {
-    let CronJob { schedule, env_prefix, exe, config, home, backup, pull, proxy, snapshot_dir, archive } = job;
+    let CronJob { schedule, env_prefix, exe, config, home, backup, pull, proxy, snapshot_dir, archive, archive_state_dir } = job;
     let mut lines = Vec::new();
     if *backup {
         // `pods backup` also rsyncs the home (the file backup); default the cron to git-only
@@ -3821,16 +3847,24 @@ fn cron_lines(job: &CronJob) -> Vec<(CronKind, String)> {
     // participants' SSH proxy. Never in the backup line's path: an archive outage can't delay a
     // backup.
     if *archive {
+        let state = archive_state_dir.map(|d| format!("ARENA_STATE_DIR={d} ")).unwrap_or_default();
         for (kind, sched, tier) in [(CronKind::ArchiveSnap, ARCHIVE_SNAP_CRON_SCHEDULE, "snap"), (CronKind::ArchiveBig, ARCHIVE_BIG_CRON_SCHEDULE, "big")] {
             lines.push((
                 kind,
                 format!(
-                    "{sched} {env_prefix}nice -n 10 {exe} --config {config} archive sync --tier {tier} >> {home}/arena-archive-cron.log 2>&1"
+                    "{sched} {env_prefix}{state}nice -n 10 {exe} --config {config} archive sync --tier {tier} >> {home}/arena-archive-cron.log 2>&1"
                 ),
             ));
         }
     }
     lines
+}
+
+/// The value of an inline env assignment (`NAME=value`) among a cron line's leading words.
+fn env_assignment(line: &str, name: &str) -> Option<String> {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let n = if words.first()?.starts_with('@') { 1 } else { 5 };
+    words.get(n..)?.iter().take_while(|w| w.contains('=') && !w.starts_with('-')).find_map(|w| w.strip_prefix(&format!("{name}="))).map(String::from)
 }
 
 /// When the archive's snap push runs: 7 minutes after each */15 backup tick.
@@ -10898,11 +10932,9 @@ async fn handle_pull(
         small = small.without_git();
         big = big.without_git();
     }
-    // rsync's temp files go to `<dir>/.rsync-tmp/`, outside every tree the backup archive's
-    // push reads (`pull::PullConfig::temp_dir`): created below, once confirmed.
-    let temp_dir = pull_temp_dir(dir);
-    small.temp_dir = Some(temp_dir.clone());
-    big.temp_dir = Some(temp_dir.clone());
+    // rsync's temp files go to the tier's own `.rsync-tmp/` (`<dir>/<label>/.rsync-tmp`,
+    // `<dir>/big/.rsync-tmp`), outside every tree the backup archive's push reads — on the
+    // destination's filesystem, checked per job below (`pull::PullConfig::temp_dir`).
 
     let src = if remote_path.is_empty() { "~/ (home)".to_string() } else { remote_path.clone() };
     let big_note = if no_big {
@@ -10926,10 +10958,12 @@ async fn handle_pull(
     // hard-links what didn't change to the pod's previous snapshot and the fleet baseline.
     let base = std::path::Path::new(dir);
     let tiers_for = |name: &str| -> Vec<(&'static str, String, PullConfig)> {
-        let snapshot = pull::snapshot_tier_for(base, &label, name, &small);
+        let mut snapshot = pull::snapshot_tier_for(base, &label, name, &small);
+        snapshot.temp_dir = Some(pull::temp_dir_for(&absolute_path(&base.join(&label))));
         let mut v = vec![("snapshot", pull::local_dest(dir, &label, name), snapshot)];
         if !no_big {
-            v.push(("big", pull::big_dest(dir, name), big.clone()));
+            let big = PullConfig { temp_dir: Some(pull::temp_dir_for(&absolute_path(&base.join(arena_core::restore::BIG)))), ..big.clone() };
+            v.push(("big", pull::big_dest(dir, name), big));
         }
         v
     };
@@ -10974,10 +11008,6 @@ async fn handle_pull(
         return Ok(());
     }
 
-    // The backup dir as before (plain `mkdir -p`), then the temp dir in it owner-only: what's in
-    // flight is a pod's files (its rc files carry its API keys).
-    std::fs::create_dir_all(dir).with_context(|| format!("creating {dir}"))?;
-    create_private_dir(std::path::Path::new(&temp_dir)).with_context(|| format!("creating {temp_dir}"))?;
 
     let total_pods = targets.len();
     // Where each pod's repo really is: rsync -a copies a symlink as a symlink, so a repo setup
@@ -11030,7 +11060,8 @@ async fn handle_pull(
     // Which jobs failed, by name: the summary (and the cron log) must say which pod to look at.
     let mut failures: Vec<String> = Vec::new();
     for (name, t, tier, job) in planned {
-        let dest = job.dest.as_str();
+        let dest_owned = job.dest.clone();
+        let dest = dest_owned.as_str();
         if job.repo {
             match clear_stale_link(dest) {
                 Ok(false) => {}
@@ -11049,6 +11080,29 @@ async fn handle_pull(
             failed += 1;
             failures.push(format!("{name} [{tier}] (creating {dest})"));
             continue;
+        }
+        // The temp dir, owner-only (what's in flight is a pod's files — its rc files carry its API
+        // keys) — and only on the destination's filesystem: across filesystems rsync's rename
+        // fails and it rewrites the destination in place, half-written for as long as it copies
+        // (AD7). Then rsync's own default (beside each file, renamed atomically) is the safe one.
+        let mut job = job;
+        if let Some(tmp) = job.config.temp_dir.clone() {
+            match same_filesystem(std::path::Path::new(&tmp), std::path::Path::new(dest)) {
+                Ok(true) => {}
+                Ok(false) => {
+                    println!(
+                        "({name} [{tier}]: {dest} is on another filesystem than {tmp} — rsync keeps its temp files beside \
+                         each file there, so an archive push running at the same time can see one)"
+                    );
+                    job.config.temp_dir = None;
+                }
+                Err(e) => {
+                    eprintln!("[FAILED] {name} [{tier}]: creating {tmp}: {e}");
+                    failed += 1;
+                    failures.push(format!("{name} [{tier}] (creating {tmp})"));
+                    continue;
+                }
+            }
         }
         // The repo job's config is the tier's with the repo's paths swapped in
         // (`volume::pull_jobs`), so it carries the tier's `--timeout` too. A job's passes (the
@@ -11145,13 +11199,22 @@ async fn handle_pull(
     Ok(())
 }
 
-/// Where a pull into `dir` has rsync write its temp files: `<dir>/.rsync-tmp`, absolute (the
-/// canonical path once `dir` exists; before the first pull, `dir` made absolute against the
-/// working directory — the same place).
-fn pull_temp_dir(dir: &str) -> String {
-    let base = std::path::Path::new(dir);
-    let abs = std::fs::canonicalize(base).or_else(|_| std::path::absolute(base)).unwrap_or_else(|_| base.to_path_buf());
-    arena_core::pull::temp_dir_for(&abs)
+/// `p` absolute: canonical once it exists, else made absolute against the working directory (the
+/// same place, before the first pull creates it).
+fn absolute_path(p: &std::path::Path) -> std::path::PathBuf {
+    std::fs::canonicalize(p).or_else(|_| std::path::absolute(p)).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// Create the temp dir `tmp` (owner-only) and say whether it is on `dest`'s filesystem.
+fn same_filesystem(tmp: &std::path::Path, dest: &std::path::Path) -> std::io::Result<bool> {
+    create_private_dir(tmp)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(std::fs::metadata(tmp)?.dev() == std::fs::metadata(dest)?.dev())
+    }
+    #[cfg(not(unix))]
+    Ok(true)
 }
 
 /// `mkdir -p` with mode 0700 for any directory it creates (an existing one is left as it is).
@@ -12021,15 +12084,15 @@ fn fleet_ssh_for(cfg: &Config, pods: &[arena_core::Pod]) -> (String, usize) {
         ),
         _ => arena_core::sshconfig::render_manual(prefix, ssh_user, pod_identity, pods),
     };
-    // The backup archive (when this user has one): its block in the same managed block, and its
-    // pinned host key in its own file. The read key itself goes by scp ([`archive::install_read_key`]).
-    match archive::pod_access(cfg) {
-        Some(a) => {
-            let cfg_text = format!("{fleet_cfg}\n{}", a.block);
-            (format!("{}{}", fleet_ssh_command(&fleet_pubkeys, &cfg_text), archive::pod_known_hosts_command(&a)), fleet_pubkeys.len())
-        }
-        None => (fleet_ssh_command(&fleet_pubkeys, &fleet_cfg), fleet_pubkeys.len()),
+    // The backup archive (when this user can render it): its own managed block and its pinned
+    // host key, after the fleet's. When it can't (no archive, or state it can't read) nothing is
+    // sent — a pod's existing archive block is never removed (AD4). The read key itself goes by
+    // scp ([`archive::install_read_key`]).
+    let mut cmd = fleet_ssh_command(&fleet_pubkeys, &fleet_cfg);
+    if let archive::PodArchive::Ready(a) = archive::pod_archive(cfg) {
+        cmd.push_str(&archive::pod_archive_command(&a));
     }
+    (cmd, fleet_pubkeys.len())
 }
 
 /// One pod's key write: the token export lines + the fleet SSH (authorized_keys +
@@ -12133,7 +12196,11 @@ async fn handle_copy_keys(
         fleet_keys
     );
 
-    let archive_access = archive::pod_access(cfg);
+    let pod_archive = archive::pod_archive(cfg);
+    if let Some(w) = pod_archive.warning() {
+        eprintln!("{w}");
+    }
+    let archive_access = pod_archive.ready().cloned();
     if let Some(a) = &archive_access {
         println!(
             "Also the backup archive's access on each: the `{}` ssh block, its pinned host key, and the read key \
@@ -12606,8 +12673,12 @@ async fn handle_ssh_config(
     // The backup archive's block, when this user has one (`arena archive up`): its own alias,
     // which no block above matches.
     let rendered = match archive::laptop_block_for(cfg) {
-        Some(block) => format!("{rendered}\n{block}"),
-        None => rendered,
+        Ok(Some(block)) => format!("{rendered}\n{block}"),
+        Ok(None) => rendered,
+        Err(why) => {
+            eprintln!("warning: the backup archive's state isn't readable here ({why}) — its block is left out");
+            rendered
+        }
     };
 
     print!("{rendered}");
@@ -14313,6 +14384,7 @@ mod tests {
             proxy,
             snapshot_dir,
             archive: false,
+            archive_state_dir: None,
         })
     }
 
@@ -14394,6 +14466,7 @@ mod tests {
             proxy: false,
             snapshot_dir: None,
             archive: false,
+            archive_state_dir: None,
         });
         assert_eq!(
             lines,
@@ -16464,33 +16537,52 @@ mod remote_tests {
         assert!(fake.calls().is_empty() && stub.take().is_empty());
     }
 
-    /// S17: every pull rsync writes its temp files to `<abs backup dir>/.rsync-tmp` — outside
-    /// every label and `big/`, which the archive push reads — created owner-only once confirmed;
-    /// a dry run shows it and creates nothing. The destinations are as before.
+    /// S17 + AD7: every pull rsync writes its temp files to its tier root's `.rsync-tmp`
+    /// (`<dir>/<label>/.rsync-tmp`, `<dir>/big/.rsync-tmp`) — beside the pod trees the archive
+    /// pushes, never in one — created owner-only once confirmed; a dry run shows it and creates
+    /// nothing. A destination on another filesystem (a pod dir that is its own mount) gets no
+    /// `--temp-dir` — rsync would rewrite it in place — and says so. Destinations are as before.
     #[tokio::test]
     async fn the_pull_writes_its_temp_files_outside_every_pushed_tree() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let stub = StubRsync::new("tempdir");
         let base = stub.0.join("backups");
         let cfg = Config::parse("MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple bloom cloud)\nSHARED_SSH_KEY_PATH=/nonexistent/k\n");
         let chosen = picked(&fleet(), &cfg, &["apple"]).await;
         let fake = Arc::new(FakeRemote::new());
-        fake.script(&host(22001), [repo_in_place()]);
+        fake.script(&host(22001), [repo_in_place(), repo_in_place()]);
         let remote: Arc<dyn Remote> = fake.clone();
         let base_s = base.display().to_string();
         handle_pull(&remote, &cfg, Some("w1d1".into()), &base_s, None, None, false, false, &chosen, true, true, &stub.path()).await.unwrap();
         assert!(!base.exists(), "a dry run creates nothing");
         handle_pull(&remote, &cfg, Some("w1d1".into()), &base_s, None, None, false, false, &chosen, false, true, &stub.path()).await.unwrap();
-        let tmp = std::fs::canonicalize(&base).unwrap().join(".rsync-tmp");
-        assert!(tmp.is_dir());
-        assert_eq!(std::fs::metadata(&tmp).unwrap().permissions().mode() & 0o777, 0o700);
+        let canon = std::fs::canonicalize(&base).unwrap();
+        let (snap_tmp, big_tmp) = (canon.join("w1d1/.rsync-tmp"), canon.join("big/.rsync-tmp"));
+        for tmp in [&snap_tmp, &big_tmp] {
+            assert!(tmp.is_dir(), "{}", tmp.display());
+            assert_eq!(std::fs::metadata(tmp).unwrap().permissions().mode() & 0o777, 0o700);
+        }
         let args = stub.take_args();
         assert_eq!(args.len(), 3, "{args:?}");
         for a in &args {
+            let tmp = if a.contains("/big/devtest-apple") { &big_tmp } else { &snap_tmp };
             assert!(a.contains(&format!("--temp-dir={}", tmp.display())), "{a}");
         }
         assert_eq!(stub.take(), ["big/devtest-apple", "w1d1/devtest-apple", "w1d1/devtest-apple"], "destinations unchanged");
         assert!(arena_core::archive::sync::sort_labels([".rsync-tmp", "w1d1", "big"]).iter().all(|l| l != ".rsync-tmp"));
+        // A pod's big dir on another filesystem (tmpfs): no --temp-dir for it, the rest unchanged.
+        let shm = std::path::Path::new("/dev/shm");
+        let other = shm.join(format!("arena-tempdir-{}", std::process::id()));
+        if std::fs::create_dir_all(&other).is_ok() && std::fs::metadata(shm).unwrap().dev() != std::fs::metadata(&canon).unwrap().dev() {
+            std::fs::remove_dir_all(canon.join("big/devtest-apple")).unwrap();
+            std::os::unix::fs::symlink(&other, canon.join("big/devtest-apple")).unwrap();
+            handle_pull(&remote, &cfg, Some("w1d1".into()), &base_s, None, None, false, false, &chosen, false, true, &stub.path()).await.unwrap();
+            let args = stub.take_args();
+            let big = args.iter().find(|a| a.contains("/big/devtest-apple")).unwrap();
+            assert!(!big.contains("--temp-dir"), "across filesystems rsync would rewrite in place: {big}");
+            assert!(args.iter().filter(|a| a.contains("/w1d1/devtest-apple")).all(|a| a.contains("--temp-dir=")), "{args:?}");
+            let _ = std::fs::remove_dir_all(&other);
+        }
     }
 
     /// One wedged pod can't hold the backup (or the cron behind it): its rsyncs are stopped

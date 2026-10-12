@@ -84,12 +84,14 @@ pub struct PullConfig {
     pub linked_dest: bool,
     /// rsync `--temp-dir`: where the RECEIVER writes each file before renaming it into place.
     /// `None` = rsync's default, a `.<name>.XXXXXX` file beside the destination file — i.e.
-    /// inside the backup tree. `pods pull`/`backup` set `<backup dir>/.rsync-tmp` (absolute,
-    /// same filesystem, so the rename stays atomic): the backup archive's push (`arena archive
-    /// sync`) reads the dated trees and `big/` while a pull may be writing them, and a push
-    /// that overlapped a pull would otherwise ship half-written temp files to an archive that
-    /// never deletes. With it, a pushed tree only ever holds whole files (renamed in at once).
-    /// Nothing else changes: the same files land in the same places with the same links.
+    /// inside the backup tree. `pods pull`/`backup` set the tier's own `.rsync-tmp`
+    /// (`<backup dir>/<label>/.rsync-tmp`, `<backup dir>/big/.rsync-tmp`; absolute): the backup
+    /// archive's push (`arena archive sync`) reads the pod trees while a pull may be writing them,
+    /// and a push that overlapped a pull would otherwise ship half-written temp files to an
+    /// archive that never deletes. It is used only when it is on the destination's filesystem —
+    /// across filesystems rsync's rename fails and it rewrites the destination in place instead
+    /// (worse than its default), so the caller then leaves it `None`. Nothing else changes: the
+    /// same files land in the same places with the same links.
     pub temp_dir: Option<String>,
 }
 
@@ -571,16 +573,17 @@ fn rsync_flags(pc: &PullConfig) -> Vec<String> {
 /// a snapshot label.
 pub const BASELINE_DIR: &str = "baseline";
 
-/// The pulls' rsync temp directory under the backup dir (`<dir>/.rsync-tmp/`,
-/// [`PullConfig::temp_dir`]): outside every snapshot label and `big/`, so nothing that reads
-/// those trees (the archive push) ever sees a half-written file. Never a snapshot label.
+/// The pulls' rsync temp directory's name ([`PullConfig::temp_dir`]): one per tier root
+/// (`<dir>/<label>/.rsync-tmp`, `<dir>/big/.rsync-tmp`) — beside the pod trees, never inside one,
+/// so nothing that reads those trees (the archive push) sees a half-written file. Hidden, so never
+/// a pod or a label.
 pub const TEMP_DIR: &str = ".rsync-tmp";
 
-/// [`PullConfig::temp_dir`] for a backup dir: `<abs dir>/.rsync-tmp`, absolute so it means the
-/// same place for every destination a pull writes (a pod's label dir, `big/<pod>/`, a repo's
-/// tree inside them). `dir` should already be absolute (canonicalized).
-pub fn temp_dir_for(dir: &Path) -> String {
-    dir.join(TEMP_DIR).display().to_string()
+/// [`PullConfig::temp_dir`] for a tier root (`<abs dir>/<label>` or `<abs dir>/big`), absolute so
+/// it means the same place for every destination of that tier (a pod's dir, a repo's tree in
+/// it). `root` should already be absolute.
+pub fn temp_dir_for(root: &Path) -> String {
+    root.join(TEMP_DIR).display().to_string()
 }
 
 /// A week's fleet baseline: `<base>/baseline/w<week>/fleet/` — the image's own files from one
@@ -1166,9 +1169,9 @@ mod tests {
     /// no other config carries one — the replication's pod-to-pod copies included.
     #[test]
     fn a_temp_dir_is_passed_through_and_off_by_default() {
-        let pc = PullConfig { temp_dir: Some(temp_dir_for(Path::new("/srv/backup"))), ..PullConfig::small_tier("50M") };
+        let pc = PullConfig { temp_dir: Some(temp_dir_for(Path::new("/srv/backup/w1d1"))), ..PullConfig::small_tier("50M") };
         let a = rsync_args(&target(), &pc, "/srv/backup/w1d1/arena9-apple/");
-        assert!(a.contains(&"--temp-dir=/srv/backup/.rsync-tmp".to_string()), "{a:?}");
+        assert!(a.contains(&"--temp-dir=/srv/backup/w1d1/.rsync-tmp".to_string()), "{a:?}");
         assert!(!rsync_args(&target(), &PullConfig::default(), "/x/").iter().any(|x| x.starts_with("--temp-dir")));
         assert!(!rsync_args(&target(), &PullConfig::replication(), "/x/").iter().any(|x| x.starts_with("--temp-dir")));
         assert!(crate::restore::parse_label(TEMP_DIR).is_none() && TEMP_DIR.starts_with('.'));

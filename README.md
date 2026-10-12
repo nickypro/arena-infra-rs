@@ -1109,16 +1109,21 @@ fills `big` can never stop the history being written; each is sized, resized, wa
 deleted on its own.
 
 - **The control box pushes** (`archive sync`, its own cron lines) with a key the archive forces
-  into `rrsync -wo -no-del -no-lock`: it can write, never read, delete, get a shell or forward.
-  The archive holds no outbound credential and can never reach a pod, a provider or the control
-  box. Every push is additive (`--delete`, `--inplace`, `--append`, `-a`, `-L`… are never sent —
-  test-enforced): a changed file is written anew, so a past day's hard-linked file never changes.
+  into `rrsync -munge -wo -no-del -no-lock`: it can write, never read, delete, get a shell or
+  forward, and every symlink a participant planted is stored defanged, never followed. The
+  archive holds no outbound credential and can never reach a pod, a provider or the control box.
+  Every push is additive (`--delete`, `--inplace`, `--append`, `--partial-dir`, `-a`, `-L`… are
+  never sent — test-enforced): a changed file is written anew, so a past day's hard-linked file
+  never changes, and no per-directory holding area exists for a planted link to redirect.
 - **Only this cohort's pods leave the control box**: the `MACHINE_NAME_LIST` names (and their
   `-old`/`-new` twins), never `@` staff boxes or anything else an unscoped pull put there
-  (`sync`/`status` list those as "kept on the control box only"). **Secret files never do**:
-  shell rc files (the API keys `copy-keys` writes), histories, `.env*`, `.netrc`,
-  `.git-credentials`, `.ssh/`, `.config/`, `.claude*`, cloud credentials, `id_*` keys and every
-  repo's `.git/config` (git works without it) — `ARCHIVE_EXTRA_EXCLUDES` only adds to the list.
+  (`sync`/`status` list those as "kept on the control box only", apart from pods named like the
+  cohort's but missing from the list). A pod that leaves the list keeps its history archived.
+  **Secret files never do**: shell rc files (the API keys `copy-keys` writes), histories,
+  `.env*`, `.netrc`, `.gitconfig`, `.git-credentials`, `.pgpass`, `.s3cfg`, `.ssh/`, `.config/`,
+  `.cache/`, `.claude*`, cloud and Kaggle credentials, Hugging Face token files, `id_*`/`*.pem`/
+  `*.key` keys and every repo's git configs (`.git/config`, `config.worktree`, submodules'; git
+  works without them) — `ARCHIVE_EXTRA_EXCLUDES` only adds to the list.
 - **Participants read** over sftp as one chrooted, read-only user (`backups`): read-only three
   times over (`internal-sftp -R`, read-only bind mounts, ownership). Laptops use the cohort key,
   pods a per-cohort read key `pods copy-keys` installs. **Access is OFF after `archive up`** until
@@ -1142,17 +1147,28 @@ arena ssh-config                    # participants' config now ends with the arc
 arena archive status                # API + probe + pushes + retention + cost; non-zero on FAIL/UNKNOWN
 ```
 
-`archive sync [--tier snap|big|both] [--label L]… [--dir D] [--dry-run]` pushes every snapshot
-label that isn't final yet (a label is final once a push that *started* 2 h after its UTC day
-ended has succeeded, so a last pull past midnight is still captured), oldest first, each
-hard-linked to the previous one and in two passes like the pull's (the files under
-`BACKUP_MAX_SIZE`, then every `.git` uncapped — a pack over the cap must not leave a broken
-repo); then `big/`. It needs no Hetzner token (it reads `archive.json`), takes a lock per tier
-(a running tier is skipped, exit 0), keeps per-tier state, and a failure in one tier never stops
-the other (`✗ big: NoSpace — arena archive resize --big-gb 300`). The pulls write their rsync
-temp files to `LOCAL_BACKUP_DIR/.rsync-tmp/`, so a push never ships a half-written file.
+`archive sync [--tier snap|big|both] [--label L]… [--dir D] [--dry-run]` pushes the snapshot
+labels that aren't final yet — the newest first, then up to three older ones per run (a backlog
+continues on the next runs) — pod by pod, as the pulls do: each pod's tree goes to
+`snap/<wNdM>/<pod>/` hard-linked to that pod's earlier labels on the archive (complete or cut
+short — rsync only links identical files) and to the week's fleet baseline, pushed once to
+`snap/baseline/` (so the image's files are stored once for every pod, as on the control box), in
+two passes like the pull's (the files under `BACKUP_MAX_SIZE`, then every `.git` uncapped — a
+pack over the cap must not leave a broken repo); then `big/`. A label is final once a push that
+*started* 2 h after its UTC day ended went through for every pod, linked to everything it should
+have been — so a failed or out-of-order push never leaves a full, un-linked copy for good: the
+next push re-links it. It needs no Hetzner token (it reads `archive.json`), takes a lock per
+tier (a running tier is skipped, exit 0; a dry run takes none), keeps per-tier state tied to the
+volume it describes (a new volume gets everything again), stops a run on a failure that would
+repeat (no space, unmounted, host key…), says on the first push how big the seed is against the
+volume and the budget, and a failure in one tier never stops the other (`✗ big: NoSpace — arena
+archive resize --big-gb 300`). The pulls write their rsync temp files to each tier's own
+`.rsync-tmp/` (`<dir>/<label>/`, `<dir>/big/`), beside the pod trees and on their filesystem, so a
+push never ships a half-written file. The cron lines carry the start date and `ARENA_STATE_DIR`
+they were installed with, and a new `cron install --start-date` rewrites them too.
 
-`archive resize --snap-gb|--big-gb N` grows a volume online (never shrinks); `archive ssh [-- CMD]`
+`archive resize --snap-gb|--big-gb N` grows a volume online (never shrinks; the volume's current
+size grows only the filesystem, finishing a resize whose `resize2fs` failed); `archive ssh [-- CMD]`
 is a root shell on the pinned key; `archive ssh-config [--pod]` prints the blocks; `archive down`
 deletes the server and keeps the volumes (protected, ≈ €0.06/GB/month) for a later `up`, which
 re-attaches them without formatting. Participants:
@@ -1161,6 +1177,12 @@ re-attaches them without formatting. Participants:
 sftp archive-arena9                    # ls snap ; cd snap/w2d5/arena9-apple ; get -r … ; reget for big files
 scp -r archive-arena9:snap/w2d5/arena9-apple/ARENA_materials/chapter1 ./restore   # OpenSSH ≥ 9 (else scp -s)
 ```
+
+Symbolic links are stored defanged on the archive (`ls -l` shows `-> /rsyncd-munged/<target>`):
+they don't resolve there, so a participant's download skips or fails on them — copy the files,
+then re-create a needed link with `ln -s <target> <name>`. (The archive's own README says so.)
+The pods' `archive-<prefix>` block lives in its own managed block of `~/.ssh/config`; `copy-keys`
+run by a user who can't read the archive state leaves it as it is and says so.
 
 State: `$ARENA_STATE_DIR/<prefix>/archive/` (0700) — the admin, push and read keys, the pinned
 `known_hosts`, `archive.json`, the per-tier sync state and locks. Run `archive up` as the user

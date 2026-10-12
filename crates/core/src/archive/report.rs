@@ -238,6 +238,10 @@ pub const SNAP_WARN_AGE: u64 = 3600;
 pub const SNAP_FAIL_AGE: u64 = 6 * 3600;
 pub const BIG_WARN_AGE: u64 = 3 * 3600;
 pub const BIG_FAIL_AGE: u64 = 24 * 3600;
+/// An archive `up` made this long ago that was never pushed to is a FAIL, not a warning.
+pub const NEVER_PUSHED_FAIL_AGE: u64 = 3600;
+/// ext4 on a Hetzner volume shows ~97% of the device in `df`; under 90% the filesystem wasn't grown.
+pub const FS_SMALLER_FRACTION: f64 = 0.90;
 
 /// What `status` judges.
 #[derive(Debug, Clone)]
@@ -257,6 +261,15 @@ pub struct StatusInputs<'a> {
     pub unsealed: &'a [String],
     pub custom_labels: &'a [String],
     pub control_box_only: &'a [String],
+    /// Pod dirs named like this cohort's but not on `MACHINE_NAME_LIST` (never pushed).
+    pub not_on_list: &'a [String],
+    /// How long ago `archive.json` was written (s): an archive that has never been pushed to an
+    /// hour after `up` means the cron isn't pushing (AD10).
+    pub host_written_age: Option<u64>,
+    /// What a full snap push costs at least (the newest label and its baseline, counted once) and
+    /// what `big/` holds — compared with the volumes (AD8).
+    pub snap_need: Option<u64>,
+    pub big_need: Option<u64>,
     pub now: u64,
     pub keep_until_days: Option<i64>,
     pub today_days: i64,
@@ -363,8 +376,16 @@ pub fn judge_status(i: &StatusInputs) -> StatusReport {
     }
 
     // --- the pushes ---------------------------------------------------------------------------
+    let unpushed_too_long = i.host_written_age.is_some_and(|a| a > NEVER_PUSHED_FAIL_AGE);
     let stale = |last: Option<u64>, warn: u64, fail: u64, what: &str| -> (Level, String) {
         match last {
+            None if unpushed_too_long => (
+                Level::Fail,
+                format!(
+                    "{what}: never pushed, over an hour after `archive up` — is the cron installed for the user (and \
+                     ARENA_STATE_DIR) that ran `up`? (`arena cron show`, `arena archive sync`)"
+                ),
+            ),
             None => (Level::Warn, format!("{what}: never pushed — `arena archive sync` / `arena cron install --archive`")),
             Some(t) => {
                 let a = i.now.saturating_sub(t);
@@ -380,6 +401,22 @@ pub fn judge_status(i: &StatusInputs) -> StatusReport {
         }
     }
     r.add("sync snap", level, msg);
+    // The sync state describes one volume (AD2): another one holds none of what it says.
+    if let Some(h) = i.host {
+        for (tier, state_volume) in [(Tier::Snap, i.snap.volume.as_deref()), (Tier::Big, i.big.volume.as_deref())] {
+            if let Some(v) = state_volume.filter(|v| *v != h.device(tier)) {
+                r.add(
+                    format!("state {tier}"),
+                    Level::Warn,
+                    format!(
+                        "the {tier} sync state describes another volume ({v}, now {}) — the next sync starts over and pushes \
+                         everything again; nothing above about {tier} pushes is on this volume",
+                        h.device(tier)
+                    ),
+                );
+            }
+        }
+    }
     let (level, mut msg) = stale(i.big.last_ok.map(|r| r.finished), BIG_WARN_AGE, BIG_FAIL_AGE, "big");
     if let Some(e) = &i.big.last_error {
         if i.big.last_ok.is_none_or(|ok| e.at > ok.finished) {
@@ -396,7 +433,30 @@ pub fn judge_status(i: &StatusInputs) -> StatusReport {
     }
     r.add("labels", Level::Ok, labels);
     if !i.control_box_only.is_empty() {
-        r.add("kept local", Level::Ok, format!("kept on the control box only: {}", i.control_box_only.join(", ")));
+        r.add("kept local", Level::Ok, format!("kept on the control box only (staff boxes, other cohorts): {}", i.control_box_only.join(", ")));
+    }
+    if !i.not_on_list.is_empty() {
+        r.add(
+            "not on the list",
+            Level::Warn,
+            format!(
+                "named like this cohort's pods but not on MACHINE_NAME_LIST, so never pushed: {} — add them to the list to archive them",
+                i.not_on_list.join(", ")
+            ),
+        );
+    }
+    // Room for what's coming (AD8): a volume under twice what a full push needs fills on the seed.
+    for (tier, need) in [(Tier::Snap, i.snap_need), (Tier::Big, i.big_need)] {
+        let gb = volume_gb(i, tier);
+        if let (Some(need), Some(gb)) = (need, gb) {
+            let have = u64::from(gb) << 30;
+            let what = match tier {
+                Tier::Snap => "the newest snapshot label with its baseline (shared files once)",
+                Tier::Big => "big/",
+            };
+            let (level, verdict) = if have < 2 * need { (Level::Warn, format!(" — under 2×: `arena archive resize {} N`", tier.gb_flag())) } else { (Level::Ok, String::new()) };
+            r.add(format!("size {tier}"), level, format!("{what} holds {} on the control box; the {tier} volume is {gb} GB{verdict}", crate::pull::human_bytes(need)));
+        }
     }
 
     // --- retention and cost -------------------------------------------------------------------
@@ -417,6 +477,12 @@ pub fn judge_status(i: &StatusInputs) -> StatusReport {
         r.add("cost", Level::Ok, format!("≈ €{:.2}/month ({gb_total} GB of volumes{})", p.monthly(server_seen, gb_total), if server_seen { " + the server" } else { "" }));
     }
     r
+}
+
+/// A tier's volume size: the API's, else archive.json's.
+fn volume_gb(i: &StatusInputs, tier: Tier) -> Option<u32> {
+    let api = i.inventory.as_ref().and_then(|r| r.as_ref().ok()).and_then(|inv| inv.volume(i.names, tier)).map(|v| v.size_gb);
+    api.or_else(|| i.host.map(|h| h.size_gb(tier)).filter(|g| *g > 0))
 }
 
 fn judge_probe(r: &mut StatusReport, p: &ProbeReport, i: &StatusInputs) {
@@ -467,6 +533,20 @@ fn judge_probe(r: &mut StatusReport, p: &ProbeReport, i: &StatusInputs) {
                 msg.push_str(&format!(" — {}", super::sync::failure_hint(super::PushFailure::NoSpace, t, gb)));
             }
             r.add(format!("space {t}"), level, msg);
+            // A resize whose filesystem step failed (AD6): the volume grew, ext4 didn't.
+            if let (Some(gb), Some(total)) = (volume_gb(i, t), tp.bytes_total) {
+                if (total as f64) < FS_SMALLER_FRACTION * ((u64::from(gb) << 30) as f64) {
+                    r.add(
+                        format!("filesystem {t}"),
+                        Level::Warn,
+                        format!(
+                            "the filesystem holds {} but the volume is {gb} GB — finish the grow: `arena archive resize {} {gb}`",
+                            crate::pull::human_bytes(total),
+                            t.gb_flag()
+                        ),
+                    );
+                }
+            }
         }
     }
 
@@ -485,7 +565,7 @@ fn judge_probe(r: &mut StatusReport, p: &ProbeReport, i: &StatusInputs) {
         None => r.add("keys backups", Level::Unknown, "the expected read keys couldn't be worked out (cohort key unreadable?)"),
     }
     match i.push_pub.map(|pubk| render_push_key_line(&p.rrsync, pubk)) {
-        Some(Ok(want)) if want.trim() == p.push_keys.trim() => r.add("keys push", Level::Ok, format!("forced into {} -wo -no-del -no-lock", p.rrsync)),
+        Some(Ok(want)) if want.trim() == p.push_keys.trim() => r.add("keys push", Level::Ok, format!("forced into {} -munge -wo -no-del -no-lock", p.rrsync)),
         Some(Ok(_)) => r.add("keys push", Level::Fail, "the push key line isn't the forced rrsync line — `arena archive up` rewrites it"),
         _ => r.add("keys push", Level::Unknown, "this state dir's push_ed25519.pub is unreadable — can't compare"),
     }
@@ -527,6 +607,8 @@ mod tests {
     const PUSH: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPushPushPushPushPushPushPushPushPushPus1 push";
     const OTHER: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOtherOtherOtherOtherOtherOtherOtherOther9 x";
     const NOW: u64 = 1_800_000_000;
+    /// A 50 GB volume's filesystem.
+    const TOTAL: u64 = 52_000_000_000;
 
     fn b64(s: &str) -> String {
         crate::base64::encode(s.as_bytes())
@@ -537,8 +619,9 @@ mod tests {
         for t in ["snap", "big"] {
             let dev = if t == "snap" { "/dev/sdb" } else { "/dev/sdc" };
             s.push_str(&format!(
-                "dev_{t}={dev}\nmounted_{t}=1\nsource_{t}={dev}\nfstype_{t}=ext4\nowner_{t}=arena-push\nbytes_total_{t}=1000\nbytes_used_{t}=100\n\
-                 inodes_total_{t}=1000\ninodes_used_{t}=10\nbind_{t}=1\nbind_source_{t}={dev}\nbind_ro_{t}=1\n"
+                "dev_{t}={dev}\nmounted_{t}=1\nsource_{t}={dev}\nfstype_{t}=ext4\nowner_{t}=arena-push\nbytes_total_{t}={TOTAL}\nbytes_used_{t}={}\n\
+                 inodes_total_{t}=1000\ninodes_used_{t}=10\nbind_{t}=1\nbind_source_{t}={dev}\nbind_ro_{t}=1\n",
+                TOTAL / 10
             ));
         }
         let push = render_push_key_line("/usr/bin/rrsync", PUSH).unwrap();
@@ -599,7 +682,7 @@ mod tests {
 
     fn snap_ok() -> SnapState {
         let mut s = SnapState::default();
-        s.labels.insert("w1d1".into(), LabelRecord { ok_started: NOW - 700, ok_finished: NOW - 600, files: 1, bytes: 1 });
+        s.labels.insert("w1d1".into(), LabelRecord { ok_started: NOW - 700, ok_finished: NOW - 600, files: 1, bytes: 1, ..Default::default() });
         s
     }
     fn big_ok() -> BigState {
@@ -623,6 +706,10 @@ mod tests {
             unsealed: &[],
             custom_labels: &[],
             control_box_only: &[],
+            not_on_list: &[],
+            host_written_age: None,
+            snap_need: None,
+            big_need: None,
             now: NOW,
             keep_until_days: None,
             today_days: 20_000,
@@ -650,7 +737,7 @@ mod tests {
     fn probe_parsing_needs_a_finished_report() {
         let p = parse_probe(&healthy_probe_text()).unwrap();
         assert!(p.snap.mounted && p.big.bind_ro);
-        assert_eq!(p.snap.bytes_total, Some(1000));
+        assert_eq!(p.snap.bytes_total, Some(TOTAL));
         assert!(p.root_keys.contains("AdminAdmin"));
         assert_eq!(p.setup_version, Some(1));
         assert!(parse_probe("mounted_snap=1\n").unwrap_err().contains("didn't finish"));
@@ -672,8 +759,8 @@ mod tests {
             ("bind not ro", Box::new(|p| p.snap.bind_ro = false), "view snap", Level::Fail),
             ("bind missing", Box::new(|p| p.big.bind = false), "view big", Level::Fail),
             ("bind of the bare dir", Box::new(|p| p.big.bind_source = "/dev/sda1".into()), "view big", Level::Fail),
-            ("80% bytes", Box::new(|p| p.big.bytes_used = Some(800)), "space big", Level::Warn),
-            ("95% bytes", Box::new(|p| p.big.bytes_used = Some(950)), "space big", Level::Fail),
+            ("80% bytes", Box::new(|p| p.big.bytes_used = Some(TOTAL / 100 * 80)), "space big", Level::Warn),
+            ("95% bytes", Box::new(|p| p.big.bytes_used = Some(TOTAL / 100 * 95)), "space big", Level::Fail),
             ("80% inodes", Box::new(|p| p.snap.inodes_used = Some(850)), "space snap", Level::Warn),
             ("95% inodes", Box::new(|p| p.snap.inodes_used = Some(999)), "space snap", Level::Fail),
             ("unknown space", Box::new(|p| p.snap.inodes_total = None), "space snap", Level::Unknown),
@@ -690,7 +777,7 @@ mod tests {
             assert_eq!(r.ok(), want < Level::Fail, "{case}");
         }
         // The resize hint names the volume's size.
-        let r = judge(|p| p.big.bytes_used = Some(960), &snap_ok(), &big_ok(), &h, Some(Ok(&i)));
+        let r = judge(|p| p.big.bytes_used = Some(TOTAL / 100 * 96), &snap_ok(), &big_ok(), &h, Some(Ok(&i)));
         assert!(r.render().contains("arena archive resize --big-gb 300"), "{}", r.render());
 
         // Stale pushes.
@@ -720,6 +807,58 @@ mod tests {
         assert!(judge(|_| {}, &snap_ok(), &big_ok(), &h, Some(Ok(&moved))).render().contains("archive.json points at 192.0.2.1"));
     }
 
+    /// AD2, AD6, AD10: a sync state for another volume, a filesystem that didn't grow with its
+    /// volume, and an archive nobody has pushed to an hour after `up`.
+    #[test]
+    fn status_flags_another_volume_an_ungrown_filesystem_and_a_cron_that_never_pushed() {
+        let h = host();
+        let i = inv();
+        let mut moved = snap_ok();
+        moved.volume = Some("/dev/disk/by-id/scsi-0HC_Volume_OLD".into());
+        let r = judge(|_| {}, &moved, &big_ok(), &h, Some(Ok(&i)));
+        assert_eq!(level_of(&r, "state snap"), Level::Warn);
+        assert!(r.render().contains("starts over"), "{}", r.render());
+        let same = SnapState { volume: Some(h.snap_device.clone()), ..snap_ok() };
+        assert!(!judge(|_| {}, &same, &big_ok(), &h, Some(Ok(&i))).items.iter().any(|x| x.name == "state snap"));
+        let r = judge(|p| p.big.bytes_total = Some(10 << 30), &snap_ok(), &big_ok(), &h, Some(Ok(&i)));
+        assert_eq!(level_of(&r, "filesystem big"), Level::Warn);
+        assert!(r.render().contains("arena archive resize --big-gb 50"), "{}", r.render());
+        assert!(!judge(|_| {}, &snap_ok(), &big_ok(), &h, Some(Ok(&i))).items.iter().any(|x| x.name.starts_with("filesystem")));
+        // Never pushed: a warning at first, a FAIL an hour after `up`.
+        let n = ArchiveNames::new("arena9").unwrap();
+        let p = parse_probe(&healthy_probe_text()).unwrap();
+        let (never_s, never_b) = (SnapState::default(), BigState::default());
+        let at = |age: u64| {
+            judge_status(&StatusInputs {
+                names: &n,
+                inventory: Some(Ok(&i)),
+                host: Some(&h),
+                probe: Some(Ok(p.clone())),
+                admin_pub: Some(ADMIN),
+                push_pub: Some(PUSH),
+                expected_backups: Some(""),
+                snap: &never_s,
+                big: &never_b,
+                unsealed: &[],
+                custom_labels: &[],
+                control_box_only: &[],
+                not_on_list: &[],
+                host_written_age: Some(age),
+                snap_need: None,
+                big_need: None,
+                now: NOW,
+                keep_until_days: None,
+                today_days: 20_000,
+                token_warning: None,
+                prices: None,
+            })
+        };
+        assert_eq!(level_of(&at(600), "sync snap"), Level::Warn);
+        assert_eq!(level_of(&at(7200), "sync snap"), Level::Fail);
+        assert_eq!(level_of(&at(7200), "sync big"), Level::Fail);
+        assert!(!at(7200).ok());
+    }
+
     #[test]
     fn status_says_unknown_probe_and_retention() {
         let n = ArchiveNames::new("arena9").unwrap();
@@ -739,6 +878,10 @@ mod tests {
             unsealed: &["w1d2".to_string()],
             custom_labels: &["mylabel".to_string()],
             control_box_only: &["james-gpu".to_string()],
+            not_on_list: &["arena9-gone".to_string()],
+            host_written_age: Some(7200),
+            snap_need: Some(30 << 30),
+            big_need: Some(1 << 30),
             now: NOW,
             keep_until_days: Some(20_000),
             today_days: 20_001,
@@ -751,7 +894,10 @@ mod tests {
         assert_eq!(level_of(&r, "retention"), Level::Warn);
         assert_eq!(level_of(&r, "credentials"), Level::Warn);
         let text = r.render();
-        for needle in ["not final yet: w1d2", "mylabel", "kept on the control box only: james-gpu", "past ARCHIVE_KEEP_UNTIL", "≈ €10.50/month"] {
+        assert_eq!(level_of(&r, "not on the list"), Level::Warn);
+        assert_eq!(level_of(&r, "size snap"), Level::Warn, "a 50 GB volume for a 30 GiB seed");
+        assert_eq!(level_of(&r, "size big"), Level::Ok);
+        for needle in ["not final yet: w1d2", "mylabel", "james-gpu", "past ARCHIVE_KEEP_UNTIL", "≈ €10.50/month", "arena9-gone"] {
             assert!(text.contains(needle), "{needle}: {text}");
         }
         inputs.keep_until_days = None;

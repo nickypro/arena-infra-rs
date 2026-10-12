@@ -20,7 +20,7 @@
 //! Losing this directory stops pushes and admin access (the keys are gone), but not the
 //! participants' read access (their keys live on their laptops and pods). Back it up.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
@@ -82,15 +82,31 @@ impl ArchiveHost {
     }
 }
 
-/// One label's last successful push.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// What the archive holds of one snapshot label. Pushed pod by pod, so a run cut short leaves a
+/// label partly there — which still counts for linking (`pods_tried`), never for sealing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LabelRecord {
-    /// When that push STARTED (UNIX s): a label is sealed by a push that started two hours
-    /// after its day ended ([`super::sync::sealed`]).
+    /// When the last push in which EVERY pod went through STARTED (UNIX s; `0` = none yet): a
+    /// label is sealed by such a push that started two hours after its day ended
+    /// ([`super::sync::sealed`]).
     pub ok_started: u64,
     pub ok_finished: u64,
     pub files: u64,
     pub bytes: u64,
+    /// The pods whose last push of this label went through.
+    #[serde(default)]
+    pub pods_ok: BTreeSet<String>,
+    /// The pods with anything of this label on the archive (through, or cut short): later labels
+    /// hard-link to these too — rsync links only identical files, so a partial copy is as good a
+    /// link source as a complete one.
+    #[serde(default)]
+    pub pods_tried: BTreeSet<String>,
+    /// Whether that full push linked every pod to everything it should have: the pod's previous
+    /// local label (complete on the archive) and the week's fleet baseline. A label pushed without
+    /// them (a backlog's out-of-order push, a failed predecessor) is never sealed — a later push
+    /// re-links its identical files and gives the duplicated space back.
+    #[serde(default)]
+    pub linked: bool,
 }
 
 /// One run of a tier's sync.
@@ -117,18 +133,48 @@ pub struct SnapState {
     pub labels: BTreeMap<String, LabelRecord>,
     pub last_run: Option<RunRecord>,
     pub last_error: Option<ErrRecord>,
+    /// The volume this state describes (its device path, which names the Hetzner volume id). A
+    /// different volume — re-created after a loss, a new project — holds none of it: the state
+    /// then starts over ([`SnapState::for_volume`]), so everything is pushed again.
+    #[serde(default)]
+    pub volume: Option<String>,
+    /// Every pod dir ever allowed (`MACHINE_NAME_LIST` and twins): a pod that leaves the list keeps
+    /// its archived history growing until its last local label is pushed — sealing never freezes
+    /// a label without it.
+    #[serde(default)]
+    pub allowed_ever: BTreeSet<String>,
+    /// The fleet baselines on the archive: week (`w3`) → the local baseline dir's mtime when it
+    /// was pushed (a `pods baseline --replace` makes a new one, pushed again).
+    #[serde(default)]
+    pub baselines: BTreeMap<String, u64>,
 }
 
 impl Default for SnapState {
     fn default() -> Self {
-        Self { version: STATE_VERSION, labels: BTreeMap::new(), last_run: None, last_error: None }
+        Self {
+            version: STATE_VERSION,
+            labels: BTreeMap::new(),
+            last_run: None,
+            last_error: None,
+            volume: None,
+            allowed_ever: BTreeSet::new(),
+            baselines: BTreeMap::new(),
+        }
     }
 }
 
 impl SnapState {
     /// The last time any label pushed OK (finished).
     pub fn last_ok(&self) -> Option<u64> {
-        self.labels.values().map(|r| r.ok_finished).max()
+        self.labels.values().map(|r| r.ok_finished).filter(|t| *t > 0).max()
+    }
+
+    /// This state if it describes `volume`, else a fresh one for it (and whether it was reset).
+    pub fn for_volume(self, volume: &str) -> (SnapState, bool) {
+        match &self.volume {
+            Some(v) if v != volume => (SnapState { volume: Some(volume.to_string()), ..SnapState::default() }, true),
+            _ => (SnapState { volume: Some(volume.to_string()), ..self }, false),
+        }
     }
 }
 
@@ -139,11 +185,27 @@ pub struct BigState {
     pub last_ok: Option<RunRecord>,
     pub last_run: Option<RunRecord>,
     pub last_error: Option<ErrRecord>,
+    /// The volume it describes (see [`SnapState::volume`]).
+    #[serde(default)]
+    pub volume: Option<String>,
+    /// Every pod dir ever allowed (see [`SnapState::allowed_ever`]).
+    #[serde(default)]
+    pub allowed_ever: BTreeSet<String>,
 }
 
 impl Default for BigState {
     fn default() -> Self {
-        Self { version: STATE_VERSION, last_ok: None, last_run: None, last_error: None }
+        Self { version: STATE_VERSION, last_ok: None, last_run: None, last_error: None, volume: None, allowed_ever: BTreeSet::new() }
+    }
+}
+
+impl BigState {
+    /// This state if it describes `volume`, else a fresh one (and whether it was reset).
+    pub fn for_volume(self, volume: &str) -> (BigState, bool) {
+        match &self.volume {
+            Some(v) if v != volume => (BigState { volume: Some(volume.to_string()), ..BigState::default() }, true),
+            _ => (BigState { volume: Some(volume.to_string()), ..self }, false),
+        }
     }
 }
 
@@ -337,7 +399,7 @@ mod tests {
         save(&p.host_file(), &host()).unwrap();
         assert_eq!(load_host(&p.host_file()).unwrap(), Some(host()));
         let mut snap = SnapState::default();
-        snap.labels.insert("w1d1".into(), LabelRecord { ok_started: 1, ok_finished: 2, files: 3, bytes: 4 });
+        snap.labels.insert("w1d1".into(), LabelRecord { ok_started: 1, ok_finished: 2, files: 3, bytes: 4, ..Default::default() });
         snap.last_error = Some(ErrRecord { at: 9, label: Some("w1d2".into()), class: PushFailure::NoSpace, message: "full".into() });
         save(&p.sync_state(Tier::Snap), &snap).unwrap();
         assert_eq!(load_snap(&p.sync_state(Tier::Snap)).unwrap(), snap);
@@ -362,6 +424,22 @@ mod tests {
         assert_eq!(std::fs::read_to_string(p.host_file()).unwrap(), text);
         std::fs::write(p.sync_state(Tier::Big), "{not json").unwrap();
         assert!(load_big(&p.sync_state(Tier::Big)).unwrap_err().contains("doesn't parse"));
+    }
+
+    /// AD2: a state describes one volume; another volume starts it over (nothing sealed there).
+    #[test]
+    fn the_sync_state_belongs_to_its_volume() {
+        let mut s = SnapState::default();
+        s.labels.insert("w0d1".into(), LabelRecord { ok_started: 9, ok_finished: 10, ..Default::default() });
+        let (s, reset) = s.for_volume("/dev/disk/by-id/scsi-0HC_Volume_1");
+        assert!(!reset && s.labels.contains_key("w0d1"), "adopted");
+        let (same, reset) = s.clone().for_volume("/dev/disk/by-id/scsi-0HC_Volume_1");
+        assert!(!reset && same == s);
+        let (other, reset) = s.for_volume("/dev/disk/by-id/scsi-0HC_Volume_2");
+        assert!(reset && other.labels.is_empty() && other.volume.as_deref() == Some("/dev/disk/by-id/scsi-0HC_Volume_2"));
+        let b = BigState { volume: Some("a".into()), last_ok: Some(RunRecord { started: 1, finished: 2, ok: true }), ..BigState::default() };
+        let (b, reset) = b.for_volume("b");
+        assert!(reset && b.last_ok.is_none());
     }
 
     #[test]

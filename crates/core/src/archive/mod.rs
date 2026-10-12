@@ -53,7 +53,7 @@ pub mod sync;
 pub use cloud::{ArchiveCloud, CloudServer, CloudSshKey, CloudVolume, HetznerArchiveCloud, Inventory, Labels, Prices};
 pub use plan::{plan_down, plan_resize, plan_up, DownStep, ResizePlan, SizeFlags, UpPlan, UpStep};
 pub use sync::{
-    allowed_pod_dirs, classify_push, label_day, label_end, link_dest_for, local_labels, plan_snap, push_args, sealed, PushFailure,
+    allowed_pod_dirs, classify_push, label_day, label_end, link_labels_for, local_labels, plan_snap, push_args, sealed, PushFailure,
     SECRET_EXCLUDES,
 };
 
