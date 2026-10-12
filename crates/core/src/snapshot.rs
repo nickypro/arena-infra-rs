@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::fleet::{self, clip, FleetCost};
-use crate::health::{failure_kind_of, Check, FailureKind, PodHealth, Status};
+use crate::health::{condemns_machine, Check, PodHealth, Status};
 use crate::naming::{is_absolute, qualify};
 use crate::pod::Pod;
 use crate::proxy::{parse_nginx, Listing, ListingStatus};
@@ -230,7 +230,9 @@ pub struct HealthCache {
 /// How long `up` remembers a machine that failed its deep check on the host: long enough to
 /// span the next few `up`s (live BPF: one broken RunPod 3070 host received 11 pods across
 /// runs, each set up and checked before it was turned away), short enough that a machine its
-/// provider has since repaired comes back on its own. Expiry is the only way to forget one.
+/// provider has since repaired comes back on its own. Sooner: a complete check on it that
+/// passes ([`clears_bad_host`]); for one run, `up --retry-bad-hosts`. A machine is banned as
+/// a whole — a multi-GPU or MIG host loses all its slots, not just the GPU that failed.
 pub const BAD_HOST_TTL_SECS: u64 = 72 * 3600;
 
 /// A machine remembered as bad: when, on which pod, and why.
@@ -260,25 +262,60 @@ impl BadHost {
 /// The record that remembers `pod`'s machine as bad after `up --check` judged it `h` — only
 /// when that verdict may condemn the machine beyond this run. Conservative, since a false
 /// "bad" turns a good machine away for days:
-/// - the check ran to the end and FAILed on the host ([`FailureKind::Host`]) — never a
-///   software/setup FAIL (the image's, on any machine), nor a check that couldn't run;
+/// - the check ran to the end and FAILed with definite, machine-level evidence
+///   ([`crate::health::condemns_machine`]: CUDA/driver errors, a wrong result) — never a
+///   timeout, python dying before it reported, a policy floor, a software/setup FAIL, nor a
+///   check that couldn't run (all of which still replace the pod in the run that saw them);
 /// - the provider names the machine ([`crate::health::machine_key`]) — never an IP.
 ///
 /// `up --check` only: `pods test --deep` checks pods in use, where a participant's own job
 /// can fail a check (a GPU full of their tensors) without the machine being at fault. Pure.
 pub fn bad_host_record(pod: &Pod, h: &PodHealth, now: u64) -> Option<(String, BadHost)> {
     let facts = h.facts.as_ref().filter(|f| f.started && f.complete)?;
-    if h.status != Status::Fail || h.failure_kind() != Some(FailureKind::Host) {
+    if h.status != Status::Fail {
+        return None;
+    }
+    let evidence: Vec<String> = h
+        .checks
+        .iter()
+        .filter(|c| condemns_machine(c, facts))
+        .map(|c| format!("{}: {}", c.name, c.detail.split_whitespace().collect::<Vec<_>>().join(" ")))
+        .collect();
+    if evidence.is_empty() {
         return None;
     }
     let key = crate::health::machine_key(pod)?;
-    let host_failures: Vec<String> = h
-        .checks
-        .iter()
-        .filter(|c| c.status == Status::Fail && failure_kind_of(&c.name, Some(facts)) == FailureKind::Host)
-        .map(|c| format!("{}: {}", c.name, c.detail.split_whitespace().collect::<Vec<_>>().join(" ")))
-        .collect();
-    Some((key, BadHost { failed_at: now, pod: h.name.clone(), reason: clip(&host_failures.join("; "), REASON_MAX) }))
+    Some((key, BadHost { failed_at: now, pod: h.name.clone(), reason: clip(&evidence.join("; "), REASON_MAX) }))
+}
+
+/// Whether `h` clears its machine's bad record: a check that ran to the end and didn't FAIL
+/// (a WARN is a working machine too). Recorded through [`record_health`] — `pods test
+/// --deep`, `up --check`, the dashboard — so a machine found bad, then fine, is forgotten at
+/// once. By [`PodHealth::host`]: a machine id clears its record; an IP matches none. Pure.
+pub fn clears_bad_host(h: &PodHealth) -> Option<&str> {
+    let ran = h.facts.as_ref().is_some_and(|f| f.started && f.complete);
+    (ran && h.status != Status::Fail).then_some(h.host.as_deref()).flatten()
+}
+
+/// The `provider`'s own machine ids among `bad` (`vast machine 31540` → `31540`): what a
+/// create is told to avoid ([`crate::pod::PodSpec::avoid_machines`]). Pure.
+pub fn avoided_machines(bad: &BTreeMap<String, BadHost>, provider: &str) -> Vec<String> {
+    let prefix = format!("{} machine ", provider.to_ascii_lowercase());
+    bad.keys().filter_map(|k| k.strip_prefix(&prefix)).map(String::from).collect()
+}
+
+/// The `config check` lines for the machines `up` remembers as bad at `now`: each with when,
+/// why and when it's forgotten, or that there are none. Pure.
+pub fn bad_hosts_lines(cache: &HealthCache, now: u64) -> Vec<String> {
+    let live = cache.live_bad_hosts(now);
+    if live.is_empty() {
+        return vec!["  · none".to_string()];
+    }
+    live.iter()
+        .map(|(machine, b)| {
+            format!("  ⚠ {machine} — failed {} — forgotten at {}", b.describe(now), rfc3339(b.failed_at + BAD_HOST_TTL_SECS))
+        })
+        .collect()
 }
 
 /// The cache's file name inside its per-prefix state directory.
@@ -424,8 +461,9 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)
 }
 
-/// Merge `results` into the cache at `path` and save it: load (tolerantly), merge, prune
-/// against `listing` when given, save atomically. Held under an exclusive `flock` on the
+/// Merge `results` into the cache at `path` and save it: load (tolerantly), merge, forget the
+/// bad machines a result clears ([`clears_bad_host`]), prune against `listing` when given,
+/// save atomically. Held under an exclusive `flock` on the
 /// state directory, so a `pods test --deep` and an `up --check` finishing together can't
 /// drop each other's records (the atomic rename alone only stops torn files). `Ok` carries
 /// the load warning, if the old file had to be ignored.
@@ -441,6 +479,9 @@ pub fn record_health(
     let lock = std::fs::File::open(dir).ok().filter(|f| f.lock().is_ok());
     let (mut cache, warning) = HealthCache::load(path);
     cache.merge(results, now);
+    for machine in results.iter().filter_map(clears_bad_host) {
+        cache.bad_hosts.remove(machine);
+    }
     if let Some(listing) = listing {
         cache.prune(listing);
     }
@@ -1162,7 +1203,7 @@ pub fn public_json(public: &PublicSnapshot) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::health::{Check, DeepFacts, GpuFact};
+    use crate::health::{Check, DeepFacts, FailureKind, GpuFact};
     use crate::pod::Maintenance;
 
     const NOW: u64 = 1_791_460_800; // 2026-10-08T12:00:00Z
@@ -1416,16 +1457,152 @@ mod tests {
         assert!(c.pods.is_empty() && warn.unwrap().contains("can't read"));
     }
 
-    /// A check that ran to the end, with these verdicts (facts as a GPU pod's with torch OK).
+    /// A check that ran to the end, with these verdicts — its facts a GPU pod's whose CUDA
+    /// failed to initialise (`CUDA unknown error`) while nvidia-smi lists the GPU.
     fn ran(p: &Pod, status: Status, checks: Vec<Check>) -> PodHealth {
         let facts = DeepFacts {
-            started: true,
-            complete: true,
-            torch: Some("ok".into()),
-            torch_cuda: Some("13.0".into()),
-            ..Default::default()
+            cuda_available: Some(false),
+            cuda_error: Some("error: RuntimeError: CUDA unknown error".into()),
+            device_count: None,
+            tensor: BTreeMap::new(),
+            ..healthy_facts(1)
         };
         PodHealth { facts: Some(facts), ..health(p, status, checks) }
+    }
+
+    /// What a complete check of a healthy `n`-GPU pod (RTX A4000, driver 580) reports.
+    fn healthy_facts(n: u32) -> DeepFacts {
+        DeepFacts {
+            started: true,
+            complete: true,
+            smi: Some("ok".into()),
+            smi_cuda: Some("13.0".into()),
+            smi_gpus: Some(n),
+            gpus: (0..n)
+                .map(|index| GpuFact {
+                    index,
+                    name: Some("NVIDIA RTX A4000".into()),
+                    driver: Some("580.65.06".into()),
+                    mem_total_mib: Some(16376),
+                    mem_used_mib: Some(1),
+                })
+                .collect(),
+            python: Some("/opt/conda/envs/arena-env/bin/python".into()),
+            py_exit: Some(0),
+            py_done: true,
+            torch: Some("ok".into()),
+            torch_version: Some("2.9.0".into()),
+            torch_cuda: Some("13.0".into()),
+            cuda_available: Some(true),
+            device_count: Some(n),
+            tensor: (0..n).map(|i| (i, "ok".to_string())).collect(),
+            peer: if n > 1 { (0..n).map(|i| (format!("{i}-{}", (i + 1) % n), "ok".to_string())).collect() } else { BTreeMap::new() },
+            peer_skipped: (n < 2).then(|| "skipped (1 GPU)".to_string()),
+            nccl: Some(if n > 1 { "ok".to_string() } else { "skipped (1 GPU)".to_string() }),
+            nccl_ranks: (n > 1).then_some(n),
+            ..Default::default()
+        }
+    }
+
+    /// Review G1: only definite, machine-level evidence from a check that ran to the end is
+    /// remembered — CUDA/driver errors, nvidia-smi errors or missing GPUs, a count mismatch,
+    /// a wrong result. Never a timeout, python dying before it reported, a policy floor, NCCL,
+    /// or a software/setup FAIL — though each of those still replaces the pod (a host FAIL,
+    /// or software/setup) in the run that saw it.
+    #[test]
+    fn only_definite_machine_evidence_is_remembered() {
+        let p = Pod { machine_id: Some("m8x2k".into()), ..at(pod("devtest-apple", "runpod", "rp1"), "70.167.32.130", 40100) };
+        let floor_590 = crate::health::HealthPolicy {
+            min_driver: Some(crate::health::DriverFloor { version: vec![590], why: "CUDA 13.1".into() }),
+            ..crate::health::HealthPolicy::default()
+        };
+        let default = crate::health::HealthPolicy::default();
+        let one = || healthy_facts(1);
+        let two = || healthy_facts(2);
+        let cuda_fail = |e: &str| DeepFacts {
+            cuda_available: Some(false),
+            cuda_error: Some(e.into()),
+            device_count: Some(0),
+            tensor: BTreeMap::new(),
+            ..one()
+        };
+        // (what, facts, policy, remembered?)
+        let cases: Vec<(&str, DeepFacts, &crate::health::HealthPolicy, bool)> = vec![
+            ("CUDA unknown error, GPU listed", cuda_fail("error: RuntimeError: CUDA unknown error"), &default, true),
+            ("cuInit 999", cuda_fail("error: RuntimeError: Unexpected error from cudaGetDeviceCount(). Error 999: unknown error"), &default, true),
+            ("nvidia-smi error", DeepFacts { smi: Some("error: Unable to determine the device handle for GPU0000:01:00.0: Unknown Error".into()), gpus: vec![], smi_gpus: None, ..one() }, &default, true),
+            ("nvidia-smi lists no GPU", DeepFacts { gpus: vec![], smi_gpus: Some(0), ..one() }, &default, true),
+            ("count mismatch", DeepFacts { device_count: Some(1), tensor: [(0, "ok".to_string())].into(), ..two() }, &default, true),
+            ("wrong result", DeepFacts { tensor: [(0, "wrong result: matmul is not finite".to_string())].into(), ..one() }, &default, true),
+            ("tensor CUDA error", DeepFacts { tensor: [(0, "error: RuntimeError: CUDA error: an illegal memory access was encountered".to_string())].into(), ..one() }, &default, true),
+            ("peer garbage", DeepFacts { peer: [("0-1".to_string(), "mismatch".to_string()), ("1-0".to_string(), "ok".to_string())].into(), ..two() }, &default, true),
+            // Never:
+            ("nvidia-smi timed out", DeepFacts { smi: Some("error: nvidia-smi timed out after 10s".into()), gpus: vec![], smi_gpus: None, ..one() }, &default, false),
+            ("python timed out", DeepFacts { py_exit: Some(124), py_done: false, torch: None, torch_version: None, torch_cuda: None, cuda_available: None, device_count: None, tensor: BTreeMap::new(), nccl: None, ..one() }, &default, false),
+            ("python OOM-killed", DeepFacts { py_exit: Some(137), py_done: false, torch: None, torch_version: None, torch_cuda: None, cuda_available: None, device_count: None, tensor: BTreeMap::new(), nccl: None, ..one() }, &default, false),
+            ("python crashed mid-way", DeepFacts { py_exit: Some(139), py_done: false, tensor: BTreeMap::new(), nccl: None, ..one() }, &default, false),
+            ("NCCL timed out", DeepFacts { nccl: Some("error: timeout after 30s (no result from rank 1)".into()), ..two() }, &default, false),
+            ("NCCL error", DeepFacts { nccl: Some("error: DistBackendError: NCCL error in: ProcessGroupNCCL.cpp".into()), ..two() }, &default, false),
+            ("driver below the floor", one(), &floor_590, false),
+            ("driver too old for torch", cuda_fail("error: RuntimeError: The NVIDIA driver on your system is too old (found version 12020)"), &default, false),
+            ("CPU-only torch", DeepFacts { torch_cuda: Some("none".into()), cuda_available: Some(false), cuda_error: None, device_count: Some(0), tensor: BTreeMap::new(), ..one() }, &default, false),
+            ("healthy", one(), &default, false),
+        ];
+        for (what, facts, policy, remembered) in cases {
+            let h = crate::health::PodHealth::checked(&p, facts, policy);
+            if what != "healthy" {
+                assert_eq!(h.status, Status::Fail, "{what}: {:#?}", h.checks);
+            }
+            assert_eq!(bad_host_record(&p, &h, NOW).is_some(), remembered, "{what}: {:#?}", h.checks);
+        }
+    }
+
+    /// Review G1: a later complete check that doesn't FAIL clears its machine's record — on
+    /// any surface that records health (`pods test --deep`, `up --check`, the dashboard).
+    /// A FAIL, a check that couldn't run, or an IP-only host clears nothing.
+    #[test]
+    fn a_clean_check_on_a_remembered_machine_forgets_it() {
+        let dir = tmp("clears");
+        let path = dir.0.join(HEALTH_CACHE_FILE);
+        let bad = BadHost { failed_at: NOW, pod: "devtest-x".into(), reason: "cuda: CUDA unknown error".into() };
+        for m in ["runpod machine m1", "runpod machine m2", "runpod machine m3"] {
+            record_bad_host(&path, m, &bad, NOW).unwrap();
+        }
+        let on = |name: &str, id: &str, m: &str| Pod { machine_id: Some(m.into()), ..at(pod(name, "runpod", id), "10.0.0.1", 40100) };
+        let checked = |p: &Pod, facts: DeepFacts| crate::health::PodHealth::checked(p, facts, &crate::health::HealthPolicy::default());
+        let results = vec![
+            checked(&on("devtest-a", "a", "m1"), healthy_facts(1)), // passes on m1: forgotten
+            checked(&on("devtest-b", "b", "m2"), DeepFacts { complete: false, ..healthy_facts(1) }), // cut off: kept
+            crate::health::PodHealth::unreachable(&on("devtest-c", "c", "m3"), "timed out after 150s"), // couldn't run: kept
+        ];
+        assert_eq!(clears_bad_host(&results[0]), Some("runpod machine m1"));
+        assert_eq!(clears_bad_host(&checked(&at(pod("devtest-d", "runpod", "d"), "10.0.0.1", 40100), healthy_facts(1))), Some("10.0.0.1"), "an IP, which names no record");
+        record_health(&path, &results, None, NOW + 60).unwrap();
+        let keys: Vec<String> = HealthCache::load(&path).0.bad_hosts.into_keys().collect();
+        assert_eq!(keys, ["runpod machine m2", "runpod machine m3"]);
+    }
+
+    #[test]
+    fn avoided_machines_are_the_providers_own_ids() {
+        let bad = BadHost { failed_at: NOW, pod: "devtest-x".into(), reason: "cuda: x".into() };
+        let map: BTreeMap<String, BadHost> =
+            ["vast machine 31540", "runpod machine ue6", "vast machine 7"].iter().map(|k| (k.to_string(), bad.clone())).collect();
+        assert_eq!(avoided_machines(&map, "vast"), ["31540", "7"]);
+        assert_eq!(avoided_machines(&map, "runpod"), ["ue6"]);
+        assert!(avoided_machines(&map, "hetzner").is_empty());
+    }
+
+    /// `config check` lists the remembered machines: when, why, and when each is forgotten.
+    #[test]
+    fn bad_hosts_lines_show_when_why_and_expiry() {
+        let mut cache = HealthCache::new();
+        assert_eq!(bad_hosts_lines(&cache, NOW), ["  · none"]);
+        cache.bad_hosts.insert("runpod machine m1".into(), BadHost { failed_at: NOW - 3 * 3600, pod: "devtest-apple".into(), reason: "cuda: x".into() });
+        cache.bad_hosts.insert("runpod machine old".into(), BadHost { failed_at: NOW - BAD_HOST_TTL_SECS, pod: "devtest-x".into(), reason: "cuda: y".into() });
+        assert_eq!(
+            bad_hosts_lines(&cache, NOW),
+            ["  ⚠ runpod machine m1 — failed 3h ago (2026-10-08T09:00:00Z, devtest-apple: cuda: x) — forgotten at 2026-10-11T09:00:00Z"]
+        );
     }
 
     /// Item 13 (live BPF S2): which `up --check` verdicts remember a machine as bad across runs.
@@ -1474,6 +1651,54 @@ mod tests {
             ("pass", ran(&runpod, Status::Pass, vec![])),
         ] {
             assert_eq!(bad_host_record(&runpod, &h, NOW), None, "{what}");
+        }
+    }
+
+    /// Review G1: `failure_kind_of` calls python dying before it reported (its 75s timeout,
+    /// the OOM killer, a crash) and a step that timed out "as likely the machine as the
+    /// image" — a Host FAIL so `up` replaces the pod *this run*. Remembering such a verdict
+    /// for 72 h (no forget flag) turns a slow first `import torch`, an nvidia-smi slower than
+    /// 10 s, or a regression in our own image/check script into a multi-day ban of every
+    /// machine tried. Only positive evidence about the machine should be persisted.
+    #[test]
+    fn review_g1_a_check_that_timed_out_is_not_remembered_for_days() {
+        let runpod = Pod { machine_id: Some("m8x2k".into()), ..at(pod("devtest-apple", "runpod", "rp1"), "70.167.32.130", 40100) };
+        let policy = crate::health::HealthPolicy::default();
+        let healthy_smi = |f: DeepFacts| DeepFacts {
+            smi: Some("ok".into()),
+            smi_cuda: Some("13.0".into()),
+            smi_gpus: Some(1),
+            gpus: vec![GpuFact { index: 0, name: Some("NVIDIA RTX A4000".into()), driver: Some("580.65".into()), mem_total_mib: Some(16376), mem_used_mib: Some(1) }],
+            ..f
+        };
+        // Python timed out (exit 124) before it reported torch: the script itself ran to the end.
+        let py_timeout = healthy_smi(DeepFacts {
+            started: true,
+            complete: true,
+            python: Some("/opt/conda/envs/arena-env/bin/python".into()),
+            py_exit: Some(124),
+            ..Default::default()
+        });
+        // nvidia-smi took longer than its 10 s bound (no persistence mode, a busy host).
+        let smi_timeout = DeepFacts {
+            started: true,
+            complete: true,
+            smi: Some("error: nvidia-smi timed out after 10s".into()),
+            python: Some("/opt/conda/envs/arena-env/bin/python".into()),
+            torch: Some("ok".into()),
+            torch_cuda: Some("13.0".into()),
+            torch_version: Some("2.9.0".into()),
+            cuda_available: Some(true),
+            device_count: Some(1),
+            tensor: [(0, "ok".to_string())].into_iter().collect(),
+            py_exit: Some(0),
+            py_done: true,
+            ..Default::default()
+        };
+        for (what, facts) in [("nvidia-smi timed out", smi_timeout), ("python timed out", py_timeout)] {
+            let h = PodHealth::checked(&runpod, facts, &policy);
+            assert_eq!((h.status, h.failure_kind()), (Status::Fail, Some(FailureKind::Host)), "{what}: {:#?}", h.checks);
+            assert_eq!(bad_host_record(&runpod, &h, NOW), None, "{what}: a timeout is remembered for 72 h: {:#?}", h.checks);
         }
     }
 

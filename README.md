@@ -123,7 +123,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     [target selection](#targeting--concurrency).
     `list` shows NAME PROVIDER ID STATUS (`run locked` for a locked pod) GPU (`count×type`;
     a MIG slice as the slice — `1×B300 MIG 34GB`, never the parent card nvidia-smi names,
-    and `up`'s placement, READY and summary lines name it the same (the catalog's name);
+    and `up`'s placement, READY and summary lines name it the same (the live catalog's name,
+    else read off the id: `NVIDIA B300 SXM6 AC MIG 1g.34gb` → `B300 MIG 34GB`);
     RunPod's GPU is its display name on v1 and v2 alike, so `--json`'s `gpu_type` doesn't
     change with `RUNPOD_API`) $/H ENDPOINT (`no public endpoint (RunPod ssh proxy only)` for
     a pod up without a public IP) MAINT (the
@@ -347,12 +348,24 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     RunPod's `machineId` from REST v1 or GraphQL — before the IP, which several RunPod hosts
     share) is rejected unseen and
     terminated (even with no attempt left). A host FAIL on a machine the provider names
-    (RunPod/Vast machine id — never an IP) is also **remembered for 72 h** in the health cache:
-    any pod that lands there later — another name's first pod, or any pod of a later `up` —
-    is turned away the same way before setup (`landed on runpod machine …, which failed the
-    deep check 3h ago (<UTC time>, <pod>: cuda: …) — rejecting it`; the summary says so too);
-    without `--check` it is only a warning, nothing is terminated. Expiry is the only way to
-    forget one; a cache that can't be read remembers nothing (one warning), never fails `up`. Up to `--check-attempts N` placements per name
+    (RunPod/Vast machine id — never an IP) is also **remembered for 72 h** in the health cache
+    — but only for definite, machine-level evidence: a CUDA/driver error from torch while
+    nvidia-smi lists the GPU, an nvidia-smi error or missing GPUs, a GPU count mismatch, a
+    wrong result (NaN matmul, garbage peer copy). Never a timeout (python's 75 s, nvidia-smi's
+    10 s, NCCL), python dying before it reported, a driver below the floor, or NCCL: those
+    still replace the pod in that run, and are forgotten with it. Any pod that lands on a
+    remembered machine later — another name's first pod, or any pod of a later `up` — is
+    turned away the same way before setup (`landed on runpod machine …, which failed the deep
+    check 3h ago (<UTC time>, <pod>: cuda: …) — rejecting it`; the summary says so too);
+    without `--check` it is only a warning, nothing is terminated. Vast's creates skip such
+    machines' offers altogether; RunPod's create can't be told, so a pod RunPod places there
+    again is just rejected and retried (within `--check-attempts` — a second `--gpu`/`--cloud`
+    option draws from another pool). A machine is banned **as a whole**: a multi-GPU or MIG
+    host loses all its slots, not just the GPU that failed. It is forgotten after 72 h, at
+    once when a later complete check on it passes (`up --check`, `pods test --deep`), or
+    ignored for one run with **`--retry-bad-hosts`** (new failures are still remembered);
+    `config check` lists the remembered machines. A cache that can't be read remembers
+    nothing (one warning), never fails `up`. Up to `--check-attempts N` placements per name
     (default 2); the last pod that FAILed its check is left running for a look. Only a check
     whose script ran can condemn a host: one that couldn't run (SSH dropped, timed out) is
     rerun once SSH answers, and if it still can't run the name FAILs with the pod left
@@ -564,8 +577,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     atomically under a lock, keyed by provider + pod id; records of pods their provider
     listed OK without are dropped. A corrupt file is one warning and gets replaced. It also
     holds `up --check`'s **bad machines** (`bad_hosts`: machine id → when, pod, failed checks),
-    dropped 72 h after their failure, never by a listing; `pods test --deep` adds none (its
-    pods are in use, and a participant's own job can fail a check).
+    dropped 72 h after their failure or when a complete check on the machine passes, never by
+    a listing; `pods test --deep` adds none (its pods are in use, and a participant's own job
+    can fail a check), but its passes clear them.
   - `snapshot [--json] [--public] [--out FILE] [--no-probe]` — the fleet in one **read-only**
     picture (one list per provider + the details query, the local proxy file, the health
     cache, and a **reachability probe**: a TCP connect to the SSH endpoint of each billing

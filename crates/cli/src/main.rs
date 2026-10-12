@@ -850,6 +850,11 @@ enum PodCmd {
         /// was never set up, and its host is known bad).
         #[arg(long, default_value_t = 2, requires = "check", value_parser = clap::value_parser!(u32).range(1..=10))]
         check_attempts: u32,
+        /// Ignore the machines earlier `up --check`s remember as bad (for 72 h — `config check`
+        /// lists them): don't reject a pod that lands on one, and let Vast rent them again. A
+        /// machine that fails again is remembered again; one that passes is forgotten.
+        #[arg(long)]
+        retry_bad_hosts: bool,
         /// Lock each pod once it's READY (the pipeline's last step; RunPod with RUNPOD_API=v2):
         /// RunPod then refuses stop, restart and terminate on it — from any client, its web
         /// console included — until `arena pods unlock`. Refused up front where pods can't be
@@ -1694,6 +1699,8 @@ struct SpecOverrides {
     bootstrap: bool,
     /// `--api-json` over `CREATE_EXTRA_JSON`, already checked ([`create_extra`]).
     api_extra: Option<arena_core::apiextra::Extra>,
+    /// Machine ids not to place on (`PodSpec::avoid_machines`): `up`'s remembered bad ones.
+    avoid_machines: Vec<String>,
 }
 
 /// Where `replace` / `migrate copy` may land the new pod beyond `--gpu` / `--cloud` (live
@@ -1763,6 +1770,9 @@ fn apply_spec_overrides(spec: &mut PodSpec, ov: &SpecOverrides) {
     }
     if let Some(extra) = &ov.api_extra {
         spec.api_extra = Some(extra.clone());
+    }
+    if !ov.avoid_machines.is_empty() {
+        spec.avoid_machines = ov.avoid_machines.clone();
     }
 }
 
@@ -4462,6 +4472,16 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
         },
         Err(e) => println!("  ✗ deep-check driver floor   {e}"),
     }
+    // The machines `up --check` remembers as bad (one small local file): where to look when
+    // `up` keeps turning a machine away. Informational — never a missing key.
+    if let Some(Ok(path)) = health_cache_path(cfg) {
+        let (cache, warning) = arena_core::snapshot::HealthCache::load(&path);
+        println!("\nMachines `up --check` remembers as bad (`pods up --retry-bad-hosts` ignores them):");
+        if let Some(w) = warning {
+            println!("  {w}");
+        }
+        arena_core::snapshot::bad_hosts_lines(&cache, arena_core::snapshot::unix_now()).iter().for_each(|l| println!("{l}"));
+    }
 
     if missing.is_empty() {
         println!("\nOK — required keys for provider `{provider_name}` are present.");
@@ -5726,7 +5746,7 @@ async fn handle_pods_with(
             let api_extra = create_extra(provider, cfg, api_json.as_deref())?;
             // A typo'd --gpu fails here, before anything is listed or created.
             let gpu = checked_gpu(cfg, provider.name(), gpu).await?;
-            let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap, api_extra };
+            let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap, api_extra, ..Default::default() };
             // Several --gpu/--cloud options or a --max-price → ordered placement; otherwise
             // the single-spec path below, unchanged. Decided before anything is listed.
             let (ov, placing) = placement_request(cfg, provider.name(), ov, max_price, order, keep_trying)?;
@@ -5812,7 +5832,7 @@ async fn handle_pods_with(
             }
         }
 
-        PodCmd::Up { names, count, add, gpu, gpus, cloud, max_price, order, disk, volume, image, bootstrap, api_json, dry_run, no_wait, keep_trying, retry_mins, retry_secs, no_setup, check, check_attempts, lock, timeout, interval } => {
+        PodCmd::Up { names, count, add, gpu, gpus, cloud, max_price, order, disk, volume, image, bootstrap, api_json, dry_run, no_wait, keep_trying, retry_mins, retry_secs, no_setup, check, check_attempts, retry_bad_hosts, lock, timeout, interval } => {
             let api_extra = create_extra(provider, cfg, api_json.as_deref())?;
             // --lock where pods can't be locked fails now, not after pods were made.
             if lock {
@@ -5820,7 +5840,14 @@ async fn handle_pods_with(
                 provider.lock_support(&target).map_err(|e| anyhow::anyhow!("--lock: {}", lock_why(e)))?;
             }
             let gpu = checked_gpu(cfg, provider.name(), gpu).await?;
-            let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap, api_extra };
+            // The machines earlier `up --check`s found bad: a marketplace (Vast) skips their
+            // offers; RunPod can't be told, so a pod it places on one is rejected (`up`).
+            let avoid_machines = if retry_bad_hosts {
+                Vec::new()
+            } else {
+                arena_core::snapshot::avoided_machines(&up::remembered_bad_hosts(cfg, arena_core::snapshot::unix_now()).0, "vast")
+            };
+            let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap, api_extra, avoid_machines };
             // Several --gpu/--cloud options or a --max-price → ordered placement (as `create`).
             let (ov, placing) = placement_request(cfg, provider.name(), ov, max_price, order, keep_trying)?;
             // Like `create`: explicit names take the direct path; -n/-a top up by count.
@@ -5977,6 +6004,7 @@ async fn handle_pods_with(
                 }),
                 keys,
                 lock,
+                retry_bad_hosts,
             };
             println!(
                 "\nEach pod is brought up on its own the moment it's created (endpoint wait ≤{timeout}s per pod; \
@@ -6184,14 +6212,14 @@ async fn handle_pods_with(
         }
 
         PodCmd::Replace { target, gpu, gpus, cloud, disk, volume, image, place, keep_old, skip_proxy, dry_run } => {
-            let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap: false, api_extra: None };
+            let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap: false, api_extra: None, ..Default::default() };
             let opts = ReplaceOpts { keep_old, skip_proxy, dry_run, yes };
             handle_replace(remote, provider, cfg, &target, &ov, &place, opts, &interrupt).await?;
         }
 
         PodCmd::Migrate { cmd } => match cmd {
             MigrateCmd::Copy { target, gpu, gpus, cloud, disk, volume, image, bootstrap, place, dry_run } => {
-                let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap, api_extra: None };
+                let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap, api_extra: None, ..Default::default() };
                 handle_migrate_copy(remote, cfg, &target, &ov, &place, dry_run, yes, &interrupt).await?;
             }
             MigrateCmd::Cutover { target, yes: y, skip_proxy, no_final_sync, dry_run } => {
@@ -12987,6 +13015,7 @@ mod replacement_spec_tests {
             min_cuda: None,
             max_price: None,
             api_extra: None,
+            avoid_machines: Vec::new(),
         }
     }
 
@@ -13254,6 +13283,23 @@ mod replacement_spec_tests {
         assert_eq!(super::v2_default_cloud(&cfg("CLOUD_TYPE=secure\n")), "SECURE");
         assert_eq!(super::v2_default_cloud(&cfg("RUNPOD_CLOUD_TYPE=COMMUNITY\n")), "COMMUNITY");
         assert_eq!(super::v2_default_cloud(&cfg("CLOUD_TYPE=ALL\n")), "COMMUNITY");
+    }
+
+    /// Review G4 (item 17): `up` with ONE GPU (config `GPU_TYPE`, or a single `--gpu` — the
+    /// common path, `placement_request` → `None`) labels its option through
+    /// `single_option_plan`, with an unpriced book: no catalog, so a MIG slice keeps its id in
+    /// the READY line and placement text (`READY … — 1×B300 SXM6 AC MIG 1g.34gb SECURE`, live
+    /// BPF S6) while `pods list` says `1×B300 MIG 34GB` — README claims they now match.
+    #[test]
+    fn review_g4_single_spec_up_labels_a_mig_slice_as_pods_list_does() {
+        let spec = PodSpec {
+            gpu_type: "NVIDIA B300 SXM6 AC MIG 1g.34gb".into(),
+            gpu_count: 1,
+            cloud_type: "SECURE".into(),
+            ..PodSpec::from_config(&cfg(""))
+        };
+        let plan = super::single_option_plan("runpod", &spec);
+        assert_eq!(plan.options[0].label, "1×B300 MIG 34GB");
     }
 }
 
@@ -16206,6 +16252,7 @@ mod placement_cli_tests {
             no_setup: true,
             check: false,
             check_attempts: 2,
+            retry_bad_hosts: false,
             lock: false,
             timeout: 60,
             interval: 10,
@@ -16563,6 +16610,7 @@ mod placement_cli_tests {
             no_setup: false,
             check: true,
             check_attempts: 2,
+            retry_bad_hosts: false,
             lock: false,
             timeout: 600,
             interval: 12,
@@ -16596,6 +16644,7 @@ mod placement_cli_tests {
             no_setup: true,
             check: false,
             check_attempts: 2,
+            retry_bad_hosts: false,
             lock: false,
             timeout: 600,
             interval: 12,

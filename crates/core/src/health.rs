@@ -618,6 +618,56 @@ pub fn failure_kind_of(name: &str, facts: Option<&DeepFacts>) -> FailureKind {
     }
 }
 
+/// Whether the FAILed check `c` is definite evidence against the machine itself — what `up`
+/// may remember for days (`snapshot::bad_host_record`). Narrower than [`failure_kind_of`]'s
+/// `Host`, which only decides whether to replace the pod now: there "as likely the machine"
+/// is reason enough, but a remembered false "bad" turns a good machine away for days, and a
+/// regression of our own (image, check script, env) would ban every machine it touched.
+/// Counted, from what was actually reported:
+/// - `nvidia-smi` answered with an error, or listed no GPUs;
+/// - `cuda`: torch imported, isn't CPU-only, and CUDA failed to initialise (torch's error,
+///   e.g. `CUDA unknown error`) while nvidia-smi lists the GPU;
+/// - `device_count`: torch's count disagrees with nvidia-smi's (or is 0), or it raised;
+/// - `gpuN`: the tensor op reported an error or a wrong result (NaN matmul);
+/// - `peer_copy`: a copy reported garbage (`mismatch`) or an error.
+///
+/// Never: anything that timed out (nvidia-smi's 10 s, python's 75 s, NCCL's), python dying
+/// or being killed before it reported (a crash, the OOM killer — `torch`, and any GPU check
+/// left `not reported`), a driver below the configured floor or one torch calls too old for
+/// its CUDA (policy: placement filters by it), NCCL at all, and any check this doesn't know.
+/// Pure.
+pub fn condemns_machine(c: &Check, f: &DeepFacts) -> bool {
+    let timed_out = |s: &str| {
+        let s = s.to_ascii_lowercase();
+        s.contains("timed out") || s.contains("timeout")
+    };
+    let error = |s: &str| !timed_out(s);
+    if c.status != Status::Fail {
+        return false;
+    }
+    let smi_lists_gpus = f.smi.as_deref() == Some("ok") && !f.gpus.is_empty();
+    match c.name.as_str() {
+        "nvidia-smi" => match f.smi.as_deref() {
+            Some("ok") => f.gpus.is_empty() && f.smi_query.as_deref().is_none_or(error),
+            Some("missing") | None => false,
+            Some(e) => error(e),
+        },
+        "cuda" => {
+            f.torch.as_deref() == Some("ok")
+                && !f.cpu_only_torch()
+                && f.cuda_available == Some(false)
+                && smi_lists_gpus
+                && f.cuda_error.as_deref().is_some_and(|e| error(e) && !e.to_ascii_lowercase().contains("too old"))
+        }
+        "device_count" => f.device_count.is_some() || f.device_count_error.as_deref().is_some_and(error),
+        "peer_copy" => f.peer.values().any(|r| r == "mismatch" || (r.starts_with("error") && error(r))),
+        name => match name.strip_prefix("gpu").and_then(|i| i.parse::<u32>().ok()) {
+            Some(i) => f.tensor.get(&i).is_some_and(|r| r != "ok" && error(r)),
+            None => false,
+        },
+    }
+}
+
 /// The pod's verdict from its checks (see [`Status`]).
 pub fn overall(checks: &[Check]) -> Status {
     if checks.iter().any(|c| c.status == Status::Fail) {

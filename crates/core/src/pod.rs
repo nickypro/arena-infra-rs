@@ -102,6 +102,11 @@ pub struct PodSpec {
     /// `globalNetworking`, a network volume mount…). Each backend refuses the fields it sets
     /// itself before any request ([`crate::apiextra`]). `None` = nothing extra.
     pub api_extra: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Machines not to place on, by the provider's machine id (`31540`): the ones an `up
+    /// --check` remembers as bad (`snapshot::BAD_HOST_TTL_SECS`). Only a marketplace backend
+    /// can honour it — Vast skips their offers; RunPod's create has no such filter, so a pod
+    /// RunPod places on one is rejected by `up` and replaced. Empty = any machine.
+    pub avoid_machines: Vec<String>,
 }
 
 impl PodSpec {
@@ -142,6 +147,7 @@ impl PodSpec {
             min_cuda: cuda.floor,
             max_price: None,
             api_extra: None,
+            avoid_machines: Vec::new(),
         }
     }
 

@@ -720,6 +720,7 @@ fn parse_spec(v: &Value) -> PodSpec {
         min_cuda: None,
         max_price: None,
         api_extra: None,
+        avoid_machines: Vec::new(),
     }
 }
 
@@ -1422,6 +1423,7 @@ mod tests {
             min_cuda: None,
             max_price: None,
             api_extra: None,
+            avoid_machines: Vec::new(),
         }
     }
 

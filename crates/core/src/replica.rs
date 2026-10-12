@@ -407,22 +407,29 @@ pub fn parse_settle(stdout: &str) -> Option<Settled> {
 /// nothing was kept; else how many files it held that the sync replaced or deleted and that
 /// had changed on it since its last sync — kept, where, and a few by name. After one that
 /// didn't complete ([`SettleMode::Keep`]): that nothing it moved was removed, and where.
-/// What came from inside a `.git` is never counted as work: said apart, after it — or, when
-/// it's all there is, in one quiet line saying where it is.
+/// What came from inside a `.git` is never counted as work: said apart, after it — or, after
+/// a complete sync where it's all there is, in one quiet line saying where it is. After one
+/// that didn't complete the ⚠ stays even then (review G3): rsync sends a repo's `.git/` first,
+/// so a sync cut off early has replaced only git's files — older copies, not changes made on
+/// the receiver — and the repo there may be half-mirrored.
 pub fn settle_lines(pod: &str, s: &Settled, mode: SettleMode) -> Vec<String> {
-    if s.kept == 0 {
-        return match s.git {
-            0 => Vec::new(),
-            n => vec![format!(
-                "  ({pod}: only git's own bookkeeping had changed there — {n} file(s) from inside .git, e.g. its index, \
-                 which git rewrites whenever it runs; kept in {})",
-                s.dirs.join(", ")
-            )],
-        };
+    if s.kept == 0 && s.git == 0 {
+        return Vec::new();
     }
-    let git = match s.git {
-        0 => String::new(),
-        n => format!(" — plus {n} of git's own file(s) from inside .git (its index is rewritten whenever git runs there)"),
+    if s.kept == 0 && mode == SettleMode::Advance {
+        return vec![format!(
+            "  ({pod}: only git's own bookkeeping had changed there — {} file(s) from inside .git, e.g. its index, \
+             which git rewrites whenever it runs; kept in {})",
+            s.git,
+            s.dirs.join(", ")
+        )];
+    }
+    let git = match (s.git, mode) {
+        (0, _) => String::new(),
+        (n, SettleMode::Advance) => {
+            format!(" — plus {n} of git's own file(s) from inside .git (its index is rewritten whenever git runs there)")
+        }
+        (n, SettleMode::Keep) => format!(" — plus {n} of git's own file(s) from inside .git"),
     };
     let mut out = vec![match mode {
         SettleMode::Advance => format!(
@@ -784,6 +791,22 @@ mod tests {
         assert!(!dst.join(KEPT_DIR).join("S3").exists());
         assert_eq!(files(&kept).len(), 4, "kept work survives later syncs");
         assert_eq!(std::fs::read_to_string(dst.join("work.py")).unwrap(), "v4\n");
+    }
+
+    /// Review G3: after a sync that did NOT complete ([`SettleMode::Keep`]) nothing is tidied:
+    /// the kept folder holds everything the partial sync replaced or deleted — not files that
+    /// "had changed there". rsync sends a repo's `.git/` first (`.` sorts before letters), so
+    /// a sync cut off early has replaced only git's files. The git-only line is the Advance
+    /// wording, without the ⚠ — it says git's bookkeeping "had changed there" (it hadn't) and
+    /// drops "the sync didn't complete, nothing it replaced or deleted was removed".
+    #[test]
+    fn review_g3_a_partial_sync_that_only_reached_git_is_not_called_git_bookkeeping() {
+        let only_git = Settled { kept: 0, git: 40, dirs: vec!["/root/arena-sync-kept/S 0".into()], files: vec![] };
+        let lines = settle_lines("devtest-alpha-new", &only_git, SettleMode::Keep);
+        assert!(
+            lines.iter().any(|l| l.contains("didn't complete")) && !lines.iter().any(|l| l.contains("had changed there")),
+            "{lines:#?}"
+        );
     }
 
     /// Live BPF S4 with the real rsync and scripts: a `git status` on the receiver rewrites

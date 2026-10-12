@@ -347,15 +347,43 @@ fn stock_rank(stock: Option<&str>) -> u8 {
 }
 
 /// The short GPU name for a label: the preset's, else the provider string minus vendor. A
-/// MIG slice is named as the live catalog names it (`B300 MIG 34GB`, not its id's `B300 SXM6
+/// MIG slice is named as RunPod's catalog names it (`B300 MIG 34GB`, not its id's `B300 SXM6
 /// AC MIG 1g.34gb`) — the name `pods list` shows for the pod (live BPF S6: `up`'s placement,
-/// `[created]`, READY and summary lines said the id's), when there is a catalog to ask.
+/// `[created]`, READY and summary lines said the id's): the live catalog's when there is one,
+/// else read off the id ([`mig_label`]) — the one-GPU path prices nothing (review G4).
 fn gpu_short(api: &str, prices: &PriceBook) -> String {
     let mig = api.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| w.eq_ignore_ascii_case("mig"));
-    if let Some(name) = prices.display_name(api).filter(|_| mig) {
-        return normalize_gpu_name(name);
+    if mig {
+        if let Some(name) = prices.display_name(api).map(normalize_gpu_name).or_else(|| mig_label(api)) {
+            return name;
+        }
     }
     gpu::find(api).map(|g| g.label.to_string()).unwrap_or_else(|| normalize_gpu_name(api))
+}
+
+/// RunPod's name for a MIG slice, from its id alone: the parent's model — its name minus the
+/// vendor and `RTX`, up to the first form-factor/edition/memory word — then `MIG` and the
+/// slice's memory (`NVIDIA B300 SXM6 AC MIG 1g.34gb` → `B300 MIG 34GB`; `NVIDIA RTX PRO 6000
+/// Blackwell Server Edition MIG 2g.48gb` → `PRO 6000 MIG 48GB`). Checked against every MIG
+/// entry of the recorded catalog. `None` for an id it can't read that way. Pure.
+fn mig_label(api: &str) -> Option<String> {
+    let (parent, profile) = api.split_once(" MIG ")?;
+    let mem = profile.trim().split_once('.')?.1.to_ascii_lowercase();
+    let gb: u32 = mem.strip_suffix("gb")?.parse().ok()?;
+    let edition = |w: &str| {
+        let w = w.to_ascii_lowercase();
+        ["sxm", "pcie", "hbm", "nvl"].iter().any(|p| w.starts_with(p))
+            || ["ac", "blackwell", "server", "workstation", "edition"].contains(&w.as_str())
+            || w.strip_suffix("gb").is_some_and(|n| n.parse::<u32>().is_ok())
+    };
+    let parent = normalize_gpu_name(parent);
+    let model: Vec<&str> = parent
+        .split_whitespace()
+        .flat_map(|w| w.split('-'))
+        .skip_while(|w| w.eq_ignore_ascii_case("rtx"))
+        .take_while(|w| !edition(w))
+        .collect();
+    (!model.is_empty()).then(|| format!("{} MIG {gb}GB", model.join(" ")))
 }
 
 /// Expand, price, filter and order the options for `provider`. Pure.
@@ -1051,6 +1079,7 @@ mod tests {
             min_cuda: None,
             max_price: None,
             api_extra: None,
+            avoid_machines: Vec::new(),
         }
     }
 
@@ -1133,11 +1162,47 @@ mod tests {
         };
         assert_eq!(labels(&book), ["1×B300 MIG 34GB", "1×H100", "1×Mystery 9"]);
         assert_eq!(book.display_name(MIG), Some("B300 MIG 34GB"));
-        // No catalog (it couldn't be fetched, or the single-spec path): the id, as before.
-        assert_eq!(labels(&PriceBook::runpod(Vec::new())), ["1×B300 SXM6 AC MIG 1g.34gb", "1×H100", "1×Mystery 9"]);
-        // A catalog row without a name doesn't blank the label.
+        // The catalog's name wins over the one read off the id ...
+        let renamed = PriceBook::runpod(vec![(None, vec![named(MIG, "B300 Slice 34GB")])]);
+        assert_eq!(labels(&renamed)[0], "1×B300 Slice 34GB");
+        // ... which is used without one (it couldn't be fetched, or the one-GPU path — review
+        // G4), or when its row has no name: never a blank label.
+        assert_eq!(labels(&PriceBook::runpod(Vec::new())), ["1×B300 MIG 34GB", "1×H100", "1×Mystery 9"]);
         let unnamed = PriceBook::runpod(vec![(None, vec![live(MIG, Some(0.5), Some(0.5), None)])]);
-        assert_eq!(labels(&unnamed)[0], "1×B300 SXM6 AC MIG 1g.34gb");
+        assert_eq!(labels(&unnamed)[0], "1×B300 MIG 34GB");
+    }
+
+    /// Review G4: the one-GPU path has no catalog, so a MIG slice is named off its id — the
+    /// same name RunPod's catalog gives it, for every MIG entry of the recorded catalog.
+    #[test]
+    fn a_mig_label_read_off_the_id_matches_the_catalogs_name() {
+        let recorded: serde_json::Value =
+            serde_json::from_str(include_str!("provider/fixtures/runpod_v2/catalog_community_cuda13.json")).unwrap();
+        let migs: Vec<(&str, &str)> = recorded["body"]["gpus"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|g| Some((g["id"].as_str()?, g["name"].as_str()?)))
+            .filter(|(id, _)| id.contains(" MIG "))
+            .collect();
+        assert!(migs.len() >= 3, "{migs:?}");
+        for (id, name) in migs {
+            assert_eq!(mig_label(id).as_deref(), Some(name), "{id}");
+        }
+        for (id, want) in [
+            ("NVIDIA A100-SXM4-80GB MIG 1g.10gb", Some("A100 MIG 10GB")),
+            ("NVIDIA H100 80GB HBM3 MIG 3g.40gb", Some("H100 MIG 40GB")),
+            ("NVIDIA B300 SXM6 AC MIG 1g", None),
+            ("NVIDIA B300 SXM6 AC", None),
+        ] {
+            assert_eq!(mig_label(id).as_deref(), want, "{id}");
+        }
+        let unpriced = |gpu: &str| {
+            let r = req(&[gpu], &["SECURE"], 1, None, Order::Listed);
+            plan_options(&r, "runpod", &PriceBook::unpriced()).options[0].label.clone()
+        };
+        assert_eq!(unpriced("NVIDIA B300 SXM6 AC MIG 1g.34gb"), "1×B300 MIG 34GB");
+        assert_eq!(unpriced("NVIDIA RTX A4000"), "1×RTX A4000", "non-MIG labels are as before");
     }
 
     #[test]

@@ -405,9 +405,12 @@ fn offer_price(dph_total: f64, dph_base: f64, storage_cost: f64, disk_gb: u32) -
 /// GPU (tolerant name match, exact card), the exact GPU count, enough disk, rentable and not
 /// rented, not external, a verified host (when `verified_only`; an offer that doesn't say is
 /// not verified), open ports for direct SSH, the CUDA floor (an offer that doesn't report its
-/// CUDA fails a configured floor — unknown isn't enough), and the cap, on [`offer_price`].
-/// An offer without an id or a full price (`dph_total`, `dph_base`, `storage_cost`) can't be
-/// rented knowingly: skipped. Pure.
+/// CUDA fails a configured floor — unknown isn't enough), and the cap, on [`offer_price`] — and
+/// never an offer on a machine the spec avoids ([`PodSpec::avoid_machines`]: one `up --check`
+/// remembers as bad; the search has no exclusion filter, so it's applied here, before
+/// choosing — else the bad machine, often the cheapest, would be rented on every attempt only
+/// to be rejected). An offer without an id or a full price (`dph_total`, `dph_base`,
+/// `storage_cost`) can't be rented knowingly: skipped. Pure.
 fn fitting_offer(v: &Value, spec: &PodSpec, verified_only: bool) -> Option<Offer> {
     let money = |k: &str| v.get(k).and_then(Value::as_f64).filter(|p| p.is_finite() && *p >= 0.0);
     let dph_total = money("dph_total").filter(|p| *p > 0.0)?;
@@ -430,7 +433,8 @@ fn fitting_offer(v: &Value, spec: &PodSpec, verified_only: bool) -> Option<Offer
         && (verified || !verified_only)
         && v.get("direct_port_count").and_then(Value::as_u64) != Some(0)
         && cuda_floor(spec).is_none_or(|floor| offer.cuda_max_good.is_some_and(|c| c + 1e-9 >= floor))
-        && spec.max_price.is_none_or(|cap| milli(offer.price) <= milli(cap));
+        && spec.max_price.is_none_or(|cap| milli(offer.price) <= milli(cap))
+        && machine_of(v).is_none_or(|m| !spec.avoid_machines.contains(&m));
     fits.then_some(offer)
 }
 
@@ -875,8 +879,12 @@ impl Provider for VastProvider {
             // No fitting offer == the marketplace has no capacity for this spec (right now).
             let cap = spec.max_price.map(|c| format!(", ≤ {}/h", fmt_money("$", c))).unwrap_or_default();
             let hosts = if self.verified_only { "; verified hosts only — VAST_ALLOW_UNVERIFIED=1 admits others" } else { "" };
+            let avoided = match spec.avoid_machines.len() {
+                0 => String::new(),
+                n => format!("; skipping {n} machine(s) `up --check` remembers as bad"),
+            };
             Error::capacity(format!(
-                "vast: no rentable offer matching {}×{} (disk ≥ {}GB{cap}{hosts})",
+                "vast: no rentable offer matching {}×{} (disk ≥ {}GB{cap}{hosts}{avoided})",
                 spec.gpu_count,
                 vast_gpu_name(&spec.gpu_type),
                 spec.disk_gb
@@ -976,6 +984,7 @@ mod tests {
             min_cuda: None,
             max_price: None,
             api_extra: None,
+            avoid_machines: Vec::new(),
         }
     }
 
@@ -1148,6 +1157,12 @@ mod tests {
         assert_eq!(ids(all.clone()), [54036773, 45866034, 19025024], "cheapest first");
         let best = &all[0];
         assert_eq!((best.id, best.gpu_name.as_str(), best.num_gpus), (54036773, "RTX 3090", 1));
+        // Review G2: a machine `up --check` remembers as bad is never chosen — the next
+        // cheapest is (the recording's offers are on machines 152666, 51342, 24191).
+        let avoiding = |ms: &[&str]| PodSpec { avoid_machines: ms.iter().map(|m| m.to_string()).collect(), ..s.clone() };
+        assert_eq!(ids(any(&avoiding(&["152666"]))), [45866034, 19025024]);
+        assert_eq!(ids(any(&avoiding(&["152666", "51342", "24191"]))), Vec::<u64>::new());
+        assert_eq!(ids(any(&avoiding(&["999"]))), [54036773, 45866034, 19025024]);
         // Priced with our 100 GB (0.104 + 0.16 × 100 / 720), not the recording's dph_total of
         // $0.1058, which assumed Vast's default 8 GB.
         assert!((best.price - 0.126_222_222).abs() < 1e-6, "{}", best.price);
