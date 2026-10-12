@@ -131,6 +131,10 @@ pub const STATE_VERSION: u32 = 1;
 /// Longest GraphQL error message kept as a failure's detail.
 const DETAIL_MAX: usize = 120;
 
+/// A burn change smaller than this (USD/h) is float noise — the same pods summed in another
+/// order — not a change point.
+const BURN_NOISE: f64 = 1e-9;
+
 // ---------------------------------------------------------------------------------------
 // Accounts and keys
 // ---------------------------------------------------------------------------------------
@@ -921,9 +925,9 @@ fn apply_one(st: &mut AccountState, f: &Fetched, listed: Option<Burn>, mode: Mod
     prune(&mut st.samples, now);
 }
 
-/// Append `(now, b)` when it is a change point or the heartbeat is due. **Any rise** is
-/// recorded: an unrecorded higher burn shown once could otherwise be forgotten, and the
-/// estimate rise on the next look. A drop needs >1 % or >$0.01 (noise is ignored — and an
+/// Append `(now, b)` when it is a change point or the heartbeat is due. **Any rise** (above
+/// [`BURN_NOISE`]) is recorded: an unrecorded higher burn shown once could otherwise be
+/// forgotten, and the estimate rise on the next look. A drop needs >1 % or >$0.01 (an
 /// ignored drop only overcounts spend).
 fn push_sample(samples: &mut Vec<(u64, f64)>, now: u64, b: f64) {
     if !b.is_finite() || b < 0.0 {
@@ -934,7 +938,7 @@ fn push_sample(samples: &mut Vec<(u64, f64)>, now: u64, b: f64) {
         Some((t, _)) if now <= t => {} // same second, or the clock went back
         Some((t, last)) => {
             let d = b - last;
-            if d > 0.0 || -d > 0.01 || -d > 0.01 * last.abs() || now - t >= SAMPLE_HEARTBEAT {
+            if d > BURN_NOISE || -d > 0.01 || -d > 0.01 * last.abs() || now - t >= SAMPLE_HEARTBEAT {
                 samples.push((now, b));
             }
         }
@@ -2654,19 +2658,22 @@ mod tests {
         assert_eq!((v.source, v.balance), (Source::Live, Some(31.0)));
     }
 
-    /// One scripted run: a live anchor, then live gone; observations at `times`, the true
+    /// One scripted run: a live anchor, then live gone; observations at `times`, the listed
     /// burn changing at `changes` (each visible at the next observation), a listing that
-    /// may fail, and billing as `billing` says. Returns `(time, estimate, truth)` per
-    /// observation, through the real `apply` + `views`.
+    /// may fail, `unlisted` USD/h more that only billing sees (volumes, stopped disks), and
+    /// billing as `billing` says. Returns `(time, estimate, truth)` per observation, through
+    /// the real `apply` + `views`.
     fn simulate(
         changes: &[(u64, f64)],
         times: &[u64],
         list_fails: &[u64],
+        unlisted: f64,
         billing: &dyn Fn(u64, &dyn Fn(u64, u64) -> f64) -> Option<std::result::Result<Billed, Fail>>,
     ) -> Vec<(u64, f64, f64)> {
         let start = NOW - 10 * H;
         let a0 = 100.0;
-        let rate = |t: u64| changes.iter().rev().find(|(c, _)| *c <= t).map_or(0.0, |c| c.1);
+        let listed_rate = |t: u64| changes.iter().rev().find(|(c, _)| *c <= t).map_or(0.0, |c| c.1);
+        let rate = |t: u64| listed_rate(t) + unlisted;
         // ∫ rate from t0 to t1, exactly (the rate is a step function).
         let spent = |t0: u64, t1: u64| -> f64 {
             let mut points = vec![t0];
@@ -2674,7 +2681,7 @@ mod tests {
             points.push(t1.max(t0));
             points.windows(2).map(|w| (w[1] - w[0]) as f64 / 3_600.0 * rate(w[0])).sum()
         };
-        let listed = |t: u64| if list_fails.contains(&t) { None } else { burn(rate(t)) };
+        let listed = |t: u64| if list_fails.contains(&t) { None } else { burn(listed_rate(t)) };
         let mut state = BalanceState::default();
         let f0 = fetched(Account::Runpod, Some(Ok(live(a0, None))), None);
         state = apply(state, &[f0], &burns_of(listed(start), None), Mode::Inline, start);
@@ -2746,6 +2753,9 @@ mod tests {
                 every(600),
                 vec![start + 600, start + 1_200, start + 3 * H, start + 5 * H, start + 5 * H + 600],
             ),
+            // A rise too small for the drop rule (0.8 %, $0.004), then back, seconds apart: only
+            // recording every rise keeps the second look from undercutting the first.
+            ("a tiny rise and back", vec![(start - H, 0.5), (start + 1_800, 0.504), (start + 1_815, 0.5)], vec![start + 600, start + 1_810, start + 1_820, start + 3_000], vec![]),
             (
                 "irregular looks",
                 vec![(start - H, 0.7), (start + 2 * H, 0.9), (start + 6 * H, 0.1)],
@@ -2756,13 +2766,19 @@ mod tests {
     }
 
     /// Invariant 5: on scripted burn histories with lagging, partial and missing billing,
-    /// the estimate never exceeds the truth.
+    /// the estimate never exceeds the truth. Spend the listing doesn't show is covered only
+    /// as far as billing is current — so with it, only complete billing is held to this
+    /// (the documented limit: unlisted spend inside the billing lag goes unseen).
     #[test]
     fn estimate_never_exceeds_truth() {
         for (hist, changes, times, fails) in histories() {
             for (scen, billing) in scenarios() {
-                for (t, est, truth) in simulate(&changes, &times, &fails, billing.as_ref()) {
-                    assert!(est <= truth + 1e-9, "{hist} / {scen} at +{}s: estimate {est} > truth {truth}", t - (NOW - 10 * H));
+                let unlisted: &[f64] = if scen == "complete" { &[0.0, 0.2] } else { &[0.0] };
+                for &extra in unlisted {
+                    for (t, est, truth) in simulate(&changes, &times, &fails, extra, billing.as_ref()) {
+                        let at = t - (NOW - 10 * H);
+                        assert!(est <= truth + 1e-9, "{hist} / {scen} / +{extra}/h unlisted at +{at}s: estimate {est} > truth {truth}");
+                    }
                 }
             }
         }
@@ -2772,11 +2788,22 @@ mod tests {
     /// not a burn that drops, not a failed listing, not billing that fails after it worked.
     #[test]
     fn estimate_is_monotone() {
+        // With spend only billing sees, billing wins over metering — and must keep winning
+        // when a later billing read fails.
         for (hist, changes, times, fails) in histories() {
             for (scen, billing) in scenarios() {
-                let run = simulate(&changes, &times, &fails, billing.as_ref());
-                for w in run.windows(2) {
-                    assert!(w[1].1 <= w[0].1 + 1e-9, "{hist} / {scen}: {} at {} rose to {} at {}", w[0].1, w[0].0, w[1].1, w[1].0);
+                for extra in [0.0, 0.2] {
+                    let run = simulate(&changes, &times, &fails, extra, billing.as_ref());
+                    for w in run.windows(2) {
+                        assert!(
+                            w[1].1 <= w[0].1 + 1e-9,
+                            "{hist} / {scen} / +{extra}/h unlisted: {} at {} rose to {} at {}",
+                            w[0].1,
+                            w[0].0,
+                            w[1].1,
+                            w[1].0
+                        );
+                    }
                 }
             }
         }
@@ -2802,7 +2829,8 @@ mod tests {
         // Samples: no change within the hour → none; the heartbeat → one; any rise → one;
         // a small drop → none; a drop over 1 % → one.
         let none = |acct| fetched(acct, None, None);
-        for (dt, rate, appended) in [(600, 0.5, false), (H, 0.5, true), (H + 60, 0.51, true), (H + 120, 0.508, false), (H + 180, 0.4, true)] {
+        let noise = 0.4 + 1e-12;
+        for (dt, rate, appended) in [(600, 0.5, false), (H, 0.5, true), (H + 60, 0.51, true), (H + 120, 0.508, false), (H + 180, 0.4, true), (H + 240, noise, false)] {
             let before = s.accounts[&Account::Runpod].samples.len();
             s = apply(s, &[none(Account::Runpod)], &burns_of(burn(rate), None), Mode::Inline, NOW + dt);
             assert_eq!(s.accounts[&Account::Runpod].samples.len(), before + usize::from(appended), "+{dt}s at {rate}");

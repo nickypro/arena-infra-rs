@@ -345,8 +345,6 @@ mod tests {
         Config::parse("MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple bloom cloud dune)\nBACKUP_REPO_PATH=/root/ARENA_materials\n")
     }
 
-    const NOW: u64 = 1_791_460_800;
-
     #[test]
     fn hours_flag_parses_and_defaults_to_six() {
         assert_eq!(parse_hours("6"), Ok(6.0));
