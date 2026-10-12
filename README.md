@@ -86,6 +86,12 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
   - `balance` — provider account balances (RunPod GraphQL `myself`, Vast `users/current`;
     Hetzner postpaid) judged against the burn into a runway; `idle` — the read-only
     `pods idle` probe script, its reply parser and the verdict/report (unknown ≠ idle).
+  - `reap` — the opt-in auto-reaper (`pods reap`), pure but for its state store: the strict
+    `reap.json` types and settings (`REAP_*`, file-only), the read-only probe (`idle_probe.sh`,
+    framed by a nonce, indexed and `cksum`-closed so a damaged reply is never "idle") and its
+    parser, classification / idle streak / due rules, the decision table (spec rows G1–G7,
+    R1–R40), the typed proofs and `ReapTicket` (the only way reap code reaches a terminate),
+    the ENDS column, plan table, notice, cron line and JSONL log line.
   - `lock` — pod locks (RunPod v2, `Pod::locked`): the one refusal sentence (`devtest-x is
     locked — `arena pods unlock devtest-x` first`), the up-front refusal over a selection,
     the mapping of the API's `Locked` error to it, and `pods lock`/`unlock`'s plan.
@@ -623,6 +629,34 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     terminate <name>` (the id when a name is shared). Anything unreadable (no reply, a scan
     that timed out, `[N/A]` GPU, our own connection not found, more than 2000 sockets so not
     every connection was read) makes a pod `?`, never a candidate. Not seen: sessions through RunPod's `ssh.runpod.io` proxy (not via sshd).
+  - `pods reap run|set|clear|pin|unpin|status|log|hold|release` — the **opt-in auto-reaper**:
+    terminate a pod past an end time the operator set (`--expire-in 8h`, `--expire-at …`), or
+    idle for a window (`--idle-after 8h`), **after a verified backup and only when every check
+    is certain** — anything it can't confirm (an unreachable pod, a probe it can't read, a
+    failed listing, an unverified clock, a lock, a pin, `~/.arena/keep` on the pod, data on
+    `/workspace`) means "do nothing and log it". Off by default in layers: a pod needs a policy
+    (`reap set <names> …`, or `pods up/create --expire-in/--expire-at/--idle-after`, recorded
+    the moment each create returns); `reap run` alone only probes (read-only) and prints the
+    plan (`WOULD TERMINATE`); `reap run --apply` acts only with `REAP_ENABLED=1` **in the config
+    file** (the environment can't set any `REAP_*` key), no hold, an NTP-synced clock and, with
+    no terminal, `--yes` — at most `REAP_MAX_PER_RUN` (default 1) per run and
+    `REAP_MAX_PER_DAY` (10) per 24 h. Acting on a pod: a durable write-ahead, the git push and
+    both rsync tiers under the pod's backup lock (every pod-side step behind its identity
+    check), a dry-run verify of the big tier (0 files pending), a post-backup quiet check (same
+    id and container, nothing new since the backup started), a fresh re-listing (same id/name,
+    RUNNING, lock reported off) and a state re-read (no hold, no new pin, still due) — then one
+    terminate, routed by provider name. Expiry never takes a pod in use or unreachable: it's
+    deferred (`OVERDUE (in use)` / `(unreachable)` in `pods list`'s ENDS column) and notified at
+    most every 6 h (`REAP_NOTIFY_CMD`, one line on stdin). A terminate error other than
+    "locked" sets an automatic hold. Needs an explicit absolute `ARENA_STATE_DIR` (state:
+    `reap.json`, log: `reap-log.jsonl`), RunPod on `RUNPOD_API=v2` (v1 and Vast are never
+    reaped), absolute `LOCAL_BACKUP_DIR`, a `.arena-backup-tier` marker on each backup root
+    (`snapshot` / `big`; the big tier's root is `LOCAL_BACKUP_BIG_DIR`, default
+    `<LOCAL_BACKUP_DIR>/big`), `ARENA_START_DATE` and no `BACKUP_REMOTE_PATH`; `config check`
+    lists what's missing. Rollout: `cron install --reap observe` first (logs `would_reap`), then
+    `--reap apply` (refused unless REAP_ENABLED=1). `reap set` also writes `~/.arena/NOTICE` and
+    an interactive-only login banner on the pod; `pods rename` keeps the policy's name; a
+    `replace`/`migrate` doesn't carry it (said).
   - `pods pull [targets] [--label <label>]` — the **file** backup (complementing the git
     `backup`): rsyncs each pod's home into `<dir>/<label>/<pod>/`, reporting per pod what was
     sent and what the snapshot holds (`12 files, 3.4M sent of 6754, 1.8G` — sizes parsed in
