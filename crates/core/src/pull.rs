@@ -364,6 +364,137 @@ pub fn big_dest(base: &str, pod_name: &str) -> String {
     format!("{}/big/{pod_name}/", base.trim_end_matches('/'))
 }
 
+/// Where the big (all-files) tier lives: `LOCAL_BACKUP_BIG_DIR` when set — its own volume,
+/// so a big tier that only ever grows can't starve the dated snapshots (or `/`) of space —
+/// else `<LOCAL_BACKUP_DIR>/big`, today's layout. A trailing `/` is dropped.
+pub fn big_root(local_backup_dir: &str, big_dir: Option<&str>) -> String {
+    match big_dir.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) => {
+            let t = d.trim_end_matches('/');
+            if t.is_empty() { "/".to_string() } else { t.to_string() }
+        }
+        None => format!("{}/big", local_backup_dir.trim_end_matches('/')),
+    }
+}
+
+/// A pod's big-tier destination under the big root `root`: `<root>/<pod>/` (the trailing
+/// slash matters to rsync). [`big_dest`] is this under `<base>/big`.
+pub fn big_dest_in(root: &str, pod_name: &str) -> String {
+    format!("{}/{pod_name}/", root.trim_end_matches('/'))
+}
+
+/// The marker file at the root of each backup tier's volume, written once by hand when the
+/// volume is formatted: its first line is exactly the tier's word ([`Tier::word`]). What
+/// catches an unmounted volume: with `nofail` a missing volume leaves an empty mountpoint on
+/// `/`, and an rsync into it "succeeds" — filling the root disk with a backup nobody will
+/// find. The reaper always requires the markers; `pods pull`/`backup` only in two-volume mode
+/// (`LOCAL_BACKUP_BIG_DIR` set).
+pub const TIER_MARKER: &str = ".arena-backup-tier";
+
+/// The two backup tiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier {
+    /// The dated small-file snapshots (`<LOCAL_BACKUP_DIR>/<wNdM>/<pod>/`).
+    Snapshot,
+    /// The all-files tier ([`big_root`]).
+    Big,
+}
+
+impl Tier {
+    /// The marker's first line for this tier.
+    pub fn word(self) -> &'static str {
+        match self {
+            Tier::Snapshot => "snapshot",
+            Tier::Big => "big",
+        }
+    }
+}
+
+/// Whether a [`TIER_MARKER`]'s text marks `tier`: its first line is exactly the tier's word
+/// (a trailing `\r` from an editor tolerated, nothing else). Pure.
+pub fn tier_marker_ok(text: &str, tier: Tier) -> bool {
+    text.lines().next().map(|l| l.strip_suffix('\r').unwrap_or(l)) == Some(tier.word())
+}
+
+/// Read `root`'s [`TIER_MARKER`] and check it marks `tier`: `Err` says what's wrong (no
+/// marker — the volume not mounted? — or the other tier's).
+pub fn check_tier_marker(root: &Path, tier: Tier) -> std::result::Result<(), String> {
+    let path = root.join(TIER_MARKER);
+    match std::fs::read_to_string(&path) {
+        Ok(text) if tier_marker_ok(&text, tier) => Ok(()),
+        Ok(_) => Err(format!("{} doesn't say `{}` — the wrong volume mounted there?", path.display(), tier.word())),
+        Err(e) => Err(format!(
+            "no tier marker {} ({e}) — is the {} volume mounted? (create it once with `printf '{}\\n' > {}`)",
+            path.display(),
+            tier.word(),
+            tier.word(),
+            path.display()
+        )),
+    }
+}
+
+/// Bytes free for an unprivileged writer on the filesystem holding `path` (`statvfs`:
+/// `f_bavail × f_frsize`) — what the reaper's free-space floor is checked against.
+#[cfg(unix)]
+pub fn free_bytes(path: &Path) -> std::io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path holds a NUL byte"))?;
+    // SAFETY: statvfs(3) on a NUL-terminated path into a zeroed struct we own.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+}
+
+/// No `statvfs` off unix: unknown, which the reaper reads as "not enough".
+#[cfg(not(unix))]
+pub fn free_bytes(_path: &Path) -> std::io::Result<u64> {
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "free space unknown on this platform"))
+}
+
+/// The rsync argv that checks a finished tier: [`rsync_args`] plus `--dry-run` — with
+/// `--stats` (always passed) it reports how many files a real run would still send
+/// ([`parse_rsync_stats`]'s `files_sent`): 0 = the destination holds everything the source
+/// has, as the tier's rules select it.
+pub fn verify_args(target: &SshTarget, pc: &PullConfig, local_dest: &str) -> Vec<String> {
+    let mut a = vec!["--dry-run".to_string()];
+    a.extend(rsync_args(target, pc, local_dest));
+    a
+}
+
+/// Where the per-pod backup lock lives: `<dir>/.arena-locks/<pod>.lock`, `dir` being the
+/// backup dir a run writes (`LOCAL_BACKUP_DIR` — a value every user shares, unlike the state
+/// dir). Every writer of a pod's backup takes it — `pods pull`, `pods backup` and the
+/// reaper's probe and backup — so our own backup SSH sessions never overlap a reaper probe
+/// (where they'd count as activity) or each other. The pod name is reduced to a safe file
+/// name.
+pub fn pod_lock_path(local_backup_dir: &str, pod: &str) -> PathBuf {
+    let safe: String = pod.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' }).collect();
+    let safe = if safe.is_empty() || safe.chars().all(|c| c == '.') { "_".to_string() } else { safe };
+    Path::new(local_backup_dir).join(".arena-locks").join(format!("{safe}.lock"))
+}
+
+/// Open (creating) a pod's backup lock file ([`pod_lock_path`]) — not locked yet.
+pub fn open_pod_lock(local_backup_dir: &str, pod: &str) -> std::io::Result<std::fs::File> {
+    let path = pod_lock_path(local_backup_dir, pod);
+    if let Some(dir) = path.parent() {
+        crate::snapshot::create_private_dir(dir)?;
+    }
+    std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path)
+}
+
+/// Take `lock` exclusively without waiting: `Ok(true)` taken (held until the file is
+/// dropped), `Ok(false)` someone else holds it.
+pub fn try_lock(lock: &std::fs::File) -> std::io::Result<bool> {
+    match lock.try_lock() {
+        Ok(()) => Ok(true),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
+}
+
 /// Build the `rsync` argv (everything after the program name) to pull `target`'s home
 /// (or `pc.remote_path`) into `local_dest`. Uses the target's transport options via
 /// `-e ssh …`; rsync appends `user@host` to the remote spec itself.
@@ -914,6 +1045,78 @@ mod tests {
             key_paths: vec!["/root/.ssh/arena8_key".into()],
             connect_timeout_secs: 10,
         }
+    }
+
+    /// The big tier's root: its own volume when configured, else today's `<dir>/big`.
+    #[test]
+    fn big_root_follows_local_backup_big_dir() {
+        assert_eq!(big_root("/b", None), "/b/big");
+        assert_eq!(big_root("/b/", Some("  ")), "/b/big");
+        assert_eq!(big_root("/b", Some("/mnt/big/")), "/mnt/big");
+        assert_eq!(big_root("./backup", None), "./backup/big");
+        assert_eq!(big_dest_in("/mnt/big", "devtest-a"), "/mnt/big/devtest-a/");
+        assert_eq!(big_dest_in(&big_root("/b", None), "devtest-a"), big_dest("/b", "devtest-a"));
+    }
+
+    /// A marker's first line must be exactly its tier's word.
+    #[test]
+    fn tier_markers_are_exact() {
+        for (text, tier, ok) in [
+            ("snapshot\n", Tier::Snapshot, true),
+            ("snapshot", Tier::Snapshot, true),
+            ("snapshot\r\nformatted 2026-10-01\n", Tier::Snapshot, true),
+            ("big\n", Tier::Big, true),
+            ("big\n", Tier::Snapshot, false),
+            ("snapshot\n", Tier::Big, false),
+            (" big\n", Tier::Big, false),
+            ("big \n", Tier::Big, false),
+            ("BIG\n", Tier::Big, false),
+            ("", Tier::Big, false),
+            ("\nbig\n", Tier::Big, false),
+        ] {
+            assert_eq!(tier_marker_ok(text, tier), ok, "{text:?} {tier:?}");
+        }
+        let d = std::env::temp_dir().join(format!("arena-pull-marker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        assert!(check_tier_marker(&d, Tier::Big).unwrap_err().contains("is the big volume mounted?"));
+        std::fs::write(d.join(TIER_MARKER), "snapshot\n").unwrap();
+        assert!(check_tier_marker(&d, Tier::Snapshot).is_ok());
+        assert!(check_tier_marker(&d, Tier::Big).unwrap_err().contains("doesn't say `big`"));
+        assert!(free_bytes(&d).unwrap() > 0);
+        assert!(free_bytes(&d.join("missing")).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The verify is the tier's own rsync, as a dry run.
+    #[test]
+    fn verify_args_are_the_tiers_args_as_a_dry_run() {
+        let pc = PullConfig::big_tier();
+        let v = verify_args(&target(), &pc, "/b/big/devtest-a/");
+        assert_eq!(v[0], "--dry-run");
+        assert_eq!(&v[1..], rsync_args(&target(), &pc, "/b/big/devtest-a/").as_slice());
+        assert!(v.contains(&"--stats".to_string()));
+    }
+
+    /// One lock per pod, in the backup dir; a second holder is told it's busy until the
+    /// first lets go.
+    #[test]
+    fn pod_locks_exclude_each_other() {
+        assert_eq!(pod_lock_path("/b", "devtest-a"), Path::new("/b/.arena-locks/devtest-a.lock"));
+        assert_eq!(pod_lock_path("/b", "../x"), Path::new("/b/.arena-locks/.._x.lock"));
+        assert_eq!(pod_lock_path("/b", ".."), Path::new("/b/.arena-locks/_.lock"));
+        let d = std::env::temp_dir().join(format!("arena-pull-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let dir = d.display().to_string();
+        let a = open_pod_lock(&dir, "devtest-a").unwrap();
+        let b = open_pod_lock(&dir, "devtest-a").unwrap();
+        let other = open_pod_lock(&dir, "devtest-b").unwrap();
+        assert!(try_lock(&a).unwrap());
+        assert!(!try_lock(&b).unwrap(), "held by `a`");
+        assert!(try_lock(&other).unwrap(), "another pod's lock is its own");
+        drop(a);
+        assert!(try_lock(&b).unwrap(), "free once `a` is dropped");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

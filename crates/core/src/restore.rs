@@ -153,6 +153,17 @@ pub fn resolve_source(base: &Path, pod: &str, from: Option<&str>) -> Result<(Str
     Ok((label, dir))
 }
 
+/// The all-files backup of `pod` when the big tier has its own root (`LOCAL_BACKUP_BIG_DIR`,
+/// [`crate::pull::big_root`]): `<big_root>/<pod>/`. Refused when it's missing or empty.
+pub fn resolve_big(big_root: &Path, pod: &str) -> Result<(String, PathBuf), String> {
+    let dir = big_root.join(pod);
+    if !non_empty_dir(&dir) {
+        let what = if dir.exists() { "is empty" } else { "doesn't exist" };
+        return Err(format!("{} {what} — no all-files backup of {pod} on the big volume", dir.display()));
+    }
+    Ok((BIG.to_string(), dir))
+}
+
 /// Check `--path`: a relative path inside the backup, no `..`/`.`/empty component. Returns it
 /// with any trailing `/` dropped.
 pub fn check_subpath(path: &str) -> Result<String, String> {

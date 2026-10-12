@@ -353,6 +353,20 @@ pub trait Provider: Send + Sync {
     /// Mutating and irreversible.
     async fn terminate_pod(&self, id: &str) -> Result<()>;
 
+    /// Mutating and irreversible: [`Self::terminate_pod`] of the pod `id` that the backend
+    /// named `provider` listed — routed by that NAME only, never guessed from the id. The
+    /// auto-reaper's one way to terminate ([`crate::reap::ReapTicket`]): Vast and Hetzner ids
+    /// are both numbers, and the fleet provider's id → backend cache could hand one backend's
+    /// id to the other, terminating a different machine. Default: this backend's own pods
+    /// only; any other name is refused without a request.
+    async fn terminate_pod_on(&self, provider: &str, id: &str) -> Result<()> {
+        if provider == self.name() {
+            self.terminate_pod(id).await
+        } else {
+            Err(Error::provider(format!("pod {id} is on `{provider}`, not `{}` — not terminated", self.name())))
+        }
+    }
+
     /// Mutating. Rename a pod in place (the cloud-side `name`). The blue-green `replace`
     /// flow uses this to swap a freshly-built pod into the canonical machine name while
     /// parking the old one under `<name>-old`. The pod's identity/disk/endpoint are

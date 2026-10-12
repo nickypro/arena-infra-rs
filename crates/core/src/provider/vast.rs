@@ -777,6 +777,7 @@ fn parse_instance(v: &Value) -> Pod {
         machine_id: machine_of(v),
         locked: None, // Vast has no pod lock
         proxy_only: false,
+        delete_protected: None,
     }
 }
 
@@ -869,6 +870,7 @@ impl Provider for VastProvider {
                 machine_id: None,
                 locked: None,
                 proxy_only: false,
+                delete_protected: None,
             });
         }
         Err(gone.unwrap_or_else(|| {

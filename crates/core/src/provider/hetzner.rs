@@ -210,6 +210,10 @@ fn parse_server(v: &Value) -> Pod {
         // RunPod v2 only.
         locked: None,
         proxy_only: false,
+        // `protection.delete` (a bool on every server): the API refuses a DELETE while it's
+        // set. Read for the auto-reaper, which never reaps a protected server; anything but a
+        // bool there is `None` (unknown — never read as "unprotected").
+        delete_protected: v.get("protection").and_then(|p| p.get("delete")).and_then(Value::as_bool),
     }
 }
 
@@ -466,6 +470,28 @@ mod tests {
         assert_eq!(p.ssh_ip.as_deref(), Some("1.2.3.4"));
         assert_eq!(p.ssh_port, Some(22)); // plain SSH on a cloud VM
         assert_eq!(p.provider, "hetzner");
+    }
+
+    /// `protection.delete` is read for the reaper (on, off) — and anything else, a missing
+    /// block or a non-bool, is unknown, never "unprotected". It is not a lock: `locked` stays
+    /// `None`, so stop/restart's lock refusals don't read it.
+    #[test]
+    fn delete_protection_is_read_and_unknown_when_odd() {
+        let with = |protection: serde_json::Value| {
+            let mut v = json!({"id": 9, "name": "devtest-alpha", "status": "running"});
+            if !protection.is_null() {
+                v["protection"] = protection;
+            }
+            parse_server(&v)
+        };
+        assert_eq!(with(json!({"delete": true, "rebuild": true})).delete_protected, Some(true));
+        assert_eq!(with(json!({"delete": false, "rebuild": false})).delete_protected, Some(false));
+        for odd in [json!(null), json!({}), json!({"delete": "true"}), json!({"delete": 1}), json!("on")] {
+            let p = with(odd.clone());
+            assert_eq!(p.delete_protected, None, "{odd}");
+            assert_eq!(p.locked, None, "{odd}");
+        }
+        assert_eq!(with(json!({"delete": true})).locked, None, "protection is not a lock");
     }
 
     #[test]

@@ -247,6 +247,14 @@ fn path_component(prefix: &str) -> String {
 /// says so); a relative `ARENA_STATE_DIR` is refused — a cron job and a shell would
 /// resolve it to different places.
 pub fn health_cache_path(prefix: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
+    state_file_path(prefix, HEALTH_CACHE_FILE, lookup)
+}
+
+/// `file` in the per-prefix state directory, resolved as [`health_cache_path`] resolves the
+/// health cache (`$ARENA_STATE_DIR`, else XDG, else `~/.local/state/arena`). For a reader that
+/// may fall back — `pods list` reading the reaper's state — never for anything that writes
+/// authority (that's [`state_dir_explicit`]).
+pub fn state_file_path(prefix: &str, file: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
     let set = |k: &str| lookup(k).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
     let root = if let Some(dir) = set("ARENA_STATE_DIR") {
         let dir = PathBuf::from(dir);
@@ -260,7 +268,25 @@ pub fn health_cache_path(prefix: &str, lookup: impl Fn(&str) -> Option<String>) 
         let home = set("HOME").ok_or("no ARENA_STATE_DIR, XDG_STATE_HOME or HOME to keep it in")?;
         PathBuf::from(home).join(".local").join("state").join("arena")
     };
-    Ok(root.join(path_component(prefix)).join(HEALTH_CACHE_FILE))
+    Ok(root.join(path_component(prefix)).join(file))
+}
+
+/// The per-prefix state directory `$ARENA_STATE_DIR/<prefix>/` — from an EXPLICIT, absolute
+/// `ARENA_STATE_DIR` only, never the XDG/`HOME` fallbacks: root's cron and an operator shell
+/// as `dev` would otherwise read and write different files (one would see no policy, the
+/// other act on a stale one). What the auto-reaper keeps its state in (`crate::reap`), and so
+/// what `pods reap …`, `--expire-*`/`--idle-after` and the reap cron line require.
+pub fn state_dir_explicit(cfg: &Config) -> Result<PathBuf, String> {
+    let dir = cfg.get("ARENA_STATE_DIR").map(str::trim).filter(|v| !v.is_empty()).ok_or_else(|| {
+        "ARENA_STATE_DIR isn't set — the reaper needs an explicit, absolute state directory (root's cron and an \
+         operator's shell must read the same files): set it in the config file, or export it"
+            .to_string()
+    })?;
+    let dir = PathBuf::from(dir);
+    if !dir.is_absolute() {
+        return Err(format!("ARENA_STATE_DIR must be an absolute path (got {})", dir.display()));
+    }
+    Ok(dir.join(path_component(cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena"))))
 }
 
 /// [`health_cache_path`] for a loaded config, as every surface resolves it: the fleet
@@ -350,13 +376,13 @@ impl HealthCache {
 }
 
 #[cfg(unix)]
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
 }
 
 #[cfg(not(unix))]
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)
 }
 
@@ -1255,6 +1281,28 @@ mod tests {
                 _ => panic!("{vars:?} {prefix}: got {got:?}"),
             }
         }
+    }
+
+    /// The reaper's state dir comes from an explicit, absolute ARENA_STATE_DIR only — never
+    /// the XDG/HOME fallbacks (root's cron and `dev` would read different files) — and is
+    /// prefix-scoped like the health cache. `state_file_path` is the tolerant reader's.
+    #[test]
+    fn explicit_state_dir_needs_an_absolute_arena_state_dir() {
+        let cfg = |text: &str| Config::parse(text);
+        let ok = state_dir_explicit(&cfg("ARENA_STATE_DIR=/srv/arena\nMACHINE_NAME_PREFIX=devtest")).unwrap();
+        assert_eq!(ok, Path::new("/srv/arena/devtest"));
+        assert_eq!(state_dir_explicit(&cfg("ARENA_STATE_DIR=/s\nMACHINE_NAME_PREFIX=../x")).unwrap(), Path::new("/s/.._x"));
+        for (text, needle) in [
+            ("MACHINE_NAME_PREFIX=devtest", "isn't set"),
+            ("ARENA_STATE_DIR=\"  \"", "isn't set"),
+            ("ARENA_STATE_DIR=state", "must be an absolute path"),
+            ("ARENA_STATE_DIR=./state", "must be an absolute path"),
+        ] {
+            let e = state_dir_explicit(&cfg(text)).unwrap_err();
+            assert!(e.contains(needle), "{text}: {e}");
+        }
+        let lookup = |k: &str| (k == "HOME").then(|| "/home/dev".to_string());
+        assert_eq!(state_file_path("devtest", "reap.json", lookup).unwrap(), Path::new("/home/dev/.local/state/arena/devtest/reap.json"));
     }
 
     /// A fresh temp directory, removed at the end of the test.

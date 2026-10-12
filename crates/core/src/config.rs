@@ -54,15 +54,32 @@ impl Config {
         "BACKUP_TIMEOUT_SECS",
     ];
 
+    /// Keys starting with this are **file-only**: the environment can neither override nor
+    /// introduce them. The auto-reaper's settings (`REAP_ENABLED`, its caps, its notify
+    /// command — `arena_core::reap`): a reap terminates pods, so whether it may run at all, and
+    /// how much it may do, must be exactly what the config file says. Without this a stray
+    /// `REAP_ENABLED=1` in a shell or a cron line would switch it on over a file saying `0`
+    /// (any key in the file is env-overridable — the rule below).
+    pub const FILE_ONLY_PREFIX: &'static str = "REAP_";
+
+    /// Whether `key` is file-only ([`Self::FILE_ONLY_PREFIX`]).
+    pub fn is_file_only(key: &str) -> bool {
+        key.starts_with(Self::FILE_ONLY_PREFIX)
+    }
+
     /// Let environment variables override values from the file: any key already in the
     /// config can be overridden by an env var of the same name (e.g.
     /// `SHARED_SSH_KEY_PATH=~/.ssh/key arena-tui`), and the [`Self::ENV_INTRODUCIBLE`]
     /// keys may be *added* even if the file omits them (e.g.
     /// `ARENA_START_DATE=2026-05-25 arena backup`). This is how an operator configures a
     /// run *without editing the shared, read-only prod config*; a stray env var still
-    /// can't introduce an arbitrary new setting.
+    /// can't introduce an arbitrary new setting. File-only keys ([`Self::is_file_only`]) are
+    /// never touched.
     fn apply_overrides<F: Fn(&str) -> Option<String>>(&mut self, lookup: F) {
         for (k, v) in self.values.iter_mut() {
+            if Self::is_file_only(k) {
+                continue;
+            }
             if let Some(override_val) = lookup(k) {
                 *v = override_val;
             }
@@ -272,6 +289,28 @@ MACHINE_NAME_LIST=(
         let mut c = Config::parse("IMAGE=base:1");
         c.apply_overrides(|k| (k == "BACKUP_TIMEOUT_SECS").then(|| "600".to_string()));
         assert_eq!(c.get("BACKUP_TIMEOUT_SECS"), Some("600"));
+    }
+
+    /// The reaper's switch and limits come from the file alone: the environment can neither
+    /// turn it on over a file that says `0`, nor introduce it, nor raise a cap.
+    #[test]
+    fn reap_keys_are_file_only() {
+        let env = |k: &str| match k {
+            "REAP_ENABLED" => Some("1".to_string()),
+            "REAP_MAX_PER_RUN" => Some("5".to_string()),
+            "IMAGE" => Some("env:2".to_string()),
+            _ => None,
+        };
+        let mut c = Config::parse("REAP_ENABLED=0\nREAP_MAX_PER_RUN=1\nIMAGE=base:1");
+        c.apply_overrides(env);
+        assert_eq!(c.get("REAP_ENABLED"), Some("0"), "env must not override the file");
+        assert_eq!(c.get("REAP_MAX_PER_RUN"), Some("1"));
+        assert_eq!(c.get("IMAGE"), Some("env:2"), "other keys still follow the env");
+        let mut c = Config::parse("IMAGE=base:1");
+        c.apply_overrides(env);
+        assert_eq!(c.get("REAP_ENABLED"), None, "env must not introduce it");
+        assert!(Config::is_file_only("REAP_NOTIFY_CMD") && !Config::is_file_only("ARENA_STATE_DIR"));
+        assert!(!Config::ENV_INTRODUCIBLE.iter().any(|k| Config::is_file_only(k)));
     }
 
     #[test]

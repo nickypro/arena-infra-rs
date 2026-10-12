@@ -48,6 +48,15 @@ pub struct Pod {
     /// the JSON unless set.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub proxy_only: bool,
+    /// Whether the provider refuses to DELETE this pod: Hetzner's `protection.delete` (set in
+    /// its console). A terminate fails until it's lifted there. Not a lock ([`Self::locked`]):
+    /// stop and restart still work, so the commands that refuse a locked pod don't read it —
+    /// only the auto-reaper does (`crate::reap::lock_state`: a protected server is never a
+    /// candidate, and nothing here ever lifts the protection). `None` = the backend doesn't
+    /// report one (RunPod, Vast), or the field was missing or odd. Left out of the JSON when
+    /// unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_protected: Option<bool>,
 }
 
 /// A provider-reported maintenance window for the host a pod runs on. Times are kept as
@@ -280,6 +289,7 @@ mod tests {
                 machine_id: None,
                 locked: Some(true),
                 proxy_only: false,
+                delete_protected: None,
             },
             Pod { id: "1".into(), name: "devtest-flutter".into(), provider: "hetzner".into(), ..Default::default() },
         ];
@@ -295,6 +305,12 @@ mod tests {
         // `false`) where it doesn't — "unknown" must never read as "unlocked" to a script.
         assert_eq!(v[0]["locked"], true);
         assert!(v[1].get("locked").is_none(), "{}", v[1]);
+        // Likewise Hetzner's delete protection: absent where unknown, never `false`.
+        assert!(v[0].get("delete_protected").is_none() && v[1].get("delete_protected").is_none());
+        let protected = Pod { delete_protected: Some(true), ..Pod::default() };
+        let v = serde_json::to_value(&protected).unwrap();
+        assert_eq!(v["delete_protected"], true);
+        assert_eq!(serde_json::from_value::<Pod>(v).unwrap(), protected);
     }
 
     /// Finding #10: `ALLOWED_CUDA_VERSIONS` is a floor (its lowest version), `MIN_CUDA_VERSION`

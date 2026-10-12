@@ -408,6 +408,7 @@ fn parse_pod(v: &Value) -> Pod {
         // read from here, never inferred from `actions`, which still lists them.
         locked: v.get("locked").and_then(Value::as_bool),
         proxy_only,
+        delete_protected: None,
     }
 }
 
@@ -1087,6 +1088,7 @@ mod tests {
                 machine_id: None,
                 locked: Some(false),
                 proxy_only: false,
+                delete_protected: None,
             }
         );
     }

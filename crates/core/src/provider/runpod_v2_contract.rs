@@ -102,6 +102,7 @@ fn sandbox_pod(name: &str) -> Pod {
         // Every recording but the lock PATCHes' answers is of the pod unlocked.
         locked: Some(false),
         proxy_only: false,
+        delete_protected: None,
     }
 }
 

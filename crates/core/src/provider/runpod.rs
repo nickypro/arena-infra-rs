@@ -257,6 +257,7 @@ fn parse_pod(v: &Value) -> Pod {
         // REST v1 can't tell a host without a public IP from one still booting; v1 creates
         // ask for a public IP instead (`supportPublicIp`).
         proxy_only: false,
+        delete_protected: None,
     }
 }
 
