@@ -352,12 +352,17 @@ pub fn settle_command(cond: Option<&str>, stamp: &str, rel: Option<&str>, mode: 
          rm -f \"$HOME/{BOOK_DIR}\"/changed-*\n\
          {advance}\
          rmdir \"$h/{KEPT_DIR}\" 2>/dev/null\n\
-         n=0\n\
-         for d in \"$@\"; do [ -d \"$d\" ] && n=$((n + $(find \"$d\" -type f | wc -l))); done\n\
-         echo \"arena-replica-kept=$n\"\n\
+         n=0; g=0\n\
          for d in \"$@\"; do\n\
          \x20 [ -d \"$d\" ] || continue\n\
-         \x20 echo \"arena-replica-dir=$d $(du -sh \"$d\" 2>/dev/null | cut -f1)\"\n\
+         \x20 n=$((n + $(find \"$d\" -type f ! -path '*/.git/*' | wc -l)))\n\
+         \x20 g=$((g + $(find \"$d\" -type f -path '*/.git/*' | wc -l)))\n\
+         done\n\
+         echo \"arena-replica-kept=$n\"\n\
+         echo \"arena-replica-git=$g\"\n\
+         for d in \"$@\"; do\n\
+         \x20 [ -d \"$d\" ] || continue\n\
+         \x20 echo \"arena-replica-dir=$d $(du -sh --exclude=.git \"$d\" 2>/dev/null | cut -f1)\"\n\
          \x20 find \"$d\" -type f ! -path '*/.git/*' | head -n 5 | while IFS= read -r f; do echo \"arena-replica-file=${{f#\"$d\"/}}\"; done\n\
          done\n\
          true\n"
@@ -366,10 +371,15 @@ pub fn settle_command(cond: Option<&str>, stamp: &str, rel: Option<&str>, mode: 
 }
 
 /// What [`settle_command`] reported: files kept, where (`dir size` per folder), and up to
-/// five per folder by name (outside `.git`).
+/// five per folder by name. `kept`, the sizes and the names all leave out what's inside a
+/// `.git` (live BPF S4: "2 file(s) … 124K" over one name — the other, unnamed, was
+/// `.git/index`, which git rewrites whenever it runs, even for a `git status`); those are
+/// counted apart, in `git`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Settled {
     pub kept: u64,
+    /// Files kept from inside a `.git` (git's own bookkeeping: its index, refs, objects).
+    pub git: u64,
     pub dirs: Vec<String>,
     pub files: Vec<String>,
 }
@@ -382,6 +392,8 @@ pub fn parse_settle(stdout: &str) -> Option<Settled> {
         if let Some(n) = line.strip_prefix("arena-replica-kept=") {
             out.kept = n.trim().parse().ok()?;
             seen = true;
+        } else if let Some(n) = line.strip_prefix("arena-replica-git=") {
+            out.git = n.trim().parse().unwrap_or(0);
         } else if let Some(d) = line.strip_prefix("arena-replica-dir=") {
             out.dirs.push(d.trim().to_string());
         } else if let Some(f) = line.strip_prefix("arena-replica-file=") {
@@ -395,20 +407,33 @@ pub fn parse_settle(stdout: &str) -> Option<Settled> {
 /// nothing was kept; else how many files it held that the sync replaced or deleted and that
 /// had changed on it since its last sync — kept, where, and a few by name. After one that
 /// didn't complete ([`SettleMode::Keep`]): that nothing it moved was removed, and where.
+/// What came from inside a `.git` is never counted as work: said apart, after it — or, when
+/// it's all there is, in one quiet line saying where it is.
 pub fn settle_lines(pod: &str, s: &Settled, mode: SettleMode) -> Vec<String> {
     if s.kept == 0 {
-        return Vec::new();
+        return match s.git {
+            0 => Vec::new(),
+            n => vec![format!(
+                "  ({pod}: only git's own bookkeeping had changed there — {n} file(s) from inside .git, e.g. its index, \
+                 which git rewrites whenever it runs; kept in {})",
+                s.dirs.join(", ")
+            )],
+        };
     }
+    let git = match s.git {
+        0 => String::new(),
+        n => format!(" — plus {n} of git's own file(s) from inside .git (its index is rewritten whenever git runs there)"),
+    };
     let mut out = vec![match mode {
         SettleMode::Advance => format!(
             "⚠ {} file(s) on {pod} had changed there since its last sync and were replaced or deleted by this \
-             one — KEPT, moved to: {}",
+             one — KEPT, moved to: {}{git}",
             s.kept,
             s.dirs.join(", ")
         ),
         SettleMode::Keep => format!(
             "⚠ the sync didn't complete, so nothing it replaced or deleted on {pod} was removed: {} file(s) KEPT in {} \
-             (older copies of the original's files among them)",
+             (older copies of the original's files among them){git}",
             s.kept,
             s.dirs.join(", ")
         ),
@@ -559,7 +584,7 @@ mod tests {
     fn settle_prepare_source_and_last_sync_output_parse() {
         let out = "arena-replica-kept=3\narena-replica-dir=/root/arena-sync-kept/S 12K\narena-replica-file=notes.txt\narena-replica-file=ARENA_materials/x.py\n";
         let s = parse_settle(out).unwrap();
-        assert_eq!(s, Settled { kept: 3, dirs: vec!["/root/arena-sync-kept/S 12K".into()], files: vec!["notes.txt".into(), "ARENA_materials/x.py".into()] });
+        assert_eq!(s, Settled { kept: 3, git: 0, dirs: vec!["/root/arena-sync-kept/S 12K".into()], files: vec!["notes.txt".into(), "ARENA_materials/x.py".into()] });
         let lines = settle_lines("devtest-a-new", &s, SettleMode::Advance);
         assert!(lines[0].contains("3 file(s) on devtest-a-new") && lines[0].contains("KEPT") && lines[0].contains("/root/arena-sync-kept/S"), "{lines:?}");
         assert_eq!(lines[1], "    notes.txt");
@@ -568,6 +593,27 @@ mod tests {
         assert!(partial[0].contains("didn't complete") && partial[0].contains("nothing it replaced or deleted") && partial[0].contains("3 file(s) KEPT"), "{partial:?}");
         assert!(settle_lines("p", &Settled::default(), SettleMode::Advance).is_empty());
         assert!(settle_lines("p", &Settled::default(), SettleMode::Keep).is_empty());
+
+        // Live BPF S4: git's own files (its index, after a `git status` there) are counted apart
+        // from the work — never in the headline count, which matches the names under it.
+        let out = "arena-replica-kept=1\narena-replica-git=1\narena-replica-dir=/root/arena-sync-kept/S 4.0K\narena-replica-file=devtest_new_only.txt\n";
+        let s = parse_settle(out).unwrap();
+        assert_eq!((s.kept, s.git, s.files.len()), (1, 1, 1));
+        let lines = settle_lines("devtest-alpha-new", &s, SettleMode::Advance);
+        assert!(
+            lines[0].starts_with("⚠ 1 file(s) on devtest-alpha-new had changed there")
+                && lines[0].contains("KEPT, moved to: /root/arena-sync-kept/S 4.0K — plus 1 of git's own file(s) from inside .git"),
+            "{lines:?}"
+        );
+        assert_eq!(lines[1], "    devtest_new_only.txt");
+        assert!(settle_lines("p", &s, SettleMode::Keep)[0].contains("1 file(s) KEPT") && settle_lines("p", &s, SettleMode::Keep)[0].contains("plus 1 of git's own"));
+        // Only git's files: one quiet line saying where — no ⚠, no work to reconcile.
+        let only_git = Settled { kept: 0, git: 2, dirs: vec!["/root/arena-sync-kept/S 4.0K".into()], files: vec![] };
+        let lines = settle_lines("devtest-alpha-new", &only_git, SettleMode::Advance);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(!lines[0].contains('⚠') && lines[0].contains("2 file(s) from inside .git") && lines[0].contains("/root/arena-sync-kept/S"), "{lines:?}");
+        // An older settle script's output (no git line) still parses.
+        assert_eq!(parse_settle("arena-replica-kept=2\n").unwrap().git, 0);
         assert_eq!(parse_settle("garbage"), None);
         assert_eq!(parse_last_sync("arena-last-sync=1791457323\n"), Some(1_791_457_323));
         assert_eq!(parse_last_sync(""), None);
@@ -738,6 +784,42 @@ mod tests {
         assert!(!dst.join(KEPT_DIR).join("S3").exists());
         assert_eq!(files(&kept).len(), 4, "kept work survives later syncs");
         assert_eq!(std::fs::read_to_string(dst.join("work.py")).unwrap(), "v4\n");
+    }
+
+    /// Live BPF S4 with the real rsync and scripts: a `git status` on the receiver rewrites
+    /// the repo's `.git/index`, the next sync replaces it, and the tidy-up keeps it (it changed
+    /// there) — but the report's count and size are the work's only, matching the names
+    /// listed; git's file is counted apart.
+    #[cfg(unix)]
+    #[test]
+    fn git_bookkeeping_kept_by_a_sync_is_counted_apart_from_the_work() {
+        if !have_rsync() {
+            eprintln!("rsync not installed — skipping");
+            return;
+        }
+        let t = tmp("gitindex");
+        let (src, dst) = (t.0.join("src"), t.0.join("dst"));
+        for f in ["ARENA_materials/.git/index", "ARENA_materials/.git/HEAD", "ARENA_materials/work.py"] {
+            put(&src.join(f), &format!("{f} v1\n"));
+            age(&src.join(f), 200);
+        }
+        std::fs::create_dir_all(&dst).unwrap();
+        assert_eq!(full_sync(&src, &dst, "S1", true), Settled::default());
+        tick();
+        // On the receiver: a `git status` (a new, big index) and a file of the participant's own.
+        put(&dst.join("ARENA_materials/.git/index"), &"i".repeat(300_000));
+        put(&dst.join("devtest_new_only.txt"), "made on the new pod\n");
+        let s = full_sync(&src, &dst, "S2", false);
+
+        assert_eq!((s.kept, s.git), (1, 1), "{s:?}");
+        assert_eq!(s.files, ["devtest_new_only.txt"]);
+        assert_eq!(files(&dst.join(KEPT_DIR).join("S2")), ["ARENA_materials/.git/index", "devtest_new_only.txt"], "nothing destroyed");
+        // The size is the work's: not the 300K index (`du` without `.git`).
+        let size = s.dirs[0].rsplit(' ').next().unwrap();
+        let kib = size.strip_suffix('K').and_then(|n| n.parse::<f64>().ok());
+        assert!(kib.is_some_and(|k| k < 100.0), "{:?}", s.dirs);
+        let lines = settle_lines("devtest-alpha-new", &s, SettleMode::Advance);
+        assert!(lines[0].starts_with("⚠ 1 file(s)") && lines[0].contains("plus 1 of git's own"), "{lines:?}");
     }
 
     /// Review finding (critical): the original reset since the last sync (its home is the

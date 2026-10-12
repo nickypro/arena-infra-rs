@@ -214,6 +214,12 @@ impl PriceBook {
         Self { offers: per_pod.into_iter().map(|(gpu, p)| (gpu, p / n)).collect(), ..Self::default() }
     }
 
+    /// The live catalog's display name for `gpu` (`B300 MIG 34GB` for `NVIDIA B300 SXM6 AC MIG
+    /// 1g.34gb`); `None` without a catalog that lists it with one.
+    pub fn display_name(&self, gpu: &str) -> Option<&str> {
+        self.catalogs.iter().flat_map(|(_, rows)| rows).find(|r| r.id == gpu).map(|r| r.display_name.trim()).filter(|n| !n.is_empty())
+    }
+
     /// The price and stock hint for `gpu` on `cloud` (`None` = a provider without tiers).
     ///
     /// A live row that quotes either tier is trusted as a pair — its `None` tier means "not
@@ -340,8 +346,15 @@ fn stock_rank(stock: Option<&str>) -> u8 {
     }
 }
 
-/// The short GPU name for a label: the preset's, else the provider string minus vendor.
-fn gpu_short(api: &str) -> String {
+/// The short GPU name for a label: the preset's, else the provider string minus vendor. A
+/// MIG slice is named as the live catalog names it (`B300 MIG 34GB`, not its id's `B300 SXM6
+/// AC MIG 1g.34gb`) — the name `pods list` shows for the pod (live BPF S6: `up`'s placement,
+/// `[created]`, READY and summary lines said the id's), when there is a catalog to ask.
+fn gpu_short(api: &str, prices: &PriceBook) -> String {
+    let mig = api.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| w.eq_ignore_ascii_case("mig"));
+    if let Some(name) = prices.display_name(api).filter(|_| mig) {
+        return normalize_gpu_name(name);
+    }
     gpu::find(api).map(|g| g.label.to_string()).unwrap_or_else(|| normalize_gpu_name(api))
 }
 
@@ -385,7 +398,7 @@ pub fn plan_options(req: &Request, provider: &str, prices: &PriceBook) -> Option
             all.push(PlacementOption {
                 listed: all.len(),
                 gpu: g.clone(),
-                label: if cpu_only { "CPU VM".to_string() } else { format!("{}×{}", req.gpu_count, gpu_short(g)) },
+                label: if cpu_only { "CPU VM".to_string() } else { format!("{}×{}", req.gpu_count, gpu_short(g, prices)) },
                 cloud: c.clone(),
                 gpu_count: req.gpu_count,
                 price_per_gpu: q.price_per_gpu,
@@ -1101,6 +1114,30 @@ mod tests {
         let none = req(&[""], &["COMMUNITY"], 1, None, Order::Cheapest);
         assert!(none.validate_for("runpod").unwrap_err().to_string().contains("GPU_TYPE"));
         assert!(none.validate_for("hetzner").is_ok());
+    }
+
+    /// Live BPF S6: a MIG slice's option reads as `pods list` reads the pod — the catalog's
+    /// display name (`1×B300 MIG 34GB`), not its id (`1×B300 SXM6 AC MIG 1g.34gb`). Only MIG
+    /// slices: every other label stays the preset's / the id minus its vendor.
+    #[test]
+    fn a_mig_option_is_labelled_with_the_catalog_name() {
+        const MIG: &str = "NVIDIA B300 SXM6 AC MIG 1g.34gb";
+        let named = |id: &str, name: &str| GpuType { display_name: name.into(), ..live(id, Some(0.5), Some(0.5), None) };
+        let book = PriceBook::runpod(vec![(
+            Some("SECURE".into()),
+            vec![named(MIG, "B300 MIG 34GB"), named("NVIDIA H100 80GB HBM3", "H100 SXM"), named("NVIDIA Mystery 9", "Mystery")],
+        )]);
+        let labels = |book: &PriceBook| -> Vec<String> {
+            let r = req(&[MIG, "NVIDIA H100 80GB HBM3", "NVIDIA Mystery 9"], &["SECURE"], 1, None, Order::Listed);
+            plan_options(&r, "runpod", book).options.iter().map(|o| o.label.clone()).collect()
+        };
+        assert_eq!(labels(&book), ["1×B300 MIG 34GB", "1×H100", "1×Mystery 9"]);
+        assert_eq!(book.display_name(MIG), Some("B300 MIG 34GB"));
+        // No catalog (it couldn't be fetched, or the single-spec path): the id, as before.
+        assert_eq!(labels(&PriceBook::runpod(Vec::new())), ["1×B300 SXM6 AC MIG 1g.34gb", "1×H100", "1×Mystery 9"]);
+        // A catalog row without a name doesn't blank the label.
+        let unnamed = PriceBook::runpod(vec![(None, vec![live(MIG, Some(0.5), Some(0.5), None)])]);
+        assert_eq!(labels(&unnamed)[0], "1×B300 SXM6 AC MIG 1g.34gb");
     }
 
     #[test]

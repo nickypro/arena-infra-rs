@@ -314,6 +314,22 @@ pub fn login_shell_wrap(cmd: &str, conda_env: Option<&str>) -> String {
     format!("zsh -c '{}'", inner.replace('\'', "'\\''"))
 }
 
+/// Whether a [`login_shell_wrap`]ped command failed because the pod has no zsh at all — a
+/// bare VM (Hetzner) before setup installs it: exit 127 with the outer shell's `zsh: command
+/// not found` (bash) or `zsh: not found` (dash). The command itself never ran, so its exit
+/// says nothing about it; a retry finds the same, and setup is the fix. Running it under
+/// bash instead would hide that the participants' own shell is missing (and with it their
+/// conda env and tokens), so the wrap stays zsh-only and the caller says this instead. Pure.
+pub fn login_shell_missing(code: Option<i32>, stderr: &str) -> bool {
+    code == Some(127)
+        && stderr.lines().map(str::trim).any(|l| l.ends_with("zsh: command not found") || l.ends_with("zsh: not found"))
+}
+
+/// What to say when [`login_shell_missing`] on `pod` — short, as it lands in a NOTES cell.
+pub fn login_shell_missing_hint(pod: &str) -> String {
+    format!("no zsh on the pod (setup installs it) — not set up yet? `arena pods setup {pod}`")
+}
+
 /// Strip the harmless startup chatter an interactive shell prints when it has no
 /// controlling TTY (we run `bash -ic` without requesting a PTY). Leaves real output and
 /// errors untouched — only the two fixed job-control lines are removed.
@@ -474,6 +490,26 @@ mod tests {
         assert_eq!(w, r#"zsh -c 'source ~/.zshrc 2>/dev/null; echo hi'"#);
         // Empty string is treated the same as None.
         assert_eq!(login_shell_wrap("echo hi", Some("")), w);
+    }
+
+    /// Live BPF F1/S9: a bare Hetzner VM has no zsh until setup, so every wrapped command
+    /// ends `exit 127: bash: line 1: zsh: command not found`. Only the outer shell's own
+    /// "no zsh" counts — a command zsh couldn't find, or another exit, is the command's.
+    #[test]
+    fn login_shell_missing_only_for_the_outer_shell_finding_no_zsh() {
+        for (code, stderr, missing) in [
+            (Some(127), "bash: line 1: zsh: command not found\n", true),
+            (Some(127), "sh: 1: zsh: not found", true),
+            (Some(127), "Warning: Permanently added '1.2.3.4' (ED25519) to the list of known hosts.\nbash: zsh: command not found", true),
+            (Some(127), "zsh:1: command not found: pytest", false), // zsh ran; the command is missing
+            (Some(1), "bash: line 1: zsh: command not found", false),
+            (None, "bash: line 1: zsh: command not found", false),
+            (Some(127), "", false),
+        ] {
+            assert_eq!(login_shell_missing(code, stderr), missing, "{code:?} {stderr:?}");
+        }
+        let hint = login_shell_missing_hint("devtest-hz2");
+        assert!(hint.contains("no zsh") && hint.contains("`arena pods setup devtest-hz2`"), "{hint}");
     }
 
     #[test]

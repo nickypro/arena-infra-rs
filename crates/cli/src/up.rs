@@ -12,11 +12,15 @@
 //! terminated — and confirmed gone, so a name never has two pods — then its name is
 //! recreated from the confirmed options and the new pod runs the pipeline again; one that
 //! lands on a machine that already failed is rejected the same way (and terminated even with
-//! no attempt left to replace it: it was never set up, and its machine is known bad). Only a
+//! no attempt left to replace it: it was never set up, and its machine is known bad). A host
+//! FAIL on a machine its provider names is also remembered in the health cache for
+//! `snapshot::BAD_HOST_TTL_SECS`, so a later run (or another name's first pod) turns that
+//! machine away before setup; without `--check` it is only warned about. Only a
 //! check whose script actually ran can condemn a host: one that couldn't run (SSH dropped,
 //! timed out) is retried once, then FAILs the name with the pod left running. A FAIL that is
 //! only software/setup (python reporting that torch is missing or doesn't import, a CPU-only
-//! torch) is never replaced — the new pod would boot the same image and fail the same way — so
+//! torch, no zsh to run the check in on a bare VM before setup) is never replaced — the new
+//! pod would boot the same image and fail the same way — so
 //! the name FAILs at once, pod left running, its machine not counted as bad; python dying
 //! before it could report (timeout, OOM, crash) is a host failure. Ctrl+C stops every
 //! pipeline where it is and launches nothing new; nothing is terminated because of it.
@@ -28,7 +32,7 @@
 //! pipelines never write the proxy config at once. The decisions and the final report are
 //! pure, in `arena_core::pipeline`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -40,7 +44,6 @@ use arena_core::fleet;
 use arena_core::health::{self, HealthPolicy, PodHealth, Status, DEEP_CHECK_TIMEOUT};
 use arena_core::pipeline::{self, Attempt, AttemptEnd, Stage, UpRow, Verdict};
 use arena_core::placement::{self, End, OptionPlan, PlacementOption, PriceSource, Progress, Rounds};
-use arena_core::pod::Maintenance;
 use arena_core::provider::{bounded_list, LIST_TIMEOUT};
 use arena_core::proxy::Listing;
 use arena_core::remote::{describe_error, Remote, PROBE_TIMEOUT};
@@ -48,6 +51,7 @@ use arena_core::setup::{
     key_rejected, looks_unreachable, provision, provision_after_key_repair, provisioning_steps, BootRetry, SetupConfig,
     SetupTimeouts,
 };
+use arena_core::snapshot::{self, BadHost};
 use arena_core::ssh::SshTarget;
 use arena_core::{Config, Pod, PodSpec, Provider};
 use tokio::sync::watch;
@@ -170,8 +174,10 @@ pub(crate) fn pipeline_text(setup: bool, check: Option<u32>, keys: bool, lock: b
     if let Some(n) = check {
         steps.push(format!(
             "deep-check it — a pod that FAILs on its host is TERMINATED and its name recreated (up to {n} \
-             placement(s) per name; options that haven't failed first; never on a machine IP that already \
-             failed); a software/setup FAIL (e.g. torch missing) is left running, not replaced"
+             placement(s) per name; options that haven't failed first; never on a machine that already \
+             failed — this run, or an `up --check` in the last {}h); a software/setup FAIL (e.g. torch \
+             missing) is left running, not replaced",
+            snapshot::BAD_HOST_TTL_SECS / 3600
         ));
     }
     if setup && keys {
@@ -240,6 +246,10 @@ struct Shared<'r, 'a> {
     /// Machines ([`health::host_key`]) that failed the deep check this run (any name's: a bad
     /// host breaks every pod on it).
     failed_hosts: Mutex<Vec<String>>,
+    /// Machines remembered as bad ([`health::machine_key`] → when and why): an earlier `up
+    /// --check`'s host failures still within their TTL (read once, at the start), plus this
+    /// run's. Unlike `failed_hosts` it turns a pod away on ANY attempt, the first included.
+    known_bad: Mutex<BTreeMap<String, BadHost>>,
     /// The provider's pod details for the deep checks, and when they were fetched.
     details: tokio::sync::Mutex<Option<(Instant, Vec<Pod>)>>,
 }
@@ -277,6 +287,10 @@ where
 {
     let (stop_tx, stop) = watch::channel(false);
     let (listing, _) = watch::channel(Arc::new(Vec::new()));
+    let (known_bad, warning) = remembered_bad_hosts(run.cfg, snapshot::unix_now());
+    if let Some(w) = warning {
+        say(To::Err, &format!("{w} — no machine is remembered as bad this run"));
+    }
     let shared = Shared {
         run,
         say,
@@ -286,6 +300,7 @@ where
         waiter_added: tokio::sync::Notify::new(),
         proxy_gate: tokio::sync::Mutex::new(()),
         failed_hosts: Mutex::new(Vec::new()),
+        known_bad: Mutex::new(known_bad),
         details: tokio::sync::Mutex::new(None),
     };
     let shared = &shared;
@@ -585,6 +600,33 @@ impl Shared<'_, '_> {
             return self.replace(run, &pod, failed_options, why, Stage::Check).await;
         }
 
+        // A machine remembered as bad — an `up --check` failed on it, earlier (within its TTL)
+        // or in this run: on ANY attempt (live BPF S2: one broken host got 11 pods across runs,
+        // each set up and checked before it was turned away). Under --check, rejected unseen
+        // like the replacement above; without it nothing here terminates a pod nobody asked to
+        // have checked — it is only said.
+        let known = health::machine_key(&pod).and_then(|k| self.known_bad.lock().unwrap().get(&k).map(|b| (k, b.clone())));
+        if let Some((machine, bad)) = known {
+            let when = bad.describe(snapshot::unix_now());
+            if self.run.check.is_none() {
+                say(
+                    To::Err,
+                    &format!(
+                        "[{name}] ⚠ landed on {machine}, which failed the deep check {when} — kept: without --check \
+                         nothing is checked or replaced (`arena pods test --deep {name}`)"
+                    ),
+                );
+            } else {
+                if let Some(a) = run.attempts.last_mut() {
+                    a.end = AttemptEnd::KnownBad(when.clone());
+                }
+                failed_options.push(option);
+                say(To::Err, &format!("[{name}] landed on {machine}, which failed the deep check {when} — rejecting it"));
+                let why = format!("attempt {n} landed on {machine}, which failed the deep check {when}");
+                return self.replace(run, &pod, failed_options, why, Stage::Check).await;
+            }
+        }
+
         // 2. The proxy (one writer at a time; a failed sync is reported, never fatal).
         if self.run.proxy.is_ok() {
             self.sync_proxy_for(run).await;
@@ -668,8 +710,10 @@ impl Shared<'_, '_> {
             // dropped, or the call timed out, moments after setup reached this very pod —
             // says nothing about the machine ("confirm before alarming"): once SSH answers
             // again it's run once more, and if that can't run either the name FAILs with the
-            // pod left running for a look.
-            if !script_ran(&h) {
+            // pod left running for a look. A script that never started although SSH worked (no
+            // zsh on a bare VM before setup, no `base64`) is no dropped session: the pod's
+            // software, the same on a retry — judged below as software/setup.
+            if !script_ran(&h) && !never_started(&h) {
                 say(To::Err, &format!("[{name}] check: couldn't run it ({}) — once more when SSH answers", h.notes()));
                 match self.or_stop(self.ssh_answers(&target, BootRetry::default())).await {
                     None => return self.end(run, Verdict::Stopped { stage: Stage::Check }),
@@ -716,6 +760,9 @@ impl Shared<'_, '_> {
                     if let Some(ip) = &host {
                         self.failed_hosts.lock().unwrap().push(ip.clone());
                     }
+                    if let Some(h) = &run.health {
+                        self.remember_bad_host(&name, &pod, h);
+                    }
                     failed_options.push(option);
                     if let Some(a) = run.attempts.last_mut() {
                         a.end = AttemptEnd::CheckFailed(notes.clone());
@@ -761,6 +808,21 @@ impl Shared<'_, '_> {
 
         run.ready_at = Some(Instant::now());
         self.end(run, Verdict::Ready)
+    }
+
+    /// Remember `pod`'s machine as bad after its check `h` FAILed — for the rest of this run
+    /// (every name's next pod, first attempts included) and, in the health cache, for the next
+    /// runs — when [`snapshot::bad_host_record`] says the verdict may condemn it (a host FAIL,
+    /// on a machine its provider names). Saving is best effort: a warning, never a failure.
+    fn remember_bad_host(&self, name: &str, pod: &Pod, h: &PodHealth) {
+        let now = snapshot::unix_now();
+        let Some((key, bad)) = snapshot::bad_host_record(pod, h, now) else {
+            return;
+        };
+        self.known_bad.lock().unwrap().insert(key.clone(), bad.clone());
+        if let Some(w) = save_bad_host(self.run.cfg, &key, &bad, now) {
+            (self.say)(To::Err, &format!("[{name}] {w}"));
+        }
     }
 
     /// Settle a name: print its READY / FAILED / STOPPED line now — the moment it's known —
@@ -814,7 +876,7 @@ impl Shared<'_, '_> {
         let name = run.name.clone();
         let max = self.run.check.as_ref().map_or(1, |c| c.attempts) as usize;
         let n = run.attempts.len();
-        let rejected = run.attempts.last().is_some_and(|a| a.end == AttemptEnd::SameHost);
+        let rejected = run.attempts.last().is_some_and(|a| matches!(a.end, AttemptEnd::SameHost | AttemptEnd::KnownBad(_)));
         let last = n >= max;
         if last && !rejected {
             let reason = format!("{why} — no attempts left (--check-attempts {max}); left running");
@@ -1073,17 +1135,24 @@ impl Shared<'_, '_> {
     }
 
     /// The deep check on one pod (one bounded exec, judged as `pods test --deep` judges it),
-    /// with the provider's maintenance window looked up alongside.
+    /// with the provider's best-effort details looked up alongside ([`Self::details_of`]):
+    /// the host's maintenance window, and the GPU's display name — so a MIG slice is labelled
+    /// as `pods list` labels it (`B300 MIG 34GB`), not by the catalog id REST v2 lists (live
+    /// BPF S6). Never fails a check: no details, no window, the listed name.
     async fn deep_check(&self, name: &str, pod: &Pod, target: &SshTarget, check: &CheckStage) -> PodHealth {
         let call = self.run.remote.exec(target, &check.cmd, Some(DEEP_CHECK_TIMEOUT));
-        let (maintenance, call) = tokio::join!(self.maintenance_of(name, pod), call);
-        let pod = Pod { maintenance, ..pod.clone() };
+        let (details, call) = tokio::join!(self.details_of(name, pod), call);
+        let pod = Pod {
+            maintenance: details.as_ref().and_then(|d| d.maintenance.clone()),
+            gpu_type: details.and_then(|d| d.gpu_type).or_else(|| pod.gpu_type.clone()),
+            ..pod.clone()
+        };
         judge_deep_call(&pod, call.map_err(|e| describe_error(&e)), &check.policy)
     }
 
     /// `pod` with the machine id from the provider's best-effort details when its listing
     /// has none (RunPod: REST v2 reports no machine; GraphQL's `machineId` does). Shares the
-    /// details fetch with [`Self::maintenance_of`]. Without details it stays as it was — and
+    /// details fetch with [`Self::deep_check`]. Without details it stays as it was — and
     /// the same-host check falls back to the IP, as before.
     async fn with_machine(&self, name: &str, pod: Pod) -> Pod {
         if pod.machine_id.is_some() || pod.provider != "runpod" {
@@ -1091,12 +1160,6 @@ impl Shared<'_, '_> {
         }
         let machine_id = self.details_of(name, &pod).await.and_then(|p| p.machine_id);
         Pod { machine_id, ..pod }
-    }
-
-    /// `pod`'s host maintenance window, from the provider's best-effort details ([`Self::details_of`]).
-    /// Never fails a check: no details, no window.
-    async fn maintenance_of(&self, name: &str, pod: &Pod) -> Option<Maintenance> {
-        self.details_of(name, pod).await.and_then(|p| p.maintenance)
     }
 
     /// `pod` as the provider's best-effort details have it: one fetch for the whole listing,
@@ -1281,6 +1344,40 @@ fn script_ran(h: &PodHealth) -> bool {
     h.facts.as_ref().is_some_and(|f| f.started && f.complete)
 }
 
+/// The machines an earlier `up --check` found bad and still remembered at `now`, from this
+/// fleet's health cache (`MACHINE_NAME_PREFIX`-scoped, like the verdicts beside them) — plus
+/// a warning when the cache couldn't be read: then none are. A cache that can't be read only
+/// costs the memory, never a create.
+fn remembered_bad_hosts(cfg: &Config, now: u64) -> (BTreeMap<String, BadHost>, Option<String>) {
+    match super::health_cache_path(cfg) {
+        None => (BTreeMap::new(), None),
+        Some(Err(e)) => (BTreeMap::new(), Some(format!("warning: no health cache to remember bad machines in: {e}"))),
+        Some(Ok(path)) => {
+            let (cache, warning) = snapshot::HealthCache::load(&path);
+            (cache.live_bad_hosts(now), warning)
+        }
+    }
+}
+
+/// Save a machine found bad to the health cache ([`snapshot::record_bad_host`]); a warning
+/// line when that didn't work, or when the old file had to be ignored.
+fn save_bad_host(cfg: &Config, key: &str, bad: &BadHost, now: u64) -> Option<String> {
+    let path = match super::health_cache_path(cfg)? {
+        Ok(p) => p,
+        Err(e) => return Some(format!("warning: {key} not remembered as bad for later runs: {e}")),
+    };
+    match snapshot::record_bad_host(&path, key, bad, now) {
+        Ok(warning) => warning,
+        Err(e) => Some(format!("warning: {key} not remembered as bad for later runs ({}: {e})", path.display())),
+    }
+}
+
+/// Whether SSH worked but the check script never started ([`health::judge_deep_call`] keeps
+/// facts only when the session did): the pod lacks what runs it — zsh before setup, `base64`.
+fn never_started(h: &PodHealth) -> bool {
+    h.facts.as_ref().is_some_and(|f| !f.started)
+}
+
 /// The pipelines end to end over a scripted fleet (`Fleet`) and `FakeRemote`, on a paused
 /// clock: every endpoint delay, budget and poll interval elapses instantly and exactly, so
 /// "A was READY before B's endpoint existed" is a statement about tokio time.
@@ -1336,6 +1433,9 @@ mod tests {
         /// RunPod-like machine ids, by SSH port: the listing (REST v2) has none, the details
         /// (`enrich`, GraphQL `machineId`) fill them in.
         details_machines: Mutex<HashMap<u16, String>>,
+        /// RunPod-like GPU display names, by SSH port: the details (GraphQL `gpuDisplayName`)
+        /// name the GPU the listing gives by its catalog id (REST v2).
+        details_gpus: Mutex<HashMap<u16, String>>,
         /// Answers `lock_support` (RunPod v2 can lock); off, it's the default refusal.
         lockable: bool,
         /// A terminate is followed at once by another pod under the same name (`twin`, never
@@ -1449,9 +1549,13 @@ mod tests {
         async fn enrich(&self, pods: &mut [Pod]) -> CoreResult<()> {
             self.enriched.fetch_add(1, Ordering::SeqCst);
             let machines = self.details_machines.lock().unwrap().clone();
+            let gpus = self.details_gpus.lock().unwrap().clone();
             for p in pods.iter_mut().filter(|p| p.provider == "runpod") {
                 if let Some(m) = p.ssh_port.and_then(|port| machines.get(&port)) {
                     p.machine_id = Some(m.clone());
+                }
+                if let Some(g) = p.ssh_port.and_then(|port| gpus.get(&port)) {
+                    p.gpu_type = Some(g.clone());
                 }
             }
             for p in pods.iter_mut().filter(|p| p.name == "devtest-cloud") {
@@ -2067,6 +2171,190 @@ mod tests {
         lines.find("[devtest-apple] landed on runpod machine m1, a machine that already failed the deep check — rejecting it");
         assert!(fake.calls_to(&host("10.0.0.9", 22009)).is_empty(), "the rejected pod is never set up or checked");
         assert_eq!(rows[0].verdict, Verdict::Ready);
+    }
+
+    /// Live BPF S6: `up`'s summary called a B300 MIG slice `1×B300 SXM6 AC MIG 1g.34gb` (REST
+    /// v2 lists the catalog id) where `pods list` says `1×B300 MIG 34GB` (the details' display
+    /// name). The check now labels the slice by the details' name too.
+    #[tokio::test(start_paused = true)]
+    async fn a_mig_slice_is_labelled_in_the_summary_as_pods_list_labels_it() {
+        const MIG: &str = "NVIDIA B300 SXM6 AC MIG 1g.34gb";
+        let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 0)])]);
+        fleet.details_gpus.lock().unwrap().insert(22001, "B300 MIG 34GB".into());
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host("10.0.0.1", 22001), [FakeReply::ok(), FakeReply::ok(), healthy()]);
+        let cfg = cfg(None);
+        let run = up_run(&fleet, fake.clone(), &cfg, true, Some(2), None).await;
+        let spec = PodSpec { name: "devtest-apple".into(), gpu_type: MIG.into(), ..PodSpec::from_config(&cfg) };
+        let pod = fleet.create_pod(&spec).await.unwrap();
+        let made = vec![Made { pod, at: Instant::now(), option: Some(0) }];
+        let rows = run_up(&run, made, std::future::pending(), &|_, _| {}).await;
+        assert_eq!(rows[0].verdict, Verdict::Ready);
+        // (The scripted check sees two devices.)
+        assert_eq!(rows[0].gpu, "2×B300 MIG 34GB");
+    }
+
+    /// A state dir for the health cache, `cfg` pointed at it, and the cache's path.
+    fn with_state(tag: &str, cfg: &mut Config) -> (TmpDir, PathBuf) {
+        let state = tmp_dir(tag);
+        cfg.values.insert("ARENA_STATE_DIR".into(), state.0.display().to_string());
+        let path = state.0.join("devtest").join("health.json");
+        (state, path)
+    }
+
+    /// Seed the health cache: machine `m` failed the deep check `ago` seconds before now.
+    fn remember(path: &Path, m: &str, ago: u64) {
+        let bad = BadHost {
+            failed_at: snapshot::unix_now() - ago,
+            pod: "devtest-bravo".into(),
+            reason: "cuda: RuntimeError: CUDA unknown error".into(),
+        };
+        snapshot::record_bad_host(path, &format!("runpod machine {m}"), &bad, snapshot::unix_now()).unwrap();
+    }
+
+    /// Item 13 (live BPF S2): a machine an earlier `up --check` failed on its host (RunPod
+    /// `ue6mmk7dp8qi`: 11 pods across runs, each set up and checked first) is turned away on
+    /// the FIRST attempt too — before setup, through the same replace path as a replacement on
+    /// a failed machine — saying when and why it was found bad.
+    #[tokio::test(start_paused = true)]
+    async fn a_machine_remembered_as_bad_is_rejected_on_the_first_attempt_before_setup() {
+        let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 0), ("10.0.0.2", 22002, 0)])]);
+        fleet.details_machines.lock().unwrap().extend([(22001, "mbad".to_string()), (22002, "mgood".to_string())]);
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host("10.0.0.2", 22002), [FakeReply::ok(), FakeReply::ok(), healthy()]);
+        let mut cfg = cfg(None);
+        let (_state, path) = with_state("known-bad", &mut cfg);
+        remember(&path, "mbad", 5 * 3600);
+        let run = up_run(&fleet, fake.clone(), &cfg, true, Some(2), None).await;
+        let made = make(&fleet, &["apple"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+
+        assert_eq!(
+            fleet.events(),
+            [format!("create devtest-apple {A4000}"), "terminate id1".to_string(), format!("create devtest-apple {R3090}")]
+        );
+        assert!(fake.calls_to(&host("10.0.0.1", 22001)).is_empty(), "the rejected pod is never set up or checked");
+        lines.find(
+            "[devtest-apple] landed on runpod machine mbad, which failed the deep check 5h ago (20", // …the UTC time
+        );
+        let line = lines.all().into_iter().find(|l| l.contains("landed on runpod machine mbad")).unwrap();
+        assert!(line.ends_with(", devtest-bravo: cuda: RuntimeError: CUDA unknown error) — rejecting it"), "{line}");
+        let row = &rows[0];
+        assert_eq!(row.verdict, Verdict::Ready, "{:#?}", lines.all());
+        let ends: Vec<(AttemptEnd, bool)> = row.attempts.iter().map(|a| (a.end.clone(), a.terminated)).collect();
+        assert!(matches!(&ends[..], [(AttemptEnd::KnownBad(w), true), (AttemptEnd::Kept, false)] if w.starts_with("5h ago")), "{ends:?}");
+        assert!(pipeline::render_up_summary(&rows).contains("on a machine that failed a deep check 5h ago"));
+
+        // With one attempt only, it's still terminated (never set up; its machine known bad):
+        // like a replacement rejected on its last attempt.
+        let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 0)])]);
+        fleet.details_machines.lock().unwrap().insert(22001, "mbad".into());
+        let fake = Arc::new(FakeRemote::new());
+        let run = up_run(&fleet, fake.clone(), &cfg, true, Some(1), None).await;
+        let made = make(&fleet, &["apple"]).await;
+        let rows = run_up(&run, made, std::future::pending(), &|_, _| {}).await;
+        assert_eq!(fleet.events(), [format!("create devtest-apple {A4000}"), "terminate id1".to_string()]);
+        match &rows[0].verdict {
+            Verdict::Failed { stage: Stage::Check, reason } => assert!(
+                reason.starts_with("attempt 1 landed on runpod machine mbad, which failed the deep check 5h ago")
+                    && reason.contains("terminated it — devtest-apple has no pod now"),
+                "{reason}"
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Without --check the remembered machine is only said: nothing terminates a pod nobody
+    /// asked to have checked (as a replacement — which only --check makes — is the only pod
+    /// today's in-run rejection ever turns away). Expired, it isn't even said; a cache that
+    /// can't be read is a warning and remembers nothing — never a reason to fail a create.
+    #[tokio::test(start_paused = true)]
+    async fn without_check_a_remembered_machine_is_a_warning_and_expired_or_unreadable_ones_are_nothing() {
+        let run_one = |cfg: Config, check: Option<u32>| async move {
+            let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 0)])]);
+            fleet.details_machines.lock().unwrap().insert(22001, "mbad".into());
+            let fake = Arc::new(FakeRemote::new());
+            fake.script(&host("10.0.0.1", 22001), [FakeReply::ok(), FakeReply::ok(), healthy()]);
+            let run = up_run(&fleet, fake.clone(), &cfg, true, check, None).await;
+            let made = make(&fleet, &["apple"]).await;
+            let lines = Lines::new();
+            let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+            (fleet.events(), rows[0].verdict.clone(), lines.all())
+        };
+        let mut cfg = cfg(None);
+        let (_state, path) = with_state("known-bad-nocheck", &mut cfg);
+        remember(&path, "mbad", 3600);
+        let (events, verdict, lines) = run_one(cfg.clone(), None).await;
+        assert_eq!(events, [format!("create devtest-apple {A4000}")], "nothing terminated");
+        assert_eq!(verdict, Verdict::Ready);
+        let warned: Vec<&String> = lines.iter().filter(|l| l.contains("landed on runpod machine mbad")).collect();
+        assert!(
+            matches!(&warned[..], [l] if l.starts_with("[devtest-apple] ⚠ landed on runpod machine mbad, which failed the deep check 1h ago")
+                && l.ends_with("— kept: without --check nothing is checked or replaced (`arena pods test --deep devtest-apple`)")),
+            "{lines:#?}"
+        );
+
+        // Expired (past the TTL): forgotten — checked and READY on that machine, under --check.
+        std::fs::remove_file(&path).unwrap();
+        remember(&path, "mbad", snapshot::BAD_HOST_TTL_SECS + 60);
+        let (events, verdict, lines) = run_one(cfg.clone(), Some(2)).await;
+        assert_eq!((events.len(), verdict), (1, Verdict::Ready), "{lines:#?}");
+        assert!(!lines.iter().any(|l| l.contains("mbad")), "{lines:#?}");
+
+        // Corrupt: one warning, nothing remembered, the run goes on.
+        std::fs::write(&path, "{not json").unwrap();
+        let (events, verdict, lines) = run_one(cfg, Some(2)).await;
+        assert_eq!((events.len(), verdict), (1, Verdict::Ready), "{lines:#?}");
+        assert!(
+            lines[0].starts_with("warning: ignoring the health cache") && lines[0].ends_with("— no machine is remembered as bad this run"),
+            "{lines:#?}"
+        );
+    }
+
+    /// A host FAIL is remembered at once — for the rest of the run (another name's FIRST pod
+    /// on that machine is turned away; it used to be set up and checked) and in the health
+    /// cache for the next runs, by machine id with when/why. A FAIL on a machine only an IP
+    /// names is never written down (IPs are shared, or reassigned).
+    #[tokio::test(start_paused = true)]
+    async fn a_host_fail_is_remembered_for_this_run_and_the_next() {
+        let fleet = Fleet::new(&[
+            ("apple", &[("10.0.0.1", 22001, 0), ("10.0.0.2", 22002, 0)]),
+            // bloom's first pod lands on apple's bad machine, after apple's check.
+            ("bloom", &[("10.0.0.1", 22003, 120), ("10.0.0.4", 22004, 0)]),
+            // cloud fails on a machine nothing but its IP names.
+            ("cloud", &[("10.0.0.5", 22005, 0), ("10.0.0.6", 22006, 0)]),
+        ]);
+        fleet.details_machines.lock().unwrap().extend(
+            [(22001, "mbad"), (22002, "m2"), (22003, "mbad"), (22004, "m4")].map(|(p, m)| (p, m.to_string())),
+        );
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host("10.0.0.1", 22001), [FakeReply::ok(), FakeReply::ok(), bad_host()]);
+        fake.script(&host("10.0.0.5", 22005), [FakeReply::ok(), FakeReply::ok(), bad_host()]);
+        for (ip, port) in [("10.0.0.2", 22002), ("10.0.0.4", 22004), ("10.0.0.6", 22006)] {
+            fake.script(&host(ip, port), [FakeReply::ok(), FakeReply::ok(), healthy()]);
+        }
+        let mut cfg = cfg(None);
+        let (_state, path) = with_state("remembers", &mut cfg);
+        let run = up_run(&fleet, fake.clone(), &cfg, true, Some(2), None).await;
+        let made = make(&fleet, &["apple", "bloom", "cloud"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+
+        assert!(rows.iter().all(|r| r.verdict == Verdict::Ready), "{:#?}", lines.all());
+        let (i, _) = lines.find("[devtest-bloom] landed on runpod machine mbad, which failed the deep check ");
+        assert!(lines.all()[i].contains(", devtest-apple: cuda: ") && lines.all()[i].ends_with("— rejecting it"), "{:#?}", lines.all());
+        assert!(fake.calls_to(&host("10.0.0.1", 22003)).is_empty(), "bloom's pod on the bad machine is never set up");
+        assert!(matches!(rows[1].attempts[0].end, AttemptEnd::KnownBad(_)), "{:?}", rows[1].attempts);
+
+        let (cache, warning) = snapshot::HealthCache::load(&path);
+        assert_eq!(warning, None);
+        let keys: Vec<&str> = cache.bad_hosts.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["runpod machine mbad"], "cloud's IP-only machine isn't remembered: {cache:#?}");
+        let bad = &cache.bad_hosts["runpod machine mbad"];
+        assert_eq!(bad.pod, "devtest-apple");
+        assert!(bad.reason.starts_with("cuda: ") && bad.live(snapshot::unix_now()), "{bad:?}");
+        assert_eq!(cache.pods.len(), 3, "the standing pods' verdicts are kept beside it");
     }
 
     /// Live (wave 6): community hosts came up RUNNING with a runtime but no direct SSH — only
@@ -2732,6 +3020,36 @@ mod tests {
         assert!(matches!(&apple[3], RemoteCall::Exec { cmd, .. } if cmd == "true"), "{apple:?}");
     }
 
+    /// Live BPF F1: `up hz2 --check --no-setup` on a bare Hetzner VM — no zsh until setup —
+    /// ended "FAILED check: couldn't run the deep check twice (ssh: exit 127: … zsh: command
+    /// not found)". That's the pod's software: a software/setup FAIL at once (no rerun, no
+    /// replacement, its machine not counted as bad), saying to run setup.
+    #[tokio::test(start_paused = true)]
+    async fn no_zsh_before_setup_is_a_software_failure_not_a_check_that_could_not_run() {
+        let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 0)])]);
+        let fake = Arc::new(FakeRemote::new());
+        let no_zsh = || FakeReply::exit(127, "bash: line 1: zsh: command not found");
+        fake.script(&host("10.0.0.1", 22001), [FakeReply::ok(), no_zsh(), no_zsh()]);
+        let cfg = cfg(None);
+        let run = up_run(&fleet, fake.clone(), &cfg, false, Some(2), None).await;
+        let made = make(&fleet, &["apple"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+
+        assert_eq!(fleet.events(), [format!("create devtest-apple {A4000}")], "never replaced");
+        lines.find("[devtest-apple] check: FAIL (software/setup, not the host) — script: no zsh on the pod");
+        match &rows[0].verdict {
+            Verdict::Failed { stage: Stage::Check, reason } => assert!(
+                reason.starts_with("software/setup failure, not the host") && reason.contains("`arena pods setup devtest-apple`"),
+                "{reason}"
+            ),
+            other => panic!("expected FAILED check, got {other:?}"),
+        }
+        assert!(!lines.all().iter().any(|l| l.contains("couldn't run")), "{:#?}", lines.all());
+        // One probe, one check: no rerun of a check that can't start until setup has run.
+        assert_eq!(execs_with(&fake, &host("10.0.0.1", 22001), "arena-deep-check"), 1);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_replacement_waits_until_the_owning_provider_lists_the_old_pod_gone() {
         // A two-backend fleet: right after the terminate RunPod's listing fails for 60s while
@@ -2960,8 +3278,9 @@ mod tests {
             pipeline_text(true, Some(2), true, false),
             "per pod, as soon as it can: wait for its SSH endpoint, sync the proxy (if nginx is set up), provision it, \
              deep-check it — a pod that FAILs on its host is TERMINATED and its name recreated (up to 2 placement(s) \
-             per name; options that haven't failed first; never on a machine IP that already failed); a software/setup \
-             FAIL (e.g. torch missing) is left running, not replaced, copy its API keys — then READY/FAILED per pod"
+             per name; options that haven't failed first; never on a machine that already failed — this run, or an \
+             `up --check` in the last 72h); a software/setup FAIL (e.g. torch missing) is left running, not replaced, \
+             copy its API keys — then READY/FAILED per pod"
         );
         assert_eq!(
             pipeline_text(false, None, true, false),

@@ -95,6 +95,10 @@ pub enum AttemptEnd {
     /// A replacement that landed on a machine IP that had already failed the deep check:
     /// rejected before it was set up or checked.
     SameHost,
+    /// Landed on a machine remembered as bad — one an `up --check` failed on its host, in an
+    /// earlier run (within `snapshot::BAD_HOST_TTL_SECS`) or this one: rejected before it was
+    /// set up or checked, on any attempt. Carries when and why it was found bad.
+    KnownBad(String),
     /// Up, but reachable only through RunPod's SSH proxy for the grace period — a host with no
     /// public IP: a host failure, like a failed check.
     NoPublicIp,
@@ -184,6 +188,7 @@ fn attempt_line(n: usize, a: &Attempt, verdict: &Verdict) -> String {
     let what = match &a.end {
         AttemptEnd::CheckFailed(notes) => format!("check FAIL — {notes}{fate}"),
         AttemptEnd::SameHost => format!("same host as a failed check — rejected{fate}"),
+        AttemptEnd::KnownBad(when) => format!("on a machine that failed a deep check {when} — rejected{fate}"),
         AttemptEnd::NoPublicIp => format!("no public SSH endpoint (RunPod ssh proxy only){fate}"),
         AttemptEnd::Kept => match verdict {
             Verdict::Ready => "ready".to_string(),
@@ -411,6 +416,29 @@ devtest-echo: stopped at endpoint (Ctrl+C) — left as it was
 ";
         let got = render_up_summary(&rows);
         assert_eq!(got, want, "\n--- got ---\n{got}");
+    }
+
+    /// Item 13: a first attempt turned away for a machine remembered as bad is explained in
+    /// the summary — when and why it was found bad — like any rejected placement.
+    #[test]
+    fn a_machine_remembered_as_bad_is_explained_in_the_summary() {
+        let when = "3h ago (2026-10-11T20:13:05Z, devtest-bravo: cuda: CUDA unknown error)";
+        let rows = vec![row(
+            "devtest-apple",
+            Verdict::Ready,
+            vec![
+                attempt("1×RTX 3070 COMMUNITY", "id1", Some("runpod machine ue6mmk7dp8qi"), AttemptEnd::KnownBad(when.into()), true),
+                attempt("1×RTX A4000 COMMUNITY", "id2", Some("runpod machine m8x2k"), AttemptEnd::Kept, false),
+            ],
+        )];
+        let got = render_up_summary(&rows);
+        assert!(
+            got.contains(&format!(
+                "devtest-apple: #1 1×RTX 3070 COMMUNITY (id1, runpod machine ue6mmk7dp8qi): on a machine that failed a deep \
+                 check {when} — rejected; terminated → #2 1×RTX A4000 COMMUNITY (id2, runpod machine m8x2k): ready\n"
+            )),
+            "{got}"
+        );
     }
 
     #[test]

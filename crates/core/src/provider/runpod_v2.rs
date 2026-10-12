@@ -12,6 +12,12 @@
 //! - **SSH comes from `ssh.direct` only.** `ssh.proxy` (RunPod's SSH gateway) carries an
 //!   interactive shell only — no scp/rsync/port-forwarding, which setup/backup/pull and the
 //!   nginx stream proxy all need — so it is never reported as the pod's endpoint.
+//! - **No public-IP request.** v1's create takes `supportPublicIp: true`; v2's
+//!   `CreatePodRequest` has no such field (nor any network option for it — checked against
+//!   its OpenAPI document 2026-10-11), and its schema refuses unknown keys. So a COMMUNITY pod
+//!   can land on a host with no public IP (`ssh.direct: null`, proxy only — live, twice):
+//!   `up` treats one that stays so past its grace as a host failure (`NO_PUBLIC_IP_GRACE`,
+//!   replaced under `--check`).
 //! - **Create defaults to the SECURE cloud** when `cloud` is omitted (silently ~doubling the
 //!   bill), so `cloud` is always sent and an unknown tier is refused before any request.
 //! - **`startSsh` injects the account's registered SSH keys into `PUBLIC_KEY` only when the

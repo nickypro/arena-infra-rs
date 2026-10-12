@@ -141,7 +141,9 @@ flowchart TD
    per `--interval`; 5 minutes up behind RunPod's SSH proxy only is a host failure) → proxy sync (`proxy::plan_forwards` under a mutex and a file lock;
    write; `SSH_PROXY_RELOAD_CMD`) → `setup::provision` over `Remote` → the deep check over
    `Remote` (`--check`; a FAIL terminates the pod, confirms it gone and recreates the
-   name, rejecting a machine — by provider machine id, else IP — that already failed) →
+   name, rejecting a machine — by provider machine id, else IP — that already failed; a
+   host FAIL on a named machine is remembered 72 h in the health cache, turning it away on
+   any attempt of any later run too) →
    API keys → `[apple] READY after …`.
 10. Verdicts go to the health cache, the proxy is synced once more, and
     `pipeline::render_up_summary` prints the table; the exit is non-zero unless every

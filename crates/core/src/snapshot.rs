@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::fleet::{self, clip, FleetCost};
-use crate::health::{Check, PodHealth, Status};
+use crate::health::{failure_kind_of, Check, FailureKind, PodHealth, Status};
 use crate::naming::{is_absolute, qualify};
 use crate::pod::Pod;
 use crate::proxy::{parse_nginx, Listing, ListingStatus};
@@ -220,6 +220,65 @@ pub const HEALTH_CACHE_VERSION: u32 = 1;
 pub struct HealthCache {
     pub version: u32,
     pub pods: BTreeMap<String, HealthRecord>,
+    /// Machines `up --check` found bad, by [`crate::health::machine_key`] ([`bad_host_record`]
+    /// says which failures count). Not pruned by a listing — the pod is gone, the machine
+    /// isn't — but by age ([`BAD_HOST_TTL_SECS`]). Additive (an older binary ignores it).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub bad_hosts: BTreeMap<String, BadHost>,
+}
+
+/// How long `up` remembers a machine that failed its deep check on the host: long enough to
+/// span the next few `up`s (live BPF: one broken RunPod 3070 host received 11 pods across
+/// runs, each set up and checked before it was turned away), short enough that a machine its
+/// provider has since repaired comes back on its own. Expiry is the only way to forget one.
+pub const BAD_HOST_TTL_SECS: u64 = 72 * 3600;
+
+/// A machine remembered as bad: when, on which pod, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BadHost {
+    /// When its check failed (Unix seconds); forgotten [`BAD_HOST_TTL_SECS`] later.
+    pub failed_at: u64,
+    /// The pod that failed there (`devtest-apple`).
+    pub pod: String,
+    /// Its failed host checks (`cuda: CUDA unknown error`), clipped.
+    pub reason: String,
+}
+
+impl BadHost {
+    /// Still remembered at `now`. A record from the future (an edited file, a clock set back)
+    /// is not: it would never expire.
+    pub fn live(&self, now: u64) -> bool {
+        now.checked_sub(self.failed_at).is_some_and(|age| age < BAD_HOST_TTL_SECS)
+    }
+
+    /// `3h ago (2026-10-11T20:13:05Z, devtest-apple: cuda: CUDA unknown error)`.
+    pub fn describe(&self, now: u64) -> String {
+        format!("{} ago ({}, {}: {})", fmt_age(now.saturating_sub(self.failed_at)), rfc3339(self.failed_at), self.pod, self.reason)
+    }
+}
+
+/// The record that remembers `pod`'s machine as bad after `up --check` judged it `h` — only
+/// when that verdict may condemn the machine beyond this run. Conservative, since a false
+/// "bad" turns a good machine away for days:
+/// - the check ran to the end and FAILed on the host ([`FailureKind::Host`]) — never a
+///   software/setup FAIL (the image's, on any machine), nor a check that couldn't run;
+/// - the provider names the machine ([`crate::health::machine_key`]) — never an IP.
+///
+/// `up --check` only: `pods test --deep` checks pods in use, where a participant's own job
+/// can fail a check (a GPU full of their tensors) without the machine being at fault. Pure.
+pub fn bad_host_record(pod: &Pod, h: &PodHealth, now: u64) -> Option<(String, BadHost)> {
+    let facts = h.facts.as_ref().filter(|f| f.started && f.complete)?;
+    if h.status != Status::Fail || h.failure_kind() != Some(FailureKind::Host) {
+        return None;
+    }
+    let key = crate::health::machine_key(pod)?;
+    let host_failures: Vec<String> = h
+        .checks
+        .iter()
+        .filter(|c| c.status == Status::Fail && failure_kind_of(&c.name, Some(facts)) == FailureKind::Host)
+        .map(|c| format!("{}: {}", c.name, c.detail.split_whitespace().collect::<Vec<_>>().join(" ")))
+        .collect();
+    Some((key, BadHost { failed_at: now, pod: h.name.clone(), reason: clip(&host_failures.join("; "), REASON_MAX) }))
 }
 
 /// The cache's file name inside its per-prefix state directory.
@@ -277,7 +336,12 @@ pub fn health_cache_path_for(cfg: &Config) -> Result<PathBuf, String> {
 
 impl HealthCache {
     pub fn new() -> Self {
-        Self { version: HEALTH_CACHE_VERSION, pods: BTreeMap::new() }
+        Self { version: HEALTH_CACHE_VERSION, pods: BTreeMap::new(), bad_hosts: BTreeMap::new() }
+    }
+
+    /// The remembered failures still [`BadHost::live`] at `now`.
+    pub fn live_bad_hosts(&self, now: u64) -> BTreeMap<String, BadHost> {
+        self.bad_hosts.iter().filter(|(_, b)| b.live(now)).map(|(k, b)| (k.clone(), b.clone())).collect()
     }
 
     /// Parse a cache file. `Err` (with why) for anything that isn't a version-1 cache.
@@ -380,6 +444,22 @@ pub fn record_health(
     if let Some(listing) = listing {
         cache.prune(listing);
     }
+    let saved = cache.save(path);
+    drop(lock);
+    saved.map(|()| warning)
+}
+
+/// Remember machine `key` as bad ([`bad_host_record`]) in the cache at `path`, forgetting the
+/// records that have expired by `now` — under the same lock as [`record_health`], so the two
+/// never drop each other's writes. `Ok` carries the load warning, if the old file had to be
+/// ignored (it is replaced, as by [`record_health`]).
+pub fn record_bad_host(path: &Path, key: &str, bad: &BadHost, now: u64) -> std::io::Result<Option<String>> {
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    create_private_dir(dir)?;
+    let lock = std::fs::File::open(dir).ok().filter(|f| f.lock().is_ok());
+    let (mut cache, warning) = HealthCache::load(path);
+    cache.bad_hosts.retain(|_, b| b.live(now));
+    cache.bad_hosts.insert(key.to_string(), bad.clone());
     let saved = cache.save(path);
     drop(lock);
     saved.map(|()| warning)
@@ -1334,6 +1414,124 @@ mod tests {
         // A directory where the file should be: unreadable, still just a warning.
         let (c, warn) = HealthCache::load(&dir.0);
         assert!(c.pods.is_empty() && warn.unwrap().contains("can't read"));
+    }
+
+    /// A check that ran to the end, with these verdicts (facts as a GPU pod's with torch OK).
+    fn ran(p: &Pod, status: Status, checks: Vec<Check>) -> PodHealth {
+        let facts = DeepFacts {
+            started: true,
+            complete: true,
+            torch: Some("ok".into()),
+            torch_cuda: Some("13.0".into()),
+            ..Default::default()
+        };
+        PodHealth { facts: Some(facts), ..health(p, status, checks) }
+    }
+
+    /// Item 13 (live BPF S2): which `up --check` verdicts remember a machine as bad across runs.
+    /// Only a host FAIL from a check that ran, and only on a machine its provider names — a
+    /// remembered false "bad" turns a good machine away for days.
+    #[test]
+    fn bad_host_record_is_only_a_host_fail_on_a_named_machine() {
+        let on = |p: Pod, m: &str| Pod { machine_id: Some(m.into()), ..p };
+        let runpod = on(at(pod("devtest-apple", "runpod", "rp1"), "70.167.32.130", 40100), "ue6mmk7dp8qi");
+        let cuda = check("cuda", Status::Fail, "RuntimeError:  CUDA unknown error");
+        let host_fail = ran(&runpod, Status::Fail, vec![cuda.clone(), check("network", Status::Warn, "0.4 MB/s")]);
+        let (key, bad) = bad_host_record(&runpod, &host_fail, NOW).unwrap();
+        assert_eq!(key, "runpod machine ue6mmk7dp8qi");
+        assert_eq!(bad, BadHost { failed_at: NOW, pod: "devtest-apple".into(), reason: "cuda: RuntimeError: CUDA unknown error".into() });
+
+        let vast_named = on(at(pod("devtest-bloom", "vast", "31415926"), "203.0.113.9", 40100), "31540");
+        assert_eq!(bad_host_record(&vast_named, &ran(&vast_named, Status::Fail, vec![cuda.clone()]), NOW).unwrap().0, "vast machine 31540");
+        // Nothing but an IP names the machine: never remembered (Vast/RunPod IPs are shared,
+        // a deleted Hetzner VM's IP goes to another VM).
+        for unnamed in [
+            at(pod("devtest-apple", "runpod", "rp1"), "70.167.32.130", 40100),
+            at(pod("devtest-bloom", "vast", "31415926"), "203.0.113.9", 40100),
+            at(pod("devtest-hz", "hetzner", "123"), "5.6.7.8", 22),
+        ] {
+            assert_eq!(bad_host_record(&unnamed, &ran(&unnamed, Status::Fail, vec![cuda.clone()]), NOW), None, "{unnamed:?}");
+        }
+        // Not a host FAIL from a check that ran: never.
+        let cpu_torch = PodHealth {
+            facts: Some(DeepFacts { started: true, complete: true, torch: Some("ok".into()), torch_cuda: Some("none".into()), ..Default::default() }),
+            ..health(&runpod, Status::Fail, vec![check("cuda", Status::Fail, "torch 2.14.1+cpu is a CPU-only build")])
+        };
+        let cut_off = PodHealth {
+            facts: Some(DeepFacts { started: true, complete: false, ..Default::default() }),
+            ..health(&runpod, Status::Fail, vec![cuda.clone()])
+        };
+        let not_started = PodHealth {
+            facts: Some(DeepFacts::default()),
+            ..health(&runpod, Status::Fail, vec![check("script", Status::Fail, "no zsh on the pod")])
+        };
+        for (what, h) in [
+            ("software/setup", cpu_torch),
+            ("unreachable", health(&runpod, Status::Fail, vec![check("ssh", Status::Fail, "timed out after 150s")])),
+            ("cut off", cut_off),
+            ("never started", not_started),
+            ("warn", ran(&runpod, Status::Warn, vec![check("network", Status::Warn, "0.4 MB/s")])),
+            ("pass", ran(&runpod, Status::Pass, vec![])),
+        ] {
+            assert_eq!(bad_host_record(&runpod, &h, NOW), None, "{what}");
+        }
+    }
+
+    /// Remembered for [`BAD_HOST_TTL_SECS`], then forgotten — and a record from the future
+    /// (an edited file, a clock set back) is never trusted, as it would never expire.
+    #[test]
+    fn a_bad_host_is_remembered_for_its_ttl_only() {
+        let bad = |failed_at| BadHost { failed_at, pod: "devtest-apple".into(), reason: "cuda: x".into() };
+        for (failed_at, live) in [
+            (NOW, true),
+            (NOW - 3600, true),
+            (NOW - BAD_HOST_TTL_SECS + 1, true),
+            (NOW - BAD_HOST_TTL_SECS, false),
+            (NOW - 10 * BAD_HOST_TTL_SECS, false),
+            (NOW + 60, false),
+        ] {
+            assert_eq!(bad(failed_at).live(NOW), live, "{failed_at}");
+        }
+        assert_eq!(bad(NOW - 3 * 3600).describe(NOW), "3h ago (2026-10-08T09:00:00Z, devtest-apple: cuda: x)");
+    }
+
+    /// The bad machines share the health cache's file, lock and tolerance: written beside the
+    /// pods' records (which `record_health` keeps), expired ones dropped on the next write, a
+    /// file without them (an older binary's) read as none, and a corrupt one — empty plus a
+    /// warning, replaced by the next write — never in the way of a create.
+    #[test]
+    fn bad_hosts_round_trip_through_the_health_cache() {
+        let dir = tmp("bad-hosts");
+        let path = dir.0.join("devtest").join(HEALTH_CACHE_FILE);
+        let bad = |failed_at, pod: &str| BadHost { failed_at, pod: pod.into(), reason: "cuda: CUDA unknown error".into() };
+        assert_eq!(record_bad_host(&path, "runpod machine old", &bad(NOW - BAD_HOST_TTL_SECS - 1, "devtest-x"), NOW - 60).unwrap(), None);
+        assert_eq!(record_bad_host(&path, "runpod machine ue6", &bad(NOW, "devtest-apple"), NOW).unwrap(), None);
+        let apple = pod("devtest-apple", "runpod", "rp1");
+        record_health(&path, &[health(&apple, Status::Pass, vec![])], None, NOW).unwrap();
+
+        let (back, warn) = HealthCache::load(&path);
+        assert_eq!(warn, None);
+        assert_eq!(back.pods.len(), 1, "the pods' records and the machines' live side by side");
+        let keys: Vec<&str> = back.bad_hosts.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["runpod machine ue6"], "the expired record was dropped on the write");
+        assert_eq!(back.live_bad_hosts(NOW + BAD_HOST_TTL_SECS).len(), 0, "and this one goes in its turn");
+        assert_eq!(back.live_bad_hosts(NOW)["runpod machine ue6"], bad(NOW, "devtest-apple"));
+
+        // A cache without the field (an older binary's) has none, and writes none back.
+        let (old, warn) = HealthCache::load(&{
+            std::fs::write(&path, "{\"version\": 1, \"pods\": {}}").unwrap();
+            path.clone()
+        });
+        assert_eq!((old.bad_hosts.len(), warn), (0, None));
+        assert!(!old.to_json().contains("bad_hosts"), "{}", old.to_json());
+
+        // Corrupt: nothing remembered, one warning; the next write replaces the file.
+        std::fs::write(&path, "{not json").unwrap();
+        let (c, warn) = HealthCache::load(&path);
+        assert!(c.live_bad_hosts(NOW).is_empty() && warn.is_some());
+        let warn = record_bad_host(&path, "runpod machine ue6", &bad(NOW, "devtest-apple"), NOW).unwrap();
+        assert!(warn.is_some_and(|w| w.starts_with("warning: ignoring the health cache")));
+        assert_eq!(HealthCache::load(&path).0.live_bad_hosts(NOW).len(), 1);
     }
 
     #[test]

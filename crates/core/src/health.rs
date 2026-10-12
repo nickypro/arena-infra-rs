@@ -1042,13 +1042,23 @@ pub fn mig_slice_name(pod: &Pod) -> Option<String> {
 /// - Elsewhere, the SSH IP where it is the machine's own address — an IP literal (RunPod's
 ///   public IP). A hostname never groups: that's what a shared proxy looks like.
 pub fn host_key(pod: &Pod) -> Option<String> {
-    if let Some(id) = pod.machine_id.as_deref().map(str::trim).filter(|id| !id.is_empty()) {
-        return Some(format!("{} machine {id}", pod.provider.to_ascii_lowercase()));
+    if let Some(key) = machine_key(pod) {
+        return Some(key);
     }
     if pod.provider.eq_ignore_ascii_case("vast") {
         return None;
     }
     pod.ssh_ip.as_deref().filter(|ip| ip.parse::<std::net::IpAddr>().is_ok()).map(String::from)
+}
+
+/// The provider's own name for `pod`'s machine (`runpod machine ue6mmk7dp8qi`) — [`host_key`]
+/// without its IP fallback; `None` when the provider reports no [`Pod::machine_id`]. The only
+/// identity a bad machine is remembered by across runs (`snapshot::bad_host_record`): an IP
+/// is shared by several machines (Vast; RunPod — finding #23) or handed to another VM once a
+/// Hetzner one is deleted — a guess one run can afford, but not one that lasts for days.
+pub fn machine_key(pod: &Pod) -> Option<String> {
+    let id = pod.machine_id.as_deref().map(str::trim).filter(|id| !id.is_empty())?;
+    Some(format!("{} machine {id}", pod.provider.to_ascii_lowercase()))
 }
 
 impl PodHealth {
@@ -1125,7 +1135,16 @@ pub fn judge_deep_call(pod: &Pod, call: std::result::Result<SshOutput, String>, 
         Ok(out) => {
             let facts = parse_deep(&out.stdout);
             let stderr = out.stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
-            if !facts.started && !out.success {
+            if !facts.started && crate::ssh::login_shell_missing(out.code, &out.stderr) {
+                // No zsh to run it in: a bare VM before setup (live: Hetzner `up --check
+                // --no-setup`). SSH worked and the script never started — the pod's software,
+                // like a missing `base64` below: a `script` FAIL (software/setup), with the fix.
+                let mut health = PodHealth::checked(pod, facts, policy);
+                for c in health.checks.iter_mut().filter(|c| c.name == "script") {
+                    c.detail = crate::ssh::login_shell_missing_hint(&pod.name);
+                }
+                health
+            } else if !facts.started && !out.success {
                 // ssh itself failed (255 = refused/auth/…): say that, not "no output".
                 PodHealth::unreachable(pod, format!("{}: {stderr}", out.exit_label()))
             } else {
@@ -2024,6 +2043,8 @@ deep_check_end=1
             (Err("timed out after 150s".into()), Status::Fail, "ssh", "timed out after 150s"),
             (Ok(out(false, 255, "", "\nssh: connect to host 1.1.1.1 port 22: Connection refused\n")), Status::Fail, "ssh", "exit 255: ssh: connect to host"),
             (Ok(out(true, 0, "", "bash: base64: command not found")), Status::Fail, "script", "(bash: base64: command not found)"),
+            // Live BPF F1: a bare VM before setup has no zsh to run the check in.
+            (Ok(out(false, 127, "", "bash: line 1: zsh: command not found")), Status::Fail, "script", "`arena pods setup devtest-apple`"),
         ];
         for (call, want, name, detail) in cases {
             let what = format!("{call:?}");
@@ -2032,6 +2053,32 @@ deep_check_end=1
             assert!(check(&h.checks, name).detail.contains(detail), "{what}: {:#?}", h.checks);
             assert_eq!((h.name.as_str(), h.provider.as_str()), ("devtest-apple", "runpod"));
         }
+    }
+
+    /// Live BPF F1: `up --check --no-setup` on a bare Hetzner VM ended "couldn't run the deep
+    /// check twice (ssh: exit 127: … zsh: command not found)". No zsh is the pod's software
+    /// (setup installs it), never its machine: one `script` FAIL, software/setup, saying the
+    /// fix — and SSH having worked, the facts are there (unstarted), unlike an unreachable pod.
+    #[test]
+    fn no_login_shell_is_a_software_failure_with_the_setup_hint() {
+        let vm = Pod { provider: "hetzner".into(), ..pod("hz2", "5.6.7.8") };
+        let call = Ok(SshOutput {
+            success: false,
+            code: Some(127),
+            stdout: String::new(),
+            stderr: "bash: line 1: zsh: command not found\n".into(),
+        });
+        let h = judge_deep_call(&vm, call, &cuda13());
+        assert_eq!(h.status, Status::Fail);
+        assert_eq!(h.checks.len(), 1, "{:#?}", h.checks);
+        assert_eq!(h.checks[0].name, "script");
+        assert!(h.checks[0].detail.contains("no zsh") && h.checks[0].detail.contains("`arena pods setup devtest-hz2`"), "{:#?}", h.checks);
+        assert_eq!(h.failure_kind(), Some(FailureKind::Software));
+        assert!(h.facts.as_ref().is_some_and(|f| !f.started), "{h:#?}");
+        assert!(h.notes().contains("`arena pods setup devtest-hz2`"), "the hint survives the NOTES clip: {}", h.notes());
+        // Any other exit 127 (ssh itself, a missing tool after zsh started) is not this.
+        let other = Ok(SshOutput { success: false, code: Some(255), stdout: String::new(), stderr: "zsh: command not found".into() });
+        assert_eq!(judge_deep_call(&vm, other, &cuda13()).checks[0].name, "ssh");
     }
 
     #[test]
@@ -2119,6 +2166,12 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
         assert_eq!(host_key(&pod("apple", "1.2.3.4")).as_deref(), Some("1.2.3.4"));
         assert_eq!(host_key(&Pod { ssh_ip: None, ..pod("apple", "") }), None);
         assert_eq!(host_key(&Pod { machine_id: Some(" ".into()), ..pod("apple", "1.2.3.4") }).as_deref(), Some("1.2.3.4"));
+        // `machine_key` is the machine-id half only: never an IP, on any provider.
+        assert_eq!(machine_key(&on(pod("apple", "1.2.3.4"), "ue6mmk7dp8qi")).as_deref(), Some("runpod machine ue6mmk7dp8qi"));
+        assert_eq!(machine_key(&on(vast("apple", "ssh4.vast.ai"), "31540")), host_key(&on(vast("apple", "ssh4.vast.ai"), "31540")));
+        assert_eq!(machine_key(&pod("apple", "1.2.3.4")), None);
+        assert_eq!(machine_key(&Pod { provider: "hetzner".into(), ..pod("apple", "1.2.3.4") }), None);
+        assert_eq!(machine_key(&Pod { machine_id: Some(" ".into()), ..pod("apple", "1.2.3.4") }), None);
     }
 
     #[test]

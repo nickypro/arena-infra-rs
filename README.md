@@ -50,7 +50,11 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     refused and the deep check won't derive a driver floor from it — never read as "no floor".
     v1 creates also
     send `supportPublicIp: true` (some community hosts have no public IP, leaving only
-    RunPod's SSH proxy). Neither API reports a pod's CUDA constraint, so
+    RunPod's SSH proxy). **v2 has no such field** (its OpenAPI `CreatePodRequest`, checked
+    2026-10-11, offers no public-IP option, and its schema refuses unknown keys), so a v2
+    COMMUNITY pod can land on a proxy-only host (live: two 4090s did): `up` calls it a host
+    failure after the 5-minute grace — `FAILED endpoint`, or replaced under `--check`;
+    SECURE pods have a public IP. Neither API reports a pod's CUDA constraint, so
     `replace`/`migrate copy` re-apply the configured one to the replacement (as `create` does).
   - `provider::vast` — Vast.ai REST backend against the same trait. Vast rents
     *offers* rather than named pods, so `create_pod` searches the marketplace
@@ -118,7 +122,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     a name two pods share is refused: pass the id); `stop` takes the shared
     [target selection](#targeting--concurrency).
     `list` shows NAME PROVIDER ID STATUS (`run locked` for a locked pod) GPU (`count×type`;
-    a MIG slice as the slice — `1×B300 MIG 34GB`, never the parent card nvidia-smi names;
+    a MIG slice as the slice — `1×B300 MIG 34GB`, never the parent card nvidia-smi names,
+    and `up`'s placement, READY and summary lines name it the same (the catalog's name);
     RunPod's GPU is its display name on v1 and v2 alike, so `--json`'s `gpu_type` doesn't
     change with `RUNPOD_API`) $/H ENDPOINT (`no public endpoint (RunPod ssh proxy only)` for
     a pod up without a public IP) MAINT (the
@@ -341,13 +346,21 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     that lands on a machine that already failed (any name's; by the provider's machine id —
     RunPod's `machineId` from REST v1 or GraphQL — before the IP, which several RunPod hosts
     share) is rejected unseen and
-    terminated (even with no attempt left). Up to `--check-attempts N` placements per name
+    terminated (even with no attempt left). A host FAIL on a machine the provider names
+    (RunPod/Vast machine id — never an IP) is also **remembered for 72 h** in the health cache:
+    any pod that lands there later — another name's first pod, or any pod of a later `up` —
+    is turned away the same way before setup (`landed on runpod machine …, which failed the
+    deep check 3h ago (<UTC time>, <pod>: cuda: …) — rejecting it`; the summary says so too);
+    without `--check` it is only a warning, nothing is terminated. Expiry is the only way to
+    forget one; a cache that can't be read remembers nothing (one warning), never fails `up`. Up to `--check-attempts N` placements per name
     (default 2); the last pod that FAILed its check is left running for a look. Only a check
     whose script ran can condemn a host: one that couldn't run (SSH dropped, timed out) is
     rerun once SSH answers, and if it still can't run the name FAILs with the pod left
     running. A FAIL that is only **software/setup** — as the facts show it: no python, python
-    reporting that `import torch` fails, a CPU-only torch (`+cpu`, no CUDA in it) on a GPU pod
-    — is never replaced — a new pod boots the same image and runs the same setup, so it
+    reporting that `import torch` fails, a CPU-only torch (`+cpu`, no CUDA in it) on a GPU pod,
+    the check script never starting although SSH worked (no zsh to run it in on a bare VM
+    before setup — `--no-setup` on Hetzner — which says to run `arena pods setup`; no
+    `base64`) — is never replaced — a new pod boots the same image and runs the same setup, so it
     would fail the same way: the name FAILs at once (`FAILED check — software/setup failure,
     not the host — …`), the pod is left running and its machine isn't counted as bad
     (`pods test --deep` says the same under its table). Python dying before it could report
@@ -486,7 +499,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `-t`/`--exclude`/`--on`/`--gpus`/`--dry-run` after it is refused rather than run on every
     pod, so quote a command that takes one, `run 'tmux kill-session -t lab'`; on a timeout the local ssh is killed, and the remote
     command dies at its next write to the closed connection; a pod whose command fails
-    shows what it printed on stdout too, then `exit N: <stderr>` — never `Some(N)`) / the
+    shows what it printed on stdout too, then `exit N: <stderr>` — never `Some(N)`; on a pod
+    with no zsh yet — a bare VM before setup — it says so and to run `arena pods setup`) / the
     read-only torch-version health check (90s per pod). Every dry run's `ssh`/`scp`/`rsync`
     line is shell-quoted, so it pastes as exactly what would run (globs like `'**/.git/**'`
     don't expand).
@@ -548,7 +562,10 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `${XDG_STATE_HOME:-~/.local/state}/arena/<prefix>/health.json` — per
     `MACHINE_NAME_PREFIX`, so the sandbox and prod never share one; owner-only, written
     atomically under a lock, keyed by provider + pod id; records of pods their provider
-    listed OK without are dropped. A corrupt file is one warning and gets replaced.
+    listed OK without are dropped. A corrupt file is one warning and gets replaced. It also
+    holds `up --check`'s **bad machines** (`bad_hosts`: machine id → when, pod, failed checks),
+    dropped 72 h after their failure, never by a listing; `pods test --deep` adds none (its
+    pods are in use, and a participant's own job can fail a check).
   - `snapshot [--json] [--public] [--out FILE] [--no-probe]` — the fleet in one **read-only**
     picture (one list per provider + the details query, the local proxy file, the health
     cache, and a **reachability probe**: a TCP connect to the SSH endpoint of each billing
@@ -682,7 +699,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
       created, edited, extracted, copied or renamed there; a user tool can't set a ctime, while
       `tar`/`unzip`/`cp -p`/`mv`/`wget` all leave old *mtimes*. After a **verified** sync it
       drops only the moved files on neither side of that line (an earlier sync's copies the
-      original has since deleted or changed); everything else is **kept and listed**. A sync
+      original has since deleted or changed); everything else is **kept and listed** — the
+      count and size are of the listed work; files from inside a `.git` (its index, rewritten
+      whenever git runs there) are kept too but counted apart (`plus N of git's own file(s)`). A sync
       that didn't complete drops nothing. The original is only ever read; backups never mirror.
     - **A mirror only from an unchanged original**: onto a `-new` that was synced before, the
       original must still be what that sync copied — its container not created since (a

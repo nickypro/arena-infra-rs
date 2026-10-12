@@ -4182,11 +4182,22 @@ fn runpod_api_row(cfg: &Config) -> (String, bool) {
 ///   ⚠ an `ALLOWED_CUDA_VERSIONS` list (it used to be an exact set; now only its lowest
 ///   version counts); ⚠ keys shadowed by a stronger one.
 /// - ✗ (not ok) on RunPod v1 when its schema can't express the constraint (13.1+).
-fn cuda_rows(cfg: &Config, runpod_v1: bool) -> (Vec<String>, bool) {
+/// - ✗ alone, in place of the ✓/⚠ row, for a value that isn't a version (`13.x`): creates
+///   are refused, so nothing about it is fine (live BPF S5 printed `✓ ≥ 13.x` above the ✗).
+///
+/// The `Err` is what `config check`'s final error lists: the key and why it's invalid, or
+/// what RunPod v1 can't express.
+fn cuda_rows(cfg: &Config, runpod_v1: bool) -> (Vec<String>, std::result::Result<(), String>) {
     let key = "host CUDA";
     let cuda = arena_core::pod::cuda_from_config(cfg);
     let mut out = Vec::new();
+    let bad = cuda.exact.iter().chain(&cuda.floor).find(|v| arena_core::pod::cuda_key(v).is_none());
     match (&cuda.floor, cuda.exact.is_empty()) {
+        _ if bad.is_some() => out.push(format!(
+            "  ✗ {key:<27}`{}` isn't a version like 13.0 (from {}) — every create would be refused",
+            bad.map(String::as_str).unwrap_or_default(),
+            cuda.source.unwrap_or_default()
+        )),
         (_, false) => out.push(format!(
             "  ⚠ {key:<27}exactly {} ({}) — RunPod matches this exactly: hosts on a newer CUDA are \"no capacity\"; \
              MIN_CUDA_VERSION sets a floor instead",
@@ -4196,7 +4207,7 @@ fn cuda_rows(cfg: &Config, runpod_v1: bool) -> (Vec<String>, bool) {
         (Some(floor), true) => out.push(format!("  ✓ {key:<27}≥ {floor} (a floor, from {})", cuda.source.unwrap_or_default())),
         (None, true) => out.push(format!("  · {key:<27}any (no MIN_CUDA_VERSION / ALLOWED_CUDA_VERSIONS)")),
     }
-    if cuda.source.is_some_and(|s| s.ends_with("ALLOWED_CUDA_VERSIONS")) {
+    if bad.is_none() && cuda.source.is_some_and(|s| s.ends_with("ALLOWED_CUDA_VERSIONS")) {
         let raw = cfg.get(cuda.source.unwrap_or_default()).unwrap_or_default();
         if raw.split(',').filter(|v| !v.trim().is_empty()).count() > 1 {
             out.push(format!(
@@ -4208,11 +4219,11 @@ fn cuda_rows(cfg: &Config, runpod_v1: bool) -> (Vec<String>, bool) {
     for shadowed in cuda.set.iter().skip(1) {
         out.push(format!("      └ {shadowed} is ignored: {} takes precedence", cuda.set[0]));
     }
-    let mut ok = true;
-    if let Some(bad) = cuda.exact.iter().chain(&cuda.floor).find(|v| arena_core::pod::cuda_key(v).is_none()) {
-        out.push(format!("  ✗ {key:<27}`{bad}` isn't a version like 13.0 — every create would be refused"));
-        ok = false;
+    if let Some(bad) = bad {
+        // The v1 check below would only say the same again.
+        return (out, Err(format!("{} (`{bad}` isn't a version like 13.0)", cuda.source.unwrap_or("the host CUDA key"))));
     }
+    let mut ok = Ok(());
     if runpod_v1 {
         let spec = PodSpec { allowed_cuda: cuda.exact.clone(), min_cuda: cuda.floor.clone(), ..PodSpec::from_config(cfg) };
         match arena_core::provider::runpod::v1_cuda_versions(&spec) {
@@ -4224,7 +4235,7 @@ fn cuda_rows(cfg: &Config, runpod_v1: bool) -> (Vec<String>, bool) {
             Ok(_) => {}
             Err(e) => {
                 out.push(format!("  ✗ {key:<27}{e}"));
-                ok = false;
+                ok = Err("a host CUDA constraint RunPod v1 can express (or RUNPOD_API=v2)".to_string());
             }
         }
     }
@@ -4314,8 +4325,8 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
             && matches!(arena_core::provider::RunpodApi::from_config(cfg), Ok(arena_core::provider::RunpodApi::V1));
         let (lines, ok) = cuda_rows(cfg, v1);
         lines.iter().for_each(|l| println!("{l}"));
-        if !ok {
-            missing.push("a host CUDA constraint RunPod v1 can express (or RUNPOD_API=v2)".into());
+        if let Err(what) = ok {
+            missing.push(what);
         }
     }
     if let Some((line, ok)) = create_extra_row(cfg) {
@@ -4456,7 +4467,8 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
         println!("\nOK — required keys for provider `{provider_name}` are present.");
         Ok(())
     } else {
-        anyhow::bail!("missing required keys: {}", missing.join(", "))
+        // Set but invalid counts too (each such entry says why): "missing" alone misled.
+        anyhow::bail!("missing or invalid keys: {}", missing.join(", "))
     }
 }
 
@@ -6476,6 +6488,13 @@ async fn run_fleet(
         // a no-PTY shell can emit harmless job-control chatter; strip it.
         let (text, why) = match call {
             Ok(out) if out.success => (strip_interactive_noise(out.stdout.trim()).trim().to_string(), None),
+            // No zsh to run it in (a bare VM before setup, live BPF S9): the command never ran,
+            // so say that — and the fix — rather than a bare `exit 127`.
+            Ok(out) if arena_core::ssh::login_shell_missing(out.code, &out.stderr) => {
+                let (text, why) = run_failure(&out);
+                let hint = arena_core::ssh::login_shell_missing_hint(name);
+                (format!("{hint}\n{text}"), Some(format!("{hint} ({why})")))
+            }
             Ok(out) => {
                 let (text, why) = run_failure(&out);
                 (text, Some(why))
@@ -14494,7 +14513,7 @@ mod tests {
         use super::{cuda_rows, Config};
         let rows = |text: &str, v1: bool| {
             let (lines, ok) = cuda_rows(&Config::parse(text), v1);
-            (lines.join("\n"), ok)
+            (lines.join("\n"), ok.is_ok())
         };
         let (l, ok) = rows("ALLOWED_CUDA_VERSIONS=\"13.0\"", false);
         assert!(ok && l.contains("✓") && l.contains("≥ 13.0 (a floor, from ALLOWED_CUDA_VERSIONS)") && !l.contains("└"), "{l}");
@@ -14515,6 +14534,23 @@ mod tests {
         assert!(ok && l.contains("any"), "{l}");
         let (l, ok) = rows("MIN_CUDA_VERSION=newest", false);
         assert!(!ok && l.contains("`newest` isn't a version"), "{l}");
+
+        // Live BPF S5: an invalid value is one ✗ row — no `✓ ≥ 13.x` above it, no repeat from
+        // the v1 check — and the final error names the key as invalid, not "missing".
+        for v1 in [true, false] {
+            let (lines, ok) = cuda_rows(&Config::parse("RUNPOD_ALLOWED_CUDA_VERSIONS=\"13.0, 13.x\""), v1);
+            assert_eq!(lines.len(), 1, "{lines:#?}");
+            assert!(
+                lines[0].starts_with("  ✗ host CUDA") && lines[0].contains("`13.x` isn't a version like 13.0 (from RUNPOD_ALLOWED_CUDA_VERSIONS)"),
+                "{lines:#?}"
+            );
+            assert_eq!(ok, Err("RUNPOD_ALLOWED_CUDA_VERSIONS (`13.x` isn't a version like 13.0)".to_string()));
+        }
+        let (_, ok) = cuda_rows(&Config::parse("EXACT_CUDA_VERSIONS=13.0,latest"), false);
+        assert_eq!(ok, Err("EXACT_CUDA_VERSIONS (`latest` isn't a version like 13.0)".to_string()));
+        // What v1 can't express keeps its own wording.
+        let (_, ok) = cuda_rows(&Config::parse("MIN_CUDA_VERSION=13.1"), true);
+        assert_eq!(ok, Err("a host CUDA constraint RunPod v1 can express (or RUNPOD_API=v2)".to_string()));
     }
 
     /// `config check` shows CREATE_EXTRA_JSON's keys (never its values) and fails a value
@@ -16811,6 +16847,29 @@ mod remote_tests {
         );
         let (lines, _) = render_run(&results, true);
         assert_eq!(lines[1], "devtest-bloom          ✗ exit 127: zsh: command not found: nvidia-smi");
+    }
+
+    /// Live BPF S9: `pods run` on a bare Hetzner VM (no zsh until setup) said only `exit 127:
+    /// bash: line 1: zsh: command not found`. It says the command never ran, and the fix.
+    #[tokio::test(start_paused = true)]
+    async fn pods_run_on_a_pod_without_zsh_says_to_set_it_up() {
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22002), [FakeReply::exit(127, "bash: line 1: zsh: command not found")]);
+        let remote: Arc<dyn Remote> = fake.clone();
+        let wrapped = login_shell_wrap("echo x > ~/unsynced.txt", Some("arena-env"));
+        let results = run_fleet(&remote, targets(&fleet()), &wrapped, Duration::from_secs(60)).await;
+        let bloom = &results[1];
+        assert_eq!(bloom.name, "devtest-bloom");
+        assert!(!bloom.ok);
+        assert_eq!(
+            bloom.why.as_deref(),
+            Some(
+                "no zsh on the pod (setup installs it) — not set up yet? `arena pods setup devtest-bloom` \
+                 (exit 127: bash: line 1: zsh: command not found)"
+            )
+        );
+        assert!(bloom.text.starts_with("no zsh on the pod") && bloom.text.ends_with("exit 127: bash: line 1: zsh: command not found"), "{}", bloom.text);
+        assert!(results[0].ok && results[2].ok, "{results:?}");
     }
 
     /// A failing command's stdout is part of its report (live: `pods run` showed only stderr,
