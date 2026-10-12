@@ -2018,7 +2018,7 @@ fleet: $0.17/h across 2 billing pod(s) (1 unpriced)
         let naming = Naming::from_config(&cfg);
         let pods = vec![at(pod("devtest-apple", "runpod", "rp1"), "203.0.113.7", 10022)];
         let mut snap = build(&pods, &[], Some(&proxy_text()), &HealthCache::new(), &naming, NOW);
-        let live = |usd: f64| Live { usd, provider_burn_per_hr: Some(0.47), spend_limit_per_hr: Some(80.0), under_balance: Some(false), reduced: false };
+        let live = |usd: f64| Live { usd, provider_burn_per_hr: Some(0.47), spend_limit_per_hr: Some(80.0), under_balance: Some(false), reduced: false, owed: None };
         let fetched = [
             Fetched { account: Account::Runpod, key_fp: "fp".into(), live: Some(Ok(live(32.54))), billed: None },
             Fetched { account: Account::Vast, key_fp: "fp".into(), live: Some(Ok(Live { provider_burn_per_hr: None, ..live(136.87) })), billed: None },

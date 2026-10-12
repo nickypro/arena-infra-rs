@@ -976,7 +976,7 @@ mod tests {
             .map(|&(account, usd, rate)| balance::Fetched {
                 account,
                 key_fp: "fp".into(),
-                live: Some(Ok(balance::Live { usd, provider_burn_per_hr: Some(rate), spend_limit_per_hr: None, under_balance: None, reduced: false })),
+                live: Some(Ok(balance::Live { usd, provider_burn_per_hr: Some(rate), spend_limit_per_hr: None, under_balance: None, reduced: false, owed: None })),
                 billed: None,
             })
             .collect();

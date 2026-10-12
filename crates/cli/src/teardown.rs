@@ -89,7 +89,8 @@ async fn collect(
 ) -> Report {
     let now = arena_core::snapshot::unix_now();
     let (state, _) = balance::load_opt(bal.state_path());
-    let observing = balance::observe(bal.api.as_ref(), &state, balance::Mode::Inline, balance::INLINE_TIMEOUT, now);
+    let mode = bal.inline_mode();
+    let observing = balance::observe(bal.api.as_ref(), &state, mode, balance::INLINE_TIMEOUT, now);
     // `list_by_provider`, not `list_pods`: the fleet's `list_pods` drops a backend that
     // failed, which here would read as "that provider has no pods".
     let (listings, volumes, keys, cron, at, fetched) =
@@ -108,7 +109,7 @@ async fn collect(
     if !fetched.is_empty() {
         // Burns from this listing (no details: an unpriced pod makes the burn a floor).
         let (policy, _) = balance::BalancePolicy::from_config(cfg);
-        report.balance = listed_views(bal, state, &fetched, &listing, &listing.pods(), &policy, now);
+        report.balance = listed_views(bal, state, &fetched, &listing, &listing.pods(), &policy, mode, now);
         report.balance_at = now;
     }
     report
@@ -510,7 +511,7 @@ mod tests {
         assert_eq!(exit, Ok(()));
         assert!(baseline.balance.is_empty());
         // RunPod at $1 while still reporting $0.35/h of spend: critical — and still ALL CLEAR.
-        let critical = Live { usd: 1.0, provider_burn_per_hr: Some(0.35), spend_limit_per_hr: None, under_balance: Some(false), reduced: false };
+        let critical = Live { usd: 1.0, provider_burn_per_hr: Some(0.35), spend_limit_per_hr: None, under_balance: Some(false), reduced: false, owed: None };
         let fails = [
             Fail { kind: FailKind::Transient, http: Some(503), detail: None },
             Fail { kind: FailKind::Auth, http: Some(401), detail: None },
@@ -520,7 +521,7 @@ mod tests {
         let mut apis = vec![FakeBalanceApi::new().live_ok(Account::Runpod, critical.clone()), FakeBalanceApi::new().live_stall(Account::Runpod)];
         apis.extend(fails.into_iter().map(|f| FakeBalanceApi::new().live_err(Account::Runpod, f)));
         for (i, api) in apis.into_iter().enumerate() {
-            let bal = BalanceCtx { api: Arc::new(api), path: None };
+            let bal = BalanceCtx { api: Arc::new(api), path: Some(Ok(dir.0.join(format!("state-{i}")).join("balance.json"))) };
             let (report, exit) = check_with(&fleet(), &cfg, Probe::Got(vec![]), None, &sched(), &bal).await;
             assert_eq!(exit, Ok(()), "#{i}: {}", report.render());
             assert_eq!((report.clear, report.remaining, report.unknown), (true, 0, 0), "#{i}");
@@ -530,7 +531,10 @@ mod tests {
             assert_eq!(v["balance"][0]["account"], "runpod", "#{i}: JSON carries the balance");
         }
         // The critical one, rendered: after the verdict line, informational.
-        let bal = BalanceCtx { api: Arc::new(FakeBalanceApi::new().live_ok(Account::Runpod, critical)), path: None };
+        let bal = BalanceCtx {
+            api: Arc::new(FakeBalanceApi::new().live_ok(Account::Runpod, critical)),
+            path: Some(Ok(dir.0.join("state-render").join("balance.json"))),
+        };
         let (report, _) = check_with(&fleet(), &cfg, Probe::Got(vec![]), None, &sched(), &bal).await;
         let text = report.render();
         let verdict = text.find("ALL CLEAR").unwrap();

@@ -22,12 +22,16 @@
 //! 3. **?**: nothing usable — said as `?` next to the burn, with a nudge to `arena balance set`.
 //!
 //! The estimate errs **low** on purpose: the anchor's first billed hour is counted whole,
-//! each metered segment is charged at its higher end, billing lag is covered by metering,
-//! spend arena doesn't list (volumes, stopped disks) by billing, and top-ups are invisible.
-//! A wrong estimate therefore warns early, never late — and a later observation never raises
-//! it (only a live reading or `set` can). Its one known undercount is a pod created *and*
-//! destroyed between two observations while billing is unavailable (always the case on
-//! Vast), bounded by that pod's lifetime × price.
+//! each metered segment is charged at its higher end, spend is taken per UTC hour as the
+//! larger of billing and metering (so billing's lag is covered by metering hour by hour and
+//! spend arena doesn't list by billing), a running pod nobody priced counts at its last seen
+//! price or a stand-in that errs high (never $0), and top-ups are invisible. A wrong estimate
+//! therefore warns early, never late — and a later observation never raises it (only a live
+//! reading or `set` can). Known undercounts: a pod created *and* destroyed between two
+//! observations while billing is unavailable (always the case on Vast), bounded by that
+//! pod's lifetime × price; stopped pods' disks where billing doesn't see them (Vast: no
+//! billing history, and its listing carries no storage rate — the burn is then marked a
+//! floor); and spend arena doesn't list that falls inside billing's lag.
 //!
 //! **Quiet failures.** A broken source is a label (`live n/a 20m`) on inline surfaces and
 //! one note in `arena balance` / a ⚠ row in `config check` — never stderr noise in `pods
@@ -95,6 +99,12 @@ pub const CRITICAL_HOURS: f64 = 24.0;
 
 /// `BALANCE_WARN_HOURS` when unset: a Friday-evening glance still covers the weekend.
 pub const DEFAULT_WARN_HOURS: f64 = 72.0;
+
+/// `BALANCE_UNPRICED_PER_GPU` when unset: the stand-in $/h per GPU for a running pod whose
+/// price nobody reports (RunPod v1's REST list has none; after GraphQL nothing fills it)
+/// and whose GPU has no preset price. Above every A4000–H100 community price — and the
+/// H100's secure one ($2.79) — so a stand-in burn errs high, which makes the runway err short.
+pub const DEFAULT_UNPRICED_PER_GPU: f64 = 3.0;
 
 /// A transient live failure (timeout, 429, 5xx) is only a label until it has lasted this
 /// long with no success in between; then it is noted like any other (seconds).
@@ -236,6 +246,9 @@ pub struct Live {
     pub under_balance: Option<bool>,
     /// The full query was rejected over a dropped field and the minimal one was needed.
     pub reduced: bool,
+    /// Vast: what its `balance` field says is owed (the magnitude of a negative `balance`).
+    /// Shown as a note, never taken off the credit — its meaning isn't confirmed.
+    pub owed: Option<f64>,
 }
 
 /// Why a read failed, in four kinds that decide how loudly it is said (see the module doc).
@@ -385,19 +398,29 @@ pub fn parse_runpod_myself(v: &Value) -> Result<Live, Fail> {
         spend_limit_per_hr: rate(me.get("spendLimit")).filter(|l| *l > 0.0),
         under_balance: me.get("underBalance").and_then(Value::as_bool),
         reduced: false,
+        owed: None,
     })
 }
 
 /// Why a Vast answer gave no balance — in our words: the body holds the email and API key.
 const VAST_NO_CREDIT: &str = "no numeric `credit` in /users/current/ (the answer isn't shown: it holds the account's email and API key)";
 
-/// Vast's `/users/current/`: `credit` (the prepaid amount the console shows) and nothing
-/// else — not even in the error.
+/// Vast's `/users/current/`: `credit` (the prepaid amount the console shows) — and,
+/// numerically only, a negative `balance` as `owed` (wave 6 surfaced it as "possibly owed";
+/// whether it is charges not yet taken from the credit is for the live console comparison
+/// to settle, so it is shown, never subtracted). Nothing else is read — not even in the
+/// error: the body holds the email and API key.
 pub fn parse_vast_user(v: &Value) -> Result<Live, Fail> {
+    let owed = v.get("balance").and_then(loose_f64).filter(|b| in_range(*b) && *b < 0.0).map(|b| -b);
     match v.get("credit").and_then(loose_f64) {
-        Some(c) if in_range(c) => {
-            Ok(Live { usd: c, provider_burn_per_hr: None, spend_limit_per_hr: None, under_balance: None, reduced: false })
-        }
+        Some(c) if in_range(c) => Ok(Live {
+            usd: c,
+            provider_burn_per_hr: None,
+            spend_limit_per_hr: None,
+            under_balance: None,
+            reduced: false,
+            owed,
+        }),
         _ => Err(Fail::new(FailKind::Drift, None, VAST_NO_CREDIT)),
     }
 }
@@ -440,8 +463,17 @@ pub fn parse_billing(v: &Value) -> Result<Billed, Fail> {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
 pub struct Burn {
     pub per_hr: f64,
-    /// Billing pods with no price: the sum is a floor.
+    /// Running pods with no price at all — none listed, none remembered, and no GPU to
+    /// stand a price in for: the sum is a floor, and the account can't be judged ok.
     pub unpriced: usize,
+    /// Stopped pods whose disk still bills at a rate the listing doesn't carry (Vast keeps
+    /// charging storage; so does RunPod): the sum is a floor (a small one).
+    pub storage: usize,
+    /// Running pods priced at a stand-in that errs high (the GPU's preset price, or
+    /// `BALANCE_UNPRICED_PER_GPU` per GPU): the burn is shown `~`.
+    pub guessed: usize,
+    /// The guessed pods' part of `per_hr`.
+    pub guessed_per_hr: f64,
     /// The last recorded sample, standing in for a listing that failed: possibly out of date.
     pub stale: bool,
 }
@@ -449,44 +481,168 @@ pub struct Burn {
 impl Burn {
     /// The real burn may be higher than `per_hr` (shown `≥`, runway `≤`).
     pub fn floor(&self) -> bool {
-        self.unpriced > 0 || self.stale
+        self.unpriced > 0 || self.storage > 0 || self.stale
+    }
+
+    /// Every pod in it was priced by the listing (or a remembered price): nothing stood in.
+    pub fn exact(&self) -> bool {
+        self.unpriced == 0 && self.storage == 0 && self.guessed == 0
     }
 }
 
-/// Each prepaid account's burn as the fleet listed it: `None` when its provider failed to
-/// list (or wasn't asked) — unknown, never zero.
-pub type Burns = BTreeMap<Account, Option<Burn>>;
-
-/// Sum the billing pods ([`bills_hourly`]) per prepaid account from a listing (`pods` are
-/// its pods, enriched where the caller enriches; `listing` says which providers answered).
-pub fn burns(listing: &Listing, pods: &[Pod]) -> Burns {
-    Account::ALL.into_iter().map(|a| (a, listed_burn(listing, pods, a.name()))).collect()
+/// Each prepaid account's burn as the fleet listed it — `None` when its provider failed
+/// to list (or wasn't asked): unknown, never zero — and the prices the listing showed per
+/// pod id, which [`apply`] remembers so a pod listed later without one keeps its price.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Burns {
+    by: BTreeMap<Account, Option<Burn>>,
+    /// `(pod id, USD/h)` the listing carried a price for, per account.
+    pub seen: BTreeMap<Account, Vec<(String, f64)>>,
 }
 
-fn listed_burn(listing: &Listing, pods: &[Pod], provider: &str) -> Option<Burn> {
+impl Burns {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The account's listed burn: `None` = not in these burns, `Some(None)` = unknown.
+    pub fn get(&self, account: &Account) -> Option<&Option<Burn>> {
+        self.by.get(account)
+    }
+}
+
+impl std::ops::Index<&Account> for Burns {
+    type Output = Option<Burn>;
+    fn index(&self, a: &Account) -> &Option<Burn> {
+        &self.by[a]
+    }
+}
+
+impl FromIterator<(Account, Option<Burn>)> for Burns {
+    fn from_iter<I: IntoIterator<Item = (Account, Option<Burn>)>>(iter: I) -> Self {
+        Burns { by: iter.into_iter().collect(), seen: BTreeMap::new() }
+    }
+}
+
+/// `2×RTX A4000` → (Some(2), "RTX A4000"): the count prefix the SSH probe writes.
+fn split_count(label: &str) -> (Option<u32>, &str) {
+    match label.split_once('×') {
+        Some((n, rest)) if !n.is_empty() && n.trim().chars().all(|c| c.is_ascii_digit()) => (n.trim().parse().ok(), rest.trim()),
+        _ => (None, label.trim()),
+    }
+}
+
+/// The dearer of a known GPU's preset prices (community or secure), per GPU — matched by
+/// the provider's type string or the short label (`RTX 3090`, as Vast and the probe say).
+fn preset_per_gpu(gpu: &str) -> Option<f64> {
+    let g = gpu.trim();
+    crate::gpu::PRESETS
+        .iter()
+        .find(|p| p.api.eq_ignore_ascii_case(g) || p.label.eq_ignore_ascii_case(g))
+        .map(|p| p.community.max(p.secure))
+}
+
+/// A stand-in $/h for a pod (or a planned one) nobody priced, erring high: the GPU's preset
+/// price, else [`BalancePolicy::unpriced_per_gpu`] per GPU. `None` when there is no GPU
+/// information at all — then it can't be priced.
+pub fn stand_in_price(gpu_type: Option<&str>, gpu_count: Option<u32>, policy: &BalancePolicy) -> Option<f64> {
+    let (prefix, label) = match gpu_type.map(str::trim).filter(|t| !t.is_empty() && *t != "-") {
+        Some(t) => {
+            let (n, rest) = split_count(t);
+            (n, Some(rest))
+        }
+        None => (None, None),
+    };
+    let count = gpu_count.filter(|n| *n > 0).or(prefix).or(label.map(|_| 1))?;
+    let per_gpu = label.and_then(preset_per_gpu).unwrap_or(policy.unpriced_per_gpu);
+    Some(per_gpu * f64::from(count))
+}
+
+/// Sum the billing pods ([`bills_hourly`]) per prepaid account from a listing (`pods` are
+/// its pods, enriched where the caller enriches; `listing` says which providers answered),
+/// with no remembered prices and the default stand-in. Surfaces use [`burns_with`].
+pub fn burns(listing: &Listing, pods: &[Pod]) -> Burns {
+    burns_with(listing, pods, &BalanceState::default(), &BalancePolicy::default())
+}
+
+/// [`burns`], pricing each running pod the listing gave no price by, in order: the last
+/// price seen for that pod (`state`), a stand-in that errs high ([`stand_in_price`]), else
+/// leaving it unpriced (the burn a floor). A stopped pod still bills its disk at a rate the
+/// listing doesn't carry: counted as `storage` (a floor).
+pub fn burns_with(listing: &Listing, pods: &[Pod], state: &BalanceState, policy: &BalancePolicy) -> Burns {
+    let mut out = Burns::new();
+    for a in Account::ALL {
+        let remembered = state.accounts.get(&a).map(|st| &st.prices);
+        out.by.insert(a, listed_burn(listing, pods, a.name(), remembered, policy));
+        let seen: Vec<(String, f64)> = pods
+            .iter()
+            .filter(|p| p.provider == a.name() && !p.id.is_empty())
+            .filter_map(|p| p.cost_per_hr.filter(|c| c.is_finite() && *c > 0.0).map(|c| (p.id.clone(), c)))
+            .collect();
+        if listing.status(a.name()) == ListingStatus::Ok && !seen.is_empty() {
+            out.seen.insert(a, seen);
+        }
+    }
+    out
+}
+
+/// Whether a pod is gone for good (no disk left to bill).
+fn gone_for_good(status: &str) -> bool {
+    matches!(status.trim().to_ascii_lowercase().as_str(), "terminated" | "destroyed" | "deleted" | "dead")
+}
+
+fn listed_burn(
+    listing: &Listing,
+    pods: &[Pod],
+    provider: &str,
+    remembered: Option<&BTreeMap<String, (f64, u64)>>,
+    policy: &BalancePolicy,
+) -> Option<Burn> {
     if listing.status(provider) != ListingStatus::Ok {
         return None;
     }
     let mut b = Burn::default();
-    for p in pods.iter().filter(|p| p.provider == provider && bills_hourly(&p.provider, &p.status)) {
-        match p.cost_per_hr.filter(|c| c.is_finite() && *c >= 0.0) {
+    for p in pods.iter().filter(|p| p.provider == provider) {
+        if !bills_hourly(&p.provider, &p.status) {
+            if !gone_for_good(&p.status) && provider != "hetzner" {
+                b.storage += 1;
+            }
+            continue;
+        }
+        let price = p.cost_per_hr.filter(|c| c.is_finite() && *c >= 0.0);
+        let remembered = || remembered.and_then(|m| m.get(&p.id)).map(|(c, _)| *c);
+        // GPU stand-ins are for the prepaid GPU clouds; a Hetzner server type isn't a GPU.
+        let stand_in = || (provider != "hetzner").then(|| stand_in_price(p.gpu_type.as_deref(), p.gpu_count, policy)).flatten();
+        match price.or_else(remembered) {
             Some(c) => b.per_hr += c,
-            None => b.unpriced += 1,
+            None => match stand_in() {
+                Some(g) => {
+                    b.per_hr += g;
+                    b.guessed += 1;
+                    b.guessed_per_hr += g;
+                }
+                None => b.unpriced += 1,
+            },
         }
     }
     Some(b)
 }
 
-/// The burn to judge by (`B` in the spec): with a listing, the higher of its sum and the
-/// provider's own rate (the account drains for staff pods and volumes too); without one,
-/// the provider's rate, else the last recorded sample (stale), else unknown — **never 0**.
+/// The burn to judge by (`B` in the spec). With a listing and the provider's own rate:
+/// the higher of the rate and the pods the listing priced (the rate covers everything on
+/// the account, so stand-in guesses and floors give way to it). With a listing alone: its
+/// sum — and where running pods couldn't be priced at all, at least the last recorded
+/// burn (those pods aren't free). Without a listing: the provider's rate, else the last
+/// recorded sample (stale) — but a stale $0 says nothing about now: unknown. Never 0 for
+/// pods that run.
 pub fn burn_now(listed: Option<Burn>, provider_rate: Option<f64>, samples: &[(u64, f64)]) -> Option<Burn> {
+    let last = samples.last().map(|s| s.1);
     match (listed, provider_rate) {
-        // The provider's rate covers everything on the account, unpriced pods included.
-        (Some(l), Some(p)) => Some(Burn { per_hr: l.per_hr.max(p), unpriced: 0, stale: false }),
+        (Some(l), Some(p)) => Some(Burn { per_hr: (l.per_hr - l.guessed_per_hr).max(p), ..Default::default() }),
+        (Some(l), None) if l.unpriced > 0 => Some(Burn { per_hr: l.per_hr.max(last.unwrap_or(0.0)), ..l }),
         (Some(l), None) => Some(l),
-        (None, Some(p)) => Some(Burn { per_hr: p, unpriced: 0, stale: false }),
-        (None, None) => samples.last().map(|&(_, b)| Burn { per_hr: b, unpriced: 0, stale: true }),
+        (None, Some(p)) => Some(Burn { per_hr: p, ..Default::default() }),
+        (None, None) => last.filter(|b| *b >= NO_BURN).map(|b| Burn { per_hr: b, stale: true, ..Default::default() }),
     }
 }
 
@@ -527,6 +683,9 @@ pub struct ProviderFacts {
     pub spend_limit_per_hr: Option<f64>,
     pub under_balance: Option<bool>,
     pub at: u64,
+    /// Vast's owed amount, as read ([`Live::owed`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owed: Option<f64>,
 }
 
 /// A failing source: since when (the first failure after the last success), and the latest.
@@ -549,23 +708,37 @@ pub enum Verdict {
     Overstates,
 }
 
-/// One fallback check: what the estimate from the check anchor predicted against the live
-/// reading, over `horizon_secs`.
+/// One fallback check: what the fallback — counting down from the check anchor by the
+/// listing's burns alone, as it will once GraphQL is gone — predicted against the live
+/// reading, over `horizon_secs`: with this run's billing history (`predicted`) and with
+/// metering only (`predicted_metered`, what it says when billing is down too). The verdict
+/// is the worse of the two.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CheckRecord {
     pub at: u64,
     pub horizon_secs: u64,
     pub predicted: f64,
+    #[serde(default)]
+    pub predicted_metered: f64,
     pub live: f64,
     pub verdict: Verdict,
 }
 
-/// The most billing has ever said was spent since the anchor at `anchor_at`: a later
-/// billing failure (or a short window) can't make the estimate rise again.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+impl CheckRecord {
+    /// The higher (worse) of the two predictions.
+    pub fn worst(&self) -> f64 {
+        self.predicted.max(self.predicted_metered)
+    }
+}
+
+/// The most billing has ever said was spent in each hour since the anchor at `anchor_at`:
+/// a later billing failure (or a short window, or a bucket read lower) can't make the
+/// estimate rise again.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BilledMax {
     pub anchor_at: u64,
-    pub usd: f64,
+    /// `(hour start, USD)`, ascending.
+    pub buckets: Vec<(u64, f64)>,
 }
 
 /// Everything remembered about one account.
@@ -581,9 +754,21 @@ pub struct AccountState {
     #[serde(default)]
     pub provider: Option<ProviderFacts>,
     /// `(when, USD/h)`: change points (any rise; a drop of >1 % or >$0.01) plus an hourly
-    /// heartbeat — what metering integrates.
+    /// heartbeat — what metering integrates. The burn as judged: the provider's own rate
+    /// while it is read, stand-in prices where nothing priced a pod.
     #[serde(default)]
     pub samples: Vec<(u64, f64)>,
+    /// The same, from the listing alone — what the fallback will have once the provider's
+    /// rate is gone: the fallback check meters with these.
+    #[serde(default)]
+    pub listed_samples: Vec<(u64, f64)>,
+    /// The last price seen for each pod (`pod id → (USD/h, when seen)`): a pod later listed
+    /// without one (RunPod v1's REST list, no details) keeps it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub prices: BTreeMap<String, (f64, u64)>,
+    /// When a sample last counted a pod at a stand-in price (estimates from then are marked).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stand_in_at: Option<u64>,
     #[serde(default)]
     pub live_ok_at: Option<u64>,
     #[serde(default)]
@@ -642,12 +827,12 @@ impl BalanceState {
 // Estimates, runway, levels
 // ---------------------------------------------------------------------------------------
 
-/// Spend from `anchor_at` to `now` by arena's own metering: a step integral over the burn
-/// points — `(anchor_at, b_A)`, the samples strictly between, `(now, b_now)` — each segment
-/// charged at the **higher** of its two ends (a change between two observations is never
-/// undercounted). `b_A` is the last sample at/before the anchor, else the first after, else
-/// `b_now`. A clock that went backwards adds nothing.
-pub fn metered_spend(anchor_at: u64, samples: &[(u64, f64)], now: u64, b_now: f64) -> f64 {
+/// Spend from `anchor_at` to `now` by arena's own metering, per UTC hour: a step integral
+/// over the burn points — `(anchor_at, b_A)`, the samples strictly between, `(now, b_now)` —
+/// each segment charged at the **higher** of its two ends (a change between two observations
+/// is never undercounted) and split at hour boundaries. `b_A` is the last sample at/before
+/// the anchor, else the first after, else `b_now`. A clock that went backwards adds nothing.
+pub fn metered_by_hour(anchor_at: u64, samples: &[(u64, f64)], now: u64, b_now: f64) -> BTreeMap<u64, f64> {
     let b_a = samples
         .iter()
         .rev()
@@ -657,10 +842,47 @@ pub fn metered_spend(anchor_at: u64, samples: &[(u64, f64)], now: u64, b_now: f6
     let mut points = vec![(anchor_at, b_a)];
     points.extend(samples.iter().filter(|(t, _)| *t > anchor_at && *t < now).copied());
     points.push((now, b_now));
-    points
-        .windows(2)
-        .map(|w| w[1].0.saturating_sub(w[0].0) as f64 / 3_600.0 * w[0].1.max(w[1].1).max(0.0))
-        .sum()
+    let mut out: BTreeMap<u64, f64> = BTreeMap::new();
+    for w in points.windows(2) {
+        let rate = w[0].1.max(w[1].1).max(0.0);
+        let (mut t, end) = (w[0].0, w[1].0);
+        while t < end {
+            let hour = floor_hour(t);
+            let stop = (hour + 3_600).min(end);
+            *out.entry(hour).or_default() += (stop - t) as f64 / 3_600.0 * rate;
+            t = stop;
+        }
+    }
+    out
+}
+
+/// [`metered_by_hour`]'s total.
+pub fn metered_spend(anchor_at: u64, samples: &[(u64, f64)], now: u64, b_now: f64) -> f64 {
+    metered_by_hour(anchor_at, samples, now, b_now).values().sum()
+}
+
+/// The billing history per hour from `t`'s hour on (that first hour whole), summed per
+/// bucket; `None` when the window starts after that hour (it can't say).
+pub fn billed_hours(b: &Billed, t: u64) -> Option<BTreeMap<u64, f64>> {
+    let h = floor_hour(t);
+    if b.from > h {
+        return None;
+    }
+    let mut out: BTreeMap<u64, f64> = BTreeMap::new();
+    for (start, usd) in b.buckets.iter().filter(|(start, _)| *start >= h) {
+        *out.entry(floor_hour(*start)).or_default() += usd;
+    }
+    Some(out)
+}
+
+/// The higher of two readings per hour.
+fn max_per_hour(a: &BTreeMap<u64, f64>, b: &BTreeMap<u64, f64>) -> BTreeMap<u64, f64> {
+    let mut out = a.clone();
+    for (h, v) in b {
+        let e = out.entry(*h).or_insert(*v);
+        *e = e.max(*v);
+    }
+    out
 }
 
 /// Which spend figure an estimate used.
@@ -686,15 +908,25 @@ pub struct Estimate {
     pub usd: f64,
     pub method: Method,
     pub metered: f64,
+    /// Billing's total over the same hours, when there was a billing history.
     pub billed: Option<f64>,
 }
 
-/// The anchor minus `max(metered, billed)` (`billed` missing → metered alone). Pure.
-pub fn estimate(anchor: &Anchor, samples: &[(u64, f64)], billed: Option<f64>, b_now: f64, now: u64) -> Estimate {
-    let metered = metered_spend(anchor.at, samples, now, b_now);
-    let spend = billed.map_or(metered, |b| b.max(metered));
-    let method = if billed.is_some_and(|b| b >= metered) { Method::Billed } else { Method::Metered };
-    Estimate { usd: anchor.usd - spend, method, metered, billed }
+/// The anchor minus the spend since: per UTC hour the **higher** of what billing and
+/// metering say (`billed` per hour from the anchor's hour, which billing counts whole), so
+/// billing's lag is covered by metering hour by hour and spend arena doesn't list by
+/// billing — never one total traded for the other. No billing: metered alone. Pure.
+pub fn estimate(anchor: &Anchor, samples: &[(u64, f64)], billed: Option<&BTreeMap<u64, f64>>, b_now: f64, now: u64) -> Estimate {
+    let metered_h = metered_by_hour(anchor.at, samples, now, b_now);
+    let metered: f64 = metered_h.values().sum();
+    let Some(billed_h) = billed else {
+        return Estimate { usd: anchor.usd - metered, method: Method::Metered, metered, billed: None };
+    };
+    let first = floor_hour(anchor.at);
+    let billed_h: BTreeMap<u64, f64> = billed_h.iter().filter(|(h, _)| **h >= first && **h <= now).map(|(h, v)| (*h, *v)).collect();
+    let spend: f64 = max_per_hour(&metered_h, &billed_h).values().sum();
+    let method = if spend > metered + 1e-9 { Method::Billed } else { Method::Metered };
+    Estimate { usd: anchor.usd - spend, method, metered, billed: Some(billed_h.values().sum()) }
 }
 
 /// Hours until `balance` runs out at `burn`; `None` for no burn (below [`NO_BURN`]).
@@ -717,7 +949,9 @@ pub enum Level {
 
 /// Critical: balance ≤ 0, live `underBalance`, or runway under [`CRITICAL_HOURS`]; low:
 /// runway under `BALANCE_WARN_HOURS` (`0` turns both runway levels off, never the other
-/// two); unknown: no balance while burning or with the burn unknown; else ok — no burn too.
+/// two); unknown: no balance while burning (or with the burn unknown, or a floor), and —
+/// short of critical — running pods nobody could price (the runway is only an upper
+/// bound); else ok, a known zero burn included. A floor is never "no burn".
 pub fn level(
     balance: Option<f64>,
     under_balance: Option<bool>,
@@ -725,40 +959,73 @@ pub fn level(
     runway_hours: Option<f64>,
     policy: &BalancePolicy,
 ) -> Level {
+    let idle = burn.is_some_and(|b| b.per_hr < NO_BURN && !b.floor());
     let Some(b) = balance else {
-        return if burn.is_some_and(|b| b.per_hr < NO_BURN) { Level::Ok } else { Level::Unknown };
+        return if idle { Level::Ok } else { Level::Unknown };
     };
     if b <= 0.0 || under_balance == Some(true) {
         return Level::Critical;
     }
+    if let Some(h) = runway_hours.filter(|_| policy.warn_hours > 0.0) {
+        if h < CRITICAL_HOURS {
+            return Level::Critical;
+        }
+    }
+    let floor_unjudged = burn.is_some_and(|b| b.unpriced > 0 || (b.floor() && b.per_hr < NO_BURN));
+    if floor_unjudged {
+        return Level::Unknown;
+    }
     match runway_hours {
-        Some(h) if policy.warn_hours > 0.0 && h < CRITICAL_HOURS => Level::Critical,
         Some(h) if h < policy.warn_hours => Level::Low,
         _ => Level::Ok,
     }
 }
 
-/// The warning threshold.
+/// The warning threshold and the stand-in price.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BalancePolicy {
     pub warn_hours: f64,
+    /// $/h per GPU for a running pod nobody priced and whose GPU has no preset price.
+    pub unpriced_per_gpu: f64,
 }
 
 impl Default for BalancePolicy {
     fn default() -> Self {
-        BalancePolicy { warn_hours: DEFAULT_WARN_HOURS }
+        BalancePolicy { warn_hours: DEFAULT_WARN_HOURS, unpriced_per_gpu: DEFAULT_UNPRICED_PER_GPU }
     }
 }
 
 impl BalancePolicy {
-    /// From `BALANCE_WARN_HOURS`. Never fails: a bad value uses the default and comes back
-    /// with the one warning line to show (in `arena balance`; `config check` marks it ✗) —
-    /// a typo must never break `pods list`.
+    /// From `BALANCE_WARN_HOURS` and `BALANCE_UNPRICED_PER_GPU`. Never fails: a bad value
+    /// uses its default and comes back in the one warning line to show (in `arena balance`;
+    /// `config check` marks it ✗) — a typo must never break `pods list`.
     pub fn from_config(cfg: &Config) -> (Self, Option<String>) {
+        let mut policy = BalancePolicy::default();
+        let mut bad = Vec::new();
         match warn_hours(cfg) {
-            Ok(h) => (BalancePolicy { warn_hours: h }, None),
-            Err(e) => (BalancePolicy::default(), Some(format!("warning: {e} — using {DEFAULT_WARN_HOURS}"))),
+            Ok(h) => policy.warn_hours = h,
+            Err(e) => bad.push(format!("{e} — using {DEFAULT_WARN_HOURS}")),
         }
+        match unpriced_per_gpu(cfg) {
+            Ok(p) => policy.unpriced_per_gpu = p,
+            Err(e) => bad.push(format!("{e} — using {DEFAULT_UNPRICED_PER_GPU}")),
+        }
+        (policy, (!bad.is_empty()).then(|| format!("warning: {}", bad.join("; "))))
+    }
+}
+
+/// `BALANCE_UNPRICED_PER_GPU` as written: unset/empty → [`DEFAULT_UNPRICED_PER_GPU`]; a
+/// finite USD/h per GPU above 0 and at most 1000.
+pub fn unpriced_per_gpu(cfg: &Config) -> Result<f64, String> {
+    match cfg.get("BALANCE_UNPRICED_PER_GPU").map(str::trim) {
+        None | Some("") => Ok(DEFAULT_UNPRICED_PER_GPU),
+        Some(v) => match v.trim_start_matches('$').parse::<f64>() {
+            Ok(p) if p.is_finite() && p > 0.0 && p <= 1_000.0 => Ok(p),
+            _ => {
+                let shown = if v.chars().count() <= 12 { format!("`{v}`") } else { "a long value".into() };
+                Err(format!("BALANCE_UNPRICED_PER_GPU must be USD per GPU-hour, above 0 and at most 1000 (got {shown})"))
+            }
+        },
     }
 }
 
@@ -843,7 +1110,8 @@ pub fn apply(mut state: BalanceState, fetched: &[Fetched], burns: &Burns, mode: 
             // Another key — another account, maybe: never inherit its anchor or samples.
             *st = AccountState::new(&f.key_fp);
         }
-        apply_one(st, f, burns.get(&f.account).copied().flatten(), mode, now);
+        let seen = burns.seen.get(&f.account).map(Vec::as_slice).unwrap_or_default();
+        apply_one(st, f, burns.get(&f.account).copied().flatten(), seen, mode, now);
     }
     state
 }
@@ -853,7 +1121,24 @@ fn fail_record(prev: Option<&FailRecord>, f: &Fail, now: u64) -> FailRecord {
     FailRecord { kind: f.kind, http: f.http, detail: f.detail.clone(), since: prev.map_or(now, |p| p.since.min(now)), last: now }
 }
 
-fn apply_one(st: &mut AccountState, f: &Fetched, listed: Option<Burn>, mode: Mode, now: u64) {
+/// Forget what a clock that ran ahead left behind: samples dated past `now` (plus the
+/// skew allowance) would block every later sample until real time caught up with them.
+fn sanitize(st: &mut AccountState, now: u64) {
+    let limit = now.saturating_add(CLOCK_SKEW);
+    st.samples.retain(|(t, _)| *t <= limit);
+    st.listed_samples.retain(|(t, _)| *t <= limit);
+    for (_, at) in st.prices.values_mut() {
+        *at = (*at).min(now);
+    }
+}
+
+fn apply_one(st: &mut AccountState, f: &Fetched, listed: Option<Burn>, seen: &[(String, f64)], mode: Mode, now: u64) {
+    sanitize(st, now);
+    for (id, usd) in seen {
+        st.prices.insert(id.clone(), (*usd, now));
+    }
+    st.prices.retain(|_, (_, at)| now.saturating_sub(*at) <= SAMPLE_KEEP);
+
     let live = f.live_ok();
     let billed = f.billed_ok();
     let provider_rate = match live {
@@ -861,17 +1146,30 @@ fn apply_one(st: &mut AccountState, f: &Fetched, listed: Option<Burn>, mode: Mod
         None => st.fresh_facts(now).and_then(|p| p.burn_per_hr),
     };
     let burn = burn_now(listed, provider_rate, &st.samples);
+    // What the fallback will have once the provider's rate is gone: the listing alone.
+    let listed_burn = burn_now(listed, None, &st.listed_samples).filter(|b| !b.stale);
 
-    // The fallback check (`arena balance` only): what the estimate from the check anchor
-    // says now, against the truth just read. Burn as the fallback would see it — the
-    // listing, not the provider's rate (which goes with GraphQL).
+    // The fallback check (`arena balance` only): what the fallback would say now, counting
+    // down from the check anchor by the listing's burns alone (the samples recorded at the
+    // provider's own rate aren't what it will have) — with this run's billing, and with
+    // metering only — against the truth just read. Either reading high is "overstates".
     if let (Mode::Full, Some(l)) = (mode, live) {
-        let fallback_burn = burn_now(listed, None, &st.samples);
         let anchor = st.check_anchor.filter(|a| a.usable(now) && now.saturating_sub(a.at) >= CHECK_MIN);
-        if let (Some(ca), Some(b)) = (anchor, fallback_burn) {
-            let predicted = estimate(&ca, &st.samples, billed.and_then(|bl| billed_since(bl, ca.at)), b.per_hr, now).usd;
-            let verdict = if predicted <= l.usd + (0.05 * l.usd.abs()).max(1.0) { Verdict::Safe } else { Verdict::Overstates };
-            st.check = Some(CheckRecord { at: now, horizon_secs: now.saturating_sub(ca.at), predicted, live: l.usd, verdict });
+        let b_now = listed_burn.or_else(|| burn_now(None, None, &st.listed_samples));
+        if let (Some(ca), Some(b)) = (anchor, b_now) {
+            let hours = billed.and_then(|bl| billed_hours(bl, ca.at));
+            let with_billing = estimate(&ca, &st.listed_samples, hours.as_ref(), b.per_hr, now).usd;
+            let metered_only = estimate(&ca, &st.listed_samples, None, b.per_hr, now).usd;
+            let tolerance = (0.05 * l.usd.abs()).max(1.0);
+            let verdict = if with_billing.max(metered_only) <= l.usd + tolerance { Verdict::Safe } else { Verdict::Overstates };
+            st.check = Some(CheckRecord {
+                at: now,
+                horizon_secs: now.saturating_sub(ca.at),
+                predicted: with_billing,
+                predicted_metered: metered_only,
+                live: l.usd,
+                verdict,
+            });
         }
     }
 
@@ -885,6 +1183,7 @@ fn apply_one(st: &mut AccountState, f: &Fetched, listed: Option<Burn>, mode: Mod
                 spend_limit_per_hr: l.spend_limit_per_hr,
                 under_balance: l.under_balance,
                 at: now,
+                owed: l.owed,
             });
             st.live_ok_at = Some(now);
             st.live_fail = None;
@@ -905,24 +1204,37 @@ fn apply_one(st: &mut AccountState, f: &Fetched, listed: Option<Burn>, mode: Mod
         Some(Ok(b)) => {
             st.billing_ok_at = Some(now);
             st.billing_fail = None;
-            if let Some(v) = st.anchor.and_then(|a| billed_since(b, a.at).map(|v| (a.at, v))) {
-                let seen = st.billed_max.filter(|m| m.anchor_at == v.0).map_or(0.0, |m| m.usd);
-                st.billed_max = Some(BilledMax { anchor_at: v.0, usd: v.1.max(seen) });
+            if let Some((at, hours)) = st.anchor.and_then(|a| billed_hours(b, a.at).map(|h| (a.at, h))) {
+                // Per hour, the most billing has ever said for this anchor.
+                let seen: BTreeMap<u64, f64> =
+                    st.billed_max.as_ref().filter(|m| m.anchor_at == at).map(|m| m.buckets.iter().copied().collect()).unwrap_or_default();
+                let merged = max_per_hour(&seen, &hours);
+                st.billed_max = Some(BilledMax { anchor_at: at, buckets: merged.into_iter().collect() });
             }
         }
         Some(Err(e)) => st.billing_fail = Some(fail_record(st.billing_fail.as_ref(), e, now)),
         None => {}
     }
-    if st.billed_max.is_some_and(|m| st.anchor.is_none_or(|a| a.at != m.anchor_at)) {
+    if st.billed_max.as_ref().is_some_and(|m| st.anchor.is_none_or(|a| a.at != m.anchor_at)) {
         st.billed_max = None;
     }
 
     // A sample only from a real reading (a listing, or the provider's rate this run) —
-    // never the stale stand-in, which would only repeat itself.
+    // never the stale stand-in, which would only repeat itself. Stand-in prices are
+    // recorded as they are (they err high), and flagged.
     if let Some(b) = burn.filter(|b| !b.stale) {
         push_sample(&mut st.samples, now, b.per_hr);
+        if b.guessed > 0 {
+            st.stand_in_at = Some(now);
+        }
     }
-    prune(&mut st.samples, now);
+    if let Some(b) = listed_burn {
+        push_sample(&mut st.listed_samples, now, b.per_hr);
+    }
+    // Never thin what an anchor in use still needs.
+    let keep_since = [st.anchor, st.check_anchor].into_iter().flatten().filter(|a| a.usable(now)).map(|a| a.at).min();
+    prune_keeping(&mut st.samples, now, keep_since);
+    prune_keeping(&mut st.listed_samples, now, keep_since);
 }
 
 /// Append `(now, b)` when it is a change point or the heartbeat is due. **Any rise** (above
@@ -935,7 +1247,7 @@ fn push_sample(samples: &mut Vec<(u64, f64)>, now: u64, b: f64) {
     }
     match samples.last().copied() {
         None => samples.push((now, b)),
-        Some((t, _)) if now <= t => {} // same second, or the clock went back
+        Some((t, _)) if now <= t => {} // same second (a clock from the future is sanitised first)
         Some((t, last)) => {
             let d = b - last;
             if d > BURN_NOISE || -d > 0.01 || -d > 0.01 * last.abs() || now - t >= SAMPLE_HEARTBEAT {
@@ -945,16 +1257,27 @@ fn push_sample(samples: &mut Vec<(u64, f64)>, now: u64, b: f64) {
     }
 }
 
-/// Drop samples older than [`SAMPLE_KEEP`] (keeping the newest of those as the baseline),
-/// then cap at [`SAMPLE_MAX`].
+/// [`prune_keeping`] with no anchor to protect.
+#[cfg(test)]
 fn prune(samples: &mut Vec<(u64, f64)>, now: u64) {
-    let cutoff = now.saturating_sub(SAMPLE_KEEP);
+    prune_keeping(samples, now, None);
+}
+
+/// Drop samples older than [`SAMPLE_KEEP`] — never one an anchor from `keep_since` still
+/// needs, and always keeping the newest of the dropped as a baseline — then, over
+/// [`SAMPLE_MAX`], **coalesce** the oldest neighbours pairwise into one sample at the
+/// earlier time with the higher burn. Merging that way only ever raises the metered spend
+/// (each merged segment is charged at the higher end), so thinning never raises an
+/// estimate; dropping the oldest would meter an old anchor at today's burn.
+fn prune_keeping(samples: &mut Vec<(u64, f64)>, now: u64, keep_since: Option<u64>) {
+    let cutoff = now.saturating_sub(SAMPLE_KEEP).min(keep_since.unwrap_or(u64::MAX));
     if let Some(i) = samples.iter().rposition(|&(t, _)| t <= cutoff) {
         samples.drain(..i);
     }
-    if samples.len() > SAMPLE_MAX {
-        let extra = samples.len() - SAMPLE_MAX;
-        samples.drain(..extra);
+    while samples.len() > SAMPLE_MAX {
+        let n = (2 * (samples.len() - SAMPLE_MAX)).min(samples.len() & !1);
+        let merged: Vec<(u64, f64)> = samples[..n].chunks(2).map(|c| (c[0].0, c[0].1.max(c[1].1))).collect();
+        samples.splice(..n, merged);
     }
 }
 
@@ -987,8 +1310,13 @@ pub struct AccountView {
     pub method: Option<Method>,
     /// What the runway is judged at.
     pub burn: Option<Burn>,
-    /// The fleet's billing pods there, as listed (`None`: the listing failed).
+    /// The fleet's billing pods there, as listed — stand-in prices included (`None`: the
+    /// listing failed).
     pub listed_per_hr: Option<f64>,
+    /// The listed burn priced every pod from the listing (or a remembered price): no
+    /// stand-in, nothing unpriced. Only then is the provider's rate above it spend arena
+    /// doesn't list.
+    pub listed_exact: bool,
     pub provider_burn_per_hr: Option<f64>,
     pub spend_limit_per_hr: Option<f64>,
     pub under_balance: Option<bool>,
@@ -1003,6 +1331,10 @@ pub struct AccountView {
     /// Only the minimal live query works.
     pub live_reduced: bool,
     pub check: Option<CheckRecord>,
+    /// The estimate's metering counted pods at stand-in prices since its anchor.
+    pub stand_in: bool,
+    /// Vast's `balance` reads as this much owed (shown, never taken off).
+    pub owed: Option<f64>,
 }
 
 impl AccountView {
@@ -1017,6 +1349,7 @@ impl AccountView {
             method: None,
             burn: None,
             listed_per_hr: None,
+            listed_exact: false,
             provider_burn_per_hr: None,
             spend_limit_per_hr: None,
             under_balance: None,
@@ -1027,6 +1360,8 @@ impl AccountView {
             noted: false,
             live_reduced: false,
             check: None,
+            stand_in: false,
+            owed: None,
         }
     }
 
@@ -1062,6 +1397,7 @@ fn view(st: Option<&AccountState>, f: &Fetched, listed: Option<Burn>, policy: &B
             spend_limit_per_hr: l.spend_limit_per_hr,
             under_balance: l.under_balance,
             at: now,
+            owed: l.owed,
         }),
         None if mode != Mode::NoLive => st.fresh_facts(now),
         None => None,
@@ -1069,7 +1405,10 @@ fn view(st: Option<&AccountState>, f: &Fetched, listed: Option<Burn>, policy: &B
     let burn = burn_now(listed, facts.and_then(|p| p.burn_per_hr), &st.samples);
     let mut v = AccountView::blank(f.account.name(), "USD", Source::Unknown);
     v.listed_per_hr = listed.map(|b| b.per_hr);
+    v.listed_exact = listed.is_some_and(|b| b.exact());
     v.provider_burn_per_hr = facts.and_then(|p| p.burn_per_hr);
+    // Vast's owed figure: this reading's, else the last one's.
+    v.owed = facts.and_then(|p| p.owed).or(st.provider.and_then(|p| p.owed));
     v.spend_limit_per_hr = facts.and_then(|p| p.spend_limit_per_hr).or(st.provider.and_then(|p| p.spend_limit_per_hr));
     v.under_balance = facts.and_then(|p| p.under_balance);
     v.live_failing = if live_now.is_some() { None } else { st.live_fail.clone() };
@@ -1081,18 +1420,21 @@ fn view(st: Option<&AccountState>, f: &Fetched, listed: Option<Burn>, policy: &B
         v.balance = Some(p.usd);
         v.as_of = Some(p.at);
     } else if let (Some(a), Some(b)) = (st.anchor.filter(|a| a.usable(now)), burn) {
-        let billed_now = f.billed_ok().and_then(|bl| billed_since(bl, a.at));
-        let billed_seen = st.billed_max.filter(|m| m.anchor_at == a.at).map(|m| m.usd);
+        // Per hour, the most billing has said — this run, or ever before for this anchor.
+        let billed_now = f.billed_ok().and_then(|bl| billed_hours(bl, a.at));
+        let billed_seen: Option<BTreeMap<u64, f64>> =
+            st.billed_max.as_ref().filter(|m| m.anchor_at == a.at).map(|m| m.buckets.iter().copied().collect());
         let billed = match (billed_now, billed_seen) {
-            (Some(x), Some(y)) => Some(x.max(y)),
+            (Some(x), Some(y)) => Some(max_per_hour(&x, &y)),
             (x, y) => x.or(y),
         };
-        let e = estimate(&a, &st.samples, billed, b.per_hr, now);
+        let e = estimate(&a, &st.samples, billed.as_ref(), b.per_hr, now);
         v.source = Source::Estimate;
         v.balance = Some(e.usd);
         v.as_of = Some(a.at);
         v.anchor_source = Some(a.source);
         v.method = Some(e.method);
+        v.stand_in = st.stand_in_at.is_some_and(|t| t >= a.at) || b.guessed > 0;
     }
     v.burn = burn;
     v.runway_hours = v.balance.zip(burn).and_then(|(bal, b)| runway(bal, &b));
@@ -1108,7 +1450,7 @@ pub fn postpaid_view(listing: &Listing, pods: &[Pod]) -> Option<AccountView> {
         return None;
     }
     let mut v = AccountView::blank("hetzner", "EUR", Source::Postpaid);
-    v.burn = listed_burn(listing, pods, "hetzner");
+    v.burn = listed_burn(listing, pods, "hetzner", None, &BalancePolicy::default());
     v.listed_per_hr = v.burn.map(|b| b.per_hr);
     v.level = Level::None;
     Some(v)
@@ -1188,10 +1530,11 @@ pub fn fmt_hours(h: f64) -> String {
 }
 
 /// The RUNWAY cell: [`fmt_hours`] (`≤` instead of `≈` when the burn is a floor), `no
-/// burn`, or `?` when the balance or the burn is unknown.
+/// burn` (a known zero only), or `?` when the balance or the burn is unknown — a floor
+/// below a cent an hour included: pods nobody priced aren't free.
 pub fn fmt_runway(v: &AccountView) -> String {
     match (v.balance, v.burn, v.runway_hours) {
-        (Some(_), Some(b), _) if b.per_hr < NO_BURN => "no burn".into(),
+        (Some(_), Some(b), _) if b.per_hr < NO_BURN && !b.floor() => "no burn".into(),
         (Some(_), Some(_), Some(h)) if v.runway_upper_bound => {
             let s = fmt_hours(h);
             match s.strip_prefix('≈') {
@@ -1243,6 +1586,9 @@ pub fn source_label(v: &AccountView, now: u64) -> String {
             if let Some(m) = v.method {
                 why.push(m.label().into());
             }
+            if v.stand_in {
+                why.push("stand-in prices".into());
+            }
             format!("est. ({})", why.join(", "))
         }
         Source::Unknown => "?".into(),
@@ -1250,10 +1596,13 @@ pub fn source_label(v: &AccountView, now: u64) -> String {
     }
 }
 
-/// The BURN cell: `$0.47/h`, `≥$0.47/h` (a floor), `?`.
+/// The BURN cell: `$0.47/h`, `~$3.47/h` (stand-in prices in it), `≥$0.47/h` (a floor), `?`.
 pub fn burn_label(v: &AccountView) -> String {
     match v.burn {
-        Some(b) => format!("{}{}/h", if b.floor() { "≥" } else { "" }, money(v, b.per_hr)),
+        Some(b) => {
+            let mark = if b.floor() { "≥" } else if b.guessed > 0 { "~" } else { "" };
+            format!("{mark}{}/h", money(v, b.per_hr))
+        }
         None => "?".into(),
     }
 }
@@ -1323,7 +1672,15 @@ fn footer_part(v: &AccountView, policy: &BalancePolicy, now: u64) -> String {
         Level::Critical => s.push_str(&format!(" — {}", critical_reason(v))),
         _ => {}
     }
+    if let Some(o) = v.owed {
+        s.push_str(&format!(" ({} reports {} owed)", title_of(v), usd(o)));
+    }
     s
+}
+
+/// `RunPod` / `Vast` for a view.
+fn title_of(v: &AccountView) -> &'static str {
+    Account::from_name(&v.account).map_or("the provider", Account::title)
 }
 
 /// The one line under `pods list`'s fleet footer (and `snapshot`'s): `balance: runpod
@@ -1377,24 +1734,51 @@ fn fail_text(f: &FailRecord) -> String {
     s
 }
 
-/// The check's reading in words: `read $0.40 low`, `read $3.10 HIGH`.
+/// The check's reading in words, by its worse variant: `read $0.40 low`, `read $3.10 HIGH`
+/// (and which variant, when only metering reads high).
 fn check_words(c: &CheckRecord) -> String {
-    let d = c.predicted - c.live;
+    let d = c.worst() - c.live;
+    let which = if c.predicted_metered > c.predicted + 0.005 && d > 0.0 { " (metering alone)" } else { "" };
     if d <= 0.0 {
         format!("read {} low", usd(-d))
     } else if c.verdict == Verdict::Safe {
-        format!("read {} high (within tolerance)", usd(d))
+        format!("read {} high{which} (within tolerance)", usd(d))
     } else {
-        format!("read {} HIGH", usd(d))
+        format!("read {} HIGH{which}", usd(d))
     }
 }
 
+/// A check in one phrase, with its age — a verdict from before live started failing must
+/// not read as current: `fallback check ✓ over 1d, 3h ago (the estimate read $0.40 low)`.
+fn check_phrase(c: &CheckRecord, failing: Option<&FailRecord>, now: u64) -> String {
+    let mark = if c.verdict == Verdict::Safe { "✓" } else { "✗" };
+    let before = if failing.is_some_and(|f| c.at < f.since) { ", before live started failing" } else { "" };
+    format!(
+        "fallback check {mark} over {}, checked {} ago{before} (the estimate {})",
+        fmt_age(c.horizon_secs),
+        fmt_age(now.saturating_sub(c.at)),
+        check_words(c)
+    )
+}
+
 /// Provider spend arena doesn't list (volumes, stopped disks, serverless): the gap when the
-/// provider's rate is over the listed burn by more than a cent.
+/// provider's rate is over the listed burn by more than a cent — and only when the listing
+/// priced every pod itself: a pod at a stand-in (or at nothing) isn't spend arena doesn't
+/// list, it's spend arena couldn't price.
 fn unattributed(v: &AccountView) -> Option<f64> {
     match (v.provider_burn_per_hr, v.listed_per_hr) {
-        (Some(p), Some(l)) if p > l + 0.01 => Some(p - l),
+        (Some(p), Some(l)) if v.listed_exact && p > l + 0.01 => Some(p - l),
         _ => None,
+    }
+}
+
+/// What the live source's failure means for this row: an estimate is shown, the last
+/// reading still is (under 5 min old), or nothing usable is.
+fn failing_consequence(v: &AccountView, now: u64) -> String {
+    match v.source {
+        Source::Estimate => "estimates in use".into(),
+        Source::Live => format!("showing the reading from {} ago", fmt_age(now.saturating_sub(v.as_of.unwrap_or(now)))),
+        _ => format!("no usable reading — arena balance set {} <USD>", v.account),
     }
 }
 
@@ -1424,7 +1808,7 @@ pub fn notes(views: &[AccountView], policy: &BalancePolicy, now: u64) -> Vec<Str
             _ => {}
         }
         if let Some(f) = v.live_failing.as_ref().filter(|_| v.noted) {
-            out.push(format!("{name}: live balance failing since {} ({}) — estimates in use", date(f.since), fail_text(f)));
+            out.push(format!("{name}: live balance failing since {} ({}) — {}", date(f.since), fail_text(f), failing_consequence(v, now)));
         }
         if v.live_reduced {
             out.push(format!(
@@ -1433,14 +1817,39 @@ pub fn notes(views: &[AccountView], policy: &BalancePolicy, now: u64) -> Vec<Str
             ));
         }
         if let Some(c) = &v.check {
-            let horizon = fmt_age(c.horizon_secs);
+            let phrase = check_phrase(c, v.live_failing.as_ref(), now);
             match c.verdict {
-                Verdict::Safe => out.push(format!("{name}: fallback check ✓ over {horizon} (the estimate {})", check_words(c))),
-                Verdict::Overstates => out.push(format!(
-                    "⚠ {name}: fallback check: the estimate {} over {horizon} — don't rely on estimates",
-                    check_words(c)
-                )),
+                Verdict::Safe => out.push(format!("{name}: {phrase}")),
+                Verdict::Overstates => out.push(format!("⚠ {name}: {phrase} — don't rely on estimates")),
             }
+        }
+        if let Some(b) = v.burn.filter(|b| b.guessed > 0) {
+            out.push(format!(
+                "{name}: {} running pod(s) have no price from the listing — counted at a stand-in that errs high ({} of {}/h; \
+                 the GPU's preset price, else BALANCE_UNPRICED_PER_GPU per GPU)",
+                b.guessed,
+                usd(b.guessed_per_hr),
+                burn_label(v)
+            ));
+        }
+        if let Some(b) = v.burn.filter(|b| b.unpriced > 0) {
+            out.push(format!(
+                "{name}: {} running pod(s) have no price and no GPU to stand one in for — the burn is a floor, the runway can't be judged",
+                b.unpriced
+            ));
+        }
+        if let Some(b) = v.burn.filter(|b| b.storage > 0) {
+            out.push(format!(
+                "{name}: {} stopped pod(s) still bill their disk at a rate the listing doesn't carry — not in the burn (a floor)",
+                b.storage
+            ));
+        }
+        if let Some(o) = v.owed {
+            out.push(format!(
+                "{name}: {} reports {} owed (its `balance`) — not taken off the credit here; compare with the console",
+                title_of(v),
+                usd(o)
+            ));
         }
         if let Some(gap) = unattributed(v) {
             out.push(format!(
@@ -1470,9 +1879,16 @@ pub fn verbose_lines(views: &[AccountView], state: &BalanceState, fetched: &[Fet
         }
         let gap = match unattributed(v) {
             Some(g) => format!(" — gap {}/h not in the listing: volumes / stopped disks / serverless?", usd(g)),
+            None if !v.listed_exact && v.listed_per_hr.is_some() => {
+                " — the listing didn't price every pod (stand-ins / unpriced / stopped disks): no gap is inferred".into()
+            }
             None => String::new(),
         };
-        out.push(format!("  burn: provider {} · listed {}{gap}", opt(v.provider_burn_per_hr), opt(v.listed_per_hr)));
+        let listed = match v.burn.filter(|_| v.listed_per_hr.is_some()).map(|_| ()) {
+            Some(()) if !v.listed_exact => format!("~{}", opt(v.listed_per_hr)),
+            _ => opt(v.listed_per_hr),
+        };
+        out.push(format!("  burn: provider {} · listed {listed}{gap} · judged at {}", opt(v.provider_burn_per_hr), burn_label(v)));
         let limit = v.spend_limit_per_hr.map_or("?".into(), |l| format!("{}/h", usd(l)));
         let under = v.under_balance.map_or("?".into(), |u| u.to_string());
         out.push(format!("  spendLimit {limit} · underBalance {under}"));
@@ -1520,6 +1936,18 @@ pub fn verbose_lines(views: &[AccountView], state: &BalanceState, fetched: &[Fet
         if let Some(fr) = st.and_then(|s| s.live_reduced.as_ref()) {
             out.push(format!("  full query rejected since {} — minimal query in use", date(fr.since)));
         }
+        if let Some(c) = st.and_then(|s| s.check) {
+            out.push(format!(
+                "  check: predicted {} with billing / {} metered alone vs live {} — {}",
+                usd(c.predicted),
+                usd(c.predicted_metered),
+                usd(c.live),
+                check_phrase(&c, st.and_then(|s| s.live_fail.as_ref()), now)
+            ));
+        }
+        if let Some(st) = st {
+            out.push(format!("  samples: {} (listing-only {}), {} remembered pod price(s)", st.samples.len(), st.listed_samples.len(), st.prices.len()));
+        }
     }
     match path {
         Some(p) => out.push(format!("state file: {}", p.display())),
@@ -1561,27 +1989,54 @@ pub fn tui_parts(views: &[AccountView]) -> (Option<String>, Option<String>, Leve
     (first, last, worst)
 }
 
-/// The `create`/`up` preflight for the target provider's account: the balance, the burn now
-/// plus the new pods' (`n × the dearest option`, an upper bound) and the runway after — then
-/// RunPod's own refusals ahead of time: under an hour's credit for the new pods (it needs
-/// "at least one hour's worth"), the planned burn over the spend limit, `underBalance`.
-/// Advisory: it never blocks, and `--yes` changes nothing.
+/// The pods a `create`/`up` is about to make, for its preflight.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NewPods {
+    pub count: usize,
+    /// $/h per pod: the dearest placement option (an upper bound), or a stand-in for a GPU
+    /// nobody priced; `None` when not even a stand-in could be named.
+    pub per_pod: Option<f64>,
+    /// `per_pod` is (or includes) a stand-in that errs high.
+    pub stand_in: bool,
+}
+
+/// [`preflight_lines_with`] for an exact price (`None` = unknown).
 pub fn preflight_lines(v: &AccountView, new_pods: usize, price_per_pod: Option<f64>, policy: &BalancePolicy, now: u64) -> Vec<String> {
-    let title = Account::from_name(&v.account).map_or("the provider", Account::title);
+    preflight_lines_with(v, NewPods { count: new_pods, per_pod: price_per_pod, stand_in: false }, policy, now)
+}
+
+/// The `create`/`up` preflight for the target provider's account: the balance, the burn now
+/// plus the new pods' (`n ×` the dearest option — an upper bound — or a stand-in price that
+/// errs high, marked `~`) and the runway after — then RunPod's own refusals ahead of time:
+/// under an hour's credit for the new pods (it needs "at least one hour's worth"), the
+/// planned burn over the spend limit, `underBalance`. New pods nobody could price make the
+/// runway `?`: never a runway that treats them as free. Advisory: it never blocks, and
+/// `--yes` changes nothing.
+pub fn preflight_lines_with(v: &AccountView, new: NewPods, policy: &BalancePolicy, now: u64) -> Vec<String> {
+    let title = title_of(v);
     let head = match v.source {
         Source::Unknown => format!("balance: {} ? {}", v.account, no_reading(v)),
         _ => format!("balance: {} {} {}", v.account, balance_label(v), source_label(v, now)),
     };
+    let n = new.count;
     let now_burn = v.burn.map(|b| b.per_hr);
-    let new = price_per_pod.filter(|p| p.is_finite() && *p >= 0.0).map(|p| p * new_pods as f64);
-    let floor = if v.burn.is_some_and(|b| b.floor()) { "≥" } else { "" };
-    let now_part = now_burn.map_or("?/h now".into(), |b| format!("{floor}{}/h now", usd(b)));
-    let new_part = match new {
-        Some(x) => format!("≤{}/h for {new_pods} new pod(s)", usd(x)),
-        None => "new pods (price unknown)".into(),
+    let added = new.per_pod.filter(|p| p.is_finite() && *p >= 0.0).map(|p| p * n as f64);
+    let tilde = if new.stand_in { "~" } else { "" };
+    let now_part = match v.burn {
+        Some(_) => format!("{}/h now", burn_label(v).trim_end_matches("/h")),
+        None => "?/h now".into(),
     };
-    let after = v.balance.zip(now_burn).map(|(bal, b)| (bal, b + new.unwrap_or(0.0)));
+    let new_part = match added {
+        Some(x) if new.stand_in => format!("≤{tilde}{}/h for {n} new pod(s) (a stand-in price — nothing priced them)", usd(x)),
+        Some(x) => format!("≤{}/h for {n} new pod(s)", usd(x)),
+        None => format!("{n} new pod(s) (price unknown)"),
+    };
+    let unpriced_new = n > 0 && added.is_none();
+    let burn_floor = v.burn.is_some_and(|b| b.floor());
+    let after = v.balance.zip(now_burn).map(|(bal, b)| (bal, b + added.unwrap_or(0.0)));
     let (runway, flag) = match after {
+        _ if unpriced_new => ("? (the new pods aren't priced — no warning can be judged)".to_string(), String::new()),
+        Some((_, total)) if total < NO_BURN && burn_floor => ("?".into(), String::new()),
         Some((_, total)) if total < NO_BURN => ("no burn".to_string(), String::new()),
         Some((bal, total)) => {
             let h = bal.max(0.0) / total;
@@ -1592,25 +2047,30 @@ pub fn preflight_lines(v: &AccountView, new_pods: usize, price_per_pod: Option<f
             } else {
                 String::new()
             };
-            (fmt_hours(h), flag)
+            let h = fmt_hours(h);
+            let h = if burn_floor { h.replacen('≈', "≤", 1) } else { h };
+            (h, flag)
         }
         None => ("?".into(), String::new()),
     };
     let mut out = vec![format!("{head} · {now_part} + {new_part} → {runway}{flag}")];
     let runpod = v.account == Account::Runpod.name();
-    if let (true, Some(bal), Some(x)) = (runpod, v.balance, new) {
+    if let (true, Some(bal), Some(x)) = (runpod, v.balance, added) {
         if bal < x {
             out.push(format!(
-                "⚠ {title} needs ≥1h of credit for the new pods (≈{}); the account has {} — creates will likely fail (402)",
+                "⚠ {title} needs ≥1h of credit for the new pods (≈{tilde}{}); the account has {} — creates will likely fail (402)",
                 usd(x),
                 balance_label(v)
             ));
         }
     }
-    if let (Some(limit), Some(b), Some(x)) = (v.spend_limit_per_hr, now_burn, new) {
+    if runpod && unpriced_new {
+        out.push(format!("⚠ the new pods' price is unknown — RunPod's \"≥1h of credit\" and spend-limit checks couldn't run"));
+    }
+    if let (Some(limit), Some(b), Some(x)) = (v.spend_limit_per_hr, now_burn, added) {
         if b + x > limit {
             out.push(format!(
-                "⚠ planned {}/h exceeds {title}'s spend limit {}/h — creates past it will be refused",
+                "⚠ planned {tilde}{}/h exceeds {title}'s spend limit {}/h — creates past it will be refused",
                 usd(b + x),
                 usd(limit)
             ));
@@ -1645,6 +2105,9 @@ pub fn teardown_info(views: &[AccountView], now: u64) -> Vec<String> {
                 Account::from_name(&v.account).map_or("the provider", Account::title),
                 usd(gap)
             ));
+        }
+        if let Some(o) = v.owed {
+            out.push(format!("info: {} reports {} owed (its `balance`; not taken off the credit)", title_of(v), usd(o)));
         }
     }
     out
@@ -1703,28 +2166,43 @@ pub fn config_rows(cfg: &Config, state: &BalanceState, accounts: &[(Account, Str
         }
         Err(e) => out.push(format!("  ✗ {key:<26} {e} — {} is used", num(DEFAULT_WARN_HOURS))),
     }
+    let key = "BALANCE_UNPRICED_PER_GPU";
+    match unpriced_per_gpu(cfg) {
+        Ok(p) => {
+            let default = if cfg.get(key).is_some_and(|v| !v.trim().is_empty()) { "" } else { " (default)" };
+            out.push(format!("  ✓ {key:<26} {}{default} — $/h per GPU for a running pod nobody priced (no preset)", usd(p)));
+        }
+        Err(e) => out.push(format!("  ✗ {key:<26} {e} — {} is used", usd(DEFAULT_UNPRICED_PER_GPU))),
+    }
     for (a, fp) in accounts {
         let name = a.name();
         let Some(st) = state.get(*a, fp) else {
             out.push(format!("  · {name:<26} no reading yet — run `arena balance`"));
             continue;
         };
+        // What a failing live source leaves on screen: the last reading (under FRESH), an
+        // estimate (a usable anchor), or nothing usable.
+        let consequence = if st.fresh_facts(now).is_some() {
+            "the last reading is still shown".to_string()
+        } else if st.anchor.is_some_and(|a| a.usable(now)) {
+            "estimates in use".to_string()
+        } else {
+            format!("no usable reading (none, or older than {}) — arena balance set {name} <USD>", fmt_age(ANCHOR_MAX_AGE))
+        };
         match (&st.live_fail, st.live_ok_at) {
             (Some(f), _) if noted(f, now) => out.push(format!(
-                "  ⚠ {name:<26} live balance failing since {} ({}) — estimates in use",
+                "  ⚠ {name:<26} live balance failing since {} ({}) — {consequence}",
                 date(f.since),
                 fail_text(f)
             )),
             (Some(f), _) => out.push(format!(
-                "  · {name:<26} live balance unavailable for {} ({}) — estimates in use",
+                "  · {name:<26} live balance unavailable for {} ({}) — {consequence}",
                 fmt_age(now.saturating_sub(f.since)),
                 f.kind.label()
             )),
             (None, Some(t)) => {
                 let check = match &st.check {
-                    Some(c) if c.verdict == Verdict::Safe => {
-                        format!(" · fallback check ✓ over {} ({})", fmt_age(c.horizon_secs), check_words(c))
-                    }
+                    Some(c) if c.verdict == Verdict::Safe => format!(" · {}", check_phrase(c, None, now)),
                     _ => String::new(),
                 };
                 out.push(format!("  ✓ {name:<26} live {} ago{check}", fmt_age(now.saturating_sub(t))));
@@ -1745,11 +2223,7 @@ pub fn config_rows(cfg: &Config, state: &BalanceState, accounts: &[(Account, Str
             ));
         }
         if let Some(c) = st.check.filter(|c| c.verdict == Verdict::Overstates) {
-            out.push(format!(
-                "  ⚠ {name:<26} fallback check: the estimate {} over {} — don't rely on estimates",
-                check_words(&c),
-                fmt_age(c.horizon_secs)
-            ));
+            out.push(format!("  ⚠ {name:<26} {} — don't rely on estimates", check_phrase(&c, st.live_fail.as_ref(), now)));
         }
         if let Some(f) = &st.billing_fail {
             out.push(format!(
@@ -1773,11 +2247,31 @@ pub fn parse_state(text: &str) -> Result<BalanceState, String> {
         return Err(format!("unsupported version {} (expected {STATE_VERSION})", s.version));
     }
     for st in s.accounts.values_mut() {
-        st.samples.retain(|(_, b)| b.is_finite() && *b >= 0.0);
-        st.samples.sort_by_key(|s| s.0);
-        st.samples.dedup_by_key(|s| s.0);
+        for series in [&mut st.samples, &mut st.listed_samples] {
+            series.retain(|(_, b)| b.is_finite() && *b >= 0.0);
+            series.sort_by_key(|s| s.0);
+            series.dedup_by_key(|s| s.0);
+        }
+        st.prices.retain(|_, (c, _)| c.is_finite() && *c >= 0.0);
     }
     Ok(s)
+}
+
+/// Whether the state file at `path` can be written now: its directory can be made, and a
+/// file created in it. Inline surfaces ask before a live read — without a state that
+/// keeps, nothing remembers the last attempt, and every look would read live again.
+pub fn writable(path: &Path) -> bool {
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    if crate::snapshot::create_private_dir(dir).is_err() {
+        return false;
+    }
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+    let probe = dir.join(format!(".balance-probe-{}-{nanos}", std::process::id()));
+    let made = std::fs::OpenOptions::new().write(true).create_new(true).open(&probe).is_ok();
+    if made {
+        let _ = std::fs::remove_file(&probe);
+    }
+    made
 }
 
 /// Load tolerantly: missing → empty (normal before the first reading); unreadable, corrupt
@@ -1860,6 +2354,36 @@ pub fn record_manual(
     Ok((old, state, warning))
 }
 
+/// Remember the prices `pods` carry (a `create`/`up` result, say) for the configured
+/// accounts they belong to, so the next listing that has no price for them — RunPod v1's
+/// REST list — still does. Scoped like any reading: an entry for another key starts over.
+pub fn remember_prices(path: &Path, accounts: &[(Account, String)], pods: &[Pod], now: u64) -> std::io::Result<()> {
+    let priced: Vec<(Account, &str, &str, f64)> = pods
+        .iter()
+        .filter_map(|p| {
+            let a = Account::from_name(&p.provider)?;
+            let fp = accounts.iter().find(|(x, _)| *x == a)?.1.as_str();
+            let c = p.cost_per_hr.filter(|c| c.is_finite() && *c > 0.0)?;
+            (!p.id.is_empty()).then_some((a, fp, p.id.as_str(), c))
+        })
+        .collect();
+    if priced.is_empty() {
+        return Ok(());
+    }
+    record(path, |mut s| {
+        s.version = STATE_VERSION;
+        for (a, fp, id, c) in &priced {
+            let st = s.accounts.entry(*a).or_insert_with(|| AccountState::new(fp));
+            if st.key_fp != *fp {
+                *st = AccountState::new(fp);
+            }
+            st.prices.insert(id.to_string(), (*c, now));
+        }
+        s
+    })
+    .map(|_| ())
+}
+
 /// After an observation: record it (modes that write, with a state file) and return the
 /// state to build views from. Without a state file, or when the write fails, it is applied
 /// in memory — the surface still shows what it saw — and the second value is the warning
@@ -1902,11 +2426,34 @@ pub trait BalanceApi: Send + Sync {
     async fn live(&self, account: Account) -> Result<Live, Fail>;
     /// RunPod's hourly billing history from `from_hour` to `to`.
     async fn billed(&self, from_hour: u64, to: u64) -> Result<Billed, Fail>;
+    /// When this reader last tried `account` live, in this process — so a long-lived
+    /// surface (the TUI) keeps to [`FRESH`] even when its state file can't be saved.
+    fn last_live_attempt(&self, _account: Account) -> Option<u64> {
+        None
+    }
+    /// Remember a live attempt (see [`BalanceApi::last_live_attempt`]).
+    fn note_live_attempt(&self, _account: Account, _at: u64) {}
+}
+
+/// A reader's memory of its own live attempts.
+#[derive(Debug, Default)]
+struct Tried(std::sync::Mutex<BTreeMap<Account, u64>>);
+
+impl Tried {
+    fn get(&self, a: Account) -> Option<u64> {
+        self.0.lock().ok().and_then(|m| m.get(&a).copied())
+    }
+    fn note(&self, a: Account, at: u64) {
+        if let Ok(mut m) = self.0.lock() {
+            m.insert(a, at);
+        }
+    }
 }
 
 /// The real reads: one GraphQL *query* (never a mutation) and two GETs, the keys in the
 /// bearer header only, to fixed hosts — redirecting a key elsewhere is never configurable.
 pub struct HttpBalanceApi {
+    tried: Tried,
     client: Client,
     runpod_key: Option<String>,
     vast_key: Option<String>,
@@ -1919,6 +2466,7 @@ impl HttpBalanceApi {
     pub fn from_config(cfg: &Config) -> Self {
         let key = |a: Account| cfg.get(a.key_name()).map(str::trim).filter(|k| !k.is_empty()).map(String::from);
         HttpBalanceApi {
+            tried: Tried::default(),
             client: Client::new(),
             runpod_key: key(Account::Runpod),
             vast_key: key(Account::Vast),
@@ -1933,6 +2481,7 @@ impl HttpBalanceApi {
     #[cfg(test)]
     fn with_bases(graphql_url: &str, v2_base: &str, vast_base: &str, runpod_key: Option<&str>, vast_key: Option<&str>) -> Self {
         HttpBalanceApi {
+            tried: Tried::default(),
             client: crate::http::test_server::client(),
             runpod_key: runpod_key.map(String::from),
             vast_key: vast_key.map(String::from),
@@ -1968,6 +2517,14 @@ async fn fetch(rb: reqwest::RequestBuilder) -> Result<Value, Fail> {
 impl BalanceApi for HttpBalanceApi {
     fn accounts(&self) -> Vec<(Account, String)> {
         Account::ALL.into_iter().filter_map(|a| self.key(a).map(|k| (a, key_fp(k)))).collect()
+    }
+
+    fn last_live_attempt(&self, account: Account) -> Option<u64> {
+        self.tried.get(account)
+    }
+
+    fn note_live_attempt(&self, account: Account, at: u64) {
+        self.tried.note(account, at);
     }
 
     async fn live(&self, account: Account) -> Result<Live, Fail> {
@@ -2009,11 +2566,14 @@ impl BalanceApi for HttpBalanceApi {
 // ---------------------------------------------------------------------------------------
 
 /// Whether an inline surface should try live now: never tried, the last attempt (success
-/// or failure) at least [`FRESH`] ago, or one from the future (the clock went back).
-fn live_due(st: Option<&AccountState>, now: u64) -> bool {
-    match st.and_then(AccountState::last_live_attempt) {
+/// or failure — recorded in the state, or remembered by this reader) at least [`FRESH`]
+/// ago, or one from the future (the clock went back).
+fn live_due(st: Option<&AccountState>, remembered: Option<u64>, now: u64) -> bool {
+    let recorded = st.and_then(AccountState::last_live_attempt).filter(|t| *t <= now.saturating_add(CLOCK_SKEW));
+    let remembered = remembered.filter(|t| *t <= now.saturating_add(CLOCK_SKEW));
+    match recorded.max(remembered) {
         None => true,
-        Some(t) => t > now.saturating_add(CLOCK_SKEW) || now.saturating_sub(t) >= FRESH,
+        Some(t) => now.saturating_sub(t) >= FRESH,
     }
 }
 
@@ -2084,7 +2644,10 @@ async fn observe_one(
 ) -> Fetched {
     let mut f = Fetched::nothing(account, key_fp);
     let from = billing_from(account, st, mode, now);
-    let live = || within(deadline, api.live(account));
+    let live = || {
+        api.note_live_attempt(account, now);
+        within(deadline, api.live(account))
+    };
     let billed = |from: u64| within(deadline, api.billed(from, now));
     match mode {
         Mode::CacheOnly => {}
@@ -2102,7 +2665,7 @@ async fn observe_one(
         },
         Mode::Inline => {
             let failing = st.is_some_and(|s| s.live_fail.is_some());
-            match (live_due(st, now), from) {
+            match (live_due(st, api.last_live_attempt(account), now), from) {
                 // Within FRESH of a failed attempt: the estimate needs billing, not live.
                 (false, Some(from)) if failing => f.billed = Some(billed(from).await),
                 (false, _) => {}
@@ -2156,6 +2719,7 @@ mod fake {
         live_calls: AtomicUsize,
         billed_calls: AtomicUsize,
         billed_args: Mutex<Vec<(u64, u64)>>,
+        tried: Tried,
         panics: bool,
     }
 
@@ -2249,6 +2813,14 @@ mod fake {
             }
         }
 
+        fn last_live_attempt(&self, account: Account) -> Option<u64> {
+            self.tried.get(account)
+        }
+
+        fn note_live_attempt(&self, account: Account, at: u64) {
+            self.tried.note(account, at);
+        }
+
         async fn billed(&self, from_hour: u64, to: u64) -> Result<Billed, Fail> {
             assert!(!self.panics, "this surface must make no balance call (billing)");
             self.billed_calls.fetch_add(1, Ordering::SeqCst);
@@ -2296,7 +2868,7 @@ mod tests {
     ];
 
     fn live(usd: f64, rate: Option<f64>) -> Live {
-        Live { usd, provider_burn_per_hr: rate, spend_limit_per_hr: None, under_balance: None, reduced: false }
+        Live { usd, provider_burn_per_hr: rate, spend_limit_per_hr: None, under_balance: None, reduced: false, owed: None }
     }
 
     fn fetched(account: Account, live: Option<Result<Live, Fail>>, billed: Option<Result<Billed, Fail>>) -> Fetched {
@@ -2304,7 +2876,7 @@ mod tests {
     }
 
     fn burn(per_hr: f64) -> Option<Burn> {
-        Some(Burn { per_hr, unpriced: 0, stale: false })
+        Some(Burn { per_hr, unpriced: 0, stale: false, ..Default::default() })
     }
 
     fn burns_of(runpod: Option<Burn>, vast: Option<Burn>) -> Burns {
@@ -2371,7 +2943,7 @@ mod tests {
         let l = parse_runpod_myself(&fixture("runpod_myself")).unwrap();
         assert_eq!(
             l,
-            Live { usd: 32.54, provider_burn_per_hr: Some(0.47), spend_limit_per_hr: Some(80.0), under_balance: Some(false), reduced: false }
+            Live { usd: 32.54, provider_burn_per_hr: Some(0.47), spend_limit_per_hr: Some(80.0), under_balance: Some(false), reduced: false, owed: None }
         );
         // (case, body, Ok(usd) | Err(detail needle))
         let cases: Vec<(&str, Value, std::result::Result<f64, &str>)> = vec![
@@ -2519,15 +3091,15 @@ mod tests {
 
     #[test]
     fn burn_now_rules() {
-        let listed = Some(Burn { per_hr: 0.4, unpriced: 1, stale: false });
+        let listed = Some(Burn { per_hr: 0.4, unpriced: 1, stale: false, ..Default::default() });
         // (case, listed, provider rate, samples, want)
         let cases: Vec<(&str, Option<Burn>, Option<f64>, Vec<(u64, f64)>, Option<Burn>)> = vec![
-            ("listing + provider: the higher", listed, Some(0.6), vec![], Some(Burn { per_hr: 0.6, unpriced: 0, stale: false })),
-            ("listing above provider", listed, Some(0.1), vec![], Some(Burn { per_hr: 0.4, unpriced: 0, stale: false })),
+            ("listing + provider: the higher", listed, Some(0.6), vec![], Some(Burn { per_hr: 0.6, unpriced: 0, stale: false, ..Default::default() })),
+            ("listing above provider", listed, Some(0.1), vec![], Some(Burn { per_hr: 0.4, unpriced: 0, stale: false, ..Default::default() })),
             ("listing alone keeps its unpriced floor", listed, None, vec![], listed),
             ("listed nothing: a real zero", burn(0.0), None, vec![(NOW - H, 2.0)], burn(0.0)),
             ("no listing: the provider rate", None, Some(0.3), vec![(NOW - H, 2.0)], burn(0.3)),
-            ("no listing, no rate: last sample, stale", None, None, vec![(NOW - 2 * H, 1.0), (NOW - H, 2.0)], Some(Burn { per_hr: 2.0, unpriced: 0, stale: true })),
+            ("no listing, no rate: last sample, stale", None, None, vec![(NOW - 2 * H, 1.0), (NOW - H, 2.0)], Some(Burn { per_hr: 2.0, unpriced: 0, stale: true, ..Default::default() })),
             // Unknown is never zero.
             ("nothing at all: unknown", None, None, vec![], None),
         ];
@@ -2541,7 +3113,8 @@ mod tests {
         ]);
         let pods = l.pods();
         let b = burns(&l, &pods);
-        assert_eq!(b[&Account::Runpod], Some(Burn { per_hr: 0.25, unpriced: 1, stale: false }));
+        // The EXITED pod still bills its disk at a rate the listing doesn't carry: a floor.
+        assert_eq!(b[&Account::Runpod], Some(Burn { per_hr: 0.25, unpriced: 1, storage: 1, ..Default::default() }));
         assert_eq!(b[&Account::Vast], None);
         let none = burns(&listing(vec![("runpod", Ok(vec![]))]), &[]);
         assert_eq!((none[&Account::Runpod], none[&Account::Vast]), (burn(0.0), None), "not queried is unknown too");
@@ -2549,8 +3122,8 @@ mod tests {
 
     #[test]
     fn level_table() {
-        let p = |h: f64| BalancePolicy { warn_hours: h };
-        let b = |r: f64| Burn { per_hr: r, unpriced: 0, stale: false };
+        let p = |h: f64| BalancePolicy { warn_hours: h, ..Default::default() };
+        let b = |r: f64| Burn { per_hr: r, unpriced: 0, stale: false, ..Default::default() };
         let lv = |bal: Option<f64>, under: Option<bool>, burn: Option<Burn>, pol: f64| {
             let runway = bal.zip(burn).and_then(|(x, y)| runway(x, &y));
             level(bal, under, burn.as_ref(), runway, &p(pol))
@@ -2595,17 +3168,17 @@ mod tests {
         assert_eq!(v(Some(10.0), burn(0.0)), "no burn");
         assert_eq!(v(Some(10.0), None), "?");
         assert_eq!(v(None, burn(1.0)), "?");
-        assert_eq!(v(Some(74.4), Some(Burn { per_hr: 1.0, unpriced: 2, stale: false })), "≤3.1d");
-        assert_eq!(v(Some(0.2), Some(Burn { per_hr: 1.0, unpriced: 0, stale: true })), "<1h");
+        assert_eq!(v(Some(74.4), Some(Burn { per_hr: 1.0, unpriced: 2, stale: false, ..Default::default() })), "≤3.1d");
+        assert_eq!(v(Some(0.2), Some(Burn { per_hr: 1.0, unpriced: 0, stale: true, ..Default::default() })), "<1h");
     }
 
     #[test]
     fn policy_from_config() {
         let p = |t: &str| BalancePolicy::from_config(&Config::parse(t));
-        assert_eq!(p(""), (BalancePolicy { warn_hours: 72.0 }, None));
-        assert_eq!(p("BALANCE_WARN_HOURS=\"\""), (BalancePolicy { warn_hours: 72.0 }, None));
-        assert_eq!(p("BALANCE_WARN_HOURS=0"), (BalancePolicy { warn_hours: 0.0 }, None));
-        assert_eq!(p("BALANCE_WARN_HOURS=1.5"), (BalancePolicy { warn_hours: 1.5 }, None));
+        assert_eq!(p(""), (BalancePolicy { warn_hours: 72.0, ..Default::default() }, None));
+        assert_eq!(p("BALANCE_WARN_HOURS=\"\""), (BalancePolicy { warn_hours: 72.0, ..Default::default() }, None));
+        assert_eq!(p("BALANCE_WARN_HOURS=0"), (BalancePolicy { warn_hours: 0.0, ..Default::default() }, None));
+        assert_eq!(p("BALANCE_WARN_HOURS=1.5"), (BalancePolicy { warn_hours: 1.5, ..Default::default() }, None));
         for bad in ["-1", "two days", "inf", "NaN"] {
             let (pol, warn) = p(&format!("BALANCE_WARN_HOURS=\"{bad}\""));
             assert_eq!(pol.warn_hours, 72.0, "{bad}: the default is used");
@@ -2622,7 +3195,7 @@ mod tests {
         let none = || fetched(Account::Runpod, None, None);
         let failing = || fetched(Account::Runpod, Some(Err(gone())), None);
         let with_facts = |at: u64| AccountState {
-            provider: Some(ProviderFacts { usd: 40.0, burn_per_hr: Some(0.5), spend_limit_per_hr: None, under_balance: None, at }),
+            provider: Some(ProviderFacts { usd: 40.0, burn_per_hr: Some(0.5), spend_limit_per_hr: None, under_balance: None, at, owed: None }),
             ..anchored(40.0, NOW - at, AnchorSource::Live)
         };
         let billing = |usd: f64| Billed { buckets: vec![(NOW - 2 * H, usd)], from: NOW - 3 * H, to: NOW + H };
@@ -2633,7 +3206,8 @@ mod tests {
             ("fresh cache, --no-live", with_facts(NOW - 100), none(), Mode::NoLive, Source::Estimate, Some(40.0 - 100.0 / 3_600.0), Some(Method::Metered)),
             ("cache too old", with_facts(NOW - FRESH), none(), Mode::Inline, Source::Estimate, Some(40.0 - FRESH as f64 / 3_600.0), Some(Method::Metered)),
             ("metered wins", anchored(50.0, 2 * H, AnchorSource::Live), fetched(Account::Runpod, Some(Err(gone())), Some(Ok(billing(0.5)))), Mode::Inline, Source::Estimate, Some(48.0), Some(Method::Metered)),
-            ("billed wins", anchored(50.0, 2 * H, AnchorSource::Live), fetched(Account::Runpod, Some(Err(gone())), Some(Ok(billing(5.0)))), Mode::Inline, Source::Estimate, Some(45.0), Some(Method::Billed)),
+            // Per hour: the billed $5 for the first hour, metering's $1 for the unbilled second.
+            ("billed wins", anchored(50.0, 2 * H, AnchorSource::Live), fetched(Account::Runpod, Some(Err(gone())), Some(Ok(billing(5.0)))), Mode::Inline, Source::Estimate, Some(44.0), Some(Method::Billed)),
             ("manual", anchored(250.0, H, AnchorSource::Manual), failing(), Mode::Inline, Source::Estimate, Some(249.0), Some(Method::Metered)),
             ("13.9 d", anchored(500.0, 13 * 86_400 + 21 * H, AnchorSource::Live), failing(), Mode::Inline, Source::Estimate, Some(500.0 - 333.0), Some(Method::Metered)),
             ("14.1 d", anchored(500.0, 14 * 86_400 + 3 * H, AnchorSource::Live), failing(), Mode::Inline, Source::Unknown, None, None),
@@ -2870,7 +3444,10 @@ mod tests {
         let with_billing = fetched(Account::Runpod, Some(Err(gone())), Some(Ok(billing)));
         s = apply(s, &[with_billing], &b, Mode::Inline, NOW + 10 * H);
         let st = &s.accounts[&Account::Runpod];
-        assert_eq!((st.billing_ok_at, st.billed_max), (Some(NOW + 10 * H), Some(BilledMax { anchor_at: NOW + 9 * H, usd: 0.3 })));
+        assert_eq!(
+            (st.billing_ok_at, st.billed_max.clone()),
+            (Some(NOW + 10 * H), Some(BilledMax { anchor_at: NOW + 9 * H, buckets: vec![(floor_hour(NOW + 9 * H), 0.3)] }))
+        );
         let billing_down = fetched(Account::Runpod, Some(Err(gone())), Some(Err(Fail { kind: FailKind::Auth, http: Some(403), detail: None })));
         s = apply(s, &[billing_down], &b, Mode::Inline, NOW + 10 * H + 60);
         assert_eq!(s.accounts[&Account::Runpod].billing_fail.as_ref().map(|f| f.kind), Some(FailKind::Auth));
@@ -2936,7 +3513,7 @@ mod tests {
         let b = burn(0.47);
         let live_view = one_view(&BalanceState::default(), &fetched(Account::Runpod, Some(Ok(live(32.54, Some(0.47)))), None), b, Mode::Inline, NOW);
         let mut cached = state_with(AccountState {
-            provider: Some(ProviderFacts { usd: 32.54, burn_per_hr: Some(0.47), spend_limit_per_hr: None, under_balance: None, at: NOW - 180 }),
+            provider: Some(ProviderFacts { usd: 32.54, burn_per_hr: Some(0.47), spend_limit_per_hr: None, under_balance: None, at: NOW - 180, owed: None }),
             ..anchored(32.54, 180, AnchorSource::Live)
         });
         let cache_view = one_view(&cached, &fetched(Account::Runpod, None, None), b, Mode::Inline, NOW);
@@ -3028,7 +3605,7 @@ mod tests {
     #[test]
     fn render_table() {
         let mut hz = AccountView::blank("hetzner", "EUR", Source::Postpaid);
-        hz.burn = Some(Burn { per_hr: 0.006, unpriced: 0, stale: false });
+        hz.burn = Some(Burn { per_hr: 0.006, unpriced: 0, stale: false, ..Default::default() });
         hz.level = Level::None;
         let views = vec![lv(Account::Runpod, 48.0, 0.5), lv(Account::Vast, 3.0, 0.5), hz];
         let text = super::render_table(&views, NOW);
@@ -3056,18 +3633,19 @@ mod tests {
     fn notes_table() {
         let mut v = lv(Account::Runpod, 32.54, 0.47);
         v.listed_per_hr = Some(0.12);
-        v.check = Some(CheckRecord { at: NOW, horizon_secs: 26 * H, predicted: 32.14, live: 32.54, verdict: Verdict::Safe });
+        v.check = Some(CheckRecord { at: NOW, horizon_secs: 26 * H, predicted: 32.14, predicted_metered: 32.14, live: 32.54, verdict: Verdict::Safe });
         let mut bad = lv(Account::Vast, 10.0, 0.1);
-        bad.check = Some(CheckRecord { at: NOW, horizon_secs: 26 * H, predicted: 13.1, live: 10.0, verdict: Verdict::Overstates });
+        bad.check = Some(CheckRecord { at: NOW, horizon_secs: 26 * H, predicted: 13.1, predicted_metered: 13.1, live: 10.0, verdict: Verdict::Overstates });
         bad.live_failing = Some(FailRecord { kind: FailKind::Drift, http: Some(400), detail: Some("Cannot query field \"credit\"".into()), since: NOW - 86_400, last: NOW });
         bad.noted = true;
         let unknown = one_view(&BalanceState::default(), &fetched(Account::Runpod, Some(Err(gone())), None), burn(0.5), Mode::Inline, NOW);
         let n = notes(&[v, bad, unknown], &policy(), NOW);
         let want = [
-            "runpod: fallback check ✓ over 1d (the estimate read $0.40 low)",
+            "runpod: fallback check ✓ over 1d, checked 0s ago (the estimate read $0.40 low)",
             "runpod: RunPod reports $0.35/h more than arena lists (network volumes, stopped pods' disks, serverless?)",
-            "vast: live balance failing since 2026-10-07 12:00 UTC (drift, HTTP 400: Cannot query field \"credit\") — estimates in use",
-            "⚠ vast: fallback check: the estimate read $3.10 HIGH over 1d — don't rely on estimates",
+            // The row is still the (cached) live reading: no estimate is in use.
+            "vast: live balance failing since 2026-10-07 12:00 UTC (drift, HTTP 400: Cannot query field \"credit\") — showing the reading from 0s ago",
+            "⚠ vast: fallback check ✗ over 1d, checked 0s ago (the estimate read $3.10 HIGH) — don't rely on estimates",
             "? runpod: no usable reading — read the balance off the console and run `arena balance set runpod <USD>`",
         ];
         for w in want {
@@ -3100,7 +3678,20 @@ mod tests {
         assert_eq!(lines[3], "‼ RunPod reports the account under its minimum balance — creates will likely fail");
         // The single-spec path: price unknown.
         let rich = lv(Account::Runpod, 500.0, 0.47);
-        assert_eq!(preflight_lines(&rich, 1, None, &p, NOW), ["balance: runpod $500.00 live · $0.47/h now + new pods (price unknown) → ≈44.3d"]);
+        // An unknown price is never treated as free: no runway, and RunPod's checks can't run.
+        assert_eq!(
+            preflight_lines(&rich, 1, None, &p, NOW),
+            [
+                "balance: runpod $500.00 live · $0.47/h now + 1 new pod(s) (price unknown) → ? (the new pods aren't priced — no warning can be judged)",
+                "⚠ the new pods' price is unknown — RunPod's \"≥1h of credit\" and spend-limit checks couldn't run",
+            ]
+        );
+        // A stand-in price (nothing priced the GPU) counts, marked.
+        let lines = preflight_lines_with(&rich, NewPods { count: 2, per_pod: Some(3.0), stand_in: true }, &p, NOW);
+        assert_eq!(
+            lines,
+            ["balance: runpod $500.00 live · $0.47/h now + ≤~$6.00/h for 2 new pod(s) (a stand-in price — nothing priced them) → ≈3.2d"]
+        );
         // Vast: no RunPod-specific lines.
         let vast = lv(Account::Vast, 0.1, 0.0);
         assert_eq!(preflight_lines(&vast, 4, Some(0.3), &p, NOW).len(), 1);
@@ -3164,7 +3755,7 @@ mod tests {
         );
         // A live reading younger than FRESH: it wins for now, and that is said.
         let s = state_with(AccountState {
-            provider: Some(ProviderFacts { usd: 31.0, burn_per_hr: Some(0.5), spend_limit_per_hr: None, under_balance: None, at: NOW - 60 }),
+            provider: Some(ProviderFacts { usd: 31.0, burn_per_hr: Some(0.5), spend_limit_per_hr: None, under_balance: None, at: NOW - 60, owed: None }),
             ..anchored(250.0, 0, AnchorSource::Manual)
         });
         let lines = set_lines(old, &s, Account::Runpod, FP, &p, NOW);
@@ -3178,14 +3769,15 @@ mod tests {
         let accounts = vec![(Account::Runpod, FP.to_string()), (Account::Vast, FP.to_string())];
         let mut s = state_with(AccountState {
             live_ok_at: Some(NOW - 240),
-            check: Some(CheckRecord { at: NOW, horizon_secs: 26 * H, predicted: 32.14, live: 32.54, verdict: Verdict::Safe }),
+            check: Some(CheckRecord { at: NOW, horizon_secs: 26 * H, predicted: 32.14, predicted_metered: 32.14, live: 32.54, verdict: Verdict::Safe }),
             ..anchored(32.54, 240, AnchorSource::Live)
         });
         assert_eq!(
             config_rows(&cfg, &s, &accounts, NOW),
             [
                 "  ✓ BALANCE_WARN_HOURS         72 (default) — warn below 3d of runway",
-                "  ✓ runpod                     live 4m ago · fallback check ✓ over 1d (read $0.40 low)",
+                "  ✓ BALANCE_UNPRICED_PER_GPU   $3.00 (default) — $/h per GPU for a running pod nobody priced (no preset)",
+                "  ✓ runpod                     live 4m ago · fallback check ✓ over 1d, checked 0s ago (the estimate read $0.40 low)",
                 "  · vast                       no reading yet — run `arena balance`",
             ]
         );
@@ -3197,21 +3789,33 @@ mod tests {
             since: 1_796_256_000, // 2026-12-03
             last: NOW,
         });
-        st.check = Some(CheckRecord { at: NOW, horizon_secs: 26 * H, predicted: 13.1, live: 10.0, verdict: Verdict::Overstates });
+        st.check = Some(CheckRecord { at: NOW, horizon_secs: 26 * H, predicted: 13.1, predicted_metered: 13.1, live: 10.0, verdict: Verdict::Overstates });
         st.billing_fail = Some(FailRecord { kind: FailKind::Auth, http: Some(403), detail: None, since: NOW, last: NOW });
         st.live_reduced = Some(FailRecord { kind: FailKind::Drift, http: None, detail: None, since: NOW - H, last: NOW });
-        let rows = config_rows(&Config::parse("BALANCE_WARN_HOURS=soon"), &s, &accounts[..1], NOW);
+        let rows = config_rows(&Config::parse("BALANCE_WARN_HOURS=soon\nBALANCE_UNPRICED_PER_GPU=free"), &s, &accounts[..1], NOW);
         assert_eq!(
             rows,
             [
                 "  ✗ BALANCE_WARN_HOURS         BALANCE_WARN_HOURS must be a number of hours ≥ 0 (got `soon`) — 72 is used",
+                "  ✗ BALANCE_UNPRICED_PER_GPU   BALANCE_UNPRICED_PER_GPU must be USD per GPU-hour, above 0 and at most 1000 (got `free`) — $3.00 is used",
                 "  ⚠ runpod                     live balance failing since 2026-12-03 00:00 UTC (drift, HTTP 400: Cannot query field \"clientBalance\" on type \"User\".) — estimates in use",
                 "  ⚠ runpod                     full balance query rejected since 2026-10-08 11:00 UTC — live via the minimal query (no burn/limit/underBalance)",
-                "  ⚠ runpod                     fallback check: the estimate read $3.10 HIGH over 1d — don't rely on estimates",
+                "  ⚠ runpod                     fallback check ✗ over 1d, checked 0s ago, before live started failing (the estimate read $3.10 HIGH) — don't rely on estimates",
                 "  ⚠ runpod                     billing history failing (auth, HTTP 403) — estimates use arena's own metering only",
             ]
         );
-        assert_eq!(config_rows(&Config::parse("BALANCE_WARN_HOURS=0"), &s, &[], NOW), ["  ✓ BALANCE_WARN_HOURS         0 — runway warnings off"]);
+        // BC10: past 14 days the anchor is unusable — the row says so, not "estimates in use".
+        let st = s.accounts.get_mut(&Account::Runpod).unwrap();
+        st.anchor = Some(Anchor { usd: 32.54, at: NOW - 15 * 86_400, source: AnchorSource::Live });
+        let rows = config_rows(&Config::parse(""), &s, &accounts[..1], NOW);
+        assert!(rows[2].ends_with("— no usable reading (none, or older than 14d) — arena balance set runpod <USD>"), "{rows:?}");
+        assert_eq!(
+            config_rows(&Config::parse("BALANCE_WARN_HOURS=0\nBALANCE_UNPRICED_PER_GPU=4.5"), &s, &[], NOW),
+            [
+                "  ✓ BALANCE_WARN_HOURS         0 — runway warnings off",
+                "  ✓ BALANCE_UNPRICED_PER_GPU   $4.50 — $/h per GPU for a running pod nobody priced (no preset)",
+            ]
+        );
     }
 
     #[test]
@@ -3583,7 +4187,7 @@ mod tests {
                     barrier.wait();
                     for i in 0..25u64 {
                         let f = Fetched { account: a, key_fp: FP.into(), live: Some(Ok(live(100.0 + i as f64, None))), billed: None };
-                        record(&path, |s| apply(s, &[f], &BTreeMap::new(), Mode::Inline, NOW + i)).unwrap();
+                        record(&path, |s| apply(s, &[f], &Burns::new(), Mode::Inline, NOW + i)).unwrap();
                     }
                 })
             })
@@ -3671,5 +4275,618 @@ mod tests {
         for secret in CANARIES.iter().chain(&[RP_KEY, VAST_KEY, "canary-user", "Canary Owner"]) {
             assert!(!seen.contains(secret), "{secret} leaked");
         }
+    }
+
+    // ---- Review fixes: the fallback check, `billed_max`, stand-in prices, writability ----
+
+    /// RunPod lists $1/h of pods but reports $1.50/h (volumes, stopped disks); live $100 at
+    /// t0. Returns the account after `steps` of `(when, live USD, mode, billing)`.
+    fn check_run(steps: &[(u64, f64, Mode, Option<std::result::Result<Billed, Fail>>)]) -> AccountState {
+        let listed = burns_of(burn(1.0), None);
+        let mut s = BalanceState::default();
+        for (t, usd, mode, billed) in steps {
+            let f = fetched(Account::Runpod, Some(Ok(live(*usd, Some(1.5)))), billed.clone());
+            s = apply(s, &[f], &listed, *mode, *t);
+        }
+        s.accounts[&Account::Runpod].clone()
+    }
+
+    /// Mutant `checkrate`: the check must end its metering at the listing's burn, not at
+    /// RunPod's own rate (which the fallback won't have). One segment over the whole
+    /// horizon makes the end point decide it.
+    #[test]
+    fn check_ends_at_the_listing_burn_not_the_provider_rate() {
+        let t0 = NOW - 24 * H;
+        let st = check_run(&[(t0, 100.0, Mode::Full, None), (NOW, 64.0, Mode::Full, None)]);
+        let c = st.check.unwrap();
+        assert_eq!((c.predicted_metered, c.verdict), (76.0, Verdict::Overstates), "{c:?}");
+    }
+
+    /// Mutant `checknobill`: the check runs with this run's billing too — that variant (what
+    /// RunPod's fallback shows while billing works) is recorded — and with metering alone;
+    /// the worse decides. Here billing sees the $1.50/h, so only metering alone reads high.
+    #[test]
+    fn check_runs_with_billing_and_with_metering_alone() {
+        let t0 = NOW - 24 * H;
+        let buckets: Vec<(u64, f64)> = (0..24u64).map(|i| (t0 + i * H, 1.5)).collect();
+        let billing = Billed { buckets, from: t0, to: NOW + H };
+        let st = check_run(&[(t0, 100.0, Mode::Full, None), (NOW, 64.0, Mode::Full, Some(Ok(billing)))]);
+        let c = st.check.unwrap();
+        assert!((c.predicted - 64.0).abs() < 1e-9, "with billing: {c:?}");
+        assert!((c.predicted_metered - 76.0).abs() < 1e-9, "metering alone: {c:?}");
+        assert_eq!(c.verdict, Verdict::Overstates, "metering alone would read $12 high");
+        // Notes say which variant read high.
+        let mut v = lv(Account::Runpod, 64.0, 1.5);
+        v.check = Some(c);
+        assert!(notes(&[v], &policy(), NOW).iter().any(|n| n.contains("HIGH (metering alone)")));
+    }
+
+    /// Mutant `checkfromanchor`: an inline live read moves the anchor, not the check
+    /// anchor — the check still counts down from the check anchor, a day back.
+    #[test]
+    fn check_counts_down_from_the_check_anchor_not_the_anchor() {
+        let t0 = NOW - 24 * H;
+        let st = check_run(&[(t0, 100.0, Mode::Full, None), (NOW - H, 65.5, Mode::Inline, None), (NOW, 64.0, Mode::Full, None)]);
+        assert_eq!(st.anchor.map(|a| a.at), Some(NOW));
+        let c = st.check.unwrap();
+        assert_eq!((c.horizon_secs, c.verdict), (24 * H, Verdict::Overstates), "{c:?}");
+    }
+
+    /// Mutant `nomaxseen`: `billed_max` keeps, per hour, the most billing ever said for the
+    /// anchor — a later read of a bucket that comes back lower (or a billing failure) can't
+    /// make the estimate rise.
+    #[test]
+    fn billed_max_keeps_the_highest_reading_per_hour() {
+        let a = NOW - 3 * H;
+        let st = AccountState { samples: vec![(a, 0.5)], ..anchored(50.0, 3 * H, AnchorSource::Live) };
+        let mut s = state_with(st);
+        let read = |usd: f64| Billed { buckets: vec![(a, usd), (a + H, 0.5)], from: a, to: NOW + H };
+        let b = burns_of(burn(0.5), None);
+        let at = |billed| fetched(Account::Runpod, Some(Err(gone())), Some(billed));
+        s = apply(s, &[at(Ok(read(3.0)))], &b, Mode::Inline, NOW - H);
+        s = apply(s, &[at(Ok(read(1.0)))], &b, Mode::Inline, NOW - H + 60);
+        assert_eq!(s.accounts[&Account::Runpod].billed_max.clone().unwrap().buckets, vec![(a, 3.0), (a + H, 0.5)]);
+        let down = at(Err(Fail::transient("503")));
+        s = apply(s, std::slice::from_ref(&down), &b, Mode::Inline, NOW);
+        let v = one_view(&s, &down, burn(0.5), Mode::Inline, NOW);
+        // Hour 1: billed $3 (seen earlier); hour 2: max($0.50, metered $0.50); hour 3: metered $0.50.
+        assert!((v.balance.unwrap() - 46.0).abs() < 1e-9, "{v:?}");
+    }
+
+    #[test]
+    fn stand_in_price_table() {
+        let p = policy();
+        // (gpu type, count, want) — the dearer preset price, else the per-GPU ceiling.
+        let cases: Vec<(Option<&str>, Option<u32>, Option<f64>)> = vec![
+            (Some("NVIDIA RTX A4000"), Some(1), Some(0.32)),
+            (Some("RTX 3090"), Some(2), Some(0.86)),
+            (Some("2×RTX A4000"), None, Some(0.64)),
+            (Some("NVIDIA H100 80GB HBM3"), Some(1), Some(2.79)),
+            (Some("Mystery GPU"), Some(1), Some(3.0)),
+            (None, Some(4), Some(12.0)),
+            (Some("-"), None, None),
+            (None, None, None),
+            (None, Some(0), None),
+        ];
+        for (ty, n, want) in cases {
+            let got = stand_in_price(ty, n, &p);
+            assert!(got.zip(want).map_or(got == want, |(g, w)| (g - w).abs() < 1e-9), "{ty:?} ×{n:?}: {got:?} != {want:?}");
+        }
+        let dear = BalancePolicy { unpriced_per_gpu: 4.5, ..Default::default() };
+        assert_eq!(stand_in_price(None, Some(2), &dear), Some(9.0));
+        // The default ceiling is above every preset community price, and the H100's secure one.
+        let community = crate::gpu::PRESETS.iter().map(|g| g.community).fold(0.0, f64::max);
+        let h100 = crate::gpu::PRESETS.iter().find(|g| g.label == "H100").map(|g| g.secure).unwrap();
+        assert!(DEFAULT_UNPRICED_PER_GPU > community && DEFAULT_UNPRICED_PER_GPU > h100);
+    }
+
+    /// Every running pod gets a price that errs high: the listing's, the last one seen for
+    /// that pod, a stand-in; only a pod with no GPU at all stays unpriced. Hetzner (a CPU VM,
+    /// EUR) never gets a GPU stand-in.
+    #[test]
+    fn burns_price_running_pods_by_memory_or_stand_in() {
+        let gpu = |id: &str, cost: Option<f64>, n: Option<u32>| Pod {
+            id: id.into(),
+            provider: "runpod".into(),
+            status: "RUNNING".into(),
+            cost_per_hr: cost,
+            gpu_count: n,
+            ..Default::default()
+        };
+        // A priced look (enriched): p1 at $0.50 is remembered.
+        let l1 = listing(vec![("runpod", Ok(vec![gpu("p1", Some(0.5), Some(1))]))]);
+        let b1 = burns_with(&l1, &l1.pods(), &BalanceState::default(), &policy());
+        assert_eq!(b1.seen[&Account::Runpod], vec![("p1".to_string(), 0.5)]);
+        let s = apply(BalanceState::default(), &[fetched(Account::Runpod, Some(Ok(live(50.0, None))), None)], &b1, Mode::Inline, NOW - H);
+        assert_eq!(s.accounts[&Account::Runpod].prices["p1"], (0.5, NOW - H));
+        // An unpriced look (v1 REST, no details): p1 from memory, p2 at a stand-in, p3 unpriced.
+        let l2 = listing(vec![("runpod", Ok(vec![gpu("p1", None, Some(1)), gpu("p2", None, Some(2)), gpu("p3", None, None)]))]);
+        let b2 = burns_with(&l2, &l2.pods(), &s, &policy());
+        let rp = b2[&Account::Runpod].unwrap();
+        assert_eq!((rp.per_hr, rp.guessed, rp.guessed_per_hr, rp.unpriced), (0.5 + 6.0, 1, 6.0, 1));
+        // With RunPod's own rate known, the guesses give way to it (it covers the account).
+        assert_eq!(burn_now(Some(rp), Some(0.9), &[]).unwrap().per_hr, 0.9);
+        assert_eq!(burn_now(Some(rp), Some(0.1), &[]).unwrap().per_hr, 0.5, "the remembered price still counts");
+        // The guess is recorded as a sample (it errs high) and flags the estimate.
+        let f = fetched(Account::Runpod, Some(Err(gone())), None);
+        let s = apply(s, std::slice::from_ref(&f), &b2, Mode::Inline, NOW);
+        assert!(s.accounts[&Account::Runpod].samples.iter().any(|(t, b)| *t == NOW && *b >= 6.5));
+        let v = views(&s, std::slice::from_ref(&f), &b2, &policy(), Mode::Inline, NOW + 600).remove(0);
+        assert!(source_label(&v, NOW + 600).contains("stand-in prices"), "{v:?}");
+        assert_eq!(burn_label(&v), "≥$6.50/h", "unpriced p3 makes it a floor");
+        // Hetzner: no GPU stand-in for a server type.
+        let l3 = listing(vec![("hetzner", Ok(vec![Pod { provider: "hetzner".into(), status: "running".into(), gpu_type: Some("cx23".into()), ..Default::default() }]))]);
+        assert_eq!(postpaid_view(&l3, &l3.pods()).unwrap().burn.unwrap().unpriced, 1);
+    }
+
+    #[test]
+    fn a_guessed_burn_is_judged_and_shown_with_a_tilde() {
+        let guessed = Burn { per_hr: 3.0, guessed: 1, guessed_per_hr: 3.0, ..Default::default() };
+        let mut v = lv(Account::Runpod, 30.0, 3.0);
+        v.burn = Some(guessed);
+        v.runway_hours = runway(30.0, &guessed);
+        v.level = level(Some(30.0), None, Some(&guessed), v.runway_hours, &policy());
+        assert_eq!((burn_label(&v).as_str(), fmt_runway(&v).as_str(), v.level), ("~$3.00/h", "≈10h", Level::Critical));
+        assert!(notes(&[v], &policy(), NOW).iter().any(|n| n.contains("1 running pod(s) have no price from the listing — counted at a stand-in")));
+    }
+
+    #[test]
+    fn writable_probes_the_state_dir() {
+        let dir = tmp("writable");
+        assert!(writable(&dir.0.join("devtest").join("balance.json")));
+        assert!(dir.0.join("devtest").is_dir(), "the state dir is made");
+        let names: Vec<_> = std::fs::read_dir(dir.0.join("devtest")).unwrap().collect();
+        assert!(names.is_empty(), "the probe file is removed");
+        std::fs::write(dir.0.join("file"), "").unwrap();
+        assert!(!writable(&dir.0.join("file").join("balance.json")), "a file where the dir should be");
+    }
+
+    // ---- Adversarial review (balance safety): regression tests, expected to FAIL on d2cbe31 ----
+
+    /// A RunPod v1 fleet as REST lists it — no `$/h` (that comes from the GraphQL details
+    /// query, down whenever the GraphQL balance is) — `n` RUNNING pods, unpriced. `arena
+    /// balance` and `teardown --check` never enrich, so on v1 this is what they always see.
+    fn review_unpriced_runpod(n: usize) -> Listing {
+        listing(vec![("runpod", Ok((0..n).map(|_| pod("runpod", "RUNNING", None)).collect()))])
+    }
+
+    /// BS1a: live failing + an unpriced floor burn (`≥$0.00/h`, 10 pods unpriced) reads as
+    /// "no burn" and level ok — though 10 pods are running and 4 h of money is left.
+    #[test]
+    fn review_bs1a_unpriced_floor_is_never_no_burn() {
+        let t0 = NOW - H;
+        let lst = review_unpriced_runpod(10);
+        let b = burns(&lst, &lst.pods());
+        assert_eq!(b[&Account::Runpod], Some(Burn { per_hr: 0.0, unpriced: 10, stale: false, ..Default::default() }), "fixture: a $0 floor");
+        // `arena balance` an hour ago: live $15, RunPod's own rate $3/h (10 pods × $0.30).
+        let ok = fetched(Account::Runpod, Some(Ok(live(15.0, Some(3.0)))), None);
+        let s = apply(BalanceState::default(), &[ok], &b, Mode::Full, t0);
+        // GraphQL down now (live and billing transient).
+        let down = fetched(Account::Runpod, Some(Err(Fail::transient("503"))), Some(Err(Fail::transient("503"))));
+        let s = apply(s, std::slice::from_ref(&down), &b, Mode::Full, NOW);
+        let v = views(&s, std::slice::from_ref(&down), &b, &policy(), Mode::Full, NOW).remove(0);
+        assert_eq!(v.source, Source::Estimate);
+        // Truth: $12 left at $3/h = 4 h → critical (`balance --check` exit 2).
+        assert_ne!(fmt_runway(&v), "no burn", "10 running pods, unpriced, is not 'no burn': {v:?}");
+        assert_ne!(v.level, Level::Ok, "4 h of runway reads ok (check_exit {}): {v:?}", check_exit(std::slice::from_ref(&v)));
+    }
+
+    /// BS1b: the same floor is recorded as a $0 *sample*, so metering then charges the time
+    /// after it at $0/h and, with billing unavailable (403 scope / same outage), the estimate
+    /// overstates the money left.
+    #[test]
+    fn review_bs1b_unpriced_floor_is_not_recorded_as_zero_burn() {
+        let t0 = NOW - 2 * H;
+        let lst = review_unpriced_runpod(10);
+        let b = burns(&lst, &lst.pods());
+        let ok = fetched(Account::Runpod, Some(Ok(live(15.0, Some(3.0)))), None);
+        let s = apply(BalanceState::default(), &[ok], &b, Mode::Full, t0);
+        let down = fetched(Account::Runpod, Some(Err(Fail::transient("503"))), Some(Err(Fail::transient("503"))));
+        let s = apply(s, std::slice::from_ref(&down), &b, Mode::Full, t0 + H);
+        let s = apply(s, std::slice::from_ref(&down), &b, Mode::Full, NOW);
+        let v = views(&s, std::slice::from_ref(&down), &b, &policy(), Mode::Full, NOW).remove(0);
+        // Truth at NOW: 15 − 2 h × $3 = $9.
+        assert!(
+            v.balance.unwrap() <= 9.0 + 1e-9,
+            "estimate ${:.2} > truth $9.00 (errs HIGH); samples {:?}",
+            v.balance.unwrap(),
+            s.accounts[&Account::Runpod].samples
+        );
+    }
+
+    /// BS3: Vast bills storage for stopped instances, but `bills_hourly` leaves them out and
+    /// Vast has neither a provider rate nor a billing history — 20 stopped instances read
+    /// "no burn" / ok, and an estimate would never count that storage down.
+    #[test]
+    fn review_bs3_vast_stopped_instances_are_not_no_burn() {
+        let lst = listing(vec![("vast", Ok((0..20).map(|_| pod("vast", "exited", Some(0.35))).collect()))]);
+        let b = burns(&lst, &lst.pods());
+        let f = Fetched { account: Account::Vast, key_fp: FP.into(), live: Some(Ok(live(5.0, None))), billed: None };
+        let v = views(&BalanceState::default(), &[f], &b, &policy(), Mode::Inline, NOW).remove(0);
+        assert_ne!(fmt_runway(&v), "no burn", "20 stopped Vast instances still pay storage: {v:?}");
+    }
+
+    /// BS4: the SAMPLE_MAX cap drops the oldest samples — the baseline an older anchor needs
+    /// with them — so pruning *raises* the estimate (invariant 6 broken; Vast has no billing
+    /// to cover it).
+    #[test]
+    fn review_bs4_sample_cap_never_raises_the_estimate() {
+        let anchor = Anchor { usd: 500.0, at: NOW - 10 * 86_400, source: AnchorSource::Live };
+        // Five days at $3/h, then a low burn flickering between two views (e.g. the TUI's
+        // priced listing vs a surface that sees unpriced pods) — past SAMPLE_MAX change points.
+        let mut samples = vec![(anchor.at, 3.0)];
+        let low_from = NOW - 5 * 86_400;
+        let n = SAMPLE_MAX + 10;
+        let step = (5 * 86_400) / n as u64;
+        for i in 0..n {
+            samples.push((low_from + i as u64 * step, if i % 2 == 0 { 0.10 } else { 0.12 }));
+        }
+        let before = estimate(&anchor, &samples, None, 0.1, NOW).usd;
+        let mut pruned = samples.clone();
+        prune(&mut pruned, NOW);
+        assert_eq!(pruned.len(), SAMPLE_MAX);
+        let after = estimate(&anchor, &pruned, None, 0.1, NOW).usd;
+        assert!(after <= before + 1e-9, "pruning raised the estimate: ${before:.2} → ${after:.2}");
+    }
+
+    /// BS5: a sample from the future (a clock that ran ahead, since corrected) blocks every
+    /// later sample until real time passes it — a burn seen meanwhile is never recorded, and
+    /// the estimate overstates.
+    #[test]
+    fn review_bs5_future_sample_does_not_freeze_metering() {
+        let mut st = anchored(50.0, 2 * H, AnchorSource::Live);
+        st.samples = vec![(NOW - 2 * H, 0.0), (NOW + 86_400, 0.0)];
+        let s = state_with(st);
+        let down = fetched(Account::Runpod, Some(Err(Fail::transient("503"))), None);
+        // An hour ago the listing showed pods at $5/h …
+        let s = apply(s, std::slice::from_ref(&down), &burns_of(burn(5.0), None), Mode::Inline, NOW - H);
+        // … now they're gone.
+        let s = apply(s, std::slice::from_ref(&down), &burns_of(burn(0.0), None), Mode::Inline, NOW);
+        let v = views(&s, std::slice::from_ref(&down), &burns_of(burn(0.0), None), &policy(), Mode::Inline, NOW).remove(0);
+        assert!(
+            v.balance.unwrap() <= 45.0 + 1e-9,
+            "estimate ${:.2} > truth ≤ $45 — the $5/h hour was never recorded: {:?}",
+            v.balance.unwrap(),
+            s.accounts[&Account::Runpod].samples
+        );
+    }
+
+    /// BS6: with a state file that can't be written (disk full, a root-owned or stray-file
+    /// state dir, no HOME), FRESH no longer rate-limits: every inline look (each TUI details
+    /// round, each `pods list` under `watch`) makes a live call.
+    #[tokio::test]
+    async fn review_bs6_unwritable_state_still_bounds_live_calls() {
+        let dir = tmp("review-unwritable");
+        let blocker = dir.0.join("devtest");
+        std::fs::write(&blocker, "").unwrap(); // the state "directory" is a file
+        let path = blocker.join(crate::snapshot::BALANCE_FILE);
+        let api = FakeBalanceApi::new().live_ok(Account::Runpod, live(40.0, Some(0.5)));
+        for i in 0..3 {
+            let now = NOW + i * 60; // the TUI's details round, once a minute
+            let (state, _) = load(&path);
+            let fetched = observe(&api, &state, Mode::Inline, INLINE_TIMEOUT, now).await;
+            let _ = commit(Some(&path), state, &fetched, &burns_of(burn(0.5), None), Mode::Inline, now);
+        }
+        assert!(api.live_calls() <= 1, "{} live calls in 3 minutes (FRESH = 5 min)", api.live_calls());
+    }
+
+    /// BS7 (semantics unverified): Vast's `/users/current/` also has `balance`, negative when
+    /// charges are owed; the previous implementation surfaced it ("possibly owed"), this one
+    /// reads `credit` alone — if `balance` is pending charges, the live figure is high.
+    #[test]
+    fn review_bs7_vast_owed_balance_is_not_ignored() {
+        // ADAPTED (fix direction 9): no arithmetic on `balance` until the live console
+        // comparison settles what it means — the credit stays the balance, and the owed
+        // figure is carried and said ("Vast reports $8.00 owed") wherever the balance is.
+        let l = parse_vast_user(&json!({"credit": 10.0, "balance": -8.0})).unwrap();
+        assert_eq!((l.usd, l.owed), (10.0, Some(8.0)));
+        let f = Fetched { account: Account::Vast, key_fp: FP.into(), live: Some(Ok(l)), billed: None };
+        let v = views(&BalanceState::default(), &[f], &burns_of(None, burn(0.5)), &policy(), Mode::Inline, NOW).remove(0);
+        assert!(footer_line(std::slice::from_ref(&v), &policy(), NOW).unwrap().contains("(Vast reports $8.00 owed)"));
+        assert!(notes(std::slice::from_ref(&v), &policy(), NOW).iter().any(|n| n.contains("Vast reports $8.00 owed")));
+    }
+
+    /// BS9: the single-spec `create`/`up` path (one GPU, no `--max-price` — the common one)
+    /// can't price the new pods, and the preflight then judges the runway as if they cost
+    /// nothing: `→ no burn` (or the pre-create runway, unflagged) for pods about to bill.
+    #[test]
+    fn review_bs9_preflight_with_unpriced_new_pods_never_says_no_burn() {
+        let f = fetched(Account::Runpod, Some(Ok(live(1.0, Some(0.0)))), None);
+        let v = views(&BalanceState::default(), &[f], &burns_of(burn(0.0), None), &policy(), Mode::Inline, NOW).remove(0);
+        let lines = preflight_lines(&v, 10, None, &policy(), NOW);
+        assert!(!lines[0].ends_with("no burn"), "10 new pods of unknown price, $1 left: {lines:?}");
+    }
+
+    /// BS10: the fallback check integrates samples recorded as max(listed, RunPod's own
+    /// rate) — but after GraphQL goes the fallback only has the listing. Spend arena doesn't
+    /// list (stopped pods' disks, volumes) is in every sample the check uses and in none the
+    /// fallback will, so with billing unavailable (403) the check says "safe" for a fallback
+    /// that will overstate by that spend. False assurance from the early-warning mechanism.
+    #[test]
+    fn review_bs10_fallback_check_judges_the_metering_the_fallback_will_have() {
+        // $1/h of listed pods; RunPod reports $1.50/h (+$0.50/h of disks/volumes arena can't list).
+        let listed = burns_of(burn(1.0), None);
+        let t0 = NOW - 24 * H;
+        let mut s = BalanceState::default();
+        for i in 0..24u64 {
+            // The hourly inline looks (footer, TUI) while GraphQL works.
+            let f = fetched(Account::Runpod, Some(Ok(live(100.0 - 1.5 * i as f64, Some(1.5)))), None);
+            s = apply(s, &[f], &listed, Mode::Inline, t0 + i * H);
+        }
+        // `arena balance` 24 h on: live $64; billing refused (key scope).
+        let f = fetched(Account::Runpod, Some(Ok(live(64.0, Some(1.5)))), Some(Err(Fail::new(FailKind::Auth, Some(403), "billing"))));
+        let s = apply(s, &[f], &listed, Mode::Full, NOW);
+        let c = s.accounts[&Account::Runpod].check.expect("a check ran");
+        // What the fallback would have said from the listing alone: 100 − 24 × $1 = $76 vs $64.
+        assert_eq!(c.verdict, Verdict::Overstates, "check {c:?}: predicted from provider-rate samples, not the listing");
+    }
+}
+
+/// Adversarial review (balance correctness): one regression test per finding. Each asserts
+/// what the operator should be told; on the reviewed lane commit each one FAILS.
+#[cfg(test)]
+mod review_balance_correct {
+    use super::*;
+
+    const NOW: u64 = 1_791_460_800; // 2026-10-08T12:00:00Z, on the hour
+    const H: u64 = 3_600;
+    const FP: &str = "9c3e01ab";
+
+    fn live(usd: f64, rate: Option<f64>) -> Live {
+        Live { usd, provider_burn_per_hr: rate, spend_limit_per_hr: None, under_balance: None, reduced: false, owed: None }
+    }
+
+    fn rp(live: Option<std::result::Result<Live, Fail>>, billed: Option<std::result::Result<Billed, Fail>>) -> Fetched {
+        Fetched { account: Account::Runpod, key_fp: FP.into(), live, billed }
+    }
+
+    fn burns(runpod: Option<Burn>) -> Burns {
+        [(Account::Runpod, runpod), (Account::Vast, None)].into_iter().collect()
+    }
+
+    fn priced(r: f64) -> Option<Burn> {
+        Some(Burn { per_hr: r, unpriced: 0, stale: false, ..Default::default() })
+    }
+
+    /// Running pods the listing has no price for (RunPod v1's REST list has no $/h; `arena
+    /// balance` and `teardown --check` don't enrich, and after GraphQL nothing does).
+    fn unpriced(n: usize) -> Option<Burn> {
+        Some(Burn { per_hr: 0.0, unpriced: n, stale: false, ..Default::default() })
+    }
+
+    fn gone() -> Fail {
+        Fail { kind: FailKind::Gone, http: Some(404), detail: None }
+    }
+
+    fn view_at(s: &BalanceState, f: &Fetched, b: Option<Burn>, mode: Mode, now: u64) -> AccountView {
+        views(s, std::slice::from_ref(f), &burns(b), &BalancePolicy::default(), mode, now).remove(0)
+    }
+
+    /// BC2: `max(billed, metered)` of the TOTALS. When billing has seen spend metering
+    /// can't (a pod created and destroyed while the operator's machine was off, a volume),
+    /// billed wins overall — and then the listed spend inside billing's lag, which metering
+    /// DID see, is dropped. A per-hour max keeps both.
+    #[test]
+    fn bc2_max_of_totals_drops_the_metered_spend_inside_the_billing_lag() {
+        let t0 = NOW - 10 * H;
+        // Live $100 at t0, the fleet listing $1/h — then the machine is off for 10 h.
+        let s = apply(BalanceState::default(), &[rp(Some(Ok(live(100.0, None))), None)], &burns(priced(1.0)), Mode::Inline, t0);
+        // Meanwhile a staff pod ran t0+2h..t0+5h at $2/h and was terminated. Truth: 10 × $1 +
+        // 3 × $2 = $16 → $84. Billing (available!) lags 2 h: hours 8 and 9 still read $0.
+        let buckets: Vec<(u64, f64)> = (0..=10u64)
+            .map(|i| {
+                let usd = match i {
+                    8.. => 0.0,
+                    2..=4 => 3.0,
+                    _ => 1.0,
+                };
+                (t0 + i * H, usd)
+            })
+            .collect();
+        let billed = Billed { buckets, from: t0, to: NOW + H };
+        let f = rp(Some(Err(gone())), Some(Ok(billed)));
+        let s = apply(s, std::slice::from_ref(&f), &burns(priced(1.0)), Mode::Inline, NOW);
+        let v = view_at(&s, &f, priced(1.0), Mode::Inline, NOW);
+        assert_eq!(v.source, Source::Estimate);
+        let truth = 100.0 - 16.0;
+        let est = v.balance.unwrap();
+        assert!(
+            est <= truth + 1e-9,
+            "estimate ${est:.2} > truth ${truth:.2}: max(billed $14, metered $10) forgets the $2 metering saw in the 2 unbilled hours"
+        );
+    }
+
+    /// BC1a: two running pods with no price, and no provider rate (live failing, or the
+    /// minimal query): the burn is a floor of $0 — shown as "no burn", level ok.
+    #[test]
+    fn bc1a_unpriced_running_pods_read_as_no_burn() {
+        let t0 = NOW - H;
+        let s = apply(BalanceState::default(), &[rp(Some(Ok(live(30.0, None))), None)], &burns(priced(1.0)), Mode::Inline, t0);
+        let v = view_at(&s, &rp(Some(Err(gone())), None), unpriced(2), Mode::Inline, NOW);
+        assert_eq!(v.source, Source::Estimate);
+        assert_ne!(fmt_runway(&v), "no burn", "two pods running at unknown prices is not 'no burn': {v:?}");
+    }
+
+    /// BC1b: no balance while unpriced pods run is "unknown while burning" (`--check` 3),
+    /// not ok (0) — the spec's Unknown level is "balance ? while B > 0 or B is unknown".
+    #[test]
+    fn bc1b_unknown_balance_with_unpriced_pods_is_ok_instead_of_unknown() {
+        let v = view_at(&BalanceState::default(), &rp(Some(Err(gone())), None), unpriced(2), Mode::Inline, NOW);
+        assert_eq!(v.balance, None);
+        assert_eq!((v.level, check_exit(&[v.clone()])), (Level::Unknown, 3), "{v:?}");
+    }
+
+    /// BC1c: invariant 7 ("a failed listing never yields … runway ∞/no burn"): the stale
+    /// stand-in for a failed listing is the last sample — and when that was $0 the row
+    /// reads "no burn", level ok.
+    #[test]
+    fn bc1c_failed_listing_with_a_stale_zero_sample_reads_no_burn() {
+        let t0 = NOW - 2 * H;
+        let s = apply(BalanceState::default(), &[rp(Some(Ok(live(30.0, None))), None)], &burns(priced(0.0)), Mode::Inline, t0);
+        let v = view_at(&s, &rp(Some(Err(gone())), None), None, Mode::Inline, NOW);
+        assert_ne!(fmt_runway(&v), "no burn", "the listing failed: the burn is unknown, never 'no burn': {v:?}");
+    }
+
+    /// BC4: a floor burn (unpriced pods) is stored as an exact sample, so metering charges
+    /// the pods $0 between two such looks.
+    #[test]
+    fn bc4_a_floor_burn_is_recorded_as_an_exact_sample() {
+        let t0 = NOW - 3 * H;
+        // One pod at $1/h all along: priced at t0 (pods list, enriched) …
+        let mut s = apply(BalanceState::default(), &[rp(Some(Ok(live(100.0, None))), None)], &burns(priced(1.0)), Mode::Inline, t0);
+        // … then two looks that list it without a price (teardown --check, arena balance) while live fails.
+        let f = rp(Some(Err(gone())), None);
+        s = apply(s, std::slice::from_ref(&f), &burns(unpriced(1)), Mode::Inline, t0 + H);
+        s = apply(s, std::slice::from_ref(&f), &burns(unpriced(1)), Mode::Inline, t0 + 2 * H);
+        // The next priced look.
+        let v = view_at(&s, &f, priced(1.0), Mode::Inline, NOW);
+        let truth = 100.0 - 3.0;
+        assert!(
+            v.balance.unwrap() <= truth + 1e-9,
+            "estimate {:?} > truth {truth}: samples {:?}",
+            v.balance,
+            s.accounts[&Account::Runpod].samples
+        );
+    }
+
+    /// BC3: the fallback check integrates samples that were recorded at the provider's own
+    /// rate (GraphQL `currentSpendPerHr`) — which the real fallback won't have once GraphQL
+    /// is gone. With $0.50/h arena doesn't list and billing down, the check says ✓ while the
+    /// fallback-to-be would read $10 HIGH.
+    #[test]
+    fn bc3_fallback_check_meters_with_the_rate_the_fallback_will_not_have() {
+        let t0 = NOW - 20 * H;
+        let listed = burns(priced(1.0));
+        let billing_down = || Some(Err(Fail { kind: FailKind::Auth, http: Some(403), detail: None }));
+        let mut s = apply(BalanceState::default(), &[rp(Some(Ok(live(100.0, Some(1.5)))), billing_down())], &listed, Mode::Full, t0);
+        // The TUI looks every hour, live working (RunPod's rate $1.50/h: $0.50/h volumes).
+        for i in 1..20u64 {
+            s = apply(s, &[rp(Some(Ok(live(100.0 - 1.5 * i as f64, Some(1.5)))), None)], &listed, Mode::Inline, t0 + i * H);
+        }
+        // `arena balance` 20 h on: live $70.
+        s = apply(s, &[rp(Some(Ok(live(70.0, Some(1.5)))), billing_down())], &listed, Mode::Full, NOW);
+        let c = s.accounts[&Account::Runpod].check.expect("a check ran");
+        // What the fallback would estimate from the same check anchor once GraphQL is gone:
+        // $100 − 20 h × the listed $1/h = $80 — $10 over the truth.
+        let fallback_world: Vec<(u64, f64)> = (0..20u64).map(|i| (t0 + i * H, 1.0)).collect();
+        let would = estimate(&Anchor { usd: 100.0, at: t0, source: AnchorSource::Live }, &fallback_world, None, 1.0, NOW).usd;
+        assert!((would - 80.0).abs() < 1e-6);
+        assert_eq!(
+            c.verdict,
+            Verdict::Overstates,
+            "check predicted ${:.2} (provider-rate samples) vs the fallback's ${would:.2}; live ${:.2}",
+            c.predicted,
+            c.live
+        );
+    }
+
+    /// BC5: `arena balance` / `teardown --check` list without details; RunPod v1's list has
+    /// no $/h, so every running pod is unpriced and `listed_per_hr` is $0 — and the whole
+    /// provider rate is then blamed on "network volumes, stopped pods' disks, serverless?".
+    #[test]
+    fn bc5_unpriced_pods_are_reported_as_spend_arena_does_not_list() {
+        let f = rp(Some(Ok(live(32.54, Some(0.47)))), None);
+        let v = view_at(&BalanceState::default(), &f, unpriced(1), Mode::Full, NOW);
+        let lines: Vec<String> = notes(&[v.clone()], &BalancePolicy::default(), NOW).into_iter().chain(teardown_info(&[v], NOW)).collect();
+        for l in &lines {
+            assert!(
+                !l.contains("more than arena lists (network volumes, stopped pods' disks, serverless?)"),
+                "the $0.47/h is arena's own unpriced pod, not unlisted spend: {l}"
+            );
+        }
+    }
+
+    /// BC6: SAMPLE_MAX drops the OLDEST samples, whatever the anchor needs: an anchor older
+    /// than the kept samples is then metered at the first kept sample's rate.
+    #[test]
+    fn bc6_the_sample_cap_drops_samples_the_anchor_still_needs() {
+        let t0 = NOW - 10 * 86_400;
+        let anchor = Anchor { usd: 10_000.0, at: t0, source: AnchorSource::Live };
+        // A busy cohort with GraphQL gone: the burn swings $5 ↔ $0.10 every 6 min (each a
+        // change point), 2 400 samples over the anchor's 10 days.
+        let samples: Vec<(u64, f64)> = (0..2_400u64).map(|i| (t0 + i * 360, if i % 2 == 1 { 0.1 } else { 5.0 })).collect();
+        let full = estimate(&anchor, &samples, None, 5.0, NOW).usd;
+        let st = AccountState {
+            key_fp: FP.into(),
+            anchor: Some(anchor),
+            live_fail: Some(FailRecord { kind: FailKind::Gone, http: Some(404), detail: None, since: t0 + 60, last: NOW - H }),
+            samples,
+            ..Default::default()
+        };
+        let mut s = BalanceState::default();
+        s.accounts.insert(Account::Runpod, st);
+        let f = rp(Some(Err(gone())), None);
+        let s = apply(s, std::slice::from_ref(&f), &burns(priced(5.0)), Mode::Inline, NOW);
+        let v = view_at(&s, &f, priced(5.0), Mode::Inline, NOW);
+        assert!(
+            v.balance.unwrap() <= full + 1e-6,
+            "after the cap the estimate rose from ${full:.2} to ${:.2} ({} samples kept, first at +{}h)",
+            v.balance.unwrap(),
+            s.accounts[&Account::Runpod].samples.len(),
+            (s.accounts[&Account::Runpod].samples[0].0 - t0) / H
+        );
+    }
+
+    /// BC7: the single-spec preflight ("+ new pods (price unknown)") still states a runway
+    /// "after" them as if they were free — `≈`, and no warning even for 20 new pods.
+    #[test]
+    fn bc7_preflight_with_unknown_price_states_a_runway_that_ignores_the_new_pods() {
+        let v = view_at(&BalanceState::default(), &rp(Some(Ok(live(100.0, Some(1.0)))), None), priced(1.0), Mode::Inline, NOW);
+        let lines = preflight_lines(&v, 20, None, &BalancePolicy::default(), NOW);
+        assert!(!lines[0].contains("→ ≈4.1d"), "the runway after 20 pods of unknown price can't be ≈100 h: {}", lines[0]);
+    }
+
+    /// BC8: a stopped Vast instance still bills its disk (as `teardown` itself says), Vast has
+    /// no billing history, so metering is all there is — and stopped instances are $0 there:
+    /// shown "no burn", and the estimate never counts it (an undercount the docs don't list).
+    #[test]
+    fn bc8_stopped_vast_instances_disk_is_never_counted() {
+        let pod = Pod { provider: "vast".into(), status: "EXITED".into(), cost_per_hr: Some(0.3), ..Default::default() };
+        let l = Listing::from_results(vec![("vast".into(), Ok(vec![pod]))]);
+        let b = super::burns(&l, &l.pods())[&Account::Vast].unwrap();
+        assert!(b.per_hr > 0.0 || b.floor(), "a stopped Vast instance's disk is spend the estimate must count (or at least call the burn a floor): {b:?}");
+    }
+
+    /// BC9: a fallback-check verdict is shown with no age: after GraphQL died ten days ago the
+    /// old ✓ still reads as current next to "live balance failing".
+    #[test]
+    fn bc9_an_old_fallback_check_reads_as_current() {
+        let t0 = NOW - 10 * 86_400;
+        let st = AccountState {
+            key_fp: FP.into(),
+            anchor: Some(Anchor { usd: 100.0, at: t0, source: AnchorSource::Live }),
+            check: Some(CheckRecord { at: t0, horizon_secs: 26 * H, predicted: 99.6, predicted_metered: 99.6, live: 100.0, verdict: Verdict::Safe }),
+            live_fail: Some(FailRecord { kind: FailKind::Gone, http: Some(404), detail: None, since: t0 + 60, last: NOW }),
+            samples: vec![(t0, 0.1)],
+            ..Default::default()
+        };
+        let mut s = BalanceState::default();
+        s.accounts.insert(Account::Runpod, st);
+        let v = view_at(&s, &rp(None, None), priced(0.1), Mode::Inline, NOW);
+        let n = notes(&[v], &BalancePolicy::default(), NOW);
+        let check = n.iter().find(|l| l.contains("fallback check")).expect("check note");
+        assert!(check.contains("10d ago") || check.contains("2026-09-28"), "a 10-day-old verdict must say how old it is: {check}");
+    }
+
+    /// BC10: a live reading under FRESH old is still shown as **live** after a newer
+    /// failure (per spec) — but the note under it says "estimates in use"; and `config check`
+    /// says the same when the anchor is past 14 days and the balance is `?`.
+    #[test]
+    fn bc10_estimates_in_use_is_said_where_none_is() {
+        let st = AccountState {
+            key_fp: FP.into(),
+            provider: Some(ProviderFacts { usd: 40.0, burn_per_hr: Some(0.5), spend_limit_per_hr: None, under_balance: None, at: NOW - 120, owed: None }),
+            anchor: Some(Anchor { usd: 40.0, at: NOW - 120, source: AnchorSource::Live }),
+            live_ok_at: Some(NOW - 120),
+            live_fail: Some(FailRecord { kind: FailKind::Auth, http: Some(403), detail: None, since: NOW - 60, last: NOW - 60 }),
+            ..Default::default()
+        };
+        let mut s = BalanceState::default();
+        s.accounts.insert(Account::Runpod, st);
+        let auth = Fail { kind: FailKind::Auth, http: Some(403), detail: None };
+        let v = view_at(&s, &rp(Some(Err(auth)), None), priced(0.5), Mode::Full, NOW);
+        assert_eq!(v.source, Source::Live);
+        let n = notes(&[v], &BalancePolicy::default(), NOW);
+        assert!(!n.iter().any(|l| l.contains("estimates in use")), "the row is live, yet: {n:?}");
     }
 }
