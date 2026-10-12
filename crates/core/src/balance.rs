@@ -100,11 +100,13 @@ pub const CRITICAL_HOURS: f64 = 24.0;
 /// `BALANCE_WARN_HOURS` when unset: a Friday-evening glance still covers the weekend.
 pub const DEFAULT_WARN_HOURS: f64 = 72.0;
 
-/// `BALANCE_UNPRICED_PER_GPU` when unset: the stand-in $/h per GPU for a running pod whose
+/// `BALANCE_UNPRICED_PER_GPU` when unset: the ceiling $/h per GPU for a running pod whose
 /// price nobody reports (RunPod v1's REST list has none; after GraphQL nothing fills it)
-/// and whose GPU has no preset price. Above every A4000–H100 community price — and the
-/// H100's secure one ($2.79) — so a stand-in burn errs high, which makes the runway err short.
-pub const DEFAULT_UNPRICED_PER_GPU: f64 = 3.0;
+/// and whose GPU type isn't a known preset — an H200, a B200/B300, whatever comes next, a
+/// MIG slice of one, or no type at all. Above the dearest pod price in RunPod's recorded
+/// catalog (B300 SXM6 secure, $7.89/GPU-h; B200 $6.79), so an unknown GPU's burn errs high
+/// and the runway short. A known preset GPU is priced at its own dearer preset instead.
+pub const DEFAULT_UNPRICED_PER_GPU: f64 = 8.0;
 
 /// A transient live failure (timeout, 429, 5xx) is only a label until it has lasted this
 /// long with no success in between; then it is noted like any other (seconds).
@@ -474,6 +476,8 @@ pub struct Burn {
     pub guessed: usize,
     /// The guessed pods' part of `per_hr`.
     pub guessed_per_hr: f64,
+    /// Of `guessed`, the pods of an unknown GPU type, priced at the ceiling.
+    pub ceiling: usize,
     /// The last recorded sample, standing in for a listing that failed: possibly out of date.
     pub stale: bool,
 }
@@ -533,19 +537,32 @@ fn split_count(label: &str) -> (Option<u32>, &str) {
 }
 
 /// The dearer of a known GPU's preset prices (community or secure), per GPU — matched by
-/// the provider's type string or the short label (`RTX 3090`, as Vast and the probe say).
+/// the provider's type string or the short label (`RTX 3090`, as Vast and the probe say). A
+/// MIG slice (`… MIG 1g.10gb`) is a fraction of its parent: the parent's price errs high.
 fn preset_per_gpu(gpu: &str) -> Option<f64> {
     let g = gpu.trim();
+    let parent = g.find(" MIG ").map_or(g, |i| g[..i].trim());
     crate::gpu::PRESETS
         .iter()
-        .find(|p| p.api.eq_ignore_ascii_case(g) || p.label.eq_ignore_ascii_case(g))
+        .find(|p| p.api.eq_ignore_ascii_case(parent) || p.label.eq_ignore_ascii_case(parent))
         .map(|p| p.community.max(p.secure))
 }
 
-/// A stand-in $/h for a pod (or a planned one) nobody priced, erring high: the GPU's preset
-/// price, else [`BalancePolicy::unpriced_per_gpu`] per GPU. `None` when there is no GPU
-/// information at all — then it can't be priced.
-pub fn stand_in_price(gpu_type: Option<&str>, gpu_count: Option<u32>, policy: &BalancePolicy) -> Option<f64> {
+/// How a stand-in price was found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StandIn {
+    /// The GPU is a known preset: its dearer preset price.
+    Preset,
+    /// The GPU type is unknown (or not given): the ceiling, `BALANCE_UNPRICED_PER_GPU`.
+    Ceiling,
+}
+
+/// A stand-in $/h for a pod (or a planned one) nobody priced, erring high, and how it was
+/// found: a known preset GPU at its dearer preset price; an unknown GPU type (a MIG slice of
+/// an unknown parent included), or a GPU count with no type, at the ceiling
+/// [`BalancePolicy::unpriced_per_gpu`] per GPU. `None` when there is no GPU information at
+/// all — then it can't be priced.
+pub fn stand_in(gpu_type: Option<&str>, gpu_count: Option<u32>, policy: &BalancePolicy) -> Option<(f64, StandIn)> {
     let (prefix, label) = match gpu_type.map(str::trim).filter(|t| !t.is_empty() && *t != "-") {
         Some(t) => {
             let (n, rest) = split_count(t);
@@ -553,9 +570,16 @@ pub fn stand_in_price(gpu_type: Option<&str>, gpu_count: Option<u32>, policy: &B
         }
         None => (None, None),
     };
-    let count = gpu_count.filter(|n| *n > 0).or(prefix).or(label.map(|_| 1))?;
-    let per_gpu = label.and_then(preset_per_gpu).unwrap_or(policy.unpriced_per_gpu);
-    Some(per_gpu * f64::from(count))
+    let count = f64::from(gpu_count.filter(|n| *n > 0).or(prefix).or(label.map(|_| 1))?);
+    match label.and_then(preset_per_gpu) {
+        Some(per_gpu) => Some((per_gpu * count, StandIn::Preset)),
+        None => Some((policy.unpriced_per_gpu * count, StandIn::Ceiling)),
+    }
+}
+
+/// [`stand_in`]'s price alone.
+pub fn stand_in_price(gpu_type: Option<&str>, gpu_count: Option<u32>, policy: &BalancePolicy) -> Option<f64> {
+    stand_in(gpu_type, gpu_count, policy).map(|(p, _)| p)
 }
 
 /// Sum the billing pods ([`bills_hourly`]) per prepaid account from a listing (`pods` are
@@ -612,14 +636,17 @@ fn listed_burn(
         let price = p.cost_per_hr.filter(|c| c.is_finite() && *c >= 0.0);
         let remembered = || remembered.and_then(|m| m.get(&p.id)).map(|(c, _)| *c);
         // GPU stand-ins are for the prepaid GPU clouds; a Hetzner server type isn't a GPU.
-        let stand_in = || (provider != "hetzner").then(|| stand_in_price(p.gpu_type.as_deref(), p.gpu_count, policy)).flatten();
+        let stand_in = || (provider != "hetzner").then(|| stand_in(p.gpu_type.as_deref(), p.gpu_count, policy)).flatten();
         match price.or_else(remembered) {
             Some(c) => b.per_hr += c,
             None => match stand_in() {
-                Some(g) => {
+                Some((g, how)) => {
                     b.per_hr += g;
                     b.guessed += 1;
                     b.guessed_per_hr += g;
+                    if how == StandIn::Ceiling {
+                        b.ceiling += 1;
+                    }
                 }
                 None => b.unpriced += 1,
             },
@@ -1823,11 +1850,21 @@ pub fn notes(views: &[AccountView], policy: &BalancePolicy, now: u64) -> Vec<Str
                 Verdict::Overstates => out.push(format!("⚠ {name}: {phrase} — don't rely on estimates")),
             }
         }
-        if let Some(b) = v.burn.filter(|b| b.guessed > 0) {
+        if let Some(b) = v.burn.filter(|b| b.guessed > b.ceiling) {
             out.push(format!(
-                "{name}: {} running pod(s) have no price from the listing — counted at a stand-in that errs high ({} of {}/h; \
-                 the GPU's preset price, else BALANCE_UNPRICED_PER_GPU per GPU)",
-                b.guessed,
+                "{name}: {} running pod(s) have no price from the listing — counted at their GPU's dearer preset price \
+                 (a stand-in that errs high; stand-ins are {} of {}/h)",
+                b.guessed - b.ceiling,
+                usd(b.guessed_per_hr),
+                burn_label(v)
+            ));
+        }
+        if let Some(b) = v.burn.filter(|b| b.ceiling > 0) {
+            out.push(format!(
+                "{name}: {} running pod(s) have no price and an unknown GPU type — priced at the ceiling, \
+                 {}/GPU-h (BALANCE_UNPRICED_PER_GPU; stand-ins are {} of {}/h)",
+                b.ceiling,
+                usd(policy.unpriced_per_gpu),
                 usd(b.guessed_per_hr),
                 burn_label(v)
             ));
@@ -1998,11 +2035,13 @@ pub struct NewPods {
     pub per_pod: Option<f64>,
     /// `per_pod` is (or includes) a stand-in that errs high.
     pub stand_in: bool,
+    /// The stand-in is the ceiling: the GPU type is unknown.
+    pub ceiling: bool,
 }
 
 /// [`preflight_lines_with`] for an exact price (`None` = unknown).
 pub fn preflight_lines(v: &AccountView, new_pods: usize, price_per_pod: Option<f64>, policy: &BalancePolicy, now: u64) -> Vec<String> {
-    preflight_lines_with(v, NewPods { count: new_pods, per_pod: price_per_pod, stand_in: false }, policy, now)
+    preflight_lines_with(v, NewPods { count: new_pods, per_pod: price_per_pod, stand_in: false, ceiling: false }, policy, now)
 }
 
 /// The `create`/`up` preflight for the target provider's account: the balance, the burn now
@@ -2027,6 +2066,11 @@ pub fn preflight_lines_with(v: &AccountView, new: NewPods, policy: &BalancePolic
         None => "?/h now".into(),
     };
     let new_part = match added {
+        Some(x) if new.ceiling => format!(
+            "≤{tilde}{}/h for {n} new pod(s) (unknown GPU type, priced at the ceiling {}/GPU-h)",
+            usd(x),
+            usd(policy.unpriced_per_gpu)
+        ),
         Some(x) if new.stand_in => format!("≤{tilde}{}/h for {n} new pod(s) (a stand-in price — nothing priced them)", usd(x)),
         Some(x) => format!("≤{}/h for {n} new pod(s)", usd(x)),
         None => format!("{n} new pod(s) (price unknown)"),
@@ -2170,7 +2214,7 @@ pub fn config_rows(cfg: &Config, state: &BalanceState, accounts: &[(Account, Str
     match unpriced_per_gpu(cfg) {
         Ok(p) => {
             let default = if cfg.get(key).is_some_and(|v| !v.trim().is_empty()) { "" } else { " (default)" };
-            out.push(format!("  ✓ {key:<26} {}{default} — $/h per GPU for a running pod nobody priced (no preset)", usd(p)));
+            out.push(format!("  ✓ {key:<26} {}{default} — ceiling per GPU-h for an unpriced pod of an unknown GPU type", usd(p)));
         }
         Err(e) => out.push(format!("  ✗ {key:<26} {e} — {} is used", usd(DEFAULT_UNPRICED_PER_GPU))),
     }
@@ -3185,6 +3229,22 @@ mod tests {
             assert!(warn.unwrap().starts_with("warning: BALANCE_WARN_HOURS must be a number of hours ≥ 0"), "{bad}");
         }
         assert!(p("BALANCE_WARN_HOURS=rpa_AAAAAAAAAAAAAAAA").1.unwrap().contains("a long value"), "a pasted key isn't echoed");
+        // BALANCE_UNPRICED_PER_GPU is validated the same way: finite, above 0 (at most 1000);
+        // a bad value uses the default ($8) and says so — never a failure.
+        assert_eq!(p("").0.unpriced_per_gpu, 8.0);
+        assert_eq!(p("BALANCE_UNPRICED_PER_GPU=12").0.unpriced_per_gpu, 12.0);
+        assert_eq!(p("BALANCE_UNPRICED_PER_GPU=\"$5.5\"").0.unpriced_per_gpu, 5.5);
+        for bad in ["0", "-1", "inf", "NaN", "lots", "1001"] {
+            let (pol, warn) = p(&format!("BALANCE_UNPRICED_PER_GPU=\"{bad}\""));
+            assert_eq!(pol.unpriced_per_gpu, 8.0, "{bad}: the default is used");
+            let warn = warn.unwrap();
+            assert!(warn.starts_with("warning: BALANCE_UNPRICED_PER_GPU must be USD per GPU-hour") && warn.ends_with("using 8"), "{bad}: {warn}");
+        }
+        // Both bad: one line, both said, both defaults used.
+        let (pol, warn) = p("BALANCE_WARN_HOURS=soon\nBALANCE_UNPRICED_PER_GPU=free");
+        assert_eq!((pol.warn_hours, pol.unpriced_per_gpu), (72.0, 8.0));
+        let warn = warn.unwrap();
+        assert!(warn.contains("BALANCE_WARN_HOURS must be") && warn.contains("BALANCE_UNPRICED_PER_GPU must be"), "{warn}");
     }
 
     /// The tier table: what each situation shows.
@@ -3687,7 +3747,12 @@ mod tests {
             ]
         );
         // A stand-in price (nothing priced the GPU) counts, marked.
-        let lines = preflight_lines_with(&rich, NewPods { count: 2, per_pod: Some(3.0), stand_in: true }, &p, NOW);
+        let ceiling = preflight_lines_with(&rich, NewPods { count: 1, per_pod: Some(8.0), stand_in: true, ceiling: true }, &p, NOW);
+        assert_eq!(
+            ceiling,
+            ["balance: runpod $500.00 live · $0.47/h now + ≤~$8.00/h for 1 new pod(s) (unknown GPU type, priced at the ceiling $8.00/GPU-h) → ≈2.4d ⚠ below BALANCE_WARN_HOURS=72"]
+        );
+        let lines = preflight_lines_with(&rich, NewPods { count: 2, per_pod: Some(3.0), stand_in: true, ceiling: false }, &p, NOW);
         assert_eq!(
             lines,
             ["balance: runpod $500.00 live · $0.47/h now + ≤~$6.00/h for 2 new pod(s) (a stand-in price — nothing priced them) → ≈3.2d"]
@@ -3776,7 +3841,7 @@ mod tests {
             config_rows(&cfg, &s, &accounts, NOW),
             [
                 "  ✓ BALANCE_WARN_HOURS         72 (default) — warn below 3d of runway",
-                "  ✓ BALANCE_UNPRICED_PER_GPU   $3.00 (default) — $/h per GPU for a running pod nobody priced (no preset)",
+                "  ✓ BALANCE_UNPRICED_PER_GPU   $8.00 (default) — ceiling per GPU-h for an unpriced pod of an unknown GPU type",
                 "  ✓ runpod                     live 4m ago · fallback check ✓ over 1d, checked 0s ago (the estimate read $0.40 low)",
                 "  · vast                       no reading yet — run `arena balance`",
             ]
@@ -3797,7 +3862,7 @@ mod tests {
             rows,
             [
                 "  ✗ BALANCE_WARN_HOURS         BALANCE_WARN_HOURS must be a number of hours ≥ 0 (got `soon`) — 72 is used",
-                "  ✗ BALANCE_UNPRICED_PER_GPU   BALANCE_UNPRICED_PER_GPU must be USD per GPU-hour, above 0 and at most 1000 (got `free`) — $3.00 is used",
+                "  ✗ BALANCE_UNPRICED_PER_GPU   BALANCE_UNPRICED_PER_GPU must be USD per GPU-hour, above 0 and at most 1000 (got `free`) — $8.00 is used",
                 "  ⚠ runpod                     live balance failing since 2026-12-03 00:00 UTC (drift, HTTP 400: Cannot query field \"clientBalance\" on type \"User\".) — estimates in use",
                 "  ⚠ runpod                     full balance query rejected since 2026-10-08 11:00 UTC — live via the minimal query (no burn/limit/underBalance)",
                 "  ⚠ runpod                     fallback check ✗ over 1d, checked 0s ago, before live started failing (the estimate read $3.10 HIGH) — don't rely on estimates",
@@ -3813,7 +3878,7 @@ mod tests {
             config_rows(&Config::parse("BALANCE_WARN_HOURS=0\nBALANCE_UNPRICED_PER_GPU=4.5"), &s, &[], NOW),
             [
                 "  ✓ BALANCE_WARN_HOURS         0 — runway warnings off",
-                "  ✓ BALANCE_UNPRICED_PER_GPU   $4.50 — $/h per GPU for a running pod nobody priced (no preset)",
+                "  ✓ BALANCE_UNPRICED_PER_GPU   $4.50 — ceiling per GPU-h for an unpriced pod of an unknown GPU type",
             ]
         );
     }
@@ -4356,28 +4421,53 @@ mod tests {
     #[test]
     fn stand_in_price_table() {
         let p = policy();
-        // (gpu type, count, want) — the dearer preset price, else the per-GPU ceiling.
-        let cases: Vec<(Option<&str>, Option<u32>, Option<f64>)> = vec![
-            (Some("NVIDIA RTX A4000"), Some(1), Some(0.32)),
-            (Some("RTX 3090"), Some(2), Some(0.86)),
-            (Some("2×RTX A4000"), None, Some(0.64)),
-            (Some("NVIDIA H100 80GB HBM3"), Some(1), Some(2.79)),
-            (Some("Mystery GPU"), Some(1), Some(3.0)),
-            (None, Some(4), Some(12.0)),
+        // (gpu type, count, want price, how) — a known preset at its dearer preset price; an
+        // unknown type (or a MIG slice of an unknown parent, or a count with no type) at the
+        // ceiling; no GPU information at all: no price.
+        let cases: Vec<(Option<&str>, Option<u32>, Option<(f64, StandIn)>)> = vec![
+            (Some("NVIDIA RTX A4000"), Some(1), Some((0.32, StandIn::Preset))),
+            (Some("RTX 3090"), Some(2), Some((0.86, StandIn::Preset))),
+            (Some("2×RTX A4000"), None, Some((0.64, StandIn::Preset))),
+            (Some("NVIDIA H100 80GB HBM3"), Some(1), Some((2.79, StandIn::Preset))),
+            (Some("NVIDIA H100 80GB HBM3 MIG 1g.10gb"), Some(1), Some((2.79, StandIn::Preset))),
+            (Some("NVIDIA H200"), Some(1), Some((8.0, StandIn::Ceiling))),
+            (Some("NVIDIA B200"), Some(8), Some((64.0, StandIn::Ceiling))),
+            (Some("NVIDIA B300 SXM6 AC"), Some(1), Some((8.0, StandIn::Ceiling))),
+            (Some("NVIDIA B300 SXM6 AC MIG 1g.34gb"), Some(1), Some((8.0, StandIn::Ceiling))),
+            (Some("Mystery GPU"), None, Some((8.0, StandIn::Ceiling))),
+            (None, Some(4), Some((32.0, StandIn::Ceiling))),
             (Some("-"), None, None),
             (None, None, None),
             (None, Some(0), None),
         ];
         for (ty, n, want) in cases {
-            let got = stand_in_price(ty, n, &p);
-            assert!(got.zip(want).map_or(got == want, |(g, w)| (g - w).abs() < 1e-9), "{ty:?} ×{n:?}: {got:?} != {want:?}");
+            let got = stand_in(ty, n, &p);
+            let same = match (got, want) {
+                (Some((g, gk)), Some((w, wk))) => (g - w).abs() < 1e-9 && gk == wk,
+                (g, w) => g.is_none() && w.is_none(),
+            };
+            assert!(same, "{ty:?} ×{n:?}: {got:?} != {want:?}");
+            assert_eq!(stand_in_price(ty, n, &p), got.map(|g| g.0));
         }
-        let dear = BalancePolicy { unpriced_per_gpu: 4.5, ..Default::default() };
-        assert_eq!(stand_in_price(None, Some(2), &dear), Some(9.0));
-        // The default ceiling is above every preset community price, and the H100's secure one.
-        let community = crate::gpu::PRESETS.iter().map(|g| g.community).fold(0.0, f64::max);
-        let h100 = crate::gpu::PRESETS.iter().find(|g| g.label == "H100").map(|g| g.secure).unwrap();
-        assert!(DEFAULT_UNPRICED_PER_GPU > community && DEFAULT_UNPRICED_PER_GPU > h100);
+        let dear = BalancePolicy { unpriced_per_gpu: 12.0, ..Default::default() };
+        assert_eq!(stand_in(Some("NVIDIA B300 SXM6 AC"), Some(2), &dear), Some((24.0, StandIn::Ceiling)));
+        assert_eq!(stand_in(Some("NVIDIA RTX A4000"), Some(1), &dear), Some((0.32, StandIn::Preset)), "a known GPU ignores the ceiling");
+    }
+
+    /// The ceiling sits above the dearest pod price RunPod's recorded catalog lists (and
+    /// every preset): an unknown GPU is never priced below what a known one can cost.
+    #[test]
+    fn the_ceiling_is_above_every_recorded_gpu_price() {
+        let catalog: Value = serde_json::from_str(include_str!("provider/fixtures/runpod_v2/catalog_community_cuda13.json")).unwrap();
+        let dearest = catalog["body"]["gpus"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| ["community", "secure"].map(|k| g["price"][k].as_f64().unwrap_or(0.0)))
+            .fold(0.0, f64::max);
+        assert!((dearest - 7.89).abs() < 1e-9, "the B300's secure price, as recorded: {dearest}");
+        let presets = crate::gpu::PRESETS.iter().map(|g| g.community.max(g.secure)).fold(0.0, f64::max);
+        assert!(DEFAULT_UNPRICED_PER_GPU > dearest && DEFAULT_UNPRICED_PER_GPU > presets);
     }
 
     /// Every running pod gets a price that errs high: the listing's, the last one seen for
@@ -4399,21 +4489,26 @@ mod tests {
         assert_eq!(b1.seen[&Account::Runpod], vec![("p1".to_string(), 0.5)]);
         let s = apply(BalanceState::default(), &[fetched(Account::Runpod, Some(Ok(live(50.0, None))), None)], &b1, Mode::Inline, NOW - H);
         assert_eq!(s.accounts[&Account::Runpod].prices["p1"], (0.5, NOW - H));
-        // An unpriced look (v1 REST, no details): p1 from memory, p2 at a stand-in, p3 unpriced.
+        // An unpriced look (v1 REST, no details): p1 from memory, p2 (two GPUs of no known
+        // type) at the ceiling, p3 unpriced.
         let l2 = listing(vec![("runpod", Ok(vec![gpu("p1", None, Some(1)), gpu("p2", None, Some(2)), gpu("p3", None, None)]))]);
         let b2 = burns_with(&l2, &l2.pods(), &s, &policy());
         let rp = b2[&Account::Runpod].unwrap();
-        assert_eq!((rp.per_hr, rp.guessed, rp.guessed_per_hr, rp.unpriced), (0.5 + 6.0, 1, 6.0, 1));
+        assert_eq!((rp.per_hr, rp.guessed, rp.guessed_per_hr, rp.ceiling, rp.unpriced), (0.5 + 16.0, 1, 16.0, 1, 1));
         // With RunPod's own rate known, the guesses give way to it (it covers the account).
         assert_eq!(burn_now(Some(rp), Some(0.9), &[]).unwrap().per_hr, 0.9);
         assert_eq!(burn_now(Some(rp), Some(0.1), &[]).unwrap().per_hr, 0.5, "the remembered price still counts");
         // The guess is recorded as a sample (it errs high) and flags the estimate.
         let f = fetched(Account::Runpod, Some(Err(gone())), None);
         let s = apply(s, std::slice::from_ref(&f), &b2, Mode::Inline, NOW);
-        assert!(s.accounts[&Account::Runpod].samples.iter().any(|(t, b)| *t == NOW && *b >= 6.5));
+        assert!(s.accounts[&Account::Runpod].samples.iter().any(|(t, b)| *t == NOW && *b >= 16.5));
         let v = views(&s, std::slice::from_ref(&f), &b2, &policy(), Mode::Inline, NOW + 600).remove(0);
         assert!(source_label(&v, NOW + 600).contains("stand-in prices"), "{v:?}");
-        assert_eq!(burn_label(&v), "≥$6.50/h", "unpriced p3 makes it a floor");
+        assert_eq!(burn_label(&v), "≥$16.50/h", "unpriced p3 makes it a floor");
+        assert!(
+            notes(&[v], &policy(), NOW + 600).iter().any(|n| n.contains("1 running pod(s) have no price and an unknown GPU type — priced at the ceiling, $8.00/GPU-h")),
+            "the ceiling is named"
+        );
         // Hetzner: no GPU stand-in for a server type.
         let l3 = listing(vec![("hetzner", Ok(vec![Pod { provider: "hetzner".into(), status: "running".into(), gpu_type: Some("cx23".into()), ..Default::default() }]))]);
         assert_eq!(postpaid_view(&l3, &l3.pods()).unwrap().burn.unwrap().unpriced, 1);
@@ -4421,13 +4516,16 @@ mod tests {
 
     #[test]
     fn a_guessed_burn_is_judged_and_shown_with_a_tilde() {
+        // A known preset GPU's stand-in (no ceiling).
         let guessed = Burn { per_hr: 3.0, guessed: 1, guessed_per_hr: 3.0, ..Default::default() };
         let mut v = lv(Account::Runpod, 30.0, 3.0);
         v.burn = Some(guessed);
         v.runway_hours = runway(30.0, &guessed);
         v.level = level(Some(30.0), None, Some(&guessed), v.runway_hours, &policy());
         assert_eq!((burn_label(&v).as_str(), fmt_runway(&v).as_str(), v.level), ("~$3.00/h", "≈10h", Level::Critical));
-        assert!(notes(&[v], &policy(), NOW).iter().any(|n| n.contains("1 running pod(s) have no price from the listing — counted at a stand-in")));
+        let n = notes(&[v], &policy(), NOW);
+        assert!(n.iter().any(|n| n.contains("1 running pod(s) have no price from the listing — counted at their GPU's dearer preset price")), "{n:?}");
+        assert!(!n.iter().any(|n| n.contains("ceiling")), "{n:?}");
     }
 
     #[test]

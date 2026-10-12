@@ -565,7 +565,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     don't fetch details; after GraphQL nothing does) are counted at the last price seen for
     that pod (remembered in the state from any surface that saw one: an enriched `pods list`,
     the TUI, a v2 listing, a `create`/`up` result), else at a stand-in that errs high — the
-    GPU's dearer preset price, else `BALANCE_UNPRICED_PER_GPU` (default $3) per GPU — shown
+    GPU's dearer preset price when it is a known one, else (an unknown GPU type) the ceiling
+    `BALANCE_UNPRICED_PER_GPU` (default $8, above the dearest recorded catalog price) per GPU — shown
     `~$X/h` with a note; a running pod with no GPU information at all makes the account
     `unknown` (never "no burn"). RunPod's own rate, while it is read, replaces the stand-ins.
     **Known undercounts:** a pod created and destroyed between two observations while

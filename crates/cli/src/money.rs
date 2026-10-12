@@ -252,26 +252,24 @@ pub(crate) async fn balance_preflight(
 /// at its stand-in (it could be the dearest); on the single-spec path, the spec's GPU at a
 /// stand-in. `per_pod: None` only when not even a stand-in can be named.
 fn new_pod_price(count: usize, options: Option<&OptionPlan>, spec: &arena_core::PodSpec, policy: &BalancePolicy) -> balance::NewPods {
-    let stand_in = |gpu: &str, n: u32| balance::stand_in_price(Some(gpu), Some(n), policy);
-    let mut guessed = false;
+    let (mut guessed, mut ceiling) = (false, false);
+    let mut stand_in = |gpu: &str, n: u32| {
+        let found = balance::stand_in(Some(gpu), Some(n), policy);
+        guessed = true;
+        ceiling |= found.is_some_and(|(_, how)| how == balance::StandIn::Ceiling);
+        found.map(|(p, _)| p)
+    };
     let per_pod = match options {
         Some(plan) if !plan.options.is_empty() => plan
             .options
             .iter()
-            .map(|o| {
-                o.price_per_pod.or_else(|| {
-                    guessed = true;
-                    stand_in(&o.gpu, o.gpu_count.max(1))
-                })
-            })
+            .map(|o| o.price_per_pod.or_else(|| stand_in(&o.gpu, o.gpu_count.max(1))))
             .collect::<Option<Vec<f64>>>()
             .map(|prices| prices.into_iter().fold(0.0, f64::max)),
-        _ => {
-            guessed = true;
-            stand_in(&spec.gpu_type, spec.gpu_count.max(1))
-        }
+        _ => stand_in(&spec.gpu_type, spec.gpu_count.max(1)),
     };
-    balance::NewPods { count, per_pod, stand_in: guessed && per_pod.is_some() }
+    let known = per_pod.is_some();
+    balance::NewPods { count, per_pod, stand_in: guessed && known, ceiling: ceiling && known }
 }
 
 /// One pod's probe call, read: the reply, or why there is none. A call that failed outright
@@ -746,7 +744,7 @@ mod tests {
             balance_config_rows(&dir.cfg(""), &panicking, T0 + 240),
             [
                 "  ✓ BALANCE_WARN_HOURS         72 (default) — warn below 3d of runway",
-                "  ✓ BALANCE_UNPRICED_PER_GPU   $3.00 (default) — $/h per GPU for a running pod nobody priced (no preset)",
+                "  ✓ BALANCE_UNPRICED_PER_GPU   $8.00 (default) — ceiling per GPU-h for an unpriced pod of an unknown GPU type",
                 "  ✓ runpod                     live 4m ago",
                 "  · vast                       no reading yet — run `arena balance`",
             ]
@@ -869,6 +867,18 @@ mod tests {
             let lines = balance_preflight(&fleet(), &dir.cfg(""), &bal, 1, None, &spec).await;
             assert!(lines.iter().all(|l| !l.to_lowercase().contains("error")), "{case}: {lines:?}");
         }
+    }
+
+    /// The new pods' price on the single-spec path: a known GPU at its preset, an unknown
+    /// one (a B300, say) at the ceiling — said as such.
+    #[test]
+    fn new_pods_of_an_unknown_gpu_are_priced_at_the_ceiling() {
+        let policy = BalancePolicy::default();
+        let spec = |gpu: &str, n: u32| arena_core::PodSpec { gpu_type: gpu.into(), gpu_count: n, ..arena_core::PodSpec::from_config(&cfg()) };
+        let known = new_pod_price(3, None, &spec("NVIDIA RTX A4000", 1), &policy);
+        assert_eq!((known.per_pod, known.stand_in, known.ceiling), (Some(0.32), true, false));
+        let unknown = new_pod_price(3, None, &spec("NVIDIA B300 SXM6 AC", 2), &policy);
+        assert_eq!((unknown.per_pod, unknown.stand_in, unknown.ceiling), (Some(16.0), true, true));
     }
 
     /// Review BC5 / BC1 through `arena balance` itself: it lists without details, and RunPod
