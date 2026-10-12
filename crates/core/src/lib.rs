@@ -29,6 +29,7 @@ pub mod plan;
 pub mod pod;
 pub mod provider;
 pub mod proxy;
+pub mod reap;
 pub mod pull;
 pub mod remote;
 pub mod replica;
