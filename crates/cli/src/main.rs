@@ -2081,6 +2081,8 @@ async fn create_pods(
     use arena_core::ProviderErrorKind as K;
 
     let base = spec_with_overrides(cfg, ov);
+    // What the `[created]` lines say it was created on (as the placement path's do).
+    let on = single_option_plan(provider.name(), &base).options.first().map(|o| o.describe());
     let policy = arena_core::retry::RetryPolicy::default();
     let mut created = Vec::new();
     'names: for name in names {
@@ -2095,7 +2097,7 @@ async fn create_pods(
             // through immediately to the classification below.
             match arena_core::retry::retrying(&policy, || provider.create_pod(&spec)).await {
                 Ok(pod) => {
-                    println!("[created] {} id={}", pod.name, pod.id);
+                    println!("{}", created_line(&pod, on.as_deref()));
                     let made = Made { pod, at: tokio::time::Instant::now(), option: None };
                     on_made(&made);
                     created.push(made);
@@ -2429,6 +2431,34 @@ fn single_option_plan(provider_name: &str, spec: &PodSpec) -> arena_core::placem
         order: Order::Listed,
     };
     plan_options(&req, provider_name, &PriceBook::unpriced())
+}
+
+/// `provider.describe(spec)` — what the one-GPU path's dry run and confirm say a create is —
+/// with a MIG slice named as `pods list`, READY and the summary name it (`1×B300 MIG 34GB`,
+/// the option label) instead of by its catalog id (`NVIDIA B300 SXM6 AC MIG 1g.34gb x1`, live
+/// G #17). Anything else is the provider's own description, unchanged.
+fn describe_create(provider: &dyn Provider, spec: &PodSpec) -> String {
+    let desc = provider.describe(spec);
+    let mig = spec.gpu_type.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| w.eq_ignore_ascii_case("mig"));
+    let id = format!("{} x{}", spec.gpu_type, spec.gpu_count);
+    match single_option_plan(provider.name(), spec).options.first() {
+        Some(o) if mig && desc.contains(&id) => desc.replacen(&id, &o.label, 1),
+        _ => desc,
+    }
+}
+
+/// The single-spec path's `[created]` line: the pod, and — as the placement path's says it —
+/// what it was created on (`1×RTX 3070 COMMUNITY`, the option's label and tier) and its price
+/// when the provider reported one. Pure.
+fn created_line(pod: &arena_core::Pod, on: Option<&str>) -> String {
+    let mut line = format!("[created] {} id={}", pod.name, pod.id);
+    if let Some(on) = on {
+        line.push_str(&format!(" on {on}"));
+    }
+    if let Some(c) = pod.cost_per_hr.filter(|c| c.is_finite() && *c > 0.0) {
+        line.push_str(&format!(" ({}/h)", arena_core::fleet::fmt_money(arena_core::fleet::currency_symbol(&pod.provider), c)));
+    }
+    line
 }
 
 /// The spec the first create would use: the first name, on placement's first option (or the
@@ -5779,7 +5809,7 @@ async fn handle_pods_with(
                 match &options {
                     Some(plan) => print_placement_preview(provider, plan, &spec, &names),
                     None => {
-                        let desc = provider.describe(&spec);
+                        let desc = describe_create(provider, &spec);
                         for name in &names {
                             println!("[dry-run] would create {name} on {} ({desc})", provider.name());
                         }
@@ -5795,7 +5825,7 @@ async fn handle_pods_with(
                 Some(plan) => placement_prompt(provider, plan, &spec, &names, then)?,
                 None => format!(
                     "Will create {} pod(s) on {} ({}){then}:\n  {}",
-                    names.len(), provider.name(), provider.describe(&spec), names.join(", ")
+                    names.len(), provider.name(), describe_create(provider, &spec), names.join(", ")
                 ),
             };
             if !confirm(yes, &what)? {
@@ -5890,7 +5920,7 @@ async fn handle_pods_with(
                 match &options {
                     Some(plan) => print_placement_preview(provider, plan, &spec, &names),
                     None => {
-                        let desc = provider.describe(&spec);
+                        let desc = describe_create(provider, &spec);
                         for name in &names {
                             println!("[dry-run] would create {name} on {} ({desc})", provider.name());
                         }
@@ -5927,7 +5957,7 @@ async fn handle_pods_with(
                 Some(plan) => placement_prompt(provider, plan, &spec, &names, &then)?,
                 None => format!(
                     "Will create {} pod(s) on {} ({}){then}:\n  {}",
-                    names.len(), provider.name(), provider.describe(&spec), names.join(", ")
+                    names.len(), provider.name(), describe_create(provider, &spec), names.join(", ")
                 ),
             };
             if !confirm(yes, &what)? {
@@ -13300,6 +13330,41 @@ mod replacement_spec_tests {
         };
         let plan = super::single_option_plan("runpod", &spec);
         assert_eq!(plan.options[0].label, "1×B300 MIG 34GB");
+    }
+
+    /// Live G #17: on the one-GPU path the dry run and the confirm describe the create with
+    /// `provider.describe` — the MIG slice by its catalog id. They now name it as `pods list`,
+    /// READY and the summary do; every other GPU's description is the provider's, unchanged.
+    #[test]
+    fn the_one_gpu_dry_run_and_confirm_name_a_mig_slice_as_pods_list_does() {
+        let provider = arena_core::provider::runpod::RunpodProvider::new("k");
+        let spec = |gpu: &str| PodSpec { gpu_type: gpu.into(), gpu_count: 1, cloud_type: "SECURE".into(), ..PodSpec::from_config(&cfg("")) };
+        let mig = super::describe_create(&provider, &spec("NVIDIA B300 SXM6 AC MIG 1g.34gb"));
+        assert!(mig.starts_with("1×B300 MIG 34GB, SECURE, disk "), "{mig}");
+        assert!(!mig.contains("SXM6"), "{mig}");
+        let a4000 = spec("NVIDIA RTX A4000");
+        assert_eq!(super::describe_create(&provider, &a4000), arena_core::Provider::describe(&provider, &a4000));
+    }
+
+    /// Live G: the one-GPU path's `[created]` line named no GPU; it now says what the pod was
+    /// created on, and its price when the provider reported one — as the placement path's does.
+    #[test]
+    fn the_one_gpu_created_line_names_the_gpu_and_price() {
+        let pod = |cost: Option<f64>| arena_core::Pod {
+            id: "qd3hgsswhhmk1b".into(),
+            name: "devtest-delta".into(),
+            provider: "runpod".into(),
+            cost_per_hr: cost,
+            ..Default::default()
+        };
+        let spec = PodSpec { gpu_type: "NVIDIA GeForce RTX 3070".into(), gpu_count: 1, cloud_type: "COMMUNITY".into(), ..PodSpec::from_config(&cfg("")) };
+        let on = super::single_option_plan("runpod", &spec).options[0].describe();
+        assert_eq!(
+            super::created_line(&pod(Some(0.13)), Some(&on)),
+            "[created] devtest-delta id=qd3hgsswhhmk1b on 1×RTX 3070 COMMUNITY ($0.13/h)"
+        );
+        assert_eq!(super::created_line(&pod(None), Some(&on)), "[created] devtest-delta id=qd3hgsswhhmk1b on 1×RTX 3070 COMMUNITY");
+        assert_eq!(super::created_line(&pod(None), None), "[created] devtest-delta id=qd3hgsswhhmk1b");
     }
 }
 

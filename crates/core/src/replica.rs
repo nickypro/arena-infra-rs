@@ -417,11 +417,13 @@ pub fn settle_lines(pod: &str, s: &Settled, mode: SettleMode) -> Vec<String> {
         return Vec::new();
     }
     if s.kept == 0 && mode == SettleMode::Advance {
+        // Just the folders: their sizes leave `.git` out, so here they'd read `0` (live G).
+        let dirs: Vec<&str> = s.dirs.iter().map(|d| d.rsplit_once(' ').map_or(d.as_str(), |(dir, _)| dir)).collect();
         return vec![format!(
             "  ({pod}: only git's own bookkeeping had changed there — {} file(s) from inside .git, e.g. its index, \
              which git rewrites whenever it runs; kept in {})",
             s.git,
-            s.dirs.join(", ")
+            dirs.join(", ")
         )];
     }
     let git = match (s.git, mode) {
@@ -614,11 +616,13 @@ mod tests {
         );
         assert_eq!(lines[1], "    devtest_new_only.txt");
         assert!(settle_lines("p", &s, SettleMode::Keep)[0].contains("1 file(s) KEPT") && settle_lines("p", &s, SettleMode::Keep)[0].contains("plus 1 of git's own"));
-        // Only git's files: one quiet line saying where — no ⚠, no work to reconcile.
-        let only_git = Settled { kept: 0, git: 2, dirs: vec!["/root/arena-sync-kept/S 4.0K".into()], files: vec![] };
+        // Only git's files: one quiet line saying where — no ⚠, no work to reconcile, and no
+        // size (it leaves `.git` out: live G printed `… kept in /root/arena-sync-kept/S 0`).
+        let only_git = Settled { kept: 0, git: 2, dirs: vec!["/root/arena-sync-kept/S 0".into()], files: vec![] };
         let lines = settle_lines("devtest-alpha-new", &only_git, SettleMode::Advance);
         assert_eq!(lines.len(), 1, "{lines:?}");
-        assert!(!lines[0].contains('⚠') && lines[0].contains("2 file(s) from inside .git") && lines[0].contains("/root/arena-sync-kept/S"), "{lines:?}");
+        assert!(!lines[0].contains('⚠') && lines[0].contains("2 file(s) from inside .git"), "{lines:?}");
+        assert!(lines[0].ends_with("kept in /root/arena-sync-kept/S)"), "{lines:?}");
         // An older settle script's output (no git line) still parses.
         assert_eq!(parse_settle("arena-replica-kept=2\n").unwrap().git, 0);
         assert_eq!(parse_settle("garbage"), None);

@@ -542,10 +542,25 @@ impl Shared<'_, '_> {
         let pod = match self.or_stop(self.wait_endpoint(&pod.id, started + self.run.timeout)).await {
             None => return self.end(run, Verdict::Stopped { stage: Stage::Endpoint }),
             Some(EndpointWait::TimedOut) => {
-                let reason = format!(
-                    "no SSH endpoint after {}s — left running (`arena proxy apply` once it has one)",
-                    self.run.timeout.as_secs()
-                );
+                // The wait never trusts one missing listing (a backend that failed to list drops
+                // its pods from the aggregate), but the verdict must say how things stand now:
+                // ask the owning backend once — a pod terminated elsewhere meanwhile is gone,
+                // not "left running" (live G: one deleted out of band read so for 10 minutes).
+                let secs = self.run.timeout.as_secs();
+                let gone = match self.or_stop(self.run.provider.list_by_provider()).await {
+                    Some(listings) => gone_from_owner(&listings, &pod),
+                    None => false,
+                };
+                let reason = if gone {
+                    run.pod = None;
+                    format!(
+                        "no SSH endpoint after {secs}s, and {} no longer lists it (terminated elsewhere?) — nothing \
+                         left running",
+                        pod.provider
+                    )
+                } else {
+                    format!("no SSH endpoint after {secs}s — left running (`arena proxy apply` once it has one)")
+                };
                 return self.end(run, Verdict::Failed { stage: Stage::Endpoint, reason });
             }
             Some(EndpointWait::NoPublicIp { pod, since }) => {
@@ -1113,17 +1128,8 @@ impl Shared<'_, '_> {
             if let Some(twin) = answered.find(|p| p.name == pod.name && p.id != pod.id && live(p)) {
                 return Gone::Taken(twin.id.clone());
             }
-            let owner = match listings.iter().find(|(p, _)| *p == pod.provider) {
-                Some(l) => Some(l),
-                None => match &listings[..] {
-                    [only] => Some(only),
-                    _ => None,
-                },
-            };
-            if let Some((_, Ok(pods))) = owner {
-                if !pods.iter().any(|p| p.id == pod.id && live(p)) {
-                    return Gone::Yes;
-                }
+            if gone_from_owner(&listings, pod) {
+                return Gone::Yes;
             }
             if Instant::now() + every > deadline {
                 return Gone::StillListed;
@@ -1360,6 +1366,21 @@ impl Shared<'_, '_> {
 /// Error text onto one line (it often embeds a command's multi-line stderr).
 fn one_line(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Whether `pod`'s own backend answered in `listings` (per backend, `list_by_provider`) and
+/// lists it no more — or only as terminated. A backend that failed to list, or none that
+/// owns it, proves nothing (`false`): the aggregate listing skips a failed backend, and "not
+/// in a listing RunPod isn't in" must never read as gone. Pure.
+fn gone_from_owner(listings: &[(String, arena_core::Result<Vec<Pod>>)], pod: &Pod) -> bool {
+    let owner = match listings.iter().find(|(p, _)| *p == pod.provider) {
+        Some(l) => Some(l),
+        None => match listings {
+            [only] => Some(only),
+            _ => None,
+        },
+    };
+    matches!(owner, Some((_, Ok(pods))) if !pods.iter().any(|p| p.id == pod.id && !p.status.eq_ignore_ascii_case("TERMINATED")))
 }
 
 /// Whether a deep check's script ran start to end — the only kind of check that says
@@ -2594,6 +2615,51 @@ mod tests {
         let rows = run_up(&run, made, std::future::pending(), &|_, _| {}).await;
         assert!(matches!(&rows[0].verdict, Verdict::Failed { stage: Stage::Endpoint, reason } if reason.starts_with("no SSH endpoint after 120s")), "{:?}", rows[0].verdict);
         assert_eq!(fleet.events().len(), 1, "nothing terminated");
+    }
+
+    /// Live G: a pod terminated elsewhere while `up` waited for its endpoint ended `FAILED
+    /// endpoint — no SSH endpoint after 600s — left running`. A missing listing still proves
+    /// nothing during the wait, but at the deadline its own backend is asked: gone is said.
+    /// One its backend can't list stays "left running" (unknown is not gone).
+    #[tokio::test(start_paused = true)]
+    async fn a_pod_terminated_elsewhere_during_the_endpoint_wait_is_not_left_running() {
+        let cfg = cfg(None);
+        let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 100_000)])]);
+        let run = up_run(&fleet, Arc::new(FakeRemote::new()), &cfg, true, None, None).await;
+        let made = make(&fleet, &["apple"]).await;
+        let elsewhere = async {
+            tokio::time::sleep(Duration::from_secs(100)).await;
+            fleet.terminate_pod("id1").await.unwrap();
+        };
+        let (rows, ()) = tokio::join!(run_up(&run, made, std::future::pending(), &|_, _| {}), elsewhere);
+        match &rows[0].verdict {
+            Verdict::Failed { stage: Stage::Endpoint, reason } => assert!(
+                reason.starts_with("no SSH endpoint after 600s, and runpod no longer lists it (terminated elsewhere?)")
+                    && reason.ends_with("— nothing left running")
+                    && !reason.contains("left running (`"),
+                "{reason}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(rows[0].gpu, "-", "no pod to describe");
+
+        // Its backend failing to list at the deadline: unknown — as before.
+        let fleet = Fleet {
+            down_after_terminate: Duration::from_secs(100_000),
+            ..Fleet::new(&[("apple", &[("10.0.0.1", 22001, 100_000)]), ("bloom", &[("10.0.0.2", 22002, 0)])])
+        };
+        let run = up_run(&fleet, Arc::new(FakeRemote::new()), &cfg, true, None, None).await;
+        let made = make(&fleet, &["apple"]).await;
+        // Another pod's terminate makes the fake's RunPod listing fail from then on.
+        let bloom = make(&fleet, &["bloom"]).await;
+        fleet.terminate_pod(&bloom[0].pod.id).await.unwrap();
+        let rows = run_up(&run, made, std::future::pending(), &|_, _| {}).await;
+        assert!(
+            matches!(&rows[0].verdict, Verdict::Failed { stage: Stage::Endpoint, reason }
+                if reason == "no SSH endpoint after 600s — left running (`arena proxy apply` once it has one)"),
+            "{:?}",
+            rows[0].verdict
+        );
     }
 
     #[tokio::test(start_paused = true)]
