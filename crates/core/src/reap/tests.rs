@@ -201,3 +201,35 @@ fn identity_condition_holds_only_on_the_pod() {
     let st = std::process::Command::new("sh").args(["-c", &format!("{c} && echo yes || echo no")]).output().unwrap();
     assert_eq!(String::from_utf8_lossy(&st.stdout).trim(), "no");
 }
+
+/// Live W7 B-RS8b: an attempt stopped after its freeze (`REAP_ENABLED=0` mid-run) left a copy
+/// named exactly like a reap's. A frozen copy's name says what it is — a reap's only once the
+/// terminate succeeded — and a recovered reap (F2) finds its own attempt's copy, never an older
+/// attempt's or another pod's.
+#[test]
+fn frozen_copy_names() {
+    let s = "20261013T194004Z";
+    assert_eq!(frozen_leaf(s, "hetzner", "170164296", FrozenKind::Attempt), "20261013T194004Z-hetzner-170164296-attempt");
+    assert_eq!(frozen_leaf(s, "hetzner", "170164296", FrozenKind::Reaped), "20261013T194004Z-hetzner-170164296");
+    assert_eq!(frozen_leaf(s, "runpod", "p1", FrozenKind::Rehearsal), "20261013T194004Z-runpod-p1-rehearsal");
+    for kind in [FrozenKind::Reaped, FrozenKind::Attempt, FrozenKind::Rehearsal] {
+        assert_eq!(frozen_kind(&frozen_leaf(s, "runpod", "p1", kind)), kind);
+    }
+    assert_eq!(reaped_leaf_of("20261013T194004Z-runpod-p1-attempt"), Some("20261013T194004Z-runpod-p1"));
+    assert_eq!(reaped_leaf_of("20261013T194004Z-runpod-p1"), None);
+    assert_eq!(reaped_leaf_of("-attempt"), None);
+    let leaves: Vec<String> = [
+        "20261013T190000Z-runpod-p1-attempt", // an earlier attempt, before this one's write-ahead
+        "20261013T194004Z-runpod-p1-attempt", // this attempt's
+        "20261013T194500Z-runpod-p2-attempt", // another pod of the name
+        "20261013T194600Z-runpod-p1-rehearsal",
+        "20261013T194700Z-runpod-p1",
+        "x-runpod-p1-attempt",
+    ]
+    .map(String::from)
+    .to_vec();
+    assert_eq!(attempt_since(&leaves, "runpod", "p1", "20261013T194000Z"), Some("20261013T194004Z-runpod-p1-attempt"));
+    assert_eq!(attempt_since(&leaves, "runpod", "p1", "20261013T194005Z"), None, "none frozen since");
+    assert_eq!(attempt_since(&leaves, "runpod", "p2", "20261013T194000Z"), Some("20261013T194500Z-runpod-p2-attempt"));
+    assert_eq!(attempt_since(&leaves, "runpod", "p1", "20261013T180000Z"), Some("20261013T194004Z-runpod-p1-attempt"), "the newest");
+}

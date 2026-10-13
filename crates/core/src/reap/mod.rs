@@ -64,9 +64,27 @@ pub const DRIFT_MAX: u64 = 120;
 /// The control clock going back by more than this since the last run makes it unverified.
 pub const CLOCK_BACKSTEP: u64 = 120;
 
-/// CPU use (millicores, averaged since the previous observation of the same container) above
-/// which a pod is in use: 0.10 cores.
+/// CPU use (millicores, averaged since the previous observation of the same container, over at
+/// least [`CPU_CUM_MIN_SPAN`]) above which a pod is in use: 0.10 cores.
 pub const CPU_CUM_MILLICORES: u64 = 100;
+
+/// The shortest span the cumulative CPU check averages over (s): a look taken sooner than this
+/// after the previous one is judged as if this long had passed. Why: every look costs the pod
+/// CPU of its own — the root SSH login (on a VM, logind starting and stopping `user@0.service`),
+/// the probe's scans and GPU samples, the jobs listing — about 5 s (live W7 B-H1b: 3.1 s for
+/// `user-0.slice` + 2.2 s for the probe's session on a Hetzner cx23), all of it landing between
+/// two looks. Over the cron's 15-minute gap that is 0.006 cores; over the 29 s between a cron
+/// look and a manual `reap run` it was 0.17 — `cpu`, and every policy's streak reset by the
+/// reaper's own probe. Averaged over at least 3 minutes, a look's own cost stays under the
+/// threshold up to 18 CPU-seconds (3× what was measured), while a real job still shows: more
+/// than 18 CPU-seconds anywhere in a short gap (a full core for 20 s) is over it — the same
+/// absolute amount a 3-minute gap allows, so a short gap is never judged more leniently than
+/// that — and a job still running is the window check's ([`CPU_WIN_MILLICORES`]) whatever the
+/// gap. A gap of 3 minutes or longer is judged exactly as before. (Rejected: comparing against
+/// an older look instead — over the cron's 15 minutes that dilutes a short gap's burst five
+/// times more; and a fixed per-look allowance — it would loosen every gap, the cron's included.)
+/// Network needs no floor: a look moves ~100 KB, one second's worth of the threshold.
+pub const CPU_CUM_MIN_SPAN: u64 = 180;
 
 /// CPU use over the probe's own 10 s window above which a pod is in use: 0.25 cores.
 pub const CPU_WIN_MILLICORES: u64 = 250;
@@ -939,6 +957,68 @@ pub fn identity_condition(provider: &str, id: &str) -> Option<String> {
         )),
         _ => None,
     }
+}
+
+/// What a frozen copy under `reaped/<name>/` is, by its leaf's name (RS1): the verified backup
+/// of a pod that was then terminated, one of an attempt that stopped before its terminate, or a
+/// rehearsal's. The name is the only record on the control box's disk, so it must never
+/// overstate: a copy is named a reap's only once the terminate succeeded (W7 B-RS8b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrozenKind {
+    /// `<stamp>-<provider>-<id>`: the pod was terminated after it.
+    Reaped,
+    /// `<stamp>-<provider>-<id>-attempt`: frozen by an `--apply` attempt that stopped before (or
+    /// was cut off around) its terminate — a re-listing, a pin, `REAP_ENABLED=0`, a crash.
+    Attempt,
+    /// `<stamp>-<provider>-<id>-rehearsal`: `--rehearse`, never a terminate.
+    Rehearsal,
+}
+
+/// The suffix of an attempt's frozen copy until its terminate succeeds.
+pub const ATTEMPT_SUFFIX: &str = "-attempt";
+
+/// The suffix of a rehearsal's frozen copy.
+pub const REHEARSAL_SUFFIX: &str = "-rehearsal";
+
+/// A frozen copy's leaf: `<stamp>-<provider>-<id>` plus the kind's suffix. `provider` and `id`
+/// as they go into a path (the caller's `path_component`).
+pub fn frozen_leaf(stamp: &str, provider: &str, id: &str, kind: FrozenKind) -> String {
+    let suffix = match kind {
+        FrozenKind::Reaped => "",
+        FrozenKind::Attempt => ATTEMPT_SUFFIX,
+        FrozenKind::Rehearsal => REHEARSAL_SUFFIX,
+    };
+    format!("{stamp}-{provider}-{id}{suffix}")
+}
+
+/// A leaf's kind, from its suffix.
+pub fn frozen_kind(leaf: &str) -> FrozenKind {
+    if leaf.ends_with(ATTEMPT_SUFFIX) {
+        FrozenKind::Attempt
+    } else if leaf.ends_with(REHEARSAL_SUFFIX) {
+        FrozenKind::Rehearsal
+    } else {
+        FrozenKind::Reaped
+    }
+}
+
+/// The reap's name for an attempt's leaf (its suffix dropped) — what it is renamed to once the
+/// terminate succeeded. `None` for a leaf that isn't an attempt's.
+pub fn reaped_leaf_of(attempt: &str) -> Option<&str> {
+    attempt.strip_suffix(ATTEMPT_SUFFIX).filter(|l| !l.is_empty())
+}
+
+/// Of `leaves` (one pod name's `reaped/<name>/` entries), the newest attempt of the pod
+/// `provider`/`id` frozen at or after `stamp` (the write-ahead's, in the same `YYYYMMDDTHHMMSSZ`
+/// form — fixed width, so it sorts as text): what a run cut off between its terminate and its
+/// record froze (F2), never an older attempt's or another pod's.
+pub fn attempt_since<'a>(leaves: &'a [String], provider: &str, id: &str, stamp: &str) -> Option<&'a str> {
+    let tail = format!("-{provider}-{id}{ATTEMPT_SUFFIX}");
+    leaves
+        .iter()
+        .map(String::as_str)
+        .filter(|l| l.strip_suffix(tail.as_str()).is_some_and(|s| s.len() == stamp.len() && s >= stamp))
+        .max()
 }
 
 /// Whether the provider reports `pod` protected against a terminate: RunPod's `locked`,

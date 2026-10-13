@@ -541,6 +541,16 @@ pub fn next_baseline(prev: Option<&ProcBaseline>, facts: &Result<ProbeFacts, Pro
     Some(b)
 }
 
+/// Which look [`classify_look`] judges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Look {
+    /// A look of a run: the cumulative counters since the previous look are judged too.
+    Regular,
+    /// The reap's post-backup look ([`classify_post_backup`]): its counters span our own backup,
+    /// so they are recorded as the next look's baseline, not judged.
+    PostBackup,
+}
+
 /// Classify one probe (spec §6.2) against the previous observation `prev` of the pod:
 /// `Unknown` if the probe failed or is garbled, is about another pod, its container or clock
 /// is off, or any applicable signal is unknown (including no baseline for the cumulative
@@ -548,6 +558,27 @@ pub fn next_baseline(prev: Option<&ProcBaseline>, facts: &Result<ProbeFacts, Pro
 /// every applicable signal is present and under its threshold. Vetoes are `Active` so the
 /// streak resets. Counters are only kept when they can be trusted as the next baseline.
 pub fn classify(prev: Option<&Observation>, facts: &Result<ProbeFacts, ProbeError>, jobs: JobsOutcome, ctx: &ClassifyCtx) -> Observation {
+    classify_look(prev, facts, jobs, ctx, Look::Regular)
+}
+
+/// The reap's post-backup look (spec §4 12d) as an observation of its own, `prev` being the
+/// deciding look. Recorded so that it — not the deciding look before the backup — is the next
+/// look's baseline: the counters between the two hold the backup's own git push and rsync, and
+/// a rehearsal, or any attempt stopped after its backup (a re-listing, a pin, `REAP_ENABLED=0`),
+/// otherwise read as `cpu, net` on the next look and broke the streak by itself (live W7 B-H3b:
+/// a 1.1 GB backup, four minutes before). It is a real look all the same, judged as any other —
+/// identity, container, clock and drift against the deciding look, and every point-in-time
+/// signal: a session, a file changed since the deciding look's scan began, a process, the CPU
+/// and network of its own window … — so activity it sees counts (`Active` resets the streak),
+/// and anything it can't read is `Unknown`. Only the cumulative counters aren't judged (the
+/// backup is in them), exactly as [`quiet_now`] doesn't. (A backup longer than [`MAX_GAP`]
+/// restarts the streak at this look: [`idle_streak`]'s own rule.)
+pub fn classify_post_backup(prev: Option<&Observation>, facts: &Result<ProbeFacts, ProbeError>, jobs: JobsOutcome, ctx: &ClassifyCtx) -> Observation {
+    classify_look(prev, facts, jobs, ctx, Look::PostBackup)
+}
+
+/// [`classify`] / [`classify_post_backup`].
+fn classify_look(prev: Option<&Observation>, facts: &Result<ProbeFacts, ProbeError>, jobs: JobsOutcome, ctx: &ClassifyCtx, look: Look) -> Observation {
     if let Err(r) = usable(facts, ctx) {
         let (container, pod_t) = match facts {
             Ok(f) if r != Reason::Identity => (f.container(), Some(f.now)),
@@ -572,6 +603,9 @@ pub fn classify(prev: Option<&Observation>, facts: &Result<ProbeFacts, ProbeErro
     // Cumulative counters since the previous observation of the same container.
     match (prev, same) {
         (Some(p), None) if p.container.is_some() && p.container != container => unk.push(Reason::ContainerChanged),
+        // The post-backup look after the deciding one (same container): our own backup is in
+        // them — recorded, not judged.
+        (Some(_), _) if look == Look::PostBackup => {}
         (_, Some(p)) if p.cpu_usec.is_some() && p.counters_t.is_some() => {
             let (pt, cpu_then, net_then) = (p.counters_t.unwrap_or(0), p.cpu_usec.unwrap_or(0), p.net_bytes);
             let dt = f.t1.saturating_sub(pt);
@@ -580,7 +614,8 @@ pub fn classify(prev: Option<&Observation>, facts: &Result<ProbeFacts, ProbeErro
             } else {
                 match f.cpu.end {
                     Some(c) if c >= cpu_then => {
-                        if (c - cpu_then) / dt > CPU_CUM_MILLICORES * 1000 {
+                        // Over at least CPU_CUM_MIN_SPAN: a look's own CPU never reads as use.
+                        if (c - cpu_then) / dt.max(CPU_CUM_MIN_SPAN) > CPU_CUM_MILLICORES * 1000 {
                             act.push(Reason::Cpu);
                         }
                     }

@@ -373,6 +373,113 @@ fn quiet_now_ignores_cumulative_counters() {
     assert_eq!(quiet_now(&Err(ProbeError::Failed), JobsOutcome::Read { busy: 0 }, &ctx).unwrap_err(), [Reason::ProbeFailed]);
 }
 
+/// The previous look `gap` seconds before `r`, with `cpu_since` µs of CPU used since it.
+fn gap_prev(r: &Reply, gap: u64, cpu_since: u64) -> Observation {
+    Observation {
+        t: r.now() - gap,
+        pod_t: Some(r.now() - gap),
+        counters_t: Some(r.t0 + r.window - gap),
+        cpu_usec: Some(r.cpu.1.unwrap() - cpu_since),
+        net_bytes: Some(r.net.1.unwrap() - 1_000),
+        ..prev(r)
+    }
+}
+
+/// Live W7 B-H1b: a `reap run` 29 s after the cron's read `cpu` — the reaper's own look (the
+/// root SSH login starting `user@0.service`, the probe) costs the pod ~5 s of CPU, 0.17 cores
+/// over 29 s, and every policy's streak reset. The cumulative check averages over at least
+/// CPU_CUM_MIN_SPAN: a look's own cost (up to 18 CPU-seconds) never reads as use, a real job's
+/// CPU in a short gap still does, and a gap of CPU_CUM_MIN_SPAN or more is judged as before.
+#[test]
+fn w7_b_h1b_a_looks_own_cpu_never_reads_as_use() {
+    let r = Reply::default();
+    let read0 = JobsOutcome::Read { busy: 0 };
+    let verdict = |gap: u64, cpu: u64| classify_reply(&r, Some(&gap_prev(&r, gap, cpu)), read0, "runpod");
+    // The live case, and the reaper's own cost at any short gap (3× what was measured).
+    assert_eq!(verdict(29, 5_300_000).verdict, Verdict::Idle, "the reaper's own look, 29 s after the last");
+    for gap in [5, 29, 60, 120, 179] {
+        assert_eq!(verdict(gap, 18_000_000).verdict, Verdict::Idle, "{gap} s, 18 CPU-seconds");
+    }
+    // A real job in a short gap: a full core for 20 s of it (and the look's own 5 s).
+    for gap in [25, 29, 60, 179] {
+        assert_eq!(verdict(gap, 25_000_000).reasons, [Reason::Cpu], "{gap} s, a core for 20 s");
+    }
+    // At and past CPU_CUM_MIN_SPAN, exactly the old rule (0.10 cores since the last look).
+    for gap in [CPU_CUM_MIN_SPAN, 300, 900, MAX_GAP] {
+        let over = gap * 100_000 + gap; // 0.10001 cores
+        assert_eq!(verdict(gap, over).reasons, [Reason::Cpu], "{gap} s over");
+        assert_eq!(verdict(gap, gap * 100_000 - gap).verdict, Verdict::Idle, "{gap} s under");
+    }
+    // A job still running is the window's, whatever the gap.
+    let busy = Reply { cpu: (Some(1_000_000_000), Some(1_003_000_000)), ..Default::default() };
+    let p = gap_prev(&busy, 29, 0);
+    assert_eq!(classify_reply(&busy, Some(&p), read0, "runpod").reasons, [Reason::Cpu]);
+}
+
+/// Live W7 B-H3b: four minutes after a rehearsal the next look read `cpu, net` — the counters
+/// since the deciding look held the reaper's own 1.1 GB backup — so a rehearsal, or any attempt
+/// stopped after its backup, reset the streak by itself. The post-backup look is recorded as an
+/// observation: its counters aren't judged (the backup is in them) but become the next look's
+/// baseline; otherwise it is a real look — what it sees counts.
+#[test]
+fn w7_b_h3b_the_post_backup_look_is_the_next_baseline_and_a_real_look() {
+    let read0 = JobsOutcome::Read { busy: 0 };
+    let r = Reply { net: (Some(2_000_000_000), Some(2_000_002_000)), ..Default::default() };
+    // The deciding look 2 minutes before: the backup since moved 1.1 GB and burned 60 s of CPU.
+    let deciding = Observation { net_bytes: Some(r.net.1.unwrap() - 1_100_000_000), ..gap_prev(&r, 120, 60_000_000) };
+    let ctx = |now: u64| ClassifyCtx { provider: "runpod", listed_id: "pod1", now, clock_ok: true, baseline: None };
+    let facts = |reply: &Reply| parse_probe(&reply.render(), &reply.nonce, reply.since);
+    // As a regular look, the backup reads as use…
+    assert_eq!(classify(Some(&deciding), &facts(&r), read0, &ctx(r.now())).reasons, [Reason::Cpu, Reason::Net]);
+    // …as the post-backup look it doesn't, and its counters are kept, as they are now.
+    let post = classify_post_backup(Some(&deciding), &facts(&r), read0, &ctx(r.now()));
+    assert_eq!((post.verdict, post.reasons.clone()), (Verdict::Idle, vec![]));
+    assert_eq!((post.cpu_usec, post.net_bytes, post.counters_t), (r.cpu.1, r.net.1, Some(r.t0 + r.window)));
+    assert_eq!((post.container.as_deref(), post.pod_t, post.scan_from), (Some(CONTAINER), Some(r.now()), Some(r.t0 - 900)));
+    // The next look, 4 minutes on, measured from it: quiet.
+    let next = Reply {
+        t0: r.t0 + 240,
+        cpu: (Some(r.cpu.1.unwrap() + 240_000), Some(r.cpu.1.unwrap() + 245_000)),
+        net: (Some(r.net.1.unwrap() + 2_400), Some(r.net.1.unwrap() + 2_500)),
+        ..Default::default()
+    };
+    assert_eq!(classify(Some(&post), &facts(&next), read0, &ctx(next.now())).verdict, Verdict::Idle);
+    // A real look: activity counts, what it can't read is unknown.
+    let with_session = Reply { sshd: [Reply::default().sshd, vec![(5000, "sshd: root@pts/0".into())]].concat(), ..Default::default() };
+    let cases: Vec<(&str, Reply, JobsOutcome, Verdict, Reason)> = vec![
+        ("a login meanwhile", with_session, read0, Verdict::Active, Reason::Session),
+        ("a file saved since the deciding look's scan began", Reply { files: "hit", ..Default::default() }, read0, Verdict::Active, Reason::Files),
+        ("busy right now", Reply { cpu: (Some(1_000_000_000), Some(1_003_000_000)), ..Default::default() }, read0, Verdict::Active, Reason::Cpu),
+        ("a job", Reply::default(), JobsOutcome::Read { busy: 1 }, Verdict::Active, Reason::Job),
+        ("keep", Reply { keep: true, ..Default::default() }, read0, Verdict::Active, Reason::Keep),
+        ("a process started meanwhile", with_proc(late("python")), read0, Verdict::Active, Reason::Process),
+        ("jobs unreadable", Reply::default(), JobsOutcome::Failed, Verdict::Unknown, Reason::JobsUnknown),
+        ("another pod", Reply { id: "other".into(), ..Default::default() }, read0, Verdict::Unknown, Reason::Identity),
+        (
+            "another container",
+            Reply { pid1_start: "999".into(), procs: Some(vec![(999, 11, false, "start.sh".into())]), ..Default::default() },
+            read0,
+            Verdict::Unknown,
+            Reason::ContainerChanged,
+        ),
+    ];
+    for (case, reply, jobs, verdict, reason) in cases {
+        let o = classify_post_backup(Some(&deciding), &facts(&reply), jobs, &ctx(reply.now()));
+        assert_eq!(o.verdict, verdict, "{case}: {:?}", o.reasons);
+        assert!(o.reasons.contains(&reason), "{case}: {:?}", o.reasons);
+    }
+    // Its clock: drift against the deciding look, and an unverified control clock.
+    let drifted = Observation { pod_t: Some(r.now() - 120 - 121), ..deciding.clone() };
+    assert_eq!(classify_post_backup(Some(&drifted), &facts(&r), read0, &ctx(r.now())).reasons, [Reason::Clock]);
+    let unverified = ClassifyCtx { clock_ok: false, ..ctx(r.now()) };
+    assert_eq!(classify_post_backup(Some(&deciding), &facts(&r), read0, &unverified).verdict, Verdict::Unknown);
+    // No deciding look before it: nothing to measure from.
+    assert_eq!(classify_post_backup(None, &facts(&r), read0, &ctx(r.now())).reasons, [Reason::NoBaseline]);
+    // A failed probe: no facts, no counters.
+    let failed = classify_post_backup(Some(&deciding), &Err(ProbeError::Failed), read0, &ctx(r.now()));
+    assert_eq!((failed.verdict, failed.cpu_usec), (Verdict::Unknown, None));
+}
+
 fn streak_of(ts: &[u64]) -> Vec<Observation> {
     ts.iter().map(|t| obs(*t, Verdict::Idle)).collect()
 }

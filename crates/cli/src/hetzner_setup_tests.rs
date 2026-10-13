@@ -14,8 +14,10 @@ impl Drop for Tmp {
     }
 }
 
-/// The stubs. `uv` logs its argv to `$STUBS/uv.log`; `uv venv … DIR` makes a venv whose
-/// `python` "imports" only once `$STUBS/torch-ok` exists; `uv pip install` exits
+/// The stubs. `uv` logs its argv to `$STUBS/uv.log` (and the `TMPDIR` it got); `uv venv … DIR`
+/// makes a venv whose `python` "imports" only once `$STUBS/torch-ok` exists; `uv pip install`
+/// leaves a 0-byte, mode-666 `uv-setuptools-<hash>.lock` in its temp dir as the real one does
+/// (and, with `$UV_STRAY` set, one at that path too: a uv that ignores `TMPDIR`), exits
 /// `$UV_INSTALL_EXIT` (default 0) and, when `$UV_INSTALL_MAKES_TORCH` is set, "installs" torch;
 /// its `--help` lists `--torch-backend` unless `$UV_OLD` is set (an older uv).
 fn install_stubs(dir: &Path) {
@@ -36,6 +38,15 @@ fn install_stubs(dir: &Path) {
         "uv",
         r#"S="$(dirname "$0")"
 echo "uv $*" >> "$S/uv.log"
+echo "TMPDIR ${TMPDIR:-}" >> "$S/uv.log"
+case "$1 $2" in
+  "pip install")
+    [ "$3" = --help ] || {
+      D=${TMPDIR:-${ARENA_SETUP_TMP_ROOT:-/tmp}}
+      : > "$D/uv-setuptools-9f3c2a1b.lock" && chmod 666 "$D/uv-setuptools-9f3c2a1b.lock"
+      [ -z "${UV_STRAY:-}" ] || : > "$UV_STRAY"
+    };;
+esac
 case "$1" in
   --version) echo "uv 0.0.0 (stub)";;
   venv)
@@ -74,6 +85,10 @@ fn run(stubs: &Path, home: &Path, repo: &Path, env: &[(&str, &str)]) -> Run {
     for (k, v) in env {
         cmd.env(k, v);
     }
+    // /tmp, stood in for: nothing here touches the box's own.
+    let tmp_root = home.parent().unwrap().join("tmp");
+    std::fs::create_dir_all(&tmp_root).unwrap();
+    cmd.env("ARENA_SETUP_TMP_ROOT", &tmp_root);
     let out = cmd.output().expect("bash");
     Run {
         ok: out.status.success(),
@@ -189,4 +204,35 @@ fn an_older_uv_without_torch_backend_installs_from_the_cpu_index() {
     let r = run(&stubs, &home, &repo, &[("UV_INSTALL_MAKES_TORCH", "1")]);
     let install = install_line(&r.uv_log);
     assert!(r.ok && install.contains(" --torch-backend cpu --override overrides.txt") && !install.contains("--extra-index-url"), "{install}");
+}
+
+/// Live W7 B-H0: a fresh VM never read as idle — the setup's own `uv` had left five 0-byte
+/// `/tmp/uv-setuptools-<hash>.lock` files, "data outside the home" to the auto-reaper's probe for
+/// the VM's whole life. The script gives every installer a temp dir of its own (`TMPDIR` under
+/// `/tmp/.arena-setup.*`) and removes it when it ends — after a failure too; a `uv-*` file a uv
+/// wrote to /tmp itself during the run goes with it, while one from before the run (not this
+/// run's) stays. `/tmp` is a stand-in here.
+#[test]
+fn w7_b_h0_setup_leaves_no_uv_files_behind() {
+    for (tag, env) in [("clean-ok", [("UV_INSTALL_MAKES_TORCH", "1")]), ("clean-fail", [("UV_INSTALL_EXIT", "1")])] {
+        let (_t, stubs, home, repo) = setup(tag);
+        let tmp = home.parent().unwrap().join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let older = tmp.join("uv-setuptools-0ld0ld.lock");
+        std::fs::write(&older, "").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let stray = tmp.join("uv-setuptools-57a7.lock");
+        let stray_s = stray.display().to_string();
+        let env: Vec<(&str, &str)> = env.iter().copied().chain([("UV_STRAY", stray_s.as_str())]).collect();
+        let r = run(&stubs, &home, &repo, &env);
+        assert_eq!(r.ok, tag == "clean-ok", "{tag}: {}", r.stderr);
+        let tmpdirs: Vec<&str> = r.uv_log.lines().filter_map(|l| l.strip_prefix("TMPDIR ")).collect();
+        let ours = format!("{}/.arena-setup.", tmp.display());
+        assert!(!tmpdirs.is_empty() && tmpdirs.iter().all(|d| d.starts_with(&ours)), "{tag}: uv ran without the setup's own TMPDIR:\n{}", r.uv_log);
+        for d in &tmpdirs {
+            assert!(!Path::new(d).exists(), "{tag}: the setup's temp dir {d} (uv's locks in it) outlived the script");
+        }
+        let left: Vec<String> = std::fs::read_dir(&tmp).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(left, ["uv-setuptools-0ld0ld.lock"], "{tag}: only what was there before the run stays");
+    }
 }

@@ -364,13 +364,14 @@ pub fn notice_text(name: &str, p: &PodPolicy, tz: i64) -> String {
             fmt_span(w)
         ));
     }
-    s.push_str(
-        "  Your home directory is backed up first (not kept: caches, installed packages and venvs, Hugging Face hub \
-         downloads, ~/.ssh) — only your home. Nothing happens while the machine is in use, while a \
-         TEMP_FOLDER_FOR_SWEEPS/ holds any results, or while you have data outside your home (/data, /tmp, /workspace, \
-         a link out of the home …).\n  \
+    // What the reap's backup leaves out: the one wording code, notice and README share.
+    s.push_str(&format!(
+        "  Your home directory is backed up first ({}) — only your home. Nothing happens while the machine is in use, \
+         while a TEMP_FOLDER_FOR_SWEEPS/ holds any results, or while you have data outside your home (/data, /tmp, \
+         /workspace, a link out of the home …).\n  \
          To keep it running, create ~/.arena/keep (`mkdir -p ~/.arena && touch ~/.arena/keep`) and tell the organisers.\n",
-    );
+        crate::pull::REAP_NOT_KEPT_SUMMARY
+    ));
     s
 }
 
@@ -410,8 +411,13 @@ pub fn wall_command(name: &str, trigger: Trigger, in_secs: u64) -> String {
     format!("command -v wall >/dev/null 2>&1 && printf '%s\\n' {} | wall 2>/dev/null; true", sq(&msg))
 }
 
-/// The cron schedule of the reap line: four times an hour, off the `*/15` backup's ticks.
-pub const CRON_SCHEDULE: &str = "7,22,37,52 * * * *";
+/// The cron schedule of the reap line: four times an hour, on minutes no other arena line uses —
+/// off the `*/15` backup's ticks (its rsyncs hold the pods' backup locks: a probe meanwhile is
+/// skipped), and off the backup archive's pushes (`archive sync`: snap at :07/:22/:37/:52, big at
+/// :40), which read the same backup roots a reap backup writes (live W7 step 0: the reap line had
+/// the archive snap line's very minutes). 11 minutes after a backup tick, 4 after an archive
+/// push; and none is a multiple of 5 (the proxy re-sync, which a reap's own proxy sync would meet).
+pub const CRON_SCHEDULE: &str = "11,26,41,56 * * * *";
 
 /// `PATH` for the reap line (cron's is `/usr/bin:/bin`; nginx and friends live in sbin).
 pub const CRON_PATH: &str = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";

@@ -162,7 +162,7 @@ fn cron_line_both_modes() {
     let observe = cron_line(false, "/usr/local/bin/arena", "/root/arena/config.env", "/root", &env);
     assert_eq!(
         observe,
-        "7,22,37,52 * * * * PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ARENA_STATE_DIR=/var/lib/arena flock -n -o /root/.arena-reap-cron.lock /usr/local/bin/arena --config /root/arena/config.env pods reap run >> /root/arena-reap-cron.log 2>&1"
+        "11,26,41,56 * * * * PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ARENA_STATE_DIR=/var/lib/arena flock -n -o /root/.arena-reap-cron.lock /usr/local/bin/arena --config /root/arena/config.env pods reap run >> /root/arena-reap-cron.log 2>&1"
     );
     let apply = cron_line(true, "/usr/local/bin/arena", "/root/arena/config.env", "/root", &[]);
     assert!(apply.contains(" pods reap run --apply --yes >> "), "{apply}");

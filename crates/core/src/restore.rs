@@ -41,8 +41,9 @@ use crate::ssh::SshTarget;
 pub const BIG: &str = "big";
 
 /// Where the auto-reaper freezes a reaped pod's verified backup (`<root>/reaped/<name>/<UTC
-/// stamp>-<provider>-<id>/`, on each tier's root): never a snapshot label, never written into
-/// or deleted by arena; restored from by hand (rsync from that path).
+/// stamp>-<provider>-<id>/`, on each tier's root; `…-attempt` for an attempt that stopped before
+/// its terminate, `…-rehearsal` for a rehearsal — `crate::reap::FrozenKind`): never a snapshot
+/// label, never written into or deleted by arena; restored from by hand (rsync from that path).
 pub const REAPED: &str = "reaped";
 
 /// The default wall-clock budget for one restore (`--timeout` overrides): a full home over a
