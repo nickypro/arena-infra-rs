@@ -1233,7 +1233,8 @@ impl Shared<'_, '_> {
 
     /// This pod's API keys (its per-host CSV keys + the broadcast tokens) and the fleet SSH
     /// map, in one bounded exec — `pods copy-keys` for exactly this pod. `Ok` carries the
-    /// line to print and the fleet-SSH write it made (none if there was nothing to send).
+    /// line to print and the fleet-SSH write it made (none if there was nothing to send). With
+    /// a backup archive, the pod gets its access even with no key for it (A-ckl9).
     async fn copy_keys(
         &self,
         name: &str,
@@ -1242,15 +1243,16 @@ impl Shared<'_, '_> {
         keys: &KeySources,
     ) -> std::result::Result<(To, String, Option<String>), String> {
         let (vars, matched) = keys.vars_for(&pod.name);
-        if vars.is_empty() {
-            let line = format!("[{name}] keys: none for it (no per-host key matched {name}, no broadcast token set)");
-            return Ok((To::Err, line, None));
+        let archive = super::archive::pod_archive(self.run.cfg);
+        let none_for_it = format!("keys: none for it (no per-host key matched {name}, no broadcast token set)");
+        if vars.is_empty() && archive.ready().is_none() {
+            return Ok((To::Err, format!("[{name}] {none_for_it}"), None));
         }
         let fleet_pods = self.listing.borrow().clone();
         let (fleet_ssh, _) = fleet_ssh_for(self.run.cfg, &fleet_pods);
         let written = self.run.remote.exec(target, &copy_keys_command(&vars, &fleet_ssh), Some(COPY_KEYS_TIMEOUT)).await;
         // The backup archive's read key (when this user has an archive), by scp — as `copy-keys`.
-        let archive_note = match (&written, super::archive::pod_archive(self.run.cfg)) {
+        let archive_note = match (&written, archive) {
             (Ok(o), super::archive::PodArchive::Ready(a)) if o.success => {
                 super::archive::install_read_key(self.run.remote.as_ref(), target, &a, COPY_KEYS_TIMEOUT).await.err()
             }
@@ -1258,10 +1260,18 @@ impl Shared<'_, '_> {
             _ => None,
         };
         if let Some(e) = archive_note {
-            return Ok((To::Err, format!("[{name}] keys ✓ — backup archive: {e}"), Some(fleet_ssh)));
+            let done = if vars.is_empty() { "fleet ssh" } else { "keys" };
+            return Ok((To::Err, format!("[{name}] {done} ✓ — backup archive: {e}"), Some(fleet_ssh)));
         }
         match written {
-            Ok(o) if o.success && matched => Ok((To::Out, format!("[{name}] keys ✓"), Some(fleet_ssh))),
+            // No key for it, only the archive's access: said as such — a warning only when a key
+            // file exists that didn't name it.
+            Ok(o) if o.success && vars.is_empty() => {
+                let to = if keys.per_host.is_empty() { To::Out } else { To::Err };
+                let why = if keys.per_host.is_empty() { "keys: none generated".to_string() } else { none_for_it };
+                Ok((to, format!("[{name}] backup archive access ✓ ({why})"), Some(fleet_ssh)))
+            }
+            Ok(o) if o.success && (matched || keys.per_host.is_empty()) => Ok((To::Out, format!("[{name}] keys ✓"), Some(fleet_ssh))),
             Ok(o) if o.success => Ok((
                 To::Err,
                 format!("[{name}] keys ✓ — broadcast tokens only: no per-host key in keys/*_api_keys.csv matched {name}"),
@@ -1808,7 +1818,7 @@ mod tests {
                 attempts,
                 cmd: health::deep_check_command(Some("arena-env")),
             }),
-            keys: keys.map(|d| KeySources::load(cfg, &d.to_string_lossy(), None, None)).filter(|k| !k.csv.is_empty()),
+            keys: keys.and_then(|d| crate::up_keys_stage(cfg, &d.to_string_lossy(), true)),
             lock: false,
             retry_bad_hosts: false,
             balance: None,
@@ -3477,6 +3487,35 @@ mod tests {
         let (refreshed, _) = lines.find("[devtest-apple] fleet SSH map updated");
         let (bloom_ready, _) = lines.find("[devtest-bloom] READY");
         assert!(bloom_ready < refreshed, "{:#?}", lines.all());
+    }
+
+    /// W7 live (A-ckl9): with a backup archive and no key file at all, the keys stage still runs
+    /// — each pod gets the archive's access (its block in the one exec, no key exported; the read
+    /// key by scp), said as such. Without an archive (or without setup) there is no keys stage.
+    #[tokio::test(start_paused = true)]
+    async fn the_keys_stage_writes_the_archive_access_without_any_key_file() {
+        let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 0)])]);
+        let fake = Arc::new(FakeRemote::new());
+        let state = tmp_dir("archive-state");
+        let none = tmp_dir("keys-none");
+        let cfg = Config::parse(&format!("{}ARENA_STATE_DIR={}\n", cfg_text(None), state.0.display()));
+        let dir = none.0.to_string_lossy().into_owned();
+        assert!(crate::up_keys_stage(&cfg, &dir, true).is_none(), "no keys, no archive: no stage");
+        crate::archive::seed_pod_access(&cfg);
+        assert!(crate::up_keys_stage(&cfg, &dir, false).is_none(), "--no-setup: no stage");
+        let run = up_run(&fleet, fake.clone(), &cfg, true, None, Some(&none.0)).await;
+        assert!(run.keys.is_some());
+        let made = make(&fleet, &["apple"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+        assert!(rows.iter().all(|r| r.verdict == Verdict::Ready), "{:#?}", lines.all());
+        let calls = fake.calls_to(&host("10.0.0.1", 22001));
+        assert!(
+            calls.iter().any(|c| matches!(c, RemoteCall::Exec { cmd, .. } if cmd.contains("# BEGIN arena-archive") && !cmd.contains("export "))),
+            "{calls:#?}"
+        );
+        assert!(calls.iter().any(|c| matches!(c, RemoteCall::Copy { remote, .. } if remote == ".ssh/arena_archive_key")), "{calls:#?}");
+        lines.find("[devtest-apple] backup archive access ✓ (keys: none generated)");
     }
 
     /// `--lock` is the last step: a pod that fails its check is replaced (it was never

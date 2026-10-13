@@ -3609,7 +3609,9 @@ async fn handle_setup(
 
     // Auto-handle API keys: if per-host CSVs have been generated, distribute them and say
     // so; otherwise report they're not set up (rather than silently doing nothing). HF is
-    // already handled inline above. Best-effort — never fails the setup.
+    // already handled inline above. Best-effort — never fails the setup. With a backup
+    // archive, copy-keys runs anyway: it writes the archive's access (A-ckl9).
+    let archive_ready = archive::pod_archive(cfg).ready().is_some();
     let csv_sources: Vec<&str> = arena_core::apikeys::PROVIDERS
         .iter()
         .filter(|(base, _, _)| {
@@ -3619,24 +3621,33 @@ async fn handle_setup(
         })
         .map(|(_, display, _)| *display)
         .collect();
-    if csv_sources.is_empty() {
+    if csv_sources.is_empty() && !archive_ready {
         println!(
             "API keys: none generated in {keys_dir}/ — skipping (run `arena keys gen --all` \
              or drop in <provider>_api_keys.csv, then re-run setup / `pods copy-keys`)."
         );
     } else if provisioned.is_empty() {
-        println!("API keys: found {} — skipped, no pod provisioned successfully.", csv_sources.join(", "));
+        if !csv_sources.is_empty() {
+            println!("API keys: found {} — skipped, no pod provisioned successfully.", csv_sources.join(", "));
+        }
     } else {
         // Scope key distribution to exactly the pods that just provisioned OK: never the
         // rest of the fleet (`setup <one-pod>` must not touch the others), and never a pod
         // that just failed or timed out — re-contacting a wedged pod would hang here. Each
         // pod's write is bounded by COPY_KEYS_TIMEOUT anyway.
         let skipped = if failed > 0 { format!(" (skipping the {failed} that failed)") } else { String::new() };
-        println!(
-            "API keys: found {} — distributing to the {} provisioned pod(s){skipped}…",
-            csv_sources.join(", "),
-            provisioned.len()
-        );
+        if csv_sources.is_empty() {
+            println!(
+                "API keys: none generated in {keys_dir}/ — writing the backup archive's access to the {} provisioned pod(s){skipped}…",
+                provisioned.len()
+            );
+        } else {
+            println!(
+                "API keys: found {} — distributing to the {} provisioned pod(s){skipped}…",
+                csv_sources.join(", "),
+                provisioned.len()
+            );
+        }
         let done = Selected {
             pods: sel.pods.iter().filter(|p| provisioned.contains(&p.name)).cloned().collect(),
             named: true,
@@ -6613,7 +6624,7 @@ async fn handle_pods_bal(
                 None => (spec_with_overrides(cfg, &ov), None),
             };
             check_create_body(provider, &first_create_spec(&spec, options.as_ref(), &names[0]))?;
-            let keys = (!no_setup).then(|| KeySources::load(cfg, KEYS_DIR, None, None)).filter(|k| !k.csv.is_empty());
+            let keys = up_keys_stage(cfg, KEYS_DIR, !no_setup);
             let per_pod = up::pipeline_text(!no_setup, check.then_some(check_attempts), keys.is_some(), lock);
             if dry_run {
                 match &options {
@@ -6715,6 +6726,9 @@ async fn handle_pods_bal(
                 stage
             });
             match &keys {
+                Some(k) if k.csv.is_empty() => println!(
+                    "API keys: none generated in {KEYS_DIR}/ — each pod gets the backup archive's access once it's set up"
+                ),
                 Some(k) => println!("API keys: {} — copied to each pod once it's set up", k.csv.join(", ")),
                 None if setup.is_some() => println!(
                     "API keys: none generated in {KEYS_DIR}/ — skipping (run `arena keys gen --all` or drop in \
@@ -9836,7 +9850,7 @@ async fn after_swap(
 /// command to run is said. Nothing to carry without key files.
 async fn rekey_promoted(remote: Arc<dyn Remote>, cfg: &Config, owner: &dyn Provider, id: &str, canonical: &str, keys_dir: &str) {
     let keys = KeySources::load(cfg, keys_dir, None, None);
-    if keys.per_host.is_empty() && keys.broadcast.is_empty() {
+    if keys.per_host.is_empty() && keys.broadcast.is_empty() && archive::pod_archive(cfg).ready().is_none() {
         return;
     }
     println!("      giving {canonical} its API keys under its new name…");
@@ -13495,6 +13509,18 @@ fn fleet_ssh_for(cfg: &Config, pods: &[arena_core::Pod]) -> (String, usize) {
     (cmd, fleet_pubkeys.len())
 }
 
+/// What `up`'s keys stage copies to each pod once it's set up (`None`: no keys stage): the key
+/// files' per-host keys and the broadcast tokens when there are key files — and, with a backup
+/// archive this user can render, the stage runs without any too: it writes each pod's archive
+/// access (W7 live A-ckl9: a cohort without key files never got it).
+fn up_keys_stage(cfg: &Config, keys_dir: &str, setup: bool) -> Option<KeySources> {
+    if !setup {
+        return None;
+    }
+    let keys = KeySources::load(cfg, keys_dir, None, None);
+    (!keys.csv.is_empty() || archive::pod_archive(cfg).ready().is_some()).then_some(keys)
+}
+
 /// One pod's key write: the token export lines + the fleet SSH (authorized_keys +
 /// `~/.ssh/config`), in one round-trip.
 fn copy_keys_command(vars: &[(String, String)], fleet_ssh: &str) -> String {
@@ -13503,7 +13529,10 @@ fn copy_keys_command(vars: &[(String, String)], fleet_ssh: &str) -> String {
 
 /// `pods copy-keys`: distribute API keys to each pod's shell. Per-host keys come from
 /// `<keys_dir>/<provider>_api_keys.csv`; a Hugging Face token (from `--hf-token` or
-/// config `HF_TOKEN`) is broadcast to every pod (for gated repos like Llama 3).
+/// config `HF_TOKEN`) is broadcast to every pod (for gated repos like Llama 3). With a backup
+/// archive this user can render, every reachable pod also gets its access (the ssh block, the
+/// pinned key, the read key) — keys or not: a cohort without key files still reads the archive
+/// from its pods (W7 live A-ckl9). "No keys to copy" is an error only with no archive either.
 #[allow(clippy::too_many_arguments)]
 async fn handle_copy_keys(
     // How we reach pods: `SshRemote` for real, `FakeRemote` in tests. Each pod's write is
@@ -13529,13 +13558,24 @@ async fn handle_copy_keys(
         sources.push(format!("{display} (broadcast to every selected pod)"));
     }
 
-    if keys.per_host.is_empty() && keys.broadcast.is_empty() {
+    // The backup archive's access goes to every pod it reaches, whatever the keys (A-ckl9).
+    let pod_archive = archive::pod_archive(cfg);
+    let archive_access = pod_archive.ready().cloned();
+    if keys.per_host.is_empty() && keys.broadcast.is_empty() && archive_access.is_none() {
+        if let Some(w) = pod_archive.warning() {
+            eprintln!("{w}");
+        }
         anyhow::bail!(
             "no keys to copy: put `<provider>_api_keys.csv` in {keys_dir}/ \
              (openai/anthropic/openrouter), set HF_TOKEN / CLAUDE_CODE_OAUTH_TOKEN, or pass --hf-token"
         );
     }
-    println!("Key sources: {}\n", sources.join(", "));
+    let no_keys = sources.is_empty();
+    if no_keys {
+        println!("Key sources: none — writing only the fleet's ssh and the backup archive's access\n");
+    } else {
+        println!("Key sources: {}\n", sources.join(", "));
+    }
 
     // Build the per-pod var set (broadcast HF merged into every reachable selected pod).
     let pods = &sel.pods;
@@ -13548,7 +13588,7 @@ async fn handle_copy_keys(
     let mut stopped: Vec<&str> = Vec::new();
     for pod in pods {
         let (vars, matched_per_host) = keys.vars_for(&pod.name);
-        if vars.is_empty() {
+        if vars.is_empty() && archive_access.is_none() {
             continue; // nothing for this pod
         }
         if arena_core::status::is_stopped(&pod.status) {
@@ -13603,11 +13643,9 @@ async fn handle_copy_keys(
         fleet_keys
     );
 
-    let pod_archive = archive::pod_archive(cfg);
     if let Some(w) = pod_archive.warning() {
         eprintln!("{w}");
     }
-    let archive_access = pod_archive.ready().cloned();
     if let Some(a) = &archive_access {
         println!(
             "Also the backup archive's access on each: the `{}` ssh block, its pinned host key, and the read key \
@@ -13621,13 +13659,19 @@ async fn handle_copy_keys(
         println!("Dry-run — would set on {} pod(s) (values redacted):\n", jobs.len());
         for (name, _, vars) in &jobs {
             let names: Vec<&str> = vars.iter().map(|(k, _)| k.as_str()).collect();
-            println!("  {name:<22} {}", names.join(", "));
+            let what = if names.is_empty() { "(no keys — the backup archive's access only)".to_string() } else { names.join(", ") };
+            println!("  {name:<22} {what}");
         }
         println!("\nPreview only — run without --dry-run to write to ~/.bashrc & ~/.zshrc.");
         return Ok(());
     }
     let names = jobs.iter().map(|(n, _, _)| n.as_str()).collect::<Vec<_>>().join(", ");
-    if !confirm(yes, &format!("Will export API keys into ~/.bashrc & ~/.zshrc, authorize the fleet keys, and write ~/.ssh/config on {} pod(s): {names}", jobs.len()))? {
+    let what = if no_keys {
+        "authorize the fleet keys and write ~/.ssh/config (the fleet map and the backup archive's block)"
+    } else {
+        "export API keys into ~/.bashrc & ~/.zshrc, authorize the fleet keys, and write ~/.ssh/config"
+    };
+    if !confirm(yes, &format!("Will {what} on {} pod(s): {names}", jobs.len()))? {
         println!("aborted.");
         return Ok(());
     }
@@ -15492,6 +15536,27 @@ mod setup_tests {
                     if cmd.contains("OPENAI_API_KEY") && *timeout == Some(COPY_KEYS_TIMEOUT)),
                 "{calls:?}"
             );
+        }
+    }
+
+    /// W7 live (A-ckl9): `setup` with no key file but a backup archive still hands off to
+    /// copy-keys — every provisioned pod gets the archive's access (its block, the read key).
+    #[tokio::test(start_paused = true)]
+    async fn setup_writes_the_archive_access_without_any_key_file() {
+        let dir = std::env::temp_dir().join(format!("arena-setup-archive-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("keys")).unwrap();
+        let cfg = setup_cfg(&format!("ARENA_STATE_DIR={}\n", dir.join("state").display()));
+        crate::archive::seed_pod_access(&cfg);
+        let fake = Arc::new(FakeRemote::new());
+        let keys = dir.join("keys").display().to_string();
+        let r = handle_setup(fake.clone(), &cfg, true, false, None, None, false, false, budgets(&cfg, None), &everyone(), &keys, None).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        r.unwrap();
+        for port in [22001, 22002, 22003] {
+            let calls = fake.calls_to(&format!("10.0.0.1:{port}"));
+            assert!(calls.iter().any(|c| matches!(c, RemoteCall::Exec { cmd, .. } if cmd.contains("# BEGIN arena-archive"))), "{calls:#?}");
+            assert!(calls.iter().any(|c| matches!(c, RemoteCall::Copy { remote, .. } if remote == ".ssh/arena_archive_key")), "{calls:#?}");
         }
     }
 

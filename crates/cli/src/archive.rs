@@ -2079,6 +2079,32 @@ pub(crate) fn pod_archive_command(a: &PodAccess) -> String {
     )
 }
 
+/// For tests of the copy-keys paths outside this module (`up`'s keys stage, `setup`): the
+/// state of an archive this config's user can render for pods — `archive.json` up, the read key,
+/// a pin — in its (temporary) `ARENA_STATE_DIR`.
+#[cfg(test)]
+pub(crate) fn seed_pod_access(cfg: &Config) {
+    let paths = ArchivePaths::for_config(cfg).unwrap();
+    paths.ensure_dir().unwrap();
+    state::ensure_keypair(&paths.read_key(), "arena-archive-read").unwrap();
+    std::fs::write(paths.known_hosts(), "192.0.2.1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHostHostHostHostHostHostHostHostHostHos5\n").unwrap();
+    let host = ArchiveHost {
+        version: state::STATE_VERSION,
+        prefix: cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena").to_string(),
+        server_id: 7,
+        ipv4: "192.0.2.1".into(),
+        location: "nbg1".into(),
+        snap_device: "/dev/disk/by-id/scsi-0HC_Volume_1".into(),
+        big_device: "/dev/disk/by-id/scsi-0HC_Volume_2".into(),
+        access_on: true,
+        setup_version: 1,
+        snap_gb: 10,
+        big_gb: 10,
+        host_key_fingerprint: None,
+    };
+    state::save(&paths.host_file(), &host).unwrap();
+}
+
 /// The markers of the pods' archive block in `~/.ssh/config`.
 pub(crate) const POD_BLOCK_BEGIN: &str = "# BEGIN arena-archive";
 pub(crate) const POD_BLOCK_END: &str = "# END arena-archive";
@@ -3476,6 +3502,38 @@ mod tests {
         let e = crate::handle_copy_keys(fake.clone(), &w.cfg, &keys_dir, None, None, &only_bravo, false, true).await.unwrap_err().to_string();
         assert!(e.contains("stopped (devtest-bravo)") && e.contains("arena pods start devtest-bravo"), "{e}");
         assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+    }
+
+    /// W7 live (A-ckl9): with no key file and no token, copy-keys still writes each pod's archive
+    /// access — the block and pin in its one exec (no key exported), the read key by scp — and
+    /// its dry run lists the pod; "no keys to copy" is an error only with no archive either.
+    #[tokio::test]
+    async fn copy_keys_without_any_key_still_writes_the_archive_access() {
+        let w = world("copykeys-nokeys");
+        let cfg = Config::parse(&cfg_text(&w).replace("HF_TOKEN=hf_x\n", ""));
+        let sel = crate::Selected { pods: vec![pod("devtest-alpha")], named: true };
+        let keys_dir = w.dir.join("keys").display().to_string();
+        let fake = Arc::new(FakeRemote::new());
+        let e = crate::handle_copy_keys(fake.clone(), &cfg, &keys_dir, None, None, &sel, false, true).await.unwrap_err();
+        assert!(e.to_string().contains("no keys to copy"), "{e}");
+        assert!(fake.calls().is_empty());
+        w.up().await.unwrap();
+        std::fs::write(w.env().paths.known_hosts(), "203.0.113.102 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHostHostHostHostHostHostHostHostHostHos5\n").unwrap();
+        crate::handle_copy_keys(fake.clone(), &cfg, &keys_dir, None, None, &sel, true, true).await.unwrap();
+        assert!(fake.calls().is_empty(), "a dry run sends nothing");
+        crate::handle_copy_keys(fake.clone(), &cfg, &keys_dir, None, None, &sel, false, true).await.unwrap();
+        let calls = fake.calls();
+        assert_eq!(calls.len(), 3, "{calls:#?}");
+        let RemoteCall::Exec { cmd, .. } = &calls[0] else { panic!("{calls:?}") };
+        assert!(cmd.contains("# BEGIN arena-archive\nHost archive-devtest") && cmd.contains(".ssh/arena_archive_known_hosts"), "{cmd}");
+        assert!(cmd.contains("# BEGIN arena-infra fleet") && !cmd.contains("export "), "the fleet block, no key: {cmd}");
+        assert!(matches!(&calls[1], RemoteCall::Copy { remote, .. } if remote == ".ssh/arena_archive_key"), "{calls:?}");
+        // Lane F's stopped handling holds here too: every named pod stopped is its error.
+        let stopped = crate::Selected { pods: vec![arena_core::Pod { status: "EXITED".into(), ..pod("devtest-alpha") }], named: true };
+        let fake = Arc::new(FakeRemote::new());
+        let e = crate::handle_copy_keys(fake.clone(), &cfg, &keys_dir, None, None, &stopped, false, true).await.unwrap_err();
+        assert!(e.to_string().contains("stopped (devtest-alpha)"), "{e}");
+        assert!(fake.calls().is_empty());
     }
 
     /// Run a copy-keys command as a pod would, in a fake `$HOME`.
