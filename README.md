@@ -477,7 +477,7 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     with its identity. Lines written by older versions are recognized by the command they
     run; comments in the block (a paused `# …` line, a note) are never matched, replaced or
     removed by a targeted install/remove.
-  - `archive up|status|sync|resize|access|ssh-config|ssh|forget|down` — the **backup archive**: an
+  - `archive up|status|sync|resize|access|ssh-config|ssh|forget|unforget|down` — the **backup archive**: an
     always-on Hetzner VM with two volumes (dated snapshots, all files) holding copy #2 of
     `LOCAL_BACKUP_DIR`, pushed by cron, readable by participants once `access on`; never part of
     the fleet. See [Backup archive](#backup-archive-arena-archive).
@@ -1377,7 +1377,16 @@ deleted on its own.
   `--inplace`, `--append`, `--partial-dir`, `-a`, `-p`, `-L`… are never sent — test-enforced; a
   push is `-rlt -J --chmod=u=rwX,go=rX`): a changed file is written anew, so a past day's
   hard-linked file — or another pod's copy of a shared one — never changes, not even its mode, and
-  no per-directory holding area exists for a planted link to redirect.
+  no per-directory holding area exists for a planted link to redirect. **A file is linked only
+  where it was compared by content**: rsync tries a `--link-dest` *before* the file already there,
+  by size and mtime only — a same-size, same-mtime file of another day once replaced a label's own
+  correct copy (live W7). So a pod's first push of a label adds only what is missing, checksummed
+  against its earlier labels and the baseline (`--checksum --ignore-existing`); later pushes while
+  the day runs compare with the label's own copy (no link source); and a **check** — `--checksum`
+  with the link sources but without `-t` (so no mtime is ever set on a shared file), then a quick
+  pass for the mtimes — re-links a label pushed before its predecessor and, once its day is over,
+  compares every pod's copy with the control box's before the label seals. The content read costs
+  one pass of each pod's label at its first push and one at its check.
 - **Only this cohort's pods leave the control box**: the `MACHINE_NAME_LIST` names (and their
   `-old`/`-new` twins), never `@` staff boxes or anything else an unscoped pull put there
   (`sync`/`status` list those as "kept on the control box only", apart from pods named like the
@@ -1385,7 +1394,9 @@ deleted on its own.
   (`sync`/`status` name it: "off the list, still archived"); one re-listed as an `@` staff box,
   or **forgotten** — `arena archive forget <pod>` (consent withdrawn; also its `-old`/`-new`
   twins unless those are list entries of their own; refused unless run against the state dir
-  that holds `archive.json`, the one the cron reads) — is never pushed again. Its archived copies
+  that holds `archive.json`, the one the cron reads; it shows what it would record and asks —
+  `-y` or `--confirm <prefix>-<pod>` without a terminal) — is never pushed again, until
+  `arena archive unforget <pod>` lifts it (a deleted copy stays deleted). Its archived copies
   stay — readable by every participant while access is on, as `forget` and `status` say — until
   `--delete-archived`, which lists every directory with its size, needs the name typed
   (`--confirm <prefix>-<pod>`) and only then takes the sync locks for the delete itself.
@@ -1411,7 +1422,7 @@ deleted on its own.
 arena archive up --dry-run          # the plan, live prices, the local sizes it will hold
 arena archive up                    # keys (state dir), SSH-key object, server, volumes, pin, setup
 arena cron install --archive        # snap at :07/:22/:37/:52, big at :40 (absolute LOCAL_BACKUP_DIR, a start date)
-arena pods copy-keys --all          # the pods' `archive-<prefix>` block, pinned key and read key
+arena pods copy-keys --all          # the pods' `archive-<prefix>` block, pinned key and read key (no key files needed)
 arena archive access on             # when you're ready (prints the privacy statement)
 arena ssh-config                    # participants' config now ends with the archive block
 arena archive status                # API + probe + pushes + retention + cost; non-zero on FAIL/UNKNOWN
@@ -1421,14 +1432,14 @@ arena archive status                # API + probe + pushes + retention + cost; n
 labels that aren't final yet — the newest first, then up to three older ones per run, those
 tried least recently (round-robin: a label that fails every run never takes every slot) — pod by pod, as the pulls do: each pod's tree goes to
 `snap/<wNdM>/<pod>/` hard-linked to that pod's earlier labels on the archive (complete or cut
-short — rsync only links identical files) and to the week's fleet baseline, pushed once to
+short — only a file identical in content and mtime is linked) and to the week's fleet baseline, pushed once to
 `snap/baseline/` (so the image's files are stored once for every pod, as on the control box), in
 two passes like the pull's (the files under `BACKUP_MAX_SIZE`, then every `.git` uncapped — a
 pack over the cap must not leave a broken repo); then `big/`, pod by pod (least recently pushed
 first), so one pod's failure is that pod's alone. A label is final once a push that
 *started* 2 h after its UTC day ended went through for every pod, linked to everything it should
-have been — so a failed or out-of-order push never leaves a full, un-linked copy for good: the
-next push re-links it. One stuck pod never holds the rest up: a pod whose push of a past label
+have been, and compared by content with the control box's once its day was over — so a failed or
+out-of-order push never leaves a full, un-linked copy for good: the next push checks and re-links it. One stuck pod never holds the rest up: a pod whose push of a past label
 fails of its own kind three runs in a row is **sealed partial** for that label — kept as it is on
 the archive, later labels link to it and seal — and `status` names each one (`archive sync --label
 L` retries it); a fleet baseline that fails three runs in a row likewise stops holding labels
@@ -1449,9 +1460,23 @@ they were installed with, and a new `cron install --start-date` rewrites them to
 
 `archive resize --snap-gb|--big-gb N` grows a volume online (never shrinks; the volume's current
 size grows only the filesystem, finishing a resize whose `resize2fs` failed); `archive ssh [-- CMD]`
-is a root shell on the pinned key; `archive ssh-config [--pod]` prints the blocks; `archive down`
-deletes the server and keeps the volumes (protected, ≈ €0.06/GB/month) for a later `up`, which
-re-attaches them without formatting. Participants:
+is a root shell on the pinned key; `archive ssh-config [--pod | --known-hosts]` prints the blocks
+(or the laptops' known-hosts file); `archive down` deletes the server and keeps the volumes
+(protected, priced as everywhere: live `/pricing`, else the list prices) for a later `up`, which
+re-attaches them without formatting. `archive up` also powers on a server it finds off (a shutdown
+inside it): nothing else can, the fleet commands never see it. Every surface — `up`, `down`,
+`status`, `teardown --check`, `balance` — prices the archive by the same rule, the server's IPv4
+included.
+
+**A rebuilt archive has a new host key**, and Hetzner may give the new server the same IPv4. `up`
+says so when the pin changes: pods get the new pin from `arena pods copy-keys --all` (their sftp
+refuses the archive until then); laptops keep the archive's key apart — the block's `HostKeyAlias
+archive-<prefix>` and its own `~/.ssh/arena_archive_known_hosts`, so neither a new IP nor the old
+key under the same IP in `~/.ssh/known_hosts` matters. Hand out the new `arena ssh-config --out
+DIR/config` (it writes `DIR/arena_archive_known_hosts` beside it, keyed by the alias), or have
+participants run `ssh-keygen -R archive-<prefix> -f ~/.ssh/arena_archive_known_hosts` and compare
+the new fingerprint; a laptop on a block from before this one pinned it in `~/.ssh/known_hosts`
+(`ssh-keygen -R <ip>` there). Participants:
 
 ```bash
 sftp archive-arena9                    # ls snap ; cd snap/w2d5/arena9-apple ; get -r … ; reget for big files

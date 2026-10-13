@@ -210,6 +210,19 @@ flowchart TD
   (never a current `@` staff entry or a pod `archive forget` revoked) and never secret files,
   and participants read only after `archive access on`. One pod that can't be pushed never holds
   the others' labels open (round-robin backlog; "sealed partial" after three failed runs).
+- **An archived file is its local source, never another day's look-alike**: rsync tries a
+  `--link-dest` before the file already there, by size and mtime only — so a push links ONLY
+  where it compares by content (`sync::PodPush`): a pod's first push of a label adds what is
+  missing (`--checksum --ignore-existing`), later pushes while the day runs update against the
+  label's own copy (quick check, no link source), and a check (`--checksum` without `-t`, then a
+  quick pass for the mtimes) re-links a label pushed before its links and verifies every pod's
+  copy once its day is over — a label seals only after that. Covered by real-rsync tests in both
+  push orders and a first backlog (`cmp` of every archived file), the bug reproduced with the
+  old argv.
+- **One archive price**: `archive up/down/resize/status`, `teardown --check` and `balance` price
+  the archive by one rule (`archive::Prices::monthly_for`: servers with their IPv4 plus volume
+  GB), at the live `/pricing` else one list table (`Prices::LIST`) — a test holds the three to
+  the cent.
 
 ## Testing
 
