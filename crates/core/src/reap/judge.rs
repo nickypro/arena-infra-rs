@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::probe::{Files, GpuFacts, ProbeError, ProbeFacts, RepoSite, Since, Workspace};
+use super::probe::{Files, GpuFacts, HomeState, Mounts, ProbeError, ProbeFacts, RepoSite, Since, Workspace};
 use super::render::NotifyKind;
 use super::*;
 use crate::provider::Provider;
@@ -68,6 +68,10 @@ pub enum Row {
     Rehearsed,
     RelistFailed,
     GoneBeforeReap,
+    /// The verified backup couldn't be frozen into `reaped/` (RS1).
+    FreezeFailed,
+    /// `REAP_ENABLED` was switched off in the config file during the run (RS8).
+    DisabledMidRun,
     Reaped,
     TerminateRefusedLocked,
     TerminateFailed,
@@ -127,6 +131,8 @@ impl Row {
             Rehearsed => "R36",
             RelistFailed => "R37",
             GoneBeforeReap => "R37",
+            FreezeFailed => "R34b",
+            DisabledMidRun => "R37b",
             Reaped => "R38",
             TerminateRefusedLocked => "R39",
             TerminateFailed => "R40",
@@ -274,6 +280,8 @@ pub struct ClassifyCtx<'a> {
     /// Control clock when the probe answered.
     pub now: u64,
     pub clock_ok: bool,
+    /// The pod's process baseline so far (RS7; any container — only its own is used).
+    pub baseline: Option<&'a ProcBaseline>,
 }
 
 /// An observation with no facts (probe failed or garbled, identity or clock wrong).
@@ -315,10 +323,31 @@ fn usable(facts: &Result<ProbeFacts, ProbeError>, ctx: &ClassifyCtx) -> Result<(
 
 /// The point-in-time signals: everything but the cumulative counters (spec §6.2 `quiet_now`
 /// uses exactly these). `(activity, unknown)`.
-fn point_signals(f: &ProbeFacts, jobs: JobsOutcome, provider: &str) -> (Vec<Reason>, Vec<Reason>) {
+fn point_signals(f: &ProbeFacts, jobs: JobsOutcome, provider: &str, baseline: Option<&ProcBaseline>) -> (Vec<Reason>, Vec<Reason>) {
     let (mut act, mut unk) = (Vec::new(), Vec::new());
     if f.keep {
         act.push(Reason::Keep);
+    }
+    match f.home {
+        HomeState::Ok => {}
+        HomeState::Link => unk.push(Reason::HomeLink),
+        HomeState::Err => unk.push(Reason::HomeUnknown),
+    }
+    match f.uncovered {
+        Files::Hit => act.push(Reason::Uncovered),
+        Files::NoneChanged => {}
+        Files::Timeout => unk.push(Reason::FilesTimeout),
+        Files::Err => unk.push(Reason::FilesError),
+    }
+    match f.mounts {
+        Mounts::Clean => {}
+        Mounts::HasData => act.push(Reason::OtherMount),
+        Mounts::Err => unk.push(Reason::MountsUnknown),
+    }
+    match late_process(f, baseline) {
+        Some(true) => act.push(Reason::Process),
+        Some(false) => {}
+        None => unk.push(Reason::ProcessesUnknown),
     }
     match f.workspace {
         Workspace::HasData => act.push(Reason::Workspace),
@@ -424,6 +453,39 @@ fn point_signals(f: &ProbeFacts, jobs: JobsOutcome, provider: &str) -> (Vec<Reas
     (act, unk)
 }
 
+/// The jiffy (since boot) by which the container's own processes had started: PID 1's start +
+/// [`BOOT_GRACE`]. `None` when PID 1's start isn't known.
+fn boot_end(f: &ProbeFacts) -> Option<u64> {
+    let pid1: u64 = f.pid1_start.as_deref()?.parse().ok()?;
+    Some(pid1.saturating_add(BOOT_GRACE.saturating_mul(f.hz)))
+}
+
+/// Whether a process is running that isn't the container's own (RS7): not idle by itself ([`ProcFact::idle`]), not
+/// started within [`BOOT_GRACE`] of the container, not a restart of one that was (its command
+/// line's cksum in `baseline`, for this container). `None` = can't tell (no process list, or
+/// no container start).
+pub fn late_process(f: &ProbeFacts, baseline: Option<&ProcBaseline>) -> Option<bool> {
+    let procs = f.procs.as_ref()?;
+    let end = boot_end(f)?;
+    let container = f.container();
+    let known = baseline.filter(|b| Some(&b.container) == container.as_ref()).map(|b| &b.hashes);
+    Some(procs.iter().any(|p| !p.idle && p.start > end && !known.is_some_and(|h| h.contains(&p.hash))))
+}
+
+/// The pod's process baseline after a look (RS7): the boot-time processes this look saw, added
+/// to `prev`'s when it's of the same container (a new container starts afresh). `prev` as it
+/// was when the facts can't extend it.
+pub fn next_baseline(prev: Option<&ProcBaseline>, facts: &Result<ProbeFacts, ProbeError>) -> Option<ProcBaseline> {
+    let Ok(f) = facts else { return prev.cloned() };
+    let (Some(container), Some(procs), Some(end)) = (f.container(), f.procs.as_ref(), boot_end(f)) else { return prev.cloned() };
+    let mut b = match prev {
+        Some(p) if p.container == container => p.clone(),
+        _ => ProcBaseline { container, hashes: Default::default() },
+    };
+    b.hashes.extend(procs.iter().filter(|p| p.start <= end).map(|p| p.hash));
+    Some(b)
+}
+
 /// Classify one probe (spec §6.2) against the previous observation `prev` of the pod:
 /// `Unknown` if the probe failed or is garbled, is about another pod, its container or clock
 /// is off, or any applicable signal is unknown (including no baseline for the cumulative
@@ -451,7 +513,7 @@ pub fn classify(prev: Option<&Observation>, facts: &Result<ProbeFacts, ProbeErro
             }
         }
     }
-    let (mut act, mut unk) = point_signals(f, jobs, ctx.provider);
+    let (mut act, mut unk) = point_signals(f, jobs, ctx.provider, ctx.baseline);
     // Cumulative counters since the previous observation of the same container.
     match (prev, same) {
         (Some(p), None) if p.container.is_some() && p.container != container => unk.push(Reason::ContainerChanged),
@@ -629,7 +691,9 @@ pub fn observation_row(obs: &Observation, overdue: bool) -> Decision {
     let row = match obs.verdict {
         Verdict::Idle => return Decision::of(Row::Candidate),
         Verdict::Active if has(Reason::Keep) => Row::Keep,
-        Verdict::Active if has(Reason::Workspace) || has(Reason::RepoOutside) => Row::NotCovered,
+        Verdict::Active if has(Reason::Workspace) || has(Reason::RepoOutside) || has(Reason::Uncovered) || has(Reason::OtherMount) => {
+            Row::NotCovered
+        }
         Verdict::Active => Row::Active,
         Verdict::Unknown if has(Reason::ProbeFailed) => Row::ProbeFailed,
         Verdict::Unknown if has(Reason::Identity) => Row::Identity,
@@ -762,6 +826,19 @@ pub struct BackupEvidence {
     pub verify: StepEnd,
     pub snapshot_dir: String,
     pub big_dir: String,
+    /// The verified backup frozen into `reaped/` (RS1): `None` = not done (the backup failed
+    /// before it); `Some` with `matched` = the frozen copy holds exactly what was verified.
+    pub frozen: Option<Frozen>,
+}
+
+/// The reap's own, immutable copy of a verified backup: hard links of both tiers' dirs under
+/// `<root>/reaped/<name>/<UTC stamp>-<provider>-<id>/`, counted against the originals (RS1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Frozen {
+    pub snapshot_dir: String,
+    pub big_dir: String,
+    /// File/byte counts of both frozen trees equal the verified ones.
+    pub matched: bool,
 }
 
 /// A verified backup (spec I11): constructed only by [`BackupProof::check`].
@@ -786,7 +863,7 @@ pub struct BackupFailure {
 impl BackupProof {
     /// Rows R31–R34 over the evidence, in order: the lock, the destination, git (exit 0 and a
     /// sentinel), every rsync pass exit 0 (23, 24, 255, a timeout: no), the verify (exit 0,
-    /// stats, nothing pending).
+    /// stats, nothing pending), then the frozen copy (RS1). The proof names the FROZEN dirs.
     pub fn check(ev: &BackupEvidence) -> Result<BackupProof, BackupFailure> {
         let fail = |row| BackupFailure { row, pending: None };
         if !ev.lock_held {
@@ -803,13 +880,19 @@ impl BackupProof {
         if ev.finished < ev.started || ev.container.is_empty() {
             return Err(fail(Row::RsyncFailed));
         }
+        // RS1: only a frozen copy, counted equal to what was verified, is the reap's backup —
+        // the live per-name dirs are a later same-named pod's to pull into.
+        let frozen = ev.frozen.as_ref().filter(|f| f.matched).ok_or_else(|| fail(Row::FreezeFailed))?;
+        if frozen.snapshot_dir == ev.snapshot_dir || frozen.big_dir == ev.big_dir {
+            return Err(fail(Row::FreezeFailed));
+        }
         Ok(BackupProof {
             key: ev.key.clone(),
             container: ev.container.clone(),
             started: ev.started,
             finished: ev.finished,
-            snapshot_dir: ev.snapshot_dir.clone(),
-            big_dir: ev.big_dir.clone(),
+            snapshot_dir: frozen.snapshot_dir.clone(),
+            big_dir: frozen.big_dir.clone(),
             branch,
         })
     }
@@ -831,6 +914,9 @@ pub struct TriggerProof {
     /// Control clock of the deciding observation.
     decided_at: u64,
     container: String,
+    /// Pod clock the deciding observation's file scan started at: the post-backup look must
+    /// scan from there (RS4), so nothing between the two goes unwatched.
+    scan_from: u64,
 }
 
 impl TriggerProof {
@@ -857,6 +943,7 @@ impl TriggerProof {
             trigger,
             decided_at: obs.t,
             container: obs.container.clone().ok_or(Row::ReprobeNotIdle)?,
+            scan_from: obs.scan_from.ok_or(Row::ReprobeNotIdle)?,
         })
     }
 
@@ -878,6 +965,11 @@ impl TriggerProof {
     pub fn decided_at(&self) -> u64 {
         self.decided_at
     }
+
+    /// Where the post-backup look's scan must start (pod clock): the deciding look's start.
+    pub fn scan_from(&self) -> u64 {
+        self.scan_from
+    }
 }
 
 /// What the post-backup probe must find (spec §6.2 `quiet_now`).
@@ -888,6 +980,8 @@ pub struct QuietCtx<'a> {
     pub container: &'a str,
     /// Control clock when the probe answered.
     pub now: u64,
+    /// The pod's process baseline (RS7).
+    pub baseline: Option<&'a ProcBaseline>,
 }
 
 /// The pod quiet right after the backup — constructed only by [`quiet_now`].
@@ -895,6 +989,8 @@ pub struct QuietCtx<'a> {
 pub struct QuietProof {
     container: String,
     at: u64,
+    /// Pod clock the look's file scan started at.
+    scan_from: u64,
 }
 
 /// The post-backup check (R35): the same pod (id) and container as before the backup, its
@@ -903,20 +999,20 @@ pub struct QuietProof {
 /// backup's scope — plus no file changed since the backup started (the scan's `since`). The
 /// cumulative counters are NOT used: they include the backup's own traffic. `Err` lists why.
 pub fn quiet_now(facts: &Result<ProbeFacts, ProbeError>, jobs: JobsOutcome, ctx: &QuietCtx) -> Result<QuietProof, Vec<Reason>> {
-    let cctx = ClassifyCtx { provider: ctx.provider, listed_id: ctx.id, now: ctx.now, clock_ok: true };
+    let cctx = ClassifyCtx { provider: ctx.provider, listed_id: ctx.id, now: ctx.now, clock_ok: true, baseline: ctx.baseline };
     usable(facts, &cctx).map_err(|r| vec![r])?;
     let Ok(f) = facts else { return Err(vec![Reason::ProbeFailed]) };
     if f.container().as_deref() != Some(ctx.container) {
         return Err(vec![Reason::ContainerChanged]);
     }
-    let (mut act, unk) = point_signals(f, jobs, ctx.provider);
+    let (mut act, unk) = point_signals(f, jobs, ctx.provider, ctx.baseline);
     act.extend(unk);
     if !act.is_empty() {
         act.sort();
         act.dedup();
         return Err(act);
     }
-    Ok(QuietProof { container: ctx.container.to_string(), at: ctx.now })
+    Ok(QuietProof { container: ctx.container.to_string(), at: ctx.now, scan_from: f.scan_from })
 }
 
 /// The re-listing just before the terminate — constructed only by [`relist_verdict`].
@@ -928,8 +1024,11 @@ pub struct RelistProof {
 
 /// R37 over the re-listing of the pod's provider (`listed_at`, `now`: control clock): fresh
 /// (≤ [`RELIST_MAX_AGE`]), the pod there with the same id and name, `RUNNING`, its lock state
-/// reported and off. Gone ⇒ [`Row::GoneBeforeReap`]; anything else ⇒ [`Row::RelistFailed`].
-pub fn relist_verdict(listed: Listed, expect_key: &str, expect_name: &str, listed_at: u64, now: u64) -> Result<RelistProof, Row> {
+/// reported and off — and (RS5) R4/R5 again over `all_ok` (every provider that re-listed fine):
+/// still a reapable name, held by exactly one pod, no `<name>-old`/`-new` twin (a replace or
+/// migrate started during the backup). Gone ⇒ [`Row::GoneBeforeReap`]; a twin or a shared name
+/// ⇒ [`Row::DuplicateOrTwin`]; anything else ⇒ [`Row::RelistFailed`].
+pub fn relist_verdict(listed: Listed, all_ok: &[Pod], expect_key: &str, expect_name: &str, listed_at: u64, now: u64) -> Result<RelistProof, Row> {
     if listed_at > now || now - listed_at > RELIST_MAX_AGE {
         return Err(Row::RelistFailed);
     }
@@ -941,6 +1040,10 @@ pub fn relist_verdict(listed: Listed, expect_key: &str, expect_name: &str, liste
     if key(&pod.provider, &pod.id) != expect_key || pod.name != expect_name || !pod.status.eq_ignore_ascii_case("RUNNING") || lock_state(pod) != Some(false)
     {
         return Err(Row::RelistFailed);
+    }
+    let twins = [format!("{expect_name}-old"), format!("{expect_name}-new")];
+    if all_ok.iter().filter(|p| p.name == expect_name).count() != 1 || all_ok.iter().any(|p| twins.contains(&p.name)) {
+        return Err(Row::DuplicateOrTwin);
     }
     Ok(RelistProof { key: expect_key.to_string(), at: listed_at })
 }
@@ -1015,6 +1118,19 @@ impl RunGate {
         }
         Ok(RunGate(()))
     }
+
+    /// The gate again right before the terminate (RS8), from the config FILE and the state as
+    /// they are now: `REAP_ENABLED` switched off since the run began → [`Row::DisabledMidRun`],
+    /// a hold set since → [`Row::Held`]. The caps were spent by the write-ahead already.
+    pub fn still(self, enabled_now: bool, held_now: bool) -> Result<RunGate, Row> {
+        if !enabled_now {
+            return Err(Row::DisabledMidRun);
+        }
+        if held_now {
+            return Err(Row::Held);
+        }
+        Ok(self)
+    }
 }
 
 /// The durable write-ahead record of this attempt (`terminating` + the attempt counted, saved
@@ -1068,6 +1184,11 @@ impl ReapTicket {
         let order = [trigger.decided_at, wal.at, backup.started, backup.finished, quiet.at, relist.at];
         if order.windows(2).any(|w| w[0] > w[1]) {
             return Err(Row::RelistFailed);
+        }
+        // RS4: the post-backup look scanned from (at most) where the deciding look's scan
+        // started — no stretch between the two went unwatched.
+        if quiet.scan_from > trigger.scan_from {
+            return Err(Row::PostBackupNotQuiet);
         }
         Ok(ReapTicket::new(trigger))
     }

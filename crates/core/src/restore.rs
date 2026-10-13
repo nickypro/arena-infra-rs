@@ -40,6 +40,11 @@ use crate::ssh::SshTarget;
 /// `--from big`: pull's all-files tier (`<dir>/big/<pod>/`).
 pub const BIG: &str = "big";
 
+/// Where the auto-reaper freezes a reaped pod's verified backup (`<root>/reaped/<name>/<UTC
+/// stamp>-<provider>-<id>/`, on each tier's root): never a snapshot label, never written into
+/// or deleted by arena; restored from by hand (rsync from that path).
+pub const REAPED: &str = "reaped";
+
 /// The default wall-clock budget for one restore (`--timeout` overrides): a full home over a
 /// slow uplink takes tens of minutes; a silent transfer is already stopped by the I/O timeout.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2 * 3600);
@@ -90,7 +95,7 @@ pub fn all_labels(base: &Path, pod: &str) -> Vec<String> {
         .flatten()
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|l| parse_label(l).is_none() && l != BIG && non_empty_dir(&base.join(l).join(pod)))
+        .filter(|l| parse_label(l).is_none() && l != BIG && l != REAPED && non_empty_dir(&base.join(l).join(pod)))
         .collect();
     others.sort();
     let mut v = snapshot_labels(base, pod);
@@ -138,6 +143,13 @@ pub fn resolve_source(base: &Path, pod: &str, from: Option<&str>) -> Result<(Str
     let label = match from {
         Some(l) if l.is_empty() || l.contains('/') || l == "." || l == ".." => {
             return Err(format!("--from `{l}` isn't a backup label (e.g. w1d3) or `big`"))
+        }
+        Some(REAPED) => {
+            return Err(format!(
+                "a reaped pod's frozen backup is under {}/{REAPED}/{pod}/<stamp>-<provider>-<id>/ — restore from it by hand \
+                 (see `arena pods reap status`)",
+                base.display()
+            ))
         }
         Some(l) => l.to_string(),
         None => match labels.first() {

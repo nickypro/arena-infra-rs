@@ -107,7 +107,7 @@ fn prev_for(r: &Reply) -> Observation {
 
 fn verdict_of(text: &str, r: &Reply, since: Since) -> Verdict {
     let facts = parse_probe(text, &r.nonce, since);
-    let ctx = ClassifyCtx { provider: "runpod", listed_id: "pod1", now: r.now() + CTL_NOW_SKEW, clock_ok: true };
+    let ctx = ClassifyCtx { provider: "runpod", listed_id: "pod1", now: r.now() + CTL_NOW_SKEW, clock_ok: true, baseline: None };
     classify(Some(&prev_for(r)), &facts, JobsOutcome::Read { busy: 0 }, &ctx).verdict
 }
 
@@ -355,4 +355,144 @@ fn the_script_runs_under_sh() {
     let out = std::process::Command::new("sh").args(["-c", PROBE_SCRIPT, "arena-idle-probe", "bad nonce", "-900", "", "x", ""]).output().unwrap();
     assert!(out.stdout.is_empty());
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// REVIEW RS6 (fails today): the file scan is `find "$HOME" …` with find's default `-P`, so a
+/// HOME that is a symlink (e.g. `/root -> /data/root`) is examined as the link itself and never
+/// descended into — the scan reports `files none` (quiet) instead of a hit or "can't tell".
+/// `/workspace` has the same shape (`find /workspace -xdev …` on a symlinked `/workspace` reports
+/// `clean`). Unknown must never read as quiet.
+#[cfg(target_os = "linux")]
+#[test]
+fn review_rs6_a_symlinked_home_is_scanned_not_skipped() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = std::env::temp_dir().join(format!("arena-reap-probe-rv6-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let (bin, real, link) = (root.join("bin"), root.join("home_real"), root.join("home"));
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&real).unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let stub = |name: &str, body: &str| {
+        let p = bin.join(name);
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    stub("nvidia-smi", "case \"$1\" in --query-gpu*) echo '0, 3';; *) ;; esac");
+    // The link (and the dir) are older than the scan's start; the participant's file is newer.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    std::fs::write(real.join("notebook.ipynb"), "{}").unwrap();
+    let out = std::process::Command::new("env")
+        .arg("-i")
+        .arg(format!("PATH={}:/usr/sbin:/usr/bin:/sbin:/bin", bin.display()))
+        .arg(format!("HOME={}", link.display()))
+        .arg("ARENA_PROBE_TEST_WINDOW=1")
+        .arg("ARENA_PROBE_TEST_GPU_TIMEOUT=1")
+        .args(["sh", "-c", PROBE_SCRIPT, "arena-idle-probe", "T3ST", &format!("@{since}"), "", "runpod", "203.0.113.9 50000 10.0.0.2 22"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let f = parse_probe(&stdout, "T3ST", Since::At(since)).unwrap_or_else(|e| panic!("{e:?}\n{stdout}"));
+    let _ = std::fs::remove_dir_all(&root);
+    assert_ne!(f.files, Files::NoneChanged, "a file written under a symlinked HOME after the scan's start reads as `none` (quiet)");
+}
+
+/// RS2/RS6/RS7 facts: the home as resolved, the sweep-folder scan, other mounts, and the
+/// process lines (`start cksum i|p name`) — each value strict.
+#[test]
+fn home_mounts_and_processes_parse() {
+    let p = |r: &Reply| parse_probe(&r.render(), "N0NCE", r.since);
+    let f = p(&Reply::default()).unwrap();
+    assert_eq!((f.home, f.uncovered, f.mounts, f.hz), (HomeState::Ok, Files::NoneChanged, Mounts::Clean, 100));
+    assert_eq!(
+        f.procs.as_deref(),
+        Some(&[ProcFact { start: 123_456, hash: 11, idle: false }, ProcFact { start: 123_500, hash: 22, idle: true }, ProcFact { start: 123_900, hash: 33, idle: false }][..])
+    );
+    for (home, want) in [("link", HomeState::Link), ("err", HomeState::Err)] {
+        assert_eq!(p(&Reply { home, ..Default::default() }).unwrap().home, want);
+    }
+    for (u, want) in [("hit", Files::Hit), ("timeout", Files::Timeout), ("err", Files::Err)] {
+        assert_eq!(p(&Reply { uncovered: u, ..Default::default() }).unwrap().uncovered, want);
+    }
+    for (m, want) in [("has_data", Mounts::HasData), ("err", Mounts::Err)] {
+        assert_eq!(p(&Reply { mounts: m, ..Default::default() }).unwrap().mounts, want);
+    }
+    // A shell (`i`) and a name with a space (tmux's server) parse; idle by kind or by name.
+    let procs = vec![(130_000, 5, true, "bash".to_string()), (130_001, 6, false, "tmux: server".to_string()), (130_002, 7, false, "python3".to_string())];
+    let f = p(&Reply { procs: Some(procs), ..Default::default() }).unwrap();
+    assert_eq!(f.procs.unwrap().iter().map(|x| x.idle).collect::<Vec<_>>(), [true, true, false]);
+    assert_eq!(p(&Reply { procs: None, ..Default::default() }).unwrap().procs, None);
+    assert_eq!(p(&Reply { proc_overflow: true, ..Default::default() }).unwrap().procs, None);
+    // Anything else is garbled, never "no processes".
+    for bad in ["home=maybe", "uncovered=", "mounts=some", "hz=0", "proc_read=maybe"] {
+        let (k, _) = bad.split_once('=').unwrap();
+        let lines: Vec<String> =
+            Reply::default().fact_lines().into_iter().map(|l| if l.starts_with(&format!("ARENA_PROBE {k}=")) { format!("ARENA_PROBE {bad}") } else { l }).collect();
+        assert!(lines.contains(&format!("ARENA_PROBE {bad}")), "{bad}");
+        assert_eq!(parse_probe(&Reply::frame("N0NCE", &lines), "N0NCE", Since::Back(900)), Err(ProbeError::Garbled), "{bad}");
+    }
+    for bad in ["123 11 x start.sh", "123 11 p", "x 11 p a", "123 99999999999 p a", "123 11 p 0123456789012345678901234"] {
+        let lines: Vec<String> =
+            Reply::default().fact_lines().into_iter().map(|l| if l.starts_with("ARENA_PROBE proc=1 ") { format!("ARENA_PROBE proc=1 {bad}") } else { l }).collect();
+        assert!(lines.contains(&format!("ARENA_PROBE proc=1 {bad}")), "{bad}");
+        assert_eq!(parse_probe(&Reply::frame("N0NCE", &lines), "N0NCE", Since::Back(900)), Err(ProbeError::Garbled), "{bad}");
+    }
+}
+
+/// The real script (RS2, RS6, RS7): a file in a sweep folder since the container started is
+/// `uncovered`; a dot-dir notebook is a plain change; a process in another session is listed
+/// with its command line's cksum — a dormant `sleep` as `p`, a login shell (`-bash`) as `i` —
+/// and the probe's own session is not; a home linked within one filesystem is resolved (`ok`).
+#[cfg(target_os = "linux")]
+#[test]
+fn the_script_lists_processes_and_sweep_folders() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Stdio};
+    let root = std::env::temp_dir().join(format!("arena-reap-probe-rs7-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let (bin, real, link) = (root.join("bin"), root.join("home_real"), root.join("home"));
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(real.join("ARENA_materials/TEMP_FOLDER_FOR_SWEEPS/run1")).unwrap();
+    std::fs::create_dir_all(real.join(".ipython/profile_default")).unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let p = bin.join("nvidia-smi");
+    std::fs::write(&p, "#!/bin/sh\ncase \"$1\" in --query-gpu*) echo '0, 3';; *) ;; esac\n").unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(real.join("ARENA_materials/TEMP_FOLDER_FOR_SWEEPS/run1/ckpt.pt"), "w").unwrap();
+    std::fs::write(real.join(".ipython/profile_default/notes.ipynb"), "{}").unwrap();
+    // Two processes in sessions of their own: a dormant job, and a login shell waiting on input.
+    let mut sleeper = Command::new("setsid").args(["sleep", "37"]).stdin(Stdio::null()).spawn().unwrap();
+    let mut shell = Command::new("setsid").args(["bash", "-c", "exec -a -bash cat"]).stdin(Stdio::piped()).spawn().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let out = Command::new("env")
+        .arg("-i")
+        .arg(format!("PATH={}:/usr/sbin:/usr/bin:/sbin:/bin", bin.display()))
+        .arg(format!("HOME={}", link.display()))
+        .arg("ARENA_PROBE_TEST_WINDOW=1")
+        .arg("ARENA_PROBE_TEST_GPU_TIMEOUT=1")
+        .args(["sh", "-c", PROBE_SCRIPT, "arena-idle-probe", "T3ST", "-900", "", "runpod", "203.0.113.9 50000 10.0.0.2 22"])
+        .output()
+        .unwrap();
+    let _ = sleeper.kill();
+    let _ = shell.kill();
+    let _ = sleeper.wait();
+    let _ = shell.wait();
+    let _ = std::fs::remove_dir_all(&root);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let f = parse_probe(&stdout, "T3ST", Since::Back(900)).unwrap_or_else(|e| panic!("{e:?}\n{stdout}"));
+    assert_eq!(f.home, HomeState::Ok, "a link within one filesystem is resolved:\n{stdout}");
+    assert_eq!((f.files, f.uncovered), (Files::Hit, Files::Hit), "{stdout}");
+    if stdout.contains("proc_overflow=1") {
+        eprintln!("more than 300 processes on this machine: the process half is skipped");
+        return;
+    }
+    let procs = f.procs.unwrap_or_else(|| panic!("no process list:\n{stdout}"));
+    let find = |cmdline: &str| procs.iter().find(|p| p.hash == cksum(cmdline.as_bytes())).copied();
+    assert_eq!(find("sleep 37 ").map(|p| p.idle), Some(false), "the dormant job, a process of its own:\n{stdout}");
+    assert_eq!(find("-bash ").map(|p| p.idle), Some(true), "a login shell, idle by itself:\n{stdout}");
+    // This test's own process (the probe's session) isn't listed.
+    let me = std::fs::read("/proc/self/cmdline").unwrap();
+    let me: String = String::from_utf8_lossy(&me).replace('\0', " ");
+    assert!(find(&me).is_none(), "the probe's own session is listed:\n{stdout}");
 }

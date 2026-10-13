@@ -127,6 +127,48 @@ pub enum Files {
     Err,
 }
 
+/// The home as the probe resolved it (RS6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HomeState {
+    /// A real directory, or a link to one on the same filesystem (scanned through it).
+    Ok,
+    /// A symlink to another filesystem (scanned through its target): can't tell.
+    Link,
+    /// Couldn't be resolved.
+    Err,
+}
+
+/// Writable mounts outside the home, `/workspace` and the system (RS2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mounts {
+    /// None, or nothing written on any since the container started.
+    Clean,
+    /// Data written on one since the container started — outside the backup.
+    HasData,
+    Err,
+}
+
+/// One process outside the probe's own session and ancestry (RS7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcFact {
+    /// Start, jiffies since boot (as PID 1's).
+    pub start: u64,
+    /// cksum of its command line — how a boot-time service is recognised once restarted.
+    pub hash: u32,
+    /// Never "in use" by itself: a known idle daemon by name ([`IDLE_DAEMONS`]), or a plain
+    /// interactive shell (the probe's `i`: no script, no `-c`).
+    pub idle: bool,
+}
+
+/// Processes that never mean "in use" by themselves, by name: sshd's own (sessions are the
+/// session signal's business; an internet scanner's pre-auth child is one), the per-user
+/// systemd manager and its `(sd-pam)` that logind starts for ANY SSH login — our probe's
+/// included — cron's own job wrapper, and tmux's server (its panes are the tmux signal's
+/// business: a non-shell foreground counts there). What any of them RUNS is a process of its
+/// own and counts. Everything else started after boot counts — mosh-server, a screen, a
+/// kernel, an editor, `nohup python train.py` asleep.
+pub const IDLE_DAEMONS: &[&str] = &["sshd", "sshd-session", "sshd-auth", "systemd", "(sd-pam)", "cron", "CRON", "tmux: server"];
+
 /// The sockets, judged (spec §6.1 `tcp`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Sockets {
@@ -173,6 +215,19 @@ pub struct ProbeFacts {
     pub repo: RepoSite,
     /// Mounts strictly under the home; `None` = unknown.
     pub home_mounts: Option<u32>,
+    /// The home resolved, a link, or unresolvable (RS6).
+    pub home: HomeState,
+    /// A sweep folder's (`TEMP_FOLDER_FOR_SWEEPS/`) files changed since the container started —
+    /// never copied by a reap's backup (RS2). Same scan (and so the same timeout/error) as
+    /// `files`.
+    pub uncovered: Files,
+    /// Other writable mounts (RS2).
+    pub mounts: Mounts,
+    /// Clock ticks per second (`getconf CLK_TCK`): process start times are in these.
+    pub hz: u64,
+    /// Every process outside the probe's session and ancestry; `None` = the list couldn't be
+    /// read in full (RS7).
+    pub procs: Option<Vec<ProcFact>>,
 }
 
 impl ProbeFacts {
@@ -228,10 +283,17 @@ const SCALARS: &[(&str, bool)] = &[
     ("boot_id", true),
     ("pid1_start", true),
     ("now", true),
+    ("home", true),
+    ("hz", true),
+    ("uncovered", true),
+    ("mounts", true),
+    ("proc_read", true),
+    ("proc_overflow", false),
+    ("proc_n", true),
 ];
 
 /// Repeated keys (`<key>=<index> <value>`), each with a `<key>_n` count.
-const REPEATED: &[&str] = &["gpu_rc", "gpu", "tcp", "anc", "sshd", "pane"];
+const REPEATED: &[&str] = &["gpu_rc", "gpu", "tcp", "anc", "sshd", "pane", "proc"];
 
 /// POSIX `cksum` (CRC-32, polynomial 0x04C11DB7, the length appended) — what the probe closes
 /// its reply with.
@@ -373,11 +435,52 @@ pub fn parse_probe(stdout: &str, nonce: &str, since: Since) -> Result<ProbeFacts
         }
         _ => return Err(Garbled),
     };
-    let files = match s("files") {
-        "hit" => Files::Hit,
-        "none" => Files::NoneChanged,
-        "timeout" => Files::Timeout,
-        "err" => Files::Err,
+    let scan = |v: &str| -> Result<Files, ProbeError> {
+        Ok(match v {
+            "hit" => Files::Hit,
+            "none" => Files::NoneChanged,
+            "timeout" => Files::Timeout,
+            "err" => Files::Err,
+            _ => return Err(Garbled),
+        })
+    };
+    let files = scan(s("files"))?;
+    let uncovered = scan(s("uncovered"))?;
+    let home = match s("home") {
+        "ok" => HomeState::Ok,
+        "link" => HomeState::Link,
+        "err" => HomeState::Err,
+        _ => return Err(Garbled),
+    };
+    let mounts = match s("mounts") {
+        "clean" => Mounts::Clean,
+        "has_data" => Mounts::HasData,
+        "err" => Mounts::Err,
+        _ => return Err(Garbled),
+    };
+    let hz = digits(s("hz")).filter(|h| *h > 0).ok_or(Garbled)?;
+    let procs = match (s("proc_read"), scalars.get("proc_overflow").copied()) {
+        ("ok", None) => {
+            let mut v = Vec::new();
+            for line in rep("proc") {
+                let f: Vec<&str> = line.splitn(4, ' ').collect();
+                let [start, hash, kind, comm] = f.as_slice() else { return Err(Garbled) };
+                let start = digits(start).ok_or(Garbled)?;
+                let hash = digits(hash).and_then(|h| u32::try_from(h).ok()).ok_or(Garbled)?;
+                if comm.is_empty() || comm.len() > 24 {
+                    return Err(Garbled);
+                }
+                let shell = match *kind {
+                    "i" => true,
+                    "p" => false,
+                    _ => return Err(Garbled),
+                };
+                v.push(ProcFact { start, hash, idle: shell || IDLE_DAEMONS.contains(comm) });
+            }
+            Some(v)
+        }
+        ("ok", Some("1")) => None,
+        ("err", None) if rep("proc").is_empty() => None,
         _ => return Err(Garbled),
     };
     // Our own connection (`$SSH_CONNECTION`): always there over SSH, so required.
@@ -505,6 +608,11 @@ pub fn parse_probe(stdout: &str, nonce: &str, since: Since) -> Result<ProbeFacts
         workspace,
         repo,
         home_mounts,
+        home,
+        uncovered,
+        mounts,
+        hz,
+        procs,
     })
 }
 
@@ -689,6 +797,13 @@ pub mod fixture {
         pub workspace: &'static str,
         pub repo: &'static str,
         pub home_mounts: String,
+        pub home: &'static str,
+        pub uncovered: &'static str,
+        pub mounts: &'static str,
+        pub hz: u64,
+        /// `(start jiffies, cmdline cksum, interactive shell, name)`; `None` = `proc_read=err`.
+        pub procs: Option<Vec<(u64, u32, bool, String)>>,
+        pub proc_overflow: bool,
     }
 
     /// `/proc/net/tcp` hex for an IPv4 `a.b.c.d:port`.
@@ -736,6 +851,17 @@ pub mod fixture {
                 workspace: "absent",
                 repo: "under_home",
                 home_mounts: "0".into(),
+                home: "ok",
+                uncovered: "none",
+                mounts: "clean",
+                hz: 100,
+                // PID 1 and the image's services, all started at boot (pid1_start 123456).
+                procs: Some(vec![
+                    (123_456, 11, false, "start.sh".to_string()),
+                    (123_500, 22, false, "sshd".to_string()),
+                    (123_900, 33, false, "jupyter-lab".to_string()),
+                ]),
+                proc_overflow: false,
             }
         }
     }
@@ -819,6 +945,26 @@ pub mod fixture {
             o("workspace", self.workspace.into());
             o("repo", self.repo.into());
             o("home_mounts", self.home_mounts.clone());
+            o("home", self.home.into());
+            o("hz", self.hz.to_string());
+            o("uncovered", self.uncovered.into());
+            o("mounts", self.mounts.into());
+            match &self.procs {
+                None => {
+                    o("proc_read", "err".into());
+                    o("proc_n", "0".into());
+                }
+                Some(procs) => {
+                    o("proc_read", "ok".into());
+                    for (i, (start, hash, shell, comm)) in procs.iter().enumerate() {
+                        o("proc", format!("{} {start} {hash} {} {comm}", i + 1, if *shell { "i" } else { "p" }));
+                    }
+                    if self.proc_overflow {
+                        o("proc_overflow", "1".into());
+                    }
+                    o("proc_n", procs.len().to_string());
+                }
+            }
             o("id", self.id.clone());
             o("boot_id", self.boot_id.clone());
             o("pid1_start", self.pid1_start.clone());

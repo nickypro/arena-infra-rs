@@ -114,15 +114,47 @@ fi
 o gpu_rc_n "$(n_of gpu_rc)"
 o gpu_n "$(n_of gpu)"
 
-# --- Files changed (ctime) since $S, outside .git and ~/.arena; one filesystem -----------------
+# --- The home, resolved, and the container's start -------------------------------------------
+# HOME as the backup reads it: through any symlink (`pwd -P`) — a scan of the link itself sees
+# nothing and would read as quiet. A home that is a link to ANOTHER filesystem
+# (`/root -> /data/root`) is reported (`home=link`: can't tell); unresolvable, `home=err`.
 H=${HOME:-/root}
-f=$(timeout 60 find "$H" -xdev \( -name .git -o -path "$H/.arena" \) -prune -o -newerct "@$S" -print -quit 2>/dev/null)
-rc=$?
-if [ -n "$f" ]; then o files hit
-elif [ "$rc" = 124 ]; then o files timeout
-elif [ "$rc" = 0 ]; then o files none
-else o files err
+while [ "$H" != / ] && [ "${H%/}" != "$H" ]; do H=${H%/}; done
+Hr=$(cd "$H" 2>/dev/null && pwd -P)
+if [ -z "$Hr" ]; then o home err; Hr=$H
+elif [ "$Hr" != "$H" ]; then
+    hp=${H%/*}
+    [ -n "$hp" ] || hp=/
+    d1=$(stat -c %d "$Hr" 2>/dev/null)
+    d2=$(stat -c %d "$hp" 2>/dev/null)
+    if num "$d1" && [ "$d1" = "$d2" ]; then o home ok; else o home link; fi
+else o home ok
 fi
+hz=$(getconf CLK_TCK 2>/dev/null)
+num "$hz" || hz=100
+o hz "$hz"
+st=$(awk '{ s = $0; sub(/^.*\) /, "", s); split(s, f, " "); print f[20] }' /proc/1/stat 2>/dev/null)
+bt=$(awk '$1 == "btime" { print $2 }' /proc/stat 2>/dev/null)
+# The container's start (epoch); unknown = 0, so "changed since it started" means "ever".
+cs=0
+if num "$st" && num "$bt"; then cs=$((bt + st / hz)); fi
+
+# --- Files changed (ctime) since $S; and, never copied by a reap's backup, a sweep folder's
+# files changed since the container started — one pass over the resolved home, one filesystem,
+# outside .git and ~/.arena.
+marks=$( { timeout 60 find "$Hr" -xdev \( -name .git -o -path "$Hr/.arena" \) -prune -o \
+    \( \( -path '*/TEMP_FOLDER_FOR_SWEEPS/*' -newerct "@$cs" -printf 'U\n' \) , \( -newerct "@$S" -printf 'F\n' \) \) 2>/dev/null
+    echo "RC $?"; } | awk '$1 == "RC" { print; next } !seen[$1]++ { print }')
+rc=$(printf '%s\n' "$marks" | awk '$1 == "RC" { print $2 }')
+judge_scan() {
+    if printf '%s\n' "$marks" | grep -qx "$2"; then o "$1" hit
+    elif [ "$rc" = 124 ]; then o "$1" timeout
+    elif [ "$rc" = 0 ]; then o "$1" none
+    else o "$1" err
+    fi
+}
+judge_scan files F
+judge_scan uncovered U
 o scan_from "$S"
 
 # --- Sockets: ESTABLISHED (01) and LISTEN (0A), capped ----------------------------------------
@@ -153,6 +185,7 @@ while num "$p" && [ "$p" -gt 1 ] && [ "$i" -lt 64 ]; do
     i=$((i + 1))
 done
 o anc_n "$(n_of anc)"
+ANCS=" $(printf '%s' "$OUT" | awk -F'[= ]' '$2 == "anc" { printf "%s ", $4 }')"
 for d in /proc/[0-9]*; do
     c=
     { IFS= read -r c; } 2>/dev/null <"$d/comm" || continue
@@ -162,6 +195,54 @@ for d in /proc/[0-9]*; do
     o_n sshd "${d#/proc/} ${cmd:-sshd-exited}"
 done
 o sshd_n "$(n_of sshd)"
+
+# --- Processes outside this probe's own session and ancestry: start time (jiffies since boot),
+# a cksum of the command line, i(nteractive shell) or p, the name. Judged against the
+# container's boot-time processes (arena_core::reap::judge) — a dormant `nohup python train.py`
+# is a process too. A plain interactive shell (no script, no -c) does nothing by itself: what
+# it runs is a process of its own.
+ish() {
+    set -f
+    # shellcheck disable=SC2086
+    set -- $1
+    set +f
+    a=${1##*/}
+    a=${a#-}
+    case "$a" in bash | sh | zsh | dash | fish | ksh | ash) ;; *) return 1 ;; esac
+    shift
+    for x in "$@"; do
+        case "$x" in -l | -i | --login | -il | -li) ;; *) return 1 ;; esac
+    done
+    return 0
+}
+sid=$(awk '{ s = $0; sub(/^.*\) /, "", s); split(s, f, " "); print f[4] }' /proc/$$/stat 2>/dev/null)
+if num "$sid"; then
+    o proc_read ok
+    for d in /proc/[0-9]*; do
+        p=${d#/proc/}
+        line=
+        { IFS= read -r line; } 2>/dev/null <"$d/stat" || continue
+        rest=${line##*) }
+        # shellcheck disable=SC2086
+        set -- $rest
+        [ "$4" = "$sid" ] && continue
+        case "$ANCS" in *" $p "*) continue ;; esac
+        pst=${20}
+        num "$pst" || continue
+        cmd=$({ tr '\000' ' ' <"$d/cmdline"; } 2>/dev/null)
+        [ -n "$cmd" ] || continue
+        if [ "$(n_of proc)" -ge 300 ]; then o proc_overflow 1; break; fi
+        crc=$(printf '%s' "$cmd" | cksum | awk '{ print $1 }')
+        k=p
+        ish "$cmd" && k=i
+        c=
+        { IFS= read -r c; } 2>/dev/null <"$d/comm"
+        o_n proc "$pst $crc $k $(printf %s "${c:-?}" | tr -c '[:alnum:]._+(): -' '?' | cut -c1-24)"
+    done
+else
+    o proc_read err
+fi
+o proc_n "$(n_of proc)"
 o self "$(printf %s "$SELF" | tr -c '0-9a-fA-F.: ' '?' | cut -c1-120)"
 
 # --- Logins, tmux, screen ---------------------------------------------------------------------
@@ -207,26 +288,54 @@ else
 fi
 
 # --- Markers, scope, identity -----------------------------------------------------------------
-if [ -e "$H/.arena/keep" ]; then o keep 1; else o keep 0; fi
-hz=$(getconf CLK_TCK 2>/dev/null)
-num "$hz" || hz=100
-st=$(awk '{ s = $0; sub(/^.*\) /, "", s); split(s, f, " "); print f[20] }' /proc/1/stat 2>/dev/null)
-bt=$(awk '$1 == "btime" { print $2 }' /proc/stat 2>/dev/null)
-if [ ! -e /workspace ]; then
+if [ -e "$Hr/.arena/keep" ]; then o keep 1; else o keep 0; fi
+# /workspace (RunPod's volume) — resolved through a link; inside the home it's the home's.
+Wr=
+if [ -e /workspace ]; then Wr=$(cd /workspace 2>/dev/null && pwd -P); fi
+if [ ! -e /workspace ] && [ ! -L /workspace ]; then
     o workspace absent
-elif awk '$2 == "/workspace" { f = 1 } END { exit !f }' /proc/self/mounts 2>/dev/null; then
-    e=$(timeout 20 find /workspace -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)
-    rc=$?
-    if [ -n "$e" ]; then o workspace has_data; elif [ "$rc" = 0 ]; then o workspace clean; else o workspace err; fi
-elif num "$st" && num "$bt"; then
-    cs=$((bt + st / hz))
-    e=$(timeout 20 find /workspace -xdev -mindepth 1 -newerct "@$cs" -print -quit 2>/dev/null)
+elif [ -z "$Wr" ]; then
+    o workspace err
+elif [ "$Wr" = "$Hr" ] || [ "${Wr#"$Hr"/}" != "$Wr" ]; then
+    o workspace absent
+elif awk -v w="$Wr" '$2 == w { f = 1 } END { exit !f }' /proc/self/mounts 2>/dev/null; then
+    e=$(timeout 20 find "$Wr" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)
     rc=$?
     if [ -n "$e" ]; then o workspace has_data; elif [ "$rc" = 0 ]; then o workspace clean; else o workspace err; fi
 else
-    o workspace err
+    e=$(timeout 20 find "$Wr" -xdev -mindepth 1 -newerct "@$cs" -print -quit 2>/dev/null)
+    rc=$?
+    if [ -n "$e" ]; then o workspace has_data; elif [ "$rc" = 0 ]; then o workspace clean; else o workspace err; fi
 fi
-h=$(cd "$H" 2>/dev/null && pwd -P)
+# Any other writable mount outside the home and the system (a Hetzner volume, a network
+# share): data written there since the container started is outside the backup.
+cands=$(awk -v h="$Hr" -v w="$Wr" '
+    BEGIN { n = split("proc sysfs devpts devtmpfs tmpfs cgroup cgroup2 mqueue securityfs debugfs tracefs pstore bpf fusectl configfs hugetlbfs autofs binfmt_misc nsfs ramfs rpc_pipefs efivarfs selinuxfs squashfs overlay nfsd", a, " "); for (i = 1; i <= n; i++) sys[a[i]] = 1 }
+    { mp = $2; opt = "," $4 "," }
+    sys[$3] { next }
+    opt !~ /,rw,/ { next }
+    mp == "/" || mp == "/workspace" || mp == w { next }
+    mp ~ "^/(proc|sys|dev|run|etc|boot|usr|lib|lib32|lib64|libx32|bin|sbin|snap|var/lib/docker|var/snap)(/|$)" { next }
+    h != "" && (mp == h || index(mp, h "/") == 1) { next }
+    { print mp }' /proc/self/mounts 2>/dev/null) || cands=ERR
+mounts=clean
+if [ "$cands" = ERR ]; then
+    mounts=err
+else
+    while IFS= read -r mp; do
+        [ -n "$mp" ] || continue
+        case "$mp" in *\\*) mounts=err; continue ;; esac
+        [ -d "$mp" ] || continue
+        e=$(timeout 10 find "$mp" -xdev -mindepth 1 -newerct "@$cs" -print -quit 2>/dev/null)
+        rc=$?
+        if [ -n "$e" ]; then mounts=has_data; break; fi
+        [ "$rc" = 0 ] || mounts=err
+    done <<EOF_MOUNTS
+$cands
+EOF_MOUNTS
+fi
+o mounts "$mounts"
+h=$Hr
 if [ -z "$REPO" ] || [ ! -e "$REPO" ]; then
     o repo absent
 else

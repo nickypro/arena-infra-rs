@@ -19,7 +19,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use arena_core::reap::judge::{
     self, caps_left, classify, due_row, observation_row, order_candidates, pre_ssh_gate, quiet_now, recheck_state, relist_verdict,
-    BackupEvidence, BackupProof, ClassifyCtx, Decision, GateCtx, JobsOutcome, Listed, Mode, QuietCtx, ReapTicket, RunGate,
+    BackupEvidence, BackupProof, ClassifyCtx, Decision, Frozen, GateCtx, JobsOutcome, Listed, Mode, QuietCtx, ReapTicket, RunGate,
     RunInputs, Row, StepEnd, TriggerProof,
 };
 use arena_core::reap::probe::{self, ProbeError, ProbeFacts, RepoSite, Since};
@@ -192,6 +192,15 @@ pub(crate) struct ReapEnv<'a> {
     pub out: &'a (dyn Fn(&str) + Sync),
     /// Sync the proxy after a reap (off in tests).
     pub sync_proxy: bool,
+    /// The config FILE, re-read right before a terminate for `REAP_ENABLED` (RS8). `None` =
+    /// can't be re-read: never terminates.
+    pub config_file: Option<PathBuf>,
+}
+
+/// `REAP_ENABLED=1` in the config FILE as it is now (RS8). Unreadable = off.
+fn enabled_in_file(env: &ReapEnv<'_>) -> bool {
+    let Some(path) = &env.config_file else { return false };
+    std::fs::read_to_string(path).map(|t| ReapSettings::from_config(&Config::parse(&t)).is_ok_and(|s| s.enabled)).unwrap_or(false)
 }
 
 /// The real environment's pieces.
@@ -258,6 +267,12 @@ fn prefix(cfg: &Config) -> &str {
     cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena")
 }
 
+/// After a state-changing command (RS3): which state file it wrote — the one the reap cron
+/// reads (the config file's `ARENA_STATE_DIR`), so a hold or pin is seen landing there.
+fn wrote(env: &ReapEnv<'_>, store: &Store) {
+    (env.out)(&format!("(state: {})", store.state_path().display()));
+}
+
 /// `arena pods reap …`.
 pub(crate) async fn handle_reap(cmd: ReapCmd, env: &ReapEnv<'_>) -> Result<()> {
     match cmd {
@@ -289,6 +304,7 @@ pub(crate) async fn handle_reap(cmd: ReapCmd, env: &ReapEnv<'_>) -> Result<()> {
                 Ok(())
             })?;
             (env.out)(&format!("reap: on hold — `--apply` runs observe until `arena pods reap release` ({reason})"));
+            wrote(env, &store);
             Ok(())
         }
         ReapCmd::Release => {
@@ -313,6 +329,7 @@ pub(crate) async fn handle_reap(cmd: ReapCmd, env: &ReapEnv<'_>) -> Result<()> {
                 Ok(())
             })?;
             (env.out)("reap: hold released");
+            wrote(env, &store);
             Ok(())
         }
     }
@@ -565,6 +582,7 @@ async fn handle_set(env: &ReapEnv<'_>, sel: &Select, ask: SetAsk, dry_run: bool)
         }
         Ok(())
     })?;
+    wrote(env, &store);
     // The participant notice, best effort.
     let state = store.load()?;
     for (p, ..) in &plan {
@@ -639,6 +657,7 @@ async fn handle_clear(env: &ReapEnv<'_>, sel: &Select, expire: bool, idle: bool,
         }
         Ok(())
     })?;
+    wrote(env, &store);
     let state = store.load()?;
     for p in &touched {
         let rec = state.pods.get(&core_reap::key(&p.provider, &p.id));
@@ -664,6 +683,7 @@ async fn handle_pin(env: &ReapEnv<'_>, sel: &Select, until: Option<String>, note
         let till = until.map_or("until unpinned".to_string(), |u| format!("until {}", describe_time(u, now, env.tz)));
         (env.out)(&format!("{}: pinned {till} — never reaped meanwhile", p.name));
     }
+    wrote(env, &store);
     Ok(())
 }
 
@@ -699,6 +719,7 @@ fn handle_unpin(env: &ReapEnv<'_>, sel: &Select) -> Result<()> {
         Ok(before - s.pins.len())
     })?;
     (env.out)(&format!("unpinned {removed} pin(s)"));
+    wrote(env, &store);
     Ok(())
 }
 
@@ -1088,7 +1109,8 @@ async fn handle_run(env: &ReapEnv<'_>, sel: &Select, asked: Mode, max: Option<u3
         && !super::confirm(
             env.yes,
             &format!(
-                "Reap: terminate up to {} due pod(s) this run, each after a verified backup (REAP_MAX_PER_RUN / --max)?",
+                "Reap: terminate up to {} due pod(s) this run, each after a verified, frozen backup (REAP_MAX_PER_RUN / \
+                 --max)? To stop it mid-run: `arena pods reap hold` (or REAP_ENABLED=0 in the config file)",
                 max.map_or(settings.max_per_run, |m| m.min(settings.max_per_run))
             ),
         )?
@@ -1267,8 +1289,9 @@ async fn handle_run(env: &ReapEnv<'_>, sel: &Select, asked: Mode, max: Option<u3
             continue;
         }
         let mut pol = pol.clone();
-        let cctx = ClassifyCtx { provider: &pol.provider, listed_id: &pol.id, now: p.at, clock_ok };
+        let cctx = ClassifyCtx { provider: &pol.provider, listed_id: &pol.id, now: p.at, clock_ok, baseline: pol.proc_baseline.as_ref() };
         let obs = classify(pol.observations.last(), &p.facts, p.jobs, &cctx);
+        pol.proc_baseline = judge::next_baseline(pol.proc_baseline.as_ref(), &p.facts);
         // The expiry is first "seen" only by a verified clock, through a probe that was read and
         // whose clock agreed with ours (Idle or Active — every other outcome is Unknown).
         let clock_fine = matches!(obs.verdict, Verdict::Idle | Verdict::Active);
@@ -1352,6 +1375,7 @@ async fn handle_run(env: &ReapEnv<'_>, sel: &Select, asked: Mode, max: Option<u3
                 if !p.warned_soon {
                     rec.warned_soon = false;
                 }
+                rec.proc_baseline.clone_from(&p.proc_baseline);
             }
             rec.last = Some(core_reap::LastDecision { t: merge_now, row: d.row, reasons: d.reasons.clone() });
         }
@@ -1451,7 +1475,7 @@ async fn handle_run(env: &ReapEnv<'_>, sel: &Select, asked: Mode, max: Option<u3
     }
     drop(run_lock);
     let attention = ctx.attention.load(std::sync::atomic::Ordering::SeqCst)
-        || outcomes.values().any(|r| matches!(r, Row::GitFailed | Row::RsyncFailed | Row::TerminateFailed | Row::DestUnhealthy))
+        || outcomes.values().any(|r| matches!(r, Row::GitFailed | Row::RsyncFailed | Row::TerminateFailed | Row::DestUnhealthy | Row::FreezeFailed))
         || decided.values().any(|d| d.row == Row::DestUnhealthy);
     if attention {
         return Err(ReapExit { code: 3, why: "reap: something needs attention (see above and `arena pods reap log`)".into() }.into());
@@ -1594,7 +1618,8 @@ async fn act_one(ctx: &RunCtx<'_, '_>, dest: &Dest, mut pol: PodPolicy, pod: Pod
             return Act::Done(Row::BackupBusy);
         }
     };
-    // a. A deciding look older than OBS_FRESH is taken again.
+    // a. The deciding look is taken immediately before the backup (RS4): one older than
+    // OBS_FRESH (60 s) is taken again, under this pod's lock.
     let mut repo = repo;
     let mut now = (env.clock)();
     if pol.observations.last().is_none_or(|o| now.saturating_sub(o.t) > core_reap::OBS_FRESH) {
@@ -1602,10 +1627,19 @@ async fn act_one(ctx: &RunCtx<'_, '_>, dest: &Dest, mut pol: PodPolicy, pod: Pod
         let nonce = (env.nonce)();
         let (facts, jobs) = probe_pod(env.remote.as_ref(), &target, &nonce, since, &ctx.repo, &pod.provider).await;
         now = (env.clock)();
-        let obs = classify(pol.observations.last(), &facts, jobs, &ClassifyCtx { provider: &pod.provider, listed_id: &pod.id, now, clock_ok });
+        let cctx = ClassifyCtx { provider: &pod.provider, listed_id: &pod.id, now, clock_ok, baseline: pol.proc_baseline.as_ref() };
+        let obs = classify(pol.observations.last(), &facts, jobs, &cctx);
         repo = facts.as_ref().ok().map(|f| f.repo);
+        pol.proc_baseline = judge::next_baseline(pol.proc_baseline.as_ref(), &facts);
         pol.observations.push(obs.clone());
         end_attempt(ctx, &key, None, Some(obs.clone()));
+        let baseline = pol.proc_baseline.clone();
+        let _ = ctx.store.update(|s| {
+            if let Some(p) = s.pods.get_mut(&key) {
+                p.proc_baseline.clone_from(&baseline);
+            }
+            Ok(())
+        });
         if obs.verdict != Verdict::Idle {
             ctx.log("act", Some(&name), Some(&key), Row::ReprobeNotIdle, &obs.reasons, Some(trigger), vec![]);
             return Act::Done(Row::ReprobeNotIdle);
@@ -1660,7 +1694,7 @@ async fn act_one(ctx: &RunCtx<'_, '_>, dest: &Dest, mut pol: PodPolicy, pod: Pod
     let started = (env.clock)();
     let snapshot_dir = arena_core::pull::local_dest(&dest.snap_root, &dest.label, &name);
     let big_dir = arena_core::pull::big_dest_in(&dest.big_root, &name);
-    let ev = backup(ctx, dest, &target, &pod, &cond, repo, started, &snapshot_dir, &big_dir, proof.container()).await;
+    let ev = backup(ctx, dest, &target, &pod, &cond, repo, started, &snapshot_dir, &big_dir, proof.container(), ctx.mode == Mode::Rehearse).await;
     let backup_proof = match BackupProof::check(&ev) {
         Ok(b) => b,
         Err(f) => {
@@ -1683,6 +1717,10 @@ async fn act_one(ctx: &RunCtx<'_, '_>, dest: &Dest, mut pol: PodPolicy, pod: Pod
             };
             end_attempt(ctx, &key, retry, obs);
             match f.row {
+                Row::FreezeFailed => {
+                    ctx.queue(Some(&key), NotifyKind::FreezeFailed, Some(&name), "the verified backup couldn't be frozen into reaped/ — not reaped");
+                    ctx.attention();
+                }
                 Row::GitFailed => ctx.queue(Some(&key), NotifyKind::GitFailed, Some(&name), "the reap's git backup failed — not reaped; retried in 6h"),
                 Row::RsyncFailed => ctx.queue(Some(&key), NotifyKind::RsyncFailed, Some(&name), "the reap's file backup failed — not reaped; retried in 6h"),
                 Row::DestUnhealthy => ctx.queue(None, NotifyKind::DestUnhealthy, Some(&name), "backup destination unhealthy at the reap's backup"),
@@ -1692,12 +1730,13 @@ async fn act_one(ctx: &RunCtx<'_, '_>, dest: &Dest, mut pol: PodPolicy, pod: Pod
             return Act::Done(f.row);
         }
     };
-    // d. Quiet now, the same pod and container, nothing changed since the backup started.
-    let back = (env.clock)().saturating_sub(backup_proof.started()) + core_reap::POST_BACKUP_MARGIN;
+    // d. Quiet now: the same pod and container, and nothing changed since the DECIDING look's
+    // scan started (RS4 — so the stretch between that look and the backup is covered too).
     let nonce = (env.nonce)();
-    let (facts, jobs) = probe_pod(env.remote.as_ref(), &target, &nonce, Since::Back(back), &ctx.repo, &pod.provider).await;
+    let (facts, jobs) = probe_pod(env.remote.as_ref(), &target, &nonce, Since::At(proof.scan_from()), &ctx.repo, &pod.provider).await;
     let quiet_at = (env.clock)();
-    let quiet = match quiet_now(&facts, jobs, &QuietCtx { provider: &pod.provider, id: &pod.id, container: proof.container(), now: quiet_at }) {
+    let qctx = QuietCtx { provider: &pod.provider, id: &pod.id, container: proof.container(), now: quiet_at, baseline: pol.proc_baseline.as_ref() };
+    let quiet = match quiet_now(&facts, jobs, &qctx) {
         Ok(q) => q,
         Err(reasons) => {
             end_attempt(ctx, &key, None, None);
@@ -1707,20 +1746,20 @@ async fn act_one(ctx: &RunCtx<'_, '_>, dest: &Dest, mut pol: PodPolicy, pod: Pod
     };
     // e. A rehearsal stops here.
     let (Some(run_gate), Some(wal)) = (run_gate, wal) else {
-        ctx.log("act", Some(&name), Some(&key), Row::Rehearsed, &[], Some(trigger), vec![snapshot_dir, big_dir]);
+        ctx.log("act", Some(&name), Some(&key), Row::Rehearsed, &[], Some(trigger), vec![backup_proof.snapshot_dir.clone(), backup_proof.big_dir.clone()]);
         return Act::Done(Row::Rehearsed);
     };
     // f. Re-list this provider; re-read the state.
-    let results = env.provider.list_by_provider().await;
+    let results: Vec<(String, std::result::Result<Vec<Pod>, String>)> =
+        env.provider.list_by_provider().await.into_iter().map(|(n, r)| (n, r.map_err(|e| e.to_string()))).collect();
     let listed_at = (env.clock)();
-    let mine: Option<std::result::Result<Vec<Pod>, String>> =
-        results.into_iter().find(|(n, _)| *n == pod.provider).map(|(_, r)| r.map_err(|e| e.to_string()));
-    let listed = match &mine {
+    let all_ok: Vec<Pod> = results.iter().filter_map(|(_, r)| r.as_ref().ok()).flatten().cloned().collect();
+    let listed = match results.iter().find(|(n, _)| *n == pod.provider).map(|(_, r)| r) {
         None => Listed::NotQueried,
         Some(Err(_)) => Listed::Failed,
         Some(Ok(pods)) => pods.iter().find(|p| p.id == pod.id).map_or(Listed::Gone, Listed::Pod),
     };
-    let relist = match relist_verdict(listed, &key, &name, listed_at, (env.clock)()) {
+    let relist = match relist_verdict(listed, &all_ok, &key, &name, listed_at, (env.clock)()) {
         Ok(r) => r,
         Err(row) => {
             if row == Row::GoneBeforeReap {
@@ -1745,6 +1784,16 @@ async fn act_one(ctx: &RunCtx<'_, '_>, dest: &Dest, mut pol: PodPolicy, pod: Pod
     };
     let recheck = match recheck_state(&reread, &key, trigger, &pol.observations, (env.clock)()) {
         Ok(r) => r,
+        Err(row) => {
+            end_attempt(ctx, &key, None, None);
+            ctx.log("act", Some(&name), Some(&key), row, &[], Some(trigger), vec![]);
+            return Act::Done(row);
+        }
+    };
+    // RS8: the switch, re-read from the config FILE right now — `REAP_ENABLED=0` set during a
+    // long backup stops this terminate (as `reap hold` does, through the re-read state).
+    let run_gate = match run_gate.still(enabled_in_file(env), reread.hold.is_some()) {
+        Ok(g) => g,
         Err(row) => {
             end_attempt(ctx, &key, None, None);
             ctx.log("act", Some(&name), Some(&key), row, &[], Some(trigger), vec![]);
@@ -1862,6 +1911,7 @@ async fn backup(
     snapshot_dir: &str,
     big_dir: &str,
     container: &str,
+    rehearsal: bool,
 ) -> BackupEvidence {
     use arena_core::pull::{self, PullConfig};
     let env = ctx.env;
@@ -1878,12 +1928,8 @@ async fn backup(
         verify: StepEnd::Error,
         snapshot_dir: snapshot_dir.to_string(),
         big_dir: big_dir.to_string(),
+        frozen: None,
     };
-    // Space and markers again, right before writing.
-    if dest_check(env.cfg, &ctx.settings, &env.rsync).await.is_err() {
-        ev.dest_ok = false;
-        return ev;
-    }
     let began = tokio::time::Instant::now();
     let left = |b: Duration| -> Duration { Duration::from_secs(b.saturating_sub(began.elapsed()).as_secs().max(1)) };
     // Git: a repo the probe saw absent has nothing to push (the tiers carry the whole home).
@@ -1898,6 +1944,13 @@ async fn backup(
             ev.finished = (env.clock)();
             return ev;
         }
+    }
+    // Space and markers again, right before the first write here (RS9): a volume unmounted
+    // since the run's check (or during the git push) must not take this pod's last copy.
+    if dest_check(env.cfg, &ctx.settings, &env.rsync).await.is_err() {
+        ev.dest_ok = false;
+        ev.finished = (env.clock)();
+        return ev;
     }
     let guard = Some(arena_core::replica::guarded_rsync_path(cond));
     let base = Path::new(&dest.snap_root);
@@ -1920,7 +1973,8 @@ async fn backup(
             return ev;
         }
     }
-    let big = PullConfig { rsync_path: guard, ..PullConfig::big_tier() };
+    // RS2: the reap's own big tier — dot-directories kept, only the documented caches left out.
+    let big = PullConfig { rsync_path: guard, ..PullConfig::reap_tier() };
     ev.big = step_end(arena_core::remote::run_local(&env.rsync, &pull::rsync_args(t, &big, big_dir), &format!("reap rsync of {} [big]", pod.name), Some(left(dest.budget))).await);
     if matches!(ev.big, StepEnd::Exit { code: 0, .. }) {
         ev.verify = step_end(
@@ -1928,7 +1982,43 @@ async fn backup(
         );
     }
     ev.finished = (env.clock)();
+    if judge::verify_verdict(&ev.verify).is_ok() {
+        ev.frozen = Some(freeze(dest, pod, (env.clock)(), snapshot_dir, big_dir, rehearsal));
+    }
     ev
+}
+
+/// RS1: the verified backup, frozen — hard-link copies (`cp -al`: same filesystem, no space) of
+/// both tiers' dirs into `<root>/reaped/<name>/<UTC stamp>-<provider>-<id>[-rehearsal]/`
+/// (`snapshot/`, `big/`), counted against the originals. Under this pod's lock, so nothing
+/// writes the originals meanwhile. The live per-name dirs are a later same-named pod's to pull
+/// into; rsync writes a changed file as a new inode, so the frozen links keep what was
+/// verified. Nothing in arena writes into or deletes from `reaped/`.
+fn freeze(dest: &Dest, pod: &Pod, now: u64, snapshot_dir: &str, big_dir: &str, rehearsal: bool) -> Frozen {
+    use arena_core::pull::{link_tree, tree_count};
+    let leaf = format!(
+        "{}-{}-{}{}",
+        arena_core::restore::stamp(now),
+        arena_core::snapshot::path_component(&pod.provider),
+        arena_core::snapshot::path_component(&pod.id),
+        if rehearsal { "-rehearsal" } else { "" }
+    );
+    let at = |root: &str, tier: &str| -> PathBuf {
+        Path::new(root).join(arena_core::restore::REAPED).join(arena_core::snapshot::path_component(&pod.name)).join(&leaf).join(tier)
+    };
+    let (snap_to, big_to) = (at(&dest.snap_root, "snapshot"), at(&dest.big_root, "big"));
+    let one = |from: &str, to: &Path| -> bool {
+        let src = Path::new(from);
+        match (tree_count(src), link_tree(src, to)) {
+            (Ok(a), Ok(b)) if a == b => true,
+            (a, b) => {
+                eprintln!("warning: freezing {from} into {}: {a:?} vs {b:?}", to.display());
+                false
+            }
+        }
+    };
+    let matched = one(snapshot_dir, &snap_to) & one(big_dir, &big_to);
+    Frozen { snapshot_dir: snap_to.display().to_string(), big_dir: big_to.display().to_string(), matched }
 }
 
 /// The `ENDS` column for `pods list` (spec §3.4): `None` when the reaper has no state here (no
@@ -1977,6 +2067,26 @@ pub(crate) fn renamed(cfg: &Config, provider: &str, id: &str, new_name: &str) {
     if let Err(e) = r {
         eprintln!("warning: the reaper's record of {id} wasn't renamed ({e}) — it now stays inert until `arena pods reap set` again");
     }
+}
+
+/// `pods replace` / `migrate copy` / `migrate cutover` (RS5): the refusal when the auto-reaper
+/// is reaping `pod` right now — its write-ahead record (`terminating`) is in the state the
+/// config FILE names (whatever this shell exports). Copying from, or renaming, a pod the reaper
+/// is about to terminate would race it; the reaper's own last re-listing also stops at a
+/// `-new`/`-old` twin, this closes the stretch before one is listed. No state, or one that
+/// can't be read (the reaper then can't act either): no refusal.
+pub(crate) fn reap_in_progress(cfg: &Config, pod: &Pod, verb: &str) -> Option<String> {
+    let store = Store::new(arena_core::snapshot::state_dir_in_file(cfg).ok()?);
+    let state = store.load_if_any().ok()??;
+    let t = state.pods.get(&core_reap::key(&pod.provider, &pod.id))?.terminating.as_ref()?;
+    Some(format!(
+        "refusing to {verb}: the auto-reaper is reaping {} (its {} reap, run {}, since {} UTC) — wait for it to end \
+         (`arena pods reap status`); `arena pods reap hold` stops it before its terminate",
+        pod.name,
+        t.trigger.word(),
+        t.run_id,
+        render::fmt_local(t.at, 0)
+    ))
 }
 
 /// `pods replace` / `migrate`: the reap policy stays with the old id — say so.

@@ -147,7 +147,7 @@ fn log_lines_are_fixed_vocabulary() {
     };
     let text = hostile.render();
     let facts = parse_probe(&text, "N0NCE", hostile.since);
-    let o = classify(None, &facts, JobsOutcome::Read { busy: 0 }, &ClassifyCtx { provider: "runpod", listed_id: "pod1", now: hostile.now(), clock_ok: true });
+    let o = classify(None, &facts, JobsOutcome::Read { busy: 0 }, &ClassifyCtx { provider: "runpod", listed_id: "pod1", now: hostile.now(), clock_ok: true, baseline: None });
     let line = LogLine {
         t: T,
         run: "r1".into(),

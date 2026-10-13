@@ -104,8 +104,16 @@ pub const SSHD_LINE_CAP: usize = 100;
 /// Pods probed at once.
 pub const PROBE_CONCURRENCY: usize = 8;
 
-/// A deciding observation older than this is taken again before anything acts on it.
-pub const OBS_FRESH: u64 = 5 * 60;
+/// A deciding observation older than this is taken again before anything acts on it: the
+/// deciding look is taken immediately before the backup (RS4), so nothing in between goes
+/// unwatched for more than this.
+pub const OBS_FRESH: u64 = 60;
+
+/// Processes started within this long of the container's start (PID 1) are the image's own
+/// (its boot-time services): they, and later restarts with the same command line, are the
+/// pod's process baseline. Anything else running that isn't an idle daemon is somebody's —
+/// a dormant `nohup python train.py` included (RS7).
+pub const BOOT_GRACE: u64 = 120;
 
 /// The re-listing a terminate rides on may be at most this old.
 pub const RELIST_MAX_AGE: u64 = 60;
@@ -485,6 +493,14 @@ pub enum Reason {
     Workspace,
     /// The repo (`BACKUP_REPO_PATH`) resolves outside the home — not in the backup's scope.
     RepoOutside,
+    /// A sweep folder (`TEMP_FOLDER_FOR_SWEEPS/`) changed since the container started — never
+    /// copied by a reap's backup.
+    Uncovered,
+    /// Data written since the container started on another writable mount — outside the backup.
+    OtherMount,
+    /// A process that isn't the image's own (started after boot, not a restart of a boot-time
+    /// service, not an idle daemon): somebody's job, dormant or not.
+    Process,
     // --- couldn't tell (Unknown) ---
     /// SSH or the exec failed, timed out, or the reply had no end marker.
     ProbeFailed,
@@ -533,6 +549,14 @@ pub enum Reason {
     HomeMounts,
     /// The probe's measuring window wasn't ~10 s.
     WindowBad,
+    /// The home is a symlink: can't tell that the backup reads what was scanned.
+    HomeLink,
+    /// The home couldn't be resolved.
+    HomeUnknown,
+    /// The other mounts couldn't be checked.
+    MountsUnknown,
+    /// The process list couldn't be read in full.
+    ProcessesUnknown,
 }
 
 impl Reason {
@@ -541,7 +565,26 @@ impl Reason {
         use Reason::*;
         matches!(
             self,
-            Session | Who | Inbound | Outbound | ManySockets | Cpu | Net | GpuUtil | GpuMem | GpuProcs | Tmux | Screen | Files | Job | Keep | Workspace | RepoOutside
+            Session
+                | Who
+                | Inbound
+                | Outbound
+                | ManySockets
+                | Cpu
+                | Net
+                | GpuUtil
+                | GpuMem
+                | GpuProcs
+                | Tmux
+                | Screen
+                | Files
+                | Job
+                | Keep
+                | Workspace
+                | RepoOutside
+                | Uncovered
+                | OtherMount
+                | Process
         )
     }
 
@@ -628,6 +671,19 @@ pub struct PodPolicy {
     /// When each notification kind was last sent for this pod.
     #[serde(default)]
     pub notified: BTreeMap<render::NotifyKind, u64>,
+    /// The container's boot-time processes (RS7), as seen so far.
+    #[serde(default)]
+    pub proc_baseline: Option<ProcBaseline>,
+}
+
+/// A container's own processes — those started within [`BOOT_GRACE`] of its start — by the
+/// cksum of their command line, collected across looks (so a service restarted later is still
+/// recognised). Reset when the container changes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcBaseline {
+    pub container: String,
+    pub hashes: std::collections::BTreeSet<u32>,
 }
 
 impl PodPolicy {
@@ -649,6 +705,7 @@ impl PodPolicy {
             terminating: None,
             last: None,
             notified: BTreeMap::new(),
+            proc_baseline: None,
         }
     }
 

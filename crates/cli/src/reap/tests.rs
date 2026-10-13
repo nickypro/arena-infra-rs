@@ -45,6 +45,22 @@ struct Sim {
     /// What happens in the world while the backup runs (fired by the git step).
     on_git: OnGit,
     git_done: bool,
+    /// REVIEW: a file in the home changed at this time (the pod clock is the control clock here):
+    /// a probe sees it when it runs after it and its scan window starts at or before it.
+    file_at: Option<u64>,
+    /// REVIEW: probing this pod takes this long — the control clock moves on (a slow probe round).
+    probe_secs: u64,
+    /// RS2: the probe's sweep-folder scan (`none`/`hit`/…) and other writable mounts.
+    uncovered: &'static str,
+    mounts: &'static str,
+    /// RS6: the home as resolved (`ok`/`link`/`err`).
+    home: &'static str,
+    /// RS7: processes beyond the image's boot-time three — `(seconds after PID 1, cmdline
+    /// cksum, interactive shell, name)` — and whether the list is unreadable.
+    procs: Vec<(u64, u32, bool, &'static str)>,
+    procs_unreadable: bool,
+    /// RS7: a process that starts after the backup's git step (a job launched mid-reap).
+    proc_after_git: Option<(u64, u32, bool, &'static str)>,
 }
 
 /// A change to the world in the middle of a reap (between the decision and the terminate).
@@ -62,6 +78,12 @@ enum OnGit {
     Extended,
     /// The backup takes 6 minutes (the control clock moves on).
     Slow,
+    /// REVIEW: an operator starts `pods replace`/`migrate` of it: `<name>-new` appears listed.
+    Twin,
+    /// RS8: an operator sets `REAP_ENABLED=0` in the config file.
+    Disable,
+    /// RS9: the big volume is unmounted (its tier marker gone).
+    Unmount,
 }
 
 impl Sim {
@@ -87,6 +109,14 @@ impl Sim {
             unreachable_after_git: false,
             on_git: OnGit::Nothing,
             git_done: false,
+            file_at: None,
+            probe_secs: 0,
+            uncovered: "none",
+            mounts: "clean",
+            home: "ok",
+            procs: Vec::new(),
+            procs_unreadable: false,
+            proc_after_git: None,
         }
     }
 }
@@ -100,6 +130,10 @@ struct Remote2 {
     clock: Arc<AtomicU64>,
     log: PathBuf,
     calls: Mutex<Vec<(String, &'static str)>>,
+    /// The world's directory (its config file, the backup roots).
+    dir: PathBuf,
+    /// Each probe's host and the (pod-clock) time its file scan started.
+    scans: Mutex<Vec<(String, u64)>>,
 }
 
 fn kind_of(cmd: &str) -> &'static str {
@@ -171,13 +205,37 @@ impl Remote2 {
                     cpu: (Some(sim.cpu), Some(sim.cpu + 5_000)),
                     net: (Some(sim.net), Some(sim.net + 100)),
                     gpu,
-                    files: if sim.files_hit { "hit" } else { "none" },
+                    files: {
+                        let scan_from = match since {
+                            Since::At(t) => t,
+                            Since::Back(b) => (now - 22).saturating_sub(b),
+                        };
+                        self.scans.lock().unwrap().push((host.to_string(), scan_from));
+                        let late_file = sim.file_at.is_some_and(|f| f >= scan_from && f <= now);
+                        if sim.files_hit || late_file { "hit" } else { "none" }
+                    },
                     sshd,
                     keep: sim.keep,
                     workspace: sim.workspace,
                     repo: sim.repo,
+                    uncovered: sim.uncovered,
+                    mounts: sim.mounts,
+                    home: sim.home,
+                    procs: (!sim.procs_unreadable).then(|| {
+                        let pid1: u64 = sim.pid1.parse().unwrap_or(0);
+                        let after_git = sim.proc_after_git.filter(|_| sim.git_done);
+                        [(0, 11, false, "start.sh"), (1, 22, false, "sshd"), (4, 33, false, "jupyter-lab")]
+                            .into_iter()
+                            .chain(sim.procs.iter().copied())
+                            .chain(after_git)
+                            .map(|(secs, hash, shell, name)| (pid1 + secs * 100, hash, shell, name.to_string()))
+                            .collect()
+                    }),
                     ..Default::default()
                 };
+                if sim.probe_secs > 0 {
+                    self.clock.fetch_add(sim.probe_secs, Ordering::SeqCst);
+                }
                 ok(r.render())
             }
             "jobs" => {
@@ -192,6 +250,15 @@ impl Remote2 {
                 sim.git_done = true;
                 let id = sim.id.clone();
                 let mut listing = self.listing.lock().unwrap();
+                if sim.on_git == OnGit::Twin {
+                    for (_, r) in listing.iter_mut() {
+                        if let Ok(pods) = r {
+                            if let Some(p) = pods.iter().find(|p| p.id == id).cloned() {
+                                pods.push(Pod { id: format!("{}-twin", p.id), name: format!("{}-new", p.name), ..p });
+                            }
+                        }
+                    }
+                }
                 let pod = listing.iter_mut().filter_map(|(_, r)| r.as_mut().ok()).flatten().find(|p| p.id == id);
                 let name = pod.as_ref().map(|p| p.name.clone()).unwrap_or_default();
                 match (sim.on_git, pod) {
@@ -215,6 +282,14 @@ impl Remote2 {
                     }
                     (OnGit::Slow, _) => {
                         self.clock.fetch_add(360, Ordering::SeqCst);
+                    }
+                    (OnGit::Disable, _) => {
+                        let cfg = self.dir.join("config.env");
+                        let text = std::fs::read_to_string(&cfg).unwrap();
+                        std::fs::write(&cfg, text.replace("REAP_ENABLED=1", "REAP_ENABLED=0")).unwrap();
+                    }
+                    (OnGit::Unmount, _) => {
+                        std::fs::remove_file(self.dir.join("snap/big/.arena-backup-tier")).unwrap();
                     }
                     (OnGit::Extended, _) => {
                         let now = self.clock.load(Ordering::SeqCst);
@@ -393,11 +468,14 @@ for a in "$@"; do last="$a"; done
 case " $* " in
   *" --dry-run "*) echo "rsync verify $last" >> "$d/calls.log"; echo "Number of regular files transferred: $(cat "$d/pending" 2>/dev/null || echo 0)"; exit "$(cat "$d/exit_verify" 2>/dev/null || echo 0)";;
 esac
+# What the pod holds now ($d/content), written as rsync does: a temp file renamed over the old.
+put() { mkdir -p "$1" && cat "$d/content" > "$1/.work.tmp" 2>/dev/null || echo v1 > "$1/.work.tmp"; mv "$1/.work.tmp" "$1/work.txt"; }
 case "$last" in
-  */snap/big/*) echo "rsync big $last" >> "$d/calls.log"; [ -f "$d/hang_big" ] && sleep 5; exit "$(cat "$d/exit_big" 2>/dev/null || echo 0)";;
+  */snap/big/*) echo "rsync big $last" >> "$d/calls.log"; printf '%s\n' "$@" > "$d/big_args"; [ -f "$d/hang_big" ] && sleep 5; put "$last"; exit "$(cat "$d/exit_big" 2>/dev/null || echo 0)";;
 esac
 echo "rsync snapshot $last" >> "$d/calls.log"
 echo "Number of regular files transferred: 1"
+put "$last"
 exit "$(cat "$d/exit_snap" 2>/dev/null || echo 0)"
 "#,
         )
@@ -411,7 +489,8 @@ exit "$(cat "$d/exit_snap" 2>/dev/null || echo 0)"
         );
         let clock = Arc::new(AtomicU64::new(T0));
         let log = dir.join("calls.log");
-        let cfg = Config::parse(&text);
+        std::fs::write(dir.join("config.env"), &text).unwrap();
+        let cfg = Config::parse(&text).with_source(&dir.join("config.env"));
         let listing: Listing2 = Arc::new(Mutex::new(vec![("runpod".into(), Ok(Vec::new())), ("hetzner".into(), Ok(Vec::new()))]));
         let store = Store::new(dir.join("state").join("devtest"));
         let ntp = Arc::new(Mutex::new(Some(true)));
@@ -426,7 +505,16 @@ exit "$(cat "$d/exit_snap" 2>/dev/null || echo 0)"
                 strict: Mutex::new(true),
                 log: log.clone(),
             },
-            remote: Arc::new(Remote2 { sims: Mutex::new(HashMap::new()), listing, store, clock: clock.clone(), log, calls: Mutex::new(Vec::new()) }),
+            remote: Arc::new(Remote2 {
+                sims: Mutex::new(HashMap::new()),
+                listing,
+                store,
+                clock: clock.clone(),
+                log,
+                calls: Mutex::new(Vec::new()),
+                dir: dir.clone(),
+                scans: Mutex::new(Vec::new()),
+            }),
             clock,
             ntp_fn: {
                 let n = ntp.clone();
@@ -509,6 +597,7 @@ exit "$(cat "$d/exit_snap" 2>/dev/null || echo 0)"
             resolve_local: &|_| None,
             out: &*self.out_fn,
             sync_proxy: false,
+            config_file: self.cfg.source().map(Path::to_path_buf),
         }
     }
 
@@ -611,8 +700,11 @@ async fn idle_8h_is_reaped_once_after_a_verified_backup() {
     assert!(probes.iter().any(|p| *p < git) && probes.iter().any(|p| *p > verify && *p < term), "{order:#?}");
     let s = w.state();
     let tomb = &s.reaped["runpod:pa"];
-    assert!(tomb.snapshot_dir.as_deref().unwrap().ends_with("/snap/w0d4/devtest-alpha/") || tomb.snapshot_dir.as_deref().unwrap().contains("/snap/w"), "{tomb:?}");
-    assert!(tomb.big_dir.as_deref().unwrap().ends_with("/snap/big/devtest-alpha/"));
+    // RS1: the tombstone names the FROZEN copies, never the live per-name dirs.
+    let (snap, big) = (tomb.snapshot_dir.as_deref().unwrap(), tomb.big_dir.as_deref().unwrap());
+    assert!(snap.contains("/snap/reaped/devtest-alpha/") && snap.ends_with("-runpod-pa/snapshot"), "{tomb:?}");
+    assert!(big.contains("/snap/big/reaped/devtest-alpha/") && big.ends_with("-runpod-pa/big"), "{tomb:?}");
+    assert_eq!(std::fs::read_to_string(Path::new(big).join("work.txt")).unwrap(), "v1\n");
     assert!(!s.pods.contains_key("runpod:pa"));
     assert_eq!(s.attempts.len(), 1);
     assert!(w.notified().iter().any(|l| l.contains("reaped devtest-alpha") && l.contains("arena keys revoke devtest-alpha")), "{:?}", w.notified());
@@ -1060,7 +1152,10 @@ async fn dry_run_is_read_only_and_rehearse_never_terminates() {
     assert!(w.order().iter().any(|l| l.starts_with("rsync verify")), "{:?}", w.order());
     assert!(out.contains("rehearsed"), "{out}");
     assert_eq!(w.state().attempts.len(), 0, "a rehearsal uses no cap");
-    assert!(w.store().read_log().unwrap().iter().any(|l| l.contains("\"row\":\"rehearsed\"") && l.contains("/snap/big/devtest-alpha/")));
+    assert!(
+        w.store().read_log().unwrap().iter().any(|l| l.contains("\"row\":\"rehearsed\"") && l.contains("/snap/big/reaped/devtest-alpha/") && l.contains("-rehearsal/big")),
+        "a rehearsal freezes its copy too, marked as one"
+    );
 }
 
 /// Scenario 17: the re-listing shows the pod changed (renamed, stopped, locked) — nothing; or
@@ -1081,7 +1176,7 @@ async fn relist_changed_or_gone() {
     assert!(w.terminated().is_empty(), "{out}");
     let s = w.state();
     assert!(!s.pods.contains_key(&core_reap::key("runpod", &a.id)));
-    assert!(s.reaped[&core_reap::key("runpod", &a.id)].big_dir.as_deref().is_some_and(|d| d.ends_with("/snap/big/devtest-alpha/")));
+    assert!(s.reaped[&core_reap::key("runpod", &a.id)].big_dir.as_deref().is_some_and(|d| d.contains("/snap/big/reaped/devtest-alpha/")));
 }
 
 /// Scenario 18 (I14): a terminate that fails in an unknown way sets a hold; the next --apply
@@ -1453,4 +1548,364 @@ async fn a_stale_deciding_look_is_taken_again() {
         let ids: Vec<String> = w.terminated().into_iter().map(|(_, id)| id).collect();
         assert_eq!(ids, ["pa", "pb"], "expiry first, then idle: {out}");
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// REVIEW (adversarial safety review of the reaper lane, branch `review`). Each test states the
+// property that SHOULD hold; those marked "fails today" demonstrate a finding.
+// ---------------------------------------------------------------------------------------
+
+/// REVIEW RS1 (fails today): a reap's verified backup lands in the pod NAME's shared, mutable
+/// dirs — `<big root>/<name>/` (all files, rsync without `--delete`) and today's
+/// `<label>/<name>/` — the very dirs every later pod of that name is pulled into. The participant
+/// whose idle pod was reaped comes back; `pods up` fills the free list name with a fresh
+/// `devtest-alpha` (new id); its next `pods pull` / `pods backup --pull` overwrites every
+/// same-path file (their edited ARENA_materials files, `.git/HEAD`/refs/logs …) with the image's
+/// pristine copies — possibly before anyone ran `pods restore --from big`. The tombstone and the
+/// "reaped" notification still point there. (The same sharing happens when R5 can't see a
+/// same-named twin because that provider's listing failed this run.)
+#[tokio::test]
+async fn review_rs1_a_reaped_pods_backup_is_not_its_successors_pull_dir() {
+    let w = World::new("rv-rs1", "");
+    let a = rp("devtest-alpha", "pa", 22001);
+    w.add(a.clone(), Sim::new("pa", "runpod"));
+    w.policy(&a, None, Some(900));
+    run_until_reaped(&w, "apply", 300, 12).await;
+    assert_eq!(w.terminated(), [("runpod".to_string(), "pa".to_string())]);
+    let tomb = w.state().reaped["runpod:pa"].clone();
+    // Where `pods pull` writes a (new) devtest-alpha under the same config.
+    let dir = crate::local_backup_dir(&w.cfg);
+    let (big_root, _) = crate::pull_roots(&w.cfg, &dir);
+    let (wk, d) = crate::resolve_week_day(&w.cfg, None, None).unwrap();
+    let successor_big = arena_core::pull::big_dest_in(&big_root, "devtest-alpha");
+    let successor_snap = arena_core::pull::local_dest(&dir, &format!("w{wk}d{d}"), "devtest-alpha");
+    assert!(
+        tomb.big_dir.as_deref() != Some(successor_big.as_str()) && tomb.snapshot_dir.as_deref() != Some(successor_snap.as_str()),
+        "the reaped pod's only verified copies are the dirs a same-named successor's pulls overwrite in place: {tomb:?}"
+    );
+}
+
+/// REVIEW RS2 (fails today): the reap's "verified" copy is the big tier, whose filter is the
+/// backup default — it drops every dot-directory but `.git`/`.claude`, `TEMP_FOLDER_FOR_SWEEPS/`
+/// (sweep/RLVR run outputs, "deliberately NOT backed up"), `venv/`, `huggingface/`, `hf_cache/`,
+/// `models--*/`, `datasets--*/`, … The verify runs with the same filter, so it can't notice, and
+/// the probe has no NotCovered fact for any of them (only `/workspace` and a repo outside home).
+/// Terminating destroys whatever is only there. (Spec §1 accepts "the existing excludes" — but
+/// a backup that drops data on purpose was safe only while nothing terminated pods behind it.)
+///
+/// Fixed (RS2) as the review allowed: the reap's backup is its own tier
+/// ([`PullConfig::reap_tier`]) — dot-directories kept; what it still leaves out is either a
+/// documented cache/secret (`REAP_NOT_KEPT`) or vetoed (`REAP_VETOED`: a pod with anything
+/// written there since its container started is never reaped — `uncovered_and_other_mounts_veto`).
+#[test]
+fn review_rs2_the_reaps_verified_copy_keeps_participant_data() {
+    use arena_core::pull::{PullConfig, REAP_NOT_KEPT, REAP_VETOED};
+    let t = SshTarget::for_host("root", "10.0.0.1", 22001, None);
+    let args = arena_core::pull::rsync_args(&t, &PullConfig::reap_tier(), "/big/devtest-alpha/");
+    assert!(!args.iter().any(|a| a == "**/.*/"), "dot-directories are kept: {args:?}");
+    for d in ["TEMP_FOLDER_FOR_SWEEPS/", "venv/", "huggingface/", "hf_cache/"] {
+        assert!(REAP_NOT_KEPT.contains(&d) || REAP_VETOED.contains(&d), "{d} dropped without being documented or vetoed");
+    }
+    assert!(REAP_VETOED.contains(&"TEMP_FOLDER_FOR_SWEEPS/"));
+    // The verify reads with the same filter as the copy.
+    let verify = arena_core::pull::verify_args(&t, &PullConfig::reap_tier(), "/big/devtest-alpha/");
+    for a in args.iter().filter(|a| a.starts_with("--exclude") || a.starts_with("--include") || a.starts_with("--filter")) {
+        assert!(verify.contains(a), "{a} missing from the verify");
+    }
+}
+
+/// REVIEW RS4 (fails today): nothing watches the pod between the deciding look and the
+/// backup. The deciding look may be up to OBS_FRESH (5 min) old when the backup starts (the
+/// probe round of a fleet takes minutes), and the post-backup look only scans files changed
+/// since `backup start − 60 s`. A participant who comes back after the idle window, saves a
+/// file and leaves inside that gap is not seen: the pod is terminated ~3 min after they used it.
+/// (Their file is in the backup — the environment, their tmux/kernels, is gone.)
+#[tokio::test]
+async fn review_rs4_activity_between_the_deciding_look_and_the_backup_is_unwatched() {
+    let w = World::new("rv-rs4", "");
+    let a = rp("devtest-alpha", "pa", 22001);
+    let b = rp("devtest-bravo", "pb", 22002);
+    w.add(a.clone(), Sim::new("pa", "runpod"));
+    w.add(b.clone(), Sim::new("pb", "runpod"));
+    w.policy(&a, None, Some(900));
+    w.policy(&b, None, Some(8 * 3600));
+    for i in 0..4 {
+        if i > 0 {
+            w.tick(300);
+        }
+        w.step("observe").await;
+    }
+    w.tick(300);
+    let t = w.now();
+    // This run's probe round takes a while (bravo's look, after alpha's): alpha's deciding look
+    // at t is still "fresh" (< OBS_FRESH) when its backup starts at t + 240.
+    w.sim(22002, |s| s.probe_secs = 240);
+    // Meanwhile alpha's participant logs in, saves a file at t + 60, and logs out.
+    w.sim(22001, |s| s.file_at = Some(t + 60));
+    let (_, out) = w.run("apply").await;
+    assert!(w.terminated().is_empty(), "reaped ~3 min after its participant saved a file (unwatched gap): {out}");
+}
+
+/// REVIEW RS5 (fails today): R5 (a `-old`/`-new` twin listed ⇒ a replace/migrate is running ⇒
+/// nothing) is checked before the probe only. The re-listing just before the terminate (R37)
+/// re-checks id, name, status and lock — not twins. An operator who starts `pods replace` /
+/// `migrate` of the pod during the reap's (possibly hour-long) backup has `<name>-new` listed and
+/// is copying the home from this pod: the reaper terminates the source under it.
+#[tokio::test]
+async fn review_rs5_a_twin_listed_at_the_relist_stops_the_terminate() {
+    let (w, _a) = due_world("rv-rs5", "").await;
+    w.sim(22001, |s| s.on_git = OnGit::Twin);
+    let (_, out) = w.run("apply").await;
+    assert!(w.terminated().is_empty(), "terminated while `devtest-alpha-new` (a replace/migrate of it) was listed: {out}");
+}
+
+// ---------------------------------------------------------------------------------------
+// Safety review fixes (RS1–RS9).
+// ---------------------------------------------------------------------------------------
+
+/// RS1: a reaped pod's backup is frozen — a same-named successor, reaped (or pulled) later into
+/// the same per-name dirs with different files, leaves the first one's frozen copy
+/// byte-identical, and the two reaps' copies are apart.
+#[tokio::test]
+async fn rs1_a_reaped_pods_frozen_copy_outlives_its_successor() {
+    let (w, a) = due_world("rs1-succ", "").await;
+    w.put("content", "the first devtest-alpha's work\n");
+    w.step("apply").await;
+    assert_eq!(w.terminated().len(), 1);
+    let first = w.state().reaped[&core_reap::key("runpod", &a.id)].clone();
+    let frozen_big = Path::new(first.big_dir.as_deref().unwrap()).join("work.txt");
+    let frozen_snap = Path::new(first.snapshot_dir.as_deref().unwrap()).join("work.txt");
+    let before = (std::fs::read(&frozen_big).unwrap(), std::fs::read(&frozen_snap).unwrap());
+    assert_eq!(before.0, b"the first devtest-alpha's work\n");
+    // A new devtest-alpha (another id), with other files, idle and reaped in its turn.
+    let b = rp("devtest-alpha", "pa2", 22002);
+    w.add(b.clone(), Sim::new("pa2", "runpod"));
+    w.policy(&b, None, Some(900));
+    w.put("content", "the successor's own\n");
+    w.tick(60);
+    let runs = run_until_reaped_n(&w, 2, 300, 12).await;
+    assert!(runs < 12, "the successor was never reaped");
+    let second = w.state().reaped[&core_reap::key("runpod", &b.id)].clone();
+    assert_ne!(second.big_dir, first.big_dir);
+    assert_eq!(std::fs::read(Path::new(second.big_dir.as_deref().unwrap()).join("work.txt")).unwrap(), b"the successor's own\n");
+    // The live per-name dir now holds the successor's — the first's frozen copy didn't move.
+    assert_eq!(std::fs::read(w.dir.join("snap/big/devtest-alpha/work.txt")).unwrap(), b"the successor's own\n");
+    assert_eq!((std::fs::read(&frozen_big).unwrap(), std::fs::read(&frozen_snap).unwrap()), before);
+    // The notification and `reap status` point at the frozen copies.
+    assert!(w.notified().iter().any(|l| l.contains(first.big_dir.as_deref().unwrap())), "{:?}", w.notified());
+    w.out.lock().unwrap().clear();
+    w.reap(&["status"]).await.unwrap();
+    let out = w.out.lock().unwrap().join("\n");
+    assert!(out.contains("/snap/big/reaped/devtest-alpha/"), "{out}");
+}
+
+/// [`run_until_reaped`] until `n` terminates.
+async fn run_until_reaped_n(w: &World, n: usize, every: u64, max: usize) -> usize {
+    for i in 0..max {
+        if i > 0 {
+            w.tick(every);
+        }
+        let (r, out) = w.run("apply").await;
+        assert!(exit_code(&r).is_some_and(|c| c == 0 || c == 3), "{r:?}\n{out}");
+        if w.terminated().len() >= n {
+            return i + 1;
+        }
+    }
+    max
+}
+
+/// RS1: a frozen copy that can't be made (its folder already there) or doesn't count equal is
+/// no backup — nothing terminated, the operator told.
+#[tokio::test]
+async fn rs1_no_terminate_without_a_frozen_copy() {
+    let (w, _a) = due_world("rs1-freeze", "").await;
+    // `reaped/` can't be created: a FILE where its folder goes.
+    std::fs::write(w.dir.join("snap/big/reaped"), "in the way").unwrap();
+    let (r, out) = w.run("apply").await;
+    assert!(w.terminated().is_empty(), "{out}");
+    assert_eq!(exit_code(&r), Some(3), "needs attention: {out}");
+    assert!(w.notified().iter().any(|l| l.contains("freeze_failed devtest-alpha")), "{:?}", w.notified());
+    assert!(w.store().read_log().unwrap().iter().any(|l| l.contains("\"row\":\"freeze_failed\"")));
+}
+
+/// RS2: a pod with files written in a sweep folder (which the reap's backup never copies), or
+/// data on another writable mount, is never reaped — and a recent notebook in a dot-directory is
+/// simply backed up (the reap tier keeps it).
+#[tokio::test]
+async fn rs2_uncovered_and_other_mounts_veto() {
+    for (tag, set) in [("sweep", (|s: &mut Sim| s.uncovered = "hit") as fn(&mut Sim)), ("mount", |s: &mut Sim| s.mounts = "has_data"), ("ws", |s: &mut Sim| s.workspace = "has_data")] {
+        let w = World::new(&format!("rs2-{tag}"), "");
+        let a = rp("devtest-alpha", "pa", 22001);
+        let mut sim = Sim::new("pa", "runpod");
+        set(&mut sim);
+        w.add(a.clone(), sim);
+        w.policy(&a, Some(600), Some(900));
+        for _ in 0..10 {
+            w.tick(300);
+            w.step("apply").await;
+        }
+        assert!(w.terminated().is_empty(), "{tag}");
+        assert_eq!(w.last_row(&a), Some(Row::NotCovered), "{tag}");
+        let ends = super::ends_column(&w.cfg, &[a.clone()], w.now(), 0).unwrap();
+        assert_eq!(ends[0], "not covered", "{tag}");
+    }
+}
+
+/// RS4: the deciding look is retaken right before the backup when it's over 60 s old (here:
+/// another pod's slow probe in the same round), and the post-backup look scans from exactly
+/// where the deciding look's scan began — nothing between the two goes unwatched.
+#[tokio::test]
+async fn rs4_the_deciding_look_is_fresh_and_the_post_backup_scan_starts_there() {
+    for (secs, looks) in [(59, 1), (61, 2)] {
+        let w = World::new(&format!("rs4-{secs}"), "");
+        let a = rp("devtest-alpha", "pa", 22001);
+        let b = rp("devtest-bravo", "pb", 22002);
+        w.add(a.clone(), Sim::new("pa", "runpod"));
+        w.add(b.clone(), Sim::new("pb", "runpod"));
+        w.policy(&a, None, Some(900));
+        w.policy(&b, None, Some(8 * 3600));
+        for i in 0..4 {
+            if i > 0 {
+                w.tick(300);
+            }
+            w.step("observe").await;
+        }
+        w.tick(300);
+        w.sim(22002, |s| s.probe_secs = secs);
+        let first = w.calls_to(22001).len();
+        let scans_before = w.remote.scans.lock().unwrap().len();
+        let (_, out) = w.run("apply").await;
+        assert_eq!(w.terminated(), [("runpod".to_string(), "pa".to_string())], "{secs}: {out}");
+        let calls: Vec<&str> = w.calls_to(22001)[first..].to_vec();
+        let git = calls.iter().position(|k| *k == "git").unwrap();
+        assert_eq!(calls[..git].iter().filter(|k| **k == "probe").count(), looks, "{secs} s: {calls:?}");
+        let scans: Vec<u64> = w.remote.scans.lock().unwrap()[scans_before..].iter().filter(|(h, _)| *h == host(22001)).map(|(_, t)| *t).collect();
+        let (deciding, post) = (scans[looks - 1], *scans.last().unwrap());
+        assert_eq!(post, deciding, "{secs} s: the post-backup scan starts where the deciding look's did ({scans:?})");
+    }
+}
+
+/// RS5: a `-new`/`-old` twin listed at the final relist stops the terminate (the review's test
+/// above); and `pods replace` / `migrate` refuse a pod whose reap is in progress (its
+/// write-ahead record), whatever this shell's ARENA_STATE_DIR.
+#[test]
+fn rs5_replace_refuses_a_pod_being_reaped() {
+    let w = World::new("rs5-repl", "");
+    let a = rp("devtest-alpha", "pa", 22001);
+    w.policy(&a, None, Some(900));
+    assert_eq!(super::reap_in_progress(&w.cfg, &a, "replace"), None);
+    store::write_ahead(&w.store(), "runpod:pa", "run-1", Trigger::Idle, T0).unwrap();
+    let why = super::reap_in_progress(&w.cfg, &a, "replace").unwrap();
+    assert!(why.starts_with("refusing to replace: the auto-reaper is reaping devtest-alpha") && why.contains("reap hold"), "{why}");
+    // Another pod, or no state at all: nothing.
+    assert_eq!(super::reap_in_progress(&w.cfg, &rp("devtest-bravo", "pb", 22002), "replace"), None);
+    assert_eq!(super::reap_in_progress(&Config::parse("MACHINE_NAME_PREFIX=devtest"), &a, "migrate"), None);
+}
+
+/// RS7: a dormant `nohup python train.py` (no CPU, no files, no session) is a process of its
+/// own — never reaped; a boot-time service restarted later, a login shell or tmux's server
+/// isn't; an unreadable process list is "can't tell".
+#[tokio::test]
+async fn rs7_a_dormant_process_vetoes_and_boot_services_dont() {
+    let cases: [(&str, Vec<(u64, u32, bool, &'static str)>, bool, Option<Row>); 5] = [
+        ("dormant job", vec![(3600, 901, false, "python")], false, Some(Row::Active)),
+        ("restarted jupyter", vec![(3600, 33, false, "jupyter-lab")], false, None),
+        ("login shell", vec![(3600, 77, true, "bash")], false, None),
+        ("tmux server", vec![(3600, 78, false, "tmux: server")], false, None),
+        ("unreadable", vec![], true, Some(Row::Unknown)),
+    ];
+    for (case, procs, unreadable, want) in cases {
+        let w = World::new(&format!("rs7-{}", case.replace(' ', "-")), "");
+        let a = rp("devtest-alpha", "pa", 22001);
+        let mut sim = Sim::new("pa", "runpod");
+        sim.procs = procs;
+        sim.procs_unreadable = unreadable;
+        w.add(a.clone(), sim);
+        w.policy(&a, None, Some(900));
+        let runs = run_until_reaped(&w, "apply", 300, 10).await;
+        match want {
+            Some(row) => {
+                assert!(w.terminated().is_empty(), "{case}");
+                assert_eq!(w.last_row(&a), Some(row), "{case}");
+            }
+            None => assert!(runs < 10 && w.terminated().len() == 1, "{case}: never reaped"),
+        }
+    }
+    // A process started during the backup: the post-backup look stops the terminate.
+    let (w, _a) = due_world("rs7-late", "").await;
+    w.sim(22001, |s| s.proc_after_git = Some((7200, 902, false, "python")));
+    w.step("apply").await;
+    assert!(w.terminated().is_empty());
+    assert!(w.store().read_log().unwrap().iter().any(|l| l.contains("post_backup_not_quiet") && l.contains("process")));
+}
+
+/// RS8: `REAP_ENABLED=0` written to the config file during the backup stops the terminate
+/// (`disabled_mid_run`); the write-ahead is cleared and no cap is lost beyond the attempt.
+#[tokio::test]
+async fn rs8_reap_enabled_off_mid_run_stops_the_terminate() {
+    let (w, a) = due_world("rs8-off", "").await;
+    w.sim(22001, |s| s.on_git = OnGit::Disable);
+    let (_, out) = w.run("apply").await;
+    assert!(w.terminated().is_empty(), "{out}");
+    assert!(w.store().read_log().unwrap().iter().any(|l| l.contains("\"row\":\"disabled_mid_run\"")));
+    assert!(w.state().pods[&core_reap::key("runpod", &a.id)].terminating.is_none());
+    // An unreadable config file at that point is "off" too.
+    let (w, _a) = due_world("rs8-gone", "").await;
+    let mut env = w.env();
+    env.config_file = Some(w.dir.join("no-such-config.env"));
+    let argv = ["arena", "pods", "reap", "run", "--apply"].map(String::from);
+    let super::super::Cmd::Pods(super::super::PodCmd::Reap(cmd)) = super::super::Cli::try_parse_from(argv).unwrap().cmd else { panic!() };
+    let _ = handle_reap(cmd, &env).await;
+    assert!(w.terminated().is_empty());
+    assert!(w.store().read_log().unwrap().iter().any(|l| l.contains("\"row\":\"disabled_mid_run\"")));
+}
+
+/// RS9: the backup volume unmounted after the run's check (here: during the git push) — the
+/// re-check right before the first write stops the reap: no rsync, nothing terminated.
+#[tokio::test]
+async fn rs9_a_volume_unmounted_before_the_writes_stops_the_reap() {
+    let (w, _a) = due_world("rs9-unmount", "").await;
+    w.sim(22001, |s| s.on_git = OnGit::Unmount);
+    let (r, out) = w.run("apply").await;
+    assert!(w.terminated().is_empty(), "{out}");
+    assert_eq!(exit_code(&r), Some(3), "{out}");
+    let order = w.order();
+    let git = order.iter().position(|l| l.starts_with("remote git")).unwrap();
+    assert!(!order[git..].iter().any(|l| l.starts_with("rsync")), "{order:#?}");
+    assert!(w.store().read_log().unwrap().iter().any(|l| l.contains("\"row\":\"dest_unhealthy\"")));
+}
+
+/// RS3: every state-changing reap command says which state file it wrote.
+#[tokio::test]
+async fn rs3_state_changes_name_the_state_file() {
+    let w = World::new("rs3-path", "");
+    let a = rp("devtest-alpha", "pa", 22001);
+    w.add(a.clone(), Sim::new("pa", "runpod"));
+    *w.fleet.strict.lock().unwrap() = false;
+    let path = w.store().state_path().display().to_string();
+    for args in [
+        vec!["set", "devtest-alpha", "--idle-after", "8h"],
+        vec!["pin", "devtest-alpha"],
+        vec!["unpin", "devtest-alpha"],
+        vec!["hold", "--reason", "drill"],
+        vec!["release"],
+        vec!["clear", "devtest-alpha"],
+    ] {
+        w.out.lock().unwrap().clear();
+        w.reap(&args).await.unwrap();
+        let out = w.out.lock().unwrap().join("\n");
+        assert!(out.contains(&format!("(state: {path})")), "{args:?}: {out}");
+    }
+}
+
+/// RS2: the reap's big tier is its own (`reap_tier`): the home's dot-directories are copied, the
+/// sweep folder isn't (and vetoes instead).
+#[tokio::test]
+async fn rs2_the_reaps_big_tier_keeps_dot_dirs() {
+    let (w, _a) = due_world("rs2-tier", "").await;
+    w.step("apply").await;
+    assert_eq!(w.terminated().len(), 1);
+    let args = std::fs::read_to_string(w.dir.join("big_args")).unwrap();
+    assert!(!args.contains("**/.*/"), "the reap's copy drops dot-directories:\n{args}");
+    assert!(args.contains("TEMP_FOLDER_FOR_SWEEPS/") && args.contains(".cache/"), "{args}");
 }

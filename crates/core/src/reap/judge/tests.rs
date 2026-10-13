@@ -139,7 +139,64 @@ fn prev(r: &Reply) -> Observation {
 
 fn classify_reply(r: &Reply, prev: Option<&Observation>, jobs: JobsOutcome, provider: &str) -> Observation {
     let facts = parse_probe(&r.render(), &r.nonce, r.since);
-    classify(prev, &facts, jobs, &ClassifyCtx { provider, listed_id: "pod1", now: r.now(), clock_ok: true })
+    classify(prev, &facts, jobs, &ClassifyCtx { provider, listed_id: "pod1", now: r.now(), clock_ok: true, baseline: None })
+}
+
+/// A process `name` started an hour after the fixture's container (PID 1 at 123456 jiffies, 100 Hz).
+fn late(name: &str) -> (u64, u32, bool, String) {
+    (123_456 + 3600 * 100, 4_000_000_001, false, name.to_string())
+}
+
+/// The fixture's processes plus `p`.
+fn with_proc(p: (u64, u32, bool, String)) -> Reply {
+    let mut r = Reply::default();
+    r.procs.as_mut().unwrap().push(p);
+    r
+}
+
+/// RS7: what counts as a process of its own, against the container's boot-time ones.
+#[test]
+fn late_processes_against_the_baseline() {
+    let facts = |r: &Reply| parse_probe(&r.render(), "N0NCE", r.since).unwrap();
+    let base = facts(&Reply::default());
+    let b = |hashes: &[u32]| ProcBaseline { container: CONTAINER.into(), hashes: hashes.iter().copied().collect() };
+    // The image's own processes, started at boot: nothing.
+    assert_eq!(late_process(&base, None), Some(false));
+    // Within BOOT_GRACE of PID 1: still the container's own; one jiffy past it: a process.
+    let at = |j: u64| with_proc((123_456 + j, 99, false, "svc".into()));
+    assert_eq!(late_process(&facts(&at(BOOT_GRACE * 100)), None), Some(false));
+    assert_eq!(late_process(&facts(&at(BOOT_GRACE * 100 + 1)), None), Some(true));
+    // Idle by itself: sshd's, systemd's, cron's own, tmux's server, a plain interactive shell.
+    for name in ["sshd", "sshd-session", "systemd", "(sd-pam)", "cron", "CRON", "tmux: server"] {
+        assert_eq!(late_process(&facts(&with_proc(late(name))), None), Some(false), "{name}");
+    }
+    let shell = (123_456 + 3600 * 100, 5, true, "bash".to_string());
+    assert_eq!(late_process(&facts(&with_proc(shell)), None), Some(false), "an interactive shell");
+    // Not: a script run by a shell (the probe's `p`), an editor, a kernel, mosh, a screen.
+    for name in ["bash", "vim", "python3", "mosh-server", "screen", "node"] {
+        assert_eq!(late_process(&facts(&with_proc(late(name))), None), Some(true), "{name}");
+    }
+    // A boot-time service restarted later (its command line's cksum in this container's
+    // baseline) isn't; the same cksum from another container's baseline doesn't count.
+    let restarted = facts(&with_proc((123_456 + 3600 * 100, 33, false, "jupyter-lab".into())));
+    assert_eq!(late_process(&restarted, None), Some(true));
+    assert_eq!(late_process(&restarted, Some(&b(&[33]))), Some(false));
+    let other = ProcBaseline { container: "x/1".into(), ..b(&[33]) };
+    assert_eq!(late_process(&restarted, Some(&other)), Some(true));
+    // Can't tell: no list, a capped list, no container start.
+    assert_eq!(late_process(&facts(&Reply { procs: None, ..Default::default() }), None), None);
+    assert_eq!(late_process(&facts(&Reply { proc_overflow: true, ..Default::default() }), None), None);
+    // The baseline: boot-time cksums, accumulated per container; a new container starts afresh;
+    // a failed look keeps what was known.
+    let first = next_baseline(None, &Ok(base.clone())).unwrap();
+    assert_eq!(first, b(&[11, 22, 33]));
+    let more = with_proc((123_456 + 50, 44, false, "late-boot".into()));
+    assert_eq!(next_baseline(Some(&first), &Ok(facts(&more))).unwrap(), b(&[11, 22, 33, 44]));
+    assert_eq!(next_baseline(Some(&first), &Ok(facts(&with_proc(late("python"))))).unwrap(), first, "a late process never joins");
+    let moved = Reply { pid1_start: "200000".into(), procs: Some(vec![(200_000, 7, false, "start.sh".into())]), ..Default::default() };
+    assert_eq!(next_baseline(Some(&first), &Ok(facts(&moved))).unwrap().hashes, [7].into_iter().collect());
+    assert_eq!(next_baseline(Some(&first), &Err(ProbeError::Failed)).unwrap(), first);
+    assert_eq!(next_baseline(None, &Ok(facts(&Reply { procs: None, ..Default::default() }))), None);
 }
 
 /// Spec R15–R23: each signal alone flips an idle pod to Active (with its reason) or Unknown;
@@ -199,6 +256,20 @@ fn classify_each_signal() {
         ("identity", Reply { id: "other".into(), ..Default::default() }, read0, Verdict::Unknown, Reason::Identity),
         ("identity empty", Reply { id: String::new(), ..Default::default() }, read0, Verdict::Unknown, Reason::Identity),
         ("container unknown", Reply { boot_id: String::new(), ..Default::default() }, read0, Verdict::Unknown, Reason::ContainerUnknown),
+        // RS2: never copied by the reap's backup, or outside what it reads.
+        ("sweep folder written", Reply { uncovered: "hit", ..Default::default() }, read0, Verdict::Active, Reason::Uncovered),
+        ("sweep scan timed out", Reply { uncovered: "timeout", ..Default::default() }, read0, Verdict::Unknown, Reason::FilesTimeout),
+        ("sweep scan failed", Reply { uncovered: "err", ..Default::default() }, read0, Verdict::Unknown, Reason::FilesError),
+        ("data on another mount", Reply { mounts: "has_data", ..Default::default() }, read0, Verdict::Active, Reason::OtherMount),
+        ("mounts unreadable", Reply { mounts: "err", ..Default::default() }, read0, Verdict::Unknown, Reason::MountsUnknown),
+        // RS6: a home that couldn't be resolved, or is a link to another filesystem.
+        ("home a cross-fs link", Reply { home: "link", ..Default::default() }, read0, Verdict::Unknown, Reason::HomeLink),
+        ("home unresolvable", Reply { home: "err", ..Default::default() }, read0, Verdict::Unknown, Reason::HomeUnknown),
+        // RS7: a process started after boot (a dormant `nohup python train.py`), or no list.
+        ("late process", with_proc(late("python")), read0, Verdict::Active, Reason::Process),
+        ("mosh-server", with_proc(late("mosh-server")), read0, Verdict::Active, Reason::Process),
+        ("processes unreadable", Reply { procs: None, ..Default::default() }, read0, Verdict::Unknown, Reason::ProcessesUnknown),
+        ("process list capped", Reply { proc_overflow: true, ..Default::default() }, read0, Verdict::Unknown, Reason::ProcessesUnknown),
     ];
     for (case, r, jobs, verdict, reason) in cases {
         let o = classify_reply(&r, Some(&prev(&r)), jobs, "runpod");
@@ -232,7 +303,7 @@ fn classify_each_signal() {
     assert!(classify_reply(&idle, Some(&unverified), read0, "runpod").reasons.contains(&Reason::NoBaseline));
     // Skew: 300 s ok, 301 s not. Drift: 120 s ok, 121 s not.
     let facts = parse_probe(&idle.render(), "N0NCE", idle.since);
-    let at = |now: u64, p: &Observation| classify(Some(p), &facts, read0, &ClassifyCtx { provider: "runpod", listed_id: "pod1", now, clock_ok: true });
+    let at = |now: u64, p: &Observation| classify(Some(p), &facts, read0, &ClassifyCtx { provider: "runpod", listed_id: "pod1", now, clock_ok: true, baseline: None });
     let mut p2 = prev(&idle);
     assert_eq!(at(idle.now() + 300, &Observation { t: idle.now() + 300 - 900, ..p2.clone() }).verdict, Verdict::Idle);
     let skewed = at(idle.now() + 301, &p2);
@@ -242,11 +313,11 @@ fn classify_each_signal() {
     p2.pod_t = Some(idle.now() - 900 - 121);
     assert_eq!(at(idle.now(), &p2).reasons, [Reason::Clock], "drift 121 s");
     // Unverified control clock: never Idle.
-    let o = classify(Some(&prev(&idle)), &facts, read0, &ClassifyCtx { provider: "runpod", listed_id: "pod1", now: idle.now(), clock_ok: false });
+    let o = classify(Some(&prev(&idle)), &facts, read0, &ClassifyCtx { provider: "runpod", listed_id: "pod1", now: idle.now(), clock_ok: false, baseline: None });
     assert_eq!((o.verdict, o.clock_ok), (Verdict::Unknown, false));
     // A failed or garbled probe, or one about another pod, keeps no counters (no baseline).
     for f in [Err(ProbeError::Failed), Err(ProbeError::Garbled), parse_probe(&Reply { id: "x".into(), ..Default::default() }.render(), "N0NCE", Since::Back(900))] {
-        let o = classify(None, &f, read0, &ClassifyCtx { provider: "runpod", listed_id: "pod1", now: idle.now(), clock_ok: true });
+        let o = classify(None, &f, read0, &ClassifyCtx { provider: "runpod", listed_id: "pod1", now: idle.now(), clock_ok: true, baseline: None });
         assert_eq!(o.verdict, Verdict::Unknown);
         assert!(o.cpu_usec.is_none() && o.net_bytes.is_none(), "{o:?}");
     }
@@ -257,7 +328,7 @@ fn classify_each_signal() {
 #[test]
 fn quiet_now_ignores_cumulative_counters() {
     let r = Reply::default();
-    let ctx = QuietCtx { provider: "runpod", id: "pod1", container: CONTAINER, now: r.now() };
+    let ctx = QuietCtx { provider: "runpod", id: "pod1", container: CONTAINER, now: r.now(), baseline: None };
     let facts = parse_probe(&r.render(), "N0NCE", r.since);
     assert!(quiet_now(&facts, JobsOutcome::Read { busy: 0 }, &ctx).is_ok());
     // A huge CPU/network count since any earlier look doesn't matter: nothing to compare with.
@@ -452,6 +523,11 @@ fn good_backup() -> BackupEvidence {
         verify: ok("Number of regular files transferred: 0\n"),
         snapshot_dir: "/b/w1d1/devtest-alpha/".into(),
         big_dir: "/big/devtest-alpha/".into(),
+        frozen: Some(Frozen {
+            snapshot_dir: "/b/reaped/devtest-alpha/20261012T000000Z-runpod-pod1/snapshot".into(),
+            big_dir: "/big/reaped/devtest-alpha/20261012T000000Z-runpod-pod1/big".into(),
+            matched: true,
+        }),
     }
 }
 
@@ -471,9 +547,15 @@ struct Bundle {
     quiet_jobs: JobsOutcome,
     quiet_at: u64,
     relist: Option<Option<Pod>>,
+    /// Every other pod the final re-listing returned (all providers that answered).
+    others: Vec<Pod>,
     relist_at: u64,
     relist_now: u64,
     state: ReapState,
+    /// The config file's `REAP_ENABLED` and the state's hold, re-read right before the
+    /// terminate (RS8).
+    enabled_now: bool,
+    held_now: bool,
 }
 
 fn bundle() -> Bundle {
@@ -492,14 +574,18 @@ fn bundle() -> Bundle {
         wal_saved: true,
         wal_at: T + 1,
         backup: good_backup(),
-        quiet: Reply { t0: T + 130 - 22, ..Default::default() },
+        // The post-backup look scans from where the deciding look's scan started (RS4).
+        quiet: Reply { t0: T + 130 - 22, since: Since::At(T - MAX_GAP - SCAN_MARGIN), ..Default::default() },
         quiet_facts: Err(ProbeError::Failed),
         quiet_jobs: JobsOutcome::Read { busy: 0 },
         quiet_at: T + 130,
         relist: Some(Some(pod)),
+        others: vec![rp("devtest-bravo", "pod2"), hz("devtest-charlie", "h3")],
         relist_at: T + 140,
         relist_now: T + 141,
         state,
+        enabled_now: true,
+        held_now: false,
     }
     .requiet()
 }
@@ -522,15 +608,17 @@ fn try_ticket(b: &Bundle) -> Option<ReapTicket> {
     let trigger = TriggerProof::from_decision(&b.policy, &b.decision, b.decided_now).ok()?;
     let wal = b.wal_saved.then(|| WriteAheadProof::saved(trigger.key(), b.wal_at))?;
     let backup = BackupProof::check(&b.backup).ok()?;
-    let qctx = QuietCtx { provider: "runpod", id: &b.policy.id, container: trigger.container(), now: b.quiet_at };
+    let qctx = QuietCtx { provider: "runpod", id: &b.policy.id, container: trigger.container(), now: b.quiet_at, baseline: b.policy.proc_baseline.as_ref() };
     let quiet = quiet_now(&b.quiet_facts, b.quiet_jobs, &qctx).ok()?;
     let listed = match &b.relist {
         None => Listed::Failed,
         Some(None) => Listed::Gone,
         Some(Some(p)) => Listed::Pod(p),
     };
-    let relist = relist_verdict(listed, trigger.key(), &b.policy.name, b.relist_at, b.relist_now).ok()?;
+    let all_ok: Vec<Pod> = b.relist.iter().flatten().cloned().chain(b.others.iter().cloned()).collect();
+    let relist = relist_verdict(listed, &all_ok, trigger.key(), &b.policy.name, b.relist_at, b.relist_now).ok()?;
     let recheck = recheck_state(&b.state, trigger.key(), trigger.trigger(), &b.policy.observations, b.relist_now).ok()?;
+    let run = run.still(b.enabled_now, b.held_now).ok()?;
     ReapTicket::issue(run, trigger, wal, backup, quiet, relist, recheck).ok()
 }
 
@@ -574,6 +662,34 @@ fn faults() -> Vec<Fault> {
         ("backup of another container", |b| b.backup.container = "other/1".into()),
         ("backup before the decision", |b| b.backup.started = T - 1),
         ("backup of another pod", |b| b.backup.key = "runpod:other".into()),
+        ("backup not frozen", |b| b.backup.frozen = None),
+        ("frozen copy doesn't match", |b| b.backup.frozen.iter_mut().for_each(|f| f.matched = false)),
+        ("frozen into the live snapshot dir", |b| { let d = b.backup.snapshot_dir.clone(); b.backup.frozen.iter_mut().for_each(|f| f.snapshot_dir.clone_from(&d)) }),
+        ("frozen into the live big dir", |b| { let d = b.backup.big_dir.clone(); b.backup.frozen.iter_mut().for_each(|f| f.big_dir.clone_from(&d)) }),
+        ("quiet scan starts after the decision's", |b| {
+            b.quiet.since = Since::At(T - MAX_GAP - SCAN_MARGIN + 1);
+            requiet(b)
+        }),
+        ("a process started after the backup", |b| {
+            b.quiet.procs.get_or_insert_with(Vec::new).push((900_000, 77, false, "python".into()));
+            requiet(b)
+        }),
+        ("process list unreadable after", |b| {
+            b.quiet.procs = None;
+            requiet(b)
+        }),
+        ("sweep folder written", |b| {
+            b.quiet.uncovered = "hit";
+            requiet(b)
+        }),
+        ("data on another mount", |b| {
+            b.quiet.mounts = "has_data";
+            requiet(b)
+        }),
+        ("home unresolvable", |b| {
+            b.quiet.home = "err";
+            requiet(b)
+        }),
         ("quiet probe failed", |b| {
             b.quiet.nonce = "LOST".into();
             requiet(b)
@@ -612,6 +728,11 @@ fn faults() -> Vec<Fault> {
         ("locked since", |b| b.relist = Some(Some(Pod { locked: Some(true), ..rp("devtest-alpha", "pod1") }))),
         ("lock state unknown", |b| b.relist = Some(Some(Pod { locked: None, ..rp("devtest-alpha", "pod1") }))),
         ("relist stale", |b| b.relist_now = b.relist_at + RELIST_MAX_AGE + 1),
+        ("a -new twin listed at the relist", |b| b.others.push(rp("devtest-alpha-new", "pod9"))),
+        ("a -old twin listed elsewhere", |b| b.others.push(hz("devtest-alpha-old", "h9"))),
+        ("another pod of the same name", |b| b.others.push(hz("devtest-alpha", "h8"))),
+        ("REAP_ENABLED=0 mid-run", |b| b.enabled_now = false),
+        ("held mid-run", |b| b.held_now = true),
         ("relist before the quiet probe", |b| b.relist_at = T + 120),
         ("hold since", |b| b.state.hold = Some(Hold { reason: "x".into(), set_at: T, auto: false })),
         ("pinned since", |b| b.state.pins.push(Pin { name: "devtest-alpha".into(), id: None, until: None, note: None, set_at: T })),

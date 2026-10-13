@@ -6,7 +6,7 @@
 //! the bash/python scripts use — no migration required.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 
@@ -14,6 +14,12 @@ use crate::error::{Error, Result};
 pub struct Config {
     pub values: HashMap<String, String>,
     pub machine_names: Vec<String>,
+    /// What the FILE itself says, before the environment's overrides — for the settings only
+    /// the file may decide ([`Config::file_value`]).
+    file: HashMap<String, String>,
+    /// The file this was loaded from ([`Config::load`]) — what a reap re-reads `REAP_ENABLED`
+    /// from right before a terminate (`arena_core::reap`, RS8). `None` for a parsed text.
+    source: Option<PathBuf>,
 }
 
 impl Config {
@@ -22,7 +28,20 @@ impl Config {
             .map_err(|e| Error::Config(format!("reading {}: {e}", path.display())))?;
         let mut cfg = Self::parse(&text);
         cfg.apply_overrides(|k| std::env::var(k).ok());
+        cfg.source = Some(path.to_path_buf());
         Ok(cfg)
+    }
+
+    /// The file this config was loaded from, if any.
+    pub fn source(&self) -> Option<&Path> {
+        self.source.as_deref()
+    }
+
+    /// This config, as read from `path` by the caller itself (no environment applied) — a
+    /// test's hermetic stand-in for [`Config::load`].
+    pub fn with_source(mut self, path: &Path) -> Self {
+        self.source = Some(path.to_path_buf());
+        self
     }
 
     /// A few arena-specific keys that are commonly *absent* from a shared config but
@@ -131,11 +150,17 @@ impl Config {
             }
         }
 
-        Config { values, machine_names }
+        Config { file: values.clone(), values, machine_names, source: None }
     }
 
     pub fn get(&self, key: &str) -> Option<&str> {
         self.values.get(key).map(String::as_str)
+    }
+
+    /// `key` as the config FILE sets it, whatever the environment says (`None`: the file doesn't
+    /// set it). For settings whose authority is the file alone — the reaper's state dir.
+    pub fn file_value(&self, key: &str) -> Option<&str> {
+        self.file.get(key).map(String::as_str)
     }
 
     pub fn require(&self, key: &str) -> Result<&str> {
@@ -289,6 +314,47 @@ MACHINE_NAME_LIST=(
         let mut c = Config::parse("IMAGE=base:1");
         c.apply_overrides(|k| (k == "BACKUP_TIMEOUT_SECS").then(|| "600".to_string()));
         assert_eq!(c.get("BACKUP_TIMEOUT_SECS"), Some("600"));
+    }
+
+    /// REVIEW RS3 (fails today): the reaper's whole authority AND every veto (`reap hold`,
+    /// `reap pin`, `reap clear`) live in `$ARENA_STATE_DIR/<prefix>/reap.json`. The config FILE —
+    /// what root's reap cron reads — names that dir, but an operator shell that exports another
+    /// ARENA_STATE_DIR (allowed: "lets the sandbox, a cron job or a test point it somewhere
+    /// explicit") silently overrides it. `reap hold` / `reap pin` typed in that shell then land
+    /// in a state file the cron never reads — and print success without naming the file.
+    #[test]
+    fn review_rs3_env_must_not_redirect_the_reapers_state_dir() {
+        let mut c = Config::parse("ARENA_STATE_DIR=/var/lib/arena\nMACHINE_NAME_PREFIX=arena9");
+        c.apply_overrides(|k| (k == "ARENA_STATE_DIR").then(|| "/home/dev/.arena-state".to_string()));
+        // Fix (RS3): the reaper never follows the environment's dir — it refuses, naming both.
+        let e = crate::snapshot::state_dir_explicit(&c).unwrap_err();
+        assert!(e.contains("/home/dev/.arena-state") && e.contains("/var/lib/arena") && e.contains("file's only"), "{e}");
+        // The same value from both: fine. The environment alone (no file value): refused too.
+        let mut same = Config::parse("ARENA_STATE_DIR=/var/lib/arena\nMACHINE_NAME_PREFIX=arena9");
+        same.apply_overrides(|k| (k == "ARENA_STATE_DIR").then(|| "/var/lib/arena".to_string()));
+        assert_eq!(crate::snapshot::state_dir_explicit(&same).unwrap(), std::path::Path::new("/var/lib/arena/arena9"));
+        let mut env_only = Config::parse("MACHINE_NAME_PREFIX=arena9");
+        env_only.apply_overrides(|k| (k == "ARENA_STATE_DIR").then(|| "/var/lib/arena".to_string()));
+        assert!(crate::snapshot::state_dir_explicit(&env_only).unwrap_err().contains("isn't set in the config file"));
+        // The health cache still follows the environment, as documented.
+        assert!(crate::snapshot::health_cache_path_for(&c).unwrap().starts_with("/home/dev/.arena-state"));
+        // A read that must find the reaper's record whatever the shell exports (`pods replace`
+        // checking for a reap in progress) uses the file's, and never the environment's alone.
+        assert_eq!(crate::snapshot::state_dir_in_file(&c).unwrap(), std::path::Path::new("/var/lib/arena/arena9"));
+        assert!(crate::snapshot::state_dir_in_file(&env_only).is_err());
+        assert!(crate::snapshot::state_dir_in_file(&Config::parse("ARENA_STATE_DIR=rel/dir")).unwrap_err().contains("absolute"));
+    }
+
+    /// RS8: a loaded config remembers its file (what a reap re-reads `REAP_ENABLED` from right
+    /// before a terminate); a parsed text has none.
+    #[test]
+    fn a_loaded_config_knows_its_file() {
+        let p = std::env::temp_dir().join(format!("arena-config-source-{}.env", std::process::id()));
+        std::fs::write(&p, "REAP_ENABLED=1\n").unwrap();
+        let c = Config::load(&p).unwrap();
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(c.source(), Some(p.as_path()));
+        assert_eq!(Config::parse("REAP_ENABLED=1").source(), None);
     }
 
     /// The reaper's switch and limits come from the file alone: the environment can neither

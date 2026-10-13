@@ -322,6 +322,122 @@ impl PullConfig {
     pub fn big_tier() -> Self {
         Self { max_size: None, min_size: None, ..Self::default() }
     }
+
+    /// The auto-reaper's final copy (`crate::reap`, RS2): the big tier, but keeping EVERYTHING
+    /// in the home except [`REAP_NOT_KEPT`] — dot-directories included (`~/.config`,
+    /// `~/.ipython`, `~/.jupyter`, `~/.local/bin`, `~/.arena/jobs` logs, VS Code's local history …),
+    /// which the regular tiers drop. What it still doesn't keep is either reconstructable or
+    /// a secret ([`REAP_NOT_KEPT`]: documented, never a veto) or a sweep folder
+    /// ([`REAP_VETOED`]: never copied, and a pod with anything written there since its
+    /// container started is never reaped — the probe's `uncovered` fact). Never deletes.
+    pub fn reap_tier() -> Self {
+        let mut s = Self::big_tier();
+        s.excludes = REAP_NOT_KEPT.iter().chain(REAP_VETOED).map(|e| e.to_string()).collect();
+        s
+    }
+}
+
+/// What a reap's backup ([`PullConfig::reap_tier`]) leaves out because it is reconstructable,
+/// a cache, a secret or ours — the documented list a reap may lose, never a veto: package and
+/// build caches (`.cache/` — pip, uv, Hugging Face hub, torch —, `__pycache__/`, `.npm/`,
+/// `.triton/`, `.nv/`), installed packages (`site-packages/`, `venv/`, `.venv/`, `node_modules/`,
+/// `~/.local/lib/` — pip `--user` —, uv's Pythons), Hugging Face download caches (`hf_cache/`,
+/// `huggingface/`, `models--*/`, `datasets--*/` — public, re-downloadable), the VS Code server's
+/// own binaries and extensions (setup reinstalls them; its `data/` — settings, local history —
+/// IS kept), `.ssh/` (keys: setup's, and secrets a backup volume shouldn't hold), and the
+/// image's checkout setup moved aside when the repo went onto `/workspace` (a copy from the
+/// image, as the regular tiers skip it; a pod with work on `/workspace` is never reaped).
+pub const REAP_NOT_KEPT: &[&str] = &[
+    ".cache/",
+    "__pycache__/",
+    ".npm/",
+    ".triton/",
+    ".nv/",
+    "site-packages/",
+    "venv/",
+    ".venv/",
+    "node_modules/",
+    "/.local/lib/",
+    "/.local/share/uv/",
+    "hf_cache/",
+    "huggingface/",
+    "models--*/",
+    "datasets--*/",
+    "/.vscode-server/bin/",
+    "/.vscode-server/cli/",
+    "/.vscode-server/extensions/",
+    ".ssh/",
+    "*.arena-aside-*/",
+];
+
+/// What a reap's backup never copies AND never loses: sweep/RLVR run folders (large; "do all
+/// run work here"). A pod with any file there written since its container started is
+/// `NotCovered` — never reaped (the probe's `uncovered`, RS2).
+pub const REAP_VETOED: &[&str] = &["TEMP_FOLDER_FOR_SWEEPS/"];
+
+/// Counts of a tree: regular files, their bytes, directories, symlinks, and anything else
+/// (devices, fifos, sockets) — what a frozen copy is checked against ([`link_tree`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TreeCount {
+    pub files: u64,
+    pub bytes: u64,
+    pub dirs: u64,
+    pub links: u64,
+    pub other: u64,
+}
+
+/// Count `root`'s tree (never following a symlink).
+pub fn tree_count(root: &Path) -> std::io::Result<TreeCount> {
+    let mut c = TreeCount::default();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(&dir)? {
+            let e = e?;
+            let t = e.file_type()?;
+            if t.is_dir() {
+                c.dirs += 1;
+                stack.push(e.path());
+            } else if t.is_symlink() {
+                c.links += 1;
+            } else if t.is_file() {
+                c.files += 1;
+                c.bytes += e.metadata()?.len();
+            } else {
+                c.other += 1;
+            }
+        }
+    }
+    Ok(c)
+}
+
+/// `cp -al src dst`: a hard-link copy of the tree `src` at `dst` (which must not exist; its
+/// parent is created) — directories made anew, symlinks re-created as links, everything else
+/// (regular files, and a fifo or socket rsync carried) hard-linked: same filesystem, no space
+/// used, and a later rsync into `src` writes a changed file as a NEW inode, so the copy keeps
+/// what it had. Returns the counts of the copy, for the caller to hold against `src`'s.
+pub fn link_tree(src: &Path, dst: &Path) -> std::io::Result<TreeCount> {
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::create_dir(dst)?;
+    let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
+    while let Some((from, to)) = stack.pop() {
+        for e in std::fs::read_dir(&from)? {
+            let e = e?;
+            let t = e.file_type()?;
+            let target = to.join(e.file_name());
+            if t.is_dir() {
+                std::fs::create_dir(&target)?;
+                stack.push((e.path(), target));
+            } else if t.is_symlink() {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(std::fs::read_link(e.path())?, &target)?;
+            } else {
+                std::fs::hard_link(e.path(), &target)?;
+            }
+        }
+    }
+    tree_count(dst)
 }
 
 /// The default wall-clock budget for one pod's backup rsync (`BACKUP_TIMEOUT_SECS`): 2 hours.
@@ -1836,5 +1952,118 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let back: Vec<String> = String::from_utf8_lossy(&o.stdout).lines().map(String::from).collect();
         assert_eq!(back, rsync_args(&target(), &pc, dest), "{line}");
+    }
+
+    /// RS2: the reap's tier through the real rsync — what it keeps (dot-directories with work
+    /// in them, `.git`, `.claude`, shell rc files, big files) and what it leaves out (only the
+    /// documented caches, secrets and the sweep folder).
+    #[cfg(unix)]
+    #[test]
+    fn the_reap_tier_keeps_participant_data() {
+        if std::process::Command::new("rsync").arg("--version").output().is_err() {
+            eprintln!("rsync not installed — skipping");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("arena-pull-reaptier-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (src, dst) = (root.join("src"), root.join("dst"));
+        let kept = [
+            "notes.txt",
+            "work/model.pt",
+            "ARENA_materials/.git/HEAD",
+            "ARENA_materials/chapter1/solutions.ipynb",
+            ".ipython/profile_default/history.sqlite",
+            ".jupyter/lab/workspaces/default.json",
+            ".config/wandb/settings",
+            ".local/bin/mytool",
+            ".local/share/jupyter/kernels/k.json",
+            ".vscode-server/data/User/History/1/entry.py",
+            ".claude/projects/p.jsonl",
+            ".arena/jobs/20261012-1/out.log",
+            ".bashrc",
+            ".hidden_scratch/run.py",
+        ];
+        let not_kept = [
+            ".cache/pip/wheel",
+            "ARENA_materials/__pycache__/m.pyc",
+            "venv/lib/x.py",
+            ".venv/lib/x.py",
+            "node_modules/x/index.js",
+            ".local/lib/python3.11/site-packages/x.py",
+            ".local/share/uv/python/p",
+            "hf_cache/models--gpt2/blob",
+            "data/huggingface/hub/x",
+            ".vscode-server/bin/abc/node",
+            ".vscode-server/extensions/ms-python/x",
+            ".ssh/id_ed25519",
+            ".triton/cache/x",
+            "ARENA_materials/TEMP_FOLDER_FOR_SWEEPS/run1/ckpt.pt",
+            "ARENA_materials.arena-aside-20261001T000000Z/README.md",
+        ];
+        for f in kept.iter().chain(&not_kept) {
+            let p = src.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, f).unwrap();
+        }
+        std::fs::create_dir_all(&dst).unwrap();
+        let mut args = rsync_args(&target(), &PullConfig::reap_tier(), &format!("{}/", dst.display()));
+        let e = args.iter().position(|a| a == "-e").unwrap();
+        args.drain(e..e + 2);
+        let n = args.len();
+        args[n - 2] = format!("{}/", src.display());
+        let out = std::process::Command::new("rsync").args(&args).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        for f in kept {
+            assert!(dst.join(f).is_file(), "the reap's backup must keep {f}");
+        }
+        for f in not_kept {
+            assert!(!dst.join(f).exists(), "documented as not kept, yet copied: {f}");
+        }
+        // The documented list is the whole filter: no other exclude, no size cap.
+        let pc = PullConfig::reap_tier();
+        assert!(pc.max_size.is_none() && pc.min_size.is_none() && pc.first_excludes.is_empty());
+        assert_eq!(pc.excludes, REAP_NOT_KEPT.iter().chain(REAP_VETOED).map(|e| e.to_string()).collect::<Vec<_>>());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// RS1: a frozen copy (`link_tree`) holds the tree as it was — counted equal, every kind of
+    /// entry carried — and a later rsync into the original (a same-named successor's pull)
+    /// changes nothing in it: rsync writes a changed file as a new inode.
+    #[cfg(unix)]
+    #[test]
+    fn a_frozen_copy_survives_a_later_pull_into_the_original() {
+        let root = std::env::temp_dir().join(format!("arena-pull-freeze-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (live, frozen, next) = (root.join("big/devtest-alpha"), root.join("reaped/devtest-alpha/S-runpod-p1/big"), root.join("next"));
+        std::fs::create_dir_all(live.join("sub/empty")).unwrap();
+        std::fs::write(live.join("notebook.ipynb"), "v1 of the participant's work").unwrap();
+        std::fs::write(live.join("sub/data.bin"), [0u8; 4096]).unwrap();
+        std::os::unix::fs::symlink("notebook.ipynb", live.join("latest")).unwrap();
+        let fifo = live.join("sub/pipe");
+        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        let before = tree_count(&live).unwrap();
+        assert_eq!(before, TreeCount { files: 2, bytes: 28 + 4096, dirs: 2, links: 1, other: 1 });
+        assert_eq!(link_tree(&live, &frozen).unwrap(), before, "the copy counts equal, the fifo too");
+        assert!(link_tree(&live, &frozen).is_err(), "never into an existing folder");
+        assert_eq!(std::fs::read_link(frozen.join("latest")).unwrap(), Path::new("notebook.ipynb"));
+        if std::process::Command::new("rsync").arg("--version").output().is_ok() {
+            // A successor's pull, through the real rsync with the backup tiers' flags.
+            std::fs::create_dir_all(&next).unwrap();
+            std::fs::write(next.join("notebook.ipynb"), "the successor's own").unwrap();
+            let mut args = rsync_args(&target(), &PullConfig::big_tier(), &format!("{}/", live.display()));
+            let e = args.iter().position(|a| a == "-e").unwrap();
+            args.drain(e..e + 2);
+            let n = args.len();
+            args[n - 2] = format!("{}/", next.display());
+            let out = std::process::Command::new("rsync").args(&args).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            assert_eq!(std::fs::read_to_string(live.join("notebook.ipynb")).unwrap(), "the successor's own");
+        } else {
+            std::fs::write(live.join(".tmp"), "the successor's own").unwrap();
+            std::fs::rename(live.join(".tmp"), live.join("notebook.ipynb")).unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(frozen.join("notebook.ipynb")).unwrap(), "v1 of the participant's work");
+        assert_eq!(tree_count(&frozen).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

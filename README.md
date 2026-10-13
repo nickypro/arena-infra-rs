@@ -634,22 +634,42 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     idle for a window (`--idle-after 8h`), **after a verified backup and only when every check
     is certain** — anything it can't confirm (an unreachable pod, a probe it can't read, a
     failed listing, an unverified clock, a lock, a pin, `~/.arena/keep` on the pod, data on
-    `/workspace`) means "do nothing and log it". Off by default in layers: a pod needs a policy
+    `/workspace` or another writable mount, files written in a `TEMP_FOLDER_FOR_SWEEPS/` since
+    the container started, a home that's a link to another filesystem, a process list it
+    can't read) means "do nothing and log it". Off by default in layers: a pod needs a policy
     (`reap set <names> …`, or `pods up/create --expire-in/--expire-at/--idle-after`, recorded
     the moment each create returns); `reap run` alone only probes (read-only) and prints the
     plan (`WOULD TERMINATE`); `reap run --apply` acts only with `REAP_ENABLED=1` **in the config
     file** (the environment can't set any `REAP_*` key), no hold, an NTP-synced clock and, with
     no terminal, `--yes` — at most `REAP_MAX_PER_RUN` (default 1) per run and
-    `REAP_MAX_PER_DAY` (10) per 24 h. Acting on a pod: a durable write-ahead, the git push and
-    both rsync tiers under the pod's backup lock (every pod-side step behind its identity
-    check), a dry-run verify of the big tier (0 files pending), a post-backup quiet check (same
-    id and container, nothing new since the backup started), a fresh re-listing (same id/name,
-    RUNNING, lock reported off) and a state re-read (no hold, no new pin, still due) — then one
-    terminate, routed by provider name. Expiry never takes a pod in use or unreachable: it's
+    `REAP_MAX_PER_DAY` (10) per 24 h. Acting on a pod: the deciding look taken again if over
+    60 s old, a durable write-ahead, the git push, the tier roots' markers and free space
+    checked again, both rsync tiers under the pod's backup lock (every pod-side step behind
+    its identity check) — the big tier as the reap's own copy, which keeps the home's
+    dot-directories and leaves out only documented caches and secrets (`.cache`, venvs and
+    `site-packages`, Hugging Face downloads, the VS Code server's binaries, `.ssh`) — a
+    dry-run verify (0 files pending), then the verified dirs **frozen**: hard-linked (same
+    filesystem, no space) into `<root>/reaped/<name>/<UTC stamp>-<provider>-<id>/snapshot` and
+    `<big root>/reaped/…/big`, counted equal to what was verified — a later same-named pod's
+    pulls never touch that copy, and nothing in arena writes or deletes under `reaped/`.
+    Then a post-backup quiet check (same id and container; nothing changed since the deciding
+    look's scan began; no process started since boot that isn't the container's own), a
+    fresh re-listing (same id/name, RUNNING, lock reported off, no `-new`/`-old` twin, no
+    second pod of that name), a state re-read (no hold, no new pin, still due) and
+    `REAP_ENABLED` re-read from the config file — then one terminate, routed by provider name.
+    **Processes**: a process started after the container's first two minutes counts as use —
+    a dormant `nohup python train.py`, a kernel, an editor, `mosh-server`, a `screen` —
+    unless it's a restart of one of the container's own boot-time services (by its command
+    line), a plain interactive shell, tmux's server (its panes are judged: a non-shell
+    foreground counts), sshd's or cron's own, or the login's `systemd --user`. To stop a run
+    mid-way: `arena pods reap hold` (or `REAP_ENABLED=0` in the file) — checked again right
+    before the terminate. `pods replace`/`migrate copy`/`cutover` refuse a pod being reaped. Expiry never takes a pod in use or unreachable: it's
     deferred (`OVERDUE (in use)` / `(unreachable)` in `pods list`'s ENDS column) and notified at
     most every 6 h (`REAP_NOTIFY_CMD`, one line on stdin). A terminate error other than
-    "locked" sets an automatic hold. Needs an explicit absolute `ARENA_STATE_DIR` (state:
-    `reap.json`, log: `reap-log.jsonl`), RunPod on `RUNPOD_API=v2` (v1 and Vast are never
+    "locked" sets an automatic hold. Needs an explicit absolute `ARENA_STATE_DIR` **in the
+    config file** (state: `reap.json`, log: `reap-log.jsonl`) — a shell exporting a different
+    one is refused (it would put a `hold` where the cron never looks); every state change
+    prints the file it wrote — RunPod on `RUNPOD_API=v2` (v1 and Vast are never
     reaped), absolute `LOCAL_BACKUP_DIR`, a `.arena-backup-tier` marker on each backup root
     (`snapshot` / `big`; the big tier's root is `LOCAL_BACKUP_BIG_DIR`, default
     `<LOCAL_BACKUP_DIR>/big`), `ARENA_START_DATE` and no `BACKUP_REMOTE_PATH`; `config check`

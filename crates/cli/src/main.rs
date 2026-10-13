@@ -4091,9 +4091,10 @@ fn cron_lines(job: &CronJob) -> Vec<(CronKind, String)> {
 /// The auto-reaper's cron line for `cron install --reap observe|apply`
 /// (`arena_core::reap::render::cron_line`). Refuses `apply` unless the config FILE says
 /// `REAP_ENABLED=1` (observe first, review the log, then switch it on); needs valid REAP_*
-/// settings and an explicit, absolute ARENA_STATE_DIR. ARENA_STATE_DIR and ARENA_START_DATE are
-/// written into the line when they come from the environment rather than the file (cron
-/// doesn't inherit a shell's environment).
+/// settings and an explicit, absolute ARENA_STATE_DIR in the config FILE (the reaper reads the
+/// file's only — RS3 — so a hold set from any shell lands where the cron looks).
+/// ARENA_START_DATE is written into the line when it comes from the environment rather than the
+/// file (cron doesn't inherit a shell's environment).
 fn reap_cron_line(apply: bool, config_path: &std::path::Path, exe: &str, cfg_abs: &str, home: &str) -> Result<String> {
     let text = std::fs::read_to_string(config_path).with_context(|| format!("reading {}", config_path.display()))?;
     let file = Config::parse(&text);
@@ -4107,12 +4108,9 @@ fn reap_cron_line(apply: bool, config_path: &std::path::Path, exe: &str, cfg_abs
     arena_core::reap::ReapSettings::from_config(&cfg).map_err(|e| anyhow::anyhow!("--reap: {e}"))?;
     arena_core::snapshot::state_dir_explicit(&cfg).map_err(|e| anyhow::anyhow!("--reap: {e}"))?;
     let mut env = Vec::new();
-    for key in ["ARENA_STATE_DIR", "ARENA_START_DATE"] {
-        if file.get(key).is_some() {
-            continue;
-        }
-        let Some(v) = cfg.get(key).map(str::trim).filter(|v| !v.is_empty()) else { continue };
-        if key == "ARENA_START_DATE" && arena_core::schedule::parse_ymd(v).is_none() {
+    let key = "ARENA_START_DATE";
+    if let (None, Some(v)) = (file.get(key), cfg.get(key).map(str::trim).filter(|v| !v.is_empty())) {
+        if arena_core::schedule::parse_ymd(v).is_none() {
             anyhow::bail!("--reap: ARENA_START_DATE must be YYYY-MM-DD (got {v})");
         }
         if v.chars().any(|c| c.is_whitespace() || c == '%' || c == '\'' || c == '"') {
@@ -6588,6 +6586,7 @@ async fn handle_pods_with(
                 resolve_local: &reap::real::resolve_local,
                 out: &|l: &str| println!("{l}"),
                 sync_proxy: true,
+                config_file: cfg.source().map(std::path::Path::to_path_buf),
             };
             reap::handle_reap(cmd, &env).await?;
         }
@@ -9526,9 +9525,14 @@ async fn migrate_copy_on(
     if let (Some(r), false) = (&stopped, dry_run) {
         anyhow::bail!("{r}");
     }
+    // Not from a pod the auto-reaper is terminating right now (RS5).
+    let reaping = reap::reap_in_progress(cfg, &src, "migrate");
+    if let (Some(r), false) = (&reaping, dry_run) {
+        anyhow::bail!("{r}");
+    }
 
     if dry_run {
-        if let Some(r) = &stopped {
+        for r in [&stopped, &reaping].into_iter().flatten() {
             print_would_refuse(r);
         }
         println!("migrate copy {canonical} (dry-run):");
@@ -9710,6 +9714,11 @@ async fn migrate_cutover_on(
     if let (Some(r), false) = (&locked, dry_run) {
         anyhow::bail!("{r}");
     }
+    // Nor while the auto-reaper is terminating it (RS5).
+    let reaping = reap::reap_in_progress(cfg, &src, "cut over");
+    if let (Some(r), false) = (&reaping, dry_run) {
+        anyhow::bail!("{r}");
+    }
     let write_only = if skip_proxy { None } else { write_only_proxy(cfg) };
     let sync_line = if no_final_sync {
         format!(
@@ -9729,7 +9738,7 @@ async fn migrate_cutover_on(
     };
 
     if dry_run {
-        if let Some(r) = &locked {
+        for r in [&locked, &reaping].into_iter().flatten() {
             print_would_refuse(r);
         }
         println!("migrate cutover {canonical} (dry-run):");
@@ -10187,6 +10196,11 @@ async fn replace_on(
     if let (Some(r), false) = (&stopped, dry_run) {
         anyhow::bail!("{r}");
     }
+    // Nor one the auto-reaper is terminating right now (RS5).
+    let reaping = reap::reap_in_progress(cfg, &src, "replace");
+    if let (Some(r), false) = (&reaping, dry_run) {
+        anyhow::bail!("{r}");
+    }
 
     let rep = plan_replacement(cfg, owner, &src, job.ov, job.place).await?;
 
@@ -10225,7 +10239,7 @@ async fn replace_on(
     }
 
     if dry_run {
-        for r in [&locked, &stopped].into_iter().flatten() {
+        for r in [&locked, &stopped, &reaping].into_iter().flatten() {
             println!();
             print_would_refuse(r);
         }
@@ -11645,8 +11659,11 @@ async fn pull_locked(
             format!("w{w}d{d}")
         }
     };
-    if label.is_empty() || label.contains('/') || [".", "..", arena_core::restore::BIG, pull::BASELINE_DIR].contains(&label.as_str()) {
-        anyhow::bail!("`{label}` can't be a snapshot label (a name like w1d3; not `big`, `baseline` or a path)");
+    if label.is_empty()
+        || label.contains('/')
+        || [".", "..", arena_core::restore::BIG, pull::BASELINE_DIR, arena_core::restore::REAPED].contains(&label.as_str())
+    {
+        anyhow::bail!("`{label}` can't be a snapshot label (a name like w1d3; not `big`, `baseline`, `reaped` or a path)");
     }
     // Knobs come from flags, else config (BACKUP_MAX_SIZE / BACKUP_REMOTE_PATH), else
     // sensible defaults. `.git` is kept by default unless --no-git.

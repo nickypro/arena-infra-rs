@@ -31,6 +31,8 @@ pub enum NotifyKind {
     GitFailed,
     RsyncFailed,
     DestUnhealthy,
+    /// The verified backup couldn't be frozen into `reaped/` (RS1): not reaped.
+    FreezeFailed,
     /// A terminate failed in an unknown way: a hold is set.
     TerminateFailed,
     /// A reaped pod is still listed and billing.
@@ -214,7 +216,8 @@ pub fn why_label(row: Row, reasons: &[Reason]) -> String {
     if !reasons.is_empty() {
         let words: Vec<String> = reasons.iter().map(|r| r.word()).collect();
         let lead = match row {
-            Row::Active | Row::Keep | Row::NotCovered => "in use: ",
+            Row::NotCovered => "not covered by the backup: ",
+            Row::Active | Row::Keep => "in use: ",
             Row::PostBackupNotQuiet => "not quiet after the backup: ",
             _ => "can't tell: ",
         };
@@ -249,6 +252,8 @@ pub fn why_label(row: Row, reasons: &[Reason]) -> String {
         Row::PostBackupNotQuiet => "not quiet after the backup",
         Row::Rehearsed => "rehearsal: backed up and verified, not terminated",
         Row::RelistFailed => "re-listing didn't confirm the pod",
+        Row::FreezeFailed => "the verified backup couldn't be frozen into reaped/",
+        Row::DisabledMidRun => "REAP_ENABLED was switched off in the config file during the run",
         Row::GoneBeforeReap => "gone before the reap",
         Row::Reaped => "terminated after a verified backup",
         Row::TerminateRefusedLocked => "the provider refused: locked",
@@ -355,7 +360,9 @@ pub fn notice_text(name: &str, p: &PodPolicy, tz: i64) -> String {
         ));
     }
     s.push_str(
-        "  Your home directory is backed up first. Nothing happens while the machine is in use.\n  \
+        "  Your home directory is backed up first (not kept: caches, installed packages and venvs, Hugging Face \
+         downloads, ~/.ssh). Nothing happens while the machine is in use, or while TEMP_FOLDER_FOR_SWEEPS/ holds new \
+         results.\n  \
          To keep it running, create ~/.arena/keep (`mkdir -p ~/.arena && touch ~/.arena/keep`) and tell the organisers.\n",
     );
     s
