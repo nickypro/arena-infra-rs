@@ -241,6 +241,26 @@ pub fn note_push_failed(rec: &mut LabelRecord, pod: &str, class: PushFailure, st
     false
 }
 
+/// Record that `pod`'s push of `label` failed (`why`): what `status` names under "snap failing"
+/// until that label's push of the pod goes through ([`clear_snap_failing`]).
+pub fn note_snap_failing(st: &mut SnapState, pod: &str, label: &str, why: &str) {
+    st.pods_failing.insert(pod.to_string(), format!("{label}: {why}"));
+}
+
+/// `pod`'s push of `label` went through: no longer failing, when its last failure was that label.
+pub fn clear_snap_failing(st: &mut SnapState, pod: &str, label: &str) {
+    if st.pods_failing.get(pod).is_some_and(|why| why.starts_with(&format!("{label}: "))) {
+        st.pods_failing.remove(pod);
+    }
+}
+
+/// Failure records only for pods still `present` on the control box: a pod whose dir was
+/// deleted there is never pushed again, so it can't stay "failing" for good (W7 live: a stale
+/// "⚠ big failing" after the pod's dir was gone).
+pub fn prune_failing(failing: &mut std::collections::BTreeMap<String, String>, present: impl Fn(&str) -> bool) {
+    failing.retain(|p, _| present(p));
+}
+
 /// One snapshot label on the control box: its name and the allowed pod dirs it holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalLabel {
@@ -1210,15 +1230,16 @@ pub fn failure_hint(f: PushFailure, tier: Tier, current_gb: u32) -> String {
 /// that left before the archive existed, or a misspelt list — and the rest (staff boxes, other
 /// cohorts'). `sync` and `status` list both as "kept on the control box only", apart.
 pub fn control_box_only(dir: &Path, labels: &[String], allowed: &[String], prefix: &str, machine_names: &[String]) -> (Vec<String>, Vec<String>) {
-    control_box_only_in(dir, &dir.join(crate::restore::BIG), labels, allowed, prefix, machine_names)
+    control_box_only_in(dir, Some(&dir.join(crate::restore::BIG)), labels, allowed, prefix, machine_names)
 }
 
-/// [`control_box_only`] with the big tier at its own root (`pull::big_root`). The auto-reaper's
+/// [`control_box_only`] with the big tier at its own root (`pull::big_root`) — `None` to leave the
+/// big tier out (a `--tier snap` run names only what snap left behind). The auto-reaper's
 /// `reaped/` there (its frozen backups, kept on the control box by design) isn't a pod dir:
 /// never listed.
 pub fn control_box_only_in(
     dir: &Path,
-    big_root: &Path,
+    big_root: Option<&Path>,
     labels: &[String],
     allowed: &[String],
     prefix: &str,
@@ -1228,7 +1249,7 @@ pub fn control_box_only_in(
         machine_names.iter().filter(|e| crate::naming::is_absolute(e)).map(|e| crate::naming::qualify(prefix, e)).collect();
     let mut cohort: BTreeSet<String> = BTreeSet::new();
     let mut other: BTreeSet<String> = BTreeSet::new();
-    let trees = labels.iter().map(|l| dir.join(l)).chain([big_root.to_path_buf()]);
+    let trees = labels.iter().map(|l| dir.join(l)).chain(big_root.map(Path::to_path_buf));
     for tree in trees {
         for d in subdirs(&tree).unwrap_or_default() {
             if allowed.contains(&d) || d == crate::restore::REAPED {
@@ -2478,7 +2499,7 @@ mod tests {
         assert!(!custom_labels(&snap).contains(&"reaped".to_string()), "{:?}", custom_labels(&snap));
         assert!(!valid_custom_label("reaped"));
         let allowed = vec!["arena9-apple".to_string()];
-        let (cohort, other) = control_box_only_in(&snap, &big, &["w0d1".into()], &allowed, "arena9", &[]);
+        let (cohort, other) = control_box_only_in(&snap, Some(&big), &["w0d1".into()], &allowed, "arena9", &[]);
         assert!(cohort.is_empty() && other.is_empty(), "{cohort:?} {other:?}");
         // Single-volume layout too: `<dir>/big/reaped` is no pod dir.
         write(&snap.join("big/reaped/arena9-apple/S/big/big.bin"), "x");

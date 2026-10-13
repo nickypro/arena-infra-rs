@@ -456,6 +456,11 @@ pub fn judge_status(i: &StatusInputs) -> StatusReport {
     if !big_failing.is_empty() {
         r.add("big failing", Level::Warn, format!("big pushes failing: {}", big_failing.join(", ")));
     }
+    // And snap's, pod by pod (W7 live: a pod left out of its snap push was named nowhere).
+    let snap_failing: Vec<String> = i.snap.pods_failing.iter().filter(|(p, _)| !i.forgotten.contains(p)).map(|(p, why)| format!("{p} ({why})")).collect();
+    if !snap_failing.is_empty() {
+        r.add("snap failing", Level::Warn, format!("snap pushes failing: {}", snap_failing.join(", ")));
+    }
     let mut labels = format!("{} label(s) pushed", i.snap.labels.len());
     if !i.unsealed.is_empty() {
         labels.push_str(&format!("; not final yet: {}", i.unsealed.join(", ")));
@@ -882,6 +887,16 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// W7 live: a pod left out of its snap push (or failing) is named, as a failing big pod is.
+    #[test]
+    fn status_names_a_failing_snap_pod() {
+        let mut snap = snap_ok();
+        snap.pods_failing.insert("arena9-charlie".into(), "w0d2: left out: over 1000 unstorable symlinks".into());
+        let r = judge(|_| {}, &snap, &big_ok(), &host(), Some(Ok(&inv())));
+        assert_eq!(level_of(&r, "snap failing"), Level::Warn);
+        assert!(r.render().contains("snap pushes failing: arena9-charlie (w0d2: left out: over 1000 unstorable symlinks)"), "{}", r.render());
     }
 
     fn level_of(r: &StatusReport, name: &str) -> Level {

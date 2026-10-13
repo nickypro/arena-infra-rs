@@ -190,6 +190,12 @@ pub struct SnapState {
     /// ([`super::sync::chain_ok`]); a push that goes through resets it.
     #[serde(default)]
     pub baseline_fails: u32,
+    /// Per pod whose last snap push failed — or that was left out (too many unstorable links):
+    /// `<label>: <why>`, so `status` names it as it names a failing big pod (W7 live: a left-out
+    /// snap pod was named nowhere). Cleared when that label's push of the pod goes through, and
+    /// for a pod the control box no longer holds ([`super::sync::note_snap_failing`]).
+    #[serde(default)]
+    pub pods_failing: BTreeMap<String, String>,
 }
 
 impl Default for SnapState {
@@ -203,6 +209,7 @@ impl Default for SnapState {
             allowed_ever: BTreeSet::new(),
             baselines: BTreeMap::new(),
             baseline_fails: 0,
+            pods_failing: BTreeMap::new(),
         }
     }
 }
