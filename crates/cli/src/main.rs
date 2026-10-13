@@ -4511,10 +4511,8 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
 
     // The balance sources as last seen (the state file only — no request): ⚠ rows are
     // advice, never missing keys.
-    println!("\nBalance (`arena balance`):");
-    for row in money::balance_config_rows(cfg, &money::BalanceCtx::from_config(cfg), arena_core::snapshot::unix_now()) {
-        println!("{row}");
-    }
+    let now = arena_core::snapshot::unix_now();
+    balance_section(cfg, &money::BalanceCtx::from_config(cfg), now).iter().for_each(|l| println!("{l}"));
 
     // Read-only readiness: are the local files this user needs actually there/readable?
     // Answers "is it set up yet?" without touching any API.
@@ -4575,14 +4573,7 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
     }
     // The machines `up --check` remembers as bad (one small local file): where to look when
     // `up` keeps turning a machine away. Informational — never a missing key.
-    if let Some(Ok(path)) = health_cache_path(cfg) {
-        let (cache, warning) = arena_core::snapshot::HealthCache::load(&path);
-        println!("\nMachines `up --check` remembers as bad (`pods up --retry-bad-hosts` ignores them):");
-        if let Some(w) = warning {
-            println!("  {w}");
-        }
-        arena_core::snapshot::bad_hosts_lines(&cache, arena_core::snapshot::unix_now()).iter().for_each(|l| println!("{l}"));
-    }
+    bad_hosts_section(cfg, now).iter().for_each(|l| println!("{l}"));
 
     if missing.is_empty() {
         println!("\nOK — required keys for provider `{provider_name}` are present.");
@@ -4591,6 +4582,28 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
         // Set but invalid counts too (each such entry says why): "missing" alone misled.
         anyhow::bail!("missing or invalid keys: {}", missing.join(", "))
     }
+}
+
+/// `config check`'s Balance section: each prepaid account's sources as last seen, from the
+/// balance state file alone (no request; ⚠ rows are advice, never missing keys).
+fn balance_section(cfg: &Config, bal: &money::BalanceCtx, now: u64) -> Vec<String> {
+    let mut out = vec!["\nBalance (`arena balance`):".to_string()];
+    out.extend(money::balance_config_rows(cfg, bal, now));
+    out
+}
+
+/// `config check`'s section on the machines `up --check` remembers as bad, from the health
+/// cache — which shares its state directory (and its lock) with the balance state file.
+/// Nothing when there is no state directory.
+fn bad_hosts_section(cfg: &Config, now: u64) -> Vec<String> {
+    let Some(Ok(path)) = health_cache_path(cfg) else {
+        return Vec::new();
+    };
+    let (cache, warning) = arena_core::snapshot::HealthCache::load(&path);
+    let mut out = vec!["\nMachines `up --check` remembers as bad (`pods up --retry-bad-hosts` ignores them):".to_string()];
+    out.extend(warning.map(|w| format!("  {w}")));
+    out.extend(arena_core::snapshot::bad_hosts_lines(&cache, now));
+    out
 }
 
 async fn handle_backup(
@@ -6172,6 +6185,7 @@ async fn handle_pods_bal(
                 keys,
                 lock,
                 retry_bad_hosts,
+                balance: Some(bal),
             };
             println!(
                 "\nEach pod is brought up on its own the moment it's created (endpoint wait ≤{timeout}s per pod; \
@@ -16351,6 +16365,11 @@ mod placement_cli_tests {
         /// A second backend that fails to list (a bogus `VAST_API_KEY`), holding a pod nobody
         /// can see: the aggregate `list_pods` skips it, as the fleet provider's does.
         vast_down: bool,
+        /// The $/h each create answers with (`None`: unpriced, as RunPod v1's REST create).
+        price: Option<f64>,
+        /// Each pod is RUNNING with an SSH endpoint the moment it's made, so `up`'s pipelines
+        /// (with `--no-setup`) bring it up at once.
+        up_at_once: bool,
     }
 
     impl Recorder {
@@ -16390,7 +16409,12 @@ mod placement_cli_tests {
             if self.dry.contains(&spec.gpu_type.as_str()) {
                 return Err(Error::capacity("create pod HTTP 500: There are no instances currently available"));
             }
-            let pod = Pod { id: format!("id-{}", spec.name), name: spec.name.clone(), provider: "runpod".into(), ..Default::default() };
+            let mut pod = Pod { id: format!("id-{}", spec.name), name: spec.name.clone(), provider: "runpod".into(), ..Default::default() };
+            pod.cost_per_hr = self.price;
+            if self.up_at_once {
+                let port = 22_000 + self.made.lock().unwrap().len() as u16;
+                (pod.status, pod.ssh_ip, pod.ssh_port) = ("RUNNING".into(), Some("203.0.113.9".into()), Some(port));
+            }
             self.made.lock().unwrap().push(pod.clone());
             Ok(pod)
         }
@@ -17024,6 +17048,47 @@ mod placement_cli_tests {
         assert!(lines[0].contains("+ ≤$2.00/h for 10 new pod(s) →"), "{lines:?}");
         // No account for this provider configured: nothing.
         assert!(money::balance_preflight(&Recorder::default(), &cfg(), &money::BalanceCtx::from_config(&cfg()), 10, Some(&plan), &base).await.is_empty());
+    }
+
+    /// Merge of wave 7 balance onto lane G's `up`: every path that makes a pod remembers the
+    /// price its create answered with, for the balance (a later listing with no price —
+    /// RunPod v1's REST list — still prices the pod): `create`, `up --no-wait`, and the
+    /// streaming `up` whose pipelines start as each create returns — single spec and
+    /// placement alike. A create with no price remembers nothing.
+    #[tokio::test]
+    async fn every_create_path_remembers_its_price_for_the_balance() {
+        use arena_core::balance::{self, Account, Live};
+        let live = Live { usd: 100.0, provider_burn_per_hr: Some(0.0), spend_limit_per_hr: None, under_balance: None, reduced: false, owed: None };
+        let bal = balance_of(live);
+        let remembered = |id: &str| {
+            let (state, _) = balance::load(bal.state_path().unwrap());
+            state.accounts.get(&Account::Runpod).and_then(|a| a.prices.get(id)).map(|(usd, _)| *usd)
+        };
+        let streaming = |gpu: Option<&str>| {
+            let mut up = up_apple();
+            if let PodCmd::Up { gpu: g, no_wait, timeout, interval, .. } = &mut up {
+                (*g, *no_wait, *timeout, *interval) = (gpu.map(String::from), false, 60, 1);
+            }
+            up
+        };
+        let cases: [(&str, PodCmd, f64); 5] = [
+            ("create, single spec", create(&["apple"], None, None, None), 0.21),
+            ("create, placement", create(&["apple"], Some("3090,A4000"), None, None), 0.22),
+            ("up --no-wait, placement", up_apple(), 0.23),
+            ("up, placement (streaming)", streaming(Some("3090,A4000")), 0.24),
+            ("up, single spec (streaming)", streaming(None), 0.25),
+        ];
+        for (case, cmd, price) in cases {
+            let rec = Recorder { price: Some(price), up_at_once: true, ..Default::default() };
+            handle_pods_bal(cmd, &rec, fake_remote(), &cfg(), true, Interrupt::manual(), &bal).await.unwrap_or_else(|e| panic!("{case}: {e:#}"));
+            let made = rec.made.lock().unwrap().clone();
+            assert_eq!(made.len(), 1, "{case}");
+            assert_eq!(remembered(&made[0].id), Some(price), "{case}");
+        }
+        // Unpriced: nothing new remembered (the last case's price stays as it was).
+        let rec = Recorder { up_at_once: true, ..Default::default() };
+        handle_pods_bal(streaming(None), &rec, fake_remote(), &cfg(), true, Interrupt::manual(), &bal).await.unwrap();
+        assert_eq!(remembered("id-arena8-apple"), Some(0.25));
     }
 
     #[tokio::test]

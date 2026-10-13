@@ -50,9 +50,11 @@ pub struct Pod {
     pub proxy_only: bool,
     /// The pod's disk in GB — container plus volume — where the listing says (RunPod v1
     /// `containerDiskInGb + volumeInGb`, v2 `disk + mounts.persistent.size`, Vast
-    /// `disk_space`). What a stopped pod keeps billing for ([`crate::balance`]). Left out of
-    /// the JSON when unknown, like `machine_id`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// `disk_space`). What a stopped pod keeps billing for ([`crate::balance`]), read from a
+    /// fresh listing only — so it is never written to JSON: `pods list --json` stays byte for
+    /// byte what it was before the balance knew disks (a scripting interface), and a JSON
+    /// that carries it still reads.
+    #[serde(default, skip_serializing)]
     pub disk_gb: Option<f64>,
 }
 
@@ -308,6 +310,15 @@ mod tests {
         // `false`) where it doesn't — "unknown" must never read as "unlocked" to a script.
         assert_eq!(v[0]["locked"], true);
         assert!(v[1].get("locked").is_none(), "{}", v[1]);
+        // The balance's disk size never reaches the JSON (merge of wave 7 balance): the same
+        // pods with their disks known print byte for byte the same, and a JSON carrying it
+        // (hand-made, or from a later version) still reads.
+        let mut disks = pods.clone();
+        disks[0].disk_gb = Some(60.0);
+        disks[1].disk_gb = Some(0.0);
+        assert_eq!(serde_json::to_string_pretty(&disks).unwrap(), json);
+        let read: Pod = serde_json::from_str(r#"{"id":"1","name":"n","provider":"vast","status":"EXITED","disk_gb":32.5}"#).unwrap();
+        assert_eq!(read.disk_gb, Some(32.5));
     }
 
     /// Finding #10: `ALLOWED_CUDA_VERSIONS` is a floor (its lowest version), `MIN_CUDA_VERSION`

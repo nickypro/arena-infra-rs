@@ -783,6 +783,45 @@ mod tests {
         );
     }
 
+    /// Merge of wave 7 balance with lane G: `config check` shows both state-file sections —
+    /// the balance sources and the machines `up --check` remembers as bad — read from one
+    /// state directory, whose lock both writers take: a bad-host write after a balance
+    /// reading, then a price write after it, and each file keeps the other's records. Neither
+    /// section makes a balance call.
+    #[tokio::test]
+    async fn config_check_shows_the_balance_and_the_bad_hosts_from_one_state_dir() {
+        use arena_core::snapshot::{self, BadHost};
+        let dir = StateDir::new("merge-w7");
+        let conf = dir.cfg("");
+        let fleet = Fleet { backends: vec![("runpod", Ok(vec![]))] };
+        let (_, bal) = ctx(FakeBalanceApi::new().live_ok(Account::Runpod, rp_live(31.0, 0.0)), Some(&dir));
+        balance_report(&fleet, &conf, &bal, BalanceFlags::default(), T0).await.unwrap();
+        // G's health cache resolves into the balance file's directory.
+        let health = match crate::health_cache_path(&conf) {
+            Some(Ok(p)) => p,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(health.parent(), dir.file().parent());
+        let now = snapshot::unix_now();
+        let bad = BadHost { failed_at: now - 3_600, pod: "devtest-apple".into(), reason: "cuda: RuntimeError: CUDA unknown error".into() };
+        assert_eq!(snapshot::record_bad_host(&health, "runpod machine mbad", &bad, now).unwrap(), None);
+        bal.remember_prices(&[pod("devtest-apple", "RUNNING", 0.17, 1)]);
+
+        let panicking = BalanceCtx { api: Arc::new(FakeBalanceApi::new().with(Account::Runpod).panicking()), path: Some(Ok(dir.file())) };
+        let balance = crate::balance_section(&conf, &panicking, T0 + 240);
+        assert_eq!(balance[0], "\nBalance (`arena balance`):");
+        assert!(balance.iter().any(|l| l == "  ✓ runpod                     live 4m ago"), "{balance:#?}");
+        let bad_hosts = crate::bad_hosts_section(&conf, now);
+        assert_eq!(bad_hosts[0], "\nMachines `up --check` remembers as bad (`pods up --retry-bad-hosts` ignores them):");
+        assert!(matches!(&bad_hosts[1..], [l] if l.starts_with("  ⚠ runpod machine mbad — failed 1h ago")), "{bad_hosts:#?}");
+        let (state, warning) = balance::load(&dir.file());
+        assert_eq!(warning, None);
+        assert_eq!(state.accounts[&Account::Runpod].prices.get("id-devtest-apple").map(|p| p.0), Some(0.17));
+        assert!(state.accounts[&Account::Runpod].anchor.is_some(), "the reading survived both writes");
+        // No state directory: no bad-hosts section at all.
+        assert!(crate::bad_hosts_section(&cfg(), now).is_empty());
+    }
+
     // ---- `pods list`: the balance line, and everything else unchanged ----
 
     fn no_remote() -> Arc<dyn Remote> {
@@ -864,6 +903,31 @@ mod tests {
         let (out, err) = crate::list_with(&fleet, &no_remote(), &cfg(), &bal, false, false).await.unwrap();
         assert_eq!(err, want);
         assert_eq!(out.lines().last().unwrap(), "balance: vast $40.00 live ?", "{out}");
+    }
+
+    /// Merge of wave 7 balance with fix batch P (finding #9): `list_with` keeps the footer's
+    /// PARTIAL mark and the "NOT known to be empty" line when a provider didn't answer — the
+    /// balance line still comes under them.
+    #[tokio::test]
+    async fn pods_list_marks_a_partial_fleet_above_the_balance_line() {
+        let fleet = Fleet { backends: vec![("runpod", Ok(vec![pod("devtest-apple", "RUNNING", 0.25, 1)])), ("vast", Err("list pods HTTP 429"))] };
+        let dir = StateDir::new("partial-footer");
+        let (_, bal) = ctx(FakeBalanceApi::new().live_ok(Account::Vast, vast_live(40.0)), Some(&dir));
+        let (out, _) = crate::list_with(&fleet, &no_remote(), &cfg(), &bal, false, false).await.unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        let footer = lines[lines.len() - 2];
+        assert!(
+            footer.starts_with("fleet: $0.25/h across 1 billing pod(s)")
+                && footer.ends_with(" — PARTIAL: vast didn't answer, so its pods and their cost are missing"),
+            "{out}"
+        );
+        assert_eq!(lines[lines.len() - 1], "balance: vast $40.00 live ?");
+        // Nothing listed while a provider failed: not "(no pods)" — and the JSON is the pods alone.
+        let empty = Fleet { backends: vec![("runpod", Ok(vec![])), ("vast", Err("list pods HTTP 429"))] };
+        let (out, _) = crate::list_with(&empty, &no_remote(), &cfg(), &no_balance(), false, false).await.unwrap();
+        assert_eq!(out, "(no pods listed — vast didn't answer, so this is NOT known to be empty)\n");
+        let (json, _) = crate::list_with(&empty, &no_remote(), &cfg(), &no_balance(), true, false).await.unwrap();
+        assert_eq!(json, "[]\n");
     }
 
     #[tokio::test]

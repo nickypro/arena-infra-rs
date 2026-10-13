@@ -166,6 +166,10 @@ pub(crate) struct UpRun<'a> {
     /// `--retry-bad-hosts`: ignore the machines earlier runs remember as bad (a machine that
     /// fails again is remembered again; one that passes is forgotten).
     pub retry_bad_hosts: bool,
+    /// Where a replacement's price is remembered for the balance, the moment its create
+    /// returns — as the create phase does for the first pods (`OnMade`) — so a later listing
+    /// with no price (RunPod v1's REST list) still prices it. `None`: not remembered.
+    pub balance: Option<&'a crate::money::BalanceCtx>,
 }
 
 /// The per-pod part of `up`'s plan, for the dry-run and the confirm prompt.
@@ -1003,6 +1007,9 @@ impl Shared<'_, '_> {
         let placed =
             placement::place(self.run.provider, &base, &names, &plan, self.run.rounds, None, interrupt, &mut show)
                 .await;
+        if let Some(bal) = self.run.balance {
+            bal.remember_prices(&placed.created);
+        }
         match (placed.created.first(), placed.log.first().and_then(|l| l.placed)) {
             (Some(new), Some(k)) => Some((new.clone(), order[k])),
             _ => {
@@ -1780,6 +1787,7 @@ mod tests {
             keys: keys.map(|d| KeySources::load(cfg, &d.to_string_lossy(), None, None)).filter(|k| !k.csv.is_empty()),
             lock: false,
             retry_bad_hosts: false,
+            balance: None,
         }
     }
 
@@ -2408,6 +2416,52 @@ mod tests {
         assert_eq!(bad.pod, "devtest-apple");
         assert!(bad.reason.starts_with("cuda: ") && bad.live(snapshot::unix_now()), "{bad:?}");
         assert_eq!(cache.pods.len(), 3, "the standing pods' verdicts are kept beside it");
+    }
+
+    /// Merge of wave 7 balance onto lane G: a replacement — for a pod that FAILed its check
+    /// on its host, or one turned away on a machine remembered as bad — remembers the price
+    /// its create answered with in the balance state, the moment it's made (the first pods
+    /// are the create phase's, through `OnMade`). The two state files share one directory and
+    /// its lock: G's bad-host and verdict writes and the balance's price writes interleave
+    /// here, and neither file loses the other's records.
+    #[tokio::test(start_paused = true)]
+    async fn replacements_remember_their_price_beside_the_remembered_bad_host() {
+        use arena_core::balance::{self, Account, FakeBalanceApi};
+        let fleet = Fleet::new(&[
+            ("apple", &[("10.0.0.1", 22001, 0), ("10.0.0.2", 22002, 0)]),
+            // bloom's first pod lands on apple's bad machine, after apple's check.
+            ("bloom", &[("10.0.0.1", 22003, 120), ("10.0.0.4", 22004, 0)]),
+        ]);
+        fleet.details_machines.lock().unwrap().extend([(22001, "mbad"), (22002, "m2"), (22003, "mbad"), (22004, "m4")].map(|(p, m)| (p, m.to_string())));
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host("10.0.0.1", 22001), [FakeReply::ok(), FakeReply::ok(), bad_host()]);
+        for (ip, port) in [("10.0.0.2", 22002), ("10.0.0.4", 22004)] {
+            fake.script(&host(ip, port), [FakeReply::ok(), FakeReply::ok(), healthy()]);
+        }
+        let mut cfg = cfg(None);
+        let (state, health) = with_state("w7-prices", &mut cfg);
+        let prices = state.0.join("devtest").join(snapshot::BALANCE_FILE);
+        let bal = crate::money::BalanceCtx { api: Arc::new(FakeBalanceApi::new().with(Account::Runpod)), path: Some(Ok(prices.clone())) };
+        let run = UpRun { balance: Some(&bal), ..up_run(&fleet, fake.clone(), &cfg, true, Some(2), None).await };
+        let made = make(&fleet, &["apple", "bloom"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+        assert!(rows.iter().all(|r| r.verdict == Verdict::Ready), "{:#?}", lines.all());
+        assert!(matches!(rows[1].attempts[0].end, AttemptEnd::KnownBad(_)), "{:?}", rows[1].attempts);
+
+        // The pods standing now are the two replacements: each remembered at its create's price.
+        let mut standing: Vec<String> = fleet.listed().into_iter().map(|p| p.id).collect();
+        standing.sort();
+        assert_eq!(standing.len(), 2);
+        let (saved, warning) = balance::load(&prices);
+        assert_eq!(warning, None);
+        let remembered: Vec<(&String, f64)> = saved.accounts[&Account::Runpod].prices.iter().map(|(id, (usd, _))| (id, *usd)).collect();
+        assert_eq!(remembered, standing.iter().map(|id| (id, 0.17)).collect::<Vec<_>>());
+        // …and G's records beside them: the bad machine, and each name's verdict.
+        let (cache, warning) = snapshot::HealthCache::load(&health);
+        assert_eq!(warning, None);
+        assert_eq!(cache.bad_hosts.keys().collect::<Vec<_>>(), ["runpod machine mbad"]);
+        assert_eq!(cache.pods.len(), 2);
     }
 
     /// Review G1: a check that timed out (python's 75 s here) is a host FAIL — the pod is
