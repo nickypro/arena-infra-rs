@@ -186,6 +186,31 @@ pub fn provider_supported(pod: &Pod, runpod_v2: bool) -> bool {
     }
 }
 
+/// Why a policy on `pod` can't act (RR2), for the ENDS column: a provider the reaper doesn't
+/// act on (`vast`, `RunPod v1`), a lock state the listing doesn't report (R8), a pod renamed
+/// outside arena (R6), a name two listed pods share or a `-old`/`-new` twin listed (R5).
+/// `None` = it can. `all` = the listing.
+pub fn inert_why(policy: &PodPolicy, pod: &Pod, all: &[Pod], runpod_v2: bool) -> Option<String> {
+    if !provider_supported(pod, runpod_v2) {
+        return Some(if pod.provider == "runpod" { "RunPod v1".to_string() } else { pod.provider.clone() });
+    }
+    // The listing doesn't say whether it's locked (R8: never reaped until it does).
+    if lock_state(pod).is_none() {
+        return Some("lock state unknown".into());
+    }
+    if policy.name != pod.name {
+        return Some("renamed outside arena".into());
+    }
+    if all.iter().filter(|p| p.name == pod.name).count() > 1 {
+        return Some("name shared".into());
+    }
+    let twins = [format!("{}-old", pod.name), format!("{}-new", pod.name)];
+    if all.iter().any(|p| twins.contains(&p.name)) {
+        return Some("twin listed".into());
+    }
+    None
+}
+
 /// Rows R1–R13: whether a policy's pod may be probed at all. `Ok(pod)` = probe it; `Err(row)`
 /// = nothing (not even an SSH connection). [`Listed::Gone`] is the caller's (it prunes).
 pub fn pre_ssh_gate<'a>(policy: &PodPolicy, listed: Listed<'a>, ctx: &GateCtx) -> Result<&'a Pod, Row> {

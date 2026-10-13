@@ -760,6 +760,35 @@ pub struct Hold {
     pub auto: bool,
 }
 
+/// `hold.json`'s version.
+pub const HOLD_VERSION: u32 = 1;
+
+/// `hold.json`: `{"version":1,"hold":{…}}`, read strictly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HoldFile {
+    version: u32,
+    hold: Hold,
+}
+
+impl Hold {
+    /// `hold.json`'s text for this hold.
+    pub fn to_file(&self) -> String {
+        let mut s = serde_json::to_string_pretty(&HoldFile { version: HOLD_VERSION, hold: self.clone() }).unwrap_or_default();
+        s.push('\n');
+        s
+    }
+
+    /// Parse `hold.json` strictly (another version, an unknown field: an error).
+    pub fn parse_file(text: &str) -> Result<Hold, String> {
+        let f: HoldFile = serde_json::from_str(text).map_err(|e| e.to_string())?;
+        if f.version != HOLD_VERSION {
+            return Err(format!("unsupported version {} (this arena reads {HOLD_VERSION})", f.version));
+        }
+        Ok(f.hold)
+    }
+}
+
 /// What was reaped, and where its backup is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -788,6 +817,9 @@ pub struct ReapState {
     pub pods: BTreeMap<String, PodPolicy>,
     #[serde(default)]
     pub pins: Vec<Pin>,
+    /// The hold — kept in its own file (`hold.json`, [`store::HOLD_FILE`]) so `reap hold` /
+    /// `release` work even when `reap.json` can't be read (RR13); filled in by the store's load.
+    #[serde(skip)]
     pub hold: Option<Hold>,
     /// Terminate attempts (write-ahead times), for the rolling daily cap.
     #[serde(default)]

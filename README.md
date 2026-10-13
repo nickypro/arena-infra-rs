@@ -673,10 +673,29 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     reaped), absolute `LOCAL_BACKUP_DIR`, a `.arena-backup-tier` marker on each backup root
     (`snapshot` / `big`; the big tier's root is `LOCAL_BACKUP_BIG_DIR`, default
     `<LOCAL_BACKUP_DIR>/big`), `ARENA_START_DATE` and no `BACKUP_REMOTE_PATH`; `config check`
-    lists what's missing. Rollout: `cron install --reap observe` first (logs `would_reap`), then
+    lists what's missing once the reaper is on or its cron line is installed (off: one `·
+    reaper off (opt-in)` row, a ✗ only for a `REAP_*` value set but invalid). Every `pods reap
+    … --json` prints exactly one JSON document on stdout — `{"error": …}` on a failure,
+    `{"skipped": …}` when another run holds the lock — and everything else on stderr. Rollout: `cron install --reap observe` first (logs `would_reap`), then
     `--reap apply` (refused unless REAP_ENABLED=1). `reap set` also writes `~/.arena/NOTICE` and
-    an interactive-only login banner on the pod; `pods rename` keeps the policy's name; a
-    `replace`/`migrate` doesn't carry it (said).
+    an interactive-only login banner on the pod (also written after `up`'s setup for a pod
+    created with a policy, after `pods setup`, and after a restart's re-provision — the 1-hour
+    `wall` before a reap reaches nobody in a RunPod container, which has no utmp); `pods
+    rename` keeps the policy's name; a `replace`/`migrate` doesn't carry it (said).
+    **When the reaper never acts** (all fail safe: the pod stays, `reap run` says why, an
+    expired one is `OVERDUE` and notified every 6 h): a live Jupyter kernel (its loopback
+    connections are sockets in use), any process started after the container's first two
+    minutes that isn't one of its own services restarted (a VS Code server left running, a
+    `screen`, `mosh-server`, a forgotten `python`), data on `/workspace` (where setup puts the
+    repo when the pod has a volume) or another writable mount, new files in a
+    `TEMP_FOLDER_FOR_SWEEPS/`, a MIG GPU slice (`[N/A]` utilisation reads as unknown), RunPod
+    on `RUNPOD_API=v1` (the default) and Vast (no lock state — `up --expire-*` refuses them,
+    ENDS shows `not reapable (…)`), a pod renamed outside arena or sharing its name, a home
+    that's a link to another filesystem, `~/.arena/keep`. A tmux session whose panes run only
+    a shell doesn't count (its utmp entries aren't logins); one running anything else does.
+    A `reap.json` that can't be read stops every run (`reap hold`/`release` still work — the
+    hold has its own `hold.json`); the error gives the recovery: move it aside
+    (`mv reap.json reap.json.bad-<UTC time>`) and the reaper starts with no policies.
   - `pods pull [targets] [--label <label>]` — the **file** backup (complementing the git
     `backup`): rsyncs each pod's home into `<dir>/<label>/<pod>/`, reporting per pod what was
     sent and what the snapshot holds (`12 files, 3.4M sent of 6754, 1.8G` — sizes parsed in
@@ -702,8 +721,14 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     one invocation counts a hard-linked file once. Knobs come from flags
     else config: `LOCAL_BACKUP_DIR` (`--dir`), `BACKUP_MAX_SIZE` (`--max-size`),
     `BACKUP_REMOTE_PATH` (`--remote-path`, default `~/`). Label defaults to the `wNdM`
-    iteration (`big`/`baseline` are refused). Confirms first; `--dry-run` prints the exact
-    rsync commands, shell-quoted. **Bounded**: rsync
+    iteration (`big`/`baseline`/`reaped` are refused). Confirms first; `--dry-run` prints the
+    exact rsync commands, shell-quoted. **Per-pod backup lock** (in an existing absolute
+    `LOCAL_BACKUP_DIR`: `.arena-locks/<name>.lock`, the folder 0700 — a missing backup dir is
+    never created for it, and the run goes as before without locks): each pod's lock is taken
+    once per name (two listed pods sharing a name share it) and released the moment that pod's
+    own rsyncs end, so one slow pod never holds the others; `pods backup` holds it for that
+    pod's git push, then for its rsyncs. A pod whose lock another backup (the cron, the
+    reaper, the TUI's backup) holds for 120 s is skipped, named, and fails the run. **Bounded**: rsync
     `--timeout=300` (gives up after 5 min without any I/O) and a wall-clock budget per pod,
     `BACKUP_TIMEOUT_SECS` (default 7200 = 2 h, max a day; settable from the environment) —
     a pod that runs out is stopped (SIGTERM, so rsync takes its ssh and receiver down too;

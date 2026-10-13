@@ -89,7 +89,7 @@ fn non_empty_dir(dir: &Path) -> bool {
 /// Every label under `base` holding a non-empty backup of `pod`, for "what is there" messages:
 /// the `wNdM` snapshots newest first, then any other label (`pods pull --label …`) by name,
 /// then `big`.
-pub fn all_labels(base: &Path, pod: &str) -> Vec<String> {
+pub fn all_labels(base: &Path, big_root: &Path, pod: &str) -> Vec<String> {
     let mut others: Vec<String> = std::fs::read_dir(base)
         .into_iter()
         .flatten()
@@ -100,7 +100,9 @@ pub fn all_labels(base: &Path, pod: &str) -> Vec<String> {
     others.sort();
     let mut v = snapshot_labels(base, pod);
     v.extend(others);
-    if non_empty_dir(&base.join(BIG).join(pod)) {
+    // The big tier where it is (`crate::pull::big_root`: its own volume when
+    // LOCAL_BACKUP_BIG_DIR is set, else `<base>/big`) — RR15.
+    if non_empty_dir(&big_root.join(pod)) {
         v.push(BIG.to_string());
     }
     v
@@ -127,13 +129,13 @@ pub fn snapshot_labels(base: &Path, pod: &str) -> Vec<String> {
 /// for the newest `wNdM` snapshot. Returns `(label, dir)`. Refuses — the message says what
 /// exists instead — when the base dir is missing, the chosen backup is missing or empty, or
 /// there is no snapshot to default to.
-pub fn resolve_source(base: &Path, pod: &str, from: Option<&str>) -> Result<(String, PathBuf), String> {
+pub fn resolve_source(base: &Path, big_root: &Path, pod: &str, from: Option<&str>) -> Result<(String, PathBuf), String> {
     if !base.is_dir() {
         return Err(format!("no backups here: {} doesn't exist (pass --dir, or set LOCAL_BACKUP_DIR)", base.display()));
     }
     let labels = snapshot_labels(base, pod);
     let have = || {
-        let v = all_labels(base, pod);
+        let v = all_labels(base, big_root, pod);
         if v.is_empty() {
             format!("there is no backup of {pod} under {}", base.display())
         } else {
@@ -455,12 +457,13 @@ mod tests {
         std::fs::create_dir_all(t.0.join("w1d3/devtest-a")).unwrap();
         put(&t.0, "big/devtest-b/x", "x");
         put(&t.0, "m2test/devtest-b/x", "x");
-        let ok = |from: Option<&str>| resolve_source(&t.0, "devtest-a", from).unwrap();
+        let big = t.0.join("big");
+        let ok = |from: Option<&str>| resolve_source(&t.0, &big, "devtest-a", from).unwrap();
         assert_eq!(ok(None), ("w1d2".to_string(), t.0.join("w1d2/devtest-a")), "the newest snapshot");
         assert_eq!(ok(Some("w1d1")).1, t.0.join("w1d1/devtest-a"));
         assert_eq!(ok(Some("big")).1, t.0.join("big/devtest-a"));
         assert_eq!(ok(Some("m2test")).1, t.0.join("m2test/devtest-a"), "a custom label, named");
-        let err = |pod: &str, from: Option<&str>| resolve_source(&t.0, pod, from).unwrap_err();
+        let err = |pod: &str, from: Option<&str>| resolve_source(&t.0, &big, pod, from).unwrap_err();
         // Every backup there is gets listed — custom labels too.
         let e = err("devtest-a", Some("w1d3"));
         assert!(e.contains("is empty") && e.contains("backups of devtest-a: w1d2, w1d1, m2test, big"), "{e}");
@@ -474,9 +477,19 @@ mod tests {
         for bad in ["", "..", ".", "w1d1/../x", "/etc"] {
             assert!(err("devtest-a", Some(bad)).contains("isn't a backup label"), "{bad}");
         }
-        let e = resolve_source(&t.0.join("missing"), "devtest-a", None).unwrap_err();
+        let e = resolve_source(&t.0.join("missing"), &big, "devtest-a", None).unwrap_err();
         assert!(e.contains("doesn't exist") && e.contains("--dir"), "{e}");
-        assert_eq!(all_labels(&t.0, "devtest-a"), ["w1d2", "w1d1", "m2test", "big"]);
+        assert_eq!(all_labels(&t.0, &big, "devtest-a"), ["w1d2", "w1d1", "m2test", "big"]);
+        // RR15: the big tier on its own volume (LOCAL_BACKUP_BIG_DIR) is listed from there — and
+        // a `reaped/` folder is never a label.
+        let vol = tmp("source-bigvol");
+        put(&vol.0, "devtest-c/all.bin", "x");
+        put(&t.0, "w1d1/devtest-c/notes.txt", "x");
+        put(&t.0, "reaped/devtest-c/20261012T000000Z-runpod-p1/snapshot/x", "x");
+        assert_eq!(all_labels(&t.0, &vol.0, "devtest-c"), ["w1d1", "big"]);
+        assert_eq!(all_labels(&t.0, &big, "devtest-c"), ["w1d1"]);
+        let e = resolve_source(&t.0, &vol.0, "devtest-c", Some("w9d9")).unwrap_err();
+        assert!(e.contains("backups of devtest-c: w1d1, big"), "{e}");
     }
 
     #[test]

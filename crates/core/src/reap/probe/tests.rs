@@ -496,3 +496,42 @@ fn the_script_lists_processes_and_sweep_folders() {
     let me: String = String::from_utf8_lossy(&me).replace('\0', " ");
     assert!(find(&me).is_none(), "the probe's own session is listed:\n{stdout}");
 }
+
+/// Review RR (robustness): on a VM with utmp (Hetzner), Ubuntu's tmux (linked with
+/// libutempter) registers EVERY pane as a `who` login — `root pts/1 … (tmux(4011013).%12)`.
+/// The probe's tmux rule says panes running only a shell are not busy, but the same idle,
+/// detached tmux session is then counted by `who` as a login, so the pod is `Active` (`who`)
+/// forever: the tmux exemption never applies where utmp exists. Run on the real script with a
+/// `who` that reports one tmux pane and a tmux whose only pane runs zsh.
+#[cfg(target_os = "linux")]
+#[test]
+fn review_rr_idle_tmux_pane_is_not_a_who_login() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = std::env::temp_dir().join(format!("arena-reap-rr-who-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let (bin, home) = (root.join("bin"), root.join("home"));
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let stub = |name: &str, body: &str| {
+        let p = bin.join(name);
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    // What `who` prints on Ubuntu 24.04 for one detached tmux session with one pane.
+    stub("who", "echo 'root     pts/1        2026-10-12 08:41 (tmux(4011013).%0)'");
+    stub("tmux", "echo zsh");
+    let out = std::process::Command::new("env")
+        .arg("-i")
+        .arg(format!("PATH={}:/usr/sbin:/usr/bin:/sbin:/bin", bin.display()))
+        .arg(format!("HOME={}", home.display()))
+        .arg("ARENA_PROBE_TEST_WINDOW=1")
+        .args(["sh", "-c", PROBE_SCRIPT, "arena-idle-probe", "T3ST", "-900", "", "hetzner", "203.0.113.9 50000 10.0.0.2 22"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let f = parse_probe(&stdout, "T3ST", Since::Back(900)).unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(f.tmux_busy, Some(0), "the pane runs a shell: not busy");
+    // The same pane, seen through utmp, must not count as a login either.
+    assert_eq!(f.who, Some(0), "an idle tmux pane's utmp entry counted as a login: the tmux exemption is void wherever utmp exists");
+}

@@ -1438,7 +1438,7 @@ fn readiness_rows_name_the_blockers() {
     let text = lines.join("\n");
     assert!(text.contains("REAP_ENABLED") && text.contains("marked `snapshot`") && text.contains("marked `big`"), "{text}");
     assert!(blockers.contains(&"BACKUP_REMOTE_PATH unset".to_string()), "{blockers:?}");
-    let (_, blockers) = readiness_rows(&Config::parse("ARENA_STATE_DIR=x"), "/nonexistent/rsync");
+    let (_, blockers) = super::readiness_rows_for(&Config::parse("ARENA_STATE_DIR=x"), "/nonexistent/rsync", true);
     assert!(blockers.iter().any(|b| b.contains("ARENA_STATE_DIR")) && blockers.contains(&"rsync".to_string()), "{blockers:?}");
 }
 
@@ -1459,7 +1459,7 @@ fn reap_cron_line_rules() {
     assert_eq!(super::super::CronKind::of(&observe), Some(super::super::CronKind::Reap));
     write(&format!("ARENA_STATE_DIR={state}\nREAP_ENABLED=1\n"));
     let apply = super::super::reap_cron_line(true, &path, "/usr/local/bin/arena", "/root/c.env", "/root").unwrap();
-    assert!(apply.contains(" pods reap run --apply --yes >> ") && apply.contains("flock -n /root/.arena-reap-cron.lock"), "{apply}");
+    assert!(apply.contains(" pods reap run --apply --yes >> ") && apply.contains("flock -n -o /root/.arena-reap-cron.lock"), "{apply}");
     assert_eq!(super::super::CronKind::of(&apply), Some(super::super::CronKind::Reap));
     // No state dir anywhere: refused.
     write("REAP_ENABLED=1\n");
@@ -1882,14 +1882,14 @@ async fn rs3_state_changes_name_the_state_file() {
     let a = rp("devtest-alpha", "pa", 22001);
     w.add(a.clone(), Sim::new("pa", "runpod"));
     *w.fleet.strict.lock().unwrap() = false;
-    let path = w.store().state_path().display().to_string();
-    for args in [
-        vec!["set", "devtest-alpha", "--idle-after", "8h"],
-        vec!["pin", "devtest-alpha"],
-        vec!["unpin", "devtest-alpha"],
-        vec!["hold", "--reason", "drill"],
-        vec!["release"],
-        vec!["clear", "devtest-alpha"],
+    let (state, hold) = (w.store().state_path().display().to_string(), w.store().hold_path().display().to_string());
+    for (args, path) in [
+        (vec!["set", "devtest-alpha", "--idle-after", "8h"], &state),
+        (vec!["pin", "devtest-alpha"], &state),
+        (vec!["unpin", "devtest-alpha"], &state),
+        (vec!["hold", "--reason", "drill"], &hold),
+        (vec!["release"], &hold),
+        (vec!["clear", "devtest-alpha"], &state),
     ] {
         w.out.lock().unwrap().clear();
         w.reap(&args).await.unwrap();
@@ -1908,4 +1908,401 @@ async fn rs2_the_reaps_big_tier_keeps_dot_dirs() {
     let args = std::fs::read_to_string(w.dir.join("big_args")).unwrap();
     assert!(!args.contains("**/.*/"), "the reap's copy drops dot-directories:\n{args}");
     assert!(args.contains("TEMP_FOLDER_FOR_SWEEPS/") && args.contains(".cache/"), "{args}");
+}
+
+// ---------------------------------------------------------------------------------------
+// Review RR (robustness / regressions) — each test states the behaviour that should hold and
+// fails on 0e1a148.
+// ---------------------------------------------------------------------------------------
+
+/// RR: `up/create --expire-in` on a pod the reaper never acts on — Vast, or RunPod on REST v1
+/// (the default `RUNPOD_API`, which lists `locked: None`) — is recorded without a word (`reap
+/// set` refuses the very same pod), and `pods list`'s ENDS column then counts down to the end
+/// time and shows `OVERDUE …` past it, as if the pod were going to be reaped. It never is (R3 /
+/// R8 every run): the operator replaced `at` + destroy with `up --expire-in` and the pod bills on.
+#[test]
+fn review_rr_create_flags_on_a_never_reaped_provider_are_silent_and_look_live() {
+    let w = World::new("rr-unsup", "");
+    let vast = Pod { provider: "vast".into(), locked: None, ..rp("devtest-alpha", "77", 22001) };
+    let v1 = Pod { locked: None, ..rp("devtest-bravo", "pv1", 22002) };
+    let naming = Naming::from_config(&w.cfg);
+    assert!(never_reaped(&vast, &[vast.clone()], &naming, true).is_some(), "reap set refuses Vast");
+    assert!(never_reaped(&v1, &[v1.clone()], &naming, false).is_some(), "reap set refuses RunPod v1");
+    // `up/create --expire-in 8h` accepts both and records them (nothing in resolve looks at the
+    // provider; the create path prints nothing about it).
+    let (policy, store) = resolve_create_policy(&w.cfg, Some("8h"), None, None, T0, &|_| None).unwrap().unwrap();
+    record_created(&store, &vast, policy, T0, "up");
+    record_created(&store, &v1, policy, T0, "up");
+    let ends = ends_column(&w.cfg, &[vast.clone(), v1.clone()], T0 + 9 * 3600, 0).unwrap();
+    for (pod, label) in [&vast, &v1].iter().zip(&ends) {
+        assert!(
+            !label.starts_with("OVERDUE") && !label.contains("(in "),
+            "{} ({}): ENDS says `{label}` for a pod the reaper will never terminate",
+            pod.name,
+            pod.provider
+        );
+    }
+}
+
+/// A provider whose first `list_pods` waits until released — to interleave two `reap set`s.
+struct Gated<'a> {
+    inner: &'a Fleet,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl Provider for Gated<'_> {
+    fn name(&self) -> &'static str {
+        "runpod"
+    }
+    fn describe(&self, _spec: &PodSpec) -> String {
+        String::new()
+    }
+    async fn list_pods(&self) -> arena_core::Result<Vec<Pod>> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        self.inner.list_pods().await
+    }
+    async fn create_pod(&self, _spec: &PodSpec) -> arena_core::Result<Pod> {
+        panic!("create")
+    }
+    async fn stop_pod(&self, _id: &str) -> arena_core::Result<()> {
+        panic!("stop")
+    }
+    async fn restart_pod(&self, _id: &str) -> arena_core::Result<()> {
+        panic!("restart")
+    }
+    async fn terminate_pod(&self, _id: &str) -> arena_core::Result<()> {
+        panic!("terminate")
+    }
+}
+
+/// RR: two `reap set`s from two terminals. `handle_set` loads the state WITHOUT the state lock,
+/// computes every field from that copy (`set_values(old)`), lists the fleet, and only then
+/// writes inside `store.update` — assigning `expires_at`/`idle_after_secs` from the stale copy.
+/// So `reap set A --idle-after 8h` started just before `reap set A --extend 2h` finishes puts the
+/// OLD end time back: the operator's extension is silently lost (and `first_due_seen` reset).
+#[tokio::test]
+async fn review_rr_concurrent_reap_set_keeps_both_changes() {
+    let w = World::new("rr-race", "");
+    *w.fleet.strict.lock().unwrap() = false;
+    let a = rp("devtest-alpha", "pa", 22001);
+    w.add(a.clone(), Sim::new("pa", "runpod"));
+    w.policy(&a, Some(3 * 3600), None);
+    let gated = Gated { inner: &w.fleet, entered: tokio::sync::Notify::new(), release: tokio::sync::Notify::new() };
+    let mut slow_env = w.env();
+    slow_env.provider = &gated;
+    let argv = ["arena", "pods", "reap", "set", "devtest-alpha", "--idle-after", "8h"].map(String::from);
+    let super::super::Cmd::Pods(super::super::PodCmd::Reap(slow_cmd)) = super::super::Cli::try_parse_from(argv).unwrap().cmd else { panic!() };
+    let slow = handle_reap(slow_cmd, &slow_env);
+    let fast = async {
+        gated.entered.notified().await; // the slow `set` has loaded the state and is listing
+        w.reap(&["set", "devtest-alpha", "--extend", "2h"]).await.unwrap();
+        gated.release.notify_one();
+    };
+    let (r, ()) = tokio::join!(slow, fast);
+    r.unwrap();
+    let p = &w.state().pods["runpod:pa"];
+    assert_eq!(p.idle_after_secs, Some(8 * 3600));
+    assert_eq!(p.expires_at, Some(T0 + 5 * 3600), "the --extend 2h made meanwhile was overwritten with the stale end time");
+}
+
+/// RR: `pods pull` (and `pods backup`, which takes them the same way) holds EVERY selected pod's
+/// backup lock until the whole fleet run ends — not until that pod's own rsyncs end. One slow
+/// pod (up to BACKUP_TIMEOUT_SECS) therefore keeps every other pod locked: each reaper probe in
+/// that time is `BackupBusy` (no observation — idle streaks break past MAX_GAP), and an
+/// operator's `pods pull <other pod>` waits 120 s and FAILS as "busy", where before it ran.
+#[tokio::test]
+async fn review_rr_a_pull_releases_each_pods_lock_when_that_pod_is_done() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = World::new("rr-hold", "");
+    let snap = w.dir.join("bk");
+    std::fs::create_dir_all(&snap).unwrap();
+    let mark = w.dir.join("alpha.done");
+    let rsync = w.dir.join("rsync-slow-bravo");
+    std::fs::write(
+        &rsync,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in --version) echo rsync; exit 0;; esac\nfor a in \"$@\"; do last=\"$a\"; done\n\
+             case \"$last\" in *devtest-bravo*) sleep 4;; *big/devtest-alpha*) touch '{}';; esac\n\
+             echo 'Number of regular files transferred: 1'\nexit 0\n",
+            mark.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&rsync, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let cfg = Config::parse(&format!("MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=( alpha bravo )\nLOCAL_BACKUP_DIR={}\n", snap.display()));
+    let sel = super::super::Selected { pods: vec![rp("devtest-alpha", "pa", 22001), rp("devtest-bravo", "pb", 22002)], named: true };
+    let remote: Arc<dyn Remote> = Arc::new(arena_core::remote::FakeRemote::new());
+    let dir = snap.display().to_string();
+    let args = super::super::PullRun { label: Some("w1d1".into()), max_size: None, remote_path: None, no_git: false, no_big: false, dry_run: false, yes: true };
+    let rs = rsync.display().to_string();
+    let pull = super::super::pull_locked(&remote, &cfg, &dir, args, &sel, &rs, super::super::LockMode::Take(Duration::from_millis(300)));
+    let check = async {
+        for _ in 0..100 {
+            if mark.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(mark.exists(), "alpha's big tier never ran");
+        tokio::time::sleep(Duration::from_millis(1000)).await; // alpha's jobs are all done; bravo still sleeping
+        let f = arena_core::pull::open_pod_lock(&dir, "devtest-alpha").unwrap();
+        arena_core::pull::try_lock(&f).unwrap()
+    };
+    let (r, alpha_free) = tokio::join!(pull, check);
+    r.unwrap();
+    assert!(alpha_free, "alpha's backup was finished, yet its lock stayed held while bravo's rsync ran");
+}
+
+/// RR: the per-pod lock is opened under `<LOCAL_BACKUP_DIR>/.arena-locks` with a RECURSIVE
+/// 0700 create — so on a box where LOCAL_BACKUP_DIR doesn't exist yet, the first `pods pull`/
+/// `pods backup` (even the git-only `--no-pull` cron, which never touched that directory before)
+/// creates LOCAL_BACKUP_DIR and every missing parent as 0700 (root's cron: root-only), where the
+/// pull used to create it with the umask's mode — another user can't then read or restore the
+/// backups.
+#[tokio::test]
+async fn review_rr_taking_the_locks_doesnt_make_the_backup_dir_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = World::new("rr-mode", "");
+    let base = w.dir.join("fresh").join("backup");
+    let reference = w.dir.join("reference");
+    std::fs::create_dir_all(&reference).unwrap(); // what the pull's own create_dir_all gives
+    let locks = super::super::take_pod_locks(&base.display().to_string(), &["devtest-alpha".to_string()], Duration::from_millis(100)).await;
+    drop(locks);
+    // Fixed (RR5) as the coordinator set it: the locks never create LOCAL_BACKUP_DIR or a parent
+    // of it at all — a run with it missing goes as before (no locks), the pull creating its
+    // destination with the umask's mode as it always did.
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert!(!base.exists() && !w.dir.join("fresh").exists(), "the lock created LOCAL_BACKUP_DIR (or its parent)");
+    std::fs::create_dir_all(&base).unwrap();
+    assert_eq!(mode(&base), mode(&reference));
+}
+
+/// RR: `config check` for someone who never enables the reaper (REAP_ENABLED unset) now prints
+/// a block of red ✗ rows (state dir, RUNPOD_API, tier markers, …) that aren't failures for them.
+#[test]
+fn review_rr_config_check_has_no_red_rows_when_the_reaper_is_off() {
+    let cfg = Config::parse("MACHINE_NAME_PREFIX=devtest\nLOCAL_BACKUP_DIR=/srv/arena-backup\nARENA_START_DATE=2026-10-05\n");
+    let (lines, blockers) = readiness_rows(&cfg, "rsync");
+    let crosses: Vec<&String> = lines.iter().filter(|l| l.contains('✗')).collect();
+    assert!(!blockers.is_empty(), "there are gaps (they only count when enabled)");
+    assert!(crosses.is_empty(), "REAP_ENABLED unset, yet config check shows ✗ rows: {crosses:#?}");
+}
+
+/// RR (regression for users who never enable the reaper): two listed pods that share a name —
+/// a duplicate `up`, a stray stopped twin — lock each other out. The lock is per NAME, and
+/// `take_pod_locks` opens it once per selected pod: the run's second open of the same file is
+/// refused by its own first (flock is per open file description), so after the full 120 s wait
+/// the name is "busy", and `pods backup` / `pods pull` then drop EVERY pod of that name — no
+/// git push, no rsync, a failed run — on every */15 tick (and every other pod's backup waits
+/// those 120 s first). Before the locks, both pods were backed up.
+#[tokio::test]
+async fn review_rr_two_pods_sharing_a_name_are_still_backed_up() {
+    let w = World::new("rr-dup", "");
+    let snap = w.dir.join("bk");
+    std::fs::create_dir_all(&snap).unwrap();
+    let cfg = Config::parse(&format!("MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=( alpha )\nLOCAL_BACKUP_DIR={}\n", snap.display()));
+    let sel = super::super::Selected { pods: vec![rp("devtest-alpha", "pa", 22001), rp("devtest-alpha", "pa2", 22003)], named: false };
+    let remote: Arc<dyn Remote> = Arc::new(arena_core::remote::FakeRemote::new());
+    let dir = snap.display().to_string();
+    let args = super::super::PullRun { label: Some("w1d1".into()), max_size: None, remote_path: None, no_git: false, no_big: false, dry_run: false, yes: true };
+    let r = super::super::pull_locked(&remote, &cfg, &dir, args, &sel, &w.rsync, super::super::LockMode::Take(Duration::from_millis(300))).await;
+    let rsyncs = w.order().iter().filter(|l| l.starts_with("rsync")).count();
+    assert!(r.is_ok() && rsyncs > 0, "nothing of devtest-alpha was backed up ({rsyncs} rsyncs): {r:?}");
+}
+
+/// RR: the reap cron line is `flock -n LOCK arena …` WITHOUT `-o`, so the locked fd that
+/// flock(1) hands to arena is inherited by everything arena spawns (ssh, the reap's rsyncs,
+/// REAP_NOTIFY_CMD and whatever it backgrounds). If arena dies (killed, OOM) while one of them
+/// lives on, that orphan keeps `.arena-reap-cron.lock` and every later tick exits at once,
+/// silently (`flock -n` prints nothing) — the reaper just stops. The backup line uses
+/// `flock -n -o` for exactly this reason ("a stray rsync outliving an arena that was itself
+/// killed would otherwise keep every later tick skipping").
+#[test]
+fn review_rr_reap_cron_lock_is_not_inherited_by_arenas_children() {
+    let line = arena_core::reap::render::cron_line(true, "/usr/local/bin/arena", "/root/c.env", "/root", &[]);
+    assert!(line.contains("flock -n -o "), "{line}");
+}
+
+/// RR: `pods reap run --json` isn't always JSON on stdout: a run that finds another in progress
+/// (the cron's, four times an hour) prints a plain sentence instead and exits 0 — and after a
+/// reap the proxy sync's report line (`report_sync`, println) lands on stdout before the JSON.
+#[tokio::test]
+async fn review_rr_reap_run_json_is_always_json() {
+    let w = World::new("rr-json", "");
+    let lock = w.store().try_run_lock().unwrap().unwrap();
+    w.out.lock().unwrap().clear();
+    let r = w.reap(&["run", "--json"]).await;
+    let out = w.out.lock().unwrap().join("\n");
+    drop(lock);
+    assert!(serde_json::from_str::<serde_json::Value>(&out).is_ok(), "`reap run --json` printed non-JSON: {out:?} ({r:?})");
+}
+
+// ---------------------------------------------------------------------------------------
+// Robustness review fixes (RR1–RR15), beyond the review's own tests above.
+// ---------------------------------------------------------------------------------------
+
+/// RR1/RR3: a run's locks — once per name, released per piece of work, idle ones at once.
+#[tokio::test]
+async fn rr_pod_locks_once_per_name_released_per_pod() {
+    let w = World::new("rr-locks", "");
+    let dir = w.dir.join("bk");
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = dir.display().to_string();
+    let names = ["devtest-alpha", "devtest-alpha", "devtest-bravo", "devtest-charlie"].map(String::from);
+    let mut locks = super::super::take_pod_locks(&d, &names, Duration::from_millis(200)).await;
+    assert!(locks.busy.is_empty(), "a run never waits on its own lock: {:?}", locks.busy);
+    for n in ["devtest-alpha", "devtest-alpha", "devtest-bravo"] {
+        locks.expect(n);
+    }
+    locks.release_idle();
+    let free = |n: &str| arena_core::pull::try_lock(&arena_core::pull::open_pod_lock(&d, n).unwrap()).unwrap();
+    assert!(free("devtest-charlie"), "no work under it: released at once");
+    assert!(!free("devtest-alpha") && !free("devtest-bravo"));
+    locks.done("devtest-alpha");
+    assert!(locks.holds("devtest-alpha") && !free("devtest-alpha"), "the other alpha pod still works under it");
+    locks.done("devtest-alpha");
+    assert!(free("devtest-alpha"), "the last alpha job ended");
+    assert!(!free("devtest-bravo"));
+    drop(locks);
+    assert!(free("devtest-bravo"));
+    // Another process's hold (here: an open lock of our own, outside the run) is "busy".
+    let other = arena_core::pull::open_pod_lock(&d, "devtest-bravo").unwrap();
+    assert!(arena_core::pull::try_lock(&other).unwrap());
+    let locks = super::super::take_pod_locks(&d, &names, Duration::from_millis(200)).await;
+    assert_eq!(locks.busy, ["devtest-bravo"]);
+}
+
+/// RR5: the locks never create LOCAL_BACKUP_DIR (a run with it missing goes as before, no
+/// locks, no warning); inside an existing one only `.arena-locks`, 0700.
+#[tokio::test]
+async fn rr_locks_make_only_their_own_folder() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = World::new("rr-lockdir", "");
+    let missing = w.dir.join("not-yet").join("backup");
+    let locks = super::super::take_pod_locks(&missing.display().to_string(), &["devtest-alpha".to_string()], Duration::from_millis(50)).await;
+    assert!(locks.held.is_empty() && locks.busy.is_empty());
+    assert!(!w.dir.join("not-yet").exists(), "the lock created the backup dir's parent");
+    assert!(arena_core::pull::open_pod_lock(&missing.display().to_string(), "devtest-alpha").is_err());
+    let base = w.dir.join("bk2");
+    std::fs::create_dir_all(&base).unwrap();
+    let before = std::fs::metadata(&base).unwrap().permissions().mode();
+    drop(arena_core::pull::open_pod_lock(&base.display().to_string(), "devtest-alpha").unwrap());
+    assert_eq!(std::fs::metadata(&base).unwrap().permissions().mode(), before, "the backup dir's mode is its own");
+    assert_eq!(std::fs::metadata(base.join(".arena-locks")).unwrap().permissions().mode() & 0o777, 0o700);
+}
+
+/// RR2: `up/create --expire-*/--idle-after` refuse a provider the reaper never acts on — before
+/// anything is created — with `reap set`'s words; RunPod v2 and Hetzner are fine.
+#[test]
+fn rr_create_flags_refuse_never_reaped_providers() {
+    let v1 = Config::parse("RUNPOD_API=v1");
+    let v2 = Config::parse("RUNPOD_API=v2");
+    let r = super::create_flags_refusal(&v1, "runpod").unwrap();
+    assert!(r.contains("RunPod REST v1") && r.contains("only acts on RunPod (RUNPOD_API=v2) and Hetzner") && r.contains("nothing was created"), "{r}");
+    assert!(super::create_flags_refusal(&v2, "vast").unwrap().contains("pods on vast"));
+    assert_eq!(super::create_flags_refusal(&v2, "runpod"), None);
+    assert_eq!(super::create_flags_refusal(&v1, "hetzner"), None);
+    // ENDS: a record made inert by a rename outside arena, or a shared name, says so too.
+    let w = World::new("rr-inert", "");
+    let a = rp("devtest-alpha", "pa", 22001);
+    w.policy(&a, Some(3600), None);
+    let renamed = Pod { name: "devtest-bravo".into(), ..a.clone() };
+    let ends = super::ends_column(&w.cfg, &[renamed], T0 + 7200, 0).unwrap();
+    assert_eq!(ends[0], "not reapable (renamed outside arena)");
+    let twin = rp("devtest-alpha", "pz", 22009);
+    let ends = super::ends_column(&w.cfg, &[a.clone(), twin], T0 + 7200, 0).unwrap();
+    assert_eq!(ends[0], "not reapable (name shared)");
+    let ends = super::ends_column(&w.cfg, &[a], T0 + 7200, 0).unwrap();
+    assert!(ends[0].starts_with("OVERDUE"), "{ends:?}");
+}
+
+/// RR8: the reaper off — one neutral row, no outside command, a ✗ only for a REAP_* value set
+/// and invalid; full rows (✗ per gap) once it's on.
+#[test]
+fn rr_config_check_reaper_rows_off_and_on() {
+    let off = Config::parse("MACHINE_NAME_PREFIX=devtest\n");
+    let (lines, blockers) = readiness_rows(&off, "/nonexistent/rsync");
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    assert!(lines[0].contains("· reaper") && lines[0].contains("off (opt-in)") && lines[0].contains("thing(s) to set up"), "{lines:?}");
+    assert!(!blockers.contains(&"rsync".to_string()), "no outside command when off: {blockers:?}");
+    let typo = Config::parse("MACHINE_NAME_PREFIX=devtest\nREAP_MAX_PER_DAY=500\n");
+    let (lines, _) = readiness_rows(&typo, "/nonexistent/rsync");
+    assert!(lines.iter().any(|l| l.contains('✗') && l.contains("REAP_* settings")), "{lines:#?}");
+    assert_eq!(lines.iter().filter(|l| l.contains('✗')).count(), 1, "{lines:#?}");
+    let (lines, blockers) = super::readiness_rows_for(&off, "/nonexistent/rsync", true);
+    assert!(lines.len() > 5 && lines.iter().any(|l| l.contains('✗')) && blockers.contains(&"rsync".to_string()), "{lines:#?}");
+}
+
+/// RR9: `--json` errors are one JSON document too.
+#[tokio::test]
+async fn rr_json_errors_are_json() {
+    let w = World::new("rr-json-err", "");
+    std::fs::create_dir_all(w.store().dir.clone()).unwrap();
+    std::fs::write(w.store().state_path(), "{not json").unwrap();
+    for args in [vec!["run", "--json"], vec!["status", "--json"]] {
+        w.out.lock().unwrap().clear();
+        let r = w.reap(&args).await;
+        let out = w.out.lock().unwrap().join("\n");
+        assert!(r.is_err(), "{args:?}");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{args:?}: {e}: {out}"));
+        assert!(v["error"].as_str().is_some_and(|e| e.contains("reap.json")), "{args:?}: {v}");
+    }
+    // The log, as one array.
+    let w = World::new("rr-json-log", "");
+    let a = rp("devtest-alpha", "pa", 22001);
+    w.add(a.clone(), Sim::new("pa", "runpod"));
+    w.policy(&a, None, Some(900));
+    w.step("observe").await;
+    w.out.lock().unwrap().clear();
+    w.reap(&["log", "--json"]).await.unwrap();
+    let out = w.out.lock().unwrap().join("\n");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"));
+    assert!(v.as_array().is_some_and(|a| !a.is_empty()), "{v}");
+}
+
+/// RR11: the reap notice is (re)written on a pod with a policy — what `up` (after setup),
+/// `pods setup` and a restart's re-provision call; a pod with none gets nothing.
+#[tokio::test]
+async fn rr_notice_reasserted_where_a_policy_is() {
+    let w = World::new("rr-notice", "");
+    let a = rp("devtest-alpha", "pa", 22001);
+    let b = rp("devtest-bravo", "pb", 22002);
+    w.add(a.clone(), Sim::new("pa", "runpod"));
+    w.add(b.clone(), Sim::new("pb", "runpod"));
+    w.policy(&a, Some(3600), None);
+    super::reassert_notices(w.remote.as_ref(), &w.cfg, &[a.clone(), b.clone()]).await;
+    assert_eq!(w.calls_to(22001), ["notice"]);
+    assert!(w.calls_to(22002).is_empty());
+    let t = SshTarget::from_pod(&b, &w.cfg).unwrap();
+    assert_eq!(super::reassert_notice(w.remote.as_ref(), &w.cfg, &b, &t).await, Ok(false));
+}
+
+/// RR13: a `reap.json` that can't be read doesn't stop `reap hold` or `release` (the hold has
+/// its own file); a run still refuses to act; the error names the recovery.
+#[tokio::test]
+async fn rr_hold_and_release_work_with_a_corrupt_state() {
+    let (w, _a) = due_world("rr-corrupt", "").await;
+    let bad = "{\"version\": 99}";
+    std::fs::write(w.store().state_path(), bad).unwrap();
+    w.reap(&["hold", "--reason", "corrupt state drill"]).await.unwrap();
+    assert_eq!(w.store().read_hold().unwrap().map(|h| h.reason), Some("corrupt state drill".to_string()));
+    let (r, out) = w.run("apply").await;
+    assert!(w.terminated().is_empty(), "{out}");
+    let e = format!("{:#}", r.unwrap_err());
+    assert!(e.contains(".bad-") && e.contains("hold`/`release` still work"), "{e}");
+    // `up/create --expire-in` refuses before creating anything, naming the same recovery.
+    let e = format!("{:#}", resolve_create_policy(&w.cfg, Some("8h"), None, None, T0, &|_| None).unwrap_err());
+    assert!(e.contains("before creating pods with a policy") && e.contains(".bad-"), "{e}");
+    w.reap(&["release"]).await.unwrap();
+    assert_eq!(w.store().read_hold().unwrap(), None);
+    assert_eq!(std::fs::read_to_string(w.store().state_path()).unwrap(), bad, "left untouched");
+    // A hold file that can't be read: a run doesn't act; `release` offers to remove it.
+    std::fs::write(w.store().state_path(), w.store().load().map(|s| s.to_json()).unwrap_or_else(|_| ReapState::default().to_json())).unwrap();
+    std::fs::write(w.store().hold_path(), "garbage").unwrap();
+    assert!(w.store().load().is_err(), "an unreadable hold is never \"no hold\"");
+    w.reap(&["release"]).await.unwrap();
+    assert!(!w.store().hold_path().exists());
 }

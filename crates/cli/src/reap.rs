@@ -273,8 +273,52 @@ fn wrote(env: &ReapEnv<'_>, store: &Store) {
     (env.out)(&format!("(state: {})", store.state_path().display()));
 }
 
+/// [`wrote`] for the hold, which has its own file next to the state (RR13).
+fn wrote_hold(env: &ReapEnv<'_>, store: &Store) {
+    (env.out)(&format!("(state: {})", store.hold_path().display()));
+}
+
 /// `arena pods reap …`.
 pub(crate) async fn handle_reap(cmd: ReapCmd, env: &ReapEnv<'_>) -> Result<()> {
+    let json = matches!(&cmd, ReapCmd::Run { json: true, .. } | ReapCmd::Status { json: true, .. } | ReapCmd::Log { json: true, .. });
+    if !json {
+        return reap_cmd(cmd, env).await;
+    }
+    // `--json` (RR9): exactly one JSON document on stdout, whatever happens — a command that
+    // fails before printing one prints `{"error": …}` (and still fails); every other line goes
+    // to stderr.
+    let printed = std::sync::atomic::AtomicBool::new(false);
+    let (seen, inner) = (&printed, env.out);
+    let out = move |l: &str| {
+        seen.store(true, std::sync::atomic::Ordering::SeqCst);
+        inner(l)
+    };
+    let quiet = ReapEnv {
+        provider: env.provider,
+        remote: env.remote.clone(),
+        cfg: env.cfg,
+        yes: env.yes,
+        clock: env.clock.clone(),
+        ntp: env.ntp,
+        tz: env.tz,
+        rsync: env.rsync.clone(),
+        nonce: env.nonce.clone(),
+        resolve_local: env.resolve_local,
+        out: &out,
+        sync_proxy: env.sync_proxy,
+        config_file: env.config_file.clone(),
+    };
+    let r = reap_cmd(cmd, &quiet).await;
+    if let Err(e) = &r {
+        if !printed.load(std::sync::atomic::Ordering::SeqCst) {
+            (env.out)(&serde_json::json!({ "error": format!("{e:#}") }).to_string());
+        }
+    }
+    r
+}
+
+/// [`handle_reap`]'s commands.
+async fn reap_cmd(cmd: ReapCmd, env: &ReapEnv<'_>) -> Result<()> {
     match cmd {
         ReapCmd::Run { apply, rehearse, max, json, sel } => {
             let asked = if apply {
@@ -299,20 +343,32 @@ pub(crate) async fn handle_reap(cmd: ReapCmd, env: &ReapEnv<'_>) -> Result<()> {
             let store = store_for(env.cfg)?;
             let now = (env.clock)();
             let reason: String = reason.chars().filter(|c| !c.is_control()).take(300).collect();
-            store.update(|s| {
-                s.hold = Some(Hold { reason: reason.clone(), set_at: now, auto: false });
-                Ok(())
-            })?;
+            // Its own file, under the state lock: works whatever state reap.json is in (RR13).
+            store.set_hold(Some(&Hold { reason: reason.clone(), set_at: now, auto: false }))?;
             (env.out)(&format!("reap: on hold — `--apply` runs observe until `arena pods reap release` ({reason})"));
-            wrote(env, &store);
+            wrote_hold(env, &store);
             Ok(())
         }
         ReapCmd::Release => {
             let store = store_for(env.cfg)?;
-            let state = store.load()?;
-            let Some(h) = state.hold else {
-                (env.out)("reap: no hold");
-                return Ok(());
+            // The hold file alone (RR13): reap.json may be unreadable. One that can't be read is
+            // offered for removal like any hold.
+            let h = match store.read_hold() {
+                Ok(Some(h)) => h,
+                Ok(None) => {
+                    (env.out)("reap: no hold");
+                    return Ok(());
+                }
+                Err(e) => {
+                    if !super::confirm(env.yes, &format!("The hold file can't be read ({e}).\nRemove it (`--apply` runs act again)?"))? {
+                        (env.out)("aborted.");
+                        return Ok(());
+                    }
+                    store.set_hold(None)?;
+                    (env.out)("reap: hold released");
+                    wrote_hold(env, &store);
+                    return Ok(());
+                }
             };
             let who = if h.auto { "set by the reaper itself" } else { "set by an operator" };
             let what = format!(
@@ -324,12 +380,11 @@ pub(crate) async fn handle_reap(cmd: ReapCmd, env: &ReapEnv<'_>) -> Result<()> {
                 (env.out)("aborted.");
                 return Ok(());
             }
-            store.update(|s| {
-                s.hold = None;
-                Ok(())
-            })?;
+            if !store.clear_hold_if(&h)? {
+                anyhow::bail!("the hold changed while you were asked — not released; run `arena pods reap release` again");
+            }
             (env.out)("reap: hold released");
-            wrote(env, &store);
+            wrote_hold(env, &store);
             Ok(())
         }
     }
@@ -391,6 +446,20 @@ pub(crate) fn resolve_create_policy(
         .transpose()
         .map_err(anyhow::Error::msg)?;
     Ok(Some((CreatePolicy { expires_at, idle_after_secs }, store)))
+}
+
+/// `up`/`create --expire-in/--expire-at/--idle-after` on a provider the reaper never acts on
+/// (RR2): the refusal, before anything is created — the same rule (and words) as `reap set`'s.
+/// `provider` = where the pods would be created.
+pub(crate) fn create_flags_refusal(cfg: &Config, provider: &str) -> Option<String> {
+    let probe = Pod { provider: provider.to_string(), ..Default::default() };
+    (!judge::provider_supported(&probe, runpod_v2(cfg))).then(|| {
+        format!(
+            "refusing --expire-in/--expire-at/--idle-after: pods on {} are never reaped — the reaper only acts on RunPod \
+             (RUNPOD_API=v2) and Hetzner pods; nothing was created",
+            if provider == "runpod" { "RunPod REST v1" } else { provider }
+        )
+    })
 }
 
 /// Record `policy` for a pod the moment its create returned (`up`/`create`, `--check`
@@ -517,7 +586,8 @@ async fn handle_set(env: &ReapEnv<'_>, sel: &Select, ask: SetAsk, dry_run: bool)
     if ask.expire_in.is_none() && ask.expire_at.is_none() && ask.extend.is_none() && ask.idle_after.is_none() && ask.note.is_none() {
         anyhow::bail!("nothing to set: pass --expire-in/--expire-at/--extend and/or --idle-after (or --note)");
     }
-    let state = store.load()?;
+    // The state must be readable before anything is listed (a corrupt one: said now).
+    store.load()?;
     let (picked, all) = pick(env, sel, "set a reap policy on").await?;
     let pods = reapable_only(env, sel, picked, &all)?;
     if pods.is_empty() {
@@ -525,16 +595,52 @@ async fn handle_set(env: &ReapEnv<'_>, sel: &Select, ask: SetAsk, dry_run: bool)
         return Ok(());
     }
     let now = (env.clock)();
-    let mut plan: Vec<(Pod, Option<u64>, Option<u64>)> = Vec::new();
-    for p in &pods {
-        let old = state.pods.get(&core_reap::key(&p.provider, &p.id));
-        let (exp, idle) = set_values(&ask, old, now, settings.idle_floor_secs, env.resolve_local)?;
-        if exp.is_none() && idle.is_none() {
-            anyhow::bail!("{}: a policy needs an end time or an idle window", p.name);
+    let note = ask.note.clone().map(|n| n.chars().filter(|c| !c.is_control()).take(200).collect::<String>());
+    let expiry_touched = ask.expire_in.is_some() || ask.expire_at.is_some() || ask.extend.is_some();
+    // Every value from the record as it is NOW, re-read under the state lock (RR7): another
+    // `reap set` (an `--extend` from another terminal) that finished while this one was
+    // listing the fleet is built on, never overwritten with what this one read before it.
+    let decide = |s: &ReapState| -> std::result::Result<Vec<(Pod, Option<u64>, Option<u64>, bool)>, String> {
+        let mut plan = Vec::new();
+        for p in &pods {
+            let old = s.pods.get(&core_reap::key(&p.provider, &p.id));
+            let (exp, idle) = set_values(&ask, old, now, settings.idle_floor_secs, env.resolve_local).map_err(|e| e.to_string())?;
+            if exp.is_none() && idle.is_none() {
+                return Err(format!("{}: a policy needs an end time or an idle window", p.name));
+            }
+            plan.push((p.clone(), exp, idle, s.pinned(&p.name, &p.id, now)));
         }
-        plan.push((p.clone(), exp, idle));
-    }
-    for (p, exp, idle) in &plan {
+        Ok(plan)
+    };
+    let plan = if dry_run {
+        decide(&store.load()?).map_err(anyhow::Error::msg)?
+    } else {
+        store.update(|s| {
+            let plan = decide(s)?;
+            for (p, exp, idle, _) in &plan {
+                let k = core_reap::key(&p.provider, &p.id);
+                let rec = s.pods.entry(k).or_insert_with(|| PodPolicy::new(p, None, None, now, "set", None));
+                rec.name = p.name.clone();
+                if *exp != rec.expires_at || expiry_touched {
+                    rec.first_due_seen = None;
+                    rec.warned_soon = false;
+                }
+                if *idle != rec.idle_after_secs {
+                    rec.warned_soon = false;
+                }
+                rec.expires_at = *exp;
+                rec.idle_after_secs = *idle;
+                rec.set_at = now;
+                rec.set_by = "set".into();
+                if note.is_some() {
+                    rec.note.clone_from(&note);
+                }
+            }
+            Ok(plan)
+        })?
+    };
+    // What was saved, in words.
+    for (p, exp, idle, pinned) in &plan {
         let mut parts = Vec::new();
         if let Some(e) = exp {
             parts.push(format!("expires {}", describe_time(*e, now, env.tz)));
@@ -548,7 +654,7 @@ async fn handle_set(env: &ReapEnv<'_>, sel: &Select, ask: SetAsk, dry_run: bool)
             None => warn.push("its lock state isn't reported — never reaped until it is"),
             Some(false) => {}
         }
-        if state.pinned(&p.name, &p.id, now) {
+        if *pinned {
             warn.push("pinned — never reaped while pinned");
         }
         let warn = if warn.is_empty() { String::new() } else { format!(" (⚠ {})", warn.join("; ")) };
@@ -558,30 +664,6 @@ async fn handle_set(env: &ReapEnv<'_>, sel: &Select, ask: SetAsk, dry_run: bool)
         (env.out)("\nDry-run only — no policy recorded, nothing written to the pods.");
         return Ok(());
     }
-    let note = ask.note.clone().map(|n| n.chars().filter(|c| !c.is_control()).take(200).collect::<String>());
-    let expiry_touched = ask.expire_in.is_some() || ask.expire_at.is_some() || ask.extend.is_some();
-    store.update(|s| {
-        for (p, exp, idle) in &plan {
-            let k = core_reap::key(&p.provider, &p.id);
-            let rec = s.pods.entry(k).or_insert_with(|| PodPolicy::new(p, None, None, now, "set", None));
-            rec.name = p.name.clone();
-            if *exp != rec.expires_at || expiry_touched {
-                rec.first_due_seen = None;
-                rec.warned_soon = false;
-            }
-            if *idle != rec.idle_after_secs {
-                rec.warned_soon = false;
-            }
-            rec.expires_at = *exp;
-            rec.idle_after_secs = *idle;
-            rec.set_at = now;
-            rec.set_by = "set".into();
-            if note.is_some() {
-                rec.note.clone_from(&note);
-            }
-        }
-        Ok(())
-    })?;
     wrote(env, &store);
     // The participant notice, best effort.
     let state = store.load()?;
@@ -590,6 +672,46 @@ async fn handle_set(env: &ReapEnv<'_>, sel: &Select, ask: SetAsk, dry_run: bool)
         write_notice(env, p, Some(rec)).await;
     }
     Ok(())
+}
+
+/// The command writing `pod`'s notice of its reap policy (`None`: no state here, or no policy
+/// on the pod).
+fn notice_command_for(cfg: &Config, pod: &Pod) -> Option<String> {
+    let store = Store::new(arena_core::snapshot::state_dir_explicit(cfg).ok()?);
+    let state = store.load_if_any().ok()??;
+    let p = state.pods.get(&core_reap::key(&pod.provider, &pod.id)).filter(|p| !p.is_empty())?;
+    Some(render::notice_write_command(&render::notice_text(&pod.name, p, real::tz())))
+}
+
+/// RR11: (re)write the participant notice (`~/.arena/NOTICE` and the interactive-only banner)
+/// on `pod` at `target` when it has a reap policy — after setup has put its shell rc files in
+/// their final form (a policy given at `up`/`create`; `pods setup`; a restart that reset the
+/// container). `Ok(false)` = no policy, nothing written; `Err` = the write failed (said by the
+/// caller, never fatal). The only warning the reaper otherwise gives is a `wall`, which
+/// reaches nobody in a RunPod container (no utmp).
+pub(crate) async fn reassert_notice(remote: &dyn Remote, cfg: &Config, pod: &Pod, target: &SshTarget) -> std::result::Result<bool, String> {
+    let Some(cmd) = notice_command_for(cfg, pod) else { return Ok(false) };
+    match remote.exec(target, &cmd, Some(arena_core::remote::PROBE_TIMEOUT)).await {
+        Ok(o) if o.success => Ok(true),
+        Ok(o) => Err(o.exit_label()),
+        Err(e) => Err(arena_core::remote::describe_error(&e)),
+    }
+}
+
+/// [`reassert_notice`] for each of `pods` (running, with an endpoint), one line for the lot.
+pub(crate) async fn reassert_notices(remote: &dyn Remote, cfg: &Config, pods: &[Pod]) {
+    let mut n = 0;
+    for p in pods.iter().filter(|p| !arena_core::status::is_stopped(&p.status)) {
+        let Ok(t) = SshTarget::from_pod(p, cfg) else { continue };
+        match reassert_notice(remote, cfg, p, &t).await {
+            Ok(true) => n += 1,
+            Ok(false) => {}
+            Err(why) => eprintln!("warning: {}: its reap notice wasn't written ({why})", p.name),
+        }
+    }
+    if n > 0 {
+        println!("Reap notice (the pod's end time / idle window) written on {n} pod(s) with a reap policy.");
+    }
 }
 
 /// Write (`Some`) or remove (`None`) a pod's notice, best effort: a stopped pod or one with no
@@ -612,18 +734,9 @@ async fn write_notice(env: &ReapEnv<'_>, pod: &Pod, policy: Option<&PodPolicy>) 
 
 async fn handle_clear(env: &ReapEnv<'_>, sel: &Select, expire: bool, idle: bool, dry_run: bool) -> Result<()> {
     let store = store_for(env.cfg)?;
+    store.load()?;
     let (picked, _) = pick(env, sel, "clear the reap policy of").await?;
     let (both, only_expire, only_idle) = (!expire && !idle, expire && !idle, idle && !expire);
-    let state = store.load()?;
-    let mut touched = Vec::new();
-    for p in &picked {
-        let k = core_reap::key(&p.provider, &p.id);
-        if state.pods.contains_key(&k) {
-            touched.push(p.clone());
-        } else {
-            (env.out)(&format!("{}: no reap policy", p.name));
-        }
-    }
     let what = if both || (expire && idle) {
         "policy"
     } else if only_expire {
@@ -633,30 +746,41 @@ async fn handle_clear(env: &ReapEnv<'_>, sel: &Select, expire: bool, idle: bool,
     } else {
         "policy"
     };
+    // Which of the picked pods have a policy, and the change, from the record as it is NOW —
+    // re-read under the state lock (RR7).
+    let split = |s: &ReapState| -> (Vec<Pod>, Vec<Pod>) { picked.iter().cloned().partition(|p| s.pods.contains_key(&core_reap::key(&p.provider, &p.id))) };
+    let (touched, untouched) = if dry_run {
+        split(&store.load()?)
+    } else {
+        store.update(|s| {
+            let (touched, untouched) = split(s);
+            for p in &touched {
+                let k = core_reap::key(&p.provider, &p.id);
+                let Some(rec) = s.pods.get_mut(&k) else { continue };
+                if both || expire {
+                    rec.expires_at = None;
+                    rec.first_due_seen = None;
+                }
+                if both || idle {
+                    rec.idle_after_secs = None;
+                }
+                rec.warned_soon = false;
+                if rec.is_empty() && rec.terminating.is_none() {
+                    s.pods.remove(&k);
+                }
+            }
+            Ok((touched, untouched))
+        })?
+    };
+    for p in &untouched {
+        (env.out)(&format!("{}: no reap policy", p.name));
+    }
     for p in &touched {
         (env.out)(&format!("{}{}: {what} cleared", if dry_run { "[dry-run] " } else { "" }, p.name));
     }
     if dry_run || touched.is_empty() {
         return Ok(());
     }
-    store.update(|s| {
-        for p in &touched {
-            let k = core_reap::key(&p.provider, &p.id);
-            let Some(rec) = s.pods.get_mut(&k) else { continue };
-            if both || expire {
-                rec.expires_at = None;
-                rec.first_due_seen = None;
-            }
-            if both || idle {
-                rec.idle_after_secs = None;
-            }
-            rec.warned_soon = false;
-            if rec.is_empty() && rec.terminating.is_none() {
-                s.pods.remove(&k);
-            }
-        }
-        Ok(())
-    })?;
     wrote(env, &store);
     let state = store.load()?;
     for p in &touched {
@@ -800,7 +924,14 @@ fn handle_log(env: &ReapEnv<'_>, tail: usize, pod: Option<&str>, json: bool) -> 
         });
     }
     let start = picked.len().saturating_sub(tail);
-    picked[start..].iter().for_each(|l| (env.out)(l));
+    if json {
+        // One JSON document (RR9): the lines as an array — a line that isn't JSON as a string.
+        let v: Vec<serde_json::Value> =
+            picked[start..].iter().map(|l| serde_json::from_str(l).unwrap_or_else(|_| serde_json::Value::String(l.clone()))).collect();
+        (env.out)(&serde_json::to_string_pretty(&v)?);
+    } else {
+        picked[start..].iter().for_each(|l| (env.out)(l));
+    }
     Ok(())
 }
 
@@ -1115,14 +1246,19 @@ async fn handle_run(env: &ReapEnv<'_>, sel: &Select, asked: Mode, max: Option<u3
             ),
         )?
     {
-        (env.out)("aborted.");
+        (env.out)(if json { r#"{"aborted":true}"# } else { "aborted." });
         return Ok(());
     }
     // G2: one run at a time.
     let run_lock = match store.try_run_lock() {
         Ok(Some(l)) => l,
         Ok(None) => {
-            (env.out)(&format!("reap: another run is in progress ({}) — not running", store.dir.join(store::RUN_LOCK).display()));
+            let lock = store.dir.join(store::RUN_LOCK).display().to_string();
+            if json {
+                (env.out)(&serde_json::json!({ "skipped": "another run is in progress", "lock": lock }).to_string());
+            } else {
+                (env.out)(&format!("reap: another run is in progress ({lock}) — not running"));
+            }
             return Ok(());
         }
         Err(e) => return Err(ReapExit { code: 3, why: format!("reap: {e}") }.into()),
@@ -1424,7 +1560,12 @@ async fn handle_run(env: &ReapEnv<'_>, sel: &Select, asked: Mode, max: Option<u3
         }
     }
     if reaped_any && env.sync_proxy {
-        super::sync_proxy(cfg, env.provider, "reap").await;
+        // Its report line on stderr under --json: stdout is the one JSON document.
+        if json {
+            super::sync_proxy_to_stderr(cfg, env.provider, "reap").await;
+        } else {
+            super::sync_proxy(cfg, env.provider, "reap").await;
+        }
     }
     send_notifications(&ctx).await;
     ctx.flush_log();
@@ -1824,10 +1965,7 @@ async fn act_one(ctx: &RunCtx<'_, '_>, dest: &Dest, mut pol: PodPolicy, pod: Pod
                 // I14: a failed post-terminate save — the write-ahead record still names the
                 // pod (the next run finds it gone: recovered). Say so; try to hold.
                 eprintln!("warning: {name} was terminated but the state couldn't be saved: {e}");
-                let _ = ctx.store.update(|s| {
-                    s.hold = Some(Hold { reason: format!("the state couldn't be saved after reaping {name}"), set_at: now, auto: true });
-                    Ok(())
-                });
+                let _ = ctx.store.set_hold(Some(&Hold { reason: format!("the state couldn't be saved after reaping {name}"), set_at: now, auto: true }));
                 ctx.queue(None, NotifyKind::HoldSet, Some(&name), "terminated, but the state couldn't be saved — hold set");
                 ctx.attention();
             }
@@ -1858,10 +1996,7 @@ async fn act_one(ctx: &RunCtx<'_, '_>, dest: &Dest, mut pol: PodPolicy, pod: Pod
                 Ok(Err(e)) => arena_core::fleet::clip(&e.to_string(), 200),
                 _ => "no answer within 120s".to_string(),
             };
-            let _ = ctx.store.update(|s| {
-                s.hold = Some(Hold { reason: format!("terminating {name} failed: {why}"), set_at: now, auto: true });
-                Ok(())
-            });
+            let _ = ctx.store.set_hold(Some(&Hold { reason: format!("terminating {name} failed: {why}"), set_at: now, auto: true }));
             ctx.queue(None, NotifyKind::TerminateFailed, Some(&name), &format!("terminate failed ({why}) — hold set; check the pod by hand"));
             ctx.log("act", Some(&name), Some(&key), Row::TerminateFailed, &[], Some(trigger), vec![]);
             ctx.attention();
@@ -2035,12 +2170,14 @@ pub(crate) fn ends_column(cfg: &Config, pods: &[Pod], now: u64, tz: i64) -> Opti
         }
     };
     let naming = Naming::from_config(cfg);
+    let v2 = runpod_v2(cfg);
     Some(
         pods.iter()
             .map(|p| {
                 let pol = state.pods.get(&core_reap::key(&p.provider, &p.id));
                 let pin = state.pins.iter().find(|x| x.holds(&p.name, &p.id, now));
-                render::ends_label(pol, pin, p, &naming, now, tz)
+                let inert = pol.and_then(|pol| judge::inert_why(pol, p, pods, v2));
+                render::ends_label(pol, pin, p, &naming, inert.as_deref(), now, tz)
             })
             .collect(),
     )
@@ -2102,7 +2239,18 @@ pub(crate) fn policy_not_carried_note(cfg: &Config, provider: &str, old_id: &str
 /// `config check`'s reaper rows, and what blocks reaping (counted as missing only when
 /// REAP_ENABLED=1). Local and read-only: the config, the backup roots' markers and free space,
 /// `timedatectl`, `rsync --version`.
+#[cfg(test)]
 pub(crate) fn readiness_rows(cfg: &Config, rsync: &str) -> (Vec<String>, Vec<String>) {
+    let on = cfg.get("REAP_ENABLED").map(str::trim) == Some("1");
+    readiness_rows_for(cfg, rsync, on)
+}
+
+/// [`readiness_rows`], `full` or not (RR8). Full — the reaper is on, or its cron line is
+/// installed (observe mode needs the same): every row, ✗ for each gap. Off (opt-in, the
+/// default): ONE neutral `·` row with how many things to set up before switching it on, no ✗
+/// unless a REAP_* value is set and invalid (a typo the operator should see either way), and
+/// no outside command run (`timedatectl`, `rsync`). The blockers are counted either way.
+pub(crate) fn readiness_rows_for(cfg: &Config, rsync: &str, full: bool) -> (Vec<String>, Vec<String>) {
     let (mut lines, mut blockers) = (Vec::new(), Vec::new());
     let mut row = |ok: Option<bool>, what: &str, detail: String, blocker: Option<&str>| {
         let mark = match ok {
@@ -2182,6 +2330,21 @@ pub(crate) fn readiness_rows(cfg: &Config, rsync: &str) -> (Vec<String>, Vec<Str
         if remote_path { "set — a reap needs the whole home backed up; unset it".into() } else { "unset (the whole home)".into() },
         Some("BACKUP_REMOTE_PATH unset"),
     );
+    if !full {
+        let invalid = settings.is_none();
+        let n = blockers.len();
+        let mut out: Vec<String> = if invalid { lines.into_iter().filter(|l| l.contains("REAP_* settings")).collect() } else { Vec::new() };
+        out.push(format!(
+            "  · {:<28} off (opt-in){}",
+            "reaper",
+            if n == 0 {
+                String::new()
+            } else {
+                format!(" — {n} thing(s) to set up before switching it on (REAP_ENABLED=1 in the config file lists them)")
+            }
+        ));
+        return (out, blockers);
+    }
     let ntp = real::ntp();
     row(
         Some(ntp == Some(true)),

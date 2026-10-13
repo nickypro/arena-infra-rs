@@ -157,6 +157,8 @@ pub(crate) struct UpRun<'a> {
     pub keys: Option<KeySources>,
     /// `--lock`: lock each pod as its last step (checked lockable before the create).
     pub lock: bool,
+    /// `--expire-*`/`--idle-after` given: write each pod's reap notice once it's set up (RR11).
+    pub reap_notice: bool,
 }
 
 /// The per-pod part of `up`'s plan, for the dry-run and the confirm prompt.
@@ -655,6 +657,16 @@ impl Shared<'_, '_> {
                     return self.end(run, Verdict::Failed { stage: Stage::Endpoint, reason });
                 }
                 Some(Ok(())) => {}
+            }
+        }
+
+        // The participant's notice of the reap policy this pod was created with (RR11): after
+        // setup, whose rc files the banner goes into. Best effort — said, never fatal.
+        if self.run.reap_notice {
+            match crate::reap::reassert_notice(self.run.remote.as_ref(), self.run.cfg, &pod, &target).await {
+                Ok(true) => say(To::Out, &format!("[{name}] reap notice ✓")),
+                Ok(false) => {}
+                Err(why) => say(To::Err, &format!("[{name}] reap notice not written ({why}) — `arena pods reap set {name} …` writes it")),
             }
         }
 
@@ -1626,6 +1638,7 @@ mod tests {
             }),
             keys: keys.map(|d| KeySources::load(cfg, &d.to_string_lossy(), None, None)).filter(|k| !k.csv.is_empty()),
             lock: false,
+            reap_notice: false,
         }
     }
 

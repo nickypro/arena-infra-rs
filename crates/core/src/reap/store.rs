@@ -1,7 +1,8 @@
 //! The reaper's files in `$ARENA_STATE_DIR/<prefix>/` (spec §5.1): `reap.json` (0600,
-//! written atomically and fsynced, loaded STRICTLY), its short lock `reap.json.lock` (held
-//! only around a load–modify–save), the run lock `reap.lock` (one run at a time) and the log
-//! `reap-log.jsonl` (+ `.1`).
+//! written atomically and fsynced, loaded STRICTLY), the hold in its own `hold.json` (so a
+//! hold can be set or released whatever state `reap.json` is in — RR13), their short lock
+//! `reap.json.lock` (held only around a load–modify–save), the run lock `reap.lock` (one run
+//! at a time) and the log `reap-log.jsonl` (+ `.1`).
 //!
 //! Strict means: a missing file is empty state (nothing is authorised); a corrupt, unreadable
 //! or other-version file is an error, never read as empty and never overwritten — its bytes
@@ -16,6 +17,7 @@ use super::judge::WriteAheadProof;
 use super::{ReapState, Terminating, Trigger};
 
 pub const STATE_FILE: &str = "reap.json";
+pub const HOLD_FILE: &str = "hold.json";
 pub const STATE_LOCK: &str = "reap.json.lock";
 pub const RUN_LOCK: &str = "reap.lock";
 pub const LOG_FILE: &str = "reap-log.jsonl";
@@ -50,9 +52,14 @@ impl std::fmt::Display for StoreError {
         let owner = |o: &Option<u32>| o.map(|u| format!(" (the file is owned by uid {u})")).unwrap_or_default();
         match self {
             StoreError::Unreadable { path, error, owner: o } => write!(f, "can't read {}: {error}{}", path.display(), owner(o)),
-            StoreError::Corrupt { path, error } => {
-                write!(f, "{} isn't a reap state file this arena can read ({error}) — left untouched", path.display())
-            }
+            StoreError::Corrupt { path, error } => write!(
+                f,
+                "{p} isn't a reap state file this arena can read ({error}) — left untouched. Nothing is reaped while it \
+                 stays; `arena pods reap hold`/`release` still work. To start over: `mv {p} {p}.bad-$(date -u \
+                 +%Y%m%dT%H%M%SZ)` — the reaper then has no policies (nothing is reaped until `reap set` again; \
+                 `arena pods reap log` shows what was set)",
+                p = path.display()
+            ),
             StoreError::Lock { path, error } => write!(f, "can't lock {}: {error}", path.display()),
             StoreError::Write { path, error, owner: o } => write!(f, "can't write {}: {error}{}", path.display(), owner(o)),
             StoreError::Refused(why) => write!(f, "{why}"),
@@ -92,14 +99,63 @@ impl Store {
         self.dir.join(LOG_FILE)
     }
 
-    /// Load strictly (see the module doc).
+    pub fn hold_path(&self) -> PathBuf {
+        self.dir.join(HOLD_FILE)
+    }
+
+    /// Load strictly (see the module doc), the hold from its own file.
     pub fn load(&self) -> Result<ReapState, StoreError> {
         let path = self.state_path();
+        let mut state = match std::fs::read_to_string(&path) {
+            Ok(text) => ReapState::parse(&text).map_err(|error| StoreError::Corrupt { path, error })?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => ReapState::default(),
+            Err(e) => return Err(StoreError::Unreadable { owner: owner_of(&path), path, error: e.to_string() }),
+        };
+        state.hold = self.read_hold()?;
+        Ok(state)
+    }
+
+    /// The hold (`hold.json`), strictly: none without the file; one that can't be read is an
+    /// error (a run then doesn't act), never "no hold".
+    pub fn read_hold(&self) -> Result<Option<super::Hold>, StoreError> {
+        let path = self.hold_path();
         match std::fs::read_to_string(&path) {
-            Ok(text) => ReapState::parse(&text).map_err(|error| StoreError::Corrupt { path, error }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ReapState::default()),
+            Ok(text) => super::Hold::parse_file(&text).map(Some).map_err(|error| StoreError::Corrupt { path, error }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(StoreError::Unreadable { owner: owner_of(&path), path, error: e.to_string() }),
         }
+    }
+
+    /// Write (`Some`) or remove (`None`) the hold file, atomically and fsynced — under the state
+    /// lock, never reading `reap.json` (RR13: a corrupt one doesn't stop `reap hold`).
+    pub fn set_hold(&self, hold: Option<&super::Hold>) -> Result<(), StoreError> {
+        let _lock = self.lock_state()?;
+        self.write_hold(hold)
+    }
+
+    /// [`Store::set_hold`] only while the hold is still `seen` (what an operator was shown
+    /// before confirming a release): `Ok(false)` = it changed meanwhile, left as it is.
+    pub fn clear_hold_if(&self, seen: &super::Hold) -> Result<bool, StoreError> {
+        let _lock = self.lock_state()?;
+        if self.read_hold().ok().flatten().as_ref() != Some(seen) {
+            return Ok(false);
+        }
+        self.write_hold(None).map(|()| true)
+    }
+
+    fn write_hold(&self, hold: Option<&super::Hold>) -> Result<(), StoreError> {
+        let path = self.hold_path();
+        let werr = |e: std::io::Error| StoreError::Write { owner: owner_of(&path), path: path.clone(), error: e.to_string() };
+        crate::snapshot::create_private_dir(&self.dir).map_err(werr)?;
+        match hold {
+            Some(h) => crate::snapshot::write_atomic(&path, h.to_file().as_bytes(), 0o600).map_err(werr)?,
+            None => match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(werr(e)),
+            },
+        }
+        File::open(&self.dir).and_then(|d| d.sync_all()).map_err(werr)
     }
 
     /// Load for display only (`pods list`'s ENDS column): `Ok(None)` when there is no file.
@@ -117,7 +173,12 @@ impl Store {
         let werr = |e: std::io::Error| StoreError::Write { owner: owner_of(&path), path: path.clone(), error: e.to_string() };
         crate::snapshot::create_private_dir(&self.dir).map_err(werr)?;
         crate::snapshot::write_atomic(&path, state.to_json().as_bytes(), 0o600).map_err(werr)?;
-        File::open(&self.dir).and_then(|d| d.sync_all()).map_err(werr)
+        File::open(&self.dir).and_then(|d| d.sync_all()).map_err(werr)?;
+        // The hold, as the state now has it (it lives in its own file).
+        if self.read_hold().ok().flatten() != state.hold {
+            self.write_hold(state.hold.as_ref())?;
+        }
+        Ok(())
     }
 
     /// The state lock, held until the returned file is dropped (waits up to

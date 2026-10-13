@@ -246,8 +246,13 @@ o proc_n "$(n_of proc)"
 o self "$(printf %s "$SELF" | tr -c '0-9a-fA-F.: ' '?' | cut -c1-120)"
 
 # --- Logins, tmux, screen ---------------------------------------------------------------------
+# `who` without the utmp entries tmux (libutempter: host `tmux(<pid>).%<pane>`) and screen
+# (host `:<n>…`) write for their own windows: those are judged by the tmux/screen facts below
+# (a pane running only a shell isn't use), not as logins.
 if command -v who >/dev/null 2>&1; then
-    if w=$(timeout 5 who 2>/dev/null); then o who "$(printf '%s' "$w" | grep -c .)"; else o who -; fi
+    if w=$(timeout 5 who 2>/dev/null); then
+        o who "$(printf '%s\n' "$w" | grep -v -E '[(](tmux[(][0-9]+[)][.]%[0-9]+|:[^)]*)[)][[:space:]]*$' | grep -c .)"
+    else o who -; fi
 else
     o who absent
 fi

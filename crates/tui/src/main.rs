@@ -1572,6 +1572,14 @@ async fn run_backup(remote: &dyn Remote, cfg: &Config, pod: &Pod) -> String {
         Ok(t) => t,
         Err(e) => return format!("✗ {}: {e}", pod.name),
     };
+    // The pod's backup lock, like every other writer of its backup (RR10): never alongside a
+    // pull, the cron's push or the reaper's own backup of it (whose git step would then fail
+    // on `.git/index.lock`). Busy = say so and do nothing.
+    let dir = cfg.get("LOCAL_BACKUP_DIR").map(str::trim).filter(|d| !d.is_empty()).unwrap_or("./backup");
+    let _lock = match arena_core::pull::try_pod_lock_now(dir, &pod.name) {
+        Ok(lock) => lock,
+        Err(()) => return format!("⊘ {} — busy: another backup of it (a pull, the cron or the reaper) is running; try again shortly", pod.name),
+    };
     let repo = backup_repo_path(cfg);
     let cmd = backup::backup_command(&repo, cfg.get("GIT_SSH_KEY_REMOTE"), &format!("arena-tui backup {}", pod.name));
     match remote.exec(&target, &cmd, Some(BACKUP_TIMEOUT)).await {
@@ -4014,6 +4022,22 @@ deep_check_end=1
         let fake = FakeRemote::new();
         let charlie = pod("charlie", "runpod", "rp3", 3, None);
         assert!(run_backup(&fake, &cfg, &charlie).await.starts_with("✗ devtest-charlie: "));
+        // RR10: the pod's backup lock held by another backup (a pull, the cron, the reaper):
+        // busy, said, nothing run on the pod.
+        let dir = std::env::temp_dir().join(format!("arena-tui-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let locked = self::cfg(&format!(
+            "ARENA_REPO_OWNER=nickypro\nARENA_REPO_NAME=arena-sandbox-materials\nGIT_SSH_KEY_LOCAL=/nonexistent/deploy_key\nLOCAL_BACKUP_DIR={}\n",
+            dir.display()
+        ));
+        let held = arena_core::pull::open_pod_lock(&dir.display().to_string(), &alpha.name).unwrap();
+        assert!(arena_core::pull::try_lock(&held).unwrap());
+        let quiet = FakeRemote::new();
+        let line = run_backup(&quiet, &locked, &alpha).await;
+        assert!(line.starts_with("⊘ ") && line.contains("busy"), "{line}");
+        assert!(quiet.calls().is_empty(), "{:?}", quiet.calls());
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
         assert!(fake.calls().is_empty());
     }
 }

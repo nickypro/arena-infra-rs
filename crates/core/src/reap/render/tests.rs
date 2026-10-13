@@ -33,7 +33,7 @@ fn ends_label_every_state() {
         p.last = Some(LastDecision { t: T, row, reasons: vec![] });
         p
     };
-    let label = |p: Option<&PodPolicy>, pin: Option<&Pin>, pod: &Pod| ends_label(p, pin, pod, &naming, T, TZ);
+    let label = |p: Option<&PodPolicy>, pin: Option<&Pin>, pod: &Pod| ends_label(p, pin, pod, &naming, None, T, TZ);
     assert_eq!(label(None, None, &a), "-");
     assert_eq!(label(Some(&pol(Some(T + 4 * 86_400), None)), None, &a), "10-12 14:00");
     assert_eq!(label(Some(&pol(Some(T + 5 * 3600), None)), None, &a), "19:00 (in 5h)");
@@ -54,6 +54,9 @@ fn ends_label_every_state() {
     assert_eq!(label(Some(&with_last(idle.clone(), Row::Keep)), None, &a), "kept on pod");
     assert_eq!(label(Some(&with_last(idle.clone(), Row::NotCovered)), None, &a), "not covered");
     assert_eq!(label(Some(&idle), None, &pod("devtest-zulu")), "ignored (off-list)");
+    // RR2: a policy the reaper can't act on never counts down, never reads OVERDUE.
+    let overdue = pol(Some(T - 35 * 60), None);
+    assert_eq!(ends_label(Some(&overdue), None, &a, &naming, Some("vast"), T, TZ), "not reapable (vast)");
     assert_eq!(label(Some(&idle), None, &pod("devtest-boss")), "ignored (off-list)");
 }
 
@@ -106,6 +109,52 @@ fn banner_is_interactive_only_and_on_stderr() {
     assert!(w.contains("| wall") && w.contains("in about 1h") && w.ends_with("; true"), "{w}");
 }
 
+/// RR14: the notice command run for real, twice, in a temp HOME: one banner line per rc file;
+/// a non-interactive `sh -c` / `bash -c` sourcing the rc prints NOTHING (stdout or stderr —
+/// rsync and scp run through it); an interactive bash prints the notice, on stderr only.
+#[cfg(unix)]
+#[test]
+fn banner_is_silent_unless_interactive_and_then_on_stderr() {
+    use std::process::{Command, Stdio};
+    let home = std::env::temp_dir().join(format!("arena-reap-banner-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join(".bashrc"), "# the image's\n").unwrap();
+    std::fs::write(home.join(".zshrc"), "# the image's\n").unwrap();
+    let text = "arena: devtest-alpha is set to be shut down at 18:00\n";
+    let run = |prog: &str, args: &[&str]| {
+        Command::new(prog)
+            .args(args)
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    for _ in 0..2 {
+        let o = run("sh", &["-c", &notice_write_command(text)]);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    }
+    assert_eq!(std::fs::read_to_string(home.join(".arena/NOTICE")).unwrap(), text);
+    for rc in [".bashrc", ".zshrc"] {
+        let body = std::fs::read_to_string(home.join(rc)).unwrap();
+        assert_eq!(body.lines().filter(|l| *l == BANNER_LINE).count(), 1, "{rc}:\n{body}");
+    }
+    // Non-interactive: nothing on either stream.
+    for (prog, script) in [("sh", ". \"$HOME/.bashrc\""), ("bash", ". \"$HOME/.bashrc\"; true")] {
+        let o = run(prog, &["-c", script]);
+        assert!(o.stdout.is_empty() && o.stderr.is_empty(), "{prog}: {:?} / {:?}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    }
+    // Interactive (bash reads ~/.bashrc): the notice on stderr, stdout untouched.
+    if Command::new("bash").arg("--version").output().is_ok() {
+        let o = run("bash", &["-i", "-c", "true"]);
+        assert!(o.stdout.is_empty(), "{:?}", String::from_utf8_lossy(&o.stdout));
+        assert!(String::from_utf8_lossy(&o.stderr).contains("set to be shut down"), "{:?}", String::from_utf8_lossy(&o.stderr));
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// The cron line, both modes.
 #[test]
 fn cron_line_both_modes() {
@@ -113,7 +162,7 @@ fn cron_line_both_modes() {
     let observe = cron_line(false, "/usr/local/bin/arena", "/root/arena/config.env", "/root", &env);
     assert_eq!(
         observe,
-        "7,22,37,52 * * * * PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ARENA_STATE_DIR=/var/lib/arena flock -n /root/.arena-reap-cron.lock /usr/local/bin/arena --config /root/arena/config.env pods reap run >> /root/arena-reap-cron.log 2>&1"
+        "7,22,37,52 * * * * PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ARENA_STATE_DIR=/var/lib/arena flock -n -o /root/.arena-reap-cron.lock /usr/local/bin/arena --config /root/arena/config.env pods reap run >> /root/arena-reap-cron.log 2>&1"
     );
     let apply = cron_line(true, "/usr/local/bin/arena", "/root/arena/config.env", "/root", &[]);
     assert!(apply.contains(" pods reap run --apply --yes >> "), "{apply}");

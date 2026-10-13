@@ -1557,8 +1557,13 @@ struct ReapAtCreate {
 }
 
 impl ReapAtCreate {
-    /// The policy and where to record it (`None`: no flag given). Errors before any create.
-    fn resolve(&self, cfg: &Config) -> Result<Option<(reap::CreatePolicy, arena_core::reap::store::Store)>> {
+    /// The policy and where to record it (`None`: no flag given). Errors before any create —
+    /// also when `provider` (where the pods go) is one the reaper never acts on (RR2).
+    fn resolve(&self, cfg: &Config, provider: &str) -> Result<Option<(reap::CreatePolicy, arena_core::reap::store::Store)>> {
+        let asked = self.expire_in.is_some() || self.expire_at.is_some() || self.idle_after.is_some();
+        if let (true, Some(why)) = (asked, reap::create_flags_refusal(cfg, provider)) {
+            anyhow::bail!("{why}");
+        }
         reap::resolve_create_policy(
             cfg,
             self.expire_in.as_deref(),
@@ -3477,10 +3482,14 @@ async fn handle_setup(
             pods: sel.pods.iter().filter(|p| provisioned.contains(&p.name)).cloned().collect(),
             named: true,
         };
-        if let Err(e) = handle_copy_keys(remote, cfg, keys_dir, None, None, &done, false, true).await {
+        if let Err(e) = handle_copy_keys(remote.clone(), cfg, keys_dir, None, None, &done, false, true).await {
             eprintln!("  (API-key distribution failed: {e})");
         }
     }
+    // The reap notice on each pod set up that has a policy (RR11): setup has just written its
+    // shell rc files (where the banner goes), and a restart that reset the container lost it.
+    let set_up: Vec<arena_core::Pod> = sel.pods.iter().filter(|p| provisioned.contains(&p.name)).cloned().collect();
+    reap::reassert_notices(remote.as_ref(), cfg, &set_up).await;
 
     if failed > 0 {
         anyhow::bail!("{failed} pod(s) failed to set up");
@@ -4126,6 +4135,18 @@ fn reap_cron_line(apply: bool, config_path: &std::path::Path, exe: &str, cfg_abs
     Ok(arena_core::reap::render::cron_line(apply, exe, cfg_abs, home, &env))
 }
 
+/// Whether this user's crontab has the reap line — `config check` then shows the reaper's
+/// readiness in full (observe mode needs it too). Unreadable (no crontab, no `crontab`): no.
+fn reap_cron_installed() -> bool {
+    std::process::Command::new(CRONTAB)
+        .arg("-l")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .is_some_and(|o| String::from_utf8_lossy(&o.stdout).lines().any(|l| CronKind::of(l) == Some(CronKind::Reap)))
+}
+
 /// Replace the crontab with `content` via `crontab -` (reads from stdin).
 async fn write_crontab(content: &str, crontab: &str) -> Result<()> {
     use std::process::Stdio;
@@ -4607,11 +4628,15 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
     }
 
     println!("\nAuto-reaper (`pods reap`, opt-in; REAP_* are read from the config file only):");
-    let (lines, blockers) = reap::readiness_rows(cfg, RSYNC);
+    let enabled = cfg.get("REAP_ENABLED").map(str::trim) == Some("1");
+    let (lines, blockers) = reap::readiness_rows_for(cfg, RSYNC, enabled || reap_cron_installed());
     lines.iter().for_each(|l| println!("{l}"));
-    // Only a reaper that's switched on makes its gaps a failure of the check.
-    if cfg.get("REAP_ENABLED").map(str::trim) == Some("1") {
+    // Only a reaper that's switched on makes its gaps a failure of the check; a REAP_* value
+    // that's set but invalid fails it either way.
+    if enabled {
         missing.extend(blockers);
+    } else if arena_core::reap::ReapSettings::from_config(cfg).is_err() {
+        missing.push("REAP_* settings".to_string());
     }
 
     println!("\nDashboard (optional):");
@@ -4697,6 +4722,9 @@ async fn handle_backup(
     message: Option<String>,
     // The pods to back up, resolved by the caller (`pods backup` shares it with the pull).
     sel: &Selected,
+    // The pods' backup locks the caller took ([`take_pod_locks`]; empty = none): each is
+    // released as that pod's push ends (RR3).
+    locks: &mut PodLocks,
 ) -> Result<()> {
     use arena_core::backup;
 
@@ -4738,6 +4766,12 @@ async fn handle_backup(
     }
 
     // Run concurrently with a live [done/total] counter (one SSH per pod, slow serially).
+    // Each pod's lock (when the caller took them) goes as that pod's push ends; a name with no
+    // push to run here (no endpoint) at once.
+    for (name, _) in &targets {
+        locks.expect(name);
+    }
+    locks.release_idle();
     let total = targets.len();
     println!(
         "Backing up {total} pod(s) over SSH (current branch; main/master skipped; {}s budget each)…",
@@ -4750,7 +4784,7 @@ async fn handle_backup(
             (name, target, cmd)
         })
         .collect();
-    let t = backup_fleet(&remote, jobs, &repo_path, |line| println!("{line}")).await;
+    let t = backup_fleet(&remote, jobs, &repo_path, |line| println!("{line}"), |name| locks.done(name)).await;
     println!(
         "\nDone: {} pushed, {} unchanged, {} skipped (main/master), {} failed.",
         t.pushed, t.unchanged, t.skipped, t.failed
@@ -4803,11 +4837,12 @@ async fn handle_full_backup(
     // INDEPENDENT of git, so a git failure on one pod (e.g. a missing repo, or a pod
     // sitting on main) must NOT skip the rsync for the whole fleet. Capture the git
     // result, always run the pull, then surface the git error at the end.
-    // Each pod's backup lock, once, for both steps: the git push's SSH session must not
-    // overlap a reaper probe of the pod (where it would count as activity) any more than the
-    // rsync may. A pod another backup holds for the whole wait is left out of both, named.
+    // Each pod's backup lock for its git push (whose SSH session must not overlap a reaper
+    // probe of the pod, where it would count as activity), released as that pod's push ends
+    // (RR3); the pull then takes each again for that pod's own rsyncs. A name another backup
+    // holds for the whole wait is left out of both, named.
     let dir = local_backup_dir(cfg);
-    let (sel, locks) = if dry_run {
+    let (sel, mut locks) = if dry_run {
         (sel.clone(), PodLocks::default())
     } else {
         let names: Vec<String> = sel.pods.iter().map(|p| p.name.clone()).collect();
@@ -4816,15 +4851,16 @@ async fn handle_full_backup(
         (kept, locks)
     };
     for b in &locks.busy {
-        println!("✗ {b}: {}", busy_line(b));
+        println!("✗ {b}: {}", busy_line(b, POD_LOCK_WAIT));
     }
-    let git_result = if sel.pods.is_empty() { Ok(()) } else { handle_backup(remote.clone(), cfg, !dry_run, message, &sel).await };
+    let git_result =
+        if sel.pods.is_empty() { Ok(()) } else { handle_backup(remote.clone(), cfg, !dry_run, message, &sel, &mut locks).await };
+    locks.held.clear();
     if !no_pull && !sel.pods.is_empty() {
         println!();
         let args = PullRun { label: None, max_size: None, remote_path: None, no_git: false, no_big: false, dry_run, yes: true };
-        pull_locked(&remote, cfg, &dir, args, &sel, rsync, LockMode::Held).await?;
+        pull_locked(&remote, cfg, &dir, args, &sel, rsync, LockMode::Take(POD_LOCK_WAIT)).await?;
     }
-    drop(locks.held);
     git_result?;
     if !locks.busy.is_empty() {
         anyhow::bail!("{} pod(s) not backed up — another backup held them: {}", locks.busy.len(), locks.busy.join(", "));
@@ -4856,6 +4892,8 @@ async fn backup_fleet(
     jobs: Vec<(String, SshTarget, String)>,
     repo: &str,
     mut emit: impl FnMut(&str),
+    // Each pod's name as its push ends (its backup lock is released there).
+    mut ended: impl FnMut(&str),
 ) -> BackupTally {
     use arena_core::backup::{self, parse_backup_report};
     let mut t = BackupTally::default();
@@ -4892,6 +4930,7 @@ async fn backup_fleet(
             }
         };
         emit(&line);
+        ended(name);
     })
     .await;
     t
@@ -5295,6 +5334,17 @@ async fn sync_proxy(cfg: &Config, fleet: &dyn Provider, why: &str) -> ProxySync 
         Ok(()) => proxy_sync_now(cfg, fleet).await,
     };
     report_sync(why, outcome)
+}
+
+/// [`sync_proxy`] with its report line on stderr — for a caller whose stdout is a JSON
+/// document (`pods reap run --json`).
+async fn sync_proxy_to_stderr(cfg: &Config, fleet: &dyn Provider, why: &str) -> ProxySync {
+    let outcome = match proxy_deployable(cfg).await {
+        Err(reason) => ProxySync::Skipped(reason),
+        Ok(()) => proxy_sync_now(cfg, fleet).await,
+    };
+    eprintln!("{}", sync_line(why, &outcome));
+    outcome
 }
 
 /// [`sync_proxy`]'s merge + write, without its deployability probe or its report line — for
@@ -5965,7 +6015,7 @@ async fn handle_pods_with(
         PodCmd::Create { names, count, add, gpu, gpus, cloud, max_price, order, disk, volume, image, bootstrap, api_json, reap, skip_proxy, dry_run, keep_trying, retry_mins, retry_secs } => {
             // A reap policy asked for: resolved (one end time for every pod) and its state
             // checked before anything is created; then every create records it.
-            let reaping = reap.resolve(cfg)?;
+            let reaping = reap.resolve(cfg, provider.name())?;
             let recorder;
             let provider: &dyn Provider = match &reaping {
                 Some((policy, store)) => {
@@ -6070,7 +6120,7 @@ async fn handle_pods_with(
         PodCmd::Up { names, count, add, gpu, gpus, cloud, max_price, order, disk, volume, image, bootstrap, api_json, reap, dry_run, no_wait, keep_trying, retry_mins, retry_secs, no_setup, check, check_attempts, lock, timeout, interval } => {
             // As `create`: the reap policy is resolved once, before anything is created, and
             // recorded for each pod (replacements included) the moment its create returns.
-            let reaping = reap.resolve(cfg)?;
+            let reaping = reap.resolve(cfg, provider.name())?;
             let recorder;
             let provider: &dyn Provider = match &reaping {
                 Some((policy, store)) => {
@@ -6246,6 +6296,7 @@ async fn handle_pods_with(
                 }),
                 keys,
                 lock,
+                reap_notice: reaping.is_some(),
             };
             println!(
                 "\nEach pod is brought up on its own the moment it's created (endpoint wait ≤{timeout}s per pod; \
@@ -11542,14 +11593,14 @@ struct PullRun {
     yes: bool,
 }
 
-/// Whether a pull takes the per-pod backup locks itself, or runs under ones its caller holds
-/// (`pods backup`, which takes them once for the git push and the pull).
+/// How a pull takes the per-pod backup locks: each name's once, waiting up to this long for
+/// one another backup holds, each released when that pod's own rsyncs end (RR3). (`pods
+/// backup` takes them for its git push and releases each as that pod's push ends; the pull
+/// then takes them again.)
 #[derive(Debug, Clone, Copy)]
 enum LockMode {
     /// Take each pod's lock, waiting up to this long for one another backup holds.
     Take(Duration),
-    /// The caller holds them.
-    Held,
 }
 
 /// How long `pods pull` / `pods backup` wait for a pod's backup lock when another backup of
@@ -11557,30 +11608,71 @@ enum LockMode {
 /// that the pod is a failure for this run (`busy: …`), the others carry on.
 const POD_LOCK_WAIT: Duration = Duration::from_secs(120);
 
-/// The per-pod backup locks a run took ([`arena_core::pull::pod_lock_path`]), and the pods
-/// whose lock another backup held for the whole wait.
+/// The per-pod backup locks a run holds ([`arena_core::pull::pod_lock_path`]): one per
+/// distinct NAME — two listed pods sharing a name share it, so a run never waits on its own
+/// lock (RR1) — each released as soon as the last piece of this run's work under it ends
+/// ([`PodLocks::done`]), not when the fleet's slowest pod does (RR3); and the names another
+/// backup held for the whole wait.
 #[derive(Debug, Default)]
 struct PodLocks {
-    /// Held until this is dropped.
-    held: Vec<std::fs::File>,
-    /// Pods whose lock stayed busy: skipped, a failure.
+    /// Held (until released or this is dropped), with how many pieces of this run's work are
+    /// still to end under each.
+    held: std::collections::HashMap<String, (std::fs::File, usize)>,
+    /// Names whose lock stayed busy: skipped, a failure.
     busy: Vec<String>,
 }
 
-/// Take the backup lock of each of `names` in `dir`, all at once, waiting up to `wait` for
-/// the busy ones. A lock that can't even be opened (the backup dir not writable here) is
-/// warned about once and gone without — the run then fails or succeeds as it always did;
-/// only a lock another backup HOLDS keeps a pod out. A relative `dir` takes no locks: the
-/// reaper (the backup these locks keep out of each other's way) refuses one, and a relative
-/// path means a different place to every cwd — the legacy `./backup` setup is unchanged.
+impl PodLocks {
+    /// `name` has one more piece of work under its lock (a lock this run doesn't hold: nothing).
+    fn expect(&mut self, name: &str) {
+        if let Some((_, left)) = self.held.get_mut(name) {
+            *left += 1;
+        }
+    }
+
+    /// One piece of `name`'s work ended: the lock goes with the last.
+    fn done(&mut self, name: &str) {
+        if let Some((_, left)) = self.held.get_mut(name) {
+            *left = left.saturating_sub(1);
+            if *left == 0 {
+                self.held.remove(name);
+            }
+        }
+    }
+
+    /// Release every lock no work was announced under ([`PodLocks::expect`]).
+    fn release_idle(&mut self) {
+        self.held.retain(|_, (_, left)| *left > 0);
+    }
+
+    /// Whether this run holds `name`'s lock.
+    #[cfg(test)]
+    fn holds(&self, name: &str) -> bool {
+        self.held.contains_key(name)
+    }
+}
+
+/// Take the backup lock of each distinct name in `names` in `dir` — once per name (RR1) —
+/// waiting up to `wait` for the busy ones; nothing is announced under them yet (the caller
+/// [`PodLocks::expect`]s its work, then releases the idle ones). A lock that can't even be
+/// opened (the backup dir not writable here) is warned about once and gone without — the run
+/// then fails or succeeds as it always did; only a lock another backup HOLDS keeps a pod out.
+/// A relative `dir` takes no locks: the reaper (the backup these locks keep out of each
+/// other's way) refuses one, and a relative path means a different place to every cwd — the
+/// legacy `./backup` setup is unchanged. Nor does a `dir` that doesn't exist yet (RR5): the
+/// locks never create it — the run goes as it did before them.
 async fn take_pod_locks(dir: &str, names: &[String], wait: Duration) -> PodLocks {
     let mut out = PodLocks::default();
-    if !std::path::Path::new(dir).is_absolute() {
+    let path = std::path::Path::new(dir);
+    if !path.is_absolute() || !path.is_dir() {
         return out;
     }
+    let mut names: Vec<String> = names.to_vec();
+    names.sort();
+    names.dedup();
     let mut pending: Vec<(String, std::fs::File)> = Vec::new();
     let mut warned = false;
-    for name in names {
+    for name in &names {
         match arena_core::pull::open_pod_lock(dir, name) {
             Ok(f) => pending.push((name.clone(), f)),
             Err(e) if !warned => {
@@ -11596,7 +11688,9 @@ async fn take_pod_locks(dir: &str, names: &[String], wait: Duration) -> PodLocks
         let mut still = Vec::new();
         for (name, f) in pending {
             match arena_core::pull::try_lock(&f) {
-                Ok(true) => out.held.push(f),
+                Ok(true) => {
+                    out.held.insert(name, (f, 0));
+                }
                 Ok(false) => still.push((name, f)),
                 Err(e) => {
                     eprintln!("warning: locking {name}'s backup failed ({e}) — going ahead without its lock");
@@ -11618,9 +11712,9 @@ async fn take_pod_locks(dir: &str, names: &[String], wait: Duration) -> PodLocks
     out
 }
 
-/// The line for a pod whose backup lock stayed busy.
-fn busy_line(name: &str) -> String {
-    format!("busy: another backup of {name} is running (waited {}s for its lock) — skipped this run", POD_LOCK_WAIT.as_secs())
+/// The line for a pod whose backup lock stayed busy for the whole `wait`.
+fn busy_line(name: &str, wait: Duration) -> String {
+    format!("busy: another backup of {name} is running (waited {}s for its lock) — skipped this run", wait.as_secs())
 }
 
 /// Where a pull writes its big tier, and whether it's in two-volume mode: `LOCAL_BACKUP_BIG_DIR`
@@ -11777,13 +11871,12 @@ async fn pull_locked(
     // Each pod's backup lock, unless the caller holds them: a pod another backup holds for
     // the whole wait is skipped — a failure of this run, named.
     let mut lock_failures: Vec<String> = Vec::new();
-    let _locks = match locking {
-        LockMode::Held => PodLocks::default(),
+    let mut locks = match locking {
         LockMode::Take(wait) => {
             let names: Vec<String> = targets.iter().map(|(n, _)| n.clone()).collect();
             let locks = take_pod_locks(dir, &names, wait).await;
             for b in &locks.busy {
-                println!("✗ {b}: {}", busy_line(b));
+                println!("✗ {b}: {}", busy_line(b, wait));
                 lock_failures.push(format!("{b} (busy)"));
             }
             locks
@@ -11839,6 +11932,8 @@ async fn pull_locked(
         }
     }
     let mut set = tokio::task::JoinSet::new();
+    // Each running job's pod, by task: its lock goes when the pod's last job ends (RR3).
+    let mut job_pod: std::collections::HashMap<tokio::task::Id, String> = Default::default();
     let (mut jobs, mut failed) = (0, 0);
     // Which jobs failed, by name: the summary (and the cron log) must say which pod to look at.
     let mut failures: Vec<String> = Vec::new();
@@ -11870,7 +11965,9 @@ async fn pull_locked(
             job.config.passes().iter().map(|pc| (pc.git_only, pull::rsync_args(t, pc, dest))).collect();
         let (name, rsync) = (name.clone(), rsync.to_string());
         jobs += 1;
-        set.spawn(async move {
+        locks.expect(&name);
+        let pod = name.clone();
+        let handle = set.spawn(async move {
             let started = tokio::time::Instant::now();
             let mut stats: Option<pull::RsyncStats> = None;
             for (i, (git, args)) in passes.into_iter().enumerate() {
@@ -11895,14 +11992,25 @@ async fn pull_locked(
             }
             (name, tier, Ok(stats))
         });
+        job_pod.insert(handle.id(), pod);
     }
+    // A pod none of whose jobs started holds its lock no longer.
+    locks.release_idle();
     let (mut ok, mut done) = (0, 0);
-    while let Some(joined) = set.join_next().await {
+    while let Some(joined) = set.join_next_with_id().await {
         done += 1;
         let (name, tier, out) = match joined {
-            Ok(r) => r,
+            Ok((id, r)) => {
+                if let Some(pod) = job_pod.remove(&id) {
+                    locks.done(&pod);
+                }
+                r
+            }
             // A crashed task still counts — as a failure, never silently.
             Err(e) => {
+                if let Some(pod) = job_pod.remove(&e.id()) {
+                    locks.done(&pod);
+                }
                 println!("[{done}/{jobs}] ✗ an rsync task crashed: {e}");
                 failed += 1;
                 failures.push("(a crashed task)".into());
@@ -12308,7 +12416,7 @@ async fn handle_restore(
     let (big_root, two_volume) = pull_roots(cfg, &opts.dir);
     let (label, src) = match opts.from.as_deref() {
         Some(restore::BIG) if two_volume => restore::resolve_big(std::path::Path::new(&big_root), &pod.name),
-        from => restore::resolve_source(base, &pod.name, from),
+        from => restore::resolve_source(base, std::path::Path::new(&big_root), &pod.name, from),
     }
     .map_err(|e| anyhow::anyhow!("refusing to restore {}: {e}", pod.name))?;
     let sub = opts.path.as_deref().map(restore::check_subpath).transpose().map_err(|e| anyhow::anyhow!(e))?;
@@ -18344,7 +18452,7 @@ mod remote_tests {
         let jobs = targets(&f).into_iter().map(|(n, t)| (n, t, "backup".to_string())).collect();
         let mut lines = Vec::new();
         let start = Instant::now();
-        let tally = backup_fleet(&remote, jobs, REPO, |l| lines.push(l.to_string())).await;
+        let tally = backup_fleet(&remote, jobs, REPO, |l| lines.push(l.to_string()), |_| {}).await;
         assert_eq!(tally, BackupTally { pushed: 1, unchanged: 1, skipped: 1, failed: 2 });
         assert_eq!(start.elapsed(), BACKUP_TIMEOUT);
         // The wedged pod reports last, after its budget; the rest as soon as they answered.
@@ -18364,7 +18472,7 @@ mod remote_tests {
         // Through the command: each pod's own commit message, the budget, a non-zero result.
         let fake = Arc::new(FakeRemote::new());
         fake.script(&host(22002), [FakeReply::exit(1, "boom")]);
-        let err = handle_backup(fake.clone(), &cfg(), true, None, &everyone(&fleet())).await.unwrap_err();
+        let err = handle_backup(fake.clone(), &cfg(), true, None, &everyone(&fleet()), &mut crate::PodLocks::default()).await.unwrap_err();
         assert_eq!(err.to_string(), "1 pod(s) failed to back up");
         for (name, port) in [("apple", 22001), ("bloom", 22002), ("cloud", 22003)] {
             let want = backup_command(REPO, Some(KEY), &format!("arena backup devtest-{name}"));
@@ -18372,8 +18480,36 @@ mod remote_tests {
         }
         // Dry run: nothing reaches a pod.
         let fake = Arc::new(FakeRemote::new());
-        handle_backup(fake.clone(), &cfg(), false, None, &everyone(&fleet())).await.unwrap();
+        handle_backup(fake.clone(), &cfg(), false, None, &everyone(&fleet()), &mut crate::PodLocks::default()).await.unwrap();
         assert!(fake.calls().is_empty());
+    }
+
+    /// RR3: `pods backup`'s git push releases each pod's backup lock the moment that pod's push
+    /// ends — a wedged pod (here: one that hangs to the budget) keeps only its own.
+    #[tokio::test(start_paused = true)]
+    async fn rr3_backup_releases_each_pods_lock_as_its_push_ends() {
+        let dir = std::env::temp_dir().join(format!("arena-rr3-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.display().to_string();
+        let f = fleet_of(&[("apple", 22001), ("bloom", 22002)]);
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [FakeReply::stdout("NO_CHANGES feature-y\n")]);
+        fake.script(&host(22002), [FakeReply::hang()]);
+        let names: Vec<String> = f.pods.iter().map(|p| p.name.clone()).collect();
+        let mut locks = crate::take_pod_locks(&d, &names, Duration::from_millis(10)).await;
+        assert!(locks.holds("devtest-apple") && locks.holds("devtest-bloom"));
+        let free = |n: &str| arena_core::pull::try_lock(&arena_core::pull::open_pod_lock(&d, n).unwrap()).unwrap();
+        let (sel, c) = (everyone(&f), cfg());
+        let backup = handle_backup(fake.clone(), &c, true, None, &sel, &mut locks);
+        let check = async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            (free("devtest-apple"), free("devtest-bloom"))
+        };
+        let (_, (apple, bloom)) = tokio::join!(backup, check);
+        assert!(apple, "apple's push ended, yet its lock was still held");
+        assert!(!bloom, "bloom's push was still running");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test(start_paused = true)]

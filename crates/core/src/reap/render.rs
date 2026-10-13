@@ -129,10 +129,14 @@ fn idle_part(policy: &PodPolicy) -> Option<String> {
 /// (off-list)`, `locked`, `pinned`/`pinned→10-12`, `kept on pod`, `not covered` where those
 /// stop it; else the expiry (`10-12 18:00`, `18:00 (in 5h)`, `OVERDUE 35m`, `OVERDUE 35m (in
 /// use)`, `OVERDUE 35m (unreachable)`) and/or `idle 3h/8h`.
-pub fn ends_label(policy: Option<&PodPolicy>, pin: Option<&Pin>, pod: &Pod, naming: &Naming, now: u64, tz: i64) -> String {
+pub fn ends_label(policy: Option<&PodPolicy>, pin: Option<&Pin>, pod: &Pod, naming: &Naming, inert: Option<&str>, now: u64, tz: i64) -> String {
     let Some(p) = policy.filter(|p| !p.is_empty()) else { return "-".into() };
     if !naming.reapable(&pod.name) {
         return "ignored (off-list)".into();
+    }
+    // A policy the reaper can't act on is never shown counting down (RR2).
+    if let Some(why) = inert {
+        return format!("not reapable ({why})");
     }
     if lock_state(pod) == Some(true) {
         return "locked".into();
@@ -412,12 +416,15 @@ pub const CRON_PATH: &str = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/
 
 /// The reap cron line (spec §12.2): observe (`pods reap run`) or apply (`--apply --yes`),
 /// with `env` (`ARENA_STATE_DIR=…`, `ARENA_START_DATE=…` — the ones the config file doesn't
-/// set) inline, under `flock -n` so a tick never stacks on a long reap backup.
+/// set) inline, under `flock -n -o` so a tick never stacks on a long reap backup — `-o`
+/// keeps the lock from being inherited by what arena spawns (an rsync, ssh, the notify
+/// command): one of them outliving an arena that was killed would otherwise hold it, and every
+/// later tick would skip without a word (RR4; the backup line has had `-o` for that reason).
 pub fn cron_line(apply: bool, exe: &str, config: &str, home: &str, env: &[(String, String)]) -> String {
     let env: String = env.iter().map(|(k, v)| format!("{k}={v} ")).collect();
     let act = if apply { " --apply --yes" } else { "" };
     format!(
-        "{CRON_SCHEDULE} {CRON_PATH} {env}flock -n {home}/.arena-reap-cron.lock {exe} --config {config} pods reap run{act} >> {home}/arena-reap-cron.log 2>&1"
+        "{CRON_SCHEDULE} {CRON_PATH} {env}flock -n -o {home}/.arena-reap-cron.lock {exe} --config {config} pods reap run{act} >> {home}/arena-reap-cron.log 2>&1"
     )
 }
 

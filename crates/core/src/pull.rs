@@ -592,13 +592,47 @@ pub fn pod_lock_path(local_backup_dir: &str, pod: &str) -> PathBuf {
     Path::new(local_backup_dir).join(".arena-locks").join(format!("{safe}.lock"))
 }
 
-/// Open (creating) a pod's backup lock file ([`pod_lock_path`]) — not locked yet.
+/// Open (creating) a pod's backup lock file ([`pod_lock_path`]) — not locked yet. Only inside
+/// a backup dir that already EXISTS: the lock never creates `local_backup_dir` or a parent of
+/// it (a pull creates its destination the way it always did — with the umask's mode; a
+/// git-only backup never touched it). The `.arena-locks` folder alone is made, 0700. A
+/// missing backup dir is `NotFound`.
 pub fn open_pod_lock(local_backup_dir: &str, pod: &str) -> std::io::Result<std::fs::File> {
+    let base = Path::new(local_backup_dir);
+    if !base.is_dir() {
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("{} doesn't exist", base.display())));
+    }
     let path = pod_lock_path(local_backup_dir, pod);
     if let Some(dir) = path.parent() {
-        crate::snapshot::create_private_dir(dir)?;
+        let mut b = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            b.mode(0o700);
+        }
+        match b.create(dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => {}
+            Err(e) => return Err(e),
+        }
     }
     std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path)
+}
+
+/// A one-pod writer's lock (the TUI's git backup, RR10), without waiting: `Ok(Some(lock))`
+/// held until dropped; `Ok(None)` no lock to take — a relative or missing backup dir, or a
+/// lock that can't be opened, as before the locks; `Err(())` another backup of the pod (a
+/// pull, the cron's push, the reaper) holds it.
+pub fn try_pod_lock_now(local_backup_dir: &str, pod: &str) -> std::result::Result<Option<std::fs::File>, ()> {
+    if !Path::new(local_backup_dir).is_absolute() {
+        return Ok(None);
+    }
+    let Ok(f) = open_pod_lock(local_backup_dir, pod) else { return Ok(None) };
+    match try_lock(&f) {
+        Ok(true) => Ok(Some(f)),
+        Ok(false) => Err(()),
+        Err(_) => Ok(None),
+    }
 }
 
 /// Take `lock` exclusively without waiting: `Ok(true)` taken (held until the file is
@@ -1224,14 +1258,23 @@ mod tests {
         let d = std::env::temp_dir().join(format!("arena-pull-lock-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         let dir = d.display().to_string();
+        // RR5: never in a backup dir that isn't there (the lock doesn't create it).
+        assert_eq!(open_pod_lock(&dir, "devtest-a").unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        assert!(!d.exists());
+        assert_eq!(try_pod_lock_now(&dir, "devtest-a").map(|l| l.is_none()), Ok(true), "nothing to take: as before the locks");
+        std::fs::create_dir_all(&d).unwrap();
         let a = open_pod_lock(&dir, "devtest-a").unwrap();
         let b = open_pod_lock(&dir, "devtest-a").unwrap();
         let other = open_pod_lock(&dir, "devtest-b").unwrap();
         assert!(try_lock(&a).unwrap());
         assert!(!try_lock(&b).unwrap(), "held by `a`");
         assert!(try_lock(&other).unwrap(), "another pod's lock is its own");
+        assert_eq!(try_pod_lock_now(&dir, "devtest-a").map(|l| l.is_some()), Err(()), "busy");
         drop(a);
         assert!(try_lock(&b).unwrap(), "free once `a` is dropped");
+        drop(b);
+        assert_eq!(try_pod_lock_now(&dir, "devtest-a").map(|l| l.is_some()), Ok(true));
+        assert_eq!(try_pod_lock_now("relative/backup", "devtest-a").map(|l| l.is_none()), Ok(true));
         let _ = std::fs::remove_dir_all(&d);
     }
 
