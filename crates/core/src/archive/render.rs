@@ -285,9 +285,10 @@ pub fn resize_command(device: &str, tier: Tier) -> String {
 }
 
 /// `archive forget --delete-archived` on the VM (as root, any access state): every directory of
-/// `pods` on both volumes — `snap/<label>/<pod>/` of every label and `big/<pod>/` — measured
-/// (`dirs=`, `bytes=` — `du`, so a file counts once even when other pods' copies share it, and
-/// such shared files stay for them) and, with `delete`, removed (`deleted=`). Never deletes
+/// `pods` on both volumes — `snap/<label>/<pod>/` of every label and `big/<pod>/` — listed with
+/// its size (`item=<bytes>\t<dir>`) and measured (`dirs=`, `bytes=` — `du`, so a file counts once
+/// even when other pods' copies share it, and such shared files stay for them) and, with
+/// `delete`, removed (`deleted=`). Never deletes
 /// while a volume isn't mounted (`unmounted_<tier>=1`): its mountpoint would show nothing while
 /// the pod's data sits on the volume. Only plain pod names (one path component) are accepted.
 pub fn forget_command(pods: &[String], delete: bool) -> Result<String, String> {
@@ -300,7 +301,8 @@ pub fn forget_command(pods: &[String], delete: bool) -> Result<String, String> {
         ": arena-archive-forget; set -u; um=''; for t in {tiers}; do mountpoint -q '{root}'/$t || {{ echo unmounted_$t=1; um=1; }}; done; \
          cd '{root}' || exit 3; set --; \
          for p in {pods}; do for d in snap/*/\"$p\" big/\"$p\"; do if [ -d \"$d\" ] && [ ! -L \"$d\" ]; then set -- \"$@\" \"$d\"; fi; done; done; \
-         echo dirs=$#; if [ $# -gt 0 ]; then echo bytes=$(du -scb -- \"$@\" | tail -n1 | cut -f1); else echo bytes=0; fi; ",
+         echo dirs=$#; if [ $# -gt 0 ]; then du -sb -- \"$@\" | sed 's/^/item=/'; echo bytes=$(du -scb -- \"$@\" | tail -n1 | cut -f1); \
+         else echo bytes=0; fi; ",
         tiers = Tier::ALL.map(|t| t.as_str()).join(" "),
         root = super::PUSH_ROOT,
         pods = quoted.join(" "),
@@ -600,6 +602,13 @@ mod tests {
         mounted(true);
         let m = run(false);
         assert_eq!(m.get("dirs").map(String::as_str), Some("4"), "{m:?}");
+        // Each directory is listed with its size (A3-6), for the operator to see before typing.
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        let cmd = forget_command(&pods, false).unwrap().replace(super::super::PUSH_ROOT, root.to_str().unwrap());
+        let out = String::from_utf8(std::process::Command::new("sh").arg("-c").arg(&cmd).env("PATH", &path).output().unwrap().stdout).unwrap();
+        let mut items: Vec<&str> = out.lines().filter_map(|l| l.strip_prefix("item=")).map(|l| l.split('\t').nth(1).unwrap()).collect();
+        items.sort();
+        assert_eq!(items, ["big/devtest-bravo", "snap/mylabel/devtest-bravo", "snap/w0d1/devtest-bravo", "snap/w0d2/devtest-bravo-old"], "{out}");
         assert!(m["bytes"].parse::<u64>().unwrap() > 0 && m.get("forget_done").is_some(), "{m:?}");
         assert!(root.join("snap/w0d1/devtest-bravo").exists(), "measuring deletes nothing");
         // A volume not mounted: nothing deleted.

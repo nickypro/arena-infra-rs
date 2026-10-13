@@ -268,6 +268,9 @@ pub struct StatusInputs<'a> {
     pub off_list: &'a [String],
     /// Pod dirs `archive forget` revoked (never pushed again).
     pub forgotten: &'a [String],
+    /// Dirs no longer pushed whose earlier copies are still on the archive (A3-7): forgotten ones
+    /// not deleted (`--delete-archived`), and staff boxes once on the list.
+    pub still_archived: &'a [String],
     /// How long ago `archive.json` was written (s): an archive that has never been pushed to an
     /// hour after `up` means the cron isn't pushing (AD10).
     pub host_written_age: Option<u64>,
@@ -399,11 +402,16 @@ pub fn judge_status(i: &StatusInputs) -> StatusReport {
             }
         }
     };
-    let (level, mut msg) = stale(i.snap.last_ok(), SNAP_WARN_AGE, SNAP_FAIL_AGE, "snap");
+    let (mut level, mut msg) = stale(i.snap.last_ok(), SNAP_WARN_AGE, SNAP_FAIL_AGE, "snap");
     if let Some(e) = &i.snap.last_error {
         if i.snap.last_ok().is_none_or(|ok| e.at > ok) {
             msg.push_str(&format!("; last error {} ({}{}: {})", age(i.now, e.at), e.class, e.label.as_deref().map(|l| format!(" {l}")).unwrap_or_default(), e.message));
+            level = level.max(outage_level(e.class, Tier::Snap, i, &mut msg));
         }
+    }
+    if i.snap.last_run.is_some_and(|r| r.all_failed) {
+        level = Level::Fail;
+        msg.push_str(" — every push of the last run failed: the archive, not a pod (`arena archive sync` says why)");
     }
     r.add("sync snap", level, msg);
     // The sync state describes one volume (AD2): another one holds none of what it says.
@@ -422,13 +430,32 @@ pub fn judge_status(i: &StatusInputs) -> StatusReport {
             }
         }
     }
-    let (level, mut msg) = stale(i.big.last_ok.map(|r| r.finished), BIG_WARN_AGE, BIG_FAIL_AGE, "big");
+    let (mut level, mut msg) = stale(i.big.last_any_ok(), BIG_WARN_AGE, BIG_FAIL_AGE, "big");
     if let Some(e) = &i.big.last_error {
-        if i.big.last_ok.is_none_or(|ok| e.at > ok.finished) {
+        if i.big.last_any_ok().is_none_or(|ok| e.at > ok) {
             msg.push_str(&format!("; last error {} ({}: {})", age(i.now, e.at), e.class, e.message));
+            level = level.max(outage_level(e.class, Tier::Big, i, &mut msg));
         }
     }
+    if i.big.last_run.is_some_and(|r| r.all_failed) {
+        level = Level::Fail;
+        msg.push_str(" — every push of the last run failed: the archive, not a pod (`arena archive sync` says why)");
+    }
     r.add("sync big", level, msg);
+    // Big goes pod by pod (A3-1): one pod failing is that pod's, named, never the tier's.
+    let big_failing: Vec<String> = i
+        .big
+        .pods_failing
+        .iter()
+        .filter(|(p, _)| !i.forgotten.contains(p))
+        .map(|(p, why)| {
+            let ok = i.big.pods_ok_at.get(p).map_or("never".to_string(), |t| format!("last OK {}", age(i.now, *t)));
+            format!("{p} ({ok}; {why})")
+        })
+        .collect();
+    if !big_failing.is_empty() {
+        r.add("big failing", Level::Warn, format!("big pushes failing: {}", big_failing.join(", ")));
+    }
     let mut labels = format!("{} label(s) pushed", i.snap.labels.len());
     if !i.unsealed.is_empty() {
         labels.push_str(&format!("; not final yet: {}", i.unsealed.join(", ")));
@@ -463,12 +490,28 @@ pub fn judge_status(i: &StatusInputs) -> StatusReport {
     if !i.forgotten.is_empty() {
         r.add("forgotten", Level::Ok, format!("never pushed again (`arena archive forget`): {}", i.forgotten.join(", ")));
     }
+    if !i.still_archived.is_empty() {
+        let access_on = i.host.is_some_and(|h| h.access_on);
+        let (level, who) =
+            if access_on { (Level::Warn, "READABLE BY EVERY PARTICIPANT (access is on)") } else { (Level::Ok, "not readable now (access is off)") };
+        r.add(
+            "still archived",
+            level,
+            format!(
+                "no longer pushed but their earlier copies are still on the archive, {who}: {} — `arena archive forget <pod> \
+                 --delete-archived` deletes one",
+                i.still_archived.join(", ")
+            ),
+        );
+    }
     // One stuck pod never holds the rest up (A2-1): who keeps failing, and who was settled as is.
     let retrying: Vec<String> = i
         .snap
         .labels
         .iter()
-        .flat_map(|(l, r)| r.fails.iter().filter(|(p, _)| !r.given_up.contains(*p)).map(move |(p, n)| format!("{l} {p} ({n} of {GIVE_UP_AFTER})")))
+        .flat_map(|(l, r)| r.fails.iter().filter(|(p, _)| !r.given_up.contains(*p)).map(move |(p, n)| (l, p, n)))
+        .filter(|(_, p, _)| !i.forgotten.contains(p))
+        .map(|(l, p, n)| format!("{l} {p} ({n} of {GIVE_UP_AFTER})"))
         .collect();
     if !retrying.is_empty() {
         r.add(
@@ -477,7 +520,7 @@ pub fn judge_status(i: &StatusInputs) -> StatusReport {
             format!("pushes of a past label that keep failing (failed in a row): {} — `arena archive sync` says why", retrying.join(", ")),
         );
     }
-    let partial = i.snap.partial();
+    let partial: Vec<(String, String)> = i.snap.partial().into_iter().filter(|(_, p)| !i.forgotten.contains(p)).collect();
     if !partial.is_empty() {
         let list: Vec<String> = partial.iter().map(|(l, p)| format!("{l} {p}")).collect();
         r.add(
@@ -531,6 +574,21 @@ pub fn judge_status(i: &StatusInputs) -> StatusReport {
         r.add("cost", Level::Ok, format!("≈ €{:.2}/month ({gb_total} GB of volumes{})", p.monthly(server_seen, gb_total), if server_seen { " + the server" } else { "" }));
     }
     r
+}
+
+/// How bad a tier's last error is (A3-2): a failure of the archive itself (full, read-only,
+/// failing, unmounted, unreachable, keys refused …) is a FAIL — nothing is pushed and no pod is to
+/// blame — with what to do; a pod's own failure leaves the level to the staleness check.
+fn outage_level(class: super::PushFailure, tier: Tier, i: &StatusInputs, msg: &mut String) -> Level {
+    if !super::sync::archive_wide(class) {
+        return Level::Ok;
+    }
+    let gb = i.host.map_or(0, |h| h.size_gb(tier));
+    let hint = super::sync::failure_hint(class, tier, gb);
+    if !hint.is_empty() {
+        msg.push_str(&format!(" — {hint}"));
+    }
+    Level::Fail
 }
 
 /// A tier's volume size: the API's, else archive.json's.
@@ -740,7 +798,7 @@ mod tests {
         s
     }
     fn big_ok() -> BigState {
-        BigState { last_ok: Some(RunRecord { started: NOW - 1000, finished: NOW - 900, ok: true }), ..BigState::default() }
+        BigState { last_ok: Some(RunRecord { started: NOW - 1000, finished: NOW - 900, ok: true, all_failed: false }), ..BigState::default() }
     }
 
     fn judge(edit: impl Fn(&mut ProbeReport), snap: &SnapState, big: &BigState, h: &ArchiveHost, inventory: Option<Result<&Inventory, String>>) -> StatusReport {
@@ -763,6 +821,7 @@ mod tests {
             not_on_list: &[],
             off_list: &[],
             forgotten: &[],
+            still_archived: &[],
             host_written_age: None,
             snap_need: None,
             big_need: None,
@@ -845,7 +904,7 @@ mod tests {
         let r = judge(|_| {}, &stale_snap, &big_ok(), &h, Some(Ok(&i)));
         assert_eq!(level_of(&r, "sync snap"), Level::Fail);
         assert!(r.render().contains("Unreachable w1d2"), "{}", r.render());
-        let stale_big = BigState { last_ok: Some(RunRecord { started: 0, finished: NOW - 25 * 3600, ok: true }), ..BigState::default() };
+        let stale_big = BigState { last_ok: Some(RunRecord { started: 0, finished: NOW - 25 * 3600, ok: true, all_failed: false }), ..BigState::default() };
         assert_eq!(level_of(&judge(|_| {}, &snap_ok(), &stale_big, &h, Some(Ok(&i))), "sync big"), Level::Fail);
         assert_eq!(level_of(&judge(|_| {}, &SnapState::default(), &BigState::default(), &h, Some(Ok(&i))), "sync snap"), Level::Warn);
 
@@ -901,6 +960,7 @@ mod tests {
                 not_on_list: &[],
                 off_list: &[],
                 forgotten: &[],
+                still_archived: &[],
                 host_written_age: Some(age),
                 snap_need: None,
                 big_need: None,
@@ -945,6 +1005,76 @@ mod tests {
         assert!(!quiet.items.iter().any(|x| ["failing", "partial", "baseline"].contains(&x.name.as_str())), "{}", quiet.render());
     }
 
+    /// A3-2: a failure of the archive itself (a read-only or failing volume …) or a run in which
+    /// every push failed is a FAIL at once, with what to do; a pod's own failure isn't. A3-1: a
+    /// big pod that keeps failing is named, never the tier. A3-7: forgotten pods drop out of the
+    /// failing/partial lines, and copies still on the archive are named — a WARN with access on.
+    #[test]
+    fn status_fails_on_an_archive_failure_and_names_failing_big_pods() {
+        let (h, i) = (host(), inv());
+        let mut snap = snap_ok();
+        snap.last_error = Some(ErrRecord { at: NOW - 60, label: Some("w1d2".into()), class: PushFailure::ArchiveIo, message: "Read-only file system (30)".into() });
+        let r = judge(|_| {}, &snap, &big_ok(), &h, Some(Ok(&i)));
+        assert_eq!(level_of(&r, "sync snap"), Level::Fail);
+        assert!(r.render().contains("refuses writes"), "{}", r.render());
+        snap.last_error.as_mut().unwrap().class = PushFailure::Other;
+        assert_eq!(level_of(&judge(|_| {}, &snap, &big_ok(), &h, Some(Ok(&i))), "sync snap"), Level::Ok, "a pod's own failure");
+        snap.last_run = Some(RunRecord { started: NOW - 100, finished: NOW - 50, ok: false, all_failed: true });
+        let r = judge(|_| {}, &snap, &big_ok(), &h, Some(Ok(&i)));
+        assert_eq!(level_of(&r, "sync snap"), Level::Fail);
+        assert!(r.render().contains("every push of the last run failed"));
+        let mut big = big_ok();
+        big.pods_ok_at.insert("arena9-apple".into(), NOW - 100);
+        big.pods_failing.insert("arena9-bloom".into(), "Other: exit 23".into());
+        big.pods_failing.insert("arena9-gone".into(), "Other: exit 23".into());
+        let r = judge(|_| {}, &snap_ok(), &big, &h, Some(Ok(&i)));
+        assert_eq!(level_of(&r, "sync big"), Level::Ok, "one pod failing is that pod's");
+        assert_eq!(level_of(&r, "big failing"), Level::Warn);
+        assert!(r.render().contains("arena9-bloom (never; Other: exit 23)"), "{}", r.render());
+        // A3-7, through the full inputs: forgotten pods leave the failing/partial lines.
+        let n = ArchiveNames::new("arena9").unwrap();
+        let mut s2 = snap_ok();
+        let mut rec = LabelRecord::default();
+        rec.fails.insert("arena9-gone".into(), 2);
+        rec.given_up.insert("arena9-gone2".into());
+        s2.labels.insert("w0d3".into(), rec);
+        let forgotten = ["arena9-gone".to_string(), "arena9-gone2".to_string()];
+        let mut on = h.clone();
+        on.access_on = true;
+        let still = ["arena9-gone".to_string()];
+        let r = judge_status(&StatusInputs {
+            names: &n,
+            inventory: Some(Ok(&i)),
+            host: Some(&on),
+            probe: None,
+            admin_pub: Some(ADMIN),
+            push_pub: Some(PUSH),
+            expected_backups: Some(""),
+            snap: &s2,
+            big: &big,
+            unsealed: &[],
+            custom_labels: &[],
+            control_box_only: &[],
+            not_on_list: &[],
+            off_list: &[],
+            forgotten: &forgotten,
+            still_archived: &still,
+            host_written_age: None,
+            snap_need: None,
+            big_need: None,
+            now: NOW,
+            keep_until_days: None,
+            today_days: 20_000,
+            token_warning: None,
+            prices: None,
+        });
+        let text = r.render();
+        assert!(!r.items.iter().any(|x| x.name == "failing" || x.name == "partial"), "{text}");
+        assert!(!text.contains("arena9-gone (never"), "a forgotten pod's big failure isn't listed: {text}");
+        assert_eq!(level_of(&r, "still archived"), Level::Warn);
+        assert!(text.contains("READABLE BY EVERY PARTICIPANT") && text.contains("--delete-archived"), "{text}");
+    }
+
     #[test]
     fn status_says_unknown_probe_and_retention() {
         let n = ArchiveNames::new("arena9").unwrap();
@@ -967,6 +1097,7 @@ mod tests {
             not_on_list: &["arena9-gone".to_string()],
             off_list: &["arena9-left".to_string()],
             forgotten: &["arena9-withdrew".to_string()],
+            still_archived: &["arena9-withdrew".to_string()],
             host_written_age: Some(7200),
             snap_need: Some(30 << 30),
             big_need: Some(1 << 30),

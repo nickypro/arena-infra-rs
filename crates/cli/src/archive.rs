@@ -663,7 +663,8 @@ pub(crate) async fn archive_status(env: &Env<'_>, cloud: Option<&dyn ArchiveClou
     };
     let snap = state::load_snap(&env.paths.sync_state(Tier::Snap)).map_err(anyhow::Error::msg)?;
     let big = state::load_big(&env.paths.sync_state(Tier::Big)).map_err(anyhow::Error::msg)?;
-    let forgotten = state::load_forgotten(&env.paths.forgotten()).map_err(anyhow::Error::msg)?.names();
+    let forgotten_file = state::load_forgotten(&env.paths.forgotten()).map_err(anyhow::Error::msg)?;
+    let forgotten = forgotten_file.names();
     let dir = PathBuf::from(super::local_backup_dir(env.cfg));
     let mut ever = snap.allowed_ever.clone();
     ever.extend(big.allowed_ever.iter().cloned());
@@ -679,6 +680,14 @@ pub(crate) async fn archive_status(env: &Env<'_>, cloud: Option<&dyn ArchiveClou
     let (not_on_list, only_local) = push::control_box_only(&dir, &labels, &allowed, &names.prefix, &env.cfg.machine_names);
     let not_on_list: Vec<String> = not_on_list.into_iter().filter(|d| !forgotten.contains(d)).collect();
     let off_list = off_list_present(&dir, &labels, &allowed, &current);
+    // No longer pushed, but still on the archive (A3-7): forgotten without `--delete-archived`, and
+    // staff boxes that once were on the list.
+    let mut still_archived: Vec<String> = forgotten_file.pods.iter().filter(|(_, r)| r.deleted.is_none()).map(|(p, _)| p.clone()).collect();
+    for d in push::staff_dirs(&names.prefix, &env.cfg.machine_names) {
+        if ever.contains(&d) && !still_archived.contains(&d) {
+            still_archived.push(d);
+        }
+    }
     let forgotten: Vec<String> = forgotten.into_iter().collect();
     // What a full push needs (AD8): the newest label with its baseline, and `big/` until its first push.
     let baselines = push::local_baselines(&dir);
@@ -717,6 +726,7 @@ pub(crate) async fn archive_status(env: &Env<'_>, cloud: Option<&dyn ArchiveClou
         not_on_list: &not_on_list,
         off_list: &off_list,
         forgotten: &forgotten,
+        still_archived: &still_archived,
         host_written_age,
         snap_need,
         big_need,
@@ -842,8 +852,8 @@ pub(crate) async fn archive_sync_with(
         }
     }
     // Who must never be pushed (A2-3): a forgotten pod stays forgotten even when its file can't be
-    // read — then nothing is pushed at all.
-    let forgotten = state::load_forgotten(&paths.forgotten()).map_err(anyhow::Error::msg)?.names();
+    // read — then nothing is pushed at all. (Each tier reads it again once it holds its lock.)
+    cohort(cfg, &names, paths)?;
     let raw_dir = o.dir.clone().unwrap_or_else(|| PathBuf::from(super::local_backup_dir(cfg)));
     let dir = std::fs::canonicalize(&raw_dir).with_context(|| format!("the backup dir {} doesn't exist (LOCAL_BACKUP_DIR / --dir)", raw_dir.display()))?;
     say(&format!("Pushing {} → {} ({}){}", dir.display(), host.ipv4, names.server(), if o.dry_run { " — dry run" } else { "" }));
@@ -855,6 +865,7 @@ pub(crate) async fn archive_sync_with(
     let ctx = SyncCtx {
         cfg,
         paths,
+        names: &names,
         dir: &dir,
         o: &o,
         transport: push_transport(paths, &host.ipv4),
@@ -863,9 +874,6 @@ pub(crate) async fn archive_sync_with(
         rsync,
         clock,
         say,
-        current: push::push_set(&names.prefix, &cfg.machine_names, &Default::default(), &forgotten),
-        prefix: names.prefix.clone(),
-        forgotten,
     };
     let mut failed = 0;
     for tier in tiers {
@@ -883,12 +891,13 @@ pub(crate) async fn archive_sync_with(
     }
     // What stays behind, by why: named like the cohort's but not on the list, forgotten, or not
     // the cohort's — and what is still pushed only because it once was on the list.
+    let c = cohort(cfg, &names, paths)?;
     let mut ever = state::load_snap(&paths.sync_state(Tier::Snap)).map(|s| s.allowed_ever).unwrap_or_default();
     ever.extend(state::load_big(&paths.sync_state(Tier::Big)).map(|s| s.allowed_ever).unwrap_or_default());
-    let allowed = push::push_set(&names.prefix, &cfg.machine_names, &ever, &ctx.forgotten);
+    let allowed = push::push_set(&names.prefix, &cfg.machine_names, &ever, &c.forgotten);
     let local = push::local_labels(&dir).unwrap_or_default();
     let (not_listed, other) = push::control_box_only(&dir, &local, &allowed, &names.prefix, &cfg.machine_names);
-    let (forgotten_here, not_listed): (Vec<String>, Vec<String>) = not_listed.into_iter().partition(|d| ctx.forgotten.contains(d));
+    let (forgotten_here, not_listed): (Vec<String>, Vec<String>) = not_listed.into_iter().partition(|d| c.forgotten.contains(d));
     if !not_listed.is_empty() {
         say(&format!("not pushed — named like this cohort's pods but not on MACHINE_NAME_LIST: {} (add them to the list to archive them)", not_listed.join(", ")));
     }
@@ -898,7 +907,7 @@ pub(crate) async fn archive_sync_with(
     if !other.is_empty() {
         say(&format!("kept on the control box only (staff boxes, other cohorts): {}", other.join(", ")));
     }
-    let off_list = off_list_present(&dir, &local, &allowed, &ctx.current);
+    let off_list = off_list_present(&dir, &local, &allowed, &c.current);
     if !off_list.is_empty() {
         say(&format!("off MACHINE_NAME_LIST, still archived (they were on it): {} — `arena archive forget <pod>` stops that", off_list.join(", ")));
     }
@@ -912,6 +921,7 @@ pub(crate) async fn archive_sync_with(
 struct SyncCtx<'a> {
     cfg: &'a Config,
     paths: &'a ArchivePaths,
+    names: &'a ArchiveNames,
     dir: &'a Path,
     o: &'a SyncOpts,
     transport: PushTransport,
@@ -920,11 +930,20 @@ struct SyncCtx<'a> {
     rsync: &'a str,
     clock: &'a dyn Fn() -> u64,
     say: &'a dyn Fn(&str),
-    /// Today's allowlist (`MACHINE_NAME_LIST` and twins, never a staff entry or a forgotten pod).
-    current: Vec<String>,
-    prefix: String,
-    /// The pods `archive forget` revoked: never pushed (A2-3).
+}
+
+/// Who may be pushed right now, read from the state dir: the forgotten pods (A2-3) and today's
+/// allowlist without them (never a staff entry). Read again by each tier once it holds its lock
+/// (A3-4): a `forget` writes before it locks, so a push that starts after it let go sees it.
+struct Cohort {
     forgotten: std::collections::BTreeSet<String>,
+    current: Vec<String>,
+}
+
+fn cohort(cfg: &Config, names: &ArchiveNames, paths: &ArchivePaths) -> Result<Cohort> {
+    let forgotten = state::load_forgotten(&paths.forgotten()).map_err(anyhow::Error::msg)?.names();
+    let current = push::push_set(&names.prefix, &cfg.machine_names, &Default::default(), &forgotten);
+    Ok(Cohort { forgotten, current })
 }
 
 /// The pod dirs present in the backup dir (labels and `big/`) that are pushed only because they
@@ -985,9 +1004,18 @@ async fn run_push(rsync: &str, jobs: &[PushJob], transport: &PushTransport, sett
     Ok(((!notes.is_empty()).then(|| notes.join("; ")), stats))
 }
 
-/// Failures that would repeat for every push of the run: stop it there (the rest waits).
-fn stops_the_run(f: PushFailure) -> bool {
-    matches!(f, PushFailure::NoSpace | PushFailure::NotMounted | PushFailure::HostKey | PushFailure::AuthDenied | PushFailure::Unreachable | PushFailure::Refused)
+/// [`run_push`] with a client-side `--log-file` (0600, in the tier's temp dir under
+/// `tier_root`, removed after): also how many bytes of files it sent — a push cut off by its
+/// budget that sent something was making progress, never the pod's failure (A3-5).
+async fn run_push_logged(ctx: &SyncCtx<'_>, tier_root: &Path, jobs: &[PushJob], budget: Duration) -> (PushOutcome, u64) {
+    let log = push::private_temp_file(tier_root, "log", "").ok();
+    let jobs: Vec<PushJob> = jobs.iter().map(|j| PushJob { log_file: log.as_ref().map(|p| p.display().to_string()), ..j.clone() }).collect();
+    let outcome = run_push(ctx.rsync, &jobs, &ctx.transport, ctx.settings, budget).await;
+    let sent = log.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).map_or(0, |t| push::sent_bytes(&t));
+    if let Some(p) = log {
+        let _ = std::fs::remove_file(p);
+    }
+    (outcome, sent)
 }
 
 /// The first push to an empty tier: what it needs against the volume and the budget (AD8) — so
@@ -1013,13 +1041,20 @@ fn seed_note(tier: Tier, need: u64, ctx: &SyncCtx<'_>) {
 }
 
 /// Say how many symlinks a push leaves out because the archive can't store them (A2-1) — the
-/// count, never their targets (a participant's text).
+/// count, never their targets (a participant's text) — and which pods it can't carry at all.
 fn skip_note(ctx: &SyncCtx<'_>, what: &str, job: &PushJob) {
     if !job.skip.is_empty() {
         (ctx.say)(&format!(
             "! {what}: {} symlink(s) left out — a target too long to store on the archive (over {} bytes)",
             job.skip.len(),
             push::PATH_MAX - push::MUNGE_PREFIX.len() - 1
+        ));
+    }
+    for p in &job.left_out {
+        (ctx.say)(&format!(
+            "! {what}: {p} left out of this push — over {} symlinks too long to store on the archive (or their rules couldn't be \
+             written); remove them from the pod",
+            push::MAX_SKIP_RULES
         ));
     }
 }
@@ -1040,6 +1075,25 @@ fn save_big(ctx: &SyncCtx<'_>, st: &BigState) -> Result<()> {
     state::save(&ctx.paths.sync_state(Tier::Big), st).context("saving sync-big.json")
 }
 
+/// A pod's failure held back until the run is over (A3-2): it is charged toward "sealed partial"
+/// only if another pod's push (or the baseline's) went through in the same run — a failure every
+/// pod shares is the archive's.
+struct Charge {
+    label: String,
+    pod: String,
+    class: PushFailure,
+    started: u64,
+    end: Option<u64>,
+}
+
+/// `pods` in push order: the one the budget last ran out on first (A3-5), then the rest in order.
+fn rotated(pods: &[String], cut_off: Option<&String>) -> Vec<String> {
+    match cut_off.and_then(|c| pods.iter().position(|p| p == c)) {
+        Some(i) => pods[i..].iter().chain(&pods[..i]).cloned().collect(),
+        None => pods.to_vec(),
+    }
+}
+
 /// The snap tier (§7.2, AD1/AD5/AD8): the baselines, then each label `plan_snap` names, pod by pod
 /// — each pod's two passes linked to its earlier labels and its baseline — state saved after each.
 async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
@@ -1056,13 +1110,14 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
             }
         }
     };
+    let c = cohort(ctx.cfg, ctx.names, ctx.paths)?;
     let start = start_days(ctx.cfg)?;
     let (mut st, reset) = state::load_snap(&ctx.paths.sync_state(Tier::Snap)).map_err(anyhow::Error::msg)?.for_volume(&ctx.host.snap_device);
     if reset {
         (ctx.say)(&format!("! the snap volume is a different one now ({}): its sync state starts over — every label is pushed again", ctx.host.snap_device));
     }
-    st.allowed_ever.extend(ctx.current.iter().cloned());
-    let allowed = push::push_set(&ctx.prefix, &ctx.cfg.machine_names, &st.allowed_ever, &ctx.forgotten);
+    st.allowed_ever.extend(c.current.iter().cloned());
+    let allowed = push::push_set(&ctx.names.prefix, &ctx.cfg.machine_names, &st.allowed_ever, &c.forgotten);
     let local = push::local_snapshot(ctx.dir, &allowed).with_context(|| format!("reading {}", ctx.dir.display()))?;
     let baselines = push::local_baselines(ctx.dir);
     let plan = push::plan_snap(&local, &o.labels, &st, start);
@@ -1081,10 +1136,15 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
     }
     let run_started = (ctx.clock)();
     let mut failed = 0;
+    // What the run learns about the archive (A3-2): who got through, what waits to be charged,
+    // whether the archive itself failed.
+    let mut ok_pods: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let (mut baseline_ok, mut baseline_failed, mut outage, mut tried, mut real_failures) = (false, false, false, 0usize, 0usize);
+    let mut charges: Vec<Charge> = Vec::new();
     // 1. The fleet baselines (cross-pod dedup, as on the control box): every local week in one push.
     if !base_todo.is_empty() {
         let weeks: Vec<u32> = baselines.iter().map(|b| b.week).collect();
-        let jobs = [SnapPass::Files, SnapPass::Git].map(|p| push::baseline_job(ctx.dir, &weeks, p));
+        let jobs = push::baseline_jobs(ctx.dir, &weeks);
         skip_note(ctx, "snap baseline", &jobs[0]);
         if o.dry_run {
             for j in &jobs {
@@ -1093,30 +1153,33 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
             for b in &base_todo {
                 st.baselines.insert(format!("w{}", b.week), b.mtime);
             }
+        } else if !jobs[0].left_out.is_empty() {
+            failed += 1;
+            baseline_failed = true;
+            (ctx.say)(&format!("✗ snap baseline: left out of this run (labels are pushed without it and stay open until it's there)"));
         } else {
-            match run_push(ctx.rsync, &jobs, &ctx.transport, ctx.settings, ctx.settings.snap_timeout).await {
+            tried += 1;
+            let root = ctx.dir.join(arena_core::pull::BASELINE_DIR);
+            match run_push_logged(ctx, &root, &jobs, ctx.settings.snap_timeout).await.0 {
                 Ok((_, s)) => {
                     for b in &base_todo {
                         st.baselines.insert(format!("w{}", b.week), b.mtime);
                     }
                     st.baseline_fails = 0;
+                    baseline_ok = true;
                     (ctx.say)(&format!("✓ snap baseline {} ({})", base_todo.iter().map(|b| format!("w{}", b.week)).collect::<Vec<_>>().join(", "), s.unwrap_or_default().summary()));
                 }
                 Err((class, msg)) => {
                     failed += 1;
-                    if push::counts_toward_give_up(class) {
-                        st.baseline_fails += 1;
-                    }
+                    real_failures += 1;
                     st.last_error = Some(ErrRecord { at: (ctx.clock)(), label: Some("baseline".into()), class, message: msg.clone() });
-                    let then = if push::baseline_given_up(&st) {
-                        format!("failed {} runs in a row: labels now seal without it (each pod keeps its own copy of the image's files)", st.baseline_fails)
+                    let hint = push::failure_hint(class, Tier::Snap, ctx.host.snap_gb);
+                    let hint = if hint.is_empty() { String::new() } else { format!("{hint}; ") };
+                    (ctx.say)(&format!("✗ snap baseline: {class} — {hint}{msg} (labels are pushed without it and stay open until it's there)"));
+                    if push::archive_wide(class) {
+                        outage = true;
                     } else {
-                        "labels are pushed without it and stay open until it's there".to_string()
-                    };
-                    (ctx.say)(&format!("✗ snap baseline: {class} — {msg} ({then})"));
-                    if stops_the_run(class) {
-                        save_snap(ctx, &st)?;
-                        return Ok(failed);
+                        baseline_failed = push::counts_toward_give_up(class);
                     }
                 }
             }
@@ -1125,6 +1188,9 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
     }
     // 2. The labels, pod by pod.
     'labels: for label in &plan.labels {
+        if outage {
+            break;
+        }
         let custom = arena_core::restore::parse_label(label).is_none();
         // `--label` retries a pod settled partial too; otherwise it's left as it is.
         let forced = o.labels.contains(label);
@@ -1142,68 +1208,92 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
         let base_local = if custom { None } else { push::baseline_for(label, &baselines) };
         let base_link = base_local.filter(|b| push::baseline_pushed(*b, &st)).map(|b| b.week);
         let started = (ctx.clock)();
-        let deadline = tokio::time::Instant::now() + ctx.settings.snap_timeout;
+        let budget = ctx.settings.snap_timeout;
+        let deadline = tokio::time::Instant::now() + budget;
         let mut rec = st.labels.get(label).cloned().unwrap_or_default();
         if !o.dry_run {
             rec.last_tried = started;
         }
-        let (mut complete, mut linked, mut stopped) = (true, true, false);
+        let todo: Vec<String> = pods.iter().filter(|p| forced || !rec.given_up.contains(*p)).cloned().collect();
+        let order = rotated(&todo, rec.cut_off.as_ref());
+        // Each pod's fair share of the label's budget (A3-5): a pod is only to blame for a timeout
+        // that started with at least that much left.
+        let fair = budget / u32::try_from(order.len().max(1)).unwrap_or(u32::MAX);
+        // Who goes first next run (A3-5): the first pod the budget left no time to start, else the
+        // first one it cut off mid-push — so no pod is always the one left over.
+        let (mut not_started, mut cut_mid): (Option<String>, Option<String>) = (None, None);
+        let (mut complete, mut linked) = (true, true);
         let mut stats = arena_core::pull::RsyncStats::default();
         let mut notes: Vec<String> = Vec::new();
-        for pod in &pods {
-            if rec.given_up.contains(pod) && !forced {
-                continue;
-            }
+        for pod in &order {
             let links = push::link_labels_for(label, pod, &st);
             let chain = !custom && push::chain_ok(label, pod, &local, &st, base_local);
-            let jobs = [SnapPass::Files, SnapPass::Git].map(|p| push::pod_job(ctx.dir, label, pod, p, &links, base_link));
+            let jobs = push::pod_jobs(ctx.dir, label, pod, &links, base_link);
             skip_note(ctx, &format!("snap {label} {pod}"), &jobs[0]);
             if o.dry_run {
-                for j in &jobs {
-                    (ctx.say)(&format!("[snap {label} {pod}{}] {}", if j.pass == SnapPass::Git { " .git" } else { "" }, arena_core::pull::display_argv(ctx.rsync, &push::push_args(j, &ctx.transport, ctx.settings))));
+                if jobs[0].left_out.is_empty() {
+                    for j in &jobs {
+                        (ctx.say)(&format!("[snap {label} {pod}{}] {}", if j.pass == SnapPass::Git { " .git" } else { "" }, arena_core::pull::display_argv(ctx.rsync, &push::push_args(j, &ctx.transport, ctx.settings))));
+                    }
                 }
                 rec.pods_tried.insert(pod.clone());
                 rec.pods_ok.insert(pod.clone());
                 continue;
             }
+            if !jobs[0].left_out.is_empty() {
+                // Its own doing (A3-1): its failure, charged like any other.
+                rec.pods_ok.remove(pod);
+                complete = false;
+                failed += 1;
+                real_failures += 1;
+                charges.push(Charge { label: label.clone(), pod: pod.clone(), class: PushFailure::Other, started, end });
+                continue;
+            }
             let left = deadline.saturating_duration_since(tokio::time::Instant::now());
             if left.is_zero() {
-                (ctx.say)(&format!("… snap {label}: its {} s budget is used up — {pod} and the rest wait for the next run", ctx.settings.snap_timeout.as_secs()));
+                (ctx.say)(&format!("… snap {label}: its {} s budget is used up — {pod} and the rest wait for the next run", budget.as_secs()));
+                not_started = Some(pod.clone());
                 complete = false;
                 break;
             }
             // Whatever happens next, something of it may be on the archive: a link source.
             rec.pods_tried.insert(pod.clone());
-            match run_push(ctx.rsync, &jobs, &ctx.transport, ctx.settings, left).await {
+            tried += 1;
+            let (outcome, sent) = run_push_logged(ctx, &src, &jobs, left).await;
+            match outcome {
                 Ok((note, s)) => {
                     push::note_push_ok(&mut rec, pod);
+                    ok_pods.insert(pod.clone());
                     linked &= chain;
                     stats = stats.add(s.unwrap_or_default());
                     notes.extend(note);
                 }
+                Err((PushFailure::Timeout, msg)) if left < fair || sent > 0 => {
+                    // Cut off by the others' share of the budget, or still making progress: it
+                    // continues next run, first in line — never the pod's failure.
+                    rec.pods_ok.remove(pod);
+                    complete = false;
+                    cut_mid.get_or_insert(pod.clone());
+                    let why = if sent > 0 { format!("it had sent {}", arena_core::pull::human_bytes(sent)) } else { format!("{} s of its {} s share left", left.as_secs(), fair.as_secs()) };
+                    (ctx.say)(&format!("… snap {label} {pod}: cut off by the label's budget ({why}; {msg}) — it continues next run, first"));
+                }
                 Err((class, msg)) => {
                     failed += 1;
-                    // The pod's own failure, the third in a row on a push that could seal the
-                    // label: settled as it is, so the label (and the next ones) can seal (A2-1).
-                    let settled = push::note_push_failed(&mut rec, pod, class, started, end);
-                    if !settled {
-                        complete = false;
-                    }
+                    real_failures += 1;
+                    rec.pods_ok.remove(pod);
+                    complete = false;
                     st.last_error = Some(ErrRecord { at: (ctx.clock)(), label: Some(label.clone()), class, message: format!("{pod}: {msg}") });
                     let hint = push::failure_hint(class, Tier::Snap, ctx.host.snap_gb);
                     let hint = if hint.is_empty() { String::new() } else { format!("{hint}; ") };
                     (ctx.say)(&format!("✗ snap {label} {pod}: {class} — {hint}{msg}"));
-                    if settled {
-                        (ctx.say)(&format!(
-                            "! snap {label} {pod}: failed {} runs in a row — sealed partial: kept as it is on the archive, later labels link \
-                             to it (`arena archive sync --label {label}` retries it)",
-                            push::GIVE_UP_AFTER
-                        ));
+                    if push::archive_wide(class) {
+                        // The archive's failure, not the pod's (A3-2): stop, charge nobody.
+                        outage = true;
+                        st.labels.insert(label.clone(), rec.clone());
+                        save_snap(ctx, &st)?;
+                        break 'labels;
                     }
-                    stopped = stops_the_run(class);
-                    if stopped {
-                        break;
-                    }
+                    charges.push(Charge { label: label.clone(), pod: pod.clone(), class, started, end });
                 }
             }
             st.labels.insert(label.clone(), rec.clone());
@@ -1214,14 +1304,17 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
             st.labels.insert(label.clone(), LabelRecord { ok_finished: 1, linked: true, ..rec });
             continue;
         }
+        rec.cut_off = not_started.or(cut_mid);
         if complete {
             rec.ok_started = started;
             rec.ok_finished = (ctx.clock)().max(1);
             rec.files = stats.files_sent;
             rec.bytes = stats.bytes_sent;
             rec.linked = linked && !custom;
-            st.labels.insert(label.clone(), rec.clone());
-            save_snap(ctx, &st)?;
+        }
+        st.labels.insert(label.clone(), rec.clone());
+        save_snap(ctx, &st)?;
+        if complete {
             let partial: Vec<&str> = pods.iter().filter(|p| rec.given_up.contains(*p)).map(String::as_str).collect();
             let final_ = if push::sealed(label, &st, start, &pods) && !partial.is_empty() {
                 format!(", final — partial for {}", partial.join(", "))
@@ -1235,9 +1328,6 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
             let note = if notes.is_empty() { String::new() } else { format!(" — note: {}", notes.join("; ")) };
             (ctx.say)(&format!("✓ snap {label} ({} pod(s), {}{final_}){note}", pods.len(), stats.summary()));
         }
-        if stopped {
-            break 'labels;
-        }
     }
     if o.dry_run {
         if !plan.deferred.is_empty() {
@@ -1245,15 +1335,52 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
         }
         return Ok(0);
     }
+    // 3. The held-back charges (A3-2): only when something else got through in this run — a
+    //    failure every pod shares, or one in a run the archive itself failed, is nobody's.
+    if outage {
+        if !charges.is_empty() || baseline_failed {
+            (ctx.say)(&format!("  (the archive failed: none of this run's failures counts against a pod)"));
+        }
+    } else {
+        for ch in charges {
+            let other_ok = baseline_ok || ok_pods.iter().any(|p| *p != ch.pod);
+            if !other_ok {
+                continue;
+            }
+            let rec = st.labels.entry(ch.label.clone()).or_default();
+            if push::note_push_failed(rec, &ch.pod, ch.class, ch.started, ch.end) {
+                (ctx.say)(&format!(
+                    "! snap {} {}: failed {} runs in a row — sealed partial: kept as it is on the archive, later labels link to it \
+                     (`arena archive sync --label {}` retries it)",
+                    ch.label,
+                    ch.pod,
+                    push::GIVE_UP_AFTER,
+                    ch.label
+                ));
+            }
+        }
+        if baseline_failed && !ok_pods.is_empty() {
+            st.baseline_fails += 1;
+            if push::baseline_given_up(&st) {
+                (ctx.say)(&format!(
+                    "! snap baseline: failed {} runs in a row — labels now seal without it (each pod keeps its own copy of the image's files)",
+                    st.baseline_fails
+                ));
+            }
+        }
+    }
     if !plan.deferred.is_empty() {
         (ctx.say)(&format!("… {} older label(s) wait for the next runs: {}", plan.deferred.len(), plan.deferred.join(", ")));
     }
-    st.last_run = Some(RunRecord { started: run_started, finished: (ctx.clock)(), ok: failed == 0 });
+    let all_failed = outage || (tried > 0 && ok_pods.is_empty() && !baseline_ok && real_failures > 0);
+    st.last_run = Some(RunRecord { started: run_started, finished: (ctx.clock)(), ok: failed == 0, all_failed });
     save_snap(ctx, &st)?;
     Ok(failed)
 }
 
-/// The big tier: one push of `<dir>/big/`.
+/// The big tier: one push per pod (A3-1 — one pod's failure, or its too many unstorable links,
+/// is that pod's alone), the least recently pushed first (a pod cut off by the budget goes first
+/// next time), each within the tier's budget.
 async fn sync_big(ctx: &SyncCtx<'_>) -> Result<usize> {
     let o = ctx.o;
     let _lock = if o.dry_run {
@@ -1267,12 +1394,13 @@ async fn sync_big(ctx: &SyncCtx<'_>) -> Result<usize> {
             }
         }
     };
+    let c = cohort(ctx.cfg, ctx.names, ctx.paths)?;
     let (mut st, reset) = state::load_big(&ctx.paths.sync_state(Tier::Big)).map_err(anyhow::Error::msg)?.for_volume(&ctx.host.big_device);
     if reset {
         (ctx.say)(&format!("! the big volume is a different one now ({}): its sync state starts over", ctx.host.big_device));
     }
-    st.allowed_ever.extend(ctx.current.iter().cloned());
-    let allowed = push::push_set(&ctx.prefix, &ctx.cfg.machine_names, &st.allowed_ever, &ctx.forgotten);
+    st.allowed_ever.extend(c.current.iter().cloned());
+    let allowed = push::push_set(&ctx.names.prefix, &ctx.cfg.machine_names, &st.allowed_ever, &c.forgotten);
     let src = ctx.dir.join(arena_core::restore::BIG);
     if !src.is_dir() {
         (ctx.say)(&format!("= big: nothing to push yet (no {})", src.display()));
@@ -1280,34 +1408,79 @@ async fn sync_big(ctx: &SyncCtx<'_>) -> Result<usize> {
         return Ok(0);
     }
     let present = push::subdirs(&src).with_context(|| format!("reading {}", src.display()))?;
-    let (pods, _) = push::split_pod_dirs(&present, &allowed);
-    let job = push::big_job(ctx.dir, &pods);
-    skip_note(ctx, "big", &job);
-    if st.last_ok.is_none() {
+    let (mut pods, _) = push::split_pod_dirs(&present, &allowed);
+    pods.sort_by_key(|p| (st.pods_ok_at.get(p).copied().unwrap_or(0), p.clone()));
+    if st.last_any_ok().is_none() {
         seed_note(Tier::Big, push::unique_bytes(&pods.iter().map(|p| src.join(p)).collect::<Vec<_>>()), ctx);
     }
+    let started = (ctx.clock)();
+    let budget = ctx.settings.big_timeout;
+    let deadline = tokio::time::Instant::now() + budget;
+    let fair = budget / u32::try_from(pods.len().max(1)).unwrap_or(u32::MAX);
+    let (mut failed, mut ok, mut tried, mut real_failures, mut outage, mut all_through) = (0usize, 0usize, 0usize, 0usize, false, true);
+    for pod in &pods {
+        let job = push::big_job(ctx.dir, std::slice::from_ref(pod));
+        skip_note(ctx, &format!("big {pod}"), &job);
+        if o.dry_run {
+            if job.left_out.is_empty() {
+                (ctx.say)(&format!("[big {pod}] {}", arena_core::pull::display_argv(ctx.rsync, &push::push_args(&job, &ctx.transport, ctx.settings))));
+            }
+            continue;
+        }
+        if !job.left_out.is_empty() {
+            failed += 1;
+            real_failures += 1;
+            all_through = false;
+            st.pods_failing.insert(pod.clone(), format!("left out: over {} unstorable symlinks", push::MAX_SKIP_RULES));
+            continue;
+        }
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            (ctx.say)(&format!("… big: its {} s budget is used up — {pod} and the rest go first next run", budget.as_secs()));
+            all_through = false;
+            break;
+        }
+        tried += 1;
+        let (outcome, sent) = run_push_logged(ctx, &src, std::slice::from_ref(&job), left).await;
+        let at = (ctx.clock)();
+        match outcome {
+            Ok((note, stats)) => {
+                ok += 1;
+                st.pods_ok_at.insert(pod.clone(), at.max(1));
+                st.pods_failing.remove(pod);
+                (ctx.say)(&format!("✓ big {pod} ({}){}", stats.unwrap_or_default().summary(), note.map(|n| format!(" — note: {n}")).unwrap_or_default()));
+            }
+            Err((PushFailure::Timeout, msg)) if left < fair || sent > 0 => {
+                all_through = false;
+                let why = if sent > 0 { format!("it had sent {}", arena_core::pull::human_bytes(sent)) } else { format!("{} s of its {} s share left", left.as_secs(), fair.as_secs()) };
+                (ctx.say)(&format!("… big {pod}: cut off by the budget ({why}; {msg}) — it continues next run"));
+            }
+            Err((class, msg)) => {
+                failed += 1;
+                real_failures += 1;
+                all_through = false;
+                st.last_error = Some(ErrRecord { at, label: Some(pod.clone()), class, message: format!("{pod}: {msg}") });
+                let hint = push::failure_hint(class, Tier::Big, ctx.host.big_gb);
+                (ctx.say)(&format!("✗ big {pod}: {class} — {}{msg}", if hint.is_empty() { String::new() } else { format!("{hint}; ") }));
+                if push::archive_wide(class) {
+                    outage = true;
+                    save_big(ctx, &st)?;
+                    break;
+                }
+                st.pods_failing.insert(pod.clone(), format!("{class}: {msg}"));
+            }
+        }
+        save_big(ctx, &st)?;
+    }
     if o.dry_run {
-        (ctx.say)(&format!("[big] {}", arena_core::pull::display_argv(ctx.rsync, &push::push_args(&job, &ctx.transport, ctx.settings))));
         return Ok(0);
     }
-    let started = (ctx.clock)();
-    let outcome = run_push(ctx.rsync, std::slice::from_ref(&job), &ctx.transport, ctx.settings, ctx.settings.big_timeout).await;
     let finished = (ctx.clock)();
-    let run = RunRecord { started, finished, ok: outcome.is_ok() };
+    let run = RunRecord { started, finished, ok: failed == 0, all_failed: outage || (tried > 0 && ok == 0 && real_failures > 0) };
     st.last_run = Some(run);
-    let failed = match outcome {
-        Ok((note, stats)) => {
-            st.last_ok = Some(run);
-            (ctx.say)(&format!("✓ big ({}){}", stats.unwrap_or_default().summary(), note.map(|n| format!(" — note: {n}")).unwrap_or_default()));
-            0
-        }
-        Err((class, msg)) => {
-            st.last_error = Some(ErrRecord { at: finished, label: None, class, message: msg.clone() });
-            let hint = push::failure_hint(class, Tier::Big, ctx.host.big_gb);
-            (ctx.say)(&format!("✗ big: {class} — {}{msg}", if hint.is_empty() { String::new() } else { format!("{hint}; ") }));
-            1
-        }
-    };
+    if all_through && !pods.is_empty() {
+        st.last_ok = Some(run);
+    }
     save_big(ctx, &st)?;
     Ok(failed)
 }
@@ -1477,14 +1650,24 @@ pub(crate) struct ForgetOpts {
 const FORGET_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// `archive forget <pod>` (A2-3): record the revocation first — local, instant, what every later
-/// push reads (`forgotten.json`, [`push::push_set`]) — then, with `--delete-archived`, delete
-/// what the archive holds of it over the admin path (root: access on or off), holding both sync
-/// locks so no push puts any of it back meanwhile, after showing its size and with its name typed.
+/// push reads (`forgotten.json`, [`push::push_set`]) — in the state dir that holds this archive's
+/// `archive.json`, the one the cron's sync reads (A3-3: anywhere else it would protect nobody).
+/// Then, with `--delete-archived`: list what the archive holds of it, directory by directory
+/// with sizes, ask for the name typed — all without the sync locks (A3-8) — and only for the
+/// delete itself take both locks, so no push of this user's runs meanwhile; the VM re-checks its
+/// mounts and refuses with a volume unmounted. Over the admin path (root): access on or off.
 pub(crate) async fn archive_forget(env: &Env<'_>, pod: &str, o: ForgetOpts, now: u64) -> Result<()> {
     let names = &env.names;
-    let dirs = push::forget_dirs(&names.prefix, pod).with_context(|| format!("{pod:?}: a pod name (`bravo` or `{}-bravo`)", names.prefix))?;
+    let dirs = push::forget_dirs(&names.prefix, pod, &env.cfg.machine_names)
+        .with_context(|| format!("{pod:?}: a pod name (`bravo` or `{}-bravo`)", names.prefix))?;
     let base = dirs[0].clone();
-    env.paths.ensure_dir().with_context(|| format!("creating {}", env.paths.dir.display()))?;
+    let Some(host) = env.host()? else {
+        bail!(
+            "no archive.json in {} — this isn't the state dir the archive's sync reads, so a forget here would stop nothing. Run \
+             it as the user that ran `arena archive up`, with the same ARENA_STATE_DIR as its cron line; nothing was recorded",
+            env.paths.dir.display()
+        );
+    };
     let file = env.paths.forgotten();
     let mut forgotten = state::load_forgotten(&file).map_err(anyhow::Error::msg)?;
     let fresh: Vec<&String> = dirs.iter().filter(|d| !forgotten.pods.contains_key(*d)).collect();
@@ -1492,29 +1675,28 @@ pub(crate) async fn archive_forget(env: &Env<'_>, pod: &str, o: ForgetOpts, now:
         forgotten.pods.entry(d.clone()).or_insert(state::ForgetRecord { at: now, deleted: None });
     }
     state::save(&file, &forgotten).with_context(|| format!("writing {}", file.display()))?;
+    let covers = dirs.join(", ");
     if fresh.is_empty() {
-        println!("{base} (and its -old/-new twins) was already forgotten: no push takes it.");
+        println!("{covers}: already forgotten — no push takes them ({}).", file.display());
     } else {
-        println!("✓ {base} (and its -old/-new twins) is forgotten: from the next sync on no push takes it, whatever MACHINE_NAME_LIST says.");
+        println!("✓ forgotten: {covers} — from the next sync on no push takes them, whatever MACHINE_NAME_LIST says (recorded in {}).", file.display());
     }
     if push::allowed_pod_dirs(&names.prefix, &env.cfg.machine_names).contains(&base) {
         println!("  note: it is still on MACHINE_NAME_LIST — forget wins for the archive; take it off the list if it should go everywhere.");
     }
+    let readable = if host.access_on {
+        "stay READABLE BY EVERY PARTICIPANT (access is on)"
+    } else {
+        "stay on the archive (not readable now: access is off — readable again by every participant if it's turned on)"
+    };
     if !o.delete_archived {
-        println!("  What the archive already holds of it stays: `arena archive forget {base} --delete-archived` deletes that.");
+        println!("  Its archived copies {readable} until `arena archive forget {base} --delete-archived` deletes them.");
         return Ok(());
     }
-    // Deleting: the VM, the admin key, and no push of this user's running meanwhile.
+    // Deleting: the VM and the admin key.
     let host = env.host_up()?;
     if !state::readable(&env.paths.admin_key()) || !state::readable(&env.paths.known_hosts()) {
         bail!("the admin key or the pinned host key isn't readable by this user — run this as the user that ran `arena archive up`");
-    }
-    let mut held = Vec::new();
-    for t in Tier::ALL {
-        match lock_within(&env.paths.sync_lock(t), Duration::from_secs(5)).await? {
-            Some(l) => held.push(l),
-            None => bail!("an `arena archive sync` ({t}) is pushing right now — {base} is already forgotten (the next sync skips it); re-run this in a few minutes to delete its copy"),
-        }
     }
     let run = |delete: bool| {
         let cmd = render::forget_command(&dirs, delete).map_err(anyhow::Error::msg);
@@ -1526,28 +1708,40 @@ pub(crate) async fn archive_forget(env: &Env<'_>, pod: &str, o: ForgetOpts, now:
             if !kv.contains_key("forget_done") && !kv.contains_key("refused") {
                 bail!("the archive didn't finish ({}: {})", out.exit_label(), out.stderr.trim());
             }
-            Ok::<_, anyhow::Error>(kv)
+            Ok::<_, anyhow::Error>((kv, out.stdout))
         }
     };
-    let measured = run(false).await?;
-    let unmounted: Vec<&str> = Tier::ALL.iter().filter(|t| measured.contains_key(&format!("unmounted_{t}"))).map(|t| t.as_str()).collect();
-    if !unmounted.is_empty() {
+    let unmounted = |kv: &std::collections::BTreeMap<String, String>| -> Vec<&'static str> {
+        Tier::ALL.iter().filter(|t| kv.contains_key(&format!("unmounted_{t}"))).map(|t| t.as_str()).collect()
+    };
+    // 1. What it holds — no lock: the cron keeps pushing the others while this runs and waits.
+    let (measured, listing) = run(false).await?;
+    let um = unmounted(&measured);
+    if !um.is_empty() {
         bail!(
             "the {} volume isn't mounted on the archive — what it holds of {base} can't be seen or deleted now (`arena archive status`, \
              `arena archive up` re-mounts); nothing was deleted",
-            unmounted.join(" and ")
+            um.join(" and ")
         );
     }
     let n: u64 = measured.get("dirs").and_then(|v| v.parse().ok()).unwrap_or(0);
     let bytes: u64 = measured.get("bytes").and_then(|v| v.parse().ok()).unwrap_or(0);
     if n == 0 {
-        println!("The archive holds nothing of {base} (or its twins): nothing to delete.");
+        println!("The archive holds nothing of {covers}: nothing to delete.");
         return Ok(());
     }
+    println!("The archive holds {n} director{} of {covers} — these would be deleted:", if n == 1 { "y" } else { "ies" });
+    for (i, item) in listing.lines().filter_map(|l| l.strip_prefix("item=")).enumerate() {
+        if i == 200 {
+            println!("  … and {} more", n.saturating_sub(200));
+            break;
+        }
+        let (size, dir) = item.split_once('\t').unwrap_or(("?", item));
+        let size = size.parse::<u64>().map_or_else(|_| size.to_string(), arena_core::pull::human_bytes);
+        println!("  {dir}  {size}");
+    }
     println!(
-        "The archive holds {n} director{} of {base} and its twins (every label on snap, and big): {} — files its copies share with \
-         the fleet baseline or other pods stay for them.",
-        if n == 1 { "y" } else { "ies" },
+        "  in all {} — files these copies share with the fleet baseline or other pods stay for them.",
         arena_core::pull::human_bytes(bytes)
     );
     let typed = match o.confirm.as_deref() {
@@ -1557,20 +1751,35 @@ pub(crate) async fn archive_forget(env: &Env<'_>, pod: &str, o: ForgetOpts, now:
     if !typed {
         bail!("not deleted: type the pod's name to confirm (`--confirm {base}`); it stays forgotten either way");
     }
-    let done = run(true).await?;
+    // 2. The delete itself, with no push of this user's running (the cron's syncs share the locks).
+    let mut held = Vec::new();
+    for t in Tier::ALL {
+        match lock_within(&env.paths.sync_lock(t), Duration::from_secs(5)).await? {
+            Some(l) => held.push(l),
+            None => bail!(
+                "an `arena archive sync` ({t}) is pushing right now — nothing was deleted; {base} is already forgotten (the next sync \
+                 skips it): re-run this in a few minutes"
+            ),
+        }
+    }
+    let (done, _) = run(true).await?;
+    drop(held);
+    let um = unmounted(&done);
+    if !um.is_empty() || done.get("refused").is_some() {
+        bail!("the archive refused the delete: the {} volume isn't mounted now — nothing was deleted", if um.is_empty() { "a".to_string() } else { um.join(" and ") });
+    }
     match done.get("deleted").map(String::as_str) {
-        Some(d) if d.chars().all(|c| c.is_ascii_digit()) => {
+        Some(d) if !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()) => {
             for dir in &dirs {
                 if let Some(r) = forgotten.pods.get_mut(dir) {
                     r.deleted = Some(now);
                 }
             }
             state::save(&file, &forgotten).with_context(|| format!("writing {}", file.display()))?;
-            println!("✓ deleted {d} director{} of {base} from the archive.", if d == "1" { "y" } else { "ies" });
-            drop(held);
+            println!("✓ deleted {d} director{} of {covers} from the archive.", if d == "1" { "y" } else { "ies" });
             Ok(())
         }
-        _ => bail!("the archive refused or failed the delete ({:?}) — `arena archive ssh` to look", done),
+        _ => bail!("the archive refused or failed the delete ({done:?}) — `arena archive ssh` to look"),
     }
 }
 
@@ -2731,9 +2940,9 @@ mod tests {
         file(&w, "w0d3/devtest-alpha/a.py");
         let stub = rsync_stub(&w.dir);
         let paths = w.env().paths;
-        // Run 1, on day 4: w0d1 (the first, full label) runs out of time.
-        std::fs::write(w.dir.join("fail-label-w0d1"), "rsync error: timeout in data send/receive (code 30)\n").unwrap();
-        std::fs::write(w.dir.join("fail-label-w0d1.code"), "30").unwrap();
+        // Run 1, on day 4: w0d1's push fails (its own kind; a network stall would stop the run).
+        std::fs::write(w.dir.join("fail-label-w0d1"), "rsync: [sender] send_files failed to open \"/b/w0d1/devtest-alpha/a.py\": Permission denied (13)\n").unwrap();
+        std::fs::write(w.dir.join("fail-label-w0d1.code"), "23").unwrap();
         let now = day_end("w0d3") + 3 * 3600;
         assert!(archive_sync(&w.cfg, &paths, sync_opts("snap"), &stub, &clock(now)).await.is_err());
         let run1 = rsync_calls(&w.dir);
@@ -2890,7 +3099,7 @@ mod tests {
         assert!(archive_sync(&w.cfg, &paths, sync_opts("both"), &stub, &clock(day_end("w0d1") + 120)).await.is_err());
         let after = snap_state(&w);
         assert_eq!(after.labels.values().map(|r| r.ok_finished).collect::<Vec<_>>(), ok_before, "the last complete pushes stand");
-        assert_eq!(after.last_error.as_ref().map(|e| e.class), Some(PushFailure::Timeout));
+        assert_eq!(after.last_error.as_ref().map(|e| e.class), Some(PushFailure::Stalled), "rsync's I/O timeout: the network's");
         assert!(state::load_big(&paths.sync_state(Tier::Big)).unwrap().last_ok.is_some(), "big still pushed");
     }
 
@@ -2931,7 +3140,7 @@ mod tests {
         assert!(!said.iter().any(|l| l.contains("skipped")), "{said:#?}");
         let w0d2 = said.iter().find(|l| l.starts_with("[snap w0d2 devtest-alpha]")).unwrap_or_else(|| panic!("{said:#?}"));
         assert!(w0d2.contains("--link-dest=/snap/w0d1/devtest-alpha/"), "{w0d2}");
-        assert!(said.iter().any(|l| l.starts_with("[big]")));
+        assert!(said.iter().any(|l| l.starts_with("[big devtest-alpha]")), "big goes pod by pod: {said:#?}");
         // Without a start date, snap errors and big still pushes.
         drop(_held);
         let nodate = Config::parse(&cfg_text(&w).replace("ARENA_START_DATE=2026-10-01\n", ""));
@@ -3268,10 +3477,12 @@ mod tests {
         let now = day_end("w0d4") + 3 * 3600;
         let pods = ["devtest-alpha", "devtest-bravo"];
         let mut said = Vec::new();
-        for run in 0..3u64 {
+        for run in 0..4u64 {
             let (r, s) = sync_said(&w, sync_opts("snap"), &stub, now + run * 900).await;
-            assert!(r.is_err(), "run {run}: bravo's pushes fail: {s:#?}\n{:#?}", rsync_calls(&w.dir));
-            if run < 2 {
+            // Runs 1–3 fail on bravo (charged at each run's end: alpha got through); the 4th
+            // leaves bravo settled and seals the labels.
+            assert_eq!(r.is_err(), run < 3, "run {run}: {s:#?}\n{:#?}", rsync_calls(&w.dir));
+            if run < 3 {
                 assert!(!is_sealed(&w, "w0d1", &pods), "run {run}: a passing failure never seals anything partial");
             }
             said.extend(s);
@@ -3286,13 +3497,13 @@ mod tests {
         assert!(said.iter().any(|l| l.contains("snap w0d1 devtest-bravo: failed 3 runs in a row — sealed partial")), "{said:#?}");
         // Nothing left: bravo isn't pushed again and again for good.
         fresh_calls(&w.dir);
-        let (r, _) = sync_said(&w, sync_opts("snap"), &stub, now + 3 * 900).await;
+        let (r, _) = sync_said(&w, sync_opts("snap"), &stub, now + 4 * 900).await;
         r.unwrap();
         assert!(rsync_calls(&w.dir).is_empty(), "{:#?}", rsync_calls(&w.dir));
         // `--label` retries it; through once, it's complete there again.
         std::fs::remove_file(w.dir.join("fail-pod-devtest-bravo")).unwrap();
         let o = SyncOpts { labels: vec!["w0d2".into()], ..sync_opts("snap") };
-        archive_sync(&w.cfg, &w.env().paths, o, &stub, &clock(now + 4 * 900)).await.unwrap();
+        archive_sync(&w.cfg, &w.env().paths, o, &stub, &clock(now + 5 * 900)).await.unwrap();
         let st = snap_state(&w);
         assert!(st.labels["w0d2"].pods_ok.contains("devtest-bravo") && !st.labels["w0d2"].given_up.contains("devtest-bravo"));
         assert!(st.labels["w0d1"].given_up.contains("devtest-bravo"), "only the label asked for");
@@ -3320,13 +3531,12 @@ mod tests {
         }
         assert_eq!(snap_state(&w).baseline_fails, 3);
         assert!(said.iter().any(|l| l.contains("labels now seal without it")), "{said:#?}");
-        // The third failure's run went on to seal what was past its day — without the baseline.
-        assert!(is_sealed(&w, "w0d1", &["devtest-alpha"]), "{:#?}", snap_state(&w).labels);
-        // It is still tried every run (extra dedup for the labels to come).
+        // The next run links and seals without it — and still tries it (extra dedup to come).
         fresh_calls(&w.dir);
         let (r, _) = sync_said(&w, sync_opts("snap"), &stub, now + 3 * 900).await;
         assert!(r.is_err());
         assert!(rsync_calls(&w.dir).iter().any(|c| c.ends_with(":snap/baseline/")));
+        assert!(is_sealed(&w, "w0d1", &["devtest-alpha"]), "{:#?}", snap_state(&w).labels);
         // An outage never counts: a fresh state whose baseline push can't connect stays at 0.
         let w2 = world("baseline-outage");
         seed(&w2);
@@ -3354,7 +3564,7 @@ mod tests {
         r.unwrap();
         let w0d1: Vec<String> = rsync_calls(&w.dir).into_iter().filter(|c| c.ends_with(":snap/w0d1/devtest-alpha/")).collect();
         assert_eq!(w0d1.len(), 2);
-        assert!(w0d1.iter().all(|c| c.contains("--exclude=/longlink ")), "{w0d1:#?}");
+        assert!(w0d1.iter().all(|c| c.contains("--exclude-from=") && !c.contains("--exclude=/longlink")), "rules by file, never argv: {w0d1:#?}");
         assert!(said.iter().any(|l| l == "! snap w0d1 devtest-alpha: 1 symlink(s) left out — a target too long to store on the archive (over 4080 bytes)"), "{said:#?}");
         assert!(!said.iter().any(|l| l.contains("xxxx")), "never the target text");
     }
@@ -3428,13 +3638,21 @@ mod tests {
         let e = archive_forget(&env, "devtest-bravo", ForgetOpts { delete_archived: true, confirm: Some("devtest-bravo".into()) }, 400).await.unwrap_err();
         assert!(e.to_string().contains("big volume isn't mounted"), "{e}");
         assert!(!w.remote.cmds().iter().any(|c| c.contains("rm -rf")));
+        // A3-8: measured and confirmed without the locks; the delete alone waits for them.
+        w.remote.on("arena-archive-forget", out(0, "dirs=1\nitem=1\tbig/devtest-alpha\nbytes=1\nforget_done=1\n", ""));
         let held = try_lock(&env.paths.sync_lock(Tier::Snap)).unwrap().expect("free");
         w.remote.clear();
         let e = archive_forget(&env, "alpha", ForgetOpts { delete_archived: true, confirm: Some("devtest-alpha".into()) }, 500).await.unwrap_err();
-        assert!(e.to_string().contains("pushing right now"), "{e}");
-        assert!(w.remote.calls().is_empty(), "nothing asked of the VM");
+        assert!(e.to_string().contains("pushing right now") && e.to_string().contains("nothing was deleted"), "{e}");
+        assert_eq!(w.remote.cmds().len(), 1, "measured (no lock needed), never deleted: {:?}", w.remote.cmds());
+        assert!(!w.remote.cmds()[0].contains("rm -rf"));
         assert!(state::load_forgotten(&env.paths.forgotten()).unwrap().pods.contains_key("devtest-alpha"));
         drop(held);
+        // The VM re-checks its mounts at the delete itself.
+        w.remote.on("rm -rf", out(4, "unmounted_snap=1\nrefused=unmounted\n", ""));
+        let e = archive_forget(&env, "alpha", ForgetOpts { delete_archived: true, confirm: Some("devtest-alpha".into()) }, 600).await.unwrap_err();
+        assert!(e.to_string().contains("refused the delete") && e.to_string().contains("nothing was deleted"), "{e}");
+        assert_eq!(state::load_forgotten(&env.paths.forgotten()).unwrap().pods["devtest-alpha"].deleted, None);
     }
 
     /// A2-3: a pod off the list (and so pushed only by `allowed_ever`) is named by the run as such;
@@ -3461,5 +3679,205 @@ mod tests {
         fresh_calls(&w.dir);
         archive_sync(&alpha_only, &w.env().paths, sync_opts("snap"), &stub, &clock(now + 1800)).await.unwrap();
         assert!(rsync_calls(&w.dir).iter().any(|c| c.ends_with(":snap/w0d1/devtest-bravo/")), "{:#?}", rsync_calls(&w.dir));
+    }
+
+    // ---- review 3 (re-review of eb838a2) -------------------------------------------------------
+
+    /// A3-2: an ARCHIVE-wide write error — the snap volume remounted read-only by ext4 after an
+    /// I/O error (errors=remount-ro), or EIO from a failing Hetzner volume — fails every pod's
+    /// push with exit 23, which `classify_push` calls `Other`: "the pod's own kind". It doesn't
+    /// stop the run, so every pod of every past label is charged, and three runs (45 min) later
+    /// every pod is "sealed partial" for every past label: an outage seals everything partial,
+    /// and nothing is retried by itself once the volume is fixed.
+    #[tokio::test]
+    async fn review3_a_read_only_archive_volume_never_seals_every_pod_partial() {
+        let w = world("rv3-erofs");
+        seed(&w);
+        file(&w, "w0d1/devtest-bravo/b.py");
+        let stub = rsync_stub(&w.dir);
+        std::fs::write(
+            w.dir.join("fail-snap"),
+            "rsync: [receiver] mkstemp \"/srv/arena/push/snap/w0d1/devtest-alpha/.a.py.Gx81bQ\" failed: Read-only file system (30)\n\
+             rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1338) [sender=3.2.7]\n",
+        )
+        .unwrap();
+        std::fs::write(w.dir.join("fail-snap.code"), "23").unwrap();
+        let now = day_end("w0d2") + 3 * 3600;
+        for run in 0..3u64 {
+            let _ = sync_said(&w, sync_opts("snap"), &stub, now + run * 900).await;
+        }
+        let partial = snap_state(&w).partial();
+        assert!(partial.is_empty(), "a read-only archive volume sealed every pod partial: {partial:?}");
+    }
+
+    /// A3-3: `archive forget` (without --delete-archived) never checks that its state dir is the
+    /// archive's: it creates the dir if missing and says "✓ … is forgotten: from the next sync on
+    /// no push takes it". Run as another user, under sudo (HOME=/root), or without the
+    /// ARENA_STATE_DIR the cron line carries, the revocation lands where no push reads it — and the
+    /// cron goes on pushing the pod of a participant who withdrew consent.
+    #[tokio::test]
+    async fn review3_forget_where_the_archive_state_isnt_is_refused() {
+        let w = world("rv3-wrongdir");
+        seed(&w);
+        file(&w, "w0d1/devtest-bravo/b.py");
+        let elsewhere = Config::parse(&cfg_text(&w).replace("/state\n", "/elsewhere\n"));
+        let env = Env::new(&elsewhere, &w.remote, true).unwrap();
+        assert_ne!(env.paths.dir, w.env().paths.dir);
+        let r = archive_forget(&env, "bravo", ForgetOpts::default(), 100).await;
+        let stub = rsync_stub(&w.dir);
+        archive_sync(&w.cfg, &w.env().paths, sync_opts("snap"), &stub, &clock(day_end("w0d1") + 3 * 3600)).await.unwrap();
+        let pushed = rsync_calls(&w.dir).iter().any(|c| c.contains("devtest-bravo"));
+        assert!(
+            r.is_err() || !pushed,
+            "forget said OK in {} (no archive.json there) while the cron's sync still pushes bravo",
+            env.paths.dir.display()
+        );
+    }
+
+    /// A3-4: a sync reads forgotten.json once, BEFORE it takes its tier's lock, then waits up to
+    /// LOCK_PATIENCE for the lock. A `forget --delete-archived` that holds the lock (measures,
+    /// deletes) inside that wait leaves the sync free, the moment it lets go, to push the pod
+    /// straight back with the list it read before — the "✓ deleted" is untrue a second later.
+    #[tokio::test]
+    async fn review3_a_sync_waiting_for_its_lock_never_pushes_a_pod_forgotten_meanwhile() {
+        let w = world("rv3-race");
+        seed(&w);
+        file(&w, "big/devtest-bravo/ckpt.pt");
+        let stub = rsync_stub(&w.dir);
+        let env = w.env();
+        // `forget --delete-archived` holds the big lock while it measures and deletes …
+        let held = try_lock(&env.paths.sync_lock(Tier::Big)).unwrap().expect("free");
+        let sync = sync_said(&w, sync_opts("big"), &stub, day_end("w0d1") + 3 * 3600);
+        let forget = async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            archive_forget(&env, "bravo", ForgetOpts::default(), 100).await.unwrap();
+            drop(held); // … and lets go: the archive's copy is gone.
+        };
+        let ((r, said), ()) = tokio::join!(sync, forget);
+        r.unwrap();
+        let calls = rsync_calls(&w.dir);
+        assert!(!calls.is_empty(), "the sync waited and pushed: {said:#?}");
+        assert!(!calls.iter().any(|c| c.contains("devtest-bravo")), "pushed back right after the forget: {calls:#?}");
+    }
+
+    /// A3-5: a budget timeout counts as the pod's own failure (A2-1 c), but the budget is the
+    /// LABEL's, spent by its pods in order: a pod after a slow one gets what's left, is cut off,
+    /// and is charged. Three runs later it is "sealed partial" for that label though its own push
+    /// takes 3 s of a 5 s budget. (Likewise a big pod still making progress over several runs —
+    /// the seed `seed_note` promises "continues over several runs".)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn review3_a_pod_cut_off_by_another_pods_share_of_the_budget_is_never_sealed_partial() {
+        use std::os::unix::fs::PermissionsExt;
+        let w = world_with("rv3-budget", "ARCHIVE_SNAP_TIMEOUT_SECS=5\n");
+        seed(&w);
+        file(&w, "w0d1/devtest-bravo/b.py");
+        let stub = w.dir.join("slow-rsync");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\n[ \"$1\" = --version ] && { echo 'rsync  version 3.2.7  protocol version 31'; exit 0; }\n\
+             for a; do last=$a; done\nprintf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/rsync-calls\"\n\
+             case \"$*\" in *'**/.git/**'*) ;; *) case \"$last\" in *:snap/w0d1/devtest-*) sleep 3 ;; esac ;; esac\n\
+             printf 'Number of files: 1 (reg: 1)\\nNumber of regular files transferred: 1\\nTotal file size: 1 bytes\\nTotal transferred file size: 1 bytes\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let stub = stub.display().to_string();
+        let now = day_end("w0d1") + 3 * 3600;
+        for run in 0..3u64 {
+            let _ = sync_said(&w, sync_opts("snap"), &stub, now + run * 900).await;
+        }
+        let st = snap_state(&w);
+        assert!(st.labels["w0d1"].pods_ok.contains("devtest-alpha"), "{:#?}", st.labels["w0d1"]);
+        assert!(!st.labels["w0d1"].given_up.contains("devtest-bravo"), "bravo sealed partial for alpha's share of the budget: {:#?}", st.labels["w0d1"]);
+    }
+
+    /// A3-1: a pod with more unstorable links than MAX_SKIP_RULES is left out — of its own snap
+    /// push (its failure, charged like any) and of big, which goes pod by pod: every other pod's
+    /// big push still goes, and the run names the pod.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn too_many_unstorable_links_leave_only_that_pod_out() {
+        let w = world("toomany");
+        seed(&w);
+        let long = format!("/{}", "a".repeat(4084));
+        for tree in ["w0d1/devtest-bravo/links", "big/devtest-bravo/links"] {
+            let d = w.dir.join("backup").join(tree);
+            std::fs::create_dir_all(&d).unwrap();
+            for i in 0..=push::MAX_SKIP_RULES {
+                std::os::unix::fs::symlink(&long, d.join(format!("l{i}"))).unwrap();
+            }
+        }
+        let stub = rsync_stub(&w.dir);
+        let (r, said) = sync_said(&w, sync_opts("both"), &stub, day_end("w0d1") + 3 * 3600).await;
+        assert!(r.is_err(), "bravo's pushes are its failures");
+        let calls = rsync_calls(&w.dir);
+        assert!(!calls.iter().any(|c| c.contains("devtest-bravo")), "{calls:#?}");
+        assert!(calls.iter().any(|c| c.ends_with(":snap/w0d1/devtest-alpha/")) && calls.iter().any(|c| c.contains("--include=/devtest-alpha/")));
+        assert!(said.iter().any(|l| l.contains("snap w0d1 devtest-bravo: devtest-bravo left out of this push")), "{said:#?}");
+        assert!(said.iter().any(|l| l.contains("big devtest-bravo: devtest-bravo left out of this push")), "{said:#?}");
+        assert!(said.iter().any(|l| l.starts_with("✓ big devtest-alpha")), "{said:#?}");
+        let big = state::load_big(&w.env().paths.sync_state(Tier::Big)).unwrap();
+        assert!(big.pods_ok_at.contains_key("devtest-alpha") && big.pods_failing.contains_key("devtest-bravo"), "{big:#?}");
+        assert!(calls.iter().all(|c| c.len() < 64 * 1024), "argv stays small");
+    }
+
+    /// A3-2: a failure nobody else got past is the archive's: a cohort whose only pod fails (or a
+    /// run where every push failed) charges nobody — status says FAIL instead.
+    #[tokio::test]
+    async fn a_failure_no_other_pod_got_past_is_never_charged() {
+        let w = world("nobody-else");
+        seed(&w);
+        let stub = rsync_stub(&w.dir);
+        std::fs::write(w.dir.join("fail-snap"), "rsync error: some files/attrs were not transferred (see previous errors) (code 23)\n").unwrap();
+        std::fs::write(w.dir.join("fail-snap.code"), "23").unwrap();
+        let now = day_end("w0d2") + 3 * 3600;
+        for run in 0..5u64 {
+            assert!(sync_said(&w, sync_opts("snap"), &stub, now + run * 900).await.0.is_err());
+        }
+        let st = snap_state(&w);
+        assert!(st.partial().is_empty() && st.labels.values().all(|r| r.fails.is_empty()), "{:#?}", st.labels);
+        assert!(st.last_run.unwrap().all_failed, "every push failed: status FAILs");
+    }
+
+    /// A3-5: a pod still making progress when the budget cuts it off (its `--log-file` shows
+    /// files sent) is never charged; one that sends nothing with its full share is.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pod_making_progress_is_never_charged_for_the_budget() {
+        use std::os::unix::fs::PermissionsExt;
+        let w = world_with("progress", "ARCHIVE_SNAP_TIMEOUT_SECS=4\n");
+        seed(&w);
+        file(&w, "w0d1/devtest-bravo/b.py");
+        let stub = w.dir.join("slow-rsync");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\n[ \"$1\" = --version ] && { echo 'rsync  version 3.2.7  protocol version 31'; exit 0; }\nd=$(dirname \"$0\"); log=''\n\
+             for a; do last=$a; case \"$a\" in --log-file=*) log=${a#--log-file=};; esac; done\nprintf '%s\\n' \"$*\" >> \"$d/rsync-calls\"\n\
+             case \"$last\" in *:snap/w0d1/devtest-bravo/) if [ -f \"$d/progress\" ] && [ -n \"$log\" ]; then \
+             echo '2026/10/13 10:00:00 [1] <f+++++++++ 1000' >> \"$log\"; fi; exec sleep 30 ;; esac\n\
+             printf 'Number of files: 1 (reg: 1)\\nNumber of regular files transferred: 1\\nTotal file size: 1 bytes\\nTotal transferred file size: 1 bytes\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let stub = stub.display().to_string();
+        let now = day_end("w0d2") + 3 * 3600;
+        std::fs::write(w.dir.join("progress"), "").unwrap();
+        let mut said = Vec::new();
+        for run in 0..3u64 {
+            said.extend(sync_said(&w, sync_opts("snap"), &stub, now + run * 900).await.1);
+        }
+        let rec = snap_state(&w).labels["w0d1"].clone();
+        assert!(rec.fails.is_empty() && rec.given_up.is_empty(), "progress is never a failure: {rec:#?}");
+        assert!(said.iter().any(|l| l.contains("devtest-bravo: cut off by the label's budget (it had sent 1000;")), "{said:#?}");
+        // No progress, with its full share of the budget: its own failure.
+        std::fs::remove_file(w.dir.join("progress")).unwrap();
+        for run in 3..9u64 {
+            let _ = sync_said(&w, sync_opts("snap"), &stub, now + run * 900).await;
+            if snap_state(&w).labels["w0d1"].given_up.contains("devtest-bravo") {
+                break;
+            }
+        }
+        assert!(snap_state(&w).labels["w0d1"].given_up.contains("devtest-bravo"), "{:#?}", snap_state(&w).labels["w0d1"]);
     }
 }

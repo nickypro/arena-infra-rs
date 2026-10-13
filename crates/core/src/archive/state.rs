@@ -122,6 +122,10 @@ pub struct LabelRecord {
     /// `archive sync --label <L>` retries them.
     #[serde(default)]
     pub given_up: BTreeSet<String>,
+    /// The pod the label's budget last ran out on (A3-5): the next run starts with it, so no pod
+    /// is always the one left over.
+    #[serde(default)]
+    pub cut_off: Option<String>,
 }
 
 /// One run of a tier's sync.
@@ -130,6 +134,10 @@ pub struct RunRecord {
     pub started: u64,
     pub finished: u64,
     pub ok: bool,
+    /// Pushes were tried and none went through, and not for want of budget (A3-2): the archive,
+    /// not a pod — `status` says FAIL.
+    #[serde(default)]
+    pub all_failed: bool,
 }
 
 /// The last failure.
@@ -225,15 +233,35 @@ pub struct BigState {
     /// Every pod dir ever allowed (see [`SnapState::allowed_ever`]).
     #[serde(default)]
     pub allowed_ever: BTreeSet<String>,
+    /// Per pod (big is pushed pod by pod, A3-1): when its last push went through …
+    #[serde(default)]
+    pub pods_ok_at: BTreeMap<String, u64>,
+    /// … and, for a pod whose last push failed, why (`<class>: <message>`).
+    #[serde(default)]
+    pub pods_failing: BTreeMap<String, String>,
 }
 
 impl Default for BigState {
     fn default() -> Self {
-        Self { version: STATE_VERSION, last_ok: None, last_run: None, last_error: None, volume: None, allowed_ever: BTreeSet::new() }
+        Self {
+            version: STATE_VERSION,
+            last_ok: None,
+            last_run: None,
+            last_error: None,
+            volume: None,
+            allowed_ever: BTreeSet::new(),
+            pods_ok_at: BTreeMap::new(),
+            pods_failing: BTreeMap::new(),
+        }
     }
 }
 
 impl BigState {
+    /// The last time any pod's big push went through.
+    pub fn last_any_ok(&self) -> Option<u64> {
+        self.pods_ok_at.values().copied().chain(self.last_ok.map(|r| r.finished)).filter(|t| *t > 0).max()
+    }
+
     /// This state if it describes `volume`, else a fresh one keeping `allowed_ever` (and whether
     /// it was reset).
     pub fn for_volume(self, volume: &str) -> (BigState, bool) {
@@ -520,7 +548,7 @@ mod tests {
         // A2-3: who belongs to the cohort isn't the volume's: a pod already off the list still
         // gets its history onto the new volume.
         assert!(other.allowed_ever.contains("arena9-gone"), "allowed_ever survives a volume reset");
-        let mut b = BigState { volume: Some("a".into()), last_ok: Some(RunRecord { started: 1, finished: 2, ok: true }), ..BigState::default() };
+        let mut b = BigState { volume: Some("a".into()), last_ok: Some(RunRecord { started: 1, finished: 2, ok: true, all_failed: false }), ..BigState::default() };
         b.allowed_ever.insert("arena9-gone".into());
         let (b, reset) = b.for_volume("b");
         assert!(reset && b.last_ok.is_none() && b.allowed_ever.contains("arena9-gone"));

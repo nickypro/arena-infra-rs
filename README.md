@@ -1111,8 +1111,9 @@ deleted on its own.
 - **The control box pushes** (`archive sync`, its own cron lines) with a key the archive forces
   into `rrsync -munge -wo -no-del -no-lock`: it can write, never read, delete, get a shell or
   forward, and every symlink a participant planted is stored defanged, never followed (one whose
-  target is too long to store that way — over 4080 bytes — is left out, with a count in the run's
-  output). The archive holds no outbound credential and can never reach a pod, a provider or the
+  target is too long to store that way — over 4080 bytes — is left out by an exact rule in a
+  private `--exclude-from` file, never argv, with a count in the run's output; a pod with more than
+  1000 of them is left out of the push, named). The archive holds no outbound credential and can never reach a pod, a provider or the
   control box. Every push is additive and never touches a file already there (`--delete`,
   `--inplace`, `--append`, `--partial-dir`, `-a`, `-p`, `-L`… are never sent — test-enforced; a
   push is `-rlt -J --chmod=u=rwX,go=rX`): a changed file is written anew, so a past day's
@@ -1123,9 +1124,12 @@ deleted on its own.
   (`sync`/`status` list those as "kept on the control box only", apart from pods named like the
   cohort's but missing from the list). A pod that leaves the list keeps its history archived
   (`sync`/`status` name it: "off the list, still archived"); one re-listed as an `@` staff box,
-  or **forgotten** — `arena archive forget <pod>` (consent withdrawn), which also covers its
-  twins — is never pushed again, and `--delete-archived` deletes what the archive holds of it
-  (every label, both tiers; its size first, the name typed: `--confirm <prefix>-<pod>`).
+  or **forgotten** — `arena archive forget <pod>` (consent withdrawn; also its `-old`/`-new`
+  twins unless those are list entries of their own; refused unless run against the state dir
+  that holds `archive.json`, the one the cron reads) — is never pushed again. Its archived copies
+  stay — readable by every participant while access is on, as `forget` and `status` say — until
+  `--delete-archived`, which lists every directory with its size, needs the name typed
+  (`--confirm <prefix>-<pod>`) and only then takes the sync locks for the delete itself.
   **Secret files never do**: shell rc files (the API keys `copy-keys` writes), histories,
   `.env*`, `.netrc`, `.gitconfig`, `.git-credentials`, `.pgpass`, `.s3cfg`, `.ssh/`, `.config/`,
   `.cache/`, `.claude*`, cloud and Kaggle credentials, Hugging Face token files, `id_*`/`*.pem`/
@@ -1161,14 +1165,20 @@ tried least recently (round-robin: a label that fails every run never takes ever
 short — rsync only links identical files) and to the week's fleet baseline, pushed once to
 `snap/baseline/` (so the image's files are stored once for every pod, as on the control box), in
 two passes like the pull's (the files under `BACKUP_MAX_SIZE`, then every `.git` uncapped — a
-pack over the cap must not leave a broken repo); then `big/`. A label is final once a push that
+pack over the cap must not leave a broken repo); then `big/`, pod by pod (least recently pushed
+first), so one pod's failure is that pod's alone. A label is final once a push that
 *started* 2 h after its UTC day ended went through for every pod, linked to everything it should
 have been — so a failed or out-of-order push never leaves a full, un-linked copy for good: the
 next push re-links it. One stuck pod never holds the rest up: a pod whose push of a past label
-fails of its own kind (rsync's errors, its time budget — never an outage, a full or unmounted
-volume) three runs in a row is **sealed partial** for that label — kept as it is on the archive,
-later labels link to it and seal — and `status` names each one (`archive sync --label L` retries
-it); a fleet baseline that fails three runs in a row likewise stops holding labels open. It needs no Hetzner token (it reads `archive.json`), takes a lock per
+fails of its own kind three runs in a row is **sealed partial** for that label — kept as it is on
+the archive, later labels link to it and seal — and `status` names each one (`archive sync --label
+L` retries it); a fleet baseline that fails three runs in a row likewise stops holding labels
+open. A failure only counts against a pod when another pod's push got through in the same run:
+the archive's own failures — full, read-only or failing volume (EROFS/EIO), unmounted,
+unreachable, keys refused, a stalled connection — stop the run, charge nobody and make `status`
+FAIL, and so does a run in which every push failed. A pod cut off by the label's budget before it
+had its fair share (budget ÷ pods), or still sending files when cut off, is never charged: it goes
+first next run. It needs no Hetzner token (it reads `archive.json`), takes a lock per
 tier (a running tier is skipped, exit 0; a dry run takes none), keeps per-tier state tied to the
 volume it describes (a new volume gets everything again), stops a run on a failure that would
 repeat (no space, unmounted, host key…), says on the first push how big the seed is against the

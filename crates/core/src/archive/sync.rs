@@ -352,12 +352,23 @@ pub fn push_set(prefix: &str, machine_names: &[String], ever: &BTreeSet<String>,
 }
 
 /// What `archive forget <pod>` covers: the pod dir (`bravo` → `<prefix>-bravo`; a full name as
-/// given) and its `-old`/`-new` twins (`replace` / `migrate`). `None` for a name that isn't one
-/// plain path component.
-pub fn forget_dirs(prefix: &str, pod: &str) -> Option<Vec<String>> {
+/// given) and its `-old`/`-new` twins (`replace` / `migrate`) — but never a twin that is itself
+/// another entry of `MACHINE_NAME_LIST` (a participant named `bravo-new` is someone else, A3-6).
+/// `None` for a name that isn't one plain path component.
+pub fn forget_dirs(prefix: &str, pod: &str, machine_names: &[String]) -> Option<Vec<String>> {
     let p = pod.trim();
+    if !plain_name(p) {
+        return None;
+    }
     let base = if p.starts_with(&format!("{prefix}-")) { p.to_string() } else { format!("{prefix}-{p}") };
-    plain_name(p).then(|| vec![base.clone(), format!("{base}-old"), format!("{base}-new")])
+    let entries: Vec<String> = machine_names.iter().map(|e| e.trim()).filter(|e| !e.is_empty()).map(|e| crate::naming::qualify(prefix, e)).collect();
+    let mut out = vec![base.clone()];
+    for twin in [format!("{base}-old"), format!("{base}-new")] {
+        if !entries.contains(&twin) {
+            out.push(twin);
+        }
+    }
+    Some(out)
 }
 
 /// `[A-Za-z0-9._-]+`, not starting with a dot: safe as an anchored rsync rule and a path.
@@ -533,7 +544,7 @@ pub struct PushJob {
     pub tier: Tier,
     /// Snap (pods and the baseline) only.
     pub pass: SnapPass,
-    /// What it is, for messages: `w1d3 arena9-apple`, `baseline`, `big`.
+    /// What it is, for messages: `w1d3 arena9-apple`, `baseline`, `big arena9-apple`.
     pub what: String,
     /// The local source directory (a trailing `/` is added).
     pub src: String,
@@ -546,16 +557,32 @@ pub struct PushJob {
     pub top_rules: Vec<String>,
     /// Create the destination's missing parents (`--mkpath`): a pod's push into a new label.
     pub mkpath: bool,
-    /// Anchored `--exclude` rules for the exact symlinks the archive can't store
-    /// ([`unmungeable_links`]), found in the local tree when the job was made — each job's
-    /// message says how many (never their targets).
+    /// Anchored rules leaving out the exact symlinks the archive can't store
+    /// ([`unmungeable_links`]), found in the local tree when the job was made — each job's message
+    /// says how many (never their targets). They reach rsync through `skip_file`, never argv.
     pub skip: Vec<String>,
+    /// The 0600 `--exclude-from` file holding `skip` (A3-1: per-link rules in argv could pass
+    /// ARG_MAX and stop the push before it starts), in the tier's temp dir; removed when the last
+    /// job holding it is dropped.
+    pub skip_file: Option<std::sync::Arc<SkipFile>>,
+    /// Pods this job can't carry this run (A3-1): more than [`MAX_SKIP_RULES`] unstorable links,
+    /// or their rules couldn't be written. A pod's own push isn't run at all; a big push of
+    /// several pods leaves their dirs out. The caller says so, per pod.
+    pub left_out: Vec<String>,
+    /// rsync's client-side `--log-file` for this push, if the caller wants one: what was sent
+    /// before a timeout ([`sent_bytes`], A3-5).
+    pub log_file: Option<String>,
 }
 
 /// What rrsync's `-munge` puts in front of every symlink's target on the archive.
 pub const MUNGE_PREFIX: &str = "/rsyncd-munged/";
 /// Linux's `PATH_MAX`: a symlink's target, with its terminating NUL, must fit in it.
 pub const PATH_MAX: usize = 4096;
+/// The most unstorable links one pod's push leaves out by rule (A3-1). A tree with more is a
+/// participant's doing (no real home holds a thousand 4 KB link targets): that pod is left out
+/// of the push — its own failure — rather than every rule costing every file of every pod a
+/// match.
+pub const MAX_SKIP_RULES: usize = 1000;
 
 /// Whether a symlink with a target of `len` bytes can be stored munged (A2-1): a target of
 /// 4081..4095 bytes is legal on a pod and on the control box, but 15 bytes longer it isn't —
@@ -564,23 +591,40 @@ pub fn munge_fits(len: usize) -> bool {
     len + MUNGE_PREFIX.len() < PATH_MAX
 }
 
+/// Directory names every push leaves out whole (the plain directory entries of
+/// [`SECRET_EXCLUDES`] and the pulls' temp dir): a link scan never walks into them (A3-9).
+fn never_pushed_dir(name: &std::ffi::OsStr) -> bool {
+    let Some(n) = name.to_str() else { return false };
+    n == crate::pull::TEMP_DIR
+        || SECRET_EXCLUDES.iter().any(|e| {
+            let plain = e.strip_suffix('/').unwrap_or(e);
+            plain == n && !plain.contains(['/', '*', '?', '['])
+        })
+}
+
 /// The symlinks under `root` (none followed) whose target is too long to store munged
-/// ([`munge_fits`]), as paths relative to `root`. Unreadable directories are skipped (rsync then
-/// says so itself); a missing root is empty.
-pub fn unmungeable_links(root: &Path) -> Vec<PathBuf> {
+/// ([`munge_fits`]), as paths relative to `root`, sorted — at most `cap + 1` of them (more than
+/// `cap` means "too many"; the walk stops there). Directories every push leaves out aren't
+/// walked; unreadable ones are skipped (rsync then says so itself); a missing root is empty.
+pub fn unmungeable_links(root: &Path, cap: usize) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack: Vec<PathBuf> = vec![PathBuf::new()];
-    while let Some(rel) = stack.pop() {
+    'walk: while let Some(rel) = stack.pop() {
         let Ok(rd) = std::fs::read_dir(root.join(&rel)) else { continue };
         for e in rd.flatten() {
             let Ok(ft) = e.file_type() else { continue };
             let child = rel.join(e.file_name());
             if ft.is_dir() {
-                stack.push(child);
+                if !never_pushed_dir(&e.file_name()) {
+                    stack.push(child);
+                }
             } else if ft.is_symlink() {
                 if let Ok(target) = std::fs::read_link(e.path()) {
                     if !munge_fits(target.as_os_str().len()) {
                         out.push(child);
+                        if out.len() > cap {
+                            break 'walk;
+                        }
                     }
                 }
             }
@@ -595,6 +639,8 @@ pub fn unmungeable_links(root: &Path) -> Vec<PathBuf> {
 /// `\` only in a pattern that has a wildcard); each byte of a control character or of invalid
 /// UTF-8 becomes `?` (rsync matches bytes: `?` is one byte, never a `/`), which can only match
 /// the path's own siblings that differ in just those bytes: never less than the link itself.
+/// So a rule is always one line, starting with `/` (never a comment or a `- `/`+ ` prefix in an
+/// `--exclude-from` file).
 pub fn literal_rule(under: &str, rel: &Path) -> String {
     #[cfg(unix)]
     let bytes: &[u8] = {
@@ -629,76 +675,196 @@ pub fn literal_rule(under: &str, rel: &Path) -> String {
     s
 }
 
-/// The anchored rules leaving out every unmungeable symlink under `root` (the job's source
-/// subtree `under`, `/` for a pod's own push).
-fn skip_rules(root: &Path, under: &str) -> Vec<String> {
-    unmungeable_links(root).iter().map(|rel| literal_rule(under, rel)).collect()
+/// A job's `--exclude-from` file (0600, in the tier's temp dir), removed when dropped.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SkipFile(PathBuf);
+
+impl SkipFile {
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
 }
 
-/// `pod`'s push of `label` (`<dir>/<label>/<pod>/` → `snap/<label>/<pod>/`), linked to its earlier
-/// labels and its baseline; the symlinks the archive can't store are left out.
-pub fn pod_job(dir: &Path, label: &str, pod: &str, pass: SnapPass, link_labels: &[String], baseline: Option<u32>) -> PushJob {
+impl Drop for SkipFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// A private file in a tier's temp dir (`<tier root>/.rsync-tmp/`, created 0700 if missing):
+/// `.arena-archive-<kind>-<pid>-<n>`, created new with mode 0600 and `text`.
+pub fn private_temp_file(tier_root: &Path, kind: &str, text: &str) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let dir = tier_root.join(crate::pull::TEMP_DIR);
+    crate::snapshot::create_private_dir(&dir)?;
+    let path = dir.join(format!(".arena-archive-{kind}-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    o.open(&path)?.write_all(text.as_bytes())?;
+    Ok(path)
+}
+
+/// What a job leaves out: the rules for its trees (each `(root, under)`), written to one
+/// `--exclude-from` file in `tier_root`'s temp dir — or, past [`MAX_SKIP_RULES`] for a tree or
+/// when the file can't be written, that tree's `owner` named as left out.
+struct Skip {
+    rules: Vec<String>,
+    file: Option<std::sync::Arc<SkipFile>>,
+    left_out: Vec<String>,
+}
+
+fn skip_for(tier_root: &Path, trees: &[(&str, PathBuf, String)]) -> Skip {
+    let mut rules = Vec::new();
+    let mut left_out = Vec::new();
+    for (owner, root, under) in trees {
+        let links = unmungeable_links(root, MAX_SKIP_RULES);
+        if links.len() > MAX_SKIP_RULES {
+            left_out.push(owner.to_string());
+        } else {
+            rules.extend(links.iter().map(|rel| literal_rule(under, rel)));
+        }
+    }
+    if rules.is_empty() {
+        return Skip { rules, file: None, left_out };
+    }
+    let text: String = rules.iter().map(|r| format!("{r}\n")).collect();
+    match private_temp_file(tier_root, "skip", &text) {
+        Ok(p) => Skip { rules, file: Some(std::sync::Arc::new(SkipFile(p))), left_out },
+        // Can't leave the links out: every tree that has one stays out of this run instead.
+        Err(_) => {
+            let mut left_out = left_out;
+            for (owner, root, _) in trees {
+                if !unmungeable_links(root, 0).is_empty() && !left_out.iter().any(|o| o == owner) {
+                    left_out.push(owner.to_string());
+                }
+            }
+            Skip { rules: Vec::new(), file: None, left_out }
+        }
+    }
+}
+
+/// `pod`'s two pushes of `label` (`<dir>/<label>/<pod>/` → `snap/<label>/<pod>/`: the files under
+/// the cap, then `.git`), linked to its earlier labels and its baseline — one scan of the tree
+/// for both (A3-9); the symlinks the archive can't store are left out.
+pub fn pod_jobs(dir: &Path, label: &str, pod: &str, link_labels: &[String], baseline: Option<u32>) -> [PushJob; 2] {
     let mut link_dests: Vec<String> = link_labels.iter().map(|l| format!("/snap/{l}/{pod}/")).collect();
     if let Some(w) = baseline {
         link_dests.push(format!("/snap/{}/w{w}/fleet/", crate::pull::BASELINE_DIR));
     }
     let src = dir.join(label).join(pod);
-    PushJob {
+    let skip = skip_for(&dir.join(label), &[(pod, src.clone(), "/".to_string())]);
+    [SnapPass::Files, SnapPass::Git].map(|pass| PushJob {
         tier: Tier::Snap,
         pass,
         what: format!("{label} {pod}"),
-        skip: skip_rules(&src, "/"),
         src: src.display().to_string(),
         dest: format!("snap/{label}/{pod}/"),
-        link_dests,
+        link_dests: link_dests.clone(),
         top_rules: Vec::new(),
         mkpath: true,
+        skip: skip.rules.clone(),
+        skip_file: skip.file.clone(),
+        left_out: skip.left_out.clone(),
+        log_file: None,
+    })
+}
+
+/// One pass of [`pod_jobs`].
+pub fn pod_job(dir: &Path, label: &str, pod: &str, pass: SnapPass, link_labels: &[String], baseline: Option<u32>) -> PushJob {
+    let [files, git] = pod_jobs(dir, label, pod, link_labels, baseline);
+    match pass {
+        SnapPass::Files => files,
+        SnapPass::Git => git,
     }
 }
 
-/// The fleet baselines' push (`<dir>/baseline/` → `snap/baseline/`): only `w<N>/fleet/` of each
-/// local week, nothing else that dir may hold (an old baseline moved aside).
-pub fn baseline_job(dir: &Path, weeks: &[u32], pass: SnapPass) -> PushJob {
+/// The fleet baselines' two pushes (`<dir>/baseline/` → `snap/baseline/`): only `w<N>/fleet/` of
+/// each local week, nothing else that dir may hold (an old baseline moved aside).
+pub fn baseline_jobs(dir: &Path, weeks: &[u32]) -> [PushJob; 2] {
     let src = dir.join(crate::pull::BASELINE_DIR);
     let mut top_rules = Vec::new();
-    let mut skip = Vec::new();
+    let mut trees = Vec::new();
     for w in weeks {
         top_rules.push(format!("--include=/w{w}/"));
         top_rules.push(format!("--include=/w{w}/fleet/"));
         top_rules.push(format!("--exclude=/w{w}/*"));
-        skip.extend(skip_rules(&src.join(format!("w{w}")).join("fleet"), &format!("/w{w}/fleet/")));
+        trees.push(("baseline", src.join(format!("w{w}")).join("fleet"), format!("/w{w}/fleet/")));
     }
     top_rules.push("--exclude=/*".into());
-    PushJob {
+    let skip = skip_for(&src, &trees);
+    let mut left_out = skip.left_out.clone();
+    left_out.dedup();
+    [SnapPass::Files, SnapPass::Git].map(|pass| PushJob {
         tier: Tier::Snap,
         pass,
         what: "baseline".into(),
         src: src.display().to_string(),
         dest: format!("snap/{}/", crate::pull::BASELINE_DIR),
         link_dests: Vec::new(),
-        top_rules,
+        top_rules: top_rules.clone(),
         mkpath: false,
-        skip,
+        skip: skip.rules.clone(),
+        skip_file: skip.file.clone(),
+        left_out: left_out.clone(),
+        log_file: None,
+    })
+}
+
+/// One pass of [`baseline_jobs`].
+pub fn baseline_job(dir: &Path, weeks: &[u32], pass: SnapPass) -> PushJob {
+    let [files, git] = baseline_jobs(dir, weeks);
+    match pass {
+        SnapPass::Files => files,
+        SnapPass::Git => git,
     }
 }
 
-/// The big tier's push (`<dir>/big/` → `big/`), only the allowed pods present.
+/// A big push (`<dir>/big/` → `big/`) of `pods` — `sync` makes one per pod (A3-1: one pod's
+/// failure never fails another's). A pod with too many unstorable links is left out (no
+/// include: `--exclude=/*` keeps its dir back) and named in `left_out`.
 pub fn big_job(dir: &Path, pods: &[String]) -> PushJob {
     let src = dir.join(crate::restore::BIG);
-    let mut top_rules: Vec<String> = pods.iter().map(|p| format!("--include=/{p}/")).collect();
+    let trees: Vec<(&str, PathBuf, String)> = pods.iter().map(|p| (p.as_str(), src.join(p), format!("/{p}/"))).collect();
+    let skip = skip_for(&src, &trees);
+    let mut top_rules: Vec<String> = pods.iter().filter(|p| !skip.left_out.contains(p)).map(|p| format!("--include=/{p}/")).collect();
     top_rules.push("--exclude=/*".into());
-    let skip = pods.iter().flat_map(|p| skip_rules(&src.join(p), &format!("/{p}/"))).collect();
+    let what = match pods {
+        [one] => format!("big {one}"),
+        _ => "big".into(),
+    };
     PushJob {
         tier: Tier::Big,
         pass: SnapPass::Files,
-        what: "big".into(),
+        what,
         src: src.display().to_string(),
         dest: "big/".into(),
         link_dests: Vec::new(),
         top_rules,
         mkpath: false,
-        skip,
+        skip: skip.rules,
+        skip_file: skip.file,
+        left_out: skip.left_out,
+        log_file: None,
     }
+}
+
+/// What a push sent before it ended, from its `--log-file` (format `%i %l`): the bytes of every
+/// file it sent (`<f…` lines) — what tells a push still making progress from a stuck one (A3-5).
+pub fn sent_bytes(log: &str) -> u64 {
+    log.lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace().skip_while(|w| !w.starts_with("<f"));
+            it.next()?;
+            it.next()?.replace(',', "").parse::<u64>().ok()
+        })
+        .sum()
 }
 
 /// The rsync argv (after the program name) for `job` — pure, so every invariant is a table test.
@@ -706,19 +872,20 @@ pub fn big_job(dir: &Path, pods: &[String]) -> PushJob {
 /// ```text
 /// snap pod:  -rlt -J -z --chmod=u=rwX,go=rX [--max-size=M] --timeout=300 [--bwlimit=B] --stats --mkpath
 ///            [--link-dest=/snap/<earlier>/<pod>/]… [--link-dest=/snap/baseline/w<N>/fleet/]
-///            --exclude=<secret>… --exclude=<extra>… [--exclude=/<unmungeable link>…]
+///            --exclude=<secret>… --exclude=<extra>… [--exclude-from=<the job's skip file>]
 ///            [git pass: --include=*/ --include=**/.git/** --exclude=*]
+///            [--log-file=<f> --log-file-format=%i %l]
 ///            -e <pinned ssh> <dir>/<L>/<pod>/ arena-push@<ip>:snap/<L>/<pod>/
 /// baseline:  the same flags, --include=/w<N>/ --include=/w<N>/fleet/ --exclude=/w<N>/* … --exclude=/*,
 ///            <dir>/baseline/ → snap/baseline/
 /// big:       -rlt -J --chmod=u=rwX,go=rX --timeout=300 [--bwlimit=B] --stats --exclude=<secret>…
-///            --include=/<pod>/… --exclude=/*  <dir>/big/ → big/
+///            [--exclude-from=…] --include=/<pod>/ --exclude=/*  <dir>/big/ → big/
 /// ```
 ///
 /// - `--link-dest`s are absolute: rrsync refuses `..` and re-roots `/snap/…` under its root.
 /// - Filter order matters (first match wins): secrets first, then the links left out, then the
 ///   anchored top-level rules (any other top-level dir — a staff box, a stranger — goes no
-///   further).
+///   further). `--exclude-from` and `--log-file` are the client's own: rrsync never sees them.
 /// - No `-p` (A2-2): `--chmod` gives each new file its mode; a file already there keeps its own.
 /// - `-z` and the cap on snap only. No partial transfers anywhere (no holding area in a
 ///   participant-shaped tree, ARCH-SEC-1): a big file cut off by the budget starts over next run.
@@ -745,12 +912,16 @@ pub fn push_args(job: &PushJob, transport: &PushTransport, settings: &ArchiveSet
     for s in SECRET_EXCLUDES.iter().copied().chain(settings.extra_excludes.iter().map(String::as_str)) {
         a.push(format!("--exclude={s}"));
     }
-    for s in &job.skip {
-        a.push(format!("--exclude={s}"));
+    if let (false, Some(f)) = (job.skip.is_empty(), &job.skip_file) {
+        a.push(format!("--exclude-from={}", f.path().display()));
     }
     a.extend(job.top_rules.iter().cloned());
     if job.tier == Tier::Snap && job.pass == SnapPass::Git {
         a.extend(["--include=*/", "--include=**/.git/**", "--exclude=*"].map(String::from));
+    }
+    if let Some(l) = &job.log_file {
+        a.push(format!("--log-file={l}"));
+        a.push("--log-file-format=%i %l".into());
     }
     a.push("-e".into());
     a.push(transport.rsh.clone());
@@ -772,9 +943,14 @@ pub enum PushFailure {
     NoSpace,
     /// The volume isn't mounted: the push hit the root-owned immutable mountpoint.
     NotMounted,
+    /// The volume refuses writes: read-only (ext4 remounts so after an I/O error), failing
+    /// (EIO), or corrupt (A3-2).
+    ArchiveIo,
     /// rrsync refused the argv — a contract bug in arena.
     Refused,
-    /// The budget ran out, or rsync's I/O timeout.
+    /// rsync's I/O timeout (exit 30): the connection went silent — the network's, not a pod's.
+    Stalled,
+    /// The push ran out of its budget (arena stopped it).
     Timeout,
     Other,
 }
@@ -785,10 +961,34 @@ impl std::fmt::Display for PushFailure {
     }
 }
 
+/// Failures of the archive itself (or the way to it), never of the pod being pushed: every
+/// later push of the run would fail the same way, so the run stops there, and nothing of it is
+/// ever charged to a pod ([`counts_toward_give_up`]); `status` says FAIL.
+pub fn archive_wide(f: PushFailure) -> bool {
+    matches!(
+        f,
+        PushFailure::NoSpace
+            | PushFailure::NotMounted
+            | PushFailure::ArchiveIo
+            | PushFailure::HostKey
+            | PushFailure::AuthDenied
+            | PushFailure::Unreachable
+            | PushFailure::Refused
+            | PushFailure::Stalled
+    )
+}
+
 /// Classify a finished push (§7.5): `Ok(note)` for success (exit 0; exit 24 — files vanished
 /// mid-push, a pull was writing — is OK with a note), else the failure class. The most specific
-/// signal wins: rrsync's refusal, the host key, the key, space, the mountpoint, then timeouts and
-/// reachability; exit 255 alone means ssh never got through.
+/// signal wins: rrsync's refusal, the host key, the key, a volume that refuses writes (full,
+/// read-only, failing), the mountpoint, then timeouts and reachability; exit 255 alone means ssh
+/// never got through.
+///
+/// A participant names files, and rsync's messages quote file names — so a name can't pass for
+/// an archive failure (A3-2): ssh's and rrsync's messages are only read from lines without a
+/// quote; an errno is read only at the very END of a line (after any quoted name; rsync escapes
+/// control characters in names, so a name can't end a line); the mountpoint check reads the
+/// whole quoted path of a receiver's line.
 pub fn classify_push(code: Option<i32>, stderr: &str, timed_out: bool) -> Result<Option<String>, PushFailure> {
     if timed_out {
         return Err(PushFailure::Timeout);
@@ -798,28 +998,29 @@ pub fn classify_push(code: Option<i32>, stderr: &str, timed_out: bool) -> Result
         Some(24) => return Ok(Some("some files vanished while being sent (a pull was writing them) — the next push takes them".into())),
         _ => {}
     }
-    let has = |n: &str| stderr.contains(n);
-    if has("rrsync error:") {
+    let bare: Vec<&str> = stderr.lines().filter(|l| !l.contains('"')).collect();
+    let has = |n: &str| bare.iter().any(|l| l.contains(n));
+    let ends = |tails: &[&str]| stderr.lines().any(|l| tails.iter().any(|t| l.trim_end().ends_with(t)));
+    if bare.iter().any(|l| l.split_once(" error: ").is_some_and(|(who, _)| who.ends_with("rrsync") && !who.contains(' '))) {
         return Err(PushFailure::Refused);
     }
-    if has("Host key verification failed")
-        || has("HOST IDENTIFICATION HAS CHANGED")
-        || (has("No ") && has("host key is known"))
-        || has("Host key for ") && has("has changed")
-    {
+    if has("Host key verification failed") || has("HOST IDENTIFICATION HAS CHANGED") || (has("No ") && has("host key is known")) || (has("Host key for ") && has("has changed")) {
         return Err(PushFailure::HostKey);
     }
     if has("Permission denied (publickey") {
         return Err(PushFailure::AuthDenied);
     }
-    if has("No space left on device") || has("Disk quota exceeded") {
+    if ends(&["No space left on device (28)", "Disk quota exceeded (122)"]) {
         return Err(PushFailure::NoSpace);
+    }
+    if ends(&["Read-only file system (30)", "Input/output error (5)", "Structure needs cleaning (117)"]) {
+        return Err(PushFailure::ArchiveIo);
     }
     if not_mounted(stderr) {
         return Err(PushFailure::NotMounted);
     }
     if code == Some(30) {
-        return Err(PushFailure::Timeout);
+        return Err(PushFailure::Stalled);
     }
     let unreachable = [
         "Connection refused",
@@ -837,16 +1038,28 @@ pub fn classify_push(code: Option<i32>, stderr: &str, timed_out: bool) -> Result
     Err(PushFailure::Other)
 }
 
-/// A permission error creating/writing a TOP-level `snap/<x>` or `big/<x>` path: the unmounted,
-/// root-owned, immutable mountpoint (a mounted volume's root belongs to the push user).
+/// A receiver's permission error creating/writing a TOP-level `snap/<x>` or `big/<x>` path: the
+/// unmounted, root-owned, immutable mountpoint (a mounted volume's root belongs to the push
+/// user). The path is everything between the line's first and last quote — a name holding
+/// quotes can't fake a shorter one — and a pod's own paths are always deeper.
 fn not_mounted(stderr: &str) -> bool {
-    stderr.lines().filter(|l| l.contains("Permission denied") || l.contains("Operation not permitted")).any(|l| {
-        l.split('"').skip(1).step_by(2).any(|path| {
+    stderr
+        .lines()
+        .filter(|l| {
+            let t = l.trim_end();
+            let role = l.to_ascii_lowercase();
+            (role.contains("[receiver]") || role.contains("[generator]")) && (t.ends_with("Permission denied (13)") || t.ends_with("Operation not permitted (1)"))
+        })
+        .any(|l| {
+            let (Some(a), Some(b)) = (l.find('"'), l.rfind('"')) else { return false };
+            if b <= a {
+                return false;
+            }
+            let path = &l[a + 1..b];
             let rel = path.strip_prefix(super::PUSH_ROOT).map(|p| p.trim_start_matches('/')).unwrap_or(path);
             let parts: Vec<&str> = rel.split('/').filter(|c| !c.is_empty() && *c != ".").collect();
             matches!(parts.first(), Some(&"snap") | Some(&"big")) && parts.len() <= 2
         })
-    })
 }
 
 /// What to do about a failure, for the push's `✗` line.
@@ -857,6 +1070,10 @@ pub fn failure_hint(f: PushFailure, tier: Tier, current_gb: u32) -> String {
             format!("arena archive resize {} {more} (bytes or inodes: `arena archive status`)", tier.gb_flag())
         }
         PushFailure::NotMounted => "the volume isn't mounted — `arena archive status`, then `arena archive up` re-mounts it".into(),
+        PushFailure::ArchiveIo => format!(
+            "the {tier} volume refuses writes (read-only after an I/O error, or failing) — `arena archive ssh -- dmesg | tail`, \
+             then fsck/remount it (`arena archive up` re-mounts); nothing is charged to any pod"
+        ),
         PushFailure::HostKey => {
             "the archive's host key isn't the pinned one — `arena archive status`; re-pin only with `arena archive up \
              --accept-new-host-key` if you know why it changed"
@@ -865,10 +1082,8 @@ pub fn failure_hint(f: PushFailure, tier: Tier, current_gb: u32) -> String {
         PushFailure::AuthDenied => "the push key was refused — `arena archive up` re-installs the key files".into(),
         PushFailure::Unreachable => "the archive didn't answer — `arena archive status` (the label stays unsealed and backfills)".into(),
         PushFailure::Refused => "rrsync refused the push: a bug in arena's push arguments — please report it".into(),
-        PushFailure::Timeout => format!(
-            "ran out of its budget (ARCHIVE_{}_TIMEOUT_SECS) or rsync's I/O timeout — the next run continues",
-            tier.as_str().to_uppercase()
-        ),
+        PushFailure::Stalled => "rsync's connection went silent (its I/O timeout) — the network; the next run continues".into(),
+        PushFailure::Timeout => format!("ran out of its budget (ARCHIVE_{}_TIMEOUT_SECS) — the next run continues", tier.as_str().to_uppercase()),
         PushFailure::Other => String::new(),
     }
 }
@@ -1269,7 +1484,8 @@ mod tests {
         let after = end.unwrap() + GRACE_SECS;
         let mut r = LabelRecord::default();
         let p = "arena9-apple";
-        for class in [Unreachable, HostKey, AuthDenied, NoSpace, NotMounted, Refused] {
+        for class in [Unreachable, HostKey, AuthDenied, NoSpace, NotMounted, Refused, ArchiveIo, Stalled] {
+            assert!(archive_wide(class), "{class}");
             for _ in 0..5 {
                 assert!(!note_push_failed(&mut r, p, class, after, end), "{class}");
             }
@@ -1381,11 +1597,14 @@ mod tests {
         assert_eq!(staff_dirs("arena9", &list), ["arena9-bloom", "arena9-bloom-old", "arena9-bloom-new", "james-gpu", "james-gpu-old", "james-gpu-new"]);
         // Forgotten wins even over today's list.
         assert!(!push_set("arena9", &list, &BTreeSet::new(), &set(&["arena9-apple"])).contains(&"arena9-apple".to_string()));
-        assert_eq!(forget_dirs("arena9", "bloom").unwrap(), ["arena9-bloom", "arena9-bloom-old", "arena9-bloom-new"]);
-        assert_eq!(forget_dirs("arena9", "arena9-bloom").unwrap()[0], "arena9-bloom");
+        assert_eq!(forget_dirs("arena9", "bloom", &list).unwrap(), ["arena9-bloom", "arena9-bloom-old", "arena9-bloom-new"]);
+        assert_eq!(forget_dirs("arena9", "arena9-bloom", &list).unwrap()[0], "arena9-bloom");
         for bad in ["", "../x", "a/b", ".x", "@james-gpu", "a b"] {
-            assert!(forget_dirs("arena9", bad).is_none(), "{bad:?}");
+            assert!(forget_dirs("arena9", bad, &list).is_none(), "{bad:?}");
         }
+        // A3-6: a "twin" that is another participant's own list entry is never taken along.
+        let list2: Vec<String> = ["bravo", "bravo-new"].map(String::from).to_vec();
+        assert_eq!(forget_dirs("arena9", "bravo", &list2).unwrap(), ["arena9-bravo", "arena9-bravo-old"]);
     }
 
     /// §14.7: recorded stderr samples.
@@ -1410,7 +1629,21 @@ mod tests {
             (Some(1), "/usr/bin/rrsync error: do not use .. in --link-dest (anchor the path at the root of your restricted dir)", false, Err(Refused)),
             (Some(1), "/usr/bin/rrsync error: option --delete has been disabled on this server.", false, Err(Refused)),
             (Some(1), "/usr/bin/rrsync error: reading from write-only server is not allowed", false, Err(Refused)),
-            (Some(30), "rsync error: timeout in data send/receive (code 30)", false, Err(Timeout)),
+            (Some(30), "rsync error: timeout in data send/receive (code 30)", false, Err(Stalled)),
+            // A3-2: a volume that refuses writes is the archive's failure.
+            (Some(23), "rsync: [receiver] mkstemp \"/srv/arena/push/snap/w0d1/a/.x.Gx81bQ\" failed: Read-only file system (30)", false, Err(ArchiveIo)),
+            (Some(23), "rsync: [receiver] write failed on \"/srv/arena/push/big/a/x\": Input/output error (5)", false, Err(ArchiveIo)),
+            (Some(23), "rsync: [generator] recv_generator: mkdir \"/srv/arena/push/snap/w0d1/a/d\" failed: Structure needs cleaning (117)", false, Err(ArchiveIo)),
+            (Some(23), "rsync: [receiver] write failed on \"/srv/arena/push/big/a/x\": Disk quota exceeded (122)", false, Err(NoSpace)),
+            // … and a participant's file NAMED like one never passes for it (rsync quotes names;
+            // the errno is read only at the end of a line).
+            (Some(23), "rsync: [sender] send_files failed to open \"/b/w0d1/a/x: Read-only file system (30)\": Permission denied (13)", false, Err(Other)),
+            (Some(23), "rsync: [sender] send_files failed to open \"/b/w0d1/a/No space left on device (28)\": Permission denied (13)", false, Err(Other)),
+            (Some(23), "rsync: [sender] send_files failed to open \"/b/w0d1/a/Host key verification failed\": Permission denied (13)", false, Err(Other)),
+            (Some(23), "rsync: [sender] send_files failed to open \"/b/w0d1/a/ssh: connect to host x port 22: Connection refused\": Permission denied (13)", false, Err(Other)),
+            (Some(23), "rsync: [sender] send_files failed to open \"/b/w0d1/a//usr/bin/rrsync error: x\": Permission denied (13)", false, Err(Other)),
+            (Some(23), "rsync: [sender] send_files failed to open \"/b/w0d1/a/q\" \"/srv/arena/push/snap\" \"z\": Permission denied (13)", false, Err(Other)),
+            (Some(23), "rsync: [receiver] mkdir \"/srv/arena/push/snap/w0d1/a/q\" \"/srv/arena/push/snap\" \"z\" failed: Permission denied (13)", false, Err(Other)),
             (None, "", true, Err(Timeout)),
             (Some(12), "rsync error: error in rsync protocol data stream (code 12)", false, Err(Other)),
         ];
@@ -2165,5 +2398,131 @@ mod tests {
         assert_eq!(literal_rule("/", Path::new("new\nline")), "/new?line");
         assert_eq!(literal_rule("/", Path::new("c1\u{85}ctl")), "/c1??ctl", "a two-byte control character: two `?`");
         assert_eq!(literal_rule("/", Path::new(OsStr::from_bytes(b"[a]\xff"))), "/\\[a]?");
+    }
+
+    // ---- review 3 (re-review of eb838a2) -------------------------------------------------------
+
+    /// A3-1: the skip rules (A2-1 a) go into rsync's argv, one `--exclude=` per link, with no
+    /// bound. A participant who plants ~560 over-long links in a deep directory (≈ 2 MB of disk)
+    /// makes the argv longer than ARG_MAX: rsync can't even be started (E2BIG → `Other`). The big
+    /// tier is ONE push for every pod — so no pod's big/ reaches the archive again, for good;
+    /// before eb838a2 the same links only cost an exit 23 with everything else transferred.
+    #[cfg(unix)]
+    #[test]
+    fn review3_many_unstorable_links_never_stop_the_big_push_for_every_pod() {
+        let Some(rrsync) = rrsync_path() else { return };
+        let t = tmp("rv3-argmax");
+        let push = t.0.join("push");
+        std::fs::create_dir_all(push.join("big")).unwrap();
+        let tr = shim_transport(&t.0, "shim", &forced(rrsync, &push, true));
+        let src = t.0.join("backup");
+        write(&src.join("big/arena9-apple/ckpt.pt"), "apple's weights\n");
+        // 16 × 240-byte components: each rule is ~3.9 KB; 600 of them are > 2 MB of argv.
+        let deep = src.join("big/arena9-evil").join(vec!["d".repeat(240); 16].join("/"));
+        std::fs::create_dir_all(&deep).unwrap();
+        let long = format!("/{}", "a".repeat(4084));
+        for i in 0..600 {
+            std::os::unix::fs::symlink(&long, deep.join(format!("l{i}"))).unwrap();
+        }
+        let job = big_job(&src, &["arena9-apple".into(), "arena9-evil".into()]);
+        assert_eq!(job.skip.len(), 600);
+        let args = push_args(&job, &tr, &settings(""));
+        let o = std::process::Command::new("rsync").args(&args).output();
+        let argv: usize = args.iter().map(|a| a.len() + 1).sum();
+        let o = o.unwrap_or_else(|e| panic!("one participant's links stop the cohort's big push before it starts ({argv} bytes of argv): {e}"));
+        assert!(classify_push(o.status.code(), &String::from_utf8_lossy(&o.stderr), false).is_ok(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert!(push.join("big/arena9-apple/ckpt.pt").exists(), "another pod's big file never arrives");
+    }
+
+    /// A3-1: the skip rules never reach argv — one `--exclude-from` file (0600, in the tier's temp
+    /// dir, shared by a pod's two passes, gone with the jobs); a tree with more than
+    /// MAX_SKIP_RULES unstorable links is left out of its push (a pod's push isn't made; a big
+    /// push of several pods leaves only that dir back); dirs every push leaves out aren't walked.
+    #[cfg(unix)]
+    #[test]
+    fn skip_rules_go_through_a_private_file_and_too_many_leave_only_that_pod_out() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tmp("skipfile");
+        let src = t.0.join("backup");
+        let long = format!("/{}", "a".repeat(4084));
+        write(&src.join("w0d1/arena9-apple/work.py"), "w\n");
+        std::os::unix::fs::symlink(&long, src.join("w0d1/arena9-apple/longlink")).unwrap();
+        // Under a dir no push takes: never walked, never a rule.
+        write(&src.join("w0d1/arena9-apple/.cache/x"), "c\n");
+        std::os::unix::fs::symlink(&long, src.join("w0d1/arena9-apple/.cache/hidden")).unwrap();
+        let [files, git] = pod_jobs(&src, "w0d1", "arena9-apple", &[], None);
+        assert_eq!(files.skip, ["/longlink"]);
+        let f = files.skip_file.clone().expect("a rules file");
+        assert!(std::sync::Arc::ptr_eq(&f, git.skip_file.as_ref().unwrap()), "one scan, one file for both passes");
+        assert!(f.path().starts_with(src.join("w0d1/.rsync-tmp")), "{}", f.path().display());
+        assert_eq!(std::fs::read_to_string(f.path()).unwrap(), "/longlink\n");
+        assert_eq!(std::fs::metadata(f.path()).unwrap().permissions().mode() & 0o777, 0o600);
+        let a = push_args(&files, &transport(), &settings(""));
+        assert!(a.contains(&format!("--exclude-from={}", f.path().display())), "{a:?}");
+        assert!(!a.iter().any(|x| x.contains("longlink")), "never a per-link argv element: {a:?}");
+        let path = f.path().to_path_buf();
+        drop((files, git, f));
+        assert!(!path.exists(), "the rules file goes with its jobs");
+        // Too many: that pod is left out — of its own push, and of a big push of several pods.
+        let evil = src.join("big/arena9-evil/links");
+        std::fs::create_dir_all(&evil).unwrap();
+        for i in 0..=MAX_SKIP_RULES {
+            std::os::unix::fs::symlink(&long, evil.join(format!("l{i}"))).unwrap();
+        }
+        write(&src.join("big/arena9-apple/ckpt.pt"), "apple\n");
+        std::fs::create_dir_all(src.join("w0d1/arena9-evil")).unwrap();
+        std::fs::rename(src.join("big/arena9-evil/links"), src.join("w0d1/arena9-evil/links")).unwrap();
+        let [e, _] = pod_jobs(&src, "w0d1", "arena9-evil", &[], None);
+        assert_eq!(e.left_out, ["arena9-evil"]);
+        assert!(e.skip.is_empty() && e.skip_file.is_none());
+        std::fs::rename(src.join("w0d1/arena9-evil/links"), src.join("big/arena9-evil/links")).unwrap();
+        let big = big_job(&src, &["arena9-apple".into(), "arena9-evil".into()]);
+        assert_eq!(big.left_out, ["arena9-evil"]);
+        let a = push_args(&big, &transport(), &settings(""));
+        assert!(a.contains(&"--include=/arena9-apple/".to_string()) && !a.iter().any(|x| x.contains("arena9-evil")), "{a:?}");
+        assert!(a.iter().map(|x| x.len() + 1).sum::<usize>() < 64 * 1024, "argv stays small");
+        let one = big_job(&src, &["arena9-apple".into()]);
+        assert!(one.left_out.is_empty() && one.what == "big arena9-apple");
+    }
+
+    /// A3-5: what a push sent before it was stopped, from its `--log-file` (`%i %l`): sent files
+    /// only, never directories or links.
+    #[test]
+    fn sent_bytes_counts_the_files_a_push_sent() {
+        let log = "2026/10/13 10:44:38 [226377] building file list\n\
+                   2026/10/13 10:44:38 [226377] cd+++++++++ 4096\n\
+                   2026/10/13 10:44:38 [226377] <f+++++++++ 300,000\n\
+                   2026/10/13 10:44:38 [226377] <f.st...... 3\n\
+                   2026/10/13 10:44:39 [226377] cL+++++++++ 7\n\
+                   2026/10/13 10:44:39 [226377] Total bytes sent: 300,175\n";
+        assert_eq!(sent_bytes(log), 300_003);
+        assert_eq!(sent_bytes(""), 0);
+        // And rrsync never sees the log options (client-side): the forbidden table stays clean.
+        let mut j = pod_job(Path::new("/b"), "w0d1", "arena9-apple", SnapPass::Files, &[], None);
+        j.log_file = Some("/b/w0d1/.rsync-tmp/log".into());
+        let a = push_args(&j, &transport(), &settings(""));
+        assert!(a.contains(&"--log-file=/b/w0d1/.rsync-tmp/log".to_string()) && a.contains(&"--log-file-format=%i %l".to_string()));
+        assert_eq!(forbidden_flag(&a), None);
+    }
+
+    /// A3-1 and A3-5 through the real forced command: the `--exclude-from` file and the client's
+    /// `--log-file` pass rrsync, the links are left out, the log counts what was sent.
+    #[test]
+    fn exclude_from_and_log_file_pass_rrsync() {
+        let Some(rrsync) = rrsync_path() else { return };
+        let t = tmp("exfrom");
+        let push = t.0.join("push");
+        std::fs::create_dir_all(push.join("snap")).unwrap();
+        let tr = shim_transport(&t.0, "shim", &forced(rrsync, &push, true));
+        let src = t.0.join("backup");
+        write(&src.join("w0d1/arena9-apple/work.py"), &"w".repeat(1000));
+        std::os::unix::fs::symlink(format!("/{}", "a".repeat(4084)), src.join("w0d1/arena9-apple/longlink")).unwrap();
+        let mut job = pod_job(&src, "w0d1", "arena9-apple", SnapPass::Files, &[], None);
+        let log = t.0.join("push.log");
+        job.log_file = Some(log.display().to_string());
+        let o = std::process::Command::new("rsync").args(push_args(&job, &tr, &settings(""))).output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert!(push.join("snap/w0d1/arena9-apple/work.py").exists() && std::fs::symlink_metadata(push.join("snap/w0d1/arena9-apple/longlink")).is_err());
+        assert_eq!(sent_bytes(&std::fs::read_to_string(&log).unwrap()), 1000);
     }
 }
