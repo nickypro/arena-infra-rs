@@ -19,20 +19,30 @@
 //! follows links on either side (`-L`, `-K`, `-k`, `--copy-links`), keeps a per-directory holding
 //! area in the pushed tree (`--partial-dir`, `--delay-updates`: a participant's symlink of that
 //! name would make the archive's rsync empty another pod's directory — review finding
-//! ARCH-SEC-1), or **rewrites a file in place** (`--inplace`, `--append*`): rrsync allows those,
-//! and in place on the archive means on an inode that past days' snapshots share — a silent
-//! change to history. A normal push writes a changed file anew (temp + rename) and never touches
-//! the old inode. `-a` is out because the receiver is unprivileged (`-D`/`-o`/`-g` mean nothing
-//! there); `--chmod` is fixed so every push gives every file the same mode — which is also what
-//! lets `--link-dest` match and link. On the archive itself rrsync runs with `-munge`: every
-//! symlink a participant planted is stored defanged (`/rsyncd-munged/…`), never followed.
+//! ARCH-SEC-1), **rewrites a file in place** (`--inplace`, `--append*`), or **sets attributes
+//! of a file that is already there** (`-p`/`--perms`, `-E`, `-o`/`-g`/`--chown`, ACLs, xattrs —
+//! review finding A2-2). In place on the archive means on an inode that past days' snapshots,
+//! the fleet baseline and other pods share: one participant's `chmod +x` (size and mtime
+//! unchanged, so rsync's quick check passes and only the attributes are "fixed") would change
+//! every pod's copy. So a push is `-rlt -J --chmod=u=rwX,go=rX`: without `-p` the `--chmod`
+//! mode is given to each NEW file only (0644/0755) and an existing file's mode is never touched;
+//! `-J` never sets a symlink's time (`touch -h` on a hard-linked link would reach sealed days).
+//! A changed file is written anew (temp + rename), never over the old inode. On the archive
+//! itself rrsync runs with `-munge`: every symlink a participant planted is stored defanged
+//! (`/rsyncd-munged/…`), never followed — and one whose target is too long to store that way is
+//! left out of the push ([`unmungeable_links`], A2-1) rather than failing the pod's push for good.
+//!
+//! One pod that can't be pushed never holds the rest up (A2-1): the backlog is taken round-robin
+//! ([`plan_snap`]), and a pod whose push of a past label fails [`GIVE_UP_AFTER`] times in a row
+//! is settled for that label as it is on the archive ("sealed partial", [`note_push_failed`]) —
+//! so the label, and every later one linked to it, can seal; `status` names each such pod.
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::state::SnapState;
+use super::state::{LabelRecord, SnapState};
 use super::{ArchiveSettings, Tier};
 use crate::restore::parse_label;
 
@@ -105,15 +115,62 @@ pub fn label_end(label: &str, start_days: i64) -> Option<u64> {
 /// last full push (every pod through) started ≥ [`GRACE_SECS`] after its day ended, linked every
 /// pod to what it should have ([`super::state::LabelRecord::linked`]), and carried every allowed
 /// pod the control box holds for it (`local_pods` — a pod re-added to the list, or one whose push
-/// failed, keeps the label open). A label whose day hasn't ended (clock skew included) and a
-/// custom label never are.
+/// failed, keeps the label open) — or settled it as it is (`given_up`, after [`GIVE_UP_AFTER`]
+/// failed pushes in a row: "sealed partial"). A label whose day hasn't ended (clock skew
+/// included) and a custom label never are.
 pub fn sealed(label: &str, state: &SnapState, start_days: i64, local_pods: &[String]) -> bool {
     match (label_end(label, start_days), state.labels.get(label)) {
         (Some(end), Some(rec)) => {
-            rec.ok_finished > 0 && rec.ok_started >= end + GRACE_SECS && rec.linked && local_pods.iter().all(|p| rec.pods_ok.contains(p))
+            rec.ok_finished > 0
+                && rec.ok_started >= end + GRACE_SECS
+                && rec.linked
+                && local_pods.iter().all(|p| rec.pods_ok.contains(p) || rec.given_up.contains(p))
         }
         _ => false,
     }
+}
+
+/// How many failed pushes in a row (of a label whose day is over, for one pod — or of the
+/// baseline) settle it as it is: three runs, 45 minutes at the cron's pace. Long enough that a
+/// passing hiccup never seals anything partial; short enough that one stuck pod (a file the cron
+/// user can't read, a wedged tree) never holds every later label open.
+pub const GIVE_UP_AFTER: u32 = 3;
+
+/// Whether a failure is the pod's own and so counts toward [`GIVE_UP_AFTER`]: rsync's errors
+/// (exit 23 …) and running out of time. Failures of the archive or the network — down, full,
+/// unmounted, a host key or push key refused, an rrsync refusal — stop the whole run and say
+/// nothing about the pod: an outage of any length never seals anything partial.
+pub fn counts_toward_give_up(f: PushFailure) -> bool {
+    matches!(f, PushFailure::Other | PushFailure::Timeout)
+}
+
+/// Record that `pod`'s push of a label went through: it is complete there for this pod again
+/// (a `--label` retry of a pod settled partial un-settles it).
+pub fn note_push_ok(rec: &mut LabelRecord, pod: &str) {
+    rec.pods_ok.insert(pod.to_string());
+    rec.fails.remove(pod);
+    rec.given_up.remove(pod);
+}
+
+/// Record that `pod`'s push of a label failed with `class`, the push having started at
+/// `started`: `true` when this failure settles the pod for that label as it is ("sealed
+/// partial") — the [`GIVE_UP_AFTER`]th failure in a row of the pod's own kind
+/// ([`counts_toward_give_up`]), each of a push that could have sealed it (started ≥
+/// [`GRACE_SECS`] after the day, `end` = [`label_end`]; never a custom label). Other failures
+/// leave the count as it is.
+pub fn note_push_failed(rec: &mut LabelRecord, pod: &str, class: PushFailure, started: u64, end: Option<u64>) -> bool {
+    rec.pods_ok.remove(pod);
+    let Some(end) = end else { return false };
+    if !counts_toward_give_up(class) || started < end + GRACE_SECS {
+        return false;
+    }
+    let n = rec.fails.entry(pod.to_string()).or_insert(0);
+    *n += 1;
+    if *n >= GIVE_UP_AFTER {
+        rec.given_up.insert(pod.to_string());
+        return true;
+    }
+    false
 }
 
 /// One snapshot label on the control box: its name and the allowed pod dirs it holds.
@@ -137,12 +194,15 @@ pub struct SnapPlan {
 }
 
 /// The labels to push: the **newest** local label first when it isn't final (the newest work is
-/// protected soonest, even behind a backlog), then the older unsealed ones oldest first — at most
-/// [`MAX_BACKLOG_PER_RUN`] of them — then each `forced` one (`--label`, pushed even if sealed or
-/// deferred). Covers the first run (a backlog, worked off over a few runs as a link chain), the
-/// steady state (today, and yesterday until it seals) and a backfill after an outage. Pushing the
-/// newest before its predecessors costs nothing for good: it isn't sealed until it was pushed
-/// with them in place, and that later push re-links its identical files.
+/// protected soonest, even behind a backlog), then at most [`MAX_BACKLOG_PER_RUN`] older unsealed
+/// ones — those **tried least recently** (`last_tried`; never tried first, ties oldest first:
+/// round-robin, so a label that fails every run can never take every slot and starve the others,
+/// A2-1), pushed oldest first so each links to the one before — then each `forced` one
+/// (`--label`, pushed even if sealed or deferred). Covers the first run (a backlog, worked off over
+/// a few runs as a link chain), the steady state (today, and yesterday until it seals) and a
+/// backfill after an outage. Pushing the newest before its predecessors costs nothing for good: it
+/// isn't sealed until it was pushed with them in place, and that later push re-links its
+/// identical files.
 pub fn plan_snap(local: &[LocalLabel], forced: &[String], state: &SnapState, start_days: i64) -> SnapPlan {
     let mut sorted: Vec<&LocalLabel> = local.iter().filter(|l| parse_label(&l.label).is_some()).collect();
     sorted.sort_by_key(|l| parse_label(&l.label));
@@ -155,8 +215,12 @@ pub fn plan_snap(local: &[LocalLabel], forced: &[String], state: &SnapState, sta
         backlog.retain(|l| *l != n);
         plan.labels.push(n);
     }
-    for (i, l) in backlog.into_iter().enumerate() {
-        if i < MAX_BACKLOG_PER_RUN {
+    let tried = |l: &String| state.labels.get(l).map_or(0, |r| r.last_tried);
+    let mut turn: Vec<String> = backlog.clone();
+    turn.sort_by_key(|l| (tried(l), parse_label(l)));
+    turn.truncate(MAX_BACKLOG_PER_RUN);
+    for l in backlog {
+        if turn.contains(&l) {
             plan.labels.push(l);
         } else {
             plan.deferred.push(l);
@@ -211,8 +275,15 @@ pub fn baseline_pushed(b: LocalBaseline, state: &SnapState) -> bool {
 }
 
 /// Whether `pod`'s push of `label` links to everything it should (what lets the label seal): the
-/// pod's previous local label is complete on the archive for this pod, and the label's baseline
-/// (if the control box has one) is on the archive.
+/// pod's previous local label is complete on the archive for this pod — or settled partial
+/// ([`note_push_failed`]: as complete as it will get) — and the label's baseline (if the control
+/// box has one) is on the archive, unless its push has failed [`GIVE_UP_AFTER`] times in a row.
+///
+/// Why the baseline holds a seal at all (A2-1 d): a label sealed without it keeps a full copy of
+/// the image's files for every pod — the pod's later labels link to that copy, not the baseline —
+/// and a sealed label is never pushed (re-linked) again: tens of GB on a cohort's snap volume
+/// for good. A passing failure therefore only delays the seal; a baseline that keeps failing
+/// stops holding anything after three runs (labels then seal on their own chain).
 pub fn chain_ok(label: &str, pod: &str, local: &[LocalLabel], state: &SnapState, baseline: Option<LocalBaseline>) -> bool {
     let Some(key) = parse_label(label) else { return false };
     let prev = local
@@ -222,8 +293,14 @@ pub fn chain_ok(label: &str, pod: &str, local: &[LocalLabel], state: &SnapState,
         .filter(|(k, _)| *k < key)
         .max_by_key(|(k, _)| *k)
         .map(|(_, l)| l);
-    let prev_ok = prev.is_none_or(|p| state.labels.get(p).is_some_and(|r| r.pods_ok.contains(pod)));
-    prev_ok && baseline.is_none_or(|b| baseline_pushed(b, state))
+    let prev_ok = prev.is_none_or(|p| state.labels.get(p).is_some_and(|r| r.pods_ok.contains(pod) || r.given_up.contains(pod)));
+    prev_ok && baseline.is_none_or(|b| baseline_pushed(b, state) || baseline_given_up(state))
+}
+
+/// Whether the baseline push has failed [`GIVE_UP_AFTER`] times in a row (its own kind of
+/// failure): labels no longer wait for it to seal.
+pub fn baseline_given_up(state: &SnapState) -> bool {
+    state.baseline_fails >= GIVE_UP_AFTER
 }
 
 /// The pod dirs that may leave the control box (S11): for every cohort entry of
@@ -241,6 +318,46 @@ pub fn allowed_pod_dirs(prefix: &str, machine_names: &[String]) -> Vec<String> {
         }
     }
     out
+}
+
+/// The pod dirs of the list's staff entries (`@name`) with their `-old`/`-new` twins.
+pub fn staff_dirs(prefix: &str, machine_names: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for e in machine_names.iter().map(|e| e.trim()).filter(|e| crate::naming::is_absolute(e)) {
+        let base = crate::naming::qualify(prefix, e);
+        for d in [base.clone(), format!("{base}-old"), format!("{base}-new")] {
+            if !out.contains(&d) {
+                out.push(d);
+            }
+        }
+    }
+    out
+}
+
+/// The pod dirs a sync pushes (S11, A2-3): today's allowlist and every dir ever on it
+/// (`allowed_ever` — a pod that left the list keeps its history growing), minus the list's
+/// **current** staff entries and every **forgotten** pod (`arena archive forget`). The list's
+/// staff marking and an explicit forget always win over history: a box re-listed as `@name`, or a
+/// participant who withdrew consent, never leaves the control box again.
+pub fn push_set(prefix: &str, machine_names: &[String], ever: &BTreeSet<String>, forgotten: &BTreeSet<String>) -> Vec<String> {
+    let staff = staff_dirs(prefix, machine_names);
+    let mut out = allowed_pod_dirs(prefix, machine_names);
+    for d in ever {
+        if !out.contains(d) {
+            out.push(d.clone());
+        }
+    }
+    out.retain(|d| !staff.contains(d) && !forgotten.contains(d));
+    out
+}
+
+/// What `archive forget <pod>` covers: the pod dir (`bravo` → `<prefix>-bravo`; a full name as
+/// given) and its `-old`/`-new` twins (`replace` / `migrate`). `None` for a name that isn't one
+/// plain path component.
+pub fn forget_dirs(prefix: &str, pod: &str) -> Option<Vec<String>> {
+    let p = pod.trim();
+    let base = if p.starts_with(&format!("{prefix}-")) { p.to_string() } else { format!("{prefix}-{p}") };
+    plain_name(p).then(|| vec![base.clone(), format!("{base}-old"), format!("{base}-new")])
 }
 
 /// `[A-Za-z0-9._-]+`, not starting with a dot: safe as an anchored rsync rule and a path.
@@ -340,6 +457,11 @@ pub const SECRET_EXCLUDES: &[&str] = &[
     ".git/worktrees/**/config.worktree",
     ".git.arena-nested/config",
     ".git.arena-nested/config.worktree",
+    // a bare or mirror clone (`git clone --bare|--mirror` → `<name>.git/`) keeps its config there
+    "*.git/config",
+    "*.git/config.worktree",
+    "*.git/modules/**/config",
+    "*.git/worktrees/**/config.worktree",
     // rsync's own holding areas and temp dirs — never shipped, whatever they are (a participant's
     // symlink named like one is exactly ARCH-SEC-1's attack)
     ".rsync-tmp",
@@ -349,7 +471,8 @@ pub const SECRET_EXCLUDES: &[&str] = &[
 
 /// Flags no push may ever carry (S1): prefixes for long options, letters for short clusters.
 /// (`--del` covers every `--delete*` and rsync's own `--del` alias; `--partial` covers
-/// `--partial-dir`.)
+/// `--partial-dir`.) The attribute flags (`--perms` … `--xattrs`, A2-2) would re-set the
+/// attributes of a file already on the archive — an inode other days and pods share.
 pub const FORBIDDEN_LONG: &[&str] = &[
     "--del",
     "--remove",
@@ -363,8 +486,15 @@ pub const FORBIDDEN_LONG: &[&str] = &[
     "--delay-updates",
     "--keep-dirlinks",
     "--temp-dir",
+    "--perms",
+    "--executability",
+    "--owner",
+    "--group",
+    "--chown",
+    "--acls",
+    "--xattrs",
 ];
-pub const FORBIDDEN_SHORT: &[char] = &['a', 'K', 'L', 'k'];
+pub const FORBIDDEN_SHORT: &[char] = &['a', 'K', 'L', 'k', 'p', 'E', 'o', 'g', 'A', 'X'];
 
 /// Whether an argv carries a forbidden flag (any position). Filter rules are written
 /// `--exclude=PAT`, so a pattern can never be read as a flag.
@@ -416,20 +546,109 @@ pub struct PushJob {
     pub top_rules: Vec<String>,
     /// Create the destination's missing parents (`--mkpath`): a pod's push into a new label.
     pub mkpath: bool,
+    /// Anchored `--exclude` rules for the exact symlinks the archive can't store
+    /// ([`unmungeable_links`]), found in the local tree when the job was made — each job's
+    /// message says how many (never their targets).
+    pub skip: Vec<String>,
+}
+
+/// What rrsync's `-munge` puts in front of every symlink's target on the archive.
+pub const MUNGE_PREFIX: &str = "/rsyncd-munged/";
+/// Linux's `PATH_MAX`: a symlink's target, with its terminating NUL, must fit in it.
+pub const PATH_MAX: usize = 4096;
+
+/// Whether a symlink with a target of `len` bytes can be stored munged (A2-1): a target of
+/// 4081..4095 bytes is legal on a pod and on the control box, but 15 bytes longer it isn't —
+/// the archive's `symlink()` fails (ENAMETOOLONG) and so would every push of that pod, for good.
+pub fn munge_fits(len: usize) -> bool {
+    len + MUNGE_PREFIX.len() < PATH_MAX
+}
+
+/// The symlinks under `root` (none followed) whose target is too long to store munged
+/// ([`munge_fits`]), as paths relative to `root`. Unreadable directories are skipped (rsync then
+/// says so itself); a missing root is empty.
+pub fn unmungeable_links(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack: Vec<PathBuf> = vec![PathBuf::new()];
+    while let Some(rel) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(root.join(&rel)) else { continue };
+        for e in rd.flatten() {
+            let Ok(ft) = e.file_type() else { continue };
+            let child = rel.join(e.file_name());
+            if ft.is_dir() {
+                stack.push(child);
+            } else if ft.is_symlink() {
+                if let Ok(target) = std::fs::read_link(e.path()) {
+                    if !munge_fits(target.as_os_str().len()) {
+                        out.push(child);
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// An rsync filter pattern that matches exactly `rel` (bytes), anchored under `under` (`/` or
+/// `/<pod>/`). A path with a wildcard character in it has each of `\*?[` escaped (rsync honours
+/// `\` only in a pattern that has a wildcard); each byte of a control character or of invalid
+/// UTF-8 becomes `?` (rsync matches bytes: `?` is one byte, never a `/`), which can only match
+/// the path's own siblings that differ in just those bytes: never less than the link itself.
+pub fn literal_rule(under: &str, rel: &Path) -> String {
+    #[cfg(unix)]
+    let bytes: &[u8] = {
+        use std::os::unix::ffi::OsStrExt;
+        rel.as_os_str().as_bytes()
+    };
+    #[cfg(not(unix))]
+    let lossy = rel.to_string_lossy().into_owned();
+    #[cfg(not(unix))]
+    let bytes: &[u8] = lossy.as_bytes();
+    let mut parts: Vec<(bool, char)> = Vec::new(); // (literal?, char)
+    for chunk in bytes.utf8_chunks() {
+        for c in chunk.valid().chars() {
+            if c.is_control() {
+                parts.extend(std::iter::repeat_n((false, '?'), c.len_utf8()));
+            } else {
+                parts.push((true, c));
+            }
+        }
+        for _ in chunk.invalid() {
+            parts.push((false, '?'));
+        }
+    }
+    let wild = parts.iter().any(|(lit, c)| !lit || "*?[".contains(*c));
+    let mut s = String::from(under);
+    for (lit, c) in parts {
+        if lit && wild && "\\*?[".contains(c) {
+            s.push('\\');
+        }
+        s.push(c);
+    }
+    s
+}
+
+/// The anchored rules leaving out every unmungeable symlink under `root` (the job's source
+/// subtree `under`, `/` for a pod's own push).
+fn skip_rules(root: &Path, under: &str) -> Vec<String> {
+    unmungeable_links(root).iter().map(|rel| literal_rule(under, rel)).collect()
 }
 
 /// `pod`'s push of `label` (`<dir>/<label>/<pod>/` → `snap/<label>/<pod>/`), linked to its earlier
-/// labels and its baseline.
+/// labels and its baseline; the symlinks the archive can't store are left out.
 pub fn pod_job(dir: &Path, label: &str, pod: &str, pass: SnapPass, link_labels: &[String], baseline: Option<u32>) -> PushJob {
     let mut link_dests: Vec<String> = link_labels.iter().map(|l| format!("/snap/{l}/{pod}/")).collect();
     if let Some(w) = baseline {
         link_dests.push(format!("/snap/{}/w{w}/fleet/", crate::pull::BASELINE_DIR));
     }
+    let src = dir.join(label).join(pod);
     PushJob {
         tier: Tier::Snap,
         pass,
         what: format!("{label} {pod}"),
-        src: dir.join(label).join(pod).display().to_string(),
+        skip: skip_rules(&src, "/"),
+        src: src.display().to_string(),
         dest: format!("snap/{label}/{pod}/"),
         link_dests,
         top_rules: Vec::new(),
@@ -440,61 +659,71 @@ pub fn pod_job(dir: &Path, label: &str, pod: &str, pass: SnapPass, link_labels: 
 /// The fleet baselines' push (`<dir>/baseline/` → `snap/baseline/`): only `w<N>/fleet/` of each
 /// local week, nothing else that dir may hold (an old baseline moved aside).
 pub fn baseline_job(dir: &Path, weeks: &[u32], pass: SnapPass) -> PushJob {
+    let src = dir.join(crate::pull::BASELINE_DIR);
     let mut top_rules = Vec::new();
+    let mut skip = Vec::new();
     for w in weeks {
         top_rules.push(format!("--include=/w{w}/"));
         top_rules.push(format!("--include=/w{w}/fleet/"));
         top_rules.push(format!("--exclude=/w{w}/*"));
+        skip.extend(skip_rules(&src.join(format!("w{w}")).join("fleet"), &format!("/w{w}/fleet/")));
     }
     top_rules.push("--exclude=/*".into());
     PushJob {
         tier: Tier::Snap,
         pass,
         what: "baseline".into(),
-        src: dir.join(crate::pull::BASELINE_DIR).display().to_string(),
+        src: src.display().to_string(),
         dest: format!("snap/{}/", crate::pull::BASELINE_DIR),
         link_dests: Vec::new(),
         top_rules,
         mkpath: false,
+        skip,
     }
 }
 
 /// The big tier's push (`<dir>/big/` → `big/`), only the allowed pods present.
 pub fn big_job(dir: &Path, pods: &[String]) -> PushJob {
+    let src = dir.join(crate::restore::BIG);
     let mut top_rules: Vec<String> = pods.iter().map(|p| format!("--include=/{p}/")).collect();
     top_rules.push("--exclude=/*".into());
+    let skip = pods.iter().flat_map(|p| skip_rules(&src.join(p), &format!("/{p}/"))).collect();
     PushJob {
         tier: Tier::Big,
         pass: SnapPass::Files,
         what: "big".into(),
-        src: dir.join(crate::restore::BIG).display().to_string(),
+        src: src.display().to_string(),
         dest: "big/".into(),
         link_dests: Vec::new(),
         top_rules,
         mkpath: false,
+        skip,
     }
 }
 
 /// The rsync argv (after the program name) for `job` — pure, so every invariant is a table test.
 ///
 /// ```text
-/// snap pod:  -rlpt -z --chmod=u=rwX,go=rX [--max-size=M] --timeout=300 [--bwlimit=B] --stats --mkpath
+/// snap pod:  -rlt -J -z --chmod=u=rwX,go=rX [--max-size=M] --timeout=300 [--bwlimit=B] --stats --mkpath
 ///            [--link-dest=/snap/<earlier>/<pod>/]… [--link-dest=/snap/baseline/w<N>/fleet/]
-///            --exclude=<secret>… --exclude=<extra>… [git pass: --include=*/ --include=**/.git/** --exclude=*]
+///            --exclude=<secret>… --exclude=<extra>… [--exclude=/<unmungeable link>…]
+///            [git pass: --include=*/ --include=**/.git/** --exclude=*]
 ///            -e <pinned ssh> <dir>/<L>/<pod>/ arena-push@<ip>:snap/<L>/<pod>/
 /// baseline:  the same flags, --include=/w<N>/ --include=/w<N>/fleet/ --exclude=/w<N>/* … --exclude=/*,
 ///            <dir>/baseline/ → snap/baseline/
-/// big:       -rlpt --chmod=u=rwX,go=rX --timeout=300 [--bwlimit=B] --stats --exclude=<secret>…
+/// big:       -rlt -J --chmod=u=rwX,go=rX --timeout=300 [--bwlimit=B] --stats --exclude=<secret>…
 ///            --include=/<pod>/… --exclude=/*  <dir>/big/ → big/
 /// ```
 ///
 /// - `--link-dest`s are absolute: rrsync refuses `..` and re-roots `/snap/…` under its root.
-/// - Filter order matters (first match wins): secrets first, then the anchored top-level rules
-///   (any other top-level dir — a staff box, a stranger — goes no further).
+/// - Filter order matters (first match wins): secrets first, then the links left out, then the
+///   anchored top-level rules (any other top-level dir — a staff box, a stranger — goes no
+///   further).
+/// - No `-p` (A2-2): `--chmod` gives each new file its mode; a file already there keeps its own.
 /// - `-z` and the cap on snap only. No partial transfers anywhere (no holding area in a
 ///   participant-shaped tree, ARCH-SEC-1): a big file cut off by the budget starts over next run.
 pub fn push_args(job: &PushJob, transport: &PushTransport, settings: &ArchiveSettings) -> Vec<String> {
-    let mut a: Vec<String> = vec!["-rlpt".into()];
+    let mut a: Vec<String> = vec!["-rlt".into(), "-J".into()];
     if job.tier == Tier::Snap {
         a.push("-z".into());
     }
@@ -514,6 +743,9 @@ pub fn push_args(job: &PushJob, transport: &PushTransport, settings: &ArchiveSet
         a.push(format!("--link-dest={d}"));
     }
     for s in SECRET_EXCLUDES.iter().copied().chain(settings.extra_excludes.iter().map(String::as_str)) {
+        a.push(format!("--exclude={s}"));
+    }
+    for s in &job.skip {
         a.push(format!("--exclude={s}"));
     }
     a.extend(job.top_rules.iter().cloned());
@@ -757,7 +989,7 @@ mod tests {
     }
     /// A label pushed OK at `started` for `pods`, linked.
     fn rec(started: u64, pods: &[&str]) -> LabelRecord {
-        LabelRecord { ok_started: started, ok_finished: started + 60, files: 1, bytes: 1, pods_ok: set(pods), pods_tried: set(pods), linked: true }
+        LabelRecord { ok_started: started, ok_finished: started + 60, files: 1, bytes: 1, pods_ok: set(pods), pods_tried: set(pods), linked: true, ..Default::default() }
     }
     fn local(labels: &[(&str, &[&str])]) -> Vec<LocalLabel> {
         labels.iter().map(|(l, p)| LocalLabel { label: l.to_string(), pods: p.iter().map(|s| s.to_string()).collect() }).collect()
@@ -781,8 +1013,9 @@ mod tests {
         v
     }
 
-    /// S1 (and ARCH-SEC-1): no push argv, in any combination, carries a flag that deletes, reads,
-    /// follows a link, rewrites in place or keeps a holding area in the pushed tree.
+    /// S1 (and ARCH-SEC-1, A2-2): no push argv, in any combination, carries a flag that deletes,
+    /// reads, follows a link, rewrites in place, keeps a holding area in the pushed tree, or sets
+    /// the attributes of a file already on the archive (`-p` and friends).
     #[test]
     fn no_push_ever_carries_a_deleting_reading_link_following_or_in_place_flag() {
         let mut n = 0;
@@ -816,10 +1049,24 @@ mod tests {
             "--delay-updates",
             "--keep-dirlinks",
             "--temp-dir=x",
+            "-rlpt",
+            "-p",
+            "--perms",
+            "-E",
+            "--executability",
+            "-o",
+            "-g",
+            "--owner",
+            "--group",
+            "--chown=a:b",
+            "-A",
+            "--acls",
+            "-X",
+            "--xattrs",
         ] {
             assert!(forbidden_flag(&[bad.to_string()]).is_some(), "{bad}");
         }
-        for ok in ["-rlpt", "-z", "-e", "--exclude=--delete", "--exclude=.rsync-partial", "--stats", "--mkpath", "--link-dest=/snap/w1d1/p/"] {
+        for ok in ["-rlt", "-J", "-z", "-e", "--chmod=u=rwX,go=rX", "--exclude=--delete", "--exclude=.rsync-partial", "--stats", "--mkpath", "--link-dest=/snap/w1d1/p/"] {
             assert!(forbidden_flag(&[ok.to_string()]).is_none(), "{ok}");
         }
     }
@@ -828,11 +1075,12 @@ mod tests {
     fn pod_baseline_and_big_argv_exactly() {
         let d = Path::new("/b");
         let a = push_args(&pod_job(d, "w1d3", "arena9-apple", SnapPass::Files, &["w1d2".into(), "w1d1".into()], Some(1)), &transport(), &settings(""));
-        let head: Vec<&str> = a.iter().take(11).map(String::as_str).collect();
+        let head: Vec<&str> = a.iter().take(12).map(String::as_str).collect();
         assert_eq!(
             head,
             [
-                "-rlpt",
+                "-rlt",
+                "-J",
                 "-z",
                 "--chmod=u=rwX,go=rX",
                 "--max-size=50M",
@@ -861,8 +1109,8 @@ mod tests {
         assert_eq!(&b[b.len() - 2..], ["/b/baseline/", "arena-push@192.0.2.1:snap/baseline/"]);
         // Big: no -z, no cap, no links, no holding area; only the allowed pods.
         let big = push_args(&big_job(d, &["arena9-apple".into()]), &transport(), &settings("ARCHIVE_BWLIMIT=0"));
-        let head: Vec<&str> = big.iter().take(4).map(String::as_str).collect();
-        assert_eq!(head, ["-rlpt", "--chmod=u=rwX,go=rX", "--timeout=300", "--stats"]);
+        let head: Vec<&str> = big.iter().take(5).map(String::as_str).collect();
+        assert_eq!(head, ["-rlt", "-J", "--chmod=u=rwX,go=rX", "--timeout=300", "--stats"]);
         assert!(!big.iter().any(|x| x == "-z" || x.starts_with("--max-size") || x.starts_with("--link-dest") || x.starts_with("--partial") || x.starts_with("--bwlimit") || x == "--mkpath"), "{big:?}");
         assert_eq!(&big[big.len() - 6..big.len() - 4], ["--include=/arena9-apple/", "--exclude=/*"].map(String::from));
         assert_eq!(&big[big.len() - 2..], ["/b/big/", "arena-push@192.0.2.1:big/"]);
@@ -888,7 +1136,7 @@ mod tests {
         }
         let big = push_args(&big_job(Path::new("/b"), &["arena9-apple".into()]), &transport(), &settings(""));
         assert!(big.iter().position(|x| x == "--include=/arena9-apple/") < big.iter().position(|x| x == "--exclude=/*"));
-        for must in [".bashrc", ".zshrc", ".claude*", ".ssh/", ".env", ".netrc", ".git-credentials", ".gitconfig", ".git/config", ".git/config.worktree", ".git/modules/**/config", ".bash_history", ".config/", "id_ed25519", ".pgpass"] {
+        for must in [".bashrc", ".zshrc", ".claude*", ".ssh/", ".env", ".netrc", ".git-credentials", ".gitconfig", ".git/config", ".git/config.worktree", ".git/modules/**/config", "*.git/config", ".bash_history", ".config/", "id_ed25519", ".pgpass"] {
             assert!(SECRET_EXCLUDES.contains(&must), "{must}");
         }
     }
@@ -936,6 +1184,11 @@ mod tests {
         // A pod the control box holds that wasn't pushed (re-added to the list, or its push failed): open.
         st.labels.insert("w0d1".into(), rec(late, A));
         assert!(!sealed("w0d1", &st, START, &["arena9-apple".into(), "arena9-bloom".into()]));
+        // ... unless that pod was settled partial (A2-1): the label seals without it.
+        let mut settled = rec(late, A);
+        settled.given_up.insert("arena9-bloom".into());
+        st.labels.insert("w0d1".into(), settled);
+        assert!(sealed("w0d1", &st, START, &["arena9-apple".into(), "arena9-bloom".into()]));
         // Only partly pushed (no full push yet): open.
         st.labels.insert("w0d1".into(), LabelRecord { ok_started: 0, ok_finished: 0, ..rec(late, A) });
         assert!(!sealed("w0d1", &st, START, &["arena9-apple".into()]));
@@ -972,6 +1225,80 @@ mod tests {
         assert_eq!(p.labels, ["w0d4", "w0d1", "mylabel"]);
         let p = plan_snap(&loc, &["w0d5".into()], &SnapState::default(), START);
         assert_eq!((p.labels.last().map(String::as_str), p.deferred.clone()), (Some("w0d5"), vec!["w0d4".to_string()]));
+    }
+
+    /// A2-1 (b): the backlog goes round-robin — least recently tried first, never tried before
+    /// all — so labels that fail on every run can't take every slot: each label gets its turn
+    /// within a few runs, and the chosen ones go oldest first (each links to the one before).
+    #[test]
+    fn the_backlog_goes_round_robin_so_failing_labels_never_starve_the_rest() {
+        let days = ["w0d1", "w0d2", "w0d3", "w0d4", "w0d5", "w0d6", "w0d7"];
+        let loc = local(&days.iter().map(|d| (*d, A)).collect::<Vec<_>>());
+        let mut st = SnapState::default();
+        // Run 1 took w0d1..w0d3 (all failed: open), never the others.
+        for (i, l) in ["w0d1", "w0d2", "w0d3"].iter().enumerate() {
+            st.labels.insert(l.to_string(), LabelRecord { last_tried: 1000 + i as u64, pods_tried: set(A), ..Default::default() });
+        }
+        let p = plan_snap(&loc, &[], &st, START);
+        assert_eq!(p.labels, ["w0d7", "w0d4", "w0d5", "w0d6"], "the untried labels' turn");
+        assert_eq!(p.deferred, ["w0d1", "w0d2", "w0d3"]);
+        // Run 2 took those (w0d4 open, w0d5/w0d6 sealed): the stuck ones again, the oldest try first.
+        st.labels.insert("w0d4".into(), LabelRecord { last_tried: 2000, pods_tried: set(A), ..Default::default() });
+        for l in ["w0d5", "w0d6"] {
+            st.labels.insert(l.into(), LabelRecord { last_tried: 2001, ..rec(day_start("w0d8") + 3 * 3600, A) });
+        }
+        let p = plan_snap(&loc, &[], &st, START);
+        assert_eq!(p.labels, ["w0d7", "w0d1", "w0d2", "w0d3"]);
+        // Run 3: w0d4 (tried longest ago) comes before the stuck ones tried since.
+        for (i, l) in ["w0d1", "w0d2", "w0d3"].iter().enumerate() {
+            st.labels.get_mut(*l).unwrap().last_tried = 3000 + i as u64;
+        }
+        let p = plan_snap(&loc, &[], &st, START);
+        assert_eq!(p.labels, ["w0d7", "w0d1", "w0d2", "w0d4"], "oldest first among the chosen");
+        assert_eq!(p.deferred, ["w0d3"]);
+    }
+
+    /// A2-1 (c): a pod's push of a past label that fails of its own kind three runs in a row
+    /// settles it ("sealed partial"); an outage (any run-stopping failure) never counts, nor does
+    /// a failure before the label could seal; a push that goes through resets the count and
+    /// un-settles a pod a `--label` retry got through.
+    #[test]
+    fn a_stuck_pod_is_settled_after_three_failed_runs_and_an_outage_never_is() {
+        use PushFailure::*;
+        let end = label_end("w0d1", START);
+        let after = end.unwrap() + GRACE_SECS;
+        let mut r = LabelRecord::default();
+        let p = "arena9-apple";
+        for class in [Unreachable, HostKey, AuthDenied, NoSpace, NotMounted, Refused] {
+            for _ in 0..5 {
+                assert!(!note_push_failed(&mut r, p, class, after, end), "{class}");
+            }
+        }
+        assert!(r.fails.is_empty() && r.given_up.is_empty(), "an outage seals nothing partial: {r:?}");
+        // Before the push that could seal it (the day and its grace not over): not counted.
+        for _ in 0..5 {
+            assert!(!note_push_failed(&mut r, p, Other, after - 1, end));
+        }
+        assert!(r.fails.is_empty());
+        // A custom label: never.
+        assert!(!note_push_failed(&mut r, p, Other, after, None));
+        assert!(!note_push_failed(&mut r, p, Other, after, end));
+        assert!(!note_push_failed(&mut r, p, Timeout, after + 900, end));
+        assert_eq!(r.fails.get(p), Some(&2));
+        // An outage in between doesn't reset the count either.
+        assert!(!note_push_failed(&mut r, p, Unreachable, after + 1800, end));
+        assert!(note_push_failed(&mut r, p, Other, after + 2700, end), "the third of its own kind");
+        assert!(r.given_up.contains(p) && !r.pods_ok.contains(p));
+        // Settled: the label seals without it; a later success (a `--label` retry) un-settles it.
+        note_push_ok(&mut r, p);
+        assert!(r.pods_ok.contains(p) && r.fails.is_empty() && r.given_up.is_empty());
+        // A success in between resets the count.
+        let mut r = LabelRecord::default();
+        note_push_failed(&mut r, p, Other, after, end);
+        note_push_failed(&mut r, p, Other, after, end);
+        note_push_ok(&mut r, p);
+        assert!(!note_push_failed(&mut r, p, Other, after, end) && !r.given_up.contains(p));
+        assert_eq!(GIVE_UP_AFTER, 3);
     }
 
     /// AD1: a pod links to every earlier label it has on the archive — complete or cut short —
@@ -1014,6 +1341,17 @@ mod tests {
         assert!(!chain_ok("w0d3", "arena9-apple", &loc, &st, Some(b)), "an older baseline of that week");
         st.baselines.insert("w0".into(), 77);
         assert!(chain_ok("w0d3", "arena9-apple", &loc, &st, Some(b)));
+        // A2-1 (d): a baseline whose push keeps failing stops holding labels open after three runs.
+        st.baselines.clear();
+        st.baseline_fails = GIVE_UP_AFTER - 1;
+        assert!(!chain_ok("w0d3", "arena9-apple", &loc, &st, Some(b)), "a passing failure only delays the seal");
+        st.baseline_fails = GIVE_UP_AFTER;
+        assert!(chain_ok("w0d3", "arena9-apple", &loc, &st, Some(b)));
+        st.baseline_fails = 0;
+        st.baselines.insert("w0".into(), 77);
+        // A2-1 (c): a previous label settled partial for the pod counts as complete for the chain.
+        st.labels.insert("w0d1".into(), LabelRecord { pods_tried: set(A), given_up: set(A), ..Default::default() });
+        assert!(chain_ok("w0d3", "arena9-apple", &loc, &st, Some(b)));
         let bs = [LocalBaseline { week: 0, mtime: 1 }, LocalBaseline { week: 2, mtime: 2 }];
         assert_eq!(baseline_for("w1d3", &bs).map(|b| b.week), Some(0));
         assert_eq!(baseline_for("w2d1", &bs).map(|b| b.week), Some(2));
@@ -1030,6 +1368,24 @@ mod tests {
         let (push, keep) = split_pod_dirs(&present, &a);
         assert_eq!(push, ["arena9-apple", "arena9-bloom-old"]);
         assert_eq!(keep, ["james-gpu", "arena9-ghost", "arena8-apple"]);
+    }
+
+    /// A2-3: what a sync pushes is the list and everything ever on it, minus the list's current
+    /// staff entries (and their twins) and every forgotten pod — history never outranks either.
+    #[test]
+    fn the_push_set_is_list_and_history_minus_staff_and_forgotten() {
+        let list: Vec<String> = ["apple", "@arena9-bloom", "@james-gpu"].map(String::from).to_vec();
+        let ever: BTreeSet<String> = set(&["arena9-bloom", "arena9-bloom-old", "arena9-cherry", "arena9-gone"]);
+        let p = push_set("arena9", &list, &ever, &set(&["arena9-gone"]));
+        assert_eq!(p, ["arena9-apple", "arena9-apple-old", "arena9-apple-new", "arena9-cherry"]);
+        assert_eq!(staff_dirs("arena9", &list), ["arena9-bloom", "arena9-bloom-old", "arena9-bloom-new", "james-gpu", "james-gpu-old", "james-gpu-new"]);
+        // Forgotten wins even over today's list.
+        assert!(!push_set("arena9", &list, &BTreeSet::new(), &set(&["arena9-apple"])).contains(&"arena9-apple".to_string()));
+        assert_eq!(forget_dirs("arena9", "bloom").unwrap(), ["arena9-bloom", "arena9-bloom-old", "arena9-bloom-new"]);
+        assert_eq!(forget_dirs("arena9", "arena9-bloom").unwrap()[0], "arena9-bloom");
+        for bad in ["", "../x", "a/b", ".x", "@james-gpu", "a b"] {
+            assert!(forget_dirs("arena9", bad).is_none(), "{bad:?}");
+        }
     }
 
     /// §14.7: recorded stderr samples.
@@ -1163,6 +1519,15 @@ mod tests {
         ("ARENA_materials/.git/modules/sub/config", false),
         ("ARENA_materials/.git/modules/a/b/config", false),
         ("ARENA_materials/.git.arena-nested/config", false),
+        // a bare or mirror clone keeps its config at the top of `<name>.git/`
+        ("mirrors/ARENA.git/config", false),
+        ("ARENA.git/config", false),
+        ("mirrors/ARENA.git/config.worktree", false),
+        ("mirrors/ARENA.git/modules/sub/config", false),
+        ("mirrors/ARENA.git/HEAD", true),
+        ("mirrors/ARENA.git/refs/heads/main", true),
+        ("mirrors/ARENA.git/hooks/config.sample", true),
+        ("dotgit/config", true),
         ("proj/.rsync-partial/x", false),
         ("proj/.rsync-tmp/x", false),
         // lookalikes that are work, not secrets
@@ -1574,5 +1939,231 @@ mod tests {
         assert_eq!(other, ["arena8-x", "james-gpu"]);
         let b = local_baselines(d);
         assert_eq!(b.iter().map(|b| b.week).collect::<Vec<_>>(), [0], "an empty baseline doesn't count");
+    }
+
+    // ---- review 2 (re-review of 8cdbd36) -------------------------------------------------------
+
+    /// A2-2: an archived file that is a hard link (to the fleet baseline, an earlier day, other
+    /// pods) must never change when one participant changes their own copy's MODE. rsync's quick
+    /// check passes (size and mtime unchanged by `chmod`), so the next */15 push of the same label
+    /// "fixes" the attributes of the existing destination file in place — that is, of the inode the
+    /// baseline and every other pod's copy share (the rsync man page's --link-dest caveat).
+    #[test]
+    fn review2_a_mode_change_never_rewrites_a_shared_inode() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let Some(rrsync) = rrsync_path() else { return };
+        let t = tmp("rv2-mode");
+        let push = t.0.join("push");
+        std::fs::create_dir_all(push.join("snap")).unwrap();
+        let tr = shim_transport(&t.0, "shim", &forced(rrsync, &push, true));
+        let src = t.0.join("backup");
+        let nb = "ARENA_materials/nb.py";
+        write(&src.join("baseline/w0/fleet").join(nb), "the image's file\n");
+        for pod in ["arena9-apple", "arena9-bloom"] {
+            let to = src.join("w0d1").join(pod).join("ARENA_materials");
+            std::fs::create_dir_all(&to).unwrap();
+            assert!(std::process::Command::new("cp").arg("-p").arg(src.join("baseline/w0/fleet").join(nb)).arg(&to).status().unwrap().success());
+        }
+        let s = settings("");
+        let run = |args: &[String]| std::process::Command::new("rsync").args(args).output().unwrap();
+        for pass in [SnapPass::Files, SnapPass::Git] {
+            assert!(run(&push_args(&baseline_job(&src, &[0], pass), &tr, &s)).status.success());
+        }
+        let job = |pod: &str| pod_job(&src, "w0d1", pod, SnapPass::Files, &[], Some(0));
+        for pod in ["arena9-apple", "arena9-bloom"] {
+            let o = run(&push_args(&job(pod), &tr, &s));
+            assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        }
+        let at = |p: &str| push.join("snap").join(p).join(nb);
+        let ino = |p: &str| std::fs::metadata(at(p)).unwrap().ino();
+        let mode = |p: &str| std::fs::metadata(at(p)).unwrap().permissions().mode() & 0o777;
+        assert!(ino("w0d1/arena9-apple") == ino("w0d1/arena9-bloom") && ino("w0d1/arena9-bloom") == ino("baseline/w0/fleet"), "precondition: one shared inode");
+        // apple's participant: `chmod +x` on their own copy; the next push of today's label.
+        std::fs::set_permissions(src.join("w0d1/arena9-apple").join(nb), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(run(&push_args(&job("arena9-apple"), &tr, &s)).status.success());
+        assert_eq!(mode("w0d1/arena9-bloom"), 0o644, "another pod's archived copy was changed by apple's push");
+        assert_eq!(mode("baseline/w0/fleet"), 0o644, "the fleet baseline was changed by apple's push");
+    }
+
+    /// A2-2 (`-J`): a symlink that later days share with an earlier one (`--link-dest` hard-links
+    /// links too) never takes a new time from one participant's `touch -h`: the push never sets a
+    /// link's time, so the earlier — perhaps sealed — day's link stays as it was.
+    #[test]
+    fn a_link_time_change_never_reaches_an_earlier_day() {
+        use std::os::unix::fs::MetadataExt;
+        let Some(rrsync) = rrsync_path() else { return };
+        let t = tmp("rv2-linktime");
+        let push = t.0.join("push");
+        std::fs::create_dir_all(push.join("snap")).unwrap();
+        let tr = shim_transport(&t.0, "shim", &forced(rrsync, &push, true));
+        let src = t.0.join("backup");
+        let d1 = src.join("w0d1/arena9-apple");
+        write(&d1.join("work.py"), "work\n");
+        std::os::unix::fs::symlink("work.py", d1.join("latest")).unwrap();
+        let touch = |when: &str, p: &Path| assert!(std::process::Command::new("touch").args(["-h", "-d", when]).arg(p).status().unwrap().success());
+        touch("2020-01-01", &d1.join("latest"));
+        std::fs::create_dir_all(src.join("w0d2")).unwrap();
+        assert!(std::process::Command::new("cp").arg("-a").arg(&d1).arg(src.join("w0d2/arena9-apple")).status().unwrap().success());
+        let s = settings("");
+        let run = |job: &PushJob| {
+            let o = std::process::Command::new("rsync").args(push_args(job, &tr, &s)).output().unwrap();
+            assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        };
+        run(&pod_job(&src, "w0d1", "arena9-apple", SnapPass::Files, &[], None));
+        let day2 = pod_job(&src, "w0d2", "arena9-apple", SnapPass::Files, &["w0d1".into()], None);
+        run(&day2);
+        let at = |l: &str| std::fs::symlink_metadata(push.join("snap").join(l).join("arena9-apple/latest")).unwrap();
+        assert_eq!(at("w0d1").ino(), at("w0d2").ino(), "precondition: the link is shared between the days");
+        let before = at("w0d1").mtime();
+        touch("2030-01-01", &src.join("w0d2/arena9-apple/latest"));
+        run(&day2);
+        assert_eq!(at("w0d1").mtime(), before, "the earlier day's link took the new time");
+    }
+
+    /// A2-1: `-munge` stores a symlink as `/rsyncd-munged/<target>` — 15 bytes longer. A target
+    /// of 4081..4095 bytes is legal on the pod (and on the control box), but can't be created
+    /// munged: the receiver's symlink() fails with ENAMETOOLONG, rsync exits 23 on EVERY push of
+    /// that pod, so the pod's push of that label (and of every later label while the link stays)
+    /// never goes through and the label never seals. One participant can do this on purpose.
+    #[test]
+    fn review2_a_long_symlink_target_never_fails_a_pods_push() {
+        let Some(rrsync) = rrsync_path() else { return };
+        let t = tmp("rv2-longlink");
+        let push = t.0.join("push");
+        std::fs::create_dir_all(push.join("snap")).unwrap();
+        let tr = shim_transport(&t.0, "shim", &forced(rrsync, &push, true));
+        let src = t.0.join("backup");
+        let home = src.join("w0d1/arena9-evil");
+        write(&home.join("work.py"), "work\n");
+        std::os::unix::fs::symlink(format!("/{}", "a".repeat(4084)), home.join("longlink")).unwrap();
+        let s = settings("");
+        for pass in [SnapPass::Files, SnapPass::Git] {
+            let o = std::process::Command::new("rsync").args(push_args(&pod_job(&src, "w0d1", "arena9-evil", pass, &[], None), &tr, &s)).output().unwrap();
+            let err = String::from_utf8_lossy(&o.stderr);
+            assert!(
+                classify_push(o.status.code(), &err, false).is_ok(),
+                "{pass:?}: a participant's symlink fails this pod's push for good ({:?}) — the label can never seal: {}",
+                o.status.code(),
+                err.lines().last().unwrap_or("")
+            );
+        }
+    }
+
+    /// AD8 through the real forced command (`rrsync -munge -wo -no-del -no-lock`, absolute
+    /// link-dests re-rooted by rrsync): the baseline and two pods' copies of an image file are ONE
+    /// inode on the receiver, and the next day links to it too.
+    #[test]
+    fn the_baseline_dedups_across_pods_through_rrsync() {
+        use std::os::unix::fs::MetadataExt;
+        let Some(rrsync) = rrsync_path() else { return };
+        let t = tmp("dedup-rrsync");
+        let push = t.0.join("push");
+        std::fs::create_dir_all(push.join("snap")).unwrap();
+        let tr = shim_transport(&t.0, "shim", &forced(rrsync, &push, true));
+        let src = t.0.join("backup");
+        let nb = "ARENA_materials/big_notebook.ipynb";
+        write(&src.join("baseline/w0/fleet").join(nb), &"n".repeat(5000));
+        for label in ["w0d1", "w0d2"] {
+            for pod in ["arena9-apple", "arena9-bloom"] {
+                let to = src.join(label).join(pod).join("ARENA_materials");
+                std::fs::create_dir_all(&to).unwrap();
+                assert!(std::process::Command::new("cp").arg("-p").arg(src.join("baseline/w0/fleet").join(nb)).arg(&to).status().unwrap().success());
+                write(&src.join(label).join(pod).join("mine.py"), pod);
+            }
+        }
+        let s = settings("");
+        let run = |job: &PushJob| {
+            let o = std::process::Command::new("rsync").args(push_args(job, &tr, &s)).output().unwrap();
+            assert!(o.status.success(), "{}: {}", job.what, String::from_utf8_lossy(&o.stderr));
+        };
+        for pass in [SnapPass::Files, SnapPass::Git] {
+            run(&baseline_job(&src, &[0], pass));
+        }
+        for pod in ["arena9-apple", "arena9-bloom"] {
+            for pass in [SnapPass::Files, SnapPass::Git] {
+                run(&pod_job(&src, "w0d1", pod, pass, &[], Some(0)));
+                run(&pod_job(&src, "w0d2", pod, pass, &["w0d1".into()], Some(0)));
+            }
+        }
+        let ino = |p: String| std::fs::metadata(push.join("snap").join(&p)).unwrap_or_else(|e| panic!("{p}: {e}")).ino();
+        let base = ino(format!("baseline/w0/fleet/{nb}"));
+        for at in ["w0d1/arena9-apple", "w0d1/arena9-bloom", "w0d2/arena9-apple", "w0d2/arena9-bloom"] {
+            assert_eq!(ino(format!("{at}/{nb}")), base, "{at}: one inode with the baseline");
+        }
+        assert_ne!(ino("w0d1/arena9-apple/mine.py".into()), ino("w0d1/arena9-bloom/mine.py".into()));
+        assert_eq!(ino("w0d1/arena9-apple/mine.py".into()), ino("w0d2/arena9-apple/mine.py".into()), "the next day links to the day before");
+    }
+
+    /// A2-1 (a) through the real forced command: every symlink whose target can't be stored
+    /// munged is left out — by an exact rule, whatever its name holds (spaces, wildcards, a
+    /// backslash, a newline, bytes that aren't UTF-8, deep in the tree) — so the push goes
+    /// through; links of a storable length arrive munged, and look-alike siblings still arrive.
+    #[cfg(unix)]
+    #[test]
+    fn every_unstorable_symlink_is_left_out_by_an_exact_rule() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let Some(rrsync) = rrsync_path() else { return };
+        let t = tmp("longlinks");
+        let push = t.0.join("push");
+        std::fs::create_dir_all(push.join("snap")).unwrap();
+        let tr = shim_transport(&t.0, "shim", &forced(rrsync, &push, true));
+        let src = t.0.join("backup");
+        let home = src.join("w0d1/arena9-evil");
+        write(&home.join("work.py"), "work\n");
+        let long = format!("/{}", "a".repeat(4084));
+        assert!(!munge_fits(long.len()) && munge_fits(4080) && !munge_fits(4081));
+        let names: Vec<&[u8]> =
+            vec![b"plain", b"with space ", b"star*", b"q?mark", b"[class]", b"back\\slash", b"new\nline", b"bad\xffutf8", b"c1\xc2\x85ctl", b"deep/er/link", b"-dash"];
+        for n in &names {
+            let p = home.join(OsStr::from_bytes(n));
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&long, &p).unwrap();
+        }
+        // Look-alikes that must arrive: what a too-wide rule would also have taken.
+        for n in ["plainer", "starry", "q_mark", "c", "backslash"] {
+            write(&home.join(n), "kept\n");
+        }
+        std::os::unix::fs::symlink("../work.py", home.join("deep/ok-link")).unwrap();
+        let s = settings("");
+        let job = pod_job(&src, "w0d1", "arena9-evil", SnapPass::Files, &[], None);
+        assert_eq!(job.skip.len(), names.len(), "{:?}", job.skip);
+        let o = std::process::Command::new("rsync").args(push_args(&job, &tr, &s)).output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let got = push.join("snap/w0d1/arena9-evil");
+        for n in &names {
+            assert!(std::fs::symlink_metadata(got.join(OsStr::from_bytes(n))).is_err(), "{:?} arrived", String::from_utf8_lossy(n));
+        }
+        for n in ["plainer", "starry", "q_mark", "c", "backslash", "work.py"] {
+            assert!(got.join(n).exists(), "{n} must arrive");
+        }
+        assert_eq!(std::fs::read_link(got.join("deep/ok-link")).unwrap(), Path::new("/rsyncd-munged/../work.py"), "a storable link arrives munged");
+        // The big tier and the baseline leave them out the same way.
+        std::fs::create_dir_all(src.join("big")).unwrap();
+        assert!(std::process::Command::new("cp").arg("-a").arg(&home).arg(src.join("big/arena9-evil")).status().unwrap().success());
+        let big = big_job(&src, &["arena9-evil".into()]);
+        assert_eq!(big.skip.len(), names.len());
+        assert!(big.skip.iter().all(|r| r.starts_with("/arena9-evil/")), "{:?}", big.skip);
+        std::fs::create_dir_all(push.join("big")).unwrap();
+        let o = std::process::Command::new("rsync").args(push_args(&big, &tr, &s)).output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert!(push.join("big/arena9-evil/work.py").exists() && std::fs::symlink_metadata(push.join("big/arena9-evil/plain")).is_err());
+        std::fs::create_dir_all(src.join("baseline/w0")).unwrap();
+        assert!(std::process::Command::new("cp").arg("-a").arg(&home).arg(src.join("baseline/w0/fleet")).status().unwrap().success());
+        let base = baseline_job(&src, &[0], SnapPass::Files);
+        assert!(base.skip.iter().all(|r| r.starts_with("/w0/fleet/")) && base.skip.len() == names.len(), "{:?}", base.skip);
+        let o = std::process::Command::new("rsync").args(push_args(&base, &tr, &s)).output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        // Without the rules, the same push fails for good (what A2-1 was).
+        let unskipped = PushJob { skip: Vec::new(), ..job };
+        let o = std::process::Command::new("rsync").args(push_args(&unskipped, &tr, &s)).output().unwrap();
+        assert_eq!(o.status.code(), Some(23), "{}", String::from_utf8_lossy(&o.stderr));
+        // The rule text: literal, escaped only with a wildcard about.
+        assert_eq!(literal_rule("/", Path::new("a b")), "/a b");
+        assert_eq!(literal_rule("/p/", Path::new("back\\slash")), "/p/back\\slash");
+        assert_eq!(literal_rule("/", Path::new("x*y\\z")), "/x\\*y\\\\z");
+        assert_eq!(literal_rule("/", Path::new("new\nline")), "/new?line");
+        assert_eq!(literal_rule("/", Path::new("c1\u{85}ctl")), "/c1??ctl", "a two-byte control character: two `?`");
+        assert_eq!(literal_rule("/", Path::new(OsStr::from_bytes(b"[a]\xff"))), "/\\[a]?");
     }
 }

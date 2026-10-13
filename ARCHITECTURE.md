@@ -112,7 +112,7 @@ flowchart TD
 | `fleet`, `status` | the one place a pod's labels (GPU, `$/H`, endpoint, maintenance) and the fleet cost are computed; `is_billing`/`bills_hourly` decide what counts as billing | yes |
 | `snapshot` | `FleetSnapshot` (`build`: pods + proxy state + last health), the SSH-port reachability probe behind the `Reach` seam (`SshPortProbe`: TCP connect + sshd's greeting, nothing sent), the prefix-scoped health cache (atomic, locked, 0600), and `PublicSnapshot` — a separate allowlisted struct for publishing (`up` needs the probe's answer) | build + targets pure; probe and cache I/O |
 | `teardown` | turns listings, volumes, OpenRouter keys, cron/`at` lines, the proxy file and the backup archive's inventory into a ✓ ✗ ? – ◷ checklist with fix commands (unknown ≠ empty; `◷ kept` = there on purpose until `ARCHIVE_KEEP_UNTIL`) | yes |
-| `archive` | the backup archive VM (`arena archive`): `plan` (up/down/resize planners that refuse anything ambiguous and never plan a volume deletion without the typed confirm), `sync` (labels, sealing, the cohort allowlist, `SECRET_EXCLUDES`, the exact push argv — never a deleting/in-place flag — and failure classes), `render` (the embedded `setup.sh`/`probe.sh` and every file sent to the VM: sshd drop-in, fstab block, forced rrsync key line, read keys, README, ssh blocks), `report` (setup report, probe, status judge), `state` (keys, pin, `archive.json`, per-tier sync state, atomic 0600), `cloud` (the `ArchiveCloud` seam: Hetzner servers/volumes/keys/actions/prices, fail-closed listings; a stateful fake) | planners/renderers/judges pure; `cloud` and `state` I/O |
+| `archive` | the backup archive VM (`arena archive`): `plan` (up/down/resize planners that refuse anything ambiguous and never plan a volume deletion without the typed confirm), `sync` (labels, sealing and partial seals, the round-robin backlog, the cohort push set, `SECRET_EXCLUDES`, unstorable symlinks, the exact push argv — never a deleting/in-place/attribute flag — and failure classes), `render` (the embedded `setup.sh`/`probe.sh` and every file sent to the VM: sshd drop-in, fstab block, forced rrsync key line, read keys, README, ssh blocks), `report` (setup report, probe, status judge), `state` (keys, pin, `archive.json`, per-tier sync state, `forgotten.json`, atomic 0600), `cloud` (the `ArchiveCloud` seam: Hetzner servers/volumes/keys/actions/prices, fail-closed listings; a stateful fake) | planners/renderers/judges pure; `cloud` and `state` I/O |
 | `lock` | pod locks (`Pod::locked`, RunPod v2): the up-front refusal of a locked pod for every lifecycle command, the API's `Locked` error read as the same `… is locked — arena pods unlock … first`, `pods lock`/`unlock`'s plan | yes |
 | `apiextra`, `apiget` | `--api-json`/`CREATE_EXTRA_JSON` (parse, deep-merge into a backend's create body, refuse its `MANAGED` fields and a `ports` list without `22/tcp`); `arena api get` (path guard: relative to the provider's API base only; secret redaction; no redirects) | yes (one GET in `apiget::get`) |
 | `jobs` | detached runs (`pods run --background`): the on-pod wrapper, ids, status, log reads by byte offset | yes |
@@ -199,9 +199,12 @@ flowchart TD
   touch it) and delete protection backs up; it holds no outbound credential. Each role has its
   own key — admin (authorized by no pod), push (forced into write-only, no-delete rrsync), read
   (per cohort) — every connection to it is pinned to its recorded host key, and its cron path
-  makes no Hetzner call at all. Pushes are additive by construction (no deleting or in-place
-  flag can be built — a test over every combination), carry only the cohort's pod dirs and
-  never secret files, and participants read only after `archive access on`.
+  makes no Hetzner call at all. Pushes are additive by construction (no deleting, in-place or
+  attribute-setting flag can be built — a test over every combination — so a file already on the
+  archive, which other days and pods share, never changes), carry only the cohort's pod dirs
+  (never a current `@` staff entry or a pod `archive forget` revoked) and never secret files,
+  and participants read only after `archive access on`. One pod that can't be pushed never holds
+  the others' labels open (round-robin backlog; "sealed partial" after three failed runs).
 
 ## Testing
 

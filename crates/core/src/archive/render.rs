@@ -190,14 +190,15 @@ pub fn render_readme(r: &ReadmeInputs) -> String {
          \x20 Symbolic links are kept defanged: `ls -l` shows them pointing at /rsyncd-munged/<target>,\n\
          \x20 and they don't resolve here, so a download skips them or fails on them. Copy the files,\n\
          \x20 then re-create a link you need with `ln -s <target> <name>` (target = the part after\n\
-         \x20 /rsyncd-munged/).\n\
+         \x20 /rsyncd-munged/). A link whose target is over 4080 characters isn't kept at all.\n\
+         \x20 A day can be partial for a pod whose copy kept failing that day; ask the organisers.\n\
          \n\
          Not copied here — secrets stay on the organisers' machine:\n\
          \x20 shell rc files (.bashrc, .zshrc, .profile …), shell and REPL histories, .env files, .netrc,\n\
          \x20 .gitconfig, .git-credentials, .pypirc, .npmrc, .pgpass, .s3cfg, .boto, .rclone.conf, .ssh/,\n\
          \x20 .gnupg/, .aws/, .docker/, .kaggle/ and kaggle.json, .config/, .cache/, .huggingface/ and HF\n\
          \x20 token files, .claude*, private keys (id_rsa/id_ecdsa/id_ed25519/id_dsa, *.pem, *.key), and each\n\
-         \x20 repo's .git/config files (git works without them; add the remote back with\n\
+         \x20 repo's .git/config files, a bare clone's too (git works without them; add the remote back with\n\
          \x20 `git remote add origin <url>`).{extra}\n\
          \x20 Anything else in your home IS copied: don't keep other secrets there.\n\
          \n\
@@ -283,11 +284,42 @@ pub fn resize_command(device: &str, tier: Tier) -> String {
     )
 }
 
+/// `archive forget --delete-archived` on the VM (as root, any access state): every directory of
+/// `pods` on both volumes — `snap/<label>/<pod>/` of every label and `big/<pod>/` — measured
+/// (`dirs=`, `bytes=` — `du`, so a file counts once even when other pods' copies share it, and
+/// such shared files stay for them) and, with `delete`, removed (`deleted=`). Never deletes
+/// while a volume isn't mounted (`unmounted_<tier>=1`): its mountpoint would show nothing while
+/// the pod's data sits on the volume. Only plain pod names (one path component) are accepted.
+pub fn forget_command(pods: &[String], delete: bool) -> Result<String, String> {
+    let plain = |p: &String| !p.is_empty() && !p.starts_with('.') && p.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
+    if pods.is_empty() || !pods.iter().all(plain) {
+        return Err(format!("not plain pod names: {pods:?}"));
+    }
+    let quoted: Vec<String> = pods.iter().map(|p| format!("'{p}'")).collect();
+    let mut c = format!(
+        ": arena-archive-forget; set -u; um=''; for t in {tiers}; do mountpoint -q '{root}'/$t || {{ echo unmounted_$t=1; um=1; }}; done; \
+         cd '{root}' || exit 3; set --; \
+         for p in {pods}; do for d in snap/*/\"$p\" big/\"$p\"; do if [ -d \"$d\" ] && [ ! -L \"$d\" ]; then set -- \"$@\" \"$d\"; fi; done; done; \
+         echo dirs=$#; if [ $# -gt 0 ]; then echo bytes=$(du -scb -- \"$@\" | tail -n1 | cut -f1); else echo bytes=0; fi; ",
+        tiers = Tier::ALL.map(|t| t.as_str()).join(" "),
+        root = super::PUSH_ROOT,
+        pods = quoted.join(" "),
+    );
+    if delete {
+        c.push_str(
+            "if [ -n \"$um\" ]; then echo refused=unmounted; exit 4; fi; \
+             if [ $# -gt 0 ]; then rm -rf --one-file-system -- \"$@\" || { echo deleted=failed; exit 5; }; fi; echo deleted=$#; ",
+        );
+    }
+    c.push_str("echo forget_done=1");
+    Ok(c)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const PUB: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPushPushPushPushPushPushPushPushPushPus1 me@box";
+    const PUB:&str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPushPushPushPushPushPushPushPushPushPus1 me@box";
     const COHORT: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICohortCohortCohortCohortCohortCohortCo2 arena9";
     const READ: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIReadReadReadReadReadReadReadReadReadRea3 read";
     const DEPLOY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDeployDeployDeployDeployDeployDeployDe4 arena_infra";
@@ -528,5 +560,65 @@ mod tests {
         let decoded = String::from_utf8(crate::base64::decode(b64).unwrap()).unwrap();
         assert!(decoded.starts_with("ARENA_SNAP_DEV='/dev/a'\nARENA_BIG_DEV='/dev/b'\n#!/bin/bash"), "{}", &decoded[..80]);
         assert_eq!(sh_assign("X", "it's\nok"), "X='it'\\''s\nok'\n");
+    }
+
+    /// A2-3: `forget --delete-archived`'s VM command, run for real by `sh` on a fake push root:
+    /// it measures and removes exactly the pod's (and its twins') dirs on both tiers — another
+    /// pod's copy of a shared (hard-linked) file stays — and never deletes with a volume unmounted.
+    #[cfg(unix)]
+    #[test]
+    fn forget_removes_only_that_pods_dirs_and_never_with_a_volume_unmounted() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = std::env::temp_dir().join(format!("arena-archive-forget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        let root = t.join("push");
+        let put = |rel: &str, body: &str| {
+            let f = root.join(rel);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, body).unwrap();
+        };
+        put("snap/w0d1/devtest-bravo/b.py", "bravo's work\n");
+        put("snap/w0d2/devtest-bravo-old/o.py", "old twin\n");
+        put("snap/mylabel/devtest-bravo/c.py", "custom label\n");
+        put("big/devtest-bravo/ckpt.pt", "weights\n");
+        put("snap/w0d1/devtest-alpha/a.py", "alpha's\n");
+        put("snap/w0d1/devtest-bravons/x", "a longer name, not bravo's\n");
+        std::fs::hard_link(root.join("snap/w0d1/devtest-alpha/a.py"), root.join("snap/w0d1/devtest-bravo/shared.py")).unwrap();
+        let bin = t.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let mounted = |yes: bool| {
+            std::fs::write(bin.join("mountpoint"), format!("#!/bin/sh\nexit {}\n", if yes { 0 } else { 1 })).unwrap();
+            std::fs::set_permissions(bin.join("mountpoint"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let pods: Vec<String> = ["devtest-bravo", "devtest-bravo-old", "devtest-bravo-new"].map(String::from).to_vec();
+        let run = |delete: bool| {
+            let cmd = forget_command(&pods, delete).unwrap().replace(super::super::PUSH_ROOT, root.to_str().unwrap());
+            let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+            let o = std::process::Command::new("sh").arg("-c").arg(&cmd).env("PATH", path).output().unwrap();
+            crate::archive::report::parse_kv(&String::from_utf8_lossy(&o.stdout))
+        };
+        mounted(true);
+        let m = run(false);
+        assert_eq!(m.get("dirs").map(String::as_str), Some("4"), "{m:?}");
+        assert!(m["bytes"].parse::<u64>().unwrap() > 0 && m.get("forget_done").is_some(), "{m:?}");
+        assert!(root.join("snap/w0d1/devtest-bravo").exists(), "measuring deletes nothing");
+        // A volume not mounted: nothing deleted.
+        mounted(false);
+        let m = run(true);
+        assert_eq!(m.get("refused").map(String::as_str), Some("unmounted"), "{m:?}");
+        assert!(root.join("big/devtest-bravo/ckpt.pt").exists());
+        mounted(true);
+        let m = run(true);
+        assert_eq!(m.get("deleted").map(String::as_str), Some("4"), "{m:?}");
+        for gone in ["snap/w0d1/devtest-bravo", "snap/w0d2/devtest-bravo-old", "snap/mylabel/devtest-bravo", "big/devtest-bravo"] {
+            assert!(!root.join(gone).exists(), "{gone}");
+        }
+        assert_eq!(std::fs::read_to_string(root.join("snap/w0d1/devtest-alpha/a.py")).unwrap(), "alpha's\n", "the shared file stays for alpha");
+        assert!(root.join("snap/w0d1/devtest-bravons/x").exists(), "only exact names");
+        assert_eq!(run(false).get("dirs").map(String::as_str), Some("0"));
+        for bad in [vec!["../x".to_string()], vec![".".to_string()], vec!["a/b".to_string()], vec![String::new()], vec![]] {
+            assert!(forget_command(&bad, true).is_err(), "{bad:?}");
+        }
+        let _ = std::fs::remove_dir_all(&t);
     }
 }

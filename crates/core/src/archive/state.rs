@@ -11,6 +11,7 @@
 //! | `archive.json` | 0600 | `up`, `access`, `down`, `resize` |
 //! | `sync-snap.json` / `sync-big.json` | 0600 | each tier's push (only its own) |
 //! | `sync-snap.lock` / `sync-big.lock` | 0600 | each tier's push (`flock`, non-blocking) |
+//! | `forgotten.json` | 0600 | `archive forget` (read by every push and `status`) |
 //!
 //! State files are written atomically (temp + rename, [`crate::snapshot::write_atomic`]). One
 //! with an unknown `version` is an error, never silently reset: the sync state is what seals a
@@ -107,6 +108,20 @@ pub struct LabelRecord {
     /// re-links its identical files and gives the duplicated space back.
     #[serde(default)]
     pub linked: bool,
+    /// When a run last took this label up (UNIX s; `0` = never): the backlog goes round-robin,
+    /// least recently tried first ([`super::sync::plan_snap`]).
+    #[serde(default)]
+    pub last_tried: u64,
+    /// Per pod: how many of its pushes of this (past) label failed in a row, of the pod's own kind
+    /// ([`super::sync::note_push_failed`]).
+    #[serde(default)]
+    pub fails: BTreeMap<String, u32>,
+    /// The pods settled for this label as they are on the archive after
+    /// [`super::sync::GIVE_UP_AFTER`] failed pushes in a row ("sealed partial"): the label seals
+    /// without them, later labels link to what of them is there, `status` names each one, and
+    /// `archive sync --label <L>` retries them.
+    #[serde(default)]
+    pub given_up: BTreeSet<String>,
 }
 
 /// One run of a tier's sync.
@@ -140,13 +155,20 @@ pub struct SnapState {
     pub volume: Option<String>,
     /// Every pod dir ever allowed (`MACHINE_NAME_LIST` and twins): a pod that leaves the list keeps
     /// its archived history growing until its last local label is pushed — sealing never freezes
-    /// a label without it.
+    /// a label without it. It describes the cohort, not the volume: kept when the state starts
+    /// over for another volume (A2-3). The list's staff entries and `archive forget` override it
+    /// ([`super::sync::push_set`]).
     #[serde(default)]
     pub allowed_ever: BTreeSet<String>,
     /// The fleet baselines on the archive: week (`w3`) → the local baseline dir's mtime when it
     /// was pushed (a `pods baseline --replace` makes a new one, pushed again).
     #[serde(default)]
     pub baselines: BTreeMap<String, u64>,
+    /// How many baseline pushes in a row failed (of their own kind): from
+    /// [`super::sync::GIVE_UP_AFTER`] on, labels seal without the baseline
+    /// ([`super::sync::chain_ok`]); a push that goes through resets it.
+    #[serde(default)]
+    pub baseline_fails: u32,
 }
 
 impl Default for SnapState {
@@ -159,6 +181,7 @@ impl Default for SnapState {
             volume: None,
             allowed_ever: BTreeSet::new(),
             baselines: BTreeMap::new(),
+            baseline_fails: 0,
         }
     }
 }
@@ -169,12 +192,23 @@ impl SnapState {
         self.labels.values().map(|r| r.ok_finished).filter(|t| *t > 0).max()
     }
 
-    /// This state if it describes `volume`, else a fresh one for it (and whether it was reset).
+    /// This state if it describes `volume`, else a fresh one for it — keeping only the cohort's
+    /// `allowed_ever` — and whether it was reset.
     pub fn for_volume(self, volume: &str) -> (SnapState, bool) {
         match &self.volume {
-            Some(v) if v != volume => (SnapState { volume: Some(volume.to_string()), ..SnapState::default() }, true),
+            Some(v) if v != volume => {
+                (SnapState { volume: Some(volume.to_string()), allowed_ever: self.allowed_ever, ..SnapState::default() }, true)
+            }
             _ => (SnapState { volume: Some(volume.to_string()), ..self }, false),
         }
+    }
+
+    /// Every `(label, pod)` settled partial ([`LabelRecord::given_up`]), oldest label first.
+    pub fn partial(&self) -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> =
+            self.labels.iter().flat_map(|(l, r)| r.given_up.iter().map(move |p| (l.clone(), p.clone()))).collect();
+        v.sort_by_key(|(l, p)| (crate::restore::parse_label(l), l.clone(), p.clone()));
+        v
     }
 }
 
@@ -200,13 +234,52 @@ impl Default for BigState {
 }
 
 impl BigState {
-    /// This state if it describes `volume`, else a fresh one (and whether it was reset).
+    /// This state if it describes `volume`, else a fresh one keeping `allowed_ever` (and whether
+    /// it was reset).
     pub fn for_volume(self, volume: &str) -> (BigState, bool) {
         match &self.volume {
-            Some(v) if v != volume => (BigState { volume: Some(volume.to_string()), ..BigState::default() }, true),
+            Some(v) if v != volume => {
+                (BigState { volume: Some(volume.to_string()), allowed_ever: self.allowed_ever, ..BigState::default() }, true)
+            }
             _ => (BigState { volume: Some(volume.to_string()), ..self }, false),
         }
     }
+}
+
+/// `forgotten.json`: the pod dirs `archive forget` revoked — never pushed again, whatever the
+/// list or `allowed_ever` say ([`super::sync::push_set`]). It describes the cohort's consent,
+/// not a volume: no volume change or `down` touches it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Forgotten {
+    pub version: u32,
+    pub pods: BTreeMap<String, ForgetRecord>,
+}
+
+/// One forgotten pod dir.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForgetRecord {
+    /// When it was forgotten (UNIX s).
+    pub at: u64,
+    /// When its archived copy was deleted (`--delete-archived`), if it was.
+    #[serde(default)]
+    pub deleted: Option<u64>,
+}
+
+impl Default for Forgotten {
+    fn default() -> Self {
+        Self { version: STATE_VERSION, pods: BTreeMap::new() }
+    }
+}
+
+impl Forgotten {
+    pub fn names(&self) -> BTreeSet<String> {
+        self.pods.keys().cloned().collect()
+    }
+}
+
+/// `forgotten.json` (missing = none forgotten).
+pub fn load_forgotten(path: &Path) -> Result<Forgotten, String> {
+    Ok(load(path, |s: &Forgotten| s.version)?.unwrap_or_default())
 }
 
 /// Where everything lives.
@@ -252,6 +325,9 @@ impl ArchivePaths {
     }
     pub fn sync_lock(&self, tier: Tier) -> PathBuf {
         self.dir.join(format!("sync-{}.lock", tier.as_str()))
+    }
+    pub fn forgotten(&self) -> PathBuf {
+        self.dir.join("forgotten.json")
     }
 
     /// The paths go into rsync's `-e` string, which rsync splits on spaces (quotes, but no
@@ -435,11 +511,19 @@ mod tests {
         assert!(!reset && s.labels.contains_key("w0d1"), "adopted");
         let (same, reset) = s.clone().for_volume("/dev/disk/by-id/scsi-0HC_Volume_1");
         assert!(!reset && same == s);
+        let mut s = s;
+        s.allowed_ever.insert("arena9-gone".into());
+        s.baseline_fails = 2;
         let (other, reset) = s.for_volume("/dev/disk/by-id/scsi-0HC_Volume_2");
         assert!(reset && other.labels.is_empty() && other.volume.as_deref() == Some("/dev/disk/by-id/scsi-0HC_Volume_2"));
-        let b = BigState { volume: Some("a".into()), last_ok: Some(RunRecord { started: 1, finished: 2, ok: true }), ..BigState::default() };
+        assert_eq!(other.baseline_fails, 0);
+        // A2-3: who belongs to the cohort isn't the volume's: a pod already off the list still
+        // gets its history onto the new volume.
+        assert!(other.allowed_ever.contains("arena9-gone"), "allowed_ever survives a volume reset");
+        let mut b = BigState { volume: Some("a".into()), last_ok: Some(RunRecord { started: 1, finished: 2, ok: true }), ..BigState::default() };
+        b.allowed_ever.insert("arena9-gone".into());
         let (b, reset) = b.for_volume("b");
-        assert!(reset && b.last_ok.is_none());
+        assert!(reset && b.last_ok.is_none() && b.allowed_ever.contains("arena9-gone"));
     }
 
     #[test]

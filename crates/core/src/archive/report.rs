@@ -10,6 +10,7 @@ use serde::Serialize;
 use super::cloud::{Inventory, Prices};
 use super::render::render_push_key_line;
 use super::state::{ArchiveHost, BigState, SnapState};
+use super::sync::GIVE_UP_AFTER;
 use super::{key_blob, ArchiveNames, Tier, SETUP_VERSION};
 
 /// `key=value` lines (the last value of a key wins; anything else is ignored — a login banner,
@@ -263,6 +264,10 @@ pub struct StatusInputs<'a> {
     pub control_box_only: &'a [String],
     /// Pod dirs named like this cohort's but not on `MACHINE_NAME_LIST` (never pushed).
     pub not_on_list: &'a [String],
+    /// Pod dirs still pushed only because they once were on the list (`allowed_ever`, A2-3).
+    pub off_list: &'a [String],
+    /// Pod dirs `archive forget` revoked (never pushed again).
+    pub forgotten: &'a [String],
     /// How long ago `archive.json` was written (s): an archive that has never been pushed to an
     /// hour after `up` means the cron isn't pushing (AD10).
     pub host_written_age: Option<u64>,
@@ -444,6 +449,55 @@ pub fn judge_status(i: &StatusInputs) -> StatusReport {
                 i.not_on_list.join(", ")
             ),
         );
+    }
+    if !i.off_list.is_empty() {
+        r.add(
+            "off the list",
+            Level::Ok,
+            format!(
+                "off MACHINE_NAME_LIST, still archived (they were on it): {} — `arena archive forget <pod>` stops that",
+                i.off_list.join(", ")
+            ),
+        );
+    }
+    if !i.forgotten.is_empty() {
+        r.add("forgotten", Level::Ok, format!("never pushed again (`arena archive forget`): {}", i.forgotten.join(", ")));
+    }
+    // One stuck pod never holds the rest up (A2-1): who keeps failing, and who was settled as is.
+    let retrying: Vec<String> = i
+        .snap
+        .labels
+        .iter()
+        .flat_map(|(l, r)| r.fails.iter().filter(|(p, _)| !r.given_up.contains(*p)).map(move |(p, n)| format!("{l} {p} ({n} of {GIVE_UP_AFTER})")))
+        .collect();
+    if !retrying.is_empty() {
+        r.add(
+            "failing",
+            Level::Warn,
+            format!("pushes of a past label that keep failing (failed in a row): {} — `arena archive sync` says why", retrying.join(", ")),
+        );
+    }
+    let partial = i.snap.partial();
+    if !partial.is_empty() {
+        let list: Vec<String> = partial.iter().map(|(l, p)| format!("{l} {p}")).collect();
+        r.add(
+            "partial",
+            Level::Warn,
+            format!(
+                "sealed partial — kept as they are on the archive after {GIVE_UP_AFTER} failed pushes in a row: {} — `arena archive sync \
+                 --label <L>` retries one",
+                list.join(", ")
+            ),
+        );
+    }
+    if i.snap.baseline_fails > 0 {
+        let n = i.snap.baseline_fails;
+        let what = if super::sync::baseline_given_up(i.snap) {
+            "labels now seal without it (each pod keeps its own copy of the image's files)"
+        } else {
+            "labels wait for it to seal"
+        };
+        r.add("baseline", Level::Warn, format!("the fleet baseline's push failed {n} time(s) in a row — {what}; `arena archive sync` says why"));
     }
     // Room for what's coming (AD8): a volume under twice what a full push needs fills on the seed.
     for (tier, need) in [(Tier::Snap, i.snap_need), (Tier::Big, i.big_need)] {
@@ -707,6 +761,8 @@ mod tests {
             custom_labels: &[],
             control_box_only: &[],
             not_on_list: &[],
+            off_list: &[],
+            forgotten: &[],
             host_written_age: None,
             snap_need: None,
             big_need: None,
@@ -843,6 +899,8 @@ mod tests {
                 custom_labels: &[],
                 control_box_only: &[],
                 not_on_list: &[],
+                off_list: &[],
+                forgotten: &[],
                 host_written_age: Some(age),
                 snap_need: None,
                 big_need: None,
@@ -857,6 +915,34 @@ mod tests {
         assert_eq!(level_of(&at(7200), "sync snap"), Level::Fail);
         assert_eq!(level_of(&at(7200), "sync big"), Level::Fail);
         assert!(!at(7200).ok());
+    }
+
+    /// A2-1: status names each pod that keeps failing a past label (and how close it is to being
+    /// settled), each label sealed partial, and a failing baseline — whether labels still wait.
+    #[test]
+    fn status_names_failing_pods_partial_seals_and_a_failing_baseline() {
+        let (h, i) = (host(), inv());
+        let mut snap = snap_ok();
+        let mut retrying = LabelRecord::default();
+        retrying.fails.insert("arena9-bloom".into(), 2);
+        snap.labels.insert("w0d4".into(), retrying);
+        let mut settled = LabelRecord::default();
+        settled.fails.insert("arena9-apple".into(), 3);
+        settled.given_up.insert("arena9-apple".into());
+        snap.labels.insert("w0d3".into(), settled);
+        snap.baseline_fails = 1;
+        let r = judge(|_| {}, &snap, &big_ok(), &h, Some(Ok(&i)));
+        let text = r.render();
+        assert_eq!(level_of(&r, "failing"), Level::Warn);
+        assert_eq!(level_of(&r, "partial"), Level::Warn);
+        assert!(text.contains("w0d4 arena9-bloom (2 of 3)") && !text.contains("w0d3 arena9-apple (3"), "{text}");
+        assert!(text.contains("sealed partial") && text.contains("w0d3 arena9-apple") && text.contains("--label <L>"), "{text}");
+        assert_eq!(level_of(&r, "baseline"), Level::Warn);
+        assert!(text.contains("labels wait for it"), "{text}");
+        snap.baseline_fails = GIVE_UP_AFTER;
+        assert!(judge(|_| {}, &snap, &big_ok(), &h, Some(Ok(&i))).render().contains("labels now seal without it"));
+        let quiet = judge(|_| {}, &snap_ok(), &big_ok(), &h, Some(Ok(&i)));
+        assert!(!quiet.items.iter().any(|x| ["failing", "partial", "baseline"].contains(&x.name.as_str())), "{}", quiet.render());
     }
 
     #[test]
@@ -879,6 +965,8 @@ mod tests {
             custom_labels: &["mylabel".to_string()],
             control_box_only: &["james-gpu".to_string()],
             not_on_list: &["arena9-gone".to_string()],
+            off_list: &["arena9-left".to_string()],
+            forgotten: &["arena9-withdrew".to_string()],
             host_written_age: Some(7200),
             snap_need: Some(30 << 30),
             big_need: Some(1 << 30),
@@ -900,6 +988,11 @@ mod tests {
         for needle in ["not final yet: w1d2", "mylabel", "james-gpu", "past ARCHIVE_KEEP_UNTIL", "≈ €10.50/month", "arena9-gone"] {
             assert!(text.contains(needle), "{needle}: {text}");
         }
+        // A2-3: what is still archived only because it once was on the list, and what was forgotten.
+        assert_eq!(level_of(&r, "off the list"), Level::Ok);
+        assert!(text.contains("still archived (they were on it): arena9-left") && text.contains("forget"), "{text}");
+        assert_eq!(level_of(&r, "forgotten"), Level::Ok);
+        assert!(text.contains("never pushed again (`arena archive forget`): arena9-withdrew"), "{text}");
         inputs.keep_until_days = None;
         inputs.probe = None;
         let r = judge_status(&inputs);
