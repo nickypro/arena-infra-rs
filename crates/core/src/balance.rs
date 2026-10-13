@@ -1639,6 +1639,14 @@ pub struct AccountView {
     pub stand_in: bool,
     /// Vast's `balance` reads as this much owed (shown, never taken off).
     pub owed: Option<f64>,
+    /// Hetzner: the backup archive's share of `burn` (EUR/h, its server and volumes — billed to
+    /// the account, never a fleet pod: the fleet listing leaves it out), when `arena balance`
+    /// read it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archive_per_hr: Option<f64>,
+    /// Hetzner: why the archive's cost couldn't be read (it then isn't in `burn`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archive_unread: Option<String>,
 }
 
 impl AccountView {
@@ -1669,6 +1677,8 @@ impl AccountView {
             check: None,
             stand_in: false,
             owed: None,
+            archive_per_hr: None,
+            archive_unread: None,
         }
     }
 
@@ -1770,6 +1780,23 @@ pub fn postpaid_view(listing: &Listing, pods: &[Pod]) -> Option<AccountView> {
     v.listed_per_hr = v.burn.map(|b| b.per_hr);
     v.level = Level::None;
     Some(v)
+}
+
+/// Add the backup archive's cost ([`BalanceApi::archive_eur_per_hr`]) to Hetzner's row: it
+/// bills the same account, so it is in the burn — as its own named part, never as a fleet
+/// pod. `Ok(None)` (no archive) changes nothing; a failed read is said and left out. A burn
+/// already unknown (the listing failed) stays unknown.
+pub fn add_archive(v: &mut AccountView, read: Result<Option<f64>, String>) {
+    match read {
+        Ok(Some(per_hr)) if per_hr.is_finite() && per_hr >= 0.0 => {
+            v.archive_per_hr = Some(per_hr);
+            if let Some(b) = v.burn.as_mut() {
+                b.per_hr += per_hr;
+            }
+        }
+        Ok(_) => {}
+        Err(e) => v.archive_unread = Some(e),
+    }
 }
 
 /// `balance --check`'s exit: 2 if any account is critical, else 3 if any is unknown while
@@ -2235,6 +2262,15 @@ pub fn notes(views: &[AccountView], policy: &BalancePolicy, now: u64) -> Vec<Str
         }
         if v.source == Source::Postpaid {
             out.push(format!("{name}: postpaid — billed monthly in arrears, no balance to run out"));
+            if let Some(a) = v.archive_per_hr {
+                out.push(format!(
+                    "{name}: includes the backup archive, {}/h (its server and volumes — not a fleet pod; `arena archive status`)",
+                    money(v, a)
+                ));
+            }
+            if let Some(e) = &v.archive_unread {
+                out.push(format!("{name}: the backup archive's cost couldn't be read ({e}) — not included"));
+            }
         }
     }
     out
@@ -2249,7 +2285,15 @@ pub fn verbose_lines(views: &[AccountView], state: &BalanceState, fetched: &[Fet
         out.push(format!("{}:", v.account));
         if v.source == Source::Postpaid {
             let burn = v.burn.map_or("? (its listing failed)".into(), |b| format!("{}/h", money(v, b.per_hr)));
-            out.push(format!("  postpaid {burn} — servers only: volumes not counted"));
+            match v.archive_per_hr {
+                Some(a) => out.push(format!(
+                    "  postpaid {burn} — fleet servers {}/h + the backup archive {}/h (its server and volumes); the \
+                     fleet's volumes not counted",
+                    v.listed_per_hr.map_or("?".into(), |l| money(v, l)),
+                    money(v, a)
+                )),
+                None => out.push(format!("  postpaid {burn} — servers only: volumes not counted")),
+            }
             continue;
         }
         let gap = match (unattributed(v), rate_gap(v)) {
@@ -2906,6 +2950,12 @@ pub trait BalanceApi: Send + Sync {
     }
     /// Remember a live attempt (see [`BalanceApi::last_live_attempt`]).
     fn note_live_attempt(&self, _account: Account, _at: u64) {}
+    /// The backup archive's cost (`arena archive`: EUR/h, its server and volumes) — postpaid
+    /// Hetzner spend the fleet listing can't price (the archive is never a fleet pod). `None`:
+    /// no archive token configured, not asked; `Ok(None)`: no archive. Reads only.
+    async fn archive_eur_per_hr(&self) -> Option<Result<Option<f64>, String>> {
+        None
+    }
 }
 
 /// A reader's memory of its own live attempts.
@@ -2933,6 +2983,9 @@ pub struct HttpBalanceApi {
     graphql_url: String,
     v2_base: String,
     vast_base: String,
+    /// The backup archive's own Hetzner project (its token, else the fleet's) and this
+    /// cohort's names: priced for Hetzner's row only.
+    archive: Option<(crate::archive::HetznerArchiveCloud, crate::archive::ArchiveNames)>,
 }
 
 impl HttpBalanceApi {
@@ -2946,6 +2999,9 @@ impl HttpBalanceApi {
             graphql_url: crate::provider::runpod::GRAPHQL.to_string(),
             v2_base: crate::provider::runpod_v2::BASE.to_string(),
             vast_base: crate::provider::vast::BASE.to_string(),
+            archive: crate::archive::archive_token(cfg).zip(crate::archive::ArchiveNames::from_config(cfg).ok()).map(
+                |((token, _), names)| (crate::archive::HetznerArchiveCloud::new(token), names),
+            ),
         }
     }
 
@@ -2961,6 +3017,7 @@ impl HttpBalanceApi {
             graphql_url: graphql_url.into(),
             v2_base: v2_base.into(),
             vast_base: vast_base.into(),
+            archive: None,
         }
     }
 
@@ -2990,6 +3047,11 @@ async fn fetch(rb: reqwest::RequestBuilder) -> Result<Value, Fail> {
 impl BalanceApi for HttpBalanceApi {
     fn accounts(&self) -> Vec<(Account, String)> {
         Account::ALL.into_iter().filter_map(|a| self.key(a).map(|k| (a, key_fp(k)))).collect()
+    }
+
+    async fn archive_eur_per_hr(&self) -> Option<Result<Option<f64>, String>> {
+        let (cloud, names) = self.archive.as_ref()?;
+        Some(crate::archive::cloud::eur_per_hr(cloud, names).await.map_err(|e| e.to_string()))
     }
 
     fn last_live_attempt(&self, account: Account) -> Option<u64> {
@@ -3194,9 +3256,17 @@ mod fake {
         billed_args: Mutex<Vec<(u64, u64)>>,
         tried: Tried,
         panics: bool,
+        /// What [`BalanceApi::archive_eur_per_hr`] answers (`None`: not configured).
+        archive: Option<Result<Option<f64>, String>>,
     }
 
     impl FakeBalanceApi {
+        /// The backup archive's cost this fake reports for Hetzner's row.
+        pub fn archive(mut self, read: Result<Option<f64>, String>) -> Self {
+            self.archive = Some(read);
+            self
+        }
+
         /// No account configured.
         pub fn new() -> Self {
             Self::default()
@@ -3292,6 +3362,11 @@ mod fake {
 
         fn note_live_attempt(&self, account: Account, at: u64) {
             self.tried.note(account, at);
+        }
+
+        async fn archive_eur_per_hr(&self) -> Option<Result<Option<f64>, String>> {
+            assert!(!self.panics, "this surface must make no balance call (the archive's cost)");
+            self.archive.clone()
         }
 
         async fn billed(&self, from_hour: u64, to: u64) -> Result<Billed, Fail> {

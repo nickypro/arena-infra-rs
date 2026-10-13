@@ -1120,7 +1120,8 @@ pub fn local_baselines(dir: &Path) -> Vec<LocalBaseline> {
         .into_iter()
         .filter_map(|w| {
             let week: u32 = w.strip_prefix('w')?.parse().ok()?;
-            let fleet = base.join(&w).join("fleet");
+            // Where `pods baseline` writes it and the pulls link to it (`pull::baseline_dir`).
+            let fleet = crate::pull::baseline_dir(dir, week);
             let non_empty = std::fs::read_dir(&fleet).ok()?.next().is_some();
             let mtime = std::fs::metadata(&fleet).ok()?.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
             non_empty.then_some(LocalBaseline { week, mtime })

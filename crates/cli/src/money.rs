@@ -158,15 +158,34 @@ pub(crate) async fn balance_report(
     }
     let (state, load_warning) = balance::load_opt(path);
     let mode = if flags.no_live { Mode::NoLive } else { Mode::Full };
-    let (listed, fetched) =
-        tokio::join!(provider.list_by_provider(), balance::observe(bal.api.as_ref(), &state, mode, balance::COMMAND_TIMEOUT, now));
+    // The backup archive bills the Hetzner account but is never a fleet pod (the listing
+    // leaves it out): its cost is read from its own project, alongside, within the same
+    // budget — not under `--no-live`, which makes no call beyond billing.
+    let archive = async {
+        if flags.no_live {
+            return None;
+        }
+        match tokio::time::timeout(balance::COMMAND_TIMEOUT, bal.api.archive_eur_per_hr()).await {
+            Ok(read) => read,
+            Err(_) => Some(Err(format!("timed out after {}s", balance::COMMAND_TIMEOUT.as_secs()))),
+        }
+    };
+    let (listed, fetched, archive) = tokio::join!(
+        provider.list_by_provider(),
+        balance::observe(bal.api.as_ref(), &state, mode, balance::COMMAND_TIMEOUT, now),
+        archive
+    );
     let listing = Listing::from_results(listed);
     let pods = listing.pods();
     let burns = balance::burns_with(&listing, &pods, &state, &policy);
     let (state, save_warning) = balance::commit(path, state, &fetched, &burns, mode, now);
     let save_warning = save_warning.filter(|_| unsavable.is_none());
     let mut views = balance::views(&state, &fetched, &burns, &policy, mode, now);
-    views.extend(balance::postpaid_view(&listing, &pods));
+    let mut hetzner = balance::postpaid_view(&listing, &pods);
+    if let (Some(v), Some(read)) = (hetzner.as_mut(), archive) {
+        balance::add_archive(v, read);
+    }
+    views.extend(hetzner);
     for (p, e) in listing.errors() {
         // What stands in for its burn: the one last observed, if recent enough — else nothing.
         let burn = views.iter().find(|v| v.account == p).and_then(|v| v.burn).filter(|b| b.stale);
@@ -933,6 +952,48 @@ mod tests {
         let plain = listed("").await;
         assert_eq!(listed("BALANCE_WARN_HOURS=soon\nBALANCE_UNPRICED_PER_GPU=free\n").await, plain);
         assert!(plain.0.ends_with("balance: runpod $48.00 live ≈4.0d · vast $136.87 live no burn\n"), "{}", plain.0);
+    }
+
+    /// Merge of wave 7 archive: the backup archive bills the Hetzner account but is never a
+    /// fleet pod (the Hetzner listing leaves it out). `arena balance` reads its cost from its
+    /// own project and counts it in Hetzner's burn as its own part, said in a note and under
+    /// `-v`; a read that fails is said and left out; no archive changes nothing; `--no-live`
+    /// doesn't ask.
+    #[tokio::test]
+    async fn balance_counts_the_archive_in_hetzners_burn_never_as_a_pod() {
+        let cpu = Pod {
+            id: "h1".into(),
+            name: "devtest-cpu".into(),
+            provider: "hetzner".into(),
+            status: "running".into(),
+            cost_per_hr: Some(0.012),
+            ..Default::default()
+        };
+        let fleet = Fleet { backends: vec![("hetzner", Ok(vec![cpu]))] };
+        let dir = StateDir::new("archive-burn");
+        let json = BalanceFlags { json: true, ..Default::default() };
+        let hetzner = |out: &Printed| -> serde_json::Value {
+            let v: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+            v.as_array().unwrap().iter().find(|a| a["account"] == "hetzner").cloned().unwrap()
+        };
+        let (_, bal) = ctx(FakeBalanceApi::new().archive(Ok(Some(0.03))), Some(&dir));
+        let hz = hetzner(&balance_report(&fleet, &dir.cfg(""), &bal, json, T0).await.unwrap());
+        assert!((hz["burn"]["per_hr"].as_f64().unwrap() - 0.042).abs() < 1e-9, "{hz:#}");
+        assert_eq!((hz["listed_per_hr"].as_f64(), hz["archive_per_hr"].as_f64()), (Some(0.012), Some(0.03)), "{hz:#}");
+        let text = balance_report(&fleet, &dir.cfg(""), &bal, BalanceFlags { verbose: true, ..Default::default() }, T0).await.unwrap().stdout;
+        assert!(text.contains("hetzner: includes the backup archive, €0.030/h (its server and volumes — not a fleet pod"), "{text}");
+        assert!(text.contains("postpaid €0.042/h — fleet servers €0.012/h + the backup archive €0.030/h"), "{text}");
+        // `--no-live`: not asked.
+        let hz = hetzner(&balance_report(&fleet, &dir.cfg(""), &bal, BalanceFlags { no_live: true, ..json }, T0).await.unwrap());
+        assert!(hz.get("archive_per_hr").is_none() && (hz["burn"]["per_hr"].as_f64().unwrap() - 0.012).abs() < 1e-9, "{hz:#}");
+        // No archive: nothing changes. A failed read: said, not counted.
+        let (_, none) = ctx(FakeBalanceApi::new().archive(Ok(None)), Some(&dir));
+        let hz = hetzner(&balance_report(&fleet, &dir.cfg(""), &none, json, T0).await.unwrap());
+        assert!(hz.get("archive_per_hr").is_none() && hz.get("archive_unread").is_none(), "{hz:#}");
+        let (_, failed) = ctx(FakeBalanceApi::new().archive(Err("hetzner archive list servers HTTP 503".into())), Some(&dir));
+        let out = balance_report(&fleet, &dir.cfg(""), &failed, BalanceFlags::default(), T0).await.unwrap();
+        assert!(out.stdout.contains("hetzner: the backup archive's cost couldn't be read (hetzner archive list servers HTTP 503) — not included"), "{}", out.stdout);
+        assert_eq!(out.code, 0, "information only");
     }
 
     // ---- `pods list`: the balance line, and everything else unchanged ----

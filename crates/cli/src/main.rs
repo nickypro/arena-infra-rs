@@ -4251,6 +4251,12 @@ fn note_invalid(missing: &mut Vec<String>, e: &arena_core::Error) {
         arena_core::Error::Config(m) => m.clone(),
         other => other.to_string(),
     };
+    note_invalid_text(missing, &msg);
+}
+
+/// [`note_invalid`] for a parser that reports a plain message (`KEY …` first).
+fn note_invalid_text(missing: &mut Vec<String>, msg: &str) {
+    let msg = msg.to_string();
     let key: String = msg.chars().take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_').collect();
     if key.is_empty() {
         missing.push(msg);
@@ -4705,7 +4711,7 @@ fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<String>) {
     }
 
     println!("\nBackup archive (optional, `arena archive`):");
-    for line in archive::config_check_lines(cfg) {
+    for line in archive::config_check_lines(cfg, &mut missing) {
         println!("{line}");
     }
 
@@ -15127,7 +15133,7 @@ mod tests {
         let base = "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple)\nRUNPOD_API_KEY=not-a-real-key\n\
                     HETZNER_API_KEY=not-a-real-key\nGPU_TYPE=\"NVIDIA RTX A4000\"\nIMAGE=img:1\n";
         // (what's added to the base, the keys the check must fail on)
-        let cases: [(&str, &[&str]); 16] = [
+        let cases: [(&str, &[&str]); 22] = [
             ("", &[]),
             ("SHARED_SSH_KEY_PATH=/nonexistent/k\nGIT_SSH_KEY_LOCAL=/nonexistent/d", &[]),
             ("BACKUP_TIMEOUT_SECS=soon", &["BACKUP_TIMEOUT_SECS"]),
@@ -15143,6 +15149,13 @@ mod tests {
             ("CREATE_EXTRA_JSON='[1]'", &["CREATE_EXTRA_JSON"]),
             ("BALANCE_WARN_HOURS=soon", &["BALANCE_WARN_HOURS"]),
             ("BALANCE_UNPRICED_PER_GPU=free", &["BALANCE_UNPRICED_PER_GPU"]),
+            // The backup archive's settings (its section names the first bad one) and state dir.
+            ("ARCHIVE_SNAP_GB=5", &["ARCHIVE_SNAP_GB"]),
+            ("ARCHIVE_KEEP_UNTIL=soon", &["ARCHIVE_KEEP_UNTIL"]),
+            ("ARCHIVE_BWLIMIT=fast", &["ARCHIVE_BWLIMIT"]),
+            ("ARCHIVE_BIG_TIMEOUT_SECS=0", &["ARCHIVE_BIG_TIMEOUT_SECS"]),
+            ("BACKUP_MAX_SIZE=huge", &["BACKUP_MAX_SIZE"]),
+            ("ARENA_STATE_DIR=state", &["ARENA_STATE_DIR"]),
             ("SETUP_TIMEOUT_SECS=0\nMIN_DRIVER_VERSION=x.y\nBACKUP_TIMEOUT_SECS=-1", &["BACKUP_TIMEOUT_SECS", "MIN_DRIVER_VERSION", "SETUP_TIMEOUT_SECS"]),
             (
                 "BALANCE_WARN_HOURS=-1\nRUNPOD_API=v9\nVSCODE_EXTENSIONS=x\nCREATE_EXTRA_JSON='[]'",

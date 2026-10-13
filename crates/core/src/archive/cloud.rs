@@ -143,6 +143,28 @@ impl Prices {
     }
 }
 
+/// Hours in a month, for a monthly price per hour: Hetzner bills by the hour, capped at the
+/// monthly price — which an always-on archive always reaches.
+pub const HOURS_PER_MONTH: f64 = 730.0;
+
+/// What this cohort's archive bills per hour (EUR excl. VAT): its server(s) with the IPv4 and
+/// its volumes, at `/pricing`'s monthly rates over [`HOURS_PER_MONTH`]. For `arena balance`'s
+/// Hetzner row — the fleet listing leaves the archive out, so nothing else prices it. Reads
+/// only (one inventory, one price list); `Ok(None)`: this cohort has no archive.
+pub async fn eur_per_hr(cloud: &dyn ArchiveCloud, names: &ArchiveNames) -> Result<Option<f64>> {
+    let owned = cloud.inventory(Some(&names.prefix)).await?.owned_by(names);
+    if owned.servers.is_empty() && owned.volumes.is_empty() {
+        return Ok(None);
+    }
+    let gb: u32 = owned.volumes.iter().map(|v| v.size_gb).sum();
+    let server = owned.servers.first();
+    let location = server.map(|s| s.location.clone()).or_else(|| owned.volumes.first().map(|v| v.location.clone())).unwrap_or_default();
+    let server_type = server.map_or(super::DEFAULT_SERVER_TYPES[0], |s| s.server_type.as_str());
+    let p = cloud.prices(server_type, &location).await?;
+    let servers = owned.servers.len() as f64 * p.monthly(true, 0);
+    Ok(Some((servers + p.monthly(false, gb)) / HOURS_PER_MONTH))
+}
+
 /// The Hetzner calls the archive makes. `inventory` is the only read every command needs;
 /// `archive sync` makes none at all (it takes no `ArchiveCloud`).
 #[async_trait]
@@ -834,6 +856,29 @@ mod fake {
 mod tests {
     use super::*;
     use crate::http::test_server::{canned, serve};
+
+    /// `arena balance`'s share: the archive's server (+ IPv4) and volumes at the monthly prices
+    /// per hour; volumes alone after `archive down`; nothing without an archive; a failed list
+    /// is an error, never "no archive".
+    #[tokio::test]
+    async fn eur_per_hr_prices_the_server_and_its_volumes_per_hour() {
+        let n = names();
+        let fake = FakeArchiveCloud::new();
+        assert_eq!(eur_per_hr(&fake, &n).await.unwrap(), None);
+        let key = fake.create_ssh_key(&n.ssh_key(), "ssh-ed25519 AAAA", &n.labels()).await.unwrap();
+        let (srv, _) = fake.create_server(&server_body(&n, "cx23", "nbg1", key.id)).await.unwrap();
+        fake.create_volume(&volume_body(&n, Tier::Snap, 50, srv.id)).await.unwrap();
+        fake.create_volume(&volume_body(&n, Tier::Big, 200, srv.id)).await.unwrap();
+        // The fake's prices: cx23 €5.49 + IPv4 €0.50, €0.0572/GB.
+        let want = (5.49 + 0.5 + 250.0 * 0.0572) / HOURS_PER_MONTH;
+        assert!((eur_per_hr(&fake, &n).await.unwrap().unwrap() - want).abs() < 1e-12);
+        fake.delete_server(srv.id).await.unwrap();
+        assert!((eur_per_hr(&fake, &n).await.unwrap().unwrap() - 250.0 * 0.0572 / HOURS_PER_MONTH).abs() < 1e-12);
+        // Another cohort's archive is not this one's cost.
+        assert_eq!(eur_per_hr(&fake, &ArchiveNames::new("other").unwrap()).await.unwrap(), None);
+        fake.fail_inventory(Some("hetzner archive list servers HTTP 503"));
+        assert!(eur_per_hr(&fake, &n).await.is_err());
+    }
 
     fn names() -> ArchiveNames {
         ArchiveNames::new("arena9").unwrap()

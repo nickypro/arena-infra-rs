@@ -693,7 +693,7 @@ pub(crate) async fn archive_status(env: &Env<'_>, cloud: Option<&dyn ArchiveClou
     let baselines = push::local_baselines(&dir);
     let snap_need = local.last().map(|newest| {
         let mut trees = vec![dir.join(&newest.label)];
-        trees.extend(push::baseline_for(&newest.label, &baselines).map(|b| dir.join(arena_core::pull::BASELINE_DIR).join(format!("w{}", b.week)).join("fleet")));
+        trees.extend(push::baseline_for(&newest.label, &baselines).map(|b| arena_core::pull::baseline_dir(&dir, b.week)));
         push::unique_bytes(&trees)
     });
     let big_need = big.last_ok.is_none().then(|| push::unique_bytes(&[dir.join(arena_core::restore::BIG)])).filter(|b| *b > 0);
@@ -1130,7 +1130,7 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
     if st.last_ok().is_none() {
         if let Some(newest) = local.last() {
             let mut trees = vec![ctx.dir.join(&newest.label)];
-            trees.extend(push::baseline_for(&newest.label, &baselines).map(|b| ctx.dir.join(arena_core::pull::BASELINE_DIR).join(format!("w{}", b.week)).join("fleet")));
+            trees.extend(push::baseline_for(&newest.label, &baselines).map(|b| arena_core::pull::baseline_dir(ctx.dir, b.week)));
             seed_note(Tier::Snap, push::unique_bytes(&trees), ctx);
         }
     }
@@ -2116,7 +2116,7 @@ pub(crate) fn cron_state_root(cfg: &Config) -> std::result::Result<String, Strin
 }
 
 /// `config check`'s Archive section.
-pub(crate) fn config_check_lines(cfg: &Config) -> Vec<String> {
+pub(crate) fn config_check_lines(cfg: &Config, missing: &mut Vec<String>) -> Vec<String> {
     let mut out = Vec::new();
     let set = |k: &str| cfg.get(k).is_some_and(|v| !v.trim().is_empty());
     match archive::archive_token(cfg) {
@@ -2152,17 +2152,29 @@ pub(crate) fn config_check_lines(cfg: &Config) -> Vec<String> {
             s.bwlimit.as_deref().unwrap_or("none"),
             s.keep_until_text()
         )),
-        Err(e) => out.push(format!("  ✗ settings                     {e}")),
+        Err(e) => {
+            // A value its parser refuses (it names the first): a ✗ row fails the check.
+            out.push(format!("  ✗ settings                     {e}"));
+            super::note_invalid_text(missing, &e);
+        }
     }
     match ArchivePaths::for_config(cfg) {
-        Err(e) => out.push(format!("  ✗ state dir                    {e}")),
+        // A relative ARENA_STATE_DIR is a value to fix (✗, fails the check); no HOME to keep
+        // the state in is this environment's — advice (⚠).
+        Err(e) if e.starts_with("ARENA_STATE_DIR") => {
+            out.push(format!("  ✗ state dir                    {e}"));
+            super::note_invalid_text(missing, &e);
+        }
+        Err(e) => out.push(format!("  ⚠ state dir                    {e}")),
         Ok(p) => {
             out.push(format!("  · state dir                    {}", p.dir.display()));
             for (f, what) in [(p.host_file(), "archive.json"), (p.push_key(), "push key"), (p.admin_key(), "admin key"), (p.known_hosts(), "pinned host key")] {
                 let (mark, note) = if state::readable(&f) {
                     ("✓", "readable")
                 } else if f.exists() {
-                    ("✗", "NOT readable by this user")
+                    // Readiness (another user's state: root's cron vs a shell): advice, never a
+                    // failure — as an unreadable key file is.
+                    ("⚠", "NOT readable by this user")
                 } else {
                     ("·", "absent (`arena archive up`)")
                 };
@@ -3221,6 +3233,42 @@ mod tests {
             "{calls:?}"
         );
         assert!(matches!(&calls[2], RemoteCall::Exec { cmd, .. } if cmd.contains("chmod 600") && cmd.contains("arena_archive_key")));
+    }
+
+    /// Merge of wave 7 archive with lanes B/R/F: with an archive, copy-keys still does all it
+    /// did — each pod's own per-host keys (never another's), the broadcast token, the fleet
+    /// block, a stopped pod skipped as stopped (and, when every named pod is, lane F's
+    /// "stopped" error with nothing sent) — and adds the archive block and the read key by scp
+    /// for the pod it reaches.
+    #[tokio::test]
+    async fn copy_keys_with_an_archive_keeps_per_host_keys_and_the_stopped_pod_handling() {
+        let w = world("copykeys-merge");
+        w.up().await.unwrap();
+        std::fs::write(w.env().paths.known_hosts(), "203.0.113.102 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHostHostHostHostHostHostHostHostHostHos5\n").unwrap();
+        let keys = w.dir.join("keys");
+        std::fs::create_dir_all(&keys).unwrap();
+        std::fs::write(keys.join("openai_api_keys.csv"), "devtest-alpha,sk-openai-alpha\ndevtest-bravo,sk-openai-bravo\n").unwrap();
+        let keys_dir = keys.display().to_string();
+        let alpha = pod("devtest-alpha");
+        let bravo = arena_core::Pod { status: "EXITED".into(), ssh_port: Some(22002), ..pod("devtest-bravo") };
+        let sel = crate::Selected { pods: vec![alpha, bravo.clone()], named: true };
+        let fake = Arc::new(FakeRemote::new());
+        crate::handle_copy_keys(fake.clone(), &w.cfg, &keys_dir, None, None, &sel, false, true).await.unwrap();
+        let calls = fake.calls();
+        assert_eq!(calls.len(), 3, "{calls:#?}");
+        assert!(calls.iter().all(|c| c.host() == "10.0.0.1:22001"), "the stopped pod is never reached: {calls:#?}");
+        let RemoteCall::Exec { cmd, .. } = &calls[0] else { panic!("{calls:?}") };
+        assert!(cmd.contains("sk-openai-alpha") && !cmd.contains("sk-openai-bravo"), "its own per-host key only");
+        assert!(cmd.contains("hf_x"), "the broadcast token");
+        let (fleet, archive) = (cmd.find("# BEGIN arena-infra fleet").unwrap(), cmd.find("# BEGIN arena-archive").unwrap());
+        assert!(fleet < archive, "the fleet block first, the archive's after it");
+        assert!(matches!(&calls[1], RemoteCall::Copy { remote, .. } if remote == ".ssh/arena_archive_key"), "{calls:?}");
+        // Every named pod stopped: lane F's error, nothing sent, no key copied.
+        let fake = Arc::new(FakeRemote::new());
+        let only_bravo = crate::Selected { pods: vec![bravo], named: true };
+        let e = crate::handle_copy_keys(fake.clone(), &w.cfg, &keys_dir, None, None, &only_bravo, false, true).await.unwrap_err().to_string();
+        assert!(e.contains("stopped (devtest-bravo)") && e.contains("arena pods start devtest-bravo"), "{e}");
+        assert!(fake.calls().is_empty(), "{:?}", fake.calls());
     }
 
     /// Run a copy-keys command as a pod would, in a fake `$HOME`.

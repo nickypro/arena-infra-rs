@@ -470,6 +470,57 @@ mod tests {
         assert!(matches!(read_archive(None).await, Probe::Skipped(_)));
     }
 
+    /// Merge of wave 7 balance and archive: with this cohort's backup archive up (its own
+    /// Hetzner project) and a critical prepaid balance, the checklist carries the archive's own
+    /// item — remaining without a retention date, `◷ kept` (not blocking) before one — while
+    /// the fleet's pods item holds the fleet only (the Hetzner listing leaves the archive out,
+    /// so it is never a leftover pod). The balance stays information: the same items whatever
+    /// it says, the exit decided by the archive, the JSON carrying both.
+    #[tokio::test]
+    async fn the_archive_item_and_the_balance_side_by_side() {
+        use arena_core::archive::cloud::{server_body, volume_body, FakeArchiveCloud};
+        use arena_core::archive::{ArchiveNames, Tier};
+        use arena_core::balance::{Account, FakeBalanceApi, Live};
+        use arena_core::teardown::Area;
+        let dir = tmp("archive-balance");
+        let n = ArchiveNames::new("devtest").unwrap();
+        let fake = FakeArchiveCloud::new();
+        let key = fake.create_ssh_key(&n.ssh_key(), "ssh-ed25519 AAAA", &n.labels()).await.unwrap();
+        let (srv, _) = fake.create_server(&server_body(&n, "cx23", "nbg1", key.id)).await.unwrap();
+        for tier in [Tier::Snap, Tier::Big] {
+            fake.create_volume(&volume_body(&n, tier, 10, srv.id)).await.unwrap();
+        }
+        fake.clear_calls();
+        let archive = read_archive(Some(&fake)).await;
+        // The fleet: nothing left on RunPod or Hetzner — the archive server isn't in that listing.
+        let fleet = Fleet { backends: vec![("runpod", Ok(vec![])), ("hetzner", Ok(vec![]))] };
+        let sched = FakeSched::with(&[("crontab -l", ran("")), ("atq", ran(""))]);
+        let poor = Live { usd: 1.0, provider_burn_per_hr: Some(0.0), spend_limit_per_hr: None, under_balance: Some(true), reduced: false, owed: None };
+        let bal = BalanceCtx { api: Arc::new(FakeBalanceApi::new().live_ok(Account::Runpod, poor)), path: Some(Ok(dir.0.join("state").join("balance.json"))) };
+        for (keep_until, verdict, clear) in [(None, Verdict::Remaining, false), (Some("2099-12-31"), Verdict::Kept, true)] {
+            let mut cfg = cfg(&dir.0);
+            if let Some(d) = keep_until {
+                cfg.values.insert("ARCHIVE_KEEP_UNTIL".into(), d.into());
+            }
+            let ready = |a: &Probe<Inventory>| std::future::ready(a.clone());
+            let report = collect(&fleet, &cfg, std::future::ready(Probe::Got(vec![])), ready(&archive), None, &sched, &bal).await;
+            let item = report.items.iter().find(|i| i.area == Area::Archive).expect("an archive item");
+            assert_eq!(item.verdict, verdict, "{}", report.render());
+            let pods: Vec<&arena_core::teardown::Item> = report.items.iter().filter(|i| i.area == Area::Pods).collect();
+            // No pod anywhere — the archive server isn't one (vast: not configured, skipped).
+            assert!(pods.iter().any(|i| i.scope == "hetzner" && i.verdict == Verdict::Clear), "{}", report.render());
+            assert!(pods.iter().all(|i| i.entries.is_empty() && i.verdict != Verdict::Remaining), "{}", report.render());
+            assert_eq!(report.clear, clear, "{}", report.render());
+            assert_eq!(report.balance.len(), 1, "the balance is reported alongside");
+            let v = serde_json::to_value(&report).unwrap();
+            assert_eq!(v["balance"][0]["account"], "runpod");
+            assert!(v["items"].as_array().unwrap().iter().any(|i| i["area"] == "archive"), "{v:#}");
+            let exit = teardown_with(&fleet, &cfg, std::future::ready(Probe::Got(vec![])), ready(&archive), None, &sched, false, &bal).await;
+            assert_eq!(exit.is_ok(), clear, "the archive decides the exit; the critical balance never does");
+        }
+        assert!(fake.mutations().is_empty(), "teardown only lists the archive");
+    }
+
     fn vol(id: &str, gb: u32) -> NetworkVolume {
         NetworkVolume { id: id.into(), name: format!("{id}-data"), size_gb: Some(gb), data_center: None, tier: None }
     }
