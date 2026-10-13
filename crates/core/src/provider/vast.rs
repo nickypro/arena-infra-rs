@@ -794,6 +794,8 @@ fn parse_instance(v: &Value) -> Pod {
         proxy_only: false,
         disk_gb: v.get("disk_space").and_then(Value::as_f64).filter(|g| g.is_finite() && *g >= 0.0),
         volume_gb: None,
+        delete_protected: None,
+        created_at: None,
     }
 }
 
@@ -892,6 +894,8 @@ impl Provider for VastProvider {
                 proxy_only: false,
                 disk_gb: Some(f64::from(spec.disk_gb)),
                 volume_gb: None,
+                delete_protected: None,
+                created_at: None,
             });
         }
         Err(gone.unwrap_or_else(|| {

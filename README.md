@@ -93,6 +93,12 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     metered) spend, else `?`; burn, runway, levels, the `balance.json` state and every
     surface's rendering (Hetzner postpaid); `idle` — the read-only
     `pods idle` probe script, its reply parser and the verdict/report (unknown ≠ idle).
+  - `reap` — the opt-in auto-reaper (`pods reap`), pure but for its state store: the strict
+    `reap.json` types and settings (`REAP_*`, file-only), the read-only probe (`idle_probe.sh`,
+    framed by a nonce, indexed and `cksum`-closed so a damaged reply is never "idle") and its
+    parser, classification / idle streak / due rules, the decision table (spec rows G1–G7,
+    R1–R40), the typed proofs and `ReapTicket` (the only way reap code reaches a terminate),
+    the ENDS column, plan table, notice, cron line and JSONL log line.
   - `lock` — pod locks (RunPod v2, `Pod::locked`): the one refusal sentence (`devtest-x is
     locked — `arena pods unlock devtest-x` first`), the up-front refusal over a selection,
     the mapping of the API's `Locked` error to it, and `pods lock`/`unlock`'s plan.
@@ -724,6 +730,91 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     terminate <name>` (the id when a name is shared). Anything unreadable (no reply, a scan
     that timed out, `[N/A]` GPU, our own connection not found, more than 2000 sockets so not
     every connection was read) makes a pod `?`, never a candidate. Not seen: sessions through RunPod's `ssh.runpod.io` proxy (not via sshd).
+  - `pods reap run|set|clear|pin|unpin|status|log|hold|release` — the **opt-in auto-reaper**:
+    terminate a pod past an end time the operator set (`--expire-in 8h`, `--expire-at …`), or
+    idle for a window (`--idle-after 8h`), **after a verified backup and only when every check
+    is certain** — anything it can't confirm (an unreachable pod, a probe it can't read, a
+    failed listing, an unverified clock, a lock, a pin, `~/.arena/keep` on the pod, anything
+    the reap's backup wouldn't copy — any file in a `TEMP_FOLDER_FOR_SWEEPS/`, a link from the
+    home to somewhere outside it, data written since the pod was created on `/workspace`,
+    another writable mount or the usual places outside the home (`/data /scratch /srv /mnt
+    /media /opt /var/tmp /tmp /home/<other>`; the system, installed Python packages and caches
+    passed over) —, a home that's a link to another filesystem, a process list, crontab or
+    timer it can't read) means "do nothing and log it". **Since when** is the pod's creation as
+    its provider lists it — not the last boot: a Hetzner VM's disk outlives reboots (on RunPod,
+    where a restart starts the container afresh, the later of creation and container start). Off by default in layers: a pod needs a policy
+    (`reap set <names> …`, or `pods up/create --expire-in/--expire-at/--idle-after`, recorded
+    the moment each create returns); `reap run` alone only probes (read-only) and prints the
+    plan (`WOULD TERMINATE`); `reap run --apply` acts only with `REAP_ENABLED=1` **in the config
+    file** (the environment can't set any `REAP_*` key), no hold, an NTP-synced clock and, with
+    no terminal, `--yes` — at most `REAP_MAX_PER_RUN` (default 1) per run and
+    `REAP_MAX_PER_DAY` (10) per 24 h. Acting on a pod: the deciding look taken again if over
+    60 s old, a durable write-ahead, the git push, the tier roots' markers and free space
+    checked again, both rsync tiers under the pod's backup lock (every pod-side step behind
+    its identity check) — the big tier as the reap's own copy, which keeps the home's
+    dot-directories and leaves out only documented caches and secrets (`.cache` but
+    `~/.cache/huggingface/` — of which only the hub cache, `hub/` and `xet/`, is left out —,
+    venvs and `site-packages`, Hugging Face hub entries `models--*/`/`datasets--*/`, the VS Code
+    server's binaries, `.ssh`) — a
+    dry-run verify (0 files pending), then the verified dirs **frozen**: hard-linked (same
+    filesystem, no space) into `<root>/reaped/<name>/<UTC stamp>-<provider>-<id>/snapshot` and
+    `<big root>/reaped/…/big`, counted equal to what was verified — a later same-named pod's
+    pulls never touch that copy, and nothing in arena writes or deletes under `reaped/` (a
+    freeze that fails removes the leaves it made itself, and backs off 6 h like a failed
+    backup).
+    Then a post-backup quiet check (same id and container; nothing changed since the deciding
+    look's scan began; no process started since boot that isn't the container's own), a
+    fresh re-listing (same id/name, RUNNING, lock reported off, no `-new`/`-old` twin, no
+    second pod of that name — and every provider listed: one that failed could hide a twin),
+    a state re-read (no hold, no new pin, still due) and
+    `REAP_ENABLED` re-read from the config file — then one terminate, routed by provider name.
+    **Processes**: a process counts as use — a dormant `nohup python train.py`, a kernel, an
+    editor, `mosh-server`, a `screen` — unless it's one of the image's own services (a command
+    line seen in the first two minutes of the FIRST boot the reaper looked at, kept per pod: a
+    participant's `@reboot` job after a later reboot counts), a plain interactive shell, tmux's
+    server (its panes are judged: a non-shell foreground counts), sshd's or cron's own, or the
+    login's `systemd --user`. So does any open terminal (a process on a `/dev/pts` outside the
+    probe's own session, a tmux pane's own shell aside: an ssh login, RunPod's web or proxy
+    shell, a VS Code or Jupyter terminal) and scheduled work no process shows yet (a crontab
+    line, an `at` job, a systemd timer someone added). To stop a run
+    mid-way: `arena pods reap hold` (or `REAP_ENABLED=0` in the file) — checked again right
+    before the terminate. `pods replace`/`migrate copy`/`cutover` refuse a pod being reaped —
+    and, where the reaper is configured (`REAP_ENABLED=1` in the file or its cron line), when
+    they can't read its state (root's state dir from an operator's shell), naming the path. Expiry never takes a pod in use or unreachable: it's
+    deferred (`OVERDUE (in use)` / `(unreachable)` in `pods list`'s ENDS column) and notified at
+    most every 6 h (`REAP_NOTIFY_CMD`, one line on stdin). A terminate error other than
+    "locked" sets an automatic hold. Needs an explicit absolute `ARENA_STATE_DIR` **in the
+    config file** (state: `reap.json`, log: `reap-log.jsonl`) — a shell exporting a different
+    one is refused (it would put a `hold` where the cron never looks); every state change
+    prints the file it wrote — RunPod on `RUNPOD_API=v2` (v1 and Vast are never
+    reaped), absolute `LOCAL_BACKUP_DIR`, a `.arena-backup-tier` marker on each backup root
+    (`snapshot` / `big`; the big tier's root is `LOCAL_BACKUP_BIG_DIR`, default
+    `<LOCAL_BACKUP_DIR>/big`), `ARENA_START_DATE` and no `BACKUP_REMOTE_PATH`; `config check`
+    lists what's missing once the reaper is on or its cron line is installed (off: one `·
+    reaper off (opt-in)` row, a ✗ only for a `REAP_*` value set but invalid). Every `pods reap
+    … --json` prints exactly one JSON document on stdout — `{"error": …}` on a failure,
+    `{"skipped": …}` when another run holds the lock — and everything else on stderr. Rollout: `cron install --reap observe` first (logs `would_reap`), then
+    `--reap apply` (refused unless REAP_ENABLED=1). `reap set` also writes `~/.arena/NOTICE` and
+    an interactive-only login banner on the pod (also written after `up`'s setup for a pod
+    created with a policy, after `pods setup`, and after a restart's re-provision — the 1-hour
+    `wall` before a reap reaches nobody in a RunPod container, which has no utmp); `pods
+    rename` keeps the policy's name; a `replace`/`migrate` doesn't carry it (said).
+    **When the reaper never acts** (all fail safe: the pod stays, `reap run` says why, an
+    expired one is `OVERDUE` and notified every 6 h): a live Jupyter kernel (its loopback
+    connections are sockets in use), any process started after the container's first two
+    minutes that isn't one of its own services restarted (a VS Code server left running, a
+    `screen`, `mosh-server`, a forgotten `python`), an open terminal, a crontab line or timer,
+    data on `/workspace` (where setup puts the repo when the pod has a volume) or another
+    writable mount, any file in a `TEMP_FOLDER_FOR_SWEEPS/`, data written outside the home since
+    the pod was created (or a link out of the home), a pod whose provider gives no creation
+    time, a MIG GPU slice (`[N/A]` utilisation reads as unknown), RunPod
+    on `RUNPOD_API=v1` (the default) and Vast (no lock state — `up --expire-*` refuses them,
+    ENDS shows `not reapable (…)`), a pod renamed outside arena or sharing its name, a home
+    that's a link to another filesystem, `~/.arena/keep`. A tmux session whose panes run only
+    a shell doesn't count (its utmp entries aren't logins); one running anything else does.
+    A `reap.json` that can't be read stops every run (`reap hold`/`release` still work — the
+    hold has its own `hold.json`); the error gives the recovery: move it aside
+    (`mv reap.json reap.json.bad-<UTC time>`) and the reaper starts with no policies.
   - `pods pull [targets] [--label <label>]` — the **file** backup (complementing the git
     `backup`): rsyncs each pod's home into `<dir>/<label>/<pod>/`, reporting per pod what was
     sent and what the snapshot holds (`12 files, 3.4M sent of 6754, 1.8G` — sizes parsed in
@@ -749,8 +840,14 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     one invocation counts a hard-linked file once. Knobs come from flags
     else config: `LOCAL_BACKUP_DIR` (`--dir`), `BACKUP_MAX_SIZE` (`--max-size`),
     `BACKUP_REMOTE_PATH` (`--remote-path`, default `~/`). Label defaults to the `wNdM`
-    iteration (`big`/`baseline` are refused). Confirms first; `--dry-run` prints the exact
-    rsync commands, shell-quoted. **Bounded**: rsync
+    iteration (`big`/`baseline`/`reaped` are refused). Confirms first; `--dry-run` prints the
+    exact rsync commands, shell-quoted. **Per-pod backup lock** (in an existing absolute
+    `LOCAL_BACKUP_DIR`: `.arena-locks/<name>.lock`, the folder 0700 — a missing backup dir is
+    never created for it, and the run goes as before without locks): each pod's lock is taken
+    once per name (two listed pods sharing a name share it) and released the moment that pod's
+    own rsyncs end, so one slow pod never holds the others; `pods backup` holds it for that
+    pod's git push, then for its rsyncs. A pod whose lock another backup (the cron, the
+    reaper, the TUI's backup) holds for 120 s is skipped, named, and fails the run. **Bounded**: rsync
     `--timeout=300` (gives up after 5 min without any I/O) and a wall-clock budget per pod,
     `BACKUP_TIMEOUT_SECS` (default 7200 = 2 h, max a day; settable from the environment) —
     a pod that runs out is stopped (SIGTERM, so rsync takes its ssh and receiver down too;

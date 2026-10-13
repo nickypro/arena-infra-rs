@@ -430,6 +430,9 @@ fn parse_pod(v: &Value) -> Pod {
         disk_gb: runpod::disk_sum(&[v.get("disk"), v.pointer("/mounts/persistent/size")]),
         volume_gb: runpod::disk_sum(&[v.pointer("/mounts/persistent/size")])
             .or_else(|| runpod::disk_sum(&[v.get("disk")]).map(|_| 0.0)),
+        delete_protected: None,
+        // `createdAt` (`2026-10-08T09:33:33.607Z`).
+        created_at: s("createdAt").as_deref().and_then(crate::reap::parse_rfc3339).and_then(|t| u64::try_from(t).ok()),
     }
 }
 
@@ -1113,6 +1116,8 @@ mod tests {
                 // `disk` 100 + the persistent volume's 20.
                 disk_gb: Some(120.0),
                 volume_gb: Some(20.0),
+                delete_protected: None,
+                created_at: Some(1_780_315_200),
             }
         );
     }

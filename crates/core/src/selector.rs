@@ -140,6 +140,17 @@ impl<'a> Naming<'a> {
         name.starts_with(&format!("{}-", self.prefix)) && !self.is_staff(name)
     }
 
+    /// Is `name` one the auto-reaper may ever consider (`crate::reap`): exactly
+    /// `qualify(prefix, e)` for a non-`@` `MACHINE_NAME_LIST` entry `e` — this cohort's listed
+    /// machines and nothing else. Stricter than [`Naming::is_cohort`], which takes any
+    /// `{prefix}-…`: a parked `-old`/`-new` twin, a pod off the list and a staff `@` box (even
+    /// one whose name a plain entry would also spell) are all `false`.
+    pub fn reapable(&self, name: &str) -> bool {
+        !name.is_empty()
+            && !self.is_staff(name)
+            && self.list.iter().any(|e| !is_absolute(e) && qualify(self.prefix, e) == name)
+    }
+
     /// A pod name as the operator would type it: without the fleet prefix.
     fn short<'n>(&self, name: &'n str) -> &'n str {
         name.strip_prefix(self.prefix).and_then(|r| r.strip_prefix('-')).unwrap_or(name)
@@ -516,6 +527,28 @@ fn edit_distance(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only a plain list entry's own name is reapable: not a twin, not off-list, not a staff
+    /// box — even a staff box whose name a plain entry would also spell.
+    #[test]
+    fn reapable_is_a_plain_list_entrys_exact_name() {
+        let list: Vec<String> = ["apple", "bloom", "@devtest-boss", "@james-gpu", "boss"].map(String::from).to_vec();
+        let n = Naming { prefix: "devtest", list: &list };
+        for (name, want) in [
+            ("devtest-apple", true),
+            ("devtest-bloom", true),
+            ("devtest-apple-old", false),
+            ("devtest-apple-new", false),
+            ("devtest-cloud", false),
+            ("james-gpu", false),
+            ("devtest-boss", false), // `@devtest-boss` wins over the plain `boss`
+            ("apple", false),
+            ("arena9-apple", false),
+            ("", false),
+        ] {
+            assert_eq!(n.reapable(name), want, "{name}");
+        }
+    }
 
     /// The list: apple … mayor, with an absolute `@james-gpu` in the middle.
     fn list() -> Vec<String> {

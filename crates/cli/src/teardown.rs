@@ -521,6 +521,49 @@ mod tests {
         assert!(fake.mutations().is_empty(), "teardown only lists the archive");
     }
 
+    /// Merge of wave 7 reaper: the reaper's own files — its state and hold (`reap.json`), its run
+    /// and state locks, the per-pod backup locks, its frozen `reaped/` backups — never touch the
+    /// checklist (a held or pending reap is the reaper's business, not a leftover: no item, ALL
+    /// CLEAR stays ALL CLEAR). Its cron line is an arena line like any other: remaining, with
+    /// `arena cron remove` (which clears the whole block, the archive's lines too) as the fix.
+    #[tokio::test]
+    async fn the_reapers_files_never_change_the_checklist_and_its_cron_line_is_a_cron_line() {
+        let dir = tmp("reaper-files");
+        let state = dir.0.join("state");
+        let mut cfg = cfg(&dir.0);
+        cfg.values.insert("ARENA_STATE_DIR".into(), state.display().to_string());
+        cfg.values.insert("LOCAL_BACKUP_DIR".into(), dir.0.join("backup").display().to_string());
+        let fleet = Fleet { backends: vec![("runpod", Ok(vec![]))] };
+        let quiet = || FakeSched::with(&[("crontab -l", ran("")), ("atq", ran(""))]);
+        let (baseline, exit) = check(&fleet, &cfg, Probe::Got(vec![]), None, &quiet()).await;
+        assert_eq!(exit, Ok(()), "{}", baseline.render());
+        for (path, text) in [
+            ("state/devtest/reap.json", r#"{"version":1,"hold":{"reason":"maintenance","at":1791460800}}"#),
+            ("state/devtest/reap.lock", ""),
+            ("state/devtest/reap.json.lock", ""),
+            ("state/devtest/reap-log.jsonl", "{}\n"),
+            ("backup/.arena-locks/devtest-apple.lock", ""),
+            ("backup/reaped/devtest-apple/20261012T000000Z-runpod-p1/snapshot/a.py", "x"),
+            ("backup/big/reaped/devtest-apple/20261012T000000Z-runpod-p1/big/b.bin", "x"),
+        ] {
+            let p = dir.0.join(path);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        }
+        let (report, exit) = check(&fleet, &cfg, Probe::Got(vec![]), None, &quiet()).await;
+        assert_eq!(exit, Ok(()), "{}", report.render());
+        assert_eq!(report.items, baseline.items, "the reaper's files are no item");
+        // Its cron line: an arena line, remaining, cleared by `arena cron remove`.
+        let reap_line = arena_core::reap::render::cron_line(false, "/usr/local/bin/arena", "/c", "/h", &[]);
+        let tab = format!("{CRON_BEGIN}\n{reap_line}\n{CRON_END}\n");
+        let sched = FakeSched::with(&[("crontab -l", ran(&tab)), ("atq", ran(""))]);
+        let (report, exit) = check(&fleet, &cfg, Probe::Got(vec![]), None, &sched).await;
+        assert!(exit.is_err());
+        let cron = report.items.iter().find(|i| i.area == arena_core::teardown::Area::Cron).unwrap();
+        assert_eq!(cron.verdict, Verdict::Remaining, "{}", report.render());
+        assert_eq!(cron.fix.first().map(String::as_str), Some("arena cron remove"));
+    }
+
     fn vol(id: &str, gb: u32) -> NetworkVolume {
         NetworkVolume { id: id.into(), name: format!("{id}-data"), size_gb: Some(gb), data_center: None, tier: None }
     }

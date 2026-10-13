@@ -608,6 +608,14 @@ async fn run_setup(env: &Env<'_>, cloud: &dyn ArchiveCloud, settings: &ArchiveSe
     Ok(())
 }
 
+/// The big tier's root for the backup dir `dir`: `LOCAL_BACKUP_BIG_DIR` (its own volume) when
+/// set, else `<dir>/big` — `pull::big_root`, where `pods pull` writes it (and where the
+/// auto-reaper freezes its `reaped/`, which is never pushed).
+fn big_root_for(cfg: &Config, dir: &Path) -> PathBuf {
+    let root = PathBuf::from(arena_core::pull::big_root(&dir.display().to_string(), cfg.get("LOCAL_BACKUP_BIG_DIR")));
+    std::fs::canonicalize(&root).unwrap_or(root)
+}
+
 /// `up --dry-run`'s local sizes: the newest snapshot label and `big/`, against the volumes.
 fn print_local_sizes(cfg: &Config, inv: &archive::Inventory, names: &ArchiveNames, settings: &ArchiveSettings, flags: SizeFlags) {
     let dir = super::local_backup_dir(cfg);
@@ -616,7 +624,7 @@ fn print_local_sizes(cfg: &Config, inv: &archive::Inventory, names: &ArchiveName
     let newest = push::local_labels(base).ok().and_then(|l| l.last().cloned());
     let sizes = [
         (Tier::Snap, newest.as_ref().map(|l| base.join(l)), newest.clone().unwrap_or_default()),
-        (Tier::Big, Some(base.join(arena_core::restore::BIG)), "big/".into()),
+        (Tier::Big, Some(big_root_for(cfg, base)), "big/".into()),
     ];
     println!("  local sizes ({dir}):");
     for (tier, path, what) in sizes {
@@ -677,9 +685,10 @@ pub(crate) async fn archive_status(env: &Env<'_>, cloud: Option<&dyn ArchiveClou
         Err(_) => labels.clone(),
     };
     let custom = push::custom_labels(&dir);
-    let (not_on_list, only_local) = push::control_box_only(&dir, &labels, &allowed, &names.prefix, &env.cfg.machine_names);
+    let big_root = big_root_for(env.cfg, &dir);
+    let (not_on_list, only_local) = push::control_box_only_in(&dir, &big_root, &labels, &allowed, &names.prefix, &env.cfg.machine_names);
     let not_on_list: Vec<String> = not_on_list.into_iter().filter(|d| !forgotten.contains(d)).collect();
-    let off_list = off_list_present(&dir, &labels, &allowed, &current);
+    let off_list = off_list_present(&dir, &big_root, &labels, &allowed, &current);
     // No longer pushed, but still on the archive (A3-7): forgotten without `--delete-archived`, and
     // staff boxes that once were on the list.
     let mut still_archived: Vec<String> = forgotten_file.pods.iter().filter(|(_, r)| r.deleted.is_none()).map(|(p, _)| p.clone()).collect();
@@ -696,7 +705,9 @@ pub(crate) async fn archive_status(env: &Env<'_>, cloud: Option<&dyn ArchiveClou
         trees.extend(push::baseline_for(&newest.label, &baselines).map(|b| arena_core::pull::baseline_dir(&dir, b.week)));
         push::unique_bytes(&trees)
     });
-    let big_need = big.last_ok.is_none().then(|| push::unique_bytes(&[dir.join(arena_core::restore::BIG)])).filter(|b| *b > 0);
+    // The pod dirs the big push would send (never `reaped/` or the pull's temp dir).
+    let big_trees: Vec<PathBuf> = allowed.iter().map(|p| big_root.join(p)).filter(|p| p.is_dir()).collect();
+    let big_need = big.last_ok.is_none().then(|| push::unique_bytes(&big_trees)).filter(|b| *b > 0);
     let host_written_age = std::fs::metadata(env.paths.host_file())
         .and_then(|m| m.modified())
         .ok()
@@ -856,6 +867,7 @@ pub(crate) async fn archive_sync_with(
     cohort(cfg, &names, paths)?;
     let raw_dir = o.dir.clone().unwrap_or_else(|| PathBuf::from(super::local_backup_dir(cfg)));
     let dir = std::fs::canonicalize(&raw_dir).with_context(|| format!("the backup dir {} doesn't exist (LOCAL_BACKUP_DIR / --dir)", raw_dir.display()))?;
+    let big_root = big_root_for(cfg, &dir);
     say(&format!("Pushing {} → {} ({}){}", dir.display(), host.ipv4, names.server(), if o.dry_run { " — dry run" } else { "" }));
     if tiers.contains(&Tier::Snap) && !o.dry_run {
         if let Some(v) = rsync_without_mkpath(rsync) {
@@ -867,6 +879,7 @@ pub(crate) async fn archive_sync_with(
         paths,
         names: &names,
         dir: &dir,
+        big: &big_root,
         o: &o,
         transport: push_transport(paths, &host.ipv4),
         settings: &settings,
@@ -896,7 +909,7 @@ pub(crate) async fn archive_sync_with(
     ever.extend(state::load_big(&paths.sync_state(Tier::Big)).map(|s| s.allowed_ever).unwrap_or_default());
     let allowed = push::push_set(&names.prefix, &cfg.machine_names, &ever, &c.forgotten);
     let local = push::local_labels(&dir).unwrap_or_default();
-    let (not_listed, other) = push::control_box_only(&dir, &local, &allowed, &names.prefix, &cfg.machine_names);
+    let (not_listed, other) = push::control_box_only_in(&dir, &big_root, &local, &allowed, &names.prefix, &cfg.machine_names);
     let (forgotten_here, not_listed): (Vec<String>, Vec<String>) = not_listed.into_iter().partition(|d| c.forgotten.contains(d));
     if !not_listed.is_empty() {
         say(&format!("not pushed — named like this cohort's pods but not on MACHINE_NAME_LIST: {} (add them to the list to archive them)", not_listed.join(", ")));
@@ -907,7 +920,7 @@ pub(crate) async fn archive_sync_with(
     if !other.is_empty() {
         say(&format!("kept on the control box only (staff boxes, other cohorts): {}", other.join(", ")));
     }
-    let off_list = off_list_present(&dir, &local, &allowed, &c.current);
+    let off_list = off_list_present(&dir, &big_root, &local, &allowed, &c.current);
     if !off_list.is_empty() {
         say(&format!("off MACHINE_NAME_LIST, still archived (they were on it): {} — `arena archive forget <pod>` stops that", off_list.join(", ")));
     }
@@ -923,6 +936,8 @@ struct SyncCtx<'a> {
     paths: &'a ArchivePaths,
     names: &'a ArchiveNames,
     dir: &'a Path,
+    /// The big tier's root ([`big_root_for`]): `LOCAL_BACKUP_BIG_DIR`, else `<dir>/big`.
+    big: &'a Path,
     o: &'a SyncOpts,
     transport: PushTransport,
     settings: &'a ArchiveSettings,
@@ -948,10 +963,10 @@ fn cohort(cfg: &Config, names: &ArchiveNames, paths: &ArchivePaths) -> Result<Co
 
 /// The pod dirs present in the backup dir (labels and `big/`) that are pushed only because they
 /// once were on the list (`allowed_ever`): what `sync` and `status` name, with how to stop it.
-fn off_list_present(dir: &Path, labels: &[String], allowed: &[String], current: &[String]) -> Vec<String> {
+fn off_list_present(dir: &Path, big_root: &Path, labels: &[String], allowed: &[String], current: &[String]) -> Vec<String> {
     let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for tree in labels.iter().map(String::as_str).chain([arena_core::restore::BIG]) {
-        for d in push::subdirs(&dir.join(tree)).unwrap_or_default() {
+    for tree in labels.iter().map(|l| dir.join(l)).chain([big_root.to_path_buf()]) {
+        for d in push::subdirs(&tree).unwrap_or_default() {
             if allowed.contains(&d) && !current.contains(&d) {
                 out.insert(d);
             }
@@ -1401,7 +1416,7 @@ async fn sync_big(ctx: &SyncCtx<'_>) -> Result<usize> {
     }
     st.allowed_ever.extend(c.current.iter().cloned());
     let allowed = push::push_set(&ctx.names.prefix, &ctx.cfg.machine_names, &st.allowed_ever, &c.forgotten);
-    let src = ctx.dir.join(arena_core::restore::BIG);
+    let src = ctx.big.to_path_buf();
     if !src.is_dir() {
         (ctx.say)(&format!("= big: nothing to push yet (no {})", src.display()));
         save_big(ctx, &st)?;
@@ -1419,7 +1434,7 @@ async fn sync_big(ctx: &SyncCtx<'_>) -> Result<usize> {
     let fair = budget / u32::try_from(pods.len().max(1)).unwrap_or(u32::MAX);
     let (mut failed, mut ok, mut tried, mut real_failures, mut outage, mut all_through) = (0usize, 0usize, 0usize, 0usize, false, true);
     for pod in &pods {
-        let job = push::big_job(ctx.dir, std::slice::from_ref(pod));
+        let job = push::big_job_in(ctx.big, std::slice::from_ref(pod));
         skip_note(ctx, &format!("big {pod}"), &job);
         if o.dry_run {
             if job.left_out.is_empty() {

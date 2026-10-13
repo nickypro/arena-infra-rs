@@ -277,6 +277,8 @@ fn parse_pod(v: &Value) -> Pod {
         proxy_only: false,
         disk_gb: disk_sum(&[v.get("containerDiskInGb"), v.get("volumeInGb")]),
         volume_gb: disk_sum(&[v.get("volumeInGb")]),
+        delete_protected: None,
+        created_at: None,
     }
 }
 

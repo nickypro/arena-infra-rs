@@ -64,6 +64,20 @@ pub struct Pod {
     /// Never written to JSON, like `disk_gb`.
     #[serde(default, skip_serializing)]
     pub volume_gb: Option<f64>,
+    /// Whether the provider refuses to DELETE this pod: Hetzner's `protection.delete` (set in
+    /// its console). A terminate fails until it's lifted there. Not a lock ([`Self::locked`]):
+    /// stop and restart still work, so the commands that refuse a locked pod don't read it —
+    /// only the auto-reaper does (`crate::reap::lock_state`: a protected server is never a
+    /// candidate, and nothing here ever lifts the protection). `None` = the backend doesn't
+    /// report one (RunPod, Vast), or the field was missing or odd. Left out of the JSON when
+    /// unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_protected: Option<bool>,
+    /// When the provider created the pod (unix seconds; RunPod REST v2's `createdAt`,
+    /// Hetzner's `created`). What the auto-reaper's coverage checks reach back to — a VM's disk
+    /// outlives its reboots (`crate::reap`, R2-1). `None` = not reported (RunPod v1, Vast).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<u64>,
 }
 
 /// A provider-reported maintenance window for the host a pod runs on. Times are kept as
@@ -304,6 +318,8 @@ mod tests {
                 proxy_only: false,
                 disk_gb: None,
                 volume_gb: None,
+                delete_protected: None,
+                created_at: None,
             },
             Pod { id: "1".into(), name: "devtest-flutter".into(), provider: "hetzner".into(), ..Default::default() },
         ];
@@ -329,6 +345,12 @@ mod tests {
         assert_eq!(serde_json::to_string_pretty(&disks).unwrap(), json);
         let read: Pod = serde_json::from_str(r#"{"id":"1","name":"n","provider":"vast","status":"EXITED","disk_gb":32.5}"#).unwrap();
         assert_eq!(read.disk_gb, Some(32.5));
+        // Likewise Hetzner's delete protection: absent where unknown, never `false`.
+        assert!(v[0].get("delete_protected").is_none() && v[1].get("delete_protected").is_none());
+        let protected = Pod { delete_protected: Some(true), ..Pod::default() };
+        let v = serde_json::to_value(&protected).unwrap();
+        assert_eq!(v["delete_protected"], true);
+        assert_eq!(serde_json::from_value::<Pod>(v).unwrap(), protected);
     }
 
     /// Finding #10: `ALLOWED_CUDA_VERSIONS` is a floor (its lowest version), `MIN_CUDA_VERSION`

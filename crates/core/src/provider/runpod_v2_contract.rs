@@ -105,6 +105,8 @@ fn sandbox_pod(name: &str) -> Pod {
         // Every recording is of a 60 GB container disk, no volume.
         disk_gb: Some(60.0),
         volume_gb: Some(0.0),
+        delete_protected: None,
+        created_at: Some(1_791_452_013),
     }
 }
 

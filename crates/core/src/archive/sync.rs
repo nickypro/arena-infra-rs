@@ -53,8 +53,10 @@ pub const GRACE_SECS: u64 = 7200;
 /// rsync's I/O-silence cut-off, as for every other rsync arena runs.
 pub const IO_TIMEOUT_SECS: u64 = crate::pull::RSYNC_IO_TIMEOUT_SECS;
 
-/// The control box's dirs that are never a snapshot label, whatever their name.
-const NOT_LABELS: &[&str] = &[crate::restore::BIG, crate::pull::BASELINE_DIR, crate::pull::TEMP_DIR];
+/// The control box's dirs that are never a snapshot label, whatever their name — the
+/// auto-reaper's `reaped/` (its frozen, verified backups of reaped pods) among them: never a
+/// label, never a custom `--label`, so never pushed, sealed or deleted here.
+const NOT_LABELS: &[&str] = &[crate::restore::BIG, crate::pull::BASELINE_DIR, crate::pull::TEMP_DIR, crate::restore::REAPED];
 
 /// The `wNdM` labels among `names`, oldest first (by week, then day — `w10d1` after `w9d5`).
 pub fn sort_labels<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String> {
@@ -830,7 +832,15 @@ pub fn baseline_job(dir: &Path, weeks: &[u32], pass: SnapPass) -> PushJob {
 /// failure never fails another's). A pod with too many unstorable links is left out (no
 /// include: `--exclude=/*` keeps its dir back) and named in `left_out`.
 pub fn big_job(dir: &Path, pods: &[String]) -> PushJob {
-    let src = dir.join(crate::restore::BIG);
+    big_job_in(&dir.join(crate::restore::BIG), pods)
+}
+
+/// [`big_job`] from the big tier's own root (`pull::big_root`: `LOCAL_BACKUP_BIG_DIR`, its own
+/// volume, else `<dir>/big`). Only `pods`' dirs are included (`--exclude=/*` after them), so
+/// nothing else at that root ever goes — the auto-reaper's `reaped/`, the pull's `.rsync-tmp`,
+/// the tier marker.
+pub fn big_job_in(big_root: &Path, pods: &[String]) -> PushJob {
+    let src = big_root.to_path_buf();
     let trees: Vec<(&str, PathBuf, String)> = pods.iter().map(|p| (p.as_str(), src.join(p), format!("/{p}/"))).collect();
     let skip = skip_for(&src, &trees);
     let mut top_rules: Vec<String> = pods.iter().filter(|p| !skip.left_out.contains(p)).map(|p| format!("--include=/{p}/")).collect();
@@ -1093,13 +1103,28 @@ pub fn failure_hint(f: PushFailure, tier: Tier, current_gb: u32) -> String {
 /// that left before the archive existed, or a misspelt list — and the rest (staff boxes, other
 /// cohorts'). `sync` and `status` list both as "kept on the control box only", apart.
 pub fn control_box_only(dir: &Path, labels: &[String], allowed: &[String], prefix: &str, machine_names: &[String]) -> (Vec<String>, Vec<String>) {
+    control_box_only_in(dir, &dir.join(crate::restore::BIG), labels, allowed, prefix, machine_names)
+}
+
+/// [`control_box_only`] with the big tier at its own root (`pull::big_root`). The auto-reaper's
+/// `reaped/` there (its frozen backups, kept on the control box by design) isn't a pod dir:
+/// never listed.
+pub fn control_box_only_in(
+    dir: &Path,
+    big_root: &Path,
+    labels: &[String],
+    allowed: &[String],
+    prefix: &str,
+    machine_names: &[String],
+) -> (Vec<String>, Vec<String>) {
     let staff: Vec<String> =
         machine_names.iter().filter(|e| crate::naming::is_absolute(e)).map(|e| crate::naming::qualify(prefix, e)).collect();
     let mut cohort: BTreeSet<String> = BTreeSet::new();
     let mut other: BTreeSet<String> = BTreeSet::new();
-    for tree in labels.iter().map(String::as_str).chain([crate::restore::BIG]) {
-        for d in subdirs(&dir.join(tree)).unwrap_or_default() {
-            if allowed.contains(&d) {
+    let trees = labels.iter().map(|l| dir.join(l)).chain([big_root.to_path_buf()]);
+    for tree in trees {
+        for d in subdirs(&tree).unwrap_or_default() {
+            if allowed.contains(&d) || d == crate::restore::REAPED {
                 continue;
             }
             if d.starts_with(&format!("{prefix}-")) && !staff.contains(&d) {
@@ -2151,6 +2176,49 @@ mod tests {
         assert_eq!(ino(&format!("w0d1/arena9-apple/{nb}")), ino(&format!("baseline/w0/fleet/{nb}")));
         assert_eq!(ino(&format!("w0d1/arena9-apple/{nb}")), ino(&format!("w0d1/arena9-bloom/{nb}")));
         assert_ne!(ino("w0d1/arena9-apple/mine.py"), ino("w0d1/arena9-bloom/mine.py"));
+    }
+
+    /// Merge of wave 7 reaper: the auto-reaper's `reaped/` (its frozen, verified backups, on
+    /// the snapshot root and on the big tier's own root) never becomes a snapshot label, a
+    /// custom `--label`, a "control box only" pod or part of a big push — through the real
+    /// rsync too — and `forget` (the archive's only deletion) can't name it. With the big tier
+    /// on its own root (`LOCAL_BACKUP_BIG_DIR`), the big push reads from there.
+    #[test]
+    fn reaped_is_never_a_label_never_pushed_and_never_forgotten() {
+        let t = tmp("reaped");
+        let (snap, big) = (t.0.join("backup"), t.0.join("bigvol"));
+        for p in [
+            "w0d1/arena9-apple/a.py",
+            "reaped/arena9-apple/20261012T000000Z-runpod-p1/snapshot/a.py",
+            "big-unused/x",
+        ] {
+            write(&snap.join(p), "x");
+        }
+        for p in ["arena9-apple/big.bin", "reaped/arena9-apple/20261012T000000Z-runpod-p1/big/big.bin", ".rsync-tmp/partial"] {
+            write(&big.join(p), "x");
+        }
+        assert_eq!(local_labels(&snap).unwrap(), ["w0d1"]);
+        assert!(!custom_labels(&snap).contains(&"reaped".to_string()), "{:?}", custom_labels(&snap));
+        assert!(!valid_custom_label("reaped"));
+        let allowed = vec!["arena9-apple".to_string()];
+        let (cohort, other) = control_box_only_in(&snap, &big, &["w0d1".into()], &allowed, "arena9", &[]);
+        assert!(cohort.is_empty() && other.is_empty(), "{cohort:?} {other:?}");
+        // Single-volume layout too: `<dir>/big/reaped` is no pod dir.
+        write(&snap.join("big/reaped/arena9-apple/S/big/big.bin"), "x");
+        let (cohort, other) = control_box_only(&snap, &["w0d1".into()], &allowed, "arena9", &[]);
+        assert!(cohort.is_empty() && other.is_empty(), "{cohort:?} {other:?}");
+        // The big push from the big root: its rules take the pod's dir and nothing else.
+        let job = big_job_in(&big, &allowed);
+        assert_eq!(job.src, big.display().to_string());
+        assert_eq!(job.top_rules, ["--include=/arena9-apple/", "--exclude=/*"]);
+        if std::process::Command::new("rsync").arg("--version").output().is_ok() {
+            let o = push_local(&job, &settings(""), &t.0);
+            assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+            assert!(t.0.join("push/big/arena9-apple/big.bin").is_file());
+            assert!(!t.0.join("push/big/reaped").exists() && !t.0.join("push/big/.rsync-tmp").exists());
+        }
+        // `forget` names this cohort's pods (and twins) only — never `reaped`.
+        assert!(forget_dirs("arena9", "reaped", &[]).unwrap().iter().all(|d| d != "reaped"));
     }
 
     #[test]

@@ -207,6 +207,14 @@ impl Provider for MultiProvider {
     async fn terminate_pod(&self, id: &str) -> Result<()> {
         self.backend_for(id).await?.terminate_pod(id).await
     }
+    async fn terminate_pod_on(&self, provider: &str, id: &str) -> Result<()> {
+        // By name alone — no id cache, no fallback: a backend that isn't configured (or a
+        // name that isn't one) is refused before any request.
+        match self.backends.iter().find(|b| b.name() == provider) {
+            Some(b) => b.terminate_pod(id).await,
+            None => Err(Error::provider(format!("no configured provider `{provider}` — pod {id} not terminated"))),
+        }
+    }
     async fn rename_pod(&self, id: &str, new_name: &str) -> Result<()> {
         self.backend_for(id).await?.rename_pod(id, new_name).await
     }
@@ -612,6 +620,69 @@ mod tests {
         assert!(m.check_create_extra(&extra).unwrap_err().to_string().contains("isn't supported on provider `vast`"));
         m.primary = 1;
         assert!(m.check_create_extra(&extra).is_ok());
+    }
+
+    /// A backend recording which ids it terminated.
+    struct Terminates {
+        name: &'static str,
+        pods: Vec<Pod>,
+        gone: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl Provider for Terminates {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        fn describe(&self, _spec: &PodSpec) -> String {
+            String::new()
+        }
+        async fn list_pods(&self) -> Result<Vec<Pod>> {
+            Ok(self.pods.clone())
+        }
+        async fn create_pod(&self, _spec: &PodSpec) -> Result<Pod> {
+            unimplemented!("not exercised")
+        }
+        async fn stop_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn restart_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn terminate_pod(&self, id: &str) -> Result<()> {
+            self.gone.lock().unwrap().push(format!("{}:{id}", self.name));
+            Ok(())
+        }
+    }
+
+    /// The reaper's terminate goes to the backend NAMED, whatever the id cache says: a Vast
+    /// instance and a Hetzner server can share a numeric id, and by id the cache holds only
+    /// one of them. An unconfigured name is refused with no call.
+    #[tokio::test]
+    async fn terminate_on_routes_by_name_never_by_the_id_cache() {
+        let gone = Arc::new(Mutex::new(Vec::new()));
+        let m = MultiProvider {
+            backends: vec![
+                Box::new(Terminates { name: "vast", pods: vec![tagged_pod("7", "vast")], gone: gone.clone() }),
+                Box::new(Terminates { name: "hetzner", pods: vec![tagged_pod("7", "hetzner")], gone: gone.clone() }),
+            ],
+            primary: 0,
+            owner: std::sync::Mutex::new(HashMap::new()),
+            warn_on_partial: false,
+            list_timeout: crate::provider::LIST_TIMEOUT,
+        };
+        m.list_by_provider().await; // the cache now maps "7" to one of them
+        m.terminate_pod_on("vast", "7").await.unwrap();
+        m.terminate_pod_on("hetzner", "7").await.unwrap();
+        assert_eq!(*gone.lock().unwrap(), ["vast:7", "hetzner:7"]);
+        let e = m.terminate_pod_on("runpod", "7").await.unwrap_err().to_string();
+        assert!(e.contains("no configured provider `runpod`"), "{e}");
+        assert_eq!(gone.lock().unwrap().len(), 2, "nothing terminated for an unknown backend");
+        // A single backend refuses another's name the same way (the default impl).
+        let single = Terminates { name: "hetzner", pods: Vec::new(), gone: gone.clone() };
+        assert!(single.terminate_pod_on("vast", "7").await.is_err());
+        single.terminate_pod_on("hetzner", "8").await.unwrap();
+        assert_eq!(gone.lock().unwrap().last().map(String::as_str), Some("hetzner:8"));
     }
 
     #[tokio::test]

@@ -137,7 +137,7 @@ fn one_line(s: &str) -> String {
 
 /// Truncate to `max` chars with an ellipsis, so free text can't blow up a table row.
 /// (Also clips `pods test --deep`'s NOTES column.)
-pub(crate) fn clip(s: &str, max: usize) -> String {
+pub fn clip(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {
@@ -331,8 +331,31 @@ pub fn pod_cells(p: &Pod) -> Vec<String> {
 /// The `pods list` table: NAME PROVIDER ID STATUS GPU $/H ENDPOINT MAINT, one row per pod
 /// in the given order (the caller sorts).
 pub fn render_pods_table(pods: &[Pod]) -> String {
-    let rows: Vec<Vec<String>> = pods.iter().map(pod_cells).collect();
-    table::render(&POD_HEADERS, &POD_ALIGN, &rows)
+    render_pods_table_with(pods, None)
+}
+
+/// [`render_pods_table`] with the auto-reaper's `ENDS` column (`ends[i]` for `pods[i]`, from
+/// `crate::reap::render::ends_label`) before MAINT — `None` = no column (the reaper keeps no
+/// state here), so the table is unchanged for everyone not using it.
+pub fn render_pods_table_with(pods: &[Pod], ends: Option<&[String]>) -> String {
+    let Some(ends) = ends.filter(|e| e.len() == pods.len()) else {
+        let rows: Vec<Vec<String>> = pods.iter().map(pod_cells).collect();
+        return table::render(&POD_HEADERS, &POD_ALIGN, &rows);
+    };
+    let mut headers: Vec<&str> = POD_HEADERS.to_vec();
+    headers.insert(headers.len() - 1, "ENDS");
+    let mut align: Vec<Align> = POD_ALIGN.to_vec();
+    align.insert(align.len() - 1, Align::Left);
+    let rows: Vec<Vec<String>> = pods
+        .iter()
+        .zip(ends)
+        .map(|(p, e)| {
+            let mut c = pod_cells(p);
+            c.insert(c.len() - 1, e.clone());
+            c
+        })
+        .collect();
+    table::render(&headers, &align, &rows)
 }
 
 #[cfg(test)]
@@ -398,6 +421,20 @@ mod tests {
         for (ty, n, want) in cases {
             assert_eq!(gpu_label(&mk(*ty, *n)), *want, "{ty:?} {n:?}");
         }
+    }
+
+    /// The ENDS column sits before MAINT, and only when given (one label per pod).
+    #[test]
+    fn ends_column_only_when_given() {
+        let pods = vec![pod("devtest-a", "runpod", "RUNNING"), pod("devtest-b", "hetzner", "RUNNING")];
+        let plain = render_pods_table(&pods);
+        assert!(!plain.contains("ENDS"));
+        let ends = vec!["18:00 (in 5h)".to_string(), "-".to_string()];
+        let with = render_pods_table_with(&pods, Some(&ends));
+        let header = with.lines().next().unwrap();
+        assert!(header.find("ENDS").unwrap() < header.find("MAINT").unwrap(), "{header}");
+        assert!(with.lines().nth(1).unwrap().contains("18:00 (in 5h)"), "{with}");
+        assert_eq!(render_pods_table_with(&pods, Some(&ends[..1])), plain, "a mismatched column is left out");
     }
 
     #[test]
@@ -592,6 +629,8 @@ mod tests {
                 proxy_only: false,
                 disk_gb: None,
                 volume_gb: None,
+                delete_protected: None,
+                created_at: None,
             },
             Pod {
                 id: "def456".into(),

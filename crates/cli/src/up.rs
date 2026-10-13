@@ -170,6 +170,8 @@ pub(crate) struct UpRun<'a> {
     /// returns — as the create phase does for the first pods (`OnMade`) — so a later listing
     /// with no price (RunPod v1's REST list) still prices it. `None`: not remembered.
     pub balance: Option<&'a crate::money::BalanceCtx>,
+    /// `--expire-*`/`--idle-after` given: write each pod's reap notice once it's set up (RR11).
+    pub reap_notice: bool,
 }
 
 /// The per-pod part of `up`'s plan, for the dry-run and the confirm prompt.
@@ -731,6 +733,16 @@ impl Shared<'_, '_> {
                     return self.end(run, Verdict::Failed { stage: Stage::Endpoint, reason });
                 }
                 Some(Ok(())) => {}
+            }
+        }
+
+        // The participant's notice of the reap policy this pod was created with (RR11): after
+        // setup, whose rc files the banner goes into. Best effort — said, never fatal.
+        if self.run.reap_notice {
+            match crate::reap::reassert_notice(self.run.remote.as_ref(), self.run.cfg, &pod, &target).await {
+                Ok(true) => say(To::Out, &format!("[{name}] reap notice ✓")),
+                Ok(false) => {}
+                Err(why) => say(To::Err, &format!("[{name}] reap notice not written ({why}) — `arena pods reap set {name} …` writes it")),
             }
         }
 
@@ -1800,6 +1812,7 @@ mod tests {
             lock: false,
             retry_bad_hosts: false,
             balance: None,
+            reap_notice: false,
         }
     }
 
@@ -3026,6 +3039,7 @@ mod tests {
             image: None,
             bootstrap: false,
             api_json: None,
+            reap: crate::ReapAtCreate::default(),
             dry_run: false,
             no_wait: false,
             keep_trying: false,
@@ -3063,6 +3077,7 @@ mod tests {
             image: None,
             bootstrap: false,
             api_json: None,
+            reap: crate::ReapAtCreate::default(),
             dry_run: false,
             no_wait: false,
             keep_trying: false,

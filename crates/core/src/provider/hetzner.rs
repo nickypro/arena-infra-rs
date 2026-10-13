@@ -213,6 +213,16 @@ fn parse_server(v: &Value) -> Pod {
         // A Hetzner server bills whole while it exists: its disk is never priced apart.
         disk_gb: None,
         volume_gb: None,
+        // `protection.delete` (a bool on every server): the API refuses a DELETE while it's
+        // set. Read for the auto-reaper, which never reaps a protected server; anything but a
+        // bool there is `None` (unknown — never read as "unprotected").
+        delete_protected: v.get("protection").and_then(|p| p.get("delete")).and_then(Value::as_bool),
+        // `created`: ISO-8601 with an offset (`2016-01-30T23:50:00+00:00`).
+        created_at: v
+            .get("created")
+            .and_then(Value::as_str)
+            .and_then(crate::reap::parse_rfc3339)
+            .and_then(|t| u64::try_from(t).ok()),
     }
 }
 
@@ -511,6 +521,41 @@ mod tests {
         assert_eq!(p.ssh_ip.as_deref(), Some("1.2.3.4"));
         assert_eq!(p.ssh_port, Some(22)); // plain SSH on a cloud VM
         assert_eq!(p.provider, "hetzner");
+        assert_eq!(p.created_at, None, "no `created`: unknown");
+    }
+
+    /// `created` (the API's ISO-8601 with an offset) is the server's creation — what the
+    /// reaper's coverage checks reach back to, across reboots (R2-1). Anything odd: unknown.
+    #[test]
+    fn parses_the_servers_creation_time() {
+        let at = |c: serde_json::Value| parse_server(&json!({"id": 1, "name": "devtest-a", "status": "running", "created": c})).created_at;
+        assert_eq!(at(json!("2016-01-30T23:50:00+00:00")), Some(1_454_197_800));
+        assert_eq!(at(json!("2016-01-31T00:50:00+01:00")), Some(1_454_197_800));
+        for odd in [json!("yesterday"), json!(1_454_197_800), json!(null), json!("2016-02-30T00:00:00+00:00")] {
+            assert_eq!(at(odd.clone()), None, "{odd}");
+        }
+    }
+
+    /// `protection.delete` is read for the reaper (on, off) — and anything else, a missing
+    /// block or a non-bool, is unknown, never "unprotected". It is not a lock: `locked` stays
+    /// `None`, so stop/restart's lock refusals don't read it.
+    #[test]
+    fn delete_protection_is_read_and_unknown_when_odd() {
+        let with = |protection: serde_json::Value| {
+            let mut v = json!({"id": 9, "name": "devtest-alpha", "status": "running"});
+            if !protection.is_null() {
+                v["protection"] = protection;
+            }
+            parse_server(&v)
+        };
+        assert_eq!(with(json!({"delete": true, "rebuild": true})).delete_protected, Some(true));
+        assert_eq!(with(json!({"delete": false, "rebuild": false})).delete_protected, Some(false));
+        for odd in [json!(null), json!({}), json!({"delete": "true"}), json!({"delete": 1}), json!("on")] {
+            let p = with(odd.clone());
+            assert_eq!(p.delete_protected, None, "{odd}");
+            assert_eq!(p.locked, None, "{odd}");
+        }
+        assert_eq!(with(json!({"delete": true})).locked, None, "protection is not a lock");
     }
 
     #[test]

@@ -334,6 +334,133 @@ impl PullConfig {
     pub fn big_tier() -> Self {
         Self { max_size: None, min_size: None, ..Self::default() }
     }
+
+    /// The auto-reaper's final copy (`crate::reap`, RS2): the big tier, but keeping EVERYTHING
+    /// in the home except [`REAP_NOT_KEPT`] — dot-directories included (`~/.config`,
+    /// `~/.ipython`, `~/.jupyter`, `~/.local/bin`, `~/.arena/jobs` logs, VS Code's local history …),
+    /// which the regular tiers drop. What it still doesn't keep is either reconstructable or
+    /// a secret ([`REAP_NOT_KEPT`]: documented, never a veto) or a sweep folder
+    /// ([`REAP_VETOED`]: never copied, and a pod with any file there is never reaped — the
+    /// probe's `uncovered` fact). Hugging Face: only the re-downloadable hub cache
+    /// ([`REAP_HF_NOT_KEPT`]) is left out; everything else under `~/.cache/huggingface/` (and
+    /// any `huggingface/`/`hf_cache/` folder — a `save_pretrained` there) is copied (R2-1).
+    /// Never deletes.
+    pub fn reap_tier() -> Self {
+        let mut s = Self::big_tier();
+        // First match wins: the hub cache out, then the rest of ~/.cache/huggingface in, then
+        // every other cache out.
+        s.first_excludes = REAP_HF_NOT_KEPT.iter().map(|e| e.to_string()).collect();
+        s.includes.extend(["/.cache/", "/.cache/huggingface/", "/.cache/huggingface/**"].map(String::from));
+        s.excludes = REAP_NOT_KEPT.iter().chain(REAP_VETOED).map(|e| e.to_string()).collect();
+        s
+    }
+}
+
+/// What a reap's backup ([`PullConfig::reap_tier`]) leaves out because it is reconstructable,
+/// a cache, a secret or ours — the documented list a reap may lose, never a veto: package and
+/// build caches (`~/.cache/*` — pip, uv, torch — but `~/.cache/huggingface/` (see
+/// [`REAP_HF_NOT_KEPT`]), any other `.cache/`, `__pycache__/`, `.npm/`, `.triton/`, `.nv/`),
+/// installed packages (`site-packages/`, `venv/`, `.venv/`, `node_modules/`, `~/.local/lib/` —
+/// pip `--user` —, uv's Pythons), Hugging Face hub entries wherever the hub cache is
+/// (`models--*/`, `datasets--*/` — public, re-downloadable), the VS Code server's
+/// own binaries and extensions (setup reinstalls them; its `data/` — settings, local history —
+/// IS kept), `.ssh/` (keys: setup's, and secrets a backup volume shouldn't hold), and the
+/// image's checkout setup moved aside when the repo went onto `/workspace` (a copy from the
+/// image, as the regular tiers skip it; a pod with work on `/workspace` is never reaped).
+pub const REAP_NOT_KEPT: &[&str] = &[
+    "/.cache/*",
+    ".cache/",
+    "__pycache__/",
+    ".npm/",
+    ".triton/",
+    ".nv/",
+    "site-packages/",
+    "venv/",
+    ".venv/",
+    "node_modules/",
+    "/.local/lib/",
+    "/.local/share/uv/",
+    "models--*/",
+    "datasets--*/",
+    "/.vscode-server/bin/",
+    "/.vscode-server/cli/",
+    "/.vscode-server/extensions/",
+    ".ssh/",
+    "*.arena-aside-*/",
+];
+
+/// The Hugging Face hub cache in `~/.cache/huggingface/` — the re-downloadable part, left out of
+/// a reap's backup ahead of everything (the rest of that folder is copied).
+pub const REAP_HF_NOT_KEPT: &[&str] = &["/.cache/huggingface/hub/", "/.cache/huggingface/xet/"];
+
+/// What a reap's backup never copies AND never loses: sweep/RLVR run folders (large; "do all
+/// run work here"). A pod with any file there at all (a placeholder aside) is `NotCovered` —
+/// never reaped (the probe's `uncovered`, RS2, R2-1).
+pub const REAP_VETOED: &[&str] = &["TEMP_FOLDER_FOR_SWEEPS/"];
+
+/// Counts of a tree: regular files, their bytes, directories, symlinks, and anything else
+/// (devices, fifos, sockets) — what a frozen copy is checked against ([`link_tree`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TreeCount {
+    pub files: u64,
+    pub bytes: u64,
+    pub dirs: u64,
+    pub links: u64,
+    pub other: u64,
+}
+
+/// Count `root`'s tree (never following a symlink).
+pub fn tree_count(root: &Path) -> std::io::Result<TreeCount> {
+    let mut c = TreeCount::default();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(&dir)? {
+            let e = e?;
+            let t = e.file_type()?;
+            if t.is_dir() {
+                c.dirs += 1;
+                stack.push(e.path());
+            } else if t.is_symlink() {
+                c.links += 1;
+            } else if t.is_file() {
+                c.files += 1;
+                c.bytes += e.metadata()?.len();
+            } else {
+                c.other += 1;
+            }
+        }
+    }
+    Ok(c)
+}
+
+/// `cp -al src dst`: a hard-link copy of the tree `src` at `dst` (which must not exist; its
+/// parent is created) — directories made anew, symlinks re-created as links, everything else
+/// (regular files, and a fifo or socket rsync carried) hard-linked: same filesystem, no space
+/// used, and a later rsync into `src` writes a changed file as a NEW inode, so the copy keeps
+/// what it had. Returns the counts of the copy, for the caller to hold against `src`'s.
+pub fn link_tree(src: &Path, dst: &Path) -> std::io::Result<TreeCount> {
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::create_dir(dst)?;
+    let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
+    while let Some((from, to)) = stack.pop() {
+        for e in std::fs::read_dir(&from)? {
+            let e = e?;
+            let t = e.file_type()?;
+            let target = to.join(e.file_name());
+            if t.is_dir() {
+                std::fs::create_dir(&target)?;
+                stack.push((e.path(), target));
+            } else if t.is_symlink() {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(std::fs::read_link(e.path())?, &target)?;
+            } else {
+                std::fs::hard_link(e.path(), &target)?;
+            }
+        }
+    }
+    tree_count(dst)
 }
 
 /// The default wall-clock budget for one pod's backup rsync (`BACKUP_TIMEOUT_SECS`): 2 hours.
@@ -374,6 +501,171 @@ pub fn local_dest(base: &str, label: &str, pod_name: &str) -> String {
 /// multi-GB checkpoint is stored once instead of re-copied into each day's snapshot.
 pub fn big_dest(base: &str, pod_name: &str) -> String {
     format!("{}/big/{pod_name}/", base.trim_end_matches('/'))
+}
+
+/// Where the big (all-files) tier lives: `LOCAL_BACKUP_BIG_DIR` when set — its own volume,
+/// so a big tier that only ever grows can't starve the dated snapshots (or `/`) of space —
+/// else `<LOCAL_BACKUP_DIR>/big`, today's layout. A trailing `/` is dropped.
+pub fn big_root(local_backup_dir: &str, big_dir: Option<&str>) -> String {
+    match big_dir.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) => {
+            let t = d.trim_end_matches('/');
+            if t.is_empty() { "/".to_string() } else { t.to_string() }
+        }
+        None => format!("{}/big", local_backup_dir.trim_end_matches('/')),
+    }
+}
+
+/// A pod's big-tier destination under the big root `root`: `<root>/<pod>/` (the trailing
+/// slash matters to rsync). [`big_dest`] is this under `<base>/big`.
+pub fn big_dest_in(root: &str, pod_name: &str) -> String {
+    format!("{}/{pod_name}/", root.trim_end_matches('/'))
+}
+
+/// The marker file at the root of each backup tier's volume, written once by hand when the
+/// volume is formatted: its first line is exactly the tier's word ([`Tier::word`]). What
+/// catches an unmounted volume: with `nofail` a missing volume leaves an empty mountpoint on
+/// `/`, and an rsync into it "succeeds" — filling the root disk with a backup nobody will
+/// find. The reaper always requires the markers; `pods pull`/`backup` only in two-volume mode
+/// (`LOCAL_BACKUP_BIG_DIR` set).
+pub const TIER_MARKER: &str = ".arena-backup-tier";
+
+/// The two backup tiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier {
+    /// The dated small-file snapshots (`<LOCAL_BACKUP_DIR>/<wNdM>/<pod>/`).
+    Snapshot,
+    /// The all-files tier ([`big_root`]).
+    Big,
+}
+
+impl Tier {
+    /// The marker's first line for this tier.
+    pub fn word(self) -> &'static str {
+        match self {
+            Tier::Snapshot => "snapshot",
+            Tier::Big => "big",
+        }
+    }
+}
+
+/// Whether a [`TIER_MARKER`]'s text marks `tier`: its first line is exactly the tier's word
+/// (a trailing `\r` from an editor tolerated, nothing else). Pure.
+pub fn tier_marker_ok(text: &str, tier: Tier) -> bool {
+    text.lines().next().map(|l| l.strip_suffix('\r').unwrap_or(l)) == Some(tier.word())
+}
+
+/// Read `root`'s [`TIER_MARKER`] and check it marks `tier`: `Err` says what's wrong (no
+/// marker — the volume not mounted? — or the other tier's).
+pub fn check_tier_marker(root: &Path, tier: Tier) -> std::result::Result<(), String> {
+    let path = root.join(TIER_MARKER);
+    match std::fs::read_to_string(&path) {
+        Ok(text) if tier_marker_ok(&text, tier) => Ok(()),
+        Ok(_) => Err(format!("{} doesn't say `{}` — the wrong volume mounted there?", path.display(), tier.word())),
+        Err(e) => Err(format!(
+            "no tier marker {} ({e}) — is the {} volume mounted? (create it once with `printf '{}\\n' > {}`)",
+            path.display(),
+            tier.word(),
+            tier.word(),
+            path.display()
+        )),
+    }
+}
+
+/// Bytes free for an unprivileged writer on the filesystem holding `path` (`statvfs`:
+/// `f_bavail × f_frsize`) — what the reaper's free-space floor is checked against.
+#[cfg(unix)]
+pub fn free_bytes(path: &Path) -> std::io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path holds a NUL byte"))?;
+    // SAFETY: statvfs(3) on a NUL-terminated path into a zeroed struct we own.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+}
+
+/// No `statvfs` off unix: unknown, which the reaper reads as "not enough".
+#[cfg(not(unix))]
+pub fn free_bytes(_path: &Path) -> std::io::Result<u64> {
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "free space unknown on this platform"))
+}
+
+/// The rsync argv that checks a finished tier: [`rsync_args`] plus `--dry-run` — with
+/// `--stats` (always passed) it reports how many files a real run would still send
+/// ([`parse_rsync_stats`]'s `files_sent`): 0 = the destination holds everything the source
+/// has, as the tier's rules select it.
+pub fn verify_args(target: &SshTarget, pc: &PullConfig, local_dest: &str) -> Vec<String> {
+    let mut a = vec!["--dry-run".to_string()];
+    a.extend(rsync_args(target, pc, local_dest));
+    a
+}
+
+/// Where the per-pod backup lock lives: `<dir>/.arena-locks/<pod>.lock`, `dir` being the
+/// backup dir a run writes (`LOCAL_BACKUP_DIR` — a value every user shares, unlike the state
+/// dir). Every writer of a pod's backup takes it — `pods pull`, `pods backup` and the
+/// reaper's probe and backup — so our own backup SSH sessions never overlap a reaper probe
+/// (where they'd count as activity) or each other. The pod name is reduced to a safe file
+/// name.
+pub fn pod_lock_path(local_backup_dir: &str, pod: &str) -> PathBuf {
+    let safe: String = pod.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' }).collect();
+    let safe = if safe.is_empty() || safe.chars().all(|c| c == '.') { "_".to_string() } else { safe };
+    Path::new(local_backup_dir).join(".arena-locks").join(format!("{safe}.lock"))
+}
+
+/// Open (creating) a pod's backup lock file ([`pod_lock_path`]) — not locked yet. Only inside
+/// a backup dir that already EXISTS: the lock never creates `local_backup_dir` or a parent of
+/// it (a pull creates its destination the way it always did — with the umask's mode; a
+/// git-only backup never touched it). The `.arena-locks` folder alone is made, 0700. A
+/// missing backup dir is `NotFound`.
+pub fn open_pod_lock(local_backup_dir: &str, pod: &str) -> std::io::Result<std::fs::File> {
+    let base = Path::new(local_backup_dir);
+    if !base.is_dir() {
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("{} doesn't exist", base.display())));
+    }
+    let path = pod_lock_path(local_backup_dir, pod);
+    if let Some(dir) = path.parent() {
+        let mut b = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            b.mode(0o700);
+        }
+        match b.create(dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => {}
+            Err(e) => return Err(e),
+        }
+    }
+    std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path)
+}
+
+/// A one-pod writer's lock (the TUI's git backup, RR10), without waiting: `Ok(Some(lock))`
+/// held until dropped; `Ok(None)` no lock to take — a relative or missing backup dir, or a
+/// lock that can't be opened, as before the locks; `Err(())` another backup of the pod (a
+/// pull, the cron's push, the reaper) holds it.
+pub fn try_pod_lock_now(local_backup_dir: &str, pod: &str) -> std::result::Result<Option<std::fs::File>, ()> {
+    if !Path::new(local_backup_dir).is_absolute() {
+        return Ok(None);
+    }
+    let Ok(f) = open_pod_lock(local_backup_dir, pod) else { return Ok(None) };
+    match try_lock(&f) {
+        Ok(true) => Ok(Some(f)),
+        Ok(false) => Err(()),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Take `lock` exclusively without waiting: `Ok(true)` taken (held until the file is
+/// dropped), `Ok(false)` someone else holds it.
+pub fn try_lock(lock: &std::fs::File) -> std::io::Result<bool> {
+    match lock.try_lock() {
+        Ok(()) => Ok(true),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
 }
 
 /// Build the `rsync` argv (everything after the program name) to pull `target`'s home
@@ -943,6 +1235,87 @@ mod tests {
             connect_timeout_secs: 10,
             host_keys: Default::default(),
         }
+    }
+
+    /// The big tier's root: its own volume when configured, else today's `<dir>/big`.
+    #[test]
+    fn big_root_follows_local_backup_big_dir() {
+        assert_eq!(big_root("/b", None), "/b/big");
+        assert_eq!(big_root("/b/", Some("  ")), "/b/big");
+        assert_eq!(big_root("/b", Some("/mnt/big/")), "/mnt/big");
+        assert_eq!(big_root("./backup", None), "./backup/big");
+        assert_eq!(big_dest_in("/mnt/big", "devtest-a"), "/mnt/big/devtest-a/");
+        assert_eq!(big_dest_in(&big_root("/b", None), "devtest-a"), big_dest("/b", "devtest-a"));
+    }
+
+    /// A marker's first line must be exactly its tier's word.
+    #[test]
+    fn tier_markers_are_exact() {
+        for (text, tier, ok) in [
+            ("snapshot\n", Tier::Snapshot, true),
+            ("snapshot", Tier::Snapshot, true),
+            ("snapshot\r\nformatted 2026-10-01\n", Tier::Snapshot, true),
+            ("big\n", Tier::Big, true),
+            ("big\n", Tier::Snapshot, false),
+            ("snapshot\n", Tier::Big, false),
+            (" big\n", Tier::Big, false),
+            ("big \n", Tier::Big, false),
+            ("BIG\n", Tier::Big, false),
+            ("", Tier::Big, false),
+            ("\nbig\n", Tier::Big, false),
+        ] {
+            assert_eq!(tier_marker_ok(text, tier), ok, "{text:?} {tier:?}");
+        }
+        let d = std::env::temp_dir().join(format!("arena-pull-marker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        assert!(check_tier_marker(&d, Tier::Big).unwrap_err().contains("is the big volume mounted?"));
+        std::fs::write(d.join(TIER_MARKER), "snapshot\n").unwrap();
+        assert!(check_tier_marker(&d, Tier::Snapshot).is_ok());
+        assert!(check_tier_marker(&d, Tier::Big).unwrap_err().contains("doesn't say `big`"));
+        assert!(free_bytes(&d).unwrap() > 0);
+        assert!(free_bytes(&d.join("missing")).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The verify is the tier's own rsync, as a dry run.
+    #[test]
+    fn verify_args_are_the_tiers_args_as_a_dry_run() {
+        let pc = PullConfig::big_tier();
+        let v = verify_args(&target(), &pc, "/b/big/devtest-a/");
+        assert_eq!(v[0], "--dry-run");
+        assert_eq!(&v[1..], rsync_args(&target(), &pc, "/b/big/devtest-a/").as_slice());
+        assert!(v.contains(&"--stats".to_string()));
+    }
+
+    /// One lock per pod, in the backup dir; a second holder is told it's busy until the
+    /// first lets go.
+    #[test]
+    fn pod_locks_exclude_each_other() {
+        assert_eq!(pod_lock_path("/b", "devtest-a"), Path::new("/b/.arena-locks/devtest-a.lock"));
+        assert_eq!(pod_lock_path("/b", "../x"), Path::new("/b/.arena-locks/.._x.lock"));
+        assert_eq!(pod_lock_path("/b", ".."), Path::new("/b/.arena-locks/_.lock"));
+        let d = std::env::temp_dir().join(format!("arena-pull-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let dir = d.display().to_string();
+        // RR5: never in a backup dir that isn't there (the lock doesn't create it).
+        assert_eq!(open_pod_lock(&dir, "devtest-a").unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        assert!(!d.exists());
+        assert_eq!(try_pod_lock_now(&dir, "devtest-a").map(|l| l.is_none()), Ok(true), "nothing to take: as before the locks");
+        std::fs::create_dir_all(&d).unwrap();
+        let a = open_pod_lock(&dir, "devtest-a").unwrap();
+        let b = open_pod_lock(&dir, "devtest-a").unwrap();
+        let other = open_pod_lock(&dir, "devtest-b").unwrap();
+        assert!(try_lock(&a).unwrap());
+        assert!(!try_lock(&b).unwrap(), "held by `a`");
+        assert!(try_lock(&other).unwrap(), "another pod's lock is its own");
+        assert_eq!(try_pod_lock_now(&dir, "devtest-a").map(|l| l.is_some()), Err(()), "busy");
+        drop(a);
+        assert!(try_lock(&b).unwrap(), "free once `a` is dropped");
+        drop(b);
+        assert_eq!(try_pod_lock_now(&dir, "devtest-a").map(|l| l.is_some()), Ok(true));
+        assert_eq!(try_pod_lock_now("relative/backup", "devtest-a").map(|l| l.is_none()), Ok(true));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
@@ -1674,5 +2047,126 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let back: Vec<String> = String::from_utf8_lossy(&o.stdout).lines().map(String::from).collect();
         assert_eq!(back, rsync_args(&target(), &pc, dest), "{line}");
+    }
+
+    /// RS2: the reap's tier through the real rsync — what it keeps (dot-directories with work
+    /// in them, `.git`, `.claude`, shell rc files, big files) and what it leaves out (only the
+    /// documented caches, secrets and the sweep folder).
+    #[cfg(unix)]
+    #[test]
+    fn the_reap_tier_keeps_participant_data() {
+        if std::process::Command::new("rsync").arg("--version").output().is_err() {
+            eprintln!("rsync not installed — skipping");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("arena-pull-reaptier-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (src, dst) = (root.join("src"), root.join("dst"));
+        let kept = [
+            "notes.txt",
+            "work/model.pt",
+            "ARENA_materials/.git/HEAD",
+            "ARENA_materials/chapter1/solutions.ipynb",
+            ".ipython/profile_default/history.sqlite",
+            ".jupyter/lab/workspaces/default.json",
+            ".config/wandb/settings",
+            ".local/bin/mytool",
+            ".local/share/jupyter/kernels/k.json",
+            ".vscode-server/data/User/History/1/entry.py",
+            ".claude/projects/p.jsonl",
+            ".arena/jobs/20261012-1/out.log",
+            ".bashrc",
+            ".hidden_scratch/run.py",
+            // R2-1: only the hub cache of Hugging Face is left out.
+            ".cache/huggingface/token",
+            ".cache/huggingface/datasets/my_set/data.arrow",
+            "hf_cache/finetuned/model.safetensors",
+            "data/huggingface/my_model/config.json",
+        ];
+        let not_kept = [
+            ".cache/pip/wheel",
+            "ARENA_materials/__pycache__/m.pyc",
+            "venv/lib/x.py",
+            ".venv/lib/x.py",
+            "node_modules/x/index.js",
+            ".local/lib/python3.11/site-packages/x.py",
+            ".local/share/uv/python/p",
+            "hf_cache/models--gpt2/blob",
+            ".cache/huggingface/hub/models--gpt2/blobs/x",
+            ".cache/huggingface/xet/chunk",
+            ".cache/torch/hub/x",
+            ".vscode-server/bin/abc/node",
+            ".vscode-server/extensions/ms-python/x",
+            ".ssh/id_ed25519",
+            ".triton/cache/x",
+            "ARENA_materials/TEMP_FOLDER_FOR_SWEEPS/run1/ckpt.pt",
+            "ARENA_materials.arena-aside-20261001T000000Z/README.md",
+        ];
+        for f in kept.iter().chain(&not_kept) {
+            let p = src.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, f).unwrap();
+        }
+        std::fs::create_dir_all(&dst).unwrap();
+        let mut args = rsync_args(&target(), &PullConfig::reap_tier(), &format!("{}/", dst.display()));
+        let e = args.iter().position(|a| a == "-e").unwrap();
+        args.drain(e..e + 2);
+        let n = args.len();
+        args[n - 2] = format!("{}/", src.display());
+        let out = std::process::Command::new("rsync").args(&args).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        for f in kept {
+            assert!(dst.join(f).is_file(), "the reap's backup must keep {f}");
+        }
+        for f in not_kept {
+            assert!(!dst.join(f).exists(), "documented as not kept, yet copied: {f}");
+        }
+        // The documented list is the whole filter: no other exclude, no size cap.
+        let pc = PullConfig::reap_tier();
+        assert!(pc.max_size.is_none() && pc.min_size.is_none());
+        assert_eq!(pc.first_excludes, REAP_HF_NOT_KEPT.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+        assert_eq!(pc.excludes, REAP_NOT_KEPT.iter().chain(REAP_VETOED).map(|e| e.to_string()).collect::<Vec<_>>());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// RS1: a frozen copy (`link_tree`) holds the tree as it was — counted equal, every kind of
+    /// entry carried — and a later rsync into the original (a same-named successor's pull)
+    /// changes nothing in it: rsync writes a changed file as a new inode.
+    #[cfg(unix)]
+    #[test]
+    fn a_frozen_copy_survives_a_later_pull_into_the_original() {
+        let root = std::env::temp_dir().join(format!("arena-pull-freeze-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (live, frozen, next) = (root.join("big/devtest-alpha"), root.join("reaped/devtest-alpha/S-runpod-p1/big"), root.join("next"));
+        std::fs::create_dir_all(live.join("sub/empty")).unwrap();
+        std::fs::write(live.join("notebook.ipynb"), "v1 of the participant's work").unwrap();
+        std::fs::write(live.join("sub/data.bin"), [0u8; 4096]).unwrap();
+        std::os::unix::fs::symlink("notebook.ipynb", live.join("latest")).unwrap();
+        let fifo = live.join("sub/pipe");
+        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        let before = tree_count(&live).unwrap();
+        assert_eq!(before, TreeCount { files: 2, bytes: 28 + 4096, dirs: 2, links: 1, other: 1 });
+        assert_eq!(link_tree(&live, &frozen).unwrap(), before, "the copy counts equal, the fifo too");
+        assert!(link_tree(&live, &frozen).is_err(), "never into an existing folder");
+        assert_eq!(std::fs::read_link(frozen.join("latest")).unwrap(), Path::new("notebook.ipynb"));
+        if std::process::Command::new("rsync").arg("--version").output().is_ok() {
+            // A successor's pull, through the real rsync with the backup tiers' flags.
+            std::fs::create_dir_all(&next).unwrap();
+            std::fs::write(next.join("notebook.ipynb"), "the successor's own").unwrap();
+            let mut args = rsync_args(&target(), &PullConfig::big_tier(), &format!("{}/", live.display()));
+            let e = args.iter().position(|a| a == "-e").unwrap();
+            args.drain(e..e + 2);
+            let n = args.len();
+            args[n - 2] = format!("{}/", next.display());
+            let out = std::process::Command::new("rsync").args(&args).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            assert_eq!(std::fs::read_to_string(live.join("notebook.ipynb")).unwrap(), "the successor's own");
+        } else {
+            std::fs::write(live.join(".tmp"), "the successor's own").unwrap();
+            std::fs::rename(live.join(".tmp"), live.join("notebook.ipynb")).unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(frozen.join("notebook.ipynb")).unwrap(), "v1 of the participant's work");
+        assert_eq!(tree_count(&frozen).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
