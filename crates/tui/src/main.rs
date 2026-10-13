@@ -1314,7 +1314,8 @@ fn create_extra(provider: &dyn Provider, cfg: &Config) -> arena_core::Result<Opt
 
 /// Create the named pods (sequentially, no capacity-wait), returning a summary line.
 /// Each create is gated by the add-pod form's Enter, mirroring `arena pods create` —
-/// config `CREATE_EXTRA_JSON` included (a bad one creates nothing and says why).
+/// config `CREATE_EXTRA_JSON` included (a bad one creates nothing and says why), and the
+/// prices the creates answered with remembered for the balance.
 async fn create_pods(
     provider: &Arc<dyn Provider>,
     cfg: &Config,
@@ -1352,12 +1353,23 @@ async fn create_pods(
             Err(e) => fails.push(format!("✗ {name}: {e}")),
         }
     }
+    remember_prices(cfg, &created);
     let mut s = format!("created {}/{}", created.len(), names.len());
     for f in fails.iter().take(8) {
         s.push('\n');
         s.push_str(f);
     }
     (s, created)
+}
+
+/// Remember the prices `created` answered with in the balance state the CLI keeps
+/// ([`balance_state_path`]), for the configured prepaid accounts — as every `arena` create
+/// path does — so a later listing with no price (RunPod v1's) still prices these pods. Best
+/// effort and quiet; nothing without a state directory.
+fn remember_prices(cfg: &Config, created: &[Pod]) {
+    if let Some(Ok(path)) = balance_state_path(cfg) {
+        let _ = balance::remember_prices(&path, &balance::configured(cfg), created, snapshot::unix_now());
+    }
 }
 
 /// A menu pick for the cursor pod: run/set-branch collect an argument first; everything
@@ -3705,6 +3717,53 @@ deep_check_end=1
                 }
             }
         }
+    }
+
+    /// The add-pod form remembers each created pod's price in the balance state the CLI keeps
+    /// (as `arena pods create` does), under the configured account's key fingerprint; an
+    /// unpriced create remembers nothing.
+    #[tokio::test]
+    async fn add_pod_form_remembers_the_created_pods_prices_for_the_balance() {
+        struct Priced;
+        #[async_trait::async_trait]
+        impl Provider for Priced {
+            fn name(&self) -> &'static str {
+                "runpod"
+            }
+            fn describe(&self, _spec: &PodSpec) -> String {
+                String::new()
+            }
+            async fn list_pods(&self) -> arena_core::Result<Vec<Pod>> {
+                Ok(vec![])
+            }
+            async fn create_pod(&self, spec: &PodSpec) -> arena_core::Result<Pod> {
+                // bravo's create answers with no price (RunPod v1's REST create).
+                let cost_per_hr = (spec.name != "devtest-bravo").then_some(0.27);
+                Ok(Pod { id: format!("id-{}", spec.name), name: spec.name.clone(), provider: "runpod".into(), cost_per_hr, ..Default::default() })
+            }
+            async fn stop_pod(&self, _id: &str) -> arena_core::Result<()> {
+                unimplemented!()
+            }
+            async fn restart_pod(&self, _id: &str) -> arena_core::Result<()> {
+                unimplemented!()
+            }
+            async fn terminate_pod(&self, _id: &str) -> arena_core::Result<()> {
+                unimplemented!()
+            }
+        }
+        let dir = tmp("tui-prices");
+        // A dummy key: it only names the account (its fingerprint) — nothing is called.
+        let conf = cfg(&format!("ARENA_STATE_DIR={}\nRUNPOD_API_KEY=not-a-real-key\n", dir.0.display()));
+        let p: Arc<dyn Provider> = Arc::new(Priced);
+        let names = ["devtest-alpha".to_string(), "devtest-bravo".to_string()];
+        let (msg, created) = create_pods(&p, &conf, &names, Some("COMMUNITY"), "NVIDIA RTX A4000", 1, Some(40), Some(0)).await;
+        assert_eq!((msg.as_str(), created.len()), ("created 2/2", 2));
+        let (state, warning) = balance::load(&dir.0.join("devtest").join(snapshot::BALANCE_FILE));
+        assert_eq!(warning, None);
+        let runpod = &state.accounts[&balance::Account::Runpod];
+        assert_eq!(runpod.key_fp, balance::key_fp("not-a-real-key"));
+        let prices: Vec<(&str, f64)> = runpod.prices.iter().map(|(id, (usd, _))| (id.as_str(), *usd)).collect();
+        assert_eq!(prices, [("id-devtest-alpha", 0.27)]);
     }
 
     /// The dashboard refuses restart/stop/terminate on a pod the listing reports locked —

@@ -645,7 +645,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     **Pods nobody priced** (RunPod v1's REST list has no $/h; `arena balance` and teardown
     don't fetch details; after GraphQL nothing does) are counted at the last price seen for
     that pod (remembered in the state from any surface that saw one — an enriched `pods
-    list`, the TUI, a v2 listing, a `create`/`up` result — only from pods that bill by the
+    list`, the TUI, a v2 listing, the result of any create — `create`, `up` and its
+    replacements, `replace`, `migrate copy`, the TUI's add-pod form — only from pods that bill by the
     hour, and kept while the pod keeps being listed, 15 days after that), else at a stand-in
     that errs high: a known GPU at the most it is known to cost (RunPod's recorded catalog,
     the presets, the dearest live catalog/offer price seen in `offers`/`create`/`up`), an
@@ -665,7 +666,7 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     $0/h); runway = balance ÷ burn. Levels: **critical** under 24 h, at ≤ $0, or on RunPod's
     `underBalance` (at $0 RunPod *terminates* pods without a network volume); **low** under
     `BALANCE_WARN_HOURS` (default 72, `0` = runway levels off; malformed → 72 and a
-    warning). Lists the fleet (no details) while reading every account (≤ 10 s), records the
+    warning here — `config check` fails on it). Lists the fleet (no details) while reading every account (≤ 10 s), records the
     reading in `balance.json` (0600, next to the health cache, per prefix, scoped by a
     32-bit key fingerprint), then runs the **fallback check**: the estimate from a reading
     30 min–~1 day old against the live truth, metered from the listing's burns alone (what

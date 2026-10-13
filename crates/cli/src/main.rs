@@ -4510,9 +4510,9 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
     cfg_row(cfg, &mut missing, "OPENROUTER_KEY_LIMIT", false, false); // USD cap per generated key
 
     // The balance sources as last seen (the state file only — no request): ⚠ rows are
-    // advice, never missing keys.
+    // advice, never missing keys; a ✗ row (a balance key set but invalid) fails the check.
     let now = arena_core::snapshot::unix_now();
-    balance_section(cfg, &money::BalanceCtx::from_config(cfg), now).iter().for_each(|l| println!("{l}"));
+    balance_section(cfg, &money::BalanceCtx::from_config(cfg), now, &mut missing).iter().for_each(|l| println!("{l}"));
 
     // Read-only readiness: are the local files this user needs actually there/readable?
     // Answers "is it set up yet?" without touching any API.
@@ -4585,10 +4585,13 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
 }
 
 /// `config check`'s Balance section: each prepaid account's sources as last seen, from the
-/// balance state file alone (no request; ⚠ rows are advice, never missing keys).
-fn balance_section(cfg: &Config, bal: &money::BalanceCtx, now: u64) -> Vec<String> {
+/// balance state file alone (no request; ⚠ rows are advice, never missing keys). A balance
+/// key set but invalid is a ✗ row and joins `missing` — the check fails on it like on any
+/// invalid key, while every other surface just uses the default.
+fn balance_section(cfg: &Config, bal: &money::BalanceCtx, now: u64, missing: &mut Vec<String>) -> Vec<String> {
     let mut out = vec!["\nBalance (`arena balance`):".to_string()];
     out.extend(money::balance_config_rows(cfg, bal, now));
+    missing.extend(arena_core::balance::invalid_keys(cfg));
     out
 }
 
@@ -6398,13 +6401,13 @@ async fn handle_pods_bal(
         PodCmd::Replace { target, gpu, gpus, cloud, disk, volume, image, place, keep_old, skip_proxy, dry_run } => {
             let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap: false, api_extra: None, ..Default::default() };
             let opts = ReplaceOpts { keep_old, skip_proxy, dry_run, yes };
-            handle_replace(remote, provider, cfg, &target, &ov, &place, opts, &interrupt).await?;
+            handle_replace(remote, provider, cfg, &target, &ov, &place, opts, &interrupt, bal).await?;
         }
 
         PodCmd::Migrate { cmd } => match cmd {
             MigrateCmd::Copy { target, gpu, gpus, cloud, disk, volume, image, bootstrap, place, dry_run } => {
                 let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap, api_extra: None, ..Default::default() };
-                handle_migrate_copy(remote, cfg, &target, &ov, &place, dry_run, yes, &interrupt).await?;
+                handle_migrate_copy(remote, cfg, &target, &ov, &place, dry_run, yes, &interrupt, bal).await?;
             }
             MigrateCmd::Cutover { target, yes: y, skip_proxy, no_final_sync, dry_run } => {
                 let opts = CutoverOpts { skip_proxy, no_final_sync, dry_run, yes: yes || y };
@@ -9137,13 +9140,16 @@ fn print_replacement_plan(owner: &dyn Provider, rep: &Replacement, name: &str) {
 /// Create `name` from the replacement's options ([`arena_core::placement::place`], as
 /// `create`/`up` do): one create at a time, the first option with capacity wins, retried in
 /// rounds while `--retry-mins` allows (Ctrl+C stops between rounds). Nothing else has been
-/// touched before it exists; on failure nothing was created.
+/// touched before it exists; on failure nothing was created. The price its create answered
+/// with is remembered for the balance (`balance`) the moment it exists, as `create`/`up` do:
+/// the wait, setup and copy after it take minutes, or fail — the pod bills all the same.
 async fn create_replacement(
     owner: &dyn Provider,
     rep: &Replacement,
     name: &str,
     place: &PlaceFlags,
     interrupt: &Interrupt,
+    balance: Option<&money::BalanceCtx>,
 ) -> Result<arena_core::Pod> {
     use arena_core::placement::{self, End, Progress};
     let mut show = |p: &Progress| {
@@ -9156,6 +9162,9 @@ async fn create_replacement(
     let names = [name.to_string()];
     let run = placement::place(owner, &rep.base, &names, &rep.plan, place.rounds(), None, || interrupt.wait(), &mut show).await;
     if let Some(pod) = run.created.into_iter().next() {
+        if let Some(bal) = balance {
+            bal.remember_prices([&pod]);
+        }
         return Ok(pod);
     }
     let (why, hint) = match run.end {
@@ -9423,6 +9432,8 @@ async fn handle_migrate_copy(
     dry_run: bool,
     yes: bool,
     interrupt: &Interrupt,
+    // Where the new pod's price is remembered for the balance.
+    bal: &money::BalanceCtx,
 ) -> Result<()> {
     // Setup runs after the create below: a malformed SETUP_TIMEOUT_SECS must fail now,
     // before anything is created (and billed) — not after a ~15 min wait for the new pod,
@@ -9430,7 +9441,7 @@ async fn handle_migrate_copy(
     // re-sync that won't run setup (it's a config error either way; fix it once).
     let setup_timeouts = arena_core::setup::SetupTimeouts::from_config(cfg, None)?;
     let (owner, canonical, pods) = resolve_migration(cfg, target).await?;
-    let job = MigrateCopyJob { setup_timeouts, ov, place, dry_run, yes, interrupt, keys_dir: KEYS_DIR };
+    let job = MigrateCopyJob { setup_timeouts, ov, place, dry_run, yes, interrupt, keys_dir: KEYS_DIR, balance: Some(bal) };
     migrate_copy_on(remote, cfg, owner.as_ref(), &canonical, &pods, job).await
 }
 
@@ -9444,6 +9455,9 @@ struct MigrateCopyJob<'a> {
     interrupt: &'a Interrupt,
     /// Where the per-host API-key CSVs live (`KEYS_DIR`; a temp dir in tests).
     keys_dir: &'a str,
+    /// Where `-new`'s price is remembered for the balance ([`create_replacement`]); `None`:
+    /// not remembered.
+    balance: Option<&'a money::BalanceCtx>,
 }
 
 /// [`handle_migrate_copy`] once the owner and its listing are known ([`resolve_migration`])
@@ -9456,7 +9470,7 @@ async fn migrate_copy_on(
     pods: &[arena_core::Pod],
     job: MigrateCopyJob<'_>,
 ) -> Result<()> {
-    let MigrateCopyJob { setup_timeouts, ov, place, dry_run, yes, interrupt, keys_dir } = job;
+    let MigrateCopyJob { setup_timeouts, ov, place, dry_run, yes, interrupt, keys_dir, balance } = job;
     let canonical = canonical.to_string();
     let src = pods.iter().find(|p| p.name == canonical).expect("the canonical pod is listed").clone();
     let new_name = format!("{canonical}-new");
@@ -9525,7 +9539,7 @@ async fn migrate_copy_on(
             return Ok(());
         }
         println!("[1/3] creating {new_name}…");
-        let created = create_replacement(owner, &rep, &new_name, place, interrupt).await?;
+        let created = create_replacement(owner, &rep, &new_name, place, interrupt, balance).await?;
         println!("      created id={}", created.id);
         println!("[2/3] waiting for {new_name} to come up and stabilize…");
         wait_for_endpoint(owner, &created.id, 900)
@@ -10054,6 +10068,8 @@ async fn handle_replace(
     place: &PlaceFlags,
     opts: ReplaceOpts,
     interrupt: &Interrupt,
+    // Where the new pod's price is remembered for the balance.
+    bal: &money::BalanceCtx,
 ) -> Result<()> {
     // Setup runs after the create (step 3/7): a malformed SETUP_TIMEOUT_SECS must fail
     // now, before anything is created (and billed) — not after the new pod has come up,
@@ -10063,7 +10079,7 @@ async fn handle_replace(
     // name or a raw id, so read the canonical name back from the fleet rather than trusting
     // the argument (a user may pass an id).
     let (owner, src_id, src_label) = resolve_target_any(cfg, target).await?;
-    let job = ReplaceJob { setup_timeouts, ov, place, opts, interrupt, keys_dir: KEYS_DIR };
+    let job = ReplaceJob { setup_timeouts, ov, place, opts, interrupt, keys_dir: KEYS_DIR, balance: Some(bal) };
     replace_on(remote, fleet, cfg, owner.as_ref(), src_id, src_label, job).await
 }
 
@@ -10085,6 +10101,9 @@ struct ReplaceJob<'a> {
     interrupt: &'a Interrupt,
     /// Where the per-host API-key CSVs live (`KEYS_DIR`; a temp dir in tests).
     keys_dir: &'a str,
+    /// Where the new pod's price is remembered for the balance ([`create_replacement`]);
+    /// `None`: not remembered.
+    balance: Option<&'a money::BalanceCtx>,
 }
 
 /// [`handle_replace`] once the source pod (`src_id`) and the backend that owns it are
@@ -10197,7 +10216,7 @@ async fn replace_on(
     // [1/7] create the replacement under the staging name — on the first option with
     // capacity (several with a --gpu/--cloud list), retried while --retry-mins allows.
     println!("[1/7] creating {new_name}…");
-    let created = create_replacement(owner, &rep, &new_name, job.place, job.interrupt).await?;
+    let created = create_replacement(owner, &rep, &new_name, job.place, job.interrupt, job.balance).await?;
     println!("      created {new_name} id={}", created.id);
 
     // [2/7] wait for an SSH endpoint, then for it to STABILIZE. A freshly-created pod's
@@ -14595,9 +14614,10 @@ mod setup_tests {
             let fake = Arc::new(FakeRemote::new());
             let (place, interrupt) = (super::PlaceFlags::default(), super::Interrupt::manual());
             let opts = super::ReplaceOpts { keep_old: false, skip_proxy: true, dry_run, yes: true };
-            let err = super::handle_replace(fake.clone(), &fleet(), &cfg, "apple", &ov, &place, opts, &interrupt).await.unwrap_err();
+            let bal = crate::money::BalanceCtx::from_config(&cfg); // no account, no state file: a test
+            let err = super::handle_replace(fake.clone(), &fleet(), &cfg, "apple", &ov, &place, opts, &interrupt, &bal).await.unwrap_err();
             assert!(err.to_string().contains("SETUP_TIMEOUT_SECS"), "replace (dry_run={dry_run}): {err}");
-            let err = super::handle_migrate_copy(fake.clone(), &cfg, "apple", &ov, &place, dry_run, true, &interrupt).await.unwrap_err();
+            let err = super::handle_migrate_copy(fake.clone(), &cfg, "apple", &ov, &place, dry_run, true, &interrupt, &bal).await.unwrap_err();
             assert!(fake.calls().is_empty(), "nothing reached a pod");
             assert!(err.to_string().contains("SETUP_TIMEOUT_SECS"), "migrate copy (dry_run={dry_run}): {err}");
         }
@@ -20853,7 +20873,7 @@ mod lifecycle_tests {
         let (ov, place, interrupt) = (SpecOverrides::default(), PlaceFlags::default(), Interrupt::manual());
         let opts = ReplaceOpts { keep_old: false, skip_proxy: false, dry_run: false, yes: true };
         let timeouts = arena_core::setup::SetupTimeouts::from_config(&cfg, None).unwrap();
-        let job = ReplaceJob { setup_timeouts: timeouts, ov: &ov, place: &place, opts, interrupt: &interrupt, keys_dir: &keys_dir };
+        let job = ReplaceJob { setup_timeouts: timeouts, ov: &ov, place: &place, opts, interrupt: &interrupt, keys_dir: &keys_dir, balance: None };
         replace_on(remote.clone(), &f, &cfg, &f, "r-alpha".into(), "devtest-alpha".into(), job).await.unwrap();
         assert_eq!(
             f.calls(),
@@ -20912,7 +20932,7 @@ mod lifecycle_tests {
         let (ov, place, interrupt) = (SpecOverrides::default(), PlaceFlags::default(), Interrupt::manual());
         let opts = ReplaceOpts { keep_old: false, skip_proxy: false, dry_run: false, yes: true };
         let timeouts = arena_core::setup::SetupTimeouts::from_config(&cfg, None).unwrap();
-        let job = ReplaceJob { setup_timeouts: timeouts, ov: &ov, place: &place, opts, interrupt: &interrupt, keys_dir: &keys_dir };
+        let job = ReplaceJob { setup_timeouts: timeouts, ov: &ov, place: &place, opts, interrupt: &interrupt, keys_dir: &keys_dir, balance: None };
         replace_on(remote, &f, &cfg, &f, src_id.into(), "devtest-alpha".into(), job).await.unwrap();
         assert_eq!(
             f.calls(),
@@ -20924,6 +20944,82 @@ mod lifecycle_tests {
             ]
         );
         assert!(!stage.0.exists(), "removed once the original is gone");
+    }
+
+    /// A balance that remembers prices into `dir` for the RunPod account (a fake: no call).
+    fn priced_balance(dir: &Path) -> crate::money::BalanceCtx {
+        use arena_core::balance::{Account, FakeBalanceApi};
+        let path = dir.join("state").join("devtest").join(arena_core::snapshot::BALANCE_FILE);
+        crate::money::BalanceCtx { api: Arc::new(FakeBalanceApi::new().with(Account::Runpod)), path: Some(Ok(path)) }
+    }
+
+    /// The price the balance state remembers for pod `id`, if any.
+    fn remembered(bal: &crate::money::BalanceCtx, id: &str) -> Option<f64> {
+        let (state, _) = arena_core::balance::load(bal.state_path().unwrap());
+        state.accounts.get(&arena_core::balance::Account::Runpod).and_then(|a| a.prices.get(id)).map(|p| p.0)
+    }
+
+    /// `pods replace` remembers the new pod's price the moment it's made, as `create`/`up`
+    /// do — by id, so the promoted pod (renamed to the canonical name) keeps it, and a later
+    /// listing with no price (RunPod v1's) still prices it.
+    #[tokio::test(start_paused = true)]
+    async fn replace_remembers_the_new_pods_price_for_the_balance() {
+        let dir = tmpdir("replace-price");
+        let cfg = keyed_cfg(&dir.0, "");
+        let keys_dir = dir.0.display().to_string();
+        let f = fleet();
+        let mut new = pod("r-new", "", "runpod", Some(("10.0.0.2", 22001)));
+        new.cost_per_hr = Some(0.29);
+        *f.to_create.lock().unwrap() = vec![new];
+        let (old_host, new_host) = ("10.0.0.1:22001", "10.0.0.2:22001");
+        let remote = Arc::new(FakeRemote::new());
+        remote.on(old_host, "arena-replica-sent", FakeReply::stdout("arena-replica-sent=no\n"));
+        remote.on(old_host, "RUNPOD_POD_ID", FakeReply::stdout("r-alpha"));
+        remote.on(new_host, "arena-replica-ready", FakeReply::stdout("arena-replica-ready\n"));
+        remote.on(new_host, "MARK=", FakeReply::stdout("ID=r-new\nMARK=arena-replace-r-new\n"));
+        remote.on(new_host, "SSH_OK", FakeReply::stdout("NVIDIA RTX A4000\nSSH_OK\n"));
+        let (ov, place, interrupt) = (SpecOverrides::default(), PlaceFlags::default(), Interrupt::manual());
+        // --keep-old: the original isn't terminated (no staging clean-up of a shared id).
+        let opts = ReplaceOpts { keep_old: true, skip_proxy: false, dry_run: false, yes: true };
+        let timeouts = arena_core::setup::SetupTimeouts::from_config(&cfg, None).unwrap();
+        let bal = priced_balance(&dir.0);
+        let job = ReplaceJob { setup_timeouts: timeouts, ov: &ov, place: &place, opts, interrupt: &interrupt, keys_dir: &keys_dir, balance: Some(&bal) };
+        replace_on(remote, &f, &cfg, &f, "r-alpha".into(), "devtest-alpha".into(), job).await.unwrap();
+        assert_eq!(f.calls(), ["create devtest-alpha-new NVIDIA RTX A4000", "rename r-alpha devtest-alpha-old", "rename r-new devtest-alpha"]);
+        assert_eq!(remembered(&bal, "r-new"), Some(0.29));
+    }
+
+    /// `migrate copy` remembers `-new`'s price the moment it's created — before the wait for
+    /// it to come up, so a copy that then fails (here: it never gets an endpoint) still leaves
+    /// the billing pod priced. An unpriced create remembers nothing.
+    #[tokio::test(start_paused = true)]
+    async fn migrate_copy_remembers_the_new_pods_price_even_when_the_copy_fails() {
+        let dir = tmpdir("migrate-price");
+        let cfg = keyed_cfg(&dir.0, "");
+        let (ov, place, interrupt) = (SpecOverrides::default(), PlaceFlags::default(), Interrupt::manual());
+        let timeouts = arena_core::setup::SetupTimeouts::from_config(&cfg, None).unwrap();
+        let bal = priced_balance(&dir.0);
+        for (id, price) in [("r-new", Some(0.33)), ("r-bare", None)] {
+            let f = fleet();
+            let mut new = pod(id, "", "runpod", None); // never gets an endpoint
+            new.cost_per_hr = price;
+            *f.to_create.lock().unwrap() = vec![new];
+            let pods = f.pods.lock().unwrap().clone();
+            let job = MigrateCopyJob {
+                setup_timeouts: timeouts,
+                ov: &ov,
+                place: &place,
+                dry_run: false,
+                yes: true,
+                interrupt: &interrupt,
+                keys_dir: "/nonexistent",
+                balance: Some(&bal),
+            };
+            let e = migrate_copy_on(Arc::new(FakeRemote::new()), &cfg, &f, "devtest-alpha", &pods, job).await.unwrap_err();
+            assert!(format!("{e:#}").contains("devtest-alpha-new never came up"), "{e:#}");
+            assert_eq!(f.calls(), ["create devtest-alpha-new NVIDIA RTX A4000"]);
+            assert_eq!(remembered(&bal, id), price, "{id}");
+        }
     }
 
     /// Review finding: `replace` / `migrate copy` created (and billed) the new pod, set it up,
@@ -20940,7 +21036,7 @@ mod lifecycle_tests {
         let timeouts = arena_core::setup::SetupTimeouts::from_config(&cfg, None).unwrap();
         let replace = |dry_run| {
             let opts = ReplaceOpts { keep_old: false, skip_proxy: true, dry_run, yes: true };
-            ReplaceJob { setup_timeouts: timeouts, ov: &ov, place: &place, opts, interrupt: &interrupt, keys_dir: "/nonexistent" }
+            ReplaceJob { setup_timeouts: timeouts, ov: &ov, place: &place, opts, interrupt: &interrupt, keys_dir: "/nonexistent", balance: None }
         };
         let e = replace_on(Arc::new(FakeRemote::new()), &f, &cfg, &f, "r-alpha".into(), "devtest-alpha".into(), replace(false))
             .await
@@ -20952,7 +21048,7 @@ mod lifecycle_tests {
         assert!(take_would_refuse().iter().any(|r| r.contains("devtest-alpha is stopped")));
         // migrate copy: the same, whether -new would be created or re-synced.
         let pods = f.pods.lock().unwrap().clone();
-        let copy = |dry_run| MigrateCopyJob { setup_timeouts: timeouts, ov: &ov, place: &place, dry_run, yes: true, interrupt: &interrupt, keys_dir: "/nonexistent" };
+        let copy = |dry_run| MigrateCopyJob { setup_timeouts: timeouts, ov: &ov, place: &place, dry_run, yes: true, interrupt: &interrupt, keys_dir: "/nonexistent", balance: None };
         let e = migrate_copy_on(Arc::new(FakeRemote::new()), &cfg, &f, "devtest-alpha", &pods, copy(false)).await.unwrap_err().to_string();
         assert!(e.contains("devtest-alpha is stopped (EXITED)"), "{e}");
         migrate_copy_on(Arc::new(FakeRemote::new()), &cfg, &f, "devtest-alpha", &pods, copy(true)).await.unwrap();
@@ -21043,7 +21139,7 @@ mod lifecycle_tests {
         let (ov, place, interrupt) = (SpecOverrides::default(), PlaceFlags::default(), Interrupt::manual());
         let opts = ReplaceOpts { keep_old: false, skip_proxy: true, dry_run: false, yes: true };
         let timeouts = arena_core::setup::SetupTimeouts::from_config(&cfg, None).unwrap();
-        let job = ReplaceJob { setup_timeouts: timeouts, ov: &ov, place: &place, opts, interrupt: &interrupt, keys_dir: "/nonexistent" };
+        let job = ReplaceJob { setup_timeouts: timeouts, ov: &ov, place: &place, opts, interrupt: &interrupt, keys_dir: "/nonexistent", balance: None };
         let start = tokio::time::Instant::now();
         let e = replace_on(remote.clone(), &f, &cfg, &f, "r-alpha".into(), "devtest-alpha".into(), job).await.unwrap_err();
         let e = format!("{e:#}");
@@ -21294,7 +21390,7 @@ mod lifecycle_tests {
             let opts = ReplaceOpts { keep_old, skip_proxy: true, dry_run, yes: true };
             let id = f.pods.lock().unwrap().iter().find(|p| p.name == src).unwrap().id.clone();
             let (ov, place, interrupt) = (SpecOverrides::default(), PlaceFlags::default(), Interrupt::manual());
-            let job = ReplaceJob { setup_timeouts: timeouts, ov: &ov, place: &place, opts, interrupt: &interrupt, keys_dir: "/nonexistent" };
+            let job = ReplaceJob { setup_timeouts: timeouts, ov: &ov, place: &place, opts, interrupt: &interrupt, keys_dir: "/nonexistent", balance: None };
             replace_on(Arc::new(FakeRemote::new()), f, cfg, f, id, src.to_string(), job).await
         }
         let want = format!("refusing to replace: {}{LOCKED_REPLACEMENT_NOTE}", hint("devtest-alpha"));

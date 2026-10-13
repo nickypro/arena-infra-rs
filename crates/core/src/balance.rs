@@ -2368,9 +2368,25 @@ fn fmt_threshold(h: f64) -> String {
     }
 }
 
+/// The balance keys set but invalid, as `KEY (what it must be)` — exactly the keys
+/// [`config_rows`] marks ✗ — for `config check`'s "missing or invalid keys" error: a ✗ row
+/// fails the check, as any other invalid key does. Only `config check` fails on them: every
+/// other surface uses the default (`arena balance` says so), so a typo never breaks `pods
+/// list`. Pure.
+pub fn invalid_keys(cfg: &Config) -> Vec<String> {
+    let mut out = Vec::new();
+    if warn_hours(cfg).is_err() {
+        out.push("BALANCE_WARN_HOURS (must be a number of hours ≥ 0)".to_string());
+    }
+    if unpriced_per_gpu(cfg).is_err() {
+        out.push("BALANCE_UNPRICED_PER_GPU (must be USD per GPU-hour, above 0 and at most 1000)".to_string());
+    }
+    out
+}
+
 /// `config check`'s "Balance (`arena balance`)" rows, from the state file alone (no
 /// request): the threshold, then per configured account how its sources stand. A ⚠ row
-/// is advice, never a missing key.
+/// is advice, never a missing key; a ✗ row is a key set but invalid ([`invalid_keys`]).
 pub fn config_rows(cfg: &Config, state: &BalanceState, accounts: &[(Account, String)], now: u64) -> Vec<String> {
     let mut out = Vec::new();
     let key = "BALANCE_WARN_HOURS";
@@ -4043,6 +4059,40 @@ mod tests {
         assert_eq!(lines[2], "note: live is $31.00; a manual value is used only while live is unavailable");
     }
 
+    /// A ✗ row in `config check` fails it: the keys [`config_rows`] marks ✗ are exactly the
+    /// keys [`invalid_keys`] names — for every way a balance key can be wrong, and for none
+    /// when they're fine. (⚠ rows — a failing source, a fallback check reading high — never
+    /// count.)
+    #[test]
+    fn the_keys_marked_cross_are_exactly_the_invalid_keys() {
+        let s = BalanceState::default();
+        let cases = [
+            "",
+            "BALANCE_WARN_HOURS=0\nBALANCE_UNPRICED_PER_GPU=4.5",
+            "BALANCE_WARN_HOURS=\nBALANCE_UNPRICED_PER_GPU=",
+            "BALANCE_WARN_HOURS=soon",
+            "BALANCE_WARN_HOURS=-1",
+            "BALANCE_WARN_HOURS=nan",
+            "BALANCE_WARN_HOURS=inf",
+            "BALANCE_UNPRICED_PER_GPU=free",
+            "BALANCE_UNPRICED_PER_GPU=0",
+            "BALANCE_UNPRICED_PER_GPU=1001",
+            "BALANCE_WARN_HOURS=-1\nBALANCE_UNPRICED_PER_GPU=-3",
+        ];
+        for text in cases {
+            let cfg = Config::parse(text);
+            let crossed: Vec<String> = config_rows(&cfg, &s, &[], NOW)
+                .iter()
+                .filter_map(|r| r.strip_prefix("  ✗ "))
+                .map(|r| r.split_whitespace().next().unwrap_or_default().to_string())
+                .collect();
+            let failing: Vec<String> = invalid_keys(&cfg).iter().map(|e| e.split(" (").next().unwrap_or_default().to_string()).collect();
+            assert_eq!(crossed, failing, "{text:?}");
+        }
+        assert!(invalid_keys(&Config::parse("")).is_empty());
+        assert_eq!(invalid_keys(&Config::parse("BALANCE_WARN_HOURS=-1\nBALANCE_UNPRICED_PER_GPU=-3")).len(), 2);
+    }
+
     #[test]
     fn config_rows_table() {
         let cfg = Config::parse("");
@@ -4082,6 +4132,14 @@ mod tests {
                 "  ⚠ runpod                     full balance query rejected since 2026-10-08 11:00 UTC — live via the minimal query (no burn/limit/underBalance)",
                 "  ⚠ runpod                     fallback check ✗ over 1d, checked 0s ago, before live started failing (the estimate read $3.10 HIGH) — don't rely on estimates",
                 "  ⚠ runpod                     billing history failing (auth, HTTP 403) — estimates use arena's own metering only",
+            ]
+        );
+        // Each ✗ row is a key `config check` fails on.
+        assert_eq!(
+            invalid_keys(&Config::parse("BALANCE_WARN_HOURS=soon\nBALANCE_UNPRICED_PER_GPU=free")),
+            [
+                "BALANCE_WARN_HOURS (must be a number of hours ≥ 0)",
+                "BALANCE_UNPRICED_PER_GPU (must be USD per GPU-hour, above 0 and at most 1000)",
             ]
         );
         // BC10: past 14 days the anchor is unusable — the row says so, not "estimates in use".
