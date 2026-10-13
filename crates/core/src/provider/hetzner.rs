@@ -216,6 +216,17 @@ fn parse_server(v: &Value) -> Pod {
     }
 }
 
+/// Whether a listed server is the backup archive VM (`arena archive`): it carries the
+/// label key [`crate::archive::LABEL_KEY`] (any value — any cohort's archive). The fleet never
+/// sees it, so no fleet command (`pods *`, `proxy`, `snapshot`, the TUI, `teardown`'s pod
+/// item) can list, stop, restart or terminate it — the archive is managed only by `arena
+/// archive`. The test is on the label alone, never the name: an *unlabelled* server that
+/// merely looks like an archive (`<prefix>-archive` made by hand) stays visible to the fleet
+/// and to `teardown --check`, instead of vanishing from every view.
+pub(crate) fn is_archive_server(v: &Value) -> bool {
+    v.get("labels").and_then(Value::as_object).is_some_and(|l| l.contains_key(crate::archive::LABEL_KEY))
+}
+
 /// Servers per page we ask for (Hetzner's maximum; the default is 25).
 const PER_PAGE: u64 = 50;
 /// Hard stop for the pagination loop (50 × 20 = 1000 servers — far beyond any cohort).
@@ -270,7 +281,7 @@ impl Provider for HetznerProvider {
             let url = format!("{}/servers?page={page}&per_page={PER_PAGE}", self.base);
             let body = send_json(self.auth(self.client.get(url)), "hetzner list").await?;
             let (servers, next) = servers_page(&body)?;
-            out.extend(servers.iter().map(parse_server));
+            out.extend(servers.iter().filter(|v| !is_archive_server(v)).map(parse_server));
             match next {
                 None => return Ok(out),
                 Some(n) if n > page => page = n,
@@ -428,6 +439,37 @@ mod tests {
         assert_eq!(srv.requests.lock().unwrap().len(), 1);
         // The real wait is 90 s, read every 5 s.
         assert_eq!(SHUTDOWN_WAIT.total(), std::time::Duration::from_secs(90));
+    }
+
+    /// S9: the fleet listing drops every server carrying the archive label key (any cohort's
+    /// archive) and keeps all others — an unlabelled `<prefix>-archive` lookalike included —
+    /// across pages, over the real request path.
+    #[tokio::test]
+    async fn list_pods_omits_archive_labelled_servers_and_keeps_the_rest() {
+        use crate::http::test_server::{canned, client, serve};
+        let page1 = json!({
+            "servers": [
+                {"id": 1, "name": "arena9-apple", "status": "running", "labels": {}},
+                {"id": 2, "name": "arena9-archive", "status": "running", "labels": {"arena-archive": "arena9"}},
+                {"id": 3, "name": "arena8-archive", "status": "running", "labels": {"arena-archive": "arena8", "x": "y"}},
+            ],
+            "meta": {"pagination": {"page": 1, "next_page": 2}}
+        });
+        let page2 = json!({
+            "servers": [
+                {"id": 4, "name": "devtest-archive", "status": "running"},
+                {"id": 5, "name": "odd", "status": "running", "labels": {"arena-archive-tier": "snap"}},
+                {"id": 6, "name": "arena9-bloom", "status": "off", "labels": {"team": "arena-archive"}},
+            ],
+            "meta": {"pagination": {"page": 2, "next_page": null}}
+        });
+        let srv = serve(vec![
+            canned(200, "application/json", &page1.to_string()),
+            canned(200, "application/json", &page2.to_string()),
+        ]);
+        let p = HetznerProvider { api_key: "k".into(), client: client(), base: srv.base.clone(), opts: HetznerOpts::default(), shutdown: SHUTDOWN_WAIT };
+        let names: Vec<String> = p.list_pods().await.unwrap().into_iter().map(|p| p.name).collect();
+        assert_eq!(names, ["arena9-apple", "devtest-archive", "odd", "arena9-bloom"]);
     }
 
     #[test]

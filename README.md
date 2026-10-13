@@ -459,7 +459,10 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     move an endpoint) — remove it before changing `MACHINE_NAME_PREFIX`/`_LIST`: a name that
     leaves the list loses its forward on the next tick; `--snapshot <DIR>` = a `*/2 …
     snapshot --public --out <DIR>/fleet.json` line (log `~/arena-snapshot-cron.log`) for the
-    [fleet page](#publishing-the-fleet-page). Every line runs under `flock -n` (a tick that
+    [fleet page](#publishing-the-fleet-page); `--archive` = the [backup archive](#backup-archive-arena-archive)'s
+    two push lines (`archive sync --tier snap` at :07/:22/:37/:52, `--tier big` at :40, under
+    `nice`, log `~/arena-archive-cron.log`, each tier locked in-process; refused without this
+    user's archive state, an absolute `LOCAL_BACKUP_DIR` or a start date). Every line runs under `flock -n` (a tick that
     finds the previous one still running exits instead of stacking — the backup's lock is
     `~/.arena-backup-cron.lock`, held by `flock -o` itself so no stray rsync can keep it).
     `remove --backup|--proxy|--snapshot` drops just those; plain `remove` drops the whole
@@ -468,6 +471,10 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     with its identity. Lines written by older versions are recognized by the command they
     run; comments in the block (a paused `# …` line, a note) are never matched, replaced or
     removed by a targeted install/remove.
+  - `archive up|status|sync|resize|access|ssh-config|ssh|forget|down` — the **backup archive**: an
+    always-on Hetzner VM with two volumes (dated snapshots, all files) holding copy #2 of
+    `LOCAL_BACKUP_DIR`, pushed by cron, readable by participants once `access on`; never part of
+    the fleet. See [Backup archive](#backup-archive-arena-archive).
   - `pods backup [targets]` — the **full save**: git-push the ARENA tree **and** rsync the
     home to the local backups folder (`pull`). The git push is on **whatever branch the
     pod is on** (never switches/creates one, so bespoke branches are respected) and
@@ -1252,6 +1259,128 @@ Then serve `/srv/arena-fleet` with any static host (an existing web server's dir
 construction, so no auth is needed; health shows `unknown` until a `pods test --deep` or
 `up --check` has run under the same user (the cache lives in that user's state dir — set
 `ARENA_STATE_DIR` for both if the cron runs as someone else).
+
+## Backup archive (`arena archive`)
+
+Copy #2 of the cohort's backups, on one small always-on Hetzner VM per cohort, so they outlive
+the pods (a wipe, a replace, the end of the program) and participants can get their own files
+back without the operator. Two volumes, because they fail differently: `snap` holds the dated
+small-file snapshots (`snap/<wNdM>/<pod>/`, hard-linked across days exactly like the control
+box's `LOCAL_BACKUP_DIR`), `big` the all-files mirror (`big/<pod>/`). A checkpoint dump that
+fills `big` can never stop the history being written; each is sized, resized, watched and
+deleted on its own.
+
+- **The control box pushes** (`archive sync`, its own cron lines) with a key the archive forces
+  into `rrsync -munge -wo -no-del -no-lock`: it can write, never read, delete, get a shell or
+  forward, and every symlink a participant planted is stored defanged, never followed (one whose
+  target is too long to store that way — over 4080 bytes — is left out by an exact rule in a
+  private `--exclude-from` file, never argv, with a count in the run's output; a pod with more than
+  1000 of them is left out of the push, named). The archive holds no outbound credential and can never reach a pod, a provider or the
+  control box. Every push is additive and never touches a file already there (`--delete`,
+  `--inplace`, `--append`, `--partial-dir`, `-a`, `-p`, `-L`… are never sent — test-enforced; a
+  push is `-rlt -J --chmod=u=rwX,go=rX`): a changed file is written anew, so a past day's
+  hard-linked file — or another pod's copy of a shared one — never changes, not even its mode, and
+  no per-directory holding area exists for a planted link to redirect.
+- **Only this cohort's pods leave the control box**: the `MACHINE_NAME_LIST` names (and their
+  `-old`/`-new` twins), never `@` staff boxes or anything else an unscoped pull put there
+  (`sync`/`status` list those as "kept on the control box only", apart from pods named like the
+  cohort's but missing from the list). A pod that leaves the list keeps its history archived
+  (`sync`/`status` name it: "off the list, still archived"); one re-listed as an `@` staff box,
+  or **forgotten** — `arena archive forget <pod>` (consent withdrawn; also its `-old`/`-new`
+  twins unless those are list entries of their own; refused unless run against the state dir
+  that holds `archive.json`, the one the cron reads) — is never pushed again. Its archived copies
+  stay — readable by every participant while access is on, as `forget` and `status` say — until
+  `--delete-archived`, which lists every directory with its size, needs the name typed
+  (`--confirm <prefix>-<pod>`) and only then takes the sync locks for the delete itself.
+  **Secret files never do**: shell rc files (the API keys `copy-keys` writes), histories,
+  `.env*`, `.netrc`, `.gitconfig`, `.git-credentials`, `.pgpass`, `.s3cfg`, `.ssh/`, `.config/`,
+  `.cache/`, `.claude*`, cloud and Kaggle credentials, Hugging Face token files, `id_*`/`*.pem`/
+  `*.key` keys and every repo's git configs (`.git/config`, `config.worktree`, submodules', a
+  bare or mirror clone's `<name>.git/config`; git works without them) — `ARCHIVE_EXTRA_EXCLUDES` only adds to the list.
+- **Participants read** over sftp as one chrooted, read-only user (`backups`): read-only three
+  times over (`internal-sftp -R`, read-only bind mounts, ownership). Laptops use the cohort key,
+  pods a per-cohort read key `pods copy-keys` installs. **Access is OFF after `archive up`** until
+  you run `archive access on`, which says plainly that everyone holding the cohort key can then
+  read every pod's backups (they are root on every pod already); `access off` is instant.
+- **The fleet never sees it**: every resource carries the label `arena-archive=<prefix>`, the
+  Hetzner fleet listing drops labelled servers (so no `pods`/`proxy`/`snapshot`/TUI command can
+  touch it), and delete protection backs that up. Use its own Hetzner project
+  (`ARCHIVE_HETZNER_API_KEY`); without one it falls back to `HETZNER_API_KEY` and says so.
+- **Nothing is ever deleted automatically.** `ARCHIVE_KEEP_UNTIL` only drives messages, the
+  README on the archive and `teardown --check` (`◷ kept` until then). Deleting data is
+  `archive down --delete-volumes --confirm <prefix>-archive`, typed — `-y` is never enough.
+
+```bash
+arena archive up --dry-run          # the plan, live prices, the local sizes it will hold
+arena archive up                    # keys (state dir), SSH-key object, server, volumes, pin, setup
+arena cron install --archive        # snap at :07/:22/:37/:52, big at :40 (absolute LOCAL_BACKUP_DIR, a start date)
+arena pods copy-keys --all          # the pods' `archive-<prefix>` block, pinned key and read key
+arena archive access on             # when you're ready (prints the privacy statement)
+arena ssh-config                    # participants' config now ends with the archive block
+arena archive status                # API + probe + pushes + retention + cost; non-zero on FAIL/UNKNOWN
+```
+
+`archive sync [--tier snap|big|both] [--label L]… [--dir D] [--dry-run]` pushes the snapshot
+labels that aren't final yet — the newest first, then up to three older ones per run, those
+tried least recently (round-robin: a label that fails every run never takes every slot) — pod by pod, as the pulls do: each pod's tree goes to
+`snap/<wNdM>/<pod>/` hard-linked to that pod's earlier labels on the archive (complete or cut
+short — rsync only links identical files) and to the week's fleet baseline, pushed once to
+`snap/baseline/` (so the image's files are stored once for every pod, as on the control box), in
+two passes like the pull's (the files under `BACKUP_MAX_SIZE`, then every `.git` uncapped — a
+pack over the cap must not leave a broken repo); then `big/`, pod by pod (least recently pushed
+first), so one pod's failure is that pod's alone. A label is final once a push that
+*started* 2 h after its UTC day ended went through for every pod, linked to everything it should
+have been — so a failed or out-of-order push never leaves a full, un-linked copy for good: the
+next push re-links it. One stuck pod never holds the rest up: a pod whose push of a past label
+fails of its own kind three runs in a row is **sealed partial** for that label — kept as it is on
+the archive, later labels link to it and seal — and `status` names each one (`archive sync --label
+L` retries it); a fleet baseline that fails three runs in a row likewise stops holding labels
+open. A failure only counts against a pod when another pod's push got through in the same run:
+the archive's own failures — full, read-only or failing volume (EROFS/EIO), unmounted,
+unreachable, keys refused, a stalled connection — stop the run, charge nobody and make `status`
+FAIL, and so does a run in which every push failed. A pod cut off by the label's budget before it
+had its fair share (budget ÷ pods), or still sending files when cut off, is never charged: it goes
+first next run. It needs no Hetzner token (it reads `archive.json`), takes a lock per
+tier (a running tier is skipped, exit 0; a dry run takes none), keeps per-tier state tied to the
+volume it describes (a new volume gets everything again), stops a run on a failure that would
+repeat (no space, unmounted, host key…), says on the first push how big the seed is against the
+volume and the budget, and a failure in one tier never stops the other (`✗ big: NoSpace — arena
+archive resize --big-gb 300`). The pulls write their rsync temp files to each tier's own
+`.rsync-tmp/` (`<dir>/<label>/`, `<dir>/big/`), beside the pod trees and on their filesystem, so a
+push never ships a half-written file. The cron lines carry the start date and `ARENA_STATE_DIR`
+they were installed with, and a new `cron install --start-date` rewrites them too.
+
+`archive resize --snap-gb|--big-gb N` grows a volume online (never shrinks; the volume's current
+size grows only the filesystem, finishing a resize whose `resize2fs` failed); `archive ssh [-- CMD]`
+is a root shell on the pinned key; `archive ssh-config [--pod]` prints the blocks; `archive down`
+deletes the server and keeps the volumes (protected, ≈ €0.06/GB/month) for a later `up`, which
+re-attaches them without formatting. Participants:
+
+```bash
+sftp archive-arena9                    # ls snap ; cd snap/w2d5/arena9-apple ; get -r … ; reget for big files
+scp -r archive-arena9:snap/w2d5/arena9-apple/ARENA_materials/chapter1 ./restore   # OpenSSH ≥ 9 (else scp -s)
+```
+
+Symbolic links are stored defanged on the archive (`ls -l` shows `-> /rsyncd-munged/<target>`):
+they don't resolve there, so a participant's download skips or fails on them — copy the files,
+then re-create a needed link with `ln -s <target> <name>`. (The archive's own README says so.)
+The pods' `archive-<prefix>` block lives in its own managed block of `~/.ssh/config`; `copy-keys`
+run by a user who can't read the archive state leaves it as it is and says so.
+
+State: `$ARENA_STATE_DIR/<prefix>/archive/` (0700) — the admin, push and read keys, the pinned
+`known_hosts`, `archive.json`, the per-tier sync state and locks, `forgotten.json`. Run `archive up` as the user
+whose crontab pushes (prod: root, with `ARENA_STATE_DIR` in config), and back the directory up:
+losing it stops pushes and admin access, never participants' reads.
+
+**End of the program:**
+1. A final `arena pods backup`, then `arena archive sync --tier both`.
+2. `arena archive status`: every label final, no FAIL.
+3. Announce the laptop block (`arena archive ssh-config`) and the keep-until date.
+4. `arena cron remove --archive --backup`.
+5. Tear the pods down (`arena teardown --check` lists what's left).
+6. Set `ARCHIVE_KEEP_UNTIL` (`teardown --check` then shows the archive as `◷ kept`).
+7. After that date: `arena archive access off` → `arena archive down` →
+   `arena archive down --delete-volumes --confirm <prefix>-archive` → `teardown --check` ALL CLEAR.
 
 ## Testing
 

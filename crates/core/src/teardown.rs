@@ -102,10 +102,17 @@ pub struct Inputs {
     pub proxy: Probe<ProxyFile>,
     /// Whose crontab and `at` queue were read.
     pub user: String,
+    /// Every backup archive in the archive's Hetzner project (`label_selector=arena-archive`, any
+    /// prefix), read with the archive token; skipped when no Hetzner token is set at all.
+    pub archive: Probe<crate::archive::Inventory>,
+    /// `ARCHIVE_KEEP_UNTIL` (days since the epoch): until then this cohort's archive is `◷ kept`.
+    pub archive_keep_until: Option<i64>,
+    /// Today, in days since the epoch (UTC).
+    pub today_days: i64,
 }
 
 /// One checklist line's outcome.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Verdict {
     /// Checked: nothing left.
@@ -116,6 +123,9 @@ pub enum Verdict {
     Unknown,
     /// Doesn't apply here (not configured / not installed): not checked.
     Skipped,
+    /// Still there ON PURPOSE until a date the operator set (the backup archive before its
+    /// `ARCHIVE_KEEP_UNTIL`): shown, never counted against the check.
+    Kept,
 }
 
 impl Verdict {
@@ -125,6 +135,7 @@ impl Verdict {
             Verdict::Remaining => "✗",
             Verdict::Unknown => "?",
             Verdict::Skipped => "–",
+            Verdict::Kept => "◷",
         }
     }
 }
@@ -139,11 +150,13 @@ pub enum Area {
     Cron,
     At,
     Proxy,
+    Archive,
 }
 
 impl Area {
     fn label(self) -> &'static str {
         match self {
+            Area::Archive => "backup archive",
             Area::Pods => "pods",
             Area::Volumes => "network volumes",
             Area::Keys => "OpenRouter keys",
@@ -209,6 +222,17 @@ pub enum Entry {
         public_port: u16,
         target: String,
         provider: Option<String>,
+    },
+    /// A backup-archive resource (server, volume or SSH-key object), labelled with its cohort.
+    Archive {
+        id: u64,
+        name: String,
+        /// `server` / `volume` / `ssh key`.
+        resource: String,
+        /// The cohort prefix its label names.
+        prefix: String,
+        /// `cx23, nbg1, protected` / `200 GB, detached, protected`.
+        detail: String,
     },
 }
 
@@ -281,6 +305,7 @@ pub fn build(inputs: &Inputs, naming: &Naming) -> Report {
     items.push(at_item(&inputs.at, &inputs.user));
     let configured: Vec<&str> = inputs.listings.iter().map(|(p, _)| p.as_str()).collect();
     items.push(proxy_item(&inputs.proxy, &configured));
+    items.push(archive_item(&inputs.archive, naming.prefix, inputs.archive_keep_until, inputs.today_days));
     let count = |v: Verdict| items.iter().filter(|i| i.verdict == v).count();
     let (remaining, unknown) = (count(Verdict::Remaining), count(Verdict::Unknown));
     Report {
@@ -884,6 +909,119 @@ fn closes(s: &str, q: char) -> bool {
     })
 }
 
+/// ~€ per GB of archive volume per month, and a cx23 with its IPv4 per month — Hetzner's list
+/// prices (autumn 2026, excl. VAT), shown as estimates: this check never reads a bill or prices.
+pub const ARCHIVE_VOLUME_EUR_PER_GB_MONTH: f64 = 0.057;
+pub const ARCHIVE_SERVER_EUR_MONTH: f64 = 6.0;
+
+/// The backup archive(s) (`arena archive`) still in the archive's Hetzner project. This
+/// cohort's, with `ARCHIVE_KEEP_UNTIL` set and not yet past, is `◷ kept` (on purpose, doesn't
+/// fail the check); anything else that's there is `✗` — past the date, no date set, orphan
+/// volumes whose server is gone, or another cohort's archive (named, with its own fix). A
+/// listing that failed is `?`. The fix lines are printed, never run, and each deletion is the
+/// typed `--confirm` form.
+pub fn archive_item(probe: &Probe<crate::archive::Inventory>, prefix: &str, keep_until: Option<i64>, today_days: i64) -> Item {
+    const SCOPE: &str = "hetzner";
+    let inv = match probe {
+        Probe::Skipped(why) => return Item::new(Area::Archive, SCOPE, Verdict::Skipped, why.clone()),
+        Probe::Failed(e) => return Item::new(Area::Archive, SCOPE, Verdict::Unknown, format!("couldn't list ({e}) — NOT known to be gone")),
+        Probe::Got(inv) if inv.is_empty() => return Item::new(Area::Archive, SCOPE, Verdict::Clear, "none"),
+        Probe::Got(inv) => inv,
+    };
+    let prefixes = inv.prefixes();
+    let mut item = Item::new(Area::Archive, SCOPE, Verdict::Remaining, String::new());
+    let mut summaries = Vec::new();
+    for p in &prefixes {
+        let Ok(names) = crate::archive::ArchiveNames::new(p) else { continue };
+        let ours = inv.owned_by(&names);
+        let gb: u32 = ours.volumes.iter().map(|v| v.size_gb).sum();
+        let monthly = f64::from(gb) * ARCHIVE_VOLUME_EUR_PER_GB_MONTH + if ours.servers.is_empty() { 0.0 } else { ARCHIVE_SERVER_EUR_MONTH };
+        let server = match ours.servers.as_slice() {
+            [] => "no server (orphan volumes)".to_string(),
+            [s] => format!("{} ({})", s.name, s.server_type),
+            many => format!("{} servers", many.len()),
+        };
+        let vols = match ours.volumes.len() {
+            1 => "1 volume".to_string(),
+            n => format!("{n} volumes"),
+        };
+        summaries.push(format!("{server} + {vols}, {gb} GB, ≈ €{monthly:.0}/month"));
+        for s in &ours.servers {
+            item.entries.push(Entry::Archive {
+                id: s.id,
+                name: s.name.clone(),
+                resource: "server".into(),
+                prefix: p.clone(),
+                detail: format!("{}, {}{}", s.server_type, s.location, if s.delete_protected { ", protected" } else { "" }),
+            });
+        }
+        for v in &ours.volumes {
+            item.entries.push(Entry::Archive {
+                id: v.id,
+                name: v.name.clone(),
+                resource: "volume".into(),
+                prefix: p.clone(),
+                detail: format!(
+                    "{} GB, {}{}",
+                    v.size_gb,
+                    if v.server.is_some() { "attached" } else { "detached" },
+                    if v.delete_protected { ", protected" } else { "" }
+                ),
+            });
+        }
+        for k in &ours.ssh_keys {
+            item.entries.push(Entry::Archive { id: k.id, name: k.name.clone(), resource: "ssh key".into(), prefix: p.clone(), detail: String::new() });
+        }
+        if p == prefix {
+            if !ours.servers.is_empty() {
+                item.fix.push("arena archive access off".into());
+            }
+            item.fix.push(format!("arena archive down --delete-volumes --confirm {}", names.server()));
+            if ours.servers.is_empty() && !ours.volumes.is_empty() {
+                item.notes.push("orphan volumes: their server is gone (`arena archive up` re-attaches them to a new one)".into());
+            }
+        } else {
+            item.fix.push(format!(
+                "MACHINE_NAME_PREFIX={p} arena archive down --delete-volumes --confirm {}   # another cohort's archive: with that cohort's config",
+                names.server()
+            ));
+        }
+    }
+    let only_ours = prefixes.len() == 1 && prefixes[0] == prefix;
+    let orphans = crate::archive::ArchiveNames::new(prefix).is_ok_and(|n| {
+        let ours = inv.owned_by(&n);
+        ours.servers.is_empty() && !ours.volumes.is_empty()
+    });
+    let summary = if prefixes.len() == 1 { summaries.join("") } else { prefixes.iter().zip(&summaries).map(|(p, s)| format!("{p}: {s}")).collect::<Vec<_>>().join("; ") };
+    match keep_until {
+        Some(d) if only_ours && !orphans && today_days <= d => {
+            item.verdict = Verdict::Kept;
+            item.summary = format!("kept until {}: {summary}", crate::schedule::ymd_string(d));
+            item.fix.clear();
+            item.notes.push(format!(
+                "after that date: `arena archive access off`, then `arena archive down --delete-volumes --confirm {prefix}-archive`"
+            ));
+        }
+        Some(d) if only_ours && today_days > d => {
+            item.summary = format!("{summary} — past ARCHIVE_KEEP_UNTIL ({})", crate::schedule::ymd_string(d));
+        }
+        Some(d) if only_ours => {
+            item.summary = format!("{summary} — ARCHIVE_KEEP_UNTIL is {}, but orphan volumes aren't kept", crate::schedule::ymd_string(d));
+        }
+        _ if only_ours => {
+            item.summary = format!("{summary} — no retention date set (ARCHIVE_KEEP_UNTIL)");
+        }
+        _ => {
+            item.summary = summary;
+            if prefixes.iter().any(|p| p != prefix) {
+                item.notes.push("another cohort's archive is in this project — it is not this cohort's to delete without its organisers".into());
+            }
+        }
+    }
+    item.notes.push("deleting the volumes destroys the archived backups — there is no other copy on Hetzner".into());
+    item
+}
+
 /// `N remain`, or `1 remains`.
 fn remain(n: usize) -> String {
     if n == 1 {
@@ -928,7 +1066,7 @@ fn clip(s: &str) -> String {
 /// The lines under an item, one per entry, the name/id column aligned within the item.
 fn entry_lines(entries: &[Entry]) -> Vec<String> {
     let key = |e: &Entry| match e {
-        Entry::Pod { name, .. } | Entry::Key { name, .. } | Entry::Forward { name, .. } => name.clone(),
+        Entry::Pod { name, .. } | Entry::Key { name, .. } | Entry::Forward { name, .. } | Entry::Archive { name, .. } => name.clone(),
         Entry::Volume { id, .. } => id.clone(),
         Entry::AtJob { id, .. } => format!("#{id}"),
         Entry::CronLine { .. } => String::new(),
@@ -989,6 +1127,9 @@ fn entry_lines(entries: &[Entry]) -> Vec<String> {
                     let owner = provider.as_deref().map(|p| format!("  ({p})")).unwrap_or_default();
                     format!("{k}  :{public_port} → {target}{owner}")
                 }
+                Entry::Archive { id, resource, prefix, detail, .. } => {
+                    format!("{k}  id={id}  {resource}  {detail}  (cohort {prefix})")
+                }
             };
             line.trim_end().to_string()
         })
@@ -1022,7 +1163,8 @@ impl Report {
         if !self.clear {
             out.push_str(
                 "Suggested order: cron and at first (so nothing recreates a pod), then keys, pods, volumes, \
-                 and `arena proxy apply` last — then re-run `arena teardown --check`.\n",
+                 and `arena proxy apply` last — then re-run `arena teardown --check`. The backup archive goes \
+                 only after its retention date (ARCHIVE_KEEP_UNTIL).\n",
             );
         }
         out
@@ -1030,13 +1172,15 @@ impl Report {
 
     /// The bottom line, also the error a non-clear check exits with.
     pub fn verdict_line(&self) -> String {
+        let kept = self.items.iter().filter(|i| i.verdict == Verdict::Kept).count();
+        let kept_note = if kept > 0 { format!(" ({kept} kept — marked ◷)") } else { String::new() };
         if self.clear {
             let skipped = self.items.iter().filter(|i| i.verdict == Verdict::Skipped).count();
             let note = if skipped > 0 { format!(" ({skipped} not applicable here — marked –)") } else { String::new() };
-            format!("ALL CLEAR: nothing left billing or scheduled{note}.")
+            format!("ALL CLEAR: nothing left billing or scheduled{note}{kept_note}.")
         } else {
             format!(
-                "NOT CLEAR: {} item(s) still remain, {} couldn't be checked.",
+                "NOT CLEAR: {} item(s) still remain, {} couldn't be checked{kept_note}.",
                 self.remaining, self.unknown
             )
         }
@@ -1091,6 +1235,9 @@ mod tests {
             at: Probe::Skipped("`at` isn't installed here".into()),
             proxy: Probe::Got(ProxyFile { path: "/srv/proxy.conf".into(), text: String::new() }),
             user: "dev".into(),
+            archive: Probe::Got(crate::archive::Inventory::default()),
+            archive_keep_until: None,
+            today_days: 20_000,
         }
     }
 
@@ -1113,6 +1260,7 @@ mod tests {
                 (Area::Cron, "dev", Verdict::Clear),
                 (Area::At, "dev", Verdict::Skipped),
                 (Area::Proxy, "/srv/proxy.conf", Verdict::Clear),
+                (Area::Archive, "hetzner", Verdict::Clear), // the archive answered: none
             ]
         );
         let text = r.render();
@@ -1640,6 +1788,100 @@ mod tests {
             assert!(!out.contains("SECRET") && !out.contains("sk-or"), "{out}");
         }
         assert!(text.contains("OPENROUTER_PROVISIONING_KEY=…\t/usr/local/bin/arena keys gen --yes"), "{text}");
+    }
+
+    fn archive_inv(prefix: &str, server: bool) -> crate::archive::Inventory {
+        use crate::archive::{ArchiveNames, CloudServer, CloudVolume, Tier};
+        let n = ArchiveNames::new(prefix).unwrap();
+        let vol = |id: u64, t: Tier, gb: u32| CloudVolume {
+            id,
+            name: n.volume(t),
+            size_gb: gb,
+            location: "nbg1".into(),
+            server: server.then_some(1),
+            format: Some("ext4".into()),
+            linux_device: String::new(),
+            labels: n.volume_labels(t),
+            delete_protected: true,
+        };
+        crate::archive::Inventory {
+            servers: if server {
+                vec![CloudServer {
+                    id: 1,
+                    name: n.server(),
+                    status: "running".into(),
+                    location: "nbg1".into(),
+                    ipv4: None,
+                    labels: n.labels(),
+                    delete_protected: true,
+                    server_type: "cx23".into(),
+                }]
+            } else {
+                vec![]
+            },
+            volumes: vec![vol(2, Tier::Snap, 50), vol(3, Tier::Big, 200)],
+            ssh_keys: vec![],
+        }
+    }
+
+    /// §14.10: Clear / Kept (this prefix, date not passed) / Remaining (past, unset, orphans,
+    /// another prefix) / Unknown / Skipped — and Kept never fails the check.
+    #[test]
+    fn the_archive_is_kept_until_its_date_and_remains_otherwise() {
+        let item = |p: Probe<crate::archive::Inventory>, keep: Option<i64>| archive_item(&p, "arena9", keep, 20_000);
+        assert_eq!(item(Probe::Got(Default::default()), None).verdict, Verdict::Clear);
+        assert_eq!(item(Probe::Skipped("no token".into()), None).verdict, Verdict::Skipped);
+        let unknown = item(Probe::Failed("HTTP 503".into()), Some(30_000));
+        assert_eq!(unknown.verdict, Verdict::Unknown);
+        assert!(unknown.summary.contains("NOT known to be gone"));
+
+        let kept = item(Probe::Got(archive_inv("arena9", true)), Some(20_118));
+        assert_eq!(kept.verdict, Verdict::Kept);
+        assert_eq!(kept.summary, "kept until 2025-01-30: arena9-archive (cx23) + 2 volumes, 250 GB, ≈ €20/month");
+        assert!(kept.fix.is_empty(), "nothing to do yet");
+        assert_eq!(kept.entries.len(), 3);
+        // The date itself still keeps it.
+        assert_eq!(item(Probe::Got(archive_inv("arena9", true)), Some(20_000)).verdict, Verdict::Kept);
+
+        let past = item(Probe::Got(archive_inv("arena9", true)), Some(19_999));
+        assert_eq!(past.verdict, Verdict::Remaining);
+        assert!(past.summary.contains("past ARCHIVE_KEEP_UNTIL"), "{}", past.summary);
+        assert_eq!(past.fix, ["arena archive access off", "arena archive down --delete-volumes --confirm arena9-archive"]);
+        let unset = item(Probe::Got(archive_inv("arena9", true)), None);
+        assert_eq!(unset.verdict, Verdict::Remaining);
+        assert!(unset.summary.contains("no retention date set"));
+        let orphans = item(Probe::Got(archive_inv("arena9", false)), Some(30_000));
+        assert_eq!(orphans.verdict, Verdict::Remaining);
+        assert!(orphans.summary.contains("no server (orphan volumes)") && orphans.notes.iter().any(|n| n.contains("orphan volumes")), "{orphans:?}");
+        assert_eq!(orphans.fix, ["arena archive down --delete-volumes --confirm arena9-archive"]);
+        let mut both = archive_inv("arena9", true);
+        let other = archive_inv("arena8", false);
+        both.volumes.extend(other.volumes.into_iter().map(|mut v| {
+            v.id += 10;
+            v
+        }));
+        let mixed = item(Probe::Got(both), Some(30_000));
+        assert_eq!(mixed.verdict, Verdict::Remaining);
+        assert!(mixed.summary.starts_with("arena8: no server") && mixed.summary.contains("; arena9: arena9-archive"), "{}", mixed.summary);
+        assert!(mixed.fix.iter().any(|f| f.starts_with("MACHINE_NAME_PREFIX=arena8 arena archive down --delete-volumes --confirm arena8-archive")), "{:?}", mixed.fix);
+
+        // In the report: ◷, not counted, said in the verdict, serialised as "kept".
+        let names = list();
+        let naming = Naming { prefix: "arena9", list: &names };
+        let mut i = inputs();
+        i.keys = Probe::Got(vec![]);
+        i.archive = Probe::Got(archive_inv("arena9", true));
+        i.archive_keep_until = Some(20_118);
+        let r = build(&i, &naming);
+        assert!(r.clear, "{}", r.render());
+        assert!(r.render().contains("◷ backup archive (hetzner): kept until 2025-01-30"), "{}", r.render());
+        assert!(r.verdict_line().contains("(1 kept — marked ◷)"), "{}", r.verdict_line());
+        let v = serde_json::to_value(&r).unwrap();
+        let a = v["items"].as_array().unwrap().iter().find(|x| x["area"] == "archive").unwrap();
+        assert_eq!(a["verdict"], "kept");
+        assert_eq!(a["entries"][0]["kind"], "archive");
+        let back: Verdict = serde_json::from_value(a["verdict"].clone()).unwrap();
+        assert_eq!(back, Verdict::Kept);
     }
 
     /// The JSON scripts read: verdict per item, typed entries, the counts.

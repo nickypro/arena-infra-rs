@@ -82,6 +82,22 @@ pub fn render_proxy(
     out
 }
 
+/// One `Host` block for the backup archive (`arena archive`): its own alias (`archive-<prefix>`,
+/// which no fleet wildcard matches), the read-only `backups` user, ONE identity
+/// (`IdentitiesOnly`, so an agent's or default key is never offered), and a host-key policy:
+/// laptops trust the key on first use (`accept-new`, with the fingerprint printed above the
+/// block to compare), pods get the pinned key in their own `known_hosts` file (`yes`). Unlike
+/// the fleet's blocks, host keys are checked: the archive is one long-lived server.
+pub fn render_archive_block(alias: &str, host: &str, user: &str, identity: &str, known_hosts: Option<&str>, strict: &str) -> String {
+    let mut s = format!(
+        "Host {alias}\n    HostName {host}\n    User {user}\n    IdentityFile {identity}\n    IdentitiesOnly yes\n    StrictHostKeyChecking {strict}\n"
+    );
+    if let Some(kh) = known_hosts {
+        s.push_str(&format!("    UserKnownHostsFile {kh}\n"));
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

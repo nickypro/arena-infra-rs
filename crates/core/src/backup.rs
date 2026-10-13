@@ -782,7 +782,7 @@ mod tests {
         if fake_ssh::have_rsync() {
             let fake = fake_ssh::install(&s.base);
             let target =
-                crate::ssh::SshTarget { user: "root".into(), host: "pod".into(), port: 22, key_paths: vec![], connect_timeout_secs: 5 };
+                crate::ssh::SshTarget { user: "root".into(), host: "pod".into(), port: 22, key_paths: vec![], connect_timeout_secs: 5, host_keys: Default::default() };
             for (tier, pc) in [
                 ("big", crate::pull::PullConfig::big_tier()),
                 ("snapshot", crate::pull::PullConfig::small_tier("50M")),
@@ -907,6 +907,7 @@ mod tests {
             port: 22001,
             key_paths: vec!["/root/.ssh/devtest key".into()],
             connect_timeout_secs: 10,
+            host_keys: Default::default(),
         };
         let line = backup_dry_run_line(&target, s.work.to_str().unwrap(), None, "arena backup");
         // The stand-in: ssh's last argument is the remote command; stdin passes through.

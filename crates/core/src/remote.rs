@@ -521,6 +521,7 @@ mod tests {
             port: 22001,
             key_paths: vec!["/k/arena_key".into()],
             connect_timeout_secs: 10,
+            host_keys: Default::default(),
         }
     }
 

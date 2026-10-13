@@ -40,6 +40,7 @@ flowchart TD
         Proxy["proxy<br/>sticky merge · nginx render/parse"]
         Snap["snapshot<br/>FleetSnapshot · health cache · PublicSnapshot"]
         Tear["teardown<br/>checklist judge"]
+        Arch["archive<br/>backup VM: planners · push argv · setup/probe · status judge"]
         Money["balance + idle<br/>runway judge · idle probe + verdicts"]
         Labels["fleet + status<br/>labels · billing · cost"]
         Jobs["jobs<br/>detached runs on pods"]
@@ -60,12 +61,13 @@ flowchart TD
 
     CLI --> Config
     TUI --> Config
-    CLI --> Sel & Place & Pipe & Setup & Health & Proxy & Snap & Tear & Jobs & Money & Misc
+    CLI --> Sel & Place & Pipe & Setup & Health & Proxy & Snap & Tear & Jobs & Money & Misc & Arch
     TUI --> Snap & Sel & Setup & Health & Money & Misc
     CLI --> Remote
     TUI --> Remote
 
     cfg[("config.env<br/>--config (default: the read-only prod copy)")] -->|read| Config
+    Arch -->|"rsync push (rrsync, write-only) · pinned ssh"| archvm[("backup archive VM<br/>snap + big volumes, sftp read-only")]
     Http -->|HTTPS| APIs[("rest.runpod.io/v1 · api.runpod.io/v2 + /graphql<br/>console.vast.ai/api/v0 · api.hetzner.cloud/v1<br/>openrouter.ai/api/v1")]
     Remote -->|"ssh / scp, each call on a budget"| pods[("pods<br/>setup · deep check · run · jobs · git")]
     CLI -->|"write (flock, atomic) + SSH_PROXY_RELOAD_CMD"| nginx[("proxy nginx stream config<br/>local file, or over SSH")]
@@ -81,7 +83,7 @@ flowchart TD
 | crate | binary | role |
 |-------|--------|------|
 | `arena-core` | — | config parsing, the `Provider` trait + RunPod v1/v2, Vast, Hetzner backends + `build`/`build_fleet` factories, the `Remote` SSH seam, every planner and judge (selector, placement, pipeline, proxy merge, health, snapshot, teardown, jobs, balance, idle), the `Pod`/`PodSpec` model, errors |
-| `arena-cli` | `arena` | clap CLI over the library: `pods …` (list/create/up/setup/stop/start/restart/rename/reimage/replace/migrate/terminate/backup/pull/baseline/restore/init-branches/set-branch/run/jobs/logs/test/copy-keys/cp), `pods idle`, `proxy plan/apply`, `snapshot`, `teardown --check`, `balance`, `offers`, `gpus`, `keys`, `ssh-config`, `config`, `cron`, `plan`, `tui`. Owns the I/O: the `up` executor (`up.rs`), the job fan-out (`jobs.rs`), the teardown readers (`teardown.rs`), the account reads and idle probes (`money.rs`), proxy deploys |
+| `arena-cli` | `arena` | clap CLI over the library: `pods …` (list/create/up/setup/stop/start/restart/rename/reimage/replace/migrate/terminate/backup/pull/baseline/restore/init-branches/set-branch/run/jobs/logs/test/copy-keys/cp), `pods idle`, `proxy plan/apply`, `snapshot`, `teardown --check`, `balance`, `offers`, `gpus`, `keys`, `ssh-config`, `config`, `cron`, `plan`, `archive`, `tui`. Owns the I/O: the `up` executor (`up.rs`), the job fan-out (`jobs.rs`), the teardown readers (`teardown.rs`), the account reads and idle probes (`money.rs`), the backup archive's handlers (`archive.rs`: Hetzner calls, pinned SSH to the VM, the pushes), proxy deploys |
 | `arena-tui` | `arena-tui` | ratatui dashboard: each refresh is one `snapshot::build`; per-pod and marked-set actions behind confirmation modals; background deep checks into the shared health cache; the prepaid balances in the summary bar (observed in the details round) |
 
 `web/fleet.html` is not a crate: a self-contained page that renders `fleet.json`
@@ -109,7 +111,8 @@ flowchart TD
 | `proxy` | the nginx `stream` config: stable port = `MACHINE_NAME_LIST` index; `plan_forwards` **merges** the previous config with a per-provider listing and removes a forward only when its pod is confirmed gone; render ↔ parse round-trip | yes |
 | `fleet`, `status` | the one place a pod's labels (GPU, `$/H`, endpoint, maintenance) and the fleet cost are computed; `is_billing`/`bills_hourly` decide what counts as billing | yes |
 | `snapshot` | `FleetSnapshot` (`build`: pods + proxy state + last health), the SSH-port reachability probe behind the `Reach` seam (`SshPortProbe`: TCP connect + sshd's greeting, nothing sent), the prefix-scoped health cache (atomic, locked, 0600), and `PublicSnapshot` — a separate allowlisted struct for publishing (`up` needs the probe's answer) | build + targets pure; probe and cache I/O |
-| `teardown` | turns listings, volumes, OpenRouter keys, cron/`at` lines and the proxy file into a ✓ ✗ ? – checklist with fix commands (unknown ≠ empty) | yes |
+| `teardown` | turns listings, volumes, OpenRouter keys, cron/`at` lines, the proxy file and the backup archive's inventory into a ✓ ✗ ? – ◷ checklist with fix commands (unknown ≠ empty; `◷ kept` = there on purpose until `ARCHIVE_KEEP_UNTIL`) | yes |
+| `archive` | the backup archive VM (`arena archive`): `plan` (up/down/resize planners that refuse anything ambiguous and never plan a volume deletion without the typed confirm), `sync` (labels, sealing and partial seals, the round-robin backlog, the cohort push set, `SECRET_EXCLUDES`, unstorable symlinks, the exact push argv — never a deleting/in-place/attribute flag — and failure classes), `render` (the embedded `setup.sh`/`probe.sh` and every file sent to the VM: sshd drop-in, fstab block, forced rrsync key line, read keys, README, ssh blocks), `report` (setup report, probe, status judge), `state` (keys, pin, `archive.json`, per-tier sync state, `forgotten.json`, atomic 0600), `cloud` (the `ArchiveCloud` seam: Hetzner servers/volumes/keys/actions/prices, fail-closed listings; a stateful fake) | planners/renderers/judges pure; `cloud` and `state` I/O |
 | `lock` | pod locks (`Pod::locked`, RunPod v2): the up-front refusal of a locked pod for every lifecycle command, the API's `Locked` error read as the same `… is locked — arena pods unlock … first`, `pods lock`/`unlock`'s plan | yes |
 | `apiextra`, `apiget` | `--api-json`/`CREATE_EXTRA_JSON` (parse, deep-merge into a backend's create body, refuse its `MANAGED` fields and a `ports` list without `22/tcp`); `arena api get` (path guard: relative to the provider's API base only; secret redaction; no redirects) | yes (one GET in `apiget::get`) |
 | `jobs` | detached runs (`pods run --background`): the on-pod wrapper, ids, status, log reads by byte offset | yes |
@@ -195,6 +198,17 @@ flowchart TD
   maintenance times — no IPs, ports, ids, providers, costs or keys (pinned by a leak test).
 - **Secrets stay out of git**: `config.env` and `*.key` are git-ignored; `config check`
   shows set/missing only.
+- **The backup archive is outside the fleet and can't reach it**: its resources carry the
+  `arena-archive` label, which the Hetzner fleet listing drops (no fleet command can see or
+  touch it) and delete protection backs up; it holds no outbound credential. Each role has its
+  own key — admin (authorized by no pod), push (forced into write-only, no-delete rrsync), read
+  (per cohort) — every connection to it is pinned to its recorded host key, and its cron path
+  makes no Hetzner call at all. Pushes are additive by construction (no deleting, in-place or
+  attribute-setting flag can be built — a test over every combination — so a file already on the
+  archive, which other days and pods share, never changes), carry only the cohort's pod dirs
+  (never a current `@` staff entry or a pod `archive forget` revoked) and never secret files,
+  and participants read only after `archive access on`. One pod that can't be pushed never holds
+  the others' labels open (round-robin backlog; "sealed partial" after three failed runs).
 
 ## Testing
 

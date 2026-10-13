@@ -564,6 +564,7 @@ mod tests {
             port: 22001,
             key_paths: vec![],
             connect_timeout_secs: 5,
+            host_keys: Default::default(),
         }
     }
 

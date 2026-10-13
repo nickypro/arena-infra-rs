@@ -59,6 +59,15 @@ impl Config {
         "BALANCE_WARN_HOURS",
         // The stand-in $/h per GPU for a running pod nobody priced (`balance::stand_in_price`).
         "BALANCE_UNPRICED_PER_GPU",
+        // The backup archive's per-run knobs (`archive::ArchiveSettings`): sizes for one `archive
+        // up`, a retention date, push bandwidth and budgets — none of them secret. (Its token,
+        // ARCHIVE_HETZNER_API_KEY, belongs in the config file.)
+        "ARCHIVE_SNAP_GB",
+        "ARCHIVE_BIG_GB",
+        "ARCHIVE_KEEP_UNTIL",
+        "ARCHIVE_BWLIMIT",
+        "ARCHIVE_SNAP_TIMEOUT_SECS",
+        "ARCHIVE_BIG_TIMEOUT_SECS",
     ];
 
     /// Let environment variables override values from the file: any key already in the

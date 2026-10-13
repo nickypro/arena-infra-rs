@@ -1083,6 +1083,7 @@ mod tests {
             port: 22,
             key_paths: vec![],
             connect_timeout_secs: 10,
+            host_keys: Default::default(),
         };
         let run = |jobs: &[PullJob]| {
             for job in jobs {
@@ -1202,7 +1203,7 @@ mod tests {
 
         // Via local staging: pull the source (split as `pods pull` does), push the stage.
         let fake = fake_ssh::install(&root);
-        let target = crate::ssh::SshTarget { user: "root".into(), host: "10.0.0.2".into(), port: 22, key_paths: vec![], connect_timeout_secs: 10 };
+        let target = crate::ssh::SshTarget { user: "root".into(), host: "10.0.0.2".into(), port: 22, key_paths: vec![], connect_timeout_secs: 10, host_keys: Default::default() };
         let probe = RepoProbe {
             home: Some(root.join("old/home").display().to_string()),
             real: Some(root.join("old/ws/ARENA_materials").display().to_string()),
@@ -1307,7 +1308,7 @@ mod tests {
         put("stage/notes.txt", "notes\n");
         put("stage/ARENA_materials/chapter1/work.py", "work\n");
         let fake = fake_ssh::install(&root);
-        let target = crate::ssh::SshTarget { user: "root".into(), host: "10.0.0.2".into(), port: 22, key_paths: vec![], connect_timeout_secs: 10 };
+        let target = crate::ssh::SshTarget { user: "root".into(), host: "10.0.0.2".into(), port: 22, key_paths: vec![], connect_timeout_secs: 10, host_keys: Default::default() };
         for (src, cfg) in push_jobs(&pc, &stage, Some("ARENA_materials"), true) {
             fake_ssh::rsync(&fake_ssh::swap_transport(&push_rsync_args(&target, &cfg, &src), &fake), &root.join("via/home"));
         }
@@ -1344,7 +1345,7 @@ mod tests {
         let staged_repo = std::fs::symlink_metadata(root.join("stage/ARENA_materials")).is_ok_and(|m| m.is_dir());
         assert!(!staged_repo);
         let fake = fake_ssh::install(&root);
-        let target = crate::ssh::SshTarget { user: "root".into(), host: "10.0.0.2".into(), port: 22, key_paths: vec![], connect_timeout_secs: 10 };
+        let target = crate::ssh::SshTarget { user: "root".into(), host: "10.0.0.2".into(), port: 22, key_paths: vec![], connect_timeout_secs: 10, host_keys: Default::default() };
         for (src, cfg) in push_jobs(&pc, &stage, Some("ARENA_materials"), staged_repo) {
             fake_ssh::rsync(&fake_ssh::swap_transport(&push_rsync_args(&target, &cfg, &src), &fake), &root.join("dest"));
         }
@@ -1424,7 +1425,7 @@ mod tests {
             assert!(root.join(format!("{name}/home/ARENA_materials/ex/clone/.git")).is_dir());
         }
         let fake = fake_ssh::install(&root);
-        let target = crate::ssh::SshTarget { user: "root".into(), host: "10.0.0.2".into(), port: 22, key_paths: vec![], connect_timeout_secs: 10 };
+        let target = crate::ssh::SshTarget { user: "root".into(), host: "10.0.0.2".into(), port: 22, key_paths: vec![], connect_timeout_secs: 10, host_keys: Default::default() };
         let stage = format!("{}/", root.join("stage").display());
         let split = RepoPull { rel: "ARENA_materials".into(), source: format!("{}/", repo.display()), whole: false };
         let staging_pc = PullConfig { mirror: Mirror::Exact, ..PullConfig::replication() };
@@ -1539,7 +1540,7 @@ mod tests {
         std::fs::write(home.join("notes.txt"), "notes\n").unwrap();
         std::os::unix::fs::symlink(&vol, home.join("ARENA_materials")).unwrap();
         let fake = fake_ssh::install(&root);
-        let target = crate::ssh::SshTarget { user: "root".into(), host: "10.0.0.1".into(), port: 22, key_paths: vec![], connect_timeout_secs: 10 };
+        let target = crate::ssh::SshTarget { user: "root".into(), host: "10.0.0.1".into(), port: 22, key_paths: vec![], connect_timeout_secs: 10, host_keys: Default::default() };
         let repo = home.join("ARENA_materials").display().to_string();
         let probe = RepoProbe { home: Some(home.display().to_string()), real: Some(vol.display().to_string()), volume_mounted: true, ..Default::default() };
         let home_abs = home.display().to_string();

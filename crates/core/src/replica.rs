@@ -719,7 +719,7 @@ mod tests {
     fn sync(src: &Path, dst: &Path, stamp: &str) {
         let pc = crate::pull::PullConfig { mirror: home_mirror(stamp), ..crate::pull::PullConfig::replication() };
         let mut args: Vec<String> = crate::pull::push_rsync_args(
-            &crate::ssh::SshTarget { user: "u".into(), host: "h".into(), port: 1, key_paths: vec![], connect_timeout_secs: 1 },
+            &crate::ssh::SshTarget { user: "u".into(), host: "h".into(), port: 1, key_paths: vec![], connect_timeout_secs: 1, host_keys: Default::default() },
             &pc,
             &format!("{}/", src.display()),
         );
