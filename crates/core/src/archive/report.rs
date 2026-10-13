@@ -571,7 +571,8 @@ pub fn judge_status(i: &StatusInputs) -> StatusReport {
         Some(d) => r.add("retention", Level::Ok, format!("kept until {}", crate::schedule::ymd_string(d))),
     }
     if let Some(p) = i.prices {
-        r.add("cost", Level::Ok, format!("≈ €{:.2}/month ({gb_total} GB of volumes{})", p.monthly(server_seen, gb_total), if server_seen { " + the server" } else { "" }));
+        let cost = super::cloud::eur_month(p.monthly(server_seen, gb_total));
+        r.add("cost", Level::Ok, format!("≈ {cost} ({gb_total} GB of volumes{})", if server_seen { " + the server with its IPv4" } else { "" }));
     }
     r
 }
@@ -802,6 +803,17 @@ mod tests {
     }
 
     fn judge(edit: impl Fn(&mut ProbeReport), snap: &SnapState, big: &BigState, h: &ArchiveHost, inventory: Option<Result<&Inventory, String>>) -> StatusReport {
+        judge_priced(edit, snap, big, h, inventory, None)
+    }
+
+    fn judge_priced(
+        edit: impl Fn(&mut ProbeReport),
+        snap: &SnapState,
+        big: &BigState,
+        h: &ArchiveHost,
+        inventory: Option<Result<&Inventory, String>>,
+        prices: Option<Prices>,
+    ) -> StatusReport {
         let n = ArchiveNames::new("arena9").unwrap();
         let mut p = parse_probe(&healthy_probe_text()).unwrap();
         edit(&mut p);
@@ -829,9 +841,47 @@ mod tests {
             keep_until_days: None,
             today_days: 20_000,
             token_warning: None,
-            prices: None,
+            prices,
         };
         judge_status(&i)
+    }
+
+    /// W7 live (A1/A9): one archive, one price — `teardown --check`'s item, `archive status`'s
+    /// cost line and `balance`'s €/h (× the hours of a month) are the same figure to the cent,
+    /// the server's IPv4 included: with the live prices and with the list ones (`/pricing`
+    /// down), for the archive and for its orphan volumes.
+    #[tokio::test]
+    async fn teardown_status_and_balance_price_the_archive_alike() {
+        use crate::archive::cloud::{archive_prices, eur_month, eur_per_hr, server_body, volume_body, ArchiveCloud, FakeArchiveCloud, HOURS_PER_MONTH};
+        use crate::teardown::{archive_item, Probe};
+        let n = ArchiveNames::new("arena9").unwrap();
+        let fake = FakeArchiveCloud::new();
+        let key = fake.create_ssh_key(&n.ssh_key(), "ssh-ed25519 AAAA", &n.labels()).await.unwrap();
+        let (srv, _) = fake.create_server(&server_body(&n, "cx23", "nbg1", key.id)).await.unwrap();
+        for t in [Tier::Snap, Tier::Big] {
+            fake.create_volume(&volume_body(&n, t, 10, srv.id)).await.unwrap();
+        }
+        // Live (the fake's /pricing): €5.49 + €0.50 + 20 × €0.0572; the list: the W7 live figure.
+        let pinned = [(false, "€7.13/month"), (true, "€8.62/month")];
+        for orphans in [false, true] {
+            if orphans {
+                fake.delete_server(srv.id).await.unwrap();
+            }
+            for (fail, server_and_volumes) in pinned {
+                fake.fail_prices(fail);
+                let inv = fake.inventory(Some("arena9")).await.unwrap();
+                let p = archive_prices(&fake, &inv.owned_by(&n)).await;
+                let teardown = archive_item(&Probe::Got(inv.clone()), "arena9", None, 20_000, &p).summary;
+                let status = judge_priced(|_| {}, &snap_ok(), &big_ok(), &host(), Some(Ok(&inv)), Some(p));
+                let status = status.items.iter().find(|i| i.name == "cost").expect("a cost line").msg.clone();
+                let balance = eur_month(eur_per_hr(&fake, &n).await.unwrap().unwrap() * HOURS_PER_MONTH);
+                assert!(teardown.contains(&format!("≈ {balance}")), "orphans {orphans}, /pricing down {fail}: teardown {teardown} vs balance {balance}");
+                assert!(status.starts_with(&format!("≈ {balance} ")), "orphans {orphans}, /pricing down {fail}: status {status} vs balance {balance}");
+                if !orphans {
+                    assert_eq!(balance, server_and_volumes, "/pricing down {fail}");
+                }
+            }
+        }
     }
 
     fn level_of(r: &StatusReport, name: &str) -> Level {

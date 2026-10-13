@@ -136,10 +136,55 @@ pub struct Prices {
 }
 
 impl Prices {
-    /// The archive's monthly cost: the server (with its IPv4) plus `gb` of volume.
+    /// Hetzner's list prices (EUR excl. VAT) as its `/pricing` answered on 2026-10-13 (a cx23 in
+    /// nbg1, a primary IPv4, a GB of volume): what every surface prices the archive at when the
+    /// live list can't be read — the same table everywhere, so no surface keeps a figure of its
+    /// own (W7 live: `teardown` said ≈ €7/month from constants of its own, without the IPv4,
+    /// where `up`/`status`/`balance` said €8.62).
+    pub const LIST: Prices = Prices { volume_gb_month: 0.0767, server_month: Some(6.49), ipv4_month: Some(0.60) };
+
+    /// What `servers` archive servers (each with its primary IPv4) and `gb` of volumes cost a
+    /// month — THE rule every surface prices the archive by (`archive up`/`down`/`resize`/
+    /// `status`, `teardown --check`, `balance`). A part the live list lacks (the type isn't sold
+    /// in that location) is priced from [`Prices::LIST`], never left out.
+    pub fn monthly_for(&self, servers: usize, gb: u32) -> f64 {
+        let server = self.server_month.or(Self::LIST.server_month).unwrap_or(0.0) + self.ipv4_month.or(Self::LIST.ipv4_month).unwrap_or(0.0);
+        servers as f64 * server + f64::from(gb) * self.volume_gb_month
+    }
+
+    /// [`Prices::monthly_for`] for none or one server.
     pub fn monthly(&self, server: bool, gb: u32) -> f64 {
-        let s = if server { self.server_month.unwrap_or(0.0) + self.ipv4_month.unwrap_or(0.0) } else { 0.0 };
-        s + f64::from(gb) * self.volume_gb_month
+        self.monthly_for(usize::from(server), gb)
+    }
+}
+
+/// `€X.XX/month` — how every surface writes the archive's monthly cost.
+pub fn eur_month(eur: f64) -> String {
+    format!("€{eur:.2}/month")
+}
+
+/// The prices an archive of that server type in that location is shown at: the live `/pricing`
+/// when it answers, else [`Prices::LIST`] — and whether they are live.
+pub async fn prices_or_list(cloud: &dyn ArchiveCloud, server_type: &str, location: &str) -> (Prices, bool) {
+    match cloud.prices(server_type, location).await {
+        Ok(p) => (p, true),
+        Err(_) => (Prices::LIST, false),
+    }
+}
+
+/// The prices one cohort's archive (`owned`) is shown at by every surface: [`prices_or_list`]
+/// for its server type and location ([`priced_as`]).
+pub async fn archive_prices(cloud: &dyn ArchiveCloud, owned: &Inventory) -> Prices {
+    let (server_type, location) = priced_as(owned);
+    prices_or_list(cloud, &server_type, &location).await.0
+}
+
+/// The server type and location one cohort's archive (`owned`) is priced at: its server's;
+/// with only its volumes left (orphans), the first default type in their location.
+pub fn priced_as(owned: &Inventory) -> (String, String) {
+    match owned.servers.first() {
+        Some(s) => (s.server_type.clone(), s.location.clone()),
+        None => (super::DEFAULT_SERVER_TYPES[0].to_string(), owned.volumes.first().map(|v| v.location.clone()).unwrap_or_else(|| "nbg1".into())),
     }
 }
 
@@ -147,22 +192,18 @@ impl Prices {
 /// monthly price — which an always-on archive always reaches.
 pub const HOURS_PER_MONTH: f64 = 730.0;
 
-/// What this cohort's archive bills per hour (EUR excl. VAT): its server(s) with the IPv4 and
-/// its volumes, at `/pricing`'s monthly rates over [`HOURS_PER_MONTH`]. For `arena balance`'s
-/// Hetzner row — the fleet listing leaves the archive out, so nothing else prices it. Reads
-/// only (one inventory, one price list); `Ok(None)`: this cohort has no archive.
+/// What this cohort's archive bills per hour (EUR excl. VAT): [`Prices::monthly_for`] its
+/// server(s) and volumes ([`prices_or_list`]) over [`HOURS_PER_MONTH`] — the figure `archive
+/// status` and `teardown --check` show per month. For `arena balance`'s Hetzner row — the fleet
+/// listing leaves the archive out, so nothing else prices it. Reads only (one inventory, one
+/// price list); `Ok(None)`: this cohort has no archive.
 pub async fn eur_per_hr(cloud: &dyn ArchiveCloud, names: &ArchiveNames) -> Result<Option<f64>> {
     let owned = cloud.inventory(Some(&names.prefix)).await?.owned_by(names);
     if owned.servers.is_empty() && owned.volumes.is_empty() {
         return Ok(None);
     }
     let gb: u32 = owned.volumes.iter().map(|v| v.size_gb).sum();
-    let server = owned.servers.first();
-    let location = server.map(|s| s.location.clone()).or_else(|| owned.volumes.first().map(|v| v.location.clone())).unwrap_or_default();
-    let server_type = server.map_or(super::DEFAULT_SERVER_TYPES[0], |s| s.server_type.as_str());
-    let p = cloud.prices(server_type, &location).await?;
-    let servers = owned.servers.len() as f64 * p.monthly(true, 0);
-    Ok(Some((servers + p.monthly(false, gb)) / HOURS_PER_MONTH))
+    Ok(Some(archive_prices(cloud, &owned).await.monthly_for(owned.servers.len(), gb) / HOURS_PER_MONTH))
 }
 
 /// The Hetzner calls the archive makes. `inventory` is the only read every command needs;
@@ -599,6 +640,8 @@ mod fake {
         unavailable: Vec<String>,
         /// Fail the n-th (1-based) volume create.
         fail_volume_create: Option<usize>,
+        /// `/pricing` fails.
+        fail_prices: bool,
         volume_creates: usize,
     }
 
@@ -630,6 +673,11 @@ mod fake {
         /// These server types answer `resource_unavailable`.
         pub fn unavailable(&self, types: &[&str]) {
             self.world.lock().unwrap().unavailable = types.iter().map(|s| s.to_string()).collect();
+        }
+
+        /// `/pricing` fails (or answers again).
+        pub fn fail_prices(&self, fail: bool) {
+            self.world.lock().unwrap().fail_prices = fail;
         }
 
         /// The `n`-th volume create (1-based, counting from now) fails with a 500.
@@ -861,7 +909,9 @@ mod fake {
         }
 
         async fn prices(&self, _server_type: &str, _location: &str) -> Result<Prices> {
-            drop(self.record(CloudCall::Prices));
+            if self.record(CloudCall::Prices).fail_prices {
+                return Err(Error::provider("hetzner pricing HTTP 503"));
+            }
             Ok(Prices { volume_gb_month: 0.0572, server_month: Some(5.49), ipv4_month: Some(0.5) })
         }
     }
@@ -891,6 +941,10 @@ mod tests {
         assert!((eur_per_hr(&fake, &n).await.unwrap().unwrap() - 250.0 * 0.0572 / HOURS_PER_MONTH).abs() < 1e-12);
         // Another cohort's archive is not this one's cost.
         assert_eq!(eur_per_hr(&fake, &ArchiveNames::new("other").unwrap()).await.unwrap(), None);
+        // `/pricing` down: the list prices, never no figure (orphan volumes priced as such).
+        fake.fail_prices(true);
+        assert!((eur_per_hr(&fake, &n).await.unwrap().unwrap() - Prices::LIST.monthly_for(0, 250) / HOURS_PER_MONTH).abs() < 1e-12);
+        fake.fail_prices(false);
         fake.fail_inventory(Some("hetzner archive list servers HTTP 503"));
         assert!(eur_per_hr(&fake, &n).await.is_err());
     }
@@ -1008,6 +1062,10 @@ mod tests {
         assert_eq!(p, Prices { volume_gb_month: 0.044, server_month: Some(4.59), ipv4_month: Some(0.5) });
         assert!((p.monthly(true, 100) - (4.59 + 0.5 + 4.4)).abs() < 1e-9);
         assert!((p.monthly(false, 10) - 0.44).abs() < 1e-9);
+        // A type not sold there is priced from the list, never left out of the total.
+        let cax = parse_prices(&body, "cax11", "nbg1").unwrap();
+        assert!((cax.monthly_for(2, 0) - 2.0 * (Prices::LIST.server_month.unwrap() + 0.5)).abs() < 1e-9);
+        assert_eq!(eur_month(8.624), "€8.62/month");
         assert_eq!(parse_prices(&body, "cax11", "nbg1").unwrap().server_month, None);
         assert!(parse_prices(&json!({}), "cx23", "nbg1").is_err());
     }

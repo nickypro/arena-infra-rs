@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use arena_core::balance;
-use arena_core::archive::{ArchiveCloud, Inventory};
+use arena_core::archive::{ArchiveCloud, Inventory, Prices};
 use arena_core::openrouter::{KeyApi, KeyInfo};
 use arena_core::provider::runpod::NetworkVolume;
 use arena_core::provider::{runpod, runpod_v2, RunpodApi, LIST_TIMEOUT};
@@ -45,7 +45,8 @@ pub(crate) async fn handle_teardown(provider: &dyn Provider, cfg: &Config, check
     let bal = BalanceCtx::from_config(cfg);
     // The backup archive's own project (its token, else the fleet's): a list call, nothing else.
     let cloud = arena_core::archive::archive_token(cfg).map(|(t, _)| arena_core::archive::HetznerArchiveCloud::new(t));
-    let archive = read_archive(cloud.as_ref().map(|c| c as &dyn ArchiveCloud));
+    let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena").to_string();
+    let archive = read_archive_priced(cloud.as_ref().map(|c| c as &dyn ArchiveCloud), &prefix);
     teardown_with(provider, cfg, read_volumes(cfg), archive, keys, &SystemSched, json, &bal).await
 }
 
@@ -57,7 +58,7 @@ pub(crate) async fn teardown_with(
     provider: &dyn Provider,
     cfg: &Config,
     volumes: impl Future<Output = Probe<Vec<NetworkVolume>>>,
-    archive: impl Future<Output = Probe<Inventory>>,
+    archive: impl Future<Output = (Probe<Inventory>, Prices)>,
     keys: Option<&dyn KeyApi>,
     sched: &dyn Sched,
     json: bool,
@@ -98,7 +99,7 @@ async fn collect(
     provider: &dyn Provider,
     cfg: &Config,
     volumes: impl Future<Output = Probe<Vec<NetworkVolume>>>,
-    archive: impl Future<Output = Probe<Inventory>>,
+    archive: impl Future<Output = (Probe<Inventory>, Prices)>,
     keys: Option<&dyn KeyApi>,
     sched: &dyn Sched,
     bal: &BalanceCtx,
@@ -109,7 +110,7 @@ async fn collect(
     let observing = balance::observe(bal.api.as_ref(), &state, mode, balance::INLINE_TIMEOUT, now);
     // `list_by_provider`, not `list_pods`: the fleet's `list_pods` drops a backend that
     // failed, which here would read as "that provider has no pods".
-    let (listings, volumes, archive, keys, cron, at, fetched) = tokio::join!(
+    let (listings, volumes, (archive, archive_prices), keys, cron, at, fetched) = tokio::join!(
         provider.list_by_provider(),
         volumes,
         archive,
@@ -141,6 +142,7 @@ async fn collect(
         user: current_user(),
         archive,
         archive_keep_until,
+        archive_prices,
         today_days: arena_core::schedule::days_from_unix(arena_core::snapshot::unix_now()),
     };
     let mut report = teardown::build(&inputs, &Naming::from_config(cfg));
@@ -188,6 +190,26 @@ pub(crate) async fn read_archive(cloud: Option<&dyn ArchiveCloud>) -> Probe<Inve
         Ok(Err(e)) => Probe::Failed(e.to_string()),
         Err(_) => Probe::Failed(format!("timed out after {}s", LIST_TIMEOUT.as_secs())),
     }
+}
+
+/// [`read_archive`] and the prices its cost is shown at: this cohort's archive (else the first
+/// one listed) priced as `archive status` and `balance` price it ([`arena_core::archive::cloud::
+/// archive_prices`]: one bounded, read-only `GET /pricing`, else the list prices) — so the three
+/// agree (W7 live: teardown said ≈ €7/month where they said €8.62).
+pub(crate) async fn read_archive_priced(cloud: Option<&dyn ArchiveCloud>, prefix: &str) -> (Probe<Inventory>, Prices) {
+    let probe = read_archive(cloud).await;
+    let prices = match (cloud, &probe) {
+        (Some(cloud), Probe::Got(inv)) if !inv.is_empty() => {
+            let names = arena_core::archive::ArchiveNames::new(prefix).ok().filter(|n| !inv.owned_by(n).is_empty());
+            let names = names.or_else(|| inv.prefixes().first().and_then(|p| arena_core::archive::ArchiveNames::new(p).ok()));
+            match names {
+                Some(n) => tokio::time::timeout(LIST_TIMEOUT, arena_core::archive::cloud::archive_prices(cloud, &inv.owned_by(&n))).await.unwrap_or(Prices::LIST),
+                None => Prices::LIST,
+            }
+        }
+        _ => Prices::LIST,
+    };
+    (probe, prices)
 }
 
 /// Every OpenRouter key on the account (all pages); `teardown::keys_item` picks this cohort's.
@@ -443,8 +465,8 @@ mod tests {
         Pod { id: format!("id-{name}"), name: name.into(), provider: "runpod".into(), status: status.into(), ..Default::default() }
     }
 
-    fn no_archive() -> Probe<Inventory> {
-        Probe::Skipped("no token".into())
+    fn no_archive() -> (Probe<Inventory>, Prices) {
+        (Probe::Skipped("no token".into()), Prices::LIST)
     }
 
     /// S16 / S8: teardown's archive read is one LIST — no mutation, whatever it finds — and a
@@ -502,7 +524,7 @@ mod tests {
             if let Some(d) = keep_until {
                 cfg.values.insert("ARCHIVE_KEEP_UNTIL".into(), d.into());
             }
-            let ready = |a: &Probe<Inventory>| std::future::ready(a.clone());
+            let ready = |a: &Probe<Inventory>| std::future::ready((a.clone(), Prices::LIST));
             let report = collect(&fleet, &cfg, std::future::ready(Probe::Got(vec![])), ready(&archive), None, &sched, &bal).await;
             let item = report.items.iter().find(|i| i.area == Area::Archive).expect("an archive item");
             assert_eq!(item.verdict, verdict, "{}", report.render());

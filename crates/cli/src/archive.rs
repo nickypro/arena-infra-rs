@@ -243,9 +243,9 @@ fn days_today() -> i64 {
     arena_core::schedule::days_from_unix(arena_core::snapshot::unix_now())
 }
 
-/// `€X.XX/month`.
+/// `€X.XX/month` (the one format: `archive::cloud::eur_month`).
 fn eur(x: f64) -> String {
-    format!("€{x:.2}/month")
+    archive::cloud::eur_month(x)
 }
 
 // =========================================================================================
@@ -330,16 +330,18 @@ pub(crate) async fn archive_up(env: &Env<'_>, cloud: &dyn ArchiveCloud, source: 
         .iter()
         .map(|t| inv.volume(names, *t).map(|v| v.size_gb).unwrap_or_else(|| flags.of(*t).unwrap_or_else(|| settings.size_of(*t))))
         .sum();
-    match cloud.prices(&server_type, &location).await {
-        Ok(p) => println!(
-            "  cost: ≈ {} ({server_type} {}, IPv4 {}, {gb} GB of volumes at €{:.4}/GB) — excl. VAT",
-            eur(p.monthly(true, gb)),
-            p.server_month.map_or("?".into(), eur),
-            p.ipv4_month.map_or("?".into(), eur),
-            p.volume_gb_month
-        ),
-        Err(e) => println!("  cost: live prices unavailable ({e})"),
-    }
+    // The one pricing rule (`Prices::monthly_for`): live, else the list prices — as `status`,
+    // `teardown --check` and `balance` show it.
+    let (p, live) = archive::cloud::prices_or_list(cloud, &server_type, &location).await;
+    let p_or = |x: Option<f64>, list: Option<f64>| eur(x.or(list).unwrap_or(0.0));
+    println!(
+        "  cost: ≈ {} ({server_type} {}, IPv4 {}, {gb} GB of volumes at €{:.4}/GB) — excl. VAT{}",
+        eur(p.monthly(true, gb)),
+        p_or(p.server_month, archive::Prices::LIST.server_month),
+        p_or(p.ipv4_month, archive::Prices::LIST.ipv4_month),
+        p.volume_gb_month,
+        if live { "" } else { " (Hetzner's list prices: /pricing didn't answer)" }
+    );
     println!("  participant access: {}", if env.host()?.is_some_and(|h| h.access_on) { "on (kept)" } else { "OFF until `arena archive access on`" });
     if o.dry_run {
         print_local_sizes(env.cfg, &inv, names, &settings, flags);
@@ -718,8 +720,11 @@ pub(crate) async fn archive_status(env: &Env<'_>, cloud: Option<&dyn ArchiveClou
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| now.saturating_sub(d.as_secs()));
-    let prices = match (cloud, inventory.as_ref().and_then(|i| i.as_ref().ok()).and_then(|i| i.server(names))) {
-        (Some(c), Some(s)) => c.prices(&s.server_type, &s.location).await.ok(),
+    // Priced as everywhere (`Prices::monthly_for`, live else the list prices) — orphan
+    // volumes included.
+    let owned = inventory.as_ref().and_then(|i| i.as_ref().ok()).map(|i| i.owned_by(names)).filter(|o| !o.servers.is_empty() || !o.volumes.is_empty());
+    let prices = match (cloud, owned) {
+        (Some(c), Some(o)) => Some(archive::cloud::archive_prices(c, &o).await),
         _ => None,
     };
     let expected = host.as_ref().and_then(|h| backups_keys(env, h.access_on).ok());
@@ -1523,7 +1528,7 @@ pub(crate) async fn archive_resize(env: &Env<'_>, cloud: &dyn ArchiveCloud, tier
         println!("{} is already {} GB: growing its filesystem to it (finishing a resize whose resize2fs step failed)", env.names.volume(tier), plan.to_gb);
     }
     let delta = match inv.server(&env.names) {
-        Some(s) => cloud.prices(&s.server_type, &s.location).await.ok().map(|p| f64::from(plan.to_gb - plan.from_gb) * p.volume_gb_month),
+        Some(s) => Some(f64::from(plan.to_gb - plan.from_gb) * archive::cloud::prices_or_list(cloud, &s.server_type, &s.location).await.0.volume_gb_month),
         None => None,
     };
     println!(
@@ -1912,11 +1917,11 @@ pub(crate) async fn archive_down(env: &Env<'_>, cloud: &dyn ArchiveCloud, o: Dow
             h.ipv4 = String::new();
             state::save(&env.paths.host_file(), &h).context("writing archive.json")?;
         }
-        let price = cloud.prices("cx23", &ours.volumes.first().map(|v| v.location.clone()).unwrap_or_else(|| "nbg1".into())).await.ok();
+        let p = archive::cloud::archive_prices(cloud, &archive::Inventory { servers: Vec::new(), ..ours.clone() }).await;
         println!(
-            "Done. The volumes are kept ({kept_gb} GB{}, still delete-protected): `arena archive up` builds a new server for them; \
+            "Done. The volumes are kept ({kept_gb} GB, ≈ {}, still delete-protected): `arena archive up` builds a new server for them; \
              `arena archive down --delete-volumes --confirm {}` deletes them.",
-            price.map(|p| format!(", ≈ {}", eur(p.monthly(false, kept_gb)))).unwrap_or_default(),
+            eur(p.monthly(false, kept_gb)),
             names.server()
         );
     } else {

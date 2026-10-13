@@ -107,6 +107,9 @@ pub struct Inputs {
     pub archive: Probe<crate::archive::Inventory>,
     /// `ARCHIVE_KEEP_UNTIL` (days since the epoch): until then this cohort's archive is `◷ kept`.
     pub archive_keep_until: Option<i64>,
+    /// What the archive is priced at: the live `/pricing` for its server type and location, else
+    /// the list prices ([`crate::archive::Prices::LIST`]) — as `archive status` and `balance`.
+    pub archive_prices: crate::archive::Prices,
     /// Today, in days since the epoch (UTC).
     pub today_days: i64,
 }
@@ -305,7 +308,7 @@ pub fn build(inputs: &Inputs, naming: &Naming) -> Report {
     items.push(at_item(&inputs.at, &inputs.user));
     let configured: Vec<&str> = inputs.listings.iter().map(|(p, _)| p.as_str()).collect();
     items.push(proxy_item(&inputs.proxy, &configured));
-    items.push(archive_item(&inputs.archive, naming.prefix, inputs.archive_keep_until, inputs.today_days));
+    items.push(archive_item(&inputs.archive, naming.prefix, inputs.archive_keep_until, inputs.today_days, &inputs.archive_prices));
     let count = |v: Verdict| items.iter().filter(|i| i.verdict == v).count();
     let (remaining, unknown) = (count(Verdict::Remaining), count(Verdict::Unknown));
     Report {
@@ -909,18 +912,14 @@ fn closes(s: &str, q: char) -> bool {
     })
 }
 
-/// ~€ per GB of archive volume per month, and a cx23 with its IPv4 per month — Hetzner's list
-/// prices (autumn 2026, excl. VAT), shown as estimates: this check never reads a bill or prices.
-pub const ARCHIVE_VOLUME_EUR_PER_GB_MONTH: f64 = 0.057;
-pub const ARCHIVE_SERVER_EUR_MONTH: f64 = 6.0;
-
 /// The backup archive(s) (`arena archive`) still in the archive's Hetzner project. This
 /// cohort's, with `ARCHIVE_KEEP_UNTIL` set and not yet past, is `◷ kept` (on purpose, doesn't
 /// fail the check); anything else that's there is `✗` — past the date, no date set, orphan
 /// volumes whose server is gone, or another cohort's archive (named, with its own fix). A
 /// listing that failed is `?`. The fix lines are printed, never run, and each deletion is the
-/// typed `--confirm` form.
-pub fn archive_item(probe: &Probe<crate::archive::Inventory>, prefix: &str, keep_until: Option<i64>, today_days: i64) -> Item {
+/// typed `--confirm` form. Each archive's cost is [`crate::archive::Prices::monthly_for`] at
+/// `prices` — the one rule `archive up`/`status` and `balance` price it by, IPv4 included.
+pub fn archive_item(probe: &Probe<crate::archive::Inventory>, prefix: &str, keep_until: Option<i64>, today_days: i64, prices: &crate::archive::Prices) -> Item {
     const SCOPE: &str = "hetzner";
     let inv = match probe {
         Probe::Skipped(why) => return Item::new(Area::Archive, SCOPE, Verdict::Skipped, why.clone()),
@@ -935,7 +934,7 @@ pub fn archive_item(probe: &Probe<crate::archive::Inventory>, prefix: &str, keep
         let Ok(names) = crate::archive::ArchiveNames::new(p) else { continue };
         let ours = inv.owned_by(&names);
         let gb: u32 = ours.volumes.iter().map(|v| v.size_gb).sum();
-        let monthly = f64::from(gb) * ARCHIVE_VOLUME_EUR_PER_GB_MONTH + if ours.servers.is_empty() { 0.0 } else { ARCHIVE_SERVER_EUR_MONTH };
+        let monthly = crate::archive::cloud::eur_month(prices.monthly_for(ours.servers.len(), gb));
         let server = match ours.servers.as_slice() {
             [] => "no server (orphan volumes)".to_string(),
             [s] => format!("{} ({})", s.name, s.server_type),
@@ -945,7 +944,7 @@ pub fn archive_item(probe: &Probe<crate::archive::Inventory>, prefix: &str, keep
             1 => "1 volume".to_string(),
             n => format!("{n} volumes"),
         };
-        summaries.push(format!("{server} + {vols}, {gb} GB, ≈ €{monthly:.0}/month"));
+        summaries.push(format!("{server} + {vols}, {gb} GB, ≈ {monthly}"));
         for s in &ours.servers {
             item.entries.push(Entry::Archive {
                 id: s.id,
@@ -1237,6 +1236,7 @@ mod tests {
             user: "dev".into(),
             archive: Probe::Got(crate::archive::Inventory::default()),
             archive_keep_until: None,
+            archive_prices: crate::archive::Prices::LIST,
             today_days: 20_000,
         }
     }
@@ -1828,7 +1828,8 @@ mod tests {
     /// another prefix) / Unknown / Skipped — and Kept never fails the check.
     #[test]
     fn the_archive_is_kept_until_its_date_and_remains_otherwise() {
-        let item = |p: Probe<crate::archive::Inventory>, keep: Option<i64>| archive_item(&p, "arena9", keep, 20_000);
+        let prices = crate::archive::Prices { volume_gb_month: 0.05, server_month: Some(5.0), ipv4_month: Some(0.5) };
+        let item = |p: Probe<crate::archive::Inventory>, keep: Option<i64>| archive_item(&p, "arena9", keep, 20_000, &prices);
         assert_eq!(item(Probe::Got(Default::default()), None).verdict, Verdict::Clear);
         assert_eq!(item(Probe::Skipped("no token".into()), None).verdict, Verdict::Skipped);
         let unknown = item(Probe::Failed("HTTP 503".into()), Some(30_000));
@@ -1837,7 +1838,8 @@ mod tests {
 
         let kept = item(Probe::Got(archive_inv("arena9", true)), Some(20_118));
         assert_eq!(kept.verdict, Verdict::Kept);
-        assert_eq!(kept.summary, "kept until 2025-01-30: arena9-archive (cx23) + 2 volumes, 250 GB, ≈ €20/month");
+        // The server with its IPv4 (€5.50) + 250 GB at €0.05: the one rule, to the cent.
+        assert_eq!(kept.summary, "kept until 2025-01-30: arena9-archive (cx23) + 2 volumes, 250 GB, ≈ €18.00/month");
         assert!(kept.fix.is_empty(), "nothing to do yet");
         assert_eq!(kept.entries.len(), 3);
         // The date itself still keeps it.
