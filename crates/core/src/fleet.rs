@@ -604,6 +604,7 @@ mod tests {
                 locked: None,
                 proxy_only: false,
                 delete_protected: None,
+                created_at: None,
             },
             Pod {
                 id: "def456".into(),

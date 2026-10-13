@@ -103,6 +103,7 @@ fn sandbox_pod(name: &str) -> Pod {
         locked: Some(false),
         proxy_only: false,
         delete_protected: None,
+        created_at: Some(1_791_452_013),
     }
 }
 

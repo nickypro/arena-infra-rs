@@ -111,7 +111,7 @@ impl Store {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => ReapState::default(),
             Err(e) => return Err(StoreError::Unreadable { owner: owner_of(&path), path, error: e.to_string() }),
         };
-        state.hold = self.read_hold()?;
+        state.hold = self.read_hold()?.or_else(|| state.legacy_hold.take());
         Ok(state)
     }
 

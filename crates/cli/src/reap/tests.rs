@@ -61,6 +61,11 @@ struct Sim {
     procs_unreadable: bool,
     /// RS7: a process that starts after the backup's git step (a job launched mid-reap).
     proc_after_git: Option<(u64, u32, bool, &'static str)>,
+    /// R2-2: links out of the home, data outside it; RS7: scheduled work, open terminals.
+    links: &'static str,
+    roots: &'static str,
+    sched: &'static str,
+    ttys: &'static str,
 }
 
 /// A change to the world in the middle of a reap (between the decision and the terminate).
@@ -84,6 +89,9 @@ enum OnGit {
     Disable,
     /// RS9: the big volume is unmounted (its tier marker gone).
     Unmount,
+    /// REVIEW-2: a `migrate copy` (placed on Hetzner) creates `<name>-new` there, and
+    /// Hetzner's listing fails at the reap's final re-listing.
+    TwinOnFailedProvider,
 }
 
 impl Sim {
@@ -117,6 +125,10 @@ impl Sim {
             procs: Vec::new(),
             procs_unreadable: false,
             proc_after_git: None,
+            links: "none",
+            roots: "none",
+            sched: "none",
+            ttys: "0",
         }
     }
 }
@@ -134,6 +146,8 @@ struct Remote2 {
     dir: PathBuf,
     /// Each probe's host and the (pod-clock) time its file scan started.
     scans: Mutex<Vec<(String, u64)>>,
+    /// Each probe's host and the pod creation time it was handed (its last argument).
+    created: Mutex<Vec<(String, String)>>,
 }
 
 fn kind_of(cmd: &str) -> &'static str {
@@ -185,6 +199,7 @@ impl Remote2 {
         match kind {
             "probe" => {
                 let (nonce, since) = probe_args(cmd);
+                self.created.lock().unwrap().push((host.to_string(), cmd.rsplit('\'').nth(1).unwrap_or_default().to_string()));
                 let now = self.clock.load(Ordering::SeqCst);
                 let id = match (&sim.id_after_git, sim.git_done) {
                     (Some(other), true) => other.clone(),
@@ -221,6 +236,10 @@ impl Remote2 {
                     uncovered: sim.uncovered,
                     mounts: sim.mounts,
                     home: sim.home,
+                    links: sim.links,
+                    roots: sim.roots,
+                    sched: sim.sched,
+                    ttys: sim.ttys,
                     procs: (!sim.procs_unreadable).then(|| {
                         let pid1: u64 = sim.pid1.parse().unwrap_or(0);
                         let after_git = sim.proc_after_git.filter(|_| sim.git_done);
@@ -287,6 +306,13 @@ impl Remote2 {
                         let cfg = self.dir.join("config.env");
                         let text = std::fs::read_to_string(&cfg).unwrap();
                         std::fs::write(&cfg, text.replace("REAP_ENABLED=1", "REAP_ENABLED=0")).unwrap();
+                    }
+                    (OnGit::TwinOnFailedProvider, _) => {
+                        for (n, r) in listing.iter_mut() {
+                            if n == "hetzner" {
+                                *r = Err("hetzner: list timed out".into());
+                            }
+                        }
                     }
                     (OnGit::Unmount, _) => {
                         std::fs::remove_file(self.dir.join("snap/big/.arena-backup-tier")).unwrap();
@@ -514,6 +540,7 @@ exit "$(cat "$d/exit_snap" 2>/dev/null || echo 0)"
                 calls: Mutex::new(Vec::new()),
                 dir: dir.clone(),
                 scans: Mutex::new(Vec::new()),
+                created: Mutex::new(Vec::new()),
             }),
             clock,
             ntp_fn: {
@@ -1603,8 +1630,12 @@ fn review_rs2_the_reaps_verified_copy_keeps_participant_data() {
     let t = SshTarget::for_host("root", "10.0.0.1", 22001, None);
     let args = arena_core::pull::rsync_args(&t, &PullConfig::reap_tier(), "/big/devtest-alpha/");
     assert!(!args.iter().any(|a| a == "**/.*/"), "dot-directories are kept: {args:?}");
-    for d in ["TEMP_FOLDER_FOR_SWEEPS/", "venv/", "huggingface/", "hf_cache/"] {
+    for d in ["TEMP_FOLDER_FOR_SWEEPS/", "venv/"] {
         assert!(REAP_NOT_KEPT.contains(&d) || REAP_VETOED.contains(&d), "{d} dropped without being documented or vetoed");
+    }
+    // R2-1: a `huggingface/`/`hf_cache/` folder is copied (only the hub cache is left out).
+    for d in ["huggingface/", "hf_cache/"] {
+        assert!(!args.iter().any(|a| a == d), "{d} is excluded: {args:?}");
     }
     assert!(REAP_VETOED.contains(&"TEMP_FOLDER_FOR_SWEEPS/"));
     // The verify reads with the same filter as the copy.
@@ -2305,4 +2336,162 @@ async fn rr_hold_and_release_work_with_a_corrupt_state() {
     assert!(w.store().load().is_err(), "an unreadable hold is never \"no hold\"");
     w.reap(&["release"]).await.unwrap();
     assert!(!w.store().hold_path().exists());
+}
+
+// ---------------------------------------------------------------------------------------
+// Second review (on 8464ea3) — each test fails on 8464ea3 unless it says otherwise.
+// ---------------------------------------------------------------------------------------
+
+/// REVIEW-2 R2-3: a freeze that fails (RS1's `freeze_failed`) has no back-off, unlike a failed
+/// git push or rsync (6 h): every tick takes a new write-ahead (spending `REAP_MAX_PER_DAY`),
+/// runs the pod's whole backup again (both tiers + the verify, up to BACKUP_TIMEOUT_SECS of
+/// transfer) and tries another freeze — each partial one left under `reaped/`, which nothing
+/// ever cleans. Here: `reaped/` blocked, three ticks 15 min apart.
+#[tokio::test]
+async fn review2_r2_3_a_failed_freeze_is_retried_every_tick() {
+    let (w, a) = due_world("rv2-freeze-retry", "").await;
+    std::fs::write(w.dir.join("snap/big/reaped"), "in the way").unwrap();
+    for i in 0..3 {
+        if i > 0 {
+            w.tick(900);
+        }
+        w.step("apply").await;
+    }
+    assert!(w.terminated().is_empty());
+    let bigs = w.order().iter().filter(|l| l.starts_with("rsync big")).count();
+    let attempts = w.state().attempts.len();
+    let retry = w.state().pods[&core_reap::key("runpod", &a.id)].retry_after;
+    assert!(
+        bigs <= 1 && attempts <= 1,
+        "a persistent freeze failure re-ran the full reap backup {bigs}x and spent {attempts} of the daily cap in 30 min (retry_after {retry:?})"
+    );
+}
+
+/// REVIEW-2 R2-4: `pods replace` / `migrate copy` / `cutover` refuse a pod whose reap is in
+/// progress only when they can READ the reaper's state: an operator whose user can't (root's
+/// cron owns `$ARENA_STATE_DIR`, 0700/0600; a non-root operator shell) gets no refusal —
+/// `reap_in_progress` reads "can't read" as "no reap", although the reaper (root) can act.
+#[test]
+fn review2_r2_4_reap_in_progress_fails_open_on_an_unreadable_state() {
+    use std::os::unix::fs::PermissionsExt;
+    let uid = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| s.lines().find(|l| l.starts_with("Uid:")).and_then(|l| l.split_whitespace().nth(1)).map(String::from));
+    if uid.as_deref() == Some("0") {
+        eprintln!("running as root: permissions don't stop reads — skipping");
+        return;
+    }
+    let w = World::new("rv2-inprog", "");
+    let a = rp("devtest-alpha", "pa", 22001);
+    w.policy(&a, None, Some(900));
+    store::write_ahead(&w.store(), "runpod:pa", "run-1", Trigger::Idle, T0).unwrap();
+    assert!(super::reap_in_progress(&w.cfg, &a, "replace").is_some(), "readable: refused");
+    // The state as another user sees root's 0700 state dir.
+    let state_dir = w.dir.join("state");
+    std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let seen = super::reap_in_progress(&w.cfg, &a, "replace");
+    std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(seen.is_some(), "a reap in progress the operator's user can't read about: replace goes ahead");
+}
+
+/// REVIEW-2 R2-5: the final re-listing's R5 check (RS5) looks only at the providers that
+/// listed fine. A `migrate copy` placed on another provider creates `<name>-new` THERE; when
+/// that provider's listing fails at the relist, the twin can't be seen — "can't tell" — yet
+/// the terminate goes ahead (only the pod's own provider must have listed).
+#[tokio::test]
+async fn review2_r2_5_a_failed_listing_elsewhere_at_the_relist_is_not_a_clean_r5() {
+    let (w, _a) = due_world("rv2-relist-other", "").await;
+    w.sim(22001, |s| s.on_git = OnGit::TwinOnFailedProvider);
+    let (_, out) = w.run("apply").await;
+    assert!(w.terminated().is_empty(), "terminated although a provider that may hold its -new twin didn't list: {out}");
+}
+
+// ---------------------------------------------------------------------------------------
+// Third review fixes (R2-1 … R2-5, RS7 a/b/c).
+// ---------------------------------------------------------------------------------------
+
+/// R2-1/R2-2: data the reap's backup never reads — a link out of the home, a file written
+/// outside it since the pod's creation, a sweep folder holding anything — vetoes (`not
+/// covered`), for expiry and idle alike; each look hands the probe the pod's listed creation.
+#[tokio::test]
+async fn r2_outside_data_links_and_sweeps_veto() {
+    for (tag, set) in [
+        ("links", (|s: &mut Sim| s.links = "hit") as fn(&mut Sim)),
+        ("roots", |s: &mut Sim| s.roots = "hit"),
+        ("sweep", |s: &mut Sim| s.uncovered = "hit"),
+    ] {
+        let w = World::new(&format!("r2-{tag}"), "");
+        let a = Pod { created_at: Some(T0 - 86_400), ..rp("devtest-alpha", "pa", 22001) };
+        let mut sim = Sim::new("pa", "runpod");
+        set(&mut sim);
+        w.add(a.clone(), sim);
+        w.policy(&a, Some(600), Some(900));
+        for _ in 0..8 {
+            w.tick(300);
+            w.step("apply").await;
+        }
+        assert!(w.terminated().is_empty(), "{tag}");
+        assert_eq!(w.last_row(&a), Some(Row::NotCovered), "{tag}");
+        let created: Vec<String> = w.remote.created.lock().unwrap().iter().map(|(_, c)| c.clone()).collect();
+        assert!(!created.is_empty() && created.iter().all(|c| *c == (T0 - 86_400).to_string()), "{tag}: {created:?}");
+    }
+}
+
+/// RS7a/b: scheduled work (a crontab line, an `at` job, a timer) or an open terminal (RunPod's
+/// proxy shell among them) is use — never reaped; can't read them: can't tell.
+#[tokio::test]
+async fn rs7_scheduled_work_and_terminals_are_use() {
+    for (tag, set, row) in [
+        ("sched", (|s: &mut Sim| s.sched = "hit") as fn(&mut Sim), Row::Active),
+        ("tty", |s: &mut Sim| s.ttys = "1", Row::Active),
+        ("sched-unknown", |s: &mut Sim| s.sched = "err", Row::Unknown),
+    ] {
+        let w = World::new(&format!("rs7-{tag}"), "");
+        let a = rp("devtest-alpha", "pa", 22001);
+        let mut sim = Sim::new("pa", "runpod");
+        set(&mut sim);
+        w.add(a.clone(), sim);
+        w.policy(&a, None, Some(900));
+        let runs = run_until_reaped(&w, "apply", 300, 8).await;
+        assert!(runs == 8 && w.terminated().is_empty(), "{tag}");
+        assert_eq!(w.last_row(&a), Some(row), "{tag}");
+    }
+}
+
+/// R2-3: a failed freeze leaves nothing of its own under `reaped/` (the leaves it made, exactly
+/// those, are removed) and backs off 6 h like a failed git push or rsync.
+#[tokio::test]
+async fn r2_3_a_failed_freeze_cleans_up_after_itself_and_backs_off() {
+    let (w, a) = due_world("r2-3-clean", "").await;
+    // Something of an earlier reap there: never touched.
+    let earlier = w.dir.join("snap/reaped/devtest-alpha/20260101T000000Z-runpod-old/snapshot");
+    std::fs::create_dir_all(&earlier).unwrap();
+    std::fs::write(earlier.join("work.txt"), "an earlier reap's").unwrap();
+    std::fs::write(w.dir.join("snap/big/reaped"), "in the way").unwrap();
+    w.step("apply").await;
+    assert!(w.terminated().is_empty());
+    let leaves: Vec<String> = std::fs::read_dir(w.dir.join("snap/reaped/devtest-alpha")).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    assert_eq!(leaves, ["20260101T000000Z-runpod-old"], "only this attempt's own leaves go");
+    assert_eq!(std::fs::read_to_string(earlier.join("work.txt")).unwrap(), "an earlier reap's");
+    let p = &w.state().pods[&core_reap::key("runpod", &a.id)];
+    assert!(p.retry_after.is_some_and(|t| t >= w.now() + 6 * 3600 - 60), "{:?}", p.retry_after);
+    assert!(w.notified().iter().any(|l| l.contains("freeze_failed devtest-alpha") && l.contains("retried in 6h")), "{:?}", w.notified());
+}
+
+/// R2-4: where the reaper is configured, a state that can't be read refuses (corrupt here —
+/// the review's own test covers a permission error); not configured, no check at all.
+#[test]
+fn r2_4_reap_in_progress_fails_closed_only_where_the_reaper_is_configured() {
+    let w = World::new("r2-4-closed", "");
+    let a = rp("devtest-alpha", "pa", 22001);
+    assert_eq!(super::reap_in_progress(&w.cfg, &a, "replace"), None, "no state file: no reap");
+    std::fs::create_dir_all(w.store().dir.clone()).unwrap();
+    std::fs::write(w.store().state_path(), "{garbage").unwrap();
+    let why = super::reap_in_progress(&w.cfg, &a, "migrate").unwrap();
+    assert!(why.starts_with("refusing to migrate: can't tell whether the auto-reaper is reaping devtest-alpha") && why.contains("reap.json"), "{why}");
+    // REAP_ENABLED off in the file (and no reap cron line on this box): nothing is read.
+    let off = Config::parse(&format!("MACHINE_NAME_PREFIX=devtest\nARENA_STATE_DIR={}\nREAP_ENABLED=0\n", w.dir.join("state").display()));
+    if !super::super::reap_cron_installed() {
+        assert_eq!(super::reap_in_progress(&off, &a, "replace"), None);
+    }
 }

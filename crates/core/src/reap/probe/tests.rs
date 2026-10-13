@@ -25,13 +25,13 @@ fn cksum_matches_the_posix_tool() {
 /// The command: env -i, the script base64-decoded under sh, the arguments quoted.
 #[test]
 fn the_command_ships_the_script_and_quotes_its_arguments() {
-    let c = probe_command("abc123", Since::At(1_791_460_000), "/root/ARENA_materials/", "runpod");
+    let c = probe_command("abc123", Since::At(1_791_460_000), "/root/ARENA_materials/", "runpod", Some(1_791_000_000));
     assert!(c.starts_with("env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=\"$HOME\" sh -c \"$(printf %s "), "{c}");
-    assert!(c.ends_with(" | base64 -d)\" arena-idle-probe 'abc123' '@1791460000' '/root/ARENA_materials' 'runpod' \"$SSH_CONNECTION\""), "{c}");
+    assert!(c.ends_with(" | base64 -d)\" arena-idle-probe 'abc123' '@1791460000' '/root/ARENA_materials' 'runpod' \"$SSH_CONNECTION\" '1791000000'"), "{c}");
     let b64 = c.split("printf %s ").nth(1).unwrap().split(' ').next().unwrap();
     assert_eq!(crate::base64::decode(b64).unwrap(), PROBE_SCRIPT.as_bytes());
-    let q = probe_command("n", Since::Back(900), "/root/it's", "hetzner");
-    assert!(q.contains("'-900' '/root/it'\\''s' 'hetzner'"), "{q}");
+    let q = probe_command("n", Since::Back(900), "/root/it's", "hetzner", None);
+    assert!(q.contains("'-900' '/root/it'\\''s' 'hetzner'") && q.ends_with("\"$SSH_CONNECTION\" '-'"), "{q}");
     assert_ne!(nonce_from(1), nonce_from(2));
     assert!(nonce_from(7).len() == 16 && nonce_from(7).bytes().all(|b| b.is_ascii_hexdigit()));
 }
@@ -418,6 +418,13 @@ fn home_mounts_and_processes_parse() {
     for (m, want) in [("has_data", Mounts::HasData), ("err", Mounts::Err)] {
         assert_eq!(p(&Reply { mounts: m, ..Default::default() }).unwrap().mounts, want);
     }
+    // R2-2 and RS7a/b.
+    let f = p(&Reply::default()).unwrap();
+    assert_eq!((f.links, f.roots, f.sched, f.ttys), (Files::NoneChanged, Files::NoneChanged, Some(false), Some(0)));
+    let f = p(&Reply { links: "hit", roots: "timeout", sched: "hit", ttys: "3", ..Default::default() }).unwrap();
+    assert_eq!((f.links, f.roots, f.sched, f.ttys), (Files::Hit, Files::Timeout, Some(true), Some(3)));
+    let f = p(&Reply { links: "err", roots: "err", sched: "err", ttys: "-", ..Default::default() }).unwrap();
+    assert_eq!((f.links, f.roots, f.sched, f.ttys), (Files::Err, Files::Err, None, None));
     // A shell (`i`) and a name with a space (tmux's server) parse; idle by kind or by name.
     let procs = vec![(130_000, 5, true, "bash".to_string()), (130_001, 6, false, "tmux: server".to_string()), (130_002, 7, false, "python3".to_string())];
     let f = p(&Reply { procs: Some(procs), ..Default::default() }).unwrap();
@@ -425,7 +432,7 @@ fn home_mounts_and_processes_parse() {
     assert_eq!(p(&Reply { procs: None, ..Default::default() }).unwrap().procs, None);
     assert_eq!(p(&Reply { proc_overflow: true, ..Default::default() }).unwrap().procs, None);
     // Anything else is garbled, never "no processes".
-    for bad in ["home=maybe", "uncovered=", "mounts=some", "hz=0", "proc_read=maybe"] {
+    for bad in ["home=maybe", "uncovered=", "mounts=some", "hz=0", "proc_read=maybe", "links=some", "roots=", "sched=maybe", "ttys=x", "ttys=99999999999"] {
         let (k, _) = bad.split_once('=').unwrap();
         let lines: Vec<String> =
             Reply::default().fact_lines().into_iter().map(|l| if l.starts_with(&format!("ARENA_PROBE {k}=")) { format!("ARENA_PROBE {bad}") } else { l }).collect();
@@ -534,4 +541,239 @@ fn review_rr_idle_tmux_pane_is_not_a_who_login() {
     assert_eq!(f.tmux_busy, Some(0), "the pane runs a shell: not busy");
     // The same pane, seen through utmp, must not count as a login either.
     assert_eq!(f.who, Some(0), "an idle tmux pane's utmp entry counted as a login: the tmux exemption is void wherever utmp exists");
+}
+
+/// Stand-in commands for running the real probe script here: `bin/<name>` with `body`.
+#[cfg(target_os = "linux")]
+fn review2_stub(bin: &std::path::Path, name: &str, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let p = bin.join(name);
+    std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// The real probe under `sh`, HOME = `home`, PATH = `bin` first.
+#[cfg(target_os = "linux")]
+fn review2_run_probe(bin: &std::path::Path, home: &std::path::Path, since: &str, provider: &str) -> String {
+    let out = std::process::Command::new("env")
+        .arg("-i")
+        .arg(format!("PATH={}:/usr/sbin:/usr/bin:/sbin:/bin", bin.display()))
+        .arg(format!("HOME={}", home.display()))
+        .arg("ARENA_PROBE_TEST_WINDOW=1")
+        .arg("ARENA_PROBE_TEST_GPU_TIMEOUT=1")
+        .args(["sh", "-c", PROBE_SCRIPT, "arena-idle-probe", "T3ST", since, "", provider, "203.0.113.9 50000 10.0.0.2 22"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// REVIEW-2 R2-1 (fails on 8464ea3): the sweep-folder veto (RS2) only looks at files changed
+/// "since the container started" — PID 1's start. On a Hetzner VM that is the last BOOT, and the
+/// disk survives every reboot (`pods restart` is a hard `reset`; `pods stop`/`start` a power
+/// cycle; the participant's own `reboot`). A sweep whose results sit in
+/// `TEMP_FOLDER_FOR_SWEEPS/` from before the reboot reads `uncovered=none`; the reap's tier
+/// never copies that folder (`REAP_VETOED`), so the reap destroys the only copy. Here the real
+/// script runs with PID 1's start (via a stand-in `awk` for `/proc/1/stat` only) placed just
+/// after the sweep file was written — a reboot in between.
+#[cfg(target_os = "linux")]
+#[test]
+fn review2_r2_1_sweep_results_from_before_a_vm_reboot_are_neither_copied_nor_vetoed() {
+    let root = std::env::temp_dir().join(format!("arena-reap-rv2-sweep-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let (bin, home) = (root.join("bin"), root.join("home"));
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(home.join("ARENA_materials/TEMP_FOLDER_FOR_SWEEPS/run1")).unwrap();
+    std::fs::write(home.join("ARENA_materials/TEMP_FOLDER_FOR_SWEEPS/run1/ckpt.pt"), "a finished sweep's only copy").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let reboot = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let real_awk = String::from_utf8(std::process::Command::new("sh").args(["-c", "command -v awk"]).output().unwrap().stdout).unwrap();
+    let real_awk = real_awk.trim();
+    // `awk … /proc/1/stat` (the container's start) answers "PID 1 started at `reboot`"; every
+    // other awk call is the real one.
+    review2_stub(
+        &bin,
+        "awk",
+        &format!(
+            "for a in \"$@\"; do last=\"$a\"; done\nif [ \"$last\" = /proc/1/stat ]; then\n  bt=$({real_awk} '$1 == \"btime\" {{ print $2 }}' /proc/stat)\n  echo $(( ({reboot} - bt) * $(getconf CLK_TCK) ))\n  exit 0\nfi\nexec {real_awk} \"$@\""
+        ),
+    );
+    review2_stub(&bin, "nvidia-smi", "case \"$1\" in --query-gpu*) echo '0, 3';; *) ;; esac");
+    review2_stub(&bin, "curl", "exit 7");
+    let stdout = review2_run_probe(&bin, &home, &format!("@{reboot}"), "hetzner");
+    let _ = std::fs::remove_dir_all(&root);
+    let f = parse_probe(&stdout, "T3ST", Since::At(reboot)).unwrap_or_else(|e| panic!("{e:?}\n{stdout}"));
+    assert_eq!(f.files, Files::NoneChanged, "nothing changed since the reboot:\n{stdout}");
+    assert_ne!(
+        f.uncovered,
+        Files::NoneChanged,
+        "a sweep folder holding results from before the VM's last reboot reads as covered — the reap's backup never copies it:\n{stdout}"
+    );
+}
+
+/// REVIEW-2 mutation guard (passes on 8464ea3): the sweep-folder veto looks back to the
+/// container's start, not to the scan's `since` — a sweep written after the container started
+/// but before the last look still vetoes. (Mutant `-newerct "@$cs"` → `"@$S"` in the
+/// `uncovered` scan survived every test before this one.)
+#[cfg(target_os = "linux")]
+#[test]
+fn review2_mut_sweep_veto_reaches_back_to_the_container_start() {
+    let root = std::env::temp_dir().join(format!("arena-reap-rv2-mutk-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let (bin, home) = (root.join("bin"), root.join("home"));
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(home.join("ARENA_materials/TEMP_FOLDER_FOR_SWEEPS/run1")).unwrap();
+    std::fs::write(home.join("ARENA_materials/TEMP_FOLDER_FOR_SWEEPS/run1/ckpt.pt"), "w").unwrap();
+    review2_stub(&bin, "nvidia-smi", "case \"$1\" in --query-gpu*) echo '0, 3';; *) ;; esac");
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let stdout = review2_run_probe(&bin, &home, &format!("@{since}"), "runpod");
+    let _ = std::fs::remove_dir_all(&root);
+    let f = parse_probe(&stdout, "T3ST", Since::At(since)).unwrap_or_else(|e| panic!("{e:?}\n{stdout}"));
+    assert_eq!(f.files, Files::NoneChanged, "{stdout}");
+    assert_eq!(f.uncovered, Files::Hit, "a sweep written since the container started (before the last look) must veto:\n{stdout}");
+}
+
+/// REVIEW-2 mutation guard (passes on 8464ea3 where /dev/shm is another filesystem): a home
+/// that is a link to ANOTHER filesystem is `home=link` (can't tell). (Mutant: the `link` branch
+/// reporting `ok` survived every test before this one — the only symlinked-home test links
+/// within one filesystem.)
+#[cfg(target_os = "linux")]
+#[test]
+fn review2_mut_a_home_linked_to_another_filesystem_is_unknown() {
+    let shm = std::path::Path::new("/dev/shm");
+    let dev = |p: &std::path::Path| std::fs::metadata(p).map(|m| std::os::unix::fs::MetadataExt::dev(&m));
+    let tmp = std::env::temp_dir();
+    if !shm.is_dir() || dev(shm).ok() == dev(&tmp).ok() {
+        eprintln!("no second filesystem at /dev/shm — skipping");
+        return;
+    }
+    let root = tmp.join(format!("arena-reap-rv2-mutd-{}", std::process::id()));
+    let real = shm.join(format!("arena-reap-rv2-mutd-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&real);
+    let (bin, link) = (root.join("bin"), root.join("home"));
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&real).unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    review2_stub(&bin, "nvidia-smi", "case \"$1\" in --query-gpu*) echo '0, 3';; *) ;; esac");
+    let stdout = review2_run_probe(&bin, &link, "-900", "runpod");
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&real);
+    let f = parse_probe(&stdout, "T3ST", Since::Back(900)).unwrap_or_else(|e| panic!("{e:?}\n{stdout}"));
+    assert_eq!(f.home, HomeState::Link, "{stdout}");
+}
+
+/// REVIEW-2 R2-2 (fails on 8464ea3): data written OUTSIDE the home on the root filesystem is
+/// neither copied by the reap (its tiers copy the home; `rsync -a` copies a symlink as a link)
+/// nor seen by the probe (the file scan doesn't follow links; the mounts fact only looks at
+/// OTHER mounts). Here: `~/data -> /…/outside` (the classic "big outputs elsewhere" link, made
+/// long ago), and a training run writes `outside/ckpt.pt` after the last look. Every fact the
+/// judge uses for coverage reads clean; the pod is reaped and the checkpoint is lost.
+#[cfg(target_os = "linux")]
+#[test]
+fn review2_r2_2_data_behind_a_link_out_of_the_home_is_neither_copied_nor_seen() {
+    let root = std::env::temp_dir().join(format!("arena-reap-rv2-outside-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let (bin, home, outside) = (root.join("bin"), root.join("home"), root.join("outside"));
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, home.join("data")).unwrap();
+    review2_stub(&bin, "nvidia-smi", "case \"$1\" in --query-gpu*) echo '0, 3';; *) ;; esac");
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    std::fs::write(outside.join("ckpt.pt"), "the run's only checkpoint").unwrap();
+    let stdout = review2_run_probe(&bin, &home, &format!("@{since}"), "runpod");
+    let _ = std::fs::remove_dir_all(&root);
+    let f = parse_probe(&stdout, "T3ST", Since::At(since)).unwrap_or_else(|e| panic!("{e:?}\n{stdout}"));
+    // Fixed (R2-2) with a fact of its own: the link out of the home is `links=hit` (not covered).
+    assert!(
+        f.files != Files::NoneChanged || f.uncovered != Files::NoneChanged || f.home != HomeState::Ok || f.links != Files::NoneChanged,
+        "a file written after the last look behind ~/data -> outside the home reads as quiet and covered:\n{stdout}"
+    );
+    assert_eq!(f.links, Files::Hit, "{stdout}");
+}
+
+/// The real script's R2-1/R2-2/RS7 parts, in a hermetic stand-in (`ARENA_PROBE_TEST_ROOTS` for
+/// the places outside the home, `ARENA_PROBE_TEST_SYSROOT` for the crontabs and timers):
+/// - links out of the home: to a data dir → hit; to the system or dangling → none;
+/// - outside the home: a file written after the pod's creation → hit, even when the VM booted
+///   after it (Hetzner: the disk outlives reboots); an older one, or junk (site-packages,
+///   `/tmp/systemd-private-*`-like) → none; no creation time on Hetzner → can't tell;
+/// - scheduled work: a crontab line or an added timer → hit; comments, a packaged (linked)
+///   timer, snapd's → none;
+/// - a process on a pseudo-terminal in another session → counted.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_script_sees_outside_the_home_schedules_and_terminals() {
+    use std::process::{Command, Stdio};
+    let root = std::env::temp_dir().join(format!("arena-reap-probe-r22-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let (bin, home, data, sys) = (root.join("bin"), root.join("home"), root.join("data"), root.join("sys"));
+    for d in [&bin, &home, &data, &sys] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    review2_stub(&bin, "nvidia-smi", "case \"$1\" in --query-gpu*) echo '0, 3';; *) ;; esac");
+    let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let run = |home: &std::path::Path, roots: &str, provider: &str, created: &str| -> ProbeFacts {
+        let out = Command::new("env")
+            .arg("-i")
+            .arg(format!("PATH={}:/usr/sbin:/usr/bin:/sbin:/bin", bin.display()))
+            .arg(format!("HOME={}", home.display()))
+            .arg("ARENA_PROBE_TEST_WINDOW=1")
+            .arg("ARENA_PROBE_TEST_GPU_TIMEOUT=1")
+            .arg(format!("ARENA_PROBE_TEST_ROOTS={roots}"))
+            .arg(format!("ARENA_PROBE_TEST_SYSROOT={}", sys.display()))
+            .args(["sh", "-c", PROBE_SCRIPT, "arena-idle-probe", "T3ST", "-900", "", provider, "203.0.113.9 50000 10.0.0.2 22", created])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        parse_probe(&stdout, "T3ST", Since::Back(900)).unwrap_or_else(|e| panic!("{e:?}\n{stdout}"))
+    };
+    // Old data, then the pod's "creation", then new data.
+    std::fs::create_dir_all(data.join("old")).unwrap();
+    std::fs::write(data.join("old/ckpt.pt"), "from before").unwrap();
+    std::fs::create_dir_all(data.join("venv/lib/python3.11/site-packages/x")).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let created = now();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    std::fs::write(data.join("venv/lib/python3.11/site-packages/x/mod.py"), "an install").unwrap();
+    let roots = data.display().to_string();
+    // Only junk and old files there: none; no creation on Hetzner: can't tell.
+    assert_eq!(run(&home, &roots, "hetzner", &created.to_string()).roots, Files::NoneChanged);
+    assert_eq!(run(&home, &roots, "hetzner", "-").roots, Files::Err);
+    assert_eq!(run(&home, &roots, "hetzner", &(now() + 3600).to_string()).roots, Files::Err, "a creation in the future is no anchor");
+    // New data after the creation: hit — on Hetzner even though this box booted long before.
+    std::fs::write(data.join("old/new_ckpt.pt"), "the run's only copy").unwrap();
+    assert_eq!(run(&home, &roots, "hetzner", &created.to_string()).roots, Files::Hit);
+    // Links: to the system, dangling — none; to a data dir — hit.
+    std::os::unix::fs::symlink("/usr/bin", home.join("bin")).unwrap();
+    std::os::unix::fs::symlink(root.join("nowhere"), home.join("gone")).unwrap();
+    assert_eq!(run(&home, "", "runpod", "-").links, Files::NoneChanged);
+    std::os::unix::fs::symlink(data.join("old"), home.join("outputs")).unwrap();
+    assert_eq!(run(&home, "", "runpod", "-").links, Files::Hit);
+    std::fs::remove_file(home.join("outputs")).unwrap();
+    // Scheduled work.
+    std::fs::create_dir_all(sys.join("var/spool/cron/crontabs")).unwrap();
+    std::fs::create_dir_all(sys.join("etc/systemd/system/timers.target.wants")).unwrap();
+    std::fs::write(sys.join("var/spool/cron/crontabs/root"), "# m h dom mon dow command\nMAILTO=\"\"\n\n").unwrap();
+    std::fs::write(sys.join("etc/systemd/system/snap.lxd.daily.timer"), "[Timer]\n").unwrap();
+    std::os::unix::fs::symlink("/lib/systemd/system/apt-daily.timer", sys.join("etc/systemd/system/timers.target.wants/apt-daily.timer")).unwrap();
+    assert_eq!(run(&home, "", "runpod", "-").sched, Some(false), "comments, snapd's, a packaged one");
+    std::fs::write(sys.join("var/spool/cron/crontabs/root"), "# m h dom mon dow command\n17 3 * * * cd ~/run && python train.py\n").unwrap();
+    assert_eq!(run(&home, "", "runpod", "-").sched, Some(true), "a crontab line");
+    std::fs::write(sys.join("var/spool/cron/crontabs/root"), "").unwrap();
+    std::fs::write(sys.join("etc/systemd/system/train.timer"), "[Timer]\nOnCalendar=daily\n").unwrap();
+    assert_eq!(run(&home, "", "runpod", "-").sched, Some(true), "an added timer");
+    std::fs::remove_file(sys.join("etc/systemd/system/train.timer")).unwrap();
+    // A terminal: `sleep` on a pseudo-terminal (via `script`) in a session of its own.
+    let before = run(&home, "", "runpod", "-").ttys.expect("the list read whole");
+    let mut term = Command::new("setsid").args(["script", "-qfc", "sleep 39", "/dev/null"]).stdin(Stdio::null()).stdout(Stdio::null()).spawn().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let during = run(&home, "", "runpod", "-").ttys;
+    let _ = term.kill();
+    let _ = term.wait();
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(during.is_some_and(|n| n > before), "a process on a pty in another session: {before} → {during:?}");
 }

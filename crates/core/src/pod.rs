@@ -57,6 +57,11 @@ pub struct Pod {
     /// unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delete_protected: Option<bool>,
+    /// When the provider created the pod (unix seconds; RunPod REST v2's `createdAt`,
+    /// Hetzner's `created`). What the auto-reaper's coverage checks reach back to — a VM's disk
+    /// outlives its reboots (`crate::reap`, R2-1). `None` = not reported (RunPod v1, Vast).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<u64>,
 }
 
 /// A provider-reported maintenance window for the host a pod runs on. Times are kept as
@@ -290,6 +295,7 @@ mod tests {
                 locked: Some(true),
                 proxy_only: false,
                 delete_protected: None,
+                created_at: None,
             },
             Pod { id: "1".into(), name: "devtest-flutter".into(), provider: "hetzner".into(), ..Default::default() },
         ];

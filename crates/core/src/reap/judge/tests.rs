@@ -176,17 +176,26 @@ fn late_processes_against_the_baseline() {
     for name in ["bash", "vim", "python3", "mosh-server", "screen", "node"] {
         assert_eq!(late_process(&facts(&with_proc(late(name))), None), Some(true), "{name}");
     }
-    // A boot-time service restarted later (its command line's cksum in this container's
-    // baseline) isn't; the same cksum from another container's baseline doesn't count.
+    // A boot-time service restarted later (its command line's cksum in the baseline) isn't —
+    // after a reboot, or in a new container, too: the baseline is the FIRST boot's (RS7c).
     let restarted = facts(&with_proc((123_456 + 3600 * 100, 33, false, "jupyter-lab".into())));
     assert_eq!(late_process(&restarted, None), Some(true));
     assert_eq!(late_process(&restarted, Some(&b(&[33]))), Some(false));
-    let other = ProcBaseline { container: "x/1".into(), ..b(&[33]) };
-    assert_eq!(late_process(&restarted, Some(&other)), Some(true));
+    let earlier_boot = |h: &[u32]| ProcBaseline { container: "x/1".into(), ..b(h) };
+    assert_eq!(late_process(&restarted, Some(&earlier_boot(&[11, 33]))), Some(false), "the first boot's services, after a reboot");
+    assert_eq!(late_process(&restarted, Some(&earlier_boot(&[33]))), Some(true), "PID 1's start.sh isn't in that baseline");
+    // RS7c: after a reboot (a Hetzner VM keeps its disk), an EARLY process the first boot
+    // didn't have counts — a participant's `@reboot` cron or enabled unit; in the first boot
+    // itself the boot window still exempts it; the image's own early services never count.
+    let early = facts(&with_proc((123_456 + 50, 77, false, "python".into())));
+    assert_eq!(late_process(&early, Some(&b(&[11, 22, 33]))), Some(false), "the first boot's own window");
+    assert_eq!(late_process(&early, None), Some(false), "a first look: its boot's window");
+    assert_eq!(late_process(&early, Some(&earlier_boot(&[11, 22, 33]))), Some(true), "a later boot: not the image's");
+    assert_eq!(late_process(&base, Some(&earlier_boot(&[11, 22, 33]))), Some(false), "the image's services after a reboot");
     // Can't tell: no list, a capped list, no container start.
     assert_eq!(late_process(&facts(&Reply { procs: None, ..Default::default() }), None), None);
     assert_eq!(late_process(&facts(&Reply { proc_overflow: true, ..Default::default() }), None), None);
-    // The baseline: boot-time cksums, accumulated per container; a new container starts afresh;
+    // The baseline: the first boot's early cksums, extended only by later looks at that boot;
     // a failed look keeps what was known.
     let first = next_baseline(None, &Ok(base.clone())).unwrap();
     assert_eq!(first, b(&[11, 22, 33]));
@@ -194,7 +203,8 @@ fn late_processes_against_the_baseline() {
     assert_eq!(next_baseline(Some(&first), &Ok(facts(&more))).unwrap(), b(&[11, 22, 33, 44]));
     assert_eq!(next_baseline(Some(&first), &Ok(facts(&with_proc(late("python"))))).unwrap(), first, "a late process never joins");
     let moved = Reply { pid1_start: "200000".into(), procs: Some(vec![(200_000, 7, false, "start.sh".into())]), ..Default::default() };
-    assert_eq!(next_baseline(Some(&first), &Ok(facts(&moved))).unwrap().hashes, [7].into_iter().collect());
+    assert_eq!(next_baseline(Some(&first), &Ok(facts(&moved))).unwrap(), first, "a later boot never adds to it (RS7c)");
+    assert_eq!(next_baseline(None, &Ok(facts(&moved))).unwrap().hashes, [7].into_iter().collect(), "a pod first seen there");
     assert_eq!(next_baseline(Some(&first), &Err(ProbeError::Failed)).unwrap(), first);
     assert_eq!(next_baseline(None, &Ok(facts(&Reply { procs: None, ..Default::default() }))), None);
 }
@@ -269,6 +279,17 @@ fn classify_each_signal() {
         ("late process", with_proc(late("python")), read0, Verdict::Active, Reason::Process),
         ("mosh-server", with_proc(late("mosh-server")), read0, Verdict::Active, Reason::Process),
         ("processes unreadable", Reply { procs: None, ..Default::default() }, read0, Verdict::Unknown, Reason::ProcessesUnknown),
+        // R2-2: what the backup never reads — a link out of the home, data outside it.
+        ("link out of the home", Reply { links: "hit", ..Default::default() }, read0, Verdict::Active, Reason::LinkOutside),
+        ("links unreadable", Reply { links: "err", ..Default::default() }, read0, Verdict::Unknown, Reason::LinksUnknown),
+        ("data outside the home", Reply { roots: "hit", ..Default::default() }, read0, Verdict::Active, Reason::OutsideData),
+        ("outside scan out of time", Reply { roots: "timeout", ..Default::default() }, read0, Verdict::Unknown, Reason::OutsideUnknown),
+        ("outside scan no anchor", Reply { roots: "err", ..Default::default() }, read0, Verdict::Unknown, Reason::OutsideUnknown),
+        // RS7: scheduled work, an open terminal.
+        ("scheduled", Reply { sched: "hit", ..Default::default() }, read0, Verdict::Active, Reason::Scheduled),
+        ("schedules unreadable", Reply { sched: "err", ..Default::default() }, read0, Verdict::Unknown, Reason::ScheduledUnknown),
+        ("terminal", Reply { ttys: "2", ..Default::default() }, read0, Verdict::Active, Reason::Terminal),
+        ("terminals unknown", Reply { ttys: "-", ..Default::default() }, read0, Verdict::Unknown, Reason::SessionsUnknown),
         ("process list capped", Reply { proc_overflow: true, ..Default::default() }, read0, Verdict::Unknown, Reason::ProcessesUnknown),
     ];
     for (case, r, jobs, verdict, reason) in cases {
@@ -444,6 +465,9 @@ fn observation_rows_and_overdue_notices() {
         (o(Verdict::Active, vec![Reason::Keep, Reason::Session]), Row::Keep, NotifyKind::OverdueInUse),
         (o(Verdict::Active, vec![Reason::Workspace]), Row::NotCovered, NotifyKind::OverdueInUse),
         (o(Verdict::Active, vec![Reason::RepoOutside]), Row::NotCovered, NotifyKind::OverdueInUse),
+        (o(Verdict::Active, vec![Reason::LinkOutside]), Row::NotCovered, NotifyKind::OverdueInUse),
+        (o(Verdict::Active, vec![Reason::OutsideData]), Row::NotCovered, NotifyKind::OverdueInUse),
+        (o(Verdict::Active, vec![Reason::Uncovered]), Row::NotCovered, NotifyKind::OverdueInUse),
         (o(Verdict::Active, vec![Reason::GpuUtil]), Row::Active, NotifyKind::OverdueInUse),
         (o(Verdict::Unknown, vec![Reason::NoBaseline]), Row::Unknown, NotifyKind::OverdueUnreachable),
     ];
@@ -549,6 +573,8 @@ struct Bundle {
     relist: Option<Option<Pod>>,
     /// Every other pod the final re-listing returned (all providers that answered).
     others: Vec<Pod>,
+    /// Another provider's listing failed at the final re-listing (R2-5).
+    partial: bool,
     relist_at: u64,
     relist_now: u64,
     state: ReapState,
@@ -581,6 +607,7 @@ fn bundle() -> Bundle {
         quiet_at: T + 130,
         relist: Some(Some(pod)),
         others: vec![rp("devtest-bravo", "pod2"), hz("devtest-charlie", "h3")],
+        partial: false,
         relist_at: T + 140,
         relist_now: T + 141,
         state,
@@ -616,7 +643,7 @@ fn try_ticket(b: &Bundle) -> Option<ReapTicket> {
         Some(Some(p)) => Listed::Pod(p),
     };
     let all_ok: Vec<Pod> = b.relist.iter().flatten().cloned().chain(b.others.iter().cloned()).collect();
-    let relist = relist_verdict(listed, &all_ok, trigger.key(), &b.policy.name, b.relist_at, b.relist_now).ok()?;
+    let relist = relist_verdict(listed, &all_ok, b.partial, trigger.key(), &b.policy.name, b.relist_at, b.relist_now).ok()?;
     let recheck = recheck_state(&b.state, trigger.key(), trigger.trigger(), &b.policy.observations, b.relist_now).ok()?;
     let run = run.still(b.enabled_now, b.held_now).ok()?;
     ReapTicket::issue(run, trigger, wal, backup, quiet, relist, recheck).ok()
@@ -690,6 +717,22 @@ fn faults() -> Vec<Fault> {
             b.quiet.home = "err";
             requiet(b)
         }),
+        ("a link out of the home after", |b| {
+            b.quiet.links = "hit";
+            requiet(b)
+        }),
+        ("data outside the home after", |b| {
+            b.quiet.roots = "hit";
+            requiet(b)
+        }),
+        ("work scheduled after", |b| {
+            b.quiet.sched = "hit";
+            requiet(b)
+        }),
+        ("a terminal opened after", |b| {
+            b.quiet.ttys = "1";
+            requiet(b)
+        }),
         ("quiet probe failed", |b| {
             b.quiet.nonce = "LOST".into();
             requiet(b)
@@ -731,6 +774,7 @@ fn faults() -> Vec<Fault> {
         ("a -new twin listed at the relist", |b| b.others.push(rp("devtest-alpha-new", "pod9"))),
         ("a -old twin listed elsewhere", |b| b.others.push(hz("devtest-alpha-old", "h9"))),
         ("another pod of the same name", |b| b.others.push(hz("devtest-alpha", "h8"))),
+        ("another provider's listing failed", |b| b.partial = true),
         ("REAP_ENABLED=0 mid-run", |b| b.enabled_now = false),
         ("held mid-run", |b| b.held_now = true),
         ("relist before the quiet probe", |b| b.relist_at = T + 120),

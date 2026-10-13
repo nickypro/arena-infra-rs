@@ -1,9 +1,10 @@
 # arena idle probe (the auto-reaper's look at a pod): READ-ONLY — it writes nothing anywhere.
 #
-#   env -i PATH=… HOME="$HOME" sh -c "$THIS" arena-idle-probe <nonce> <since> <repo> <provider> "$SSH_CONNECTION"
+#   env -i PATH=… HOME="$HOME" sh -c "$THIS" arena-idle-probe <nonce> <since> <repo> <provider> "$SSH_CONNECTION" <created>
 #
 # <since>: `@<epoch>` (scan files changed since then, pod clock) or `-<secs>` (that long before
-# this probe started). Rendered and parsed by arena_core::reap::probe (probe_command /
+# this probe started). <created>: the pod's creation (epoch, as its provider lists it; `-` or
+# absent = unknown) — what the coverage checks reach back to, whatever reboots came since. Rendered and parsed by arena_core::reap::probe (probe_command /
 # parse_probe). POSIX sh (dash on the images). Every step that can hang runs under `timeout`.
 #
 # Output, all on stdout, in this order:
@@ -24,6 +25,7 @@ SINCE=$2
 REPO=$3
 PROV=$4
 SELF=$5
+CR=${6:-}
 case "$N" in '' | *[!A-Za-z0-9]*) exit 2 ;; esac
 command -v timeout >/dev/null 2>&1 || exit 3
 command -v cksum >/dev/null 2>&1 || exit 3
@@ -138,12 +140,26 @@ bt=$(awk '$1 == "btime" { print $2 }' /proc/stat 2>/dev/null)
 # The container's start (epoch); unknown = 0, so "changed since it started" means "ever".
 cs=0
 if num "$st" && num "$bt"; then cs=$((bt + st / hz)); fi
+# Since when data outside the backup is a veto (A; empty = unknown, and a check that needs it
+# can't tell): the pod's creation — it survives reboots, and a VM's disk does too (Hetzner).
+# Where a restart starts the container afresh from its image (RunPod, Vast), the later of that
+# and the container's start (what came before went with the old container; the image's files
+# were unpacked before it started). A creation in this pod's future is no anchor.
+A=
+if num "$CR" && [ "$CR" -le "$t0" ]; then
+    case "$PROV" in
+        hetzner) A=$CR ;;
+        *) if [ "$cs" -gt "$CR" ]; then A=$cs; else A=$CR; fi ;;
+    esac
+elif [ "$PROV" != hetzner ] && [ "$cs" -gt 0 ]; then
+    A=$cs
+fi
 
-# --- Files changed (ctime) since $S; and, never copied by a reap's backup, a sweep folder's
-# files changed since the container started — one pass over the resolved home, one filesystem,
-# outside .git and ~/.arena.
+# --- Files changed (ctime) since $S; and, never copied by a reap's backup, any regular file in a
+# sweep folder at all (whenever it was written: the folder is never copied) but a placeholder —
+# one pass over the resolved home, one filesystem, outside .git and ~/.arena.
 marks=$( { timeout 60 find "$Hr" -xdev \( -name .git -o -path "$Hr/.arena" \) -prune -o \
-    \( \( -path '*/TEMP_FOLDER_FOR_SWEEPS/*' -newerct "@$cs" -printf 'U\n' \) , \( -newerct "@$S" -printf 'F\n' \) \) 2>/dev/null
+    \( \( -path '*/TEMP_FOLDER_FOR_SWEEPS/*' -type f ! -name .gitkeep ! -name .gitignore ! -name .keep -printf 'U\n' \) , \( -newerct "@$S" -printf 'F\n' \) \) 2>/dev/null
     echo "RC $?"; } | awk '$1 == "RC" { print; next } !seen[$1]++ { print }')
 rc=$(printf '%s\n' "$marks" | awk '$1 == "RC" { print $2 }')
 judge_scan() {
@@ -156,6 +172,76 @@ judge_scan() {
 judge_scan files F
 judge_scan uncovered U
 o scan_from "$S"
+
+# --- Outside the home: what the reap's backup (the home, links copied as links) never reads ----
+# The system, installed software and caches — never a participant's only copy (documented in
+# the README): where a link from the home may point, and what the roots scan passes over.
+junk() {
+    case "$1" in
+        /usr | /usr/* | /etc | /etc/* | /bin | /bin/* | /sbin | /sbin/* | /lib | /lib/* | /lib32 | /lib32/* | /lib64 | /lib64/* \
+        | /libx32 | /libx32/* | /proc | /proc/* | /sys | /sys/* | /dev | /dev/* | /run | /run/* | /boot | /boot/* | /snap | /snap/* \
+        | /var/lib | /var/lib/* | /var/cache | /var/cache/* | /var/log | /var/log/* \
+        | /opt/conda | /opt/conda/* | /opt/miniconda* | /opt/anaconda* | /opt/nvidia | /opt/nvidia/* | /opt/hpcx | /opt/hpcx/* \
+        | */site-packages/* | */dist-packages/* | */__pycache__/* | */node_modules/* | */.cache/* | */.triton/* \
+        | /tmp/systemd-private-* | /var/tmp/systemd-private-* | /tmp/snap-private-tmp* | /tmp/.X11-unix* | /tmp/.ICE-unix* \
+        | /tmp/.font-unix* | /tmp/.XIM-unix* | /tmp/.Test-unix* | /tmp/tmux-* | /tmp/vscode-* | /tmp/.vscode-* \
+        | /tmp/torchinductor_* | /tmp/hsperfdata_* | /tmp/.arena-* | /tmp/arena_deep.* | /tmp/cx | /tmp/cx/* | /tmp/pip-*) return 0 ;;
+    esac
+    return 1
+}
+# (a) A link in the home (3 levels down, outside .git) to somewhere else that isn't junk: what's
+# there is copied as the link alone. A dangling one has nothing behind it.
+links=none
+lst=$( { timeout 15 find "$Hr" -xdev -maxdepth 3 \( -name .git -o -path "$Hr/.arena" \) -prune -o -type l -print 2>/dev/null; echo "RC $?"; } | head -n 501)
+case "$(printf '%s\n' "$lst" | tail -n 1)" in
+    "RC 0") ;;
+    *) links=err ;;
+esac
+[ "$(printf '%s\n' "$lst" | grep -vc '^RC ')" -ge 500 ] && links=err
+if [ "$links" = none ]; then
+    while IFS= read -r l; do
+        case "$l" in '' | "RC "*) continue ;; esac
+        t=$(readlink -f -- "$l" 2>/dev/null) || continue
+        [ -e "$t" ] || continue
+        case "$t" in "$Hr" | "$Hr"/*) continue ;; esac
+        junk "$t" && continue
+        links=hit
+        break
+    done <<EOF_LINKS
+$lst
+EOF_LINKS
+fi
+o links "$links"
+# (b) Data written since the pod was created (A) in the places a participant can write outside
+# the home on its filesystem — regular files only (no sockets or fifos), junk passed over. A
+# scan that runs out of time, or no anchor, can't tell.
+ROOTS=${ARENA_PROBE_TEST_ROOTS-/data /scratch /srv /mnt /media /opt /var/tmp /tmp /home/*}
+roots=none
+if [ -z "$A" ]; then
+    roots=err
+else
+    rdl=$(( $(date +%s) + 25 ))
+    for r in $ROOTS; do
+        [ -d "$r" ] || continue
+        rr=$(cd "$r" 2>/dev/null && pwd -P) || { roots=err; continue; }
+        case "$rr" in "$Hr" | "$Hr"/*) continue ;; esac
+        [ "$rr" = /workspace ] && continue
+        left=$(( rdl - $(date +%s) ))
+        if [ "$left" -le 0 ]; then roots=timeout; break; fi
+        e=$(timeout "$left" find "$rr" -xdev \( -path "$Hr" -o -path /workspace -o -name site-packages -o -name dist-packages \
+            -o -name __pycache__ -o -name node_modules -o -name .cache -o -name .triton -o -path /opt/conda -o -path '/opt/miniconda*' \
+            -o -path '/opt/anaconda*' -o -path /opt/nvidia -o -path /opt/hpcx -o -path '/tmp/systemd-private-*' -o -path '/var/tmp/systemd-private-*' \
+            -o -path '/tmp/snap-private-tmp*' -o -path '/tmp/.X11-unix' -o -path '/tmp/.ICE-unix' -o -path '/tmp/.font-unix' \
+            -o -path '/tmp/.XIM-unix' -o -path '/tmp/.Test-unix' -o -path '/tmp/tmux-*' -o -path '/tmp/vscode-*' -o -path '/tmp/.vscode-*' \
+            -o -path '/tmp/torchinductor_*' -o -path '/tmp/hsperfdata_*' -o -path '/tmp/.arena-*' -o -path '/tmp/arena_deep.*' \
+            -o -path /tmp/cx -o -path '/tmp/pip-*' \) -prune -o -type f -newerct "@$A" -print -quit 2>/dev/null)
+        rc=$?
+        if [ -n "$e" ]; then roots=hit; break; fi
+        if [ "$rc" = 124 ]; then roots=timeout; break; fi
+        [ "$rc" = 0 ] || roots=err
+    done
+fi
+o roots "$roots"
 
 # --- Sockets: ESTABLISHED (01) and LISTEN (0A), capped ----------------------------------------
 if [ -r /proc/net/tcp ]; then
@@ -216,7 +302,12 @@ ish() {
     return 0
 }
 sid=$(awk '{ s = $0; sub(/^.*\) /, "", s); split(s, f, " "); print f[4] }' /proc/$$/stat 2>/dev/null)
+# Terminals: processes on a pseudo-terminal (/dev/pts/*: majors 136–143) outside this probe's
+# session — an ssh login, RunPod's web/proxy shell, a VS Code or Jupyter terminal — but a tmux
+# pane's own shell (judged by the tmux fact). `-` when the list can't be read whole.
+ttys=-
 if num "$sid"; then
+    ttys=0
     o proc_read ok
     for d in /proc/[0-9]*; do
         p=${d#/proc/}
@@ -229,9 +320,19 @@ if num "$sid"; then
         case "$ANCS" in *" $p "*) continue ;; esac
         pst=${20}
         num "$pst" || continue
+        pp=$2
+        tn=$5
         cmd=$({ tr '\000' ' ' <"$d/cmdline"; } 2>/dev/null)
         [ -n "$cmd" ] || continue
-        if [ "$(n_of proc)" -ge 300 ]; then o proc_overflow 1; break; fi
+        if [ "$(n_of proc)" -ge 300 ]; then o proc_overflow 1; ttys=-; break; fi
+        if num "$tn" && [ "$tn" != 0 ]; then
+            maj=$(( (tn >> 8) & 4095 ))
+            if [ "$maj" -ge 136 ] && [ "$maj" -le 143 ]; then
+                pc=
+                { IFS= read -r pc; } 2>/dev/null <"/proc/$pp/comm"
+                [ "$pc" = "tmux: server" ] || ttys=$((ttys + 1))
+            fi
+        fi
         crc=$(printf '%s' "$cmd" | cksum | awk '{ print $1 }')
         k=p
         ish "$cmd" && k=i
@@ -243,7 +344,38 @@ else
     o proc_read err
 fi
 o proc_n "$(n_of proc)"
+o ttys "$ttys"
 o self "$(printf %s "$SELF" | tr -c '0-9a-fA-F.: ' '?' | cut -c1-120)"
+
+# --- Scheduled work no process shows yet: a user crontab line, an `at` job, a systemd timer
+# someone added (a regular file — not a packaged one, which is a link, nor snapd's own). One
+# that can't be read can't tell. (SYS: a test's stand-in root; empty on a pod.)
+SYS=${ARENA_PROBE_TEST_SYSROOT:-}
+s_hit=0
+s_err=0
+for d in "$SYS/var/spool/cron/crontabs" "$SYS/var/spool/cron"; do
+    [ -d "$d" ] || continue
+    if [ ! -r "$d" ] || [ ! -x "$d" ]; then s_err=1; continue; fi
+    for f in "$d"/*; do
+        [ -f "$f" ] || continue
+        if [ ! -r "$f" ]; then s_err=1; continue; fi
+        grep -qvE '^[[:space:]]*(#|$|[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=)' "$f" 2>/dev/null && s_hit=1
+    done
+done
+if [ -z "$SYS" ] && command -v atq >/dev/null 2>&1; then
+    if q=$(timeout 5 atq 2>/dev/null); then [ -n "$q" ] && s_hit=1; else s_err=1; fi
+elif [ -d "$SYS/var/spool/cron/atjobs" ]; then
+    for f in "$SYS/var/spool/cron/atjobs"/*; do
+        [ -f "$f" ] && case "${f##*/}" in .SEQ) ;; *) s_hit=1 ;; esac
+    done
+fi
+for f in "$SYS"/etc/systemd/system/*.timer "$SYS"/etc/systemd/system/*/*.timer "$SYS"/run/systemd/transient/*.timer \
+    "$Hr"/.config/systemd/user/*.timer "$Hr"/.config/systemd/user/*/*.timer; do
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    case "${f##*/}" in snap.*) continue ;; esac
+    s_hit=1
+done
+if [ "$s_hit" = 1 ]; then o sched hit; elif [ "$s_err" = 1 ]; then o sched err; else o sched none; fi
 
 # --- Logins, tmux, screen ---------------------------------------------------------------------
 # `who` without the utmp entries tmux (libutempter: host `tmux(<pid>).%<pane>`) and screen
@@ -307,13 +439,15 @@ elif awk -v w="$Wr" '$2 == w { f = 1 } END { exit !f }' /proc/self/mounts 2>/dev
     e=$(timeout 20 find "$Wr" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)
     rc=$?
     if [ -n "$e" ]; then o workspace has_data; elif [ "$rc" = 0 ]; then o workspace clean; else o workspace err; fi
+elif [ -z "$A" ]; then
+    o workspace err
 else
-    e=$(timeout 20 find "$Wr" -xdev -mindepth 1 -newerct "@$cs" -print -quit 2>/dev/null)
+    e=$(timeout 20 find "$Wr" -xdev -mindepth 1 -newerct "@$A" -print -quit 2>/dev/null)
     rc=$?
     if [ -n "$e" ]; then o workspace has_data; elif [ "$rc" = 0 ]; then o workspace clean; else o workspace err; fi
 fi
 # Any other writable mount outside the home and the system (a Hetzner volume, a network
-# share): data written there since the container started is outside the backup.
+# share): data written there since the pod was created (A) is outside the backup.
 cands=$(awk -v h="$Hr" -v w="$Wr" '
     BEGIN { n = split("proc sysfs devpts devtmpfs tmpfs cgroup cgroup2 mqueue securityfs debugfs tracefs pstore bpf fusectl configfs hugetlbfs autofs binfmt_misc nsfs ramfs rpc_pipefs efivarfs selinuxfs squashfs overlay nfsd", a, " "); for (i = 1; i <= n; i++) sys[a[i]] = 1 }
     { mp = $2; opt = "," $4 "," }
@@ -326,12 +460,14 @@ cands=$(awk -v h="$Hr" -v w="$Wr" '
 mounts=clean
 if [ "$cands" = ERR ]; then
     mounts=err
+elif [ -z "$A" ] && [ -n "$cands" ]; then
+    mounts=err
 else
     while IFS= read -r mp; do
         [ -n "$mp" ] || continue
         case "$mp" in *\\*) mounts=err; continue ;; esac
         [ -d "$mp" ] || continue
-        e=$(timeout 10 find "$mp" -xdev -mindepth 1 -newerct "@$cs" -print -quit 2>/dev/null)
+        e=$(timeout 10 find "$mp" -xdev -mindepth 1 -newerct "@$A" -print -quit 2>/dev/null)
         rc=$?
         if [ -n "$e" ]; then mounts=has_data; break; fi
         [ "$rc" = 0 ] || mounts=err

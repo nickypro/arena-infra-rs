@@ -1119,14 +1119,15 @@ async fn probe_one(remote: Arc<dyn Remote>, job: ProbeJob, nonce: String, repo: 
         Ok(l) => l,
         Err(()) => return Probed { key: job.key, busy: true, facts: Err(ProbeError::Failed), jobs: JobsOutcome::Failed, at: clock() },
     };
-    let (facts, jobs) = probe_pod(remote.as_ref(), &job.target, &nonce, job.since, &repo, &job.pod.provider).await;
+    let (facts, jobs) = probe_pod(remote.as_ref(), &job.target, &nonce, job.since, &repo, &job.pod).await;
     drop(lock);
     Probed { key: job.key, busy: false, facts, jobs, at: clock() }
 }
 
-/// The probe and the jobs listing on one pod (no locking — the caller's).
-async fn probe_pod(remote: &dyn Remote, t: &SshTarget, nonce: &str, since: Since, repo: &str, provider: &str) -> (Result<ProbeFacts, ProbeError>, JobsOutcome) {
-    let cmd = probe::probe_command(nonce, since, repo, provider);
+/// The probe and the jobs listing on one pod (no locking — the caller's). The pod's listed
+/// creation time goes to the probe: what its coverage checks reach back to (R2-1).
+async fn probe_pod(remote: &dyn Remote, t: &SshTarget, nonce: &str, since: Since, repo: &str, pod: &Pod) -> (Result<ProbeFacts, ProbeError>, JobsOutcome) {
+    let cmd = probe::probe_command(nonce, since, repo, &pod.provider, pod.created_at);
     let facts = match remote.exec(t, &cmd, Some(Duration::from_secs(core_reap::PROBE_BUDGET_SECS))).await {
         Ok(o) => probe::parse_probe(&o.stdout, nonce, since),
         Err(_) => Err(ProbeError::Failed),
@@ -1766,7 +1767,7 @@ async fn act_one(ctx: &RunCtx<'_, '_>, dest: &Dest, mut pol: PodPolicy, pod: Pod
     if pol.observations.last().is_none_or(|o| now.saturating_sub(o.t) > core_reap::OBS_FRESH) {
         let since = judge::plan_since(&pol, now);
         let nonce = (env.nonce)();
-        let (facts, jobs) = probe_pod(env.remote.as_ref(), &target, &nonce, since, &ctx.repo, &pod.provider).await;
+        let (facts, jobs) = probe_pod(env.remote.as_ref(), &target, &nonce, since, &ctx.repo, &pod).await;
         now = (env.clock)();
         let cctx = ClassifyCtx { provider: &pod.provider, listed_id: &pod.id, now, clock_ok, baseline: pol.proc_baseline.as_ref() };
         let obs = classify(pol.observations.last(), &facts, jobs, &cctx);
@@ -1840,7 +1841,9 @@ async fn act_one(ctx: &RunCtx<'_, '_>, dest: &Dest, mut pol: PodPolicy, pod: Pod
         Ok(b) => b,
         Err(f) => {
             let (retry, obs) = match f.row {
-                Row::GitFailed | Row::RsyncFailed => (Some((env.clock)() + core_reap::BACKUP_FAIL_RETRY), None),
+                // A failed freeze too (R2-3): it would fail the same way next tick, after the
+                // pod's whole backup again and another write-ahead against the daily cap.
+                Row::GitFailed | Row::RsyncFailed | Row::FreezeFailed => (Some((env.clock)() + core_reap::BACKUP_FAIL_RETRY), None),
                 // Files still changing: that's activity (the streak restarts).
                 Row::VerifyPending if f.pending.is_some_and(|n| n > 0) => (None, Some(Observation {
                     t: (env.clock)(),
@@ -1859,7 +1862,7 @@ async fn act_one(ctx: &RunCtx<'_, '_>, dest: &Dest, mut pol: PodPolicy, pod: Pod
             end_attempt(ctx, &key, retry, obs);
             match f.row {
                 Row::FreezeFailed => {
-                    ctx.queue(Some(&key), NotifyKind::FreezeFailed, Some(&name), "the verified backup couldn't be frozen into reaped/ — not reaped");
+                    ctx.queue(Some(&key), NotifyKind::FreezeFailed, Some(&name), "the verified backup couldn't be frozen into reaped/ — not reaped; retried in 6h");
                     ctx.attention();
                 }
                 Row::GitFailed => ctx.queue(Some(&key), NotifyKind::GitFailed, Some(&name), "the reap's git backup failed — not reaped; retried in 6h"),
@@ -1874,7 +1877,7 @@ async fn act_one(ctx: &RunCtx<'_, '_>, dest: &Dest, mut pol: PodPolicy, pod: Pod
     // d. Quiet now: the same pod and container, and nothing changed since the DECIDING look's
     // scan started (RS4 — so the stretch between that look and the backup is covered too).
     let nonce = (env.nonce)();
-    let (facts, jobs) = probe_pod(env.remote.as_ref(), &target, &nonce, Since::At(proof.scan_from()), &ctx.repo, &pod.provider).await;
+    let (facts, jobs) = probe_pod(env.remote.as_ref(), &target, &nonce, Since::At(proof.scan_from()), &ctx.repo, &pod).await;
     let quiet_at = (env.clock)();
     let qctx = QuietCtx { provider: &pod.provider, id: &pod.id, container: proof.container(), now: quiet_at, baseline: pol.proc_baseline.as_ref() };
     let quiet = match quiet_now(&facts, jobs, &qctx) {
@@ -1895,12 +1898,14 @@ async fn act_one(ctx: &RunCtx<'_, '_>, dest: &Dest, mut pol: PodPolicy, pod: Pod
         env.provider.list_by_provider().await.into_iter().map(|(n, r)| (n, r.map_err(|e| e.to_string()))).collect();
     let listed_at = (env.clock)();
     let all_ok: Vec<Pod> = results.iter().filter_map(|(_, r)| r.as_ref().ok()).flatten().cloned().collect();
+    // R2-5: any provider whose listing failed may hide a `-new` twin — no terminate.
+    let partial = results.iter().any(|(_, r)| r.is_err());
     let listed = match results.iter().find(|(n, _)| *n == pod.provider).map(|(_, r)| r) {
         None => Listed::NotQueried,
         Some(Err(_)) => Listed::Failed,
         Some(Ok(pods)) => pods.iter().find(|p| p.id == pod.id).map_or(Listed::Gone, Listed::Pod),
     };
-    let relist = match relist_verdict(listed, &all_ok, &key, &name, listed_at, (env.clock)()) {
+    let relist = match relist_verdict(listed, &all_ok, partial, &key, &name, listed_at, (env.clock)()) {
         Ok(r) => r,
         Err(row) => {
             if row == Row::GoneBeforeReap {
@@ -2128,7 +2133,8 @@ async fn backup(
 /// (`snapshot/`, `big/`), counted against the originals. Under this pod's lock, so nothing
 /// writes the originals meanwhile. The live per-name dirs are a later same-named pod's to pull
 /// into; rsync writes a changed file as a new inode, so the frozen links keep what was
-/// verified. Nothing in arena writes into or deletes from `reaped/`.
+/// verified. Nothing in arena writes into or deletes from `reaped/` — but a freeze that fails
+/// removes the `<stamp>-<provider>-<id>` leaves it made itself, exactly those (R2-3).
 fn freeze(dest: &Dest, pod: &Pod, now: u64, snapshot_dir: &str, big_dir: &str, rehearsal: bool) -> Frozen {
     use arena_core::pull::{link_tree, tree_count};
     let leaf = format!(
@@ -2138,11 +2144,22 @@ fn freeze(dest: &Dest, pod: &Pod, now: u64, snapshot_dir: &str, big_dir: &str, r
         arena_core::snapshot::path_component(&pod.id),
         if rehearsal { "-rehearsal" } else { "" }
     );
-    let at = |root: &str, tier: &str| -> PathBuf {
-        Path::new(root).join(arena_core::restore::REAPED).join(arena_core::snapshot::path_component(&pod.name)).join(&leaf).join(tier)
+    let leaf_in = |root: &str| -> PathBuf {
+        Path::new(root).join(arena_core::restore::REAPED).join(arena_core::snapshot::path_component(&pod.name)).join(&leaf)
     };
-    let (snap_to, big_to) = (at(&dest.snap_root, "snapshot"), at(&dest.big_root, "big"));
-    let one = |from: &str, to: &Path| -> bool {
+    let (snap_leaf, big_leaf) = (leaf_in(&dest.snap_root), leaf_in(&dest.big_root));
+    let (snap_to, big_to) = (snap_leaf.join("snapshot"), big_leaf.join("big"));
+    // The leaves this attempt made (a leaf already there is never this attempt's: refused).
+    let mut made: Vec<PathBuf> = Vec::new();
+    let mut one = |from: &str, leaf: &Path, to: &Path| -> bool {
+        if !made.iter().any(|m| m == leaf) {
+            let fresh = leaf.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::create_dir(leaf));
+            if let Err(e) = fresh {
+                eprintln!("warning: freezing {from}: can't make {} ({e})", leaf.display());
+                return false;
+            }
+            made.push(leaf.to_path_buf());
+        }
         let src = Path::new(from);
         match (tree_count(src), link_tree(src, to)) {
             (Ok(a), Ok(b)) if a == b => true,
@@ -2152,7 +2169,15 @@ fn freeze(dest: &Dest, pod: &Pod, now: u64, snapshot_dir: &str, big_dir: &str, r
             }
         }
     };
-    let matched = one(snapshot_dir, &snap_to) & one(big_dir, &big_to);
+    let matched = one(snapshot_dir, &snap_leaf, &snap_to) && one(big_dir, &big_leaf, &big_to);
+    if !matched {
+        // Only what this attempt made — never anything else under `reaped/`.
+        for leaf in &made {
+            if let Err(e) = std::fs::remove_dir_all(leaf) {
+                eprintln!("warning: removing the partial frozen copy {}: {e}", leaf.display());
+            }
+        }
+    }
     Frozen { snapshot_dir: snap_to.display().to_string(), big_dir: big_to.display().to_string(), matched }
 }
 
@@ -2210,11 +2235,37 @@ pub(crate) fn renamed(cfg: &Config, provider: &str, id: &str, new_name: &str) {
 /// is reaping `pod` right now — its write-ahead record (`terminating`) is in the state the
 /// config FILE names (whatever this shell exports). Copying from, or renaming, a pod the reaper
 /// is about to terminate would race it; the reaper's own last re-listing also stops at a
-/// `-new`/`-old` twin, this closes the stretch before one is listed. No state, or one that
-/// can't be read (the reaper then can't act either): no refusal.
+/// `-new`/`-old` twin, this closes the stretch before one is listed. It fails CLOSED (R2-4):
+/// where the reaper is configured (`REAP_ENABLED=1` in the config file, or a reap cron line), a
+/// state this user can't read — root's 0700 state dir from an operator's shell, a corrupt file
+/// — refuses, naming the path and why. No state file at all: no reap. The reaper not
+/// configured: no check (nothing changes for anyone not using it).
 pub(crate) fn reap_in_progress(cfg: &Config, pod: &Pod, verb: &str) -> Option<String> {
-    let store = Store::new(arena_core::snapshot::state_dir_in_file(cfg).ok()?);
-    let state = store.load_if_any().ok()??;
+    let configured = cfg.file_value("REAP_ENABLED").map(str::trim) == Some("1") || super::reap_cron_installed();
+    if !configured {
+        return None;
+    }
+    let cant_tell = |why: String| {
+        Some(format!(
+            "refusing to {verb}: can't tell whether the auto-reaper is reaping {} ({why}) — run this as the reaper's user, \
+             or `arena pods reap hold` and check `arena pods reap status` first",
+            pod.name
+        ))
+    };
+    let store = match arena_core::snapshot::state_dir_in_file(cfg) {
+        Ok(dir) => Store::new(dir),
+        Err(e) => return cant_tell(e),
+    };
+    let path = store.state_path();
+    match std::fs::metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => return cant_tell(format!("{}: {e}", path.display())),
+        Ok(_) => {}
+    }
+    let state = match store.load() {
+        Ok(s) => s,
+        Err(e) => return cant_tell(e.to_string()),
+    };
     let t = state.pods.get(&core_reap::key(&pod.provider, &pod.id))?.terminating.as_ref()?;
     Some(format!(
         "refusing to {verb}: the auto-reaper is reaping {} (its {} reap, run {}, since {} UTC) — wait for it to end \

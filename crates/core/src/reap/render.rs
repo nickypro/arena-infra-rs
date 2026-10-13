@@ -256,6 +256,7 @@ pub fn why_label(row: Row, reasons: &[Reason]) -> String {
         Row::PostBackupNotQuiet => "not quiet after the backup",
         Row::Rehearsed => "rehearsal: backed up and verified, not terminated",
         Row::RelistFailed => "re-listing didn't confirm the pod",
+        Row::PartialListing => "another provider's listing failed at the re-listing (a twin could be there)",
         Row::FreezeFailed => "the verified backup couldn't be frozen into reaped/",
         Row::DisabledMidRun => "REAP_ENABLED was switched off in the config file during the run",
         Row::GoneBeforeReap => "gone before the reap",
@@ -364,9 +365,10 @@ pub fn notice_text(name: &str, p: &PodPolicy, tz: i64) -> String {
         ));
     }
     s.push_str(
-        "  Your home directory is backed up first (not kept: caches, installed packages and venvs, Hugging Face \
-         downloads, ~/.ssh). Nothing happens while the machine is in use, or while TEMP_FOLDER_FOR_SWEEPS/ holds new \
-         results.\n  \
+        "  Your home directory is backed up first (not kept: caches, installed packages and venvs, Hugging Face hub \
+         downloads, ~/.ssh) — only your home. Nothing happens while the machine is in use, while a \
+         TEMP_FOLDER_FOR_SWEEPS/ holds any results, or while you have data outside your home (/data, /tmp, /workspace, \
+         a link out of the home …).\n  \
          To keep it running, create ~/.arena/keep (`mkdir -p ~/.arena && touch ~/.arena/keep`) and tell the organisers.\n",
     );
     s

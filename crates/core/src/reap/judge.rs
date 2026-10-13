@@ -67,6 +67,9 @@ pub enum Row {
     PostBackupNotQuiet,
     Rehearsed,
     RelistFailed,
+    /// Another provider's listing failed at the final re-listing: a `-new` twin (a migrate
+    /// placed there) or a second pod of the name may be hiding in it (R2-5).
+    PartialListing,
     GoneBeforeReap,
     /// The verified backup couldn't be frozen into `reaped/` (RS1).
     FreezeFailed,
@@ -130,6 +133,7 @@ impl Row {
             PostBackupNotQuiet => "R35",
             Rehearsed => "R36",
             RelistFailed => "R37",
+            PartialListing => "R37c",
             GoneBeforeReap => "R37",
             FreezeFailed => "R34b",
             DisabledMidRun => "R37b",
@@ -369,6 +373,26 @@ fn point_signals(f: &ProbeFacts, jobs: JobsOutcome, provider: &str, baseline: Op
         Mounts::HasData => act.push(Reason::OtherMount),
         Mounts::Err => unk.push(Reason::MountsUnknown),
     }
+    match f.links {
+        Files::Hit => act.push(Reason::LinkOutside),
+        Files::NoneChanged => {}
+        Files::Timeout | Files::Err => unk.push(Reason::LinksUnknown),
+    }
+    match f.roots {
+        Files::Hit => act.push(Reason::OutsideData),
+        Files::NoneChanged => {}
+        Files::Timeout | Files::Err => unk.push(Reason::OutsideUnknown),
+    }
+    match f.sched {
+        Some(true) => act.push(Reason::Scheduled),
+        Some(false) => {}
+        None => unk.push(Reason::ScheduledUnknown),
+    }
+    match f.ttys {
+        Some(0) => {}
+        Some(_) => act.push(Reason::Terminal),
+        None => unk.push(Reason::SessionsUnknown),
+    }
     match late_process(f, baseline) {
         Some(true) => act.push(Reason::Process),
         Some(false) => {}
@@ -485,27 +509,33 @@ fn boot_end(f: &ProbeFacts) -> Option<u64> {
     Some(pid1.saturating_add(BOOT_GRACE.saturating_mul(f.hz)))
 }
 
-/// Whether a process is running that isn't the container's own (RS7): not idle by itself ([`ProcFact::idle`]), not
-/// started within [`BOOT_GRACE`] of the container, not a restart of one that was (its command
-/// line's cksum in `baseline`, for this container). `None` = can't tell (no process list, or
-/// no container start).
+/// Whether a process is running that isn't the image's own (RS7): not idle by itself
+/// ([`ProcFact::idle`]), and neither one whose command line's cksum is in the pod's `baseline`
+/// (the services of the FIRST boot the reaper saw) nor — in that first boot only — one
+/// started within [`BOOT_GRACE`] of it. After a later boot (a Hetzner VM keeps its disk, so a
+/// participant's `@reboot` cron or enabled unit comes back with it), an early process counts
+/// unless the first boot had the same command line (RS7c). `None` = can't tell (no process
+/// list, or no container start).
 pub fn late_process(f: &ProbeFacts, baseline: Option<&ProcBaseline>) -> Option<bool> {
     let procs = f.procs.as_ref()?;
     let end = boot_end(f)?;
     let container = f.container();
-    let known = baseline.filter(|b| Some(&b.container) == container.as_ref()).map(|b| &b.hashes);
-    Some(procs.iter().any(|p| !p.idle && p.start > end && !known.is_some_and(|h| h.contains(&p.hash))))
+    let first_boot = baseline.is_none_or(|b| Some(&b.container) == container.as_ref());
+    let known = baseline.map(|b| &b.hashes);
+    Some(procs.iter().any(|p| !p.idle && !known.is_some_and(|h| h.contains(&p.hash)) && !(first_boot && p.start <= end)))
 }
 
-/// The pod's process baseline after a look (RS7): the boot-time processes this look saw, added
-/// to `prev`'s when it's of the same container (a new container starts afresh). `prev` as it
-/// was when the facts can't extend it.
+/// The pod's process baseline after a look (RS7c): taken at its first look — the processes of
+/// that boot's first [`BOOT_GRACE`] — and extended only by later looks at the SAME boot (one
+/// that came early in it); a later boot or container never adds to it. `prev` as it was when
+/// the facts can't extend it.
 pub fn next_baseline(prev: Option<&ProcBaseline>, facts: &Result<ProbeFacts, ProbeError>) -> Option<ProcBaseline> {
     let Ok(f) = facts else { return prev.cloned() };
     let (Some(container), Some(procs), Some(end)) = (f.container(), f.procs.as_ref(), boot_end(f)) else { return prev.cloned() };
     let mut b = match prev {
-        Some(p) if p.container == container => p.clone(),
-        _ => ProcBaseline { container, hashes: Default::default() },
+        Some(p) if p.container != container => return Some(p.clone()),
+        Some(p) => p.clone(),
+        None => ProcBaseline { container, hashes: Default::default() },
     };
     b.hashes.extend(procs.iter().filter(|p| p.start <= end).map(|p| p.hash));
     Some(b)
@@ -716,7 +746,14 @@ pub fn observation_row(obs: &Observation, overdue: bool) -> Decision {
     let row = match obs.verdict {
         Verdict::Idle => return Decision::of(Row::Candidate),
         Verdict::Active if has(Reason::Keep) => Row::Keep,
-        Verdict::Active if has(Reason::Workspace) || has(Reason::RepoOutside) || has(Reason::Uncovered) || has(Reason::OtherMount) => {
+        Verdict::Active
+            if has(Reason::Workspace)
+                || has(Reason::RepoOutside)
+                || has(Reason::Uncovered)
+                || has(Reason::OtherMount)
+                || has(Reason::LinkOutside)
+                || has(Reason::OutsideData) =>
+        {
             Row::NotCovered
         }
         Verdict::Active => Row::Active,
@@ -1052,8 +1089,9 @@ pub struct RelistProof {
 /// reported and off — and (RS5) R4/R5 again over `all_ok` (every provider that re-listed fine):
 /// still a reapable name, held by exactly one pod, no `<name>-old`/`-new` twin (a replace or
 /// migrate started during the backup). Gone ⇒ [`Row::GoneBeforeReap`]; a twin or a shared name
-/// ⇒ [`Row::DuplicateOrTwin`]; anything else ⇒ [`Row::RelistFailed`].
-pub fn relist_verdict(listed: Listed, all_ok: &[Pod], expect_key: &str, expect_name: &str, listed_at: u64, now: u64) -> Result<RelistProof, Row> {
+/// ⇒ [`Row::DuplicateOrTwin`]; any OTHER provider's listing failed (`partial`: a twin may be in
+/// it) ⇒ [`Row::PartialListing`] (R2-5); anything else ⇒ [`Row::RelistFailed`].
+pub fn relist_verdict(listed: Listed, all_ok: &[Pod], partial: bool, expect_key: &str, expect_name: &str, listed_at: u64, now: u64) -> Result<RelistProof, Row> {
     if listed_at > now || now - listed_at > RELIST_MAX_AGE {
         return Err(Row::RelistFailed);
     }
@@ -1069,6 +1107,9 @@ pub fn relist_verdict(listed: Listed, all_ok: &[Pod], expect_key: &str, expect_n
     let twins = [format!("{expect_name}-old"), format!("{expect_name}-new")];
     if all_ok.iter().filter(|p| p.name == expect_name).count() != 1 || all_ok.iter().any(|p| twins.contains(&p.name)) {
         return Err(Row::DuplicateOrTwin);
+    }
+    if partial {
+        return Err(Row::PartialListing);
     }
     Ok(RelistProof { key: expect_key.to_string(), at: listed_at })
 }

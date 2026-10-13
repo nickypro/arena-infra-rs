@@ -633,10 +633,15 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     terminate a pod past an end time the operator set (`--expire-in 8h`, `--expire-at …`), or
     idle for a window (`--idle-after 8h`), **after a verified backup and only when every check
     is certain** — anything it can't confirm (an unreachable pod, a probe it can't read, a
-    failed listing, an unverified clock, a lock, a pin, `~/.arena/keep` on the pod, data on
-    `/workspace` or another writable mount, files written in a `TEMP_FOLDER_FOR_SWEEPS/` since
-    the container started, a home that's a link to another filesystem, a process list it
-    can't read) means "do nothing and log it". Off by default in layers: a pod needs a policy
+    failed listing, an unverified clock, a lock, a pin, `~/.arena/keep` on the pod, anything
+    the reap's backup wouldn't copy — any file in a `TEMP_FOLDER_FOR_SWEEPS/`, a link from the
+    home to somewhere outside it, data written since the pod was created on `/workspace`,
+    another writable mount or the usual places outside the home (`/data /scratch /srv /mnt
+    /media /opt /var/tmp /tmp /home/<other>`; the system, installed Python packages and caches
+    passed over) —, a home that's a link to another filesystem, a process list, crontab or
+    timer it can't read) means "do nothing and log it". **Since when** is the pod's creation as
+    its provider lists it — not the last boot: a Hetzner VM's disk outlives reboots (on RunPod,
+    where a restart starts the container afresh, the later of creation and container start). Off by default in layers: a pod needs a policy
     (`reap set <names> …`, or `pods up/create --expire-in/--expire-at/--idle-after`, recorded
     the moment each create returns); `reap run` alone only probes (read-only) and prints the
     plan (`WOULD TERMINATE`); `reap run --apply` acts only with `REAP_ENABLED=1` **in the config
@@ -646,24 +651,35 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     60 s old, a durable write-ahead, the git push, the tier roots' markers and free space
     checked again, both rsync tiers under the pod's backup lock (every pod-side step behind
     its identity check) — the big tier as the reap's own copy, which keeps the home's
-    dot-directories and leaves out only documented caches and secrets (`.cache`, venvs and
-    `site-packages`, Hugging Face downloads, the VS Code server's binaries, `.ssh`) — a
+    dot-directories and leaves out only documented caches and secrets (`.cache` but
+    `~/.cache/huggingface/` — of which only the hub cache, `hub/` and `xet/`, is left out —,
+    venvs and `site-packages`, Hugging Face hub entries `models--*/`/`datasets--*/`, the VS Code
+    server's binaries, `.ssh`) — a
     dry-run verify (0 files pending), then the verified dirs **frozen**: hard-linked (same
     filesystem, no space) into `<root>/reaped/<name>/<UTC stamp>-<provider>-<id>/snapshot` and
     `<big root>/reaped/…/big`, counted equal to what was verified — a later same-named pod's
-    pulls never touch that copy, and nothing in arena writes or deletes under `reaped/`.
+    pulls never touch that copy, and nothing in arena writes or deletes under `reaped/` (a
+    freeze that fails removes the leaves it made itself, and backs off 6 h like a failed
+    backup).
     Then a post-backup quiet check (same id and container; nothing changed since the deciding
     look's scan began; no process started since boot that isn't the container's own), a
     fresh re-listing (same id/name, RUNNING, lock reported off, no `-new`/`-old` twin, no
-    second pod of that name), a state re-read (no hold, no new pin, still due) and
+    second pod of that name — and every provider listed: one that failed could hide a twin),
+    a state re-read (no hold, no new pin, still due) and
     `REAP_ENABLED` re-read from the config file — then one terminate, routed by provider name.
-    **Processes**: a process started after the container's first two minutes counts as use —
-    a dormant `nohup python train.py`, a kernel, an editor, `mosh-server`, a `screen` —
-    unless it's a restart of one of the container's own boot-time services (by its command
-    line), a plain interactive shell, tmux's server (its panes are judged: a non-shell
-    foreground counts), sshd's or cron's own, or the login's `systemd --user`. To stop a run
+    **Processes**: a process counts as use — a dormant `nohup python train.py`, a kernel, an
+    editor, `mosh-server`, a `screen` — unless it's one of the image's own services (a command
+    line seen in the first two minutes of the FIRST boot the reaper looked at, kept per pod: a
+    participant's `@reboot` job after a later reboot counts), a plain interactive shell, tmux's
+    server (its panes are judged: a non-shell foreground counts), sshd's or cron's own, or the
+    login's `systemd --user`. So does any open terminal (a process on a `/dev/pts` outside the
+    probe's own session, a tmux pane's own shell aside: an ssh login, RunPod's web or proxy
+    shell, a VS Code or Jupyter terminal) and scheduled work no process shows yet (a crontab
+    line, an `at` job, a systemd timer someone added). To stop a run
     mid-way: `arena pods reap hold` (or `REAP_ENABLED=0` in the file) — checked again right
-    before the terminate. `pods replace`/`migrate copy`/`cutover` refuse a pod being reaped. Expiry never takes a pod in use or unreachable: it's
+    before the terminate. `pods replace`/`migrate copy`/`cutover` refuse a pod being reaped —
+    and, where the reaper is configured (`REAP_ENABLED=1` in the file or its cron line), when
+    they can't read its state (root's state dir from an operator's shell), naming the path. Expiry never takes a pod in use or unreachable: it's
     deferred (`OVERDUE (in use)` / `(unreachable)` in `pods list`'s ENDS column) and notified at
     most every 6 h (`REAP_NOTIFY_CMD`, one line on stdin). A terminate error other than
     "locked" sets an automatic hold. Needs an explicit absolute `ARENA_STATE_DIR` **in the
@@ -686,9 +702,11 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     expired one is `OVERDUE` and notified every 6 h): a live Jupyter kernel (its loopback
     connections are sockets in use), any process started after the container's first two
     minutes that isn't one of its own services restarted (a VS Code server left running, a
-    `screen`, `mosh-server`, a forgotten `python`), data on `/workspace` (where setup puts the
-    repo when the pod has a volume) or another writable mount, new files in a
-    `TEMP_FOLDER_FOR_SWEEPS/`, a MIG GPU slice (`[N/A]` utilisation reads as unknown), RunPod
+    `screen`, `mosh-server`, a forgotten `python`), an open terminal, a crontab line or timer,
+    data on `/workspace` (where setup puts the repo when the pod has a volume) or another
+    writable mount, any file in a `TEMP_FOLDER_FOR_SWEEPS/`, data written outside the home since
+    the pod was created (or a link out of the home), a pod whose provider gives no creation
+    time, a MIG GPU slice (`[N/A]` utilisation reads as unknown), RunPod
     on `RUNPOD_API=v1` (the default) and Vast (no lock state — `up --expire-*` refuses them,
     ENDS shows `not reapable (…)`), a pod renamed outside arena or sharing its name, a home
     that's a link to another filesystem, `~/.arena/keep`. A tmux session whose panes run only

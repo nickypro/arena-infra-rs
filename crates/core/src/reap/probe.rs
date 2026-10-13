@@ -47,14 +47,15 @@ fn sq(s: &str) -> String {
 /// environment but `HOME`), as POSIX `sh`. `$SSH_CONNECTION` is expanded by the login shell
 /// *before* `env -i` — how the probe learns its own connection. The arguments are quoted, never
 /// spliced into the script. `nonce` must be alphanumeric (the script refuses anything else).
-pub fn probe_command(nonce: &str, since: Since, repo: &str, provider: &str) -> String {
+pub fn probe_command(nonce: &str, since: Since, repo: &str, provider: &str, created: Option<u64>) -> String {
     let b64 = crate::base64::encode(PROBE_SCRIPT.as_bytes());
     format!(
-        "env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=\"$HOME\" sh -c \"$(printf %s {b64} | base64 -d)\" arena-idle-probe {} {} {} {} \"$SSH_CONNECTION\"",
+        "env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=\"$HOME\" sh -c \"$(printf %s {b64} | base64 -d)\" arena-idle-probe {} {} {} {} \"$SSH_CONNECTION\" {}",
         sq(nonce),
         sq(&since.arg()),
         sq(repo.trim_end_matches('/')),
-        sq(provider)
+        sq(provider),
+        sq(&created.map_or_else(|| "-".to_string(), |c| c.to_string()))
     )
 }
 
@@ -217,12 +218,25 @@ pub struct ProbeFacts {
     pub home_mounts: Option<u32>,
     /// The home resolved, a link, or unresolvable (RS6).
     pub home: HomeState,
-    /// A sweep folder's (`TEMP_FOLDER_FOR_SWEEPS/`) files changed since the container started —
-    /// never copied by a reap's backup (RS2). Same scan (and so the same timeout/error) as
-    /// `files`.
+    /// Any regular file in a sweep folder (`TEMP_FOLDER_FOR_SWEEPS/`), whenever it was written —
+    /// the folder is never copied by a reap's backup (RS2, R2-1). Same scan (and so the same
+    /// timeout/error) as `files`.
     pub uncovered: Files,
-    /// Other writable mounts (RS2).
+    /// Other writable mounts: data there written since the pod was created (RS2, R2-1).
     pub mounts: Mounts,
+    /// A link in the home to somewhere outside it that isn't the system or a cache — the
+    /// backup copies the link alone (R2-2). `Timeout`/`Err` = can't tell.
+    pub links: Files,
+    /// A regular file written since the pod was created in the places outside the home a
+    /// participant can write (`/data`, `/srv`, `/opt`, `/tmp`, `/home/<other>`, …), system junk
+    /// passed over (R2-2). `Timeout`/`Err` = can't tell (also: no creation time to reach back to).
+    pub roots: Files,
+    /// Scheduled work no process shows yet: a user crontab line, an `at` job, a systemd timer
+    /// someone added (RS7a). `None` = can't tell.
+    pub sched: Option<bool>,
+    /// Processes on a pseudo-terminal outside the probe's session, a tmux pane's own shell
+    /// aside (RS7b). `None` = the process list couldn't be read whole.
+    pub ttys: Option<u32>,
     /// Clock ticks per second (`getconf CLK_TCK`): process start times are in these.
     pub hz: u64,
     /// Every process outside the probe's session and ancestry; `None` = the list couldn't be
@@ -287,6 +301,10 @@ const SCALARS: &[(&str, bool)] = &[
     ("hz", true),
     ("uncovered", true),
     ("mounts", true),
+    ("links", true),
+    ("roots", true),
+    ("sched", true),
+    ("ttys", true),
     ("proc_read", true),
     ("proc_overflow", false),
     ("proc_n", true),
@@ -446,6 +464,18 @@ pub fn parse_probe(stdout: &str, nonce: &str, since: Since) -> Result<ProbeFacts
     };
     let files = scan(s("files"))?;
     let uncovered = scan(s("uncovered"))?;
+    let links = scan(s("links"))?;
+    let roots = scan(s("roots"))?;
+    let sched = match s("sched") {
+        "none" => Some(false),
+        "hit" => Some(true),
+        "err" => None,
+        _ => return Err(Garbled),
+    };
+    let ttys = match s("ttys") {
+        "-" => None,
+        n => Some(u32::try_from(digits(n).ok_or(Garbled)?).map_err(|_| Garbled)?),
+    };
     let home = match s("home") {
         "ok" => HomeState::Ok,
         "link" => HomeState::Link,
@@ -611,6 +641,10 @@ pub fn parse_probe(stdout: &str, nonce: &str, since: Since) -> Result<ProbeFacts
         home,
         uncovered,
         mounts,
+        links,
+        roots,
+        sched,
+        ttys,
         hz,
         procs,
     })
@@ -800,6 +834,11 @@ pub mod fixture {
         pub home: &'static str,
         pub uncovered: &'static str,
         pub mounts: &'static str,
+        pub links: &'static str,
+        pub roots: &'static str,
+        pub sched: &'static str,
+        /// `-` = unknown.
+        pub ttys: &'static str,
         pub hz: u64,
         /// `(start jiffies, cmdline cksum, interactive shell, name)`; `None` = `proc_read=err`.
         pub procs: Option<Vec<(u64, u32, bool, String)>>,
@@ -854,6 +893,10 @@ pub mod fixture {
                 home: "ok",
                 uncovered: "none",
                 mounts: "clean",
+                links: "none",
+                roots: "none",
+                sched: "none",
+                ttys: "0",
                 hz: 100,
                 // PID 1 and the image's services, all started at boot (pid1_start 123456).
                 procs: Some(vec![
@@ -949,6 +992,10 @@ pub mod fixture {
             o("hz", self.hz.to_string());
             o("uncovered", self.uncovered.into());
             o("mounts", self.mounts.into());
+            o("links", self.links.into());
+            o("roots", self.roots.into());
+            o("sched", self.sched.into());
+            o("ttys", self.ttys.into());
             match &self.procs {
                 None => {
                     o("proc_read", "err".into());

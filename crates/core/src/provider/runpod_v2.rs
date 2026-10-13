@@ -409,6 +409,8 @@ fn parse_pod(v: &Value) -> Pod {
         locked: v.get("locked").and_then(Value::as_bool),
         proxy_only,
         delete_protected: None,
+        // `createdAt` (`2026-10-08T09:33:33.607Z`).
+        created_at: s("createdAt").as_deref().and_then(crate::reap::parse_rfc3339).and_then(|t| u64::try_from(t).ok()),
     }
 }
 
@@ -1089,6 +1091,7 @@ mod tests {
                 locked: Some(false),
                 proxy_only: false,
                 delete_protected: None,
+                created_at: Some(1_780_315_200),
             }
         );
     }

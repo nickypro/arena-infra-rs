@@ -493,14 +493,26 @@ pub enum Reason {
     Workspace,
     /// The repo (`BACKUP_REPO_PATH`) resolves outside the home — not in the backup's scope.
     RepoOutside,
-    /// A sweep folder (`TEMP_FOLDER_FOR_SWEEPS/`) changed since the container started — never
-    /// copied by a reap's backup.
+    /// A sweep folder (`TEMP_FOLDER_FOR_SWEEPS/`) holds a file — never copied by a reap's backup.
     Uncovered,
-    /// Data written since the container started on another writable mount — outside the backup.
+    /// Data written since the pod was created on another writable mount — outside the backup.
     OtherMount,
     /// A process that isn't the image's own (started after boot, not a restart of a boot-time
     /// service, not an idle daemon): somebody's job, dormant or not.
     Process,
+    /// A link in the home to somewhere outside it (not the system, not a cache): the backup
+    /// copies the link alone (R2-2).
+    #[serde(rename = "link_outside_home")]
+    LinkOutside,
+    /// A file written since the pod was created outside the home (`/data`, `/srv`, `/opt`,
+    /// `/tmp`, another user's home …) — outside the backup (R2-2).
+    #[serde(rename = "data_outside_home")]
+    OutsideData,
+    /// Scheduled work: a user crontab line, an `at` job or an added systemd timer (RS7a).
+    Scheduled,
+    /// A terminal open on the pod (a process on a pseudo-terminal outside the probe's own
+    /// session: an ssh login, RunPod's web or proxy shell, a VS Code/Jupyter terminal — RS7b).
+    Terminal,
     // --- couldn't tell (Unknown) ---
     /// SSH or the exec failed, timed out, or the reply had no end marker.
     ProbeFailed,
@@ -557,6 +569,13 @@ pub enum Reason {
     MountsUnknown,
     /// The process list couldn't be read in full.
     ProcessesUnknown,
+    /// The home's links couldn't be checked (too many, or the scan failed).
+    LinksUnknown,
+    /// The places outside the home couldn't be scanned (out of time, an error, or no creation
+    /// time to reach back to).
+    OutsideUnknown,
+    /// Crontabs, `at` or the timers couldn't be read.
+    ScheduledUnknown,
 }
 
 impl Reason {
@@ -585,6 +604,10 @@ impl Reason {
                 | Uncovered
                 | OtherMount
                 | Process
+                | LinkOutside
+                | OutsideData
+                | Scheduled
+                | Terminal
         )
     }
 
@@ -676,9 +699,10 @@ pub struct PodPolicy {
     pub proc_baseline: Option<ProcBaseline>,
 }
 
-/// A container's own processes — those started within [`BOOT_GRACE`] of its start — by the
-/// cksum of their command line, collected across looks (so a service restarted later is still
-/// recognised). Reset when the container changes.
+/// The image's own processes — those started within [`BOOT_GRACE`] of the FIRST boot (or
+/// container) the reaper saw — by the cksum of their command line (so a service restarted
+/// later, or after a reboot, is still recognised). Never reset: a later boot's early processes
+/// that aren't here count as use (RS7c). `container` = that first boot.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcBaseline {
@@ -821,6 +845,10 @@ pub struct ReapState {
     /// `release` work even when `reap.json` can't be read (RR13); filled in by the store's load.
     #[serde(skip)]
     pub hold: Option<Hold>,
+    /// The `hold` a `reap.json` from before RR13 carries (`"hold": null` or a hold): read, never
+    /// written — such a hold still holds (the store's load takes it when `hold.json` has none).
+    #[serde(default, rename = "hold", skip_serializing)]
+    pub legacy_hold: Option<Hold>,
     /// Terminate attempts (write-ahead times), for the rolling daily cap.
     #[serde(default)]
     pub attempts: Vec<u64>,
@@ -839,6 +867,7 @@ impl Default for ReapState {
             pods: BTreeMap::new(),
             pins: Vec::new(),
             hold: None,
+            legacy_hold: None,
             attempts: Vec::new(),
             reaped: BTreeMap::new(),
             run_notified: BTreeMap::new(),

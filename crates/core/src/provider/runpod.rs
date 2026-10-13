@@ -258,6 +258,7 @@ fn parse_pod(v: &Value) -> Pod {
         // ask for a public IP instead (`supportPublicIp`).
         proxy_only: false,
         delete_protected: None,
+        created_at: None,
     }
 }
 
