@@ -425,8 +425,11 @@ fn parse_pod(v: &Value) -> Pod {
         // read from here, never inferred from `actions`, which still lists them.
         locked: v.get("locked").and_then(Value::as_bool),
         proxy_only,
-        // `disk` is the container disk; a persistent volume is `mounts.persistent.size`.
+        // `disk` is the container disk; a persistent volume is `mounts.persistent.size` —
+        // and a pod whose disk is reported without one has no volume (0 GB).
         disk_gb: runpod::disk_sum(&[v.get("disk"), v.pointer("/mounts/persistent/size")]),
+        volume_gb: runpod::disk_sum(&[v.pointer("/mounts/persistent/size")])
+            .or_else(|| runpod::disk_sum(&[v.get("disk")]).map(|_| 0.0)),
     }
 }
 
@@ -1109,6 +1112,7 @@ mod tests {
                 proxy_only: false,
                 // `disk` 100 + the persistent volume's 20.
                 disk_gb: Some(120.0),
+                volume_gb: Some(20.0),
             }
         );
     }

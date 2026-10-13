@@ -640,7 +640,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     key: only `credit` is read, and it is never quoted) — when read now or under 5 min ago;
     else **est.**: the last live reading (or `balance set`) minus max(billed, metered)
     spend since — *billed* from RunPod's REST v2 hourly billing history (every resource on
-    the account, but it lags), *metered* from arena's own burn samples (each step charged at
+    the account, but it lags: live, a bucket appears about an hour after its usage, filled
+    in ~5-min steps — the hour in progress isn't there, nor is an empty one — so for the
+    first hour metering alone carries the estimate), *metered* from arena's own burn samples (each step charged at
     its higher end), taken per UTC hour as the larger of the two — shown `~$X est. (live
     n/a 2d, billed)`, for up to 14 days; else `?` with `arena balance set <acct> <USD>`.
     Estimates err low (they warn early, never late) and never rise between readings.
@@ -653,12 +655,20 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     that errs high: a known GPU at the most it is known to cost (RunPod's recorded catalog,
     the presets, the dearest live catalog/offer price seen in `offers`/`create`/`up`), an
     unknown GPU type at the ceiling `BALANCE_UNPRICED_PER_GPU` (default $8, above the dearest
-    recorded catalog price) per GPU — shown `~$X/h` with a note. A stopped pod's disk is
-    priced too, from the listing's disk size: RunPod $0.20/GB-month (its idle-disk rate),
-    Vast a $0.50/GB-month ceiling — so after a nightly `pods stop --all` a healthy account
-    reads ok. A running pod with no GPU information, a stopped pod whose disk size isn't
-    listed, or a burn not known at all make the account `unknown` ("burn unknown: …", never
-    "no burn"). RunPod's own rate, while it is read, replaces the stand-ins.
+    recorded catalog price) per GPU — shown `~$X/h` with a note. **Disks**, from the
+    listing's sizes: a running RunPod pod's container and volume disk at RunPod's
+    $0.10/GB-month on top of its listed $/h (live: a listed $0.13/h 3070 with a 60 GB disk
+    drained $0.138/h); a stopped RunPod pod's volume disk alone at $0.20/GB-month (its
+    container disk isn't billed — live, a stopped pod with no volume cost $0.00/h); a stopped
+    Vast instance's disk at a $0.50/GB-month ceiling (a running one's price includes it) — so
+    after a nightly `pods stop --all` a healthy account reads ok. A running pod with no GPU
+    information, a stopped pod whose (volume) disk size isn't listed, or a burn not known at
+    all make the account `unknown` ("burn unknown: …", never "no burn"). A listing that fails
+    (a Vast 429 is retried once first, when it asks for ≤ 2 s) is stood in for by the burn
+    observed under 30 min ago, marked stale (`-v` says so) — older, a $0 is unknown and
+    anything more a floor. RunPod's own rate, while it is read, replaces the stand-ins; it
+    lags a create, stop or terminate by minutes, so "RunPod reports $X/h more than arena
+    lists" needs two readings at least 5 min apart.
     **Known undercounts:** a pod created and destroyed between two observations while
     billing is unavailable; and spend arena doesn't list that falls inside billing's lag.
     Vast's negative `balance`, when reported, is shown as "Vast reports $X owed" (never
@@ -686,7 +696,10 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
   - `balance set <runpod|vast> <USD>` — record the balance read off the console when every
     API is dead (a manual anchor; a local write, scoped to the configured key; the next live
     reading replaces it). `create`/`up` print the target account's balance next to the plan
-    — the runway after the new pods (`n ×` the dearest option), and RunPod's refusals ahead
+    — the runway after the new pods (`n ×` the dearest option; with no `--gpu` list or
+    `--max-price`, the spec's GPU and tier priced live alongside, within the same 5 s — else
+    the live price `offers`/placement saw for that GPU and tier under a day ago, `~` with its
+    age — else a stand-in), and RunPod's refusals ahead
     of time: under an hour's credit for them, over the spend limit, `underBalance` — never
     blocking.
   - `pods idle [targets] [--hours N] [--json]` — which pods look abandoned: a **read-only

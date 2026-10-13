@@ -28,6 +28,47 @@ pub(crate) async fn send_json(rb: RequestBuilder, ctx: &str) -> Result<Value> {
     judge(status, &text, ctx)
 }
 
+/// How long to wait before the one retry of a 429 ([`send_json_retrying_429`]): what the
+/// server asked for — `Retry-After` in seconds, else a JSON body's `retry_after` — when that
+/// is at most `max`; a second when it asked nothing. `None` when it asks for longer: no
+/// retry (its answer won't come sooner, and the caller's bound is short). Pure.
+pub(crate) fn retry_wait(asked: Option<f64>, max: std::time::Duration) -> Option<std::time::Duration> {
+    match asked {
+        None => Some(std::time::Duration::from_secs(1).min(max)),
+        Some(s) if s.is_finite() && s >= 0.0 && s <= max.as_secs_f64() => Some(std::time::Duration::from_secs_f64(s)),
+        Some(_) => None,
+    }
+}
+
+/// [`send_json`], with a 429 retried once after [`retry_wait`] (at most `max_wait`): one
+/// throttled answer — Vast's listing, live — would otherwise make a whole surface read that
+/// provider as failed. `make` builds the request afresh (a builder is spent by sending).
+pub(crate) async fn send_json_retrying_429(make: impl Fn() -> RequestBuilder, ctx: &str, max_wait: std::time::Duration) -> Result<Value> {
+    let resp = make().send().await?;
+    let status = resp.status();
+    if status != StatusCode::TOO_MANY_REQUESTS {
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(status_error(status, &text, ctx));
+        }
+        let text = resp.text().await?;
+        return judge(status, &text, ctx);
+    }
+    let header = resp.headers().get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse::<f64>().ok());
+    let text = resp.text().await.unwrap_or_default();
+    let body = serde_json::from_str::<Value>(&text).ok().and_then(|v| {
+        let after = v.get("retry_after")?;
+        after.as_f64().or_else(|| after.as_str().and_then(|s| s.trim().parse().ok()))
+    });
+    match retry_wait(header.or(body), max_wait) {
+        Some(wait) => {
+            tokio::time::sleep(wait).await;
+            send_json(make(), ctx).await
+        }
+        None => Err(status_error(status, &text, ctx)),
+    }
+}
+
 /// Send `rb` and check only its status: for calls whose success body we don't use (stop,
 /// restart, terminate, delete). A 2xx is success whatever its body says or however it's
 /// encoded — a mutating call that worked must not be reported as failed because its
@@ -226,6 +267,62 @@ mod tests {
     use super::test_server::{canned, client, serve};
     use super::*;
     use crate::error::ProviderErrorKind as K;
+
+    /// The one retry of a 429 waits what the server asked, when that fits the bound — a
+    /// second when it asked nothing — and doesn't retry when it asks for longer.
+    #[test]
+    fn retry_wait_table() {
+        use std::time::Duration as D;
+        let max = D::from_secs(2);
+        let cases = [
+            (None, Some(D::from_secs(1))),
+            (Some(0.0), Some(D::ZERO)),
+            (Some(1.5), Some(D::from_millis(1_500))),
+            (Some(2.0), Some(D::from_secs(2))),
+            (Some(12.0), None), // Vast's own `retry_after`, live
+            (Some(-1.0), None),
+            (Some(f64::NAN), None),
+        ];
+        for (asked, want) in cases {
+            assert_eq!(retry_wait(asked, max), want, "{asked:?}");
+        }
+        assert_eq!(retry_wait(None, D::from_millis(300)), Some(D::from_millis(300)), "never past the bound");
+    }
+
+    /// Against a loopback server: a 429 that asks for at most the bound is retried once and
+    /// the second answer is the result; one that asks for longer — or a second 429 — is the
+    /// classified error, after one request or two.
+    #[tokio::test]
+    async fn a_429_is_retried_once_when_it_asks_for_little() {
+        let max = std::time::Duration::from_secs(2);
+        let srv = serve(vec![canned(429, "text/plain", "slow down").header("Retry-After", "0"), canned(200, "application/json", r#"{"ok":1}"#)]);
+        let c = client();
+        let v = send_json_retrying_429(|| c.get(format!("{}/x", srv.base)), "t", max).await.unwrap();
+        assert_eq!(v["ok"], 1);
+        assert_eq!(srv.requests.lock().unwrap().len(), 2);
+
+        let srv = serve(vec![
+            canned(429, "application/json", r#"{"detail":"too frequent","retry_after":12}"#),
+            canned(200, "application/json", "{}"),
+        ]);
+        let e = send_json_retrying_429(|| c.get(format!("{}/x", srv.base)), "t", max).await.unwrap_err();
+        assert_eq!(e.kind(), Some(K::RateLimited), "{e}");
+        assert_eq!(srv.requests.lock().unwrap().len(), 1, "12 s is past the bound: no retry");
+
+        let srv = serve(vec![
+            canned(429, "application/json", r#"{"retry_after":"0"}"#),
+            canned(429, "application/json", r#"{"retry_after":0}"#),
+            canned(200, "application/json", "{}"),
+        ]);
+        let e = send_json_retrying_429(|| c.get(format!("{}/x", srv.base)), "t", max).await.unwrap_err();
+        assert_eq!(e.kind(), Some(K::RateLimited), "{e}");
+        assert_eq!(srv.requests.lock().unwrap().len(), 2, "once only");
+
+        // Anything else is send_json's answer, first time.
+        let srv = serve(vec![canned(401, "text/plain", "no"), canned(200, "application/json", "{}")]);
+        let e = send_json_retrying_429(|| c.get(format!("{}/x", srv.base)), "t", max).await.unwrap_err();
+        assert_eq!((e.kind(), srv.requests.lock().unwrap().len()), (Some(K::Auth), 1));
+    }
 
     #[test]
     fn judge_checks_the_status_before_the_body() {

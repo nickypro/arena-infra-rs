@@ -557,7 +557,10 @@ mod tests {
         let verdict = text.find("ALL CLEAR").unwrap();
         let info = text.find("info: prepaid balance — ‼ runpod $1.00 live (not part of the verdict)").unwrap_or_else(|| panic!("{text}"));
         assert!(info > verdict, "{text}");
-        assert!(text.contains("info: RunPod reports $0.35/h more than arena lists"), "{text}");
+        // RunPod's $0.35/h above an empty listing, at a single reading: not yet "spend arena
+        // doesn't list" — live, RunPod's rate counted a terminated pod for minutes. Two
+        // readings 5 min apart confirm it (`balance`'s tests).
+        assert!(!text.contains("more than arena lists"), "{text}");
     }
 
     /// A stopped pod, a failed provider, a volume, a key, the cron block, an arena `at` job and

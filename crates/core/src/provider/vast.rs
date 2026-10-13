@@ -56,7 +56,7 @@ use crate::apiextra::{self, managed, Extra, Managed};
 use crate::config::Config;
 use crate::error::{Error, ProviderErrorKind, Result};
 use crate::fleet::fmt_money;
-use crate::http::{send_json, send_ok, status_error};
+use crate::http::{send_json, send_json_retrying_429, send_ok, status_error};
 use crate::placement::{milli, PriceBook};
 use crate::pod::{Pod, PodSpec};
 use crate::retry::{retrying, RetryPolicy};
@@ -103,6 +103,10 @@ const KEY_ATTACH_BUDGET: Duration = Duration::from_secs(60);
 /// harmless) instead of waited on. Never on the rent: there a timeout would leave unknown
 /// whether the offer was rented.
 const ATTACH_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The longest wait for the one retry of a throttled listing: Vast's `retry_after` above this
+/// isn't waited for (well inside the listing's bound, `provider::LIST_TIMEOUT`).
+const LIST_429_WAIT: Duration = Duration::from_secs(2);
 
 pub struct VastProvider {
     api_key: String,
@@ -789,6 +793,7 @@ fn parse_instance(v: &Value) -> Pod {
         locked: None, // Vast has no pod lock
         proxy_only: false,
         disk_gb: v.get("disk_space").and_then(Value::as_f64).filter(|g| g.is_finite() && *g >= 0.0),
+        volume_gb: None,
     }
 }
 
@@ -834,8 +839,12 @@ impl Provider for VastProvider {
         )
     }
 
+    /// A throttled listing (429) is retried once, after what Vast asks for when that is at
+    /// most [`LIST_429_WAIT`] ([`crate::http::send_json_retrying_429`]) — live, one 429 made
+    /// an idle Vast account read `unknown`.
     async fn list_pods(&self) -> Result<Vec<Pod>> {
-        let body = send_json(self.auth(self.client.get(format!("{}/instances/", self.base))), "vast list").await?;
+        let url = format!("{}/instances/", self.base);
+        let body = send_json_retrying_429(|| self.auth(self.client.get(&url)), "vast list", LIST_429_WAIT).await?;
         Ok(instances_array(&body)?.iter().map(parse_instance).collect())
     }
 
@@ -882,6 +891,7 @@ impl Provider for VastProvider {
                 locked: None,
                 proxy_only: false,
                 disk_gb: Some(f64::from(spec.disk_gb)),
+                volume_gb: None,
             });
         }
         Err(gone.unwrap_or_else(|| {
@@ -1031,6 +1041,25 @@ mod tests {
         assert_eq!(e.kind(), Some(K::RateLimited), "the offer search: {e}");
         let e = p.terminate_pod("7").await.unwrap_err();
         assert_eq!(e.kind(), Some(K::Auth), "{e}");
+    }
+
+    /// Live: one 429 on the listing made an idle Vast account read `unknown`. A 429 that asks
+    /// for at most two seconds (or nothing) is retried once; Vast's own `retry_after: 12` isn't
+    /// waited for.
+    #[tokio::test]
+    async fn a_throttled_listing_is_retried_once() {
+        let srv = serve(vec![
+            canned(429, "application/json", r#"{"detail": "API requests too frequent", "retry_after": 0}"#),
+            canned(200, "application/json", r#"{"instances": [{"id": 7, "label": "devtest-apple", "actual_status": "running"}]}"#),
+        ]);
+        let pods = provider(&srv.base).list_pods().await.unwrap();
+        assert_eq!((pods.len(), srv.requests.lock().unwrap().len()), (1, 2));
+        let srv = serve(vec![
+            canned(429, "application/json", r#"{"detail": "API requests too frequent", "limit": 3.0, "retry_after": 12}"#),
+            canned(200, "application/json", r#"{"instances": []}"#),
+        ]);
+        let e = provider(&srv.base).list_pods().await.unwrap_err();
+        assert_eq!((e.kind(), srv.requests.lock().unwrap().len()), (Some(K::RateLimited), 1), "{e}");
     }
 
     #[test]

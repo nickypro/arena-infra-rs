@@ -50,12 +50,20 @@ pub struct Pod {
     pub proxy_only: bool,
     /// The pod's disk in GB — container plus volume — where the listing says (RunPod v1
     /// `containerDiskInGb + volumeInGb`, v2 `disk + mounts.persistent.size`, Vast
-    /// `disk_space`). What a stopped pod keeps billing for ([`crate::balance`]), read from a
-    /// fresh listing only — so it is never written to JSON: `pods list --json` stays byte for
-    /// byte what it was before the balance knew disks (a scripting interface), and a JSON
-    /// that carries it still reads.
+    /// `disk_space`). What a running RunPod pod bills on top of its listed $/h, and a stopped
+    /// Vast instance keeps billing for ([`crate::balance`]), read from a fresh listing only —
+    /// so it is never written to JSON: `pods list --json` stays byte for byte what it was
+    /// before the balance knew disks (a scripting interface), and a JSON that carries it
+    /// still reads.
     #[serde(default, skip_serializing)]
     pub disk_gb: Option<f64>,
+    /// Of `disk_gb`, the pod's volume disk (RunPod v1 `volumeInGb`, v2
+    /// `mounts.persistent.size`; `0` when the pod has none) — all a stopped RunPod pod still
+    /// bills for: its container disk isn't (live, a stopped pod with no volume billed
+    /// $0.00/h). `None` where the listing doesn't say (Vast and Hetzner have no such split).
+    /// Never written to JSON, like `disk_gb`.
+    #[serde(default, skip_serializing)]
+    pub volume_gb: Option<f64>,
 }
 
 /// A provider-reported maintenance window for the host a pod runs on. Times are kept as
@@ -295,6 +303,7 @@ mod tests {
                 locked: Some(true),
                 proxy_only: false,
                 disk_gb: None,
+                volume_gb: None,
             },
             Pod { id: "1".into(), name: "devtest-flutter".into(), provider: "hetzner".into(), ..Default::default() },
         ];
@@ -315,6 +324,7 @@ mod tests {
         // (hand-made, or from a later version) still reads.
         let mut disks = pods.clone();
         disks[0].disk_gb = Some(60.0);
+        disks[0].volume_gb = Some(20.0);
         disks[1].disk_gb = Some(0.0);
         assert_eq!(serde_json::to_string_pretty(&disks).unwrap(), json);
         let read: Pod = serde_json::from_str(r#"{"id":"1","name":"n","provider":"vast","status":"EXITED","disk_gb":32.5}"#).unwrap();

@@ -212,6 +212,7 @@ fn parse_server(v: &Value) -> Pod {
         proxy_only: false,
         // A Hetzner server bills whole while it exists: its disk is never priced apart.
         disk_gb: None,
+        volume_gb: None,
     }
 }
 

@@ -23,8 +23,11 @@ pub fn currency_symbol(provider: &str) -> &'static str {
 }
 
 /// Format an hourly price. Two decimals normally; three below 0.10 so a cheap CPU VM
-/// (Hetzner cx23 ≈ €0.006/h) doesn't round to a misleading `0.01` or `0.00`.
+/// (Hetzner cx23 ≈ €0.006/h) doesn't round to a misleading `0.01` or `0.00`. Never a signed
+/// zero: an empty `f64` sum is `-0.0` and printed `$-0.00` (live, under `balance -v`) — a
+/// value that would print as zero is zero.
 pub fn fmt_money(symbol: &str, amount: f64) -> String {
+    let amount = if amount <= 0.0 && amount > -0.005 { 0.0 } else { amount };
     if amount > 0.0 && amount < 0.10 {
         format!("{symbol}{amount:.3}")
     } else {
@@ -354,6 +357,27 @@ mod tests {
         }
     }
 
+    /// Never a signed zero (live: `$-0.00` from an empty sum); small amounts keep their
+    /// third decimal.
+    #[test]
+    fn fmt_money_table() {
+        let cases = [
+            (0.0, "$0.00"),
+            (-0.0, "$0.00"),
+            (-0.004, "$0.00"),
+            (0.006, "$0.006"),
+            (0.0999, "$0.100"),
+            (0.1, "$0.10"),
+            (1.234, "$1.23"),
+            (-0.5, "$-0.50"),
+        ];
+        for (x, want) in cases {
+            assert_eq!(fmt_money("$", x), want, "{x}");
+        }
+        assert_eq!(fmt_money("€", -0.0), "€0.00");
+        assert_eq!(fmt_money("$", [0.0f64; 0].iter().sum()), "$0.00", "an empty sum");
+    }
+
     #[test]
     fn gpu_label_table() {
         let mk = |ty: Option<&str>, n: Option<u32>| Pod {
@@ -567,6 +591,7 @@ mod tests {
                 locked: None,
                 proxy_only: false,
                 disk_gb: None,
+                volume_gb: None,
             },
             Pod {
                 id: "def456".into(),

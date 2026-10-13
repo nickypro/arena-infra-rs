@@ -276,6 +276,7 @@ fn parse_pod(v: &Value) -> Pod {
         // ask for a public IP instead (`supportPublicIp`).
         proxy_only: false,
         disk_gb: disk_sum(&[v.get("containerDiskInGb"), v.get("volumeInGb")]),
+        volume_gb: disk_sum(&[v.get("volumeInGb")]),
     }
 }
 
@@ -939,6 +940,21 @@ mod tests {
         assert_eq!(crate::health::host_key(&p).as_deref(), Some("runpod machine m8x2k"));
         let p = parse_pod(&json!({"id": "a", "publicIp": "87.197.146.56", "portMappings": {"22": 40702}}));
         assert_eq!((p.machine_id.as_deref(), crate::health::host_key(&p).as_deref()), (None, Some("87.197.146.56")), "no id: the IP, as before");
+    }
+
+    /// The balance prices a pod's disk from the listing: running, container + volume; stopped,
+    /// the volume alone (RunPod doesn't bill a stopped pod's container disk). A part nobody
+    /// reports isn't 0 GB.
+    #[test]
+    fn parse_pod_reads_the_disk_and_the_volume() {
+        let disk = |v: Value| {
+            let p = parse_pod(&v);
+            (p.disk_gb, p.volume_gb)
+        };
+        assert_eq!(disk(json!({"id": "a", "containerDiskInGb": 60, "volumeInGb": 0})), (Some(60.0), Some(0.0)));
+        assert_eq!(disk(json!({"id": "a", "containerDiskInGb": 50, "volumeInGb": 20})), (Some(70.0), Some(20.0)));
+        assert_eq!(disk(json!({"id": "a", "containerDiskInGb": 50})), (Some(50.0), None));
+        assert_eq!(disk(json!({"id": "a"})), (None, None));
     }
 
     #[test]

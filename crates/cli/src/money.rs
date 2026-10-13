@@ -79,16 +79,25 @@ impl BalanceCtx {
     }
 
     /// Remember the per-GPU prices a live catalog or offer search gave a placement plan
-    /// (best effort, quiet): a known GPU's balance stand-in is never below them.
+    /// (best effort, quiet): per GPU the dearest (a known GPU's balance stand-in is never
+    /// below it), per GPU and tier the latest (a preflight's price for a day).
     pub(crate) fn remember_gpu_prices(&self, plan: &OptionPlan) {
-        let live: Vec<(String, f64)> = plan
+        let live: Vec<balance::GpuQuote> = plan
             .options
             .iter()
+            .chain(plan.dropped.iter().map(|d| &d.option))
             .filter(|o| o.price_source == Some(arena_core::placement::PriceSource::Live))
-            .filter_map(|o| o.price_per_gpu.map(|p| (o.gpu.clone(), p)))
+            .filter_map(|o| {
+                o.price_per_gpu.map(|per_gpu| balance::GpuQuote {
+                    provider: plan.provider.clone(),
+                    gpu: o.gpu.clone(),
+                    cloud: o.cloud.clone(),
+                    per_gpu,
+                })
+            })
             .collect();
         if let (Some(p), false) = (self.state_path(), live.is_empty()) {
-            let _ = balance::remember_gpu_prices(p, &live);
+            let _ = balance::remember_gpu_prices(p, &live, unix_now());
         }
     }
 
@@ -137,10 +146,13 @@ pub(crate) async fn balance_report(
         stderr.push(format!("warning: no balance state ({e}) — live readings only"));
     }
     let path = bal.state_path();
-    if let Some(p) = path.filter(|p| !balance::writable(p)) {
+    // A state that can't be saved is one warning, with why — the save that then fails is the
+    // same news, not a second line.
+    let unsavable = path.and_then(|p| balance::unsavable(p).map(|why| (p, why)));
+    if let Some((p, why)) = &unsavable {
         stderr.push(format!(
-            "warning: the balance state {} can't be saved — live readings only here, and the footers and preflight \
-             read no live balance until it can",
+            "warning: the balance state {} can't be saved ({why}) — live readings only here, and the footers and \
+             preflight read no live balance until it can",
             p.display()
         ));
     }
@@ -149,14 +161,27 @@ pub(crate) async fn balance_report(
     let (listed, fetched) =
         tokio::join!(provider.list_by_provider(), balance::observe(bal.api.as_ref(), &state, mode, balance::COMMAND_TIMEOUT, now));
     let listing = Listing::from_results(listed);
-    for (p, e) in listing.errors() {
-        stderr.push(format!("warning: {p} failed to list ({e}) — its burn is unknown"));
-    }
     let pods = listing.pods();
     let burns = balance::burns_with(&listing, &pods, &state, &policy);
     let (state, save_warning) = balance::commit(path, state, &fetched, &burns, mode, now);
+    let save_warning = save_warning.filter(|_| unsavable.is_none());
     let mut views = balance::views(&state, &fetched, &burns, &policy, mode, now);
     views.extend(balance::postpaid_view(&listing, &pods));
+    for (p, e) in listing.errors() {
+        // What stands in for its burn: the one last observed, if recent enough — else nothing.
+        let burn = views.iter().find(|v| v.account == p).and_then(|v| v.burn).filter(|b| b.stale);
+        let what = match burn {
+            Some(b) if b.recent() => {
+                format!("its burn is the one observed {} ago (stale)", arena_core::snapshot::fmt_age(b.stale_secs.unwrap_or(0)))
+            }
+            Some(b) => format!(
+                "its burn is at least the one observed {} ago (stale)",
+                arena_core::snapshot::fmt_age(b.stale_secs.unwrap_or(0))
+            ),
+            None => "its burn is unknown".into(),
+        };
+        stderr.push(format!("warning: {p} failed to list ({e}) — {what}"));
+    }
     stderr.extend([policy_warning, load_warning, save_warning].into_iter().flatten());
     let stdout = if flags.json {
         format!("{}\n", serde_json::to_string_pretty(&views)?)
@@ -233,10 +258,17 @@ pub(crate) fn listed_views(
     balance::views(&state, fetched, &burns, policy, mode, now)
 }
 
+/// The single spec's live price, read alongside the preflight's balance ([`balance_preflight`]):
+/// the plan placement would make for that one GPU and tier, priced as placement prices it,
+/// or `None` when no answer came in time.
+pub(crate) type SpecQuote<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Option<OptionPlan>> + Send + 'a>>;
+
 /// The `create`/`up` preflight: the target provider's account only, observed inline (no
 /// extra listing: the burn is the provider's or the last recorded sample), with the new
-/// pods priced at the dearest placement option — an option nobody priced, or the single
-/// spec's GPU, at a stand-in that errs high (`~`), never free. Advisory and quiet: lines to
+/// pods priced at the dearest placement option — on the single-spec path, its one GPU and
+/// tier read live alongside (`quote`, within the same bound; remembered like any plan's
+/// prices) — an option with no live price at the one read for that GPU and tier under a day
+/// ago, else at a stand-in that errs high (`~`), never free. Advisory and quiet: lines to
 /// print, never an error.
 pub(crate) async fn balance_preflight(
     provider: &dyn Provider,
@@ -245,40 +277,63 @@ pub(crate) async fn balance_preflight(
     new_pods: usize,
     options: Option<&OptionPlan>,
     spec: &arena_core::PodSpec,
+    quote: Option<SpecQuote<'_>>,
 ) -> Vec<String> {
     let Some(account) = Account::from_name(provider.name()) else { return Vec::new() };
+    // No balance to show: no catalog request either.
+    if !bal.api.accounts().iter().any(|(a, _)| *a == account) {
+        return Vec::new();
+    }
     let now = unix_now();
     let mode = bal.inline_mode();
     let (state, _) = balance::load_opt(bal.state_path());
-    let Some(fetched) = balance::observe_account(bal.api.as_ref(), &state, account, mode, balance::INLINE_TIMEOUT, now).await else {
-        return Vec::new();
+    let quoting = async move {
+        match quote {
+            Some(q) if options.is_none() => q.await,
+            _ => None,
+        }
     };
+    let observing = balance::observe_account(bal.api.as_ref(), &state, account, mode, balance::INLINE_TIMEOUT, now);
+    let (fetched, quoted) = tokio::join!(observing, quoting);
+    let Some(fetched) = fetched else { return Vec::new() };
     let fetched = [fetched];
     let burns = balance::Burns::new();
     let (state, _) = balance::commit(bal.state_path(), state, &fetched, &burns, mode, now);
+    if let Some(plan) = &quoted {
+        bal.remember_gpu_prices(plan);
+    }
     let (policy, _) = BalancePolicy::from_config(cfg);
     let views = balance::views(&state, &fetched, &burns, &policy, mode, now);
-    let new = new_pod_price(new_pods, options, spec, &policy, &state.gpu_seen);
+    let new = new_pod_price(new_pods, options.or(quoted.as_ref()), spec, provider.name(), &policy, &state, now);
     views.first().map(|v| balance::preflight_lines_with(v, new, &policy, now)).unwrap_or_default()
 }
 
-/// What the new pods cost per pod at most: the dearest placement option — a live catalog
-/// price as it is; a preset estimate, or no price, at least the known GPU's stand-in (the
-/// most it is known to cost: RunPod's recorded catalog, live prices seen), an unknown GPU
-/// at the ceiling — and on the single-spec path the spec's GPU at that stand-in. `per_pod:
-/// None` only when not even a stand-in can be named.
+/// What the new pods cost per pod at most: the dearest placement option (on the single-spec
+/// path, the spec's one GPU and tier). Per option: a live price as it is; else the live price
+/// read for that GPU and tier on `provider` under a day ago ([`balance::QUOTE_FRESH`],
+/// `quoted`); else a preset estimate, or no price, at least the known GPU's stand-in (the
+/// most it is known to cost: RunPod's recorded catalog, live prices seen), an unknown GPU at
+/// the ceiling. `per_pod: None` only when not even a stand-in can be named.
 fn new_pod_price(
     count: usize,
     options: Option<&OptionPlan>,
     spec: &arena_core::PodSpec,
+    provider: &str,
     policy: &BalancePolicy,
-    seen: &std::collections::BTreeMap<String, f64>,
+    state: &balance::BalanceState,
+    now: u64,
 ) -> balance::NewPods {
     use arena_core::placement::PriceSource;
-    let (mut guessed, mut ceiling) = (false, false);
-    let mut stand_in = |gpu: &str, n: u32, floor: Option<f64>| {
-        let found = balance::stand_in_with(Some(gpu), Some(n), policy, seen);
-        match (found, floor) {
+    let (mut guessed, mut ceiling, mut quoted) = (false, false, None::<u64>);
+    let mut price = |gpu: &str, cloud: Option<&str>, n: u32, live: Option<f64>, estimate: Option<f64>| {
+        if live.is_some() {
+            return live;
+        }
+        if let Some((per_gpu, age)) = state.fresh_quote(provider, gpu, cloud, now) {
+            quoted = Some(quoted.map_or(age, |q| q.max(age)));
+            return Some(per_gpu * f64::from(n));
+        }
+        match (balance::stand_in_with(Some(gpu), Some(n), policy, &state.gpu_seen), estimate) {
             (Some((p, how)), f) if f.is_none_or(|f| p > f) => {
                 guessed = true;
                 ceiling |= how == balance::StandIn::Ceiling;
@@ -291,16 +346,20 @@ fn new_pod_price(
         Some(plan) if !plan.options.is_empty() => plan
             .options
             .iter()
-            .map(|o| match (o.price_per_pod, o.price_source) {
-                (Some(p), Some(PriceSource::Live)) => Some(p),
-                (p, _) => stand_in(&o.gpu, o.gpu_count.max(1), p),
+            .map(|o| {
+                let live = o.price_per_pod.filter(|_| o.price_source == Some(PriceSource::Live));
+                price(&o.gpu, o.cloud.as_deref(), o.gpu_count.max(1), live, o.price_per_pod)
             })
             .collect::<Option<Vec<f64>>>()
             .map(|prices| prices.into_iter().fold(0.0, f64::max)),
-        _ => stand_in(&spec.gpu_type, spec.gpu_count.max(1), None),
+        _ => {
+            // The tier the single spec creates on (RunPod's only — Vast has none).
+            let cloud = (provider == "runpod").then(|| spec.cloud_type.trim().to_uppercase());
+            price(&spec.gpu_type, cloud.as_deref(), spec.gpu_count.max(1), None, None)
+        }
     };
     let known = per_pod.is_some();
-    balance::NewPods { count, per_pod, stand_in: guessed && known, ceiling: ceiling && known }
+    balance::NewPods { count, per_pod, stand_in: guessed && known, ceiling: ceiling && known, quoted: quoted.filter(|_| known) }
 }
 
 /// One pod's probe call, read: the reply, or why there is none. A call that failed outright
@@ -636,11 +695,13 @@ mod tests {
             "vast      $136.87  live             ?  ?       -                 ? unknown",
             "hetzner  postpaid  postpaid  €0.006/h  -       -                 -",
             "  ⚠ runpod: ≈2.8d of runway at $0.47/h (≈ 2026-10-11 09:14 UTC), under BALANCE_WARN_HOURS=72",
-            "  runpod: RunPod reports $0.22/h more than arena lists",
             "  hetzner: postpaid",
         ] {
             assert!(out.stdout.contains(needle), "`{needle}` missing:\n{}", out.stdout);
         }
+        // One reading isn't a gap yet: RunPod's rate lags a terminate by minutes (live
+        // follow-up 5) — the next one, 10 min on, confirms it.
+        assert!(!out.stdout.contains("more than arena lists"), "{}", out.stdout);
         assert_eq!(api.live_calls(), 2);
         // Recorded: the anchors are there for the fallback.
         let (state, _) = arena_core::balance::load(&dir.file());
@@ -649,7 +710,13 @@ mod tests {
         let v = balance_report(&mixed_fleet(), &dir.cfg(""), &bal, BalanceFlags { verbose: true, ..Default::default() }, T0 + 600)
             .await
             .unwrap();
-        for needle in ["  burn: provider $0.47/h · listed $0.25/h — gap $0.22/h not in the listing", "  spendLimit $80.00/h · underBalance false", "state file: ", "  postpaid €0.006/h — servers only: volumes not counted"] {
+        for needle in [
+            "  runpod: RunPod reports $0.22/h more than arena lists",
+            "  burn: provider $0.47/h · listed $0.25/h — gap $0.22/h not in the listing",
+            "  spendLimit $80.00/h · underBalance false",
+            "state file: ",
+            "  postpaid €0.006/h — servers only: volumes not counted",
+        ] {
             assert!(v.stdout.contains(needle), "`{needle}` missing:\n{}", v.stdout);
         }
         // --json: one object per account, the source always there.
@@ -1006,7 +1073,7 @@ mod tests {
             assert_eq!(table, base_out, "{case}");
             assert!(footer.contains('?') || footer.contains("est."), "{case}: {footer}");
             let spec = arena_core::PodSpec::from_config(&dir.cfg(""));
-            let lines = balance_preflight(&fleet(), &dir.cfg(""), &bal, 1, None, &spec).await;
+            let lines = balance_preflight(&fleet(), &dir.cfg(""), &bal, 1, None, &spec, None).await;
             assert!(lines.iter().all(|l| !l.to_lowercase().contains("error")), "{case}: {lines:?}");
         }
     }
@@ -1029,7 +1096,7 @@ mod tests {
             assert_eq!(err, base_err, "silent");
             assert!(out.starts_with(&base_out) && out.ends_with("balance: runpod ? (no reading — arena balance set runpod <USD>) $0.50/h\n"), "{out}");
             let spec = arena_core::PodSpec::from_config(&dir.cfg(""));
-            balance_preflight(&fleet, &dir.cfg(""), &bal, 1, None, &spec).await;
+            balance_preflight(&fleet, &dir.cfg(""), &bal, 1, None, &spec, None).await;
             assert_eq!(api.live_calls(), 0, "no live call from an inline surface");
         }
         // `arena balance` reads live, and says the state can't be saved.
@@ -1037,11 +1104,61 @@ mod tests {
         let out = balance_report(&fleet, &dir.cfg(""), &bal, BalanceFlags::default(), T0).await.unwrap();
         assert_eq!(api.live_calls(), 1);
         assert!(out.stdout.contains("$40.00  live"), "{}", out.stdout);
-        assert!(out.stderr.iter().any(|l| l.contains("can't be saved")), "{:?}", out.stderr);
+        // Said once, with why — not again as "couldn't save" (the load's own "can't read" is
+        // another matter: here the state is a directory).
+        assert!(out.stderr[0].contains("can't be saved (it isn't a regular file)"), "{:?}", out.stderr);
+        assert!(!out.stderr.iter().any(|l| l.contains("couldn't save")), "{:?}", out.stderr);
         // A writable state: inline.
         let ok = StateDir::new("savable");
         let (_, bal) = ctx(FakeBalanceApi::new(), Some(&ok));
         assert_eq!(bal.inline_mode(), Mode::Inline);
+    }
+
+    /// Live follow-up 6: a read-only state directory (`chmod a-w`) printed two warnings —
+    /// "can't be saved", then "couldn't save … Permission denied". One, with the reason.
+    #[tokio::test]
+    async fn a_read_only_state_dir_is_one_warning() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = StateDir::new("read-only");
+        let fleet = Fleet { backends: vec![("runpod", Ok(vec![]))] };
+        let (_, bal) = ctx(FakeBalanceApi::new().live_ok(Account::Runpod, rp_live(30.63, 0.0)), Some(&dir));
+        balance_report(&fleet, &dir.cfg(""), &bal, BalanceFlags::default(), T0).await.unwrap();
+        let state_dir = dir.file().parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let readonly = !balance::writable(&dir.file()); // root writes anyway: nothing to see
+        let (_, bal) = ctx(FakeBalanceApi::new().live_ok(Account::Runpod, rp_live(30.63, 0.0)), Some(&dir));
+        let out = balance_report(&fleet, &dir.cfg(""), &bal, BalanceFlags::default(), T0 + 600).await.unwrap();
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if readonly {
+            assert_eq!(out.stderr.len(), 1, "{:?}", out.stderr);
+            assert!(out.stderr[0].contains("can't be saved (Permission denied"), "{:?}", out.stderr);
+            assert!(out.stdout.contains("$30.63  live"), "{}", out.stdout);
+        }
+    }
+
+    /// Live follow-up 4: one 429 on Vast's listing (its idle $0 seen 15 min before) read
+    /// `source: unknown, level: unknown` under `--no-live`. The recent burn stands in: an
+    /// estimate, level ok — and the warning says what stands in.
+    #[tokio::test]
+    async fn a_throttled_vast_listing_keeps_an_idle_account_ok() {
+        let dir = StateDir::new("vast-429");
+        let api = || FakeBalanceApi::new().live_ok(Account::Vast, vast_live(136.84));
+        let ok = Fleet { backends: vec![("vast", Ok(vec![]))] };
+        let (_, bal) = ctx(api(), Some(&dir));
+        balance_report(&ok, &dir.cfg(""), &bal, BalanceFlags::default(), T0).await.unwrap();
+        let throttled = Fleet { backends: vec![("vast", Err("vast list HTTP 429 Too Many Requests"))] };
+        let (_, bal) = ctx(api(), Some(&dir));
+        let flags = BalanceFlags { no_live: true, check: true, json: true, ..Default::default() };
+        let out = balance_report(&throttled, &dir.cfg(""), &bal, flags, T0 + 900).await.unwrap();
+        assert_eq!(out.stderr, ["warning: vast failed to list (provider error: vast list HTTP 429 Too Many Requests) — its burn is the one observed 15m ago (stale)"]);
+        let v: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+        assert_eq!((v[0]["source"].as_str(), v[0]["level"].as_str(), v[0]["burn"]["stale"].as_bool()), (Some("estimate"), Some("ok"), Some(true)), "{v}");
+        assert_eq!(out.code, 0);
+        // Still failing 40 min on: unknown, as before (`--check` 3).
+        let (_, bal) = ctx(api(), Some(&dir));
+        let out = balance_report(&throttled, &dir.cfg(""), &bal, flags, T0 + 2_400).await.unwrap();
+        assert!(out.stderr[0].ends_with("— its burn is unknown"), "{:?}", out.stderr);
+        assert_eq!(out.code, 3);
     }
 
     /// The new pods' price on the single-spec path: a known GPU at its preset, an unknown
@@ -1050,11 +1167,119 @@ mod tests {
     fn new_pods_of_an_unknown_gpu_are_priced_at_the_ceiling() {
         let policy = BalancePolicy::default();
         let spec = |gpu: &str, n: u32| arena_core::PodSpec { gpu_type: gpu.into(), gpu_count: n, ..arena_core::PodSpec::from_config(&cfg()) };
-        let none = std::collections::BTreeMap::new();
-        let known = new_pod_price(3, None, &spec("NVIDIA RTX A4000", 1), &policy, &none);
+        let none = balance::BalanceState::default();
+        let known = new_pod_price(3, None, &spec("NVIDIA RTX A4000", 1), "runpod", &policy, &none, T0);
         assert_eq!((known.per_pod, known.stand_in, known.ceiling), (Some(0.32), true, false));
-        let unknown = new_pod_price(3, None, &spec("NVIDIA B999 Mystery", 2), &policy, &none);
+        let unknown = new_pod_price(3, None, &spec("NVIDIA B999 Mystery", 2), "runpod", &policy, &none, T0);
         assert_eq!((unknown.per_pod, unknown.stand_in, unknown.ceiling), (Some(16.0), true, true));
+    }
+
+    /// One option of a plan, priced as the catalog or an offer search priced it.
+    fn option(gpu: &str, cloud: Option<&str>, per_gpu: Option<f64>, source: Option<arena_core::placement::PriceSource>) -> arena_core::placement::PlacementOption {
+        arena_core::placement::PlacementOption {
+            listed: 0,
+            gpu: gpu.into(),
+            label: format!("1×{gpu}"),
+            cloud: cloud.map(String::from),
+            gpu_count: 1,
+            price_per_gpu: per_gpu,
+            price_per_pod: per_gpu,
+            price_source: source,
+            stock: None,
+        }
+    }
+
+    fn plan_of(provider: &str, options: Vec<arena_core::placement::PlacementOption>) -> OptionPlan {
+        OptionPlan {
+            provider: provider.into(),
+            gpu_count: 1,
+            order: arena_core::placement::Order::Listed,
+            max_price: None,
+            options,
+            dropped: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    /// Live follow-up 2: `pods up bravo --gpu A4000 --cloud community --dry-run` stood the A4000
+    /// preset ($0.32) in while `offers` knew $0.17 community. The single spec is priced by
+    /// its tier's live price read now; else by the one read for that GPU and tier under a day
+    /// ago (`~`, with its age); else at the stand-in. Per tier: a secure price never prices a
+    /// community pod, nor one on another provider.
+    #[test]
+    fn the_single_spec_is_priced_by_its_tiers_live_price() {
+        use arena_core::placement::PriceSource::{Estimate, Live as Now};
+        let policy = BalancePolicy::default();
+        let a4000 = |cloud: &str| arena_core::PodSpec {
+            gpu_type: "NVIDIA RTX A4000".into(),
+            gpu_count: 1,
+            cloud_type: cloud.into(),
+            ..arena_core::PodSpec::from_config(&cfg())
+        };
+        let price = |plan: Option<&OptionPlan>, spec: &arena_core::PodSpec, provider: &str, st: &balance::BalanceState, now: u64| {
+            let n = new_pod_price(1, plan, spec, provider, &policy, st, now);
+            (n.per_pod, n.stand_in, n.quoted)
+        };
+        let empty = balance::BalanceState::default();
+        // Read now (the quote the preflight fetched alongside): as it is.
+        let now = plan_of("runpod", vec![option("NVIDIA RTX A4000", Some("COMMUNITY"), Some(0.17), Some(Now))]);
+        assert_eq!(price(Some(&now), &a4000("COMMUNITY"), "runpod", &empty, T0), (Some(0.17), false, None));
+        // Nothing read now: the price `offers` saw 3 h ago for that very tier.
+        let mut st = balance::BalanceState::default();
+        st.gpu_seen.insert("NVIDIA RTX A4000".into(), 0.25);
+        st.gpu_quotes.insert(balance::quote_key("runpod", "NVIDIA RTX A4000", Some("COMMUNITY")), (0.17, T0 - 3 * 3_600));
+        st.gpu_quotes.insert(balance::quote_key("runpod", "NVIDIA RTX A4000", Some("SECURE")), (0.25, T0 - 3 * 3_600));
+        assert_eq!(price(None, &a4000("COMMUNITY"), "runpod", &st, T0), (Some(0.17), false, Some(3 * 3_600)));
+        assert_eq!(price(None, &a4000("community"), "runpod", &st, T0), (Some(0.17), false, Some(3 * 3_600)), "tier case");
+        assert_eq!(price(None, &a4000("SECURE"), "runpod", &st, T0), (Some(0.25), false, Some(3 * 3_600)));
+        // A catalog that failed (preset estimates) still goes by the fresh quote.
+        let failed = plan_of("runpod", vec![option("NVIDIA RTX A4000", Some("COMMUNITY"), Some(0.32), Some(Estimate))]);
+        assert_eq!(price(Some(&failed), &a4000("COMMUNITY"), "runpod", &st, T0), (Some(0.17), false, Some(3 * 3_600)));
+        // Another provider's quote prices nothing here; a day-old one neither: the stand-in.
+        assert_eq!(price(None, &a4000("COMMUNITY"), "vast", &st, T0), (Some(0.32), true, None));
+        assert_eq!(price(None, &a4000("COMMUNITY"), "runpod", &st, T0 + 21 * 3_600 + 1), (Some(0.32), true, None));
+        // Vast has no tiers: its quote is keyed without one, whatever CLOUD_TYPE says.
+        st.gpu_quotes.insert(balance::quote_key("vast", "NVIDIA RTX A4000", None), (0.098, T0 - 60));
+        assert_eq!(price(None, &a4000("COMMUNITY"), "vast", &st, T0), (Some(0.098), false, Some(60)));
+    }
+
+    /// The live case end to end: $30.77 left, $0.14/h burning, `up bravo --gpu A4000 --cloud
+    /// community`. With the A4000 preset stood in, ≈2.7d and a ⚠ under 72 h; with the
+    /// community price read alongside, `≤$0.17/h` (no `~`) and no warning — and that price is
+    /// remembered, so a preflight whose catalog read fails goes by it, said with its age.
+    #[tokio::test]
+    async fn the_single_spec_preflight_reads_its_live_price_alongside() {
+        let dir = StateDir::new("single-quote");
+        let spec = arena_core::PodSpec {
+            gpu_type: "NVIDIA RTX A4000".into(),
+            gpu_count: 1,
+            cloud_type: "COMMUNITY".into(),
+            ..arena_core::PodSpec::from_config(&dir.cfg(""))
+        };
+        let fleet = Fleet { backends: vec![("runpod", Ok(vec![]))] };
+        let live = |q: Option<OptionPlan>| -> Option<SpecQuote<'static>> { Some(Box::pin(async move { q })) };
+        let (_, bal) = ctx(FakeBalanceApi::new().live_ok(Account::Runpod, rp_live(30.77, 0.14)), Some(&dir));
+        let stood_in = balance_preflight(&fleet, &dir.cfg(""), &bal, 1, None, &spec, live(None)).await;
+        assert!(stood_in[0].ends_with("$0.14/h now + ≤~$0.32/h for 1 new pod(s) (a stand-in that errs high — no live price) → ≈2.7d ⚠ below BALANCE_WARN_HOURS=72"), "{stood_in:?}");
+        let quote = plan_of("runpod", vec![option("NVIDIA RTX A4000", Some("COMMUNITY"), Some(0.17), Some(arena_core::placement::PriceSource::Live))]);
+        let (_, bal) = ctx(FakeBalanceApi::new().live_ok(Account::Runpod, rp_live(30.77, 0.14)), Some(&dir));
+        let read = balance_preflight(&fleet, &dir.cfg(""), &bal, 1, None, &spec, live(Some(quote))).await;
+        assert!(read[0].ends_with("$0.14/h now + ≤$0.17/h for 1 new pod(s) → ≈4.1d"), "{read:?}");
+        let (state, _) = balance::load(&dir.file());
+        assert_eq!(state.gpu_quotes.get(&balance::quote_key("runpod", "NVIDIA RTX A4000", Some("COMMUNITY"))).map(|q| q.0), Some(0.17));
+        // The catalog down now: the remembered price, said as such.
+        let (_, bal) = ctx(FakeBalanceApi::new().live_ok(Account::Runpod, rp_live(30.77, 0.14)), Some(&dir));
+        let remembered = balance_preflight(&fleet, &dir.cfg(""), &bal, 1, None, &spec, live(None)).await;
+        assert!(remembered[0].contains("+ ≤~$0.17/h for 1 new pod(s) (the live price seen ") && remembered[0].ends_with(" ago) → ≈4.1d"), "{remembered:?}");
+        // No balance account: no preflight — and the quote isn't even awaited.
+        let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = asked.clone();
+        let never: Option<SpecQuote<'static>> = Some(Box::pin(async move {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            None
+        }));
+        assert!(balance_preflight(&fleet, &dir.cfg(""), &no_balance(), 1, None, &spec, never).await.is_empty());
+        assert!(!asked.load(std::sync::atomic::Ordering::SeqCst), "no catalog request without a balance to show");
     }
 
     /// Review BC5 / BC1 through `arena balance` itself: it lists without details, and RunPod

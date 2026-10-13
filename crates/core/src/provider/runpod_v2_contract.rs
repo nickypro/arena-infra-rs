@@ -104,6 +104,7 @@ fn sandbox_pod(name: &str) -> Pod {
         proxy_only: false,
         // Every recording is of a 60 GB container disk, no volume.
         disk_gb: Some(60.0),
+        volume_gb: Some(0.0),
     }
 }
 

@@ -2463,19 +2463,56 @@ async fn plan_placement(
     Ok(plan)
 }
 
-/// The single-spec path's one option, as a plan — what an `up --check` replacement creates
-/// from when no `--gpu`/`--cloud` list or `--max-price` was given: the same GPU, count and
-/// tier the first create used. Unpriced (that path never quoted one).
-fn single_option_plan(provider_name: &str, spec: &PodSpec) -> arena_core::placement::OptionPlan {
-    use arena_core::placement::{plan_options, Order, PriceBook, Request};
-    let req = Request {
+/// The single-spec path's one option, as a request: the spec's GPU, count and tier.
+fn single_request(spec: &PodSpec) -> arena_core::placement::Request {
+    use arena_core::placement::{Order, Request};
+    Request {
         gpus: vec![spec.gpu_type.clone()],
         clouds: vec![spec.cloud_type.trim().to_uppercase()],
         gpu_count: spec.gpu_count,
         max_price: None,
         order: Order::Listed,
-    };
-    plan_options(&req, provider_name, &PriceBook::unpriced())
+    }
+}
+
+/// The single-spec path's one option, as a plan — what an `up --check` replacement creates
+/// from when no `--gpu`/`--cloud` list or `--max-price` was given: the same GPU, count and
+/// tier the first create used. Unpriced (that path never quoted one).
+fn single_option_plan(provider_name: &str, spec: &PodSpec) -> arena_core::placement::OptionPlan {
+    arena_core::placement::plan_options(&single_request(spec), provider_name, &arena_core::placement::PriceBook::unpriced())
+}
+
+/// Print the `create`/`up` balance preflight ([`money::balance_preflight`]) — on the
+/// single-spec path with the spec's live price read alongside ([`single_spec_quote`]).
+async fn print_balance_preflight(
+    provider: &dyn Provider,
+    cfg: &Config,
+    bal: &money::BalanceCtx,
+    new_pods: usize,
+    options: Option<&arena_core::placement::OptionPlan>,
+    spec: &PodSpec,
+) {
+    let quote = single_spec_quote(cfg, provider.name(), spec);
+    money::balance_preflight(provider, cfg, bal, new_pods, options, spec, Some(quote)).await.iter().for_each(|l| println!("{l}"));
+}
+
+/// The single spec's live price for the `create`/`up` preflight: its one option priced the
+/// way placement prices it ([`fetch_price_book`] — RunPod's catalog, v2's per tier (cached for
+/// the run) or v1's GraphQL; Vast's cheapest matching offer), within the preflight's bound
+/// ([`arena_core::balance::INLINE_TIMEOUT`]); `None` when nothing answered in time. Live, the
+/// preflight otherwise stood the A4000 preset ($0.32) in for a $0.17 community card and
+/// warned. In this crate's unit tests nothing is fetched: a stray key in a test config must
+/// never reach the network (tests hand the preflight a quote of their own).
+fn single_spec_quote<'a>(cfg: &'a Config, provider_name: &'a str, spec: &'a PodSpec) -> money::SpecQuote<'a> {
+    Box::pin(async move {
+        if cfg!(test) {
+            return None;
+        }
+        let req = single_request(spec);
+        let fetch = fetch_price_book(cfg, provider_name, &req, spec);
+        let (book, _) = tokio::time::timeout(arena_core::balance::INLINE_TIMEOUT, fetch).await.ok()?.ok()?;
+        Some(arena_core::placement::plan_options(&req, provider_name, &book))
+    })
 }
 
 /// `provider.describe(spec)` — what the one-GPU path's dry run and confirm say a create is —
@@ -6012,7 +6049,7 @@ async fn handle_pods_bal(
                 }
                 print_create_body(provider, &first_create_spec(&spec, options.as_ref(), &names[0]));
                 warn_no_volume(provider, &spec);
-                money::balance_preflight(provider, cfg, bal, names.len(), options.as_ref(), &spec).await.iter().for_each(|l| println!("{l}"));
+                print_balance_preflight(provider, cfg, bal, names.len(), options.as_ref(), &spec).await;
                 println!("\nDry-run only — no pods created (this is a preview).");
                 return Ok(());
             }
@@ -6026,7 +6063,7 @@ async fn handle_pods_bal(
             };
             // The account balance for these pods, next to the prompt: advisory (it never
             // blocks, and `--yes` changes nothing), quiet if the balance can't be read.
-            money::balance_preflight(provider, cfg, bal, names.len(), options.as_ref(), &spec).await.iter().for_each(|l| println!("{l}"));
+            print_balance_preflight(provider, cfg, bal, names.len(), options.as_ref(), &spec).await;
             if !confirm(yes, &what)? {
                 println!("aborted.");
                 return Ok(());
@@ -6131,7 +6168,7 @@ async fn handle_pods_bal(
                 }
                 print_create_body(provider, &first_create_spec(&spec, options.as_ref(), &names[0]));
                 warn_no_volume(provider, &spec);
-                money::balance_preflight(provider, cfg, bal, names.len(), options.as_ref(), &spec).await.iter().for_each(|l| println!("{l}"));
+                print_balance_preflight(provider, cfg, bal, names.len(), options.as_ref(), &spec).await;
                 let retry = if retry_mins > 0 { format!(" (retrying up to {retry_mins}m for capacity)") } else { String::new() };
                 println!(
                     "\nDry-run only — no pods created (preview){retry}: would create the above, then {per_pod}. \
@@ -6166,7 +6203,7 @@ async fn handle_pods_bal(
             };
             // The account balance for these pods, next to the prompt: advisory (it never
             // blocks, and `--yes` changes nothing), quiet if the balance can't be read.
-            money::balance_preflight(provider, cfg, bal, names.len(), options.as_ref(), &spec).await.iter().for_each(|l| println!("{l}"));
+            print_balance_preflight(provider, cfg, bal, names.len(), options.as_ref(), &spec).await;
             if !confirm(yes, &what)? {
                 println!("aborted.");
                 return Ok(());
@@ -17122,7 +17159,7 @@ mod placement_cli_tests {
         let base = spec_with_overrides(&cfg(), &SpecOverrides::default());
         let req = arena_core::placement::Request::from_flags(Some("3090,A4000"), None, &base, None, Order::Listed).unwrap();
         let plan = plan_placement(&cfg(), "runpod", &req, &base).await.unwrap();
-        let lines = money::balance_preflight(&fake, &cfg(), &bal, 1, Some(&plan), &base).await;
+        let lines = money::balance_preflight(&fake, &cfg(), &bal, 1, Some(&plan), &base, None).await;
         // The options' prices are preset estimates (no key): raised to the known GPU's
         // stand-in (RunPod's recorded catalog), marked `~`.
         assert!(lines[0].starts_with("balance: runpod $0.10 live · $0.47/h now + ≤~$") && lines[0].ends_with("‼ under 24h"), "{lines:?}");
@@ -17147,7 +17184,7 @@ mod placement_cli_tests {
         assert!((dearest - 0.5).abs() < 1e-9, "{plan:?}");
         // Plenty of money, but 400 new pods at the dearest option would pass the $80/h limit.
         let near_limit = Live { usd: 5_000.0, provider_burn_per_hr: Some(10.0), spend_limit_per_hr: Some(80.0), under_balance: Some(false), reduced: false, owed: None };
-        let lines = money::balance_preflight(&Recorder::default(), &cfg(), &balance_of(near_limit), 400, Some(&plan), &base).await;
+        let lines = money::balance_preflight(&Recorder::default(), &cfg(), &balance_of(near_limit), 400, Some(&plan), &base, None).await;
         let want = format!(
             "⚠ planned ~${:.2}/h exceeds RunPod's spend limit $80.00/h — creates past it will be refused",
             10.0 + 400.0 * dearest
@@ -17156,7 +17193,7 @@ mod placement_cli_tests {
         assert!(!lines.iter().any(|l| l.contains("1h of credit")), "{lines:?}");
         // $1 for 10 new pods: under an hour's credit.
         let thin = Live { usd: 1.0, provider_burn_per_hr: Some(0.0), spend_limit_per_hr: Some(80.0), under_balance: Some(false), reduced: false, owed: None };
-        let lines = money::balance_preflight(&Recorder::default(), &cfg(), &balance_of(thin.clone()), 10, Some(&plan), &base).await;
+        let lines = money::balance_preflight(&Recorder::default(), &cfg(), &balance_of(thin.clone()), 10, Some(&plan), &base, None).await;
         let credit = format!(
             "⚠ RunPod needs ≥1h of credit for the new pods (≈~${:.2}); the account has $1.00 — creates will likely fail (402)",
             10.0 * dearest
@@ -17164,7 +17201,7 @@ mod placement_cli_tests {
         assert!(lines.contains(&credit), "{lines:?}");
         // The single-spec path: nothing priced the A4000 — it stands in at the most it is
         // known to cost ($0.32/h), never at $0: the runway and the credit check use it, `~`.
-        let lines = money::balance_preflight(&Recorder::default(), &cfg(), &balance_of(thin.clone()), 10, None, &base).await;
+        let lines = money::balance_preflight(&Recorder::default(), &cfg(), &balance_of(thin.clone()), 10, None, &base, None).await;
         assert_eq!(
             lines,
             [
@@ -17177,17 +17214,17 @@ mod placement_cli_tests {
         let mut unpriced = plan.clone();
         unpriced.options[0].price_per_pod = None;
         unpriced.options[0].gpu = "NVIDIA H100 80GB HBM3".into();
-        let lines = money::balance_preflight(&Recorder::default(), &cfg(), &balance_of(thin.clone()), 10, Some(&unpriced), &base).await;
+        let lines = money::balance_preflight(&Recorder::default(), &cfg(), &balance_of(thin.clone()), 10, Some(&unpriced), &base, None).await;
         assert!(lines[0].contains("+ ≤~$34.90/h for 10 new pod(s)"), "{lines:?}");
         // A live catalog price is taken as it is (it's what RunPod charges right now).
         let mut live_priced = plan.clone();
         for o in live_priced.options.iter_mut() {
             (o.price_per_pod, o.price_source) = (Some(0.2), Some(arena_core::placement::PriceSource::Live));
         }
-        let lines = money::balance_preflight(&Recorder::default(), &cfg(), &balance_of(thin), 10, Some(&live_priced), &base).await;
+        let lines = money::balance_preflight(&Recorder::default(), &cfg(), &balance_of(thin), 10, Some(&live_priced), &base, None).await;
         assert!(lines[0].contains("+ ≤$2.00/h for 10 new pod(s) →"), "{lines:?}");
         // No account for this provider configured: nothing.
-        assert!(money::balance_preflight(&Recorder::default(), &cfg(), &money::BalanceCtx::from_config(&cfg()), 10, Some(&plan), &base).await.is_empty());
+        assert!(money::balance_preflight(&Recorder::default(), &cfg(), &money::BalanceCtx::from_config(&cfg()), 10, Some(&plan), &base, None).await.is_empty());
     }
 
     /// Merge of wave 7 balance onto lane G's `up`: every path that makes a pod remembers the
