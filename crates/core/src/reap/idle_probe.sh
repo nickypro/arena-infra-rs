@@ -305,12 +305,16 @@ sid=$(awk '{ s = $0; sub(/^.*\) /, "", s); split(s, f, " "); print f[4] }' /proc
 # Terminals: processes on a pseudo-terminal (/dev/pts/*: majors 136–143) outside this probe's
 # session — an ssh login, RunPod's web/proxy shell, a VS Code or Jupyter terminal — but a tmux
 # pane's own shell (judged by the tmux fact). `-` when the list can't be read whole.
+# The process list read: /proc, the pod's own (a container's PID namespace, or the VM's) — or a
+# test's stand-in (ARENA_PROBE_TEST_PROCROOT; never on a pod: the probe runs under `env -i`).
+# This probe's own session and ancestry always come from the real /proc.
+PROCFS=${ARENA_PROBE_TEST_PROCROOT:-/proc}
 ttys=-
 if num "$sid"; then
     ttys=0
     o proc_read ok
-    for d in /proc/[0-9]*; do
-        p=${d#/proc/}
+    for d in "$PROCFS"/[0-9]*; do
+        p=${d#"$PROCFS"/}
         line=
         { IFS= read -r line; } 2>/dev/null <"$d/stat" || continue
         rest=${line##*) }
@@ -329,7 +333,7 @@ if num "$sid"; then
             maj=$(( (tn >> 8) & 4095 ))
             if [ "$maj" -ge 136 ] && [ "$maj" -le 143 ]; then
                 pc=
-                { IFS= read -r pc; } 2>/dev/null <"/proc/$pp/comm"
+                { IFS= read -r pc; } 2>/dev/null <"$PROCFS/$pp/comm"
                 [ "$pc" = "tmux: server" ] || ttys=$((ttys + 1))
             fi
         fi

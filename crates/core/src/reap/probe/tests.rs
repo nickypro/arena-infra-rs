@@ -703,7 +703,11 @@ fn review2_r2_2_data_behind_a_link_out_of_the_home_is_neither_copied_nor_seen() 
 ///   `/tmp/systemd-private-*`-like) → none; no creation time on Hetzner → can't tell;
 /// - scheduled work: a crontab line or an added timer → hit; comments, a packaged (linked)
 ///   timer, snapd's → none;
-/// - a process on a pseudo-terminal in another session → counted.
+/// - a process on a pseudo-terminal in another session → counted; not one on a console tty, with
+///   no terminal, in the probe's own session or a tmux pane's own shell. Read from stand-in
+///   process lists (`ARENA_PROBE_TEST_PROCROOT`) — synthetic rows, and the real rows of a pty the
+///   test opens itself — never this shared box's own: other users opening and closing terminals
+///   meanwhile made a before/after count of the live `/proc` flaky.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_script_sees_outside_the_home_schedules_and_terminals() {
@@ -767,13 +771,96 @@ fn the_script_sees_outside_the_home_schedules_and_terminals() {
     std::fs::write(sys.join("etc/systemd/system/train.timer"), "[Timer]\nOnCalendar=daily\n").unwrap();
     assert_eq!(run(&home, "", "runpod", "-").sched, Some(true), "an added timer");
     std::fs::remove_file(sys.join("etc/systemd/system/train.timer")).unwrap();
-    // A terminal: `sleep` on a pseudo-terminal (via `script`) in a session of its own.
-    let before = run(&home, "", "runpod", "-").ttys.expect("the list read whole");
+    // Terminals, from stand-in process lists only.
+    let ttys_in = |procs: &std::path::Path| -> Option<u32> {
+        let out = Command::new("env")
+            .arg("-i")
+            .arg(format!("PATH={}:/usr/sbin:/usr/bin:/sbin:/bin", bin.display()))
+            .arg(format!("HOME={}", home.display()))
+            .arg("ARENA_PROBE_TEST_WINDOW=1")
+            .arg("ARENA_PROBE_TEST_GPU_TIMEOUT=1")
+            .arg("ARENA_PROBE_TEST_ROOTS=")
+            .arg(format!("ARENA_PROBE_TEST_SYSROOT={}", sys.display()))
+            .arg(format!("ARENA_PROBE_TEST_PROCROOT={}", procs.display()))
+            .args(["sh", "-c", PROBE_SCRIPT, "arena-idle-probe", "T3ST", "-900", "", "runpod", "203.0.113.9 50000 10.0.0.2 22", "-"])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        parse_probe(&stdout, "T3ST", Since::Back(900)).unwrap_or_else(|e| panic!("{e:?}\n{stdout}")).ttys
+    };
+    let session_of = |stat: &str| -> u32 { stat.rsplit_once(") ").unwrap().1.split_whitespace().nth(3).unwrap().parse().unwrap() };
+    // The probe runs in this test's session: rows in it are the probe's own, never counted.
+    let mine = session_of(&std::fs::read_to_string("/proc/self/stat").unwrap());
+    // Synthetic rows as the kernel writes them (`pid (comm) state ppid pgrp session tty_nr …
+    // starttime …`; tty_nr = major << 8 | minor). Pids above any pid_max: never a real ancestor.
+    let synthetic = root.join("procs-synthetic");
+    std::fs::create_dir_all(&synthetic).unwrap();
+    assert_eq!(ttys_in(&synthetic), Some(0), "nothing listed: no terminal");
+    let row = |pid: u32, ppid: u32, sid: u32, tty: u32, comm: &str| {
+        let d = synthetic.join(pid.to_string());
+        std::fs::create_dir_all(&d).unwrap();
+        let stat = format!("{pid} ({comm}) S {ppid} {pid} {sid} {tty} -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 12345 0 0\n");
+        std::fs::write(d.join("stat"), stat).unwrap();
+        std::fs::write(d.join("cmdline"), format!("{comm}\0")).unwrap();
+        std::fs::write(d.join("comm"), format!("{comm}\n")).unwrap();
+    };
+    row(5_000_001, 1, 5_000_001, (136 << 8) | 3, "bash"); // a login on /dev/pts/3: counted
+    row(5_000_002, 5_000_001, 5_000_001, (143 << 8) | 7, "python"); // major 143, the last pts one: counted
+    row(5_000_003, 1, 5_000_003, (4 << 8) | 1, "agetty"); // /dev/tty1: a console, not a pseudo-terminal
+    row(5_000_004, 1, 5_000_004, (144 << 8) | 1, "x"); // major 144: past the pts range
+    row(5_000_005, 1, 5_000_005, 0, "train"); // no terminal at all
+    row(5_000_006, 1, 5_000_006, 0, "tmux: server");
+    row(5_000_007, 5_000_006, 5_000_007, (136 << 8) | 9, "zsh"); // a tmux pane's own shell: the tmux fact's
+    row(5_000_008, 1, mine, (136 << 8) | 4, "sleep"); // in the probe's own session
+    assert_eq!(ttys_in(&synthetic), Some(2));
+
+    // A real pseudo-terminal of the test's own — `sleep` under `script`, in a session of its own —
+    // copied, row by row as the kernel wrote it, into an otherwise empty stand-in: what the
+    // probe counts is exactly its processes on that pty.
     let mut term = Command::new("setsid").args(["script", "-qfc", "sleep 39", "/dev/null"]).stdin(Stdio::null()).stdout(Stdio::null()).spawn().unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(400));
-    let during = run(&home, "", "runpod", "-").ttys;
+    let real = root.join("procs-real");
+    let pty_major = |stat: &str| -> bool {
+        let tty: u32 = stat.rsplit_once(") ").unwrap().1.split_whitespace().nth(4).unwrap().parse().unwrap();
+        (136..=143).contains(&((tty >> 8) & 4095))
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let on_pty = loop {
+        // The script's process tree, by parent links.
+        let mut tree = vec![term.id()];
+        let rows: Vec<(u32, String)> = std::fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .filter_map(|e| Some((e.file_name().to_str()?.parse::<u32>().ok()?, std::fs::read_to_string(e.path().join("stat")).ok()?)))
+            .collect();
+        let parent = |stat: &str| -> u32 { stat.rsplit_once(") ").unwrap().1.split_whitespace().nth(1).unwrap().parse().unwrap() };
+        while let Some(more) = rows.iter().find(|(p, st)| !tree.contains(p) && tree.contains(&parent(st))).map(|(p, _)| *p) {
+            tree.push(more);
+        }
+        let _ = std::fs::remove_dir_all(&real);
+        let mut n = 0;
+        for pid in &tree {
+            let (from, to) = (std::path::Path::new("/proc").join(pid.to_string()), real.join(pid.to_string()));
+            let copied: Option<String> = (|| {
+                let stat = std::fs::read_to_string(from.join("stat")).ok()?;
+                let cmdline = std::fs::read(from.join("cmdline")).ok()?;
+                let comm = std::fs::read(from.join("comm")).ok()?;
+                std::fs::create_dir_all(&to).ok()?;
+                std::fs::write(to.join("stat"), &stat).ok()?;
+                std::fs::write(to.join("cmdline"), &cmdline).ok()?;
+                std::fs::write(to.join("comm"), comm).ok()?;
+                (!cmdline.is_empty()).then_some(stat)
+            })();
+            n += copied.is_some_and(|st| pty_major(&st)) as u32;
+        }
+        if n > 0 || std::time::Instant::now() > deadline {
+            break n;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let counted = ttys_in(&real);
     let _ = term.kill();
     let _ = term.wait();
     let _ = std::fs::remove_dir_all(&root);
-    assert!(during.is_some_and(|n| n > before), "a process on a pty in another session: {before} → {during:?}");
+    assert!(on_pty >= 1, "`script` ran its command on the pty it opened");
+    assert_eq!(counted, Some(on_pty), "exactly the test's own processes on its pty");
 }
