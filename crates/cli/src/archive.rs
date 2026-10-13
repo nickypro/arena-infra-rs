@@ -445,6 +445,11 @@ async fn run_up_step(
             cloud.wait_action(a, ACTION_LIMIT).await?;
             println!("✓ {} protected", names.volume(*tier));
         }
+        UpStep::PowerOn { id } => {
+            let a = cloud.power_on(*id).await.context("powering the server on")?;
+            cloud.wait_action(a, SERVER_ACTION_LIMIT).await.context("waiting for the server to power on")?;
+            println!("✓ {} powered on (it was off) — waiting for it to boot", names.server());
+        }
         UpStep::PinHostKey { fresh } => {
             let ip = server_ip(env, cloud, server).await?;
             pin_host_key(env, &ip, *fresh || *created, o.accept_new_host_key).await?;
@@ -2489,6 +2494,30 @@ mod tests {
         let vm = w.remote.calls();
         assert!(matches!(vm[0].0.host_keys, HostKeyPolicy::Pinned { .. }), "the existing pin is kept");
         assert!(std::fs::read_to_string(w.env().paths.known_hosts()).unwrap().contains("HostHost"), "the pin wasn't reset");
+        assert_eq!(w.remote.cmds().iter().filter(|c| c.contains("arena-archive-setup")).count(), 1);
+    }
+
+    /// W7 live (A-ckl7): `up` on an archive that is off (a shutdown inside it) powers it on —
+    /// the dry run changes nothing — then waits for SSH on the pin and converges as usual; it
+    /// never just waits five minutes for an SSH that can't come.
+    #[tokio::test]
+    async fn up_powers_on_an_archive_that_is_off() {
+        let w = world("poweron");
+        w.up().await.unwrap();
+        std::fs::write(w.env().paths.known_hosts(), "203.0.113.102 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHostHostHostHostHostHostHostHostHostHos5\n").unwrap();
+        let mut inv = w.cloud.state();
+        inv.servers[0].status = "off".into();
+        let id = inv.servers[0].id;
+        let off = FakeArchiveCloud::with(inv);
+        archive_up(&w.env(), &off, TokenSource::Archive, UpOpts { dry_run: true, ..Default::default() }).await.unwrap();
+        assert!(off.mutations().is_empty(), "{:?}", off.calls());
+        w.remote.clear();
+        archive_up(&w.env(), &off, TokenSource::Archive, UpOpts::default()).await.unwrap();
+        assert_eq!(off.mutations(), [CloudCall::PowerOn(id)]);
+        assert!(off.calls().iter().any(|c| matches!(c, CloudCall::WaitAction(_))), "it waits for the action");
+        assert_eq!(off.state().servers[0].status, "running");
+        let vm = w.remote.calls();
+        assert!(matches!(vm[0].0.host_keys, HostKeyPolicy::Pinned { .. }), "the pin is kept: same server");
         assert_eq!(w.remote.cmds().iter().filter(|c| c.contains("arena-archive-setup")).count(), 1);
     }
 

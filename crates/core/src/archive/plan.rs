@@ -27,6 +27,9 @@ pub enum UpStep {
     AttachVolume { tier: Tier, id: u64 },
     /// Turn on an existing volume's delete protection.
     ProtectVolume { tier: Tier, id: u64 },
+    /// Power on the server, which is off (a shutdown inside it, a console power-off), and wait
+    /// for the action — after its volumes are attached, so it boots with them.
+    PowerOn { id: u64 },
     /// Wait for SSH and pin the host key; `fresh` = this run creates the server, so the first
     /// connection may trust on first use into an emptied known_hosts.
     PinHostKey { fresh: bool },
@@ -48,6 +51,7 @@ impl UpStep {
             }
             UpStep::AttachVolume { tier, id } => format!("attach the existing volume {} (id {id}) — never formatted", names.volume(*tier)),
             UpStep::ProtectVolume { tier, id } => format!("turn on delete protection for {} (id {id})", names.volume(*tier)),
+            UpStep::PowerOn { id } => format!("power on {} (id {id}) — it is off", names.server()),
             UpStep::PinHostKey { fresh: true } => "wait for SSH, then pin the new server's host key".into(),
             UpStep::PinHostKey { fresh: false } => "wait for SSH on the pinned host key".into(),
             UpStep::RunSetup => "run the setup script as root (users, mounts, read-only binds, sshd; idempotent)".into(),
@@ -211,6 +215,7 @@ pub fn plan_up(
 
     let mut steps = Vec::new();
     let fresh = server.is_none();
+    let mut power_on = None;
     match server {
         None => {
             let key = ours.ssh_keys.first();
@@ -237,8 +242,15 @@ pub fn plan_up(
             if !s.delete_protected {
                 steps.push(UpStep::ProtectServer);
             }
-            if s.status != "running" {
-                notes.push(format!("{} is {} — SSH waits for it to come up (power it on in the console if it stays off)", s.name, s.status));
+            match s.status.as_str() {
+                "running" => {}
+                // Nothing else starts it (fleet isolation hides it from `pods start`): `up` does.
+                "off" => power_on = Some(s.id),
+                "stopping" => notes.push(format!(
+                    "{} is stopping — once it is off, `arena archive up` powers it on again (SSH waits for it meanwhile)",
+                    s.name
+                )),
+                other => notes.push(format!("{} is {other} — SSH waits for it to come up", s.name)),
             }
         }
     }
@@ -255,6 +267,7 @@ pub fn plan_up(
             }
         }
     }
+    steps.extend(power_on.map(|id| UpStep::PowerOn { id }));
     steps.extend([UpStep::PinHostKey { fresh }, UpStep::RunSetup, UpStep::WriteState]);
     (UpPlan::Steps(steps), notes)
 }
@@ -483,6 +496,29 @@ mod tests {
             steps(up(&inv)),
             [vec![UpStep::AttachVolume { tier: Tier::Snap, id: 2 }, UpStep::ProtectVolume { tier: Tier::Snap, id: 2 }], TAIL.to_vec()].concat()
         );
+    }
+
+    /// W7 live (A-ckl7): a server that is off is powered on — after its volumes are attached,
+    /// before SSH is waited for — never left for SSH to time out on. Other states only wait.
+    #[test]
+    fn up_powers_on_a_server_that_is_off() {
+        let mut inv = all_present();
+        inv.servers[0].status = "off".into();
+        let (plan, notes) = up(&inv);
+        assert_eq!(steps((plan, notes.clone())), [vec![UpStep::PowerOn { id: 1 }], TAIL.to_vec()].concat());
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(UpStep::PowerOn { id: 1 }.describe(&names()), "power on arena9-archive (id 1) — it is off");
+        // Detached as well: attached first, then powered on.
+        inv.volumes[0] = vol(2, Tier::Snap, None, true);
+        let s = steps(up(&inv));
+        assert_eq!(s[..2], [UpStep::AttachVolume { tier: Tier::Snap, id: 2 }, UpStep::PowerOn { id: 1 }]);
+        for (status, says) in [("starting", "is starting — SSH waits"), ("stopping", "once it is off, `arena archive up` powers it on")] {
+            let mut inv = all_present();
+            inv.servers[0].status = status.into();
+            let (plan, notes) = up(&inv);
+            assert_eq!(steps((plan, Vec::new())), TAIL, "{status}");
+            assert!(notes.iter().any(|n| n.contains(says)), "{status}: {notes:?}");
+        }
     }
 
     /// Server lost, volumes kept: a new server in the volumes' location, both attached, a fresh pin.

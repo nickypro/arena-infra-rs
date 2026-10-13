@@ -182,6 +182,9 @@ pub trait ArchiveCloud: Send + Sync {
     async fn resize(&self, volume: u64, size_gb: u32) -> Result<u64>;
     /// `{delete: on, rebuild: on}`.
     async fn protect_server(&self, id: u64, on: bool) -> Result<u64>;
+    /// `POST /servers/{id}/actions/poweron`: start a server that is off (a shutdown inside it, a
+    /// console power-off) — `up` does, rather than wait for SSH that never comes.
+    async fn power_on(&self, id: u64) -> Result<u64>;
     /// `{delete: on}`.
     async fn protect_volume(&self, id: u64, on: bool) -> Result<u64>;
     async fn delete_server(&self, id: u64) -> Result<()>;
@@ -493,6 +496,10 @@ impl ArchiveCloud for HetznerArchiveCloud {
         action_id(&self.post(&format!("volumes/{id}/actions/change_protection"), &json!({"delete": on}), "hetzner volume protection").await?)
     }
 
+    async fn power_on(&self, id: u64) -> Result<u64> {
+        action_id(&self.post(&format!("servers/{id}/actions/poweron"), &json!({}), "hetzner power on server").await?)
+    }
+
     async fn delete_server(&self, id: u64) -> Result<()> {
         send_ok(self.auth(self.client.delete(format!("{}/servers/{id}", self.base))), "hetzner delete server").await
     }
@@ -561,6 +568,7 @@ mod fake {
         Resize(u64, u32),
         ProtectServer(u64, bool),
         ProtectVolume(u64, bool),
+        PowerOn(u64),
         DeleteServer(u64),
         DeleteVolume(u64),
         DeleteSshKey(u64),
@@ -804,6 +812,13 @@ mod fake {
             Ok(id_of(&mut w))
         }
 
+        async fn power_on(&self, id: u64) -> Result<u64> {
+            let mut w = self.record(CloudCall::PowerOn(id));
+            let s = w.inv.servers.iter_mut().find(|s| s.id == id).ok_or_else(|| not_found("server", id))?;
+            s.status = "running".into();
+            Ok(id_of(&mut w))
+        }
+
         async fn delete_server(&self, id: u64) -> Result<()> {
             let mut w = self.record(CloudCall::DeleteServer(id));
             let s = w.inv.servers.iter().find(|s| s.id == id).ok_or_else(|| not_found("server", id))?;
@@ -911,14 +926,17 @@ mod tests {
         let srv = serve(vec![
             canned(201, "application/json", r#"{"server":{"id":5,"name":"arena9-archive","status":"initializing","labels":{"arena-archive":"arena9"},"public_net":{"ipv4":{"ip":"192.0.2.9"}},"datacenter":{"location":{"name":"nbg1"}},"server_type":{"name":"cx23"},"protection":{"delete":false}},"action":{"id":77}}"#),
             canned(201, "application/json", r#"{"volume":{"id":8,"name":"arena9-archive-snap","size":50,"server":5,"format":"ext4","linux_device":"/dev/disk/by-id/scsi-0HC_Volume_8","location":{"name":"nbg1"},"labels":{"arena-archive":"arena9","arena-archive-tier":"snap"},"protection":{"delete":false}},"action":{"id":78},"next_actions":[{"id":79}]}"#),
+            canned(201, "application/json", r#"{"action":{"id":80,"command":"start_server","status":"running"}}"#),
         ]);
         let c = HetznerArchiveCloud::for_test(&srv.base);
         let (s, a) = c.create_server(&server_body(&names(), "cx23", "nbg1", 42)).await.unwrap();
         assert_eq!((s.id, s.ipv4.as_deref(), s.location.as_str(), a), (5, Some("192.0.2.9"), "nbg1", 77));
         let (v, actions) = c.create_volume(&volume_body(&names(), Tier::Snap, 50, 5)).await.unwrap();
         assert_eq!((v.id, v.tier(), v.server, v.format.as_deref(), actions), (8, Some(Tier::Snap), Some(5), Some("ext4"), vec![78, 79]));
+        // A server found off is powered on (w7 live: `up` waited 5 min for SSH, then failed).
+        assert_eq!(c.power_on(5).await.unwrap(), 80);
         let reqs = srv.requests.lock().unwrap().clone();
-        assert_eq!(reqs, ["POST /servers HTTP/1.1", "POST /volumes HTTP/1.1"]);
+        assert_eq!(reqs, ["POST /servers HTTP/1.1", "POST /volumes HTTP/1.1", "POST /servers/5/actions/poweron HTTP/1.1"]);
         let bodies = srv.bodies.lock().unwrap().clone();
         assert_eq!(serde_json::from_str::<Value>(&bodies[0]).unwrap(), server_body(&names(), "cx23", "nbg1", 42));
         assert_eq!(serde_json::from_str::<Value>(&bodies[1]).unwrap(), volume_body(&names(), Tier::Snap, 50, 5));
