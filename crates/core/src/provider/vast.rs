@@ -63,6 +63,13 @@ use crate::retry::{retrying, RetryPolicy};
 
 pub(crate) const BASE: &str = "https://console.vast.ai/api/v0";
 
+/// The account's own record, `GET {base}/users/current/` (bearer auth), for its `credit`
+/// ([`crate::balance`]). The answer also carries the account's email and **API key**: the
+/// caller reads `credit` alone and never quotes, logs or stores the body.
+pub(crate) fn user_request(client: &Client, base: &str, api_key: &str) -> RequestBuilder {
+    client.get(format!("{}/users/current/", base.trim_end_matches('/'))).bearer_auth(api_key)
+}
+
 /// Offers per search, cheapest first: plenty to re-filter client-side and still find one.
 const SEARCH_LIMIT: u32 = 64;
 
@@ -781,6 +788,7 @@ fn parse_instance(v: &Value) -> Pod {
         machine_id: machine_of(v),
         locked: None, // Vast has no pod lock
         proxy_only: false,
+        disk_gb: v.get("disk_space").and_then(Value::as_f64).filter(|g| g.is_finite() && *g >= 0.0),
     }
 }
 
@@ -873,6 +881,7 @@ impl Provider for VastProvider {
                 machine_id: None,
                 locked: None,
                 proxy_only: false,
+                disk_gb: Some(f64::from(spec.disk_gb)),
             });
         }
         Err(gone.unwrap_or_else(|| {

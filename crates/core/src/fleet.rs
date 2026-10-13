@@ -566,6 +566,7 @@ mod tests {
                 machine_id: None,
                 locked: None,
                 proxy_only: false,
+                disk_gb: None,
             },
             Pod {
                 id: "def456".into(),

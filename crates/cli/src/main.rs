@@ -190,19 +190,37 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Money left on each provider account and how long it lasts (read-only).
+    /// Money left on each prepaid account, how long it lasts, and where the number comes from.
     ///
-    /// RunPod (GraphQL `clientBalance`, `currentSpendPerHr`, `spendLimit`, `underBalance`) and
-    /// Vast (`credit`) are prepaid — at zero the provider stops every pod; Hetzner is postpaid.
-    /// Burn = the higher of the provider's own rate and this fleet's billing pods there;
-    /// runway = balance ÷ burn, with the date it runs out. Below BALANCE_WARN_HOURS (default
-    /// 48) — or at zero, or flagged by RunPod — a row is a ⚠. Exits non-zero when any account
-    /// needs a top-up or couldn't be read (`arena balance || <alert>` from cron). Never shows
-    /// account ids or emails.
+    /// RunPod (GraphQL `myself`) and Vast (`credit`) are prepaid — at $0 RunPod terminates pods
+    /// without a network volume and Vast stops every instance; Hetzner is postpaid. A balance
+    /// is **live** (read now, or < 5 min ago), **est.** (the last live reading — or `balance
+    /// set` — minus max(billed, metered) spend since: RunPod's v2 billing history and arena's
+    /// own burn samples; it errs low), or `?`. Burn = the higher of the provider's own rate
+    /// and this fleet's billing pods there; runway = balance ÷ burn. Critical under 24 h (or
+    /// at $0, or RunPod's underBalance), low under BALANCE_WARN_HOURS (default 72). Lists the
+    /// fleet (no details), reads every configured account (10 s at most), records it in the
+    /// state file next to the health cache, then runs the fallback check (the estimate from
+    /// an older reading against the live one). Exits 0 unless `--check`.
+    #[command(args_conflicts_with_subcommands = true)]
     Balance {
-        /// Print the report as JSON (for scripts); the exit status is the same.
+        #[command(subcommand)]
+        cmd: Option<BalanceCmd>,
+        /// Print the accounts as JSON (for scripts).
         #[arg(long)]
         json: bool,
+        /// Exit 2 if any account is critical, else 3 if any is unknown while burning, else 1
+        /// if any is low, else 0 (combines with --json).
+        #[arg(long)]
+        check: bool,
+        /// No live call: show what the fallback estimate would say (billing history and
+        /// arena's metering only). Writes nothing.
+        #[arg(long)]
+        no_live: bool,
+        /// Also print the burn's parts, spend limit, anchors, the billing history used, the
+        /// last failures and the state file.
+        #[arg(long, short = 'v')]
+        verbose: bool,
     },
     /// Read-only passthrough to a provider's REST API, for what no command covers (GET only).
     #[command(subcommand, infer_subcommands = true)]
@@ -321,6 +339,33 @@ impl SelectByFlag {
     fn args(&self) -> SelectArgs {
         self.opts.args(&self.targets)
     }
+}
+
+/// `arena balance set`.
+#[derive(Subcommand)]
+enum BalanceCmd {
+    /// Record the balance read off the provider's console (USD) — the escape hatch when
+    /// every balance API is dead. Estimates count down from it until the next live reading
+    /// replaces it. A local write, scoped to the configured key's account; no confirm.
+    Set {
+        /// `runpod` or `vast` (Hetzner is postpaid: nothing to set).
+        #[arg(value_parser = parse_balance_account)]
+        account: arena_core::balance::Account,
+        /// The balance in USD, e.g. 250 or 31.20 (may be negative).
+        #[arg(value_parser = arena_core::balance::parse_amount, allow_negative_numbers = true)]
+        usd: f64,
+    },
+}
+
+/// `balance set`'s account: a prepaid one.
+fn parse_balance_account(s: &str) -> std::result::Result<arena_core::balance::Account, String> {
+    arena_core::balance::Account::from_name(s).ok_or_else(|| {
+        if s.trim().eq_ignore_ascii_case("hetzner") {
+            "hetzner is postpaid — there is no balance to set".to_string()
+        } else {
+            format!("`{s}` isn't a prepaid account (runpod or vast)")
+        }
+    })
 }
 
 #[derive(Subcommand)]
@@ -2676,7 +2721,24 @@ async fn run() -> Result<()> {
         }
         Cmd::Keys(k) => handle_keys(k, provider.unwrap().as_ref(), remote, &cfg, cli.yes).await,
         Cmd::Teardown { check, json } => teardown::handle_teardown(provider.unwrap().as_ref(), &cfg, check, json).await,
-        Cmd::Balance { json } => money::handle_balance(provider.unwrap().as_ref(), &cfg, json).await,
+        Cmd::Balance { cmd, json, check, no_live, verbose } => {
+            let bal = money::BalanceCtx::from_config(&cfg);
+            let now = arena_core::snapshot::unix_now();
+            if let Some(BalanceCmd::Set { account, usd }) = cmd {
+                print!("{}", money::balance_set(&cfg, &bal, account, usd, now)?);
+                return Ok(());
+            }
+            let flags = money::BalanceFlags { json, check, no_live, verbose };
+            let out = money::balance_report(provider.unwrap().as_ref(), &cfg, &bal, flags, now).await?;
+            out.stderr.iter().for_each(|l| eprintln!("{l}"));
+            print!("{}", out.stdout);
+            if out.code != 0 {
+                use std::io::Write;
+                std::io::stdout().flush()?;
+                std::process::exit(out.code);
+            }
+            Ok(())
+        }
         Cmd::Gpus { json } => handle_gpus(&cfg, &cli.provider, json).await,
         Cmd::Api(c) => handle_api(c, &cfg).await,
         Cmd::Offers { gpu, cloud, max_price, gpus, order, json } => {
@@ -2825,6 +2887,8 @@ async fn handle_offers(
     let base = spec_with_overrides(cfg, &SpecOverrides { gpus, ..Default::default() });
     let req = arena_core::placement::Request::from_flags(gpu.as_deref(), cloud.as_deref(), &base, max_price, order)?;
     let plan = plan_placement(cfg, provider_name, &req, &base).await?;
+    // Live catalog/offer prices are remembered for the balance's known-GPU stand-ins.
+    money::BalanceCtx::from_config(cfg).remember_gpu_prices(&plan);
     if json {
         println!("{}", serde_json::to_string_pretty(&plan)?);
         return Ok(());
@@ -4445,6 +4509,13 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
     cfg_row(cfg, &mut missing, "OPENROUTER_PROVISIONING_KEY", false, true); // mints runtime keys
     cfg_row(cfg, &mut missing, "OPENROUTER_KEY_LIMIT", false, false); // USD cap per generated key
 
+    // The balance sources as last seen (the state file only — no request): ⚠ rows are
+    // advice, never missing keys.
+    println!("\nBalance (`arena balance`):");
+    for row in money::balance_config_rows(cfg, &money::BalanceCtx::from_config(cfg), arena_core::snapshot::unix_now()) {
+        println!("{row}");
+    }
+
     // Read-only readiness: are the local files this user needs actually there/readable?
     // Answers "is it set up yet?" without touching any API.
     println!("\nSetup readiness (local, read-only):");
@@ -5698,6 +5769,85 @@ async fn probe_gpus(remote: &Arc<dyn Remote>, cfg: &Config, pods: &mut [arena_co
     }
 }
 
+/// `pods list`, as (stdout, stderr lines) — returned rather than printed, so the contract
+/// is tested: every provider's pods (`Listing` from `list_by_provider`, so a provider that
+/// failed is known: a partial failure is one warning line, a total failure the same error
+/// as ever), best-effort details, the GPU probe — and, for the table only, the balance line
+/// under the fleet footer. The balance is observed inline alongside the listing (within
+/// `INLINE_TIMEOUT`; live only when the last attempt is `FRESH` old), judged against this
+/// listing's burns after the details fill the prices — a provider that failed to list is
+/// an unknown burn, never $0/h — and is silent whatever happens to it. `--json` reads no
+/// balance at all and is unchanged byte for byte.
+async fn list_with(
+    provider: &dyn Provider,
+    remote: &Arc<dyn Remote>,
+    cfg: &Config,
+    bal: &money::BalanceCtx,
+    json: bool,
+    probe: bool,
+) -> Result<(String, Vec<String>)> {
+    use arena_core::balance::{self, BalancePolicy, Mode};
+    let now = arena_core::snapshot::unix_now();
+    let (state, _) = if json { Default::default() } else { balance::load_opt(bal.state_path()) };
+    let listing = async {
+        let listing = arena_core::proxy::Listing::from_results(provider.list_by_provider().await);
+        let errs: Vec<String> = listing.errors().iter().map(|(p, e)| format!("{p}: {e}")).collect();
+        if !listing.any_ok() && !errs.is_empty() {
+            anyhow::bail!("all providers failed to list: {}", errs.join("; "));
+        }
+        let mut warnings = Vec::new();
+        if !errs.is_empty() {
+            warnings.push(format!("warning: some providers failed to list ({})", errs.join("; ")));
+        }
+        let mut pods = listing.pods();
+        pods.sort_by(|a, b| a.provider.cmp(&b.provider).then(a.name.cmp(&b.name)));
+        // Best-effort details the list API omits (RunPod: GPU, $/h, host maintenance
+        // window) — one extra read-only query. Never fatal: on failure or a hang the list
+        // still renders, just with fewer columns filled, after one warning line.
+        if let Some(warning) = enrich_best_effort(provider, &mut pods, ENRICH_TIMEOUT).await {
+            warnings.push(warning);
+        }
+        if probe {
+            // nvidia-smi over SSH (same source as the TUI), concurrently, bounded per pod.
+            probe_gpus(remote, cfg, &mut pods).await;
+        }
+        anyhow::Ok((listing, pods, warnings))
+    };
+    let mode = if json { Mode::CacheOnly } else { bal.inline_mode() };
+    let observing = async {
+        if json {
+            Vec::new()
+        } else {
+            balance::observe(bal.api.as_ref(), &state, mode, balance::INLINE_TIMEOUT, now).await
+        }
+    };
+    let (listed, fetched) = tokio::join!(listing, observing);
+    let (listing, pods, warnings) = listed?;
+    if json {
+        return Ok((format!("{}\n", serde_json::to_string_pretty(&pods)?), warnings));
+    }
+    let mut out = String::new();
+    // Columns + footer come from arena_core::fleet so the TUI/snapshot reuse them. A
+    // provider that didn't answer makes the total a lower bound — said on the line — and an
+    // empty table "not known to be empty".
+    use arena_core::fleet;
+    let failed: Vec<String> = listing.errors().iter().map(|(p, _)| p.to_string()).collect();
+    if pods.is_empty() {
+        out.push_str(&format!("{}\n", fleet::empty_listing_line(&failed)));
+    } else {
+        out.push_str(&fleet::render_pods_table(&pods));
+        out.push_str(&format!("{}\n", fleet::listing_footer(&fleet::fleet_cost(&pods), &failed)));
+    }
+    if !fetched.is_empty() {
+        let (policy, _) = BalancePolicy::from_config(cfg);
+        let views = money::listed_views(bal, state, &fetched, &listing, &pods, &policy, mode, now);
+        if let Some(line) = balance::footer_line(&views, &policy, now) {
+            out.push_str(&format!("{line}\n"));
+        }
+    }
+    Ok((out, warnings))
+}
+
 async fn handle_pods(
     cmd: PodCmd,
     provider: &dyn Provider,
@@ -5719,56 +5869,27 @@ async fn handle_pods_with(
     yes: bool,
     interrupt: Interrupt,
 ) -> Result<()> {
+    handle_pods_bal(cmd, provider, remote, cfg, yes, interrupt, &money::BalanceCtx::from_config(cfg)).await
+}
+
+/// [`handle_pods_with`] with the balance reads handed in (`pods list`'s footer, the
+/// `create`/`up` preflight) — the real ones, or a fake in tests.
+async fn handle_pods_bal(
+    cmd: PodCmd,
+    provider: &dyn Provider,
+    remote: Arc<dyn Remote>,
+    cfg: &Config,
+    yes: bool,
+    interrupt: Interrupt,
+    bal: &money::BalanceCtx,
+) -> Result<()> {
     match cmd {
         PodCmd::List { json, probe, no_probe } => {
-            // Fleet view across every configured provider (the aggregate provider), so
-            // e.g. hetzner CPU pods show up alongside the GPU fleet. Grouped by provider.
-            let listing = async {
-                let (mut pods, failed) = money::list_noting_failures(provider).await?;
-                pods.sort_by(|a, b| a.provider.cmp(&b.provider).then(a.name.cmp(&b.name)));
-                // Best-effort details the list API omits (RunPod: GPU, $/h, host maintenance
-                // window) — one extra read-only query. Never fatal: on failure or a hang the
-                // list still renders, just with fewer columns filled, after one warning line.
-                if let Some(warning) = enrich_best_effort(provider, &mut pods, ENRICH_TIMEOUT).await {
-                    eprintln!("{warning}");
-                }
-                // Probe GPU by default for the human table; JSON stays fast/scriptable unless
-                // asked. `--no-probe` always wins.
-                if !no_probe && (probe || !json) {
-                    // nvidia-smi over SSH (same source as the TUI), concurrently, bounded per pod.
-                    probe_gpus(&remote, cfg, &mut pods).await;
-                }
-                anyhow::Ok((pods, failed))
-            };
-            // The account balances for the footer, read while the listing runs (table only;
-            // each read within FOOTER_TIMEOUT, best-effort — they never fail the list, and
-            // hold it up at most until that budget runs out).
-            let balances = async {
-                if json {
-                    None
-                } else {
-                    Some(arena_core::balance::fetch_all(cfg, money::FOOTER_TIMEOUT).await)
-                }
-            };
-            let (listed, balances) = tokio::join!(listing, balances);
-            let (pods, failed) = listed?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&pods)?);
-                return Ok(());
-            }
-            let footer = balances
-                .map(|b| money::list_footer(&b, &pods, &failed, cfg, arena_core::snapshot::unix_now()))
-                .unwrap_or_default();
-            // Columns + footer come from arena_core::fleet so the TUI/snapshot reuse them. A
-            // provider that didn't answer makes the total a lower bound — said on the line.
-            use arena_core::fleet;
-            if pods.is_empty() {
-                println!("{}", fleet::empty_listing_line(&failed));
-            } else {
-                print!("{}", fleet::render_pods_table(&pods));
-                println!("{}", fleet::listing_footer(&fleet::fleet_cost(&pods), &failed));
-            }
-            footer.iter().for_each(|l| println!("{l}"));
+            // Probe GPU by default for the human table; JSON stays fast/scriptable unless
+            // asked. `--no-probe` always wins.
+            let (out, warnings) = list_with(provider, &remote, cfg, bal, json, !no_probe && (probe || !json)).await?;
+            warnings.iter().for_each(|w| eprintln!("{w}"));
+            print!("{out}");
         }
 
         PodCmd::Create { names, count, add, gpu, gpus, cloud, max_price, order, disk, volume, image, bootstrap, api_json, skip_proxy, dry_run, keep_trying, retry_mins, retry_secs } => {
@@ -5800,6 +5921,7 @@ async fn handle_pods_with(
             let (spec, options) = match placing {
                 Some((req, base)) => {
                     let plan = plan_placement(cfg, provider.name(), &req, &base).await?;
+                    bal.remember_gpu_prices(&plan);
                     (base, Some(plan))
                 }
                 None => (spec_with_overrides(cfg, &ov), None),
@@ -5817,6 +5939,7 @@ async fn handle_pods_with(
                 }
                 print_create_body(provider, &first_create_spec(&spec, options.as_ref(), &names[0]));
                 warn_no_volume(provider, &spec);
+                money::balance_preflight(provider, cfg, bal, names.len(), options.as_ref(), &spec).await.iter().for_each(|l| println!("{l}"));
                 println!("\nDry-run only — no pods created (this is a preview).");
                 return Ok(());
             }
@@ -5828,6 +5951,9 @@ async fn handle_pods_with(
                     names.len(), provider.name(), describe_create(provider, &spec), names.join(", ")
                 ),
             };
+            // The account balance for these pods, next to the prompt: advisory (it never
+            // blocks, and `--yes` changes nothing), quiet if the balance can't be read.
+            money::balance_preflight(provider, cfg, bal, names.len(), options.as_ref(), &spec).await.iter().for_each(|l| println!("{l}"));
             if !confirm(yes, &what)? {
                 println!("aborted.");
                 return Ok(());
@@ -5850,6 +5976,9 @@ async fn handle_pods_with(
                 Ok(created) => (created, None),
                 Err(CreateFailed { created, error }) => (created, Some(error)),
             };
+            // A price the create answered with is remembered for the balance (a later
+            // listing without one — RunPod v1's — still prices the pod).
+            bal.remember_prices(created.iter().map(|m| &m.pod));
             // Fresh pods rarely have an SSH endpoint yet, so this mostly reports them as
             // "not forwarded yet" — but it keeps every create ending with the proxy in step
             // (and a provider that hands out the IP at create, like Hetzner, is wired now).
@@ -5909,6 +6038,7 @@ async fn handle_pods_with(
             let (spec, options) = match placing {
                 Some((req, base)) => {
                     let plan = plan_placement(cfg, provider.name(), &req, &base).await?;
+                    bal.remember_gpu_prices(&plan);
                     (base, Some(plan))
                 }
                 None => (spec_with_overrides(cfg, &ov), None),
@@ -5928,6 +6058,7 @@ async fn handle_pods_with(
                 }
                 print_create_body(provider, &first_create_spec(&spec, options.as_ref(), &names[0]));
                 warn_no_volume(provider, &spec);
+                money::balance_preflight(provider, cfg, bal, names.len(), options.as_ref(), &spec).await.iter().for_each(|l| println!("{l}"));
                 let retry = if retry_mins > 0 { format!(" (retrying up to {retry_mins}m for capacity)") } else { String::new() };
                 println!(
                     "\nDry-run only — no pods created (preview){retry}: would create the above, then {per_pod}. \
@@ -5960,6 +6091,9 @@ async fn handle_pods_with(
                     names.len(), provider.name(), describe_create(provider, &spec), names.join(", ")
                 ),
             };
+            // The account balance for these pods, next to the prompt: advisory (it never
+            // blocks, and `--yes` changes nothing), quiet if the balance can't be read.
+            money::balance_preflight(provider, cfg, bal, names.len(), options.as_ref(), &spec).await.iter().for_each(|l| println!("{l}"));
             if !confirm(yes, &what)? {
                 println!("aborted.");
                 return Ok(());
@@ -5985,6 +6119,9 @@ async fn handle_pods_with(
                     Ok(created) => (created, None),
                     Err(CreateFailed { created, error }) => (created, Some(error)),
                 };
+                // As `create`: the prices the creates answered with are remembered for the
+                // balance — those made before a failure too.
+                bal.remember_prices(created.iter().map(|m| &m.pod));
                 if !created.is_empty() {
                     sync_proxy(cfg, provider, "up").await;
                 }
@@ -6046,6 +6183,9 @@ async fn handle_pods_with(
                 // create phase is over.
                 let made_tx = made_tx;
                 let on_made = move |m: &Made| {
+                    // Its price, for the balance, the moment it exists (as a replacement's,
+                    // in `up::UpRun`): the pipeline after it may run for many minutes.
+                    bal.remember_prices(std::iter::once(&m.pod));
                     let _ = made_tx.send(m.clone());
                 };
                 match &options {
@@ -6673,7 +6813,8 @@ async fn handle_snapshot(
     // `--no-probe`.
     reach: Option<Arc<dyn arena_core::snapshot::Reach>>,
 ) -> Result<()> {
-    let (snap, warnings) = collect_snapshot(provider, cfg, arena_core::snapshot::unix_now(), reach).await?;
+    let bal = money::BalanceCtx::from_config(cfg);
+    let (snap, warnings) = collect_snapshot(provider, cfg, arena_core::snapshot::unix_now(), reach, &bal).await?;
     for w in warnings {
         eprintln!("{w}");
     }
@@ -6715,12 +6856,15 @@ async fn handle_snapshot(
 /// session, no deep check, no proxy over SSH. A provider that fails to list makes the
 /// snapshot partial (and the public one `complete: false`); if none answers it's an error
 /// and nothing is written — a page going stale says more than a page that shows an empty
-/// fleet. Returns the snapshot and the warning lines to print.
+/// fleet. The prepaid balances come from the balance state file alone (`bal` only says
+/// which accounts are configured): no balance call, nothing written — a cron's snapshot
+/// never observes. Returns the snapshot and the warning lines to print.
 async fn collect_snapshot(
     provider: &dyn Provider,
     cfg: &Config,
     now: u64,
     reach: Option<Arc<dyn arena_core::snapshot::Reach>>,
+    bal: &money::BalanceCtx,
 ) -> Result<(arena_core::snapshot::FleetSnapshot, Vec<String>)> {
     use arena_core::snapshot::{self, HealthCache};
     let listing = arena_core::proxy::Listing::from_results(provider.list_by_provider().await);
@@ -6753,6 +6897,15 @@ async fn collect_snapshot(
         }
     };
     let mut snap = snapshot::build(&pods, &partial, proxy.as_deref(), &health, &Naming::from_config(cfg), now);
+    let accounts = bal.api.accounts();
+    if !accounts.is_empty() {
+        use arena_core::balance::{self, BalancePolicy, Fetched, Mode};
+        let (state, _) = balance::load_opt(bal.state_path());
+        let fetched: Vec<Fetched> = accounts.into_iter().map(|(a, fp)| Fetched::nothing(a, fp)).collect();
+        let (policy, _) = BalancePolicy::from_config(cfg);
+        snap.balance = balance::views(&state, &fetched, &balance::burns_with(&listing, &pods, &state, &policy), &policy, Mode::CacheOnly, now);
+        snap.balance_policy = policy;
+    }
     if let Some(reach) = reach {
         snapshot::probe_reachability(&mut snap, reach).await;
     }
@@ -16721,6 +16874,158 @@ mod placement_cli_tests {
         );
     }
 
+    /// The `up` in [`up_places_through_the_options_then_carries_on`]: 3090 then A4000.
+    fn up_apple() -> PodCmd {
+        PodCmd::Up {
+            names: vec!["apple".into()],
+            count: None,
+            add: None,
+            gpu: Some("3090,A4000".into()),
+            gpus: None,
+            cloud: None,
+            max_price: None,
+            order: Order::Listed,
+            disk: None,
+            volume: None,
+            image: None,
+            bootstrap: false,
+            api_json: None,
+            dry_run: false,
+            no_wait: true,
+            keep_trying: false,
+            retry_mins: 0,
+            retry_secs: 60,
+            no_setup: true,
+            check: false,
+            check_attempts: 2,
+            retry_bad_hosts: false,
+            lock: false,
+            timeout: 600,
+            interval: 12,
+        }
+    }
+
+    /// A balance reading `live`, with a state file of its own (removed on drop): inline
+    /// surfaces read live only when the state can be saved.
+    struct TestBal(money::BalanceCtx, std::path::PathBuf);
+    impl std::ops::Deref for TestBal {
+        type Target = money::BalanceCtx;
+        fn deref(&self) -> &money::BalanceCtx {
+            &self.0
+        }
+    }
+    impl Drop for TestBal {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.1);
+        }
+    }
+    fn balance_of(live: arena_core::balance::Live) -> TestBal {
+        use arena_core::balance::{Account, FakeBalanceApi};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!("arena-preflight-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
+        let path = Some(Ok(dir.join("devtest").join(arena_core::snapshot::BALANCE_FILE)));
+        TestBal(money::BalanceCtx { api: Arc::new(FakeBalanceApi::new().live_ok(Account::Runpod, live)), path }, dir)
+    }
+
+    /// Invariant 2 for `up`/`create`: a critical balance (under RunPod's minimum, under an
+    /// hour's credit for the new pods) is said next to the plan — and changes nothing: with
+    /// `--yes` the very same creates run as with no balance at all, dry runs create nothing.
+    #[tokio::test]
+    async fn up_preflight_warns_and_still_creates() {
+        use arena_core::balance::Live;
+        let poor = Live { usd: 0.10, provider_burn_per_hr: Some(0.47), spend_limit_per_hr: Some(80.0), under_balance: Some(true), reduced: false, owed: None };
+        let bal = balance_of(poor);
+        let plain = Recorder::dry(&["NVIDIA GeForce RTX 3090"]);
+        handle_pods(up_apple(), &plain, fake_remote(), &cfg(), true).await.unwrap();
+        let fake = Recorder::dry(&["NVIDIA GeForce RTX 3090"]);
+        handle_pods_bal(up_apple(), &fake, fake_remote(), &cfg(), true, Interrupt::manual(), &bal).await.unwrap();
+        assert_eq!(fake.calls(), plain.calls());
+        assert_eq!(fake.calls().len(), 2);
+        // `create` likewise; a dry run creates nothing either way.
+        let plain = Recorder::default();
+        handle_pods(create(&["apple"], None, None, None), &plain, fake_remote(), &cfg(), true).await.unwrap();
+        let fake = Recorder::default();
+        handle_pods_bal(create(&["apple"], None, None, None), &fake, fake_remote(), &cfg(), true, Interrupt::manual(), &bal).await.unwrap();
+        assert_eq!((fake.calls(), fake.calls().len()), (plain.calls(), 1));
+        let dry = Recorder::default();
+        let mut cmd = create(&["apple"], None, None, None);
+        if let PodCmd::Create { dry_run, .. } = &mut cmd {
+            *dry_run = true;
+        }
+        handle_pods_bal(cmd, &dry, fake_remote(), &cfg(), true, Interrupt::manual(), &bal).await.unwrap();
+        assert!(dry.calls().is_empty());
+        // What it said: the runway after, an hour's credit, underBalance.
+        let base = spec_with_overrides(&cfg(), &SpecOverrides::default());
+        let req = arena_core::placement::Request::from_flags(Some("3090,A4000"), None, &base, None, Order::Listed).unwrap();
+        let plan = plan_placement(&cfg(), "runpod", &req, &base).await.unwrap();
+        let lines = money::balance_preflight(&fake, &cfg(), &bal, 1, Some(&plan), &base).await;
+        // The options' prices are preset estimates (no key): raised to the known GPU's
+        // stand-in (RunPod's recorded catalog), marked `~`.
+        assert!(lines[0].starts_with("balance: runpod $0.10 live · $0.47/h now + ≤~$") && lines[0].ends_with("‼ under 24h"), "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("⚠ RunPod needs ≥1h of credit for the new pods (≈~$")), "{lines:?}");
+        assert_eq!(lines.last().unwrap(), "‼ RunPod reports the account under its minimum balance — creates will likely fail");
+    }
+
+    #[tokio::test]
+    async fn create_preflight_credit_and_spend_limit_lines() {
+        use arena_core::balance::{BalancePolicy, Live};
+        let base = spec_with_overrides(&cfg(), &SpecOverrides::default());
+        let req = arena_core::placement::Request::from_flags(Some("A4000,3090"), None, &base, None, Order::Cheapest).unwrap();
+        let plan = plan_placement(&cfg(), "runpod", &req, &base).await.unwrap();
+        // No key: the options carry preset estimates, so the bound is each option at the most
+        // its GPU is known to cost (A4000 $0.32, RTX 3090 $0.50 recorded) — here $0.50.
+        let policy = BalancePolicy::default();
+        let dearest = plan
+            .options
+            .iter()
+            .map(|o| o.price_per_pod.unwrap_or(0.0).max(arena_core::balance::stand_in_price(Some(&o.gpu), Some(o.gpu_count), &policy).unwrap()))
+            .fold(0.0, f64::max);
+        assert!((dearest - 0.5).abs() < 1e-9, "{plan:?}");
+        // Plenty of money, but 400 new pods at the dearest option would pass the $80/h limit.
+        let near_limit = Live { usd: 5_000.0, provider_burn_per_hr: Some(10.0), spend_limit_per_hr: Some(80.0), under_balance: Some(false), reduced: false, owed: None };
+        let lines = money::balance_preflight(&Recorder::default(), &cfg(), &balance_of(near_limit), 400, Some(&plan), &base).await;
+        let want = format!(
+            "⚠ planned ~${:.2}/h exceeds RunPod's spend limit $80.00/h — creates past it will be refused",
+            10.0 + 400.0 * dearest
+        );
+        assert!(lines.contains(&want), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("1h of credit")), "{lines:?}");
+        // $1 for 10 new pods: under an hour's credit.
+        let thin = Live { usd: 1.0, provider_burn_per_hr: Some(0.0), spend_limit_per_hr: Some(80.0), under_balance: Some(false), reduced: false, owed: None };
+        let lines = money::balance_preflight(&Recorder::default(), &cfg(), &balance_of(thin.clone()), 10, Some(&plan), &base).await;
+        let credit = format!(
+            "⚠ RunPod needs ≥1h of credit for the new pods (≈~${:.2}); the account has $1.00 — creates will likely fail (402)",
+            10.0 * dearest
+        );
+        assert!(lines.contains(&credit), "{lines:?}");
+        // The single-spec path: nothing priced the A4000 — it stands in at the most it is
+        // known to cost ($0.32/h), never at $0: the runway and the credit check use it, `~`.
+        let lines = money::balance_preflight(&Recorder::default(), &cfg(), &balance_of(thin.clone()), 10, None, &base).await;
+        assert_eq!(
+            lines,
+            [
+                "balance: runpod $1.00 live · $0.00/h now + ≤~$3.20/h for 10 new pod(s) (a stand-in that errs high — no live price) → <1h ‼ under 24h",
+                "⚠ RunPod needs ≥1h of credit for the new pods (≈~$3.20); the account has $1.00 — creates will likely fail (402)",
+            ]
+        );
+        // An option nobody priced counts at its stand-in in the `≤` bound (it may be the
+        // dearest): an H100 SXM at RunPod's recorded $3.49, never the June preset's $2.79.
+        let mut unpriced = plan.clone();
+        unpriced.options[0].price_per_pod = None;
+        unpriced.options[0].gpu = "NVIDIA H100 80GB HBM3".into();
+        let lines = money::balance_preflight(&Recorder::default(), &cfg(), &balance_of(thin.clone()), 10, Some(&unpriced), &base).await;
+        assert!(lines[0].contains("+ ≤~$34.90/h for 10 new pod(s)"), "{lines:?}");
+        // A live catalog price is taken as it is (it's what RunPod charges right now).
+        let mut live_priced = plan.clone();
+        for o in live_priced.options.iter_mut() {
+            (o.price_per_pod, o.price_source) = (Some(0.2), Some(arena_core::placement::PriceSource::Live));
+        }
+        let lines = money::balance_preflight(&Recorder::default(), &cfg(), &balance_of(thin), 10, Some(&live_priced), &base).await;
+        assert!(lines[0].contains("+ ≤$2.00/h for 10 new pod(s) →"), "{lines:?}");
+        // No account for this provider configured: nothing.
+        assert!(money::balance_preflight(&Recorder::default(), &cfg(), &money::BalanceCtx::from_config(&cfg()), 10, Some(&plan), &base).await.is_empty());
+    }
+
     #[tokio::test]
     async fn offers_plans_without_a_fleet_or_a_key() {
         // Off RunPod nothing is priced, so a cap leaves nothing — but it's a view, not an error.
@@ -21372,6 +21677,11 @@ mod snapshot_tests {
         ))
     }
 
+    /// No prepaid account configured: no balance in the snapshot.
+    fn no_balance() -> crate::money::BalanceCtx {
+        crate::money::BalanceCtx { api: Arc::new(arena_core::balance::FakeBalanceApi::new()), path: None }
+    }
+
     fn checked(p: &Pod, status: Status, checks: &[(&str, Status, &str)]) -> PodHealth {
         PodHealth {
             id: p.id.clone(),
@@ -21398,6 +21708,40 @@ mod snapshot_tests {
         assert!(matches!(parse(&["snap", "--json"]).unwrap(), Cmd::Snapshot { json: true, .. }));
     }
 
+    /// Invariant 9: the snapshot's balance comes from the state file — the fake panics on
+    /// any balance call — and only the internal forms show it; `--public` has none of it.
+    #[tokio::test]
+    async fn snapshot_makes_no_balance_calls() {
+        use arena_core::balance::{self, Account, FakeBalanceApi, Fetched, Live, Mode};
+        let dir = tmp("balance");
+        let cfg = cfg(&dir.0);
+        let state_file = dir.0.join("state").join("devtest").join(arena_core::snapshot::BALANCE_FILE);
+        // A reading recorded earlier (as `arena balance` would have).
+        let fp = FakeBalanceApi::fp(Account::Runpod);
+        let live = Live { usd: 512.34, provider_burn_per_hr: Some(0.5), spend_limit_per_hr: None, under_balance: None, reduced: false, owed: None };
+        let at = arena_core::snapshot::unix_now() - 3_600;
+        let f = Fetched { account: Account::Runpod, key_fp: fp, live: Some(Ok(live)), billed: None };
+        balance::record(&state_file, |s| balance::apply(s, &[f], &balance::Burns::new(), Mode::Full, at)).unwrap();
+        let before = std::fs::read(&state_file).unwrap();
+        let bal = crate::money::BalanceCtx {
+            api: Arc::new(FakeBalanceApi::new().with(Account::Runpod).panicking()),
+            path: Some(Ok(state_file.clone())),
+        };
+        let (snap, _) = collect_snapshot(&fleet(), &cfg, arena_core::snapshot::unix_now(), None, &bal).await.unwrap();
+        assert_eq!(std::fs::read(&state_file).unwrap(), before, "nothing written");
+        assert_eq!(snap.balance.len(), 1);
+        assert_eq!(snap.balance[0].source, balance::Source::Estimate, "an hour-old reading is an estimate");
+        let naming = Naming::from_config(&cfg);
+        let table = render_snapshot(&snap, &naming, false, false).unwrap();
+        assert!(table.lines().last().unwrap().starts_with("balance: runpod ~$511."), "{table}");
+        let json = render_snapshot(&snap, &naming, true, false).unwrap();
+        assert!(json.contains("\"balance\"") && json.contains("\"source\": \"estimate\""), "{json}");
+        let public = render_snapshot(&snap, &naming, false, true).unwrap();
+        for needle in ["balance", "credit", "runway", "511.", "512."] {
+            assert!(!public.contains(needle), "`{needle}` in the public snapshot: {public}");
+        }
+    }
+
     #[tokio::test]
     async fn snapshot_joins_listing_proxy_and_cached_health_without_touching_anything() {
         let dir = tmp("collect");
@@ -21414,7 +21758,7 @@ mod snapshot_tests {
         let f = fleet();
         // apple's (and the staff box's) sshd answer; bloom's doesn't.
         let probe = answering(&[22001, 22003]);
-        let (snap, warnings) = collect_snapshot(&f, &cfg, arena_core::snapshot::unix_now(), Some(probe.clone())).await.unwrap();
+        let (snap, warnings) = collect_snapshot(&f, &cfg, arena_core::snapshot::unix_now(), Some(probe.clone()), &no_balance()).await.unwrap();
         assert_eq!(f.enriched.load(Ordering::SeqCst), 1, "one details query, like `pods list`");
         let mut asked = probe.asked.lock().unwrap().clone();
         asked.sort();
@@ -21455,7 +21799,7 @@ mod snapshot_tests {
         assert_eq!(status, [("apple", PublicStatus::Up), ("bloom", PublicStatus::Starting)]);
 
         // `--no-probe`: nothing probed (SSH `-`), and a listed-running pod with an endpoint is up.
-        let (snap, _) = collect_snapshot(&fleet(), &cfg, arena_core::snapshot::unix_now(), None).await.unwrap();
+        let (snap, _) = collect_snapshot(&fleet(), &cfg, arena_core::snapshot::unix_now(), None, &no_balance()).await.unwrap();
         assert!(snap.pods.iter().all(|p| p.reachable.is_none()));
         let public = arena_core::snapshot::public_snapshot(&snap, &Naming::from_config(&cfg));
         assert!(public.machines.iter().all(|m| m.status == PublicStatus::Up), "{public:?}");
@@ -21566,13 +21910,13 @@ mod snapshot_tests {
         std::fs::create_dir_all(&state).unwrap();
         std::fs::write(state.join("health.json"), "{truncated").unwrap();
         std::fs::remove_file(dir.0.join("proxy.conf")).unwrap();
-        let (snap, warnings) = collect_snapshot(&fleet(), &cfg, 1_791_460_800, all_up()).await.unwrap();
+        let (snap, warnings) = collect_snapshot(&fleet(), &cfg, 1_791_460_800, all_up(), &no_balance()).await.unwrap();
         assert!(snap.pods.iter().all(|p| p.health.is_none() && p.proxy == ProxyState::None), "{snap:#?}");
         assert_eq!(warnings.iter().filter(|w| w.contains("ignoring the health cache")).count(), 1, "{warnings:?}");
         // A remote proxy is never fetched (no SSH): its forwards are unknown.
         cfg.values.insert("PROXY_LOCAL".into(), "false".into());
         cfg.values.insert("SSH_PROXY_HOST".into(), "proxy.example".into());
-        let (snap, _) = collect_snapshot(&fleet(), &cfg, 1_791_460_800, all_up()).await.unwrap();
+        let (snap, _) = collect_snapshot(&fleet(), &cfg, 1_791_460_800, all_up(), &no_balance()).await.unwrap();
         assert!(snap.pods.iter().all(|p| p.proxy == ProxyState::Unknown));
     }
 }

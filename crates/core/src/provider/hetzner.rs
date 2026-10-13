@@ -210,6 +210,8 @@ fn parse_server(v: &Value) -> Pod {
         // RunPod v2 only.
         locked: None,
         proxy_only: false,
+        // A Hetzner server bills whole while it exists: its disk is never priced apart.
+        disk_gb: None,
     }
 }
 

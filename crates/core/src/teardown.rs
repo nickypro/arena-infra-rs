@@ -251,6 +251,13 @@ pub struct Report {
     /// Items that couldn't be checked.
     pub unknown: usize,
     pub items: Vec<Item>,
+    /// The prepaid account balances, observed alongside (`crate::balance`): information
+    /// only — `clear`, `remaining` and `unknown` never read it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub balance: Vec<crate::balance::AccountView>,
+    /// When the balance was observed (for its ages).
+    #[serde(skip)]
+    pub balance_at: u64,
 }
 
 /// Judge every input. Items come in a fixed order — pods per provider (every known provider:
@@ -276,7 +283,15 @@ pub fn build(inputs: &Inputs, naming: &Naming) -> Report {
     items.push(proxy_item(&inputs.proxy, &configured));
     let count = |v: Verdict| items.iter().filter(|i| i.verdict == v).count();
     let (remaining, unknown) = (count(Verdict::Remaining), count(Verdict::Unknown));
-    Report { cohort: naming.prefix.to_string(), clear: remaining == 0 && unknown == 0, remaining, unknown, items }
+    Report {
+        cohort: naming.prefix.to_string(),
+        clear: remaining == 0 && unknown == 0,
+        remaining,
+        unknown,
+        items,
+        balance: Vec::new(),
+        balance_at: 0,
+    }
 }
 
 /// Is `name` a key `keys gen` would have minted for this cohort's machines: its own
@@ -1000,6 +1015,10 @@ impl Report {
         out.push('\n');
         out.push_str(&self.verdict_line());
         out.push('\n');
+        for line in crate::balance::teardown_info(&self.balance, self.balance_at) {
+            out.push_str(&line);
+            out.push('\n');
+        }
         if !self.clear {
             out.push_str(
                 "Suggested order: cron and at first (so nothing recreates a pod), then keys, pods, volumes, \

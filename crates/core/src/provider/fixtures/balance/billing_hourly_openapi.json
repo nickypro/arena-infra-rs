@@ -1,0 +1,82 @@
+{
+  "records": [
+    {
+      "startTime": "2026-10-08T10:00:00Z",
+      "endTime": "2026-10-08T11:00:00Z",
+      "totalAmount": 0.47,
+      "podGpuAmount": 0.4,
+      "podCpuAmount": 0,
+      "podDiskAmount": 0.02,
+      "serverlessGpuAmount": 0,
+      "serverlessCpuAmount": 0,
+      "serverlessDiskAmount": 0,
+      "serverlessFeeAmount": 0,
+      "storageStandardAmount": 0.05,
+      "storageHighPerformanceAmount": 0,
+      "endpointAmount": 0,
+      "clusterGpuAmount": 0,
+      "clusterDiskAmount": 0,
+      "clusterNetworkingAmount": 0
+    },
+    {
+      "startTime": "2026-10-08T11:00:00Z",
+      "endTime": "2026-10-08T12:00:00Z",
+      "totalAmount": 0.52,
+      "podGpuAmount": 0.4,
+      "podCpuAmount": 0,
+      "podDiskAmount": 0.02,
+      "serverlessGpuAmount": 0,
+      "serverlessCpuAmount": 0,
+      "serverlessDiskAmount": 0,
+      "serverlessFeeAmount": 0,
+      "storageStandardAmount": 0.1,
+      "storageHighPerformanceAmount": 0,
+      "endpointAmount": 0,
+      "clusterGpuAmount": 0,
+      "clusterDiskAmount": 0,
+      "clusterNetworkingAmount": 0
+    },
+    {
+      "startTime": "2026-10-08T12:00:00Z",
+      "endTime": "2026-10-08T13:00:00Z",
+      "totalAmount": 0,
+      "podGpuAmount": 0,
+      "podCpuAmount": 0,
+      "podDiskAmount": 0,
+      "serverlessGpuAmount": 0,
+      "serverlessCpuAmount": 0,
+      "serverlessDiskAmount": 0,
+      "serverlessFeeAmount": 0,
+      "storageStandardAmount": 0,
+      "storageHighPerformanceAmount": 0,
+      "endpointAmount": 0,
+      "clusterGpuAmount": 0,
+      "clusterDiskAmount": 0,
+      "clusterNetworkingAmount": 0
+    }
+  ],
+  "metadata": {
+    "query": {
+      "startTime": "2026-10-08T10:00:00Z",
+      "endTime": "2026-10-08T13:00:00Z",
+      "bucketSize": "hour"
+    },
+    "recordCount": 3,
+    "totals": {
+      "totalAmount": 0.99,
+      "podGpuAmount": 0.8,
+      "podCpuAmount": 0,
+      "podDiskAmount": 0.04,
+      "serverlessGpuAmount": 0,
+      "serverlessCpuAmount": 0,
+      "serverlessDiskAmount": 0,
+      "serverlessFeeAmount": 0,
+      "storageStandardAmount": 0.15,
+      "storageHighPerformanceAmount": 0,
+      "endpointAmount": 0,
+      "clusterGpuAmount": 0,
+      "clusterDiskAmount": 0,
+      "clusterNetworkingAmount": 0
+    }
+  }
+}

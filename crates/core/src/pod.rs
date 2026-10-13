@@ -48,6 +48,12 @@ pub struct Pod {
     /// the JSON unless set.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub proxy_only: bool,
+    /// The pod's disk in GB — container plus volume — where the listing says (RunPod v1
+    /// `containerDiskInGb + volumeInGb`, v2 `disk + mounts.persistent.size`, Vast
+    /// `disk_space`). What a stopped pod keeps billing for ([`crate::balance`]). Left out of
+    /// the JSON when unknown, like `machine_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_gb: Option<f64>,
 }
 
 /// A provider-reported maintenance window for the host a pod runs on. Times are kept as
@@ -286,6 +292,7 @@ mod tests {
                 machine_id: None,
                 locked: Some(true),
                 proxy_only: false,
+                disk_gb: None,
             },
             Pod { id: "1".into(), name: "devtest-flutter".into(), provider: "hetzner".into(), ..Default::default() },
         ];

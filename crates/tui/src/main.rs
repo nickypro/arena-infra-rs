@@ -16,8 +16,10 @@
 //! deep-checks the cursor pod (or the marked set) in the background and records the
 //! verdicts in that cache; `/` marks pods by the CLI's selector syntax (`apple..delta`).
 //! Every pod SSH call goes through `arena_core::remote::Remote` with a time budget, so a
-//! wedged pod can't hang an action. The summary bar also carries the provider accounts'
-//! balance and runway (`arena balance`'s, read every 5 min in a task of its own).
+//! wedged pod can't hang an action. The summary bar also carries the prepaid accounts'
+//! balance and runway (`arena balance`'s views, observed inline in the refresh's slower
+//! details round — at most one live read per account per 5 min — and recorded in the same
+//! state file the CLI keeps; a low or critical one leads the bar).
 //!
 //! Safety against live prod is built into the *interaction*, not bolted on: a mutating
 //! action always pops a confirmation modal. Lifecycle actions (restart/stop/terminate)
@@ -54,7 +56,7 @@ use ratatui::{
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
-use arena_core::balance::{self, AccountProbe, Burns};
+use arena_core::balance::{self, AccountView, BalanceApi, BalancePolicy, HttpBalanceApi};
 use arena_core::fleet;
 use arena_core::health::{deep_check_command, judge_deep_call, HealthPolicy, PodHealth, DEEP_CHECK_TIMEOUT};
 use arena_core::metrics::{self, PodMetrics, ProbeOpts};
@@ -72,7 +74,7 @@ use arena_core::status::display_status;
 use state::{
     capture_details, dashboard_snapshot, details_due, display_name, health_cell, mark_key, marked_pods,
     marked_set_token, merge_details, names_preview, overlay_details, partial_notice, proxy_cell, proxy_detail,
-    select_marks, short_branch, spark, summarize, summary_text, Action, BalanceRead, Confirm, DeepChecks, FleetSummary,
+    select_marks, short_branch, spark, summarize, summary_text, Action, Confirm, DeepChecks, FleetSummary,
     History, NewPodForm, NpField, PodDetails, ProviderOpt, Tone,
 };
 
@@ -191,12 +193,9 @@ struct Shared {
     action_result: Option<String>,
     /// True while a background action is in flight (so new triggers are ignored).
     action_running: bool,
-    /// The provider accounts as last read by [`balance_loop`] (`None` until the first read).
-    balance: Option<BalanceRead>,
-    /// The fleet's burn per provider from the last listing (billing pods; a provider that
-    /// failed to list is unknown), which the balance's runway is judged against. `None`
-    /// before the first listing.
-    fleet_burns: Option<Burns>,
+    /// The prepaid accounts as last observed in a details round (empty before the first,
+    /// or with no prepaid key configured).
+    balance: Vec<AccountView>,
 }
 
 impl Shared {
@@ -282,19 +281,11 @@ async fn main() -> Result<()> {
     let details_wanted = Arc::new(AtomicBool::new(false));
     let remote: Arc<dyn Remote> = Arc::new(SshRemote);
 
-    // The account balances for the summary bar, on their own slow cadence and in their own
-    // task: a stalled billing API never holds up a refresh. A bad BALANCE_WARN_HOURS falls
-    // back to the default here (`arena balance` is the place that refuses it).
-    let (warn_hours, _) = balance::warn_hours_or_default(&cfg);
-    let balance_cfg = cfg.clone();
-    tokio::spawn(balance_loop(
-        move || {
-            let cfg = balance_cfg.clone();
-            async move { balance::fetch_all(&cfg, balance::FETCH_TIMEOUT).await }
-        },
-        warn_hours,
-        shared.clone(),
-    ));
+    // The prepaid balances for the summary bar: observed in the refresh's details round
+    // (bounded, quiet), recorded in the CLI's state file. A bad BALANCE_WARN_HOURS falls
+    // back to the default (`arena balance` is the place that says so).
+    let (policy, _) = BalancePolicy::from_config(&cfg);
+    let balance = BalanceCtx::new(Arc::new(HttpBalanceApi::from_config(&cfg)), balance_state_path(&cfg).and_then(Result::ok), policy);
 
     // Background fetcher: keeps `shared` fresh without blocking the UI.
     tokio::spawn(fetch_loop(
@@ -304,6 +295,7 @@ async fn main() -> Result<()> {
         progress_cmd,
         shared.clone(),
         Cadence { interval: interval.clone(), nudge: nudge.clone(), details_wanted: details_wanted.clone() },
+        Some(balance),
     ));
 
     let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena").to_string();
@@ -344,6 +336,7 @@ async fn fetch_loop(
     progress_cmd: Option<String>,
     shared: Arc<Mutex<Shared>>,
     cadence: Cadence,
+    balance: Option<BalanceCtx>,
 ) {
     // The per-pod probe gathers GPU stats + branch + setup health in one SSH call.
     let repo_path = cfg.get("BACKUP_REPO_PATH").map(String::from).unwrap_or_else(|| {
@@ -354,7 +347,7 @@ async fn fetch_loop(
         repo_path: Some(repo_path),
         key_remote: Some(cfg.get("GIT_SSH_KEY_REMOTE").unwrap_or("/root/.ssh/id_ed25519").to_string()),
     };
-    let mut details = DetailsState::default();
+    let mut details = DetailsState { balance, ..Default::default() };
     loop {
         shared.lock().unwrap().refreshing = true;
         let forced = cadence.details_wanted.swap(false, Ordering::Relaxed);
@@ -368,22 +361,6 @@ async fn fetch_loop(
     }
 }
 
-/// The summary bar's account balances: read at once, then every [`state::BALANCE_EVERY`]
-/// (`read` is `balance::fetch_all` for real, each provider within its `FETCH_TIMEOUT`;
-/// scripted in tests). Read-only API calls only, and none at all when no provider key is
-/// configured.
-async fn balance_loop<F, Fut>(read: F, warn_hours: f64, shared: Arc<Mutex<Shared>>)
-where
-    F: Fn() -> Fut,
-    Fut: std::future::Future<Output = Vec<AccountProbe>>,
-{
-    loop {
-        let probes = read().await;
-        shared.lock().unwrap().balance = Some(BalanceRead { probes, warn_hours });
-        tokio::time::sleep(state::BALANCE_EVERY).await;
-    }
-}
-
 /// What the refresh remembers between rounds about the provider's details query.
 #[derive(Default)]
 struct DetailsState {
@@ -393,6 +370,63 @@ struct DetailsState {
     last: Option<tokio::time::Instant>,
     /// Why the last query's answer is incomplete, if it is.
     warning: Option<String>,
+    /// The prepaid balances, observed on the details cadence (`None`: not shown — tests).
+    balance: Option<BalanceCtx>,
+}
+
+/// What the summary bar's balance reads with: the reads, the state file the CLI keeps too
+/// (`None`: live readings only) and the threshold — plus the state as last applied here,
+/// so a state file that can't be saved never makes every round read live again.
+struct BalanceCtx {
+    api: Arc<dyn BalanceApi>,
+    path: Option<PathBuf>,
+    policy: BalancePolicy,
+    /// The state as this dashboard last applied it.
+    memory: Option<balance::BalanceState>,
+    /// When the balance was last observed (tokio's clock).
+    last: Option<tokio::time::Instant>,
+}
+
+impl BalanceCtx {
+    fn new(api: Arc<dyn BalanceApi>, path: Option<PathBuf>, policy: BalancePolicy) -> Self {
+        BalanceCtx { api, path, policy, memory: None, last: None }
+    }
+
+    /// The state to observe against: the file's, unless what this dashboard last applied
+    /// is newer (the file couldn't be written, or another writer lost a race).
+    fn state(&self) -> balance::BalanceState {
+        let (file, _) = balance::load_opt(self.path.as_deref());
+        let newest = |s: &balance::BalanceState| s.accounts.values().filter_map(|a| a.last_live_attempt()).max();
+        match &self.memory {
+            Some(m) if newest(m) > newest(&file) => m.clone(),
+            _ => file,
+        }
+    }
+}
+
+/// Observe the prepaid balances (inline: ≤ INLINE_TIMEOUT, a live read only when the last
+/// attempt is FRESH old), quiet whatever happens to them.
+async fn observe_balance(b: &BalanceCtx, now: u64) -> (balance::BalanceState, Vec<balance::Fetched>) {
+    let state = b.state();
+    let fetched = balance::observe(b.api.as_ref(), &state, balance::Mode::Inline, balance::INLINE_TIMEOUT, now).await;
+    (state, fetched)
+}
+
+/// Record what was observed against this listing's burns (unknown for a provider that
+/// failed to list — every one, when none answered) and judge it.
+fn balance_views(
+    b: &mut BalanceCtx,
+    (state, fetched): (balance::BalanceState, Vec<balance::Fetched>),
+    listing: &Listing,
+    pods: &[Pod],
+    now: u64,
+) -> Vec<AccountView> {
+    let burns = balance::burns_with(listing, pods, &state, &b.policy);
+    let (state, _) = balance::commit(b.path.as_deref(), state, &fetched, &burns, balance::Mode::Inline, now);
+    let views = balance::views(&state, &fetched, &burns, &b.policy, balance::Mode::Inline, now);
+    b.memory = Some(state);
+    b.last = Some(tokio::time::Instant::now());
+    views
 }
 
 /// One refresh: list pods (per provider, so a provider that failed is known — not just
@@ -413,36 +447,61 @@ async fn refresh(
     forced: bool,
 ) {
     let listing = Listing::from_results(provider.list_by_provider().await);
+    let now = snapshot::unix_now();
+    // The prepaid balances on the details cadence (every DETAILS_EVERY, or `r` after the
+    // minimum gap) — and FRESH keeps live reads to one per account per 5 min however often.
+    let balance_due = details.balance.as_ref().is_some_and(|b| details_due(b.last.map(|t| t.elapsed()), forced));
     if !listing.any_ok() {
-        // Keep the last known pods on screen; just report the error.
+        // Keep the last known pods on screen; just report the error. The balance is still
+        // observed and aged — with every burn unknown, from the provider's rate or the last
+        // sample, else `?` — never frozen at its last value.
+        let views = match details.balance.as_mut().filter(|_| balance_due) {
+            Some(b) => {
+                let seen = observe_balance(b, now).await;
+                Some(balance_views(b, seen, &listing, &[], now))
+            }
+            None => None,
+        };
         let errs: Vec<String> = listing.errors().iter().map(|(p, e)| format!("{p}: {e}")).collect();
         let mut s = shared.lock().unwrap();
         s.status = format!("list error: {}", errs.join("; "));
+        if let Some(v) = views {
+            s.balance = v;
+        }
         s.refreshing = false;
         return;
     }
     let partial: Vec<String> = listing.errors().iter().map(|(p, _)| p.to_string()).collect();
     let mut pods = listing.pods();
-    let metrics = if details_due(details.last.map(|t| t.elapsed()), forced) {
+    let observing = async {
+        match details.balance.as_ref().filter(|_| balance_due) {
+            Some(b) => Some(observe_balance(b, now).await),
+            None => None,
+        }
+    };
+    let (metrics, observed) = if details_due(details.last.map(|t| t.elapsed()), forced) {
         let mut enriched = pods.clone();
-        let (metrics, failed) =
-            tokio::join!(fetch_metrics(remote, &pods, cfg, opts), enrich_bounded(provider, &mut enriched));
+        let (metrics, failed, seen) =
+            tokio::join!(fetch_metrics(remote, &pods, cfg, opts), enrich_bounded(provider, &mut enriched), observing);
         // A query that failed part-way still shows what it filled (as `pods list` does),
         // over the last good details rather than instead of them (`state::merge_details`).
         merge_details(&mut details.details, capture_details(&enriched), failed.is_none());
         details.warning = failed;
         details.last = Some(tokio::time::Instant::now());
-        metrics
+        (metrics, seen)
     } else {
-        fetch_metrics(remote, &pods, cfg, opts).await
+        tokio::join!(fetch_metrics(remote, &pods, cfg, opts), observing)
     };
     overlay_details(&mut pods, &details.details);
     // The balance's runway is judged against what is billing as listed (not the pending
-    // placeholders), a provider that failed to list counting as unknown.
-    let burns = balance::burns(&pods, &partial);
+    // placeholders, and after the details filled the prices), a provider that failed to
+    // list counting as unknown — never as $0/h.
+    let balance_views = match (observed, details.balance.as_mut()) {
+        (Some(seen), Some(b)) => Some(balance_views(b, seen, &listing, &pods, now)),
+        _ => None,
+    };
     let (proxy, proxy_warning) = snapshot::local_proxy_text(cfg);
     let (file_health, health_warning) = load_health(cfg);
-    let now = snapshot::unix_now();
 
     let mut guard = shared.lock().unwrap();
     let s = &mut *guard;
@@ -470,7 +529,9 @@ async fn refresh(
         [&details.warning, &proxy_warning, &health_warning].into_iter().flatten().map(String::as_str).collect();
     s.status = status_line(&s.summary, &warnings);
     s.metrics = metrics;
-    s.fleet_burns = Some(burns);
+    if let Some(v) = balance_views {
+        s.balance = v;
+    }
     s.publish(snap);
     s.last_refresh = Some(Instant::now());
     s.refreshing = false;
@@ -496,6 +557,15 @@ fn health_cache_path(cfg: &Config) -> Option<std::result::Result<PathBuf, String
         return None;
     }
     Some(snapshot::health_cache_path_for(cfg))
+}
+
+/// Where the balance state lives — the CLI's file ([`snapshot::BALANCE_FILE`] beside the
+/// health cache), under the same test guard as [`health_cache_path`].
+fn balance_state_path(cfg: &Config) -> Option<std::result::Result<PathBuf, String>> {
+    if cfg!(test) && cfg.get("ARENA_STATE_DIR").is_none() {
+        return None;
+    }
+    Some(snapshot::state_file_path_for(cfg, snapshot::BALANCE_FILE))
 }
 
 /// The health cache as it stands (an empty one when there is none or it can't be read),
@@ -1891,16 +1961,16 @@ fn render_select(f: &mut Frame, value: &str) {
 }
 
 /// The summary bar (`state::summary_text`): counts, then the fleet's burn from the
-/// snapshot's core `FleetCost`, worded as `pods list`'s footer, then the account balance —
+/// snapshot's core `FleetCost`, worded as `pods list`'s footer, then the prepaid balances —
 /// led, in yellow, by which provider failed to list when one did (the totals after it are
-/// then a floor), and, in red, by the balance when an account needs a top-up.
+/// then a floor), and by a low (yellow) or critical (red) balance.
 fn summary_line(s: &Shared) -> Paragraph<'static> {
-    let balance = s.balance.as_ref().and_then(|b| b.line(s.fleet_burns.as_ref(), snapshot::unix_now()));
-    let text = summary_text(&s.summary, &s.snap.cost, &s.snap.partial, balance.as_ref());
+    let text = summary_text(&s.summary, &s.snap.cost, &s.snap.partial, &s.balance);
+    let (lead, _, _) = balance::tui_parts(&s.balance);
     let mut rest = text.as_str();
     let mut spans = Vec::new();
-    for (notice, tone) in [(partial_notice(&s.snap.partial), Tone::Warn), (state::balance_notice(balance.as_ref()), Tone::Bad)] {
-        if let Some(n) = notice.filter(|n| rest.starts_with(n.as_str())) {
+    for (notice, tone) in [(partial_notice(&s.snap.partial), Some(Tone::Warn)), (lead, state::balance_tone(&s.balance))] {
+        if let (Some(n), Some(tone)) = (notice.filter(|n| rest.starts_with(n.as_str())), tone) {
             rest = &rest[n.len()..];
             spans.push(Span::styled(n, tone_style(tone)));
         }
@@ -3255,77 +3325,173 @@ deep_check_end=1
         assert_eq!(columns_that_fit(45, &core, &[9, 1]), 0);
     }
 
-    /// The account balance in the summary bar: at its end while it needs nothing; in red
-    /// right at its front when an account needs a top-up, so a narrow terminal still shows
-    /// it. Judged against the fleet as listed (alpha $0.17 + bravo $0.25 billing on RunPod).
-    #[test]
-    fn the_summary_bar_shows_the_balance_and_leads_with_a_top_up_warning() {
-        use arena_core::balance::Account;
-        let mut shared = fixture_shared();
-        shared.fleet_burns = Some(balance::burns(&shared.pods, &[]));
-        let read = |b: f64| BalanceRead {
-            probes: vec![
-                AccountProbe {
-                    provider: "runpod".into(),
-                    account: Ok(Account::Prepaid { balance: b, provider_per_hr: Some(0.0), spend_limit_per_hr: None, under_balance: None, owed: None }),
-                },
-                AccountProbe { provider: "hetzner".into(), account: Ok(Account::Postpaid) },
-            ],
-            warn_hours: 48.0,
-        };
-        let ui = ui(cfg(""), Arc::new(FakeRemote::new()));
-        // No read yet: no balance at all.
-        let bar = |shared: &Shared, w: u16| draw(w, 12, shared, &ui).into_iter().find(|l| l.contains(" pods · ")).unwrap();
-        assert!(!bar(&shared, 240).contains("balance"));
-        shared.balance = Some(read(100.0)); // 100 / 0.42 = 238h
-        let wide = bar(&shared, 240);
-        assert!(wide.contains("€0.13/day  ·  balance: runpod $100.00 ~9.9d · hetzner postpaid"), "{wide}");
-        shared.balance = Some(read(10.0)); // ~23h, under 48
-        for w in [80, 120] {
-            let narrow = bar(&shared, w);
-            assert!(narrow.starts_with(" balance: ⚠ runpod $10.00 ~23h · hetzner postpaid · 4 pods"), "{w}: {narrow}");
-        }
-        // Red, as a ⚠ that stops every pod deserves.
-        let mut t = Terminal::new(TestBackend::new(120, 12)).unwrap();
-        t.draw(|f| view(f, &shared, &ui, 5)).unwrap();
-        let buf = t.backend().buffer();
-        let y = (0..12).find(|&y| (0..120).map(|x| buf[(x, y)].symbol()).collect::<String>().contains(" pods · ")).unwrap();
-        assert_eq!(buf[(3, y)].fg, Color::Red, "the warning is red");
+    /// Prepaid accounts read live now at `rate`/h: `(account, USD, rate)`.
+    fn live_views(accounts: &[(balance::Account, f64, f64)]) -> Vec<AccountView> {
+        let fetched: Vec<balance::Fetched> = accounts
+            .iter()
+            .map(|&(account, usd, rate)| balance::Fetched {
+                account,
+                key_fp: "fp".into(),
+                live: Some(Ok(balance::Live { usd, provider_burn_per_hr: Some(rate), spend_limit_per_hr: None, under_balance: None, reduced: false, owed: None })),
+                billed: None,
+            })
+            .collect();
+        balance::views(&balance::BalanceState::default(), &fetched, &balance::Burns::new(), &BalancePolicy::default(), balance::Mode::Inline, NOW)
     }
 
-    /// The balances are read at once, then every BALANCE_EVERY — not on each refresh.
-    #[tokio::test(start_paused = true)]
-    async fn balances_are_read_on_their_own_slow_cadence() {
-        let reads = Arc::new(AtomicUsize::new(0));
-        let shared = Arc::new(Mutex::new(Shared::default()));
-        let counter = reads.clone();
-        let task = tokio::spawn(balance_loop(
-            move || {
-                let n = counter.fetch_add(1, Ordering::SeqCst);
-                async move {
-                    vec![AccountProbe { provider: "runpod".into(), account: Err(format!("read {n}")) }]
-                }
-            },
-            12.0,
-            shared.clone(),
-        ));
-        let settle = || async {
-            for _ in 0..5 {
-                tokio::task::yield_now().await;
-            }
+    /// The prepaid balance in the summary bar: at its end while it needs nothing; right at
+    /// its front when an account is low (yellow) or critical (red), so a narrow terminal
+    /// still shows it.
+    #[test]
+    fn the_summary_bar_shows_the_balance_and_leads_with_a_low_one() {
+        use balance::Account;
+        let mut shared = fixture_shared();
+        let ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        let bar = |shared: &Shared, w: u16| draw(w, 12, shared, &ui).into_iter().find(|l| l.contains(" pods · ")).unwrap();
+        // Nothing observed yet: no balance at all.
+        assert!(!bar(&shared, 240).contains("balance"));
+        shared.balance = live_views(&[(Account::Runpod, 100.0, 0.42)]); // ≈238h
+        let wide = bar(&shared, 240);
+        assert!(wide.contains("€0.13/day  ·  balance: runpod $100.00 ≈9.9d"), "{wide}");
+        // The colour of the lead: yellow when low, red when critical.
+        let lead_colour = |shared: &Shared| {
+            let mut t = Terminal::new(TestBackend::new(120, 12)).unwrap();
+            t.draw(|f| view(f, shared, &ui, 5)).unwrap();
+            let buf = t.backend().buffer().clone();
+            let y = (0..12).find(|&y| (0..120).map(|x| buf[(x, y)].symbol()).collect::<String>().contains(" pods · ")).unwrap();
+            buf[(3, y)].fg
         };
-        settle().await;
-        assert_eq!(reads.load(Ordering::SeqCst), 1, "read at start");
-        let got = shared.lock().unwrap().balance.clone().unwrap();
-        assert_eq!((got.warn_hours, got.probes[0].account.clone()), (12.0, Err("read 0".to_string())));
-        tokio::time::advance(state::BALANCE_EVERY - Duration::from_secs(1)).await;
-        settle().await;
-        assert_eq!(reads.load(Ordering::SeqCst), 1, "not before BALANCE_EVERY");
-        tokio::time::advance(Duration::from_secs(1)).await;
-        settle().await;
-        assert_eq!(reads.load(Ordering::SeqCst), 2);
-        assert_eq!(shared.lock().unwrap().balance.as_ref().unwrap().probes[0].account, Err("read 1".to_string()));
-        task.abort();
+        shared.balance = live_views(&[(Account::Runpod, 20.0, 0.42)]); // ≈47h, under 72
+        for w in [80, 120] {
+            let narrow = bar(&shared, w);
+            assert!(narrow.starts_with(" ⚠ runpod balance ≈47h · 4 pods"), "{w}: {narrow}");
+        }
+        assert_eq!(lead_colour(&shared), Color::Yellow);
+        shared.balance = live_views(&[(Account::Runpod, 5.0, 0.42)]); // ≈11h
+        assert!(bar(&shared, 80).starts_with(" ‼ runpod balance ≈11h · 4 pods"));
+        assert_eq!(lead_colour(&shared), Color::Red, "the warning is red");
+    }
+
+    /// The balance is observed in the details round (every DETAILS_EVERY, or `r` after the
+    /// minimum gap) — never on each refresh — and a live read happens at most once per FRESH
+    /// however often that is: the state file remembers the last attempt.
+    #[tokio::test(start_paused = true)]
+    async fn balance_is_observed_on_the_details_cadence() {
+        use balance::{Account, FakeBalanceApi, Live};
+        let dir = tmp("balance-cadence");
+        let cfg = cfg("");
+        let provider = FakeFleet {
+            pods: vec![pod("alpha", "runpod", "rp1", 1, None)],
+            lists: AtomicUsize::new(0),
+            details: AtomicUsize::new(0),
+            details_error: None,
+        };
+        let api = Arc::new(FakeBalanceApi::new().live_ok(
+            Account::Runpod,
+            Live { usd: 100.0, provider_burn_per_hr: None, spend_limit_per_hr: None, under_balance: None, reduced: false, owed: None },
+        ));
+        let ctx = BalanceCtx::new(api.clone(), Some(dir.0.join("devtest").join(snapshot::BALANCE_FILE)), BalancePolicy::default());
+        let remote: Arc<dyn Remote> = Arc::new(FakeRemote::new());
+        let shared = Mutex::new(Shared::default());
+        let mut details = DetailsState { balance: Some(ctx), ..Default::default() };
+        let opts = ProbeOpts::default();
+        refresh(&provider, &remote, &cfg, &opts, &shared, &mut details, false).await;
+        assert_eq!(api.live_calls(), 1, "the first round reads it");
+        {
+            let s = shared.lock().unwrap();
+            assert_eq!((s.balance.len(), s.balance[0].balance), (1, Some(100.0)));
+            // Judged against the same listing, after the details filled alpha's $0.17.
+            assert_eq!(s.balance[0].listed_per_hr, Some(0.17));
+        }
+        // An ordinary refresh: no balance work at all.
+        refresh(&provider, &remote, &cfg, &opts, &shared, &mut details, false).await;
+        assert_eq!(api.live_calls(), 1);
+        // The next details round (and `r` after the gap) observe again — but the reading is
+        // younger than FRESH, so no live call: still shown, from the state file.
+        tokio::time::advance(state::DETAILS_EVERY).await;
+        refresh(&provider, &remote, &cfg, &opts, &shared, &mut details, false).await;
+        tokio::time::advance(state::DETAILS_MIN_GAP).await;
+        refresh(&provider, &remote, &cfg, &opts, &shared, &mut details, true).await;
+        assert_eq!(api.live_calls(), 1, "at most one live read per FRESH");
+        assert_eq!(shared.lock().unwrap().balance[0].balance, Some(100.0));
+    }
+
+    /// A fleet whose every provider fails to list.
+    struct Down;
+
+    #[async_trait::async_trait]
+    impl Provider for Down {
+        fn name(&self) -> &'static str {
+            "runpod"
+        }
+        fn describe(&self, _spec: &PodSpec) -> String {
+            String::new()
+        }
+        async fn list_pods(&self) -> arena_core::Result<Vec<Pod>> {
+            Err(arena_core::Error::provider("list pods HTTP 503"))
+        }
+        async fn list_by_provider(&self) -> Vec<(String, arena_core::Result<Vec<Pod>>)> {
+            vec![("runpod".into(), Err(arena_core::Error::provider("list pods HTTP 503")))]
+        }
+        async fn create_pod(&self, _spec: &PodSpec) -> arena_core::Result<Pod> {
+            panic!("a refresh must never create a pod")
+        }
+        async fn stop_pod(&self, _id: &str) -> arena_core::Result<()> {
+            panic!("a refresh must never stop a pod")
+        }
+        async fn restart_pod(&self, _id: &str) -> arena_core::Result<()> {
+            panic!("a refresh must never restart a pod")
+        }
+        async fn terminate_pod(&self, _id: &str) -> arena_core::Result<()> {
+            panic!("a refresh must never terminate a pod")
+        }
+    }
+
+    fn rp_live(usd: f64, rate: f64) -> balance::Live {
+        balance::Live { usd, provider_burn_per_hr: Some(rate), spend_limit_per_hr: None, under_balance: None, reduced: false, owed: None }
+    }
+
+    /// BS8: with every provider failing to list, the balance is still observed on its
+    /// cadence and shown afresh — not the last views frozen on screen.
+    #[tokio::test(start_paused = true)]
+    async fn balance_is_observed_even_when_every_listing_fails() {
+        use balance::{Account, FakeBalanceApi};
+        let dir = tmp("balance-down");
+        let api = Arc::new(FakeBalanceApi::new().live_ok(Account::Runpod, rp_live(40.0, 0.5)));
+        let ctx = BalanceCtx::new(api.clone(), Some(dir.0.join("devtest").join(snapshot::BALANCE_FILE)), BalancePolicy::default());
+        let mut details = DetailsState { balance: Some(ctx), ..Default::default() };
+        let shared = Mutex::new(Shared { balance: live_views(&[(Account::Runpod, 100.0, 0.5)]), ..Default::default() });
+        let remote: Arc<dyn Remote> = Arc::new(FakeRemote::new());
+        refresh(&Down, &remote, &cfg(""), &ProbeOpts::default(), &shared, &mut details, false).await;
+        let s = shared.lock().unwrap();
+        assert!(s.status.starts_with("list error"), "{}", s.status);
+        assert_eq!((s.balance.len(), s.balance[0].balance), (1, Some(40.0)), "observed afresh, not the old $100");
+        // Burns unknown (nothing listed): the provider's own rate is the burn.
+        assert_eq!(s.balance[0].burn.map(|b| b.per_hr), Some(0.5));
+        assert_eq!(api.live_calls(), 1);
+    }
+
+    /// BS6 for the dashboard: with no state file at all, what it applied last keeps live
+    /// reads to one per FRESH — and the reading stays on screen between them.
+    #[tokio::test(start_paused = true)]
+    async fn without_a_state_file_live_is_still_read_once_per_fresh() {
+        use balance::{Account, FakeBalanceApi};
+        let provider = FakeFleet {
+            pods: vec![pod("alpha", "runpod", "rp1", 1, None)],
+            lists: AtomicUsize::new(0),
+            details: AtomicUsize::new(0),
+            details_error: None,
+        };
+        let api = Arc::new(FakeBalanceApi::new().live_ok(Account::Runpod, rp_live(40.0, 0.5)));
+        let mut details = DetailsState { balance: Some(BalanceCtx::new(api.clone(), None, BalancePolicy::default())), ..Default::default() };
+        let shared = Mutex::new(Shared::default());
+        let remote: Arc<dyn Remote> = Arc::new(FakeRemote::new());
+        for _ in 0..3 {
+            refresh(&provider, &remote, &cfg(""), &ProbeOpts::default(), &shared, &mut details, false).await;
+            tokio::time::advance(state::DETAILS_EVERY).await;
+        }
+        assert_eq!(api.live_calls(), 1, "one live read in three rounds");
+        assert_eq!(shared.lock().unwrap().balance[0].balance, Some(40.0));
     }
 
     /// A provider that failed to list is said at the front of the summary bar, so it is on
@@ -3767,14 +3933,9 @@ deep_check_end=1
             assert_eq!(health_cell(a.health.as_ref(), false, s.snap.generated_at).0, "pass 10m");
             assert!(b.health.is_none());
             assert_eq!(s.snap.partial, ["vast"]);
-            let summary = summary_text(&s.summary, &s.snap.cost, &s.snap.partial, None);
+            let summary = summary_text(&s.summary, &s.snap.cost, &s.snap.partial, &[]);
             assert!(summary.contains("fleet: $0.17/h across 2 billing pod(s) (1 unpriced)"), "{summary}");
             assert!(summary.starts_with(" ⚠ vast failed to list — its pods (and their cost) are missing"), "{summary}");
-            // The balance's runway is judged against the same listing: RunPod's billing
-            // pods, and Vast — which failed to list — unknown rather than idle.
-            let burns = s.fleet_burns.as_ref().expect("set by the refresh");
-            assert_eq!(burns.of("runpod").map(|b| b.billing), Some(2));
-            assert_eq!(burns.of("vast"), None);
         }
         assert_eq!(alpha_row(&shared), ("$0.17".to_string(), true));
         assert_eq!(calls(), (1, 1), "the first refresh fills the details");
@@ -3821,7 +3982,7 @@ deep_check_end=1
         assert_eq!(alpha.gpu_type.as_deref(), Some("RTX A4000"));
         assert!(s.status.contains("⚠ pod details incomplete: ") && s.status.contains("some field errored"), "{}", s.status);
         // The fleet total counts the price it got.
-        assert!(summary_text(&s.summary, &s.snap.cost, &s.snap.partial, None).contains("$0.17/h"));
+        assert!(summary_text(&s.summary, &s.snap.cost, &s.snap.partial, &[]).contains("$0.17/h"));
     }
 
     /// The dashboard's deep check is `pods test --deep`'s: the same script in one exec per

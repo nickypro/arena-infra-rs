@@ -42,6 +42,18 @@ pub(crate) async fn send_ok(rb: RequestBuilder, ctx: &str) -> Result<()> {
     Err(status_error(status, &text, ctx))
 }
 
+/// Send `rb` and hand back its status and body text, unjudged — for a caller with its own
+/// reading of failures (`balance::classify`, which sorts them into transient / auth / gone /
+/// drift and must never quote a body). Status first, as everywhere here: an error status's
+/// body is read best-effort, so a body that can't be read never hides the status; on a 2xx
+/// a body that can't be read is an error. Only a transport failure is `Err`.
+pub(crate) async fn send_text(rb: RequestBuilder) -> Result<(StatusCode, String)> {
+    let resp = rb.send().await?;
+    let status = resp.status();
+    let text = if status.is_success() { resp.text().await? } else { resp.text().await.unwrap_or_default() };
+    Ok((status, text))
+}
+
 /// Turn one response (status + raw body) into its JSON body or a classified error. Pure,
 /// so the status handling is table-tested.
 ///
@@ -280,5 +292,23 @@ mod tests {
             *srv.requests.lock().unwrap(),
             ["GET /pods HTTP/1.1", "GET /pods HTTP/1.1", "POST /pods/a/stop HTTP/1.1", "DELETE /pods/a HTTP/1.1"]
         );
+    }
+
+    /// `send_text` hands back any status with its body, unjudged; only a transport failure
+    /// (here: the server hanging up) is an error.
+    #[tokio::test]
+    async fn send_text_returns_status_and_body_and_errs_only_on_transport() {
+        use super::test_server::hang_up;
+        let srv = serve(vec![
+            canned(503, "text/html", "<html>down</html>"),
+            canned(200, "application/json", r#"{"ok":1}"#),
+            hang_up(),
+        ]);
+        let c = client();
+        let (s, t) = send_text(c.get(format!("{}/x", srv.base))).await.unwrap();
+        assert_eq!((s.as_u16(), t.as_str()), (503, "<html>down</html>"));
+        let (s, t) = send_text(c.get(format!("{}/x", srv.base))).await.unwrap();
+        assert_eq!((s.as_u16(), t.as_str()), (200, r#"{"ok":1}"#));
+        assert!(send_text(c.get(format!("{}/x", srv.base))).await.is_err());
     }
 }

@@ -177,6 +177,17 @@ fn list_request(client: &Client, api_key: &str, cursor: Option<&str>) -> Request
     api_request(client, api_key, Method::GET, base_url("pods")).query(&query)
 }
 
+/// The account's spend history ([`crate::balance`]): `GET {base}/billing` in hourly buckets
+/// from `from` to `to` (Unix seconds, sent as RFC 3339; RunPod snaps the start down and the
+/// end up to the hour). Every billable resource on the account — pods, disks, volumes,
+/// serverless — which is what lets an estimate see spend arena doesn't list. Read-only, key
+/// in the header only. `base` is [`BASE`] or a loopback test server.
+pub(crate) fn billing_request(client: &Client, base: &str, api_key: &str, from: u64, to: u64) -> RequestBuilder {
+    let url = format!("{}/billing", base.trim_end_matches('/'));
+    let (start, end) = (crate::snapshot::rfc3339(from), crate::snapshot::rfc3339(to));
+    client.get(url).bearer_auth(api_key).query(&[("bucketSize", "hour"), ("startTime", &start), ("endTime", &end)])
+}
+
 /// The GPU catalog with prices and pod stock for one cloud tier — the stock counted over
 /// hosts at or above `min_cuda` when there is a floor (the hosts a create would accept,
 /// finding #31: a stock hint over hosts we'd never be placed on misleads).
@@ -414,6 +425,8 @@ fn parse_pod(v: &Value) -> Pod {
         // read from here, never inferred from `actions`, which still lists them.
         locked: v.get("locked").and_then(Value::as_bool),
         proxy_only,
+        // `disk` is the container disk; a persistent volume is `mounts.persistent.size`.
+        disk_gb: runpod::disk_sum(&[v.get("disk"), v.pointer("/mounts/persistent/size")]),
     }
 }
 
@@ -1094,6 +1107,8 @@ mod tests {
                 machine_id: None,
                 locked: Some(false),
                 proxy_only: false,
+                // `disk` 100 + the persistent volume's 20.
+                disk_gb: Some(120.0),
             }
         );
     }

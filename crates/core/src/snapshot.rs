@@ -334,15 +334,18 @@ fn path_component(prefix: &str) -> String {
     }
 }
 
-/// Where the health cache lives: `$ARENA_STATE_DIR/<prefix>/health.json`, else
-/// `$XDG_STATE_HOME/arena/<prefix>/health.json`, else
-/// `~/.local/state/arena/<prefix>/health.json`. Scoped by `MACHINE_NAME_PREFIX` so the
-/// sandbox (`devtest`) and production (`arena9`) never read or prune each other's records,
-/// even with one state directory. `lookup` reads a variable (the CLI: config, then the
-/// environment), so this is pure. A relative `XDG_STATE_HOME` is ignored (the XDG spec
-/// says so); a relative `ARENA_STATE_DIR` is refused — a cron job and a shell would
-/// resolve it to different places.
-pub fn health_cache_path(prefix: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
+/// The balance state's file name (`crate::balance`), next to the health cache.
+pub const BALANCE_FILE: &str = "balance.json";
+
+/// Where a per-fleet state file lives: `$ARENA_STATE_DIR/<prefix>/<file>`, else
+/// `$XDG_STATE_HOME/arena/<prefix>/<file>`, else `~/.local/state/arena/<prefix>/<file>`.
+/// Scoped by `MACHINE_NAME_PREFIX` so the sandbox (`devtest`) and production (`arena9`)
+/// never read or prune each other's records, even with one state directory. `lookup` reads
+/// a variable (the CLI: config, then the environment), so this is pure. A relative
+/// `XDG_STATE_HOME` is ignored (the XDG spec says so); a relative `ARENA_STATE_DIR` is
+/// refused — a cron job and a shell would resolve it to different places. `file` is one of
+/// this crate's own names ([`HEALTH_CACHE_FILE`], [`BALANCE_FILE`]), never user input.
+pub fn state_file_path(prefix: &str, file: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
     let set = |k: &str| lookup(k).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
     let root = if let Some(dir) = set("ARENA_STATE_DIR") {
         let dir = PathBuf::from(dir);
@@ -356,19 +359,29 @@ pub fn health_cache_path(prefix: &str, lookup: impl Fn(&str) -> Option<String>) 
         let home = set("HOME").ok_or("no ARENA_STATE_DIR, XDG_STATE_HOME or HOME to keep it in")?;
         PathBuf::from(home).join(".local").join("state").join("arena")
     };
-    Ok(root.join(path_component(prefix)).join(HEALTH_CACHE_FILE))
+    Ok(root.join(path_component(prefix)).join(path_component(file)))
 }
 
-/// [`health_cache_path`] for a loaded config, as every surface resolves it: the fleet
-/// prefix and `ARENA_STATE_DIR` from the config (which also takes it from the
-/// environment), the XDG/`HOME` fallbacks from the environment. One function, so the CLI
-/// that writes the cache and the dashboard that reads it can't look in different places.
-pub fn health_cache_path_for(cfg: &Config) -> Result<PathBuf, String> {
+/// [`state_file_path`] for a loaded config, as every surface resolves it: the fleet prefix
+/// and `ARENA_STATE_DIR` from the config (which also takes it from the environment), the
+/// XDG/`HOME` fallbacks from the environment. One function, so the CLI that writes a state
+/// file and the dashboard that reads it can't look in different places.
+pub fn state_file_path_for(cfg: &Config, file: &str) -> Result<PathBuf, String> {
     let prefix = cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena");
-    health_cache_path(prefix, |k| match k {
+    state_file_path(prefix, file, |k| match k {
         "ARENA_STATE_DIR" => cfg.get(k).map(String::from),
         _ => std::env::var(k).ok(),
     })
+}
+
+/// Where the health cache lives ([`state_file_path`] with [`HEALTH_CACHE_FILE`]).
+pub fn health_cache_path(prefix: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
+    state_file_path(prefix, HEALTH_CACHE_FILE, lookup)
+}
+
+/// [`health_cache_path`] for a loaded config ([`state_file_path_for`]).
+pub fn health_cache_path_for(cfg: &Config) -> Result<PathBuf, String> {
+    state_file_path_for(cfg, HEALTH_CACHE_FILE)
 }
 
 impl HealthCache {
@@ -451,13 +464,13 @@ impl HealthCache {
 }
 
 #[cfg(unix)]
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
 }
 
 #[cfg(not(unix))]
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)
 }
 
@@ -602,6 +615,14 @@ pub struct FleetSnapshot {
     pub cost: FleetCost,
     /// Providers that failed to list: their pods are missing from `pods` (and `cost`).
     pub partial: Vec<String>,
+    /// The prepaid accounts as the balance state file last saw them (`crate::balance`,
+    /// cache only — building a snapshot makes no balance call). Filled by the caller;
+    /// internal only: [`PublicSnapshot`] has no such field.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub balance: Vec<crate::balance::AccountView>,
+    /// The threshold the balance was judged against (for its footer's words).
+    #[serde(skip)]
+    pub balance_policy: crate::balance::BalancePolicy,
 }
 
 /// The MACHINE_NAME_LIST entry whose qualified name is `name` (first one, like the proxy's
@@ -665,6 +686,8 @@ pub fn build(
         pods: pods_out,
         cost: fleet::fleet_cost(pods),
         partial: partial.to_vec(),
+        balance: Vec::new(),
+        balance_policy: Default::default(),
     }
 }
 
@@ -847,8 +870,11 @@ pub fn health_label(h: Option<&HealthRecord>, now: u64) -> String {
 /// HEALTH before MAINT, then the fleet cost footer and, for a partial listing, which
 /// providers are missing.
 pub fn render_table(snap: &FleetSnapshot) -> String {
+    let balance = crate::balance::footer_line(&snap.balance, &snap.balance_policy, snap.generated_at)
+        .map(|l| format!("{l}\n"))
+        .unwrap_or_default();
     if snap.pods.is_empty() && snap.partial.is_empty() {
-        return "(no pods)\n".into();
+        return format!("(no pods)\n{balance}");
     }
     let rows: Vec<Vec<String>> = snap
         .pods
@@ -877,6 +903,7 @@ pub fn render_table(snap: &FleetSnapshot) -> String {
             snap.partial.join(", ")
         ));
     }
+    out.push_str(&balance);
     out
 }
 
@@ -1051,7 +1078,7 @@ fn public_time(s: Option<&str>) -> Option<String> {
 /// after it. Field ranges are checked (no Feb 30, no 24:00); a leap second `:60` is read
 /// as the next minute. `None` for anything else, including an instant before 1970 (which
 /// [`rfc3339`] can't print).
-fn parse_rfc3339(s: &str) -> Option<u64> {
+pub(crate) fn parse_rfc3339(s: &str) -> Option<u64> {
     let b = s.as_bytes();
     let num = |r: std::ops::Range<usize>| -> Option<i64> {
         let d = b.get(r)?;
@@ -1349,7 +1376,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_path_resolution_table() {
+    fn state_file_path_table() {
         let env = |pairs: &'static [(&'static str, &'static str)]| move |k: &str| {
             pairs.iter().find(|(key, _)| *key == k).map(|(_, v)| v.to_string())
         };
@@ -1375,7 +1402,18 @@ mod tests {
                 (Err(needle), Err(e)) => assert!(e.contains(needle), "{e}"),
                 _ => panic!("{vars:?} {prefix}: got {got:?}"),
             }
+            // The balance state (`balance.json`) resolves the same way, beside it: same
+            // directory, same prefix scoping, same refusals.
+            let balance = state_file_path(prefix, BALANCE_FILE, env(vars));
+            match (want, &balance) {
+                (Ok(p), Ok(g)) => assert_eq!(g, &Path::new(p).with_file_name(BALANCE_FILE), "{vars:?} {prefix}"),
+                (Err(needle), Err(e)) => assert!(e.contains(needle), "{e}"),
+                _ => panic!("{vars:?} {prefix}: got {balance:?}"),
+            }
         }
+        // A file name can't climb out either (only constants are passed, but still).
+        let lookup = |k: &str| (k == "ARENA_STATE_DIR").then(|| "/s".to_string());
+        assert_eq!(state_file_path("p", "../x", lookup).unwrap(), Path::new("/s/p/.._x"));
     }
 
     /// A fresh temp directory, removed at the end of the test.
@@ -1938,6 +1976,7 @@ mod tests {
     fn health_cache_path_for_takes_the_state_dir_and_prefix_from_config() {
         let cfg = Config::parse("MACHINE_NAME_PREFIX=devtest\nARENA_STATE_DIR=/srv/arena-state\n");
         assert_eq!(health_cache_path_for(&cfg).unwrap(), Path::new("/srv/arena-state/devtest/health.json"));
+        assert_eq!(state_file_path_for(&cfg, BALANCE_FILE).unwrap(), Path::new("/srv/arena-state/devtest/balance.json"));
         let rel = Config::parse("ARENA_STATE_DIR=state\n");
         assert!(health_cache_path_for(&rel).unwrap_err().contains("absolute"));
     }
@@ -2390,6 +2429,35 @@ fleet: $0.17/h across 2 billing pod(s) (1 unpriced)
         }
         // The default budget is the documented few seconds.
         assert_eq!(SshPortProbe::default().timeout, REACH_TIMEOUT);
+    }
+
+    /// Invariant 9: a snapshot carrying prepaid balances (amounts, runways, a failing source)
+    /// publishes none of it — no `balance`, `credit` or `runway`, no amount — while the
+    /// internal table and JSON do show it.
+    #[test]
+    fn snapshot_public_has_no_balance() {
+        use crate::balance::{self, Account, Fetched, Live};
+        let cfg = cfg();
+        let naming = Naming::from_config(&cfg);
+        let pods = vec![at(pod("devtest-apple", "runpod", "rp1"), "203.0.113.7", 10022)];
+        let mut snap = build(&pods, &[], Some(&proxy_text()), &HealthCache::new(), &naming, NOW);
+        let live = |usd: f64| Live { usd, provider_burn_per_hr: Some(0.47), spend_limit_per_hr: Some(80.0), under_balance: Some(false), reduced: false, owed: None };
+        let fetched = [
+            Fetched { account: Account::Runpod, key_fp: "fp".into(), live: Some(Ok(live(32.54))), billed: None },
+            Fetched { account: Account::Vast, key_fp: "fp".into(), live: Some(Ok(Live { provider_burn_per_hr: None, ..live(136.87) })), billed: None },
+        ];
+        snap.balance = balance::views(&balance::BalanceState::default(), &fetched, &balance::Burns::new(), &snap.balance_policy, balance::Mode::Inline, NOW);
+        let internal = format!("{}{}", serde_json::to_string(&snap).unwrap(), render_table(&snap));
+        for needle in ["32.54", "136.87", "runway", "balance: ⚠ runpod $32.54 live"] {
+            assert!(internal.contains(needle), "fixture sanity: {needle}");
+        }
+        let json = public_json(&public_snapshot(&snap, &naming));
+        let lower = json.to_lowercase();
+        for needle in ["balance", "credit", "runway", "32.54", "136.87", "0.47", "80.0", "spend", "burn", "$"] {
+            assert!(!lower.contains(needle), "`{needle}` leaked into {json}");
+        }
+        // The pinned public shape still parses (deny_unknown_fields): nothing was added.
+        let _: PublicSnapshot = serde_json::from_str(&json).unwrap();
     }
 
     /// PLAN Phase 4's leak test: a fleet stuffed with everything that must never be
