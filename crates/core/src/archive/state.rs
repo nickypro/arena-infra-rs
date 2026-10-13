@@ -98,16 +98,29 @@ pub struct LabelRecord {
     #[serde(default)]
     pub pods_ok: BTreeSet<String>,
     /// The pods with anything of this label on the archive (through, or cut short): later labels
-    /// hard-link to these too — rsync links only identical files, so a partial copy is as good a
-    /// link source as a complete one.
+    /// hard-link to these too — a link is made only to a file identical in content and mtime, so
+    /// a partial copy is as good a link source as a complete one. Also what makes a pod's next
+    /// push of the label an update rather than its first ([`super::sync::pod_push`]).
     #[serde(default)]
     pub pods_tried: BTreeSet<String>,
-    /// Whether that full push linked every pod to everything it should have: the pod's previous
-    /// local label (complete on the archive) and the week's fleet baseline. A label pushed without
-    /// them (a backlog's out-of-order push, a failed predecessor) is never sealed — a later push
-    /// re-links its identical files and gives the duplicated space back.
+    /// Whether that full push left every pod linked ([`LabelRecord::pods_linked`]). A label pushed
+    /// without its links (a backlog's out-of-order push, a failed predecessor) is never sealed — a
+    /// later push compares it by content against them, re-links its identical files and gives the
+    /// duplicated space back.
     #[serde(default)]
     pub linked: bool,
+    /// The pods whose copy of this label was compared BY CONTENT against everything it should link
+    /// to (the pod's previous local label complete on the archive, the week's fleet baseline):
+    /// their identical files share inodes. Only such a push links anything (A3-extra,
+    /// [`super::sync::PodPush`]); a pod not in here is re-linked once its links are there.
+    #[serde(default)]
+    pub pods_linked: BTreeSet<String>,
+    /// The pods whose copy of this label was compared by content with the control box's after the
+    /// label's day and grace were over ([`super::sync::GRACE_SECS`]): the archive holds exactly
+    /// the final local label, whatever a same-size, same-mtime change slipped past rsync's quick
+    /// check before. A label seals only with every pod in here (or settled partial).
+    #[serde(default)]
+    pub pods_final: BTreeSet<String>,
     /// When a run last took this label up (UNIX s; `0` = never): the backlog goes round-robin,
     /// least recently tried first ([`super::sync::plan_snap`]).
     #[serde(default)]

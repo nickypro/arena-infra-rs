@@ -6,13 +6,34 @@
 //! with `--link-dest` to that pod's earlier labels on the archive and to the week's fleet
 //! baseline (`<dir>/baseline/w<N>/fleet/`, pushed to `snap/baseline/`). So an unchanged file shares
 //! one inode across days, and the image's files — the same on every pod — across pods too. Every
-//! earlier label that is on the archive counts as a link source, complete or cut short (rsync
-//! links only identical files), so one failed push never turns the following days into full
+//! earlier label that is on the archive counts as a link source, complete or cut short (only an
+//! identical file is linked), so one failed push never turns the following days into full
 //! copies; and a label pushed without the links it should have had is never sealed, so a later
 //! push re-links it ([`sealed`]). And like the pull's snapshot tier each push is **two passes**
 //! ([`SnapPass`]): the files under the size cap, then every `.git` uncapped — a repo's big pack is
 //! over the cap, and a capped copy would be a `.git` whose refs point at objects that never
 //! arrived (`pull::PullConfig::passes`).
+//!
+//! **A link is made by content, never by size and mtime alone (A3-extra).** rsync tries every
+//! `--link-dest` BEFORE the file the destination already holds, with its quick check (same size,
+//! same mtime): a re-push of an open label replaced its own correct copy by a hard link to an
+//! earlier day's same-size, same-mtime file of different content (live W7: `snap/w0d2/…/notes.txt`
+//! read "notes w0d1"), and a first push links such a file in place of the new one. So how a pod's
+//! push compares depends on what the archive holds of it ([`pod_push`], [`Compare`]):
+//! - its **first** push of a label adds only what is missing, by content against the link
+//!   sources (`--checksum --ignore-existing`);
+//! - while the day runs, later pushes compare with the label's **own** copy only (the quick check,
+//!   no link source): a changed file is written anew, nothing there is ever re-linked;
+//! - a **check** re-links a copy pushed before its links were there and, once its day is over,
+//!   compares the whole copy with the control box's before the label seals: `--checksum` with the
+//!   link sources but without `-t` (so a file equal in content but not in mtime is never touched
+//!   in place), then a quick pass that gives each file its mtime (writing it anew if needed).
+//!
+//! Plain `--checksum` on every push was rejected: it reads every file on both ends every 15
+//! minutes, and for a file equal in content but not in mtime it sets the mtime IN PLACE — on an
+//! inode that past days and other pods share (A2-2). The cost kept is one content read of each
+//! pod's label when it is first pushed and once when it is checked (≈ twice a day; hard-linked
+//! files are one inode, mostly in the page cache).
 //!
 //! What may never be in a push ([`FORBIDDEN_LONG`], test-enforced on every argv): anything that
 //! deletes (`--delete*`, `--remove-*` — rrsync `-no-del` refuses them too), reads (`--sender`),
@@ -117,18 +138,53 @@ pub fn label_end(label: &str, start_days: i64) -> Option<u64> {
 /// last full push (every pod through) started ≥ [`GRACE_SECS`] after its day ended, linked every
 /// pod to what it should have ([`super::state::LabelRecord::linked`]), and carried every allowed
 /// pod the control box holds for it (`local_pods` — a pod re-added to the list, or one whose push
-/// failed, keeps the label open) — or settled it as it is (`given_up`, after [`GIVE_UP_AFTER`]
-/// failed pushes in a row: "sealed partial"). A label whose day hasn't ended (clock skew
-/// included) and a custom label never are.
+/// failed, keeps the label open), each compared by content with the final local label
+/// ([`super::state::LabelRecord::pods_final`]) — or settled it as it is (`given_up`, after
+/// [`GIVE_UP_AFTER`] failed pushes in a row: "sealed partial"). A label whose day hasn't ended
+/// (clock skew included) and a custom label never are.
 pub fn sealed(label: &str, state: &SnapState, start_days: i64, local_pods: &[String]) -> bool {
     match (label_end(label, start_days), state.labels.get(label)) {
         (Some(end), Some(rec)) => {
             rec.ok_finished > 0
                 && rec.ok_started >= end + GRACE_SECS
                 && rec.linked
-                && local_pods.iter().all(|p| rec.pods_ok.contains(p) || rec.given_up.contains(p))
+                && local_pods.iter().all(|p| (rec.pods_ok.contains(p) && rec.pods_final.contains(p)) || rec.given_up.contains(p))
         }
         _ => false,
+    }
+}
+
+/// How one pod's push of a label compares with what the archive holds (A3-extra, module doc).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PodPush {
+    /// Its first push of the label: only what is missing is added, each file linked to an
+    /// earlier copy identical in content and mtime, else sent ([`Compare::NewOnly`]).
+    Seed,
+    /// A later push while the day runs: the quick check against the label's own copy, no link
+    /// sources ([`Compare::Quick`]).
+    Update,
+    /// Content against the link sources and the label's own copy, then the mtimes
+    /// ([`Compare::Content`] then [`Compare::Quick`]): re-links and verifies.
+    Check,
+}
+
+/// How `pod`'s push of the label `rec` describes compares ([`PodPush`]):
+/// - [`PodPush::Seed`] when nothing of it has been pushed (`pods_tried`);
+/// - [`PodPush::Check`] when asked (`forced`: `sync --label`), when its links are all there now
+///   (`chain`, and there is something to link to: `has_links`) but it isn't linked yet, or when
+///   the push could seal the label (`could_seal`: started after the day and its grace) and the pod
+///   wasn't compared since then — once per pod and label, at its last push;
+/// - else [`PodPush::Update`].
+pub fn pod_push(rec: &LabelRecord, pod: &str, chain: bool, has_links: bool, could_seal: bool, forced: bool) -> PodPush {
+    if !rec.pods_tried.contains(pod) {
+        return PodPush::Seed;
+    }
+    let relink = chain && has_links && !rec.pods_linked.contains(pod);
+    let verify = could_seal && !rec.pods_final.contains(pod);
+    if forced || relink || verify {
+        PodPush::Check
+    } else {
+        PodPush::Update
     }
 }
 
@@ -146,12 +202,22 @@ pub fn counts_toward_give_up(f: PushFailure) -> bool {
     matches!(f, PushFailure::Other | PushFailure::Timeout)
 }
 
-/// Record that `pod`'s push of a label went through: it is complete there for this pod again
-/// (a `--label` retry of a pod settled partial un-settles it).
-pub fn note_push_ok(rec: &mut LabelRecord, pod: &str) {
+/// Record that `pod`'s push of a label went through, compared `how`: it is complete there for
+/// this pod again (a `--label` retry of a pod settled partial un-settles it). A push that
+/// compared by content (a seed or a check) leaves the pod linked when its `chain` was whole
+/// ([`chain_ok`]), and final when it `could_seal` the label; with no link source at all
+/// (`has_links` false: a pod's first label, no baseline) every push is as linked as it gets.
+pub fn note_push_ok(rec: &mut LabelRecord, pod: &str, how: PodPush, chain: bool, has_links: bool, could_seal: bool) {
     rec.pods_ok.insert(pod.to_string());
     rec.fails.remove(pod);
     rec.given_up.remove(pod);
+    let by_content = how != PodPush::Update;
+    if chain && (by_content || !has_links) {
+        rec.pods_linked.insert(pod.to_string());
+    }
+    if by_content && could_seal {
+        rec.pods_final.insert(pod.to_string());
+    }
 }
 
 /// Record that `pod`'s push of a label failed with `class`, the push having started at
@@ -532,6 +598,25 @@ pub enum SnapPass {
     Git,
 }
 
+/// How one rsync pass compares a file with what the archive holds (A3-extra, module doc). Every
+/// one of them writes a changed file anew (temp + rename) and never sets an attribute of a file
+/// already there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compare {
+    /// rsync's quick check (size and mtime) against the destination's own copy; no link source
+    /// (a pod's update, the baseline, big).
+    Quick,
+    /// `--checksum --ignore-existing`: only what the destination lacks, each file linked to a link
+    /// source identical in content and mtime, else sent. What is there is never touched.
+    NewOnly,
+    /// `--checksum` without `-t`: every file by content against its own copy and the link
+    /// sources — a different one is sent anew, an identical source is linked in its place — and no
+    /// mtime is ever set on a file that is there (with `-t`, a file equal in content but not in
+    /// mtime would get the new mtime in place). Always followed by a [`Compare::Quick`] pass,
+    /// which gives every file its mtime.
+    Content,
+}
+
 /// How a push reaches the archive: rsync's `-e` (the pinned ssh, push key only) and
 /// `arena-push@<ip>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -546,13 +631,17 @@ pub struct PushJob {
     pub tier: Tier,
     /// Snap (pods and the baseline) only.
     pub pass: SnapPass,
+    /// How it compares with what is there ([`Compare`]): a pod's push by its [`PodPush`];
+    /// [`Compare::Quick`] for the baseline and big.
+    pub compare: Compare,
     /// What it is, for messages: `w1d3 arena9-apple`, `baseline`, `big arena9-apple`.
     pub what: String,
     /// The local source directory (a trailing `/` is added).
     pub src: String,
     /// Where it goes, under rrsync's root: `snap/w1d3/arena9-apple/`, `snap/baseline/`, `big/`.
     pub dest: String,
-    /// Absolute link sources under rrsync's root (`/snap/w1d2/arena9-apple/`), tried in order.
+    /// Absolute link sources under rrsync's root (`/snap/w1d2/arena9-apple/`), tried in order —
+    /// only on a pass that compares by content (never [`Compare::Quick`]).
     pub link_dests: Vec<String>,
     /// The anchored rules after the secrets that pick the top level (`--include=/<pod>/`… then
     /// `--exclude=/*`); empty for a pod's push, whose whole tree is its own.
@@ -752,39 +841,44 @@ fn skip_for(tier_root: &Path, trees: &[(&str, PathBuf, String)]) -> Skip {
     }
 }
 
-/// `pod`'s two pushes of `label` (`<dir>/<label>/<pod>/` → `snap/<label>/<pod>/`: the files under
-/// the cap, then `.git`), linked to its earlier labels and its baseline — one scan of the tree
-/// for both (A3-9); the symlinks the archive can't store are left out.
-pub fn pod_jobs(dir: &Path, label: &str, pod: &str, link_labels: &[String], baseline: Option<u32>) -> [PushJob; 2] {
+/// `pod`'s pushes of `label` (`<dir>/<label>/<pod>/` → `snap/<label>/<pod>/`), compared `how`
+/// ([`PodPush`]): for each of the two passes (the files under the cap, then `.git`) one rsync — or,
+/// for a check, the content pass then the quick one. The passes that compare by content link to
+/// its earlier labels and its baseline; one scan of the tree for all (A3-9); the symlinks the
+/// archive can't store are left out.
+pub fn pod_jobs(dir: &Path, label: &str, pod: &str, link_labels: &[String], baseline: Option<u32>, how: PodPush) -> Vec<PushJob> {
     let mut link_dests: Vec<String> = link_labels.iter().map(|l| format!("/snap/{l}/{pod}/")).collect();
     if let Some(w) = baseline {
         link_dests.push(format!("/snap/{}/w{w}/fleet/", crate::pull::BASELINE_DIR));
     }
     let src = dir.join(label).join(pod);
     let skip = skip_for(&dir.join(label), &[(pod, src.clone(), "/".to_string())]);
-    [SnapPass::Files, SnapPass::Git].map(|pass| PushJob {
+    let job = |pass: SnapPass, compare: Compare| PushJob {
         tier: Tier::Snap,
         pass,
+        compare,
         what: format!("{label} {pod}"),
         src: src.display().to_string(),
         dest: format!("snap/{label}/{pod}/"),
-        link_dests: link_dests.clone(),
+        link_dests: if compare == Compare::Quick { Vec::new() } else { link_dests.clone() },
         top_rules: Vec::new(),
         mkpath: true,
         skip: skip.rules.clone(),
         skip_file: skip.file.clone(),
         left_out: skip.left_out.clone(),
         log_file: None,
-    })
+    };
+    let passes = [SnapPass::Files, SnapPass::Git];
+    match how {
+        PodPush::Seed => passes.into_iter().map(|p| job(p, Compare::NewOnly)).collect(),
+        PodPush::Update => passes.into_iter().map(|p| job(p, Compare::Quick)).collect(),
+        PodPush::Check => passes.into_iter().flat_map(|p| [job(p, Compare::Content), job(p, Compare::Quick)]).collect(),
+    }
 }
 
-/// One pass of [`pod_jobs`].
+/// One pass of a pod's FIRST push of a label ([`PodPush::Seed`]).
 pub fn pod_job(dir: &Path, label: &str, pod: &str, pass: SnapPass, link_labels: &[String], baseline: Option<u32>) -> PushJob {
-    let [files, git] = pod_jobs(dir, label, pod, link_labels, baseline);
-    match pass {
-        SnapPass::Files => files,
-        SnapPass::Git => git,
-    }
+    pod_jobs(dir, label, pod, link_labels, baseline, PodPush::Seed).into_iter().find(|j| j.pass == pass).expect("a seed has both passes")
 }
 
 /// The fleet baselines' two pushes (`<dir>/baseline/` → `snap/baseline/`): only `w<N>/fleet/` of
@@ -806,6 +900,7 @@ pub fn baseline_jobs(dir: &Path, weeks: &[u32]) -> [PushJob; 2] {
     [SnapPass::Files, SnapPass::Git].map(|pass| PushJob {
         tier: Tier::Snap,
         pass,
+        compare: Compare::Quick,
         what: "baseline".into(),
         src: src.display().to_string(),
         dest: format!("snap/{}/", crate::pull::BASELINE_DIR),
@@ -852,6 +947,7 @@ pub fn big_job_in(big_root: &Path, pods: &[String]) -> PushJob {
     PushJob {
         tier: Tier::Big,
         pass: SnapPass::Files,
+        compare: Compare::Quick,
         what,
         src: src.display().to_string(),
         dest: "big/".into(),
@@ -880,8 +976,10 @@ pub fn sent_bytes(log: &str) -> u64 {
 /// The rsync argv (after the program name) for `job` — pure, so every invariant is a table test.
 ///
 /// ```text
-/// snap pod:  -rlt -J -z --chmod=u=rwX,go=rX [--max-size=M] --timeout=300 [--bwlimit=B] --stats --mkpath
-///            [--link-dest=/snap/<earlier>/<pod>/]… [--link-dest=/snap/baseline/w<N>/fleet/]
+/// snap pod:  -rlt -J -z --chmod=u=rwX,go=rX [compare] [--max-size=M] --timeout=300 [--bwlimit=B] --stats --mkpath
+///            [--link-dest=/snap/<earlier>/<pod>/]… [--link-dest=/snap/baseline/w<N>/fleet/]   (by content only)
+///            compare: quick = nothing (and no link-dest); new-only = --checksum --ignore-existing;
+///                     content = --checksum, and -rl instead of -rlt (never an mtime set in place)
 ///            --exclude=<secret>… --exclude=<extra>… [--exclude-from=<the job's skip file>]
 ///            [git pass: --include=*/ --include=**/.git/** --exclude=*]
 ///            [--log-file=<f> --log-file-format=%i %l]
@@ -897,14 +995,21 @@ pub fn sent_bytes(log: &str) -> u64 {
 ///   anchored top-level rules (any other top-level dir — a staff box, a stranger — goes no
 ///   further). `--exclude-from` and `--log-file` are the client's own: rrsync never sees them.
 /// - No `-p` (A2-2): `--chmod` gives each new file its mode; a file already there keeps its own.
+/// - A `--link-dest` only where files are compared by content (A3-extra, [`Compare`]): rsync
+///   tries the link sources before the file already there, by size and mtime alone.
 /// - `-z` and the cap on snap only. No partial transfers anywhere (no holding area in a
 ///   participant-shaped tree, ARCH-SEC-1): a big file cut off by the budget starts over next run.
 pub fn push_args(job: &PushJob, transport: &PushTransport, settings: &ArchiveSettings) -> Vec<String> {
-    let mut a: Vec<String> = vec!["-rlt".into(), "-J".into()];
+    let mut a: Vec<String> = vec![if job.compare == Compare::Content { "-rl" } else { "-rlt" }.into(), "-J".into()];
     if job.tier == Tier::Snap {
         a.push("-z".into());
     }
     a.push("--chmod=u=rwX,go=rX".into());
+    match job.compare {
+        Compare::Quick => {}
+        Compare::NewOnly => a.extend(["--checksum", "--ignore-existing"].map(String::from)),
+        Compare::Content => a.push("--checksum".into()),
+    }
     if job.tier == Tier::Snap && job.pass == SnapPass::Files {
         a.push(format!("--max-size={}", settings.snap_max_size));
     }
@@ -916,8 +1021,10 @@ pub fn push_args(job: &PushJob, transport: &PushTransport, settings: &ArchiveSet
     if job.mkpath {
         a.push("--mkpath".into());
     }
-    for d in &job.link_dests {
-        a.push(format!("--link-dest={d}"));
+    if job.compare != Compare::Quick {
+        for d in &job.link_dests {
+            a.push(format!("--link-dest={d}"));
+        }
     }
     for s in SECRET_EXCLUDES.iter().copied().chain(settings.extra_excludes.iter().map(String::as_str)) {
         a.push(format!("--exclude={s}"));
@@ -1230,7 +1337,18 @@ mod tests {
     }
     /// A label pushed OK at `started` for `pods`, linked.
     fn rec(started: u64, pods: &[&str]) -> LabelRecord {
-        LabelRecord { ok_started: started, ok_finished: started + 60, files: 1, bytes: 1, pods_ok: set(pods), pods_tried: set(pods), linked: true, ..Default::default() }
+        LabelRecord {
+            ok_started: started,
+            ok_finished: started + 60,
+            files: 1,
+            bytes: 1,
+            pods_ok: set(pods),
+            pods_tried: set(pods),
+            linked: true,
+            pods_linked: set(pods),
+            pods_final: set(pods),
+            ..Default::default()
+        }
     }
     fn local(labels: &[(&str, &[&str])]) -> Vec<LocalLabel> {
         labels.iter().map(|(l, p)| LocalLabel { label: l.to_string(), pods: p.iter().map(|s| s.to_string()).collect() }).collect()
@@ -1250,6 +1368,9 @@ mod tests {
             v.push(pod_job(d, "w1d3", "arena9-apple", pass, &["w1d2".into(), "w1d1".into()], Some(1)));
             v.push(baseline_job(d, &[0, 1], pass));
         }
+        for how in [PodPush::Update, PodPush::Check] {
+            v.extend(pod_jobs(d, "w1d3", "arena9-apple", &["w1d2".into()], Some(1), how));
+        }
         v.push(big_job(d, &["arena9-apple".into(), "arena9-bloom-new".into()]));
         v
     }
@@ -1267,7 +1388,7 @@ mod tests {
                 n += 1;
             }
         }
-        assert_eq!(n, 28);
+        assert_eq!(n, 52);
         // The checker itself catches each one.
         for bad in [
             "--delete",
@@ -1307,7 +1428,7 @@ mod tests {
         ] {
             assert!(forbidden_flag(&[bad.to_string()]).is_some(), "{bad}");
         }
-        for ok in ["-rlt", "-J", "-z", "-e", "--chmod=u=rwX,go=rX", "--exclude=--delete", "--exclude=.rsync-partial", "--stats", "--mkpath", "--link-dest=/snap/w1d1/p/"] {
+        for ok in ["-rlt", "-rl", "-J", "-z", "-e", "--chmod=u=rwX,go=rX", "--exclude=--delete", "--exclude=.rsync-partial", "--stats", "--mkpath", "--link-dest=/snap/w1d1/p/", "--checksum", "--ignore-existing"] {
             assert!(forbidden_flag(&[ok.to_string()]).is_none(), "{ok}");
         }
     }
@@ -1316,7 +1437,7 @@ mod tests {
     fn pod_baseline_and_big_argv_exactly() {
         let d = Path::new("/b");
         let a = push_args(&pod_job(d, "w1d3", "arena9-apple", SnapPass::Files, &["w1d2".into(), "w1d1".into()], Some(1)), &transport(), &settings(""));
-        let head: Vec<&str> = a.iter().take(12).map(String::as_str).collect();
+        let head: Vec<&str> = a.iter().take(14).map(String::as_str).collect();
         assert_eq!(
             head,
             [
@@ -1324,6 +1445,8 @@ mod tests {
                 "-J",
                 "-z",
                 "--chmod=u=rwX,go=rX",
+                "--checksum",
+                "--ignore-existing",
                 "--max-size=50M",
                 "--timeout=300",
                 "--bwlimit=10M",
@@ -1337,6 +1460,25 @@ mod tests {
         let tail: Vec<&str> = a[a.len() - 4..].iter().map(String::as_str).collect();
         assert_eq!(tail, ["-e", "ssh -p 22 -i /st/push_ed25519 -o IdentitiesOnly=yes", "/b/w1d3/arena9-apple/", "arena-push@192.0.2.1:snap/w1d3/arena9-apple/"]);
         assert!(!a.iter().any(|x| x == "--exclude=/*"), "a pod's push takes its whole (secret-filtered) tree");
+        // A3-extra: a later push while the day runs — the quick check, never a link source; a
+        // check — content (no -t) with the links, then the quick pass, per pass.
+        let links = ["w1d2".to_string()];
+        let upd = pod_jobs(d, "w1d3", "arena9-apple", &links, Some(1), PodPush::Update);
+        assert_eq!(upd.iter().map(|j| (j.pass, j.compare)).collect::<Vec<_>>(), [(SnapPass::Files, Compare::Quick), (SnapPass::Git, Compare::Quick)]);
+        for j in &upd {
+            let u = push_args(j, &transport(), &settings(""));
+            assert_eq!(u[0], "-rlt");
+            assert!(!u.iter().any(|x| x.starts_with("--link-dest") || x == "--checksum" || x == "--ignore-existing"), "{u:?}");
+        }
+        let chk = pod_jobs(d, "w1d3", "arena9-apple", &links, Some(1), PodPush::Check);
+        assert_eq!(
+            chk.iter().map(|j| (j.pass, j.compare)).collect::<Vec<_>>(),
+            [(SnapPass::Files, Compare::Content), (SnapPass::Files, Compare::Quick), (SnapPass::Git, Compare::Content), (SnapPass::Git, Compare::Quick)]
+        );
+        let c = push_args(&chk[0], &transport(), &settings(""));
+        assert_eq!(&c[..5], ["-rl", "-J", "-z", "--chmod=u=rwX,go=rX", "--checksum"].map(String::from), "no -t: no mtime set in place");
+        assert!(!c.contains(&"--ignore-existing".to_string()) && c.contains(&"--link-dest=/snap/w1d2/arena9-apple/".to_string()), "{c:?}");
+        assert!(c.contains(&"--link-dest=/snap/baseline/w1/fleet/".to_string()));
         // The .git pass: uncapped, the same links, only .git contents.
         let git = push_args(&pod_job(d, "w1d3", "arena9-apple", SnapPass::Git, &["w1d2".into()], None), &transport(), &settings(""));
         assert!(!git.iter().any(|x| x.starts_with("--max-size")), "{git:?}");
@@ -1433,12 +1575,57 @@ mod tests {
         // Only partly pushed (no full push yet): open.
         st.labels.insert("w0d1".into(), LabelRecord { ok_started: 0, ok_finished: 0, ..rec(late, A) });
         assert!(!sealed("w0d1", &st, START, &["arena9-apple".into()]));
+        // A3-extra: never compared by content with the final local label (a state written before
+        // that rule, or only updated since): open — the next push checks it.
+        st.labels.insert("w0d1".into(), LabelRecord { pods_final: set(&[]), ..rec(late, A) });
+        assert!(!sealed("w0d1", &st, START, &["arena9-apple".into()]));
         // A custom label never; a future one not until its day passes; no record never.
         st.labels.insert("mylabel".into(), rec(u64::MAX / 2, A));
         assert!(!sealed("mylabel", &st, START, &[]));
         st.labels.insert("w5d1".into(), rec(day_start("w5d1") + 3600, A));
         assert!(!sealed("w5d1", &st, START, &[]));
         assert!(!sealed("w0d3", &st, START, &[]));
+    }
+
+    /// A3-extra: how a pod's push compares — a first push adds only what's missing by content; a
+    /// later one while the day runs is a quick update with no link source; a check (by content,
+    /// with the links) re-links once the chain is there, verifies once at the push that can seal,
+    /// and runs whenever asked (`--label`).
+    #[test]
+    fn a_pod_push_compares_by_content_wherever_it_links() {
+        let p = "arena9-apple";
+        let fresh = LabelRecord::default();
+        let tried = LabelRecord { pods_tried: set(A), ..Default::default() };
+        let linked = LabelRecord { pods_linked: set(A), ..tried.clone() };
+        let done = LabelRecord { pods_final: set(A), ..linked.clone() };
+        use PodPush::*;
+        // (record, chain, has_links, could_seal, forced) → how
+        let table: &[(&LabelRecord, bool, bool, bool, bool, PodPush)] = &[
+            (&fresh, false, false, false, false, Seed),
+            (&fresh, true, true, true, true, Seed),
+            (&tried, false, true, false, false, Update),
+            (&tried, true, false, false, false, Update),
+            (&tried, true, true, false, false, Check),
+            (&linked, true, true, false, false, Update),
+            (&linked, true, true, true, false, Check),
+            (&tried, false, true, true, false, Check),
+            (&done, true, true, true, false, Update),
+            (&done, true, true, false, true, Check),
+        ];
+        for (i, (r, chain, has, seal, forced, want)) in table.iter().enumerate() {
+            assert_eq!(pod_push(r, p, *chain, *has, *seal, *forced), *want, "row {i}");
+        }
+        // What a push that went through records.
+        let mut r = LabelRecord::default();
+        note_push_ok(&mut r, p, Seed, false, true, true);
+        assert!(r.pods_ok.contains(p) && !r.pods_linked.contains(p) && r.pods_final.contains(p), "seeded before its links: final, not linked");
+        note_push_ok(&mut r, p, Update, true, true, false);
+        assert!(!r.pods_linked.contains(p), "an update links nothing");
+        note_push_ok(&mut r, p, Check, true, true, false);
+        assert!(r.pods_linked.contains(p));
+        let mut r = LabelRecord::default();
+        note_push_ok(&mut r, p, Update, true, false, true);
+        assert!(r.pods_linked.contains(p) && !r.pods_final.contains(p), "nothing to link to: linked as it gets; never final without a content check");
     }
 
     /// The run's order (AD1): the newest label first, then the backlog oldest first, capped; the
@@ -1532,13 +1719,13 @@ mod tests {
         assert!(note_push_failed(&mut r, p, Other, after + 2700, end), "the third of its own kind");
         assert!(r.given_up.contains(p) && !r.pods_ok.contains(p));
         // Settled: the label seals without it; a later success (a `--label` retry) un-settles it.
-        note_push_ok(&mut r, p);
+        note_push_ok(&mut r, p, PodPush::Update, false, true, false);
         assert!(r.pods_ok.contains(p) && r.fails.is_empty() && r.given_up.is_empty());
         // A success in between resets the count.
         let mut r = LabelRecord::default();
         note_push_failed(&mut r, p, Other, after, end);
         note_push_failed(&mut r, p, Other, after, end);
-        note_push_ok(&mut r, p);
+        note_push_ok(&mut r, p, PodPush::Update, false, true, false);
         assert!(!note_push_failed(&mut r, p, Other, after, end) && !r.given_up.contains(p));
         assert_eq!(GIVE_UP_AFTER, 3);
     }
@@ -1807,8 +1994,12 @@ mod tests {
     /// Run `job`'s push into a LOCAL `<root>/push`: the same argv minus `-e`, the remote spec and
     /// the absolute link-dests rewritten to their local paths (what rrsync does).
     fn push_local(job: &PushJob, settings: &ArchiveSettings, root: &Path) -> std::process::Output {
+        run_local_argv(push_args(job, &transport(), settings), job.tier, root)
+    }
+
+    /// [`push_local`] for an argv as given.
+    fn run_local_argv(mut a: Vec<String>, tier: Tier, root: &Path) -> std::process::Output {
         let push = root.join("push");
-        let mut a = push_args(job, &transport(), settings);
         let e = a.iter().position(|x| x == "-e").unwrap();
         a.drain(e..e + 2);
         for x in a.iter_mut() {
@@ -1819,7 +2010,7 @@ mod tests {
                 *x = format!("{}/{rest}", push.display());
             }
         }
-        std::fs::create_dir_all(push.join(job.tier.as_str())).unwrap();
+        std::fs::create_dir_all(push.join(tier.as_str())).unwrap();
         std::process::Command::new("rsync").args(&a).output().unwrap()
     }
 
@@ -1998,6 +2189,13 @@ mod tests {
                 assert!(o.status.success(), "{label} {pass:?}: {}", String::from_utf8_lossy(&o.stderr));
             }
         }
+        // A3-extra: a later update and a check (`--checksum`, `--ignore-existing`, `-rl`) pass too.
+        for how in [PodPush::Update, PodPush::Check] {
+            for j in pod_jobs(&src, "w0d2", "arena9-apple", &["w0d1".into()], Some(0), how) {
+                let o = run(&push_args(&j, &tr, &s));
+                assert!(o.status.success(), "w0d2 {how:?} {:?}: {}", j.compare, String::from_utf8_lossy(&o.stderr));
+            }
+        }
         let ino = |p: &Path| std::fs::metadata(p).unwrap().ino();
         assert_eq!(ino(&push.join("snap/w0d1/arena9-apple/a.py")), ino(&push.join("snap/w0d2/arena9-apple/a.py")), "absolute link-dest, re-rooted");
         assert!(push.join("snap/baseline/w0/fleet/image.py").exists());
@@ -2123,27 +2321,106 @@ mod tests {
         }
     }
 
-    /// AD1 on the real rsync: a label first pushed without its links (out of order, or after a
-    /// failed predecessor) is a full copy; the later linked push replaces its identical files by
-    /// hard links — the space comes back, which is why an unlinked push is never sealed.
+    /// Every job of a pod's push, through the real rsync into `<root>/push`.
+    fn push_pod(src: &Path, root: &Path, label: &str, links: &[&str], how: PodPush) {
+        let links: Vec<String> = links.iter().map(|l| l.to_string()).collect();
+        for job in pod_jobs(src, label, "arena9-apple", &links, None, how) {
+            let o = push_local(&job, &settings(""), root);
+            assert!(o.status.success(), "{label} {how:?} {:?}: {}", job.compare, String::from_utf8_lossy(&o.stderr));
+        }
+    }
+
+    /// Two days of one pod whose `notes.txt` has the same size and the same mtime (to the
+    /// nanosecond) but other text — what rsync's quick check can't tell apart — and a
+    /// `shared.txt` that is the same file on both days.
+    fn same_stat_days(src: &Path) {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::new(1_791_800_000, 500_000_000);
+        for l in ["w0d1", "w0d2"] {
+            for (f, text) in [("notes.txt", format!("notes {l}\n")), ("sub/shared.txt", "shared\n".to_string())] {
+                let p = src.join(format!("{l}/arena9-apple/{f}"));
+                write(&p, &text);
+                std::fs::File::options().write(true).open(&p).unwrap().set_modified(t).unwrap();
+            }
+        }
+    }
+
+    /// Whether every file of `label` arrived with its local content.
+    fn archived_as_local(src: &Path, root: &Path, label: &str) -> Result<(), String> {
+        let local = src.join(label).join("arena9-apple");
+        for f in files_under(&local).into_iter().filter(|f| local.join(f).is_file()) {
+            let (a, b) = (std::fs::read(local.join(&f)).unwrap(), std::fs::read(root.join(format!("push/snap/{label}/arena9-apple/{f}"))).unwrap_or_default());
+            if a != b {
+                return Err(format!("{label}/{f}: local {:?}, archived {:?}", String::from_utf8_lossy(&a), String::from_utf8_lossy(&b)));
+            }
+        }
+        Ok(())
+    }
+
+    /// A3-extra (live W7) on the real rsync: a file of an earlier day with the same size and mtime
+    /// but other content is never linked in place of a label's own — neither on the label's first
+    /// push after that day (the link sources compared by content) nor when a label pushed before
+    /// its predecessor is checked and re-linked (its own correct copy stays; the old re-push
+    /// replaced it). The identical file is still shared, a copy pushed out of order still gets its
+    /// space back, and a check never sets an mtime on a file other days share. The fixture first
+    /// reproduces the bug with the old argv (a quick-check re-push with `--link-dest`).
     #[test]
-    fn a_later_linked_push_relinks_a_full_copy() {
+    fn a_same_size_same_mtime_file_of_another_day_is_never_linked_in_its_place() {
         use std::os::unix::fs::MetadataExt;
         if !have("rsync", "--version") {
             return;
         }
-        let t = tmp("relink");
+        let ino = |root: &Path, l: &str, f: &str| std::fs::metadata(root.join(format!("push/snap/{l}/arena9-apple/{f}"))).unwrap().ino();
+        // The bug, as it was: w0d2 pushed first, then w0d1, then w0d2 again with --link-dest.
+        let t = tmp("same-stat-old");
         let src = t.0.join("backup");
-        write(&src.join("w0d1/arena9-apple/a.py"), "same\n");
-        std::fs::create_dir_all(src.join("w0d2")).unwrap();
-        assert!(std::process::Command::new("cp").arg("-a").arg(src.join("w0d1/arena9-apple")).arg(src.join("w0d2/")).status().unwrap().success());
-        let s = settings("");
-        assert!(push_local(&pod_job(&src, "w0d2", "arena9-apple", SnapPass::Files, &[], None), &s, &t.0).status.success());
-        assert!(push_local(&pod_job(&src, "w0d1", "arena9-apple", SnapPass::Files, &[], None), &s, &t.0).status.success());
-        let ino = |l: &str| std::fs::metadata(t.0.join(format!("push/snap/{l}/arena9-apple/a.py"))).unwrap().ino();
-        assert_ne!(ino("w0d1"), ino("w0d2"), "two full copies");
-        assert!(push_local(&pod_job(&src, "w0d2", "arena9-apple", SnapPass::Files, &["w0d1".into()], None), &s, &t.0).status.success());
-        assert_eq!(ino("w0d1"), ino("w0d2"), "re-linked");
+        same_stat_days(&src);
+        push_pod(&src, &t.0, "w0d2", &[], PodPush::Update);
+        push_pod(&src, &t.0, "w0d1", &[], PodPush::Update);
+        let mut old = push_args(&pod_jobs(&src, "w0d2", "arena9-apple", &[], None, PodPush::Update)[0], &transport(), &settings(""));
+        old.insert(2, "--link-dest=/snap/w0d1/arena9-apple/".into());
+        let o = run_local_argv(old, Tier::Snap, &t.0);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert!(archived_as_local(&src, &t.0, "w0d2").is_err(), "the old argv no longer reproduces the bug — the fixture proves nothing");
+
+        // Today, oldest day first: w0d2's first push links by content.
+        let t = tmp("same-stat-oldfirst");
+        let src = t.0.join("backup");
+        same_stat_days(&src);
+        push_pod(&src, &t.0, "w0d1", &[], PodPush::Seed);
+        push_pod(&src, &t.0, "w0d2", &["w0d1"], PodPush::Seed);
+        push_pod(&src, &t.0, "w0d2", &["w0d1"], PodPush::Update);
+        push_pod(&src, &t.0, "w0d2", &["w0d1"], PodPush::Check);
+        for l in ["w0d1", "w0d2"] {
+            archived_as_local(&src, &t.0, l).unwrap();
+        }
+        assert_eq!(ino(&t.0, "w0d1", "sub/shared.txt"), ino(&t.0, "w0d2", "sub/shared.txt"), "the identical file is shared");
+        assert_ne!(ino(&t.0, "w0d1", "notes.txt"), ino(&t.0, "w0d2", "notes.txt"));
+
+        // Newest first (a first backlog): two full copies, then the check re-links w0d2 —
+        // only what is identical.
+        let t = tmp("same-stat-newfirst");
+        let src = t.0.join("backup");
+        same_stat_days(&src);
+        push_pod(&src, &t.0, "w0d2", &[], PodPush::Seed);
+        push_pod(&src, &t.0, "w0d1", &[], PodPush::Seed);
+        assert_ne!(ino(&t.0, "w0d1", "sub/shared.txt"), ino(&t.0, "w0d2", "sub/shared.txt"), "two full copies");
+        push_pod(&src, &t.0, "w0d2", &["w0d1"], PodPush::Update);
+        push_pod(&src, &t.0, "w0d2", &["w0d1"], PodPush::Check);
+        for l in ["w0d1", "w0d2"] {
+            archived_as_local(&src, &t.0, l).unwrap();
+        }
+        assert_eq!(ino(&t.0, "w0d1", "sub/shared.txt"), ino(&t.0, "w0d2", "sub/shared.txt"), "re-linked: the space comes back");
+
+        // A file touched without a change: the check writes w0d2's anew; w0d1's (shared until
+        // then) keeps its mtime — no attribute is ever set in place.
+        let mtime = |root: &Path, l: &str, f: &str| std::fs::metadata(root.join(format!("push/snap/{l}/arena9-apple/{f}"))).unwrap().modified().unwrap();
+        let before = mtime(&t.0, "w0d1", "sub/shared.txt");
+        let later = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_791_900_000);
+        std::fs::File::options().write(true).open(src.join("w0d2/arena9-apple/sub/shared.txt")).unwrap().set_modified(later).unwrap();
+        push_pod(&src, &t.0, "w0d2", &["w0d1"], PodPush::Check);
+        assert_eq!(mtime(&t.0, "w0d1", "sub/shared.txt"), before, "the sealed day's copy is untouched");
+        assert_eq!(mtime(&t.0, "w0d2", "sub/shared.txt"), later);
+        archived_as_local(&src, &t.0, "w0d2").unwrap();
     }
 
     /// AD8 on the real rsync: with the fleet baseline pushed, two pods' identical image files
@@ -2519,7 +2796,7 @@ mod tests {
         // Under a dir no push takes: never walked, never a rule.
         write(&src.join("w0d1/arena9-apple/.cache/x"), "c\n");
         std::os::unix::fs::symlink(&long, src.join("w0d1/arena9-apple/.cache/hidden")).unwrap();
-        let [files, git] = pod_jobs(&src, "w0d1", "arena9-apple", &[], None);
+        let [files, git]: [PushJob; 2] = pod_jobs(&src, "w0d1", "arena9-apple", &[], None, PodPush::Seed).try_into().unwrap();
         assert_eq!(files.skip, ["/longlink"]);
         let f = files.skip_file.clone().expect("a rules file");
         assert!(std::sync::Arc::ptr_eq(&f, git.skip_file.as_ref().unwrap()), "one scan, one file for both passes");
@@ -2541,7 +2818,7 @@ mod tests {
         write(&src.join("big/arena9-apple/ckpt.pt"), "apple\n");
         std::fs::create_dir_all(src.join("w0d1/arena9-evil")).unwrap();
         std::fs::rename(src.join("big/arena9-evil/links"), src.join("w0d1/arena9-evil/links")).unwrap();
-        let [e, _] = pod_jobs(&src, "w0d1", "arena9-evil", &[], None);
+        let e = pod_jobs(&src, "w0d1", "arena9-evil", &[], None, PodPush::Seed).remove(0);
         assert_eq!(e.left_out, ["arena9-evil"]);
         assert!(e.skip.is_empty() && e.skip_file.is_none());
         std::fs::rename(src.join("w0d1/arena9-evil/links"), src.join("big/arena9-evil/links")).unwrap();

@@ -1110,7 +1110,8 @@ fn rotated(pods: &[String], cut_off: Option<&String>) -> Vec<String> {
 }
 
 /// The snap tier (§7.2, AD1/AD5/AD8): the baselines, then each label `plan_snap` names, pod by pod
-/// — each pod's two passes linked to its earlier labels and its baseline — state saved after each.
+/// — each pod's passes compared as [`push::pod_push`] says (by content wherever they link: a first
+/// push, a re-link, the check before a seal; A3-extra) — state saved after each.
 async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
     let o = ctx.o;
     // A dry run takes no lock (it changes nothing) and never reports "skipped" (AD9).
@@ -1223,6 +1224,8 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
         let base_local = if custom { None } else { push::baseline_for(label, &baselines) };
         let base_link = base_local.filter(|b| push::baseline_pushed(*b, &st)).map(|b| b.week);
         let started = (ctx.clock)();
+        // A push that may seal the label compares each pod's copy by content first (A3-extra).
+        let could_seal = end.is_some_and(|e| started >= e + push::GRACE_SECS);
         let budget = ctx.settings.snap_timeout;
         let deadline = tokio::time::Instant::now() + budget;
         let mut rec = st.labels.get(label).cloned().unwrap_or_default();
@@ -1243,7 +1246,9 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
         for pod in &order {
             let links = push::link_labels_for(label, pod, &st);
             let chain = !custom && push::chain_ok(label, pod, &local, &st, base_local);
-            let jobs = push::pod_jobs(ctx.dir, label, pod, &links, base_link);
+            let has_links = !links.is_empty() || base_link.is_some();
+            let how = push::pod_push(&rec, pod, chain, has_links, could_seal, forced);
+            let jobs = push::pod_jobs(ctx.dir, label, pod, &links, base_link, how);
             skip_note(ctx, &format!("snap {label} {pod}"), &jobs[0]);
             if o.dry_run {
                 if jobs[0].left_out.is_empty() {
@@ -1277,9 +1282,9 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
             let (outcome, sent) = run_push_logged(ctx, &src, &jobs, left).await;
             match outcome {
                 Ok((note, s)) => {
-                    push::note_push_ok(&mut rec, pod);
+                    push::note_push_ok(&mut rec, pod, how, chain, has_links, could_seal);
                     ok_pods.insert(pod.clone());
-                    linked &= chain;
+                    linked &= rec.pods_linked.contains(pod);
                     stats = stats.add(s.unwrap_or_default());
                     notes.extend(note);
                 }
@@ -2941,13 +2946,22 @@ mod tests {
         assert!(!is_sealed(&w, "w0d2", &["devtest-alpha"]), "today");
         assert!(!snap_state(&w).labels["w0d2"].linked, "pushed before w0d1 was there");
         assert!(state::load_big(&paths.sync_state(Tier::Big)).unwrap().last_ok.is_some());
-        // The next tick: w0d1 is final; w0d2 again, now linked to it.
+        // The next tick: w0d1 is final; w0d2 is checked against it (A3-extra): by content with
+        // the link, then the quick pass for the mtimes — per pass.
         fresh_calls(&w.dir);
         archive_sync(&w.cfg, &paths, sync_opts("both"), &stub, &clock(now + 900)).await.unwrap();
         let calls = rsync_calls(&w.dir);
-        assert_eq!(calls.len(), 3, "{calls:#?}");
+        assert_eq!(calls.len(), 5, "{calls:#?}");
         assert!(calls[0].ends_with(":snap/w0d2/devtest-alpha/") && calls[0].contains("--link-dest=/snap/w0d1/devtest-alpha/"));
+        assert!(calls[0].starts_with("-rl -J ") && calls[0].contains(" --checksum "), "{}", calls[0]);
+        assert!(calls[1].starts_with("-rlt ") && !calls[1].contains("--link-dest") && !calls[1].contains("--checksum"), "{}", calls[1]);
         assert!(snap_state(&w).labels["w0d2"].linked);
+        // And the tick after: a quick update, never a link source while the day runs.
+        fresh_calls(&w.dir);
+        archive_sync(&w.cfg, &paths, sync_opts("snap"), &stub, &clock(now + 1200)).await.unwrap();
+        let calls = rsync_calls(&w.dir);
+        assert_eq!(calls.len(), 2, "{calls:#?}");
+        assert!(calls.iter().all(|c| !c.contains("--link-dest") && !c.contains("--checksum")), "{calls:#?}");
         // --label: a final label again, and a custom one (no link-dest).
         fresh_calls(&w.dir);
         let o = SyncOpts { tier: "snap".into(), labels: vec!["w0d1".into(), "mylabel".into()], ..Default::default() };
@@ -3128,6 +3142,155 @@ mod tests {
         assert_eq!(after.labels.values().map(|r| r.ok_finished).collect::<Vec<_>>(), ok_before, "the last complete pushes stand");
         assert_eq!(after.last_error.as_ref().map(|e| e.class), Some(PushFailure::Stalled), "rsync's I/O timeout: the network's");
         assert!(state::load_big(&paths.sync_state(Tier::Big)).unwrap().last_ok.is_some(), "big still pushed");
+    }
+
+    /// The real rsync, its `-e` swapped for a shim that runs the push key's forced command (the
+    /// real rrsync, `-munge -wo -no-del -no-lock`, rooted at `<w>/push`) as sshd would: `archive
+    /// sync` end to end, offline. `None` without rsync, python3 or rrsync.
+    fn real_push(w: &World) -> Option<String> {
+        use std::os::unix::fs::PermissionsExt;
+        let rrsync = ["/usr/bin/rrsync", "/usr/share/doc/rsync/scripts/rrsync"].into_iter().find(|p| Path::new(p).exists())?;
+        if !have("rsync") || !have("python3") || !have("bash") {
+            return None;
+        }
+        let push = w.dir.join("push");
+        std::fs::create_dir_all(push.join("snap")).unwrap();
+        let line = render::render_push_key_line(rrsync, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPushPushPushPushPushPushPushPushPushPus1 x").unwrap();
+        let forced = line.split("command=\"").nth(1).unwrap().split('"').next().unwrap().replace(arena_core::archive::PUSH_ROOT, &push.display().to_string());
+        let shim = w.dir.join("sshd-shim");
+        std::fs::write(&shim, format!("#!/bin/sh\nwhile [ $# -gt 0 ] && [ \"$1\" != rsync ]; do shift; done\nSSH_ORIGINAL_COMMAND=\"$*\" exec {forced}\n")).unwrap();
+        let wrapper = w.dir.join("rsync-real");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/bash\na=()\nwhile [ $# -gt 0 ]; do if [ \"$1\" = -e ]; then a+=(-e {}); shift 2; else a+=(\"$1\"); shift; fi; done\nexec rsync \"${{a[@]}}\"\n",
+                shim.display()
+            ),
+        )
+        .unwrap();
+        for f in [&shim, &wrapper] {
+            std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        Some(wrapper.display().to_string())
+    }
+
+    /// Two pods' days whose `notes.txt` has the same size and mtime (to the nanosecond) but other
+    /// text — what rsync's quick check can't tell apart — beside a file and a `.git` that are the
+    /// same on every day.
+    fn same_stat_label(w: &World, label: &str) {
+        let t = std::time::UNIX_EPOCH + Duration::new(1_791_800_000, 500_000_000);
+        for pod in ["devtest-alpha", "devtest-bravo"] {
+            for (f, text) in [("notes.txt", format!("notes {label} {pod}\n")), ("sub/shared.txt", format!("shared {pod}\n")), ("repo/.git/HEAD", "ref: refs/heads/main\n".into())] {
+                let p = w.dir.join("backup").join(label).join(pod).join(f);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(&p, text).unwrap();
+                std::fs::File::options().write(true).open(&p).unwrap().set_modified(t).unwrap();
+            }
+        }
+    }
+
+    /// `cmp` of every archived file with its local source (`Err` names the first that differs —
+    /// or has no source); `Ok` is how many there are (all of them: completeness).
+    fn archive_matches_local(w: &World) -> std::result::Result<usize, String> {
+        let mut n = 0;
+        let snap = w.dir.join("push/snap");
+        let mut stack = vec![snap.clone()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                    continue;
+                }
+                let rel = p.strip_prefix(&snap).unwrap();
+                let local = w.dir.join("backup").join(rel);
+                let cmp = std::process::Command::new("cmp").arg("-s").arg(&local).arg(&p).status().unwrap();
+                if !cmp.success() {
+                    return Err(format!("{}: {:?} archived as {:?}", rel.display(), std::fs::read_to_string(&local).ok(), std::fs::read_to_string(&p).ok()));
+                }
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    fn archived_ino(w: &World, label: &str, rel: &str) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(w.dir.join("push/snap").join(label).join(rel)).unwrap().ino()
+    }
+
+    /// The state an `archive sync` needs (archive.json, the push key, a pin), no data.
+    fn seed_state_only(w: &World) {
+        seed(w);
+        for d in ["w0d1", "w0d2", "big", "mylabel"] {
+            let _ = std::fs::remove_dir_all(w.dir.join("backup").join(d));
+        }
+    }
+
+    /// A3-extra (live W7: an archived `notes.txt` held the previous day's text), end to end: the
+    /// real `archive sync` — its planner, push modes and state — through the real rsync and
+    /// rrsync, run again and again, in both label orders and as a first-ever backlog. After every
+    /// run every archived file is `cmp`-equal to its local source; the identical files still
+    /// share inodes and every label still seals.
+    #[tokio::test]
+    async fn a3_extra_every_archived_file_is_its_local_source_in_any_push_order() {
+        // Oldest first: w0d1 alone, then w0d2 appears (its first push links to w0d1), pushed
+        // again while open, then checked and sealed.
+        let w = world("a3x-oldfirst");
+        seed_state_only(&w);
+        let Some(rsync) = real_push(&w) else {
+            eprintln!("rsync/rrsync/python3 missing — skipping");
+            return;
+        };
+        let paths = w.env().paths;
+        same_stat_label(&w, "w0d1");
+        let now = day_end("w0d1") + 3 * 3600;
+        archive_sync(&w.cfg, &paths, sync_opts("snap"), &rsync, &clock(now)).await.unwrap();
+        assert_eq!(archive_matches_local(&w), Ok(6));
+        same_stat_label(&w, "w0d2");
+        for (i, at) in [now + 900, now + 1800, day_end("w0d2") + 3 * 3600, day_end("w0d2") + 3 * 3600 + 900].into_iter().enumerate() {
+            archive_sync(&w.cfg, &paths, sync_opts("snap"), &rsync, &clock(at)).await.unwrap();
+            assert_eq!(archive_matches_local(&w), Ok(12), "run {}", i + 2);
+        }
+        for pod in ["devtest-alpha", "devtest-bravo"] {
+            assert_eq!(archived_ino(&w, "w0d1", &format!("{pod}/sub/shared.txt")), archived_ino(&w, "w0d2", &format!("{pod}/sub/shared.txt")), "{pod}: the identical file is shared");
+        }
+        assert!(is_sealed(&w, "w0d1", &["devtest-alpha", "devtest-bravo"]) && is_sealed(&w, "w0d2", &["devtest-alpha", "devtest-bravo"]));
+
+        // Newest first: both days there before the first run (w0d2 is pushed before w0d1 exists
+        // on the archive), then the runs that re-link, check and seal it.
+        let w = world("a3x-newfirst");
+        seed_state_only(&w);
+        let rsync = real_push(&w).unwrap();
+        let paths = w.env().paths;
+        same_stat_label(&w, "w0d1");
+        same_stat_label(&w, "w0d2");
+        for (i, at) in [now, now + 900, now + 1800, day_end("w0d2") + 3 * 3600].into_iter().enumerate() {
+            archive_sync(&w.cfg, &paths, sync_opts("snap"), &rsync, &clock(at)).await.unwrap();
+            assert_eq!(archive_matches_local(&w), Ok(12), "run {}", i + 1);
+        }
+        assert_eq!(archived_ino(&w, "w0d1", "devtest-alpha/sub/shared.txt"), archived_ino(&w, "w0d2", "devtest-alpha/sub/shared.txt"), "re-linked");
+        assert_ne!(archived_ino(&w, "w0d1", "devtest-alpha/notes.txt"), archived_ino(&w, "w0d2", "devtest-alpha/notes.txt"));
+        assert!(is_sealed(&w, "w0d2", &["devtest-alpha", "devtest-bravo"]));
+
+        // A first-ever backlog of five days, every `notes.txt` the same size and mtime: the
+        // newest first, then the oldest three; the next run the rest; every run exact.
+        let w = world("a3x-backlog");
+        seed_state_only(&w);
+        let rsync = real_push(&w).unwrap();
+        let paths = w.env().paths;
+        for d in 1..=5 {
+            same_stat_label(&w, &format!("w0d{d}"));
+        }
+        let at = day_end("w0d5") + 3 * 3600;
+        for (i, (t, files)) in [(at, 24), (at + 900, 30), (at + 1800, 30)].into_iter().enumerate() {
+            archive_sync(&w.cfg, &paths, sync_opts("snap"), &rsync, &clock(t)).await.unwrap();
+            assert_eq!(archive_matches_local(&w), Ok(files), "run {} (run 1 defers w0d4: at most 3 older labels a run)", i + 1);
+        }
+        for d in 1..=5 {
+            assert!(is_sealed(&w, &format!("w0d{d}"), &["devtest-alpha", "devtest-bravo"]), "w0d{d}");
+            assert_eq!(archived_ino(&w, "w0d1", "devtest-bravo/sub/shared.txt"), archived_ino(&w, &format!("w0d{d}"), "devtest-bravo/sub/shared.txt"), "w0d{d}");
+        }
     }
 
     /// A held lock skips only that tier (exit 0); the other tier pushes.
