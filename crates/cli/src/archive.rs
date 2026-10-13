@@ -90,10 +90,14 @@ pub(crate) enum ArchiveCmd {
         #[arg(value_parser = ["on", "off"])]
         state: String,
     },
-    /// Print the participants' laptop ssh-config block (or, with --pod, the one `copy-keys` puts on pods).
+    /// Print the participants' laptop ssh-config block (or, with --pod, the one `copy-keys` puts on
+    /// pods; with --known-hosts, the laptops' arena_archive_known_hosts file the block reads).
     SshConfig {
-        #[arg(long)]
+        #[arg(long, conflicts_with = "known_hosts")]
         pod: bool,
+        /// The laptops' own known-hosts file for the archive: the pinned key under the alias.
+        #[arg(long)]
+        known_hosts: bool,
     },
     /// A root shell (or one command) on the archive: the admin key, the pinned host key.
     Ssh {
@@ -479,7 +483,9 @@ async fn server_ip(env: &Env<'_>, cloud: &dyn ArchiveCloud, server: &mut Option<
 /// known_hosts; a changed pin needs `--accept-new-host-key`.
 async fn pin_host_key(env: &Env<'_>, ip: &str, fresh: bool, accept_new: bool) -> Result<()> {
     let kh = env.paths.known_hosts();
-    let never_pinned = std::fs::read_to_string(&kh).map_or(true, |t| render::parse_known_hosts(&t).is_empty());
+    // The pin before this run — what pods and laptops hold — to say so if it changes (W7 A9).
+    let before = std::fs::read_to_string(&kh).unwrap_or_default();
+    let never_pinned = render::parse_known_hosts(&before).is_empty();
     let mut policy = if fresh || never_pinned {
         state::save_text(&kh, "").with_context(|| format!("resetting {}", kh.display()))?;
         HostKeyPolicy::PinFirstUse { known_hosts: kh.display().to_string() }
@@ -514,6 +520,10 @@ async fn pin_host_key(env: &Env<'_>, ip: &str, fresh: bool, accept_new: bool) ->
         tokio::time::sleep(SSH_RETRY).await;
     }
     println!("✓ SSH as root, host key pinned in {}", kh.display());
+    let after = std::fs::read_to_string(&kh).unwrap_or_default();
+    if let Some(notice) = render::host_key_change_notice(&env.names.alias(), ip, &before, &after, fingerprint(&kh).as_deref()) {
+        println!("{notice}");
+    }
     Ok(())
 }
 
@@ -1637,6 +1647,20 @@ pub(crate) fn laptop_block_for(cfg: &Config) -> std::result::Result<Option<Strin
     Ok(state::load_host(&paths.host_file())?.filter(ArchiveHost::is_up).map(|host| laptop_block(cfg, &host)))
 }
 
+/// The laptops' own known-hosts file for this config's archive (`render::LAPTOP_KNOWN_HOSTS`):
+/// the pinned key under the alias — what `arena ssh-config --out` writes beside the config, so
+/// handing out both again is the whole re-pin after a rebuild. `Ok(None)`: no archive up.
+pub(crate) fn laptop_known_hosts_for(cfg: &Config) -> std::result::Result<Option<String>, String> {
+    let paths = ArchivePaths::for_config(cfg)?;
+    let Some(host) = state::load_host(&paths.host_file())?.filter(ArchiveHost::is_up) else { return Ok(None) };
+    let text = std::fs::read_to_string(paths.known_hosts()).map_err(|e| format!("{}: {e}", paths.known_hosts().display()))?;
+    let keys = render::parse_known_hosts(&text);
+    if keys.is_empty() {
+        return Err(format!("no pinned host key in {} yet", paths.known_hosts().display()));
+    }
+    Ok(Some(render::render_laptop_known_hosts(&ArchiveNames { prefix: host.prefix }.alias(), &keys)))
+}
+
 /// `archive ssh-config [--pod]`.
 pub(crate) fn archive_ssh_config(env: &Env<'_>, pod: bool) -> Result<String> {
     let host = env.host_up()?;
@@ -2282,8 +2306,13 @@ pub(crate) async fn handle_archive(cmd: ArchiveCmd, cfg: &Config, remote: &dyn R
             archive_resize(&env, c, tier, gb, dry_run).await
         }
         ArchiveCmd::Access { state } => archive_access(&env, state == "on").await,
-        ArchiveCmd::SshConfig { pod } => {
-            print!("{}", archive_ssh_config(&env, pod)?);
+        ArchiveCmd::SshConfig { pod, known_hosts } => {
+            let text = if known_hosts {
+                laptop_known_hosts_for(env.cfg).map_err(anyhow::Error::msg)?.context("no archive is up (`arena archive up`)")?
+            } else {
+                archive_ssh_config(&env, pod)?
+            };
+            print!("{text}");
             Ok(())
         }
         ArchiveCmd::Ssh { cmd } => archive_ssh(&env, &cmd),
@@ -3617,8 +3646,65 @@ mod tests {
         assert!(a.lines().any(|l| l == format!("identityfile {identity}")), "{a}");
         assert!(a.lines().any(|l| l == "identitiesonly yes"), "{a}");
         assert!(!a.lines().any(|l| l == "hostname proxy.example.org"), "{a}");
+        // W7 A9: its host key is kept apart — under the alias, in a file of its own.
+        assert!(a.lines().any(|l| l == "hostkeyalias archive-devtest"), "{a}");
+        assert!(a.lines().any(|l| l.starts_with("userknownhostsfile ") && l.ends_with("/.ssh/arena_archive_known_hosts")), "{a}");
         let pod = g("devtest-alpha");
         assert!(pod.lines().any(|l| l == "user root") && pod.lines().any(|l| l == "hostname proxy.example.org"), "{pod}");
+    }
+
+    /// A provider with no pods (`arena ssh-config` lists them for the manual layout).
+    struct NoPods;
+
+    #[async_trait::async_trait]
+    impl arena_core::Provider for NoPods {
+        fn name(&self) -> &'static str {
+            "runpod"
+        }
+        fn describe(&self, _spec: &arena_core::PodSpec) -> String {
+            String::new()
+        }
+        async fn list_pods(&self) -> arena_core::Result<Vec<arena_core::Pod>> {
+            Ok(Vec::new())
+        }
+        async fn create_pod(&self, _spec: &arena_core::PodSpec) -> arena_core::Result<arena_core::Pod> {
+            unimplemented!("not exercised")
+        }
+        async fn stop_pod(&self, _id: &str) -> arena_core::Result<()> {
+            Ok(())
+        }
+        async fn restart_pod(&self, _id: &str) -> arena_core::Result<()> {
+            Ok(())
+        }
+        async fn terminate_pod(&self, _id: &str) -> arena_core::Result<()> {
+            Ok(())
+        }
+        async fn pod_spec(&self, _id: &str) -> arena_core::Result<arena_core::PodSpec> {
+            unimplemented!("not exercised")
+        }
+    }
+
+    /// W7 live (A9): a rebuilt archive (same IPv4, new host key) is re-pinned on laptops by handing
+    /// out `arena ssh-config --out` again: it writes the archive's pinned key under the alias in
+    /// the file the block reads, beside the config — rewritten with the new key after a rebuild.
+    #[tokio::test]
+    async fn ssh_config_out_writes_the_archives_own_known_hosts_file() {
+        let w = world("sshcfg-out");
+        w.up().await.unwrap();
+        let pin = |blob: &str| format!("{} ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI{blob}\n", w.host().ipv4);
+        std::fs::write(w.env().paths.known_hosts(), pin("OldOldOldOldOldOldOldOldOldOldOldOldOld01")).unwrap();
+        let out = w.dir.join("handout").join("config");
+        std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+        crate::handle_ssh_config(&NoPods, &w.cfg, false, Some(&out)).await.unwrap();
+        let config = std::fs::read_to_string(&out).unwrap();
+        assert!(config.contains("Host archive-devtest") && config.contains("HostKeyAlias archive-devtest"), "{config}");
+        let kh = || std::fs::read_to_string(w.dir.join("handout/arena_archive_known_hosts")).unwrap();
+        assert_eq!(kh(), "archive-devtest ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOldOldOldOldOldOldOldOldOldOldOldOldOld01\n");
+        // A rebuild re-pins: the next handout carries the new key, the address never matters.
+        std::fs::write(w.env().paths.known_hosts(), pin("NewNewNewNewNewNewNewNewNewNewNewNewNew01")).unwrap();
+        crate::handle_ssh_config(&NoPods, &w.cfg, false, Some(&out)).await.unwrap();
+        assert!(kh().starts_with("archive-devtest ") && kh().contains("NewNew") && !kh().contains("OldOld"), "{}", kh());
+        assert_eq!(laptop_known_hosts_for(&w.cfg).unwrap().as_deref(), Some(kh().as_str()));
     }
 
     /// §14.11: `cron install --archive` adds the two lines (start date on both) and keeps every

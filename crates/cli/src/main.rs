@@ -14136,6 +14136,14 @@ async fn handle_ssh_config(
     if let Some(path) = out {
         std::fs::write(path, &rendered).with_context(|| format!("writing {}", path.display()))?;
         eprintln!("\n(wrote {})", path.display());
+        // The archive block reads its host key from a file of its own (W7 A9): written beside
+        // the config, so handing out both again is the whole re-pin after a rebuild.
+        if let Ok(Some(kh)) = archive::laptop_known_hosts_for(cfg) {
+            let name = arena_core::archive::render::LAPTOP_KNOWN_HOSTS.trim_start_matches("~/.ssh/");
+            let file = path.parent().unwrap_or(std::path::Path::new(".")).join(name);
+            std::fs::write(&file, kh).with_context(|| format!("writing {}", file.display()))?;
+            eprintln!("(wrote {} — the archive's pinned host key; it belongs in ~/.ssh/ beside the config)", file.display());
+        }
     }
     Ok(())
 }

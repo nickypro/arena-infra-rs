@@ -208,14 +208,60 @@ pub fn render_readme(r: &ReadmeInputs) -> String {
     )
 }
 
-/// The participants' laptop block (§8.2): the cohort key, trust on first use — with the pinned
-/// fingerprint to compare by eye. Its alias escapes the fleet's `Host <prefix>-*` wildcard.
+/// Where a laptop keeps the archive's host key: a file of its own, the key under the alias
+/// (`HostKeyAlias`) — never `~/.ssh/known_hosts`. W7 live: a rebuilt archive kept its IPv4 with a
+/// new host key, and a laptop that had learnt the old key under that IP in its main file got
+/// "REMOTE HOST IDENTIFICATION HAS CHANGED". Under the alias the pin survives a new IP, never
+/// collides with whatever else used the address, and re-pinning touches nothing else:
+/// `arena ssh-config --out` rewrites the file; by hand, `ssh-keygen -R <alias> -f` it.
+pub const LAPTOP_KNOWN_HOSTS: &str = "~/.ssh/arena_archive_known_hosts";
+
+/// The participants' laptop block (§8.2): the cohort key, trust on first use into the block's
+/// own known-hosts file ([`LAPTOP_KNOWN_HOSTS`]) under the alias — with the pinned fingerprint to
+/// compare by eye, and what to do when the archive is rebuilt. Its alias escapes the fleet's
+/// `Host <prefix>-*` wildcard.
 pub fn render_laptop_block(alias: &str, host: &str, identity: &str, fingerprint: Option<&str>) -> String {
     let fp = match fingerprint {
         Some(f) => format!("# {f} — compare on first connect\n"),
         None => String::new(),
     };
-    format!("{fp}{}", crate::sshconfig::render_archive_block(alias, host, super::READ_USER, identity, None, "accept-new"))
+    let rebuilt = format!(
+        "# A rebuilt archive has a new host key: take the new block and its {} file, or run\n\
+         #   ssh-keygen -R {alias} -f {LAPTOP_KNOWN_HOSTS}\n# and compare the new fingerprint.\n",
+        LAPTOP_KNOWN_HOSTS.trim_start_matches("~/.ssh/")
+    );
+    let block = crate::sshconfig::render_archive_block(alias, host, super::READ_USER, identity, Some(LAPTOP_KNOWN_HOSTS), "accept-new", Some(alias));
+    format!("{fp}{rebuilt}{block}")
+}
+
+/// The laptop's own known-hosts file for the archive ([`LAPTOP_KNOWN_HOSTS`]): the pinned key(s)
+/// under the alias — what `arena ssh-config --out` writes beside the config.
+pub fn render_laptop_known_hosts(alias: &str, keys: &[(String, String)]) -> String {
+    render_known_hosts(alias, None, keys)
+}
+
+/// What `archive up` says when the archive's pinned host key changed — a new server after a loss
+/// (Hetzner may give it the same IPv4), or a re-pin: who holds the old pin and how each gets the
+/// new one. `None` when nothing was pinned before (a first `up`) or the key is the same.
+pub fn host_key_change_notice(alias: &str, ip: &str, before: &str, after: &str, fingerprint: Option<&str>) -> Option<String> {
+    let (old, new) = (parse_known_hosts(before), parse_known_hosts(after));
+    if old.is_empty() || new.is_empty() || old == new {
+        return None;
+    }
+    let same_ip = before
+        .lines()
+        .filter(|l| !l.trim_start().starts_with(['#', '@']))
+        .filter_map(|l| l.split_whitespace().next())
+        .any(|names| names.split(',').any(|n| n == ip));
+    let where_ = if same_ip { format!("the new server kept the IPv4 {ip}") } else { format!("the server is now at {ip}") };
+    let fp = fingerprint.map(|f| format!(" (now {f})")).unwrap_or_default();
+    Some(format!(
+        "⚠ The archive's host key changed{fp} — {where_}. Whoever pinned the old one is refused until re-pinned:\n\
+         \x20 pods:    `arena pods copy-keys --all` gives them the new pin (their `sftp {alias}` refuses it until then)\n\
+         \x20 laptops: hand out the new `arena ssh-config` (with `--out`: the config and its arena_archive_known_hosts file),\n\
+         \x20          or have them run `ssh-keygen -R {alias} -f {LAPTOP_KNOWN_HOSTS}`; a block from before kept the key in\n\
+         \x20          ~/.ssh/known_hosts: `ssh-keygen -R {ip}` there"
+    ))
 }
 
 /// Where a pod keeps the archive's read key and pinned host key (`copy-keys` writes both).
@@ -224,7 +270,7 @@ pub const POD_KNOWN_HOSTS: &str = ".ssh/arena_archive_known_hosts";
 
 /// A pod's block, inside its managed `~/.ssh/config` block: the read key, the pinned host key.
 pub fn render_pod_block(alias: &str, host: &str) -> String {
-    crate::sshconfig::render_archive_block(alias, host, super::READ_USER, &format!("~/{POD_KEY}"), Some(&format!("~/{POD_KNOWN_HOSTS}")), "yes")
+    crate::sshconfig::render_archive_block(alias, host, super::READ_USER, &format!("~/{POD_KEY}"), Some(&format!("~/{POD_KNOWN_HOSTS}")), "yes", None)
 }
 
 /// known_hosts lines for the pinned key(s): under the IP, and under `ARCHIVE_HOST` if set.
@@ -431,8 +477,12 @@ mod tests {
         let l = render_laptop_block("archive-arena9", "192.0.2.1", "~/.ssh/arena9_key", Some("ED25519 SHA256:abc"));
         assert_eq!(
             l,
-            "# ED25519 SHA256:abc — compare on first connect\nHost archive-arena9\n    HostName 192.0.2.1\n    User backups\n    \
-             IdentityFile ~/.ssh/arena9_key\n    IdentitiesOnly yes\n    StrictHostKeyChecking accept-new\n"
+            "# ED25519 SHA256:abc — compare on first connect\n\
+             # A rebuilt archive has a new host key: take the new block and its arena_archive_known_hosts file, or run\n\
+             #   ssh-keygen -R archive-arena9 -f ~/.ssh/arena_archive_known_hosts\n# and compare the new fingerprint.\n\
+             Host archive-arena9\n    HostName 192.0.2.1\n    User backups\n    \
+             IdentityFile ~/.ssh/arena9_key\n    IdentitiesOnly yes\n    StrictHostKeyChecking accept-new\n    \
+             UserKnownHostsFile ~/.ssh/arena_archive_known_hosts\n    HostKeyAlias archive-arena9\n"
         );
         let p = render_pod_block("archive-arena9", "archive.example.org");
         assert_eq!(
@@ -449,6 +499,30 @@ mod tests {
         assert_eq!(render_known_hosts("192.0.2.1", None, &keys).lines().count(), 1);
         let hashed = "|1|c2FsdA==|aGFzaA== ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHostHostHostHostHostHostHostHostHostHos5\n# c\n@revoked * ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAAgQ\n";
         assert_eq!(parse_known_hosts(hashed), keys);
+        assert_eq!(render_laptop_known_hosts("archive-arena9", &keys), format!("archive-arena9 ssh-ed25519 {}\n", keys[0].1));
+    }
+
+    /// W7 live (A9): a rebuilt server kept its IPv4 with a new host key. `up` says so — the pods'
+    /// fix and the laptops' (the alias-keyed file, and the old main-file pin under the IP) — and
+    /// says nothing on a first pin or when the key is the same.
+    #[test]
+    fn a_changed_host_key_is_announced_with_each_fix() {
+        let old = "2.28.196.210 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOldOldOldOldOldOldOldOldOldOldOldOldOld1\n";
+        let new = "2.28.196.210 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINewNewNewNewNewNewNewNewNewNewNewNewNew1\n";
+        let n = host_key_change_notice("archive-arena9", "2.28.196.210", old, new, Some("ED25519 SHA256:pXdR")).expect("a notice");
+        for needle in [
+            "host key changed (now ED25519 SHA256:pXdR)",
+            "kept the IPv4 2.28.196.210",
+            "`arena pods copy-keys --all`",
+            "ssh-keygen -R archive-arena9 -f ~/.ssh/arena_archive_known_hosts",
+            "`ssh-keygen -R 2.28.196.210`",
+        ] {
+            assert!(n.contains(needle), "{needle}: {n}");
+        }
+        let moved = host_key_change_notice("archive-arena9", "162.55.187.124", old, &new.replace("2.28.196.210", "162.55.187.124"), None).unwrap();
+        assert!(moved.contains("now at 162.55.187.124"), "{moved}");
+        assert_eq!(host_key_change_notice("archive-arena9", "2.28.196.210", "", new, None), None, "a first pin");
+        assert_eq!(host_key_change_notice("archive-arena9", "2.28.196.210", old, old, None), None, "the same key");
     }
 
     /// S6: no command or script arena runs on the archive can create a filesystem, wipe a
