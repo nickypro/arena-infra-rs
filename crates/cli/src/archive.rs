@@ -116,20 +116,28 @@ pub(crate) enum ArchiveCmd {
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// Stop archiving a pod for good — consent withdrawn, a box that turned out to be staff's: no
-    /// push takes it (or its -old/-new twins) again, whatever MACHINE_NAME_LIST says. With
-    /// `--delete-archived`, also delete what the archive holds of it (every label, both tiers),
-    /// after showing its size, with its name typed — access on or off.
+    /// Stop archiving a pod — consent withdrawn, a box that turned out to be staff's: no push
+    /// takes it (or its -old/-new twins) again, whatever MACHINE_NAME_LIST says, until `archive
+    /// unforget`. Shows what it would record and asks (`-y`, or `--confirm <name>`, without a
+    /// terminal). With `--delete-archived`, also delete what the archive holds of it (every label,
+    /// both tiers) for good, after showing its size, with its name typed — access on or off.
     Forget {
         /// The pod: `bravo` or `<prefix>-bravo`.
         pod: String,
-        /// Also delete its archived copy (both volumes).
+        /// Also delete its archived copy (both volumes) — for good: nothing brings it back.
         #[arg(long)]
         delete_archived: bool,
-        /// With --delete-archived: the pod's full name typed out (else asked at a terminal; `-y`
-        /// is not enough).
+        /// The pod's full name typed out: confirms the forget (as `-y` does) and, with
+        /// --delete-archived, the deletion (else asked at a terminal; `-y` is not enough for that).
         #[arg(long)]
         confirm: Option<String>,
+    },
+    /// Undo `archive forget <pod>`: pushes take the pod (and its -old/-new twins) again from the
+    /// next sync. What `--delete-archived` deleted stays deleted — only what the control box still
+    /// holds is pushed again.
+    Unforget {
+        /// The pod: `bravo` or `<prefix>-bravo`.
+        pod: String,
     },
 }
 
@@ -1703,13 +1711,16 @@ pub(crate) struct ForgetOpts {
 /// How long `forget --delete-archived` measures or deletes on the VM.
 const FORGET_TIMEOUT: Duration = Duration::from_secs(900);
 
-/// `archive forget <pod>` (A2-3): record the revocation first — local, instant, what every later
-/// push reads (`forgotten.json`, [`push::push_set`]) — in the state dir that holds this archive's
-/// `archive.json`, the one the cron's sync reads (A3-3: anywhere else it would protect nobody).
-/// Then, with `--delete-archived`: list what the archive holds of it, directory by directory
-/// with sizes, ask for the name typed — all without the sync locks (A3-8) — and only for the
-/// delete itself take both locks, so no push of this user's runs meanwhile; the VM re-checks its
-/// mounts and refuses with a volume unmounted. Over the admin path (root): access on or off.
+/// `archive forget <pod>` (A2-3): say what it would record, and record it only once confirmed —
+/// `-y`, the typed `--confirm <name>`, or a yes at a terminal (W7 live A-ckl8: it used to act at
+/// once, without a terminal or `-y`, as no other command that changes something does). The record
+/// is local and instant, and what every later push reads (`forgotten.json`, [`push::push_set`]),
+/// in the state dir that holds this archive's `archive.json`, the one the cron's sync reads
+/// (A3-3: anywhere else it would protect nobody); `archive unforget` lifts it. Then, with
+/// `--delete-archived`: list what the archive holds of it, directory by directory with sizes, ask
+/// for the name typed — all without the sync locks (A3-8) — and only for the delete itself take
+/// both locks, so no push of this user's runs meanwhile; the VM re-checks its mounts and refuses
+/// with a volume unmounted. Over the admin path (root): access on or off.
 pub(crate) async fn archive_forget(env: &Env<'_>, pod: &str, o: ForgetOpts, now: u64) -> Result<()> {
     let names = &env.names;
     let dirs = push::forget_dirs(&names.prefix, pod, &env.cfg.machine_names)
@@ -1725,15 +1736,27 @@ pub(crate) async fn archive_forget(env: &Env<'_>, pod: &str, o: ForgetOpts, now:
     let file = env.paths.forgotten();
     let mut forgotten = state::load_forgotten(&file).map_err(anyhow::Error::msg)?;
     let fresh: Vec<&String> = dirs.iter().filter(|d| !forgotten.pods.contains_key(*d)).collect();
-    for d in &dirs {
-        forgotten.pods.entry(d.clone()).or_insert(state::ForgetRecord { at: now, deleted: None });
-    }
-    state::save(&file, &forgotten).with_context(|| format!("writing {}", file.display()))?;
     let covers = dirs.join(", ");
+    // The name typed confirms the forget as `-y` does; another name confirms nothing (it is asked,
+    // or refused without a terminal) — and, with --delete-archived, deletes nothing.
+    let typed = o.confirm.as_deref().map(str::trim) == Some(base.as_str());
     if fresh.is_empty() {
         println!("{covers}: already forgotten — no push takes them ({}).", file.display());
     } else {
-        println!("✓ forgotten: {covers} — from the next sync on no push takes them, whatever MACHINE_NAME_LIST says (recorded in {}).", file.display());
+        println!(
+            "Forget {covers}: from the next sync on no push takes them, whatever MACHINE_NAME_LIST says (recorded in {}; \
+             `arena archive unforget {base}` lifts it — it never deletes anything by itself).",
+            file.display()
+        );
+        if !typed && !confirm(env.yes, &format!("Forget {covers}?"))? {
+            println!("aborted — nothing was recorded.");
+            return Ok(());
+        }
+        for d in &dirs {
+            forgotten.pods.entry(d.clone()).or_insert(state::ForgetRecord { at: now, deleted: None });
+        }
+        state::save(&file, &forgotten).with_context(|| format!("writing {}", file.display()))?;
+        println!("✓ forgotten: {covers}.");
     }
     if push::allowed_pod_dirs(&names.prefix, &env.cfg.machine_names).contains(&base) {
         println!("  note: it is still on MACHINE_NAME_LIST — forget wins for the archive; take it off the list if it should go everywhere.");
@@ -1835,6 +1858,41 @@ pub(crate) async fn archive_forget(env: &Env<'_>, pod: &str, o: ForgetOpts, now:
         }
         _ => bail!("the archive refused or failed the delete ({done:?}) — `arena archive ssh` to look"),
     }
+}
+
+/// `archive unforget <pod>`: take the pod (and its twins) off `forgotten.json`, once confirmed —
+/// pushes take them again from the next sync. A deletion (`forget --delete-archived`) isn't
+/// undone, and it says so: only what the control box still holds is pushed again.
+pub(crate) fn archive_unforget(env: &Env<'_>, pod: &str) -> Result<()> {
+    let names = &env.names;
+    let dirs = push::forget_dirs(&names.prefix, pod, &env.cfg.machine_names)
+        .with_context(|| format!("{pod:?}: a pod name (`bravo` or `{}-bravo`)", names.prefix))?;
+    let file = env.paths.forgotten();
+    let mut forgotten = state::load_forgotten(&file).map_err(anyhow::Error::msg)?;
+    let listed: Vec<String> = dirs.iter().filter(|d| forgotten.pods.contains_key(*d)).cloned().collect();
+    if listed.is_empty() {
+        println!("{}: not forgotten — nothing to undo ({}).", dirs.join(", "), file.display());
+        return Ok(());
+    }
+    let deleted: Vec<String> = listed.iter().filter(|d| forgotten.pods[*d].deleted.is_some()).cloned().collect();
+    println!("Unforget {}: pushes take them again from the next sync (if they're on MACHINE_NAME_LIST, or were archived before).", listed.join(", "));
+    if !deleted.is_empty() {
+        println!(
+            "  Their archived copy was DELETED (`forget --delete-archived`): that can't be undone — only what the control box still \
+             holds is pushed again: {}",
+            deleted.join(", ")
+        );
+    }
+    if !confirm(env.yes, &format!("Unforget {}?", listed.join(", ")))? {
+        println!("aborted — they stay forgotten.");
+        return Ok(());
+    }
+    for d in &listed {
+        forgotten.pods.remove(d);
+    }
+    state::save(&file, &forgotten).with_context(|| format!("writing {}", file.display()))?;
+    println!("✓ unforgotten: {} — the next sync pushes them again.", listed.join(", "));
+    Ok(())
 }
 
 /// Ask for `name` to be typed at a terminal (`false` without one: then `--confirm` is the way).
@@ -2323,6 +2381,7 @@ pub(crate) async fn handle_archive(cmd: ArchiveCmd, cfg: &Config, remote: &dyn R
         ArchiveCmd::Forget { pod, delete_archived, confirm } => {
             archive_forget(&env, &pod, ForgetOpts { delete_archived, confirm }, arena_core::snapshot::unix_now()).await
         }
+        ArchiveCmd::Unforget { pod } => archive_unforget(&env, &pod),
         ArchiveCmd::Sync { .. } => unreachable!("handled above"),
     }
 }
@@ -4005,6 +4064,43 @@ mod tests {
         assert!(said.iter().any(|l| l.contains("forgotten (`arena archive forget`): devtest-bravo, devtest-bravo-old")), "{said:#?}");
         assert!(is_sealed(&w, "w0d1", &["devtest-alpha"]), "a forgotten pod never holds a label open");
         assert!(archive_forget(&env, "../etc", ForgetOpts::default(), 600).await.is_err());
+    }
+
+    /// W7 live (A-ckl8): `forget` acted at once, without a terminal or `-y`. Now it says what it
+    /// would record and records it only once confirmed — `-y` or the pod's name typed with
+    /// `--confirm` (a wrong one records nothing) — and `unforget` lifts it, as asked as `forget`,
+    /// saying a deleted copy can't come back.
+    #[tokio::test]
+    async fn forget_asks_first_and_unforget_lifts_it() {
+        let w = forget_world("forget-ask").await;
+        let paths = w.env().paths;
+        let forgotten = || state::load_forgotten(&paths.forgotten()).unwrap().names().into_iter().collect::<Vec<_>>();
+        let asking = Env::new(&w.cfg, &w.remote, false).unwrap();
+        let e = archive_forget(&asking, "bravo", ForgetOpts::default(), 100).await.unwrap_err();
+        assert!(e.to_string().contains("--yes"), "no terminal, no -y: refused — {e}");
+        assert!(forgotten().is_empty(), "nothing recorded");
+        let wrong = ForgetOpts { confirm: Some("devtest-brav".into()), ..Default::default() };
+        assert!(archive_forget(&asking, "bravo", wrong, 100).await.unwrap_err().to_string().contains("--yes"), "another name confirms nothing");
+        assert!(forgotten().is_empty());
+        let typed = ForgetOpts { confirm: Some("devtest-bravo".into()), ..Default::default() };
+        archive_forget(&asking, "bravo", typed, 100).await.unwrap();
+        assert_eq!(forgotten(), ["devtest-bravo", "devtest-bravo-new", "devtest-bravo-old"]);
+        // Again: already forgotten, nothing to confirm.
+        archive_forget(&asking, "devtest-bravo", ForgetOpts::default(), 200).await.unwrap();
+        // Unforget asks the same way.
+        assert!(archive_unforget(&asking, "bravo").unwrap_err().to_string().contains("--yes"));
+        assert_eq!(forgotten().len(), 3, "still forgotten");
+        let mut f = state::load_forgotten(&paths.forgotten()).unwrap();
+        f.pods.get_mut("devtest-bravo").unwrap().deleted = Some(150);
+        state::save(&paths.forgotten(), &f).unwrap();
+        archive_unforget(&w.env(), "devtest-bravo").unwrap();
+        assert!(forgotten().is_empty(), "lifted, twins included");
+        archive_unforget(&w.env(), "bravo").unwrap();
+        assert!(archive_unforget(&w.env(), "../etc").is_err());
+        // Pushed again from the next sync.
+        let stub = rsync_stub(&w.dir);
+        archive_sync(&w.cfg, &paths, sync_opts("snap"), &stub, &clock(day_end("w0d1") + 3 * 3600)).await.unwrap();
+        assert!(rsync_calls(&w.dir).iter().any(|c| c.ends_with(":snap/w0d1/devtest-bravo/")), "{:#?}", rsync_calls(&w.dir));
     }
 
     /// A2-3: `--delete-archived` measures first and deletes nothing without the pod's name typed;
