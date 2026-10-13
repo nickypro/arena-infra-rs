@@ -4081,7 +4081,7 @@ fn handle_config(
 
 /// Report one config key: prints a ✓/✗/· line (never the value if `secret`) and
 /// records it in `missing` when it's required but absent/empty.
-fn cfg_row(cfg: &Config, missing: &mut Vec<String>, key: &str, required: bool, secret: bool) {
+fn cfg_row(out: &mut String, cfg: &Config, missing: &mut Vec<String>, key: &str, required: bool, secret: bool) {
     let ok = cfg.get(key).map(|v| !v.is_empty()).unwrap_or(false);
     let mark = if ok { "✓" } else if required { "✗" } else { "·" };
     let shown = if !ok {
@@ -4091,10 +4091,36 @@ fn cfg_row(cfg: &Config, missing: &mut Vec<String>, key: &str, required: bool, s
     } else {
         cfg.get(key).unwrap_or("").to_string()
     };
-    println!("  {mark} {key:<28} {shown}");
+    use std::fmt::Write as _;
+    let _ = writeln!(out, "  {mark} {key:<28} {shown}");
     if required && !ok {
         missing.push(key.to_string());
     }
+}
+
+/// `config check`'s entry for a value its parser refused, as `KEY (why)` — the key read off
+/// the error, which names it first (`KEY must be …`, `KEY="x" is not …`, `KEY: …`) — added
+/// once per key: a bad CUDA value breaks two rows (the create spec's and the deep check's
+/// driver floor) but is one key to fix.
+fn note_invalid(missing: &mut Vec<String>, e: &arena_core::Error) {
+    let msg = match e {
+        arena_core::Error::Config(m) => m.clone(),
+        other => other.to_string(),
+    };
+    let key: String = msg.chars().take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_').collect();
+    if key.is_empty() {
+        missing.push(msg);
+        return;
+    }
+    if missing.iter().any(|m| m.split([' ', '(']).next() == Some(key.as_str())) {
+        return;
+    }
+    let mut why = msg[key.len()..].trim_start_matches(['=', ':', ' ']).trim();
+    // The value itself is on its ✗ row.
+    if let Some(i) = why.rfind(" (got ").filter(|_| why.ends_with(')')) {
+        why = &why[..i];
+    }
+    missing.push(format!("{key} ({why})"));
 }
 
 /// The keys offered in the interactive `config set` picker, with whether each is a
@@ -4360,6 +4386,34 @@ fn vast_hosts_row(cfg: &Config) -> (String, bool) {
 /// Print a config checklist for the selected provider + proxy + backup, never showing
 /// secret values. Returns an error if a required key is missing.
 fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
+    let (report, missing) = config_report(cfg, provider_name);
+    print!("{report}");
+    if missing.is_empty() {
+        println!("\nOK — required keys for provider `{provider_name}` are present.");
+        Ok(())
+    } else {
+        // Set but invalid counts too (each such entry says why): "missing" alone misled.
+        anyhow::bail!("missing or invalid keys: {}", missing.join(", "))
+    }
+}
+
+/// [`config_check`]'s report — every section's rows — and what it fails on: the keys
+/// missing, or set to a value their parser refuses. Nothing is printed, so a test holds the
+/// ✗ rows against that list: a ✗ row means the check fails (a missing `GPU_TYPE`/`IMAGE`
+/// aside), a ⚠ row is advice.
+fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<String>) {
+    let mut out = String::new();
+    // Every row goes into `out`: within this function `println!` is this one, so a row added
+    // here later lands in the report, in order.
+    macro_rules! println {
+        () => {
+            out.push('\n')
+        };
+        ($($arg:tt)*) => {{
+            use std::fmt::Write as _;
+            let _ = writeln!(out, $($arg)*);
+        }};
+    }
     let mut missing: Vec<String> = Vec::new();
 
     // Show every provider's API key (set/empty), marking the selected one. Only the
@@ -4399,13 +4453,13 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
         }
     }
     if provider_name == "hetzner" {
-        cfg_row(cfg, &mut missing, "HETZNER_SERVER_TYPE", false, false);
-        cfg_row(cfg, &mut missing, "HETZNER_IMAGE", false, false);
-        cfg_row(cfg, &mut missing, "HETZNER_SSH_KEY", false, false);
+        cfg_row(&mut out, cfg, &mut missing, "HETZNER_SERVER_TYPE", false, false);
+        cfg_row(&mut out, cfg, &mut missing, "HETZNER_IMAGE", false, false);
+        cfg_row(&mut out, cfg, &mut missing, "HETZNER_SSH_KEY", false, false);
     }
 
     println!("\nMachine naming:");
-    cfg_row(cfg, &mut missing, "MACHINE_NAME_PREFIX", false, false);
+    cfg_row(&mut out, cfg, &mut missing, "MACHINE_NAME_PREFIX", false, false);
     println!(
         "  {} MACHINE_NAME_LIST          {} names",
         if cfg.machine_names.is_empty() { "✗" } else { "✓" },
@@ -4441,12 +4495,12 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
     }
 
     println!("\nSSH (backup + dashboard metrics):");
-    cfg_row(cfg, &mut missing, "SSH_USER", false, false);
-    cfg_row(cfg, &mut missing, "SHARED_SSH_KEY_PATH", false, false);
+    cfg_row(&mut out, cfg, &mut missing, "SSH_USER", false, false);
+    cfg_row(&mut out, cfg, &mut missing, "SHARED_SSH_KEY_PATH", false, false);
 
     println!("\nProxy (`proxy plan` / `proxy apply`):");
-    cfg_row(cfg, &mut missing, "SSH_PROXY_HOST", false, false);
-    cfg_row(cfg, &mut missing, "SSH_PROXY_STARTING_PORT", false, false);
+    cfg_row(&mut out, cfg, &mut missing, "SSH_PROXY_HOST", false, false);
+    cfg_row(&mut out, cfg, &mut missing, "SSH_PROXY_STARTING_PORT", false, false);
     // Absent and empty mean different things here (default reload vs never reload), so
     // this row can't use `cfg_row`'s set/missing view.
     let reload = arena_core::proxy::reload_cmd_from(cfg);
@@ -4460,9 +4514,9 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
     }
 
     println!("\nBackup (git `backup` + file `pull`):");
-    cfg_row(cfg, &mut missing, "ARENA_REPO_NAME", false, false);
-    cfg_row(cfg, &mut missing, "GIT_SSH_KEY_REMOTE", false, false);
-    cfg_row(cfg, &mut missing, "ARENA_START_DATE", false, false); // wNdM label (init-branches / pull)
+    cfg_row(&mut out, cfg, &mut missing, "ARENA_REPO_NAME", false, false);
+    cfg_row(&mut out, cfg, &mut missing, "GIT_SSH_KEY_REMOTE", false, false);
+    cfg_row(&mut out, cfg, &mut missing, "ARENA_START_DATE", false, false); // wNdM label (init-branches / pull)
     // Where `pods pull` rsyncs pod files to locally (config LOCAL_BACKUP_DIR, else ./backup),
     // shown as an absolute path so it's obvious where backups land.
     let backup_dir = local_backup_dir(cfg);
@@ -4497,17 +4551,20 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
             arena_core::error::human_duration(&d),
             if cfg.get("BACKUP_TIMEOUT_SECS").is_some_and(|v| !v.trim().is_empty()) { "" } else { " (default)" }
         ),
-        Err(e) => println!("  ✗ pull time budget per pod   {e}"),
+        Err(e) => {
+            println!("  ✗ pull time budget per pod   {e}");
+            note_invalid(&mut missing, &e);
+        }
     }
 
     println!("\nDashboard (optional):");
-    cfg_row(cfg, &mut missing, "PROGRESS_CMD", false, false);
+    cfg_row(&mut out, cfg, &mut missing, "PROGRESS_CMD", false, false);
 
     println!("\nEvals / model access (optional, `pods copy-keys` / `arena keys`):");
-    cfg_row(cfg, &mut missing, "HF_TOKEN", false, true); // broadcast for gated repos (Llama 3 …)
-    cfg_row(cfg, &mut missing, "CLAUDE_CODE_OAUTH_TOKEN", false, true); // broadcast for Claude Code
-    cfg_row(cfg, &mut missing, "OPENROUTER_PROVISIONING_KEY", false, true); // mints runtime keys
-    cfg_row(cfg, &mut missing, "OPENROUTER_KEY_LIMIT", false, false); // USD cap per generated key
+    cfg_row(&mut out, cfg, &mut missing, "HF_TOKEN", false, true); // broadcast for gated repos (Llama 3 …)
+    cfg_row(&mut out, cfg, &mut missing, "CLAUDE_CODE_OAUTH_TOKEN", false, true); // broadcast for Claude Code
+    cfg_row(&mut out, cfg, &mut missing, "OPENROUTER_PROVISIONING_KEY", false, true); // mints runtime keys
+    cfg_row(&mut out, cfg, &mut missing, "OPENROUTER_KEY_LIMIT", false, false); // USD cap per generated key
 
     // The balance sources as last seen (the state file only — no request): ⚠ rows are
     // advice, never missing keys; a ✗ row (a balance key set but invalid) fails the check.
@@ -4524,7 +4581,7 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
         let ok = readable(&resolved);
         println!(
             "  {} shared SSH key             {}{}",
-            if ok { "✓" } else { "✗" },
+            if ok { "✓" } else { "⚠" },
             resolved,
             if ok || resolved == k { String::new() } else { format!("  (configured: {k})") }
         );
@@ -4534,9 +4591,9 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
     }
     if let Some(k) = cfg.get("GIT_SSH_KEY_LOCAL") {
         let resolved = arena_core::ssh::resolve_key_path(k);
-        println!("  {} git deploy key (local)    {resolved}", if readable(&resolved) { "✓" } else { "✗" });
+        println!("  {} git deploy key (local)    {resolved}", if readable(&resolved) { "✓" } else { "⚠" });
         let pubk = format!("{resolved}.pub");
-        println!("  {} git deploy key .pub       {pubk}", if readable(&pubk) { "✓" } else { "✗" });
+        println!("  {} git deploy key .pub       {pubk}", if readable(&pubk) { "✓" } else { "⚠" });
     }
     let plan_present = readable("arena-plan.json");
     println!(
@@ -4546,7 +4603,7 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
     );
     println!(
         "  {} iteration start date       {}",
-        if cfg.get("ARENA_START_DATE").is_some() { "✓" } else { "✗" },
+        if cfg.get("ARENA_START_DATE").is_some() { "✓" } else { "⚠" },
         cfg.get("ARENA_START_DATE").unwrap_or("unset — backups can't label wNdM")
     );
     // The per-step setup budgets, as `pods setup`/`up` will use them (SETUP_TIMEOUT_SECS).
@@ -4557,7 +4614,10 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
             t.config.as_secs(),
             t.bare_vm.as_secs()
         ),
-        Err(e) => println!("  ✗ setup step budgets        {e}"),
+        Err(e) => {
+            println!("  ✗ setup step budgets        {e}");
+            note_invalid(&mut missing, &e);
+        }
     }
     // The driver floor `pods test --deep` holds pods to (MIN_DRIVER_VERSION, else derived
     // from ALLOWED_CUDA_VERSIONS).
@@ -4569,19 +4629,16 @@ fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
             }
             None => println!("  · deep-check driver floor   none (no MIN_DRIVER_VERSION / MIN_CUDA_VERSION / ALLOWED_CUDA_VERSIONS)"),
         },
-        Err(e) => println!("  ✗ deep-check driver floor   {e}"),
+        Err(e) => {
+            println!("  ✗ deep-check driver floor   {e}");
+            note_invalid(&mut missing, &e);
+        }
     }
     // The machines `up --check` remembers as bad (one small local file): where to look when
     // `up` keeps turning a machine away. Informational — never a missing key.
     bad_hosts_section(cfg, now).iter().for_each(|l| println!("{l}"));
 
-    if missing.is_empty() {
-        println!("\nOK — required keys for provider `{provider_name}` are present.");
-        Ok(())
-    } else {
-        // Set but invalid counts too (each such entry says why): "missing" alone misled.
-        anyhow::bail!("missing or invalid keys: {}", missing.join(", "))
-    }
+    (out, missing)
 }
 
 /// `config check`'s Balance section: each prepaid account's sources as last seen, from the
@@ -14800,6 +14857,69 @@ mod tests {
         // `config check` never shows secret values — not even a key pasted into RUNPOD_API.
         let (line, ok) = runpod_api_row(&Config::parse("RUNPOD_API=rpa_SECRETKEY123"));
         assert!(!ok && line.contains("✗") && !line.contains("SECRETKEY"), "{line}");
+    }
+
+    /// "✗ means fail": every key set to a value its parser refuses shows a ✗ row and is named —
+    /// once, however many rows it breaks — in `config check`'s "missing or invalid keys"
+    /// error, and every ✗ row names a key that error names; a valid config has neither,
+    /// whichever provider is selected. What's only not ready here (a key file this user can't
+    /// read, no ARENA_START_DATE) is a ⚠ row: advice, never a failure.
+    #[test]
+    fn config_check_invalid_values_are_exactly_its_cross_rows_and_its_error_list() {
+        use super::{config_report, Config};
+        // Everything required is there (dummy keys: nothing is called), GPU and image too.
+        let base = "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple)\nRUNPOD_API_KEY=not-a-real-key\n\
+                    HETZNER_API_KEY=not-a-real-key\nGPU_TYPE=\"NVIDIA RTX A4000\"\nIMAGE=img:1\n";
+        // (what's added to the base, the keys the check must fail on)
+        let cases: [(&str, &[&str]); 16] = [
+            ("", &[]),
+            ("SHARED_SSH_KEY_PATH=/nonexistent/k\nGIT_SSH_KEY_LOCAL=/nonexistent/d", &[]),
+            ("BACKUP_TIMEOUT_SECS=soon", &["BACKUP_TIMEOUT_SECS"]),
+            ("BACKUP_TIMEOUT_SECS=0", &["BACKUP_TIMEOUT_SECS"]),
+            ("SETUP_TIMEOUT_SECS=5m", &["SETUP_TIMEOUT_SECS"]),
+            ("MIN_DRIVER_VERSION=abc", &["MIN_DRIVER_VERSION"]),
+            ("VSCODE_PREINSTALL=maybe", &["VSCODE_PREINSTALL"]),
+            ("VSCODE_EXTENSIONS=bogus", &["VSCODE_EXTENSIONS"]),
+            // Two ✗ rows (the create spec's, the driver floor's), one key to fix.
+            ("ALLOWED_CUDA_VERSIONS=thirteen", &["ALLOWED_CUDA_VERSIONS"]),
+            ("RUNPOD_API=v3", &["RUNPOD_API"]),
+            ("VAST_ALLOW_UNVERIFIED=maybe", &["VAST_ALLOW_UNVERIFIED"]),
+            ("CREATE_EXTRA_JSON='[1]'", &["CREATE_EXTRA_JSON"]),
+            ("BALANCE_WARN_HOURS=soon", &["BALANCE_WARN_HOURS"]),
+            ("BALANCE_UNPRICED_PER_GPU=free", &["BALANCE_UNPRICED_PER_GPU"]),
+            ("SETUP_TIMEOUT_SECS=0\nMIN_DRIVER_VERSION=x.y\nBACKUP_TIMEOUT_SECS=-1", &["BACKUP_TIMEOUT_SECS", "MIN_DRIVER_VERSION", "SETUP_TIMEOUT_SECS"]),
+            (
+                "BALANCE_WARN_HOURS=-1\nRUNPOD_API=v9\nVSCODE_EXTENSIONS=x\nCREATE_EXTRA_JSON='[]'",
+                &["BALANCE_WARN_HOURS", "CREATE_EXTRA_JSON", "RUNPOD_API", "VSCODE_EXTENSIONS"],
+            ),
+        ];
+        for provider in ["runpod", "hetzner"] {
+            for (extra, want) in cases {
+                let (report, missing) = config_report(&Config::parse(&format!("{base}{extra}\n")), provider);
+                let mut named: Vec<&str> = missing.iter().map(|m| m.split([' ', '(']).next().unwrap_or_default()).collect();
+                named.sort_unstable();
+                assert_eq!(named, want, "{provider} {extra:?}: {missing:#?}");
+                let crossed: Vec<&str> = report.lines().map(str::trim_start).filter(|l| l.starts_with("✗ ")).collect();
+                for row in &crossed {
+                    assert!(want.iter().any(|k| row.contains(k)), "{provider} {extra:?}: a ✗ row for no failing key: {row}");
+                }
+                for key in want {
+                    assert!(crossed.iter().any(|row| row.contains(key)), "{provider} {extra:?}: {key} fails with no ✗ row:\n{report}");
+                }
+            }
+        }
+        // The entries say why, without the value (that's on its row).
+        let (_, missing) = config_report(&Config::parse(&format!("{base}BACKUP_TIMEOUT_SECS=soon\nMIN_DRIVER_VERSION=abc\n")), "runpod");
+        assert_eq!(
+            missing,
+            [
+                "BACKUP_TIMEOUT_SECS (must be a whole number of seconds, 1..=86400)",
+                "MIN_DRIVER_VERSION (\"abc\" is not a driver version like 580 or 580.65.06)",
+            ]
+        );
+        // Not ready here is ⚠, and named.
+        let (report, _) = config_report(&Config::parse(&format!("{base}SHARED_SSH_KEY_PATH=/nonexistent/k\n")), "runpod");
+        assert!(report.contains("  ⚠ shared SSH key") && report.contains("  ⚠ iteration start date       unset"), "{report}");
     }
 
     /// Finding #10: `config check` says whether creates ask for a CUDA floor or an exact set,

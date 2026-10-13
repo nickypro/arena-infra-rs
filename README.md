@@ -441,7 +441,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     (which only fires inside the night window, in system-local time) are the next step.
   - `config check` — validate that the keys the selected provider + proxy + backup
     need are present (never prints secret values; exits non-zero if a required key is
-    missing). Copy `config.env.example` to get started.
+    missing or any key is set to a value it can't use — every such key is a ✗ row and is
+    named in the error; ⚠ rows, e.g. a key file this user can't read or no
+    `ARENA_START_DATE`, are advice). Copy `config.env.example` to get started.
   - `cron install|remove|show` — manage arena's lines in your crontab (other entries are
     never touched). Each line has an identity — **backup**, **proxy**, **snapshot** — and
     `install` adds/replaces **only the lines its flags name**, keeping the rest (a later
