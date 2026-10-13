@@ -78,6 +78,20 @@ impl BalanceCtx {
         }
     }
 
+    /// Remember the per-GPU prices a live catalog or offer search gave a placement plan
+    /// (best effort, quiet): a known GPU's balance stand-in is never below them.
+    pub(crate) fn remember_gpu_prices(&self, plan: &OptionPlan) {
+        let live: Vec<(String, f64)> = plan
+            .options
+            .iter()
+            .filter(|o| o.price_source == Some(arena_core::placement::PriceSource::Live))
+            .filter_map(|o| o.price_per_gpu.map(|p| (o.gpu.clone(), p)))
+            .collect();
+        if let (Some(p), false) = (self.state_path(), live.is_empty()) {
+            let _ = balance::remember_gpu_prices(p, &live);
+        }
+    }
+
     /// Remember the prices of pods just made (best effort, quiet).
     pub(crate) fn remember_prices<'a>(&self, pods: impl IntoIterator<Item = &'a Pod>) {
         let pods: Vec<Pod> = pods.into_iter().cloned().collect();
@@ -244,29 +258,46 @@ pub(crate) async fn balance_preflight(
     let (state, _) = balance::commit(bal.state_path(), state, &fetched, &burns, mode, now);
     let (policy, _) = BalancePolicy::from_config(cfg);
     let views = balance::views(&state, &fetched, &burns, &policy, mode, now);
-    let new = new_pod_price(new_pods, options, spec, &policy);
+    let new = new_pod_price(new_pods, options, spec, &policy, &state.gpu_seen);
     views.first().map(|v| balance::preflight_lines_with(v, new, &policy, now)).unwrap_or_default()
 }
 
-/// What the new pods cost per pod at most: the dearest placement option, an unpriced one
-/// at its stand-in (it could be the dearest); on the single-spec path, the spec's GPU at a
-/// stand-in. `per_pod: None` only when not even a stand-in can be named.
-fn new_pod_price(count: usize, options: Option<&OptionPlan>, spec: &arena_core::PodSpec, policy: &BalancePolicy) -> balance::NewPods {
+/// What the new pods cost per pod at most: the dearest placement option — a live catalog
+/// price as it is; a preset estimate, or no price, at least the known GPU's stand-in (the
+/// most it is known to cost: RunPod's recorded catalog, live prices seen), an unknown GPU
+/// at the ceiling — and on the single-spec path the spec's GPU at that stand-in. `per_pod:
+/// None` only when not even a stand-in can be named.
+fn new_pod_price(
+    count: usize,
+    options: Option<&OptionPlan>,
+    spec: &arena_core::PodSpec,
+    policy: &BalancePolicy,
+    seen: &std::collections::BTreeMap<String, f64>,
+) -> balance::NewPods {
+    use arena_core::placement::PriceSource;
     let (mut guessed, mut ceiling) = (false, false);
-    let mut stand_in = |gpu: &str, n: u32| {
-        let found = balance::stand_in(Some(gpu), Some(n), policy);
-        guessed = true;
-        ceiling |= found.is_some_and(|(_, how)| how == balance::StandIn::Ceiling);
-        found.map(|(p, _)| p)
+    let mut stand_in = |gpu: &str, n: u32, floor: Option<f64>| {
+        let found = balance::stand_in_with(Some(gpu), Some(n), policy, seen);
+        match (found, floor) {
+            (Some((p, how)), f) if f.is_none_or(|f| p > f) => {
+                guessed = true;
+                ceiling |= how == balance::StandIn::Ceiling;
+                Some(p)
+            }
+            (_, f) => f,
+        }
     };
     let per_pod = match options {
         Some(plan) if !plan.options.is_empty() => plan
             .options
             .iter()
-            .map(|o| o.price_per_pod.or_else(|| stand_in(&o.gpu, o.gpu_count.max(1))))
+            .map(|o| match (o.price_per_pod, o.price_source) {
+                (Some(p), Some(PriceSource::Live)) => Some(p),
+                (p, _) => stand_in(&o.gpu, o.gpu_count.max(1), p),
+            })
             .collect::<Option<Vec<f64>>>()
             .map(|prices| prices.into_iter().fold(0.0, f64::max)),
-        _ => stand_in(&spec.gpu_type, spec.gpu_count.max(1)),
+        _ => stand_in(&spec.gpu_type, spec.gpu_count.max(1), None),
     };
     let known = per_pod.is_some();
     balance::NewPods { count, per_pod, stand_in: guessed && known, ceiling: ceiling && known }
@@ -601,7 +632,8 @@ mod tests {
         for needle in [
             "ACCOUNT   BALANCE  SOURCE        BURN  RUNWAY  RUNS OUT (UTC)    LEVEL",
             "runpod     $32.54  live       $0.47/h  ≈2.8d   2026-10-11 09:14  ⚠ low",
-            "vast      $136.87  live             ?  ?       -                 ok",
+            // Vast's listing failed: its burn is unknown, so it can't be judged (B2-2).
+            "vast      $136.87  live             ?  ?       -                 ? unknown",
             "hetzner  postpaid  postpaid  €0.006/h  -       -                 -",
             "  ⚠ runpod: ≈2.8d of runway at $0.47/h (≈ 2026-10-11 09:14 UTC), under BALANCE_WARN_HOURS=72",
             "  runpod: RunPod reports $0.22/h more than arena lists",
@@ -869,15 +901,49 @@ mod tests {
         }
     }
 
+    /// B2-4 / B2-6: a state that can't be saved (here `balance.json` is a directory: a
+    /// probe beside it would pass, the save never can) makes every inline surface read no
+    /// live balance at all — each `pods list` is a new process with no memory of the last
+    /// attempt — and say nothing; only `arena balance` reads live, and says why it can't keep it.
+    #[tokio::test]
+    async fn unsavable_state_makes_inline_surfaces_read_no_live_balance() {
+        let dir = StateDir::new("unsavable");
+        std::fs::create_dir_all(dir.file()).unwrap();
+        let fleet = Fleet { backends: vec![("runpod", Ok(vec![pod("devtest-apple", "RUNNING", 0.5, 1)]))] };
+        let (base_out, base_err) = crate::list_with(&fleet, &no_remote(), &dir.cfg(""), &no_balance(), false, false).await.unwrap();
+        for _ in 0..3 {
+            // A fresh process each time: a fresh reader, no memory of the last attempt.
+            let (api, bal) = ctx(FakeBalanceApi::new().live_ok(Account::Runpod, rp_live(40.0, 0.5)), Some(&dir));
+            assert_eq!(bal.inline_mode(), Mode::CacheOnly);
+            let (out, err) = crate::list_with(&fleet, &no_remote(), &dir.cfg(""), &bal, false, false).await.unwrap();
+            assert_eq!(err, base_err, "silent");
+            assert!(out.starts_with(&base_out) && out.ends_with("balance: runpod ? (no reading — arena balance set runpod <USD>) $0.50/h\n"), "{out}");
+            let spec = arena_core::PodSpec::from_config(&dir.cfg(""));
+            balance_preflight(&fleet, &dir.cfg(""), &bal, 1, None, &spec).await;
+            assert_eq!(api.live_calls(), 0, "no live call from an inline surface");
+        }
+        // `arena balance` reads live, and says the state can't be saved.
+        let (api, bal) = ctx(FakeBalanceApi::new().live_ok(Account::Runpod, rp_live(40.0, 0.5)), Some(&dir));
+        let out = balance_report(&fleet, &dir.cfg(""), &bal, BalanceFlags::default(), T0).await.unwrap();
+        assert_eq!(api.live_calls(), 1);
+        assert!(out.stdout.contains("$40.00  live"), "{}", out.stdout);
+        assert!(out.stderr.iter().any(|l| l.contains("can't be saved")), "{:?}", out.stderr);
+        // A writable state: inline.
+        let ok = StateDir::new("savable");
+        let (_, bal) = ctx(FakeBalanceApi::new(), Some(&ok));
+        assert_eq!(bal.inline_mode(), Mode::Inline);
+    }
+
     /// The new pods' price on the single-spec path: a known GPU at its preset, an unknown
     /// one (a B300, say) at the ceiling — said as such.
     #[test]
     fn new_pods_of_an_unknown_gpu_are_priced_at_the_ceiling() {
         let policy = BalancePolicy::default();
         let spec = |gpu: &str, n: u32| arena_core::PodSpec { gpu_type: gpu.into(), gpu_count: n, ..arena_core::PodSpec::from_config(&cfg()) };
-        let known = new_pod_price(3, None, &spec("NVIDIA RTX A4000", 1), &policy);
+        let none = std::collections::BTreeMap::new();
+        let known = new_pod_price(3, None, &spec("NVIDIA RTX A4000", 1), &policy, &none);
         assert_eq!((known.per_pod, known.stand_in, known.ceiling), (Some(0.32), true, false));
-        let unknown = new_pod_price(3, None, &spec("NVIDIA B300 SXM6 AC", 2), &policy);
+        let unknown = new_pod_price(3, None, &spec("NVIDIA B999 Mystery", 2), &policy, &none);
         assert_eq!((unknown.per_pod, unknown.stand_in, unknown.ceiling), (Some(16.0), true, true));
     }
 

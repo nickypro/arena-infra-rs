@@ -101,6 +101,8 @@ fn sandbox_pod(name: &str) -> Pod {
         machine_id: None,
         // Every recording but the lock PATCHes' answers is of the pod unlocked.
         locked: Some(false),
+        // Every recording is of a 60 GB container disk, no volume.
+        disk_gb: Some(60.0),
     }
 }
 

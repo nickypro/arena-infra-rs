@@ -2695,6 +2695,8 @@ async fn handle_offers(
     let base = spec_with_overrides(cfg, &SpecOverrides { gpus, ..Default::default() });
     let req = arena_core::placement::Request::from_flags(gpu.as_deref(), cloud.as_deref(), &base, max_price, order)?;
     let plan = plan_placement(cfg, provider_name, &req, &base).await?;
+    // Live catalog/offer prices are remembered for the balance's known-GPU stand-ins.
+    money::BalanceCtx::from_config(cfg).remember_gpu_prices(&plan);
     if json {
         println!("{}", serde_json::to_string_pretty(&plan)?);
         return Ok(());
@@ -5634,6 +5636,7 @@ async fn handle_pods_bal(
             let (spec, options) = match placing {
                 Some((req, base)) => {
                     let plan = plan_placement(cfg, provider.name(), &req, &base).await?;
+                    bal.remember_gpu_prices(&plan);
                     (base, Some(plan))
                 }
                 None => (spec_with_overrides(cfg, &ov), None),
@@ -5740,6 +5743,7 @@ async fn handle_pods_bal(
             let (spec, options) = match placing {
                 Some((req, base)) => {
                     let plan = plan_placement(cfg, provider.name(), &req, &base).await?;
+                    bal.remember_gpu_prices(&plan);
                     (base, Some(plan))
                 }
                 None => (spec_with_overrides(cfg, &ov), None),
@@ -16063,24 +16067,33 @@ mod placement_cli_tests {
         let req = arena_core::placement::Request::from_flags(Some("3090,A4000"), None, &base, None, Order::Listed).unwrap();
         let plan = plan_placement(&cfg(), "runpod", &req, &base).await.unwrap();
         let lines = money::balance_preflight(&fake, &cfg(), &bal, 1, Some(&plan), &base).await;
-        assert!(lines[0].starts_with("balance: runpod $0.10 live · $0.47/h now + ≤$") && lines[0].ends_with("‼ under 24h"), "{lines:?}");
-        assert!(lines.iter().any(|l| l.starts_with("⚠ RunPod needs ≥1h of credit for the new pods (≈$")), "{lines:?}");
+        // The options' prices are preset estimates (no key): raised to the known GPU's
+        // stand-in (RunPod's recorded catalog), marked `~`.
+        assert!(lines[0].starts_with("balance: runpod $0.10 live · $0.47/h now + ≤~$") && lines[0].ends_with("‼ under 24h"), "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("⚠ RunPod needs ≥1h of credit for the new pods (≈~$")), "{lines:?}");
         assert_eq!(lines.last().unwrap(), "‼ RunPod reports the account under its minimum balance — creates will likely fail");
     }
 
     #[tokio::test]
     async fn create_preflight_credit_and_spend_limit_lines() {
-        use arena_core::balance::Live;
+        use arena_core::balance::{BalancePolicy, Live};
         let base = spec_with_overrides(&cfg(), &SpecOverrides::default());
         let req = arena_core::placement::Request::from_flags(Some("A4000,3090"), None, &base, None, Order::Cheapest).unwrap();
         let plan = plan_placement(&cfg(), "runpod", &req, &base).await.unwrap();
-        let dearest = plan.options.iter().filter_map(|o| o.price_per_pod).fold(0.0, f64::max);
-        assert!(dearest > 0.0, "preset estimates price the options: {plan:?}");
+        // No key: the options carry preset estimates, so the bound is each option at the most
+        // its GPU is known to cost (A4000 $0.32, RTX 3090 $0.50 recorded) — here $0.50.
+        let policy = BalancePolicy::default();
+        let dearest = plan
+            .options
+            .iter()
+            .map(|o| o.price_per_pod.unwrap_or(0.0).max(arena_core::balance::stand_in_price(Some(&o.gpu), Some(o.gpu_count), &policy).unwrap()))
+            .fold(0.0, f64::max);
+        assert!((dearest - 0.5).abs() < 1e-9, "{plan:?}");
         // Plenty of money, but 400 new pods at the dearest option would pass the $80/h limit.
         let near_limit = Live { usd: 5_000.0, provider_burn_per_hr: Some(10.0), spend_limit_per_hr: Some(80.0), under_balance: Some(false), reduced: false, owed: None };
         let lines = money::balance_preflight(&Recorder::default(), &cfg(), &balance_of(near_limit), 400, Some(&plan), &base).await;
         let want = format!(
-            "⚠ planned ${:.2}/h exceeds RunPod's spend limit $80.00/h — creates past it will be refused",
+            "⚠ planned ~${:.2}/h exceeds RunPod's spend limit $80.00/h — creates past it will be refused",
             10.0 + 400.0 * dearest
         );
         assert!(lines.contains(&want), "{lines:?}");
@@ -16089,26 +16102,34 @@ mod placement_cli_tests {
         let thin = Live { usd: 1.0, provider_burn_per_hr: Some(0.0), spend_limit_per_hr: Some(80.0), under_balance: Some(false), reduced: false, owed: None };
         let lines = money::balance_preflight(&Recorder::default(), &cfg(), &balance_of(thin.clone()), 10, Some(&plan), &base).await;
         let credit = format!(
-            "⚠ RunPod needs ≥1h of credit for the new pods (≈${:.2}); the account has $1.00 — creates will likely fail (402)",
+            "⚠ RunPod needs ≥1h of credit for the new pods (≈~${:.2}); the account has $1.00 — creates will likely fail (402)",
             10.0 * dearest
         );
         assert!(lines.contains(&credit), "{lines:?}");
-        // The single-spec path: nothing priced the A4000 — it stands in at its dearer preset
-        // price ($0.32/h), never at $0: the runway and the credit check use it, marked `~`.
+        // The single-spec path: nothing priced the A4000 — it stands in at the most it is
+        // known to cost ($0.32/h), never at $0: the runway and the credit check use it, `~`.
         let lines = money::balance_preflight(&Recorder::default(), &cfg(), &balance_of(thin.clone()), 10, None, &base).await;
         assert_eq!(
             lines,
             [
-                "balance: runpod $1.00 live · $0.00/h now + ≤~$3.20/h for 10 new pod(s) (a stand-in price — nothing priced them) → <1h ‼ under 24h",
+                "balance: runpod $1.00 live · $0.00/h now + ≤~$3.20/h for 10 new pod(s) (a stand-in that errs high — no live price) → <1h ‼ under 24h",
                 "⚠ RunPod needs ≥1h of credit for the new pods (≈~$3.20); the account has $1.00 — creates will likely fail (402)",
             ]
         );
-        // An option nobody priced counts at its stand-in in the `≤` bound (it may be the dearest).
+        // An option nobody priced counts at its stand-in in the `≤` bound (it may be the
+        // dearest): an H100 SXM at RunPod's recorded $3.49, never the June preset's $2.79.
         let mut unpriced = plan.clone();
         unpriced.options[0].price_per_pod = None;
         unpriced.options[0].gpu = "NVIDIA H100 80GB HBM3".into();
-        let lines = money::balance_preflight(&Recorder::default(), &cfg(), &balance_of(thin), 10, Some(&unpriced), &base).await;
-        assert!(lines[0].contains("+ ≤~$27.90/h for 10 new pod(s)"), "{lines:?}");
+        let lines = money::balance_preflight(&Recorder::default(), &cfg(), &balance_of(thin.clone()), 10, Some(&unpriced), &base).await;
+        assert!(lines[0].contains("+ ≤~$34.90/h for 10 new pod(s)"), "{lines:?}");
+        // A live catalog price is taken as it is (it's what RunPod charges right now).
+        let mut live_priced = plan.clone();
+        for o in live_priced.options.iter_mut() {
+            (o.price_per_pod, o.price_source) = (Some(0.2), Some(arena_core::placement::PriceSource::Live));
+        }
+        let lines = money::balance_preflight(&Recorder::default(), &cfg(), &balance_of(thin), 10, Some(&live_priced), &base).await;
+        assert!(lines[0].contains("+ ≤$2.00/h for 10 new pod(s) →"), "{lines:?}");
         // No account for this provider configured: nothing.
         assert!(money::balance_preflight(&Recorder::default(), &cfg(), &money::BalanceCtx::from_config(&cfg()), 10, Some(&plan), &base).await.is_empty());
     }

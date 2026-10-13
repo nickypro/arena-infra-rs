@@ -97,6 +97,74 @@ pub const CLOCK_SKEW: u64 = 300;
 /// Runway below this many hours is critical (unless `BALANCE_WARN_HOURS=0`).
 pub const CRITICAL_HOURS: f64 = 24.0;
 
+/// What RunPod charged per GPU-hour on its dearest cloud for each GPU it listed, as recorded
+/// live on 2026-10-08 (`provider/fixtures/runpod_v2/catalog_community_cuda13.json`, max of
+/// community and secure). A known GPU's stand-in is never below this — the placement
+/// presets ([`crate::gpu::PRESETS`], from June) are, for five of them; a test keeps every
+/// entry at or above the fixture.
+pub const RECORDED_PER_GPU: &[(&str, f64)] = &[
+    ("AMD Instinct MI300X OAM", 2.39),
+    ("AMD Instinct MI350 OAM", 5.49),
+    ("NVIDIA A100 80GB PCIe", 1.59),
+    ("NVIDIA A100-SXM4-40GB", 1.0),
+    ("NVIDIA A100-SXM4-80GB", 1.59),
+    ("NVIDIA A40", 0.49),
+    ("NVIDIA B200", 6.79),
+    ("NVIDIA B300 SXM6 AC", 7.89),
+    ("NVIDIA B300 SXM6 AC MIG 1g.34gb", 0.5),
+    ("NVIDIA GeForce RTX 3070", 0.13),
+    ("NVIDIA GeForce RTX 3080", 0.17),
+    ("NVIDIA GeForce RTX 3080 Ti", 0.18),
+    ("NVIDIA GeForce RTX 3090", 0.5),
+    ("NVIDIA GeForce RTX 3090 Ti", 0.46),
+    ("NVIDIA GeForce RTX 4070 Ti", 0.5),
+    ("NVIDIA GeForce RTX 4080", 0.5),
+    ("NVIDIA GeForce RTX 4090", 0.74),
+    ("NVIDIA GeForce RTX 5080", 0.59),
+    ("NVIDIA GeForce RTX 5090", 0.99),
+    ("NVIDIA H100 80GB HBM3", 3.49),
+    ("NVIDIA H100 NVL", 3.19),
+    ("NVIDIA H100 PCIe", 2.89),
+    ("NVIDIA H200", 4.59),
+    ("NVIDIA H200 NVL", 3.79),
+    ("NVIDIA L4", 0.49),
+    ("NVIDIA L40", 0.82),
+    ("NVIDIA L40S", 1.09),
+    ("NVIDIA RTX 2000 Ada Generation", 0.5),
+    ("NVIDIA RTX 4000 Ada Generation", 0.28),
+    ("NVIDIA RTX 4000 SFF Ada Generation", 0.44),
+    ("NVIDIA RTX 5000 Ada Generation", 0.83),
+    ("NVIDIA RTX 6000 Ada Generation", 0.84),
+    ("NVIDIA RTX A2000", 0.5),
+    ("NVIDIA RTX A4000", 0.25),
+    ("NVIDIA RTX A4500", 0.25),
+    ("NVIDIA RTX A5000", 0.27),
+    ("NVIDIA RTX A6000", 0.53),
+    ("NVIDIA RTX PRO 4000 Blackwell", 0.57),
+    ("NVIDIA RTX PRO 4500 Blackwell", 0.72),
+    ("NVIDIA RTX PRO 4500 Blackwell Server Edition", 0.72),
+    ("NVIDIA RTX PRO 5000 Blackwell", 0.96),
+    ("NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition", 1.64),
+    ("NVIDIA RTX PRO 6000 Blackwell Server Edition", 2.09),
+    ("NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 1g.24gb", 0.59),
+    ("NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 2g.48gb", 1.09),
+    ("NVIDIA RTX PRO 6000 Blackwell Workstation Edition", 2.19),
+    ("Tesla V100-PCIE-16GB", 0.19),
+    ("Tesla V100-SXM2-16GB", 0.23),
+];
+
+/// A stopped RunPod pod's disk, $/GB-month: RunPod's published rate for an idle (stopped)
+/// pod's volume disk, applied to its container disk too — errs high.
+pub const RUNPOD_STOPPED_PER_GB_MONTH: f64 = 0.20;
+
+/// A stopped Vast instance's disk, $/GB-month: a ceiling — hosts set their own storage price
+/// (the recorded search's dearest is $0.33/GB-month), and Vast has no billing history to
+/// check against.
+pub const VAST_STOPPED_PER_GB_MONTH: f64 = 0.50;
+
+/// Hours in a storage month (Vast's own convention; RunPod's too, near enough).
+const HOURS_PER_MONTH: f64 = 720.0;
+
 /// `BALANCE_WARN_HOURS` when unset: a Friday-evening glance still covers the weekend.
 pub const DEFAULT_WARN_HOURS: f64 = 72.0;
 
@@ -468,9 +536,13 @@ pub struct Burn {
     /// Running pods with no price at all — none listed, none remembered, and no GPU to
     /// stand a price in for: the sum is a floor, and the account can't be judged ok.
     pub unpriced: usize,
-    /// Stopped pods whose disk still bills at a rate the listing doesn't carry (Vast keeps
-    /// charging storage; so does RunPod): the sum is a floor (a small one).
+    /// Stopped pods whose disk still bills but whose disk size isn't listed: the sum is a
+    /// floor (a small one).
     pub storage: usize,
+    /// Stopped pods whose disk is priced at a stand-in storage rate (errs high).
+    pub stopped: usize,
+    /// Their part of `per_hr`.
+    pub stopped_per_hr: f64,
     /// Running pods priced at a stand-in that errs high (the GPU's preset price, or
     /// `BALANCE_UNPRICED_PER_GPU` per GPU): the burn is shown `~`.
     pub guessed: usize,
@@ -490,7 +562,13 @@ impl Burn {
 
     /// Every pod in it was priced by the listing (or a remembered price): nothing stood in.
     pub fn exact(&self) -> bool {
-        self.unpriced == 0 && self.storage == 0 && self.guessed == 0
+        self.unpriced == 0 && self.storage == 0 && self.guessed == 0 && self.stopped == 0
+    }
+
+    /// The part priced at stand-ins (GPU guesses, stopped disks): what gives way to the
+    /// provider's own rate, which covers the whole account.
+    fn stand_in_per_hr(&self) -> f64 {
+        self.guessed_per_hr + self.stopped_per_hr
     }
 }
 
@@ -500,8 +578,11 @@ impl Burn {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Burns {
     by: BTreeMap<Account, Option<Burn>>,
-    /// `(pod id, USD/h)` the listing carried a price for, per account.
+    /// `(pod id, USD/h)` the listing carried a price for, per account (billing pods only).
     pub seen: BTreeMap<Account, Vec<(String, f64)>>,
+    /// Every pod id an answering listing showed, per account: a remembered price stays
+    /// alive while its pod keeps being listed, priced or not.
+    pub listed_ids: BTreeMap<Account, Vec<String>>,
 }
 
 impl Burns {
@@ -524,7 +605,7 @@ impl std::ops::Index<&Account> for Burns {
 
 impl FromIterator<(Account, Option<Burn>)> for Burns {
     fn from_iter<I: IntoIterator<Item = (Account, Option<Burn>)>>(iter: I) -> Self {
-        Burns { by: iter.into_iter().collect(), seen: BTreeMap::new() }
+        Burns { by: iter.into_iter().collect(), seen: BTreeMap::new(), listed_ids: BTreeMap::new() }
     }
 }
 
@@ -536,33 +617,55 @@ fn split_count(label: &str) -> (Option<u32>, &str) {
     }
 }
 
-/// The dearer of a known GPU's preset prices (community or secure), per GPU — matched by
-/// the provider's type string or the short label (`RTX 3090`, as Vast and the probe say). A
-/// MIG slice (`… MIG 1g.10gb`) is a fraction of its parent: the parent's price errs high.
-fn preset_per_gpu(gpu: &str) -> Option<f64> {
+/// What a known GPU costs at most per GPU-hour, by everything arena has seen: the dearer of
+/// its placement presets (community or secure), RunPod's recorded catalog price
+/// ([`RECORDED_PER_GPU`]) and the dearest live catalog/offer price seen for it (`seen`,
+/// from `balance.json`). Matched by the provider's type string or a short label (`RTX
+/// 3090`, as Vast and the probe say — resolved to RunPod's id). A MIG slice nobody lists is
+/// priced as its parent (errs high). `None`: an unknown GPU.
+fn known_per_gpu(gpu: &str, seen: &BTreeMap<String, f64>) -> Option<f64> {
+    let lookup = |name: &str| -> Option<f64> {
+        let name = name.trim();
+        let id = crate::gpu::PRESETS
+            .iter()
+            .find(|p| p.api.eq_ignore_ascii_case(name) || p.label.eq_ignore_ascii_case(name))
+            .map_or_else(|| crate::gpu::resolve(name), |p| p.api.to_string());
+        let preset = crate::gpu::PRESETS.iter().find(|p| p.api.eq_ignore_ascii_case(&id)).map(|p| p.community.max(p.secure));
+        let recorded = RECORDED_PER_GPU.iter().find(|(r, _)| r.eq_ignore_ascii_case(&id)).map(|r| r.1);
+        let live = seen.iter().filter(|(k, _)| k.eq_ignore_ascii_case(&id) || k.eq_ignore_ascii_case(name)).map(|(_, v)| *v).reduce(f64::max);
+        [preset, recorded, live].into_iter().flatten().reduce(f64::max)
+    };
     let g = gpu.trim();
-    let parent = g.find(" MIG ").map_or(g, |i| g[..i].trim());
-    crate::gpu::PRESETS
-        .iter()
-        .find(|p| p.api.eq_ignore_ascii_case(parent) || p.label.eq_ignore_ascii_case(parent))
-        .map(|p| p.community.max(p.secure))
+    lookup(g).or_else(|| g.find(" MIG ").and_then(|i| lookup(&g[..i])))
 }
 
 /// How a stand-in price was found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StandIn {
-    /// The GPU is a known preset: its dearer preset price.
+    /// A known GPU: the most it is known to cost ([`RECORDED_PER_GPU`], the presets, live
+    /// prices seen).
     Preset,
     /// The GPU type is unknown (or not given): the ceiling, `BALANCE_UNPRICED_PER_GPU`.
     Ceiling,
 }
 
+/// [`stand_in_with`] without any live price seen.
+pub fn stand_in(gpu_type: Option<&str>, gpu_count: Option<u32>, policy: &BalancePolicy) -> Option<(f64, StandIn)> {
+    stand_in_with(gpu_type, gpu_count, policy, &BTreeMap::new())
+}
+
 /// A stand-in $/h for a pod (or a planned one) nobody priced, erring high, and how it was
-/// found: a known preset GPU at its dearer preset price; an unknown GPU type (a MIG slice of
-/// an unknown parent included), or a GPU count with no type, at the ceiling
+/// found: a known GPU at the most it is known to cost ([`known_per_gpu`] — never below
+/// what RunPod's recorded catalog charges); an unknown GPU type (a MIG slice of an unknown
+/// parent included), or a GPU count with no type, at the ceiling
 /// [`BalancePolicy::unpriced_per_gpu`] per GPU. `None` when there is no GPU information at
 /// all — then it can't be priced.
-pub fn stand_in(gpu_type: Option<&str>, gpu_count: Option<u32>, policy: &BalancePolicy) -> Option<(f64, StandIn)> {
+pub fn stand_in_with(
+    gpu_type: Option<&str>,
+    gpu_count: Option<u32>,
+    policy: &BalancePolicy,
+    seen: &BTreeMap<String, f64>,
+) -> Option<(f64, StandIn)> {
     let (prefix, label) = match gpu_type.map(str::trim).filter(|t| !t.is_empty() && *t != "-") {
         Some(t) => {
             let (n, rest) = split_count(t);
@@ -571,7 +674,7 @@ pub fn stand_in(gpu_type: Option<&str>, gpu_count: Option<u32>, policy: &Balance
         None => (None, None),
     };
     let count = f64::from(gpu_count.filter(|n| *n > 0).or(prefix).or(label.map(|_| 1))?);
-    match label.and_then(preset_per_gpu) {
+    match label.and_then(|l| known_per_gpu(l, seen)) {
         Some(per_gpu) => Some((per_gpu * count, StandIn::Preset)),
         None => Some((policy.unpriced_per_gpu * count, StandIn::Ceiling)),
     }
@@ -597,15 +700,21 @@ pub fn burns_with(listing: &Listing, pods: &[Pod], state: &BalanceState, policy:
     let mut out = Burns::new();
     for a in Account::ALL {
         let remembered = state.accounts.get(&a).map(|st| &st.prices);
-        out.by.insert(a, listed_burn(listing, pods, a.name(), remembered, policy));
-        let seen: Vec<(String, f64)> = pods
-            .iter()
-            .filter(|p| p.provider == a.name() && !p.id.is_empty())
+        out.by.insert(a, listed_burn(listing, pods, a.name(), remembered, &state.gpu_seen, policy));
+        if listing.status(a.name()) != ListingStatus::Ok {
+            continue;
+        }
+        let mine = || pods.iter().filter(|p| p.provider == a.name() && !p.id.is_empty());
+        // Remember a price only from a pod that bills by the hour (a stopped pod's figure,
+        // if any, is its disk's, not what it costs once resumed).
+        let seen: Vec<(String, f64)> = mine()
+            .filter(|p| bills_hourly(&p.provider, &p.status))
             .filter_map(|p| p.cost_per_hr.filter(|c| c.is_finite() && *c > 0.0).map(|c| (p.id.clone(), c)))
             .collect();
-        if listing.status(a.name()) == ListingStatus::Ok && !seen.is_empty() {
+        if !seen.is_empty() {
             out.seen.insert(a, seen);
         }
+        out.listed_ids.insert(a, mine().map(|p| p.id.clone()).collect());
     }
     out
 }
@@ -615,11 +724,21 @@ fn gone_for_good(status: &str) -> bool {
     matches!(status.trim().to_ascii_lowercase().as_str(), "terminated" | "destroyed" | "deleted" | "dead")
 }
 
+/// A stopped pod's disk, $/h at the stand-in storage rate; `None` when its size isn't listed.
+fn stopped_disk_per_hr(provider: &str, disk_gb: Option<f64>) -> Option<f64> {
+    let rate = match provider {
+        "runpod" => RUNPOD_STOPPED_PER_GB_MONTH,
+        _ => VAST_STOPPED_PER_GB_MONTH,
+    };
+    disk_gb.filter(|g| g.is_finite() && *g >= 0.0).map(|g| g * rate / HOURS_PER_MONTH)
+}
+
 fn listed_burn(
     listing: &Listing,
     pods: &[Pod],
     provider: &str,
     remembered: Option<&BTreeMap<String, (f64, u64)>>,
+    gpu_seen: &BTreeMap<String, f64>,
     policy: &BalancePolicy,
 ) -> Option<Burn> {
     if listing.status(provider) != ListingStatus::Ok {
@@ -629,14 +748,23 @@ fn listed_burn(
     for p in pods.iter().filter(|p| p.provider == provider) {
         if !bills_hourly(&p.provider, &p.status) {
             if !gone_for_good(&p.status) && provider != "hetzner" {
-                b.storage += 1;
+                // A stopped pod still bills its disk: priced at a stand-in storage rate where
+                // the listing gives its size; otherwise counted as a floor.
+                match stopped_disk_per_hr(provider, p.disk_gb) {
+                    Some(c) => {
+                        b.per_hr += c;
+                        b.stopped += 1;
+                        b.stopped_per_hr += c;
+                    }
+                    None => b.storage += 1,
+                }
             }
             continue;
         }
         let price = p.cost_per_hr.filter(|c| c.is_finite() && *c >= 0.0);
         let remembered = || remembered.and_then(|m| m.get(&p.id)).map(|(c, _)| *c);
         // GPU stand-ins are for the prepaid GPU clouds; a Hetzner server type isn't a GPU.
-        let stand_in = || (provider != "hetzner").then(|| stand_in(p.gpu_type.as_deref(), p.gpu_count, policy)).flatten();
+        let stand_in = || (provider != "hetzner").then(|| stand_in_with(p.gpu_type.as_deref(), p.gpu_count, policy, gpu_seen)).flatten();
         match price.or_else(remembered) {
             Some(c) => b.per_hr += c,
             None => match stand_in() {
@@ -665,7 +793,7 @@ fn listed_burn(
 pub fn burn_now(listed: Option<Burn>, provider_rate: Option<f64>, samples: &[(u64, f64)]) -> Option<Burn> {
     let last = samples.last().map(|s| s.1);
     match (listed, provider_rate) {
-        (Some(l), Some(p)) => Some(Burn { per_hr: (l.per_hr - l.guessed_per_hr).max(p), ..Default::default() }),
+        (Some(l), Some(p)) => Some(Burn { per_hr: (l.per_hr - l.stand_in_per_hr()).max(p), ..Default::default() }),
         (Some(l), None) if l.unpriced > 0 => Some(Burn { per_hr: l.per_hr.max(last.unwrap_or(0.0)), ..l }),
         (Some(l), None) => Some(l),
         (None, Some(p)) => Some(Burn { per_hr: p, ..Default::default() }),
@@ -835,11 +963,15 @@ pub struct BalanceState {
     pub version: u32,
     #[serde(default)]
     pub accounts: BTreeMap<Account, AccountState>,
+    /// The dearest $/GPU-h a live catalog or offer search showed for each GPU type (`arena
+    /// offers`, `create`/`up` placement): a known GPU's stand-in is never below it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub gpu_seen: BTreeMap<String, f64>,
 }
 
 impl Default for BalanceState {
     fn default() -> Self {
-        BalanceState { version: STATE_VERSION, accounts: BTreeMap::new() }
+        BalanceState { version: STATE_VERSION, accounts: BTreeMap::new(), gpu_seen: BTreeMap::new() }
     }
 }
 
@@ -993,12 +1125,15 @@ pub fn level(
     if b <= 0.0 || under_balance == Some(true) {
         return Level::Critical;
     }
+    // No burn known at all (its listing failed, no rate, no usable sample): no warning can
+    // be judged — never "ok" on less information than a floor would give.
+    let Some(burn) = burn else { return Level::Unknown };
     if let Some(h) = runway_hours.filter(|_| policy.warn_hours > 0.0) {
         if h < CRITICAL_HOURS {
             return Level::Critical;
         }
     }
-    let floor_unjudged = burn.is_some_and(|b| b.unpriced > 0 || (b.floor() && b.per_hr < NO_BURN));
+    let floor_unjudged = burn.unpriced > 0 || (burn.floor() && burn.per_hr < NO_BURN);
     if floor_unjudged {
         return Level::Unknown;
     }
@@ -1138,7 +1273,8 @@ pub fn apply(mut state: BalanceState, fetched: &[Fetched], burns: &Burns, mode: 
             *st = AccountState::new(&f.key_fp);
         }
         let seen = burns.seen.get(&f.account).map(Vec::as_slice).unwrap_or_default();
-        apply_one(st, f, burns.get(&f.account).copied().flatten(), seen, mode, now);
+        let listed = burns.listed_ids.get(&f.account).map(Vec::as_slice).unwrap_or_default();
+        apply_one(st, f, burns.get(&f.account).copied().flatten(), seen, listed, mode, now);
     }
     state
 }
@@ -1159,12 +1295,19 @@ fn sanitize(st: &mut AccountState, now: u64) {
     }
 }
 
-fn apply_one(st: &mut AccountState, f: &Fetched, listed: Option<Burn>, seen: &[(String, f64)], mode: Mode, now: u64) {
+fn apply_one(st: &mut AccountState, f: &Fetched, listed: Option<Burn>, seen: &[(String, f64)], listed_ids: &[String], mode: Mode, now: u64) {
     sanitize(st, now);
+    // A remembered price is the pod's own: it goes SAMPLE_KEEP after the pod was last
+    // listed, and until then each listing of the pod — priced or not — refreshes it.
+    st.prices.retain(|_, (_, at)| now.saturating_sub(*at) <= SAMPLE_KEEP);
+    for id in listed_ids {
+        if let Some((_, at)) = st.prices.get_mut(id) {
+            *at = now;
+        }
+    }
     for (id, usd) in seen {
         st.prices.insert(id.clone(), (*usd, now));
     }
-    st.prices.retain(|_, (_, at)| now.saturating_sub(*at) <= SAMPLE_KEEP);
 
     let live = f.live_ok();
     let billed = f.billed_ok();
@@ -1477,7 +1620,7 @@ pub fn postpaid_view(listing: &Listing, pods: &[Pod]) -> Option<AccountView> {
         return None;
     }
     let mut v = AccountView::blank("hetzner", "EUR", Source::Postpaid);
-    v.burn = listed_burn(listing, pods, "hetzner", None, &BalancePolicy::default());
+    v.burn = listed_burn(listing, pods, "hetzner", None, &BTreeMap::new(), &BalancePolicy::default());
     v.listed_per_hr = v.burn.map(|b| b.per_hr);
     v.level = Level::None;
     Some(v)
@@ -1627,7 +1770,7 @@ pub fn source_label(v: &AccountView, now: u64) -> String {
 pub fn burn_label(v: &AccountView) -> String {
     match v.burn {
         Some(b) => {
-            let mark = if b.floor() { "≥" } else if b.guessed > 0 { "~" } else { "" };
+            let mark = if b.floor() { "≥" } else if b.guessed > 0 || b.stopped > 0 { "~" } else { "" };
             format!("{mark}{}/h", money(v, b.per_hr))
         }
         None => "?".into(),
@@ -1799,6 +1942,26 @@ fn unattributed(v: &AccountView) -> Option<f64> {
     }
 }
 
+/// Why a row's burn can't be judged (a known balance, level unknown).
+fn burn_unknown_why(v: &AccountView) -> String {
+    match v.burn {
+        None => "its listing didn't answer, and there is no rate or recent sample to go by".into(),
+        Some(b) => {
+            let mut why = Vec::new();
+            if b.unpriced > 0 {
+                why.push(format!("{} running pod(s) with no price and no GPU information", b.unpriced));
+            }
+            if b.storage > 0 {
+                why.push(format!("{} stopped pod(s) whose disk size isn't listed (their storage still bills)", b.storage));
+            }
+            if why.is_empty() {
+                why.push("the burn is only a floor".into());
+            }
+            why.join("; ")
+        }
+    }
+}
+
 /// What the live source's failure means for this row: an estimate is shown, the last
 /// reading still is (under 5 min old), or nothing usable is.
 fn failing_consequence(v: &AccountView, now: u64) -> String {
@@ -1829,9 +1992,10 @@ pub fn notes(views: &[AccountView], policy: &BalancePolicy, now: u64) -> Vec<Str
                 burn_label(v),
                 num(policy.warn_hours)
             )),
-            Level::Unknown => out.push(format!(
+            Level::Unknown if v.balance.is_none() => out.push(format!(
                 "? {name}: no usable reading — read the balance off the console and run `arena balance set {name} <USD>`"
             )),
+            Level::Unknown => out.push(format!("? {name}: burn unknown: {} — the runway can't be judged", burn_unknown_why(v))),
             _ => {}
         }
         if let Some(f) = v.live_failing.as_ref().filter(|_| v.noted) {
@@ -1875,10 +2039,18 @@ pub fn notes(views: &[AccountView], policy: &BalancePolicy, now: u64) -> Vec<Str
                 b.unpriced
             ));
         }
-        if let Some(b) = v.burn.filter(|b| b.storage > 0) {
+        if let Some(b) = v.burn.filter(|b| b.storage > 0 && v.level != Level::Unknown) {
             out.push(format!(
-                "{name}: {} stopped pod(s) still bill their disk at a rate the listing doesn't carry — not in the burn (a floor)",
+                "{name}: {} stopped pod(s) still bill their disk, whose size isn't listed — not in the burn (a floor)",
                 b.storage
+            ));
+        }
+        if let Some(b) = v.burn.filter(|b| b.stopped > 0) {
+            out.push(format!(
+                "{name}: {} stopped pod(s) still bill their disk — counted at a stand-in storage rate ({}/h; {})",
+                b.stopped,
+                usd(b.stopped_per_hr),
+                if name == "runpod" { "RunPod's $0.20/GB-month for an idle disk" } else { "a $0.50/GB-month ceiling" }
             ));
         }
         if let Some(o) = v.owed {
@@ -2071,7 +2243,7 @@ pub fn preflight_lines_with(v: &AccountView, new: NewPods, policy: &BalancePolic
             usd(x),
             usd(policy.unpriced_per_gpu)
         ),
-        Some(x) if new.stand_in => format!("≤{tilde}{}/h for {n} new pod(s) (a stand-in price — nothing priced them)", usd(x)),
+        Some(x) if new.stand_in => format!("≤{tilde}{}/h for {n} new pod(s) (a stand-in that errs high — no live price)", usd(x)),
         Some(x) => format!("≤{}/h for {n} new pod(s)", usd(x)),
         None => format!("{n} new pod(s) (price unknown)"),
     };
@@ -2305,17 +2477,35 @@ pub fn parse_state(text: &str) -> Result<BalanceState, String> {
 /// file created in it. Inline surfaces ask before a live read — without a state that
 /// keeps, nothing remembers the last attempt, and every look would read live again.
 pub fn writable(path: &Path) -> bool {
+    use std::io::Write as _;
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     if crate::snapshot::create_private_dir(dir).is_err() {
         return false;
     }
+    // The file itself must be one a save can replace (not a directory) and write.
+    let current = match std::fs::symlink_metadata(path) {
+        Ok(m) if !m.is_file() => return false,
+        Ok(m) => {
+            if std::fs::OpenOptions::new().append(true).open(path).is_err() {
+                return false;
+            }
+            m.len()
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(_) => return false,
+    };
+    // Then write — and fsync — as much as a save would, and more: an empty file needs only
+    // an inode, so a full disk or a spent block quota would pass while every save fails.
+    let size = current.saturating_mul(2).max(64 * 1024) as usize;
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
     let probe = dir.join(format!(".balance-probe-{}-{nanos}", std::process::id()));
-    let made = std::fs::OpenOptions::new().write(true).create_new(true).open(&probe).is_ok();
-    if made {
-        let _ = std::fs::remove_file(&probe);
-    }
-    made
+    let wrote = (|| -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&probe)?;
+        f.write_all(&vec![0u8; size])?;
+        f.sync_all()
+    })();
+    let _ = std::fs::remove_file(&probe);
+    wrote.is_ok()
 }
 
 /// Load tolerantly: missing → empty (normal before the first reading); unreadable, corrupt
@@ -2396,6 +2586,24 @@ pub fn record_manual(
         s
     })?;
     Ok((old, state, warning))
+}
+
+/// Remember the dearest $/GPU-h a live catalog or offer search showed per GPU type, so a
+/// known GPU's stand-in never falls below it. Keeps the max ever seen.
+pub fn remember_gpu_prices(path: &Path, prices: &[(String, f64)]) -> std::io::Result<()> {
+    let prices: Vec<&(String, f64)> = prices.iter().filter(|(g, p)| !g.trim().is_empty() && p.is_finite() && *p > 0.0 && *p <= 1_000.0).collect();
+    if prices.is_empty() {
+        return Ok(());
+    }
+    record(path, |mut s| {
+        s.version = STATE_VERSION;
+        for (g, p) in &prices {
+            let e = s.gpu_seen.entry(g.trim().to_string()).or_insert(*p);
+            *e = e.max(*p);
+        }
+        s
+    })
+    .map(|_| ())
 }
 
 /// Remember the prices `pods` carry (a `create`/`up` result, say) for the configured
@@ -3184,7 +3392,14 @@ mod tests {
             ("negative", Some(-3.0), None, Some(b(0.0)), 72.0, Level::Critical),
             ("underBalance", Some(500.0), Some(true), Some(b(0.1)), 72.0, Level::Critical),
             ("no burn", Some(10.0), None, Some(b(0.001)), 72.0, Level::Ok),
-            ("burn unknown, balance known", Some(10.0), None, None, 72.0, Level::Ok),
+            // B2-2: a known balance with no burn known at all can't be judged — never ok.
+            ("burn unknown, balance known", Some(10.0), None, None, 72.0, Level::Unknown),
+            // B2-6 (mutant m8): a floor that can't be judged reads unknown, short of critical —
+            // a running pod nobody could price, or stopped disks of unknown size and nothing else.
+            ("unpriced running pod, long runway", Some(500.0), None, Some(Burn { per_hr: 1.0, unpriced: 1, ..Default::default() }), 72.0, Level::Unknown),
+            ("unpriced running pod, short runway", Some(5.0), None, Some(Burn { per_hr: 1.0, unpriced: 1, ..Default::default() }), 72.0, Level::Critical),
+            ("stopped disks of unknown size only", Some(500.0), None, Some(Burn { storage: 3, ..Default::default() }), 72.0, Level::Unknown),
+            ("stopped disks priced, nothing running", Some(500.0), None, Some(Burn { per_hr: 0.04, stopped: 3, stopped_per_hr: 0.04, ..Default::default() }), 72.0, Level::Ok),
             ("unknown while burning", None, None, Some(b(0.5)), 72.0, Level::Unknown),
             ("unknown, burn unknown", None, None, None, 72.0, Level::Unknown),
             ("unknown but idle", None, None, Some(b(0.0)), 72.0, Level::Ok),
@@ -3755,7 +3970,7 @@ mod tests {
         let lines = preflight_lines_with(&rich, NewPods { count: 2, per_pod: Some(3.0), stand_in: true, ceiling: false }, &p, NOW);
         assert_eq!(
             lines,
-            ["balance: runpod $500.00 live · $0.47/h now + ≤~$6.00/h for 2 new pod(s) (a stand-in price — nothing priced them) → ≈3.2d"]
+            ["balance: runpod $500.00 live · $0.47/h now + ≤~$6.00/h for 2 new pod(s) (a stand-in that errs high — no live price) → ≈3.2d"]
         );
         // Vast: no RunPod-specific lines.
         let vast = lv(Account::Vast, 0.1, 0.0);
@@ -4424,16 +4639,20 @@ mod tests {
         // (gpu type, count, want price, how) — a known preset at its dearer preset price; an
         // unknown type (or a MIG slice of an unknown parent, or a count with no type) at the
         // ceiling; no GPU information at all: no price.
+        // Known GPUs at the most they are known to cost: the presets and RunPod's recorded
+        // catalog (H100 SXM $3.49, H200 $4.59, B200 $6.79, B300 $7.89 — the recorded price of
+        // its MIG slice too); a MIG slice nobody lists at its parent's.
         let cases: Vec<(Option<&str>, Option<u32>, Option<(f64, StandIn)>)> = vec![
             (Some("NVIDIA RTX A4000"), Some(1), Some((0.32, StandIn::Preset))),
-            (Some("RTX 3090"), Some(2), Some((0.86, StandIn::Preset))),
+            (Some("RTX 3090"), Some(2), Some((1.0, StandIn::Preset))),
             (Some("2×RTX A4000"), None, Some((0.64, StandIn::Preset))),
-            (Some("NVIDIA H100 80GB HBM3"), Some(1), Some((2.79, StandIn::Preset))),
-            (Some("NVIDIA H100 80GB HBM3 MIG 1g.10gb"), Some(1), Some((2.79, StandIn::Preset))),
-            (Some("NVIDIA H200"), Some(1), Some((8.0, StandIn::Ceiling))),
-            (Some("NVIDIA B200"), Some(8), Some((64.0, StandIn::Ceiling))),
-            (Some("NVIDIA B300 SXM6 AC"), Some(1), Some((8.0, StandIn::Ceiling))),
-            (Some("NVIDIA B300 SXM6 AC MIG 1g.34gb"), Some(1), Some((8.0, StandIn::Ceiling))),
+            (Some("NVIDIA H100 80GB HBM3"), Some(1), Some((3.49, StandIn::Preset))),
+            (Some("NVIDIA H100 80GB HBM3 MIG 1g.10gb"), Some(1), Some((3.49, StandIn::Preset))),
+            (Some("NVIDIA H200"), Some(1), Some((4.59, StandIn::Preset))),
+            (Some("NVIDIA B200"), Some(8), Some((54.32, StandIn::Preset))),
+            (Some("NVIDIA B300 SXM6 AC"), Some(1), Some((7.89, StandIn::Preset))),
+            (Some("NVIDIA B300 SXM6 AC MIG 1g.34gb"), Some(1), Some((0.5, StandIn::Preset))),
+            (Some("NVIDIA B999 Mystery MIG 1g.10gb"), Some(1), Some((8.0, StandIn::Ceiling))),
             (Some("Mystery GPU"), None, Some((8.0, StandIn::Ceiling))),
             (None, Some(4), Some((32.0, StandIn::Ceiling))),
             (Some("-"), None, None),
@@ -4450,7 +4669,7 @@ mod tests {
             assert_eq!(stand_in_price(ty, n, &p), got.map(|g| g.0));
         }
         let dear = BalancePolicy { unpriced_per_gpu: 12.0, ..Default::default() };
-        assert_eq!(stand_in(Some("NVIDIA B300 SXM6 AC"), Some(2), &dear), Some((24.0, StandIn::Ceiling)));
+        assert_eq!(stand_in(Some("NVIDIA B999 Mystery"), Some(2), &dear), Some((24.0, StandIn::Ceiling)));
         assert_eq!(stand_in(Some("NVIDIA RTX A4000"), Some(1), &dear), Some((0.32, StandIn::Preset)), "a known GPU ignores the ceiling");
     }
 
@@ -4468,6 +4687,106 @@ mod tests {
         assert!((dearest - 7.89).abs() < 1e-9, "the B300's secure price, as recorded: {dearest}");
         let presets = crate::gpu::PRESETS.iter().map(|g| g.community.max(g.secure)).fold(0.0, f64::max);
         assert!(DEFAULT_UNPRICED_PER_GPU > dearest && DEFAULT_UNPRICED_PER_GPU > presets);
+    }
+
+    /// B2-1: the compiled table is at or above what RunPod's recorded catalog charges for
+    /// every GPU it lists (its dearest cloud) — and so is every known-GPU stand-in.
+    #[test]
+    fn recorded_table_is_at_or_above_the_fixture() {
+        let catalog: Value = serde_json::from_str(include_str!("provider/fixtures/runpod_v2/catalog_community_cuda13.json")).unwrap();
+        let p = policy();
+        for g in catalog["body"]["gpus"].as_array().unwrap() {
+            let id = g["id"].as_str().unwrap();
+            let dearest = ["community", "secure"].iter().filter_map(|k| g["price"][*k].as_f64()).fold(0.0, f64::max);
+            if dearest <= 0.0 {
+                continue; // an unpriced catalog row ("unknown")
+            }
+            let row = RECORDED_PER_GPU.iter().find(|(r, _)| *r == id).unwrap_or_else(|| panic!("{id} missing from RECORDED_PER_GPU"));
+            assert!(row.1 >= dearest, "{id}: table ${} < RunPod ${dearest}", row.1);
+            let (s, how) = stand_in(Some(id), Some(1), &p).unwrap();
+            assert!(how == StandIn::Preset && s >= dearest, "{id}: stand-in ${s} < RunPod ${dearest}");
+        }
+    }
+
+    /// B2-1: a live catalog/offer price seen for a GPU raises its stand-in above the table;
+    /// remembering keeps the dearest ever seen.
+    #[test]
+    fn live_prices_seen_raise_a_known_stand_in() {
+        let dir = tmp("gpu-seen");
+        let path = dir.0.join("devtest").join(crate::snapshot::BALANCE_FILE);
+        remember_gpu_prices(&path, &[("NVIDIA H100 80GB HBM3".into(), 3.99), ("NVIDIA RTX A4000".into(), 0.2)]).unwrap();
+        remember_gpu_prices(&path, &[("NVIDIA H100 80GB HBM3".into(), 3.59), ("bogus".into(), f64::NAN)]).unwrap();
+        let (s, _) = load(&path);
+        assert_eq!(s.gpu_seen.get("NVIDIA H100 80GB HBM3"), Some(&3.99), "the dearest seen is kept");
+        assert!(!s.gpu_seen.contains_key("bogus"));
+        let p = policy();
+        let (h100, how) = stand_in_with(Some("NVIDIA H100 80GB HBM3"), Some(10), &p, &s.gpu_seen).unwrap();
+        assert!((h100 - 39.9).abs() < 1e-9 && how == StandIn::Preset, "{h100} {how:?}");
+        // A cheaper live price never lowers a known GPU below the table or presets.
+        assert_eq!(stand_in_with(Some("NVIDIA RTX A4000"), Some(1), &p, &s.gpu_seen), Some((0.32, StandIn::Preset)));
+        // And the listing's stand-ins use it too.
+        let l = listing(vec![("runpod", Ok(vec![Pod { id: "h".into(), provider: "runpod".into(), status: "RUNNING".into(), gpu_type: Some("NVIDIA H100 80GB HBM3".into()), gpu_count: Some(1), ..Default::default() }]))]);
+        assert!((burns_with(&l, &l.pods(), &s, &p)[&Account::Runpod].unwrap().per_hr - 3.99).abs() < 1e-9);
+    }
+
+    /// B2-3: stopped pods' disks are priced at a stand-in storage rate where the listing gives
+    /// their size — after a nightly `pods stop --all` a healthy account reads ok with a long
+    /// runway (`--check` 0); only a disk of unknown size leaves the burn a floor.
+    #[test]
+    fn stopped_disks_are_priced_and_a_stopped_fleet_reads_ok() {
+        let stopped = |provider: &str, disk: Option<f64>| Pod { provider: provider.into(), status: "EXITED".into(), disk_gb: disk, ..Default::default() };
+        let l = listing(vec![
+            ("runpod", Ok(vec![stopped("runpod", Some(120.0)), stopped("runpod", Some(60.0))])),
+            ("vast", Ok(vec![stopped("vast", Some(72.0))])),
+        ]);
+        let b = burns(&l, &l.pods());
+        let rp = b[&Account::Runpod].unwrap();
+        // 180 GB × $0.20/GB-month ÷ 720 h = $0.05/h.
+        assert_eq!((rp.stopped, rp.storage, rp.floor()), (2, 0, false));
+        assert!((rp.per_hr - 0.05).abs() < 1e-12 && (rp.stopped_per_hr - 0.05).abs() < 1e-12, "{rp:?}");
+        let vast = b[&Account::Vast].unwrap();
+        assert!((vast.per_hr - 0.05).abs() < 1e-12, "72 GB × $0.50 ÷ 720: {vast:?}"); // 72 × 0.5 / 720
+        let f = Fetched { account: Account::Runpod, key_fp: FP.into(), live: Some(Ok(live(300.0, None))), billed: None };
+        let v = views(&BalanceState::default(), &[f], &b, &policy(), Mode::Inline, NOW).remove(0);
+        assert_eq!((v.level, check_exit(std::slice::from_ref(&v))), (Level::Ok, 0));
+        assert_eq!((burn_label(&v).as_str(), fmt_runway(&v).as_str()), ("~$0.050/h", ">60d"));
+        assert!(notes(&[v], &policy(), NOW).iter().any(|n| n.contains("2 stopped pod(s) still bill their disk — counted at a stand-in storage rate")));
+        // RunPod's own rate, when read, covers the disks: the stand-in gives way.
+        assert_eq!(burn_now(Some(rp), Some(0.01), &[]).unwrap().per_hr, 0.01);
+        // A disk of unknown size: a floor — and with nothing else, unknown, said by cause.
+        let l = listing(vec![("vast", Ok(vec![stopped("vast", None)]))]);
+        let f = Fetched { account: Account::Vast, key_fp: FP.into(), live: Some(Ok(live(300.0, None))), billed: None };
+        let v = views(&BalanceState::default(), &[f], &burns(&l, &l.pods()), &policy(), Mode::Inline, NOW).remove(0);
+        assert_eq!(v.level, Level::Unknown);
+        let n = notes(&[v], &policy(), NOW);
+        assert!(n.iter().any(|l| l == "? vast: burn unknown: 1 stopped pod(s) whose disk size isn't listed (their storage still bills) — the runway can't be judged"), "{n:#?}");
+        assert!(!n.iter().any(|l| l.contains("balance set")), "{n:#?}");
+    }
+
+    /// B2-5: a price is remembered only from a pod that bills by the hour, and kept while
+    /// the pod keeps being listed — 15 days after its last listing it goes.
+    #[test]
+    fn prices_are_remembered_from_billing_pods_and_kept_while_listed() {
+        let pod = |status: &str, cost: Option<f64>| Pod { id: "p1".into(), provider: "runpod".into(), status: status.into(), cost_per_hr: cost, gpu_count: Some(1), ..Default::default() };
+        let p = policy();
+        let f = fetched(Account::Runpod, Some(Err(gone())), None);
+        // A stopped pod's figure (its disk's) is never remembered as its price.
+        let l = listing(vec![("runpod", Ok(vec![pod("EXITED", Some(0.006))]))]);
+        let s = apply(BalanceState::default(), std::slice::from_ref(&f), &burns_with(&l, &l.pods(), &BalanceState::default(), &p), Mode::Inline, NOW - 21 * 86_400);
+        assert!(s.accounts[&Account::Runpod].prices.is_empty());
+        // A billing pod's is; the pod listed (unpriced) daily for 20 days keeps it…
+        let l = listing(vec![("runpod", Ok(vec![pod("RUNNING", Some(0.17))]))]);
+        let mut s = apply(s, std::slice::from_ref(&f), &burns_with(&l, &l.pods(), &BalanceState::default(), &p), Mode::Inline, NOW - 20 * 86_400);
+        let bare = listing(vec![("runpod", Ok(vec![pod("RUNNING", None)]))]);
+        for d in 1..=20u64 {
+            let b = burns_with(&bare, &bare.pods(), &s, &p);
+            s = apply(s, std::slice::from_ref(&f), &b, Mode::Inline, NOW - 20 * 86_400 + d * 86_400);
+        }
+        assert_eq!(s.accounts[&Account::Runpod].prices.get("p1").map(|x| x.0), Some(0.17));
+        // …and 16 days after it was last listed at all, it's gone.
+        let none = listing(vec![("runpod", Ok(vec![]))]);
+        let s = apply(s, std::slice::from_ref(&f), &burns(&none, &[]), Mode::Inline, NOW + 16 * 86_400);
+        assert!(s.accounts[&Account::Runpod].prices.is_empty());
     }
 
     /// Every running pod gets a price that errs high: the listing's, the last one seen for
@@ -4986,5 +5305,160 @@ mod review_balance_correct {
         assert_eq!(v.source, Source::Live);
         let n = notes(&[v], &BalancePolicy::default(), NOW);
         assert!(!n.iter().any(|l| l.contains("estimates in use")), "the row is live, yet: {n:?}");
+    }
+}
+
+/// Adversarial re-review of the review fixes (9147170 + 05f6614): one test per new finding.
+/// Each asserts what the operator should be told; on 05f6614 each one FAILS.
+#[cfg(test)]
+mod review_balance_2 {
+    use super::*;
+    use crate::proxy::Listing;
+
+    const NOW: u64 = 1_791_460_800; // 2026-10-08T12:00:00Z, on the hour
+    const H: u64 = 3_600;
+    const D: u64 = 86_400;
+    const FP: &str = "9c3e01ab";
+
+    fn live(usd: f64, rate: Option<f64>) -> Live {
+        Live { usd, provider_burn_per_hr: rate, spend_limit_per_hr: None, under_balance: None, reduced: false, owed: None }
+    }
+
+    fn fetched(account: Account, live: Option<std::result::Result<Live, Fail>>) -> Fetched {
+        Fetched { account, key_fp: FP.into(), live, billed: None }
+    }
+
+    fn listing(provider: &str, pods: Vec<Pod>) -> Listing {
+        Listing::from_results(vec![(provider.to_string(), Ok(pods))])
+    }
+
+    /// B2-1: the "dearer preset" stand-in is below what RunPod's own recorded catalog (the
+    /// fixture the ceiling test reads) charges for the same GPU — H100 SXM secure $3.49 vs
+    /// the $2.79 stand-in, RTX 4090 $0.74 vs $0.69, RTX 3090 $0.50 vs $0.43, L40S, A40. The
+    /// stand-in is documented and shown as "errs high" (`≤~$X/h`), and the preflight's
+    /// "≥1h of credit" check then misses a create RunPod will refuse.
+    #[test]
+    fn b2_1_preset_stand_in_is_never_below_runpods_recorded_price() {
+        let catalog: Value =
+            serde_json::from_str(include_str!("provider/fixtures/runpod_v2/catalog_community_cuda13.json")).unwrap();
+        let p = BalancePolicy::default();
+        let below: Vec<String> = catalog["body"]["gpus"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|g| {
+                let id = g["id"].as_str()?;
+                let dearest = ["community", "secure"].iter().filter_map(|k| g["price"][*k].as_f64()).fold(0.0, f64::max);
+                match stand_in(Some(id), Some(1), &p) {
+                    Some((s, StandIn::Preset)) if s + 1e-9 < dearest => Some(format!("{id}: stand-in ${s:.2} < RunPod ${dearest:.2}")),
+                    _ => None,
+                }
+            })
+            .collect();
+        // The preflight consequence: 10 × H100 SXM on secure cost $34.90/h; $30 is under an
+        // hour of it, so RunPod will refuse the create (402) — the stand-in says $27.90.
+        let f = fetched(Account::Runpod, Some(Ok(live(30.0, Some(0.0)))));
+        let v = views(&BalanceState::default(), &[f], &Burns::new(), &p, Mode::Inline, NOW).remove(0);
+        let (per_pod, _) = stand_in(Some("NVIDIA H100 80GB HBM3"), Some(1), &p).unwrap();
+        let lines = preflight_lines_with(&v, NewPods { count: 10, per_pod: Some(per_pod), stand_in: true, ceiling: false }, &p, NOW);
+        assert!(
+            below.is_empty() && lines.iter().any(|l| l.contains("needs ≥1h of credit")),
+            "stand-ins below RunPod's price: {below:#?}\npreflight: {lines:#?}"
+        );
+    }
+
+    /// B2-2: a sub-cent floor (a listing of stopped pods) with a known balance is now level
+    /// Unknown (`--check` 3) — but an UNKNOWN burn (the listing failed; the last sample was $0,
+    /// which the fix rightly no longer trusts) with the same balance is level Ok (`--check` 0):
+    /// strictly less information reads better. Vast live $3, its instance listing down.
+    #[test]
+    fn b2_2_an_unknown_burn_with_a_known_balance_is_not_ok() {
+        let mut s = BalanceState::default();
+        s.accounts.insert(Account::Vast, AccountState { key_fp: FP.into(), samples: vec![(NOW - 2 * H, 0.0)], ..Default::default() });
+        let f = fetched(Account::Vast, Some(Ok(live(3.0, None))));
+        let failed: Burns = [(Account::Runpod, None), (Account::Vast, None)].into_iter().collect();
+        let v = views(&s, std::slice::from_ref(&f), &failed, &BalancePolicy::default(), Mode::Inline, NOW).remove(0);
+        assert_eq!((v.burn, fmt_runway(&v).as_str()), (None, "?"), "fixture: the burn is unknown");
+        // The same account with its listing up and three stopped instances: Unknown.
+        let stopped = listing("vast", (0..3).map(|_| Pod { provider: "vast".into(), status: "exited".into(), ..Default::default() }).collect());
+        let w = views(&s, std::slice::from_ref(&f), &burns(&stopped, &stopped.pods()), &BalancePolicy::default(), Mode::Inline, NOW).remove(0);
+        assert_eq!(w.level, Level::Unknown, "fixture: a sub-cent floor is Unknown");
+        assert_ne!(
+            (v.level, check_exit(std::slice::from_ref(&v))),
+            (Level::Ok, 0),
+            "$3 left, burn unknown, reads ok / `--check` 0 — while stopped disks read unknown / 3"
+        );
+    }
+
+    /// B2-3: level Unknown is now also reached WITH a live balance (a sub-cent floor: only
+    /// stopped pods, e.g. after the nightly `pods stop --all`; or a running pod with no GPU
+    /// info) — and the note still says "no usable reading — … arena balance set", a dead end
+    /// (`set` can't change a burn-driven Unknown) that contradicts the live row above it.
+    #[test]
+    fn b2_3_a_burn_driven_unknown_does_not_say_no_usable_reading() {
+        let stopped = listing("vast", (0..3).map(|_| Pod { provider: "vast".into(), status: "exited".into(), ..Default::default() }).collect());
+        let f = fetched(Account::Vast, Some(Ok(live(500.0, None))));
+        let v = views(&BalanceState::default(), &[f], &burns(&stopped, &stopped.pods()), &BalancePolicy::default(), Mode::Inline, NOW).remove(0);
+        assert_eq!((v.source, v.balance, v.level), (Source::Live, Some(500.0), Level::Unknown), "fixture");
+        let n = notes(std::slice::from_ref(&v), &BalancePolicy::default(), NOW);
+        assert!(!n.iter().any(|l| l.contains("no usable reading")), "a live $500 reading, yet: {n:#?}");
+    }
+
+    /// B2-4 (BS6, CLI half): the writability probe creates an EMPTY file; the save writes the
+    /// state and renames it over `balance.json`. Whatever lets the first and not the second
+    /// — a full disk or a block quota (an inode, no blocks), a `balance.json` that can't be
+    /// replaced — passes the probe, and every short-lived `pods list` reads live again
+    /// (no in-process memory survives between commands). Here `balance.json` is a directory.
+    #[tokio::test]
+    async fn b2_4_a_probe_that_passes_while_the_save_fails_still_bounds_live_calls() {
+        let dir = std::env::temp_dir().join(format!("arena-review-b2-4-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("devtest").join(crate::snapshot::BALANCE_FILE);
+        std::fs::create_dir_all(&path).unwrap(); // the probe's file fits beside it; the state can't replace it
+        let burns: Burns = [(Account::Runpod, Some(Burn { per_hr: 0.5, ..Default::default() }))].into_iter().collect();
+        let mut calls = 0;
+        for i in 0..3 {
+            let now = NOW + i * 60; // `watch -n60 arena pods list`: a new process each time
+            let api = FakeBalanceApi::new().live_ok(Account::Runpod, live(40.0, Some(0.5)));
+            let mode = if writable(&path) { Mode::Inline } else { Mode::CacheOnly }; // BalanceCtx::inline_mode
+            let (state, _) = load(&path);
+            let fetched = observe(&api, &state, mode, INLINE_TIMEOUT, now).await;
+            let (_, warning) = commit(Some(&path), state, &fetched, &burns, mode, now);
+            assert!(mode != Mode::Inline || warning.is_some(), "fixture: the save fails");
+            calls += api.live_calls();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(calls <= 1, "{calls} live calls in 3 minutes (FRESH = 5 min)");
+    }
+
+    /// B2-5: a remembered price expires 15 days after the pod was last seen WITH a price —
+    /// even while the same pod keeps being listed (unpriced) every day. On RunPod v1 after
+    /// GraphQL (nothing prices a pod any more: the fallback's whole purpose), every pod of a
+    /// long cohort then jumps to the ceiling ($8/GPU-h for a $0.17 A4000: 47×), the estimate
+    /// collapses and every surface reads critical "probably a top-up".
+    #[test]
+    fn b2_5_a_pod_still_listed_keeps_its_remembered_price() {
+        let pod = |cost: Option<f64>| Pod {
+            id: "p1".into(),
+            provider: "runpod".into(),
+            status: "RUNNING".into(),
+            cost_per_hr: cost,
+            gpu_count: Some(1),
+            ..Default::default()
+        };
+        let p = BalancePolicy::default();
+        let down = fetched(Account::Runpod, Some(Err(Fail::transient("503"))));
+        // Day 0: an enriched look prices p1 at $0.17.
+        let t0 = NOW - 16 * D;
+        let priced = listing("runpod", vec![pod(Some(0.17))]);
+        let mut s = apply(BalanceState::default(), std::slice::from_ref(&down), &burns_with(&priced, &priced.pods(), &BalanceState::default(), &p), Mode::Inline, t0);
+        // Then daily looks at the REST list alone: the same pod, no price.
+        let bare = listing("runpod", vec![pod(None)]);
+        for d in 1..=16 {
+            let b = burns_with(&bare, &bare.pods(), &s, &p);
+            s = apply(s, std::slice::from_ref(&down), &b, Mode::Inline, t0 + d * D);
+        }
+        let b = burns_with(&bare, &bare.pods(), &s, &p)[&Account::Runpod].unwrap();
+        assert_eq!((b.per_hr, b.guessed), (0.17, 0), "the same pod, listed every day, is now priced at {b:?}");
     }
 }

@@ -216,7 +216,15 @@ fn parse_pod(v: &Value) -> Pod {
         // it — `pods lock`/`unlock` need RUNPOD_API=v2 — but a lock set in the console is
         // still shown, and still refused up front by stop/restart/terminate).
         locked: v.get("locked").and_then(Value::as_bool),
+        disk_gb: disk_sum(&[v.get("containerDiskInGb"), v.get("volumeInGb")]),
     }
+}
+
+/// A pod's disk from its parts (GB): the sum of those reported, `None` when none is — a
+/// disk nobody reported isn't 0 GB.
+pub(crate) fn disk_sum(parts: &[Option<&Value>]) -> Option<f64> {
+    let known: Vec<f64> = parts.iter().flatten().filter_map(|v| loose_f64(v)).filter(|g| g.is_finite() && *g >= 0.0).collect();
+    (!known.is_empty()).then(|| known.iter().sum())
 }
 
 /// The pod objects in a 2xx `GET /pods` body: a top-level array (REST v1) or a `pods`

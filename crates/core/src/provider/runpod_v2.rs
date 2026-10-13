@@ -409,6 +409,8 @@ fn parse_pod(v: &Value) -> Pod {
         // `locked` (a bool on every v2 pod): stop/restart/terminate refused while true —
         // read from here, never inferred from `actions`, which still lists them.
         locked: v.get("locked").and_then(Value::as_bool),
+        // `disk` is the container disk; a persistent volume is `mounts.persistent.size`.
+        disk_gb: runpod::disk_sum(&[v.get("disk"), v.pointer("/mounts/persistent/size")]),
     }
 }
 
@@ -1025,6 +1027,8 @@ mod tests {
                 maintenance: None,
                 machine_id: None,
                 locked: Some(false),
+                // `disk` 100 + the persistent volume's 20.
+                disk_gb: Some(120.0),
             }
         );
     }

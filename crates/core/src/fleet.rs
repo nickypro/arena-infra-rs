@@ -497,6 +497,7 @@ mod tests {
                 )),
                 machine_id: None,
                 locked: None,
+                disk_gb: None,
             },
             Pod {
                 id: "def456".into(),

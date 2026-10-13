@@ -563,16 +563,20 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     Estimates err low (they warn early, never late) and never rise between readings.
     **Pods nobody priced** (RunPod v1's REST list has no $/h; `arena balance` and teardown
     don't fetch details; after GraphQL nothing does) are counted at the last price seen for
-    that pod (remembered in the state from any surface that saw one: an enriched `pods list`,
-    the TUI, a v2 listing, a `create`/`up` result), else at a stand-in that errs high — the
-    GPU's dearer preset price when it is a known one, else (an unknown GPU type) the ceiling
-    `BALANCE_UNPRICED_PER_GPU` (default $8, above the dearest recorded catalog price) per GPU — shown
-    `~$X/h` with a note; a running pod with no GPU information at all makes the account
-    `unknown` (never "no burn"). RunPod's own rate, while it is read, replaces the stand-ins.
+    that pod (remembered in the state from any surface that saw one — an enriched `pods
+    list`, the TUI, a v2 listing, a `create`/`up` result — only from pods that bill by the
+    hour, and kept while the pod keeps being listed, 15 days after that), else at a stand-in
+    that errs high: a known GPU at the most it is known to cost (RunPod's recorded catalog,
+    the presets, the dearest live catalog/offer price seen in `offers`/`create`/`up`), an
+    unknown GPU type at the ceiling `BALANCE_UNPRICED_PER_GPU` (default $8, above the dearest
+    recorded catalog price) per GPU — shown `~$X/h` with a note. A stopped pod's disk is
+    priced too, from the listing's disk size: RunPod $0.20/GB-month (its idle-disk rate),
+    Vast a $0.50/GB-month ceiling — so after a nightly `pods stop --all` a healthy account
+    reads ok. A running pod with no GPU information, a stopped pod whose disk size isn't
+    listed, or a burn not known at all make the account `unknown` ("burn unknown: …", never
+    "no burn"). RunPod's own rate, while it is read, replaces the stand-ins.
     **Known undercounts:** a pod created and destroyed between two observations while
-    billing is unavailable; stopped pods' disks (Vast has no billing history and its
-    listing carries no storage rate; RunPod's billing covers them, with its lag) — they make
-    the burn a floor (`≥`); and spend arena doesn't list that falls inside billing's lag.
+    billing is unavailable; and spend arena doesn't list that falls inside billing's lag.
     Vast's negative `balance`, when reported, is shown as "Vast reports $X owed" (never
     subtracted: what it means is for the live console comparison to settle). **Hetzner** is postpaid: €/h, no runway, never a
     warning; volumes aren't counted. Burn = the higher of the provider's own rate and this
@@ -587,8 +591,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     the fallback will have once RunPod's rate is gone), with this run's billing and with
     metering alone — either reading high is a ⚠ (`fallback check ✓ over 26h, checked 3m ago
     (the estimate read $0.40 low)`), so a broken fallback shows up while GraphQL still works.
-    If the state file can't be saved, inline surfaces read no live balance (they'd read it
-    on every look) and `arena balance` says so. `--no-live` shows what
+    If the state file can't be saved (a probe writes and fsyncs a state-sized file first, so a
+    full disk or a spent quota counts), inline surfaces read no live balance at all — they'd
+    read it on every look — and say nothing; `arena balance` reads live and says so. `--no-live` shows what
     the fallback says (no live call, nothing written); `-v` adds the burn's parts, spend
     limit, anchors, billing buckets, last failures and the state file. Exit 0; with
     `--check` 2 if any account is critical, else 3 if any is unknown while burning, else 1
