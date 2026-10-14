@@ -2804,3 +2804,23 @@ async fn review_w7lr_f2_never_promotes_a_copy_whose_terminate_was_never_sent() {
         w.notified()
     );
 }
+
+/// REVIEW w7lr (B-RS2 wording): the notice is meant to say exactly what a reap's backup leaves
+/// out ("one wording … in the NOTICE and README"), yet `REAP_NOT_KEPT` drops the VS Code server's
+/// `extensions/` — what the participant installed — while the summary only owns up to "the VS
+/// Code server's binaries"; and it drops `.ssh/` at ANY depth (unanchored), while the summary says
+/// `~/.ssh`. Each left-out path must be named by the participant's sentence.
+#[test]
+fn review_w7lr_the_notice_names_what_the_reap_tier_drops() {
+    use arena_core::pull::{REAP_NOT_KEPT, REAP_NOT_KEPT_SUMMARY};
+    assert!(REAP_NOT_KEPT.contains(&"/.vscode-server/extensions/"));
+    assert!(
+        REAP_NOT_KEPT_SUMMARY.contains("extensions"),
+        "the reap tier drops ~/.vscode-server/extensions/ but the notice only says binaries: {REAP_NOT_KEPT_SUMMARY}"
+    );
+    // `.ssh/` is either anchored to the home (what the notice says), or the notice says "any .ssh".
+    assert!(
+        REAP_NOT_KEPT.contains(&"/.ssh/") || !REAP_NOT_KEPT_SUMMARY.contains("~/.ssh"),
+        "the notice says ~/.ssh, the filter drops every .ssh/ at any depth: {REAP_NOT_KEPT:?}"
+    );
+}
