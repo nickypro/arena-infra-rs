@@ -1414,9 +1414,12 @@ deleted on its own.
   created empty by `archive up`, and every push's start is written and fsynced before rsync runs,
   so a push killed half-way is followed by a check, never by another first push). A sync state of
   unknown origin (a lost `sync-snap.json`) proves no absence: its first pushes wait for a check.
-  A pod whose pull is running (its backup lock held) waits for the next run rather than seeding a
-  half-written tree. The content read costs one pass of each pod's label at its first push and
-  one at its check.
+  A pod's first push of today's label waits while its pull runs (its backup lock held) rather than
+  seeding a half-written tree; a past label's tree is final and never waits, nor do later pushes.
+  A backup run holds each pod's lock from its start until that pod's rsync ends, so a pod can
+  wait run after run: after 4 runs (an hour at the cron's pace) `sync` and `status` ("waiting for
+  a pull") name it. The content read costs one pass of each pod's label at its first push and one
+  at its check.
 - **Only this cohort's pods leave the control box**: the `MACHINE_NAME_LIST` names (and their
   `-old`/`-new` twins), never `@` staff boxes or anything else an unscoped pull put there
   (`sync`/`status` list those as "kept on the control box only", apart from pods named like the
@@ -1431,8 +1434,10 @@ deleted on its own.
   `--delete-archived`, which lists every directory with its size, needs the name typed
   (`--confirm <prefix>-<pod>`) and only then takes the sync locks for the delete itself — and
   takes the pod out of the sync state, so none of its labels counts as pushed or final. After an
-  `unforget` every label the control box still holds of it is pushed and checked again; what the
-  control box no longer holds is lost for good, and `unforget` and `status` ("lost") say so.
+  `unforget` every dated label the control box still holds of it is pushed and checked again, and
+  its big tree copied again; a custom label only by `archive sync --label L` (it says so); what the
+  control box no longer holds — labels, or the big tree (`big/`) — is lost for good, and `unforget`
+  and `status` ("lost") say so.
   **Secret files never do**: shell rc files (the API keys `copy-keys` writes), histories,
   `.env*`, `.netrc`, `.gitconfig`, `.git-credentials`, `.pgpass`, `.s3cfg`, `.ssh/`, `.config/`,
   `.cache/`, `.claude*`, cloud and Kaggle credentials, Hugging Face token files, `id_*`/`*.pem`/
