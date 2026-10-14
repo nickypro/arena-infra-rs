@@ -14888,6 +14888,7 @@ mod selection_tests {
     /// (and may fail the exit), not veto the rest of `--all`.
     #[tokio::test]
     async fn review_sf_sf3_a_shadeform_pod_does_not_veto_stop_all() {
+        let mut vetoed = Vec::new();
         for status in ["RUNNING", "TERMINATED"] {
             let mut f = fleet();
             f.pods.push(pod("arena8-mayor", status, "shadeform", Some(1)));
@@ -14896,8 +14897,11 @@ mod selection_tests {
                 .map_err(|e| e.to_string());
             let got: Vec<String> = f.calls().into_iter().map(|(op, id)| format!("{op} {id}")).collect();
             let want: Vec<String> = ids(&["apple", "bloom", "cloud", "vm"]).into_iter().map(|id| format!("stop {id}")).collect();
-            assert_eq!(got, want, "Shadeform pod {status}: `pods stop --all` stopped nothing else ({r:?})");
+            if got != want {
+                vetoed.push(format!("Shadeform pod {status}: stopped {got:?}, not {want:?} ({r:?})"));
+            }
         }
+        assert!(vetoed.is_empty(), "a Shadeform pod vetoed `pods stop --all`:\n{}", vetoed.join("\n"));
     }
 
     #[tokio::test]
