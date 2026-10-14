@@ -1973,10 +1973,21 @@ pub(crate) async fn archive_forget(env: &Env<'_>, pod: &str, o: ForgetOpts, now:
             // locks, so no sync rewrites the state meanwhile: the labels reopen for these dirs
             // (pushed and checked again after `unforget`, never called final meanwhile).
             let cleared = clear_pushes(&env.paths, &dirs);
+            // What was deleted: what the VM listed, and what the sync state knew (RR2).
+            let mut gone = push::deleted_from_listing(&listing);
+            if let Ok(known) = &cleared {
+                for (d, c) in known {
+                    let g = gone.entry(d.clone()).or_default();
+                    g.labels.extend(c.labels.iter().cloned());
+                    g.big |= c.big;
+                }
+            }
             for dir in &dirs {
                 if let Some(r) = forgotten.pods.get_mut(dir) {
+                    let g = gone.remove(dir).unwrap_or_default();
                     r.deleted = Some(now);
-                    r.deleted_labels = cleared.as_ref().ok().and_then(|m| m.get(dir).cloned()).unwrap_or_default();
+                    r.deleted_labels = g.labels;
+                    r.deleted_big = g.big;
                 }
             }
             state::save(&file, &forgotten).with_context(|| format!("writing {}", file.display()))?;
@@ -1990,20 +2001,24 @@ pub(crate) async fn archive_forget(env: &Env<'_>, pod: &str, o: ForgetOpts, now:
 }
 
 /// Take `dirs` out of both tiers' sync state ([`push::forget_pushes`]) — their archived copy was
-/// deleted — and return, per dir, the snapshot labels it held. The caller holds both tier locks.
-fn clear_pushes(paths: &ArchivePaths, dirs: &[String]) -> Result<std::collections::BTreeMap<String, std::collections::BTreeSet<String>>> {
+/// deleted — and return, per dir, what the state knew it held: snapshot labels, a big copy. The
+/// caller holds both tier locks.
+fn clear_pushes(paths: &ArchivePaths, dirs: &[String]) -> Result<std::collections::BTreeMap<String, push::DeletedCopy>> {
     let snap_path = paths.sync_state(Tier::Snap);
     let mut snap = state::load_snap(&snap_path).map_err(anyhow::Error::msg)?;
-    let labels = push::forget_pushes(&mut snap, dirs);
+    let mut known: std::collections::BTreeMap<String, push::DeletedCopy> =
+        push::forget_pushes(&mut snap, dirs).into_iter().map(|(d, labels)| (d, push::DeletedCopy { labels, big: false })).collect();
     state::save(&snap_path, &snap).context("saving sync-snap.json")?;
     let big_path = paths.sync_state(Tier::Big);
     let mut big = state::load_big(&big_path).map_err(anyhow::Error::msg)?;
     for d in dirs {
-        big.pods_ok_at.remove(d);
-        big.pods_failing.remove(d);
+        let was = big.pods_ok_at.remove(d).is_some() | big.pods_failing.remove(d).is_some();
+        if was {
+            known.entry(d.clone()).or_default().big = true;
+        }
     }
     state::save(&big_path, &big).context("saving sync-big.json")?;
-    Ok(labels)
+    Ok(known)
 }
 
 /// `archive unforget <pod>`: take the pod (and its twins) off `forgotten.json`, once confirmed —
@@ -2021,25 +2036,31 @@ pub(crate) fn archive_unforget(env: &Env<'_>, pod: &str) -> Result<()> {
         return Ok(());
     }
     let deleted: Vec<String> = listed.iter().filter(|d| forgotten.pods[*d].deleted.is_some()).cloned().collect();
-    // R2: of what the delete removed, what the control box still holds comes back; the rest is
-    // gone for good — said here, and by `status` from now on.
+    // R2/RR2: of what the delete removed — snapshot labels and the big copy — what the control box
+    // still holds comes back; the rest is gone for good — said here, and by `status` from now on.
     let backup = PathBuf::from(super::local_backup_dir(env.cfg));
-    let comes_back = |d: &str| -> (Vec<String>, Vec<String>) {
-        forgotten.pods[d].deleted_labels.iter().cloned().partition(|l| backup.join(l).join(d).is_dir())
-    };
+    let big_root = big_root_for(env.cfg, &backup);
     println!("Unforget {}: pushes take them again from the next sync (if they're on MACHINE_NAME_LIST, or were archived before).", listed.join(", "));
     let mut lost: Vec<(String, Vec<String>)> = Vec::new();
     for d in &deleted {
-        let (back, gone) = comes_back(d);
-        if back.is_empty() && gone.is_empty() {
+        let r = &forgotten.pods[d];
+        let gone = push::DeletedCopy { labels: r.deleted_labels.clone(), big: r.deleted_big };
+        let c = push::comeback(&gone, |l| backup.join(l).join(d).is_dir(), big_root.join(d).is_dir());
+        if gone == push::DeletedCopy::default() {
             println!("  {d}: its archived copy was DELETED (`forget --delete-archived`) — the next sync pushes what the control box still holds of it");
         }
-        if !back.is_empty() {
-            println!("  {d}: deleted from the archive, still on the control box — pushed (and checked) again: {}", back.join(", "));
+        if !c.pushed.is_empty() {
+            println!("  {d}: deleted from the archive, still on the control box — pushed (and checked) again: {}", c.pushed.join(", "));
         }
-        if !gone.is_empty() {
-            println!("  {d}: deleted from the archive and gone from the control box — LOST for good: {}", gone.join(", "));
-            lost.push((d.clone(), gone));
+        if c.big_back {
+            println!("  {d}: its big copy was deleted from the archive; the control box still holds it — the next big push copies it again");
+        }
+        for l in &c.by_label {
+            println!("  {d}: the custom label {l} was deleted from the archive; the control box still holds it, but a sync pushes it only when asked: `arena archive sync --label {l}`");
+        }
+        if !c.lost.is_empty() {
+            println!("  {d}: deleted from the archive and gone from the control box — LOST for good: {}", c.lost.join(", "));
+            lost.push((d.clone(), c.lost));
         }
     }
     if !confirm(env.yes, &format!("Unforget {}?", listed.join(", ")))? {

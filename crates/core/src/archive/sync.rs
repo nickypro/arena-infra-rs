@@ -356,6 +356,65 @@ pub fn forget_pushes(st: &mut SnapState, dirs: &[String]) -> std::collections::B
     out
 }
 
+/// What `forget --delete-archived` removed of one pod dir: the snapshot labels it held, and
+/// whether its big copy.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeletedCopy {
+    pub labels: BTreeSet<String>,
+    pub big: bool,
+}
+
+/// The pod dirs and what of them the VM listed before deleting (`item=<bytes>\t<dir>` lines of
+/// `render::forget_command`: `snap/<label>/<pod>`, `big/<pod>`) — what the delete removed,
+/// whatever the sync state knew (re-review RR2).
+pub fn deleted_from_listing(listing: &str) -> std::collections::BTreeMap<String, DeletedCopy> {
+    let mut out: std::collections::BTreeMap<String, DeletedCopy> = Default::default();
+    for dir in listing.lines().filter_map(|l| l.strip_prefix("item=")).filter_map(|i| i.split_once('\t').map(|(_, d)| d.trim())) {
+        let parts: Vec<&str> = dir.split('/').filter(|p| !p.is_empty()).collect();
+        match parts.as_slice() {
+            ["snap", label, pod] => {
+                out.entry(pod.to_string()).or_default().labels.insert(label.to_string());
+            }
+            ["big", pod] => out.entry(pod.to_string()).or_default().big = true,
+            _ => {}
+        }
+    }
+    out
+}
+
+/// What `unforget` says of a pod dir's deleted copy (R2, RR2), given what the control box still
+/// holds (`holds_label`, `holds_big`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Comeback {
+    /// Dated labels it holds: the next syncs push (and check) them again.
+    pub pushed: Vec<String>,
+    /// Custom labels it holds: a sync never pushes those on its own — `sync --label L` does.
+    pub by_label: Vec<String>,
+    /// Its big tree is still there: the next big push copies it again.
+    pub big_back: bool,
+    /// Gone from the control box too — lost for good: those labels, and `big/` for the big copy.
+    pub lost: Vec<String>,
+}
+
+pub fn comeback(gone: &DeletedCopy, holds_label: impl Fn(&str) -> bool, holds_big: bool) -> Comeback {
+    let mut c = Comeback::default();
+    if gone.big {
+        if holds_big {
+            c.big_back = true;
+        } else {
+            c.lost.push(format!("{}/", crate::restore::BIG));
+        }
+    }
+    for l in &gone.labels {
+        match (holds_label(l), parse_label(l).is_some()) {
+            (true, true) => c.pushed.push(l.clone()),
+            (true, false) => c.by_label.push(l.clone()),
+            (false, _) => c.lost.push(l.clone()),
+        }
+    }
+    c
+}
+
 /// Drop the failure records of labels their pod is settled partial on ("sealed partial":
 /// [`LabelRecord::given_up`]): such a label is never pushed for the pod again, so its record
 /// would say "failing" for good — after the pod's later labels go through too — beside the
@@ -1808,6 +1867,16 @@ mod tests {
         assert!(pull_wait_overdue(&st.pull_waits["arena9-apple"], 3700), "{PULL_WAIT_WARN_RUNS} runs");
         note_pull_waits(&mut st, &none, &one("arena9-apple"), 4600);
         assert!(st.pull_waits.is_empty(), "its first push went ahead");
+        // RR2.
+        let listing = "dirs=4\nitem=28\tsnap/w0d3/arena9-bloom\nitem=0\tsnap/mylabel/arena9-bloom\nitem=4096\tbig/arena9-bloom\n\
+                       item=5\tsnap/w0d1/arena9-bloom-old\nbytes=4129\n";
+        let gone = deleted_from_listing(listing);
+        assert_eq!(gone["arena9-bloom"].labels.iter().cloned().collect::<Vec<_>>(), ["mylabel", "w0d3"]);
+        assert!(gone["arena9-bloom"].big && !gone["arena9-bloom-old"].big);
+        let c = comeback(&gone["arena9-bloom"], |l| l != "w0d3", false);
+        assert_eq!(c, Comeback { pushed: vec![], by_label: vec!["mylabel".into()], big_back: false, lost: vec!["big/".into(), "w0d3".into()] });
+        let c = comeback(&gone["arena9-bloom"], |_| true, true);
+        assert_eq!(c, Comeback { pushed: vec!["w0d3".into()], by_label: vec!["mylabel".into()], big_back: true, lost: vec![] });
     }
 
     /// Review w7la R2: a pod whose archived copy `forget --delete-archived` deleted is out of the

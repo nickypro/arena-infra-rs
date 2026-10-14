@@ -338,9 +338,9 @@ impl BigState {
 pub struct Forgotten {
     pub version: u32,
     pub pods: BTreeMap<String, ForgetRecord>,
-    /// Per pod dir taken back by `archive unforget` after `--delete-archived`: the labels whose
-    /// archived copy was deleted and that the control box no longer holds either — gone for
-    /// good. `status` says so (review w7la R2); a later push of such a label clears it.
+    /// Per pod dir taken back by `archive unforget` after `--delete-archived`: what of its
+    /// archived copy was deleted that the control box no longer holds either — snapshot labels,
+    /// and `big/` for its big copy — gone for good. `status` says so (R2, RR2).
     #[serde(default)]
     pub lost: BTreeMap<String, BTreeSet<String>>,
 }
@@ -353,10 +353,15 @@ pub struct ForgetRecord {
     /// When its archived copy was deleted (`--delete-archived`), if it was.
     #[serde(default)]
     pub deleted: Option<u64>,
-    /// The labels that copy held (per the sync state the delete cleared), so `unforget` can say
-    /// which come back from the control box and which are lost (R2).
+    /// The snapshot labels that copy held (the VM's listing, and the sync state the delete
+    /// cleared), so `unforget` can say which come back from the control box and which are lost
+    /// (R2).
     #[serde(default)]
     pub deleted_labels: BTreeSet<String>,
+    /// Whether it held a big copy (`big/<pod>`) too — lost for good when the control box no longer
+    /// holds the pod's big tree either (re-review RR2).
+    #[serde(default)]
+    pub deleted_big: bool,
 }
 
 impl Default for Forgotten {
