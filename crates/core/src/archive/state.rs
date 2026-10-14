@@ -116,11 +116,20 @@ pub struct LabelRecord {
     #[serde(default)]
     pub pods_linked: BTreeSet<String>,
     /// The pods whose copy of this label was compared by content with the control box's after the
-    /// label's day and grace were over ([`super::sync::GRACE_SECS`]): the archive holds exactly
-    /// the final local label, whatever a same-size, same-mtime change slipped past rsync's quick
-    /// check before. A label seals only with every pod in here (or settled partial).
+    /// label's day and grace were over ([`super::sync::GRACE_SECS`]) by a check that COMPLETED
+    /// (never a seed: `--ignore-existing` never looks at what the archive already holds): the
+    /// archive holds exactly the final local label, whatever a same-size, same-mtime change
+    /// slipped past rsync's quick check before. A label seals only with every pod in here (or
+    /// settled partial).
     #[serde(default)]
     pub pods_final: BTreeSet<String>,
+    /// The pods whose seed (first push of this label) STARTED and hasn't completed — written and
+    /// fsynced before rsync runs ([`super::sync::note_push_start`], [`save_durable`]). A seed
+    /// killed half-way (Ctrl-C, a reboot, the OOM killer) leaves files the state otherwise
+    /// knows nothing of, which another seed would skip unseen: such a pod's next push is a
+    /// check ([`super::sync::pod_push`]). Review w7la R1.
+    #[serde(default)]
+    pub pods_seeding: BTreeSet<String>,
     /// When a run last took this label up (UNIX s; `0` = never): the backlog goes round-robin,
     /// least recently tried first ([`super::sync::plan_snap`]).
     #[serde(default)]
@@ -196,6 +205,15 @@ pub struct SnapState {
     /// for a pod the control box no longer holds ([`super::sync::note_snap_failing`]).
     #[serde(default)]
     pub pods_failing: BTreeMap<String, String>,
+    /// This state was started by `archive up` for a snap volume it had just created — empty —
+    /// and every push since was recorded before it ran ([`save_durable`]). Only then does "no
+    /// push of this pod's label ever started" prove its tree is absent on the archive, so that a
+    /// seed (`--ignore-existing`) counts as the pod's final content check (review w7la R1). A
+    /// state of unknown origin — started by a sync (no file: a new archive's or a lost one's),
+    /// reset for another volume, or written before this rule — is `false`: its seeds wait for a
+    /// check.
+    #[serde(default)]
+    pub born_empty: bool,
 }
 
 impl Default for SnapState {
@@ -210,6 +228,7 @@ impl Default for SnapState {
             baselines: BTreeMap::new(),
             baseline_fails: 0,
             pods_failing: BTreeMap::new(),
+            born_empty: false,
         }
     }
 }
@@ -440,6 +459,15 @@ pub fn save<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
     let mut text = serde_json::to_string_pretty(value).map_err(std::io::Error::other)?;
     text.push('\n');
     crate::snapshot::write_atomic(path, text.as_bytes(), 0o600)
+}
+
+/// [`save`], then fsync the directory so the rename itself is durable: a write-ahead record
+/// that must survive a crash of what follows it (a push's start, review w7la R1) — the
+/// reaper's pattern (`reap::store`).
+pub fn save_durable<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+    save(path, value)?;
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    std::fs::File::open(dir)?.sync_all()
 }
 
 /// Write a plain-text state file (the pinned known_hosts) atomically, 0600.

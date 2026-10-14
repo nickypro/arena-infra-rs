@@ -378,16 +378,40 @@ pub(crate) async fn archive_up(env: &Env<'_>, cloud: &dyn ArchiveCloud, source: 
     // 6–9. Execute, in order; a failure names its step (a re-run converges).
     let mut server: Option<CloudServer> = existing.cloned();
     let mut created = false;
+    let mut made: Vec<Tier> = Vec::new();
     for step in &steps {
         let what = step.describe(names);
-        run_up_step(env, cloud, &settings, step, &mut server, &mut created, &o)
+        run_up_step(env, cloud, &settings, step, &mut server, &mut created, &mut made, &o)
             .await
             .with_context(|| format!("archive up stopped at: {what} — fix the cause and re-run `arena archive up` (it picks up where it stopped)"))?;
+    }
+    if made.contains(&Tier::Snap) {
+        born_empty_snap_state(env)?;
     }
     Ok(())
 }
 
+/// The snap volume this `up` just created is empty: start its sync state saying so
+/// ([`SnapState::born_empty`]) — with every push recorded before it runs, that is what lets a
+/// first push (a seed) count as the final check of a pod's label (R1). Never over a state that
+/// already describes this volume.
+fn born_empty_snap_state(env: &Env<'_>) -> Result<()> {
+    let host = env.host_up()?;
+    let path = env.paths.sync_state(Tier::Snap);
+    let old = state::load_snap(&path).map_err(anyhow::Error::msg)?;
+    if old.volume.as_deref() == Some(host.snap_device.as_str()) {
+        return Ok(());
+    }
+    if old.volume.is_some() {
+        println!("  the new snap volume's sync state starts over: every label is pushed to it again");
+    }
+    // Nothing of another volume's state applies — but who belongs to the cohort does (A2-3).
+    let fresh = SnapState { volume: Some(host.snap_device.clone()), allowed_ever: old.allowed_ever, born_empty: true, ..SnapState::default() };
+    state::save_durable(&path, &fresh).context("writing sync-snap.json for the new snap volume")
+}
+
 /// One step of `up`.
+#[allow(clippy::too_many_arguments)]
 async fn run_up_step(
     env: &Env<'_>,
     cloud: &dyn ArchiveCloud,
@@ -395,6 +419,7 @@ async fn run_up_step(
     step: &UpStep,
     server: &mut Option<CloudServer>,
     created: &mut bool,
+    made: &mut Vec<Tier>,
     o: &UpOpts,
 ) -> Result<()> {
     let names = &env.names;
@@ -456,6 +481,7 @@ async fn run_up_step(
             }
             let a = cloud.protect_volume(v.id, true).await?;
             cloud.wait_action(a, ACTION_LIMIT).await?;
+            made.push(*tier);
             println!("✓ volume {} ({} GB, ext4, attached, protected)", v.name, v.size_gb);
         }
         UpStep::AttachVolume { tier, id } => {
@@ -1127,6 +1153,15 @@ fn save_snap(ctx: &SyncCtx<'_>, st: &SnapState) -> Result<()> {
     state::save(&ctx.paths.sync_state(Tier::Snap), st).context("saving sync-snap.json")
 }
 
+/// [`save_snap`], durably (`state::save_durable`: the directory fsynced too) — the write-ahead
+/// record of a push about to start (R1).
+fn save_snap_durable(ctx: &SyncCtx<'_>, st: &SnapState) -> Result<()> {
+    if ctx.o.dry_run {
+        return Ok(());
+    }
+    state::save_durable(&ctx.paths.sync_state(Tier::Snap), st).context("saving sync-snap.json before a push")
+}
+
 /// Save the big tier's state (not in a dry run).
 fn save_big(ctx: &SyncCtx<'_>, st: &BigState) -> Result<()> {
     if ctx.o.dry_run {
@@ -1178,6 +1213,8 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
         (ctx.say)(&format!("! the snap volume is a different one now ({}): its sync state starts over — every label is pushed again", ctx.host.snap_device));
     }
     st.allowed_ever.extend(c.current.iter().cloned());
+    // Whether a seed here proves its tree absent (R1): the state began with its volume, empty.
+    let born_empty = st.born_empty;
     let allowed = push::push_set(&ctx.names.prefix, &ctx.cfg.machine_names, &st.allowed_ever, &c.forgotten);
     let local = push::local_snapshot(ctx.dir, &allowed).with_context(|| format!("reading {}", ctx.dir.display()))?;
     push::prune_failing(&mut st.pods_failing, |p| local.iter().any(|l| l.pods.iter().any(|x| x == p)));
@@ -1325,13 +1362,18 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
                 complete = false;
                 break;
             }
-            // Whatever happens next, something of it may be on the archive: a link source.
-            rec.pods_tried.insert(pod.clone());
+            // Whatever happens next, something of it may be on the archive: a link source — and a
+            // seed's start. Written and fsynced BEFORE rsync runs, so a push killed half-way (no
+            // signal handler can be relied on: a reboot, the OOM killer) is followed by a check,
+            // never by a seed that skips what it left unseen (review w7la R1).
+            push::note_push_start(&mut rec, pod, how);
+            st.labels.insert(label.clone(), rec.clone());
+            save_snap_durable(ctx, &st)?;
             tried += 1;
             let (outcome, sent) = run_push_logged(ctx, &src, &jobs, left).await;
             match outcome {
                 Ok((note, s)) => {
-                    push::note_push_ok(&mut rec, pod, how, chain, has_links, could_seal);
+                    push::note_push_ok(&mut rec, pod, how, chain, has_links, could_seal, born_empty);
                     push::clear_snap_failing(&mut st, pod, label);
                     through.push(pod.clone());
                     ok_pods.insert(pod.clone());
@@ -3058,6 +3100,8 @@ mod tests {
             host_key_fingerprint: None,
         };
         state::save(&p.host_file(), &h).unwrap();
+        // What `archive up` writes for the snap volume it creates: its sync state, born empty (R1).
+        state::save(&p.sync_state(Tier::Snap), &SnapState { volume: Some(h.snap_device.clone()), born_empty: true, ..SnapState::default() }).unwrap();
         for f in ["w0d1/devtest-alpha/a.py", "w0d2/devtest-alpha/a.py", "w0d2/staff-box/s.txt", "w0d2/devtest-ghost/g", "big/devtest-alpha/ckpt.pt", "mylabel/devtest-alpha/x"] {
             file(w, f);
         }
@@ -3289,13 +3333,24 @@ mod tests {
         let lost = FakeArchiveCloud::with(inv);
         archive_up(&w.env(), &lost, TokenSource::Archive, UpOpts::default()).await.unwrap();
         assert_ne!(w.host().snap_device, old_dev, "a different (empty) snap volume");
+        // `up` made it: its sync state starts over, born empty (R1).
+        let st = snap_state(&w);
+        assert!(st.born_empty && st.labels.is_empty() && st.volume.as_deref() == Some(w.host().snap_device.as_str()), "{st:#?}");
         fresh_calls(&w.dir);
-        let (r, said) = sync_said(&w, sync_opts("snap"), &stub, now + 900).await;
+        let (r, _) = sync_said(&w, sync_opts("snap"), &stub, now + 900).await;
         r.unwrap();
         let calls = rsync_calls(&w.dir);
         assert!(calls.iter().any(|c| c.ends_with(":snap/w0d1/devtest-alpha/")) && calls.iter().any(|c| c.ends_with(":snap/w0d2/devtest-alpha/")), "{calls:#?}");
-        assert!(said.iter().any(|l| l.contains("starts over")), "{said:#?}");
         assert_eq!(snap_state(&w).volume, Some(w.host().snap_device));
+        // A state of unknown origin for another volume (not `up`'s) is reset by the sync, never
+        // trusted as born empty.
+        let mut other = snap_state(&w);
+        other.volume = Some("/dev/disk/by-id/scsi-0HC_Volume_999".into());
+        state::save(&paths.sync_state(Tier::Snap), &other).unwrap();
+        let (r, said) = sync_said(&w, sync_opts("snap"), &stub, now + 1800).await;
+        r.unwrap();
+        assert!(said.iter().any(|l| l.contains("starts over")), "{said:#?}");
+        assert!(!snap_state(&w).born_empty);
     }
 
     /// S10: a full big volume fails big (exit ≠ 0) but leaves the snap pushes and sync-snap.json
@@ -3547,10 +3602,12 @@ mod tests {
         seed(&w);
         file(&w, "w0d3/devtest-alpha/a.py");
         let _held = try_lock(&paths.sync_lock(Tier::Snap)).unwrap().expect("free");
+        let before = std::fs::read(paths.sync_state(Tier::Snap)).unwrap();
         let (r, said) = sync_said(&w, SyncOpts { dry_run: true, ..sync_opts("both") }, &stub, day_end("w0d3") + 3600).await;
         r.unwrap();
         assert!(rsync_calls(&w.dir).is_empty());
-        assert!(!paths.sync_state(Tier::Snap).exists() && !paths.sync_state(Tier::Big).exists());
+        assert_eq!(std::fs::read(paths.sync_state(Tier::Snap)).unwrap(), before, "a dry run writes no state");
+        assert!(!paths.sync_state(Tier::Big).exists());
         assert!(!said.iter().any(|l| l.contains("skipped")), "{said:#?}");
         let w0d2 = said.iter().find(|l| l.starts_with("[snap w0d2 devtest-alpha]")).unwrap_or_else(|| panic!("{said:#?}"));
         assert!(w0d2.contains("--link-dest=/snap/w0d1/devtest-alpha/"), "{w0d2}");

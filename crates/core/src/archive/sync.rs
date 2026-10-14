@@ -21,13 +21,22 @@
 //! read "notes w0d1"), and a first push links such a file in place of the new one. So how a pod's
 //! push compares depends on what the archive holds of it ([`pod_push`], [`Compare`]):
 //! - its **first** push of a label adds only what is missing, by content against the link
-//!   sources (`--checksum --ignore-existing`);
+//!   sources (`--checksum --ignore-existing`) — recorded (fsynced) before rsync runs, so one
+//!   killed half-way is followed by a check, never by another seed;
 //! - while the day runs, later pushes compare with the label's **own** copy only (the quick check,
 //!   no link source): a changed file is written anew, nothing there is ever re-linked;
 //! - a **check** re-links a copy pushed before its links were there and, once its day is over,
 //!   compares the whole copy with the control box's before the label seals: `--checksum` with the
 //!   link sources but without `-t` (so a file equal in content but not in mtime is never touched
 //!   in place), then a quick pass that gives each file its mtime (writing it anew if needed).
+//!   `--label` is always a check.
+//!
+//! A pod's copy counts as final only once every file of it was compared by content in a pass
+//! that completed (review w7la R1): a check — or a seed, which never looks at what the archive
+//! already holds, only when its tree is provably absent: the volume was born empty for this
+//! state (`archive up` created it, [`super::state::SnapState::born_empty`]) and no push of the
+//! pod's label ever started (each start is fsynced before rsync runs). A lost or reset state
+//! file proves nothing: its seeds wait for a check.
 //!
 //! Plain `--checksum` on every push was rejected: it reads every file on both ends every 15
 //! minutes, and for a file equal in content but not in mtime it sets the mtime IN PLACE — on an
@@ -169,19 +178,24 @@ pub enum PodPush {
 }
 
 /// How `pod`'s push of the label `rec` describes compares ([`PodPush`]):
+/// - [`PodPush::Check`] when asked (`forced`: `sync --label`, whatever the state knows of the pod)
+///   or when a seed of it started and never completed (`pods_seeding`: what it left is unseen);
 /// - [`PodPush::Seed`] when nothing of it has been pushed (`pods_tried`);
-/// - [`PodPush::Check`] when asked (`forced`: `sync --label`), when its links are all there now
-///   (`chain`, and there is something to link to: `has_links`) but it isn't linked yet, or when
-///   the push could seal the label (`could_seal`: started after the day and its grace) and the pod
-///   wasn't compared since then — once per pod and label, at its last push;
+/// - [`PodPush::Check`] when its links are all there now (`chain`, and there is something to link
+///   to: `has_links`) but it isn't linked yet, or when the push could seal the label
+///   (`could_seal`: started after the day and its grace) and the pod wasn't checked since then —
+///   once per pod and label, at its last push;
 /// - else [`PodPush::Update`].
 pub fn pod_push(rec: &LabelRecord, pod: &str, chain: bool, has_links: bool, could_seal: bool, forced: bool) -> PodPush {
+    if forced || rec.pods_seeding.contains(pod) {
+        return PodPush::Check;
+    }
     if !rec.pods_tried.contains(pod) {
         return PodPush::Seed;
     }
     let relink = chain && has_links && !rec.pods_linked.contains(pod);
     let verify = could_seal && !rec.pods_final.contains(pod);
-    if forced || relink || verify {
+    if relink || verify {
         PodPush::Check
     } else {
         PodPush::Update
@@ -202,12 +216,26 @@ pub fn counts_toward_give_up(f: PushFailure) -> bool {
     matches!(f, PushFailure::Other | PushFailure::Timeout)
 }
 
+/// Record, BEFORE `pod`'s push of a label runs, that it is starting (the caller saves it with
+/// [`super::state::save_durable`] first): from now on something of it may be on the archive —
+/// a link source, and never a fresh seed again — and a seed's start is kept until it completes
+/// ([`LabelRecord::pods_seeding`]), so one killed half-way is followed by a check (R1).
+pub fn note_push_start(rec: &mut LabelRecord, pod: &str, how: PodPush) {
+    rec.pods_tried.insert(pod.to_string());
+    if how == PodPush::Seed {
+        rec.pods_seeding.insert(pod.to_string());
+    }
+}
+
 /// Record that `pod`'s push of a label went through, compared `how`: it is complete there for
 /// this pod again (a `--label` retry of a pod settled partial un-settles it). A push that
 /// compared by content (a seed or a check) leaves the pod linked when its `chain` was whole
-/// ([`chain_ok`]), and final when it `could_seal` the label; with no link source at all
-/// (`has_links` false: a pod's first label, no baseline) every push is as linked as it gets.
-pub fn note_push_ok(rec: &mut LabelRecord, pod: &str, how: PodPush, chain: bool, has_links: bool, could_seal: bool) {
+/// ([`chain_ok`]). One that `could_seal` the label leaves it final when it compared EVERY file:
+/// a check, or a seed into a tree known to be absent (`born_empty`: the state's volume was
+/// created empty and every push since was recorded — a seed's `--ignore-existing` never looks at
+/// what is already there, R1). With no link source at all (`has_links` false: a pod's first
+/// label, no baseline) every push is as linked as it gets.
+pub fn note_push_ok(rec: &mut LabelRecord, pod: &str, how: PodPush, chain: bool, has_links: bool, could_seal: bool, born_empty: bool) {
     rec.pods_ok.insert(pod.to_string());
     rec.fails.remove(pod);
     rec.given_up.remove(pod);
@@ -215,7 +243,11 @@ pub fn note_push_ok(rec: &mut LabelRecord, pod: &str, how: PodPush, chain: bool,
     if chain && (by_content || !has_links) {
         rec.pods_linked.insert(pod.to_string());
     }
-    if by_content && could_seal {
+    if by_content {
+        rec.pods_seeding.remove(pod);
+    }
+    let compared_all = how == PodPush::Check || (how == PodPush::Seed && born_empty);
+    if compared_all && could_seal {
         rec.pods_final.insert(pod.to_string());
     }
 }
@@ -1619,11 +1651,19 @@ mod tests {
         let tried = LabelRecord { pods_tried: set(A), ..Default::default() };
         let linked = LabelRecord { pods_linked: set(A), ..tried.clone() };
         let done = LabelRecord { pods_final: set(A), ..linked.clone() };
+        // R1: a seed that started and never completed (killed half-way).
+        let killed = LabelRecord { pods_seeding: set(A), ..tried.clone() };
+        let killed_final = LabelRecord { pods_seeding: set(A), ..done.clone() };
         use PodPush::*;
         // (record, chain, has_links, could_seal, forced) → how
         let table: &[(&LabelRecord, bool, bool, bool, bool, PodPush)] = &[
             (&fresh, false, false, false, false, Seed),
-            (&fresh, true, true, true, true, Seed),
+            (&fresh, true, true, true, false, Seed),
+            (&fresh, true, true, true, true, Check),
+            (&fresh, false, false, false, true, Check),
+            (&killed, false, false, false, false, Check),
+            (&killed, true, true, true, false, Check),
+            (&killed_final, true, true, false, false, Check),
             (&tried, false, true, false, false, Update),
             (&tried, true, false, false, false, Update),
             (&tried, true, true, false, false, Check),
@@ -1636,16 +1676,29 @@ mod tests {
         for (i, (r, chain, has, seal, forced, want)) in table.iter().enumerate() {
             assert_eq!(pod_push(r, p, *chain, *has, *seal, *forced), *want, "row {i}");
         }
-        // What a push that went through records.
+        // What a push records when it starts (before rsync runs: R1), and once it went through.
         let mut r = LabelRecord::default();
-        note_push_ok(&mut r, p, Seed, false, true, true);
-        assert!(r.pods_ok.contains(p) && !r.pods_linked.contains(p) && r.pods_final.contains(p), "seeded before its links: final, not linked");
-        note_push_ok(&mut r, p, Update, true, true, false);
+        note_push_start(&mut r, p, Seed);
+        assert!(r.pods_tried.contains(p) && r.pods_seeding.contains(p), "a seed's start");
+        assert_eq!(pod_push(&r, p, true, true, true, false), Check, "killed now: a check next");
+        note_push_ok(&mut r, p, Seed, false, true, true, true);
+        assert!(r.pods_ok.contains(p) && !r.pods_linked.contains(p) && r.pods_final.contains(p), "seeded into a tree known absent: final, not linked");
+        assert!(!r.pods_seeding.contains(p), "the seed completed");
+        let mut r = LabelRecord::default();
+        note_push_start(&mut r, p, Seed);
+        note_push_ok(&mut r, p, Seed, true, true, true, false);
+        assert!(r.pods_linked.contains(p) && !r.pods_final.contains(p), "a seed where the tree may have held files (state of unknown origin): never final");
+        note_push_start(&mut r, p, Check);
+        assert!(!r.pods_seeding.contains(p), "only a seed's start is kept");
+        note_push_ok(&mut r, p, Check, true, true, true, false);
+        assert!(r.pods_final.contains(p), "a completed check: final");
+        let mut r = LabelRecord::default();
+        note_push_ok(&mut r, p, Update, true, true, false, true);
         assert!(!r.pods_linked.contains(p), "an update links nothing");
-        note_push_ok(&mut r, p, Check, true, true, false);
+        note_push_ok(&mut r, p, Check, true, true, false, true);
         assert!(r.pods_linked.contains(p));
         let mut r = LabelRecord::default();
-        note_push_ok(&mut r, p, Update, true, false, true);
+        note_push_ok(&mut r, p, Update, true, false, true, true);
         assert!(r.pods_linked.contains(p) && !r.pods_final.contains(p), "nothing to link to: linked as it gets; never final without a content check");
     }
 
@@ -1740,13 +1793,13 @@ mod tests {
         assert!(note_push_failed(&mut r, p, Other, after + 2700, end), "the third of its own kind");
         assert!(r.given_up.contains(p) && !r.pods_ok.contains(p));
         // Settled: the label seals without it; a later success (a `--label` retry) un-settles it.
-        note_push_ok(&mut r, p, PodPush::Update, false, true, false);
+        note_push_ok(&mut r, p, PodPush::Update, false, true, false, false);
         assert!(r.pods_ok.contains(p) && r.fails.is_empty() && r.given_up.is_empty());
         // A success in between resets the count.
         let mut r = LabelRecord::default();
         note_push_failed(&mut r, p, Other, after, end);
         note_push_failed(&mut r, p, Other, after, end);
-        note_push_ok(&mut r, p, PodPush::Update, false, true, false);
+        note_push_ok(&mut r, p, PodPush::Update, false, true, false, false);
         assert!(!note_push_failed(&mut r, p, Other, after, end) && !r.given_up.contains(p));
         assert_eq!(GIVE_UP_AFTER, 3);
     }
