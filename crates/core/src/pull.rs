@@ -410,10 +410,12 @@ pub const REAP_NOT_KEPT: &[&str] = &[
 
 /// [`REAP_NOT_KEPT`] in the participant's words — the notice on every pod with a reap policy says
 /// exactly this, and so does the README (a test holds both to it).
+/// Every entry is named (W7LR-2): `.ssh/` matches a folder of that name at any depth — "every .ssh
+/// folder"; `__pycache__/` is "Python bytecode"; `*.arena-aside-*/` is "arena's moved-aside copy".
 pub const REAP_NOT_KEPT_SUMMARY: &str = "not kept: only what can be downloaded or installed again — Python environments and \
      installed packages (venvs, site-packages, ~/.local/lib, conda envs, node_modules), download and build caches (pip, uv, \
-     npm, the Hugging Face and torch hubs, compiled kernels, matplotlib's) and the VS Code server's binaries — and ~/.ssh; \
-     the rest of ~/.cache is kept";
+     npm, the Hugging Face and torch hubs, compiled kernels, Python bytecode, matplotlib's), the VS Code server's binaries \
+     and extensions, and arena's moved-aside copy of the image's repo — and every .ssh folder; the rest of ~/.cache is kept";
 
 /// What a reap's backup never copies AND never loses: sweep/RLVR run folders (large; "do all
 /// run work here"). A pod with any file there at all (a placeholder aside) is `NotCovered` —

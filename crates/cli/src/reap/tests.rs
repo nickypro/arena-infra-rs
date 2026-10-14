@@ -743,8 +743,8 @@ async fn idle_8h_is_reaped_once_after_a_verified_backup() {
     let tomb = &s.reaped["runpod:pa"];
     // RS1: the tombstone names the FROZEN copies, never the live per-name dirs.
     let (snap, big) = (tomb.snapshot_dir.as_deref().unwrap(), tomb.big_dir.as_deref().unwrap());
-    assert!(snap.contains("/snap/reaped/devtest-alpha/") && snap.ends_with("-runpod-pa/snapshot"), "{tomb:?}");
-    assert!(big.contains("/snap/big/reaped/devtest-alpha/") && big.ends_with("-runpod-pa/big"), "{tomb:?}");
+    assert!(snap.contains("/snap/reaped/devtest-alpha/") && snap.ends_with("-runpod-pa-reaped/snapshot"), "{tomb:?}");
+    assert!(big.contains("/snap/big/reaped/devtest-alpha/") && big.ends_with("-runpod-pa-reaped/big"), "{tomb:?}");
     assert_eq!(std::fs::read_to_string(Path::new(big).join("work.txt")).unwrap(), "v1\n");
     assert!(!s.pods.contains_key("runpod:pa"));
     assert_eq!(s.attempts.len(), 1);
@@ -2693,7 +2693,7 @@ async fn w7_b_rs8b_a_stopped_attempts_copy_never_looks_like_a_reap() {
     for (leaves, first) in [(&snap2, &snap[0]), (&big2, &big[0])] {
         assert_eq!(leaves.len(), 2, "{leaves:?}");
         assert!(leaves.contains(first), "the stopped attempt's copy is untouched: {leaves:?}");
-        assert!(leaves.iter().any(|l| l.ends_with("-runpod-pa")), "{leaves:?}");
+        assert!(leaves.iter().any(|l| l.ends_with("-runpod-pa-reaped")), "{leaves:?}");
     }
     let tomb = w.state().reaped[&core_reap::key("runpod", &a.id)].clone();
     for d in [tomb.snapshot_dir.as_deref().unwrap(), tomb.big_dir.as_deref().unwrap()] {
@@ -2705,47 +2705,80 @@ async fn w7_b_rs8b_a_stopped_attempts_copy_never_looks_like_a_reap() {
     assert_eq!(status.matches("1 reaped, 1 stopped attempt(s), 0 rehearsal(s)").count(), 2, "{status}");
 }
 
-/// F2 + W7 B-RS8b: a run cut off between its terminate and its record leaves the copy named an
-/// attempt. The next run finds the pod gone with its reap pending: the copy this attempt froze
-/// (after its write-ahead) takes the reap's name and the tombstone names it — never an older
-/// attempt's copy.
+/// F2 + W7 B-RS8b + W7LR-1: a run cut off between its terminate and its record leaves the copy
+/// named an attempt. The next run finds the pod gone with its write-ahead marked "terminate sent":
+/// the copy that write-ahead recorded as frozen — that one only — takes the reap's name and the
+/// tombstone names it; an older attempt's copy, and a half-made leaf of a run killed mid-freeze
+/// (never recorded), keep their `-attempt` names. Without the "sent" mark (the run died before
+/// its terminate; the pod went otherwise): nothing is renamed, and the pod is said to be gone not
+/// by the reaper, its copy kept as `-attempt`.
 #[tokio::test]
 async fn w7_b_rs8b_a_recovered_reap_takes_its_own_copy() {
-    let (w, a) = due_world("w7-rs8b-f2", "").await;
-    let at = w.now();
-    w.store()
-        .update(|s| {
-            s.pods.get_mut("runpod:pa").unwrap().terminating = Some(core_reap::Terminating { run_id: "r1".into(), trigger: Trigger::Idle, at });
-            Ok(())
-        })
-        .unwrap();
-    let stamp = arena_core::restore::stamp;
-    let (ours, older) = (format!("{}-runpod-pa-attempt", stamp(at + 30)), format!("{}-runpod-pa-attempt", stamp(at - 3600)));
-    for (root, tier) in [("snap", "snapshot"), ("snap/big", "big")] {
-        for leaf in [&ours, &older] {
-            let d = w.dir.join(root).join("reaped/devtest-alpha").join(leaf).join(tier);
-            std::fs::create_dir_all(&d).unwrap();
-            std::fs::write(d.join("work.txt"), leaf.as_str()).unwrap();
+    for sent in [true, false] {
+        let (w, a) = due_world(&format!("w7-rs8b-f2-{sent}"), "").await;
+        let at = w.now();
+        let stamp = arena_core::restore::stamp;
+        let (ours, older, half) = (
+            format!("{}-runpod-pa-attempt", stamp(at + 30)),
+            format!("{}-runpod-pa-attempt", stamp(at - 3600)),
+            format!("{}-runpod-pa-attempt", stamp(at + 3000)),
+        );
+        let leaf = |root: &str, l: &str| w.dir.join(root).join("reaped/devtest-alpha").join(l);
+        for (root, tier) in [("snap", "snapshot"), ("snap/big", "big")] {
+            for l in [&ours, &older, &half] {
+                let d = leaf(root, l).join(tier);
+                std::fs::create_dir_all(&d).unwrap();
+                std::fs::write(d.join("work.txt"), l.as_str()).unwrap();
+            }
+        }
+        let frozen = core_reap::FrozenDirs {
+            snapshot_dir: leaf("snap", &ours).join("snapshot").display().to_string(),
+            big_dir: leaf("snap/big", &ours).join("big").display().to_string(),
+        };
+        w.store()
+            .update(|s| {
+                let t = core_reap::Terminating { frozen: Some(frozen.clone()), sent_at: sent.then_some(at + 40), ..core_reap::Terminating::new("r1", Trigger::Idle, at) };
+                s.pods.get_mut("runpod:pa").unwrap().terminating = Some(t);
+                Ok(())
+            })
+            .unwrap();
+        // The pod is gone; the record of what happened to it never written.
+        for (_, r) in w.fleet.backends.lock().unwrap().iter_mut() {
+            if let Ok(p) = r {
+                p.retain(|x| x.id != a.id);
+            }
+        }
+        w.tick(300);
+        w.step("observe").await;
+        let tomb = w.state().reaped[&core_reap::key("runpod", &a.id)].clone();
+        assert!(tomb.recovered && tomb.not_reaped == !sent, "{tomb:?}");
+        let reaped = format!("{}-runpod-pa-reaped", stamp(at + 30));
+        for (root, tier, dir) in [("snap", "snapshot", &tomb.snapshot_dir), ("snap/big", "big", &tomb.big_dir)] {
+            let ours_now = if sent { &reaped } else { &ours };
+            let want = leaf(root, ours_now).join(tier);
+            assert_eq!(dir.as_deref(), Some(want.display().to_string().as_str()), "{sent} {root}");
+            assert_eq!(std::fs::read_to_string(want.join("work.txt")).unwrap(), ours);
+            let mut expect = vec![older.clone(), ours_now.clone(), half.clone()];
+            expect.sort();
+            assert_eq!(frozen_leaves(&w, root), expect, "{sent} {root}: only the recorded, sent copy is renamed");
+        }
+        let n = w.notified();
+        if sent {
+            assert!(n.iter().any(|l| l.contains("recovered_reaped devtest-alpha") && l.contains("its last verified backup") && l.contains(&reaped)), "{n:?}");
+        } else {
+            assert!(
+                n.iter().any(|l| l.contains("gone_before_reap devtest-alpha")
+                    && l.contains("gone, not by the reaper (or before its terminate) — the attempt's copy is kept as -attempt")
+                    && l.contains(&ours)),
+                "{n:?}"
+            );
+            assert!(!n.iter().any(|l| l.contains("recovered_reaped") || l.contains("its last verified backup")), "{n:?}");
+            w.out.lock().unwrap().clear();
+            w.reap(&["status"]).await.unwrap();
+            let status = w.out.lock().unwrap().join("\n");
+            assert!(status.contains("gone, not by the reaper (or before its terminate): devtest-alpha"), "{status}");
         }
     }
-    // Terminated; the record never written.
-    for (_, r) in w.fleet.backends.lock().unwrap().iter_mut() {
-        if let Ok(p) = r {
-            p.retain(|x| x.id != a.id);
-        }
-    }
-    w.tick(300);
-    w.step("observe").await;
-    let tomb = w.state().reaped[&core_reap::key("runpod", &a.id)].clone();
-    assert!(tomb.recovered);
-    let reaped = format!("{}-runpod-pa", stamp(at + 30));
-    for (root, tier, dir) in [("snap", "snapshot", &tomb.snapshot_dir), ("snap/big", "big", &tomb.big_dir)] {
-        let want = w.dir.join(root).join("reaped/devtest-alpha").join(&reaped).join(tier);
-        assert_eq!(dir.as_deref(), Some(want.display().to_string().as_str()), "{root}");
-        assert_eq!(std::fs::read_to_string(want.join("work.txt")).unwrap(), ours);
-        assert_eq!(frozen_leaves(&w, root), [older.clone(), reaped.clone()], "{root}: the older attempt stays one");
-    }
-    assert!(w.notified().iter().any(|l| l.contains("its last verified backup") && l.contains(&reaped)), "{:?}", w.notified());
 }
 
 // ---------------------------------------------------------------------------------------

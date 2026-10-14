@@ -758,16 +758,22 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     notice says exactly what it leaves out: "not kept: only what can be downloaded or installed
     again — Python environments and installed packages (venvs, site-packages, ~/.local/lib, conda
     envs, node_modules), download and build caches (pip, uv, npm, the Hugging Face and torch hubs,
-    compiled kernels, matplotlib's) and the VS Code server's binaries — and ~/.ssh; the rest of
-    ~/.cache is kept" (`pull::REAP_NOT_KEPT` lists the paths: Hugging Face `datasets/`, W&B and any
+    compiled kernels, Python bytecode, matplotlib's), the VS Code server's binaries and extensions,
+    and arena's moved-aside copy of the image's repo — and every .ssh folder; the rest of ~/.cache
+    is kept" (`pull::REAP_NOT_KEPT` lists the paths: Hugging Face `datasets/`, W&B and any
     cache nobody listed are kept; conda's `envs/`/`pkgs/` only under a conda root in the home) — a
     dry-run verify (0 files pending), then the verified dirs **frozen**: hard-linked (same
     filesystem, no space) into `<root>/reaped/<name>/<UTC stamp>-<provider>-<id>-attempt/snapshot`
-    and `<big root>/reaped/…/big`, counted equal to what was verified — renamed to
-    `<UTC stamp>-<provider>-<id>/` only once the terminate succeeded, so an attempt that stopped
-    before it (a re-listing, a pin, `REAP_ENABLED=0`, a crash — whose copy a run that finds the pod
-    gone later renames) keeps the `-attempt` name, and a rehearsal's is `-rehearsal`; `reap status`
-    counts each kind under each root's `reaped/` and their size. A later same-named pod's pulls
+    and `<big root>/reaped/…/big`, counted equal to what was verified, and recorded on the
+    attempt's write-ahead — renamed `…-reaped/` only once the terminate succeeded. An attempt that
+    never sent its terminate (a re-listing, a pin, `REAP_ENABLED=0`, a crash before it) keeps the
+    `-attempt` name; so does its copy when the pod is later found gone (by hand, with its host:
+    "gone, not by the reaper (or before its terminate)"). Only a write-ahead marked "terminate
+    sent" — saved right before the call — lets a run that finds the pod gone rename the copy it
+    recorded (a crash between the terminate and its record); a half-made copy of a run killed
+    mid-freeze is never recorded, so never renamed. A rehearsal's is `-rehearsal`; copies frozen
+    before these names (no suffix) are "older (state unknown)". `reap status` counts each kind
+    under each root's `reaped/` and their size. A later same-named pod's pulls
     never touch that copy, and nothing in arena writes or deletes under `reaped/` (a freeze that
     fails removes the leaves it made itself, and backs off 6 h like a failed backup).
     Then a post-backup quiet check (same id and container; nothing changed since the deciding
@@ -808,7 +814,7 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     lists what's missing once the reaper is on or its cron line is installed (off: one `·
     reaper off (opt-in)` row, a ✗ only for a `REAP_*` value set but invalid). Every `pods reap
     … --json` prints exactly one JSON document on stdout — `{"error": …}` on a failure,
-    `{"skipped": …}` when another run holds the lock — and everything else on stderr. Rollout: `cron install --reap observe` first (logs `would_reap`; the line runs at :11/:26/:41/:56 — minutes no other arena line uses), then
+    `{"skipped": …}` when another run holds the lock — and everything else on stderr. Rollout: `cron install --reap observe` first (logs `would_reap`; the line runs at :11/:27/:41/:57 — minutes no other arena line uses), then
     `--reap apply` (refused unless REAP_ENABLED=1). `reap set` also writes `~/.arena/NOTICE` and
     an interactive-only login banner on the pod (also written after `up`'s setup for a pod
     created with a policy, after `pods setup`, and after a restart's re-provision — the 1-hour

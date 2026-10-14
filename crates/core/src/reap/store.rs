@@ -13,8 +13,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use super::judge::WriteAheadProof;
-use super::{ReapState, Terminating, Trigger};
+use super::judge::{SentMark, WriteAheadProof};
+use super::{FrozenDirs, ReapState, Terminating, Trigger};
 
 pub const STATE_FILE: &str = "reap.json";
 pub const HOLD_FILE: &str = "hold.json";
@@ -297,9 +297,45 @@ pub fn write_ahead(store: &Store, key: &str, run_id: &str, trigger: Trigger, now
         if p.terminating.is_some() {
             return Err(format!("{key}: a terminate is already pending"));
         }
-        p.terminating = Some(Terminating { run_id: run_id.to_string(), trigger, at: now });
+        p.terminating = Some(Terminating::new(run_id, trigger, now));
         s.attempts.push(now);
         Ok(())
     })?;
     Ok(WriteAheadProof::saved(key, now))
+}
+
+/// The run's own pending write-ahead of `key`, to record a step on (refused when it isn't there
+/// any more, or is another run's).
+fn own_write_ahead<'a>(s: &'a mut ReapState, key: &str, run_id: &str) -> Result<&'a mut Terminating, String> {
+    s.pods
+        .get_mut(key)
+        .and_then(|p| p.terminating.as_mut())
+        .filter(|t| t.run_id == run_id)
+        .ok_or_else(|| format!("{key}: this run's write-ahead isn't pending any more"))
+}
+
+/// Record on the attempt's write-ahead that its freeze completed — the frozen copy's dirs,
+/// counted equal to what was verified (W7LR-1) — saved before anything else is done. Only a copy
+/// recorded here may ever take a reap's name; a half-made one (a run killed mid-freeze) never is.
+pub fn record_frozen(store: &Store, key: &str, run_id: &str, dirs: &FrozenDirs) -> Result<(), StoreError> {
+    store.update(|s| {
+        own_write_ahead(s, key, run_id)?.frozen = Some(dirs.clone());
+        Ok(())
+    })
+}
+
+/// Mark the attempt's write-ahead "terminate sent", durably, right before the call (W7LR-1): a
+/// later run that finds the pod gone calls it reaped — its copy renamed to a reap's — only with
+/// this mark. Refused (no mark, so no terminate) unless this run's write-ahead is pending with
+/// its frozen copy recorded. Only a successful save yields the [`SentMark`] the terminate needs.
+pub fn mark_sent(store: &Store, key: &str, run_id: &str, now: u64) -> Result<SentMark, StoreError> {
+    store.update(|s| {
+        let t = own_write_ahead(s, key, run_id)?;
+        if t.frozen.is_none() {
+            return Err(format!("{key}: no completed freeze recorded"));
+        }
+        t.sent_at = Some(now);
+        Ok(())
+    })?;
+    Ok(SentMark::saved(key))
 }

@@ -20,6 +20,9 @@ pub enum NotifyKind {
     Reaped,
     /// A pod with a pending terminate was found gone (a crash after the terminate).
     RecoveredReaped,
+    /// A pod with a reap attempt under way was found gone before its terminate was sent: not
+    /// reaped by the reaper; its copy, if frozen, keeps its `-attempt` name (W7LR-1).
+    GoneBeforeReap,
     /// Overdue but in use: deferred.
     OverdueInUse,
     /// Overdue but couldn't be checked: deferred.
@@ -413,11 +416,12 @@ pub fn wall_command(name: &str, trigger: Trigger, in_secs: u64) -> String {
 
 /// The cron schedule of the reap line: four times an hour, on minutes no other arena line uses —
 /// off the `*/15` backup's ticks (its rsyncs hold the pods' backup locks: a probe meanwhile is
-/// skipped), and off the backup archive's pushes (`archive sync`: snap at :07/:22/:37/:52, big at
+/// skipped), off the backup archive's pushes (`archive sync`: snap at :07/:22/:37/:52, big at
 /// :40), which read the same backup roots a reap backup writes (live W7 step 0: the reap line had
-/// the archive snap line's very minutes). 11 minutes after a backup tick, 4 after an archive
-/// push; and none is a multiple of 5 (the proxy re-sync, which a reap's own proxy sync would meet).
-pub const CRON_SCHEDULE: &str = "11,26,41,56 * * * *";
+/// the archive snap line's very minutes), off the `*/5` proxy re-sync (a reap syncs the proxy
+/// too) and off the `*/2` dashboard snapshot: odd minutes, none a multiple of 5 — 11 or 12 after
+/// a backup tick, 4 or 5 after an archive push.
+pub const CRON_SCHEDULE: &str = "11,27,41,57 * * * *";
 
 /// `PATH` for the reap line (cron's is `/usr/bin:/bin`; nginx and friends live in sbin).
 pub const CRON_PATH: &str = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";

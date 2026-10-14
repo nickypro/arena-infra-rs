@@ -571,8 +571,9 @@ pub fn classify(prev: Option<&Observation>, facts: &Result<ProbeFacts, ProbeErro
 /// signal: a session, a file changed since the deciding look's scan began, a process, the CPU
 /// and network of its own window … — so activity it sees counts (`Active` resets the streak),
 /// and anything it can't read is `Unknown`. Only the cumulative counters aren't judged (the
-/// backup is in them), exactly as [`quiet_now`] doesn't. (A backup longer than [`MAX_GAP`]
-/// restarts the streak at this look: [`idle_streak`]'s own rule.)
+/// backup is in them), exactly as [`quiet_now`] doesn't. The drift is checked against the
+/// deciding look however long the backup took; a backup longer than [`MAX_GAP`] restarts the
+/// streak at this look ([`idle_streak`]'s own rule).
 pub fn classify_post_backup(prev: Option<&Observation>, facts: &Result<ProbeFacts, ProbeError>, jobs: JobsOutcome, ctx: &ClassifyCtx) -> Observation {
     classify_look(prev, facts, jobs, ctx, Look::PostBackup)
 }
@@ -588,8 +589,11 @@ fn classify_look(prev: Option<&Observation>, facts: &Result<ProbeFacts, ProbeErr
     }
     let Ok(f) = facts else { unreachable!("usable() passed") };
     let container = f.container();
-    // Drift: Δ pod clock vs Δ control clock since the previous look at this container.
-    let same = prev.filter(|p| p.container == container && p.clock_ok && p.t <= ctx.now && ctx.now - p.t <= MAX_GAP);
+    // Drift: Δ pod clock vs Δ control clock since the previous look at this container — for the
+    // post-backup look against the deciding one whatever the backup took (W7LR-3: a backup may run
+    // for hours, MAX_GAP is 40 min).
+    let within = |p: &Observation| ctx.now - p.t <= MAX_GAP || look == Look::PostBackup;
+    let same = prev.filter(|p| p.container == container && p.clock_ok && p.t <= ctx.now && within(p));
     if let Some(p) = same {
         if let Some(pt) = p.pod_t {
             let pod_d = f.now as i128 - pt as i128;
@@ -929,7 +933,8 @@ pub struct BackupEvidence {
 }
 
 /// The reap's own, immutable copy of a verified backup: hard links of both tiers' dirs under
-/// `<root>/reaped/<name>/<UTC stamp>-<provider>-<id>/`, counted against the originals (RS1).
+/// `<root>/reaped/<name>/<UTC stamp>-<provider>-<id>-attempt/` (`-reaped` once its terminate
+/// succeeded; `-rehearsal`), counted against the originals (RS1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frozen {
     pub snapshot_dir: String,
@@ -1249,6 +1254,20 @@ impl WriteAheadProof {
     }
 }
 
+/// The write-ahead marked "terminate sent" and saved (W7LR-1) — constructed only by the store
+/// once that save succeeded ([`super::store::mark_sent`]); [`ReapTicket::terminate`] takes it, so
+/// no terminate goes out that a crashed run's successor couldn't tell from one never sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentMark {
+    key: String,
+}
+
+impl SentMark {
+    pub(crate) fn saved(key: &str) -> SentMark {
+        SentMark { key: key.to_string() }
+    }
+}
+
 /// The ONE way reap code terminates a pod (spec I4): a ticket exists only when every gate
 /// passed — the run's ([`RunGate`]), the trigger's, a durable write-ahead, a verified backup
 /// after the deciding observation, the pod quiet after it in the same container, a fresh
@@ -1311,8 +1330,12 @@ impl ReapTicket {
     }
 
     /// Terminate the ticket's pod — routed by its provider's NAME
-    /// ([`Provider::terminate_pod_on`]). Consumes the ticket: one ticket, one call.
-    pub async fn terminate(self, provider: &dyn Provider) -> crate::Result<()> {
+    /// ([`Provider::terminate_pod_on`]) — once its write-ahead says the terminate is being sent
+    /// (`sent`, the same pod's). Consumes the ticket: one ticket, one call.
+    pub async fn terminate(self, sent: SentMark, provider: &dyn Provider) -> crate::Result<()> {
+        if sent.key != self.key() {
+            return Err(crate::Error::provider(format!("not sent: the mark is {}'s, the ticket {}'s", sent.key, self.key())));
+        }
         provider.terminate_pod_on(&self.provider, &self.id).await
     }
 }
@@ -1332,8 +1355,10 @@ pub struct Event {
 /// Reconcile `state` with the listing (`listing(provider)` = that provider's pods, or `None`
 /// when it failed or wasn't queried — then nothing of it changes):
 /// - a pending `terminating` whose pod is listed: cleared, `Interrupted` (F1 — a fresh
-///   candidate, which needs a new backup); whose pod is gone: a tombstone, `RecoveredReaped`
-///   (F2);
+///   candidate, which needs a new backup); whose pod is gone: a tombstone — `RecoveredReaped`
+///   (F2) when the write-ahead says the terminate was sent, naming the attempt's frozen copy (the
+///   caller renames it a reap's); else `GoneBeforeReap`, `not_reaped` (W7LR-1: the run was cut off
+///   before its terminate, and the pod went some other way — by hand, with its host);
 /// - a policy whose pod is gone from an OK listing: pruned (records for attempts `up --check`
 ///   terminated go the same way);
 /// - a tombstone whose pod is still listed and billing: counted; the second run that sees it
@@ -1355,11 +1380,22 @@ pub fn reconcile<'a>(state: &mut ReapState, listing: &dyn Fn(&str) -> Option<&'a
             }
             (false, Some(t)) => {
                 state.pods.remove(&k);
+                let sent = t.sent_at.is_some();
                 state.reaped.insert(
                     k.clone(),
-                    Tombstone { at: now, name: name.clone(), trigger: Some(t.trigger), snapshot_dir: None, big_dir: None, branch: None, recovered: true, seen_after: 0 },
+                    Tombstone {
+                        at: now,
+                        name: name.clone(),
+                        trigger: Some(t.trigger),
+                        snapshot_dir: t.frozen.as_ref().map(|f| f.snapshot_dir.clone()),
+                        big_dir: t.frozen.as_ref().map(|f| f.big_dir.clone()),
+                        branch: None,
+                        recovered: true,
+                        seen_after: 0,
+                        not_reaped: !sent,
+                    },
                 );
-                events.push(Event { row: Row::RecoveredReaped, key: k, name });
+                events.push(Event { row: if sent { Row::RecoveredReaped } else { Row::GoneBeforeReap }, key: k, name });
             }
             (false, None) => {
                 state.pods.remove(&k);
@@ -1369,7 +1405,8 @@ pub fn reconcile<'a>(state: &mut ReapState, listing: &dyn Fn(&str) -> Option<&'a
         }
     }
     let mut hold = None;
-    for (k, t) in state.reaped.iter_mut() {
+    // (F3 checks the reaper's own terminates only: a `not_reaped` pod went otherwise.)
+    for (k, t) in state.reaped.iter_mut().filter(|(_, t)| !t.not_reaped) {
         let provider = k.split_once(':').map_or("", |(p, _)| p);
         let id = k.split_once(':').map_or("", |(_, i)| i);
         let Some(pods) = listing(provider) else { continue };

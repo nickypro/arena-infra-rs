@@ -71,7 +71,7 @@ fn pre_ssh_gate_rows() {
     let mut empty = p(&a);
     empty.idle_after_secs = None;
     let renamed = PodPolicy { name: "devtest-zulu".into(), ..p(&a) };
-    let terminating = PodPolicy { terminating: Some(Terminating { run_id: "r".into(), trigger: Trigger::Idle, at: T }), ..p(&a) };
+    let terminating = PodPolicy { terminating: Some(Terminating::new("r", Trigger::Idle, T)), ..p(&a) };
     let cases: Vec<(&str, PodPolicy, Pod, Row)> = vec![
         ("R1 no policy", empty, a.clone(), Row::NoPolicy),
         ("R3 vast", p(&a), Pod { provider: "vast".into(), ..a.clone() }, Row::ProviderUnsupported),
@@ -471,6 +471,11 @@ fn w7_b_h3b_the_post_backup_look_is_the_next_baseline_and_a_real_look() {
     // Its clock: drift against the deciding look, and an unverified control clock.
     let drifted = Observation { pod_t: Some(r.now() - 120 - 121), ..deciding.clone() };
     assert_eq!(classify_post_backup(Some(&drifted), &facts(&r), read0, &ctx(r.now())).reasons, [Reason::Clock]);
+    // A backup longer than MAX_GAP (W7LR-3): the drift is still checked against the deciding look.
+    let long = gap_prev(&r, 3 * 3600, 0);
+    assert_eq!(classify_post_backup(Some(&long), &facts(&r), read0, &ctx(r.now())).verdict, Verdict::Idle);
+    let long_drift = Observation { pod_t: Some(r.now() - 3 * 3600 - 121), ..long };
+    assert_eq!(classify_post_backup(Some(&long_drift), &facts(&r), read0, &ctx(r.now())).reasons, [Reason::Clock]);
     let unverified = ClassifyCtx { clock_ok: false, ..ctx(r.now()) };
     assert_eq!(classify_post_backup(Some(&deciding), &facts(&r), read0, &unverified).verdict, Verdict::Unknown);
     // No deciding look before it: nothing to measure from.
@@ -1044,11 +1049,17 @@ fn reconcile_with_the_listing() {
     let b = rp("devtest-bravo", "rb");
     let c = hz("devtest-charlie", "7");
     let d = rp("devtest-delta", "rd");
-    let tw = |p: &Pod| PodPolicy { terminating: Some(Terminating { run_id: "r1".into(), trigger: Trigger::Idle, at: T }), ..policy(p, None, Some(900)) };
-    s.pods.insert(key("runpod", "ra"), tw(&a));
-    s.pods.insert(key("runpod", "rb"), tw(&b));
-    s.pods.insert(key("hetzner", "7"), tw(&c));
+    let e = rp("devtest-echo", "re");
+    let frozen = FrozenDirs { snapshot_dir: "/b/reaped/devtest-bravo/S-runpod-rb-attempt/snapshot".into(), big_dir: "/big/reaped/devtest-bravo/S-runpod-rb-attempt/big".into() };
+    // Its terminate sent (the mark is saved right before the call, after the freeze is recorded).
+    let sent = Terminating { frozen: Some(frozen.clone()), sent_at: Some(T + 30), ..Terminating::new("r1", Trigger::Idle, T) };
+    let tw = |p: &Pod, t: &Terminating| PodPolicy { terminating: Some(t.clone()), ..policy(p, None, Some(900)) };
+    s.pods.insert(key("runpod", "ra"), tw(&a, &sent));
+    s.pods.insert(key("runpod", "rb"), tw(&b, &sent));
+    s.pods.insert(key("hetzner", "7"), tw(&c, &sent));
     s.pods.insert(key("runpod", "rd"), policy(&d, None, Some(900)));
+    // W7LR-1: frozen, but its terminate never sent (the run died before; the pod went otherwise).
+    s.pods.insert(key("runpod", "re"), tw(&e, &Terminating { sent_at: None, ..sent.clone() }));
     let runpod = vec![a.clone()];
     let listing = |p: &str| -> Option<&[Pod]> {
         match p {
@@ -1061,20 +1072,32 @@ fn reconcile_with_the_listing() {
     assert!(rows.contains(&(Row::Interrupted, "devtest-alpha")));
     assert!(rows.contains(&(Row::RecoveredReaped, "devtest-bravo")));
     assert!(rows.contains(&(Row::Pruned, "devtest-delta")));
-    assert_eq!(ev.len(), 3, "{rows:?}");
+    assert!(rows.contains(&(Row::GoneBeforeReap, "devtest-echo")));
+    assert_eq!(ev.len(), 4, "{rows:?}");
     assert!(s.pods[&key("runpod", "ra")].terminating.is_none());
-    assert!(s.reaped[&key("runpod", "rb")].recovered);
+    let rb = &s.reaped[&key("runpod", "rb")];
+    assert!(rb.recovered && !rb.not_reaped && rb.snapshot_dir.as_deref() == Some(frozen.snapshot_dir.as_str()), "{rb:?}");
+    let re = &s.reaped[&key("runpod", "re")];
+    assert!(re.recovered && re.not_reaped && re.big_dir.as_deref() == Some(frozen.big_dir.as_str()), "{re:?}");
     assert!(s.pods[&key("hetzner", "7")].terminating.is_some(), "Hetzner's listing failed: untouched");
     assert!(!s.pods.contains_key(&key("runpod", "rd")));
     // F3: a reaped pod still listed and billing — once noted, twice a hold.
     let mut s = ReapState::default();
-    s.reaped.insert(key("runpod", "ra"), Tombstone { at: T, name: "devtest-alpha".into(), trigger: Some(Trigger::Idle), snapshot_dir: None, big_dir: None, branch: None, recovered: false, seen_after: 0 });
+    let tomb = Tombstone { at: T, name: "devtest-alpha".into(), trigger: Some(Trigger::Idle), snapshot_dir: None, big_dir: None, branch: None, recovered: false, seen_after: 0, not_reaped: false };
+    s.reaped.insert(key("runpod", "ra"), tomb.clone());
     let still = |p: &str| -> Option<&[Pod]> { (p == "runpod").then_some(&runpod[..]) };
     reconcile(&mut s, &still, T + 900);
     assert!(s.hold.is_none());
     let ev = reconcile(&mut s, &still, T + 1800);
     assert_eq!(ev[0].row, Row::StillBilling);
     assert!(s.hold.as_ref().is_some_and(|h| h.auto && h.reason.contains("still listed and billing")));
+    // …but a pod the reaper never terminated (W7LR-1) isn't its to vouch for.
+    let mut s = ReapState::default();
+    s.reaped.insert(key("runpod", "ra"), Tombstone { not_reaped: true, ..tomb });
+    for t in [T + 900, T + 1800] {
+        assert!(reconcile(&mut s, &still, t).is_empty());
+    }
+    assert!(s.hold.is_none());
 }
 
 /// The rows' spec numbers are what the docs and logs cite.

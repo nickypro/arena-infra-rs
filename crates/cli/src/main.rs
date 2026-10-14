@@ -16370,10 +16370,10 @@ mod tests {
     }
 
     /// Live W7 step 0: the reap line ran at :07/:22/:37/:52 — the archive snap push's very
-    /// minutes, both at the backup roots at once. Every arena line that reads or writes the backup
-    /// roots runs on minutes of its own: the */15 backup, the archive's snap and big pushes, the
-    /// reaper; and the reaper (whose reap syncs the proxy) is off the */5 proxy re-sync too. Read
-    /// from the rendered lines, as cron reads them.
+    /// minutes, both at the backup roots at once. The reap line runs on minutes no other arena line
+    /// uses — every one `cron install` renders: the */15 backup, the archive's snap and big pushes,
+    /// the */5 proxy re-sync and the */2 dashboard snapshot (W7LR note a). Read from the rendered
+    /// lines, as cron reads them.
     #[test]
     fn the_reap_line_runs_on_minutes_no_other_line_uses() {
         use super::{cron_lines, CronJob, CronKind::*};
@@ -16397,16 +16397,17 @@ mod tests {
             backup: true,
             pull: true,
             proxy: true,
-            snapshot_dir: None,
+            snapshot_dir: Some("/srv/www"),
             archive: true,
             archive_state_dir: None,
         };
         let lines = cron_lines(&job);
-        let line = |k: super::CronKind| lines.iter().find(|(x, _)| *x == k).map(|(_, l)| l.clone()).unwrap();
+        let kinds: Vec<super::CronKind> = lines.iter().map(|(k, _)| *k).collect();
+        assert_eq!(kinds, [Backup, Proxy, Snapshot, ArchiveSnap, ArchiveBig], "every other line arena renders");
         let reap = minutes(&arena_core::reap::render::cron_line(true, "/opt/arena", "/srv/config.env", "/home/u", &[]));
         assert_eq!(reap.len(), 4, "four times an hour: {reap:?}");
-        for k in [Backup, ArchiveSnap, ArchiveBig, Proxy] {
-            let other = minutes(&line(k));
+        for (k, l) in &lines {
+            let other = minutes(l);
             assert!(reap.is_disjoint(&other), "the reap line shares minutes with the {} line: {reap:?} vs {other:?}", k.label());
         }
     }

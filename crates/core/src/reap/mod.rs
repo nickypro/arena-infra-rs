@@ -662,13 +662,41 @@ pub struct Observation {
 }
 
 /// A pending terminate: written (and fsynced) before the reap's backup starts — the
-/// write-ahead record a crashed run is reconciled from (spec §8 F1/F2).
+/// write-ahead record a crashed run is reconciled from (spec §8 F1/F2). As the attempt goes on it
+/// records how far it got, each step saved before the next: its frozen copy once the freeze
+/// completed, then that the terminate is being sent. Only both together let a later run that
+/// finds the pod gone call it reaped (W7LR-1: the write-ahead alone predates the backup, so it
+/// can't tell a run cut off after its terminate from one cut off before it — after which the
+/// pod may have gone by hand or with its host).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Terminating {
     pub run_id: String,
     pub trigger: Trigger,
     pub at: u64,
+    /// The attempt's verified backup, frozen and counted equal (RS1) — recorded once the freeze
+    /// completed, never before: a leaf a run killed mid-freeze left behind is never named here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frozen: Option<FrozenDirs>,
+    /// When the terminate was sent: marked, and fsynced, right before the call
+    /// ([`store::mark_sent`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_at: Option<u64>,
+}
+
+impl Terminating {
+    /// The write-ahead as [`store::write_ahead`] first saves it: nothing frozen, nothing sent.
+    pub fn new(run_id: &str, trigger: Trigger, at: u64) -> Terminating {
+        Terminating { run_id: run_id.to_string(), trigger, at, frozen: None, sent_at: None }
+    }
+}
+
+/// Both tiers' dirs of a frozen copy (`<root>/reaped/<name>/<leaf>/snapshot`, `…/big`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrozenDirs {
+    pub snapshot_dir: String,
+    pub big_dir: String,
 }
 
 /// The decision a run made for a pod, kept for `reap status` and the `ENDS` column.
@@ -847,6 +875,10 @@ pub struct Tombstone {
     /// Runs that still saw it listed and billing after the Ok terminate (F3: 2 ⇒ hold).
     #[serde(default)]
     pub seen_after: u32,
+    /// Gone, but not by the reaper — or before its terminate was sent: a reap attempt of it was
+    /// under way (its copy, if frozen, keeps its `-attempt` name), the pod went otherwise (W7LR-1).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub not_reaped: bool,
 }
 
 /// The whole state file.
@@ -960,19 +992,26 @@ pub fn identity_condition(provider: &str, id: &str) -> Option<String> {
 }
 
 /// What a frozen copy under `reaped/<name>/` is, by its leaf's name (RS1): the verified backup
-/// of a pod that was then terminated, one of an attempt that stopped before its terminate, or a
-/// rehearsal's. The name is the only record on the control box's disk, so it must never
-/// overstate: a copy is named a reap's only once the terminate succeeded (W7 B-RS8b).
+/// of a pod the reaper then terminated, one of an attempt that stopped before its terminate was
+/// sent, a rehearsal's — or one frozen before these names existed. The name is the only record
+/// on the control box's disk, so it must never overstate: a copy is named a reap's only once the
+/// terminate succeeded (W7 B-RS8b), or was sent and the pod is gone (F2, W7LR-1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrozenKind {
-    /// `<stamp>-<provider>-<id>`: the pod was terminated after it.
+    /// `<stamp>-<provider>-<id>-reaped`: the pod was terminated after it.
     Reaped,
-    /// `<stamp>-<provider>-<id>-attempt`: frozen by an `--apply` attempt that stopped before (or
-    /// was cut off around) its terminate — a re-listing, a pin, `REAP_ENABLED=0`, a crash.
+    /// `<stamp>-<provider>-<id>-attempt`: frozen by an `--apply` attempt that never sent its
+    /// terminate — a re-listing, a pin, `REAP_ENABLED=0`, a crash, the pod gone otherwise.
     Attempt,
     /// `<stamp>-<provider>-<id>-rehearsal`: `--rehearse`, never a terminate.
     Rehearsal,
+    /// `<stamp>-<provider>-<id>`: frozen before the names above (a reap's or a stopped
+    /// attempt's — its name can't tell).
+    Older,
 }
+
+/// The suffix of a reap's frozen copy.
+pub const REAPED_SUFFIX: &str = "-reaped";
 
 /// The suffix of an attempt's frozen copy until its terminate succeeds.
 pub const ATTEMPT_SUFFIX: &str = "-attempt";
@@ -984,41 +1023,31 @@ pub const REHEARSAL_SUFFIX: &str = "-rehearsal";
 /// as they go into a path (the caller's `path_component`).
 pub fn frozen_leaf(stamp: &str, provider: &str, id: &str, kind: FrozenKind) -> String {
     let suffix = match kind {
-        FrozenKind::Reaped => "",
+        FrozenKind::Reaped => REAPED_SUFFIX,
         FrozenKind::Attempt => ATTEMPT_SUFFIX,
         FrozenKind::Rehearsal => REHEARSAL_SUFFIX,
+        FrozenKind::Older => "",
     };
     format!("{stamp}-{provider}-{id}{suffix}")
 }
 
 /// A leaf's kind, from its suffix.
 pub fn frozen_kind(leaf: &str) -> FrozenKind {
-    if leaf.ends_with(ATTEMPT_SUFFIX) {
+    if leaf.ends_with(REAPED_SUFFIX) {
+        FrozenKind::Reaped
+    } else if leaf.ends_with(ATTEMPT_SUFFIX) {
         FrozenKind::Attempt
     } else if leaf.ends_with(REHEARSAL_SUFFIX) {
         FrozenKind::Rehearsal
     } else {
-        FrozenKind::Reaped
+        FrozenKind::Older
     }
 }
 
-/// The reap's name for an attempt's leaf (its suffix dropped) — what it is renamed to once the
-/// terminate succeeded. `None` for a leaf that isn't an attempt's.
-pub fn reaped_leaf_of(attempt: &str) -> Option<&str> {
-    attempt.strip_suffix(ATTEMPT_SUFFIX).filter(|l| !l.is_empty())
-}
-
-/// Of `leaves` (one pod name's `reaped/<name>/` entries), the newest attempt of the pod
-/// `provider`/`id` frozen at or after `stamp` (the write-ahead's, in the same `YYYYMMDDTHHMMSSZ`
-/// form — fixed width, so it sorts as text): what a run cut off between its terminate and its
-/// record froze (F2), never an older attempt's or another pod's.
-pub fn attempt_since<'a>(leaves: &'a [String], provider: &str, id: &str, stamp: &str) -> Option<&'a str> {
-    let tail = format!("-{provider}-{id}{ATTEMPT_SUFFIX}");
-    leaves
-        .iter()
-        .map(String::as_str)
-        .filter(|l| l.strip_suffix(tail.as_str()).is_some_and(|s| s.len() == stamp.len() && s >= stamp))
-        .max()
+/// The reap's name for an attempt's leaf (`…-attempt` → `…-reaped`) — what it is renamed to
+/// once its terminate succeeded. `None` for a leaf that isn't an attempt's.
+pub fn reaped_leaf_of(attempt: &str) -> Option<String> {
+    attempt.strip_suffix(ATTEMPT_SUFFIX).filter(|l| !l.is_empty()).map(|l| format!("{l}{REAPED_SUFFIX}"))
 }
 
 /// Whether the provider reports `pod` protected against a terminate: RunPod's `locked`,
