@@ -1168,6 +1168,15 @@ fn save_snap_durable(ctx: &SyncCtx<'_>, st: &SnapState) -> Result<()> {
     state::save_durable(&ctx.paths.sync_state(Tier::Snap), st).context("saving sync-snap.json before a push")
 }
 
+/// Whether `pod`'s backup lock in the backup dir is held — its pull (or the reaper's backup) is
+/// writing its tree right now. A probe: taken and let go at once (a pull waits for a busy lock,
+/// polling, so this never makes one skip a pod); a lock that can't be opened or taken says "no"
+/// (the push goes as before the locks). The pull locks `LOCAL_BACKUP_DIR`, which `dir` is (or
+/// `--dir`, when that's where the pulls write).
+fn pull_running(dir: &Path, pod: &str) -> bool {
+    arena_core::pull::try_pod_lock_now(&dir.display().to_string(), pod).is_err()
+}
+
 /// Save the big tier's state (not in a dry run).
 fn save_big(ctx: &SyncCtx<'_>, st: &BigState) -> Result<()> {
     if ctx.o.dry_run {
@@ -1367,6 +1376,14 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
                 not_started = Some(pod.clone());
                 complete = false;
                 break;
+            }
+            // A pod whose pull is running has a half-written tree: pushed now, its first push would
+            // seed the label from the few files there yet and the rest would land as full copies
+            // until the check (review w7la R3). It waits for the next run — never charged.
+            if pull_running(ctx.dir, pod) {
+                (ctx.say)(&format!("… snap {label} {pod}: its pull is running (the pod's backup lock is held) — it waits for the next run"));
+                complete = false;
+                continue;
             }
             // Whatever happens next, something of it may be on the archive: a link source — and a
             // seed's start. Written and fsynced BEFORE rsync runs, so a push killed half-way (no

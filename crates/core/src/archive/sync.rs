@@ -24,7 +24,8 @@
 //!   sources (`--checksum --ignore-existing`) — recorded (fsynced) before rsync runs, so one
 //!   killed half-way is followed by a check, never by another seed;
 //! - while the day runs, later pushes compare with the label's **own** copy only (the quick check,
-//!   no link source): a changed file is written anew, nothing there is ever re-linked;
+//!   no link source): a changed file is written anew, nothing there is ever re-linked; a pod whose
+//!   pull is running (its backup lock held) waits for the next run (review w7la R3);
 //! - a **check** re-links a copy pushed before its links were there and, once its day is over,
 //!   compares the whole copy with the control box's before the label seals: `--checksum` with the
 //!   link sources but without `-t` (so a file equal in content but not in mtime is never touched
