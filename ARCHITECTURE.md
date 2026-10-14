@@ -216,9 +216,12 @@ flowchart TD
   missing (`--checksum --ignore-existing`), later pushes while the day runs update against the
   label's own copy (quick check, no link source), and a check (`--checksum` without `-t`, then a
   quick pass for the mtimes) re-links a label pushed before its links and verifies every pod's
-  copy once its day is over — a label seals only after that. Covered by real-rsync tests in both
-  push orders and a first backlog (`cmp` of every archived file), the bug reproduced with the
-  old argv.
+  copy once its day is over — a label seals only after that. A pod's copy is final only once
+  every file of it was compared in a pass that completed: a check, or a first push into a tree
+  provably absent (`SnapState::born_empty`: `archive up` created the volume empty, and each push's
+  start is written and fsynced before rsync runs — a killed one is followed by a check). Covered
+  by real-rsync tests in both push orders, a first backlog and a killed first push (`cmp` of every
+  archived file), the bug reproduced with the old argv.
 - **One archive price**: `archive up/down/resize/status`, `teardown --check` and `balance` price
   the archive by one rule (`archive::Prices::monthly_for`: servers with their IPv4 plus volume
   GB), at the live `/pricing` else one list table (`Prices::LIST`) — a test holds the three to

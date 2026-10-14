@@ -1385,8 +1385,15 @@ deleted on its own.
   the day runs compare with the label's own copy (no link source); and a **check** — `--checksum`
   with the link sources but without `-t` (so no mtime is ever set on a shared file), then a quick
   pass for the mtimes — re-links a label pushed before its predecessor and, once its day is over,
-  compares every pod's copy with the control box's before the label seals. The content read costs
-  one pass of each pod's label at its first push and one at its check.
+  compares every pod's copy with the control box's before the label seals; `sync --label` is
+  always a check. A pod's copy counts as final only when every file of it was compared in a pass
+  that completed: a check — or a first push into a tree known to be absent (the snap volume was
+  created empty by `archive up`, and every push's start is written and fsynced before rsync runs,
+  so a push killed half-way is followed by a check, never by another first push). A sync state of
+  unknown origin (a lost `sync-snap.json`) proves no absence: its first pushes wait for a check.
+  A pod whose pull is running (its backup lock held) waits for the next run rather than seeding a
+  half-written tree. The content read costs one pass of each pod's label at its first push and
+  one at its check.
 - **Only this cohort's pods leave the control box**: the `MACHINE_NAME_LIST` names (and their
   `-old`/`-new` twins), never `@` staff boxes or anything else an unscoped pull put there
   (`sync`/`status` list those as "kept on the control box only", apart from pods named like the
@@ -1396,10 +1403,13 @@ deleted on its own.
   twins unless those are list entries of their own; refused unless run against the state dir
   that holds `archive.json`, the one the cron reads; it shows what it would record and asks —
   `-y` or `--confirm <prefix>-<pod>` without a terminal) — is never pushed again, until
-  `arena archive unforget <pod>` lifts it (a deleted copy stays deleted). Its archived copies
+  `arena archive unforget <pod>` lifts it. Its archived copies
   stay — readable by every participant while access is on, as `forget` and `status` say — until
   `--delete-archived`, which lists every directory with its size, needs the name typed
-  (`--confirm <prefix>-<pod>`) and only then takes the sync locks for the delete itself.
+  (`--confirm <prefix>-<pod>`) and only then takes the sync locks for the delete itself — and
+  takes the pod out of the sync state, so none of its labels counts as pushed or final. After an
+  `unforget` every label the control box still holds of it is pushed and checked again; what the
+  control box no longer holds is lost for good, and `unforget` and `status` ("lost") say so.
   **Secret files never do**: shell rc files (the API keys `copy-keys` writes), histories,
   `.env*`, `.netrc`, `.gitconfig`, `.git-credentials`, `.pgpass`, `.s3cfg`, `.ssh/`, `.config/`,
   `.cache/`, `.claude*`, cloud and Kaggle credentials, Hugging Face token files, `id_*`/`*.pem`/
