@@ -1234,6 +1234,7 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
     let allowed = push::push_set(&ctx.names.prefix, &ctx.cfg.machine_names, &st.allowed_ever, &c.forgotten);
     let local = push::local_snapshot(ctx.dir, &allowed).with_context(|| format!("reading {}", ctx.dir.display()))?;
     push::prune_failing(&mut st.pods_failing, |p| local.iter().any(|l| l.pods.iter().any(|x| x == p)));
+    st.pull_waits.retain(|p, _| local.iter().any(|l| l.pods.iter().any(|x| x == p)));
     let baselines = push::local_baselines(ctx.dir);
     let plan = push::plan_snap(&local, &o.labels, &st, start);
     let base_todo: Vec<push::LocalBaseline> = baselines.iter().copied().filter(|b| !push::baseline_pushed(*b, &st)).collect();
@@ -1256,6 +1257,8 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
     let mut ok_pods: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let (mut baseline_ok, mut baseline_failed, mut outage, mut tried, mut real_failures) = (false, false, false, 0usize, 0usize);
     let mut charges: Vec<Charge> = Vec::new();
+    // Whose first push of an open label waited for its pull this run, and whose went ahead (RR1).
+    let (mut pull_waited, mut pull_went) = (std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
     // 1. The fleet baselines (cross-pod dedup, as on the control box): every local week in one push.
     if !base_todo.is_empty() {
         let weeks: Vec<u32> = baselines.iter().map(|b| b.week).collect();
@@ -1378,13 +1381,19 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
                 complete = false;
                 break;
             }
-            // A pod whose pull is running has a half-written tree: pushed now, its first push would
-            // seed the label from the few files there yet and the rest would land as full copies
-            // until the check (review w7la R3). It waits for the next run — never charged.
-            if pull_running(ctx.dir, pod) {
-                (ctx.say)(&format!("… snap {label} {pod}: its pull is running (the pod's backup lock is held) — it waits for the next run"));
-                complete = false;
-                continue;
+            // A pod whose pull is running has a half-written tree: its first push of a still-open
+            // label would seed it from the few files there yet, the rest landing as full copies
+            // until the check (review w7la R3). That push alone waits for the next run — never
+            // charged, but counted (`status` names a pod kept waiting, RR1); a past label's tree
+            // is final and never waits ([`push::holds_for_pull`]).
+            if push::holds_for_pull(how, could_seal) {
+                if pull_running(ctx.dir, pod) {
+                    (ctx.say)(&format!("… snap {label} {pod}: its pull is running (the pod's backup lock is held) — its first push waits for the next run"));
+                    pull_waited.insert(pod.clone());
+                    complete = false;
+                    continue;
+                }
+                pull_went.insert(pod.clone());
             }
             // Whatever happens next, something of it may be on the archive: a link source — and a
             // seed's start. Written and fsynced BEFORE rsync runs, so a push killed half-way (no
@@ -1397,6 +1406,9 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
             let (outcome, sent) = run_push_logged(ctx, &src, &jobs, left).await;
             match outcome {
                 Ok((note, s)) => {
+                    if how == push::PodPush::Seed {
+                        pull_went.insert(pod.clone());
+                    }
                     push::note_push_ok(&mut rec, pod, how, chain, has_links, could_seal, born_empty);
                     push::clear_snap_failing(&mut st, pod, label);
                     through.push(pod.clone());
@@ -1522,6 +1534,13 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
     }
     if !plan.deferred.is_empty() {
         (ctx.say)(&format!("… {} older label(s) wait for the next runs: {}", plan.deferred.len(), plan.deferred.join(", ")));
+    }
+    push::note_pull_waits(&mut st, &pull_waited, &pull_went, run_started);
+    for (pod, w) in st.pull_waits.iter().filter(|(_, w)| push::pull_wait_overdue(w, run_started)) {
+        (ctx.say)(&format!(
+            "! snap {pod}: its first push of today's label has waited for its running pull {} runs in a row — `arena archive status`",
+            w.runs
+        ));
     }
     let all_failed = outage || (tried > 0 && ok_pods.is_empty() && !baseline_ok && real_failures > 0);
     st.last_run = Some(RunRecord { started: run_started, finished: (ctx.clock)(), ok: failed == 0, all_failed });
@@ -4765,6 +4784,35 @@ mod tests {
         let st = snap_state(&w);
         assert!(st.labels["w0d3"].pods_ok.contains("devtest-bravo"));
         assert!(!st.pods_failing.contains_key("devtest-bravo"), "bravo's pushes go through again: {:?}", st.pods_failing);
+    }
+
+    /// Re-review RR1 (beside the review's test): while a pod's pull keeps its backup lock, only its
+    /// first push of TODAY's label waits — counted run by run, said by the sync after an hour's
+    /// worth (`status` names it, `status_names_a_pod_kept_waiting_by_its_pull`) — and the first
+    /// run after the pull goes ahead and clears it.
+    #[tokio::test]
+    async fn a_pod_kept_waiting_by_its_pull_is_counted_and_said() {
+        let w = world("rr-pull-said");
+        seed(&w);
+        file(&w, "w0d3/devtest-alpha/today.py");
+        let stub = rsync_stub(&w.dir);
+        let backup = w.dir.join("backup").display().to_string();
+        let pull = arena_core::pull::try_pod_lock_now(&backup, "devtest-alpha").unwrap().expect("the pull's lock");
+        let now = day_end("w0d2") + 3 * 3600;
+        let mut said = Vec::new();
+        for run in 0..4u64 {
+            let (_, s) = sync_said(&w, sync_opts("snap"), &stub, now + run * 900).await;
+            said = s;
+        }
+        let waits = snap_state(&w).pull_waits;
+        assert!(waits.get("devtest-alpha").is_some_and(|w| w.runs == 4 && (now..now + 60).contains(&w.since)), "{waits:?}");
+        assert!(said.iter().any(|l| l.contains("devtest-alpha: its first push of today's label has waited for its running pull 4 runs")), "{said:#?}");
+        assert!(!rsync_calls(&w.dir).iter().any(|c| c.ends_with(":snap/w0d3/devtest-alpha/")), "today's seed waited");
+        drop(pull);
+        fresh_calls(&w.dir);
+        sync_said(&w, sync_opts("snap"), &stub, now + 3600).await.0.unwrap();
+        assert!(rsync_calls(&w.dir).iter().any(|c| c.ends_with(":snap/w0d3/devtest-alpha/")), "{:#?}", rsync_calls(&w.dir));
+        assert!(snap_state(&w).pull_waits.is_empty());
     }
 
     // ---- Re-review w7la (the R1–R4 fixes): regression tests — each fails on 41e6d19 ----

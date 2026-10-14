@@ -214,6 +214,23 @@ pub struct SnapState {
     /// check.
     #[serde(default)]
     pub born_empty: bool,
+    /// Per pod whose first push of a still-open label waited for its running pull (its backup
+    /// lock held, [`super::sync::holds_for_pull`]): how many runs in a row, since when. A backup
+    /// run holds each pod's lock from its start until that pod's rsync ends, so a pod queued
+    /// behind the fleet or with a slow pull can wait run after run; `status` names it once
+    /// that's [`super::sync::pull_wait_overdue`] (re-review w7la RR1). Cleared when the pod's
+    /// first push goes ahead.
+    #[serde(default)]
+    pub pull_waits: BTreeMap<String, PullWait>,
+}
+
+/// How long a pod's first push of an open label has been waiting for its pull.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullWait {
+    /// Runs in a row it waited.
+    pub runs: u32,
+    /// When it first waited (UNIX s).
+    pub since: u64,
 }
 
 impl Default for SnapState {
@@ -229,6 +246,7 @@ impl Default for SnapState {
             baseline_fails: 0,
             pods_failing: BTreeMap::new(),
             born_empty: false,
+            pull_waits: BTreeMap::new(),
         }
     }
 }

@@ -460,6 +460,26 @@ pub fn judge_status(i: &StatusInputs) -> StatusReport {
     if !big_failing.is_empty() {
         r.add("big failing", Level::Warn, format!("big pushes failing: {}", big_failing.join(", ")));
     }
+    // A pod whose first push of today's label keeps waiting for its pull (re-review RR1): its
+    // backup run holds the pod's lock that long — slow, queued behind the fleet, or stuck.
+    let waiting: Vec<String> = i
+        .snap
+        .pull_waits
+        .iter()
+        .filter(|(p, w)| !i.forgotten.contains(*p) && super::sync::pull_wait_overdue(w, i.now))
+        .map(|(p, w)| format!("{p} ({} runs, since {})", w.runs, age(i.now, w.since)))
+        .collect();
+    if !waiting.is_empty() {
+        r.add(
+            "waiting for a pull",
+            Level::Warn,
+            format!(
+                "first push of today's label held back by a running pull (the pod's backup lock): {} — is the backup run that \
+                 slow, queued, or stuck? (`arena cron show`, the backup log)",
+                waiting.join(", ")
+            ),
+        );
+    }
     // And snap's, pod by pod (W7 live: a pod left out of its snap push was named nowhere).
     let snap_failing: Vec<String> = i.snap.pods_failing.iter().filter(|(p, _)| !i.forgotten.contains(p)).map(|(p, why)| format!("{p} ({why})")).collect();
     if !snap_failing.is_empty() {
@@ -902,6 +922,20 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Re-review RR1: a pod whose first push of today's label has waited for its running pull an
+    /// hour's worth of runs is named; one that waited only a run or two isn't.
+    #[test]
+    fn status_names_a_pod_kept_waiting_by_its_pull() {
+        use crate::archive::state::PullWait;
+        let mut snap = snap_ok();
+        snap.pull_waits.insert("arena9-apple".into(), PullWait { runs: 4, since: NOW - 3700 });
+        snap.pull_waits.insert("arena9-bloom".into(), PullWait { runs: 1, since: NOW - 900 });
+        let r = judge(|_| {}, &snap, &big_ok(), &host(), Some(Ok(&inv())));
+        assert_eq!(level_of(&r, "waiting for a pull"), Level::Warn);
+        let text = r.render();
+        assert!(text.contains("arena9-apple (4 runs, since 1.0 h ago)") && !text.contains("arena9-bloom ("), "{text}");
     }
 
     /// W7 live: a pod left out of its snap push (or failing) is named, as a failing big pod is.

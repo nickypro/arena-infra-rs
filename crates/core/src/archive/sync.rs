@@ -24,8 +24,10 @@
 //!   sources (`--checksum --ignore-existing`) — recorded (fsynced) before rsync runs, so one
 //!   killed half-way is followed by a check, never by another seed;
 //! - while the day runs, later pushes compare with the label's **own** copy only (the quick check,
-//!   no link source): a changed file is written anew, nothing there is ever re-linked; a pod whose
-//!   pull is running (its backup lock held) waits for the next run (review w7la R3);
+//!   no link source): a changed file is written anew, nothing there is ever re-linked. A pod's
+//!   first push of a still-open label waits while its pull runs (its backup lock held: the tree
+//!   is half-written) — never a past label's, whose tree is final ([`holds_for_pull`]; `status`
+//!   names a pod kept waiting for an hour);
 //! - a **check** re-links a copy pushed before its links were there and, once its day is over,
 //!   compares the whole copy with the control box's before the label seals: `--checksum` with the
 //!   link sources but without `-t` (so a file equal in content but not in mtime is never touched
@@ -215,6 +217,45 @@ pub const GIVE_UP_AFTER: u32 = 3;
 /// nothing about the pod: an outage of any length never seals anything partial.
 pub fn counts_toward_give_up(f: PushFailure) -> bool {
     matches!(f, PushFailure::Other | PushFailure::Timeout)
+}
+
+/// Whether a push waits for the pod's running pull (its backup lock held): only its FIRST push
+/// (a seed) of a label still open to pulls — its day and grace not over (`could_seal` false; a
+/// custom label is never over). That push would seed the label from the few files there yet,
+/// and the rest would land as full copies until the check (review w7la R3). A past label's tree
+/// is final — a pull writes only today's — so its pushes never wait (re-review RR1: a backup
+/// run holds each pod's lock from its start until that pod's rsync ends, so waiting there could
+/// hold a pod's past labels back for good); nor does an update or a check of an open label,
+/// which never seed from a half-written tree (later pushes catch up, the check verifies).
+pub fn holds_for_pull(how: PodPush, could_seal: bool) -> bool {
+    how == PodPush::Seed && !could_seal
+}
+
+/// After this many runs in a row — an hour at the cron's 15 minutes ([`PULL_WAIT_WARN_SECS`]) —
+/// a pod whose first push keeps waiting for its pull is named by `status` and the sync's output:
+/// longer than a backup run normally keeps a pod's lock, short enough that a stuck or endless
+/// backup run is seen the same hour.
+pub const PULL_WAIT_WARN_RUNS: u32 = 4;
+/// … or after this long (whichever comes first: the cron may run less often than every 15 min).
+pub const PULL_WAIT_WARN_SECS: u64 = 3600;
+
+/// Whether a pod's waiting for its pull is long enough to say so ([`PULL_WAIT_WARN_RUNS`],
+/// [`PULL_WAIT_WARN_SECS`]).
+pub fn pull_wait_overdue(w: &super::state::PullWait, now: u64) -> bool {
+    w.runs >= PULL_WAIT_WARN_RUNS || now.saturating_sub(w.since) >= PULL_WAIT_WARN_SECS
+}
+
+/// Record one run's waits: each pod in `waited` waited one more run (since `now` if new); each in
+/// `went` — its first push went ahead — no longer waits. Pods the control box no longer holds
+/// are pruned with [`prune_failing`]'s rule by the caller.
+pub fn note_pull_waits(st: &mut SnapState, waited: &BTreeSet<String>, went: &BTreeSet<String>, now: u64) {
+    for p in went.iter().filter(|p| !waited.contains(*p)) {
+        st.pull_waits.remove(p);
+    }
+    for p in waited {
+        let w = st.pull_waits.entry(p.clone()).or_insert(super::state::PullWait { runs: 0, since: now });
+        w.runs += 1;
+    }
 }
 
 /// Record, BEFORE `pod`'s push of a label runs, that it is starting (the caller saves it with
@@ -1741,6 +1782,32 @@ mod tests {
         let mut r = LabelRecord::default();
         note_push_ok(&mut r, p, Update, true, false, true, true);
         assert!(r.pods_linked.contains(p) && !r.pods_final.contains(p), "nothing to link to: linked as it gets; never final without a content check");
+    }
+
+    /// Re-review RR1: only a pod's first push of a still-open label waits for its pull; waits are
+    /// counted run by run and said after an hour's worth. RR2: what a delete removed, from the
+    /// VM's listing, and what `unforget` says of it — dated labels pushed again, custom ones only
+    /// by `--label`, the big copy back or lost.
+    #[test]
+    fn pull_waits_and_what_unforget_says_of_a_deleted_copy() {
+        use PodPush::*;
+        for (how, could_seal, waits) in [(Seed, false, true), (Seed, true, false), (Update, false, false), (Check, false, false), (Check, true, false)] {
+            assert_eq!(holds_for_pull(how, could_seal), waits, "{how:?} could_seal={could_seal}");
+        }
+        let mut st = SnapState::default();
+        let one = |p: &str| [p.to_string()].into_iter().collect::<BTreeSet<String>>();
+        let none = BTreeSet::new();
+        for run in 0..3u64 {
+            note_pull_waits(&mut st, &one("arena9-apple"), &none, 1000 + run * 900);
+        }
+        let w = st.pull_waits["arena9-apple"];
+        assert_eq!((w.runs, w.since), (3, 1000));
+        assert!(!pull_wait_overdue(&w, 1000 + 2 * 900), "three runs, 30 min");
+        assert!(pull_wait_overdue(&w, 1000 + PULL_WAIT_WARN_SECS), "an hour");
+        note_pull_waits(&mut st, &one("arena9-apple"), &none, 3700);
+        assert!(pull_wait_overdue(&st.pull_waits["arena9-apple"], 3700), "{PULL_WAIT_WARN_RUNS} runs");
+        note_pull_waits(&mut st, &none, &one("arena9-apple"), 4600);
+        assert!(st.pull_waits.is_empty(), "its first push went ahead");
     }
 
     /// Review w7la R2: a pod whose archived copy `forget --delete-archived` deleted is out of the
