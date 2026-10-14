@@ -558,8 +558,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     from where it left off (exact byte offsets, lines printed once, `[pod]`-prefixed with
     several pods) until every job has ended, then exits non-zero unless all were `exit 0`;
     a pod that fails 5 reads in a row is given up on; Ctrl+C stops following, never a job.
-    `pods jobs --kill JOB` (confirms) sends SIGTERM to the job's process group where it is
-    running (→ `exit 143 (SIGTERM)`); no SIGKILL follow-up. Log text is stripped of
+    `pods jobs --kill JOB` (confirms) sends SIGTERM to every process group of the job's session
+    where it is running — the wrapper's, and any a command made of its own (`timeout …` does) —
+    (→ `exit 143 (SIGTERM)`); no SIGKILL follow-up. Log text is stripped of
     escape sequences/control characters before printing. Calls are bounded (30s per pod;
     the start may have happened if it timed out — the report says so).
   - `pods test --deep [targets] [--json] [-v]` — the **is-this-pod-usable** check (read-only),
@@ -738,8 +739,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     the reap's backup wouldn't copy — any file in a `TEMP_FOLDER_FOR_SWEEPS/`, a link from the
     home to somewhere outside it, data written since the pod was created on `/workspace`,
     another writable mount or the usual places outside the home (`/data /scratch /srv /mnt
-    /media /opt /var/tmp /tmp /home/<other>`; the system, installed Python packages and caches
-    passed over) —, a home that's a link to another filesystem, a process list, crontab or
+    /media /opt /var/tmp /tmp /home/<other>`; the system, installed Python packages, caches and
+    empty files — nothing to lose in those: uv's 0-byte `/tmp/uv-setuptools-*.lock` once kept a
+    fresh VM from ever reading as idle — passed over) —, a home that's a link to another filesystem, a process list, crontab or
     timer it can't read) means "do nothing and log it". **Since when** is the pod's creation as
     its provider lists it — not the last boot: a Hetzner VM's disk outlives reboots (on RunPod,
     where a restart starts the container afresh, the later of creation and container start). Off by default in layers: a pod needs a policy
@@ -752,22 +754,41 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     60 s old, a durable write-ahead, the git push, the tier roots' markers and free space
     checked again, both rsync tiers under the pod's backup lock (every pod-side step behind
     its identity check) — the big tier as the reap's own copy, which keeps the home's
-    dot-directories and leaves out only documented caches and secrets (`.cache` but
-    `~/.cache/huggingface/` — of which only the hub cache, `hub/` and `xet/`, is left out —,
-    venvs and `site-packages`, Hugging Face hub entries `models--*/`/`datasets--*/`, the VS Code
-    server's binaries, `.ssh`) — a
+    dot-directories and all of `~/.cache` but its well-known download caches; the participant's
+    notice says exactly what it leaves out: "not kept: only what can be downloaded or installed
+    again — Python environments and installed packages (venvs, site-packages, ~/.local/lib, conda
+    envs, node_modules), download and build caches (pip, uv, npm, the Hugging Face and torch hubs,
+    compiled kernels, Python bytecode, matplotlib's), the VS Code server's binaries and extensions,
+    and arena's moved-aside copy of the image's repo — and every .ssh folder; the rest of ~/.cache
+    is kept" (`pull::REAP_NOT_KEPT` lists the paths: Hugging Face `datasets/`, W&B and any
+    cache nobody listed are kept; conda's `envs/`/`pkgs/` only under a conda root in the home) — a
     dry-run verify (0 files pending), then the verified dirs **frozen**: hard-linked (same
-    filesystem, no space) into `<root>/reaped/<name>/<UTC stamp>-<provider>-<id>/snapshot` and
-    `<big root>/reaped/…/big`, counted equal to what was verified — a later same-named pod's
-    pulls never touch that copy, and nothing in arena writes or deletes under `reaped/` (a
-    freeze that fails removes the leaves it made itself, and backs off 6 h like a failed
-    backup).
+    filesystem, no space) into `<root>/reaped/<name>/<UTC stamp>-<provider>-<id>-attempt/snapshot`
+    and `<big root>/reaped/…/big`, counted equal to what was verified, and recorded on the
+    attempt's write-ahead — renamed `…-reaped/` only once the terminate succeeded. An attempt that
+    never sent its terminate (a re-listing, a pin, `REAP_ENABLED=0`, a crash before it) keeps the
+    `-attempt` name; so does its copy when the pod is later found gone (by hand, with its host:
+    "gone, not by the reaper (or before its terminate)"). Only a write-ahead marked "terminate
+    sent" — saved right before the call — lets a run that finds the pod gone rename the copy it
+    recorded (a crash between the terminate and its record); a half-made copy of a run killed
+    mid-freeze is never recorded, so never renamed. A rehearsal's is `-rehearsal`; copies frozen
+    before these names (no suffix) are "older (state unknown)". `reap status` counts each kind
+    under each root's `reaped/` and their size. A later same-named pod's pulls
+    never touch that copy, and nothing in arena writes or deletes under `reaped/` (a freeze that
+    fails removes the leaves it made itself, and backs off 6 h like a failed backup).
     Then a post-backup quiet check (same id and container; nothing changed since the deciding
-    look's scan began; no process started since boot that isn't the container's own), a
+    look's scan began; no process started since boot that isn't the container's own) — recorded
+    as a look of its own and the next look's baseline, so the backup's own CPU and traffic never
+    read as use afterwards (a rehearsal or a stopped attempt leaves the streak alone), while what
+    it sees counts like any look's —, a
     fresh re-listing (same id/name, RUNNING, lock reported off, no `-new`/`-old` twin, no
     second pod of that name — and every provider listed: one that failed could hide a twin),
     a state re-read (no hold, no new pin, still due) and
     `REAP_ENABLED` re-read from the config file — then one terminate, routed by provider name.
+    **CPU** counts as use above 0.25 cores over the probe's own 10 s, or 0.10 cores since the
+    previous look — averaged over at least 3 minutes, so a look taken soon after another (a manual
+    `reap run` right after the cron's) never reads the reaper's own ~5 s of CPU as use, while a
+    job's 20 s of a full core between two such looks still does.
     **Processes**: a process counts as use — a dormant `nohup python train.py`, a kernel, an
     editor, `mosh-server`, a `screen` — unless it's one of the image's own services (a command
     line seen in the first two minutes of the FIRST boot the reaper looked at, kept per pod: a
@@ -793,7 +814,7 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     lists what's missing once the reaper is on or its cron line is installed (off: one `·
     reaper off (opt-in)` row, a ✗ only for a `REAP_*` value set but invalid). Every `pods reap
     … --json` prints exactly one JSON document on stdout — `{"error": …}` on a failure,
-    `{"skipped": …}` when another run holds the lock — and everything else on stderr. Rollout: `cron install --reap observe` first (logs `would_reap`), then
+    `{"skipped": …}` when another run holds the lock — and everything else on stderr. Rollout: `cron install --reap observe` first (logs `would_reap`; the line runs at :11/:27/:41/:57 — minutes no other arena line uses), then
     `--reap apply` (refused unless REAP_ENABLED=1). `reap set` also writes `~/.arena/NOTICE` and
     an interactive-only login banner on the pod (also written after `up`'s setup for a pod
     created with a policy, after `pods setup`, and after a restart's re-provision — the 1-hour
@@ -1082,7 +1103,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     package/venv/install step, or a venv whose python can't `import torch, transformer_lens`
     afterwards, exits non-zero with the reason as its last line (`FAILED: …`) — a VM is never
     reported set up without a working env. Re-runs skip the install only when that import
-    gate already passes.
+    gate already passes. Its installers' scratch (uv's above all) goes to a temp dir of its own,
+    removed when it ends, failure or not: uv's 0-byte `uv-setuptools-*.lock` files, left in
+    `/tmp`, kept a fresh VM from ever reading as idle to the auto-reaper.
     **VS Code warm-up** (last step, on every provider, `up`/`restart`/`replace` included):
     pre-installs what a participant's first Remote-SSH connect would otherwise download on
     the pod — the latest stable VS Code server for the pod's CPU (x64/arm64, resolved from

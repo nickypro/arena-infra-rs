@@ -71,7 +71,7 @@ fn pre_ssh_gate_rows() {
     let mut empty = p(&a);
     empty.idle_after_secs = None;
     let renamed = PodPolicy { name: "devtest-zulu".into(), ..p(&a) };
-    let terminating = PodPolicy { terminating: Some(Terminating { run_id: "r".into(), trigger: Trigger::Idle, at: T }), ..p(&a) };
+    let terminating = PodPolicy { terminating: Some(Terminating::new("r", Trigger::Idle, T)), ..p(&a) };
     let cases: Vec<(&str, PodPolicy, Pod, Row)> = vec![
         ("R1 no policy", empty, a.clone(), Row::NoPolicy),
         ("R3 vast", p(&a), Pod { provider: "vast".into(), ..a.clone() }, Row::ProviderUnsupported),
@@ -371,6 +371,118 @@ fn quiet_now_ignores_cumulative_counters() {
         assert!(e.contains(&reason), "{reason:?}: {e:?}");
     }
     assert_eq!(quiet_now(&Err(ProbeError::Failed), JobsOutcome::Read { busy: 0 }, &ctx).unwrap_err(), [Reason::ProbeFailed]);
+}
+
+/// The previous look `gap` seconds before `r`, with `cpu_since` µs of CPU used since it.
+fn gap_prev(r: &Reply, gap: u64, cpu_since: u64) -> Observation {
+    Observation {
+        t: r.now() - gap,
+        pod_t: Some(r.now() - gap),
+        counters_t: Some(r.t0 + r.window - gap),
+        cpu_usec: Some(r.cpu.1.unwrap() - cpu_since),
+        net_bytes: Some(r.net.1.unwrap() - 1_000),
+        ..prev(r)
+    }
+}
+
+/// Live W7 B-H1b: a `reap run` 29 s after the cron's read `cpu` — the reaper's own look (the
+/// root SSH login starting `user@0.service`, the probe) costs the pod ~5 s of CPU, 0.17 cores
+/// over 29 s, and every policy's streak reset. The cumulative check averages over at least
+/// CPU_CUM_MIN_SPAN: a look's own cost (up to 18 CPU-seconds) never reads as use, a real job's
+/// CPU in a short gap still does, and a gap of CPU_CUM_MIN_SPAN or more is judged as before.
+#[test]
+fn w7_b_h1b_a_looks_own_cpu_never_reads_as_use() {
+    let r = Reply::default();
+    let read0 = JobsOutcome::Read { busy: 0 };
+    let verdict = |gap: u64, cpu: u64| classify_reply(&r, Some(&gap_prev(&r, gap, cpu)), read0, "runpod");
+    // The live case, and the reaper's own cost at any short gap (3× what was measured).
+    assert_eq!(verdict(29, 5_300_000).verdict, Verdict::Idle, "the reaper's own look, 29 s after the last");
+    for gap in [5, 29, 60, 120, 179] {
+        assert_eq!(verdict(gap, 18_000_000).verdict, Verdict::Idle, "{gap} s, 18 CPU-seconds");
+    }
+    // A real job in a short gap: a full core for 20 s of it (and the look's own 5 s).
+    for gap in [25, 29, 60, 179] {
+        assert_eq!(verdict(gap, 25_000_000).reasons, [Reason::Cpu], "{gap} s, a core for 20 s");
+    }
+    // At and past CPU_CUM_MIN_SPAN, exactly the old rule (0.10 cores since the last look).
+    for gap in [CPU_CUM_MIN_SPAN, 300, 900, MAX_GAP] {
+        let over = gap * 100_000 + gap; // 0.10001 cores
+        assert_eq!(verdict(gap, over).reasons, [Reason::Cpu], "{gap} s over");
+        assert_eq!(verdict(gap, gap * 100_000 - gap).verdict, Verdict::Idle, "{gap} s under");
+    }
+    // A job still running is the window's, whatever the gap.
+    let busy = Reply { cpu: (Some(1_000_000_000), Some(1_003_000_000)), ..Default::default() };
+    let p = gap_prev(&busy, 29, 0);
+    assert_eq!(classify_reply(&busy, Some(&p), read0, "runpod").reasons, [Reason::Cpu]);
+}
+
+/// Live W7 B-H3b: four minutes after a rehearsal the next look read `cpu, net` — the counters
+/// since the deciding look held the reaper's own 1.1 GB backup — so a rehearsal, or any attempt
+/// stopped after its backup, reset the streak by itself. The post-backup look is recorded as an
+/// observation: its counters aren't judged (the backup is in them) but become the next look's
+/// baseline; otherwise it is a real look — what it sees counts.
+#[test]
+fn w7_b_h3b_the_post_backup_look_is_the_next_baseline_and_a_real_look() {
+    let read0 = JobsOutcome::Read { busy: 0 };
+    let r = Reply { net: (Some(2_000_000_000), Some(2_000_002_000)), ..Default::default() };
+    // The deciding look 2 minutes before: the backup since moved 1.1 GB and burned 60 s of CPU.
+    let deciding = Observation { net_bytes: Some(r.net.1.unwrap() - 1_100_000_000), ..gap_prev(&r, 120, 60_000_000) };
+    let ctx = |now: u64| ClassifyCtx { provider: "runpod", listed_id: "pod1", now, clock_ok: true, baseline: None };
+    let facts = |reply: &Reply| parse_probe(&reply.render(), &reply.nonce, reply.since);
+    // As a regular look, the backup reads as use…
+    assert_eq!(classify(Some(&deciding), &facts(&r), read0, &ctx(r.now())).reasons, [Reason::Cpu, Reason::Net]);
+    // …as the post-backup look it doesn't, and its counters are kept, as they are now.
+    let post = classify_post_backup(Some(&deciding), &facts(&r), read0, &ctx(r.now()));
+    assert_eq!((post.verdict, post.reasons.clone()), (Verdict::Idle, vec![]));
+    assert_eq!((post.cpu_usec, post.net_bytes, post.counters_t), (r.cpu.1, r.net.1, Some(r.t0 + r.window)));
+    assert_eq!((post.container.as_deref(), post.pod_t, post.scan_from), (Some(CONTAINER), Some(r.now()), Some(r.t0 - 900)));
+    // The next look, 4 minutes on, measured from it: quiet.
+    let next = Reply {
+        t0: r.t0 + 240,
+        cpu: (Some(r.cpu.1.unwrap() + 240_000), Some(r.cpu.1.unwrap() + 245_000)),
+        net: (Some(r.net.1.unwrap() + 2_400), Some(r.net.1.unwrap() + 2_500)),
+        ..Default::default()
+    };
+    assert_eq!(classify(Some(&post), &facts(&next), read0, &ctx(next.now())).verdict, Verdict::Idle);
+    // A real look: activity counts, what it can't read is unknown.
+    let with_session = Reply { sshd: [Reply::default().sshd, vec![(5000, "sshd: root@pts/0".into())]].concat(), ..Default::default() };
+    let cases: Vec<(&str, Reply, JobsOutcome, Verdict, Reason)> = vec![
+        ("a login meanwhile", with_session, read0, Verdict::Active, Reason::Session),
+        ("a file saved since the deciding look's scan began", Reply { files: "hit", ..Default::default() }, read0, Verdict::Active, Reason::Files),
+        ("busy right now", Reply { cpu: (Some(1_000_000_000), Some(1_003_000_000)), ..Default::default() }, read0, Verdict::Active, Reason::Cpu),
+        ("a job", Reply::default(), JobsOutcome::Read { busy: 1 }, Verdict::Active, Reason::Job),
+        ("keep", Reply { keep: true, ..Default::default() }, read0, Verdict::Active, Reason::Keep),
+        ("a process started meanwhile", with_proc(late("python")), read0, Verdict::Active, Reason::Process),
+        ("jobs unreadable", Reply::default(), JobsOutcome::Failed, Verdict::Unknown, Reason::JobsUnknown),
+        ("another pod", Reply { id: "other".into(), ..Default::default() }, read0, Verdict::Unknown, Reason::Identity),
+        (
+            "another container",
+            Reply { pid1_start: "999".into(), procs: Some(vec![(999, 11, false, "start.sh".into())]), ..Default::default() },
+            read0,
+            Verdict::Unknown,
+            Reason::ContainerChanged,
+        ),
+    ];
+    for (case, reply, jobs, verdict, reason) in cases {
+        let o = classify_post_backup(Some(&deciding), &facts(&reply), jobs, &ctx(reply.now()));
+        assert_eq!(o.verdict, verdict, "{case}: {:?}", o.reasons);
+        assert!(o.reasons.contains(&reason), "{case}: {:?}", o.reasons);
+    }
+    // Its clock: drift against the deciding look, and an unverified control clock.
+    let drifted = Observation { pod_t: Some(r.now() - 120 - 121), ..deciding.clone() };
+    assert_eq!(classify_post_backup(Some(&drifted), &facts(&r), read0, &ctx(r.now())).reasons, [Reason::Clock]);
+    // A backup longer than MAX_GAP (W7LR-3): the drift is still checked against the deciding look.
+    let long = gap_prev(&r, 3 * 3600, 0);
+    assert_eq!(classify_post_backup(Some(&long), &facts(&r), read0, &ctx(r.now())).verdict, Verdict::Idle);
+    let long_drift = Observation { pod_t: Some(r.now() - 3 * 3600 - 121), ..long };
+    assert_eq!(classify_post_backup(Some(&long_drift), &facts(&r), read0, &ctx(r.now())).reasons, [Reason::Clock]);
+    let unverified = ClassifyCtx { clock_ok: false, ..ctx(r.now()) };
+    assert_eq!(classify_post_backup(Some(&deciding), &facts(&r), read0, &unverified).verdict, Verdict::Unknown);
+    // No deciding look before it: nothing to measure from.
+    assert_eq!(classify_post_backup(None, &facts(&r), read0, &ctx(r.now())).reasons, [Reason::NoBaseline]);
+    // A failed probe: no facts, no counters.
+    let failed = classify_post_backup(Some(&deciding), &Err(ProbeError::Failed), read0, &ctx(r.now()));
+    assert_eq!((failed.verdict, failed.cpu_usec), (Verdict::Unknown, None));
 }
 
 fn streak_of(ts: &[u64]) -> Vec<Observation> {
@@ -937,11 +1049,17 @@ fn reconcile_with_the_listing() {
     let b = rp("devtest-bravo", "rb");
     let c = hz("devtest-charlie", "7");
     let d = rp("devtest-delta", "rd");
-    let tw = |p: &Pod| PodPolicy { terminating: Some(Terminating { run_id: "r1".into(), trigger: Trigger::Idle, at: T }), ..policy(p, None, Some(900)) };
-    s.pods.insert(key("runpod", "ra"), tw(&a));
-    s.pods.insert(key("runpod", "rb"), tw(&b));
-    s.pods.insert(key("hetzner", "7"), tw(&c));
+    let e = rp("devtest-echo", "re");
+    let frozen = FrozenDirs { snapshot_dir: "/b/reaped/devtest-bravo/S-runpod-rb-attempt/snapshot".into(), big_dir: "/big/reaped/devtest-bravo/S-runpod-rb-attempt/big".into() };
+    // Its terminate sent (the mark is saved right before the call, after the freeze is recorded).
+    let sent = Terminating { frozen: Some(frozen.clone()), sent_at: Some(T + 30), ..Terminating::new("r1", Trigger::Idle, T) };
+    let tw = |p: &Pod, t: &Terminating| PodPolicy { terminating: Some(t.clone()), ..policy(p, None, Some(900)) };
+    s.pods.insert(key("runpod", "ra"), tw(&a, &sent));
+    s.pods.insert(key("runpod", "rb"), tw(&b, &sent));
+    s.pods.insert(key("hetzner", "7"), tw(&c, &sent));
     s.pods.insert(key("runpod", "rd"), policy(&d, None, Some(900)));
+    // W7LR-1: frozen, but its terminate never sent (the run died before; the pod went otherwise).
+    s.pods.insert(key("runpod", "re"), tw(&e, &Terminating { sent_at: None, ..sent.clone() }));
     let runpod = vec![a.clone()];
     let listing = |p: &str| -> Option<&[Pod]> {
         match p {
@@ -954,20 +1072,32 @@ fn reconcile_with_the_listing() {
     assert!(rows.contains(&(Row::Interrupted, "devtest-alpha")));
     assert!(rows.contains(&(Row::RecoveredReaped, "devtest-bravo")));
     assert!(rows.contains(&(Row::Pruned, "devtest-delta")));
-    assert_eq!(ev.len(), 3, "{rows:?}");
+    assert!(rows.contains(&(Row::GoneBeforeReap, "devtest-echo")));
+    assert_eq!(ev.len(), 4, "{rows:?}");
     assert!(s.pods[&key("runpod", "ra")].terminating.is_none());
-    assert!(s.reaped[&key("runpod", "rb")].recovered);
+    let rb = &s.reaped[&key("runpod", "rb")];
+    assert!(rb.recovered && !rb.not_reaped && rb.snapshot_dir.as_deref() == Some(frozen.snapshot_dir.as_str()), "{rb:?}");
+    let re = &s.reaped[&key("runpod", "re")];
+    assert!(re.recovered && re.not_reaped && re.big_dir.as_deref() == Some(frozen.big_dir.as_str()), "{re:?}");
     assert!(s.pods[&key("hetzner", "7")].terminating.is_some(), "Hetzner's listing failed: untouched");
     assert!(!s.pods.contains_key(&key("runpod", "rd")));
     // F3: a reaped pod still listed and billing — once noted, twice a hold.
     let mut s = ReapState::default();
-    s.reaped.insert(key("runpod", "ra"), Tombstone { at: T, name: "devtest-alpha".into(), trigger: Some(Trigger::Idle), snapshot_dir: None, big_dir: None, branch: None, recovered: false, seen_after: 0 });
+    let tomb = Tombstone { at: T, name: "devtest-alpha".into(), trigger: Some(Trigger::Idle), snapshot_dir: None, big_dir: None, branch: None, recovered: false, seen_after: 0, not_reaped: false };
+    s.reaped.insert(key("runpod", "ra"), tomb.clone());
     let still = |p: &str| -> Option<&[Pod]> { (p == "runpod").then_some(&runpod[..]) };
     reconcile(&mut s, &still, T + 900);
     assert!(s.hold.is_none());
     let ev = reconcile(&mut s, &still, T + 1800);
     assert_eq!(ev[0].row, Row::StillBilling);
     assert!(s.hold.as_ref().is_some_and(|h| h.auto && h.reason.contains("still listed and billing")));
+    // …but a pod the reaper never terminated (W7LR-1) isn't its to vouch for.
+    let mut s = ReapState::default();
+    s.reaped.insert(key("runpod", "ra"), Tombstone { not_reaped: true, ..tomb });
+    for t in [T + 900, T + 1800] {
+        assert!(reconcile(&mut s, &still, t).is_empty());
+    }
+    assert!(s.hold.is_none());
 }
 
 /// The rows' spec numbers are what the docs and logs cite.

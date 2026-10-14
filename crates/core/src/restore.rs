@@ -41,8 +41,10 @@ use crate::ssh::SshTarget;
 pub const BIG: &str = "big";
 
 /// Where the auto-reaper freezes a reaped pod's verified backup (`<root>/reaped/<name>/<UTC
-/// stamp>-<provider>-<id>/`, on each tier's root): never a snapshot label, never written into
-/// or deleted by arena; restored from by hand (rsync from that path).
+/// stamp>-<provider>-<id>-reaped/`, on each tier's root; `…-attempt` for an attempt that never
+/// sent its terminate, `…-rehearsal` for a rehearsal, no suffix for one frozen before these names —
+/// `crate::reap::FrozenKind`): never a snapshot label, never written into or deleted by arena;
+/// restored from by hand (rsync from that path).
 pub const REAPED: &str = "reaped";
 
 /// The default wall-clock budget for one restore (`--timeout` overrides): a full home over a
@@ -148,7 +150,7 @@ pub fn resolve_source(base: &Path, big_root: &Path, pod: &str, from: Option<&str
         }
         Some(REAPED) => {
             return Err(format!(
-                "a reaped pod's frozen backup is under {}/{REAPED}/{pod}/<stamp>-<provider>-<id>/ — restore from it by hand \
+                "a reaped pod's frozen backup is under {}/{REAPED}/{pod}/<stamp>-<provider>-<id>-reaped/ — restore from it by hand \
                  (see `arena pods reap status`)",
                 base.display()
             ))

@@ -15889,13 +15889,40 @@ mod tests {
         let (_, blockers) = reap::readiness_rows_for(&on, RSYNC, true);
         let crossed = section.iter().filter(|l| l.trim_start().starts_with("✗ ")).count();
         assert!(!blockers.is_empty(), "this config has gaps (no explicit ARENA_STATE_DIR, a relative backup dir…)");
-        assert_eq!(crossed, blockers.len(), "{section:#?} {blockers:?}");
-        assert!(blockers.iter().all(|b| missing.contains(b)), "{blockers:?} {missing:?}");
+        // Every ✗ row is a gap, each gap named once (both tier roots relative: two rows, one fix).
+        assert!(crossed >= blockers.len(), "{section:#?} {blockers:?}");
+        assert!(blockers.iter().all(|b| missing.iter().filter(|m| *m == b).count() == 1), "{blockers:?} {missing:?}");
         // Observing only: the same rows, no ✗, nothing missing for them.
         let observe = Config::parse(base);
         let (lines, gaps) = reap::readiness_rows_for(&observe, RSYNC, true);
         assert!(!gaps.is_empty() && !lines.iter().any(|l| l.contains('✗')), "{lines:#?}");
         assert!(lines.iter().any(|l| l.trim_start().starts_with("⚠ ")), "{lines:#?}");
+    }
+
+    /// Live W7 step 0: with both tier markers missing, `config check` failed with "missing or
+    /// invalid keys: the backup tier markers, the backup tier markers" — one fix, named twice (so
+    /// two relative tier roots). Each thing to set up is named once, and the off row counts it once.
+    #[test]
+    fn config_check_names_each_reaper_gap_once() {
+        use super::{config_report, reap, Config, RSYNC};
+        let dir = std::env::temp_dir().join(format!("arena-cc-markers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("snap/big")).unwrap();
+        let base = format!(
+            "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple)\nRUNPOD_API_KEY=not-a-real-key\nGPU_TYPE=\"NVIDIA RTX A4000\"\n\
+             IMAGE=img:1\nARENA_STATE_DIR={d}/state\nARENA_START_DATE=2026-10-05\nRUNPOD_API=v2\n",
+            d = dir.display()
+        );
+        // Both roots absolute, neither marked; then both relative.
+        for (extra, gap) in [(format!("LOCAL_BACKUP_DIR={}/snap\n", dir.display()), "the backup tier markers"), (String::new(), "absolute LOCAL_BACKUP_DIR")] {
+            let (_, missing) = config_report(&Config::parse(&format!("{base}{extra}REAP_ENABLED=1\n")), "runpod");
+            assert_eq!(missing.iter().filter(|m| *m == gap).count(), 1, "{missing:?}");
+            let (lines, blockers) = reap::readiness_rows_for(&Config::parse(&format!("{base}{extra}")), RSYNC, false);
+            assert_eq!(blockers.iter().filter(|b| *b == gap).count(), 1, "{blockers:?}");
+            let n = blockers.len();
+            assert!(lines.iter().any(|l| l.contains(&format!(" — {n} thing(s) to set up"))), "{n}: {lines:#?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Finding #10: `config check` says whether creates ask for a CUDA floor or an exact set,
@@ -16412,6 +16439,49 @@ mod tests {
             } else {
                 assert_eq!(after, before);
             }
+        }
+    }
+
+    /// Live W7 step 0: the reap line ran at :07/:22/:37/:52 — the archive snap push's very
+    /// minutes, both at the backup roots at once. The reap line runs on minutes no other arena line
+    /// uses — every one `cron install` renders: the */15 backup, the archive's snap and big pushes,
+    /// the */5 proxy re-sync and the */2 dashboard snapshot (W7LR note a). Read from the rendered
+    /// lines, as cron reads them.
+    #[test]
+    fn the_reap_line_runs_on_minutes_no_other_line_uses() {
+        use super::{cron_lines, CronJob, CronKind::*};
+        // The minutes a crontab line's first field names (`*/n`, `a,b,…`, `n`).
+        let minutes = |line: &str| -> std::collections::BTreeSet<u32> {
+            let field = line.split_whitespace().next().unwrap();
+            field
+                .split(',')
+                .flat_map(|part| match part.strip_prefix("*/") {
+                    Some(step) => (0..60).step_by(step.parse().unwrap()).collect::<Vec<u32>>(),
+                    None => vec![part.parse().unwrap()],
+                })
+                .collect()
+        };
+        let job = CronJob {
+            schedule: super::BACKUP_CRON_SCHEDULE,
+            env_prefix: "",
+            exe: "/opt/arena",
+            config: "/srv/config.env",
+            home: "/home/u",
+            backup: true,
+            pull: true,
+            proxy: true,
+            snapshot_dir: Some("/srv/www"),
+            archive: true,
+            archive_state_dir: None,
+        };
+        let lines = cron_lines(&job);
+        let kinds: Vec<super::CronKind> = lines.iter().map(|(k, _)| *k).collect();
+        assert_eq!(kinds, [Backup, Proxy, Snapshot, ArchiveSnap, ArchiveBig], "every other line arena renders");
+        let reap = minutes(&arena_core::reap::render::cron_line(true, "/opt/arena", "/srv/config.env", "/home/u", &[]));
+        assert_eq!(reap.len(), 4, "four times an hour: {reap:?}");
+        for (k, l) in &lines {
+            let other = minutes(l);
+            assert!(reap.is_disjoint(&other), "the reap line shares minutes with the {} line: {reap:?} vs {other:?}", k.label());
         }
     }
 

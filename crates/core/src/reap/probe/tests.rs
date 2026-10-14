@@ -695,6 +695,64 @@ fn review2_r2_2_data_behind_a_link_out_of_the_home_is_neither_copied_nor_seen() 
     assert_eq!(f.links, Files::Hit, "{stdout}");
 }
 
+/// Live W7 B-H0: a fresh Hetzner VM never read as idle — arena's own setup (`uv`) had left five
+/// 0-byte `/tmp/uv-setuptools-<hash>.lock` files (mode 666): "data written outside the home since
+/// the VM was created", for as long as the VM lived (on a VM the anchor is the creation, which
+/// outlives reboots). An empty regular file holds no data to lose: passed over — but a file with
+/// a single byte in it still vetoes, wherever it sits (a directory with data in it too); a
+/// symlink or a directory alone was never one (regular files only). The real script, `/tmp`
+/// stood in for by `ARENA_PROBE_TEST_ROOTS`.
+#[cfg(target_os = "linux")]
+#[test]
+fn w7_b_h0_empty_files_outside_the_home_hold_nothing_to_lose() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = std::env::temp_dir().join(format!("arena-reap-probe-empty-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let (bin, home, tmp) = (root.join("bin"), root.join("home"), root.join("tmp"));
+    for d in [&bin, &home, &tmp] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    review2_stub(&bin, "nvidia-smi", "case \"$1\" in --query-gpu*) echo '0, 3';; *) ;; esac");
+    let created = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let roots = || -> Files {
+        let out = std::process::Command::new("env")
+            .arg("-i")
+            .arg(format!("PATH={}:/usr/sbin:/usr/bin:/sbin:/bin", bin.display()))
+            .arg(format!("HOME={}", home.display()))
+            .arg("ARENA_PROBE_TEST_WINDOW=1")
+            .arg("ARENA_PROBE_TEST_GPU_TIMEOUT=1")
+            .arg(format!("ARENA_PROBE_TEST_ROOTS={}", tmp.display()))
+            .args(["sh", "-c", PROBE_SCRIPT, "arena-idle-probe", "T3ST", "-900", "", "hetzner", "203.0.113.9 50000 10.0.0.2 22"])
+            .arg(created.to_string())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        parse_probe(&stdout, "T3ST", Since::Back(900)).unwrap_or_else(|e| panic!("{e:?}\n{stdout}")).roots
+    };
+    // What the setup's uv leaves, as it leaves it; an empty dir; a link.
+    for h in ["0f3a9c", "1b2c7d", "2d4e8e", "3f5a1f", "4b6c2a"] {
+        let lock = tmp.join(format!("uv-setuptools-{h}.lock"));
+        std::fs::write(&lock, "").unwrap();
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o666)).unwrap();
+    }
+    std::fs::create_dir_all(tmp.join("run/empty")).unwrap();
+    std::fs::write(tmp.join("run/empty/DONE"), "").unwrap();
+    std::os::unix::fs::symlink("/etc/hostname", tmp.join("a-link")).unwrap();
+    let only_empty = roots();
+    // One byte is data.
+    std::fs::write(tmp.join("uv-setuptools-5c7d3b.lock"), "x").unwrap();
+    let one_byte = roots();
+    std::fs::remove_file(tmp.join("uv-setuptools-5c7d3b.lock")).unwrap();
+    // A directory with data in it.
+    std::fs::write(tmp.join("run/empty/ckpt.pt"), "the run's only copy").unwrap();
+    let in_dir = roots();
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(only_empty, Files::NoneChanged, "empty files (uv's locks), an empty file in a dir, a link: nothing to lose");
+    assert_eq!(one_byte, Files::Hit, "a file with a byte in it is data");
+    assert_eq!(in_dir, Files::Hit, "a file with data in a directory is data");
+}
+
 /// The real script's R2-1/R2-2/RS7 parts, in a hermetic stand-in (`ARENA_PROBE_TEST_ROOTS` for
 /// the places outside the home, `ARENA_PROBE_TEST_SYSROOT` for the crontabs and timers):
 /// - links out of the home: to a data dir → hit; to the system or dangling → none;

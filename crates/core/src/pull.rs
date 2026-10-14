@@ -337,51 +337,70 @@ impl PullConfig {
 
     /// The auto-reaper's final copy (`crate::reap`, RS2): the big tier, but keeping EVERYTHING
     /// in the home except [`REAP_NOT_KEPT`] — dot-directories included (`~/.config`,
-    /// `~/.ipython`, `~/.jupyter`, `~/.local/bin`, `~/.arena/jobs` logs, VS Code's local history …),
-    /// which the regular tiers drop. What it still doesn't keep is either reconstructable or
-    /// a secret ([`REAP_NOT_KEPT`]: documented, never a veto) or a sweep folder
-    /// ([`REAP_VETOED`]: never copied, and a pod with any file there is never reaped — the
-    /// probe's `uncovered` fact). Hugging Face: only the re-downloadable hub cache
-    /// ([`REAP_HF_NOT_KEPT`]) is left out; everything else under `~/.cache/huggingface/` (and
-    /// any `huggingface/`/`hf_cache/` folder — a `save_pretrained` there) is copied (R2-1).
-    /// Never deletes.
+    /// `~/.ipython`, `~/.jupyter`, `~/.local/bin`, `~/.arena/jobs` logs, VS Code's local history …)
+    /// and `~/.cache` but for its well-known download caches (processed `datasets`, wandb, any
+    /// cache nobody listed), which the regular tiers drop. What it still doesn't keep can be
+    /// downloaded or installed again, or is a secret ([`REAP_NOT_KEPT`]: documented, never a
+    /// veto) — or is a sweep folder ([`REAP_VETOED`]: never copied, and a pod with any file
+    /// there is never reaped — the probe's `uncovered` fact). Never deletes.
     pub fn reap_tier() -> Self {
         let mut s = Self::big_tier();
-        // First match wins: the hub cache out, then the rest of ~/.cache/huggingface in, then
-        // every other cache out.
-        s.first_excludes = REAP_HF_NOT_KEPT.iter().map(|e| e.to_string()).collect();
-        s.includes.extend(["/.cache/", "/.cache/huggingface/", "/.cache/huggingface/**"].map(String::from));
         s.excludes = REAP_NOT_KEPT.iter().chain(REAP_VETOED).map(|e| e.to_string()).collect();
         s
     }
 }
 
-/// What a reap's backup ([`PullConfig::reap_tier`]) leaves out because it is reconstructable,
-/// a cache, a secret or ours — the documented list a reap may lose, never a veto: package and
-/// build caches (`~/.cache/*` — pip, uv, torch — but `~/.cache/huggingface/` (see
-/// [`REAP_HF_NOT_KEPT`]), any other `.cache/`, `__pycache__/`, `.npm/`, `.triton/`, `.nv/`),
-/// installed packages (`site-packages/`, `venv/`, `.venv/`, `node_modules/`, `~/.local/lib/` —
-/// pip `--user` —, uv's Pythons), Hugging Face hub entries wherever the hub cache is
-/// (`models--*/`, `datasets--*/` — public, re-downloadable), the VS Code server's
-/// own binaries and extensions (setup reinstalls them; its `data/` — settings, local history —
-/// IS kept), `.ssh/` (keys: setup's, and secrets a backup volume shouldn't hold), and the
-/// image's checkout setup moved aside when the repo went onto `/workspace` (a copy from the
-/// image, as the regular tiers skip it; a pod with work on `/workspace` is never reaped).
+/// What a reap's backup ([`PullConfig::reap_tier`]) leaves out — the documented list a reap may
+/// lose, never a veto: only what can be **downloaded or installed again**, plus secrets (W7
+/// B-RS2: the earlier list left out all of `~/.cache` and more, while the commit, the checklist
+/// and the participant's notice promised otherwise — a dataset `datasets.map()` spent hours on
+/// lives in `~/.cache/huggingface/datasets`, a W&B run's files in `~/.cache/wandb`). Said in
+/// the participant notice ([`REAP_NOT_KEPT_SUMMARY`]) and the README.
+/// - Python environments and installed packages: `venv/`, `.venv/`, `site-packages/`,
+///   `~/.local/lib/` (pip `--user`), uv's managed Pythons (`~/.local/share/uv/`), conda's `envs/`
+///   and `pkgs/` under a conda root in the home (by its usual names — never a bare `envs/`, which
+///   may be somebody's code), `node_modules/` (`npm install` again), `__pycache__/` (python
+///   writes it again on import);
+/// - well-known download and build caches: `~/.cache/pip`, `~/.cache/uv`, the Hugging Face hub
+///   (`~/.cache/huggingface/hub` and `xet`; `models--*/` and `datasets--*/` wherever the hub
+///   cache was pointed — public downloads), `~/.cache/torch/hub` (torch.hub's downloads),
+///   `~/.triton` and `~/.nv` (compiled kernels), `~/.cache/matplotlib` (its font list), `~/.npm`;
+///   the VS Code server's own binaries and extensions (setup reinstalls them; its `data/` —
+///   settings, local history — IS kept);
+/// - `.ssh/` (keys: setup's, and secrets a backup volume shouldn't hold);
+/// - the image's checkout setup moved aside when the repo went onto `/workspace` (a copy from the
+///   image, as the regular tiers skip it; a pod with work on `/workspace` is never reaped).
+///
+/// Everything else in `~/.cache` is kept: an unknown folder may be somebody's only copy.
 pub const REAP_NOT_KEPT: &[&str] = &[
-    "/.cache/*",
-    ".cache/",
-    "__pycache__/",
-    ".npm/",
-    ".triton/",
-    ".nv/",
-    "site-packages/",
     "venv/",
     ".venv/",
-    "node_modules/",
+    "site-packages/",
     "/.local/lib/",
     "/.local/share/uv/",
+    "/.conda/envs/",
+    "/.conda/pkgs/",
+    "/miniconda3/envs/",
+    "/miniconda3/pkgs/",
+    "/anaconda3/envs/",
+    "/anaconda3/pkgs/",
+    "/miniforge3/envs/",
+    "/miniforge3/pkgs/",
+    "/mambaforge/envs/",
+    "/mambaforge/pkgs/",
+    "node_modules/",
+    "__pycache__/",
+    "/.cache/pip/",
+    "/.cache/uv/",
+    "/.cache/huggingface/hub/",
+    "/.cache/huggingface/xet/",
     "models--*/",
     "datasets--*/",
+    "/.cache/torch/hub/",
+    "/.triton/",
+    "/.nv/",
+    "/.cache/matplotlib/",
+    "/.npm/",
     "/.vscode-server/bin/",
     "/.vscode-server/cli/",
     "/.vscode-server/extensions/",
@@ -389,9 +408,14 @@ pub const REAP_NOT_KEPT: &[&str] = &[
     "*.arena-aside-*/",
 ];
 
-/// The Hugging Face hub cache in `~/.cache/huggingface/` — the re-downloadable part, left out of
-/// a reap's backup ahead of everything (the rest of that folder is copied).
-pub const REAP_HF_NOT_KEPT: &[&str] = &["/.cache/huggingface/hub/", "/.cache/huggingface/xet/"];
+/// [`REAP_NOT_KEPT`] in the participant's words — the notice on every pod with a reap policy says
+/// exactly this, and so does the README (a test holds both to it).
+/// Every entry is named (W7LR-2): `.ssh/` matches a folder of that name at any depth — "every .ssh
+/// folder"; `__pycache__/` is "Python bytecode"; `*.arena-aside-*/` is "arena's moved-aside copy".
+pub const REAP_NOT_KEPT_SUMMARY: &str = "not kept: only what can be downloaded or installed again — Python environments and \
+     installed packages (venvs, site-packages, ~/.local/lib, conda envs, node_modules), download and build caches (pip, uv, \
+     npm, the Hugging Face and torch hubs, compiled kernels, Python bytecode, matplotlib's), the VS Code server's binaries \
+     and extensions, and arena's moved-aside copy of the image's repo — and every .ssh folder; the rest of ~/.cache is kept";
 
 /// What a reap's backup never copies AND never loses: sweep/RLVR run folders (large; "do all
 /// run work here"). A pod with any file there at all (a placeholder aside) is `NotCovered` —
@@ -2082,19 +2106,34 @@ mod tests {
             ".cache/huggingface/datasets/my_set/data.arrow",
             "hf_cache/finetuned/model.safetensors",
             "data/huggingface/my_model/config.json",
+            // W7 B-RS2: the rest of ~/.cache is kept — an unknown folder, W&B's, the torch
+            // kernels nobody listed — and so is a `.cache` or `envs/` of the participant's own.
+            ".cache/keepme",
+            ".cache/wandb/artifacts/run-1/table.json",
+            ".cache/torch/kernels/k.bin",
+            "ARENA_materials/.cache/results.json",
+            "ARENA_materials/chapter2_rl/envs/my_env.py",
+            "miniconda3/etc/profile.d/conda.sh",
         ];
         let not_kept = [
             ".cache/pip/wheel",
+            ".cache/uv/archive-v0/x",
             "ARENA_materials/__pycache__/m.pyc",
             "venv/lib/x.py",
             ".venv/lib/x.py",
             "node_modules/x/index.js",
             ".local/lib/python3.11/site-packages/x.py",
             ".local/share/uv/python/p",
+            "miniconda3/envs/arena-env/lib/libtorch.so",
+            "miniconda3/pkgs/torch-2.9.tar.bz2",
+            ".conda/envs/mine/bin/python",
             "hf_cache/models--gpt2/blob",
             ".cache/huggingface/hub/models--gpt2/blobs/x",
             ".cache/huggingface/xet/chunk",
-            ".cache/torch/hub/x",
+            ".cache/torch/hub/checkpoints/resnet.pth",
+            ".cache/matplotlib/fontlist-v390.json",
+            ".npm/_cacache/x",
+            ".nv/ComputeCache/x",
             ".vscode-server/bin/abc/node",
             ".vscode-server/extensions/ms-python/x",
             ".ssh/id_ed25519",
@@ -2121,10 +2160,11 @@ mod tests {
         for f in not_kept {
             assert!(!dst.join(f).exists(), "documented as not kept, yet copied: {f}");
         }
-        // The documented list is the whole filter: no other exclude, no size cap.
+        // The documented list is the whole filter: no other exclude, no size cap, nothing kept
+        // but by the big tier's own includes (`.git`, `.claude`).
         let pc = PullConfig::reap_tier();
         assert!(pc.max_size.is_none() && pc.min_size.is_none());
-        assert_eq!(pc.first_excludes, REAP_HF_NOT_KEPT.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+        assert!(pc.first_excludes.is_empty() && pc.includes == PullConfig::big_tier().includes, "{pc:?}");
         assert_eq!(pc.excludes, REAP_NOT_KEPT.iter().chain(REAP_VETOED).map(|e| e.to_string()).collect::<Vec<_>>());
         let _ = std::fs::remove_dir_all(&root);
     }

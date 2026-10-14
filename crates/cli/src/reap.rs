@@ -887,12 +887,21 @@ fn handle_status(env: &ReapEnv<'_>, sel: &Select, json: bool) -> Result<()> {
     for (k, t) in &state.reaped {
         let paths = [t.snapshot_dir.as_deref(), t.big_dir.as_deref()].into_iter().flatten().collect::<Vec<_>>().join(" + ");
         (env.out)(&format!(
-            "reaped: {} ({k}) {}{}{}",
+            "{}: {} ({k}) {}{}{}",
+            if t.not_reaped { "gone, not by the reaper (or before its terminate)" } else { "reaped" },
             t.name,
             render::fmt_local(t.at, env.tz),
             if t.recovered { " (recovered)" } else { "" },
             if paths.is_empty() { String::new() } else { format!(" — backup {paths}") }
         ));
+    }
+    // What's frozen under each root's `reaped/` — kept for good — by kind, and its size (W7 B-RS8b).
+    let snap = env.cfg.get("LOCAL_BACKUP_DIR").map(str::trim).filter(|d| !d.is_empty()).unwrap_or("./backup").to_string();
+    let big = arena_core::pull::big_root(&snap, env.cfg.get("LOCAL_BACKUP_BIG_DIR"));
+    for root in [snap, big] {
+        if let Some(line) = reaped_summary(Path::new(&root)) {
+            (env.out)(&line);
+        }
     }
     Ok(())
 }
@@ -1036,7 +1045,7 @@ async fn send_notifications(ctx: &RunCtx<'_, '_>) {
                 None => s.run_notified.get(kind).copied(),
             };
             // A reap or a recovery is always said (the pod's record is gone anyway).
-            let always = matches!(kind, NotifyKind::Reaped | NotifyKind::RecoveredReaped | NotifyKind::TerminateFailed | NotifyKind::HoldSet);
+            let always = matches!(kind, NotifyKind::Reaped | NotifyKind::RecoveredReaped | NotifyKind::GoneBeforeReap | NotifyKind::TerminateFailed | NotifyKind::HoldSet);
             if always || render::may_notify(last, now) {
                 match key.as_ref().and_then(|k| s.pods.get_mut(k)) {
                     Some(p) => {
@@ -1359,7 +1368,45 @@ async fn handle_run(env: &ReapEnv<'_>, sel: &Select, asked: Mode, max: Option<u3
     for e in &events {
         ctx.log("event", Some(&e.name), Some(&e.key), e.row, &[], None, vec![]);
         match e.row {
-            Row::RecoveredReaped => ctx.queue(None, NotifyKind::RecoveredReaped, Some(&e.name), "found gone with a reap of it pending (the run that began it was interrupted) — check its backup under LOCAL_BACKUP_DIR"),
+            Row::RecoveredReaped => {
+                // Its terminate was sent (F2, W7LR-1): the copy its attempt froze — exactly the one
+                // the write-ahead recorded — takes the reap's name.
+                let frozen = state.reaped.get(&e.key).map(|t| (t.snapshot_dir.clone(), t.big_dir.clone())).unwrap_or_default();
+                let promote = |d: &Option<String>| d.as_deref().map(|d| promote_dir(d).unwrap_or_else(|why| {
+                    eprintln!("warning: {}'s frozen copy keeps its attempt name ({why})", e.name);
+                    d.to_string()
+                }));
+                let (snap, big) = (promote(&frozen.0), promote(&frozen.1));
+                let detail = if snap.is_none() && big.is_none() {
+                    "found gone with its terminate sent (the run that sent it was interrupted) — no frozen copy recorded; check \
+                     its backup under LOCAL_BACKUP_DIR"
+                        .to_string()
+                } else {
+                    let saved = store.update(|st| {
+                        if let Some(t) = st.reaped.get_mut(&e.key) {
+                            (t.snapshot_dir, t.big_dir) = (snap.clone(), big.clone());
+                        }
+                        Ok(())
+                    });
+                    if let Err(err) = saved {
+                        eprintln!("warning: couldn't record {}'s renamed copy in its tombstone: {err}", e.name);
+                    }
+                    let paths: Vec<&str> = [snap.as_deref(), big.as_deref()].into_iter().flatten().collect();
+                    format!("found gone with its terminate sent (the run that sent it was interrupted) — its last verified backup: {}", paths.join(" + "))
+                };
+                ctx.queue(None, NotifyKind::RecoveredReaped, Some(&e.name), &detail)
+            }
+            Row::GoneBeforeReap => {
+                // A reap attempt was under way, its terminate never sent: not reaped (W7LR-1).
+                let t = state.reaped.get(&e.key);
+                let paths: Vec<&str> = t.map(|t| [t.snapshot_dir.as_deref(), t.big_dir.as_deref()].into_iter().flatten().collect()).unwrap_or_default();
+                let copy = if paths.is_empty() {
+                    "its attempt hadn't frozen a copy".to_string()
+                } else {
+                    format!("the attempt's copy is kept as -attempt: {}", paths.join(" + "))
+                };
+                ctx.queue(None, NotifyKind::GoneBeforeReap, Some(&e.name), &format!("gone, not by the reaper (or before its terminate) — {copy}"))
+            }
             Row::StillBilling => {
                 ctx.queue(None, NotifyKind::StillBilling, Some(&e.name), "still listed and billing after it was terminated");
                 ctx.attention();
@@ -1737,6 +1784,22 @@ fn end_attempt(ctx: &RunCtx<'_, '_>, key: &str, retry_after: Option<u64>, obs: O
     }
 }
 
+/// Append `obs` to the pod's record, the attempt going on (the post-backup look, W7 B-H3b). One
+/// that can't be saved is said: the next look then measures from the deciding look, the backup in
+/// its counters — `cpu, net`, the safe direction.
+fn record_observation(ctx: &RunCtx<'_, '_>, key: &str, obs: &Observation) {
+    let r = ctx.store.update(|s| {
+        if let Some(p) = s.pods.get_mut(key) {
+            p.observations.push(obs.clone());
+        }
+        Ok(())
+    });
+    if let Err(e) = r {
+        eprintln!("warning: couldn't record {key}'s post-backup look: {e}");
+        ctx.attention();
+    }
+}
+
 /// Spec §4 step 12 for one candidate: fresh look → write-ahead → backup → quiet → (rehearse
 /// stops) → re-list + state re-read → ticket → terminate.
 async fn act_one(ctx: &RunCtx<'_, '_>, dest: &Dest, mut pol: PodPolicy, pod: Pod, trigger: Trigger, repo: Option<RepoSite>, clock_ok: bool) -> Act {
@@ -1836,7 +1899,9 @@ async fn act_one(ctx: &RunCtx<'_, '_>, dest: &Dest, mut pol: PodPolicy, pod: Pod
     let started = (env.clock)();
     let snapshot_dir = arena_core::pull::local_dest(&dest.snap_root, &dest.label, &name);
     let big_dir = arena_core::pull::big_dest_in(&dest.big_root, &name);
-    let ev = backup(ctx, dest, &target, &pod, &cond, repo, started, &snapshot_dir, &big_dir, proof.container(), ctx.mode == Mode::Rehearse).await;
+    // The frozen copy's working name (W7 B-RS8b): a reap's only once the terminate succeeded.
+    let kind = if ctx.mode == Mode::Rehearse { core_reap::FrozenKind::Rehearsal } else { core_reap::FrozenKind::Attempt };
+    let ev = backup(ctx, dest, &target, &pod, &cond, repo, started, &snapshot_dir, &big_dir, proof.container(), kind).await;
     let backup_proof = match BackupProof::check(&ev) {
         Ok(b) => b,
         Err(f) => {
@@ -1874,16 +1939,40 @@ async fn act_one(ctx: &RunCtx<'_, '_>, dest: &Dest, mut pol: PodPolicy, pod: Pod
             return Act::Done(f.row);
         }
     };
+    // The freeze completed: recorded on the write-ahead before anything else (W7LR-1) — only a
+    // copy recorded there may later take a reap's name. Not recorded: no terminate (F4).
+    if ctx.mode == Mode::Apply {
+        let dirs = core_reap::FrozenDirs { snapshot_dir: backup_proof.snapshot_dir.clone(), big_dir: backup_proof.big_dir.clone() };
+        if let Err(e) = store::record_frozen(&ctx.store, &key, &ctx.run_id, &dirs) {
+            end_attempt(ctx, &key, None, None);
+            return Act::Abort(Row::StateUnreadable, format!("{name}'s frozen copy couldn't be recorded ({e})"));
+        }
+    }
     // d. Quiet now: the same pod and container, and nothing changed since the DECIDING look's
     // scan started (RS4 — so the stretch between that look and the backup is covered too).
     let nonce = (env.nonce)();
     let (facts, jobs) = probe_pod(env.remote.as_ref(), &target, &nonce, Since::At(proof.scan_from()), &ctx.repo, &pod).await;
     let quiet_at = (env.clock)();
     let qctx = QuietCtx { provider: &pod.provider, id: &pod.id, container: proof.container(), now: quiet_at, baseline: pol.proc_baseline.as_ref() };
+    // W7 B-H3b: the post-backup look is an observation too — the next look's baseline, so our own
+    // backup never reads as `cpu, net` there; what it sees counts like any look's.
+    // (Into the state only: the re-check below judges the trigger on the looks up to the deciding
+    // one, as before.)
+    let cctx = ClassifyCtx { provider: &pod.provider, listed_id: &pod.id, now: quiet_at, clock_ok, baseline: pol.proc_baseline.as_ref() };
+    let post = judge::classify_post_backup(pol.observations.last(), &facts, jobs, &cctx);
+    // Both must hold: quiet now, and a look that is Idle as an observation (its drift against
+    // the deciding look's clock checked too) — when in doubt, nothing.
     let quiet = match quiet_now(&facts, jobs, &qctx) {
-        Ok(q) => q,
-        Err(reasons) => {
-            end_attempt(ctx, &key, None, None);
+        Ok(q) if post.verdict == Verdict::Idle => {
+            record_observation(ctx, &key, &post);
+            q
+        }
+        quiet => {
+            let reasons = match quiet {
+                Err(r) => r,
+                Ok(_) => post.reasons.clone(),
+            };
+            end_attempt(ctx, &key, None, Some(post));
             ctx.log("act", Some(&name), Some(&key), Row::PostBackupNotQuiet, &reasons, Some(trigger), vec![]);
             return Act::Done(Row::PostBackupNotQuiet);
         }
@@ -1955,15 +2044,32 @@ async fn act_one(ctx: &RunCtx<'_, '_>, dest: &Dest, mut pol: PodPolicy, pod: Pod
             return Act::Done(row);
         }
     };
-    let outcome = tokio::time::timeout(Duration::from_secs(120), ticket.terminate(env.provider)).await;
+    // "Terminate sent", saved right before the call (W7LR-1): a run that later finds the pod gone
+    // can tell it from an attempt cut off before its terminate. Not saved: not sent.
+    let sent = match store::mark_sent(&ctx.store, &key, &ctx.run_id, (env.clock)()) {
+        Ok(m) => m,
+        Err(e) => {
+            end_attempt(ctx, &key, None, None);
+            return Act::Abort(Row::StateUnreadable, format!("the terminate of {name} couldn't be marked sent ({e}) — not sent"));
+        }
+    };
+    let outcome = tokio::time::timeout(Duration::from_secs(120), ticket.terminate(sent, env.provider)).await;
+    // The terminate succeeded: only now is the frozen copy a reap's (W7 B-RS8b) — renamed under
+    // the pod's lock still.
+    let (snap_final, big_final) = match &outcome {
+        Ok(Ok(())) => (promote_tier(ctx, &backup_proof.snapshot_dir), promote_tier(ctx, &backup_proof.big_dir)),
+        _ => (backup_proof.snapshot_dir.clone(), backup_proof.big_dir.clone()),
+    };
     drop(lock);
     let now = (env.clock)();
-    let paths = vec![backup_proof.snapshot_dir.clone(), backup_proof.big_dir.clone()];
+    let paths = vec![snap_final.clone(), big_final.clone()];
     match outcome {
         Ok(Ok(())) => {
             let saved = ctx.store.update(|s| {
                 s.pods.remove(&key);
-                s.reaped.insert(key.clone(), tombstone(&name, trigger, &backup_proof, now, false));
+                let mut t = tombstone(&name, trigger, &backup_proof, now, true);
+                (t.snapshot_dir, t.big_dir) = (Some(snap_final.clone()), Some(big_final.clone()));
+                s.reaped.insert(key.clone(), t);
                 Ok(())
             });
             if let Err(e) = saved {
@@ -2010,7 +2116,9 @@ async fn act_one(ctx: &RunCtx<'_, '_>, dest: &Dest, mut pol: PodPolicy, pod: Pod
     }
 }
 
-fn tombstone(name: &str, trigger: Trigger, b: &BackupProof, at: u64, recovered: bool) -> Tombstone {
+/// A pod gone after a backup of this run: `reaped` = by this run's terminate; else it went
+/// before it (R37, `not_reaped` — its copy keeps its `-attempt` name).
+fn tombstone(name: &str, trigger: Trigger, b: &BackupProof, at: u64, reaped: bool) -> Tombstone {
     Tombstone {
         at,
         name: name.to_string(),
@@ -2018,8 +2126,9 @@ fn tombstone(name: &str, trigger: Trigger, b: &BackupProof, at: u64, recovered: 
         snapshot_dir: Some(b.snapshot_dir.clone()),
         big_dir: Some(b.big_dir.clone()),
         branch: b.branch.clone(),
-        recovered,
+        recovered: false,
         seen_after: 0,
+        not_reaped: !reaped,
     }
 }
 
@@ -2051,7 +2160,7 @@ async fn backup(
     snapshot_dir: &str,
     big_dir: &str,
     container: &str,
-    rehearsal: bool,
+    kind: core_reap::FrozenKind,
 ) -> BackupEvidence {
     use arena_core::pull::{self, PullConfig};
     let env = ctx.env;
@@ -2123,26 +2232,27 @@ async fn backup(
     }
     ev.finished = (env.clock)();
     if judge::verify_verdict(&ev.verify).is_ok() {
-        ev.frozen = Some(freeze(dest, pod, (env.clock)(), snapshot_dir, big_dir, rehearsal));
+        ev.frozen = Some(freeze(dest, pod, (env.clock)(), snapshot_dir, big_dir, kind));
     }
     ev
 }
 
 /// RS1: the verified backup, frozen — hard-link copies (`cp -al`: same filesystem, no space) of
-/// both tiers' dirs into `<root>/reaped/<name>/<UTC stamp>-<provider>-<id>[-rehearsal]/`
-/// (`snapshot/`, `big/`), counted against the originals. Under this pod's lock, so nothing
-/// writes the originals meanwhile. The live per-name dirs are a later same-named pod's to pull
-/// into; rsync writes a changed file as a new inode, so the frozen links keep what was
-/// verified. Nothing in arena writes into or deletes from `reaped/` — but a freeze that fails
-/// removes the `<stamp>-<provider>-<id>` leaves it made itself, exactly those (R2-3).
-fn freeze(dest: &Dest, pod: &Pod, now: u64, snapshot_dir: &str, big_dir: &str, rehearsal: bool) -> Frozen {
+/// both tiers' dirs into `<root>/reaped/<name>/<UTC stamp>-<provider>-<id>-attempt/` (or
+/// `-rehearsal`; `snapshot/`, `big/`), counted against the originals. Under this pod's lock, so
+/// nothing writes the originals meanwhile. The live per-name dirs are a later same-named pod's to
+/// pull into; rsync writes a changed file as a new inode, so the frozen links keep what was
+/// verified. An attempt's copy keeps its `-attempt` name unless and until its terminate succeeds
+/// ([`promote_dir`]): one that stopped before — a re-listing, a pin, `REAP_ENABLED=0` — must
+/// never look like a reap's (W7 B-RS8b). Nothing in arena writes into or deletes from `reaped/` —
+/// but a freeze that fails removes the leaves it made itself, exactly those (R2-3).
+fn freeze(dest: &Dest, pod: &Pod, now: u64, snapshot_dir: &str, big_dir: &str, kind: core_reap::FrozenKind) -> Frozen {
     use arena_core::pull::{link_tree, tree_count};
-    let leaf = format!(
-        "{}-{}-{}{}",
-        arena_core::restore::stamp(now),
-        arena_core::snapshot::path_component(&pod.provider),
-        arena_core::snapshot::path_component(&pod.id),
-        if rehearsal { "-rehearsal" } else { "" }
+    let leaf = core_reap::frozen_leaf(
+        &arena_core::restore::stamp(now),
+        &arena_core::snapshot::path_component(&pod.provider),
+        &arena_core::snapshot::path_component(&pod.id),
+        kind,
     );
     let leaf_in = |root: &str| -> PathBuf {
         Path::new(root).join(arena_core::restore::REAPED).join(arena_core::snapshot::path_component(&pod.name)).join(&leaf)
@@ -2180,6 +2290,88 @@ fn freeze(dest: &Dest, pod: &Pod, now: u64, snapshot_dir: &str, big_dir: &str, r
     }
     Frozen { snapshot_dir: snap_to.display().to_string(), big_dir: big_to.display().to_string(), matched }
 }
+
+/// W7 B-RS8b: a frozen tier dir of an attempt (`<root>/reaped/<name>/<…>-attempt/<tier>`) takes
+/// the reap's name — its leaf `…-reaped` — once its terminate succeeded (or, F2, was sent and
+/// the pod is gone). A rename within `reaped/<name>/` (atomic, nothing copied; nothing else in
+/// arena writes there), never onto a leaf already there. `Err` (said by the caller) leaves it
+/// where it is, still named an attempt. Returns the tier dir's path now.
+fn promote_dir(tier_dir: &str) -> std::result::Result<String, String> {
+    let p = Path::new(tier_dir);
+    let (Some(leaf), Some(tier)) = (p.parent(), p.file_name()) else { return Err(format!("{tier_dir} isn't a frozen tier dir")) };
+    let name = leaf.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let Some(reaped) = core_reap::reaped_leaf_of(name) else { return Err(format!("{} isn't an attempt's copy", leaf.display())) };
+    let to = leaf.with_file_name(reaped);
+    if to.symlink_metadata().is_ok() {
+        return Err(format!("{} is there already", to.display()));
+    }
+    std::fs::rename(leaf, &to).map_err(|e| format!("renaming {} to {}: {e}", leaf.display(), to.display()))?;
+    Ok(to.join(tier).display().to_string())
+}
+
+/// [`promote_dir`] after a terminate this run sent and saw succeed: the path now — the old one,
+/// with a warning (and attention), when the rename didn't happen.
+fn promote_tier(ctx: &RunCtx<'_, '_>, tier_dir: &str) -> String {
+    promote_dir(tier_dir).unwrap_or_else(|e| {
+        eprintln!("warning: the reaped pod's frozen copy keeps its attempt name ({e})");
+        ctx.attention();
+        tier_dir.to_string()
+    })
+}
+
+/// One backup root's `reaped/` for `reap status`: how many frozen copies of each kind, and the
+/// disk they hold — what nothing in arena ever deletes (W7 B-RS8b). The size is a walk counting
+/// each file once (hard links the live tiers share included), bounded: past
+/// [`REAPED_WALK_CAP`] entries it says so instead. `None` when there is no `reaped/`.
+fn reaped_summary(root: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let base = root.join(arena_core::restore::REAPED);
+    let names = std::fs::read_dir(&base).ok()?;
+    let (mut reaped, mut attempts, mut rehearsals, mut older) = (0u32, 0u32, 0u32, 0u32);
+    let mut stack = Vec::new();
+    for n in names.flatten().filter(|e| e.file_type().is_ok_and(|t| t.is_dir())) {
+        for l in std::fs::read_dir(n.path()).into_iter().flatten().flatten().filter(|e| e.file_type().is_ok_and(|t| t.is_dir())) {
+            match core_reap::frozen_kind(&l.file_name().to_string_lossy()) {
+                core_reap::FrozenKind::Reaped => reaped += 1,
+                core_reap::FrozenKind::Attempt => attempts += 1,
+                core_reap::FrozenKind::Rehearsal => rehearsals += 1,
+                core_reap::FrozenKind::Older => older += 1,
+            }
+            stack.push(l.path());
+        }
+    }
+    let (mut seen, mut bytes, mut entries) = (std::collections::HashSet::new(), 0u64, 0usize);
+    let mut capped = false;
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            entries += 1;
+            if entries > REAPED_WALK_CAP {
+                capped = true;
+                break;
+            }
+            let Ok(m) = e.metadata() else { continue };
+            if m.is_dir() {
+                stack.push(e.path());
+            } else if seen.insert((m.dev(), m.ino())) {
+                bytes += m.blocks() * 512;
+            }
+        }
+        if capped {
+            break;
+        }
+    }
+    let size = if capped { format!("over {REAPED_WALK_CAP} entries — `du -sh {}` for its size", base.display()) } else { format!("{} on disk", arena_core::pull::human_bytes(bytes)) };
+    // Frozen before the suffixes (W7LR note b): a reap's or a stopped attempt's — said so.
+    let older = if older > 0 { format!(", {older} older (state unknown: frozen before the -reaped/-attempt names)") } else { String::new() };
+    Some(format!(
+        "frozen copies {}: {reaped} reaped, {attempts} stopped attempt(s), {rehearsals} rehearsal(s){older}; {size} — kept for good \
+         (an `-attempt` copy's pod wasn't terminated after it)",
+        base.display()
+    ))
+}
+
+/// The most entries `reap status` walks under one `reaped/` for its size.
+const REAPED_WALK_CAP: usize = 200_000;
 
 /// The `ENDS` column for `pods list` (spec §3.4): `None` when the reaper has no state here (no
 /// explicit `ARENA_STATE_DIR`, or no state file) — the column isn't shown; a state that can't be
@@ -2317,9 +2509,13 @@ pub(crate) fn readiness_rows_for(cfg: &Config, rsync: &str, full: bool) -> (Vec<
             (None, _) => "·",
         };
         lines.push(format!("  {mark} {what:<28} {detail}"));
+        // Each thing to set up once, however many rows it fails (both tier roots unmarked, or
+        // relative, is one fix — the error listed it twice: live W7 step 0).
         if ok == Some(false) {
             if let Gap::Blocks(b) | Gap::Invalid(Some(b)) = gap {
-                blockers.push(b.to_string());
+                if !blockers.iter().any(|x| x == b) {
+                    blockers.push(b.to_string());
+                }
             }
         }
     };

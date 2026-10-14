@@ -133,8 +133,8 @@ fn tidy_drops_only_what_expired() {
     s.pins.push(Pin { name: "b".into(), id: None, until: Some(NOW + 1), note: None, set_at: 0 });
     s.pins.push(Pin { name: "c".into(), id: None, until: None, note: None, set_at: 0 });
     s.attempts = vec![NOW - 86_400, NOW - 86_399, NOW];
-    s.reaped.insert("runpod:x".into(), Tombstone { at: NOW - TOMBSTONE_KEEP, name: "x".into(), trigger: None, snapshot_dir: None, big_dir: None, branch: None, recovered: false, seen_after: 0 });
-    s.reaped.insert("runpod:y".into(), Tombstone { at: NOW - 10, name: "y".into(), trigger: None, snapshot_dir: None, big_dir: None, branch: None, recovered: false, seen_after: 0 });
+    s.reaped.insert("runpod:x".into(), Tombstone { at: NOW - TOMBSTONE_KEEP, name: "x".into(), trigger: None, snapshot_dir: None, big_dir: None, branch: None, recovered: false, seen_after: 0, not_reaped: false });
+    s.reaped.insert("runpod:y".into(), Tombstone { at: NOW - 10, name: "y".into(), trigger: None, snapshot_dir: None, big_dir: None, branch: None, recovered: false, seen_after: 0, not_reaped: false });
     let mut p = PodPolicy::new(&pod("devtest-a"), None, Some(3600), NOW, "set", None);
     for i in 0..1200u64 {
         p.observations.push(Observation { t: NOW - 20_000 + i * 10, clock_ok: true, container: None, pod_t: None, verdict: Verdict::Unknown, reasons: vec![], cpu_usec: None, net_bytes: None, counters_t: None, scan_from: None });
@@ -200,4 +200,64 @@ fn identity_condition_holds_only_on_the_pod() {
     // On this machine (no RUNPOD_POD_ID in PID 1's env, or unreadable): false.
     let st = std::process::Command::new("sh").args(["-c", &format!("{c} && echo yes || echo no")]).output().unwrap();
     assert_eq!(String::from_utf8_lossy(&st.stdout).trim(), "no");
+}
+
+/// Live W7 B-RS8b: an attempt stopped after its freeze (`REAP_ENABLED=0` mid-run) left a copy
+/// named exactly like a reap's. A frozen copy's name says what it is — `-reaped` only once the
+/// terminate succeeded — and a copy frozen before the suffixes existed reads as "older" (W7LR
+/// note b: a reap's or a stopped attempt's, its name can't tell), never as a reap's.
+#[test]
+fn frozen_copy_names() {
+    let s = "20261013T194004Z";
+    assert_eq!(frozen_leaf(s, "hetzner", "170164296", FrozenKind::Attempt), "20261013T194004Z-hetzner-170164296-attempt");
+    assert_eq!(frozen_leaf(s, "hetzner", "170164296", FrozenKind::Reaped), "20261013T194004Z-hetzner-170164296-reaped");
+    assert_eq!(frozen_leaf(s, "runpod", "p1", FrozenKind::Rehearsal), "20261013T194004Z-runpod-p1-rehearsal");
+    for kind in [FrozenKind::Reaped, FrozenKind::Attempt, FrozenKind::Rehearsal, FrozenKind::Older] {
+        assert_eq!(frozen_kind(&frozen_leaf(s, "runpod", "p1", kind)), kind);
+    }
+    // Live W7's copies, frozen before the suffixes: older, whatever they were.
+    assert_eq!(frozen_kind("20261013T194004Z-hetzner-170164296"), FrozenKind::Older);
+    assert_eq!(reaped_leaf_of("20261013T194004Z-runpod-p1-attempt").as_deref(), Some("20261013T194004Z-runpod-p1-reaped"));
+    assert_eq!(reaped_leaf_of("20261013T194004Z-runpod-p1"), None);
+    assert_eq!(reaped_leaf_of("20261013T194004Z-runpod-p1-rehearsal"), None);
+    assert_eq!(reaped_leaf_of("-attempt"), None);
+}
+
+/// W7LR-1: the write-ahead records how far an attempt got — its completed freeze, then "terminate
+/// sent" — each on this run's own pending record only, and the send only after the freeze: a
+/// later run calls a gone pod reaped (its copy renamed a reap's) only with both. A state written
+/// before these fields reads as nothing frozen, nothing sent.
+#[test]
+fn the_write_ahead_records_the_freeze_then_the_send() {
+    let dir = std::env::temp_dir().join(format!("arena-reap-marks-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let st = store::Store::new(dir.clone());
+    let pod = Pod { provider: "runpod".into(), id: "p1".into(), name: "devtest-alpha".into(), ..Default::default() };
+    let k = key("runpod", "p1");
+    st.update(|s| {
+        s.pods.insert(k.clone(), PodPolicy::new(&pod, None, Some(900), NOW, "set", None));
+        Ok(())
+    })
+    .unwrap();
+    let dirs = FrozenDirs { snapshot_dir: "/b/reaped/devtest-alpha/S-runpod-p1-attempt/snapshot".into(), big_dir: "/big/reaped/devtest-alpha/S-runpod-p1-attempt/big".into() };
+    // Nothing pending: nothing to record on.
+    assert!(store::record_frozen(&st, &k, "r1", &dirs).is_err());
+    assert!(store::mark_sent(&st, &k, "r1", NOW).is_err());
+    store::write_ahead(&st, &k, "r1", Trigger::Idle, NOW).unwrap();
+    // Never sent before the freeze is recorded; another run's record isn't this run's.
+    assert!(store::mark_sent(&st, &k, "r1", NOW + 5).is_err());
+    assert!(store::record_frozen(&st, &k, "r2", &dirs).is_err());
+    store::record_frozen(&st, &k, "r1", &dirs).unwrap();
+    assert!(store::mark_sent(&st, &k, "r2", NOW + 9).is_err());
+    store::mark_sent(&st, &k, "r1", NOW + 9).unwrap();
+    let t = st.load().unwrap().pods[&k].terminating.clone().unwrap();
+    assert_eq!((t.frozen, t.sent_at), (Some(dirs), Some(NOW + 9)));
+    // The fields are left out of a record that has neither (an older arena reads it).
+    let text = std::fs::read_to_string(st.state_path()).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(text.contains("\"sent_at\"") && text.contains("\"frozen\""));
+    let fresh = serde_json::to_string(&Terminating::new("r1", Trigger::Idle, NOW)).unwrap();
+    assert_eq!(fresh, format!("{{\"run_id\":\"r1\",\"trigger\":\"idle\",\"at\":{NOW}}}"));
+    let old: Terminating = serde_json::from_str(&fresh).unwrap();
+    assert_eq!((old.frozen, old.sent_at), (None, None));
 }

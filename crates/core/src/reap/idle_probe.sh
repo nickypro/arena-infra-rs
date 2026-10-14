@@ -213,8 +213,11 @@ EOF_LINKS
 fi
 o links "$links"
 # (b) Data written since the pod was created (A) in the places a participant can write outside
-# the home on its filesystem — regular files only (no sockets or fifos), junk passed over. A
-# scan that runs out of time, or no anchor, can't tell.
+# the home on its filesystem — regular files only (no sockets or fifos), junk passed over, and
+# empty ones too: a 0-byte file holds no data to lose (uv leaves a lock per setuptools build,
+# `/tmp/uv-setuptools-<hash>.lock`, mode 666, for good — on a VM, where the anchor is the
+# creation, they vetoed forever; live W7 B-H0). A scan that runs out of time, or no anchor,
+# can't tell.
 ROOTS=${ARENA_PROBE_TEST_ROOTS-/data /scratch /srv /mnt /media /opt /var/tmp /tmp /home/*}
 roots=none
 if [ -z "$A" ]; then
@@ -234,7 +237,7 @@ else
             -o -path '/tmp/snap-private-tmp*' -o -path '/tmp/.X11-unix' -o -path '/tmp/.ICE-unix' -o -path '/tmp/.font-unix' \
             -o -path '/tmp/.XIM-unix' -o -path '/tmp/.Test-unix' -o -path '/tmp/tmux-*' -o -path '/tmp/vscode-*' -o -path '/tmp/.vscode-*' \
             -o -path '/tmp/torchinductor_*' -o -path '/tmp/hsperfdata_*' -o -path '/tmp/.arena-*' -o -path '/tmp/arena_deep.*' \
-            -o -path /tmp/cx -o -path '/tmp/pip-*' \) -prune -o -type f -newerct "@$A" -print -quit 2>/dev/null)
+            -o -path /tmp/cx -o -path '/tmp/pip-*' \) -prune -o -type f ! -empty -newerct "@$A" -print -quit 2>/dev/null)
         rc=$?
         if [ -n "$e" ]; then roots=hit; break; fi
         if [ "$rc" = 124 ]; then roots=timeout; break; fi

@@ -15,8 +15,8 @@
 //! files back, so a second operator — or this one after a laptop crash — sees the same state.
 //!
 //! **Detaching**: `setsid -f nohup sh run >log 2>&1 </dev/null`. `setsid` gives the wrapper
-//! its own session and process group (no controlling terminal; the group is what `--kill`
-//! signals), `-f` forks it off so the start script carries on at once, `nohup` makes it
+//! its own session and process group (no controlling terminal; the session — every process
+//! group in it — is what `--kill` signals), `-f` forks it off so the start script carries on at once, `nohup` makes it
 //! immune to a hangup, and redirecting all three standard streams is what lets the SSH call
 //! return at once — sshd keeps the session open while anything still holds its pipes. Not
 //! `setsid … &`: a non-interactive shell starts an `&` list with SIGINT and SIGQUIT
@@ -329,9 +329,15 @@ echo
 echo ARENA_JOBS_END
 "#;
 
-/// SIGTERM to a running job's process group — only once `judge` has confirmed the pid is
-/// still this job's wrapper, and only if that pid leads its own group (`setsid` made it
-/// so; anything else means it isn't ours to signal). A job that wasn't signalled is judged
+/// SIGTERM to a running job — its whole session — only once `judge` has confirmed the pid is
+/// still this job's wrapper, and only if that pid leads its own group and session (`setsid`
+/// made it so; anything else means it isn't ours to signal). The wrapper's own process group
+/// first, then every other group of its session: a command that puts itself in a group of its
+/// own (`timeout` does, and so does any job-control shell) is out of the wrapper's group and
+/// lived on through a group-only kill (live W7 B-H2: `timeout 600 sh -c 'while :; …'` kept
+/// burning CPU after "SIGTERM sent"). A process group never spans sessions, so nothing outside
+/// the job is signalled; the session is read from `/proc/<pid>/stat` (field 6) by the shell
+/// itself — no `pkill`, which a pod image may not have. A job that wasn't signalled is judged
 /// again before that's called a failure: one that ended in between (its `/proc` entry gone,
 /// so no group to read, or nothing left to signal) was simply not running any more. The
 /// status line printed is the last judgement.
@@ -340,14 +346,25 @@ if [ ! -d "$J/$id" ]; then echo ARENA_JOB_MISSING; echo ARENA_JOBS_END; exit 0; 
 judge "$id"
 verdict=SKIPPED
 if [ "$state" = running ]; then
-  pgrp=$(sed -e 's/^.*) //' "/proc/$pid/stat" 2>/dev/null | cut -d' ' -f3)
-  if [ "$pgrp" = "$pid" ] && kill -s TERM -- "-$pid" 2>/dev/null; then
+  st=$(sed -e 's/^.*) //' "/proc/$pid/stat" 2>/dev/null)
+  pgrp=$(printf '%s\n' "$st" | cut -d' ' -f3)
+  sid=$(printf '%s\n' "$st" | cut -d' ' -f4)
+  if [ "$pgrp" = "$pid" ] && [ "$sid" = "$pid" ] && kill -s TERM -- "-$pid" 2>/dev/null; then
     verdict=SENT
+    for s in /proc/[0-9]*/stat; do
+      line=
+      { IFS= read -r line; } 2>/dev/null < "$s" || continue
+      set -f
+      # shellcheck disable=SC2086
+      set -- ${line##*) }
+      set +f
+      [ "$4" = "$pid" ] && [ "$3" != "$pid" ] && kill -s TERM -- "-$3" 2>/dev/null
+    done
   else
     judge "$id"
     if [ "$state" != running ]; then
       verdict=SKIPPED
-    elif [ "$pgrp" != "$pid" ]; then
+    elif [ "$pgrp" != "$pid" ] || [ "$sid" != "$pid" ]; then
       verdict=REFUSED
     else
       verdict=FAILED
@@ -404,7 +421,7 @@ fn read_script(job: Option<&JobId>, from: Option<u64>) -> String {
     format!("{PRELUDE}{script}")
 }
 
-/// The remote command that stops job `id` (SIGTERM to its process group); read by
+/// The remote command that stops job `id` (SIGTERM to its session's process groups); read by
 /// [`parse_kill`].
 pub fn kill_command(id: &JobId) -> String {
     sh_c(&kill_script(id))
@@ -485,11 +502,11 @@ pub enum ReadReply {
 pub enum KillReply {
     /// No such job on this pod.
     Missing,
-    /// SIGTERM went to the job's process group.
+    /// SIGTERM went to the job's process group, and to every other group of its session.
     Sent(JobInfo),
     /// Not running (already over, or not started), so nothing was signalled.
     Skipped(JobInfo),
-    /// The pid doesn't lead its own process group, so it wasn't signalled.
+    /// The pid doesn't lead its own process group and session, so it wasn't signalled.
     Refused(JobInfo),
     /// `kill` itself failed.
     Failed(JobInfo),
@@ -1493,6 +1510,62 @@ mod tests {
         assert!(stranger.try_wait().unwrap().is_none(), "the unrelated process was not signalled");
         let _ = stranger.kill();
         let _ = stranger.wait();
+    }
+
+    /// Every live process whose session is `sid`, as `(pid, process group)` — from `/proc`.
+    #[cfg(target_os = "linux")]
+    fn session_procs(sid: u32) -> Vec<(u32, u32)> {
+        std::fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .filter_map(|e| {
+                let pid: u32 = e.file_name().to_str()?.parse().ok()?;
+                let stat = std::fs::read_to_string(e.path().join("stat")).ok()?;
+                let f: Vec<&str> = stat.rsplit_once(") ")?.1.split_whitespace().collect();
+                // state ppid pgrp session …; a zombie is gone but for its parent's wait.
+                let (state, pgrp, session) = (*f.first()?, f.get(2)?.parse::<u32>().ok()?, f.get(3)?.parse::<u32>().ok()?);
+                (state != "Z" && session == sid).then_some((pid, pgrp))
+            })
+            .collect()
+    }
+
+    /// Live W7 B-H2: `pods jobs --kill` said "SIGTERM sent" and the job ran on — `timeout` puts
+    /// itself in a process group of its own, so the SIGTERM to the wrapper's group never reached
+    /// it or its `sh -c 'while :; …'`. The kill signals every group of the job's session now.
+    /// For real: the job's processes are all gone after the kill (none left in its session, the
+    /// group `timeout` made included), the job reads as ended by SIGTERM, and the reply is what
+    /// it always was.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn w7_b_h2_kill_stops_a_job_that_made_a_group_of_its_own() {
+        let Some(pod) = LocalPod::new("timeout") else { return };
+        if pod.run("command -v timeout").trim().is_empty() {
+            eprintln!("timeout missing — skipping");
+            return;
+        }
+        let k = JobId::generate(1_791_469_390, "timeout");
+        let sid = parse_started(&pod.run(&start_command(&k, "timeout 30 sh -c 'while :; do sleep 1; done'", None)), &k).unwrap();
+        // The job's session is the wrapper's pid; `timeout` makes a group of its own in it.
+        pod.wait_until("timeout's own process group", &|| session_procs(sid).iter().any(|(_, g)| *g != sid));
+        let reply = parse_kill(&pod.run(&kill_command(&k)));
+        let (lines, failed) = render_kill(&[("devtest-apple".to_string(), reply.clone())], &k);
+        assert!(matches!(reply, Ok(KillReply::Sent(_))) && failed == 0, "{reply:?}");
+        assert_eq!(lines, [format!("✓ devtest-apple: SIGTERM sent to job {k} (process group {sid})")]);
+        let left = || session_procs(sid);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !left().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let survivors = left();
+        // (A survivor would outlive the test: end it before failing.)
+        for (p, _) in &survivors {
+            let _ = std::process::Command::new("kill").args(["-KILL", &p.to_string()]).status();
+        }
+        assert!(survivors.is_empty(), "still running after the kill: {survivors:?}");
+        let kdir = pod.job_dir(&k);
+        pod.wait_until("the killed job's exit code", &|| kdir.join("exit").exists());
+        let jobs = parse_list(&pod.run(&list_command())).unwrap();
+        assert_eq!(jobs.iter().map(|j| (j.id.clone(), j.state)).collect::<Vec<_>>(), [(k, JobState::Exited(143))]);
     }
 
     /// The window between `judge`'s first look for `exit` and its liveness check, made

@@ -66,6 +66,13 @@ struct Sim {
     roots: &'static str,
     sched: &'static str,
     ttys: &'static str,
+    /// W7 B-H1b: CPU (µs) each probe itself costs the pod — the root login, the scans — landing
+    /// in the counters after it answered, as it does on a pod.
+    probe_cpu: u64,
+    /// W7 B-H3b: CPU (µs) and network (bytes) the reap's own backup costs the pod (from its git
+    /// step on), and how long it takes (s: the control clock moves on).
+    backup_load: (u64, u64),
+    backup_secs: u64,
 }
 
 /// A change to the world in the middle of a reap (between the decision and the terminate).
@@ -129,6 +136,9 @@ impl Sim {
             roots: "none",
             sched: "none",
             ttys: "0",
+            probe_cpu: 0,
+            backup_load: (0, 0),
+            backup_secs: 0,
         }
     }
 }
@@ -255,6 +265,7 @@ impl Remote2 {
                 if sim.probe_secs > 0 {
                     self.clock.fetch_add(sim.probe_secs, Ordering::SeqCst);
                 }
+                sim.cpu += sim.probe_cpu;
                 ok(r.render())
             }
             "jobs" => {
@@ -267,6 +278,9 @@ impl Remote2 {
             }
             "git" => {
                 sim.git_done = true;
+                sim.cpu += sim.backup_load.0;
+                sim.net += sim.backup_load.1;
+                self.clock.fetch_add(sim.backup_secs, Ordering::SeqCst);
                 let id = sim.id.clone();
                 let mut listing = self.listing.lock().unwrap();
                 if sim.on_git == OnGit::Twin {
@@ -729,8 +743,8 @@ async fn idle_8h_is_reaped_once_after_a_verified_backup() {
     let tomb = &s.reaped["runpod:pa"];
     // RS1: the tombstone names the FROZEN copies, never the live per-name dirs.
     let (snap, big) = (tomb.snapshot_dir.as_deref().unwrap(), tomb.big_dir.as_deref().unwrap());
-    assert!(snap.contains("/snap/reaped/devtest-alpha/") && snap.ends_with("-runpod-pa/snapshot"), "{tomb:?}");
-    assert!(big.contains("/snap/big/reaped/devtest-alpha/") && big.ends_with("-runpod-pa/big"), "{tomb:?}");
+    assert!(snap.contains("/snap/reaped/devtest-alpha/") && snap.ends_with("-runpod-pa-reaped/snapshot"), "{tomb:?}");
+    assert!(big.contains("/snap/big/reaped/devtest-alpha/") && big.ends_with("-runpod-pa-reaped/big"), "{tomb:?}");
     assert_eq!(std::fs::read_to_string(Path::new(big).join("work.txt")).unwrap(), "v1\n");
     assert!(!s.pods.contains_key("runpod:pa"));
     assert_eq!(s.attempts.len(), 1);
@@ -2500,4 +2514,346 @@ fn r2_4_reap_in_progress_fails_closed_only_where_the_reaper_is_configured() {
     if !super::super::reap_cron_installed() {
         assert_eq!(super::reap_in_progress(&off, &a, "replace"), None);
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// Live campaign W7 (reaper findings).
+// ---------------------------------------------------------------------------------------
+
+/// The leaves under `<root>/reaped/devtest-alpha/`.
+fn frozen_leaves(w: &World, root: &str) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(w.dir.join(root).join("reaped/devtest-alpha"))
+        .map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
+/// Live W7 B-H1b: every look costs the pod ~5 s of CPU of its own (the root login starting
+/// `user@0.service`, the probe), landing before the next look. A `reap run` 29 s after the
+/// cron's read that as `cpu` and reset every streak. Now it doesn't — the streak goes on — while
+/// a real burst in such a short gap still counts.
+#[tokio::test]
+async fn w7_b_h1b_a_run_right_after_another_keeps_the_streak() {
+    let w = World::new("w7-h1b", "");
+    let a = hz("devtest-alpha", "170164296", 22001);
+    let mut sim = Sim::new("170164296", "hetzner");
+    sim.probe_cpu = 5_300_000;
+    w.add(a.clone(), sim);
+    w.policy(&a, None, Some(1200));
+    for i in 0..3 {
+        if i > 0 {
+            w.tick(300);
+        }
+        w.step("observe").await;
+    }
+    // By hand, 29 s after the cron's look.
+    w.tick(29);
+    let (_, out) = w.run("observe").await;
+    let p = w.state().pods["hetzner:170164296"].clone();
+    let last = p.observations.last().unwrap();
+    assert_eq!(last.verdict, Verdict::Idle, "the reaper's own look read as use: {last:?}\n{out}");
+    assert_eq!(judge::idle_streak(&p.observations).map(|s| s.count), Some(3), "{:#?}", p.observations);
+    // A real job in the next short gap: a full core for 20 s.
+    w.tick(29);
+    w.sim(22001, |s| s.cpu += 20_000_000);
+    w.step("observe").await;
+    let p = w.state().pods["hetzner:170164296"].clone();
+    assert_eq!(p.observations.last().unwrap().reasons, [Reason::Cpu], "{:?}", p.observations.last());
+    assert_eq!(w.last_row(&a), Some(Row::Active));
+}
+
+/// Live W7 B-H3b: four minutes after a rehearsal (1.1 GB backed up) the next look read `cpu,
+/// net` — the reaper's own backup — and the streak restarted; so after any attempt stopped
+/// past its backup (here `REAP_ENABLED=0` mid-run, RS8). The post-backup look is the next
+/// look's baseline now: the streak goes on, and the next `--apply` reaps at once.
+#[tokio::test]
+async fn w7_b_h3b_a_stopped_attempt_leaves_the_streak_alone() {
+    for mode in ["rehearse", "apply"] {
+        let (w, a) = due_world(&format!("w7-h3b-{mode}"), "").await;
+        let key = core_reap::key("runpod", &a.id);
+        w.sim(22001, |s| {
+            s.backup_load = (60_000_000, 1_100_000_000);
+            s.backup_secs = 30;
+            if mode == "apply" {
+                s.on_git = OnGit::Disable;
+            }
+        });
+        let (_, out) = w.run(mode).await;
+        assert!(w.terminated().is_empty(), "{mode}: {out}");
+        let stopped = if mode == "apply" { "disabled_mid_run" } else { "rehearsed" };
+        assert!(w.store().read_log().unwrap().iter().any(|l| l.contains(&format!("\"row\":\"{stopped}\""))), "{mode}: {out}");
+        let before = w.state().pods[&key].observations.len();
+        // The post-backup look, recorded: Idle, its counters the backup's after-state.
+        let post = w.state().pods[&key].observations.last().cloned().unwrap();
+        assert_eq!(post.verdict, Verdict::Idle, "{mode}: {post:?}");
+        // Four minutes on.
+        if mode == "apply" {
+            let cfg = w.dir.join("config.env");
+            std::fs::write(&cfg, std::fs::read_to_string(&cfg).unwrap().replace("REAP_ENABLED=0", "REAP_ENABLED=1")).unwrap();
+        }
+        w.tick(240);
+        w.step("observe").await;
+        let p = w.state().pods[&key].clone();
+        assert_eq!(p.observations.len(), before + 1);
+        let next = p.observations.last().unwrap();
+        assert_eq!(next.verdict, Verdict::Idle, "{mode}: the reaper's own backup read as use: {next:?}");
+        assert!(judge::idle_streak(&p.observations).is_some_and(|s| s.count >= 6), "{mode}: {:#?}", p.observations);
+        w.sim(22001, |s| s.on_git = OnGit::Nothing);
+        w.tick(60);
+        w.step("apply").await;
+        assert_eq!(w.terminated(), [("runpod".to_string(), "pa".to_string())], "{mode}");
+    }
+}
+
+/// W7 B-H3b: the post-backup look is a real look — what it sees counts. A login meanwhile is
+/// recorded (Active: the streak restarts), and the attempt stops.
+#[tokio::test]
+async fn w7_b_h3b_what_the_post_backup_look_sees_counts() {
+    for mode in ["rehearse", "apply"] {
+        let (w, a) = due_world(&format!("w7-h3b-seen-{mode}"), "").await;
+        w.sim(22001, |s| s.session_after_git = true);
+        w.step(mode).await;
+        assert!(w.terminated().is_empty(), "{mode}");
+        let p = &w.state().pods[&core_reap::key("runpod", &a.id)];
+        let post = p.observations.last().unwrap();
+        assert_eq!((post.verdict, post.reasons.clone()), (Verdict::Active, vec![Reason::Session]), "{mode}");
+        assert!(judge::idle_streak(&p.observations).is_none(), "{mode}");
+        assert!(p.terminating.is_none(), "{mode}");
+    }
+}
+
+/// Live W7 B-RS2: the reap tier left out all of `~/.cache` (and more), while the commit, the
+/// checklist and the participant notice promised otherwise. Decision: only what can be
+/// downloaded or installed again, plus secrets — the rest of `~/.cache` is kept. Through the
+/// real rsync with the reap's own filter; and code, notice and README say the same thing.
+#[test]
+fn w7_rs2_the_reap_tier_keeps_what_nobody_can_download_again() {
+    use arena_core::pull::{PullConfig, REAP_NOT_KEPT_SUMMARY};
+    // The notice and the README carry the one wording.
+    let pol = PodPolicy::new(&rp("devtest-alpha", "pa", 22001), None, Some(8 * 3600), T0, "set", None);
+    assert!(render::notice_text("devtest-alpha", &pol, 0).contains(REAP_NOT_KEPT_SUMMARY));
+    let squash = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(squash(include_str!("../../../../README.md")).contains(&squash(REAP_NOT_KEPT_SUMMARY)), "the README says otherwise");
+    if std::process::Command::new("rsync").arg("--version").output().is_err() {
+        eprintln!("rsync not installed — skipping the copy");
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("arena-reap-w7rs2-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let (src, dst) = (root.join("src"), root.join("dst"));
+    let kept = [".cache/keepme", ".cache/huggingface/datasets/x", ".cache/wandb/run.json", "work/notes.md"];
+    let left_out = ["venv/x", ".cache/huggingface/hub/models--x/blob", ".cache/pip/http/y", ".ssh/id_ed25519"];
+    for f in kept.iter().chain(&left_out) {
+        let p = src.join(f);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, f).unwrap();
+    }
+    std::fs::create_dir_all(&dst).unwrap();
+    let t = SshTarget::for_host("root", "10.0.0.1", 22001, None);
+    let mut args = arena_core::pull::rsync_args(&t, &PullConfig::reap_tier(), &format!("{}/", dst.display()));
+    let e = args.iter().position(|a| a == "-e").unwrap();
+    args.drain(e..e + 2);
+    let n = args.len();
+    args[n - 2] = format!("{}/", src.display());
+    let out = std::process::Command::new("rsync").args(&args).output().unwrap();
+    let (got_kept, got_left): (Vec<bool>, Vec<bool>) = (kept.iter().map(|f| dst.join(f).is_file()).collect(), left_out.iter().map(|f| dst.join(f).exists()).collect());
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(got_kept, [true; 4], "kept: {kept:?}");
+    assert_eq!(got_left, [false; 4], "left out: {left_out:?}");
+}
+
+/// Live W7 B-RS8b: an attempt stopped after its freeze (`REAP_ENABLED=0` set mid-run) left
+/// `reaped/<name>/<stamp>-<provider>-<id>/` — named exactly like a real reap's copy. It is
+/// frozen as `…-attempt` and keeps that name on any stop; only a terminate that succeeded
+/// renames its copy to the reap's name — never another attempt's. `reap status` counts them.
+#[tokio::test]
+async fn w7_b_rs8b_a_stopped_attempts_copy_never_looks_like_a_reap() {
+    let (w, a) = due_world("w7-rs8b", "").await;
+    w.sim(22001, |s| s.on_git = OnGit::Disable);
+    let (_, out) = w.run("apply").await;
+    assert!(w.terminated().is_empty(), "{out}");
+    let attempt = |l: &String| l.ends_with("-runpod-pa-attempt");
+    let (snap, big) = (frozen_leaves(&w, "snap"), frozen_leaves(&w, "snap/big"));
+    assert!(snap.len() == 1 && attempt(&snap[0]) && big.len() == 1 && attempt(&big[0]), "{snap:?} {big:?}");
+    assert!(w.dir.join("snap/reaped/devtest-alpha").join(&snap[0]).join("snapshot/work.txt").is_file());
+    w.out.lock().unwrap().clear();
+    w.reap(&["status"]).await.unwrap();
+    let status = w.out.lock().unwrap().join("\n");
+    assert_eq!(status.matches("0 reaped, 1 stopped attempt(s)").count(), 2, "both roots: {status}");
+    // Later, a reap that succeeds: its own copy takes the reap's name, the stopped one stays.
+    let cfg = w.dir.join("config.env");
+    std::fs::write(&cfg, std::fs::read_to_string(&cfg).unwrap().replace("REAP_ENABLED=0", "REAP_ENABLED=1")).unwrap();
+    w.sim(22001, |s| s.on_git = OnGit::Nothing);
+    w.tick(60);
+    run_until_reaped(&w, "apply", 300, 8).await;
+    assert_eq!(w.terminated().len(), 1);
+    let (snap2, big2) = (frozen_leaves(&w, "snap"), frozen_leaves(&w, "snap/big"));
+    for (leaves, first) in [(&snap2, &snap[0]), (&big2, &big[0])] {
+        assert_eq!(leaves.len(), 2, "{leaves:?}");
+        assert!(leaves.contains(first), "the stopped attempt's copy is untouched: {leaves:?}");
+        assert!(leaves.iter().any(|l| l.ends_with("-runpod-pa-reaped")), "{leaves:?}");
+    }
+    let tomb = w.state().reaped[&core_reap::key("runpod", &a.id)].clone();
+    for d in [tomb.snapshot_dir.as_deref().unwrap(), tomb.big_dir.as_deref().unwrap()] {
+        assert!(Path::new(d).is_dir() && !d.contains("-attempt"), "{d}");
+    }
+    w.out.lock().unwrap().clear();
+    w.reap(&["status"]).await.unwrap();
+    let status = w.out.lock().unwrap().join("\n");
+    assert_eq!(status.matches("1 reaped, 1 stopped attempt(s), 0 rehearsal(s)").count(), 2, "{status}");
+}
+
+/// F2 + W7 B-RS8b + W7LR-1: a run cut off between its terminate and its record leaves the copy
+/// named an attempt. The next run finds the pod gone with its write-ahead marked "terminate sent":
+/// the copy that write-ahead recorded as frozen — that one only — takes the reap's name and the
+/// tombstone names it; an older attempt's copy, and a half-made leaf of a run killed mid-freeze
+/// (never recorded), keep their `-attempt` names. Without the "sent" mark (the run died before
+/// its terminate; the pod went otherwise): nothing is renamed, and the pod is said to be gone not
+/// by the reaper, its copy kept as `-attempt`.
+#[tokio::test]
+async fn w7_b_rs8b_a_recovered_reap_takes_its_own_copy() {
+    for sent in [true, false] {
+        let (w, a) = due_world(&format!("w7-rs8b-f2-{sent}"), "").await;
+        let at = w.now();
+        let stamp = arena_core::restore::stamp;
+        let (ours, older, half) = (
+            format!("{}-runpod-pa-attempt", stamp(at + 30)),
+            format!("{}-runpod-pa-attempt", stamp(at - 3600)),
+            format!("{}-runpod-pa-attempt", stamp(at + 3000)),
+        );
+        let leaf = |root: &str, l: &str| w.dir.join(root).join("reaped/devtest-alpha").join(l);
+        for (root, tier) in [("snap", "snapshot"), ("snap/big", "big")] {
+            for l in [&ours, &older, &half] {
+                let d = leaf(root, l).join(tier);
+                std::fs::create_dir_all(&d).unwrap();
+                std::fs::write(d.join("work.txt"), l.as_str()).unwrap();
+            }
+        }
+        let frozen = core_reap::FrozenDirs {
+            snapshot_dir: leaf("snap", &ours).join("snapshot").display().to_string(),
+            big_dir: leaf("snap/big", &ours).join("big").display().to_string(),
+        };
+        w.store()
+            .update(|s| {
+                let t = core_reap::Terminating { frozen: Some(frozen.clone()), sent_at: sent.then_some(at + 40), ..core_reap::Terminating::new("r1", Trigger::Idle, at) };
+                s.pods.get_mut("runpod:pa").unwrap().terminating = Some(t);
+                Ok(())
+            })
+            .unwrap();
+        // The pod is gone; the record of what happened to it never written.
+        for (_, r) in w.fleet.backends.lock().unwrap().iter_mut() {
+            if let Ok(p) = r {
+                p.retain(|x| x.id != a.id);
+            }
+        }
+        w.tick(300);
+        w.step("observe").await;
+        let tomb = w.state().reaped[&core_reap::key("runpod", &a.id)].clone();
+        assert!(tomb.recovered && tomb.not_reaped == !sent, "{tomb:?}");
+        let reaped = format!("{}-runpod-pa-reaped", stamp(at + 30));
+        for (root, tier, dir) in [("snap", "snapshot", &tomb.snapshot_dir), ("snap/big", "big", &tomb.big_dir)] {
+            let ours_now = if sent { &reaped } else { &ours };
+            let want = leaf(root, ours_now).join(tier);
+            assert_eq!(dir.as_deref(), Some(want.display().to_string().as_str()), "{sent} {root}");
+            assert_eq!(std::fs::read_to_string(want.join("work.txt")).unwrap(), ours);
+            let mut expect = vec![older.clone(), ours_now.clone(), half.clone()];
+            expect.sort();
+            assert_eq!(frozen_leaves(&w, root), expect, "{sent} {root}: only the recorded, sent copy is renamed");
+        }
+        let n = w.notified();
+        if sent {
+            assert!(n.iter().any(|l| l.contains("recovered_reaped devtest-alpha") && l.contains("its last verified backup") && l.contains(&reaped)), "{n:?}");
+        } else {
+            assert!(
+                n.iter().any(|l| l.contains("gone_before_reap devtest-alpha")
+                    && l.contains("gone, not by the reaper (or before its terminate) — the attempt's copy is kept as -attempt")
+                    && l.contains(&ours)),
+                "{n:?}"
+            );
+            assert!(!n.iter().any(|l| l.contains("recovered_reaped") || l.contains("its last verified backup")), "{n:?}");
+            w.out.lock().unwrap().clear();
+            w.reap(&["status"]).await.unwrap();
+            let status = w.out.lock().unwrap().join("\n");
+            assert!(status.contains("gone, not by the reaper (or before its terminate): devtest-alpha"), "{status}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Review of ca3f726 (W7 live findings).
+// ---------------------------------------------------------------------------------------
+
+/// REVIEW w7lr: F2 renames an attempt's copy to a reap's name whenever the pod is found gone
+/// with its write-ahead pending — but the write-ahead is written BEFORE the backup, so the state
+/// can't tell "cut off between the terminate and its record" (what F2 is for) from "cut off
+/// before any terminate was sent, and the pod then went some other way" (deleted by hand after a
+/// `terminate failed — check the pod by hand`, a host reclaim, the operator's `pods down` while
+/// the control box was down …). In the second case the reaper never terminated the pod: the copy
+/// is an attempt's, and the participant may have worked for hours after it was frozen. Naming it
+/// a reap's — and notifying "its last verified backup" — is exactly the overstatement B-RS8b set
+/// out to remove ("a copy is named a reap's only once the terminate succeeded"); the same path
+/// would promote a half-made leaf of a run killed mid-freeze.
+///
+/// The crash is played faithfully: a real `--apply` freezes its copy and stops at the RS8 gate
+/// (before any terminate); the write-ahead is then put back exactly as `store::write_ahead` left
+/// it, i.e. the run died there instead of running `end_attempt`. Then someone deletes the pod.
+#[tokio::test]
+async fn review_w7lr_f2_never_promotes_a_copy_whose_terminate_was_never_sent() {
+    let (w, a) = due_world("rev-w7lr-f2", "").await;
+    let key = core_reap::key("runpod", &a.id);
+    let at = w.now();
+    w.sim(22001, |s| s.on_git = OnGit::Disable);
+    let (_, out) = w.run("apply").await;
+    assert!(w.terminated().is_empty(), "{out}");
+    let attempt = |l: &String| l.ends_with("-runpod-pa-attempt");
+    let (snap, big) = (frozen_leaves(&w, "snap"), frozen_leaves(&w, "snap/big"));
+    assert!(snap.len() == 1 && attempt(&snap[0]) && big.len() == 1 && attempt(&big[0]), "{snap:?} {big:?}");
+    // The run dies at the gate instead of ending its attempt: the write-ahead stays pending.
+    store::write_ahead(&w.store(), &key, "run-that-died", Trigger::Idle, at).unwrap();
+    let cfg = w.dir.join("config.env");
+    std::fs::write(&cfg, std::fs::read_to_string(&cfg).unwrap().replace("REAP_ENABLED=0", "REAP_ENABLED=1")).unwrap();
+    // Nobody ever sent a terminate; the pod is then deleted by hand (or reclaimed by its host).
+    for (_, r) in w.fleet.backends.lock().unwrap().iter_mut() {
+        if let Ok(p) = r {
+            p.retain(|x| x.id != a.id);
+        }
+    }
+    w.tick(300);
+    w.step("observe").await;
+    assert!(w.terminated().is_empty(), "the reaper never terminated it");
+    assert!(w.state().reaped.get(&key).is_some_and(|t| t.recovered), "F2 ran");
+    for root in ["snap", "snap/big"] {
+        let leaves = frozen_leaves(&w, root);
+        assert!(
+            leaves.len() == 1 && attempt(&leaves[0]),
+            "{root}: a copy whose terminate was never sent was renamed to a reap's: {leaves:?}"
+        );
+    }
+    assert!(
+        !w.notified().iter().any(|l| l.contains("its last verified backup")),
+        "the notice vouches for an attempt's copy as the reaped pod's last backup: {:?}",
+        w.notified()
+    );
+}
+
+/// REVIEW w7lr (B-RS2 wording): the notice is meant to say exactly what a reap's backup leaves
+/// out ("one wording … in the NOTICE and README"), yet `REAP_NOT_KEPT` drops the VS Code server's
+/// `extensions/` — what the participant installed — while the summary only owns up to "the VS
+/// Code server's binaries"; and it drops `.ssh/` at ANY depth (unanchored), while the summary says
+/// `~/.ssh`. Each left-out path must be named by the participant's sentence.
+#[test]
+fn review_w7lr_the_notice_names_what_the_reap_tier_drops() {
+    use arena_core::pull::{REAP_NOT_KEPT, REAP_NOT_KEPT_SUMMARY};
+    assert!(REAP_NOT_KEPT.contains(&"/.vscode-server/extensions/"));
+    assert!(
+        REAP_NOT_KEPT_SUMMARY.contains("extensions"),
+        "the reap tier drops ~/.vscode-server/extensions/ but the notice only says binaries: {REAP_NOT_KEPT_SUMMARY}"
+    );
+    // `.ssh/` is either anchored to the home (what the notice says), or the notice says "any .ssh".
+    assert!(
+        REAP_NOT_KEPT.contains(&"/.ssh/") || !REAP_NOT_KEPT_SUMMARY.contains("~/.ssh"),
+        "the notice says ~/.ssh, the filter drops every .ssh/ at any depth: {REAP_NOT_KEPT:?}"
+    );
 }

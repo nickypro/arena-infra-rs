@@ -20,6 +20,24 @@ export DEBIAN_FRONTEND=noninteractive
 # Stop with the reason as the last line of stderr (what `arena pods setup` shows).
 die() { echo "FAILED: $*" >&2; exit 1; }
 
+# The installers' scratch — uv's above all — goes to a temp dir of this script's own, removed
+# when it ends (the EXIT trap: after a `die` too). uv leaves a 0-byte lock per setuptools build
+# in its temp dir (`uv-setuptools-<hash>.lock`, mode 666) and never removes it: left in /tmp, those
+# read as data written outside the home since the VM was created to the auto-reaper's probe
+# (`data_outside_home`) until a reboot empties /tmp — a freshly set-up VM never read as idle
+# (live W7 B-H0). A uv that ignored TMPDIR is caught too: the `/tmp/uv-*` files made since this
+# script began (empty, regular) go with it — never an older one, which isn't this run's.
+# (ARENA_SETUP_TMP_ROOT: a test's stand-in for /tmp; never set on a pod.)
+TMP_ROOT=${ARENA_SETUP_TMP_ROOT:-/tmp}
+SETUP_TMP=$(mktemp -d "$TMP_ROOT/.arena-setup.XXXXXX") || die "couldn't make a temp dir in $TMP_ROOT"
+touch "$SETUP_TMP/.started" || die "couldn't write in $SETUP_TMP"
+cleanup() {
+    find "$TMP_ROOT" -maxdepth 1 -type f -name 'uv-*' -empty -newer "$SETUP_TMP/.started" -delete 2>/dev/null
+    rm -rf "$SETUP_TMP"
+}
+trap cleanup EXIT
+export TMPDIR="$SETUP_TMP"
+
 REPO_DIR="${REPO_DIR:-/root/ARENA_materials}"
 # If the repo isn't already present (e.g. rsync'd from the control plane), clone it.
 REPO_URL="${REPO_URL:-https://github.com/ARENA-education/ARENA_materials.git}"
