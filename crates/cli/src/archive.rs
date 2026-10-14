@@ -4456,4 +4456,179 @@ mod tests {
         }
         assert!(snap_state(&w).labels["w0d1"].given_up.contains("devtest-bravo"), "{:#?}", snap_state(&w).labels["w0d1"]);
     }
+
+    // ---- Review w7la (adversarial): regression tests — each fails on 209f3d0 ----
+
+    /// A control-box file with exact text and mtime (seconds + nanoseconds), parents made.
+    fn rv_put(w: &World, rel: &str, text: &str, secs: u64, nanos: u32) {
+        let p = w.dir.join("backup").join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, text).unwrap();
+        std::fs::File::options().write(true).open(&p).unwrap().set_modified(std::time::UNIX_EPOCH + Duration::new(secs, nanos)).unwrap();
+    }
+
+    /// A hard link in the control box's backup dir (what a pull's `--link-dest` makes).
+    fn rv_link(w: &World, from: &str, to: &str) {
+        let b = w.dir.join("backup");
+        std::fs::create_dir_all(b.join(to).parent().unwrap()).unwrap();
+        std::fs::hard_link(b.join(from), b.join(to)).unwrap();
+    }
+
+    /// REVIEW w7la R1 (038a1e2, data): a pod's FIRST push of a label (Seed: `--checksum
+    /// --ignore-existing`) also counts as its final content check when it could seal
+    /// (`note_push_ok`: `by_content && could_seal`) — but `--ignore-existing` never compares what
+    /// the archive already holds. `pods_tried` reaches the state file only AFTER the push, so a
+    /// sync killed mid-push (Ctrl-C: `archive sync` has no SIGINT handler; a reboot; the OOM
+    /// killer) leaves files on the archive the state knows nothing of. The next push is a Seed
+    /// again, skips them unseen, and seals the label. Here the killed first push ran inside the
+    /// grace, the last pull past midnight then changed `notes.txt`, and the next push (after the
+    /// grace) sealed w0d1 with the old text. (`sync --label w0d1` would not repair it either: a
+    /// pod not in `pods_tried` is seeded even when forced.)
+    #[tokio::test]
+    async fn review_w7la_a_killed_first_push_never_seals_unchecked_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let w = world("rv-killed-seed");
+        seed_state_only(&w);
+        let Some(real) = real_push(&w) else {
+            eprintln!("rsync/rrsync/python3 missing — skipping");
+            return;
+        };
+        let paths = w.env().paths;
+        let state_file = paths.sync_state(Tier::Snap);
+        // The state on disk while alpha's push of w0d1 runs: exactly what a kill then leaves.
+        let at_push = w.dir.join("state-at-push");
+        let wrapper = w.dir.join("rsync-capture");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in *:snap/w0d1/devtest-alpha/*) if [ ! -e '{c}' ] && [ ! -e '{c}.absent' ]; then \
+                 if [ -e '{s}' ]; then cp '{s}' '{c}'; else : > '{c}.absent'; fi; fi ;; esac\nexec {real} \"$@\"\n",
+                c = at_push.display(),
+                s = state_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let rsync = wrapper.display().to_string();
+        let t0 = 1_791_800_000;
+        rv_put(&w, "w0d1/devtest-alpha/notes.txt", "notes v1\n", t0, 0);
+        rv_put(&w, "w0d1/devtest-alpha/sub/shared.txt", "shared\n", t0, 0);
+        // 01:30, inside w0d1's grace: its first push (a seed) — killed once its files landed.
+        archive_sync(&w.cfg, &paths, sync_opts("snap"), &rsync, &clock(day_end("w0d1") + 1800)).await.unwrap();
+        if at_push.exists() {
+            std::fs::copy(&at_push, &state_file).unwrap();
+        } else {
+            std::fs::remove_file(&state_file).unwrap();
+        }
+        // The last pull past midnight changes notes.txt (what the grace is for).
+        rv_put(&w, "w0d1/devtest-alpha/notes.txt", "notes v2, the final pull\n", t0 + 3600, 0);
+        // After the grace: the push that may seal, then one more tick.
+        for at in [day_end("w0d1") + 3 * 3600, day_end("w0d1") + 3 * 3600 + 900] {
+            archive_sync(&w.cfg, &paths, sync_opts("snap"), &rsync, &clock(at)).await.unwrap();
+        }
+        let sealed = is_sealed(&w, "w0d1", &["devtest-alpha"]);
+        let matches = archive_matches_local(&w);
+        assert!(!sealed || matches == Ok(2), "w0d1 sealed (final) while the archive differs from the control box: {matches:?}");
+        assert_eq!(matches, Ok(2), "the archive must hold the final local label");
+    }
+
+    /// REVIEW w7la R2 (bcd00ad): `archive unforget` after `forget --delete-archived` promises
+    /// "only what the control box still holds is pushed again" / "the next sync pushes them
+    /// again" — but sync-snap.json still has the pod pushed, linked and final in every label it
+    /// was in, so no sealed label is pushed again: the archive keeps none of the pod's history
+    /// though the control box holds all of it, and `status` calls those labels final.
+    #[tokio::test]
+    async fn review_w7la_unforget_after_a_delete_pushes_the_sealed_labels_again() {
+        let w = forget_world("rv-unforget-del").await;
+        let stub = rsync_stub(&w.dir);
+        let env = w.env();
+        let t = day_end("w0d1") + 3 * 3600;
+        archive_sync(&w.cfg, &env.paths, sync_opts("snap"), &stub, &clock(t)).await.unwrap();
+        assert!(is_sealed(&w, "w0d1", &["devtest-alpha", "devtest-bravo", "devtest-bravo-old"]), "{:#?}", snap_state(&w).labels);
+        w.remote.on("arena-archive-forget", out(0, "dirs=3\nbytes=4096\nforget_done=1\n", ""));
+        w.remote.on("rm -rf", out(0, "dirs=3\nbytes=4096\ndeleted=3\nforget_done=1\n", ""));
+        archive_forget(&env, "devtest-bravo", ForgetOpts { delete_archived: true, confirm: Some("devtest-bravo".into()) }, t + 100).await.unwrap();
+        archive_unforget(&env, "bravo").unwrap();
+        fresh_calls(&w.dir);
+        archive_sync(&w.cfg, &env.paths, sync_opts("snap"), &stub, &clock(t + 900)).await.unwrap();
+        let calls = rsync_calls(&w.dir);
+        for pod in ["devtest-bravo", "devtest-bravo-old"] {
+            assert!(
+                calls.iter().any(|c| c.ends_with(&format!(":snap/w0d1/{pod}/"))),
+                "its archived w0d1 was deleted and the control box still holds it — unforget said it is pushed again: {calls:#?}"
+            );
+        }
+    }
+
+    /// REVIEW w7la R3 (038a1e2, space): an update (any later push of an open label) has no link
+    /// source, so every file that reaches the control box's label AFTER the pod's first push is
+    /// sent and stored as a full copy until the label's check after its day — even one that is
+    /// byte-for-byte (and mtime-for-mtime) the previous day's file. The archive's push reads the
+    /// trees while a pull writes them (`PullConfig::temp_dir`'s doc): a sync that meets a pod's
+    /// first pull of the day still running (it holds the pod's backup lock) seeds the label from
+    /// the few files there yet, and the rest of the day's tree — normally hard-linked — lands as
+    /// full copies: up to a whole pod's tree per such overlap, over ARCHIVE_BWLIMIT, for a day.
+    #[tokio::test]
+    async fn review_w7la_files_a_pull_adds_after_the_first_push_still_share_inodes() {
+        let w = world("rv-half-pulled");
+        seed_state_only(&w);
+        let Some(rsync) = real_push(&w) else {
+            eprintln!("rsync/rrsync/python3 missing — skipping");
+            return;
+        };
+        let paths = w.env().paths;
+        let t0 = 1_791_800_000;
+        for f in ["a.txt", "data/b.bin"] {
+            rv_put(&w, &format!("w0d1/devtest-alpha/{f}"), &format!("the same every day: {f}\n"), t0, 0);
+        }
+        let t = day_end("w0d1") + 3 * 3600;
+        archive_sync(&w.cfg, &paths, sync_opts("snap"), &rsync, &clock(t)).await.unwrap();
+        assert!(is_sealed(&w, "w0d1", &["devtest-alpha"]));
+        // w0d2's first pull of alpha is running (it holds alpha's backup lock): so far only a.txt,
+        // hard-linked to w0d1's as the pull's --link-dest makes it.
+        rv_link(&w, "w0d1/devtest-alpha/a.txt", "w0d2/devtest-alpha/a.txt");
+        let backup = w.dir.join("backup").display().to_string();
+        let pull = arena_core::pull::try_pod_lock_now(&backup, "devtest-alpha").unwrap().expect("the pull's lock");
+        archive_sync(&w.cfg, &paths, sync_opts("snap"), &rsync, &clock(t + 900)).await.unwrap();
+        drop(pull);
+        // The pull is done: the rest of the tree, unchanged since w0d1.
+        rv_link(&w, "w0d1/devtest-alpha/data/b.bin", "w0d2/devtest-alpha/data/b.bin");
+        archive_sync(&w.cfg, &paths, sync_opts("snap"), &rsync, &clock(t + 1800)).await.unwrap();
+        assert_eq!(archive_matches_local(&w), Ok(4));
+        assert_eq!(
+            archived_ino(&w, "w0d1", "devtest-alpha/data/b.bin"),
+            archived_ino(&w, "w0d2", "devtest-alpha/data/b.bin"),
+            "an unchanged file stored as a second full copy while w0d2 is open"
+        );
+    }
+
+    /// REVIEW w7la R4 (8f59808, status): `pods_failing` is cleared only when the SAME label's push
+    /// of the pod goes through (`clear_snap_failing`). A pod settled partial on a label is never
+    /// pushed for it again, so after its later labels go through, `status` still says "snap pushes
+    /// failing: <pod> (<old label>: …)" for good — beside the "partial" row that already names it.
+    #[tokio::test]
+    async fn review_w7la_a_pod_settled_partial_and_pushing_again_is_not_failing() {
+        let w = world("rv-failing-stale");
+        seed(&w);
+        for f in ["w0d1/devtest-bravo/b.py", "w0d2/devtest-bravo/b.py"] {
+            file(&w, f);
+        }
+        let stub = rsync_stub(&w.dir);
+        std::fs::write(w.dir.join("fail-pod-devtest-bravo"), "rsync: send_files failed to open \"b.py\": Permission denied (13)\n").unwrap();
+        std::fs::write(w.dir.join("fail-pod-devtest-bravo.code"), "23").unwrap();
+        let now = day_end("w0d2") + 3 * 3600;
+        for run in 0..3u64 {
+            let _ = archive_sync(&w.cfg, &w.env().paths, sync_opts("snap"), &stub, &clock(now + run * 900)).await;
+        }
+        let st = snap_state(&w);
+        assert!(st.labels["w0d1"].given_up.contains("devtest-bravo") && st.labels["w0d2"].given_up.contains("devtest-bravo"), "{:#?}", st.labels);
+        // Fixed on the control box: bravo's next label goes through.
+        std::fs::remove_file(w.dir.join("fail-pod-devtest-bravo")).unwrap();
+        file(&w, "w0d3/devtest-bravo/b.py");
+        file(&w, "w0d3/devtest-alpha/a.py");
+        archive_sync(&w.cfg, &w.env().paths, sync_opts("snap"), &stub, &clock(day_end("w0d3") + 3 * 3600)).await.unwrap();
+        let st = snap_state(&w);
+        assert!(st.labels["w0d3"].pods_ok.contains("devtest-bravo"));
+        assert!(!st.pods_failing.contains_key("devtest-bravo"), "bravo's pushes go through again: {:?}", st.pods_failing);
+    }
 }
