@@ -386,7 +386,7 @@ pub(crate) async fn archive_up(env: &Env<'_>, cloud: &dyn ArchiveCloud, source: 
             .with_context(|| format!("archive up stopped at: {what} — fix the cause and re-run `arena archive up` (it picks up where it stopped)"))?;
     }
     if made.contains(&Tier::Snap) {
-        born_empty_snap_state(env)?;
+        born_empty_snap_state(env).await?;
     }
     Ok(())
 }
@@ -394,10 +394,20 @@ pub(crate) async fn archive_up(env: &Env<'_>, cloud: &dyn ArchiveCloud, source: 
 /// The snap volume this `up` just created is empty: start its sync state saying so
 /// ([`SnapState::born_empty`]) — with every push recorded before it runs, that is what lets a
 /// first push (a seed) count as the final check of a pod's label (R1). Never over a state that
-/// already describes this volume.
-fn born_empty_snap_state(env: &Env<'_>) -> Result<()> {
+/// already describes this volume, and only under the snap tier's sync lock: a sync that started
+/// meanwhile may already have recorded a push to the new volume, which an overwrite would erase
+/// (re-review RN2). If a sync holds the lock past [`LOCK_PATIENCE`], the state is left as that
+/// sync makes it — not born empty, so its first pushes wait for a check (the safe side).
+async fn born_empty_snap_state(env: &Env<'_>) -> Result<()> {
     let host = env.host_up()?;
     let path = env.paths.sync_state(Tier::Snap);
+    let Some(_lock) = lock_within(&env.paths.sync_lock(Tier::Snap), LOCK_PATIENCE).await? else {
+        println!(
+            "  an `arena archive sync` is pushing to the new snap volume: its sync state isn't marked born empty — its first \
+             pushes wait for a content check (safe; only slower)"
+        );
+        return Ok(());
+    };
     let old = state::load_snap(&path).map_err(anyhow::Error::msg)?;
     if old.volume.as_deref() == Some(host.snap_device.as_str()) {
         return Ok(());
@@ -4834,6 +4844,23 @@ mod tests {
         sync_said(&w, sync_opts("snap"), &stub, now + 3600).await.0.unwrap();
         assert!(rsync_calls(&w.dir).iter().any(|c| c.ends_with(":snap/w0d3/devtest-alpha/")), "{:#?}", rsync_calls(&w.dir));
         assert!(snap_state(&w).pull_waits.is_empty());
+    }
+
+    /// Re-review RN2: `up` marks a snap volume it created born empty only under the snap tier's
+    /// sync lock — a sync holding it (already pushing to the new volume) leaves the state unmarked:
+    /// its first pushes then wait for a check, never count unseen files as checked.
+    #[tokio::test]
+    async fn up_marks_a_new_volume_born_empty_only_under_the_sync_lock() {
+        let w = world("rr-born-lock");
+        let paths = w.env().paths;
+        paths.ensure_dir().unwrap();
+        let held = try_lock(&paths.sync_lock(Tier::Snap)).unwrap().expect("free");
+        w.up().await.unwrap();
+        assert!(!snap_state(&w).born_empty, "a sync held the lock: not marked");
+        drop(held);
+        let w2 = world("rr-born-free");
+        w2.up().await.unwrap();
+        assert!(snap_state(&w2).born_empty);
     }
 
     // ---- Re-review w7la (the R1–R4 fixes): regression tests — each fails on 41e6d19 ----
