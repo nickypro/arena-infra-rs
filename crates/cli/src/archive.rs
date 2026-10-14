@@ -750,6 +750,7 @@ pub(crate) async fn archive_status(env: &Env<'_>, cloud: Option<&dyn ArchiveClou
     // A pod whose dir is gone from the control box is never pushed again: not "failing" (W7).
     push::prune_failing(&mut big.pods_failing, |p| big_root.join(p).is_dir());
     push::prune_failing(&mut snap.pods_failing, |p| local.iter().any(|l| l.pods.iter().any(|x| x == p)));
+    push::drop_settled_failing(&mut snap);
     let (not_on_list, only_local) = push::control_box_only_in(&dir, Some(&big_root), &labels, &allowed, &names.prefix, &env.cfg.machine_names);
     let not_on_list: Vec<String> = not_on_list.into_iter().filter(|d| !forgotten.contains(d)).collect();
     let off_list = off_list_present(&dir, Some(&big_root), &labels, &allowed, &current);
@@ -1507,6 +1508,8 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
                 ));
             }
         }
+        // A pod settled partial on a label isn't "failing" for good (R4): the partial row names it.
+        push::drop_settled_failing(&mut st);
         if baseline_failed && !ok_pods.is_empty() {
             st.baseline_fails += 1;
             if push::baseline_given_up(&st) {

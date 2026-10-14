@@ -315,6 +315,18 @@ pub fn forget_pushes(st: &mut SnapState, dirs: &[String]) -> std::collections::B
     out
 }
 
+/// Drop the failure records of labels their pod is settled partial on ("sealed partial":
+/// [`LabelRecord::given_up`]): such a label is never pushed for the pod again, so its record
+/// would say "failing" for good — after the pod's later labels go through too — beside the
+/// "partial" row that already names it (review w7la R4).
+pub fn drop_settled_failing(st: &mut SnapState) {
+    let labels = &st.labels;
+    st.pods_failing.retain(|pod, why| {
+        let label = why.split_once(": ").map_or(why.as_str(), |(l, _)| l);
+        !labels.get(label).is_some_and(|r| r.given_up.contains(pod))
+    });
+}
+
 /// Failure records only for pods still `present` on the control box: a pod whose dir was
 /// deleted there is never pushed again, so it can't stay "failing" for good (W7 live: a stale
 /// "⚠ big failing" after the pod's dir was gone).
@@ -1754,6 +1766,13 @@ mod tests {
         assert!(!sealed("w0d1", &st, START, &["arena9-apple".into(), "arena9-bloom".into()]), "it reopens for the pod");
         assert!(link_labels_for("w0d3", "arena9-bloom", &st).is_empty(), "nothing links to the deleted copy");
         assert!(st.pods_failing.is_empty());
+        // R4.
+        let mut st = SnapState::default();
+        st.labels.insert("w0d1".into(), LabelRecord { given_up: set(&["arena9-bloom"]), ..Default::default() });
+        st.pods_failing.insert("arena9-bloom".into(), "w0d1: Other: x".into());
+        st.pods_failing.insert("arena9-cloud".into(), "w0d1: Other: y".into());
+        drop_settled_failing(&mut st);
+        assert_eq!(st.pods_failing.keys().collect::<Vec<_>>(), ["arena9-cloud"], "settled partial: the partial row says it");
     }
 
     /// The run's order (AD1): the newest label first, then the backlog oldest first, capped; the
