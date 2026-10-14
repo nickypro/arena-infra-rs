@@ -4766,4 +4766,66 @@ mod tests {
         assert!(st.labels["w0d3"].pods_ok.contains("devtest-bravo"));
         assert!(!st.pods_failing.contains_key("devtest-bravo"), "bravo's pushes go through again: {:?}", st.pods_failing);
     }
+
+    // ---- Re-review w7la (the R1–R4 fixes): regression tests — each fails on 41e6d19 ----
+
+    /// RE-REVIEW w7la RR1 (5399ce4, R3's fix): the pull-lock probe holds back EVERY label of a
+    /// pod whose backup lock is held — but a pull writes only today's label; a past label's tree
+    /// is final, and its backlog push, its check and its seal gain nothing from waiting. And the
+    /// lock is held far longer than the pod's own rsync: `take_pod_locks` takes every selected
+    /// pod's lock when a `pods backup`/`pull` run STARTS and lets each go only when that pod's
+    /// rsyncs end — a pod queued behind the fleet, or one whose pull is slow, is "busy" at every
+    /// :07/:22/:37/:52 tick of a backup that runs past 7 minutes. Such a pod is never pushed,
+    /// never charged, never given up, and named by no `status` row: its labels stay open and
+    /// absent from the archive for as long as its pulls run long. Here alpha's lock is held across
+    /// four runs (an hour) after w0d1 and w0d2 ended: neither is pushed.
+    #[tokio::test]
+    async fn rereview_w7la_a_running_pull_never_holds_back_a_pods_past_labels() {
+        let w = world("rr-pull-past");
+        seed(&w);
+        // Today's label, the one alpha's pull is writing.
+        file(&w, "w0d3/devtest-alpha/today.py");
+        let stub = rsync_stub(&w.dir);
+        let backup = w.dir.join("backup").display().to_string();
+        let pull = arena_core::pull::try_pod_lock_now(&backup, "devtest-alpha").unwrap().expect("the pull's lock");
+        let now = day_end("w0d2") + 3 * 3600;
+        for run in 0..4u64 {
+            let _ = archive_sync(&w.cfg, &w.env().paths, sync_opts("snap"), &stub, &clock(now + run * 900)).await;
+        }
+        drop(pull);
+        let calls = rsync_calls(&w.dir);
+        for l in ["w0d1", "w0d2"] {
+            assert!(
+                calls.iter().any(|c| c.ends_with(&format!(":snap/{l}/devtest-alpha/"))),
+                "{l} is over (the pull writes w0d3): its tree is final, yet never pushed in an hour: {calls:#?}"
+            );
+            assert!(is_sealed(&w, l, &["devtest-alpha"]), "{l}: {:#?}", snap_state(&w).labels.get(l));
+        }
+    }
+
+    /// RE-REVIEW w7la RR2 (875b277, R2's fix): `forget --delete-archived` deletes the pod's big
+    /// copy too (`big/<pod>`, "both volumes"), but `unforget`'s "LOST for good" and `status`'s
+    /// "lost" row only ever name SNAP labels (`deleted_labels`). When the control box no longer
+    /// holds the pod's big tree, its archived checkpoints are gone for good and nothing says so:
+    /// `unforget` reports only "pushed (and checked) again" for the labels.
+    #[tokio::test]
+    async fn rereview_w7la_unforget_names_a_deleted_big_copy_the_control_box_no_longer_holds() {
+        let w = forget_world("rr-unforget-big").await;
+        let stub = rsync_stub(&w.dir);
+        let env = w.env();
+        let t = day_end("w0d1") + 3 * 3600;
+        archive_sync(&w.cfg, &env.paths, sync_opts("both"), &stub, &clock(t)).await.unwrap();
+        w.remote.on("arena-archive-forget", out(0, "dirs=4\nbytes=4096\nforget_done=1\n", ""));
+        w.remote.on("rm -rf", out(0, "dirs=4\nbytes=4096\ndeleted=4\nforget_done=1\n", ""));
+        archive_forget(&env, "devtest-bravo", ForgetOpts { delete_archived: true, confirm: Some("devtest-bravo".into()) }, t + 100).await.unwrap();
+        // Since then the control box's big tree of bravo is gone (its snapshots are still there).
+        std::fs::remove_dir_all(w.dir.join("backup/big/devtest-bravo")).unwrap();
+        archive_unforget(&env, "bravo").unwrap();
+        let f = state::load_forgotten(&env.paths.forgotten()).unwrap();
+        assert!(
+            f.lost.get("devtest-bravo").is_some_and(|l| !l.is_empty()),
+            "bravo's big copy was deleted from the archive and is gone from the control box — lost for good, named nowhere: {:?}",
+            f.lost
+        );
+    }
 }
