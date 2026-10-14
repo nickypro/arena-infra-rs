@@ -112,15 +112,23 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     Shadeform Managed Key (whose private half Shadeform holds; `default` opts into it). The
     listing shows **every** instance on the account; arena only terminates, renames or
     restarts one whose name has the prefix **and** that carries `arena-<prefix>` — anything
-    else is refused with no request. A new instance that goes to `error` before it has an
-    endpoint, or isn't up within `SHADEFORM_READY_MINS` (15), is deleted and the name placed
-    on the next option (`up`, with or without `--check`). Setup is the bare-VM script in its
+    else is refused with no request; a rename must keep the `<prefix>-` name (else arena
+    couldn't touch it again). A new instance that goes to `error` before it has an endpoint,
+    or isn't up within `SHADEFORM_READY_MINS` (15) or `--timeout`, whichever comes first, is
+    deleted and the name placed on the next option (`up`, with or without `--check`). A price
+    that can't be read after create (`info` retried with backoff for ~30 s, then the listing)
+    gets the instance deleted and the next entry tried. Setup is the bare-VM script in its
     GPU mode (`ARENA_GPU=1`: the CUDA requirements kept, `uv --torch-backend auto`, and the
-    env must see the GPU). `pods stop/start` refuse it up front; restart is gated as a wipe
-    (unverified); no lock; the reaper doesn't act on it yet. Balance: the undocumented
-    `GET /account` (`balance`, `hourly_burn` only — its personal fields are never kept);
-    any failure there is "unknown". `api get shadeform sshkeys --raw` is refused (it returns
-    the managed key's private half). Spec and recorded fixtures: `specs/shadeform.md`,
+    env must see the GPU). The bootstrap leaves each cohort key as one plain line in root's
+    `authorized_keys` (a cloud-init `command="echo 'Please login as …'"` line for it is
+    dropped). `pods stop/start` skip it — said, the rest stopped/started, and `stop` exits
+    non-zero while one still bills; a selection of nothing else is refused. Restart is gated
+    as a wipe (unverified); no lock; the reaper doesn't act on it yet. Balance: the
+    undocumented `GET /account` (`balance`, `hourly_burn` only — its personal fields are never
+    kept); any failure there is "unknown". `api get shadeform sshkeys --raw` is refused however
+    the path is spelled (`v1/`, case, percent-encoding), and Shadeform output never shows a
+    private key or the account's personal fields, `--raw` included. `teardown --check` lists
+    the account's Shadeform volumes too. Spec and recorded fixtures: `specs/shadeform.md`,
     `crates/core/src/provider/fixtures/shadeform/`.
   - `naming` — next-free machine-name allocation, mirroring the legacy logic.
   - `snapshot` — one read-only picture of the fleet (`FleetSnapshot`, built by one pure
@@ -379,7 +387,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     — a host with no public IP — is a host failure: `FAILED endpoint`, or replaced under
     `--check`; so is one still up behind the proxy only when a shorter `--timeout` ends, and
     a listing that momentarily lacks the pod doesn't restart those 5 minutes; on Shadeform a
-    pod listed `error`, or not up within `SHADEFORM_READY_MINS`, is a failed placement —
+    pod listed `error`, or not up within `SHADEFORM_READY_MINS` or `--timeout` (whichever comes
+    first), is a failed placement —
     deleted at once and the name tried on the next option, with or without `--check`,
     within `--check-attempts` placements)
     → sync the proxy (one writer at a time) → provision it (`--no-setup` skips) →

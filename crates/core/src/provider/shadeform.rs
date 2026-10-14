@@ -638,7 +638,7 @@ pub fn render_bootstrap(keys: &[String], nonce: &str, name: &str) -> Result<Stri
     if !valid_id(nonce) {
         return Err(Error::Config("the Shadeform create nonce isn't a UUID".into()));
     }
-    if name.is_empty() || name.len() > 63 || !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) {
+    if !valid_name(name) {
         return Err(Error::Config(format!("machine name `{name}` can't go into the Shadeform bootstrap script (use [A-Za-z0-9._-])")));
     }
     let script = BOOTSTRAP.replace("@KEYS@", &keys.join("\n")).replace("@NONCE@", nonce).replace("@NAME@", name);
@@ -649,6 +649,12 @@ pub fn render_bootstrap(keys: &[String], nonce: &str, name: &str) -> Result<Stri
         )));
     }
     Ok(script)
+}
+
+/// Whether `name` is a machine name arena writes into a script and onto Shadeform: 1–63 of
+/// `[A-Za-z0-9._-]`. Pure.
+fn valid_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 63 && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 /// The cohort's public keys from the spec: `PUBLIC_KEY` holds them newline-joined
@@ -911,6 +917,59 @@ pub fn parse_instance(v: &Value, now: u64) -> Pod {
     }
 }
 
+/// One volume on the account (`GET /volumes`), priced from `GET /volumes/types` — for
+/// `teardown --check` (review SF7): arena never creates one (`VOLUME_GB>0` and `volume_ids` are
+/// refused), but the API key is account-wide, and a volume made in the console bills per
+/// GB-month after every instance is gone.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShadeformVolume {
+    pub id: String,
+    pub name: String,
+    pub cloud: String,
+    pub region: String,
+    /// `size_in_gb`; `None` if not given.
+    pub size_gb: Option<u32>,
+    /// The listed `price_per_gb_per_hour` for its (cloud, region); `None` if unknown.
+    pub usd_per_gb_hour: Option<f64>,
+}
+
+impl ShadeformVolume {
+    /// $/month at the listed rate (730 h), when size and rate are known.
+    pub fn usd_per_month(&self) -> Option<f64> {
+        Some(f64::from(self.size_gb?) * self.usd_per_gb_hour? * 730.0)
+    }
+}
+
+/// The volumes of a 2xx `GET /volumes` body, each priced from a `GET /volumes/types` body when
+/// there is one. No `volumes` array is schema drift and an error — never "none". Pure.
+pub fn parse_volumes(volumes: &Value, types: Option<&Value>) -> Result<Vec<ShadeformVolume>> {
+    let list = volumes.get("volumes").and_then(Value::as_array).ok_or_else(|| {
+        Error::provider(format!("shadeform volumes: unexpected response shape (no volumes array): {}", super::body_excerpt(volumes)))
+    })?;
+    let rate = |cloud: &str, region: &str| -> Option<f64> {
+        types?.get("volume_types")?.as_array()?.iter().find_map(|t| {
+            let same = t.get("cloud").and_then(Value::as_str) == Some(cloud) && t.get("region").and_then(Value::as_str) == Some(region);
+            let p = t.get("price_per_gb_per_hour")?;
+            same.then(|| p.as_str().and_then(|s| s.trim().parse::<f64>().ok()).or_else(|| p.as_f64())).flatten()
+        })
+    };
+    Ok(list
+        .iter()
+        .map(|v| {
+            let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+            let (cloud, region) = (s("cloud"), s("region"));
+            ShadeformVolume {
+                id: s("id"),
+                name: s("name"),
+                size_gb: v.get("size_in_gb").and_then(Value::as_u64).and_then(|g| u32::try_from(g).ok()),
+                usd_per_gb_hour: rate(&cloud, &region).filter(|r| r.is_finite() && *r >= 0.0),
+                cloud,
+                region,
+            }
+        })
+        .collect())
+}
+
 /// Unix seconds now.
 fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
@@ -1027,6 +1086,19 @@ struct Relist {
 
 const RELIST: Relist = Relist { tries: 3, every: Duration::from_secs(10) };
 
+/// The waits between the post-create price reads ([`ShadeformProvider::settle`]): ~30 s of
+/// backoff before the listing is tried and, failing that, the instance deleted.
+pub const PRICE_READS: [Duration; 5] =
+    [Duration::from_secs(1), Duration::from_secs(2), Duration::from_secs(4), Duration::from_secs(8), Duration::from_secs(15)];
+
+/// What settling a created instance came to ([`ShadeformProvider::settle`]).
+enum Settled {
+    /// Priced, within the cap and the quote: the pod.
+    Pod(Pod),
+    /// Its price couldn't be read: deleted (why) — the create tries the next entry/option.
+    Unpriced(String),
+}
+
 /// The Shadeform backend. `Debug` is deliberately not derived (it holds the API key).
 pub struct ShadeformProvider {
     api_key: String,
@@ -1036,11 +1108,21 @@ pub struct ShadeformProvider {
     relist: Relist,
     /// Each create's nonce ([`new_nonce`]; a fixed one in tests, so a canned listing can hold it).
     make_nonce: fn() -> String,
+    /// The waits between post-create price reads ([`PRICE_READS`]; none in tests).
+    price_reads: Vec<Duration>,
 }
 
 impl ShadeformProvider {
     pub fn new(api_key: impl Into<String>, opts: ShadeformOpts) -> Self {
-        Self { api_key: api_key.into(), client: Client::new(), base: BASE.to_string(), opts, relist: RELIST, make_nonce: new_nonce }
+        Self {
+            api_key: api_key.into(),
+            client: Client::new(),
+            base: BASE.to_string(),
+            opts,
+            relist: RELIST,
+            make_nonce: new_nonce,
+            price_reads: PRICE_READS.to_vec(),
+        }
     }
 
     /// `SHADEFORM_API_KEY` plus the validated options.
@@ -1121,6 +1203,14 @@ impl ShadeformProvider {
         fitting_entries(instance_types(&body)?, spec, &self.opts, avoid)
     }
 
+    /// Every volume on the account, priced (`GET /volumes`, then `GET /volumes/types` — a
+    /// failed price read only leaves them unpriced). Read-only.
+    pub async fn list_volumes(&self) -> Result<Vec<ShadeformVolume>> {
+        let body = self.get_json("/volumes", "shadeform volumes").await?;
+        let types = self.get_json("/volumes/types", "shadeform volume types").await.ok();
+        parse_volumes(&body, types.as_ref())
+    }
+
     /// Placement's live prices: per GPU option, the cheapest in-stock entry that fits `base`
     /// with that GPU (`Ok(None)` = none). **One** catalog read for every option (in stock,
     /// cheapest first), bounded by `limit`. Read-only; a failure is each option's `Err`.
@@ -1176,39 +1266,65 @@ impl ShadeformProvider {
         None
     }
 
-    /// The created (or adopted) instance as a pod, after the price guard: one priced above
-    /// the cap or the quote is deleted at once and the create fails, saying both prices.
-    /// Once an instance exists this never fails for any other reason (an error would send
-    /// placement to the next option — a second instance for the name): without `info`, the
-    /// pod is built from the entry and the listing fills it in.
-    async fn settle(&self, id: &str, known: Option<Value>, entry: &Entry, spec: &PodSpec) -> Result<Pod> {
-        let v = match known {
-            Some(v) => Some(v),
-            None => self.info(id).await.ok(),
+    /// The created (or adopted) instance as a pod, once its price passed the guard
+    /// ([`price_guard`]): one priced above the cap or the quote is deleted at once and the
+    /// create fails, saying both prices.
+    ///
+    /// The price must be **read** (review SF4: one failed `info` used to skip the guard and keep
+    /// the instance, shown at the quote): `info` is read again with backoff ([`PRICE_READS`],
+    /// ~30 s in all) while it fails or carries no readable price, then the listing is tried. A
+    /// price still unknown is no price to accept — the instance is deleted and
+    /// [`Settled::Unpriced`] says why, so the create moves on to the next entry/option (nothing
+    /// is left behind to duplicate). Only if that delete fails is it an error ("may still be
+    /// running"), which ends the run.
+    async fn settle(&self, id: &str, known: Option<Value>, entry: &Entry, spec: &PodSpec) -> Result<Settled> {
+        let mut v = known.filter(|v| price_of(v).is_some());
+        let mut waits = self.price_reads.iter();
+        while v.is_none() {
+            if let Ok(read) = self.info(id).await {
+                if price_of(&read).is_some() {
+                    v = Some(read);
+                    break;
+                }
+            }
+            match waits.next() {
+                Some(w) => tokio::time::sleep(*w).await,
+                None => break,
+            }
+        }
+        if v.is_none() {
+            if let Ok(list) = self.instances().await {
+                v = list.into_iter().find(|i| i.get("id").and_then(Value::as_str) == Some(id)).filter(|i| price_of(i).is_some());
+            }
+        }
+        let delete_path = format!("/instances/{id}/delete");
+        let delete = || self.post_ok(&delete_path, None, "shadeform delete");
+        let Some(v) = v else {
+            let why = format!(
+                "the price of {} ({id}) couldn't be read after its create (info and the listing failed or carried none)",
+                spec.name
+            );
+            return match delete().await {
+                Ok(()) => Ok(Settled::Unpriced(format!("{why} — deleted it rather than keep an unchecked price; trying the next"))),
+                Err(e) => Err(Error::provider(format!(
+                    "{why}, and deleting it FAILED ({e}) — it may still be running: check `arena pods list --provider shadeform` \
+                     for {} (and `arena pods terminate` it) before creating it again",
+                    spec.name
+                ))),
+            };
         };
         let cap = self.opts.cap(spec.max_price);
-        if let Some(why) = v.as_ref().and_then(price_of).and_then(|charged| price_guard(charged, entry.price(), cap)) {
-            return Err(match self.post_ok(&format!("/instances/{id}/delete"), None, "shadeform delete").await {
+        if let Some(why) = price_of(&v).and_then(|charged| price_guard(charged, entry.price(), cap)) {
+            return Err(match delete().await {
                 Ok(()) => Error::provider(format!("{why} — deleted {} ({id})", spec.name)),
                 Err(e) => Error::provider(format!(
-                    "{why} — deleting {} ({id}) FAILED ({e}): it may still be billing; terminate it (`arena pods terminate {}`)",
+                    "{why} — deleting {} ({id}) FAILED ({e}): it may still be running — check `arena pods list --provider \
+                     shadeform` and terminate it (`arena pods terminate {}`)",
                     spec.name, spec.name
                 )),
             });
         }
-        Ok(match v {
-            Some(v) => parse_instance(&v, now()),
-            None => Pod {
-                id: id.to_string(),
-                name: spec.name.clone(),
-                provider: NAME.into(),
-                status: "CREATING".into(),
-                gpu_type: runpod_gpu_id(&entry.gpu_type, None).map(String::from),
-                gpu_count: Some(entry.num_gpus),
-                cost_per_hr: Some(entry.price()),
-                ..Pod::default()
-            },
-        })
+        Ok(Settled::Pod(parse_instance(&v, now())))
     }
 
     /// Up-front refusals for a create: no request has been made when one of these fires.
@@ -1318,14 +1434,26 @@ impl Provider for ShadeformProvider {
             let nonce = (self.make_nonce)();
             let payload = create_payload(&self.opts, spec, entry, &nonce, key_id.as_deref())?;
             match self.create_once(&payload).await {
-                Ok(Created::Id(id)) => return self.settle(&id, None, entry, spec).await,
+                Ok(Created::Id(id)) => match self.settle(&id, None, entry, spec).await? {
+                    Settled::Pod(pod) => return Ok(pod),
+                    Settled::Unpriced(why) => {
+                        avoid.push((entry.cloud.clone(), entry.region.clone()));
+                        last_capacity = Some(Error::capacity(why));
+                    }
+                },
                 Ok(Created::Unsure(why)) => {
                     let found = self.find_created(&nonce).await;
                     let id = found.as_ref().and_then(|v| v.get("id")).and_then(Value::as_str).filter(|id| valid_id(id)).map(String::from);
-                    return match (found, id) {
-                        (Some(v), Some(id)) => self.settle(&id, Some(v), entry, spec).await,
-                        _ => Err(create_unsure(entry, &spec.name, &why)),
+                    let (Some(v), Some(id)) = (found, id) else {
+                        return Err(create_unsure(entry, &spec.name, &why));
                     };
+                    match self.settle(&id, Some(v), entry, spec).await? {
+                        Settled::Pod(pod) => return Ok(pod),
+                        Settled::Unpriced(why) => {
+                            avoid.push((entry.cloud.clone(), entry.region.clone()));
+                            last_capacity = Some(Error::capacity(why));
+                        }
+                    }
                 }
                 Err(e) if e.kind() == Some(ProviderErrorKind::Capacity) => {
                     avoid.push((entry.cloud.clone(), entry.region.clone()));
@@ -1383,6 +1511,18 @@ impl Provider for ShadeformProvider {
     /// `POST /instances/{id}/update {"name": …}` — of our own instance only; its tags are
     /// left as they are (omitted = unchanged).
     async fn rename_pod(&self, id: &str, new_name: &str) -> Result<()> {
+        // Review SF5: a name without `<prefix>-` would disown the instance — [`is_ours`] fails
+        // from then on, so arena could no longer terminate, restart or rename it back while it
+        // bills. Refused before any request, as create refuses it.
+        require_id(id)?;
+        let prefix = format!("{}-", self.opts.prefix);
+        if !new_name.starts_with(&prefix) || new_name.len() == prefix.len() || !valid_name(new_name) {
+            return Err(Error::Config(format!(
+                "can't rename a Shadeform instance to `{new_name}`: arena only manages `{}-…` names there \
+                 ([A-Za-z0-9._-], ≤ 63) — renamed outside the prefix, it couldn't be terminated by arena any more",
+                self.opts.prefix
+            )));
+        }
         self.ours(id, "renamed").await?;
         self.post_ok(&format!("/instances/{id}/update"), Some(&json!({ "name": new_name })), "shadeform rename").await
     }

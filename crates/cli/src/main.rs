@@ -933,7 +933,8 @@ enum PodCmd {
         /// look; one that lands on a machine that already failed is terminated even then (it
         /// was never set up, and its host is known bad). Also, with or without --check, how often
         /// a pod that never came up is replaced (Shadeform: listed `error`, or not up within
-        /// SHADEFORM_READY_MINS — always terminated: it may bill).
+        /// SHADEFORM_READY_MINS or --timeout, whichever comes first — always terminated: it
+        /// may bill).
         #[arg(long, default_value_t = 2, requires = "check", value_parser = clap::value_parser!(u32).range(1..=10))]
         check_attempts: u32,
         /// Ignore the machines earlier `up --check`s remember as bad (for 72 h — `config check`
@@ -1754,7 +1755,8 @@ fn warn_no_volume(provider: &dyn Provider, spec: &PodSpec) {
     if provider.name() == "shadeform" {
         // No volumes there (VOLUME_GB > 0 is refused at create), and no stop: say both.
         eprintln!(
-            "⚠ Shadeform: no persistent volume and no stop — work survives only through backups              (`arena pods backup`), and each VM bills until it's terminated."
+            "⚠ Shadeform: no persistent volume and no stop — work survives only through backups \
+             (`arena pods backup`), and each VM bills until it's terminated."
         );
         return;
     }
@@ -3019,7 +3021,7 @@ async fn handle_api(cmd: ApiCmd, cfg: &Config) -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("{} isn't set (see `arena config check`)", base.key))?;
             eprintln!("GET {url} ({}{})", base.provider, if raw { ", raw" } else { ", secrets redacted" });
             let (status, body) = apiget::get_for(&base, url, key).await?;
-            let out = apiget::render(status, &body, raw, key)?;
+            let out = apiget::render_for(&base, status, &body, raw, key)?;
             if !out.is_empty() {
                 println!("{out}");
             }
@@ -4853,7 +4855,8 @@ fn shadeform_rows(cfg: &Config) -> (Vec<String>, Option<arena_core::Error>) {
     let default = |k: &str| if set(k) { "" } else { " (default)" };
     let mut out = Vec::new();
     out.push(match &o.clouds {
-        Clouds::All => "  ⚠ SHADEFORM_CLOUDS             * — any cloud: ports, images, drivers and boot times differ per cloud;                         widen one cloud at a time after a live test"
+        Clouds::All => "  ⚠ SHADEFORM_CLOUDS             * — any cloud: ports, images, drivers and boot times differ per cloud; \
+                        widen one cloud at a time after a live test"
             .to_string(),
         Clouds::Only(c) => format!("  ✓ SHADEFORM_CLOUDS             {}{}", c.join(", "), default("SHADEFORM_CLOUDS")),
     });
@@ -4868,7 +4871,8 @@ fn shadeform_rows(cfg: &Config) -> (Vec<String>, Option<arena_core::Error>) {
         default("SHADEFORM_MAX_PRICE")
     ));
     out.push(if o.ssh_key == DEFAULT_KEY {
-        "  ⚠ SHADEFORM_SSH_KEY            default — the account's default key (on a new account the Shadeform          Managed Key, whose private half Shadeform holds and returns to any API key holder)"
+        "  ⚠ SHADEFORM_SSH_KEY            default — the account's default key (on a new account the Shadeform \
+         Managed Key, whose private half Shadeform holds and returns to any API key holder)"
             .to_string()
     } else {
         format!(
@@ -4885,7 +4889,8 @@ fn shadeform_rows(cfg: &Config) -> (Vec<String>, Option<arena_core::Error>) {
         default("SHADEFORM_ALLOW_BAREMETAL")
     ));
     out.push(
-        "      └ shadeform: no stop (a VM bills until terminated), no volumes; what happens at a $0 wallet is          undocumented — keep Auto Top Up on"
+        "      └ shadeform: no stop (a VM bills until terminated), no volumes; what happens at a $0 wallet is \
+         undocumented — keep Auto Top Up on"
             .to_string(),
     );
     (out, None)
@@ -6925,11 +6930,6 @@ async fn handle_pods_bal(
 
         PodCmd::Stop { sel, wipe_ok, dry_run } => {
             let sel = select(provider, cfg, &sel.args(), Unscoped::Refuse("stop")).await?;
-            // A pod whose backend has no stop (Shadeform: it bills until deleted) refuses the
-            // whole batch up front — before the --wipe-ok gate, which would only mislead.
-            if let Some(r) = stop_refusal(provider, sel.pods.iter(), "stop") {
-                anyhow::bail!("{r}");
-            }
             // Every selected pod that's billing is stopped — not just RUNNING: RunPod v2
             // reports real states, and a PROVISIONING/STARTING pod bills too (one status rule
             // for this, the $/H column and the fleet total: `status::is_billing`). A selected
@@ -6939,7 +6939,19 @@ async fn handle_pods_bal(
             for p in sel.pods.iter().filter(|p| !billing(p)) {
                 eprintln!("skip {} — not running or starting ({})", p.name, p.status);
             }
-            let pods: Vec<&arena_core::Pod> = sel.pods.iter().filter(|p| billing(p)).collect();
+            let billing_pods: Vec<&arena_core::Pod> = sel.pods.iter().filter(|p| billing(p)).collect();
+            // A billing pod whose backend has no stop (Shadeform: it bills until deleted) is
+            // skipped and said — before the --wipe-ok gate, which would only mislead — and the
+            // rest are stopped: one overflow VM must not veto `stop --all` (review SF3). Only a
+            // selection with nothing else to stop is refused outright. Afterwards the exit is
+            // non-zero while a skipped one still bills (see `no_stop_left`).
+            let (no_stop, pods) = split_no_stop(provider, billing_pods);
+            if pods.is_empty() && !no_stop.is_empty() {
+                anyhow::bail!("{}", no_stop_refusal(&no_stop, "stop"));
+            }
+            for (p, why) in &no_stop {
+                eprintln!("skip {} — {why}", p.name);
+            }
             if pods.is_empty() {
                 println!("(no running or starting pods to stop)");
                 return Ok(());
@@ -6975,6 +6987,9 @@ async fn handle_pods_bal(
                 if !blocked.is_empty() && !wipe_ok {
                     println!("(would be refused without --wipe-ok: {})", blocked.join(", "));
                 }
+                if !no_stop.is_empty() {
+                    println!("(would skip, still billing — no stop on their provider: {})", names_of(&no_stop).join(", "));
+                }
                 println!("\nDry-run only — would stop {} pod(s).", pods.len());
                 return Ok(());
             }
@@ -7003,6 +7018,9 @@ async fn handle_pods_bal(
             println!("\nstopped {ok}/{total}");
             if ok < total {
                 anyhow::bail!("{} pod(s) failed to stop", total - ok);
+            }
+            if let Some(left) = no_stop_left(&no_stop) {
+                anyhow::bail!("{left}");
             }
         }
 
@@ -8121,23 +8139,50 @@ async fn handle_reimage(
 /// synced. A Hetzner VM kept its disk: only the sync. Pods that aren't stopped are said and
 /// left alone. A start the provider refuses (e.g. its host has no free GPU left) is
 /// reported per pod and fails the exit; the others carry on.
-/// Why `pods stop`/`start` (`what`) refuses this selection, if it does: a pod whose backend
-/// has no stop at all ([`Provider::stop_support`] — Shadeform: an instance bills until it's
-/// deleted, so there's nothing to stop or start; terminate it after a backup instead). The
-/// whole selection is refused up front, never half-run. `None` = every pod can.
-fn stop_refusal<'a>(provider: &dyn Provider, pods: impl Iterator<Item = &'a arena_core::Pod>, what: &str) -> Option<String> {
-    let mut names = Vec::new();
-    let mut why = None;
+/// The pods among `pods` whose backend has no stop at all ([`Provider::stop_support`] —
+/// Shadeform: an instance bills until it's deleted, so there's nothing to stop or start), each
+/// with why; then the rest. Pure (no request): `pods stop`/`start` skip the first and act on the
+/// second (review SF3).
+fn split_no_stop<'a>(provider: &dyn Provider, pods: Vec<&'a arena_core::Pod>) -> (Vec<(&'a arena_core::Pod, String)>, Vec<&'a arena_core::Pod>) {
+    let mut no_stop = Vec::new();
+    let mut rest = Vec::new();
     for p in pods {
-        if let Err(e) = provider.stop_support(p) {
-            names.push(p.name.clone());
-            why.get_or_insert_with(|| match e {
-                arena_core::Error::NotImplemented(m) => m,
-                other => other.to_string(),
-            });
+        match provider.stop_support(p) {
+            Ok(()) => rest.push(p),
+            Err(e) => no_stop.push((
+                p,
+                match e {
+                    arena_core::Error::NotImplemented(m) => m,
+                    other => other.to_string(),
+                },
+            )),
         }
     }
-    why.map(|why| format!("can't {what} {} — {why}", names.join(", ")))
+    (no_stop, rest)
+}
+
+fn names_of(no_stop: &[(&arena_core::Pod, String)]) -> Vec<String> {
+    no_stop.iter().map(|(p, _)| p.name.clone()).collect()
+}
+
+/// The refusal when everything `pods stop`/`start` (`what`) would act on has no stop.
+fn no_stop_refusal(no_stop: &[(&arena_core::Pod, String)], what: &str) -> String {
+    let why = no_stop.first().map(|(_, w)| w.as_str()).unwrap_or_default();
+    format!("can't {what} {} — {why}", names_of(no_stop).join(", "))
+}
+
+/// The exit of a `pods stop` that skipped pods with no stop (review SF3): **non-zero**, after
+/// every other pod was stopped — what was asked ("stop these") isn't done while one of them
+/// still bills, and a script or the operator reading the exit must see that, as for a stop that
+/// failed. `None` when nothing was skipped.
+fn no_stop_left(no_stop: &[(&arena_core::Pod, String)]) -> Option<String> {
+    (!no_stop.is_empty()).then(|| {
+        format!(
+            "{} pod(s) still billing — their provider has no stop: {} (back up, then `arena pods terminate`)",
+            no_stop.len(),
+            names_of(no_stop).join(", ")
+        )
+    })
 }
 
 async fn handle_start(
@@ -8152,13 +8197,19 @@ async fn handle_start(
     keys_dir: &str,
 ) -> Result<()> {
     let RestartOpts { no_setup, skip_proxy, dry_run, yes, .. } = opts;
-    if let Some(r) = stop_refusal(provider, sel.pods.iter(), "start") {
-        anyhow::bail!("{r}");
+    // A pod whose backend has no stop is never stopped, so there's nothing to start: said and
+    // skipped — a selection of only such pods is refused (review SF3: never a veto on the rest).
+    let (no_stop, startable) = split_no_stop(provider, sel.pods.iter().collect());
+    if startable.is_empty() && !no_stop.is_empty() {
+        anyhow::bail!("{}", no_stop_refusal(&no_stop, "start"));
     }
-    for p in sel.pods.iter().filter(|p| !arena_core::status::is_stopped(&p.status)) {
+    for (p, why) in &no_stop {
+        eprintln!("skip {} — {why}", p.name);
+    }
+    for p in startable.iter().filter(|p| !arena_core::status::is_stopped(&p.status)) {
         eprintln!("skip {} — not stopped ({})", p.name, p.status);
     }
-    let pods: Vec<arena_core::Pod> = sel.pods.iter().filter(|p| arena_core::status::is_stopped(&p.status)).cloned().collect();
+    let pods: Vec<arena_core::Pod> = startable.iter().filter(|p| arena_core::status::is_stopped(&p.status)).map(|p| (*p).clone()).collect();
     if pods.is_empty() {
         println!("(no stopped pods to start)");
         return Ok(());
@@ -14904,6 +14955,34 @@ mod selection_tests {
         assert!(vetoed.is_empty(), "a Shadeform pod vetoed `pods stop --all`:\n{}", vetoed.join("\n"));
     }
 
+    /// SF3, the rest of it: `stop --all` with a billing Shadeform pod stops every other pod, says
+    /// the Shadeform one is skipped, and exits non-zero (it still bills); an explicit stop of
+    /// only that pod is refused with nothing stopped; a `deleting` one (TERMINATED) is just "not
+    /// running" — exit 0.
+    #[tokio::test]
+    async fn sf3_stop_skips_shadeform_pods_exits_non_zero_and_refuses_them_alone() {
+        let mut f = fleet();
+        f.pods.push(pod("arena8-mayor", "RUNNING", "shadeform", Some(1)));
+        let r = handle_pods(pods_cmd(&["stop", "--all", "--wipe-ok"]), &f, Arc::new(FakeRemote::new()), &cfg(), true).await;
+        let e = r.unwrap_err().to_string();
+        assert!(e.contains("1 pod(s) still billing") && e.contains("arena8-mayor") && e.contains("no stop"), "{e}");
+        assert_eq!(f.calls().len(), 4, "every other running pod stopped: {:?}", f.calls());
+        // Only the Shadeform pod: refused, nothing stopped.
+        let mut f = fleet();
+        f.pods.push(pod("arena8-mayor", "RUNNING", "shadeform", Some(1)));
+        let e = handle_pods(pods_cmd(&["stop", "mayor"]), &f, Arc::new(FakeRemote::new()), &cfg(), true).await.unwrap_err().to_string();
+        assert!(e.starts_with("can't stop arena8-mayor — Shadeform has no stop"), "{e}");
+        assert!(f.calls().is_empty());
+        // Already deleting: not a stop target — the rest stop and the exit is 0.
+        let mut f = fleet();
+        f.pods.push(pod("arena8-mayor", "TERMINATED", "shadeform", Some(1)));
+        handle_pods(pods_cmd(&["stop", "--all", "--wipe-ok"]), &f, Arc::new(FakeRemote::new()), &cfg(), true).await.unwrap();
+        assert_eq!(f.calls().len(), 4);
+        // `start` of only the Shadeform pod: refused the same way, nothing sent.
+        let e = handle_pods(pods_cmd(&["start", "mayor"]), &f, Arc::new(FakeRemote::new()), &cfg(), true).await.unwrap_err().to_string();
+        assert!(e.starts_with("can't start arena8-mayor — Shadeform has no stop"), "{e}");
+    }
+
     #[tokio::test]
     async fn stop_stops_exactly_the_selected_running_pods() {
         // The fleet's RunPod pods have no volume (the fake's spec), so stopping them needs
@@ -16231,21 +16310,27 @@ mod tests {
         }
     }
 
-    /// `pods stop`/`start` refuse a selection with a Shadeform pod up front — it has no stop (it
-    /// bills until deleted), and the --wipe-ok gate would only mislead; the refusal says to back
-    /// it up and terminate it. Other pods pass.
+    /// `pods stop`/`start` skip a Shadeform pod (it has no stop — it bills until deleted) and act on
+    /// the rest; only a selection of nothing else is refused outright, and the stop's exit stays
+    /// non-zero while a skipped one still bills (review SF3).
     #[test]
-    fn stop_and_start_refuse_a_shadeform_pod_up_front() {
+    fn stop_and_start_skip_a_shadeform_pod_and_refuse_only_it_alone() {
         use super::Config;
         let fleet = arena_core::provider::build_fleet("runpod", &Config::parse("RUNPOD_API_KEY=r\nSHADEFORM_API_KEY=k"), false).unwrap();
         let sf = arena_core::Pod { name: "devtest-alpha".into(), provider: "shadeform".into(), ..Default::default() };
         let rp = arena_core::Pod { name: "devtest-bloom".into(), provider: "runpod".into(), ..Default::default() };
-        assert_eq!(super::stop_refusal(fleet.as_ref(), [&rp].into_iter(), "stop"), None);
+        let (no_stop, rest) = super::split_no_stop(fleet.as_ref(), vec![&rp, &sf]);
+        assert_eq!((super::names_of(&no_stop), rest.iter().map(|p| p.name.as_str()).collect::<Vec<_>>()), (vec!["devtest-alpha".to_string()], vec!["devtest-bloom"]));
+        assert!(no_stop[0].1.starts_with("Shadeform has no stop") && no_stop[0].1.contains("arena pods terminate"), "{}", no_stop[0].1);
         for what in ["stop", "start"] {
-            let r = super::stop_refusal(fleet.as_ref(), [&rp, &sf].into_iter(), what).unwrap();
+            let r = super::no_stop_refusal(&no_stop, what);
             assert!(r.starts_with(&format!("can't {what} devtest-alpha — Shadeform has no stop")), "{r}");
-            assert!(r.contains("bills until it's deleted") && r.contains("arena pods terminate"), "{r}");
         }
+        let left = super::no_stop_left(&no_stop).unwrap();
+        assert!(left.starts_with("1 pod(s) still billing") && left.contains("devtest-alpha"), "{left}");
+        assert_eq!(super::no_stop_left(&[]), None);
+        let (none, all) = super::split_no_stop(fleet.as_ref(), vec![&rp]);
+        assert!(none.is_empty() && all.len() == 1);
     }
 
     /// `--json` on `gpus` and `pods list` is a scripting contract — pin the flag parsing

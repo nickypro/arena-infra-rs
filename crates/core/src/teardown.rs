@@ -22,6 +22,7 @@ use crate::lock::is_locked;
 use crate::openrouter::{key_name, KeyInfo};
 use crate::pod::Pod;
 use crate::provider::runpod::NetworkVolume;
+use crate::provider::shadeform::ShadeformVolume;
 use crate::proxy::parse_nginx_detailed;
 use crate::selector::Naming;
 use crate::status::bills_hourly;
@@ -97,6 +98,9 @@ pub struct Inputs {
     /// Each *configured* provider's own listing (`Provider::list_by_provider`), errors as text.
     pub listings: Vec<(String, Result<Vec<Pod>, String>)>,
     pub volumes: Probe<Vec<NetworkVolume>>,
+    /// Shadeform's volumes (`GET /volumes`) — judged only when Shadeform is configured (it's in
+    /// `listings`).
+    pub shadeform_volumes: Probe<Vec<ShadeformVolume>>,
     pub keys: Probe<Vec<KeyInfo>>,
     pub cron: Probe<CronLines>,
     pub at: Probe<Vec<AtJob>>,
@@ -304,6 +308,9 @@ pub fn build(inputs: &Inputs, naming: &Naming) -> Report {
         items.push(pods_item(provider, listing.as_ref().map(Vec::as_slice), naming, &all));
     }
     items.push(volumes_item(&inputs.volumes));
+    if inputs.listings.iter().any(|(p, _)| p == "shadeform") {
+        items.push(shadeform_volumes_item(&inputs.shadeform_volumes));
+    }
     items.push(keys_item(&inputs.keys, naming));
     items.push(cron_item(&inputs.cron, &inputs.user));
     items.push(at_item(&inputs.at, &inputs.user));
@@ -539,6 +546,58 @@ pub fn volumes_item(volumes: &Probe<Vec<NetworkVolume>>) -> Item {
     item.notes.push(
         "deleting a volume is irreversible and destroys its data — confirm the groups are finished first (export RUNPOD_API_KEY \
          for the commands, or delete it in the RunPod console)"
+            .into(),
+    );
+    item
+}
+
+/// Shadeform's volumes (review SF7): any volume on the account is remaining — it bills per
+/// GB-month after every instance is gone, priced at Shadeform's listed $/GB-hour; a failed read
+/// is UNKNOWN, never "none". arena never makes one (volumes are refused at create), so one here
+/// was made in the console or by something else using the account-wide key.
+pub fn shadeform_volumes_item(volumes: &Probe<Vec<ShadeformVolume>>) -> Item {
+    const SCOPE: &str = "shadeform";
+    let vols = match volumes {
+        Probe::Skipped(why) => return Item::new(Area::Volumes, SCOPE, Verdict::Skipped, why.clone()),
+        Probe::Failed(e) => {
+            let mut item = Item::new(Area::Volumes, SCOPE, Verdict::Unknown, format!("couldn't check ({e}) — NOT known to be empty"));
+            item.notes.push("look in the Shadeform console (Volumes) before calling the teardown done".into());
+            return item;
+        }
+        Probe::Got(v) if v.is_empty() => return Item::new(Area::Volumes, SCOPE, Verdict::Clear, "none"),
+        Probe::Got(v) => v,
+    };
+    let total_gb: u32 = vols.iter().filter_map(|v| v.size_gb).sum();
+    let monthly = total(vols.iter().filter_map(ShadeformVolume::usd_per_month));
+    let unpriced = vols.iter().filter(|v| v.usd_per_month().is_none()).count();
+    let mut summary = format!(
+        "{}, {total_gb} GB — ~${monthly:.2}/month (~${:.2}/day) at Shadeform's listed $/GB-hour",
+        remain(vols.len()),
+        monthly * 12.0 / 365.0
+    );
+    if unpriced > 0 {
+        summary.push_str(&format!(" ({unpriced} without a size or listed rate not included)"));
+    }
+    let mut item = Item::new(Area::Volumes, SCOPE, Verdict::Remaining, summary);
+    let mut sorted: Vec<&ShadeformVolume> = vols.iter().collect();
+    sorted.sort_by(|a, b| (&a.name, &a.id).cmp(&(&b.name, &b.id)));
+    for v in sorted {
+        item.entries.push(Entry::Volume {
+            id: v.id.clone(),
+            name: v.name.clone(),
+            size_gb: v.size_gb,
+            data_center: Some(format!("{}/{}", v.cloud, v.region)),
+            tier: None,
+            est_usd_per_month: v.usd_per_month(),
+        });
+        item.fix.push(format!(
+            "curl -X POST -H \"X-API-KEY: $SHADEFORM_API_KEY\" https://api.shadeform.ai/v1/volumes/{}/delete",
+            sh_word(&v.id)
+        ));
+    }
+    item.notes.push(
+        "deleting a volume is irreversible and destroys its data — and one still mounted goes only once its instance is \
+         deleted (export SHADEFORM_API_KEY for the commands, or delete it in the Shadeform console)"
             .into(),
     );
     item
@@ -1230,6 +1289,7 @@ mod tests {
         Inputs {
             listings: vec![("runpod".into(), Ok(vec![])), ("hetzner".into(), Ok(vec![]))],
             volumes: Probe::Got(vec![]),
+            shadeform_volumes: Probe::Skipped("not read in this test".into()),
             keys: Probe::Got(vec![key("arena7-apple", false, Some(3.0), Some(5.0))]),
             cron: Probe::Got(CronLines::default()),
             at: Probe::Skipped("`at` isn't installed here".into()),
@@ -1262,6 +1322,43 @@ mod tests {
             "no Shadeform volumes line at all:\n{}",
             r.render()
         );
+    }
+
+    /// SF7: Shadeform's volumes item — only when Shadeform is configured; a volume is remaining
+    /// with its $/month at the listed rate and a delete command; a failed read is UNKNOWN (not
+    /// clear); none is clear.
+    #[test]
+    fn sf7_shadeform_volumes_item() {
+        let names = list();
+        let naming = Naming { prefix: "arena8", list: &names };
+        let vol = |id: &str, gb: Option<u32>, rate: Option<f64>| ShadeformVolume {
+            id: id.into(),
+            name: format!("{id}-data"),
+            cloud: "crusoe".into(),
+            region: "culpeper-usa-1".into(),
+            size_gb: gb,
+            usd_per_gb_hour: rate,
+        };
+        let item = |probe: Probe<Vec<ShadeformVolume>>| {
+            let mut i = inputs();
+            i.listings.push(("shadeform".into(), Ok(vec![])));
+            i.shadeform_volumes = probe;
+            let r = build(&i, &naming);
+            let it = r.items.iter().find(|it| it.area == Area::Volumes && it.scope == "shadeform").cloned().unwrap();
+            (r, it)
+        };
+        let (r, it) = item(Probe::Got(vec![vol("v-1", Some(100), Some(0.00012)), vol("v-2", None, None)]));
+        assert_eq!(it.verdict, Verdict::Remaining);
+        assert!(!r.clear);
+        assert!(it.summary.starts_with("2 remain, 100 GB"), "{}", it.summary);
+        assert!(it.summary.contains("~$8.76/month") && it.summary.contains("1 without a size or listed rate"), "{}", it.summary);
+        assert!(it.fix[0].contains("https://api.shadeform.ai/v1/volumes/v-1/delete") && it.fix[0].contains("$SHADEFORM_API_KEY"), "{:?}", it.fix);
+        let (r, it) = item(Probe::Failed("shadeform volumes HTTP 503".into()));
+        assert_eq!((it.verdict, r.clear), (Verdict::Unknown, false));
+        let (r, it) = item(Probe::Got(vec![]));
+        assert_eq!((it.verdict, r.clear), (Verdict::Clear, true));
+        // Not configured: no line at all (as before).
+        assert!(!build(&inputs(), &naming).items.iter().any(|it| it.area == Area::Volumes && it.scope == "shadeform"));
     }
 
     #[test]

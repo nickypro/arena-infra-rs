@@ -556,15 +556,26 @@ impl Shared<'_, '_> {
         // billing), within that backend's ready deadline: past it, or once listed ERROR, the
         // pod is a failed placement — terminated and the name tried on the next option, never
         // waited out or left billing.
+        //
+        // The wait ends at whichever bound comes first — the backend's ready deadline or
+        // `--timeout` — and on such a backend (or any whose pods can't be stopped: they bill
+        // until deleted) every expiry is a failed placement, whichever bound it was. Review SF1:
+        // keeping the ready deadline only when it was under `--timeout` dropped it with the
+        // shipped defaults (15 min vs 600 s), and a pod still pending at 600 s was "left
+        // running" — billing.
         let started = Instant::now();
-        let ready = self.run.provider.ready_deadline(&pod).filter(|r| *r <= self.run.timeout);
-        let deadline = started + ready.unwrap_or(self.run.timeout);
-        let dead_on_error = self.run.provider.ready_deadline(&pod).is_some();
-        let pod = match self.or_stop(self.wait_endpoint(&pod.id, deadline, dead_on_error)).await {
+        let ready = self.run.provider.ready_deadline(&pod);
+        let deadline = started + ready.map_or(self.run.timeout, |r| r.min(self.run.timeout));
+        let fail_on_expiry = ready.is_some() || self.run.provider.stop_support(&pod).is_err();
+        let pod = match self.or_stop(self.wait_endpoint(&pod.id, deadline, fail_on_expiry)).await {
             None => return self.end(run, Verdict::Stopped { stage: Stage::Endpoint }),
             Some(EndpointWait::Failed { pod, why }) => return self.dead(run, &pod, option, failed_options, why).await,
-            Some(EndpointWait::TimedOut) if ready.is_some() => {
-                let why = format!("not up after {} (its provider's ready deadline)", pipeline::fmt_elapsed(started.elapsed()));
+            Some(EndpointWait::TimedOut) if fail_on_expiry => {
+                let bound = match ready {
+                    Some(r) if r <= self.run.timeout => "its provider's ready deadline",
+                    _ => "--timeout",
+                };
+                let why = format!("not up after {} ({bound})", pipeline::fmt_elapsed(started.elapsed()));
                 return self.dead(run, &pod, option, failed_options, why).await;
             }
             Some(EndpointWait::TimedOut) => {

@@ -76,16 +76,67 @@ impl ApiBase {
 /// Refuse `--raw` where the body carries a secret the provider itself holds for us:
 /// Shadeform's `/sshkeys` (and `/sshkeys/{id}/info`) return the managed key's **private half**
 /// — printed raw it would land in the terminal, shell history and logs. Without `--raw` the
-/// passthrough redacts it (`private_key` is a secret name). Pure.
+/// passthrough redacts it (`private_key` is a secret name).
+///
+/// Judged on the path as the API will route it, not as typed (review SF2): the typed path and
+/// the resolved URL's path are each percent-decoded (twice: `%2573`), lowercased, split on `/`
+/// with empty and `.` segments dropped, and a leading copy of the base's own path (`v1/` —
+/// the docs' spelling, which [`resolve_url`] strips too) removed; any that then starts with a
+/// `sshkeys…` segment is refused. And [`render_for`] blanks a private key in Shadeform output
+/// even with `--raw`, should a spelling ever slip past this. Pure.
 pub fn refuse_raw(base: &ApiBase, path: &str, raw: bool) -> Result<()> {
-    let first = path.trim().trim_start_matches('/').split(['/', '?']).next().unwrap_or("").to_ascii_lowercase();
-    if raw && base.provider == "shadeform" && first.starts_with("sshkeys") {
+    if raw && base.provider == "shadeform" && reaches_sshkeys(base, path) {
         return Err(Error::Config(
-            "api get shadeform sshkeys… --raw is refused: Shadeform returns the managed SSH key's private half there —              drop --raw (it's redacted)"
+            "api get shadeform sshkeys… --raw is refused: Shadeform returns the managed SSH key's private half there — \
+             drop --raw (it's redacted)"
                 .into(),
         ));
     }
     Ok(())
+}
+
+/// `%XX` decoded (invalid escapes kept as typed). Pure.
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A path's segments as a router would see them: query/fragment cut, percent-decoded (twice),
+/// lowercased, empty and `.` segments dropped. Pure.
+fn canonical_segments(path: &str) -> Vec<String> {
+    let p = path.trim().split(['?', '#']).next().unwrap_or("");
+    let decoded = percent_decode(&percent_decode(p)).to_ascii_lowercase();
+    decoded.split(['/', '\\']).map(str::trim).filter(|s| !s.is_empty() && *s != ".").map(String::from).collect()
+}
+
+/// Whether `path` (typed, or as [`resolve_url`] resolves it under `base`) reaches a `sshkeys…`
+/// route once the base's own path (`v1`) is taken off the front. Pure.
+fn reaches_sshkeys(base: &ApiBase, path: &str) -> bool {
+    let base_segs = Url::parse(base.url).map(|u| canonical_segments(u.path())).unwrap_or_default();
+    let mut candidates = vec![canonical_segments(path)];
+    if let Ok(url) = resolve_url(base.url, path) {
+        candidates.push(canonical_segments(url.path()));
+    }
+    candidates.into_iter().any(|mut segs| {
+        while !base_segs.is_empty() && segs.starts_with(&base_segs) {
+            segs.drain(..base_segs.len());
+        }
+        segs.first().is_some_and(|s| s.starts_with("sshkeys"))
+    })
 }
 
 /// Whether `p` starts with a URL scheme (`https:`, `file:`, `javascript:` …): letters, then
@@ -302,7 +353,7 @@ pub fn render(status: StatusCode, body: &str, raw: bool, api_key: &str) -> Resul
         let shown = match json {
             // Compact, as the error prints a JSON body anyway — and scrubbed here, before
             // the clip.
-            Some(v) => scrub(&(if raw { v } else { redact(&v) }).to_string(), api_key),
+            Some(v) => scrub(&(if raw { v } else { redact_personal(&redact(&v)) }).to_string(), api_key),
             None if raw => body,
             None => redact_text(&body),
         };
@@ -316,12 +367,53 @@ pub fn render(status: StatusCode, body: &str, raw: bool, api_key: &str) -> Resul
         });
     }
     let text = match json {
-        Some(v) => serde_json::to_string_pretty(&if raw { v } else { redact(&v) })
+        Some(v) => serde_json::to_string_pretty(&if raw { v } else { redact_personal(&redact(&v)) })
             .map_err(|e| Error::provider(format!("api get: re-encoding the response: {e}")))?,
         None if raw => body,
         None => redact_text(&body),
     };
     Ok(scrub(&text, api_key))
+}
+
+/// [`render`] for `base`'s API. Shadeform's bodies hold two things for us that are never
+/// worth printing, so on Shadeform they are blanked **even with `--raw`** (review SF2/SF9,
+/// defence in depth behind [`refuse_raw`]): a private key (`/sshkeys` returns the managed
+/// key's private half) and personal data (`/account`'s email, phone, tax id, address,
+/// organisation). Everything else is as [`render`] has it. Pure.
+pub fn render_for(base: &ApiBase, status: StatusCode, body: &str, raw: bool, api_key: &str) -> Result<String> {
+    if base.provider != "shadeform" || !raw {
+        return render(status, body, raw, api_key);
+    }
+    let body = match serde_json::from_str::<Value>(body) {
+        Ok(v) => redact_personal(&blank_where(&v, &|k| k.to_ascii_lowercase().contains("private"))).to_string(),
+        Err(_) if body.contains("PRIVATE KEY") || body.contains("-----BEGIN") => redact_text(body),
+        Err(_) => body.to_string(),
+    };
+    render(status, &body, raw, api_key)
+}
+
+/// Personal data, by key name: blanked in the default rendering like a secret (review SF9 —
+/// Shadeform's `GET /account` carries the account's email, phone, tax id, address and
+/// organisation; Vast's `users/current/` an email). Broad on purpose, as [`secret_key`] is.
+fn personal_key(name: &str) -> bool {
+    let n = name.to_ascii_lowercase().replace('-', "_");
+    ["email", "e_mail", "phone", "mobile", "tax_id", "taxid", "vat_id", "address", "organization", "organisation", "postal", "zip_code"]
+        .iter()
+        .any(|w| n.contains(w))
+}
+
+/// `v` with every value under a personal-data key ([`personal_key`]) blanked. Pure.
+fn redact_personal(v: &Value) -> Value {
+    blank_where(v, &personal_key)
+}
+
+/// `v` with every value under a key `hit` names blanked ([`blank`]), at any depth. Pure.
+fn blank_where(v: &Value, hit: &dyn Fn(&str) -> bool) -> Value {
+    match v {
+        Value::Object(o) => Value::Object(o.iter().map(|(k, v)| (k.clone(), if hit(k) { blank(v) } else { blank_where(v, hit) })).collect()),
+        Value::Array(a) => Value::Array(a.iter().map(|x| blank_where(x, hit)).collect()),
+        other => other.clone(),
+    }
 }
 
 /// The passthrough's HTTP client: redirects are never followed (a 3xx is reported, so the
@@ -683,5 +775,54 @@ mod tests {
         for pii in ["someone@example.invalid", "+1 555 0100", "T-12345", "1 Example Way"] {
             assert!(!out.contains(pii), "`api get shadeform account` printed {pii:?}:\n{out}");
         }
+    }
+
+    /// SF2, the fix's own table: every spelling that reaches `/v1/sshkeys…` is refused with
+    /// `--raw` — the docs' `v1/` prefix, any case, percent-encoding (once or twice), `//` and
+    /// `./` — and nothing else is: other routes, or `sshkeys` without `--raw`, or another API.
+    #[test]
+    fn sf2_raw_refusal_canonicalises_the_path() {
+        let cfg = Config::parse("");
+        let sf = api_base("shadeform", &cfg).unwrap();
+        for path in [
+            "sshkeys", "SSHKEYS", "/sshkeys/", "v1/sshkeys", "V1/SshKeys", "/v1/sshkeys/abc/info", "v1//sshkeys", "./sshkeys",
+            "v1/./sshkeys", "%73shkeys", "%2573shkeys", "v1/%53%53HKEYS", "sshkeys?x=1", "sshkeys/abc/info#f", "v1/v1/sshkeys",
+        ] {
+            assert!(refuse_raw(&sf, path, true).is_err(), "{path} should be refused with --raw");
+            assert!(refuse_raw(&sf, path, false).is_ok(), "{path} without --raw is redacted, not refused");
+        }
+        for path in ["instances", "v1/instances", "instances/types", "account", "sshkey-ish/../x", "my-sshkeys"] {
+            assert!(refuse_raw(&sf, path, true).is_ok(), "{path}");
+        }
+        assert!(refuse_raw(&api_base("vast", &cfg).unwrap(), "v1/sshkeys", true).is_ok(), "only Shadeform's");
+        assert_eq!(percent_decode("%73sh%4Beys%zz%"), "sshKeys%zz%");
+        assert_eq!(canonical_segments("/V1//./%73shkeys/?q=1"), ["v1", "sshkeys"]);
+    }
+
+    /// SF2/SF9 defence in depth: on Shadeform a private key and personal fields are blanked
+    /// even with `--raw` — whatever path got there; elsewhere `--raw` is as received. Without
+    /// `--raw`, personal fields are blanked on every API (Vast's `users/current/` has an email).
+    #[test]
+    fn render_for_blanks_shadeforms_private_key_and_personal_data_even_raw() {
+        let cfg = Config::parse("");
+        let sf = api_base("shadeform", &cfg).unwrap();
+        let vast = api_base("vast", &cfg).unwrap();
+        let keys = r#"{"ssh_keys":[{"id":"1","name":"Shadeform Managed Key","public_key":"ssh-rsa AAAA x","private_key":"PRIVATE-KEY-MATERIAL-MUST-NEVER-BE-PRINTED","is_default":true}]}"#;
+        let out = render_for(&sf, StatusCode::OK, keys, true, "sf-key-material").unwrap();
+        assert!(!out.contains("PRIVATE-KEY-MATERIAL") && out.contains("ssh-rsa AAAA x") && out.contains(REDACTED), "{out}");
+        let account = r#"{"balance":"12.50","email":"someone@example.invalid","phone_number":"+1 555 0100","tax_id":"T-1","address":"1 Way","organization":"Org"}"#;
+        let out = render_for(&sf, StatusCode::OK, account, true, "sf-key-material").unwrap();
+        for pii in ["someone@example.invalid", "+1 555 0100", "T-1", "1 Way", "\"Org\""] {
+            assert!(!out.contains(pii), "{pii} in {out}");
+        }
+        assert!(out.contains("12.50"));
+        let pem = "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----";
+        assert!(!render_for(&sf, StatusCode::OK, pem, true, "sf-key-material").unwrap().contains("abc"));
+        // Another API with --raw: as received (its documented contract).
+        let out = render_for(&vast, StatusCode::OK, r#"{"email":"x@y.z","credit":1}"#, true, "vast-key-material").unwrap();
+        assert!(out.contains("x@y.z"), "{out}");
+        // Without --raw, personal data is blanked everywhere.
+        let out = render_for(&vast, StatusCode::OK, r#"{"email":"x@y.z","credit":1}"#, false, "vast-key-material").unwrap();
+        assert!(!out.contains("x@y.z") && out.contains("credit"), "{out}");
     }
 }

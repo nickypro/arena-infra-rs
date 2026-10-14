@@ -23,6 +23,7 @@ pub(super) fn provider(base: &str, client: Client) -> ShadeformProvider {
         opts: opts(),
         relist: Relist { tries: 2, every: Duration::ZERO },
         make_nonce: fixed_nonce,
+        price_reads: vec![Duration::ZERO; 5],
     }
 }
 
@@ -799,4 +800,161 @@ esac"#,
         "root's first entry for the cohort key is cloud-init's lock-out line — root login runs its `command=` and exits \
          142:\n{keys}"
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// Review fixes (SF4–SF7): the fixes' own regression tests, beside the review's.
+// ---------------------------------------------------------------------------------------
+
+/// SF4: a price that can't be read after the create — `info` failing every time and the listing
+/// too — is no price to accept: the instance is deleted and the next entry tried (here it
+/// succeeds), the first one's region avoided. If that delete fails, the run stops saying it
+/// may still be running — never a silent keep.
+#[tokio::test]
+async fn sf4_an_unreadable_price_deletes_the_instance_and_tries_the_next_entry() {
+    let (first, second) = ("aaaaaaaa-0000-4000-8000-000000000006", "aaaaaaaa-0000-4000-8000-000000000007");
+    let mut replies = create_prelude();
+    replies.push(json_reply(&format!(r#"{{"id": "{first}"}}"#)));
+    replies.push(canned(503, "text/plain", "busy"));
+    replies.push(canned(503, "text/plain", "busy"));
+    replies.push(canned(503, "text/plain", "busy"));
+    replies.push(json_reply(""));
+    replies.push(json_reply(&format!(r#"{{"id": "{second}"}}"#)));
+    replies.push(json_reply(&instance(second, "devtest-alpha", "creating", 57, our_tags()).to_string()));
+    let srv = serve(replies);
+    let mut p = provider(&srv.base, client());
+    p.price_reads = vec![Duration::ZERO];
+    let pod = p.create_pod(&spec("NVIDIA RTX A6000", 1)).await.unwrap();
+    assert_eq!(pod.id, second);
+    let r = requests(&srv);
+    assert_eq!(r[3..8], [
+        "POST /instances/create HTTP/1.1".to_string(),
+        format!("GET /instances/{first}/info HTTP/1.1"),
+        format!("GET /instances/{first}/info HTTP/1.1"),
+        "GET /instances HTTP/1.1".into(),
+        format!("POST /instances/{first}/delete HTTP/1.1"),
+    ]);
+    let bodies = srv.bodies.lock().unwrap().clone();
+    let region = |i: usize| serde_json::from_str::<Value>(&bodies[i]).unwrap()["region"].as_str().unwrap().to_string();
+    assert_eq!((region(3), region(8)), ("kansascity-usa-1".into(), "desmoines-usa-1".into()), "the failed region is avoided");
+
+    // The listing has it but without a price (no rental_terms, no integer hourly_price): the same.
+    let mut unpriced = instance(first, "devtest-alpha", "creating", 0, our_tags());
+    unpriced["hourly_price"] = json!("n/a");
+    let mut replies = create_prelude();
+    replies.push(json_reply(&format!(r#"{{"id": "{first}"}}"#)));
+    replies.push(json_reply(&unpriced.to_string()));
+    replies.push(json_reply(&unpriced.to_string()));
+    replies.push(json_reply(&json!({"instances": [unpriced]}).to_string()));
+    replies.push(canned(500, "text/plain", "boom"));
+    let srv = serve(replies);
+    let mut p = provider(&srv.base, client());
+    p.price_reads = vec![Duration::ZERO];
+    let e = p.create_pod(&spec("NVIDIA RTX A6000", 1)).await.unwrap_err();
+    let msg = e.to_string();
+    assert!(msg.contains("couldn't be read") && msg.contains("deleting it FAILED") && msg.contains("may still be running"), "{msg}");
+    assert_eq!(e.kind(), Some(K::Other), "the run stops: nothing more is created");
+    assert_eq!(posts(&srv), 2, "one create, one delete attempt");
+    // The real backoff: ~30 s in all.
+    assert_eq!(PRICE_READS.iter().sum::<Duration>(), Duration::from_secs(30));
+}
+
+/// SF5: a rename that keeps the prefix still works; one that drops it (or isn't a name) is
+/// refused before any request.
+#[tokio::test]
+async fn sf5_rename_keeps_the_prefix_or_is_refused_unsent() {
+    let srv = serve(vec![]);
+    let p = provider(&srv.base, client());
+    for bad in ["staff-box", "devtest", "devtest-", "devtestx-alpha", "devtest-al pha", "devtest-a'b"] {
+        let e = p.rename_pod(ID, bad).await.unwrap_err();
+        assert!(matches!(e, Error::Config(_)) && e.to_string().contains("only manages `devtest-…` names"), "{bad}: {e}");
+    }
+    assert!(requests(&srv).is_empty());
+}
+
+/// SF6: run the rendered bootstrap for real (bash, `sudo`/`id`/`getent` stubbed onto a temp
+/// root). A cohort key cloud-init left behind a `command=` lock-out in root's file ends up as one
+/// plain line; unrelated lines stay; a rerun gives the same file; the `shadeform` user gets the
+/// plain lines too.
+#[cfg(target_os = "linux")]
+#[test]
+fn sf6_bootstrap_rewrites_restricted_cohort_lines_and_is_idempotent() {
+    use std::os::unix::fs::PermissionsExt;
+    let base = std::env::temp_dir().join(format!("arena-sf6-boot-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let (stubs, fake) = (base.join("stubs"), base.join("fake"));
+    for d in [stubs.clone(), fake.join("root/.ssh"), fake.join("home/shadeform/.ssh")] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let stub = |name: &str, body: &str| {
+        let p = stubs.join(name);
+        std::fs::write(&p, format!("#!/bin/bash\n{body}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    stub("id", "echo 1000");
+    stub(
+        "getent",
+        r#"case "$2" in root) echo "root:x:0:0:root:$FAKE/root:/bin/bash";; shadeform) echo "shadeform:x:1000:1000::$FAKE/home/shadeform:/bin/bash";; *) exit 2;; esac"#,
+    );
+    stub(
+        "sudo",
+        r#"[ "$1" = -n ] && shift
+cmd=$1; shift; args=()
+for a in "$@"; do a=${a//\/var\/lib\/arena/$FAKE/var/lib/arena}; a=${a//\/etc\/ssh/$FAKE/etc/ssh}; args+=("$a"); done
+case "$cmd" in
+  chown|systemctl) exit 0;;
+  sshd) echo "permitrootlogin prohibit-password"; exit 0;;
+  install) out=(); skip=0; for a in "${args[@]}"; do if [ $skip = 1 ]; then skip=0; continue; fi; case "$a" in -o|-g) skip=1;; *) out+=("$a");; esac; done; exec install "${out[@]}";;
+  *) exec "$cmd" "${args[@]}";;
+esac"#,
+    );
+    let other = "ssh-rsa AAAAB3OtherKeyNotTheCohorts other@laptop";
+    let restricted = format!("no-port-forwarding,command=\"echo 'Please login as the user \\\"shadeform\\\".';exit 142\" {KEY_A}");
+    std::fs::write(fake.join("root/.ssh/authorized_keys"), format!("{other}\n{restricted}\n")).unwrap();
+    std::fs::write(fake.join("home/shadeform/.ssh/authorized_keys"), format!("{KEY_A}\n")).unwrap();
+    let key_b = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeDeployKeyForTestsOnly deploy@arena";
+    let script = render_bootstrap(&[KEY_A.into(), key_b.into()], NONCE, "devtest-alpha").unwrap();
+    let run = || {
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .env_clear()
+            .env("PATH", format!("{}:/usr/bin:/bin", stubs.display()))
+            .env("FAKE", &fake)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        std::fs::read_to_string(fake.join("root/.ssh/authorized_keys")).unwrap()
+    };
+    let once = run();
+    let twice = run();
+    let shadeform = std::fs::read_to_string(fake.join("home/shadeform/.ssh/authorized_keys")).unwrap();
+    let leftovers = std::fs::read_dir(fake.join("root/.ssh")).unwrap().count();
+    let _ = std::fs::remove_dir_all(&base);
+    assert_eq!(once, format!("{other}\n{KEY_A}\n{key_b}\n"), "the lock-out line is gone, the other key kept, ours plain");
+    assert_eq!(twice, once, "a rerun gives the same file");
+    assert_eq!(shadeform, format!("{KEY_A}\n{key_b}\n"));
+    assert_eq!(leftovers, 1, "no temp file left behind");
+}
+
+/// SF7: the account's volumes, read over the loopback (`GET /volumes`, then `/volumes/types` for
+/// the price): sized, priced per (cloud, region) at the recorded rate; a body without the array
+/// fails closed; a failed price read only leaves them unpriced.
+#[tokio::test]
+async fn sf7_volumes_are_listed_and_priced() {
+    let vols = json!({"volumes": [
+        {"id": "v-1", "cloud": "crusoe", "region": "culpeper-usa-1", "name": "data", "size_in_gb": 100, "cost_estimate": "0.5"},
+        {"id": "v-2", "cloud": "massedcompute", "region": "nowhere-1", "name": "odd", "size_in_gb": 10},
+    ]});
+    let srv = serve(vec![json_reply(&vols.to_string()), json_reply(raw("volumes_types_2026-10-14.json"))]);
+    let got = provider(&srv.base, client()).list_volumes().await.unwrap();
+    assert_eq!(requests(&srv), ["GET /volumes HTTP/1.1", "GET /volumes/types HTTP/1.1"]);
+    assert_eq!((got[0].id.as_str(), got[0].size_gb, got[0].usd_per_gb_hour), ("v-1", Some(100), Some(0.00012)));
+    assert!((got[0].usd_per_month().unwrap() - 100.0 * 0.00012 * 730.0).abs() < 1e-9);
+    assert_eq!((got[1].usd_per_gb_hour, got[1].usd_per_month()), (None, None), "no listed rate there");
+    let srv = serve(vec![json_reply(&vols.to_string()), canned(503, "text/plain", "busy")]);
+    assert!(provider(&srv.base, client()).list_volumes().await.unwrap().iter().all(|v| v.usd_per_gb_hour.is_none()));
+    let srv = serve(vec![json_reply("{}")]);
+    assert!(provider(&srv.base, client()).list_volumes().await.unwrap_err().to_string().contains("no volumes array"));
+    assert!(parse_volumes(&json_of("volumes_empty.json"), None).unwrap().is_empty());
 }
