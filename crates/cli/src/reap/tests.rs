@@ -2747,3 +2747,60 @@ async fn w7_b_rs8b_a_recovered_reap_takes_its_own_copy() {
     }
     assert!(w.notified().iter().any(|l| l.contains("its last verified backup") && l.contains(&reaped)), "{:?}", w.notified());
 }
+
+// ---------------------------------------------------------------------------------------
+// Review of ca3f726 (W7 live findings).
+// ---------------------------------------------------------------------------------------
+
+/// REVIEW w7lr: F2 renames an attempt's copy to a reap's name whenever the pod is found gone
+/// with its write-ahead pending — but the write-ahead is written BEFORE the backup, so the state
+/// can't tell "cut off between the terminate and its record" (what F2 is for) from "cut off
+/// before any terminate was sent, and the pod then went some other way" (deleted by hand after a
+/// `terminate failed — check the pod by hand`, a host reclaim, the operator's `pods down` while
+/// the control box was down …). In the second case the reaper never terminated the pod: the copy
+/// is an attempt's, and the participant may have worked for hours after it was frozen. Naming it
+/// a reap's — and notifying "its last verified backup" — is exactly the overstatement B-RS8b set
+/// out to remove ("a copy is named a reap's only once the terminate succeeded"); the same path
+/// would promote a half-made leaf of a run killed mid-freeze.
+///
+/// The crash is played faithfully: a real `--apply` freezes its copy and stops at the RS8 gate
+/// (before any terminate); the write-ahead is then put back exactly as `store::write_ahead` left
+/// it, i.e. the run died there instead of running `end_attempt`. Then someone deletes the pod.
+#[tokio::test]
+async fn review_w7lr_f2_never_promotes_a_copy_whose_terminate_was_never_sent() {
+    let (w, a) = due_world("rev-w7lr-f2", "").await;
+    let key = core_reap::key("runpod", &a.id);
+    let at = w.now();
+    w.sim(22001, |s| s.on_git = OnGit::Disable);
+    let (_, out) = w.run("apply").await;
+    assert!(w.terminated().is_empty(), "{out}");
+    let attempt = |l: &String| l.ends_with("-runpod-pa-attempt");
+    let (snap, big) = (frozen_leaves(&w, "snap"), frozen_leaves(&w, "snap/big"));
+    assert!(snap.len() == 1 && attempt(&snap[0]) && big.len() == 1 && attempt(&big[0]), "{snap:?} {big:?}");
+    // The run dies at the gate instead of ending its attempt: the write-ahead stays pending.
+    store::write_ahead(&w.store(), &key, "run-that-died", Trigger::Idle, at).unwrap();
+    let cfg = w.dir.join("config.env");
+    std::fs::write(&cfg, std::fs::read_to_string(&cfg).unwrap().replace("REAP_ENABLED=0", "REAP_ENABLED=1")).unwrap();
+    // Nobody ever sent a terminate; the pod is then deleted by hand (or reclaimed by its host).
+    for (_, r) in w.fleet.backends.lock().unwrap().iter_mut() {
+        if let Ok(p) = r {
+            p.retain(|x| x.id != a.id);
+        }
+    }
+    w.tick(300);
+    w.step("observe").await;
+    assert!(w.terminated().is_empty(), "the reaper never terminated it");
+    assert!(w.state().reaped.get(&key).is_some_and(|t| t.recovered), "F2 ran");
+    for root in ["snap", "snap/big"] {
+        let leaves = frozen_leaves(&w, root);
+        assert!(
+            leaves.len() == 1 && attempt(&leaves[0]),
+            "{root}: a copy whose terminate was never sent was renamed to a reap's: {leaves:?}"
+        );
+    }
+    assert!(
+        !w.notified().iter().any(|l| l.contains("its last verified backup")),
+        "the notice vouches for an attempt's copy as the reaped pod's last backup: {:?}",
+        w.notified()
+    );
+}
