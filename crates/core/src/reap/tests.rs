@@ -188,6 +188,16 @@ fn lock_state_per_provider() {
     assert_eq!(min_obs(8 * 3600 + 1), 17);
 }
 
+/// Shadeform v1: never reaped (R3) — whatever its listing says — so no SSH, no backup, no
+/// terminate; its nonce identity isn't wired into the probe and guards yet.
+#[test]
+fn shadeform_pods_are_not_reaped_yet() {
+    let pod = Pod { provider: "shadeform".into(), identity: Some("3f0c2a8e-5b1d-4c7e-9a2f-0123456789ab".into()), ..Default::default() };
+    assert!(!judge::provider_supported(&pod, true));
+    assert_eq!(identity_condition("shadeform", "3f0c2a8e-5b1d-4c7e-9a2f-0123456789ab"), None);
+    assert_eq!(lock_state(&pod), None);
+}
+
 /// The identity guard every backup step runs behind: true only on the pod itself.
 #[cfg(target_os = "linux")]
 #[test]

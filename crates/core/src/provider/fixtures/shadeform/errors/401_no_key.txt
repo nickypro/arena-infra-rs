@@ -1,0 +1,1 @@
+Either X-Api-Key or Authorization header must be set

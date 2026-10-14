@@ -631,6 +631,8 @@ mod tests {
                 volume_gb: None,
                 delete_protected: None,
                 created_at: None,
+                identity: None,
+                status_detail: None,
             },
             Pod {
                 id: "def456".into(),

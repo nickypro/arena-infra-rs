@@ -78,6 +78,19 @@ pub struct Pod {
     /// outlives its reboots (`crate::reap`, R2-1). `None` = not reported (RunPod v1, Vast).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<u64>,
+    /// A per-create nonce the machine itself can show, where the provider exposes no id the VM
+    /// knows (Shadeform: the `arena-nonce-<uuid>` tag arena sets, which its bootstrap also writes
+    /// to `/var/lib/arena/shadeform-nonce`). For an identity check against the machine, never for
+    /// routing. `None` = none (every other backend). Never written to JSON, like `disk_gb`: `pods
+    /// list --json` stays what it was.
+    #[serde(default, skip_serializing)]
+    pub identity: Option<String>,
+    /// The provider's free-text reason for the pod's state, where it gives one (Shadeform's
+    /// `status_details`: "provider failed to launch", "preempted") — what `up` says when a new
+    /// pod goes to `ERROR` before it ever had an endpoint. `None` = not given. Never written to
+    /// JSON.
+    #[serde(default, skip_serializing)]
+    pub status_detail: Option<String>,
 }
 
 /// A provider-reported maintenance window for the host a pod runs on. Times are kept as
@@ -320,6 +333,8 @@ mod tests {
                 volume_gb: None,
                 delete_protected: None,
                 created_at: None,
+                identity: None,
+                status_detail: None,
             },
             Pod { id: "1".into(), name: "devtest-flutter".into(), provider: "hetzner".into(), ..Default::default() },
         ];
@@ -397,6 +412,17 @@ mod tests {
         assert_eq!(cuda_key("13"), Some((13, 0)));
         assert_eq!(cuda_key("13.0.1"), None);
         assert_eq!(cuda_key("new"), None);
+    }
+
+    /// Shadeform's identity nonce and status details are for arena's own checks and messages:
+    /// `pods list --json` (a scripting interface) prints exactly what it printed without them.
+    #[test]
+    fn identity_and_status_detail_never_reach_the_json() {
+        let plain = Pod { id: "u".into(), name: "devtest-alpha".into(), provider: "shadeform".into(), ..Default::default() };
+        let tagged = Pod { identity: Some("3f0c".into()), status_detail: Some("provider failed".into()), ..plain.clone() };
+        assert_eq!(serde_json::to_string(&tagged).unwrap(), serde_json::to_string(&plain).unwrap());
+        let read: Pod = serde_json::from_str(r#"{"id":"u","name":"n","provider":"shadeform","status":"RUNNING","identity":"x"}"#).unwrap();
+        assert_eq!(read.identity.as_deref(), Some("x"), "a JSON carrying it still reads");
     }
 
     /// JSON written before gpu_count/maintenance existed must still load (`#[serde(default)]`).

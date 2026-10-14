@@ -43,12 +43,12 @@ pub struct ApiBase {
 }
 
 /// The provider names `api get` takes.
-pub const PROVIDERS: &str = "runpod (follows RUNPOD_API), runpod-v1, runpod-v2, vast, hetzner";
+pub const PROVIDERS: &str = "runpod (follows RUNPOD_API), runpod-v1, runpod-v2, vast, hetzner, shadeform";
 
 /// The API base for `provider`: `runpod` is the generation `RUNPOD_API` selects (as every
 /// other command), `runpod-v1`/`runpod-v2` name one explicitly. Pure.
 pub fn api_base(provider: &str, cfg: &Config) -> Result<ApiBase> {
-    use crate::provider::{hetzner, runpod, runpod_v2, vast};
+    use crate::provider::{hetzner, runpod, runpod_v2, shadeform, vast};
     let v1 = ApiBase { provider: "runpod-v1", url: runpod::BASE, key: "RUNPOD_API_KEY" };
     let v2 = ApiBase { provider: "runpod-v2", url: runpod_v2::BASE, key: "RUNPOD_API_KEY" };
     Ok(match provider.trim().to_ascii_lowercase().as_str() {
@@ -60,8 +60,32 @@ pub fn api_base(provider: &str, cfg: &Config) -> Result<ApiBase> {
         "runpod-v2" => v2,
         "vast" => ApiBase { provider: "vast", url: vast::BASE, key: "VAST_API_KEY" },
         "hetzner" => ApiBase { provider: "hetzner", url: hetzner::BASE, key: "HETZNER_API_KEY" },
+        "shadeform" => ApiBase { provider: "shadeform", url: shadeform::BASE, key: "SHADEFORM_API_KEY" },
         other => return Err(Error::Config(format!("api get: unknown provider `{other}` (known: {PROVIDERS})"))),
     })
+}
+
+impl ApiBase {
+    /// The header the key travels in: Shadeform takes it as `X-API-KEY` (`None`: the bearer
+    /// `Authorization` header, every other API here).
+    pub fn key_header(&self) -> Option<&'static str> {
+        (self.provider == "shadeform").then_some("X-API-KEY")
+    }
+}
+
+/// Refuse `--raw` where the body carries a secret the provider itself holds for us:
+/// Shadeform's `/sshkeys` (and `/sshkeys/{id}/info`) return the managed key's **private half**
+/// — printed raw it would land in the terminal, shell history and logs. Without `--raw` the
+/// passthrough redacts it (`private_key` is a secret name). Pure.
+pub fn refuse_raw(base: &ApiBase, path: &str, raw: bool) -> Result<()> {
+    let first = path.trim().trim_start_matches('/').split(['/', '?']).next().unwrap_or("").to_ascii_lowercase();
+    if raw && base.provider == "shadeform" && first.starts_with("sshkeys") {
+        return Err(Error::Config(
+            "api get shadeform sshkeys… --raw is refused: Shadeform returns the managed SSH key's private half there —              drop --raw (it's redacted)"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Whether `p` starts with a URL scheme (`https:`, `file:`, `javascript:` …): letters, then
@@ -307,6 +331,23 @@ fn client_builder() -> reqwest::ClientBuilder {
     Client::builder().redirect(reqwest::redirect::Policy::none()).timeout(TIMEOUT)
 }
 
+/// `GET` `url` the way `base` takes its key ([`ApiBase::key_header`]; see [`get`]).
+pub async fn get_for(base: &ApiBase, url: Url, api_key: &str) -> Result<(StatusCode, String)> {
+    get_for_with(&client_builder().build()?, base, url, api_key).await
+}
+
+async fn get_for_with(client: &Client, base: &ApiBase, url: Url, api_key: &str) -> Result<(StatusCode, String)> {
+    match base.key_header() {
+        None => get_with(client, url, api_key).await,
+        Some(header) => {
+            let resp = client.get(url).header(header, api_key).header("Accept", "application/json").send().await?;
+            let status = resp.status();
+            let body = if status.is_success() { resp.text().await? } else { resp.text().await.unwrap_or_default() };
+            Ok((status, body))
+        }
+    }
+}
+
 /// `GET` `url` with the key as a bearer token (see [`client_builder`]). Returns the status
 /// and the body text — read best-effort for an error status, so the status still
 /// classifies a body that can't be read.
@@ -411,6 +452,9 @@ mod tests {
         assert_eq!(api_base("vast", &v1).unwrap(), ApiBase { provider: "vast", url: VAST, key: "VAST_API_KEY" });
         assert_eq!(api_base("hetzner", &v1).unwrap().url, "https://api.hetzner.cloud/v1");
         assert_eq!(api_base("hetzner", &v1).unwrap().key, "HETZNER_API_KEY");
+        let sf = api_base("shadeform", &v1).unwrap();
+        assert_eq!((sf.url, sf.key, sf.key_header()), ("https://api.shadeform.ai/v1", "SHADEFORM_API_KEY", Some("X-API-KEY")));
+        assert_eq!(api_base("hetzner", &v1).unwrap().key_header(), None, "bearer everywhere else");
         let e = api_base("openrouter", &v1).unwrap_err().to_string();
         assert!(e.contains("unknown provider `openrouter`") && e.contains("runpod-v2"), "{e}");
         assert!(api_base("runpod", &Config::parse("RUNPOD_API=v3")).is_err());
@@ -560,5 +604,32 @@ mod tests {
         }
         // A following client would have made that request inside `send` (and answered 200).
         assert!(elsewhere.requests.lock().unwrap().is_empty(), "the redirect was followed: {:?}", elsewhere.requests.lock().unwrap());
+    }
+
+    /// Shadeform: the key in `X-API-KEY` (no `Authorization`), and `--raw` on `sshkeys…`
+    /// refused — the body holds the managed key's private half; redacted without it.
+    #[tokio::test]
+    async fn shadeform_key_header_and_sshkeys_raw_refusal() {
+        use crate::http::test_server::{canned, serve};
+        let cfg = Config::parse("");
+        let sf = api_base("shadeform", &cfg).unwrap();
+        let srv = serve(vec![canned(200, "application/json", r#"{"instances":[]}"#)]);
+        let client = client_builder().no_proxy().build().unwrap();
+        let url = Url::parse(&format!("{}/instances", srv.base)).unwrap();
+        let (status, _) = get_for_with(&client, &sf, url, "sf-key-material").await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+        let head = srv.headers.lock().unwrap()[0].clone();
+        assert!(head.iter().any(|h| h == "x-api-key: sf-key-material"), "{head:?}");
+        assert!(!head.iter().any(|h| h.to_ascii_lowercase().starts_with("authorization")), "{head:?}");
+        for path in ["sshkeys", "/sshkeys/abc/info", "SSHKEYS?x=1"] {
+            let e = refuse_raw(&sf, path, true).unwrap_err().to_string();
+            assert!(e.contains("private half") && e.contains("drop --raw"), "{path}: {e}");
+            refuse_raw(&sf, path, false).unwrap();
+        }
+        refuse_raw(&sf, "instances", true).unwrap();
+        refuse_raw(&api_base("vast", &cfg).unwrap(), "sshkeys", true).unwrap();
+        let body = r#"{"ssh_keys":[{"id":"1","name":"Shadeform Managed Key","public_key":"ssh-rsa AAAA x","private_key":"PRIVATE-KEY-MATERIAL-MUST-NEVER-BE-PRINTED"}]}"#;
+        let out = render(StatusCode::OK, body, false, "sf-key-material").unwrap();
+        assert!(!out.contains("PRIVATE-KEY-MATERIAL") && out.contains("Shadeform Managed Key"), "{out}");
     }
 }

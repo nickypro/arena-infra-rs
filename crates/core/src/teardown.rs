@@ -33,7 +33,8 @@ pub const VOLUME_USD_PER_GB_MONTH: f64 = 0.07;
 
 /// Every provider a fleet can span, with the config key that turns it on — so a provider
 /// that isn't configured is listed as "not checked" instead of silently missing.
-pub const PROVIDER_KEYS: [(&str, &str); 3] = [("runpod", "RUNPOD_API_KEY"), ("vast", "VAST_API_KEY"), ("hetzner", "HETZNER_API_KEY")];
+pub const PROVIDER_KEYS: [(&str, &str); 4] =
+    [("runpod", "RUNPOD_API_KEY"), ("vast", "VAST_API_KEY"), ("hetzner", "HETZNER_API_KEY"), ("shadeform", "SHADEFORM_API_KEY")];
 
 /// Commands of the legacy arena-infra scripts. The playbook schedules `destroy_pods --yes
 /// <name>` with `at` at create time, so a pending job running one of these is arena's even
@@ -1255,6 +1256,7 @@ mod tests {
                 (Area::Pods, "runpod", Verdict::Clear),
                 (Area::Pods, "vast", Verdict::Skipped), // not configured: said, not failed
                 (Area::Pods, "hetzner", Verdict::Clear),
+                (Area::Pods, "shadeform", Verdict::Skipped), // likewise
                 (Area::Volumes, "runpod", Verdict::Clear),
                 (Area::Keys, "", Verdict::Clear), // another cohort's key isn't ours
                 (Area::Cron, "dev", Verdict::Clear),
@@ -1266,7 +1268,8 @@ mod tests {
         let text = r.render();
         assert!(text.contains("– pods (vast): not configured (no VAST_API_KEY) — not checked"), "{text}");
         assert!(text.contains("– at jobs (dev): `at` isn't installed here"), "{text}");
-        assert!(text.contains("ALL CLEAR: nothing left billing or scheduled (2 not applicable here — marked –)."), "{text}");
+        assert!(text.contains("– pods (shadeform): not configured (no SHADEFORM_API_KEY) — not checked"), "{text}");
+        assert!(text.contains("ALL CLEAR: nothing left billing or scheduled (3 not applicable here — marked –)."), "{text}");
         assert!(!text.contains("fix:") && !text.contains("Suggested order"), "{text}");
     }
 

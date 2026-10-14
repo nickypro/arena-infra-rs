@@ -246,22 +246,26 @@ const BURN_NOISE: f64 = 1e-9;
 // Accounts and keys
 // ---------------------------------------------------------------------------------------
 
-/// A prepaid provider account. Hetzner (postpaid) has no balance and is not one.
+/// A prepaid provider account. Hetzner (postpaid) has no balance and is not one. Shadeform is
+/// a prepaid wallet; its balance comes from an undocumented endpoint (`GET /account`), so any
+/// failure there reads as "unknown" — the estimate and `?` chain — never as $0.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Account {
     Runpod,
     Vast,
+    Shadeform,
 }
 
 impl Account {
-    pub const ALL: [Account; 2] = [Account::Runpod, Account::Vast];
+    pub const ALL: [Account; 3] = [Account::Runpod, Account::Vast, Account::Shadeform];
 
     /// The provider's name (`runpod`, `vast`), which is also how the account reads.
     pub fn name(self) -> &'static str {
         match self {
             Account::Runpod => "runpod",
             Account::Vast => "vast",
+            Account::Shadeform => "shadeform",
         }
     }
 
@@ -270,6 +274,7 @@ impl Account {
         match self {
             Account::Runpod => "RunPod",
             Account::Vast => "Vast",
+            Account::Shadeform => "Shadeform",
         }
     }
 
@@ -278,6 +283,7 @@ impl Account {
         match self {
             Account::Runpod => "RUNPOD_API_KEY",
             Account::Vast => "VAST_API_KEY",
+            Account::Shadeform => "SHADEFORM_API_KEY",
         }
     }
 
@@ -290,6 +296,7 @@ impl Account {
         match self {
             Account::Runpod => "at $0 RunPod terminates pods without a network volume (data lost)",
             Account::Vast => "at $0 Vast stops every instance",
+            Account::Shadeform => "what Shadeform does at $0 is undocumented — keep Auto Top Up on",
         }
     }
 }
@@ -1593,7 +1600,7 @@ pub enum Source {
 /// One account as every surface shows it (and `arena balance --json` prints it).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct AccountView {
-    /// `runpod`, `vast` or `hetzner`.
+    /// `runpod`, `vast`, `shadeform` or `hetzner`.
     pub account: String,
     /// `USD` or `EUR` — never summed across.
     pub currency: &'static str,
@@ -2980,9 +2987,11 @@ pub struct HttpBalanceApi {
     client: Client,
     runpod_key: Option<String>,
     vast_key: Option<String>,
+    shadeform_key: Option<String>,
     graphql_url: String,
     v2_base: String,
     vast_base: String,
+    shadeform_base: String,
     /// The backup archive's own Hetzner project (its token, else the fleet's) and this
     /// cohort's names: priced for Hetzner's row only.
     archive: Option<(crate::archive::HetznerArchiveCloud, crate::archive::ArchiveNames)>,
@@ -2996,9 +3005,11 @@ impl HttpBalanceApi {
             client: Client::new(),
             runpod_key: key(Account::Runpod),
             vast_key: key(Account::Vast),
+            shadeform_key: key(Account::Shadeform),
             graphql_url: crate::provider::runpod::GRAPHQL.to_string(),
             v2_base: crate::provider::runpod_v2::BASE.to_string(),
             vast_base: crate::provider::vast::BASE.to_string(),
+            shadeform_base: crate::provider::shadeform::BASE.to_string(),
             archive: crate::archive::archive_token(cfg).zip(crate::archive::ArchiveNames::from_config(cfg).ok()).map(
                 |((token, _), names)| (crate::archive::HetznerArchiveCloud::new(token), names),
             ),
@@ -3014,17 +3025,28 @@ impl HttpBalanceApi {
             client: crate::http::test_server::client(),
             runpod_key: runpod_key.map(String::from),
             vast_key: vast_key.map(String::from),
+            shadeform_key: None,
             graphql_url: graphql_url.into(),
             v2_base: v2_base.into(),
             vast_base: vast_base.into(),
+            shadeform_base: String::new(),
             archive: None,
         }
+    }
+
+    /// The same reads, with Shadeform's `/account` on a loopback server.
+    #[cfg(test)]
+    fn with_shadeform(mut self, base: &str, key: &str) -> Self {
+        self.shadeform_base = base.into();
+        self.shadeform_key = Some(key.into());
+        self
     }
 
     fn key(&self, a: Account) -> Option<&str> {
         match a {
             Account::Runpod => self.runpod_key.as_deref(),
             Account::Vast => self.vast_key.as_deref(),
+            Account::Shadeform => self.shadeform_key.as_deref(),
         }
     }
 
@@ -3083,6 +3105,32 @@ impl BalanceApi for HttpBalanceApi {
                         _ => f,
                     })
                     .and_then(|v| parse_vast_user(&v))
+            }
+            Account::Shadeform => {
+                // Undocumented, and its body carries the account's email, phone, tax id and
+                // address: read as text, typed at once into the money fields alone
+                // (`shadeform::parse_account`), never quoted — an error status keeps its kind
+                // and code only.
+                let rb = crate::provider::shadeform::account_request(&self.client, &self.shadeform_base, key);
+                match crate::http::send_text(rb).await {
+                    Err(_) => Err(Fail::transient("no answer (network error)")),
+                    Ok((status, _)) if !status.is_success() => Err(match classify(status.as_u16(), "") {
+                        Err(f) => Fail { detail: None, ..f },
+                        Ok(_) => Fail::new(FailKind::Drift, Some(status.as_u16()), "unexpected status"),
+                    }),
+                    Ok((_, text)) => match crate::provider::shadeform::parse_account(&text) {
+                        Ok((usd, burn)) if in_range(usd) && in_range(burn) && burn >= 0.0 => Ok(Live {
+                            usd,
+                            provider_burn_per_hr: Some(burn),
+                            spend_limit_per_hr: None,
+                            under_balance: None,
+                            reduced: false,
+                            owed: None,
+                        }),
+                        Ok(_) => Err(Fail::new(FailKind::Drift, None, "GET /account: a balance or burn out of range")),
+                        Err(why) => Err(Fail::new(FailKind::Drift, None, why)),
+                    },
+                }
             }
         }
     }
@@ -3148,8 +3196,8 @@ pub async fn observe(api: &dyn BalanceApi, state: &BalanceState, mode: Mode, lim
             Some(observe_one(api, a, fp.clone(), st, mode, deadline, now).await)
         }
     };
-    let (runpod, vast) = tokio::join!(one(Account::Runpod), one(Account::Vast));
-    [runpod, vast].into_iter().flatten().collect()
+    let (runpod, vast, shadeform) = tokio::join!(one(Account::Runpod), one(Account::Vast), one(Account::Shadeform));
+    [runpod, vast, shadeform].into_iter().flatten().collect()
 }
 
 /// [`observe`] for one account (the `create`/`up` preflight, which concerns only the target
@@ -4545,6 +4593,55 @@ mod tests {
         )
     }
 
+    /// Shadeform's wallet, from its undocumented `GET /account`: the key in `X-API-KEY` (never
+    /// bearer, never the URL); the balance and the account's own burn read. The endpoint gone
+    /// (404), a changed shape, an outage: a failure of the right kind — and the body (the
+    /// account's email, phone, tax id, address) is never in it.
+    #[tokio::test]
+    async fn shadeform_balance_is_read_from_its_account_endpoint() {
+        let pii = r#""email":"someone@example.invalid","phone_number":"+1 555 0100","tax_id":"T-1","address":"1 Way""#;
+        let srv = serve(vec![
+            canned(200, "application/json", &format!(r#"{{"id":"x","tier":"free","balance":"12.50","hourly_burn":"0.57",{pii}}}"#)),
+            canned(404, "text/plain", "404 page not found"),
+            canned(200, "application/json", &format!("{{{pii}}}")),
+            canned(503, "text/plain", "someone@example.invalid"),
+            canned(401, "text/plain", "Unauthorized"),
+        ]);
+        let (gql, v2, vast) = (serve(vec![]), serve(vec![]), serve(vec![]));
+        let api = api_at(&gql, &v2, &vast).with_shadeform(&srv.base, "sf-key-material");
+        assert!(api.accounts().iter().any(|(a, _)| *a == Account::Shadeform));
+        let l = api.live(Account::Shadeform).await.unwrap();
+        assert_eq!((l.usd, l.provider_burn_per_hr), (12.5, Some(0.57)));
+        for (kind, http) in [(FailKind::Gone, Some(404)), (FailKind::Drift, None), (FailKind::Transient, Some(503)), (FailKind::Auth, Some(401))] {
+            let f = api.live(Account::Shadeform).await.unwrap_err();
+            assert_eq!((f.kind, f.http), (kind, http), "{f:?}");
+            assert!(!format!("{f:?}").contains("someone") && !format!("{f:?}").contains("555"), "{f:?}");
+        }
+        assert!(srv.requests.lock().unwrap().iter().all(|l| l == "GET /account HTTP/1.1"));
+        for h in srv.headers.lock().unwrap().iter() {
+            assert!(h.iter().any(|l| l == "x-api-key: sf-key-material"), "{h:?}");
+            assert!(!h.iter().any(|l| l.to_ascii_lowercase().starts_with("authorization")), "{h:?}");
+        }
+        // Not configured: not an account, no request.
+        assert!(!api_at(&gql, &v2, &vast).accounts().iter().any(|(a, _)| *a == Account::Shadeform));
+        assert_eq!(Account::from_name("Shadeform"), Some(Account::Shadeform));
+        assert!(Account::Shadeform.at_zero().contains("undocumented"));
+    }
+
+    /// A failed `/account` read is "balance unknown" — never $0, never a failure of what shows
+    /// it (the view is still made, with no balance).
+    #[test]
+    fn a_failed_shadeform_balance_is_unknown_not_zero() {
+        let v = views(&BalanceState::default(), &[fetched(Account::Shadeform, Some(Err(gone())), None)], &Burns::new(), &policy(), Mode::Inline, NOW)
+            .remove(0);
+        assert_eq!(v.account, "shadeform");
+        assert_eq!(v.balance, None, "unknown, not 0");
+        assert_eq!(v.source, Source::Unknown);
+        let ok = views(&BalanceState::default(), &[fetched(Account::Shadeform, Some(Ok(live(8.0, Some(0.57)))), None)], &Burns::new(), &policy(), Mode::Inline, NOW)
+            .remove(0);
+        assert_eq!(ok.balance, Some(8.0));
+    }
+
     fn bodies(s: &Server) -> Vec<Value> {
         s.bodies.lock().unwrap().iter().map(|b| serde_json::from_str(b).unwrap_or(Value::Null)).collect()
     }
@@ -4814,7 +4911,7 @@ mod tests {
     fn record_merges_concurrent_writers() {
         let dir = tmp("concurrent");
         let path = dir.0.join("devtest").join(crate::snapshot::BALANCE_FILE);
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(Account::ALL.len()));
         let writers: Vec<_> = Account::ALL
             .into_iter()
             .map(|a| {

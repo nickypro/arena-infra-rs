@@ -107,6 +107,8 @@ fn sandbox_pod(name: &str) -> Pod {
         volume_gb: Some(0.0),
         delete_protected: None,
         created_at: Some(1_791_452_013),
+        identity: None,
+        status_detail: None,
     }
 }
 

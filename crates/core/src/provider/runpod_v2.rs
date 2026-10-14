@@ -433,6 +433,8 @@ fn parse_pod(v: &Value) -> Pod {
         delete_protected: None,
         // `createdAt` (`2026-10-08T09:33:33.607Z`).
         created_at: s("createdAt").as_deref().and_then(crate::reap::parse_rfc3339).and_then(|t| u64::try_from(t).ok()),
+        identity: None,
+        status_detail: None,
     }
 }
 
@@ -1118,6 +1120,8 @@ mod tests {
                 volume_gb: Some(20.0),
                 delete_protected: None,
                 created_at: Some(1_780_315_200),
+                identity: None,
+                status_detail: None,
             }
         );
     }

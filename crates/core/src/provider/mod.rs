@@ -13,6 +13,7 @@ pub mod hetzner;
 pub mod multi;
 pub mod runpod;
 pub mod runpod_v2;
+pub mod shadeform;
 pub mod vast;
 
 pub use multi::build_fleet;
@@ -111,8 +112,10 @@ pub fn build(name: &str, cfg: &Config) -> Result<Box<dyn Provider>> {
                 opts,
             )))
         }
+        // Opt-in overflow only (`--provider shadeform`): never in the default plan chain.
+        "shadeform" => Ok(Box::new(shadeform::ShadeformProvider::from_config(cfg)?)),
         other => Err(Error::Config(format!(
-            "unknown provider `{other}` (known: runpod, vast, hetzner)"
+            "unknown provider `{other}` (known: runpod, vast, hetzner, shadeform)"
         ))),
     }
 }
@@ -335,6 +338,25 @@ pub trait Provider: Send + Sync {
         } else {
             ContainerReset::No
         }
+    }
+
+    /// Whether `pod`'s backend can stop it (and start it again) at all; `Err` says why not, in
+    /// the operator's words. Pure: `pods stop`/`start` refuse a selection with such a pod up
+    /// front, before any gate or prompt — a `--wipe-ok` gate would only mislead about a pod
+    /// that can't be stopped. Default: it can (RunPod, Vast, Hetzner). Shadeform has no stop:
+    /// an instance bills until it's deleted.
+    fn stop_support(&self, _pod: &Pod) -> Result<()> {
+        Ok(())
+    }
+
+    /// How long a pod this backend just created may take to come up — listed with an SSH
+    /// endpoint — before `pods up` counts it as a failed placement: terminated (it bills, and
+    /// nothing is on it yet) and the name tried again on the next option. `None` (the default):
+    /// `up --timeout` bounds the wait, and a pod still without an endpoint then is left running
+    /// for a look. Shadeform: `SHADEFORM_READY_MINS` — its instances can sit in a pending state
+    /// for long, billed or not (unverified).
+    fn ready_deadline(&self, _pod: &Pod) -> Option<std::time::Duration> {
+        None
     }
 
     /// Mutating. Start a stopped pod again (same id): RunPod's `start` (REST v1 `POST

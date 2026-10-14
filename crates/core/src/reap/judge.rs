@@ -181,7 +181,9 @@ pub struct GateCtx<'a> {
 }
 
 /// Whether reaping supports `pod`'s provider (R3): RunPod on REST v2, Hetzner. Never Vast (no
-/// lock state, no verified identity) or RunPod on v1.
+/// lock state, no verified identity) or RunPod on v1 — nor Shadeform yet: its identity is a
+/// per-create nonce (`Pod::identity`, the VM's `/var/lib/arena/shadeform-nonce`) that the
+/// probe and the identity guards don't read yet.
 pub fn provider_supported(pod: &Pod, runpod_v2: bool) -> bool {
     match pod.provider.as_str() {
         "runpod" => runpod_v2,

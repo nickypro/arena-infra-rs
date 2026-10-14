@@ -233,7 +233,7 @@ pub fn why_label(row: Row, reasons: &[Reason]) -> String {
     match row {
         Row::NoPolicy => "no policy",
         Row::ListingFailed => "its provider's listing failed",
-        Row::ProviderUnsupported => "provider not supported (Vast; RunPod needs RUNPOD_API=v2)",
+        Row::ProviderUnsupported => "provider not supported (Vast, Shadeform; RunPod needs RUNPOD_API=v2)",
         Row::NotOnList => "not a MACHINE_NAME_LIST machine",
         Row::DuplicateOrTwin => "name shared, or a -old/-new twin listed",
         Row::NameMismatch => "listed under another name than its policy's",

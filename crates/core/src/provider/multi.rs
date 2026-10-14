@@ -26,8 +26,9 @@ use crate::error::{Error, Result};
 use crate::pod::{Pod, PodSpec};
 use crate::provider::{build, ContainerReset, Provider, StopOutcome};
 
-/// The known backends, in the order they're listed/built.
-const KNOWN: [&str; 3] = ["runpod", "vast", "hetzner"];
+/// The known backends, in the order they're listed/built. `shadeform` is opt-in overflow: it
+/// joins the fleet's listing when `SHADEFORM_API_KEY` is set, and creates only when chosen.
+const KNOWN: [&str; 4] = ["runpod", "vast", "hetzner", "shadeform"];
 
 pub struct MultiProvider {
     backends: Vec<Box<dyn Provider>>,
@@ -189,6 +190,13 @@ impl Provider for MultiProvider {
         // gated as a wipe but never claimed.
         self.owner_of(pod).map_or(ContainerReset::Unknown, |i| self.backends[i].restart_resets_container(pod))
     }
+    fn stop_support(&self, pod: &Pod) -> Result<()> {
+        // The owner's answer; a pod no backend claims is the stop's own error later.
+        self.owner_of(pod).map_or(Ok(()), |i| self.backends[i].stop_support(pod))
+    }
+    fn ready_deadline(&self, pod: &Pod) -> Option<std::time::Duration> {
+        self.owner_of(pod).and_then(|i| self.backends[i].ready_deadline(pod))
+    }
     fn lock_support(&self, pod: &Pod) -> Result<()> {
         match self.owner_of(pod) {
             Some(i) => self.backends[i].lock_support(pod),
@@ -248,6 +256,9 @@ pub fn build_fleet(primary: &str, cfg: &Config, warn_on_partial: bool) -> Result
     // Validate RUNPOD_API up front: a non-primary backend is built best-effort below, so
     // a typo there would otherwise silently drop RunPod from the fleet instead of erroring.
     crate::provider::RunpodApi::from_config(cfg)?;
+    // Likewise every SHADEFORM_* option (spec gap 10): a typo there must fail the fleet, not
+    // make every Shadeform instance vanish from `pods list` while it keeps billing.
+    crate::provider::shadeform::ShadeformOpts::from_config(cfg)?;
     let mut backends: Vec<Box<dyn Provider>> = Vec::new();
     let mut primary_idx = None;
     for name in KNOWN {
@@ -270,6 +281,22 @@ pub fn build_fleet(primary: &str, cfg: &Config, warn_on_partial: bool) -> Result
         warn_on_partial,
         list_timeout: crate::provider::LIST_TIMEOUT,
     }))
+}
+
+/// A fleet of exactly these backends (the first one primary), for other modules' tests.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use super::*;
+
+    pub(crate) fn fleet_of(backends: Vec<Box<dyn Provider>>) -> MultiProvider {
+        MultiProvider {
+            backends,
+            primary: 0,
+            owner: std::sync::Mutex::new(std::collections::HashMap::new()),
+            warn_on_partial: false,
+            list_timeout: crate::provider::LIST_TIMEOUT,
+        }
+    }
 }
 
 #[cfg(test)]

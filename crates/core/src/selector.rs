@@ -36,7 +36,7 @@ use crate::naming::{canonical_name, is_absolute, qualify, ABSOLUTE_MARKER};
 use crate::pod::Pod;
 
 /// The providers `--on` accepts (the `provider` tag each backend puts on its pods).
-pub const PROVIDERS: [&str; 3] = ["runpod", "vast", "hetzner"];
+pub const PROVIDERS: [&str; 4] = ["runpod", "vast", "hetzner", "shadeform"];
 
 /// The reserved token meaning "every pod" (same as `--all`).
 pub const ALL: &str = "all";
@@ -720,7 +720,7 @@ mod tests {
             assert_eq!(ok(a), *want, "{a:?}");
         }
         let e = err(&SelectArgs { on: Some("aws".into()), ..Default::default() });
-        assert_eq!(e, "--on `aws`: not a provider (one of runpod, vast, hetzner)");
+        assert_eq!(e, "--on `aws`: not a provider (one of runpod, vast, hetzner, shadeform)");
     }
 
     #[test]
