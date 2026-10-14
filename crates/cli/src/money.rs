@@ -223,7 +223,7 @@ pub(crate) async fn balance_report(
     Ok(Printed { stdout, stderr, code })
 }
 
-/// `arena balance set <runpod|vast> <USD>`: record the balance read off the provider's
+/// `arena balance set <runpod|vast|shadeform> <USD>`: record the balance read off the provider's
 /// console as a manual anchor — the escape hatch when every API is dead. A local write (no
 /// confirm), scoped by the configured key's fingerprint; the next live reading replaces it.
 pub(crate) fn balance_set(cfg: &Config, bal: &BalanceCtx, account: Account, usd: f64, now: u64) -> Result<String> {

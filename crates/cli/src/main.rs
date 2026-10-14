@@ -23,6 +23,8 @@ use arena_core::{Config, PodSpec};
 
 mod archive;
 #[cfg(test)]
+mod gpu_vm_setup_tests;
+#[cfg(test)]
 mod hetzner_setup_tests;
 mod jobs;
 mod money;
@@ -47,7 +49,8 @@ struct Cli {
     #[arg(long, default_value = DEFAULT_CONFIG, global = true)]
     config: PathBuf,
 
-    /// Compute provider to target.
+    /// Compute provider to target: runpod, vast, hetzner or shadeform (opt-in overflow GPU VMs:
+    /// they bill until terminated — there's no stop).
     #[arg(long, default_value = "runpod", global = true)]
     provider: String,
 
@@ -291,7 +294,7 @@ struct SelectOpts {
     /// never matches).
     #[arg(long, value_name = "N")]
     gpus: Option<u32>,
-    /// Only pods on this provider: runpod, vast or hetzner. (Not `--provider`, which picks
+    /// Only pods on this provider: runpod, vast, hetzner or shadeform. (Not `--provider`, which picks
     /// where `create`/`up` make pods.)
     #[arg(long, value_name = "PROVIDER")]
     on: Option<String>,
@@ -359,7 +362,7 @@ enum BalanceCmd {
     /// every balance API is dead. Estimates count down from it until the next live reading
     /// replaces it. A local write, scoped to the configured key's account; no confirm.
     Set {
-        /// `runpod` or `vast` (Hetzner is postpaid: nothing to set).
+        /// `runpod`, `vast` or `shadeform` (Hetzner is postpaid: nothing to set).
         #[arg(value_parser = parse_balance_account)]
         account: arena_core::balance::Account,
         /// The balance in USD, e.g. 250 or 31.20 (may be negative).
@@ -374,7 +377,7 @@ fn parse_balance_account(s: &str) -> std::result::Result<arena_core::balance::Ac
         if s.trim().eq_ignore_ascii_case("hetzner") {
             "hetzner is postpaid — there is no balance to set".to_string()
         } else {
-            format!("`{s}` isn't a prepaid account (runpod or vast)")
+            format!("`{s}` isn't a prepaid account (runpod, vast or shadeform)")
         }
     })
 }
@@ -384,16 +387,18 @@ enum ApiCmd {
     /// GET one path from a provider's API and print the response (pretty JSON). Read-only:
     /// GET is the only verb there is.
     ///
-    /// PROVIDER: runpod (follows RUNPOD_API), runpod-v1, runpod-v2, vast or hetzner. PATH is
-    /// relative to that API's base — e.g. `pods`, `pods/<id>`, `catalog/datacenters`,
+    /// PROVIDER: runpod (follows RUNPOD_API), runpod-v1, runpod-v2, vast, hetzner or shadeform.
+    /// PATH is relative to that API's base — e.g. `pods`, `pods/<id>`, `catalog/datacenters`,
     /// `network-volumes`, `billing/pods` (RunPod v2); `instances/`, `users/current/` (Vast);
-    /// `servers`, `locations` (Hetzner). Absolute URLs, `//host`, `..` and `#` are refused and
-    /// redirects aren't followed, so the configured key only ever goes to the provider (in
-    /// the Authorization header). Secrets — env values, keys, tokens (`rpa_…`, `sk-…`,
-    /// `hf_…`), SSH key material — are redacted unless --raw; the API key itself never prints.
+    /// `servers`, `locations` (Hetzner); `instances`, `instances/types` (Shadeform). Absolute
+    /// URLs, `//host`, `..` and `#` are refused and redirects aren't followed, so the configured
+    /// key only ever goes to the provider (in the Authorization header; Shadeform's X-API-KEY).
+    /// Secrets — env values, keys, tokens (`rpa_…`, `sk-…`, `hf_…`), SSH key material — are
+    /// redacted unless --raw; the API key itself never prints. `--raw` on Shadeform's
+    /// `sshkeys` is refused (it returns the managed key's private half).
     #[command(verbatim_doc_comment)]
     Get {
-        /// runpod, runpod-v1, runpod-v2, vast or hetzner.
+        /// runpod, runpod-v1, runpod-v2, vast, hetzner or shadeform.
         provider: String,
         /// Path under the provider's API base, e.g. `pods` (a query string is fine).
         path: String,
@@ -926,7 +931,9 @@ enum PodCmd {
         /// With --check: placements per name in total, the first create included (2 = one
         /// replacement). A pod that FAILs the check on its last attempt is left running for a
         /// look; one that lands on a machine that already failed is terminated even then (it
-        /// was never set up, and its host is known bad).
+        /// was never set up, and its host is known bad). Also, with or without --check, how often
+        /// a pod that never came up is replaced (Shadeform: listed `error`, or not up within
+        /// SHADEFORM_READY_MINS — always terminated: it may bill).
         #[arg(long, default_value_t = 2, requires = "check", value_parser = clap::value_parser!(u32).range(1..=10))]
         check_attempts: u32,
         /// Ignore the machines earlier `up --check`s remember as bad (for 72 h — `config check`
@@ -1703,6 +1710,12 @@ impl Provider for RecordingProvider<'_> {
     async fn start_pod(&self, id: &str) -> arena_core::Result<()> {
         self.inner.start_pod(id).await
     }
+    fn stop_support(&self, pod: &arena_core::Pod) -> arena_core::Result<()> {
+        self.inner.stop_support(pod)
+    }
+    fn ready_deadline(&self, pod: &arena_core::Pod) -> Option<Duration> {
+        self.inner.ready_deadline(pod)
+    }
     async fn terminate_pod(&self, id: &str) -> arena_core::Result<()> {
         self.inner.terminate_pod(id).await
     }
@@ -1738,6 +1751,13 @@ impl Provider for RecordingProvider<'_> {
 /// Warn (on a GPU provider) when pods would be created with no persistent volume —
 /// container disk is wiped on restart, so uncommitted work would be lost.
 fn warn_no_volume(provider: &dyn Provider, spec: &PodSpec) {
+    if provider.name() == "shadeform" {
+        // No volumes there (VOLUME_GB > 0 is refused at create), and no stop: say both.
+        eprintln!(
+            "⚠ Shadeform: no persistent volume and no stop — work survives only through backups              (`arena pods backup`), and each VM bills until it's terminated."
+        );
+        return;
+    }
     if spec.volume_gb == 0 && provider.name() != "hetzner" {
         eprintln!(
             "⚠ no persistent volume (VOLUME_GB=0): work is lost when a pod restarts. \
@@ -2509,6 +2529,14 @@ fn gpu_flag_or_warning(
 async fn checked_gpu(cfg: &Config, provider_name: &str, gpu: Option<String>) -> Result<Option<String>> {
     use arena_core::provider::{runpod, RunpodApi};
     let Some(raw) = gpu else { return Ok(None) };
+    if provider_name == "shadeform" {
+        // Shadeform answers an unknown GPU name with an empty catalog (read as "no stock"
+        // forever): every token must map to one of its types, checked here before anything.
+        for token in arena_core::placement::split_list(&raw) {
+            arena_core::provider::shadeform::shadeform_gpu_type(&arena_core::gpu::resolve(&token))?;
+        }
+        return Ok(Some(raw));
+    }
     if provider_name != "runpod" {
         return Ok(Some(raw));
     }
@@ -2561,7 +2589,9 @@ fn v1_creatable_check(ids: &str, catalog: &[arena_core::provider::runpod::GpuTyp
 /// is per tier; each tier fetched once per run, see [`v2_catalog`]) and no GraphQL; on v1 the
 /// GraphQL `gpuTypes` (Phase 0.D) — backed by the preset estimates. Vast: the cheapest offer
 /// fitting `base` (disk, CUDA floor) per GPU option, one marketplace search per card, each
-/// bounded by [`PRICE_TIMEOUT`]. Hetzner quotes nothing.
+/// bounded by [`PRICE_TIMEOUT`]. Shadeform: the cheapest in-stock catalog entry per option
+/// (allowed clouds, CUDA floor, `SHADEFORM_MAX_PRICE`), from one catalog read. Hetzner quotes
+/// nothing.
 async fn fetch_price_book(
     cfg: &Config,
     provider_name: &str,
@@ -2582,6 +2612,18 @@ async fn fetch_price_book(
         let vast = vast::VastProvider::from_config(cfg)?;
         let quotes = vast.quote(&req.gpus, &spec, PRICE_TIMEOUT).await;
         return Ok(vast::price_book(&quotes, req.gpu_count, vast.verified_only()));
+    }
+    if provider_name == "shadeform" {
+        if cfg.get("SHADEFORM_API_KEY").is_none_or(str::is_empty) {
+            let note = "no SHADEFORM_API_KEY — shadeform options are unpriced (--max-price can't check them)";
+            return Ok((PriceBook::unpriced(), vec![note.into()]));
+        }
+        // One catalog read for every option; built as create builds it, so the plan only
+        // quotes clouds, images and prices create would take.
+        let spec = PodSpec { gpu_count: req.gpu_count, ..base.clone() };
+        let sf = arena_core::provider::shadeform::ShadeformProvider::from_config(cfg)?;
+        let quotes = sf.quote(&req.gpus, &spec, PRICE_TIMEOUT).await;
+        return Ok(arena_core::provider::shadeform::price_book(&quotes, req.gpu_count, sf.opts()));
     }
     if provider_name != "runpod" {
         let note = format!(
@@ -2970,12 +3012,13 @@ async fn handle_api(cmd: ApiCmd, cfg: &Config) -> Result<()> {
         ApiCmd::Get { provider, path, raw } => {
             let base = apiget::api_base(&provider, cfg)?;
             let url = apiget::resolve_url(base.url, &path)?;
+            apiget::refuse_raw(&base, &path, raw)?;
             let key = cfg
                 .get(base.key)
                 .filter(|k| !k.trim().is_empty())
                 .ok_or_else(|| anyhow::anyhow!("{} isn't set (see `arena config check`)", base.key))?;
             eprintln!("GET {url} ({}{})", base.provider, if raw { ", raw" } else { ", secrets redacted" });
-            let (status, body) = apiget::get(url, key).await?;
+            let (status, body) = apiget::get_for(&base, url, key).await?;
             let out = apiget::render(status, &body, raw, key)?;
             if !out.is_empty() {
                 println!("{out}");
@@ -3095,8 +3138,8 @@ async fn handle_offers(
     order: arena_core::placement::Order,
     json: bool,
 ) -> Result<()> {
-    if !["runpod", "vast", "hetzner"].contains(&provider_name) {
-        anyhow::bail!("unknown provider `{provider_name}` (known: runpod, vast, hetzner)");
+    if !["runpod", "vast", "hetzner", "shadeform"].contains(&provider_name) {
+        anyhow::bail!("unknown provider `{provider_name}` (known: runpod, vast, hetzner, shadeform)");
     }
     let gpu = checked_gpu(cfg, provider_name, gpu).await?;
     let base = spec_with_overrides(cfg, &SpecOverrides { gpus, ..Default::default() });
@@ -3442,8 +3485,8 @@ fn setup_config(
     Ok((scfg, line))
 }
 
-/// Bare-VM (hetzner) pods scp [`HETZNER_SETUP`]; write it once to a temp file and return
-/// its path — only when `needed` (a hetzner pod is in the target set): a runpod-only setup
+/// Bare-VM pods (hetzner, shadeform: `setup::is_bare_vm`) scp [`HETZNER_SETUP`]; write it once
+/// to a temp file and return its path — only when `needed` (such a pod is in the target set): a runpod-only setup
 /// (e.g. `replace`) needs no hetzner script, and writing one is pure overhead (`""` then).
 /// The filename carries the pid so concurrent runs (or another user's run) never collide on
 /// a fixed path and hit EACCES overwriting a file they don't own.
@@ -3512,7 +3555,7 @@ async fn handle_setup(
         return Ok(());
     }
 
-    let hetzner_script = stage_hetzner_script(targets.iter().any(|(_, prov, _)| prov == "hetzner"))?;
+    let hetzner_script = stage_hetzner_script(targets.iter().any(|(_, prov, _)| arena_core::setup::is_bare_vm(prov)))?;
 
     if !apply {
         // Redact broadcast token values in the *previewed* command — the dry-run prints
@@ -4521,6 +4564,7 @@ const SETTABLE_KEYS: &[(&str, bool)] = &[
     ("RUNPOD_API_KEY", true),
     ("VAST_API_KEY", true),
     ("HETZNER_API_KEY", true),
+    ("SHADEFORM_API_KEY", true), // opt-in overflow GPU VMs (`--provider shadeform`)
     ("HF_TOKEN", true), // broadcast to pods for gated repos (Llama 3 …)
     ("CLAUDE_CODE_OAUTH_TOKEN", true), // broadcast to pods for Claude Code access
     ("OPENROUTER_PROVISIONING_KEY", true), // mints per-machine OpenRouter keys (`arena keys`)
@@ -4789,6 +4833,64 @@ fn vast_hosts_row(cfg: &Config) -> (String, bool) {
     }
 }
 
+/// `config check`'s Shadeform rows — its options as the provider reads them (no request: the
+/// SSH key's presence on the account is checked at create) — and the refusal when one is
+/// invalid (its ✗ row says which; the whole check then fails). Pure, for testing. Never shows
+/// the API key, and an invalid value is described, never echoed when long.
+fn shadeform_rows(cfg: &Config) -> (Vec<String>, Option<arena_core::Error>) {
+    use arena_core::provider::shadeform::{Clouds, ShadeformOpts, DEFAULT_KEY};
+    let o = match ShadeformOpts::from_config(cfg) {
+        Ok(o) => o,
+        Err(e) => {
+            let why = match &e {
+                arena_core::Error::Config(m) => m.clone(),
+                other => other.to_string(),
+            };
+            return (vec![format!("  ✗ SHADEFORM_*                  {why}")], Some(e));
+        }
+    };
+    let set = |k: &str| cfg.get(k).is_some_and(|v| !v.trim().is_empty());
+    let default = |k: &str| if set(k) { "" } else { " (default)" };
+    let mut out = Vec::new();
+    out.push(match &o.clouds {
+        Clouds::All => "  ⚠ SHADEFORM_CLOUDS             * — any cloud: ports, images, drivers and boot times differ per cloud;                         widen one cloud at a time after a live test"
+            .to_string(),
+        Clouds::Only(c) => format!("  ✓ SHADEFORM_CLOUDS             {}{}", c.join(", "), default("SHADEFORM_CLOUDS")),
+    });
+    out.push(if o.regions.is_empty() {
+        "  · SHADEFORM_REGIONS            (any region)".to_string()
+    } else {
+        format!("  ✓ SHADEFORM_REGIONS            {}", o.regions.join(", "))
+    });
+    out.push(format!(
+        "  ✓ SHADEFORM_MAX_PRICE          {}/h per pod{} — the ceiling under any --max-price",
+        arena_core::fleet::fmt_money("$", o.max_price),
+        default("SHADEFORM_MAX_PRICE")
+    ));
+    out.push(if o.ssh_key == DEFAULT_KEY {
+        "  ⚠ SHADEFORM_SSH_KEY            default — the account's default key (on a new account the Shadeform          Managed Key, whose private half Shadeform holds and returns to any API key holder)"
+            .to_string()
+    } else {
+        format!(
+            "  ✓ SHADEFORM_SSH_KEY            {}{} (must be uploaded to the Shadeform account under that name — checked at create)",
+            o.ssh_key,
+            default("SHADEFORM_SSH_KEY")
+        )
+    });
+    out.push(format!("  · SHADEFORM_MAX_BOOT_SECS      {}{}", o.max_boot_secs, default("SHADEFORM_MAX_BOOT_SECS")));
+    out.push(format!("  · SHADEFORM_READY_MINS         {}{}", o.ready_mins, default("SHADEFORM_READY_MINS")));
+    out.push(format!(
+        "  · SHADEFORM_ALLOW_BAREMETAL    {}{}",
+        if o.allow_baremetal { "yes" } else { "no" },
+        default("SHADEFORM_ALLOW_BAREMETAL")
+    ));
+    out.push(
+        "      └ shadeform: no stop (a VM bills until terminated), no volumes; what happens at a $0 wallet is          undocumented — keep Auto Top Up on"
+            .to_string(),
+    );
+    (out, None)
+}
+
 /// Print a config checklist for the selected provider + proxy + backup, never showing
 /// secret values. Returns an error if a required key is missing.
 fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
@@ -4829,6 +4931,7 @@ fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<String>) {
         ("runpod", "RUNPOD_API_KEY"),
         ("vast", "VAST_API_KEY"),
         ("hetzner", "HETZNER_API_KEY"),
+        ("shadeform", "SHADEFORM_API_KEY"),
     ] {
         let selected = name == provider_name;
         let set = cfg.get(key).map(|v| !v.is_empty()).unwrap_or(false);
@@ -4856,6 +4959,16 @@ fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<String>) {
         println!("{line}");
         if !ok {
             missing.push("VAST_ALLOW_UNVERIFIED (must be 1/true/yes or 0/false/no)".into());
+        }
+    }
+    let shadeform_in_play = provider_name == "shadeform"
+        || cfg.get("SHADEFORM_API_KEY").is_some_and(|v| !v.is_empty())
+        || arena_core::provider::shadeform::OPTION_KEYS.iter().any(|k| cfg.get(k).is_some());
+    if shadeform_in_play {
+        let (lines, bad) = shadeform_rows(cfg);
+        lines.iter().for_each(|l| println!("{l}"));
+        if let Some(e) = bad {
+            note_invalid(&mut missing, &e);
         }
     }
     if provider_name == "hetzner" {
@@ -6656,7 +6769,7 @@ async fn handle_pods_bal(
             } else {
                 let (scfg, tokens) =
                     setup_config(cfg, None, None, false, false).context("provisioning settings (or pass --no-setup)")?;
-                let hetzner_script = stage_hetzner_script(provider.name() == "hetzner")?;
+                let hetzner_script = stage_hetzner_script(arena_core::setup::is_bare_vm(provider.name()))?;
                 Some((up::SetupStage { scfg, timeouts: setup_timeouts, hetzner_script }, tokens))
             };
 
@@ -6757,6 +6870,7 @@ async fn handle_pods_bal(
                 retry_bad_hosts,
                 balance: Some(bal),
                 reap_notice: reaping.is_some(),
+                placements: check_attempts,
             };
             println!(
                 "\nEach pod is brought up on its own the moment it's created (endpoint wait ≤{timeout}s per pod; \
@@ -6811,6 +6925,11 @@ async fn handle_pods_bal(
 
         PodCmd::Stop { sel, wipe_ok, dry_run } => {
             let sel = select(provider, cfg, &sel.args(), Unscoped::Refuse("stop")).await?;
+            // A pod whose backend has no stop (Shadeform: it bills until deleted) refuses the
+            // whole batch up front — before the --wipe-ok gate, which would only mislead.
+            if let Some(r) = stop_refusal(provider, sel.pods.iter(), "stop") {
+                anyhow::bail!("{r}");
+            }
             // Every selected pod that's billing is stopped — not just RUNNING: RunPod v2
             // reports real states, and a PROVISIONING/STARTING pod bills too (one status rule
             // for this, the $/H column and the fleet total: `status::is_billing`). A selected
@@ -8002,6 +8121,25 @@ async fn handle_reimage(
 /// synced. A Hetzner VM kept its disk: only the sync. Pods that aren't stopped are said and
 /// left alone. A start the provider refuses (e.g. its host has no free GPU left) is
 /// reported per pod and fails the exit; the others carry on.
+/// Why `pods stop`/`start` (`what`) refuses this selection, if it does: a pod whose backend
+/// has no stop at all ([`Provider::stop_support`] — Shadeform: an instance bills until it's
+/// deleted, so there's nothing to stop or start; terminate it after a backup instead). The
+/// whole selection is refused up front, never half-run. `None` = every pod can.
+fn stop_refusal<'a>(provider: &dyn Provider, pods: impl Iterator<Item = &'a arena_core::Pod>, what: &str) -> Option<String> {
+    let mut names = Vec::new();
+    let mut why = None;
+    for p in pods {
+        if let Err(e) = provider.stop_support(p) {
+            names.push(p.name.clone());
+            why.get_or_insert_with(|| match e {
+                arena_core::Error::NotImplemented(m) => m,
+                other => other.to_string(),
+            });
+        }
+    }
+    why.map(|why| format!("can't {what} {} — {why}", names.join(", ")))
+}
+
 async fn handle_start(
     provider: &dyn Provider,
     // How the started pods are set up again: `SshRemote` for real, `FakeRemote` in tests.
@@ -8014,6 +8152,9 @@ async fn handle_start(
     keys_dir: &str,
 ) -> Result<()> {
     let RestartOpts { no_setup, skip_proxy, dry_run, yes, .. } = opts;
+    if let Some(r) = stop_refusal(provider, sel.pods.iter(), "start") {
+        anyhow::bail!("{r}");
+    }
     for p in sel.pods.iter().filter(|p| !arena_core::status::is_stopped(&p.status)) {
         eprintln!("skip {} — not stopped ({})", p.name, p.status);
     }
@@ -11797,7 +11938,7 @@ async fn resolve_target_any(
     let mut backends: Vec<(&str, Box<dyn Provider>)> = Vec::new();
     let mut pods: Vec<arena_core::Pod> = Vec::new();
     let mut owner_of: Vec<usize> = Vec::new(); // pods[i] belongs to backends[owner_of[i]]
-    for name in ["runpod", "vast", "hetzner"] {
+    for name in ["runpod", "vast", "hetzner", "shadeform"] {
         let Ok(p) = arena_core::provider::build(name, cfg) else { continue };
         match arena_core::retry::retrying(&policy, || p.list_pods()).await {
             Ok(listed) => {
@@ -14462,6 +14603,11 @@ mod replacement_spec_tests {
         let c = cfg("");
         assert_eq!(super::checked_gpu(&c, "vast", Some("RTX 3070 typo".into())).await.unwrap().as_deref(), Some("RTX 3070 typo"));
         assert_eq!(super::checked_gpu(&c, "hetzner", None).await.unwrap(), None);
+        // Shadeform: every token must name one of its GPU types (a typo there is an empty
+        // catalog, i.e. "no stock" forever) — checked offline, no key needed.
+        assert_eq!(super::checked_gpu(&c, "shadeform", Some("A6000,l40s".into())).await.unwrap().as_deref(), Some("A6000,l40s"));
+        let e = super::checked_gpu(&c, "shadeform", Some("A6000,3090".into())).await.unwrap_err().to_string();
+        assert!(e.contains("no Shadeform GPU type"), "{e}");
         assert_eq!(super::checked_gpu(&c, "runpod", Some("3070".into())).await.unwrap().as_deref(), Some("3070"));
         let v2 = cfg("RUNPOD_API=v2\n");
         assert_eq!(super::live_gpu_catalog(&v2).await.unwrap_err(), "no RUNPOD_API_KEY");
@@ -15997,6 +16143,60 @@ mod tests {
         assert!(ok && line.contains("⚠") && line.contains("unverified"), "{line}");
         let (line, ok) = vast_hosts_row(&Config::parse("VAST_ALLOW_UNVERIFIED=on"));
         assert!(!ok && line.contains("✗") && line.contains("must be"), "{line}");
+    }
+
+    /// Shadeform's rows: its options as the provider reads them, the managed-key and any-cloud
+    /// warnings, an invalid value failing the whole check — and its API key only ever "(set)".
+    #[test]
+    fn config_check_shadeform_rows() {
+        use super::{config_report, shadeform_rows, Config};
+        let (lines, bad) = shadeform_rows(&Config::parse("SHADEFORM_API_KEY=sf_secret_value_123\nMACHINE_NAME_PREFIX=devtest"));
+        let text = lines.join("\n");
+        assert!(bad.is_none(), "{text}");
+        for want in [
+            "✓ SHADEFORM_CLOUDS             massedcompute (default)",
+            "· SHADEFORM_REGIONS            (any region)",
+            "✓ SHADEFORM_MAX_PRICE          $1.00/h per pod (default)",
+            "✓ SHADEFORM_SSH_KEY            devtest (default) (must be uploaded",
+            "· SHADEFORM_READY_MINS         15 (default)",
+            "no stop",
+        ] {
+            assert!(text.contains(want), "{want}\n{text}");
+        }
+        let (lines, _) = shadeform_rows(&Config::parse("SHADEFORM_CLOUDS=*\nSHADEFORM_SSH_KEY=default\nSHADEFORM_MAX_PRICE=0.7"));
+        let text = lines.join("\n");
+        assert!(text.contains("⚠ SHADEFORM_CLOUDS             * — any cloud") && text.contains("⚠ SHADEFORM_SSH_KEY            default"), "{text}");
+        assert!(text.contains("$0.70/h per pod —"), "{text}");
+        let (lines, bad) = shadeform_rows(&Config::parse("SHADEFORM_MAX_PRICE=cheap"));
+        assert!(bad.is_some() && lines[0].contains("✗ SHADEFORM_*                  SHADEFORM_MAX_PRICE must be"), "{lines:?}");
+        // The whole report: the key is "(set)", never shown; an invalid option fails the check.
+        let (report, missing) = config_report(&Config::parse("SHADEFORM_API_KEY=sf_secret_value_123\nSHADEFORM_READY_MINS=0"), "shadeform");
+        assert!(!report.contains("sf_secret_value_123"), "{report}");
+        assert!(report.contains("✓ SHADEFORM_API_KEY        (set)   ← selected"), "{report}");
+        assert!(missing.iter().any(|m| m.starts_with("SHADEFORM_READY_MINS")), "{missing:?}");
+        let (_, missing) = config_report(&Config::parse(""), "shadeform");
+        assert!(missing.contains(&"SHADEFORM_API_KEY".to_string()), "{missing:?}");
+        // Not in play: one "(empty)" row, none of its options.
+        let (report, missing) = config_report(&Config::parse("RUNPOD_API_KEY=r"), "runpod");
+        assert!(report.contains("· SHADEFORM_API_KEY        (empty)") && !report.contains("SHADEFORM_CLOUDS"), "{report}");
+        assert!(!missing.iter().any(|m| m.contains("SHADEFORM")), "{missing:?}");
+    }
+
+    /// `pods stop`/`start` refuse a selection with a Shadeform pod up front — it has no stop (it
+    /// bills until deleted), and the --wipe-ok gate would only mislead; the refusal says to back
+    /// it up and terminate it. Other pods pass.
+    #[test]
+    fn stop_and_start_refuse_a_shadeform_pod_up_front() {
+        use super::Config;
+        let fleet = arena_core::provider::build_fleet("runpod", &Config::parse("RUNPOD_API_KEY=r\nSHADEFORM_API_KEY=k"), false).unwrap();
+        let sf = arena_core::Pod { name: "devtest-alpha".into(), provider: "shadeform".into(), ..Default::default() };
+        let rp = arena_core::Pod { name: "devtest-bloom".into(), provider: "runpod".into(), ..Default::default() };
+        assert_eq!(super::stop_refusal(fleet.as_ref(), [&rp].into_iter(), "stop"), None);
+        for what in ["stop", "start"] {
+            let r = super::stop_refusal(fleet.as_ref(), [&rp, &sf].into_iter(), what).unwrap();
+            assert!(r.starts_with(&format!("can't {what} devtest-alpha — Shadeform has no stop")), "{r}");
+            assert!(r.contains("bills until it's deleted") && r.contains("arena pods terminate"), "{r}");
+        }
     }
 
     /// `--json` on `gpus` and `pods list` is a scripting contract — pin the flag parsing

@@ -81,6 +81,10 @@ enum EndpointWait {
     NoPublicIp { pod: Pod, since: Duration },
     /// The deadline passed with no endpoint, and not up behind the proxy only.
     TimedOut,
+    /// It died before it came up — listed `ERROR` on a backend whose creates can fail after
+    /// they succeeded ([`Provider::ready_deadline`]: Shadeform): a failed placement. `why`, for
+    /// the lines and the attempt log (`error: <status details>`).
+    Failed { pod: Pod, why: String },
 }
 
 /// How long a pod we terminated (to replace it) may stay listed before we give up on the
@@ -172,6 +176,10 @@ pub(crate) struct UpRun<'a> {
     pub balance: Option<&'a crate::money::BalanceCtx>,
     /// `--expire-*`/`--idle-after` given: write each pod's reap notice once it's set up (RR11).
     pub reap_notice: bool,
+    /// `--check-attempts`: placements per name, the first create included — what also bounds
+    /// replacing a pod that never came up (listed `ERROR`, or not up by its backend's ready
+    /// deadline), with or without `--check`: that is a failed placement, not a host to inspect.
+    pub placements: u32,
 }
 
 /// The per-pod part of `up`'s plan, for the dry-run and the confirm prompt.
@@ -543,10 +551,22 @@ impl Shared<'_, '_> {
         run.fleet_ssh = None;
         run.pod = Some(pod.clone());
 
-        // 1. Its SSH endpoint, within its own deadline.
+        // 1. Its SSH endpoint, within its own deadline — or, on a backend whose creates can fail
+        // after they succeeded (Shadeform: an instance goes to `error`, or sits pending, maybe
+        // billing), within that backend's ready deadline: past it, or once listed ERROR, the
+        // pod is a failed placement — terminated and the name tried on the next option, never
+        // waited out or left billing.
         let started = Instant::now();
-        let pod = match self.or_stop(self.wait_endpoint(&pod.id, started + self.run.timeout)).await {
+        let ready = self.run.provider.ready_deadline(&pod).filter(|r| *r <= self.run.timeout);
+        let deadline = started + ready.unwrap_or(self.run.timeout);
+        let dead_on_error = self.run.provider.ready_deadline(&pod).is_some();
+        let pod = match self.or_stop(self.wait_endpoint(&pod.id, deadline, dead_on_error)).await {
             None => return self.end(run, Verdict::Stopped { stage: Stage::Endpoint }),
+            Some(EndpointWait::Failed { pod, why }) => return self.dead(run, &pod, option, failed_options, why).await,
+            Some(EndpointWait::TimedOut) if ready.is_some() => {
+                let why = format!("not up after {} (its provider's ready deadline)", pipeline::fmt_elapsed(started.elapsed()));
+                return self.dead(run, &pod, option, failed_options, why).await;
+            }
             Some(EndpointWait::TimedOut) => {
                 // The wait never trusts one missing listing (a backend that failed to list drops
                 // its pods from the aggregate), but the verdict must say how things stand now:
@@ -856,6 +876,21 @@ impl Shared<'_, '_> {
         self.end(run, Verdict::Ready)
     }
 
+    /// A pod that never came up ([`EndpointWait::Failed`], or past its backend's ready
+    /// deadline): a failed placement, not a host to inspect — nothing is on it yet, and it may
+    /// bill. It is terminated and the name recreated, options that haven't failed first, within
+    /// the name's placements (`--check-attempts`, with or without `--check`); with none left
+    /// it is still terminated, and the name fails at `endpoint`.
+    async fn dead(&self, run: &mut NameRun, pod: &Pod, option: usize, failed_options: &mut Vec<usize>, why: String) -> Option<(Pod, usize)> {
+        (self.say)(To::Err, &format!("[{}] {why} — before it came up: a failed placement", run.name));
+        if let Some(a) = run.attempts.last_mut() {
+            a.end = AttemptEnd::Dead(why.clone());
+        }
+        failed_options.push(option);
+        run.pod = Some(pod.clone());
+        self.replace(run, pod, failed_options, why, Stage::Endpoint).await
+    }
+
     /// Remember `pod`'s machine as bad after its check `h` FAILed — for the rest of this run
     /// (every name's next pod, first attempts included) and, in the health cache, for the next
     /// runs — when [`snapshot::bad_host_record`] says the verdict may condemn it (a host FAIL,
@@ -920,9 +955,18 @@ impl Shared<'_, '_> {
     ) -> Option<(Pod, usize)> {
         let say = self.say;
         let name = run.name.clone();
-        let max = self.run.check.as_ref().map_or(1, |c| c.attempts) as usize;
+        // A pod that never came up is replaced within the name's placements even without
+        // --check (`dead`); every other replacement is --check's.
+        let dead = run.attempts.last().is_some_and(|a| matches!(a.end, AttemptEnd::Dead(_)));
+        let max = match &self.run.check {
+            Some(c) => c.attempts,
+            None if dead => self.run.placements.max(1),
+            None => 1,
+        } as usize;
         let n = run.attempts.len();
-        let rejected = run.attempts.last().is_some_and(|a| matches!(a.end, AttemptEnd::SameHost | AttemptEnd::KnownBad(_)));
+        // Rejected (terminated even with no attempt left): a machine known bad, or a pod that
+        // never came up — never set up, nothing to look at, and it may bill.
+        let rejected = run.attempts.last().is_some_and(|a| matches!(a.end, AttemptEnd::SameHost | AttemptEnd::KnownBad(_) | AttemptEnd::Dead(_)));
         let last = n >= max;
         if last && !rejected {
             let reason = format!("{why} — no attempts left (--check-attempts {max}); left running");
@@ -1085,7 +1129,11 @@ impl Shared<'_, '_> {
     /// missing from proves nothing: the poller's aggregate listing skips a backend whose list
     /// failed, so one RunPod 5xx/429 drops every RunPod pod from it — and used to restart every
     /// proxy-only pod's grace, turning a replaceable host into `FAILED endpoint`, left billing.
-    async fn wait_endpoint(&self, id: &str, deadline: Instant) -> EndpointWait {
+    ///
+    /// `dead_on_error`: a pod listed `ERROR` meanwhile is [`EndpointWait::Failed`] (a backend
+    /// with a ready deadline — Shadeform; elsewhere ERROR isn't known to be final, and the wait
+    /// runs on as before).
+    async fn wait_endpoint(&self, id: &str, deadline: Instant, dead_on_error: bool) -> EndpointWait {
         let _waiting = Waiting::new(&self.waiters);
         self.waiter_added.notify_one();
         let mut rx = self.listing.subscribe();
@@ -1098,6 +1146,10 @@ impl Shared<'_, '_> {
         loop {
             let listed = rx.borrow_and_update().iter().find(|p| p.id == id).cloned();
             match listed {
+                Some(p) if dead_on_error && p.status.trim().eq_ignore_ascii_case("ERROR") => {
+                    let why = format!("error: {}", p.status_detail.as_deref().unwrap_or("listed ERROR, no details given"));
+                    return EndpointWait::Failed { pod: p, why };
+                }
                 Some(p) if p.ssh_ip.is_some() && p.ssh_port.is_some() => return EndpointWait::Ready(p),
                 Some(p) if p.proxy_only => {
                     let since = proxy_only.as_ref().map_or_else(Instant::now, |(t, _)| *t);
@@ -1533,6 +1585,10 @@ mod tests {
         hetzner: Mutex<Vec<Pod>>,
         /// Each create's `avoid_machines`, in order.
         avoids: Mutex<Vec<Vec<String>>>,
+        /// A Shadeform-like backend: its new pods get this ready deadline
+        /// (`Provider::ready_deadline`). An endpoint scripted as `error` lists its pod `ERROR`
+        /// ("provider failed to launch") once its delay has passed — on any fake.
+        ready: Option<Duration>,
     }
 
     /// A pod in the fake: its endpoint from `from`; listed until `gone_at`.
@@ -1568,6 +1624,9 @@ mod tests {
                         // `proxy` = a host with no public IP: up, behind RunPod's proxy only.
                         if s.ip == "proxy" {
                             p.proxy_only = true;
+                        } else if s.ip == "error" {
+                            p.status = "ERROR".into();
+                            p.status_detail = Some("provider failed to launch".into());
                         } else {
                             (p.ssh_ip, p.ssh_port) = (Some(s.ip.clone()), Some(s.port));
                         }
@@ -1669,6 +1728,9 @@ mod tests {
             }
             self.events.lock().unwrap().push(format!("authorize {} {}", pod.id, keys.len()));
             Ok(())
+        }
+        fn ready_deadline(&self, _pod: &Pod) -> Option<Duration> {
+            self.ready
         }
         fn lock_support(&self, _pod: &Pod) -> CoreResult<()> {
             if self.lockable {
@@ -1823,6 +1885,7 @@ mod tests {
             retry_bad_hosts: false,
             balance: None,
             reap_notice: false,
+            placements: check.unwrap_or(2),
         }
     }
 
@@ -2631,6 +2694,80 @@ mod tests {
         let rows = run_up(&run, made, std::future::pending(), &|_, _| {}).await;
         assert!(matches!(&rows[0].verdict, Verdict::Failed { stage: Stage::Endpoint, reason } if reason.contains("no attempts left")), "{:?}", rows[0].verdict);
         assert_eq!(fleet.events().len(), 1, "nothing terminated");
+    }
+
+    /// Shadeform (spec §8.3/§10.4): a create that succeeded can still fail — the instance goes to
+    /// `error`, or never becomes active. On a backend with a ready deadline, a pod listed ERROR
+    /// during the endpoint wait is terminated at once (not waited out to the deadline, never
+    /// left billing) and the name placed on the next option — even without --check, within its
+    /// placements; the attempt log says `error: <status details>`.
+    #[tokio::test(start_paused = true)]
+    async fn a_pod_that_goes_to_error_is_deleted_and_the_next_option_tried() {
+        let mut fleet = Fleet::new(&[("apple", &[("error", 0, 30), ("10.0.0.2", 22002, 0)])]);
+        fleet.ready = Some(Duration::from_secs(900));
+        let fake = Arc::new(FakeRemote::new());
+        let cfg = cfg(None);
+        let run = up_run(&fleet, fake.clone(), &cfg, true, None, None).await;
+        let made = make(&fleet, &["apple"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+        assert_eq!(
+            fleet.events(),
+            [format!("create devtest-apple {A4000}"), "terminate id1".to_string(), format!("create devtest-apple {R3090}")]
+        );
+        assert_eq!(rows[0].verdict, Verdict::Ready);
+        assert_eq!((rows[0].attempts[0].end.clone(), rows[0].attempts[0].terminated), (AttemptEnd::Dead("error: provider failed to launch".into()), true));
+        let (_, at) = lines.find("[devtest-apple] error: provider failed to launch — before it came up");
+        assert!(at < Duration::from_secs(60), "said at once, not at the deadline: {at:?}");
+        let summary = pipeline::render_up_summary(&rows);
+        assert!(summary.contains("never came up — error: provider failed to launch; terminated"), "{summary}");
+        assert!(fake.calls_to(&host("10.0.0.2", 22002)).len() == 2, "only the replacement was set up");
+
+        // No placement left: still terminated (it may bill), and the name fails at `endpoint`.
+        let mut fleet = Fleet::new(&[("apple", &[("error", 0, 30)])]);
+        fleet.ready = Some(Duration::from_secs(900));
+        let mut run = up_run(&fleet, Arc::new(FakeRemote::new()), &cfg, true, None, None).await;
+        run.placements = 1;
+        let made = make(&fleet, &["apple"]).await;
+        let rows = run_up(&run, made, std::future::pending(), &|_, _| {}).await;
+        assert_eq!(fleet.events(), [format!("create devtest-apple {A4000}"), "terminate id1".to_string()]);
+        match &rows[0].verdict {
+            Verdict::Failed { stage: Stage::Endpoint, reason } => {
+                assert!(reason.contains("error: provider failed to launch") && reason.contains("no attempts left") && reason.contains("terminated it"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // A backend without a ready deadline (RunPod, Vast): ERROR isn't known to be final there —
+        // the wait runs on as before, and the pod is left as it is.
+        let fleet = Fleet::new(&[("apple", &[("error", 0, 30)])]);
+        let mut run = up_run(&fleet, Arc::new(FakeRemote::new()), &cfg, true, None, None).await;
+        run.timeout = Duration::from_secs(120);
+        let made = make(&fleet, &["apple"]).await;
+        let rows = run_up(&run, made, std::future::pending(), &|_, _| {}).await;
+        assert_eq!(fleet.events().len(), 1, "nothing terminated");
+        assert!(matches!(&rows[0].verdict, Verdict::Failed { stage: Stage::Endpoint, reason } if reason.contains("no SSH endpoint after 120s")), "{:?}", rows[0].verdict);
+    }
+
+    /// Not up by the backend's ready deadline (SHADEFORM_READY_MINS) — shorter than `--timeout`:
+    /// the same failed placement at the deadline, terminated, the next option tried.
+    #[tokio::test(start_paused = true)]
+    async fn a_pod_not_up_by_its_ready_deadline_is_deleted_and_replaced() {
+        let mut fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 500), ("10.0.0.2", 22002, 0)])]);
+        fleet.ready = Some(Duration::from_secs(120));
+        let cfg = cfg(None);
+        let run = up_run(&fleet, Arc::new(FakeRemote::new()), &cfg, true, None, None).await;
+        let made = make(&fleet, &["apple"]).await;
+        let lines = Lines::new();
+        let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+        assert_eq!(
+            fleet.events(),
+            [format!("create devtest-apple {A4000}"), "terminate id1".to_string(), format!("create devtest-apple {R3090}")]
+        );
+        assert_eq!(rows[0].verdict, Verdict::Ready);
+        assert!(matches!(&rows[0].attempts[0].end, AttemptEnd::Dead(w) if w.starts_with("not up after 2m")), "{:?}", rows[0].attempts[0]);
+        let (_, at) = lines.find("[devtest-apple] not up after 2m");
+        assert_eq!(at, Duration::from_secs(120));
     }
 
     /// Review fix: the proxy-only grace restarted whenever one listing lacked the pod — and the

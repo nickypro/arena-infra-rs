@@ -3,6 +3,10 @@
 #   - system deps (build tools, ffmpeg, libosmesa6 for headless mujoco, zsh, …)
 #   - docker + docker compose
 #   - uv + a Python 3.13 venv with the ARENA packages (CPU substitutions)
+# ARENA_GPU=1 is the same for a bare **GPU** VM (Shadeform, a CUDA image with its driver): the
+# requirements keep their CUDA wheels, uv matches torch to the host's driver (`--torch-backend
+# ${ARENA_TORCH_BACKEND:-auto}`), and the env gate also asks torch for the GPU. ARENA_MACHINE_NAME
+# names the machine for ~/.name and the banner where the hostname doesn't (Shadeform's).
 #   - a ~/.zshrc / ~/.bashrc that auto-activates the venv, so `arena pods run`
 #     (which does `zsh -c 'source ~/.zshrc; …'`) lands in the right Python.
 #
@@ -38,6 +42,7 @@ cleanup() {
 trap cleanup EXIT
 export TMPDIR="$SETUP_TMP"
 
+GPU="${ARENA_GPU:-0}"
 REPO_DIR="${REPO_DIR:-/root/ARENA_materials}"
 # If the repo isn't already present (e.g. rsync'd from the control plane), clone it.
 REPO_URL="${REPO_URL:-https://github.com/ARENA-education/ARENA_materials.git}"
@@ -84,7 +89,16 @@ cd "$REPO_DIR" || die "no repo at $REPO_DIR"
 # The gate: the env is usable only if its python imports what the exercises need. It decides
 # both whether to skip the slow (~4GB) install — e.g. on a pod booted from a pre-built snapshot,
 # which is what makes those come up in ~1 min instead of 10 — and whether setup succeeded.
-env_ok() { [ -x "$VENV/bin/python" ] && "$VENV/bin/python" -c 'import torch, transformer_lens' >/dev/null 2>&1; }
+# On a GPU VM it must also see the GPU: a torch that can't (a CPU wheel, a driver/CUDA mismatch)
+# is no GPU env, however well it imports.
+env_ok() {
+    [ -x "$VENV/bin/python" ] || return 1
+    if [ "$GPU" = 1 ]; then
+        "$VENV/bin/python" -c 'import torch, transformer_lens; assert torch.cuda.is_available()' >/dev/null 2>&1
+    else
+        "$VENV/bin/python" -c 'import torch, transformer_lens' >/dev/null 2>&1
+    fi
+}
 
 # The venv's Python: ARENA_PYTHON if set, else 3.13 — raised to the lower bound of the repo's
 # `requires-python` when that is newer. (3.11 broke: the requirements pin jax[cuda13]==0.11.2,
@@ -104,17 +118,24 @@ if env_ok; then
 else
     [ -f requirements.txt ] || die "no requirements.txt in $REPO_DIR to install the ARENA env from"
     PY=$(pick_python)
-    # CPU substitutions, by pattern rather than by exact upstream line (those drift: jax went
-    # cuda12 → cuda13, torch moved off the cu118 index): any `jax[cuda…]` extra → `jax[cpu]`;
-    # bitsandbytes and the nvidia-* CUDA runtime wheels dropped (GPU-only — dead weight on a CPU
-    # box); CUDA wheel indexes and `+cuNNN` local versions dropped — torch comes from the CPU
-    # index via `--torch-backend cpu`.
-    sed -E -e 's#^([[:space:]]*)jax\[cuda[^]]*\]#\1jax[cpu]#' \
-        -e '/^[[:space:]]*bitsandbytes([^A-Za-z0-9_.-]|$)/d' \
-        -e '/^[[:space:]]*nvidia-[A-Za-z0-9_.-]*cu[0-9]+/d' \
-        -e '/^[[:space:]]*--(extra-)?index-url[[:space:]=]+https?:\/\/download\.pytorch\.org\/whl\/cu/d' \
-        -e 's#\+cu[0-9]+##g' \
-        requirements.txt > requirements.cpu.txt || die "couldn't write requirements.cpu.txt"
+    if [ "$GPU" = 1 ]; then
+        # A GPU VM: the requirements as they are — CUDA wheels, `+cuNNN` pins and their index.
+        REQ=requirements.gpu.txt
+        cp requirements.txt "$REQ" || die "couldn't write $REQ"
+    else
+        REQ=requirements.cpu.txt
+        # CPU substitutions, by pattern rather than by exact upstream line (those drift: jax went
+        # cuda12 → cuda13, torch moved off the cu118 index): any `jax[cuda…]` extra → `jax[cpu]`;
+        # bitsandbytes and the nvidia-* CUDA runtime wheels dropped (GPU-only — dead weight on a CPU
+        # box); CUDA wheel indexes and `+cuNNN` local versions dropped — torch comes from the CPU
+        # index via `--torch-backend cpu`.
+        sed -E -e 's#^([[:space:]]*)jax\[cuda[^]]*\]#\1jax[cpu]#' \
+            -e '/^[[:space:]]*bitsandbytes([^A-Za-z0-9_.-]|$)/d' \
+            -e '/^[[:space:]]*nvidia-[A-Za-z0-9_.-]*cu[0-9]+/d' \
+            -e '/^[[:space:]]*--(extra-)?index-url[[:space:]=]+https?:\/\/download\.pytorch\.org\/whl\/cu/d' \
+            -e 's#\+cu[0-9]+##g' \
+            requirements.txt > requirements.cpu.txt || die "couldn't write requirements.cpu.txt"
+    fi
     # transformer_lens pins numpy<2, which conflicts with jax (numpy>=2). That pin is stale —
     # override it so the resolve succeeds (TL runs fine on numpy 2.x).
     printf 'numpy>=2.0\n' > overrides.txt || die "couldn't write overrides.txt"
@@ -128,16 +149,29 @@ else
     # --index-strategy unsafe-best-match: that index also carries some shared deps (e.g.
     # importlib-metadata) at versions that conflict with PyPI pins (circuitsvis); this lets uv
     # pick the best version across BOTH indexes instead of first-index-only.
+    # A GPU VM: `--torch-backend auto` matches torch's CUDA wheels to the host's driver (or the
+    # backend ARENA_TORCH_BACKEND names, e.g. cu130); unsafe-best-match lets the requirements' own
+    # CUDA index and PyPI both serve, as for the CPU index. An older uv: the requirements' index.
     if uv pip install --help 2>/dev/null | grep -q -- '--torch-backend'; then
-        backend=(--torch-backend cpu)
+        if [ "$GPU" = 1 ]; then
+            backend=(--torch-backend "${ARENA_TORCH_BACKEND:-auto}" --index-strategy unsafe-best-match)
+        else
+            backend=(--torch-backend cpu)
+        fi
+    elif [ "$GPU" = 1 ]; then
+        backend=(--index-strategy unsafe-best-match)
     else
         backend=(--extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match)
     fi
-    uv pip install --no-cache-dir "${backend[@]}" --override overrides.txt -r requirements.cpu.txt \
-        || die "installing the ARENA packages (requirements.cpu.txt) into the Python $PY venv failed — see uv's error above"
+    uv pip install --no-cache-dir "${backend[@]}" --override overrides.txt -r "$REQ" \
+        || die "installing the ARENA packages ($REQ) into the Python $PY venv failed — see uv's error above"
 fi
 # The final gate, also after an install that "succeeded": no torch / transformer_lens, no setup.
 if ! env_ok; then
+    if [ "$GPU" = 1 ]; then
+        why=$("$VENV/bin/python" -c 'import torch, transformer_lens; assert torch.cuda.is_available(), "torch.cuda.is_available() is False (driver/CUDA mismatch?)"' 2>&1 | tail -n1)
+        die "the ARENA env at $VENV can't import torch + transformer_lens or use the GPU (${why:-no python in it}) — not set up"
+    fi
     why=$("$VENV/bin/python" -c 'import torch, transformer_lens' 2>&1 | tail -n1)
     die "the ARENA env at $VENV can't import torch + transformer_lens (${why:-no python in it}) — not set up"
 fi
@@ -206,10 +240,11 @@ for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
         printf '\n# ARENA env: no conda on CPU pods — activate the uv venv (no-op on conda GPU pods).\nif ! command -v conda >/dev/null 2>&1 && [ -f "%s/bin/activate" ]; then\n    source "%s/bin/activate"\nfi\n' "$VENV" "$VENV" >> "$rc"
 done
 
-# Machine name (MOTD + prompt) from the Hetzner hostname, e.g. arena8-flutter.
-[ -f "$HOME/.name" ] || printf 'export MACHINE_NAME=%s\n' "$(hostname)" > "$HOME/.name"
+# Machine name (MOTD + prompt) from the Hetzner hostname, e.g. arena8-flutter (ARENA_MACHINE_NAME
+# where the hostname isn't the machine name: a Shadeform VM's).
+[ -f "$HOME/.name" ] || printf 'export MACHINE_NAME=%s\n' "${ARENA_MACHINE_NAME:-$(hostname)}" > "$HOME/.name"
 # ARENA figlet login banner, same script the GPU pods use.
-MACHINE_NAME="$(hostname)" bash "$HOME/.arena_infra/scripts/motd.sh" 2>/dev/null || true
+MACHINE_NAME="${ARENA_MACHINE_NAME:-$(hostname)}" bash "$HOME/.arena_infra/scripts/motd.sh" 2>/dev/null || true
 # Default shell -> zsh, so interactive SSH and `arena pods run` land in the configured env.
 chsh -s "$(which zsh)" root 2>/dev/null || true
 # Tokens (OPENROUTER_API_KEY, HF_TOKEN, …) are distributed separately by

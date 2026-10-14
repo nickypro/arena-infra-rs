@@ -1269,9 +1269,10 @@ fn build_new_pod_form(cfg: &Config, launch_provider: &str, existing: &[Pod]) -> 
         "runpod" => "RUNPOD_API_KEY",
         "vast" => "VAST_API_KEY",
         "hetzner" => "HETZNER_API_KEY",
+        "shadeform" => "SHADEFORM_API_KEY",
         _ => "",
     };
-    let providers: Vec<ProviderOpt> = ["runpod", "vast", "hetzner"]
+    let providers: Vec<ProviderOpt> = ["runpod", "vast", "hetzner", "shadeform"]
         .iter()
         .map(|p| ProviderOpt {
             name: p.to_string(),
@@ -1805,12 +1806,13 @@ fn truncate(s: &str, max: usize) -> String {
     out
 }
 
-/// A one-letter, color-coded provider badge: R=runpod, V=vast, H=hetzner.
+/// A one-letter, color-coded provider badge: R=runpod, V=vast, H=hetzner, S=shadeform.
 fn provider_cell(provider: &str) -> Cell<'static> {
     let (letter, color) = match provider {
         "runpod" => ("R", Color::Cyan),
         "vast" => ("V", Color::Magenta),
         "hetzner" => ("H", Color::Yellow),
+        "shadeform" => ("S", Color::Green),
         other => (other.get(0..1).unwrap_or("?"), Color::Gray),
     };
     Cell::from(Span::styled(

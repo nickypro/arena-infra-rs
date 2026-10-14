@@ -424,10 +424,38 @@ impl ProvisionStep {
     }
 }
 
+/// Which bare-VM setup a provider's pods get: they're plain VMs (not containers from the
+/// cohort image), so the full setup script builds the ARENA env on them ([`provisioning_steps`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BareVm {
+    /// A CPU VM (Hetzner): the script swaps the CUDA requirements for CPU wheels.
+    Cpu,
+    /// A GPU VM (Shadeform): the script keeps the CUDA requirements (`ARENA_GPU=1`), lets uv
+    /// match torch to the host's driver, and its env gate also asks for `torch.cuda`.
+    Gpu,
+}
+
+/// The bare-VM setup `provider`'s pods get, if they're bare VMs at all (`None`: image-based
+/// pods — RunPod, Vast). The one place a provider name decides this. Pure.
+pub fn bare_vm(provider: &str) -> Option<BareVm> {
+    match provider {
+        "hetzner" => Some(BareVm::Cpu),
+        "shadeform" => Some(BareVm::Gpu),
+        _ => None,
+    }
+}
+
+/// Whether `provider`'s pods are bare VMs ([`bare_vm`]).
+pub fn is_bare_vm(provider: &str) -> bool {
+    bare_vm(provider).is_some()
+}
+
 /// The ordered provisioning steps for a pod, chosen by provider — pure and unit-tested,
 /// so the runner never has to know what a provider *is*. Adding a backend = add its
 /// steps here; the runner and the dry-run preview stay generic.
-///   - bare-VM (hetzner): push the deploy key + the full setup script, then run it.
+///   - bare-VM ([`bare_vm`]): push the deploy key + the full setup script, then run it —
+///     on a CPU VM (hetzner) as it always was; on a GPU VM (shadeform) in its GPU mode, with
+///     the machine name for `~/.name` (a Shadeform VM's hostname isn't the machine name).
 ///   - image-based (runpod/vast): push the git deploy key, then the post-image config.
 ///
 /// Image-based pods move the repo onto their volume first (unless `REPO_ON_VOLUME=0`, and when
@@ -450,8 +478,8 @@ pub fn provisioning_steps(
         remote: scfg.key_remote.clone(),
         timeout: timeouts.copy,
     };
-    let mut steps = match provider {
-        "hetzner" => vec![
+    let mut steps = match bare_vm(provider) {
+        Some(BareVm::Cpu) => vec![
             // Copy the git deploy key first, so the script can clone (and later push to)
             // the PRIVATE cohort repo over SSH — not just the public mirror.
             copy_key,
@@ -472,7 +500,27 @@ pub fn provisioning_steps(
                 timeout: timeouts.bare_vm,
             },
         ],
-        _ => {
+        Some(BareVm::Gpu) => vec![
+            copy_key,
+            ProvisionStep::Scp {
+                label: "copy bare-VM setup script",
+                local: hetzner_script_local.to_string(),
+                remote: "/root/hetzner_setup.sh".into(),
+                timeout: timeouts.copy,
+            },
+            ProvisionStep::Run {
+                label: "GPU VM setup script",
+                cmd: format!(
+                    "ARENA_GPU=1 ARENA_MACHINE_NAME={} REPO_URL={} REPO_DIR={} REPO_KEY={} bash /root/hetzner_setup.sh",
+                    shell_quote(name),
+                    shell_quote(&scfg.repo_url),
+                    shell_quote(&scfg.repo_path),
+                    shell_quote(&scfg.key_remote),
+                ),
+                timeout: timeouts.bare_vm,
+            },
+        ],
+        None => {
             let mut v = vec![copy_key];
             let relocation = scfg.relocate.then(|| crate::volume::relocation_command(&scfg.repo_path, timeouts.relocate));
             if let Some(cmd) = relocation.flatten() {
@@ -1059,6 +1107,37 @@ mod tests {
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
+    }
+
+    /// Shadeform's GPU VMs get the bare-VM steps in their GPU mode (`ARENA_GPU=1`, the machine
+    /// name for `~/.name`) — the same script, on the same long budget; the only provider names
+    /// that pick a bare-VM setup are Hetzner's (CPU) and Shadeform's (GPU).
+    #[test]
+    fn shadeform_gets_the_bare_vm_gpu_steps() {
+        for (provider, want) in [("hetzner", Some(BareVm::Cpu)), ("shadeform", Some(BareVm::Gpu)), ("runpod", None), ("vast", None), ("lambda", None)] {
+            assert_eq!(bare_vm(provider), want, "{provider}");
+            assert_eq!(is_bare_vm(provider), want.is_some(), "{provider}");
+        }
+        let t = SetupTimeouts::default();
+        let steps = provisioning_steps("shadeform", &steps_cfg(), "devtest-alpha", false, "/tmp/h.sh", &t);
+        assert_eq!(
+            steps,
+            vec![
+                ProvisionStep::Scp { label: "copy deploy key", local: "/local/key".into(), remote: "/root/.ssh/id_ed25519".into(), timeout: secs(60) },
+                ProvisionStep::Scp { label: "copy bare-VM setup script", local: "/tmp/h.sh".into(), remote: "/root/hetzner_setup.sh".into(), timeout: secs(60) },
+                ProvisionStep::Run {
+                    label: "GPU VM setup script",
+                    cmd: "ARENA_GPU=1 ARENA_MACHINE_NAME='devtest-alpha' REPO_URL='git@github.com:o/r.git' REPO_DIR='/root/ARENA_3.0' \
+                          REPO_KEY='/root/.ssh/id_ed25519' bash /root/hetzner_setup.sh"
+                        .into(),
+                    timeout: secs(1800),
+                },
+            ]
+        );
+        // No relocation onto a volume (a VM has none), and --timeout sizes this step too.
+        assert!(!steps.iter().any(|s| s.label() == RELOCATE_LABEL));
+        let t = SetupTimeouts::resolve(None, Some(900)).unwrap();
+        assert_eq!(provisioning_steps("shadeform", &steps_cfg(), "devtest-alpha", false, "/tmp/h.sh", &t)[2].timeout(), secs(900));
     }
 
     #[test]

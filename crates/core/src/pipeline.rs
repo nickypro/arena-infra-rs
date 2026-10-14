@@ -102,6 +102,9 @@ pub enum AttemptEnd {
     /// Up, but reachable only through RunPod's SSH proxy for the grace period — a host with no
     /// public IP: a host failure, like a failed check.
     NoPublicIp,
+    /// Never came up: listed `ERROR` (Shadeform: `error: <status details>`), or not up by its
+    /// backend's ready deadline — a failed placement, terminated.
+    Dead(String),
 }
 
 /// One placement of a name — its first create or a replacement.
@@ -190,6 +193,7 @@ fn attempt_line(n: usize, a: &Attempt, verdict: &Verdict) -> String {
         AttemptEnd::SameHost => format!("same host as a failed check — rejected{fate}"),
         AttemptEnd::KnownBad(when) => format!("on a machine that failed a deep check {when} — rejected{fate}"),
         AttemptEnd::NoPublicIp => format!("no public SSH endpoint (RunPod ssh proxy only){fate}"),
+        AttemptEnd::Dead(why) => format!("never came up — {why}{fate}"),
         AttemptEnd::Kept => match verdict {
             Verdict::Ready => "ready".to_string(),
             Verdict::Failed { stage, .. } => format!("FAILED {}", stage.label()),
