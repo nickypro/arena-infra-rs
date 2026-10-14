@@ -667,4 +667,21 @@ mod tests {
         let e = refuse_raw(&sf, "sshkeys", true).unwrap_err().to_string();
         assert!(!e.contains("    "), "a run of spaces inside the message: {e:?}");
     }
+
+    /// REVIEW sf SF9 (hygiene, low): `GET /account` is the one Shadeform body arena reads that
+    /// carries the human's personal data — email, phone, tax id, postal address (spec §6: "never
+    /// logs the body"; the spike piped it through a redactor). `balance` types it down to the
+    /// money, but `api get shadeform account` (the obvious way to eyeball the undocumented
+    /// endpoint during the live test) prints every field unredacted without `--raw`, straight
+    /// into terminal scrollback and the agent transcripts and reports this sandbox keeps. The
+    /// default (redacted) rendering should blank them as it blanks keys; `--raw` stays raw.
+    #[test]
+    fn review_sf_sf9_account_pii_is_redacted_without_raw() {
+        let body = r#"{"id":"x","tier":"free","balance":"12.50","hourly_burn":"0.57","email":"someone@example.invalid","phone_number":"+1 555 0100","tax_id":"T-12345","address":"1 Example Way","organization":"Example Org"}"#;
+        let out = render(StatusCode::OK, body, false, "sf-key-material").unwrap();
+        assert!(out.contains("12.50"), "{out}");
+        for pii in ["someone@example.invalid", "+1 555 0100", "T-12345", "1 Example Way"] {
+            assert!(!out.contains(pii), "`api get shadeform account` printed {pii:?}:\n{out}");
+        }
+    }
 }
