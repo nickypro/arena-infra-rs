@@ -3514,6 +3514,19 @@ mod tests {
     /// The real rsync, its `-e` swapped for a shim that runs the push key's forced command (the
     /// real rrsync, `-munge -wo -no-del -no-lock`, rooted at `<w>/push`) as sshd would: `archive
     /// sync` end to end, offline. `None` without rsync, python3 or rrsync.
+    /// Let go of a pod's backup lock as a finished pull does, and wait until it really is free:
+    /// a child that another test thread forked (and hasn't exec'd yet) holds a copy of the lock's
+    /// descriptor for a moment, and flock frees the lock only when every copy is closed (seen on
+    /// a loaded CI runner).
+    fn release_pull(pull: std::fs::File, backup: &str, pod: &str) {
+        drop(pull);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while arena_core::pull::try_pod_lock_now(backup, pod).is_err() {
+            assert!(std::time::Instant::now() < deadline, "{pod}'s backup lock is still held after its pull let go");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     fn real_push(w: &World) -> Option<String> {
         use std::os::unix::fs::PermissionsExt;
         let rrsync = ["/usr/bin/rrsync", "/usr/share/doc/rsync/scripts/rrsync"].into_iter().find(|p| Path::new(p).exists())?;
@@ -4775,7 +4788,7 @@ mod tests {
         let backup = w.dir.join("backup").display().to_string();
         let pull = arena_core::pull::try_pod_lock_now(&backup, "devtest-alpha").unwrap().expect("the pull's lock");
         archive_sync(&w.cfg, &paths, sync_opts("snap"), &rsync, &clock(t + 900)).await.unwrap();
-        drop(pull);
+        release_pull(pull, &backup, "devtest-alpha");
         // The pull is done: the rest of the tree, unchanged since w0d1.
         rv_link(&w, "w0d1/devtest-alpha/data/b.bin", "w0d2/devtest-alpha/data/b.bin");
         archive_sync(&w.cfg, &paths, sync_opts("snap"), &rsync, &clock(t + 1800)).await.unwrap();
@@ -4839,7 +4852,7 @@ mod tests {
         assert!(waits.get("devtest-alpha").is_some_and(|w| w.runs == 4 && (now..now + 60).contains(&w.since)), "{waits:?}");
         assert!(said.iter().any(|l| l.contains("devtest-alpha: its first push of today's label has waited for its running pull 4 runs")), "{said:#?}");
         assert!(!rsync_calls(&w.dir).iter().any(|c| c.ends_with(":snap/w0d3/devtest-alpha/")), "today's seed waited");
-        drop(pull);
+        release_pull(pull, &backup, "devtest-alpha");
         fresh_calls(&w.dir);
         sync_said(&w, sync_opts("snap"), &stub, now + 3600).await.0.unwrap();
         assert!(rsync_calls(&w.dir).iter().any(|c| c.ends_with(":snap/w0d3/devtest-alpha/")), "{:#?}", rsync_calls(&w.dir));

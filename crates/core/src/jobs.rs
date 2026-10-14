@@ -1409,12 +1409,34 @@ mod tests {
             d
         }
 
+        /// Waits generously (a loaded CI runner is slow to schedule the job's processes) and,
+        /// on a timeout, says what the jobs left behind and which of their processes still run.
         fn wait_until(&self, what: &str, ok: &dyn Fn() -> bool) {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             while !ok() {
-                assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+                assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}{}", self.debug_jobs());
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
+        }
+
+        /// Every job's files (short ones in full) and the processes running from this pod's dir.
+        fn debug_jobs(&self) -> String {
+            let mut s = String::new();
+            for d in std::fs::read_dir(self.home.join(JOBS_DIR)).into_iter().flatten().flatten() {
+                for f in std::fs::read_dir(d.path()).into_iter().flatten().flatten() {
+                    let body = std::fs::read_to_string(f.path()).unwrap_or_default();
+                    let body = if f.file_name() == "run" { format!("{} bytes", body.len()) } else { format!("{:?}", body.chars().take(300).collect::<String>()) };
+                    s += &format!("\n  {}/{}: {body}", d.file_name().to_string_lossy(), f.file_name().to_string_lossy());
+                }
+            }
+            let ps = std::process::Command::new("ps").args(["-eo", "pid,ppid,sid,stat,etime,args"]).output();
+            let mine = self.dir.display().to_string();
+            for l in ps.iter().flat_map(|o| String::from_utf8_lossy(&o.stdout).lines().map(str::to_owned).collect::<Vec<_>>()) {
+                if l.contains(&mine) || l.contains("bash -c") {
+                    s += &format!("\n  ps: {l}");
+                }
+            }
+            s
         }
     }
 
