@@ -14760,6 +14760,15 @@ mod selection_tests {
         fn restart_wipes_container_disk(&self, pod: &Pod) -> bool {
             pod.provider != "hetzner" // as the fleet provider routes it
         }
+        // REVIEW sf SF3: as the fleet routes it — a Shadeform pod has no stop (no pod in the
+        // existing fixtures is on Shadeform, so their tests are unchanged).
+        fn stop_support(&self, pod: &Pod) -> Result<()> {
+            if pod.provider == "shadeform" {
+                Err(arena_core::Error::NotImplemented(arena_core::provider::shadeform::NO_STOP.into()))
+            } else {
+                Ok(())
+            }
+        }
     }
 
     fn pod(name: &str, status: &str, provider: &str, gpus: Option<u32>) -> Pod {
@@ -14867,6 +14876,28 @@ mod selection_tests {
         // A malformed range fails before listing too.
         assert!(select(&f, &cfg(), &args(&["cloud..apple"]), Unscoped::All).await.is_err());
         assert_eq!(*f.lists.lock().unwrap(), 0, "nothing was listed");
+    }
+
+    /// REVIEW sf SF3 (money): one Shadeform pod anywhere in a `pods stop --all` selection makes
+    /// the whole stop bail up front (`stop_refusal` over `sel.pods`) — so the routine nightly
+    /// `pods stop --all --wipe-ok` (balance.rs counts on it) stops *nothing*: every RunPod pod
+    /// keeps billing all night because an overflow VM exists. The refusal also counts pods that
+    /// aren't stop targets at all: a Shadeform instance already `deleting` (listed TERMINATED,
+    /// billing nothing) blocks the batch the same way, unlike every other non-billing pod,
+    /// which is "skip … — not running". A pod that can't be stopped must be skipped and said
+    /// (and may fail the exit), not veto the rest of `--all`.
+    #[tokio::test]
+    async fn review_sf_sf3_a_shadeform_pod_does_not_veto_stop_all() {
+        for status in ["RUNNING", "TERMINATED"] {
+            let mut f = fleet();
+            f.pods.push(pod("arena8-mayor", status, "shadeform", Some(1)));
+            let r = handle_pods(pods_cmd(&["stop", "--all", "--wipe-ok"]), &f, Arc::new(FakeRemote::new()), &cfg(), true)
+                .await
+                .map_err(|e| e.to_string());
+            let got: Vec<String> = f.calls().into_iter().map(|(op, id)| format!("{op} {id}")).collect();
+            let want: Vec<String> = ids(&["apple", "bloom", "cloud", "vm"]).into_iter().map(|id| format!("stop {id}")).collect();
+            assert_eq!(got, want, "Shadeform pod {status}: `pods stop --all` stopped nothing else ({r:?})");
+        }
     }
 
     #[tokio::test]
@@ -16180,6 +16211,20 @@ mod tests {
         let (report, missing) = config_report(&Config::parse("RUNPOD_API_KEY=r"), "runpod");
         assert!(report.contains("· SHADEFORM_API_KEY        (empty)") && !report.contains("SHADEFORM_CLOUDS"), "{report}");
         assert!(!missing.iter().any(|m| m.contains("SHADEFORM")), "{missing:?}");
+    }
+
+    /// REVIEW sf SF8 (cosmetic): two `config check` rows (and the `└` note, and
+    /// `warn_no_volume`'s Shadeform line, which prints straight to stderr) carry a long run of
+    /// spaces mid-sentence — a lost `\` line continuation: "differ per cloud;
+    /// [25 spaces] widen one cloud at a time". Past the aligned key column, no row should.
+    #[test]
+    fn review_sf_sf8_shadeform_rows_have_no_stray_indentation() {
+        use super::{shadeform_rows, Config};
+        let (lines, _) = shadeform_rows(&Config::parse("SHADEFORM_CLOUDS=*\nSHADEFORM_SSH_KEY=default"));
+        for l in &lines {
+            let tail: String = l.chars().skip(36).collect();
+            assert!(!tail.contains("    "), "a run of spaces inside: {l:?}");
+        }
     }
 
     /// `pods stop`/`start` refuse a selection with a Shadeform pod up front — it has no stop (it

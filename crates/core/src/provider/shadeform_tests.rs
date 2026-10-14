@@ -666,3 +666,137 @@ async fn the_fleet_routes_shadeform_pods_to_shadeform() {
     assert!(fleet.terminate_pod_on("vast", ID).await.is_err());
     assert_eq!(requests(&srv).last().unwrap(), &format!("POST /instances/{ID}/delete HTTP/1.1"));
 }
+
+// ---------------------------------------------------------------------------------------
+// Adversarial review (branch `review`): each test fails on `shadeform` for the reason its
+// doc comment gives.
+// ---------------------------------------------------------------------------------------
+
+/// REVIEW sf SF4: the post-create price guard fails open. `settle` reads `info` once; when that
+/// one read fails (here a 503 right after the create answered with an id), the pod is built
+/// from the catalog entry — priced at the *quote* — and nothing checks the real price again:
+/// an instance Shadeform bills at $1.20/h, over the $1.00 cap (and 2× the $0.57 quote), stays
+/// up, shown in `pods list`/the footer at $0.57. (Likewise an `info` whose price can't be read
+/// — no `rental_terms`, a non-integer `hourly_price` — skips the guard.) A failed read must
+/// not end the guard: re-read the instance (`info` again, or the listing) before accepting it.
+/// The canned re-read below answers both shapes (an instance carrying an `instances` array).
+#[tokio::test]
+async fn review_sf_sf4_price_guard_survives_a_failed_info_read() {
+    let new_id = "aaaaaaaa-0000-4000-8000-000000000005";
+    let over = instance(new_id, "devtest-alpha", "creating", 120, our_tags());
+    let mut both = over.clone();
+    both["instances"] = json!([over]);
+    let mut replies = create_prelude();
+    replies.push(json_reply(&format!(r#"{{"id": "{new_id}"}}"#)));
+    replies.push(canned(503, "text/plain", "upstream connect error"));
+    replies.push(json_reply(&both.to_string()));
+    replies.push(json_reply(""));
+    let srv = serve(replies);
+    let r = provider(&srv.base, client()).create_pod(&spec("NVIDIA RTX A6000", 1)).await;
+    let reqs = requests(&srv);
+    assert!(
+        r.is_err() && reqs.iter().any(|l| l == &format!("POST /instances/{new_id}/delete HTTP/1.1")),
+        "an instance billed at $1.20/h (cap $1.00) was kept after one failed `info` read — the price guard never ran: \
+         {:?}; requests {reqs:?}",
+        r.map(|p| p.cost_per_hr)
+    );
+}
+
+/// REVIEW sf SF5: `rename_pod` checks that the instance is ours, not that the NEW name keeps it
+/// ours. `pods rename` accepts any MACHINE_NAME_LIST entry, absolute ones (`@staff-box` →
+/// `staff-box`) included; renamed so, the instance no longer starts with `<prefix>-`, so
+/// [`is_ours`] fails from then on — every later terminate / restart / rename by arena (`up`'s
+/// replace, teardown's printed fix, the rename back) is refused while it keeps billing, and
+/// teardown files it under "not this cohort's". Create refuses such a name up front; rename
+/// must too — before any POST.
+#[tokio::test]
+async fn review_sf_sf5_rename_refuses_a_name_that_would_disown_the_instance() {
+    let ours = instance(ID, "devtest-alpha", "active", 57, our_tags()).to_string();
+    let srv = serve(vec![json_reply(&ours), json_reply("")]);
+    let p = provider(&srv.base, client());
+    let r = p.rename_pod(ID, "staff-box").await;
+    assert!(
+        r.is_err() && posts(&srv) == 0,
+        "renamed to `staff-box` (no `devtest-` prefix): arena can't terminate it afterwards — {r:?}, {} POST(s)",
+        posts(&srv)
+    );
+    // After such a rename, arena's own terminate is refused (what the operator then meets).
+    let disowned = instance(ID, "staff-box", "active", 57, our_tags()).to_string();
+    let srv = serve(vec![json_reply(&disowned)]);
+    assert!(provider(&srv.base, client()).terminate_pod(ID).await.is_err());
+}
+
+/// REVIEW sf SF6: the bootstrap only *appends* the cohort keys to root's `authorized_keys` (then
+/// `sort -u`s it). An Ubuntu cloud image's cloud-init (`disable_root: true`, its default) has
+/// already put the instance's key — `ssh_key_id`, which is the cohort key arena uploads as
+/// `devtest` — into root's file behind `no-port-forwarding,…,command="echo 'Please login as the
+/// user \"shadeform\" rather than the user \"root\".';…;exit 142"`. sshd uses the FIRST line
+/// whose key matches, and `sort -u` keeps that restricted line first (`no-…` < `ssh-…`; a plain
+/// append would leave it first too): root login with the cohort key runs the echo and exits
+/// 142 — arena (which connects as root) is locked out, setup fails, the VM bills. The script
+/// must leave each cohort key's first match in root's file without options (drop a restricted
+/// line for a key it authorizes, or put its own lines first and not re-sort them below).
+/// Run for real under bash with `id`/`getent`/`sudo` stubbed onto a temp root.
+#[cfg(target_os = "linux")]
+#[test]
+fn review_sf_sf6_bootstrap_root_login_survives_cloud_inits_disable_root_line() {
+    use std::os::unix::fs::PermissionsExt;
+    let base = std::env::temp_dir().join(format!("arena-sf-review-boot-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let (stubs, fake) = (base.join("stubs"), base.join("fake"));
+    for d in [stubs.clone(), fake.join("root/.ssh"), fake.join("home/shadeform/.ssh")] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let stub = |name: &str, body: &str| {
+        let p = stubs.join(name);
+        std::fs::write(&p, format!("#!/bin/bash\n{body}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    // Not root: the script goes through `sudo -n`, which the stub runs as-is on the fake root
+    // (paths outside the homes mapped under it; ownership changes dropped).
+    stub("id", "echo 1000");
+    stub(
+        "getent",
+        r#"case "$2" in root) echo "root:x:0:0:root:$FAKE/root:/bin/bash";; shadeform) echo "shadeform:x:1000:1000::$FAKE/home/shadeform:/bin/bash";; *) exit 2;; esac"#,
+    );
+    stub(
+        "sudo",
+        r#"[ "$1" = -n ] && shift
+cmd=$1; shift; args=()
+for a in "$@"; do a=${a//\/var\/lib\/arena/$FAKE/var/lib/arena}; a=${a//\/etc\/ssh/$FAKE/etc/ssh}; args+=("$a"); done
+case "$cmd" in
+  chown) exit 0;;
+  sshd) echo "permitrootlogin prohibit-password"; exit 0;;
+  systemctl) exit 0;;
+  install) out=(); skip=0; for a in "${args[@]}"; do if [ $skip = 1 ]; then skip=0; continue; fi; case "$a" in -o|-g) skip=1;; *) out+=("$a");; esac; done; exec install "${out[@]}";;
+  *) exec "$cmd" "${args[@]}";;
+esac"#,
+    );
+    let blob = KEY_A.split(' ').nth(1).unwrap();
+    let restricted = format!(
+        "no-port-forwarding,no-agent-forwarding,no-X11-forwarding,command=\"echo 'Please login as the user \\\"shadeform\\\" \
+         rather than the user \\\"root\\\".';echo;sleep 10;exit 142\" {KEY_A}\n"
+    );
+    std::fs::write(fake.join("root/.ssh/authorized_keys"), &restricted).unwrap();
+    let script = render_bootstrap(&[KEY_A.into()], NONCE, "devtest-alpha").unwrap();
+    let path = format!("{}:/usr/bin:/bin", stubs.display());
+    let out = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .env_clear()
+        .env("PATH", path)
+        .env("FAKE", &fake)
+        .output()
+        .unwrap();
+    let keys = std::fs::read_to_string(fake.join("root/.ssh/authorized_keys")).unwrap();
+    let nonce = std::fs::read_to_string(fake.join("var/lib/arena/shadeform-nonce")).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&base);
+    assert!(out.status.success() && nonce.trim() == NONCE, "the harness ran the script: {}", String::from_utf8_lossy(&out.stderr));
+    // sshd: the first line whose key matches is the one used, options and all.
+    let first = keys.lines().find(|l| l.contains(blob)).unwrap();
+    assert!(
+        first.starts_with("ssh-ed25519 "),
+        "root's first entry for the cohort key is cloud-init's lock-out line — root login runs its `command=` and exits \
+         142:\n{keys}"
+    );
+}

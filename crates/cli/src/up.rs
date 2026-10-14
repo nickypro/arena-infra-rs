@@ -2770,6 +2770,32 @@ mod tests {
         assert_eq!(at, Duration::from_secs(120));
     }
 
+    /// REVIEW sf SF1 (money): with the shipped defaults — `pods up --timeout 600` and
+    /// `SHADEFORM_READY_MINS=15` — a Shadeform pod that never comes up is left billing. The
+    /// endpoint stage keeps the backend's ready deadline only when it is `<= --timeout`
+    /// (`ready_deadline(..).filter(|r| *r <= self.run.timeout)`); 900 s isn't, so `ready` is
+    /// `None`, the wait ends at 600 s as a plain `TimedOut`, and that path says "no SSH endpoint
+    /// after 600s — left running": no terminate, no next option, the VM bills (pending
+    /// time may be billed — unverified) until someone notices. The lane's own test only used a
+    /// deadline *under* the timeout (120 s). A backend with a ready deadline must make the
+    /// endpoint timeout a failed placement whichever bound comes first (`min(ready, --timeout)`).
+    #[tokio::test(start_paused = true)]
+    async fn review_sf_sf1_a_pod_pending_past_the_default_timeout_is_not_left_billing() {
+        let mut fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 5000), ("10.0.0.2", 22002, 0)])]);
+        fleet.ready = Some(Duration::from_secs(15 * 60)); // SHADEFORM_READY_MINS' default
+        let cfg = cfg(None);
+        let run = up_run(&fleet, Arc::new(FakeRemote::new()), &cfg, true, None, None).await;
+        assert_eq!(run.timeout, Duration::from_secs(600), "`pods up --timeout`'s default");
+        let made = make(&fleet, &["apple"]).await;
+        let rows = run_up(&run, made, std::future::pending(), &|_, _| {}).await;
+        assert!(
+            fleet.events().iter().any(|e| e == "terminate id1"),
+            "a Shadeform pod still pending at --timeout was left running: events {:?}, verdict {:?}",
+            fleet.events(),
+            rows[0].verdict
+        );
+    }
+
     /// Review fix: the proxy-only grace restarted whenever one listing lacked the pod — and the
     /// poller's aggregate listing drops every RunPod pod while RunPod's own list fails (a single
     /// 5xx/429), so one gap turned a replaceable host into `FAILED endpoint`, left billing. A

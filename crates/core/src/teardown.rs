@@ -1242,6 +1242,28 @@ mod tests {
         }
     }
 
+    /// REVIEW sf SF7: teardown never looks at Shadeform volumes (spec §8.2, §10.4.8, §11:
+    /// "Shadeform pods + a volume → NOT CLEAR"; left out as lane deviation 5 because arena never
+    /// creates one). But teardown's job is "nothing left billing *on the account*" — it lists
+    /// foreign pods for exactly that reason — and a volume made in the console (or by another
+    /// tool on the shared, admin-only key) bills per GB-month after every instance is gone,
+    /// while `teardown --check` prints ALL CLEAR without even a "not checked" line for it. With
+    /// SHADEFORM_API_KEY configured there must be a Shadeform volumes item (Clear / Remaining /
+    /// Unknown — or at least an explicit "not checked").
+    #[test]
+    fn review_sf_sf7_teardown_has_a_shadeform_volumes_item() {
+        let names = list();
+        let naming = Naming { prefix: "arena8", list: &names };
+        let mut i = inputs();
+        i.listings.push(("shadeform".into(), Ok(vec![])));
+        let r = build(&i, &naming);
+        assert!(
+            r.items.iter().any(|it| it.area == Area::Volumes && it.scope == "shadeform"),
+            "no Shadeform volumes line at all:\n{}",
+            r.render()
+        );
+    }
+
     #[test]
     fn all_clear_when_everything_answered_empty() {
         let names = list();

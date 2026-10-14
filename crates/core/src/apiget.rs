@@ -632,4 +632,39 @@ mod tests {
         let out = render(StatusCode::OK, body, false, "sf-key-material").unwrap();
         assert!(!out.contains("PRIVATE-KEY-MATERIAL") && out.contains("Shadeform Managed Key"), "{out}");
     }
+
+    /// REVIEW sf SF2: `--raw` on Shadeform's `sshkeys` is refused by the path's *first segment*,
+    /// but [`resolve_url`] strips a leading copy of the base's own version — the docs' spelling,
+    /// `https://api.shadeform.ai/v1/sshkeys`, pasted as `v1/sshkeys` or `/v1/sshkeys`. Such a path
+    /// passes the refusal (`v1` isn't `sshkeys`) and then GETs `/v1/sshkeys`: `api get shadeform
+    /// v1/sshkeys --raw` prints the managed key's private half, unredacted, to the terminal and
+    /// its logs. The refusal must judge the path actually requested (the resolved URL's), which
+    /// also covers a percent-encoded segment (`%73shkeys`): Shadeform's router is Go's (its 404
+    /// is `404 page not found`), which matches on the decoded path.
+    #[test]
+    fn review_sf_sf2_raw_refusal_covers_every_path_that_reaches_sshkeys() {
+        let sf = api_base("shadeform", &Config::parse("")).unwrap();
+        for path in ["v1/sshkeys", "/v1/sshkeys", "v1/sshkeys/abc/info", "/v1/sshkeys?x=1"] {
+            let url = resolve_url(sf.url, path).unwrap();
+            assert!(url.path().starts_with("/v1/sshkeys"), "{path} → {url}");
+            assert!(
+                refuse_raw(&sf, path, true).is_err(),
+                "`api get shadeform {path} --raw` passes the refusal and GETs {url} — the private key, raw"
+            );
+        }
+        let url = resolve_url(sf.url, "%73shkeys").unwrap();
+        assert_eq!(url.path(), "/v1/%73shkeys");
+        assert!(refuse_raw(&sf, "%73shkeys", true).is_err(), "`%73shkeys` is `sshkeys` to Go's router — refused only by spelling");
+    }
+
+    /// REVIEW sf SF8 (cosmetic): several new messages carry a run of spaces mid-sentence — a
+    /// source line continuation lost its `\`, so the next line's indentation became part of the
+    /// string: this refusal prints "private half there —              drop --raw". (Also in
+    /// the CLI: `warn_no_volume`'s Shadeform line and two `config check` rows.)
+    #[test]
+    fn review_sf_sf8_refusal_text_has_no_stray_indentation() {
+        let sf = api_base("shadeform", &Config::parse("")).unwrap();
+        let e = refuse_raw(&sf, "sshkeys", true).unwrap_err().to_string();
+        assert!(!e.contains("    "), "a run of spaces inside the message: {e:?}");
+    }
 }
