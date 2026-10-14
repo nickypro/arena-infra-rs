@@ -271,6 +271,10 @@ pub struct StatusInputs<'a> {
     /// Dirs no longer pushed whose earlier copies are still on the archive (A3-7): forgotten ones
     /// not deleted (`--delete-archived`), and staff boxes once on the list.
     pub still_archived: &'a [String],
+    /// Pod dirs whose archived copy `forget --delete-archived` deleted, taken back by `unforget`,
+    /// with the labels the control box no longer holds either: `pod (w0d1, w0d2)` — gone for good
+    /// (review w7la R2).
+    pub lost: &'a [String],
     /// How long ago `archive.json` was written (s): an archive that has never been pushed to an
     /// hour after `up` means the cron isn't pushing (AD10).
     pub host_written_age: Option<u64>,
@@ -506,6 +510,16 @@ pub fn judge_status(i: &StatusInputs) -> StatusReport {
                 "no longer pushed but their earlier copies are still on the archive, {who}: {} — `arena archive forget <pod> \
                  --delete-archived` deletes one",
                 i.still_archived.join(", ")
+            ),
+        );
+    }
+    if !i.lost.is_empty() {
+        r.add(
+            "lost",
+            Level::Warn,
+            format!(
+                "deleted from the archive (`forget --delete-archived`) and gone from the control box — not recoverable: {}",
+                i.lost.join(", ")
             ),
         );
     }
@@ -839,6 +853,7 @@ mod tests {
             off_list: &[],
             forgotten: &[],
             still_archived: &[],
+            lost: &[],
             host_written_age: None,
             snap_need: None,
             big_need: None,
@@ -1026,6 +1041,7 @@ mod tests {
                 off_list: &[],
                 forgotten: &[],
                 still_archived: &[],
+                lost: &[],
                 host_written_age: Some(age),
                 snap_need: None,
                 big_need: None,
@@ -1124,6 +1140,7 @@ mod tests {
             off_list: &[],
             forgotten: &forgotten,
             still_archived: &still,
+            lost: &[],
             host_written_age: None,
             snap_need: None,
             big_need: None,
@@ -1163,6 +1180,7 @@ mod tests {
             off_list: &["arena9-left".to_string()],
             forgotten: &["arena9-withdrew".to_string()],
             still_archived: &["arena9-withdrew".to_string()],
+            lost: &[],
             host_written_age: Some(7200),
             snap_need: Some(30 << 30),
             big_need: Some(1 << 30),

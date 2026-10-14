@@ -286,6 +286,34 @@ pub fn clear_snap_failing(st: &mut SnapState, pod: &str, label: &str) {
     }
 }
 
+/// Take `dirs` — a pod and its twins whose archived copy `forget --delete-archived` deleted —
+/// out of the snap sync state: every label it was pushed in reopens for it (pushed again, and
+/// checked, should it be pushed again: `unforget`), and no later label links to the deleted
+/// copy. Returns, per dir, the labels it was in: what the delete removed (review w7la R2).
+pub fn forget_pushes(st: &mut SnapState, dirs: &[String]) -> std::collections::BTreeMap<String, BTreeSet<String>> {
+    let mut out: std::collections::BTreeMap<String, BTreeSet<String>> = Default::default();
+    for (label, r) in st.labels.iter_mut() {
+        for d in dirs {
+            // Anything of it there — through, cut short or settled partial — was deleted.
+            let was_there = [r.pods_tried.remove(d), r.pods_ok.remove(d), r.given_up.remove(d)].contains(&true);
+            if was_there {
+                out.entry(d.clone()).or_default().insert(label.clone());
+            }
+            r.pods_linked.remove(d);
+            r.pods_final.remove(d);
+            r.pods_seeding.remove(d);
+            r.fails.remove(d);
+            if r.cut_off.as_deref() == Some(d.as_str()) {
+                r.cut_off = None;
+            }
+        }
+    }
+    for d in dirs {
+        st.pods_failing.remove(d);
+    }
+    out
+}
+
 /// Failure records only for pods still `present` on the control box: a pod whose dir was
 /// deleted there is never pushed again, so it can't stay "failing" for good (W7 live: a stale
 /// "⚠ big failing" after the pod's dir was gone).
@@ -1700,6 +1728,31 @@ mod tests {
         let mut r = LabelRecord::default();
         note_push_ok(&mut r, p, Update, true, false, true, true);
         assert!(r.pods_linked.contains(p) && !r.pods_final.contains(p), "nothing to link to: linked as it gets; never final without a content check");
+    }
+
+    /// Review w7la R2: a pod whose archived copy `forget --delete-archived` deleted is out of the
+    /// sync state — every label it was in reopens for it, nothing links to it — and what it was
+    /// in is returned; R4: a failing record of a label the pod is settled partial on goes.
+    #[test]
+    fn a_deleted_copy_leaves_the_sync_state_and_a_settled_label_is_not_failing() {
+        let mut st = SnapState::default();
+        st.labels.insert("w0d1".into(), LabelRecord { cut_off: Some("arena9-bloom".into()), ..rec(10, &["arena9-apple", "arena9-bloom"]) });
+        st.labels.insert("w0d2".into(), LabelRecord { given_up: set(&["arena9-bloom"]), fails: [("arena9-bloom".to_string(), 3)].into(), ..rec(20, A) });
+        st.labels.insert("w0d3".into(), rec(30, A));
+        st.pods_failing.insert("arena9-bloom".into(), "w0d2: Other: x".into());
+        let gone = forget_pushes(&mut st, &["arena9-bloom".to_string(), "arena9-bloom-old".to_string()]);
+        assert_eq!(gone.get("arena9-bloom").map(|l| l.iter().cloned().collect::<Vec<_>>()), Some(vec!["w0d1".to_string(), "w0d2".to_string()]));
+        assert!(!gone.contains_key("arena9-bloom-old"));
+        for r in st.labels.values() {
+            for set in [&r.pods_tried, &r.pods_ok, &r.pods_linked, &r.pods_final, &r.given_up] {
+                assert!(!set.contains("arena9-bloom"), "{r:?}");
+            }
+            assert!(!r.fails.contains_key("arena9-bloom") && r.cut_off.is_none(), "{r:?}");
+        }
+        assert!(st.labels["w0d1"].pods_final.contains("arena9-apple"), "the others untouched");
+        assert!(!sealed("w0d1", &st, START, &["arena9-apple".into(), "arena9-bloom".into()]), "it reopens for the pod");
+        assert!(link_labels_for("w0d3", "arena9-bloom", &st).is_empty(), "nothing links to the deleted copy");
+        assert!(st.pods_failing.is_empty());
     }
 
     /// The run's order (AD1): the newest label first, then the backlog oldest first, capped; the

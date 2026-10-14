@@ -756,6 +756,11 @@ pub(crate) async fn archive_status(env: &Env<'_>, cloud: Option<&dyn ArchiveClou
     // No longer pushed, but still on the archive (A3-7): forgotten without `--delete-archived`, and
     // staff boxes that once were on the list.
     let mut still_archived: Vec<String> = forgotten_file.pods.iter().filter(|(_, r)| r.deleted.is_none()).map(|(p, _)| p.clone()).collect();
+    let lost: Vec<String> = forgotten_file
+        .lost
+        .iter()
+        .map(|(p, labels)| format!("{p} ({})", labels.iter().cloned().collect::<Vec<_>>().join(", ")))
+        .collect();
     for d in push::staff_dirs(&names.prefix, &env.cfg.machine_names) {
         if ever.contains(&d) && !still_archived.contains(&d) {
             still_archived.push(d);
@@ -805,6 +810,7 @@ pub(crate) async fn archive_status(env: &Env<'_>, cloud: Option<&dyn ArchiveClou
         off_list: &off_list,
         forgotten: &forgotten,
         still_archived: &still_archived,
+        lost: &lost,
         host_written_age,
         snap_need,
         big_need,
@@ -1831,7 +1837,7 @@ pub(crate) async fn archive_forget(env: &Env<'_>, pod: &str, o: ForgetOpts, now:
             return Ok(());
         }
         for d in &dirs {
-            forgotten.pods.entry(d.clone()).or_insert(state::ForgetRecord { at: now, deleted: None });
+            forgotten.pods.entry(d.clone()).or_insert(state::ForgetRecord { at: now, ..Default::default() });
         }
         state::save(&file, &forgotten).with_context(|| format!("writing {}", file.display()))?;
         println!("✓ forgotten: {covers}.");
@@ -1918,24 +1924,47 @@ pub(crate) async fn archive_forget(env: &Env<'_>, pod: &str, o: ForgetOpts, now:
         }
     }
     let (done, _) = run(true).await?;
-    drop(held);
     let um = unmounted(&done);
     if !um.is_empty() || done.get("refused").is_some() {
         bail!("the archive refused the delete: the {} volume isn't mounted now — nothing was deleted", if um.is_empty() { "a".to_string() } else { um.join(" and ") });
     }
     match done.get("deleted").map(String::as_str) {
         Some(d) if !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()) => {
+            // R2: what the delete removed no longer counts as pushed — still under both tier
+            // locks, so no sync rewrites the state meanwhile: the labels reopen for these dirs
+            // (pushed and checked again after `unforget`, never called final meanwhile).
+            let cleared = clear_pushes(&env.paths, &dirs);
             for dir in &dirs {
                 if let Some(r) = forgotten.pods.get_mut(dir) {
                     r.deleted = Some(now);
+                    r.deleted_labels = cleared.as_ref().ok().and_then(|m| m.get(dir).cloned()).unwrap_or_default();
                 }
             }
             state::save(&file, &forgotten).with_context(|| format!("writing {}", file.display()))?;
+            drop(held);
             println!("✓ deleted {d} director{} of {covers} from the archive.", if d == "1" { "y" } else { "ies" });
+            cleared.context("the sync state still counts them as pushed (`arena archive unforget` clears it too)")?;
             Ok(())
         }
         _ => bail!("the archive refused or failed the delete ({done:?}) — `arena archive ssh` to look"),
     }
+}
+
+/// Take `dirs` out of both tiers' sync state ([`push::forget_pushes`]) — their archived copy was
+/// deleted — and return, per dir, the snapshot labels it held. The caller holds both tier locks.
+fn clear_pushes(paths: &ArchivePaths, dirs: &[String]) -> Result<std::collections::BTreeMap<String, std::collections::BTreeSet<String>>> {
+    let snap_path = paths.sync_state(Tier::Snap);
+    let mut snap = state::load_snap(&snap_path).map_err(anyhow::Error::msg)?;
+    let labels = push::forget_pushes(&mut snap, dirs);
+    state::save(&snap_path, &snap).context("saving sync-snap.json")?;
+    let big_path = paths.sync_state(Tier::Big);
+    let mut big = state::load_big(&big_path).map_err(anyhow::Error::msg)?;
+    for d in dirs {
+        big.pods_ok_at.remove(d);
+        big.pods_failing.remove(d);
+    }
+    state::save(&big_path, &big).context("saving sync-big.json")?;
+    Ok(labels)
 }
 
 /// `archive unforget <pod>`: take the pod (and its twins) off `forgotten.json`, once confirmed —
@@ -1953,22 +1982,51 @@ pub(crate) fn archive_unforget(env: &Env<'_>, pod: &str) -> Result<()> {
         return Ok(());
     }
     let deleted: Vec<String> = listed.iter().filter(|d| forgotten.pods[*d].deleted.is_some()).cloned().collect();
+    // R2: of what the delete removed, what the control box still holds comes back; the rest is
+    // gone for good — said here, and by `status` from now on.
+    let backup = PathBuf::from(super::local_backup_dir(env.cfg));
+    let comes_back = |d: &str| -> (Vec<String>, Vec<String>) {
+        forgotten.pods[d].deleted_labels.iter().cloned().partition(|l| backup.join(l).join(d).is_dir())
+    };
     println!("Unforget {}: pushes take them again from the next sync (if they're on MACHINE_NAME_LIST, or were archived before).", listed.join(", "));
-    if !deleted.is_empty() {
-        println!(
-            "  Their archived copy was DELETED (`forget --delete-archived`): that can't be undone — only what the control box still \
-             holds is pushed again: {}",
-            deleted.join(", ")
-        );
+    let mut lost: Vec<(String, Vec<String>)> = Vec::new();
+    for d in &deleted {
+        let (back, gone) = comes_back(d);
+        if back.is_empty() && gone.is_empty() {
+            println!("  {d}: its archived copy was DELETED (`forget --delete-archived`) — the next sync pushes what the control box still holds of it");
+        }
+        if !back.is_empty() {
+            println!("  {d}: deleted from the archive, still on the control box — pushed (and checked) again: {}", back.join(", "));
+        }
+        if !gone.is_empty() {
+            println!("  {d}: deleted from the archive and gone from the control box — LOST for good: {}", gone.join(", "));
+            lost.push((d.clone(), gone));
+        }
     }
     if !confirm(env.yes, &format!("Unforget {}?", listed.join(", ")))? {
         println!("aborted — they stay forgotten.");
         return Ok(());
     }
+    // A deleted copy no longer counts as pushed (`forget` cleared it; a delete before that did
+    // not): cleared again under both tier locks, so no sync rewrites the state meanwhile.
+    let mut held = Vec::new();
+    if !deleted.is_empty() {
+        for t in Tier::ALL {
+            match try_lock(&env.paths.sync_lock(t))? {
+                Some(l) => held.push(l),
+                None => bail!("an `arena archive sync` ({t}) is running — re-run `arena archive unforget {pod}` when it's done; nothing was changed"),
+            }
+        }
+        clear_pushes(&env.paths, &deleted)?;
+    }
+    for (d, gone) in lost {
+        forgotten.lost.entry(d).or_default().extend(gone);
+    }
     for d in &listed {
         forgotten.pods.remove(d);
     }
     state::save(&file, &forgotten).with_context(|| format!("writing {}", file.display()))?;
+    drop(held);
     println!("✓ unforgotten: {} — the next sync pushes them again.", listed.join(", "));
     Ok(())
 }

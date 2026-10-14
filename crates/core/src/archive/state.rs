@@ -320,21 +320,30 @@ impl BigState {
 pub struct Forgotten {
     pub version: u32,
     pub pods: BTreeMap<String, ForgetRecord>,
+    /// Per pod dir taken back by `archive unforget` after `--delete-archived`: the labels whose
+    /// archived copy was deleted and that the control box no longer holds either — gone for
+    /// good. `status` says so (review w7la R2); a later push of such a label clears it.
+    #[serde(default)]
+    pub lost: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// One forgotten pod dir.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForgetRecord {
     /// When it was forgotten (UNIX s).
     pub at: u64,
     /// When its archived copy was deleted (`--delete-archived`), if it was.
     #[serde(default)]
     pub deleted: Option<u64>,
+    /// The labels that copy held (per the sync state the delete cleared), so `unforget` can say
+    /// which come back from the control box and which are lost (R2).
+    #[serde(default)]
+    pub deleted_labels: BTreeSet<String>,
 }
 
 impl Default for Forgotten {
     fn default() -> Self {
-        Self { version: STATE_VERSION, pods: BTreeMap::new() }
+        Self { version: STATE_VERSION, pods: BTreeMap::new(), lost: BTreeMap::new() }
     }
 }
 
