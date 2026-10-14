@@ -84,6 +84,44 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     container host, so it ignores the GPU-centric `PodSpec` fields and takes its
     sizing/OS/location/SSH-keys from `HETZNER_*` config. VMs come up on a real public
     IP with SSH on `:22`, so they use the same proxy/`pods up` flow as GPU providers.
+  - `provider::shadeform` — Shadeform (one REST API over ~18 GPU clouds), **opt-in overflow
+    only** (`--provider shadeform`, never a default): a pod is a **bare GPU VM**, not a
+    container from the cohort image, and it **bills until deleted — no stop/start, no
+    volumes** (`VOLUME_GB>0` is refused). Placement is Vast-like: `create_pod` reads the catalog
+    (`GET /instances/types?gpu_type=…&num_gpus=…&available=true&sort=price`) and creates on the
+    cheapest **in-stock** `(cloud, region, type)` entry that passes every filter, re-checked
+    client-side: the cloud in `SHADEFORM_CLOUDS` (default `massedcompute` — in practice the only
+    cheap cloud with CUDA-13 images; `*` = any, with a `config check` warning) and the region in
+    `SHADEFORM_REGIONS`, a VM (bare metal only with `SHADEFORM_ALLOW_BAREMETAL=1`), on-demand
+    (spot never), an OS image at or above the CUDA floor (`MIN_CUDA_VERSION` /
+    `ALLOWED_CUDA_VERSIONS`: the newest `ubuntuNN.NN_cudaX.Y_shade_os`), a worst-case boot
+    ≤ `SHADEFORM_MAX_BOOT_SECS` (1200), and a price ≤ min(`--max-price`, `SHADEFORM_MAX_PRICE`
+    — default $1.00/h, the hard ceiling). A capacity refusal tries the next entry (3 at most).
+    GPU names map from RunPod's ids (`NVIDIA RTX A6000` → `A6000`; an unmapped one is refused
+    before any request — Shadeform answers a typo with an empty catalog). The key goes in
+    `X-API-KEY` only. Every create carries a fresh **nonce tag** (`arena`, `arena-<prefix>`,
+    `arena-nonce-<uuid>`): an answer that might hide an instance (a 5xx, no id, a timeout or a
+    dropped connection after sending) is settled by listing for that tag — adopted if found,
+    else the run stops with "may have been created" (never retried, never the next option).
+    After create the instance's price is checked again: above the cap or 10 % over the quote
+    → deleted at once. Root SSH comes from a **bootstrap script** (`launch_configuration`,
+    run by Shadeform when the VM turns active) that authorizes the cohort keys for root and
+    the `shadeform` user and writes the nonce to `/var/lib/arena/shadeform-nonce`; the endpoint
+    (`ip`, `ssh_port` or 22) is withheld until the VM has been active 60 s. The create uses the
+    uploaded cohort key `SHADEFORM_SSH_KEY` (default: the prefix), never silently the account's
+    Shadeform Managed Key (whose private half Shadeform holds; `default` opts into it). The
+    listing shows **every** instance on the account; arena only terminates, renames or
+    restarts one whose name has the prefix **and** that carries `arena-<prefix>` — anything
+    else is refused with no request. A new instance that goes to `error` before it has an
+    endpoint, or isn't up within `SHADEFORM_READY_MINS` (15), is deleted and the name placed
+    on the next option (`up`, with or without `--check`). Setup is the bare-VM script in its
+    GPU mode (`ARENA_GPU=1`: the CUDA requirements kept, `uv --torch-backend auto`, and the
+    env must see the GPU). `pods stop/start` refuse it up front; restart is gated as a wipe
+    (unverified); no lock; the reaper doesn't act on it yet. Balance: the undocumented
+    `GET /account` (`balance`, `hourly_burn` only — its personal fields are never kept);
+    any failure there is "unknown". `api get shadeform sshkeys --raw` is refused (it returns
+    the managed key's private half). Spec and recorded fixtures: `specs/shadeform.md`,
+    `crates/core/src/provider/fixtures/shadeform/`.
   - `naming` — next-free machine-name allocation, mirroring the legacy logic.
   - `snapshot` — one read-only picture of the fleet (`FleetSnapshot`, built by one pure
     `build` that the CLI and the TUI share), the **health cache** of the last deep check per
@@ -91,7 +129,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
   - `teardown` — the pure judge behind `teardown --check`: listings, volumes, keys, cron/`at`
     and proxy inputs in, a `✓ ✗ ? –` checklist with fix commands out (unknown ≠ empty).
   - `balance` — prepaid account balances and the fallback chain: live (RunPod GraphQL
-    `myself`, Vast `users/current`), else an estimate from the last reading minus max(billed,
+    `myself`, Vast `users/current`, Shadeform's undocumented `account`), else an estimate from
+    the last reading minus max(billed,
     metered) spend, else `?`; burn, runway, levels, the `balance.json` state and every
     surface's rendering (Hetzner postpaid); `idle` — the read-only
     `pods idle` probe script, its reply parser and the verdict/report (unknown ≠ idle).
@@ -128,8 +167,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     Provider list responses with an unexpected shape are errors, never "zero pods".
 - `arena` (CLI):
   - `pods list | create | stop | restart | terminate` (`--provider
-    runpod|vast|hetzner`; Vast reads `VAST_API_KEY`, Hetzner reads `HETZNER_API_KEY`
-    + `HETZNER_*`). `restart`/`terminate` take **one** pod (name, bare name, `@name` or id —
+    runpod|vast|hetzner|shadeform`; Vast reads `VAST_API_KEY`, Hetzner reads `HETZNER_API_KEY`
+    + `HETZNER_*`, Shadeform `SHADEFORM_API_KEY` + `SHADEFORM_*`). `restart`/`terminate` take **one** pod (name, bare name, `@name` or id —
     a name two pods share is refused: pass the id); `stop` takes the shared
     [target selection](#targeting--concurrency).
     `list` shows NAME PROVIDER ID STATUS (`run locked` for a locked pod) GPU (`count×type`;
@@ -329,6 +368,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
   - `offers [--gpu …] [--cloud …] [--max-price …] [--gpus N] [--order …] [--json]` —
     read-only: the same option table (OPTION, CLOUD, $/H/POD, PRICE source, STOCK, plus what
     the cap dropped and why), i.e. what `create`/`up` would try. `--json` = the plan.
+    `--provider shadeform`: one catalog read prices every option at its cheapest in-stock
+    entry (allowed clouds, CUDA floor, `SHADEFORM_MAX_PRICE`); an option with nothing in stock
+    is noted and left unpriced.
   - `pods up -n N` — one-command spin-up: create, then **one independent pipeline per
     pod** (never a batch), each started **the moment its create returns** — while placement
     may still be retrying for other names under `--retry-mins` (placed pods used to sit idle,
@@ -336,7 +378,10 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     (`--timeout`, default 600s, per pod; a pod up for 5 minutes with only RunPod's SSH proxy
     — a host with no public IP — is a host failure: `FAILED endpoint`, or replaced under
     `--check`; so is one still up behind the proxy only when a shorter `--timeout` ends, and
-    a listing that momentarily lacks the pod doesn't restart those 5 minutes)
+    a listing that momentarily lacks the pod doesn't restart those 5 minutes; on Shadeform a
+    pod listed `error`, or not up within `SHADEFORM_READY_MINS`, is a failed placement —
+    deleted at once and the name tried on the next option, with or without `--check`,
+    within `--check-attempts` placements)
     → sync the proxy (one writer at a time) → provision it (`--no-setup` skips) →
     [`--check`: deep check] → copy its API keys (when `keys/*_api_keys.csv` exist) →
     `[name] READY after 4m10s — …` or `[name] FAILED <stage>: …`, printed the moment that
@@ -653,7 +698,10 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     **RunPod** GraphQL `myself { clientBalance currentSpendPerHr spendLimit underBalance }`
     (a field RunPod drops costs that field: the query is retried with `clientBalance` alone),
     **Vast** `GET /api/v0/users/current/` → `credit` (that body carries the email and API
-    key: only `credit` is read, and it is never quoted) — when read now or under 5 min ago;
+    key: only `credit` is read, and it is never quoted), **Shadeform** `GET /account` (undocumented:
+    `balance` and `hourly_burn` only — the body's email, phone, tax id and address are dropped at
+    parse and never quoted; at $0 Shadeform's behaviour is undocumented: keep Auto Top Up on) —
+    when read now or under 5 min ago;
     else **est.**: the last live reading (or `balance set`) minus max(billed, metered)
     spend since — *billed* from RunPod's REST v2 hourly billing history (every resource on
     the account, but it lags: live, a bucket appears about an hour after its usage, filled
@@ -709,7 +757,7 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `--check` 2 if any account is critical, else 3 if any is unknown while burning, else 1
     if any is low. A failing source is one note here and a ⚠ row in `config check` —
     nowhere else does it print or change an exit.
-  - `balance set <runpod|vast> <USD>` — record the balance read off the console when every
+  - `balance set <runpod|vast|shadeform> <USD>` — record the balance read off the console when every
     API is dead (a manual anchor; a local write, scoped to the configured key; the next live
     reading replaces it). `create`/`up` print the target account's balance next to the plan
     — the runway after the new pods (`n ×` the dearest option; with no `--gpu` list or
@@ -1042,9 +1090,10 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     has a key (or a CSV row) can still be targeted by name. Dry-runs show each key name and
     whether it exists. `keys which` shows the local keys file. (`copy-keys`
     is the *distributor*; `keys` is the *generator*.)
-  - `api get <runpod|runpod-v1|runpod-v2|vast|hetzner> <path> [--raw]` — **read-only**
+  - `api get <runpod|runpod-v1|runpod-v2|vast|hetzner|shadeform> <path> [--raw]` — **read-only**
     passthrough for what no command covers (`pods/<id>`, `catalog/datacenters`,
-    `network-volumes`, `billing/pods`; Vast `users/current/`; Hetzner `locations`): one GET
+    `network-volumes`, `billing/pods`; Vast `users/current/`; Hetzner `locations`; Shadeform
+    `instances/types`, its key in `X-API-KEY`; `sshkeys` there refuses `--raw`): one GET
     (there is no other verb) with the configured key, printed as pretty JSON. The path is
     relative to the provider's API base — absolute URLs, `//host`, `..` and `#` are refused
     before the key is read, redirects aren't followed — so the key only goes to the provider.

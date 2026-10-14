@@ -30,6 +30,7 @@ flowchart TD
         RP2["runpod_v2<br/>REST v2 (RUNPOD_API=v2)"]
         Vast["vast<br/>(offer-search rent)"]
         Hz["hetzner<br/>(CPU VMs)"]
+        Sf["shadeform<br/>(GPU VMs, opt-in)"]
         Http["http + retry<br/>status before parse · backoff"]
         Sel["selector<br/>names · a..b ranges · filters"]
         Place["placement<br/>options → prices → place()"]
@@ -47,8 +48,8 @@ flowchart TD
         Misc["naming · gpu · openrouter · apikeys · backup<br/>pull · restore · volume · sshconfig · metrics · plan · schedule"]
 
         Config --> Fleet
-        Fleet --> RP1 & RP2 & Vast & Hz
-        RP1 & RP2 & Vast & Hz --> Http
+        Fleet --> RP1 & RP2 & Vast & Hz & Sf
+        RP1 & RP2 & Vast & Hz & Sf --> Http
         Place -->|"create, one at a time"| Fleet
         Setup --> Remote
         Health --> Remote
@@ -68,7 +69,7 @@ flowchart TD
 
     cfg[("config.env<br/>--config (default: the read-only prod copy)")] -->|read| Config
     Arch -->|"rsync push (rrsync, write-only) · pinned ssh"| archvm[("backup archive VM<br/>snap + big volumes, sftp read-only")]
-    Http -->|HTTPS| APIs[("rest.runpod.io/v1 · api.runpod.io/v2 + /graphql<br/>console.vast.ai/api/v0 · api.hetzner.cloud/v1<br/>openrouter.ai/api/v1")]
+    Http -->|HTTPS| APIs[("rest.runpod.io/v1 · api.runpod.io/v2 + /graphql<br/>console.vast.ai/api/v0 · api.hetzner.cloud/v1<br/>api.shadeform.ai/v1 · openrouter.ai/api/v1")]
     Remote -->|"ssh / scp, each call on a budget"| pods[("pods<br/>setup · deep check · run · jobs · git")]
     CLI -->|"write (flock, atomic) + SSH_PROXY_RELOAD_CMD"| nginx[("proxy nginx stream config<br/>local file, or over SSH")]
     CLI -->|"test --deep · up --check"| cache[("health.json<br/>$ARENA_STATE_DIR/&lt;prefix&gt;/")]
@@ -97,6 +98,7 @@ flowchart TD
 | `provider` | the `Provider` trait, `build` (one backend by name) and `build_fleet` (`MultiProvider`: lists every configured backend, creates on the `--provider` one, routes per-pod calls to the owner). `list_by_provider` keeps each backend's own Ok/Err — a failed listing is never "no pods"; `list_complete` (every name-picking caller: create/up, placement retry rounds, rename, the TUI's add form) fails if any backend didn't answer — between retry rounds (`placement::relist`, both create paths) a recoverable failure (429/5xx, or a list stalled past its bound) skips that round instead of ending the run. List calls bounded at 60 s (`LIST_TIMEOUT`, an `Error::Timeout`); mutating calls deliberately aren't | trait + I/O |
 | `provider::runpod` / `runpod_v2` | RunPod REST v1 (which RunPod retires on 2026-11-15) and REST v2 (`RUNPOD_API=v2`: paginated listing, real lifecycle statuses, explicit `cloud`, account SSH keys merged into `PUBLIC_KEY`). v1 uses GraphQL for rename, maintenance windows, the GPU catalog and network volumes; v2 renames (name-only `PATCH`), locks/unlocks (`{"locked"}`-only `PATCH`) and reads the catalog over REST, keeping GraphQL only for maintenance windows, the balance and a volume-listing fallback (the "GraphQL dependency inventory" in `runpod_v2.rs`); contract tests replay recorded v2 responses (`provider/fixtures/runpod_v2/`) | builders/parsers pure |
 | `provider::vast`, `provider::hetzner` | Vast rents the cheapest matching *offer* (name carried as the instance label — its offer search still sends the flat query body Vast now rejects, see FEATURE_MAP); Hetzner creates CPU VMs sized by `HETZNER_*` | parsers pure |
+| `provider::shadeform` | opt-in overflow GPU VMs (`--provider shadeform`): catalog → `fitting_entries` (clouds/regions allowlists, VM, on-demand, `best_os` at the CUDA floor, boot time, price cap) → create with a nonce tag and a rendered bootstrap script (`shadeform_bootstrap.sh`: cohort keys for root, the nonce file); an unsure create is settled by listing for the nonce (`create_outcome`, `find_by_nonce`), a created one price-checked (`price_guard`); ownership (`is_ours`: prefix name + `arena-<prefix>` tag) guards terminate/rename/restart; no stop (`stop_support`), a ready deadline (`ready_deadline`) that `up` turns into delete + next option; `/sshkeys` and `/account` typed at parse (no private key, no personal data kept); contract tests replay recorded GETs (`provider/fixtures/shadeform/`) | catalog/create/parse pure; loopback-tested I/O |
 | `http`, `retry` | every response's **status is read before its body is parsed**, so a 401 with an HTML body is classified `Auth`, a 429/5xx transient, a capacity message `Capacity`; `retry` backs off on transient errors only | yes |
 | `remote` | the `Remote` trait (`exec`, `copy`, `copy_recursive`, each with a timeout): `SshRemote` stops a timed-out ssh/scp with SIGTERM then SIGKILL before returning the timeout (`run_local`: the same for rsync); `FakeRemote` (feature `test-util`) scripts replies, delays and failures per host | trait + I/O |
 | `selector` | one target syntax for every fleet command: bare/full/`@` names, ids, `a..b` ranges in list order, `all`, `--exclude`, `--gpus N`, `--on`; typos and empty selections are errors | yes |
