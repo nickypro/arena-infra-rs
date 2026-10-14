@@ -1,5 +1,7 @@
 # arena-infra-rs
 
+[![CI](https://github.com/nickypro/arena-infra-rs/actions/workflows/ci.yml/badge.svg?branch=dev%2Fphase0)](https://github.com/nickypro/arena-infra-rs/actions/workflows/ci.yml)
+
 A streamlined Rust rewrite of `arena-infra` — the control plane for ARENA's GPU
 pods. Goals: multi-provider machine spin-up, a tidy commit/backup flow, a
 performance/GPU/progress dashboard, and robust port forwarding, behind both a CLI
