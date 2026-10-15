@@ -1,6 +1,7 @@
 # CI: the same gate every change passes locally before a push — release build + the full test
-# suite with zero warnings. Hermetic: no provider keys, no network calls (the live smoke test is
-# `#[ignore]` and also guarded by ARENA_LIVE_SMOKE), so it's safe on a public repo and on PRs.
+# suite with zero warnings, and clippy with zero warnings. Hermetic: no provider keys, no
+# network calls (the live smoke test is `#[ignore]` and also guarded by ARENA_LIVE_SMOKE), so
+# it's safe on a public repo and on PRs.
 name: CI
 
 on:
@@ -50,9 +51,10 @@ jobs:
       - name: Test
         run: cargo test --release --locked
 
-  # Informational until the clippy clean-up lands: reports the count, never fails the run.
+  # Blocking: any clippy warning fails the run. The lint set is the pinned toolchain's
+  # (RUSTUP_TOOLCHAIN), so a newer clippy's new lints arrive only with a deliberate bump.
   clippy:
-    name: clippy (report only)
+    name: clippy
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -61,9 +63,4 @@ jobs:
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Clippy
-        run: |
-          cargo clippy --all-targets --locked 2>&1 | tee clippy.log || true
-          # Each clippy warning carries a "…/rust-clippy/…/index.html#<lint>" help link.
-          grep -oE 'rust-clippy/[^ ]*index\.html#[a-z_]+' clippy.log | sed 's/.*#//' | sort | uniq -c | sort -rn > lints.txt || true
-          echo "### clippy: $(awk '{s+=$1} END {print s+0}' lints.txt) warnings" >> "$GITHUB_STEP_SUMMARY"
-          head -25 lints.txt | sed 's/^/    /' >> "$GITHUB_STEP_SUMMARY"
+        run: cargo clippy --all-targets --locked -- -D warnings
