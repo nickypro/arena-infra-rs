@@ -56,7 +56,7 @@ fn reply<T>(call: PodCall, parse: impl FnOnce(&str) -> Result<T, String>) -> Res
     let out = call?;
     if !out.success && !out.stdout.contains("ARENA_") {
         let stderr = arena_core::ssh::strip_interactive_noise(&out.stderr);
-        let last = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).last().unwrap_or("(no output)");
+        let last = stderr.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("(no output)");
         let code = out.code.map_or_else(|| "killed".to_string(), |c| c.to_string());
         return Err(format!("exit {code}: {}", jobs::sanitize(last)));
     }
@@ -191,7 +191,7 @@ pub(crate) async fn handle_list(
     let replies = each_reply(&remote, &targets, &jobs::list_command(), READ_TIMEOUT, jobs::parse_list).await;
     let pods: Vec<(String, Result<Vec<JobInfo>, String>)> = targets.into_iter().map(|(n, _)| n).zip(replies).collect();
     let (text, failed) = jobs::render_jobs(&pods, only);
-    text.lines().for_each(|l| say(l));
+    text.lines().for_each(say);
     if failed > 0 {
         anyhow::bail!("{failed} pod(s) failed");
     }

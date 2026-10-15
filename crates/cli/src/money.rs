@@ -390,7 +390,7 @@ fn read_probe(call: PodCall) -> Probe {
     };
     if !out.success && !out.stdout.contains("ARENA_IDLE_") {
         let stderr = arena_core::ssh::strip_interactive_noise(&out.stderr);
-        let last = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).last().unwrap_or("(no output)");
+        let last = stderr.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("(no output)");
         let code = out.code.map_or_else(|| "killed".to_string(), |c| c.to_string());
         return Probe::Failed(format!("exit {code}: {}", arena_core::jobs::sanitize(last)));
     }
@@ -440,7 +440,7 @@ pub(crate) async fn handle_idle(
     if json {
         say(&serde_json::to_string_pretty(&report)?);
     } else {
-        idle::render(&report).lines().for_each(|l| say(l));
+        idle::render(&report).lines().for_each(say);
     }
     Ok(())
 }
@@ -759,7 +759,8 @@ mod tests {
         let check = BalanceFlags { check: true, ..Default::default() };
         let gone = || Fail { kind: FailKind::Gone, http: Some(404), detail: None };
         // (case, runpod live, vast live, exit)
-        let cases: Vec<(&str, std::result::Result<Live, Fail>, std::result::Result<Live, Fail>, i32)> = vec![
+        type Case = (&'static str, std::result::Result<Live, Fail>, std::result::Result<Live, Fail>, i32);
+        let cases: Vec<Case> = vec![
             ("all fine", Ok(rp_live(500.0, 0.5)), Ok(vast_live(10.0)), 0),
             ("low", Ok(rp_live(30.0, 0.5)), Ok(vast_live(10.0)), 1),
             ("critical", Ok(rp_live(5.0, 0.5)), Ok(vast_live(10.0)), 2),

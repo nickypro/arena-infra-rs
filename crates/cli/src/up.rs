@@ -1552,7 +1552,7 @@ mod tests {
     /// test makes each take `sync_delay`, so overlapping proxy writers would show).
     #[derive(Default)]
     struct Fleet {
-        endpoints: Mutex<HashMap<String, VecDeque<(String, u16, Duration)>>>,
+        endpoints: Mutex<Endpoints>,
         pods: Mutex<Vec<Slot>>,
         events: Mutex<Vec<String>>,
         next_id: AtomicUsize,
@@ -1611,9 +1611,15 @@ mod tests {
         gone_at: Option<Instant>,
     }
 
+    /// Per pod name: the endpoint each of its creates gets, in order — `(ip, port, after)`.
+    type Endpoints = HashMap<String, VecDeque<(String, u16, Duration)>>;
+
+    /// One name's script: `(name, [(ip, port, endpoint after N s)])`.
+    type Script<'a> = (&'a str, &'a [(&'a str, u16, u64)]);
+
     impl Fleet {
         /// `(name, [(ip, port, endpoint after N s)])` — one endpoint per create of that name.
-        fn new(script: &[(&str, &[(&str, u16, u64)])]) -> Self {
+        fn new(script: &[Script<'_>]) -> Self {
             let fleet = Fleet::default();
             for (name, eps) in script {
                 let q = eps.iter().map(|(ip, port, s)| (ip.to_string(), *port, Duration::from_secs(*s))).collect();

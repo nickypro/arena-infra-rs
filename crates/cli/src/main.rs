@@ -993,6 +993,7 @@ enum PodCmd {
     ///
     /// Targets: names / ids / ranges / `all` (see "Target selection"); none = the whole fleet.
     #[command(verbatim_doc_comment)]
+    #[allow(clippy::doc_lazy_continuation)] // verbatim `--help` text: its layout is the output, not Markdown
     Setup {
         /// Preview only: print what would happen, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
@@ -1908,14 +1909,6 @@ const CAPACITY_RETRY_SECS: u64 = 30;
 /// enough to "wait around" for a free GPU, bounded enough to never spin forever.
 const MAX_CAPACITY_ATTEMPTS: u32 = 120;
 
-/// Create one pod per name, returning those that came up. Error handling is typed:
-/// - `Capacity` → the pool is exhausted; stop gracefully (or, with `keep_trying`,
-///   wait `CAPACITY_RETRY_SECS` and retry that name) — the pods already created are
-///   kept, never rolled back.
-/// - `Auth` → credentials are wrong; abort immediately (retrying is pointless).
-/// - anything else → report what we made so far, then surface the error.
-/// Command-line overrides for the create spec, so you don't have to edit config.env
-/// to spin up a different GPU/count/cloud for one run.
 /// Start-command script for `--bootstrap`: makes a non-arena base image (e.g. an NVIDIA
 /// NGC image) SSH-reachable. Installs openssh-server, authorizes `$PUBLIC_KEY` (which
 /// RunPod injects from the pod's env), generates host keys, and runs sshd in the
@@ -1925,6 +1918,8 @@ const MAX_CAPACITY_ATTEMPTS: u32 = 120;
 /// The prebuilt arena image needs none of this, so `--bootstrap` is opt-in.
 const BOOTSTRAP_SCRIPT: &str = r#"export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get install -y --no-install-recommends openssh-server && mkdir -p ~/.ssh && echo "$PUBLIC_KEY" >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && ssh-keygen -A && mkdir -p /run/sshd && /usr/sbin/sshd -D"#;
 
+/// Command-line overrides for the create spec, so you don't have to edit config.env
+/// to spin up a different GPU/count/cloud for one run.
 #[derive(Debug, Clone, Default)]
 struct SpecOverrides {
     gpu: Option<String>,
@@ -2309,6 +2304,12 @@ async fn create_with_retry(
     Ok(all)
 }
 
+/// Create one pod per name, returning those that came up. Error handling is typed:
+/// - `Capacity` → the pool is exhausted; stop gracefully (or, with `keep_trying`,
+///   wait `CAPACITY_RETRY_SECS` and retry that name) — the pods already created are
+///   kept, never rolled back.
+/// - `Auth` → credentials are wrong; abort immediately (retrying is pointless).
+/// - anything else → report what we made so far, then surface the error.
 async fn create_pods(
     provider: &dyn Provider,
     cfg: &Config,
@@ -3473,7 +3474,7 @@ fn setup_config(
         flag.or_else(|| cfg.get(k).filter(|s| !s.is_empty()).map(String::from))
     };
     let mut scfg = arena_core::setup::SetupConfig::from_config(cfg)?;
-    scfg.broadcast_exports = arena_core::apikeys::broadcast_env_vars(&token_value);
+    scfg.broadcast_exports = arena_core::apikeys::broadcast_env_vars(token_value);
     scfg.zsh_install = zsh_install;
     if no_vscode {
         scfg.vscode = None;
@@ -6204,7 +6205,7 @@ async fn handle_plan(cmd: PlanCmd, provider: &dyn Provider, cfg: &Config) -> Res
             }
             for d in &plan.days {
                 let date = d.effective_days(today_days).map(ymd_string).unwrap_or_else(|| "??".into());
-                let today = (d.effective_days(today_days) == Some(today_days)).then_some(" (today)").unwrap_or("");
+                let today = if d.effective_days(today_days) == Some(today_days) { " (today)" } else { "" };
                 println!(
                     "  {date}{today}: {} pods × {}gpu{}",
                     d.count,
@@ -7401,7 +7402,7 @@ fn run_failure(out: &arena_core::ssh::SshOutput) -> (String, String) {
     let stderr = strip_interactive_noise(out.stderr.trim()).trim().to_string();
     let exit = if stderr.is_empty() { out.exit_label() } else { format!("{}: {stderr}", out.exit_label()) };
     let text = if stdout.is_empty() { exit } else { format!("{stdout}\n{exit}") };
-    let last = |s: &str| s.lines().map(str::trim).filter(|l| !l.is_empty()).last().map(String::from);
+    let last = |s: &str| s.lines().map(str::trim).rfind(|l| !l.is_empty()).map(String::from);
     let why = match (last(&stderr), last(&stdout)) {
         (Some(e), _) => format!("{}: {e}", out.exit_label()),
         (None, Some(o)) => format!("{} — last output: {o}", out.exit_label()),
@@ -11993,7 +11994,7 @@ async fn resolve_target_any(
         let Ok(p) = arena_core::provider::build(name, cfg) else { continue };
         match arena_core::retry::retrying(&policy, || p.list_pods()).await {
             Ok(listed) => {
-                owner_of.extend(std::iter::repeat(backends.len()).take(listed.len()));
+                owner_of.extend(std::iter::repeat_n(backends.len(), listed.len()));
                 pods.extend(listed);
                 backends.push((name, p));
             }
@@ -13330,7 +13331,7 @@ fn restore_note(
 ) -> Option<String> {
     use arena_core::volume::{repo_pull, RepoProbe};
     let rel = repo_pull(repo, user, None)?.rel; // the repo's place in the backup (home-relative)
-    let carried = sub.map_or(true, |p| p == rel || p.starts_with(&format!("{rel}/")) || rel.starts_with(&format!("{p}/")));
+    let carried = sub.is_none_or(|p| p == rel || p.starts_with(&format!("{rel}/")) || rel.starts_with(&format!("{p}/")));
     if !carried || !src.join(&rel).exists() {
         return None;
     }
@@ -13660,7 +13661,7 @@ impl KeySources {
             };
             flag.or_else(|| cfg.get(k).filter(|s| !s.is_empty()).map(String::from))
         };
-        let broadcast = apikeys::broadcast_env_vars(&token_value);
+        let broadcast = apikeys::broadcast_env_vars(token_value);
         let broadcast_names =
             apikeys::BROADCAST_TOKENS.iter().filter(|(key, _, _)| token_value(key).is_some()).map(|(_, d, _)| *d).collect();
         Self { per_host, broadcast, csv, broadcast_names }
@@ -13771,7 +13772,9 @@ async fn handle_copy_keys(
 
     // Build the per-pod var set (broadcast HF merged into every reachable selected pod).
     let pods = &sel.pods;
-    let mut jobs: Vec<(String, SshTarget, Vec<(String, String)>)> = Vec::new();
+    /// One pod's write: its name, how to reach it, and the `(name, value)` vars it gets.
+    type KeyJob = (String, SshTarget, Vec<(String, String)>);
+    let mut jobs: Vec<KeyJob> = Vec::new();
     // Reachable pods that matched NO per-host key — they'd get broadcast tokens only.
     // Worth flagging loudly: a stale/misnamed CSV (e.g. last cohort's hosts) otherwise
     // hides behind a per-pod ✓, so nobody notices the per-host keys never landed.
@@ -14176,7 +14179,7 @@ async fn keys_with(
                 println!("(no {prefix}-* keys; {excluded} other key(s) hidden — use --all to show all)");
                 return Ok(());
             }
-            println!("{:<28} {:>9} {:>9}  {}", "NAME", "LIMIT", "USAGE", "HASH");
+            println!("{:<28} {:>9} {:>9}  HASH", "NAME", "LIMIT", "USAGE");
             for k in &shown {
                 let lim = k.limit.map(|l| format!("${l:.2}")).unwrap_or_else(|| "-".into());
                 let used = k.usage.map(|u| format!("${u:.2}")).unwrap_or_else(|| "-".into());
@@ -16396,7 +16399,7 @@ mod tests {
     fn install_preserves_other_crontab_entries() {
         let existing = "0 9 * * * /usr/bin/other-job\n# my note\n";
         let line = "0 * * * * arena pods backup --yes".to_string();
-        let out = with_arena_block(existing, &[line.clone()]);
+        let out = with_arena_block(existing, std::slice::from_ref(&line));
         // keeps the user's entries…
         assert!(out.contains("/usr/bin/other-job"));
         assert!(out.contains("# my note"));
@@ -16683,7 +16686,7 @@ mod tests {
         );
 
         // Duplicates of a kind (two backup lines from a hand edit) collapse into the new one.
-        let doubled: Vec<String> = vec![legacy_backup.into(), legacy_backup.replace("*/15", "0").into()];
+        let doubled: Vec<String> = vec![legacy_backup.into(), legacy_backup.replace("*/15", "0")];
         assert_eq!(merge_cron_block(&doubled, &[Backup], &backup), [backup[0].1.as_str()]);
 
         // `cron remove --proxy --snapshot`: just those; the backup line and the note stay.
@@ -16827,11 +16830,12 @@ mod tests {
         let a = cron_job(false, false).remove(0);
         let doubled = vec![a.clone(), a.clone()];
         let after = merge_cron_block(&doubled, &[Backup], &[(Backup, a.clone())]);
-        assert_eq!(after, [a.clone()]);
+        assert_eq!(after, std::slice::from_ref(&a));
         assert_eq!(cron_diff(&doubled, &after), [format!("- {a}"), format!("  {a}")]);
         // (case, before, after, diff)
         let l = |s: &str| s.to_string();
-        let cases: Vec<(&str, Vec<String>, Vec<String>, Vec<String>)> = vec![
+        type Case = (&'static str, Vec<String>, Vec<String>, Vec<String>);
+        let cases: Vec<Case> = vec![
             ("unchanged", vec![l("A"), l("B")], vec![l("A"), l("B")], vec![l("  A"), l("  B")]),
             ("replace in place", vec![l("A"), l("B")], vec![l("X"), l("B")], vec![l("- A"), l("+ X"), l("  B")]),
             ("three copies to one", vec![l("A"), l("A"), l("A")], vec![l("A")], vec![l("- A"), l("- A"), l("  A")]),
@@ -16888,7 +16892,8 @@ mod tests {
         let none = BackupFlags { schedule: None, start_date: None, no_start_date: false, pull: false, no_pull: false };
         let want = |schedule: &str, start: Option<&str>, pull: bool| BackupOpts { schedule: schedule.into(), start_date: start.map(String::from), pull };
         // (case, installed, flags, opts, kept)
-        let cases: Vec<(&str, Option<&BackupOpts>, BackupFlags, BackupOpts, Vec<&str>)> = vec![
+        type Case<'a> = (&'a str, Option<&'a BackupOpts>, BackupFlags<'a>, BackupOpts, Vec<&'a str>);
+        let cases: Vec<Case> = vec![
             ("fresh: the defaults", None, BackupFlags { ..none }, want("*/15 * * * *", None, false), vec![]),
             ("fresh with flags", None, BackupFlags { pull: true, start_date: Some("2026-03-01"), ..none }, want("*/15 * * * *", Some("2026-03-01"), true), vec![]),
             (
@@ -17540,13 +17545,16 @@ mod proxy_deploy_tests {
 
     /// A fleet whose per-provider listing the test scripts between lifecycle steps — the
     /// shape `build_fleet` hands the pods commands.
-    struct Fleet(std::sync::Mutex<Vec<(&'static str, std::result::Result<Vec<Pod>, &'static str>)>>);
+    struct Fleet(std::sync::Mutex<Listings>);
+
+    /// Per provider: its pods, or why its listing failed.
+    type Listings = Vec<(&'static str, std::result::Result<Vec<Pod>, &'static str>)>;
 
     impl Fleet {
-        fn new(v: Vec<(&'static str, std::result::Result<Vec<Pod>, &'static str>)>) -> Self {
+        fn new(v: Listings) -> Self {
             Fleet(std::sync::Mutex::new(v))
         }
-        fn set(&self, v: Vec<(&'static str, std::result::Result<Vec<Pod>, &'static str>)>) {
+        fn set(&self, v: Listings) {
             *self.0.lock().unwrap() = v;
         }
     }
@@ -19042,7 +19050,8 @@ mod remote_tests {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         // (positionals, --label, -t, want: Ok((label, targets, noted)) or Err(tell))
         type Want<'a> = std::result::Result<(Option<&'a str>, &'a [&'a str], bool), &'a str>;
-        let cases: &[(&[&str], Option<&str>, &[&str], Want)] = &[
+        type Case<'a> = (&'a [&'a str], Option<&'a str>, &'a [&'a str], Want<'a>);
+        let cases: &[Case] = &[
             (&["bravo"], None, &[], Ok((None, &["bravo"], false))),
             (&["bravo", "apple..bloom"], Some("w1d3"), &[], Ok((Some("w1d3"), &["bravo", "apple..bloom"], false))),
             (&[], None, &[], Ok((None, &[], false))),

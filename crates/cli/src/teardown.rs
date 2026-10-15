@@ -55,6 +55,7 @@ pub(crate) async fn handle_teardown(provider: &dyn Provider, cfg: &Config, check
 /// (or `--json`), then fail unless everything is clear — something remaining *or* unknown
 /// makes the exit non-zero. The balance (`bal`) is information only: whatever it says, or
 /// however it fails, the items and the exit are the same.
+#[allow(clippy::too_many_arguments)] // one argument per source, so tests can hand in fakes
 pub(crate) async fn teardown_with(
     provider: &dyn Provider,
     cfg: &Config,
@@ -97,6 +98,7 @@ fn listing_error_text(e: &arena_core::Error) -> String {
 }
 
 /// Read every source concurrently — the prepaid balances inline among them — and judge them.
+#[allow(clippy::too_many_arguments)] // one argument per source, as `teardown_with`
 async fn collect(
     provider: &dyn Provider,
     cfg: &Config,

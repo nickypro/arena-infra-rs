@@ -600,7 +600,9 @@ async fn handle_set(env: &ReapEnv<'_>, sel: &Select, ask: SetAsk, dry_run: bool)
     // Every value from the record as it is NOW, re-read under the state lock (RR7): another
     // `reap set` (an `--extend` from another terminal) that finished while this one was
     // listing the fleet is built on, never overwritten with what this one read before it.
-    let decide = |s: &ReapState| -> std::result::Result<Vec<(Pod, Option<u64>, Option<u64>, bool)>, String> {
+    /// Per pod: its new `expires_at` and `idle_after_secs`, and whether it is pinned now.
+    type SetPlan = Vec<(Pod, Option<u64>, Option<u64>, bool)>;
+    let decide = |s: &ReapState| -> std::result::Result<SetPlan, String> {
         let mut plan = Vec::new();
         for p in &pods {
             let old = s.pods.get(&core_reap::key(&p.provider, &p.id));
@@ -988,6 +990,7 @@ struct RunCtx<'a, 'b> {
 }
 
 impl RunCtx<'_, '_> {
+    #[allow(clippy::too_many_arguments)] // one argument per `LogLine` field
     fn log(&self, kind: &str, pod: Option<&str>, key: Option<&str>, row: Row, reasons: &[Reason], trigger: Option<Trigger>, paths: Vec<String>) {
         let line = LogLine {
             t: (self.env.clock)(),

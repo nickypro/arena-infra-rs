@@ -116,7 +116,7 @@ fn setup(tag: &str) -> (Tmp, PathBuf, PathBuf, PathBuf) {
 }
 
 fn last_line(s: &str) -> &str {
-    s.lines().map(str::trim).filter(|l| !l.is_empty()).last().unwrap_or("")
+    s.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("")
 }
 
 #[test]

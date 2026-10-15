@@ -1227,7 +1227,7 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
         match lock_within(&ctx.paths.sync_lock(Tier::Snap), LOCK_PATIENCE).await? {
             Some(l) => Some(l),
             None => {
-                (ctx.say)(&format!("= snap: another `archive sync` is pushing it — skipped"));
+                (ctx.say)("= snap: another `archive sync` is pushing it — skipped");
                 return Ok(0);
             }
         }
@@ -1249,7 +1249,7 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
     let plan = push::plan_snap(&local, &o.labels, &st, start);
     let base_todo: Vec<push::LocalBaseline> = baselines.iter().copied().filter(|b| !push::baseline_pushed(*b, &st)).collect();
     if plan.labels.is_empty() && base_todo.is_empty() {
-        (ctx.say)(&format!("= snap: nothing to push (every label is final)"));
+        (ctx.say)("= snap: nothing to push (every label is final)");
         save_snap(ctx, &st)?;
         return Ok(0);
     }
@@ -1284,7 +1284,7 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
         } else if !jobs[0].left_out.is_empty() {
             failed += 1;
             baseline_failed = true;
-            (ctx.say)(&format!("✗ snap baseline: left out of this run (labels are pushed without it and stay open until it's there)"));
+            (ctx.say)("✗ snap baseline: left out of this run (labels are pushed without it and stay open until it's there)");
         } else {
             tried += 1;
             let root = ctx.dir.join(arena_core::pull::BASELINE_DIR);
@@ -1510,7 +1510,7 @@ async fn sync_snap(ctx: &SyncCtx<'_>) -> Result<usize> {
     //    failure every pod shares, or one in a run the archive itself failed, is nobody's.
     if outage {
         if !charges.is_empty() || baseline_failed {
-            (ctx.say)(&format!("  (the archive failed: none of this run's failures counts against a pod)"));
+            (ctx.say)("  (the archive failed: none of this run's failures counts against a pod)");
         }
     } else {
         for ch in charges {
@@ -1569,7 +1569,7 @@ async fn sync_big(ctx: &SyncCtx<'_>) -> Result<usize> {
         match lock_within(&ctx.paths.sync_lock(Tier::Big), LOCK_PATIENCE).await? {
             Some(l) => Some(l),
             None => {
-                (ctx.say)(&format!("= big: another `archive sync` is pushing it — skipped"));
+                (ctx.say)("= big: another `archive sync` is pushing it — skipped");
                 return Ok(0);
             }
         }
@@ -1974,7 +1974,7 @@ pub(crate) async fn archive_forget(env: &Env<'_>, pod: &str, o: ForgetOpts, now:
     }
     let (done, _) = run(true).await?;
     let um = unmounted(&done);
-    if !um.is_empty() || done.get("refused").is_some() {
+    if !um.is_empty() || done.contains_key("refused") {
         bail!("the archive refused the delete: the {} volume isn't mounted now — nothing was deleted", if um.is_empty() { "a".to_string() } else { um.join(" and ") });
     }
     match done.get("deleted").map(String::as_str) {
@@ -2159,7 +2159,7 @@ pub(crate) async fn archive_down(env: &Env<'_>, cloud: &dyn ArchiveCloud, o: Dow
         }
         let snap = state::load_snap(&env.paths.sync_state(Tier::Snap)).unwrap_or_default();
         let big = state::load_big(&env.paths.sync_state(Tier::Big)).unwrap_or_default();
-        let at = |t: Option<u64>| t.map_or("never".to_string(), |t| arena_core::snapshot::rfc3339(t));
+        let at = |t: Option<u64>| t.map_or("never".to_string(), arena_core::snapshot::rfc3339);
         println!("  last OK push: snap {}, big {}", at(snap.last_ok()), at(big.last_ok.map(|r| r.finished)));
         if let Ok(start) = start_days(env.cfg) {
             let forgotten = state::load_forgotten(&env.paths.forgotten()).map(|f| f.names()).unwrap_or_default();

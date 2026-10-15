@@ -1048,7 +1048,7 @@ async fn keep_and_not_covered_veto() {
         assert!(w.terminated().is_empty(), "{case}");
         let want = if case == "keep" { Row::Keep } else { Row::NotCovered };
         assert_eq!(w.last_row(&a), Some(want), "{case}");
-        let ends = super::ends_column(&w.cfg, &[a.clone()], w.now(), 0).unwrap();
+        let ends = super::ends_column(&w.cfg, std::slice::from_ref(&a), w.now(), 0).unwrap();
         assert_eq!(ends[0], if case == "keep" { "kept on pod" } else { "not covered" }, "{case}");
     }
 }
@@ -1460,7 +1460,7 @@ fn rename_and_replace_hooks() {
 fn ends_column_needs_a_state_file() {
     let w = World::new("ends", "");
     let a = rp("devtest-alpha", "pa", 22001);
-    assert_eq!(ends_column(&w.cfg, &[a.clone()], T0, 0), None, "no state file: no column");
+    assert_eq!(ends_column(&w.cfg, std::slice::from_ref(&a), T0, 0), None, "no state file: no column");
     w.policy(&a, Some(5 * 3600), None);
     assert_eq!(ends_column(&w.cfg, &[a.clone(), rp("devtest-bravo", "pb", 1)], T0, 0).unwrap(), ["17:00 (in 5h)", "-"]);
     std::fs::write(w.store().state_path(), "junk").unwrap();
@@ -1791,7 +1791,7 @@ async fn rs2_uncovered_and_other_mounts_veto() {
         }
         assert!(w.terminated().is_empty(), "{tag}");
         assert_eq!(w.last_row(&a), Some(Row::NotCovered), "{tag}");
-        let ends = super::ends_column(&w.cfg, &[a.clone()], w.now(), 0).unwrap();
+        let ends = super::ends_column(&w.cfg, std::slice::from_ref(&a), w.now(), 0).unwrap();
         assert_eq!(ends[0], "not covered", "{tag}");
     }
 }
@@ -1852,7 +1852,8 @@ fn rs5_replace_refuses_a_pod_being_reaped() {
 /// isn't; an unreadable process list is "can't tell".
 #[tokio::test]
 async fn rs7_a_dormant_process_vetoes_and_boot_services_dont() {
-    let cases: [(&str, Vec<(u64, u32, bool, &'static str)>, bool, Option<Row>); 5] = [
+    type Case = (&'static str, Vec<(u64, u32, bool, &'static str)>, bool, Option<Row>);
+    let cases: [Case; 5] = [
         ("dormant job", vec![(3600, 901, false, "python")], false, Some(Row::Active)),
         ("restarted jupyter", vec![(3600, 33, false, "jupyter-lab")], false, None),
         ("login shell", vec![(3600, 77, true, "bash")], false, None),
@@ -1971,8 +1972,8 @@ fn review_rr_create_flags_on_a_never_reaped_provider_are_silent_and_look_live() 
     let vast = Pod { provider: "vast".into(), locked: None, ..rp("devtest-alpha", "77", 22001) };
     let v1 = Pod { locked: None, ..rp("devtest-bravo", "pv1", 22002) };
     let naming = Naming::from_config(&w.cfg);
-    assert!(never_reaped(&vast, &[vast.clone()], &naming, true).is_some(), "reap set refuses Vast");
-    assert!(never_reaped(&v1, &[v1.clone()], &naming, false).is_some(), "reap set refuses RunPod v1");
+    assert!(never_reaped(&vast, std::slice::from_ref(&vast), &naming, true).is_some(), "reap set refuses Vast");
+    assert!(never_reaped(&v1, std::slice::from_ref(&v1), &naming, false).is_some(), "reap set refuses RunPod v1");
     // `up/create --expire-in 8h` accepts both and records them (nothing in resolve looks at the
     // provider; the create path prints nothing about it).
     let (policy, store) = resolve_create_policy(&w.cfg, Some("8h"), None, None, T0, &|_| None).unwrap().unwrap();
@@ -2751,7 +2752,7 @@ async fn w7_b_rs8b_a_recovered_reap_takes_its_own_copy() {
         w.tick(300);
         w.step("observe").await;
         let tomb = w.state().reaped[&core_reap::key("runpod", &a.id)].clone();
-        assert!(tomb.recovered && tomb.not_reaped == !sent, "{tomb:?}");
+        assert!(tomb.recovered && tomb.not_reaped != sent, "{tomb:?}");
         let reaped = format!("{}-runpod-pa-reaped", stamp(at + 30));
         for (root, tier, dir) in [("snap", "snapshot", &tomb.snapshot_dir), ("snap/big", "big", &tomb.big_dir)] {
             let ours_now = if sent { &reaped } else { &ours };
