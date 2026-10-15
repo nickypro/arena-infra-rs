@@ -129,9 +129,8 @@ pub fn summarize(pods: &[Pod], metrics: &HashMap<String, PodMetrics>) -> FleetSu
             s.mem_total_mb += t;
         }
     }
-    if util_n > 0 {
-        s.mean_util = Some((util_sum / util_n) as u32);
-    }
+    // No GPU reported a utilization (util_n == 0): no mean.
+    s.mean_util = util_sum.checked_div(util_n).map(|m| m as u32);
     s
 }
 
@@ -1340,7 +1339,7 @@ mod tests {
         assert_eq!(claimed, [alpha.clone(), bravo.clone()]);
         assert!(deep.is_running(&alpha) && deep.is_running(&bravo) && !deep.is_running(&charlie));
         let second = deep.begin(vec![bravo.clone(), charlie.clone()]);
-        assert_eq!(second, [charlie.clone()], "bravo is already being checked");
+        assert_eq!(second, std::slice::from_ref(&charlie), "bravo is already being checked");
         assert_eq!(deep.running(), 3);
 
         // The first check lands: alpha fails on its GPU; bravo got no result at all.
