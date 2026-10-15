@@ -33,10 +33,12 @@ use super::confirm;
 /// `arena archive …`.
 #[derive(clap::Subcommand, Debug)]
 pub(crate) enum ArchiveCmd {
-    /// Create or converge the archive (idempotent): its own SSH-key object, the server (delete +
-    /// rebuild protected), the two volumes (ext4 by Hetzner, protected), the pinned host key, the
-    /// setup script. Re-run it any time — after a server loss it builds a new server for the
-    /// surviving volumes, never formatting them. Participant access stays as it was (OFF at first).
+    /// Create or repair the archive VM (idempotent)
+    ///
+    /// Converges its SSH key, the server, the two protected volumes, the pinned host key and the
+    /// setup script. Safe to re-run: after a server loss it builds a new server for the surviving
+    /// volumes, never formatting them. Participant access stays as it was (off at first).
+    #[command(verbatim_doc_comment)]
     Up {
         /// The snap volume's size at creation (default ARCHIVE_SNAP_GB, else 50).
         #[arg(long)]
@@ -44,28 +46,31 @@ pub(crate) enum ArchiveCmd {
         /// The big volume's size at creation (default ARCHIVE_BIG_GB, else 200).
         #[arg(long)]
         big_gb: Option<u32>,
-        /// Accept the server's current host key although it isn't the pinned one (a rebuilt
-        /// server). Check its fingerprint in the Hetzner console.
+        /// Accept a changed host key (a rebuilt server); check it in the Hetzner console
         #[arg(long)]
         accept_new_host_key: bool,
         /// Preview: the plan, live prices and local sizes; changes nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// Read-only health: the server and volumes (API), mounts, read-only binds, space and inodes,
-    /// the key audit (probe over SSH), the last pushes, retention and cost. Exit non-zero on any
-    /// FAIL or UNKNOWN.
+    /// Archive health check (read-only)
+    ///
+    /// Server and volumes, mounts, space and inodes, the key audit, last pushes, retention and
+    /// cost. Exits non-zero on any FAIL or UNKNOWN.
+    #[command(verbatim_doc_comment)]
     Status {
+        /// Print the report as JSON
         #[arg(long)]
         json: bool,
     },
-    /// Push the backup dir to the archive (additive only — never deletes there). Snap first: every
-    /// dated label that isn't final yet, hard-linked to the previous one; then big. What cron runs.
+    /// Push local backups to the archive (additive; cron runs it)
+    ///
+    /// Never deletes on the archive. Snapshots first (each linked to the previous one), then big.
     Sync {
-        /// `snap`, `big` or `both` (default).
+        /// `snap`, `big` or `both`
         #[arg(long, default_value = "both")]
         tier: String,
-        /// Push this snapshot label even if final, or a custom one (`pods pull --label …`). Repeatable.
+        /// Also push this label even if final, or a custom one (repeatable)
         #[arg(long = "label")]
         labels: Vec<String>,
         /// Push from this directory instead of LOCAL_BACKUP_DIR.
@@ -75,66 +80,81 @@ pub(crate) enum ArchiveCmd {
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// Grow a volume (online): the API resize, then resize2fs on the server. Never shrinks.
+    /// Grow an archive volume online (never shrinks)
     Resize {
+        /// New size of the snap volume in GB
         #[arg(long, conflicts_with = "big_gb", required_unless_present = "big_gb")]
         snap_gb: Option<u32>,
+        /// New size of the big volume in GB
         #[arg(long)]
         big_gb: Option<u32>,
+        /// Preview only: change nothing
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// Let participants read (`on`: the cohort key from laptops, the read key from pods) or stop
-    /// them (`off`: instant, and open sessions are ended). Off until you turn it on.
+    /// Turn participants' read access to the archive on or off
+    ///
+    /// `on`: the cohort key from laptops, the read key from pods. `off` is instant and ends open
+    /// sessions. Off until you turn it on.
+    #[command(verbatim_doc_comment)]
     Access {
+        /// `on` or `off`
         #[arg(value_parser = ["on", "off"])]
         state: String,
     },
-    /// Print the participants' laptop ssh-config block (or, with --pod, the one `copy-keys` puts on
-    /// pods; with --known-hosts, the laptops' arena_archive_known_hosts file the block reads).
+    /// Print the participants' ssh-config block for the archive
     SshConfig {
+        /// Print the block `copy-keys` puts on pods instead
         #[arg(long, conflicts_with = "known_hosts")]
         pod: bool,
-        /// The laptops' own known-hosts file for the archive: the pinned key under the alias.
+        /// Print the laptops' known-hosts file for the archive instead
         #[arg(long)]
         known_hosts: bool,
     },
-    /// A root shell (or one command) on the archive: the admin key, the pinned host key.
+    /// Root shell (or one command) on the archive
     Ssh {
-        /// The command to run (after `--`); none = an interactive shell.
+        /// Command to run (after `--`); none = an interactive shell
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
     },
-    /// Delete the server (its volumes are detached and KEPT, still protected). With
-    /// `--delete-volumes --confirm <prefix>-archive`: also the volumes and every backup on them.
+    /// Delete the archive server (its volumes are kept)
+    ///
+    /// The volumes are detached and kept, still protected. With
+    /// `--delete-volumes --confirm <prefix>-archive` the volumes and EVERY BACKUP on them are
+    /// deleted too, for good.
+    #[command(verbatim_doc_comment)]
     Down {
+        /// Also DELETE both volumes and every backup on them (irreversible)
         #[arg(long)]
         delete_volumes: bool,
-        /// Required with --delete-volumes: the archive's name typed out (`-y` is not enough).
+        /// The archive's name, typed out (required with --delete-volumes; -y isn't enough)
         #[arg(long)]
         confirm: Option<String>,
+        /// Preview only: change nothing
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// Stop archiving a pod — consent withdrawn, a box that turned out to be staff's: no push
-    /// takes it (or its -old/-new twins) again, whatever MACHINE_NAME_LIST says, until `archive
-    /// unforget`. Shows what it would record and asks (`-y`, or `--confirm <name>`, without a
-    /// terminal). With `--delete-archived`, also delete what the archive holds of it (every label,
-    /// both tiers) for good, after showing its size, with its name typed — access on or off.
+    /// Stop archiving a pod (consent withdrawn, a staff box)
+    ///
+    /// No push takes the pod (or its -old/-new twins) again until `archive unforget`.
+    /// --delete-archived also deletes everything the archive holds of it, for good. Asks first
+    /// (without a terminal: -y, or --confirm <name>).
+    #[command(verbatim_doc_comment)]
     Forget {
         /// The pod: `bravo` or `<prefix>-bravo`.
         pod: String,
-        /// Also delete its archived copy (both volumes) — for good: nothing brings it back.
+        /// Also delete its archived copy on both volumes, for good
         #[arg(long)]
         delete_archived: bool,
-        /// The pod's full name typed out: confirms the forget (as `-y` does) and, with
-        /// --delete-archived, the deletion (else asked at a terminal; `-y` is not enough for that).
+        /// The pod's full name typed out: confirms the forget and any --delete-archived
+        ///
+        /// `-y` confirms the forget only, never the deletion.
         #[arg(long)]
         confirm: Option<String>,
     },
-    /// Undo `archive forget <pod>`: pushes take the pod (and its -old/-new twins) again from the
-    /// next sync. What `--delete-archived` deleted stays deleted — only what the control box still
-    /// holds is pushed again.
+    /// Undo `archive forget`: archive the pod again
+    ///
+    /// What --delete-archived deleted stays deleted; only what this box still holds is pushed.
     Unforget {
         /// The pod: `bravo` or `<prefix>-bravo`.
         pod: String,

@@ -36,21 +36,21 @@ use super::Select;
 /// `arena pods reap …`.
 #[derive(clap::Subcommand, Debug)]
 pub(crate) enum ReapCmd {
-    /// Look at every pod with a reap policy (one read-only probe each), record what was seen,
-    /// and print the plan: who would be reaped and why not. Nothing is changed on any pod.
+    /// Evaluate reap policies and print the plan; --apply acts
     ///
-    /// --apply: also act, on at most REAP_MAX_PER_RUN due pods (--max lowers it): back each up
-    /// (git push + both rsync tiers into the backup dir, then a dry-run verify), check it's still
-    /// quiet and still the same pod, re-list it, then terminate it. Needs REAP_ENABLED=1 in the
-    /// config file (else it runs as observe), no hold (`reap hold`), a verified clock and, with no
-    /// terminal, --yes. --rehearse does everything up to and including the real backup and
-    /// verify, then stops — no terminate. Exits 3 when something needs attention.
+    /// Probes every pod with a policy (read-only) and prints who would be reaped and why not.
+    ///
+    /// --apply: for each due pod (at most REAP_MAX_PER_RUN), back it up and verify the backup,
+    /// re-check it's still quiet and the same pod, then TERMINATE it. Needs REAP_ENABLED=1 in the
+    /// config file (else it only observes), no `reap hold`, a synced clock and, without a
+    /// terminal, --yes. --rehearse does all but the terminate. Exits 3 when something needs
+    /// attention.
     #[command(verbatim_doc_comment)]
     Run {
-        /// Act on due pods (see above).
+        /// Back up and TERMINATE due pods (needs REAP_ENABLED=1)
         #[arg(long, conflicts_with = "rehearse")]
         apply: bool,
-        /// Run every gate including the real backup and verify, but never terminate.
+        /// Do the real backup and verify, but never terminate
         #[arg(long)]
         rehearse: bool,
         /// At most this many terminate attempts this run (only lowers REAP_MAX_PER_RUN).
@@ -62,21 +62,22 @@ pub(crate) enum ReapCmd {
         #[command(flatten)]
         sel: Select,
     },
-    /// Give the selected pods a reap policy (or change it): an end time and/or an idle window.
-    /// Best effort, writes ~/.arena/NOTICE on each pod and a login-banner line (interactive
-    /// shells only) that shows it. Needs names or --all; only this cohort's MACHINE_NAME_LIST
-    /// machines can have one.
+    /// Set or change pods' reap policy: end time and/or idle window
+    ///
+    /// Also writes a notice on each pod (~/.arena/NOTICE and a login banner). Needs names or
+    /// --all; only this cohort's MACHINE_NAME_LIST machines can have a policy.
+    #[command(verbatim_doc_comment)]
     Set {
         /// Reap after this long from now: e.g. `90m`, `8h`, `1d12h` (10 min .. 60 days).
         #[arg(long, value_name = "DUR", conflicts_with_all = ["expire_at", "extend"])]
         expire_in: Option<String>,
-        /// Reap at this time: RFC 3339 (`2026-10-12T18:00:00Z`) or `YYYY-MM-DD HH:MM` (local).
+        /// Reap at this time: RFC 3339 or `YYYY-MM-DD HH:MM` (local)
         #[arg(long, value_name = "TIME", conflicts_with = "extend")]
         expire_at: Option<String>,
-        /// Push the current end time back by this long (from now, if it has passed or there is none).
+        /// Push the end time back by this long (from now if it has passed or is unset)
         #[arg(long, value_name = "DUR")]
         extend: Option<String>,
-        /// Reap after this long with no activity at all: e.g. `8h` (REAP_IDLE_FLOOR_MINS .. 14 days).
+        /// Reap after this long with no activity, e.g. `8h` (REAP_IDLE_FLOOR_MINS..14 days)
         #[arg(long, value_name = "DUR")]
         idle_after: Option<String>,
         /// A note kept with the policy.
@@ -88,7 +89,7 @@ pub(crate) enum ReapCmd {
         #[command(flatten)]
         sel: Select,
     },
-    /// Remove the selected pods' expiry and/or idle policy (both when neither flag is given).
+    /// Remove pods' end time and/or idle window (both by default)
     Clear {
         /// Remove only the end time.
         #[arg(long)]
@@ -102,9 +103,9 @@ pub(crate) enum ReapCmd {
         #[command(flatten)]
         sel: Select,
     },
-    /// Pin pods: never reaped while pinned, whatever their policy (stored by name AND id).
+    /// Pin pods so they are never reaped, whatever their policy
     Pin {
-        /// Until this time (RFC 3339 or `YYYY-MM-DD HH:MM` local); default: until unpinned.
+        /// Until this time (RFC 3339 or local `YYYY-MM-DD HH:MM`; default: forever)
         #[arg(long, value_name = "TIME")]
         until: Option<String>,
         /// A note kept with the pin.
@@ -113,13 +114,12 @@ pub(crate) enum ReapCmd {
         #[command(flatten)]
         sel: Select,
     },
-    /// Remove pins matching these names or ids (or --all). Reads only the state.
+    /// Remove pins (by name or id, or --all)
     Unpin {
         #[command(flatten)]
         sel: Select,
     },
-    /// The reaper's state — policies, pins, streaks, last decisions, hold, what was reaped.
-    /// No network.
+    /// Show the reaper's state (policies, pins, hold, decisions)
     Status {
         /// Print the state as JSON.
         #[arg(long)]
@@ -127,9 +127,9 @@ pub(crate) enum ReapCmd {
         #[command(flatten)]
         sel: Select,
     },
-    /// The reaper's log (`reap-log.jsonl`): one line per evaluated pod per run, plus events.
+    /// Show the reaper's log (a line per pod per run)
     Log {
-        /// The last N lines.
+        /// Show the last N lines
         #[arg(long, default_value_t = 50)]
         tail: usize,
         /// Only this pod's lines (full or bare name).
@@ -139,13 +139,13 @@ pub(crate) enum ReapCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Stop all acting: `--apply` runs observe until `reap release`.
+    /// Stop all reaping: --apply only observes until `reap release`
     Hold {
         /// Why (shown by every run until released).
         #[arg(long)]
         reason: String,
     },
-    /// Show the hold's reason and clear it (asks first) — also a hold the reaper set itself.
+    /// Clear the hold (shows its reason; asks first)
     Release,
 }
 

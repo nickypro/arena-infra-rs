@@ -45,16 +45,15 @@ const DEFAULT_CONFIG: &str = "/home/dev/prod-ro/config.env";
     infer_subcommands = true
 )]
 struct Cli {
-    /// Path to config.env (defaults to the read-only prod copy).
+    /// Path to config.env
     #[arg(long, default_value = DEFAULT_CONFIG, global = true)]
     config: PathBuf,
 
-    /// Compute provider to target: runpod, vast, hetzner or shadeform (opt-in overflow GPU VMs:
-    /// they bill until terminated — there's no stop).
+    /// Provider: runpod, vast, hetzner or shadeform
     #[arg(long, default_value = "runpod", global = true)]
     provider: String,
 
-    /// Skip the interactive "Proceed? [y/N]" confirmation on mutating commands.
+    /// Skip the "Proceed? [y/N]" prompt (required when there's no terminal)
     #[arg(long, short = 'y', global = true)]
     yes: bool,
 
@@ -116,48 +115,48 @@ fn exit_code(result: &Result<()>) -> std::process::ExitCode {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Machine (pod) lifecycle.
+    /// Pods: create, set up, run, back up, stop, terminate
     #[command(subcommand, infer_subcommands = true)]
     Pods(PodCmd),
-    /// Launch the interactive dashboard (arena-tui), inheriting --provider/--config.
+    /// Open the interactive dashboard (arena-tui)
     Tui,
-    /// The SSH proxy's port forwards: `plan` previews (read-only), `apply` writes the
-    /// config and reloads nginx (confirms first).
+    /// SSH proxy forwards: preview (plan) or write + reload (apply)
     #[command(subcommand, infer_subcommands = true)]
     Proxy(ProxyCmd),
-    /// View/preview a scheduled provisioning plan (arena-plan.json). Read-only for now;
-    /// the timed executor + arming come next.
+    /// Check or preview a provisioning plan file (read-only)
     #[command(subcommand, infer_subcommands = true)]
     Plan(PlanCmd),
-    /// Inspect the loaded config.
+    /// Check, show or set config.env keys
     #[command(subcommand, infer_subcommands = true)]
     Config(ConfigCmd),
-    /// Manage a cron schedule for `arena pods backup` (edits your crontab, touching only
-    /// arena-managed lines).
+    /// Install, remove or show arena's crontab lines
+    ///
+    /// Edits your crontab; only arena-managed lines are touched.
     #[command(subcommand, infer_subcommands = true)]
     Cron(CronCmd),
-    /// Manage OpenRouter API keys for the cohort (generate / list / rotate / revoke) via
-    /// the provisioning API. Needs OPENROUTER_PROVISIONING_KEY in config.
+    /// Manage the cohort's OpenRouter API keys
+    ///
+    /// Needs OPENROUTER_PROVISIONING_KEY in the config.
     #[command(subcommand, infer_subcommands = true)]
     Keys(KeysCmd),
-    /// List the known GPU types (names to pass to `--gpu`, with VRAM, $/hr and stock —
-    /// live from RunPod where available, else the local presets).
+    /// List GPU types for --gpu, with VRAM, $/h and stock
+    ///
+    /// Live from RunPod where available, else the local presets.
     Gpus {
-        /// Emit JSON instead of a table (for scripting). Includes every live catalog entry,
-        /// with `creatable` flagging the ones the create API rejects (the table hides them).
+        /// JSON instead of a table (also lists the uncreatable entries the table hides)
         #[arg(long)]
         json: bool,
     },
-    /// What multi-option placement would try (read-only; a dry run of `pods create/up`
-    /// without the names): the --gpu × --cloud options with $/h per pod (RunPod's live
-    /// prices, ~ = preset estimate), price source and stock hint, ordered and filtered by
-    /// --max-price exactly as create does.
+    /// Preview the GPU options create/up would try, with prices
+    ///
+    /// Read-only. The --gpu × --cloud options with $/h per pod (`~` = preset estimate), price
+    /// source and stock hint, ordered and filtered by --max-price exactly as create does.
+    #[command(verbatim_doc_comment)]
     Offers {
-        /// GPU type(s), comma-separated, e.g. `A4000,4000Ada,3090` (default: config GPU_TYPE).
+        /// GPU type(s), comma-separated, e.g. `A4000,3090` (default: config GPU_TYPE)
         #[arg(long)]
         gpu: Option<String>,
-        /// Cloud tier(s), comma-separated, e.g. `community,secure` (default: config
-        /// CLOUD_TYPE). Only RunPod has tiers.
+        /// Cloud tier(s), e.g. `community,secure`; RunPod only (default: config CLOUD_TYPE)
         #[arg(long)]
         cloud: Option<String>,
         /// Max $/h per pod: options above it, or with no known price, are dropped.
@@ -166,15 +165,14 @@ enum Cmd {
         /// GPUs per pod (default: config NUM_GPUS) — prices and the cap are per pod.
         #[arg(long)]
         gpus: Option<u32>,
-        /// `cheapest` (default) or `listed`.
+        /// `cheapest` or `listed`
         #[arg(long, default_value = "cheapest")]
         order: arena_core::placement::Order,
         /// Emit the option plan as JSON instead of a table.
         #[arg(long)]
         json: bool,
     },
-    /// Print the participant-facing `~/.ssh/config` for the fleet (read-only). Direct
-    /// pod endpoints by default, or stable proxy ports with --proxy.
+    /// Print the participants' ~/.ssh/config (read-only)
     SshConfig {
         /// Use the proxy layout (stable `SSH_PROXY_*` ports) instead of direct pod IPs.
         #[arg(long)]
@@ -183,34 +181,29 @@ enum Cmd {
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    /// End-of-program teardown check (read-only): is anything still billing, or scheduled to
-    /// recreate something? Every pod on every configured provider in any state (a stopped pod
-    /// keeps its name and still bills its disk), RunPod network volumes (size, ~$/month), this
-    /// user's arena cron lines and `at` jobs, this cohort's enabled OpenRouter keys (with
-    /// usage) and the forwards left in the local proxy config — as a ✓/✗/? checklist with the
-    /// exact command that cleans up each item. Deletes nothing. Exits non-zero unless all is
-    /// clear; a source that couldn't be read is `?` (unknown), never "empty".
+    /// End-of-program check that nothing is left billing (read-only)
+    ///
+    /// Checks every pod on every provider (a stopped pod still bills its disk), RunPod network
+    /// volumes, arena cron lines and `at` jobs, the cohort's enabled OpenRouter keys and the
+    /// local proxy forwards. Prints a ✓/✗/? checklist with the command that cleans up each item;
+    /// deletes nothing. Exits non-zero unless all is clear (`?` = couldn't be read, never
+    /// "empty").
+    #[command(verbatim_doc_comment)]
     Teardown {
-        /// Run the check. Required: `teardown` itself tears nothing down — the checklist
-        /// prints the commands that do.
+        /// Run the check (required: teardown itself deletes nothing)
         #[arg(long)]
         check: bool,
         /// Print the checklist as JSON (for scripts); the exit status is the same.
         #[arg(long)]
         json: bool,
     },
-    /// Money left on each prepaid account, how long it lasts, and where the number comes from.
+    /// Prepaid balance, burn rate and runway per provider account
     ///
-    /// RunPod (GraphQL `myself`) and Vast (`credit`) are prepaid — at $0 RunPod terminates pods
-    /// without a network volume and Vast stops every instance; Hetzner is postpaid. A balance
-    /// is **live** (read now, or < 5 min ago), **est.** (the last live reading — or `balance
-    /// set` — minus max(billed, metered) spend since: RunPod's v2 billing history and arena's
-    /// own burn samples; it errs low), or `?`. Burn = the higher of the provider's own rate
-    /// and this fleet's billing pods there; runway = balance ÷ burn. Critical under 24 h (or
-    /// at $0, or RunPod's underBalance), low under BALANCE_WARN_HOURS (default 72). Lists the
-    /// fleet (no details), reads every configured account (10 s at most), records it in the
-    /// state file next to the health cache, then runs the fallback check (the estimate from
-    /// an older reading against the live one). Exits 0 unless `--check`.
+    /// At $0 RunPod terminates pods without a network volume and Vast stops every instance;
+    /// Hetzner is postpaid. A balance is live, est. (the last live reading minus spend since;
+    /// errs low) or `?`. Critical under 24 h, low under BALANCE_WARN_HOURS. Reads the accounts
+    /// and records the reading locally; changes nothing else. Exits 0 unless --check.
+    #[command(verbatim_doc_comment)]
     #[command(args_conflicts_with_subcommands = true)]
     Balance {
         #[command(subcommand)]
@@ -218,49 +211,44 @@ enum Cmd {
         /// Print the accounts as JSON (for scripts).
         #[arg(long)]
         json: bool,
-        /// Exit 2 if any account is critical, else 3 if any is unknown while burning, else 1
-        /// if any is low, else 0 (combines with --json).
+        /// Exit 2 if any account is critical, 3 if unknown while burning, 1 if low, else 0
         #[arg(long)]
         check: bool,
-        /// No live call: show what the fallback estimate would say (billing history and
-        /// arena's metering only). Writes nothing.
+        /// No live read: show only the fallback estimate (writes nothing)
         #[arg(long)]
         no_live: bool,
-        /// Also print the burn's parts, spend limit, anchors, the billing history used, the
-        /// last failures and the state file.
+        /// Also print the burn's parts, spend limit, billing history and last failures
         #[arg(long, short = 'v')]
         verbose: bool,
     },
-    /// Read-only passthrough to a provider's REST API, for what no command covers (GET only).
+    /// Read-only GET passthrough to a provider's REST API
     #[command(subcommand, infer_subcommands = true)]
     Api(ApiCmd),
-    /// The backup archive: an always-on Hetzner VM with two volumes (dated snapshots, all files)
-    /// that keeps copy #2 of the cohort's backups, pushed from LOCAL_BACKUP_DIR by cron, readable
-    /// (when you say so) by participants over sftp. Never part of the fleet.
+    /// The backup archive VM (second copy of cohort backups)
+    ///
+    /// An always-on Hetzner VM with two volumes (dated snapshots, all files), filled from
+    /// LOCAL_BACKUP_DIR by cron. Participants can read it over sftp once you turn access on.
+    /// Never part of the fleet.
+    #[command(verbatim_doc_comment)]
     #[command(subcommand, infer_subcommands = true)]
     Archive(archive::ArchiveCmd),
-    /// The fleet in one read-only picture: `pods list`'s columns plus whether each cohort
-    /// machine's SSH port answers, its proxy port (live/stale) and its last `pods test --deep`
-    /// / `up --check` verdict with its age (from the local health cache). Lists pods, reads
-    /// local files and TCP-probes the SSH port of each billing machine on the prefixed
-    /// MACHINE_NAME_LIST (a few seconds at most; no login, no command; staff boxes and
-    /// off-list pods are never dialed): never runs a check, changes nothing.
+    /// Read-only fleet overview: pods, SSH, proxy, last health check
+    ///
+    /// `pods list`'s columns plus whether each cohort machine's SSH port answers, its proxy port
+    /// and its last `pods test --deep` / `up --check` verdict. Only TCP-probes the SSH port (no
+    /// login, no command); never runs a check, changes nothing.
+    #[command(verbatim_doc_comment)]
     Snapshot {
-        /// The full internal snapshot as JSON (ids, endpoints, costs, check reasons) — for
-        /// scripts and the operator, never for publishing.
+        /// Full snapshot as JSON (ids, endpoints, costs): for scripts, never for publishing
         #[arg(long)]
         json: bool,
-        /// The public, allowlisted JSON for the web dashboard (`web/fleet.html`): only
-        /// MACHINE_NAME_LIST machines, only name / GPU / up-starting-down / health + age +
-        /// a fixed-vocabulary reason / maintenance times. No IPs, ports, ids, keys, costs.
+        /// Public JSON for web/fleet.html (cohort machines only; no IPs, ids or costs)
         #[arg(long)]
         public: bool,
-        /// Write to this file instead of stdout, atomically (temp + rename), so a web server
-        /// never serves a half-written file.
+        /// Write to FILE (atomically) instead of stdout
         #[arg(long, value_name = "FILE")]
         out: Option<PathBuf>,
-        /// Skip the SSH-port probe: a pod listed running with an endpoint then counts as up
-        /// (the SSH column shows `-`).
+        /// Skip the SSH-port probe (a running pod with an endpoint counts as up)
         #[arg(long)]
         no_probe: bool,
     },
@@ -286,20 +274,16 @@ struct SelectOpts {
     /// Every pod (narrow it with --exclude / --gpus / --on).
     #[arg(long)]
     all: bool,
-    /// Leave these pods out: same syntax as the targets, ranges too (repeatable, or
-    /// comma-separated). A name that matches no pod is an error, not a no-op.
+    /// Leave these pods out (same syntax as targets; an unknown name is an error)
     #[arg(long, value_name = "TARGET")]
     exclude: Vec<String>,
-    /// Only pods with exactly N GPUs (the provider's count; a pod whose count is unknown
-    /// never matches).
+    /// Only pods with exactly N GPUs
     #[arg(long, value_name = "N")]
     gpus: Option<u32>,
-    /// Only pods on this provider: runpod, vast, hetzner or shadeform. (Not `--provider`, which picks
-    /// where `create`/`up` make pods.)
+    /// Only pods on this provider (--provider is where new pods go)
     #[arg(long, value_name = "PROVIDER")]
     on: Option<String>,
-    /// The old spelling of the targets, still accepted. With --all it keeps its old meaning
-    /// "of all pods, only these" (`stop --all --include apple` = `stop apple`).
+    /// Old spelling of the targets (with --all: only these)
     #[arg(long, hide = true, value_name = "TARGET")]
     include: Vec<String>,
 }
@@ -323,8 +307,7 @@ impl SelectOpts {
 #[derive(clap::Args, Debug, Clone, Default)]
 #[command(next_help_heading = "Target selection")]
 struct Select {
-    /// Pods: names (`apple`, `arena8-apple`, `@james-gpu`), provider ids, ranges
-    /// `apple..mayor` (inclusive, MACHINE_NAME_LIST order) or `all`.
+    /// Pods: names (`apple`, `@box`), ids, ranges (`apple..mayor`) or `all`
     #[arg(value_name = "TARGET")]
     targets: Vec<String>,
     #[command(flatten)]
@@ -340,9 +323,7 @@ impl Select {
 #[derive(clap::Args, Debug, Clone, Default)]
 #[command(next_help_heading = "Target selection")]
 struct SelectByFlag {
-    /// Only these pods (repeatable, or comma-separated): names (`apple`, `arena8-apple`,
-    /// `@james-gpu`), provider ids, ranges `apple..mayor` (inclusive, MACHINE_NAME_LIST
-    /// order) or `all`. Default: every pod.
+    /// Only these pods: names, ids, ranges or `all` (default: every pod)
     #[arg(long = "target", short = 't', value_name = "TARGET")]
     targets: Vec<String>,
     #[command(flatten)]
@@ -358,9 +339,11 @@ impl SelectByFlag {
 /// `arena balance set`.
 #[derive(Subcommand)]
 enum BalanceCmd {
-    /// Record the balance read off the provider's console (USD) — the escape hatch when
-    /// every balance API is dead. Estimates count down from it until the next live reading
-    /// replaces it. A local write, scoped to the configured key's account; no confirm.
+    /// Record a balance read off the provider's console (USD)
+    ///
+    /// For when every balance API is down: estimates count down from it until the next live
+    /// reading. A local write for the configured key's account; no confirm.
+    #[command(verbatim_doc_comment)]
     Set {
         /// `runpod`, `vast` or `shadeform` (Hetzner is postpaid: nothing to set).
         #[arg(value_parser = parse_balance_account)]
@@ -384,25 +367,19 @@ fn parse_balance_account(s: &str) -> std::result::Result<arena_core::balance::Ac
 
 #[derive(Subcommand)]
 enum ApiCmd {
-    /// GET one path from a provider's API and print the response (pretty JSON). Read-only:
-    /// GET is the only verb there is.
+    /// GET one API path and print the JSON (read-only)
     ///
-    /// PROVIDER: runpod (follows RUNPOD_API), runpod-v1, runpod-v2, vast, hetzner or shadeform.
-    /// PATH is relative to that API's base — e.g. `pods`, `pods/<id>`, `catalog/datacenters`,
-    /// `network-volumes`, `billing/pods` (RunPod v2); `instances/`, `users/current/` (Vast);
-    /// `servers`, `locations` (Hetzner); `instances`, `instances/types` (Shadeform). Absolute
-    /// URLs, `//host`, `..` and `#` are refused and redirects aren't followed, so the configured
-    /// key only ever goes to the provider (in the Authorization header; Shadeform's X-API-KEY).
-    /// Secrets — env values, keys, tokens (`rpa_…`, `sk-…`, `hf_…`), SSH key material — are
-    /// redacted unless --raw; the API key itself never prints. `--raw` on Shadeform's
-    /// `sshkeys` is refused (it returns the managed key's private half).
+    /// PATH is relative to the API base, e.g. `pods`, `billing/pods` (RunPod v2), `instances/`
+    /// (Vast), `servers` (Hetzner), `instances/types` (Shadeform). Absolute URLs and `..` are
+    /// refused, so the key only ever goes to the provider. Secrets in the response are redacted
+    /// unless --raw; the API key never prints.
     #[command(verbatim_doc_comment)]
     Get {
-        /// runpod, runpod-v1, runpod-v2, vast, hetzner or shadeform.
+        /// runpod (follows RUNPOD_API), runpod-v1, runpod-v2, vast, hetzner or shadeform
         provider: String,
         /// Path under the provider's API base, e.g. `pods` (a query string is fine).
         path: String,
-        /// Print the body as received — env values, keys and all — except the API key.
+        /// Don't redact secrets in the body (the API key itself never prints)
         #[arg(long)]
         raw: bool,
     },
@@ -410,11 +387,13 @@ enum ApiCmd {
 
 #[derive(Subcommand)]
 enum KeysCmd {
-    /// Generate an OpenRouter runtime key per machine (named `<prefix>-<machine>`), each
-    /// with a USD credit cap, and save to `keys/openrouter_api_keys.csv`. Skips machines
-    /// that already have a key (use `rotate`). `--copy` also distributes them to the pods.
-    /// Targets are pods or MACHINE_NAME_LIST names (a key can be minted before its pod
-    /// exists); `--all` = every current pod.
+    /// Mint an OpenRouter key per machine (skips existing ones)
+    ///
+    /// Keys are named `<prefix>-<machine>`, capped at --limit USD and saved to
+    /// keys/openrouter_api_keys.csv. Targets may be MACHINE_NAME_LIST names with no pod yet;
+    /// --all = every current pod. --copy also puts them on the pods. `rotate` replaces existing
+    /// keys.
+    #[command(verbatim_doc_comment)]
     Gen {
         /// USD credit cap per key (default: config OPENROUTER_KEY_LIMIT, else 5).
         #[arg(long)]
@@ -428,19 +407,19 @@ enum KeysCmd {
         #[command(flatten)]
         sel: Select,
     },
-    /// List the provisioned OpenRouter keys (name, USD limit, usage). By default shows
-    /// only this iteration's keys (named `<MACHINE_NAME_PREFIX>-*`) and notes how many
-    /// others were hidden; `--all` shows every key on the account.
+    /// List the cohort's OpenRouter keys (limit, usage)
     List {
-        /// Show every key on the account, not just this iteration's `<prefix>-*` keys.
+        /// Every key on the account, not just this cohort's `<prefix>-*` keys
         #[arg(long)]
         all: bool,
     },
-    /// Show the local OpenRouter keys file (path, whether it exists, and which pods have
-    /// a key) — never prints the secret values.
+    /// Show the local keys file and which pods have keys
     Which,
-    /// Rotate machines' keys — delete each and generate a fresh one (e.g. after a leak).
-    /// Updates the CSV; `--copy` re-pushes to the pod(s). Targets as for `gen`, or --all.
+    /// Replace machines' keys with fresh ones (e.g. after a leak)
+    ///
+    /// Deletes each key, mints a new one and updates the CSV; --copy re-pushes to the pods.
+    /// Targets as for `gen`, or --all.
+    #[command(verbatim_doc_comment)]
     Rotate {
         /// USD credit cap for the new key (default: config OPENROUTER_KEY_LIMIT, else 5).
         #[arg(long)]
@@ -454,7 +433,9 @@ enum KeysCmd {
         #[command(flatten)]
         sel: Select,
     },
-    /// Revoke (delete) machines' keys without regenerating. Targets as for `gen`, or --all.
+    /// Delete machines' keys without minting new ones
+    ///
+    /// Targets as for `gen`, or --all.
     Revoke {
         /// Preview only: change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
@@ -466,68 +447,50 @@ enum KeysCmd {
 
 #[derive(Subcommand)]
 enum CronCmd {
-    /// Add or replace arena cron lines, keeping the others. Each line has an identity —
-    /// backup, proxy, snapshot, the two archive lines — and only the ones named by these flags
-    /// are (re)written:
-    /// `cron install --proxy` leaves an installed backup line (its --pull, --start-date,
-    /// schedule) as it is. With no flag at all it installs the backup line. Rewriting the
-    /// backup line keeps the installed one's --pull, start date and schedule unless a flag
-    /// changes them (--no-pull, --no-start-date to drop one). Shows the before → after diff
-    /// and confirms.
+    /// Add or replace arena cron lines (shows the diff, confirms)
+    ///
+    /// Each flag names one line (backup, proxy, snapshot, archive, reap); only those are
+    /// (re)written and the rest are kept. No flag = the backup line. A rewritten backup line
+    /// keeps the installed one's --pull, start date and schedule unless you change them.
+    #[command(verbatim_doc_comment)]
     Install {
-        /// The backup line: `pods backup` every 15 minutes (or --schedule), git-only unless
-        /// --pull. Implied by any of the backup line's own flags below, and by no flags at all.
+        /// The backup line: `pods backup` every 15 min (git only unless --pull)
         #[arg(long)]
         backup: bool,
-        /// The backup line's cron schedule (default: the installed line's, else every 15
-        /// minutes).
+        /// The backup line's cron schedule (default: the installed one's, else */15)
         #[arg(long)]
         schedule: Option<String>,
-        /// Bake `ARENA_START_DATE=YYYY-MM-DD` into the backup line, so the scheduled
-        /// backup computes the right wNdM label without it being in config.env
-        /// (a crontab line doesn't inherit your shell environment). An installed line's
-        /// start date is kept unless this or --no-start-date is given.
+        /// Bake ARENA_START_DATE (YYYY-MM-DD) into the backup line (cron lacks your env)
         #[arg(long)]
         start_date: Option<String>,
-        /// Drop the installed backup line's `ARENA_START_DATE` (e.g. once it is in config.env).
+        /// Drop the backup line's ARENA_START_DATE (e.g. once it's in config.env)
         #[arg(long, conflicts_with = "start_date")]
         no_start_date: bool,
-        /// The backup line also runs `pods pull` (the rsync file backup) each tick, after
-        /// the git backup. An installed line's --pull is kept unless --no-pull is given.
+        /// The backup line also runs `pods pull` (rsync file backup) after the git push
         #[arg(long)]
         pull: bool,
-        /// Make the backup line git-only (`pods backup --no-pull`), even if the installed
-        /// one also pulls.
+        /// Make the backup line git-only, even if the installed one pulls
         #[arg(long, conflicts_with = "pull")]
         no_pull: bool,
-        /// The proxy line: re-sync the proxy every 5 minutes (`proxy apply --yes`, logged
-        /// to ~/arena-proxy-cron.log): catches what the CLI didn't do itself — a pod
-        /// terminated from the dashboard, a restart that moved an SSH endpoint.
+        /// The proxy line: `proxy apply --yes` every 5 min (catches outside changes)
         #[arg(long)]
         proxy: bool,
-        /// The snapshot line: write the public dashboard JSON every 2 minutes: `snapshot
-        /// --public --out <DIR>/fleet.json` (atomic; logged to ~/arena-snapshot-cron.log).
-        /// Put `web/fleet.html` in the same directory and serve it with any static host.
+        /// The snapshot line: write DIR/fleet.json for web/fleet.html every 2 min
         #[arg(long, value_name = "DIR")]
         snapshot: Option<PathBuf>,
-        /// The backup archive's two lines (`arena archive up` first): `archive sync --tier snap`
-        /// at :07/:22/:37/:52 (7 minutes after each */15 backup tick) and `--tier big` hourly at
-        /// :40, logged to ~/arena-archive-cron.log. Needs an absolute LOCAL_BACKUP_DIR, this
-        /// user's archive state, and a start date (--start-date or ARENA_START_DATE).
+        /// The archive push lines (run `archive up` first; needs a start date)
         #[arg(long)]
         archive: bool,
-        /// The auto-reaper line (`pods reap run`, four times an hour): `observe` (looks and logs
-        /// `would_reap` to reap-log.jsonl — install this first and review it) or `apply` (acts;
-        /// refused unless REAP_ENABLED=1 in the config file). Needs an explicit, absolute
-        /// ARENA_STATE_DIR (written into the line when the config file doesn't set it).
+        /// The reaper line: `observe` (logs only; start here) or `apply` (acts)
+        ///
+        /// `apply` terminates pods only with REAP_ENABLED=1 in the config file.
         #[arg(long, value_name = "MODE", value_parser = ["observe", "apply"])]
         reap: Option<String>,
         /// Preview only: print the diff, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// Remove arena cron lines: just the backup / proxy / snapshot / archive lines with those
-    /// flags, else every arena-managed line. Shows the diff and confirms.
+    /// Remove arena cron lines (the flagged ones, else all)
     Remove {
         /// Remove the backup line.
         #[arg(long)]
@@ -548,22 +511,25 @@ enum CronCmd {
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// Show the currently-installed arena cron lines, each with its identity.
+    /// Show the installed arena cron lines
     Show,
 }
 
 #[derive(Subcommand)]
 enum PlanCmd {
-    /// Validate the plan file; print the detected local time/timezone, the night
-    /// window, caps, and every day entry with its resolved date.
+    /// Validate the plan file and print its resolved schedule
     Check {
+        /// The plan file
         #[arg(long, default_value = "arena-plan.json")]
         file: PathBuf,
     },
-    /// Preview what the plan would do for a date (default: today): the GPU/provider
-    /// fallback order, fill-to-target against the current fleet, and (for a replace
-    /// day) what it would tear down. Read-only — never mutates.
+    /// Preview what the plan would do on a date (read-only)
+    ///
+    /// The GPU/provider fallback order, the fill-to-target against the current fleet and, on a
+    /// replace day, what it would tear down.
+    #[command(verbatim_doc_comment)]
     Show {
+        /// The plan file
         #[arg(long, default_value = "arena-plan.json")]
         file: PathBuf,
         /// Date to preview (YYYY-MM-DD). Defaults to today (local).
@@ -574,18 +540,16 @@ enum PlanCmd {
 
 #[derive(Subcommand)]
 enum ConfigCmd {
-    /// Validate that the keys needed by the selected provider, proxy, and backup are
-    /// present. Read-only; never prints secret values. Exits non-zero if a required
-    /// key is missing.
-    Check,
-    /// Set a key in config.env (e.g. an API key): replaces the line if present, else
-    /// appends `KEY="value"`. Writes to the --config file; never echoes the value.
+    /// Check that the needed config keys are set (read-only)
     ///
-    /// Script-friendly: `config set KEY VALUE` sets it directly, or give just `KEY` and
-    /// pipe the value on stdin (keeps secrets out of argv / `ps`):
+    /// Never prints secret values. Exits non-zero if a required key is missing.
+    Check,
+    /// Set a key in config.env (never echoes the value)
+    ///
+    /// Replaces the key's line in the --config file, else appends KEY="value".
+    /// Give only KEY to read the value from stdin (keeps it out of `ps`):
     ///   printf %s "$TOKEN" | arena config set HF_TOKEN
-    /// With no KEY at all it prompts interactively (pick a key — showing which are
-    /// already set — then type the value); that path needs a terminal.
+    /// With no KEY it prompts interactively (needs a terminal).
     #[command(verbatim_doc_comment)]
     Set {
         /// Config key, e.g. RUNPOD_API_KEY. Omit to choose interactively.
@@ -593,27 +557,28 @@ enum ConfigCmd {
         /// Value to store (will be quoted). Omit to read from stdin / be prompted.
         value: Option<String>,
     },
-    /// Show which config file is active (path + whether it's readable/writable), plus a
-    /// summary of what's loaded and any keys currently coming from the environment.
+    /// Show the active config file and a summary of what's loaded
     Which,
 }
 
 #[derive(Subcommand)]
 enum ProxyCmd {
-    /// Compute the proxy plan — the current config merged with every provider's listing
-    /// (`+ ~ - =` per machine: added / changed / removed / kept-stale) — and print the
-    /// nginx `stream` config (stable public port -> each pod's current SSH endpoint).
-    /// Read-only: never connects to the proxy (a remote proxy's diff isn't shown).
+    /// Preview the proxy forwards and nginx config (read-only)
+    ///
+    /// Merges the current config with every provider's listing (`+ ~ - =` per machine) and prints
+    /// the nginx `stream` config. Never connects to the proxy host.
+    #[command(verbatim_doc_comment)]
     Plan {
-        /// Also write the rendered nginx config to this local path for review.
-        /// (Local only — this never copies anything to the proxy host.)
+        /// Also write the rendered nginx config to this local file (never to the proxy)
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    /// Merge the fleet's listing into the live proxy config, show the changes, then write
-    /// it and run SSH_PROXY_RELOAD_CMD (default `nginx -t && nginx -s reload`; empty =
-    /// write-only). A forward is only removed once its pod is confirmed gone; nothing is
-    /// written if no provider answered. Acts by default; --dry-run to preview.
+    /// Write the proxy config and reload nginx (confirms first)
+    ///
+    /// Merges the fleet's listing into the live config, shows the changes, writes it and runs
+    /// SSH_PROXY_RELOAD_CMD. A forward is removed only once its pod is confirmed gone; nothing is
+    /// written if no provider answered.
+    #[command(verbatim_doc_comment)]
     Apply {
         /// Preview only: print what would happen, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
@@ -623,14 +588,15 @@ enum ProxyCmd {
 
 #[derive(Subcommand)]
 enum MigrateCmd {
-    /// Build + set up `<name>-new` and sync `<name>`'s files onto it. Repeatable (an
-    /// incremental rsync each run), and it never renames or touches the proxy — the
-    /// participant keeps using `<name>` and can SSH the new pod directly to test it.
+    /// Build `<name>-new` and sync the pod's files onto it
+    ///
+    /// Repeatable. Never renames or touches the proxy: the participant keeps using `<name>` and
+    /// can SSH the new pod directly to test it.
+    #[command(verbatim_doc_comment)]
     Copy {
         /// Machine name (or id) to migrate.
         target: String,
-        /// GPU type for the new pod (default: same as the source) — or a comma list of
-        /// fallbacks (`3070,A4000`), tried one create at a time in --order, as `pods up` does.
+        /// GPU type, or a comma list of fallbacks (default: same as the source)
         #[arg(long)]
         gpu: Option<String>,
         /// GPUs per pod (default: same as the source).
@@ -648,8 +614,7 @@ enum MigrateCmd {
         /// Docker image (default: same as the source, else config IMAGE).
         #[arg(long)]
         image: Option<String>,
-        /// Bring up sshd on boot via a start script — needed when `--image` is a bare
-        /// (non-arena, non-RunPod) base image that doesn't already run sshd.
+        /// Start sshd on boot (for a bare `--image` that doesn't run it)
         #[arg(long)]
         bootstrap: bool,
         #[command(flatten)]
@@ -658,10 +623,12 @@ enum MigrateCmd {
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// Cut over: final delta sync, swap names (`<name>`→`<name>-old`, `<name>-new`→`<name>`),
-    /// re-point the proxy, then VERIFY the new pod is reachable through the proxy. If the
-    /// verification fails it auto-reverts (names + proxy) so the participant stays on the
-    /// original. `<name>-old` is kept (delete it later with `migrate finish`).
+    /// Final sync, swap names, re-point the proxy, verify
+    ///
+    /// `<name>` becomes `<name>-old` and `<name>-new` becomes `<name>`. If the new pod isn't
+    /// reachable through the proxy, it all reverts automatically. `<name>-old` is kept until
+    /// `migrate finish`.
+    #[command(verbatim_doc_comment)]
     Cutover {
         /// Machine name (or id) being migrated.
         target: String,
@@ -671,43 +638,39 @@ enum MigrateCmd {
         /// Don't touch the proxy at all (just swap names); you run `arena proxy apply`.
         #[arg(long)]
         skip_proxy: bool,
-        /// Skip the final sync and cut over to the copy already on `<name>-new` — for when
-        /// the original is stopped or unreachable and can't be synced from. Anything changed
-        /// on the original since the last `migrate copy` stays behind on it (the plan says
-        /// when that sync ran).
+        /// Skip the final sync (for an original that's stopped or unreachable)
+        ///
+        /// Changes on the original since the last `migrate copy` stay behind on it.
         #[arg(long)]
         no_final_sync: bool,
         /// Preview only.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// Delete the parked `<name>-old` pod (run once you've confirmed the new pod is good).
+    /// Terminate the parked `<name>-old` once the new pod is good
     ///
-    /// Syncs the proxy first and refuses while it can't confirm that `<name>`'s stable port
-    /// routes to the live pod — terminating `-old` would otherwise leave the participant's
-    /// port pointing at a dead pod. Refuses a STOPPED `-old` without `--discard-stopped`:
-    /// nothing was synced from it since the new pod's last sync (a `cutover --no-final-sync`),
-    /// so what changed on it since — on its volume — goes with it.
+    /// Syncs the proxy first and refuses until `<name>`'s port routes to the live pod. Refuses a
+    /// STOPPED `-old` without --discard-stopped: what changed on it since the last sync would be
+    /// lost.
+    #[command(verbatim_doc_comment)]
     Finish {
         /// Machine name (or id) that was migrated.
         target: String,
         /// Skip the confirmation prompt.
         #[arg(short, long)]
         yes: bool,
-        /// Terminate `<name>-old` even though it is stopped: whatever it holds that the new
-        /// pod's last sync didn't copy is deleted with it.
+        /// Terminate a stopped `-old` anyway, losing whatever wasn't synced from it
         #[arg(long)]
         discard_stopped: bool,
         /// Preview only.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// Roll a cutover back: swap `<name>`↔`<name>-old` and re-point the proxy to the original.
+    /// Roll a cutover back to the original pod
     ///
-    /// Work done on the new pod since the cutover is NOT on the original: it stays on
-    /// `<name>-new`. A later `migrate copy` never destroys it — whatever of it the copy
-    /// replaces or deletes there is kept in `~/arena-sync-kept/` (and listed) — but it isn't
-    /// merged back either.
+    /// Swaps the names and the proxy back. Work done on the new pod since the cutover is NOT
+    /// moved back: it stays on `<name>-new`.
+    #[command(verbatim_doc_comment)]
     Revert {
         /// Machine name (or id) to roll back.
         target: String,
@@ -721,7 +684,7 @@ enum MigrateCmd {
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// Show the migration pair (`<name>`, `<name>-new`, `<name>-old`) and what each step does next.
+    /// Show the migration pair and what each step does next
     Status {
         /// Machine name (or id).
         target: String,
@@ -732,49 +695,43 @@ enum MigrateCmd {
 enum PodCmd {
     /// List current pods (read-only).
     List {
-        /// Emit JSON instead of a table (for scripting): the pods, including gpu_count,
-        /// cost_per_hr and the host maintenance window where the provider reports them.
+        /// JSON instead of a table (adds GPU count, cost, maintenance window)
         #[arg(long)]
         json: bool,
-        /// Force the GPU-via-SSH probe (default for `--json`, which skips it otherwise).
+        /// Probe GPUs over SSH even with --json (which skips it otherwise)
         #[arg(long)]
         probe: bool,
-        /// Skip the GPU-via-SSH probe (faster; GPU shows only what the provider reports,
-        /// else "-"). The table view probes by default: `nvidia-smi` on the machine is the
-        /// ground truth, and some listings omit the GPU.
+        /// Skip the GPU probe over SSH (faster; the GPU column may show `-`)
         #[arg(long)]
         no_probe: bool,
     },
-    /// Create pods — by name (`create apple bloom`), `-n` total, or `-a` add.
+    /// Create pods: by name, up to `-n` in total, or `-a` more
+    ///
+    /// Tries the --gpu/--cloud options one create at a time until one has capacity, then syncs
+    /// the proxy. `pods up` also sets the new pods up.
+    #[command(verbatim_doc_comment)]
     Create {
-        /// Explicit machine names to create (e.g. `apple bloom`). Bare names get the
-        /// configured prefix. Mutually exclusive with -n/-a.
+        /// Machine names (`apple bloom`); bare names get the prefix. Not with -n/-a
         names: Vec<String>,
-        /// Target number of pods ON --provider (the create target) — tops up to this many;
-        /// pods on other providers don't count (mutually exclusive with -a).
+        /// Top up to N pods ON --provider; other providers don't count (not with -a)
         #[arg(short = 'n', long)]
         count: Option<usize>,
-        /// Number of pods to ADD on --provider (mutually exclusive with -n).
+        /// Add N pods on --provider (not with -n)
         #[arg(short = 'a', long)]
         add: Option<usize>,
-        /// GPU type, e.g. `A4000`, `3090`, `A100`, `A100 SXM` (or a full provider name) — or
-        /// a comma list of fallbacks (`A4000,4000Ada,3090`): each name tries the options one
-        /// create at a time, in --order, until one has capacity (see `arena offers`).
+        /// GPU type, or a comma list of fallbacks (`A4000,3090`); see `arena offers`
         #[arg(long)]
         gpu: Option<String>,
         /// GPUs per pod (overrides config NUM_GPUS).
         #[arg(long)]
         gpus: Option<u32>,
-        /// RunPod cloud tier: COMMUNITY or SECURE (overrides config) — or a comma list
-        /// (`community,secure`) to fall back across tiers.
+        /// RunPod tier COMMUNITY or SECURE (overrides config), or a comma list to fall back
         #[arg(long)]
         cloud: Option<String>,
-        /// Max $/h per pod (per-GPU price × --gpus). Options above it, or with no known
-        /// price, are not tried. Prices: RunPod's live catalog (else preset estimates).
+        /// Max $/h per pod; options above it or with no known price aren't tried
         #[arg(long, value_parser = parse_max_price)]
         max_price: Option<f64>,
-        /// Order to try several --gpu/--cloud options in: `cheapest` (by $/h per pod; a tie
-        /// goes to the better stock hint, then the listed order) or `listed` (GPU-major).
+        /// Order to try the --gpu/--cloud options in: `cheapest` or `listed`
         #[arg(long, default_value = "cheapest")]
         order: arena_core::placement::Order,
         /// Container disk size in GB (overrides config DISK_GB).
@@ -783,97 +740,65 @@ enum PodCmd {
         /// Persistent volume size in GB (overrides config VOLUME_GB; default 0).
         #[arg(long)]
         volume: Option<u32>,
-        /// Docker image (overrides config IMAGE/RUNPOD_DOCKER_IMAGE).
-        /// NOTE: for a custom (non-arena) image you probably want --bootstrap too,
-        /// or the pod won't come up SSH-reachable.
+        /// Docker image (overrides config IMAGE); a non-arena image needs --bootstrap
         #[arg(long)]
         image: Option<String>,
-        /// Set a start command that installs + launches sshd on boot, so a non-arena base
-        /// image (e.g. an NVIDIA NGC image) is SSH-reachable. The prebuilt arena image
-        /// doesn't need this.
+        /// Install + start sshd on boot, for non-arena base images
         #[arg(long)]
         bootstrap: bool,
-        /// Extra fields for the provider's create request: one JSON object, deep-merged into
-        /// the body (over config CREATE_EXTRA_JSON) — API options without a flag, e.g.
-        /// '{"dataCenterIds":["EU-RO-1"]}' or '{"globalNetworking":true}' on RunPod v2. Fields
-        /// arena sets itself (name, image, GPU, tier, disk, SSH keys, 22/tcp…) are refused;
-        /// --dry-run prints the merged body.
+        /// Extra JSON merged into the create request, e.g. '{"dataCenterIds":["EU-RO-1"]}'
         #[arg(long, value_name = "JSON")]
         api_json: Option<String>,
         #[command(flatten)]
         reap: ReapAtCreate,
-        /// Don't sync the proxy afterwards. By default `create` re-syncs it once the pods
-        /// exist (best-effort; pods still booting get their forward on a later sync).
+        /// Don't sync the proxy afterwards
         #[arg(long)]
         skip_proxy: bool,
         /// Preview only: print what would happen, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
-        /// On capacity exhaustion, wait and keep retrying instead of stopping (one GPU/cloud
-        /// only — with several options use --retry-mins).
+        /// On no capacity, wait and retry (one GPU/cloud only; else use --retry-mins)
         #[arg(long)]
         keep_trying: bool,
-        /// Keep re-attempting (topping up to the target) for up to this many minutes,
-        /// e.g. while waiting for capacity. 0 = a single attempt. Ctrl+C stops early. With
-        /// several options, each round re-tries every option.
+        /// Keep retrying for up to this many minutes while capacity is short (0 = once)
         #[arg(long, default_value_t = 0)]
         retry_mins: u64,
         /// Seconds between retry rounds.
         #[arg(long, default_value_t = 60)]
         retry_secs: u64,
     },
-    /// Spin up: create pods, then bring each up on its own — endpoint, proxy, setup, keys.
+    /// Create pods and set each up: endpoint, proxy, setup, keys
     ///
-    /// After the create every pod runs an independent pipeline: wait for its SSH endpoint →
-    /// sync the proxy → provision it (unless --no-setup) → [--check: deep-check it] → copy
-    /// its API keys (when keys/*_api_keys.csv exist) → `[name] READY …` or `[name] FAILED
-    /// <stage>: …`, printed the moment that pod is done; one slow pod never holds up another.
-    /// Ends with a NAME/GPU/$/H/PROXY PORT/HEALTH/STATUS/READY AFTER table (a requested name
-    /// that got no pod included) and exits non-zero unless every requested name is READY. A
-    /// pod that fails is left running: one is only ever terminated by --check (below).
+    /// Each pod runs its own pipeline (SSH endpoint → proxy → setup → --check → API keys) and
+    /// prints READY or FAILED <stage> as soon as it's done; one slow pod never holds up another.
+    /// Exits non-zero unless every requested name is READY. A pod that fails is left running.
     ///
-    /// --check: a pod that FAILs the deep check (`pods test --deep`) on its HOST (driver,
-    /// CUDA, device count, a GPU's tensor op, peer copies, NCCL) is on a bad machine — it
-    /// is TERMINATED and its name recreated from the same --gpu/--cloud/--max-price options
-    /// (options that haven't failed first), up to --check-attempts placements per name; a
-    /// replacement that lands on a machine IP that already failed is rejected the same way.
-    /// A FAIL that is only software/setup (no python, python reporting that torch is missing
-    /// or doesn't import, a CPU-only torch on a GPU pod) is NOT replaced — a new pod from the
-    /// same image fails the same way: the name FAILs, the pod is left running. Python killed
-    /// or crashed before it could report (timeout, OOM, SIGILL) counts as the host's.
-    /// A check that can't run at all (SSH drops, times out) is retried once
-    /// and never counts against the host. A WARN counts as ready. Ctrl+C (also during the
-    /// create's retries): no new attempts, nothing terminated, report.
+    /// --check: a pod that FAILs the deep check on its host (driver, CUDA, GPU) is TERMINATED and
+    /// its name recreated, up to --check-attempts. A software/setup failure isn't replaced.
+    /// Ctrl+C: no new attempts, nothing terminated.
     #[command(verbatim_doc_comment)]
     Up {
-        /// Explicit machine names to create (e.g. `apple bloom`), like `pods create`.
-        /// Bare names get the configured prefix. Mutually exclusive with -n/-a.
+        /// Machine names (`apple bloom`); bare names get the prefix. Not with -n/-a
         names: Vec<String>,
-        /// Target number of pods ON --provider (the create target) — tops up to this many;
-        /// pods on other providers don't count (mutually exclusive with -a).
+        /// Top up to N pods ON --provider; other providers don't count (not with -a)
         #[arg(short = 'n', long)]
         count: Option<usize>,
-        /// Number of pods to ADD on --provider (mutually exclusive with -n).
+        /// Add N pods on --provider (not with -n)
         #[arg(short = 'a', long)]
         add: Option<usize>,
-        /// GPU type, e.g. `A4000`, `3090`, `A100`, `A100 SXM` (or a full provider name) — or
-        /// a comma list of fallbacks (`A4000,4000Ada,3090`): each name tries the options one
-        /// create at a time, in --order, until one has capacity (see `arena offers`).
+        /// GPU type, or a comma list of fallbacks (`A4000,3090`); see `arena offers`
         #[arg(long)]
         gpu: Option<String>,
         /// GPUs per pod (overrides config NUM_GPUS).
         #[arg(long)]
         gpus: Option<u32>,
-        /// RunPod cloud tier: COMMUNITY or SECURE (overrides config) — or a comma list
-        /// (`community,secure`) to fall back across tiers.
+        /// RunPod tier COMMUNITY or SECURE (overrides config), or a comma list to fall back
         #[arg(long)]
         cloud: Option<String>,
-        /// Max $/h per pod (per-GPU price × --gpus). Options above it, or with no known
-        /// price, are not tried. Prices: RunPod's live catalog (else preset estimates).
+        /// Max $/h per pod; options above it or with no known price aren't tried
         #[arg(long, value_parser = parse_max_price)]
         max_price: Option<f64>,
-        /// Order to try several --gpu/--cloud options in: `cheapest` (by $/h per pod; a tie
-        /// goes to the better stock hint, then the listed order) or `listed` (GPU-major).
+        /// Order to try the --gpu/--cloud options in: `cheapest` or `listed`
         #[arg(long, default_value = "cheapest")]
         order: arena_core::placement::Order,
         /// Container disk size in GB (overrides config DISK_GB).
@@ -882,21 +807,13 @@ enum PodCmd {
         /// Persistent volume size in GB (overrides config VOLUME_GB; default 0).
         #[arg(long)]
         volume: Option<u32>,
-        /// Docker image (overrides config IMAGE/RUNPOD_DOCKER_IMAGE).
-        /// NOTE: for a custom (non-arena) image you probably want --bootstrap too,
-        /// or the pod won't come up SSH-reachable.
+        /// Docker image (overrides config IMAGE); a non-arena image needs --bootstrap
         #[arg(long)]
         image: Option<String>,
-        /// Set a start command that installs + launches sshd on boot, so a non-arena base
-        /// image (e.g. an NVIDIA NGC image) is SSH-reachable. The prebuilt arena image
-        /// doesn't need this.
+        /// Install + start sshd on boot, for non-arena base images
         #[arg(long)]
         bootstrap: bool,
-        /// Extra fields for the provider's create request: one JSON object, deep-merged into
-        /// the body (over config CREATE_EXTRA_JSON) — API options without a flag, e.g.
-        /// '{"dataCenterIds":["EU-RO-1"]}' or '{"globalNetworking":true}' on RunPod v2. Fields
-        /// arena sets itself (name, image, GPU, tier, disk, SSH keys, 22/tcp…) are refused;
-        /// --dry-run prints the merged body.
+        /// Extra JSON merged into the create request, e.g. '{"dataCenterIds":["EU-RO-1"]}'
         #[arg(long, value_name = "JSON")]
         api_json: Option<String>,
         #[command(flatten)]
@@ -907,98 +824,55 @@ enum PodCmd {
         /// Don't poll after creating; just print ids (run `proxy plan` later).
         #[arg(long, conflicts_with = "check")]
         no_wait: bool,
-        /// On capacity exhaustion, wait and keep retrying instead of stopping (one GPU/cloud
-        /// only — with several options use --retry-mins).
+        /// On no capacity, wait and retry (one GPU/cloud only; else use --retry-mins)
         #[arg(long)]
         keep_trying: bool,
-        /// Keep re-attempting (topping up to the target) for up to this many minutes
-        /// before waiting for endpoints / deploying the proxy. 0 = a single attempt.
-        /// Ctrl+C stops the retry loop early.
+        /// Keep retrying for up to this many minutes while capacity is short (0 = once)
         #[arg(long, default_value_t = 0)]
         retry_mins: u64,
         /// Seconds between retry rounds.
         #[arg(long, default_value_t = 60)]
         retry_secs: u64,
-        /// Skip provisioning the new pods over SSH (and so their API keys). By default `up`
-        /// runs setup on each pod it creates (deploy key + repo + tokens, or the hetzner
-        /// bare-VM script) as soon as that pod has an endpoint.
+        /// Skip setup over SSH (and so the API keys)
         #[arg(long)]
         no_setup: bool,
-        /// After setup, deep-check each pod (`pods test --deep`); a pod that FAILs is
-        /// terminated and its name recreated (see --check-attempts). A WARN counts as ready.
+        /// Deep-check each pod; TERMINATE and recreate any that FAIL on a bad host
         #[arg(long)]
         check: bool,
-        /// With --check: placements per name in total, the first create included (2 = one
-        /// replacement). A pod that FAILs the check on its last attempt is left running for a
-        /// look; one that lands on a machine that already failed is terminated even then (it
-        /// was never set up, and its host is known bad). Also, with or without --check, how often
-        /// a pod that never came up is replaced (Shadeform: listed `error`, or not up within
-        /// SHADEFORM_READY_MINS or --timeout, whichever comes first — always terminated: it
-        /// may bill).
+        /// With --check: placements per name, the first create included (2 = one retry)
+        ///
+        /// The last attempt's failing pod is left running for a look.
+        ///
+        /// Also caps how often a pod that never came up is replaced (Shadeform: always terminated).
         #[arg(long, default_value_t = 2, requires = "check", value_parser = clap::value_parser!(u32).range(1..=10))]
         check_attempts: u32,
-        /// Ignore the machines earlier `up --check`s remember as bad (for 72 h — `config check`
-        /// lists them): don't reject a pod that lands on one, and let Vast rent them again. A
-        /// machine that fails again is remembered again; one that passes is forgotten.
+        /// Allow machines that earlier `up --check`s marked bad (remembered 72 h)
         #[arg(long)]
         retry_bad_hosts: bool,
-        /// Lock each pod once it's READY (the pipeline's last step; RunPod with RUNPOD_API=v2):
-        /// RunPod then refuses stop, restart and terminate on it — from any client, its web
-        /// console included — until `arena pods unlock`. Refused up front where pods can't be
-        /// locked. A pod whose lock fails is `FAILED lock`, left running, unlocked.
+        /// Lock each pod once READY (RunPod v2) so it can't be stopped or deleted
         #[arg(long, conflicts_with = "no_wait")]
         lock: bool,
-        /// Per pod (and per replacement): how long it may take to come up — its SSH endpoint
-        /// to appear, then sshd to answer on it. Past that it's `FAILED endpoint`, left running.
+        /// Seconds each pod may take to get an endpoint and answer SSH (else FAILED)
         #[arg(long, default_value_t = 600)]
         timeout: u64,
-        /// Seconds between endpoint polls (one list call per poll for the whole fleet, shared
-        /// by every pod's pipeline).
+        /// Seconds between endpoint polls
         #[arg(long, default_value_t = 12)]
         interval: u64,
     },
-    /// Provision pods over SSH. Acts by default; --dry-run to preview.
+    /// Provision pods over SSH: keys, repo, tokens, VS Code
     ///
-    /// Per pod, in order:
-    ///   1. copy the git deploy key (scp) and chmod it;
-    ///   1b. (image-based pods, best-effort, its own 900s budget) when /workspace is a
-    ///      mounted volume, move the repo onto it: BACKUP_REPO_PATH becomes a link to
-    ///      /workspace/<repo dir>, so a restart keeps the work; after a reset the volume
-    ///      copy is linked back over the image's untouched checkout (kept aside). Work in
-    ///      the checkout, a repo in use, too little room: left alone, with a warning — never
-    ///      a failed setup. REPO_ON_VOLUME=0 turns it off;
-    ///   2. add a github.com block to ~/.ssh/config pointing at that key;
-    ///   3. add the shared + deploy public keys to ~/.ssh/authorized_keys;
-    ///   4. point the ARENA repo's origin at GitHub, fetch the default branch only (no
-    ///      tags, not every participant's branch), and update the branch (stay on the
-    ///      current branch by default; --force checks out the default branch and
-    ///      hard-resets);
-    ///   5. update submodules;
-    ///   6. write ~/.name (export MACHINE_NAME=…);
-    ///   7. (optional) export any broadcast tokens that are set — Hugging Face
-    ///      (HF_TOKEN + HUGGING_FACE_HUB_TOKEN) and Claude Code (CLAUDE_CODE_OAUTH_TOKEN)
-    ///      — into ~/.bashrc & ~/.zshrc; tokens not set are skipped;
-    ///   8. (best-effort, last) warm up VS Code Remote-SSH: the latest stable VS Code
-    ///      server + extensions (VSCODE_EXTENSIONS, default Python, Pylance, Jupyter) into
-    ///      ~/.vscode-server, and the arena env as python.defaultInterpreterPath (if unset).
-    ///      Skips what's already there; its own 300s budget; if it fails the pod is still
-    ///      set up, with a warning. --no-vscode / VSCODE_PREINSTALL=0 turn it off.
-    ///
-    /// Pods run in parallel, each step on a time budget (copies 60s; the config step
-    /// 300s, the hetzner bare-VM script 1800s — see --timeout / SETUP_TIMEOUT_SECS). A
-    /// stuck pod reports `✗ <name> (timed out at <step> after Ns)`; the others carry on.
-    ///
-    /// It does NOT distribute per-host API keys (use `pods copy-keys`) or back anything
-    /// up (use `pods backup` / `pods pull`).
-    ///
-    /// Targets: names / ids / ranges / `all` (see "Target selection"); none = the whole fleet.
+    /// Per pod: deploy key + GitHub SSH config, authorized keys, the ARENA repo (fetch the
+    /// default branch, update the current one), submodules, ~/.name, broadcast tokens (HF, Claude
+    /// Code), a VS Code server warm-up, then API keys if keys/*_api_keys.csv exist. With a
+    /// /workspace volume the repo is moved onto it, so a restart keeps the work. Confirms first;
+    /// no targets = every pod.
     #[command(verbatim_doc_comment)]
     #[allow(clippy::doc_lazy_continuation)] // verbatim `--help` text: its layout is the output, not Markdown
     Setup {
         /// Preview only: print what would happen, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
-        /// Force-checkout the default branch and hard-reset (else stay on current).
+        /// DISCARDS local changes: check out the default branch and hard-reset it
         #[arg(long)]
         force: bool,
         /// Hugging Face token to broadcast (overrides config HF_TOKEN).
@@ -1007,41 +881,29 @@ enum PodCmd {
         /// Claude Code OAuth token to broadcast (overrides config CLAUDE_CODE_OAUTH_TOKEN).
         #[arg(long)]
         cc_token: Option<String>,
-        /// Install the full shell the GPU pods get: zsh + oh-my-zsh + powerlevel10k + the
-        /// shared arena-infra dotfiles, set as the login shell (no conda/ARENA repo). For
-        /// bare / non-arena base images — the prebuilt arena image already has this.
+        /// Also install zsh, oh-my-zsh, powerlevel10k and dotfiles (for bare images)
         #[arg(long)]
         zsh_install: bool,
-        /// Skip the VS Code warm-up (server + extensions + default interpreter) this time
-        /// (config VSCODE_PREINSTALL=0 turns it off everywhere, `up` included).
+        /// Skip the VS Code warm-up (VSCODE_PREINSTALL=0 turns it off everywhere)
         #[arg(long)]
         no_vscode: bool,
-        /// Per-pod budget in seconds for the main provisioning command (default 300 for
-        /// image-based pods, 1800 for the hetzner bare-VM script; overrides config
-        /// SETUP_TIMEOUT_SECS; at most 86400). A pod that runs over reports `timed out at
-        /// <step>`; the others carry on.
+        /// Per-pod budget in seconds for the main step (default 300; Hetzner VMs 1800)
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..=arena_core::setup::MAX_STEP_TIMEOUT_SECS))]
         timeout: Option<u64>,
         #[command(flatten)]
         sel: Select,
     },
-    /// Stop every selected pod that is billing: names / ids / ranges, or --all (narrowed
-    /// by --exclude / --gpus / --on). Needs targets or --all.
+    /// Stop billing pods (RunPod/Vast: WIPES the container disk)
     ///
-    /// "Billing" means running OR on its way up (starting / provisioning / pending /
-    /// initializing / loading / restarting …) OR in ERROR — all of these are stopped, so
-    /// they need --wipe-ok just like a running pod. Selected pods that are already stopped,
-    /// or in a state we don't know, are skipped with a note.
+    /// Stops every selected pod that is billing: running, starting/provisioning/… or in ERROR.
+    /// Pods already stopped, or in an unknown state, are skipped. Needs targets or --all.
     ///
-    /// On RunPod (and Vast, unverified) a stopped pod keeps NO data: its container disk is
-    /// discarded and it starts again as a fresh image — only a persistent volume at
-    /// /workspace survives. Setup moves the ARENA repo onto the volume when a pod has one
-    /// (BACKUP_REPO_PATH becomes a link to /workspace/<repo>); each such pod is asked where its
-    /// repo really is, and unless it is on the volume the pod needs --wipe-ok. `pods start`
-    /// brings a stopped pod back (and sets it up again). Hetzner VMs keep their disk.
+    /// On RunPod and Vast only a /workspace volume survives a stop. A pod whose repo isn't on one
+    /// needs --wipe-ok (even with --yes): back it up first. Hetzner VMs keep their disk.
+    /// `pods start` brings pods back.
+    #[command(verbatim_doc_comment)]
     Stop {
-        /// Stop even pods whose container disk would be discarded with the participants'
-        /// work on it (required for them, even with --yes). Back them up first.
+        /// Also stop pods whose work would be WIPED (required for them, even with --yes)
         #[arg(long)]
         wipe_ok: bool,
         /// Preview only: print what would happen, change nothing.
@@ -1050,24 +912,17 @@ enum PodCmd {
         #[command(flatten)]
         sel: Select,
     },
-    /// Restart a pod in place — on RunPod this WIPES its container disk.
+    /// Restart a pod in place (RunPod: WIPES its container disk)
     ///
-    /// RunPod's restart resets the container to its image: everything outside a persistent
-    /// volume (/workspace) is gone — participants' files, ~/.name, setup's git remote, the
-    /// distributed keys. Setup moves the ARENA repo onto the volume when the pod has one
-    /// (BACKUP_REPO_PATH, default /root/<ARENA_REPO_NAME>, becomes a link to
-    /// /workspace/<repo>); the pod is asked where its repo really is, and unless it is on the
-    /// volume the restart is refused without --wipe-ok (even with --yes); Vast (stop+start) is
-    /// treated the same. The re-setup afterwards re-links the repo to the volume copy.
-    /// Afterwards it waits for the SSH endpoint, re-runs `setup` on the pod (--no-setup
-    /// skips) and syncs the proxy once the endpoint has settled, so it comes back usable.
-    /// Hetzner's hard reset keeps the VM disk. A STOPPED pod is refused: a restart needs a
-    /// running one — `pods start` brings a stopped pod back.
+    /// Everything outside a /workspace volume is lost (files, ~/.name, keys). Refused without
+    /// --wipe-ok unless the pod's repo is on a volume, even with --yes; Vast is treated the same.
+    /// Then waits for SSH, re-runs setup and syncs the proxy. Hetzner's reset keeps the disk. A
+    /// stopped pod is refused: use `pods start`.
+    #[command(verbatim_doc_comment)]
     Restart {
         /// Machine name (e.g. arena8-apple) or raw provider id.
         target: String,
-        /// Restart even though the container disk is wiped with the participants' work on it
-        /// (required then, even with --yes). Back the pod up first.
+        /// Restart even if work on the container disk is WIPED (required, even with --yes)
         #[arg(long)]
         wipe_ok: bool,
         /// Don't re-run setup on the pod afterwards (it comes back as the bare image).
@@ -1080,20 +935,14 @@ enum PodCmd {
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// Start stopped pods again (RunPod `start`, Vast state `running`, Hetzner `poweron`).
+    /// Start stopped pods again (and set them up again)
     ///
-    /// The way back from `pods stop`. A RunPod (or Vast) pod comes back as a FRESH image — its
-    /// container disk went at the stop; only a /workspace volume survived — so afterwards
-    /// each started pod's SSH endpoint is waited for until it settles, `setup` runs on it
-    /// again (~/.name, deploy key + git remote, API keys, the repo re-linked onto its
-    /// volume; --no-setup skips) and the proxy is synced. A Hetzner VM kept its disk: no
-    /// setup. Pods that aren't stopped are skipped with a note. The provider can refuse a
-    /// start when the pod's host has no free GPU left — then the pod stays stopped (terminate
-    /// it and create a new one, or retry later).
-    ///
-    /// Targets: names / ids / ranges, or --all (narrowed by --exclude / --gpus / --on).
+    /// RunPod/Vast pods come back as a fresh image (only a /workspace volume survived the stop),
+    /// so each gets `setup` again and the proxy is synced; Hetzner VMs kept their disk. A start
+    /// can be refused when the host has no free GPU: the pod stays stopped.
+    #[command(verbatim_doc_comment)]
     Start {
-        /// Don't re-run setup on the started pods (they come back as the bare image).
+        /// Don't re-run setup (the pods come back as the bare image)
         #[arg(long)]
         no_setup: bool,
         /// Don't sync the proxy afterwards.
@@ -1105,18 +954,13 @@ enum PodCmd {
         #[command(flatten)]
         sel: Select,
     },
-    /// Rename a pod (metadata only — the container is NOT restarted), then re-point the proxy.
+    /// Rename a pod (no restart) and re-point the proxy
     ///
-    /// `rename <old> <new>` renames one pod; `<new>` must be a free MACHINE_NAME_LIST name
-    /// (bare `apple` or full `arena9-apple`). `rename --from-prefix arena8` renames every
-    /// `arena8-<x>` to `{MACHINE_NAME_PREFIX}-<x>` — for a cohort prefix change. Every rename
-    /// is validated up front; nothing is touched if any of them is invalid.
-    ///
-    /// After the provider rename: rewrites ~/.name on each pod over SSH (an unreachable pod
-    /// is reported — re-run `pods setup <name>` later), moves the machine's OpenRouter key
-    /// mapping (its row in keys/openrouter_api_keys.csv and, with
-    /// OPENROUTER_PROVISIONING_KEY, the key's name on OpenRouter), then syncs the proxy. The
-    /// pod's MACHINE_NAME env var keeps the old name: env only changes with a reimage.
+    /// `rename <old> <new>`: <new> must be a free MACHINE_NAME_LIST name. `--from-prefix X`
+    /// renames every `X-<name>` pod to the current prefix. All renames are checked first. Also
+    /// rewrites ~/.name and moves the OpenRouter key mapping. The pod's MACHINE_NAME env var
+    /// keeps the old name until a reimage.
+    #[command(verbatim_doc_comment)]
     Rename {
         /// Current machine name (e.g. arena8-apple) or raw provider id.
         #[arg(required_unless_present = "from_prefix", conflicts_with = "from_prefix")]
@@ -1134,17 +978,13 @@ enum PodCmd {
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// Lock pods (RunPod, RUNPOD_API=v2): RunPod refuses stop, restart and terminate on a locked
-    /// pod — from ANY client, its web console included — until it's unlocked. The protection
-    /// for a running cohort's pods; setup, backups, `run` and SSH are unaffected. `pods up
-    /// --lock` locks new pods once they're READY.
+    /// Lock pods so nothing can stop or delete them (RunPod v2)
     ///
-    /// While locked, arena's own stop / restart / reimage / terminate / replace / migrate
-    /// cutover|finish refuse the pod up front ("… is locked — `arena pods unlock …` first");
-    /// `terminate --unlock` is the one command that lifts a lock itself. Pods on a backend
-    /// that can't lock (RUNPOD_API=v1, Vast, Hetzner) are reported and make the exit non-zero.
-    ///
-    /// Targets: names / ids / ranges, or --all (narrowed by --exclude / --gpus / --on).
+    /// RunPod then refuses stop, restart and terminate from any client, its web console included,
+    /// until `pods unlock`; setup, backups, `run` and SSH still work. arena's own stop, restart,
+    /// reimage, terminate, replace and migrate refuse a locked pod (`terminate --unlock` lifts
+    /// it). Pods on a backend that can't lock make the exit non-zero.
+    #[command(verbatim_doc_comment)]
     Lock {
         /// Preview only: print what would happen, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
@@ -1152,8 +992,7 @@ enum PodCmd {
         #[command(flatten)]
         sel: Select,
     },
-    /// Unlock pods locked with `pods lock` / `up --lock` (or in RunPod's console): stop,
-    /// restart and terminate work on them again — from any client. Same targets as `lock`.
+    /// Unlock pods so they can be stopped or terminated again
     Unlock {
         /// Preview only: print what would happen, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
@@ -1161,25 +1000,17 @@ enum PodCmd {
         #[command(flatten)]
         sel: Select,
     },
-    /// Reimage pods in place: swap the image + re-seed SSH keys, WIPING the container disk.
+    /// Reimage pods in place: new image, WIPES the container disk
     ///
-    /// Same host/id/name, fresh container from `--image` (default RUNPOD_DOCKER_IMAGE).
-    /// PUBLIC_KEY is re-seeded from the current config keys and MACHINE_NAME set to the
-    /// pod's name; other env is kept. Nothing is copied over — use `replace` to keep files.
-    ///
-    /// The same gate as restart/stop: everything outside a /workspace volume is lost, so a
-    /// pod whose ARENA repo isn't on a confirmed volume is refused without --wipe-ok (even
-    /// with --yes; the dry run says so). Afterwards each reimaged pod's endpoint is waited
-    /// for until it settles, `setup` runs on it again (~/.name, deploy key + git remote,
-    /// API keys; --no-setup skips) and the proxy is synced (ports change).
-    ///
-    /// Targets: names / ids / ranges, or --all (narrowed by --exclude / --gpus / --on).
+    /// Same host and name, fresh container from --image; nothing is copied over (`replace` keeps
+    /// files). Refused without --wipe-ok unless the repo is on a /workspace volume, even with
+    /// --yes. Then waits for SSH, re-runs setup and syncs the proxy.
+    #[command(verbatim_doc_comment)]
     Reimage {
         /// Image to use (default: RUNPOD_DOCKER_IMAGE from config).
         #[arg(long)]
         image: Option<String>,
-        /// Reimage even pods whose participants' work isn't on a confirmed volume (required
-        /// for them, even with --yes). Back them up first.
+        /// Reimage even pods whose work isn't on a volume (required, even with --yes)
         #[arg(long)]
         wipe_ok: bool,
         /// Don't re-run setup on the reimaged pods (they come back as the bare image).
@@ -1194,24 +1025,23 @@ enum PodCmd {
         #[command(flatten)]
         sel: Select,
     },
-    /// Replace a pod with a fresh one on a new host, keeping its name + files (blue-green).
+    /// Move a pod to a fresh host, keeping its name and files
     ///
-    /// Unlike `restart` (same host — useless when the *host* is the problem), `replace`
-    /// builds a brand-new pod, copies the old one's files onto it, then swaps it into the
-    /// canonical machine name so its proxy port / ssh-config identity carry over. The old
-    /// pod is parked as `<name>-old` until you confirm, never deleted out from under you.
-    /// Same spec as the source by default; the flags below override for a spec migration.
+    /// Builds a new pod, copies the files over, then swaps it into the name so its proxy port and
+    /// ssh-config carry over: for when the host is the problem (`restart` stays on it). The old
+    /// pod is parked as `<name>-old`, then terminated unless --keep-old. Same spec as the source
+    /// unless overridden.
+    #[command(verbatim_doc_comment)]
     Replace {
         /// Machine name (e.g. arena8-apple) or raw provider id to replace.
         target: String,
-        /// GPU type for the replacement (default: same as the source) — or a comma list of
-        /// fallbacks (`3070,A4000`), tried one create at a time in --order, as `pods up` does.
+        /// GPU type, or a comma list of fallbacks (default: same as the source)
         #[arg(long)]
         gpu: Option<String>,
         /// GPUs per pod (default: same as the source).
         #[arg(long)]
         gpus: Option<u32>,
-        /// RunPod cloud tier COMMUNITY/SECURE (default: same as the source) — or a comma list.
+        /// RunPod tier COMMUNITY/SECURE, or a comma list (default: same as the source)
         #[arg(long)]
         cloud: Option<String>,
         /// Container disk GB (default: same as the source).
@@ -1225,68 +1055,57 @@ enum PodCmd {
         image: Option<String>,
         #[command(flatten)]
         place: PlaceFlags,
-        /// Don't terminate the parked `<name>-old` pod at the end — leave it for manual
-        /// teardown once you've confirmed the replacement is healthy.
+        /// Keep the parked `<name>-old` pod instead of terminating it at the end
         #[arg(long)]
         keep_old: bool,
-        /// Skip the final `proxy apply` step. The swap still happens; you re-point nginx
-        /// yourself with `arena proxy apply`. Useful when testing on a throwaway name, or
-        /// to avoid rewriting the whole fleet's proxy config from a replace.
+        /// Skip the final `proxy apply` (re-point the proxy yourself later)
         #[arg(long)]
         skip_proxy: bool,
         /// Preview only: print the full plan, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// Staged, low-downtime migration to a fresh machine (safer than one-shot `replace`).
+    /// Staged move to a fresh host: copy, test, cut over (safer)
     ///
-    /// Three manual steps so the participant keeps working and can TEST the new pod before
-    /// any cutover — and the proxy switch is verified + auto-reverts if it breaks:
-    ///   migrate copy <name>     build+setup <name>-new and sync files (repeatable; no swap)
-    ///   migrate cutover <name>  final delta sync, swap names + proxy, verify, revert if bad
-    ///   migrate finish <name>   delete the parked <name>-old once you're happy
-    ///   migrate revert <name>   roll a cutover back (swap names + proxy back to the original)
-    ///   migrate status <name>   show the migration pair's state
+    /// The participant keeps working and can test the new pod before the cutover, which is
+    /// verified and reverts itself if it breaks: `copy` (repeatable) → `cutover` → `finish` (or
+    /// `revert`); `status` shows where a pair is.
+    #[command(verbatim_doc_comment)]
     Migrate {
         #[command(subcommand)]
         cmd: MigrateCmd,
     },
-    /// Terminate (delete) a pod, or the whole fleet with --all.
+    /// Terminate (delete) a pod, or every pod with --all
     ///
-    /// Deliberately one pod at a time (no ranges or lists — irreversible): the target is
-    /// matched like every other command's (name, bare name, `@name` or id), and a name two
-    /// pods share is refused (pass the id).
+    /// IRREVERSIBLE: the pod and its disk are gone. One pod at a time (no ranges or lists); a
+    /// name two pods share is refused (pass the id).
+    #[command(verbatim_doc_comment)]
     Terminate {
         /// Machine name (e.g. arena8-apple) or raw provider id. Omit with --all.
         target: Option<String>,
-        /// Terminate every pod the provider reports (the whole fleet).
+        /// Terminate EVERY pod the provider reports (the whole fleet)
         #[arg(long, conflicts_with = "target")]
         all: bool,
-        /// Unlock locked pods, then terminate them — without it a locked pod is refused (as RunPod
-        /// itself refuses it). With --all it lifts only the cohort's locks (`{prefix}-…`): a
-        /// locked staff/personal box (`@name` entry, or off the list) is KEPT and the exit fails
-        /// — name it alone to unlock it. For the end of the program: `pods terminate --all
-        /// --unlock`. The confirm text names the pods it unlocks. A pod whose unlock fails isn't
-        /// terminated.
+        /// Unlock locked pods, then terminate them (else a locked pod is refused)
+        ///
+        /// With --all, only the cohort's: a locked staff/off-list box is kept and the exit fails.
         #[arg(long)]
         unlock: bool,
-        /// Also revoke each terminated machine's OpenRouter key (every key named after it)
-        /// and drop its row from keys/openrouter_api_keys.csv. Needs
-        /// OPENROUTER_PROVISIONING_KEY. A failed revoke is reported and makes the exit
-        /// non-zero, but never stops a terminate.
+        /// Also revoke each terminated machine's OpenRouter key and drop its CSV row
         #[arg(long)]
         revoke_key: bool,
-        /// Don't sync the proxy afterwards (the forward stays until the next
-        /// `arena proxy apply`).
+        /// Don't sync the proxy afterwards (the forward stays until `proxy apply`)
         #[arg(long)]
         skip_proxy: bool,
         /// Preview only: print what would happen, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// Full backup: git-push each pod's current branch (skips main/master) AND rsync its
-    /// home to the local backups folder (`pull`). Targets: names / ids / ranges (none = every
-    /// reachable pod). --no-pull = git only.
+    /// Git-push each pod's branch, then rsync its home locally
+    ///
+    /// Pushes the current branch (never main/master), then runs `pods pull`; --no-pull = git
+    /// only. No targets = every reachable pod.
+    #[command(verbatim_doc_comment)]
     Backup {
         /// Only do the git push; skip the rsync file backup.
         #[arg(long)]
@@ -1300,33 +1119,29 @@ enum PodCmd {
         #[command(flatten)]
         sel: Select,
     },
-    /// Rsync each pod's home to a local backup folder (the file backup). Targets: names /
-    /// ids / ranges, like every other command (none = every pod with an SSH endpoint); the
-    /// snapshot's label goes behind --label. Each pod's rsync is bounded: 5 min without I/O,
-    /// and BACKUP_TIMEOUT_SECS of wall clock (default 2h).
+    /// Rsync each pod's home to the local backup folder
+    ///
+    /// Writes a dated snapshot (files under --max-size) and the complete `big/` mirror. No
+    /// targets = every pod with an SSH endpoint. Each pod's rsync is time-limited
+    /// (BACKUP_TIMEOUT_SECS).
+    #[command(verbatim_doc_comment)]
     Pull {
-        /// Snapshot label, e.g. `w1d3` (default: the computed `wNdM` iteration). The old
-        /// positional spelling (`pods pull w1d3`) still works — with a note — when the word
-        /// can't be a pod's name.
+        /// Snapshot label, e.g. `w1d3` (default: the computed wNdM)
         #[arg(long)]
         label: Option<String>,
-        /// Local base directory for backups (default: config LOCAL_BACKUP_DIR, else ./backup).
+        /// Local backup dir (default: config LOCAL_BACKUP_DIR, else ./backup)
         #[arg(long)]
         dir: Option<String>,
-        /// Max file size for the dated `wNdM` snapshot tier (rsync --max-size), e.g. `50M`:
-        /// files below it get point-in-time history. The `big/` mirror always holds the
-        /// complete home regardless (default: config BACKUP_MAX_SIZE, else 50M).
+        /// Max file size in the dated snapshot (default: BACKUP_MAX_SIZE, else 50M)
         #[arg(long)]
         max_size: Option<String>,
-        /// Remote path to pull, relative to the home dir (default: config
-        /// BACKUP_REMOTE_PATH, else the whole home dir).
+        /// Path under the home dir to pull (default: BACKUP_REMOTE_PATH, else all)
         #[arg(long)]
         remote_path: Option<String>,
-        /// Exclude `.git` (by default the repo's git history/state IS backed up).
+        /// Exclude `.git` (backed up by default)
         #[arg(long)]
         no_git: bool,
-        /// Skip the all-files big backup (`<dir>/big/<pod>/`); write only the dated snapshot
-        /// tier. By default both run.
+        /// Skip the all-files `big/` mirror; write only the dated snapshot
         #[arg(long)]
         no_big: bool,
         /// Preview only: print the rsync commands, copy nothing.
@@ -1338,22 +1153,12 @@ enum PodCmd {
         #[command(flatten)]
         sel: Select,
     },
-    /// Capture the week's FLEET BASELINE from ONE freshly set-up pod: the image's own files,
-    /// which every pod's dated snapshots then hard-link to instead of copying them again (a new
-    /// or replaced pod's first snapshot included; each pod's later snapshots also link to its
-    /// previous one). Run it once a week, or when the image changes, on a pod `up` just made.
+    /// Capture the week's shared baseline from one fresh pod
     ///
-    /// It rsyncs the pod's home with the snapshot tier's filters (its .git complete) into
-    /// <dir>/baseline/w<N>/fleet/, then KEEPS ONLY THE FILES OLDER THAN THE POD'S CONTAINER —
-    /// the image's: a hard link is made when size, mtime and permissions match, contents are
-    /// never compared, and a file written at setup or later (~/.name, the API keys in .bashrc,
-    /// anyone's work) can match another pod's that way with different contents. Nor anything
-    /// copied onto the pod since with an older mtime kept (a `pods replace`/`migrate` copy of
-    /// another pod's home, a `pods restore`): the pod lists those first (ctime after its
-    /// container's creation, mtime before). A repo on the /workspace volume is left out (a
-    /// volume can hold work from before the container). Refused when the container's creation
-    /// time is unknown or over a day old, when that listing fails, and when the week already
-    /// has a baseline (--replace moves the old one aside; nothing is deleted).
+    /// Saves the image's own files (older than the pod's container) so every pod's dated
+    /// snapshots hard-link to them instead of copying. Run it once a week, or when the image
+    /// changes, on a pod `up` just made. Refused if the container is over a day old or the week
+    /// already has a baseline (--replace moves it aside; nothing is deleted).
     #[command(verbatim_doc_comment)]
     Baseline {
         /// The pod: machine name (e.g. arena8-apple), bare name, @name or provider id.
@@ -1361,65 +1166,50 @@ enum PodCmd {
         /// The week it is for (default: the current one, from ARENA_START_DATE).
         #[arg(long)]
         week: Option<u32>,
-        /// Local base directory of the backups (default: config LOCAL_BACKUP_DIR, else ./backup).
+        /// Local backup dir (default: config LOCAL_BACKUP_DIR, else ./backup)
         #[arg(long)]
         dir: Option<String>,
-        /// Capture it again: the week's current baseline is moved aside to
-        /// fleet.replaced-<UTC time>/ (delete it yourself once no snapshot needs it — snapshots
-        /// keep their own links either way).
+        /// Capture again; the week's current baseline is moved aside (nothing deleted)
         #[arg(long)]
         replace: bool,
         /// Preview only: ask the pod (read-only) and print the plan and the rsync commands.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// Push a local backup (what `pull` saved) back onto ONE pod — never deletes anything.
+    /// Push a local backup back onto one pod (never deletes)
     ///
-    /// From `<dir>/<label>/<pod>/` (a dated snapshot: the files under the size cap; or a
-    /// custom `pull --label`) or `<dir>/big/<pod>/` (`--from big`: every file); default: that
-    /// pod's newest wNdM snapshot. Rsync over the pod's direct SSH endpoint into its home —
-    /// through the repo's link onto the /workspace volume when setup made one, so the work
-    /// lands on the volume. Files on the pod that the backup doesn't have stay; files on the
-    /// pod NEWER than the backup's copy stay too (reported; --overwrite-newer replaces them); a
-    /// file it replaces is kept under /workspace/.arena-restore/<UTC time>/ when the pod has
-    /// its volume mounted, else ~/.arena-restore/<UTC time>/ (pulls don't back that dir up).
-    /// ~/.ssh, the shell rc files and histories, ~/.name and .claude* are never pushed (they
-    /// belong to the pod); nor, by default, is .git from a snapshot (--with-git): one pulled
-    /// before .git got its own uncapped pass can lack objects over the size cap — the repo is
-    /// checked after any restore that pushed its .git.
-    /// Confirms first, showing source, destination and size, and warns when the snapshot was
-    /// written after the pod's disk was last reset. Refused when that backup doesn't exist or
-    /// is empty.
+    /// Default source: the pod's newest wNdM snapshot (--from big: every file). Files on the pod
+    /// newer than the backup's copy stay (--overwrite-newer replaces them); any file it replaces
+    /// is kept under .arena-restore/<time>/. Never pushes ~/.ssh, shell rc and history files,
+    /// ~/.name or (without --with-git) .git. Confirms first, showing source, destination and
+    /// size.
+    #[command(verbatim_doc_comment)]
     Restore {
         /// Machine name (e.g. arena8-apple) or raw provider id.
         target: String,
-        /// Which backup: a snapshot label (e.g. w1d3) or `big`. Default: the newest snapshot.
+        /// Snapshot label (e.g. `w1d3`) or `big` (default: the newest snapshot)
         #[arg(long)]
         from: Option<String>,
-        /// Only restore this path inside the backup (relative), e.g. ARENA_materials/chapter1.
+        /// Restore only this path in the backup, e.g. ARENA_materials/chapter1
         #[arg(long)]
         path: Option<String>,
-        /// Local base directory of the backups (default: config LOCAL_BACKUP_DIR, else ./backup).
+        /// Local backup dir (default: config LOCAL_BACKUP_DIR, else ./backup)
         #[arg(long)]
         dir: Option<String>,
-        /// Budget in seconds for the whole transfer (default 7200, at most 86400); it also
-        /// gives up after 300 s without any I/O.
+        /// Budget in seconds for the whole transfer (default 7200)
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..=arena_core::setup::MAX_STEP_TIMEOUT_SECS))]
         timeout: Option<u64>,
-        /// Also replace files on the pod that are NEWER than the backup's copy (default: they
-        /// stay; the replaced copies are kept either way).
+        /// Also replace pod files NEWER than the backup's copy (replaced ones are kept)
         #[arg(long)]
         overwrite_newer: bool,
-        /// Push .git dirs from a snapshot too (the big tier always carries them): a snapshot
-        /// drops files over its size cap, git packs included.
+        /// Push .git dirs from a snapshot too (it may lack git packs over its size cap)
         #[arg(long)]
         with_git: bool,
         /// Preview only: print the plan and the rsync command, copy nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
     },
-    /// Create + push each pod's wNdM autocommit branch (no commit). Targets: names / ids /
-    /// ranges (none = every reachable pod).
+    /// Create + push each pod's wNdM autocommit branch
     InitBranches {
         /// Override the iteration week (default: computed from ARENA_START_DATE).
         #[arg(long)]
@@ -1433,13 +1223,11 @@ enum PodCmd {
         #[command(flatten)]
         sel: Select,
     },
-    /// Switch pods' branch (gentle ff-only; --hard force-resets to origin). Targets after
-    /// the branch: names / ids / ranges, or --all (every pod with an SSH endpoint).
+    /// Switch pods' git branch (ff-only; --hard force-resets)
     SetBranch {
         /// Branch to check out (e.g. main, or a feature branch).
         branch: String,
-        /// DESTRUCTIVE: hard-reset the branch to `origin/<branch>`, discarding local
-        /// commits/changes (untracked files are left alone).
+        /// DESTRUCTIVE: reset to `origin/<branch>`, dropping local commits and changes
         #[arg(long)]
         hard: bool,
         /// Preview only: print what would happen, change nothing.
@@ -1448,31 +1236,21 @@ enum PodCmd {
         #[command(flatten)]
         sel: Select,
     },
-    /// Run a shell command on every pod over SSH (concurrent).
+    /// Run a shell command on pods over SSH (in parallel)
     ///
-    /// Runs inside an interactive shell with the conda env active (default `arena-env`,
-    /// override via `CONDA_ENV`; set it empty to disable), so commands see the
-    /// participants' python/packages and the token exports written by `setup`. Flags go
-    /// BEFORE the command — everything after it is the command. Scope it with
-    /// `-t <targets>` (names / ids / ranges) and the other selection flags; default: every pod.
-    /// A bare selection or --dry-run flag after the command is refused (it would widen the
-    /// run, or make the preview real); quote a command that takes one: `run 'ls -t'`.
-    ///
-    /// `--background`: start it detached instead (a course-test run that outlasts your SSH
-    /// session) and return at once with a job id — see `pods jobs` and `pods logs`.
+    /// Runs in an interactive shell with the conda env active (CONDA_ENV, default arena-env).
+    /// Flags go BEFORE the command; everything after it is the command (quote it if needed:
+    /// `run 'ls -t'`). Default: every pod; narrow it with -t. --background returns at once with a
+    /// job id (see `pods jobs` / `pods logs`).
+    #[command(verbatim_doc_comment)]
     Run {
-        /// The command to run (everything after `run`).
+        /// The command to run (everything after the flags)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
-        /// Start the command detached on each pod (same shell + conda env) and return at
-        /// once: one job id for the whole run, its files (log = stdout+stderr, pid, exit
-        /// code) under `~/.arena/jobs/<id>/` on each pod. It keeps running after this
-        /// command — and your connection — ends; no time limit (stop it with `pods jobs
-        /// --kill <id>`). Pods' files live on the container disk: a restart wipes them.
+        /// Start it detached and return a job id (stop it with `pods jobs --kill`)
         #[arg(long, visible_alias = "bg", conflicts_with = "timeout")]
         background: bool,
-        /// Per-pod budget in seconds (default 1800 = 30 min; at most 86400). A pod that
-        /// runs over reports `✗ timed out after Ns` and counts as failed; the others carry on.
+        /// Per-pod budget in seconds; a pod over it counts as failed
         #[arg(long, default_value_t = RUN_TIMEOUT_SECS, value_parser = clap::value_parser!(u64).range(1..=arena_core::setup::MAX_STEP_TIMEOUT_SECS))]
         timeout: u64,
         /// Preview only: print the command + target pods, run nothing.
@@ -1481,48 +1259,40 @@ enum PodCmd {
         #[command(flatten)]
         sel: SelectByFlag,
     },
-    /// Background jobs (`pods run --background`) on each pod, newest first: id, start time
-    /// (UTC), `running (pid N)` / `exit N` / `lost`, command. Read-only, except `--kill`.
+    /// List background jobs on each pod (or --kill one)
     ///
-    /// Targets: names / ids / ranges (none = every pod). A job id among them (it's told
-    /// apart by its shape, `20261008-142301-…`) shows just that job.
+    /// Newest first: id, start time, status, command. Read-only except --kill. A job id among the
+    /// targets shows just that job.
+    #[command(verbatim_doc_comment)]
     Jobs {
-        /// Stop job JOB on the selected pods (confirms first): SIGTERM to the job's process
-        /// group, only where it is still running and the pod confirms the pid is still that
-        /// job. It then reads `exit 143 (SIGTERM)`. A program that ignores SIGTERM keeps
-        /// running (no SIGKILL follow-up).
+        /// Stop job JOB: SIGTERM to its process group (confirms first)
         #[arg(long, value_name = "JOB")]
         kill: Option<String>,
         #[command(flatten)]
         sel: Select,
     },
-    /// A background job's log on each pod: its status and the last `--tail` lines.
+    /// Show a background job's log on each pod
     ///
-    /// JOB is an id from `pods jobs` (default: each pod's newest job); it can go anywhere
-    /// among the targets — it's told apart by its shape (`20261008-142301-…`). `--follow`
-    /// keeps printing new lines (every 3s) until every followed job has ended, then exits
-    /// non-zero if any ended other than `exit 0`; Ctrl+C stops following, never the job.
-    /// Read-only. Targets: names / ids / ranges (none = every pod).
+    /// JOB (from `pods jobs`; default: each pod's newest) can go among the targets. --follow
+    /// keeps printing until every job has ended and exits non-zero if any didn't exit 0.
+    /// Read-only: Ctrl+C stops following, never the job.
+    #[command(verbatim_doc_comment)]
     Logs {
         /// Lines to show per pod (from at most the last 1 MiB of its log).
         #[arg(short = 'n', long, default_value_t = jobs::DEFAULT_TAIL, value_parser = clap::value_parser!(u64).range(0..=100_000))]
         tail: u64,
-        /// Keep printing new output until every followed job has ended (Ctrl+C stops
-        /// following; the jobs keep running).
+        /// Keep printing until the jobs end (Ctrl+C leaves them running)
         #[arg(short = 'f', long)]
         follow: bool,
         #[command(flatten)]
         sel: Select,
     },
-    /// Health check (read-only). Plain: torch version on every pod (90s budget per pod).
+    /// Health check: torch version, or --deep GPU tests (read-only)
     ///
-    /// `--deep`: per-GPU CUDA tensor op, driver vs the configured floor
-    /// (`MIN_DRIVER_VERSION`, else derived from `ALLOWED_CUDA_VERSIONS`), torch device
-    /// count vs nvidia-smi, GPU↔GPU copy + NCCL all_reduce (only with >1 GPU), Hugging
-    /// Face download speed, disk, host load, maintenance window. One pass/warn/fail row
-    /// per pod (150s budget each); exits non-zero if any pod FAILs (warnings don't).
-    ///
-    /// Targets (both checks): names / ids / ranges (none = every pod with an SSH endpoint).
+    /// --deep: per-GPU CUDA op, driver vs MIN_DRIVER_VERSION, device count, GPU↔GPU copy + NCCL,
+    /// HF download speed, disk, load, maintenance window. One pass/warn/fail row per pod; exits
+    /// non-zero on any FAIL. No targets = every pod with an SSH endpoint.
+    #[command(verbatim_doc_comment)]
     Test {
         /// Run the deep check instead of the torch-version check.
         #[arg(long)]
@@ -1536,24 +1306,16 @@ enum PodCmd {
         #[command(flatten)]
         sel: Select,
     },
-    /// Which pods look abandoned — a read-only REPORT; it never stops or terminates anything.
+    /// Report pods that look abandoned (read-only; reaps nothing)
     ///
-    /// One bounded probe per billing pod (60s budget; nothing written): live inbound
-    /// connections — SSH sessions (VS Code Remote-SSH counts; this probe's own is left out)
-    /// and others from off the pod (a Jupyter tab through the provider's proxy) — GPU
-    /// utilization (busiest of 3 samples) and memory, the newest file change under the home
-    /// and the repo (BACKUP_REPO_PATH; .git, caches and editor servers skipped; 20s scan), and
-    /// the container's uptime. A pod idle by EVERY measure for --hours (no connection, GPU
-    /// ≤5%, no file change, up that long) is listed as a candidate with the commands an
-    /// operator could run — `pods backup` first, then `pods terminate` — printed, not run.
-    /// Only this cohort's machines get commands (a staff `@` box or another prefix's pod is
-    /// named, nothing more). Anything that can't be read makes a pod unknown, never a
-    /// candidate. Not seen: sessions through RunPod's ssh.runpod.io proxy (they don't come
-    /// in over the pod's sshd) — check with the group before acting.
-    ///
-    /// Targets: names / ids / ranges (none = every pod).
+    /// Probes each billing pod: inbound connections (SSH, VS Code, Jupyter), GPU use, newest file
+    /// change, uptime. A pod idle by every measure for --hours is a candidate, with the
+    /// `pods backup` / `pods terminate` commands printed (not run). Unreadable = unknown, never a
+    /// candidate. Not seen: sessions via RunPod's ssh.runpod.io proxy; check with the group
+    /// before acting.
+    #[command(verbatim_doc_comment)]
     Idle {
-        /// How long a pod must have been idle by every measure (hours, default 6).
+        /// Hours a pod must have been idle by every measure
         #[arg(long, default_value_t = arena_core::idle::DEFAULT_HOURS, value_parser = money::parse_hours)]
         hours: f64,
         /// Print the report as JSON (verdicts, readings, suggested commands).
@@ -1562,24 +1324,28 @@ enum PodCmd {
         #[command(flatten)]
         sel: Select,
     },
-    /// The opt-in auto-reaper: terminate pods past an end time, or idle for a window — after a
-    /// verified backup, only when every check is certain. Off by default: nothing happens to a
-    /// pod without a policy (`reap set`, or `up --expire-in/--idle-after`), and only `reap run
-    /// --apply` with REAP_ENABLED=1 in the config file acts. `reap run` alone just looks.
+    /// Opt-in auto-reaper for expired or idle pods (off by default)
+    ///
+    /// Terminates pods past an end time or idle for a window, after a verified backup. Nothing
+    /// happens without a policy (`reap set`, or `up --expire-in/--idle-after`), and only
+    /// `reap run --apply` with REAP_ENABLED=1 in the config file acts. `reap run` alone just
+    /// looks.
+    #[command(verbatim_doc_comment)]
     #[command(subcommand, infer_subcommands = true)]
     Reap(reap::ReapCmd),
-    /// Distribute API keys to pods' shells (per-host CSVs + broadcast HF token). Targets:
-    /// names / ids / ranges (none = every reachable pod).
+    /// Copy API keys and tokens into pods' shells
+    ///
+    /// Per-host keys from `<keys-dir>/<provider>_api_keys.csv`, plus the HF and Claude Code
+    /// tokens. No targets = every reachable pod.
+    #[command(verbatim_doc_comment)]
     CopyKeys {
         /// Directory holding the per-host `<provider>_api_keys.csv` files.
         #[arg(long, default_value = "./keys")]
         keys_dir: String,
-        /// Hugging Face token to set on every pod (HF_TOKEN + HUGGING_FACE_HUB_TOKEN).
-        /// Overrides config HF_TOKEN. Use to enable pulls from gated repos.
+        /// Hugging Face token for every pod (overrides config HF_TOKEN)
         #[arg(long)]
         hf_token: Option<String>,
-        /// Claude Code OAuth token to set on every pod (CLAUDE_CODE_OAUTH_TOKEN).
-        /// Overrides config CLAUDE_CODE_OAUTH_TOKEN.
+        /// Claude Code OAuth token for every pod (overrides config CLAUDE_CODE_OAUTH_TOKEN)
         #[arg(long)]
         cc_token: Option<String>,
         /// Preview only: print what would be set per pod (key values redacted).
@@ -1588,7 +1354,7 @@ enum PodCmd {
         #[command(flatten)]
         sel: Select,
     },
-    /// scp a local file (or dir, with -r) to every pod (mirrors the repo path if no DEST).
+    /// Copy a local file or dir (-r) to every pod (scp)
     #[command(visible_alias = "copy")]
     Cp {
         /// Local file (or directory, with -r) to copy.
@@ -1598,9 +1364,7 @@ enum PodCmd {
         /// Recurse into a directory (scp -r).
         #[arg(short = 'r', long)]
         recursive: bool,
-        /// Per-pod scp budget in seconds (default: 10 min plus 1s per MB sent across all
-        /// pods — every copy shares your uplink; at most 86400). A pod that runs over
-        /// reports `✗ timed out after Ns` and counts as failed; the others carry on.
+        /// Per-pod scp budget in seconds (default: 10 min + 1 s per MB sent)
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..=arena_core::setup::MAX_STEP_TIMEOUT_SECS))]
         timeout: Option<u64>,
         /// Preview only: print the scp commands, copy nothing.
@@ -1618,15 +1382,13 @@ enum PodCmd {
 /// (ARENA_STATE_DIR, explicit and absolute) isn't usable.
 #[derive(clap::Args, Debug, Clone, Default)]
 struct ReapAtCreate {
-    /// Give each pod an end time this far from now (e.g. `8h`, `3d`): the opt-in reaper
-    /// terminates it then, after a verified backup — never while it's in use.
+    /// Have the opt-in reaper terminate each pod this long from now (`8h`, `3d`)
     #[arg(long, value_name = "DUR", conflicts_with = "expire_at")]
     expire_in: Option<String>,
-    /// Give each pod this end time (RFC 3339, or `YYYY-MM-DD HH:MM` local).
+    /// Have the opt-in reaper terminate each pod at this time (RFC 3339 or local)
     #[arg(long, value_name = "TIME")]
     expire_at: Option<String>,
-    /// Let the opt-in reaper terminate each pod after this long with no activity at all
-    /// (e.g. `8h`), after a verified backup.
+    /// Have the opt-in reaper terminate each pod after this long fully idle (`8h`)
     #[arg(long, value_name = "DUR")]
     idle_after: Option<String>,
 }
@@ -1943,15 +1705,13 @@ struct SpecOverrides {
 /// cheapest first (or as listed), with a retry window while capacity is short.
 #[derive(clap::Args, Debug, Clone, Default)]
 struct PlaceFlags {
-    /// Max $/h for the new pod (per-GPU price × --gpus). Options above it, or with no known
-    /// price, are not tried.
+    /// Max $/h for the new pod; options above it or unpriced aren't tried
     #[arg(long, value_parser = parse_max_price)]
     max_price: Option<f64>,
     /// Order to try several --gpu/--cloud options in: `cheapest` or `listed`.
     #[arg(long, default_value = "cheapest")]
     order: arena_core::placement::Order,
-    /// Keep re-trying every option for up to this many minutes while capacity is short
-    /// (0 = one round). Ctrl+C stops early; nothing is touched until the new pod exists.
+    /// Keep retrying every option for up to this many minutes (0 = once)
     #[arg(long, default_value_t = 0)]
     retry_mins: u64,
     /// Seconds between retry rounds.
@@ -15243,7 +15003,8 @@ mod selection_tests {
 
     /// `pods stop --help` states the rule the handler applies (`status::is_billing`), not
     /// the old RUNNING-only one: an ERROR / PROVISIONING pod is stopped too, and needs
-    /// --wipe-ok like a running one — the help must not promise otherwise.
+    /// --wipe-ok like a running one — the help must not promise otherwise. The one-line
+    /// summary in `arena pods --help` warns that a stop wipes the container disk.
     #[test]
     fn stop_help_states_the_billing_rule() {
         use clap::CommandFactory;
@@ -15251,7 +15012,7 @@ mod selection_tests {
         let stop = cli.find_subcommand("pods").and_then(|p| p.find_subcommand("stop")).expect("pods stop");
         let about = stop.get_about().map(|s| s.to_string()).unwrap_or_default();
         let long = stop.get_long_about().map(|s| s.to_string()).unwrap_or_default();
-        assert!(about.contains("billing") && !about.contains("running pods"), "{about}");
+        assert!(about.contains("billing") && !about.contains("running pods") && about.contains("WIPES"), "{about}");
         for want in ["starting", "provisioning", "ERROR", "--wipe-ok", "skipped"] {
             assert!(long.contains(want), "missing {want:?}: {long}");
         }
@@ -15276,7 +15037,7 @@ mod selection_tests {
         }
         let proxy = cli.find_subcommand("proxy").expect("proxy");
         let about = proxy.get_about().map(|s| s.to_string()).unwrap_or_default();
-        assert!(!about.contains("read-only;") && about.contains("`apply` writes"), "{about}");
+        assert!(!about.contains("read-only") && about.contains("write + reload (apply)"), "{about}");
     }
 
     #[tokio::test]
