@@ -15040,6 +15040,97 @@ mod selection_tests {
         assert!(!about.contains("read-only") && about.contains("write + reload (apply)"), "{about}");
     }
 
+    /// The help stays short enough to be read (the operator's complaint: one-line summaries
+    /// that ran to 500 characters). Walks the whole command tree: every command has a one-line
+    /// summary (`about`: its line in the parent's command list) of at most 70 characters,
+    /// every argument has help whose first line is at most 100 and whose `--help` text is at
+    /// most 300, and every command's `--help` text (`long_about`) is at most 800. Details
+    /// belong in README.md / FEATURE_MAP.md, not here.
+    #[test]
+    fn help_text_stays_short() {
+        use clap::CommandFactory;
+        const ABOUT_MAX: usize = 70;
+        const ARG_HELP_MAX: usize = 100;
+        const ARG_LONG_HELP_MAX: usize = 300;
+        const LONG_ABOUT_MAX: usize = 800;
+        // Justified exceptions to LONG_ABOUT_MAX, by command path (`"arena pods up"`): none.
+        const LONG_ABOUT_EXCEPTIONS: &[&str] = &[];
+        fn walk(cmd: &clap::Command, path: String, bad: &mut Vec<String>) {
+            let len = |s: &str| s.chars().count();
+            let about = cmd.get_about().map(|s| s.to_string()).unwrap_or_default();
+            if about.trim().is_empty() || about.contains('\n') || len(&about) > ABOUT_MAX {
+                bad.push(format!("{path}: about, {} chars: {about:?}", len(&about)));
+            }
+            let long = cmd.get_long_about().map(|s| s.to_string()).unwrap_or_default();
+            if len(&long) > LONG_ABOUT_MAX && !LONG_ABOUT_EXCEPTIONS.contains(&path.as_str()) {
+                bad.push(format!("{path}: long help, {} chars", len(&long)));
+            }
+            for arg in cmd.get_arguments() {
+                let id = arg.get_id();
+                let help = arg.get_help().map(|s| s.to_string()).unwrap_or_default();
+                let first = help.lines().next().unwrap_or_default();
+                if first.trim().is_empty() || len(first) > ARG_HELP_MAX {
+                    bad.push(format!("{path} --{id}: help, {} chars: {help:?}", len(first)));
+                }
+                let long = arg.get_long_help().map(|s| s.to_string()).unwrap_or_default();
+                if len(&long) > ARG_LONG_HELP_MAX {
+                    bad.push(format!("{path} --{id}: long help, {} chars", len(&long)));
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                walk(sub, format!("{path} {}", sub.get_name()), bad);
+            }
+        }
+        let mut cli = super::Cli::command();
+        cli.build();
+        let mut bad = Vec::new();
+        walk(&cli, "arena".to_string(), &mut bad);
+        assert!(bad.is_empty(), "help text missing or too long (details go in README.md):\n{}", bad.join("\n"));
+    }
+
+    /// Shortening the help never drops a warning: the commands and flags that wipe, delete or
+    /// terminate still say so, in the words an operator scans for.
+    #[test]
+    fn dangerous_commands_keep_their_warnings() {
+        use clap::CommandFactory;
+        let cli = super::Cli::command();
+        let find = |path: &[&str]| {
+            path.iter().fold(&cli, |c, name| c.find_subcommand(name).unwrap_or_else(|| panic!("no command {path:?}")))
+        };
+        let text = |s: Option<&clap::builder::StyledStr>| s.map(|s| s.to_string()).unwrap_or_default();
+        for (path, word) in [(&["pods", "stop"][..], "WIPES"), (&["pods", "restart"], "WIPES"), (&["pods", "reimage"], "WIPES")] {
+            let about = text(find(path).get_about());
+            assert!(about.contains(word), "{path:?}: {about}");
+        }
+        for (path, word) in [
+            (&["pods", "terminate"][..], "IRREVERSIBLE"),
+            (&["pods", "up"], "TERMINATED"),
+            (&["pods", "reap"], "REAP_ENABLED=1"),
+            (&["pods", "reap", "run"], "TERMINATE"),
+            (&["archive", "down"], "EVERY BACKUP"),
+            (&["teardown"], "deletes nothing"),
+        ] {
+            let long = text(find(path).get_long_about());
+            assert!(long.contains(word), "{path:?}: {long}");
+        }
+        for (path, id, word) in [
+            (&["pods", "terminate"][..], "all", "EVERY"),
+            (&["pods", "stop"], "wipe_ok", "WIPED"),
+            (&["pods", "restart"], "wipe_ok", "WIPED"),
+            (&["pods", "set-branch"], "hard", "DESTRUCTIVE"),
+            (&["pods", "setup"], "force", "DISCARDS"),
+            (&["pods", "up"], "check", "TERMINATE"),
+            (&["pods", "reap", "run"], "apply", "TERMINATE"),
+            (&["archive", "down"], "delete_volumes", "DELETE"),
+            (&["archive", "forget"], "delete_archived", "for good"),
+            (&["pods", "migrate", "finish"], "discard_stopped", "losing"),
+        ] {
+            let arg = find(path).get_arguments().find(|a| a.get_id() == id).unwrap_or_else(|| panic!("{path:?} {id}"));
+            let help = text(arg.get_help());
+            assert!(help.contains(word), "{path:?} --{id}: {help}");
+        }
+    }
+
     #[tokio::test]
     async fn a_selection_flag_after_runs_command_is_refused_not_widened() {
         // `run hostname -t apple` parses as the command `hostname -t apple` with NO targets
