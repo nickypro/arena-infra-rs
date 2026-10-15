@@ -197,7 +197,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     (`--json` keeps the raw `cost_per_hr`). Under the footer (table only, `(no pods)` too)
     one `balance: runpod $32.54 live ≈4.0d · vast ~$118.30 est. ≈49.2d` line (see `balance`;
     `⚠`/`‼` with the threshold or the consequence when low/critical, `?` with the `set`
-    nudge when unknown), observed while the list runs — within 5 s, a live read only when
+    nudge when unknown; an opt-in account — Shadeform, never in the default provider chain —
+    at $0 with nothing billing there reads plainly, `shadeform $0.00 live unfunded`: it's
+    unfunded on purpose, and alarms like any other once a pod bills there), observed while the list runs — within 5 s, a live read only when
     the last one is 5 min old, silent whatever happens; `--json` reads no balance at all. GPU/$/maintenance come from one extra read-only
     RunPod GraphQL query per `list` (on `RUNPOD_API=v2` the REST list already has GPU and $,
     so GraphQL adds only maintenance) (best-effort: if it fails you get one warning line and
@@ -1244,7 +1246,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     answer (first, so a narrow terminal can't cut it off), and ending with the account
     prepaid balances (`arena balance`'s views, observed in the details round — at most one
     live read per account per 5 min — and recorded in the CLI's state file; a low account
-    moves to the front in yellow, a critical one in red). API calls per refresh are
+    moves to the front in yellow, a critical one in red, with its amount: `‼ runpod $1.20
+    ≈1.9d`; an unfunded opt-in account with nothing billing there stays at the end,
+    `shadeform $0.00 unfunded`). API calls per refresh are
     unchanged (one list per provider); the details query (GPU/$/maintenance) runs every
     60 s or on `r` (≥10 s apart); one that fails part-way still shows what it filled (as
     `pods list` does) over the last good answer, with a footer warning.
@@ -1255,27 +1259,34 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     typo marks nothing and leaves the marks as they were, saying why in the footer; a
     valid one replaces the marks. Marks are per `provider:id` (a Vast and a Hetzner id
     can collide). `all` is refused, and since `/first..last` marks a cohort in one line,
-    terminate/restart on a marked set of more than 5 pods — or of every listed pod — ask
+    terminate/restart/stop on a marked set of more than 5 pods — or of every listed pod — ask
     for `ALL`, like the whole fleet (smaller sets: the pod count). A marked-set confirm
-    names the pods (the first 10, then `… and N more`), with the token prompt always on
-    screen.
+    names the pods once (the first 10, then `… and N more`), with the token prompt always on
+    screen. `Esc` on the list clears the marks (it never quits).
   - Every pod SSH call (metrics, test/run/backup/set-branch/setup, deep check) goes
     through `Remote` with a budget (90 s / 30 min / 5 min / 2 min / setup's per-step /
     150 s), so a wedged pod ends an action with `timed out after …`; only `c` (your
     interactive shell) is a plain `ssh`.
   - **Navigate** with `↑/↓`/`j/k`; `enter` opens a per-pod detail pane (per-GPU
-    breakdown, full branch/origin/health, util/temp **sparklines**). `Ctrl-C`/`q` quit.
+    breakdown, full branch/origin/health, util/temp **sparklines**). `Ctrl-C`/`q` quit;
+    `Esc` only steps back (detail → list; on the list it clears the marks).
   - **Act** on the selected pod with `a` (restart / stop / terminate / backup / setup /
     test / run / set-branch), on the **whole fleet** with `A` (backup / setup /
-    test / run / set-branch; restart and terminate only on a **marked** set), or **add pods** with `n`. `run` and `set-branch` pop a
-    text-input modal to type the command / branch; `test` is read-only. Every mutation
+    test / run / set-branch; restart, stop and terminate only on a **marked** set — a stop
+    there skips, and names, pods not running and pods whose provider has no stop
+    (Shadeform), and refuses a set of only those, as `pods stop` does), or **add pods** with
+    `n` (it lists the fleet in the background first). `run` and `set-branch` pop a
+    text-input modal to type the command / branch; `run` shows each pod's whole output (its
+    last 40 lines, stderr too when it fails); `test` is read-only. Every mutation
     goes through a confirmation modal — the *only* place the TUI mutates anything.
     Lifecycle actions (restart/stop/terminate) require **typing the pod's exact name**;
     restart is destructive like terminate (red, and its modal says it wipes the container
     disk on RunPod/Vast; Hetzner: "disk kept");
     whole-fleet mutations require typing **ALL** (a marked set: its count, or `ALL` as
-    above); backup/setup/test show the precise
-    command(s) and take a single `y`. The dashboard's reads stay reads.
+    above); every confirm says what will happen in plain words (`alpha: commit + push the
+    current branch`), never the generated `ssh …` line — `v` shows that for
+    backup/setup/test — and backup/setup/test take a single `y`. The dashboard's reads stay
+    reads.
   - **Add-pod (`n`)** is an interactive form: `↑↓` moves between fields, `←→` changes
     the value. Pick the provider (unavailable ones — no API key — are greyed out),
     cloud type (RunPod only), GPU type (full option list shown) and count, and how many

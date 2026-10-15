@@ -154,7 +154,7 @@ pub fn balance_tone(balance: &[AccountView]) -> Option<Tone> {
 /// The summary bar: when a provider failed to list, [`partial_notice`] **first** — the bar
 /// is one unwrapped line and its tail is cut on anything narrower than ~160 columns, so a
 /// warning at the end would be invisible exactly when it matters —, then a low or critical
-/// prepaid balance the same way (` ⚠ runpod balance ≈1.9d ·`, `balance::tui_parts`), then
+/// prepaid balance the same way (` ⚠ runpod $1.20 ≈1.9d ·`, `balance::tui_parts`), then
 /// pod/GPU/util counts from the probes, then the fleet's burn exactly as `pods list`'s
 /// footer words it ([`fleet::fleet_footer`]: billing pods only, `$` and Hetzner's `€` kept
 /// apart, unpriced pods called out), the same per day, and last the balances that need
@@ -164,7 +164,12 @@ pub fn summary_text(s: &FleetSummary, cost: &FleetCost, partial: &[String], bala
     let (first, last, _) = balance::tui_parts(balance);
     let mut out = partial_notice(partial).unwrap_or_default();
     out.push_str(&first.unwrap_or_default());
-    out.push_str(&format!(" {} pods · {} GPUs · mean util {util} · {}", s.pods, s.total_gpus, fleet::fleet_footer(cost)));
+    out.push_str(&format!(
+        " {} · {} · mean util {util} · {}",
+        count_of(s.pods, "pod", "pods"),
+        count_of(s.total_gpus, "GPU", "GPUs"),
+        fleet::fleet_footer(cost)
+    ));
     let mut per_day = Vec::new();
     if cost.priced_usd > 0 {
         per_day.push(format!("{}/day", fleet::fmt_money("$", cost.usd_per_hr * 24.0)));
@@ -182,6 +187,11 @@ pub fn summary_text(s: &FleetSummary, cost: &FleetCost, partial: &[String], bala
         out.push_str(&format!("  ·  balance: {rest}"));
     }
     out
+}
+
+/// `1 pod`, `0 pods`, `3 GPUs` — the bar said `1 pods`.
+fn count_of(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
 }
 
 /// How a cell should read at a glance; `main` maps it to a colour.
@@ -470,18 +480,18 @@ pub fn marked_pods<'a>(pods: &'a [Pod], marked: &HashSet<String>) -> Vec<&'a Pod
     pods.iter().filter(|p| marked.contains(&mark_key(p))).collect()
 }
 
-/// The most pods a destructive action (terminate/restart) on a marked set confirms with
+/// The most pods a lifecycle action (terminate/restart/stop) on a marked set confirms with
 /// just their count. Marks used to take a keypress per pod; `/` now marks a cohort in one
 /// short range (`/apple..zulu`), so the bar has to follow what is marked, not how: a
 /// bigger set — or every listed pod, however few — asks for `ALL`, the whole-fleet bar.
 pub const SET_COUNT_CONFIRM_MAX: usize = 5;
 
 /// The token a marked-set confirm asks to be typed, for `marked` of the `listed` pods: the
-/// count (which the operator chose), or `ALL` for a destructive action on more than
-/// [`SET_COUNT_CONFIRM_MAX`] pods or on the whole listed fleet. Non-destructive actions
-/// (backup/setup/run/set-branch) keep the count.
+/// count (which the operator chose), or `ALL` for a lifecycle action
+/// ([`Action::marked_set_only`]) on more than [`SET_COUNT_CONFIRM_MAX`] pods or on the whole
+/// listed fleet. The others (backup/setup/run/set-branch) keep the count.
 pub fn marked_set_token(action: Action, marked: usize, listed: usize) -> String {
-    if action.is_destructive() && (marked > SET_COUNT_CONFIRM_MAX || marked >= listed) {
+    if action.marked_set_only() && (marked > SET_COUNT_CONFIRM_MAX || marked >= listed) {
         "ALL".into()
     } else {
         marked.to_string()
@@ -494,6 +504,19 @@ pub fn names_preview(names: &[String], max: usize) -> String {
     match names.len().checked_sub(max) {
         Some(more) if more > 0 => format!("{}, … and {more} more", names[..max].join(", ")),
         _ => names.join(", "),
+    }
+}
+
+/// A confirm's summary of what is about to happen ([`Action::what`]): `alpha: print the torch
+/// version (read-only)` for one pod; for several, the names once, compactly (at most `max` of
+/// them, [`names_preview`]) — `3 pods: alpha, bravo, charlie` — then what, rather than the
+/// action again per pod. Pure.
+pub fn action_summary(action: Action, names: &[String], arg: Option<&str>, max: usize) -> Vec<String> {
+    let what = action.what(arg);
+    match names {
+        [] => vec![what],
+        [one] => vec![format!("{one}: {what}")],
+        _ => vec![format!("{} pods: {}", names.len(), names_preview(names, max)), what],
     }
 }
 
@@ -734,15 +757,20 @@ impl Action {
         Self::MENU.iter().find(|(k, _)| *k == c).map(|(_, a)| *a)
     }
 
-    /// The multi-pod menu's actions (and keys): everything except the per-pod-only
-    /// `stop`; the destructive ones (`terminate`, `restart`) are offered only for a marked
-    /// set — never for "the whole fleet" in one keystroke.
+    /// The multi-pod menu's actions (and keys): all of the per-pod menu's, the lifecycle ones
+    /// (`restart`, `stop`, `terminate`) only for a marked set — never for "the whole fleet" in
+    /// one keystroke ([`Self::marked_set_only`]).
     pub fn fleet_menu(has_marked: bool) -> Vec<(char, Action)> {
-        Self::MENU
-            .iter()
-            .copied()
-            .filter(|(_, a)| !matches!(a, Action::Stop) && (!a.is_destructive() || has_marked))
-            .collect()
+        Self::MENU.iter().copied().filter(|(_, a)| !a.marked_set_only() || has_marked).collect()
+    }
+
+    /// Whether a multi-pod run is offered only for a marked set, and a big one (or every listed
+    /// pod) confirmed with `ALL` ([`marked_set_token`]): the actions one pod's confirm wants its
+    /// name typed back for. Each can lose the participants' work — terminate the pod; restart,
+    /// and a stop on RunPod, its container disk — so none is a one-keystroke whole-fleet action
+    /// (stop was per-pod only; a marked set now gets it on the same terms as restart).
+    pub fn marked_set_only(&self) -> bool {
+        matches!(self, Action::Restart | Action::Stop | Action::Terminate)
     }
 
     /// A short description shown beside the action in the menu.
@@ -820,6 +848,27 @@ impl Action {
         matches!(self, Action::Run | Action::SetBranch)
     }
 
+    /// What the action does, in words an operator reads at a glance — the confirm's summary,
+    /// never the generated command (an `ssh -p … -o … -i …` line nobody reads: live, it pushed
+    /// the remote command off the popup). `arg` is what was typed for `run` (shown verbatim:
+    /// the operator wrote it) or `set-branch`; `None` (or blank) before it is.
+    pub fn what(&self, arg: Option<&str>) -> String {
+        let arg = arg.map(str::trim).filter(|a| !a.is_empty());
+        match self {
+            Action::Test => "print the torch version (read-only)".into(),
+            Action::Run => arg.map_or_else(|| "run a shell command".into(), String::from),
+            Action::SetBranch => match arg {
+                Some(b) => format!("switch to branch {b} (fast-forward only)"),
+                None => "switch branch (fast-forward only)".into(),
+            },
+            Action::Backup => "commit + push the current branch".into(),
+            Action::Setup => "provision (deploy key, SSH keys, repo, tools)".into(),
+            Action::Restart => "restart in place (a hard reset)".into(),
+            Action::Stop => "stop (it can be started again)".into(),
+            Action::Terminate => "terminate (delete)".into(),
+        }
+    }
+
     /// The prompt shown in the input modal for [`Self::needs_input`] actions.
     pub fn input_prompt(&self) -> &'static str {
         match self {
@@ -838,17 +887,19 @@ pub struct Confirm {
     pub pod_id: String,
     /// What the user has typed so far (only used for typed-name confirmations).
     pub typed: String,
-    /// The exact command(s) that will run, shown for backup/setup so the operator
-    /// sees precisely what's about to execute.
+    /// The full generated command(s) (test/backup/setup) — not shown unless asked for (`v`,
+    /// [`Self::full`]): the confirm says what the action does ([`action_summary`]).
     pub preview: Option<String>,
     /// Whether this pod's restart/stop resets its container disk — selects the warning
     /// ([`Action::warning`]). Defaults to `true`: assuming a wipe only adds a warning.
     pub wipes_disk: bool,
+    /// The full command is shown under the summary (`v` toggles it).
+    pub full: bool,
 }
 
 impl Confirm {
     pub fn new(action: Action, pod_name: String, pod_id: String, preview: Option<String>) -> Self {
-        Self { action, pod_name, pod_id, typed: String::new(), preview, wipes_disk: true }
+        Self { action, pod_name, pod_id, typed: String::new(), preview, wipes_disk: true, full: false }
     }
 
     /// The warning line for this confirmation, if any.
@@ -968,6 +1019,20 @@ mod tests {
         assert_eq!(idle, " 0 pods · 0 GPUs · mean util - · fleet: $0.00/h across 0 billing pod(s)");
     }
 
+    /// One pod with one GPU reads `1 pod · 1 GPU` — the bar said `1 pods · 1 GPUs`.
+    #[test]
+    fn summary_counts_are_pluralised() {
+        let pods = [pod("arena8-apple", Some(0.40))];
+        let mut metrics = HashMap::new();
+        metrics.insert("arena8-apple".to_string(), PodMetrics { gpus: parse_nvidia_smi("RTX 3090, 30, 8000, 16000, 60\n"), ..Default::default() });
+        let cost = fleet::fleet_cost(&pods);
+        let one = summary_text(&summarize(&pods, &metrics), &cost, &[], &[]);
+        assert!(one.starts_with(" 1 pod · 1 GPU · mean util 30% · "), "{one}");
+        let two = [pod("arena8-apple", Some(0.40)), pod("arena8-bloom", Some(0.40))];
+        let both = summary_text(&summarize(&two, &HashMap::new()), &fleet::fleet_cost(&two), &[], &[]);
+        assert!(both.starts_with(" 2 pods · 0 GPUs · "), "{both}");
+    }
+
     /// Prepaid accounts as read live now at `rate`/h (no listing): `(account, USD, rate)`.
     fn balances(accounts: &[(balance::Account, f64, f64)]) -> Vec<AccountView> {
         let fetched: Vec<balance::Fetched> = accounts
@@ -1009,14 +1074,14 @@ mod tests {
         let low = balances(&[(Account::Runpod, 30.0, 0.5), (Account::Vast, 90.0, 0.0)]); // 60h
         let text = summary_text(&s, &cost, &["hetzner".to_string()], &low);
         assert!(
-            text.starts_with(" ⚠ hetzner failed to list — its pods (and their cost) are missing · ⚠ runpod balance ≈2.5d · 1 pods · "),
+            text.starts_with(" ⚠ hetzner failed to list — its pods (and their cost) are missing · ⚠ runpod $30.00 ≈2.5d · 1 pod · 0 GPUs · "),
             "{text}"
         );
         assert!(text.ends_with("  ·  balance: vast $90.00 no burn"), "the ok one stays at the end: {text}");
         assert_eq!(text.matches("runpod").count(), 1, "said once: {text}");
         assert_eq!(balance_tone(&low), Some(Tone::Warn));
         let critical = balances(&[(Account::Runpod, 3.0, 0.5)]); // 6h
-        assert!(summary_text(&s, &cost, &[], &critical).starts_with(" ‼ runpod balance ≈6.0h · 1 pods · "));
+        assert!(summary_text(&s, &cost, &[], &critical).starts_with(" ‼ runpod $3.00 ≈6.0h · 1 pod · "));
         assert_eq!(balance_tone(&critical), Some(Tone::Bad));
     }
 
@@ -1075,8 +1140,40 @@ mod tests {
         let fleet = |marked| Action::fleet_menu(marked).into_iter().map(|(_, a)| a).collect::<Vec<_>>();
         assert!(!fleet(false).contains(&Action::Restart) && !fleet(false).contains(&Action::Terminate));
         assert!(fleet(true).contains(&Action::Restart) && fleet(true).contains(&Action::Terminate));
-        assert!(!fleet(true).contains(&Action::Stop));
         assert!(fleet(false).contains(&Action::Setup));
+    }
+
+    /// The confirm's summary for every action: a plain line per pod (the operator's own command
+    /// verbatim for `run`), the names once for several — never an `ssh … -o … -i …` line.
+    #[test]
+    fn every_action_has_a_short_summary() {
+        let one = ["tuiprobe".to_string()];
+        // (action, typed argument, the summary for one pod)
+        let cases = [
+            (Action::Test, None, "tuiprobe: print the torch version (read-only)"),
+            (Action::Run, Some("nvidia-smi -L; hostname"), "tuiprobe: nvidia-smi -L; hostname"),
+            (Action::Run, None, "tuiprobe: run a shell command"),
+            (Action::SetBranch, Some(" w3d2 "), "tuiprobe: switch to branch w3d2 (fast-forward only)"),
+            (Action::SetBranch, Some(""), "tuiprobe: switch branch (fast-forward only)"),
+            (Action::Backup, None, "tuiprobe: commit + push the current branch"),
+            (Action::Setup, None, "tuiprobe: provision (deploy key, SSH keys, repo, tools)"),
+            (Action::Restart, None, "tuiprobe: restart in place (a hard reset)"),
+            (Action::Stop, None, "tuiprobe: stop (it can be started again)"),
+            (Action::Terminate, None, "tuiprobe: terminate (delete)"),
+        ];
+        for (action, arg, want) in cases {
+            assert_eq!(action_summary(action, &one, arg, 10), [want], "{action:?}");
+        }
+        for (_, action) in Action::MENU {
+            assert!(cases.iter().any(|(a, ..)| a == action), "{action:?} has no summary case");
+            assert!(!action.what(None).contains("ssh"), "{action:?}");
+        }
+        // Several pods: the names once, compactly, then what.
+        let three: Vec<String> = ["alpha", "bravo", "charlie"].map(String::from).into();
+        assert_eq!(action_summary(Action::Backup, &three, None, 10), ["3 pods: alpha, bravo, charlie", "commit + push the current branch"]);
+        let many: Vec<String> = (0..12).map(|i| format!("m{i:02}")).collect();
+        assert_eq!(action_summary(Action::Test, &many, None, 2), ["12 pods: m00, m01, … and 10 more", "print the torch version (read-only)"]);
+        assert_eq!(action_summary(Action::Test, &[], None, 2), ["print the torch version (read-only)"]);
     }
 
     #[test]
@@ -1503,13 +1600,31 @@ mod tests {
         assert_eq!(mark_key(&pods[1]), "hetzner:88");
     }
 
-    /// Terminate/restart on a marked set ask for the count only for a small, partial set;
+    /// The marked-set menu offers stop (it used to be per-pod only) on the terms restart has:
+    /// only for a marked set — never the whole fleet in one keystroke, so `A` has none of the
+    /// lifecycle actions — and with the same token ([`marked_set_token`]).
+    #[test]
+    fn stop_is_offered_for_a_marked_set_like_restart() {
+        let fleet = |marked| Action::fleet_menu(marked).into_iter().collect::<Vec<_>>();
+        assert!(fleet(true).contains(&('s', Action::Stop)), "{:?}", fleet(true));
+        for lifecycle in [Action::Stop, Action::Restart, Action::Terminate] {
+            assert!(!fleet(false).iter().any(|(_, a)| *a == lifecycle), "{lifecycle:?} on the whole fleet: {:?}", fleet(false));
+            assert!(lifecycle.marked_set_only());
+        }
+        assert_eq!(fleet(true).len(), Action::MENU.len(), "a marked set gets every per-pod action");
+        assert!(!Action::Backup.marked_set_only() && !Action::Test.marked_set_only());
+    }
+
+    /// Terminate/restart/stop on a marked set ask for the count only for a small, partial set;
     /// a big one — or the whole listed fleet, however it was marked (`/first..last`, a comma
     /// list, a space per pod) — asks for `ALL`, like `A`. Safe actions keep the count.
     #[test]
     fn a_destructive_marked_set_that_is_big_or_the_whole_fleet_asks_for_all() {
         // (action, marked, listed, token)
         let cases = [
+            (Action::Stop, 3, 30, "3"),
+            (Action::Stop, SET_COUNT_CONFIRM_MAX + 1, 30, "ALL"),
+            (Action::Stop, 2, 2, "ALL"),
             (Action::Terminate, 3, 30, "3"),
             (Action::Terminate, SET_COUNT_CONFIRM_MAX, 30, "5"),
             (Action::Terminate, SET_COUNT_CONFIRM_MAX + 1, 30, "ALL"),

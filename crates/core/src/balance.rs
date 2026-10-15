@@ -299,6 +299,14 @@ impl Account {
             Account::Shadeform => "what Shadeform does at $0 is undocumented — keep Auto Top Up on",
         }
     }
+
+    /// An opt-in account: its provider isn't in the default provider chain
+    /// ([`crate::plan::in_default_chain`]) — Shadeform, overflow made only on `--provider
+    /// shadeform` — so an empty wallet there is usually deliberate, not an outage coming
+    /// ([`unfunded_overflow`]). RunPod and Vast never are.
+    pub fn opt_in(self) -> bool {
+        !crate::plan::in_default_chain(self.name())
+    }
 }
 
 /// A key's fingerprint: FNV-1a 32-bit as 8 hex characters. Stored next to each account's
@@ -2014,22 +2022,59 @@ fn no_reading(v: &AccountView) -> String {
     format!("(no reading — arena balance set {} <USD>)", v.account)
 }
 
+/// An opt-in account ([`Account::opt_in`]: Shadeform) at $0 with **nothing billing there** —
+/// a known zero burn, not an unknown one or a floor. Overflow is chosen per create, so its
+/// wallet sits unfunded on purpose: the inline surfaces (the `pods list` footer, the TUI bar)
+/// show it as `shadeform $0.00 unfunded` among the accounts that need nothing — no ‼, no lead,
+/// no tone, no top-up advice (live, every `pods list` ended in `‼ shadeform $0.00 live no burn
+/// — … keep Auto Top Up on`, and the TUI bar led with it). Once a pod bills there (burn > 0)
+/// it alarms like any other. Never RunPod or Vast: at $0 RunPod stops (or terminates) the
+/// pods, so their burn drops to zero exactly when the alarm matters. `arena balance`,
+/// `balance --check`, `teardown --check` and the create/up preflight judge the account as is.
+fn unfunded_overflow(v: &AccountView) -> bool {
+    v.level == Level::Critical
+        && Account::from_name(&v.account).is_some_and(Account::opt_in)
+        && v.burn.is_some_and(|b| b.per_hr < NO_BURN && !b.floor())
+}
+
+/// The level an inline surface shows: the account's own, except an [`unfunded_overflow`] one
+/// needs nothing.
+fn inline_level(v: &AccountView) -> Level {
+    if unfunded_overflow(v) {
+        Level::Ok
+    } else {
+        v.level
+    }
+}
+
+/// The runway an inline surface shows: [`fmt_runway`], or `unfunded` for an
+/// [`unfunded_overflow`] account (its `no burn` is the point, its $0 is why it's listed).
+fn inline_runway(v: &AccountView) -> String {
+    if unfunded_overflow(v) {
+        "unfunded".into()
+    } else {
+        fmt_runway(v)
+    }
+}
+
 /// One prepaid account in a footer: `runpod $32.54 live ≈69h`, `vast ~$118.30 est.
 /// ≈49d`; a low or critical one with its source spelled out, its threshold or its
-/// consequence; an unknown one as `?` with the nudge and its burn.
+/// consequence; an unknown one as `?` with the nudge and its burn; an opt-in one left
+/// unfunded on purpose plainly (`shadeform $0.00 live unfunded`, [`unfunded_overflow`]).
 fn footer_part(v: &AccountView, policy: &BalancePolicy, now: u64) -> String {
     let name = &v.account;
     if v.source == Source::Unknown {
         return format!("{name} ? {} {}", no_reading(v), burn_label(v));
     }
-    let detailed = matches!(v.level, Level::Low | Level::Critical) || v.noted;
+    let level = inline_level(v);
+    let detailed = matches!(level, Level::Low | Level::Critical) || v.noted;
     let src = match v.source {
         Source::Live => live_label(v, now),
         _ if detailed => source_label(v, now),
         _ => "est.".into(),
     };
-    let mut s = format!("{}{name} {} {src} {}", glyph(v.level), balance_label(v), fmt_runway(v));
-    match v.level {
+    let mut s = format!("{}{name} {} {src} {}", glyph(level), balance_label(v), inline_runway(v));
+    match level {
         Level::Low => s.push_str(&format!(" < {}h", num(policy.warn_hours))),
         Level::Critical => s.push_str(&format!(" — {}", critical_reason(v))),
         _ => {}
@@ -2405,29 +2450,34 @@ pub fn verbose_lines(views: &[AccountView], state: &BalanceState, fetched: &[Fet
 }
 
 /// The TUI summary bar's balance: `(first, last, worst)`. A low or critical account goes
-/// **first** (` ⚠ runpod balance ≈1.9d ·`, ahead of the counts — the bar is one unwrapped
-/// line and its tail is cut on a narrow terminal); the rest last (`runpod $32.54 ≈69h · vast
-/// ~$118.30 est. ≈49d`); `worst` picks the tone (critical → bad, low → warn).
+/// **first**, with its amount (` ⚠ runpod $1.20 ≈1.9d ·`, ahead of the counts — the bar is
+/// one unwrapped line and its tail is cut on a narrow terminal); the rest last (`runpod
+/// $32.54 ≈69h · vast ~$118.30 est. ≈49d · shadeform $0.00 unfunded` — an opt-in account
+/// unfunded on purpose is one of them, [`unfunded_overflow`]); `worst` picks the tone
+/// (critical → bad, low → warn).
 pub fn tui_parts(views: &[AccountView]) -> (Option<String>, Option<String>, Level) {
     let mut first = Vec::new();
     let mut last = Vec::new();
     let mut worst = Level::Ok;
     for v in views.iter().filter(|v| v.prepaid()) {
-        match v.level {
+        let level = inline_level(v);
+        let src = if v.source == Source::Estimate { " est." } else { "" };
+        match level {
             Level::Low | Level::Critical => {
-                let what = if v.under_balance == Some(true) && v.level == Level::Critical && v.balance.is_some_and(|b| b > 0.0) {
+                // The amount always: live, `‼ shadeform balance no burn` said neither how
+                // much was left nor that it was $0.
+                let what = if v.under_balance == Some(true) && level == Level::Critical && v.balance.is_some_and(|b| b > 0.0) {
                     "under its minimum".to_string()
                 } else {
                     fmt_runway(v)
                 };
-                first.push(format!("{}{} balance {what}", glyph(v.level), v.account));
+                first.push(format!("{}{} {}{src} {what}", glyph(level), v.account, balance_label(v)));
                 if worst != Level::Critical {
-                    worst = v.level;
+                    worst = level;
                 }
             }
             _ => {
-                let src = if v.source == Source::Estimate { " est." } else { "" };
-                let runway = if v.source == Source::Unknown { String::new() } else { format!(" {}", fmt_runway(v)) };
+                let runway = if v.source == Source::Unknown { String::new() } else { format!(" {}", inline_runway(v)) };
                 last.push(format!("{} {}{src}{runway}", v.account, balance_label(v)));
             }
         }
@@ -4383,9 +4433,62 @@ mod tests {
         assert_eq!(tui_parts(&[ok.clone(), est]), (None, Some("runpod $48.00 ≈4.0d · vast ~$118.30 est. ≈49.2d".into()), Level::Ok));
         let low = lv(Account::Runpod, 31.2, 0.68);
         let crit = lv(Account::Vast, 3.0, 0.5);
-        assert_eq!(tui_parts(std::slice::from_ref(&low)), (Some(" ⚠ runpod balance ≈45h ·".into()), None, Level::Low));
-        assert_eq!(tui_parts(&[low, crit]), (Some(" ⚠ runpod balance ≈45h · ‼ vast balance ≈6.0h ·".into()), None, Level::Critical));
+        // A lead always carries its amount (live: `‼ shadeform balance no burn` said neither).
+        assert_eq!(tui_parts(std::slice::from_ref(&low)), (Some(" ⚠ runpod $31.20 ≈45h ·".into()), None, Level::Low));
+        assert_eq!(tui_parts(&[low, crit]), (Some(" ⚠ runpod $31.20 ≈45h · ‼ vast $3.00 ≈6.0h ·".into()), None, Level::Critical));
+        let mut low_est = lv(Account::Runpod, 2.5, 0.0625); // 40h
+        low_est.source = Source::Estimate;
+        assert_eq!(tui_parts(&[low_est]).0.as_deref(), Some(" ⚠ runpod ~$2.50 est. ≈40h ·"));
         assert_eq!(tui_parts(&[]), (None, None, Level::Ok));
+    }
+
+    /// Live (2026-10-15): with no pods anywhere, the TUI bar led with a red `‼ shadeform balance
+    /// no burn` and every `pods list` ended in `‼ shadeform $0.00 live 21s no burn — what
+    /// Shadeform does at $0 is undocumented — keep Auto Top Up on` — for the opt-in overflow
+    /// account, unfunded on purpose. With nothing billing there it is listed with its amount
+    /// among the accounts that need nothing; with a billing pod it alarms as before. RunPod at
+    /// $0 alarms whatever its burn (at $0 RunPod stops the pods — the burn drops to zero just
+    /// then), and so does Vast; an opt-in account whose burn isn't known does too. `arena
+    /// balance`'s table and notes, and `balance --check`, judge it as before.
+    #[test]
+    fn an_unfunded_opt_in_account_is_quiet_inline_until_something_bills_there() {
+        let at = |account: Account, usd: f64, b: Option<Burn>| {
+            let f = Fetched { account, key_fp: FP.into(), live: Some(Ok(live(usd, None))), billed: None };
+            let burns: Burns = [(account, b)].into_iter().collect();
+            views(&BalanceState::default(), &[f], &burns, &policy(), Mode::Inline, NOW).remove(0)
+        };
+        let p = policy();
+        let idle = at(Account::Shadeform, 0.0, burn(0.0));
+        assert!(Account::Shadeform.opt_in() && !Account::Runpod.opt_in() && !Account::Vast.opt_in());
+        assert_eq!(idle.level, Level::Critical, "the account itself is judged as before");
+        assert_eq!(tui_parts(std::slice::from_ref(&idle)), (None, Some("shadeform $0.00 unfunded".into()), Level::Ok));
+        assert_eq!(footer_line(std::slice::from_ref(&idle), &p, NOW).unwrap(), "balance: shadeform $0.00 live unfunded");
+        // Beside a healthy RunPod: in the tail, after it; nothing leads, the tone is RunPod's.
+        let ok = lv(Account::Runpod, 48.0, 0.5);
+        assert_eq!(tui_parts(&[ok.clone(), idle.clone()]), (None, Some("runpod $48.00 ≈4.0d · shadeform $0.00 unfunded".into()), Level::Ok));
+        // `arena balance` and `balance --check` are unchanged.
+        assert!(super::render_table(std::slice::from_ref(&idle), NOW).contains("‼ critical"));
+        assert!(notes(std::slice::from_ref(&idle), &p, NOW).iter().any(|n| n.starts_with("‼ shadeform") && n.contains("Auto Top Up")));
+        assert_eq!(check_exit(std::slice::from_ref(&idle)), 2);
+        // A billing Shadeform pod: the alarm, with the amount, as before.
+        let burning = at(Account::Shadeform, 0.0, burn(0.57));
+        assert_eq!(tui_parts(std::slice::from_ref(&burning)), (Some(" ‼ shadeform $0.00 <1h ·".into()), None, Level::Critical));
+        let line = footer_line(std::slice::from_ref(&burning), &p, NOW).unwrap();
+        assert!(line.starts_with("balance: ‼ shadeform $0.00 live <1h — ") && line.contains("keep Auto Top Up on"), "{line}");
+        // RunPod (and Vast) at $0 with no burn: still the alarm.
+        for account in [Account::Runpod, Account::Vast] {
+            let zero = at(account, 0.0, burn(0.0));
+            let name = account.name();
+            assert_eq!(tui_parts(std::slice::from_ref(&zero)), (Some(format!(" ‼ {name} $0.00 no burn ·")), None, Level::Critical), "{name}");
+            let line = footer_line(std::slice::from_ref(&zero), &p, NOW).unwrap();
+            assert!(line.starts_with(&format!("balance: ‼ {name} $0.00 live no burn — at $0 ")), "{line}");
+        }
+        // Shadeform at $0 whose burn isn't known (its listing failed, no rate): not known to be
+        // idle — the alarm stands.
+        let unknown = at(Account::Shadeform, 0.0, None);
+        assert_eq!(tui_parts(std::slice::from_ref(&unknown)).2, Level::Critical);
+        // Funded and idle: `no burn`, as for any account.
+        assert_eq!(tui_parts(&[at(Account::Shadeform, 5.0, burn(0.0))]).1.as_deref(), Some("shadeform $5.00 no burn"));
     }
 
     #[test]

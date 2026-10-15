@@ -23,9 +23,9 @@
 //!
 //! Safety against live prod is built into the *interaction*, not bolted on: a mutating
 //! action always pops a confirmation modal. Lifecycle actions (restart/stop/terminate)
-//! make you type the pod's exact name back before they apply; backup/setup show the
-//! precise command(s) that will run and take a single `y`. There is no way to mutate a
-//! pod without going through that modal — the dashboard's reads stay reads.
+//! make you type the pod's exact name back before they apply; backup/setup say what they
+//! will do in plain words (`v` shows the generated command) and take a single `y`. There is
+//! no way to mutate a pod without going through that modal — the dashboard's reads stay reads.
 //!
 //! Provider is chosen by `ARENA_PROVIDER` (default `runpod`); config path by
 //! `ARENA_CONFIG`; initial cadence by `ARENA_REFRESH_SECS` (default 5).
@@ -72,8 +72,8 @@ use arena_core::{Config, Pod, PodSpec};
 use prefs::Prefs;
 use arena_core::status::display_status;
 use state::{
-    capture_details, dashboard_snapshot, details_due, display_name, health_cell, mark_key, marked_pods,
-    marked_set_token, merge_details, names_preview, overlay_details, partial_notice, proxy_cell, proxy_detail,
+    action_summary, capture_details, dashboard_snapshot, details_due, display_name, health_cell, mark_key, marked_pods,
+    marked_set_token, merge_details, overlay_details, partial_notice, proxy_cell, proxy_detail,
     select_marks, short_branch, spark, summarize, summary_text, Action, Confirm, DeepChecks, FleetSummary,
     History, NewPodForm, NpField, PodDetails, ProviderOpt, Tone,
 };
@@ -127,9 +127,10 @@ enum Mode {
     /// marked set (`a` with marks); `sel` = highlighted row.
     FleetMenu { scope: Scope, sel: usize },
     /// A pending multi-pod action; requires typing the confirm token (`ALL` for the whole
-    /// fleet, the pod count for a marked set — `ALL` again for terminate/restart on a big
-    /// one or one that is every listed pod: [`fleet_confirm_token`]).
-    FleetConfirm { action: Action, typed: String, scope: Scope },
+    /// fleet, the pod count for a marked set — `ALL` again for terminate/restart/stop on a big
+    /// one or one that is every listed pod: [`fleet_confirm_token`]). `note`: what the confirm
+    /// says besides (a stop's pods it will skip, and why — [`StopPlan::skip_lines`]).
+    FleetConfirm { action: Action, typed: String, scope: Scope, note: String },
     /// Interactive add-pod form (↑↓ field, ←→ value).
     NewPod(NewPodForm),
     /// Collect a free-text argument (a command, or a branch) for `Run`/`SetBranch`,
@@ -196,6 +197,9 @@ struct Shared {
     /// The prepaid accounts as last observed in a details round (empty before the first,
     /// or with no prepaid key configured).
     balance: Vec<AccountView>,
+    /// `n`'s fresh listing, set by its background task ([`start_new_pod_listing`]); the UI
+    /// loop turns it into the add-pod form ([`new_pod_mode`]).
+    new_pod_listing: Option<std::result::Result<Vec<Pod>, String>>,
 }
 
 impl Shared {
@@ -798,6 +802,70 @@ fn apply_select(ui: &mut Ui, shared: &mut Shared, input: &str) {
     ui.mode = Mode::List;
 }
 
+/// What a key on the list or detail view leaves for the loop to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListKey {
+    /// `q`: leave the dashboard.
+    Quit,
+    /// Handled: the cursor, the marks, or which view or popup is open.
+    Done,
+    /// Not one of [`list_key`]'s: the loop's own (it needs the provider, the terminal or the
+    /// shared state).
+    Other,
+}
+
+/// The list and detail views' keys that need nothing but `ui` and the row count `len`. Only
+/// `q` quits (and Ctrl+C, from anywhere); Esc steps back and never quits — from the detail view
+/// to the list, and on the list it clears the marks if there are any, else does nothing. Live:
+/// Esc on the list quit, so the Esc-Esc that backs out of a popup closed the dashboard.
+fn list_key(ui: &mut Ui, code: KeyCode, len: usize) -> ListKey {
+    match code {
+        KeyCode::Char('q') => return ListKey::Quit,
+        KeyCode::Esc if matches!(ui.mode, Mode::Detail) => ui.mode = Mode::List,
+        KeyCode::Esc | KeyCode::Char('x') => ui.marked.clear(),
+        KeyCode::Up | KeyCode::Char('k') => ui.selected = ui.selected.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => {
+            if ui.selected + 1 < len {
+                ui.selected += 1;
+            }
+        }
+        KeyCode::Enter => {
+            if len > 0 {
+                ui.mode = Mode::Detail;
+            }
+        }
+        KeyCode::Char('/') => ui.mode = Mode::Select { value: String::new() },
+        // Act on the marked set if any are marked, else the cursor pod.
+        KeyCode::Char('a') if !ui.marked.is_empty() => ui.mode = Mode::FleetMenu { scope: Scope::Marked, sel: 0 },
+        KeyCode::Char('a') if len > 0 => ui.mode = Mode::Menu { sel: 0 },
+        KeyCode::Char('A') if len > 0 => ui.mode = Mode::FleetMenu { scope: Scope::All, sel: 0 },
+        KeyCode::Char('a' | 'A') => {}
+        _ => return ListKey::Other,
+    }
+    ListKey::Done
+}
+
+/// `n`: list the whole fleet **in the background** — fresh, not the cached snapshot, so the
+/// form never offers a name that already exists — and say so meanwhile; the loop opens the
+/// form when the listing lands ([`new_pod_mode`]). Awaiting it in the key loop froze the
+/// dashboard (no redraw, no keys) for as long as the slowest provider took to answer.
+fn start_new_pod_listing(shared: &Arc<Mutex<Shared>>, provider: &Arc<dyn Provider>, ui: &mut Ui) {
+    ui.mode = Mode::Working("listing the fleet for free names…".into());
+    let (shared, provider) = (shared.clone(), provider.clone());
+    tokio::spawn(async move {
+        let listed = provider.list_pods().await.map_err(|e| e.to_string());
+        shared.lock().unwrap().new_pod_listing = Some(listed);
+    });
+}
+
+/// The add-pod form for `n`'s listing — or why there is none.
+fn new_pod_mode(ui: &Ui, listed: std::result::Result<Vec<Pod>, String>) -> Mode {
+    match listed {
+        Ok(existing) => Mode::NewPod(build_new_pod_form(&ui.cfg, &ui.provider_name, &existing)),
+        Err(e) => Mode::Result(format!("✗ list failed: {e}")),
+    }
+}
+
 async fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     shared: &Arc<Mutex<Shared>>,
@@ -815,6 +883,13 @@ async fn run(
                 ui.result_scroll = 0;
                 ui.mode = Mode::Result(msg);
                 nudge.notify_one();
+            }
+        }
+        // `n`'s listing landed: the add-pod form (or why not).
+        {
+            let listed = shared.lock().unwrap().new_pod_listing.take();
+            if let Some(listed) = listed {
+                ui.mode = new_pod_mode(&ui, listed);
             }
         }
         // Clamp the cursor in case the fleet shrank under us.
@@ -849,30 +924,10 @@ async fn run(
         let code = k.code;
 
         match ui.mode.clone() {
-            Mode::List | Mode::Detail => {
-                let in_detail = matches!(ui.mode, Mode::Detail);
-                match code {
-                    KeyCode::Char('q') => break,
-                    KeyCode::Esc => {
-                        if in_detail {
-                            ui.mode = Mode::List;
-                        } else {
-                            break;
-                        }
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        ui.selected = ui.selected.saturating_sub(1);
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        if ui.selected + 1 < len {
-                            ui.selected += 1;
-                        }
-                    }
-                    KeyCode::Enter => {
-                        if len > 0 {
-                            ui.mode = Mode::Detail;
-                        }
-                    }
+            Mode::List | Mode::Detail => match list_key(&mut ui, code, len) {
+                ListKey::Quit => break,
+                ListKey::Done => {}
+                ListKey::Other => match code {
                     KeyCode::Char('r') => {
                         // A manual refresh also re-reads the provider's details (maintenance
                         // windows, $/h) — rate-limited by `state::details_due`.
@@ -891,7 +946,6 @@ async fn run(
                             start_deep_check(shared, &ui, pods);
                         }
                     }
-                    KeyCode::Char('/') => ui.mode = Mode::Select { value: String::new() },
                     KeyCode::Char('s') => {
                         // Toggle short/full names and persist the choice.
                         ui.short_names = !ui.short_names;
@@ -900,19 +954,6 @@ async fn run(
                     KeyCode::Char('f') => {
                         cycle_interval(interval);
                         nudge.notify_one(); // apply a shorter cadence immediately
-                    }
-                    KeyCode::Char('a') => {
-                        // Act on the marked set if any are marked, else the cursor pod.
-                        if !ui.marked.is_empty() {
-                            ui.mode = Mode::FleetMenu { scope: Scope::Marked, sel: 0 };
-                        } else if len > 0 {
-                            ui.mode = Mode::Menu { sel: 0 };
-                        }
-                    }
-                    KeyCode::Char('A') => {
-                        if len > 0 {
-                            ui.mode = Mode::FleetMenu { scope: Scope::All, sel: 0 };
-                        }
                     }
                     KeyCode::Char(' ') => {
                         // Toggle multi-select mark on the cursor pod.
@@ -927,21 +968,10 @@ async fn run(
                         connect_ssh(terminal, shared, &mut ui)?;
                         nudge.notify_one();
                     }
-                    KeyCode::Char('x') => ui.marked.clear(),
-                    KeyCode::Char('n') => {
-                        // Fresh list (not the cached snapshot) so we never allocate a
-                        // name that already exists and create a duplicate.
-                        match provider.list_pods().await {
-                            Ok(existing) => {
-                                ui.mode =
-                                    Mode::NewPod(build_new_pod_form(&ui.cfg, &ui.provider_name, &existing));
-                            }
-                            Err(e) => ui.mode = Mode::Result(format!("✗ list failed: {e}")),
-                        }
-                    }
+                    KeyCode::Char('n') => start_new_pod_listing(shared, provider, &mut ui),
                     _ => {}
-                }
-            }
+                },
+            },
             Mode::Menu { mut sel } => {
                 let n = Action::MENU.len();
                 match code {
@@ -969,6 +999,10 @@ async fn run(
                     KeyCode::Enter if c.is_satisfied() => apply_action(shared, &mut ui, provider, &c),
                     KeyCode::Char('y') if !typed => apply_action(shared, &mut ui, provider, &c),
                     KeyCode::Char('n') if !typed => ui.mode = Mode::List,
+                    KeyCode::Char('v') if !typed && c.preview.is_some() => {
+                        c.full = !c.full;
+                        ui.mode = Mode::Confirm(c);
+                    }
                     KeyCode::Backspace if typed => {
                         c.typed.pop();
                         ui.mode = Mode::Confirm(c);
@@ -1003,7 +1037,7 @@ async fn run(
                     _ => ui.mode = Mode::FleetMenu { scope, sel },
                 }
             }
-            Mode::FleetConfirm { action, mut typed, scope } => {
+            Mode::FleetConfirm { action, mut typed, scope, note } => {
                 let token = fleet_confirm_token(shared, &ui.marked, scope, action);
                 match code {
                     KeyCode::Esc => ui.mode = Mode::List,
@@ -1017,13 +1051,13 @@ async fn run(
                     }
                     KeyCode::Backspace => {
                         typed.pop();
-                        ui.mode = Mode::FleetConfirm { action, typed, scope };
+                        ui.mode = Mode::FleetConfirm { action, typed, scope, note };
                     }
                     KeyCode::Char(c) => {
                         typed.push(c);
-                        ui.mode = Mode::FleetConfirm { action, typed, scope };
+                        ui.mode = Mode::FleetConfirm { action, typed, scope, note };
                     }
-                    _ => ui.mode = Mode::FleetConfirm { action, typed, scope },
+                    _ => ui.mode = Mode::FleetConfirm { action, typed, scope, note },
                 }
             }
             Mode::NewPod(mut form) => match code {
@@ -1184,9 +1218,11 @@ async fn run(
     Ok(())
 }
 
-/// Run a safe action against every pod concurrently, returning a summary line plus the
-/// first few failures. Used by the fleet menu (backup / setup / test / run / set-branch, and
-/// restart / terminate on a marked set).
+/// Run an action against every pod concurrently, returning a summary line, then each pod's
+/// outcome. Used by the fleet menu (backup / setup / test / run / set-branch, and restart /
+/// stop / terminate on a marked set). A stop acts only on the pods [`stop_plan`] stops, then
+/// names the ones it skipped — and ends in a ✗ while one of them still bills, as `pods stop`
+/// exits non-zero then.
 async fn execute_fleet(
     provider: &Arc<dyn Provider>,
     remote: &Arc<dyn Remote>,
@@ -1195,6 +1231,15 @@ async fn execute_fleet(
     pods: Vec<Pod>,
     arg: Option<String>,
 ) -> String {
+    let (pods, skipped) = match action {
+        Action::Stop => {
+            let plan = stop_plan(provider.as_ref(), pods);
+            let mut skipped = plan.skip_lines();
+            skipped.extend(plan.still_billing());
+            (plan.stop, skipped)
+        }
+        _ => (pods, Vec::new()),
+    };
     let total = pods.len();
     let mut set = JoinSet::new();
     for pod in pods {
@@ -1218,7 +1263,83 @@ async fn execute_fleet(
     // pod's torch version. The result modal scrolls if it's taller than the screen.
     lines.sort();
     let header = format!("{} — {ok}/{total} ok", action.label());
-    std::iter::once(header).chain(lines).collect::<Vec<_>>().join("\n")
+    std::iter::once(header).chain(lines).chain(skipped).collect::<Vec<_>>().join("\n")
+}
+
+/// What a multi-pod `stop` does with each pod — `pods stop`'s rules, through the same core
+/// helpers: only a pod that bills ([`arena_core::status::is_billing`]: running or starting —
+/// an allow-list, so a state nobody knows never gets a pod stopped) is stopped; the rest are
+/// said and left alone. A billing pod whose backend has no stop at all
+/// ([`Provider::stop_support`] — Shadeform: it bills until it's deleted) is skipped and named,
+/// and the others still stop (review SF3: one overflow VM must not veto the rest). A locked
+/// pod is refused by [`execute`], as for one pod.
+struct StopPlan {
+    stop: Vec<Pod>,
+    /// Billing pods whose backend can't stop them, each with why: they still bill.
+    no_stop: Vec<(Pod, String)>,
+    /// Pods that aren't billing (already stopped, a state nobody knows).
+    idle: Vec<Pod>,
+}
+
+/// Sort `pods` for a stop ([`StopPlan`]). Pure: no request.
+fn stop_plan(provider: &dyn Provider, pods: Vec<Pod>) -> StopPlan {
+    let mut plan = StopPlan { stop: Vec::new(), no_stop: Vec::new(), idle: Vec::new() };
+    for p in pods {
+        if !arena_core::status::is_billing(&p.status) {
+            plan.idle.push(p);
+        } else if let Err(e) = provider.stop_support(&p) {
+            let why = no_stop_why(e);
+            plan.no_stop.push((p, why));
+        } else {
+            plan.stop.push(p);
+        }
+    }
+    plan
+}
+
+/// A [`Provider::stop_support`] refusal in the operator's words (the backend's own sentence).
+fn no_stop_why(e: arena_core::Error) -> String {
+    match e {
+        arena_core::Error::NotImplemented(m) => m,
+        other => other.to_string(),
+    }
+}
+
+impl StopPlan {
+    /// Why there is nothing to confirm: every billing pod has no stop — refused, as `pods stop`
+    /// refuses such a selection — or nothing bills at all.
+    fn refusal(&self) -> Option<String> {
+        if !self.stop.is_empty() {
+            return None;
+        }
+        Some(match self.no_stop.first() {
+            Some((_, why)) => {
+                let names: Vec<&str> = self.no_stop.iter().map(|(p, _)| p.name.as_str()).collect();
+                format!("✗ can't stop {} — {why}", names.join(", "))
+            }
+            None => "⊘ nothing to stop — no running or starting pod among them".into(),
+        })
+    }
+
+    /// One line per pod left alone, and why — for the confirm and the result.
+    fn skip_lines(&self) -> Vec<String> {
+        let idle = self.idle.iter().map(|p| format!("⊘ {} — skipped: not running or starting ({})", p.name, p.status));
+        let no_stop = self.no_stop.iter().map(|(p, why)| format!("⊘ {} — skipped, still billing: {why}", p.name));
+        idle.chain(no_stop).collect()
+    }
+
+    /// The closing ✗ while a skipped pod still bills (`pods stop` exits non-zero then): what
+    /// was asked isn't done while one of them bills.
+    fn still_billing(&self) -> Option<String> {
+        (!self.no_stop.is_empty()).then(|| {
+            let names: Vec<&str> = self.no_stop.iter().map(|(p, _)| p.name.as_str()).collect();
+            format!(
+                "✗ {} pod(s) still billing — their provider has no stop: {} (back up, then `arena pods terminate`)",
+                names.len(),
+                names.join(", ")
+            )
+        })
+    }
 }
 
 /// Build the GPU-type choices for the add-pod form: the config default first (so the
@@ -1375,13 +1496,21 @@ fn remember_prices(cfg: &Config, created: &[Pod]) {
 }
 
 /// A menu pick for the cursor pod: run/set-branch collect an argument first; everything
-/// else goes through a confirm modal. Shared by the arrow-Enter and letter-key paths.
+/// else goes through a confirm modal. Shared by the arrow-Enter and letter-key paths. A stop
+/// of a pod whose backend has no stop (Shadeform) is refused here, before the confirm — as
+/// `pods stop` refuses it alone: the confirm's "keeps no data" warning would only mislead.
 fn choose_pod_action(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, provider: &Arc<dyn Provider>, action: Action) {
     let Some(pod) = selected_pod(shared, ui.selected) else {
         ui.mode = Mode::List;
         return;
     };
     let shown = ui.shown_name(&pod.name);
+    if action == Action::Stop {
+        if let Err(e) = provider.stop_support(&pod) {
+            ui.mode = Mode::Result(format!("✗ can't stop {} — {}", pod.name, no_stop_why(e)));
+            return;
+        }
+    }
     ui.mode = if action.needs_input() {
         Mode::Input { action, scope: InputScope::Pod { name: shown, id: pod.id }, value: String::new() }
     } else {
@@ -1392,7 +1521,9 @@ fn choose_pod_action(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, provider: &Arc<dy
 }
 
 /// A menu pick for a multi-pod scope: `test` runs right away (read-only); run/set-branch
-/// collect an argument; the rest go through the typed-token confirm.
+/// collect an argument; the rest go through the typed-token confirm. A stop first sorts its
+/// pods as `pods stop` does ([`stop_plan`]): one with nothing to stop is refused here, and the
+/// confirm names what it will skip.
 fn choose_fleet_action(
     shared: &Arc<Mutex<Shared>>,
     ui: &mut Ui,
@@ -1401,6 +1532,13 @@ fn choose_fleet_action(
     scope: Scope,
 ) {
     match action {
+        Action::Stop => {
+            let plan = stop_plan(provider.as_ref(), scope_pods(shared, &ui.marked, scope));
+            ui.mode = match plan.refusal() {
+                Some(r) => Mode::Result(r),
+                None => Mode::FleetConfirm { action, typed: String::new(), scope, note: plan.skip_lines().join("\n") },
+            };
+        }
         Action::Test => {
             let pods = scope_pods(shared, &ui.marked, scope);
             let (provider, remote, cfg) = (provider.clone(), ui.remote.clone(), ui.cfg.clone());
@@ -1412,7 +1550,7 @@ fn choose_fleet_action(
         Action::Run | Action::SetBranch => {
             ui.mode = Mode::Input { action, scope: InputScope::Set(scope), value: String::new() };
         }
-        _ => ui.mode = Mode::FleetConfirm { action, typed: String::new(), scope },
+        _ => ui.mode = Mode::FleetConfirm { action, typed: String::new(), scope, note: String::new() },
     }
 }
 
@@ -1590,7 +1728,7 @@ async fn execute(
         Action::Setup => run_setup(remote, cfg, pod).await,
         Action::Test => run_ssh_oneline(remote, cfg, pod, TORCH_TEST_CMD, "torch", TEST_TIMEOUT).await,
         Action::Run => match arg {
-            Some(cmd) if !cmd.trim().is_empty() => run_ssh_oneline(remote, cfg, pod, cmd, "run", RUN_TIMEOUT).await,
+            Some(cmd) if !cmd.trim().is_empty() => run_ssh_output(remote, cfg, pod, cmd).await,
             _ => format!("✗ {name}: no command given"),
         },
         Action::SetBranch => match arg {
@@ -1604,8 +1742,8 @@ async fn execute(
 const TORCH_TEST_CMD: &str =
     "python -c 'import torch; print(torch.__version__)' 2>&1 || python3 -c 'import torch; print(torch.__version__)'";
 
-/// Run a command over SSH (within `timeout`) and report its last output line (read-only
-/// flows: test / run).
+/// Run a command over SSH (within `timeout`) and report its last output line — `test`'s
+/// torch version (`run` shows the whole output: [`run_ssh_output`]).
 async fn run_ssh_oneline(
     remote: &dyn Remote,
     cfg: &Config,
@@ -1625,6 +1763,57 @@ async fn run_ssh_oneline(
         }
         Ok(out) => format!("✗ {} {what} ({}): {}", pod.name, out.exit_label(), out.stderr.trim()),
         Err(e) => format!("✗ {} {what} failed: {}", pod.name, describe_error(&e)),
+    }
+}
+
+/// `run`: the operator's command over SSH, within [`RUN_TIMEOUT`], reported with its output
+/// ([`run_report`]).
+async fn run_ssh_output(remote: &dyn Remote, cfg: &Config, pod: &Pod, cmd: &str) -> String {
+    let target = match SshTarget::from_pod(pod, cfg) {
+        Ok(t) => t,
+        Err(e) => return format!("✗ {}: {e}", pod.name),
+    };
+    match remote.exec(&target, cmd, Some(RUN_TIMEOUT)).await {
+        Ok(out) => run_report(&pod.name, &out),
+        Err(e) => format!("✗ {} run failed: {}", pod.name, describe_error(&e)),
+    }
+}
+
+/// The most output lines `run` shows per pod: the last ones — where a command's result and its
+/// errors end up — with the rest counted. The result popup scrolls; a fleet's worth of
+/// unbounded output would not.
+const RUN_OUTPUT_LINES: usize = 40;
+
+/// The most characters of one output line `run` shows (a minified file, a progress log).
+const RUN_LINE_CHARS: usize = 300;
+
+/// `run`'s outcome for one pod: the command's output — stdout, plus stderr when it failed —
+/// each line as a terminal would show it (`jobs::display_line`: a progress bar's last state, no
+/// escape sequences), on the heading's line when it's one line, else indented under it, the
+/// last [`RUN_OUTPUT_LINES`] of it with how many came before. Live: it showed only the last
+/// line — `nvidia-smi -L; hostname` read as just the hostname. Pure.
+fn run_report(name: &str, out: &arena_core::ssh::SshOutput) -> String {
+    let head = if out.success { format!("✓ {name} run") } else { format!("✗ {name} run ({})", out.exit_label()) };
+    let mut text: Vec<String> = out.stdout.lines().map(|l| arena_core::jobs::display_line(l.as_bytes())).collect();
+    if !out.success {
+        text.extend(out.stderr.lines().map(|l| arena_core::jobs::display_line(l.as_bytes())));
+    }
+    while text.last().is_some_and(|l| l.trim().is_empty()) {
+        text.pop();
+    }
+    let shown: Vec<String> = text.iter().map(|l| truncate(&l.replace('\t', "    "), RUN_LINE_CHARS)).collect();
+    match shown.as_slice() {
+        [] => format!("{head}: (no output)"),
+        [one] => format!("{head}: {one}"),
+        _ => {
+            let skip = shown.len().saturating_sub(RUN_OUTPUT_LINES);
+            let mut lines = vec![format!("{head}:")];
+            if skip > 0 {
+                lines.push(format!("  … {skip} earlier line(s) not shown"));
+            }
+            lines.extend(shown[skip..].iter().map(|l| format!("  {l}")));
+            lines.join("\n")
+        }
     }
 }
 
@@ -1728,8 +1917,8 @@ fn setup_steps(cfg: &Config, pod: &Pod) -> arena_core::Result<Vec<arena_core::se
     Ok(provisioning_steps("image", &scfg, &pod.name, false, "", &budget))
 }
 
-/// The exact command(s) a safe (non-typed) action will run, for the confirm modal.
-/// Lifecycle actions return `None` (their modal shows the typed-name prompt instead).
+/// The exact command(s) a safe (non-typed) action will run, for the confirm modal's `v` (it
+/// says what the action does otherwise: [`confirm_body`]). Lifecycle actions return `None`.
 fn build_preview(cfg: &Config, action: Action, pod: &Pod) -> Option<String> {
     let target = SshTarget::from_pod(pod, cfg);
     match action {
@@ -1932,7 +2121,7 @@ fn view(f: &mut Frame, shared: &Shared, ui: &Ui, secs: u64) {
         Mode::Menu { sel } => render_menu(f, shared, ui, *sel),
         Mode::Confirm(c) => render_confirm(f, c),
         Mode::FleetMenu { scope, sel } => render_fleet_menu(f, shared, ui, *scope, *sel),
-        Mode::FleetConfirm { action, typed, scope } => render_fleet_confirm(f, shared, ui, *action, typed, *scope),
+        Mode::FleetConfirm { action, typed, scope, note } => render_fleet_confirm(f, shared, ui, *action, typed, *scope, note),
         Mode::NewPod(form) => render_new_pod(f, form),
         Mode::Input { action, scope, value } => render_input(f, shared, ui, *action, scope, value),
         Mode::Select { value } => render_select(f, value),
@@ -1942,15 +2131,18 @@ fn view(f: &mut Frame, shared: &Shared, ui: &Ui, secs: u64) {
     }
 }
 
-/// The free-text input modal for `run` / `set-branch` (one pod or the whole fleet).
+/// The free-text input modal for `run` / `set-branch` (one pod or a multi-pod scope) — also
+/// their confirm: Enter runs it. On top, what Enter will do as typed so far ([`action_summary`]:
+/// `alpha: switch to branch w3d2 (fast-forward only)`, the command itself for `run`; several
+/// pods named once), wrapped by the widget.
 fn render_input(f: &mut Frame, shared: &Shared, ui: &Ui, action: Action, scope: &InputScope, value: &str) {
-    let who = match scope {
-        InputScope::Pod { name, .. } => name.clone(),
-        InputScope::Set(sc) => scope_label(shared, &ui.marked, *sc).1,
+    let names = match scope {
+        InputScope::Pod { name, .. } => vec![name.clone()],
+        InputScope::Set(sc) => scope_names(shared, ui, *sc),
     };
     let text = format!(
-        "{} on {who}\n\n{}\n\n  > {value}\n\n[enter] run  [esc] cancel",
-        action.label(),
+        "{}\n\n{}\n\n  > {value}\n\n[enter] run  [esc] cancel",
+        action_summary(action, &names, Some(value), CONFIRM_NAMES_MAX).join("\n"),
         action.input_prompt(),
     );
     let area = centered_rect(70, 40, f.area());
@@ -2645,7 +2837,8 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
 }
 
 /// The footer: a live [`Notice`] if there is one (else the refresh status and its age),
-/// how many deep checks are running, then the keys for the current mode.
+/// how many deep checks are running, then the keys for the current mode — the way out first
+/// (`[q] quit`, `[esc] back`): the line is cut at the terminal's width.
 fn footer_hint(shared: &Shared, ui: &Ui, secs: u64) -> Line<'static> {
     let age = match shared.last_refresh {
         Some(t) => format!("updated {}s ago", t.elapsed().as_secs()),
@@ -2657,14 +2850,15 @@ fn footer_hint(shared: &Shared, ui: &Ui, secs: u64) -> Line<'static> {
         n => format!(" · deep-checking {n}"),
     };
     let keys = match &ui.mode {
-        Mode::List => "[enter] detail  [c] ssh  [space] mark  [/] select  [x] unmark all  [a] act  [A] all  [d] deep check  [n] new  [r] refresh",
-        Mode::Detail => "[c] ssh  [space] mark  [/] select  [x] unmark all  [a] act  [A] all  [d] deep check  [n] new  [r] refresh  [esc] back",
+        Mode::List => "[q] quit  [enter] detail  [c] ssh  [space] mark  [/] select  [x] unmark all  [a] act  [A] all  [d] deep check  [n] new  [r] refresh",
+        Mode::Detail => "[esc] back  [q] quit  [c] ssh  [space] mark  [/] select  [x] unmark all  [a] act  [A] all  [d] deep check  [n] new  [r] refresh",
         Mode::Menu { .. } => "[↑↓] move  [enter] choose  [letter] pick  [esc] cancel",
         Mode::Confirm(c) if c.action.requires_typed_name() => "type the pod's name  [enter] apply  [esc] cancel",
+        Mode::Confirm(c) if c.preview.is_some() => "[y] apply  [v] full command  [n/esc] cancel",
         Mode::Confirm(_) => "[y] apply  [n/esc] cancel",
         Mode::FleetMenu { .. } => "[↑↓] move  [enter] choose  [letter] pick  [esc] cancel",
         Mode::FleetConfirm { .. } => "type the token to confirm  [enter] apply  [esc] cancel",
-        Mode::NewPod { .. } => "[↑↓] pods  [+-] gpus  [←→] type  [enter] create  [esc] cancel",
+        Mode::NewPod { .. } => "[↑↓] field  [←→] change  [enter] create  [esc] cancel",
         Mode::Input { .. } => "type the value  [enter] run  [esc] cancel",
         Mode::Select { .. } => "type a selection  [enter] mark  [esc] cancel",
         Mode::Working(_) => "working… (background) — please wait",
@@ -2740,12 +2934,11 @@ fn render_menu(f: &mut Frame, shared: &Shared, ui: &Ui, sel: usize) {
     render_action_menu(f, format!("Actions for {name}:"), Action::MENU, sel);
 }
 
-/// The single-pod confirm. What is about to happen — the action, its warning, and for a
-/// safe action the exact commands it runs — fills the top of the popup; the prompt (`[y]
+/// The single-pod confirm. What is about to happen — a plain summary of the action on the pod,
+/// its warning, and (`v`) the full command — fills the top of the popup; the prompt (`[y]
 /// apply`, or the typed-name field) sits in its own rows at the bottom, so it is always on
 /// screen. Live (wave 6): Setup's preview — several long commands — wrapped past the popup's
-/// bottom and took the `[y] apply` line with it. Each command now takes one line, clipped to
-/// the popup's width, and a preview too long for the popup says how many lines it left out.
+/// bottom and took the `[y] apply` line with it; the body is now bounded by its rows.
 fn render_confirm(f: &mut Frame, c: &Confirm) {
     let border = if c.action.is_destructive() { Color::Red } else { Color::Yellow };
     let area = centered_rect(80, 70, f.area());
@@ -2766,7 +2959,8 @@ fn render_confirm(f: &mut Frame, c: &Confirm) {
     f.render_widget(Paragraph::new(prompt.join("\n")), rows[1]);
 }
 
-/// The confirm's bottom rows: the typed-name field, or the `[y]` keys. Pure.
+/// The confirm's bottom rows: the typed-name field, or the `[y]` keys (and `[v]` when there is
+/// a full command to show). Pure.
 fn confirm_prompt(c: &Confirm) -> Vec<String> {
     if c.action.requires_typed_name() {
         vec![
@@ -2776,35 +2970,87 @@ fn confirm_prompt(c: &Confirm) -> Vec<String> {
             "[enter] apply  [esc] cancel".to_string(),
         ]
     } else {
-        vec![String::new(), "[y] apply   [n/esc] cancel".to_string()]
+        let v = match (&c.preview, c.full) {
+            (None, _) => "",
+            (Some(_), false) => "   [v] full command",
+            (Some(_), true) => "   [v] hide command",
+        };
+        vec![String::new(), format!("[y] apply{v}   [n/esc] cancel")]
     }
 }
 
-/// The confirm's body for an area `width` × `rows` (pure, so tested): `<Action> pod '<name>'`,
-/// the warning (wrapped by the widget), then — for a safe action — `Will run:` and one line
-/// per command, clipped to `width`; when the commands don't fit in the rows left, the last
-/// row says how many were left out.
+/// The confirm's body for an area `width` × `rows` (pure, so tested): what the action does to
+/// the pod in plain words (`alpha: print the torch version (read-only)`, [`action_summary`])
+/// and its warning, word-wrapped. The generated command is shown only on `v`
+/// ([`Confirm::full`]): under `Will run:`, wrapped rather than clipped, and when it doesn't
+/// fit in the rows left the last row says how many were left out. Live: the confirm opened
+/// on `ssh -p 22192 -o BatchMode=yes -o StrictHostKeyChecking=no … -i /…`, clipped at the
+/// width — the remote command never showed.
 fn confirm_body(c: &Confirm, width: usize, rows: usize) -> Vec<String> {
-    let mut out = vec![format!("{} pod '{}'", c.action.label(), c.pod_name)];
+    let width = width.max(2);
+    let summary = action_summary(c.action, std::slice::from_ref(&c.pod_name), None, CONFIRM_NAMES_MAX);
+    let mut out: Vec<String> = summary.iter().flat_map(|l| wrap_words(l, width)).collect();
     if let Some(w) = c.warning() {
         out.push(String::new());
-        out.push(w.to_string());
+        out.extend(wrap_words(w, width));
     }
-    let Some(p) = &c.preview else { return out };
+    let Some(p) = c.preview.as_ref().filter(|_| c.full) else { return out };
     out.push(String::new());
     out.push("Will run:".to_string());
-    // Rows the warning takes once wrapped (it's the only long text above the commands).
-    let used: usize = out.iter().map(|l| l.chars().count().max(1).div_ceil(width.max(1))).sum();
-    let room = rows.saturating_sub(used);
-    let lines: Vec<&str> = p.lines().collect();
+    let room = rows.saturating_sub(out.len());
+    let lines: Vec<String> = p.lines().flat_map(|l| wrap_command(l, width)).collect();
     let fits = if lines.len() <= room { lines.len() } else { room.saturating_sub(1) };
-    for l in &lines[..fits] {
-        out.push(truncate(l, width.max(2)));
-    }
+    out.extend(lines[..fits].iter().cloned());
     if fits < lines.len() {
         out.push(format!("… {} more line(s) not shown", lines.len() - fits));
     }
     out
+}
+
+/// `text` word-wrapped into rows of at most `width` characters (a word longer than a row is
+/// cut), so the confirm knows exactly how many rows its text takes. Pure.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let mut row: Vec<char> = Vec::new();
+    for word in text.split(' ').filter(|w| !w.is_empty()) {
+        let mut word: Vec<char> = word.chars().collect();
+        if !row.is_empty() && row.len() + 1 + word.len() > width {
+            rows.push(row.drain(..).collect::<String>());
+        }
+        if !row.is_empty() {
+            row.push(' ');
+        }
+        while row.len() + word.len() > width {
+            let take = width - row.len();
+            row.extend(word.drain(..take));
+            rows.push(row.drain(..).collect::<String>());
+        }
+        row.extend(word);
+    }
+    if !row.is_empty() || rows.is_empty() {
+        rows.push(row.into_iter().collect());
+    }
+    rows
+}
+
+/// One command line as rows of at most `width` characters, cut wherever the width runs out (a
+/// command has no word breaks worth keeping), each continuation indented two spaces so one
+/// command doesn't read as two. Pure.
+fn wrap_command(line: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let indent = if width > 4 { 2 } else { 0 };
+    let mut rest: Vec<char> = line.chars().collect();
+    let mut rows = Vec::new();
+    loop {
+        let pad = if rows.is_empty() { 0 } else { indent };
+        let take = rest.len().min(width - pad);
+        let row: String = rest.drain(..take).collect();
+        rows.push(format!("{}{row}", " ".repeat(pad)));
+        if rest.is_empty() {
+            return rows;
+        }
+    }
 }
 
 /// `(count, human label)` for a scope, e.g. `(19, "all 19 pods")` / `(3, "3 marked pods")`.
@@ -2821,6 +3067,15 @@ fn scope_label(shared: &Shared, marked: &std::collections::HashSet<String>, scop
     }
 }
 
+/// The shown names of the pods a scope targets, in row order.
+fn scope_names(shared: &Shared, ui: &Ui, scope: Scope) -> Vec<String> {
+    let pods: Vec<&Pod> = match scope {
+        Scope::All => shared.pods.iter().collect(),
+        Scope::Marked => marked_pods(&shared.pods, &ui.marked),
+    };
+    pods.iter().map(|p| ui.shown_name(&p.name)).collect()
+}
+
 /// How many marked pods a marked-set confirm names before `… and N more`: enough to see
 /// what a `/` selection caught (it can mark pods scrolled off screen) without pushing the
 /// token prompt out of the fixed-size popup.
@@ -2832,22 +3087,17 @@ fn render_fleet_menu(f: &mut Frame, shared: &Shared, ui: &Ui, scope: Scope, sel:
     render_action_menu(f, format!("Actions — {who}:"), &actions, sel);
 }
 
-/// The multi-pod confirm. What is about to happen (and, for a marked set, to which pods —
-/// `/` can mark pods scrolled off screen — up to [`CONFIRM_NAMES_MAX`] names) wraps in the
-/// top of the popup and is clipped if it must be; the token prompt and what has been typed
+/// The multi-pod confirm. What is about to happen — to which pods, named once (`/` can mark
+/// pods scrolled off screen; up to [`CONFIRM_NAMES_MAX`] names), then what it does in plain
+/// words ([`action_summary`]), its warning, and `note` (a stop's pods it will skip) — wraps in
+/// the top of the popup and is clipped if it must be; the token prompt and what has been typed
 /// sit in their own rows at the bottom, so they are always on screen.
-fn render_fleet_confirm(f: &mut Frame, shared: &Shared, ui: &Ui, action: Action, typed: &str, scope: Scope) {
-    let (n, who) = scope_label(shared, &ui.marked, scope);
+fn render_fleet_confirm(f: &mut Frame, shared: &Shared, ui: &Ui, action: Action, typed: &str, scope: Scope, note: &str) {
+    let n = scope_label(shared, &ui.marked, scope).0;
     let token = fleet_confirm_token_str(shared, &ui.marked, scope, action);
     // Per-pod providers aren't known here: warn as if each one wipes (the safe side).
     let warn = action.warning(true).map(|w| format!("\n\n{w}")).unwrap_or_default();
-    let names = match scope {
-        Scope::All => String::new(),
-        Scope::Marked => {
-            let names: Vec<String> = marked_pods(&shared.pods, &ui.marked).iter().map(|p| ui.shown_name(&p.name)).collect();
-            format!(": {}", names_preview(&names, CONFIRM_NAMES_MAX))
-        }
-    };
+    let summary = action_summary(action, &scope_names(shared, ui, scope), None, CONFIRM_NAMES_MAX).join("\n");
     // Why a marked set asks for ALL rather than its count (`state::marked_set_token`).
     let why = if scope == Scope::Marked && token == "ALL" {
         let what = if n >= shared.pods.len() { "every listed pod" } else { "a big set" };
@@ -2855,6 +3105,7 @@ fn render_fleet_confirm(f: &mut Frame, shared: &Shared, ui: &Ui, action: Action,
     } else {
         String::new()
     };
+    let note = if note.is_empty() { String::new() } else { format!("\n\n{note}") };
     let border = if action.is_destructive() { Color::Red } else { Color::Yellow };
     let area = centered_rect(70, 60, f.area());
     f.render_widget(Clear, area);
@@ -2869,7 +3120,7 @@ fn render_fleet_confirm(f: &mut Frame, shared: &Shared, ui: &Ui, action: Action,
         .constraints([Constraint::Min(0), Constraint::Length(5)])
         .split(inner);
     f.render_widget(
-        Paragraph::new(format!("{} {who}{names}.{warn}{why}", action.label())).wrap(Wrap { trim: false }),
+        Paragraph::new(format!("{summary}{warn}{why}{note}")).wrap(Wrap { trim: false }),
         rows[0],
     );
     f.render_widget(
@@ -3224,14 +3475,17 @@ deep_check_end=1
     /// proxy port + state; the summary bar the fleet total with € kept apart.
     /// Live (wave 6): the Setup confirm's preview — several long commands — wrapped past the
     /// popup and clipped its `[y] apply` line, and the footer said "type to confirm" for a
-    /// `[y]` prompt. The prompt has its own rows now, each command one clipped line (the rest
-    /// counted), and the footer names the keys the prompt takes.
+    /// `[y]` prompt. The prompt has its own rows now; the full command (shown on `v`) is
+    /// wrapped within the rows left, the rest counted; and the footer names the keys the
+    /// prompt takes.
     #[test]
     fn the_setup_confirm_always_shows_its_prompt() {
         let shared = Shared::default();
         let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
         let long: Vec<String> = (0..30).map(|i| format!("ssh -p 22001 root@10.0.0.1 'step {i}: {}'", "x".repeat(200))).collect();
-        ui.mode = Mode::Confirm(Confirm::new(Action::Setup, "devtest-alpha".into(), "id".into(), Some(long.join("\n"))));
+        let mut c = Confirm::new(Action::Setup, "devtest-alpha".into(), "id".into(), Some(long.join("\n")));
+        c.full = true;
+        ui.mode = Mode::Confirm(c);
         for (w, h) in [(120, 40), (80, 24), (60, 16)] {
             let all = draw(w, h, &shared, &ui).join("\n");
             assert!(all.contains("[y] apply") && all.contains("[n/esc] cancel"), "{w}x{h}:\n{all}");
@@ -3239,18 +3493,23 @@ deep_check_end=1
             assert!(!all.contains("type to confirm"), "{w}x{h}: the footer offers [y]:\n{all}");
         }
         // A short preview is shown whole.
-        ui.mode = Mode::Confirm(Confirm::new(Action::Setup, "devtest-alpha".into(), "id".into(), Some("echo one\necho two".into())));
+        let mut c = Confirm::new(Action::Setup, "devtest-alpha".into(), "id".into(), Some("echo one\necho two".into()));
+        c.full = true;
+        ui.mode = Mode::Confirm(c);
         let all = draw(120, 40, &shared, &ui).join("\n");
         assert!(all.contains("echo two") && !all.contains("not shown") && all.contains("[y] apply"), "{all}");
         // A typed-name action keeps its field at the bottom, and its footer says so.
         ui.mode = Mode::Confirm(Confirm::new(Action::Terminate, "devtest-alpha".into(), "id".into(), None));
         let all = draw(100, 30, &shared, &ui).join("\n");
         assert!(all.contains("Type the pod name to confirm") && all.contains("type the pod's name"), "{all}");
-        // The body (pure): commands clipped to the width, the overflow counted.
-        let c = Confirm::new(Action::Setup, "p".into(), "id".into(), Some(long.join("\n")));
+        // The body (pure): the summary (2 rows at 40), then the commands wrapped to the width
+        // (each 237–238 characters: 7 rows, 210 in all), the rows that don't fit counted.
+        let mut c = Confirm::new(Action::Setup, "p".into(), "id".into(), Some(long.join("\n")));
+        c.full = true;
         let body = confirm_body(&c, 40, 10);
         assert!(body.len() <= 10 && body.iter().all(|l| l.chars().count() <= 40), "{body:?}");
-        assert_eq!(body.last().unwrap(), "… 24 more line(s) not shown");
+        assert_eq!(body[..2], ["p: provision (deploy key, SSH keys,", "repo, tools)"]);
+        assert_eq!(body.last().unwrap(), "… 205 more line(s) not shown");
     }
 
     #[test]
@@ -3387,12 +3646,35 @@ deep_check_end=1
         shared.balance = live_views(&[(Account::Runpod, 20.0, 0.42)]); // ≈47h, under 72
         for w in [80, 120] {
             let narrow = bar(&shared, w);
-            assert!(narrow.starts_with(" ⚠ runpod balance ≈47h · 4 pods"), "{w}: {narrow}");
+            assert!(narrow.starts_with(" ⚠ runpod $20.00 ≈47h · 4 pods"), "{w}: {narrow}");
         }
         assert_eq!(lead_colour(&shared), Color::Yellow);
         shared.balance = live_views(&[(Account::Runpod, 5.0, 0.42)]); // ≈11h
-        assert!(bar(&shared, 80).starts_with(" ‼ runpod balance ≈11h · 4 pods"));
+        assert!(bar(&shared, 80).starts_with(" ‼ runpod $5.00 ≈11h · 4 pods"));
         assert_eq!(lead_colour(&shared), Color::Red, "the warning is red");
+        // RunPod at $0 with nothing billing is still the alarm (at $0 RunPod stops the pods).
+        shared.balance = live_views(&[(Account::Runpod, 0.0, 0.0)]);
+        assert!(bar(&shared, 80).starts_with(" ‼ runpod $0.00 no burn · 4 pods"), "{}", bar(&shared, 80));
+        assert_eq!(lead_colour(&shared), Color::Red);
+    }
+
+    /// Live (2026-10-15): with no Shadeform pods the bar led, in red, with `‼ shadeform balance no
+    /// burn` — the opt-in overflow account, unfunded on purpose. It now sits at the end with its
+    /// amount, in the bar's own colour; with a billing pod there it leads again.
+    #[test]
+    fn an_unfunded_overflow_account_does_not_lead_the_bar() {
+        use balance::Account;
+        let mut shared = fixture_shared();
+        let ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        let bar = |shared: &Shared, w: u16| draw(w, 12, shared, &ui).into_iter().find(|l| l.contains(" pods · ")).unwrap();
+        shared.balance = live_views(&[(Account::Runpod, 100.0, 0.42), (Account::Shadeform, 0.0, 0.0)]);
+        let wide = bar(&shared, 240);
+        assert!(wide.starts_with(" 4 pods · "), "{wide}");
+        assert!(wide.contains("  ·  balance: runpod $100.00 ≈9.9d · shadeform $0.00 unfunded"), "{wide}");
+        assert!(!wide.contains('‼'), "{wide}");
+        assert_eq!(state::balance_tone(&shared.balance), None);
+        shared.balance = live_views(&[(Account::Shadeform, 0.0, 0.57)]);
+        assert!(bar(&shared, 80).starts_with(" ‼ shadeform $0.00 <1h · 4 pods"), "{}", bar(&shared, 80));
     }
 
     /// The balance is observed in the details round (every DETAILS_EVERY, or `r` after the
@@ -3572,9 +3854,9 @@ deep_check_end=1
         let mut shared = fixture_shared();
         let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
         ui.marked = ["runpod:rp1", "runpod:rp2"].map(String::from).into_iter().collect();
-        ui.mode = Mode::FleetConfirm { action: Action::Terminate, typed: String::new(), scope: Scope::Marked };
+        ui.mode = Mode::FleetConfirm { action: Action::Terminate, typed: String::new(), scope: Scope::Marked, note: String::new() };
         let all = draw(180, 30, &shared, &ui).join("\n");
-        assert!(all.contains("terminate 2 marked pods: alpha, bravo."), "{all}");
+        assert!(all.contains("2 pods: alpha, bravo") && all.contains("terminate (delete)"), "{all}");
         assert!(all.contains("Type 2 to confirm"), "{all}");
 
         ui.mode = Mode::List;
@@ -3602,7 +3884,7 @@ deep_check_end=1
         ui.short_names = false;
         ui.marked = shared.pods.iter().map(mark_key).collect();
         for (action, typed) in [(Action::Restart, "AL"), (Action::Terminate, "ALL"), (Action::Setup, "2")] {
-            ui.mode = Mode::FleetConfirm { action, typed: typed.into(), scope: Scope::Marked };
+            ui.mode = Mode::FleetConfirm { action, typed: typed.into(), scope: Scope::Marked, note: String::new() };
             for (w, h) in [(100, 30), (80, 24)] {
                 let all = draw(w, h, &shared, &ui).join("\n");
                 let token = if action.is_destructive() { "ALL" } else { "20" };
@@ -3660,7 +3942,7 @@ deep_check_end=1
         assert_eq!(token(&ui, Action::Terminate), "2");
         // The popup says why it wants ALL.
         apply_select(&mut ui, &mut shared.lock().unwrap(), "alpha..delta");
-        ui.mode = Mode::FleetConfirm { action: Action::Terminate, typed: String::new(), scope: Scope::Marked };
+        ui.mode = Mode::FleetConfirm { action: Action::Terminate, typed: String::new(), scope: Scope::Marked, note: String::new() };
         let all = draw(180, 30, &shared.lock().unwrap(), &ui).join("\n");
         assert!(all.contains("That is every listed pod: terminate on it takes ALL") && all.contains("Type ALL"), "{all}");
     }
@@ -4233,7 +4515,7 @@ deep_check_end=1
             fake.script(host, replies);
             let line = match what {
                 "test" | "test-hung" => run_ssh_oneline(&fake, &cfg, &alpha, TORCH_TEST_CMD, "torch", TEST_TIMEOUT).await,
-                "run-hung" => run_ssh_oneline(&fake, &cfg, &alpha, "sleep 99999", "run", RUN_TIMEOUT).await,
+                "run-hung" => run_ssh_output(&fake, &cfg, &alpha, "sleep 99999").await,
                 "backup" => run_backup(&fake, &cfg, &alpha).await,
                 "set-branch" => run_set_branch(&fake, &cfg, &alpha, "w1d2").await,
                 _ => run_setup(&fake, &cfg, &alpha).await,
@@ -4262,5 +4544,367 @@ deep_check_end=1
         drop(held);
         let _ = std::fs::remove_dir_all(&dir);
         assert!(fake.calls().is_empty());
+    }
+    /// A provider for the action tests that never answers a fleet call it isn't asked.
+    fn quiet_fleet() -> FakeFleet {
+        FakeFleet { pods: vec![], lists: AtomicUsize::new(0), details: AtomicUsize::new(0), details_error: None }
+    }
+
+    /// Esc steps back and never quits: from the detail view to the list (the marks kept), and
+    /// on the list it clears the marks, else does nothing; `q` quits, and the footer says so.
+    /// Live: Esc on the list quit, so the Esc-Esc that backs out of a popup closed the dashboard.
+    #[test]
+    fn esc_steps_back_and_never_quits_and_q_does() {
+        let shared = fixture_shared();
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        let marks: HashSet<String> = ["runpod:rp1".to_string()].into();
+        ui.marked = marks.clone();
+        ui.mode = Mode::Detail;
+        assert_eq!(list_key(&mut ui, KeyCode::Esc, 4), ListKey::Done);
+        assert!(matches!(ui.mode, Mode::List) && ui.marked == marks, "detail → list, the marks kept");
+        assert_eq!(list_key(&mut ui, KeyCode::Esc, 4), ListKey::Done);
+        assert!(matches!(ui.mode, Mode::List) && ui.marked.is_empty(), "on the list: the marks cleared");
+        assert_eq!(list_key(&mut ui, KeyCode::Esc, 4), ListKey::Done, "nothing marked: nothing happens");
+        assert!(matches!(ui.mode, Mode::List));
+        assert_eq!(list_key(&mut ui, KeyCode::Char('q'), 4), ListKey::Quit);
+        ui.mode = Mode::Detail;
+        assert_eq!(list_key(&mut ui, KeyCode::Char('q'), 4), ListKey::Quit);
+        // The keys that moved out of the loop with it still do what they did.
+        ui.mode = Mode::List;
+        ui.selected = 0;
+        list_key(&mut ui, KeyCode::Down, 4);
+        list_key(&mut ui, KeyCode::Char('j'), 4);
+        list_key(&mut ui, KeyCode::Up, 4);
+        assert_eq!(ui.selected, 1);
+        list_key(&mut ui, KeyCode::Enter, 4);
+        assert!(matches!(ui.mode, Mode::Detail));
+        ui.mode = Mode::List;
+        list_key(&mut ui, KeyCode::Char('a'), 4);
+        assert!(matches!(ui.mode, Mode::Menu { sel: 0 }));
+        ui.mode = Mode::List;
+        ui.marked = marks.clone();
+        list_key(&mut ui, KeyCode::Char('a'), 4);
+        assert!(matches!(ui.mode, Mode::FleetMenu { scope: Scope::Marked, .. }));
+        ui.mode = Mode::List;
+        list_key(&mut ui, KeyCode::Char('A'), 4);
+        assert!(matches!(ui.mode, Mode::FleetMenu { scope: Scope::All, .. }));
+        ui.mode = Mode::List;
+        list_key(&mut ui, KeyCode::Char('x'), 4);
+        assert!(ui.marked.is_empty());
+        assert_eq!(list_key(&mut ui, KeyCode::Char('A'), 0), ListKey::Done);
+        assert!(matches!(ui.mode, Mode::List), "no pods: no fleet menu");
+        list_key(&mut ui, KeyCode::Char('/'), 4);
+        assert!(matches!(ui.mode, Mode::Select { .. }));
+        ui.mode = Mode::List;
+        assert_eq!(list_key(&mut ui, KeyCode::Char('r'), 4), ListKey::Other);
+        // The footer says how to quit — first, as the line is cut at the terminal's width.
+        for mode in [Mode::List, Mode::Detail] {
+            ui.mode = mode;
+            let footer = draw(80, 12, &shared, &ui).pop().unwrap();
+            assert!(footer.contains("[q] quit"), "{footer}");
+        }
+    }
+
+    /// `run` shows what the command printed — every line, not the last one (live: `nvidia-smi
+    /// -L; hostname` read as just the hostname) — with stderr when it fails, as a terminal would
+    /// show it, and past RUN_OUTPUT_LINES the earlier lines counted; per pod for several pods.
+    /// `test` stays its one-liner (`actions_go_through_remote_with_their_budgets`).
+    #[tokio::test]
+    async fn run_shows_the_whole_output_per_pod() {
+        let cfg = cfg("");
+        let alpha = pod("alpha", "runpod", "rp1", 1, Some(22001));
+        let hundred: String = (1..=100).map(|i| format!("line {i}\n")).collect();
+        // (the reply, the outcome)
+        let cases: Vec<(FakeReply, String)> = vec![
+            (
+                FakeReply::stdout("GPU 0: NVIDIA RTX A4000 (UUID: GPU-1)\nGPU 1: NVIDIA RTX A4000 (UUID: GPU-2)\nalpha-host\n"),
+                "✓ devtest-alpha run:\n  GPU 0: NVIDIA RTX A4000 (UUID: GPU-1)\n  GPU 1: NVIDIA RTX A4000 (UUID: GPU-2)\n  alpha-host".into(),
+            ),
+            (FakeReply::stdout("alpha-host\n"), "✓ devtest-alpha run: alpha-host".into()),
+            (FakeReply::ok(), "✓ devtest-alpha run: (no output)".into()),
+            (
+                FakeReply::exit(2, "ls: cannot access 'nope': No such file or directory\n").with_stdout("found:\n"),
+                "✗ devtest-alpha run (exit 2):\n  found:\n  ls: cannot access 'nope': No such file or directory".into(),
+            ),
+            (FakeReply::stdout("\u{1b}[32mok\u{1b}[0m\n 10%\r100%\n\n"), "✓ devtest-alpha run:\n  ok\n  100%".into()),
+            (
+                FakeReply::stdout(&hundred),
+                format!(
+                    "✓ devtest-alpha run:\n  … 60 earlier line(s) not shown\n{}",
+                    (61..=100).map(|i| format!("  line {i}")).collect::<Vec<_>>().join("\n")
+                ),
+            ),
+        ];
+        for (reply, want) in cases {
+            let fake = FakeRemote::new();
+            fake.script("10.0.0.1:22001", [reply]);
+            assert_eq!(execute(&quiet_fleet(), &fake, &cfg, Action::Run, &alpha, Some("nvidia-smi -L; hostname")).await, want);
+        }
+        // Several pods: each pod's output under its own line.
+        let fake = Arc::new(FakeRemote::new());
+        fake.script("10.0.0.1:22001", [FakeReply::stdout("alpha-host\nup 3 days\n")]);
+        fake.script("10.0.0.2:22002", [FakeReply::exit(127, "sh: uptim: not found\n")]);
+        let (provider, remote): (Arc<dyn Provider>, Arc<dyn Remote>) = (Arc::new(quiet_fleet()), fake.clone());
+        let pods = vec![alpha.clone(), pod("bravo", "runpod", "rp2", 2, Some(22002))];
+        let out = execute_fleet(&provider, &remote, &cfg, Action::Run, pods, Some("hostname; uptim".into())).await;
+        assert_eq!(out, "run — 1/2 ok\n✓ devtest-alpha run:\n  alpha-host\n  up 3 days\n✗ devtest-bravo run (exit 127): sh: uptim: not found");
+    }
+
+    /// The confirm says what the action does in plain words — never the generated `ssh -p …
+    /// -o … -i …` line (live: clipped at the width, it hid the remote command) — for every
+    /// action that has a confirm; the full command is there on `v`, wrapped, not clipped. The
+    /// input modal (run/set-branch's confirm) and a multi-pod confirm summarise the same way,
+    /// naming several pods once.
+    #[test]
+    fn confirms_summarise_the_action_instead_of_the_ssh_line() {
+        let shared = fixture_shared();
+        let conf = cfg("ARENA_REPO_OWNER=nickypro\nARENA_REPO_NAME=arena-sandbox-materials\nGIT_SSH_KEY_LOCAL=/nonexistent/deploy_key\n");
+        let mut ui = ui(conf, Arc::new(FakeRemote::new()));
+        let alpha = shared.pods.iter().find(|p| p.id == "rp1").unwrap().clone();
+        // (action, its summary)
+        for (action, want) in [
+            (Action::Test, "alpha: print the torch version (read-only)"),
+            (Action::Backup, "alpha: commit + push the current branch"),
+            (Action::Setup, "alpha: provision (deploy key, SSH keys, repo, tools)"),
+            (Action::Restart, "alpha: restart in place (a hard reset)"),
+            (Action::Stop, "alpha: stop (it can be started again)"),
+            (Action::Terminate, "alpha: terminate (delete)"),
+        ] {
+            let preview = build_preview(&ui.cfg, action, &alpha);
+            assert_eq!(preview.is_some(), !action.requires_typed_name(), "{action:?}");
+            ui.mode = Mode::Confirm(Confirm::new(action, "alpha".into(), alpha.id.clone(), preview));
+            let all = draw(100, 30, &shared, &ui).join("\n");
+            assert!(all.contains(want), "{action:?}:\n{all}");
+            assert!(!all.contains("ssh -p") && !all.contains("BatchMode") && !all.contains("Will run"), "{action:?}:\n{all}");
+            if action.requires_typed_name() {
+                assert!(all.contains("Type the pod name to confirm"), "{action:?}:\n{all}");
+            } else {
+                assert!(all.contains("[v] full command"), "{action:?}:\n{all}");
+            }
+        }
+        // The warnings stay.
+        ui.mode = Mode::Confirm(Confirm::new(Action::Terminate, "alpha".into(), alpha.id.clone(), None));
+        assert!(draw(100, 30, &shared, &ui).join("\n").contains("⚠ IRREVERSIBLE"));
+        // `v`: the full command, wrapped whole — its end (the python3 fallback) included.
+        let mut c = Confirm::new(Action::Test, "alpha".into(), alpha.id.clone(), build_preview(&ui.cfg, Action::Test, &alpha));
+        c.full = true;
+        let body = confirm_body(&c, 50, 40);
+        let at = body.iter().position(|l| l == "Will run:").unwrap();
+        let rebuilt: String =
+            body[at + 1..].iter().enumerate().map(|(i, l)| if i == 0 { l.as_str() } else { l.strip_prefix("  ").unwrap() }).collect();
+        assert_eq!(Some(rebuilt), c.preview.clone());
+        assert!(body.iter().all(|l| l.chars().count() <= 50), "{body:?}");
+        ui.mode = Mode::Confirm(c);
+        let all = draw(100, 30, &shared, &ui).join("\n");
+        assert!(all.contains("Will run:") && all.contains("[v] hide command"), "{all}");
+        // Several pods: named once, then what.
+        ui.marked = ["runpod:rp1", "runpod:rp2", "hetzner:88"].map(String::from).into();
+        ui.mode = Mode::FleetConfirm { action: Action::Backup, typed: String::new(), scope: Scope::Marked, note: String::new() };
+        let all = draw(180, 30, &shared, &ui).join("\n");
+        assert!(all.contains("3 pods: alpha, bravo, charlie") && all.contains("commit + push the current branch"), "{all}");
+        // run / set-branch: the input modal says what Enter does, the command verbatim.
+        ui.mode = Mode::Input { action: Action::Run, scope: InputScope::Set(Scope::Marked), value: "nvidia-smi -L; hostname".into() };
+        let all = draw(180, 30, &shared, &ui).join("\n");
+        assert!(all.contains("3 pods: alpha, bravo, charlie") && all.contains("nvidia-smi -L; hostname"), "{all}");
+        ui.mode = Mode::Input { action: Action::SetBranch, scope: InputScope::Pod { name: "alpha".into(), id: "rp1".into() }, value: "w3d2".into() };
+        let all = draw(180, 30, &shared, &ui).join("\n");
+        assert!(all.contains("alpha: switch to branch w3d2 (fast-forward only)"), "{all}");
+    }
+
+    /// The text wrappers the confirm counts its rows with (pure).
+    #[test]
+    fn wrap_words_and_wrap_command_table() {
+        // (text, width, rows)
+        let words: &[(&str, usize, &[&str])] = &[
+            ("a bb ccc", 4, &["a bb", "ccc"]),
+            ("a bb ccc", 8, &["a bb ccc"]),
+            ("abcdefghij k", 4, &["abcd", "efgh", "ij k"]),
+            ("", 4, &[""]),
+        ];
+        for (text, width, want) in words {
+            assert_eq!(wrap_words(text, *width), *want, "{text:?} at {width}");
+        }
+        let cmds: &[(&str, usize, &[&str])] = &[
+            ("echo hi", 10, &["echo hi"]),
+            ("abcdefghijkl", 6, &["abcdef", "  ghij", "  kl"]),
+            ("", 6, &[""]),
+        ];
+        for (line, width, want) in cmds {
+            assert_eq!(wrap_command(line, *width), *want, "{line:?} at {width}");
+        }
+    }
+
+    /// The add-pod form's footer names the form's own keys (it said `[↑↓] pods  [+-] gpus  [←→]
+    /// type` — keys the form doesn't have — under a form saying `[↑↓] field  [←→] change`).
+    #[test]
+    fn the_new_pod_footer_matches_the_form() {
+        let shared = fixture_shared();
+        let mut ui = ui(cfg("RUNPOD_API_KEY=x\n"), Arc::new(FakeRemote::new()));
+        ui.mode = Mode::NewPod(build_new_pod_form(&ui.cfg, "runpod", &[]));
+        let lines = draw(120, 40, &shared, &ui);
+        let footer = lines.last().unwrap();
+        assert!(footer.contains("[↑↓] field  [←→] change  [enter] create  [esc] cancel"), "{footer}");
+        assert!(!footer.contains("[+-]") && !footer.contains("[↑↓] pods"), "{footer}");
+        assert!(lines.join("\n").contains("[↑↓] field   [←→] change   [enter] CREATE   [esc] cancel"));
+    }
+
+    /// A multi-pod stop sorts its pods as `pods stop` does, through the core helpers
+    /// (`status::is_billing`, and `Provider::stop_support` — here the real fleet's, where
+    /// Shadeform says it has no stop): a billing pod with no stop is skipped and named, a pod
+    /// not running is left alone, the rest are stopped; a selection of only no-stop pods is
+    /// refused, as `pods stop` refuses it — and one pod's stop of such a pod is refused before
+    /// its confirm. The marked-set menu has stop; the whole fleet's doesn't.
+    #[test]
+    fn a_marked_stop_skips_what_it_cannot_stop_and_refuses_it_alone() {
+        use arena_core::provider::shadeform::NO_STOP;
+        let fleet: Arc<dyn Provider> =
+            Arc::from(arena_core::provider::build_fleet("runpod", &Config::parse("RUNPOD_API_KEY=r\nSHADEFORM_API_KEY=k"), false).unwrap());
+        let alpha = pod("alpha", "runpod", "rp1", 1, Some(22001));
+        let mayor = pod("mayor", "shadeform", "sf1", 5, Some(22));
+        let mut delta = pod("delta", "runpod", "rp4", 4, None);
+        delta.status = "EXITED".into();
+        let plan = stop_plan(fleet.as_ref(), vec![alpha.clone(), mayor.clone(), delta.clone()]);
+        assert_eq!(plan.stop.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["devtest-alpha"]);
+        assert_eq!(plan.refusal(), None);
+        assert_eq!(
+            plan.skip_lines(),
+            [
+                "⊘ devtest-delta — skipped: not running or starting (EXITED)".to_string(),
+                format!("⊘ devtest-mayor — skipped, still billing: {NO_STOP}"),
+            ]
+        );
+        assert!(plan.still_billing().unwrap().starts_with("✗ 1 pod(s) still billing — their provider has no stop: devtest-mayor"));
+        let alone = stop_plan(fleet.as_ref(), vec![mayor.clone(), delta.clone()]);
+        assert_eq!(alone.refusal().unwrap(), format!("✗ can't stop devtest-mayor — {NO_STOP}"));
+        assert!(stop_plan(fleet.as_ref(), vec![delta.clone()]).refusal().unwrap().starts_with("⊘ nothing to stop"));
+
+        // Through the menu picks, as the key loop calls them.
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let snap = dashboard_snapshot(&[alpha.clone(), mayor.clone(), delta.clone()], &[], None, &HealthCache::new(), &Naming::from_config(&cfg("")), NOW);
+        shared.lock().unwrap().publish(snap);
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        ui.marked = [&alpha, &mayor, &delta].iter().map(|p| mark_key(p)).collect();
+        choose_fleet_action(&shared, &mut ui, &fleet, Action::Stop, Scope::Marked);
+        let Mode::FleetConfirm { action: Action::Stop, ref note, .. } = ui.mode else { panic!("{:?}", ui.mode) };
+        assert!(note.contains("devtest-mayor — skipped, still billing: Shadeform has no stop") && note.contains("devtest-delta — skipped"), "{note}");
+        let all = draw(180, 40, &shared.lock().unwrap(), &ui).join("\n");
+        assert!(all.contains("skipped, still billing") && all.contains("Type ALL to confirm"), "{all}");
+        // Only the Shadeform pod: refused, nothing to confirm.
+        ui.marked = [mark_key(&mayor)].into();
+        choose_fleet_action(&shared, &mut ui, &fleet, Action::Stop, Scope::Marked);
+        assert!(matches!(&ui.mode, Mode::Result(r) if r.starts_with("✗ can't stop devtest-mayor — Shadeform has no stop")), "{:?}", ui.mode);
+        // One pod's stop: refused before the confirm for it, the confirm for another.
+        let row = |id: &str| shared.lock().unwrap().pods.iter().position(|p| p.id == id).unwrap();
+        ui.selected = row("sf1");
+        choose_pod_action(&shared, &mut ui, &fleet, Action::Stop);
+        assert!(matches!(&ui.mode, Mode::Result(r) if r.starts_with("✗ can't stop devtest-mayor — Shadeform has no stop")), "{:?}", ui.mode);
+        ui.selected = row("rp1");
+        choose_pod_action(&shared, &mut ui, &fleet, Action::Stop);
+        assert!(matches!(&ui.mode, Mode::Confirm(c) if c.action == Action::Stop), "{:?}", ui.mode);
+        // The menus.
+        ui.mode = Mode::FleetMenu { scope: Scope::Marked, sel: 0 };
+        assert!(draw(120, 40, &shared.lock().unwrap(), &ui).join("\n").contains("[s] stop"));
+        ui.mode = Mode::FleetMenu { scope: Scope::All, sel: 0 };
+        assert!(!draw(120, 40, &shared.lock().unwrap(), &ui).join("\n").contains("[s] stop"));
+    }
+
+    /// The marked stop as it runs: the stoppable pods stopped (through the stop's outcome), the
+    /// skipped ones named after them, and a ✗ while one still bills (`pods stop` exits non-zero).
+    #[tokio::test]
+    async fn a_marked_stop_stops_the_rest_and_says_what_still_bills() {
+        /// Records each stop; a `shadeform` pod has no stop, as that backend says.
+        struct Stops(Mutex<Vec<String>>);
+        #[async_trait::async_trait]
+        impl Provider for Stops {
+            fn name(&self) -> &'static str {
+                "fleet"
+            }
+            fn describe(&self, _spec: &PodSpec) -> String {
+                String::new()
+            }
+            async fn list_pods(&self) -> arena_core::Result<Vec<Pod>> {
+                Ok(vec![])
+            }
+            async fn create_pod(&self, _spec: &PodSpec) -> arena_core::Result<Pod> {
+                unimplemented!()
+            }
+            async fn stop_pod(&self, id: &str) -> arena_core::Result<()> {
+                assert_ne!(id, "sf1", "a pod with no stop was sent a stop");
+                self.0.lock().unwrap().push(id.to_string());
+                Ok(())
+            }
+            async fn restart_pod(&self, _id: &str) -> arena_core::Result<()> {
+                unimplemented!()
+            }
+            async fn terminate_pod(&self, _id: &str) -> arena_core::Result<()> {
+                unimplemented!()
+            }
+            fn stop_support(&self, pod: &Pod) -> arena_core::Result<()> {
+                match pod.provider.as_str() {
+                    "shadeform" => Err(arena_core::Error::NotImplemented("Shadeform has no stop (fake)".into())),
+                    _ => Ok(()),
+                }
+            }
+        }
+        let stops = Arc::new(Stops(Mutex::new(Vec::new())));
+        let provider: Arc<dyn Provider> = stops.clone();
+        let remote: Arc<dyn Remote> = Arc::new(FakeRemote::new());
+        let mut delta = pod("delta", "runpod", "rp4", 4, None);
+        delta.status = "EXITED".into();
+        let pods = vec![pod("alpha", "runpod", "rp1", 1, None), pod("mayor", "shadeform", "sf1", 5, None), delta, pod("bravo", "runpod", "rp2", 2, None)];
+        let out = execute_fleet(&provider, &remote, &cfg(""), Action::Stop, pods, None).await;
+        assert_eq!(
+            out,
+            "stop — 2/2 ok\n✓ stopped devtest-alpha\n✓ stopped devtest-bravo\n⊘ devtest-delta — skipped: not running or starting (EXITED)\n\
+             ⊘ devtest-mayor — skipped, still billing: Shadeform has no stop (fake)\n\
+             ✗ 1 pod(s) still billing — their provider has no stop: devtest-mayor (back up, then `arena pods terminate`)"
+        );
+        let mut stopped = stops.0.lock().unwrap().clone();
+        stopped.sort();
+        assert_eq!(stopped, ["rp1", "rp2"]);
+    }
+
+    /// `n` lists the fleet in the background: `listing…` at once, the dashboard drawing on;
+    /// the form opens when the listing lands, its names past the listed ones. Awaiting it in
+    /// the key loop froze the dashboard for as long as the slowest provider took.
+    #[tokio::test(start_paused = true)]
+    async fn n_lists_in_the_background_and_opens_the_form_when_it_lands() {
+        struct Slow;
+        #[async_trait::async_trait]
+        impl Provider for Slow {
+            fn name(&self) -> &'static str {
+                "runpod"
+            }
+            fn describe(&self, _spec: &PodSpec) -> String {
+                String::new()
+            }
+            async fn list_pods(&self) -> arena_core::Result<Vec<Pod>> {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                Ok(vec![Pod { id: "rp1".into(), name: "devtest-alpha".into(), provider: "runpod".into(), ..Default::default() }])
+            }
+            async fn create_pod(&self, _spec: &PodSpec) -> arena_core::Result<Pod> {
+                unimplemented!()
+            }
+            async fn stop_pod(&self, _id: &str) -> arena_core::Result<()> {
+                unimplemented!()
+            }
+            async fn restart_pod(&self, _id: &str) -> arena_core::Result<()> {
+                unimplemented!()
+            }
+            async fn terminate_pod(&self, _id: &str) -> arena_core::Result<()> {
+                unimplemented!()
+            }
+        }
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let mut ui = ui(cfg("RUNPOD_API_KEY=x\n"), Arc::new(FakeRemote::new()));
+        let provider: Arc<dyn Provider> = Arc::new(Slow);
+        start_new_pod_listing(&shared, &provider, &mut ui);
+        assert!(matches!(&ui.mode, Mode::Working(m) if m.starts_with("listing")), "{:?}", ui.mode);
+        assert!(shared.lock().unwrap().new_pod_listing.is_none(), "still listing");
+        tokio::time::sleep(Duration::from_secs(11)).await;
+        let listed = shared.lock().unwrap().new_pod_listing.take().expect("the listing landed");
+        let Mode::NewPod(form) = new_pod_mode(&ui, listed) else { panic!("no form") };
+        assert_eq!(form.free.first().map(String::as_str), Some("devtest-bravo"), "alpha is taken");
+        assert!(matches!(new_pod_mode(&ui, Err("vast 429".into())), Mode::Result(r) if r == "✗ list failed: vast 429"));
     }
 }
