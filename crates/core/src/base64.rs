@@ -28,7 +28,7 @@ pub(crate) fn encode(bytes: &[u8]) -> String {
 /// from a pod is checked, not trusted.
 pub(crate) fn decode(text: &str) -> Result<Vec<u8>, String> {
     let s = text.as_bytes();
-    if s.len() % 4 != 0 {
+    if !s.len().is_multiple_of(4) {
         return Err(format!("base64 length {} is not a multiple of 4", s.len()));
     }
     let value = |c: u8| -> Option<u32> {

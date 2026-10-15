@@ -183,7 +183,7 @@ impl Provider for MultiProvider {
         // Ask the backend that owns the pod: by its `provider` tag first (as `enrich`),
         // else the id→backend cache. A pod no backend claims is assumed to wipe — the
         // answer only ever adds a confirmation, never removes one.
-        self.owner_of(pod).map_or(true, |i| self.backends[i].restart_wipes_container_disk(pod))
+        self.owner_of(pod).is_none_or(|i| self.backends[i].restart_wipes_container_disk(pod))
     }
     fn restart_resets_container(&self, pod: &Pod) -> ContainerReset {
         // The owner's answer too (RunPod v2's verified reset vs v1's unknown); no owner:
@@ -729,8 +729,11 @@ mod tests {
         name: &'static str,
         marker: u32,
         fail: bool,
-        seen: Arc<Mutex<Vec<Vec<String>>>>,
+        seen: Seen,
     }
+
+    /// Each `enrich` call's pod ids, in call order.
+    type Seen = Arc<Mutex<Vec<Vec<String>>>>;
 
     #[async_trait]
     impl Provider for FakeBackend {
@@ -767,7 +770,7 @@ mod tests {
         }
     }
 
-    fn backend(name: &'static str, marker: u32, fail: bool) -> (Box<dyn Provider>, Arc<Mutex<Vec<Vec<String>>>>) {
+    fn backend(name: &'static str, marker: u32, fail: bool) -> (Box<dyn Provider>, Seen) {
         let seen = Arc::new(Mutex::new(Vec::new()));
         (Box::new(FakeBackend { name, marker, fail, seen: seen.clone() }), seen)
     }

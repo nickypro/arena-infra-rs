@@ -503,7 +503,7 @@ done
         fn warned(out: &Output) -> String {
             assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stdout));
             let stderr = String::from_utf8_lossy(&out.stderr);
-            let last = stderr.lines().filter(|l| !l.trim().is_empty()).last().unwrap_or("").to_string();
+            let last = stderr.lines().rfind(|l| !l.trim().is_empty()).unwrap_or("").to_string();
             assert!(last.starts_with("vscode warm-up incomplete: "), "{stderr}");
             last
         }
@@ -590,7 +590,8 @@ done
 
         #[test]
         fn unexpected_update_api_answers_install_nothing() {
-            let cases: &[(&str, fn(String) -> String)] = &[
+            type Case = (&'static str, fn(String) -> String);
+            let cases: &[Case] = &[
                 ("html error page", |_| "<html><body>Service Unavailable</body></html>".into()),
                 ("no sha256", |j| j.replace("\"sha256hash\"", "\"sha1hash\"")),
                 ("short commit", |j| j.replace(&format!("\"version\":\"{COMMIT}\""), "\"version\":\"2a59476\"")),

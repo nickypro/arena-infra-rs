@@ -923,7 +923,7 @@ fn inv_ticket_iff_all_gates() {
         }
     }
     // splitmix64, seeded: reproducible.
-    let mut seed: u64 = 0x5EED_0F_A4E4;
+    let mut seed: u64 = 0x5EED0FA4E4;
     let mut next = || {
         seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = seed;

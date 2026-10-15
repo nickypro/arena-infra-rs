@@ -1436,7 +1436,8 @@ mod tests {
         let env = |pairs: &'static [(&'static str, &'static str)]| move |k: &str| {
             pairs.iter().find(|(key, _)| *key == k).map(|(_, v)| v.to_string())
         };
-        let cases: &[(&[(&str, &str)], &str, Result<&str, &str>)] = &[
+        type Case<'a> = (&'a [(&'a str, &'a str)], &'a str, Result<&'a str, &'a str>);
+        let cases: &[Case] = &[
             (&[("HOME", "/home/dev")], "devtest", Ok("/home/dev/.local/state/arena/devtest/health.json")),
             (&[("HOME", "/root"), ("XDG_STATE_HOME", "/var/state")], "arena9", Ok("/var/state/arena/arena9/health.json")),
             // A relative XDG_STATE_HOME is ignored (XDG spec).
@@ -1982,7 +1983,8 @@ mod tests {
         let snap = build(&pods, &[], Some(&text), &cache, &naming, NOW);
         let row = |name: &str| snap.pods.iter().find(|p| p.pod.name == name).unwrap();
         // (name, proxy port, proxy state, has health, list entry)
-        let cases: &[(&str, Option<u16>, ProxyState, bool, Option<&str>)] = &[
+        type Case = (&'static str, Option<u16>, ProxyState, bool, Option<&'static str>);
+        let cases: &[Case] = &[
             ("devtest-apple", Some(9500), ProxyState::Live, true, Some("apple")),
             ("devtest-bloom", Some(9501), ProxyState::Stale, false, Some("bloom")),
             ("devtest-cloud", Some(9502), ProxyState::Stale, false, Some("cloud")),
@@ -2332,7 +2334,7 @@ fleet: $0.17/h across 2 billing pod(s) (1 unpriced)
         let cfg = cfg();
         let naming = Naming::from_config(&cfg);
         let apple = at(pod("devtest-apple", "runpod", "rp1"), "10.0.0.1", 22001);
-        let full = public_json(&public_snapshot(&build(&[apple.clone()], &[], None, &HealthCache::new(), &naming, NOW), &naming));
+        let full = public_json(&public_snapshot(&build(std::slice::from_ref(&apple), &[], None, &HealthCache::new(), &naming, NOW), &naming));
         let none_listed = public_json(&public_snapshot(&build(&[], &[], None, &HealthCache::new(), &naming, NOW), &naming));
         let snap = |pods: &[Pod], partial: &[&str]| {
             let partial: Vec<String> = partial.iter().map(|p| p.to_string()).collect();

@@ -1437,7 +1437,7 @@ deep_check_end=1
             let h = PodHealth::checked(&p, parse_deep(&mig), &cuda13());
             assert_eq!(h.facts.as_ref().unwrap().gpu_label(), want);
             assert_eq!(check(&h.checks, "nvidia-smi").detail, format!("{want} (MIG slice of B300 SXM6 AC)"));
-            assert!(render_health_table(&[h.clone()]).contains(want), "GPUS column");
+            assert!(render_health_table(std::slice::from_ref(&h)).contains(want), "GPUS column");
             assert_eq!(h.status, Status::Pass);
         }
         // Not MIG: unchanged.

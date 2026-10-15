@@ -839,7 +839,8 @@ mod tests {
         assert_eq!(me, Some((a("203.0.113.9:50000"), 22)));
         let listen = [a("0.0.0.0:22"), a("0.0.0.0:8888")];
         // (case, established (local, remote), ssh, found, other)
-        let cases: Vec<(&str, Vec<(&str, &str)>, u32, bool, u32)> = vec![
+        type Case = (&'static str, Vec<(&'static str, &'static str)>, u32, bool, u32);
+        let cases: Vec<Case> = vec![
             ("only us", vec![("172.17.0.2:22", "203.0.113.9:50000")], 0, true, 0),
             ("us + VS Code via the proxy", vec![("172.17.0.2:22", "203.0.113.9:50000"), ("172.17.0.2:22", "198.51.100.7:61000")], 1, true, 0),
             ("same client ip, other port = another session", vec![("172.17.0.2:22", "203.0.113.9:50000"), ("172.17.0.2:22", "203.0.113.9:50001")], 1, true, 0),

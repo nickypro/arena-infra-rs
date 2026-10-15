@@ -670,6 +670,7 @@ pub fn open_pod_lock(local_backup_dir: &str, pod: &str) -> std::io::Result<std::
 /// held until dropped; `Ok(None)` no lock to take — a relative or missing backup dir, or a
 /// lock that can't be opened, as before the locks; `Err(())` another backup of the pod (a
 /// pull, the cron's push, the reaper) holds it.
+#[allow(clippy::result_unit_err)] // `Err(())` is only "busy": callers (cli, tui) branch on it, never report it
 pub fn try_pod_lock_now(local_backup_dir: &str, pod: &str) -> std::result::Result<Option<std::fs::File>, ()> {
     if !Path::new(local_backup_dir).is_absolute() {
         return Ok(None);
@@ -923,7 +924,7 @@ pub fn newest_baseline(base: &Path, week: Option<u32>) -> Option<PathBuf> {
         .flatten()
         .filter_map(|e| e.ok())
         .filter_map(|e| e.file_name().to_str()?.strip_prefix('w')?.parse::<u32>().ok())
-        .filter(|w| week.map_or(true, |max| *w <= max))
+        .filter(|w| week.is_none_or(|max| *w <= max))
         .collect();
     weeks.sort_unstable();
     weeks.into_iter().rev().map(|w| baseline_dir(base, w)).find(|d| non_empty_dir(d))
@@ -1059,7 +1060,7 @@ fn prune_dir(dir: &Path, rel: &Path, since: u64, copied: &BTreeSet<PathBuf>, s: 
         }
         let mtime = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs());
         let size = if m.is_file() { m.len() } else { 0 };
-        if mtime.map_or(true, |t| t >= since) || copied.contains(&rel) {
+        if mtime.is_none_or(|t| t >= since) || copied.contains(&rel) {
             std::fs::remove_file(entry.path())?;
             s.removed_files += 1;
             s.removed_bytes += size;
@@ -1144,6 +1145,7 @@ impl RsyncStats {
     }
 
     /// Two passes into one destination as one ([`PullConfig::passes`]).
+    #[allow(clippy::should_implement_trait)] // called as `a.add(b)` in arena-cli; an `impl Add` would only move those callers to `+`
     pub fn add(self, o: RsyncStats) -> RsyncStats {
         let sum = |a: Option<u64>, b: Option<u64>| match (a, b) {
             (None, None) => None,
@@ -1716,8 +1718,7 @@ mod tests {
 
     #[test]
     fn honors_custom_remote_path() {
-        let mut pc = PullConfig::default();
-        pc.remote_path = "ARENA_3.0/results".into();
+        let pc = PullConfig { remote_path: "ARENA_3.0/results".into(), ..Default::default() };
         let a = rsync_args(&target(), &pc, "./out/");
         assert_eq!(a[a.len() - 2], "root@1.2.3.4:ARENA_3.0/results");
     }

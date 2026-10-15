@@ -512,7 +512,7 @@ pub fn link_labels_for(label: &str, pod: &str, state: &SnapState) -> Vec<String>
         .filter_map(|(l, _)| Some((l, parse_label(l)?)))
         .filter(|(_, k)| *k < key)
         .collect();
-    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v.sort_by_key(|&(_, k)| std::cmp::Reverse(k));
     v.into_iter().take(MAX_LINK_LABELS).map(|(l, _)| l.clone()).collect()
 }
 
@@ -1509,7 +1509,7 @@ pub fn bwlimit_bytes(bwlimit: Option<&str>) -> Option<u64> {
         _ => return None,
     };
     let v: f64 = num.parse().ok()?;
-    (v > 0.0).then(|| (v * mul as f64) as u64)
+    (v > 0.0).then_some((v * mul as f64) as u64)
 }
 
 #[cfg(test)]
@@ -2107,7 +2107,8 @@ mod tests {
     #[test]
     fn push_failures_are_classified_from_what_rsync_and_ssh_say() {
         use PushFailure::*;
-        let cases: Vec<(Option<i32>, &str, bool, Result<bool, PushFailure>)> = vec![
+        type Case = (Option<i32>, &'static str, bool, Result<bool, PushFailure>);
+        let cases: Vec<Case> = vec![
             (Some(0), "", false, Ok(false)),
             (Some(24), "file has vanished: \"/b/w1d1/x\"", false, Ok(true)),
             (Some(11), "rsync: [Receiver] write failed on \"/srv/arena/push/big/arena9-apple/ckpt.pt\": No space left on device (28)", false, Err(NoSpace)),

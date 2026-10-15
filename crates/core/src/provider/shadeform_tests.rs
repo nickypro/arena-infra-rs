@@ -485,7 +485,7 @@ async fn placement_stops_on_an_unsure_create() {
     let req = Request { gpus: vec!["NVIDIA RTX A6000".into(), "NVIDIA L40S".into()], clouds: vec!["COMMUNITY".into()], gpu_count: 1, max_price: None, order: Order::Listed };
     let plan = plan_options(&req, "shadeform", &PriceBook::unpriced());
     let rounds = Rounds { window: Duration::ZERO, every: Duration::from_secs(1) };
-    let placed = place(&p, &base, &["devtest-alpha".to_string()], &plan, rounds, None, || std::future::pending::<()>(), &mut |_| {}).await;
+    let placed = place(&p, &base, &["devtest-alpha".to_string()], &plan, rounds, None, std::future::pending::<()>, &mut |_| {}).await;
     assert!(matches!(placed.end, End::Failed { .. }), "{:?}", placed.end);
     assert!(placed.created.is_empty());
     assert_eq!(posts(&srv), 1, "one create, no second option");

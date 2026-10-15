@@ -750,6 +750,7 @@ impl Progress<'_> {
 /// ends the run between rounds, keeping what was made. The option order is the confirmed
 /// plan's — fixed for the run — and every create carries its `--max-price`
 /// ([`PodSpec::max_price`]), which a marketplace backend enforces on the offer it rents.
+#[allow(clippy::too_many_arguments)] // the run's independent inputs; a one-use struct for them would add nothing
 pub async fn place<W, F>(
     provider: &dyn Provider,
     base: &PodSpec,

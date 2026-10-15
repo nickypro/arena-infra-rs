@@ -378,7 +378,7 @@ pub fn newer_on_pod(stdout: &str) -> Vec<String> {
 /// be checked afterwards? `src` = the backup, `subpath` its `--path`, `git` = .git pushed at all.
 pub fn pushes_repo_git(src: &Path, subpath: Option<&str>, rel: &str, git: bool) -> bool {
     let inside = |p: &str| rel == p || rel.starts_with(&format!("{p}/")) || p == format!("{rel}/.git") || p.starts_with(&format!("{rel}/.git/"));
-    git && subpath.map_or(true, inside) && src.join(rel).join(".git").is_dir()
+    git && subpath.is_none_or(inside) && src.join(rel).join(".git").is_dir()
 }
 
 /// The read-only check after a restore that pushed the repo's `.git`: git can still resolve
@@ -531,7 +531,8 @@ mod tests {
     fn a_snapshot_written_after_the_reset_is_flagged_with_the_one_before_it() {
         const RESET: u64 = 1_791_400_000;
         // (label, last written, container created, earlier snapshot, warns)
-        let cases: &[(&str, Option<u64>, Option<u64>, Option<&str>, bool)] = &[
+        type Case = (&'static str, Option<u64>, Option<u64>, Option<&'static str>, bool);
+        let cases: &[Case] = &[
             ("w1d2", Some(RESET + 900), Some(RESET), Some("w1d1"), true),
             ("big", Some(RESET + 900), Some(RESET), Some("w1d2"), true),
             // written before the reset: it holds the work

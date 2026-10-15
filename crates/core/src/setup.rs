@@ -887,7 +887,7 @@ fn optional_failure(call: Result<crate::ssh::SshOutput>) -> Option<String> {
         Ok(out) if out.success => None,
         Ok(out) => {
             let exit = out.exit_label();
-            let last = out.stderr.lines().map(str::trim).filter(|l| !l.is_empty()).last().unwrap_or("");
+            let last = out.stderr.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("");
             Some(if last.is_empty() { exit } else { format!("{exit}: {}", crate::fleet::clip_middle(last, WARNING_MAX_CHARS)) })
         }
         Err(Error::Timeout { after, .. }) => Some(format!("timed out after {}", human_duration(&after))),
@@ -1191,7 +1191,8 @@ mod tests {
             SetupTimeouts::resolve(cfg, flag).map(|t| (t.copy, t.config, t.bare_vm))
         };
         // (config value, --timeout) -> (copy, config, bare_vm)
-        let table: &[(Option<&str>, Option<u64>, (Duration, Duration, Duration))] = &[
+        type Row = (Option<&'static str>, Option<u64>, (Duration, Duration, Duration));
+        let table: &[Row] = &[
             (None, None, (secs(60), secs(300), secs(1800))),
             (Some(""), None, (secs(60), secs(300), secs(1800))),
             (Some(" 900 "), None, (secs(60), secs(900), secs(900))),

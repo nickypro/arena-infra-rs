@@ -1289,7 +1289,7 @@ mod tests {
             // $0.10 listed, but $0.30 + 100 GB at $0.50/GB/month = $0.369 at our disk.
             ("over the cap at our disk", with(&[("dph_base", json!(0.30)), ("storage_cost", json!(0.50))])),
         ] {
-            assert_eq!(pick(&[bad.clone()], true), None, "{why}: alone");
+            assert_eq!(pick(std::slice::from_ref(&bad), true), None, "{why}: alone");
             assert_eq!(pick(&[bad, ok.clone()], true), Some(2), "{why}: beside a good one");
         }
         // Unverified hosts are fine once allowed; with no CUDA floor, unknown CUDA is too.
@@ -1356,7 +1356,8 @@ mod tests {
         let gone_410 = r#"{"success": false, "error": "no_such_ask", "msg": "error 410/3907: no_such_ask Instance type 1234567 is no longer available.", "ask_id": 1234567}"#;
         let not_ours = r#"{"success": false, "error": "invalid_args", "msg": "error 403/3586: Offer 1234567 is not your own. Hosts can only rent their machines.", "ask_id": 1234567}"#;
         // (case, status, body, Ok id / Err kind)
-        let cases: Vec<(&str, u16, &str, std::result::Result<u64, Option<K>>)> = vec![
+        type Case = (&'static str, u16, &'static str, std::result::Result<u64, Option<K>>);
+        let cases: Vec<Case> = vec![
             ("rented", 200, r#"{"success": true, "new_contract": 7835610}"#, Ok(7835610)),
             ("id as string", 200, r#"{"success": true, "new_contract": "7835610"}"#, Ok(7835610)),
             ("offer gone (docs' 404)", 404, gone_404, Err(Some(K::Capacity))),

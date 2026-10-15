@@ -667,7 +667,9 @@ fn judge_gpu(rcs: &[&str], lines: &[&str]) -> Result<GpuFacts, ProbeError> {
     if rc_of.keys().copied().ne(1..=rc_of.len() as u64) {
         return Err(Garbled);
     }
-    let mut per: BTreeMap<u64, Vec<(Option<u32>, Option<u64>)>> = BTreeMap::new();
+    /// One GPU in one sample: its utilization (%) and memory used (MiB); `None` = unreadable.
+    type GpuReading = (Option<u32>, Option<u64>);
+    let mut per: BTreeMap<u64, Vec<GpuReading>> = BTreeMap::new();
     for l in lines {
         let (k, rest) = l.split_once(' ').ok_or(Garbled)?;
         let k = digits(k).filter(|k| rc_of.contains_key(k)).ok_or(Garbled)?;

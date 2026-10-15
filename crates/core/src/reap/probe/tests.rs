@@ -346,7 +346,7 @@ fn the_script_runs_under_sh() {
         assert_eq!(f.tmux_busy, Some(1), "{case}: python3 in a pane");
         assert_eq!(f.who, Some(0));
         assert_eq!(f.repo, RepoSite::Absent);
-        assert!(f.t1 >= f.t0 + 1 && f.now >= f.t1, "{case}");
+        assert!(f.t1 > f.t0 && f.now >= f.t1, "{case}");
         // A fresh HOME was created moments ago: its own ctime is a change.
         assert_eq!(f.files, Files::Hit, "{case}");
         assert!(f.boot_id.is_some(), "{case}");

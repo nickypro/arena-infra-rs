@@ -683,7 +683,7 @@ mod tests {
         let mut items: Vec<&str> = out.lines().filter_map(|l| l.strip_prefix("item=")).map(|l| l.split('\t').nth(1).unwrap()).collect();
         items.sort();
         assert_eq!(items, ["big/devtest-bravo", "snap/mylabel/devtest-bravo", "snap/w0d1/devtest-bravo", "snap/w0d2/devtest-bravo-old"], "{out}");
-        assert!(m["bytes"].parse::<u64>().unwrap() > 0 && m.get("forget_done").is_some(), "{m:?}");
+        assert!(m["bytes"].parse::<u64>().unwrap() > 0 && m.contains_key("forget_done"), "{m:?}");
         assert!(root.join("snap/w0d1/devtest-bravo").exists(), "measuring deletes nothing");
         // A volume not mounted: nothing deleted.
         mounted(false);

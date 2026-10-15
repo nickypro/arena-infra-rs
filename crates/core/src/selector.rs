@@ -183,7 +183,7 @@ impl Token {
     fn matching(&self, naming: &Naming, pods: &[Pod]) -> Vec<usize> {
         let hit = |p: &Pod| match self {
             Token::Name(t) => naming.matches(p, t),
-            Token::Range { names, .. } => names.iter().any(|n| *n == p.name),
+            Token::Range { names, .. } => names.contains(&p.name),
             Token::All => true,
         };
         (0..pods.len()).filter(|&i| hit(&pods[i])).collect()
@@ -508,8 +508,8 @@ fn edit_distance(a: &str, b: &str) -> usize {
     for (i, row) in d.iter_mut().enumerate() {
         row[0] = i;
     }
-    for j in 0..=b.len() {
-        d[0][j] = j;
+    for (j, cell) in d[0].iter_mut().enumerate() {
+        *cell = j;
     }
     for i in 1..=a.len() {
         for j in 1..=b.len() {

@@ -280,7 +280,8 @@ fn best_os_on_every_recorded_image() {
     }
     let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     let f13 = Some((13, 0));
-    let cases: &[(&[&str], Option<(u32, u32)>, Option<&str>)] = &[
+    type Case<'a> = (&'a [&'a str], Option<(u32, u32)>, Option<&'a str>);
+    let cases: &[Case] = &[
         (&["ubuntu22.04_cuda12.8_shade_os", "ubuntu22.04_cuda12.2_shade_os", "ubuntu22.04"], f13, None),
         (&["ubuntu22.04_cuda12.8_shade_os", "ubuntu22.04_cuda12.2_shade_os", "ubuntu22.04"], Some((12, 0)), Some("ubuntu22.04_cuda12.8_shade_os")),
         (&["ubuntu22.04_cuda12.8_shade_os", "ubuntu22.04_cuda12.2_shade_os", "ubuntu22.04"], None, Some("ubuntu22.04_cuda12.8_shade_os")),

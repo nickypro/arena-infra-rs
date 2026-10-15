@@ -824,8 +824,11 @@ pub async fn fetch_gpu_types(api_key: &str, cloud: &str, min_cuda: Option<&str>)
 /// the keys include the API key, and must never be printed.
 #[derive(Default)]
 pub struct CatalogCache {
-    entries: Mutex<HashMap<(String, &'static str), std::result::Result<Vec<GpuType>, String>>>,
+    entries: Mutex<HashMap<(String, &'static str), CatalogAnswer>>,
 }
+
+/// One cached catalog lookup: the tier's GPU types, or why there are none (ready to print).
+type CatalogAnswer = std::result::Result<Vec<GpuType>, String>;
 
 impl CatalogCache {
     /// The catalog for `cloud` with this `api_key`: cached, or `fetch(tier)`'s answer
@@ -1610,7 +1613,8 @@ mod tests {
     fn a_network_volume_next_to_the_pod_volume_is_refused() {
         let network = json!({"mounts": {"network": [{"volumeId": "v", "path": "/data"}]}});
         // (case, volume_gb, extra, Ok(mounts) / Err(what the refusal says))
-        let cases: [(&str, u32, Option<Value>, std::result::Result<Option<Value>, &str>); 5] = [
+        type Case = (&'static str, u32, Option<Value>, std::result::Result<Option<Value>, &'static str>);
+        let cases: [Case; 5] = [
             ("network + pod volume", 20, Some(network.clone()), Err("pass --volume 0")),
             ("network: null + pod volume", 20, Some(json!({"mounts": {"network": null}})), Err("replaces the pod volume")),
             ("network alone", 0, Some(network.clone()), Ok(Some(json!({"network": [{"volumeId": "v", "path": "/data"}]})))),

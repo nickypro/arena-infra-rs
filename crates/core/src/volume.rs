@@ -964,7 +964,8 @@ mod tests {
     #[test]
     fn remote_paths_resolve_as_rsync_reads_them_or_not_at_all() {
         // (remote path, home, resolved)
-        let cases: &[(&str, &str, Option<(&str, bool)>)] = &[
+        type Case = (&'static str, &'static str, Option<(&'static str, bool)>);
+        let cases: &[Case] = &[
             ("", "/root", Some(("/root", true))),
             ("~", "/root", Some(("/root", false))),
             ("~/", "/root/", Some(("/root", true))),
@@ -997,7 +998,8 @@ mod tests {
         let plain = RepoProbe { real: Some(CFG.into()), ..linked.clone() };
         let pull = |rel: &str, source: &str, whole: bool| Ok(Some(RepoPull { rel: rel.into(), source: source.into(), whole }));
         // (remote path, probe, plan)
-        let cases: Vec<(&str, Option<&RepoProbe>, Result<Option<RepoPull>, String>)> = vec![
+        type Case<'a> = (&'a str, Option<&'a RepoProbe>, Result<Option<RepoPull>, String>);
+        let cases: Vec<Case> = vec![
             // the home, however it's spelled with its contents: the home split
             ("~/", Some(&linked), pull("ARENA_materials", "/workspace/ARENA_materials/", false)),
             ("/root/", Some(&linked), pull("ARENA_materials", "/workspace/ARENA_materials/", false)),

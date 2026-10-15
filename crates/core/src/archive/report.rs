@@ -982,7 +982,8 @@ mod tests {
         assert!(healthy.ok(), "{}", healthy.render());
         assert_eq!(healthy.count(Level::Warn), 0, "{}", healthy.render());
 
-        let cases: Vec<(&str, Box<dyn Fn(&mut ProbeReport)>, &str, Level)> = vec![
+        type Case = (&'static str, Box<dyn Fn(&mut ProbeReport)>, &'static str, Level);
+        let cases: Vec<Case> = vec![
             ("volume missing", Box::new(|p| p.big.mounted = false), "mount big", Level::Fail),
             ("wrong device", Box::new(|p| p.snap.source = "/dev/sda1".into()), "mount snap", Level::Fail),
             ("bind not ro", Box::new(|p| p.snap.bind_ro = false), "view snap", Level::Fail),

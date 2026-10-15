@@ -551,7 +551,8 @@ mod tests {
     #[test]
     fn up_refuses_every_ambiguous_inventory() {
         let base = all_present();
-        let cases: Vec<(&str, Box<dyn Fn(&mut Inventory)>, &str)> = vec![
+        type Case = (&'static str, Box<dyn Fn(&mut Inventory)>, &'static str);
+        let cases: Vec<Case> = vec![
             ("two servers", Box::new(|i| i.servers.push(CloudServer { id: 9, ..server(9, true) })), "2 servers"),
             ("duplicate tier", Box::new(|i| i.volumes.push(vol(9, Tier::Snap, None, true))), "two snap volumes"),
             ("attached elsewhere", Box::new(|i| i.volumes[1].server = Some(77)), "attached to server 77"),

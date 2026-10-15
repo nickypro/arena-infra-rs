@@ -460,9 +460,13 @@ impl Entry {
     }
 }
 
+/// A `major.minor` version (an Ubuntu release, a CUDA version), compared numerically — as
+/// [`crate::pod::cuda_key`] reads one.
+type Version = (u32, u32);
+
 /// `ubuntu22.04_cuda13.0_shade_os` → (ubuntu (22, 4), CUDA (13, 0)); `ubuntu22.04` → no CUDA.
 /// `None` for anything else (it isn't asked for). Pure.
-pub fn parse_os(s: &str) -> Option<((u32, u32), Option<(u32, u32)>)> {
+pub fn parse_os(s: &str) -> Option<(Version, Option<Version>)> {
     let rest = s.trim().strip_prefix("ubuntu")?;
     let (ver, rest) = rest.split_once('_').unwrap_or((rest, ""));
     let ubuntu = crate::pod::cuda_key(ver)?;
@@ -1092,6 +1096,7 @@ pub const PRICE_READS: [Duration; 5] =
     [Duration::from_secs(1), Duration::from_secs(2), Duration::from_secs(4), Duration::from_secs(8), Duration::from_secs(15)];
 
 /// What settling a created instance came to ([`ShadeformProvider::settle`]).
+#[allow(clippy::large_enum_variant)] // a return value matched at once, never stored: boxing the pod buys nothing
 enum Settled {
     /// Priced, within the cap and the quote: the pod.
     Pod(Pod),

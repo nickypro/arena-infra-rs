@@ -1000,7 +1000,8 @@ mod tests {
     #[test]
     fn logs_arguments_split_into_targets_and_one_job() {
         let w = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let cases: &[(&[&str], Result<(&[&str], Option<&str>), &str>)] = &[
+        type Case<'a> = (&'a [&'a str], Result<(&'a [&'a str], Option<&'a str>), &'a str>);
+        let cases: &[Case] = &[
             (&[], Ok((&[], None))),
             (&["apple", "bloom..cloud"], Ok((&["apple", "bloom..cloud"], None))),
             (&["20261008-142301-pytest"], Ok((&[], Some("20261008-142301-pytest")))),

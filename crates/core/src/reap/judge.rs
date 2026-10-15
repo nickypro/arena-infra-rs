@@ -524,7 +524,7 @@ pub fn late_process(f: &ProbeFacts, baseline: Option<&ProcBaseline>) -> Option<b
     let container = f.container();
     let first_boot = baseline.is_none_or(|b| Some(&b.container) == container.as_ref());
     let known = baseline.map(|b| &b.hashes);
-    Some(procs.iter().any(|p| !p.idle && !known.is_some_and(|h| h.contains(&p.hash)) && !(first_boot && p.start <= end)))
+    Some(procs.iter().any(|p| !(p.idle || known.is_some_and(|h| h.contains(&p.hash)) || (first_boot && p.start <= end))))
 }
 
 /// The pod's process baseline after a look (RS7c): taken at its first look — the processes of
