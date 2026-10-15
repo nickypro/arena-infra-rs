@@ -771,7 +771,8 @@ enum PodCmd {
     ///
     /// Each pod runs its own pipeline (SSH endpoint → proxy → setup → --check → API keys) and
     /// prints READY or FAILED <stage> as soon as it's done; one slow pod never holds up another.
-    /// Exits non-zero unless every requested name is READY. A pod that fails is left running.
+    /// Exits non-zero unless every requested name is READY. A pod that fails is left running
+    /// (Shadeform: deleted, since it can't be stopped and bills until then).
     ///
     /// --check: a pod that FAILs the deep check on its host (driver, CUDA, GPU) is TERMINATED and
     /// its name recreated, up to --check-attempts. A software/setup failure isn't replaced.
