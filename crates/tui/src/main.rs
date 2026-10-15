@@ -1230,7 +1230,7 @@ fn gpu_type_choices(cfg: &Config) -> Vec<String> {
         out.push(default);
     }
     for api in arena_core::gpu::preset_apis() {
-        if !out.iter().any(|x| *x == api) {
+        if !out.contains(&api) {
             out.push(api);
         }
     }
@@ -1317,6 +1317,7 @@ fn create_extra(provider: &dyn Provider, cfg: &Config) -> arena_core::Result<Opt
 /// Each create is gated by the add-pod form's Enter, mirroring `arena pods create` —
 /// config `CREATE_EXTRA_JSON` included (a bad one creates nothing and says why), and the
 /// prices the creates answered with remembered for the balance.
+#[allow(clippy::too_many_arguments)] // the add-pod form's fields, one argument each (as `arena pods create`'s flags)
 async fn create_pods(
     provider: &Arc<dyn Provider>,
     cfg: &Config,
@@ -2580,7 +2581,7 @@ fn detail_pane(f: &mut Frame, shared: &Shared, ui: &Ui, area: Rect) {
             .map(|m| {
                 // Biggest VRAM first — surface the "main" jobs, not idle ~300M helpers.
                 let mut procs: Vec<&metrics::GpuProc> = m.gpu_procs.iter().collect();
-                procs.sort_by(|a, b| b.mem_mb.unwrap_or(0).cmp(&a.mem_mb.unwrap_or(0)));
+                procs.sort_by_key(|p| std::cmp::Reverse(p.mem_mb.unwrap_or(0)));
                 procs
                     .into_iter()
                     .take(n_procs)

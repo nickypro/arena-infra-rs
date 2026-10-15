@@ -2526,7 +2526,7 @@ pub fn preflight_lines_with(v: &AccountView, new: NewPods, policy: &BalancePolic
         }
     }
     if runpod && unpriced_new {
-        out.push(format!("⚠ the new pods' price is unknown — RunPod's \"≥1h of credit\" and spend-limit checks couldn't run"));
+        out.push("⚠ the new pods' price is unknown — RunPod's \"≥1h of credit\" and spend-limit checks couldn't run".to_string());
     }
     if let (Some(limit), Some(b), Some(x)) = (v.spend_limit_per_hr, now_burn, added) {
         if b + x > limit {
@@ -3606,7 +3606,8 @@ mod tests {
         empty["records"] = json!([]);
         assert_eq!(parse_billing(&empty).unwrap().buckets, vec![]);
         // (case, mutation, detail needle)
-        let bad: Vec<(&str, Box<dyn Fn(&mut Value)>, &str)> = vec![
+        type Case = (&'static str, Box<dyn Fn(&mut Value)>, &'static str);
+        let bad: Vec<Case> = vec![
             ("empty object", Box::new(|v: &mut Value| *v = json!({})), "no metadata.query"),
             ("negative", Box::new(|v: &mut Value| v["records"][1]["totalAmount"] = json!(-0.5)), "negative"),
             ("not a number", Box::new(|v: &mut Value| v["records"][0]["totalAmount"] = json!("x")), "totalAmount"),
@@ -3667,7 +3668,8 @@ mod tests {
     #[test]
     fn metered_spend_table() {
         // (case, anchor_at, samples, now, b_now, want USD)
-        let cases: Vec<(&str, u64, Vec<(u64, f64)>, u64, f64, f64)> = vec![
+        type Case = (&'static str, u64, Vec<(u64, f64)>, u64, f64, f64);
+        let cases: Vec<Case> = vec![
             ("no samples: B over the whole span", NOW - 2 * H, vec![], NOW, 0.5, 1.0),
             ("constant", NOW - 2 * H, vec![(NOW - 3 * H, 1.0), (NOW - H, 1.0)], NOW, 1.0, 2.0),
             // A step up between samples is charged at the higher end for that segment.
@@ -3689,7 +3691,8 @@ mod tests {
     fn burn_now_rules() {
         let listed = Some(Burn { per_hr: 0.4, unpriced: 1, stale: false, ..Default::default() });
         // (case, listed, provider rate, samples, want)
-        let cases: Vec<(&str, Option<Burn>, Option<f64>, Vec<(u64, f64)>, Option<Burn>)> = vec![
+        type Case = (&'static str, Option<Burn>, Option<f64>, Vec<(u64, f64)>, Option<Burn>);
+        let cases: Vec<Case> = vec![
             ("listing + provider: the higher", listed, Some(0.6), vec![], Some(Burn { per_hr: 0.6, unpriced: 0, stale: false, ..Default::default() })),
             ("listing above provider", listed, Some(0.1), vec![], Some(Burn { per_hr: 0.4, unpriced: 0, stale: false, ..Default::default() })),
             ("listing alone keeps its unpriced floor", listed, None, vec![], listed),
@@ -3738,7 +3741,8 @@ mod tests {
             level(bal, under, burn.as_ref(), runway, &p(pol))
         };
         // (case, balance, underBalance, burn/h, warn hours, want)
-        let cases: Vec<(&str, Option<f64>, Option<bool>, Option<Burn>, f64, Level)> = vec![
+        type Case = (&'static str, Option<f64>, Option<bool>, Option<Burn>, f64, Level);
+        let cases: Vec<Case> = vec![
             ("23.9h", Some(23.9), None, Some(b(1.0)), 72.0, Level::Critical),
             ("24h", Some(24.0), None, Some(b(1.0)), 72.0, Level::Low),
             ("71.9h", Some(71.9), None, Some(b(1.0)), 72.0, Level::Low),
@@ -3832,7 +3836,8 @@ mod tests {
         };
         let billing = |usd: f64| Billed { buckets: vec![(NOW - 2 * H, usd)], from: NOW - 3 * H, to: NOW + H };
         // (case, state, fetched, mode, want source, want balance, want method)
-        let cases: Vec<(&str, AccountState, Fetched, Mode, Source, Option<f64>, Option<Method>)> = vec![
+        type Case = (&'static str, AccountState, Fetched, Mode, Source, Option<f64>, Option<Method>);
+        let cases: Vec<Case> = vec![
             ("live this run", AccountState::default(), ok(live(32.54, None)), Mode::Inline, Source::Live, Some(32.54), None),
             ("fresh cache", with_facts(NOW - 100), none(), Mode::Inline, Source::Live, Some(40.0), None),
             ("fresh cache, --no-live", with_facts(NOW - 100), none(), Mode::NoLive, Source::Estimate, Some(40.0 - 100.0 / 3_600.0), Some(Method::Metered)),
@@ -3864,6 +3869,10 @@ mod tests {
         assert_eq!((v.source, v.balance), (Source::Live, Some(31.0)));
     }
 
+    /// Scripted billing: its answer at `t`, given the true spend between two times
+    /// (`spent(t0, t1)`); `None` = not fetched.
+    type Billing = dyn Fn(u64, &dyn Fn(u64, u64) -> f64) -> Option<std::result::Result<Billed, Fail>>;
+
     /// One scripted run: a live anchor, then live gone; observations at `times`, the listed
     /// burn changing at `changes` (each visible at the next observation), a listing that
     /// may fail, `unlisted` USD/h more that only billing sees (volumes, stopped disks), and
@@ -3874,7 +3883,7 @@ mod tests {
         times: &[u64],
         list_fails: &[u64],
         unlisted: f64,
-        billing: &dyn Fn(u64, &dyn Fn(u64, u64) -> f64) -> Option<std::result::Result<Billed, Fail>>,
+        billing: &Billing,
     ) -> Vec<(u64, f64, f64)> {
         let start = NOW - 10 * H;
         let a0 = 100.0;
@@ -3928,7 +3937,7 @@ mod tests {
         Billed { buckets, from, to: floor_hour(t) + H }
     }
 
-    fn scenarios() -> Vec<(&'static str, Box<dyn Fn(u64, &dyn Fn(u64, u64) -> f64) -> Option<std::result::Result<Billed, Fail>>>)> {
+    fn scenarios() -> Vec<(&'static str, Box<Billing>)> {
         vec![
             ("complete", Box::new(|t, s| Some(Ok(billing_at(t, s, 0, 1.0))))),
             ("lagging 2h", Box::new(|t, s| Some(Ok(billing_at(t, s, 2, 1.0))))),
@@ -3939,9 +3948,12 @@ mod tests {
         ]
     }
 
+    /// (name, listed burn changes `(at, USD/h)`, observation times, failed-listing times).
+    type History = (&'static str, Vec<(u64, f64)>, Vec<u64>, Vec<u64>);
+
     /// Burn histories: steps up and down between observations, idle spells, a failed
     /// listing (while the rate holds), irregular observation times.
-    fn histories() -> Vec<(&'static str, Vec<(u64, f64)>, Vec<u64>, Vec<u64>)> {
+    fn histories() -> Vec<History> {
         let start = NOW - 10 * H;
         let every = |step: u64| (1..=(9 * H / step)).map(|i| start + i * step).collect::<Vec<_>>();
         vec![
@@ -4065,7 +4077,7 @@ mod tests {
 
         // Reduced: recorded while only the minimal query works, cleared when the full one does.
         let reduced = fetched(Account::Runpod, Some(Ok(Live { reduced: true, ..live(29.0, None) })), None);
-        s = apply(s, &[reduced.clone()], &b, Mode::Inline, NOW + 7 * H);
+        s = apply(s, std::slice::from_ref(&reduced), &b, Mode::Inline, NOW + 7 * H);
         s = apply(s, &[reduced], &b, Mode::Inline, NOW + 8 * H);
         assert_eq!(s.accounts[&Account::Runpod].live_reduced.as_ref().map(|r| (r.since, r.last)), Some((NOW + 7 * H, NOW + 8 * H)));
         s = apply(s, &[ok(28.0)], &b, Mode::Inline, NOW + 9 * H);
@@ -4179,9 +4191,9 @@ mod tests {
         // $0.00, never no burn.
         let v = one_view(&BalanceState::default(), &fetched(Account::Runpod, Some(Err(gone())), None), None, Mode::Inline, NOW);
         assert_eq!((v.balance, v.burn, v.level), (None, None, Level::Unknown));
-        let line = footer_line(&[v.clone()], &policy(), NOW).unwrap();
+        let line = footer_line(std::slice::from_ref(&v), &policy(), NOW).unwrap();
         assert_eq!(line, "balance: runpod ? (no reading — arena balance set runpod <USD>) ?");
-        let table = super::render_table(&[v.clone()], NOW);
+        let table = super::render_table(std::slice::from_ref(&v), NOW);
         assert!(!table.contains("$0.00") && !table.contains("no burn") && !table.contains("∞"), "{table}");
         // Burning with no balance: the burn is said.
         let v = one_view(&BalanceState::default(), &fetched(Account::Runpod, Some(Err(gone())), None), burn(0.47), Mode::Inline, NOW);
@@ -4371,7 +4383,7 @@ mod tests {
         assert_eq!(tui_parts(&[ok.clone(), est]), (None, Some("runpod $48.00 ≈4.0d · vast ~$118.30 est. ≈49.2d".into()), Level::Ok));
         let low = lv(Account::Runpod, 31.2, 0.68);
         let crit = lv(Account::Vast, 3.0, 0.5);
-        assert_eq!(tui_parts(&[low.clone()]), (Some(" ⚠ runpod balance ≈45h ·".into()), None, Level::Low));
+        assert_eq!(tui_parts(std::slice::from_ref(&low)), (Some(" ⚠ runpod balance ≈45h ·".into()), None, Level::Low));
         assert_eq!(tui_parts(&[low, crit]), (Some(" ⚠ runpod balance ≈45h · ‼ vast balance ≈6.0h ·".into()), None, Level::Critical));
         assert_eq!(tui_parts(&[]), (None, None, Level::Ok));
     }
@@ -4710,9 +4722,7 @@ mod tests {
         let req = crate::provider::vast::user_request(&c, "https://console.vast.ai/api/v0", "VSECRET").build().unwrap();
         assert_eq!((req.method(), req.url().as_str()), (&reqwest::Method::GET, "https://console.vast.ai/api/v0/users/current/"));
         assert_eq!(req.headers()["authorization"], "Bearer VSECRET");
-        for r in [&req] {
-            assert!(!r.url().as_str().contains("SECRET") && r.body().is_none());
-        }
+        assert!(!req.url().as_str().contains("SECRET") && req.body().is_none());
     }
 
     /// Invariant 1: every request the HTTP API sends is a GraphQL POST of a *query* (no
@@ -4818,7 +4828,7 @@ mod tests {
     async fn inline_billing_only_while_live_failing() {
         let fp = FakeBalanceApi::fp(Account::Runpod);
         let state = |fail: bool| {
-            let lf = fail.then(|| FailRecord { kind: FailKind::Gone, http: Some(410), detail: None, since: NOW - 3 * H, last: NOW - H });
+            let lf = fail.then_some(FailRecord { kind: FailKind::Gone, http: Some(410), detail: None, since: NOW - 3 * H, last: NOW - H });
             let mut s = BalanceState::default();
             s.accounts.insert(
                 Account::Runpod,
@@ -5012,9 +5022,12 @@ mod tests {
 
     // ---- Review fixes: the fallback check, `billed_max`, stand-in prices, writability ----
 
+    /// One step of [`check_run`]: `(when, live USD, mode, billing)`.
+    type Step = (u64, f64, Mode, Option<std::result::Result<Billed, Fail>>);
+
     /// RunPod lists $1/h of pods but reports $1.50/h (volumes, stopped disks); live $100 at
     /// t0. Returns the account after `steps` of `(when, live USD, mode, billing)`.
-    fn check_run(steps: &[(u64, f64, Mode, Option<std::result::Result<Billed, Fail>>)]) -> AccountState {
+    fn check_run(steps: &[Step]) -> AccountState {
         let listed = burns_of(burn(1.0), None);
         let mut s = BalanceState::default();
         for (t, usd, mode, billed) in steps {
@@ -5095,7 +5108,8 @@ mod tests {
         // Known GPUs at the most they are known to cost: the presets and RunPod's recorded
         // catalog (H100 SXM $3.49, H200 $4.59, B200 $6.79, B300 $7.89 — the recorded price of
         // its MIG slice too); a MIG slice nobody lists at its parent's.
-        let cases: Vec<(Option<&str>, Option<u32>, Option<(f64, StandIn)>)> = vec![
+        type Case = (Option<&'static str>, Option<u32>, Option<(f64, StandIn)>);
+        let cases: Vec<Case> = vec![
             (Some("NVIDIA RTX A4000"), Some(1), Some((0.32, StandIn::Preset))),
             (Some("RTX 3090"), Some(2), Some((1.0, StandIn::Preset))),
             (Some("2×RTX A4000"), None, Some((0.64, StandIn::Preset))),
@@ -5792,7 +5806,7 @@ mod review_balance_correct {
     fn bc1b_unknown_balance_with_unpriced_pods_is_ok_instead_of_unknown() {
         let v = view_at(&BalanceState::default(), &rp(Some(Err(gone())), None), unpriced(2), Mode::Inline, NOW);
         assert_eq!(v.balance, None);
-        assert_eq!((v.level, check_exit(&[v.clone()])), (Level::Unknown, 3), "{v:?}");
+        assert_eq!((v.level, check_exit(std::slice::from_ref(&v))), (Level::Unknown, 3), "{v:?}");
     }
 
     /// BC1c: invariant 7 ("a failed listing never yields … runway ∞/no burn"): the stale
@@ -5866,7 +5880,7 @@ mod review_balance_correct {
     fn bc5_unpriced_pods_are_reported_as_spend_arena_does_not_list() {
         let f = rp(Some(Ok(live(32.54, Some(0.47)))), None);
         let v = view_at(&BalanceState::default(), &f, unpriced(1), Mode::Full, NOW);
-        let lines: Vec<String> = notes(&[v.clone()], &BalancePolicy::default(), NOW).into_iter().chain(teardown_info(&[v], NOW)).collect();
+        let lines: Vec<String> = notes(std::slice::from_ref(&v), &BalancePolicy::default(), NOW).into_iter().chain(teardown_info(&[v], NOW)).collect();
         for l in &lines {
             assert!(
                 !l.contains("more than arena lists (network volumes, stopped pods' disks, serverless?)"),
