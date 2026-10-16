@@ -14,12 +14,13 @@
 #   BIGSTUCK_BASE <sha>|none   what `git reset` to, to rewrite those commits without it
 #   BRANCH <branch>            the branch it backs up (before anything else, unless SKIP)
 #   REDACTED <n> <path>        a file committed with its n key(s) redacted; the file on disk keeps them
-#   HEALED <n> <old> <new>     GitHub refused the push over a key in older unpushed commits: those n
-#                              commits rewritten with the keys redacted, pushed as a fast-forward
-#   HEAL_ABORTED <why>         the heal stopped short (the branch moved meanwhile): the next run ends it (exit 1)
-#   PUSH_BLOCKED <reason>      GitHub's push protection still refuses the push — a key the redaction
+#   REDACTED_HISTORY <n> <old> <new>  a key in older unpushed commits (an earlier backup's, or one the
+#                              participant made): those n commits rewritten redacted, pushed as a fast-forward
+#   HEAL_ABORTED <why>         that rewrite stopped short (the branch moved meanwhile): the next run ends it (exit 1)
+#   PUSH_BLOCKED <reason>      GitHub's push protection still refuses the push — a secret the redaction
 #                              doesn't know; the reason names GitHub's secret type and path:line (exit 4)
-# Any other failure exits non-zero via `set -e` (a rejected push is a failure).
+#   PUSH_FAILED                the push failed otherwise (the network, a non-fast-forward…; exit 1)
+# Any other failure exits non-zero via `set -e`.
 set -e
 REPO=$1
 MSG=$2
@@ -207,13 +208,12 @@ if [ -s "$T.stuck" ]; then
 fi
 # What git push said, as GitHub's push protection words a refusal (GH013 since rulesets, GH009
 # before): the refusal names the secret's type and where it is, never the secret — but it does
-# carry a URL that *allows* the secret into the repo, which nothing here may print or pass on.
+# carry a URL that *allows* the secret into the repo, which nothing here may print or pass on
+# (`no_bypass_url`, shared with init-branches: arena_core::backup::NO_BYPASS_URL_SH).
 push_protected() {
     LC_ALL=C grep -qiE 'GH013|GH009|push protection|push declined due to repository rule violations|cannot contain secrets|secrets? detected' "$1"
 }
-no_bypass_url() {
-    LC_ALL=C grep -viE 'https?://[^ ]*(unblock|bypass|secret-scanning)' || true
-}
+# @ARENA_NO_BYPASS_URL@
 # The refusal in one line: GitHub's secret type(s) (the heading line above each `locations:`) and
 # path:line(s), else the `[remote rejected]` reason. Never a URL.
 push_block_reason() {
@@ -226,39 +226,40 @@ push_block_reason() {
     _pr=$(LC_ALL=C sed -n 's/.*\[remote rejected\][^(]*(\(.*\)).*/\1/p' "$1" | head -n 1)
     echo "${_pr:-refused by GitHub push protection}"
 }
-if git push -u origin "$B" 2>"$T.push"; then
-    no_bypass_url < "$T.push" >&2
-    echo "PUSHED $B"
-    exit 0
-fi
-no_bypass_url < "$T.push" >&2
 
-# --- A push GitHub refused over a key -------------------------------------------------------
-# A key committed before the redaction above existed (or by hand) is still in the unpushed
-# commits, and GitHub's push protection refuses the branch until they're rewritten (live: three
-# pods, 14-24 commits each, ~20 hours, fixed by hand with filter-branch). So those commits — and
-# only those: the ones on no remote branch, `HEAD --not --remotes`, never anything GitHub already
-# has — are rewritten with their keys redacted, by plumbing alone: each commit's tree through a
-# temporary index, then `commit-tree` with its own author, committer, dates, message and (mapped)
-# parents, merges included. Rewriting is deterministic, and a commit with nothing to redact and
-# unchanged parents keeps its id. The participant's files are never read or written. The new tip
-# is pushed as a fast-forward (never forced), and only then does the branch move — compare-and-
-# swap, so a commit made meanwhile is never lost: the heal stops there, and the next run redoes
-# it on top (the same rewrite, so it lands as a fast-forward again — hence a push refused because
-# the remote branch has commits this one lacks, after a heal, is healed the same way).
+# --- Keys in the commits going out ----------------------------------------------------------
+# The redaction above covers what this backup commits; a key can still be in the unpushed
+# commits — committed by an older backup (live: three pods refused by GitHub for ~20 hours,
+# 14-24 commits each, fixed by hand with filter-branch) or by the participant by hand ("commit
+# all" on a file whose key the backup keeps out of git). Whether GitHub refuses it depends on
+# the repo's push-protection settings; it must never leave the pod either way. So the blobs of
+# the commits going out — only those on no remote branch, `HEAD --not --remotes`, never anything
+# GitHub already has — are scanned before the push (one `cat-file --batch | grep -q`: usually a
+# single commit this run made, already clean), and if one holds a key those commits are
+# rewritten with it redacted, by plumbing alone: each commit's tree through a temporary index,
+# then `commit-tree` with its own author, committer, dates, message and (mapped) parents, merges
+# included. Deterministic, and a commit with nothing to redact and unchanged parents keeps its
+# id. The participant's files are never read or written. The new tip is pushed as a
+# fast-forward (never forced), and only then does the branch move — compare-and-swap, so a
+# commit made meanwhile is never lost: the run stops there (HEAL_ABORTED), and the next one redoes
+# the same rewrite (same ids: a fast-forward of what was pushed) with that commit on top.
 TIP=$(git rev-parse HEAD)
-if push_protected "$T.push"; then
-    :
-elif LC_ALL=C grep -qE '\[rejected\].*\((non-fast-forward|fetch first)\)' "$T.push" \
-    && R=$(git rev-parse -q --verify "refs/remotes/origin/$B") && ! git merge-base --is-ancestor "$R" HEAD; then
-    :
-else
-    exit 1
-fi
 git rev-list --objects HEAD --not --remotes | git cat-file --batch-check='%(objecttype) %(objectname) %(rest)' \
-    | awk '$1 == "blob" { print $2 }' | sort -u | while read -r b; do redact_blob "$b"; done > "$T.hmap"
+    | awk '$1 == "blob" { print $2 }' | sort -u > "$T.blobs"
+: > "$T.hmap"
+if [ -s "$T.blobs" ]; then
+    # A failed cat-file must not read as "no key": the grep then saw only part of the blobs.
+    rm -f "$T.catfail"
+    { git cat-file --batch < "$T.blobs" || : > "$T.catfail"; } | LC_ALL=C grep -aqE -- "$SECRET_RE" && K=0 || K=$?
+    if [ "$K" = 1 ] && [ -e "$T.catfail" ]; then K=2; fi
+    if [ "$K" -gt 1 ]; then echo "arena backup: scanning the outgoing commits for keys failed - nothing pushed" >&2; exit 2; fi
+    if [ "$K" = 0 ]; then
+        while read -r b; do redact_blob "$b"; done < "$T.blobs" > "$T.hmap"
+    fi
+fi
 : > "$T.cmap"
 N=0
+NEW=$TIP
 if [ -s "$T.hmap" ]; then
     git rev-list --reverse --topo-order HEAD --not --remotes > "$T.commits"
     while read -r c; do
@@ -286,31 +287,37 @@ if [ -s "$T.hmap" ]; then
         fi
         echo "$c $n" >> "$T.cmap"
     done < "$T.commits"
+    NEW=$(sed -n "s/^$TIP //p" "$T.cmap")
 fi
-NEW=$(sed -n "s/^$TIP //p" "$T.cmap")
-if [ -z "$NEW" ] || [ "$NEW" = "$TIP" ]; then
-    # Nothing the redaction knows: GitHub's reason, as it gave it.
-    if push_protected "$T.push"; then echo "PUSH_BLOCKED $(push_block_reason "$T.push")"; exit 4; fi
-    exit 1
+
+# The tip, or its redacted rewrite (as a fast-forward of the remote branch).
+if [ "$NEW" != "$TIP" ]; then
+    if [ "$(git rev-parse HEAD)" != "$TIP" ]; then
+        echo "HEAL_ABORTED $B moved while its unpushed commits were being redacted — the next backup redoes it"
+        exit 1
+    fi
+    set -- origin "$NEW:refs/heads/$B"
+else
+    set -- -u origin "$B"
 fi
-if [ "$(git rev-parse HEAD)" != "$TIP" ]; then
-    echo "HEAL_ABORTED $B moved while its unpushed commits were rewritten — the next backup redoes it"
-    exit 1
-fi
-if ! git push origin "$NEW:refs/heads/$B" 2>"$T.push"; then
-    no_bypass_url < "$T.push" >&2
-    if push_protected "$T.push"; then echo "PUSH_BLOCKED $(push_block_reason "$T.push")"; exit 4; fi
-    exit 1
-fi
+if git push "$@" 2>"$T.push"; then pushed=1; else pushed=; fi
 no_bypass_url < "$T.push" >&2
-echo "HEALED $N $TIP $NEW"
-if ! git update-ref -m "arena backup: keys redacted from unpushed commits" "refs/heads/$B" "$NEW" "$TIP"; then
-    echo "HEAL_ABORTED $B moved while the rewrite was pushed — the next backup puts the new commit on top"
+if [ -z "$pushed" ]; then
+    # Still refused: a secret the patterns don't know (or a binary GitHub scans) — said, by type.
+    if push_protected "$T.push"; then echo "PUSH_BLOCKED $(push_block_reason "$T.push")"; exit 4; fi
+    echo "PUSH_FAILED"
     exit 1
 fi
-# The branch is checked out: its index entries holding a key now hold the redacted copy, so the
-# index matches the new tip and `git status` shows just the files on disk with their real keys as
-# modified — the state the redaction above leaves. No file on disk is touched.
-redact_index "$T.hmap" > /dev/null
-git branch --set-upstream-to="origin/$B" "$B" > /dev/null 2>&1 || true
+if [ "$NEW" != "$TIP" ]; then
+    echo "REDACTED_HISTORY $N $TIP $NEW"
+    if ! git update-ref -m "arena backup: keys redacted from unpushed commits" "refs/heads/$B" "$NEW" "$TIP"; then
+        echo "HEAL_ABORTED $B moved while the redacted commits were pushed — the next backup puts the new commit on top"
+        exit 1
+    fi
+    # The branch is checked out: its index entries holding a key now hold the redacted copy, so
+    # the index matches the new tip and `git status` shows just the files on disk with their real
+    # keys as modified — the state the redaction above leaves. No file on disk is touched.
+    redact_index "$T.hmap" > /dev/null
+    git branch --set-upstream-to="origin/$B" "$B" > /dev/null 2>&1 || true
+fi
 echo "PUSHED $B"

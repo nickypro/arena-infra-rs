@@ -11,16 +11,29 @@
 SECRET_RE='@SECRET_RE@'
 REDACT_SED='@REDACT_SED@'
 
+# Whether file $1 holds a key: 0 yes, 1 no. A grep that fails (exit 2+: a pattern it can't run,
+# no memory) stops the whole run — never read as "no key", which would commit the key.
+key_in_file() {
+    if LC_ALL=C grep -aqE -- "$SECRET_RE" "$1"; then return 0; else _k=$?; fi
+    if [ "$_k" -eq 1 ]; then return 1; fi
+    echo "arena backup: scanning for keys failed (grep exit $_k) - nothing committed or pushed" >&2
+    exit 2
+}
+
 # A blob's redacted copy, written to the object store: `<blob> <redacted blob> <keys>` on
 # stdout — nothing for a blob without a key, or a binary one (a NUL in its first 8000 bytes,
-# git's own test): its bytes aren't text to rewrite, and git shows no diff of it anyway.
+# git's own test): its bytes aren't text to rewrite, and git shows no diff of it anyway. Every
+# step goes through a file in $T and runs under `set -e` (no pipeline hides a failure): a sed
+# that dies mid-blob stops the run instead of committing a truncated "redacted" copy.
 redact_blob() {
-    git cat-file blob "$1" | LC_ALL=C grep -aqE -- "$SECRET_RE" || return 0
-    _rs=$(git cat-file -s "$1")
+    git cat-file blob "$1" > "$T.rb"
+    key_in_file "$T.rb" || return 0
+    _rs=$(wc -c < "$T.rb")
     if [ "$_rs" -gt 8000 ]; then _rs=8000; fi
-    if [ "$(git cat-file blob "$1" | head -c 8000 | tr -d '\000' | wc -c)" -ne "$_rs" ]; then return 0; fi
-    _rn=$(git cat-file blob "$1" | LC_ALL=C grep -aoE -- "$SECRET_RE" | wc -l)
-    _rr=$(git cat-file blob "$1" | LC_ALL=C sed -E "$REDACT_SED" | git hash-object -w --stdin)
+    if [ "$(head -c 8000 "$T.rb" | tr -d '\000' | wc -c)" -ne "$_rs" ]; then return 0; fi
+    _rn=$(LC_ALL=C grep -aoE -- "$SECRET_RE" "$T.rb" | wc -l)
+    LC_ALL=C sed -E "$REDACT_SED" "$T.rb" > "$T.rr"
+    _rr=$(git hash-object -w --stdin < "$T.rr")
     if [ "$_rr" != "$1" ]; then echo "$1 $_rr $_rn"; fi
 }
 

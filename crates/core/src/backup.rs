@@ -12,9 +12,9 @@
 //! ([`SECRET_PATTERNS`]: GitHub's push protection refuses the push — then every push after it).
 //! The image's nested clones are adopted instead — the course repo tracks their files where they
 //! are, their own `.git` untouched — once; other nested repos are kept out and reported. A file
-//! holding a key is committed with the key redacted, the file on disk untouched; and a branch
-//! GitHub already refuses over a key in older unpushed commits is healed — those commits
-//! rewritten redacted, pushed as a fast-forward. The script is [`backup_script`].
+//! holding a key is committed with the key redacted, the file on disk untouched; and unpushed
+//! commits holding one (an older backup's, or the participant's own) are rewritten redacted before
+//! the push, which goes out as a fast-forward. The script is [`backup_script`].
 //!
 //! This module only *renders* the command (pure, unit-tested). Running it — and thus
 //! mutating remote git state — is gated behind the CLI's `--apply`.
@@ -102,8 +102,9 @@ pub const BACKUP_BLOCKED_EXIT: i32 = 4;
 pub struct SecretPattern {
     /// What it is (as GitHub's push protection names it, near enough).
     pub name: &'static str,
-    /// The key itself, as a GNU extended regex matched on bytes (`sed -E`/`grep -E`, `LC_ALL=C`)
-    /// — without what must come before it ([`SECRET_LEAD`]).
+    /// What must come right before it: [`SECRET_LEAD`], or a variant of it.
+    pub lead: &'static str,
+    /// The key itself, as a GNU extended regex matched on bytes (`sed -E`/`grep -E`, `LC_ALL=C`).
     pub re: &'static str,
     /// What it becomes in git: plain text that no pattern matches, so redacting twice changes
     /// nothing (the next backup's redacted blob is the one HEAD has: no new commit).
@@ -115,13 +116,23 @@ pub struct SecretPattern {
 /// notebook's source and outputs are JSON strings, where a key starting a line follows `\n`.
 pub const SECRET_LEAD: &str = r"(^|[^A-Za-z0-9_]|\\[nrt])";
 
-/// The keys the backup redacts before committing (and out of unpushed commits GitHub refused):
-/// high-confidence formats only — a fixed prefix and a long body of a fixed alphabet — so ordinary
-/// code (`sklearn`, `hf_hub_download`, a UUID, a notebook's base64 image) never matches. What we
-/// hand out first (OpenRouter keys, `HF_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`), then what GitHub's
-/// push protection refuses that a participant is likely to paste. A miss isn't silent: GitHub
-/// refuses the push, the backup reports `PUSH_BLOCKED` with GitHub's name for the secret, and the
-/// pod's files are copied by rsync instead — add the pattern here. One list: the backup script,
+/// [`SECRET_LEAD`], or — before a prefix nothing else starts with (`sk-or-v1-`, `sk-ant-`,
+/// `github_pat_`, `gh?_`) — the end of an ANSI colour code (a notebook's coloured output:
+/// `\u001b[32m` + key) or a URL-escaped quote (`%22`, `%27`). Never a letter: `task-or-v1-…`
+/// still isn't a key.
+pub const SECRET_LEAD_DISTINCT: &str = r"(^|[^A-Za-z0-9_]|\\[nrt]|\[[0-9;]*m|%2[27])";
+
+/// [`SECRET_LEAD`] without `+` and `/` — the only non-word characters inside base64 — for a
+/// prefix that turns up in base64 by chance (`AIza` + 35 more in a notebook's inline image).
+pub const SECRET_LEAD_NO_BASE64: &str = r"(^|[^A-Za-z0-9_+/]|\\[nrt])";
+
+/// The keys the backup redacts before committing and out of unpushed commits: high-confidence
+/// formats only — a fixed prefix and a long body of a fixed alphabet — so ordinary code
+/// (`sklearn`, `hf_hub_download`, a UUID, a notebook's base64 image) never matches. What we hand
+/// out first (OpenRouter keys, `HF_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`), then what GitHub's push
+/// protection refuses that a participant is likely to paste. A miss isn't silent: GitHub refuses
+/// the push, the backup reports `PUSH_BLOCKED` with GitHub's name for the secret, and the pod's
+/// files are copied by rsync instead — add the pattern here. One list: the backup script,
 /// `set-branch` and the table tests all render it from here ([`secret_regex`], [`redact_sed`]).
 ///
 /// Formats (GitHub's secret-scanning pattern list, the providers' own docs):
@@ -136,34 +147,75 @@ pub const SECRET_LEAD: &str = r"(^|[^A-Za-z0-9_]|\\[nrt])";
 /// - Hugging Face user access token: `hf_` + exactly 34 letters.
 /// - GitHub: `ghp_` (classic PAT), `gho_` (OAuth), `ghu_`/`ghs_` (app user/server), `ghr_`
 ///   (refresh) + 36+ alphanumerics; fine-grained `github_pat_` + 82+ of `[A-Za-z0-9_]`.
+/// - Google API key (Gemini, Maps…): `AIza` + 35 of `[0-9A-Za-z_-]`; never after `+` or `/`
+///   ([`SECRET_LEAD_NO_BASE64`]).
+/// - Groq: `gsk_` + exactly 52 alphanumerics.
 /// - AWS access key id: `AKIA` + exactly 16 of `[0-9A-Z]`.
+///
+/// Still missed, by design (each would make `task-or-v1-…`-style words match): two keys pasted
+/// back to back with nothing between them (the second one), and a key glued to a following `_`
+/// or letter where the format ends in `\b`.
 pub const SECRET_PATTERNS: &[SecretPattern] = &[
-    SecretPattern { name: "OpenRouter API key", re: r"sk-or-v1-[0-9a-f]{64}\b", replacement: "REDACTED-OPENROUTER-KEY" },
+    SecretPattern {
+        name: "OpenRouter API key",
+        lead: SECRET_LEAD_DISTINCT,
+        re: r"sk-or-v1-[0-9a-f]{64}\b",
+        replacement: "REDACTED-OPENROUTER-KEY",
+    },
     SecretPattern {
         name: "Anthropic API key",
+        lead: SECRET_LEAD_DISTINCT,
         re: r"sk-ant-(api03|admin01|oat01)-[A-Za-z0-9_-]{80,}",
         replacement: "REDACTED-ANTHROPIC-KEY",
     },
-    SecretPattern { name: "OpenAI API key", re: r"sk-(proj|svcacct|admin)-[A-Za-z0-9_-]{40,}", replacement: "REDACTED-OPENAI-KEY" },
-    SecretPattern { name: "OpenAI API key", re: r"sk-[A-Za-z0-9_-]{10,}T3BlbkFJ[A-Za-z0-9_-]{10,}", replacement: "REDACTED-OPENAI-KEY" },
-    SecretPattern { name: "Hugging Face token", re: r"hf_[A-Za-z]{34}\b", replacement: "REDACTED-HUGGINGFACE-TOKEN" },
-    SecretPattern { name: "GitHub token", re: r"gh[pousr]_[A-Za-z0-9]{36,}", replacement: "REDACTED-GITHUB-TOKEN" },
-    SecretPattern { name: "GitHub fine-grained token", re: r"github_pat_[A-Za-z0-9_]{82,}", replacement: "REDACTED-GITHUB-TOKEN" },
-    SecretPattern { name: "AWS access key id", re: r"AKIA[0-9A-Z]{16}\b", replacement: "REDACTED-AWS-ACCESS-KEY-ID" },
+    SecretPattern {
+        name: "OpenAI API key",
+        lead: SECRET_LEAD,
+        re: r"sk-(proj|svcacct|admin)-[A-Za-z0-9_-]{40,}",
+        replacement: "REDACTED-OPENAI-KEY",
+    },
+    SecretPattern {
+        name: "OpenAI API key",
+        lead: SECRET_LEAD,
+        re: r"sk-[A-Za-z0-9_-]{10,}T3BlbkFJ[A-Za-z0-9_-]{10,}",
+        replacement: "REDACTED-OPENAI-KEY",
+    },
+    SecretPattern { name: "Hugging Face token", lead: SECRET_LEAD, re: r"hf_[A-Za-z]{34}\b", replacement: "REDACTED-HUGGINGFACE-TOKEN" },
+    SecretPattern { name: "GitHub token", lead: SECRET_LEAD_DISTINCT, re: r"gh[pousr]_[A-Za-z0-9]{36,}", replacement: "REDACTED-GITHUB-TOKEN" },
+    SecretPattern {
+        name: "GitHub fine-grained token",
+        lead: SECRET_LEAD_DISTINCT,
+        re: r"github_pat_[A-Za-z0-9_]{82,}",
+        replacement: "REDACTED-GITHUB-TOKEN",
+    },
+    SecretPattern {
+        name: "Google API key",
+        lead: SECRET_LEAD_NO_BASE64,
+        re: r"AIza[0-9A-Za-z_-]{35}",
+        replacement: "REDACTED-GOOGLE-API-KEY",
+    },
+    SecretPattern { name: "Groq API key", lead: SECRET_LEAD, re: r"gsk_[A-Za-z0-9]{52}\b", replacement: "REDACTED-GROQ-KEY" },
+    SecretPattern { name: "AWS access key id", lead: SECRET_LEAD, re: r"AKIA[0-9A-Z]{16}\b", replacement: "REDACTED-AWS-ACCESS-KEY-ID" },
 ];
 
-/// Any one key of [`SECRET_PATTERNS`], with its [`SECRET_LEAD`]: what the backup looks for (and
-/// counts) in a blob before rewriting it.
+/// Any one key of [`SECRET_PATTERNS`], with its lead: what the backup looks for (and counts) in
+/// a blob before rewriting it.
 pub fn secret_regex() -> String {
-    let any: Vec<&str> = SECRET_PATTERNS.iter().map(|p| p.re).collect();
-    format!("{SECRET_LEAD}({})", any.join("|"))
+    SECRET_PATTERNS.iter().map(|p| format!("{}{}", p.lead, p.re)).collect::<Vec<_>>().join("|")
 }
 
 /// [`SECRET_PATTERNS`] as a `sed -E` program: each key → its replacement, what came before it
 /// kept. Every other byte of the blob is left exactly as it was.
 pub fn redact_sed() -> String {
-    SECRET_PATTERNS.iter().map(|p| format!("s/{SECRET_LEAD}{}/\\1{}/g", p.re, p.replacement)).collect::<Vec<_>>().join("\n")
+    // `#` as the delimiter: no pattern, lead or replacement has one (a lead has `/`).
+    SECRET_PATTERNS.iter().map(|p| format!("s#{}{}#\\1{}#g", p.lead, p.re, p.replacement)).collect::<Vec<_>>().join("\n")
 }
+
+/// The shell function both commands that push (the backup, `init-branches`) pass git's push
+/// output through: it drops every line with a URL that would *allow* a secret into the repo
+/// (GitHub's push protection prints `…/secret-scanning/unblock-secret/…` beside each refused
+/// secret) — never printed, never passed on to a report line or a log.
+pub const NO_BYPASS_URL_SH: &str = "no_bypass_url() { LC_ALL=C grep -viE 'https?://[^ ]*(unblock|bypass|secret-scanning)' || true; }";
 
 /// The redaction's shell functions (`redact.sh`), with [`secret_regex`] and [`redact_sed`]
 /// rendered in — shared by the backup script and `set-branch`'s command.
@@ -171,14 +223,16 @@ pub fn redact_sh() -> String {
     include_str!("redact.sh").replace("@SECRET_RE@", &secret_regex()).replace("@REDACT_SED@", &redact_sed())
 }
 
-/// The line of `backup.sh` that [`backup_script`] replaces with [`redact_sh`].
+/// The lines of `backup.sh` that [`backup_script`] replaces with [`redact_sh`] and
+/// [`NO_BYPASS_URL_SH`].
 const REDACT_SH_MARK: &str = "# @ARENA_REDACT_SH@";
+const NO_BYPASS_URL_MARK: &str = "# @ARENA_NO_BYPASS_URL@";
 
-/// The backup script ([`backup_command`]): `backup.sh` with [`redact_sh`] rendered in. POSIX
-/// `sh`, so it runs the same whatever the pod's login shell; its header documents every line it
-/// prints.
+/// The backup script ([`backup_command`]): `backup.sh` with [`redact_sh`] and
+/// [`NO_BYPASS_URL_SH`] rendered in. POSIX `sh`, so it runs the same whatever the pod's login
+/// shell; its header documents every line it prints.
 pub fn backup_script() -> String {
-    include_str!("backup.sh").replacen(REDACT_SH_MARK, redact_sh().trim_end(), 1)
+    include_str!("backup.sh").replacen(REDACT_SH_MARK, redact_sh().trim_end(), 1).replacen(NO_BYPASS_URL_MARK, NO_BYPASS_URL_SH, 1)
 }
 
 /// Render the remote shell command that commits + pushes one machine's working tree **on
@@ -285,13 +339,15 @@ pub struct BackupReport {
     pub branch: Option<String>,
     /// Files committed with their keys redacted: `(keys, path)` — the files on disk keep them.
     pub redacted: Vec<(u64, String)>,
-    /// A push GitHub refused over a key in older unpushed commits, healed: `(commits rewritten,
-    /// old tip, new tip)` — the new tip is on GitHub.
-    pub healed: Option<(u64, String, String)>,
-    /// Why a heal stopped short (the branch moved meanwhile; the next run ends it).
+    /// Unpushed commits that held a key, rewritten redacted and pushed: `(commits rewritten, old
+    /// tip, new tip)` — the new tip is on GitHub, the old one in the branch's reflog.
+    pub history: Option<(u64, String, String)>,
+    /// Why that rewrite stopped short (the branch moved meanwhile; the next run ends it).
     pub heal_aborted: Option<String>,
     /// GitHub's push protection still refuses the push: its reason (secret type, path:line).
     pub push_blocked: Option<String>,
+    /// The push itself failed otherwise (the network, a non-fast-forward…): `PUSH_FAILED`.
+    pub push_failed: bool,
 }
 
 /// Parse a backup's stdout ([`backup_script`]'s header lists the lines). Unknown lines (git's
@@ -313,12 +369,13 @@ pub fn parse_backup_report(stdout: &str) -> BackupReport {
             "NESTED_KEPT" if !rest.is_empty() => r.kept.push(rest.to_string()),
             "BRANCH" if !rest.trim().is_empty() => r.branch = Some(rest.trim().to_string()),
             "REDACTED" => r.redacted.extend(sized(rest)),
-            "HEALED" => {
+            "REDACTED_HISTORY" => {
                 let f: Vec<&str> = rest.split_whitespace().collect();
                 if let [n, old, new] = f[..] {
-                    r.healed = n.parse().ok().map(|n| (n, old.to_string(), new.to_string()));
+                    r.history = n.parse().ok().map(|n| (n, old.to_string(), new.to_string()));
                 }
             }
+            "PUSH_FAILED" => r.push_failed = true,
             "HEAL_ABORTED" => r.heal_aborted = Some(rest.trim().to_string()),
             "PUSH_BLOCKED" => {
                 let why = rest.trim();
@@ -394,10 +451,10 @@ impl BackupReport {
                 some_of(&files, 3)
             ));
         }
-        if let Some((n, old, new)) = &self.healed {
+        if let Some((n, old, new)) = &self.history {
             notes.push(format!(
-                "healed: GitHub refused the push over a key in older unpushed commits — rewrote {n} of them with the key(s) \
-                 redacted and pushed them as a fast-forward ({} → {})",
+                "rewrote {n} unpushed commit(s) that held a pasted key — redacted, pushed as a fast-forward ({} → {}; the \
+                 originals stay in the branch's reflog on the pod)",
                 short_id(old),
                 short_id(new)
             ));
@@ -423,10 +480,19 @@ impl BackupReport {
                  (the file on disk may keep it)"
             ));
         }
-        self.heal_aborted.as_ref().map(|why| match &self.healed {
+        self.heal_aborted.as_ref().map(|why| match &self.history {
             Some((n, _, new)) => format!("pushed {n} rewritten commit(s) ({}), then {why}", short_id(new)),
             None => why.clone(),
         })
+    }
+
+    /// Whether the run reached the repo and failed at the push itself — refused, a big file in
+    /// the way, a rewrite cut short, or the push failing outright: the failures where the
+    /// pod's work is there but not on GitHub, so it gets the fallback copy. A run that never got
+    /// that far (no repo, ssh denied, a timeout: nothing says how far it got) fails as it
+    /// always did, and isn't rsynced every 15 minutes.
+    pub fn failed_at_push(&self) -> bool {
+        self.push_failed || self.push_blocked.is_some() || self.heal_aborted.is_some() || !self.big_stuck.is_empty()
     }
 
     /// [`Self::failure`] in a few words, for a line that says what else happened (the fallback
@@ -487,7 +553,12 @@ pub fn init_branch_command(cfg: &BackupConfig, machine_name: &str) -> String {
     parts.push("git fetch --all --prune".into());
     // Create the branch from the current HEAD, or switch to it if it already exists.
     parts.push(format!("git checkout -b {bq} 2>/dev/null || git checkout {bq}"));
-    parts.push(format!("git push -u origin {bq}"));
+    // The new branch carries any commit of the old one GitHub refuses (the next backup redacts
+    // and pushes it): the refusal goes to the operator without GitHub's allow-the-secret URL.
+    parts.push(NO_BYPASS_URL_SH.into());
+    parts.push("P=$(git rev-parse --absolute-git-dir)/arena-init-push.$$".into());
+    parts.push(format!("if git push -u origin {bq} 2>\"$P\"; then R=0; else R=$?; fi"));
+    parts.push("no_bypass_url < \"$P\" >&2; rm -f \"$P\"; exit $R".into());
     parts.join("; ")
 }
 
@@ -614,7 +685,7 @@ mod tests {
         assert!(s.contains(r#"git commit -q -m "$MSG""#));
         // "Nothing staged" isn't "nothing to do": push whenever ahead of / without an upstream.
         assert!(s.contains("git rev-list --count '@{u}..HEAD'"));
-        assert!(s.contains(r#"git push -u origin "$B""#) && s.contains("PUSHED $B"));
+        assert!(s.contains(r#"set -- -u origin "$B""#) && s.contains(r#"git push "$@""#) && s.contains("PUSHED $B"));
         assert!(s.contains("Arena Autocommit"));
         assert!(s.contains(r#"export GIT_SSH_COMMAND="ssh -i $KEY"#));
         assert_eq!(GIT_MAX_FILE_BYTES, 99_614_720, "95 MiB: headroom under GitHub's 100 MiB");
@@ -647,6 +718,12 @@ mod tests {
     const ALNUM: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     const LETTERS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
     const URLSAFE: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
+
+    /// The set-aside copies of `name` under `.git/arena-unredacted` (one folder per switch).
+    fn aside_copies(aside: &std::path::Path, name: &str) -> Vec<Vec<u8>> {
+        let Ok(runs) = std::fs::read_dir(aside) else { return Vec::new() };
+        runs.flatten().filter(|e| e.path().is_dir()).filter_map(|e| std::fs::read(e.path().join(name)).ok()).collect()
+    }
 
     /// An OpenRouter-shaped key (`sk-or-v1-` + 64 hex), distinct per `seed`.
     fn openrouter_key(seed: usize) -> String {
@@ -686,6 +763,8 @@ mod tests {
         let gh = |p: &str| format!("{p}_{}", body(ALNUM, 36, 4));
         let hf = format!("{}{}", "hf_", body(LETTERS, 34, 5));
         let aws = format!("{}{}", "AKIA", body("ABCDEFGHIJKLMNOPQRSTUVWXYZ0234567", 16, 6));
+        let google = format!("{}{}", "AIza", body(URLSAFE, 35, 14));
+        let groq = format!("{}{}", "gsk_", body(ALNUM, 52, 15));
         // (input line, what git gets, keys counted)
         let keys: Vec<(String, String, usize)> = vec![
             (format!("export OPENROUTER_API_KEY={or}"), "export OPENROUTER_API_KEY=REDACTED-OPENROUTER-KEY".into(), 1),
@@ -709,6 +788,13 @@ mod tests {
             (format!("t={}{}_{}", "github_pat_", body(ALNUM, 22, 12), body(ALNUM, 59, 13)), "t=REDACTED-GITHUB-TOKEN".into(), 1),
             (format!("aws_access_key_id = {aws}"), "aws_access_key_id = REDACTED-AWS-ACCESS-KEY-ID".into(), 1),
             (format!("{or} {hf} {aws}"), "REDACTED-OPENROUTER-KEY REDACTED-HUGGINGFACE-TOKEN REDACTED-AWS-ACCESS-KEY-ID".into(), 3),
+            // A notebook's coloured output (the ANSI code JSON-escaped, or raw) and a URL-escaped
+            // quote, before a prefix nothing else has (review).
+            (format!("    \"\\u001b[32m{or}\\u001b[0m\\n\","), "    \"\\u001b[32mREDACTED-OPENROUTER-KEY\\u001b[0m\\n\",".into(), 1),
+            (format!("\u{1b}[1;32m{}\u{1b}[0m", gh("ghp")), "\u{1b}[1;32mREDACTED-GITHUB-TOKEN\u{1b}[0m".into(), 1),
+            (format!("GET /v1?key=%22{or}%22"), "GET /v1?key=%22REDACTED-OPENROUTER-KEY%22".into(), 1),
+            (format!("genai.configure(api_key=\"{google}\")"), "genai.configure(api_key=\"REDACTED-GOOGLE-API-KEY\")".into(), 1),
+            (format!("GROQ_API_KEY={groq}"), "GROQ_API_KEY=REDACTED-GROQ-KEY".into(), 1),
         ];
         for (input, want, n) in &keys {
             let (got, counted) = redact(&format!("{input}\n"));
@@ -741,6 +827,15 @@ mod tests {
             format!("{}{}", "AKIA", body("abcdefghijklmnopqrstuvwxyz", 16, 6)),
             format!("X{}{}", "AKIA", body("ABCDEFGHIJKLMNOPQRSTUVWXYZ", 16, 6)),
             format!("commit {} sk-{}", body(HEX, 40, 2), body(HEX, 32, 3)),
+            // The extra leads are for unmistakable prefixes only: still no `task-or-v1-…`.
+            format!("\u{1b}[32mtask-or-v1-{}", body(HEX, 64, 1)),
+            format!("%22task-or-v1-{}", body(HEX, 64, 1)),
+            // `AIza` + 35 inside base64 (after `/` or `+`), or one short; Groq one short or glued.
+            format!("iVBORw0KGgo/{}{}", "AIza", body(ALNUM, 35, 14)),
+            format!("iVBORw0KGgo+{}{}", "AIza", body(ALNUM, 35, 14)),
+            format!("k = '{}{}'", "AIza", body(ALNUM, 34, 14)),
+            format!("{}{}", "gsk_", body(ALNUM, 51, 15)),
+            format!("x{}{}", "gsk_", body(ALNUM, 52, 15)),
             format!("      \"image/png\": \"{}\"", crate::base64::encode(&image)),
         ];
         for line in &lookalikes {
@@ -752,7 +847,9 @@ mod tests {
         for p in SECRET_PATTERNS {
             assert!(p.replacement.chars().all(|c| c.is_ascii_uppercase() || c == '-'), "{}", p.replacement);
             assert_eq!(redact(&format!("{}\n", p.replacement)), (format!("{}\n", p.replacement), 0));
-            assert!(!p.re.contains('/') && !p.re.contains('\''), "{}", p.re);
+            for part in [p.lead, p.re] {
+                assert!(!part.contains('#') && !part.contains('\''), "{part}");
+            }
         }
         assert!(!secret_regex().contains('\'') && !redact_sed().contains('\''));
     }
@@ -768,7 +865,8 @@ mod tests {
         assert!(script.contains("redact_blob()") && script.contains("redact_index()"));
         assert_eq!(redact_sed().lines().count(), SECRET_PATTERNS.len());
         for p in SECRET_PATTERNS {
-            assert!(secret_regex().contains(p.re) && redact_sed().contains(&format!("{}/\\1{}/g", p.re, p.replacement)));
+            assert!(secret_regex().contains(&format!("{}{}", p.lead, p.re)));
+            assert!(redact_sed().contains(&format!("s#{}{}#\\1{}#g", p.lead, p.re, p.replacement)));
         }
         let set_branch = checkout_command("/r", "main", None, false);
         assert!(set_branch.contains(&format!("REDACT_SED='{}'", redact_sed())));
@@ -1401,10 +1499,10 @@ done
         let (code, out, err) = s.backup_raw();
         let r = parse_backup_report(&out);
         assert_eq!((code, r.outcome.clone()), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into()))), "{out}{err}");
-        let (n, old, new) = r.healed.clone().expect("healed");
+        let (n, old, new) = r.history.clone().expect("rewritten");
         assert_eq!((n, old.as_str()), (3, old_tip.as_str()));
         assert_eq!(s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "rev-parse", "autocommit-x"]), new);
-        assert!(r.notes().iter().any(|n| n.starts_with("healed: GitHub refused the push over a key in older unpushed commits — rewrote 3")));
+        assert!(r.notes().iter().any(|n| n.starts_with("rewrote 3 unpushed commit(s) that held a pasted key")), "{:?}", r.notes());
         // A fast-forward: origin's commits before the heal are all still there, in order.
         let remote_after = remote_log();
         assert!(remote_after.ends_with(&remote_before), "{remote_after}");
@@ -1422,7 +1520,7 @@ done
         // The old commits stay reachable from the reflog (nothing is lost on the pod).
         assert_eq!(s.git(&s.work, &["rev-parse", "autocommit-x@{1}"]), old_tip);
         let (code, r, err) = s.backup();
-        assert_eq!((code, r.outcome, r.healed), (Some(0), Some((BACKUP_NO_CHANGES, "autocommit-x".into())), None), "{err}");
+        assert_eq!((code, r.outcome, r.history), (Some(0), Some((BACKUP_NO_CHANGES, "autocommit-x".into())), None), "{err}");
         assert_eq!(r.redacted, [(1, "exercises.py".to_string())]);
     }
 
@@ -1452,7 +1550,7 @@ done
         s.git(&s.work, &["merge", "-q", "--no-edit", "-m", "merge main", "main"]);
         let (code, r, err) = s.backup();
         assert_eq!((code, r.outcome.clone()), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into()))), "{err}");
-        assert_eq!(r.healed.as_ref().map(|h| h.0), Some(2), "the key's commit and the merge");
+        assert_eq!(r.history.as_ref().map(|h| h.0), Some(2), "the key's commit and the merge");
         let parents = s.git(&s.work, &["log", "-1", "--format=%P", "HEAD"]);
         let parents: Vec<&str> = parents.split(' ').collect();
         assert_eq!(parents.len(), 2);
@@ -1468,7 +1566,7 @@ done
         s.git(&s.work, &["add", "-A"]);
         s.git(&s.work, &["commit", "-q", "-m", "y"]);
         let (code, r, err) = s.backup();
-        assert_eq!((code, r.outcome.clone(), r.healed.map(|h| h.0)), (Some(0), Some((BACKUP_PUSHED, "autocommit-y".into())), Some(1)), "{err}");
+        assert_eq!((code, r.outcome.clone(), r.history.map(|h| h.0)), (Some(0), Some((BACKUP_PUSHED, "autocommit-y".into())), Some(1)), "{err}");
         assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "@{u}"]), "origin/autocommit-y");
         assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), s.git(&s.work, &["rev-parse", "origin/autocommit-y"]));
         assert!(!s.origin_holds(&key));
@@ -1509,7 +1607,7 @@ done
         let r = parse_backup_report(&out);
         assert_eq!(code, Some(1), "{out}{err}");
         assert!(r.outcome.is_none(), "{out}");
-        let (_, _, pushed) = r.healed.clone().expect("the rewrite was pushed");
+        let (_, _, pushed) = r.history.clone().expect("the rewrite was pushed");
         assert!(r.heal_aborted.as_deref().unwrap().contains("moved"), "{out}");
         let fail = r.failure("/r", "devtest-x", code).expect("explained");
         assert!(fail.starts_with("pushed 2 rewritten commit(s)") && fail.contains("moved"), "{fail}");
@@ -1551,7 +1649,7 @@ done
             assert_eq!(code, Some(BACKUP_BLOCKED_EXIT), "run {run}: {out}{err}");
             assert_eq!(r.push_blocked.as_deref(), Some("Devtest Unknown Token at scratch.py:2"), "run {run}: {out}");
             assert_eq!(r.branch.as_deref(), Some("autocommit-x"));
-            assert!(r.outcome.is_none() && r.healed.is_none());
+            assert!(r.outcome.is_none() && r.history.is_none());
             for text in [&out, &err] {
                 assert!(!text.contains(&unknown) && !text.contains(&key), "run {run}: a secret printed: {text}");
                 assert!(!text.contains("unblock-secret") && !text.contains("2DEVTESTunblock"), "run {run}: the bypass URL: {text}");
@@ -1580,7 +1678,7 @@ done
     fn githubs_refusal_is_summed_up_without_its_urls() {
         let script = backup_script();
         let start = script.find("push_protected() {").unwrap();
-        let end = script.find("if git push -u origin").unwrap();
+        let end = script.find("# --- Keys in the commits going out").unwrap();
         let funcs = &script[start..end];
         let dir = std::env::temp_dir().join(format!("arena-pushreason-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1660,9 +1758,14 @@ done
         let cfg = BackupConfig { repo_path: s.work.display().to_string(), prefix: "devtest".into(), week: 1, day: 2, git_ssh_key: None };
         let o = std::process::Command::new("bash").arg("-c").arg(init_branch_command(&cfg, "devtest-x")).output().unwrap();
         assert!(!o.status.success(), "the new branch's push carries the key");
+        // Its refusal reaches the operator — without GitHub's allow-the-secret URL (review: it
+        // used to pass the push's stderr through as it was).
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(err.contains("GH013") && err.contains("locations:"), "{err}");
+        assert!(!err.contains("unblock-secret") && !err.contains("secret-scanning") && !err.contains(&key), "{err}");
         assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "autocommit-devtest-w1d2-x");
         let (code, r, err) = s.backup();
-        assert_eq!((code, r.outcome, r.healed.map(|h| h.0)), (Some(0), Some((BACKUP_PUSHED, "autocommit-devtest-w1d2-x".into())), Some(1)), "{err}");
+        assert_eq!((code, r.outcome, r.history.map(|h| h.0)), (Some(0), Some((BACKUP_PUSHED, "autocommit-devtest-w1d2-x".into())), Some(1)), "{err}");
         assert_eq!(s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "log", "-1", "--format=%s", "autocommit-devtest-w1d2-x"]), "yesterday, with a key");
         assert!(!s.origin_holds(&key));
     }
@@ -1697,8 +1800,8 @@ done
             assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "main");
             assert_eq!(s.read("README.md").len(), 5, "main's own README");
             assert!(!s.work.join("joep.py").exists());
-            assert_eq!(std::fs::read(aside.join("README.md")).unwrap(), ex.as_bytes());
-            assert_eq!(std::fs::read(aside.join("joep.py")).unwrap(), joep.as_bytes());
+            assert_eq!(aside_copies(&aside, "README.md"), [ex.clone().into_bytes()]);
+            assert_eq!(aside_copies(&aside, "joep.py"), [joep.clone().into_bytes()]);
             assert!(!out.contains(&key) && !err.contains(&key));
             // …and back: the keys are back on disk, the set-aside copies gone.
             let (ok, out, err) = run(checkout_command(repo, "autocommit-x", None, hard));
@@ -1719,6 +1822,103 @@ done
         assert!(!ok && err.contains("would be overwritten"), "{out}{err}");
         assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "autocommit-x");
         assert_eq!((s.read("README.md"), s.read("joep.py")), (ex.clone().into_bytes(), joep.clone().into_bytes()));
+    }
+
+    /// Review: a key in a commit the participant made by hand ("commit all" on the file the
+    /// backup keeps showing as modified) went out whenever GitHub didn't refuse it — push
+    /// protection off, or a type it scans but doesn't block. Now the commits going out are
+    /// scanned and rewritten first, whatever the remote does: this origin refuses nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_key_in_a_commit_the_participant_made_never_leaves_the_pod() {
+        let s = GitSandbox::new("own-commit", 1_000_000);
+        let hf = format!("{}{}", "hf_", body(LETTERS, 34, 9));
+        let mine = format!("from huggingface_hub import login\nlogin(\"{hf}\")\n");
+        std::fs::write(s.work.join("mine.py"), &mine).unwrap();
+        s.git(&s.work, &["add", "mine.py"]);
+        s.git(&s.work, &["commit", "-q", "-m", "my own commit"]);
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome.clone()), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into()))), "{err}");
+        assert_eq!(r.history.as_ref().map(|h| h.0), Some(1));
+        assert!(!s.origin_holds(&hf), "the key reached origin");
+        assert_eq!(s.git(&s.work, &["log", "-1", "--format=%s", "HEAD"]), "my own commit");
+        assert_eq!(s.git(&s.work, &["show", "HEAD:mine.py"]), "from huggingface_hub import login\nlogin(\"REDACTED-HUGGINGFACE-TOKEN\")");
+        assert_eq!(s.read("mine.py"), mine.as_bytes());
+        assert_eq!(s.git(&s.work, &["status", "--porcelain"]), "M mine.py");
+        // And a clean branch costs no rewrite.
+        let (code, r, _) = s.backup();
+        assert_eq!((code, r.outcome, r.history), (Some(0), Some((BACKUP_NO_CHANGES, "autocommit-x".into())), None));
+    }
+
+    /// Review: `redact_blob` failed open — a grep that couldn't run read as "no key", and a sed
+    /// dying mid-blob committed a truncated "redacted" copy (the pipeline hid its status). Now
+    /// either stops the run: nothing committed, nothing pushed, no key anywhere on origin.
+    #[cfg(unix)]
+    #[test]
+    fn a_scan_or_rewrite_that_fails_stops_the_run_and_commits_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let real = |tool: &str| ["/usr/bin", "/bin"].iter().map(|d| format!("{d}/{tool}")).find(|p| std::path::Path::new(p).exists()).unwrap();
+        for (tool, wrapper) in [
+            // grep given the key patterns: exit 2, as a grep that can't run them would.
+            ("grep", format!("#!/bin/sh\ncase \"$*\" in *sk-or-v1-*) exit 2;; esac\nexec {} \"$@\"\n", real("grep"))),
+            // sed given the redaction program: the first bytes of the blob, then it dies.
+            ("sed", format!("#!/bin/sh\ncase \"$*\" in *REDACTED-*) for a; do last=$a; done; head -c 10 \"$last\"; exit 1;; esac\nexec {} \"$@\"\n", real("sed"))),
+        ] {
+            let s = GitSandbox::new(&format!("failclosed-{tool}"), 1_000_000);
+            let bin = s.base.join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::write(bin.join(tool), wrapper).unwrap();
+            std::fs::set_permissions(bin.join(tool), std::fs::Permissions::from_mode(0o755)).unwrap();
+            let key = openrouter_key(11);
+            std::fs::write(s.work.join("ex.py"), format!("k = '{key}'\nmore = 1\n")).unwrap();
+            let head = s.git(&s.work, &["rev-parse", "HEAD"]);
+            let cmd = backup_command_limited(s.work.to_str().unwrap(), None, "arena backup", s.skip, s.limit);
+            let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+            let o = std::process::Command::new("bash").arg("-c").arg(cmd).env("PATH", path).output().unwrap();
+            let (out, err) = (String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+            assert!(!o.status.success(), "{tool}: {out}{err}");
+            assert!(!out.contains("PUSHED") && !out.contains("NO_CHANGES"), "{tool}: {out}");
+            assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), head, "{tool}: a commit was made");
+            assert_eq!(s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "rev-parse", "autocommit-x"]), head, "{tool}");
+            assert!(!s.origin_holds(&key), "{tool}: the key reached origin");
+        }
+    }
+
+    /// Review: a path set aside again (another day's branch, another key) overwrote the earlier
+    /// copy, so the first branch's key was gone. Every switch now sets aside into a folder of its
+    /// own: both keys are kept, and each comes back on its own branch.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_set_aside_twice_keeps_both_keys_and_each_comes_back_on_its_own_branch() {
+        let s = GitSandbox::new("aside-twice", 1_000_000);
+        let run = |cmd: String| {
+            let o = std::process::Command::new("bash").arg("-c").arg(cmd).output().unwrap();
+            assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+            String::from_utf8_lossy(&o.stdout).into_owned()
+        };
+        let repo = s.work.to_str().unwrap();
+        let day1 = format!("KEY = \"{}\"\n", openrouter_key(12));
+        let day2 = format!("KEY = \"{}\"\n", openrouter_key(13));
+        std::fs::write(s.work.join("ex.py"), &day1).unwrap();
+        assert_eq!(s.backup().1.redacted.len(), 1);
+        assert!(run(checkout_command(repo, "main", None, true)).contains("UNREDACTED_KEPT ex.py"));
+        // Day 2: a new branch, the same file, another key (the same redacted text).
+        s.git(&s.work, &["checkout", "-q", "-b", "autocommit-y"]);
+        std::fs::write(s.work.join("ex.py"), &day2).unwrap();
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.redacted.len()), (Some(0), 1), "{err}");
+        assert!(run(checkout_command(repo, "main", None, true)).contains("UNREDACTED_KEPT ex.py"));
+        let aside = s.work.join(".git/arena-unredacted");
+        let mut copies = aside_copies(&aside, "ex.py");
+        copies.sort();
+        let mut both = vec![day1.clone().into_bytes(), day2.clone().into_bytes()];
+        both.sort();
+        assert_eq!(copies, both, "both days' keys kept");
+        // Each back on its own branch.
+        assert!(run(checkout_command(repo, "autocommit-x", None, false)).contains("UNREDACTED_RESTORED ex.py"));
+        assert_eq!(s.read("ex.py"), day1.as_bytes());
+        assert!(run(checkout_command(repo, "autocommit-y", None, false)).contains("UNREDACTED_RESTORED ex.py"));
+        assert_eq!(s.read("ex.py"), day2.as_bytes());
     }
 
     /// The dry run's per-pod line pastes: next to the file its here-doc writes, it runs the
