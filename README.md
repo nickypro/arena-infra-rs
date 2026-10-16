@@ -569,7 +569,20 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     runs under `sh` whatever the login shell; `--dry-run` prints each pod's line — `ssh …
     'sh -s <exact arguments>' < arena-backup.sh` — and, once, the here-doc that writes
     `arena-backup.sh`: paste that first and every line runs as the backup would (without it the
-    shell refuses to start, never a silent no-op).
+    shell refuses to start, never a silent no-op). **A pasted key never blocks the push** (live:
+    an OpenRouter key in an exercise made GitHub refuse three pods' pushes for ~20 hours, GH013):
+    each new or changed text file is scanned for high-confidence key formats
+    (`arena_core::backup::SECRET_PATTERNS`: OpenRouter, Anthropic, OpenAI, Hugging Face, GitHub,
+    AWS) and committed with each key replaced by `REDACTED-…` — in git only: the file on disk
+    keeps the key (the code still runs) and shows as modified; reported per pod (`redacted N
+    pasted key(s) in …`). A branch GitHub already refuses over a key in older unpushed commits is
+    **healed**: just those commits (none a remote has) are rewritten with the key redacted — same
+    messages, authors, dates — and pushed as a fast-forward, never forced; files on disk
+    untouched. A secret the patterns don't know fails the pod with GitHub's name for it and its
+    path:line (never the secret, never GitHub's allow-URL). **A pod whose push fails, for any
+    reason, is rsynced into `LOCAL_BACKUP_DIR` in the same run — even under `--no-pull`** (the
+    cron's) — and its line says where its files went (or why that failed too); the run still
+    fails.
   - `pods set-branch <branch> <targets|--all> [--hard]` — switch pods' ARENA checkout to a
     branch. Gentle by default (fetch + checkout + ff-only pull — fails on a diverged/dirty
     tree rather than clobbering work). **`--hard` is destructive**: force the branch to
@@ -578,11 +591,18 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `--dry-run` previews. Pods switch concurrently, 2-min budget each. A nested clone the
     backup adopted (see `pods backup`) is tracked only on the autocommit branches, so a
     switch to `main` would delete it from disk and break that exercise: it is put back from
-    the previous HEAD, **staged** (so switching back goes through), and named per pod.
+    the previous HEAD, **staged** (so switching back goes through), and named per pod. Each
+    pod's current branch is **backed up first** (the `backup` commit + push, keys redacted, a
+    refused branch healed; a no-op on `main` or a branch in sync); a pod whose branch still
+    can't be pushed is rsynced into `LOCAL_BACKUP_DIR` first, then switched (its commits stay in
+    the local branch), and its line and the run's exit say so. A file the backup committed with
+    a key redacted keeps the real key on disk: around the switch it's set aside in
+    `.git/arena-unredacted/` (so gentle doesn't refuse it and `--hard` doesn't drop the key) and
+    put back when the pod returns to that branch.
   - `pods init-branches` — create each pod's `autocommit-…-wNdM-…` branch and push it
     upstream **without committing** (legacy `init_branches`), so a new day's branch
     exists before `backup` runs. `--week`/`--day` override; `--dry-run` previews. 2-min
-    budget per pod.
+    budget per pod. A pod still on another branch has it backed up first, as `set-branch` does.
   - `pods run [-t <targets>] [--timeout <secs>] <cmd>` / `pods test [targets]` — run an
     arbitrary command on every (selected) pod (concurrent, confirms first naming the pods;
     each pod gets `--timeout`, default 1800s = 30 min — flags go *before* the command: a bare
