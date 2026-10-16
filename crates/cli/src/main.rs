@@ -1113,7 +1113,8 @@ enum PodCmd {
     /// Git-push each pod's branch, then rsync its home locally
     ///
     /// Pushes the current branch (never main/master), then runs `pods pull`; --no-pull = git
-    /// only. No targets = every reachable pod.
+    /// only. No targets (or --all) = this cohort's reachable pods (`<prefix>-*`, not @ staff
+    /// entries); name a staff box to include it.
     #[command(verbatim_doc_comment)]
     Backup {
         /// Only do the git push; skip the rsync file backup.
@@ -1131,8 +1132,8 @@ enum PodCmd {
     /// Rsync each pod's home to the local backup folder
     ///
     /// Writes a dated snapshot (files under --max-size) and the complete `big/` mirror. No
-    /// targets = every pod with an SSH endpoint. Each pod's rsync is time-limited
-    /// (BACKUP_TIMEOUT_SECS).
+    /// targets (or --all) = this cohort's pods with an SSH endpoint (not @ staff entries).
+    /// Each pod's rsync is time-limited (BACKUP_TIMEOUT_SECS).
     #[command(verbatim_doc_comment)]
     Pull {
         /// Snapshot label, e.g. `w1d3` (default: the computed wNdM)
@@ -1219,6 +1220,9 @@ enum PodCmd {
         dry_run: bool,
     },
     /// Create + push each pod's wNdM autocommit branch
+    ///
+    /// No targets (or --all) = this cohort's pods (`<prefix>-*`, not @ staff entries).
+    #[command(verbatim_doc_comment)]
     InitBranches {
         /// Override the iteration week (default: computed from ARENA_START_DATE).
         #[arg(long)]
@@ -1233,12 +1237,19 @@ enum PodCmd {
         sel: Select,
     },
     /// Switch pods' git branch (ff-only; --hard force-resets)
+    ///
+    /// --all = this cohort's pods (`<prefix>-*`, not @ staff entries); name a staff box to
+    /// include it. On main/master no backup commits until `init-branches` (or --init-branches).
+    #[command(verbatim_doc_comment)]
     SetBranch {
         /// Branch to check out (e.g. main, or a feature branch).
         branch: String,
         /// DESTRUCTIVE: reset to `origin/<branch>`, dropping local commits and changes
         #[arg(long)]
         hard: bool,
+        /// Then create + push each pod's day branch, as `init-branches` does
+        #[arg(long)]
+        init_branches: bool,
         /// Preview only: print what would happen, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
@@ -5134,6 +5145,9 @@ async fn handle_backup(
         "\nDone: {} pushed, {} unchanged, {} skipped (main/master), {} failed.",
         t.pushed, t.unchanged, t.skipped, t.failed
     );
+    // The pods on main/master, after the counts — the line the operator acts on (never a failure).
+    let fleet_wide = !sel.named && t.pushed + t.unchanged == 0;
+    on_protected_lines(&Naming::from_config(cfg), &t.on_protected, fleet_wide).iter().for_each(|l| say(l));
     unpushed.extend(t.unpushed);
     if t.failed > 0 {
         anyhow::bail!("{} pod(s) failed to back up", t.failed);
@@ -5313,6 +5327,9 @@ struct BackupTally {
     failed: usize,
     /// The pods whose git push failed — for the copy the backup makes of them instead.
     unpushed: Vec<Unpushed>,
+    /// The `skipped` pods, each with the protected branch it's on (`(name, branch)`): said in
+    /// one line after the run ([`on_protected_lines`]), not one per pod.
+    on_protected: Vec<(String, String)>,
 }
 
 /// A pod whose git backup failed this run: why (a few words), the branch it left unpushed (when
@@ -5339,10 +5356,61 @@ fn failure_why(call: &PodCall) -> String {
     }
 }
 
+/// Is `branch` one `pods backup` never commits on (`backup.sh`'s SKIP: main, master, a
+/// detached HEAD)?
+fn is_protected_branch(branch: &str) -> bool {
+    matches!(branch, "main" | "master" | "HEAD")
+}
+
+/// The one line for this cohort's pods sitting on a protected branch (`(name, branch)`), which
+/// no backup commits until `init-branches` gives each its day branch — the daily
+/// `set-branch main --hard` leaves the whole fleet there. One line, not one SKIP per pod, and it
+/// says what ends it. `fleet_wide`: the run named no pods and found none on a branch backups
+/// commit on (the morning reset), so the fix is the plain `arena pods init-branches`; otherwise
+/// it names these pods, since a fleet-wide init would also move a pod off a bespoke branch.
+///
+/// Not a failure (the exit stays 0): the pods are where the operator put them, their work stays
+/// on disk, and the window between the reset and `init-branches` is routine every morning — a
+/// non-zero exit there would be a daily false alarm that teaches the operator to ignore the one
+/// that means a push or a pod broke. The cron's exit status goes nowhere anyway (its line
+/// appends to `arena-cron.log`); this line, and `set-branch`'s reminder at the reset itself,
+/// are what make the gap loud.
+fn on_protected_line(pods: &[(String, String)], fleet_wide: bool) -> Option<String> {
+    if pods.is_empty() {
+        return None;
+    }
+    let branches: std::collections::BTreeSet<&str> = pods.iter().map(|(_, b)| b.as_str()).collect();
+    let on = branches.into_iter().map(|b| if b == "HEAD" { "a detached HEAD" } else { b }).collect::<Vec<_>>().join(" or ");
+    let cmd = if fleet_wide {
+        "arena pods init-branches".to_string()
+    } else {
+        // Sorted: the pods finish in any order.
+        let mut names: Vec<&str> = pods.iter().map(|(n, _)| n.as_str()).collect();
+        names.sort();
+        format!("arena pods init-branches {}", names.join(" "))
+    };
+    let n = pods.len();
+    Some(format!("⚠ {n} cohort pod{} on {on}: not backed up until `{cmd}`", if n == 1 { "" } else { "s" }))
+}
+
+/// What `pods backup` says, after its run, about the pods it found on a protected branch
+/// (`(name, branch)`): this cohort's in one line ([`on_protected_line`]); a staff or off-list
+/// box (only ever there because it was named) one line each, as before — `init-branches`
+/// is not its fix, and it isn't counted with the cohort's. `fleet_wide` as for
+/// [`on_protected_line`].
+fn on_protected_lines(naming: &Naming, pods: &[(String, String)], fleet_wide: bool) -> Vec<String> {
+    let (cohort, mut other): (Vec<_>, Vec<_>) = pods.iter().cloned().partition(|(n, _)| naming.is_cohort(n));
+    other.sort();
+    let mut out: Vec<String> = other.iter().map(|(n, b)| format!("⊘ {n} (skipped — on protected branch {b})")).collect();
+    out.extend(on_protected_line(&cohort, fleet_wide));
+    out
+}
+
 /// Run each pod's backup command (`(name, target, cmd)`) concurrently over `remote`, each
 /// within [`BACKUP_TIMEOUT`], classifying its output by the sentinel it printed and
 /// emitting one `[done/total]` line per pod as it finishes — with what the run kept out of
-/// git (files over GitHub's limit, nested repos) or adopted into it. A non-zero exit, a
+/// git (files over GitHub's limit, nested repos) or adopted into it; a pod on a protected
+/// branch goes into the tally instead, for one line after the run. A non-zero exit, a
 /// timeout or a crashed task is a failure; the others still finish. A pod whose unpushed
 /// commits already carry a file over GitHub's limit fails with the exact commands that fix it
 /// (`repo` is the checkout they run in), never as the same opaque push rejection every tick;
@@ -5374,7 +5442,9 @@ async fn backup_fleet(
                 }
                 Some((backup::BACKUP_SKIPPED, branch)) => {
                     t.skipped += 1;
-                    format!("[{done}/{total}] ⊘ {name} (skipped — on protected branch {branch})")
+                    // Said once for all of them after the run (`on_protected_lines`).
+                    t.on_protected.push((name.to_string(), branch.clone()));
+                    String::new()
                 }
                 _ => {
                     t.pushed += 1;
@@ -5395,7 +5465,9 @@ async fn backup_fleet(
                 failure_line(done, total, name, &call)
             }
         };
-        emit(&line);
+        if !line.is_empty() {
+            emit(&line);
+        }
         ended(name);
     })
     .await;
@@ -6997,15 +7069,17 @@ async fn handle_pods_bal(
 
         PodCmd::InitBranches { sel, week, day, dry_run } => {
             let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
+            let sel = cohort_only(cfg, sel);
             handle_init_branches(remote, cfg, week, day, &sel, dry_run, yes, RSYNC).await?;
         }
 
         PodCmd::Pull { label, dir, max_size, remote_path, no_git, no_big, target_flag, sel, dry_run } => {
             let dir = dir.unwrap_or_else(|| local_backup_dir(cfg));
-            let (label, mut sel, note) = resolve_pull(provider, cfg, label, sel, &target_flag).await?;
+            let (label, sel, note) = resolve_pull(provider, cfg, label, sel, &target_flag).await?;
             if let Some(note) = &note {
                 eprintln!("{note}");
             }
+            let mut sel = cohort_only(cfg, sel);
             refresh_missing_endpoints(provider, &mut sel, ENDPOINT_RETRY).await;
             handle_pull(&remote, cfg, label, &dir, max_size, remote_path, no_git, no_big, &sel, dry_run, yes, RSYNC).await?;
         }
@@ -7115,7 +7189,8 @@ async fn handle_pods_bal(
         PodCmd::Backup { sel, no_pull, dry_run, message } => {
             // Resolved once, before the prompt (a typo fails before asking), and shared by the
             // git push and the pull.
-            let mut sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
+            let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
+            let mut sel = cohort_only(cfg, sel);
             refresh_missing_endpoints(provider, &mut sel, ENDPOINT_RETRY).await;
             handle_full_backup(remote, cfg, &sel, no_pull, message, dry_run, yes, RSYNC).await?;
         }
@@ -7146,9 +7221,20 @@ async fn handle_pods_bal(
             handle_setup(remote, cfg, !dry_run, force, hf_token, cc_token, zsh_install, no_vscode, timeouts, &sel, KEYS_DIR, Some(provider))
                 .await?;
         }
-        PodCmd::SetBranch { branch, sel, hard, dry_run } => {
+        PodCmd::SetBranch { branch, sel, hard, dry_run, init_branches } => {
             let sel = select(provider, cfg, &sel.args(), Unscoped::Refuse("switch")).await?;
-            handle_set_branch(remote, cfg, &branch, &sel, hard, dry_run, yes, RSYNC).await?;
+            let sel = cohort_only(cfg, sel);
+            // The day `--init-branches` would init, before anything switches: a missing start
+            // date fails here, not after the reset.
+            if init_branches {
+                resolve_week_day(cfg, None, None)?;
+            }
+            handle_set_branch(remote.clone(), cfg, &branch, &sel, hard, dry_run, yes, RSYNC).await?;
+            // The same pods, once every one has switched (a failed switch has bailed above).
+            if init_branches {
+                println!();
+                handle_init_branches(remote, cfg, None, None, &sel, dry_run, yes, RSYNC).await?;
+            }
         }
         PodCmd::Run { sel, command, timeout, dry_run, background } => {
             if let Some(why) = misplaced_run_flags(&command) {
@@ -7836,19 +7922,19 @@ async fn handle_set_branch(
     }
     let total = targets.len();
     let doing = format!("to '{branch}'");
+    let mut landed: Vec<String> = Vec::new();
     let run = switch_guarded(&remote, cfg, sel, targets, rsync, hard.then_some(branch), |_| cmd.clone(), BRANCH_TIMEOUT, &doing, |name, out, note| {
         // Nested clones the backup adopted, which the new branch doesn't track: put back on
         // disk (staged) so their exercises keep working.
         let restored: Vec<&str> = out.stdout.lines().filter_map(|l| l.trim_end_matches('\r').strip_prefix("RESTORED ")).collect();
-        let also = if restored.is_empty() {
-            String::new()
-        } else {
-            format!(" — kept {} adopted nested clone(s) on disk (staged): {}", restored.len(), restored.join(", "))
-        };
-        format!("✓ {name} (on {branch}){also}{}{note}", unredacted_note(&out.stdout))
+        landed.push(name.to_string());
+        format!("✓ {name} (on {branch}){}{}{note}", restored_note(&restored, branch), unredacted_note(&out.stdout))
     })
     .await;
     println!("\nswitched {}/{total}", run.ok);
+    if let Some(line) = set_branch_reminder(&Naming::from_config(cfg), branch, &landed, !sel.named) {
+        say(&line);
+    }
     run.result("switch branch")
 }
 
@@ -8022,7 +8108,7 @@ async fn switch_batch(
         let note = notes.get(name).map_or("", String::as_str);
         match &call {
             Ok(out) if out.success => {
-                println!("[{done}/{total}] {}", ok_line(name, out, note));
+                say(&format!("[{done}/{total}] {}", ok_line(name, out, note)));
                 run.ok += 1;
             }
             _ => {
@@ -8069,6 +8155,39 @@ fn unredacted_note(stdout: &str) -> String {
         note.push_str(&format!(" — real key(s) back in {} file(s) git has redacted: {}", back.len(), back.join(", ")));
     }
     note
+}
+
+/// The per-pod note for the nested repos a switch put back (`RESTORED <path>` lines;
+/// `""` when none). What happened to them: the backup adopted these clones (the course repo
+/// tracks their files on the autocommit branches only), so the checkout to `branch`, which
+/// doesn't track them, deleted their files; the switch then put them back from the old HEAD,
+/// staged ([`arena_core::backup::checkout_command`]). On main/master no backup commits;
+/// `init-branches` branches off with the index as it is, so the first backup on the day branch
+/// commits them. On any other branch the next backup does.
+fn restored_note(restored: &[&str], branch: &str) -> String {
+    if restored.is_empty() {
+        return String::new();
+    }
+    let n = restored.len();
+    let when = if is_protected_branch(branch) { "the first backup on the next day branch" } else { "the next backup" };
+    format!(
+        " — restored {n} nested repo{} that {branch} doesn't track ({}): on disk and staged; {when} commits them",
+        if n == 1 { "" } else { "s" },
+        restored.join(", ")
+    )
+}
+
+/// `set-branch`'s closing reminder when it left this cohort's pods (`landed`: the ones that
+/// switched) on a protected branch: from now until `init-branches`, no backup commits their
+/// work ([`on_protected_line`]). Said at the moment of the reset, when the operator can act.
+/// `None` for any other branch or when no cohort pod landed.
+fn set_branch_reminder(naming: &Naming, branch: &str, landed: &[String], fleet_wide: bool) -> Option<String> {
+    if !is_protected_branch(branch) {
+        return None;
+    }
+    let on: Vec<(String, String)> =
+        landed.iter().filter(|n| naming.is_cohort(n)).map(|n| (n.clone(), branch.to_string())).collect();
+    on_protected_line(&on, fleet_wide)
 }
 
 /// Why a pod can't be locked, in the backend's own words (without the `not implemented:`
@@ -12254,7 +12373,8 @@ async fn refresh_missing_endpoints(provider: &dyn Provider, sel: &mut Selected, 
 #[derive(Debug, Clone, Copy)]
 enum Unscoped {
     /// The whole fleet: read-only checks, and the commands that always defaulted to it
-    /// (`run`, `test`, `setup`, `copy-keys`, `cp`, `backup`, `pull`, `init-branches`).
+    /// (`run`, `test`, `setup`, `copy-keys`, `cp`, `backup`, `pull`, `init-branches` — the
+    /// last three, like `set-branch --all`, then keep only this cohort's pods: [`cohort_only`]).
     All,
     /// Refuse: a command that changes pods (`stop`, `reimage`, `set-branch`, `keys`) must
     /// be told which — names or `--all` (the verb goes in the message).
@@ -12345,6 +12465,75 @@ async fn select(provider: &dyn Provider, cfg: &Config, sel: &SelectArgs, unscope
     }
     let picked = selector.resolve(&naming, &pods)?;
     Ok(Selected { pods: picked.into_iter().map(|i| pods[i].clone()).collect(), named: sel.names_pods() })
+}
+
+/// Narrow a fleet-wide selection of the git backup commands (`pods backup`, `pull`,
+/// `init-branches`, `set-branch`) to this cohort's machines, saying in one line who was left
+/// out ([`split_cohort`], [`non_cohort_line`]). A selection that named pods comes back as it was.
+fn cohort_only(cfg: &Config, sel: Selected) -> Selected {
+    let naming = Naming::from_config(cfg);
+    let (kept, left_out) = split_cohort(&naming, sel);
+    if let Some(line) = non_cohort_line(naming.prefix, &left_out) {
+        say(&line);
+    }
+    kept
+}
+
+/// What a fleet-wide backup command acts on — one that names no pod (no targets, `all` or
+/// `--all`): only this cohort's machines ([`Naming::is_cohort`]: `{prefix}-…`, never an `@`
+/// staff entry), plus the names it left out. The account also holds staff and personal boxes
+/// (an `@` entry, another prefix, a pod RunPod named itself) with no checkout or no deploy key:
+/// every */15 backup failed or skipped on them and buried the real failures, and
+/// `set-branch main --all --hard` would reset one that has a checkout. A `{prefix}-…` pod off
+/// `MACHINE_NAME_LIST` stays in: it's an extra pod made for someone, or a parked `-old`/`-new`
+/// twin, and dropping a participant's backup is the worse mistake (a staff box that wears the
+/// prefix is listed as `@{prefix}-name` to leave it out). Named pods (names, ids, ranges) are
+/// acted on exactly, staff boxes included. Pure.
+fn split_cohort(naming: &Naming, sel: Selected) -> (Selected, Vec<String>) {
+    if sel.named {
+        return (sel, Vec::new());
+    }
+    let (pods, out): (Vec<_>, Vec<_>) = sel.pods.into_iter().partition(|p| naming.is_cohort(&p.name));
+    let out = out.into_iter().map(|p| if p.name.is_empty() { p.id } else { p.name }).collect();
+    (Selected { pods, ..sel }, out)
+}
+
+/// The one line for the pods [`split_cohort`] left out — neither a failure nor counted in any
+/// other line, so a real failure stands out. `None` when there were none.
+fn non_cohort_line(prefix: &str, names: &[String]) -> Option<String> {
+    const SHOWN: usize = 6;
+    if names.is_empty() {
+        return None;
+    }
+    let mut list = names.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", ");
+    if names.len() > SHOWN {
+        list.push_str(&format!(" (+{} more)", names.len() - SHOWN));
+    }
+    let n = names.len();
+    Some(format!(
+        "⊘ skipped {n} non-cohort pod{} (not {prefix}-…, or an @ staff entry): {list} — name one to include it",
+        if n == 1 { "" } else { "s" }
+    ))
+}
+
+/// Print a line the operator reads (a summary, a reminder, a per-pod result). Under test it's
+/// also kept, so a scenario test can see what was said ([`take_said`]).
+fn say(line: &str) {
+    #[cfg(test)]
+    SAID.with(|n| n.borrow_mut().push(line.to_string()));
+    println!("{line}");
+}
+
+#[cfg(test)]
+thread_local! {
+    static SAID: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Under test: the [`say`] lines printed on this thread so far (taken). A `#[tokio::test]`
+/// runs the command on its own thread, so these are that test's.
+#[cfg(test)]
+fn take_said() -> Vec<String> {
+    SAID.with(|n| std::mem::take(&mut *n.borrow_mut()))
 }
 
 /// A fresh listing narrowed to the pods with these `ids` — ones the program itself just
@@ -20385,6 +20574,7 @@ mod remote_tests {
         let mut lines = Vec::new();
         let start = Instant::now();
         let tally = backup_fleet(&remote, jobs, REPO, |l| lines.push(l.to_string()), |_| {}).await;
+        let on_main = vec![("devtest-delta".to_string(), "main".to_string())];
         let failed = |pod: &str, why: &str| Unpushed { pod: pod.into(), why: why.into(), branch: None, at_push: false };
         assert_eq!(
             tally,
@@ -20397,18 +20587,20 @@ mod remote_tests {
                     failed("devtest-echo", "exit 128: fatal: Could not read from remote repository."),
                     failed("devtest-bloom", "timed out after 300s"),
                 ],
+                on_protected: on_main,
             }
         );
         assert_eq!(start.elapsed(), BACKUP_TIMEOUT);
-        // The wedged pod reports last, after its budget; the rest as soon as they answered.
-        assert_eq!(lines[4], "[5/5] ✗ devtest-bloom: timed out after 300s");
-        let mut first: Vec<String> = unnumbered(&lines[..4]);
+        // The wedged pod reports last, after its budget; the rest as soon as they answered. The
+        // pod on main has no line of its own: it's said once, after the run.
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert_eq!(lines[3], "[5/5] ✗ devtest-bloom: timed out after 300s");
+        let mut first: Vec<String> = unnumbered(&lines[..3]);
         first.sort();
         assert_eq!(
             first,
             [
                 "= devtest-cloud (no changes, on feature-y)",
-                "⊘ devtest-delta (skipped — on protected branch main)",
                 "✓ devtest-apple -> autocommit-x",
                 "✗ devtest-echo (exit 128): fatal: Could not read from remote repository.",
             ]
@@ -21767,6 +21959,399 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
         // … but --json/-v still belong to --deep.
         for args in [&["arena", "pods", "test", "--json"][..], &["arena", "pods", "test", "-v"]] {
             assert!(parse(args).is_err(), "{args:?}");
+        }
+    }
+
+    /// Which pods a fleet-wide git backup command reaches, and the one-line summaries for the
+    /// pods it left out and the cohort pods it found on main (spec items 2 and 3).
+    mod cohort_scope {
+        use super::super::{
+            non_cohort_line, on_protected_line, on_protected_lines, resolve_week_day, restored_note, set_branch_reminder,
+            split_cohort, take_said,
+        };
+        use super::*;
+
+        /// A pod named exactly `full` (no prefix added) at `10.0.0.1:<port>`.
+        fn box_pod(full: &str, port: u16) -> Pod {
+            Pod { id: format!("id-{full}"), name: full.into(), ..pod("x", port) }
+        }
+
+        /// A shared account: two listed cohort pods, an extra `devtest-` pod off the list, a staff
+        /// box listed as `@devtest-zebra` (it wears the prefix), a staff box `@staff-gpu`, a pod the
+        /// provider named itself, and another cohort's pod.
+        fn account() -> Fleet {
+            Fleet {
+                kind: "runpod",
+                pods: vec![
+                    pod("apple", 22001),
+                    pod("bloom", 22002),
+                    pod("extra", 22003),
+                    box_pod("devtest-zebra", 22004),
+                    box_pod("staff-gpu", 22005),
+                    box_pod("quiet_blue_fox", 22006),
+                    box_pod("devtest2-apple", 22007),
+                ],
+            }
+        }
+
+        fn account_cfg(extra: &str) -> Config {
+            Config::parse(&format!(
+                "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple bloom @devtest-zebra @staff-gpu)\n\
+                 BACKUP_REPO_PATH={REPO}\nGIT_SSH_KEY_REMOTE={KEY}\nSHARED_SSH_KEY_PATH=/nonexistent/devtest_key\n{extra}"
+            ))
+        }
+
+        /// The cohort's three; the line for the other four (in selection order: list slot, then name).
+        const COHORT_PORTS: [u16; 3] = [22001, 22002, 22003];
+        const LEFT_OUT: &str = "⊘ skipped 4 non-cohort pods (not devtest-…, or an @ staff entry): \
+            devtest-zebra, staff-gpu, devtest2-apple, quiet_blue_fox — name one to include it";
+
+        fn names(sel: &Selected) -> Vec<&str> {
+            sel.pods.iter().map(|p| p.name.as_str()).collect()
+        }
+
+        #[test]
+        fn a_fleet_wide_selection_keeps_this_cohorts_pods_and_names_the_rest() {
+            let cfg = account_cfg("");
+            let naming = Naming::from_config(&cfg);
+            let pods = account().pods;
+            // (selection, named?, kept, left out)
+            let pick = |names: &[&str]| pods.iter().filter(|p| names.contains(&p.name.as_str())).cloned().collect::<Vec<_>>();
+            let cases: Vec<(Vec<Pod>, bool, Vec<&str>, Vec<&str>)> = vec![
+                // Fleet-wide: the `devtest-` pods, the off-list extra included; staff boxes (even
+                // one wearing the prefix), the provider-named pod and another prefix are left out.
+                (
+                    pods.clone(),
+                    false,
+                    vec!["devtest-apple", "devtest-bloom", "devtest-extra"],
+                    vec!["devtest-zebra", "staff-gpu", "quiet_blue_fox", "devtest2-apple"],
+                ),
+                // Named: exactly what was named, staff boxes included.
+                (pick(&["devtest-zebra", "staff-gpu", "quiet_blue_fox"]), true, vec!["devtest-zebra", "staff-gpu", "quiet_blue_fox"], vec![]),
+                (pick(&["devtest-apple"]), true, vec!["devtest-apple"], vec![]),
+                // Fleet-wide with nothing to leave out, and an empty fleet.
+                (pick(&["devtest-apple", "devtest-extra"]), false, vec!["devtest-apple", "devtest-extra"], vec![]),
+                (vec![], false, vec![], vec![]),
+            ];
+            for (i, (pods, named, kept, out)) in cases.into_iter().enumerate() {
+                let (sel, left) = split_cohort(&naming, Selected { pods, named });
+                assert_eq!((names(&sel), sel.named, left), (kept, named, out.iter().map(|s| s.to_string()).collect::<Vec<_>>()), "case {i}");
+            }
+            // A pod without a name is left out by its id.
+            let nameless = Pod { name: String::new(), ..box_pod("x", 22009) };
+            assert_eq!(split_cohort(&naming, Selected::all(vec![nameless])).1, ["id-x"]);
+        }
+
+        #[test]
+        fn the_left_out_pods_get_one_line() {
+            let many: Vec<String> = (1..=8).map(|i| format!("box{i}")).collect();
+            let cases: &[(&[String], Option<&str>)] = &[
+                (&[], None),
+                (
+                    &many[..1],
+                    Some("⊘ skipped 1 non-cohort pod (not devtest-…, or an @ staff entry): box1 — name one to include it"),
+                ),
+                (
+                    &many[..2],
+                    Some("⊘ skipped 2 non-cohort pods (not devtest-…, or an @ staff entry): box1, box2 — name one to include it"),
+                ),
+                (
+                    &many,
+                    Some(
+                        "⊘ skipped 8 non-cohort pods (not devtest-…, or an @ staff entry): box1, box2, box3, box4, box5, box6 \
+                         (+2 more) — name one to include it",
+                    ),
+                ),
+            ];
+            for (names, want) in cases {
+                assert_eq!(non_cohort_line("devtest", names).as_deref(), *want, "{names:?}");
+            }
+        }
+
+        #[test]
+        fn cohort_pods_on_main_get_one_line_naming_the_fix() {
+            let on = |pods: &[(&str, &str)]| pods.iter().map(|(n, b)| (n.to_string(), b.to_string())).collect::<Vec<_>>();
+            let cases: &[(&[(&str, &str)], bool, Option<&str>)] = &[
+                (&[], true, None),
+                // The morning reset: the plain command.
+                (
+                    &[("devtest-bloom", "main"), ("devtest-apple", "main"), ("devtest-extra", "main")],
+                    true,
+                    Some("⚠ 3 cohort pods on main: not backed up until `arena pods init-branches`"),
+                ),
+                // Some of the fleet, or a named run: the pods themselves, sorted.
+                (
+                    &[("devtest-bloom", "main"), ("devtest-apple", "master")],
+                    false,
+                    Some("⚠ 2 cohort pods on main or master: not backed up until `arena pods init-branches devtest-apple devtest-bloom`"),
+                ),
+                (
+                    &[("devtest-apple", "HEAD")],
+                    false,
+                    Some("⚠ 1 cohort pod on a detached HEAD: not backed up until `arena pods init-branches devtest-apple`"),
+                ),
+            ];
+            for (pods, fleet_wide, want) in cases {
+                assert_eq!(on_protected_line(&on(pods), *fleet_wide).as_deref(), *want, "{pods:?}");
+            }
+            // In `pods backup`: a staff box on main (it was named) has its own line and is not
+            // counted with the cohort's; each pod is said exactly once.
+            let cfg = account_cfg("");
+            let naming = Naming::from_config(&cfg);
+            let found = on(&[("devtest-apple", "main"), ("devtest-zebra", "main"), ("quiet_blue_fox", "master")]);
+            assert_eq!(
+                on_protected_lines(&naming, &found, false),
+                [
+                    "⊘ devtest-zebra (skipped — on protected branch main)",
+                    "⊘ quiet_blue_fox (skipped — on protected branch master)",
+                    "⚠ 1 cohort pod on main: not backed up until `arena pods init-branches devtest-apple`",
+                ]
+            );
+            assert!(on_protected_lines(&naming, &[], true).is_empty());
+        }
+
+        #[test]
+        fn set_branch_says_what_it_restored_and_reminds_on_main() {
+            let cases: &[(&[&str], &str, &str)] = &[
+                (&[], "main", ""),
+                (
+                    &["Grokking"],
+                    "main",
+                    " — restored 1 nested repo that main doesn't track (Grokking): on disk and staged; \
+                     the first backup on the next day branch commits them",
+                ),
+                (
+                    &["Grokking", "chapter4/exercises/shutdown_avoidance"],
+                    "master",
+                    " — restored 2 nested repos that master doesn't track (Grokking, chapter4/exercises/shutdown_avoidance): \
+                     on disk and staged; the first backup on the next day branch commits them",
+                ),
+                (
+                    &["Grokking"],
+                    "feature-x",
+                    " — restored 1 nested repo that feature-x doesn't track (Grokking): on disk and staged; the next backup commits them",
+                ),
+            ];
+            for (restored, branch, want) in cases {
+                assert_eq!(restored_note(restored, branch), *want, "{restored:?} {branch}");
+            }
+            let cfg = account_cfg("");
+            let naming = Naming::from_config(&cfg);
+            let landed = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            let reminder = |branch: &str, pods: &[&str], fleet_wide: bool| set_branch_reminder(&naming, branch, &landed(pods), fleet_wide);
+            assert_eq!(
+                reminder("main", &["devtest-apple", "devtest-bloom"], true).as_deref(),
+                Some("⚠ 2 cohort pods on main: not backed up until `arena pods init-branches`")
+            );
+            // A staff box that landed on main isn't counted (init-branches isn't its fix).
+            assert_eq!(
+                reminder("master", &["staff-gpu", "devtest-bloom"], false).as_deref(),
+                Some("⚠ 1 cohort pod on master: not backed up until `arena pods init-branches devtest-bloom`")
+            );
+            assert_eq!(reminder("main", &["staff-gpu"], false), None);
+            assert_eq!(reminder("main", &[], true), None);
+            assert_eq!(reminder("autocommit-devtest-w1d2-apple", &["devtest-apple"], true), None);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn backup_by_default_reaches_only_this_cohorts_pods_and_says_who_it_left_out() {
+            let cfg = account_cfg("");
+            take_said();
+            // No targets, `all`, `--all`: the cohort's three (the off-list extra included) and one
+            // line for the rest — not a failure (the run succeeds).
+            for argv in [&["backup", "--no-pull"][..], &["backup", "all", "--no-pull"], &["backup", "--all", "--no-pull"]] {
+                let fake = Arc::new(FakeRemote::new());
+                handle_pods(pods(argv), &account(), fake.clone(), &cfg, true).await.unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+                assert_eq!(ports(&fake), COHORT_PORTS, "{argv:?}");
+                assert_eq!(take_said(), [LEFT_OUT], "{argv:?}");
+            }
+            // A filter narrows the cohort's pods; it doesn't widen the default.
+            let fake = Arc::new(FakeRemote::new());
+            handle_pods(pods(&["backup", "--exclude", "bloom", "--no-pull"]), &account(), fake.clone(), &cfg, true).await.unwrap();
+            assert_eq!(ports(&fake), [22001, 22003]);
+            assert_eq!(take_said(), [LEFT_OUT]);
+            // Named — by name, @name or id, or a range: exactly those, staff boxes included, no line.
+            let cases: &[(&[&str], &[u16])] = &[
+                (&["backup", "staff-gpu", "@devtest-zebra", "quiet_blue_fox", "--no-pull"], &[22004, 22005, 22006]),
+                (&["backup", "id-devtest2-apple", "apple", "--no-pull"], &[22001, 22007]),
+                (&["backup", "apple..staff-gpu", "--no-pull"], &[22001, 22002, 22005]),
+            ];
+            for (argv, want) in cases {
+                let fake = Arc::new(FakeRemote::new());
+                handle_pods(pods(argv), &account(), fake.clone(), &cfg, true).await.unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+                assert_eq!(ports(&fake), *want, "{argv:?}");
+                assert_eq!(take_said(), Vec::<String>::new(), "{argv:?}");
+            }
+            // The non-cohort failures that used to fail every run are gone from it: here they
+            // would all fail, and the default run still succeeds.
+            let fake = Arc::new(FakeRemote::new());
+            for port in [22004, 22005, 22006, 22007] {
+                fake.script(&host(port), [FakeReply::exit(255, "Permission denied (publickey).")]);
+            }
+            handle_pods(pods(&["backup", "--no-pull"]), &account(), fake.clone(), &cfg, true).await.unwrap();
+            assert_eq!(ports(&fake), COHORT_PORTS);
+            take_said();
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn backup_says_once_which_cohort_pods_sit_on_main_and_still_exits_zero() {
+            let cfg = account_cfg("");
+            take_said();
+            // The morning reset: every cohort pod on main — one line, the plain fix, exit 0.
+            let fake = Arc::new(FakeRemote::new());
+            for port in COHORT_PORTS {
+                fake.script(&host(port), [FakeReply::stdout("SKIP main\n")]);
+            }
+            handle_pods(pods(&["backup", "--no-pull"]), &account(), fake.clone(), &cfg, true).await.unwrap();
+            assert_eq!(take_said(), [LEFT_OUT, "⚠ 3 cohort pods on main: not backed up until `arena pods init-branches`"]);
+
+            // Some on main: the line names them.
+            let fake = Arc::new(FakeRemote::new());
+            fake.script(&host(22001), [FakeReply::stdout("PUSHED autocommit-devtest-w1d2-apple\n")]);
+            fake.script(&host(22002), [FakeReply::stdout("SKIP main\n")]);
+            fake.script(&host(22003), [FakeReply::stdout("SKIP master\n")]);
+            handle_pods(pods(&["backup", "--no-pull"]), &account(), fake.clone(), &cfg, true).await.unwrap();
+            assert_eq!(
+                take_said(),
+                [
+                    LEFT_OUT,
+                    "⚠ 2 cohort pods on main or master: not backed up until `arena pods init-branches devtest-bloom devtest-extra`"
+                ]
+            );
+
+            // A staff box named next to a cohort pod, both on main: each said once, in its own line.
+            let fake = Arc::new(FakeRemote::new());
+            for port in [22001, 22004] {
+                fake.script(&host(port), [FakeReply::stdout("SKIP main\n")]);
+            }
+            handle_pods(pods(&["backup", "apple", "@devtest-zebra", "--no-pull"]), &account(), fake.clone(), &cfg, true).await.unwrap();
+            assert_eq!(
+                take_said(),
+                [
+                    "⊘ devtest-zebra (skipped — on protected branch main)",
+                    "⚠ 1 cohort pod on main: not backed up until `arena pods init-branches devtest-apple`"
+                ]
+            );
+
+            // A real failure beside them still fails the run — for that pod only.
+            let fake = Arc::new(FakeRemote::new());
+            fake.script(&host(22001), [FakeReply::stdout("SKIP main\n")]);
+            fake.script(&host(22002), [FakeReply::exit(1, "error: failed to push some refs")]);
+            fake.script(&host(22003), [FakeReply::stdout("SKIP main\n")]);
+            let err = handle_pods(pods(&["backup", "--no-pull"]), &account(), fake.clone(), &cfg, true).await.unwrap_err();
+            assert_eq!(err.to_string(), "1 pod(s) failed to back up");
+            assert_eq!(take_said(), [LEFT_OUT, "⚠ 2 cohort pods on main: not backed up until `arena pods init-branches`"]);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn set_branch_to_main_says_what_it_restored_and_reminds_until_init_branches() {
+            let cfg = account_cfg("");
+            take_said();
+            // `--all --hard`: the cohort's pods only; the pod with adopted clones says what was put
+            // back; the run ends with the reminder.
+            let fake = Arc::new(FakeRemote::new());
+            fake.script(&host(22001), [FakeReply::stdout("RESTORED Grokking\nRESTORED chapter4/x\n")]);
+            handle_pods(pods(&["set-branch", "main", "--all", "--hard"]), &account(), fake.clone(), &cfg, true).await.unwrap();
+            assert_eq!(ports(&fake), COHORT_PORTS);
+            let said = take_said();
+            assert_eq!((said.len(), said[0].as_str()), (5, LEFT_OUT), "{said:?}");
+            let mut per_pod = unnumbered(&said[1..4]);
+            per_pod.sort();
+            assert_eq!(
+                per_pod,
+                [
+                    "✓ devtest-apple (on main) — restored 2 nested repos that main doesn't track (Grokking, chapter4/x): \
+                     on disk and staged; the first backup on the next day branch commits them",
+                    "✓ devtest-bloom (on main)",
+                    "✓ devtest-extra (on main)",
+                ]
+            );
+            assert_eq!(said[4], "⚠ 3 cohort pods on main: not backed up until `arena pods init-branches`");
+
+            // Named, a staff box among them: the reminder names the cohort pod only.
+            let fake = Arc::new(FakeRemote::new());
+            handle_pods(pods(&["set-branch", "main", "bloom", "staff-gpu"]), &account(), fake.clone(), &cfg, true).await.unwrap();
+            assert_eq!(ports(&fake), [22002, 22005]);
+            let said = take_said();
+            assert_eq!(said.last().map(String::as_str), Some("⚠ 1 cohort pod on main: not backed up until `arena pods init-branches devtest-bloom`"));
+            assert_eq!(said.len(), 3, "{said:?}");
+
+            // A failed switch: the reminder still names the pods that did land on main.
+            let fake = Arc::new(FakeRemote::new());
+            fake.script(&host(22002), [FakeReply::exit(1, "error: Your local changes would be overwritten")]);
+            let err = handle_pods(pods(&["set-branch", "main", "apple", "bloom"]), &account(), fake.clone(), &cfg, true).await.unwrap_err();
+            assert_eq!(err.to_string(), "1 pod(s) failed to switch branch");
+            assert_eq!(take_said().last().map(String::as_str), Some("⚠ 1 cohort pod on main: not backed up until `arena pods init-branches devtest-apple`"));
+
+            // Any other branch: no reminder.
+            let fake = Arc::new(FakeRemote::new());
+            handle_pods(pods(&["set-branch", "feature-x", "apple"]), &account(), fake.clone(), &cfg, true).await.unwrap();
+            assert_eq!(take_said(), ["[1/1] ✓ devtest-apple (on feature-x)"]);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn set_branch_init_branches_inits_the_same_pods_once_every_one_has_switched() {
+            let cfg = account_cfg("ARENA_START_DATE=2026-10-05\n");
+            let (week, day) = resolve_week_day(&cfg, None, None).unwrap();
+            let bcfg = BackupConfig::from_config(&cfg, week, day);
+            let hard = checkout_command(REPO, "main", Some(KEY), true);
+            take_said();
+            // Each cohort pod: the hard reset, then its day branch — nothing on the staff boxes.
+            let fake = Arc::new(FakeRemote::new());
+            handle_pods(pods(&["set-branch", "main", "--all", "--hard", "--init-branches"]), &account(), fake.clone(), &cfg, true).await.unwrap();
+            assert_eq!(ports(&fake), COHORT_PORTS);
+            for (name, port) in [("devtest-apple", 22001), ("devtest-bloom", 22002), ("devtest-extra", 22003)] {
+                let init = init_branch_command(&bcfg, name);
+                assert_eq!(execs(&fake, port), [(hard.clone(), Some(BRANCH_TIMEOUT)), (init, Some(BRANCH_TIMEOUT))], "{name}");
+            }
+            take_said();
+            // A failed switch: no pod gets a day branch (the operator re-runs once all are on main).
+            let fake = Arc::new(FakeRemote::new());
+            fake.script(&host(22002), [FakeReply::exit(1, "fatal: unable to access")]);
+            let err = handle_pods(pods(&["set-branch", "main", "--all", "--hard", "--init-branches"]), &account(), fake.clone(), &cfg, true)
+                .await
+                .unwrap_err();
+            assert_eq!(err.to_string(), "1 pod(s) failed to switch branch");
+            assert!(COHORT_PORTS.iter().all(|&p| execs(&fake, p).len() == 1), "{:?}", fake.calls());
+            // No start date to name the day: refused before any pod is switched.
+            let fake = Arc::new(FakeRemote::new());
+            let err = handle_pods(pods(&["set-branch", "main", "--all", "--hard", "--init-branches"]), &account(), fake.clone(), &account_cfg(""), true)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("ARENA_START_DATE"), "{err}");
+            assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+            // A dry run previews both and reaches nobody.
+            let fake = Arc::new(FakeRemote::new());
+            handle_pods(pods(&["set-branch", "main", "--all", "--init-branches", "--dry-run"]), &account(), fake.clone(), &cfg, true).await.unwrap();
+            assert!(fake.calls().is_empty());
+            take_said();
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn init_branches_by_default_leaves_out_non_cohort_pods_too() {
+            let cfg = account_cfg("");
+            take_said();
+            let fake = Arc::new(FakeRemote::new());
+            handle_pods(pods(&["init-branches", "--week", "1", "--day", "2"]), &account(), fake.clone(), &cfg, true).await.unwrap();
+            assert_eq!(ports(&fake), COHORT_PORTS);
+            assert_eq!(take_said(), [LEFT_OUT]);
+            let fake = Arc::new(FakeRemote::new());
+            handle_pods(pods(&["init-branches", "staff-gpu", "--week", "1", "--day", "2"]), &account(), fake.clone(), &cfg, true).await.unwrap();
+            assert_eq!(ports(&fake), [22005]);
+            assert!(take_said().is_empty());
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn pull_by_default_leaves_out_non_cohort_pods_too() {
+            let cfg = account_cfg("");
+            take_said();
+            // A dry run (it reaches no pod either way) says the same one line; named, none.
+            let fake = Arc::new(FakeRemote::new());
+            handle_pods(pods(&["pull", "--label", "w1d2", "--dry-run"]), &account(), fake.clone(), &cfg, true).await.unwrap();
+            assert_eq!(take_said(), [LEFT_OUT]);
+            handle_pods(pods(&["pull", "staff-gpu", "--label", "w1d2", "--dry-run"]), &account(), fake.clone(), &cfg, true).await.unwrap();
+            assert!(take_said().is_empty());
+            assert!(fake.calls().is_empty());
         }
     }
 }

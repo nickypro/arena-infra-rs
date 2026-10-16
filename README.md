@@ -546,7 +546,17 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
   - `pods backup [targets]` — the **full save**: git-push the ARENA tree **and** rsync the
     home to the local backups folder (`pull`). The git push is on **whatever branch the
     pod is on** (never switches/creates one, so bespoke branches are respected) and
-    **skips `main`/`master`**; clean trees report `NO_CHANGES`. Selected pods, or all.
+    **skips `main`/`master`**; clean trees report `NO_CHANGES`. Selected pods, or — none
+    named (no targets, `all`/`--all`) — **this cohort's**: `<prefix>-…` pods (one off
+    `MACHINE_NAME_LIST` too: an extra pod made for someone, a parked `-old` twin), never an `@`
+    staff entry. The rest (staff boxes, another prefix, a pod the provider named) get one
+    `⊘ skipped N non-cohort pods (…): a, b — name one to include it` line, never a failure;
+    named, they're backed up like any pod (list a staff box that wears the prefix as
+    `@<prefix>-name` to leave it out). Cohort pods on `main`/`master` (after `set-branch main`,
+    until `init-branches`) get one line after the run, not a SKIP each:
+    ``⚠ 12 cohort pods on main: not backed up until `arena pods init-branches` `` (it names the
+    pods when only some are). Not a failure — the exit stays 0: the reset window is routine
+    every morning, and a daily non-zero exit would bury the ones that mean a push broke.
     `--no-pull` = git only; `--message` overrides the commit message. Confirms first
     (`--dry-run` previews both). Each pod's git push has a 5-min budget, its rsync the
     `pull` budgets below. To stage onto a dated autocommit branch, run `pods init-branches`
@@ -589,15 +599,18 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     (the cron's) — and its line says where its files went (or why that failed too); the run still
     fails. A pod that fails before its push (no repo, ssh refused, a timeout) keeps its plain
     failure line and isn't copied every 15 minutes.
-  - `pods set-branch <branch> <targets|--all> [--hard]` — switch pods' ARENA checkout to a
-    branch. Gentle by default (fetch + checkout + ff-only pull — fails on a diverged/dirty
+  - `pods set-branch <branch> <targets|--all> [--hard] [--init-branches]` — switch pods'
+    ARENA checkout to a branch. Gentle by default (fetch + checkout + ff-only pull — fails on a diverged/dirty
     tree rather than clobbering work). **`--hard` is destructive**: force the branch to
     match `origin/<branch>`, discarding local commits/changes (untracked files survive) —
     e.g. `set-branch main --all --hard` resets the fleet to `main`. Confirms first;
     `--dry-run` previews. Pods switch concurrently, 2-min budget each. A nested clone the
     backup adopted (see `pods backup`) is tracked only on the autocommit branches, so a
     switch to `main` would delete it from disk and break that exercise: it is put back from
-    the previous HEAD, **staged** (so switching back goes through), and named per pod. Each
+    the previous HEAD, **staged** (so switching back goes through), and named per pod
+    (`restored 2 nested repos that main doesn't track (Grokking, …): on disk and staged; the
+    first backup on the next day branch commits them`). `--all` = this cohort's pods, as for
+    `backup` (a staff box only when named). Each
     pod's current branch is **backed up first** (the `backup` commit + push, keys redacted; a
     no-op on `main` or a branch in sync), under the pod's backup lock, held until its switch
     ends. A pod whose push fails is rsynced into `LOCAL_BACKUP_DIR` first, then switched, its
@@ -608,12 +621,16 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     backup committed with a key redacted keeps the real key on disk: around the switch it's set
     aside in `.git/arena-unredacted/<time>-<pid>/` (so gentle doesn't refuse it and `--hard`
     doesn't drop the key; a later set-aside never overwrites an earlier one) and put back when
-    the pod returns to that branch.
+    the pod returns to that branch. Landing pods on `main`/`master` ends with the reminder
+    ``⚠ N cohort pods on main: not backed up until `arena pods init-branches` ``;
+    `--init-branches` runs `init-branches` on the same pods once every one has switched (the
+    start date is checked first; a failed switch inits nobody).
   - `pods init-branches` — create each pod's `autocommit-…-wNdM-…` branch and push it
     upstream **without committing** (legacy `init_branches`), so a new day's branch
     exists before `backup` runs. `--week`/`--day` override; `--dry-run` previews. 2-min
     budget per pod. A pod still on another branch has it backed up first, as `set-branch` does
-    (and isn't switched if it can be neither pushed nor copied).
+    (and isn't switched if it can be neither pushed nor copied). No targets = this cohort's
+    pods, as for `backup`.
   - `pods run [-t <targets>] [--timeout <secs>] <cmd>` / `pods test [targets]` — run an
     arbitrary command on every (selected) pod (concurrent, confirms first naming the pods;
     each pod gets `--timeout`, default 1800s = 30 min — flags go *before* the command: a bare
@@ -931,7 +948,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
   - `pods pull [targets] [--label <label>]` — the **file** backup (complementing the git
     `backup`): rsyncs each pod's home into `<dir>/<label>/<pod>/`, reporting per pod what was
     sent and what the snapshot holds (`12 files, 3.4M sent of 6754, 1.8G` — sizes parsed in
-    every format rsync prints). Targets are positional like every command's (the old `-t`
+    every format rsync prints). No targets = this cohort's pods, as for `backup` (a staff box
+    only when named). Targets are positional like every command's (the old `-t`
     still works, and so does `pods pull w1d3` — read as the label, with a note — when `w1d3`
     names no pod). **Keeps `.git`, complete** (`--no-git` to skip): the size cap
     (`--max-size`) applies to the files, then a second pass copies every kept `.git` uncapped
@@ -1411,10 +1429,11 @@ old spelling of a target (`stop --all --include X` keeps meaning "only X").
 | --- | --- | --- | --- |
 | `run` | `-t <targets>` (the command is positional) | every pod | parallel |
 | `test`, `test --deep` | positional | every pod | parallel |
-| `setup`, `copy-keys`, `backup`, `init-branches` | positional | every pod | parallel |
+| `setup`, `copy-keys` | positional | every pod | parallel |
+| `backup`, `init-branches` | positional | this cohort's pods (`all`/`--all` too; a staff box only when named) | parallel |
 | `cp` | `-t <targets>` (file/dest are positional) | every pod | parallel |
-| `pull` | positional (the label is `--label`; the old `-t`, and a lone `wNdM` that names no pod, still work) | every pod | parallel |
-| `set-branch <branch>` | positional after the branch | **refused** (targets or `--all`) | parallel |
+| `pull` | positional (the label is `--label`; the old `-t`, and a lone `wNdM` that names no pod, still work) | this cohort's pods, as `backup` | parallel |
+| `set-branch <branch>` | positional after the branch | **refused** (targets or `--all` = this cohort's pods) | parallel |
 | `stop`, `reimage` | positional | **refused** (targets or `--all`) | serial (provider API) |
 | `keys gen/rotate/revoke` | positional (pods *or* list names) | **refused** (`--all` = current pods) | serial |
 | `terminate`, `restart`, `rename`, `replace`, `migrate` | **one** pod (same matcher; ambiguous name refused) | — (`terminate --all` for the fleet) | n/a |
