@@ -6,12 +6,15 @@
 //! safe default: participants' work is backed up without ever racing each other on
 //! `main`. The repo path, branch prefix, and push key are all config-driven.
 //!
-//! Two things never go into those commits, because each once stopped participants' work from
+//! Three things never go into those commits, because each once stopped participants' work from
 //! reaching GitHub: a file over [`GIT_MAX_FILE_BYTES`] (GitHub refuses the push — then every
-//! push after it), and a nested repo as a gitlink (a commit id without its files). The image's
-//! nested clones are adopted instead — the course repo tracks their files where they are, their
-//! own `.git` untouched — once; other nested repos are kept out and reported. The script is
-//! [`BACKUP_SCRIPT`].
+//! push after it), a nested repo as a gitlink (a commit id without its files), and a pasted key
+//! ([`SECRET_PATTERNS`]: GitHub's push protection refuses the push — then every push after it).
+//! The image's nested clones are adopted instead — the course repo tracks their files where they
+//! are, their own `.git` untouched — once; other nested repos are kept out and reported. A file
+//! holding a key is committed with the key redacted, the file on disk untouched; and a branch
+//! GitHub already refuses over a key in older unpushed commits is healed — those commits
+//! rewritten redacted, pushed as a fast-forward. The script is [`backup_script`].
 //!
 //! This module only *renders* the command (pure, unit-tested). Running it — and thus
 //! mutating remote git state — is gated behind the CLI's `--apply`.
@@ -90,15 +93,99 @@ pub const GITHUB_FILE_LIMIT_BYTES: u64 = 100 * 1024 * 1024;
 /// unpushed commits — no push can succeed until they're rewritten ([`BackupReport::stuck_fix`]).
 pub const BACKUP_STUCK_EXIT: i32 = 3;
 
-/// The backup script ([`backup_command`]). POSIX `sh`, so it runs the same whatever the pod's
-/// login shell; its header documents every line it prints.
-pub const BACKUP_SCRIPT: &str = include_str!("backup.sh");
+/// The exit status of a backup whose push GitHub's push protection still refuses after the
+/// redaction and the heal: a key [`SECRET_PATTERNS`] doesn't know (`PUSH_BLOCKED <reason>`).
+pub const BACKUP_BLOCKED_EXIT: i32 = 4;
+
+/// One kind of key the backup never lets into git ([`SECRET_PATTERNS`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SecretPattern {
+    /// What it is (as GitHub's push protection names it, near enough).
+    pub name: &'static str,
+    /// The key itself, as a GNU extended regex matched on bytes (`sed -E`/`grep -E`, `LC_ALL=C`)
+    /// — without what must come before it ([`SECRET_LEAD`]).
+    pub re: &'static str,
+    /// What it becomes in git: plain text that no pattern matches, so redacting twice changes
+    /// nothing (the next backup's redacted blob is the one HEAD has: no new commit).
+    pub replacement: &'static str,
+}
+
+/// What must come right before a key: the start of a line, a character that can't be part of a
+/// word (so `task-or-v1-…` is no OpenRouter key), or a JSON escape (`\n`, `\t`, `\r`) — a
+/// notebook's source and outputs are JSON strings, where a key starting a line follows `\n`.
+pub const SECRET_LEAD: &str = r"(^|[^A-Za-z0-9_]|\\[nrt])";
+
+/// The keys the backup redacts before committing (and out of unpushed commits GitHub refused):
+/// high-confidence formats only — a fixed prefix and a long body of a fixed alphabet — so ordinary
+/// code (`sklearn`, `hf_hub_download`, a UUID, a notebook's base64 image) never matches. What we
+/// hand out first (OpenRouter keys, `HF_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`), then what GitHub's
+/// push protection refuses that a participant is likely to paste. A miss isn't silent: GitHub
+/// refuses the push, the backup reports `PUSH_BLOCKED` with GitHub's name for the secret, and the
+/// pod's files are copied by rsync instead — add the pattern here. One list: the backup script,
+/// `set-branch` and the table tests all render it from here ([`secret_regex`], [`redact_sed`]).
+///
+/// Formats (GitHub's secret-scanning pattern list, the providers' own docs):
+/// - OpenRouter: `sk-or-v1-` + 64 lowercase hex — the keys `pods up` mints; what GitHub refused
+///   as "OpenRouter API Key" (prod, 2026-10-15).
+/// - Anthropic: `sk-ant-api03-` (API key), `sk-ant-admin01-` (Admin API key) — 93 of
+///   `[A-Za-z0-9_-]` then `AA`; `sk-ant-oat01-` the Claude Code OAuth token, same shape, which
+///   setup broadcasts (`--cc-token`). Matched from 80 body characters on.
+/// - OpenAI: project/service-account/admin keys `sk-proj-`/`sk-svcacct-`/`sk-admin-` (long:
+///   40+ here, ~150 in practice) and any `sk-…T3BlbkFJ…` (`T3BlbkFJ` is base64 for "OpenAI";
+///   the legacy `sk-` + 20 + `T3BlbkFJ` + 20). Never a bare `sk-…`: far too broad.
+/// - Hugging Face user access token: `hf_` + exactly 34 letters.
+/// - GitHub: `ghp_` (classic PAT), `gho_` (OAuth), `ghu_`/`ghs_` (app user/server), `ghr_`
+///   (refresh) + 36+ alphanumerics; fine-grained `github_pat_` + 82+ of `[A-Za-z0-9_]`.
+/// - AWS access key id: `AKIA` + exactly 16 of `[0-9A-Z]`.
+pub const SECRET_PATTERNS: &[SecretPattern] = &[
+    SecretPattern { name: "OpenRouter API key", re: r"sk-or-v1-[0-9a-f]{64}\b", replacement: "REDACTED-OPENROUTER-KEY" },
+    SecretPattern {
+        name: "Anthropic API key",
+        re: r"sk-ant-(api03|admin01|oat01)-[A-Za-z0-9_-]{80,}",
+        replacement: "REDACTED-ANTHROPIC-KEY",
+    },
+    SecretPattern { name: "OpenAI API key", re: r"sk-(proj|svcacct|admin)-[A-Za-z0-9_-]{40,}", replacement: "REDACTED-OPENAI-KEY" },
+    SecretPattern { name: "OpenAI API key", re: r"sk-[A-Za-z0-9_-]{10,}T3BlbkFJ[A-Za-z0-9_-]{10,}", replacement: "REDACTED-OPENAI-KEY" },
+    SecretPattern { name: "Hugging Face token", re: r"hf_[A-Za-z]{34}\b", replacement: "REDACTED-HUGGINGFACE-TOKEN" },
+    SecretPattern { name: "GitHub token", re: r"gh[pousr]_[A-Za-z0-9]{36,}", replacement: "REDACTED-GITHUB-TOKEN" },
+    SecretPattern { name: "GitHub fine-grained token", re: r"github_pat_[A-Za-z0-9_]{82,}", replacement: "REDACTED-GITHUB-TOKEN" },
+    SecretPattern { name: "AWS access key id", re: r"AKIA[0-9A-Z]{16}\b", replacement: "REDACTED-AWS-ACCESS-KEY-ID" },
+];
+
+/// Any one key of [`SECRET_PATTERNS`], with its [`SECRET_LEAD`]: what the backup looks for (and
+/// counts) in a blob before rewriting it.
+pub fn secret_regex() -> String {
+    let any: Vec<&str> = SECRET_PATTERNS.iter().map(|p| p.re).collect();
+    format!("{SECRET_LEAD}({})", any.join("|"))
+}
+
+/// [`SECRET_PATTERNS`] as a `sed -E` program: each key → its replacement, what came before it
+/// kept. Every other byte of the blob is left exactly as it was.
+pub fn redact_sed() -> String {
+    SECRET_PATTERNS.iter().map(|p| format!("s/{SECRET_LEAD}{}/\\1{}/g", p.re, p.replacement)).collect::<Vec<_>>().join("\n")
+}
+
+/// The redaction's shell functions (`redact.sh`), with [`secret_regex`] and [`redact_sed`]
+/// rendered in — shared by the backup script and `set-branch`'s command.
+pub fn redact_sh() -> String {
+    include_str!("redact.sh").replace("@SECRET_RE@", &secret_regex()).replace("@REDACT_SED@", &redact_sed())
+}
+
+/// The line of `backup.sh` that [`backup_script`] replaces with [`redact_sh`].
+const REDACT_SH_MARK: &str = "# @ARENA_REDACT_SH@";
+
+/// The backup script ([`backup_command`]): `backup.sh` with [`redact_sh`] rendered in. POSIX
+/// `sh`, so it runs the same whatever the pod's login shell; its header documents every line it
+/// prints.
+pub fn backup_script() -> String {
+    include_str!("backup.sh").replacen(REDACT_SH_MARK, redact_sh().trim_end(), 1)
+}
 
 /// Render the remote shell command that commits + pushes one machine's working tree **on
 /// whatever branch it is currently on** — it never switches or creates a branch, so a
 /// participant's bespoke branch is respected (matching legacy `sync_git.sh`, not
 /// `init_branches.sh`). To stage work on a dedicated autocommit branch, put the pod there
-/// first with `init-branches`/`set-branch`. It runs [`BACKUP_SCRIPT`] under `sh` with the
+/// first with `init-branches`/`set-branch`. It runs [`backup_script`] under `sh` with the
 /// repo, message, size limits ([`GIT_MAX_FILE_BYTES`], [`GITHUB_FILE_LIMIT_BYTES`]) and push key
 /// as arguments.
 ///
@@ -128,10 +215,10 @@ pub fn backup_command_limited(
     max_file_bytes: u64,
     push_limit_bytes: u64,
 ) -> String {
-    format!("sh -c {} arena-backup {}", shell_quote(BACKUP_SCRIPT), script_args(repo_path, git_ssh_key, commit_msg, max_file_bytes, push_limit_bytes))
+    format!("sh -c {} arena-backup {}", shell_quote(&backup_script()), script_args(repo_path, git_ssh_key, commit_msg, max_file_bytes, push_limit_bytes))
 }
 
-/// [`BACKUP_SCRIPT`]'s arguments, shell-quoted.
+/// [`backup_script`]'s arguments, shell-quoted.
 fn script_args(repo_path: &str, git_ssh_key: Option<&str>, commit_msg: &str, max_file_bytes: u64, push_limit_bytes: u64) -> String {
     format!(
         "{} {} {max_file_bytes} {push_limit_bytes} {}",
@@ -141,7 +228,7 @@ fn script_args(repo_path: &str, git_ssh_key: Option<&str>, commit_msg: &str, max
     )
 }
 
-/// The file a dry run's per-pod line reads [`BACKUP_SCRIPT`] from ([`backup_dry_run_line`]);
+/// The file a dry run's per-pod line reads [`backup_script`] from ([`backup_dry_run_line`]);
 /// [`backup_script_heredoc`] writes it.
 pub const BACKUP_SCRIPT_FILE: &str = "arena-backup.sh";
 
@@ -162,10 +249,10 @@ pub fn backup_dry_run_line(target: &crate::ssh::SshTarget, repo_path: &str, git_
     format!("{} < {BACKUP_SCRIPT_FILE}", target.display_command(&backup_summary(repo_path, git_ssh_key, commit_msg)))
 }
 
-/// The here-doc that writes [`BACKUP_SCRIPT`] to [`BACKUP_SCRIPT_FILE`] — pasteable, printed once
+/// The here-doc that writes [`backup_script`] to [`BACKUP_SCRIPT_FILE`] — pasteable, printed once
 /// by a dry run for its per-pod lines ([`backup_dry_run_line`]).
 pub fn backup_script_heredoc() -> String {
-    format!("cat > {BACKUP_SCRIPT_FILE} <<'{HEREDOC_END}'\n{}\n{HEREDOC_END}", BACKUP_SCRIPT.trim_end())
+    format!("cat > {BACKUP_SCRIPT_FILE} <<'{HEREDOC_END}'\n{}\n{HEREDOC_END}", backup_script().trim_end())
 }
 
 /// [`backup_script_heredoc`]'s delimiter: a line the script never has.
@@ -178,7 +265,7 @@ pub fn parse_backup_output(stdout: &str) -> Option<(&'static str, String)> {
     parse_backup_report(stdout).outcome
 }
 
-/// Everything a backup run said ([`BACKUP_SCRIPT`]'s lines).
+/// Everything a backup run said ([`backup_script`]'s lines).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BackupReport {
     /// The sentinel and the branch it named (`None`: it never got that far).
@@ -194,9 +281,20 @@ pub struct BackupReport {
     pub adopted: Vec<String>,
     /// Nested repos left as they are and kept out of the commit.
     pub kept: Vec<String>,
+    /// The branch the run backed up (`None`: a protected one, or it never got that far).
+    pub branch: Option<String>,
+    /// Files committed with their keys redacted: `(keys, path)` — the files on disk keep them.
+    pub redacted: Vec<(u64, String)>,
+    /// A push GitHub refused over a key in older unpushed commits, healed: `(commits rewritten,
+    /// old tip, new tip)` — the new tip is on GitHub.
+    pub healed: Option<(u64, String, String)>,
+    /// Why a heal stopped short (the branch moved meanwhile; the next run ends it).
+    pub heal_aborted: Option<String>,
+    /// GitHub's push protection still refuses the push: its reason (secret type, path:line).
+    pub push_blocked: Option<String>,
 }
 
-/// Parse a backup's stdout ([`BACKUP_SCRIPT`]'s header lists the lines). Unknown lines (git's
+/// Parse a backup's stdout ([`backup_script`]'s header lists the lines). Unknown lines (git's
 /// own chatter) are ignored.
 pub fn parse_backup_report(stdout: &str) -> BackupReport {
     let mut r = BackupReport::default();
@@ -213,6 +311,19 @@ pub fn parse_backup_report(stdout: &str) -> BackupReport {
             "BIGSTUCK_BASE" => r.stuck_base = Some(rest.trim()).filter(|b| !b.is_empty() && *b != "none").map(String::from),
             "NESTED_ADOPTED" if !rest.is_empty() => r.adopted.push(rest.to_string()),
             "NESTED_KEPT" if !rest.is_empty() => r.kept.push(rest.to_string()),
+            "BRANCH" if !rest.trim().is_empty() => r.branch = Some(rest.trim().to_string()),
+            "REDACTED" => r.redacted.extend(sized(rest)),
+            "HEALED" => {
+                let f: Vec<&str> = rest.split_whitespace().collect();
+                if let [n, old, new] = f[..] {
+                    r.healed = n.parse().ok().map(|n| (n, old.to_string(), new.to_string()));
+                }
+            }
+            "HEAL_ABORTED" => r.heal_aborted = Some(rest.trim().to_string()),
+            "PUSH_BLOCKED" => {
+                let why = rest.trim();
+                r.push_blocked = Some(if why.is_empty() { "refused by GitHub push protection".into() } else { why.to_string() });
+            }
             _ if r.outcome.is_none() => {
                 for sentinel in [BACKUP_PUSHED, BACKUP_NO_CHANGES, BACKUP_SKIPPED] {
                     if word == sentinel {
@@ -229,6 +340,11 @@ pub fn parse_backup_report(stdout: &str) -> BackupReport {
 /// Bytes as `110.0 MB` (MiB, as GitHub reports file sizes).
 fn mb(bytes: u64) -> String {
     format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+}
+
+/// A commit id's first 10 characters, as a report shows it.
+fn short_id(id: &str) -> &str {
+    id.get(..10).unwrap_or(id)
 }
 
 /// `a, b, c` — at most `max` of them, then `(+N more)`.
@@ -268,7 +384,61 @@ impl BackupReport {
                 some_of(&self.kept, 4)
             ));
         }
+        if !self.redacted.is_empty() {
+            let keys: u64 = self.redacted.iter().map(|(n, _)| n).sum();
+            let files: Vec<String> = self.redacted.iter().map(|(_, p)| p.clone()).collect();
+            notes.push(format!(
+                "redacted {keys} pasted key(s) in {} file(s) before committing: {} — git has them redacted, the files on \
+                 disk keep the key (shown as modified)",
+                files.len(),
+                some_of(&files, 3)
+            ));
+        }
+        if let Some((n, old, new)) = &self.healed {
+            notes.push(format!(
+                "healed: GitHub refused the push over a key in older unpushed commits — rewrote {n} of them with the key(s) \
+                 redacted and pushed them as a fast-forward ({} → {})",
+                short_id(old),
+                short_id(new)
+            ));
+        }
         notes
+    }
+
+    /// For a run that failed in a way the script explained — a file over GitHub's limit in the
+    /// unpushed commits ([`Self::stuck_fix`]), a key GitHub refuses that the redaction doesn't
+    /// know, a heal cut short — what happened and what to do; `None` for any other run (exit
+    /// `code`). `repo` is the checkout on `pod`.
+    pub fn failure(&self, repo: &str, pod: &str, code: Option<i32>) -> Option<String> {
+        if code == Some(BACKUP_STUCK_EXIT) {
+            if let Some(fix) = self.stuck_fix(repo, pod) {
+                return Some(fix);
+            }
+        }
+        if let (Some(BACKUP_BLOCKED_EXIT), Some(why)) = (code, &self.push_blocked) {
+            let branch = self.branch.as_deref().unwrap_or("its branch");
+            return Some(format!(
+                "GitHub push protection refuses {branch}: {why} — a secret the backup doesn't redact. Its pattern belongs in \
+                 arena_core::backup::SECRET_PATTERNS; until then, take it out of the unpushed commits on {pod} by hand \
+                 (the file on disk may keep it)"
+            ));
+        }
+        self.heal_aborted.as_ref().map(|why| match &self.healed {
+            Some((n, _, new)) => format!("pushed {n} rewritten commit(s) ({}), then {why}", short_id(new)),
+            None => why.clone(),
+        })
+    }
+
+    /// [`Self::failure`] in a few words, for a line that says what else happened (the fallback
+    /// copy): `None` for a failure the script didn't explain.
+    pub fn failure_brief(&self, code: Option<i32>) -> Option<String> {
+        if code == Some(BACKUP_STUCK_EXIT) && !self.big_stuck.is_empty() {
+            return Some(format!("file(s) over {} MB in unpushed commits", GITHUB_FILE_LIMIT_BYTES / (1024 * 1024)));
+        }
+        if let (Some(BACKUP_BLOCKED_EXIT), Some(why)) = (code, &self.push_blocked) {
+            return Some(format!("GitHub push protection: {why}"));
+        }
+        self.heal_aborted.as_ref().map(|_| "the branch moved while its commits were being redacted".to_string())
     }
 
     /// For a run that found files over GitHub's limit in the unpushed commits: why nothing can be
@@ -338,6 +508,17 @@ pub fn init_branch_command(cfg: &BackupConfig, machine_name: &str) -> String {
 /// back to a branch that tracks them ("untracked working tree files would be overwritten"),
 /// staged they ride along with it. A backup never commits on `main`, and the next
 /// `init-branches` branch commits them.
+///
+/// A file the backup committed with a pasted key redacted keeps the real key on disk, so it is
+/// modified for good: a gentle switch to a branch with another version of it would refuse
+/// (`would be overwritten`) — every time — and `--hard` would throw the key away, which no
+/// commit has. So around the switch (`unredacted.sh`): each tracked file whose *only*
+/// difference from the index is keys the redaction knows is set aside in
+/// `.git/arena-unredacted/` and put back to git's version; after the switch, one whose path
+/// holds exactly that version again gets its real keys back (`UNREDACTED_RESTORED <path>`), the
+/// rest stay set aside (`UNREDACTED_KEPT <path>`) until a switch back. Even a failed switch puts
+/// them back before it exits. A file with any other uncommitted change is left to the switch, as
+/// before.
 pub fn checkout_command(repo_path: &str, branch: &str, git_ssh_key: Option<&str>, hard: bool) -> String {
     let mut parts: Vec<String> = vec!["set -e".into(), format!("cd {}", shell_quote(repo_path))];
     if let Some(key) = git_ssh_key {
@@ -350,25 +531,32 @@ pub fn checkout_command(repo_path: &str, branch: &str, git_ssh_key: Option<&str>
     }
     parts.push("git fetch origin".into());
     parts.push("OLD=$(git rev-parse -q --verify HEAD) || OLD=".into());
-    if hard {
+    let switch = if hard {
         let remote_ref = shell_quote(&format!("origin/{branch}"));
         // Force-switch to the branch reset to origin (discards local changes/commits on it).
-        parts.push(format!("git checkout -f -B {} {remote_ref}", shell_quote(branch)));
-        parts.push(format!("git reset --hard {remote_ref}"));
+        format!("git checkout -f -B {} {remote_ref} && git reset --hard {remote_ref}", shell_quote(branch))
     } else {
-        parts.push(format!("git checkout {}", shell_quote(branch)));
-        parts.push("git pull --ff-only".into());
-    }
+        format!("git checkout {} && git pull --ff-only", shell_quote(branch))
+    };
+    let mut lines = vec![parts.join("; ")];
+    // The keys set aside around the switch (from the repo's top: git's paths are relative to it).
+    lines.push(format!("REDACT_SED={}", shell_quote(&redact_sed())));
+    lines.extend(
+        include_str!("unredacted.sh").lines().filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#')).map(String::from),
+    );
+    lines.push("cd \"$(git rev-parse --show-toplevel)\"; G=$(git rev-parse --absolute-git-dir); unredacted_aside \"$G/arena-unredacted\"".into());
+    lines.push(format!("if {switch}; then SWITCHED=1; else SWITCHED=; fi"));
     // The adopted clones (listed by the backup in `$G/arena-nested`) the switch removed: back
     // from the old HEAD, staged.
-    parts.push(
-        "G=$(git rev-parse --absolute-git-dir); if [ -n \"$OLD\" ] && [ -s \"$G/arena-nested\" ]; then \
+    lines.push(
+        "if [ -n \"$SWITCHED\" ] && [ -n \"$OLD\" ] && [ -s \"$G/arena-nested\" ]; then \
          while IFS= read -r d; do if [ -n \"$d\" ] && git cat-file -e \"$OLD:$d\" 2>/dev/null && \
          ! git cat-file -e \"HEAD:$d\" 2>/dev/null; then git checkout -q \"$OLD\" -- \":(literal)$d\" && \
          echo \"RESTORED $d\"; fi; done < \"$G/arena-nested\"; fi"
             .into(),
     );
-    parts.join("; ")
+    lines.push("unredacted_restore \"$G/arena-unredacted\"; [ -n \"$SWITCHED\" ]".into());
+    lines.join("\n")
 }
 
 /// Wrap a value in single quotes for safe inclusion in a `sh -c` string, escaping any
@@ -414,7 +602,7 @@ mod tests {
             )),
             "{c}"
         );
-        let s = BACKUP_SCRIPT;
+        let s = &backup_script();
         // Never switches/creates a branch — works on whatever HEAD is on.
         assert!(!s.contains("git checkout"));
         assert!(s.contains("B=$(git rev-parse --abbrev-ref HEAD)"));
@@ -437,14 +625,159 @@ mod tests {
     fn omits_git_ssh_command_without_key() {
         // An empty key argument: the script exports no GIT_SSH_COMMAND for it.
         assert!(backup_command("/root/ARENA_3.0", None, "m").ends_with(" 'm' 99614720 104857600 ''"));
-        assert!(BACKUP_SCRIPT.contains(r#"if [ -n "$KEY" ]; then"#));
+        assert!(backup_script().contains(r#"if [ -n "$KEY" ]; then"#));
     }
 
     #[test]
     fn the_script_is_posix_sh() {
         for shell in ["sh", "bash"] {
-            let o = std::process::Command::new(shell).arg("-n").arg("-c").arg(BACKUP_SCRIPT).output().expect(shell);
+            let o = std::process::Command::new(shell).arg("-n").arg("-c").arg(backup_script()).output().expect(shell);
             assert!(o.status.success(), "{shell} -n: {}", String::from_utf8_lossy(&o.stderr));
+        }
+    }
+
+    /// `n` characters of `alphabet`, deterministic per `seed` — the body of a test key, built at
+    /// run time: a key-shaped literal in this file would itself be refused by GitHub's push
+    /// protection (this repo is public).
+    fn body(alphabet: &str, n: usize, seed: usize) -> String {
+        let a: Vec<char> = alphabet.chars().collect();
+        (0..n).map(|i| a[(i * 7 + seed * 13 + i / 3) % a.len()]).collect()
+    }
+    const HEX: &str = "0123456789abcdef";
+    const ALNUM: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    const LETTERS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    const URLSAFE: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
+
+    /// An OpenRouter-shaped key (`sk-or-v1-` + 64 hex), distinct per `seed`.
+    fn openrouter_key(seed: usize) -> String {
+        format!("{}{}", "sk-or-v1-", body(HEX, 64, seed))
+    }
+
+    /// `text` through the program a pod runs ([`redact_sed`] under GNU sed, as bytes), and how
+    /// many keys [`secret_regex`] (`grep -o`) counts in it.
+    #[cfg(unix)]
+    fn redact(text: &str) -> (String, usize) {
+        use std::io::Write;
+        let run = |cmd: &str, args: &[&str]| {
+            let mut c = std::process::Command::new(cmd)
+                .args(args)
+                .env("LC_ALL", "C")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect(cmd);
+            c.stdin.take().unwrap().write_all(text.as_bytes()).unwrap();
+            String::from_utf8(c.wait_with_output().unwrap().stdout).unwrap()
+        };
+        (run("sed", &["-E", &redact_sed()]), run("grep", &["-aoE", "--", &secret_regex()]).lines().count())
+    }
+
+    /// The patterns, through the very sed/grep programs the pods run: every kind of key (in the
+    /// places a participant pastes one — code, `.env` lines, a notebook's JSON after a `\n`
+    /// escape) becomes its REDACTED text with everything around it byte-identical; look-alikes
+    /// (`sklearn`, `task-or-v1-…`, short or long bodies, UUIDs, `hf_hub_download`, a bare
+    /// `sk-…`, a notebook's base64 image) stay exactly as they are.
+    #[cfg(unix)]
+    #[test]
+    fn secret_patterns_redact_every_kind_of_key_and_no_lookalike() {
+        let or = openrouter_key(1);
+        let or2 = openrouter_key(2);
+        let ant = |kind: &str| format!("{}{kind}-{}AA", "sk-ant-", body(URLSAFE, 93, 3));
+        let gh = |p: &str| format!("{p}_{}", body(ALNUM, 36, 4));
+        let hf = format!("{}{}", "hf_", body(LETTERS, 34, 5));
+        let aws = format!("{}{}", "AKIA", body("ABCDEFGHIJKLMNOPQRSTUVWXYZ0234567", 16, 6));
+        // (input line, what git gets, keys counted)
+        let keys: Vec<(String, String, usize)> = vec![
+            (format!("export OPENROUTER_API_KEY={or}"), "export OPENROUTER_API_KEY=REDACTED-OPENROUTER-KEY".into(), 1),
+            (or.clone(), "REDACTED-OPENROUTER-KEY".into(), 1),
+            (format!("client = OpenAI(api_key=\"{or}\", base_url=u)"), "client = OpenAI(api_key=\"REDACTED-OPENROUTER-KEY\", base_url=u)".into(), 1),
+            (format!("    \"key = '{or}'\\n\","), "    \"key = 'REDACTED-OPENROUTER-KEY'\\n\",".into(), 1),
+            (format!("   \"printed\\n{or}\\n\""), "   \"printed\\nREDACTED-OPENROUTER-KEY\\n\"".into(), 1),
+            (format!("a={or} b={or2};"), "a=REDACTED-OPENROUTER-KEY b=REDACTED-OPENROUTER-KEY;".into(), 2),
+            (format!("\t-H 'Authorization: Bearer {or}'"), "\t-H 'Authorization: Bearer REDACTED-OPENROUTER-KEY'".into(), 1),
+            (format!("k = \"{}\"", ant("api03")), "k = \"REDACTED-ANTHROPIC-KEY\"".into(), 1),
+            (format!("k = \"{}\"", ant("admin01")), "k = \"REDACTED-ANTHROPIC-KEY\"".into(), 1),
+            (format!("CLAUDE_CODE_OAUTH_TOKEN={}", ant("oat01")), "CLAUDE_CODE_OAUTH_TOKEN=REDACTED-ANTHROPIC-KEY".into(), 1),
+            (format!("k='{}{}'", "sk-proj-", body(URLSAFE, 156, 7)), "k='REDACTED-OPENAI-KEY'".into(), 1),
+            (format!("k='{}{}'", "sk-svcacct-", body(URLSAFE, 120, 8)), "k='REDACTED-OPENAI-KEY'".into(), 1),
+            (format!("k='{}{}'", "sk-admin-", body(ALNUM, 60, 9)), "k='REDACTED-OPENAI-KEY'".into(), 1),
+            (format!("k='sk-{}T3BlbkFJ{}'", body(ALNUM, 20, 10), body(ALNUM, 20, 11)), "k='REDACTED-OPENAI-KEY'".into(), 1),
+            (format!("login(token=\"{hf}\")"), "login(token=\"REDACTED-HUGGINGFACE-TOKEN\")".into(), 1),
+            (format!("HF_TOKEN={hf}"), "HF_TOKEN=REDACTED-HUGGINGFACE-TOKEN".into(), 1),
+            (format!("{} {} {}", gh("ghp"), gh("gho"), gh("ghu")), "REDACTED-GITHUB-TOKEN REDACTED-GITHUB-TOKEN REDACTED-GITHUB-TOKEN".into(), 3),
+            (format!("{},{}", gh("ghs"), gh("ghr")), "REDACTED-GITHUB-TOKEN,REDACTED-GITHUB-TOKEN".into(), 2),
+            (format!("t={}{}_{}", "github_pat_", body(ALNUM, 22, 12), body(ALNUM, 59, 13)), "t=REDACTED-GITHUB-TOKEN".into(), 1),
+            (format!("aws_access_key_id = {aws}"), "aws_access_key_id = REDACTED-AWS-ACCESS-KEY-ID".into(), 1),
+            (format!("{or} {hf} {aws}"), "REDACTED-OPENROUTER-KEY REDACTED-HUGGINGFACE-TOKEN REDACTED-AWS-ACCESS-KEY-ID".into(), 3),
+        ];
+        for (input, want, n) in &keys {
+            let (got, counted) = redact(&format!("{input}\n"));
+            assert_eq!(got, format!("{want}\n"), "{want}");
+            assert_eq!(counted, *n, "{want}");
+        }
+        // A notebook's inline image (base64 of arbitrary bytes, one long line) and every
+        // look-alike: byte-identical, nothing counted.
+        let image: Vec<u8> = (0..30_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        let lookalikes: Vec<String> = vec![
+            "from sklearn.linear_model import LogisticRegression".into(),
+            "pip install scikit-learn sk-learn".into(),
+            format!("task-or-v1-{}", body(HEX, 64, 1)),
+            format!("{}{}", "sk-or-v1-", body(HEX, 63, 1)),
+            format!("{}{}", "sk-or-v1-", body(HEX, 65, 1)),
+            format!("{}{}", "sk-or-v1-", body(HEX, 64, 1).to_uppercase()),
+            "sk-or-v1-... (paste your key here)".into(),
+            "sk-or-v1-123e4567-e89b-12d3-a456-426614174000 123e4567-e89b-12d3-a456-426614174000".into(),
+            "from huggingface_hub import hf_hub_download, hf_hub_url; os.environ['HF_HUB_ENABLE_HF_TRANSFER']".into(),
+            format!("{}{}", "hf_", body(LETTERS, 33, 5)),
+            format!("{}{}", "hf_", body(LETTERS, 35, 5)),
+            format!("{}{}9", "hf_", body(LETTERS, 34, 5)),
+            format!("x{}{}", "hf_", body(LETTERS, 34, 5)),
+            "sk-ant-api03-xxxx sk-ant-... sk-proj-abc123 sk-admin-panel sk-svcacct-".into(),
+            format!("sk-{}", body(ALNUM, 48, 3)),
+            format!("{}{}", "ghp_", body(ALNUM, 35, 4)),
+            format!("{}{}", "github_pat_", body(ALNUM, 40, 4)),
+            format!("{}{}", "AKIA", body("ABCDEFGHIJKLMNOPQRSTUVWXYZ", 15, 6)),
+            format!("{}{}", "AKIA", body("ABCDEFGHIJKLMNOPQRSTUVWXYZ", 17, 6)),
+            format!("{}{}", "AKIA", body("abcdefghijklmnopqrstuvwxyz", 16, 6)),
+            format!("X{}{}", "AKIA", body("ABCDEFGHIJKLMNOPQRSTUVWXYZ", 16, 6)),
+            format!("commit {} sk-{}", body(HEX, 40, 2), body(HEX, 32, 3)),
+            format!("      \"image/png\": \"{}\"", crate::base64::encode(&image)),
+        ];
+        for line in &lookalikes {
+            let (got, counted) = redact(&format!("{line}\n"));
+            assert_eq!((got.trim_end_matches('\n'), counted), (line.as_str(), 0), "{}", &line[..line.len().min(80)]);
+        }
+        // Every replacement is plain text no pattern matches (so a second pass changes nothing),
+        // and safe in the sed program and the single-quoted shell words it's rendered into.
+        for p in SECRET_PATTERNS {
+            assert!(p.replacement.chars().all(|c| c.is_ascii_uppercase() || c == '-'), "{}", p.replacement);
+            assert_eq!(redact(&format!("{}\n", p.replacement)), (format!("{}\n", p.replacement), 0));
+            assert!(!p.re.contains('/') && !p.re.contains('\''), "{}", p.re);
+        }
+        assert!(!secret_regex().contains('\'') && !redact_sed().contains('\''));
+    }
+
+    /// The patterns are rendered into what runs on the pods — from the one list, nothing left to
+    /// fill in — and the script that carries them is still POSIX sh.
+    #[test]
+    fn the_patterns_are_rendered_into_the_script_from_the_one_list() {
+        let script = backup_script();
+        assert!(!script.contains("@SECRET_RE@") && !script.contains("@REDACT_SED@") && !script.contains(REDACT_SH_MARK));
+        assert!(script.contains(&format!("SECRET_RE='{}'", secret_regex())));
+        assert!(script.contains(&format!("REDACT_SED='{}'", redact_sed())));
+        assert!(script.contains("redact_blob()") && script.contains("redact_index()"));
+        assert_eq!(redact_sed().lines().count(), SECRET_PATTERNS.len());
+        for p in SECRET_PATTERNS {
+            assert!(secret_regex().contains(p.re) && redact_sed().contains(&format!("{}/\\1{}/g", p.re, p.replacement)));
+        }
+        let set_branch = checkout_command("/r", "main", None, false);
+        assert!(set_branch.contains(&format!("REDACT_SED='{}'", redact_sed())));
+        assert!(set_branch.contains("unredacted_aside()") && set_branch.contains("unredacted_restore()"));
+        for shell in ["sh", "bash"] {
+            for cmd in [checkout_command("/r", "main", None, false), checkout_command("/r", "main", Some("/k"), true)] {
+                let o = std::process::Command::new(shell).arg("-n").arg("-c").arg(&cmd).output().expect(shell);
+                assert!(o.status.success(), "{shell} -n: {}", String::from_utf8_lossy(&o.stderr));
+            }
         }
     }
 
@@ -589,6 +922,79 @@ mod tests {
             let clone = self.work.join(rel);
             self.git(&self.base, &["clone", "-q", self.upstream().to_str().unwrap(), clone.to_str().unwrap()]);
             clone
+        }
+
+        /// Make origin refuse a push the way GitHub's push protection does (GH013): any new text
+        /// blob holding a key [`secret_regex`] knows ("OpenRouter API Key"), or one it doesn't
+        /// (`DEVTEST-UNKNOWN-` + 20 digits, "Devtest Unknown Token"), named with its path:line —
+        /// and a URL that would let the secret in, which must never be passed on. Binary blobs
+        /// are skipped, as GitHub's scanning skips them. `accepted` runs (in origin) after a push
+        /// passes the scan; the file size hook is gone.
+        fn push_protect(&self, accepted: &str) {
+            use std::os::unix::fs::PermissionsExt;
+            let hook = self.origin.join("hooks/pre-receive");
+            let script = r#"#!/bin/sh
+KNOWN='@KNOWN@'
+UNKNOWN='DEVTEST-UNKNOWN-[0-9]{20}'
+while read old new ref; do
+  [ "$new" = 0000000000000000000000000000000000000000 ] && continue
+  git rev-list --objects "$new" --not --all | while read sha path; do
+    [ "$(git cat-file -t "$sha")" = blob ] || continue
+    [ "$(git cat-file blob "$sha" | head -c 8000 | tr -d '\000' | wc -c)" -eq "$(git cat-file blob "$sha" | head -c 8000 | wc -c)" ] || continue
+    if git cat-file blob "$sha" | LC_ALL=C grep -aqE "$KNOWN"; then ty='OpenRouter API Key'
+    elif git cat-file blob "$sha" | LC_ALL=C grep -aqE "$UNKNOWN"; then ty='Devtest Unknown Token'
+    else continue; fi
+    line=$(git cat-file blob "$sha" | LC_ALL=C grep -anE "$KNOWN|$UNKNOWN" | head -n 1 | cut -d: -f1)
+    {
+      echo "error: GH013: Repository rule violations found for $ref."
+      echo ""
+      echo "- GITHUB PUSH PROTECTION"
+      echo "  ————————————————————————————————————————"
+      echo "    Resolve the following violations before pushing again"
+      echo ""
+      echo "    - Push cannot contain secrets"
+      echo ""
+      echo "      —— $ty ——————————————————————————————"
+      echo "       locations:"
+      echo "         - commit: $new"
+      echo "           path: $path:$line"
+      echo ""
+      echo "       (?) To push, remove secret from commit(s) or follow this URL to allow the secret."
+      echo "       https://github.com/devtest/repo/security/secret-scanning/unblock-secret/2DEVTESTunblock"
+    } >&2
+    exit 1
+  done || exit 1
+done
+@ACCEPTED@
+"#;
+            std::fs::write(&hook, script.replace("@KNOWN@", &secret_regex()).replace("@ACCEPTED@", accepted)).unwrap();
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        /// Whether any object in origin — reachable or not — holds `needle`.
+        fn origin_holds(&self, needle: &str) -> bool {
+            let o = std::process::Command::new("git")
+                .args(["--git-dir", self.origin.to_str().unwrap(), "cat-file", "--batch-all-objects", "--batch"])
+                .output()
+                .unwrap();
+            o.stdout.windows(needle.len()).any(|w| w == needle.as_bytes())
+        }
+
+        /// One backup run, raw: (exit code, stdout, stderr).
+        fn backup_raw(&self) -> (Option<i32>, String, String) {
+            let cmd = backup_command_limited(self.work.to_str().unwrap(), None, "arena backup", self.skip, self.limit);
+            let o = std::process::Command::new("bash").arg("-c").arg(cmd).output().expect("bash");
+            (o.status.code(), String::from_utf8_lossy(&o.stdout).into_owned(), String::from_utf8_lossy(&o.stderr).into_owned())
+        }
+
+        /// `rel`'s bytes in the work tree.
+        fn read(&self, rel: &str) -> Vec<u8> {
+            std::fs::read(self.work.join(rel)).unwrap()
+        }
+
+        /// `git log` of `rev` as `subject|author|author date|committer|committer date` lines.
+        fn history(&self, dir: &std::path::Path, rev: &str) -> Vec<String> {
+            self.git(dir, &["log", "--format=%s|%an <%ae>|%ad|%cn <%ce>|%cd", "--date=raw", rev]).lines().map(String::from).collect()
         }
 
         fn origin_blob_size(&self, branch: &str, path: &str) -> u64 {
@@ -892,6 +1298,429 @@ mod tests {
         assert!(err.contains("GH001"), "{err}");
     }
 
+    /// Live (prod, 2026-10-15): an OpenRouter key pasted into an exercise was committed, and
+    /// GitHub refused every push of the branch for ~20 hours. Now it's committed redacted — the
+    /// index only — and pushed through a push-protected origin; the file on disk is byte-identical
+    /// across three runs, the second and third commit nothing, and origin never sees the key.
+    /// A notebook (JSON: a key in a source line and after a `\n` in an output) the same.
+    #[cfg(unix)]
+    #[test]
+    fn a_pasted_key_is_committed_redacted_and_the_file_on_disk_never_changes() {
+        let s = GitSandbox::new("redact", 1_000_000);
+        s.push_protect("");
+        let key = openrouter_key(1);
+        let hf = format!("{}{}", "hf_", body(LETTERS, 34, 5));
+        let exercise = format!("import os\nKEY = \"{key}\"\nprint(len(KEY))\n");
+        let nb = format!(
+            "{{\n \"cells\": [{{\"cell_type\": \"code\", \"source\": [\"import os\\n\", \"os.environ['OPENROUTER_API_KEY'] = '{key}'\\n\", \
+             \"login('{hf}')\"], \"outputs\": [{{\"text\": [\"key:\\n{key}\\n\"]}}]}}]\n}}\n"
+        );
+        std::fs::create_dir_all(s.work.join("part4")).unwrap();
+        std::fs::write(s.work.join("part4/exercises.py"), &exercise).unwrap();
+        std::fs::write(s.work.join("part4/solutions.ipynb"), &nb).unwrap();
+        s.put("part4/notes.md", 40);
+        let before = s.git(&s.work, &["rev-parse", "HEAD"]);
+        for run in 1..=3 {
+            let (code, r, err) = s.backup();
+            let want = if run == 1 { BACKUP_PUSHED } else { BACKUP_NO_CHANGES };
+            assert_eq!((code, r.outcome.clone()), (Some(0), Some((want, "autocommit-x".into()))), "run {run}: {err}");
+            let mut redacted = r.redacted.clone();
+            redacted.sort();
+            assert_eq!(redacted, [(1, "part4/exercises.py".to_string()), (3, "part4/solutions.ipynb".to_string())], "run {run}");
+            assert!(!err.contains(&key) && !err.contains(&hf), "run {run}: a key in stderr");
+            assert_eq!(s.read("part4/exercises.py"), exercise.as_bytes(), "run {run}: the file on disk changed");
+            assert_eq!(s.read("part4/solutions.ipynb"), nb.as_bytes(), "run {run}: the notebook on disk changed");
+            assert!(r.notes().iter().any(|n| n.starts_with("redacted 4 pasted key(s) in 2 file(s) before committing")), "{:?}", r.notes());
+        }
+        assert_eq!(s.git(&s.work, &["rev-list", "--count", &format!("{before}..HEAD")]), "1", "one commit, then none");
+        let show = |path: &str| s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "show", &format!("autocommit-x:{path}")]);
+        assert_eq!(show("part4/exercises.py"), "import os\nKEY = \"REDACTED-OPENROUTER-KEY\"\nprint(len(KEY))");
+        assert_eq!(show("part4/solutions.ipynb"), nb.replace(&key, "REDACTED-OPENROUTER-KEY").replace(&hf, "REDACTED-HUGGINGFACE-TOKEN").trim_end());
+        assert!(s.origin_tree("autocommit-x").iter().any(|(_, p)| p == "part4/notes.md"));
+        assert!(!s.origin_holds(&key) && !s.origin_holds(&hf), "a key reached origin");
+        // `git status`: just the two files whose real keys are on disk, modified.
+        assert_eq!(s.git(&s.work, &["status", "--porcelain"]), "M part4/exercises.py\n M part4/solutions.ipynb");
+    }
+
+    /// Only text files are rewritten: a binary file (a NUL in its first 8000 bytes) holding a
+    /// key's bytes and a symlink whose target is key-shaped are committed exactly as they are
+    /// (origin here scans nothing — GitHub skips binaries; the symlink is just a shape test).
+    #[cfg(unix)]
+    #[test]
+    fn binary_files_and_symlinks_are_never_rewritten() {
+        let s = GitSandbox::new("redact-skip", 1_000_000);
+        let key = openrouter_key(3);
+        let mut bin = vec![0u8, 1, 2];
+        bin.extend_from_slice(format!(" {key} ").as_bytes());
+        std::fs::write(s.work.join("weights.bin"), &bin).unwrap();
+        std::os::unix::fs::symlink(&key, s.work.join("link")).unwrap();
+        std::fs::write(s.work.join("a.py"), format!("k='{key}'\n")).unwrap();
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.redacted.clone()), (Some(0), vec![(1, "a.py".to_string())]), "{err}");
+        let blob = |path: &str| {
+            let o = std::process::Command::new("git")
+                .args(["--git-dir", s.origin.to_str().unwrap(), "cat-file", "blob", &format!("autocommit-x:{path}")])
+                .output()
+                .unwrap();
+            o.stdout
+        };
+        assert_eq!(blob("weights.bin"), bin, "a binary file is committed byte for byte");
+        assert_eq!(blob("link"), key.as_bytes(), "a symlink is committed as it is");
+        assert!(s.origin_tree("autocommit-x").contains(&("120000".to_string(), "link".to_string())));
+        assert_eq!(blob("a.py"), b"k='REDACTED-OPENROUTER-KEY'\n");
+    }
+
+    /// The live case: keys committed by backups from before the redaction, 3 unpushed commits,
+    /// every push refused (GH013). The heal rewrites exactly those commits — same count,
+    /// messages, authors, committers and dates, the key redacted — and pushes them as a
+    /// fast-forward: origin's history before them is untouched. The file on disk keeps its key;
+    /// the index matches the new tip, so `git status` shows that file alone, as the redaction
+    /// leaves it. The next run has nothing to do.
+    #[cfg(unix)]
+    #[test]
+    fn a_key_in_older_unpushed_commits_is_healed_by_a_fast_forward_and_the_files_are_untouched() {
+        let s = GitSandbox::new("heal", 1_000_000);
+        s.push_protect("");
+        let key = openrouter_key(4);
+        let pushed = s.git(&s.work, &["rev-parse", "HEAD"]);
+        let remote_log = || s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "log", "--format=%H", "autocommit-x"]);
+        let remote_before = remote_log();
+        let exercise = format!("KEY = \"{key}\"\n");
+        std::fs::write(s.work.join("exercises.py"), &exercise).unwrap();
+        s.git(&s.work, &["add", "-A"]);
+        s.git(&s.work, &["commit", "-q", "-m", "arena backup devtest-x (old 1)"]);
+        s.put("notes.md", 30);
+        s.git(&s.work, &["add", "-A"]);
+        s.git(&s.work, &["commit", "-q", "-m", "arena backup devtest-x (old 2)"]);
+        std::fs::write(s.work.join("exercises.py"), format!("{exercise}x = 1\n")).unwrap();
+        s.git(&s.work, &["commit", "-q", "-a", "-m", "arena backup devtest-x (old 3)"]);
+        let old_tip = s.git(&s.work, &["rev-parse", "HEAD"]);
+        let old_history = s.history(&s.work, &format!("{pushed}..HEAD"));
+        let on_disk = s.read("exercises.py");
+
+        let (code, out, err) = s.backup_raw();
+        let r = parse_backup_report(&out);
+        assert_eq!((code, r.outcome.clone()), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into()))), "{out}{err}");
+        let (n, old, new) = r.healed.clone().expect("healed");
+        assert_eq!((n, old.as_str()), (3, old_tip.as_str()));
+        assert_eq!(s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "rev-parse", "autocommit-x"]), new);
+        assert!(r.notes().iter().any(|n| n.starts_with("healed: GitHub refused the push over a key in older unpushed commits — rewrote 3")));
+        // A fast-forward: origin's commits before the heal are all still there, in order.
+        let remote_after = remote_log();
+        assert!(remote_after.ends_with(&remote_before), "{remote_after}");
+        assert_eq!(remote_after.lines().count(), remote_before.lines().count() + 3);
+        // Same commits, redacted: count, messages, authors, committers, dates.
+        assert_eq!(s.history(&s.work, &format!("{pushed}..HEAD")), old_history);
+        assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), new);
+        assert_eq!(s.git(&s.work, &["show", "HEAD:exercises.py"]), "KEY = \"REDACTED-OPENROUTER-KEY\"\nx = 1");
+        assert!(!s.origin_holds(&key));
+        assert!(!out.contains(&key) && !err.contains(&key) && !err.contains("unblock-secret"), "{out}{err}");
+        // Nothing on disk touched; the index is the new tip's, but for nothing.
+        assert_eq!(s.read("exercises.py"), on_disk);
+        assert_eq!(s.git(&s.work, &["status", "--porcelain"]), "M exercises.py");
+        assert_eq!(s.git(&s.work, &["diff", "--cached", "--name-only"]), "");
+        // The old commits stay reachable from the reflog (nothing is lost on the pod).
+        assert_eq!(s.git(&s.work, &["rev-parse", "autocommit-x@{1}"]), old_tip);
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome, r.healed), (Some(0), Some((BACKUP_NO_CHANGES, "autocommit-x".into())), None), "{err}");
+        assert_eq!(r.redacted, [(1, "exercises.py".to_string())]);
+    }
+
+    /// The heal rewrites only what no remote has — `HEAD --not --remotes`, narrower than
+    /// `origin/B..B`: a course update merged in from origin's main keeps its id, even with a
+    /// key-shaped example in it (GitHub already has it), and the merge is rewritten with its
+    /// parents mapped. And a branch with no upstream yet (the day's branch, never pushed) is
+    /// healed the same way, and gets its upstream.
+    #[cfg(unix)]
+    #[test]
+    fn the_heal_rewrites_only_unpushed_commits_merges_included_and_a_new_branch_gets_its_upstream() {
+        let s = GitSandbox::new("heal-merge", 1_000_000);
+        let key = openrouter_key(5);
+        // The course's own update on main, already on GitHub — an example key in its docs.
+        let example = format!("aws_access_key_id = {}{}\n", "AKIA", body("ABCDEFGHIJKLMNOPQRSTUVWXYZ", 16, 2));
+        s.git(&s.work, &["checkout", "-q", "main"]);
+        std::fs::write(s.work.join("course_v2.md"), &example).unwrap();
+        s.git(&s.work, &["add", "-A"]);
+        s.git(&s.work, &["commit", "-q", "-m", "course update"]);
+        s.git(&s.work, &["push", "-q", "origin", "main"]);
+        let course = s.git(&s.work, &["rev-parse", "HEAD"]);
+        s.push_protect("");
+        s.git(&s.work, &["checkout", "-q", "autocommit-x"]);
+        std::fs::write(s.work.join("ex.py"), format!("k = '{key}'\n")).unwrap();
+        s.git(&s.work, &["add", "-A"]);
+        s.git(&s.work, &["commit", "-q", "-m", "old backup with a key"]);
+        s.git(&s.work, &["merge", "-q", "--no-edit", "-m", "merge main", "main"]);
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome.clone()), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into()))), "{err}");
+        assert_eq!(r.healed.as_ref().map(|h| h.0), Some(2), "the key's commit and the merge");
+        let parents = s.git(&s.work, &["log", "-1", "--format=%P", "HEAD"]);
+        let parents: Vec<&str> = parents.split(' ').collect();
+        assert_eq!(parents.len(), 2);
+        assert_eq!(parents[1], course, "the merged-in course commit keeps its id");
+        assert_eq!(s.git(&s.work, &["show", "HEAD:course_v2.md"]), example.trim_end(), "what GitHub has is never rewritten");
+        assert_eq!(s.git(&s.work, &["show", &format!("{}:ex.py", parents[0])]), "k = 'REDACTED-OPENROUTER-KEY'");
+        assert_eq!(s.git(&s.work, &["log", "-1", "--format=%s", parents[0]]), "old backup with a key");
+        assert!(!s.origin_holds(&key));
+
+        // No upstream yet. (`-f`: ex.py on disk still has its real key — modified for good.)
+        s.git(&s.work, &["checkout", "-q", "-f", "-b", "autocommit-y", "main"]);
+        std::fs::write(s.work.join("y.py"), format!("k = '{key}'\n")).unwrap();
+        s.git(&s.work, &["add", "-A"]);
+        s.git(&s.work, &["commit", "-q", "-m", "y"]);
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome.clone(), r.healed.map(|h| h.0)), (Some(0), Some((BACKUP_PUSHED, "autocommit-y".into())), Some(1)), "{err}");
+        assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "@{u}"]), "origin/autocommit-y");
+        assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), s.git(&s.work, &["rev-parse", "origin/autocommit-y"]));
+        assert!(!s.origin_holds(&key));
+        let (code, r, _) = s.backup();
+        assert_eq!((code, r.outcome), (Some(0), Some((BACKUP_NO_CHANGES, "autocommit-y".into()))));
+    }
+
+    /// The participant commits while the heal is being pushed: the branch moved, so the
+    /// compare-and-swap refuses — their commit is kept, nothing on the pod is rewritten under
+    /// it, and the run fails saying so. The next run redoes the same rewrite (same ids, so a
+    /// fast-forward of what was pushed) with their commit on top.
+    #[cfg(unix)]
+    #[test]
+    fn a_branch_that_moves_during_the_heal_is_never_overwritten_and_the_next_run_finishes() {
+        let s = GitSandbox::new("heal-cas", 1_000_000);
+        let work_git = s.work.join(".git");
+        let marker = s.base.join("commit-during-heal");
+        // Once a push passes the scan (the healed one), the participant commits on the pod.
+        s.push_protect(&format!(
+            "if [ -e '{m}' ]; then rm -f '{m}'; (unset GIT_DIR GIT_QUARANTINE_PATH GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES; \
+             W='{w}'; c=$(git --git-dir=\"$W\" -c user.name=p -c user.email=p@p commit-tree \"$(git --git-dir=\"$W\" rev-parse HEAD^{{tree}})\" \
+             -p \"$(git --git-dir=\"$W\" rev-parse HEAD)\" -m 'participant commit during the heal') && \
+             git --git-dir=\"$W\" update-ref refs/heads/autocommit-x \"$c\"); fi; true",
+            m = marker.display(),
+            w = work_git.display()
+        ));
+        let key = openrouter_key(6);
+        std::fs::write(s.work.join("ex.py"), format!("k = '{key}'\n")).unwrap();
+        s.git(&s.work, &["add", "-A"]);
+        s.git(&s.work, &["commit", "-q", "-m", "old 1"]);
+        s.put("n.md", 10);
+        s.git(&s.work, &["add", "-A"]);
+        s.git(&s.work, &["commit", "-q", "-m", "old 2"]);
+        std::fs::write(&marker, "").unwrap();
+        let on_disk = s.read("ex.py");
+
+        let (code, out, err) = s.backup_raw();
+        let r = parse_backup_report(&out);
+        assert_eq!(code, Some(1), "{out}{err}");
+        assert!(r.outcome.is_none(), "{out}");
+        let (_, _, pushed) = r.healed.clone().expect("the rewrite was pushed");
+        assert!(r.heal_aborted.as_deref().unwrap().contains("moved"), "{out}");
+        let fail = r.failure("/r", "devtest-x", code).expect("explained");
+        assert!(fail.starts_with("pushed 2 rewritten commit(s)") && fail.contains("moved"), "{fail}");
+        assert_eq!(r.failure_brief(code).as_deref(), Some("the branch moved while its commits were being redacted"));
+        // Their commit is the branch, untouched; origin has the rewrite.
+        assert_eq!(s.git(&s.work, &["log", "-1", "--format=%s", "autocommit-x"]), "participant commit during the heal");
+        assert_eq!(s.git(&s.work, &["log", "-1", "--format=%s", "autocommit-x^"]), "old 2");
+        assert_eq!(s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "rev-parse", "autocommit-x"]), pushed);
+        assert_eq!(s.read("ex.py"), on_disk);
+
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome.clone()), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into()))), "{err}");
+        assert_eq!(s.git(&s.work, &["rev-parse", "HEAD^"]), pushed, "the same rewrite, their commit on top");
+        assert_eq!(s.git(&s.work, &["log", "-1", "--format=%s", "HEAD"]), "participant commit during the heal");
+        assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "rev-parse", "autocommit-x"]));
+        assert!(!s.origin_holds(&key));
+        assert_eq!(s.read("ex.py"), on_disk);
+    }
+
+    /// A secret the patterns don't know: GitHub still refuses, and the run says which kind and
+    /// where (exit 4), never the secret and never the URL that would let it in — and changes
+    /// nothing on the pod. A known key in the same commits doesn't help it through.
+    #[cfg(unix)]
+    #[test]
+    fn a_secret_the_patterns_miss_is_reported_by_type_and_place_never_by_value() {
+        let s = GitSandbox::new("blocked", 1_000_000);
+        s.push_protect("");
+        let unknown = format!("DEVTEST-UNKNOWN-{}", body("0123456789", 20, 1));
+        let key = openrouter_key(7);
+        // Committed before the redaction: the known key gets healed out, the unknown one can't.
+        std::fs::write(s.work.join("scratch.py"), format!("a = 1\nTOKEN = '{unknown}'\nK = '{key}'\n")).unwrap();
+        s.git(&s.work, &["add", "-A"]);
+        s.git(&s.work, &["commit", "-q", "-m", "an old backup"]);
+        let tip = s.git(&s.work, &["rev-parse", "HEAD"]);
+        let pushed = s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "rev-parse", "autocommit-x"]);
+        for run in 1..=2 {
+            let (code, out, err) = s.backup_raw();
+            let r = parse_backup_report(&out);
+            assert_eq!(code, Some(BACKUP_BLOCKED_EXIT), "run {run}: {out}{err}");
+            assert_eq!(r.push_blocked.as_deref(), Some("Devtest Unknown Token at scratch.py:2"), "run {run}: {out}");
+            assert_eq!(r.branch.as_deref(), Some("autocommit-x"));
+            assert!(r.outcome.is_none() && r.healed.is_none());
+            for text in [&out, &err] {
+                assert!(!text.contains(&unknown) && !text.contains(&key), "run {run}: a secret printed: {text}");
+                assert!(!text.contains("unblock-secret") && !text.contains("2DEVTESTunblock"), "run {run}: the bypass URL: {text}");
+            }
+            let fail = r.failure("/root/ARENA_materials", "devtest-x", code).unwrap();
+            assert!(fail.starts_with("GitHub push protection refuses autocommit-x: Devtest Unknown Token at scratch.py:2 — "), "{fail}");
+            assert!(fail.contains("SECRET_PATTERNS"), "{fail}");
+            assert_eq!(r.failure_brief(code).as_deref(), Some("GitHub push protection: Devtest Unknown Token at scratch.py:2"));
+        }
+        // The heal's push was refused too (over the unknown one): nothing moved, here or there.
+        assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), tip);
+        assert_eq!(s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "rev-parse", "autocommit-x"]), pushed);
+        assert!(!s.origin_holds(&key) && !s.origin_holds(&unknown));
+        // GitHub's older wording parses too, and a refusal with no type falls back to its reason.
+        let older = parse_backup_report("PUSH_BLOCKED GitHub Personal Access Token at a.py:3\n");
+        assert_eq!(older.push_blocked.as_deref(), Some("GitHub Personal Access Token at a.py:3"));
+        assert_eq!(parse_backup_report("PUSH_BLOCKED\n").push_blocked.as_deref(), Some("refused by GitHub push protection"));
+    }
+
+    /// GitHub's refusal as git relays it, through the script's own parser: GH013 (rulesets)
+    /// and GH009 (the older wording, `——[ Type ]——`), several secrets, and one with no
+    /// locations — the reason is the type(s) and path(s), else the `[remote rejected]` reason;
+    /// never a URL.
+    #[cfg(unix)]
+    #[test]
+    fn githubs_refusal_is_summed_up_without_its_urls() {
+        let script = backup_script();
+        let start = script.find("push_protected() {").unwrap();
+        let end = script.find("if git push -u origin").unwrap();
+        let funcs = &script[start..end];
+        let dir = std::env::temp_dir().join(format!("arena-pushreason-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gh013 = "remote: error: GH013: Repository rule violations found for refs/heads/autocommit-x.        \n\
+                     remote: \n\
+                     remote: - GITHUB PUSH PROTECTION        \n\
+                     remote:   —————————————————————————————————————————        \n\
+                     remote:     Resolve the following violations before pushing again        \n\
+                     remote: \n\
+                     remote:     - Push cannot contain secrets        \n\
+                     remote: \n\
+                     remote:      (?) Learn how to resolve a blocked push        \n\
+                     remote:      https://docs.github.com/code-security/secret-scanning/working-with-secret-scanning-and-push-protection/working-with-push-protection-from-the-command-line#resolving-a-blocked-push        \n\
+                     remote: \n\
+                     remote:       —— OpenRouter API Key ————————————————————————————————        \n\
+                     remote:        locations:        \n\
+                     remote:          - commit: 8728dbe67fa7ac5c5e5b5e2d0d1a8b3c4d5e6f7a        \n\
+                     remote:            path: part4_persona_vectors/exercises.py:122        \n\
+                     remote:          - commit: 9728dbe67fa7ac5c5e5b5e2d0d1a8b3c4d5e6f7a        \n\
+                     remote:            path: joep.py:3        \n\
+                     remote: \n\
+                     remote:        (?) To push, remove secret from commit(s) or follow this URL to allow the secret.        \n\
+                     remote:        https://github.com/org/repo/security/secret-scanning/unblock-secret/2nRkZp        \n\
+                     remote: \n\
+                     remote:       —— Hugging Face User Access Token ———————————————————        \n\
+                     remote:        locations:        \n\
+                     remote:          - commit: 8728dbe67fa7ac5c5e5b5e2d0d1a8b3c4d5e6f7a        \n\
+                     remote:            path: part4_persona_vectors/exercises.py:122        \n\
+                     remote: \n\
+                     To github.com:org/repo.git\n \
+                     ! [remote rejected] autocommit-x -> autocommit-x (push declined due to repository rule violations)\n\
+                     error: failed to push some refs to 'github.com:org/repo.git'\n";
+        let gh009 = "remote: error: GH009: Secrets detected! This push failed.\n\
+                     remote:   ——[ GitHub Personal Access Token ]——————————————————————\n\
+                     remote:      locations:\n\
+                     remote:        - commit: abc\n\
+                     remote:          path: config.py:5\n\
+                     remote:      https://github.com/o/r/security/secret-scanning/unblock-secret/2xyz\n\
+                     ! [remote rejected] main -> main (secret detected)\n";
+        let bare = "remote: error: GH013: Repository rule violations found for refs/heads/x.\n \
+                    ! [remote rejected] x -> x (push declined due to repository rule violations)\n";
+        let other = "! [rejected]        x -> x (fetch first)\n";
+        let cases = [
+            (gh013, true, "OpenRouter API Key, Hugging Face User Access Token at part4_persona_vectors/exercises.py:122, joep.py:3"),
+            (gh009, true, "GitHub Personal Access Token at config.py:5"),
+            (bare, true, "push declined due to repository rule violations"),
+            (other, false, "refused by GitHub push protection"),
+        ];
+        for (i, (text, protected, reason)) in cases.iter().enumerate() {
+            let f = dir.join(format!("push{i}"));
+            std::fs::write(&f, text).unwrap();
+            let sh = format!(
+                "{funcs}\nif push_protected \"$1\"; then echo yes; else echo no; fi; push_block_reason \"$1\"; echo ---; no_bypass_url < \"$1\""
+            );
+            let o = std::process::Command::new("sh").arg("-c").arg(sh).arg("sh").arg(&f).output().unwrap();
+            let out = String::from_utf8(o.stdout).unwrap();
+            let (head, shown) = out.split_once("---\n").unwrap();
+            assert_eq!(head, format!("{}\n{reason}\n", if *protected { "yes" } else { "no" }), "case {i}");
+            assert!(!shown.contains("unblock-secret") && !shown.contains("secret-scanning"), "case {i}: {shown}");
+            assert_eq!(shown.lines().count(), text.lines().filter(|l| !l.contains("https://")).count(), "case {i}: only the URL lines go");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `init-branches` from a branch whose unpushed commits GitHub refuses: the new day's branch
+    /// carries them (created from HEAD), so its first push is refused too — and the next backup
+    /// heals the new branch (no upstream yet). Nothing of the old branch is left behind.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_days_branch_carrying_a_refused_commit_is_healed_by_the_next_backup() {
+        let s = GitSandbox::new("init-heal", 1_000_000);
+        s.push_protect("");
+        let key = openrouter_key(8);
+        std::fs::write(s.work.join("ex.py"), format!("k = '{key}'\n")).unwrap();
+        s.git(&s.work, &["add", "-A"]);
+        s.git(&s.work, &["commit", "-q", "-m", "yesterday, with a key"]);
+        let cfg = BackupConfig { repo_path: s.work.display().to_string(), prefix: "devtest".into(), week: 1, day: 2, git_ssh_key: None };
+        let o = std::process::Command::new("bash").arg("-c").arg(init_branch_command(&cfg, "devtest-x")).output().unwrap();
+        assert!(!o.status.success(), "the new branch's push carries the key");
+        assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "autocommit-devtest-w1d2-x");
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome, r.healed.map(|h| h.0)), (Some(0), Some((BACKUP_PUSHED, "autocommit-devtest-w1d2-x".into())), Some(1)), "{err}");
+        assert_eq!(s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "log", "-1", "--format=%s", "autocommit-devtest-w1d2-x"]), "yesterday, with a key");
+        assert!(!s.origin_holds(&key));
+    }
+
+    /// `set-branch` on a pod with a key the backup redacted (the file on disk keeps the real key,
+    /// so it is modified for good). Gentle to `main` used to refuse — every day — and `--hard`
+    /// threw the key away (no commit has it). Now both switch, the real-key files set aside in
+    /// `.git/arena-unredacted/`; switching back puts the keys back, byte for byte. Any other
+    /// uncommitted change still stops a gentle switch, as before — keys put back first.
+    #[cfg(unix)]
+    #[test]
+    fn set_branch_sets_real_keys_aside_and_brings_them_back() {
+        let s = GitSandbox::new("setbranch-keys", 1_000_000);
+        let key = openrouter_key(9);
+        let ex = format!("work\nKEY = \"{key}\"\n");
+        let joep = format!("mine = '{key}'\n");
+        std::fs::write(s.work.join("README.md"), &ex).unwrap();
+        std::fs::write(s.work.join("joep.py"), &joep).unwrap();
+        std::fs::write(s.work.join("other.py"), "x = 1\n").unwrap();
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.redacted.len()), (Some(0), 2), "{err}");
+        let run = |cmd: String| {
+            let o = std::process::Command::new("bash").arg("-c").arg(cmd).output().unwrap();
+            (o.status.success(), String::from_utf8_lossy(&o.stdout).into_owned(), String::from_utf8_lossy(&o.stderr).into_owned())
+        };
+        let repo = s.work.to_str().unwrap();
+        let aside = s.work.join(".git/arena-unredacted");
+        for hard in [false, true] {
+            let (ok, out, err) = run(checkout_command(repo, "main", None, hard));
+            assert!(ok, "hard={hard}: {out}{err}");
+            assert!(out.contains("UNREDACTED_KEPT README.md") && out.contains("UNREDACTED_KEPT joep.py"), "hard={hard}: {out}");
+            assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+            assert_eq!(s.read("README.md").len(), 5, "main's own README");
+            assert!(!s.work.join("joep.py").exists());
+            assert_eq!(std::fs::read(aside.join("README.md")).unwrap(), ex.as_bytes());
+            assert_eq!(std::fs::read(aside.join("joep.py")).unwrap(), joep.as_bytes());
+            assert!(!out.contains(&key) && !err.contains(&key));
+            // …and back: the keys are back on disk, the set-aside copies gone.
+            let (ok, out, err) = run(checkout_command(repo, "autocommit-x", None, hard));
+            assert!(ok, "hard={hard}: {out}{err}");
+            assert!(out.contains("UNREDACTED_RESTORED README.md") && out.contains("UNREDACTED_RESTORED joep.py"), "{out}");
+            assert_eq!((s.read("README.md"), s.read("joep.py")), (ex.clone().into_bytes(), joep.clone().into_bytes()), "hard={hard}");
+            assert!(!aside.exists(), "hard={hard}");
+            assert_eq!(s.git(&s.work, &["status", "--porcelain"]), "M README.md\n M joep.py");
+        }
+        // A gentle switch to the branch it's on keeps them where they are.
+        let (ok, out, _) = run(checkout_command(repo, "autocommit-x", None, false));
+        assert!(ok && out.contains("UNREDACTED_RESTORED README.md"), "{out}");
+        assert_eq!(s.read("README.md"), ex.as_bytes());
+        // A real uncommitted edit (to a file main doesn't have) still stops a gentle switch — and
+        // the real keys are back on disk before it exits.
+        std::fs::write(s.work.join("other.py"), "x = 2\n").unwrap();
+        let (ok, out, err) = run(checkout_command(repo, "main", None, false));
+        assert!(!ok && err.contains("would be overwritten"), "{out}{err}");
+        assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "autocommit-x");
+        assert_eq!((s.read("README.md"), s.read("joep.py")), (ex.clone().into_bytes(), joep.clone().into_bytes()));
+    }
+
     /// The dry run's per-pod line pastes: next to the file its here-doc writes, it runs the
     /// backup (here through a stand-in `ssh` running the remote command locally); without the
     /// file the shell refuses to start it. The old line (`sh -c "$ARENA_BACKUP_SH" …`) expanded
@@ -925,7 +1754,7 @@ mod tests {
         assert!(s.origin_tree("autocommit-x").iter().any(|(_, p)| p == "exercises/notes.md"));
         assert!(line.starts_with("ssh ") && line.ends_with(" < arena-backup.sh"), "{line}");
         assert!(line.contains(&format!("{GIT_MAX_FILE_BYTES} {GITHUB_FILE_LIMIT_BYTES}")), "{line}");
-        assert!(!BACKUP_SCRIPT.lines().any(|l| l == HEREDOC_END));
+        assert!(!backup_script().lines().any(|l| l == HEREDOC_END));
     }
 
     #[test]
