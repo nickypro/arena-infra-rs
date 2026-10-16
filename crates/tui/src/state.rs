@@ -20,6 +20,7 @@ use arena_core::fleet::{self, FleetCost};
 use arena_core::health::{render_summary, PodHealth, Status};
 use arena_core::metrics::PodMetrics;
 use arena_core::pod::Maintenance;
+use arena_core::provider::ContainerReset;
 use arena_core::selector::{Naming, SelectArgs, Selector};
 use arena_core::snapshot::{self, cache_key, fmt_age, FleetSnapshot, HealthCache, HealthRecord, ProxyState, SnapshotPod};
 use arena_core::Pod;
@@ -480,6 +481,18 @@ pub fn marked_pods<'a>(pods: &'a [Pod], marked: &HashSet<String>) -> Vec<&'a Pod
     pods.iter().filter(|p| marked.contains(&mark_key(p))).collect()
 }
 
+/// What a restart does to a set of pods' disks, for one label: the worst of them — a wipe
+/// (`Yes`) over a maybe (`Unknown`) over a kept disk (`No`). An empty set is `Unknown`: never
+/// "keeps". Pure.
+pub fn worst_reset(resets: impl IntoIterator<Item = ContainerReset>) -> ContainerReset {
+    let rank = |r: ContainerReset| match r {
+        ContainerReset::No => 0,
+        ContainerReset::Unknown => 1,
+        ContainerReset::Yes => 2,
+    };
+    resets.into_iter().max_by_key(|r| rank(*r)).unwrap_or(ContainerReset::Unknown)
+}
+
 /// The most pods a lifecycle action (terminate/restart/stop) on a marked set confirms with
 /// just their count. Marks used to take a keypress per pod; `/` now marks a cohort in one
 /// short range (`/apple..zulu`), so the bar has to follow what is marked, not how: a
@@ -773,10 +786,18 @@ impl Action {
         matches!(self, Action::Restart | Action::Stop | Action::Terminate)
     }
 
-    /// A short description shown beside the action in the menu.
-    pub fn desc(&self) -> &'static str {
+    /// A short description shown beside the action in the menu. `restart`: what a restart does
+    /// to the container disk of the pod(s) the menu is for — the backend's own answer
+    /// (`Provider::restart_resets_container`; a marked set: [`worst_reset`] of its pods). It
+    /// said "WIPES" for every pod, a Hetzner VM (which keeps its disk) and RunPod v1 (seen
+    /// keeping it, not known to) included. Wording only: the confirm's gate is the same for all.
+    pub fn desc(&self, restart: ContainerReset) -> &'static str {
         match self {
-            Action::Restart => "restart — WIPES the container disk",
+            Action::Restart => match restart {
+                ContainerReset::Yes => "restart — WIPES the container disk",
+                ContainerReset::Unknown => "restart — may wipe the container disk",
+                ContainerReset::No => "restart — keeps the disk",
+            },
             Action::Stop => "stop the pod",
             Action::Terminate => "terminate — irreversible",
             Action::Backup => "commit + push the tree",
@@ -824,14 +845,22 @@ impl Action {
 
     /// The warning in the confirm modal, if any. `wipes_disk`: whether the pod's provider
     /// resets the container disk on restart / stop→start (`Provider::
-    /// restart_wipes_container_disk`; Hetzner's VM keeps it) — pass `true` when unknown.
-    pub fn warning(&self, wipes_disk: bool) -> Option<&'static str> {
+    /// restart_wipes_container_disk`; Hetzner's VM keeps it) — pass `true` when unknown. It
+    /// alone decides whether a restart warns; `reset` (`Provider::restart_resets_container`)
+    /// only words it: a restart known to reset the container (RunPod v2) "WIPES" it, one that
+    /// may (RunPod v1, Vast, an unknown backend) "MAY WIPE" it — the same warning either way.
+    pub fn warning(&self, wipes_disk: bool, reset: ContainerReset) -> Option<&'static str> {
         match self {
             Action::Terminate => Some("⚠ IRREVERSIBLE"),
-            Action::Restart if wipes_disk => Some(
+            Action::Restart if wipes_disk && reset == ContainerReset::Yes => Some(
                 "⚠ WIPES THE CONTAINER DISK: the pod is reset to its image — everything outside a \
                  /workspace volume is lost (participants' files, ~/.name, git remote, keys). Back it \
                  up first; run setup (p) afterwards.",
+            ),
+            Action::Restart if wipes_disk => Some(
+                "⚠ MAY WIPE THE CONTAINER DISK: this backend's restart can reset the pod to its image — \
+                 count everything outside a /workspace volume as lost (participants' files, ~/.name, git \
+                 remote, keys). Back it up first; run setup (p) afterwards.",
             ),
             Action::Restart => Some("hard reset: running processes are killed; the disk is kept."),
             Action::Stop if wipes_disk => Some(
@@ -893,18 +922,30 @@ pub struct Confirm {
     /// Whether this pod's restart/stop resets its container disk — selects the warning
     /// ([`Action::warning`]). Defaults to `true`: assuming a wipe only adds a warning.
     pub wipes_disk: bool,
+    /// What a restart is known to do to this pod's container disk — words the restart's
+    /// warning, never decides it. Defaults to `Unknown`: never claimed.
+    pub reset: ContainerReset,
     /// The full command is shown under the summary (`v` toggles it).
     pub full: bool,
 }
 
 impl Confirm {
     pub fn new(action: Action, pod_name: String, pod_id: String, preview: Option<String>) -> Self {
-        Self { action, pod_name, pod_id, typed: String::new(), preview, wipes_disk: true, full: false }
+        Self {
+            action,
+            pod_name,
+            pod_id,
+            typed: String::new(),
+            preview,
+            wipes_disk: true,
+            reset: ContainerReset::Unknown,
+            full: false,
+        }
     }
 
     /// The warning line for this confirmation, if any.
     pub fn warning(&self) -> Option<&'static str> {
-        self.action.warning(self.wipes_disk)
+        self.action.warning(self.wipes_disk, self.reset)
     }
 
     /// Is the confirmation satisfied enough to apply? Typed-name actions need an exact
@@ -1099,6 +1140,43 @@ mod tests {
         assert_eq!(s.mean_util, None);
     }
 
+    /// The restart label says what the backend says (live: v1 RunPod kept the disk, v2 wiped
+    /// it, a Hetzner VM keeps it): "WIPES" only where a reset is known, "may wipe" where it
+    /// isn't, "keeps the disk" where it's kept — and every other action's label is the same
+    /// whatever the answer. Pure.
+    #[test]
+    fn the_restart_label_follows_the_backends_answer() {
+        use ContainerReset::{No, Unknown, Yes};
+        for (reset, want) in [
+            (Yes, "restart — WIPES the container disk"),
+            (Unknown, "restart — may wipe the container disk"),
+            (No, "restart — keeps the disk"),
+        ] {
+            assert_eq!(Action::Restart.desc(reset), want, "{reset:?}");
+        }
+        for (_, a) in Action::MENU.iter().filter(|(_, a)| *a != Action::Restart) {
+            assert!([Yes, Unknown, No].iter().all(|r| a.desc(*r) == a.desc(Yes)), "{a:?}");
+        }
+        // A marked set: the worst of its pods; nothing known is never "keeps".
+        let cases: &[(&[ContainerReset], ContainerReset)] = &[
+            (&[No, No], No),
+            (&[No, Unknown], Unknown),
+            (&[Unknown, No, Yes], Yes),
+            (&[Yes, No], Yes),
+            (&[Unknown], Unknown),
+            (&[], Unknown),
+        ];
+        for (set, want) in cases {
+            assert_eq!(worst_reset(set.iter().copied()), *want, "{set:?}");
+        }
+        // Wording only: whatever the answer, a restart wants the pod's name typed back, and a
+        // pod whose provider may wipe is warned.
+        for reset in [Yes, Unknown, No] {
+            let c = Confirm { reset, ..Confirm::new(Action::Restart, "devtest-a".into(), "1".into(), None) };
+            assert!(!c.is_satisfied() && c.warning().is_some_and(|w| w.starts_with('⚠')), "{reset:?}");
+        }
+    }
+
     #[test]
     fn lifecycle_actions_need_typed_name() {
         let mut c = Confirm::new(Action::Terminate, "arena8-apple".into(), "id".into(), None);
@@ -1116,7 +1194,7 @@ mod tests {
         assert!(!Action::Backup.requires_typed_name());
         assert!(Action::Terminate.is_destructive());
         assert!(!Action::Stop.is_destructive());
-        assert!(Action::Backup.warning(true).is_none());
+        assert!(Action::Backup.warning(true, ContainerReset::Yes).is_none());
     }
 
     /// Restart wipes a RunPod pod's container disk (live finding), so it's destructive like
@@ -1129,14 +1207,17 @@ mod tests {
         assert!(!c.is_satisfied());
         c.typed = "arena8-apple".into();
         assert!(c.is_satisfied());
-        // Unknown provider → assume the wipe; Hetzner's reset keeps the disk.
+        // Unknown provider → warned as a possible wipe; a verified reset (RunPod v2) "WIPES";
+        // Hetzner's reset keeps the disk.
+        assert!(c.warning().unwrap().contains("MAY WIPE THE CONTAINER DISK"));
+        c.reset = ContainerReset::Yes;
         assert!(c.warning().unwrap().contains("WIPES THE CONTAINER DISK"));
         c.wipes_disk = false;
         let kept = c.warning().unwrap();
-        assert!(kept.contains("disk is kept") && !kept.contains("WIPES"), "{kept}");
-        assert!(Action::Stop.warning(true).unwrap().contains("keeps no data"));
-        assert!(Action::Stop.warning(false).is_none());
-        assert!(Action::Restart.desc().contains("WIPES"));
+        assert!(kept.contains("disk is kept") && !kept.contains("WIPE"), "{kept}");
+        assert!(Action::Stop.warning(true, ContainerReset::Unknown).unwrap().contains("keeps no data"));
+        assert!(Action::Stop.warning(false, ContainerReset::No).is_none());
+        assert!(Action::Restart.desc(ContainerReset::Yes).contains("WIPES"));
         let fleet = |marked| Action::fleet_menu(marked).into_iter().map(|(_, a)| a).collect::<Vec<_>>();
         assert!(!fleet(false).contains(&Action::Restart) && !fleet(false).contains(&Action::Terminate));
         assert!(fleet(true).contains(&Action::Restart) && fleet(true).contains(&Action::Terminate));

@@ -913,17 +913,17 @@ enum PodCmd {
         #[command(flatten)]
         sel: Select,
     },
-    /// Restart a pod in place (RunPod: WIPES its container disk)
+    /// Restart a pod in place (RunPod v2 WIPES its disk; v1 and Vast may)
     ///
-    /// Everything outside a /workspace volume is lost (files, ~/.name, keys). Refused without
-    /// --wipe-ok unless the pod's repo is on a volume, even with --yes; Vast is treated the same.
-    /// Then waits for SSH, re-runs setup and syncs the proxy. Hetzner's reset keeps the disk. A
-    /// stopped pod is refused: use `pods start`.
+    /// On RunPod v2 everything outside a /workspace volume is lost (files, ~/.name, keys); RunPod
+    /// v1 and Vast may lose it, so they're gated the same. Refused without --wipe-ok unless the
+    /// pod's repo is on a volume, even with --yes. Then waits for SSH, re-runs setup and syncs the
+    /// proxy. Hetzner's reset keeps the disk. A stopped pod is refused: use `pods start`.
     #[command(verbatim_doc_comment)]
     Restart {
         /// Machine name (e.g. arena8-apple) or raw provider id.
         target: String,
-        /// Restart even if work on the container disk is WIPED (required, even with --yes)
+        /// Restart even if work on the container disk may be WIPED (required, even with --yes)
         #[arg(long)]
         wipe_ok: bool,
         /// Don't re-run setup on the pod afterwards (it comes back as the bare image).

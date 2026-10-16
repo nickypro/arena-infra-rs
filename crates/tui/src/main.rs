@@ -200,6 +200,10 @@ struct Shared {
     /// `n`'s fresh listing, set by its background task ([`start_new_pod_listing`]); the UI
     /// loop turns it into the add-pod form ([`new_pod_mode`]).
     new_pod_listing: Option<std::result::Result<Vec<Pod>, String>>,
+    /// What a restart does to each row's container disk, by [`mark_key`]: its backend's answer
+    /// (`Provider::restart_resets_container`, pure), set with the rows each refresh — what the
+    /// action menus' restart label says ([`Shared::restart_reset`]).
+    resets: HashMap<String, ContainerReset>,
 }
 
 impl Shared {
@@ -207,6 +211,12 @@ impl Shared {
     fn publish(&mut self, snap: FleetSnapshot) {
         self.pods = snap.pods.iter().map(|p| p.pod.clone()).collect();
         self.snap = snap;
+    }
+
+    /// What a restart does to these pods' disks, for the menu's label: the worst of their
+    /// backends' answers (`state::worst_reset`); a pod not answered for yet is `Unknown`.
+    fn restart_reset<'a>(&self, pods: impl IntoIterator<Item = &'a Pod>) -> ContainerReset {
+        state::worst_reset(pods.into_iter().map(|p| self.resets.get(&mark_key(p)).copied().unwrap_or(ContainerReset::Unknown)))
     }
 
     fn notify(&mut self, text: impl Into<String>, error: bool) {
@@ -536,9 +546,16 @@ async fn refresh(
     if let Some(v) = balance_views {
         s.balance = v;
     }
+    s.resets = backend_resets(provider, &display);
     s.publish(snap);
     s.last_refresh = Some(Instant::now());
     s.refreshing = false;
+}
+
+/// What a restart does to each of `pods`' container disks, by [`mark_key`]: each one's backend's
+/// answer (`Provider::restart_resets_container` — pure, no request), for the menus' restart label.
+fn backend_resets(provider: &dyn Provider, pods: &[Pod]) -> HashMap<String, ContainerReset> {
+    pods.iter().map(|p| (mark_key(p), provider.restart_resets_container(p))).collect()
 }
 
 /// The provider's best-effort details query, bounded by [`ENRICH_TIMEOUT`]. `Some(why)`
@@ -1516,7 +1533,8 @@ fn choose_pod_action(shared: &Arc<Mutex<Shared>>, ui: &mut Ui, provider: &Arc<dy
     } else {
         let preview = build_preview(&ui.cfg, action, &pod);
         let wipes_disk = provider.restart_wipes_container_disk(&pod);
-        Mode::Confirm(Confirm { wipes_disk, ..Confirm::new(action, shown, pod.id, preview) })
+        let reset = provider.restart_resets_container(&pod);
+        Mode::Confirm(Confirm { wipes_disk, reset, ..Confirm::new(action, shown, pod.id, preview) })
     };
 }
 
@@ -2905,8 +2923,9 @@ fn centered_rect(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
 }
 
 /// Render a navigable action menu: a title, one highlighted row per action (with its
-/// key + description; destructive ones in red), and a key hint. `sel` is the cursor.
-fn render_action_menu(f: &mut Frame, title: String, actions: &[(char, Action)], sel: usize) {
+/// key + description; destructive ones in red), and a key hint. `sel` is the cursor; `restart`
+/// what a restart does to the disk of the pod(s) the menu is for (its label).
+fn render_action_menu(f: &mut Frame, title: String, actions: &[(char, Action)], sel: usize, restart: ContainerReset) {
     let mut lines: Vec<Line> = vec![Line::from(title), Line::from("")];
     for (i, (k, a)) in actions.iter().enumerate() {
         let selected = i == sel;
@@ -2921,7 +2940,7 @@ fn render_action_menu(f: &mut Frame, title: String, actions: &[(char, Action)], 
             base
         };
         let marker = if selected { "▶ " } else { "  " };
-        lines.push(Line::styled(format!("{marker}[{k}] {:<10} {}", a.label(), a.desc()), style));
+        lines.push(Line::styled(format!("{marker}[{k}] {:<10} {}", a.label(), a.desc(restart)), style));
     }
     lines.push(Line::from(""));
     lines.push(Line::styled(
@@ -2937,12 +2956,9 @@ fn render_action_menu(f: &mut Frame, title: String, actions: &[(char, Action)], 
 }
 
 fn render_menu(f: &mut Frame, shared: &Shared, ui: &Ui, sel: usize) {
-    let name = shared
-        .pods
-        .get(ui.selected)
-        .map(|p| ui.shown_name(&p.name))
-        .unwrap_or_else(|| "?".into());
-    render_action_menu(f, format!("Actions for {name}:"), Action::MENU, sel);
+    let pod = shared.pods.get(ui.selected);
+    let name = pod.map(|p| ui.shown_name(&p.name)).unwrap_or_else(|| "?".into());
+    render_action_menu(f, format!("Actions for {name}:"), Action::MENU, sel, shared.restart_reset(pod));
 }
 
 /// The single-pod confirm. What is about to happen — a plain summary of the action on the pod,
@@ -3080,11 +3096,7 @@ fn scope_label(shared: &Shared, marked: &std::collections::HashSet<String>, scop
 
 /// The shown names of the pods a scope targets, in row order.
 fn scope_names(shared: &Shared, ui: &Ui, scope: Scope) -> Vec<String> {
-    let pods: Vec<&Pod> = match scope {
-        Scope::All => shared.pods.iter().collect(),
-        Scope::Marked => marked_pods(&shared.pods, &ui.marked),
-    };
-    pods.iter().map(|p| ui.shown_name(&p.name)).collect()
+    scope_pods_of(shared, ui, scope).iter().map(|p| ui.shown_name(&p.name)).collect()
 }
 
 /// How many marked pods a marked-set confirm names before `… and N more`: enough to see
@@ -3095,7 +3107,15 @@ const CONFIRM_NAMES_MAX: usize = 10;
 fn render_fleet_menu(f: &mut Frame, shared: &Shared, ui: &Ui, scope: Scope, sel: usize) {
     let (_, who) = scope_label(shared, &ui.marked, scope);
     let actions = Action::fleet_menu(scope == Scope::Marked);
-    render_action_menu(f, format!("Actions — {who}:"), &actions, sel);
+    render_action_menu(f, format!("Actions — {who}:"), &actions, sel, shared.restart_reset(scope_pods_of(shared, ui, scope)));
+}
+
+/// The listed pods `scope` covers, render-side (as [`scope_names`]).
+fn scope_pods_of<'a>(shared: &'a Shared, ui: &Ui, scope: Scope) -> Vec<&'a Pod> {
+    match scope {
+        Scope::All => shared.pods.iter().collect(),
+        Scope::Marked => marked_pods(&shared.pods, &ui.marked),
+    }
 }
 
 /// The multi-pod confirm. What is about to happen — to which pods, named once (`/` can mark
@@ -3106,8 +3126,10 @@ fn render_fleet_menu(f: &mut Frame, shared: &Shared, ui: &Ui, scope: Scope, sel:
 fn render_fleet_confirm(f: &mut Frame, shared: &Shared, ui: &Ui, action: Action, typed: &str, scope: Scope, note: &str) {
     let n = scope_label(shared, &ui.marked, scope).0;
     let token = fleet_confirm_token_str(shared, &ui.marked, scope, action);
-    // Per-pod providers aren't known here: warn as if each one wipes (the safe side).
-    let warn = action.warning(true).map(|w| format!("\n\n{w}")).unwrap_or_default();
+    // Warned as if each pod's provider wipes (the safe side); worded by the worst answer of
+    // the set's backends, as its menu label.
+    let reset = shared.restart_reset(scope_pods_of(shared, ui, scope));
+    let warn = action.warning(true, reset).map(|w| format!("\n\n{w}")).unwrap_or_default();
     let summary = action_summary(action, &scope_names(shared, ui, scope), None, CONFIRM_NAMES_MAX).join("\n");
     // Why a marked set asks for ALL rather than its count (`state::marked_set_token`).
     let why = if scope == Scope::Marked && token == "ALL" {
@@ -4766,6 +4788,54 @@ deep_check_end=1
         assert!(footer.contains("[↑↓] field  [←→] change  [enter] create  [esc] cancel"), "{footer}");
         assert!(!footer.contains("[+-]") && !footer.contains("[↑↓] pods"), "{footer}");
         assert!(lines.join("\n").contains("[↑↓] field   [←→] change   [enter] CREATE   [esc] cancel"));
+    }
+
+    /// The menus' restart label says what each pod's backend says a restart does to its disk —
+    /// live: RunPod v2's wiped it, a Hetzner VM keeps it, RunPod v1 (seen keeping it) and Vast
+    /// aren't known to — from the real fleet's answers, as the refresh records them; a marked
+    /// set's menu says the worst of its pods'. It used to say "WIPES" for every pod. The confirm
+    /// is as strict as before: the name typed back, and a ⚠ wherever the backend may wipe.
+    #[test]
+    fn the_restart_label_follows_each_pods_backend() {
+        let fleet = |api: &str| -> Arc<dyn Provider> {
+            let keys = format!("RUNPOD_API_KEY=r\nRUNPOD_API={api}\nVAST_API_KEY=v\nHETZNER_API_KEY=h\n");
+            Arc::from(arena_core::provider::build_fleet("runpod", &Config::parse(&keys), false).unwrap())
+        };
+        let (rp, va, hz) = (pod("alpha", "runpod", "rp1", 1, Some(22001)), pod("bravo", "vast", "va1", 2, Some(22002)), pod("charlie", "hetzner", "hz1", 3, Some(22)));
+        let pods = [rp.clone(), va.clone(), hz.clone()];
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let snap = dashboard_snapshot(&pods, &[], None, &HealthCache::new(), &Naming::from_config(&cfg("")), NOW);
+        shared.lock().unwrap().publish(snap);
+        let at = |id: &str| shared.lock().unwrap().pods.iter().position(|p| p.id == id).unwrap();
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        // Nothing recorded yet: never "keeps", never "WIPES".
+        ui.mode = Mode::Menu { sel: 0 };
+        assert!(draw(120, 40, &shared.lock().unwrap(), &ui).join("\n").contains("restart — may wipe the container disk"));
+        for (api, runpod) in [("v2", "WIPES the container disk"), ("v1", "may wipe the container disk")] {
+            let f = fleet(api);
+            shared.lock().unwrap().resets = backend_resets(f.as_ref(), &pods);
+            for (id, want) in [("rp1", runpod), ("va1", "may wipe the container disk"), ("hz1", "keeps the disk")] {
+                (ui.selected, ui.mode) = (at(id), Mode::Menu { sel: 0 });
+                let text = draw(120, 40, &shared.lock().unwrap(), &ui).join("\n");
+                assert!(text.contains(&format!("[r] restart    restart — {want}")), "{api} {id}: {text}");
+            }
+            for (marked, want) in [(vec![&hz], "keeps the disk"), (vec![&hz, &va], "may wipe the container disk"), (vec![&hz, &va, &rp], runpod)] {
+                ui.marked = marked.iter().map(|p| mark_key(p)).collect();
+                ui.mode = Mode::FleetMenu { scope: Scope::Marked, sel: 0 };
+                let text = draw(120, 40, &shared.lock().unwrap(), &ui).join("\n");
+                assert!(text.contains(&format!("restart — {want}")), "{api} {marked:?}: {text}");
+            }
+            ui.marked.clear();
+            // The single-pod confirm: the name typed back whatever the answer; the warning where
+            // the backend may wipe, worded by its answer.
+            for (id, warn) in [("rp1", if api == "v2" { "⚠ WIPES THE CONTAINER DISK" } else { "⚠ MAY WIPE THE CONTAINER DISK" }), ("va1", "⚠ MAY WIPE"), ("hz1", "the disk is kept")] {
+                (ui.selected, ui.mode) = (at(id), Mode::List);
+                choose_pod_action(&shared, &mut ui, &f, Action::Restart);
+                let Mode::Confirm(c) = &ui.mode else { panic!("{:?}", ui.mode) };
+                assert!(c.action.requires_typed_name() && !c.is_satisfied(), "{api} {id}");
+                assert!(c.warning().is_some_and(|w| w.contains(warn)), "{api} {id}: {:?}", c.warning());
+            }
+        }
     }
 
     /// A multi-pod stop sorts its pods as `pods stop` does, through the core helpers
