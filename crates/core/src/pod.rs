@@ -150,6 +150,11 @@ pub struct PodSpec {
     /// can honour it — Vast skips their offers; RunPod's create has no such filter, so a pod
     /// RunPod places on one is rejected by `up` and replaced. Empty = any machine.
     pub avoid_machines: Vec<String>,
+    /// `--server-type`: the Hetzner server type (`cx23`, `cpx42`…) for this create, over
+    /// `HETZNER_SERVER_TYPE`. Only Hetzner sizes a machine by type — its VMs have no GPU — so
+    /// `create`/`up` refuse the flag for any other provider rather than drop it. `None` = the
+    /// configured type.
+    pub server_type: Option<String>,
 }
 
 impl PodSpec {
@@ -191,6 +196,7 @@ impl PodSpec {
             max_price: None,
             api_extra: None,
             avoid_machines: Vec::new(),
+            server_type: None,
         }
     }
 

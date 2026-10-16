@@ -357,6 +357,7 @@ async fn unknown_gpu_create_is_a_config_error() {
         max_price: None,
         api_extra: None,
         avoid_machines: Vec::new(),
+        server_type: None,
     };
     let ours = create_payload(&spec, &[]).unwrap();
     for (k, v) in r.request.as_object().unwrap() {

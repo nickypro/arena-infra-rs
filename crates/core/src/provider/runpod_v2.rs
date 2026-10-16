@@ -742,6 +742,7 @@ fn parse_spec(v: &Value) -> PodSpec {
         max_price: None,
         api_extra: None,
         avoid_machines: Vec::new(),
+        server_type: None,
     }
 }
 
@@ -1455,6 +1456,7 @@ mod tests {
             max_price: None,
             api_extra: None,
             avoid_machines: Vec::new(),
+            server_type: None,
         }
     }
 

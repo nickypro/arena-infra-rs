@@ -25,6 +25,8 @@ mod archive;
 #[cfg(test)]
 mod gpu_vm_setup_tests;
 #[cfg(test)]
+mod hetzner_cli_tests;
+#[cfg(test)]
 mod hetzner_setup_tests;
 mod jobs;
 mod money;
@@ -725,6 +727,9 @@ enum PodCmd {
         /// GPUs per pod (overrides config NUM_GPUS).
         #[arg(long)]
         gpus: Option<u32>,
+        /// Hetzner only: server type, e.g. cx23 or cpx42 (overrides HETZNER_SERVER_TYPE)
+        #[arg(long, value_name = "TYPE")]
+        server_type: Option<String>,
         /// RunPod tier COMMUNITY or SECURE (overrides config), or a comma list to fall back
         #[arg(long)]
         cloud: Option<String>,
@@ -793,6 +798,9 @@ enum PodCmd {
         /// GPUs per pod (overrides config NUM_GPUS).
         #[arg(long)]
         gpus: Option<u32>,
+        /// Hetzner only: server type, e.g. cx23 or cpx42 (overrides HETZNER_SERVER_TYPE)
+        #[arg(long, value_name = "TYPE")]
+        server_type: Option<String>,
         /// RunPod tier COMMUNITY or SECURE (overrides config), or a comma list to fall back
         #[arg(long)]
         cloud: Option<String>,
@@ -1698,6 +1706,8 @@ struct SpecOverrides {
     api_extra: Option<arena_core::apiextra::Extra>,
     /// Machine ids not to place on (`PodSpec::avoid_machines`): `up`'s remembered bad ones.
     avoid_machines: Vec<String>,
+    /// `--server-type` (Hetzner), already checked against the create target ([`sizing_flags`]).
+    server_type: Option<String>,
 }
 
 /// Where `replace` / `migrate copy` may land the new pod beyond `--gpu` / `--cloud` (live
@@ -1769,6 +1779,41 @@ fn apply_spec_overrides(spec: &mut PodSpec, ov: &SpecOverrides) {
     if !ov.avoid_machines.is_empty() {
         spec.avoid_machines = ov.avoid_machines.clone();
     }
+    if let Some(t) = &ov.server_type {
+        spec.server_type = Some(t.clone());
+    }
+}
+
+/// The sizing flags `create`/`up` were given, checked against the backend the pods would be
+/// created on (`provider`: the fleet's primary — `--provider`). Pure. A flag the target can't
+/// honour is refused, never dropped: Hetzner sizes a CPU VM by server type and has no GPU, so
+/// `--gpu`/`--gpus` there would be ignored (live, an evals node asked for one and got the
+/// configured type) — the refusal points at `--server-type`; anywhere else `--server-type` would
+/// be. Returns the server type to create with (`None`: the configured one).
+fn sizing_flags(provider: &str, gpu: Option<&str>, gpus: Option<u32>, server_type: Option<String>) -> Result<Option<String>> {
+    let hetzner = provider == "hetzner";
+    if hetzner {
+        let given = [gpu.map(|_| "--gpu"), gpus.map(|_| "--gpus")].into_iter().flatten().collect::<Vec<_>>();
+        if !given.is_empty() {
+            anyhow::bail!(
+                "{} doesn't apply to hetzner, which creates CPU VMs sized by server type — pass --server-type \
+                 (e.g. cx23, cpx42; `arena api get hetzner server_types` lists them) or set HETZNER_SERVER_TYPE",
+                given.join(" / ")
+            );
+        }
+    }
+    let Some(t) = server_type else { return Ok(None) };
+    if !hetzner {
+        anyhow::bail!(
+            "--server-type is for Hetzner VMs only; these pods would be created on {provider} — pass --provider hetzner, \
+             or size a GPU pod with --gpu / --gpus"
+        );
+    }
+    let t = t.trim();
+    if t.is_empty() || t.len() > 32 || !t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        anyhow::bail!("--server-type takes a Hetzner server type name like cx23 or cpx42");
+    }
+    Ok(Some(t.to_ascii_lowercase()))
 }
 
 /// `--api-json` over config `CREATE_EXTRA_JSON`, parsed and checked against the create
@@ -4658,6 +4703,39 @@ fn shadeform_rows(cfg: &Config) -> (Vec<String>, Option<arena_core::Error>) {
     (out, None)
 }
 
+/// The `HETZNER_*` keys that shape a Hetzner create ([`hetzner_rows`]).
+const HETZNER_OPTION_KEYS: [&str; 4] = ["HETZNER_SERVER_TYPE", "HETZNER_LOCATION", "HETZNER_IMAGE", "HETZNER_SSH_KEY"];
+
+/// `config check`'s Hetzner rows: the create options as the provider reads them, defaults
+/// marked — and the SSH key every new server gets, the one that must already exist in the
+/// Hetzner project. Pure, and no request (`config check` makes none): whether the project has
+/// that key is checked at create, whose error names the keys it has (live, an evals node:
+/// the default key is named after the prefix, `arena9`, and the project only had `arena8`).
+fn hetzner_rows(cfg: &Config) -> Vec<String> {
+    let o = arena_core::provider::hetzner::HetznerOpts::from_config(cfg);
+    let set = |k: &str| cfg.get(k).is_some_and(|v| !v.trim().is_empty());
+    let row = |key: &str, value: &str, note: &str| {
+        let (mark, default) = if set(key) { ("✓", "") } else { ("·", " (default)") };
+        format!("  {mark} {key:<28} {value}{default}{note}")
+    };
+    let key = o.ssh_keys.join(", ");
+    let key_row = if o.ssh_keys_from == "HETZNER_SSH_KEY" {
+        format!("  ✓ {:<28} {key}", "HETZNER_SSH_KEY")
+    } else {
+        format!("  · {:<28} {key} (default: MACHINE_NAME_PREFIX)", "HETZNER_SSH_KEY")
+    };
+    vec![
+        row("HETZNER_SERVER_TYPE", &o.server_type, " — `pods create/up --server-type` overrides it"),
+        row("HETZNER_LOCATION", o.location.as_deref().unwrap_or("-"), ""),
+        row("HETZNER_IMAGE", &o.image, ""),
+        key_row,
+        format!(
+            "      └ every new server gets SSH key `{key}`: it must be in the Hetzner project under that name — checked at \
+             create (`arena api get hetzner ssh_keys` lists the project's keys)"
+        ),
+    ]
+}
+
 /// Print a config checklist for the selected provider + proxy + backup, never showing
 /// secret values. Returns an error if a required key is missing.
 fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
@@ -4738,10 +4816,13 @@ fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<String>) {
             note_invalid(&mut missing, &e);
         }
     }
-    if provider_name == "hetzner" {
-        cfg_row(&mut out, cfg, &mut missing, "HETZNER_SERVER_TYPE", false, false);
-        cfg_row(&mut out, cfg, &mut missing, "HETZNER_IMAGE", false, false);
-        cfg_row(&mut out, cfg, &mut missing, "HETZNER_SSH_KEY", false, false);
+    // As for Shadeform: whenever Hetzner is in play — `pods up --provider hetzner` reads the
+    // same config whatever the default provider is.
+    let hetzner_in_play = provider_name == "hetzner"
+        || cfg.get("HETZNER_API_KEY").is_some_and(|v| !v.is_empty())
+        || HETZNER_OPTION_KEYS.iter().any(|k| cfg.get(k).is_some());
+    if hetzner_in_play {
+        hetzner_rows(cfg).iter().for_each(|l| println!("{l}"));
     }
 
     println!("\nMachine naming:");
@@ -6447,7 +6528,7 @@ async fn handle_pods_bal(
             print!("{out}");
         }
 
-        PodCmd::Create { names, count, add, gpu, gpus, cloud, max_price, order, disk, volume, image, bootstrap, api_json, reap, skip_proxy, dry_run, keep_trying, retry_mins, retry_secs } => {
+        PodCmd::Create { names, count, add, gpu, gpus, server_type, cloud, max_price, order, disk, volume, image, bootstrap, api_json, reap, skip_proxy, dry_run, keep_trying, retry_mins, retry_secs } => {
             // A reap policy asked for: resolved (one end time for every pod) and its state
             // checked before anything is created; then every create records it.
             let reaping = reap.resolve(cfg, provider.name())?;
@@ -6464,9 +6545,12 @@ async fn handle_pods_bal(
             }
             // Bad extra JSON (or a field arena sets itself) fails before any API call.
             let api_extra = create_extra(provider, cfg, api_json.as_deref())?;
+            // Sizing flags the create target can't honour fail here too (`--gpu` on Hetzner,
+            // `--server-type` elsewhere) — refused, never silently dropped.
+            let server_type = sizing_flags(provider.name(), gpu.as_deref(), gpus, server_type)?;
             // A typo'd --gpu fails here, before anything is listed or created.
             let gpu = checked_gpu(cfg, provider.name(), gpu).await?;
-            let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap, api_extra, ..Default::default() };
+            let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap, api_extra, server_type, ..Default::default() };
             // Several --gpu/--cloud options or a --max-price → ordered placement; otherwise
             // the single-spec path below, unchanged. Decided before anything is listed.
             let (ov, placing) = placement_request(cfg, provider.name(), ov, max_price, order, keep_trying)?;
@@ -6560,7 +6644,7 @@ async fn handle_pods_bal(
             }
         }
 
-        PodCmd::Up { names, count, add, gpu, gpus, cloud, max_price, order, disk, volume, image, bootstrap, api_json, reap, dry_run, no_wait, keep_trying, retry_mins, retry_secs, no_setup, check, check_attempts, retry_bad_hosts, lock, timeout, interval } => {
+        PodCmd::Up { names, count, add, gpu, gpus, server_type, cloud, max_price, order, disk, volume, image, bootstrap, api_json, reap, dry_run, no_wait, keep_trying, retry_mins, retry_secs, no_setup, check, check_attempts, retry_bad_hosts, lock, timeout, interval } => {
             // As `create`: the reap policy is resolved once, before anything is created, and
             // recorded for each pod (replacements included) the moment its create returns.
             let reaping = reap.resolve(cfg, provider.name())?;
@@ -6581,6 +6665,7 @@ async fn handle_pods_bal(
                 let target = arena_core::Pod { provider: provider.name().to_string(), ..Default::default() };
                 provider.lock_support(&target).map_err(|e| anyhow::anyhow!("--lock: {}", lock_why(e)))?;
             }
+            let server_type = sizing_flags(provider.name(), gpu.as_deref(), gpus, server_type)?;
             let gpu = checked_gpu(cfg, provider.name(), gpu).await?;
             // The machines earlier `up --check`s found bad: a marketplace (Vast) skips their
             // offers; RunPod can't be told, so a pod it places on one is rejected (`up`).
@@ -6589,7 +6674,7 @@ async fn handle_pods_bal(
             } else {
                 arena_core::snapshot::avoided_machines(&up::remembered_bad_hosts(cfg, arena_core::snapshot::unix_now()).0, "vast")
             };
-            let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap, api_extra, avoid_machines };
+            let ov = SpecOverrides { gpu, gpus, cloud, disk, volume, image, bootstrap, api_extra, avoid_machines, server_type };
             // Several --gpu/--cloud options or a --max-price → ordered placement (as `create`).
             let (ov, placing) = placement_request(cfg, provider.name(), ov, max_price, order, keep_trying)?;
             // Like `create`: explicit names take the direct path; -n/-a top up by count.
@@ -14568,6 +14653,7 @@ mod replacement_spec_tests {
             max_price: None,
             api_extra: None,
             avoid_machines: Vec::new(),
+            server_type: None,
         }
     }
 
@@ -18162,6 +18248,7 @@ mod proxy_deploy_tests {
             add: None,
             gpu: None,
             gpus: None,
+            server_type: None,
             cloud: None,
             max_price: None,
             order: Default::default(),
@@ -18289,6 +18376,7 @@ mod placement_cli_tests {
             add: None,
             gpu: gpu.map(String::from),
             gpus: None,
+            server_type: None,
             cloud: cloud.map(String::from),
             max_price,
             order: Order::Cheapest,
@@ -18323,6 +18411,7 @@ mod placement_cli_tests {
             add: None,
             gpu: gpu.map(String::from),
             gpus: None,
+            server_type: None,
             cloud: None,
             max_price: None,
             order: Order::Cheapest,
@@ -18682,6 +18771,7 @@ mod placement_cli_tests {
             add: None,
             gpu: Some("A4000,3090".into()),
             gpus: None,
+            server_type: None,
             cloud: Some("community,secure".into()),
             max_price: Some(0.30),
             order: Order::Listed,
@@ -18717,6 +18807,7 @@ mod placement_cli_tests {
             add: None,
             gpu: Some("3090,A4000".into()),
             gpus: None,
+            server_type: None,
             cloud: None,
             max_price: None,
             order: Order::Listed, // 3090 first despite the price
@@ -18754,6 +18845,7 @@ mod placement_cli_tests {
             add: None,
             gpu: Some("3090,A4000".into()),
             gpus: None,
+            server_type: None,
             cloud: None,
             max_price: None,
             order: Order::Listed,

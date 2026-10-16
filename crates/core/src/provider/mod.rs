@@ -85,33 +85,10 @@ pub fn build(name: &str, cfg: &Config) -> Result<Box<dyn Provider>> {
             })
         }
         "vast" => Ok(Box::new(vast::VastProvider::from_config(cfg)?)),
-        "hetzner" => {
-            let opts = hetzner::HetznerOpts {
-                // cx23: newest Intel x86 shared gen (the old cx/cax lines had poor
-                // availability). Pin an EU location so placement is deterministic — the
-                // x86 shared types live only in the EU DCs, so no-location auto-placement
-                // can land on a US DC that lacks them and fail with "error during placement".
-                server_type: cfg.get("HETZNER_SERVER_TYPE").unwrap_or("cx23").to_string(),
-                image: cfg.get("HETZNER_IMAGE").unwrap_or("ubuntu-24.04").to_string(),
-                location: Some(cfg.get("HETZNER_LOCATION").unwrap_or("nbg1").to_string()),
-                // Universal default: attach the cohort SSH key, named after
-                // MACHINE_NAME_PREFIX (e.g. "arena8"), so every hetzner pod is reachable
-                // with the same arena key as the GPU fleet — no per-pod config. Upload it
-                // once to the Hetzner project under that name (`arena keys`/console).
-                // Override/disable via HETZNER_SSH_KEY.
-                ssh_keys: cfg
-                    .get("HETZNER_SSH_KEY")
-                    .filter(|s| !s.is_empty())
-                    .map(|s| vec![s.to_string()])
-                    .unwrap_or_else(|| {
-                        vec![cfg.get("MACHINE_NAME_PREFIX").unwrap_or("arena").to_string()]
-                    }),
-            };
-            Ok(Box::new(hetzner::HetznerProvider::new(
-                cfg.require("HETZNER_API_KEY")?,
-                opts,
-            )))
-        }
+        "hetzner" => Ok(Box::new(hetzner::HetznerProvider::new(
+            cfg.require("HETZNER_API_KEY")?,
+            hetzner::HetznerOpts::from_config(cfg),
+        ))),
         // Opt-in overflow only (`--provider shadeform`): never in the default plan chain.
         "shadeform" => Ok(Box::new(shadeform::ShadeformProvider::from_config(cfg)?)),
         other => Err(Error::Config(format!(
@@ -500,6 +477,7 @@ mod tests {
             max_price: None,
             api_extra: None,
             avoid_machines: Vec::new(),
+            server_type: None,
         }
     }
 

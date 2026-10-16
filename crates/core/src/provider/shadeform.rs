@@ -1579,6 +1579,7 @@ impl Provider for ShadeformProvider {
             max_price: pod.cost_per_hr,
             api_extra: None,
             avoid_machines: Vec::new(),
+            server_type: None,
         })
     }
 }

@@ -82,8 +82,12 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     than risk a second instance. The key attach after a rent is bounded (60s).
   - `provider::hetzner` — Hetzner Cloud backend for **CPU-only** VMs. Not a GPU
     container host, so it ignores the GPU-centric `PodSpec` fields and takes its
-    sizing/OS/location/SSH-keys from `HETZNER_*` config. VMs come up on a real public
-    IP with SSH on `:22`, so they use the same proxy/`pods up` flow as GPU providers.
+    sizing/OS/location/SSH-keys from `HETZNER_*` config (`create`/`up --server-type` over
+    `HETZNER_SERVER_TYPE`; `--gpu`/`--gpus` are refused there, `--server-type` everywhere else).
+    VMs come up on a real public IP with SSH on `:22`, so they use the same proxy/`pods up`
+    flow as GPU providers. A refused create is explained from the project (read-only
+    `GET /ssh_keys` + `GET /server_types`): a missing SSH key names the project's keys and
+    what to set or upload; a type the location doesn't sell lists the ones it does.
   - `provider::shadeform` — Shadeform (one REST API over ~18 GPU clouds), **opt-in overflow
     only** (`--provider shadeform`, never a default): a pod is a **bare GPU VM**, not a
     container from the cohort image, and it **bills until deleted — no stop/start, no

@@ -390,7 +390,7 @@ fn mig_label(api: &str) -> Option<String> {
 ///
 /// Cloud tiers only exist on RunPod: elsewhere the cloud list collapses to one option per
 /// GPU (with a note when more than one tier was asked for). Hetzner creates CPU VMs from
-/// `HETZNER_SERVER_TYPE`, so the GPU list collapses too — one option.
+/// `--server-type` / `HETZNER_SERVER_TYPE`, so the GPU list collapses too — one option.
 ///
 /// With a cap, an option is kept only when its per-pod price is known and within it; an
 /// unknown price can't be checked, so it's dropped (and reported) rather than risked.
@@ -412,7 +412,8 @@ pub fn plan_options(req: &Request, provider: &str, prices: &PriceBook) -> Option
     };
     let gpus: Vec<&String> = if cpu_only {
         if req.gpus.len() > 1 {
-            notes.push("hetzner creates CPU VMs (HETZNER_SERVER_TYPE) — --gpu is ignored, so there is one option".into());
+            // Only a configured GPU list gets here: `create`/`up` refuse `--gpu` on Hetzner.
+            notes.push("hetzner creates CPU VMs (--server-type / HETZNER_SERVER_TYPE) — the GPU list doesn't apply, so there is one option".into());
         }
         req.gpus.iter().take(1).collect()
     } else {
@@ -1081,6 +1082,7 @@ mod tests {
             max_price: None,
             api_extra: None,
             avoid_machines: Vec::new(),
+            server_type: None,
         }
     }
 

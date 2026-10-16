@@ -1012,6 +1012,7 @@ mod tests {
             max_price: None,
             api_extra: None,
             avoid_machines: Vec::new(),
+            server_type: None,
         }
     }
 
