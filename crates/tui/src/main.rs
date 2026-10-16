@@ -1818,12 +1818,23 @@ fn run_report(name: &str, out: &arena_core::ssh::SshOutput) -> String {
 }
 
 /// Gently switch a pod's ARENA checkout to `branch` (mirrors `arena pods set-branch`),
-/// within [`BRANCH_TIMEOUT`].
+/// within [`BRANCH_TIMEOUT`] — after the branch it's on is backed up ([`run_backup`]), as the
+/// CLI does: after a switch, commits that couldn't be pushed live only in a local branch on the
+/// pod. A branch that can't be pushed isn't switched away from here, since the TUI can't copy
+/// the pod's files first; the line names the CLI command that does.
 async fn run_set_branch(remote: &dyn Remote, cfg: &Config, pod: &Pod, branch: &str) -> String {
     let target = match SshTarget::from_pod(pod, cfg) {
         Ok(t) => t,
         Err(e) => return format!("✗ {}: {e}", pod.name),
     };
+    let backed = run_backup(remote, cfg, pod).await;
+    if backed.starts_with('✗') || backed.contains(" — busy:") {
+        return format!(
+            "✗ {} not switched to {branch}: the branch it's on wasn't pushed first ({backed}) — `arena pods set-branch {branch} {}` \
+             copies its files, then switches",
+            pod.name, pod.name
+        );
+    }
     let repo_path = cfg.get("BACKUP_REPO_PATH").map(String::from).unwrap_or_else(|| {
         format!("/root/{}", cfg.get("ARENA_REPO_NAME").unwrap_or("ARENA_materials"))
     });
@@ -1867,7 +1878,7 @@ async fn run_backup(remote: &dyn Remote, cfg: &Config, pod: &Pod) -> String {
                 _ => format!("✓ backed up {}{also}", pod.name),
             }
         }
-        Ok(out) => match parse_backup_report(&out.stdout).stuck_fix(&repo, &pod.name) {
+        Ok(out) => match parse_backup_report(&out.stdout).failure(&repo, &pod.name, out.code) {
             Some(fix) => format!("✗ backup {}: {fix}", pod.name),
             None => format!("✗ backup {} ({}): {}", pod.name, out.exit_label(), out.stderr.trim()),
         },
@@ -4483,7 +4494,16 @@ deep_check_end=1
             ("test-hung", vec![FakeReply::hang()], "✗ devtest-alpha torch failed: timed out after 90s", vec![TEST_TIMEOUT]),
             ("run-hung", vec![FakeReply::hang()], "✗ devtest-alpha run failed: timed out after 1800s", vec![RUN_TIMEOUT]),
             ("backup", vec![FakeReply::exit(1, "rejected")], "✗ backup devtest-alpha (exit 1): rejected", vec![BACKUP_TIMEOUT]),
-            ("set-branch", vec![FakeReply::ok()], "✓ devtest-alpha → w1d2", vec![BRANCH_TIMEOUT]),
+            // The branch it's on backed up first, then switched.
+            ("set-branch", vec![FakeReply::stdout("NO_CHANGES autocommit-x\n"), FakeReply::ok()], "✓ devtest-alpha → w1d2", vec![BACKUP_TIMEOUT, BRANCH_TIMEOUT]),
+            // …and not switched when that push fails (the CLI copies its files first; the TUI can't).
+            (
+                "set-branch",
+                vec![FakeReply::exit(4, "remote: error: GH013"), FakeReply::ok()],
+                "✗ devtest-alpha not switched to w1d2: the branch it's on wasn't pushed first (✗ backup devtest-alpha (exit 4): \
+                 remote: error: GH013) — `arena pods set-branch w1d2 devtest-alpha` copies its files, then switches",
+                vec![BACKUP_TIMEOUT],
+            ),
             ("setup", vec![FakeReply::ok(), FakeReply::ok(), FakeReply::ok()], "✓ set up devtest-alpha", vec![setup.copy, setup.relocate, setup.config]),
             (
                 "setup-hung",
