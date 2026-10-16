@@ -130,10 +130,14 @@ fn remote() -> Arc<dyn Remote> {
     Arc::new(arena_core::remote::FakeRemote::new())
 }
 
+/// One [`sizing_flags`] case: the create target, `--gpu`, `--gpus`, `--server-type`, then what
+/// is expected (`W`: the server type to create with, or a piece of the refusal).
+type SizingCase<'a, W> = (&'a str, Option<&'a str>, Option<u32>, Option<&'a str>, W);
+
 /// Which sizing flags each create target takes. Pure.
 #[test]
 fn sizing_flags_fit_the_create_target() {
-    let ok: &[(&str, Option<&str>, Option<u32>, Option<&str>, Option<&str>)] = &[
+    let ok: &[SizingCase<Option<&str>>] = &[
         ("hetzner", None, None, Some("cpx42"), Some("cpx42")),
         ("hetzner", None, None, Some(" CPX42 "), Some("cpx42")),
         ("hetzner", None, None, Some("104"), Some("104")),
@@ -147,7 +151,7 @@ fn sizing_flags_fit_the_create_target() {
         assert_eq!(got.as_deref(), *want, "{provider} {gpu:?} {gpus:?} {ty:?}");
     }
     let long = "x".repeat(33);
-    let refused: &[(&str, Option<&str>, Option<u32>, Option<&str>, &str)] = &[
+    let refused: &[SizingCase<&str>] = &[
         ("hetzner", Some("A4000"), None, None, "--gpu doesn't apply to hetzner, which creates CPU VMs sized by server type — pass --server-type"),
         ("hetzner", None, Some(2), Some("cx23"), "--gpus doesn't apply to hetzner"),
         ("hetzner", Some("A4000"), Some(1), None, "--gpu / --gpus doesn't apply to hetzner"),
