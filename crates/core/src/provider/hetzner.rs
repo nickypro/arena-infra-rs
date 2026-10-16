@@ -974,6 +974,10 @@ mod tests {
         assert_eq!(srv.requests.lock().unwrap().len(), 3);
     }
 
+    /// One missing-key case: the configured key names, the setting that named them, the `.pub`
+    /// to upload, the project's keys, and the advice expected.
+    type KeyCase<'a> = (&'a [&'a str], &'static str, Option<&'a str>, &'a [Value], &'a str);
+
     /// The missing-key advice: by name or id; the keys the project has (none: upload is the way);
     /// which setting to change — HETZNER_SSH_KEY when it named the key; the file to upload. Pure.
     #[test]
@@ -988,7 +992,7 @@ mod tests {
         // Present, by name or by id: nothing to say.
         assert_eq!(missing_key_advice(&opts(&["arena8"], "MACHINE_NAME_PREFIX", None), &keys), None);
         assert_eq!(missing_key_advice(&opts(&["2324"], "HETZNER_SSH_KEY", None), &keys), None);
-        let cases: &[(&[&str], &'static str, Option<&str>, &[Value], &str)] = &[
+        let cases: &[KeyCase] = &[
             (
                 &["arena9"],
                 "MACHINE_NAME_PREFIX",
@@ -1016,8 +1020,8 @@ mod tests {
                  Security → SSH keys)",
             ),
         ];
-        for (names, from, pubkey, have, want) in cases {
-            assert_eq!(missing_key_advice(&opts(names, *from, *pubkey), have).as_deref(), Some(*want), "{names:?}");
+        for &(names, from, pubkey, have, want) in cases {
+            assert_eq!(missing_key_advice(&opts(names, from, pubkey), have).as_deref(), Some(want), "{names:?}");
         }
     }
 
