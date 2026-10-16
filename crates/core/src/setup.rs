@@ -1183,6 +1183,34 @@ mod tests {
         }
     }
 
+    /// Item 4 (an evals node, 2026-10-15): a bare VM must get the course repo the image pods
+    /// follow — the configured `git@github.com:<ARENA_REPO_OWNER>/<ARENA_REPO_NAME>.git` (prod:
+    /// styme3279/ARENA_materials) at BACKUP_REPO_PATH — never a default of the script's own.
+    /// Hetzner and Shadeform pass it to the script; RunPod/Vast re-point the image's checkout.
+    #[test]
+    fn every_provider_follows_the_configured_repo() {
+        let cfg = Config::parse(
+            "ARENA_REPO_OWNER=styme3279\nARENA_REPO_NAME=ARENA_materials\nGIT_SSH_KEY_LOCAL=/k\n\
+             BACKUP_REPO_PATH=/root/ARENA_materials\n",
+        );
+        let scfg = SetupConfig::from_config(&cfg).unwrap();
+        let url = "'git@github.com:styme3279/ARENA_materials.git'";
+        let script = format!("REPO_URL={url} REPO_DIR='/root/ARENA_materials' ");
+        let image = format!("git remote set-url origin {url}");
+        let t = SetupTimeouts::default();
+        for (provider, want) in [("hetzner", &script), ("shadeform", &script), ("runpod", &image), ("vast", &image)] {
+            let steps = provisioning_steps(provider, &scfg, "arena9-apple", false, "/tmp/h.sh", &t);
+            let runs: Vec<&str> = steps
+                .iter()
+                .filter_map(|s| match s {
+                    ProvisionStep::Run { cmd, .. } => Some(cmd.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert!(runs.iter().any(|c| c.contains(want.as_str())), "{provider}: {runs:?}");
+        }
+    }
+
     #[test]
     fn setup_timeouts_resolve_flag_over_config_over_defaults() {
         let d = SetupTimeouts::default();

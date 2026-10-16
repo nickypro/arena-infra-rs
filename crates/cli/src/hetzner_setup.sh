@@ -2,7 +2,9 @@
 # Provision a bare Hetzner Ubuntu 24.04 x86 VM to look like an ARENA pod:
 #   - system deps (build tools, ffmpeg, libosmesa6 for headless mujoco, zsh, …)
 #   - docker + docker compose
-#   - uv + a Python 3.13 venv with the ARENA packages (CPU substitutions)
+#   - the configured cohort repo (REPO_URL) and its env, built by the repo's own install_uv.sh
+#     (uv, Python 3.13, CPU torch wheels) — or, for a repo without one, by this script's uv
+#     install of its requirements.txt (CPU substitutions)
 # ARENA_GPU=1 is the same for a bare **GPU** VM (Shadeform, a CUDA image with its driver): the
 # requirements keep their CUDA wheels, uv matches torch to the host's driver (`--torch-backend
 # ${ARENA_TORCH_BACKEND:-auto}`), and the env gate also asks torch for the GPU. ARENA_MACHINE_NAME
@@ -11,8 +13,9 @@
 #     (which does `zsh -c 'source ~/.zshrc; …'`) lands in the right Python.
 #
 # The arena8 SSH key is attached at CREATE time by the provider (MACHINE_NAME_PREFIX),
-# so this script assumes you can already SSH in. Run as root on the pod:
-#   ssh arena8-<name> 'bash -s' < hetzner_setup.sh
+# so this script assumes you can already SSH in. Run as root on the pod (`arena pods setup`
+# passes REPO_URL/REPO_DIR/REPO_KEY from the config; by hand, name the repo):
+#   ssh arena8-<name> 'REPO_URL=git@github.com:<owner>/<name>.git bash -s' < hetzner_setup.sh
 # Idempotent: safe to re-run. The ARENA env is (re)installed unless it already passes the
 # gate below, and the script exits non-zero — with the reason as its last line — whenever the
 # env can't be made to pass it: a VM whose venv can't `import torch` is not set up, and must
@@ -44,8 +47,11 @@ export TMPDIR="$SETUP_TMP"
 
 GPU="${ARENA_GPU:-0}"
 REPO_DIR="${REPO_DIR:-/root/ARENA_materials}"
-# If the repo isn't already present (e.g. rsync'd from the control plane), clone it.
-REPO_URL="${REPO_URL:-https://github.com/ARENA-education/ARENA_materials.git}"
+# The cohort repo: the configured one — arena passes git@github.com:<ARENA_REPO_OWNER>/
+# <ARENA_REPO_NAME>.git, the remote RunPod/Vast setup points their image's checkout at. No
+# default: the public ARENA-education repo used to be one, so a VM could quietly get a
+# different course repo than the cohort's (and backups a remote they can't push to).
+REPO_URL="${REPO_URL:-}"
 VENV="$REPO_DIR/.venv"
 
 echo "### 1/5 system packages"
@@ -71,8 +77,8 @@ uv --version || die "uv isn't installed (its installer failed?)"
 
 echo "### 4/5 ARENA repo + Python env"
 # If a git deploy key was provided (REPO_KEY), wire github.com to it so we can clone — and
-# later push backups to — the PRIVATE cohort repo over SSH. Without it, REPO_URL stays the
-# public default and the clone is anonymous.
+# later push backups to — the PRIVATE cohort repo over SSH. Without it the clone is anonymous
+# (a public REPO_URL only).
 if [ -n "${REPO_KEY:-}" ] && [ -f "$REPO_KEY" ]; then
     chmod 600 "$REPO_KEY"
     mkdir -p ~/.ssh && chmod 700 ~/.ssh
@@ -83,7 +89,21 @@ if [ -n "${REPO_KEY:-}" ] && [ -f "$REPO_KEY" ]; then
         chmod 600 ~/.ssh/config
     fi
 fi
-[ -d "$REPO_DIR" ] || git clone "$REPO_URL" "$REPO_DIR" || die "couldn't clone $REPO_URL into $REPO_DIR"
+if [ ! -d "$REPO_DIR" ]; then
+    [ -n "$REPO_URL" ] || die "no repo at $REPO_DIR and no REPO_URL to clone (arena passes the configured ARENA_REPO_OWNER/ARENA_REPO_NAME)"
+    git clone "$REPO_URL" "$REPO_DIR" || die "couldn't clone $REPO_URL into $REPO_DIR"
+elif [ -n "$REPO_URL" ] && [ -d "$REPO_DIR/.git" ]; then
+    # A checkout already there (a VM from a snapshot, a re-run) follows the configured repo
+    # too, as RunPod/Vast setup re-points the image's: origin is where backups push.
+    was=$(git -C "$REPO_DIR" remote get-url origin 2>/dev/null)
+    if [ "$was" != "$REPO_URL" ]; then
+        if git -C "$REPO_DIR" remote set-url origin "$REPO_URL" 2>/dev/null || git -C "$REPO_DIR" remote add origin "$REPO_URL" 2>/dev/null; then
+            echo "origin: $REPO_URL (was ${was:-none})"
+        else
+            echo "WARN: couldn't point $REPO_DIR's origin at $REPO_URL (it stays ${was:-unset})"
+        fi
+    fi
+fi
 cd "$REPO_DIR" || die "no repo at $REPO_DIR"
 
 # The gate: the env is usable only if its python imports what the exercises need. It decides
@@ -113,10 +133,31 @@ pick_python() {
     echo "$want"
 }
 
+# Who builds the env: the repo's own install_uv.sh — uv, its Python (3.13), the venv at
+# $REPO_DIR/.venv, its requirements.txt: the course's env as the course defines it, as the
+# image RunPod/Vast pods boot from has it. torch's wheels are steered through uv's
+# UV_TORCH_BACKEND (its `--torch-backend`; an older uv ignores it): CPU wheels on a CPU VM
+# (PyPI's torch is a CUDA build — GBs of dead weight there), on a GPU VM matched to the host's
+# driver or ARENA_TORCH_BACKEND, as below. A repo without install_uv.sh (an older checkout)
+# gets this script's own uv install of its requirements.txt, as before — said as a warning,
+# so `arena pods setup` shows which one ran. Not the repo's conda install.sh: it expects
+# RunPod's layout (run from the repo's parent, which must be named ARENA_materials), has no
+# `set -e` (a failed install passes), and its env isn't the venv the gate and shells use.
 if env_ok; then
-    echo "ARENA env already present (torch + transformer_lens import) — skipping uv install"
+    INSTALLER="none (env already present)"
+    echo "ARENA env already present (torch + transformer_lens import) — skipping the install"
+elif [ -f install_uv.sh ]; then
+    INSTALLER="install_uv.sh"
+    if [ "$GPU" = 1 ]; then tb="${ARENA_TORCH_BACKEND:-auto}"; else tb=cpu; fi
+    echo "installer: $REPO_DIR/install_uv.sh (the repo's own), torch backend $tb"
+    # A venv that fails the gate is rebuilt from scratch, as below (uv's cache keeps it quick).
+    rm -rf "$VENV"
+    UV_TORCH_BACKEND="$tb" bash ./install_uv.sh \
+        || die "the repo's install_uv.sh failed (exit $?) — see its output above"
 else
-    [ -f requirements.txt ] || die "no requirements.txt in $REPO_DIR to install the ARENA env from"
+    INSTALLER="requirements.txt (built-in uv install)"
+    echo "arena-warning: no install_uv.sh in $REPO_DIR — installed its requirements.txt with the setup script's own uv install instead"
+    [ -f requirements.txt ] || die "no install_uv.sh or requirements.txt in $REPO_DIR to install the ARENA env from"
     PY=$(pick_python)
     if [ "$GPU" = 1 ]; then
         # A GPU VM: the requirements as they are — CUDA wheels, `+cuNNN` pins and their index.
@@ -250,4 +291,4 @@ chsh -s "$(which zsh)" root 2>/dev/null || true
 # Tokens (OPENROUTER_API_KEY, HF_TOKEN, …) are distributed separately by
 # `arena pods copy-keys` (cross-provider), which appends exports to these same rc files.
 
-echo "### done — $(python --version 2>&1), torch $(python -c 'import torch; print(torch.__version__)' 2>/dev/null || echo '?'), shell=$(getent passwd root | cut -d: -f7)"
+echo "### done — $(python --version 2>&1), torch $(python -c 'import torch; print(torch.__version__)' 2>/dev/null || echo '?'), installer: $INSTALLER, shell=$(getent passwd root | cut -d: -f7)"

@@ -19,7 +19,9 @@ impl Drop for Tmp {
 /// leaves a 0-byte, mode-666 `uv-setuptools-<hash>.lock` in its temp dir as the real one does
 /// (and, with `$UV_STRAY` set, one at that path too: a uv that ignores `TMPDIR`), exits
 /// `$UV_INSTALL_EXIT` (default 0) and, when `$UV_INSTALL_MAKES_TORCH` is set, "installs" torch;
-/// its `--help` lists `--torch-backend` unless `$UV_OLD` is set (an older uv).
+/// its `--help` lists `--torch-backend` unless `$UV_OLD` is set (an older uv). `git` logs its argv
+/// to `$STUBS/git.log`; every clone "fails" (nothing is fetched), `remote get-url origin`
+/// answers `$GIT_ORIGIN` (none when unset) and `remote set-url` works.
 fn install_stubs(dir: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let stub = |name: &str, body: &str| {
@@ -33,7 +35,16 @@ fn install_stubs(dir: &Path) {
     stub("docker", "echo 'Docker version 0 (stub)'");
     // Nothing is fetched: every download/clone "fails" (the script treats those as best-effort).
     stub("curl", "exit 22");
-    stub("git", "exit 1");
+    stub(
+        "git",
+        r#"S="$(dirname "$0")"
+echo "git $*" >> "$S/git.log"
+case "$*" in
+  *"remote get-url origin") [ -n "${GIT_ORIGIN:-}" ] && { echo "$GIT_ORIGIN"; exit 0; }; exit 2;;
+  *"remote set-url origin "*) exit 0;;
+esac
+exit 1"#,
+    );
     stub(
         "uv",
         r#"S="$(dirname "$0")"
@@ -66,8 +77,10 @@ esac"#,
 
 struct Run {
     ok: bool,
+    stdout: String,
     stderr: String,
     uv_log: String,
+    git_log: String,
 }
 
 /// One run of the script against `repo` (with `env` extra), stubs in `stubs`, `HOME` = `home`.
@@ -92,9 +105,30 @@ fn run(stubs: &Path, home: &Path, repo: &Path, env: &[(&str, &str)]) -> Run {
     let out = cmd.output().expect("bash");
     Run {
         ok: out.status.success(),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         uv_log: std::fs::read_to_string(stubs.join("uv.log")).unwrap_or_default(),
+        git_log: std::fs::read_to_string(stubs.join("git.log")).unwrap_or_default(),
     }
+}
+
+/// The repo's `install_uv.sh`, stood in for (not executable: the script runs it with `bash`).
+/// It notes how it was run — its cwd and `UV_TORCH_BACKEND` — in `install_uv.ran` beside it,
+/// then builds the venv with the stub `uv` the way the real one does (`uv venv --clear --python
+/// 3.13 --seed`, `uv pip install -r requirements.txt`) — or fails with `$INSTALL_UV_EXIT`.
+fn install_uv_sh(repo: &Path) {
+    std::fs::write(
+        repo.join("install_uv.sh"),
+        r#"#!/bin/bash
+set -e
+D="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+echo "cwd=$(pwd) UV_TORCH_BACKEND=${UV_TORCH_BACKEND:-} args=$*" >> "$D/install_uv.ran"
+if [ "${INSTALL_UV_EXIT:-0}" != 0 ]; then echo "install_uv: boom, no solution" >&2; exit "$INSTALL_UV_EXIT"; fi
+uv venv --clear --python 3.13 --seed "$D/.venv"
+uv pip install --python "$D/.venv/bin/python" -r "$D/requirements.txt"
+"#,
+    )
+    .unwrap();
 }
 
 fn setup(tag: &str) -> (Tmp, PathBuf, PathBuf, PathBuf) {
@@ -235,4 +269,101 @@ fn w7_b_h0_setup_leaves_no_uv_files_behind() {
         let left: Vec<String> = std::fs::read_dir(&tmp).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
         assert_eq!(left, ["uv-setuptools-0ld0ld.lock"], "{tag}: only what was there before the run stays");
     }
+}
+
+/// Item 4 (an evals node, 2026-10-15): the VM got py3.11 and the old CPU requirements, not the
+/// course's env. Now the configured repo's own installer builds it — its `install_uv.sh` (uv,
+/// Python 3.13), as the image RunPod/Vast pods boot from was built — run from the repo with CPU
+/// torch wheels (`UV_TORCH_BACKEND=cpu`) inside the setup's own temp dir; the built-in
+/// requirements install doesn't run, and the output names the installer. Idempotent: an env
+/// that passes the gate isn't rebuilt.
+#[test]
+fn the_repos_install_uv_sh_builds_the_env_and_is_named() {
+    let (_t, stubs, home, repo) = setup("install-uv");
+    install_uv_sh(&repo);
+    let r = run(&stubs, &home, &repo, &[("UV_INSTALL_MAKES_TORCH", "1")]);
+    assert!(r.ok, "{}", r.stderr);
+    let ran = std::fs::read_to_string(repo.join("install_uv.ran")).unwrap();
+    assert_eq!(ran, format!("cwd={} UV_TORCH_BACKEND=cpu args=\n", repo.display()));
+    assert!(r.uv_log.contains("uv venv --clear --python 3.13 --seed "), "{}", r.uv_log);
+    assert!(!r.uv_log.contains("--override overrides.txt") && !repo.join("requirements.cpu.txt").exists(), "{}", r.uv_log);
+    let ours = format!("{}/.arena-setup.", home.parent().unwrap().join("tmp").display());
+    assert!(r.uv_log.lines().filter_map(|l| l.strip_prefix("TMPDIR ")).all(|d| d.starts_with(&ours)), "{}", r.uv_log);
+    assert!(r.stdout.contains(&format!("installer: {}/install_uv.sh (the repo's own), torch backend cpu", repo.display())), "{}", r.stdout);
+    assert!(last_line(&r.stdout).contains("installer: install_uv.sh,"), "{}", r.stdout);
+    assert!(!r.stdout.contains(arena_core::volume::WARNING_PREFIX), "nothing to warn about: {}", r.stdout);
+
+    std::fs::write(stubs.join("uv.log"), "").unwrap();
+    let again = run(&stubs, &home, &repo, &[]);
+    assert!(again.ok, "{}", again.stderr);
+    assert_eq!(std::fs::read_to_string(repo.join("install_uv.ran")).unwrap(), ran, "not run again");
+    assert!(!again.uv_log.contains("venv"), "{}", again.uv_log);
+    assert!(last_line(&again.stdout).contains("installer: none (env already present),"), "{}", again.stdout);
+}
+
+/// A failing install_uv.sh fails setup: its own error stays visible, the reason is last.
+#[test]
+fn a_failing_install_uv_sh_fails_setup_with_the_reason_last() {
+    let (_t, stubs, home, repo) = setup("install-uv-fails");
+    install_uv_sh(&repo);
+    let r = run(&stubs, &home, &repo, &[("INSTALL_UV_EXIT", "3"), ("UV_INSTALL_MAKES_TORCH", "1")]);
+    assert!(!r.ok, "{}", r.stderr);
+    assert!(r.stderr.contains("install_uv: boom, no solution"), "{}", r.stderr);
+    assert_eq!(last_line(&r.stderr), "FAILED: the repo's install_uv.sh failed (exit 3) — see its output above");
+    assert!(!r.uv_log.contains("pip install --no-cache-dir"), "no fallback after a failed install_uv.sh: {}", r.uv_log);
+}
+
+/// A repo without install_uv.sh (an older checkout) gets the built-in uv install of its
+/// requirements.txt, as before — and says so as an `arena-warning:` line, which `pods setup`
+/// shows on the pod's line. Without a requirements.txt either, nothing can be installed.
+#[test]
+fn without_install_uv_sh_the_requirements_install_runs_and_says_so() {
+    let (_t, stubs, home, repo) = setup("no-install-uv");
+    let r = run(&stubs, &home, &repo, &[("UV_INSTALL_MAKES_TORCH", "1")]);
+    assert!(r.ok, "{}", r.stderr);
+    let warn = format!(
+        "{}no install_uv.sh in {} — installed its requirements.txt with the setup script's own uv install instead",
+        arena_core::volume::WARNING_PREFIX,
+        repo.display()
+    );
+    assert!(r.stdout.lines().any(|l| l == warn), "{}", r.stdout);
+    assert!(install_line(&r.uv_log).ends_with("-r requirements.cpu.txt"), "{}", r.uv_log);
+    assert!(last_line(&r.stdout).contains("installer: requirements.txt (built-in uv install),"), "{}", r.stdout);
+
+    let (_t, stubs, home, repo) = setup("nothing-to-install");
+    std::fs::remove_file(repo.join("requirements.txt")).unwrap();
+    let r = run(&stubs, &home, &repo, &[]);
+    assert!(!r.ok);
+    assert_eq!(last_line(&r.stderr), format!("FAILED: no install_uv.sh or requirements.txt in {} to install the ARENA env from", repo.display()));
+}
+
+/// The configured repo (`REPO_URL`, from ARENA_REPO_OWNER/ARENA_REPO_NAME): cloned when it
+/// isn't there; with none given, refused — never a clone of another repo (the public
+/// ARENA-education one used to be the default); a checkout already there on another remote is
+/// re-pointed at it, as RunPod/Vast setup does, and one already on it is left alone.
+#[test]
+fn the_configured_repo_is_cloned_or_followed_and_never_guessed() {
+    let (_t, stubs, home, repo) = setup("repo-url");
+    let url = "git@github.com:styme3279/ARENA_materials.git";
+    let absent = repo.parent().unwrap().join("ARENA_materials");
+    let r = run(&stubs, &home, &absent, &[("REPO_URL", url)]);
+    assert!(!r.ok, "the stub clone fails");
+    assert!(r.git_log.lines().any(|l| l == format!("git clone {url} {}", absent.display())), "{}", r.git_log);
+    assert_eq!(last_line(&r.stderr), format!("FAILED: couldn't clone {url} into {}", absent.display()));
+
+    std::fs::write(stubs.join("git.log"), "").unwrap();
+    let r = run(&stubs, &home, &absent, &[("REPO_URL", "")]);
+    assert!(!r.ok && !r.git_log.contains(" clone ") && !r.git_log.contains("ARENA-education"), "{}", r.git_log);
+    assert!(last_line(&r.stderr).starts_with(&format!("FAILED: no repo at {} and no REPO_URL to clone", absent.display())), "{}", r.stderr);
+
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let old = "https://github.com/ARENA-education/ARENA_materials.git";
+    std::fs::write(stubs.join("git.log"), "").unwrap();
+    let r = run(&stubs, &home, &repo, &[("REPO_URL", url), ("GIT_ORIGIN", old), ("UV_INSTALL_MAKES_TORCH", "1")]);
+    assert!(r.ok, "{}", r.stderr);
+    assert!(r.git_log.lines().any(|l| l == format!("git -C {} remote set-url origin {url}", repo.display())), "{}", r.git_log);
+    assert!(r.stdout.lines().any(|l| l == format!("origin: {url} (was {old})")), "{}", r.stdout);
+    std::fs::write(stubs.join("git.log"), "").unwrap();
+    let r = run(&stubs, &home, &repo, &[("REPO_URL", url), ("GIT_ORIGIN", url)]);
+    assert!(r.ok && !r.git_log.contains("set-url") && !r.stdout.contains("origin: "), "{}\n{}", r.git_log, r.stdout);
 }
