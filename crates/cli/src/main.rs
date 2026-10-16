@@ -22010,6 +22010,12 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
             sel.pods.iter().map(|p| p.name.as_str()).collect()
         }
 
+        /// A `split_cohort` case: the selection, whether it named pods, the pods kept, the names left out.
+        type SplitCase = (Vec<Pod>, bool, Vec<&'static str>, Vec<&'static str>);
+
+        /// An `on_protected_line` case: `(name, branch)` pods, whether the run was fleet-wide, the line.
+        type OnMainCase = (&'static [(&'static str, &'static str)], bool, Option<&'static str>);
+
         #[test]
         fn a_fleet_wide_selection_keeps_this_cohorts_pods_and_names_the_rest() {
             let cfg = account_cfg("");
@@ -22017,7 +22023,7 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
             let pods = account().pods;
             // (selection, named?, kept, left out)
             let pick = |names: &[&str]| pods.iter().filter(|p| names.contains(&p.name.as_str())).cloned().collect::<Vec<_>>();
-            let cases: Vec<(Vec<Pod>, bool, Vec<&str>, Vec<&str>)> = vec![
+            let cases: Vec<SplitCase> = vec![
                 // Fleet-wide: the `devtest-` pods, the off-list extra included; staff boxes (even
                 // one wearing the prefix), the provider-named pod and another prefix are left out.
                 (
@@ -22071,7 +22077,7 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
         #[test]
         fn cohort_pods_on_main_get_one_line_naming_the_fix() {
             let on = |pods: &[(&str, &str)]| pods.iter().map(|(n, b)| (n.to_string(), b.to_string())).collect::<Vec<_>>();
-            let cases: &[(&[(&str, &str)], bool, Option<&str>)] = &[
+            let cases: &[OnMainCase] = &[
                 (&[], true, None),
                 // The morning reset: the plain command.
                 (
