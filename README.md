@@ -622,7 +622,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `backup` (a staff box only when named). Each
     pod's current branch is **backed up first** (the `backup` commit + push, keys redacted; a
     no-op on `main` or a branch in sync), under the pod's backup lock, held until its switch
-    ends. A pod whose push fails is rsynced into `LOCAL_BACKUP_DIR` first, then switched, its
+    ends (only with an absolute `LOCAL_BACKUP_DIR` that exists: with a relative one, such as the
+    legacy `./backup`, no lock is taken, and the dry run and the run say so in one line). A pod
+    whose push fails is rsynced into `LOCAL_BACKUP_DIR` first, then switched, its
     line saying so (its unpushed commits stay in that branch on the pod — or, after `--hard` onto
     that same branch, in its reflog); a pod that can be **neither pushed nor copied** (the copy
     failed too, the backup failed before its push, or another backup held its lock for the whole

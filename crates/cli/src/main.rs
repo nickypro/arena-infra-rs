@@ -5373,16 +5373,28 @@ impl Unpushed {
     }
 }
 
-/// Why a pod's call failed, in a few words: its exit and the last line it wrote to stderr, or
-/// why there was no answer (`timed out after 300s`, …).
+/// Why a pod's call failed, in a few words: its exit and the most telling line it wrote to
+/// stderr ([`telling_line`]), or why there was no answer (`timed out after 300s`, …).
 fn failure_why(call: &PodCall) -> String {
     match call {
-        Ok(out) => match out.stderr.trim().lines().last() {
-            Some(last) => format!("{}: {}", out.exit_label(), last.trim()),
+        Ok(out) => match telling_line(&out.stderr) {
+            Some(line) => format!("{}: {line}", out.exit_label()),
             None => out.exit_label(),
         },
         Err(why) => why.clone(),
     }
+}
+
+/// The stderr line that says what went wrong: the first one that starts (trimmed) like git's or
+/// ssh's own verdict — `ERROR:`, `fatal:`, `error:`, `remote: error`, `! [rejected]`,
+/// `! [remote rejected]` — else the last non-empty line. The last line alone is often the tail
+/// of a longer message (live: a push to a missing repo gave `and the repository exists.`, the end
+/// of git's advice, where its first line said `ERROR: Repository not found.`). `None` for an
+/// empty stderr. Pure.
+fn telling_line(stderr: &str) -> Option<&str> {
+    const VERDICTS: &[&str] = &["ERROR:", "fatal:", "error:", "remote: error", "! [rejected]", "! [remote rejected]"];
+    let lines = || stderr.lines().map(str::trim).filter(|l| !l.is_empty());
+    lines().find(|l| VERDICTS.iter().any(|v| l.starts_with(v))).or_else(|| lines().last())
 }
 
 /// Is `branch` one `pods backup` never commits on (`backup.sh`'s SKIP: main, master, a
@@ -7946,6 +7958,10 @@ async fn handle_set_branch(
         format!("switch {} pod(s) to branch '{branch}' (gentle, no reset)", targets.len())
     };
     let names = targets.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", ");
+    // Before the question, so it's read before the answer (and in the run's output with --yes).
+    if let Some(line) = switch_unlocked_line(cfg) {
+        say(&line);
+    }
     if !confirm(yes, &format!("Will {how} (each pod's current branch committed + pushed first): {names}"))? {
         println!("aborted.");
         return Ok(());
@@ -7968,15 +7984,27 @@ async fn handle_set_branch(
     run.result("switch branch")
 }
 
-/// What a dry run of a branch switch says first: the push that comes before it.
+/// What a dry run of a branch switch says first: the push that comes before it — under each
+/// pod's backup lock, or, when none is taken, the one line that says so
+/// ([`switch_unlocked_line`]).
 fn push_first_note(cfg: &Config) -> String {
     let origin = arena_core::backup::configured_repo(cfg).map_or_else(String::new, |o| format!(", nor one whose origin isn't {o}"));
-    format!(
-        "(first, each pod's current branch is backed up — the `pods backup --no-pull` commit + push, keys redacted — under \
-         the pod's backup lock, held until its switch ends; a pod whose push fails is copied into {} and then switched, its \
-         line saying so; a pod that can be neither pushed nor copied, or whose lock another backup holds, is NOT switched{origin})",
+    let unlocked = switch_unlocked_line(cfg);
+    let (under_lock, or_busy) = match unlocked {
+        Some(_) => ("", ""),
+        None => (" — under the pod's backup lock, held until its switch ends", ", or whose lock another backup holds,"),
+    };
+    let mut note = format!(
+        "(first, each pod's current branch is backed up — the `pods backup --no-pull` commit + push, keys redacted{under_lock}; \
+         a pod whose push fails is copied into {} and then switched, its line saying so; a pod that can be neither pushed nor \
+         copied{or_busy} is NOT switched{origin})",
         local_backup_dir(cfg)
-    )
+    );
+    if let Some(line) = unlocked {
+        note.push('\n');
+        note.push_str(&line);
+    }
+    note
 }
 
 /// How a guarded branch switch went ([`switch_guarded`]).
@@ -8027,7 +8055,9 @@ impl Switched {
 /// branch alone (live: the daily `set-branch main --hard` moved three pods off branches GitHub
 /// had refused for ~20 hours, one due for host maintenance that afternoon). Each pod's backup
 /// lock is taken first and held until its own switch ends, so no other backup (the cron's, a
-/// pull, the reaper's) runs on it in between; then the branch it's on is backed up — commit,
+/// pull, the reaper's) runs on it in between — when LOCAL_BACKUP_DIR is an absolute directory
+/// that exists; otherwise none is taken ([`pod_locks_off`]) and the caller says so
+/// ([`switch_unlocked_line`]); then the branch it's on is backed up — commit,
 /// redact, push (a no-op on `main`/`master` or a branch in sync) — and the pods it pushed are
 /// switched. A pod whose push failed at the push itself is copied into LOCAL_BACKUP_DIR under the
 /// lock it still holds, then switched, its line saying so ([`not_pushed_note`]). A pod with
@@ -12635,6 +12665,10 @@ async fn handle_init_branches(
         println!("Preview only — run without --dry-run to execute over SSH.");
         return Ok(());
     }
+    // Before the question, so it's read before the answer (and in the run's output with --yes).
+    if let Some(line) = switch_unlocked_line(cfg) {
+        say(&line);
+    }
     if !confirm(yes, &format!(
         "Will create + push the w{week}d{day} autocommit branch on {} pod(s): {}",
         targets.len(),
@@ -12647,8 +12681,10 @@ async fn handle_init_branches(
     let total = targets.len();
     let doing = format!("to their w{week}d{day} branch");
     let cmd_for = |name: &str| arena_core::backup::init_branch_command(&bcfg, name);
-    let run = switch_guarded(&remote, cfg, sel, targets, rsync, None, cmd_for, BRANCH_TIMEOUT, &doing, |name, _, note| {
-        format!("✓ {name} -> {}{note}", bcfg.branch_for(name))
+    // A day branch that already exists gets back the real keys set aside on it (the morning's
+    // `set-branch main` run twice): said as set-branch says it.
+    let run = switch_guarded(&remote, cfg, sel, targets, rsync, None, cmd_for, BRANCH_TIMEOUT, &doing, |name, out, note| {
+        format!("✓ {name} -> {}{}{note}", bcfg.branch_for(name), unredacted_note(&out.stdout))
     })
     .await;
     println!("\nDone: {} initialized, {} failed, {} not switched (of {total}).", run.ok, run.failed.len(), run.not_switched.len());
@@ -12780,8 +12816,7 @@ impl PodLocks {
 /// locks never create it — the run goes as it did before them.
 async fn take_pod_locks(dir: &str, names: &[String], wait: Duration) -> PodLocks {
     let mut out = PodLocks::default();
-    let path = std::path::Path::new(dir);
-    if !path.is_absolute() || !path.is_dir() {
+    if pod_locks_off(dir).is_some() {
         return out;
     }
     let mut names: Vec<String> = names.to_vec();
@@ -12827,6 +12862,32 @@ async fn take_pod_locks(dir: &str, names: &[String], wait: Duration) -> PodLocks
     }
     out.busy = pending.into_iter().map(|(n, _)| n).collect();
     out
+}
+
+/// Why a run takes no per-pod backup locks in `dir` — [`take_pod_locks`]' rule, kept in one
+/// place so what a command says about its locks can't drift from what it does — as `(what's
+/// wrong, what fixes it)`; `None` when it takes them. A relative `dir` means a different place
+/// to every cwd (the legacy `./backup`), and the locks never create a `dir` that doesn't exist.
+fn pod_locks_off(dir: &str) -> Option<(&'static str, &'static str)> {
+    let path = std::path::Path::new(dir);
+    if !path.is_absolute() {
+        Some(("is relative", "set an absolute path"))
+    } else if !path.is_dir() {
+        Some(("doesn't exist", "create it"))
+    } else {
+        None
+    }
+}
+
+/// What a branch switch (`set-branch`, `init-branches`) says, in one line, when it runs without
+/// the per-pod backup locks ([`pod_locks_off`]): then nothing keeps the cron's backup, a pull or
+/// the reaper off a pod mid-switch, and "under the pod's backup lock" would be untrue (live
+/// bsec B1: the sandbox's `./backup` switched a pod whose lock a test held). `None` when the
+/// locks are taken.
+fn switch_unlocked_line(cfg: &Config) -> Option<String> {
+    let dir = local_backup_dir(cfg);
+    let (why, fix) = pod_locks_off(&dir)?;
+    Some(format!("(no per-pod backup locks: LOCAL_BACKUP_DIR ({dir}) {why} — {fix} to keep other backups out during the switch)"))
 }
 
 /// The line for a pod whose backup lock stayed busy for the whole `wait`.
@@ -19329,6 +19390,7 @@ mod remote_tests {
         Unscoped, BACKUP_TIMEOUT, BRANCH_TIMEOUT, CP_BASE_TIMEOUT, POD_COPY_TIMEOUT, RUN_TIMEOUT_SECS, TEST_TIMEOUT,
     };
     use super::{copy_failure_reason, fallback_lines, mirror_refusal_text, not_pushed_note, sync_time_label, unredacted_note, Pulled};
+    use super::{failure_why, local_backup_dir, push_first_note, take_pod_locks, take_said, telling_line, PodCall};
     use arena_core::selector::{Naming, SelectArgs};
     use arena_core::backup::{backup_command, checkout_command, init_branch_command, BackupConfig};
     use arena_core::remote::{FakeRemote, FakeReply, Remote, RemoteCall, PROBE_TIMEOUT};
@@ -20793,6 +20855,39 @@ mod remote_tests {
         backup_cfg(&stub.0.join("backups"))
     }
 
+    /// Live (bsec B2): a push to a missing repo said `git push failed (exit 1: and the repository
+    /// exists.)` — the last line of git's advice. The "why" (the per-pod line, set-branch's
+    /// `NOT PUSHED FIRST (…)`) is now the first verdict line git or GitHub wrote, else the last
+    /// non-empty one. Pure.
+    #[test]
+    fn a_failed_push_says_why_by_its_verdict_line_not_its_last() {
+        let missing = "ERROR: Repository not found.\nfatal: Could not read from remote repository.\n\n\
+                       Please make sure you have the correct access rights\nand the repository exists.\n";
+        let cases: &[(&str, Option<&str>)] = &[
+            (missing, Some("ERROR: Repository not found.")),
+            ("ssh: connect to host github.com port 22: Connection timed out\r\nfatal: Could not read from remote repository.\r\n\r\nand the repository exists.\r\n", Some("fatal: Could not read from remote repository.")),
+            ("To github.com:o/r.git\n ! [rejected]        autocommit-x -> autocommit-x (non-fast-forward)\nerror: failed to push some refs to 'github.com:o/r.git'\nhint: Updates were rejected\n", Some("! [rejected]        autocommit-x -> autocommit-x (non-fast-forward)")),
+            ("remote: Resolving deltas: 100% (3/3)\nremote: error: File big.bin is 120.00 MB; this exceeds GitHub's file size limit\nTo github.com:o/r.git\n ! [remote rejected] x -> x (pre-receive hook declined)\nerror: failed to push some refs\n", Some("remote: error: File big.bin is 120.00 MB; this exceeds GitHub's file size limit")),
+            ("To /root/gh013.git\n ! [remote rejected] x -> x (pre-receive hook declined)\n", Some("! [remote rejected] x -> x (pre-receive hook declined)")),
+            ("error: src refspec x does not match any\n", Some("error: src refspec x does not match any")),
+            // No verdict: the last non-empty line, as before.
+            ("Warning: Permanently added 'github.com' to the list of known hosts.\nsh: 1: cd: can't cd to /root/x\n\n", Some("sh: 1: cd: can't cd to /root/x")),
+            // A verdict word mid-line is not a verdict line.
+            ("hook says: error: no\nthe end\n", Some("the end")),
+            ("", None),
+            ("  \n\n", None),
+        ];
+        for (stderr, want) in cases {
+            assert_eq!(telling_line(stderr), *want, "{stderr:?}");
+        }
+        let out = |code: i32, stderr: &str| -> PodCall {
+            Ok(arena_core::ssh::SshOutput { success: false, code: Some(code), stdout: "PUSH_FAILED\n".into(), stderr: stderr.into() })
+        };
+        assert_eq!(failure_why(&out(1, missing)), "exit 1: ERROR: Repository not found.");
+        assert_eq!(failure_why(&out(2, "")), "exit 2");
+        assert_eq!(failure_why(&Err("timed out after 300s".into())), "timed out after 300s");
+    }
+
     /// The per-pod lines of the fallback copy: why the push failed, and where the files went —
     /// or why the copy failed too.
     #[test]
@@ -21244,6 +21339,66 @@ mod remote_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Live (bsec B1): with the legacy relative `./backup`, set-branch took no per-pod lock (by
+    /// design: RR5) — yet its dry run said each pod is switched "under the pod's backup lock". Now
+    /// the dry run, and the run itself before its question, say in one line that no locks are
+    /// taken and how to get them, whenever [`take_pod_locks`] takes none; with an absolute dir
+    /// that exists, the lock claim stands and that line is never said. The locking is unchanged.
+    #[tokio::test(start_paused = true)]
+    async fn a_switch_without_per_pod_locks_says_so_and_never_claims_them() {
+        let dir = std::env::temp_dir().join(format!("arena-switch-locks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let missing = dir.join("not-made-yet").display().to_string();
+        let relative = "(no per-pod backup locks: LOCAL_BACKUP_DIR (./backup) is relative — set an absolute path to keep other \
+                        backups out during the switch)"
+            .to_string();
+        let cases = [
+            (cfg(), Some(relative.clone())),
+            (
+                Config::parse(&format!("MACHINE_NAME_PREFIX=devtest\nBACKUP_REPO_PATH={REPO}\nLOCAL_BACKUP_DIR={missing}\n")),
+                Some(format!(
+                    "(no per-pod backup locks: LOCAL_BACKUP_DIR ({missing}) doesn't exist — create it to keep other backups out \
+                     during the switch)"
+                )),
+            ),
+            (backup_cfg(&dir), None),
+        ];
+        let names = vec!["devtest-apple".to_string()];
+        for (cfg, line) in &cases {
+            let note = push_first_note(cfg);
+            let dir = local_backup_dir(cfg);
+            match line {
+                Some(line) => {
+                    assert!(note.ends_with(&format!(")\n{line}")), "{note}");
+                    assert!(!note.contains("backup lock, held") && !note.contains("whose lock"), "{note}");
+                }
+                None => {
+                    assert!(note.contains("keys redacted — under the pod's backup lock, held until its switch ends; a pod whose push"), "{note}");
+                    assert!(note.contains("neither pushed nor copied, or whose lock another backup holds, is NOT switched"), "{note}");
+                    assert!(!note.contains("no per-pod backup locks"), "{note}");
+                }
+            }
+            // What's said is what's done.
+            let locks = take_pod_locks(&dir, &names, Duration::ZERO).await;
+            assert_eq!(locks.holds("devtest-apple"), line.is_none(), "{dir}");
+            drop(locks);
+        }
+        assert!(!std::path::Path::new(&missing).exists(), "the locks never make the dir");
+
+        // The run: the line once, before the question — set-branch and init-branches alike.
+        take_said();
+        handle_set_branch(Arc::new(FakeRemote::new()), &cfg(), "main", &everyone(&fleet()), true, false, true, "rsync").await.unwrap();
+        handle_init_branches(Arc::new(FakeRemote::new()), &cfg(), Some(1), Some(2), &everyone(&fleet()), false, true, "rsync").await.unwrap();
+        let said = take_said();
+        assert_eq!(said.iter().filter(|l| **l == relative).count(), 2, "{said:#?}");
+        let locked = backup_cfg(&dir);
+        handle_set_branch(Arc::new(FakeRemote::new()), &locked, "main", &everyone(&fleet()), true, false, true, "rsync").await.unwrap();
+        handle_init_branches(Arc::new(FakeRemote::new()), &locked, Some(1), Some(2), &everyone(&fleet()), false, true, "rsync").await.unwrap();
+        let said = take_said();
+        assert!(!said.iter().any(|l| l.contains("no per-pod backup locks")), "{said:#?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn set_branch_dry_run_runs_nothing_and_apply_runs_the_checkout_on_each_pod() {
         let fake = Arc::new(FakeRemote::new());
@@ -21296,6 +21451,25 @@ mod remote_tests {
         let fake = Arc::new(FakeRemote::new());
         handle_init_branches(fake.clone(), &cfg(), Some(1), Some(2), &everyone(&fleet()), true, true, "rsync").await.unwrap();
         assert!(fake.calls().is_empty(), "dry run");
+    }
+
+    /// Live (bsec O1): init-branches onto a day branch that already exists said nothing of the
+    /// keys set aside on it. Its command now puts them back ([`init_branch_command`]); its line
+    /// says so, as set-branch's does.
+    #[tokio::test(start_paused = true)]
+    async fn init_branches_says_which_set_aside_keys_came_back() {
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [FakeReply::stdout("SKIP main\n"), FakeReply::stdout("Switched to branch 'x'\nUNREDACTED_RESTORED ex/solutions.py\n")]);
+        take_said();
+        handle_init_branches(fake.clone(), &cfg(), Some(1), Some(2), &everyone(&fleet_of(&[("apple", 22001)])), false, true, "rsync").await.unwrap();
+        let said = take_said();
+        assert!(
+            said.iter().any(|l| l
+                == "[1/1] ✓ devtest-apple -> autocommit-devtest-w1d2-apple — real key(s) back in 1 file(s) git has redacted: \
+                    ex/solutions.py"),
+            "{said:#?}"
+        );
+        assert!(init_branch_command(&BackupConfig::from_config(&cfg(), 1, 2), "devtest-apple").contains("unredacted_restore "));
     }
 
     /// A local file to copy, removed on drop.
@@ -22304,6 +22478,9 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
         const COHORT_PORTS: [u16; 3] = [22001, 22002, 22003];
         const LEFT_OUT: &str = "⊘ skipped 4 non-cohort pods (not devtest-…, or an @ staff entry): \
             devtest-zebra, staff-gpu, devtest2-apple, quiet_blue_fox — name one to include it";
+        /// What a branch switch says first with [`account_cfg`]'s legacy `./backup` (no locks).
+        const NO_LOCKS: &str = "(no per-pod backup locks: LOCAL_BACKUP_DIR (./backup) is relative — set an absolute path to keep \
+            other backups out during the switch)";
 
         fn names(sel: &Selected) -> Vec<&str> {
             sel.pods.iter().map(|p| p.name.as_str()).collect()
@@ -22560,8 +22737,8 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
             handle_pods(pods(&["set-branch", "main", "--all", "--hard"]), &account(), fake.clone(), &cfg, true).await.unwrap();
             assert_eq!(ports(&fake), COHORT_PORTS);
             let said = take_said();
-            assert_eq!((said.len(), said[0].as_str()), (5, LEFT_OUT), "{said:?}");
-            let mut per_pod = unnumbered(&said[1..4]);
+            assert_eq!((said.len(), said[0].as_str(), said[1].as_str()), (6, LEFT_OUT, NO_LOCKS), "{said:?}");
+            let mut per_pod = unnumbered(&said[2..5]);
             per_pod.sort();
             assert_eq!(
                 per_pod,
@@ -22572,7 +22749,7 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
                     "✓ devtest-extra (on main)",
                 ]
             );
-            assert_eq!(said[4], "⚠ 3 cohort pods on main: not backed up until `arena pods init-branches`");
+            assert_eq!(said[5], "⚠ 3 cohort pods on main: not backed up until `arena pods init-branches`");
 
             // Named, a staff box among them: the reminder names the cohort pod only.
             let fake = Arc::new(FakeRemote::new());
@@ -22580,7 +22757,7 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
             assert_eq!(ports(&fake), [22002, 22005]);
             let said = take_said();
             assert_eq!(said.last().map(String::as_str), Some("⚠ 1 cohort pod on main: not backed up until `arena pods init-branches devtest-bloom`"));
-            assert_eq!(said.len(), 3, "{said:?}");
+            assert_eq!(said.len(), 4, "{said:?}");
 
             // A failed switch: the reminder still names the pods that did land on main.
             let fake = Arc::new(FakeRemote::new());
@@ -22592,7 +22769,7 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
             // Any other branch: no reminder.
             let fake = Arc::new(FakeRemote::new());
             handle_pods(pods(&["set-branch", "feature-x", "apple"]), &account(), fake.clone(), &cfg, true).await.unwrap();
-            assert_eq!(take_said(), ["[1/1] ✓ devtest-apple (on feature-x)"]);
+            assert_eq!(take_said(), [NO_LOCKS, "[1/1] ✓ devtest-apple (on feature-x)"]);
         }
 
         #[tokio::test(start_paused = true)]
@@ -22648,11 +22825,11 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
             assert_eq!(ports(&fake), COHORT_PORTS);
             // The one line, then each cohort pod's own.
             let said = take_said();
-            assert_eq!((said.len(), said[0].as_str()), (4, LEFT_OUT), "{said:?}");
+            assert_eq!((said.len(), said[0].as_str(), said[1].as_str()), (5, LEFT_OUT, NO_LOCKS), "{said:?}");
             let fake = Arc::new(FakeRemote::new());
             handle_pods(pods(&["init-branches", "staff-gpu", "--week", "1", "--day", "2"]), &account(), fake.clone(), &cfg, true).await.unwrap();
             assert_eq!(ports(&fake), [22005]);
-            assert_eq!(take_said(), ["[1/1] ✓ staff-gpu -> autocommit-devtest-w1d2-staff-gpu"], "named: no ⊘ line");
+            assert_eq!(take_said(), [NO_LOCKS, "[1/1] ✓ staff-gpu -> autocommit-devtest-w1d2-staff-gpu"], "named: no ⊘ line");
         }
 
         #[tokio::test(start_paused = true)]

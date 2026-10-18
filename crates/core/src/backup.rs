@@ -616,7 +616,11 @@ impl BackupReport {
 /// upstream) before any `backup`; later backups then just commit onto it. `set -e`
 /// aborts on the first real error. A checkout whose `origin` isn't the configured repo
 /// (`cfg.origin`) is refused before anything else, as the backup refuses it (`WRONG_ORIGIN`,
-/// [`BACKUP_WRONG_ORIGIN_EXIT`]): the new branch is neither made nor pushed.
+/// [`BACKUP_WRONG_ORIGIN_EXIT`]): the new branch is neither made nor pushed. After the checkout,
+/// the real keys a switch set aside on the branch now checked out go back where the file holds
+/// exactly their redacted version (`UNREDACTED_RESTORED <path>`) — `unredacted.sh`'s restore,
+/// the step [`checkout_command`] ends with — so a day branch that already exists isn't left with
+/// them set aside, unsaid (live bsec O1).
 pub fn init_branch_command(cfg: &BackupConfig, machine_name: &str) -> String {
     let branch = cfg.branch_for(machine_name);
     let bq = shell_quote(&branch);
@@ -640,6 +644,13 @@ pub fn init_branch_command(cfg: &BackupConfig, machine_name: &str) -> String {
     parts.push("git fetch --all --prune".into());
     // Create the branch from the current HEAD, or switch to it if it already exists.
     parts.push(format!("git checkout -b {bq} 2>/dev/null || git checkout {bq}"));
+    // Landing on a day branch that already exists (`set-branch main --hard --init-branches` run
+    // twice in a day): the real keys the switch to main set aside on it go back, by the same rule
+    // as set-branch's ([`checkout_command`]), and are said (`UNREDACTED_RESTORED`). On a new
+    // branch nothing was set aside on it, so nothing moves: yesterday's keys wait for theirs.
+    parts.push(format!("REDACT_SED={}", shell_quote(&redact_sed())));
+    parts.push(unredacted_sh());
+    parts.push("cd \"$(git rev-parse --show-toplevel)\"; unredacted_restore \"$(git rev-parse --absolute-git-dir)/arena-unredacted\"".into());
     // The new branch carries any commit of the old one GitHub refuses (the next backup redacts
     // and pushes it): the refusal goes to the operator without GitHub's allow-the-secret URL.
     parts.push(NO_BYPASS_URL_SH.into());
@@ -699,9 +710,7 @@ pub fn checkout_command(repo_path: &str, branch: &str, git_ssh_key: Option<&str>
     let mut lines = vec![parts.join("; ")];
     // The keys set aside around the switch (from the repo's top: git's paths are relative to it).
     lines.push(format!("REDACT_SED={}", shell_quote(&redact_sed())));
-    lines.extend(
-        include_str!("unredacted.sh").lines().filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#')).map(String::from),
-    );
+    lines.push(unredacted_sh());
     lines.push("cd \"$(git rev-parse --show-toplevel)\"; G=$(git rev-parse --absolute-git-dir); unredacted_aside \"$G/arena-unredacted\"".into());
     lines.push(format!("if {switch}; then SWITCHED=1; else SWITCHED=; fi"));
     // The adopted clones (listed by the backup in `$G/arena-nested`) the switch removed: back
@@ -715,6 +724,13 @@ pub fn checkout_command(repo_path: &str, branch: &str, git_ssh_key: Option<&str>
     );
     lines.push("unredacted_restore \"$G/arena-unredacted\"; [ -n \"$SWITCHED\" ]".into());
     lines.join("\n")
+}
+
+/// `unredacted.sh`'s functions, comments and blank lines left out, for a command to define and
+/// call (it needs `REDACT_SED` set): around set-branch's switch ([`checkout_command`]), and after
+/// init-branches' ([`init_branch_command`]) — one rule for both.
+fn unredacted_sh() -> String {
+    include_str!("unredacted.sh").lines().filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#')).collect::<Vec<_>>().join("\n")
 }
 
 /// Wrap a value in single quotes for safe inclusion in a `sh -c` string, escaping any
@@ -2046,6 +2062,55 @@ done
         assert_eq!(s.read("ex.py"), day1.as_bytes());
         assert!(run(checkout_command(repo, "autocommit-y", None, false)).contains("UNREDACTED_RESTORED ex.py"));
         assert_eq!(s.read("ex.py"), day2.as_bytes());
+    }
+
+    /// Live (bsec O1): `set-branch main --hard --init-branches` run twice in a day landed the pod
+    /// back on its day branch with the real keys still set aside, and nothing said so — init's
+    /// checkout ran no restore. Now it runs set-branch's: back, byte for byte, and said. A new
+    /// day's branch (the normal morning) gets none of yesterday's: they stay set aside for theirs.
+    #[cfg(unix)]
+    #[test]
+    fn init_branches_onto_an_existing_day_branch_puts_its_set_aside_keys_back() {
+        let s = GitSandbox::new("init-unredacted", 1_000_000);
+        let repo = s.work.to_str().unwrap();
+        let day = |d: u32| BackupConfig { repo_path: repo.to_string(), prefix: "devtest".into(), week: 1, day: d, git_ssh_key: None, origin: None };
+        let run = |cmd: String| {
+            let o = s.run(&cmd);
+            let (out, err) = (String::from_utf8_lossy(&o.stdout).into_owned(), String::from_utf8_lossy(&o.stderr).into_owned());
+            assert!(o.status.success(), "{out}{err}");
+            (out, err)
+        };
+        let head = || s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let aside = s.work.join(".git/arena-unredacted");
+        // The morning: today's branch, a key pasted, backed up (redacted in git, real on disk).
+        run(init_branch_command(&day(2), "devtest-x"));
+        assert_eq!(head(), "autocommit-devtest-w1d2-x");
+        let key = openrouter_key(14);
+        let readme = format!("notes\nKEY = \"{key}\"\n");
+        std::fs::write(s.work.join("README.md"), &readme).unwrap();
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.redacted.len()), (Some(0), 1), "{err}");
+        // The reset to main sets it aside…
+        assert!(run(checkout_command(repo, "main", None, true)).0.contains("UNREDACTED_KEPT README.md"));
+        assert_eq!(s.read("README.md").len(), 5, "main's own README");
+        // …and the second init of the day lands on the branch that exists: the key comes back.
+        let (out, err) = run(init_branch_command(&day(2), "devtest-x"));
+        assert_eq!(head(), "autocommit-devtest-w1d2-x");
+        assert_eq!(out.lines().filter(|l| l.starts_with("UNREDACTED_")).collect::<Vec<_>>(), ["UNREDACTED_RESTORED README.md"], "{out}");
+        assert_eq!(s.read("README.md"), readme.as_bytes());
+        assert!(!aside.exists(), "nothing left set aside");
+        assert_eq!(s.git(&s.work, &["status", "--porcelain"]), "M README.md");
+        assert!(!out.contains(&key) && !err.contains(&key));
+        // A new day: the key stays set aside for its own branch, and nothing is said.
+        assert!(run(checkout_command(repo, "main", None, true)).0.contains("UNREDACTED_KEPT README.md"));
+        let (out, _) = run(init_branch_command(&day(3), "devtest-x"));
+        assert_eq!(head(), "autocommit-devtest-w1d3-x");
+        assert!(!out.contains("UNREDACTED_"), "{out}");
+        assert_eq!(s.read("README.md").len(), 5);
+        assert_eq!(aside_copies(&aside, "README.md"), [readme.clone().into_bytes()]);
+        // …until a switch back to that branch.
+        assert!(run(checkout_command(repo, "autocommit-devtest-w1d2-x", None, false)).0.contains("UNREDACTED_RESTORED README.md"));
+        assert_eq!(s.read("README.md"), readme.as_bytes());
     }
 
     /// The dry run's per-pod line pastes: next to the file its here-doc writes, it runs the
