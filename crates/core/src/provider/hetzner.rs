@@ -280,6 +280,15 @@ fn deprecated_in(t: &Value, location: &str) -> bool {
     }
 }
 
+/// A flag of `t`'s entry for `location` in its per-location list — `available` (Hetzner can
+/// place one there right now: live, cx33/cx43/cx53 and three cax types read `false` in nbg1 with
+/// no deprecation, i.e. sold out) or `recommended` — or `None` when the answer doesn't carry it
+/// (an older one, or no entry there). Pure.
+fn location_flag(t: &Value, location: &str, flag: &str) -> Option<bool> {
+    let locs = t.get("locations")?.as_array()?;
+    locs.iter().find(|l| l.get("name").and_then(Value::as_str) == Some(location))?.get(flag)?.as_bool()
+}
+
 /// `cx23 (2 vCPU, 4 GB)` — `, arm` for an Arm type — from a `GET /server_types` item
 /// (`cores`, `memory` in GB, `architecture`).
 fn type_label(t: &Value) -> String {
@@ -302,9 +311,12 @@ fn type_label(t: &Value) -> String {
 }
 
 /// What to say when server type `ty` can't be ordered in `location` (`types`: the `GET
-/// /server_types` items): the types that can — not deprecated there — in the API's order, to
-/// pick a `--server-type` from. `None` when `ty` can be ordered there, or the answer doesn't
-/// say. Without a location only a type Hetzner doesn't have at all is reported. Pure.
+/// /server_types` items): the types that can — not deprecated there, and not sold out there
+/// right now (`available: false`, when the answer has the flag: a suggestion that then fails on
+/// capacity is no help — live hz F3) — Hetzner's `recommended` ones first, each group in the
+/// API's order, to pick a `--server-type` from. `None` when `ty` can be ordered there (sold out
+/// or not: that is capacity, which a retry may get), or the answer doesn't say. Without a
+/// location only a type Hetzner doesn't have at all is reported. Pure.
 fn type_advice(types: &[Value], ty: &str, location: Option<&str>, now: u64) -> Option<String> {
     let is = |t: &&Value| {
         t.get("name").and_then(Value::as_str) == Some(ty) || t.get("id").and_then(Value::as_u64).is_some_and(|i| i.to_string() == ty)
@@ -317,10 +329,17 @@ fn type_advice(types: &[Value], ty: &str, location: Option<&str>, now: u64) -> O
     let Some(loc) = location else {
         return Some(format!("{why} (`arena api get hetzner server_types` lists them)"));
     };
-    let offered: Vec<String> =
-        types.iter().filter(|t| orderable_in(t, loc, now) == Some(true) && !deprecated_in(t, loc)).map(type_label).collect();
-    Some(if offered.is_empty() {
+    let sold: Vec<&Value> = types.iter().filter(|t| orderable_in(t, loc, now) == Some(true) && !deprecated_in(t, loc)).collect();
+    let mut free: Vec<&Value> = sold.iter().copied().filter(|t| location_flag(t, loc, "available") != Some(false)).collect();
+    free.sort_by_key(|t| location_flag(t, loc, "recommended") != Some(true));
+    let offered: Vec<String> = free.into_iter().map(type_label).collect();
+    Some(if sold.is_empty() {
         format!("{why}, and Hetzner lists no type there (`arena api get hetzner server_types`) — pick another HETZNER_LOCATION")
+    } else if offered.is_empty() {
+        format!(
+            "{why}, and every type sold there is sold out right now (`arena api get hetzner server_types`) — try again later, \
+             or pick another HETZNER_LOCATION"
+        )
     } else {
         format!(
             "{why}; available there: {} — pass --server-type <one of those> (or set HETZNER_SERVER_TYPE), or pick another \
@@ -838,26 +857,66 @@ mod tests {
         assert_eq!((o.ssh_keys[0].as_str(), o.ssh_keys_from), ("arena9", "MACHINE_NAME_PREFIX"));
     }
 
-    /// The shape relied on: `GET /server_types` items with a per-location list (`locations[].name`,
-    /// `locations[].deprecation.unavailable_after`), `cores`, `memory` (GB), `architecture`.
-    /// cpx41 went off sale in nbg1 (it's still in fsn1/ash); cpx22's retirement there is only
-    /// announced (orderable, not suggested); ccx13 is US-only; cax11 is Arm.
+    /// `GET /server_types` as Hetzner answers it (live, 2026-10-18: every key, per type and per
+    /// location), trimmed to seven types and the locations the tests ask about. Per location:
+    /// `deprecation` (`unavailable_after` passed = retired there), `available` (`false` with no
+    /// deprecation = sold out there right now) and `recommended`. As live: cpx41 is retired
+    /// everywhere but ash (`prices` still lists the rest); cx33 and cx23 are sold out in fsn1/hel1,
+    /// cx33 in nbg1 too; cpx42 and cax11 are recommended in hel1. Changed for the tests: cpx42 is
+    /// recommended in nbg1 too (live: none there is), cpx22's nbg1 retirement is announced (still
+    /// orderable, never suggested), and ccx13 keeps only its ash entry (a US-only type).
     const SERVER_TYPES: &str = r#"{"server_types": [
-        {"id": 104, "name": "cx23", "cores": 2, "memory": 4.0, "disk": 40, "architecture": "x86", "cpu_type": "shared",
-         "deprecated": false, "deprecation": null,
-         "prices": [{"location": "fsn1", "price_hourly": {"net": "0.0060", "gross": "0.0071"}},
-                    {"location": "nbg1", "price_hourly": {"net": "0.0060", "gross": "0.0071"}}],
-         "locations": [{"id": 1, "name": "fsn1", "deprecation": null}, {"id": 2, "name": "nbg1", "deprecation": null}]},
-        {"id": 11, "name": "cpx41", "cores": 8, "memory": 16.0, "architecture": "x86",
-         "locations": [{"id": 1, "name": "fsn1", "deprecation": null},
-                       {"id": 2, "name": "nbg1", "deprecation": {"announced": "2025-09-01T00:00:00+00:00", "unavailable_after": "2025-12-31T00:00:00+00:00"}},
-                       {"id": 4, "name": "ash", "deprecation": null}]},
-        {"id": 113, "name": "cpx42", "cores": 8, "memory": 16.0, "architecture": "x86", "locations": [{"id": 2, "name": "nbg1", "deprecation": null}]},
-        {"id": 111, "name": "cpx22", "cores": 2, "memory": 4.0, "architecture": "x86",
-         "locations": [{"id": 2, "name": "nbg1", "deprecation": {"announced": "2026-09-01T00:00:00+00:00", "unavailable_after": "2099-01-01T00:00:00+00:00"}}]},
-        {"id": 45, "name": "cax11", "cores": 2, "memory": 4.0, "architecture": "arm", "locations": [{"id": 2, "name": "nbg1", "deprecation": null}]},
-        {"id": 96, "name": "ccx13", "cores": 2, "memory": 8.0, "architecture": "x86", "locations": [{"id": 4, "name": "ash", "deprecation": null}]}
-    ], "meta": {"pagination": {"page": 1, "next_page": null}}}"#;
+        {"id": 114, "name": "cx23", "description": "CX 23", "category": "cost_optimized", "cores": 2, "memory": 4, "disk": 40, "cpu_type": "shared",
+         "storage_type": "local", "architecture": "x86", "deprecated": false, "deprecation": null,
+         "prices": [{"location": "fsn1", "price_hourly": {"net": "0.0104000000", "gross": "0.0104000000000000"}, "price_monthly": {"net": "6.4900000000", "gross": "6.4900000000000000"}, "included_traffic": 21990232555520, "price_per_tb_traffic": {"net": "1.2000000000", "gross": "1.2000000000000000"}},
+                    {"location": "nbg1", "price_hourly": {"net": "0.0104000000", "gross": "0.0104000000000000"}, "price_monthly": {"net": "6.4900000000", "gross": "6.4900000000000000"}, "included_traffic": 21990232555520, "price_per_tb_traffic": {"net": "1.2000000000", "gross": "1.2000000000000000"}},
+                    {"location": "hel1", "price_hourly": {"net": "0.0104000000", "gross": "0.0104000000000000"}, "price_monthly": {"net": "6.4900000000", "gross": "6.4900000000000000"}, "included_traffic": 21990232555520, "price_per_tb_traffic": {"net": "1.2000000000", "gross": "1.2000000000000000"}}],
+         "locations": [{"id": 1, "name": "fsn1", "deprecation": null, "available": false, "recommended": false},
+                       {"id": 2, "name": "nbg1", "deprecation": null, "available": true, "recommended": false},
+                       {"id": 3, "name": "hel1", "deprecation": null, "available": false, "recommended": false}]},
+        {"id": 25, "name": "cpx41", "description": "CPX 41", "category": "regular_purpose", "cores": 8, "memory": 16, "disk": 240, "cpu_type": "shared",
+         "storage_type": "local", "architecture": "x86", "deprecated": false, "deprecation": null,
+         "prices": [{"location": "fsn1", "price_hourly": {"net": "0.2267000000", "gross": "0.2267000000000000"}, "price_monthly": {"net": "141.4900000000", "gross": "141.4900000000000000"}, "included_traffic": 4398046511104, "price_per_tb_traffic": {"net": "1.2000000000", "gross": "1.2000000000000000"}},
+                    {"location": "nbg1", "price_hourly": {"net": "0.2267000000", "gross": "0.2267000000000000"}, "price_monthly": {"net": "141.4900000000", "gross": "141.4900000000000000"}, "included_traffic": 4398046511104, "price_per_tb_traffic": {"net": "1.2000000000", "gross": "1.2000000000000000"}},
+                    {"location": "hel1", "price_hourly": {"net": "0.2267000000", "gross": "0.2267000000000000"}, "price_monthly": {"net": "141.4900000000", "gross": "141.4900000000000000"}, "included_traffic": 4398046511104, "price_per_tb_traffic": {"net": "1.2000000000", "gross": "1.2000000000000000"}},
+                    {"location": "ash", "price_hourly": {"net": "0.2267000000", "gross": "0.2267000000000000"}, "price_monthly": {"net": "141.4900000000", "gross": "141.4900000000000000"}, "included_traffic": 4398046511104, "price_per_tb_traffic": {"net": "1.2000000000", "gross": "1.2000000000000000"}}],
+         "locations": [{"id": 1, "name": "fsn1", "deprecation": {"announced": "2025-10-16T06:00:00Z", "unavailable_after": "2025-12-31T23:59:59Z"}, "available": false, "recommended": false},
+                       {"id": 2, "name": "nbg1", "deprecation": {"announced": "2025-10-16T06:00:00Z", "unavailable_after": "2025-12-31T23:59:59Z"}, "available": false, "recommended": false},
+                       {"id": 3, "name": "hel1", "deprecation": {"announced": "2025-10-16T06:00:00Z", "unavailable_after": "2025-12-31T23:59:59Z"}, "available": false, "recommended": false},
+                       {"id": 4, "name": "ash", "deprecation": null, "available": true, "recommended": false}]},
+        {"id": 111, "name": "cpx42", "description": "CPX 42", "category": "regular_purpose", "cores": 8, "memory": 16, "disk": 320, "cpu_type": "shared",
+         "storage_type": "local", "architecture": "x86", "deprecated": false, "deprecation": null,
+         "prices": [{"location": "fsn1", "price_hourly": {"net": "0.1314000000", "gross": "0.1314000000000000"}, "price_monthly": {"net": "81.9900000000", "gross": "81.9900000000000000"}, "included_traffic": 21990232555520, "price_per_tb_traffic": {"net": "1.2000000000", "gross": "1.2000000000000000"}},
+                    {"location": "nbg1", "price_hourly": {"net": "0.1314000000", "gross": "0.1314000000000000"}, "price_monthly": {"net": "81.9900000000", "gross": "81.9900000000000000"}, "included_traffic": 21990232555520, "price_per_tb_traffic": {"net": "1.2000000000", "gross": "1.2000000000000000"}},
+                    {"location": "hel1", "price_hourly": {"net": "0.1314000000", "gross": "0.1314000000000000"}, "price_monthly": {"net": "81.9900000000", "gross": "81.9900000000000000"}, "included_traffic": 21990232555520, "price_per_tb_traffic": {"net": "1.2000000000", "gross": "1.2000000000000000"}}],
+         "locations": [{"id": 1, "name": "fsn1", "deprecation": null, "available": true, "recommended": false},
+                       {"id": 2, "name": "nbg1", "deprecation": null, "available": true, "recommended": true},
+                       {"id": 3, "name": "hel1", "deprecation": null, "available": true, "recommended": true}]},
+        {"id": 109, "name": "cpx22", "description": "CPX 22", "category": "regular_purpose", "cores": 2, "memory": 4, "disk": 80, "cpu_type": "shared",
+         "storage_type": "local", "architecture": "x86", "deprecated": false, "deprecation": null,
+         "prices": [{"location": "nbg1", "price_hourly": {"net": "0.0368000000", "gross": "0.0368000000000000"}, "price_monthly": {"net": "22.9900000000", "gross": "22.9900000000000000"}, "included_traffic": 21990232555520, "price_per_tb_traffic": {"net": "1.2000000000", "gross": "1.2000000000000000"}}],
+         "locations": [{"id": 2, "name": "nbg1", "deprecation": {"announced": "2026-09-01T00:00:00Z", "unavailable_after": "2099-01-01T00:00:00Z"}, "available": true, "recommended": false}]},
+        {"id": 45, "name": "cax11", "description": "CAX11", "category": "cost_optimized", "cores": 2, "memory": 4, "disk": 40, "cpu_type": "shared",
+         "storage_type": "local", "architecture": "arm", "deprecated": false, "deprecation": null,
+         "prices": [{"location": "fsn1", "price_hourly": {"net": "0.0112000000", "gross": "0.0112000000000000"}, "price_monthly": {"net": "6.9900000000", "gross": "6.9900000000000000"}, "included_traffic": 21990232555520, "price_per_tb_traffic": {"net": "1.2000000000", "gross": "1.2000000000000000"}},
+                    {"location": "nbg1", "price_hourly": {"net": "0.0112000000", "gross": "0.0112000000000000"}, "price_monthly": {"net": "6.9900000000", "gross": "6.9900000000000000"}, "included_traffic": 21990232555520, "price_per_tb_traffic": {"net": "1.2000000000", "gross": "1.2000000000000000"}},
+                    {"location": "hel1", "price_hourly": {"net": "0.0112000000", "gross": "0.0112000000000000"}, "price_monthly": {"net": "6.9900000000", "gross": "6.9900000000000000"}, "included_traffic": 21990232555520, "price_per_tb_traffic": {"net": "1.2000000000", "gross": "1.2000000000000000"}}],
+         "locations": [{"id": 1, "name": "fsn1", "deprecation": null, "available": false, "recommended": false},
+                       {"id": 2, "name": "nbg1", "deprecation": null, "available": true, "recommended": false},
+                       {"id": 3, "name": "hel1", "deprecation": null, "available": true, "recommended": true}]},
+        {"id": 96, "name": "ccx13", "description": "CCX13 Dedicated CPU", "category": "general_purpose", "cores": 2, "memory": 8, "disk": 80, "cpu_type": "dedicated",
+         "storage_type": "local", "architecture": "x86", "deprecated": false, "deprecation": null,
+         "prices": [{"location": "ash", "price_hourly": {"net": "0.0817000000", "gross": "0.0817000000000000"}, "price_monthly": {"net": "50.9900000000", "gross": "50.9900000000000000"}, "included_traffic": 1099511627776, "price_per_tb_traffic": {"net": "1.2000000000", "gross": "1.2000000000000000"}}],
+         "locations": [{"id": 4, "name": "ash", "deprecation": null, "available": true, "recommended": false}]},
+        {"id": 115, "name": "cx33", "description": "CX 33", "category": "cost_optimized", "cores": 4, "memory": 8, "disk": 80, "cpu_type": "shared",
+         "storage_type": "local", "architecture": "x86", "deprecated": false, "deprecation": null,
+         "prices": [{"location": "fsn1", "price_hourly": {"net": "0.0160000000", "gross": "0.0160000000000000"}, "price_monthly": {"net": "9.9900000000", "gross": "9.9900000000000000"}, "included_traffic": 21990232555520, "price_per_tb_traffic": {"net": "1.2000000000", "gross": "1.2000000000000000"}},
+                    {"location": "nbg1", "price_hourly": {"net": "0.0160000000", "gross": "0.0160000000000000"}, "price_monthly": {"net": "9.9900000000", "gross": "9.9900000000000000"}, "included_traffic": 21990232555520, "price_per_tb_traffic": {"net": "1.2000000000", "gross": "1.2000000000000000"}},
+                    {"location": "hel1", "price_hourly": {"net": "0.0160000000", "gross": "0.0160000000000000"}, "price_monthly": {"net": "9.9900000000", "gross": "9.9900000000000000"}, "included_traffic": 21990232555520, "price_per_tb_traffic": {"net": "1.2000000000", "gross": "1.2000000000000000"}}],
+         "locations": [{"id": 1, "name": "fsn1", "deprecation": null, "available": false, "recommended": false},
+                       {"id": 2, "name": "nbg1", "deprecation": null, "available": false, "recommended": false},
+                       {"id": 3, "name": "hel1", "deprecation": null, "available": false, "recommended": false}]}
+    ], "meta": {"pagination": {"page": 1, "per_page": 50, "previous_page": null, "next_page": null, "last_page": 1, "total_entries": 7}}}"#;
 
     /// `GET /ssh_keys` as the project answers it (key material included — never quoted back).
     const SSH_KEYS: &str = r#"{"ssh_keys": [
@@ -907,10 +966,11 @@ mod tests {
     }
 
     /// Item 4: `cpx41` is refused in nbg1, where `cpx42` is sold. Whatever Hetzner's wording —
-    /// an `invalid_input`, or one that reads like capacity (`not available in`) — the error lists
-    /// the types nbg1 sells (not the retired, the announced-retiring or the US-only ones) and how
-    /// to pick one, and is `Rejected`: never retried as if capacity might come back. The
-    /// `--server-type` reached the request body.
+    /// an `invalid_input` (live), or one that reads like capacity (`not available in`) — the error
+    /// lists the types nbg1 sells and has free now (not the retired, the announced-retiring, the
+    /// US-only or the sold-out cx33: live hz F3), the recommended one first, and how to pick one,
+    /// and is `Rejected`: never retried as if capacity might come back. The `--server-type`
+    /// reached the request body.
     #[tokio::test]
     async fn a_type_the_location_doesnt_sell_lists_the_types_it_does() {
         use crate::error::ProviderErrorKind as K;
@@ -931,11 +991,12 @@ mod tests {
             assert!(m.contains(&format!("hetzner create HTTP {status}")), "{m}");
             assert!(
                 m.contains(
-                    "server type `cpx41` can't be ordered in nbg1; available there: cx23 (2 vCPU, 4 GB), cpx42 (8 vCPU, 16 GB), \
+                    "server type `cpx41` can't be ordered in nbg1; available there: cpx42 (8 vCPU, 16 GB), cx23 (2 vCPU, 4 GB), \
                      cax11 (2 vCPU, 4 GB, arm) — pass --server-type <one of those> (or set HETZNER_SERVER_TYPE)"
                 ),
                 "{m}"
             );
+            assert!(!m.contains("cx33"), "sold out in nbg1: {m}");
             assert!(!m.contains("SSH key"), "the key is there: {m}");
             assert_eq!(e.kind(), Some(K::Rejected), "{m}");
             assert_eq!(serde_json::from_str::<Value>(&srv.bodies.lock().unwrap()[0]).unwrap()["server_type"], "cpx41");
@@ -1039,7 +1100,8 @@ mod tests {
             (t("cx23"), "ash", now, Some(false)),
             (t("cpx41"), "nbg1", now, Some(false)),
             (t("cpx41"), "nbg1", at("2025-11-01T00:00:00+00:00"), Some(true)), // before its date
-            (t("cpx41"), "fsn1", now, Some(true)),
+            (t("cpx41"), "ash", now, Some(true)),
+            (t("cx33"), "nbg1", now, Some(true)), // sold out right now: still sold there (capacity)
             (t("cpx22"), "nbg1", now, Some(true)), // announced, still sold
             // Older answers: no `locations`, a price per location sold in.
             (json!({"name": "cx22", "prices": [{"location": "nbg1"}], "deprecation": null}), "nbg1", now, Some(true)),
@@ -1056,24 +1118,35 @@ mod tests {
         for (t, loc, now, want) in cases {
             assert_eq!(orderable_in(&t, loc, now), want, "{} in {loc}", t["name"]);
         }
-        assert!(deprecated_in(&t("cpx22"), "nbg1") && !deprecated_in(&t("cpx42"), "nbg1") && !deprecated_in(&t("cpx41"), "fsn1"));
+        assert!(deprecated_in(&t("cpx22"), "nbg1") && !deprecated_in(&t("cpx42"), "nbg1") && !deprecated_in(&t("cpx41"), "ash"));
         assert!(deprecated_in(&json!({"name": "cx11", "prices": [], "deprecated": true}), "nbg1"));
+        // The live flags, per location; an answer without them (or no entry there) says nothing.
+        let flags = |t: &Value, loc: &str| (location_flag(t, loc, "available"), location_flag(t, loc, "recommended"));
+        assert_eq!(flags(&t("cx33"), "nbg1"), (Some(false), Some(false)));
+        assert_eq!(flags(&t("cpx42"), "hel1"), (Some(true), Some(true)));
+        assert_eq!(flags(&t("cx23"), "ash"), (None, None));
+        assert_eq!(flags(&json!({"name": "cx22", "locations": [{"name": "nbg1", "deprecation": null}]}), "nbg1"), (None, None));
     }
 
-    /// When to list the types, and which. Pure.
+    /// When to list the types, and which: sold there, not retiring, not sold out right now (when
+    /// the answer says), Hetzner's recommended ones first. Pure.
     #[test]
     fn type_advice_lists_the_types_on_sale_there() {
         let types: Vec<Value> = serde_json::from_str::<Value>(SERVER_TYPES).unwrap()["server_types"].as_array().unwrap().clone();
         let now = u64::try_from(crate::reap::parse_rfc3339("2026-10-16T00:00:00+00:00").unwrap()).unwrap();
-        let sold = "cx23 (2 vCPU, 4 GB), cpx42 (8 vCPU, 16 GB), cax11 (2 vCPU, 4 GB, arm)";
+        let sold = "cpx42 (8 vCPU, 16 GB), cx23 (2 vCPU, 4 GB), cax11 (2 vCPU, 4 GB, arm)";
         let cases: &[(&str, Option<&str>, Option<String>)] = &[
             ("cx23", Some("nbg1"), None),
             ("cpx22", Some("nbg1"), None), // retiring, still orderable: not this create's problem
-            ("104", Some("nbg1"), None),   // by id
+            ("cx33", Some("nbg1"), None),  // sold out there right now: capacity, which a retry may get
+            ("cx23", Some("hel1"), None),
+            ("114", Some("nbg1"), None),   // by id
             ("cpx41", Some("nbg1"), Some(format!("server type `cpx41` can't be ordered in nbg1; available there: {sold} — pass --server-type <one of those> (or set HETZNER_SERVER_TYPE), or pick another HETZNER_LOCATION"))),
             ("cpx99", Some("nbg1"), Some(format!("Hetzner has no server type `cpx99`; available there: {sold} — pass --server-type <one of those> (or set HETZNER_SERVER_TYPE), or pick another HETZNER_LOCATION"))),
             ("cx23", Some("ash"), Some("server type `cx23` can't be ordered in ash; available there: cpx41 (8 vCPU, 16 GB), ccx13 (2 vCPU, 8 GB) — pass --server-type <one of those> (or set HETZNER_SERVER_TYPE), or pick another HETZNER_LOCATION".into())),
-            ("cx23", Some("hel1"), Some("server type `cx23` can't be ordered in hel1, and Hetzner lists no type there (`arena api get hetzner server_types`) — pick another HETZNER_LOCATION".into())),
+            // hel1: both free ones are recommended (live); the sold-out cx23 and cx33 aren't offered.
+            ("cpx41", Some("hel1"), Some("server type `cpx41` can't be ordered in hel1; available there: cpx42 (8 vCPU, 16 GB), cax11 (2 vCPU, 4 GB, arm) — pass --server-type <one of those> (or set HETZNER_SERVER_TYPE), or pick another HETZNER_LOCATION".into())),
+            ("cx23", Some("hil"), Some("server type `cx23` can't be ordered in hil, and Hetzner lists no type there (`arena api get hetzner server_types`) — pick another HETZNER_LOCATION".into())),
             ("cpx41", None, None),
             ("cpx99", None, Some("Hetzner has no server type `cpx99` (`arena api get hetzner server_types` lists them)".into())),
         ];
@@ -1082,5 +1155,17 @@ mod tests {
         }
         // An answer that doesn't say (no locations, no prices): nothing claimed.
         assert_eq!(type_advice(&[json!({"name": "cx23"})], "cx23", Some("nbg1"), now), None);
+        // Every type sold there sold out right now: said, not "no type there".
+        let sold_out = [json!({"name": "cx33", "locations": [{"name": "nbg1", "deprecation": null, "available": false, "recommended": false}]})];
+        assert_eq!(
+            type_advice(&sold_out, "cpx41", Some("nbg1"), now).as_deref(),
+            Some(
+                "Hetzner has no server type `cpx41`, and every type sold there is sold out right now (`arena api get hetzner \
+                 server_types`) — try again later, or pick another HETZNER_LOCATION"
+            )
+        );
+        // An older answer without the flags: offered as before.
+        let unflagged = [json!({"name": "cx22", "cores": 2, "memory": 4, "locations": [{"name": "nbg1", "deprecation": null}]})];
+        assert!(type_advice(&unflagged, "cpx41", Some("nbg1"), now).unwrap().contains("available there: cx22 (2 vCPU, 4 GB) — "));
     }
 }
