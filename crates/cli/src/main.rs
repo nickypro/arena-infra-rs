@@ -22256,7 +22256,8 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
             // `--all --hard`: the cohort's pods only; the pod with adopted clones says what was put
             // back; the run ends with the reminder.
             let fake = Arc::new(FakeRemote::new());
-            fake.script(&host(22001), [FakeReply::stdout("RESTORED Grokking\nRESTORED chapter4/x\n")]);
+            // Each pod's branch is backed up first (its first call), then switched.
+            fake.script(&host(22001), [FakeReply::stdout("NO_CHANGES autocommit-devtest-w1d2-apple\n"), FakeReply::stdout("RESTORED Grokking\nRESTORED chapter4/x\n")]);
             handle_pods(pods(&["set-branch", "main", "--all", "--hard"]), &account(), fake.clone(), &cfg, true).await.unwrap();
             assert_eq!(ports(&fake), COHORT_PORTS);
             let said = take_said();
@@ -22284,7 +22285,7 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
 
             // A failed switch: the reminder still names the pods that did land on main.
             let fake = Arc::new(FakeRemote::new());
-            fake.script(&host(22002), [FakeReply::exit(1, "error: Your local changes would be overwritten")]);
+            fake.script(&host(22002), [FakeReply::stdout("NO_CHANGES feature-y\n"), FakeReply::exit(1, "error: Your local changes would be overwritten")]);
             let err = handle_pods(pods(&["set-branch", "main", "apple", "bloom"]), &account(), fake.clone(), &cfg, true).await.unwrap_err();
             assert_eq!(err.to_string(), "1 pod(s) failed to switch branch");
             assert_eq!(take_said().last().map(String::as_str), Some("⚠ 1 cohort pod on main: not backed up until `arena pods init-branches devtest-apple`"));
@@ -22308,17 +22309,23 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
             assert_eq!(ports(&fake), COHORT_PORTS);
             for (name, port) in [("devtest-apple", 22001), ("devtest-bloom", 22002), ("devtest-extra", 22003)] {
                 let init = init_branch_command(&bcfg, name);
-                assert_eq!(execs(&fake, port), [(hard.clone(), Some(BRANCH_TIMEOUT)), (init, Some(BRANCH_TIMEOUT))], "{name}");
+                // Each switch is preceded by the pod's backup (set-branch's, then init-branches').
+                let backup = (backup_command(REPO, Some(KEY), &format!("arena backup {name}")), Some(BACKUP_TIMEOUT));
+                assert_eq!(
+                    execs(&fake, port),
+                    [backup.clone(), (hard.clone(), Some(BRANCH_TIMEOUT)), backup, (init, Some(BRANCH_TIMEOUT))],
+                    "{name}"
+                );
             }
             take_said();
             // A failed switch: no pod gets a day branch (the operator re-runs once all are on main).
             let fake = Arc::new(FakeRemote::new());
-            fake.script(&host(22002), [FakeReply::exit(1, "fatal: unable to access")]);
+            fake.script(&host(22002), [FakeReply::stdout("NO_CHANGES feature-y\n"), FakeReply::exit(1, "fatal: unable to access")]);
             let err = handle_pods(pods(&["set-branch", "main", "--all", "--hard", "--init-branches"]), &account(), fake.clone(), &cfg, true)
                 .await
                 .unwrap_err();
             assert_eq!(err.to_string(), "1 pod(s) failed to switch branch");
-            assert!(COHORT_PORTS.iter().all(|&p| execs(&fake, p).len() == 1), "{:?}", fake.calls());
+            assert!(COHORT_PORTS.iter().all(|&p| execs(&fake, p).len() == 2), "backup + switch, no init: {:?}", fake.calls());
             // No start date to name the day: refused before any pod is switched.
             let fake = Arc::new(FakeRemote::new());
             let err = handle_pods(pods(&["set-branch", "main", "--all", "--hard", "--init-branches"]), &account(), fake.clone(), &account_cfg(""), true)
@@ -22340,11 +22347,12 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
             let fake = Arc::new(FakeRemote::new());
             handle_pods(pods(&["init-branches", "--week", "1", "--day", "2"]), &account(), fake.clone(), &cfg, true).await.unwrap();
             assert_eq!(ports(&fake), COHORT_PORTS);
-            assert_eq!(take_said(), [LEFT_OUT]);
+            let said = take_said();
+            assert_eq!((said.len(), said[0].as_str()), (4, LEFT_OUT), "{said:?}");
             let fake = Arc::new(FakeRemote::new());
             handle_pods(pods(&["init-branches", "staff-gpu", "--week", "1", "--day", "2"]), &account(), fake.clone(), &cfg, true).await.unwrap();
             assert_eq!(ports(&fake), [22005]);
-            assert!(take_said().is_empty());
+            assert_eq!(take_said(), ["[1/1] ✓ staff-gpu -> autocommit-devtest-w1d2-staff-gpu"]);
         }
 
         #[tokio::test(start_paused = true)]
