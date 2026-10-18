@@ -17,6 +17,9 @@ pub struct Config {
     /// What the FILE itself says, before the environment's overrides — for the settings only
     /// the file may decide ([`Config::file_value`]).
     file: HashMap<String, String>,
+    /// Whether the FILE sets `MACHINE_NAME_LIST` (an empty `( )` too): only then may the
+    /// environment override the list, as for any other key ([`Config::apply_overrides`]).
+    file_sets_names: bool,
     /// The file this was loaded from ([`Config::load`]) — what a reap re-reads `REAP_ENABLED`
     /// from right before a terminate (`arena_core::reap`, RS8). `None` for a parsed text.
     source: Option<PathBuf>,
@@ -109,7 +112,11 @@ impl Config {
     /// `ARENA_START_DATE=2026-05-25 arena backup`). This is how an operator configures a
     /// run *without editing the shared, read-only prod config*; a stray env var still
     /// can't introduce an arbitrary new setting. File-only keys ([`Self::is_file_only`]) are
-    /// never touched.
+    /// never touched. `MACHINE_NAME_LIST` is such a key too, though the file's bash array is
+    /// parsed into [`Self::machine_names`], not `values`: a file that sets it takes the
+    /// environment's list instead, in the same syntax (`MACHINE_NAME_LIST='( apple @staff-box )'`;
+    /// the parentheses may be left out) — live, the sandbox couldn't try a non-cohort pod
+    /// without editing its config (bsec B3). Not introducible: a file without a list keeps none.
     fn apply_overrides<F: Fn(&str) -> Option<String>>(&mut self, lookup: F) {
         for (k, v) in self.values.iter_mut() {
             if Self::is_file_only(k) {
@@ -117,6 +124,13 @@ impl Config {
             }
             if let Some(override_val) = lookup(k) {
                 *v = override_val;
+            }
+        }
+        if self.file_sets_names {
+            if let Some(list) = lookup(NAME_LIST_KEY) {
+                let list = list.trim();
+                let inner = list.strip_prefix('(').map_or(list, |rest| rest.split(')').next().unwrap_or(""));
+                self.machine_names = name_list_entries(inner);
             }
         }
         for &k in Self::ENV_INTRODUCIBLE {
@@ -131,6 +145,7 @@ impl Config {
     pub fn parse(text: &str) -> Self {
         let mut values = HashMap::new();
         let mut machine_names = Vec::new();
+        let mut file_sets_names = false;
         let mut lines = text.lines();
 
         while let Some(line) = lines.next() {
@@ -151,13 +166,8 @@ impl Config {
                         None => break,
                     }
                 }
-                let inner = buf.split(')').next().unwrap_or("");
-                for tok in inner.split_whitespace() {
-                    let name = tok.trim().trim_matches(['"', '\'']);
-                    if !name.is_empty() && !name.starts_with('#') {
-                        machine_names.push(name.to_string());
-                    }
-                }
+                machine_names.extend(name_list_entries(buf.split(')').next().unwrap_or("")));
+                file_sets_names = true;
                 continue;
             }
 
@@ -166,7 +176,13 @@ impl Config {
             }
         }
 
-        Config { file: values.clone(), values, machine_names, source: None }
+        Config { file: values.clone(), values, machine_names, file_sets_names, source: None }
+    }
+
+    /// Whether the config FILE sets `MACHINE_NAME_LIST` — so an env var of that name, when set,
+    /// is the list in effect ([`Self::apply_overrides`]; `config which` lists it).
+    pub fn file_sets_name_list(&self) -> bool {
+        self.file_sets_names
     }
 
     pub fn get(&self, key: &str) -> Option<&str> {
@@ -210,6 +226,21 @@ pub fn upsert_line(text: &str, key: &str, value: &str) -> String {
     let mut s = out.join("\n");
     s.push('\n');
     s
+}
+
+/// The key of the bash array [`Config::machine_names`] is parsed from.
+pub const NAME_LIST_KEY: &str = "MACHINE_NAME_LIST";
+
+/// The names inside a `MACHINE_NAME_LIST=( … )` array (what's between the parentheses):
+/// whitespace-separated, each unquoted, a `#…` word dropped. The file's and the environment's
+/// list read alike. Pure.
+fn name_list_entries(inner: &str) -> Vec<String> {
+    inner
+        .split_whitespace()
+        .map(|tok| tok.trim().trim_matches(['"', '\'']))
+        .filter(|name| !name.is_empty() && !name.starts_with('#'))
+        .map(String::from)
+        .collect()
 }
 
 /// Strip surrounding quotes and trailing ` # inline comments` from a raw value.
@@ -270,6 +301,42 @@ MACHINE_NAME_LIST=(
         assert_eq!(c.get("SHARED_SSH_KEY_PATH"), Some("/home/dev/.ssh/k"));
         assert_eq!(c.get("IMAGE"), Some("base:1")); // untouched
         assert_eq!(c.get("BRAND_NEW_KEY"), None); // env can't introduce an arbitrary key
+    }
+
+    /// Live (bsec B3): `MACHINE_NAME_LIST='( @devtest-bs1 )' arena-dev config check` still said
+    /// `6 names` — the file's bash array lives in `machine_names`, which the overrides never
+    /// touched. Now the environment's list wins when the file sets one, in the file's syntax (or
+    /// without the parentheses); like every key outside ENV_INTRODUCIBLE, it can't introduce one.
+    #[test]
+    fn env_overrides_the_name_list_the_file_sets() {
+        let file = "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(\n  \"apple\"\n  \"bloom\"\n  @staff-box\n)\nIMAGE=base:1\n";
+        let cases: &[(&str, &[&str])] = &[
+            ("( @devtest-bs1 )", &["@devtest-bs1"]),
+            ("(apple \"cloud\" 'dune' #off @x)", &["apple", "cloud", "dune", "@x"]),
+            ("  apple bloom  ", &["apple", "bloom"]),
+            ("()", &[]),
+            ("", &[]),
+        ];
+        for (env, want) in cases {
+            let mut c = Config::parse(file);
+            assert!(c.file_sets_name_list());
+            c.apply_overrides(|k| (k == NAME_LIST_KEY).then(|| env.to_string()));
+            assert_eq!(c.machine_names, *want, "{env:?}");
+            assert_eq!((c.get("IMAGE"), c.get(NAME_LIST_KEY)), (Some("base:1"), None), "the rest as it was");
+        }
+        // No env var: the file's list.
+        let mut c = Config::parse(file);
+        c.apply_overrides(|_| None);
+        assert_eq!(c.machine_names, ["apple", "bloom", "@staff-box"]);
+        // A file without a list (or with an empty one, which still sets it): introduced never, overridden yes.
+        let mut c = Config::parse("MACHINE_NAME_PREFIX=devtest\n");
+        assert!(!c.file_sets_name_list());
+        c.apply_overrides(|k| (k == NAME_LIST_KEY).then(|| "( apple )".to_string()));
+        assert!(c.machine_names.is_empty());
+        let mut c = Config::parse("MACHINE_NAME_LIST=()\n");
+        assert!(c.file_sets_name_list() && c.machine_names.is_empty());
+        c.apply_overrides(|k| (k == NAME_LIST_KEY).then(|| "( apple )".to_string()));
+        assert_eq!(c.machine_names, ["apple"]);
     }
 
     #[test]

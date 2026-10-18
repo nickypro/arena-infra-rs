@@ -4507,11 +4507,17 @@ fn config_which(cfg: &Config, provider_name: &str, config_path: &std::path::Path
 
     // Keys whose value is currently coming from the environment (env overrides the file
     // at load — easy to forget, so surface it).
-    let mut from_env: Vec<&String> = cfg
+    let mut from_env: Vec<&str> = cfg
         .values
         .keys()
-        .filter(|k| !Config::is_file_only(k) && std::env::var(k.as_str()).is_ok())
+        .map(String::as_str)
+        .filter(|k| !Config::is_file_only(k) && std::env::var(k).is_ok())
         .collect();
+    // The name list too (parsed apart from `values`): the environment's wins when the file has one.
+    let list = arena_core::config::NAME_LIST_KEY;
+    if cfg.file_sets_name_list() && std::env::var(list).is_ok() {
+        from_env.push(list);
+    }
     from_env.sort();
     // The reaper's keys are file-only: an env var of that name is ignored — say so, since
     // it looks like it should win.
