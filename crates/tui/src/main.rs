@@ -267,8 +267,43 @@ impl Ui {
     }
 }
 
+/// What `arena-tui` does with its command-line arguments: it takes none (`arena tui` passes
+/// the config and provider in `ARENA_CONFIG`/`ARENA_PROVIDER`), so any argument stops it
+/// before the config is read — `Some((exit code, message))`; `-h`/`--help` is usage, exit 0.
+/// It used to ignore them: `arena-tui --config <sandbox config>` loaded the default (prod)
+/// config and refreshed the prod fleet (live, 2026-10-18).
+fn args_refusal(args: &[String]) -> Option<(i32, String)> {
+    let usage = format!(
+        "arena-tui takes no arguments: the config comes from ARENA_CONFIG (default {DEFAULT_CONFIG}), \
+         the provider from ARENA_PROVIDER. Run `arena [--config <file>] [--provider <name>] tui`."
+    );
+    match args {
+        [] => None,
+        [a] if a == "-h" || a == "--help" => Some((0, usage)),
+        _ => Some((2, format!("arena-tui: unexpected argument {:?} — {usage}", args[0]))),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some((code, message)) = args_refusal(&args) {
+        if code == 0 {
+            println!("{message}");
+        } else {
+            eprintln!("{message}");
+        }
+        std::process::exit(code);
+    }
+    // No terminal, no dashboard — and nothing read or refreshed first (the refresh starts
+    // before the screen is set up, so a run without one used to poll the fleet, then fail).
+    {
+        use std::io::IsTerminal;
+        if !std::io::stdout().is_terminal() {
+            eprintln!("arena-tui: needs a terminal (stdout isn't one) — nothing was read or refreshed");
+            std::process::exit(2);
+        }
+    }
     let config_path =
         std::env::var("ARENA_CONFIG").unwrap_or_else(|_| DEFAULT_CONFIG.to_string());
     let cfg = Config::load(&PathBuf::from(&config_path))
@@ -3347,6 +3382,22 @@ fn render_result(f: &mut Frame, msg: &str, scroll: u16) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn any_argument_stops_the_dashboard_before_it_reads_a_config() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(super::args_refusal(&a(&[])), None);
+        for help in ["-h", "--help"] {
+            let (code, msg) = super::args_refusal(&a(&[help])).unwrap();
+            assert_eq!(code, 0);
+            assert!(msg.contains("ARENA_CONFIG") && msg.contains("arena [--config <file>]"), "{msg}");
+        }
+        for argv in [&["--config", "/home/dev/sandbox/config.env"][..], &["--help", "x"], &["tui"], &["-y"]] {
+            let (code, msg) = super::args_refusal(&a(argv)).unwrap();
+            assert_eq!(code, 2, "{argv:?}");
+            assert!(msg.starts_with(&format!("arena-tui: unexpected argument {:?}", argv[0])), "{msg}");
+        }
+    }
+
     use super::*;
     use std::collections::HashSet;
     use std::sync::atomic::AtomicUsize;

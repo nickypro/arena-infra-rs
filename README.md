@@ -1397,8 +1397,9 @@ cargo run -p arena-cli -- pods create -n 3 --dry-run
 # actually create them (prompts to confirm; -y to skip)
 cargo run -p arena-cli -- pods create -n 3
 
-# interactive dashboard (or `arena tui`, which inherits --provider/--config)
-cargo run -p arena-tui
+# interactive dashboard (or `arena tui`, which inherits --provider/--config); arena-tui itself
+# takes no arguments (any is refused) — its config is ARENA_CONFIG, default the prod path
+ARENA_CONFIG=./config.env cargo run -p arena-tui
 
 # point at a different config
 cargo run -p arena-cli -- --config ./config.env pods list
