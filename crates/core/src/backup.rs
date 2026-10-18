@@ -2392,10 +2392,11 @@ done
         assert!(s.ssh_calls().iter().any(|c| c.contains("git-receive-pack 'Styme3279/ARENA_materials.git'")));
         let on_github = s.git(&s.base, &["--git-dir", github.to_str().unwrap(), "ls-tree", "-r", "--name-only", "autocommit-x"]);
         assert!(on_github.lines().any(|p| p == "exercises/work.py"), "{on_github}");
-        // A configured name no GitHub repo can have (a typo with a `#`) matches nothing, not even
-        // a local path, whose key is just as empty: refused, loudly, rather than let through.
+        // A configured owner no GitHub account can have (a typo with a `#`: its key is cut to two
+        // parts, so it has none) matches nothing — not even a local path, whose key is just as
+        // empty: refused, loudly, rather than let through.
         s.git(&s.work, &["remote", "set-url", "origin", s.origin.to_str().unwrap()]);
-        s.want = Some("styme3279/ARENA#materials".into());
+        s.want = Some("styme#3279/ARENA_materials".into());
         s.put("exercises/more.py", 10);
         let (code, r, _) = s.backup();
         assert_eq!((code, r.wrong_origin.map(|w| w.1)), (Some(BACKUP_WRONG_ORIGIN_EXIT), Some(s.origin.display().to_string())));
