@@ -5394,7 +5394,7 @@ fn failure_why(call: &PodCall) -> String {
 fn telling_line(stderr: &str) -> Option<&str> {
     const VERDICTS: &[&str] = &["ERROR:", "fatal:", "error:", "remote: error", "! [rejected]", "! [remote rejected]"];
     let lines = || stderr.lines().map(str::trim).filter(|l| !l.is_empty());
-    lines().find(|l| VERDICTS.iter().any(|v| l.starts_with(v))).or_else(|| lines().last())
+    lines().find(|l| VERDICTS.iter().any(|v| l.starts_with(v))).or_else(|| lines().next_back())
 }
 
 /// Is `branch` one `pods backup` never commits on (`backup.sh`'s SKIP: main, master, a
