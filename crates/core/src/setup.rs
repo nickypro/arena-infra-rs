@@ -587,8 +587,9 @@ pub fn pod_budget(steps: &[ProvisionStep], boot: BootRetry) -> Duration {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProvisionOutcome {
     /// Every required step succeeded. `warnings`: the best-effort steps that didn't
-    /// (`<label>: <why>`) — reported, never a failure.
-    Done { warnings: Vec<String> },
+    /// (`<label>: <why>`) — reported, never a failure. `installer`: what built the ARENA env,
+    /// as the bare-VM setup script says it ([`INSTALLER_PREFIX`]; `None` from any other setup).
+    Done { warnings: Vec<String>, installer: Option<String> },
     /// A step failed: non-zero exit (`code`), a failed copy, or the call itself erroring.
     Failed { step: &'static str, code: Option<i32>, detail: String },
     /// A step (or, defensively, the whole pod budget) ran out of time.
@@ -598,7 +599,12 @@ pub enum ProvisionOutcome {
 impl ProvisionOutcome {
     /// Set up, with nothing to report.
     pub fn done() -> Self {
-        ProvisionOutcome::Done { warnings: Vec::new() }
+        ProvisionOutcome::Done { warnings: Vec::new(), installer: None }
+    }
+
+    /// Set up, with these warnings (and no installer said).
+    pub fn warned(warnings: Vec<String>) -> Self {
+        ProvisionOutcome::Done { warnings, installer: None }
     }
 
     pub fn is_done(&self) -> bool {
@@ -608,8 +614,17 @@ impl ProvisionOutcome {
     /// The best-effort steps that didn't work out on a pod that is set up (else none).
     pub fn warnings(&self) -> &[String] {
         match self {
-            ProvisionOutcome::Done { warnings } => warnings,
+            ProvisionOutcome::Done { warnings, .. } => warnings,
             _ => &[],
+        }
+    }
+
+    /// What built the ARENA env on a pod that is set up (`install_uv.sh`, `none (env already
+    /// present)`, …), when its setup said ([`INSTALLER_PREFIX`]).
+    pub fn installer(&self) -> Option<&str> {
+        match self {
+            ProvisionOutcome::Done { installer, .. } => installer.as_deref(),
+            _ => None,
         }
     }
 
@@ -618,8 +633,8 @@ impl ProvisionOutcome {
     /// names the pod (the fleet runner's, or `up`'s per-pod `[name] FAILED setup: …`).
     pub fn describe(&self) -> String {
         match self {
-            ProvisionOutcome::Done { warnings } if warnings.is_empty() => "done".to_string(),
-            ProvisionOutcome::Done { warnings } => format!("done (warning: {})", warnings.join("; ")),
+            ProvisionOutcome::Done { warnings, .. } if warnings.is_empty() => "done".to_string(),
+            ProvisionOutcome::Done { warnings, .. } => format!("done (warning: {})", warnings.join("; ")),
             ProvisionOutcome::TimedOut { step, after } => format!("timed out at {step} after {}", human_duration(after)),
             ProvisionOutcome::Failed { step, code, detail } => {
                 let exit = code.map(|c| format!(", exit {c}")).unwrap_or_default();
@@ -630,14 +645,24 @@ impl ProvisionOutcome {
     }
 }
 
-/// The fleet runner's per-pod progress line: `[done/total] ✓ name` (`… ✓ name (warning:
-/// <step>: <why>)` when a best-effort step didn't work out), or
+/// The fleet runner's per-pod progress line: `[done/total] ✓ name` (`… ✓ name (installer:
+/// install_uv.sh)` when the bare-VM script said what built the env; `… (warning: <step>: <why>)`
+/// when a best-effort step didn't work out; both: `(installer: …; warning: …)`), or
 /// `[done/total] ✗ name (timed out at <step> after Ns)` /
 /// `[done/total] ✗ name (failed at <step>, exit N): <stderr>`.
 pub fn progress_line(done: usize, total: usize, name: &str, outcome: &ProvisionOutcome) -> String {
     match outcome {
-        ProvisionOutcome::Done { warnings } if warnings.is_empty() => format!("[{done}/{total}] ✓ {name}"),
-        ProvisionOutcome::Done { warnings } => format!("[{done}/{total}] ✓ {name} (warning: {})", warnings.join("; ")),
+        ProvisionOutcome::Done { warnings, installer } => {
+            let mut said: Vec<String> = installer.iter().map(|i| format!("installer: {i}")).collect();
+            if !warnings.is_empty() {
+                said.push(format!("warning: {}", warnings.join("; ")));
+            }
+            if said.is_empty() {
+                format!("[{done}/{total}] ✓ {name}")
+            } else {
+                format!("[{done}/{total}] ✓ {name} ({})", said.join("; "))
+            }
+        }
         ProvisionOutcome::TimedOut { .. } => format!("[{done}/{total}] ✗ {name} ({})", outcome.describe()),
         ProvisionOutcome::Failed { step, code, detail } => {
             let exit = code.map(|c| format!(", exit {c}")).unwrap_or_default();
@@ -746,7 +771,7 @@ pub async fn provision(
             let tail = steps[i..].iter().all(|s| matches!(s, ProvisionStep::Optional { .. }));
             if let (ProvisionStep::Optional { label, .. }, true) = (step, tail) {
                 let why = format!("{label}: timed out after {}", human_duration(&budget));
-                return ProvisionOutcome::Done { warnings: vec![why] };
+                return ProvisionOutcome::warned(vec![why]);
             }
             ProvisionOutcome::TimedOut { step: step.label(), after: budget }
         }
@@ -798,6 +823,7 @@ async fn provision_once(
     at: &AtomicUsize,
 ) -> Pass {
     let mut warnings = Vec::new();
+    let mut installer = None;
     for (i, step) in steps.iter().enumerate() {
         at.store(i, Ordering::Relaxed);
         let step_label = step.label();
@@ -808,10 +834,12 @@ async fn provision_once(
             ProvisionStep::Run { cmd, timeout, .. } => {
                 let call = remote.exec(target, cmd, Some(*timeout)).await;
                 // A required step that worked can still have something to say (the repo
-                // couldn't go onto the volume, and why): its `arena-warning:` lines.
+                // couldn't go onto the volume, and why): its `arena-warning:` lines — and, from
+                // the bare-VM script, what built the env.
                 if let Ok(out) = &call {
                     if out.success {
                         warnings.extend(step_warnings(&out.stdout).map(|w| format!("{step_label}: {w}")));
+                        installer = step_installer(&out.stdout).or(installer);
                     }
                 }
                 call
@@ -861,7 +889,27 @@ async fn provision_once(
             }
         }
     }
-    Pass::Final(ProvisionOutcome::Done { warnings })
+    Pass::Final(ProvisionOutcome::Done { warnings, installer })
+}
+
+/// The line the bare-VM setup script (`hetzner_setup.sh`) prints after building — or finding —
+/// the ARENA env: `arena-installer: install_uv.sh` (or `none (env already present)`,
+/// `requirements.txt (built-in uv install)`). Its `### done` line said the same, but stdout
+/// never reaches the operator on success, so which one ran was invisible (live hz F4).
+pub const INSTALLER_PREFIX: &str = "arena-installer: ";
+
+/// The longest installer name shown on a ✓ line: one short suffix, never a flood.
+const INSTALLER_MAX_CHARS: usize = 80;
+
+/// What a provisioning command said built the env: its last [`INSTALLER_PREFIX`] line, prefix
+/// stripped, clipped to [`INSTALLER_MAX_CHARS`]; `None` when it says nothing. Pure.
+fn step_installer(stdout: &str) -> Option<String> {
+    stdout
+        .lines()
+        .filter_map(|l| l.trim_end_matches('\r').strip_prefix(INSTALLER_PREFIX))
+        .map(str::trim)
+        .rfind(|i| !i.is_empty())
+        .map(|i| crate::fleet::clip_middle(i, INSTALLER_MAX_CHARS))
 }
 
 /// The longest a setup warning gets before its middle is cut ([`crate::fleet::clip_middle`]).
@@ -1457,18 +1505,51 @@ mod tests {
         let out = provision(&fake, &target(22), &image_steps(), BootRetry::default()).await;
         assert_eq!(
             out,
-            ProvisionOutcome::Done {
-                warnings: vec![
-                    "repo onto volume: repo not moved onto the /workspace volume: in use (pid 42) - re-run setup when it is idle".into(),
-                    "repo + keys config: another setup is still moving the repo onto the volume - the update ran anyway".into(),
-                ]
-            }
+            ProvisionOutcome::warned(vec![
+                "repo onto volume: repo not moved onto the /workspace volume: in use (pid 42) - re-run setup when it is idle".into(),
+                "repo + keys config: another setup is still moving the repo onto the volume - the update ran anyway".into(),
+            ])
         );
         // A failed required step's stdout isn't mined for warnings: the failure is the report.
         let fake = FakeRemote::new();
         fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::exit(1, "boom").with_stdout("arena-warning: x\n")]);
         let out = provision(&fake, &target(22), &image_steps(), BootRetry::default()).await;
         assert!(matches!(&out, ProvisionOutcome::Failed { detail, .. } if detail == "boom"), "{out:?}");
+    }
+
+    /// Live (hz F4): the bare-VM script names what built the env, but on success only the ✓
+    /// line reaches the operator — which said `✓` alone. Now the script's `arena-installer:` line
+    /// is on it, beside any warning, in one short suffix. Only a step that worked is read (a
+    /// failure is its own report); the last line said wins; a runaway one is clipped.
+    #[tokio::test(start_paused = true)]
+    async fn the_installer_a_bare_vm_setup_names_is_on_its_line() {
+        let steps = provisioning_steps("hetzner", &vscode_cfg(), "devtest-hz1", false, "/tmp/h.sh", &SetupTimeouts::default());
+        let script = "### 4/6 ARENA repo + Python env\ninstaller: /root/r/install_uv.sh (the repo's own), torch backend cpu\n\
+                      arena-installer: install_uv.sh\r\n### done — Python 3.13.16, torch 2.14.1+cpu, installer: install_uv.sh\n";
+        let fake = FakeRemote::new();
+        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::stdout(script), FakeReply::ok()]);
+        let out = provision(&fake, &target(22), &steps, BootRetry::default()).await;
+        assert_eq!(out, ProvisionOutcome::Done { warnings: vec![], installer: Some("install_uv.sh".into()) });
+        assert_eq!(progress_line(1, 1, "devtest-hz1", &out), "[1/1] ✓ devtest-hz1 (installer: install_uv.sh)");
+        // With a warning (the warm-up failed): both.
+        let fake = FakeRemote::new();
+        let again = "arena-installer: install_uv.sh\narena-installer: none (env already present)\n";
+        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::stdout(again), FakeReply::exit(3, "warm-up incomplete: x")]);
+        let out = provision(&fake, &target(22), &steps, BootRetry::default()).await;
+        assert_eq!(
+            progress_line(2, 2, "devtest-hz1", &out),
+            "[2/2] ✓ devtest-hz1 (installer: none (env already present); warning: vscode warm-up: exit 3: warm-up incomplete: x)"
+        );
+        // A script that failed: its line isn't read.
+        let fake = FakeRemote::new();
+        fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::ok(), FakeReply::exit(1, "FAILED: no torch").with_stdout(script)]);
+        let out = provision(&fake, &target(22), &steps, BootRetry::default()).await;
+        assert!(!out.is_done() && out.installer().is_none(), "{out:?}");
+        // Nothing said (an image-based setup): the line as before.
+        assert_eq!(step_installer("### done\narena-installer:   \n"), None);
+        assert_eq!(progress_line(1, 1, "a", &ProvisionOutcome::warned(vec!["w".into()])), "[1/1] ✓ a (warning: w)");
+        let runaway = step_installer(&format!("arena-installer: {}\n", "x".repeat(500))).unwrap();
+        assert!(runaway.chars().count() <= INSTALLER_MAX_CHARS && runaway.contains(" … "), "{runaway}");
     }
 
     /// A long warning keeps its instruction: the live relocation warning (both copies exist,
@@ -1506,14 +1587,14 @@ mod tests {
         fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::hang(), FakeReply::ok()]);
         let start = tokio::time::Instant::now();
         let out = provision(&fake, &target(22), &image_steps(), BootRetry::default()).await;
-        assert_eq!(out, ProvisionOutcome::Done { warnings: vec!["repo onto volume: timed out after 900s".into()] });
+        assert_eq!(out, ProvisionOutcome::warned(vec!["repo onto volume: timed out after 900s".into()]));
         assert_eq!(start.elapsed(), secs(900));
         let calls = fake.calls();
         assert!(matches!(&calls[2], RemoteCall::Exec { cmd, timeout, .. } if cmd.contains("git remote set-url") && *timeout == Some(secs(300))));
         let fake = FakeRemote::new();
         fake.script("10.0.0.1:22", [FakeReply::ok(), FakeReply::exit(2, "sh: 1: find: not found")]);
         let out = provision(&fake, &target(22), &image_steps(), BootRetry::default()).await;
-        assert_eq!(out, ProvisionOutcome::Done { warnings: vec!["repo onto volume: exit 2: sh: 1: find: not found".into()] });
+        assert_eq!(out, ProvisionOutcome::warned(vec!["repo onto volume: exit 2: sh: 1: find: not found".into()]));
         assert_eq!(fake.calls().len(), 3, "the config step still ran");
     }
 
@@ -1654,7 +1735,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_failed_or_hung_warm_up_is_a_warning_on_a_set_up_pod() {
         let steps = provisioning_steps("runpod", &vscode_cfg(), "arena8-apple", false, "", &SetupTimeouts::default());
-        let warned = |w: &str| ProvisionOutcome::Done { warnings: vec![w.to_string()] };
+        let warned = |w: &str| ProvisionOutcome::warned(vec![w.to_string()]);
 
         // The script's own report: exit 3, its reason on the last stderr line (after ssh chatter).
         let fake = FakeRemote::new();
@@ -1740,7 +1821,7 @@ mod tests {
         let steps = provisioning_steps("runpod", &vscode_cfg(), "arena8-apple", false, "", &SetupTimeouts::default());
         let stuck_in_warm_up = DeafAfter { ok: 3, calls: AtomicUsize::new(0) };
         let out = provision(&stuck_in_warm_up, &target(22), &steps, BootRetry::default()).await;
-        assert_eq!(out, ProvisionOutcome::Done { warnings: vec!["vscode warm-up: timed out after 1716s".into()] });
+        assert_eq!(out, ProvisionOutcome::warned(vec!["vscode warm-up: timed out after 1716s".into()]));
         // Stuck before it: still the failure it always was.
         let stuck_in_config = DeafAfter { ok: 2, calls: AtomicUsize::new(0) };
         let out = provision(&stuck_in_config, &target(22), &steps, BootRetry::default()).await;

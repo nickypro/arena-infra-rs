@@ -1982,8 +1982,8 @@ async fn run_setup(remote: &dyn Remote, cfg: &Config, pod: &Pod) -> String {
     // No boot-race retries: the operator presses Setup on a pod that is already up.
     let no_wait = BootRetry { window: Duration::ZERO, every: Duration::ZERO };
     match provision(remote, &target, &steps, no_wait).await {
-        ProvisionOutcome::Done { warnings } if warnings.is_empty() => format!("✓ set up {}", pod.name),
-        ProvisionOutcome::Done { warnings } => format!("✓ set up {} (warning: {})", pod.name, warnings.join("; ")),
+        ProvisionOutcome::Done { warnings, .. } if warnings.is_empty() => format!("✓ set up {}", pod.name),
+        ProvisionOutcome::Done { warnings, .. } => format!("✓ set up {} (warning: {})", pod.name, warnings.join("; ")),
         failed => format!("✗ setup {}: {}", pod.name, failed.describe()),
     }
 }

@@ -153,6 +153,27 @@ fn last_line(s: &str) -> &str {
     s.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("")
 }
 
+/// What the script told `arena pods setup` built the env: its `arena-installer:` lines (the
+/// prefix core reads them by, [`arena_core::setup::INSTALLER_PREFIX`]), prefix stripped.
+fn installers_said(stdout: &str) -> Vec<&str> {
+    stdout.lines().filter_map(|l| l.strip_prefix(arena_core::setup::INSTALLER_PREFIX)).collect()
+}
+
+/// Live (hz F5): the step headers went 1/5 … 4/5, then 5/6, 6/6. Each now counts up by one to
+/// the one total.
+#[test]
+fn the_step_headers_count_up_to_one_total() {
+    let steps: Vec<(usize, usize)> = crate::HETZNER_SETUP
+        .lines()
+        .filter_map(|l| l.strip_prefix("echo \"### "))
+        .filter_map(|l| l.split_once(' ')?.0.split_once('/'))
+        .map(|(n, of)| (n.parse().unwrap(), of.parse().unwrap()))
+        .collect();
+    let total = steps.len();
+    assert_eq!(steps, (1..=total).map(|n| (n, total)).collect::<Vec<_>>());
+    assert_eq!(total, 6);
+}
+
 #[test]
 fn the_script_parses() {
     let out = Command::new("bash").arg("-n").arg("-c").arg(crate::HETZNER_SETUP).output().expect("bash");
@@ -291,6 +312,7 @@ fn the_repos_install_uv_sh_builds_the_env_and_is_named() {
     assert!(r.uv_log.lines().filter_map(|l| l.strip_prefix("TMPDIR ")).all(|d| d.starts_with(&ours)), "{}", r.uv_log);
     assert!(r.stdout.contains(&format!("installer: {}/install_uv.sh (the repo's own), torch backend cpu", repo.display())), "{}", r.stdout);
     assert!(last_line(&r.stdout).contains("installer: install_uv.sh,"), "{}", r.stdout);
+    assert_eq!(installers_said(&r.stdout), ["install_uv.sh"], "for the ✓ line (live hz F4): {}", r.stdout);
     assert!(!r.stdout.contains(arena_core::volume::WARNING_PREFIX), "nothing to warn about: {}", r.stdout);
 
     std::fs::write(stubs.join("uv.log"), "").unwrap();
@@ -299,6 +321,7 @@ fn the_repos_install_uv_sh_builds_the_env_and_is_named() {
     assert_eq!(std::fs::read_to_string(repo.join("install_uv.ran")).unwrap(), ran, "not run again");
     assert!(!again.uv_log.contains("venv"), "{}", again.uv_log);
     assert!(last_line(&again.stdout).contains("installer: none (env already present),"), "{}", again.stdout);
+    assert_eq!(installers_said(&again.stdout), ["none (env already present)"]);
 }
 
 /// A failing install_uv.sh fails setup: its own error stays visible, the reason is last.
@@ -329,6 +352,7 @@ fn without_install_uv_sh_the_requirements_install_runs_and_says_so() {
     assert!(r.stdout.lines().any(|l| l == warn), "{}", r.stdout);
     assert!(install_line(&r.uv_log).ends_with("-r requirements.cpu.txt"), "{}", r.uv_log);
     assert!(last_line(&r.stdout).contains("installer: requirements.txt (built-in uv install),"), "{}", r.stdout);
+    assert_eq!(installers_said(&r.stdout), ["requirements.txt (built-in uv install)"]);
 
     let (_t, stubs, home, repo) = setup("nothing-to-install");
     std::fs::remove_file(repo.join("requirements.txt")).unwrap();

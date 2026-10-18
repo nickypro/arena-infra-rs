@@ -742,7 +742,10 @@ impl Shared<'_, '_> {
                     return self.end(run, Verdict::Failed { stage: Stage::Setup, reason });
                 }
                 Some(outcome) => {
-                    say(To::Out, &format!("[{name}] setup ✓ ({})", pipeline::fmt_elapsed(t.elapsed())));
+                    // A bare VM's setup says what built its env (`install_uv.sh`, or `none (env
+                    // already present)`): on the ✓ line, the one the operator reads.
+                    let installer = outcome.installer().map(|i| format!(", installer: {i}")).unwrap_or_default();
+                    say(To::Out, &format!("[{name}] setup ✓ ({}{installer})", pipeline::fmt_elapsed(t.elapsed())));
                     // A best-effort step (the move onto the volume, the VS Code warm-up) that didn't
                     // work out: said, not fatal.
                     for w in outcome.warnings() {
@@ -1997,6 +2000,31 @@ mod tests {
         assert!(ok < warned, "{:#?}", lines.all());
         assert_eq!(execs_with(&fake, &host("10.0.0.1", 22001), "arena-vscode-warmup"), 1);
         assert_eq!(fleet.events().len(), 1, "never replaced: {:?}", fleet.events());
+    }
+
+    /// Live (hz F4): `up` on a Hetzner VM said only `setup ✓ (5m44s)` — which installer built the
+    /// env was in the script's output alone. Now what the setup says built it (its
+    /// `arena-installer:` line, from whichever step prints it) is on the ✓ line; a setup that
+    /// says nothing keeps the line as it was.
+    #[tokio::test(start_paused = true)]
+    async fn the_setup_line_names_the_installer_the_setup_said() {
+        for (said, want) in [
+            ("### 4/6 ARENA repo + Python env\narena-installer: install_uv.sh\n### done — Python 3.13.16\n", "(0s, installer: install_uv.sh)"),
+            ("arena-installer: none (env already present)\r\n", "(0s, installer: none (env already present))"),
+            ("### done — nothing said\n", "(0s)"),
+        ] {
+            let fleet = Fleet::new(&[("apple", &[("10.0.0.1", 22001, 0)])]);
+            let fake = Arc::new(FakeRemote::new());
+            fake.script(&host("10.0.0.1", 22001), [FakeReply::ok(), FakeReply::stdout(said), healthy()]);
+            let cfg = cfg(None);
+            let run = up_run(&fleet, fake.clone(), &cfg, true, Some(2), None).await;
+            let made = make(&fleet, &["apple"]).await;
+            let lines = Lines::new();
+            let rows = run_up(&run, made, std::future::pending(), &|to, l| lines.say(to, l)).await;
+            assert_eq!(rows[0].verdict, Verdict::Ready, "{:#?}", lines.all());
+            let (i, _) = lines.find("[devtest-apple] setup ✓");
+            assert_eq!(lines.all()[i], format!("[devtest-apple] setup ✓ {want}"));
+        }
     }
 
     /// [`cfg`] with a readable cohort key (its `.pub` beside it) and a deploy key that has

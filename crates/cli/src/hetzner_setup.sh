@@ -54,13 +54,13 @@ REPO_DIR="${REPO_DIR:-/root/ARENA_materials}"
 REPO_URL="${REPO_URL:-}"
 VENV="$REPO_DIR/.venv"
 
-echo "### 1/5 system packages"
+echo "### 1/6 system packages"
 apt-get update -qq || die "apt-get update failed"
 apt-get install -y --no-install-recommends \
     build-essential ffmpeg git curl wget ca-certificates libosmesa6 jq zsh tmux \
     python3-dev pkg-config || die "apt-get install of the system packages failed"
 
-echo "### 2/5 docker + docker compose"
+echo "### 2/6 docker + docker compose"
 if ! command -v docker >/dev/null 2>&1; then
     curl -fsSL https://get.docker.com | sh
 fi
@@ -68,14 +68,14 @@ systemctl enable --now docker 2>/dev/null || true
 docker --version || echo "WARN: docker missing (its installer failed?) — continuing; the ARENA env doesn't need it"
 docker compose version || echo "WARN: docker compose plugin missing"
 
-echo "### 3/5 uv"
+echo "### 3/6 uv"
 if ! command -v uv >/dev/null 2>&1 && [ ! -x "$HOME/.local/bin/uv" ]; then
     curl -LsSf https://astral.sh/uv/install.sh | sh
 fi
 export PATH="$HOME/.local/bin:$PATH"
 uv --version || die "uv isn't installed (its installer failed?)"
 
-echo "### 4/5 ARENA repo + Python env"
+echo "### 4/6 ARENA repo + Python env"
 # If a git deploy key was provided (REPO_KEY), wire github.com to it so we can clone — and
 # later push backups to — the PRIVATE cohort repo over SSH. Without it the clone is anonymous
 # (a public REPO_URL only).
@@ -291,4 +291,7 @@ chsh -s "$(which zsh)" root 2>/dev/null || true
 # Tokens (OPENROUTER_API_KEY, HF_TOKEN, …) are distributed separately by
 # `arena pods copy-keys` (cross-provider), which appends exports to these same rc files.
 
+# What built the env, for `arena pods setup`/`pods up` to put on the pod's ✓ line (stdout
+# reaches the operator only through these `arena-` lines).
+echo "arena-installer: $INSTALLER"
 echo "### done — $(python --version 2>&1), torch $(python -c 'import torch; print(torch.__version__)' 2>/dev/null || echo '?'), installer: $INSTALLER, shell=$(getent passwd root | cut -d: -f7)"
