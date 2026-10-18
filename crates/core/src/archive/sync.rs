@@ -216,7 +216,7 @@ pub const GIVE_UP_AFTER: u32 = 3;
 /// unmounted, a host key or push key refused, an rrsync refusal — stop the whole run and say
 /// nothing about the pod: an outage of any length never seals anything partial.
 pub fn counts_toward_give_up(f: PushFailure) -> bool {
-    matches!(f, PushFailure::Other | PushFailure::Timeout)
+    matches!(f, PushFailure::Other | PushFailure::InTheWay | PushFailure::Timeout)
 }
 
 /// Whether a push waits for the pod's running pull (its backup lock held): only its FIRST push
@@ -1271,6 +1271,13 @@ pub enum PushFailure {
     Stalled,
     /// The push ran out of its budget (arena stopped it).
     Timeout,
+    /// The archive has a directory where the backup now has a symlink or a file (rsync exit 23,
+    /// `could not make way for new symlink: <path>`): a pull moved that directory aside here
+    /// (`pull::rsync_making_way`), and the archive, which never deletes and has no shell for
+    /// arena, keeps it — so every later push of this pod fails the same way until someone moves
+    /// it aside on the archive host ([`in_the_way_fix`] says how). The pod's own failure; the
+    /// rest of the push went through.
+    InTheWay,
     Other,
 }
 
@@ -1354,7 +1361,44 @@ pub fn classify_push(code: Option<i32>, stderr: &str, timed_out: bool) -> Result
     if code == Some(255) || unreachable.iter().any(|n| has(n)) {
         return Err(PushFailure::Unreachable);
     }
+    // Only rsync writes a line that starts like this (a name in one is escaped, never a line).
+    if code == Some(crate::pull::RSYNC_PARTIAL_EXIT) && !crate::pull::make_way_entries(stderr).is_empty() {
+        return Err(PushFailure::InTheWay);
+    }
     Err(PushFailure::Other)
+}
+
+/// What a push that failed with [`PushFailure::InTheWay`] says to do: which path the archive
+/// still has as a directory, and the commands that move it aside on the archive host — into a
+/// holding directory beside it, its name kept, as the pull did here (`pull::move_aside`), which
+/// no push touches again ([`SECRET_EXCLUDES`]). `dest` is the push's destination under rrsync's
+/// root (`big/`, `snap/<L>/<pod>/`: rsync names the path relative to it), `day` the holding
+/// directory's. A path that isn't a plain one inside it is named, with no command. `None` when
+/// rsync named nothing. Pure.
+pub fn in_the_way_fix(stderr: &str, dest: &str, day: &str) -> Option<String> {
+    let entries = crate::pull::make_way_entries(stderr);
+    if entries.is_empty() {
+        return None;
+    }
+    let root = Path::new(super::PUSH_ROOT).join(dest);
+    let word = |p: &Path| crate::ssh::shell_word(&p.display().to_string());
+    let mut cmds = Vec::new();
+    for e in entries.iter().filter(|e| crate::pull::inside(&e.path)) {
+        let parent = root.join(e.path.parent().unwrap_or(Path::new("")));
+        let hold = parent.join(format!("{}{day}", crate::pull::HOLDING_PREFIX));
+        cmds.push(format!("mkdir -p {} && mv {} {}/", word(&hold), word(&root.join(&e.path)), word(&hold)));
+    }
+    let what: Vec<String> = entries.iter().map(|e| format!("{} (a {} in the backup now)", e.path.display(), e.kind)).collect();
+    let how = if cmds.is_empty() {
+        String::new()
+    } else {
+        format!("; on the archive host (`arena archive ssh`) move it aside: {}", cmds.join(" && "))
+    };
+    Some(format!(
+        "the archive has a directory where the backup now has something else: {}{how} — every later push of this pod fails \
+         until then",
+        what.join(", ")
+    ))
 }
 
 /// A receiver's permission error creating/writing a TOP-level `snap/<x>` or `big/<x>` path: the
@@ -1403,7 +1447,8 @@ pub fn failure_hint(f: PushFailure, tier: Tier, current_gb: u32) -> String {
         PushFailure::Refused => "rrsync refused the push: a bug in arena's push arguments — please report it".into(),
         PushFailure::Stalled => "rsync's connection went silent (its I/O timeout) — the network; the next run continues".into(),
         PushFailure::Timeout => format!("ran out of its budget (ARCHIVE_{}_TIMEOUT_SECS) — the next run continues", tier.as_str().to_uppercase()),
-        PushFailure::Other => String::new(),
+        // The failure's own line says which path and the commands ([`in_the_way_fix`]).
+        PushFailure::InTheWay | PushFailure::Other => String::new(),
     }
 }
 
@@ -2152,6 +2197,12 @@ mod tests {
             (Some(23), "rsync: [receiver] mkdir \"/srv/arena/push/snap/w0d1/a/q\" \"/srv/arena/push/snap\" \"z\" failed: Permission denied (13)", false, Err(Other)),
             (None, "", true, Err(Timeout)),
             (Some(12), "rsync error: error in rsync protocol data stream (code 12)", false, Err(Other)),
+            // Review b5 #2: a directory the archive keeps where the backup now has a symlink — only
+            // as rsync's own line (start of a line) with its exit 23.
+            (Some(23), "could not make way for new symlink: devtest-apple/ARENA_3.0\nrsync error: some files/attrs were not transferred (see previous errors) (code 23)", false, Err(InTheWay)),
+            (Some(23), "could not make way for new regular file: devtest-apple/proj/.git", false, Err(InTheWay)),
+            (Some(12), "could not make way for new symlink: devtest-apple/ARENA_3.0", false, Err(Other)),
+            (Some(23), "rsync: [sender] send_files failed to open \"/b/could not make way for new symlink: x\": Permission denied (13)", false, Err(Other)),
         ];
         for (code, stderr, timed_out, want) in cases {
             let got = classify_push(code, stderr, timed_out).map(|n| n.is_some());
@@ -2159,6 +2210,62 @@ mod tests {
         }
         assert!(failure_hint(PushFailure::NoSpace, Tier::Big, 200).contains("arena archive resize --big-gb 300"));
         assert!(failure_hint(PushFailure::NoSpace, Tier::Snap, 10).contains("--snap-gb 20"));
+        assert!(counts_toward_give_up(PushFailure::InTheWay) && !archive_wide(PushFailure::InTheWay), "the pod's own failure");
+    }
+
+    /// Review b5 #2: what an [`PushFailure::InTheWay`] push says to do — each path and the exact
+    /// commands for the archive host, under rrsync's root and the push's own destination; a path
+    /// that isn't a plain one inside it is named with no command. Pure.
+    #[test]
+    fn a_directory_in_the_archives_way_is_named_with_the_commands_that_move_it_aside() {
+        let two = "could not make way for new symlink: devtest-apple/ARENA_3.0\ncould not make way for new regular file: devtest-apple/my proj/.git\n";
+        assert_eq!(
+            in_the_way_fix(two, "big/", "20261018").unwrap(),
+            "the archive has a directory where the backup now has something else: devtest-apple/ARENA_3.0 (a symlink in the backup \
+             now), devtest-apple/my proj/.git (a regular file in the backup now); on the archive host (`arena archive ssh`) move it \
+             aside: mkdir -p /srv/arena/push/big/devtest-apple/.arena-olddir-20261018 && mv /srv/arena/push/big/devtest-apple/ARENA_3.0 \
+             /srv/arena/push/big/devtest-apple/.arena-olddir-20261018/ && mkdir -p '/srv/arena/push/big/devtest-apple/my \
+             proj/.arena-olddir-20261018' && mv '/srv/arena/push/big/devtest-apple/my proj/.git' '/srv/arena/push/big/devtest-apple/my \
+             proj/.arena-olddir-20261018'/ — every later push of this pod fails until then"
+        );
+        let snap = in_the_way_fix("could not make way for new symlink: hf\n", "snap/w1d2/devtest-apple/", "20261018").unwrap();
+        assert!(snap.contains("mv /srv/arena/push/snap/w1d2/devtest-apple/hf /srv/arena/push/snap/w1d2/devtest-apple/.arena-olddir-20261018/"), "{snap}");
+        let odd = in_the_way_fix("could not make way for new symlink: ../x\n", "big/", "20261018").unwrap();
+        assert!(odd.contains(": ../x (a symlink in the backup now) — every later") && !odd.contains("mv "), "{odd}");
+        assert_eq!(in_the_way_fix("rsync error: (code 23)\n", "big/", "20261018"), None);
+    }
+
+    /// The live case end to end, through the real forced command: the archive has `ARENA_3.0` as
+    /// a directory, the backup now has a link there (and the pull's holding directory beside it).
+    /// The push fails with exit 23 and reads as [`PushFailure::InTheWay`], having sent everything
+    /// else and not the holding directory; the commands it names, run on the "archive", end it.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_the_archive_keeps_in_the_way_fails_its_push_until_moved_aside_there() {
+        let Some(rrsync) = rrsync_path() else { return };
+        let t = tmp("inway");
+        let push = t.0.join("push");
+        write(&push.join("big/devtest-apple/ARENA_3.0/chapter1/old.py"), "old\n");
+        let tr = shim_transport(&t.0, "shim", &forced(rrsync, &push, true));
+        let src = t.0.join("backup");
+        let pod = src.join("big/devtest-apple");
+        write(&pod.join(".arena-olddir-20261018/ARENA_3.0/chapter1/old.py"), "old\n");
+        write(&pod.join("volume/ARENA_3.0/chapter1/new.py"), "new\n");
+        std::os::unix::fs::symlink("volume/ARENA_3.0", pod.join("ARENA_3.0")).unwrap();
+        let job = big_job(&src, &["devtest-apple".into()]);
+        let run = || std::process::Command::new("rsync").args(push_args(&job, &tr, &settings(""))).output().unwrap();
+        let o = run();
+        let err = String::from_utf8_lossy(&o.stderr).into_owned();
+        assert_eq!(classify_push(o.status.code(), &err, false), Err(PushFailure::InTheWay), "{err}");
+        assert!(push.join("big/devtest-apple/volume/ARENA_3.0/chapter1/new.py").is_file(), "the rest went");
+        assert!(!push.join("big/devtest-apple/.arena-olddir-20261018").exists(), "the holding directory never goes");
+        let fix = in_the_way_fix(&err, &job.dest, "20261018").unwrap();
+        let cmds = fix.split("move it aside: ").nth(1).unwrap().split(" — ").next().unwrap().replace(crate::archive::PUSH_ROOT, &push.display().to_string());
+        assert!(std::process::Command::new("sh").arg("-c").arg(&cmds).status().unwrap().success(), "{cmds}");
+        let o = run();
+        assert!(classify_push(o.status.code(), &String::from_utf8_lossy(&o.stderr), false).is_ok(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert!(std::fs::symlink_metadata(push.join("big/devtest-apple/ARENA_3.0")).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(push.join("big/devtest-apple/.arena-olddir-20261018/ARENA_3.0/chapter1/old.py")).unwrap(), "old\n");
     }
 
     #[test]

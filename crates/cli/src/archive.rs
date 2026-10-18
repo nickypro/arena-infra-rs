@@ -1117,6 +1117,13 @@ async fn run_push(rsync: &str, jobs: &[PushJob], transport: &PushTransport, sett
                         (a, b) => a.or(b),
                     };
                 }
+                // A directory the archive keeps where the backup now has a symlink (review b5 #2):
+                // which one, and how to move it aside there — the one thing that ends it.
+                Err(PushFailure::InTheWay) => {
+                    let day = arena_core::pull::aside_day(arena_core::snapshot::unix_now());
+                    let fix = push::in_the_way_fix(&out.stderr, &job.dest, &day).unwrap_or_default();
+                    return Err((PushFailure::InTheWay, format!("{} — {fix}", out.exit_label())));
+                }
                 Err(f) => {
                     let line = out.stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_string();
                     return Err((f, format!("{} — {line}", out.exit_label())));
@@ -3731,6 +3738,39 @@ mod tests {
         sync_said(&w, sync_opts("big"), &stub, now + 2700).await.0.unwrap();
         assert!(state::load_big(&paths.sync_state(Tier::Big)).unwrap().pods_failing.is_empty(), "its dir is gone");
         assert_eq!((size_text(28), size_text(4), size_text(4096)), ("28 B".to_string(), "4 B".to_string(), "4.0K".to_string()));
+    }
+
+    /// Review b5 #2: once a pull moved a directory aside here, the archive (which never deletes,
+    /// and gives arena no shell) still has it where the backup now has a symlink, and every big
+    /// push of that pod fails with exit 23. That read as `Other` with rsync's last line; now the
+    /// pod's line names the path and the exact commands for the archive host — still a failure of
+    /// that pod, recorded as such.
+    #[tokio::test]
+    async fn a_directory_the_archive_keeps_in_the_way_says_how_to_move_it_aside_there() {
+        let w = world("inway");
+        seed(&w);
+        file(&w, "big/devtest-alpha/x.py");
+        let stub = rsync_stub(&w.dir);
+        let paths = w.env().paths;
+        std::fs::write(
+            w.dir.join("fail-big"),
+            "could not make way for new symlink: devtest-alpha/ARENA_3.0\n\
+             rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1338) [sender=3.2.7]\n",
+        )
+        .unwrap();
+        std::fs::write(w.dir.join("fail-big.code"), "23").unwrap();
+        let (r, said) = sync_said(&w, sync_opts("big"), &stub, day_end("w0d1") + 60).await;
+        assert!(r.is_err());
+        let hold = format!("/srv/arena/push/big/devtest-alpha/.arena-olddir-{}", arena_core::pull::aside_day(arena_core::snapshot::unix_now()));
+        let fix = format!(
+            "the archive has a directory where the backup now has something else: devtest-alpha/ARENA_3.0 (a symlink in the backup \
+             now); on the archive host (`arena archive ssh`) move it aside: mkdir -p {hold} && mv \
+             /srv/arena/push/big/devtest-alpha/ARENA_3.0 {hold}/ — every later push of this pod fails until then"
+        );
+        assert!(said.contains(&format!("✗ big devtest-alpha: InTheWay — exit 23 — {fix}")), "{said:#?}");
+        let big = state::load_big(&paths.sync_state(Tier::Big)).unwrap();
+        assert_eq!(big.last_error.as_ref().map(|e| e.class), Some(PushFailure::InTheWay));
+        assert_eq!(big.pods_failing["devtest-alpha"], format!("InTheWay: exit 23 — {fix}"));
     }
 
     /// A held lock skips only that tier (exit 0); the other tier pushes.
