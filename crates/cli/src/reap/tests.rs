@@ -1546,7 +1546,8 @@ async fn pull_two_volume_markers_and_the_per_pod_lock() {
     // Busy: another backup holds the pod's lock.
     std::fs::remove_file(w.dir.join("calls.log")).unwrap();
     let held = arena_core::pull::open_pod_lock(&dir, "devtest-alpha").unwrap();
-    assert!(arena_core::pull::try_lock(&held).unwrap());
+    // The pull above released it; a fork in another test thread can keep it a moment longer.
+    assert!(super::super::lock_settles_free(&held));
     let e = pull(super::super::LockMode::Take(Duration::from_millis(300))).await.unwrap_err().to_string();
     assert!(e.contains("devtest-alpha (busy)"), "{e}");
     assert!(w.order().is_empty(), "no rsync of a busy pod: {:?}", w.order());

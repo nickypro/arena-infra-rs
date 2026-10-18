@@ -8024,6 +8024,29 @@ fn take_would_refuse() -> Vec<String> {
     WOULD_REFUSE.with(|n| std::mem::take(&mut *n.borrow_mut()))
 }
 
+/// Under test: take `lock` (a per-pod backup lock file), retrying for up to 2 s — whether a lock
+/// this process just released is free. It can read as held for a moment after its release: a
+/// child another test thread forks meanwhile (a git, an rsync stub) holds a copy of every open
+/// file — the lock's too — until it execs (`O_CLOEXEC` closes it only then), and a flock belongs
+/// to the open file, not to the process. A lock still held after 2 s is a real one. Says on
+/// stderr when it had to wait (`--nocapture` shows it).
+#[cfg(test)]
+fn lock_settles_free(lock: &std::fs::File) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if arena_core::pull::try_lock(lock).unwrap() {
+            if !start.elapsed().is_zero() {
+                eprintln!("(lock_settles_free: free after {:?})", start.elapsed());
+            }
+            return true;
+        }
+        if start.elapsed() > Duration::from_secs(2) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// `pods lock` / `pods unlock` (`lock` says which). The selection is sorted first
 /// ([`arena_core::lock::plan`]): pods already in that state are said and left alone; pods
 /// whose backend can't lock (RUNPOD_API=v1, Vast, Hetzner) are reported one by one and make
@@ -20333,13 +20356,14 @@ mod remote_tests {
         let names: Vec<String> = f.pods.iter().map(|p| p.name.clone()).collect();
         let mut locks = crate::take_pod_locks(&d, &names, Duration::from_millis(10)).await;
         assert!(locks.holds("devtest-apple") && locks.holds("devtest-bloom"));
-        let free = |n: &str| arena_core::pull::try_lock(&arena_core::pull::open_pod_lock(&d, n).unwrap()).unwrap();
+        let held = |n: &str| !arena_core::pull::try_lock(&arena_core::pull::open_pod_lock(&d, n).unwrap()).unwrap();
+        let free = |n: &str| crate::lock_settles_free(&arena_core::pull::open_pod_lock(&d, n).unwrap());
         let (sel, c) = (everyone(&f), cfg());
         let mut unpushed = Vec::new();
         let backup = handle_backup(fake.clone(), &c, true, None, &sel, &mut locks, &mut unpushed);
         let check = async {
             tokio::time::sleep(Duration::from_secs(10)).await;
-            (free("devtest-apple"), free("devtest-bloom"))
+            (free("devtest-apple"), !held("devtest-bloom"))
         };
         let (_, (apple, bloom)) = tokio::join!(backup, check);
         assert!(apple, "apple's push ended, yet its lock was still held");
@@ -20606,7 +20630,7 @@ mod remote_tests {
         assert_eq!(probe.held(22003), [true]);
         for pod in ["devtest-apple", "devtest-bloom", "devtest-cloud"] {
             let f = arena_core::pull::open_pod_lock(&base.display().to_string(), pod).unwrap();
-            assert!(arena_core::pull::try_lock(&f).unwrap(), "{pod}'s lock still held after the run");
+            assert!(crate::lock_settles_free(&f), "{pod}'s lock still held after the run");
         }
     }
 
