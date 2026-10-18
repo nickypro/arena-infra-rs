@@ -158,6 +158,8 @@ struct Remote2 {
     scans: Mutex<Vec<(String, u64)>>,
     /// Each probe's host and the pod creation time it was handed (its last argument).
     created: Mutex<Vec<(String, String)>>,
+    /// Every git step's command, in order.
+    git_cmds: Mutex<Vec<String>>,
 }
 
 fn kind_of(cmd: &str) -> &'static str {
@@ -277,6 +279,7 @@ impl Remote2 {
                 ok(format!("{line}ARENA_JOBS_END\n"))
             }
             "git" => {
+                self.git_cmds.lock().unwrap().push(cmd.to_string());
                 sim.git_done = true;
                 sim.cpu += sim.backup_load.0;
                 sim.net += sim.backup_load.1;
@@ -558,6 +561,7 @@ exit "$(cat "$d/exit_snap" 2>/dev/null || echo 0)"
                 dir: dir.clone(),
                 scans: Mutex::new(Vec::new()),
                 created: Mutex::new(Vec::new()),
+                git_cmds: Mutex::new(Vec::new()),
             }),
             clock,
             ntp_fn: {
@@ -950,6 +954,20 @@ async fn a_directory_in_the_way_of_the_reaps_big_rsync_is_moved_aside_and_the_re
     assert!(out.contains(&format!("devtest-alpha [big]: moved ARENA_3.0 aside to {aside} (a directory here, a symlink on the pod now; nothing deleted)")), "{out}");
     let tomb = &w.state().reaped["runpod:pa"];
     assert_eq!(std::fs::read_to_string(Path::new(tomb.big_dir.as_deref().unwrap()).join(&aside).join("old.py")).unwrap(), "old work");
+}
+
+/// The reap's git step is the backup's, with the configured repo: a pod whose `origin` isn't it
+/// is refused there (nothing pushed), so it isn't reaped until `pods setup`.
+#[tokio::test]
+async fn the_reaps_git_step_never_pushes_to_a_wrong_origin() {
+    let (w, a) = due_world("wrong-origin", "ARENA_REPO_OWNER=o\nARENA_REPO_NAME=r").await;
+    w.sim(22001, |s| s.git = (5, "WRONG_ORIGIN o/r https://github.com/ARENA-education/ARENA_materials\n".into()));
+    w.step("apply").await;
+    assert!(w.terminated().is_empty());
+    assert!(!w.order().iter().any(|l| l.starts_with("rsync")), "no rsync after a refused git step");
+    assert!(w.state().pods[&core_reap::key("runpod", &a.id)].retry_after.is_some());
+    let cmds = w.remote.git_cmds.lock().unwrap().clone();
+    assert!(!cmds.is_empty() && cmds.iter().all(|c| c.ends_with(" 'o/r'")), "{cmds:#?}");
 }
 
 /// Scenario 7 (I7): Vast's listing fails while RunPod's works — only RunPod is considered;

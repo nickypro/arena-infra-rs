@@ -5091,6 +5091,8 @@ async fn handle_backup(
     });
     let key = cfg.get("GIT_SSH_KEY_REMOTE").map(String::from);
     let msg_for = |name: &str| message.clone().unwrap_or_else(|| format!("arena backup {name}"));
+    // The repo every pod's `origin` must be (else WRONG_ORIGIN: nothing committed or pushed).
+    let origin = backup::configured_repo(cfg);
 
     // Back up only pods that actually have an SSH endpoint; report the rest.
     let targets = sel.named_targets(cfg)?;
@@ -5100,9 +5102,10 @@ async fn handle_backup(
     }
 
     if !apply {
+        let checked = origin.as_deref().map_or_else(String::new, |o| format!("; a pod whose origin isn't {o} is refused"));
         println!(
             "Dry-run — would commit + push the current branch on {} pod(s) (skips main/master; files over {} MB \
-             and nested repos with their own history stay out of git), running the backup script below on each:\n",
+             and nested repos with their own history stay out of git{checked}), running the backup script below on each:\n",
             targets.len(),
             backup::GIT_MAX_FILE_BYTES / (1024 * 1024)
         );
@@ -5110,7 +5113,7 @@ async fn handle_backup(
         // writes the file each pod's line reads (so both paste); the arguments are exact.
         for (name, target) in &targets {
             println!("# {name}");
-            println!("{}\n", backup::backup_dry_run_line(target, &repo_path, key.as_deref(), &msg_for(name)));
+            println!("{}\n", backup::backup_dry_run_line(target, &repo_path, key.as_deref(), &msg_for(name), origin.as_deref()));
         }
         println!(
             "# The backup script, run under sh on each pod — paste this first: it writes ./{}, which the lines above read\n{}",
@@ -5136,7 +5139,7 @@ async fn handle_backup(
     let jobs = targets
         .into_iter()
         .map(|(name, target)| {
-            let cmd = backup::backup_command(&repo_path, key.as_deref(), &msg_for(&name));
+            let cmd = backup::backup_command(&repo_path, key.as_deref(), &msg_for(&name), origin.as_deref());
             (name, target, cmd)
         })
         .collect();
@@ -5231,7 +5234,10 @@ async fn handle_full_backup(
         return both_failures(git_result, pulled.and_then(Pulled::result), &locks.busy);
     }
     if no_pull && dry_run {
-        println!("(a pod whose git push fails at the push itself is then copied into {dir} by rsync — even under --no-pull)");
+        println!(
+            "(a pod whose git push fails at the push itself, or whose origin isn't the configured repo, is then copied into \
+             {dir} by rsync — even under --no-pull)"
+        );
     }
     let pulled = copy_unpushed(&remote, cfg, &dir, &sel, &unpushed, rsync, LockMode::Take(POD_LOCK_WAIT)).await;
     print_fallback_copies(&unpushed, &pulled);
@@ -5243,9 +5249,10 @@ async fn handle_full_backup(
 /// hours but their local commits. So the pods in `unpushed` that failed at the push itself — a
 /// key GitHub refuses, a big file, the network: the work is there, not on GitHub — are rsynced
 /// into `dir` with the pull's own machinery (both tiers), in the same run, under each pod's lock
-/// (`locking`: taken here, or already the caller's). A pod that never got that far (no repo, ssh
-/// refused, a timeout) isn't: it fails the same way every run, and its plain failure line says
-/// so. Nothing to copy: `Ok` and empty.
+/// (`locking`: taken here, or already the caller's). So are the pods whose `origin` isn't the
+/// configured repo, whose work reaches no git remote at all ([`Unpushed::copied_instead`]). A pod
+/// that never got that far (no repo, ssh refused, a timeout) isn't: it fails the same way every
+/// run, and its plain failure line says so. Nothing to copy: `Ok` and empty.
 async fn copy_unpushed(
     remote: &Arc<dyn Remote>,
     cfg: &Config,
@@ -5256,12 +5263,12 @@ async fn copy_unpushed(
     locking: LockMode,
 ) -> Result<Pulled> {
     let pods: Vec<arena_core::Pod> =
-        sel.pods.iter().filter(|p| unpushed.iter().any(|u| u.at_push && u.pod == p.name)).cloned().collect();
+        sel.pods.iter().filter(|p| unpushed.iter().any(|u| u.copied_instead() && u.pod == p.name)).cloned().collect();
     if pods.is_empty() {
         return Ok(Pulled::default());
     }
     println!(
-        "\nCopying the {} pod(s) whose git push failed into {dir} instead (rsync, both tiers): {}",
+        "\nCopying the {} pod(s) git didn't back up into {dir} instead (rsync, both tiers): {}",
         pods.len(),
         pods.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ")
     );
@@ -5278,18 +5285,20 @@ fn copy_outcome(pulled: &Result<Pulled>, pod: &str) -> std::result::Result<Strin
     }
 }
 
-/// One line per pod whose git push failed: why, and where its files went instead — or that the
-/// copy failed too, and why (both failures, on the pod's own line).
+/// One line per pod copied instead of its git backup ([`Unpushed::copied_instead`]): why, and
+/// where its files went instead — or that the copy failed too, and why (both failures, on the
+/// pod's own line).
 fn fallback_lines(unpushed: &[Unpushed], pulled: &Result<Pulled>) -> Vec<String> {
     unpushed
         .iter()
-        .filter(|u| u.at_push)
+        .filter(|u| u.copied_instead())
         .map(|u| {
             let copy = match copy_outcome(pulled, &u.pod) {
                 Ok(to) => format!(" → files copied to {to}"),
                 Err(why) => format!("; the fallback copy failed too: {why}"),
             };
-            format!("✗ {}: git push failed ({}){copy}", u.pod, u.why)
+            let failed = if u.wrong_origin { "not backed up to git" } else { "git push failed" };
+            format!("✗ {}: {failed} ({}){copy}", u.pod, u.why)
         })
         .collect()
 }
@@ -5333,15 +5342,29 @@ struct BackupTally {
 }
 
 /// A pod whose git backup failed this run: why (a few words), the branch it left unpushed (when
-/// the backup got far enough to say), and whether it failed at the push itself
-/// ([`arena_core::backup::BackupReport::failed_at_push`]) — the only failures copied by rsync
-/// instead: a pod with no repo, or ssh refused, fails the same way every run and isn't.
+/// the backup got far enough to say), whether it failed at the push itself
+/// ([`arena_core::backup::BackupReport::failed_at_push`]), and whether its `origin` isn't the
+/// configured repo (`WRONG_ORIGIN`: nothing was committed or pushed). Those two are the failures
+/// `pods backup` copies by rsync instead ([`copy_unpushed`]). A pod with no repo, or ssh refused,
+/// fails the same way every run and isn't.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Unpushed {
     pod: String,
     why: String,
     branch: Option<String>,
     at_push: bool,
+    wrong_origin: bool,
+}
+
+impl Unpushed {
+    /// Whether `pods backup` copies this pod by rsync instead of its git backup. A failure at the
+    /// push, as before. A wrong `origin` too: its work reaches no git remote at all, and fails the
+    /// same way every run until `pods setup`, so without a copy it would have none anywhere but
+    /// on the pod (the */15 cron runs `--no-pull`). It is a cohort pod the backup reached, its
+    /// repo there: unlike a pod with no repo or no ssh, the copy can work.
+    fn copied_instead(&self) -> bool {
+        self.at_push || self.wrong_origin
+    }
 }
 
 /// Why a pod's call failed, in a few words: its exit and the last line it wrote to stderr, or
@@ -5455,13 +5478,14 @@ async fn backup_fleet(
             Ok(out) if report.failure(repo, name, out.code).is_some() => {
                 t.failed += 1;
                 let why = report.failure_brief(out.code).unwrap_or_else(|| failure_why(&call));
-                t.unpushed.push(Unpushed { pod: name.clone(), why, branch: report.branch.clone(), at_push: report.failed_at_push() });
+                let wrong_origin = report.wrong_origin_why(out.code).is_some();
+                t.unpushed.push(Unpushed { pod: name.clone(), why, branch: report.branch.clone(), at_push: report.failed_at_push(), wrong_origin });
                 format!("[{done}/{total}] ✗ {name}: {}", report.failure(repo, name, out.code).unwrap_or_default())
             }
             _ => {
                 t.failed += 1;
                 let at_push = report.failed_at_push();
-                t.unpushed.push(Unpushed { pod: name.clone(), why: failure_why(&call), branch: report.branch.clone(), at_push });
+                t.unpushed.push(Unpushed { pod: name.clone(), why: failure_why(&call), branch: report.branch.clone(), at_push, wrong_origin: false });
                 failure_line(done, total, name, &call)
             }
         };
@@ -7940,10 +7964,11 @@ async fn handle_set_branch(
 
 /// What a dry run of a branch switch says first: the push that comes before it.
 fn push_first_note(cfg: &Config) -> String {
+    let origin = arena_core::backup::configured_repo(cfg).map_or_else(String::new, |o| format!(", nor one whose origin isn't {o}"));
     format!(
         "(first, each pod's current branch is backed up — the `pods backup --no-pull` commit + push, keys redacted — under \
          the pod's backup lock, held until its switch ends; a pod whose push fails is copied into {} and then switched, its \
-         line saying so; a pod that can be neither pushed nor copied, or whose lock another backup holds, is NOT switched)",
+         line saying so; a pod that can be neither pushed nor copied, or whose lock another backup holds, is NOT switched{origin})",
         local_backup_dir(cfg)
     )
 }
@@ -8043,17 +8068,23 @@ async fn switch_guarded(
         "Backing up the branch each pod is on before the switch (commit + push; main/master skipped; {}s budget each)…",
         BACKUP_TIMEOUT.as_secs()
     );
+    // A pod whose `origin` isn't the configured repo is refused by its backup (nothing pushed),
+    // so it is never switched: `init-branches` would push its new branch to that origin, and
+    // `set-branch` would fetch (and `--hard` reset to) that repo's branch.
+    let origin = arena_core::backup::configured_repo(cfg);
     let jobs = targets
         .iter()
-        .map(|(n, t)| (n.clone(), t.clone(), arena_core::backup::backup_command(&repo, key, &format!("arena backup {n}"))))
+        .map(|(n, t)| (n.clone(), t.clone(), arena_core::backup::backup_command(&repo, key, &format!("arena backup {n}"), origin.as_deref())))
         .collect();
     // Each pod's lock stays held through its push: it goes as that pod's switch ends.
     let t = backup_fleet(remote, jobs, &repo, |l| println!("{l}"), |_| {}).await;
     let pushed: Vec<(String, SshTarget)> = targets.iter().filter(|(n, _)| !t.unpushed.iter().any(|u| &u.pod == n)).cloned().collect();
     let none = std::collections::HashMap::new();
     switch_batch(remote, pushed, &cmd_for, budget, doing, &none, &mut ok_line, &mut locks, &mut run).await;
-    // The rest: copied first, under the lock each still holds — or not switched at all.
-    let pulled = copy_unpushed(remote, cfg, &dir, sel, &t.unpushed, rsync, LockMode::Held).await;
+    // The rest: copied first, under the lock each still holds — or not switched at all. A pod
+    // with the wrong origin is neither copied nor switched: nothing on it changes here.
+    let at_push: Vec<Unpushed> = t.unpushed.iter().filter(|u| u.at_push).cloned().collect();
+    let pulled = copy_unpushed(remote, cfg, &dir, sel, &at_push, rsync, LockMode::Held).await;
     let mut notes = std::collections::HashMap::new();
     for u in &t.unpushed {
         let copied = if u.at_push {
@@ -8067,8 +8098,12 @@ async fn switch_guarded(
                 run.copied.push(u.pod.clone());
             }
             Err(also) => {
-                let why = format!("its branch couldn't be pushed ({}) and {also}", u.why);
-                println!("✗ {} not switched: {why}", u.pod);
+                let why = if u.wrong_origin {
+                    format!("{} — not backed up to git; run `arena pods setup {}`", u.why, u.pod)
+                } else {
+                    format!("its branch couldn't be pushed ({}) and {also}", u.why)
+                };
+                say(&format!("✗ {} not switched: {why}", u.pod));
                 run.not_switched.push((u.pod.clone(), why));
                 locks.done(&u.pod);
             }
@@ -20584,7 +20619,7 @@ mod remote_tests {
         let start = Instant::now();
         let tally = backup_fleet(&remote, jobs, REPO, |l| lines.push(l.to_string()), |_| {}).await;
         let on_main = vec![("devtest-delta".to_string(), "main".to_string())];
-        let failed = |pod: &str, why: &str| Unpushed { pod: pod.into(), why: why.into(), branch: None, at_push: false };
+        let failed = |pod: &str, why: &str| Unpushed { pod: pod.into(), why: why.into(), branch: None, at_push: false, wrong_origin: false };
         assert_eq!(
             tally,
             BackupTally {
@@ -20623,7 +20658,7 @@ mod remote_tests {
             .unwrap_err();
         assert_eq!(err.to_string(), "1 pod(s) failed to back up");
         for (name, port) in [("apple", 22001), ("bloom", 22002), ("cloud", 22003)] {
-            let want = backup_command(REPO, Some(KEY), &format!("arena backup devtest-{name}"));
+            let want = backup_command(REPO, Some(KEY), &format!("arena backup devtest-{name}"), None);
             assert_eq!(execs(&fake, port), [(want, Some(BACKUP_TIMEOUT))]);
         }
         // Dry run: nothing reaches a pod.
@@ -20756,13 +20791,13 @@ mod remote_tests {
     /// or why the copy failed too.
     #[test]
     fn each_failed_push_says_where_its_files_went_or_why_they_didnt() {
-        let u = |pod: &str, why: &str| Unpushed { pod: pod.into(), why: why.into(), branch: Some("autocommit-x".into()), at_push: true };
+        let u = |pod: &str, why: &str| Unpushed { pod: pod.into(), why: why.into(), branch: Some("autocommit-x".into()), at_push: true, wrong_origin: false };
         let mut unpushed = vec![
             u("devtest-bloom", "GitHub push protection: OpenRouter API Key at ex.py:3"),
             u("devtest-cloud", "exit 128: fatal: Could not read from remote repository."),
         ];
         // One that failed before its push: its own failure line is all it gets.
-        unpushed.push(Unpushed { pod: "devtest-delta".into(), why: "exit 2: no repo".into(), branch: None, at_push: false });
+        unpushed.push(Unpushed { pod: "devtest-delta".into(), why: "exit 2: no repo".into(), branch: None, at_push: false, wrong_origin: false });
         let pulled: anyhow::Result<Pulled> = Ok(Pulled {
             failures: vec!["devtest-cloud [big]".into()],
             failed: vec![("devtest-cloud".into(), "[big] rsync exit 12".into())],
@@ -20786,6 +20821,123 @@ mod remote_tests {
         );
         assert!(fallback_lines(&[], &pulled).is_empty());
         assert!(fallback_lines(&unpushed[2..], &pulled).is_empty(), "never copied: never said to be");
+    }
+
+    /// [`backup_cfg`] with a configured repo, `o/r`: every backup checks each pod's `origin`.
+    fn origin_cfg(base: &std::path::Path) -> Config {
+        std::fs::create_dir_all(base).unwrap();
+        Config::parse(&format!(
+            "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple bloom cloud)\nBACKUP_REPO_PATH={REPO}\n\
+             GIT_SSH_KEY_REMOTE={KEY}\nSHARED_SSH_KEY_PATH=/nonexistent/devtest_key\nARENA_START_DATE=2026-01-05\n\
+             LOCAL_BACKUP_DIR={}\nARENA_REPO_OWNER=o\nARENA_REPO_NAME=r\n",
+            base.display()
+        ))
+    }
+
+    /// A backup the pod refused (exit 5): its `origin` is the upstream course repo, not `o/r`.
+    fn wrong_origin() -> FakeReply {
+        FakeReply::exit(5, "").with_stdout("WRONG_ORIGIN o/r https://github.com/ARENA-education/ARENA_materials\n")
+    }
+
+    const WRONG_WHY: &str = "origin is https://github.com/ARENA-education/ARENA_materials, not the configured o/r";
+
+    /// Live (2026-10-17): a pod nobody set up had the upstream course repo as `origin`, and was
+    /// never backed up to git, silently. Now every backup carries the configured repo, a pod whose
+    /// origin isn't it fails on a line that says whose repo it has and what fixes it, and the run
+    /// fails. Under `--no-pull` (the */15 cron) it is copied by rsync in the same run: its work
+    /// reaches no git remote at all.
+    #[tokio::test]
+    async fn a_pod_whose_origin_isnt_the_configured_repo_fails_says_how_to_fix_it_and_is_copied() {
+        let f = fleet_of(&[("apple", 22001), ("bloom", 22002)]);
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [FakeReply::stdout("BRANCH autocommit-a\nPUSHED autocommit-a\n")]);
+        fake.script(&host(22002), [wrong_origin()]);
+        let remote: Arc<dyn Remote> = fake.clone();
+        let jobs = targets(&f).into_iter().map(|(n, t)| (n, t, "backup".to_string())).collect();
+        let mut lines = Vec::new();
+        let tally = backup_fleet(&remote, jobs, REPO, |l| lines.push(l.to_string()), |_| {}).await;
+        assert_eq!((tally.pushed, tally.failed), (1, 1));
+        let bloom = Unpushed { pod: "devtest-bloom".into(), why: WRONG_WHY.into(), branch: None, at_push: false, wrong_origin: true };
+        assert_eq!(tally.unpushed, std::slice::from_ref(&bloom));
+        let mut got = unnumbered(&lines);
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                "✓ devtest-apple -> autocommit-a".to_string(),
+                format!("✗ devtest-bloom: {WRONG_WHY} — not backed up to git; run `arena pods setup devtest-bloom`"),
+            ]
+        );
+
+        // `pods backup --no-pull`: every pod's backup checks `o/r`; bloom fails the run and is copied.
+        let stub = StubRsync::new("wrong-origin");
+        let cfg = origin_cfg(&stub.0.join("backups"));
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [FakeReply::stdout("BRANCH autocommit-a\nPUSHED autocommit-a\n")]);
+        fake.script(&host(22002), [wrong_origin(), repo_in_place()]);
+        fake.script(&host(22003), [FakeReply::stdout("SKIP main\n")]);
+        let err = handle_full_backup(fake.clone(), &cfg, &everyone(&fleet()), true, None, false, true, &stub.path()).await.unwrap_err();
+        assert_eq!(err.to_string(), "1 pod(s) failed to back up");
+        for (name, port) in [("apple", 22001), ("bloom", 22002), ("cloud", 22003)] {
+            let want = backup_command(REPO, Some(KEY), &format!("arena backup devtest-{name}"), Some("o/r"));
+            assert_eq!(execs(&fake, port)[0], (want, Some(BACKUP_TIMEOUT)), "{name}");
+        }
+        assert_eq!(execs(&fake, 22002)[1], (arena_core::volume::probe_command(REPO), Some(PROBE_TIMEOUT)), "bloom's copy");
+        let copied = stub.take();
+        assert!(copied.len() == 3 && copied.iter().all(|d| d.ends_with("/devtest-bloom")), "only bloom, both tiers: {copied:?}");
+        // Its line once copied.
+        let pulled: anyhow::Result<Pulled> =
+            Ok(Pulled { failures: vec![], failed: vec![], snapshot_root: "/b/w41d5".into(), big_root: Some("/b/big".into()) });
+        assert_eq!(
+            fallback_lines(&[bloom], &pulled),
+            [format!("✗ devtest-bloom: not backed up to git ({WRONG_WHY}) → files copied to /b/w41d5/devtest-bloom (and /b/big/devtest-bloom)")]
+        );
+        // No configured repo: no check asked for (an empty last argument).
+        assert!(backup_command(REPO, Some(KEY), "m", None).ends_with(&format!("'{KEY}' ''")));
+    }
+
+    /// `init-branches` would push a participant's new branch to whatever `origin` is, and
+    /// `set-branch` would fetch (and with `--hard` reset to) that repo's branch. A pod whose
+    /// origin isn't the configured repo is refused by its push-first backup, so neither switches
+    /// it: no copy, no switch, no init, said on its line with the fix. The others go ahead.
+    #[tokio::test]
+    async fn set_branch_and_init_branches_never_switch_a_pod_whose_origin_isnt_the_configured_repo() {
+        let stub = StubRsync::new("wrong-origin-switch");
+        let cfg = origin_cfg(&stub.0.join("backups"));
+        let backup = |name: &str| (backup_command(REPO, Some(KEY), &format!("arena backup devtest-{name}"), Some("o/r")), Some(BACKUP_TIMEOUT));
+        let refused = format!("✗ devtest-bloom not switched: {WRONG_WHY} — not backed up to git; run `arena pods setup devtest-bloom`");
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [FakeReply::stdout("BRANCH autocommit-a\nPUSHED autocommit-a\n"), FakeReply::ok()]);
+        fake.script(&host(22002), [wrong_origin()]);
+        fake.script(&host(22003), [FakeReply::stdout("SKIP main\n"), FakeReply::ok()]);
+        let _ = crate::take_said();
+        let err = handle_set_branch(fake.clone(), &cfg, "main", &everyone(&fleet()), true, false, true, &stub.path()).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "1 pod(s) NOT switched — their branch could be neither pushed nor copied first (see each one's line): devtest-bloom"
+        );
+        assert!(crate::take_said().contains(&refused), "{refused}");
+        assert_eq!(execs(&fake, 22002), [backup("bloom")], "bloom: refused, never copied or switched");
+        let hard = checkout_command(REPO, "main", Some(KEY), true);
+        for (name, port) in [("apple", 22001), ("cloud", 22003)] {
+            assert_eq!(execs(&fake, port), [backup(name), (hard.clone(), Some(BRANCH_TIMEOUT))], "{name}");
+        }
+        assert!(stub.take().is_empty(), "nothing copied");
+
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [FakeReply::stdout("SKIP main\n"), FakeReply::ok()]);
+        fake.script(&host(22002), [wrong_origin()]);
+        fake.script(&host(22003), [FakeReply::stdout("SKIP main\n"), FakeReply::ok()]);
+        let err = handle_init_branches(fake.clone(), &cfg, Some(1), Some(2), &everyone(&fleet()), false, true, &stub.path()).await.unwrap_err();
+        assert!(err.to_string().contains("NOT switched") && err.to_string().ends_with(": devtest-bloom"), "{err}");
+        assert!(crate::take_said().contains(&refused));
+        assert_eq!(execs(&fake, 22002), [backup("bloom")], "bloom never gets the init command");
+        let bcfg = BackupConfig::from_config(&cfg, 1, 2);
+        for (name, port) in [("apple", 22001), ("cloud", 22003)] {
+            let init = init_branch_command(&bcfg, &format!("devtest-{name}"));
+            assert!(init.contains("origin_check 'o/r'"), "the init command checks too");
+            assert_eq!(execs(&fake, port), [backup(name), (init, Some(BRANCH_TIMEOUT))], "{name}");
+        }
     }
 
     /// A stand-in `rsync` that runs the real one with the pull's own argv, the pod's side
@@ -20933,7 +21085,7 @@ mod remote_tests {
         let err = handle_set_branch(fake.clone(), &cfg, "main", &everyone(&fleet()), true, false, true, &stub.path()).await.unwrap_err();
         assert_eq!(err.to_string(), "1 pod(s) switched with their branch copied, not pushed (see each one's line): devtest-bloom");
         let hard = checkout_command(REPO, "main", Some(KEY), true);
-        let backup = |name: &str| (backup_command(REPO, Some(KEY), &format!("arena backup devtest-{name}")), Some(BACKUP_TIMEOUT));
+        let backup = |name: &str| (backup_command(REPO, Some(KEY), &format!("arena backup devtest-{name}"), None), Some(BACKUP_TIMEOUT));
         // bloom: its backup, the copy (asked where its repo is), then the switch — in that order.
         assert_eq!(
             execs(&fake, 22002),
@@ -20952,6 +21104,7 @@ mod remote_tests {
             why: "GitHub push protection: OpenRouter API Key at ex.py:3".into(),
             branch: Some("autocommit-devtest-w1d1-bloom".into()),
             at_push: true,
+            wrong_origin: false,
         };
         let to = "/b/w1d1/devtest-bloom (and /b/big/devtest-bloom)";
         assert_eq!(
@@ -21042,7 +21195,7 @@ mod remote_tests {
         assert!(msg.starts_with("2 pod(s) NOT switched — their branch could be neither pushed nor copied first"), "{msg}");
         assert!(msg.contains("devtest-bloom") && msg.contains("devtest-cloud") && !msg.contains("devtest-apple"), "{msg}");
         let hard = checkout_command(REPO, "main", Some(KEY), true);
-        let backup = |name: &str| (backup_command(REPO, Some(KEY), &format!("arena backup devtest-{name}")), Some(BACKUP_TIMEOUT));
+        let backup = |name: &str| (backup_command(REPO, Some(KEY), &format!("arena backup devtest-{name}"), None), Some(BACKUP_TIMEOUT));
         assert_eq!(execs(&fake, 22001), [backup("apple"), (hard.clone(), Some(BRANCH_TIMEOUT))]);
         // bloom: backed up, its copy tried (and failed) — never switched.
         assert_eq!(execs(&fake, 22002), [backup("bloom"), (arena_core::volume::probe_command(REPO), Some(PROBE_TIMEOUT))]);
@@ -21078,7 +21231,7 @@ mod remote_tests {
         assert!(fake.calls_to(&host(22002)).is_empty(), "bloom touched: {:?}", fake.calls_to(&host(22002)));
         let hard = checkout_command(REPO, "main", Some(KEY), true);
         for (name, port) in [("apple", 22001), ("cloud", 22003)] {
-            let backup = backup_command(REPO, Some(KEY), &format!("arena backup devtest-{name}"));
+            let backup = backup_command(REPO, Some(KEY), &format!("arena backup devtest-{name}"), None);
             assert_eq!(execs(&fake, port), [(backup, Some(BACKUP_TIMEOUT)), (hard.clone(), Some(BRANCH_TIMEOUT))], "{name}");
         }
         drop(held);
@@ -21096,7 +21249,7 @@ mod remote_tests {
         handle_set_branch(fake.clone(), &cfg(), "main", &everyone(&fleet()), false, false, true, "rsync").await.unwrap();
         let gentle = checkout_command(REPO, "main", Some(KEY), false);
         for (name, port) in [("apple", 22001), ("bloom", 22002), ("cloud", 22003)] {
-            let backup = backup_command(REPO, Some(KEY), &format!("arena backup devtest-{name}"));
+            let backup = backup_command(REPO, Some(KEY), &format!("arena backup devtest-{name}"), None);
             assert_eq!(execs(&fake, port), [(backup, Some(BACKUP_TIMEOUT)), (gentle.clone(), Some(BRANCH_TIMEOUT))], "port {port}");
         }
 
@@ -21131,7 +21284,7 @@ mod remote_tests {
             let want = init_branch_command(&bcfg, &format!("devtest-{name}"));
             assert!(want.contains(&format!("autocommit-devtest-w1d2-{name}")));
             // The branch it's on pushed first (a no-op on main), then the new day's branch.
-            let backup = backup_command(REPO, Some(KEY), &format!("arena backup devtest-{name}"));
+            let backup = backup_command(REPO, Some(KEY), &format!("arena backup devtest-{name}"), None);
             assert_eq!(execs(&fake, port), [(backup, Some(BACKUP_TIMEOUT)), (want, Some(BRANCH_TIMEOUT))]);
         }
         let fake = Arc::new(FakeRemote::new());

@@ -1845,7 +1845,11 @@ async fn run_set_branch(remote: &dyn Remote, cfg: &Config, pod: &Pod, branch: &s
         Ok(t) => t,
         Err(e) => return format!("✗ {}: {e}", pod.name),
     };
-    let backed = run_backup(remote, cfg, pod).await;
+    let (backed, wrong_origin) = backup_and_report(remote, cfg, pod).await;
+    // A pod whose `origin` isn't the configured repo: the CLI doesn't switch it either.
+    if let Some(why) = wrong_origin {
+        return format!("✗ {} not switched to {branch}: {why}", pod.name);
+    }
     if backed.starts_with('✗') || backed.contains(" — busy:") {
         return format!(
             "✗ {} not switched to {branch}: the branch it's on wasn't pushed first ({backed}) — `arena pods set-branch {branch} {}` \
@@ -1866,13 +1870,19 @@ async fn run_set_branch(remote: &dyn Remote, cfg: &Config, pod: &Pod, branch: &s
 }
 
 /// Commit + push the pod's ARENA tree over SSH **on its current branch** (mirrors
-/// `arena backup` for a single pod): never switches/creates a branch, skips main/master.
-/// Within [`BACKUP_TIMEOUT`].
+/// `arena backup` for a single pod): never switches/creates a branch, skips main/master, and
+/// refuses a pod whose `origin` isn't the configured repo. Within [`BACKUP_TIMEOUT`].
 async fn run_backup(remote: &dyn Remote, cfg: &Config, pod: &Pod) -> String {
+    backup_and_report(remote, cfg, pod).await.0
+}
+
+/// [`run_backup`]'s line, and, when the pod's `origin` isn't the configured repo, the refusal in
+/// its own words (`origin is …, not the configured … — not backed up to git; run …`).
+async fn backup_and_report(remote: &dyn Remote, cfg: &Config, pod: &Pod) -> (String, Option<String>) {
     use arena_core::backup::{self, parse_backup_report};
     let target = match SshTarget::from_pod(pod, cfg) {
         Ok(t) => t,
-        Err(e) => return format!("✗ {}: {e}", pod.name),
+        Err(e) => return (format!("✗ {}: {e}", pod.name), None),
     };
     // The pod's backup lock, like every other writer of its backup (RR10): never alongside a
     // pull, the cron's push or the reaper's own backup of it (whose git step would then fail
@@ -1880,27 +1890,34 @@ async fn run_backup(remote: &dyn Remote, cfg: &Config, pod: &Pod) -> String {
     let dir = cfg.get("LOCAL_BACKUP_DIR").map(str::trim).filter(|d| !d.is_empty()).unwrap_or("./backup");
     let _lock = match arena_core::pull::try_pod_lock_now(dir, &pod.name) {
         Ok(lock) => lock,
-        Err(()) => return format!("⊘ {} — busy: another backup of it (a pull, the cron or the reaper) is running; try again shortly", pod.name),
+        Err(()) => return (format!("⊘ {} — busy: another backup of it (a pull, the cron or the reaper) is running; try again shortly", pod.name), None),
     };
     let repo = backup_repo_path(cfg);
-    let cmd = backup::backup_command(&repo, cfg.get("GIT_SSH_KEY_REMOTE"), &format!("arena-tui backup {}", pod.name));
+    let origin = backup::configured_repo(cfg);
+    let cmd = backup::backup_command(&repo, cfg.get("GIT_SSH_KEY_REMOTE"), &format!("arena-tui backup {}", pod.name), origin.as_deref());
     match remote.exec(&target, &cmd, Some(BACKUP_TIMEOUT)).await {
         Ok(out) if out.success => {
             let report = parse_backup_report(&out.stdout);
             let notes = report.notes();
             let also = if notes.is_empty() { String::new() } else { format!(" — {}", notes.join("; ")) };
-            match &report.outcome {
+            let line = match &report.outcome {
                 Some((backup::BACKUP_PUSHED, branch)) => format!("✓ backed up {} → {branch}{also}", pod.name),
                 Some((backup::BACKUP_NO_CHANGES, branch)) => format!("✓ {} — no changes (on {branch}){also}", pod.name),
                 Some((backup::BACKUP_SKIPPED, branch)) => format!("⊘ {} — skipped (on protected branch {branch})", pod.name),
                 _ => format!("✓ backed up {}{also}", pod.name),
-            }
+            };
+            (line, None)
         }
-        Ok(out) => match parse_backup_report(&out.stdout).failure(&repo, &pod.name, out.code) {
-            Some(fix) => format!("✗ backup {}: {fix}", pod.name),
-            None => format!("✗ backup {} ({}): {}", pod.name, out.exit_label(), out.stderr.trim()),
-        },
-        Err(e) => format!("✗ backup {} failed: {}", pod.name, describe_error(&e)),
+        Ok(out) => {
+            let report = parse_backup_report(&out.stdout);
+            let fix = report.failure(&repo, &pod.name, out.code);
+            let line = match &fix {
+                Some(fix) => format!("✗ backup {}: {fix}", pod.name),
+                None => format!("✗ backup {} ({}): {}", pod.name, out.exit_label(), out.stderr.trim()),
+            };
+            (line, fix.filter(|_| report.wrong_origin_why(out.code).is_some()))
+        }
+        Err(e) => (format!("✗ backup {} failed: {}", pod.name, describe_error(&e)), None),
     }
 }
 
@@ -1956,7 +1973,8 @@ fn build_preview(cfg: &Config, action: Action, pod: &Pod) -> Option<String> {
                 // The script's arguments, not its ~170 lines (`arena pods backup --dry-run` prints it,
                 // as the here-doc that writes the file this line reads).
                 let msg = format!("arena-tui backup {}", pod.name);
-                arena_core::backup::backup_dry_run_line(t, &backup_repo_path(cfg), cfg.get("GIT_SSH_KEY_REMOTE"), &msg)
+                let origin = arena_core::backup::configured_repo(cfg);
+                arena_core::backup::backup_dry_run_line(t, &backup_repo_path(cfg), cfg.get("GIT_SSH_KEY_REMOTE"), &msg, origin.as_deref())
             }
             Err(e) => format!("⚠ {e}"),
         }),
@@ -4498,6 +4516,10 @@ deep_check_end=1
     #[tokio::test(start_paused = true)]
     async fn actions_go_through_remote_with_their_budgets() {
         let host = "10.0.0.1:22001";
+        let wrong_origin = || {
+            FakeReply::exit(5, "")
+                .with_stdout("WRONG_ORIGIN nickypro/arena-sandbox-materials https://github.com/ARENA-education/ARENA_materials\n")
+        };
         let cfg = cfg("ARENA_REPO_OWNER=nickypro\nARENA_REPO_NAME=arena-sandbox-materials\nGIT_SSH_KEY_LOCAL=/nonexistent/deploy_key\n");
         let alpha = pod("alpha", "runpod", "rp1", 1, Some(22001));
         let budgets = |fake: &FakeRemote| -> Vec<Option<Duration>> {
@@ -4524,6 +4546,22 @@ deep_check_end=1
                 vec![FakeReply::exit(4, "remote: error: GH013"), FakeReply::ok()],
                 "✗ devtest-alpha not switched to w1d2: the branch it's on wasn't pushed first (✗ backup devtest-alpha (exit 4): \
                  remote: error: GH013) — `arena pods set-branch w1d2 devtest-alpha` copies its files, then switches",
+                vec![BACKUP_TIMEOUT],
+            ),
+            // A pod whose origin isn't the configured repo: refused by the backup (exit 5), said with
+            // the fix — and not switched, the CLI wouldn't either.
+            (
+                "backup",
+                vec![wrong_origin()],
+                "✗ backup devtest-alpha: origin is https://github.com/ARENA-education/ARENA_materials, not the configured \
+                 nickypro/arena-sandbox-materials — not backed up to git; run `arena pods setup devtest-alpha`",
+                vec![BACKUP_TIMEOUT],
+            ),
+            (
+                "set-branch",
+                vec![wrong_origin(), FakeReply::ok()],
+                "✗ devtest-alpha not switched to w1d2: origin is https://github.com/ARENA-education/ARENA_materials, not the \
+                 configured nickypro/arena-sandbox-materials — not backed up to git; run `arena pods setup devtest-alpha`",
                 vec![BACKUP_TIMEOUT],
             ),
             ("setup", vec![FakeReply::ok(), FakeReply::ok(), FakeReply::ok()], "✓ set up devtest-alpha", vec![setup.copy, setup.relocate, setup.config]),
@@ -4565,6 +4603,11 @@ deep_check_end=1
             assert_eq!(line, want, "{what}");
             assert_eq!(budgets(&fake), budget.into_iter().map(Some).collect::<Vec<_>>(), "{what}");
         }
+        // The backup it runs carries the configured repo for that check.
+        let fake = FakeRemote::new();
+        run_backup(&fake, &cfg, &alpha).await;
+        let sent: Vec<String> = fake.calls().into_iter().filter_map(|c| match c { RemoteCall::Exec { cmd, .. } => Some(cmd), _ => None }).collect();
+        assert!(sent.len() == 1 && sent[0].ends_with(" 'nickypro/arena-sandbox-materials'"), "{sent:?}");
         // No endpoint: said, and nothing is attempted.
         let fake = FakeRemote::new();
         let charlie = pod("charlie", "runpod", "rp3", 3, None);

@@ -1,9 +1,12 @@
 # arena backup: commit + push one pod's ARENA checkout on the branch it is on.
 #
-#   sh -c "$THIS_SCRIPT" arena-backup <repo> <commit message> <max file bytes> <push limit bytes> [<git ssh key>]
+#   sh -c "$THIS_SCRIPT" arena-backup <repo> <commit message> <max file bytes> <push limit bytes> [<git ssh key> [<owner/name>]]
 #
 # Rendered and parsed by arena_core::backup (backup_command / parse_backup_report); runs under
 # plain `sh` (dash on the images), whatever the pod's login shell. Prints, on stdout:
+#   WRONG_ORIGIN <owner/name> [<url>]  `origin` isn't the configured repo <owner/name> (or there is
+#                              none): checked first, before the SKIP; nothing committed or pushed (exit 5).
+#                              The URL is printed with any credentials taken out.
 #   SKIP <branch>              on main/master/a detached HEAD: nothing done (exit 0)
 #   NO_CHANGES <branch>        clean tree and HEAD == its upstream: nothing to push (exit 0)
 #   PUSHED <branch>            committed what there was and/or pushed unpushed commits (exit 0)
@@ -27,9 +30,15 @@ MSG=$2
 MAX=$3
 LIMIT=$4
 KEY=${5:-}
+ORIGIN=${6:-}
 cd "$REPO"
 cd "$(git rev-parse --show-toplevel)"
 TOP=$(pwd)
+# Whose repo this pushes to, before anything else (the SKIP on main too): a pod nobody ran `pods
+# setup` on kept the image's upstream `origin` and had no deploy key, so it was never backed up to
+# git and nothing said so (live, 2026-10-17). An empty ORIGIN (no repo configured) checks nothing.
+# @ARENA_ORIGIN_SH@
+origin_check "$ORIGIN"
 if [ -n "$KEY" ]; then
     export GIT_SSH_COMMAND="ssh -i $KEY -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
 fi

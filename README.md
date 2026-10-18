@@ -598,7 +598,16 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     the network) **is rsynced into `LOCAL_BACKUP_DIR` in the same run — even under `--no-pull`**
     (the cron's) — and its line says where its files went (or why that failed too); the run still
     fails. A pod that fails before its push (no repo, ssh refused, a timeout) keeps its plain
-    failure line and isn't copied every 15 minutes.
+    failure line and isn't copied every 15 minutes. **A pod whose `origin` isn't the configured
+    repo** (`ARENA_REPO_OWNER`/`ARENA_REPO_NAME`; any spelling of it passes: scp-style, `ssh://`,
+    `https://` with or without credentials, `.git`, a trailing slash, any case) is refused before
+    anything else, `main` included (live: a pod nobody set up kept the upstream course repo and
+    was never backed up to git, silently): nothing committed or pushed, `✗ <pod>: origin is <url>,
+    not the configured <owner>/<name> — not backed up to git; run \`arena pods setup <pod>\``
+    (the URL never with its credentials), and the run fails. Its work reaches no git remote at
+    all, so it is rsynced like a failed push, even under `--no-pull`. `set-branch` and
+    `init-branches` don't switch it, and the reaper doesn't reap it until `pods setup`. No
+    configured repo: no check.
   - `pods set-branch <branch> <targets|--all> [--hard] [--init-branches]` — switch pods'
     ARENA checkout to a branch. Gentle by default (fetch + checkout + ff-only pull — fails on a diverged/dirty
     tree rather than clobbering work). **`--hard` is destructive**: force the branch to

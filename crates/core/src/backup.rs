@@ -16,6 +16,10 @@
 //! commits holding one (an older backup's, or the participant's own) are rewritten redacted before
 //! the push, which goes out as a fast-forward. The script is [`backup_script`].
 //!
+//! Before any of that, a checkout whose `origin` isn't the configured repo ([`configured_repo`])
+//! is refused: nothing committed, nothing pushed, `WRONG_ORIGIN` said
+//! ([`BACKUP_WRONG_ORIGIN_EXIT`]). `init-branches`' command checks the same.
+//!
 //! This module only *renders* the command (pure, unit-tested). Running it — and thus
 //! mutating remote git state — is gated behind the CLI's `--apply`.
 
@@ -33,6 +37,9 @@ pub struct BackupConfig {
     pub day: u32,
     /// SSH key on the pod to authenticate the `git push` (`GIT_SSH_KEY_REMOTE`).
     pub git_ssh_key: Option<String>,
+    /// The repo a pod's `origin` must be before anything is pushed to it ([`configured_repo`]);
+    /// `None` = no check.
+    pub origin: Option<String>,
 }
 
 /// Where the ARENA checkout — the participants' work — lives on a pod: config
@@ -47,6 +54,18 @@ pub fn repo_path(cfg: &Config) -> String {
     })
 }
 
+/// The repo every pod's checkout must have as `origin` before arena pushes anything to it, as
+/// `owner/name`: config `ARENA_REPO_OWNER` and `ARENA_REPO_NAME`, the repo `pods setup` points
+/// `origin` at (`git@github.com:{owner}/{name}.git`, [`crate::setup::SetupConfig::from_config`]).
+///
+/// `None` (no check) when either is unset or empty, and when either holds a `/` or whitespace,
+/// which no GitHub owner or repo name has: the backup script's `WRONG_ORIGIN` line reads the
+/// configured repo as its first word.
+pub fn configured_repo(cfg: &Config) -> Option<String> {
+    let part = |key: &str| cfg.get(key).map(str::trim).filter(|v| !v.is_empty() && !v.contains('/') && !v.contains(char::is_whitespace));
+    Some(format!("{}/{}", part("ARENA_REPO_OWNER")?, part("ARENA_REPO_NAME")?))
+}
+
 impl BackupConfig {
     /// Build from config plus the already-computed iteration `week`/`day`.
     pub fn from_config(cfg: &Config, week: u32, day: u32) -> Self {
@@ -56,6 +75,7 @@ impl BackupConfig {
             week,
             day,
             git_ssh_key: cfg.get("GIT_SSH_KEY_REMOTE").map(String::from),
+            origin: configured_repo(cfg),
         }
     }
 
@@ -96,6 +116,13 @@ pub const BACKUP_STUCK_EXIT: i32 = 3;
 /// The exit status of a backup whose push GitHub's push protection still refuses after the
 /// redaction and the heal: a key [`SECRET_PATTERNS`] doesn't know (`PUSH_BLOCKED <reason>`).
 pub const BACKUP_BLOCKED_EXIT: i32 = 4;
+
+/// The exit status of a backup (or `init-branches`) on a pod whose `origin` isn't the configured
+/// repo ([`configured_repo`]): `WRONG_ORIGIN`, checked before anything else, so nothing is
+/// committed or pushed. Live (2026-10-17): a pod nobody ran `pods setup` on had the upstream
+/// course repo as `origin` and no deploy key, so it was never backed up to git, and nothing said
+/// so.
+pub const BACKUP_WRONG_ORIGIN_EXIT: i32 = 5;
 
 /// One kind of key the backup never lets into git ([`SECRET_PATTERNS`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,16 +250,30 @@ pub fn redact_sh() -> String {
     include_str!("redact.sh").replace("@SECRET_RE@", &secret_regex()).replace("@REDACT_SED@", &redact_sed())
 }
 
-/// The lines of `backup.sh` that [`backup_script`] replaces with [`redact_sh`] and
-/// [`NO_BYPASS_URL_SH`].
+/// The origin check's shell functions (`origin.sh`), shared by the two commands that push to a
+/// pod's `origin`: the backup script and `init-branches`' command. `origin_check <owner/name>`
+/// ends the run with `WRONG_ORIGIN` ([`BACKUP_WRONG_ORIGIN_EXIT`]) unless every URL `origin`
+/// fetches from or pushes to is that GitHub repo, however it is spelled (scp-style, `ssh://`,
+/// `https://` with or without credentials, `.git`, a trailing slash, any case). The URL it prints
+/// has any credentials taken out.
+pub fn origin_sh() -> &'static str {
+    include_str!("origin.sh")
+}
+
+/// The lines of `backup.sh` that [`backup_script`] replaces with [`redact_sh`],
+/// [`NO_BYPASS_URL_SH`] and [`origin_sh`].
 const REDACT_SH_MARK: &str = "# @ARENA_REDACT_SH@";
 const NO_BYPASS_URL_MARK: &str = "# @ARENA_NO_BYPASS_URL@";
+const ORIGIN_SH_MARK: &str = "# @ARENA_ORIGIN_SH@";
 
-/// The backup script ([`backup_command`]): `backup.sh` with [`redact_sh`] and
-/// [`NO_BYPASS_URL_SH`] rendered in. POSIX `sh`, so it runs the same whatever the pod's login
-/// shell; its header documents every line it prints.
+/// The backup script ([`backup_command`]): `backup.sh` with [`redact_sh`], [`NO_BYPASS_URL_SH`]
+/// and [`origin_sh`] rendered in. POSIX `sh`, so it runs the same whatever the pod's login shell;
+/// its header documents every line it prints.
 pub fn backup_script() -> String {
-    include_str!("backup.sh").replacen(REDACT_SH_MARK, redact_sh().trim_end(), 1).replacen(NO_BYPASS_URL_MARK, NO_BYPASS_URL_SH, 1)
+    include_str!("backup.sh")
+        .replacen(ORIGIN_SH_MARK, origin_sh().trim_end(), 1)
+        .replacen(REDACT_SH_MARK, redact_sh().trim_end(), 1)
+        .replacen(NO_BYPASS_URL_MARK, NO_BYPASS_URL_SH, 1)
 }
 
 /// Render the remote shell command that commits + pushes one machine's working tree **on
@@ -256,8 +297,12 @@ pub fn backup_script() -> String {
 /// file over GitHub's limit already in the unpushed commits fails it with
 /// [`BACKUP_STUCK_EXIT`] and what to reset to — before a push GitHub would refuse.
 /// `set -e` aborts on any other error, so a rejected push is a failure.
-pub fn backup_command(repo_path: &str, git_ssh_key: Option<&str>, commit_msg: &str) -> String {
-    backup_command_limited(repo_path, git_ssh_key, commit_msg, GIT_MAX_FILE_BYTES, GITHUB_FILE_LIMIT_BYTES)
+///
+/// `origin` is the configured repo ([`configured_repo`]). Before anything else, the main/master
+/// SKIP included, a checkout whose `origin` isn't that repo ends the run with `WRONG_ORIGIN` and
+/// [`BACKUP_WRONG_ORIGIN_EXIT`]: nothing committed, nothing pushed. `None`: no check.
+pub fn backup_command(repo_path: &str, git_ssh_key: Option<&str>, commit_msg: &str, origin: Option<&str>) -> String {
+    backup_command_limited(repo_path, git_ssh_key, commit_msg, GIT_MAX_FILE_BYTES, GITHUB_FILE_LIMIT_BYTES, origin)
 }
 
 /// [`backup_command`] with the size limits as parameters — the largest file committed, and the
@@ -268,17 +313,23 @@ pub fn backup_command_limited(
     commit_msg: &str,
     max_file_bytes: u64,
     push_limit_bytes: u64,
+    origin: Option<&str>,
 ) -> String {
-    format!("sh -c {} arena-backup {}", shell_quote(&backup_script()), script_args(repo_path, git_ssh_key, commit_msg, max_file_bytes, push_limit_bytes))
+    format!(
+        "sh -c {} arena-backup {}",
+        shell_quote(&backup_script()),
+        script_args(repo_path, git_ssh_key, commit_msg, max_file_bytes, push_limit_bytes, origin)
+    )
 }
 
 /// [`backup_script`]'s arguments, shell-quoted.
-fn script_args(repo_path: &str, git_ssh_key: Option<&str>, commit_msg: &str, max_file_bytes: u64, push_limit_bytes: u64) -> String {
+fn script_args(repo_path: &str, git_ssh_key: Option<&str>, commit_msg: &str, max_file_bytes: u64, push_limit_bytes: u64, origin: Option<&str>) -> String {
     format!(
-        "{} {} {max_file_bytes} {push_limit_bytes} {}",
+        "{} {} {max_file_bytes} {push_limit_bytes} {} {}",
         shell_quote(repo_path),
         shell_quote(commit_msg),
         shell_quote(git_ssh_key.unwrap_or("")),
+        shell_quote(origin.unwrap_or("")),
     )
 }
 
@@ -290,8 +341,8 @@ pub const BACKUP_SCRIPT_FILE: &str = "arena-backup.sh";
 /// the script read from stdin (`sh -s`) instead of carried in the command — for a dry run's
 /// per-pod line and the TUI's confirm modal, which show the arguments without the script's
 /// ~150 lines.
-pub fn backup_summary(repo_path: &str, git_ssh_key: Option<&str>, commit_msg: &str) -> String {
-    format!("sh -s {}", script_args(repo_path, git_ssh_key, commit_msg, GIT_MAX_FILE_BYTES, GITHUB_FILE_LIMIT_BYTES))
+pub fn backup_summary(repo_path: &str, git_ssh_key: Option<&str>, commit_msg: &str, origin: Option<&str>) -> String {
+    format!("sh -s {}", script_args(repo_path, git_ssh_key, commit_msg, GIT_MAX_FILE_BYTES, GITHUB_FILE_LIMIT_BYTES, origin))
 }
 
 /// One pod's backup as a dry run prints it: `ssh … 'sh -s <args>' < arena-backup.sh`. Pasted
@@ -299,8 +350,8 @@ pub fn backup_summary(repo_path: &str, git_ssh_key: Option<&str>, commit_msg: &s
 /// backup runs; without the file the local shell refuses to start it at all. (It used to show
 /// the script as `"$ARENA_BACKUP_SH"`, which the pod's shell expanded to nothing: `sh -c ""`
 /// did nothing and exited 0 — a paste that looked like a successful backup.)
-pub fn backup_dry_run_line(target: &crate::ssh::SshTarget, repo_path: &str, git_ssh_key: Option<&str>, commit_msg: &str) -> String {
-    format!("{} < {BACKUP_SCRIPT_FILE}", target.display_command(&backup_summary(repo_path, git_ssh_key, commit_msg)))
+pub fn backup_dry_run_line(target: &crate::ssh::SshTarget, repo_path: &str, git_ssh_key: Option<&str>, commit_msg: &str, origin: Option<&str>) -> String {
+    format!("{} < {BACKUP_SCRIPT_FILE}", target.display_command(&backup_summary(repo_path, git_ssh_key, commit_msg, origin)))
 }
 
 /// The here-doc that writes [`backup_script`] to [`BACKUP_SCRIPT_FILE`] — pasteable, printed once
@@ -348,6 +399,10 @@ pub struct BackupReport {
     pub push_blocked: Option<String>,
     /// The push itself failed otherwise (the network, a non-fast-forward…): `PUSH_FAILED`.
     pub push_failed: bool,
+    /// `origin` isn't the configured repo, so nothing was committed or pushed (`WRONG_ORIGIN`):
+    /// `(the configured owner/name, origin's URL with any credentials taken out)`. The URL is
+    /// empty when there is no `origin` at all.
+    pub wrong_origin: Option<(String, String)>,
 }
 
 /// Parse a backup's stdout ([`backup_script`]'s header lists the lines). Unknown lines (git's
@@ -376,6 +431,10 @@ pub fn parse_backup_report(stdout: &str) -> BackupReport {
                 }
             }
             "PUSH_FAILED" => r.push_failed = true,
+            "WRONG_ORIGIN" if !rest.trim().is_empty() => {
+                let (want, url) = rest.split_once(' ').unwrap_or((rest, ""));
+                r.wrong_origin = Some((want.trim().to_string(), url.trim().to_string()));
+            }
             "HEAL_ABORTED" => r.heal_aborted = Some(rest.trim().to_string()),
             "PUSH_BLOCKED" => {
                 let why = rest.trim();
@@ -467,6 +526,9 @@ impl BackupReport {
     /// know, a heal cut short — what happened and what to do; `None` for any other run (exit
     /// `code`). `repo` is the checkout on `pod`.
     pub fn failure(&self, repo: &str, pod: &str, code: Option<i32>) -> Option<String> {
+        if let Some(why) = self.wrong_origin_why(code) {
+            return Some(format!("{why} — not backed up to git; run `arena pods setup {pod}`"));
+        }
         if code == Some(BACKUP_STUCK_EXIT) {
             if let Some(fix) = self.stuck_fix(repo, pod) {
                 return Some(fix);
@@ -490,7 +552,8 @@ impl BackupReport {
     /// the way, a rewrite cut short, or the push failing outright: the failures where the
     /// pod's work is there but not on GitHub, so it gets the fallback copy. A run that never got
     /// that far (no repo, ssh denied, a timeout: nothing says how far it got) fails as it
-    /// always did, and isn't rsynced every 15 minutes.
+    /// always did, and isn't rsynced every 15 minutes. A wrong `origin` is not one of these
+    /// either (nothing was tried): what to do with it is the caller's ([`Self::wrong_origin`]).
     pub fn failed_at_push(&self) -> bool {
         self.push_failed || self.push_blocked.is_some() || self.heal_aborted.is_some() || !self.big_stuck.is_empty()
     }
@@ -498,6 +561,9 @@ impl BackupReport {
     /// [`Self::failure`] in a few words, for a line that says what else happened (the fallback
     /// copy): `None` for a failure the script didn't explain.
     pub fn failure_brief(&self, code: Option<i32>) -> Option<String> {
+        if let Some(why) = self.wrong_origin_why(code) {
+            return Some(why);
+        }
         if code == Some(BACKUP_STUCK_EXIT) && !self.big_stuck.is_empty() {
             return Some(format!("file(s) over {} MB in unpushed commits", GITHUB_FILE_LIMIT_BYTES / (1024 * 1024)));
         }
@@ -505,6 +571,18 @@ impl BackupReport {
             return Some(format!("GitHub push protection: {why}"));
         }
         self.heal_aborted.as_ref().map(|_| "the branch moved while its commits were being redacted".to_string())
+    }
+
+    /// For a run that stopped because `origin` isn't the configured repo (`WRONG_ORIGIN`, exit
+    /// [`BACKUP_WRONG_ORIGIN_EXIT`]): `origin is <url>, not the configured <owner>/<name>`, or that
+    /// there is no `origin` at all. `None` for any other run.
+    pub fn wrong_origin_why(&self, code: Option<i32>) -> Option<String> {
+        let (want, url) = self.wrong_origin.as_ref().filter(|_| code == Some(BACKUP_WRONG_ORIGIN_EXIT))?;
+        Some(if url.is_empty() {
+            format!("it has no `origin` remote (the configured repo is {want})")
+        } else {
+            format!("origin is {url}, not the configured {want}")
+        })
     }
 
     /// For a run that found files over GitHub's limit in the unpushed commits: why nothing can be
@@ -536,12 +614,21 @@ impl BackupReport {
 /// branch for the iteration and pushes it upstream — **without committing any work**
 /// (legacy `init_branches.sh`). Run at the start of a day so the branch exists (with an
 /// upstream) before any `backup`; later backups then just commit onto it. `set -e`
-/// aborts on the first real error.
+/// aborts on the first real error. A checkout whose `origin` isn't the configured repo
+/// (`cfg.origin`) is refused before anything else, as the backup refuses it (`WRONG_ORIGIN`,
+/// [`BACKUP_WRONG_ORIGIN_EXIT`]): the new branch is neither made nor pushed.
 pub fn init_branch_command(cfg: &BackupConfig, machine_name: &str) -> String {
     let branch = cfg.branch_for(machine_name);
     let bq = shell_quote(&branch);
     let mut parts: Vec<String> =
         vec!["set -e".into(), format!("cd {}", shell_quote(&cfg.repo_path))];
+    // Never a participant's new branch pushed to whatever `origin` is: the same check as the
+    // backup's, before anything else (WRONG_ORIGIN, exit 5).
+    if let Some(origin) = &cfg.origin {
+        let functions: Vec<&str> = origin_sh().lines().filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#')).collect();
+        parts.push(functions.join("\n"));
+        parts.push(format!("origin_check {}", shell_quote(origin)));
+    }
     if let Some(key) = &cfg.git_ssh_key {
         parts.push(format!(
             "export GIT_SSH_COMMAND={}",
@@ -647,6 +734,7 @@ mod tests {
             week: 0,
             day: 1,
             git_ssh_key: Some("/root/.ssh/id_ed25519".into()),
+            origin: None,
         }
     }
 
@@ -664,12 +752,13 @@ mod tests {
 
     #[test]
     fn backup_stays_on_current_branch_and_protects_main() {
-        let c = backup_command("/root/ARENA_3.0", Some("/root/.ssh/id_ed25519"), "arena backup");
+        let c = backup_command("/root/ARENA_3.0", Some("/root/.ssh/id_ed25519"), "arena backup", Some("styme3279/ARENA_materials"));
         // The script under sh (whatever the login shell), its arguments exact.
         assert!(c.starts_with("sh -c '"), "{c}");
         assert!(
             c.ends_with(&format!(
-                " arena-backup '/root/ARENA_3.0' 'arena backup' {GIT_MAX_FILE_BYTES} {GITHUB_FILE_LIMIT_BYTES} '/root/.ssh/id_ed25519'"
+                " arena-backup '/root/ARENA_3.0' 'arena backup' {GIT_MAX_FILE_BYTES} {GITHUB_FILE_LIMIT_BYTES} '/root/.ssh/id_ed25519' \
+                 'styme3279/ARENA_materials'"
             )),
             "{c}"
         );
@@ -695,7 +784,7 @@ mod tests {
     #[test]
     fn omits_git_ssh_command_without_key() {
         // An empty key argument: the script exports no GIT_SSH_COMMAND for it.
-        assert!(backup_command("/root/ARENA_3.0", None, "m").ends_with(" 'm' 99614720 104857600 ''"));
+        assert!(backup_command("/root/ARENA_3.0", None, "m", None).ends_with(" 'm' 99614720 104857600 '' ''"));
         assert!(backup_script().contains(r#"if [ -n "$KEY" ]; then"#));
     }
 
@@ -933,6 +1022,8 @@ mod tests {
         work: std::path::PathBuf,
         limit: u64,
         skip: u64,
+        /// The configured repo the backup checks `origin` against (`None`: no check).
+        want: Option<String>,
     }
 
     #[cfg(unix)]
@@ -944,7 +1035,7 @@ mod tests {
             let base = std::env::temp_dir().join(format!("arena-backup-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&base);
             std::fs::create_dir_all(&base).unwrap();
-            let s = GitSandbox { origin: base.join("origin.git"), work: base.join("work"), base, limit, skip: limit };
+            let s = GitSandbox { origin: base.join("origin.git"), work: base.join("work"), base, limit, skip: limit, want: None };
             s.git(&s.base, &["init", "-q", "--bare", s.origin.to_str().unwrap()]);
             let hook = s.origin.join("hooks/pre-receive");
             std::fs::write(
@@ -987,9 +1078,45 @@ mod tests {
 
         /// One backup run: (exit code, report, stderr).
         fn backup(&self) -> (Option<i32>, BackupReport, String) {
-            let cmd = backup_command_limited(self.work.to_str().unwrap(), None, "arena backup", self.skip, self.limit);
-            let o = std::process::Command::new("bash").arg("-c").arg(cmd).output().expect("bash");
-            (o.status.code(), parse_backup_report(&String::from_utf8_lossy(&o.stdout)), String::from_utf8_lossy(&o.stderr).into_owned())
+            let (code, out, err) = self.backup_raw();
+            (code, parse_backup_report(&out), err)
+        }
+
+        /// `bash -c cmd` with git kept off the network: only local paths and ssh, and ssh is
+        /// [`Self::github`]'s stand-in (a run that tried GitHub over https fails at once).
+        fn run(&self, cmd: &str) -> std::process::Output {
+            std::process::Command::new("bash")
+                .arg("-c")
+                .arg(cmd)
+                .env("GIT_ALLOW_PROTOCOL", "file:ssh")
+                .env("GIT_SSH_COMMAND", self.base.join("fake-ssh"))
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output()
+                .expect("bash")
+        }
+
+        /// A bare repo standing in for `github.com/<owner_name>` (created once), served over a
+        /// stand-in `ssh` that runs git's remote command in `<base>/github` and logs each call
+        /// to `<base>/ssh.log`. Its scp-style URL is `git@github.com:<owner_name>.git`.
+        fn github(&self, owner_name: &str) -> std::path::PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let ssh = self.base.join("fake-ssh");
+            std::fs::write(&ssh, "#!/bin/sh\necho \"$*\" >> \"$(dirname \"$0\")/ssh.log\"\nfor a; do last=$a; done\ncd \"$(dirname \"$0\")/github\" && exec sh -c \"$last\"\n").unwrap();
+            std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let bare = self.base.join("github").join(format!("{owner_name}.git"));
+            if !bare.exists() {
+                std::fs::create_dir_all(&bare).unwrap();
+                self.git(&self.base, &["init", "-q", "--bare", bare.to_str().unwrap()]);
+            }
+            bare
+        }
+
+        /// The stand-in ssh's calls so far (the log is emptied).
+        fn ssh_calls(&self) -> Vec<String> {
+            let log = self.base.join("ssh.log");
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            let _ = std::fs::remove_file(&log);
+            text.lines().map(String::from).collect()
         }
 
         /// What origin's `branch` holds: `(mode, path)` of every entry.
@@ -1080,8 +1207,8 @@ done
 
         /// One backup run, raw: (exit code, stdout, stderr).
         fn backup_raw(&self) -> (Option<i32>, String, String) {
-            let cmd = backup_command_limited(self.work.to_str().unwrap(), None, "arena backup", self.skip, self.limit);
-            let o = std::process::Command::new("bash").arg("-c").arg(cmd).output().expect("bash");
+            let cmd = backup_command_limited(self.work.to_str().unwrap(), None, "arena backup", self.skip, self.limit, self.want.as_deref());
+            let o = self.run(&cmd);
             (o.status.code(), String::from_utf8_lossy(&o.stdout).into_owned(), String::from_utf8_lossy(&o.stderr).into_owned())
         }
 
@@ -1755,7 +1882,7 @@ done
         std::fs::write(s.work.join("ex.py"), format!("k = '{key}'\n")).unwrap();
         s.git(&s.work, &["add", "-A"]);
         s.git(&s.work, &["commit", "-q", "-m", "yesterday, with a key"]);
-        let cfg = BackupConfig { repo_path: s.work.display().to_string(), prefix: "devtest".into(), week: 1, day: 2, git_ssh_key: None };
+        let cfg = BackupConfig { repo_path: s.work.display().to_string(), prefix: "devtest".into(), week: 1, day: 2, git_ssh_key: None, origin: None };
         let o = std::process::Command::new("bash").arg("-c").arg(init_branch_command(&cfg, "devtest-x")).output().unwrap();
         assert!(!o.status.success(), "the new branch's push carries the key");
         // Its refusal reaches the operator — without GitHub's allow-the-secret URL (review: it
@@ -1872,7 +1999,7 @@ done
             let key = openrouter_key(11);
             std::fs::write(s.work.join("ex.py"), format!("k = '{key}'\nmore = 1\n")).unwrap();
             let head = s.git(&s.work, &["rev-parse", "HEAD"]);
-            let cmd = backup_command_limited(s.work.to_str().unwrap(), None, "arena backup", s.skip, s.limit);
+            let cmd = backup_command_limited(s.work.to_str().unwrap(), None, "arena backup", s.skip, s.limit, None);
             let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
             let o = std::process::Command::new("bash").arg("-c").arg(cmd).env("PATH", path).output().unwrap();
             let (out, err) = (String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
@@ -1938,7 +2065,7 @@ done
             connect_timeout_secs: 10,
             host_keys: Default::default(),
         };
-        let line = backup_dry_run_line(&target, s.work.to_str().unwrap(), None, "arena backup");
+        let line = backup_dry_run_line(&target, s.work.to_str().unwrap(), None, "arena backup", None);
         // The stand-in: ssh's last argument is the remote command; stdin passes through.
         let ssh = "ssh() { for a; do last=$a; done; sh -c \"$last\"; }";
         let dir = s.base.join("paste");
@@ -1959,7 +2086,7 @@ done
 
     #[test]
     fn escapes_single_quotes_in_message() {
-        let c = backup_command("/root/ARENA_3.0", None, "it's a backup");
+        let c = backup_command("/root/ARENA_3.0", None, "it's a backup", None);
         assert!(c.contains(r"'it'\''s a backup'"));
     }
 
@@ -1991,7 +2118,7 @@ done
         let run = || {
             let o = Command::new("bash")
                 .arg("-c")
-                .arg(backup_command(work.to_str().unwrap(), None, "arena backup"))
+                .arg(backup_command(work.to_str().unwrap(), None, "arena backup", None))
                 .output()
                 .expect("bash");
             (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string())
@@ -2082,5 +2209,246 @@ done
         assert_eq!(c.branch_for("arena8-luna"), "autocommit-arena8-w1d2-luna");
         // a name without the prefix is used as-is
         assert_eq!(c.branch_for("luna"), "autocommit-arena8-w1d2-luna");
+    }
+
+    /// The configured repo is `owner/name` when both are set, else no check.
+    #[test]
+    fn the_configured_repo_is_owner_and_name_or_no_check() {
+        let cases = [
+            ("ARENA_REPO_OWNER=styme3279\nARENA_REPO_NAME=ARENA_materials\n", Some("styme3279/ARENA_materials")),
+            ("ARENA_REPO_OWNER= nickypro \nARENA_REPO_NAME=arena-sandbox-materials\n", Some("nickypro/arena-sandbox-materials")),
+            ("ARENA_REPO_NAME=ARENA_materials\n", None),
+            ("ARENA_REPO_OWNER=styme3279\n", None),
+            ("ARENA_REPO_OWNER=\nARENA_REPO_NAME=r\n", None),
+            ("ARENA_REPO_OWNER=a b\nARENA_REPO_NAME=r\n", None),
+            ("ARENA_REPO_OWNER=o/x\nARENA_REPO_NAME=r\n", None),
+            ("", None),
+        ];
+        for (text, want) in cases {
+            let cfg = Config::parse(text);
+            assert_eq!(configured_repo(&cfg).as_deref(), want, "{text:?}");
+            assert_eq!(BackupConfig::from_config(&cfg, 1, 2).origin.as_deref(), want, "{text:?}");
+        }
+    }
+
+    /// `origin_key` and `origin_shown` from the very script, under `sh`.
+    #[cfg(unix)]
+    fn origin_fn(func: &str, url: &str) -> String {
+        let script = format!("{}\n{func} \"$1\"", origin_sh());
+        let o = std::process::Command::new("sh").arg("-c").arg(script).arg("sh").arg(url).output().unwrap();
+        assert!(o.status.success(), "{func} {url}: {}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stdout).trim_end_matches('\n').to_string()
+    }
+
+    /// Every spelling of the configured repo is it: scp-style, `ssh://` (a port, GitHub's
+    /// ssh.github.com:443), `https://` (with or without credentials), `.git`, trailing slashes,
+    /// any case. Anything else is not: another owner, a fork's name, another host or alias, a
+    /// longer path, a local path. The URL a report prints never carries the credentials.
+    #[cfg(unix)]
+    #[test]
+    fn every_spelling_of_the_configured_repo_matches_and_nothing_else_does() {
+        let token = format!("{}{}", "ghp_", body(ALNUM, 36, 4));
+        let want = origin_fn("origin_key", "git@github.com:Styme3279/ARENA_materials.git");
+        assert_eq!(want, "github.com/styme3279/arena_materials");
+        let with_token = format!("https://devtest-user:{token}@github.com/styme3279/ARENA_materials.git");
+        let token_user = format!("https://{token}@github.com/STYME3279/arena_materials/");
+        let cases: Vec<(&str, bool)> = vec![
+            ("git@github.com:styme3279/ARENA_materials.git", true),
+            ("git@github.com:STYME3279/arena_materials", true),
+            ("github.com:styme3279/ARENA_materials.git/", true),
+            ("ssh://git@github.com/styme3279/ARENA_materials.git", true),
+            ("ssh://git@github.com:22/styme3279/ARENA_materials", true),
+            ("ssh://git@ssh.github.com:443/styme3279/ARENA_materials.git", true),
+            ("https://github.com/styme3279/ARENA_materials", true),
+            ("https://github.com/styme3279/ARENA_materials.git/", true),
+            ("https://WWW.GitHub.com/STYME3279/arena_MATERIALS//", true),
+            ("http://github.com/styme3279/ARENA_materials", true),
+            ("git://github.com/styme3279/ARENA_materials.git", true),
+            (&with_token, true),
+            (&token_user, true),
+            ("https://github.com/ARENA-education/ARENA_materials", false),
+            ("git@github.com:ARENA-education/ARENA_materials.git", false),
+            ("https://github.com/styme3279/ARENA_materials-fork", false),
+            ("https://github.com/styme3279/ARENA_materials/extra", false),
+            ("https://gitlab.com/styme3279/ARENA_materials", false),
+            ("git@github-deploy:styme3279/ARENA_materials.git", false),
+            ("/srv/git/styme3279/ARENA_materials.git", false),
+            ("file:///srv/github.com/styme3279/ARENA_materials", false),
+            ("../ARENA_materials", false),
+            ("", false),
+        ];
+        for (url, same) in &cases {
+            assert_eq!(origin_fn("origin_key", url) == want, *same, "{url}: {}", origin_fn("origin_key", url));
+        }
+        // What a report may print: never the user or the token.
+        let shown_cases: Vec<(String, &str)> = vec![
+            (with_token.clone(), "https://github.com/styme3279/ARENA_materials.git"),
+            (token_user.clone(), "https://github.com/STYME3279/arena_materials/"),
+            (format!("https://devtest-user:pa/{token}@github.com/o/n"), "https://github.com/o/n"),
+            (format!("https://github.com/o/n.git?access_token={token}#x"), "https://github.com/o/n.git"),
+            ("git@github.com:o/n.git".into(), "github.com:o/n.git"),
+            ("https://github.com/ARENA-education/ARENA_materials".into(), "https://github.com/ARENA-education/ARENA_materials"),
+            ("/srv/git/n.git".into(), "/srv/git/n.git"),
+        ];
+        for (url, shown) in &shown_cases {
+            let got = origin_fn("origin_shown", url);
+            assert_eq!(got, *shown, "{url}");
+            assert!(!got.contains(&token) && !got.contains("devtest-user"), "{got}");
+        }
+    }
+
+    /// `WRONG_ORIGIN` read back: the configured repo, the URL, what the operator is told, and that
+    /// it isn't a failure at the push. Only with its exit status: the line alone means nothing.
+    #[test]
+    fn a_wrong_origin_says_whose_repo_and_how_to_fix_it() {
+        let r = parse_backup_report("WRONG_ORIGIN styme3279/ARENA_materials https://github.com/ARENA-education/ARENA_materials\n");
+        assert_eq!(
+            r.wrong_origin,
+            Some(("styme3279/ARENA_materials".to_string(), "https://github.com/ARENA-education/ARENA_materials".to_string()))
+        );
+        assert_eq!((r.outcome.clone(), r.branch.clone(), r.failed_at_push()), (None, None, false));
+        let code = Some(BACKUP_WRONG_ORIGIN_EXIT);
+        assert_eq!(
+            r.failure("/root/ARENA_materials", "devtest-bloom", code).unwrap(),
+            "origin is https://github.com/ARENA-education/ARENA_materials, not the configured styme3279/ARENA_materials — not \
+             backed up to git; run `arena pods setup devtest-bloom`"
+        );
+        assert_eq!(
+            r.failure_brief(code).unwrap(),
+            "origin is https://github.com/ARENA-education/ARENA_materials, not the configured styme3279/ARENA_materials"
+        );
+        assert_eq!((r.failure("/r", "p", Some(1)), r.wrong_origin_why(Some(0))), (None, None));
+        let none = parse_backup_report("WRONG_ORIGIN styme3279/ARENA_materials\n");
+        assert_eq!(
+            none.failure("/r", "devtest-bloom", code).unwrap(),
+            "it has no `origin` remote (the configured repo is styme3279/ARENA_materials) — not backed up to git; run \
+             `arena pods setup devtest-bloom`"
+        );
+        assert_eq!(parse_backup_report("WRONG_ORIGIN \n").wrong_origin, None);
+    }
+
+    /// The live gap (2026-10-17): a pod nobody set up had the upstream course repo as `origin`
+    /// and was never backed up to git, silently. Now, before anything else (the main SKIP too),
+    /// a checkout whose origin isn't the configured repo is refused: `WRONG_ORIGIN`, exit 5,
+    /// nothing committed, nothing pushed, nothing contacted, its credentials never printed. A
+    /// push URL of its own counts too, and so does no origin at all. Every spelling of the right
+    /// repo goes ahead: scp-style (any case) pushes to it; https gets past the check (and then
+    /// can't push here, where git may use only local paths and ssh). No configured repo: no check.
+    #[cfg(unix)]
+    #[test]
+    fn a_checkout_whose_origin_isnt_the_configured_repo_is_refused_before_anything_else() {
+        let mut s = GitSandbox::new("origin", 1_000_000);
+        let github = s.github("Styme3279/ARENA_materials");
+        s.want = Some("styme3279/ARENA_materials".into());
+        s.put("exercises/work.py", 30);
+        let head = s.git(&s.work, &["rev-parse", "HEAD"]);
+        let origin_refs = || s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "for-each-ref"]);
+        let pushed_before = origin_refs();
+        let untouched = |s: &GitSandbox| {
+            assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), head, "nothing committed");
+            assert!(s.git(&s.work, &["status", "--porcelain"]).contains("exercises/"), "the work still uncommitted");
+            assert!(s.ssh_calls().is_empty(), "nothing contacted");
+        };
+        // The sandbox's own origin (a local path) isn't the configured repo.
+        let (code, r, err) = s.backup();
+        assert_eq!(code, Some(BACKUP_WRONG_ORIGIN_EXIT), "{err}");
+        assert_eq!(r.wrong_origin, Some(("styme3279/ARENA_materials".to_string(), s.origin.display().to_string())));
+        assert_eq!((r.outcome, r.branch), (None, None), "before anything else");
+        untouched(&s);
+        assert_eq!(origin_refs(), pushed_before, "nothing pushed");
+        // The upstream course repo, as an image has it, with credentials in the URL: refused, the
+        // URL said without them. On main too: before the SKIP.
+        let token = format!("{}{}", "ghp_", body(ALNUM, 36, 9));
+        s.git(&s.work, &["remote", "set-url", "origin", &format!("https://devtest-user:{token}@github.com/ARENA-education/ARENA_materials.git")]);
+        for branch in ["autocommit-x", "main"] {
+            s.git(&s.work, &["checkout", "-q", branch]);
+            let (code, out, err) = s.backup_raw();
+            assert_eq!(code, Some(BACKUP_WRONG_ORIGIN_EXIT), "{branch}: {out}{err}");
+            assert_eq!(out, "WRONG_ORIGIN styme3279/ARENA_materials https://github.com/ARENA-education/ARENA_materials.git\n", "{branch}");
+            assert!(!out.contains(&token) && !err.contains(&token) && !out.contains("devtest-user") && !err.contains("devtest-user"), "{out}{err}");
+            untouched(&s);
+        }
+        s.git(&s.work, &["checkout", "-q", "autocommit-x"]);
+        // The right fetch URL, but a push URL elsewhere: refused, naming where the push would go.
+        s.git(&s.work, &["remote", "set-url", "origin", "git@github.com:Styme3279/ARENA_materials.git"]);
+        s.git(&s.work, &["remote", "set-url", "--push", "origin", "https://github.com/someone/ARENA_materials"]);
+        let (code, r, _) = s.backup();
+        assert_eq!((code, r.wrong_origin.map(|w| w.1)), (Some(BACKUP_WRONG_ORIGIN_EXIT), Some("https://github.com/someone/ARENA_materials".into())));
+        untouched(&s);
+        // No origin at all.
+        s.git(&s.work, &["remote", "remove", "origin"]);
+        let (code, r, _) = s.backup();
+        assert_eq!((code, r.wrong_origin), (Some(BACKUP_WRONG_ORIGIN_EXIT), Some(("styme3279/ARENA_materials".into(), String::new()))));
+        untouched(&s);
+        // The configured repo over https, credentials and all: past the check, to the push.
+        s.git(&s.work, &["remote", "add", "origin", &format!("https://devtest-user:{token}@github.com/STYME3279/arena_materials")]);
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.wrong_origin, r.push_failed), (Some(1), None, true), "{err}");
+        assert!(!err.contains(&token), "{err}");
+        // scp-style, another case: checked, committed, pushed (to the stand-in for GitHub).
+        s.git(&s.work, &["remote", "set-url", "origin", "git@github.com:Styme3279/ARENA_materials.git"]);
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into()))), "{err}");
+        assert!(s.ssh_calls().iter().any(|c| c.contains("git-receive-pack 'Styme3279/ARENA_materials.git'")));
+        let on_github = s.git(&s.base, &["--git-dir", github.to_str().unwrap(), "ls-tree", "-r", "--name-only", "autocommit-x"]);
+        assert!(on_github.lines().any(|p| p == "exercises/work.py"), "{on_github}");
+        // A configured name no GitHub repo can have (a typo with a `#`) matches nothing, not even
+        // a local path, whose key is just as empty: refused, loudly, rather than let through.
+        s.git(&s.work, &["remote", "set-url", "origin", s.origin.to_str().unwrap()]);
+        s.want = Some("styme3279/ARENA#materials".into());
+        s.put("exercises/more.py", 10);
+        let (code, r, _) = s.backup();
+        assert_eq!((code, r.wrong_origin.map(|w| w.1)), (Some(BACKUP_WRONG_ORIGIN_EXIT), Some(s.origin.display().to_string())));
+        // No configured repo: no check (a local origin pushes, as it always did).
+        s.want = None;
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome, r.wrong_origin), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into())), None), "{err}");
+    }
+
+    /// `init-branches` would push a participant's new day branch to whatever `origin` is. Now a
+    /// wrong one is refused first: no branch made, nothing fetched or pushed. The configured repo
+    /// gets its branch as before.
+    #[cfg(unix)]
+    #[test]
+    fn init_branches_never_pushes_a_new_branch_to_a_wrong_origin() {
+        let s = GitSandbox::new("init-origin", 1_000_000);
+        let github = s.github("Styme3279/ARENA_materials");
+        let mut cfg = BackupConfig {
+            repo_path: s.work.display().to_string(),
+            prefix: "devtest".into(),
+            week: 1,
+            day: 2,
+            git_ssh_key: None,
+            origin: Some("styme3279/ARENA_materials".into()),
+        };
+        s.git(&s.work, &["remote", "set-url", "origin", "https://github.com/ARENA-education/ARENA_materials"]);
+        let o = s.run(&init_branch_command(&cfg, "devtest-x"));
+        let out = String::from_utf8_lossy(&o.stdout);
+        assert_eq!(o.status.code(), Some(BACKUP_WRONG_ORIGIN_EXIT), "{out}{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(out, "WRONG_ORIGIN styme3279/ARENA_materials https://github.com/ARENA-education/ARENA_materials\n");
+        assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "autocommit-x", "no branch made or switched to");
+        assert!(s.git(&s.work, &["branch", "--list", "autocommit-devtest-w1d2-x"]).is_empty());
+        assert!(s.ssh_calls().is_empty());
+        // The configured repo (scp-style, served by the stand-in): made and pushed, as before.
+        s.git(&s.work, &["remote", "set-url", "origin", "git@github.com:Styme3279/ARENA_materials.git"]);
+        let o = s.run(&init_branch_command(&cfg, "devtest-x"));
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "autocommit-devtest-w1d2-x");
+        s.git(&s.base, &["--git-dir", github.to_str().unwrap(), "rev-parse", "--verify", "autocommit-devtest-w1d2-x"]);
+        // No configured repo: the command has no check in it at all.
+        cfg.origin = None;
+        assert!(!init_branch_command(&cfg, "devtest-x").contains("origin_check"));
+    }
+
+    /// The check is rendered into the script before the SKIP, from the one `origin.sh`, and the
+    /// script still parses under sh and bash.
+    #[test]
+    fn the_origin_check_comes_first_in_the_script() {
+        let s = backup_script();
+        assert!(!s.contains("@ARENA_ORIGIN_SH@"));
+        let check = s.find("origin_check \"$ORIGIN\"").expect("the check");
+        assert!(check < s.find("echo \"SKIP $B\"").unwrap() && check < s.find("git add -A").unwrap());
+        assert!(s.contains(origin_sh().trim_end()));
+        assert!(s.contains("ORIGIN=${6:-}"));
     }
 }
