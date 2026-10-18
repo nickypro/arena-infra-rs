@@ -1244,6 +1244,10 @@ pub fn human_bytes(b: u64) -> String {
 /// line only appears with `-vv`, and on stdout, so it is not what this reads.
 const MAKE_WAY: &str = "could not make way for new ";
 
+/// rsync's exit for a transfer that ended with some files or attributes not transferred — the
+/// one its [`MAKE_WAY`] message comes with. A line like it under any other exit is not acted on.
+pub const RSYNC_PARTIAL_EXIT: i32 = 23;
+
 /// The kinds of entry a [`MAKE_WAY`] line names where a directory can be what's in the way,
 /// in rsync's own words. `directory` is not one of them: rsync replaces a file in a new
 /// directory's way by itself.
@@ -1320,19 +1324,25 @@ pub fn inside(rel: &Path) -> bool {
     !rel.as_os_str().is_empty() && rel.components().all(|c| matches!(c, std::path::Component::Normal(_)))
 }
 
-/// The name a directory in the way is moved to, beside it: `<name>.olddir-<day>`, where `day` is
-/// `YYYYMMDD` ([`aside_day`]). That is the operator's own convention (`ARENA_3.0.olddir-20261017`).
-/// While `taken` says a name is used, it tries `…-2`, `…-3`, and so on. `None` after a thousand
-/// tries. Pure.
-pub fn aside_name(name: &std::ffi::OsStr, day: &str, taken: impl Fn(&std::ffi::OsStr) -> bool) -> Option<std::ffi::OsString> {
+/// The holding directory a directory in the way goes into, beside it: `.arena-olddir-<day>`
+/// (then `-2`, `-3`…). A dot-directory: the pulls never carry one from a pod (`**/.*/`), and the
+/// archive's pushes leave it out ([`crate::archive::SECRET_EXCLUDES`]).
+pub const HOLDING_PREFIX: &str = ".arena-olddir-";
+
+/// Where a directory in the way is moved, relative to its parent: `.arena-olddir-<day>/<name>`,
+/// `day` being `YYYYMMDD` ([`aside_day`]) — under a holding directory, its own name KEPT. Every
+/// filter that matches by name then still matches inside it: the archive's
+/// [`crate::archive::SECRET_EXCLUDES`] (`hf/token`, `.git/config`, `.config/`…) keep secrets off
+/// the cohort-readable archive by name, and a rename to `<name>.olddir-<day>` (the operator's
+/// manual convention, which this followed at first) let a moved-aside `hf/token` or
+/// `proj/.git/config` through (review b5 #1, reproduced). While `taken` says a candidate can't be
+/// used, it tries the holding directory `…-2`, `…-3`, and so on. `None` after a thousand tries.
+/// Pure.
+pub fn aside_name(name: &std::ffi::OsStr, day: &str, taken: impl Fn(&Path) -> bool) -> Option<PathBuf> {
     (1..=1000)
         .map(|n| {
-            let mut s = name.to_os_string();
-            s.push(format!(".olddir-{day}"));
-            if n > 1 {
-                s.push(format!("-{n}"));
-            }
-            s
+            let hold = if n > 1 { format!("{HOLDING_PREFIX}{day}-{n}") } else { format!("{HOLDING_PREFIX}{day}") };
+            Path::new(&hold).join(name)
         })
         .find(|candidate| !taken(candidate))
 }
@@ -1342,9 +1352,10 @@ pub fn aside_day(unix_secs: u64) -> String {
     crate::restore::stamp(unix_secs)[..8].to_string()
 }
 
-/// Move the directory `dest/rel` aside, to its [`aside_name`] beside it, so the next rsync can put
-/// what the source now has in its place. Returns the new path, relative to `dest`. It is a rename
-/// within the entry's own parent, so nothing is copied and nothing is deleted.
+/// Move the directory `dest/rel` aside, into its holding directory beside it ([`aside_name`]:
+/// `<parent>/.arena-olddir-<day>/<name>`, made if need be), so the next rsync can put what the
+/// source now has in its place. Returns the new path, relative to `dest`. It is a rename within
+/// the entry's own parent's tree, so nothing is copied and nothing is deleted.
 ///
 /// Refused (`Err` says why, for the pod's line) unless all of these hold:
 /// - `rel` is [`inside`] `dest`;
@@ -1352,9 +1363,10 @@ pub fn aside_day(unix_secs: u64) -> String {
 ///   can't reach outside `dest`;
 /// - the entry itself is a real directory.
 ///
-/// Every check uses `symlink_metadata`, which never follows a link. `dest` itself is taken as
-/// given: it is the transfer's own destination (an operator may have linked a pod's folder onto
-/// another disk).
+/// A holding directory is used only when it is a real directory (or is made here): one whose
+/// name is a symlink or a file is passed over, as is one already holding that name. Every check
+/// uses `symlink_metadata`, which never follows a link. `dest` itself is taken as given: it is
+/// the transfer's own destination (an operator may have linked a pod's folder onto another disk).
 pub fn move_aside(dest: &Path, rel: &Path, day: &str) -> std::result::Result<PathBuf, String> {
     if !inside(rel) {
         return Err("not a path inside the destination".into());
@@ -1380,12 +1392,32 @@ pub fn move_aside(dest: &Path, rel: &Path, day: &str) -> std::result::Result<Pat
         Ok(m) => return Err(format!("it is {} here", kind(&m))),
         Err(e) => return Err(format!("it can't be read: {e}")),
     }
-    let taken = |candidate: &std::ffi::OsStr| {
-        !matches!(std::fs::symlink_metadata(parent.join(candidate)), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+    let missing = |p: &Path| matches!(std::fs::symlink_metadata(p), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
+    let taken = |candidate: &Path| {
+        let hold = parent.join(candidate.parent().unwrap_or(candidate));
+        match std::fs::symlink_metadata(&hold) {
+            Ok(m) if m.file_type().is_dir() => !missing(&parent.join(candidate)),
+            Ok(_) => true,
+            Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+        }
     };
-    let to = aside_name(last, day, taken).ok_or("every name for it beside it is taken")?;
-    std::fs::rename(&from, parent.join(&to)).map_err(|e| format!("moving it aside failed: {e}"))?;
-    Ok(rel.with_file_name(to))
+    let to = aside_name(last, day, taken).ok_or("every holding directory for it beside it is taken")?;
+    let hold = parent.join(to.parent().unwrap_or(&to));
+    let made = match std::fs::create_dir(&hold) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(e) => return Err(format!("making {} failed: {e}", hold.strip_prefix(dest).unwrap_or(&hold).display())),
+    };
+    if !std::fs::symlink_metadata(&hold).is_ok_and(|m| m.file_type().is_dir()) {
+        return Err("its holding directory isn't a directory here".into());
+    }
+    if let Err(e) = std::fs::rename(&from, parent.join(&to)) {
+        if made {
+            let _ = std::fs::remove_dir(&hold);
+        }
+        return Err(format!("moving it aside failed: {e}"));
+    }
+    Ok(rel.parent().unwrap_or(Path::new("")).join(to))
 }
 
 /// What [`make_way`] did in one destination.
@@ -1406,8 +1438,8 @@ impl MadeWay {
     }
 
     /// What a pod's line says about it: empty when nothing happened, else ` — moved ARENA_3.0
-    /// aside to ARENA_3.0.olddir-20261018 (a directory here, a symlink on the pod now; nothing
-    /// deleted)`, with each refusal after it.
+    /// aside to .arena-olddir-20261018/ARENA_3.0 (a directory here, a symlink on the pod now;
+    /// nothing deleted)`, with each refusal after it.
     pub fn note(&self) -> String {
         let mut out = String::new();
         let show = |p: &Path| p.display().to_string();
@@ -1451,15 +1483,24 @@ pub fn make_way(dest: &Path, stderr: &str, day: &str) -> MadeWay {
 /// One backup rsync into `dest` (`program` + `args`, run by [`crate::remote::run_local`] within
 /// `budget`), made so that a directory left by an earlier pull can't fail it every run.
 ///
-/// When rsync fails because directories here are in the way of what the source now has
-/// ([`make_way_entries`]), they are moved aside ([`make_way`]: renamed beside themselves, nothing
-/// deleted) and the same rsync runs once more, within what's left of `budget`. rsync is
-/// incremental, so the second run sends only what the first couldn't place. There is exactly one
-/// retry: whatever the second run returns is the result.
+/// When rsync fails with exit 23 ("some files/attrs were not transferred", the only exit its
+/// make-way message comes with) because directories here are in the way of what the source now
+/// has ([`make_way_entries`]), they are moved aside ([`make_way`]: into a holding directory beside
+/// them, their names kept, nothing deleted) and the same rsync runs once more, within what's left
+/// of `budget`. rsync is incremental, so the second run sends only what the first couldn't place.
+/// There is exactly one retry: whatever the second run returns is the result.
 ///
-/// Anything else comes back exactly as rsync returned it, with nothing moved: any other failure,
-/// a first run whose entries were all refused, or one with less than a second of budget left.
-/// `day` names the moved directories ([`aside_day`]).
+/// Anything else comes back exactly as rsync returned it, with nothing moved: any other exit, a
+/// first run whose entries were all refused, or one with less than a second of budget left.
+/// `day` names the holding directories ([`aside_day`]).
+///
+/// What this trusts: rsync's stderr also carries whatever the pod's ssh session prints, and a
+/// participant is root on their pod. So a pod can print the make-way line itself, in a run that
+/// fails with exit 23 anyway (one unreadable file is enough), and get one of ITS OWN backed-up
+/// directories moved aside, each run, with a note that says the pod has a symlink there (review b5
+/// #3). That is the whole reach: the path must be [`inside`] this pod's own destination, through
+/// real directories only ([`move_aside`]), and nothing is ever deleted — the cost is the disk and
+/// transfer of copying that directory again, and a misleading line.
 pub async fn rsync_making_way(
     program: &str,
     args: &[String],
@@ -1471,7 +1512,7 @@ pub async fn rsync_making_way(
     let started = tokio::time::Instant::now();
     let first = crate::remote::run_local(program, args, what, Some(budget)).await;
     let made = match &first {
-        Ok(o) if !o.success => make_way(dest, &o.stderr, day),
+        Ok(o) if !o.success && o.code == Some(RSYNC_PARTIAL_EXIT) => make_way(dest, &o.stderr, day),
         _ => return (first, MadeWay::default()),
     };
     // Whole seconds, as every other budget a pull hands rsync.
@@ -2539,23 +2580,25 @@ mod tests {
         }
     }
 
-    /// The operator's name for a set-aside directory, the day in UTC, and never a name already
-    /// there.
+    /// A set-aside directory keeps its name, under a holding directory named for the day in
+    /// UTC (review b5 #1: a renamed `hf/` slipped past the archive's `hf/token` exclude) — never
+    /// onto a name already there.
     #[test]
-    fn a_directory_goes_aside_under_the_operators_name_and_never_onto_another() {
+    fn a_directory_goes_aside_under_a_holding_directory_keeping_its_name() {
         use std::ffi::OsStr;
-        assert_eq!(aside_name(OsStr::new("ARENA_3.0"), "20261017", |_| false).unwrap(), "ARENA_3.0.olddir-20261017");
-        let taken = ["ARENA_3.0.olddir-20261017", "ARENA_3.0.olddir-20261017-2"];
-        let got = aside_name(OsStr::new("ARENA_3.0"), "20261017", |c| taken.iter().any(|t| c == OsStr::new(t)));
-        assert_eq!(got.unwrap(), "ARENA_3.0.olddir-20261017-3");
+        assert_eq!(aside_name(OsStr::new("ARENA_3.0"), "20261017", |_| false).unwrap(), Path::new(".arena-olddir-20261017/ARENA_3.0"));
+        let taken = [".arena-olddir-20261017/ARENA_3.0", ".arena-olddir-20261017-2/ARENA_3.0"];
+        let got = aside_name(OsStr::new("ARENA_3.0"), "20261017", |c| taken.iter().any(|t| c == Path::new(t)));
+        assert_eq!(got.unwrap(), Path::new(".arena-olddir-20261017-3/ARENA_3.0"));
         assert_eq!(aside_name(OsStr::new("x"), "20261017", |_| true), None, "a thousand taken: no name");
         assert_eq!(aside_day(1_792_238_400), "20261017", "2026-10-17 12:00 UTC");
         assert_eq!(aside_day(1_792_281_599), "20261017");
         assert_eq!(aside_day(1_792_281_600), "20261018");
     }
 
-    /// The directory in the way is renamed beside itself, with everything in it, at any depth,
-    /// never onto another name. Anything else is refused and left exactly where it was: a path
+    /// The directory in the way goes into a holding directory beside itself, its name kept, with
+    /// everything in it, at any depth, never onto another name nor through a holding name that
+    /// isn't a real directory. Anything else is refused and left exactly where it was: a path
     /// with `..`, an absolute one, one whose way runs through a symlink (which would reach
     /// outside the destination), and an entry that is a symlink or a file.
     #[cfg(unix)]
@@ -2572,19 +2615,26 @@ mod tests {
         put(&dest.join("ARENA_3.0/top.txt"), "top");
         let before = tree_count(&dest.join("ARENA_3.0")).unwrap();
         let day = "20261017";
-        assert_eq!(move_aside(&dest, Path::new("ARENA_3.0"), day).unwrap(), Path::new("ARENA_3.0.olddir-20261017"));
+        let held = dest.join(".arena-olddir-20261017/ARENA_3.0");
+        assert_eq!(move_aside(&dest, Path::new("ARENA_3.0"), day).unwrap(), Path::new(".arena-olddir-20261017/ARENA_3.0"));
         assert!(std::fs::symlink_metadata(dest.join("ARENA_3.0")).is_err(), "the name is free for what the pod has");
-        assert_eq!(tree_count(&dest.join("ARENA_3.0.olddir-20261017")).unwrap(), before, "everything kept");
-        assert_eq!(std::fs::read_to_string(dest.join("ARENA_3.0.olddir-20261017/chapter1/old_work.py")).unwrap(), "yesterday's work");
-        // The same again the same day: never onto a name already there, even a dangling link.
+        assert_eq!(tree_count(&held).unwrap(), before, "everything kept");
+        assert_eq!(std::fs::read_to_string(held.join("chapter1/old_work.py")).unwrap(), "yesterday's work");
+        // Another directory the same day: the same holding directory.
+        put(&dest.join("hf/token"), "a token");
+        assert_eq!(move_aside(&dest, Path::new("hf"), day).unwrap(), Path::new(".arena-olddir-20261017/hf"));
+        assert!(dest.join(".arena-olddir-20261017/hf/token").is_file());
+        // The same name again the same day: never onto a name already there, nor into a holding
+        // name that is something else here (even a dangling link): the next free holding directory.
         put(&dest.join("ARENA_3.0/again.py"), "again");
-        std::os::unix::fs::symlink("/nonexistent", dest.join("ARENA_3.0.olddir-20261017-2")).unwrap();
-        assert_eq!(move_aside(&dest, Path::new("ARENA_3.0"), day).unwrap(), Path::new("ARENA_3.0.olddir-20261017-3"));
-        assert_eq!(tree_count(&dest.join("ARENA_3.0.olddir-20261017")).unwrap(), before, "the first one untouched");
+        std::os::unix::fs::symlink(&outside, dest.join(".arena-olddir-20261017-2")).unwrap();
+        assert_eq!(move_aside(&dest, Path::new("ARENA_3.0"), day).unwrap(), Path::new(".arena-olddir-20261017-3/ARENA_3.0"));
+        assert_eq!(tree_count(&held).unwrap(), before, "the first one untouched");
+        assert!(!outside.exists(), "nothing made through the link");
         // Deep, with spaces: within its own parent.
         put(&dest.join("a b/c d/my link/f.txt"), "f");
-        assert_eq!(move_aside(&dest, Path::new("a b/c d/my link"), day).unwrap(), Path::new("a b/c d/my link.olddir-20261017"));
-        assert!(dest.join("a b/c d/my link.olddir-20261017/f.txt").is_file());
+        assert_eq!(move_aside(&dest, Path::new("a b/c d/my link"), day).unwrap(), Path::new("a b/c d/.arena-olddir-20261017/my link"));
+        assert!(dest.join("a b/c d/.arena-olddir-20261017/my link/f.txt").is_file());
 
         // Refused, everything left as it was.
         put(&outside.join("victim/keep.txt"), "not ours");
@@ -2594,7 +2644,7 @@ mod tests {
         let absolute = outside.join("victim").display().to_string();
         let cases: [(&str, &str); 8] = [
             ("../../outside/victim", "not a path inside the destination"),
-            ("ARENA_3.0.olddir-20261017/../../../outside/victim", "not a path inside the destination"),
+            (".arena-olddir-20261017/../../../outside/victim", "not a path inside the destination"),
             (&absolute, "not a path inside the destination"),
             ("linked/victim", "linked on the way to it is a symlink here"),
             ("alink", "it is a symlink here"),
@@ -2621,26 +2671,27 @@ mod tests {
         let stderr = "could not make way for new symlink: ARENA_3.0\ncould not make way for new symlink: linked/victim\n\
                       could not make way for new regular file: ../../outside/victim\n";
         let made = make_way(&dest, stderr, "20261018");
-        assert_eq!(made.moved, [(PathBuf::from("ARENA_3.0"), PathBuf::from("ARENA_3.0.olddir-20261018"), "symlink")]);
+        assert_eq!(made.moved, [(PathBuf::from("ARENA_3.0"), PathBuf::from(".arena-olddir-20261018/ARENA_3.0"), "symlink")]);
         assert_eq!(made.refused.len(), 2, "{made:?}");
         assert_eq!(
             made.note(),
-            " — moved ARENA_3.0 aside to ARENA_3.0.olddir-20261018 (a directory here, a symlink on the pod now; nothing deleted) \
+            " — moved ARENA_3.0 aside to .arena-olddir-20261018/ARENA_3.0 (a directory here, a symlink on the pod now; nothing \
+             deleted) \
              — rsync couldn't replace, and left as it is: linked/victim (linked on the way to it is a symlink here), \
              ../../outside/victim (not a path inside the destination)"
         );
         assert_eq!(listing(&outside.join("victim")), ["keep.txt"]);
         let two = MadeWay {
             moved: vec![
-                (PathBuf::from("ARENA_3.0"), PathBuf::from("ARENA_3.0.olddir-20261018"), "symlink"),
-                (PathBuf::from("data"), PathBuf::from("data.olddir-20261018"), "regular file"),
+                (PathBuf::from("ARENA_3.0"), PathBuf::from(".arena-olddir-20261018/ARENA_3.0"), "symlink"),
+                (PathBuf::from("data"), PathBuf::from(".arena-olddir-20261018/data"), "regular file"),
             ],
             refused: vec![],
         };
         assert_eq!(
             two.note(),
             " — moved 2 directories aside (each something else on the pod now; nothing deleted): ARENA_3.0 → \
-             ARENA_3.0.olddir-20261018 (symlink), data → data.olddir-20261018 (regular file)"
+             .arena-olddir-20261018/ARENA_3.0 (symlink), data → .arena-olddir-20261018/data (regular file)"
         );
         assert_eq!(MadeWay::default().note(), "");
         let _ = std::fs::remove_dir_all(&root);
@@ -2691,19 +2742,23 @@ mod tests {
         assert_eq!(
             made.moved,
             [
-                (PathBuf::from("ARENA_3.0"), PathBuf::from("ARENA_3.0.olddir-20261017"), "symlink"),
-                (PathBuf::from("deep/x/L"), PathBuf::from("deep/x/L.olddir-20261017"), "symlink"),
+                (PathBuf::from("ARENA_3.0"), PathBuf::from(".arena-olddir-20261017/ARENA_3.0"), "symlink"),
+                (PathBuf::from("deep/x/L"), PathBuf::from("deep/x/.arena-olddir-20261017/L"), "symlink"),
             ]
         );
         assert_eq!(std::fs::read_link(dest.join("ARENA_3.0")).unwrap(), Path::new("volume/ARENA_3.0"));
         assert_eq!(std::fs::read_link(dest.join("deep/x/L")).unwrap(), Path::new("../../volume"));
         assert_eq!(std::fs::read_to_string(dest.join("volume/ARENA_3.0/chapter1/new.py")).unwrap(), "today");
-        assert_eq!(std::fs::read_to_string(dest.join("ARENA_3.0.olddir-20261017/chapter1/old_work.py")).unwrap(), "yesterday's work");
-        assert_eq!(std::fs::read_to_string(dest.join("deep/x/L.olddir-20261017/old.py")).unwrap(), "older");
+        let (old, older) = (dest.join(".arena-olddir-20261017/ARENA_3.0/chapter1/old_work.py"), dest.join("deep/x/.arena-olddir-20261017/L/old.py"));
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), "yesterday's work");
+        assert_eq!(std::fs::read_to_string(&older).unwrap(), "older");
 
+        // The next pull: nothing in its way, and the tier's own filters leave the holding
+        // directories as they are (no pod has one: `**/.*/`; nothing here is ever deleted).
         let (out, made) = rsync_making_way("rsync", &args, &dest, "rsync", budget, "20261018").await;
         assert!(out.unwrap().success);
         assert_eq!(made, MadeWay::default(), "nothing in the way any more");
+        assert_eq!((std::fs::read_to_string(&old).unwrap(), std::fs::read_to_string(&older).unwrap()), ("yesterday's work".into(), "older".into()));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2737,18 +2792,23 @@ mod tests {
         // Every run fails: moved once, run twice, the second failure returned.
         let (out, made) = rsync_making_way(&program, &[], &dest, "rsync", budget, "20261017").await;
         assert_eq!((out.unwrap().code, made.moved.len(), runs()), (Some(23), 1, 2));
-        assert!(dest.join("L.olddir-20261017/sub").is_dir());
+        assert!(dest.join(".arena-olddir-20261017/L/sub").is_dir());
         // `L` is gone now: nothing to move, no second run, the refusal said.
         let (out, made) = rsync_making_way(&program, &[], &dest, "rsync", budget, "20261017").await;
         assert_eq!((out.unwrap().code, made.moved.len(), made.refused.len(), runs()), (Some(23), 0, 1, 1));
         // Any other failure: as it was.
         let (out, made) = rsync_making_way("sh", &["-c".into(), "echo 'rsync: connection unexpectedly closed' >&2; exit 12".into()], &dest, "rsync", budget, "20261017").await;
         assert_eq!((out.unwrap().code, made), (Some(12), MadeWay::default()));
-        // Under a second left after the first run: moved aside, not run again.
+        // The line under any exit but rsync's 23 (a pod printing it, review b5 #3): not acted on.
         std::fs::create_dir_all(dest.join("L/sub")).unwrap();
+        let said = "echo 'could not make way for new symlink: L' >&2; exit 12";
+        let (out, made) = rsync_making_way("sh", &["-c".into(), said.into()], &dest, "rsync", budget, "20261017").await;
+        assert_eq!((out.unwrap().code, made), (Some(12), MadeWay::default()));
+        assert!(dest.join("L/sub").is_dir(), "left where it is");
+        // Under a second left after the first run: moved aside, not run again.
         let (out, made) = rsync_making_way(&program, &["1.2".into()], &dest, "rsync", Duration::from_secs(2), "20261017").await;
         assert_eq!((out.unwrap().code, made.moved.len(), runs()), (Some(23), 1, 1));
-        assert!(dest.join("L.olddir-20261017-2/sub").is_dir());
+        assert!(dest.join(".arena-olddir-20261017-2/L/sub").is_dir());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

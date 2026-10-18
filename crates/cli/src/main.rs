@@ -13174,7 +13174,7 @@ async fn pull_pods(
     let mut set = tokio::task::JoinSet::new();
     // Each running job's pod, by task: its lock goes when the pod's last job ends (RR3).
     let mut job_pod: std::collections::HashMap<tokio::task::Id, String> = Default::default();
-    // What a directory in the way of a symlink is renamed to today (`pull::rsync_making_way`).
+    // The day a directory in the way of a symlink is held under (`pull::rsync_making_way`).
     let day = pull::aside_day(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()));
     let (mut jobs, mut failed) = (0, 0);
     // Which jobs failed, by name: the summary (and the cron log) must say which pod to look at.
@@ -21067,8 +21067,9 @@ mod remote_tests {
     /// Live (2026-10-17): `pods backup` failed `[big]` on 9 pods every run, rsync exit 23 "could
     /// not make way for new symlink: ARENA_3.0" — a directory in the backup where the pods now
     /// have a symlink. Through the real pull and the real rsync: in both tiers the directory is
-    /// moved aside (nothing deleted), the rsync runs again, the pull succeeds, and the pod's line
-    /// says so.
+    /// moved aside — into `.arena-olddir-<day>/`, its name kept (review b5 #1) — nothing deleted,
+    /// the rsync runs again, the pull succeeds, and the pod's line says so. The next pull, with
+    /// each tier's own filters, leaves the holding directories as they are and says nothing.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_directory_that_became_a_symlink_on_the_pod_is_moved_aside_and_the_pull_succeeds() {
@@ -21105,9 +21106,10 @@ mod remote_tests {
             let aside: Vec<String> = std::fs::read_dir(&dest)
                 .unwrap()
                 .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-                .filter(|n| n.starts_with("ARENA_3.0.olddir-"))
+                .filter(|n| n.starts_with(".arena-olddir-") || n.contains(".olddir-"))
+                .map(|n| format!("{n}/ARENA_3.0"))
                 .collect();
-            assert_eq!(aside.len(), 1, "{tier}: {aside:?}");
+            assert_eq!(aside, [format!(".arena-olddir-{}/ARENA_3.0", arena_core::pull::aside_day(arena_core::snapshot::unix_now()))], "{tier}");
             assert_eq!(std::fs::read_to_string(dest.join(&aside[0]).join("chapter1/old_work.py")).unwrap(), old, "{tier}");
             assert_eq!(std::fs::read_to_string(dest.join("notes.md")).unwrap(), "notes", "{tier}");
             let line = said.iter().find(|l| l.contains(&format!("✓ devtest-apple [{tier}] ("))).unwrap_or_else(|| panic!("{tier}: {said:#?}"));
@@ -21118,6 +21120,19 @@ mod remote_tests {
                 )),
                 "{line}"
             );
+        }
+        // Again: nothing in the way, the holding directories as they were, in both tiers.
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [repo_in_place()]);
+        let remote: Arc<dyn Remote> = fake.clone();
+        handle_pull(&remote, &cfg, Some("w1d1".into()), &base.display().to_string(), None, None, false, false, &chosen, false, true, &stub.path())
+            .await
+            .unwrap();
+        let said = crate::take_said();
+        assert!(!said.iter().any(|l| l.contains("moved")), "{said:#?}");
+        for (dir, old) in [("w1d1", "this morning's work"), ("big", "yesterday's work")] {
+            let held = base.join(dir).join("devtest-apple").join(format!(".arena-olddir-{}/ARENA_3.0/chapter1/old_work.py", arena_core::pull::aside_day(arena_core::snapshot::unix_now())));
+            assert_eq!(std::fs::read_to_string(held).unwrap(), old, "{dir}");
         }
         let _ = std::fs::remove_dir_all(&pod);
     }

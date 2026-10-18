@@ -734,6 +734,12 @@ pub const SECRET_EXCLUDES: &[&str] = &[
     "*.git/config.worktree",
     "*.git/modules/**/config",
     "*.git/worktrees/**/config.worktree",
+    // a directory a pull moved aside (`pull::move_aside`: `.arena-olddir-<day>/<name>`) or the
+    // operator did by hand (`<name>.olddir-<day>`): renamed, it would slip past every rule above
+    // that names it (review b5 #1: a moved `hf/` sent its `token`), and the archive already holds
+    // its contents under the old name — it never deletes
+    ".arena-olddir-*/",
+    "*.olddir-*/",
     // rsync's own holding areas and temp dirs — never shipped, whatever they are (a participant's
     // symlink named like one is exactly ARCH-SEC-1's attack)
     ".rsync-tmp",
@@ -876,10 +882,13 @@ pub fn munge_fits(len: usize) -> bool {
 }
 
 /// Directory names every push leaves out whole (the plain directory entries of
-/// [`SECRET_EXCLUDES`] and the pulls' temp dir): a link scan never walks into them (A3-9).
+/// [`SECRET_EXCLUDES`], its two moved-aside patterns, and the pulls' temp dir): a link scan never
+/// walks into them (A3-9).
 fn never_pushed_dir(name: &std::ffi::OsStr) -> bool {
     let Some(n) = name.to_str() else { return false };
     n == crate::pull::TEMP_DIR
+        || n.starts_with(crate::pull::HOLDING_PREFIX)
+        || n.contains(".olddir-")
         || SECRET_EXCLUDES.iter().any(|e| {
             let plain = e.strip_suffix('/').unwrap_or(e);
             plain == n && !plain.contains(['/', '*', '?', '['])
@@ -3028,6 +3037,62 @@ mod tests {
         assert_eq!(literal_rule("/", Path::new("new\nline")), "/new?line");
         assert_eq!(literal_rule("/", Path::new("c1\u{85}ctl")), "/c1??ctl", "a two-byte control character: two `?`");
         assert_eq!(literal_rule("/", Path::new(OsStr::from_bytes(b"[a]\xff"))), "/\\[a]?");
+    }
+
+    /// Review b5 #1: a pull moved a directory in the way aside by renaming it (`hf` →
+    /// `hf.olddir-<day>`), so every rule here that names it stopped matching, and the big push sent
+    /// an HF_HOME's `token` and a nested clone's `.git/config` to the cohort-readable archive
+    /// (reproduced with these flags). Now the pull keeps the name under a holding directory, and
+    /// no push takes a moved-aside directory at all, the pull's or the operator's (the archive
+    /// already holds what was in it, under the old name). Through the real forced command.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_moved_aside_never_takes_its_secrets_to_the_archive() {
+        let Some(rrsync) = rrsync_path() else { return };
+        let t = tmp("olddir-secrets");
+        let push = t.0.join("push");
+        std::fs::create_dir_all(push.join("big")).unwrap();
+        let tr = shim_transport(&t.0, "shim", &forced(rrsync, &push, true));
+        let src = t.0.join("backup");
+        let pod = src.join("big/devtest-apple");
+        let secret = format!("FAKE-SECRET-{}", std::process::id());
+        write(&pod.join("work.py"), "work\n");
+        write(&pod.join("hf/token"), &secret);
+        write(&pod.join("hf/README.md"), "not a secret, but moved aside\n");
+        write(&pod.join("proj/.git/config"), &format!("[remote \"origin\"]\n\turl = https://u:{secret}@github.com/o/r\n"));
+        write(&pod.join("proj/main.py"), "main\n");
+        // The pod made `hf` a link onto its volume and absorbed `proj/.git` into a gitdir file:
+        // the pull moves both aside, then places what the pod has.
+        for rel in ["hf", "proj/.git"] {
+            crate::pull::move_aside(&pod, Path::new(rel), "20261018").unwrap();
+        }
+        std::os::unix::fs::symlink("/workspace/hf", pod.join("hf")).unwrap();
+        write(&pod.join("proj/.git"), "gitdir: ../.git/modules/proj\n");
+        assert!(pod.join(".arena-olddir-20261018/hf/token").is_file() && pod.join("proj/.arena-olddir-20261018/.git/config").is_file());
+        // And the operator's own convention, by hand.
+        write(&pod.join("hf.olddir-20261017/token"), &secret);
+        write(&pod.join("old.olddir-20261017/notes.txt"), "notes\n");
+        let o = std::process::Command::new("rsync").args(push_args(&big_job(&src, &["devtest-apple".into()]), &tr, &settings(""))).output().unwrap();
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(classify_push(o.status.code(), &err, false).is_ok(), "{err}");
+        let got = push.join("big/devtest-apple");
+        assert!(got.join("work.py").is_file() && got.join("proj/main.py").is_file(), "the rest arrives");
+        let mut stack = vec![push.clone()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap().flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                assert!(!name.starts_with(".arena-olddir-") && !name.contains(".olddir-"), "a moved-aside directory reached the archive: {}", e.path().display());
+                let ft = e.file_type().unwrap();
+                if ft.is_dir() {
+                    stack.push(e.path());
+                } else if ft.is_file() {
+                    assert!(!std::fs::read_to_string(e.path()).unwrap_or_default().contains(&secret), "{}", e.path().display());
+                }
+            }
+        }
+        // The link scan doesn't walk them either: they never go.
+        let dir = |n: &str| never_pushed_dir(std::ffi::OsStr::new(n));
+        assert!(dir(".arena-olddir-20261018") && dir("hf.olddir-20261017") && !dir("hf") && !dir("olddir"));
     }
 
     // ---- review 3 (re-review of eb838a2) -------------------------------------------------------

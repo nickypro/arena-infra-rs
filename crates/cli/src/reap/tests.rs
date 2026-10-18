@@ -520,6 +520,9 @@ case "$last" in
     put "$last"; exit "$(cat "$d/exit_big" 2>/dev/null || echo 0)";;
 esac
 echo "rsync snapshot $last" >> "$d/calls.log"
+# Once: the directory an earlier pull left in the snapshot where the pod now has a symlink.
+if [ -f "$d/makeway_snap" ]; then rm -f "$d/makeway_snap"; mkdir -p "$last/ARENA_3.0" && echo 'old snap work' > "$last/ARENA_3.0/old.py"
+  echo 'could not make way for new symlink: ARENA_3.0' >&2; exit 23; fi
 echo "Number of regular files transferred: 1"
 put "$last"
 exit "$(cat "$d/exit_snap" 2>/dev/null || echo 0)"
@@ -936,7 +939,7 @@ async fn git_must_end_with_a_sentinel() {
 
 /// The live `[big]` failure (2026-10-17) in the reap's own copy: a directory in the pod's big
 /// folder where the pod now has a symlink failed the rsync (exit 23), and so every reap attempt.
-/// It is moved aside beside itself (nothing deleted), the rsync runs once more, the reap goes
+/// It is moved aside into `.arena-olddir-<day>/` (nothing deleted), the rsync runs once more, the reap goes
 /// ahead, the frozen copy holds the old directory too, and the run's notes say so.
 #[tokio::test]
 async fn a_directory_in_the_way_of_the_reaps_big_rsync_is_moved_aside_and_the_reap_goes_ahead() {
@@ -949,11 +952,37 @@ async fn a_directory_in_the_way_of_the_reaps_big_rsync_is_moved_aside_and_the_re
     assert_eq!(exit_code(&r), Some(0), "{out}");
     assert_eq!(w.terminated(), [("runpod".to_string(), "pa".to_string())], "{out}");
     assert_eq!(w.order().iter().filter(|l| l.starts_with("rsync big")).count(), 2, "{:#?}", w.order());
-    let aside = format!("ARENA_3.0.olddir-{}", arena_core::pull::aside_day(T0));
+    let aside = format!(".arena-olddir-{}/ARENA_3.0", arena_core::pull::aside_day(T0));
     assert_eq!(std::fs::read_to_string(big.join(&aside).join("old.py")).unwrap(), "old work");
     assert!(out.contains(&format!("devtest-alpha [big]: moved ARENA_3.0 aside to {aside} (a directory here, a symlink on the pod now; nothing deleted)")), "{out}");
     let tomb = &w.state().reaped["runpod:pa"];
     assert_eq!(std::fs::read_to_string(Path::new(tomb.big_dir.as_deref().unwrap()).join(&aside).join("old.py")).unwrap(), "old work");
+}
+
+/// The same in the reap's snapshot passes (review b5: untested — the reaper's snapshot loop could
+/// go back to a plain rsync and every reap of such a pod would fail again, with no test noticing):
+/// moved aside, that pass run once more, the reap goes ahead, the frozen snapshot holds the old
+/// directory, and the run's notes say so.
+#[tokio::test]
+async fn a_directory_in_the_way_of_the_reaps_snapshot_rsync_is_moved_aside_and_the_reap_goes_ahead() {
+    let (w, _) = due_world("makeway-snap", "").await;
+    w.put("makeway_snap", "");
+    let (r, out) = w.run("apply").await;
+    assert_eq!(exit_code(&r), Some(0), "{out}");
+    assert_eq!(w.terminated(), [("runpod".to_string(), "pa".to_string())], "{out}");
+    let snaps: Vec<String> = w.order().into_iter().filter_map(|l| l.strip_prefix("rsync snapshot ").map(String::from)).collect();
+    let (control, _) = due_world("makeway-snap-control", "").await;
+    control.step("apply").await;
+    let plain = control.order().iter().filter(|l| l.starts_with("rsync snapshot ")).count();
+    assert_eq!(snaps.len(), plain + 1, "the pass that failed, once more: {snaps:#?}");
+    let aside = format!(".arena-olddir-{}/ARENA_3.0", arena_core::pull::aside_day(T0));
+    assert_eq!(std::fs::read_to_string(Path::new(&snaps[0]).join(&aside).join("old.py")).unwrap(), "old snap work\n");
+    assert!(
+        out.contains(&format!("devtest-alpha [snapshot]: moved ARENA_3.0 aside to {aside} (a directory here, a symlink on the pod now; nothing deleted)")),
+        "{out}"
+    );
+    let tomb = &w.state().reaped["runpod:pa"];
+    assert_eq!(std::fs::read_to_string(Path::new(tomb.snapshot_dir.as_deref().unwrap()).join(&aside).join("old.py")).unwrap(), "old snap work\n");
 }
 
 /// The reap's git step is the backup's, with the configured repo: a pod whose `origin` isn't it

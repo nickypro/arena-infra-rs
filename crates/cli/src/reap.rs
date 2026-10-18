@@ -2219,9 +2219,9 @@ async fn backup(
         }
     }
     // A directory an earlier pull left where the pod now has a symlink (or a file) would fail
-    // these rsyncs on every attempt (exit 23): it is moved aside beside itself, nothing deleted,
-    // and the rsync run once more within the same budget (`pull::rsync_making_way`), said in
-    // the run's notes.
+    // these rsyncs on every attempt (exit 23): it is moved aside (into `.arena-olddir-<day>/`
+    // beside it, its name kept), nothing deleted, and the rsync run once more within the same
+    // budget (`pull::rsync_making_way`), said in the run's notes.
     let day = pull::aside_day((env.clock)());
     let said = |tier: &str, made: &pull::MadeWay| {
         let note = made.note();

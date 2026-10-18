@@ -998,8 +998,13 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     arena9-bloom [big]: timed out after 7200s`); the other pods finish, and the next run
     continues incrementally. **A directory where the pod now has a symlink** (or a file) —
     rsync's `could not make way for new symlink: ARENA_3.0`, exit 23, every run (live: 9 pods'
-    `[big]`) — is moved aside beside itself, `ARENA_3.0.olddir-<YYYYMMDD UTC>` (`-2`, `-3`… if
-    that's taken), at any depth and in any tier; nothing is deleted. Then that rsync runs once
+    `[big]`) — is moved aside into a holding directory beside it, its name kept:
+    `.arena-olddir-<YYYYMMDD UTC>/ARENA_3.0` (`-2`, `-3`… if that's taken), at any depth and in
+    any tier; nothing is deleted. Keeping the name keeps every name-based filter matching inside
+    it (the archive's secret excludes: `hf/token`, `.git/config`, …), and the archive never takes
+    a moved-aside directory at all. Only rsync's exit 23 is acted on; a pod can print the line
+    itself (its ssh session's output reaches rsync's stderr), but that only ever moves one of its
+    own backed-up directories aside, never deletes. Then that rsync runs once
     more within the same budget, and the pod's line says what moved. The path comes from rsync's
     stderr, so only a plain path inside the destination is acted on: never `..` or an absolute
     path, never through a symlink, and only a real directory is moved. (`--force` would have
@@ -1582,7 +1587,9 @@ deleted on its own.
   `.env*`, `.netrc`, `.gitconfig`, `.git-credentials`, `.pgpass`, `.s3cfg`, `.ssh/`, `.config/`,
   `.cache/`, `.claude*`, cloud and Kaggle credentials, Hugging Face token files, `id_*`/`*.pem`/
   `*.key` keys and every repo's git configs (`.git/config`, `config.worktree`, submodules', a
-  bare or mirror clone's `<name>.git/config`; git works without them) — `ARCHIVE_EXTRA_EXCLUDES` only adds to the list.
+  bare or mirror clone's `<name>.git/config`; git works without them). Nor does a directory a
+  pull moved aside (`.arena-olddir-<day>/`) or the operator did (`<name>.olddir-<day>/`): the
+  archive already holds its contents under the old name — `ARCHIVE_EXTRA_EXCLUDES` only adds to the list.
 - **Participants read** over sftp as one chrooted, read-only user (`backups`): read-only three
   times over (`internal-sftp -R`, read-only bind mounts, ownership). Laptops use the cohort key,
   pods a per-cohort read key `pods copy-keys` installs. **Access is OFF after `archive up`** until
