@@ -13072,6 +13072,8 @@ async fn pull_pods(
     let mut set = tokio::task::JoinSet::new();
     // Each running job's pod, by task: its lock goes when the pod's last job ends (RR3).
     let mut job_pod: std::collections::HashMap<tokio::task::Id, String> = Default::default();
+    // What a directory in the way of a symlink is renamed to today (`pull::rsync_making_way`).
+    let day = pull::aside_day(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()));
     let (mut jobs, mut failed) = (0, 0);
     // Which jobs failed, by name: the summary (and the cron log) must say which pod to look at.
     let mut failures: Vec<String> = Vec::new();
@@ -13128,23 +13130,28 @@ async fn pull_pods(
         // snapshot's files, then its `.git`) run one after the other, within one budget.
         let passes: Vec<(bool, Vec<String>)> =
             job.config.passes().iter().map(|pc| (pc.git_only, pull::rsync_args(t, pc, dest))).collect();
-        let (name, rsync) = (name.clone(), rsync.to_string());
+        let (name, rsync, day, into) = (name.clone(), rsync.to_string(), day.clone(), std::path::PathBuf::from(dest));
         jobs += 1;
         locks.expect(&name);
         let pod = name.clone();
         let handle = set.spawn(async move {
             let started = tokio::time::Instant::now();
             let mut stats: Option<pull::RsyncStats> = None;
+            // Directories moved out of the way of what the pod has now: said on the job's line.
+            let mut made = pull::MadeWay::default();
             for (i, (git, args)) in passes.into_iter().enumerate() {
                 let what = format!("rsync of {name} [{tier}{}]", if git { ", .git" } else { "" });
                 // The first pass gets the whole budget; a later one what's left of it (whole
-                // seconds, at least one).
+                // seconds, at least one). A pass that has to move a directory aside retries
+                // within its own share.
                 let left = if i == 0 {
                     budget
                 } else {
                     Duration::from_secs(budget.saturating_sub(started.elapsed()).as_secs().max(1))
                 };
-                match arena_core::remote::run_local(&rsync, &args, &what, Some(left)).await {
+                let (out, m) = pull::rsync_making_way(&rsync, &args, &into, &what, left, &day).await;
+                made.extend(m);
+                match out {
                     Ok(o) if o.success => {
                         let s = pull::parse_rsync_stats(&o.stdout);
                         stats = match (stats, s) {
@@ -13152,10 +13159,10 @@ async fn pull_pods(
                             (a, b) => a.or(b),
                         };
                     }
-                    failed => return (name, tier, Err((git, failed))),
+                    failed => return (name, tier, made, Err((git, failed))),
                 }
             }
-            (name, tier, Ok(stats))
+            (name, tier, made, Ok(stats))
         });
         job_pod.insert(handle.id(), pod);
     }
@@ -13164,7 +13171,7 @@ async fn pull_pods(
     let (mut ok, mut done) = (0, 0);
     while let Some(joined) = set.join_next_with_id().await {
         done += 1;
-        let (name, tier, out) = match joined {
+        let (name, tier, made, out) = match joined {
             Ok((id, r)) => {
                 if let Some(pod) = job_pod.remove(&id) {
                     locks.done(&pod);
@@ -13183,16 +13190,18 @@ async fn pull_pods(
                 continue;
             }
         };
+        // A directory moved aside (or refused) is said on the job's line, whatever the outcome.
+        let moved = made.note();
         match out {
             Ok(stats) => {
                 // Report what actually moved, so a pull isn't "silent".
                 let summary = stats.map_or_else(|| "done".into(), |s| s.summary());
-                println!("[{done}/{jobs}] ✓ {name} [{tier}] ({summary})");
+                say(&format!("[{done}/{jobs}] ✓ {name} [{tier}] ({summary}){moved}"));
                 ok += 1;
             }
             Err((git, Ok(o))) => {
                 let pass = if git { ", .git" } else { "" };
-                println!("[{done}/{jobs}] ✗ {name} [{tier}{pass}] (rsync {}): {}", o.exit_label(), o.stderr.trim());
+                say(&format!("[{done}/{jobs}] ✗ {name} [{tier}{pass}] (rsync {}): {}{moved}", o.exit_label(), o.stderr.trim()));
                 failed += 1;
                 failures.push(format!("{name} [{tier}]"));
                 by_pod.push((name.clone(), format!("[{tier}{pass}] rsync {}", o.exit_label())));
@@ -13201,7 +13210,7 @@ async fn pull_pods(
             // run continues incrementally), or rsync couldn't be started.
             Err((git, Err(e))) => {
                 let pass = if git { ", .git" } else { "" };
-                println!("[{done}/{jobs}] ✗ {name} [{tier}{pass}]: {}", describe_error(&e));
+                say(&format!("[{done}/{jobs}] ✗ {name} [{tier}{pass}]: {}{moved}", describe_error(&e)));
                 failed += 1;
                 failures.push(format!("{name} [{tier}] ({})", describe_error(&e)));
                 by_pod.push((name.clone(), format!("[{tier}{pass}] {}", describe_error(&e))));
@@ -20777,6 +20786,137 @@ mod remote_tests {
         );
         assert!(fallback_lines(&[], &pulled).is_empty());
         assert!(fallback_lines(&unpushed[2..], &pulled).is_empty(), "never copied: never said to be");
+    }
+
+    /// A stand-in `rsync` that runs the real one with the pull's own argv, the pod's side
+    /// (`root@10.0.0.1:<path>`) read from the local tree `pod` instead. `None` without an rsync.
+    fn local_pod_rsync(tag: &str, pod: &std::path::Path) -> Option<StubRsync> {
+        use std::os::unix::fs::PermissionsExt;
+        let real = std::process::Command::new("sh").args(["-c", "command -v rsync"]).output().ok()?;
+        let real = String::from_utf8_lossy(&real.stdout).trim().to_string();
+        if real.is_empty() {
+            return None;
+        }
+        let stub = StubRsync::new(tag);
+        std::fs::write(
+            stub.0.join("rsync"),
+            format!(
+                "#!/bin/sh\nfor a do\n  shift\n  case $a in root@10.0.0.1:*) a=\"{}/${{a#root@10.0.0.1:}}\";; esac\n  set -- \"$@\" \"$a\"\ndone\n\
+                 exec {real} \"$@\"\n",
+                pod.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(stub.0.join("rsync"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        Some(stub)
+    }
+
+    /// Live (2026-10-17): `pods backup` failed `[big]` on 9 pods every run, rsync exit 23 "could
+    /// not make way for new symlink: ARENA_3.0" — a directory in the backup where the pods now
+    /// have a symlink. Through the real pull and the real rsync: in both tiers the directory is
+    /// moved aside (nothing deleted), the rsync runs again, the pull succeeds, and the pod's line
+    /// says so.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_directory_that_became_a_symlink_on_the_pod_is_moved_aside_and_the_pull_succeeds() {
+        let pod = std::env::temp_dir().join(format!("arena-pull-pod-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&pod);
+        let Some(stub) = local_pod_rsync("makeway", &pod) else {
+            eprintln!("no rsync here: skipped");
+            return;
+        };
+        let put = |p: &std::path::Path, text: &str| {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        };
+        put(&pod.join("volume/ARENA_3.0/chapter1/new.py"), "today");
+        put(&pod.join("notes.md"), "notes");
+        std::os::unix::fs::symlink("volume/ARENA_3.0", pod.join("ARENA_3.0")).unwrap();
+        let base = stub.0.join("backups");
+        // What earlier pulls left: the directory, in the big tier and today's snapshot.
+        put(&base.join("big/devtest-apple/ARENA_3.0/chapter1/old_work.py"), "yesterday's work");
+        put(&base.join("w1d1/devtest-apple/ARENA_3.0/chapter1/old_work.py"), "this morning's work");
+        let cfg = Config::parse(&format!("MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple bloom cloud)\nBACKUP_REPO_PATH={REPO}\nSHARED_SSH_KEY_PATH=/nonexistent/k\n"));
+        let chosen = picked(&fleet(), &cfg, &["apple"]).await;
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [repo_in_place()]);
+        let remote: Arc<dyn Remote> = fake.clone();
+        let _ = crate::take_said();
+        handle_pull(&remote, &cfg, Some("w1d1".into()), &base.display().to_string(), None, None, false, false, &chosen, false, true, &stub.path())
+            .await
+            .unwrap();
+        let said = crate::take_said();
+        for (tier, dir, old) in [("snapshot", "w1d1", "this morning's work"), ("big", "big", "yesterday's work")] {
+            let dest = base.join(dir).join("devtest-apple");
+            assert_eq!(std::fs::read_link(dest.join("ARENA_3.0")).unwrap(), std::path::Path::new("volume/ARENA_3.0"), "{tier}");
+            let aside: Vec<String> = std::fs::read_dir(&dest)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with("ARENA_3.0.olddir-"))
+                .collect();
+            assert_eq!(aside.len(), 1, "{tier}: {aside:?}");
+            assert_eq!(std::fs::read_to_string(dest.join(&aside[0]).join("chapter1/old_work.py")).unwrap(), old, "{tier}");
+            assert_eq!(std::fs::read_to_string(dest.join("notes.md")).unwrap(), "notes", "{tier}");
+            let line = said.iter().find(|l| l.contains(&format!("✓ devtest-apple [{tier}] ("))).unwrap_or_else(|| panic!("{tier}: {said:#?}"));
+            assert!(
+                line.ends_with(&format!(
+                    " — moved ARENA_3.0 aside to {} (a directory here, a symlink on the pod now; nothing deleted)",
+                    aside[0]
+                )),
+                "{line}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&pod);
+    }
+
+    /// rsync's stderr is the only source of the path it couldn't replace, and a pod can put words
+    /// there. A path outside the destination (`..`, absolute) or through a symlink in it is never
+    /// acted on: everything stays where it was, the rsync isn't run again, the job fails as it
+    /// would have, and its line says what was left alone and why.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pull_never_moves_anything_rsync_names_outside_its_destination() {
+        use std::os::unix::fs::PermissionsExt;
+        let stub = StubRsync::new("makeway-spoof");
+        std::fs::write(
+            stub.0.join("rsync"),
+            "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\necho \"$last\" >> \"$(dirname \"$0\")/calls.log\"\n\
+             echo 'could not make way for new symlink: ../../outside/victim' >&2\n\
+             echo 'could not make way for new symlink: linked/victim' >&2\n\
+             echo 'could not make way for new regular file: /etc' >&2\nexit 23\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(stub.0.join("rsync"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let base = stub.0.join("backups");
+        let outside = stub.0.join("outside");
+        std::fs::create_dir_all(outside.join("victim")).unwrap();
+        std::fs::write(outside.join("victim/keep.txt"), "not ours").unwrap();
+        std::fs::create_dir_all(base.join("big/devtest-apple")).unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("big/devtest-apple/linked")).unwrap();
+        let cfg = Config::parse(&format!("MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple bloom cloud)\nBACKUP_REPO_PATH={REPO}\nSHARED_SSH_KEY_PATH=/nonexistent/k\n"));
+        let chosen = picked(&fleet(), &cfg, &["apple"]).await;
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [repo_in_place()]);
+        let remote: Arc<dyn Remote> = fake.clone();
+        let _ = crate::take_said();
+        let err = handle_pull(&remote, &cfg, Some("w1d1".into()), &base.display().to_string(), None, None, false, false, &chosen, false, true, &stub.path())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().starts_with("2 rsync job(s) failed"), "{err}");
+        assert_eq!(stub.take(), ["big/devtest-apple", "w1d1/devtest-apple"], "each job's first pass once: no retry");
+        let names = |d: &std::path::Path| std::fs::read_dir(d).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect::<Vec<_>>();
+        assert_eq!(names(&outside), ["victim"]);
+        assert_eq!(names(&outside.join("victim")), ["keep.txt"]);
+        assert!(std::fs::symlink_metadata(base.join("big/devtest-apple/linked")).unwrap().file_type().is_symlink());
+        let said = crate::take_said();
+        let big = said.iter().find(|l| l.contains("devtest-apple [big]")).unwrap();
+        assert!(
+            big.ends_with(
+                " — rsync couldn't replace, and left as it is: ../../outside/victim (not a path inside the destination), \
+                 linked/victim (linked on the way to it is a symlink here), /etc (not a path inside the destination)"
+            ),
+            "{big}"
+        );
     }
 
     /// `set-branch` pushes each pod's branch first. One GitHub refuses (a secret the redaction

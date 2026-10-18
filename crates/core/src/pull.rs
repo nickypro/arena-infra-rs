@@ -1231,6 +1231,257 @@ pub fn human_bytes(b: u64) -> String {
     b.to_string()
 }
 
+/// What rsync prints on stderr when a non-empty directory here is in the way of what the source
+/// now has at that path, a symlink or a file. rsync 3.2.7, reproduced with the pulls' own flags,
+/// prints `could not make way for new symlink: ARENA_3.0` and then exits 23 ("some files/attrs
+/// were not transferred"); everything else is copied. Live (2026-10-17), `ARENA_3.0` became a
+/// symlink on 9 pods while `big/<pod>/ARENA_3.0` was still the directory earlier pulls had made,
+/// so every pull of those pods failed `[big]` the same way.
+///
+/// rsync removes an empty directory in the way by itself, but never a non-empty one. Only
+/// `--force` makes it do that, and `--force` DELETES the backed-up files (so does a `--delete`
+/// mirror), which a backup must never do. The related `cannot delete non-empty directory: X`
+/// line only appears with `-vv`, and on stdout, so it is not what this reads.
+const MAKE_WAY: &str = "could not make way for new ";
+
+/// The kinds of entry a [`MAKE_WAY`] line names where a directory can be what's in the way,
+/// in rsync's own words. `directory` is not one of them: rsync replaces a file in a new
+/// directory's way by itself.
+const MAKE_WAY_KINDS: &[&str] = &["symlink", "regular file", "device file", "special file"];
+
+/// An entry a failed rsync couldn't replace ([`make_way_entries`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InTheWay {
+    /// Where it is, relative to the transfer's destination, as rsync named it (with its escapes
+    /// decoded). Not checked yet: see [`inside`].
+    pub path: PathBuf,
+    /// What the source has there now: `symlink`, `regular file`, …
+    pub kind: &'static str,
+}
+
+/// The entries a failed rsync's `stderr` says it couldn't replace ([`MAKE_WAY`]), in order, each
+/// once. Only whole lines that start with rsync's message count. The path is everything after
+/// `<kind>: `, spaces included (even a trailing one), with rsync's escapes decoded
+/// ([`decode_rsync_name`]). Pure.
+pub fn make_way_entries(stderr: &str) -> Vec<InTheWay> {
+    let mut out: Vec<InTheWay> = Vec::new();
+    for line in stderr.split('\n') {
+        // rsync escapes a real carriage return in a name (`\#015`), so a bare one is a line end.
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let Some(rest) = line.strip_prefix(MAKE_WAY) else { continue };
+        let found = MAKE_WAY_KINDS.iter().find_map(|kind| Some((*kind, rest.strip_prefix(kind)?.strip_prefix(": ")?)));
+        if let Some((kind, path)) = found.and_then(|(kind, name)| Some((kind, decode_rsync_name(name)?))) {
+            if !out.iter().any(|e| e.path == path) {
+                out.push(InTheWay { path, kind });
+            }
+        }
+    }
+    out
+}
+
+/// A file name as rsync prints it, decoded. rsync writes each byte it won't print raw as `\#`
+/// plus three octal digits: control characters and every non-ASCII byte (whatever the locale:
+/// `ñame` comes out as `\#303\#261ame`). It writes a backslash that would read as an escape as
+/// `\#134` (`q\#012z` comes out as `q\#134#012z`). `None` for an empty name. Pure.
+pub fn decode_rsync_name(s: &str) -> Option<PathBuf> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let octal = b.get(i + 2..i + 5).filter(|d| d.iter().all(|c| (b'0'..=b'7').contains(c)));
+        if let (true, Some(d)) = (b[i..].starts_with(b"\\#"), octal) {
+            let v = d.iter().fold(0u32, |v, c| v * 8 + u32::from(c - b'0'));
+            if let Ok(byte) = u8::try_from(v) {
+                out.push(byte);
+                i += 5;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    if out.is_empty() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Some(PathBuf::from(std::ffi::OsString::from_vec(out)))
+    }
+    #[cfg(not(unix))]
+    Some(PathBuf::from(String::from_utf8_lossy(&out).into_owned()))
+}
+
+/// Whether `rel` stays strictly inside the directory it is relative to: not empty, and every
+/// component a plain name. That rules out a root or prefix (an absolute path), `..` and `.`.
+/// The name comes from rsync's stderr, and a pod can put words there (rsync passes the remote
+/// side's messages on), so nothing is moved on its say-so unless this holds. Pure.
+pub fn inside(rel: &Path) -> bool {
+    !rel.as_os_str().is_empty() && rel.components().all(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
+/// The name a directory in the way is moved to, beside it: `<name>.olddir-<day>`, where `day` is
+/// `YYYYMMDD` ([`aside_day`]). That is the operator's own convention (`ARENA_3.0.olddir-20261017`).
+/// While `taken` says a name is used, it tries `…-2`, `…-3`, and so on. `None` after a thousand
+/// tries. Pure.
+pub fn aside_name(name: &std::ffi::OsStr, day: &str, taken: impl Fn(&std::ffi::OsStr) -> bool) -> Option<std::ffi::OsString> {
+    (1..=1000)
+        .map(|n| {
+            let mut s = name.to_os_string();
+            s.push(format!(".olddir-{day}"));
+            if n > 1 {
+                s.push(format!("-{n}"));
+            }
+            s
+        })
+        .find(|candidate| !taken(candidate))
+}
+
+/// [`aside_name`]'s day for `unix_secs`, in UTC: `YYYYMMDD`.
+pub fn aside_day(unix_secs: u64) -> String {
+    crate::restore::stamp(unix_secs)[..8].to_string()
+}
+
+/// Move the directory `dest/rel` aside, to its [`aside_name`] beside it, so the next rsync can put
+/// what the source now has in its place. Returns the new path, relative to `dest`. It is a rename
+/// within the entry's own parent, so nothing is copied and nothing is deleted.
+///
+/// Refused (`Err` says why, for the pod's line) unless all of these hold:
+/// - `rel` is [`inside`] `dest`;
+/// - every directory on the way to the entry is a real directory, never a symlink, so the rename
+///   can't reach outside `dest`;
+/// - the entry itself is a real directory.
+///
+/// Every check uses `symlink_metadata`, which never follows a link. `dest` itself is taken as
+/// given: it is the transfer's own destination (an operator may have linked a pod's folder onto
+/// another disk).
+pub fn move_aside(dest: &Path, rel: &Path, day: &str) -> std::result::Result<PathBuf, String> {
+    if !inside(rel) {
+        return Err("not a path inside the destination".into());
+    }
+    let names: Vec<&std::ffi::OsStr> = rel.iter().collect();
+    let Some((last, parents)) = names.split_last() else {
+        return Err("not a path inside the destination".into());
+    };
+    let kind = |m: &std::fs::Metadata| if m.file_type().is_symlink() { "a symlink" } else { "not a directory" };
+    let mut parent = dest.to_path_buf();
+    for name in parents {
+        parent.push(name);
+        let shown = parent.strip_prefix(dest).unwrap_or(&parent).display().to_string();
+        match std::fs::symlink_metadata(&parent) {
+            Ok(m) if m.file_type().is_dir() => {}
+            Ok(m) => return Err(format!("{shown} on the way to it is {} here", kind(&m))),
+            Err(e) => return Err(format!("{shown} on the way to it can't be read: {e}")),
+        }
+    }
+    let from = parent.join(last);
+    match std::fs::symlink_metadata(&from) {
+        Ok(m) if m.file_type().is_dir() => {}
+        Ok(m) => return Err(format!("it is {} here", kind(&m))),
+        Err(e) => return Err(format!("it can't be read: {e}")),
+    }
+    let taken = |candidate: &std::ffi::OsStr| {
+        !matches!(std::fs::symlink_metadata(parent.join(candidate)), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+    };
+    let to = aside_name(last, day, taken).ok_or("every name for it beside it is taken")?;
+    std::fs::rename(&from, parent.join(&to)).map_err(|e| format!("moving it aside failed: {e}"))?;
+    Ok(rel.with_file_name(to))
+}
+
+/// What [`make_way`] did in one destination.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MadeWay {
+    /// Each directory moved aside, as `(from, to, kind)`: paths relative to the destination,
+    /// and what the source has in its place now.
+    pub moved: Vec<(PathBuf, PathBuf, &'static str)>,
+    /// Each entry left as it is, and why.
+    pub refused: Vec<(PathBuf, String)>,
+}
+
+impl MadeWay {
+    /// Another pass's [`MadeWay`] into the same job's.
+    pub fn extend(&mut self, other: MadeWay) {
+        self.moved.extend(other.moved);
+        self.refused.extend(other.refused);
+    }
+
+    /// What a pod's line says about it: empty when nothing happened, else ` — moved ARENA_3.0
+    /// aside to ARENA_3.0.olddir-20261018 (a directory here, a symlink on the pod now; nothing
+    /// deleted)`, with each refusal after it.
+    pub fn note(&self) -> String {
+        let mut out = String::new();
+        let show = |p: &Path| p.display().to_string();
+        match &self.moved[..] {
+            [] => {}
+            [(from, to, kind)] => out.push_str(&format!(
+                " — moved {} aside to {} (a directory here, a {kind} on the pod now; nothing deleted)",
+                show(from),
+                show(to)
+            )),
+            many => {
+                let each: Vec<String> = many.iter().map(|(from, to, kind)| format!("{} → {} ({kind})", show(from), show(to))).collect();
+                out.push_str(&format!(
+                    " — moved {} directories aside (each something else on the pod now; nothing deleted): {}",
+                    many.len(),
+                    each.join(", ")
+                ));
+            }
+        }
+        if !self.refused.is_empty() {
+            let each: Vec<String> = self.refused.iter().map(|(p, why)| format!("{} ({why})", show(p))).collect();
+            out.push_str(&format!(" — rsync couldn't replace, and left as it is: {}", each.join(", ")));
+        }
+        out
+    }
+}
+
+/// Each entry a failed rsync into `dest` couldn't replace ([`make_way_entries`] of its `stderr`),
+/// moved aside ([`move_aside`]) or refused, with why. `day` names the moved directories.
+pub fn make_way(dest: &Path, stderr: &str, day: &str) -> MadeWay {
+    let mut made = MadeWay::default();
+    for e in make_way_entries(stderr) {
+        match move_aside(dest, &e.path, day) {
+            Ok(to) => made.moved.push((e.path, to, e.kind)),
+            Err(why) => made.refused.push((e.path, why)),
+        }
+    }
+    made
+}
+
+/// One backup rsync into `dest` (`program` + `args`, run by [`crate::remote::run_local`] within
+/// `budget`), made so that a directory left by an earlier pull can't fail it every run.
+///
+/// When rsync fails because directories here are in the way of what the source now has
+/// ([`make_way_entries`]), they are moved aside ([`make_way`]: renamed beside themselves, nothing
+/// deleted) and the same rsync runs once more, within what's left of `budget`. rsync is
+/// incremental, so the second run sends only what the first couldn't place. There is exactly one
+/// retry: whatever the second run returns is the result.
+///
+/// Anything else comes back exactly as rsync returned it, with nothing moved: any other failure,
+/// a first run whose entries were all refused, or one with less than a second of budget left.
+/// `day` names the moved directories ([`aside_day`]).
+pub async fn rsync_making_way(
+    program: &str,
+    args: &[String],
+    dest: &Path,
+    what: &str,
+    budget: Duration,
+    day: &str,
+) -> (Result<crate::ssh::SshOutput>, MadeWay) {
+    let started = tokio::time::Instant::now();
+    let first = crate::remote::run_local(program, args, what, Some(budget)).await;
+    let made = match &first {
+        Ok(o) if !o.success => make_way(dest, &o.stderr, day),
+        _ => return (first, MadeWay::default()),
+    };
+    // Whole seconds, as every other budget a pull hands rsync.
+    let left = Duration::from_secs(budget.saturating_sub(started.elapsed()).as_secs());
+    if made.moved.is_empty() || left.is_zero() {
+        return (first, made);
+    }
+    (crate::remote::run_local(program, args, what, Some(left)).await, made)
+}
+
 /// The `rsync` command for dry-run output, every argument shell-quoted where a shell would
 /// change it ([`crate::ssh::shell_word`]) — the globs (`'**/.git/**'`, `'models--*/'`) and the
 /// `-e` transport — so it pastes into a shell as exactly the argv that would run.
@@ -2208,6 +2459,296 @@ mod tests {
         }
         assert_eq!(std::fs::read_to_string(frozen.join("notebook.ipynb")).unwrap(), "v1 of the participant's work");
         assert_eq!(tree_count(&frozen).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A path from raw bytes (rsync's names needn't be UTF-8).
+    #[cfg(unix)]
+    fn os_path(b: &[u8]) -> PathBuf {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(std::ffi::OsStr::from_bytes(b))
+    }
+
+    /// What rsync 3.2.7 printed in real runs with the pulls' own flags (a local copy into a
+    /// destination holding a non-empty directory where the source has a symlink, or a file). The
+    /// path is relative to the destination, at any depth, with spaces as they are (a trailing one
+    /// too) and rsync's `\#ooo` escapes decoded. A line that only looks like it isn't one of
+    /// these, and neither is `-vv`'s `cannot delete non-empty directory`.
+    #[cfg(unix)]
+    #[test]
+    fn rsync_says_which_directory_is_in_the_way_and_nothing_else_reads_as_that() {
+        const TAIL: &str =
+            "rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1356) [sender=3.2.7]\n";
+        type Case = (&'static str, &'static [(&'static [u8], &'static str)]);
+        let cases: &[Case] = &[
+            ("could not make way for new symlink: ARENA_3.0\n", &[(b"ARENA_3.0", "symlink")]),
+            ("could not make way for new symlink: a b/c d/my link\n", &[(b"a b/c d/my link", "symlink")]),
+            ("could not make way for new regular file: F\n", &[(b"F", "regular file")]),
+            ("could not make way for new symlink: sp \n", &[(b"sp ", "symlink")]),
+            ("could not make way for new symlink: a\\#012b\n", &[(b"a\nb", "symlink")]),
+            ("could not make way for new symlink: q\\#134#012z\n", &[(b"q\\#012z", "symlink")]),
+            ("could not make way for new symlink: \\#303\\#261ame\n", &[(b"\xc3\xb1ame", "symlink")]),
+            (
+                "could not make way for new symlink: L1\ncould not make way for new symlink: L2\n",
+                &[(b"L1", "symlink"), (b"L2", "symlink")],
+            ),
+            ("could not make way for new symlink: L\r\ncould not make way for new symlink: L\n", &[(b"L", "symlink")]),
+            // Not an escape: as written.
+            ("could not make way for new symlink: a\\#400b\\#12\n", &[(b"a\\#400b\\#12", "symlink")]),
+            // Not rsync's message for a directory in the way: nothing.
+            ("cannot delete non-empty directory: L\n", &[]),
+            ("rsync: [generator] could not make way for new symlink: L\n", &[]),
+            ("could not make way for backup symlink: L\n", &[]),
+            ("could not make way for new directory: D\n", &[]),
+            ("could not make way for new socket: L\n", &[]),
+            ("could not make way for new symlink: \n", &[]),
+            ("could not make way for new symlink:L\n", &[]),
+            ("", &[]),
+        ];
+        for (stderr, want) in cases {
+            let want: Vec<InTheWay> = want.iter().map(|(p, kind)| InTheWay { path: os_path(p), kind }).collect();
+            assert_eq!(make_way_entries(&format!("{stderr}{TAIL}")), want, "{stderr:?}");
+        }
+    }
+
+    /// The names are rsync's stderr, which a pod can put words into: only a plain relative path
+    /// is ever acted on.
+    #[test]
+    fn only_a_plain_relative_path_is_inside() {
+        let cases = [
+            ("ARENA_3.0", true),
+            ("a b/c d/my link", true),
+            ("a/b", true),
+            ("a//b", true),
+            ("a/./b", true),
+            ("...", true),
+            (".hidden", true),
+            ("", false),
+            ("/", false),
+            ("/etc", false),
+            ("/root/big/devtest-apple/ARENA_3.0", false),
+            ("..", false),
+            ("../x", false),
+            ("a/../b", false),
+            ("a/..", false),
+            (".", false),
+            ("./a", false),
+        ];
+        for (p, ok) in cases {
+            assert_eq!(inside(Path::new(p)), ok, "{p:?}");
+        }
+    }
+
+    /// The operator's name for a set-aside directory, the day in UTC, and never a name already
+    /// there.
+    #[test]
+    fn a_directory_goes_aside_under_the_operators_name_and_never_onto_another() {
+        use std::ffi::OsStr;
+        assert_eq!(aside_name(OsStr::new("ARENA_3.0"), "20261017", |_| false).unwrap(), "ARENA_3.0.olddir-20261017");
+        let taken = ["ARENA_3.0.olddir-20261017", "ARENA_3.0.olddir-20261017-2"];
+        let got = aside_name(OsStr::new("ARENA_3.0"), "20261017", |c| taken.iter().any(|t| c == OsStr::new(t)));
+        assert_eq!(got.unwrap(), "ARENA_3.0.olddir-20261017-3");
+        assert_eq!(aside_name(OsStr::new("x"), "20261017", |_| true), None, "a thousand taken: no name");
+        assert_eq!(aside_day(1_792_238_400), "20261017", "2026-10-17 12:00 UTC");
+        assert_eq!(aside_day(1_792_281_599), "20261017");
+        assert_eq!(aside_day(1_792_281_600), "20261018");
+    }
+
+    /// The directory in the way is renamed beside itself, with everything in it, at any depth,
+    /// never onto another name. Anything else is refused and left exactly where it was: a path
+    /// with `..`, an absolute one, one whose way runs through a symlink (which would reach
+    /// outside the destination), and an entry that is a symlink or a file.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_in_the_way_moves_aside_within_its_parent_and_nothing_outside_is_reached() {
+        let root = std::env::temp_dir().join(format!("arena-pull-aside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (dest, outside) = (root.join("big/devtest-apple"), root.join("outside"));
+        let put = |p: &Path, text: &str| {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        };
+        put(&dest.join("ARENA_3.0/chapter1/old_work.py"), "yesterday's work");
+        put(&dest.join("ARENA_3.0/top.txt"), "top");
+        let before = tree_count(&dest.join("ARENA_3.0")).unwrap();
+        let day = "20261017";
+        assert_eq!(move_aside(&dest, Path::new("ARENA_3.0"), day).unwrap(), Path::new("ARENA_3.0.olddir-20261017"));
+        assert!(std::fs::symlink_metadata(dest.join("ARENA_3.0")).is_err(), "the name is free for what the pod has");
+        assert_eq!(tree_count(&dest.join("ARENA_3.0.olddir-20261017")).unwrap(), before, "everything kept");
+        assert_eq!(std::fs::read_to_string(dest.join("ARENA_3.0.olddir-20261017/chapter1/old_work.py")).unwrap(), "yesterday's work");
+        // The same again the same day: never onto a name already there, even a dangling link.
+        put(&dest.join("ARENA_3.0/again.py"), "again");
+        std::os::unix::fs::symlink("/nonexistent", dest.join("ARENA_3.0.olddir-20261017-2")).unwrap();
+        assert_eq!(move_aside(&dest, Path::new("ARENA_3.0"), day).unwrap(), Path::new("ARENA_3.0.olddir-20261017-3"));
+        assert_eq!(tree_count(&dest.join("ARENA_3.0.olddir-20261017")).unwrap(), before, "the first one untouched");
+        // Deep, with spaces: within its own parent.
+        put(&dest.join("a b/c d/my link/f.txt"), "f");
+        assert_eq!(move_aside(&dest, Path::new("a b/c d/my link"), day).unwrap(), Path::new("a b/c d/my link.olddir-20261017"));
+        assert!(dest.join("a b/c d/my link.olddir-20261017/f.txt").is_file());
+
+        // Refused, everything left as it was.
+        put(&outside.join("victim/keep.txt"), "not ours");
+        put(&dest.join("file.txt"), "a file");
+        std::os::unix::fs::symlink(&outside, dest.join("linked")).unwrap();
+        std::os::unix::fs::symlink(outside.join("victim"), dest.join("alink")).unwrap();
+        let absolute = outside.join("victim").display().to_string();
+        let cases: [(&str, &str); 8] = [
+            ("../../outside/victim", "not a path inside the destination"),
+            ("ARENA_3.0.olddir-20261017/../../../outside/victim", "not a path inside the destination"),
+            (&absolute, "not a path inside the destination"),
+            ("linked/victim", "linked on the way to it is a symlink here"),
+            ("alink", "it is a symlink here"),
+            ("file.txt", "it is not a directory here"),
+            ("file.txt/x", "file.txt on the way to it is not a directory here"),
+            ("missing", "it can't be read"),
+        ];
+        let listing = |d: &Path| {
+            let mut names: Vec<String> = std::fs::read_dir(d).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+            names.sort();
+            names
+        };
+        let (dest_before, outside_before) = (listing(&dest), listing(&outside));
+        for (rel, why) in cases {
+            let err = move_aside(&dest, Path::new(rel), day).unwrap_err();
+            assert!(err.contains(why), "{rel}: {err}");
+        }
+        assert_eq!((listing(&dest), listing(&outside)), (dest_before, outside_before), "nothing renamed anywhere");
+        assert_eq!(listing(&outside.join("victim")), ["keep.txt"]);
+        assert!(std::fs::symlink_metadata(dest.join("linked")).unwrap().file_type().is_symlink());
+
+        // `make_way` over a stderr naming all of it: each said on the pod's line.
+        put(&dest.join("ARENA_3.0/new_dir_again.py"), "x");
+        let stderr = "could not make way for new symlink: ARENA_3.0\ncould not make way for new symlink: linked/victim\n\
+                      could not make way for new regular file: ../../outside/victim\n";
+        let made = make_way(&dest, stderr, "20261018");
+        assert_eq!(made.moved, [(PathBuf::from("ARENA_3.0"), PathBuf::from("ARENA_3.0.olddir-20261018"), "symlink")]);
+        assert_eq!(made.refused.len(), 2, "{made:?}");
+        assert_eq!(
+            made.note(),
+            " — moved ARENA_3.0 aside to ARENA_3.0.olddir-20261018 (a directory here, a symlink on the pod now; nothing deleted) \
+             — rsync couldn't replace, and left as it is: linked/victim (linked on the way to it is a symlink here), \
+             ../../outside/victim (not a path inside the destination)"
+        );
+        assert_eq!(listing(&outside.join("victim")), ["keep.txt"]);
+        let two = MadeWay {
+            moved: vec![
+                (PathBuf::from("ARENA_3.0"), PathBuf::from("ARENA_3.0.olddir-20261018"), "symlink"),
+                (PathBuf::from("data"), PathBuf::from("data.olddir-20261018"), "regular file"),
+            ],
+            refused: vec![],
+        };
+        assert_eq!(
+            two.note(),
+            " — moved 2 directories aside (each something else on the pod now; nothing deleted): ARENA_3.0 → \
+             ARENA_3.0.olddir-20261018 (symlink), data → data.olddir-20261018 (regular file)"
+        );
+        assert_eq!(MadeWay::default().note(), "");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The live failure, through the real rsync with the big tier's own flags: a directory here
+    /// where the pod now has a symlink, at the top and deeper down. rsync copies the rest and exits
+    /// 23. Through [`rsync_making_way`], both directories are moved aside with everything in them,
+    /// the rsync runs once more and succeeds, and the links are in place. The next run has nothing
+    /// in its way.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_directory_that_became_a_symlink_is_moved_aside_and_the_rsync_succeeds() {
+        if std::process::Command::new("rsync").arg("--version").output().is_err() {
+            eprintln!("no rsync here: skipped");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("arena-pull-makeway-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (pod, dest) = (root.join("pod"), root.join("big/devtest-apple"));
+        let put = |p: &Path, text: &str| {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        };
+        put(&pod.join("volume/ARENA_3.0/chapter1/new.py"), "today");
+        put(&pod.join("notes.md"), "notes");
+        std::os::unix::fs::symlink("volume/ARENA_3.0", pod.join("ARENA_3.0")).unwrap();
+        std::fs::create_dir_all(pod.join("deep/x")).unwrap();
+        std::os::unix::fs::symlink("../../volume", pod.join("deep/x/L")).unwrap();
+        put(&dest.join("ARENA_3.0/chapter1/old_work.py"), "yesterday's work");
+        put(&dest.join("deep/x/L/old.py"), "older");
+        // The big tier's argv, the pod's side read from `pod` (as the tests above do).
+        let mut args = rsync_args(&target(), &PullConfig::big_tier(), &format!("{}/", dest.display()));
+        let e = args.iter().position(|a| a == "-e").unwrap();
+        args.drain(e..e + 2);
+        let n = args.len();
+        args[n - 2] = format!("{}/", pod.display());
+        let budget = Duration::from_secs(60);
+        let first = crate::remote::run_local("rsync", &args, "rsync", Some(budget)).await.unwrap();
+        assert_eq!(first.code, Some(23), "{}", first.stderr);
+        let paths: Vec<PathBuf> = make_way_entries(&first.stderr).into_iter().map(|e| e.path).collect();
+        assert_eq!(paths, [PathBuf::from("ARENA_3.0"), PathBuf::from("deep/x/L")], "{}", first.stderr);
+        assert!(dest.join("notes.md").is_file(), "the rest was copied");
+
+        let (out, made) = rsync_making_way("rsync", &args, &dest, "rsync of devtest-apple [big]", budget, "20261017").await;
+        let out = out.unwrap();
+        assert!(out.success, "{}", out.stderr);
+        assert_eq!(
+            made.moved,
+            [
+                (PathBuf::from("ARENA_3.0"), PathBuf::from("ARENA_3.0.olddir-20261017"), "symlink"),
+                (PathBuf::from("deep/x/L"), PathBuf::from("deep/x/L.olddir-20261017"), "symlink"),
+            ]
+        );
+        assert_eq!(std::fs::read_link(dest.join("ARENA_3.0")).unwrap(), Path::new("volume/ARENA_3.0"));
+        assert_eq!(std::fs::read_link(dest.join("deep/x/L")).unwrap(), Path::new("../../volume"));
+        assert_eq!(std::fs::read_to_string(dest.join("volume/ARENA_3.0/chapter1/new.py")).unwrap(), "today");
+        assert_eq!(std::fs::read_to_string(dest.join("ARENA_3.0.olddir-20261017/chapter1/old_work.py")).unwrap(), "yesterday's work");
+        assert_eq!(std::fs::read_to_string(dest.join("deep/x/L.olddir-20261017/old.py")).unwrap(), "older");
+
+        let (out, made) = rsync_making_way("rsync", &args, &dest, "rsync", budget, "20261018").await;
+        assert!(out.unwrap().success);
+        assert_eq!(made, MadeWay::default(), "nothing in the way any more");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The retry is one: a second failure is the result, whatever it says. There is none when
+    /// nothing could be moved, for any other failure, or with under a second of the budget left
+    /// (the directory still goes aside, so the next run gets through).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_rsync_is_retried_once_and_only_when_a_directory_was_moved_in_time() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("arena-pull-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dest = root.join("dest");
+        std::fs::create_dir_all(dest.join("L/sub")).unwrap();
+        // A stand-in rsync: counts its runs, and fails like the live one every time.
+        let stub = root.join("rsync");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\necho run >> \"$(dirname \"$0\")/runs\"\n[ -z \"$1\" ] || sleep \"$1\"\n\
+             echo 'could not make way for new symlink: L' >&2\necho 'rsync error: (code 23)' >&2\nexit 23\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let program = stub.display().to_string();
+        let runs = || {
+            let n = std::fs::read_to_string(root.join("runs")).map(|t| t.lines().count()).unwrap_or(0);
+            let _ = std::fs::remove_file(root.join("runs"));
+            n
+        };
+        let budget = Duration::from_secs(30);
+        // Every run fails: moved once, run twice, the second failure returned.
+        let (out, made) = rsync_making_way(&program, &[], &dest, "rsync", budget, "20261017").await;
+        assert_eq!((out.unwrap().code, made.moved.len(), runs()), (Some(23), 1, 2));
+        assert!(dest.join("L.olddir-20261017/sub").is_dir());
+        // `L` is gone now: nothing to move, no second run, the refusal said.
+        let (out, made) = rsync_making_way(&program, &[], &dest, "rsync", budget, "20261017").await;
+        assert_eq!((out.unwrap().code, made.moved.len(), made.refused.len(), runs()), (Some(23), 0, 1, 1));
+        // Any other failure: as it was.
+        let (out, made) = rsync_making_way("sh", &["-c".into(), "echo 'rsync: connection unexpectedly closed' >&2; exit 12".into()], &dest, "rsync", budget, "20261017").await;
+        assert_eq!((out.unwrap().code, made), (Some(12), MadeWay::default()));
+        // Under a second left after the first run: moved aside, not run again.
+        std::fs::create_dir_all(dest.join("L/sub")).unwrap();
+        let (out, made) = rsync_making_way(&program, &["1.2".into()], &dest, "rsync", Duration::from_secs(2), "20261017").await;
+        assert_eq!((out.unwrap().code, made.moved.len(), runs()), (Some(23), 1, 1));
+        assert!(dest.join("L.olddir-20261017-2/sub").is_dir());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

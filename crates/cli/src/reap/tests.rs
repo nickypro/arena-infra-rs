@@ -511,7 +511,10 @@ esac
 # What the pod holds now ($d/content), written as rsync does: a temp file renamed over the old.
 put() { mkdir -p "$1" && cat "$d/content" > "$1/.work.tmp" 2>/dev/null || echo v1 > "$1/.work.tmp"; mv "$1/.work.tmp" "$1/work.txt"; }
 case "$last" in
-  */snap/big/*) echo "rsync big $last" >> "$d/calls.log"; printf '%s\n' "$@" > "$d/big_args"; [ -f "$d/hang_big" ] && sleep 5; put "$last"; exit "$(cat "$d/exit_big" 2>/dev/null || echo 0)";;
+  */snap/big/*) echo "rsync big $last" >> "$d/calls.log"; printf '%s\n' "$@" > "$d/big_args"; [ -f "$d/hang_big" ] && sleep 5
+    # Once: a directory here where the pod now has a symlink (rsync's own words, exit 23).
+    if [ -f "$d/makeway_big" ]; then rm -f "$d/makeway_big"; echo 'could not make way for new symlink: ARENA_3.0' >&2; exit 23; fi
+    put "$last"; exit "$(cat "$d/exit_big" 2>/dev/null || echo 0)";;
 esac
 echo "rsync snapshot $last" >> "$d/calls.log"
 echo "Number of regular files transferred: 1"
@@ -925,6 +928,28 @@ async fn git_must_end_with_a_sentinel() {
     w.step("apply").await;
     assert_eq!(w.terminated().len(), 1);
     assert!(!w.calls_to(22001).contains(&"git"));
+}
+
+/// The live `[big]` failure (2026-10-17) in the reap's own copy: a directory in the pod's big
+/// folder where the pod now has a symlink failed the rsync (exit 23), and so every reap attempt.
+/// It is moved aside beside itself (nothing deleted), the rsync runs once more, the reap goes
+/// ahead, the frozen copy holds the old directory too, and the run's notes say so.
+#[tokio::test]
+async fn a_directory_in_the_way_of_the_reaps_big_rsync_is_moved_aside_and_the_reap_goes_ahead() {
+    let (w, _) = due_world("makeway", "").await;
+    let big = w.dir.join("snap/big/devtest-alpha");
+    std::fs::create_dir_all(big.join("ARENA_3.0")).unwrap();
+    std::fs::write(big.join("ARENA_3.0/old.py"), "old work").unwrap();
+    w.put("makeway_big", "");
+    let (r, out) = w.run("apply").await;
+    assert_eq!(exit_code(&r), Some(0), "{out}");
+    assert_eq!(w.terminated(), [("runpod".to_string(), "pa".to_string())], "{out}");
+    assert_eq!(w.order().iter().filter(|l| l.starts_with("rsync big")).count(), 2, "{:#?}", w.order());
+    let aside = format!("ARENA_3.0.olddir-{}", arena_core::pull::aside_day(T0));
+    assert_eq!(std::fs::read_to_string(big.join(&aside).join("old.py")).unwrap(), "old work");
+    assert!(out.contains(&format!("devtest-alpha [big]: moved ARENA_3.0 aside to {aside} (a directory here, a symlink on the pod now; nothing deleted)")), "{out}");
+    let tomb = &w.state().reaped["runpod:pa"];
+    assert_eq!(std::fs::read_to_string(Path::new(tomb.big_dir.as_deref().unwrap()).join(&aside).join("old.py")).unwrap(), "old work");
 }
 
 /// Scenario 7 (I7): Vast's listing fails while RunPod's works — only RunPod is considered;

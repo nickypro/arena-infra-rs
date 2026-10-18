@@ -2215,9 +2215,23 @@ async fn backup(
             return ev;
         }
     }
+    // A directory an earlier pull left where the pod now has a symlink (or a file) would fail
+    // these rsyncs on every attempt (exit 23): it is moved aside beside itself, nothing deleted,
+    // and the rsync run once more within the same budget (`pull::rsync_making_way`), said in
+    // the run's notes.
+    let day = pull::aside_day((env.clock)());
+    let said = |tier: &str, made: &pull::MadeWay| {
+        let note = made.note();
+        if !note.is_empty() {
+            ctx.note(format!("{} [{tier}]: {}", pod.name, note.trim_start_matches(" — ")));
+        }
+    };
     for pass in snap.passes() {
         let args = pull::rsync_args(t, &pass, snapshot_dir);
-        let end = step_end(arena_core::remote::run_local(&env.rsync, &args, &format!("reap rsync of {} [snapshot]", pod.name), Some(left(dest.budget))).await);
+        let what = format!("reap rsync of {} [snapshot]", pod.name);
+        let (out, made) = pull::rsync_making_way(&env.rsync, &args, Path::new(snapshot_dir), &what, left(dest.budget), &day).await;
+        said("snapshot", &made);
+        let end = step_end(out);
         let ok = matches!(end, StepEnd::Exit { code: 0, .. });
         ev.snapshot.push(end);
         if !ok {
@@ -2227,7 +2241,10 @@ async fn backup(
     }
     // RS2: the reap's own big tier — dot-directories kept, only the documented caches left out.
     let big = PullConfig { rsync_path: guard, ..PullConfig::reap_tier() };
-    ev.big = step_end(arena_core::remote::run_local(&env.rsync, &pull::rsync_args(t, &big, big_dir), &format!("reap rsync of {} [big]", pod.name), Some(left(dest.budget))).await);
+    let what = format!("reap rsync of {} [big]", pod.name);
+    let (out, made) = pull::rsync_making_way(&env.rsync, &pull::rsync_args(t, &big, big_dir), Path::new(big_dir), &what, left(dest.budget), &day).await;
+    said("big", &made);
+    ev.big = step_end(out);
     if matches!(ev.big, StepEnd::Exit { code: 0, .. }) {
         ev.verify = step_end(
             arena_core::remote::run_local(&env.rsync, &pull::verify_args(t, &big, big_dir), &format!("reap verify of {}", pod.name), Some(left(dest.budget))).await,

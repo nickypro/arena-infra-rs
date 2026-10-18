@@ -985,8 +985,15 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     SIGKILL 2 s later) before the failure is reported — so nothing is left running even when
     it was the last job and arena exits right after — and named in the failure (`✗
     arena9-bloom [big]: timed out after 7200s`); the other pods finish, and the next run
-    continues incrementally. A repo that setup **linked onto the `/workspace` volume** is
-    still backed up as its tree (rsync `-a`
+    continues incrementally. **A directory where the pod now has a symlink** (or a file) —
+    rsync's `could not make way for new symlink: ARENA_3.0`, exit 23, every run (live: 9 pods'
+    `[big]`) — is moved aside beside itself, `ARENA_3.0.olddir-<YYYYMMDD UTC>` (`-2`, `-3`… if
+    that's taken), at any depth and in any tier; nothing is deleted. Then that rsync runs once
+    more within the same budget, and the pod's line says what moved. The path comes from rsync's
+    stderr, so only a plain path inside the destination is acted on: never `..` or an absolute
+    path, never through a symlink, and only a real directory is moved. (`--force` would have
+    deleted the backed-up directory.) The reaper's own copy does the same. A repo that setup
+    **linked onto the `/workspace` volume** is still backed up as its tree (rsync `-a`
     copies a link as a link): each pod is first asked (20s) where its repo really is, and a
     linked one is left out of the pull and pulled from its real path into the same place
     (`<dir>/<label>/<pod>/ARENA_materials/`), so the backup looks as it always did; a pod that
