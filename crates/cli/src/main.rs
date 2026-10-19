@@ -5420,18 +5420,19 @@ fn failure_why(call: &PodCall) -> String {
 
 /// The stderr line that says what went wrong: the first one that starts (trimmed) like git's or
 /// ssh's own verdict — `ERROR:`, `fatal:`, `error:`, `remote: error`, `! [rejected]`,
-/// `! [remote rejected]`, `ssh:` — or that holds `Permission denied`, else the last non-empty
-/// line. The last line alone is often the tail of a longer message (live: a push to a missing
+/// `! [remote rejected]`, `ssh:` — or that holds ssh's `Permission denied (publickey`, else the
+/// last non-empty line. The last line alone is often the tail of a longer message (live: a push to a missing
 /// repo gave `and the repository exists.`, the end of git's advice, where its first line said
 /// `ERROR: Repository not found.`). ssh's own line comes before git's `fatal: Could not read
 /// from remote repository.` and names the cause that one hides: `git@github.com: Permission
-/// denied (publickey).` (live: the deploy key gone), `ssh: connect to host … timed out`.
-/// `None` for an empty stderr. Pure.
+/// denied (publickey).` (live: the deploy key gone), `ssh: connect to host … timed out`. Only
+/// ssh's wording: a `warning: could not open directory …: Permission denied` from `git add`
+/// says nothing about a failed push (review fb2 R5). `None` for an empty stderr. Pure.
 fn telling_line(stderr: &str) -> Option<&str> {
     const VERDICTS: &[&str] = &["ERROR:", "fatal:", "error:", "remote: error", "! [rejected]", "! [remote rejected]", "ssh:"];
     let lines = || stderr.lines().map(str::trim).filter(|l| !l.is_empty());
     lines()
-        .find(|l| VERDICTS.iter().any(|v| l.starts_with(v)) || l.contains("Permission denied"))
+        .find(|l| VERDICTS.iter().any(|v| l.starts_with(v)) || l.contains("Permission denied (publickey"))
         .or_else(|| lines().next_back())
 }
 
@@ -20917,6 +20918,8 @@ mod remote_tests {
             ("remote: Resolving deltas: 100% (3/3)\nremote: error: File big.bin is 120.00 MB; this exceeds GitHub's file size limit\nTo github.com:o/r.git\n ! [remote rejected] x -> x (pre-receive hook declined)\nerror: failed to push some refs\n", Some("remote: error: File big.bin is 120.00 MB; this exceeds GitHub's file size limit")),
             ("To /root/gh013.git\n ! [remote rejected] x -> x (pre-receive hook declined)\n", Some("! [remote rejected] x -> x (pre-receive hook declined)")),
             ("error: src refspec x does not match any\n", Some("error: src refspec x does not match any")),
+            // A harmless `Permission denied` earlier on (git add, a mount it can't read) isn't the push's.
+            ("warning: could not open directory 'data/mnt/': Permission denied\nTo github.com:o/r.git\n ! [rejected]        x -> x (non-fast-forward)\n", Some("! [rejected]        x -> x (non-fast-forward)")),
             // No verdict: the last non-empty line, as before.
             ("Warning: Permanently added 'github.com' to the list of known hosts.\nsh: 1: cd: can't cd to /root/x\n\n", Some("sh: 1: cd: can't cd to /root/x")),
             // A verdict word mid-line is not a verdict line.
@@ -22769,6 +22772,33 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
             handle_pods(pods(&["backup", "--no-pull"]), &account(), fake.clone(), &cfg, true).await.unwrap();
             assert_eq!(ports(&fake), COHORT_PORTS);
             take_said();
+        }
+
+        /// Review (fb2 R8): each of the four commands passes `--include-non-cohort` through. Without
+        /// it the ⊘ line is said (the rest left out); with it nothing is left out, so nothing is said —
+        /// and `backup` reaches every pod. (`pull` and the switches as dry runs: no rsync, no switch.)
+        #[tokio::test(start_paused = true)]
+        async fn include_non_cohort_reaches_every_pod_through_each_command() {
+            let cfg = account_cfg("");
+            take_said();
+            let runs: &[&[&str]] = &[
+                &["backup", "--no-pull"],
+                &["pull", "--label", "w1d2", "--dry-run"],
+                &["init-branches", "--week", "1", "--day", "2", "--dry-run"],
+                &["set-branch", "main", "--all", "--dry-run"],
+            ];
+            for argv in runs {
+                let fake = Arc::new(FakeRemote::new());
+                handle_pods(pods(argv), &account(), fake.clone(), &cfg, true).await.unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+                assert!(take_said().iter().any(|l| l == LEFT_OUT), "{argv:?}: the default leaves them out");
+                let with = [*argv, &["--include-non-cohort"]].concat();
+                let fake = Arc::new(FakeRemote::new());
+                handle_pods(pods(&with), &account(), fake.clone(), &cfg, true).await.unwrap_or_else(|e| panic!("{with:?}: {e}"));
+                assert!(!take_said().iter().any(|l| l.starts_with("⊘ skipped")), "{with:?}: nothing left out");
+                if argv[0] == "backup" {
+                    assert_eq!(ports(&fake), [22001, 22002, 22003, 22004, 22005, 22006, 22007], "{with:?}");
+                }
+            }
         }
 
         #[tokio::test(start_paused = true)]

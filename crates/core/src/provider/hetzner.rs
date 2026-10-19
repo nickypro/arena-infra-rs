@@ -1174,6 +1174,16 @@ mod tests {
                  — pass --server-type <one of those> (or set HETZNER_SERVER_TYPE), or pick another HETZNER_LOCATION"
             )
         );
+        // Low on stock outranks recommended and the API's order: a type that's available goes first.
+        let mixed = [
+            json!({"name": "cx23", "locations": [{"name": "nbg1", "deprecation": null, "available": false, "recommended": true}]}),
+            json!({"name": "cax11", "locations": [{"name": "nbg1", "deprecation": null, "available": true, "recommended": false}]}),
+        ];
+        assert!(
+            type_advice(&mixed, "cpx41", Some("nbg1"), now).unwrap().contains("available there: cax11, cx23 (low availability) — "),
+            "{:?}",
+            type_advice(&mixed, "cpx41", Some("nbg1"), now)
+        );
         // An older answer without the flags: offered as before.
         let unflagged = [json!({"name": "cx22", "cores": 2, "memory": 4, "locations": [{"name": "nbg1", "deprecation": null}]})];
         assert!(type_advice(&unflagged, "cpx41", Some("nbg1"), now).unwrap().contains("available there: cx22 (2 vCPU, 4 GB) — "));
