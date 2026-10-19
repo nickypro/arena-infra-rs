@@ -1,0 +1,17 @@
+{
+ "request": {
+  "method": "POST",
+  "path": "/v2/pods",
+  "body": {}
+ },
+ "status": 422,
+ "body": {
+  "detail": "Request validation failed.",
+  "errors": [
+   "$: missing property 'name'",
+   "$: missing property 'image'"
+  ],
+  "status": 422,
+  "title": "Unprocessable Entity"
+ }
+}

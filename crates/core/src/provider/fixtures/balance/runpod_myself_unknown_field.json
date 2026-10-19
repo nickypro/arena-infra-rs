@@ -1,0 +1,9 @@
+{
+  "errors": [
+    {
+      "message": "Cannot query field \"spendLimit\" on type \"User\".",
+      "locations": [{ "line": 1, "column": 50 }],
+      "extensions": { "code": "GRAPHQL_VALIDATION_FAILED" }
+    }
+  ]
+}

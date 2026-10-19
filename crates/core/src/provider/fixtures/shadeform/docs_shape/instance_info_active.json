@@ -1,0 +1,48 @@
+{
+  "id": "1dc915dd-8899-4b4f-862a-f63fb2b3dc3d",
+  "cloud": "massedcompute",
+  "region": "kansascity-usa-1",
+  "shade_instance_type": "A6000",
+  "cloud_instance_type": "gpu_1x_a6000",
+  "cloud_assigned_id": "2865d9f3-86fa-4d9b-ac0b-a0fb2fa19a3a",
+  "shade_cloud": true,
+  "name": "devtest-alpha",
+  "configuration": {
+    "memory_in_gb": 48,
+    "storage_in_gb": 256,
+    "vcpus": 6,
+    "num_gpus": 1,
+    "gpu_type": "A6000",
+    "interconnect": "pcie",
+    "nvlink": false,
+    "os": "ubuntu22.04_cuda13.0_shade_os",
+    "vram_per_gpu_in_gb": 48,
+    "gpu_manufacturer": "nvidia"
+  },
+  "ip": "203.0.113.10",
+  "ssh_user": "shadeform",
+  "ssh_port": null,
+  "status": "active",
+  "status_details": "",
+  "cost_estimate": "0",
+  "hourly_price": 57,
+  "rental_terms": {
+    "rental_type": "on_demand",
+    "hourly_price": "0.57",
+    "ending_at": null
+  },
+  "active_at": "2026-01-28T20:58:02.000000Z",
+  "created_at": "2026-01-28T20:53:39.459529Z",
+  "deleted_at": null,
+  "ssh_key_id": "f246a983-5ddd-4f5f-8005-de0867cba782",
+  "tags": [
+    "arena",
+    "arena-devtest",
+    "arena-nonce-3f0c2a8e-5b1d-4c7e-9a2f-000000000001"
+  ],
+  "port_mappings": [],
+  "boot_time": {
+    "min_boot_in_sec": 300,
+    "max_boot_in_sec": 600
+  }
+}

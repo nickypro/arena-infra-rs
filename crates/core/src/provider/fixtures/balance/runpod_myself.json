@@ -1,0 +1,10 @@
+{
+  "data": {
+    "myself": {
+      "clientBalance": "32.54",
+      "currentSpendPerHr": "0.47",
+      "spendLimit": "80",
+      "underBalance": false
+    }
+  }
+}

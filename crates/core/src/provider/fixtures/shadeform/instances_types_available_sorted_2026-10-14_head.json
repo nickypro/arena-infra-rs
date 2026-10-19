@@ -1,0 +1,422 @@
+{
+ "instance_types": [
+  {
+   "cloud": "verda",
+   "shade_instance_type": "cpu_4",
+   "cloud_instance_type": "CPU.4V.16G",
+   "configuration": {
+    "memory_in_gb": 16,
+    "storage_in_gb": 250,
+    "vcpus": 4,
+    "num_gpus": 0,
+    "gpu_type": "CPU",
+    "interconnect": "",
+    "nvlink": false,
+    "os_options": [
+     "ubuntu22.04_cuda12.4_shade_os",
+     "ubuntu24.04_cuda12.8_shade_os"
+    ],
+    "vram_per_gpu_in_gb": 0,
+    "gpu_manufacturer": "n/a"
+   },
+   "memory_in_gb": 16,
+   "storage_in_gb": 250,
+   "vcpus": 4,
+   "num_gpus": 0,
+   "gpu_type": "CPU",
+   "interconnect": "",
+   "nvlink": false,
+   "hourly_price": 12,
+   "availability": [
+    {
+     "region": "helsinki-finland-1",
+     "available": true,
+     "display_name": "FI, Central",
+     "rental_type": "on_demand"
+    },
+    {
+     "region": "helsinki-finland-2",
+     "available": true,
+     "display_name": "FI, Central",
+     "rental_type": "on_demand"
+    },
+    {
+     "region": "helsinki-finland-5",
+     "available": true,
+     "display_name": "FI, Central",
+     "rental_type": "on_demand"
+    }
+   ],
+   "boot_time": {
+    "min_boot_in_sec": 300,
+    "max_boot_in_sec": 480
+   },
+   "deployment_type": "vm",
+   "flex_vm": false
+  },
+  {
+   "cloud": "latitude",
+   "shade_instance_type": "cpu_4",
+   "cloud_instance_type": "vm-small",
+   "configuration": {
+    "memory_in_gb": 16,
+    "storage_in_gb": 160,
+    "vcpus": 4,
+    "num_gpus": 0,
+    "gpu_type": "CPU",
+    "interconnect": "",
+    "nvlink": false,
+    "os_options": [
+     "ubuntu24.04"
+    ],
+    "vram_per_gpu_in_gb": 0,
+    "gpu_manufacturer": "n/a"
+   },
+   "memory_in_gb": 16,
+   "storage_in_gb": 160,
+   "vcpus": 4,
+   "num_gpus": 0,
+   "gpu_type": "CPU",
+   "interconnect": "",
+   "nvlink": false,
+   "hourly_price": 19,
+   "availability": [
+    {
+     "region": "dallas-usa-1",
+     "available": true,
+     "display_name": "US, Dallas, TX",
+     "rental_type": "on_demand"
+    },
+    {
+     "region": "TYO3",
+     "available": true,
+     "display_name": "TYO3",
+     "rental_type": "on_demand"
+    },
+    {
+     "region": "LON",
+     "available": true,
+     "display_name": "LON",
+     "rental_type": "on_demand"
+    },
+    {
+     "region": "frankfurt-germany-4",
+     "available": true,
+     "display_name": "DE, Frankfurt",
+     "rental_type": "on_demand"
+    },
+    {
+     "region": "ashburn-usa-7",
+     "available": true,
+     "display_name": "US, Ashburn, VA",
+     "rental_type": "on_demand"
+    }
+   ],
+   "boot_time": {
+    "min_boot_in_sec": 300,
+    "max_boot_in_sec": 600
+   },
+   "deployment_type": "vm",
+   "flex_vm": false
+  },
+  {
+   "cloud": "verda",
+   "shade_instance_type": "cpu_8",
+   "cloud_instance_type": "CPU.8V.32G",
+   "configuration": {
+    "memory_in_gb": 32,
+    "storage_in_gb": 500,
+    "vcpus": 8,
+    "num_gpus": 0,
+    "gpu_type": "CPU",
+    "interconnect": "",
+    "nvlink": false,
+    "os_options": [
+     "ubuntu22.04_cuda12.4_shade_os",
+     "ubuntu24.04_cuda12.8_shade_os"
+    ],
+    "vram_per_gpu_in_gb": 0,
+    "gpu_manufacturer": "n/a"
+   },
+   "memory_in_gb": 32,
+   "storage_in_gb": 500,
+   "vcpus": 8,
+   "num_gpus": 0,
+   "gpu_type": "CPU",
+   "interconnect": "",
+   "nvlink": false,
+   "hourly_price": 24,
+   "availability": [
+    {
+     "region": "helsinki-finland-1",
+     "available": true,
+     "display_name": "FI, Central",
+     "rental_type": "on_demand"
+    },
+    {
+     "region": "helsinki-finland-2",
+     "available": true,
+     "display_name": "FI, Central",
+     "rental_type": "on_demand"
+    }
+   ],
+   "boot_time": {
+    "min_boot_in_sec": 300,
+    "max_boot_in_sec": 480
+   },
+   "deployment_type": "vm",
+   "flex_vm": false
+  },
+  {
+   "cloud": "hyperstack",
+   "shade_instance_type": "cpu_small",
+   "cloud_instance_type": "n1-cpu-small",
+   "configuration": {
+    "memory_in_gb": 4,
+    "storage_in_gb": 100,
+    "vcpus": 4,
+    "num_gpus": 0,
+    "gpu_type": "CPU",
+    "interconnect": "pcie",
+    "nvlink": false,
+    "os_options": [
+     "ubuntu22.04_cuda12.8_shade_os",
+     "ubuntu22.04_cuda12.2_shade_os",
+     "ubuntu22.04"
+    ],
+    "vram_per_gpu_in_gb": 0,
+    "gpu_manufacturer": "n/a"
+   },
+   "memory_in_gb": 4,
+   "storage_in_gb": 100,
+   "vcpus": 4,
+   "num_gpus": 0,
+   "gpu_type": "CPU",
+   "interconnect": "pcie",
+   "nvlink": false,
+   "hourly_price": 35,
+   "availability": [
+    {
+     "region": "oslo-norway-1",
+     "available": true,
+     "display_name": "NO, Oslo",
+     "rental_type": "on_demand"
+    },
+    {
+     "region": "montreal-canada-2",
+     "available": true,
+     "display_name": "CA, Montreal",
+     "rental_type": "on_demand"
+    }
+   ],
+   "boot_time": {
+    "min_boot_in_sec": 300,
+    "max_boot_in_sec": 360
+   },
+   "deployment_type": "vm",
+   "flex_vm": false
+  },
+  {
+   "cloud": "latitude",
+   "shade_instance_type": "cpu_8",
+   "cloud_instance_type": "vm-medium",
+   "configuration": {
+    "memory_in_gb": 32,
+    "storage_in_gb": 320,
+    "vcpus": 8,
+    "num_gpus": 0,
+    "gpu_type": "CPU",
+    "interconnect": "",
+    "nvlink": false,
+    "os_options": [
+     "ubuntu24.04"
+    ],
+    "vram_per_gpu_in_gb": 0,
+    "gpu_manufacturer": "n/a"
+   },
+   "memory_in_gb": 32,
+   "storage_in_gb": 320,
+   "vcpus": 8,
+   "num_gpus": 0,
+   "gpu_type": "CPU",
+   "interconnect": "",
+   "nvlink": false,
+   "hourly_price": 35,
+   "availability": [
+    {
+     "region": "dallas-usa-1",
+     "available": true,
+     "display_name": "US, Dallas, TX",
+     "rental_type": "on_demand"
+    },
+    {
+     "region": "ashburn-usa-7",
+     "available": true,
+     "display_name": "US, Ashburn, VA",
+     "rental_type": "on_demand"
+    },
+    {
+     "region": "TYO3",
+     "available": true,
+     "display_name": "TYO3",
+     "rental_type": "on_demand"
+    },
+    {
+     "region": "LON",
+     "available": true,
+     "display_name": "LON",
+     "rental_type": "on_demand"
+    },
+    {
+     "region": "frankfurt-germany-4",
+     "available": true,
+     "display_name": "DE, Frankfurt",
+     "rental_type": "on_demand"
+    }
+   ],
+   "boot_time": {
+    "min_boot_in_sec": 300,
+    "max_boot_in_sec": 600
+   },
+   "deployment_type": "vm",
+   "flex_vm": false
+  },
+  {
+   "cloud": "denvr",
+   "shade_instance_type": "cpu_8",
+   "cloud_instance_type": "AMD_EPYC3_8x",
+   "configuration": {
+    "memory_in_gb": 32,
+    "storage_in_gb": 500,
+    "vcpus": 8,
+    "num_gpus": 0,
+    "gpu_type": "CPU",
+    "interconnect": "",
+    "nvlink": false,
+    "os_options": [
+     "ubuntu22.04",
+     "ubuntu20.04"
+    ],
+    "vram_per_gpu_in_gb": 0,
+    "gpu_manufacturer": "n/a"
+   },
+   "memory_in_gb": 32,
+   "storage_in_gb": 500,
+   "vcpus": 8,
+   "num_gpus": 0,
+   "gpu_type": "CPU",
+   "interconnect": "",
+   "nvlink": false,
+   "hourly_price": 47,
+   "availability": [
+    {
+     "region": "houston-usa-1",
+     "available": true,
+     "display_name": "US, Houston, TX",
+     "rental_type": "on_demand"
+    },
+    {
+     "region": "calgary-canada-1",
+     "available": true,
+     "display_name": "CA, Calgary",
+     "rental_type": "on_demand"
+    }
+   ],
+   "boot_time": {
+    "min_boot_in_sec": 420,
+    "max_boot_in_sec": 840
+   },
+   "deployment_type": "vm",
+   "flex_vm": false
+  },
+  {
+   "cloud": "verda",
+   "shade_instance_type": "cpu_16",
+   "cloud_instance_type": "CPU.16V.64G",
+   "configuration": {
+    "memory_in_gb": 64,
+    "storage_in_gb": 1000,
+    "vcpus": 16,
+    "num_gpus": 0,
+    "gpu_type": "CPU",
+    "interconnect": "",
+    "nvlink": false,
+    "os_options": [
+     "ubuntu22.04_cuda12.4_shade_os",
+     "ubuntu24.04_cuda12.8_shade_os"
+    ],
+    "vram_per_gpu_in_gb": 0,
+    "gpu_manufacturer": "n/a"
+   },
+   "memory_in_gb": 64,
+   "storage_in_gb": 1000,
+   "vcpus": 16,
+   "num_gpus": 0,
+   "gpu_type": "CPU",
+   "interconnect": "",
+   "nvlink": false,
+   "hourly_price": 47,
+   "availability": [
+    {
+     "region": "helsinki-finland-2",
+     "available": true,
+     "display_name": "FI, Central",
+     "rental_type": "on_demand"
+    }
+   ],
+   "boot_time": {
+    "min_boot_in_sec": 300,
+    "max_boot_in_sec": 480
+   },
+   "deployment_type": "vm",
+   "flex_vm": false
+  },
+  {
+   "cloud": "massedcompute",
+   "shade_instance_type": "A6000",
+   "cloud_instance_type": "gpu_1x_a6000",
+   "configuration": {
+    "memory_in_gb": 48,
+    "storage_in_gb": 256,
+    "vcpus": 6,
+    "num_gpus": 1,
+    "gpu_type": "A6000",
+    "interconnect": "pcie",
+    "nvlink": false,
+    "os_options": [
+     "ubuntu22.04_cuda13.0_shade_os"
+    ],
+    "vram_per_gpu_in_gb": 48,
+    "gpu_manufacturer": "nvidia"
+   },
+   "memory_in_gb": 48,
+   "storage_in_gb": 256,
+   "vcpus": 6,
+   "num_gpus": 1,
+   "gpu_type": "A6000",
+   "interconnect": "pcie",
+   "nvlink": false,
+   "hourly_price": 57,
+   "availability": [
+    {
+     "region": "kansascity-usa-1",
+     "available": true,
+     "display_name": "US, Kansas City, KS",
+     "rental_type": "on_demand"
+    },
+    {
+     "region": "desmoines-usa-1",
+     "available": true,
+     "display_name": "US, Des Moines, IA",
+     "rental_type": "on_demand"
+    }
+   ],
+   "boot_time": {
+    "min_boot_in_sec": 300,
+    "max_boot_in_sec": 480
+   },
+   "deployment_type": "vm",
+   "flex_vm": false
+  }
+ ]
+}

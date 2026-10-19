@@ -1,0 +1,21 @@
+{
+ "request": {
+  "method": "POST",
+  "path": "/v2/pods",
+  "body": {
+   "name": "devtest-x",
+   "image": "nickypro/arena-env:9.1",
+   "cloud": "COMMUNITY",
+   "gpu": {
+    "id": "NVIDIA NOT A GPU",
+    "count": 1
+   }
+  }
+ },
+ "status": 422,
+ "body": {
+  "detail": "Unknown GPU type: NVIDIA NOT A GPU",
+  "status": 422,
+  "title": "Unprocessable Entity"
+ }
+}

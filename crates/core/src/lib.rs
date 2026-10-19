@@ -5,25 +5,48 @@
 //! existing bash/python tooling, and a safety posture where nothing here mutates
 //! remote state unless a caller explicitly asks it to.
 
+pub mod apiextra;
+pub mod archive;
+pub mod apiget;
 pub mod apikeys;
 pub mod backup;
+pub mod balance;
+pub(crate) mod base64;
 pub mod config;
 pub mod error;
+pub mod fleet;
 pub mod gpu;
+pub mod health;
+pub(crate) mod http;
+pub mod idle;
+pub mod jobs;
+pub mod lock;
 pub mod metrics;
 pub mod naming;
 pub mod openrouter;
+pub mod pipeline;
+pub mod placement;
 pub mod plan;
 pub mod pod;
 pub mod provider;
 pub mod proxy;
+pub mod reap;
 pub mod pull;
+pub mod remote;
+pub mod replica;
+pub mod restore;
 pub mod retry;
 pub mod schedule;
+pub mod selector;
 pub mod setup;
+pub mod snapshot;
 pub mod sshconfig;
 pub mod ssh;
 pub mod status;
+pub mod table;
+pub mod teardown;
+pub mod volume;
+pub mod vscode;
 
 pub use config::Config;
 pub use error::{Error, ProviderErrorKind, Result};

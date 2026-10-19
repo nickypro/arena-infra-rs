@@ -1,0 +1,144 @@
+# Excerpt of Shadeform's published OpenAPI document (https://docs.shadeform.ai/openapi.yaml, info.version
+# 1.0.0), fetched 2026-10-14: the schemas arena's contract tests pin, copied verbatim. The rest of the
+# document (paths, examples with addresses and keys) is left out; diff the full document on each bump.
+openapi: 3.0.0
+servers:
+  - description: Shadeform Production
+    url: https://api.shadeform.ai/v1
+info:
+  version: 1.0.0
+  title: Shadeform API
+components:
+  schemas:
+    RentalTerms:
+      type: object
+      description: "How the instance is rented and on what terms."
+      required:
+        - rental_type
+      properties:
+        rental_type:
+          type: string
+          enum:
+            - on_demand
+            - spot
+            - commitment
+          example: spot
+          description: "How the instance is rented."
+        hourly_price:
+          type: string
+          example: "1.50"
+          description: "The hourly price as a decimal string in dollars. A spot instance shows its discounted spot rate. Omitted for commitments."
+        ending_at:
+          type: string
+          format: date-time
+          nullable: true
+          example: null
+          description: "The promised end of the rental when one is known. Null for open-ended rentals. Spot instances are open-ended and can be reclaimed at any time, so this is null; a reclaim shows up as the instance moving to `deleting` with `status_details: \"preempted\"`."
+    BootTime:
+      type: object
+      properties:
+        min_boot_in_sec:
+          type: integer
+          example: 180
+          description: 'boot time minimum estimate'
+        max_boot_in_sec:
+          type: integer
+          example: 300
+          description: 'boot time maximum estimate'
+    CreateRequest:
+      type: object
+      required:
+        - cloud
+        - region
+        - shade_instance_type
+        - shade_cloud
+        - name
+      properties:
+        cloud:
+          $ref: '#/components/schemas/Cloud'
+        region:
+          $ref: '#/components/schemas/Region'
+        shade_instance_type:
+          $ref: '#/components/schemas/ShadeInstanceType'
+        shade_cloud:
+          $ref: '#/components/schemas/ShadeCloud'
+        name:
+          $ref: '#/components/schemas/Name'
+        rental_type:
+          type: string
+          enum:
+            - on_demand
+            - spot
+          default: on_demand
+          example: spot
+          description: 'How the instance is rented. Defaults to on_demand. Spot instances run at a discounted hourly price but are interruptible: Shadeform may reclaim the capacity at any time, at which point the instance is terminated. Spot requires an instance type that supports it (see the availability entries tagged rental_type spot in the instance types response) and shade_cloud set to true.'
+        os:
+          type: string
+          example: "ubuntu22.04_cuda12.2_shade_os" 
+          description: 'The operating system of the instance.'
+        template_id:
+          type: string
+          example: "template-123"
+          description: 'The ID of the template to use for this instance'
+        launch_configuration:
+          $ref: '#/components/schemas/LaunchConfiguration'
+        volume_ids:
+          type: array
+          description: "List of volume IDs to be mounted. Currently only supports 1 volume at a time."
+          items:
+            $ref: '#/components/schemas/VolumeID'
+        ssh_key_id:
+          $ref: '#/components/schemas/SshKeyID'
+        auto_delete:
+          $ref: '#/components/schemas/AutoDelete'
+        alert:
+          $ref: '#/components/schemas/Alert'
+        volume_mount:
+          $ref: '#/components/schemas/VolumeMount'
+        tags:
+          type: array
+          description: 'Add custom, searchable tags to instances.'
+          items:
+            $ref: '#/components/schemas/Tag'
+        envs:
+          type: array
+          description: 'List of environment variable name and values to automatically add to the instance'
+          items:
+            $ref: '#/components/schemas/Env'
+
+    CreateResponse:
+      type: object
+      required:
+        - id
+      description: Response of the /instances/create API call
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+    HourlyPrice:
+      type: integer
+      example: 210
+      description: 'The hourly price of the instance in cents.'
+    SshPort:
+      type: integer
+      example: 22
+      description: 'The SSH port of the instance. In most cases, this will be port 22 but for some clouds, this may be a different port.'
+    Status:
+      type: string
+      example: active
+      enum:
+        - creating
+        - pending_provider
+        - pending
+        - active
+        - error
+        - deleting
+        - deleted
+      description: 'The status of the instance.'
+    AutoDelete:
+      type: object
+      description: 'Set a date or spend threshold to automatically delete the instance'
+      properties:
+        date_threshold:
+          $ref: '#/components/schemas/DateThreshold'
+        spend_threshold:
+          $ref: '#/components/schemas/SpendThreshold'

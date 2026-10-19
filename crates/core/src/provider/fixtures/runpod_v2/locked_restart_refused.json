@@ -1,0 +1,15 @@
+{
+ "request": {
+  "method": "POST",
+  "path": "/v2/pods/mqseb0i5acrssr/action",
+  "body": {
+   "action": "restart"
+  }
+ },
+ "status": 400,
+ "body": {
+  "detail": "Pod is locked",
+  "status": 400,
+  "title": "Bad Request"
+ }
+}

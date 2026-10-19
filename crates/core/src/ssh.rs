@@ -36,6 +36,68 @@ pub struct SshTarget {
     /// whichever key a pod authorizes (handy for a mixed fleet across cohorts).
     pub key_paths: Vec<String>,
     pub connect_timeout_secs: u32,
+    /// How the server's host key is checked. Every pod path uses [`HostKeyPolicy::Unchecked`]
+    /// (see the module doc: pod IPs are recycled); only the backup archive pins its key.
+    pub host_keys: HostKeyPolicy,
+}
+
+/// How an [`SshTarget`] treats the server's host key.
+///
+/// Pods churn host keys constantly, so their checking is off ([`HostKeyPolicy::Unchecked`],
+/// the default — every pod caller's argv is exactly what it always was). The backup archive
+/// (`arena archive`) is one long-lived VM holding every participant's files, reached with keys
+/// that can write to it or administer it: a MITM there would get the cohort's data, so its key
+/// is **pinned** in arena's own `known_hosts` file. The pinned modes also make the connection
+/// hermetic: `-F /dev/null` (no `~/.ssh/config` or `/etc/ssh/ssh_config` — no stray `Host *`
+/// identity, `HashKnownHosts` or proxy), `IdentitiesOnly=yes` (only the one `-i` key is offered,
+/// never an agent's or a default identity) and `GlobalKnownHostsFile=/dev/null` (only arena's
+/// pin counts). Keep-alives, because a push can sit on one big file for minutes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum HostKeyPolicy {
+    /// `StrictHostKeyChecking=no` + `UserKnownHostsFile=/dev/null` (pods).
+    #[default]
+    Unchecked,
+    /// Trust on first use into `known_hosts` (`StrictHostKeyChecking=accept-new`): only for the
+    /// first connection to a server this run just created, or when the operator asked to
+    /// re-pin (`archive up --accept-new-host-key`).
+    PinFirstUse { known_hosts: String },
+    /// Only the key already in `known_hosts` is accepted (`StrictHostKeyChecking=yes`).
+    Pinned { known_hosts: String },
+}
+
+impl HostKeyPolicy {
+    /// The `-F`/`-o` options this policy puts between `-p <port>` and the `-i` keys (the
+    /// connect timeout last, as it always was).
+    fn options(&self, connect_timeout_secs: u32) -> Vec<String> {
+        let mut a: Vec<String> = Vec::new();
+        let mut opt = |s: String| {
+            a.push("-o".into());
+            a.push(s);
+        };
+        match self {
+            HostKeyPolicy::Unchecked => {
+                opt("BatchMode=yes".into());
+                opt("StrictHostKeyChecking=no".into());
+                opt("UserKnownHostsFile=/dev/null".into());
+            }
+            HostKeyPolicy::PinFirstUse { known_hosts } | HostKeyPolicy::Pinned { known_hosts } => {
+                let strict = if matches!(self, HostKeyPolicy::Pinned { .. }) { "yes" } else { "accept-new" };
+                opt("BatchMode=yes".into());
+                opt(format!("StrictHostKeyChecking={strict}"));
+                opt(format!("UserKnownHostsFile={known_hosts}"));
+                opt("GlobalKnownHostsFile=/dev/null".into());
+                opt("IdentitiesOnly=yes".into());
+                opt("ServerAliveInterval=30".into());
+                opt("ServerAliveCountMax=4".into());
+            }
+        }
+        opt("LogLevel=ERROR".into());
+        opt(format!("ConnectTimeout={connect_timeout_secs}"));
+        if !matches!(self, HostKeyPolicy::Unchecked) {
+            a.splice(0..0, ["-F".to_string(), "/dev/null".to_string()]);
+        }
+        a
+    }
 }
 
 impl SshTarget {
@@ -56,6 +118,7 @@ impl SshTarget {
             port,
             key_paths: config_ssh_keys(cfg),
             connect_timeout_secs: 10,
+            host_keys: HostKeyPolicy::Unchecked,
         })
     }
 
@@ -68,25 +131,14 @@ impl SshTarget {
             port,
             key_paths: key_path.map(resolve_key_path).into_iter().collect(),
             connect_timeout_secs: 10,
+            host_keys: HostKeyPolicy::Unchecked,
         }
     }
 
     /// The `ssh` argv *before* the remote command — non-interactive, fail-fast.
     pub fn ssh_args(&self) -> Vec<String> {
-        let mut a = vec![
-            "-p".into(),
-            self.port.to_string(),
-            "-o".into(),
-            "BatchMode=yes".into(),
-            "-o".into(),
-            "StrictHostKeyChecking=no".into(),
-            "-o".into(),
-            "UserKnownHostsFile=/dev/null".into(),
-            "-o".into(),
-            "LogLevel=ERROR".into(),
-            "-o".into(),
-            format!("ConnectTimeout={}", self.connect_timeout_secs),
-        ];
+        let mut a = vec!["-p".into(), self.port.to_string()];
+        a.extend(self.host_keys.options(self.connect_timeout_secs));
         for key in &self.key_paths {
             a.push("-i".into());
             a.push(key.clone());
@@ -95,10 +147,12 @@ impl SshTarget {
         a
     }
 
-    /// A human-readable rendering of the full command, for dry-run output. The remote
-    /// command is single-quoted so what's printed is what would run.
+    /// A human-readable rendering of the full command, for dry-run output — shell-quoted
+    /// ([`shell_word`]: the remote command always, any other argument that needs it), so what's
+    /// printed pastes into a shell as exactly what would run.
     pub fn display_command(&self, remote_cmd: &str) -> String {
-        format!("ssh {} '{}'", self.ssh_args().join(" "), remote_cmd.replace('\'', "'\\''"))
+        let args: Vec<String> = self.ssh_args().iter().map(|a| shell_word(a)).collect();
+        format!("ssh {} '{}'", args.join(" "), remote_cmd.replace('\'', "'\\''"))
     }
 
     /// The `ssh …` invocation *without* the `user@host` — i.e. just the transport
@@ -107,21 +161,8 @@ impl SshTarget {
     /// itself, so handing it the full `ssh_args` (which end in `user@host`) would be
     /// wrong. Returns a single shell-ready string.
     pub fn rsh_command(&self) -> String {
-        let mut parts = vec![
-            "ssh".to_string(),
-            "-p".into(),
-            self.port.to_string(),
-            "-o".into(),
-            "BatchMode=yes".into(),
-            "-o".into(),
-            "StrictHostKeyChecking=no".into(),
-            "-o".into(),
-            "UserKnownHostsFile=/dev/null".into(),
-            "-o".into(),
-            "LogLevel=ERROR".into(),
-            "-o".into(),
-            format!("ConnectTimeout={}", self.connect_timeout_secs),
-        ];
+        let mut parts = vec!["ssh".to_string(), "-p".into(), self.port.to_string()];
+        parts.extend(self.host_keys.options(self.connect_timeout_secs));
         for key in &self.key_paths {
             parts.push("-i".into());
             parts.push(key.clone());
@@ -132,20 +173,8 @@ impl SshTarget {
     /// The `scp` argv to copy `local` -> `host:remote`. scp uses `-P` for the port
     /// (capital, unlike ssh's `-p`) and the same non-interactive/fail-fast options.
     pub fn scp_args(&self, local: &str, remote: &str) -> Vec<String> {
-        let mut a = vec![
-            "-P".into(),
-            self.port.to_string(),
-            "-o".into(),
-            "BatchMode=yes".into(),
-            "-o".into(),
-            "StrictHostKeyChecking=no".into(),
-            "-o".into(),
-            "UserKnownHostsFile=/dev/null".into(),
-            "-o".into(),
-            "LogLevel=ERROR".into(),
-            "-o".into(),
-            format!("ConnectTimeout={}", self.connect_timeout_secs),
-        ];
+        let mut a = vec!["-P".into(), self.port.to_string()];
+        a.extend(self.host_keys.options(self.connect_timeout_secs));
         for key in &self.key_paths {
             a.push("-i".into());
             a.push(key.clone());
@@ -155,9 +184,24 @@ impl SshTarget {
         a
     }
 
-    /// Human-readable `scp` command for dry-run output.
+    /// Human-readable `scp` command for dry-run output, shell-quoted like [`Self::display_command`].
     pub fn display_scp(&self, local: &str, remote: &str) -> String {
-        format!("scp {}", self.scp_args(local, remote).join(" "))
+        let args: Vec<String> = self.scp_args(local, remote).iter().map(|a| shell_word(a)).collect();
+        format!("scp {}", args.join(" "))
+    }
+}
+
+/// One argument as a POSIX shell reads it back unchanged: as is when it's only characters no
+/// shell treats specially (`-avz`, `--timeout=300`, `root@1.2.3.4:`, `/a/b`), else
+/// single-quoted (`'**/.git/**'`, `'ssh -p 22'`, `''`) with any `'` as `'\''`. For the commands
+/// a dry run prints: an unquoted glob (`--include **/.git/**`) pasted into a shell would expand
+/// against the operator's current directory (live finding).
+pub fn shell_word(s: &str) -> String {
+    let safe = |c: char| c.is_ascii_alphanumeric() || "@%+=:,./_-".contains(c);
+    if !s.is_empty() && s.chars().all(safe) {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
     }
 }
 
@@ -297,6 +341,22 @@ pub fn login_shell_wrap(cmd: &str, conda_env: Option<&str>) -> String {
     format!("zsh -c '{}'", inner.replace('\'', "'\\''"))
 }
 
+/// Whether a [`login_shell_wrap`]ped command failed because the pod has no zsh at all — a
+/// bare VM (Hetzner) before setup installs it: exit 127 with the outer shell's `zsh: command
+/// not found` (bash) or `zsh: not found` (dash). The command itself never ran, so its exit
+/// says nothing about it; a retry finds the same, and setup is the fix. Running it under
+/// bash instead would hide that the participants' own shell is missing (and with it their
+/// conda env and tokens), so the wrap stays zsh-only and the caller says this instead. Pure.
+pub fn login_shell_missing(code: Option<i32>, stderr: &str) -> bool {
+    code == Some(127)
+        && stderr.lines().map(str::trim).any(|l| l.ends_with("zsh: command not found") || l.ends_with("zsh: not found"))
+}
+
+/// What to say when [`login_shell_missing`] on `pod` — short, as it lands in a NOTES cell.
+pub fn login_shell_missing_hint(pod: &str) -> String {
+    format!("no zsh on the pod (setup installs it) — not set up yet? `arena pods setup {pod}`")
+}
+
 /// Strip the harmless startup chatter an interactive shell prints when it has no
 /// controlling TTY (we run `bash -ic` without requesting a PTY). Leaves real output and
 /// errors untouched — only the two fixed job-control lines are removed.
@@ -311,7 +371,9 @@ pub fn strip_interactive_noise(s: &str) -> String {
         .join("\n")
 }
 
-/// Copy a local file to the target over scp.
+/// Copy a local file to the target over scp. No time budget: pod paths — the CLI's and
+/// the dashboard's — use [`crate::remote::Remote`] instead (timeouts, fakes); this stays
+/// for the proxy host.
 pub async fn scp(target: &SshTarget, local: &str, remote: &str) -> Result<SshOutput> {
     let out = Command::new("scp")
         .args(target.scp_args(local, remote))
@@ -336,8 +398,25 @@ pub struct SshOutput {
     pub stderr: String,
 }
 
+impl SshOutput {
+    /// How it ended, for a message: `exit 1`, or `killed by a signal` ([`exit_label`]).
+    pub fn exit_label(&self) -> String {
+        exit_label(self.code)
+    }
+}
+
+/// A process's exit status as a person reads it: `exit 1` — never Rust's `Some(1)` — or
+/// `killed by a signal` when there is no code (the process was signalled: a timeout's kill, OOM).
+pub fn exit_label(code: Option<i32>) -> String {
+    match code {
+        Some(c) => format!("exit {c}"),
+        None => "killed by a signal".to_string(),
+    }
+}
+
 /// Run `remote_cmd` on the target over SSH and capture its output. stdin is closed so
-/// a remote prompt can't wedge the call.
+/// a remote prompt can't wedge the call. No time budget — see [`scp`] for who still uses
+/// this rather than [`crate::remote::Remote`].
 pub async fn run(target: &SshTarget, remote_cmd: &str) -> Result<SshOutput> {
     let out = Command::new("ssh")
         .args(target.ssh_args())
@@ -365,6 +444,7 @@ mod tests {
             port: 22001,
             key_paths: vec!["/root/.ssh/arena8_key".into()],
             connect_timeout_secs: 10,
+            host_keys: Default::default(),
         }
     }
 
@@ -379,6 +459,53 @@ mod tests {
         assert!(joined.contains("ConnectTimeout=10"));
         assert!(joined.contains("-i /root/.ssh/arena8_key"));
         assert!(joined.ends_with("root@1.2.3.4"));
+    }
+
+    /// Regression for every existing caller (spec §14 item 12): the default policy's argv is
+    /// byte for byte what `SshTarget` built before host-key policies existed.
+    #[test]
+    fn unchecked_targets_build_exactly_the_old_argv() {
+        let t = target();
+        assert_eq!(t.host_keys, HostKeyPolicy::Unchecked);
+        let old_opts = [
+            "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o",
+            "LogLevel=ERROR", "-o", "ConnectTimeout=10",
+        ];
+        let mut want: Vec<String> = ["-p", "22001"].iter().chain(old_opts.iter()).map(|s| s.to_string()).collect();
+        want.extend(["-i".to_string(), "/root/.ssh/arena8_key".into(), "root@1.2.3.4".into()]);
+        assert_eq!(t.ssh_args(), want);
+        assert_eq!(
+            t.rsh_command(),
+            format!("ssh -p 22001 {} -i /root/.ssh/arena8_key", old_opts.join(" "))
+        );
+        let mut want_scp: Vec<String> = ["-P", "22001"].iter().chain(old_opts.iter()).map(|s| s.to_string()).collect();
+        want_scp.extend(["-i".to_string(), "/root/.ssh/arena8_key".into(), "/a".into(), "root@1.2.3.4:/b".into()]);
+        assert_eq!(t.scp_args("/a", "/b"), want_scp);
+        // `for_host` / `from_pod` start unchecked too.
+        assert_eq!(SshTarget::for_host("root", "h", 22, None).host_keys, HostKeyPolicy::Unchecked);
+    }
+
+    /// The archive's modes (S3): pinned to arena's own known_hosts, hermetic (no ssh config, no
+    /// global known_hosts), only the given key offered; first use only accepts a NEW key.
+    #[test]
+    fn pinned_policies_are_strict_hermetic_and_offer_one_key() {
+        let mut t = target();
+        for (policy, strict) in [
+            (HostKeyPolicy::Pinned { known_hosts: "/st/known_hosts".into() }, "StrictHostKeyChecking=yes"),
+            (HostKeyPolicy::PinFirstUse { known_hosts: "/st/known_hosts".into() }, "StrictHostKeyChecking=accept-new"),
+        ] {
+            t.host_keys = policy;
+            for argv in [t.ssh_args(), t.scp_args("/a", "/b"), t.rsh_command().split(' ').map(String::from).collect()] {
+                let has = |o: &str| argv.windows(2).any(|w| w[0] == "-o" && w[1] == o);
+                assert!(has(strict), "{argv:?}");
+                for o in ["UserKnownHostsFile=/st/known_hosts", "GlobalKnownHostsFile=/dev/null", "IdentitiesOnly=yes", "BatchMode=yes"] {
+                    assert!(has(o), "{o}: {argv:?}");
+                }
+                assert!(!argv.iter().any(|a| a.contains("StrictHostKeyChecking=no") || a == "UserKnownHostsFile=/dev/null"), "{argv:?}");
+                assert!(argv.windows(2).any(|w| w[0] == "-F" && w[1] == "/dev/null"), "{argv:?}");
+                assert_eq!(argv.iter().filter(|a| *a == "-i").count(), 1, "exactly one identity: {argv:?}");
+            }
+        }
     }
 
     #[test]
@@ -440,6 +567,26 @@ mod tests {
         assert_eq!(login_shell_wrap("echo hi", Some("")), w);
     }
 
+    /// Live BPF F1/S9: a bare Hetzner VM has no zsh until setup, so every wrapped command
+    /// ends `exit 127: bash: line 1: zsh: command not found`. Only the outer shell's own
+    /// "no zsh" counts — a command zsh couldn't find, or another exit, is the command's.
+    #[test]
+    fn login_shell_missing_only_for_the_outer_shell_finding_no_zsh() {
+        for (code, stderr, missing) in [
+            (Some(127), "bash: line 1: zsh: command not found\n", true),
+            (Some(127), "sh: 1: zsh: not found", true),
+            (Some(127), "Warning: Permanently added '1.2.3.4' (ED25519) to the list of known hosts.\nbash: zsh: command not found", true),
+            (Some(127), "zsh:1: command not found: pytest", false), // zsh ran; the command is missing
+            (Some(1), "bash: line 1: zsh: command not found", false),
+            (None, "bash: line 1: zsh: command not found", false),
+            (Some(127), "", false),
+        ] {
+            assert_eq!(login_shell_missing(code, stderr), missing, "{code:?} {stderr:?}");
+        }
+        let hint = login_shell_missing_hint("devtest-hz2");
+        assert!(hint.contains("no zsh") && hint.contains("`arena pods setup devtest-hz2`"), "{hint}");
+    }
+
     #[test]
     fn strip_interactive_noise_drops_only_job_control_lines() {
         let raw = "bash: cannot set terminal process group (42): Inappropriate ioctl for device\n\
@@ -455,5 +602,42 @@ mod tests {
         let s = target().display_command("nvidia-smi");
         assert!(s.starts_with("ssh -p 22001"));
         assert!(s.ends_with("'nvidia-smi'"));
+    }
+
+    #[test]
+    fn shell_words_quote_only_what_a_shell_would_change() {
+        for (raw, want) in [
+            ("-avz", "-avz"),
+            ("--timeout=300", "--timeout=300"),
+            ("root@1.2.3.4:", "root@1.2.3.4:"),
+            ("/root/.ssh/arena8_key", "/root/.ssh/arena8_key"),
+            ("**/.git/**", "'**/.git/**'"),
+            ("models--*/", "'models--*/'"),
+            ("ssh -p 22", "'ssh -p 22'"),
+            ("it's", "'it'\\''s'"),
+            ("~/x", "'~/x'"),
+            ("$HOME", "'$HOME'"),
+            ("", "''"),
+        ] {
+            assert_eq!(shell_word(raw), want, "{raw:?}");
+        }
+    }
+
+    /// What a dry run prints is what a shell runs: every argument comes back intact — a key
+    /// path with a space included — from a real bash.
+    #[cfg(unix)]
+    #[test]
+    fn displayed_ssh_and_scp_commands_paste_back_as_their_argv() {
+        let mut t = target();
+        t.key_paths = vec!["/keys/my key".into(), "/keys/k2".into()];
+        let echo = |line: &str, program: &str| {
+            let rest = line.strip_prefix(&format!("{program} ")).expect("program first");
+            let o = std::process::Command::new("bash").arg("-c").arg(format!("printf '%s\\n' {rest}")).output().unwrap();
+            String::from_utf8_lossy(&o.stdout).lines().map(String::from).collect::<Vec<_>>()
+        };
+        let mut want = t.ssh_args();
+        want.push("echo 'hi' $HOME".into());
+        assert_eq!(echo(&t.display_command("echo 'hi' $HOME"), "ssh"), want);
+        assert_eq!(echo(&t.display_scp("/tmp/a b", "/root/x"), "scp"), t.scp_args("/tmp/a b", "/root/x"));
     }
 }

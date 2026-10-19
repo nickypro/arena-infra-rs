@@ -1,0 +1,17 @@
+{
+ "ssh_keys": [
+  {
+   "id": "00000000-0000-4000-8000-00000000a001",
+   "name": "Shadeform Managed Key",
+   "public_key": "ssh-rsa AAAAFAKEPUBLICKEYFORTESTS managed",
+   "is_default": true,
+   "private_key": "PRIVATE-KEY-MATERIAL-MUST-NEVER-BE-PRINTED"
+  },
+  {
+   "id": "00000000-0000-4000-8000-00000000a002",
+   "name": "devtest",
+   "public_key": "ssh-ed25519 AAAAFAKEPUBLICKEYFORTESTS devtest",
+   "is_default": false
+  }
+ ]
+}

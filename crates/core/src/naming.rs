@@ -79,6 +79,7 @@ mod tests {
             cost_per_hr: None,
             ssh_ip: None,
             ssh_port: None,
+            ..Default::default()
         }
     }
 

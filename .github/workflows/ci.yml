@@ -1,0 +1,66 @@
+# CI: the same gate every change passes locally before a push — release build + the full test
+# suite with zero warnings, and clippy with zero warnings. Hermetic: no provider keys, no
+# network calls (the live smoke test is `#[ignore]` and also guarded by ARENA_LIVE_SMOKE), so
+# it's safe on a public repo and on PRs.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned to the toolchain the code is developed on (rust-toolchain.toml says "stable", which
+  # would float): a newer compiler's new lints must not turn CI red without a code change.
+  # Bump this together with the dev machine's toolchain.
+  RUSTUP_TOOLCHAIN: "1.96.0"
+
+jobs:
+  test:
+    name: build + test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      # Same rule as the local gate: any compiler warning fails.
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+          rustc --version
+      # Tests drive real rsync/flock/ssh-keygen/git; git commits need an identity.
+      - name: Tools
+        run: |
+          command -v rsync >/dev/null || (sudo apt-get update -q && sudo apt-get install -y -q rsync)
+          git config --global user.name "arena CI"
+          git config --global user.email "ci@example.invalid"
+          git config --global init.defaultBranch main
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Build
+        run: cargo build --release --locked
+      - name: Test
+        run: cargo test --release --locked
+
+  # Blocking: any clippy warning fails the run. The lint set is the pinned toolchain's
+  # (RUSTUP_TOOLCHAIN), so a newer clippy's new lints arrive only with a deliberate bump.
+  clippy:
+    name: clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - name: Toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings

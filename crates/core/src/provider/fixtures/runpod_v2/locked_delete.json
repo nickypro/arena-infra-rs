@@ -1,0 +1,13 @@
+{
+ "request": {
+  "method": "DELETE",
+  "path": "/v2/pods/mqseb0i5acrssr",
+  "body": null
+ },
+ "status": 400,
+ "body": {
+  "detail": "Pod is locked",
+  "status": 400,
+  "title": "Bad Request"
+ }
+}

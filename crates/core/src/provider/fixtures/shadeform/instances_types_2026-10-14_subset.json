@@ -1,0 +1,588 @@
+{
+ "instance_types": [
+  {
+   "cloud": "massedcompute",
+   "shade_instance_type": "A6000",
+   "cloud_instance_type": "gpu_1x_a6000",
+   "configuration": {
+    "memory_in_gb": 48,
+    "storage_in_gb": 256,
+    "vcpus": 6,
+    "num_gpus": 1,
+    "gpu_type": "A6000",
+    "interconnect": "pcie",
+    "nvlink": false,
+    "os_options": [
+     "ubuntu22.04_cuda13.0_shade_os"
+    ],
+    "vram_per_gpu_in_gb": 48,
+    "gpu_manufacturer": "nvidia"
+   },
+   "memory_in_gb": 48,
+   "storage_in_gb": 256,
+   "vcpus": 6,
+   "num_gpus": 1,
+   "gpu_type": "A6000",
+   "interconnect": "pcie",
+   "nvlink": false,
+   "hourly_price": 57,
+   "availability": [
+    {
+     "region": "wichita-usa-1",
+     "available": false,
+     "display_name": "US, Wichita, KS",
+     "rental_type": "on_demand"
+    },
+    {
+     "region": "kansascity-usa-5",
+     "available": false,
+     "display_name": "US, Kansas City, MO",
+     "rental_type": "on_demand"
+    },
+    {
+     "region": "kansascity-usa-1",
+     "available": true,
+     "display_name": "US, Kansas City, KS",
+     "rental_type": "on_demand"
+    },
+    {
+     "region": "desmoines-usa-1",
+     "available": true,
+     "display_name": "US, Des Moines, IA",
+     "rental_type": "on_demand"
+    }
+   ],
+   "boot_time": {
+    "min_boot_in_sec": 300,
+    "max_boot_in_sec": 480
+   },
+   "deployment_type": "vm",
+   "flex_vm": false
+  },
+  {
+   "cloud": "massedcompute",
+   "shade_instance_type": "A6000x2",
+   "cloud_instance_type": "gpu_2x_a6000",
+   "configuration": {
+    "memory_in_gb": 96,
+    "storage_in_gb": 512,
+    "vcpus": 14,
+    "num_gpus": 2,
+    "gpu_type": "A6000",
+    "interconnect": "pcie",
+    "nvlink": false,
+    "os_options": [
+     "ubuntu22.04_cuda13.0_shade_os"
+    ],
+    "vram_per_gpu_in_gb": 48,
+    "gpu_manufacturer": "nvidia"
+   },
+   "memory_in_gb": 96,
+   "storage_in_gb": 512,
+   "vcpus": 14,
+   "num_gpus": 2,
+   "gpu_type": "A6000",
+   "interconnect": "pcie",
+   "nvlink": false,
+   "hourly_price": 114,
+   "availability": [
+    {
+     "region": "wichita-usa-1",
+     "available": false,
+     "display_name": "US, Wichita, KS",
+     "rental_type": "on_demand"
+    },
+    {
+     "region": "kansascity-usa-5",
+     "available": false,
+     "display_name": "US, Kansas City, MO",
+     "rental_type": "on_demand"
+    },
+    {
+     "region": "kansascity-usa-1",
+     "available": true,
+     "display_name": "US, Kansas City, KS",
+     "rental_type": "on_demand"
+    },
+    {
+     "region": "desmoines-usa-1",
+     "available": true,
+     "display_name": "US, Des Moines, IA",
+     "rental_type": "on_demand"
+    }
+   ],
+   "boot_time": {
+    "min_boot_in_sec": 300,
+    "max_boot_in_sec": 480
+   },
+   "deployment_type": "vm",
+   "flex_vm": false
+  },
+  {
+   "cloud": "hyperstack",
+   "shade_instance_type": "A4000",
+   "cloud_instance_type": "n3-RTX-A4000x1",
+   "configuration": {
+    "memory_in_gb": 21,
+    "storage_in_gb": 100,
+    "vcpus": 4,
+    "num_gpus": 1,
+    "gpu_type": "A4000",
+    "interconnect": "pcie",
+    "nvlink": false,
+    "os_options": [
+     "ubuntu22.04_cuda12.8_shade_os",
+     "ubuntu22.04_cuda12.2_shade_os",
+     "ubuntu22.04"
+    ],
+    "vram_per_gpu_in_gb": 16,
+    "gpu_manufacturer": "nvidia"
+   },
+   "memory_in_gb": 21,
+   "storage_in_gb": 100,
+   "vcpus": 4,
+   "num_gpus": 1,
+   "gpu_type": "A4000",
+   "interconnect": "pcie",
+   "nvlink": false,
+   "hourly_price": 15,
+   "availability": [
+    {
+     "region": "oslo-norway-1",
+     "available": false,
+     "display_name": "NO, Oslo",
+     "rental_type": "on_demand"
+    }
+   ],
+   "boot_time": {
+    "min_boot_in_sec": 300,
+    "max_boot_in_sec": 480
+   },
+   "deployment_type": "vm",
+   "flex_vm": false
+  },
+  {
+   "cloud": "paperspace",
+   "shade_instance_type": "A4000",
+   "cloud_instance_type": "A4000",
+   "configuration": {
+    "memory_in_gb": 45,
+    "storage_in_gb": 250,
+    "vcpus": 8,
+    "num_gpus": 1,
+    "gpu_type": "A4000",
+    "interconnect": "pcie",
+    "nvlink": false,
+    "os_options": [
+     "ubuntu22.04_cuda12.2_shade_os",
+     "ubuntu20.04_cuda12.2_shade_os",
+     "ubuntu22.04",
+     "ubuntu20.04"
+    ],
+    "vram_per_gpu_in_gb": 16,
+    "gpu_manufacturer": "nvidia"
+   },
+   "memory_in_gb": 45,
+   "storage_in_gb": 250,
+   "vcpus": 8,
+   "num_gpus": 1,
+   "gpu_type": "A4000",
+   "interconnect": "pcie",
+   "nvlink": false,
+   "hourly_price": 80,
+   "availability": [
+    {
+     "region": "amsterdam-netherlands-1",
+     "available": false,
+     "display_name": "NL, Amsterdam",
+     "rental_type": "on_demand"
+    },
+    {
+     "region": "santaclara-usa-1",
+     "available": false,
+     "display_name": "US, Santa Clara, CA",
+     "rental_type": "on_demand"
+    },
+    {
+     "region": "newyork-usa-1",
+     "available": true,
+     "display_name": "US, New York, NY",
+     "rental_type": "on_demand"
+    }
+   ],
+   "boot_time": {
+    "min_boot_in_sec": 300,
+    "max_boot_in_sec": 540
+   },
+   "deployment_type": "vm",
+   "flex_vm": false
+  },
+  {
+   "cloud": "lambdalabs",
+   "shade_instance_type": "A10",
+   "cloud_instance_type": "gpu_1x_a10",
+   "configuration": {
+    "memory_in_gb": 200,
+    "storage_in_gb": 1400,
+    "vcpus": 30,
+    "num_gpus": 1,
+    "gpu_type": "A10",
+    "interconnect": "pcie",
+    "nvlink": false,
+    "os_options": [
+     "ubuntu22.04_cuda12.4_shade_os"
+    ],
+    "vram_per_gpu_in_gb": 24,
+    "gpu_manufacturer": "nvidia"
+   },
+   "memory_in_gb": 200,
+   "storage_in_gb": 1400,
+   "vcpus": 30,
+   "num_gpus": 1,
+   "gpu_type": "A10",
+   "interconnect": "pcie",
+   "nvlink": false,
+   "hourly_price": 129,
+   "availability": [
+    {
+     "region": "mumbai-india-1",
+     "available": false,
+     "display_name": "IN, Mumbai",
+     "rental_type": "on_demand"
+    },
+    {
+     "region": "chicago-usa-2",
+     "available": false,
+     "display_name": "US, Chicago, IL",
+     "rental_type": "on_demand"
+    },
+    {
+     "region": "phoenix-usa-2",
+     "available": false,
+     "display_name": "US, Phoenix, AZ",
+     "rental_type": "on_demand"
+    },
+    {
+     "region": "saltlakecity-usa-1",
+     "available": false,
+     "display_name": "US, Salt Lake City, UT",
+     "rental_type": "on_demand"
+    },
+    {
+     "region": "dallas-usa-2",
+     "available": false,
+     "display_name": "US, Dallas, TX",
+     "rental_type": "on_demand"
+    },
+    {
+     "region": "dulles-usa-1",
+     "available": true,
+     "display_name": "US, Dulles, VA",
+     "rental_type": "on_demand"
+    },
+    {
+     "region": "sanjose-usa-2",
+     "available": true,
+     "display_name": "US, San Jose, Ca",
+     "rental_type": "on_demand"
+    }
+   ],
+   "boot_time": {
+    "min_boot_in_sec": 300,
+    "max_boot_in_sec": 480
+   },
+   "deployment_type": "vm",
+   "flex_vm": false
+  },
+  {
+   "cloud": "excesssupply",
+   "shade_instance_type": "RTX5090",
+   "cloud_instance_type": "n3-RTX-5090x1",
+   "configuration": {
+    "memory_in_gb": 120,
+    "storage_in_gb": 900,
+    "vcpus": 12,
+    "num_gpus": 1,
+    "gpu_type": "RTX5090",
+    "interconnect": "pcie",
+    "nvlink": false,
+    "os_options": [
+     "ubuntu22.04_cuda12.8_shade_os"
+    ],
+    "vram_per_gpu_in_gb": 32,
+    "gpu_manufacturer": "nvidia"
+   },
+   "memory_in_gb": 120,
+   "storage_in_gb": 900,
+   "vcpus": 12,
+   "num_gpus": 1,
+   "gpu_type": "RTX5090",
+   "interconnect": "pcie",
+   "nvlink": false,
+   "hourly_price": 65,
+   "availability": [
+    {
+     "region": "oslo-norway-3",
+     "available": true,
+     "display_name": "NO, Central",
+     "rental_type": "on_demand"
+    }
+   ],
+   "boot_time": {
+    "min_boot_in_sec": 300,
+    "max_boot_in_sec": 480
+   },
+   "deployment_type": "vm",
+   "flex_vm": false
+  },
+  {
+   "cloud": "latitude",
+   "shade_instance_type": "H100",
+   "cloud_instance_type": "g3-h100-small",
+   "configuration": {
+    "memory_in_gb": 192,
+    "storage_in_gb": 7600,
+    "vcpus": 16,
+    "num_gpus": 1,
+    "gpu_type": "H100",
+    "interconnect": "pcie",
+    "nvlink": false,
+    "os_options": [
+     "ubuntu24.04_cuda12.4_shade_os"
+    ],
+    "vram_per_gpu_in_gb": 80,
+    "gpu_manufacturer": "nvidia"
+   },
+   "memory_in_gb": 192,
+   "storage_in_gb": 7600,
+   "vcpus": 16,
+   "num_gpus": 1,
+   "gpu_type": "H100",
+   "interconnect": "pcie",
+   "nvlink": false,
+   "hourly_price": 199,
+   "availability": [
+    {
+     "region": "dallas-usa-1",
+     "available": false,
+     "display_name": "US, Dallas, TX",
+     "rental_type": "on_demand"
+    }
+   ],
+   "boot_time": {
+    "min_boot_in_sec": 300,
+    "max_boot_in_sec": 1020
+   },
+   "deployment_type": "baremetal",
+   "flex_vm": false
+  },
+  {
+   "cloud": "excesssupply",
+   "shade_instance_type": "L40x8_2",
+   "cloud_instance_type": "8x-l40.256cpu.2003gib.7149gib.3654f7ce7f",
+   "configuration": {
+    "memory_in_gb": 1892,
+    "storage_in_gb": 7154,
+    "vcpus": 240,
+    "num_gpus": 8,
+    "gpu_type": "L40",
+    "interconnect": "pcie",
+    "nvlink": false,
+    "os_options": [
+     "ubuntu24.04_cuda13.0_shade_os"
+    ],
+    "vram_per_gpu_in_gb": 48,
+    "gpu_manufacturer": "nvidia"
+   },
+   "memory_in_gb": 1892,
+   "storage_in_gb": 7154,
+   "vcpus": 240,
+   "num_gpus": 8,
+   "gpu_type": "L40",
+   "interconnect": "pcie",
+   "nvlink": false,
+   "hourly_price": 1100,
+   "availability": [
+    {
+     "region": "casper-usa-2",
+     "available": false,
+     "display_name": "US, Casper, WY",
+     "rental_type": "on_demand"
+    },
+    {
+     "region": "casper-usa-2",
+     "available": true,
+     "display_name": "US, Casper, WY",
+     "rental_type": "spot",
+     "hourly_price": "4"
+    }
+   ],
+   "boot_time": {
+    "min_boot_in_sec": 300,
+    "max_boot_in_sec": 480
+   },
+   "deployment_type": "vm",
+   "flex_vm": true
+  },
+  {
+   "cloud": "verda",
+   "shade_instance_type": "cpu_4",
+   "cloud_instance_type": "CPU.4V.16G",
+   "configuration": {
+    "memory_in_gb": 16,
+    "storage_in_gb": 250,
+    "vcpus": 4,
+    "num_gpus": 0,
+    "gpu_type": "CPU",
+    "interconnect": "",
+    "nvlink": false,
+    "os_options": [
+     "ubuntu22.04_cuda12.4_shade_os",
+     "ubuntu24.04_cuda12.8_shade_os"
+    ],
+    "vram_per_gpu_in_gb": 0,
+    "gpu_manufacturer": "n/a"
+   },
+   "memory_in_gb": 16,
+   "storage_in_gb": 250,
+   "vcpus": 4,
+   "num_gpus": 0,
+   "gpu_type": "CPU",
+   "interconnect": "",
+   "nvlink": false,
+   "hourly_price": 12,
+   "availability": [
+    {
+     "region": "helsinki-finland-1",
+     "available": true,
+     "display_name": "FI, Central",
+     "rental_type": "on_demand"
+    },
+    {
+     "region": "helsinki-finland-2",
+     "available": true,
+     "display_name": "FI, Central",
+     "rental_type": "on_demand"
+    },
+    {
+     "region": "helsinki-finland-5",
+     "available": true,
+     "display_name": "FI, Central",
+     "rental_type": "on_demand"
+    }
+   ],
+   "boot_time": {
+    "min_boot_in_sec": 300,
+    "max_boot_in_sec": 480
+   },
+   "deployment_type": "vm",
+   "flex_vm": false
+  },
+  {
+   "cloud": "massedcompute",
+   "shade_instance_type": "A100_sxm4_80G_DGX",
+   "cloud_instance_type": "gpu_1x_DGX_A100",
+   "configuration": {
+    "memory_in_gb": 160,
+    "storage_in_gb": 1000,
+    "vcpus": 16,
+    "num_gpus": 1,
+    "gpu_type": "A100_80G",
+    "interconnect": "sxm4",
+    "nvlink": false,
+    "os_options": [
+     "ubuntu22.04_cuda13.0_shade_os"
+    ],
+    "vram_per_gpu_in_gb": 80,
+    "gpu_manufacturer": "nvidia"
+   },
+   "memory_in_gb": 160,
+   "storage_in_gb": 1000,
+   "vcpus": 16,
+   "num_gpus": 1,
+   "gpu_type": "A100_80G",
+   "interconnect": "sxm4",
+   "nvlink": false,
+   "hourly_price": 138,
+   "availability": [
+    {
+     "region": "desmoines-usa-3",
+     "available": false,
+     "display_name": "US, Des Moines, IA",
+     "rental_type": "on_demand"
+    },
+    {
+     "region": "kansascity-usa-5",
+     "available": false,
+     "display_name": "US, Kansas City, MO",
+     "rental_type": "on_demand"
+    },
+    {
+     "region": "desmoines-usa-1",
+     "available": false,
+     "display_name": "US, Des Moines, IA",
+     "rental_type": "on_demand"
+    },
+    {
+     "region": "beltsville-usa-1",
+     "available": true,
+     "display_name": "US, Beltsville, MD",
+     "rental_type": "on_demand"
+    },
+    {
+     "region": "kansascity-usa-1",
+     "available": false,
+     "display_name": "US, Kansas City, KS",
+     "rental_type": "on_demand"
+    }
+   ],
+   "boot_time": {
+    "min_boot_in_sec": 300,
+    "max_boot_in_sec": 480
+   },
+   "deployment_type": "vm",
+   "flex_vm": false
+  },
+  {
+   "cloud": "excesssupply",
+   "shade_instance_type": "B300x8",
+   "cloud_instance_type": "8x-b300-sxm6-ac.384cpu.2267gib.7448gib.5b62e15793",
+   "configuration": {
+    "memory_in_gb": 2090,
+    "storage_in_gb": 29808,
+    "vcpus": 754,
+    "num_gpus": 8,
+    "gpu_type": "B300",
+    "interconnect": "SXM6",
+    "nvlink": true,
+    "os_options": [
+     "ubuntu24.04_cuda13.0_shade_os"
+    ],
+    "vram_per_gpu_in_gb": 288,
+    "gpu_manufacturer": "nvidia"
+   },
+   "memory_in_gb": 2090,
+   "storage_in_gb": 29808,
+   "vcpus": 754,
+   "num_gpus": 8,
+   "gpu_type": "B300",
+   "interconnect": "SXM6",
+   "nvlink": true,
+   "hourly_price": 6400,
+   "availability": [
+    {
+     "region": "is-reykjavik-1",
+     "available": false,
+     "display_name": "IS, Reykjav\u00edk",
+     "rental_type": "on_demand"
+    }
+   ],
+   "boot_time": {
+    "min_boot_in_sec": 900,
+    "max_boot_in_sec": 1200
+   },
+   "deployment_type": "vm",
+   "flex_vm": true
+  }
+ ]
+}

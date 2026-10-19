@@ -4,21 +4,31 @@
 //! - `list_pods` concatenates every backend (caching pod-id → backend so mutations route
 //!   correctly). A backend that errors is skipped (optionally warned about); only a total
 //!   wipeout — every backend failing — is fatal.
+//! - `list_by_provider` exposes each backend's own outcome instead (Ok pods / Err), for
+//!   callers that must not mistake "that backend didn't answer" for "that backend has no
+//!   pods" — the proxy merge, which only drops a forward on a *successful* listing.
 //! - `create_pod` goes to the chosen primary (the `--provider` / `ARENA_PROVIDER`).
-//! - `stop`/`restart`/`terminate` route to whichever backend actually owns the pod id.
+//! - `stop` (and its outcome)/`restart`/`terminate`/`set_locked` route to whichever backend actually owns the
+//!   pod id, and so do `restart_wipes_container_disk`, `restart_resets_container` and
+//!   `lock_support` (by the pod's provider tag, then the id cache).
+//! - `check_create_extra`/`preview_create_body` are the primary's, like `create_pod`.
+//! - `enrich` hands each pod to the backend that listed it; a failing backend is reported
+//!   (as one error naming it) without costing the other backends' pods their details.
 //!
 //! With a single backend configured it behaves exactly like that one provider, so
 //! single-provider setups are unaffected.
 
 use async_trait::async_trait;
 
+use crate::apiextra::Extra;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::pod::{Pod, PodSpec};
-use crate::provider::{build, Provider};
+use crate::provider::{build, ContainerReset, Provider, StopOutcome};
 
-/// The known backends, in the order they're listed/built.
-const KNOWN: [&str; 3] = ["runpod", "vast", "hetzner"];
+/// The known backends, in the order they're listed/built. `shadeform` is opt-in overflow: it
+/// joins the fleet's listing when `SHADEFORM_API_KEY` is set, and creates only when chosen.
+const KNOWN: [&str; 4] = ["runpod", "vast", "hetzner", "shadeform"];
 
 pub struct MultiProvider {
     backends: Vec<Box<dyn Provider>>,
@@ -28,9 +38,21 @@ pub struct MultiProvider {
     /// instead of warning on stderr — the TUI sets this so provider hiccups (e.g. Vast's
     /// frequent 429s) don't corrupt its alternate-screen rendering.
     warn_on_partial: bool,
+    /// Per-backend bound on a list call ([`crate::provider::LIST_TIMEOUT`]; shorter in tests).
+    list_timeout: std::time::Duration,
 }
 
 impl MultiProvider {
+    /// The backend that listed `pod`, without a request: by its `provider` tag first (set by
+    /// that backend, so unambiguous even if two backends' numeric ids collide), else the
+    /// id→backend cache. `None` = no backend claims it.
+    fn owner_of(&self, pod: &Pod) -> Option<usize> {
+        self.backends
+            .iter()
+            .position(|b| b.name() == pod.provider)
+            .or_else(|| self.owner.lock().unwrap().get(&pod.id).copied())
+    }
+
     /// The backend that owns `id`, using the cache; on a miss, refresh via a full list.
     async fn backend_for(&self, id: &str) -> Result<&dyn Provider> {
         if let Some(i) = self.owner.lock().unwrap().get(id).copied() {
@@ -54,17 +76,22 @@ impl Provider for MultiProvider {
         self.backends[self.primary].describe(spec)
     }
     async fn list_pods(&self) -> Result<Vec<Pod>> {
-        // Gather first (awaiting), then populate the cache without holding the lock across
-        // an await. A provider that errors is skipped; only a total wipeout is fatal.
-        let mut gathered: Vec<(usize, Vec<Pod>)> = Vec::new();
+        // Built on the per-backend outcomes so there's one listing path (and one place the
+        // owner cache is filled). A provider that errors is skipped; only a total wipeout
+        // is fatal.
+        let mut out = Vec::new();
         let mut errs: Vec<String> = Vec::new();
-        for (i, b) in self.backends.iter().enumerate() {
-            match b.list_pods().await {
-                Ok(pods) => gathered.push((i, pods)),
-                Err(e) => errs.push(format!("{}: {e}", b.name())),
+        let mut any_ok = false;
+        for (name, res) in self.list_by_provider().await {
+            match res {
+                Ok(pods) => {
+                    any_ok = true;
+                    out.extend(pods);
+                }
+                Err(e) => errs.push(format!("{name}: {e}")),
             }
         }
-        if gathered.is_empty() && !errs.is_empty() {
+        if !any_ok && !errs.is_empty() {
             return Err(Error::provider(format!(
                 "all providers failed to list: {}",
                 errs.join("; ")
@@ -73,16 +100,66 @@ impl Provider for MultiProvider {
         if !errs.is_empty() && self.warn_on_partial {
             eprintln!("warning: some providers failed to list ({})", errs.join("; "));
         }
-        let mut map = self.owner.lock().unwrap();
-        map.clear();
-        let mut out = Vec::new();
-        for (i, pods) in gathered {
-            for p in &pods {
-                map.insert(p.id.clone(), i);
-            }
-            out.extend(pods);
-        }
         Ok(out)
+    }
+    async fn list_by_provider(&self) -> Vec<(String, Result<Vec<Pod>>)> {
+        // Gather first (awaiting), then populate the cache without holding the lock across
+        // an await. The cache is rebuilt from the successes only when at least one backend
+        // answered, so a total wipeout doesn't forget every owner.
+        let mut results: Vec<(String, Result<Vec<Pod>>)> = Vec::new();
+        let mut owners: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for (i, b) in self.backends.iter().enumerate() {
+            let res = crate::provider::bounded_list(b.name(), b.list_pods(), self.list_timeout).await;
+            if let Ok(pods) = &res {
+                for p in pods {
+                    owners.insert(p.id.clone(), i);
+                }
+            }
+            results.push((b.name().to_string(), res));
+        }
+        if results.iter().any(|(_, r)| r.is_ok()) {
+            *self.owner.lock().unwrap() = owners;
+        }
+        results
+    }
+    async fn enrich(&self, pods: &mut [Pod]) -> Result<()> {
+        // Route each pod to the backend that listed it: by its `provider` tag first (set by
+        // that backend, so unambiguous even if two backends' numeric ids collide), else the
+        // id→backend cache. Resolve under the lock, then release it before any await.
+        let owners: Vec<Option<usize>> = {
+            let map = self.owner.lock().unwrap();
+            pods.iter()
+                .map(|p| {
+                    self.backends
+                        .iter()
+                        .position(|b| b.name() == p.provider)
+                        .or_else(|| map.get(&p.id).copied())
+                })
+                .collect()
+        };
+        // Backends are independent: one failing (rate limit, outage) must not cost the
+        // others their details, so try them all and report the failures together.
+        let mut errs: Vec<String> = Vec::new();
+        for (i, b) in self.backends.iter().enumerate() {
+            let idx: Vec<usize> = (0..pods.len()).filter(|&j| owners[j] == Some(i)).collect();
+            if idx.is_empty() {
+                continue; // no API call for a backend with nothing to enrich
+            }
+            let mut mine: Vec<Pod> = idx.iter().map(|&j| pods[j].clone()).collect();
+            let r = b.enrich(&mut mine).await;
+            // Write back even on Err: whatever the backend filled before failing is valid.
+            for (j, p) in idx.into_iter().zip(mine) {
+                pods[j] = p;
+            }
+            if let Err(e) = r {
+                errs.push(format!("{}: {e}", b.name()));
+            }
+        }
+        if errs.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::provider(format!("pod details unavailable ({})", errs.join("; "))))
+        }
     }
     async fn create_pod(&self, spec: &PodSpec) -> Result<Pod> {
         // Creation needs a concrete target: always the chosen primary.
@@ -93,11 +170,58 @@ impl Provider for MultiProvider {
     async fn stop_pod(&self, id: &str) -> Result<()> {
         self.backend_for(id).await?.stop_pod(id).await
     }
+    async fn stop_pod_outcome(&self, id: &str) -> Result<StopOutcome> {
+        self.backend_for(id).await?.stop_pod_outcome(id).await
+    }
     async fn restart_pod(&self, id: &str) -> Result<()> {
         self.backend_for(id).await?.restart_pod(id).await
     }
+    async fn start_pod(&self, id: &str) -> Result<()> {
+        self.backend_for(id).await?.start_pod(id).await
+    }
+    fn restart_wipes_container_disk(&self, pod: &Pod) -> bool {
+        // Ask the backend that owns the pod: by its `provider` tag first (as `enrich`),
+        // else the id→backend cache. A pod no backend claims is assumed to wipe — the
+        // answer only ever adds a confirmation, never removes one.
+        self.owner_of(pod).is_none_or(|i| self.backends[i].restart_wipes_container_disk(pod))
+    }
+    fn restart_resets_container(&self, pod: &Pod) -> ContainerReset {
+        // The owner's answer too (RunPod v2's verified reset vs v1's unknown); no owner:
+        // gated as a wipe but never claimed.
+        self.owner_of(pod).map_or(ContainerReset::Unknown, |i| self.backends[i].restart_resets_container(pod))
+    }
+    fn stop_support(&self, pod: &Pod) -> Result<()> {
+        // The owner's answer; a pod no backend claims is the stop's own error later.
+        self.owner_of(pod).map_or(Ok(()), |i| self.backends[i].stop_support(pod))
+    }
+    fn ready_deadline(&self, pod: &Pod) -> Option<std::time::Duration> {
+        self.owner_of(pod).and_then(|i| self.backends[i].ready_deadline(pod))
+    }
+    fn lock_support(&self, pod: &Pod) -> Result<()> {
+        match self.owner_of(pod) {
+            Some(i) => self.backends[i].lock_support(pod),
+            None => Err(Error::NotImplemented(format!("no configured provider owns pod `{}` — can't lock it", pod.name))),
+        }
+    }
+    async fn set_locked(&self, id: &str, locked: bool) -> Result<()> {
+        self.backend_for(id).await?.set_locked(id, locked).await
+    }
+    fn check_create_extra(&self, extra: &Extra) -> Result<()> {
+        self.backends[self.primary].check_create_extra(extra)
+    }
+    fn preview_create_body(&self, spec: &PodSpec) -> Result<serde_json::Value> {
+        self.backends[self.primary].preview_create_body(spec)
+    }
     async fn terminate_pod(&self, id: &str) -> Result<()> {
         self.backend_for(id).await?.terminate_pod(id).await
+    }
+    async fn terminate_pod_on(&self, provider: &str, id: &str) -> Result<()> {
+        // By name alone — no id cache, no fallback: a backend that isn't configured (or a
+        // name that isn't one) is refused before any request.
+        match self.backends.iter().find(|b| b.name() == provider) {
+            Some(b) => b.terminate_pod(id).await,
+            None => Err(Error::provider(format!("no configured provider `{provider}` — pod {id} not terminated"))),
+        }
     }
     async fn rename_pod(&self, id: &str, new_name: &str) -> Result<()> {
         self.backend_for(id).await?.rename_pod(id, new_name).await
@@ -107,6 +231,14 @@ impl Provider for MultiProvider {
     }
     async fn pod_spec(&self, id: &str) -> Result<PodSpec> {
         self.backend_for(id).await?.pod_spec(id).await
+    }
+    async fn authorize_ssh_keys(&self, pod: &Pod, keys: &[String]) -> Result<()> {
+        // By the pod's `provider` tag first (as `enrich`): Vast and Hetzner ids are both
+        // numeric, so the id cache alone could hand a Vast pod to Hetzner. Else the cache.
+        match self.backends.iter().find(|b| b.name() == pod.provider) {
+            Some(b) => b.authorize_ssh_keys(pod, keys).await,
+            None => self.backend_for(&pod.id).await?.authorize_ssh_keys(pod, keys).await,
+        }
     }
 }
 
@@ -121,6 +253,12 @@ pub fn build_fleet(primary: &str, cfg: &Config, warn_on_partial: bool) -> Result
             KNOWN.join(", ")
         )));
     }
+    // Validate RUNPOD_API up front: a non-primary backend is built best-effort below, so
+    // a typo there would otherwise silently drop RunPod from the fleet instead of erroring.
+    crate::provider::RunpodApi::from_config(cfg)?;
+    // Likewise every SHADEFORM_* option (spec gap 10): a typo there must fail the fleet, not
+    // make every Shadeform instance vanish from `pods list` while it keeps billing.
+    crate::provider::shadeform::ShadeformOpts::from_config(cfg)?;
     let mut backends: Vec<Box<dyn Provider>> = Vec::new();
     let mut primary_idx = None;
     for name in KNOWN {
@@ -141,5 +279,556 @@ pub fn build_fleet(primary: &str, cfg: &Config, warn_on_partial: bool) -> Result
         primary: primary_idx.expect("primary is built or we bailed above"),
         owner: std::sync::Mutex::new(std::collections::HashMap::new()),
         warn_on_partial,
+        list_timeout: crate::provider::LIST_TIMEOUT,
     }))
+}
+
+/// A fleet of exactly these backends (the first one primary), for other modules' tests.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use super::*;
+
+    pub(crate) fn fleet_of(backends: Vec<Box<dyn Provider>>) -> MultiProvider {
+        MultiProvider {
+            backends,
+            primary: 0,
+            owner: std::sync::Mutex::new(std::collections::HashMap::new()),
+            warn_on_partial: false,
+            list_timeout: crate::provider::LIST_TIMEOUT,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    /// A backend that answers with fixed pods, or fails like a throttled API.
+    struct Fake {
+        name: &'static str,
+        pods: Option<Vec<Pod>>,
+    }
+
+    #[async_trait]
+    impl Provider for Fake {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        fn describe(&self, _spec: &PodSpec) -> String {
+            String::new()
+        }
+        async fn list_pods(&self) -> Result<Vec<Pod>> {
+            self.pods
+                .clone()
+                .ok_or_else(|| Error::provider(format!("{} list HTTP 429 Too Many Requests", self.name)))
+        }
+        async fn create_pod(&self, _spec: &PodSpec) -> Result<Pod> {
+            unimplemented!("not exercised")
+        }
+        async fn stop_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn restart_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn terminate_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn pod(id: &str, name: &str) -> Pod {
+        Pod { id: id.into(), name: name.into(), ..Default::default() }
+    }
+
+    fn multi(backends: Vec<Fake>) -> MultiProvider {
+        MultiProvider {
+            backends: backends.into_iter().map(|b| Box::new(b) as Box<dyn Provider>).collect(),
+            primary: 0,
+            owner: std::sync::Mutex::new(std::collections::HashMap::new()),
+            warn_on_partial: false,
+            list_timeout: crate::provider::LIST_TIMEOUT,
+        }
+    }
+
+    /// A backend whose API accepts the request and never answers.
+    struct Stalled;
+
+    #[async_trait]
+    impl Provider for Stalled {
+        fn name(&self) -> &'static str {
+            "vast"
+        }
+        fn describe(&self, _spec: &PodSpec) -> String {
+            String::new()
+        }
+        async fn list_pods(&self) -> Result<Vec<Pod>> {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            Ok(vec![])
+        }
+        async fn create_pod(&self, _spec: &PodSpec) -> Result<Pod> {
+            unimplemented!("not exercised")
+        }
+        async fn stop_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn restart_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn terminate_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stalled_backend_lists_as_failed_instead_of_hanging() {
+        let mut m = multi(vec![Fake { name: "runpod", pods: Some(vec![pod("r1", "arena8-apple")]) }]);
+        m.backends.push(Box::new(Stalled));
+        m.list_timeout = std::time::Duration::from_millis(50);
+        let started = std::time::Instant::now();
+        let got = m.list_by_provider().await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "must not wait for the stalled API");
+        assert_eq!(got[0].1.as_ref().unwrap().len(), 1, "the healthy backend still answers");
+        let err = got[1].1.as_ref().unwrap_err().to_string();
+        assert!(got[1].0 == "vast" && err.contains("vast list timed out"), "{err}");
+        // A stall, told apart from a refusal (a retry round waits it out — placement::relist).
+        assert!(matches!(got[1].1, Err(Error::Timeout { .. })), "{:?}", got[1].1);
+        // A single backend's default list_by_provider is bounded the same way.
+        let err = crate::provider::bounded_list("vast", Stalled.list_pods(), std::time::Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn list_by_provider_reports_each_backends_own_outcome() {
+        let m = multi(vec![
+            Fake { name: "runpod", pods: Some(vec![pod("r1", "arena8-apple")]) },
+            Fake { name: "vast", pods: None },
+        ]);
+        let got = m.list_by_provider().await;
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, "runpod");
+        assert_eq!(got[0].1.as_ref().unwrap().len(), 1);
+        assert_eq!(got[1].0, "vast");
+        assert!(got[1].1.as_ref().unwrap_err().to_string().contains("429"));
+        // The owner cache is filled from the successes, so mutations still route.
+        assert_eq!(m.owner.lock().unwrap().get("r1"), Some(&0));
+    }
+
+    #[tokio::test]
+    async fn list_pods_still_swallows_partial_failure_but_not_total() {
+        let partial = multi(vec![
+            Fake { name: "runpod", pods: Some(vec![pod("r1", "arena8-apple")]) },
+            Fake { name: "vast", pods: None },
+        ]);
+        let pods = partial.list_pods().await.unwrap();
+        assert_eq!(pods.len(), 1);
+
+        let total = multi(vec![Fake { name: "runpod", pods: None }, Fake { name: "vast", pods: None }]);
+        let err = total.list_pods().await.unwrap_err().to_string();
+        assert!(err.contains("all providers failed"), "{err}");
+    }
+
+    /// Live finding #9: with Vast's key bogus, `create`/`up` read the fleet's partial listing
+    /// as complete and planned a second `devtest-delta` next to Vast's running one. The
+    /// name-picking listing fails on ANY failed backend — naming it — while the aggregate
+    /// `list_pods` keeps its dashboard behaviour.
+    #[tokio::test]
+    async fn list_complete_refuses_a_partial_fleet_listing() {
+        let partial = multi(vec![
+            Fake { name: "runpod", pods: Some(vec![pod("r1", "devtest-alpha")]) },
+            Fake { name: "vast", pods: None },
+        ]);
+        assert_eq!(partial.list_pods().await.unwrap().len(), 1, "the dashboard listing still shows what answered");
+        let e = crate::provider::list_complete(&partial).await.unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("vast failed to list") && msg.contains("429"), "{msg}");
+        assert!(msg.contains("refusing to pick machine names") && msg.contains("retry once vast answers"), "{msg}");
+        // Retryable only when every failure is (a 429 passes: the caller's retry may still get
+        // a whole listing); this fake's failure is unclassified, so it isn't.
+        assert!(!crate::retry::is_retryable(&e));
+        let throttled = Error::Provider { kind: crate::error::ProviderErrorKind::RateLimited, message: "HTTP 429".into() };
+        assert!(crate::retry::is_retryable(&crate::provider::partial_listing_error(&[("vast".into(), throttled)])));
+
+        let whole = multi(vec![
+            Fake { name: "runpod", pods: Some(vec![pod("r1", "devtest-alpha")]) },
+            Fake { name: "vast", pods: Some(vec![pod("v1", "devtest-delta")]) },
+        ]);
+        let names: Vec<String> = crate::provider::list_complete(&whole).await.unwrap().into_iter().map(|p| p.name).collect();
+        assert_eq!(names, ["devtest-alpha", "devtest-delta"]);
+
+        // A rejected key isn't retried, and the message names the key to fix.
+        let e = crate::provider::partial_listing_error(&[(
+            "vast".to_string(),
+            Error::Provider { kind: crate::error::ProviderErrorKind::Auth, message: "list HTTP 404: auth_error".into() },
+        )]);
+        assert!(!crate::retry::is_retryable(&e), "{e}");
+        assert!(e.to_string().contains("VAST_API_KEY was rejected"), "{e}");
+    }
+
+    /// A backend whose restart keeps the disk (like Hetzner's reset), and whose stop had to
+    /// be forced (like a Hetzner VM that didn't shut down).
+    struct Keeps;
+
+    #[async_trait]
+    impl Provider for Keeps {
+        fn name(&self) -> &'static str {
+            "hetzner"
+        }
+        fn describe(&self, _spec: &PodSpec) -> String {
+            String::new()
+        }
+        async fn list_pods(&self) -> Result<Vec<Pod>> {
+            Ok(vec![pod("h1", "arena8-vm")])
+        }
+        async fn create_pod(&self, _spec: &PodSpec) -> Result<Pod> {
+            unimplemented!("not exercised")
+        }
+        async fn stop_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn restart_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn terminate_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        fn restart_wipes_container_disk(&self, _pod: &Pod) -> bool {
+            false
+        }
+        async fn stop_pod_outcome(&self, _id: &str) -> Result<StopOutcome> {
+            Ok(StopOutcome::ForcedOff { waited: std::time::Duration::from_secs(90) })
+        }
+    }
+
+    /// How a stop ended is the owning backend's answer: a forced Hetzner power-off isn't
+    /// flattened into a plain "stopped" on the way through the fleet.
+    #[tokio::test]
+    async fn the_stop_outcome_comes_from_the_owning_backend() {
+        let mut m = multi(vec![Fake { name: "runpod", pods: Some(vec![pod("r1", "arena8-apple")]) }]);
+        m.backends.push(Box::new(Keeps));
+        assert!(matches!(m.stop_pod_outcome("h1").await.unwrap(), StopOutcome::ForcedOff { .. }));
+        assert_eq!(m.stop_pod_outcome("r1").await.unwrap(), StopOutcome::Stopped);
+    }
+
+    #[tokio::test]
+    async fn restart_wipes_is_answered_by_the_owning_backend() {
+        let mut m = multi(vec![Fake { name: "runpod", pods: Some(vec![pod("r1", "arena8-apple")]) }]);
+        m.backends.push(Box::new(Keeps));
+        // By provider tag (no listing needed).
+        assert!(m.restart_wipes_container_disk(&tagged_pod("r1", "runpod")));
+        assert!(!m.restart_wipes_container_disk(&tagged_pod("h1", "hetzner")));
+        // Untagged: by the id→backend cache once listed.
+        m.list_pods().await.unwrap();
+        assert!(!m.restart_wipes_container_disk(&pod("h1", "arena8-vm")));
+        assert!(m.restart_wipes_container_disk(&pod("r1", "arena8-apple")));
+        // Nobody owns it: assume it wipes (the safe answer).
+        assert!(m.restart_wipes_container_disk(&tagged_pod("x1", "lambda")));
+        // What a restart is known to do is the owner's answer too — a v2 backend's verified
+        // reset included (the fleet's own default would only say "unknown").
+        let mut m = multi(vec![]);
+        m.backends.push(Box::new(crate::provider::runpod_v2::RunpodV2Provider::new("k")));
+        m.backends.push(Box::new(Keeps));
+        assert_eq!(m.restart_resets_container(&tagged_pod("r1", "runpod")), ContainerReset::Yes);
+        assert_eq!(m.restart_resets_container(&tagged_pod("h1", "hetzner")), ContainerReset::No);
+        assert_eq!(m.restart_resets_container(&tagged_pod("x1", "lambda")), ContainerReset::Unknown);
+    }
+
+    /// A backend that can re-attach SSH keys (like Vast), recording which pods it was asked to.
+    struct Attaches {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl Provider for Attaches {
+        fn name(&self) -> &'static str {
+            "vast"
+        }
+        fn describe(&self, _spec: &PodSpec) -> String {
+            String::new()
+        }
+        async fn list_pods(&self) -> Result<Vec<Pod>> {
+            Ok(vec![])
+        }
+        async fn create_pod(&self, _spec: &PodSpec) -> Result<Pod> {
+            unimplemented!("not exercised")
+        }
+        async fn stop_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn restart_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn terminate_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn authorize_ssh_keys(&self, pod: &Pod, _keys: &[String]) -> Result<()> {
+            self.seen.lock().unwrap().push(pod.id.clone());
+            Ok(())
+        }
+    }
+
+    /// The key repair goes to the backend that owns the pod — by its provider tag first, so
+    /// a Vast pod whose numeric id another backend also uses still reaches Vast.
+    #[tokio::test]
+    async fn authorize_ssh_keys_goes_to_the_owning_backend() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut m = multi(vec![Fake { name: "runpod", pods: Some(vec![pod("7", "arena8-apple")]) }]);
+        m.backends.push(Box::new(Attaches { seen: seen.clone() }));
+        m.list_pods().await.unwrap(); // the id cache now says "7" is runpod's
+        m.authorize_ssh_keys(&tagged_pod("7", "vast"), &["ssh-ed25519 AAAA k".into()]).await.unwrap();
+        assert_eq!(*seen.lock().unwrap(), ["7"]);
+        // RunPod can't: NotImplemented, which callers read as "leave the failure as it is".
+        let e = m.authorize_ssh_keys(&tagged_pod("7", "runpod"), &[]).await.unwrap_err();
+        assert!(matches!(e, Error::NotImplemented(_)), "{e}");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    /// A backend that can lock (like RunPod v2), recording each (id, locked) it was asked.
+    struct Locks {
+        seen: Arc<Mutex<Vec<(String, bool)>>>,
+    }
+
+    #[async_trait]
+    impl Provider for Locks {
+        fn name(&self) -> &'static str {
+            "runpod"
+        }
+        fn describe(&self, _spec: &PodSpec) -> String {
+            String::new()
+        }
+        async fn list_pods(&self) -> Result<Vec<Pod>> {
+            Ok(vec![tagged_pod("r1", "runpod")])
+        }
+        async fn create_pod(&self, _spec: &PodSpec) -> Result<Pod> {
+            unimplemented!("not exercised")
+        }
+        async fn stop_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn restart_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn terminate_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        fn lock_support(&self, _pod: &Pod) -> Result<()> {
+            Ok(())
+        }
+        async fn set_locked(&self, id: &str, locked: bool) -> Result<()> {
+            self.seen.lock().unwrap().push((id.to_string(), locked));
+            Ok(())
+        }
+        fn check_create_extra(&self, _extra: &Extra) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Lock questions and calls go to the pod's own backend; a backend that can't lock
+    /// (the default) says so, and a pod nobody owns is refused — never sent anywhere. The
+    /// create passthrough is the primary's, as the create is.
+    #[tokio::test]
+    async fn locks_route_to_the_owning_backend() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut m = multi(vec![Fake { name: "vast", pods: Some(vec![pod("v1", "arena8-bloom")]) }]);
+        m.backends.push(Box::new(Locks { seen: seen.clone() }));
+        assert!(m.lock_support(&tagged_pod("r1", "runpod")).is_ok());
+        let e = m.lock_support(&tagged_pod("v1", "vast")).unwrap_err().to_string();
+        assert!(e.contains("not supported on vast") && e.contains("RUNPOD_API=v2"), "{e}");
+        assert!(m.lock_support(&tagged_pod("x1", "lambda")).unwrap_err().to_string().contains("no configured provider owns"));
+        m.set_locked("r1", true).await.unwrap();
+        m.set_locked("r1", false).await.unwrap();
+        assert!(m.set_locked("v1", true).await.is_err(), "vast can't lock");
+        assert_eq!(*seen.lock().unwrap(), [("r1".to_string(), true), ("r1".to_string(), false)]);
+        // The primary (vast, the default impl) refuses an extra; it's the primary's call.
+        let extra: Extra = serde_json::from_str(r#"{"price": 0.1}"#).unwrap();
+        assert!(m.check_create_extra(&extra).unwrap_err().to_string().contains("isn't supported on provider `vast`"));
+        m.primary = 1;
+        assert!(m.check_create_extra(&extra).is_ok());
+    }
+
+    /// A backend recording which ids it terminated.
+    struct Terminates {
+        name: &'static str,
+        pods: Vec<Pod>,
+        gone: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl Provider for Terminates {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        fn describe(&self, _spec: &PodSpec) -> String {
+            String::new()
+        }
+        async fn list_pods(&self) -> Result<Vec<Pod>> {
+            Ok(self.pods.clone())
+        }
+        async fn create_pod(&self, _spec: &PodSpec) -> Result<Pod> {
+            unimplemented!("not exercised")
+        }
+        async fn stop_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn restart_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn terminate_pod(&self, id: &str) -> Result<()> {
+            self.gone.lock().unwrap().push(format!("{}:{id}", self.name));
+            Ok(())
+        }
+    }
+
+    /// The reaper's terminate goes to the backend NAMED, whatever the id cache says: a Vast
+    /// instance and a Hetzner server can share a numeric id, and by id the cache holds only
+    /// one of them. An unconfigured name is refused with no call.
+    #[tokio::test]
+    async fn terminate_on_routes_by_name_never_by_the_id_cache() {
+        let gone = Arc::new(Mutex::new(Vec::new()));
+        let m = MultiProvider {
+            backends: vec![
+                Box::new(Terminates { name: "vast", pods: vec![tagged_pod("7", "vast")], gone: gone.clone() }),
+                Box::new(Terminates { name: "hetzner", pods: vec![tagged_pod("7", "hetzner")], gone: gone.clone() }),
+            ],
+            primary: 0,
+            owner: std::sync::Mutex::new(HashMap::new()),
+            warn_on_partial: false,
+            list_timeout: crate::provider::LIST_TIMEOUT,
+        };
+        m.list_by_provider().await; // the cache now maps "7" to one of them
+        m.terminate_pod_on("vast", "7").await.unwrap();
+        m.terminate_pod_on("hetzner", "7").await.unwrap();
+        assert_eq!(*gone.lock().unwrap(), ["vast:7", "hetzner:7"]);
+        let e = m.terminate_pod_on("runpod", "7").await.unwrap_err().to_string();
+        assert!(e.contains("no configured provider `runpod`"), "{e}");
+        assert_eq!(gone.lock().unwrap().len(), 2, "nothing terminated for an unknown backend");
+        // A single backend refuses another's name the same way (the default impl).
+        let single = Terminates { name: "hetzner", pods: Vec::new(), gone: gone.clone() };
+        assert!(single.terminate_pod_on("vast", "7").await.is_err());
+        single.terminate_pod_on("hetzner", "8").await.unwrap();
+        assert_eq!(gone.lock().unwrap().last().map(String::as_str), Some("hetzner:8"));
+    }
+
+    #[tokio::test]
+    async fn backend_for_routes_by_owner_cache_from_the_listing() {
+        let m = multi(vec![
+            Fake { name: "runpod", pods: Some(vec![pod("r1", "arena8-apple")]) },
+            Fake { name: "vast", pods: Some(vec![pod("v1", "arena8-bloom")]) },
+        ]);
+        assert_eq!(m.backend_for("v1").await.unwrap().name(), "vast");
+        assert_eq!(m.backend_for("r1").await.unwrap().name(), "runpod");
+        assert!(m.backend_for("nope").await.is_err());
+    }
+
+    /// A backend that records which pod ids it was asked to enrich and stamps a marker
+    /// `gpu_count` on them (then optionally fails, to model a rate-limited provider).
+    struct FakeBackend {
+        name: &'static str,
+        marker: u32,
+        fail: bool,
+        seen: Seen,
+    }
+
+    /// Each `enrich` call's pod ids, in call order.
+    type Seen = Arc<Mutex<Vec<Vec<String>>>>;
+
+    #[async_trait]
+    impl Provider for FakeBackend {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        fn describe(&self, _spec: &PodSpec) -> String {
+            String::new()
+        }
+        async fn list_pods(&self) -> Result<Vec<Pod>> {
+            Ok(Vec::new())
+        }
+        async fn create_pod(&self, _spec: &PodSpec) -> Result<Pod> {
+            unimplemented!("not exercised by enrich tests")
+        }
+        async fn stop_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn restart_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn terminate_pod(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn enrich(&self, pods: &mut [Pod]) -> Result<()> {
+            self.seen.lock().unwrap().push(pods.iter().map(|p| p.id.clone()).collect());
+            for p in pods.iter_mut() {
+                p.gpu_count = Some(self.marker);
+            }
+            if self.fail {
+                return Err(Error::provider("HTTP 429"));
+            }
+            Ok(())
+        }
+    }
+
+    fn backend(name: &'static str, marker: u32, fail: bool) -> (Box<dyn Provider>, Seen) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        (Box::new(FakeBackend { name, marker, fail, seen: seen.clone() }), seen)
+    }
+
+    fn multi_with(backends: Vec<Box<dyn Provider>>, owner: HashMap<String, usize>) -> MultiProvider {
+        MultiProvider {
+            backends,
+            primary: 0,
+            owner: Mutex::new(owner),
+            warn_on_partial: false,
+            list_timeout: crate::provider::LIST_TIMEOUT,
+        }
+    }
+
+    fn tagged_pod(id: &str, provider: &str) -> Pod {
+        Pod { id: id.into(), name: format!("devtest-{id}"), provider: provider.into(), ..Default::default() }
+    }
+
+    #[tokio::test]
+    async fn enrich_routes_each_pod_to_its_backend() {
+        let (rp, rp_seen) = backend("runpod", 1, false);
+        let (va, va_seen) = backend("vast", 2, false);
+        let (hz, hz_seen) = backend("hetzner", 3, false);
+        let m = multi_with(vec![rp, va, hz], HashMap::new());
+        let mut pods = vec![tagged_pod("r1", "runpod"), tagged_pod("v1", "vast"), tagged_pod("r2", "runpod"), tagged_pod("x1", "lambda")];
+        m.enrich(&mut pods).await.unwrap();
+        // One batched call per backend, with only its own pods, in list order.
+        assert_eq!(*rp_seen.lock().unwrap(), vec![vec!["r1".to_string(), "r2".to_string()]]);
+        assert_eq!(*va_seen.lock().unwrap(), vec![vec!["v1".to_string()]]);
+        // A backend with no pods is not called at all (no wasted API request).
+        assert!(hz_seen.lock().unwrap().is_empty());
+        let counts: Vec<Option<u32>> = pods.iter().map(|p| p.gpu_count).collect();
+        // Results land on the right pods; a pod no backend owns is left untouched.
+        assert_eq!(counts, vec![Some(1), Some(2), Some(1), None]);
+    }
+
+    #[tokio::test]
+    async fn enrich_falls_back_to_owner_cache_when_tag_is_unknown() {
+        let (rp, rp_seen) = backend("runpod", 1, false);
+        let owner = HashMap::from([("odd".to_string(), 0usize)]);
+        let m = multi_with(vec![rp], owner);
+        let mut pods = vec![tagged_pod("odd", "")];
+        m.enrich(&mut pods).await.unwrap();
+        assert_eq!(*rp_seen.lock().unwrap(), vec![vec!["odd".to_string()]]);
+        assert_eq!(pods[0].gpu_count, Some(1));
+    }
+
+    #[tokio::test]
+    async fn enrich_failure_is_reported_but_other_backends_still_fill() {
+        let (rp, _) = backend("runpod", 1, true); // e.g. rate-limited
+        let (va, _) = backend("vast", 2, false);
+        let m = multi_with(vec![rp, va], HashMap::new());
+        let mut pods = vec![tagged_pod("r1", "runpod"), tagged_pod("v1", "vast")];
+        let err = m.enrich(&mut pods).await.unwrap_err().to_string();
+        assert!(err.contains("runpod: provider error: HTTP 429"), "{err}");
+        assert!(!err.contains("vast"), "{err}");
+        // vast's details still applied; runpod's partial fill is kept too.
+        assert_eq!(pods[1].gpu_count, Some(2));
+        assert_eq!(pods[0].gpu_count, Some(1));
+    }
 }

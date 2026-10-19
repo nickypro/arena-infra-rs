@@ -1,6 +1,6 @@
 # RunPod API reference (as used by arena-infra-rs)
 
-**Last updated: 2026-06-25**
+**Last updated: 2026-10-07**
 
 > Hand-maintained reference — it may drift from RunPod's live API. When in doubt, re-verify
 > against the live OpenAPI spec at `https://rest.runpod.io/v1/openapi.json` and the RunPod web
@@ -10,12 +10,13 @@
 This project talks to RunPod through **two** surfaces:
 
 - **REST v1** — base URL `https://rest.runpod.io/v1` — the primary API for lifecycle.
-- **GraphQL** — `https://api.runpod.io/graphql?api_key=<KEY>` — used only for the two things
-  REST can't do safely/at all: the restart-free rename (`podEditName`) and the GPU catalog
-  (`gpuTypes`).
+- **GraphQL** — `https://api.runpod.io/graphql` — used only for what REST can't do
+  safely/at all: the restart-free rename (`podEditName`), the GPU catalog with live prices
+  (`gpuTypes`), and per-pod host details for `pods list` (`myself.pods`).
 
-Auth: REST uses `Authorization: Bearer <API_KEY>`. GraphQL passes the key as the
-`?api_key=<KEY>` query param (no bearer header).
+Auth: both use `Authorization: Bearer <API_KEY>` (verified for GraphQL 2026-10-07). Never
+use GraphQL's `?api_key=<KEY>` query param: reqwest's error messages include the URL, so a
+network error would print the key (`graphql_request_keeps_key_out_of_url` guards this).
 
 All RunPod code lives in **`crates/core/src/provider/runpod.rs`** unless noted. Responses are
 parsed defensively from `serde_json::Value`, so a RunPod schema tweak degrades a field to
@@ -137,7 +138,7 @@ advertises *creatable* types.
 
 ## GraphQL operations used
 
-Endpoint: `POST https://api.runpod.io/graphql?api_key=<KEY>`
+Endpoint: `POST https://api.runpod.io/graphql` with `Authorization: Bearer <KEY>`
 GraphQL returns **HTTP 200 even on logical errors** — the code must inspect the `errors` array
 (`rename_pod` does exactly this).
 
@@ -153,11 +154,25 @@ Used by `runpod.rs::rename_pod`. **This is the only correct way to rename** — 
 
 ### `gpuTypes` query — the GPU catalog
 ```graphql
-{ gpuTypes { id displayName memoryInGb } }
+{ gpuTypes { id displayName memoryInGb securePrice communityPrice
+             lowestPrice(input: {gpuCount: 1}) { stockStatus } } }
 ```
 Used by `runpod.rs::fetch_gpu_types`. The REST v1 API has no gpu-types route, so this GraphQL
 query is the authoritative live list of valid `--gpu` names (including ones the local preset
-table doesn't alias). `id` is the exact string to pass as `gpuTypeIds` on create.
+table doesn't alias). `id` is the exact string to pass as `gpuTypeIds` on create. Prices are
+$/h per GPU (0/null is treated as "tier not offered"); e.g. A4000 → community 0.17, secure 0.25, stock
+"Low" (2026-10-07). If the priced query errors with no data, it retries the plain
+`{ gpuTypes { id displayName memoryInGb } }`.
+
+### `myself.pods` query — host details for `pods list`
+```graphql
+{ myself { pods { id gpuCount costPerHr
+                  machine { gpuDisplayName maintenanceStart maintenanceEnd maintenanceNote } } } }
+```
+Used by `RunpodProvider::enrich` (only from `pods list`, never the TUI poll loop). REST's
+`machine` is empty, so this is the only source of the GPU name and the host maintenance
+window. The maintenance fields' types aren't documented: strings are kept as-is, epoch
+numbers (s or ms) become ISO UTC; null/empty = no window.
 
 ---
 
@@ -177,4 +192,5 @@ RunPod's GraphQL surface exposes these pod mutations:
 | **`podEditName`**           | **NO (undocumented)** | **YES** — `rename_pod` |
 
 The tool prefers REST v1 for all lifecycle (create/stop/restart/terminate/list/get) and only
-drops to GraphQL for `podEditName` (restart-free rename) and the `gpuTypes` catalog query.
+drops to GraphQL for `podEditName` (restart-free rename) and the read-only `gpuTypes` /
+`myself.pods` queries.

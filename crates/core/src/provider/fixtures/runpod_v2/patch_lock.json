@@ -1,0 +1,99 @@
+{
+ "request": {
+  "method": "PATCH",
+  "path": "/v2/pods/mqseb0i5acrssr",
+  "body": {
+   "locked": true
+  }
+ },
+ "status": 200,
+ "body": {
+  "actions": [
+   "stop",
+   "restart",
+   "terminate"
+  ],
+  "args": "",
+  "cloud": "COMMUNITY",
+  "cost": 0.13,
+  "createdAt": "2026-10-08T09:33:33.607Z",
+  "cudaVersion": "13.0",
+  "dataCenterId": null,
+  "disk": 60,
+  "env": {
+   "MACHINE_NAME": "<redacted>",
+   "PUBLIC_KEY": "<redacted>"
+  },
+  "globalNetworking": {
+   "enabled": false
+  },
+  "gpu": {
+   "count": 1,
+   "id": "NVIDIA GeForce RTX 3070",
+   "memory": 18,
+   "vcpuCount": 22
+  },
+  "id": "mqseb0i5acrssr",
+  "image": "nickypro/arena-env:9.1",
+  "locked": true,
+  "mounts": {},
+  "name": "devtest-echo",
+  "ports": [
+   "8888/http",
+   "22/tcp"
+  ],
+  "registry": null,
+  "runtime": {
+   "cpu": {
+    "util": 0
+   },
+   "gpus": [
+    {
+     "memoryUtil": 0,
+     "util": 0
+    }
+   ],
+   "memory": {
+    "util": 0
+   },
+   "ports": [
+    {
+     "ip": "100.65.28.182",
+     "private": 19123,
+     "public": 60257,
+     "type": "http"
+    },
+    {
+     "ip": "64.119.209.250",
+     "private": 22,
+     "public": 23924,
+     "type": "tcp"
+    },
+    {
+     "ip": "100.65.28.182",
+     "private": 8888,
+     "public": 60256,
+     "type": "http"
+    }
+   ],
+   "uptime": 65
+  },
+  "ssh": {
+   "direct": {
+    "command": "ssh <redacted>",
+    "host": "64.119.209.250",
+    "port": 23924,
+    "username": "root"
+   },
+   "proxy": {
+    "command": "ssh <redacted>",
+    "host": "ssh.runpod.io",
+    "port": 22,
+    "username": "mqseb0i5acrssr-64411cb6"
+   }
+  },
+  "startedAt": "2026-10-08T09:33:33.602Z",
+  "status": "RUNNING",
+  "template": null
+ }
+}

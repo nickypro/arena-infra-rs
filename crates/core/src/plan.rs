@@ -90,6 +90,14 @@ pub fn parse_tier(s: &str) -> (String, Option<String>) {
     }
 }
 
+/// Whether `provider` (`runpod`, `vast`, …) is in the default provider chain — what a plan
+/// with no `providers` of its own walks, so where arena puts pods unless told otherwise. A
+/// backend outside it is **opt-in**: Shadeform is overflow, created on only when `--provider
+/// shadeform` asks, so its wallet is often unfunded on purpose ([`crate::balance::Account::opt_in`]).
+pub fn in_default_chain(provider: &str) -> bool {
+    default_providers().iter().any(|p| parse_tier(p).0.eq_ignore_ascii_case(provider.trim()))
+}
+
 /// `"HH:MM"` to minutes-since-midnight, validated.
 pub fn parse_hm(s: &str) -> Option<u32> {
     let (h, m) = s.trim().split_once(':')?;
@@ -239,5 +247,14 @@ mod tests {
         assert_eq!(plan.providers, default_providers());
         assert_eq!(plan.gpus, default_gpus());
         assert_eq!(plan.window, default_window());
+    }
+
+    /// The default chain names RunPod (either tier) and Vast; Shadeform (overflow) and
+    /// Hetzner (CPU VMs) are never walked unless asked for.
+    #[test]
+    fn in_default_chain_is_the_plans_default_providers() {
+        for (provider, want) in [("runpod", true), ("vast", true), (" RunPod ", true), ("shadeform", false), ("hetzner", false), ("", false)] {
+            assert_eq!(in_default_chain(provider), want, "{provider:?}");
+        }
     }
 }

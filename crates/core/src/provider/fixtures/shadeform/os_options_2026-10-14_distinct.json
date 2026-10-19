@@ -1,0 +1,20 @@
+{
+ "source": "GET /instances/types, 2026-10-14 (299 types): every distinct configuration.os_options value, with how many types list it",
+ "os_options": {
+  "ubuntu20.04": 30,
+  "ubuntu20.04_cuda12.0_shade_os": 8,
+  "ubuntu20.04_cuda12.2_shade_os": 41,
+  "ubuntu20.04_cuda12.4_shade_os": 3,
+  "ubuntu22.04": 76,
+  "ubuntu22.04_cuda12.0_shade_os": 8,
+  "ubuntu22.04_cuda12.2_shade_os": 76,
+  "ubuntu22.04_cuda12.4_shade_os": 81,
+  "ubuntu22.04_cuda12.6_shade_os": 12,
+  "ubuntu22.04_cuda12.8_shade_os": 39,
+  "ubuntu22.04_cuda13.0_shade_os": 60,
+  "ubuntu24.04": 14,
+  "ubuntu24.04_cuda12.4_shade_os": 22,
+  "ubuntu24.04_cuda12.8_shade_os": 51,
+  "ubuntu24.04_cuda13.0_shade_os": 14
+ }
+}

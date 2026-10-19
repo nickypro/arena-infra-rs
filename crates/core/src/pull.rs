@@ -4,13 +4,26 @@
 //! home directory to the operator's machine via rsync. It's a safety net for files that
 //! never made it into git before a pod is torn down.
 //!
-//! Mirrors the legacy flags: archive + compress, human-readable progress, prune empty
-//! dirs, and a per-file size cap so a stray multi-GB checkpoint doesn't blow up the
+//! Mirrors the legacy flags: archive + compress, prune empty dirs, and a per-file size cap so a stray multi-GB checkpoint doesn't blow up the
 //! backup. Dotfile *directories* (caches, `.git`, …), `site-packages/`, and common
 //! reconstructable/huge non-dot dirs (`hf_cache/`, `__pycache__/`, `venv/`,
 //! `node_modules/`) are excluded — they're either reconstructable or huge. The rsync arg
 //! vector is built purely here so it's unit-tested; the process spawn lives in the caller.
+//!
+//! The dated snapshot tier is **deduplicated with hard links** (`--link-dest`): unchanged files
+//! are linked to this pod's previous snapshot and to the week's **fleet baseline** — the
+//! image's own files, captured once from a fresh pod (`pods baseline`, see
+//! [`prune_baseline`]) — instead of copied again (live: every day's snapshot was a full ~1.8G
+//! per pod, almost all of it image content). Each snapshot stays a complete, restorable tree.
+//! And its `.git` is complete: the size cap applies to the files, never to `.git` (a second,
+//! uncapped pass — [`PullConfig::passes`]).
 
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use crate::error::{Error, Result};
+use crate::setup::MAX_STEP_TIMEOUT_SECS;
 use crate::ssh::SshTarget;
 
 /// Options for a pull, defaulting to the legacy `backup.sh` behavior.
@@ -30,7 +43,105 @@ pub struct PullConfig {
     pub excludes: Vec<String>,
     /// Remote path to pull from, relative to the SSH login dir. Empty = the home dir.
     pub remote_path: String,
+    /// rsync `--timeout`: give up after this many seconds with **no I/O at all**. Without
+    /// it, a pod that stops answering mid-transfer (a wedged host, a dropped NAT mapping)
+    /// leaves rsync waiting forever — and the */15 backup cron stacking up behind it. It
+    /// only fires on silence: a slow transfer keeps moving bytes, and rsync sends
+    /// keep-alives while either side is busy checksumming a big file. `None` = no limit.
+    /// The wall-clock bound on a whole transfer is the caller's (`BACKUP_TIMEOUT_SECS`).
+    pub io_timeout_secs: Option<u64>,
+    /// Excludes that win over [`Self::includes`] (emitted before them): a path inside an
+    /// included tree that must still never be copied. Empty for the backup tiers.
+    pub first_excludes: Vec<String>,
+    /// What the transfer may do to the receiver's own files ([`Mirror`]). Every backup tier
+    /// accumulates (never deletes); only a pod-to-pod replication mirrors, and only when it
+    /// says so per transfer.
+    pub mirror: Mirror,
+    /// rsync `--rsync-path`: what starts rsync on the REMOTE side. `None` = plain `rsync`. A
+    /// pod-to-pod copy sets [`crate::replica::guarded_rsync_path`], so a transfer that reaches
+    /// a reassigned endpoint starts nothing there.
+    pub rsync_path: Option<String>,
+    /// Complete earlier trees whose identical files are hard-linked instead of copied (rsync
+    /// `--link-dest`, absolute paths, tried in order; "identical" = same size, mtime and
+    /// permissions): this pod's previous snapshot and the fleet baseline
+    /// ([`snapshot_link_dests`]). They must be on the destination's filesystem (they are: all
+    /// under the backup dir). Empty = no dedup.
+    pub link_dest: Vec<String>,
+    /// Only the `.git` dirs, nothing else — the size-capped tier's second pass
+    /// ([`PullConfig::passes`]).
+    pub git_only: bool,
+    /// The destination already holds this snapshot from an earlier pull (the */15 cron pulls
+    /// into the day's label all day), and its files may be hard links shared with older
+    /// snapshots and the fleet baseline: never change an existing file's attributes in place
+    /// (`--no-perms --no-owner --no-group`). rsync applies a mode or owner change that comes
+    /// without a content change to the existing file — i.e. to the inode every linked snapshot
+    /// shares (its man page: "existing files may get their attributes tweaked, and that can
+    /// affect alternate destination files via hard-links") — so one `chmod` on a pod rewrote the
+    /// mode in every earlier snapshot, and through the baseline in other pods'. A changed file
+    /// is still written anew (a new inode; the old ones untouched). The cost: a mode-only change
+    /// made after the day's first pull shows in the next day's snapshot, not this one.
+    /// ([`snapshot_tier_for`] sets it.)
+    pub linked_dest: bool,
+    /// rsync `--temp-dir`: where the RECEIVER writes each file before renaming it into place.
+    /// `None` = rsync's default, a `.<name>.XXXXXX` file beside the destination file — i.e.
+    /// inside the backup tree. `pods pull`/`backup` set the tier's own `.rsync-tmp`
+    /// (`<backup dir>/<label>/.rsync-tmp`, `<backup dir>/big/.rsync-tmp`; absolute): the backup
+    /// archive's push (`arena archive sync`) reads the pod trees while a pull may be writing them,
+    /// and a push that overlapped a pull would otherwise ship half-written temp files to an
+    /// archive that never deletes. It is used only when it is on the destination's filesystem —
+    /// across filesystems rsync's rename fails and it rewrites the destination in place instead
+    /// (worse than its default), so the caller then leaves it `None`. Nothing else changes: the
+    /// same files land in the same places with the same links.
+    pub temp_dir: Option<String>,
 }
+
+/// What a transfer may do to files on the RECEIVING side that the sender doesn't have (or
+/// has a different version of) — the one switch between a backup and a replica, so a
+/// deletion can only ever be asked for by name, never inherited from a shared default.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Mirror {
+    /// Never delete on the receiver: every backup tier (`pods pull`/`backup`), restore, and
+    /// any copy that doesn't say otherwise. What was copied before stays, even once it's gone
+    /// from the source.
+    #[default]
+    Accumulate,
+    /// `--delete`: the receiver becomes an exact copy. Only for a scratch copy the tool owns
+    /// outright and nothing else writes — the via-local staging dir of a pod-to-pod copy —
+    /// so a file deleted on the source can't come back through a stale stage.
+    Exact,
+    /// `--delete --backup --backup-dir=<dir>`: a replica on another *pod* (`replace` /
+    /// `migrate` into `<name>-new`). Deletions propagate (a file the participant deleted
+    /// mustn't reappear on the new pod), but whatever the transfer overwrites or deletes on
+    /// the receiver is MOVED into `dir` (relative to the receiving directory), never
+    /// destroyed: the new pod may hold work of its own — after a cutover then a revert, or a
+    /// test run on it ([`crate::replica`] reports and tidies what was moved). The folder the
+    /// moved files go to ([`Mirror::backup_root`]) is protected from the deletion — this
+    /// sync's and every earlier one's, wherever it appears — even when the sender has one too.
+    Replica { backup_dir: String },
+}
+
+impl Mirror {
+    /// Whether the transfer deletes on the receiver (`--delete`): [`Mirror::Exact`] and
+    /// [`Mirror::Replica`]. Such a transfer carries empty dirs and protects nothing inside a
+    /// `.git` (see [`rsync_args`]), so the receiver's tree ends up exactly the sender's.
+    pub fn deletes(&self) -> bool {
+        !matches!(self, Mirror::Accumulate)
+    }
+
+    /// The top folder a [`Mirror::Replica`] moves files into: its `backup_dir`'s first
+    /// component past any `..` (`arena-sync-kept/S` and `../arena-sync-kept/S/repo` →
+    /// `arena-sync-kept`). `None` for the other mirrors.
+    pub fn backup_root(&self) -> Option<&str> {
+        match self {
+            Mirror::Replica { backup_dir } => backup_dir.split('/').find(|c| !c.is_empty() && *c != "." && *c != ".."),
+            _ => None,
+        }
+    }
+}
+
+/// The default [`PullConfig::io_timeout_secs`]: 5 minutes without a byte means the
+/// connection is dead, not slow.
+pub const RSYNC_IO_TIMEOUT_SECS: u64 = 300;
 
 impl Default for PullConfig {
     fn default() -> Self {
@@ -71,17 +182,60 @@ impl Default for PullConfig {
                 // outputs are large + reproducible/wandb-logged). zebra's orchestrator is
                 // told to do all its run work here.
                 "TEMP_FOLDER_FOR_SWEEPS/".to_string(),
+                // Where setup moved the image's checkout aside when the repo went onto the
+                // `/workspace` volume (`crate::volume`): a second full copy of the repo, from the
+                // image — the work is in the volume copy, which the pull captures.
+                "*.arena-aside-*/".to_string(),
             ],
             remote_path: String::new(),
+            io_timeout_secs: Some(RSYNC_IO_TIMEOUT_SECS),
+            first_excludes: Vec::new(),
+            mirror: Mirror::Accumulate,
+            rsync_path: None,
+            link_dest: Vec::new(),
+            git_only: false,
+            linked_dest: false,
+            temp_dir: None,
         }
     }
 }
+
+/// What the pod-to-pod replication ([`PullConfig::replication`]) leaves behind, for the
+/// `replace` / `migrate copy` output — what the copy really drops, not "caches".
+pub const REPLICATION_SKIPS: &str = "skips caches and other dot-dirs (.cache, .venv, .vscode-server, .ssh, .claude), \
+     venvs, site-packages and ~/.local/lib (pip --user), HF caches, ~/.local/share/uv, the claude/codex that \
+     setup installs and Claude Code's own state, shell rc files + history (the API keys follow by name), zsh's \
+     completion cache, ~/.name";
+
+/// What it does carry besides the plain files: for the same output.
+pub const REPLICATION_KEEPS: &str = "the home incl. .git, ~/.config, ~/.jupyter, ~/.ipython, ~/.local (bin, share)";
 
 impl PullConfig {
     /// Drop the `.git` includes (so `.git` is excluded by `**/.*/` like other dotdirs).
     pub fn without_git(mut self) -> Self {
         self.includes.retain(|i| !i.contains(".git"));
         self
+    }
+
+    /// The rsyncs that make this tier, run one after the other into the same destination. A
+    /// size-capped tier that keeps `.git` is two: everything but `.git` under the cap, then
+    /// only the `.git` dirs with no cap — the cap used to drop a repo's big pack, leaving a
+    /// `.git` whose refs point at objects that never arrived (live: a 232M pack missing, `git
+    /// fsck` failing). With `--link-dest` the second pass costs little on disk: a pack doesn't
+    /// change, so each snapshot hard-links the previous one's. Everything else is one pass.
+    pub fn passes(&self) -> Vec<PullConfig> {
+        let keeps_git = self.includes.iter().any(|i| i.contains(".git"));
+        if self.git_only || self.max_size.is_none() || !keeps_git {
+            return vec![self.clone()];
+        }
+        let git = PullConfig {
+            max_size: None,
+            min_size: None,
+            includes: self.includes.iter().filter(|i| i.contains(".git")).cloned().collect(),
+            git_only: true,
+            ..self.clone()
+        };
+        vec![self.clone().without_git(), git]
     }
 
     /// Pod-to-pod **replication** profile (the `pods replace` copy), as opposed to the
@@ -97,9 +251,47 @@ impl PullConfig {
     ///
     /// `.cache` and the HuggingFace model/dataset caches are already excluded by the shared
     /// defaults, and `.git` is still kept so the new pod inherits branch/commit state.
+    ///
+    /// The participant's small config dot-dirs ARE carried (live finding #27: every hidden
+    /// dir was dropped, `~/.config` with wandb's settings among them): `~/.config`,
+    /// `~/.jupyter`, `~/.ipython`, `~/.local` (its `bin/` and `share/`; `lib/` — pip
+    /// `--user` installs — and uv's managed Pythons are reconstructable and stay behind).
+    /// `~/.name` is not carried: it names the pod it's on, and setup / the swap write it.
+    /// [`REPLICATION_KEEPS`] / [`REPLICATION_SKIPS`] say so in the output.
+    ///
+    /// It accumulates ([`Mirror::Accumulate`]) unless the caller asks for a mirror per
+    /// transfer: deletion is never a default.
     pub fn replication() -> Self {
         let mut s = Self { max_size: None, ..Self::default() };
         s.includes.retain(|i| !i.contains(".claude"));
+        // Root-anchored (the home's own): the dir, then (where wanted whole) its contents.
+        for dir in [".config", ".jupyter", ".ipython"] {
+            s.includes.push(format!("/{dir}/"));
+            s.includes.push(format!("/{dir}/**"));
+        }
+        // `.local` itself only: its non-dot children are copied by default, minus the
+        // excludes below.
+        s.includes.push("/.local/".to_string());
+        s.excludes.push("/.local/lib/".to_string());
+        s.excludes.push("/.local/share/uv/".to_string());
+        s.excludes.push("/.local/share/Trash/".to_string());
+        // Never Claude Code state, even inside an included tree (ToS, see above) — its config
+        // and the state its installer keeps under ~/.local.
+        for p in ["/.config/claude*", "/.config/anthropic*", "/.local/share/claude/", "/.local/state/claude/"] {
+            s.first_excludes.push(p.to_string());
+        }
+        // What setup installs on every pod (the receiver has its own before the copy): never
+        // carried, and never deleted there when the original lacks it (an exclude protects it
+        // from a mirror) — else the receiver's /usr/local/bin links would dangle.
+        s.first_excludes.push("/.local/bin/claude".to_string());
+        s.first_excludes.push("/.local/bin/codex".to_string());
+        // The caches inside an included tree (`/.config/**` would otherwise win over them).
+        s.first_excludes.push(".cache/".to_string());
+        s.first_excludes.push("__pycache__/".to_string());
+        // The receiver's own: its name, and the replica bookkeeping (`crate::replica`) — an
+        // exclude also keeps a mirroring transfer from deleting them there.
+        s.excludes.push("/.name".to_string());
+        s.excludes.push(format!("/{}", crate::replica::LAST_SYNC));
         // Exclude the whole `.claude` family — both the `.claude/` dir AND the `.claude.json`
         // credential *file* in the home root. The default `**/.*/` only drops dot-*dirs*, so
         // `.claude.json` (a file) would otherwise be replicated, leaking Claude Code creds.
@@ -119,6 +311,12 @@ impl PullConfig {
             s.excludes.push(f.to_string());
             s.excludes.push(format!("**/{f}"));
         }
+        // zsh's completion cache (`.zcompdump-<host>-<version>` and its compiled `.zwc`), which
+        // compinit rebuilds on every pod and names after the pod's own hostname: the receiver
+        // has its own after any login, the source's is useless there, and mirroring it away
+        // reported those caches as KEPT changes on every sync (live R, 2026-10-09), burying real
+        // work in the list. Excluded, so it is neither carried nor deleted on the receiver.
+        s.excludes.push(".zcompdump*".to_string());
         s
     }
 
@@ -136,6 +334,184 @@ impl PullConfig {
     pub fn big_tier() -> Self {
         Self { max_size: None, min_size: None, ..Self::default() }
     }
+
+    /// The auto-reaper's final copy (`crate::reap`, RS2): the big tier, but keeping EVERYTHING
+    /// in the home except [`REAP_NOT_KEPT`] — dot-directories included (`~/.config`,
+    /// `~/.ipython`, `~/.jupyter`, `~/.local/bin`, `~/.arena/jobs` logs, VS Code's local history …)
+    /// and `~/.cache` but for its well-known download caches (processed `datasets`, wandb, any
+    /// cache nobody listed), which the regular tiers drop. What it still doesn't keep can be
+    /// downloaded or installed again, or is a secret ([`REAP_NOT_KEPT`]: documented, never a
+    /// veto) — or is a sweep folder ([`REAP_VETOED`]: never copied, and a pod with any file
+    /// there is never reaped — the probe's `uncovered` fact). Never deletes.
+    pub fn reap_tier() -> Self {
+        let mut s = Self::big_tier();
+        s.excludes = REAP_NOT_KEPT.iter().chain(REAP_VETOED).map(|e| e.to_string()).collect();
+        s
+    }
+}
+
+/// What a reap's backup ([`PullConfig::reap_tier`]) leaves out — the documented list a reap may
+/// lose, never a veto: only what can be **downloaded or installed again**, plus secrets (W7
+/// B-RS2: the earlier list left out all of `~/.cache` and more, while the commit, the checklist
+/// and the participant's notice promised otherwise — a dataset `datasets.map()` spent hours on
+/// lives in `~/.cache/huggingface/datasets`, a W&B run's files in `~/.cache/wandb`). Said in
+/// the participant notice ([`REAP_NOT_KEPT_SUMMARY`]) and the README.
+/// - Python environments and installed packages: `venv/`, `.venv/`, `site-packages/`,
+///   `~/.local/lib/` (pip `--user`), uv's managed Pythons (`~/.local/share/uv/`), conda's `envs/`
+///   and `pkgs/` under a conda root in the home (by its usual names — never a bare `envs/`, which
+///   may be somebody's code), `node_modules/` (`npm install` again), `__pycache__/` (python
+///   writes it again on import);
+/// - well-known download and build caches: `~/.cache/pip`, `~/.cache/uv`, the Hugging Face hub
+///   (`~/.cache/huggingface/hub` and `xet`; `models--*/` and `datasets--*/` wherever the hub
+///   cache was pointed — public downloads), `~/.cache/torch/hub` (torch.hub's downloads),
+///   `~/.triton` and `~/.nv` (compiled kernels), `~/.cache/matplotlib` (its font list), `~/.npm`;
+///   the VS Code server's own binaries and extensions (setup reinstalls them; its `data/` —
+///   settings, local history — IS kept);
+/// - `.ssh/` (keys: setup's, and secrets a backup volume shouldn't hold);
+/// - the image's checkout setup moved aside when the repo went onto `/workspace` (a copy from the
+///   image, as the regular tiers skip it; a pod with work on `/workspace` is never reaped).
+///
+/// Everything else in `~/.cache` is kept: an unknown folder may be somebody's only copy.
+pub const REAP_NOT_KEPT: &[&str] = &[
+    "venv/",
+    ".venv/",
+    "site-packages/",
+    "/.local/lib/",
+    "/.local/share/uv/",
+    "/.conda/envs/",
+    "/.conda/pkgs/",
+    "/miniconda3/envs/",
+    "/miniconda3/pkgs/",
+    "/anaconda3/envs/",
+    "/anaconda3/pkgs/",
+    "/miniforge3/envs/",
+    "/miniforge3/pkgs/",
+    "/mambaforge/envs/",
+    "/mambaforge/pkgs/",
+    "node_modules/",
+    "__pycache__/",
+    "/.cache/pip/",
+    "/.cache/uv/",
+    "/.cache/huggingface/hub/",
+    "/.cache/huggingface/xet/",
+    "models--*/",
+    "datasets--*/",
+    "/.cache/torch/hub/",
+    "/.triton/",
+    "/.nv/",
+    "/.cache/matplotlib/",
+    "/.npm/",
+    "/.vscode-server/bin/",
+    "/.vscode-server/cli/",
+    "/.vscode-server/extensions/",
+    ".ssh/",
+    "*.arena-aside-*/",
+];
+
+/// [`REAP_NOT_KEPT`] in the participant's words — the notice on every pod with a reap policy says
+/// exactly this, and so does the README (a test holds both to it).
+/// Every entry is named (W7LR-2): `.ssh/` matches a folder of that name at any depth — "every .ssh
+/// folder"; `__pycache__/` is "Python bytecode"; `*.arena-aside-*/` is "arena's moved-aside copy".
+pub const REAP_NOT_KEPT_SUMMARY: &str = "not kept: only what can be downloaded or installed again — Python environments and \
+     installed packages (venvs, site-packages, ~/.local/lib, conda envs, node_modules), download and build caches (pip, uv, \
+     npm, the Hugging Face and torch hubs, compiled kernels, Python bytecode, matplotlib's), the VS Code server's binaries \
+     and extensions, and arena's moved-aside copy of the image's repo — and every .ssh folder; the rest of ~/.cache is kept";
+
+/// What a reap's backup never copies AND never loses: sweep/RLVR run folders (large; "do all
+/// run work here"). A pod with any file there at all (a placeholder aside) is `NotCovered` —
+/// never reaped (the probe's `uncovered`, RS2, R2-1).
+pub const REAP_VETOED: &[&str] = &["TEMP_FOLDER_FOR_SWEEPS/"];
+
+/// Counts of a tree: regular files, their bytes, directories, symlinks, and anything else
+/// (devices, fifos, sockets) — what a frozen copy is checked against ([`link_tree`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TreeCount {
+    pub files: u64,
+    pub bytes: u64,
+    pub dirs: u64,
+    pub links: u64,
+    pub other: u64,
+}
+
+/// Count `root`'s tree (never following a symlink).
+pub fn tree_count(root: &Path) -> std::io::Result<TreeCount> {
+    let mut c = TreeCount::default();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(&dir)? {
+            let e = e?;
+            let t = e.file_type()?;
+            if t.is_dir() {
+                c.dirs += 1;
+                stack.push(e.path());
+            } else if t.is_symlink() {
+                c.links += 1;
+            } else if t.is_file() {
+                c.files += 1;
+                c.bytes += e.metadata()?.len();
+            } else {
+                c.other += 1;
+            }
+        }
+    }
+    Ok(c)
+}
+
+/// `cp -al src dst`: a hard-link copy of the tree `src` at `dst` (which must not exist; its
+/// parent is created) — directories made anew, symlinks re-created as links, everything else
+/// (regular files, and a fifo or socket rsync carried) hard-linked: same filesystem, no space
+/// used, and a later rsync into `src` writes a changed file as a NEW inode, so the copy keeps
+/// what it had. Returns the counts of the copy, for the caller to hold against `src`'s.
+pub fn link_tree(src: &Path, dst: &Path) -> std::io::Result<TreeCount> {
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::create_dir(dst)?;
+    let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
+    while let Some((from, to)) = stack.pop() {
+        for e in std::fs::read_dir(&from)? {
+            let e = e?;
+            let t = e.file_type()?;
+            let target = to.join(e.file_name());
+            if t.is_dir() {
+                std::fs::create_dir(&target)?;
+                stack.push((e.path(), target));
+            } else if t.is_symlink() {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(std::fs::read_link(e.path())?, &target)?;
+            } else {
+                std::fs::hard_link(e.path(), &target)?;
+            }
+        }
+    }
+    tree_count(dst)
+}
+
+/// The default wall-clock budget for one pod's backup rsync (`BACKUP_TIMEOUT_SECS`): 2 hours.
+/// A first big-tier pull of a full home over a slow uplink takes tens of minutes, so this
+/// only trips on a transfer that is stuck while still trickling bytes — a silent one is
+/// already stopped by the I/O timeout ([`RSYNC_IO_TIMEOUT_SECS`]). Either way the pod is
+/// reported as a named failure and the rest of the fleet's backup carries on.
+pub const DEFAULT_BACKUP_TIMEOUT_SECS: u64 = 2 * 3600;
+
+/// The per-pod budget for a backup rsync, from the `BACKUP_TIMEOUT_SECS` config value:
+/// unset/empty = [`DEFAULT_BACKUP_TIMEOUT_SECS`]; otherwise whole seconds,
+/// 1..=[`MAX_STEP_TIMEOUT_SECS`] (a day). Anything else is a config error naming the value
+/// — a typo must not quietly become "no limit" (an unbounded backup is what stacks the
+/// cron) or the default.
+pub fn backup_timeout(config_value: Option<&str>) -> Result<Duration> {
+    let Some(raw) = config_value.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(Duration::from_secs(DEFAULT_BACKUP_TIMEOUT_SECS));
+    };
+    raw.parse::<u64>()
+        .ok()
+        .filter(|n| (1..=MAX_STEP_TIMEOUT_SECS).contains(n))
+        .map(Duration::from_secs)
+        .ok_or_else(|| {
+            Error::Config(format!(
+                "BACKUP_TIMEOUT_SECS must be a whole number of seconds, 1..={MAX_STEP_TIMEOUT_SECS} (got `{raw}`)"
+            ))
+        })
 }
 
 /// The local destination for a pod's backup: `<base>/<label>/<pod-name>/`. The trailing
@@ -149,6 +525,172 @@ pub fn local_dest(base: &str, label: &str, pod_name: &str) -> String {
 /// multi-GB checkpoint is stored once instead of re-copied into each day's snapshot.
 pub fn big_dest(base: &str, pod_name: &str) -> String {
     format!("{}/big/{pod_name}/", base.trim_end_matches('/'))
+}
+
+/// Where the big (all-files) tier lives: `LOCAL_BACKUP_BIG_DIR` when set — its own volume,
+/// so a big tier that only ever grows can't starve the dated snapshots (or `/`) of space —
+/// else `<LOCAL_BACKUP_DIR>/big`, today's layout. A trailing `/` is dropped.
+pub fn big_root(local_backup_dir: &str, big_dir: Option<&str>) -> String {
+    match big_dir.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) => {
+            let t = d.trim_end_matches('/');
+            if t.is_empty() { "/".to_string() } else { t.to_string() }
+        }
+        None => format!("{}/big", local_backup_dir.trim_end_matches('/')),
+    }
+}
+
+/// A pod's big-tier destination under the big root `root`: `<root>/<pod>/` (the trailing
+/// slash matters to rsync). [`big_dest`] is this under `<base>/big`.
+pub fn big_dest_in(root: &str, pod_name: &str) -> String {
+    format!("{}/{pod_name}/", root.trim_end_matches('/'))
+}
+
+/// The marker file at the root of each backup tier's volume, written once by hand when the
+/// volume is formatted: its first line is exactly the tier's word ([`Tier::word`]). What
+/// catches an unmounted volume: with `nofail` a missing volume leaves an empty mountpoint on
+/// `/`, and an rsync into it "succeeds" — filling the root disk with a backup nobody will
+/// find. The reaper always requires the markers; `pods pull`/`backup` only in two-volume mode
+/// (`LOCAL_BACKUP_BIG_DIR` set).
+pub const TIER_MARKER: &str = ".arena-backup-tier";
+
+/// The two backup tiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier {
+    /// The dated small-file snapshots (`<LOCAL_BACKUP_DIR>/<wNdM>/<pod>/`).
+    Snapshot,
+    /// The all-files tier ([`big_root`]).
+    Big,
+}
+
+impl Tier {
+    /// The marker's first line for this tier.
+    pub fn word(self) -> &'static str {
+        match self {
+            Tier::Snapshot => "snapshot",
+            Tier::Big => "big",
+        }
+    }
+}
+
+/// Whether a [`TIER_MARKER`]'s text marks `tier`: its first line is exactly the tier's word
+/// (a trailing `\r` from an editor tolerated, nothing else). Pure.
+pub fn tier_marker_ok(text: &str, tier: Tier) -> bool {
+    text.lines().next().map(|l| l.strip_suffix('\r').unwrap_or(l)) == Some(tier.word())
+}
+
+/// Read `root`'s [`TIER_MARKER`] and check it marks `tier`: `Err` says what's wrong (no
+/// marker — the volume not mounted? — or the other tier's).
+pub fn check_tier_marker(root: &Path, tier: Tier) -> std::result::Result<(), String> {
+    let path = root.join(TIER_MARKER);
+    match std::fs::read_to_string(&path) {
+        Ok(text) if tier_marker_ok(&text, tier) => Ok(()),
+        Ok(_) => Err(format!("{} doesn't say `{}` — the wrong volume mounted there?", path.display(), tier.word())),
+        Err(e) => Err(format!(
+            "no tier marker {} ({e}) — is the {} volume mounted? (create it once with `printf '{}\\n' > {}`)",
+            path.display(),
+            tier.word(),
+            tier.word(),
+            path.display()
+        )),
+    }
+}
+
+/// Bytes free for an unprivileged writer on the filesystem holding `path` (`statvfs`:
+/// `f_bavail × f_frsize`) — what the reaper's free-space floor is checked against.
+#[cfg(unix)]
+pub fn free_bytes(path: &Path) -> std::io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path holds a NUL byte"))?;
+    // SAFETY: statvfs(3) on a NUL-terminated path into a zeroed struct we own.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+}
+
+/// No `statvfs` off unix: unknown, which the reaper reads as "not enough".
+#[cfg(not(unix))]
+pub fn free_bytes(_path: &Path) -> std::io::Result<u64> {
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "free space unknown on this platform"))
+}
+
+/// The rsync argv that checks a finished tier: [`rsync_args`] plus `--dry-run` — with
+/// `--stats` (always passed) it reports how many files a real run would still send
+/// ([`parse_rsync_stats`]'s `files_sent`): 0 = the destination holds everything the source
+/// has, as the tier's rules select it.
+pub fn verify_args(target: &SshTarget, pc: &PullConfig, local_dest: &str) -> Vec<String> {
+    let mut a = vec!["--dry-run".to_string()];
+    a.extend(rsync_args(target, pc, local_dest));
+    a
+}
+
+/// Where the per-pod backup lock lives: `<dir>/.arena-locks/<pod>.lock`, `dir` being the
+/// backup dir a run writes (`LOCAL_BACKUP_DIR` — a value every user shares, unlike the state
+/// dir). Every writer of a pod's backup takes it — `pods pull`, `pods backup` and the
+/// reaper's probe and backup — so our own backup SSH sessions never overlap a reaper probe
+/// (where they'd count as activity) or each other. The pod name is reduced to a safe file
+/// name.
+pub fn pod_lock_path(local_backup_dir: &str, pod: &str) -> PathBuf {
+    let safe: String = pod.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' }).collect();
+    let safe = if safe.is_empty() || safe.chars().all(|c| c == '.') { "_".to_string() } else { safe };
+    Path::new(local_backup_dir).join(".arena-locks").join(format!("{safe}.lock"))
+}
+
+/// Open (creating) a pod's backup lock file ([`pod_lock_path`]) — not locked yet. Only inside
+/// a backup dir that already EXISTS: the lock never creates `local_backup_dir` or a parent of
+/// it (a pull creates its destination the way it always did — with the umask's mode; a
+/// git-only backup never touched it). The `.arena-locks` folder alone is made, 0700. A
+/// missing backup dir is `NotFound`.
+pub fn open_pod_lock(local_backup_dir: &str, pod: &str) -> std::io::Result<std::fs::File> {
+    let base = Path::new(local_backup_dir);
+    if !base.is_dir() {
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("{} doesn't exist", base.display())));
+    }
+    let path = pod_lock_path(local_backup_dir, pod);
+    if let Some(dir) = path.parent() {
+        let mut b = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            b.mode(0o700);
+        }
+        match b.create(dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => {}
+            Err(e) => return Err(e),
+        }
+    }
+    std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path)
+}
+
+/// A one-pod writer's lock (the TUI's git backup, RR10), without waiting: `Ok(Some(lock))`
+/// held until dropped; `Ok(None)` no lock to take — a relative or missing backup dir, or a
+/// lock that can't be opened, as before the locks; `Err(())` another backup of the pod (a
+/// pull, the cron's push, the reaper) holds it.
+#[allow(clippy::result_unit_err)] // `Err(())` is only "busy": callers (cli, tui) branch on it, never report it
+pub fn try_pod_lock_now(local_backup_dir: &str, pod: &str) -> std::result::Result<Option<std::fs::File>, ()> {
+    if !Path::new(local_backup_dir).is_absolute() {
+        return Ok(None);
+    }
+    let Ok(f) = open_pod_lock(local_backup_dir, pod) else { return Ok(None) };
+    match try_lock(&f) {
+        Ok(true) => Ok(Some(f)),
+        Ok(false) => Err(()),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Take `lock` exclusively without waiting: `Ok(true)` taken (held until the file is
+/// dropped), `Ok(false)` someone else holds it.
+pub fn try_lock(lock: &std::fs::File) -> std::io::Result<bool> {
+    match lock.try_lock() {
+        Ok(()) => Ok(true),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
 }
 
 /// Build the `rsync` argv (everything after the program name) to pull `target`'s home
@@ -202,6 +744,20 @@ pub fn pod_to_pod_command(
     remote_key: &str,
     pc: &PullConfig,
 ) -> String {
+    pod_to_pod_command_into(dest_ip, dest_port, dest_user, remote_key, pc, "")
+}
+
+/// [`pod_to_pod_command`] into `dest_path` on the destination (relative to its home; empty =
+/// the home) — e.g. the repo's tree into `ARENA_materials/`, which the destination resolves
+/// through a symlink there (its repo on the `/workspace` volume) instead of replacing the link.
+pub fn pod_to_pod_command_into(
+    dest_ip: &str,
+    dest_port: u16,
+    dest_user: &str,
+    remote_key: &str,
+    pc: &PullConfig,
+    dest_path: &str,
+) -> String {
     let mut parts = vec!["rsync".to_string()];
     for a in rsync_flags(pc) {
         parts.push(shell_quote(&a));
@@ -210,9 +766,13 @@ pub fn pod_to_pod_command(
     // `push_rsync_args` — the `.`-entry chown of `/root` is what locks sshd out).
     parts.push("--no-owner".into());
     parts.push("--no-group".into());
+    // ConnectTimeout: a destination the source can't reach (two pods behind one public IP:
+    // the hairpin connect just hangs) must fail in seconds — the caller then copies via the
+    // control machine — not after the kernel's ~2 min SYN timeout (live finding #30).
     let ssh = format!(
         "ssh -p {dest_port} -o BatchMode=yes -o StrictHostKeyChecking=no \
-         -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -i {remote_key}"
+         -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout={POD_TO_POD_CONNECT_TIMEOUT_SECS} \
+         -o ServerAliveInterval=30 -i {remote_key}"
     );
     parts.push("-e".into());
     parts.push(shell_quote(&ssh));
@@ -222,9 +782,17 @@ pub fn pod_to_pod_command(
         format!("$HOME/{}", pc.remote_path)
     };
     parts.push(src);
-    parts.push(format!("{dest_user}@{dest_ip}:"));
+    parts.push(if dest_path.is_empty() {
+        format!("{dest_user}@{dest_ip}:")
+    } else {
+        shell_quote(&format!("{dest_user}@{dest_ip}:{dest_path}"))
+    });
     parts.join(" ")
 }
+
+/// How long the source pod's ssh may take to connect to the destination in a direct
+/// pod-to-pod copy ([`pod_to_pod_command`]).
+pub const POD_TO_POD_CONNECT_TIMEOUT_SECS: u64 = 15;
 
 /// Single-quote a value for safe inclusion in a remote `sh -c` string (POSIX `'\''`).
 fn shell_quote(s: &str) -> String {
@@ -234,13 +802,49 @@ fn shell_quote(s: &str) -> String {
 /// The shared `rsync` flags + size filters + include/exclude rules (everything except the
 /// `-e` transport and the source/dest operands), so pull and push stay in lockstep.
 fn rsync_flags(pc: &PullConfig) -> Vec<String> {
+    // No `--human-readable`: with it rsync's `--stats` print sizes as `1.84G`, which the old
+    // digits-only parse read as 184 (live: "(6754 files, 184)" for a 1.8G pull). The default
+    // stats are plain (digit-grouped) byte counts; [`parse_rsync_stats`] reads every format.
     let mut a = vec![
         "-avz".to_string(),
-        "--human-readable".into(),
         "--info=progress2".into(),
         "--stats".into(), // emit a summary we parse to report files/bytes per pod
-        "--prune-empty-dirs".into(),
     ];
+    // Only a copy that never deletes prunes empty dirs ([`Mirror::deletes`]): a mirror carries
+    // the tree as it is, empty dirs too. Pruned from a mirror's file list, a source's empty dir
+    // is "gone" to `--delete`, which then removes the receiver's — a `.git/refs/` whose refs
+    // are all packed, and the copy is no repo at all. The rule that keeps such dirs in an
+    // accumulating tier's list (the `.git` protect below) can't do it here: a protect rule is
+    // also the receiver's, so it would keep the receiver's own git state the source doesn't
+    // have — a deleted branch's ref, a stale `rebase-merge/` — in the replica.
+    if !pc.mirror.deletes() {
+        a.push("--prune-empty-dirs".into());
+    }
+    if let Some(t) = pc.io_timeout_secs {
+        a.push(format!("--timeout={t}"));
+    }
+    if let Some(path) = &pc.rsync_path {
+        a.push(format!("--rsync-path={path}"));
+    }
+    if let Some(dir) = &pc.temp_dir {
+        a.push(format!("--temp-dir={dir}"));
+    }
+    match &pc.mirror {
+        Mirror::Accumulate => {}
+        Mirror::Exact => a.push("--delete".into()),
+        Mirror::Replica { backup_dir } => {
+            a.push("--delete".into());
+            a.push("--backup".into());
+            a.push(format!("--backup-dir={backup_dir}"));
+        }
+    }
+    // A replica's moved-aside folder is never deleted on the receiver: protect rules, first
+    // (the first matching rule wins), for the folder and everything in it — the folder alone
+    // wouldn't keep its contents once the sender has a folder of that name too.
+    if let Some(root) = pc.mirror.backup_root() {
+        a.push(format!("--filter=P {root}/"));
+        a.push(format!("--filter=P {root}/**"));
+    }
     // `--max-size` keeps the snapshot tier small (the big tier leaves it `None` to take
     // everything). `--min-size` is currently unused but honored if a caller sets it.
     if let Some(m) = &pc.max_size {
@@ -248,6 +852,24 @@ fn rsync_flags(pc: &PullConfig) -> Vec<String> {
     }
     if let Some(m) = &pc.min_size {
         a.push(format!("--min-size={m}"));
+    }
+    // After `-a`, so they win: an existing (possibly hard-linked) file's mode/owner never
+    // changes in place ([`PullConfig::linked_dest`]).
+    if pc.linked_dest {
+        a.extend(["--no-perms", "--no-owner", "--no-group"].map(String::from));
+    }
+    // Excludes that must win even inside an included tree (first: the first matching rule
+    // wins).
+    for ex in &pc.first_excludes {
+        a.push("--exclude".into());
+        a.push(ex.clone());
+    }
+    // `--prune-empty-dirs` must not prune inside a kept `.git`: a repo whose refs are all packed
+    // has an empty `.git/refs/heads/`, and git doesn't take a `.git` without `refs/` for a
+    // repository at all ("not a git repository") — the copy would be no repo. (A mirror doesn't
+    // prune, and mustn't protect: see above.)
+    if !pc.mirror.deletes() && pc.includes.iter().any(|i| i.contains(".git")) {
+        a.push("--filter=protect **/.git/**/".into());
     }
     // Includes first (they win over a later exclude), then excludes.
     for inc in &pc.includes {
@@ -258,25 +880,344 @@ fn rsync_flags(pc: &PullConfig) -> Vec<String> {
         a.push("--exclude".into());
         a.push(ex.clone());
     }
+    // The `.git` pass: whatever the rules above haven't decided — every other directory (to
+    // reach the `.git`s inside it; `--prune-empty-dirs` drops the ones that hold none) and every
+    // other file (dropped) — so it carries exactly the `.git` dirs the tier keeps, the dirs it
+    // excludes (caches, venvs) never entered.
+    if pc.git_only {
+        a.extend(["--include", "*/", "--exclude", "*"].map(String::from));
+    }
+    for d in &pc.link_dest {
+        a.push(format!("--link-dest={d}"));
+    }
     a
 }
 
-/// Parse rsync `--stats` output into `(files_transferred, human-readable bytes)` so a
-/// pull reports what actually moved (not just "done"). `None` if the stats aren't found.
-pub fn parse_rsync_stats(stdout: &str) -> Option<(u64, String)> {
-    let mut files = None;
-    let mut bytes = None;
+/// The directory under the backup dir that holds the fleet baselines (`<dir>/baseline/`); never
+/// a snapshot label.
+pub const BASELINE_DIR: &str = "baseline";
+
+/// The pulls' rsync temp directory's name ([`PullConfig::temp_dir`]): one per tier root
+/// (`<dir>/<label>/.rsync-tmp`, `<dir>/big/.rsync-tmp`) — beside the pod trees, never inside one,
+/// so nothing that reads those trees (the archive push) sees a half-written file. Hidden, so never
+/// a pod or a label.
+pub const TEMP_DIR: &str = ".rsync-tmp";
+
+/// [`PullConfig::temp_dir`] for a tier root (`<abs dir>/<label>` or `<abs dir>/big`), absolute so
+/// it means the same place for every destination of that tier (a pod's dir, a repo's tree in
+/// it). `root` should already be absolute.
+pub fn temp_dir_for(root: &Path) -> String {
+    root.join(TEMP_DIR).display().to_string()
+}
+
+/// A week's fleet baseline: `<base>/baseline/w<week>/fleet/` — the image's own files from one
+/// freshly set-up pod, for every pod's snapshots of that week (and later, until a newer one)
+/// to hard-link to ([`snapshot_link_dests`]).
+pub fn baseline_dir(base: &Path, week: u32) -> PathBuf {
+    base.join(BASELINE_DIR).join(format!("w{week}")).join("fleet")
+}
+
+/// The newest non-empty fleet baseline of `week` or before (any week when `None`).
+pub fn newest_baseline(base: &Path, week: Option<u32>) -> Option<PathBuf> {
+    let mut weeks: Vec<u32> = std::fs::read_dir(base.join(BASELINE_DIR))
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().to_str()?.strip_prefix('w')?.parse::<u32>().ok())
+        .filter(|w| week.is_none_or(|max| *w <= max))
+        .collect();
+    weeks.sort_unstable();
+    weeks.into_iter().rev().map(|w| baseline_dir(base, w)).find(|d| non_empty_dir(d))
+}
+
+fn non_empty_dir(dir: &Path) -> bool {
+    std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) && std::fs::read_dir(dir).is_ok_and(|mut e| e.next().is_some())
+}
+
+/// What a new snapshot `<base>/<label>/<pod>/` hard-links its unchanged files to, as absolute
+/// paths (rsync takes a relative `--link-dest` relative to the destination — absolute leaves no
+/// doubt), most likely match first: this pod's newest other `wNdM` snapshot (day-to-day: the
+/// files setup touched differ per pod, so only the pod's own history has them), then the
+/// newest fleet baseline of the label's week or before (the image's files, the same on every
+/// pod — what a new or replaced pod's first snapshot shares). Only directories that exist; none
+/// at all when `base` doesn't exist yet.
+pub fn snapshot_link_dests(base: &Path, label: &str, pod: &str) -> Vec<String> {
+    let Ok(base) = std::fs::canonicalize(base) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if let Some(prev) = crate::restore::snapshot_labels(&base, pod).into_iter().find(|l| l != label) {
+        out.push(base.join(prev).join(pod));
+    }
+    if let Some(b) = newest_baseline(&base, crate::restore::parse_label(label).map(|(w, _)| w)) {
+        out.push(b);
+    }
+    out.into_iter().map(|p| p.display().to_string()).collect()
+}
+
+/// The snapshot tier's config for `<base>/<label>/<pod>/`: `small` with its link-dests
+/// ([`snapshot_link_dests`]) and, when that snapshot already has files — an earlier pull of the
+/// same label — [`PullConfig::linked_dest`], so this pull can't change the files it shares with
+/// other snapshots.
+pub fn snapshot_tier_for(base: &Path, label: &str, pod: &str, small: &PullConfig) -> PullConfig {
+    PullConfig {
+        link_dest: snapshot_link_dests(base, label, pod),
+        linked_dest: non_empty_dir(&base.join(label).join(pod)),
+        ..small.clone()
+    }
+}
+
+/// What a backup tree takes on disk ([`disk_use`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiskUse {
+    /// Regular files in it, and their bytes (what `du` of this tree alone says).
+    pub files: u64,
+    pub bytes: u64,
+    /// The bytes of the files no other tree shares (link count 1): what keeping this tree
+    /// costs on top of the others — `du` over all the snapshots counts a hard-linked file once,
+    /// so this is the tree's share of that.
+    pub own_bytes: u64,
+}
+
+/// [`DiskUse`] of the tree at `path` (symlinks aren't followed or counted).
+pub fn disk_use(path: &Path) -> std::io::Result<DiskUse> {
+    let mut d = DiskUse::default();
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let m = entry.metadata()?;
+            if m.is_dir() {
+                stack.push(entry.path());
+            } else if m.is_file() {
+                d.files += 1;
+                d.bytes += m.len();
+                if links(&m) <= 1 {
+                    d.own_bytes += m.len();
+                }
+            }
+        }
+    }
+    Ok(d)
+}
+
+#[cfg(unix)]
+fn links(m: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    m.nlink()
+}
+
+#[cfg(not(unix))]
+fn links(_: &std::fs::Metadata) -> u64 {
+    1
+}
+
+/// What [`prune_baseline`] kept and removed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PruneStats {
+    pub kept_files: u64,
+    pub kept_bytes: u64,
+    pub removed_files: u64,
+    pub removed_bytes: u64,
+}
+
+/// Reduce a baseline freshly pulled from one pod to **the image's own files**: remove every
+/// file and symlink last modified at or after `since` (UNIX seconds: the pod's container
+/// creation), and every one in `copied` (home-relative paths: what was written onto the pod
+/// since then with an older mtime — [`copied_in_command`]), then the directories that leaves
+/// empty.
+///
+/// Why: rsync's `--link-dest` takes a file as "the same" when its size, mtime and permissions
+/// match — it never compares contents. Within one pod's history that's safe. Across pods it is
+/// only safe for files nobody wrote after the image was built: the image's files carry the
+/// image's mtimes on every pod, while a file written at setup or later (`~/.name`, the API keys
+/// in `.bashrc`, a script's output written on several pods in the same second) can match
+/// another pod's in size and mtime with different contents — and a snapshot would then hold
+/// the wrong pod's file. So the baseline keeps only what predates the container. The mtime
+/// alone can't tell a file *copied* onto the pod later with its old mtime kept — a whole home
+/// by `pods replace`/`migrate` (`rsync -a`), files pushed back by `pods restore`, `~/.name`
+/// among them — from the image's: the pod's ctimes can, hence `copied`.
+pub fn prune_baseline(dir: &Path, since: u64, copied: &BTreeSet<PathBuf>) -> std::io::Result<PruneStats> {
+    let mut s = PruneStats::default();
+    prune_dir(dir, Path::new(""), since, copied, &mut s)?;
+    Ok(s)
+}
+
+/// [`prune_baseline`] below `dir` (`rel` below the baseline's root); whether `dir` is now empty.
+fn prune_dir(dir: &Path, rel: &Path, since: u64, copied: &BTreeSet<PathBuf>, s: &mut PruneStats) -> std::io::Result<bool> {
+    let mut empty = true;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let m = entry.metadata()?; // not following symlinks
+        let rel = rel.join(entry.file_name());
+        if m.is_dir() {
+            if prune_dir(&entry.path(), &rel, since, copied, s)? {
+                std::fs::remove_dir(entry.path())?;
+            } else {
+                empty = false;
+            }
+            continue;
+        }
+        let mtime = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs());
+        let size = if m.is_file() { m.len() } else { 0 };
+        if mtime.is_none_or(|t| t >= since) || copied.contains(&rel) {
+            std::fs::remove_file(entry.path())?;
+            s.removed_files += 1;
+            s.removed_bytes += size;
+        } else {
+            s.kept_files += 1;
+            s.kept_bytes += size;
+            empty = false;
+        }
+    }
+    Ok(empty)
+}
+
+/// The records [`copied_in_script`]'s output is framed by: whatever a shell rc file prints
+/// comes before the first; a listing without the last didn't finish.
+const COPIED_BEGIN: &str = "arena-copied-begin";
+const COPIED_END: &str = "arena-copied-end";
+
+/// The pod-side listing behind [`prune_baseline`]'s `copied` (`mark`: the container mark,
+/// [`crate::volume::CONTAINER_MARK`] — a parameter for tests). Every non-directory under the
+/// home whose **ctime** is after the container's creation while its **mtime** is not: written
+/// onto the pod since, with an older mtime kept — `pods replace`/`migrate` copy a home with
+/// `rsync -a`, `pods restore` pushes files back, setup unpacks archives. An image file keeps the
+/// ctime its layer was unpacked with, before the container. Dot-dirs the baseline never holds
+/// are skipped (all but `.git` and `.claude`). NUL-separated `./<path>` records between
+/// [`COPIED_BEGIN`] and [`COPIED_END`]; GNU find's `-newerXY` — a find without it fails, and the
+/// capture is refused.
+pub fn copied_in_script(mark: &str) -> String {
+    format!(
+        "C={c}\n[ -e \"$C\" ] && cd \"$HOME\" || exit 1\nprintf '{COPIED_BEGIN}\\0'\n\
+         find . -xdev \\( -type d -name '.?*' ! -name .git ! -name .claude -prune \\) \
+         -o \\( ! -type d -newercm \"$C\" ! -newermm \"$C\" -print0 \\) || exit 1\nprintf '{COPIED_END}\\0'\n",
+        c = shell_quote(mark)
+    )
+}
+
+/// [`copied_in_script`] for the real container mark, as one `sh -c` command.
+pub fn copied_in_command() -> String {
+    format!("sh -c {}", shell_quote(&copied_in_script(crate::volume::CONTAINER_MARK)))
+}
+
+/// Parse [`copied_in_command`]'s output into home-relative paths — or why it can't be trusted
+/// (the capture is then refused, never made without it): the listing didn't finish, a record
+/// isn't a `./` path, a name isn't UTF-8 (it couldn't be matched to its file here).
+pub fn parse_copied_in(stdout: &str) -> std::result::Result<BTreeSet<PathBuf>, String> {
+    let records: Vec<&str> = stdout.split('\0').collect();
+    let start = records.iter().position(|r| r.ends_with(COPIED_BEGIN)).ok_or("the listing never started")?;
+    let mut out = BTreeSet::new();
+    for r in &records[start + 1..] {
+        if *r == COPIED_END {
+            return Ok(out);
+        }
+        // find never prints an empty path: this is the end of a listing cut short.
+        if r.is_empty() {
+            break;
+        }
+        let rel = r.strip_prefix("./").filter(|p| !p.is_empty()).ok_or_else(|| format!("an unexpected record {r:?}"))?;
+        if rel.contains('\u{FFFD}') {
+            return Err(format!("a file name that isn't UTF-8 ({rel}) can't be matched to its file"));
+        }
+        out.insert(PathBuf::from(rel));
+    }
+    Err("the listing didn't finish".into())
+}
+
+/// What an rsync `--stats` summary says moved (see [`parse_rsync_stats`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RsyncStats {
+    /// Regular files sent, new or changed (`Number of regular files transferred`).
+    pub files_sent: u64,
+    /// Their size, in bytes (`Total transferred file size`; the files' size, not the wire's).
+    pub bytes_sent: u64,
+    /// Everything the transfer covered, sent or not (`Number of files`); `None` = not said.
+    pub files: Option<u64>,
+    /// Its size in bytes (`Total file size`).
+    pub bytes: Option<u64>,
+}
+
+impl RsyncStats {
+    /// `12 files, 3.4M` — what was sent (the old summary's shape).
+    pub fn sent(&self) -> String {
+        format!("{} files, {}", self.files_sent, human_bytes(self.bytes_sent))
+    }
+
+    /// Two passes into one destination as one ([`PullConfig::passes`]).
+    #[allow(clippy::should_implement_trait)] // called as `a.add(b)` in arena-cli; an `impl Add` would only move those callers to `+`
+    pub fn add(self, o: RsyncStats) -> RsyncStats {
+        let sum = |a: Option<u64>, b: Option<u64>| match (a, b) {
+            (None, None) => None,
+            (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+        };
+        RsyncStats {
+            files_sent: self.files_sent + o.files_sent,
+            bytes_sent: self.bytes_sent + o.bytes_sent,
+            files: sum(self.files, o.files),
+            bytes: sum(self.bytes, o.bytes),
+        }
+    }
+
+    /// `12 files, 3.4M sent of 6754, 1.8G` — what moved, and what the tree it made holds (with
+    /// `--link-dest` the rest was hard-linked, not sent).
+    pub fn summary(&self) -> String {
+        match (self.files, self.bytes) {
+            (Some(n), Some(b)) => format!("{} sent of {n}, {}", self.sent(), human_bytes(b)),
+            _ => self.sent(),
+        }
+    }
+}
+
+/// Parse rsync `--stats` output so a pull reports what actually moved (not just "done").
+/// `None` if the stats aren't there. Reads every way rsync prints a number — plain
+/// (`1234567`), digit-grouped by locale (`1,234,567` / `1.234.567`), and human-readable with
+/// a unit (`1.84G`, `1,84G`: units of 1000, what one `--human-readable` gives) — so a size
+/// is never mistaken for its digits.
+pub fn parse_rsync_stats(stdout: &str) -> Option<RsyncStats> {
+    let mut s = RsyncStats::default();
+    let mut seen = false;
     for line in stdout.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("Number of regular files transferred:") {
-            files = rest.trim().replace(',', "").parse::<u64>().ok();
+            s.files_sent = rsync_number(rest)?;
+            seen = true;
         } else if let Some(rest) = line.strip_prefix("Total transferred file size:") {
-            // e.g. "Total transferred file size: 1,234,567 bytes"
-            let digits: String = rest.chars().filter(|c| c.is_ascii_digit()).collect();
-            bytes = digits.parse::<u64>().ok();
+            s.bytes_sent = rsync_number(rest).unwrap_or(0);
+        } else if let Some(rest) = line.strip_prefix("Number of files:") {
+            // `6,754 (reg: 6,000, dir: 754)`: the regular files, to compare with those sent.
+            s.files = rest.split_once("reg:").map_or_else(|| rsync_number(rest), |(_, reg)| rsync_number(reg.trim_end_matches(')')));
+        } else if let Some(rest) = line.strip_prefix("Total file size:") {
+            s.bytes = rsync_number(rest);
         }
     }
-    files.map(|f| (f, human_bytes(bytes.unwrap_or(0))))
+    seen.then_some(s)
+}
+
+/// The first number in an rsync stats value (`" 1,234,567 bytes"`, `" 6,754 (reg: …)"`,
+/// `" 1.84G bytes"`). See [`parse_rsync_stats`] for the formats.
+fn rsync_number(raw: &str) -> Option<u64> {
+    let tok = raw.split_whitespace().next()?;
+    let unit = |c: char| match c {
+        'K' => Some(1e3),
+        'M' => Some(1e6),
+        'G' => Some(1e9),
+        'T' => Some(1e12),
+        'P' => Some(1e15),
+        _ => None,
+    };
+    match tok.chars().last().and_then(unit) {
+        Some(scale) => {
+            let num = tok[..tok.len() - 1].replace(',', ".");
+            let v: f64 = num.parse().ok().filter(|v: &f64| v.is_finite() && *v >= 0.0)?;
+            Some((v * scale).round() as u64)
+        }
+        // Without a unit any `,`/`.` is a thousands separator (rsync prints no fractions here).
+        None if tok.chars().all(|c| c.is_ascii_digit() || c == ',' || c == '.') => {
+            tok.chars().filter(char::is_ascii_digit).collect::<String>().parse().ok()
+        }
+        None => None,
+    }
 }
 
 /// Bytes as a compact human string ("0", "12K", "3.4M", "1.2G").
@@ -290,17 +1231,311 @@ pub fn human_bytes(b: u64) -> String {
     b.to_string()
 }
 
-/// Human-readable `rsync` command for dry-run output (the `-e` value is quoted since it
-/// contains spaces).
-pub fn display_rsync(target: &SshTarget, pc: &PullConfig, local_dest: &str) -> String {
-    let args = rsync_args(target, pc, local_dest);
-    let mut out = String::from("rsync");
-    for arg in args {
-        if arg.contains(' ') {
-            out.push_str(&format!(" '{}'", arg));
-        } else {
-            out.push_str(&format!(" {arg}"));
+/// What rsync prints on stderr when a non-empty directory here is in the way of what the source
+/// now has at that path, a symlink or a file. rsync 3.2.7, reproduced with the pulls' own flags,
+/// prints `could not make way for new symlink: ARENA_3.0` and then exits 23 ("some files/attrs
+/// were not transferred"); everything else is copied. Live (2026-10-17), `ARENA_3.0` became a
+/// symlink on 9 pods while `big/<pod>/ARENA_3.0` was still the directory earlier pulls had made,
+/// so every pull of those pods failed `[big]` the same way.
+///
+/// rsync removes an empty directory in the way by itself, but never a non-empty one. Only
+/// `--force` makes it do that, and `--force` DELETES the backed-up files (so does a `--delete`
+/// mirror), which a backup must never do. The related `cannot delete non-empty directory: X`
+/// line only appears with `-vv`, and on stdout, so it is not what this reads.
+const MAKE_WAY: &str = "could not make way for new ";
+
+/// rsync's exit for a transfer that ended with some files or attributes not transferred — the
+/// one its [`MAKE_WAY`] message comes with. A line like it under any other exit is not acted on.
+pub const RSYNC_PARTIAL_EXIT: i32 = 23;
+
+/// The kinds of entry a [`MAKE_WAY`] line names where a directory can be what's in the way,
+/// in rsync's own words. `directory` is not one of them: rsync replaces a file in a new
+/// directory's way by itself.
+const MAKE_WAY_KINDS: &[&str] = &["symlink", "regular file", "device file", "special file"];
+
+/// An entry a failed rsync couldn't replace ([`make_way_entries`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InTheWay {
+    /// Where it is, relative to the transfer's destination, as rsync named it (with its escapes
+    /// decoded). Not checked yet: see [`inside`].
+    pub path: PathBuf,
+    /// What the source has there now: `symlink`, `regular file`, …
+    pub kind: &'static str,
+}
+
+/// The entries a failed rsync's `stderr` says it couldn't replace ([`MAKE_WAY`]), in order, each
+/// once. Only whole lines that start with rsync's message count. The path is everything after
+/// `<kind>: `, spaces included (even a trailing one), with rsync's escapes decoded
+/// ([`decode_rsync_name`]). Pure.
+pub fn make_way_entries(stderr: &str) -> Vec<InTheWay> {
+    let mut out: Vec<InTheWay> = Vec::new();
+    for line in stderr.split('\n') {
+        // rsync escapes a real carriage return in a name (`\#015`), so a bare one is a line end.
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let Some(rest) = line.strip_prefix(MAKE_WAY) else { continue };
+        let found = MAKE_WAY_KINDS.iter().find_map(|kind| Some((*kind, rest.strip_prefix(kind)?.strip_prefix(": ")?)));
+        if let Some((kind, path)) = found.and_then(|(kind, name)| Some((kind, decode_rsync_name(name)?))) {
+            if !out.iter().any(|e| e.path == path) {
+                out.push(InTheWay { path, kind });
+            }
         }
+    }
+    out
+}
+
+/// A file name as rsync prints it, decoded. rsync writes each byte it won't print raw as `\#`
+/// plus three octal digits: control characters and every non-ASCII byte (whatever the locale:
+/// `ñame` comes out as `\#303\#261ame`). It writes a backslash that would read as an escape as
+/// `\#134` (`q\#012z` comes out as `q\#134#012z`). `None` for an empty name. Pure.
+pub fn decode_rsync_name(s: &str) -> Option<PathBuf> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let octal = b.get(i + 2..i + 5).filter(|d| d.iter().all(|c| (b'0'..=b'7').contains(c)));
+        if let (true, Some(d)) = (b[i..].starts_with(b"\\#"), octal) {
+            let v = d.iter().fold(0u32, |v, c| v * 8 + u32::from(c - b'0'));
+            if let Ok(byte) = u8::try_from(v) {
+                out.push(byte);
+                i += 5;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    if out.is_empty() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Some(PathBuf::from(std::ffi::OsString::from_vec(out)))
+    }
+    #[cfg(not(unix))]
+    Some(PathBuf::from(String::from_utf8_lossy(&out).into_owned()))
+}
+
+/// Whether `rel` stays strictly inside the directory it is relative to: not empty, and every
+/// component a plain name. That rules out a root or prefix (an absolute path), `..` and `.`.
+/// The name comes from rsync's stderr, and a pod can put words there (rsync passes the remote
+/// side's messages on), so nothing is moved on its say-so unless this holds. Pure.
+pub fn inside(rel: &Path) -> bool {
+    !rel.as_os_str().is_empty() && rel.components().all(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
+/// The holding directory a directory in the way goes into, beside it: `.arena-olddir-<day>`
+/// (then `-2`, `-3`…). A dot-directory: the pulls never carry one from a pod (`**/.*/`), and the
+/// archive's pushes leave it out ([`crate::archive::SECRET_EXCLUDES`]).
+pub const HOLDING_PREFIX: &str = ".arena-olddir-";
+
+/// Where a directory in the way is moved, relative to its parent: `.arena-olddir-<day>/<name>`,
+/// `day` being `YYYYMMDD` ([`aside_day`]) — under a holding directory, its own name KEPT. Every
+/// filter that matches by name then still matches inside it: the archive's
+/// [`crate::archive::SECRET_EXCLUDES`] (`hf/token`, `.git/config`, `.config/`…) keep secrets off
+/// the cohort-readable archive by name, and a rename to `<name>.olddir-<day>` (the operator's
+/// manual convention, which this followed at first) let a moved-aside `hf/token` or
+/// `proj/.git/config` through (review b5 #1, reproduced). While `taken` says a candidate can't be
+/// used, it tries the holding directory `…-2`, `…-3`, and so on. `None` after a thousand tries.
+/// Pure.
+pub fn aside_name(name: &std::ffi::OsStr, day: &str, taken: impl Fn(&Path) -> bool) -> Option<PathBuf> {
+    (1..=1000)
+        .map(|n| {
+            let hold = if n > 1 { format!("{HOLDING_PREFIX}{day}-{n}") } else { format!("{HOLDING_PREFIX}{day}") };
+            Path::new(&hold).join(name)
+        })
+        .find(|candidate| !taken(candidate))
+}
+
+/// [`aside_name`]'s day for `unix_secs`, in UTC: `YYYYMMDD`.
+pub fn aside_day(unix_secs: u64) -> String {
+    crate::restore::stamp(unix_secs)[..8].to_string()
+}
+
+/// Move the directory `dest/rel` aside, into its holding directory beside it ([`aside_name`]:
+/// `<parent>/.arena-olddir-<day>/<name>`, made if need be), so the next rsync can put what the
+/// source now has in its place. Returns the new path, relative to `dest`. It is a rename within
+/// the entry's own parent's tree, so nothing is copied and nothing is deleted.
+///
+/// Refused (`Err` says why, for the pod's line) unless all of these hold:
+/// - `rel` is [`inside`] `dest`;
+/// - every directory on the way to the entry is a real directory, never a symlink, so the rename
+///   can't reach outside `dest`;
+/// - the entry itself is a real directory.
+///
+/// A holding directory is used only when it is a real directory (or is made here): one whose
+/// name is a symlink or a file is passed over, as is one already holding that name. Every check
+/// uses `symlink_metadata`, which never follows a link. `dest` itself is taken as given: it is
+/// the transfer's own destination (an operator may have linked a pod's folder onto another disk).
+pub fn move_aside(dest: &Path, rel: &Path, day: &str) -> std::result::Result<PathBuf, String> {
+    if !inside(rel) {
+        return Err("not a path inside the destination".into());
+    }
+    let names: Vec<&std::ffi::OsStr> = rel.iter().collect();
+    let Some((last, parents)) = names.split_last() else {
+        return Err("not a path inside the destination".into());
+    };
+    let kind = |m: &std::fs::Metadata| if m.file_type().is_symlink() { "a symlink" } else { "not a directory" };
+    let mut parent = dest.to_path_buf();
+    for name in parents {
+        parent.push(name);
+        let shown = parent.strip_prefix(dest).unwrap_or(&parent).display().to_string();
+        match std::fs::symlink_metadata(&parent) {
+            Ok(m) if m.file_type().is_dir() => {}
+            Ok(m) => return Err(format!("{shown} on the way to it is {} here", kind(&m))),
+            Err(e) => return Err(format!("{shown} on the way to it can't be read: {e}")),
+        }
+    }
+    let from = parent.join(last);
+    match std::fs::symlink_metadata(&from) {
+        Ok(m) if m.file_type().is_dir() => {}
+        Ok(m) => return Err(format!("it is {} here", kind(&m))),
+        Err(e) => return Err(format!("it can't be read: {e}")),
+    }
+    let missing = |p: &Path| matches!(std::fs::symlink_metadata(p), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
+    let taken = |candidate: &Path| {
+        let hold = parent.join(candidate.parent().unwrap_or(candidate));
+        match std::fs::symlink_metadata(&hold) {
+            Ok(m) if m.file_type().is_dir() => !missing(&parent.join(candidate)),
+            Ok(_) => true,
+            Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+        }
+    };
+    let to = aside_name(last, day, taken).ok_or("every holding directory for it beside it is taken")?;
+    let hold = parent.join(to.parent().unwrap_or(&to));
+    let made = match std::fs::create_dir(&hold) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(e) => return Err(format!("making {} failed: {e}", hold.strip_prefix(dest).unwrap_or(&hold).display())),
+    };
+    if !std::fs::symlink_metadata(&hold).is_ok_and(|m| m.file_type().is_dir()) {
+        return Err("its holding directory isn't a directory here".into());
+    }
+    if let Err(e) = std::fs::rename(&from, parent.join(&to)) {
+        if made {
+            let _ = std::fs::remove_dir(&hold);
+        }
+        return Err(format!("moving it aside failed: {e}"));
+    }
+    Ok(rel.parent().unwrap_or(Path::new("")).join(to))
+}
+
+/// What [`make_way`] did in one destination.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MadeWay {
+    /// Each directory moved aside, as `(from, to, kind)`: paths relative to the destination,
+    /// and what the source has in its place now.
+    pub moved: Vec<(PathBuf, PathBuf, &'static str)>,
+    /// Each entry left as it is, and why.
+    pub refused: Vec<(PathBuf, String)>,
+}
+
+impl MadeWay {
+    /// Another pass's [`MadeWay`] into the same job's.
+    pub fn extend(&mut self, other: MadeWay) {
+        self.moved.extend(other.moved);
+        self.refused.extend(other.refused);
+    }
+
+    /// What a pod's line says about it: empty when nothing happened, else ` — moved ARENA_3.0
+    /// aside to .arena-olddir-20261018/ARENA_3.0 (a directory here, a symlink on the pod now;
+    /// nothing deleted)`, with each refusal after it.
+    pub fn note(&self) -> String {
+        let mut out = String::new();
+        let show = |p: &Path| p.display().to_string();
+        match &self.moved[..] {
+            [] => {}
+            [(from, to, kind)] => out.push_str(&format!(
+                " — moved {} aside to {} (a directory here, a {kind} on the pod now; nothing deleted)",
+                show(from),
+                show(to)
+            )),
+            many => {
+                let each: Vec<String> = many.iter().map(|(from, to, kind)| format!("{} → {} ({kind})", show(from), show(to))).collect();
+                out.push_str(&format!(
+                    " — moved {} directories aside (each something else on the pod now; nothing deleted): {}",
+                    many.len(),
+                    each.join(", ")
+                ));
+            }
+        }
+        if !self.refused.is_empty() {
+            let each: Vec<String> = self.refused.iter().map(|(p, why)| format!("{} ({why})", show(p))).collect();
+            out.push_str(&format!(" — rsync couldn't replace, and left as it is: {}", each.join(", ")));
+        }
+        out
+    }
+}
+
+/// Each entry a failed rsync into `dest` couldn't replace ([`make_way_entries`] of its `stderr`),
+/// moved aside ([`move_aside`]) or refused, with why. `day` names the moved directories.
+pub fn make_way(dest: &Path, stderr: &str, day: &str) -> MadeWay {
+    let mut made = MadeWay::default();
+    for e in make_way_entries(stderr) {
+        match move_aside(dest, &e.path, day) {
+            Ok(to) => made.moved.push((e.path, to, e.kind)),
+            Err(why) => made.refused.push((e.path, why)),
+        }
+    }
+    made
+}
+
+/// One backup rsync into `dest` (`program` + `args`, run by [`crate::remote::run_local`] within
+/// `budget`), made so that a directory left by an earlier pull can't fail it every run.
+///
+/// When rsync fails with exit 23 ("some files/attrs were not transferred", the only exit its
+/// make-way message comes with) because directories here are in the way of what the source now
+/// has ([`make_way_entries`]), they are moved aside ([`make_way`]: into a holding directory beside
+/// them, their names kept, nothing deleted) and the same rsync runs once more, within what's left
+/// of `budget`. rsync is incremental, so the second run sends only what the first couldn't place.
+/// There is exactly one retry: whatever the second run returns is the result.
+///
+/// Anything else comes back exactly as rsync returned it, with nothing moved: any other exit, a
+/// first run whose entries were all refused, or one with less than a second of budget left.
+/// `day` names the holding directories ([`aside_day`]).
+///
+/// What this trusts: rsync's stderr also carries whatever the pod's ssh session prints, and a
+/// participant is root on their pod. So a pod can print the make-way line itself, in a run that
+/// fails with exit 23 anyway (one unreadable file is enough), and get one of ITS OWN backed-up
+/// directories moved aside, each run, with a note that says the pod has a symlink there (review b5
+/// #3). That is the whole reach: the path must be [`inside`] this pod's own destination, through
+/// real directories only ([`move_aside`]), and nothing is ever deleted — the cost is the disk and
+/// transfer of copying that directory again, and a misleading line.
+pub async fn rsync_making_way(
+    program: &str,
+    args: &[String],
+    dest: &Path,
+    what: &str,
+    budget: Duration,
+    day: &str,
+) -> (Result<crate::ssh::SshOutput>, MadeWay) {
+    let started = tokio::time::Instant::now();
+    let first = crate::remote::run_local(program, args, what, Some(budget)).await;
+    let made = match &first {
+        Ok(o) if !o.success && o.code == Some(RSYNC_PARTIAL_EXIT) => make_way(dest, &o.stderr, day),
+        _ => return (first, MadeWay::default()),
+    };
+    // Whole seconds, as every other budget a pull hands rsync.
+    let left = Duration::from_secs(budget.saturating_sub(started.elapsed()).as_secs());
+    if made.moved.is_empty() || left.is_zero() {
+        return (first, made);
+    }
+    (crate::remote::run_local(program, args, what, Some(left)).await, made)
+}
+
+/// The `rsync` command for dry-run output, every argument shell-quoted where a shell would
+/// change it ([`crate::ssh::shell_word`]) — the globs (`'**/.git/**'`, `'models--*/'`) and the
+/// `-e` transport — so it pastes into a shell as exactly the argv that would run.
+pub fn display_rsync(target: &SshTarget, pc: &PullConfig, local_dest: &str) -> String {
+    display_argv("rsync", &rsync_args(target, pc, local_dest))
+}
+
+/// `program` and `args` as one shell-ready line ([`crate::ssh::shell_word`] per argument).
+pub fn display_argv(program: &str, args: &[String]) -> String {
+    let mut out = String::from(program);
+    for arg in args {
+        out.push(' ');
+        out.push_str(&crate::ssh::shell_word(arg));
     }
     out
 }
@@ -316,6 +1551,116 @@ mod tests {
             port: 22001,
             key_paths: vec!["/root/.ssh/arena8_key".into()],
             connect_timeout_secs: 10,
+            host_keys: Default::default(),
+        }
+    }
+
+    /// The big tier's root: its own volume when configured, else today's `<dir>/big`.
+    #[test]
+    fn big_root_follows_local_backup_big_dir() {
+        assert_eq!(big_root("/b", None), "/b/big");
+        assert_eq!(big_root("/b/", Some("  ")), "/b/big");
+        assert_eq!(big_root("/b", Some("/mnt/big/")), "/mnt/big");
+        assert_eq!(big_root("./backup", None), "./backup/big");
+        assert_eq!(big_dest_in("/mnt/big", "devtest-a"), "/mnt/big/devtest-a/");
+        assert_eq!(big_dest_in(&big_root("/b", None), "devtest-a"), big_dest("/b", "devtest-a"));
+    }
+
+    /// A marker's first line must be exactly its tier's word.
+    #[test]
+    fn tier_markers_are_exact() {
+        for (text, tier, ok) in [
+            ("snapshot\n", Tier::Snapshot, true),
+            ("snapshot", Tier::Snapshot, true),
+            ("snapshot\r\nformatted 2026-10-01\n", Tier::Snapshot, true),
+            ("big\n", Tier::Big, true),
+            ("big\n", Tier::Snapshot, false),
+            ("snapshot\n", Tier::Big, false),
+            (" big\n", Tier::Big, false),
+            ("big \n", Tier::Big, false),
+            ("BIG\n", Tier::Big, false),
+            ("", Tier::Big, false),
+            ("\nbig\n", Tier::Big, false),
+        ] {
+            assert_eq!(tier_marker_ok(text, tier), ok, "{text:?} {tier:?}");
+        }
+        let d = std::env::temp_dir().join(format!("arena-pull-marker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        assert!(check_tier_marker(&d, Tier::Big).unwrap_err().contains("is the big volume mounted?"));
+        std::fs::write(d.join(TIER_MARKER), "snapshot\n").unwrap();
+        assert!(check_tier_marker(&d, Tier::Snapshot).is_ok());
+        assert!(check_tier_marker(&d, Tier::Big).unwrap_err().contains("doesn't say `big`"));
+        assert!(free_bytes(&d).unwrap() > 0);
+        assert!(free_bytes(&d.join("missing")).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The verify is the tier's own rsync, as a dry run.
+    #[test]
+    fn verify_args_are_the_tiers_args_as_a_dry_run() {
+        let pc = PullConfig::big_tier();
+        let v = verify_args(&target(), &pc, "/b/big/devtest-a/");
+        assert_eq!(v[0], "--dry-run");
+        assert_eq!(&v[1..], rsync_args(&target(), &pc, "/b/big/devtest-a/").as_slice());
+        assert!(v.contains(&"--stats".to_string()));
+    }
+
+    /// One lock per pod, in the backup dir; a second holder is told it's busy until the
+    /// first lets go.
+    #[test]
+    fn pod_locks_exclude_each_other() {
+        assert_eq!(pod_lock_path("/b", "devtest-a"), Path::new("/b/.arena-locks/devtest-a.lock"));
+        assert_eq!(pod_lock_path("/b", "../x"), Path::new("/b/.arena-locks/.._x.lock"));
+        assert_eq!(pod_lock_path("/b", ".."), Path::new("/b/.arena-locks/_.lock"));
+        let d = std::env::temp_dir().join(format!("arena-pull-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let dir = d.display().to_string();
+        // RR5: never in a backup dir that isn't there (the lock doesn't create it).
+        assert_eq!(open_pod_lock(&dir, "devtest-a").unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        assert!(!d.exists());
+        assert_eq!(try_pod_lock_now(&dir, "devtest-a").map(|l| l.is_none()), Ok(true), "nothing to take: as before the locks");
+        std::fs::create_dir_all(&d).unwrap();
+        let a = open_pod_lock(&dir, "devtest-a").unwrap();
+        let b = open_pod_lock(&dir, "devtest-a").unwrap();
+        let other = open_pod_lock(&dir, "devtest-b").unwrap();
+        assert!(try_lock(&a).unwrap());
+        assert!(!try_lock(&b).unwrap(), "held by `a`");
+        assert!(try_lock(&other).unwrap(), "another pod's lock is its own");
+        assert_eq!(try_pod_lock_now(&dir, "devtest-a").map(|l| l.is_some()), Err(()), "busy");
+        drop(a);
+        assert!(try_lock(&b).unwrap(), "free once `a` is dropped");
+        drop(b);
+        assert_eq!(try_pod_lock_now(&dir, "devtest-a").map(|l| l.is_some()), Ok(true));
+        assert_eq!(try_pod_lock_now("relative/backup", "devtest-a").map(|l| l.is_none()), Ok(true));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn backup_timeout_table() {
+        // (config value, budget in seconds or the error's tell)
+        let cases: &[(Option<&str>, std::result::Result<u64, &str>)] = &[
+            (None, Ok(DEFAULT_BACKUP_TIMEOUT_SECS)),
+            (Some(""), Ok(7200)),
+            (Some("  "), Ok(7200)),
+            (Some("600"), Ok(600)),
+            (Some(" 1 "), Ok(1)),
+            (Some("86400"), Ok(86_400)),
+            (Some("86401"), Err("got `86401`")),
+            (Some("0"), Err("got `0`")),
+            (Some("-5"), Err("got `-5`")),
+            (Some("2h"), Err("got `2h`")),
+            (Some("18446744073709551616"), Err("1..=86400")),
+        ];
+        for (raw, want) in cases {
+            match (backup_timeout(*raw), want) {
+                (Ok(d), Ok(secs)) => assert_eq!(d, Duration::from_secs(*secs), "{raw:?}"),
+                (Err(e), Err(tell)) => {
+                    let e = e.to_string();
+                    assert!(e.contains("BACKUP_TIMEOUT_SECS") && e.contains(tell), "{raw:?}: {e}");
+                }
+                (got, _) => panic!("{raw:?}: got {got:?}, want {want:?}"),
+            }
         }
     }
 
@@ -325,10 +1670,42 @@ mod tests {
                    Number of files: 1,200\n\
                    Number of regular files transferred: 922\n\
                    Total transferred file size: 107,000,000 bytes\n";
-        let (files, size) = parse_rsync_stats(out).unwrap();
-        assert_eq!(files, 922);
-        assert_eq!(size, "102.0M");
+        let s = parse_rsync_stats(out).unwrap();
+        assert_eq!((s.files_sent, s.bytes_sent, s.files, s.bytes), (922, 107_000_000, Some(1200), None));
+        assert_eq!(s.sent(), "922 files, 102.0M");
         assert_eq!(parse_rsync_stats("nothing here"), None);
+    }
+
+    /// Every way rsync prints its numbers. The live bug: `--human-readable` stats said `1.84G`
+    /// and the digits-only parse reported `184` (bytes) for a 1.8G pull.
+    #[test]
+    fn rsync_numbers_in_every_format() {
+        let cases: &[(&str, Option<u64>)] = &[
+            (" 1234567 bytes", Some(1_234_567)),          // --no-human-readable / old rsync
+            (" 1,234,567 bytes", Some(1_234_567)),        // the default (level 1), `,` grouping
+            (" 1.234.567 bytes", Some(1_234_567)),        // level 1 in a `,`-decimal locale
+            (" 1.84G bytes", Some(1_840_000_000)),        // one --human-readable (units of 1000)
+            (" 1,84G bytes", Some(1_840_000_000)),        // …in a `,`-decimal locale
+            (" 102.00M bytes", Some(102_000_000)),
+            (" 3.50K bytes", Some(3_500)),
+            (" 0 bytes", Some(0)),
+            (" 6,754 (reg: 6,000, dir: 754)", Some(6_754)),
+            (" ", None),
+            (" lots", None),
+            (" -1G", None),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(rsync_number(raw), *want, "{raw:?}");
+        }
+        let human = "Number of files: 6,754 (reg: 6,000, dir: 754)\n\
+                     Number of regular files transferred: 6,754\n\
+                     Total file size: 1.84G bytes\n\
+                     Total transferred file size: 1.84G bytes\n";
+        let s = parse_rsync_stats(human).unwrap();
+        assert_eq!(s.sent(), "6754 files, 1.7G");
+        assert_eq!(s.bytes, Some(1_840_000_000));
+        // Our own flags don't ask for the unit format any more (it's still parsed).
+        assert!(!rsync_args(&target(), &PullConfig::default(), "./d/").iter().any(|a| a == "--human-readable"));
     }
 
     #[test]
@@ -346,6 +1723,8 @@ mod tests {
         assert!(joined.contains("-avz"));
         assert!(joined.contains("--max-size=50M"));
         assert!(joined.contains("--prune-empty-dirs"));
+        // A transfer that goes silent gives up instead of hanging the backup forever.
+        assert!(a.contains(&"--timeout=300".to_string()), "{joined}");
         // default excludes present as separate args (dotdirs, site-packages, and the
         // non-dot caches/envs that would otherwise bloat the backup)
         for ex in ["**/.*/", ".cache/", "site-packages/", "__pycache__/", "hf_cache/", "huggingface/", "venv/", "node_modules/", "models--*/", "datasets--*/"] {
@@ -412,6 +1791,184 @@ mod tests {
         assert!(!a.iter().any(|x| x.starts_with("--max-size")));
     }
 
+    /// Live finding #27 through the real rsync (review: it had no test): what the
+    /// replication carries of the dot-dirs it now includes, and what it still drops inside
+    /// them — Claude Code's state (ToS) wherever it lives, the claude/codex binaries setup
+    /// installs on every pod, caches inside an included tree, pip `--user` and uv — plus the
+    /// rest of the drop list. The `first_excludes` must win over the `/.config/**` include.
+    #[cfg(unix)]
+    #[test]
+    fn replication_carries_the_config_dot_dirs_and_nothing_it_must_not() {
+        if std::process::Command::new("rsync").arg("--version").output().is_err() {
+            eprintln!("rsync not installed — skipping");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("arena-pull-replication-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (src, dst) = (root.join("src"), root.join("dst"));
+        let carried = [
+            "notes.txt",
+            "ARENA_materials/.git/HEAD",
+            ".config/wandb/settings",
+            ".jupyter/jupyter_server_config.py",
+            ".ipython/profile_default/startup/00.py",
+            ".local/bin/mytool",
+            ".local/share/jupyter/kernels/k.json",
+            ".arena_replace_marker",
+            "arena-sync-kept/S/work.py",
+        ];
+        let dropped = [
+            ".config/claude/settings.json",
+            ".config/anthropic/key",
+            ".local/share/claude/versions/2.0.1",
+            ".local/state/claude/locks/l",
+            ".local/bin/claude",
+            ".local/bin/codex",
+            ".config/wandb/.cache/big",
+            ".config/x/__pycache__/m.pyc",
+            ".local/lib/python3.11/site-packages/x.py",
+            ".local/share/uv/python/p",
+            ".local/share/Trash/files/t",
+            ".claude.json",
+            ".claude/projects/p.jsonl",
+            ".ssh/id_ed25519",
+            ".bashrc",
+            ".zsh_history",
+            ".zcompdump-a1b2c3d4e5f6-5.8.1",
+            ".zcompdump-a1b2c3d4e5f6-5.8.1.zwc",
+            ".name",
+            ".arena-last-sync",
+            ".arena-sync/sent-to",
+            ".cache/huggingface/x",
+            ".vscode-server/data/x",
+            "ARENA_materials/__pycache__/m.pyc",
+            "hf_cache/models--x/blob",
+        ];
+        for f in carried.iter().chain(&dropped) {
+            let p = src.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, f).unwrap();
+        }
+        std::fs::create_dir_all(&dst).unwrap();
+        let mut args = push_rsync_args(&target(), &PullConfig::replication(), &format!("{}/", src.display()));
+        let e = args.iter().position(|a| a == "-e").unwrap();
+        args.drain(e..e + 2);
+        *args.last_mut().unwrap() = format!("{}/", dst.display());
+        let out = std::process::Command::new("rsync").args(&args).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        for f in carried {
+            assert!(dst.join(f).is_file(), "should be carried: {f}");
+        }
+        for f in dropped {
+            assert!(!dst.join(f).exists(), "should stay behind: {f}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Live R (2026-10-09): every sync after a login on the receiver reported its own zsh
+    /// completion caches as KEPT changes — mirrored away (the source has none by that name)
+    /// and moved into the kept folder. Through the real rsync with the replica's mirror: the
+    /// receiver's caches stay where they are and nothing is moved aside; a real deletion still
+    /// propagates and is kept.
+    #[cfg(unix)]
+    #[test]
+    fn a_replica_leaves_the_receivers_zsh_completion_cache_alone() {
+        if std::process::Command::new("rsync").arg("--version").output().is_err() {
+            eprintln!("rsync not installed — skipping");
+            return;
+        }
+        struct Gone(std::path::PathBuf);
+        impl Drop for Gone {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = Gone(std::env::temp_dir().join(format!("arena-pull-zcompdump-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&root.0);
+        let (src, dst) = (root.0.join("src"), root.0.join("dst"));
+        for (dir, f) in [
+            (&src, ".zcompdump-srchost-5.8.1"),
+            (&src, "work.py"),
+            (&dst, ".zcompdump-dsthost-5.8.1"),
+            (&dst, ".zcompdump-dsthost-5.8.1.zwc"),
+            (&dst, "work.py"),
+            (&dst, "deleted-on-source.txt"),
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join(f), f).unwrap();
+        }
+        let pc = PullConfig { mirror: Mirror::Replica { backup_dir: "arena-sync-kept/S".into() }, ..PullConfig::replication() };
+        let mut args = push_rsync_args(&target(), &pc, &format!("{}/", src.display()));
+        let e = args.iter().position(|a| a == "-e").unwrap();
+        args.drain(e..e + 2);
+        *args.last_mut().unwrap() = format!("{}/", dst.display());
+        let out = std::process::Command::new("rsync").args(&args).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(dst.join(".zcompdump-dsthost-5.8.1").is_file() && dst.join(".zcompdump-dsthost-5.8.1.zwc").is_file());
+        assert!(!dst.join(".zcompdump-srchost-5.8.1").exists(), "the source's cache isn't carried");
+        let kept = dst.join("arena-sync-kept/S");
+        assert!(!kept.join(".zcompdump-dsthost-5.8.1").exists() && !kept.join(".zcompdump-dsthost-5.8.1.zwc").exists());
+        assert!(kept.join("deleted-on-source.txt").is_file() && !dst.join("deleted-on-source.txt").exists());
+    }
+
+    /// S17: `temp_dir` becomes `--temp-dir=` (absolute, under the backup dir, never a label);
+    /// no other config carries one — the replication's pod-to-pod copies included.
+    #[test]
+    fn a_temp_dir_is_passed_through_and_off_by_default() {
+        let pc = PullConfig { temp_dir: Some(temp_dir_for(Path::new("/srv/backup/w1d1"))), ..PullConfig::small_tier("50M") };
+        let a = rsync_args(&target(), &pc, "/srv/backup/w1d1/arena9-apple/");
+        assert!(a.contains(&"--temp-dir=/srv/backup/w1d1/.rsync-tmp".to_string()), "{a:?}");
+        assert!(!rsync_args(&target(), &PullConfig::default(), "/x/").iter().any(|x| x.starts_with("--temp-dir")));
+        assert!(!rsync_args(&target(), &PullConfig::replication(), "/x/").iter().any(|x| x.starts_with("--temp-dir")));
+        assert!(crate::restore::parse_label(TEMP_DIR).is_none() && TEMP_DIR.starts_with('.'));
+    }
+
+    /// A replica's moved-aside folder is protected (first, so no include can override it),
+    /// the guarded `--rsync-path` goes through, and a backup tier carries neither.
+    #[test]
+    fn a_replica_protects_its_kept_folder_and_can_guard_the_remote_rsync() {
+        let pc = PullConfig {
+            mirror: Mirror::Replica { backup_dir: "arena-sync-kept/S".into() },
+            rsync_path: Some("check && rsync".into()),
+            ..PullConfig::replication()
+        };
+        let a = push_rsync_args(&target(), &pc, "/tmp/s/");
+        let at = |x: &str| a.iter().position(|y| y == x).unwrap_or_else(|| panic!("{x} missing: {a:?}"));
+        assert!(at("--filter=P arena-sync-kept/") < at("--filter=P arena-sync-kept/**"));
+        assert!(at("--filter=P arena-sync-kept/**") < a.iter().position(|x| x == "--exclude" || x == "--include").unwrap());
+        assert!(a.contains(&"--rsync-path=check && rsync".to_string()));
+        assert_eq!(Mirror::Replica { backup_dir: "../arena-sync-kept/S/ARENA_materials".into() }.backup_root(), Some("arena-sync-kept"));
+        assert_eq!(Mirror::Exact.backup_root(), None);
+        // A backup tier carries no kept-folder protect, no guard and no deletion — including the
+        // snapshot tier as the pull really runs it (linked to earlier snapshots, two passes).
+        // Its only filter is the `.git` protect that keeps a complete `.git` (in a pass that has
+        // one: a capped tier's first pass leaves `.git` to the second).
+        let base = std::env::temp_dir().join(format!("arena-pull-tiers-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("w1d1/devtest-a")).unwrap();
+        std::fs::write(base.join("w1d1/devtest-a/f"), "x").unwrap();
+        let linked = snapshot_tier_for(&base, "w1d1", "devtest-a", &PullConfig::small_tier("50M"));
+        assert!(linked.linked_dest);
+        let tiers = [PullConfig::big_tier(), PullConfig::small_tier("50M"), PullConfig::replication()];
+        for tier in tiers.iter().chain(&[linked]).flat_map(|t| t.passes()) {
+            let a = rsync_args(&target(), &tier, "./d/").join(" ");
+            assert!(!a.contains("--filter=P ") && !a.contains("--rsync-path") && !a.contains("--delete") && !a.contains("--backup"), "{a}");
+            assert!(a.contains("--prune-empty-dirs"), "{a}");
+            assert_eq!(a.contains("--filter=protect **/.git/**/"), tier.includes.iter().any(|i| i.contains(".git")), "{a}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+        // …and a mirror (the replica's push, its via-local staging pull) carries none of the
+        // backups' own flags: no hard links, no frozen attributes, no `.git` protect (it would
+        // keep the receiver's stale git state) and no pruning (a pruned dir is a deleted one).
+        let staging = PullConfig { mirror: Mirror::Exact, ..PullConfig::replication() };
+        for a in [push_rsync_args(&target(), &pc, "/tmp/s/"), rsync_args(&target(), &staging, "./stage/")] {
+            let a = a.join(" ");
+            assert!(a.contains("--delete"), "{a}");
+            for leak in ["--link-dest", "--no-perms", "--filter=protect **/.git", "--prune-empty-dirs"] {
+                assert!(!a.contains(leak), "{leak}: {a}");
+            }
+        }
+    }
+
     #[test]
     fn pod_to_pod_command_quotes_globs_and_targets_endpoint() {
         let cmd = pod_to_pod_command("5.6.7.8", 22042, "root", "/root/.ssh/id_ed25519", &PullConfig::replication());
@@ -422,6 +1979,8 @@ mod tests {
         // …glob excludes are single-quoted so the source shell doesn't expand them…
         assert!(cmd.contains("'**/.*/'"));
         assert!(cmd.contains("'.claude*'"));
+        // …a stalled copy gives up (the source pod's rsync, too)…
+        assert!(cmd.contains(" '--timeout=300' "), "{cmd}");
         // …$HOME stays unquoted (remote shell expands it), dest is endpoint:home.
         assert!(cmd.contains(" $HOME/ "));
         assert!(cmd.trim_end().ends_with("root@5.6.7.8:"));
@@ -440,6 +1999,10 @@ mod tests {
         // owner/group preservation is OFF on a push, so the dest home isn't chowned to the
         // control user (which would lock sshd out).
         assert!(a.contains(&"--no-owner".to_string()) && a.contains(&"--no-group".to_string()));
+        assert!(a.contains(&"--timeout=300".to_string()));
+        // `None` drops the I/O timeout entirely.
+        let unbounded = PullConfig { io_timeout_secs: None, ..PullConfig::replication() };
+        assert!(!push_rsync_args(&target(), &unbounded, "/tmp/s/").iter().any(|x| x.starts_with("--timeout")));
         // transport still carries port + key
         let e = a.iter().position(|x| x == "-e").unwrap();
         assert!(a[e + 1].contains("-p 22001") && a[e + 1].contains("-i /root/.ssh/arena8_key"));
@@ -447,10 +2010,327 @@ mod tests {
 
     #[test]
     fn honors_custom_remote_path() {
-        let mut pc = PullConfig::default();
-        pc.remote_path = "ARENA_3.0/results".into();
+        let pc = PullConfig { remote_path: "ARENA_3.0/results".into(), ..Default::default() };
         let a = rsync_args(&target(), &pc, "./out/");
         assert_eq!(a[a.len() - 2], "root@1.2.3.4:ARENA_3.0/results");
+    }
+
+    /// The snapshot tier is two passes when it keeps `.git` (the files under the cap, then every
+    /// `.git` uncapped); every other tier is one. Link-dests ride along on both.
+    #[test]
+    fn a_capped_tier_keeping_git_is_two_passes() {
+        let snap = PullConfig { link_dest: vec!["/b/w1d1/devtest-a".into()], ..PullConfig::small_tier("50M") };
+        let p = snap.passes();
+        assert_eq!(p.len(), 2);
+        let files = rsync_args(&target(), &p[0], "./d/");
+        assert!(files.contains(&"--max-size=50M".to_string()) && !files.iter().any(|a| a.contains(".git")), "{files:?}");
+        assert!(files.contains(&"--include".to_string()), "the .claude includes stay: {files:?}");
+        let git = rsync_args(&target(), &p[1], "./d/");
+        let joined = git.join(" ");
+        assert!(!joined.contains("--max-size") && !joined.contains(".claude"), "{joined}");
+        assert!(joined.contains("--include **/.git/ --include **/.git/** --exclude **/.*/"), "{joined}");
+        // Its last rules: every other dir (to reach the .gits in it), no other file.
+        let tail: Vec<&str> = git.iter().map(String::as_str).skip_while(|a| *a != "*/").take(3).collect();
+        assert_eq!(tail, ["*/", "--exclude", "*"], "{joined}");
+        for args in [&files, &git] {
+            assert!(args.contains(&"--link-dest=/b/w1d1/devtest-a".to_string()), "{args:?}");
+        }
+        // One pass: the big tier, --no-git, the replication profile, a pass of a pass.
+        for one in [PullConfig::big_tier(), PullConfig::small_tier("50M").without_git(), PullConfig::replication(), p[1].clone()] {
+            assert_eq!(one.passes().len(), 1);
+        }
+        assert!(!rsync_args(&target(), &PullConfig::big_tier(), "./d/").iter().any(|a| a.starts_with("--link-dest")));
+    }
+
+    #[test]
+    fn snapshots_link_to_their_previous_one_and_the_weeks_baseline() {
+        let base = std::env::temp_dir().join(format!("arena-pull-linkdests-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let put = |rel: &str| {
+            let p = base.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "x").unwrap();
+        };
+        for rel in ["w0d1/devtest-a/f", "w0d3/devtest-a/f", "w1d1/devtest-b/f", "custom/devtest-a/f", "big/devtest-a/f"] {
+            put(rel);
+        }
+        put("baseline/w0/fleet/img");
+        put("baseline/w2/fleet/img");
+        std::fs::create_dir_all(base.join("baseline/w1/fleet")).unwrap(); // empty: not a baseline
+        let abs = std::fs::canonicalize(&base).unwrap();
+        let at = |rel: &str| abs.join(rel).display().to_string();
+        // (label, pod, link-dests)
+        let cases: &[(&str, &str, Vec<String>)] = &[
+            ("w1d2", "devtest-a", vec![at("w0d3/devtest-a"), at("baseline/w0/fleet")]),
+            ("w0d3", "devtest-a", vec![at("w0d1/devtest-a"), at("baseline/w0/fleet")]),
+            ("w2d1", "devtest-a", vec![at("w0d3/devtest-a"), at("baseline/w2/fleet")]),
+            ("w1d2", "devtest-new", vec![at("baseline/w0/fleet")]), // a new pod: the image's files
+            ("custom2", "devtest-a", vec![at("w0d3/devtest-a"), at("baseline/w2/fleet")]),
+        ];
+        for (label, pod, want) in cases {
+            assert_eq!(&snapshot_link_dests(&base, label, pod), want, "{label} {pod}");
+        }
+        assert_eq!(baseline_dir(&base, 3), base.join("baseline/w3/fleet"));
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(snapshot_link_dests(&base, "w0d1", "devtest-a").is_empty(), "no backup dir yet");
+    }
+
+    /// Only the image's files survive into a baseline: a file (or link) written at or after the
+    /// container's creation is dropped, and one the pod listed as copied in since (an old mtime
+    /// kept), then the directories left empty.
+    #[cfg(unix)]
+    #[test]
+    fn a_baseline_keeps_only_what_predates_the_container() {
+        let dir = std::env::temp_dir().join(format!("arena-pull-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let at = |secs: u64| std::time::UNIX_EPOCH + Duration::from_secs(secs);
+        let put = |rel: &str, n: usize, mtime: u64| {
+            let p = dir.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, vec![b'x'; n]).unwrap();
+            std::fs::File::options().write(true).open(&p).unwrap().set_modified(at(mtime)).unwrap();
+        };
+        // A container created a minute ago: the symlink made just now is newer.
+        let created = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() - 60;
+        put("arena-llm-context/model.txt", 1000, created - 86_400 * 30); // the image's
+        put("ARENA_materials/chapter1/solutions.py", 200, created - 86_400); // the image's
+        put("ARENA_materials/chapter1/my_answers.py", 50, created + 3600); // written since
+        put(".name", 30, created); // at setup, the same second: dropped
+        put("setup_only/out.log", 10, created + 5); // a whole dir written since: gone
+        std::os::unix::fs::symlink("/workspace/ARENA_materials", dir.join("linked")).unwrap(); // made now
+        // Copied onto the pod after the container with old mtimes (the pod's listing says so):
+        // the mtime alone takes them for the image's.
+        put("ARENA_materials/chapter2/carried_over.py", 70, created - 86_400 * 2);
+        put("ARENA_materials/chapter2/.name", 13, created - 600);
+        let copied: BTreeSet<PathBuf> = ["ARENA_materials/chapter2/carried_over.py", "ARENA_materials/chapter2/.name"].map(PathBuf::from).into();
+        let s = prune_baseline(&dir, created, &copied).unwrap();
+        assert_eq!(s, PruneStats { kept_files: 2, kept_bytes: 1200, removed_files: 6, removed_bytes: 173 });
+        assert!(dir.join("arena-llm-context/model.txt").is_file() && dir.join("ARENA_materials/chapter1/solutions.py").is_file());
+        for gone in ["ARENA_materials/chapter1/my_answers.py", ".name", "setup_only", "linked", "ARENA_materials/chapter2"] {
+            assert!(std::fs::symlink_metadata(dir.join(gone)).is_err(), "{gone}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The live problem, end to end with a real rsync: every day's snapshot was a full copy, and
+    /// its `.git` lacked the pack over the size cap. Now each snapshot is still a complete tree —
+    /// the same layout, its repo fsck-clean — but unchanged files are hard links: to the pod's
+    /// previous snapshot, and (for a pod with no snapshot yet) to the fleet baseline captured
+    /// from another pod. `disk_use` says what a snapshot really adds.
+    #[cfg(unix)]
+    #[test]
+    fn snapshots_are_hard_linked_complete_trees_with_a_complete_git() {
+        use crate::volume::fake_ssh;
+        use std::os::unix::fs::MetadataExt;
+        if !fake_ssh::have_rsync() {
+            eprintln!("rsync not installed — skipping");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("arena-pull-dedup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let image_time = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        // A pod's home: an image file (its mtime the image's), work, and a repo whose pack is far
+        // over the 2K cap.
+        let home_of = |pod: &str, work: &str| {
+            let h = root.join(pod);
+            let img = h.join("arena-llm-context/doc.txt");
+            std::fs::create_dir_all(img.parent().unwrap()).unwrap();
+            std::fs::write(&img, "the image's own file\n".repeat(50)).unwrap();
+            std::fs::File::options().write(true).open(&img).unwrap().set_modified(image_time).unwrap();
+            std::fs::create_dir_all(h.join("work")).unwrap();
+            std::fs::write(h.join("work/notes.md"), work).unwrap();
+            h
+        };
+        let home = home_of("pod-a", "day 1\n");
+        let repo = home.join("ARENA_materials");
+        let git = |args: &[&str]| {
+            let o = std::process::Command::new("git").current_dir(&repo).args(args).output().unwrap();
+            assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&["init", "-q"]);
+        let noise: Vec<u8> = (0..60_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        std::fs::write(repo.join("data.bin"), &noise).unwrap();
+        git(&["add", "-A"]);
+        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "data"]);
+        git(&["gc", "-q"]);
+        let fake = fake_ssh::install(&root);
+        let base = root.join("backup");
+        let pull = |pod_home: &std::path::Path, label: &str, pod: &str| {
+            let dest = local_dest(&base.display().to_string(), label, pod);
+            std::fs::create_dir_all(&dest).unwrap();
+            let pc = PullConfig { link_dest: snapshot_link_dests(&base, label, pod), ..PullConfig::small_tier("2K") };
+            for pass in pc.passes() {
+                fake_ssh::rsync(&fake_ssh::swap_transport(&rsync_args(&target(), &pass, &dest), &fake), pod_home);
+            }
+            base.join(label).join(pod)
+        };
+        let ino = |p: std::path::PathBuf| std::fs::metadata(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display())).ino();
+        let pack = |snap: &std::path::Path| {
+            std::fs::read_dir(snap.join("ARENA_materials/.git/objects/pack"))
+                .unwrap()
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .find(|p| p.extension().is_some_and(|x| x == "pack"))
+                .expect("the pack")
+        };
+
+        // Day 1: a complete repo — the pack over the cap included — and the cap still applies to files.
+        let d1 = pull(&home, "w0d1", "devtest-a");
+        assert!(std::fs::metadata(pack(&d1)).unwrap().len() > 2048);
+        assert!(!d1.join("ARENA_materials/data.bin").exists(), "the files over the cap stay in big/");
+        let fsck = std::process::Command::new("git").current_dir(d1.join("ARENA_materials")).args(["fsck", "--no-progress"]).output().unwrap();
+        assert!(fsck.status.success(), "the snapshot's repo reads: {}", String::from_utf8_lossy(&fsck.stderr));
+        assert_eq!(disk_use(&d1).unwrap().own_bytes, disk_use(&d1).unwrap().bytes, "nothing to link to yet");
+
+        // Day 2: only the edited note is new on disk; the rest are links to day 1.
+        std::fs::write(home.join("work/notes.md"), "day 2, longer\n").unwrap();
+        let d2 = pull(&home, "w0d2", "devtest-a");
+        assert_eq!(ino(d2.join("arena-llm-context/doc.txt")), ino(d1.join("arena-llm-context/doc.txt")));
+        assert_eq!(ino(pack(&d2)), ino(pack(&d1)), "the pack is linked, not copied again");
+        assert_ne!(ino(d2.join("work/notes.md")), ino(d1.join("work/notes.md")));
+        assert_eq!(std::fs::read_to_string(d1.join("work/notes.md")).unwrap(), "day 1\n", "day 1 kept as it was");
+        let u = disk_use(&d2).unwrap();
+        assert_eq!(u.own_bytes, "day 2, longer\n".len() as u64, "{u:?}");
+        assert_eq!(u.files, disk_use(&d1).unwrap().files, "a complete tree, the same layout");
+
+        // A baseline from pod-a (container created after the image, before the work)…
+        let created = image_time.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 3600;
+        let b = pull(&home, "w0-capture", "devtest-a");
+        prune_baseline(&b, created, &BTreeSet::new()).unwrap();
+        std::fs::create_dir_all(baseline_dir(&base, 0).parent().unwrap()).unwrap();
+        std::fs::rename(&b, baseline_dir(&base, 0)).unwrap();
+        assert!(baseline_dir(&base, 0).join("arena-llm-context/doc.txt").is_file());
+        assert!(!baseline_dir(&base, 0).join("work").exists(), "pod-a's work isn't in it");
+        // …and a new pod's first snapshot: the image's file is the baseline's, its work its own.
+        let home_b = home_of("pod-b", "b's work\n");
+        let first = pull(&home_b, "w0d2", "devtest-b");
+        assert_eq!(ino(first.join("arena-llm-context/doc.txt")), ino(baseline_dir(&base, 0).join("arena-llm-context/doc.txt")));
+        assert_eq!(std::fs::read_to_string(first.join("work/notes.md")).unwrap(), "b's work\n");
+        assert_eq!(disk_use(&first).unwrap().own_bytes, "b's work\n".len() as u64);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Review: a hard-linked file is one inode in every snapshot that shares it, and rsync applies
+    /// a mode change (no content change) to an existing destination file in place — so
+    /// re-pulling the day's label after a `chmod` on the pod rewrote the mode in yesterday's
+    /// snapshot too (and, through the fleet baseline, in other pods'). A re-pull now never
+    /// changes an existing file's attributes; the change shows from the next label on.
+    #[cfg(unix)]
+    #[test]
+    fn re_pulling_a_label_never_changes_the_snapshots_it_shares_files_with() {
+        use crate::volume::fake_ssh;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if !fake_ssh::have_rsync() {
+            eprintln!("rsync not installed — skipping");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("arena-pull-repull-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("pod");
+        std::fs::create_dir_all(home.join("work")).unwrap();
+        let script = home.join("work/run.sh");
+        std::fs::write(&script, "echo hi\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let fake = fake_ssh::install(&root);
+        let base = root.join("backup");
+        let small = PullConfig::small_tier("2K");
+        let pull = |label: &str| {
+            let pc = snapshot_tier_for(&base, label, "devtest-a", &small); // before the dest exists, as the CLI does
+            let dest = local_dest(&base.display().to_string(), label, "devtest-a");
+            std::fs::create_dir_all(&dest).unwrap();
+            for pass in pc.passes() {
+                fake_ssh::rsync(&fake_ssh::swap_transport(&rsync_args(&target(), &pass, &dest), &fake), &home);
+            }
+            base.join(label).join("devtest-a/work/run.sh")
+        };
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let ino = |p: &std::path::Path| std::fs::metadata(p).unwrap().ino();
+        let (d1, d2) = (pull("w0d1"), pull("w0d2"));
+        assert_eq!(ino(&d1), ino(&d2), "linked");
+        // Only a pull into a snapshot that already has files holds attributes still.
+        let flags = |label: &str| rsync_args(&target(), &snapshot_tier_for(&base, label, "devtest-a", &small), "./d/");
+        assert!(flags("w0d2").windows(3).any(|w| w == ["--no-perms", "--no-owner", "--no-group"]), "{:?}", flags("w0d2"));
+        assert!(!flags("w0d3").iter().any(|a| a.starts_with("--no-")), "a new label is a plain -a pull");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        pull("w0d2"); // the */15 cron, later the same day
+        assert_eq!(mode(&d1), 0o644, "yesterday's snapshot is as it was");
+        assert_eq!(mode(&d2), 0o644, "(today's shows it from the next label)");
+        let d3 = pull("w0d3");
+        assert_eq!((mode(&d3), mode(&d1)), (0o755, 0o644));
+        assert_ne!(ino(&d3), ino(&d2));
+        // A content change on a re-pull is a new file, as ever: the earlier snapshots keep theirs.
+        std::fs::write(&script, "echo changed\n").unwrap();
+        pull("w0d3");
+        assert_eq!(std::fs::read_to_string(&d3).unwrap(), "echo changed\n");
+        assert_eq!(std::fs::read_to_string(&d2).unwrap(), "echo hi\n");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The pod-side listing for the baseline, run for real: what was written under the home after
+    /// the container was created with an older mtime kept (a `pods replace` copy, a restore) — and
+    /// only that: not the image's files, not what was written since with a new mtime (the mtime
+    /// prune drops those), not the dot-dirs the baseline never holds (but `.git`).
+    #[cfg(unix)]
+    #[test]
+    fn the_copied_in_listing_finds_old_mtimes_written_after_the_container() {
+        let root = std::env::temp_dir().join(format!("arena-pull-copied-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let put = |rel: &str, mtime: Option<std::time::SystemTime>| {
+            let p = home.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, rel).unwrap();
+            if let Some(t) = mtime {
+                std::fs::File::options().write(true).open(&p).unwrap().set_modified(t).unwrap();
+            }
+        };
+        let old = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        // The image's files: here before the container (their ctime too).
+        put("arena-llm-context/doc.txt", Some(old));
+        put("ARENA_materials/.git/objects/pack/image.pack", Some(old));
+        // The container is created (ctime granularity is coarse: keep the steps apart).
+        std::thread::sleep(Duration::from_millis(50));
+        let mark = root.join("dockerenv");
+        std::fs::write(&mark, "").unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        // Copied in since, old mtimes kept — a replace's rsync -a, a restore.
+        put(".name", Some(old));
+        put("ARENA_materials/chapter1/my answers.py", Some(old));
+        put("ARENA_materials/.git/objects/pack/copied.pack", Some(old));
+        put(".cache/pip/wheel.whl", Some(old)); // a dot-dir the baseline never has
+        put("ARENA_materials/notes.md", None); // written since: the mtime prune's
+        let o = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(copied_in_script(mark.to_str().unwrap()))
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let got = parse_copied_in(&format!("motd from a chatty .bashrc\n{}", String::from_utf8_lossy(&o.stdout))).unwrap();
+        let want: BTreeSet<PathBuf> =
+            [".name", "ARENA_materials/.git/objects/pack/copied.pack", "ARENA_materials/chapter1/my answers.py"].map(PathBuf::from).into();
+        assert_eq!(got, want);
+        // No container mark: a failure, never an empty list.
+        let o = std::process::Command::new("sh").arg("-c").arg(copied_in_script("/nonexistent/mark")).env("HOME", &home).output().unwrap();
+        assert!(!o.status.success());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_copied_in_listing_is_trusted_only_when_complete() {
+        let ok = parse_copied_in("hi from .bashrc\narena-copied-begin\0./.name\0./a b/c.py\0arena-copied-end\0").unwrap();
+        assert_eq!(ok, [".name", "a b/c.py"].map(PathBuf::from).into());
+        assert!(parse_copied_in("arena-copied-begin\0arena-copied-end\0").unwrap().is_empty());
+        for (out, why) in [
+            ("", "never started"),
+            ("arena-copied-begin\0./a\0", "didn't finish"),
+            ("arena-copied-begin\0a\0arena-copied-end\0", "unexpected record"),
+            ("arena-copied-begin\0./\u{FFFD}x\0arena-copied-end\0", "isn't UTF-8"),
+        ] {
+            let e = parse_copied_in(out).unwrap_err();
+            assert!(e.contains(why), "{out:?}: {e}");
+        }
     }
 
     #[test]
@@ -458,5 +2338,477 @@ mod tests {
         let s = display_rsync(&target(), &PullConfig::default(), "./out/");
         assert!(s.starts_with("rsync -avz"));
         assert!(s.contains("'ssh -p 22001"));
+        assert!(s.contains("--include '**/.git/**'") && s.contains("--exclude 'models--*/'"), "{s}");
+    }
+
+    /// The dry-run line pastes into a shell as exactly the argv that runs — in a directory where
+    /// the old unquoted globs (`**/.git/**`, `models--*/`, `*.arena-aside-*/`) would have
+    /// expanded into local file names.
+    #[cfg(unix)]
+    #[test]
+    fn a_displayed_rsync_pastes_back_as_its_argv() {
+        let dir = std::env::temp_dir().join(format!("arena-display-rsync-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for d in ["models--x", "a.arena-aside-1", "z/.git/objects", "venv"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        let pc = PullConfig { remote_path: "ARENA materials/".into(), ..PullConfig::small_tier("50M") };
+        let dest = "./backup/w0d4/devtest bravo/";
+        let line = display_rsync(&target(), &pc, dest);
+        let rest = line.strip_prefix("rsync ").unwrap();
+        let o = std::process::Command::new("bash")
+            .current_dir(&dir)
+            .args(["-O", "globstar", "-c", &format!("printf '%s\\n' {rest}")])
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let back: Vec<String> = String::from_utf8_lossy(&o.stdout).lines().map(String::from).collect();
+        assert_eq!(back, rsync_args(&target(), &pc, dest), "{line}");
+    }
+
+    /// RS2: the reap's tier through the real rsync — what it keeps (dot-directories with work
+    /// in them, `.git`, `.claude`, shell rc files, big files) and what it leaves out (only the
+    /// documented caches, secrets and the sweep folder).
+    #[cfg(unix)]
+    #[test]
+    fn the_reap_tier_keeps_participant_data() {
+        if std::process::Command::new("rsync").arg("--version").output().is_err() {
+            eprintln!("rsync not installed — skipping");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("arena-pull-reaptier-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (src, dst) = (root.join("src"), root.join("dst"));
+        let kept = [
+            "notes.txt",
+            "work/model.pt",
+            "ARENA_materials/.git/HEAD",
+            "ARENA_materials/chapter1/solutions.ipynb",
+            ".ipython/profile_default/history.sqlite",
+            ".jupyter/lab/workspaces/default.json",
+            ".config/wandb/settings",
+            ".local/bin/mytool",
+            ".local/share/jupyter/kernels/k.json",
+            ".vscode-server/data/User/History/1/entry.py",
+            ".claude/projects/p.jsonl",
+            ".arena/jobs/20261012-1/out.log",
+            ".bashrc",
+            ".hidden_scratch/run.py",
+            // R2-1: only the hub cache of Hugging Face is left out.
+            ".cache/huggingface/token",
+            ".cache/huggingface/datasets/my_set/data.arrow",
+            "hf_cache/finetuned/model.safetensors",
+            "data/huggingface/my_model/config.json",
+            // W7 B-RS2: the rest of ~/.cache is kept — an unknown folder, W&B's, the torch
+            // kernels nobody listed — and so is a `.cache` or `envs/` of the participant's own.
+            ".cache/keepme",
+            ".cache/wandb/artifacts/run-1/table.json",
+            ".cache/torch/kernels/k.bin",
+            "ARENA_materials/.cache/results.json",
+            "ARENA_materials/chapter2_rl/envs/my_env.py",
+            "miniconda3/etc/profile.d/conda.sh",
+        ];
+        let not_kept = [
+            ".cache/pip/wheel",
+            ".cache/uv/archive-v0/x",
+            "ARENA_materials/__pycache__/m.pyc",
+            "venv/lib/x.py",
+            ".venv/lib/x.py",
+            "node_modules/x/index.js",
+            ".local/lib/python3.11/site-packages/x.py",
+            ".local/share/uv/python/p",
+            "miniconda3/envs/arena-env/lib/libtorch.so",
+            "miniconda3/pkgs/torch-2.9.tar.bz2",
+            ".conda/envs/mine/bin/python",
+            "hf_cache/models--gpt2/blob",
+            ".cache/huggingface/hub/models--gpt2/blobs/x",
+            ".cache/huggingface/xet/chunk",
+            ".cache/torch/hub/checkpoints/resnet.pth",
+            ".cache/matplotlib/fontlist-v390.json",
+            ".npm/_cacache/x",
+            ".nv/ComputeCache/x",
+            ".vscode-server/bin/abc/node",
+            ".vscode-server/extensions/ms-python/x",
+            ".ssh/id_ed25519",
+            ".triton/cache/x",
+            "ARENA_materials/TEMP_FOLDER_FOR_SWEEPS/run1/ckpt.pt",
+            "ARENA_materials.arena-aside-20261001T000000Z/README.md",
+        ];
+        for f in kept.iter().chain(&not_kept) {
+            let p = src.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, f).unwrap();
+        }
+        std::fs::create_dir_all(&dst).unwrap();
+        let mut args = rsync_args(&target(), &PullConfig::reap_tier(), &format!("{}/", dst.display()));
+        let e = args.iter().position(|a| a == "-e").unwrap();
+        args.drain(e..e + 2);
+        let n = args.len();
+        args[n - 2] = format!("{}/", src.display());
+        let out = std::process::Command::new("rsync").args(&args).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        for f in kept {
+            assert!(dst.join(f).is_file(), "the reap's backup must keep {f}");
+        }
+        for f in not_kept {
+            assert!(!dst.join(f).exists(), "documented as not kept, yet copied: {f}");
+        }
+        // The documented list is the whole filter: no other exclude, no size cap, nothing kept
+        // but by the big tier's own includes (`.git`, `.claude`).
+        let pc = PullConfig::reap_tier();
+        assert!(pc.max_size.is_none() && pc.min_size.is_none());
+        assert!(pc.first_excludes.is_empty() && pc.includes == PullConfig::big_tier().includes, "{pc:?}");
+        assert_eq!(pc.excludes, REAP_NOT_KEPT.iter().chain(REAP_VETOED).map(|e| e.to_string()).collect::<Vec<_>>());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// RS1: a frozen copy (`link_tree`) holds the tree as it was — counted equal, every kind of
+    /// entry carried — and a later rsync into the original (a same-named successor's pull)
+    /// changes nothing in it: rsync writes a changed file as a new inode.
+    #[cfg(unix)]
+    #[test]
+    fn a_frozen_copy_survives_a_later_pull_into_the_original() {
+        let root = std::env::temp_dir().join(format!("arena-pull-freeze-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (live, frozen, next) = (root.join("big/devtest-alpha"), root.join("reaped/devtest-alpha/S-runpod-p1/big"), root.join("next"));
+        std::fs::create_dir_all(live.join("sub/empty")).unwrap();
+        std::fs::write(live.join("notebook.ipynb"), "v1 of the participant's work").unwrap();
+        std::fs::write(live.join("sub/data.bin"), [0u8; 4096]).unwrap();
+        std::os::unix::fs::symlink("notebook.ipynb", live.join("latest")).unwrap();
+        let fifo = live.join("sub/pipe");
+        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        let before = tree_count(&live).unwrap();
+        assert_eq!(before, TreeCount { files: 2, bytes: 28 + 4096, dirs: 2, links: 1, other: 1 });
+        assert_eq!(link_tree(&live, &frozen).unwrap(), before, "the copy counts equal, the fifo too");
+        assert!(link_tree(&live, &frozen).is_err(), "never into an existing folder");
+        assert_eq!(std::fs::read_link(frozen.join("latest")).unwrap(), Path::new("notebook.ipynb"));
+        if std::process::Command::new("rsync").arg("--version").output().is_ok() {
+            // A successor's pull, through the real rsync with the backup tiers' flags.
+            std::fs::create_dir_all(&next).unwrap();
+            std::fs::write(next.join("notebook.ipynb"), "the successor's own").unwrap();
+            let mut args = rsync_args(&target(), &PullConfig::big_tier(), &format!("{}/", live.display()));
+            let e = args.iter().position(|a| a == "-e").unwrap();
+            args.drain(e..e + 2);
+            let n = args.len();
+            args[n - 2] = format!("{}/", next.display());
+            let out = std::process::Command::new("rsync").args(&args).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            assert_eq!(std::fs::read_to_string(live.join("notebook.ipynb")).unwrap(), "the successor's own");
+        } else {
+            std::fs::write(live.join(".tmp"), "the successor's own").unwrap();
+            std::fs::rename(live.join(".tmp"), live.join("notebook.ipynb")).unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(frozen.join("notebook.ipynb")).unwrap(), "v1 of the participant's work");
+        assert_eq!(tree_count(&frozen).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A path from raw bytes (rsync's names needn't be UTF-8).
+    #[cfg(unix)]
+    fn os_path(b: &[u8]) -> PathBuf {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(std::ffi::OsStr::from_bytes(b))
+    }
+
+    /// What rsync 3.2.7 printed in real runs with the pulls' own flags (a local copy into a
+    /// destination holding a non-empty directory where the source has a symlink, or a file). The
+    /// path is relative to the destination, at any depth, with spaces as they are (a trailing one
+    /// too) and rsync's `\#ooo` escapes decoded. A line that only looks like it isn't one of
+    /// these, and neither is `-vv`'s `cannot delete non-empty directory`.
+    #[cfg(unix)]
+    #[test]
+    fn rsync_says_which_directory_is_in_the_way_and_nothing_else_reads_as_that() {
+        const TAIL: &str =
+            "rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1356) [sender=3.2.7]\n";
+        type Case = (&'static str, &'static [(&'static [u8], &'static str)]);
+        let cases: &[Case] = &[
+            ("could not make way for new symlink: ARENA_3.0\n", &[(b"ARENA_3.0", "symlink")]),
+            ("could not make way for new symlink: a b/c d/my link\n", &[(b"a b/c d/my link", "symlink")]),
+            ("could not make way for new regular file: F\n", &[(b"F", "regular file")]),
+            ("could not make way for new symlink: sp \n", &[(b"sp ", "symlink")]),
+            ("could not make way for new symlink: a\\#012b\n", &[(b"a\nb", "symlink")]),
+            ("could not make way for new symlink: q\\#134#012z\n", &[(b"q\\#012z", "symlink")]),
+            ("could not make way for new symlink: \\#303\\#261ame\n", &[(b"\xc3\xb1ame", "symlink")]),
+            (
+                "could not make way for new symlink: L1\ncould not make way for new symlink: L2\n",
+                &[(b"L1", "symlink"), (b"L2", "symlink")],
+            ),
+            ("could not make way for new symlink: L\r\ncould not make way for new symlink: L\n", &[(b"L", "symlink")]),
+            // Not an escape: as written.
+            ("could not make way for new symlink: a\\#400b\\#12\n", &[(b"a\\#400b\\#12", "symlink")]),
+            // Not rsync's message for a directory in the way: nothing.
+            ("cannot delete non-empty directory: L\n", &[]),
+            ("rsync: [generator] could not make way for new symlink: L\n", &[]),
+            ("could not make way for backup symlink: L\n", &[]),
+            ("could not make way for new directory: D\n", &[]),
+            ("could not make way for new socket: L\n", &[]),
+            ("could not make way for new symlink: \n", &[]),
+            ("could not make way for new symlink:L\n", &[]),
+            ("", &[]),
+        ];
+        for (stderr, want) in cases {
+            let want: Vec<InTheWay> = want.iter().map(|(p, kind)| InTheWay { path: os_path(p), kind }).collect();
+            assert_eq!(make_way_entries(&format!("{stderr}{TAIL}")), want, "{stderr:?}");
+        }
+    }
+
+    /// The names are rsync's stderr, which a pod can put words into: only a plain relative path
+    /// is ever acted on.
+    #[test]
+    fn only_a_plain_relative_path_is_inside() {
+        let cases = [
+            ("ARENA_3.0", true),
+            ("a b/c d/my link", true),
+            ("a/b", true),
+            ("a//b", true),
+            ("a/./b", true),
+            ("...", true),
+            (".hidden", true),
+            ("", false),
+            ("/", false),
+            ("/etc", false),
+            ("/root/big/devtest-apple/ARENA_3.0", false),
+            ("..", false),
+            ("../x", false),
+            ("a/../b", false),
+            ("a/..", false),
+            (".", false),
+            ("./a", false),
+        ];
+        for (p, ok) in cases {
+            assert_eq!(inside(Path::new(p)), ok, "{p:?}");
+        }
+    }
+
+    /// A set-aside directory keeps its name, under a holding directory named for the day in
+    /// UTC (review b5 #1: a renamed `hf/` slipped past the archive's `hf/token` exclude) — never
+    /// onto a name already there.
+    #[test]
+    fn a_directory_goes_aside_under_a_holding_directory_keeping_its_name() {
+        use std::ffi::OsStr;
+        assert_eq!(aside_name(OsStr::new("ARENA_3.0"), "20261017", |_| false).unwrap(), Path::new(".arena-olddir-20261017/ARENA_3.0"));
+        let taken = [".arena-olddir-20261017/ARENA_3.0", ".arena-olddir-20261017-2/ARENA_3.0"];
+        let got = aside_name(OsStr::new("ARENA_3.0"), "20261017", |c| taken.iter().any(|t| c == Path::new(t)));
+        assert_eq!(got.unwrap(), Path::new(".arena-olddir-20261017-3/ARENA_3.0"));
+        assert_eq!(aside_name(OsStr::new("x"), "20261017", |_| true), None, "a thousand taken: no name");
+        assert_eq!(aside_day(1_792_238_400), "20261017", "2026-10-17 12:00 UTC");
+        assert_eq!(aside_day(1_792_281_599), "20261017");
+        assert_eq!(aside_day(1_792_281_600), "20261018");
+    }
+
+    /// The directory in the way goes into a holding directory beside itself, its name kept, with
+    /// everything in it, at any depth, never onto another name nor through a holding name that
+    /// isn't a real directory. Anything else is refused and left exactly where it was: a path
+    /// with `..`, an absolute one, one whose way runs through a symlink (which would reach
+    /// outside the destination), and an entry that is a symlink or a file.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_in_the_way_moves_aside_within_its_parent_and_nothing_outside_is_reached() {
+        let root = std::env::temp_dir().join(format!("arena-pull-aside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (dest, outside) = (root.join("big/devtest-apple"), root.join("outside"));
+        let put = |p: &Path, text: &str| {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        };
+        put(&dest.join("ARENA_3.0/chapter1/old_work.py"), "yesterday's work");
+        put(&dest.join("ARENA_3.0/top.txt"), "top");
+        let before = tree_count(&dest.join("ARENA_3.0")).unwrap();
+        let day = "20261017";
+        let held = dest.join(".arena-olddir-20261017/ARENA_3.0");
+        assert_eq!(move_aside(&dest, Path::new("ARENA_3.0"), day).unwrap(), Path::new(".arena-olddir-20261017/ARENA_3.0"));
+        assert!(std::fs::symlink_metadata(dest.join("ARENA_3.0")).is_err(), "the name is free for what the pod has");
+        assert_eq!(tree_count(&held).unwrap(), before, "everything kept");
+        assert_eq!(std::fs::read_to_string(held.join("chapter1/old_work.py")).unwrap(), "yesterday's work");
+        // Another directory the same day: the same holding directory.
+        put(&dest.join("hf/token"), "a token");
+        assert_eq!(move_aside(&dest, Path::new("hf"), day).unwrap(), Path::new(".arena-olddir-20261017/hf"));
+        assert!(dest.join(".arena-olddir-20261017/hf/token").is_file());
+        // The same name again the same day: never onto a name already there, nor into a holding
+        // name that is something else here (even a dangling link): the next free holding directory.
+        put(&dest.join("ARENA_3.0/again.py"), "again");
+        std::os::unix::fs::symlink(&outside, dest.join(".arena-olddir-20261017-2")).unwrap();
+        assert_eq!(move_aside(&dest, Path::new("ARENA_3.0"), day).unwrap(), Path::new(".arena-olddir-20261017-3/ARENA_3.0"));
+        assert_eq!(tree_count(&held).unwrap(), before, "the first one untouched");
+        assert!(!outside.exists(), "nothing made through the link");
+        // Deep, with spaces: within its own parent.
+        put(&dest.join("a b/c d/my link/f.txt"), "f");
+        assert_eq!(move_aside(&dest, Path::new("a b/c d/my link"), day).unwrap(), Path::new("a b/c d/.arena-olddir-20261017/my link"));
+        assert!(dest.join("a b/c d/.arena-olddir-20261017/my link/f.txt").is_file());
+
+        // Refused, everything left as it was.
+        put(&outside.join("victim/keep.txt"), "not ours");
+        put(&dest.join("file.txt"), "a file");
+        std::os::unix::fs::symlink(&outside, dest.join("linked")).unwrap();
+        std::os::unix::fs::symlink(outside.join("victim"), dest.join("alink")).unwrap();
+        let absolute = outside.join("victim").display().to_string();
+        let cases: [(&str, &str); 8] = [
+            ("../../outside/victim", "not a path inside the destination"),
+            (".arena-olddir-20261017/../../../outside/victim", "not a path inside the destination"),
+            (&absolute, "not a path inside the destination"),
+            ("linked/victim", "linked on the way to it is a symlink here"),
+            ("alink", "it is a symlink here"),
+            ("file.txt", "it is not a directory here"),
+            ("file.txt/x", "file.txt on the way to it is not a directory here"),
+            ("missing", "it can't be read"),
+        ];
+        let listing = |d: &Path| {
+            let mut names: Vec<String> = std::fs::read_dir(d).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+            names.sort();
+            names
+        };
+        let (dest_before, outside_before) = (listing(&dest), listing(&outside));
+        for (rel, why) in cases {
+            let err = move_aside(&dest, Path::new(rel), day).unwrap_err();
+            assert!(err.contains(why), "{rel}: {err}");
+        }
+        assert_eq!((listing(&dest), listing(&outside)), (dest_before, outside_before), "nothing renamed anywhere");
+        assert_eq!(listing(&outside.join("victim")), ["keep.txt"]);
+        assert!(std::fs::symlink_metadata(dest.join("linked")).unwrap().file_type().is_symlink());
+
+        // `make_way` over a stderr naming all of it: each said on the pod's line.
+        put(&dest.join("ARENA_3.0/new_dir_again.py"), "x");
+        let stderr = "could not make way for new symlink: ARENA_3.0\ncould not make way for new symlink: linked/victim\n\
+                      could not make way for new regular file: ../../outside/victim\n";
+        let made = make_way(&dest, stderr, "20261018");
+        assert_eq!(made.moved, [(PathBuf::from("ARENA_3.0"), PathBuf::from(".arena-olddir-20261018/ARENA_3.0"), "symlink")]);
+        assert_eq!(made.refused.len(), 2, "{made:?}");
+        assert_eq!(
+            made.note(),
+            " — moved ARENA_3.0 aside to .arena-olddir-20261018/ARENA_3.0 (a directory here, a symlink on the pod now; nothing \
+             deleted) \
+             — rsync couldn't replace, and left as it is: linked/victim (linked on the way to it is a symlink here), \
+             ../../outside/victim (not a path inside the destination)"
+        );
+        assert_eq!(listing(&outside.join("victim")), ["keep.txt"]);
+        let two = MadeWay {
+            moved: vec![
+                (PathBuf::from("ARENA_3.0"), PathBuf::from(".arena-olddir-20261018/ARENA_3.0"), "symlink"),
+                (PathBuf::from("data"), PathBuf::from(".arena-olddir-20261018/data"), "regular file"),
+            ],
+            refused: vec![],
+        };
+        assert_eq!(
+            two.note(),
+            " — moved 2 directories aside (each something else on the pod now; nothing deleted): ARENA_3.0 → \
+             .arena-olddir-20261018/ARENA_3.0 (symlink), data → .arena-olddir-20261018/data (regular file)"
+        );
+        assert_eq!(MadeWay::default().note(), "");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The live failure, through the real rsync with the big tier's own flags: a directory here
+    /// where the pod now has a symlink, at the top and deeper down. rsync copies the rest and exits
+    /// 23. Through [`rsync_making_way`], both directories are moved aside with everything in them,
+    /// the rsync runs once more and succeeds, and the links are in place. The next run has nothing
+    /// in its way.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_directory_that_became_a_symlink_is_moved_aside_and_the_rsync_succeeds() {
+        if std::process::Command::new("rsync").arg("--version").output().is_err() {
+            eprintln!("no rsync here: skipped");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("arena-pull-makeway-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (pod, dest) = (root.join("pod"), root.join("big/devtest-apple"));
+        let put = |p: &Path, text: &str| {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        };
+        put(&pod.join("volume/ARENA_3.0/chapter1/new.py"), "today");
+        put(&pod.join("notes.md"), "notes");
+        std::os::unix::fs::symlink("volume/ARENA_3.0", pod.join("ARENA_3.0")).unwrap();
+        std::fs::create_dir_all(pod.join("deep/x")).unwrap();
+        std::os::unix::fs::symlink("../../volume", pod.join("deep/x/L")).unwrap();
+        put(&dest.join("ARENA_3.0/chapter1/old_work.py"), "yesterday's work");
+        put(&dest.join("deep/x/L/old.py"), "older");
+        // The big tier's argv, the pod's side read from `pod` (as the tests above do).
+        let mut args = rsync_args(&target(), &PullConfig::big_tier(), &format!("{}/", dest.display()));
+        let e = args.iter().position(|a| a == "-e").unwrap();
+        args.drain(e..e + 2);
+        let n = args.len();
+        args[n - 2] = format!("{}/", pod.display());
+        let budget = Duration::from_secs(60);
+        let first = crate::remote::run_local("rsync", &args, "rsync", Some(budget)).await.unwrap();
+        assert_eq!(first.code, Some(23), "{}", first.stderr);
+        let paths: Vec<PathBuf> = make_way_entries(&first.stderr).into_iter().map(|e| e.path).collect();
+        assert_eq!(paths, [PathBuf::from("ARENA_3.0"), PathBuf::from("deep/x/L")], "{}", first.stderr);
+        assert!(dest.join("notes.md").is_file(), "the rest was copied");
+
+        let (out, made) = rsync_making_way("rsync", &args, &dest, "rsync of devtest-apple [big]", budget, "20261017").await;
+        let out = out.unwrap();
+        assert!(out.success, "{}", out.stderr);
+        assert_eq!(
+            made.moved,
+            [
+                (PathBuf::from("ARENA_3.0"), PathBuf::from(".arena-olddir-20261017/ARENA_3.0"), "symlink"),
+                (PathBuf::from("deep/x/L"), PathBuf::from("deep/x/.arena-olddir-20261017/L"), "symlink"),
+            ]
+        );
+        assert_eq!(std::fs::read_link(dest.join("ARENA_3.0")).unwrap(), Path::new("volume/ARENA_3.0"));
+        assert_eq!(std::fs::read_link(dest.join("deep/x/L")).unwrap(), Path::new("../../volume"));
+        assert_eq!(std::fs::read_to_string(dest.join("volume/ARENA_3.0/chapter1/new.py")).unwrap(), "today");
+        let (old, older) = (dest.join(".arena-olddir-20261017/ARENA_3.0/chapter1/old_work.py"), dest.join("deep/x/.arena-olddir-20261017/L/old.py"));
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), "yesterday's work");
+        assert_eq!(std::fs::read_to_string(&older).unwrap(), "older");
+
+        // The next pull: nothing in its way, and the tier's own filters leave the holding
+        // directories as they are (no pod has one: `**/.*/`; nothing here is ever deleted).
+        let (out, made) = rsync_making_way("rsync", &args, &dest, "rsync", budget, "20261018").await;
+        assert!(out.unwrap().success);
+        assert_eq!(made, MadeWay::default(), "nothing in the way any more");
+        assert_eq!((std::fs::read_to_string(&old).unwrap(), std::fs::read_to_string(&older).unwrap()), ("yesterday's work".into(), "older".into()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The retry is one: a second failure is the result, whatever it says. There is none when
+    /// nothing could be moved, for any other failure, or with under a second of the budget left
+    /// (the directory still goes aside, so the next run gets through).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_rsync_is_retried_once_and_only_when_a_directory_was_moved_in_time() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("arena-pull-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dest = root.join("dest");
+        std::fs::create_dir_all(dest.join("L/sub")).unwrap();
+        // A stand-in rsync: counts its runs, and fails like the live one every time.
+        let stub = root.join("rsync");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\necho run >> \"$(dirname \"$0\")/runs\"\n[ -z \"$1\" ] || sleep \"$1\"\n\
+             echo 'could not make way for new symlink: L' >&2\necho 'rsync error: (code 23)' >&2\nexit 23\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let program = stub.display().to_string();
+        let runs = || {
+            let n = std::fs::read_to_string(root.join("runs")).map(|t| t.lines().count()).unwrap_or(0);
+            let _ = std::fs::remove_file(root.join("runs"));
+            n
+        };
+        let budget = Duration::from_secs(30);
+        // Every run fails: moved once, run twice, the second failure returned.
+        let (out, made) = rsync_making_way(&program, &[], &dest, "rsync", budget, "20261017").await;
+        assert_eq!((out.unwrap().code, made.moved.len(), runs()), (Some(23), 1, 2));
+        assert!(dest.join(".arena-olddir-20261017/L/sub").is_dir());
+        // `L` is gone now: nothing to move, no second run, the refusal said.
+        let (out, made) = rsync_making_way(&program, &[], &dest, "rsync", budget, "20261017").await;
+        assert_eq!((out.unwrap().code, made.moved.len(), made.refused.len(), runs()), (Some(23), 0, 1, 1));
+        // Any other failure: as it was.
+        let (out, made) = rsync_making_way("sh", &["-c".into(), "echo 'rsync: connection unexpectedly closed' >&2; exit 12".into()], &dest, "rsync", budget, "20261017").await;
+        assert_eq!((out.unwrap().code, made), (Some(12), MadeWay::default()));
+        // The line under any exit but rsync's 23 (a pod printing it, review b5 #3): not acted on.
+        std::fs::create_dir_all(dest.join("L/sub")).unwrap();
+        let said = "echo 'could not make way for new symlink: L' >&2; exit 12";
+        let (out, made) = rsync_making_way("sh", &["-c".into(), said.into()], &dest, "rsync", budget, "20261017").await;
+        assert_eq!((out.unwrap().code, made), (Some(12), MadeWay::default()));
+        assert!(dest.join("L/sub").is_dir(), "left where it is");
+        // Under a second left after the first run: moved aside, not run again.
+        let (out, made) = rsync_making_way(&program, &["1.2".into()], &dest, "rsync", Duration::from_secs(2), "20261017").await;
+        assert_eq!((out.unwrap().code, made.moved.len(), runs()), (Some(23), 1, 1));
+        assert!(dest.join(".arena-olddir-20261017-2/L/sub").is_dir());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
