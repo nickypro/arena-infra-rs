@@ -280,10 +280,11 @@ fn deprecated_in(t: &Value, location: &str) -> bool {
     }
 }
 
-/// A flag of `t`'s entry for `location` in its per-location list — `available` (Hetzner can
-/// place one there right now: live, cx33/cx43/cx53 and three cax types read `false` in nbg1 with
-/// no deprecation, i.e. sold out) or `recommended` — or `None` when the answer doesn't carry it
-/// (an older one, or no entry there). Pure.
+/// A flag of `t`'s entry for `location` in its per-location list — `available` (live, cx33/cx43/
+/// cx53 and three cax types read `false` in nbg1 with no deprecation; a hint of low stock, not a
+/// refusal: a cx23 create in nbg1 went through while it read `false` there, live hz2) or
+/// `recommended` — or `None` when the answer doesn't carry it (an older one, or no entry there).
+/// Pure.
 fn location_flag(t: &Value, location: &str, flag: &str) -> Option<bool> {
     let locs = t.get("locations")?.as_array()?;
     locs.iter().find(|l| l.get("name").and_then(Value::as_str) == Some(location))?.get(flag)?.as_bool()
@@ -310,13 +311,23 @@ fn type_label(t: &Value) -> String {
     }
 }
 
+/// `label` with `note` added inside its parentheses — `cx33 (4 vCPU, 8 GB, low availability)` —
+/// or in new ones when it has none (`cx33 (low availability)`). Pure.
+fn tagged(label: &str, note: &str) -> String {
+    match label.strip_suffix(')') {
+        Some(open) => format!("{open}, {note})"),
+        None => format!("{label} ({note})"),
+    }
+}
+
 /// What to say when server type `ty` can't be ordered in `location` (`types`: the `GET
-/// /server_types` items): the types that can — not deprecated there, and not sold out there
-/// right now (`available: false`, when the answer has the flag: a suggestion that then fails on
-/// capacity is no help — live hz F3) — Hetzner's `recommended` ones first, each group in the
-/// API's order, to pick a `--server-type` from. `None` when `ty` can be ordered there (sold out
-/// or not: that is capacity, which a retry may get), or the answer doesn't say. Without a
-/// location only a type Hetzner doesn't have at all is reported. Pure.
+/// /server_types` items): the types that can — not deprecated there — to pick a `--server-type`
+/// from. Hetzner's `recommended` ones first, then the rest, then the ones it marks `available:
+/// false` there, tagged `low availability`: last, since one may fail on capacity (live hz F3),
+/// but listed, since one may also go through (live hz2: a cx23 in nbg1 did). Each group in the
+/// API's order. `None` when `ty` can be ordered there (low on stock or not: that is capacity,
+/// which a retry may get), or the answer doesn't say. Without a location only a type Hetzner
+/// doesn't have at all is reported. Pure.
 fn type_advice(types: &[Value], ty: &str, location: Option<&str>, now: u64) -> Option<String> {
     let is = |t: &&Value| {
         t.get("name").and_then(Value::as_str) == Some(ty) || t.get("id").and_then(Value::as_u64).is_some_and(|i| i.to_string() == ty)
@@ -329,17 +340,12 @@ fn type_advice(types: &[Value], ty: &str, location: Option<&str>, now: u64) -> O
     let Some(loc) = location else {
         return Some(format!("{why} (`arena api get hetzner server_types` lists them)"));
     };
-    let sold: Vec<&Value> = types.iter().filter(|t| orderable_in(t, loc, now) == Some(true) && !deprecated_in(t, loc)).collect();
-    let mut free: Vec<&Value> = sold.iter().copied().filter(|t| location_flag(t, loc, "available") != Some(false)).collect();
-    free.sort_by_key(|t| location_flag(t, loc, "recommended") != Some(true));
-    let offered: Vec<String> = free.into_iter().map(type_label).collect();
+    let mut sold: Vec<&Value> = types.iter().filter(|t| orderable_in(t, loc, now) == Some(true) && !deprecated_in(t, loc)).collect();
+    let low = |t: &Value| location_flag(t, loc, "available") == Some(false);
+    sold.sort_by_key(|t| (low(t), location_flag(t, loc, "recommended") != Some(true)));
+    let offered: Vec<String> = sold.iter().map(|t| if low(t) { tagged(&type_label(t), "low availability") } else { type_label(t) }).collect();
     Some(if sold.is_empty() {
         format!("{why}, and Hetzner lists no type there (`arena api get hetzner server_types`) — pick another HETZNER_LOCATION")
-    } else if offered.is_empty() {
-        format!(
-            "{why}, and every type sold there is sold out right now (`arena api get hetzner server_types`) — try again later, \
-             or pick another HETZNER_LOCATION"
-        )
     } else {
         format!(
             "{why}; available there: {} — pass --server-type <one of those> (or set HETZNER_SERVER_TYPE), or pick another \
@@ -860,8 +866,8 @@ mod tests {
     /// `GET /server_types` as Hetzner answers it (live, 2026-10-18: every key, per type and per
     /// location), trimmed to seven types and the locations the tests ask about. Per location:
     /// `deprecation` (`unavailable_after` passed = retired there), `available` (`false` with no
-    /// deprecation = sold out there right now) and `recommended`. As live: cpx41 is retired
-    /// everywhere but ash (`prices` still lists the rest); cx33 and cx23 are sold out in fsn1/hel1,
+    /// deprecation = low on stock there right now) and `recommended`. As live: cpx41 is retired
+    /// everywhere but ash (`prices` still lists the rest); cx33 and cx23 are low on stock in fsn1/hel1,
     /// cx33 in nbg1 too; cpx42 and cax11 are recommended in hel1. Changed for the tests: cpx42 is
     /// recommended in nbg1 too (live: none there is), cpx22's nbg1 retirement is announced (still
     /// orderable, never suggested), and ccx13 keeps only its ash entry (a US-only type).
@@ -967,8 +973,8 @@ mod tests {
 
     /// Item 4: `cpx41` is refused in nbg1, where `cpx42` is sold. Whatever Hetzner's wording —
     /// an `invalid_input` (live), or one that reads like capacity (`not available in`) — the error
-    /// lists the types nbg1 sells and has free now (not the retired, the announced-retiring, the
-    /// US-only or the sold-out cx33: live hz F3), the recommended one first, and how to pick one,
+    /// lists the types nbg1 sells (not the retired, the announced-retiring or the US-only), the
+    /// recommended one first and the low-on-stock cx33 last, tagged (live hz F3, hz2), and how to pick one,
     /// and is `Rejected`: never retried as if capacity might come back. The `--server-type`
     /// reached the request body.
     #[tokio::test]
@@ -992,11 +998,11 @@ mod tests {
             assert!(
                 m.contains(
                     "server type `cpx41` can't be ordered in nbg1; available there: cpx42 (8 vCPU, 16 GB), cx23 (2 vCPU, 4 GB), \
-                     cax11 (2 vCPU, 4 GB, arm) — pass --server-type <one of those> (or set HETZNER_SERVER_TYPE)"
+                     cax11 (2 vCPU, 4 GB, arm), cx33 (4 vCPU, 8 GB, low availability) — pass --server-type <one of those> (or set \
+                     HETZNER_SERVER_TYPE)"
                 ),
                 "{m}"
             );
-            assert!(!m.contains("cx33"), "sold out in nbg1: {m}");
             assert!(!m.contains("SSH key"), "the key is there: {m}");
             assert_eq!(e.kind(), Some(K::Rejected), "{m}");
             assert_eq!(serde_json::from_str::<Value>(&srv.bodies.lock().unwrap()[0]).unwrap()["server_type"], "cpx41");
@@ -1101,7 +1107,7 @@ mod tests {
             (t("cpx41"), "nbg1", now, Some(false)),
             (t("cpx41"), "nbg1", at("2025-11-01T00:00:00+00:00"), Some(true)), // before its date
             (t("cpx41"), "ash", now, Some(true)),
-            (t("cx33"), "nbg1", now, Some(true)), // sold out right now: still sold there (capacity)
+            (t("cx33"), "nbg1", now, Some(true)), // low on stock right now: still sold there (capacity)
             (t("cpx22"), "nbg1", now, Some(true)), // announced, still sold
             // Older answers: no `locations`, a price per location sold in.
             (json!({"name": "cx22", "prices": [{"location": "nbg1"}], "deprecation": null}), "nbg1", now, Some(true)),
@@ -1128,24 +1134,24 @@ mod tests {
         assert_eq!(flags(&json!({"name": "cx22", "locations": [{"name": "nbg1", "deprecation": null}]}), "nbg1"), (None, None));
     }
 
-    /// When to list the types, and which: sold there, not retiring, not sold out right now (when
-    /// the answer says), Hetzner's recommended ones first. Pure.
+    /// When to list the types, and which: sold there and not retiring; Hetzner's recommended ones
+    /// first, the ones it marks `available: false` there last, tagged `low availability`. Pure.
     #[test]
     fn type_advice_lists_the_types_on_sale_there() {
         let types: Vec<Value> = serde_json::from_str::<Value>(SERVER_TYPES).unwrap()["server_types"].as_array().unwrap().clone();
         let now = u64::try_from(crate::reap::parse_rfc3339("2026-10-16T00:00:00+00:00").unwrap()).unwrap();
-        let sold = "cpx42 (8 vCPU, 16 GB), cx23 (2 vCPU, 4 GB), cax11 (2 vCPU, 4 GB, arm)";
+        let sold = "cpx42 (8 vCPU, 16 GB), cx23 (2 vCPU, 4 GB), cax11 (2 vCPU, 4 GB, arm), cx33 (4 vCPU, 8 GB, low availability)";
         let cases: &[(&str, Option<&str>, Option<String>)] = &[
             ("cx23", Some("nbg1"), None),
             ("cpx22", Some("nbg1"), None), // retiring, still orderable: not this create's problem
-            ("cx33", Some("nbg1"), None),  // sold out there right now: capacity, which a retry may get
+            ("cx33", Some("nbg1"), None),  // low on stock there right now: capacity, which a retry may get
             ("cx23", Some("hel1"), None),
             ("114", Some("nbg1"), None),   // by id
             ("cpx41", Some("nbg1"), Some(format!("server type `cpx41` can't be ordered in nbg1; available there: {sold} — pass --server-type <one of those> (or set HETZNER_SERVER_TYPE), or pick another HETZNER_LOCATION"))),
             ("cpx99", Some("nbg1"), Some(format!("Hetzner has no server type `cpx99`; available there: {sold} — pass --server-type <one of those> (or set HETZNER_SERVER_TYPE), or pick another HETZNER_LOCATION"))),
             ("cx23", Some("ash"), Some("server type `cx23` can't be ordered in ash; available there: cpx41 (8 vCPU, 16 GB), ccx13 (2 vCPU, 8 GB) — pass --server-type <one of those> (or set HETZNER_SERVER_TYPE), or pick another HETZNER_LOCATION".into())),
-            // hel1: both free ones are recommended (live); the sold-out cx23 and cx33 aren't offered.
-            ("cpx41", Some("hel1"), Some("server type `cpx41` can't be ordered in hel1; available there: cpx42 (8 vCPU, 16 GB), cax11 (2 vCPU, 4 GB, arm) — pass --server-type <one of those> (or set HETZNER_SERVER_TYPE), or pick another HETZNER_LOCATION".into())),
+            // hel1: both free ones are recommended (live), and come first; the low-on-stock cx23 and cx33 last, tagged.
+            ("cpx41", Some("hel1"), Some("server type `cpx41` can't be ordered in hel1; available there: cpx42 (8 vCPU, 16 GB), cax11 (2 vCPU, 4 GB, arm), cx23 (2 vCPU, 4 GB, low availability), cx33 (4 vCPU, 8 GB, low availability) — pass --server-type <one of those> (or set HETZNER_SERVER_TYPE), or pick another HETZNER_LOCATION".into())),
             ("cx23", Some("hil"), Some("server type `cx23` can't be ordered in hil, and Hetzner lists no type there (`arena api get hetzner server_types`) — pick another HETZNER_LOCATION".into())),
             ("cpx41", None, None),
             ("cpx99", None, Some("Hetzner has no server type `cpx99` (`arena api get hetzner server_types` lists them)".into())),
@@ -1155,13 +1161,17 @@ mod tests {
         }
         // An answer that doesn't say (no locations, no prices): nothing claimed.
         assert_eq!(type_advice(&[json!({"name": "cx23"})], "cx23", Some("nbg1"), now), None);
-        // Every type sold there sold out right now: said, not "no type there".
-        let sold_out = [json!({"name": "cx33", "locations": [{"name": "nbg1", "deprecation": null, "available": false, "recommended": false}]})];
+        // Every type sold there low on stock: still listed (one may go through), each tagged — a
+        // bare name too.
+        let low = [
+            json!({"name": "cx33", "locations": [{"name": "nbg1", "deprecation": null, "available": false, "recommended": false}]}),
+            json!({"name": "cx23", "cores": 2, "memory": 4, "locations": [{"name": "nbg1", "deprecation": null, "available": false, "recommended": true}]}),
+        ];
         assert_eq!(
-            type_advice(&sold_out, "cpx41", Some("nbg1"), now).as_deref(),
+            type_advice(&low, "cpx41", Some("nbg1"), now).as_deref(),
             Some(
-                "Hetzner has no server type `cpx41`, and every type sold there is sold out right now (`arena api get hetzner \
-                 server_types`) — try again later, or pick another HETZNER_LOCATION"
+                "Hetzner has no server type `cpx41`; available there: cx23 (2 vCPU, 4 GB, low availability), cx33 (low availability) \
+                 — pass --server-type <one of those> (or set HETZNER_SERVER_TYPE), or pick another HETZNER_LOCATION"
             )
         );
         // An older answer without the flags: offered as before.
