@@ -381,6 +381,20 @@ fn parse_probe(stdout: &str, m: &mut PodMetrics) {
     }
 }
 
+/// The probe's remote command for `opts` — what [`fetch_with`] runs; `pods ask` runs it inside
+/// its own one-call bundle (`crate::ask::bundle`).
+pub fn probe_command(opts: &ProbeOpts) -> String {
+    remote_command(opts)
+}
+
+/// What [`probe_command`] printed, read into a [`PodMetrics`]: anything missing or odd stays
+/// `None` (never an error — a partial reply still says what it can).
+pub fn parse_probe_output(stdout: &str) -> PodMetrics {
+    let mut m = PodMetrics::default();
+    parse_probe(stdout, &mut m);
+    m
+}
+
 /// Probe a pod over `remote` in one round-trip, within [`PROBE_TIMEOUT`]. Never fails the
 /// caller — a connection error or a timeout is recorded in `PodMetrics::error` so one down
 /// (or wedged) pod doesn't sink a whole-fleet sweep.

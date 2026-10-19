@@ -414,10 +414,21 @@ pub fn read_command(job: Option<&JobId>, from: Option<u64>) -> String {
 }
 
 fn read_script(job: Option<&JobId>, from: Option<u64>) -> String {
+    read_script_capped(job, from, LOG_READ_CAP)
+}
+
+/// The newest job's status and the last `cap` bytes of its log ([`read_command`] for a quick
+/// look — `pods ask` wants a few dozen lines, not [`LOG_READ_CAP`]); read by [`parse_read`].
+/// `cap` is at most [`LOG_READ_CAP`].
+pub fn read_tail_command(cap: u64) -> String {
+    sh_c(&read_script_capped(None, None, cap.min(LOG_READ_CAP)))
+}
+
+fn read_script_capped(job: Option<&JobId>, from: Option<u64>, cap: u64) -> String {
     let script = READ
         .replace("@ID@", job.map_or("", JobId::as_str))
         .replace("@FROM@", &from.map(|f| f.to_string()).unwrap_or_default())
-        .replace("@CAP@", &LOG_READ_CAP.to_string());
+        .replace("@CAP@", &cap.to_string());
     format!("{PRELUDE}{script}")
 }
 
@@ -1680,5 +1691,30 @@ mod tests {
         let k = id("20261008-142302-slow");
         let e = parse_started(&pod.run(&start_command(&k, "true", None)), &k).unwrap_err();
         assert!(e.contains("may have started anyway: check `arena pods jobs` before retrying"), "{e}");
+    }
+
+    /// `read_tail_command`: the newest job's status and only the last `cap` bytes of its log —
+    /// what `pods ask` reads — through the same script as `pods logs`, so `parse_read` and
+    /// `snapshot_lines` take it as they are.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_tail_reads_the_newest_jobs_last_bytes() {
+        let Some(pod) = LocalPod::new("tail") else { return };
+        let old = pod.fake_job(&id("20261008-142301-old"), None);
+        std::fs::write(old.join("log"), "old\n").unwrap();
+        let new = pod.fake_job(&id("20261008-142302-new"), Some("999999"));
+        let log: String = (1..=100).map(|i| format!("line {i:03}\n")).collect();
+        std::fs::write(new.join("log"), &log).unwrap();
+        let cmd = read_tail_command(64);
+        assert!(cmd.contains("cap=64"), "{cmd}");
+        let ReadReply::Job { info, chunk } = parse_read(&pod.run(&cmd)).unwrap() else { panic!() };
+        assert_eq!(info.id, id("20261008-142302-new"));
+        assert_eq!((chunk.start, chunk.size, chunk.bytes.len()), (log.len() as u64 - 64, log.len() as u64, 64));
+        let (lines, cut) = snapshot_lines(&chunk, 40);
+        assert_eq!(lines.last().map(String::as_str), Some("line 100"));
+        assert_eq!(lines.len(), 7, "a window starting mid-line drops that line: {lines:?}");
+        assert!(cut, "older lines were cut by the cap");
+        // Never more than a full read's cap.
+        assert!(read_tail_command(u64::MAX).contains(&format!("cap={LOG_READ_CAP}")));
     }
 }

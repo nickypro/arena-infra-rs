@@ -8,6 +8,7 @@
 pub mod apiextra;
 pub mod archive;
 pub mod apiget;
+pub mod ask;
 pub mod apikeys;
 pub mod backup;
 pub mod balance;

@@ -165,6 +165,33 @@ pub async fn run_local(program: &str, args: &[String], what: &str, timeout: Opti
     output_within(c, what, timeout).await
 }
 
+/// A local program for [`run_local_input`]: what it is, where it runs, what it reads.
+#[derive(Debug, Clone, Copy)]
+pub struct LocalRun<'a> {
+    pub program: &'a std::path::Path,
+    pub args: &'a [String],
+    /// Its working directory.
+    pub cwd: &'a std::path::Path,
+    /// The `PATH` it gets (`None`: this process's own).
+    pub path: Option<&'a std::ffi::OsStr>,
+    /// What it reads on stdin, then end of file.
+    pub input: &'a [u8],
+}
+
+/// [`run_local`] for a program that takes its input on stdin — `pods ask`'s `claude`/`codex`
+/// (a prompt never goes in argv, where `ps` would show it to every user of the machine).
+/// `input` is written while the output is read, so a large prompt can't deadlock on a full
+/// pipe; a child that exits without reading it all has given its answer, which is not an
+/// error here. Same budget and SIGTERM-then-SIGKILL stop as [`run_local`].
+pub async fn run_local_input(run: &LocalRun<'_>, what: &str, timeout: Option<Duration>) -> Result<SshOutput> {
+    let mut c = Command::new(run.program);
+    c.args(run.args).current_dir(run.cwd).stdin(Stdio::piped()).kill_on_drop(true);
+    if let Some(path) = run.path {
+        c.env("PATH", path);
+    }
+    output_feeding(c, Some(run.input.to_vec()), what, timeout).await
+}
+
 /// A child process that can't wedge on a prompt (stdin closed) and dies with its future
 /// (`kill_on_drop`) — the property the per-step timeouts depend on.
 fn child(program: &str) -> Command {
@@ -182,11 +209,28 @@ pub const TERM_GRACE: Duration = Duration::from_secs(2);
 /// Run `cmd` to completion (capturing stdout/stderr) within `timeout`. On timeout the child
 /// is stopped *before* this returns ([`Stopper::stop`]); if this future is dropped instead,
 /// [`Stopper`]'s `Drop` does it in the background.
-async fn output_within(mut cmd: Command, what: &str, timeout: Option<Duration>) -> Result<SshOutput> {
+async fn output_within(cmd: Command, what: &str, timeout: Option<Duration>) -> Result<SshOutput> {
+    output_feeding(cmd, None, what, timeout).await
+}
+
+/// [`output_within`], writing `input` to the child's stdin (piped by the caller) meanwhile.
+async fn output_feeding(mut cmd: Command, input: Option<Vec<u8>>, what: &str, timeout: Option<Duration>) -> Result<SshOutput> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let spawned = cmd.spawn().map_err(|e| Error::provider(format!("spawning {what}: {e}")))?;
+    let mut spawned = cmd.spawn().map_err(|e| Error::provider(format!("spawning {what}: {e}")))?;
+    let stdin = spawned.stdin.take();
+    let feed = async move {
+        if let (Some(mut pipe), Some(input)) = (stdin, input) {
+            use tokio::io::AsyncWriteExt;
+            let _ = pipe.write_all(&input).await;
+            let _ = pipe.shutdown().await;
+        }
+    };
     let mut child = Stopper(Some(spawned));
-    let result = within(what, timeout, child.output(what)).await;
+    let result = within(what, timeout, async {
+        let ((), out) = tokio::join!(feed, child.output(what));
+        out
+    })
+    .await;
     if result.is_err() {
         // Timed out (or the wait itself failed): finish the stop here, not in a detached
         // task. The caller often returns at once — a wedged pod's rsync is usually a
