@@ -3683,7 +3683,10 @@ async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::path::Path, 
             apply_cron_change(&current, &before, &after, &[], dry_run, yes, crontab).await.map(|_| ())
         }
         CronCmd::Install { backup, schedule, start_date, no_start_date, pull, no_pull, proxy, snapshot, archive, reap, dry_run } => {
-            let home = &cron_home(home, effective_uid()?)?;
+            // Once, before anything is written: the tidy after the write uses it too, so nothing
+            // can fail once the crontab is in (review ai-review claude #10).
+            let euid = effective_uid()?;
+            let home = &cron_home(home, euid)?;
             let exe = std::env::current_exe().context("finding the arena executable path")?;
             let cfg_abs = std::fs::canonicalize(config_path)
                 .unwrap_or_else(|_| config_path.to_path_buf());
@@ -3817,7 +3820,7 @@ async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::path::Path, 
             if apply_cron_change(&current, &before, &after, &notes, dry_run, yes, crontab).await? {
                 // Only once it's written: until then, the old lines still use their old files.
                 let plan = tidy_plan(&kinds, &before, &after, home, &with_arena_block(&current, &after));
-                if let Some(line) = tidy_line(&tidy_old_cron_files(&plan, home, effective_uid()?)) {
+                if let Some(line) = tidy_line(&tidy_old_cron_files(&plan, home, euid)) {
                     println!("{line}");
                 }
             }
@@ -3901,6 +3904,11 @@ fn cron_home(home: Option<&str>, euid: u32) -> Result<String> {
 /// read a user as uid 0. No libc call: no new crate.
 fn effective_uid() -> Result<u32> {
     use std::os::unix::fs::MetadataExt;
+    #[cfg(test)]
+    if let Some(left) = EUID_ANSWERS.with(std::cell::Cell::get) {
+        anyhow::ensure!(left > 0, "the effective uid can't be read (a test's)");
+        EUID_ANSWERS.with(|n| n.set(Some(left - 1)));
+    }
     if let Some(uid) = created_file_owner(&std::env::temp_dir()) {
         return Ok(uid);
     }
@@ -3909,6 +3917,14 @@ fn effective_uid() -> Result<u32> {
     }
     let out = std::process::Command::new("id").arg("-u").output().context("running `id -u`")?;
     String::from_utf8_lossy(&out.stdout).trim().parse().context("reading the effective uid from `id -u`")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Under test: how many more times [`effective_uid`] answers before it fails (`None`: it always
+    /// answers) — so a test can make any read after the first fail. A `#[tokio::test]` runs the
+    /// command on its own thread, so this is that test's.
+    static EUID_ANSWERS: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
 /// The owner of a file created new in `dir` (`create_new`, so never someone else's file), read
@@ -18942,6 +18958,26 @@ mod tests {
         // Nowhere to make one: no answer (effective_uid falls back to /proc/self, then `id -u`).
         assert_eq!(created_file_owner(&base.join("missing")), None);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Review ai-review claude #10: `cron install` read the effective uid a second time for the
+    /// tidy, after it had written the crontab — a failure there reported the install as failed
+    /// once it was in, and the operator re-ran or rolled back for nothing. Now it's read once,
+    /// before anything is written: with every read after the first failing, the install goes
+    /// through and says nothing failed; with the first failing, nothing is written.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cron_install_reads_the_uid_once_before_it_writes_the_crontab() {
+        let s = CronStub::new("euid-once");
+        super::EUID_ANSWERS.with(|n| n.set(Some(0)));
+        let refused = s.run_as(&["install", "--pull", "--start-date", "2026-01-05"], true, Some(&s.home)).await;
+        assert!(refused.unwrap_err().to_string().contains("the effective uid can't be read"));
+        assert_eq!(s.tab(), "", "nothing written");
+        super::EUID_ANSWERS.with(|n| n.set(Some(1)));
+        s.run(&["install", "--pull", "--start-date", "2026-01-05"]).await;
+        assert_eq!(super::EUID_ANSWERS.with(std::cell::Cell::get), Some(0), "read once");
+        assert_eq!(s.lines().len(), 1, "{}", s.tab());
+        super::EUID_ANSWERS.with(|n| n.set(None));
     }
 
     /// The backup line a (re-)install writes: each option from its flag, else the installed
