@@ -256,37 +256,58 @@ pub fn redact_sed() -> String {
 pub const NO_BYPASS_URL_SH: &str = "no_bypass_url() { LC_ALL=C grep -viE 'https?://[^ ]*(unblock|bypass|secret-scanning)' || true; }";
 
 /// `busy_op <git dir>`, run from the checkout's top: what is in progress there that a commit or a
-/// branch switch would end — `merge`, `cherry-pick` or `revert` (its `*_HEAD` file, conflicts
-/// resolved or not), else `conflicts` (unmerged paths and none of those: a `git stash pop` that
-/// conflicted) — or nothing. A rebase detaches HEAD, which the backup already skips. Shared by
-/// the backup script (`BUSY`, [`BACKUP_BUSY_EXIT`]) and the switches that refuse to end one
-/// ([`checkout_command`]'s gentle switch, [`init_branch_command`]).
-pub const BUSY_OP_SH: &str = "busy_op() { if [ -e \"$1/MERGE_HEAD\" ]; then echo merge; elif [ -e \"$1/CHERRY_PICK_HEAD\" ]; then echo cherry-pick; \
-     elif [ -e \"$1/REVERT_HEAD\" ]; then echo revert; elif [ -n \"$(git ls-files -u | head -n 1)\" ]; then echo conflicts; fi; }";
+/// branch switch would end — `merge`, `cherry-pick` or `revert` (its `*_HEAD` file), followed by
+/// ` unmerged` while the index still has unmerged paths (conflicts not yet resolved and added),
+/// else `conflicts` (unmerged paths and none of those: a `git stash pop` that conflicted) — or
+/// nothing. The `unmerged` word lets the words name conflicts only when there are some, and give
+/// the step git wants first (review F4: a merge whose conflicts are all staged, a clean `git merge
+/// --no-commit` or `git revert -n` has none; with some, `git commit` is refused until they're
+/// added). A rebase detaches HEAD, which the backup already skips. Shared by the backup script
+/// (`BUSY`, [`BACKUP_BUSY_EXIT`]) and the switches that refuse to end one ([`checkout_command`]'s
+/// gentle switch, [`init_branch_command`]).
+pub const BUSY_OP_SH: &str = "busy_op() { if [ -n \"$(git ls-files -u | head -n 1)\" ]; then busy_u=' unmerged'; else busy_u=; fi; \
+     if [ -e \"$1/MERGE_HEAD\" ]; then echo \"merge$busy_u\"; elif [ -e \"$1/CHERRY_PICK_HEAD\" ]; then echo \"cherry-pick$busy_u\"; \
+     elif [ -e \"$1/REVERT_HEAD\" ]; then echo \"revert$busy_u\"; elif [ -n \"$busy_u\" ]; then echo conflicts; fi; }";
 
-/// Every word [`BUSY_OP_SH`] prints.
-const BUSY_KINDS: [&str; 4] = ["merge", "cherry-pick", "revert", "conflicts"];
+/// Every line [`BUSY_OP_SH`] prints, as `(what, unmerged)`: each operation with its conflicts
+/// resolved or not, and `conflicts` (unmerged by definition).
+const BUSY_LINES: [(&str, bool); 7] =
+    [("merge", false), ("merge", true), ("cherry-pick", false), ("cherry-pick", true), ("revert", false), ("revert", true), ("conflicts", true)];
 
-/// What is in progress on `branch` (`BUSY <branch> <what>`), in words: what it is, and how to end
-/// it either way — for a merge on `b`, "a merge is in progress on b" and "finish it (`git commit`)
-/// or abort it (`git merge --abort`)". Both, since only the participant knows which they want.
-pub fn busy_words(what: &str, branch: &str) -> (String, String) {
-    let op = |finish: &str, abort: &str| {
-        (format!("a {what} is in progress on {branch}"), format!("finish it (`{finish}`) or abort it (`{abort}`)"))
-    };
+/// What is in progress on `branch` (`what`: [`BUSY_OP_SH`]'s word), in words: "a merge is in
+/// progress on b", "b has unresolved conflicts".
+pub fn busy_situation(what: &str, branch: &str) -> String {
     match what {
-        "merge" => op("git commit", "git merge --abort"),
-        "cherry-pick" => op("git cherry-pick --continue", "git cherry-pick --abort"),
-        "revert" => op("git revert --continue", "git revert --abort"),
-        "conflicts" => (
-            format!("{branch} has unresolved conflicts"),
-            "resolve them (fix the files, then `git add` them) or undo them (`git reset --merge`)".to_string(),
-        ),
-        _ => (format!("a git operation ({what}) is in progress on {branch}"), "finish it or abort it".to_string()),
+        "merge" | "cherry-pick" | "revert" => format!("a {what} is in progress on {branch}"),
+        "conflicts" => format!("{branch} has unresolved conflicts"),
+        _ => format!("a git operation ({what}) is in progress on {branch}"),
     }
 }
 
-/// [`busy_words`]' operation as the object of a sentence: `the merge`, `the unresolved conflicts`.
+/// How to end an operation in progress either way — since only the participant knows which they
+/// want — with the step git asks for first: while paths are `unmerged`, `git commit` (or
+/// `--continue`) is refused until they're resolved and added (review F4), so that comes first.
+/// A merge: "finish it (`git commit`) or abort it (`git merge --abort`)", or with unmerged paths
+/// "resolve the conflicts and `git add` them, then `git commit` — or abort it (`git merge
+/// --abort`)". A `git stash pop`'s conflicts have nothing to commit or continue: resolve and add
+/// them, or undo them.
+pub fn busy_advice(what: &str, unmerged: bool) -> String {
+    let (finish, abort) = match what {
+        "merge" => ("git commit", "git merge --abort"),
+        "cherry-pick" => ("git cherry-pick --continue", "git cherry-pick --abort"),
+        "revert" => ("git revert --continue", "git revert --abort"),
+        "conflicts" => return "resolve them and `git add` them, or undo them (`git reset --merge`)".to_string(),
+        _ => return "finish it or abort it".to_string(),
+    };
+    if unmerged {
+        format!("resolve the conflicts and `git add` them, then `{finish}` — or abort it (`{abort}`)")
+    } else {
+        format!("finish it (`{finish}`) or abort it (`{abort}`)")
+    }
+}
+
+/// [`busy_situation`]'s operation as the object of a sentence: `the merge`, `the unresolved
+/// conflicts`.
 pub fn busy_noun(what: &str) -> String {
     match what {
         "conflicts" => "the unresolved conflicts".to_string(),
@@ -294,24 +315,39 @@ pub fn busy_noun(what: &str) -> String {
     }
 }
 
+/// What a backup's commit would do now, mid-operation: commit the operation's state — its
+/// conflicts named only when there are unmerged paths (a merge with its conflicts staged, a clean
+/// `git revert -n`, has no conflict markers to commit: review F4) — and end it.
+fn busy_would(what: &str, unmerged: bool) -> String {
+    match what {
+        "conflicts" => "a backup now would commit the conflicted files as they are".to_string(),
+        _ if unmerged => format!("a backup now would commit the {what}'s state, unresolved conflicts and all, and end {}", busy_noun(what)),
+        _ => format!("a backup now would commit the {what}'s state and end {}", busy_noun(what)),
+    }
+}
+
 /// A branch switch's first step (`who` names it on stderr: `arena set-branch`), from the checkout's
 /// top: while an operation is in progress ([`BUSY_OP_SH`]) it refuses — what is in progress and how
-/// to end it ([`busy_words`]) on stderr, exit [`BACKUP_BUSY_EXIT`] — before anything is touched.
-/// Checked with real git, mid-merge: `git checkout -b` (init-branches) succeeds and drops
-/// `MERGE_HEAD`, leaving the conflicted index on the new branch with no merge to abort; a gentle
-/// `git checkout` refuses unmerged paths but silently ends a merge whose conflicts are resolved
-/// and staged, carrying them onto the other branch. `--hard` doesn't run this: it discards local
-/// changes by design, the operation with them.
+/// to end it ([`busy_situation`], [`busy_advice`]) on stderr, exit [`BACKUP_BUSY_EXIT`] — before
+/// anything is touched. Checked with real git, mid-merge: `git checkout -b` (init-branches)
+/// succeeds and drops `MERGE_HEAD`, leaving the conflicted index on the new branch with no merge to
+/// abort; a gentle `git checkout` refuses unmerged paths but silently ends a merge whose conflicts
+/// are resolved and staged, carrying them onto the other branch. `--hard` doesn't run this: it
+/// discards uncommitted changes to tracked files by design, the operation with them.
 fn busy_refusal_sh(who: &str) -> String {
-    let cases: String = BUSY_KINDS
+    let cases: String = BUSY_LINES
         .iter()
-        .map(|what| {
-            let (situation, advice) = busy_words(what, "@BRANCH@");
-            let why = if *what == "conflicts" { String::new() } else { format!(" (a switch now would end {})", busy_noun(what)) };
-            let msg = format!("{who}: {situation} — not switched{why}; {advice} on the pod, then switch again");
+        .map(|&(what, unmerged)| {
+            let why = if what == "conflicts" { String::new() } else { format!(" (a switch now would end {})", busy_noun(what)) };
+            let msg = format!(
+                "{who}: {} — not switched{why}; {} on the pod, then switch again",
+                busy_situation(what, "@BRANCH@"),
+                busy_advice(what, unmerged)
+            );
             // The branch as the shell knows it, outside the quotes: the words never are code.
             let shell = msg.split("@BRANCH@").map(shell_quote).collect::<Vec<_>>().join("\"$BUSY_B\"");
-            format!("{what}) printf '%s\\n' {shell} >&2;; ")
+            let printed = if unmerged && what != "conflicts" { format!("{what} unmerged") } else { what.to_string() };
+            format!("{}) printf '%s\\n' {shell} >&2;; ", shell_quote(&printed))
         })
         .collect();
     format!(
@@ -489,6 +525,9 @@ pub struct BackupReport {
     /// What is in progress on the branch (`BUSY <branch> <what>`: `merge`, `cherry-pick`, `revert`
     /// or `conflicts`), so nothing was staged, committed or pushed.
     pub busy: Option<String>,
+    /// The index has unmerged paths — conflicts not yet resolved and added (`BUSY`'s `unmerged`
+    /// word; always so for `conflicts`).
+    pub unmerged: bool,
 }
 
 /// Parse a backup's stdout ([`backup_script`]'s header lists the lines). Unknown lines (git's
@@ -523,8 +562,9 @@ pub fn parse_backup_report(stdout: &str) -> BackupReport {
             }
             "HEAL_ABORTED" => r.heal_aborted = Some(rest.trim().to_string()),
             "BUSY" => {
-                if let [branch, what, ..] = rest.split_whitespace().collect::<Vec<_>>()[..] {
+                if let [branch, what, ref more @ ..] = rest.split_whitespace().collect::<Vec<_>>()[..] {
                     r.busy = Some(what.to_string());
+                    r.unmerged = what == "conflicts" || more.contains(&"unmerged");
                     r.branch.get_or_insert_with(|| branch.to_string());
                 }
             }
@@ -622,11 +662,8 @@ impl BackupReport {
             return Some(format!("{why} — not backed up to git; run `arena pods setup {pod}`"));
         }
         if let Some(what) = self.in_progress(code) {
-            let (situation, advice) = busy_words(what, self.branch.as_deref().unwrap_or("its branch"));
-            let would = match what {
-                "conflicts" => "a backup now would commit their conflict markers".to_string(),
-                _ => format!("a backup now would commit its conflict markers and end {}", busy_noun(what)),
-            };
+            let situation = busy_situation(what, self.branch.as_deref().unwrap_or("its branch"));
+            let (would, advice) = (busy_would(what, self.unmerged), busy_advice(what, self.unmerged));
             return Some(format!("{situation} — not committed ({would}); {advice} on the pod"));
         }
         if code == Some(BACKUP_STUCK_EXIT) {
@@ -668,8 +705,8 @@ impl BackupReport {
             return Some(why);
         }
         if let Some(what) = self.in_progress(code) {
-            let (situation, advice) = busy_words(what, self.branch.as_deref().unwrap_or("its branch"));
-            return Some(format!("{situation} — not committed; {advice} on the pod"));
+            let situation = busy_situation(what, self.branch.as_deref().unwrap_or("its branch"));
+            return Some(format!("{situation} — not committed; {} on the pod", busy_advice(what, self.unmerged)));
         }
         if code == Some(BACKUP_STUCK_EXIT) && !self.big_stuck.is_empty() {
             return Some(format!("file(s) over {} MB in unpushed commits", GITHUB_FILE_LIMIT_BYTES / (1024 * 1024)));
@@ -2703,38 +2740,74 @@ done
         assert!(s.contains("ORIGIN=${6:-}"));
     }
 
-    /// `BUSY <branch> <what>`: what is in progress, said with how to end it either way — the
-    /// verbs of the operation it is — and a failure at the push (the pod is copied instead).
+    /// `BUSY <branch> <what> [unmerged]`: what is in progress, said with how to end it either way —
+    /// the verbs of the operation it is — and a failure at the push (the pod is copied instead).
+    /// Review F4: conflicts are named only when there are unmerged paths (a merge whose conflicts
+    /// are staged, a clean `git revert -n`, has no markers to commit), and then the advice starts
+    /// with resolving and adding them — git refuses `git commit` / `--continue` until then. Every
+    /// variant's words, pinned.
     #[test]
     fn the_busy_line_says_whats_in_progress_and_how_to_end_it() {
         let code = Some(BACKUP_BUSY_EXIT);
-        let r = parse_backup_report("BRANCH autocommit-x\nBUSY autocommit-x merge\n");
-        assert_eq!((r.busy.as_deref(), r.branch.as_deref(), r.outcome.clone()), (Some("merge"), Some("autocommit-x"), None));
+        let r = parse_backup_report("BRANCH autocommit-x\nBUSY autocommit-x merge unmerged\n");
+        assert_eq!((r.busy.as_deref(), r.unmerged, r.branch.as_deref(), r.outcome.clone()), (Some("merge"), true, Some("autocommit-x"), None));
         assert!(r.failed_at_push(), "copied instead, like a failed push");
         assert_eq!((r.in_progress(code), r.in_progress(Some(1)), r.in_progress(Some(0))), (Some("merge"), None, None));
         assert_eq!(
-            r.failure("/root/ARENA_materials", "devtest-bloom", code).unwrap(),
-            "a merge is in progress on autocommit-x — not committed (a backup now would commit its conflict markers and end the \
-             merge); finish it (`git commit`) or abort it (`git merge --abort`) on the pod"
-        );
-        assert_eq!(
             r.failure_brief(code).unwrap(),
-            "a merge is in progress on autocommit-x — not committed; finish it (`git commit`) or abort it (`git merge --abort`) on \
-             the pod"
+            "a merge is in progress on autocommit-x — not committed; resolve the conflicts and `git add` them, then `git commit` \
+             — or abort it (`git merge --abort`) on the pod"
         );
         assert_eq!((r.failure("/r", "p", Some(1)), r.failure_brief(Some(1))), (None, None), "only with its own exit");
-        let said = |out: &str| parse_backup_report(out).failure("/r", "p", code).unwrap();
-        assert_eq!(
-            said("BUSY autocommit-x cherry-pick\n"),
-            "a cherry-pick is in progress on autocommit-x — not committed (a backup now would commit its conflict markers and \
-             end the cherry-pick); finish it (`git cherry-pick --continue`) or abort it (`git cherry-pick --abort`) on the pod"
-        );
-        assert!(said("BUSY b revert\n").ends_with("finish it (`git revert --continue`) or abort it (`git revert --abort`) on the pod"));
-        assert_eq!(
-            said("BRANCH b\nBUSY b conflicts\n"),
-            "b has unresolved conflicts — not committed (a backup now would commit their conflict markers); resolve them (fix \
-             the files, then `git add` them) or undo them (`git reset --merge`) on the pod"
-        );
+        // (the BUSY line, the whole failure line)
+        let cases: &[(&str, &str)] = &[
+            (
+                "BUSY b merge unmerged",
+                "a merge is in progress on b — not committed (a backup now would commit the merge's state, unresolved conflicts \
+                 and all, and end the merge); resolve the conflicts and `git add` them, then `git commit` — or abort it (`git \
+                 merge --abort`) on the pod",
+            ),
+            (
+                "BUSY b merge",
+                "a merge is in progress on b — not committed (a backup now would commit the merge's state and end the merge); \
+                 finish it (`git commit`) or abort it (`git merge --abort`) on the pod",
+            ),
+            (
+                "BUSY b cherry-pick unmerged",
+                "a cherry-pick is in progress on b — not committed (a backup now would commit the cherry-pick's state, unresolved \
+                 conflicts and all, and end the cherry-pick); resolve the conflicts and `git add` them, then `git cherry-pick \
+                 --continue` — or abort it (`git cherry-pick --abort`) on the pod",
+            ),
+            (
+                "BUSY b cherry-pick",
+                "a cherry-pick is in progress on b — not committed (a backup now would commit the cherry-pick's state and end the \
+                 cherry-pick); finish it (`git cherry-pick --continue`) or abort it (`git cherry-pick --abort`) on the pod",
+            ),
+            (
+                "BUSY b revert unmerged",
+                "a revert is in progress on b — not committed (a backup now would commit the revert's state, unresolved conflicts \
+                 and all, and end the revert); resolve the conflicts and `git add` them, then `git revert --continue` — or abort \
+                 it (`git revert --abort`) on the pod",
+            ),
+            (
+                "BUSY b revert",
+                "a revert is in progress on b — not committed (a backup now would commit the revert's state and end the revert); \
+                 finish it (`git revert --continue`) or abort it (`git revert --abort`) on the pod",
+            ),
+            (
+                "BUSY b conflicts",
+                "b has unresolved conflicts — not committed (a backup now would commit the conflicted files as they are); resolve \
+                 them and `git add` them, or undo them (`git reset --merge`) on the pod",
+            ),
+        ];
+        for (line, want) in cases {
+            let r = parse_backup_report(&format!("BRANCH b\n{line}\n"));
+            assert_eq!(r.failure("/r", "p", code).unwrap(), *want, "{line}");
+            assert!(!r.failure("/r", "p", code).unwrap().contains("conflict markers"), "{line}");
+        }
+        // A conflicts line is unmerged by definition; an unknown word after the operation isn't.
+        assert!(parse_backup_report("BUSY b conflicts\n").unmerged);
+        assert!(!parse_backup_report("BUSY b merge later\n").unmerged);
         // The branch from the BUSY line when no BRANCH came first; a line without its word is no BUSY.
         assert_eq!(parse_backup_report("BUSY feature merge\n").branch.as_deref(), Some("feature"));
         assert_eq!(parse_backup_report("BUSY feature\n").busy, None);
@@ -2818,14 +2891,22 @@ done
             let pushed = origin_ref();
             let (code, out, err) = s.backup_raw();
             assert_eq!(code, Some(BACKUP_BUSY_EXIT), "{what}: {out}{err}");
-            assert_eq!(out, format!("BRANCH autocommit-x\nBUSY autocommit-x {what}\n"), "{what}: nothing else done");
+            // Conflicted, so `unmerged` after an operation's word (a stash pop's conflicts are that already).
+            let printed = if *what == "conflicts" { what.to_string() } else { format!("{what} unmerged") };
+            assert_eq!(out, format!("BRANCH autocommit-x\nBUSY autocommit-x {printed}\n"), "{what}: nothing else done");
             assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), before.0, "{what}: nothing committed");
             assert_eq!(s.git(&s.work, &["status", "--porcelain"]), during, "{what}: nothing staged");
             assert_eq!(origin_ref(), pushed, "{what}: nothing pushed");
             if let Some(f) = head_file {
                 assert!(s.work.join(".git").join(f).exists(), "{what}: {f} gone");
             }
-            assert!(parse_backup_report(&out).failure("/r", "p", code).unwrap().contains(&abort.join(" ")), "{what}: says how to abort");
+            let words = parse_backup_report(&out).failure("/r", "p", code).unwrap();
+            assert!(words.contains(&abort.join(" ")) && words.contains("`git add` them"), "{what}: says how to abort, and to add first: {words}");
+            if *what == "merge" {
+                // Why the words say to resolve and add first: git refuses the commit until then (review F4).
+                let (c, said) = git_failing(&s.work, &["commit", "--no-edit"]);
+                assert!(c != Some(0) && said.contains("unmerged"), "{said}");
+            }
             // The participant's way out still works, and brings back what they had.
             s.git(&s.work, abort);
             let after = (s.git(&s.work, &["rev-parse", "HEAD"]), s.read("README.md"), s.git(&s.work, &["status", "--porcelain"]));
@@ -2835,6 +2916,33 @@ done
             assert_eq!((code, r.outcome, r.busy), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into())), None), "{what}: {err}");
         }
         assert_eq!(s.git(&s.work, &["stash", "list"]).lines().count(), 1, "the conflicted stash is kept");
+
+        // Nothing unmerged, still in progress (review F4): a clean `git revert -n` (git 2.43 leaves
+        // REVERT_HEAD), and a conflicted merge whose conflicts are resolved and added. BUSY without
+        // `unmerged`, words that name no conflicts — and the way out they give works as said.
+        s.git(&s.work, &["revert", "-n", "HEAD"]);
+        assert!(s.work.join(".git/REVERT_HEAD").exists() && s.git(&s.work, &["ls-files", "-u"]).is_empty());
+        let (code, out, _) = s.backup_raw();
+        assert_eq!((code, out.as_str()), (Some(BACKUP_BUSY_EXIT), "BRANCH autocommit-x\nBUSY autocommit-x revert\n"));
+        assert_eq!(
+            parse_backup_report(&out).failure("/r", "p", code).unwrap(),
+            "a revert is in progress on autocommit-x — not committed (a backup now would commit the revert's state and end the \
+             revert); finish it (`git revert --continue`) or abort it (`git revert --abort`) on the pod"
+        );
+        s.git(&s.work, &["-c", "core.editor=true", "revert", "--continue"]);
+        assert_eq!(s.backup().1.outcome, Some((BACKUP_PUSHED, "autocommit-x".into())), "finished: backed up");
+        git_failing(&s.work, &["pull", "-q", "--no-rebase", "--no-edit", "upstream", "main"]);
+        std::fs::write(s.work.join("README.md"), "resolved\n").unwrap();
+        s.git(&s.work, &["add", "README.md"]);
+        let (code, out, _) = s.backup_raw();
+        assert_eq!((code, out.as_str()), (Some(BACKUP_BUSY_EXIT), "BRANCH autocommit-x\nBUSY autocommit-x merge\n"));
+        assert_eq!(
+            parse_backup_report(&out).failure("/r", "p", code).unwrap(),
+            "a merge is in progress on autocommit-x — not committed (a backup now would commit the merge's state and end the \
+             merge); finish it (`git commit`) or abort it (`git merge --abort`) on the pod"
+        );
+        s.git(&s.work, &["commit", "-q", "--no-edit"]);
+        assert_eq!(s.backup().1.outcome, Some((BACKUP_PUSHED, "autocommit-x".into())), "finished: backed up");
 
         // A merge that went through (no conflict, committed) is backed up like any commit.
         s.git(&course, &["checkout", "-q", "-b", "extra", "main~1"]);
@@ -2866,8 +2974,9 @@ done
         let mine = s.read("README.md");
         git_failing(&s.work, &["pull", "-q", "--no-rebase", "--no-edit", "upstream", "main"]);
         let during = s.git(&s.work, &["status", "--porcelain"]);
-        let merge = "a merge is in progress on autocommit-x — not switched (a switch now would end the merge); finish it (`git \
-                     commit`) or abort it (`git merge --abort`) on the pod, then switch again\n";
+        let merge = "a merge is in progress on autocommit-x — not switched (a switch now would end the merge); resolve the \
+                     conflicts and `git add` them, then `git commit` — or abort it (`git merge --abort`) on the pod, then switch \
+                     again\n";
         for (cmd, who) in [(checkout_command(repo, "main", None, false), "arena set-branch"), (init_branch_command(&cfg, "devtest-x"), "arena init-branches")] {
             let o = s.run(&cmd);
             let err = String::from_utf8_lossy(&o.stderr);
@@ -2882,7 +2991,16 @@ done
         std::fs::write(s.work.join("README.md"), "resolved\n").unwrap();
         s.git(&s.work, &["add", "README.md"]);
         let o = s.run(&checkout_command(repo, "main", None, false));
-        assert_eq!(o.status.code(), Some(BACKUP_BUSY_EXIT), "{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(
+            (o.status.code(), String::from_utf8_lossy(&o.stderr).into_owned()),
+            (
+                Some(BACKUP_BUSY_EXIT),
+                "arena set-branch: a merge is in progress on autocommit-x — not switched (a switch now would end the merge); \
+                 finish it (`git commit`) or abort it (`git merge --abort`) on the pod, then switch again\n"
+                    .to_string()
+            ),
+            "nothing unmerged now: the plain way to finish it"
+        );
         s.git(&s.work, &["merge", "--abort"]);
         assert_eq!((s.git(&s.work, &["rev-parse", "HEAD"]), s.read("README.md")), (head.clone(), mine), "aborted as if never switched");
 
@@ -2900,8 +3018,8 @@ done
             (o.status.code(), String::from_utf8_lossy(&o.stderr).into_owned()),
             (
                 Some(BACKUP_BUSY_EXIT),
-                "arena init-branches: autocommit-x has unresolved conflicts — not switched; resolve them (fix the files, then `git \
-                 add` them) or undo them (`git reset --merge`) on the pod, then switch again\n"
+                "arena init-branches: autocommit-x has unresolved conflicts — not switched; resolve them and `git add` them, or \
+                 undo them (`git reset --merge`) on the pod, then switch again\n"
                     .to_string()
             )
         );

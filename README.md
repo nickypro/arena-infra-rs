@@ -637,9 +637,14 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     backup committed the conflict markers as a merge commit and pushed it, after which `git
     merge --abort` and VS Code's conflict view no longer worked): nothing staged, committed or
     pushed (`BUSY`, exit 6), `✗ <pod>: a merge is in progress on <branch> — not committed (a
-    backup now would commit its conflict markers and end the merge); finish it (\`git commit\`)
-    or abort it (\`git merge --abort\`) on the pod` (a cherry-pick's or revert's own
-    `--continue`/`--abort`; conflicts: `git add` them or `git reset --merge`), and the run fails.
+    backup now would commit the merge's state, unresolved conflicts and all, and end the merge);
+    resolve the conflicts and \`git add\` them, then \`git commit\` — or abort it (\`git merge
+    --abort\`) on the pod`. Conflicts are named only while some are unresolved (git refuses the
+    commit until they're added); with none left (all resolved and added, or a clean `git merge
+    --no-commit` / `git revert -n`) it's `… commit the merge's state and end the merge); finish it
+    (\`git commit\`) or abort it (\`git merge --abort\`)`. A cherry-pick or a revert gets its own
+    `--continue`/`--abort`; a `git stash pop`'s conflicts `resolve them and \`git add\` them, or
+    undo them (\`git reset --merge\`)`. The run fails.
     It is rsynced like a failed push, even under `--no-pull`, every run until it's ended (the
     reaper doesn't reap it meanwhile); the backup after that commits as always. A rebase detaches
     HEAD, so it is skipped like `main`.
@@ -667,9 +672,11 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     an operation in progress (a merge, …: see `pods backup`) is copied first the same way, its
     line saying `⚠ NOT COMMITTED FIRST: a merge is in progress on <branch>…`; the gentle switch
     then refuses to end it (`arena set-branch: a merge is in progress on <branch> — not switched
-    (a switch now would end the merge); finish it … on the pod, then switch again`, exit 6 —
-    git's own checkout would drop a merge whose conflicts are staged), and `--hard` ends it with
-    the uncommitted changes it discards, its line saying only the copy has them. A file the
+    (a switch now would end the merge); <how to end it> on the pod, then switch again`, exit 6 —
+    git's own checkout would drop a merge whose conflicts are staged; the TUI's set-branch says
+    the same, naming `--hard` as the destructive way), and `--hard` ends it, discarding its
+    uncommitted changes to tracked files (untracked files stay), its line saying only the copy
+    has them. A file the
     backup committed with a key redacted keeps the real key on disk: around the switch it's set
     aside in `.git/arena-unredacted/<time>-<pid>/` (so gentle doesn't refuse it and `--hard`
     doesn't drop the key; a later set-aside never overwrites an earlier one) and put back when

@@ -8277,7 +8277,7 @@ async fn handle_set_branch(
     }
 
     if dry_run {
-        println!("{}\n", push_first_note(cfg));
+        println!("{}\n", push_first_note(cfg, hard));
         for (name, t) in &targets {
             println!("# {name}");
             println!("{}\n", t.display_command(&cmd));
@@ -8319,19 +8319,28 @@ async fn handle_set_branch(
 
 /// What a dry run of a branch switch says first: the push that comes before it — under each
 /// pod's backup lock, or, when none is taken, the one line that says so
-/// ([`switch_unlocked_line`]).
-fn push_first_note(cfg: &Config) -> String {
+/// ([`switch_unlocked_line`]) — and what happens to a pod with a merge in progress, which can't
+/// be committed first: copied too, then the gentle switch (and init-branches) refuses to end it,
+/// while `hard` (`--hard`) ends it with its uncommitted changes to tracked files (review F5: the
+/// note said every such pod "is copied … and then switched").
+fn push_first_note(cfg: &Config, hard: bool) -> String {
     let origin = arena_core::backup::configured_repo(cfg).map_or_else(String::new, |o| format!(", nor one whose origin isn't {o}"));
     let unlocked = switch_unlocked_line(cfg);
     let (under_lock, or_busy) = match unlocked {
         Some(_) => ("", ""),
         None => (" — under the pod's backup lock, held until its switch ends", ", or whose lock another backup holds,"),
     };
+    let busy = if hard {
+        "the --hard switch then ends it, discarding its uncommitted changes to tracked files (untracked files stay)"
+    } else {
+        "then NOT switched: the switch refuses to end it"
+    };
     let mut note = format!(
         "(first, each pod's current branch is backed up — the `pods backup --no-pull` commit + push, keys redacted{under_lock}; \
-         a pod whose push fails is copied into {} and then switched, its line saying so; a pod that can be neither pushed nor \
-         copied{or_busy} is NOT switched{origin})",
-        local_backup_dir(cfg)
+         a pod whose push fails is copied into {dir} and then switched, its line saying so; a pod with a merge (cherry-pick, \
+         revert, conflicts) in progress can't be committed: it is copied into {dir} too, and {busy}; a pod that can be neither \
+         pushed nor copied{or_busy} is NOT switched{origin})",
+        dir = local_backup_dir(cfg)
     );
     if let Some(line) = unlocked {
         note.push('\n');
@@ -8539,8 +8548,9 @@ async fn switch_batch(
 /// A pod with an operation in progress (`u.busy`: a merge, …) had nothing committed at all: its
 /// line says what is in progress instead of a push's failure. A gentle switch (and init-branches)
 /// refuses to end it, on the same line ([`arena_core::backup::checkout_command`]); `--hard`
-/// (`reset_onto` set) ends it and discards the uncommitted changes with it, which only the copy
-/// has then — said here.
+/// (`reset_onto` set) ends it and discards its uncommitted changes to tracked files with it, which
+/// only the copy has then — said here. Untracked files stay on the pod: `checkout -f` and `reset
+/// --hard` leave them (review F5).
 fn not_pushed_note(u: &Unpushed, copied_to: &str, reset_onto: Option<&str>) -> String {
     let branch = u.branch.as_deref().unwrap_or("the branch it was on");
     let commits = if reset_onto.is_some() && u.branch.as_deref() == reset_onto {
@@ -8549,10 +8559,11 @@ fn not_pushed_note(u: &Unpushed, copied_to: &str, reset_onto: Option<&str>) -> S
         "its commits stay on the pod in that branch (switching deletes no branch)".to_string()
     };
     if let Some(what) = &u.busy {
-        let (situation, _) = arena_core::backup::busy_words(what, branch);
+        let situation = arena_core::backup::busy_situation(what, branch);
         let ended = match reset_onto {
             Some(_) => format!(
-                "the --hard switch ends {} and discards every uncommitted change on the pod (only that copy has them now); ",
+                "the --hard switch ends {} and discards its uncommitted changes to tracked files (only that copy has them now; \
+                 untracked files stay); ",
                 arena_core::backup::busy_noun(what)
             ),
             None => String::new(),
@@ -13016,7 +13027,7 @@ async fn handle_init_branches(
     }
 
     if dry_run {
-        println!("{}\n", push_first_note(cfg));
+        println!("{}\n", push_first_note(cfg, false));
         println!("Dry-run — would init the w{week}d{day} branch on {} pod(s):\n", targets.len());
         for (name, t) in &targets {
             let cmd = arena_core::backup::init_branch_command(&bcfg, name);
@@ -22241,13 +22252,14 @@ mod remote_tests {
         assert_eq!(unredacted_note("RESTORED Grokking\n"), "");
     }
 
-    /// A backup that found a merge in progress on the pod (exit 6): nothing committed.
+    /// A backup that found a merge in progress on the pod, its conflicts unresolved (a conflicted
+    /// `git pull upstream main`; exit 6): nothing committed.
     fn busy_merge(branch: &str) -> FakeReply {
-        FakeReply::exit(BACKUP_BUSY_EXIT, "").with_stdout(&format!("BRANCH {branch}\nBUSY {branch} merge\n"))
+        FakeReply::exit(BACKUP_BUSY_EXIT, "").with_stdout(&format!("BRANCH {branch}\nBUSY {branch} merge unmerged\n"))
     }
 
-    const MERGE_WHY: &str =
-        "a merge is in progress on autocommit-b — not committed; finish it (`git commit`) or abort it (`git merge --abort`) on the pod";
+    const MERGE_WHY: &str = "a merge is in progress on autocommit-b — not committed; resolve the conflicts and `git add` them, then \
+                             `git commit` — or abort it (`git merge --abort`) on the pod";
 
     /// Review R3: the 15-min backup committed a participant's conflicted `git pull upstream main`
     /// — conflict markers and all, as a merge commit, pushed — and `git merge --abort` no longer
@@ -22277,8 +22289,9 @@ mod remote_tests {
             [
                 "= devtest-cloud (no changes, on autocommit-c)".to_string(),
                 "✓ devtest-apple -> autocommit-a".to_string(),
-                "✗ devtest-bloom: a merge is in progress on autocommit-b — not committed (a backup now would commit its conflict \
-                 markers and end the merge); finish it (`git commit`) or abort it (`git merge --abort`) on the pod"
+                "✗ devtest-bloom: a merge is in progress on autocommit-b — not committed (a backup now would commit the merge's \
+                 state, unresolved conflicts and all, and end the merge); resolve the conflicts and `git add` them, then `git \
+                 commit` — or abort it (`git merge --abort`) on the pod"
                     .to_string(),
             ]
         );
@@ -22350,8 +22363,8 @@ mod remote_tests {
         assert!(line.starts_with(&format!("✓ devtest-bloom (on main){copied_first}")), "{line}");
         assert!(
             line.ends_with(&format!(
-                " first, and the --hard switch ends the merge and discards every uncommitted change on the pod (only that copy has \
-                 them now); {stays}"
+                " first, and the --hard switch ends the merge and discards its uncommitted changes to tracked files (only that copy \
+                 has them now; untracked files stay); {stays}"
             )),
             "{line}"
         );
@@ -22360,8 +22373,8 @@ mod remote_tests {
         // the pod's line with the copy's note, and counted as a failed switch, never a switched one.
         let refusal = |who: &str| {
             format!(
-                "{who}: a merge is in progress on autocommit-b — not switched (a switch now would end the merge); finish it (`git \
-                 commit`) or abort it (`git merge --abort`) on the pod, then switch again"
+                "{who}: a merge is in progress on autocommit-b — not switched (a switch now would end the merge); resolve the \
+                 conflicts and `git add` them, then `git commit` — or abort it (`git merge --abort`) on the pod, then switch again"
             )
         };
         for (who, init) in [("arena set-branch", false), ("arena init-branches", true)] {
@@ -22542,7 +22555,7 @@ mod remote_tests {
         ];
         let names = vec!["devtest-apple".to_string()];
         for (cfg, line) in &cases {
-            let note = push_first_note(cfg);
+            let note = push_first_note(cfg, false);
             let dir = local_backup_dir(cfg);
             match line {
                 Some(line) => {
@@ -22574,6 +22587,31 @@ mod remote_tests {
         let said = take_said();
         assert!(!said.iter().any(|l| l.contains("no per-pod backup locks")), "{said:#?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review F5: the dry run said every pod whose push fails "is copied … and then switched" — a
+    /// pod mid-merge is copied, then the gentle switch (and init-branches) refuses to end the
+    /// merge, while `--hard` ends it, discarding its uncommitted changes to tracked files only.
+    /// Each note says which.
+    #[test]
+    fn the_dry_runs_note_says_what_becomes_of_a_pod_mid_merge() {
+        let gentle = push_first_note(&cfg(), false);
+        assert!(
+            gentle.contains(
+                "; a pod with a merge (cherry-pick, revert, conflicts) in progress can't be committed: it is copied into ./backup \
+                 too, and then NOT switched: the switch refuses to end it; a pod that can be neither pushed nor copied"
+            ),
+            "{gentle}"
+        );
+        let hard = push_first_note(&cfg(), true);
+        assert!(
+            hard.contains(
+                "it is copied into ./backup too, and the --hard switch then ends it, discarding its uncommitted changes to tracked \
+                 files (untracked files stay); "
+            ),
+            "{hard}"
+        );
+        assert!(!hard.contains("refuses"), "{hard}");
     }
 
     #[tokio::test(start_paused = true)]

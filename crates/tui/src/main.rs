@@ -1874,16 +1874,20 @@ fn run_report(name: &str, out: &arena_core::ssh::SshOutput) -> String {
 /// within [`BRANCH_TIMEOUT`] — after the branch it's on is backed up ([`run_backup`]), as the
 /// CLI does: after a switch, commits that couldn't be pushed live only in a local branch on the
 /// pod. A branch that can't be pushed isn't switched away from here, since the TUI can't copy
-/// the pod's files first; the line names the CLI command that does.
+/// the pod's files first; the line names the CLI command that does. A pod with a merge in
+/// progress is never switched by a gentle switch, the CLI's included: its line says what is in
+/// progress and how to end it ([`busy_not_switched`]).
 async fn run_set_branch(remote: &dyn Remote, cfg: &Config, pod: &Pod, branch: &str) -> String {
     let target = match SshTarget::from_pod(pod, cfg) {
         Ok(t) => t,
         Err(e) => return format!("✗ {}: {e}", pod.name),
     };
-    let (backed, wrong_origin) = backup_and_report(remote, cfg, pod).await;
-    // A pod whose `origin` isn't the configured repo: the CLI doesn't switch it either.
-    if let Some(why) = wrong_origin {
-        return format!("✗ {} not switched to {branch}: {why}", pod.name);
+    let (backed, kept) = backup_and_report(remote, cfg, pod).await;
+    match kept {
+        // A pod whose `origin` isn't the configured repo: the CLI doesn't switch it either.
+        Some(Kept::WrongOrigin(why)) => return format!("✗ {} not switched to {branch}: {why}", pod.name),
+        Some(Kept::Busy { what, on, unmerged }) => return busy_not_switched(&pod.name, branch, &what, &on, unmerged),
+        None => {}
     }
     if backed.starts_with('✗') || backed.contains(" — busy:") {
         return format!(
@@ -1911,9 +1915,39 @@ async fn run_backup(remote: &dyn Remote, cfg: &Config, pod: &Pod) -> String {
     backup_and_report(remote, cfg, pod).await.0
 }
 
-/// [`run_backup`]'s line, and, when the pod's `origin` isn't the configured repo, the refusal in
-/// its own words (`origin is …, not the configured … — not backed up to git; run …`).
-async fn backup_and_report(remote: &dyn Remote, cfg: &Config, pod: &Pod) -> (String, Option<String>) {
+/// Why a pod's backup leaves it where it is for the TUI's set-branch — said in words of its own,
+/// not as a push that failed ([`backup_and_report`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Kept {
+    /// Its `origin` isn't the configured repo: the refusal in its own words (`origin is …, not the
+    /// configured … — not backed up to git; run …`).
+    WrongOrigin(String),
+    /// An operation in progress (`BUSY`): what it is (`merge`, …: `arena_core::backup::BUSY_OP_SH`),
+    /// on which branch, and whether paths are still unmerged.
+    Busy { what: String, on: String, unmerged: bool },
+}
+
+/// The TUI set-branch's line for a pod with an operation in progress (review F5): what it is and
+/// how to end it, as the CLI's gentle switch would refuse it (copying the pod first only to
+/// refuse, the CLI's advice before, would gain nothing) — and `--hard` named as the destructive
+/// way, which copies the files first and then discards the uncommitted changes to tracked files,
+/// the operation with them. Pure.
+fn busy_not_switched(pod: &str, branch: &str, what: &str, on: &str, unmerged: bool) -> String {
+    use arena_core::backup::{busy_advice, busy_noun, busy_situation};
+    let noun = busy_noun(what);
+    let why = if what == "conflicts" { String::new() } else { format!(" (a switch now would end {noun})") };
+    format!(
+        "✗ {pod} not switched to {branch}: {} — not committed or switched{why}; {} on the pod, then switch again. Or, \
+         destructively: `arena pods set-branch {branch} {pod} --hard` copies its files first, then discards its uncommitted \
+         changes to tracked files ({noun} with them)",
+        busy_situation(what, on),
+        busy_advice(what, unmerged)
+    )
+}
+
+/// [`run_backup`]'s line, and why the pod must stay where it is beyond a failed push, when it
+/// must ([`Kept`]).
+async fn backup_and_report(remote: &dyn Remote, cfg: &Config, pod: &Pod) -> (String, Option<Kept>) {
     use arena_core::backup::{self, parse_backup_report};
     let target = match SshTarget::from_pod(pod, cfg) {
         Ok(t) => t,
@@ -1950,7 +1984,16 @@ async fn backup_and_report(remote: &dyn Remote, cfg: &Config, pod: &Pod) -> (Str
                 Some(fix) => format!("✗ backup {}: {fix}", pod.name),
                 None => format!("✗ backup {} ({}): {}", pod.name, out.exit_label(), out.stderr.trim()),
             };
-            (line, fix.filter(|_| report.wrong_origin_why(out.code).is_some()))
+            let kept = match (report.wrong_origin_why(out.code), report.in_progress(out.code)) {
+                (Some(_), _) => fix.map(Kept::WrongOrigin),
+                (None, Some(what)) => Some(Kept::Busy {
+                    what: what.to_string(),
+                    on: report.branch.clone().unwrap_or_else(|| "its branch".to_string()),
+                    unmerged: report.unmerged,
+                }),
+                (None, None) => None,
+            };
+            (line, kept)
         }
         Err(e) => (format!("✗ backup {} failed: {}", pod.name, describe_error(&e)), None),
     }
@@ -4606,6 +4649,27 @@ deep_check_end=1
                 vec![wrong_origin()],
                 "✗ backup devtest-alpha: origin is https://github.com/ARENA-education/ARENA_materials, not the configured \
                  nickypro/arena-sandbox-materials — not backed up to git; run `arena pods setup devtest-alpha`",
+                vec![BACKUP_TIMEOUT],
+            ),
+            // A pod mid-merge (review F5): not switched, said as what is in progress and how to end
+            // it, `--hard` named as the destructive way — never "the CLI copies its files, then
+            // switches": the CLI's gentle switch refuses it too.
+            (
+                "set-branch",
+                vec![FakeReply::exit(6, "").with_stdout("BRANCH autocommit-x\nBUSY autocommit-x merge unmerged\n"), FakeReply::ok()],
+                "✗ devtest-alpha not switched to w1d2: a merge is in progress on autocommit-x — not committed or switched (a switch \
+                 now would end the merge); resolve the conflicts and `git add` them, then `git commit` — or abort it (`git merge \
+                 --abort`) on the pod, then switch again. Or, destructively: `arena pods set-branch w1d2 devtest-alpha --hard` \
+                 copies its files first, then discards its uncommitted changes to tracked files (the merge with them)",
+                vec![BACKUP_TIMEOUT],
+            ),
+            (
+                "set-branch",
+                vec![FakeReply::exit(6, "").with_stdout("BRANCH autocommit-x\nBUSY autocommit-x conflicts\n"), FakeReply::ok()],
+                "✗ devtest-alpha not switched to w1d2: autocommit-x has unresolved conflicts — not committed or switched; resolve \
+                 them and `git add` them, or undo them (`git reset --merge`) on the pod, then switch again. Or, destructively: \
+                 `arena pods set-branch w1d2 devtest-alpha --hard` copies its files first, then discards its uncommitted changes to \
+                 tracked files (the unresolved conflicts with them)",
                 vec![BACKUP_TIMEOUT],
             ),
             (

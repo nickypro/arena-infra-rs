@@ -16,10 +16,11 @@
 #   BIGSTUCK <bytes> <path>    a file over <push limit bytes> already in unpushed commits (exit 3)
 #   BIGSTUCK_BASE <sha>|none   what `git reset` to, to rewrite those commits without it
 #   BRANCH <branch>            the branch it backs up (before anything else, unless SKIP)
-#   BUSY <branch> <what>       an operation is in progress on it — <what> is merge, cherry-pick, revert,
-#                              or conflicts (unmerged paths with none of those: a `git stash pop` that
-#                              conflicted): nothing staged, committed or pushed, so it stays resumable
-#                              and abortable (exit 6)
+#   BUSY <branch> <what> [unmerged]  an operation is in progress on it — <what> is merge, cherry-pick,
+#                              revert, or conflicts (unmerged paths with none of those: a `git stash pop`
+#                              that conflicted); `unmerged` after an operation while some of its conflicts
+#                              aren't resolved and added yet: nothing staged, committed or pushed, so it
+#                              stays resumable and abortable (exit 6)
 #   REDACTED <n> <path>        a file committed with its n key(s) redacted; the file on disk keeps them
 #   REDACTED_HISTORY <n> <old> <new>  a key in older unpushed commits (an earlier backup's, or one the
 #                              participant made): those n commits rewritten redacted, pushed as a fast-forward
