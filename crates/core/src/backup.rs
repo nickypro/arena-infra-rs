@@ -18,7 +18,10 @@
 //!
 //! Before any of that, a checkout whose `origin` isn't the configured repo ([`configured_repo`])
 //! is refused: nothing committed, nothing pushed, `WRONG_ORIGIN` said
-//! ([`BACKUP_WRONG_ORIGIN_EXIT`]). `init-branches`' command checks the same.
+//! ([`BACKUP_WRONG_ORIGIN_EXIT`]). `init-branches`' command checks the same. And a branch with an
+//! operation in progress (a participant's conflicted `git pull upstream main`, …) is left as it is
+//! — `BUSY`, [`BACKUP_BUSY_EXIT`] — since committing would end it, conflict markers and all; the
+//! gentle switches refuse to end one too.
 //!
 //! This module only *renders* the command (pure, unit-tested). Running it — and thus
 //! mutating remote git state — is gated behind the CLI's `--apply`.
@@ -123,6 +126,14 @@ pub const BACKUP_BLOCKED_EXIT: i32 = 4;
 /// course repo as `origin` and no deploy key, so it was never backed up to git, and nothing said
 /// so.
 pub const BACKUP_WRONG_ORIGIN_EXIT: i32 = 5;
+
+/// The exit status of a backup that found an operation in progress on the branch ([`BUSY_OP_SH`]:
+/// a merge, a cherry-pick, a revert, or conflicts a `git stash pop` left): `BUSY <branch> <what>`,
+/// nothing staged, committed or pushed. Committing then would stage the conflict markers and end
+/// the operation — a participant's conflicted `git pull upstream main` became a merge commit,
+/// markers and all, pushed, and `git merge --abort` no longer worked (review R3). A branch switch
+/// that would end one refuses with it too ([`checkout_command`], [`init_branch_command`]).
+pub const BACKUP_BUSY_EXIT: i32 = 6;
 
 /// One kind of key the backup never lets into git ([`SECRET_PATTERNS`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,6 +255,71 @@ pub fn redact_sed() -> String {
 /// secret) — never printed, never passed on to a report line or a log.
 pub const NO_BYPASS_URL_SH: &str = "no_bypass_url() { LC_ALL=C grep -viE 'https?://[^ ]*(unblock|bypass|secret-scanning)' || true; }";
 
+/// `busy_op <git dir>`, run from the checkout's top: what is in progress there that a commit or a
+/// branch switch would end — `merge`, `cherry-pick` or `revert` (its `*_HEAD` file, conflicts
+/// resolved or not), else `conflicts` (unmerged paths and none of those: a `git stash pop` that
+/// conflicted) — or nothing. A rebase detaches HEAD, which the backup already skips. Shared by
+/// the backup script (`BUSY`, [`BACKUP_BUSY_EXIT`]) and the switches that refuse to end one
+/// ([`checkout_command`]'s gentle switch, [`init_branch_command`]).
+pub const BUSY_OP_SH: &str = "busy_op() { if [ -e \"$1/MERGE_HEAD\" ]; then echo merge; elif [ -e \"$1/CHERRY_PICK_HEAD\" ]; then echo cherry-pick; \
+     elif [ -e \"$1/REVERT_HEAD\" ]; then echo revert; elif [ -n \"$(git ls-files -u | head -n 1)\" ]; then echo conflicts; fi; }";
+
+/// Every word [`BUSY_OP_SH`] prints.
+const BUSY_KINDS: [&str; 4] = ["merge", "cherry-pick", "revert", "conflicts"];
+
+/// What is in progress on `branch` (`BUSY <branch> <what>`), in words: what it is, and how to end
+/// it either way — for a merge on `b`, "a merge is in progress on b" and "finish it (`git commit`)
+/// or abort it (`git merge --abort`)". Both, since only the participant knows which they want.
+pub fn busy_words(what: &str, branch: &str) -> (String, String) {
+    let op = |finish: &str, abort: &str| {
+        (format!("a {what} is in progress on {branch}"), format!("finish it (`{finish}`) or abort it (`{abort}`)"))
+    };
+    match what {
+        "merge" => op("git commit", "git merge --abort"),
+        "cherry-pick" => op("git cherry-pick --continue", "git cherry-pick --abort"),
+        "revert" => op("git revert --continue", "git revert --abort"),
+        "conflicts" => (
+            format!("{branch} has unresolved conflicts"),
+            "resolve them (fix the files, then `git add` them) or undo them (`git reset --merge`)".to_string(),
+        ),
+        _ => (format!("a git operation ({what}) is in progress on {branch}"), "finish it or abort it".to_string()),
+    }
+}
+
+/// [`busy_words`]' operation as the object of a sentence: `the merge`, `the unresolved conflicts`.
+pub fn busy_noun(what: &str) -> String {
+    match what {
+        "conflicts" => "the unresolved conflicts".to_string(),
+        _ => format!("the {what}"),
+    }
+}
+
+/// A branch switch's first step (`who` names it on stderr: `arena set-branch`), from the checkout's
+/// top: while an operation is in progress ([`BUSY_OP_SH`]) it refuses — what is in progress and how
+/// to end it ([`busy_words`]) on stderr, exit [`BACKUP_BUSY_EXIT`] — before anything is touched.
+/// Checked with real git, mid-merge: `git checkout -b` (init-branches) succeeds and drops
+/// `MERGE_HEAD`, leaving the conflicted index on the new branch with no merge to abort; a gentle
+/// `git checkout` refuses unmerged paths but silently ends a merge whose conflicts are resolved
+/// and staged, carrying them onto the other branch. `--hard` doesn't run this: it discards local
+/// changes by design, the operation with them.
+fn busy_refusal_sh(who: &str) -> String {
+    let cases: String = BUSY_KINDS
+        .iter()
+        .map(|what| {
+            let (situation, advice) = busy_words(what, "@BRANCH@");
+            let why = if *what == "conflicts" { String::new() } else { format!(" (a switch now would end {})", busy_noun(what)) };
+            let msg = format!("{who}: {situation} — not switched{why}; {advice} on the pod, then switch again");
+            // The branch as the shell knows it, outside the quotes: the words never are code.
+            let shell = msg.split("@BRANCH@").map(shell_quote).collect::<Vec<_>>().join("\"$BUSY_B\"");
+            format!("{what}) printf '%s\\n' {shell} >&2;; ")
+        })
+        .collect();
+    format!(
+        "cd \"$(git rev-parse --show-toplevel)\"; {BUSY_OP_SH}; BUSY_W=$(busy_op \"$(git rev-parse --absolute-git-dir)\"); \
+         if [ -n \"$BUSY_W\" ]; then BUSY_B=$(git rev-parse --abbrev-ref HEAD); case $BUSY_W in {cases}esac; exit {BACKUP_BUSY_EXIT}; fi"
+    )
+}
+
 /// The redaction's shell functions (`redact.sh`), with [`secret_regex`] and [`redact_sed`]
 /// rendered in — shared by the backup script and `set-branch`'s command.
 pub fn redact_sh() -> String {
@@ -261,19 +337,21 @@ pub fn origin_sh() -> &'static str {
 }
 
 /// The lines of `backup.sh` that [`backup_script`] replaces with [`redact_sh`],
-/// [`NO_BYPASS_URL_SH`] and [`origin_sh`].
+/// [`NO_BYPASS_URL_SH`], [`origin_sh`] and [`BUSY_OP_SH`].
 const REDACT_SH_MARK: &str = "# @ARENA_REDACT_SH@";
 const NO_BYPASS_URL_MARK: &str = "# @ARENA_NO_BYPASS_URL@";
 const ORIGIN_SH_MARK: &str = "# @ARENA_ORIGIN_SH@";
+const BUSY_OP_MARK: &str = "# @ARENA_BUSY_OP_SH@";
 
-/// The backup script ([`backup_command`]): `backup.sh` with [`redact_sh`], [`NO_BYPASS_URL_SH`]
-/// and [`origin_sh`] rendered in. POSIX `sh`, so it runs the same whatever the pod's login shell;
-/// its header documents every line it prints.
+/// The backup script ([`backup_command`]): `backup.sh` with [`redact_sh`], [`NO_BYPASS_URL_SH`],
+/// [`origin_sh`] and [`BUSY_OP_SH`] rendered in. POSIX `sh`, so it runs the same whatever the
+/// pod's login shell; its header documents every line it prints.
 pub fn backup_script() -> String {
     include_str!("backup.sh")
         .replacen(ORIGIN_SH_MARK, origin_sh().trim_end(), 1)
         .replacen(REDACT_SH_MARK, redact_sh().trim_end(), 1)
         .replacen(NO_BYPASS_URL_MARK, NO_BYPASS_URL_SH, 1)
+        .replacen(BUSY_OP_MARK, BUSY_OP_SH, 1)
 }
 
 /// Render the remote shell command that commits + pushes one machine's working tree **on
@@ -301,6 +379,11 @@ pub fn backup_script() -> String {
 /// `origin` is the configured repo ([`configured_repo`]). Before anything else, the main/master
 /// SKIP included, a checkout whose `origin` isn't that repo ends the run with `WRONG_ORIGIN` and
 /// [`BACKUP_WRONG_ORIGIN_EXIT`]: nothing committed, nothing pushed. `None`: no check.
+///
+/// On a branch it backs up, an operation in progress — a conflicted merge, cherry-pick or revert,
+/// or a `git stash pop`'s conflicts ([`BUSY_OP_SH`]) — ends the run before anything is staged:
+/// `BUSY <branch> <what>`, [`BACKUP_BUSY_EXIT`], nothing committed or pushed, so the participant
+/// can still finish or abort it ([`BackupReport::failure`] says how).
 pub fn backup_command(repo_path: &str, git_ssh_key: Option<&str>, commit_msg: &str, origin: Option<&str>) -> String {
     backup_command_limited(repo_path, git_ssh_key, commit_msg, GIT_MAX_FILE_BYTES, GITHUB_FILE_LIMIT_BYTES, origin)
 }
@@ -403,6 +486,9 @@ pub struct BackupReport {
     /// `(the configured owner/name, origin's URL with any credentials taken out)`. The URL is
     /// empty when there is no `origin` at all.
     pub wrong_origin: Option<(String, String)>,
+    /// What is in progress on the branch (`BUSY <branch> <what>`: `merge`, `cherry-pick`, `revert`
+    /// or `conflicts`), so nothing was staged, committed or pushed.
+    pub busy: Option<String>,
 }
 
 /// Parse a backup's stdout ([`backup_script`]'s header lists the lines). Unknown lines (git's
@@ -436,6 +522,12 @@ pub fn parse_backup_report(stdout: &str) -> BackupReport {
                 r.wrong_origin = Some((want.trim().to_string(), url.trim().to_string()));
             }
             "HEAL_ABORTED" => r.heal_aborted = Some(rest.trim().to_string()),
+            "BUSY" => {
+                if let [branch, what, ..] = rest.split_whitespace().collect::<Vec<_>>()[..] {
+                    r.busy = Some(what.to_string());
+                    r.branch.get_or_insert_with(|| branch.to_string());
+                }
+            }
             "PUSH_BLOCKED" => {
                 let why = rest.trim();
                 r.push_blocked = Some(if why.is_empty() { "refused by GitHub push protection".into() } else { why.to_string() });
@@ -523,11 +615,19 @@ impl BackupReport {
 
     /// For a run that failed in a way the script explained — a file over GitHub's limit in the
     /// unpushed commits ([`Self::stuck_fix`]), a key GitHub refuses that the redaction doesn't
-    /// know, a heal cut short — what happened and what to do; `None` for any other run (exit
-    /// `code`). `repo` is the checkout on `pod`.
+    /// know, a heal cut short, an operation in progress ([`Self::in_progress`]) — what happened
+    /// and what to do; `None` for any other run (exit `code`). `repo` is the checkout on `pod`.
     pub fn failure(&self, repo: &str, pod: &str, code: Option<i32>) -> Option<String> {
         if let Some(why) = self.wrong_origin_why(code) {
             return Some(format!("{why} — not backed up to git; run `arena pods setup {pod}`"));
+        }
+        if let Some(what) = self.in_progress(code) {
+            let (situation, advice) = busy_words(what, self.branch.as_deref().unwrap_or("its branch"));
+            let would = match what {
+                "conflicts" => "a backup now would commit their conflict markers".to_string(),
+                _ => format!("a backup now would commit its conflict markers and end {}", busy_noun(what)),
+            };
+            return Some(format!("{situation} — not committed ({would}); {advice} on the pod"));
         }
         if code == Some(BACKUP_STUCK_EXIT) {
             if let Some(fix) = self.stuck_fix(repo, pod) {
@@ -550,12 +650,15 @@ impl BackupReport {
 
     /// Whether the run reached the repo and failed at the push itself — refused, a big file in
     /// the way, a rewrite cut short, or the push failing outright: the failures where the
-    /// pod's work is there but not on GitHub, so it gets the fallback copy. A run that never got
-    /// that far (no repo, ssh denied, a timeout: nothing says how far it got) fails as it
-    /// always did, and isn't rsynced every 15 minutes. A wrong `origin` is not one of these
+    /// pod's work is there but not on GitHub, so it gets the fallback copy. An operation in
+    /// progress (`BUSY`) counts too: the run reached the repo and stopped before the commit, so
+    /// GitHub has the work only up to the last backup, every run until the participant ends it —
+    /// the copy is all that keeps the rest. A run that never got that far (no repo, ssh denied, a
+    /// timeout: nothing says how far it got) fails as it always did, and isn't rsynced every 15
+    /// minutes. A wrong `origin` is not one of these
     /// either (nothing was tried): what to do with it is the caller's ([`Self::wrong_origin`]).
     pub fn failed_at_push(&self) -> bool {
-        self.push_failed || self.push_blocked.is_some() || self.heal_aborted.is_some() || !self.big_stuck.is_empty()
+        self.push_failed || self.push_blocked.is_some() || self.heal_aborted.is_some() || !self.big_stuck.is_empty() || self.busy.is_some()
     }
 
     /// [`Self::failure`] in a few words, for a line that says what else happened (the fallback
@@ -563,6 +666,10 @@ impl BackupReport {
     pub fn failure_brief(&self, code: Option<i32>) -> Option<String> {
         if let Some(why) = self.wrong_origin_why(code) {
             return Some(why);
+        }
+        if let Some(what) = self.in_progress(code) {
+            let (situation, advice) = busy_words(what, self.branch.as_deref().unwrap_or("its branch"));
+            return Some(format!("{situation} — not committed; {advice} on the pod"));
         }
         if code == Some(BACKUP_STUCK_EXIT) && !self.big_stuck.is_empty() {
             return Some(format!("file(s) over {} MB in unpushed commits", GITHUB_FILE_LIMIT_BYTES / (1024 * 1024)));
@@ -583,6 +690,13 @@ impl BackupReport {
         } else {
             format!("origin is {url}, not the configured {want}")
         })
+    }
+
+    /// For a run that stopped because an operation is in progress on the branch (`BUSY`, exit
+    /// [`BACKUP_BUSY_EXIT`]): what it is (`merge`, `cherry-pick`, `revert`, `conflicts`). `None` for
+    /// any other run.
+    pub fn in_progress(&self, code: Option<i32>) -> Option<&str> {
+        self.busy.as_deref().filter(|_| code == Some(BACKUP_BUSY_EXIT))
     }
 
     /// For a run that found files over GitHub's limit in the unpushed commits: why nothing can be
@@ -620,7 +734,10 @@ impl BackupReport {
 /// the real keys a switch set aside on the branch now checked out go back where the file holds
 /// exactly their redacted version (`UNREDACTED_RESTORED <path>`) — `unredacted.sh`'s restore,
 /// the step [`checkout_command`] ends with — so a day branch that already exists isn't left with
-/// them set aside, unsaid (live bsec O1).
+/// them set aside, unsaid (live bsec O1). A checkout with an operation in progress (a conflicted
+/// merge, …: [`BUSY_OP_SH`]) is refused next, before anything is fetched or switched (exit
+/// [`BACKUP_BUSY_EXIT`], what and how to end it on stderr): `git checkout -b` would drop its
+/// `MERGE_HEAD` and carry the conflicted index onto the new branch, with no merge left to abort.
 pub fn init_branch_command(cfg: &BackupConfig, machine_name: &str) -> String {
     let branch = cfg.branch_for(machine_name);
     let bq = shell_quote(&branch);
@@ -633,6 +750,9 @@ pub fn init_branch_command(cfg: &BackupConfig, machine_name: &str) -> String {
         parts.push(functions.join("\n"));
         parts.push(format!("origin_check {}", shell_quote(origin)));
     }
+    // Never a participant's merge (cherry-pick, revert, conflicts) ended by the switch:
+    // `checkout -b` would drop its MERGE_HEAD and leave the conflicts on the new branch.
+    parts.push(busy_refusal_sh("arena init-branches"));
     if let Some(key) = &cfg.git_ssh_key {
         parts.push(format!(
             "export GIT_SSH_COMMAND={}",
@@ -691,8 +811,21 @@ pub fn init_branch_command(cfg: &BackupConfig, machine_name: &str) -> String {
 /// rest stay set aside (`UNREDACTED_KEPT <path>`) until a switch back. Even a failed switch puts
 /// them back before it exits. A file with any other uncommitted change is left to the switch, as
 /// before.
+///
+/// An operation in progress (a participant's conflicted `git pull upstream main`, a cherry-pick,
+/// a revert, a `git stash pop`'s conflicts: [`BUSY_OP_SH`]) is never ended by the gentle switch:
+/// it refuses first — what is in progress and how to end it, on stderr, exit
+/// [`BACKUP_BUSY_EXIT`] — touching nothing, where `git checkout` would silently drop a merge whose
+/// conflicts are resolved and staged and carry them onto the other branch. `--hard` goes ahead
+/// and ends it with the other local changes it discards (`set-branch` copies such a pod first and
+/// says so).
 pub fn checkout_command(repo_path: &str, branch: &str, git_ssh_key: Option<&str>, hard: bool) -> String {
     let mut parts: Vec<String> = vec!["set -e".into(), format!("cd {}", shell_quote(repo_path))];
+    if !hard {
+        // A participant's merge (cherry-pick, revert, conflicts) is never ended by the gentle
+        // switch: it refuses, saying what and how, before anything else.
+        parts.push(busy_refusal_sh("arena set-branch"));
+    }
     if let Some(key) = git_ssh_key {
         parts.push(format!(
             "export GIT_SSH_COMMAND={}",
@@ -2287,9 +2420,13 @@ done
         assert!(cmd.contains("git fetch --prune origin") && !cmd.contains("--all"), "{cmd}");
         assert!(cmd.contains("git checkout -b 'autocommit-arena8-w1d4-apple'"));
         assert!(cmd.contains("git push -u origin 'autocommit-arena8-w1d4-apple'"));
-        // It only creates/pushes the branch — never stages or commits work.
-        assert!(!cmd.contains("git add"));
-        assert!(!cmd.contains("git commit"));
+        // It only creates/pushes the branch — never stages or commits work. (The refusal of a
+        // checkout mid-merge names `git add`/`git commit` in the words it prints, never runs them.)
+        let refusal = busy_refusal_sh("arena init-branches");
+        assert!(cmd.contains(&refusal) && refusal.contains("printf '%s\\n' 'arena init-branches: a merge is in progress on '"));
+        let run = cmd.replace(&refusal, "");
+        assert!(!run.contains("git add"));
+        assert!(!run.contains("git commit"));
     }
 
     #[test]
@@ -2564,5 +2701,244 @@ done
         assert!(check < s.find("echo \"SKIP $B\"").unwrap() && check < s.find("git add -A").unwrap());
         assert!(s.contains(origin_sh().trim_end()));
         assert!(s.contains("ORIGIN=${6:-}"));
+    }
+
+    /// `BUSY <branch> <what>`: what is in progress, said with how to end it either way — the
+    /// verbs of the operation it is — and a failure at the push (the pod is copied instead).
+    #[test]
+    fn the_busy_line_says_whats_in_progress_and_how_to_end_it() {
+        let code = Some(BACKUP_BUSY_EXIT);
+        let r = parse_backup_report("BRANCH autocommit-x\nBUSY autocommit-x merge\n");
+        assert_eq!((r.busy.as_deref(), r.branch.as_deref(), r.outcome.clone()), (Some("merge"), Some("autocommit-x"), None));
+        assert!(r.failed_at_push(), "copied instead, like a failed push");
+        assert_eq!((r.in_progress(code), r.in_progress(Some(1)), r.in_progress(Some(0))), (Some("merge"), None, None));
+        assert_eq!(
+            r.failure("/root/ARENA_materials", "devtest-bloom", code).unwrap(),
+            "a merge is in progress on autocommit-x — not committed (a backup now would commit its conflict markers and end the \
+             merge); finish it (`git commit`) or abort it (`git merge --abort`) on the pod"
+        );
+        assert_eq!(
+            r.failure_brief(code).unwrap(),
+            "a merge is in progress on autocommit-x — not committed; finish it (`git commit`) or abort it (`git merge --abort`) on \
+             the pod"
+        );
+        assert_eq!((r.failure("/r", "p", Some(1)), r.failure_brief(Some(1))), (None, None), "only with its own exit");
+        let said = |out: &str| parse_backup_report(out).failure("/r", "p", code).unwrap();
+        assert_eq!(
+            said("BUSY autocommit-x cherry-pick\n"),
+            "a cherry-pick is in progress on autocommit-x — not committed (a backup now would commit its conflict markers and \
+             end the cherry-pick); finish it (`git cherry-pick --continue`) or abort it (`git cherry-pick --abort`) on the pod"
+        );
+        assert!(said("BUSY b revert\n").ends_with("finish it (`git revert --continue`) or abort it (`git revert --abort`) on the pod"));
+        assert_eq!(
+            said("BRANCH b\nBUSY b conflicts\n"),
+            "b has unresolved conflicts — not committed (a backup now would commit their conflict markers); resolve them (fix \
+             the files, then `git add` them) or undo them (`git reset --merge`) on the pod"
+        );
+        // The branch from the BUSY line when no BRANCH came first; a line without its word is no BUSY.
+        assert_eq!(parse_backup_report("BUSY feature merge\n").branch.as_deref(), Some("feature"));
+        assert_eq!(parse_backup_report("BUSY feature\n").busy, None);
+        assert!(!parse_backup_report("BUSY feature\n").failed_at_push());
+    }
+
+    /// [`GitSandbox`] with the course repo as `upstream` (a clone of origin's `main`, as setup adds
+    /// it) holding a change to README.md, and the participant's own change to it committed on
+    /// `autocommit-x` (not pushed): `git pull upstream main` conflicts. Returns the course repo.
+    #[cfg(unix)]
+    fn with_conflicting_upstream(s: &GitSandbox) -> std::path::PathBuf {
+        let course = s.base.join("course");
+        s.git(&s.base, &["clone", "-q", "-b", "main", s.origin.to_str().unwrap(), course.to_str().unwrap()]);
+        std::fs::write(course.join("README.md"), "the course's version\n").unwrap();
+        s.git(&course, &["-c", "user.name=u", "-c", "user.email=u@u", "commit", "-q", "-am", "upstream"]);
+        s.git(&s.work, &["remote", "add", "upstream", course.to_str().unwrap()]);
+        std::fs::write(s.work.join("README.md"), "the participant's version\n").unwrap();
+        s.git(&s.work, &["commit", "-q", "-am", "mine"]);
+        course
+    }
+
+    /// git, expected to fail (a conflict): (exit code, stdout + stderr).
+    #[cfg(unix)]
+    fn git_failing(dir: &std::path::Path, args: &[&str]) -> (Option<i32>, String) {
+        let o = std::process::Command::new("git").current_dir(dir).args(args).env("GIT_EDITOR", "true").output().expect("git");
+        (o.status.code(), format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)))
+    }
+
+    /// Review R3: a participant mid-way through a conflicted `git pull upstream main` (setup adds
+    /// the `upstream` remote) had the conflict markers committed by the next backup — a merge
+    /// commit, pushed — after which `git merge --abort` and VS Code's conflict view no longer
+    /// worked. Now a merge, a cherry-pick or a revert in progress, or a `git stash pop`'s
+    /// conflicts, stop the run before anything is staged: `BUSY`, exit 6, HEAD, the index and the
+    /// tree exactly as they were, nothing pushed — and the participant's abort still brings back
+    /// the tree they had. Once it's ended the next run backs up as always, and so does a merge
+    /// that went through.
+    #[cfg(unix)]
+    #[test]
+    fn an_operation_in_progress_is_never_committed_and_can_still_be_aborted() {
+        let s = GitSandbox::new("busy", 1_000_000);
+        let course = with_conflicting_upstream(&s);
+        // Commits for the cherry-pick (a side branch) and the revert (two edits of one line) to conflict on.
+        s.git(&s.work, &["checkout", "-q", "-b", "side", "main"]);
+        std::fs::write(s.work.join("README.md"), "the side branch's version\n").unwrap();
+        s.git(&s.work, &["commit", "-q", "-am", "side"]);
+        s.git(&s.work, &["checkout", "-q", "autocommit-x"]);
+        let origin_ref = || s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "rev-parse", "refs/heads/autocommit-x"]);
+        // What each case commits first (nothing, or the commits its operation conflicts over).
+        type Prepare = Box<dyn Fn(&GitSandbox)>;
+        // (what, its commits first, the command that conflicts, the participant's way out, its `*_HEAD`)
+        type Case<'a> = (&'a str, Prepare, &'a [&'a str], &'a [&'a str], Option<&'a str>);
+        let edit = |s: &GitSandbox, text: &str| {
+            std::fs::write(s.work.join("README.md"), format!("{text}\n")).unwrap();
+            s.git(&s.work, &["commit", "-q", "-am", text]);
+        };
+        let cases: Vec<Case> = vec![
+            ("merge", Box::new(|_| ()), &["pull", "-q", "--no-rebase", "--no-edit", "upstream", "main"], &["merge", "--abort"], Some("MERGE_HEAD")),
+            ("cherry-pick", Box::new(|_| ()), &["cherry-pick", "side"], &["cherry-pick", "--abort"], Some("CHERRY_PICK_HEAD")),
+            ("revert", Box::new(move |s| ["a", "b"].iter().for_each(|v| edit(s, v))), &["revert", "--no-edit", "HEAD~1"], &["revert", "--abort"], Some("REVERT_HEAD")),
+            (
+                "conflicts",
+                Box::new(move |s| {
+                    std::fs::write(s.work.join("README.md"), "stashed\n").unwrap();
+                    s.git(&s.work, &["stash", "-q"]);
+                    edit(s, "committed");
+                }),
+                &["stash", "pop"],
+                &["reset", "--merge"],
+                None,
+            ),
+        ];
+        for (what, prepare, start, abort, head_file) in &cases {
+            // New work beside the operation, never staged by the backup while it lasts.
+            s.put(&format!("notes-{what}.md"), 20);
+            prepare(&s);
+            let before = (s.git(&s.work, &["rev-parse", "HEAD"]), s.read("README.md"), s.git(&s.work, &["status", "--porcelain"]));
+            let (code, said) = git_failing(&s.work, start);
+            assert_ne!(code, Some(0), "{what}: no conflict: {said}");
+            let during = s.git(&s.work, &["status", "--porcelain"]);
+            assert!(during.contains("UU README.md"), "{what}: {during}");
+            let pushed = origin_ref();
+            let (code, out, err) = s.backup_raw();
+            assert_eq!(code, Some(BACKUP_BUSY_EXIT), "{what}: {out}{err}");
+            assert_eq!(out, format!("BRANCH autocommit-x\nBUSY autocommit-x {what}\n"), "{what}: nothing else done");
+            assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), before.0, "{what}: nothing committed");
+            assert_eq!(s.git(&s.work, &["status", "--porcelain"]), during, "{what}: nothing staged");
+            assert_eq!(origin_ref(), pushed, "{what}: nothing pushed");
+            if let Some(f) = head_file {
+                assert!(s.work.join(".git").join(f).exists(), "{what}: {f} gone");
+            }
+            assert!(parse_backup_report(&out).failure("/r", "p", code).unwrap().contains(&abort.join(" ")), "{what}: says how to abort");
+            // The participant's way out still works, and brings back what they had.
+            s.git(&s.work, abort);
+            let after = (s.git(&s.work, &["rev-parse", "HEAD"]), s.read("README.md"), s.git(&s.work, &["status", "--porcelain"]));
+            assert_eq!(after, before, "{what}: the abort restores the tree");
+            // Ended: backed up as always.
+            let (code, r, err) = s.backup();
+            assert_eq!((code, r.outcome, r.busy), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into())), None), "{what}: {err}");
+        }
+        assert_eq!(s.git(&s.work, &["stash", "list"]).lines().count(), 1, "the conflicted stash is kept");
+
+        // A merge that went through (no conflict, committed) is backed up like any commit.
+        s.git(&course, &["checkout", "-q", "-b", "extra", "main~1"]);
+        std::fs::write(course.join("extra.py"), "x = 1\n").unwrap();
+        s.git(&course, &["add", "extra.py"]);
+        s.git(&course, &["-c", "user.name=u", "-c", "user.email=u@u", "commit", "-q", "-m", "extra"]);
+        s.git(&s.work, &["pull", "-q", "--no-rebase", "--no-edit", "upstream", "extra"]);
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome, r.busy), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into())), None), "{err}");
+        assert_eq!(origin_ref(), s.git(&s.work, &["rev-parse", "HEAD"]));
+        assert_eq!(s.git(&s.work, &["rev-list", "--parents", "-n1", "HEAD"]).split(' ').count(), 3, "a merge commit, pushed");
+        assert!(s.origin_tree("autocommit-x").iter().any(|(_, p)| p == "extra.py"));
+    }
+
+    /// Checked with real git, mid-merge: `git checkout -b` (init-branches) succeeded, dropped
+    /// MERGE_HEAD and carried the conflicted index onto the new branch — no merge left to abort —
+    /// and a gentle `git checkout` ends a merge whose conflicts are resolved and staged. Now both
+    /// refuse first, touching nothing, with what is in progress and how to end it (exit 6); the
+    /// merge can still be aborted afterwards. `--hard` goes ahead and ends it with the other local
+    /// changes it discards, as `--hard` does (set-branch copies such a pod first and says so).
+    #[cfg(unix)]
+    #[test]
+    fn a_gentle_switch_or_init_branches_never_ends_an_operation_in_progress() {
+        let s = GitSandbox::new("busy-switch", 1_000_000);
+        with_conflicting_upstream(&s);
+        let repo = s.work.to_str().unwrap();
+        let cfg = BackupConfig { repo_path: repo.into(), prefix: "devtest".into(), week: 1, day: 2, git_ssh_key: None, origin: None };
+        let head = s.git(&s.work, &["rev-parse", "HEAD"]);
+        let mine = s.read("README.md");
+        git_failing(&s.work, &["pull", "-q", "--no-rebase", "--no-edit", "upstream", "main"]);
+        let during = s.git(&s.work, &["status", "--porcelain"]);
+        let merge = "a merge is in progress on autocommit-x — not switched (a switch now would end the merge); finish it (`git \
+                     commit`) or abort it (`git merge --abort`) on the pod, then switch again\n";
+        for (cmd, who) in [(checkout_command(repo, "main", None, false), "arena set-branch"), (init_branch_command(&cfg, "devtest-x"), "arena init-branches")] {
+            let o = s.run(&cmd);
+            let err = String::from_utf8_lossy(&o.stderr);
+            assert_eq!((o.status.code(), err.as_ref()), (Some(BACKUP_BUSY_EXIT), format!("{who}: {merge}").as_str()), "{who}");
+            assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "autocommit-x", "{who}: not switched");
+            assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), head, "{who}");
+            assert_eq!(s.git(&s.work, &["status", "--porcelain"]), during, "{who}: nothing touched");
+            assert!(s.work.join(".git/MERGE_HEAD").exists(), "{who}: the merge ended");
+        }
+        assert!(s.git(&s.work, &["branch", "--list", "autocommit-devtest-w1d2-x"]).is_empty(), "no day branch made");
+        // Resolved and staged, still a merge: still refused (git's own checkout would carry it off).
+        std::fs::write(s.work.join("README.md"), "resolved\n").unwrap();
+        s.git(&s.work, &["add", "README.md"]);
+        let o = s.run(&checkout_command(repo, "main", None, false));
+        assert_eq!(o.status.code(), Some(BACKUP_BUSY_EXIT), "{}", String::from_utf8_lossy(&o.stderr));
+        s.git(&s.work, &["merge", "--abort"]);
+        assert_eq!((s.git(&s.work, &["rev-parse", "HEAD"]), s.read("README.md")), (head.clone(), mine), "aborted as if never switched");
+
+        // A `git stash pop`'s conflicts: refused too, with their own way out — whichever directory
+        // of the checkout the command starts in (the conflict is at its top).
+        s.put("exercises/keep.py", 3);
+        let sub = BackupConfig { repo_path: s.work.join("exercises").display().to_string(), ..cfg.clone() };
+        std::fs::write(s.work.join("README.md"), "stashed\n").unwrap();
+        s.git(&s.work, &["stash", "-q"]);
+        std::fs::write(s.work.join("README.md"), "committed\n").unwrap();
+        s.git(&s.work, &["commit", "-q", "-am", "committed"]);
+        git_failing(&s.work, &["stash", "pop"]);
+        let o = s.run(&init_branch_command(&sub, "devtest-x"));
+        assert_eq!(
+            (o.status.code(), String::from_utf8_lossy(&o.stderr).into_owned()),
+            (
+                Some(BACKUP_BUSY_EXIT),
+                "arena init-branches: autocommit-x has unresolved conflicts — not switched; resolve them (fix the files, then `git \
+                 add` them) or undo them (`git reset --merge`) on the pod, then switch again\n"
+                    .to_string()
+            )
+        );
+        s.git(&s.work, &["reset", "--merge"]);
+
+        // --hard: switched, the merge ended with the local changes it discards.
+        let tip = s.git(&s.work, &["rev-parse", "HEAD"]);
+        git_failing(&s.work, &["pull", "-q", "--no-rebase", "--no-edit", "upstream", "main"]);
+        assert!(s.work.join(".git/MERGE_HEAD").exists());
+        let o = s.run(&checkout_command(repo, "main", None, true));
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+        assert!(!s.work.join(".git/MERGE_HEAD").exists() && s.git(&s.work, &["ls-files", "-u"]).is_empty());
+        assert_eq!(s.git(&s.work, &["rev-parse", "autocommit-x"]), tip, "its commits stay in the branch");
+        // A clean checkout switches as before (the guard lets it through).
+        let o = s.run(&checkout_command(repo, "autocommit-x", None, false));
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "autocommit-x");
+    }
+
+    /// The check is rendered into the script once, after the branch is known (the SKIP before it)
+    /// and before anything is staged — the nested-clone adoption, `update-index`, `git add`.
+    #[test]
+    fn the_busy_check_comes_before_anything_is_staged() {
+        let s = backup_script();
+        assert!(!s.contains("@ARENA_BUSY_OP_SH@") && s.matches(BUSY_OP_SH).count() == 1);
+        let check = s.find("W=$(busy_op \"$G\")").expect("the check");
+        assert!(s.find("echo \"SKIP $B\"").unwrap() < check && s.find("G=$(git rev-parse --absolute-git-dir)").unwrap() < check);
+        for later in ["update-index", "git add -A", "git rm -q --cached", "git commit", "git push"] {
+            assert!(check < s.find(later).unwrap(), "{later}");
+        }
+        assert!(s.contains("echo \"BUSY $B $W\"; exit 6"));
+        // The gentle switch and init-branches check it too, first; --hard doesn't.
+        let gentle = checkout_command("/r", "main", None, false);
+        assert!(gentle.contains(BUSY_OP_SH) && gentle.find("busy_op").unwrap() < gentle.find("git fetch").unwrap());
+        assert!(!checkout_command("/r", "main", None, true).contains("busy_op"));
+        let init = init_branch_command(&cfg(), "arena8-apple");
+        assert!(init.find("busy_op").unwrap() < init.find("git checkout -b").unwrap());
     }
 }

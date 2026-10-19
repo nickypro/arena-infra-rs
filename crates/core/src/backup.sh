@@ -16,6 +16,10 @@
 #   BIGSTUCK <bytes> <path>    a file over <push limit bytes> already in unpushed commits (exit 3)
 #   BIGSTUCK_BASE <sha>|none   what `git reset` to, to rewrite those commits without it
 #   BRANCH <branch>            the branch it backs up (before anything else, unless SKIP)
+#   BUSY <branch> <what>       an operation is in progress on it — <what> is merge, cherry-pick, revert,
+#                              or conflicts (unmerged paths with none of those: a `git stash pop` that
+#                              conflicted): nothing staged, committed or pushed, so it stays resumable
+#                              and abortable (exit 6)
 #   REDACTED <n> <path>        a file committed with its n key(s) redacted; the file on disk keeps them
 #   REDACTED_HISTORY <n> <old> <new>  a key in older unpushed commits (an earlier backup's, or one the
 #                              participant made): those n commits rewritten redacted, pushed as a fast-forward
@@ -50,6 +54,19 @@ echo "BRANCH $B"
 git config user.name >/dev/null 2>&1 || git config user.name 'Arena Autocommit'
 git config user.email >/dev/null 2>&1 || git config user.email 'autocommit@arena.education'
 G=$(git rev-parse --absolute-git-dir)
+
+# --- An operation in progress ---------------------------------------------------------------
+# A participant mid-way through a conflicted `git pull upstream main` (a merge), a cherry-pick or a
+# revert — or with the conflicts a `git stash pop` left — has conflict markers in the tree: `add
+# -A` would stage them as resolved and the commit would end the operation (a merge committed as a
+# merge, markers and all, then pushed), after which `git merge --abort` and the editor's conflict
+# view no longer work. So while one lasts nothing is staged, committed or pushed: the run says
+# what is in progress and stops (exit 6), the operation stays where the participant left it, and
+# the caller copies the pod by rsync instead. A rebase never gets here: it detaches HEAD (SKIP).
+# @ARENA_BUSY_OP_SH@
+W=$(busy_op "$G")
+if [ -n "$W" ]; then echo "BUSY $B $W"; exit 6; fi
+
 T="$G/arena-backup.$$"
 trap 'rm -f "$T".*' EXIT
 # @ARENA_REDACT_SH@

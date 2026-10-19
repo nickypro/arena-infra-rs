@@ -618,7 +618,18 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     (the URL never with its credentials), and the run fails. Its work reaches no git remote at
     all, so it is rsynced like a failed push, even under `--no-pull`. `set-branch` and
     `init-branches` don't switch it, and the reaper doesn't reap it until `pods setup`. No
-    configured repo: no check.
+    configured repo: no check. **A branch with an operation in progress** — a participant
+    mid-way through a conflicted `git pull upstream main` (a merge), a cherry-pick or a revert,
+    or with the conflicts a `git stash pop` left — is left exactly as it is (review R3: the
+    backup committed the conflict markers as a merge commit and pushed it, after which `git
+    merge --abort` and VS Code's conflict view no longer worked): nothing staged, committed or
+    pushed (`BUSY`, exit 6), `✗ <pod>: a merge is in progress on <branch> — not committed (a
+    backup now would commit its conflict markers and end the merge); finish it (\`git commit\`)
+    or abort it (\`git merge --abort\`) on the pod` (a cherry-pick's or revert's own
+    `--continue`/`--abort`; conflicts: `git add` them or `git reset --merge`), and the run fails.
+    It is rsynced like a failed push, even under `--no-pull`, every run until it's ended (the
+    reaper doesn't reap it meanwhile); the backup after that commits as always. A rebase detaches
+    HEAD, so it is skipped like `main`.
   - `pods set-branch <branch> <targets|--all> [--hard] [--init-branches]` — switch pods'
     ARENA checkout to a branch. Gentle by default (fetch + checkout + ff-only pull — fails on a diverged/dirty
     tree rather than clobbering work). **`--hard` is destructive**: force the branch to
@@ -639,7 +650,13 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     line saying so (its unpushed commits stay in that branch on the pod — or, after `--hard` onto
     that same branch, in its reflog); a pod that can be **neither pushed nor copied** (the copy
     failed too, the backup failed before its push, or another backup held its lock for the whole
-    2-min wait) is **not switched** (`✗ … not switched: <why>`), and the run fails. A file the
+    2-min wait) is **not switched** (`✗ … not switched: <why>`), and the run fails. A pod with
+    an operation in progress (a merge, …: see `pods backup`) is copied first the same way, its
+    line saying `⚠ NOT COMMITTED FIRST: a merge is in progress on <branch>…`; the gentle switch
+    then refuses to end it (`arena set-branch: a merge is in progress on <branch> — not switched
+    (a switch now would end the merge); finish it … on the pod, then switch again`, exit 6 —
+    git's own checkout would drop a merge whose conflicts are staged), and `--hard` ends it with
+    the uncommitted changes it discards, its line saying only the copy has them. A file the
     backup committed with a key redacted keeps the real key on disk: around the switch it's set
     aside in `.git/arena-unredacted/<time>-<pid>/` (so gentle doesn't refuse it and `--hard`
     doesn't drop the key; a later set-aside never overwrites an earlier one) and put back when
@@ -651,8 +668,11 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     upstream **without committing** (legacy `init_branches`), so a new day's branch
     exists before `backup` runs. `--week`/`--day` override; `--dry-run` previews. 2-min
     budget per pod. A pod still on another branch has it backed up first, as `set-branch` does
-    (and isn't switched if it can be neither pushed nor copied). No targets = this cohort's
-    pods, as for `backup`.
+    (and isn't switched if it can be neither pushed nor copied). A pod with a merge (cherry-pick,
+    revert, conflicts) in progress is refused, touching nothing (`arena init-branches: a merge
+    is in progress on <branch> — not switched …`, exit 6): `git checkout -b` would drop the
+    merge and carry its conflicts onto the new branch, with nothing left to abort. No targets =
+    this cohort's pods, as for `backup`.
   - `pods run [-t <targets>] [--timeout <secs>] <cmd>` / `pods test [targets]` — run an
     arbitrary command on every (selected) pod (concurrent, confirms first naming the pods;
     each pod gets `--timeout`, default 1800s = 30 min — flags go *before* the command: a bare

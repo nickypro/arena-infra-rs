@@ -5481,7 +5481,8 @@ fn fallback_lines(unpushed: &[Unpushed], pulled: &Result<Pulled>) -> Vec<String>
                 Ok(to) => format!(" → files copied to {to}"),
                 Err(why) => format!("; the fallback copy failed too: {why}"),
             };
-            let failed = if u.wrong_origin { "not backed up to git" } else { "git push failed" };
+            // Nothing was committed (a wrong origin, an operation in progress): no push to fail.
+            let failed = if u.wrong_origin || u.busy.is_some() { "not backed up to git" } else { "git push failed" };
             format!("✗ {}: {failed} ({}){copy}", u.pod, u.why)
         })
         .collect()
@@ -5530,7 +5531,8 @@ struct BackupTally {
 /// ([`arena_core::backup::BackupReport::failed_at_push`]), and whether its `origin` isn't the
 /// configured repo (`WRONG_ORIGIN`: nothing was committed or pushed). Those two are the failures
 /// `pods backup` copies by rsync instead ([`copy_unpushed`]). A pod with no repo, or ssh refused,
-/// fails the same way every run and isn't.
+/// fails the same way every run and isn't. `busy`: what was in progress on the branch (`BUSY`: a
+/// merge, …), so nothing was committed — a failure at the push for the copy, said as what it is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Unpushed {
     pod: String,
@@ -5538,6 +5540,7 @@ struct Unpushed {
     branch: Option<String>,
     at_push: bool,
     wrong_origin: bool,
+    busy: Option<String>,
 }
 
 impl Unpushed {
@@ -5676,18 +5679,20 @@ async fn backup_fleet(
                     format!("[{done}/{total}] ✓ {name} (done){also}")
                 }
             },
-            // A failure the script explained (a big file or a key GitHub refuses, a heal cut short).
+            // A failure the script explained (a big file or a key GitHub refuses, a heal cut short,
+            // an operation in progress).
             Ok(out) if report.failure(repo, name, out.code).is_some() => {
                 t.failed += 1;
                 let why = report.failure_brief(out.code).unwrap_or_else(|| failure_why(&call));
                 let wrong_origin = report.wrong_origin_why(out.code).is_some();
-                t.unpushed.push(Unpushed { pod: name.clone(), why, branch: report.branch.clone(), at_push: report.failed_at_push(), wrong_origin });
+                let busy = report.in_progress(out.code).map(String::from);
+                t.unpushed.push(Unpushed { pod: name.clone(), why, branch: report.branch.clone(), at_push: report.failed_at_push(), wrong_origin, busy });
                 format!("[{done}/{total}] ✗ {name}: {}", report.failure(repo, name, out.code).unwrap_or_default())
             }
             _ => {
                 t.failed += 1;
                 let at_push = report.failed_at_push();
-                t.unpushed.push(Unpushed { pod: name.clone(), why: failure_why(&call), branch: report.branch.clone(), at_push, wrong_origin: false });
+                t.unpushed.push(Unpushed { pod: name.clone(), why: failure_why(&call), branch: report.branch.clone(), at_push, wrong_origin: false, busy: None });
                 failure_line(done, total, name, &call)
             }
         };
@@ -8201,7 +8206,7 @@ struct Switched {
     /// Not switched: their branch could be neither pushed nor copied, their origin isn't the
     /// configured repo, or another backup held their lock — `(pod, why)`.
     not_switched: Vec<(String, String)>,
-    /// Switched after their files were copied, their push having failed.
+    /// Copied, their push having failed, before their switch (in `failed` too when it failed).
     copied: Vec<String>,
 }
 
@@ -8223,11 +8228,14 @@ impl Switched {
                 names.join(", ")
             ));
         }
-        if !self.copied.is_empty() {
+        // Copied, then switched — a copied pod whose switch failed (one that refuses to end a
+        // merge in progress) is counted with the failures above, never said to be switched.
+        let copied: Vec<&str> = self.copied.iter().filter(|p| !self.failed.contains(p)).map(String::as_str).collect();
+        if !copied.is_empty() {
             problems.push(format!(
                 "{} pod(s) switched with their branch copied, not pushed (see each one's line): {}",
-                self.copied.len(),
-                self.copied.join(", ")
+                copied.len(),
+                copied.join(", ")
             ));
         }
         if !problems.is_empty() {
@@ -8322,6 +8330,8 @@ async fn switch_guarded(
             Err(also) => {
                 let why = if u.wrong_origin {
                     format!("{} — not backed up to git; run `arena pods setup {}`", u.why, u.pod)
+                } else if u.busy.is_some() {
+                    format!("its work couldn't be committed ({}) and {also}", u.why)
                 } else {
                     format!("its branch couldn't be pushed ({}) and {also}", u.why)
                 };
@@ -8369,7 +8379,7 @@ async fn switch_batch(
                 run.ok += 1;
             }
             _ => {
-                println!("{}{note}", failure_line(done, total, name, &call));
+                say(&format!("{}{note}", failure_line(done, total, name, &call)));
                 run.failed.push(name.clone());
             }
         }
@@ -8381,6 +8391,12 @@ async fn switch_batch(
 /// The loud part of a pod's line when it was switched with its branch copied, not pushed: which
 /// branch, why, where its files went — and where its commits are now (`reset_onto`: the branch a
 /// `--hard` switch resets; on that branch, its unpushed commits are left only in the reflog).
+///
+/// A pod with an operation in progress (`u.busy`: a merge, …) had nothing committed at all: its
+/// line says what is in progress instead of a push's failure. A gentle switch (and init-branches)
+/// refuses to end it, on the same line ([`arena_core::backup::checkout_command`]); `--hard`
+/// (`reset_onto` set) ends it and discards the uncommitted changes with it, which only the copy
+/// has then — said here.
 fn not_pushed_note(u: &Unpushed, copied_to: &str, reset_onto: Option<&str>) -> String {
     let branch = u.branch.as_deref().unwrap_or("the branch it was on");
     let commits = if reset_onto.is_some() && u.branch.as_deref() == reset_onto {
@@ -8388,6 +8404,17 @@ fn not_pushed_note(u: &Unpushed, copied_to: &str, reset_onto: Option<&str>) -> S
     } else {
         "its commits stay on the pod in that branch (switching deletes no branch)".to_string()
     };
+    if let Some(what) = &u.busy {
+        let (situation, _) = arena_core::backup::busy_words(what, branch);
+        let ended = match reset_onto {
+            Some(_) => format!(
+                "the --hard switch ends {} and discards every uncommitted change on the pod (only that copy has them now); ",
+                arena_core::backup::busy_noun(what)
+            ),
+            None => String::new(),
+        };
+        return format!(" — ⚠ NOT COMMITTED FIRST: {situation}, so nothing was committed; its files were copied to {copied_to} first, and {ended}{commits}");
+    }
     format!(" — ⚠ NOT PUSHED FIRST: branch {branch} ({}); its files were copied to {copied_to} first, and {commits}", u.why)
 }
 
@@ -19866,7 +19893,7 @@ mod remote_tests {
     use super::{copy_failure_reason, fallback_lines, mirror_refusal_text, not_pushed_note, sync_time_label, unredacted_note, Pulled};
     use super::{failure_why, local_backup_dir, push_first_note, take_pod_locks, take_said, telling_line, PodCall};
     use arena_core::selector::{Naming, SelectArgs};
-    use arena_core::backup::{backup_command, checkout_command, init_branch_command, BackupConfig};
+    use arena_core::backup::{backup_command, checkout_command, init_branch_command, BackupConfig, BACKUP_BUSY_EXIT};
     use arena_core::remote::{FakeRemote, FakeReply, Remote, RemoteCall, PROBE_TIMEOUT};
     use arena_core::ssh::{login_shell_wrap, SshTarget};
     use arena_core::{Config, Pod, PodSpec, Provider, Result};
@@ -21161,7 +21188,7 @@ mod remote_tests {
         let start = Instant::now();
         let tally = backup_fleet(&remote, jobs, REPO, |l| lines.push(l.to_string()), |_| {}).await;
         let on_main = vec![("devtest-delta".to_string(), "main".to_string())];
-        let failed = |pod: &str, why: &str| Unpushed { pod: pod.into(), why: why.into(), branch: None, at_push: false, wrong_origin: false };
+        let failed = |pod: &str, why: &str| Unpushed { pod: pod.into(), why: why.into(), branch: None, at_push: false, wrong_origin: false, busy: None };
         assert_eq!(
             tally,
             BackupTally {
@@ -21370,13 +21397,13 @@ mod remote_tests {
     /// or why the copy failed too.
     #[test]
     fn each_failed_push_says_where_its_files_went_or_why_they_didnt() {
-        let u = |pod: &str, why: &str| Unpushed { pod: pod.into(), why: why.into(), branch: Some("autocommit-x".into()), at_push: true, wrong_origin: false };
+        let u = |pod: &str, why: &str| Unpushed { pod: pod.into(), why: why.into(), branch: Some("autocommit-x".into()), at_push: true, wrong_origin: false, busy: None };
         let mut unpushed = vec![
             u("devtest-bloom", "GitHub push protection: OpenRouter API Key at ex.py:3"),
             u("devtest-cloud", "exit 128: fatal: Could not read from remote repository."),
         ];
         // One that failed before its push: its own failure line is all it gets.
-        unpushed.push(Unpushed { pod: "devtest-delta".into(), why: "exit 2: no repo".into(), branch: None, at_push: false, wrong_origin: false });
+        unpushed.push(Unpushed { pod: "devtest-delta".into(), why: "exit 2: no repo".into(), branch: None, at_push: false, wrong_origin: false, busy: None });
         let pulled: anyhow::Result<Pulled> = Ok(Pulled {
             failures: vec!["devtest-cloud [big]".into()],
             failed: vec![("devtest-cloud".into(), "[big] rsync exit 12".into())],
@@ -21436,7 +21463,7 @@ mod remote_tests {
         let mut lines = Vec::new();
         let tally = backup_fleet(&remote, jobs, REPO, |l| lines.push(l.to_string()), |_| {}).await;
         assert_eq!((tally.pushed, tally.failed), (1, 1));
-        let bloom = Unpushed { pod: "devtest-bloom".into(), why: WRONG_WHY.into(), branch: None, at_push: false, wrong_origin: true };
+        let bloom = Unpushed { pod: "devtest-bloom".into(), why: WRONG_WHY.into(), branch: None, at_push: false, wrong_origin: true, busy: None };
         assert_eq!(tally.unpushed, std::slice::from_ref(&bloom));
         let mut got = unnumbered(&lines);
         got.sort();
@@ -21699,6 +21726,7 @@ mod remote_tests {
             branch: Some("autocommit-devtest-w1d1-bloom".into()),
             at_push: true,
             wrong_origin: false,
+            busy: None,
         };
         let to = "/b/w1d1/devtest-bloom (and /b/big/devtest-bloom)";
         assert_eq!(
@@ -21724,6 +21752,175 @@ mod remote_tests {
         );
         assert_eq!(unredacted_note("UNREDACTED_RESTORED joep.py\n"), " — real key(s) back in 1 file(s) git has redacted: joep.py");
         assert_eq!(unredacted_note("RESTORED Grokking\n"), "");
+    }
+
+    /// A backup that found a merge in progress on the pod (exit 6): nothing committed.
+    fn busy_merge(branch: &str) -> FakeReply {
+        FakeReply::exit(BACKUP_BUSY_EXIT, "").with_stdout(&format!("BRANCH {branch}\nBUSY {branch} merge\n"))
+    }
+
+    const MERGE_WHY: &str =
+        "a merge is in progress on autocommit-b — not committed; finish it (`git commit`) or abort it (`git merge --abort`) on the pod";
+
+    /// Review R3: the 15-min backup committed a participant's conflicted `git pull upstream main`
+    /// — conflict markers and all, as a merge commit, pushed — and `git merge --abort` no longer
+    /// worked. Now that pod's backup stops before anything is staged (`BUSY`, exit 6): its line
+    /// says what is in progress and how to end it either way, it is copied by rsync in the same
+    /// run like a failed push (both tiers, even under --no-pull: its uncommitted work is nowhere
+    /// else), and the run fails. The other pods back up as always.
+    #[tokio::test]
+    async fn a_pod_mid_merge_is_left_as_it_is_said_how_to_end_it_and_copied() {
+        let script = |fake: &FakeRemote| {
+            fake.script(&host(22001), [FakeReply::stdout("BRANCH autocommit-a\nPUSHED autocommit-a\n")]);
+            fake.script(&host(22002), [busy_merge("autocommit-b"), repo_in_place()]);
+            fake.script(&host(22003), [FakeReply::stdout("BRANCH autocommit-c\nNO_CHANGES autocommit-c\n")]);
+        };
+        // Each pod's line: bloom's says what is in progress and both ways to end it.
+        let fake = Arc::new(FakeRemote::new());
+        script(&fake);
+        let remote: Arc<dyn Remote> = fake.clone();
+        let jobs = targets(&fleet()).into_iter().map(|(n, t)| (n, t, "backup".to_string())).collect();
+        let mut lines = Vec::new();
+        let tally = backup_fleet(&remote, jobs, REPO, |l| lines.push(l.to_string()), |_| {}).await;
+        assert_eq!((tally.pushed, tally.unchanged, tally.failed), (1, 1, 1));
+        let mut got = unnumbered(&lines);
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                "= devtest-cloud (no changes, on autocommit-c)".to_string(),
+                "✓ devtest-apple -> autocommit-a".to_string(),
+                "✗ devtest-bloom: a merge is in progress on autocommit-b — not committed (a backup now would commit its conflict \
+                 markers and end the merge); finish it (`git commit`) or abort it (`git merge --abort`) on the pod"
+                    .to_string(),
+            ]
+        );
+        // Its record: what is in progress, failed at the push (so it's copied), said as what it is.
+        let bloom = Unpushed {
+            pod: "devtest-bloom".into(),
+            why: MERGE_WHY.into(),
+            branch: Some("autocommit-b".into()),
+            at_push: true,
+            wrong_origin: false,
+            busy: Some("merge".into()),
+        };
+        assert_eq!(tally.unpushed, std::slice::from_ref(&bloom));
+
+        // `pods backup --no-pull` (the cron's): bloom alone copied, both tiers; the run fails.
+        let stub = StubRsync::new("busy");
+        let fake = Arc::new(FakeRemote::new());
+        script(&fake);
+        let err = handle_full_backup(fake.clone(), &cfg_at(&stub), &everyone(&fleet()), true, None, false, true, &stub.path()).await.unwrap_err();
+        assert_eq!(err.to_string(), "1 pod(s) failed to back up");
+        let copied = stub.take();
+        assert!(copied.len() == 3 && copied.iter().all(|d| d.ends_with("/devtest-bloom")), "only bloom, both tiers: {copied:?}");
+        assert_eq!(execs(&fake, 22002)[1], (arena_core::volume::probe_command(REPO), Some(PROBE_TIMEOUT)), "bloom's copy");
+        for port in [22001, 22003] {
+            assert_eq!(execs(&fake, port).len(), 1, "{port}: its backup only");
+        }
+        // Its line after the copy: not "git push failed" — nothing was committed.
+        let pulled: anyhow::Result<Pulled> =
+            Ok(Pulled { failures: vec![], failed: vec![], snapshot_root: "/b/w41d5".into(), big_root: Some("/b/big".into()) });
+        assert_eq!(
+            fallback_lines(std::slice::from_ref(&bloom), &pulled),
+            [format!("✗ devtest-bloom: not backed up to git ({MERGE_WHY}) → files copied to /b/w41d5/devtest-bloom (and /b/big/devtest-bloom)")]
+        );
+        let refused: anyhow::Result<Pulled> = Err(anyhow::anyhow!("no space"));
+        assert_eq!(
+            fallback_lines(&[bloom], &refused),
+            [format!("✗ devtest-bloom: not backed up to git ({MERGE_WHY}); the fallback copy failed too: no space")]
+        );
+    }
+
+    /// `set-branch` backs up each pod's branch first; a pod mid-merge can't be (`BUSY`). Its files
+    /// are copied first, as for a failed push, and then the switch: `--hard` ends the merge with
+    /// the uncommitted changes it discards — said, with where the only copy of them is — while the
+    /// gentle switch and init-branches refuse to end it (their command's own refusal, on the pod's
+    /// line with the copy's note), and the run never calls that pod switched. A pod whose copy
+    /// failed too is not switched at all.
+    #[tokio::test]
+    async fn set_branch_copies_a_pod_mid_merge_first_and_its_line_names_the_merge() {
+        let stub = StubRsync::new("busy-switch");
+        let cfg = cfg_at(&stub);
+        let backup = |name: &str| (backup_command(REPO, Some(KEY), &format!("arena backup devtest-{name}"), None), Some(BACKUP_TIMEOUT));
+        let probe = (arena_core::volume::probe_command(REPO), Some(PROBE_TIMEOUT));
+        let copied_first = " — ⚠ NOT COMMITTED FIRST: a merge is in progress on autocommit-b, so nothing was committed; its files were \
+                            copied to ";
+        let stays = "its commits stay on the pod in that branch (switching deletes no branch)";
+
+        // --hard: copied, then switched; the line says the switch ended the merge.
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [FakeReply::stdout("BRANCH autocommit-a\nPUSHED autocommit-a\n"), FakeReply::ok()]);
+        fake.script(&host(22002), [busy_merge("autocommit-b"), repo_in_place(), FakeReply::ok()]);
+        let _ = crate::take_said();
+        let err = handle_set_branch(fake.clone(), &cfg, "main", &everyone(&fleet()), true, false, true, &stub.path()).await.unwrap_err();
+        assert_eq!(err.to_string(), "1 pod(s) switched with their branch copied, not pushed (see each one's line): devtest-bloom");
+        let hard = (checkout_command(REPO, "main", Some(KEY), true), Some(BRANCH_TIMEOUT));
+        assert_eq!(execs(&fake, 22002), [backup("bloom"), probe.clone(), hard]);
+        assert!(stub.take().iter().all(|d| d.ends_with("/devtest-bloom")));
+        let said = unnumbered(&crate::take_said());
+        let line = said.iter().find(|l| l.starts_with("✓ devtest-bloom (on main)")).unwrap_or_else(|| panic!("{said:#?}"));
+        assert!(line.starts_with(&format!("✓ devtest-bloom (on main){copied_first}")), "{line}");
+        assert!(
+            line.ends_with(&format!(
+                " first, and the --hard switch ends the merge and discards every uncommitted change on the pod (only that copy has \
+                 them now); {stays}"
+            )),
+            "{line}"
+        );
+
+        // Gentle, and init-branches: copied, then the switch refuses to end the merge — said on
+        // the pod's line with the copy's note, and counted as a failed switch, never a switched one.
+        let refusal = |who: &str| {
+            format!(
+                "{who}: a merge is in progress on autocommit-b — not switched (a switch now would end the merge); finish it (`git \
+                 commit`) or abort it (`git merge --abort`) on the pod, then switch again"
+            )
+        };
+        for (who, init) in [("arena set-branch", false), ("arena init-branches", true)] {
+            let fake = Arc::new(FakeRemote::new());
+            fake.script(&host(22001), [FakeReply::stdout("BRANCH autocommit-a\nPUSHED autocommit-a\n"), FakeReply::ok()]);
+            fake.script(&host(22002), [busy_merge("autocommit-b"), repo_in_place(), FakeReply::exit(BACKUP_BUSY_EXIT, &refusal(who))]);
+            let err = if init {
+                handle_init_branches(fake.clone(), &cfg, Some(1), Some(2), &everyone(&fleet()), false, true, &stub.path()).await
+            } else {
+                handle_set_branch(fake.clone(), &cfg, "main", &everyone(&fleet()), false, false, true, &stub.path()).await
+            }
+            .unwrap_err();
+            let verb = if init { "init branch" } else { "switch branch" };
+            assert_eq!(err.to_string(), format!("1 pod(s) failed to {verb}"), "{who}: never said to be switched");
+            assert_eq!(execs(&fake, 22002).len(), 3, "{who}: backup, copy, switch");
+            assert!(stub.take().iter().all(|d| d.ends_with("/devtest-bloom")), "{who}");
+            let said = unnumbered(&crate::take_said());
+            let line = said.iter().find(|l| l.starts_with("✗ devtest-bloom (exit 6): ")).unwrap_or_else(|| panic!("{who}: {said:#?}"));
+            assert!(line.starts_with(&format!("✗ devtest-bloom (exit 6): {}{copied_first}", refusal(who))), "{line}");
+            assert!(line.ends_with(&format!(" first, and {stays}")), "{line}");
+        }
+
+        // The copy fails too: not switched, its line says why both failed.
+        let failing = StubRsync::new("busy-copyfail");
+        std::fs::write(
+            failing.0.join("rsync"),
+            "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\necho \"$last\" >> \"$(dirname \"$0\")/calls.log\"\n\
+             echo 'rsync: No space left on device (28)' >&2; exit 11\n",
+        )
+        .unwrap();
+        let cfg = cfg_at(&failing);
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22002), [busy_merge("autocommit-b"), repo_in_place()]);
+        let err = handle_set_branch(fake.clone(), &cfg, "main", &everyone(&fleet_of(&[("bloom", 22002)])), true, false, true, &failing.path())
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "1 pod(s) NOT switched — each one's line says why: devtest-bloom");
+        assert_eq!(execs(&fake, 22002), [backup("bloom"), probe], "never switched");
+        let said = crate::take_said();
+        let line = said.iter().find(|l| l.starts_with("✗ devtest-bloom not switched: ")).unwrap_or_else(|| panic!("{said:#?}"));
+        assert!(
+            line.starts_with(&format!(
+                "✗ devtest-bloom not switched: its work couldn't be committed ({MERGE_WHY}) and copying its files into "
+            )),
+            "{line}"
+        );
     }
 
     /// A [`Remote`] that, at every call, notes whether the pod's backup lock was held right then
