@@ -1096,7 +1096,6 @@ fn total(amounts: impl Iterator<Item = f64>) -> f64 {
     amounts.fold(0.0, |a, b| a + b)
 }
 
-/// A shell identifier (`[A-Za-z_][A-Za-z0-9_]*`).
 /// A cron line as the checklist shows it: an arena line's leading `mkdir -p <dirs> &&` and the
 /// inline env after it (`PATH=…`, `ARENA_START_DATE=…`) left out, so the cut to
 /// [`MAX_SHOWN`] never hides what the line runs; any other line as it is.
@@ -1135,6 +1134,7 @@ fn cron_shown(line: &str) -> String {
     }
 }
 
+/// A shell identifier (`[A-Za-z_][A-Za-z0-9_]*`).
 fn is_identifier(s: &str) -> bool {
     let mut chars = s.chars();
     chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')

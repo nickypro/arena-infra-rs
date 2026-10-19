@@ -521,7 +521,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     (and `--no-pull`, `--no-start-date`) imply `--backup`, and a bare `cron install` means
     `--backup`. Rewriting the backup line **keeps the installed one's `--pull`, start date and
     schedule** unless a flag changes them (`--no-pull` / `--no-start-date` drop one; a note
-    says what was kept), so `cron install --backup` just upgrades the line; `--proxy` = a `*/5 … proxy
+    says what was kept), so `cron install --backup` just upgrades the line — a start date it
+    can't read back (a hand edit's `cd /root && ARENA_START_DATE=…`) is the one thing dropped,
+    with a note (`--start-date` sets it again); `--proxy` = a `*/5 … proxy
     apply --yes` line (log `proxy.log`; a `PATH` with `/usr/sbin` so cron finds
     nginx) that catches changes made outside the CLI (dashboard terminates, restarts that
     move an endpoint) — remove it before changing `MACHINE_NAME_PREFIX`/`_LIST`: a name that
@@ -537,7 +539,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     default** (`backup.log`, `proxy.log`, `snapshot.log`, `archive.log`, `reap.log`), so nothing
     new appears in your home. **A line that already logs somewhere else keeps doing so**: a
     re-install keeps the installed line's `>> PATH` (say `/root/logs/cron/arena-cron.log`, a
-    folder logrotate rotates) — only arena's own old defaults move. Every line starts with
+    folder logrotate rotates; `>>PATH`, with or without `2>&1`, too) — only arena's own old
+    defaults move. A line whose log it can't read (`> PATH`, `2>>ERR`, a comment after it, a
+    quoted path with a space) gets the default log, and a note names that line's redirection. Every line starts with
     `mkdir -p` of the cron folder and of a kept log's folder: cron's `sh` doesn't run a command
     whose `>>` (or lock) points into a missing directory, so a deleted folder would otherwise
     silently stop the backups. arena doesn't rotate its logs: add a logrotate rule for whichever

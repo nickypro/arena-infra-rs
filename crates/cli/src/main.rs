@@ -3714,13 +3714,6 @@ async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::path::Path, 
             // start date), else the default.
             let installed = before.iter().find(|l| CronKind::of(l) == Some(CronKind::Backup));
             let read_back = installed.and_then(|l| BackupOpts::of_line(l));
-            if backup && installed.is_some() && read_back.is_none() {
-                notes.push(
-                    "note: couldn't read the installed backup line's options (hand-edited?) — it is rewritten from \
-                     these flags alone; check the diff"
-                        .to_string(),
-                );
-            }
             let flags = BackupFlags {
                 schedule: schedule.as_deref(),
                 start_date: start_date.as_deref(),
@@ -3728,6 +3721,7 @@ async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::path::Path, 
                 pull,
                 no_pull,
             };
+            notes.extend(backup_read_note(backup, installed.map(String::as_str), read_back.as_ref(), &flags));
             let (opts, kept) = resolve_backup_opts(read_back.as_ref(), &flags);
             if backup && !kept.is_empty() {
                 notes.push(format!(
@@ -3797,6 +3791,7 @@ async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::path::Path, 
                     arena_core::cron::DIR
                 ));
             }
+            notes.extend(unread_logs_note(&before, &kinds));
             // The archive pushes what the backup line's `--pull` writes: without it there is
             // nothing new to push.
             if archive && !after.iter().any(|l| BackupOpts::of_line(l).is_some_and(|o| o.pull)) {
@@ -3893,14 +3888,36 @@ fn cron_home(home: Option<&str>, euid: u32) -> Result<String> {
     Ok(home.to_string())
 }
 
-/// This process's effective uid: the owner of `/proc/self` (Linux), else `id -u`.
+/// This process's effective uid: the owner of a file it has just created in the temp dir (and
+/// removed), else of `/proc/self`, else `id -u`. Why the file first (review fb2 F10): a new
+/// file is owned by the uid this process makes files as — what the HOME check and the tidy
+/// compare with — whereas `/proc/<pid>` is made root's for a process that isn't dumpable (a
+/// setuid or capability wrapper, `fs.suid_dumpable=0` after a credential change), which would
+/// read a user as uid 0. No libc call: no new crate.
 fn effective_uid() -> Result<u32> {
     use std::os::unix::fs::MetadataExt;
+    if let Some(uid) = created_file_owner(&std::env::temp_dir()) {
+        return Ok(uid);
+    }
     if let Ok(m) = std::fs::metadata("/proc/self") {
         return Ok(m.uid());
     }
     let out = std::process::Command::new("id").arg("-u").output().context("running `id -u`")?;
     String::from_utf8_lossy(&out.stdout).trim().parse().context("reading the effective uid from `id -u`")
+}
+
+/// The owner of a file created new in `dir` (`create_new`, so never someone else's file), read
+/// from the open file and removed at once. `None` when none could be made.
+fn created_file_owner(dir: &std::path::Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+    (0..4).find_map(|i| {
+        let path = dir.join(format!(".arena-euid-{}-{nanos}-{i}", std::process::id()));
+        let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).ok()?;
+        let uid = file.metadata().ok().map(|m| m.uid());
+        let _ = std::fs::remove_file(&path);
+        uid
+    })
 }
 
 /// `value` (`what`: the arena binary, the config path) as one word of a crontab line: refused
@@ -3913,12 +3930,56 @@ fn crontab_word(what: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// A crontab line's log: `PATH` when the line ends in `>> PATH 2>&1`, as arena's lines do.
+/// A crontab line's log: `PATH` when the line ends in an append of its output to one file —
+/// `>> PATH 2>&1` as arena's lines do, or a hand edit's `>>PATH 2>&1`, `>> PATH` or `>>PATH`
+/// (review fb2 F8: those moved to the default log, said only by the diff). `None` for any other
+/// ending — none, `> PATH`, `2>>ERR`, a comment after it, a quoted path with a space — which
+/// [`unread_log`] tells apart from a line that logs nowhere. Pure.
 fn cron_log_target(line: &str) -> Option<&str> {
-    match line.split_whitespace().collect::<Vec<_>>()[..] {
-        [.., ">>", path, "2>&1"] => Some(path),
-        _ => None,
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let words = words.strip_suffix(&["2>&1"]).unwrap_or(&words);
+    let path = match words {
+        [.., ">>", path] => *path,
+        [.., last] => last.strip_prefix(">>")?,
+        [] => return None,
+    };
+    Some(path).filter(|p| !p.is_empty() && !p.starts_with(['>', '&']))
+}
+
+/// The output redirection of a crontab line whose log [`cron_log_target`] can't read (from its
+/// first word with a `>` other than `2>&1`: `> /x.log 2>&1`, `>> /x.log 2>>/err`, …) — a re-install
+/// logs it to arena's default instead, which the install's note says. `None`: its log was read,
+/// or it has none. Pure.
+fn unread_log(line: &str) -> Option<String> {
+    if cron_log_target(line).is_some() {
+        return None;
     }
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let from = words.iter().position(|w| w.contains('>') && *w != "2>&1")?;
+    Some(words[from..].join(" "))
+}
+
+/// The note `cron install` adds when an installed line of a kind it rewrites (`kinds`; the first
+/// of each, the one replaced in place: [`kept_logs`]) has a log it couldn't read
+/// ([`unread_log`]): those lines now log to arena's default, and how to keep one. Pure.
+fn unread_logs_note(before: &[String], kinds: &[CronKind]) -> Option<String> {
+    let mut seen = Vec::new();
+    let mut unread = Vec::new();
+    for line in before {
+        let Some(kind) = CronKind::of(line).filter(|k| kinds.contains(k) && !seen.contains(k)) else { continue };
+        seen.push(kind);
+        if let Some(redirect) = unread_log(line) {
+            unread.push(format!("{} (`{redirect}`)", kind.label()));
+        }
+    }
+    (!unread.is_empty()).then(|| {
+        format!(
+            "note: couldn't read where these installed lines log — their new lines log to arena's default (~/{}/) instead; end \
+             a line with `>> PATH 2>&1` for a re-install to keep its log; check the diff: {}",
+            arena_core::cron::DIR,
+            unread.join(", ")
+        )
+    })
 }
 
 /// A crontab line's `flock` file: the word after `flock` and its `-…` options.
@@ -4199,9 +4260,11 @@ impl BackupOpts {
     /// fields, or one `@…` macro), an `ARENA_START_DATE=` among the inline env assignments
     /// before the command (only a valid date; after the `mkdir -p … &&` this version's line
     /// starts with: [`cron_line_parts`]), and whether it pulls (`pods backup` does
-    /// unless `--no-pull`). `None` for a line that isn't a backup line, has no readable
-    /// schedule, or names a start date that can't be read that way (the install then says it
-    /// couldn't read the line, rather than drop the date unannounced). Pure.
+    /// unless `--no-pull`). `None` for a line that isn't a backup line or has no readable
+    /// schedule. A start date that can't be read that way (behind a `cd … &&`, invalid, in a
+    /// comment) is left out and the rest kept — [`unread_start_date`] says so, for the install's
+    /// note (review fb2 F7: the whole line used to read as unreadable, so a re-install dropped its
+    /// schedule and `--pull` with the date). Pure.
     fn of_line(line: &str) -> Option<BackupOpts> {
         if CronKind::of(line) != Some(CronKind::Backup) {
             return None;
@@ -4220,12 +4283,35 @@ impl BackupOpts {
             .filter_map(|w| w.strip_prefix("ARENA_START_DATE="))
             .find(|d| arena_core::schedule::parse_ymd(d).is_some())
             .map(String::from);
-        // A start date somewhere in the line that wasn't read (behind a `cd … &&`, invalid, …):
-        // unreadable, so the install says so instead of silently dropping it.
-        if start_date.is_none() && line.contains("ARENA_START_DATE=") {
-            return None;
-        }
         Some(BackupOpts { schedule, start_date, pull: !words.contains(&"--no-pull") })
+    }
+}
+
+/// Whether an installed backup line names an `ARENA_START_DATE=` that [`BackupOpts::of_line`]
+/// couldn't read (behind a `cd … &&`, an invalid date, in a comment …): its re-install keeps the
+/// line's schedule and `--pull` and drops only the date, which [`backup_read_note`] says. Pure.
+fn unread_start_date(line: &str) -> bool {
+    line.contains("ARENA_START_DATE=") && BackupOpts::of_line(line).is_some_and(|o| o.start_date.is_none())
+}
+
+/// What `cron install` says about the installed backup line it rewrites (`backup`; `installed`,
+/// and `read`: what [`BackupOpts::of_line`] read of it) — that it couldn't read the line's
+/// options at all, so the flags alone decide; or only its start date, dropped while the rest is
+/// kept, unless `--start-date` / `--no-start-date` decides that too. `None`: nothing to say. Pure.
+fn backup_read_note(backup: bool, installed: Option<&str>, read: Option<&BackupOpts>, f: &BackupFlags) -> Option<String> {
+    let line = installed.filter(|_| backup)?;
+    match read {
+        None => Some(
+            "note: couldn't read the installed backup line's options (hand-edited?) — it is rewritten from these flags alone; \
+             check the diff"
+                .to_string(),
+        ),
+        Some(_) if f.start_date.is_none() && !f.no_start_date && unread_start_date(line) => Some(
+            "note: couldn't read the installed backup line's ARENA_START_DATE (hand-edited?) — the new line has none \
+             (--start-date YYYY-MM-DD sets one); its schedule and --pull are kept; check the diff"
+                .to_string(),
+        ),
+        Some(_) => None,
     }
 }
 
@@ -18436,10 +18522,11 @@ mod tests {
             // Tabs, a macro schedule, another env var first.
             ("@hourly\tPATH=/usr/bin ARENA_START_DATE=2026-02-02 /opt/arena pods backup --no-pull --yes", o("@hourly", Some("2026-02-02"), false)),
             // A start date that isn't one, one that isn't a leading env assignment (a hand edit
-            // behind `cd … &&`, an argument): unreadable — the install says so rather than drop it.
-            ("*/15 * * * * ARENA_START_DATE=soon /opt/arena pods backup --yes", None),
-            ("*/15 * * * * /opt/arena pods backup --yes # ARENA_START_DATE=2026-01-05", None),
-            ("*/15 * * * * cd /root && ARENA_START_DATE=2026-10-05 flock -n /l /opt/arena pods backup --yes", None),
+            // behind `cd … &&`, an argument): left out, the rest read (review fb2 F7) — the install
+            // says so ([`super::unread_start_date`]).
+            ("*/15 * * * * ARENA_START_DATE=soon /opt/arena pods backup --yes", o("*/15 * * * *", None, true)),
+            ("*/15 * * * * /opt/arena pods backup --yes # ARENA_START_DATE=2026-01-05", o("*/15 * * * *", None, true)),
+            ("*/30 * * * * cd /root && ARENA_START_DATE=2026-10-05 flock -n /l /opt/arena pods backup --no-pull --yes", o("*/30 * * * *", None, false)),
             // Several folders made first (a kept log elsewhere): still read.
             (
                 "*/15 * * * * mkdir -p /h/.local/state/arena-cron /h/logs/cron && ARENA_START_DATE=2026-01-05 flock -n -o \
@@ -18454,6 +18541,135 @@ mod tests {
         for (line, want) in cases {
             assert_eq!(&BackupOpts::of_line(line), want, "{line}");
         }
+    }
+
+    /// Review fb2 F7: an installed backup line whose start date can't be read (a hand edit's `cd
+    /// /root && ARENA_START_DATE=…`) read as unreadable altogether, so a re-install dropped its
+    /// schedule and `--pull` with the date. Now only the date goes, and the note says so; when
+    /// the flags decide the date, or the line isn't rewritten, there's nothing to say.
+    #[test]
+    fn an_unreadable_start_date_drops_only_the_date() {
+        use super::{backup_read_note, resolve_backup_opts, unread_start_date, BackupFlags, BackupOpts};
+        let line = "*/30 * * * * cd /root && ARENA_START_DATE=2026-10-05 /usr/local/bin/arena --config /c pods backup --yes >> \
+                    /root/logs/cron/arena-cron.log 2>&1";
+        let read = BackupOpts::of_line(line).unwrap();
+        assert_eq!(read, BackupOpts { schedule: "*/30 * * * *".into(), start_date: None, pull: true });
+        assert!(unread_start_date(line));
+        let none = BackupFlags { schedule: None, start_date: None, no_start_date: false, pull: false, no_pull: false };
+        let (opts, kept) = resolve_backup_opts(Some(&read), &none);
+        assert_eq!(opts, BackupOpts { schedule: "*/30 * * * *".into(), start_date: None, pull: true });
+        assert_eq!(kept, ["schedule `*/30 * * * *`", "--pull"]);
+        assert_eq!(
+            backup_read_note(true, Some(line), Some(&read), &none).unwrap(),
+            "note: couldn't read the installed backup line's ARENA_START_DATE (hand-edited?) — the new line has none (--start-date \
+             YYYY-MM-DD sets one); its schedule and --pull are kept; check the diff"
+        );
+        // The flags decide the date, or the backup line isn't rewritten: nothing to say.
+        assert_eq!(backup_read_note(true, Some(line), Some(&read), &BackupFlags { start_date: Some("2026-10-05"), ..none }), None);
+        assert_eq!(backup_read_note(true, Some(line), Some(&read), &BackupFlags { no_start_date: true, ..none }), None);
+        assert_eq!(backup_read_note(false, Some(line), Some(&read), &none), None);
+        // A line read in full: nothing; none installed: nothing; no readable schedule: the flags alone, said.
+        let fine = "*/15 * * * * ARENA_START_DATE=2026-10-05 /opt/arena pods backup --yes";
+        assert!(!unread_start_date(fine) && !unread_start_date("*/15 * * * * /opt/arena pods backup --yes"));
+        assert_eq!(backup_read_note(true, Some(fine), BackupOpts::of_line(fine).as_ref(), &none), None);
+        assert_eq!(backup_read_note(true, None, None, &none), None);
+        assert!(backup_read_note(true, Some("* * * pods backup"), None, &none).unwrap().contains("rewritten from these flags alone"));
+    }
+
+    /// Review fb2 F8: a hand edit's `>>PATH 2>&1` (no space), `>> PATH` or `>>PATH` is a log
+    /// someone chose, kept like arena's own `>> PATH 2>&1`. Any other ending isn't read: the new
+    /// line logs to the default, as before — now said by the install's note, naming the line's
+    /// redirection, not only by the diff. A line that logs nowhere has nothing to say.
+    #[test]
+    fn a_lines_log_is_read_in_its_hand_edited_forms() {
+        use super::{cron_log_target, kept_logs, unread_log, unread_logs_note, CronKind::*};
+        let cmd = "*/15 * * * * /usr/local/bin/arena --config /c pods backup --yes";
+        // (ending, the log read, the redirection not read)
+        let cases: &[(&str, Option<&str>, Option<&str>)] = &[
+            (" >> /root/logs/cron/arena-cron.log 2>&1", Some("/root/logs/cron/arena-cron.log"), None),
+            (" >>/root/logs/cron/arena-cron.log 2>&1", Some("/root/logs/cron/arena-cron.log"), None),
+            (" >> /root/logs/cron/arena-cron.log", Some("/root/logs/cron/arena-cron.log"), None),
+            (" >>/root/logs/cron/arena-cron.log", Some("/root/logs/cron/arena-cron.log"), None),
+            ("\t>>\t/x.log\t2>&1", Some("/x.log"), None),
+            (" > /x.log 2>&1", None, Some("> /x.log 2>&1")),
+            (" >> /x.log 2>>/x.err", None, Some(">> /x.log 2>>/x.err")),
+            (" >> /x.log 2>&1 # mine", None, Some(">> /x.log 2>&1 # mine")),
+            (" >>\"/x y.log\" 2>&1", None, Some(">>\"/x y.log\" 2>&1")),
+            (" 2>>/x.err", None, Some("2>>/x.err")),
+            (" >>", None, Some(">>")),
+            (" >>&2", None, Some(">>&2")),
+            (" 2>&1", None, None),
+            ("", None, None),
+        ];
+        for (end, log, unread) in cases {
+            let line = format!("{cmd}{end}");
+            assert_eq!((cron_log_target(&line), unread_log(&line).as_deref()), (*log, *unread), "{line:?}");
+        }
+        // The live shape (`>>PATH 2>&1`, review F8's scenario) is a chosen log: kept.
+        let attached = format!("{cmd} >>/srv/x/logs/cron/arena-cron.log 2>&1");
+        assert_eq!(kept_logs(std::slice::from_ref(&attached), "/root"), [(Backup, "/srv/x/logs/cron/arena-cron.log".to_string())]);
+        assert_eq!(unread_logs_note(std::slice::from_ref(&attached), &[Backup]), None);
+        // The note: only the kinds being rewritten, the first line of each, its redirection named.
+        let before = vec![
+            format!("{cmd} > /x.log 2>&1"),
+            format!("{cmd} >> /second.log 2>>/err"),
+            "*/5 * * * * /usr/local/bin/arena --config /c proxy apply --yes >> /p.log 2>>/p.err".to_string(),
+            "*/5 * * * * /usr/local/bin/arena --config /c snapshot --public --out /w/fleet.json".to_string(),
+        ];
+        assert_eq!(
+            unread_logs_note(&before, &[Backup, Proxy, Snapshot]).unwrap(),
+            "note: couldn't read where these installed lines log — their new lines log to arena's default \
+             (~/.local/state/arena-cron/) instead; end a line with `>> PATH 2>&1` for a re-install to keep its log; check the \
+             diff: backup (`> /x.log 2>&1`), proxy (`>> /p.log 2>>/p.err`)"
+        );
+        assert!(unread_logs_note(&before, &[Proxy]).unwrap().ends_with("check the diff: proxy (`>> /p.log 2>>/p.err`)"));
+        assert_eq!(unread_logs_note(&before, &[Snapshot]), None);
+    }
+
+    /// Review fb2 F7/F8 end to end: a hand-edited backup line — its start date behind `cd … &&`,
+    /// its log `>>PATH` with no space — re-installed keeps its schedule, `--pull` and log; only the
+    /// date goes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cron_install_keeps_what_it_can_read_of_a_hand_edited_line() {
+        let s = CronStub::new("handedit");
+        let log = format!("{}/logs/cron/arena-cron.log", s.dir.display());
+        s.set_tab(&format!(
+            "{}\n*/30 * * * * cd /root && ARENA_START_DATE=2026-10-05 /usr/local/bin/arena --config /c pods backup --yes >>{log} 2>&1\n{}\n",
+            super::CRON_BEGIN,
+            super::CRON_END
+        ));
+        s.run(&["install", "--backup"]).await;
+        let lines = s.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("*/30 * * * * mkdir -p "), "the schedule kept: {lines:?}");
+        assert!(lines[0].ends_with(&format!(" pods backup --yes >> {log} 2>&1")), "--pull and the log kept: {lines:?}");
+        assert!(!lines[0].contains("ARENA_START_DATE") && !lines[0].contains("cd /root"), "{lines:?}");
+    }
+
+    /// Review fb2 F10: the effective uid is the owner of a file the process just made — not
+    /// `/proc/self`'s, which the kernel makes root's for a process that isn't dumpable. Here that
+    /// is the current user: the HOME check passes for a home this user owns, `id -u` agrees, and
+    /// the file is gone afterwards.
+    #[cfg(unix)]
+    #[test]
+    fn the_effective_uid_is_this_users_and_its_home_passes() {
+        use super::{created_file_owner, cron_home, effective_uid};
+        use std::os::unix::fs::MetadataExt;
+        let base = std::env::temp_dir().join(format!("arena-euid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("home")).unwrap();
+        let mine = std::fs::metadata(base.join("home")).unwrap().uid();
+        assert_eq!(created_file_owner(&base), Some(mine));
+        assert_eq!(std::fs::read_dir(&base).unwrap().count(), 1, "only home/: the file made is removed");
+        assert_eq!(effective_uid().unwrap(), mine);
+        let home = base.join("home").display().to_string();
+        assert_eq!(cron_home(Some(&home), effective_uid().unwrap()).unwrap(), home);
+        let id = std::process::Command::new("id").arg("-u").output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&id.stdout).trim().parse::<u32>().unwrap(), mine, "`id -u` agrees");
+        // Nowhere to make one: no answer (effective_uid falls back to /proc/self, then `id -u`).
+        assert_eq!(created_file_owner(&base.join("missing")), None);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The backup line a (re-)install writes: each option from its flag, else the installed
