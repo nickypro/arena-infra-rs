@@ -522,17 +522,27 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `--backup`. Rewriting the backup line **keeps the installed one's `--pull`, start date and
     schedule** unless a flag changes them (`--no-pull` / `--no-start-date` drop one; a note
     says what was kept), so `cron install --backup` just upgrades the line; `--proxy` = a `*/5 … proxy
-    apply --yes` line (log `~/arena-proxy-cron.log`; a `PATH` with `/usr/sbin` so cron finds
+    apply --yes` line (log `proxy.log`; a `PATH` with `/usr/sbin` so cron finds
     nginx) that catches changes made outside the CLI (dashboard terminates, restarts that
     move an endpoint) — remove it before changing `MACHINE_NAME_PREFIX`/`_LIST`: a name that
     leaves the list loses its forward on the next tick; `--snapshot <DIR>` = a `*/2 …
-    snapshot --public --out <DIR>/fleet.json` line (log `~/arena-snapshot-cron.log`) for the
+    snapshot --public --out <DIR>/fleet.json` line (log `snapshot.log`) for the
     [fleet page](#publishing-the-fleet-page); `--archive` = the [backup archive](#backup-archive-arena-archive)'s
     two push lines (`archive sync --tier snap` at :07/:22/:37/:52, `--tier big` at :40, under
-    `nice`, log `~/arena-archive-cron.log`, each tier locked in-process; refused without this
+    `nice`, log `archive.log`, each tier locked in-process; refused without this
     user's archive state, an absolute `LOCAL_BACKUP_DIR` or a start date). Every line runs under `flock -n` (a tick that
     finds the previous one still running exits instead of stacking — the backup's lock is
-    `~/.arena-backup-cron.lock`, held by `flock -o` itself so no stray rsync can keep it).
+    `backup.lock`, held by `flock -o` itself so no stray rsync can keep it). **Logs and locks
+    live in one folder, `~/.local/state/arena/cron/`** (`backup.log`, `proxy.log`,
+    `snapshot.log`, `archive.log`, `reap.log` and the `.lock`s) — arena's default state root,
+    so nothing new appears in your home — and every line starts with `mkdir -p` of it: cron's
+    `sh` doesn't run a command whose `>>` (or lock) points into a missing directory, so a
+    deleted folder would otherwise silently stop the backups. Older versions kept these in the
+    home (`~/arena-cron.log`, `~/arena-<line>-cron.log`, `~/.arena-<line>-cron.lock`):
+    re-running your `cron install …` replaces each old line in place and, once the crontab is
+    written, moves the rewritten lines' old logs into the folder (appended if the new log
+    exists; only regular files — a symlink is left alone) and deletes their old locks, saying
+    so in one `· cron logs now in …` line.
     `remove --backup|--proxy|--snapshot` drops just those; plain `remove` drops the whole
     block. Both print the block's before → after diff (every removed copy of a duplicate
     shown) and confirm (`--yes` for scripts, `--dry-run` to preview); `show` labels each line
@@ -935,7 +945,7 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     lists what's missing once the reaper is on or its cron line is installed (off: one `·
     reaper off (opt-in)` row, a ✗ only for a `REAP_*` value set but invalid). Every `pods reap
     … --json` prints exactly one JSON document on stdout — `{"error": …}` on a failure,
-    `{"skipped": …}` when another run holds the lock — and everything else on stderr. Rollout: `cron install --reap observe` first (logs `would_reap`; the line runs at :11/:27/:41/:57 — minutes no other arena line uses), then
+    `{"skipped": …}` when another run holds the lock — and everything else on stderr. Rollout: `cron install --reap observe` first (logs `would_reap`; the line runs at :11/:27/:41/:57 — minutes no other arena line uses — its output in `~/.local/state/arena/cron/reap.log`), then
     `--reap apply` (refused unless REAP_ENABLED=1). `reap set` also writes `~/.arena/NOTICE` and
     an interactive-only login banner on the pod (also written after `up`'s setup for a pod
     created with a policy, after `pods setup`, and after a restart's re-provision — the 1-hour

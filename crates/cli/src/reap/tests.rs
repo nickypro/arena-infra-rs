@@ -1568,11 +1568,11 @@ fn reap_cron_line_rules() {
     let e = super::super::reap_cron_line(true, &path, "/usr/local/bin/arena", "/root/c.env", "/root").unwrap_err().to_string();
     assert!(e.contains("REAP_ENABLED isn't 1") && e.contains("--reap observe"), "{e}");
     let observe = super::super::reap_cron_line(false, &path, "/usr/local/bin/arena", "/root/c.env", "/root").unwrap();
-    assert!(observe.ends_with("pods reap run >> /root/arena-reap-cron.log 2>&1") && !observe.contains("ARENA_STATE_DIR="), "{observe}");
+    assert!(observe.ends_with("pods reap run >> /root/.local/state/arena/cron/reap.log 2>&1") && !observe.contains("ARENA_STATE_DIR="), "{observe}");
     assert_eq!(super::super::CronKind::of(&observe), Some(super::super::CronKind::Reap));
     write(&format!("ARENA_STATE_DIR={state}\nREAP_ENABLED=1\n"));
     let apply = super::super::reap_cron_line(true, &path, "/usr/local/bin/arena", "/root/c.env", "/root").unwrap();
-    assert!(apply.contains(" pods reap run --apply --yes >> ") && apply.contains("flock -n -o /root/.arena-reap-cron.lock"), "{apply}");
+    assert!(apply.contains(" pods reap run --apply --yes >> ") && apply.contains("flock -n -o /root/.local/state/arena/cron/reap.lock"), "{apply}");
     assert_eq!(super::super::CronKind::of(&apply), Some(super::super::CronKind::Reap));
     // No state dir anywhere: refused.
     write("REAP_ENABLED=1\n");
@@ -1581,7 +1581,12 @@ fn reap_cron_line_rules() {
     write(&format!("ARENA_STATE_DIR={state}\nREAP_MAX_PER_DAY=500\n"));
     assert!(super::super::reap_cron_line(false, &path, "/a", "/c", "/root").unwrap_err().to_string().contains("REAP_MAX_PER_DAY"));
     // The other lines are never taken for it.
-    for other in ["*/15 * * * * flock -n -o /root/.arena-backup-cron.lock /a --config /c pods backup --yes >> /root/arena-cron.log 2>&1", "# 7 * * * * arena pods reap run"] {
+    for other in [
+        "*/15 * * * * flock -n -o /root/.arena-backup-cron.lock /a --config /c pods backup --yes >> /root/arena-cron.log 2>&1",
+        "*/15 * * * * mkdir -p /root/.local/state/arena/cron && flock -n -o /root/.local/state/arena/cron/backup.lock /a --config /c \
+         pods backup --yes >> /root/.local/state/arena/cron/backup.log 2>&1",
+        "# 7 * * * * arena pods reap run",
+    ] {
         assert_ne!(super::super::CronKind::of(other), Some(super::super::CronKind::Reap), "{other}");
     }
 }
@@ -2235,7 +2240,7 @@ async fn review_rr_two_pods_sharing_a_name_are_still_backed_up() {
 /// RR: the reap cron line is `flock -n LOCK arena …` WITHOUT `-o`, so the locked fd that
 /// flock(1) hands to arena is inherited by everything arena spawns (ssh, the reap's rsyncs,
 /// REAP_NOTIFY_CMD and whatever it backgrounds). If arena dies (killed, OOM) while one of them
-/// lives on, that orphan keeps `.arena-reap-cron.lock` and every later tick exits at once,
+/// lives on, that orphan keeps the reap line's lock and every later tick exits at once,
 /// silently (`flock -n` prints nothing) — the reaper just stops. The backup line uses
 /// `flock -n -o` for exactly this reason ("a stray rsync outliving an arena that was itself
 /// killed would otherwise keep every later tick skipping").

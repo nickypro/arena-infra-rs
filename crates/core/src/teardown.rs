@@ -1701,6 +1701,8 @@ mod tests {
     fn crontab_lines_outside_the_block_are_jobs_that_mention_arena() {
         for (line, arena) in [
             ("*/15 * * * * /usr/local/bin/arena --config /x pods backup --yes", true),
+            // This version's shape: the cron folder recreated first.
+            ("*/15 * * * * mkdir -p /h/.local/state/arena/cron && flock -n -o /h/.local/state/arena/cron/backup.lock /x/arena pods backup --yes", true),
             ("0 3 * * * /home/dev/ARENA_materials/sync.sh", true),
             ("0 * * * * destroy_pods --yes apple", true),
             ("0 3 * * * /usr/bin/certbot renew", false),
@@ -1891,6 +1893,10 @@ mod tests {
             // Left alone.
             ("ARENA_START_DATE=2026-10-01 arena  pods backup", "ARENA_START_DATE=2026-10-01 arena  pods backup"),
             ("*/15 * * * * /usr/local/bin/arena --config /c pods backup --no-pull --yes >> /h/arena-cron.log 2>&1", "*/15 * * * * /usr/local/bin/arena --config /c pods backup --no-pull --yes >> /h/arena-cron.log 2>&1"),
+            (
+                "*/15 * * * * mkdir -p /h/.local/state/arena/cron && ARENA_START_DATE=2026-10-01 flock -n -o /h/.local/state/arena/cron/backup.lock /a pods backup --yes >> /h/.local/state/arena/cron/backup.log 2>&1",
+                "*/15 * * * * mkdir -p /h/.local/state/arena/cron && ARENA_START_DATE=2026-10-01 flock -n -o /h/.local/state/arena/cron/backup.lock /a pods backup --yes >> /h/.local/state/arena/cron/backup.log 2>&1",
+            ),
             ("", ""),
             ("  \t ", "  \t "),
         ] {

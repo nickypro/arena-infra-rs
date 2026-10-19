@@ -4120,11 +4120,11 @@ mod tests {
         let config = w.dir.join("config.env");
         std::fs::write(&config, "").unwrap();
         let run = |cfg: Config, args: Vec<&'static str>| {
-            let (stub, config) = (stub.display().to_string(), config.clone());
+            let (stub, config, home) = (stub.display().to_string(), config.clone(), w.dir.display().to_string());
             async move {
                 let argv = ["arena", "cron"].into_iter().chain(args);
                 let Cmd::Cron(c) = Cli::try_parse_from(argv).unwrap().cmd else { unreachable!() };
-                handle_cron(c, &cfg, &config, true, &stub).await
+                handle_cron(c, &cfg, &config, true, &stub, &home).await
             }
         };
         let lines = || crate::arena_cron_lines(&std::fs::read_to_string(&tab).unwrap_or_default()).managed;
@@ -4149,8 +4149,11 @@ mod tests {
         assert_eq!(CronKind::of(&all[3]), Some(CronKind::ArchiveBig));
         // The state dir is in the lines (AD10): cron resolves the one `up` used, not $HOME's.
         let state_root = format!("ARENA_STATE_DIR={}/state", w.dir.display());
-        assert!(all[2].starts_with(&format!("7,22,37,52 * * * * ARENA_START_DATE=2026-10-01 {state_root} nice -n 10 ")) && all[2].contains(" archive sync --tier snap >> "), "{}", all[2]);
-        assert!(all[3].starts_with(&format!("40 * * * * ARENA_START_DATE=2026-10-01 {state_root} nice -n 10 ")) && all[3].ends_with("/arena-archive-cron.log 2>&1"), "{}", all[3]);
+        // Each recreating the cron folder first, which holds the archive's one log.
+        let mkdir = arena_core::cron::mkdir(&w.dir.display().to_string());
+        let log = arena_core::cron::log(&w.dir.display().to_string(), arena_core::cron::Job::Archive);
+        assert!(all[2].starts_with(&format!("7,22,37,52 * * * * {mkdir}ARENA_START_DATE=2026-10-01 {state_root} nice -n 10 ")) && all[2].contains(" archive sync --tier snap >> "), "{}", all[2]);
+        assert!(all[3].starts_with(&format!("40 * * * * {mkdir}ARENA_START_DATE=2026-10-01 {state_root} nice -n 10 ")) && all[3].ends_with(&format!(" >> {log} 2>&1")), "{}", all[3]);
         assert_eq!(CronKind::of(&all[0]), Some(CronKind::Backup));
         // Re-installing is a no-op; remove --archive drops just those two.
         run(w.cfg.clone(), vec!["install", "--archive"]).await.unwrap();
@@ -4159,6 +4162,10 @@ mod tests {
         assert_eq!(lines(), first);
         // An archive line is never mistaken for the snapshot line (or vice versa).
         assert_eq!(CronKind::of("*/2 * * * * flock -n /h/.arena-snapshot-cron.lock /a --config /c snapshot --public --out /w/fleet.json"), Some(CronKind::Snapshot));
+        assert_eq!(
+            CronKind::of("*/2 * * * * mkdir -p /h/.local/state/arena/cron && flock -n /h/.local/state/arena/cron/snapshot.lock /a --config /c snapshot --public --out /w/fleet.json"),
+            Some(CronKind::Snapshot)
+        );
         assert_eq!(CronKind::of("# 7 * * * * /a archive sync --tier snap"), None);
 
         // AD3 (the reviewer's R3, adapted): whatever changes the backup line's start date changes
