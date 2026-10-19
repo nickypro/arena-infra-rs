@@ -470,9 +470,11 @@ pub fn backup_script() -> String {
 /// On a branch it backs up, an operation in progress — a conflicted merge, cherry-pick or revert,
 /// or a `git stash pop`'s conflicts ([`BUSY_OP_SH`]) — ends the run before anything is staged:
 /// `BUSY <branch> <what>`, [`BACKUP_BUSY_EXIT`], nothing committed or pushed, so the participant
-/// can still finish or abort it ([`BackupReport::failure`] says how). On one it skips, such work
-/// is only said (`UNCOMMITTED`, [`BackupReport::uncommitted`]) before the `SKIP`, read-only: the
-/// run still skips it, exit 0, and `set-branch --hard` copies the pod before resetting it.
+/// can still finish or abort it ([`BackupReport::failure`] says how). On one it skips, the work
+/// there no backup saves — that, changes to tracked files, commits no remote has, or untracked
+/// files — is only said (`UNCOMMITTED`, [`BackupReport::uncommitted`]) before the `SKIP`,
+/// read-only: the run still skips it, exit 0, and `set-branch --hard` copies the pod before
+/// resetting it.
 pub fn backup_command(repo_path: &str, git_ssh_key: Option<&str>, commit_msg: &str, origin: Option<&str>) -> String {
     backup_command_limited(repo_path, git_ssh_key, commit_msg, GIT_MAX_FILE_BYTES, GITHUB_FILE_LIMIT_BYTES, origin)
 }
@@ -581,9 +583,11 @@ pub struct BackupReport {
     /// The index has unmerged paths — conflicts not yet resolved and added (`BUSY`'s or
     /// `UNCOMMITTED`'s `unmerged` word; always so for `conflicts`).
     pub unmerged: bool,
-    /// On a branch no backup commits (a `SKIP`), the work there that a `--hard` reset would
-    /// discard (`UNCOMMITTED <branch> <what>`): an operation in progress ([`BUSY_OP_SH`]'s word) or
-    /// `changes` to tracked files. `set-branch --hard` copies such a pod first.
+    /// On a branch no backup commits (a `SKIP`), the work there that a `--hard` reset could
+    /// discard (`UNCOMMITTED <branch> <what>`), the first of: an operation in progress
+    /// ([`BUSY_OP_SH`]'s word), `changes` to tracked files, `commits` no remote has, `untracked`
+    /// files (not ignored, nested repos aside). `set-branch --hard` copies such a pod first, `.git`
+    /// with it.
     pub uncommitted: Option<String>,
 }
 
@@ -799,19 +803,16 @@ impl BackupReport {
         self.busy.as_deref().filter(|_| code == Some(BACKUP_BUSY_EXIT))
     }
 
-    /// For a run that skipped a protected branch (`SKIP`) with work there no backup commits
+    /// For a run that skipped a protected branch (`SKIP`) with work there no backup saves
     /// ([`Self::uncommitted`]): that work in words, and why only a copy can keep it — "main has
     /// uncommitted changes to tracked files — no backup commits on main", "a merge is in progress
-    /// on main — no backup commits on main". `None` for any other run.
+    /// on main — no backup commits on main", "main has commits no remote has — no backup pushes
+    /// main", "main has untracked files — no backup commits on main". `None` for any other run.
     pub fn uncommitted_why(&self) -> Option<String> {
         let what = self.uncommitted.as_deref()?;
         let (_, branch) = self.outcome.as_ref().filter(|(sentinel, _)| *sentinel == BACKUP_SKIPPED)?;
         let on = if branch == "HEAD" { "a detached HEAD" } else { branch.as_str() };
-        let situation = match what {
-            "changes" => format!("{on} has uncommitted changes to tracked files"),
-            _ => busy_situation(what, on),
-        };
-        Some(format!("{situation} — no backup commits on {on}"))
+        Some(format!("{} — {}", uncommitted_situation(what, on), uncommitted_reason(what, on)))
     }
 
     /// For a run that found files over GitHub's limit in the unpushed commits: why nothing can be
@@ -836,6 +837,28 @@ impl BackupReport {
             ),
             None => format!("{why}. No pushed commit to reset to: rewrite the branch's history on {pod} by hand"),
         })
+    }
+}
+
+/// The work on a branch no backup commits (`on`: `main`, `a detached HEAD`) that an `UNCOMMITTED`
+/// line names (`what`: [`BUSY_OP_SH`]'s word, `changes`, `commits` or `untracked`), in words: "main
+/// has uncommitted changes to tracked files", "main has commits no remote has", "main has
+/// untracked files", "a merge is in progress on main".
+pub fn uncommitted_situation(what: &str, on: &str) -> String {
+    match what {
+        "changes" => format!("{on} has uncommitted changes to tracked files"),
+        "commits" => format!("{on} has commits no remote has"),
+        "untracked" => format!("{on} has untracked files"),
+        _ => busy_situation(what, on),
+    }
+}
+
+/// Why no backup keeps that work (`what` as for [`uncommitted_situation`]): "no backup commits on
+/// main" — or, for commits already made, "no backup pushes main".
+pub fn uncommitted_reason(what: &str, on: &str) -> String {
+    match what {
+        "commits" => format!("no backup pushes {on}"),
+        _ => format!("no backup commits on {on}"),
     }
 }
 
@@ -902,15 +925,18 @@ pub fn init_branch_command(cfg: &BackupConfig, machine_name: &str) -> String {
 ///
 /// `hard == false` (default): **gentle** — fetch, checkout, fast-forward pull. A
 /// diverged/dirty tree makes the `--ff-only` pull fail loudly rather than clobbering
-/// work. `hard == true`: **destructive** — fetch, then force the local branch to exactly
-/// match `origin/<branch>` (`checkout -f -B … origin/<branch>` + `reset --hard`),
-/// **discarding any local commits/changes on it** (untracked files are left in place). A `git
-/// am`, rebase or paused cherry-pick/revert sequence it switches away from would outlive the reset
-/// (git keeps their state across a checkout) and stop every later switch and backup as `BUSY`,
-/// and a `git rebase --abort` would then take the pod back off the branch: once switched, `--hard`
-/// ends them as it ends a merge (`--quit`: their state only — the stash a rebase's `--autostash`
-/// made is kept in the stash list). Used by `pods set-branch [--hard]` (e.g. reset everyone back
-/// to `main`).
+/// work, and git refuses to overwrite an untracked file. `hard == true`: **destructive** —
+/// fetch, then force the local branch to exactly match `origin/<branch>` (`checkout -f -B …
+/// origin/<branch>` + `reset --hard`), **discarding any local commits/changes on it** — and
+/// **overwriting any untracked file at a path `origin/<branch>` tracks** (review pr4: checked with
+/// real git, a participant's untracked `solutions.py` on main became origin's); other untracked
+/// files stay. So `set-branch --hard` copies a pod on main with untracked files first. A `git am`,
+/// rebase or paused cherry-pick/revert sequence it switches away from would outlive the reset (git
+/// keeps their state across a checkout) and stop every later switch and backup as `BUSY`, and a
+/// `git rebase --abort` would then take the pod back off the branch: once switched, `--hard` ends
+/// them as it ends a merge (`--quit`: their state only — the stash a rebase's `--autostash` made
+/// is kept in the stash list). Used by `pods set-branch [--hard]` (e.g. reset everyone back to
+/// `main`).
 ///
 /// A nested clone the backup adopted (its files tracked by the course repo) is tracked on the
 /// autocommit branches only — the course's `main` doesn't have it — so switching to such a
@@ -3196,6 +3222,11 @@ done
         // On a branch it skips, the work there is only said, read-only, before the SKIP.
         let skip = &s[s.find("if [ \"$B\" = main ]").unwrap()..s.find("echo \"SKIP $B\"").unwrap()];
         assert!(skip.contains("echo \"UNCOMMITTED $B $W\"") && skip.contains("git --no-optional-locks diff --quiet HEAD --"), "{skip}");
+        // Commits no remote has, untracked files (review pr4): read-only too.
+        assert!(skip.contains("git --no-optional-locks rev-list -n1 HEAD --not --remotes"), "{skip}");
+        assert!(skip.contains("git --no-optional-locks ls-files --others --exclude-standard"), "{skip}");
+        let order = ["W=changes", "W=commits", "W=untracked"].map(|w| skip.find(w).unwrap_or_else(|| panic!("{w}")));
+        assert!(order.windows(2).all(|p| p[0] < p[1]), "{order:?}");
         // The --hard switch ends a `git am`, rebase or sequence once it has switched; gentle never does.
         let hard = checkout_command("/r", "main", None, true);
         let quits = hard.find("git rebase --quit").expect("quit");
@@ -3208,9 +3239,13 @@ done
 
     /// Review fb2 F3: a pod on main — no backup commits there — with a merge in progress or
     /// changes to tracked files was reset by `set-branch --hard` with no copy: its backup said
-    /// only `SKIP`. Now the run says what a reset would discard first (`UNCOMMITTED main <what>`),
-    /// still exit 0 and SKIP, touching nothing — not even the index's stat cache — and nothing
-    /// for untracked files alone (a reset keeps them) or a clean tree.
+    /// only `SKIP`. Now the run says what a reset could discard first (`UNCOMMITTED main <what>`),
+    /// still exit 0 and SKIP, touching nothing — not even the index's stat cache. Review pr4 adds
+    /// commits no remote has (a participant's work committed on main, its tree clean, was reset
+    /// away uncopied) and untracked files (`--hard` overwrites one the new branch tracks:
+    /// [`an_untracked_file_the_new_branch_tracks_is_overwritten_by_hard_so_any_is_said`]), on main
+    /// or a detached HEAD. A fresh pod — main as on origin, a nested clone as the image ships
+    /// them, an ignored file — says nothing, so `--hard` copies none of them.
     #[cfg(unix)]
     #[test]
     fn on_main_the_work_a_hard_reset_would_discard_is_said_before_the_skip() {
@@ -3229,21 +3264,42 @@ done
         };
         let r = said("SKIP main\n");
         assert_eq!((r.uncommitted.as_deref(), r.uncommitted_why()), (None, None), "clean");
+        // What a fresh pod has besides: a nested clone (its own .git, listed as `dir/`), an ignored file.
+        s.clone_upstream("exercises/clone");
+        std::fs::write(s.work.join(".git/info/exclude"), "*.log\n").unwrap();
+        std::fs::write(s.work.join("run.log"), "ignored\n").unwrap();
+        assert_eq!(said("SKIP main\n").uncommitted, None, "nothing of the participant's");
         s.put("scratch.py", 4);
-        assert_eq!(said("SKIP main\n").uncommitted, None, "untracked files survive a reset");
+        let r = said("UNCOMMITTED main untracked\nSKIP main\n");
+        assert_eq!(r.uncommitted_why().unwrap(), "main has untracked files — no backup commits on main");
         std::fs::write(s.work.join("README.md"), "edited on main\n").unwrap();
         let r = said("UNCOMMITTED main changes\nSKIP main\n");
         assert_eq!(r.outcome, Some((BACKUP_SKIPPED, "main".into())));
         assert_eq!(r.uncommitted_why().unwrap(), "main has uncommitted changes to tracked files — no backup commits on main");
-        // A conflicted `git pull upstream main` on main itself.
+        // Committed on main, not pushed: the tree is clean, the commit is on no remote.
         s.git(&s.work, &["commit", "-q", "-am", "committed on main"]);
+        std::fs::remove_file(s.work.join("scratch.py")).unwrap();
+        let r = said("UNCOMMITTED main commits\nSKIP main\n");
+        assert!(!r.unmerged && r.busy.is_none() && !r.failed_at_push(), "{r:?}");
+        assert_eq!(r.uncommitted_why().unwrap(), "main has commits no remote has — no backup pushes main");
+        // A conflicted `git pull upstream main` on main itself.
         git_failing(&s.work, &["pull", "-q", "--no-rebase", "--no-edit", "upstream", "main"]);
         assert!(s.work.join(".git/MERGE_HEAD").exists());
         let r = said("UNCOMMITTED main merge unmerged\nSKIP main\n");
         assert!(r.unmerged && r.busy.is_none() && !r.failed_at_push(), "{r:?}");
         assert_eq!(r.uncommitted_why().unwrap(), "a merge is in progress on main — no backup commits on main");
         s.git(&s.work, &["merge", "--abort"]);
-        assert_eq!(said("SKIP main\n").uncommitted, None, "aborted: the committed edit is all there is");
+        assert_eq!(said("UNCOMMITTED main commits\nSKIP main\n").uncommitted.as_deref(), Some("commits"), "aborted: the commit is still only here");
+        // Once a remote has it (init-branches pushed it on the day's branch), nothing.
+        s.git(&s.work, &["push", "-q", "origin", "main:refs/heads/autocommit-y"]);
+        assert_eq!(said("SKIP main\n").uncommitted, None);
+        // A detached HEAD: its own commits, else nothing.
+        s.git(&s.work, &["checkout", "-q", "--detach", "origin/main"]);
+        assert_eq!(said("SKIP HEAD\n").uncommitted, None);
+        std::fs::write(s.work.join("README.md"), "committed on a detached HEAD\n").unwrap();
+        s.git(&s.work, &["commit", "-q", "-am", "detached"]);
+        let r = said("UNCOMMITTED HEAD commits\nSKIP HEAD\n");
+        assert_eq!(r.uncommitted_why().unwrap(), "a detached HEAD has commits no remote has — no backup pushes a detached HEAD");
         // Parsed only with its words; never on a run that didn't skip.
         assert_eq!(parse_backup_report("UNCOMMITTED main\nSKIP main\n").uncommitted, None);
         assert_eq!(parse_backup_report("UNCOMMITTED main changes\nBRANCH b\nPUSHED b\n").uncommitted_why(), None);
@@ -3251,6 +3307,49 @@ done
             parse_backup_report("UNCOMMITTED HEAD conflicts\nSKIP HEAD\n").uncommitted_why().unwrap(),
             "a detached HEAD has unresolved conflicts — no backup commits on a detached HEAD"
         );
+        assert_eq!(
+            parse_backup_report("UNCOMMITTED HEAD rebase unmerged\nSKIP HEAD\n").uncommitted_why().unwrap(),
+            "a rebase is in progress on a detached HEAD — no backup commits on a detached HEAD"
+        );
+    }
+
+    /// Review pr4: `set-branch --hard`'s `checkout -f` and `reset --hard` overwrite an untracked
+    /// file wherever the branch they reset to tracks the same path — checked here with real git:
+    /// a participant's `solutions.py` on main, never committed, becomes the one the course staff
+    /// pushed to origin's main since. Which path origin's branch tracks, the backup can't tell: it
+    /// doesn't know the branch, and the pod's `origin/main` doesn't have the new file until the
+    /// switch's own fetch (the backup here runs before it, as set-branch's does). So any untracked
+    /// file on a branch no backup commits is said (`UNCOMMITTED main untracked`), and `--hard`
+    /// copies the pod first. An untracked file the new branch doesn't track stays.
+    #[cfg(unix)]
+    #[test]
+    fn an_untracked_file_the_new_branch_tracks_is_overwritten_by_hard_so_any_is_said() {
+        let s = GitSandbox::new("untracked-hard", 1_000_000);
+        let repo = s.work.to_str().unwrap();
+        s.git(&s.work, &["checkout", "-q", "main"]);
+        std::fs::write(s.work.join("solutions.py"), "the participant's own work\n").unwrap();
+        std::fs::write(s.work.join("notes.md"), "notes\n").unwrap();
+        // The staff push a solutions.py to the cohort's main; the pod hasn't fetched it.
+        let staff = s.base.join("staff");
+        s.git(&s.base, &["clone", "-q", "-b", "main", s.origin.to_str().unwrap(), staff.to_str().unwrap()]);
+        std::fs::write(staff.join("solutions.py"), "the staff's solutions\n").unwrap();
+        s.git(&staff, &["add", "solutions.py"]);
+        s.git(&staff, &["-c", "user.name=u", "-c", "user.email=u@u", "commit", "-q", "-m", "solutions"]);
+        s.git(&staff, &["push", "-q", "origin", "main"]);
+        assert!(s.git(&s.work, &["ls-tree", "-r", "--name-only", "origin/main"]).lines().all(|p| p != "solutions.py"), "not fetched yet");
+        let (code, out, err) = s.backup_raw();
+        assert_eq!((code, out.as_str()), (Some(0), "UNCOMMITTED main untracked\nSKIP main\n"), "{err}");
+        // What the copy is for: --hard makes the participant's file the staff's.
+        let o = s.run(&checkout_command(repo, "main", None, true));
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(std::fs::read_to_string(s.work.join("solutions.py")).unwrap(), "the staff's solutions\n", "overwritten");
+        assert_eq!(std::fs::read_to_string(s.work.join("notes.md")).unwrap(), "notes\n", "one the branch doesn't track stays");
+        // The gentle switch refuses instead (git's own check), so it needs no copy.
+        s.git(&s.work, &["reset", "-q", "--hard", "HEAD~1"]);
+        std::fs::write(s.work.join("solutions.py"), "the participant's own work\n").unwrap();
+        let o = s.run(&checkout_command(repo, "main", None, false));
+        assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("would be overwritten"), "{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(std::fs::read_to_string(s.work.join("solutions.py")).unwrap(), "the participant's own work\n");
     }
 
     /// Review pr4: `git am` keeps HEAD attached, and a patch that doesn't apply leaves no unmerged

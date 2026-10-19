@@ -676,7 +676,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
   - `pods set-branch <branch> <targets|--all> [--hard] [--init-branches]` — switch pods'
     ARENA checkout to a branch. Gentle by default (fetch + checkout + ff-only pull — fails on a diverged/dirty
     tree rather than clobbering work). **`--hard` is destructive**: force the branch to
-    match `origin/<branch>`, discarding local commits/changes (untracked files survive) —
+    match `origin/<branch>`, discarding local commits/changes — and overwriting any untracked file
+    at a path `origin/<branch>` tracks (other untracked files stay) —
     e.g. `set-branch main --all --hard` resets the fleet to `main`. Confirms first;
     `--dry-run` previews. Pods switch concurrently, 2-min budget each. A nested clone the
     backup adopted (see `pods backup`) is tracked only on the autocommit branches, so a
@@ -700,17 +701,23 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     progress on <branch> — not switched (a switch now would end the merge); <how to end it> on
     the pod, then switch again`, exit 6 — git's own checkout would drop a merge whose conflicts
     are staged; the TUI's set-branch says the same, naming `--hard` as the destructive way), and
-    `--hard` ends it, discarding its uncommitted changes to tracked files (untracked files stay),
-    its line saying only the copy has them (a `git am`, rebase or paused sequence too: git keeps
-    their state across a checkout, so once switched `--hard` quits it — its state only — rather
-    than let it stop the next init and every backup, or a later `git rebase --abort` take the pod
-    back off `main`). On `main`/`master` (or a detached HEAD) no backup
-    commits: the backup there only says what a reset would discard — a merge in progress, or
-    changes to tracked files — and **`--hard` copies such a pod first** too (`⚠ NOT COMMITTED
-    FIRST: main has uncommitted changes to tracked files, and no backup commits on main; …`),
-    never resetting it if the copy fails; a clean one isn't copied. A pod `--hard` switched after
-    copying its uncommitted work is switched, not a failure; one line after the run names those
-    pods. A file the
+    `--hard` ends it, discarding its uncommitted changes to tracked files, its line saying only the
+    copy has them (a `git am`, rebase or paused sequence too: git keeps their state across a
+    checkout, so once switched `--hard` quits it — its state only — rather than let it stop the
+    next init and every backup, or a later `git rebase --abort` take the pod back off `main`). On
+    `main`/`master` (or a detached HEAD) no backup commits or pushes: the backup there only says
+    what a reset could discard — the first of an operation in progress, changes to tracked files,
+    commits no remote has, untracked files git doesn't ignore — and **`--hard` copies such a pod
+    first** too, `.git` and all (`⚠ NOT COMMITTED FIRST: main has uncommitted changes to tracked
+    files, and no backup commits on main; …`, `⚠ NOT PUSHED FIRST: main has commits no remote has,
+    and no backup pushes main; … that copy has its .git, those commits with it; …`), never
+    resetting it if the copy fails. Any untracked file counts: `--hard` overwrites one wherever
+    the branch it resets to tracks the same path (review pr4: a participant's `solutions.py` became
+    the staff's), and which paths that branch tracks after the switch's own fetch the backup can't
+    know. A nested repo doesn't (the image ships clones like that), nor does an ignored file. A pod
+    with nothing of its own on main — main as on origin — isn't copied, and `pods backup` and the
+    cron say nothing of any of it. A pod `--hard` switched after copying such work is switched, not
+    a failure; one line after the run names those pods. A file the
     backup committed with a key redacted keeps the real key on disk: around the switch it's set
     aside in `.git/arena-unredacted/<time>-<pid>/` (so gentle doesn't refuse it and `--hard`
     doesn't drop the key; a later set-aside never overwrites an earlier one) and put back when

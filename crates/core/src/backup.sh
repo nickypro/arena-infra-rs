@@ -8,9 +8,10 @@
 #                              none): checked first, before the SKIP; nothing committed or pushed (exit 5).
 #                              The URL is printed with any credentials taken out.
 #   SKIP <branch>              on main/master/a detached HEAD: nothing done (exit 0)
-#   UNCOMMITTED <branch> <what> [unmerged]  before a SKIP, when the tree has work no backup commits
-#                              there (what a `set-branch --hard` copies first): <what> is BUSY's, or
-#                              `changes` (to tracked files) when nothing is in progress
+#   UNCOMMITTED <branch> <what> [unmerged]  before a SKIP, when the checkout has work no backup
+#                              saves there (what a `set-branch --hard` copies first, .git and all):
+#                              <what> is the first of BUSY's word, `changes` (to tracked files),
+#                              `commits` (that no remote has), `untracked` (files not ignored)
 #   NO_CHANGES <branch>        clean tree and HEAD == its upstream: nothing to push (exit 0)
 #   PUSHED <branch>            committed what there was and/or pushed unpushed commits (exit 0)
 #   BIGSKIP <bytes> <path>     a file over <max file bytes>, kept out of the commit (stays on disk)
@@ -55,12 +56,21 @@ fi
 B=$(git rev-parse --abbrev-ref HEAD)
 # @ARENA_BUSY_OP_SH@
 if [ "$B" = main ] || [ "$B" = master ] || [ "$B" = HEAD ]; then
-    # No backup commits here, so what a `set-branch --hard` would discard is said first — an
-    # operation in progress, else changes to tracked files (untracked files survive a reset) — and
-    # it copies the pod before resetting it (review fb2 F3). Read-only: no optional locks, so the
-    # participant's own git never meets an index.lock of ours.
+    # No backup commits or pushes here, so the work a `set-branch --hard` could discard is said
+    # first, and it copies the pod — .git and all — before resetting it (review fb2 F3). The first
+    # of: an operation in progress; changes to tracked files; commits no remote has (review pr4:
+    # work committed on main, its tree clean, was reset away uncopied — only the reflog kept it);
+    # untracked files git doesn't ignore (review pr4: --hard overwrites one wherever the branch it
+    # resets to tracks the same path, and which branch that is, or what origin's copy of it holds
+    # since the switch's own fetch, nothing here knows — so any counts). A nested repo (listed as
+    # `dir/`) doesn't: the image ships clones like that, and the switch leaves them be. Read-only:
+    # no optional locks, so the participant's own git never meets an index.lock of ours.
     W=$(busy_op "$(git rev-parse --absolute-git-dir)")
     if [ -z "$W" ] && ! git --no-optional-locks diff --quiet HEAD -- 2>/dev/null; then W=changes; fi
+    if [ -z "$W" ] && [ -n "$(git --no-optional-locks rev-list -n1 HEAD --not --remotes 2>/dev/null)" ]; then W=commits; fi
+    if [ -z "$W" ] && [ -n "$(git --no-optional-locks ls-files --others --exclude-standard 2>/dev/null | grep -v '/$' | head -n 1)" ]; then
+        W=untracked
+    fi
     if [ -n "$W" ]; then echo "UNCOMMITTED $B $W"; fi
     echo "SKIP $B"; exit 0
 fi

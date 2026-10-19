@@ -1265,7 +1265,7 @@ enum PodCmd {
     SetBranch {
         /// Branch to check out (e.g. main, or a feature branch).
         branch: String,
-        /// DESTRUCTIVE: reset to `origin/<branch>`, dropping local commits and changes
+        /// DESTRUCTIVE: reset to `origin/<branch>`, dropping local commits/changes; overwrites files it tracks
         #[arg(long)]
         hard: bool,
         /// Then create + push each pod's day branch, as `init-branches` does
@@ -5802,9 +5802,10 @@ struct BackupTally {
     /// The `skipped` pods, each with the protected branch it's on (`(name, branch)`): said in
     /// one line after the run ([`on_protected_lines`]), not one per pod.
     on_protected: Vec<(String, String)>,
-    /// The `skipped` pods with work on that branch no backup commits (`UNCOMMITTED`: a merge in
-    /// progress, changes to tracked files): what `set-branch --hard` copies before its reset
-    /// ([`switch_guarded`]). `pods backup` leaves them as it always has — skipped, not a failure.
+    /// The `skipped` pods with work on that branch no backup saves (`UNCOMMITTED`: an operation in
+    /// progress, changes to tracked files, commits no remote has, untracked files): what
+    /// `set-branch --hard` copies before its reset ([`switch_guarded`]). `pods backup` leaves them
+    /// as it always has — skipped, not a failure, and not said: the cron's output is unchanged.
     uncommitted: Vec<Unpushed>,
 }
 
@@ -5815,8 +5816,9 @@ struct BackupTally {
 /// `pods backup` copies by rsync instead ([`copy_unpushed`]). A pod with no repo, or ssh refused,
 /// fails the same way every run and isn't. `busy`: what was in progress on the branch (`BUSY`: a
 /// merge, …), so nothing was committed — a failure at the push for the copy, said as what it is;
-/// for a pod on a branch no backup commits, what is uncommitted there (`UNCOMMITTED`: the same
-/// words, or `changes`), which a `--hard` switch copies first ([`BackupTally::uncommitted`]).
+/// for a pod on a branch no backup commits, the work there no backup saves (`UNCOMMITTED`: the
+/// same words, or `changes`, `commits`, `untracked`), which a `--hard` switch copies first
+/// ([`BackupTally::uncommitted`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Unpushed {
     pod: String,
@@ -8490,7 +8492,9 @@ async fn handle_set_branch(
 /// ([`switch_unlocked_line`]) — and what happens to a pod with a merge in progress, which can't
 /// be committed first: copied too, then the gentle switch (and init-branches) refuses to end it,
 /// while `hard` (`--hard`) ends it with its uncommitted changes to tracked files (review F5: the
-/// note said every such pod "is copied … and then switched").
+/// note said every such pod "is copied … and then switched") — and copies a pod on a branch no
+/// backup commits with work there too, untracked files included: `--hard` overwrites one the new
+/// branch tracks (review pr4: the note said untracked files stay).
 fn push_first_note(cfg: &Config, hard: bool) -> String {
     let origin = arena_core::backup::configured_repo(cfg).map_or_else(String::new, |o| format!(", nor one whose origin isn't {o}"));
     let unlocked = switch_unlocked_line(cfg);
@@ -8499,8 +8503,9 @@ fn push_first_note(cfg: &Config, hard: bool) -> String {
         None => (" — under the pod's backup lock, held until its switch ends", ", or whose lock another backup holds,"),
     };
     let busy = if hard {
-        "the --hard switch then ends it, discarding its uncommitted changes to tracked files (untracked files stay); so is a \
-         pod on main/master with a merge in progress or changes to tracked files, which no backup commits"
+        "the --hard switch then ends it, discarding its uncommitted changes to tracked files; so is a pod on main/master or \
+         a detached HEAD, which no backup commits, with an operation in progress, changes to tracked files, commits no \
+         remote has or untracked files (the --hard switch overwrites any the new branch tracks)"
     } else {
         "then NOT switched: the switch refuses to end it"
     };
@@ -8530,10 +8535,11 @@ struct Switched {
     not_switched: Vec<(String, String)>,
     /// Copied, their push having failed, before their switch (in `failed` too when it failed).
     copied: Vec<String>,
-    /// Of `copied`, those with uncommitted work a `--hard` switch discards on purpose — a merge
-    /// in progress (`BUSY`), or work on a branch no backup commits (`UNCOMMITTED`): nothing
-    /// failed there, so once switched they are switched like the rest (review fb2 F2), the copy
-    /// holding that work, said on their line and in [`Switched::ended_line`].
+    /// Of `copied`, those with work a `--hard` switch discards on purpose — an operation in
+    /// progress (`BUSY`), or work on a branch no backup commits (`UNCOMMITTED`: changes, commits
+    /// no remote has, untracked files): nothing failed there, so once switched they are switched
+    /// like the rest (review fb2 F2), the copy holding that work, said on their line and in
+    /// [`Switched::ended_line`].
     ended: Vec<String>,
 }
 
@@ -8573,15 +8579,16 @@ impl Switched {
         Ok(())
     }
 
-    /// The pods `--hard` switched after copying the uncommitted work it discarded (`ended`, its
-    /// switch done): one line after the run, since they aren't failures — each pod's own line
-    /// has where its copy went. `None` when there are none.
+    /// The pods `--hard` switched after copying the work no backup had saved (`ended`, its switch
+    /// done): one line after the run, since they aren't failures — each pod's own line says what
+    /// that work was and where its copy went. `None` when there are none.
     fn ended_line(&self) -> Option<String> {
         let names: Vec<&str> = self.ended.iter().filter(|p| !self.failed.contains(p)).map(String::as_str).collect();
         (!names.is_empty()).then(|| {
             format!(
-                "⚠ {} pod(s) had uncommitted work (a merge in progress, or changes on a branch no backup commits) that the --hard \
-                 switch discarded after copying it — only the copy has it now (see each one's line): {}",
+                "⚠ {} pod(s) had work no backup had saved (an operation in progress, or changes, commits or untracked files on a \
+                 branch no backup commits), copied before the --hard switch discarded or overwrote it — the copy has it (see \
+                 each one's line): {}",
                 names.len(),
                 names.join(", ")
             )
@@ -8599,8 +8606,8 @@ impl Switched {
 /// redact, push (a no-op on `main`/`master` or a branch in sync) — and the pods it pushed are
 /// switched. A pod whose push failed at the push itself is copied into LOCAL_BACKUP_DIR under the
 /// lock it still holds, then switched, its line saying so ([`not_pushed_note`]); before a `--hard`
-/// reset, so is a pod on a branch no backup commits (main, …) with work there a reset would
-/// discard (`UNCOMMITTED`: [`BackupTally::uncommitted`]; review fb2 F3). A pod with
+/// reset, so is a pod on a branch no backup commits (main, …) with work there a reset could
+/// discard or overwrite (`UNCOMMITTED`: [`BackupTally::uncommitted`]; review fb2 F3, pr4). A pod with
 /// neither a push nor a copy — the copy failed too, the backup failed before the push, or
 /// another backup held its lock for the whole wait — is NOT switched: `--hard` would throw away
 /// what nothing has saved. `reset_onto`: the branch a `--hard` switch resets (a pod already on it
@@ -8654,9 +8661,11 @@ async fn switch_guarded(
         .collect();
     // Each pod's lock stays held through its push: it goes as that pod's switch ends.
     let t = backup_fleet(remote, jobs, &repo, |l| println!("{l}"), |_| {}).await;
-    // Before a --hard reset, a pod on a branch no backup commits (main, …) with work there — a
-    // merge in progress, changes to tracked files — is copied first like a failed push, and not
-    // reset if it can't be (review fb2 F3). A gentle switch or init-branches discards nothing.
+    // Before a --hard reset, a pod on a branch no backup commits (main, …) with work there — an
+    // operation in progress, changes to tracked files, commits no remote has, untracked files — is
+    // copied first like a failed push, .git and all, and not reset if it can't be (review fb2 F3,
+    // pr4). A gentle switch or init-branches discards nothing (git refuses to overwrite an
+    // untracked file there).
     let mut unpushed = t.unpushed;
     if reset_onto.is_some() {
         unpushed.extend(t.uncommitted);
@@ -8747,18 +8756,24 @@ async fn switch_batch(
 
 /// The loud part of a pod's line when it was switched with its branch copied, not pushed: which
 /// branch, why, where its files went — and where its commits are now (`reset_onto`: the branch a
-/// `--hard` switch resets; on that branch, its unpushed commits are left only in the reflog).
+/// `--hard` switch resets; on that branch, its unpushed commits are left only in the reflog; a
+/// detached HEAD's are left only in the pod's HEAD reflog).
 ///
 /// A pod with an operation in progress (`u.busy`: a merge, …) had nothing committed at all: its
 /// line says what is in progress instead of a push's failure. A gentle switch (and init-branches)
 /// refuses to end it, on the same line ([`arena_core::backup::checkout_command`]); `--hard`
 /// (`reset_onto` set) ends it and discards its uncommitted changes to tracked files with it, which
-/// only the copy has then — said here. Untracked files stay on the pod: `checkout -f` and `reset
-/// --hard` leave them (review F5).
+/// only the copy has then — said here. On a branch no backup commits (`UNCOMMITTED`), `u.busy` is
+/// that work: changes to tracked files (discarded), commits no remote has (the copy has the
+/// `.git`), untracked files — which `checkout -f` and `reset --hard` overwrite wherever the new
+/// branch tracks the same path (review pr4: the line said untracked files stay).
 fn not_pushed_note(u: &Unpushed, copied_to: &str, reset_onto: Option<&str>) -> String {
+    use arena_core::backup::{busy_noun, uncommitted_reason, uncommitted_situation};
     let branch = u.branch.as_deref().unwrap_or("the branch it was on");
     let commits = if reset_onto.is_some() && u.branch.as_deref() == reset_onto {
         format!("the --hard reset leaves its unpushed commits only in the branch's reflog on the pod (`git reflog {branch}`)")
+    } else if branch == "HEAD" {
+        "the commits of its detached HEAD stay on the pod only in its reflog (`git reflog`)".to_string()
     } else {
         "its commits stay on the pod in that branch (switching deletes no branch)".to_string()
     };
@@ -8766,23 +8781,22 @@ fn not_pushed_note(u: &Unpushed, copied_to: &str, reset_onto: Option<&str>) -> S
         // On main (…) nothing is ever committed: the work is uncommitted, not "not committed now".
         let protected = u.branch.as_deref().is_some_and(is_protected_branch);
         let on = if branch == "HEAD" { "a detached HEAD" } else { branch };
-        let situation = match what.as_str() {
-            "changes" => format!("{on} has uncommitted changes to tracked files"),
-            _ => arena_core::backup::busy_situation(what, on),
-        };
-        let why = if protected { format!("and no backup commits on {on}") } else { "so nothing was committed".to_string() };
+        let situation = uncommitted_situation(what, on);
+        let why = if protected { format!("and {}", uncommitted_reason(what, on)) } else { "so nothing was committed".to_string() };
         let ended = match (reset_onto, what.as_str()) {
             (None, _) => String::new(),
-            (Some(_), "changes") => {
-                "the --hard switch discards them (only that copy has them now; untracked files stay); ".to_string()
+            (Some(_), "changes") => "the --hard switch discards them (only that copy has them now); ".to_string(),
+            (Some(_), "commits") => "that copy has its .git, those commits with it; ".to_string(),
+            (Some(onto), "untracked") => {
+                format!("the --hard switch overwrites any of them origin/{onto} tracks (only that copy has those now); ")
             }
             (Some(_), _) => format!(
-                "the --hard switch ends {} and discards its uncommitted changes to tracked files (only that copy has them now; \
-                 untracked files stay); ",
-                arena_core::backup::busy_noun(what)
+                "the --hard switch ends {} and discards its uncommitted changes to tracked files (only that copy has them now); ",
+                busy_noun(what)
             ),
         };
-        return format!(" — ⚠ NOT COMMITTED FIRST: {situation}, {why}; its files were copied to {copied_to} first, and {ended}{commits}");
+        let first = if what == "commits" { "NOT PUSHED FIRST" } else { "NOT COMMITTED FIRST" };
+        return format!(" — ⚠ {first}: {situation}, {why}; its files were copied to {copied_to} first, and {ended}{commits}");
     }
     format!(" — ⚠ NOT PUSHED FIRST: branch {branch} ({}); its files were copied to {copied_to} first, and {commits}", u.why)
 }
@@ -22820,7 +22834,7 @@ mod remote_tests {
         assert!(
             line.ends_with(&format!(
                 " first, and the --hard switch ends the merge and discards its uncommitted changes to tracked files (only that copy \
-                 has them now; untracked files stay); {stays}"
+                 has them now); {stays}"
             )),
             "{line}"
         );
@@ -22880,9 +22894,9 @@ mod remote_tests {
     }
 
     /// The line after a `--hard` run that ended bloom's merge after copying it.
-    const ENDED_BLOOM: &str = "⚠ 1 pod(s) had uncommitted work (a merge in progress, or changes on a branch no backup commits) that \
-                               the --hard switch discarded after copying it — only the copy has it now (see each one's line): \
-                               devtest-bloom";
+    const ENDED_BLOOM: &str = "⚠ 1 pod(s) had work no backup had saved (an operation in progress, or changes, commits or untracked \
+                               files on a branch no backup commits), copied before the --hard switch discarded or overwrote it — the \
+                               copy has it (see each one's line): devtest-bloom";
 
     /// Review fb2 F2: the morning's `set-branch main --all --hard --init-branches` skipped
     /// init-branches for the whole fleet when one pod was mid-merge — that pod was copied and
@@ -23003,7 +23017,7 @@ mod remote_tests {
                 "✓ devtest-apple (on main) — ⚠ NOT COMMITTED FIRST: main has uncommitted changes to tracked files, and no backup \
                  commits on main; its files were copied to "
             ) && apple.ends_with(&format!(
-                " first, and the --hard switch discards them (only that copy has them now; untracked files stay); {reflog}"
+                " first, and the --hard switch discards them (only that copy has them now); {reflog}"
             )),
             "{apple}"
         );
@@ -23014,7 +23028,7 @@ mod remote_tests {
             "{cloud}"
         );
         assert_eq!(line("devtest-bloom"), "✓ devtest-bloom (on main)");
-        assert!(said.iter().any(|l| l.starts_with("⚠ 2 pod(s) had uncommitted work") && l.ends_with(": devtest-apple, devtest-cloud")), "{said:#?}");
+        assert!(said.iter().any(|l| l.starts_with("⚠ 2 pod(s) had work no backup had saved") && l.ends_with(": devtest-apple, devtest-cloud")), "{said:#?}");
 
         // The copy fails: not reset.
         let failing = StubRsync::new("main-dirty-copyfail");
@@ -23060,6 +23074,69 @@ mod remote_tests {
         for port in [22001, 22002, 22003] {
             assert_eq!(execs(&fake, port).len(), 1, "{port}: its backup only");
         }
+    }
+
+    /// Review pr4: on a branch no backup commits, commits no remote has and untracked files —
+    /// `UNCOMMITTED main commits`, `UNCOMMITTED HEAD untracked` — are copied before `--hard` as
+    /// changes are, `.git` and all, each pod's line saying what the copy holds (the commits are
+    /// pushed nowhere, so NOT PUSHED; an untracked file is overwritten where origin's branch tracks
+    /// it); switched, not failures. A clean pod isn't copied, and the gentle switch copies none.
+    #[tokio::test]
+    async fn hard_copies_a_pod_on_main_with_commits_or_untracked_files_first() {
+        let stub = StubRsync::new("main-commits");
+        let cfg = cfg_at(&stub);
+        let backup = |name: &str| (backup_command(REPO, Some(KEY), &format!("arena backup devtest-{name}"), None), Some(BACKUP_TIMEOUT));
+        let probe = (arena_core::volume::probe_command(REPO), Some(PROBE_TIMEOUT));
+        let script = |fake: &FakeRemote| {
+            fake.script(&host(22001), [FakeReply::stdout("UNCOMMITTED main commits\nSKIP main\n"), repo_in_place(), FakeReply::ok()]);
+            fake.script(&host(22002), [FakeReply::stdout("SKIP main\n"), FakeReply::ok()]);
+            fake.script(&host(22003), [FakeReply::stdout("UNCOMMITTED HEAD untracked\nSKIP HEAD\n"), repo_in_place(), FakeReply::ok()]);
+        };
+        let fake = Arc::new(FakeRemote::new());
+        script(&fake);
+        let _ = crate::take_said();
+        handle_set_branch(fake.clone(), &cfg, "main", &everyone(&fleet()), true, false, true, &stub.path()).await.unwrap();
+        let hard = (checkout_command(REPO, "main", Some(KEY), true), Some(BRANCH_TIMEOUT));
+        assert_eq!(execs(&fake, 22001), [backup("apple"), probe.clone(), hard.clone()]);
+        assert_eq!(execs(&fake, 22002), [backup("bloom"), hard.clone()], "clean: not copied");
+        assert_eq!(execs(&fake, 22003), [backup("cloud"), probe, hard]);
+        let copied = stub.take();
+        assert!(!copied.is_empty() && copied.iter().all(|d| d.ends_with("/devtest-apple") || d.ends_with("/devtest-cloud")), "{copied:?}");
+        let said = unnumbered(&crate::take_said());
+        let line = |pod: &str| said.iter().find(|l| l.starts_with(&format!("✓ {pod} (on main)"))).cloned().unwrap_or_else(|| panic!("{said:#?}"));
+        let apple = line("devtest-apple");
+        assert!(
+            apple.starts_with(
+                "✓ devtest-apple (on main) — ⚠ NOT PUSHED FIRST: main has commits no remote has, and no backup pushes main; its \
+                 files were copied to "
+            ) && apple.ends_with(
+                " first, and that copy has its .git, those commits with it; the --hard reset leaves its unpushed commits only in \
+                 the branch's reflog on the pod (`git reflog main`)"
+            ),
+            "{apple}"
+        );
+        let cloud = line("devtest-cloud");
+        assert!(
+            cloud.starts_with(
+                "✓ devtest-cloud (on main) — ⚠ NOT COMMITTED FIRST: a detached HEAD has untracked files, and no backup commits on \
+                 a detached HEAD; its files were copied to "
+            ) && cloud.ends_with(
+                " first, and the --hard switch overwrites any of them origin/main tracks (only that copy has those now); the \
+                 commits of its detached HEAD stay on the pod only in its reflog (`git reflog`)"
+            ),
+            "{cloud}"
+        );
+        assert_eq!(line("devtest-bloom"), "✓ devtest-bloom (on main)");
+        assert!(said.iter().any(|l| l.starts_with("⚠ 2 pod(s) had work no backup had saved") && l.ends_with(": devtest-apple, devtest-cloud")), "{said:#?}");
+        // Gentle: nothing discarded or overwritten (git refuses to), nothing copied.
+        let fake = Arc::new(FakeRemote::new());
+        script(&fake);
+        handle_set_branch(fake.clone(), &cfg, "main", &everyone(&fleet()), false, false, true, &stub.path()).await.unwrap();
+        let gentle = (checkout_command(REPO, "main", Some(KEY), false), Some(BRANCH_TIMEOUT));
+        for (name, port) in [("apple", 22001), ("bloom", 22002), ("cloud", 22003)] {
+            assert_eq!(execs(&fake, port), [backup(name), gentle.clone()], "{name}");
+        }
+        assert!(stub.take().is_empty());
     }
 
     /// A [`Remote`] that, at every call, notes whether the pod's backup lock was held right then
@@ -23247,11 +23324,13 @@ mod remote_tests {
         assert!(
             hard.contains(
                 "it is copied into ./backup too, and the --hard switch then ends it, discarding its uncommitted changes to tracked \
-                 files (untracked files stay); "
+                 files; so is a pod on main/master or a detached HEAD, which no backup commits, with an operation in progress, \
+                 changes to tracked files, commits no remote has or untracked files (the --hard switch overwrites any the new \
+                 branch tracks); "
             ),
             "{hard}"
         );
-        assert!(!hard.contains("refuses"), "{hard}");
+        assert!(!hard.contains("refuses") && !hard.contains("untracked files stay"), "{hard}");
     }
 
     #[tokio::test(start_paused = true)]
