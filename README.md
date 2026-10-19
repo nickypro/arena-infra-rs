@@ -731,7 +731,10 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     backup committed with a key redacted keeps the real key on disk: around the switch it's set
     aside in `.git/arena-unredacted/<time>-<pid>/` (so gentle doesn't refuse it and `--hard`
     doesn't drop the key; a later set-aside never overwrites an earlier one) and put back when
-    the pod returns to that branch. Landing pods on `main`/`master` ends with the reminder
+    the pod returns to that branch. A gentle switch that refuses a pod mid-merge does so before
+    setting anything aside, and the putting back is the command's exit trap: a switch that fails,
+    stops on an error, or is killed (a hangup, an interrupt, a TERM) puts the keys back first.
+    Landing pods on `main`/`master` ends with the reminder
     ``⚠ N cohort pods on main: not backed up until `arena pods init-branches` ``;
     `--init-branches` then runs `init-branches` on every pod that switched (the start date is
     checked first) — one copied first because its push failed included, whatever failed it (the

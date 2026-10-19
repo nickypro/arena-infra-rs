@@ -964,17 +964,20 @@ pub fn init_branch_command(cfg: &BackupConfig, machine_name: &str) -> String {
 /// difference from the index is keys the redaction knows is set aside in
 /// `.git/arena-unredacted/` and put back to git's version; after the switch, one whose path
 /// holds exactly that version again gets its real keys back (`UNREDACTED_RESTORED <path>`), the
-/// rest stay set aside (`UNREDACTED_KEPT <path>`) until a switch back. Even a failed switch puts
-/// them back before it exits. A file with any other uncommitted change is left to the switch, as
-/// before.
+/// rest stay set aside (`UNREDACTED_KEPT <path>`) until a switch back. The putting back is the
+/// command's EXIT trap, set just before the set-aside (review ai-review claude #4): a failed
+/// switch, a step that fails under `set -e` and a hangup, interrupt or termination (each made
+/// an exit) all put them back before the command ends — never a participant left with the
+/// redacted placeholder in their code. A file with any other uncommitted change is left to the
+/// switch, as before.
 ///
 /// An operation in progress (a participant's conflicted `git pull upstream main`, a cherry-pick,
 /// a revert, a `git stash pop`'s conflicts: [`BUSY_OP_SH`]) is never ended by the gentle switch:
 /// it refuses first — what is in progress and how to end it, on stderr, exit
-/// [`BACKUP_BUSY_EXIT`] — touching nothing, where `git checkout` would silently drop a merge whose
-/// conflicts are resolved and staged and carry them onto the other branch. `--hard` goes ahead
-/// and ends it with the other local changes it discards (`set-branch` copies such a pod first and
-/// says so).
+/// [`BACKUP_BUSY_EXIT`] — touching nothing (the keys are set aside only after it), where `git
+/// checkout` would silently drop a merge whose conflicts are resolved and staged and carry them
+/// onto the other branch. `--hard` goes ahead and ends it with the other local changes it
+/// discards (`set-branch` copies such a pod first and says so).
 pub fn checkout_command(repo_path: &str, branch: &str, git_ssh_key: Option<&str>, hard: bool) -> String {
     let mut parts: Vec<String> = vec!["set -e".into(), format!("cd {}", shell_quote(repo_path))];
     if !hard {
@@ -1017,7 +1020,15 @@ pub fn checkout_command(repo_path: &str, branch: &str, git_ssh_key: Option<&str>
     // The keys set aside around the switch (from the repo's top: git's paths are relative to it).
     lines.push(format!("REDACT_SED={}", shell_quote(&redact_sed())));
     lines.push(unredacted_sh());
-    lines.push("cd \"$(git rev-parse --show-toplevel)\"; G=$(git rev-parse --absolute-git-dir); unredacted_aside \"$G/arena-unredacted\"".into());
+    // The putting back is the EXIT trap, set before anything is set aside: whatever ends the
+    // command from here on — the switch failing, `set -e`, a signal (made an exit, so the trap
+    // runs) — the keys go back first (claude #4).
+    lines.push(
+        "cd \"$(git rev-parse --show-toplevel)\"; G=$(git rev-parse --absolute-git-dir); \
+         trap 'unredacted_restore \"$G/arena-unredacted\"' EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; \
+         unredacted_aside \"$G/arena-unredacted\""
+            .into(),
+    );
     lines.push(format!("if {switch}; then SWITCHED=1; else SWITCHED=; fi"));
     // The adopted clones (listed by the backup in `$G/arena-nested`) the switch removed: back
     // from the old HEAD, staged.
@@ -1028,7 +1039,7 @@ pub fn checkout_command(repo_path: &str, branch: &str, git_ssh_key: Option<&str>
          echo \"RESTORED $d\"; fi; done < \"$G/arena-nested\"; fi"
             .into(),
     );
-    lines.push("unredacted_restore \"$G/arena-unredacted\"; [ -n \"$SWITCHED\" ]".into());
+    lines.push("[ -n \"$SWITCHED\" ]".into());
     lines.join("\n")
 }
 
@@ -2635,6 +2646,11 @@ done
         assert!(c.contains("git checkout -f -B 'main' 'origin/main'"));
         assert!(c.contains("git reset --hard 'origin/main'"));
         assert!(!c.contains("--ff-only"));
+        // The keys' restore is the EXIT trap, set before the set-aside (claude #4).
+        for cmd in [c.clone(), checkout_command("/r", "main", None, false)] {
+            let trap = cmd.find("trap 'unredacted_restore \"$G/arena-unredacted\"' EXIT").expect("the trap");
+            assert!(trap < cmd.find("unredacted_aside \"$G").unwrap() && cmd.contains("trap 'exit 143' TERM"));
+        }
     }
 
     #[test]
@@ -3701,5 +3717,61 @@ done
         check("UNCOMMITTED main changes\nSKIP main\n");
         s.git(&s.work, &["reset", "-q", "--hard"]);
         check("SKIP main\n");
+    }
+
+    /// Review ai-review claude #4, to verify: could the gentle switch's refusal of a pod mid-merge
+    /// exit with the participant's real keys still set aside (the redacted placeholder left in
+    /// their code)? No: the refusal comes first, before anything is set aside — checked here. But a
+    /// switch that ended any other way between the set-aside and the putting back did leave them
+    /// set aside: the putting back was the command's last step. Now it is its EXIT trap, and a
+    /// hangup, interrupt or TERM (a dropped connection, a timeout's kill) is made an exit: a switch
+    /// killed mid-way puts them back too.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_or_killed_switch_never_leaves_the_real_keys_set_aside() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = GitSandbox::new("keys-busy", 1_000_000);
+        let repo = s.work.to_str().unwrap();
+        let ex = format!("KEY = \"{}\"\n", openrouter_key(22));
+        std::fs::write(s.work.join("ex.py"), &ex).unwrap();
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.redacted.len()), (Some(0), 1), "{err}");
+        let aside = s.work.join(".git/arena-unredacted");
+        // A conflicted pull of README.md; ex.py stays as it is, its real key on disk.
+        let course = s.base.join("course");
+        s.git(&s.base, &["clone", "-q", "-b", "main", s.origin.to_str().unwrap(), course.to_str().unwrap()]);
+        std::fs::write(course.join("README.md"), "the course's version\n").unwrap();
+        s.git(&course, &["-c", "user.name=u", "-c", "user.email=u@u", "commit", "-q", "-am", "upstream"]);
+        s.git(&s.work, &["remote", "add", "upstream", course.to_str().unwrap()]);
+        std::fs::write(s.work.join("README.md"), "the participant's version\n").unwrap();
+        s.git(&s.work, &["commit", "-q", "-m", "mine", "README.md"]);
+        git_failing(&s.work, &["pull", "-q", "--no-rebase", "--no-edit", "upstream", "main"]);
+        let o = s.run(&checkout_command(repo, "main", None, false));
+        assert_eq!(o.status.code(), Some(BACKUP_BUSY_EXIT), "{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(s.read("ex.py"), ex.as_bytes(), "the real key still in the file");
+        assert!(!aside.exists(), "nothing set aside");
+        s.git(&s.work, &["merge", "--abort"]);
+        assert_eq!(s.read("ex.py"), ex.as_bytes());
+
+        // Killed as the checkout starts (after the set-aside): a `git` that TERMs the command.
+        let bin = s.base.join("bin-kill");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            bin.join("git"),
+            format!(
+                "#!/bin/sh\ncase \"$*\" in *\" checkout main\" | \"checkout -f -B main origin/main\") kill -TERM \"$PPID\"; exit 1;; esac\nexec {} \"$@\"\n",
+                shell_quote(&real_git())
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(bin.join("git"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        for hard in [false, true] {
+            let (code, out, err) = run_on_path(&checkout_command(repo, "main", None, hard), &path);
+            assert_eq!(code, Some(143), "hard={hard}: {out}{err}");
+            assert_eq!(s.read("ex.py"), ex.as_bytes(), "hard={hard}: the real key put back");
+            assert!(!aside.exists(), "hard={hard}");
+            assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "autocommit-x", "hard={hard}");
+        }
     }
 }
