@@ -737,7 +737,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     archive) carries it under a name no later save reuses: the copy into `LOCAL_BACKUP_DIR` is the
     day's label, which the next pull of that label overwrites from the reset pod (review ai-review
     claude #2). Nothing to discard, no folder; a save that fails leaves the pod as it was, not
-    reset (a failed switch). A file the
+    reset (a failed switch). `--hard` with `--include-non-cohort` is refused unless the pods are
+    named: it would reset staff boxes and other cohorts' pods too. A file the
     backup committed with a key redacted keeps the real key on disk: around the switch it's set
     aside in `.git/arena-unredacted/<time>-<pid>/` (so gentle doesn't refuse it and `--hard`
     doesn't drop the key; a later set-aside never overwrites an earlier one) and put back when

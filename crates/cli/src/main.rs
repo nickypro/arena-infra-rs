@@ -7743,7 +7743,11 @@ async fn handle_pods_bal(
                 .await?;
         }
         PodCmd::SetBranch { branch, sel, cohort, hard, dry_run, init_branches } => {
-            let sel = select(provider, cfg, &sel.args(), Unscoped::Refuse("switch")).await?;
+            let sel = sel.args();
+            if let Some(why) = hard_non_cohort_refusal(hard, cohort, sel.names_pods()) {
+                anyhow::bail!("{why}");
+            }
+            let sel = select(provider, cfg, &sel, Unscoped::Refuse("switch")).await?;
             let sel = cohort_only(cfg, sel, cohort);
             // The day `--init-branches` would init, before anything switches: a missing start
             // date fails here, not after the reset.
@@ -13230,6 +13234,20 @@ fn cohort_only(cfg: &Config, sel: Selected, scope: CohortScope) -> Selected {
         say(&line);
     }
     kept
+}
+
+/// `set-branch --hard --include-non-cohort` with no pod named: refused, before any pod is listed
+/// (review ai-review claude #5). The flag takes every pod on the account — staff boxes, other
+/// cohorts' pods, a pod the provider named — which is harmless for a `pull`, but `--hard` resets
+/// each one, discarding its uncommitted work. Naming the pods (the flag then changes nothing:
+/// named pods are acted on exactly) is how to reset one of them. `None` otherwise. Pure.
+fn hard_non_cohort_refusal(hard: bool, scope: CohortScope, names_pods: bool) -> Option<String> {
+    (hard && scope.include_non_cohort && !names_pods).then(|| {
+        "set-branch --hard with --include-non-cohort refused: that takes every pod on the account, so --hard would reset staff \
+         boxes and other cohorts' pods too, discarding their uncommitted work — name the pods to reset \
+         (`arena pods set-branch <branch> <pod>... --hard`), or leave --include-non-cohort out to reset this cohort's"
+            .to_string()
+    })
 }
 
 /// What a fleet-wide backup command acts on — one that names no pod (no targets, `all` or
@@ -24830,6 +24848,48 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
                 if argv[0] == "backup" {
                     assert_eq!(ports(&fake), [22001, 22002, 22003, 22004, 22005, 22006, 22007], "{with:?}");
                 }
+            }
+        }
+
+        /// Review ai-review claude #5: `--include-non-cohort` takes every pod on the account — fine
+        /// for a pull, but `set-branch --all --hard` with it reset the staff boxes and the other
+        /// cohort's pods too, with nothing in the way. Now that is refused before a pod is listed or
+        /// touched (a dry run too, and with --init-branches), saying why; pods named outright (the
+        /// flag then changes nothing), a gentle switch, and `--hard` on this cohort go on.
+        #[tokio::test(start_paused = true)]
+        async fn hard_with_include_non_cohort_is_refused_unless_the_pods_are_named() {
+            use super::super::hard_non_cohort_refusal;
+            const REFUSED: &str = "set-branch --hard with --include-non-cohort refused: that takes every pod on the account, so \
+                --hard would reset staff boxes and other cohorts' pods too, discarding their uncommitted work — name the pods to \
+                reset (`arena pods set-branch <branch> <pod>... --hard`), or leave --include-non-cohort out to reset this cohort's";
+            let cfg = account_cfg("");
+            take_said();
+            for argv in [
+                &["set-branch", "main", "--all", "--hard", "--include-non-cohort"][..],
+                &["set-branch", "main", "all", "--hard", "--include-non-cohort", "--dry-run"],
+                &["set-branch", "main", "--all", "--hard", "--include-non-cohort", "--init-branches"],
+                &["set-branch", "main", "--all", "--exclude", "staff-gpu", "--hard", "--include-non-cohort"],
+            ] {
+                let fake = Arc::new(FakeRemote::new());
+                let err = handle_pods(pods(argv), &account(), fake.clone(), &cfg, true).await.unwrap_err();
+                assert_eq!(err.to_string(), REFUSED, "{argv:?}");
+                assert!(fake.calls().is_empty() && take_said().is_empty(), "{argv:?}: nothing touched or said");
+            }
+            // Named pods (a staff box, another cohort's): exactly those, the flag or not.
+            for argv in [
+                &["set-branch", "main", "@staff-gpu", "devtest2-apple", "--hard", "--include-non-cohort", "--dry-run"][..],
+                // Gentle, fleet-wide: every pod, as before; --hard on this cohort's: as before.
+                &["set-branch", "main", "--all", "--include-non-cohort", "--dry-run"],
+                &["set-branch", "main", "--all", "--hard", "--dry-run"],
+            ] {
+                let fake = Arc::new(FakeRemote::new());
+                handle_pods(pods(argv), &account(), fake.clone(), &cfg, true).await.unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            }
+            take_said();
+            let on = CohortScope { include_non_cohort: true };
+            assert_eq!(hard_non_cohort_refusal(true, on, false).as_deref(), Some(REFUSED));
+            for (hard, scope, named) in [(true, on, true), (false, on, false), (true, CohortScope::default(), false)] {
+                assert_eq!(hard_non_cohort_refusal(hard, scope, named), None, "{hard} {scope:?} {named}");
             }
         }
 
