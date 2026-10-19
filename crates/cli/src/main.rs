@@ -4899,6 +4899,18 @@ fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<String>) {
 
     println!("\nBackup (git `backup` + file `pull`):");
     cfg_row(&mut out, cfg, &mut missing, "ARENA_REPO_NAME", false, false);
+    // The `upstream` remote setup adds to each pod's checkout: a default, so not cfg_row's view.
+    match arena_core::setup::upstream_url(cfg) {
+        Ok(Some(url)) => println!(
+            "  · ARENA_UPSTREAM_REPO          {url}{} — each pod's `upstream` remote (setup adds it when missing)",
+            if cfg.get("ARENA_UPSTREAM_REPO").is_some_and(|v| !v.trim().is_empty()) { "" } else { " (default)" }
+        ),
+        Ok(None) => println!("  · ARENA_UPSTREAM_REPO          none — setup adds no `upstream` remote"),
+        Err(e) => {
+            println!("  ✗ ARENA_UPSTREAM_REPO          {e}");
+            note_invalid(&mut missing, &e);
+        }
+    }
     cfg_row(&mut out, cfg, &mut missing, "GIT_SSH_KEY_REMOTE", false, false);
     cfg_row(&mut out, cfg, &mut missing, "ARENA_START_DATE", false, false); // wNdM label (init-branches / pull)
     // Where `pods pull` rsyncs pod files to locally (config LOCAL_BACKUP_DIR, else ./backup),
@@ -16133,6 +16145,7 @@ mod setup_tests {
             key_remote: "/root/.ssh/id_ed25519".into(),
             repo_path: "/root/ARENA_materials".into(),
             repo_url: "git@github.com:o/r.git".into(),
+            upstream_url: None,
             branch: "main".into(),
             prefix: "devtest".into(),
             authorized_pubkeys: vec![],

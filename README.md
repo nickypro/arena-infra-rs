@@ -1215,6 +1215,11 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     re-attached to it and is set up again (up to 3×, 20s apart); elsewhere the refusal is
     reported as before. Confirms first (`--dry-run` previews,
     token redacted). Uses `GIT_SSH_KEY_LOCAL/REMOTE`, `ARENA_REPO_OWNER/NAME`, `DEFAULT_BRANCH`.
+    `origin` is pointed at the cohort repo (where backups push); the public course repo
+    (`ARENA_UPSTREAM_REPO`, default `ARENA-education/ARENA_materials`, `none` to skip) is added
+    as the checkout's `upstream` remote over https when it has none — so a participant can
+    `git pull upstream main` the course's own fixes. Setup never fetches it, and an `upstream`
+    already there (a participant's own) is left alone.
     The repo update fetches **only the default branch, without tags** (a bare `git fetch`
     would pull every participant's autocommit branch); a tracked non-default branch pulls
     just its own upstream; the default branch is fast-forwarded only when the checkout has

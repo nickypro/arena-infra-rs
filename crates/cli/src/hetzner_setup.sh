@@ -4,7 +4,8 @@
 #   - docker + docker compose
 #   - the configured cohort repo (REPO_URL) and its env, built by the repo's own install_uv.sh
 #     (uv, Python 3.13, CPU torch wheels) — or, for a repo without one, by this script's uv
-#     install of its requirements.txt (CPU substitutions)
+#     install of its requirements.txt (CPU substitutions); the public course repo (UPSTREAM_URL)
+#     becomes the checkout's `upstream` remote
 # ARENA_GPU=1 is the same for a bare **GPU** VM (Shadeform, a CUDA image with its driver): the
 # requirements keep their CUDA wheels, uv matches torch to the host's driver (`--torch-backend
 # ${ARENA_TORCH_BACKEND:-auto}`), and the env gate also asks torch for the GPU. ARENA_MACHINE_NAME
@@ -14,7 +15,7 @@
 #
 # The arena8 SSH key is attached at CREATE time by the provider (MACHINE_NAME_PREFIX),
 # so this script assumes you can already SSH in. Run as root on the pod (`arena pods setup`
-# passes REPO_URL/REPO_DIR/REPO_KEY from the config; by hand, name the repo):
+# passes REPO_URL/REPO_DIR/REPO_KEY and UPSTREAM_URL from the config; by hand, name the repo):
 #   ssh arena8-<name> 'REPO_URL=git@github.com:<owner>/<name>.git bash -s' < hetzner_setup.sh
 # Idempotent: safe to re-run. The ARENA env is (re)installed unless it already passes the
 # gate below, and the script exits non-zero — with the reason as its last line — whenever the
@@ -52,6 +53,9 @@ REPO_DIR="${REPO_DIR:-/root/ARENA_materials}"
 # default: the public ARENA-education repo used to be one, so a VM could quietly get a
 # different course repo than the cohort's (and backups a remote they can't push to).
 REPO_URL="${REPO_URL:-}"
+# The public course repo (arena passes ARENA_UPSTREAM_REPO's https URL; empty = none): added
+# as the checkout's `upstream` remote, so `git pull upstream main` gets the course's own fixes.
+UPSTREAM_URL="${UPSTREAM_URL:-}"
 VENV="$REPO_DIR/.venv"
 
 echo "### 1/6 system packages"
@@ -102,6 +106,15 @@ elif [ -n "$REPO_URL" ] && [ -d "$REPO_DIR/.git" ]; then
         else
             echo "WARN: couldn't point $REPO_DIR's origin at $REPO_URL (it stays ${was:-unset})"
         fi
+    fi
+fi
+# Only when there's none: an `upstream` a participant set is theirs. Never fetched here, and
+# never fatal — a convenience, not something the setup needs.
+if [ -n "$UPSTREAM_URL" ] && [ -d "$REPO_DIR/.git" ] && ! git -C "$REPO_DIR" remote get-url upstream >/dev/null 2>&1; then
+    if git -C "$REPO_DIR" remote add upstream "$UPSTREAM_URL"; then
+        echo "upstream: $UPSTREAM_URL"
+    else
+        echo "WARN: couldn't add the upstream remote $UPSTREAM_URL"
     fi
 fi
 cd "$REPO_DIR" || die "no repo at $REPO_DIR"
