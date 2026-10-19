@@ -709,8 +709,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     progress on <branch> — not switched (a switch now would end the merge); <how to end it> on
     the pod, then switch again`, exit 6 — git's own checkout would drop a merge whose conflicts
     are staged; the TUI's set-branch says the same, naming `--hard` as the destructive way), and
-    `--hard` ends it, discarding its uncommitted changes to tracked files, its line saying only the
-    copy has them (a `git am`, rebase or paused sequence too: git keeps their state across a
+    `--hard` ends it, discarding its uncommitted changes to tracked files, its line saying where
+    the copy went (a `git am`, rebase or paused sequence too: git keeps their state across a
     checkout, so once switched `--hard` quits it — its state only — rather than let it stop the
     next init and every backup, or a later `git rebase --abort` take the pod back off `main`). On
     `main`/`master` (or a detached HEAD) no backup commits or pushes: the backup there only says
@@ -727,7 +727,17 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     know. A nested repo doesn't (the image ships clones like that), nor does an ignored file. A pod
     with nothing of its own on main — main as on origin — isn't copied, and `pods backup` and the
     cron say nothing of any of it. A pod `--hard` switched after copying such work is switched, not
-    a failure; one line after the run names those pods. A file the
+    a failure; one line after the run names those pods. **Before any `--hard` reset, what it
+    discards is saved on the pod** — in `.git/arena-discarded/<UTC time>/`: `changes.patch` (`git
+    diff --binary HEAD`), the files with unresolved conflicts, the operation's state (`MERGE_HEAD`,
+    `MERGE_MSG`, `rebase-merge/`, …), the untracked or ignored files the reset replaces, and a
+    README on getting them back (`git apply --index …` on the commit it was on, which it names) —
+    and the pod's line says `what it discarded was saved to .git/arena-discarded/<time>/ on the
+    pod first`. In `.git`, so the reset doesn't touch it and every later copy (snapshot, big,
+    archive) carries it under a name no later save reuses: the copy into `LOCAL_BACKUP_DIR` is the
+    day's label, which the next pull of that label overwrites from the reset pod (review ai-review
+    claude #2). Nothing to discard, no folder; a save that fails leaves the pod as it was, not
+    reset (a failed switch). A file the
     backup committed with a key redacted keeps the real key on disk: around the switch it's set
     aside in `.git/arena-unredacted/<time>-<pid>/` (so gentle doesn't refuse it and `--hard`
     doesn't drop the key; a later set-aside never overwrites an earlier one) and put back when

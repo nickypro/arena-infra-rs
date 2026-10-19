@@ -948,6 +948,15 @@ pub fn init_branch_command(cfg: &BackupConfig, machine_name: &str) -> String {
 /// is kept in the stash list). Used by `pods set-branch [--hard]` (e.g. reset everyone back to
 /// `main`).
 ///
+/// What `--hard` is about to discard is first saved on the pod (`discarded.sh`): the uncommitted
+/// changes to tracked files (`git diff --binary HEAD`), the files with unresolved conflicts, an
+/// operation's state files (`MERGE_HEAD`, …) and the untracked or ignored files the reset
+/// replaces, with a README saying how to get them back — in `.git/arena-discarded/<UTC time>/`,
+/// which the reset doesn't touch and no later save reuses (review ai-review claude #2, codex #2:
+/// set-branch's own rsync of such a pod went to the day's snapshot label and the big mirror, which
+/// the next `pods pull` overwrites from the reset pod). Said as `DISCARDED_SAVED <path>` on
+/// stdout. A save that fails stops the switch before the reset: the pod isn't switched.
+///
 /// A nested clone the backup adopted (its files tracked by the course repo) is tracked on the
 /// autocommit branches only — the course's `main` doesn't have it — so switching to such a
 /// branch would delete its files from disk and break that exercise. After the switch, each
@@ -977,7 +986,7 @@ pub fn init_branch_command(cfg: &BackupConfig, machine_name: &str) -> String {
 /// [`BACKUP_BUSY_EXIT`] — touching nothing (the keys are set aside only after it), where `git
 /// checkout` would silently drop a merge whose conflicts are resolved and staged and carry them
 /// onto the other branch. `--hard` goes ahead and ends it with the other local changes it
-/// discards (`set-branch` copies such a pod first and says so).
+/// discards — saved first, as above (`set-branch` copies such a pod too, and says so).
 pub fn checkout_command(repo_path: &str, branch: &str, git_ssh_key: Option<&str>, hard: bool) -> String {
     let mut parts: Vec<String> = vec!["set -e".into(), format!("cd {}", shell_quote(repo_path))];
     if !hard {
@@ -998,11 +1007,12 @@ pub fn checkout_command(repo_path: &str, branch: &str, git_ssh_key: Option<&str>
     parts.push("OLD=$(git rev-parse -q --verify HEAD) || OLD=".into());
     let switch = if hard {
         let remote_ref = shell_quote(&format!("origin/{branch}"));
-        // Force-switch to the branch reset to origin (discards local changes/commits on it), then
-        // end any `git am`, rebase or sequence the switch left behind (their state only).
+        // What the reset discards, saved first (no save, no reset); then force-switch to the
+        // branch reset to origin (discards local changes/commits on it), then end any `git am`,
+        // rebase or sequence the switch left behind (their state only).
         format!(
-            "git checkout -f -B {} {remote_ref} && git reset --hard {remote_ref} && {{ git rebase --quit >/dev/null 2>&1; \
-             git am --quit >/dev/null 2>&1; git cherry-pick --quit >/dev/null 2>&1; true; }}",
+            "discarded_save \"$G\" {remote_ref} && git checkout -f -B {} {remote_ref} && git reset --hard {remote_ref} && \
+             {{ git rebase --quit >/dev/null 2>&1; git am --quit >/dev/null 2>&1; git cherry-pick --quit >/dev/null 2>&1; true; }}",
             shell_quote(branch)
         )
     } else {
@@ -1020,6 +1030,9 @@ pub fn checkout_command(repo_path: &str, branch: &str, git_ssh_key: Option<&str>
     // The keys set aside around the switch (from the repo's top: git's paths are relative to it).
     lines.push(format!("REDACT_SED={}", shell_quote(&redact_sed())));
     lines.push(unredacted_sh());
+    if hard {
+        lines.push(discarded_sh());
+    }
     // The putting back is the EXIT trap, set before anything is set aside: whatever ends the
     // command from here on — the switch failing, `set -e`, a signal (made an exit, so the trap
     // runs) — the keys go back first (claude #4).
@@ -1041,6 +1054,12 @@ pub fn checkout_command(repo_path: &str, branch: &str, git_ssh_key: Option<&str>
     );
     lines.push("[ -n \"$SWITCHED\" ]".into());
     lines.join("\n")
+}
+
+/// `discarded.sh`'s functions, comments and blank lines left out: what `--hard` saves before its
+/// reset ([`checkout_command`]).
+fn discarded_sh() -> String {
+    include_str!("discarded.sh").lines().filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#')).collect::<Vec<_>>().join("\n")
 }
 
 /// `unredacted.sh`'s functions, comments and blank lines left out, for a command to define and
@@ -2634,7 +2653,7 @@ done
         // Origin's branch by its full name, never the local branch's upstream (codex #5).
         assert!(c.contains("git -c checkout.defaultRemote=origin checkout 'main' && git merge --ff-only 'refs/remotes/origin/main'"));
         assert!(!c.contains("git pull") && !c.contains("@{u}")); // no hard reset
-        assert!(!c.contains("reset --hard"));
+        assert!(!c.contains("reset --hard") && !c.contains("discarded_save"), "gentle discards nothing, so saves nothing");
         assert!(c.contains("GIT_SSH_COMMAND='ssh -i /root/.ssh/id_ed25519"));
     }
 
@@ -2642,8 +2661,9 @@ done
     fn checkout_hard_resets_to_origin() {
         let c = checkout_command("/root/ARENA_3.0", "main", None, true);
         assert!(c.contains("git fetch --prune origin"));
-        // Force-switch the branch to origin and hard-reset (destructive).
-        assert!(c.contains("git checkout -f -B 'main' 'origin/main'"));
+        // What it discards saved first — no save, no reset — then force-switch the branch to
+        // origin and hard-reset (destructive).
+        assert!(c.contains("discarded_save() {") && c.contains("if discarded_save \"$G\" 'origin/main' && git checkout -f -B 'main' 'origin/main'"));
         assert!(c.contains("git reset --hard 'origin/main'"));
         assert!(!c.contains("--ff-only"));
         // The keys' restore is the EXIT trap, set before the set-aside (claude #4).
@@ -3717,6 +3737,102 @@ done
         check("UNCOMMITTED main changes\nSKIP main\n");
         s.git(&s.work, &["reset", "-q", "--hard"]);
         check("SKIP main\n");
+    }
+
+    /// Review ai-review claude #2 / codex #2: the work `set-branch --hard` discards — a merge in
+    /// progress and its conflicted file, an edit to a tracked file, untracked or ignored files the
+    /// reset replaces — was kept only in set-branch's rsync into the day's snapshot label, which the
+    /// next pull of that label overwrites from the reset pod. Now the switch saves it on the pod
+    /// first, in `.git/arena-discarded/<time>/`, and says where; what its README says gets the edit
+    /// back. A save that fails leaves the pod as it was, not reset; a reset with nothing to discard
+    /// saves nothing, and never touches an earlier save.
+    #[cfg(unix)]
+    #[test]
+    fn hard_saves_what_it_discards_on_the_pod_first() {
+        let s = GitSandbox::new("discarded", 1_000_000);
+        let repo = s.work.to_str().unwrap();
+        // The pod: ex.py tracked; a conflicted `git pull upstream main`; then ex.py edited, and its
+        // own solutions.py, results.log (ignored), data (a file) and notes.md, none tracked.
+        std::fs::write(s.work.join("ex.py"), "v = 1\n").unwrap();
+        s.git(&s.work, &["add", "ex.py"]);
+        s.git(&s.work, &["commit", "-q", "-m", "ex"]);
+        with_conflicting_upstream(&s);
+        let tip = s.git(&s.work, &["rev-parse", "HEAD"]);
+        git_failing(&s.work, &["pull", "-q", "--no-rebase", "--no-edit", "upstream", "main"]);
+        let merging = s.git(&s.work, &["rev-parse", "MERGE_HEAD"]);
+        let edit = "v = 2  # the participant's edit\n";
+        std::fs::write(s.work.join("ex.py"), edit).unwrap();
+        std::fs::write(s.work.join(".git/info/exclude"), "*.log\n").unwrap();
+        for (f, text) in [("solutions.py", "mine\n"), ("results.log", "my log\n"), ("data", "my data\n"), ("notes.md", "notes\n")] {
+            std::fs::write(s.work.join(f), text).unwrap();
+        }
+        // The staff push to the cohort's main since: a solutions.py, a log, data/x.py.
+        let staff = s.base.join("staff");
+        s.git(&s.base, &["clone", "-q", "-b", "main", s.origin.to_str().unwrap(), staff.to_str().unwrap()]);
+        for (f, text) in [("solutions.py", "the staff's\n"), ("results.log", "the staff's log\n"), ("data/x.py", "x = 1\n")] {
+            std::fs::create_dir_all(staff.join(f).parent().unwrap()).unwrap();
+            std::fs::write(staff.join(f), text).unwrap();
+        }
+        s.git(&staff, &["add", "-A"]);
+        s.git(&staff, &["-c", "user.name=u", "-c", "user.email=u@u", "commit", "-q", "-m", "solutions"]);
+        s.git(&staff, &["push", "-q", "origin", "main"]);
+        let saves = || {
+            let mut d: Vec<std::path::PathBuf> =
+                std::fs::read_dir(s.work.join(".git/arena-discarded")).map(|r| r.flatten().map(|e| e.path()).collect()).unwrap_or_default();
+            d.sort();
+            d
+        };
+        // The save fails (its folder can't be made): not reset, nothing touched.
+        std::fs::write(s.work.join(".git/arena-discarded"), "in the way\n").unwrap();
+        let o = s.run(&checkout_command(repo, "main", None, true));
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(!o.status.success() && err.contains("before the --hard reset - not reset"), "{err}");
+        assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "autocommit-x");
+        assert!(s.work.join(".git/MERGE_HEAD").exists());
+        assert_eq!((s.read("ex.py"), s.read("solutions.py")), (edit.as_bytes().to_vec(), b"mine\n".to_vec()));
+        std::fs::remove_file(s.work.join(".git/arena-discarded")).unwrap();
+
+        // Saved, then reset.
+        let o = s.run(&checkout_command(repo, "main", None, true));
+        let out = String::from_utf8_lossy(&o.stdout).into_owned();
+        assert!(o.status.success(), "{out}{}", String::from_utf8_lossy(&o.stderr));
+        let saved: Vec<&str> = out.lines().filter_map(|l| l.strip_prefix("DISCARDED_SAVED ")).collect();
+        assert!(saved.len() == 1 && saved[0].starts_with(".git/arena-discarded/20"), "{out}");
+        let d = s.work.join(saved[0]);
+        assert_eq!(saves(), std::slice::from_ref(&d));
+        // The reset happened: main as origin has it, the merge over, the files the staff's.
+        assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), s.git(&s.work, &["rev-parse", "origin/main"]));
+        assert!(!s.work.join(".git/MERGE_HEAD").exists());
+        assert_eq!((s.read("solutions.py"), s.read("results.log")), (b"the staff's\n".to_vec(), b"the staff's log\n".to_vec()));
+        assert!(s.work.join("data/x.py").is_file());
+        assert_eq!(s.read("notes.md"), b"notes\n", "a file the branch doesn't track stays, unsaved");
+        // …and the save has all of it.
+        let read = |rel: &str| std::fs::read_to_string(d.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"));
+        let patch = read("changes.patch");
+        assert!(patch.contains("+v = 2  # the participant's edit") && patch.contains("+<<<<<<< "), "{patch}");
+        assert!(read("conflicted/README.md").contains("<<<<<<< "));
+        assert_eq!(read("state/MERGE_HEAD").trim(), merging);
+        assert!(d.join("state/MERGE_MSG").is_file());
+        assert_eq!(
+            (read("untracked/solutions.py"), read("untracked/results.log"), read("untracked/data")),
+            ("mine\n".to_string(), "my log\n".to_string(), "my data\n".to_string())
+        );
+        assert!(!d.join("untracked/notes.md").exists() && !d.join(".lists").exists());
+        let readme = read("README");
+        assert!(readme.contains(&format!("It was on autocommit-x at commit {tip}")) && readme.contains("git apply --index"), "{readme}");
+        // What the README says gets the edit back.
+        s.git(&s.work, &["branch", "rescue", &tip]);
+        s.git(&s.work, &["checkout", "-q", "rescue"]);
+        s.git(&s.work, &["apply", "--index", d.join("changes.patch").to_str().unwrap()]);
+        assert_eq!(s.read("ex.py"), edit.as_bytes());
+
+        // A reset with nothing to discard saves nothing, and the first save stays.
+        s.git(&s.work, &["reset", "-q", "--hard"]);
+        s.git(&s.work, &["checkout", "-q", "main"]);
+        let o = s.run(&checkout_command(repo, "main", None, true));
+        assert!(o.status.success() && !String::from_utf8_lossy(&o.stdout).contains("DISCARDED_SAVED"), "{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(saves(), std::slice::from_ref(&d));
+        assert_eq!(read("untracked/solutions.py"), "mine\n");
     }
 
     /// Review ai-review claude #4, to verify: could the gentle switch's refusal of a pod mid-merge

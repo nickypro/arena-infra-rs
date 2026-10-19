@@ -8481,8 +8481,8 @@ async fn handle_set_branch(
 
 /// Switch the selected pods (those with an SSH endpoint) to `how.branch` over SSH.
 /// Gentle (fetch+checkout+fast-forward to origin's branch) by default; `how.hard` force-resets
-/// to `origin/<branch>`, discarding local commits/changes. Dry-run prints the exact command per
-/// pod. Pods run
+/// to `origin/<branch>`, discarding local commits/changes (saved on the pod first, its line
+/// saying where: [`discarded_note`]). Dry-run prints the exact command per pod. Pods run
 /// concurrently, each within [`BRANCH_TIMEOUT`] (it used to be serial, so one wedged pod
 /// held up every pod after it). `rsync`: the rsync a pod whose branch can't be pushed is copied
 /// with ([`RSYNC`], a stub in tests); `remote`: `SshRemote` for real, `FakeRemote` in tests.
@@ -8533,7 +8533,12 @@ async fn switch_branch(remote: Arc<dyn Remote>, cfg: &Config, sel: &Selected, ho
         // disk (staged) so their exercises keep working.
         let restored: Vec<&str> = out.stdout.lines().filter_map(|l| l.trim_end_matches('\r').strip_prefix("RESTORED ")).collect();
         landed.push(name.to_string());
-        format!("✓ {name} (on {branch}){}{}{note}", restored_note(&restored, branch), unredacted_note(&out.stdout))
+        format!(
+            "✓ {name} (on {branch}){}{}{note}{}",
+            restored_note(&restored, branch),
+            unredacted_note(&out.stdout),
+            discarded_note(&out.stdout)
+        )
     })
     .await;
     println!("\nswitched {}/{total}", run.ok);
@@ -8564,7 +8569,8 @@ fn push_first_note(cfg: &Config, hard: bool) -> String {
     let busy = if hard {
         "the --hard switch then ends it, discarding its uncommitted changes to tracked files; so is a pod on main/master or \
          a detached HEAD, which no backup commits, with an operation in progress, changes to tracked files, commits no \
-         remote has or untracked files (the --hard switch overwrites any the new branch tracks)"
+         remote has or untracked files (the --hard switch overwrites any the new branch tracks); on every pod, what the \
+         --hard reset discards is saved there first, in .git/arena-discarded/<time>/"
     } else {
         "then NOT switched: the switch refuses to end it"
     };
@@ -8642,14 +8648,16 @@ impl Switched {
 
     /// The pods `--hard` switched after copying the work no backup had saved (`ended`, its switch
     /// done): one line after the run, since they aren't failures — each pod's own line says what
-    /// that work was and where its copy went. `None` when there are none.
+    /// that work was, where its copy went and where on the pod the switch saved what it discarded
+    /// (`.git/arena-discarded/<time>/`, which no later copy overwrites — the copy's label is
+    /// re-pulled from the reset pod: review ai-review claude #2). `None` when there are none.
     fn ended_line(&self) -> Option<String> {
         let names: Vec<&str> = self.ended.iter().filter(|p| !self.failed.contains(p)).map(String::as_str).collect();
         (!names.is_empty()).then(|| {
             format!(
                 "⚠ {} pod(s) had work no backup had saved (an operation in progress, or changes, commits or untracked files on a \
-                 branch no backup commits), copied before the --hard switch discarded or overwrote it — the copy has it (see \
-                 each one's line): {}",
+                 branch no backup commits), copied before the --hard switch discarded or overwrote it — what it discarded is also \
+                 saved on the pod, in .git/arena-discarded/<time>/, which no later copy overwrites (see each one's line): {}",
                 names.len(),
                 names.join(", ")
             )
@@ -8823,11 +8831,14 @@ async fn switch_batch(
 /// A pod with an operation in progress (`u.busy`: a merge, …) had nothing committed at all: its
 /// line says what is in progress instead of a push's failure. A gentle switch (and init-branches)
 /// refuses to end it, on the same line ([`arena_core::backup::checkout_command`]); `--hard`
-/// (`reset_onto` set) ends it and discards its uncommitted changes to tracked files with it, which
-/// only the copy has then — said here. On a branch no backup commits (`UNCOMMITTED`), `u.busy` is
-/// that work: changes to tracked files (discarded), commits no remote has (the copy has the
-/// `.git`), untracked files — which `checkout -f` and `reset --hard` overwrite wherever the new
-/// branch tracks the same path (review pr4: the line said untracked files stay).
+/// (`reset_onto` set) ends it and discards its uncommitted changes to tracked files with it — said
+/// here; the switch saves them on the pod first, and its own line says where ([`discarded_note`]).
+/// The copy isn't said to be the only one (review ai-review claude #2: it is the day's snapshot
+/// label, which the next pull of that label overwrites from the reset pod). On a branch no backup
+/// commits (`UNCOMMITTED`), `u.busy` is that work: changes to tracked files (discarded), commits no
+/// remote has (the copy has the `.git`), untracked files — which `checkout -f` and `reset --hard`
+/// overwrite wherever the new branch tracks the same path (review pr4: the line said untracked
+/// files stay).
 fn not_pushed_note(u: &Unpushed, copied_to: &str, reset_onto: Option<&str>) -> String {
     use arena_core::backup::{busy_noun, uncommitted_reason, uncommitted_situation};
     let branch = u.branch.as_deref().unwrap_or("the branch it was on");
@@ -8846,13 +8857,13 @@ fn not_pushed_note(u: &Unpushed, copied_to: &str, reset_onto: Option<&str>) -> S
         let why = if protected { format!("and {}", uncommitted_reason(what, on)) } else { "so nothing was committed".to_string() };
         let ended = match (reset_onto, what.as_str()) {
             (None, _) => String::new(),
-            (Some(_), "changes") => "the --hard switch discards them (only that copy has them now); ".to_string(),
+            (Some(_), "changes") => "the --hard switch discards them; ".to_string(),
             (Some(_), "commits") => "that copy has its .git, those commits with it; ".to_string(),
             (Some(onto), "untracked") => {
-                format!("the --hard switch overwrites any of them origin/{onto} tracks (only that copy has those now); ")
+                format!("the --hard switch overwrites any of them origin/{onto} tracks; ")
             }
             (Some(_), _) => format!(
-                "the --hard switch ends {} and discards its uncommitted changes to tracked files (only that copy has them now); ",
+                "the --hard switch ends {} and discards its uncommitted changes to tracked files; ",
                 busy_noun(what)
             ),
         };
@@ -8883,6 +8894,16 @@ fn unredacted_note(stdout: &str) -> String {
         note.push_str(&format!(" — real key(s) back in {} file(s) git has redacted: {}", back.len(), back.join(", ")));
     }
     note
+}
+
+/// Where a `--hard` switch saved, on the pod, what it then discarded (`DISCARDED_SAVED <path>`:
+/// its uncommitted changes, an operation's state, untracked files the reset replaced —
+/// [`arena_core::backup::checkout_command`]), for the pod's line: a folder no later save or copy
+/// overwrites, with a README on getting it back. Empty when it saved nothing (nothing to discard).
+fn discarded_note(stdout: &str) -> String {
+    stdout.lines().find_map(|l| l.trim_end_matches('\r').strip_prefix("DISCARDED_SAVED ")).map_or_else(String::new, |path| {
+        format!(" — what it discarded was saved to {}/ on the pod first (its README says how to get it back)", path.trim_end_matches('/'))
+    })
 }
 
 /// The per-pod note for the nested repos a switch put back (`RESTORED <path>` lines;
@@ -22864,7 +22885,8 @@ mod remote_tests {
 
     /// `set-branch` backs up each pod's branch first; a pod mid-merge can't be (`BUSY`). Its files
     /// are copied first, as for a failed push, and then the switch: `--hard` ends the merge with
-    /// the uncommitted changes it discards — said, with where the only copy of them is — while the
+    /// the uncommitted changes it discards — said, with where the copy is and where on the pod the
+    /// switch saved them first (`DISCARDED_SAVED`: review ai-review claude #2) — while the
     /// gentle switch and init-branches refuse to end it (their command's own refusal, on the pod's
     /// line with the copy's note), and the run never calls that pod switched. A pod whose copy
     /// failed too is not switched at all.
@@ -22882,7 +22904,7 @@ mod remote_tests {
         // the rest — not a failure (review fb2 F2) — and one line after the run names it.
         let fake = Arc::new(FakeRemote::new());
         fake.script(&host(22001), [FakeReply::stdout("BRANCH autocommit-a\nPUSHED autocommit-a\n"), FakeReply::ok()]);
-        fake.script(&host(22002), [busy_merge("autocommit-b"), repo_in_place(), FakeReply::ok()]);
+        fake.script(&host(22002), [busy_merge("autocommit-b"), repo_in_place(), FakeReply::stdout(SAVED_BLOOM)]);
         let _ = crate::take_said();
         handle_set_branch(fake.clone(), &cfg, "main", &everyone(&fleet()), true, false, true, &stub.path()).await.unwrap();
         let hard = (checkout_command(REPO, "main", Some(KEY), true), Some(BRANCH_TIMEOUT));
@@ -22894,8 +22916,9 @@ mod remote_tests {
         assert!(line.starts_with(&format!("✓ devtest-bloom (on main){copied_first}")), "{line}");
         assert!(
             line.ends_with(&format!(
-                " first, and the --hard switch ends the merge and discards its uncommitted changes to tracked files (only that copy \
-                 has them now); {stays}"
+                " first, and the --hard switch ends the merge and discards its uncommitted changes to tracked files; {stays} — what \
+                 it discarded was saved to .git/arena-discarded/20261019T090102Z/ on the pod first (its README says how to get it \
+                 back)"
             )),
             "{line}"
         );
@@ -22956,8 +22979,12 @@ mod remote_tests {
 
     /// The line after a `--hard` run that ended bloom's merge after copying it.
     const ENDED_BLOOM: &str = "⚠ 1 pod(s) had work no backup had saved (an operation in progress, or changes, commits or untracked \
-                               files on a branch no backup commits), copied before the --hard switch discarded or overwrote it — the \
-                               copy has it (see each one's line): devtest-bloom";
+                               files on a branch no backup commits), copied before the --hard switch discarded or overwrote it — what \
+                               it discarded is also saved on the pod, in .git/arena-discarded/<time>/, which no later copy overwrites \
+                               (see each one's line): devtest-bloom";
+
+    /// What a `--hard` switch prints when it saved what it discarded ([`checkout_command`]).
+    const SAVED_BLOOM: &str = "Switched to and reset branch 'main'\nDISCARDED_SAVED .git/arena-discarded/20261019T090102Z\n";
 
     /// Review fb2 F2: the morning's `set-branch main --all --hard --init-branches` skipped
     /// init-branches for the whole fleet when one pod was mid-merge — that pod was copied and
@@ -23128,7 +23155,7 @@ mod remote_tests {
         let merging = || FakeReply::stdout("UNCOMMITTED main merge unmerged\nSKIP main\n");
         let clean = || FakeReply::stdout("SKIP main\n");
         let script = |fake: &FakeRemote| {
-            fake.script(&host(22001), [dirty(), repo_in_place(), FakeReply::ok()]);
+            fake.script(&host(22001), [dirty(), repo_in_place(), FakeReply::stdout(SAVED_BLOOM)]);
             fake.script(&host(22002), [clean(), FakeReply::ok()]);
             fake.script(&host(22003), [merging(), repo_in_place(), FakeReply::ok()]);
         };
@@ -23151,7 +23178,8 @@ mod remote_tests {
                 "✓ devtest-apple (on main) — ⚠ NOT COMMITTED FIRST: main has uncommitted changes to tracked files, and no backup \
                  commits on main; its files were copied to "
             ) && apple.ends_with(&format!(
-                " first, and the --hard switch discards them (only that copy has them now); {reflog}"
+                " first, and the --hard switch discards them; {reflog} — what it discarded was saved to \
+                 .git/arena-discarded/20261019T090102Z/ on the pod first (its README says how to get it back)"
             )),
             "{apple}"
         );
@@ -23255,8 +23283,8 @@ mod remote_tests {
                 "✓ devtest-cloud (on main) — ⚠ NOT COMMITTED FIRST: a detached HEAD has untracked files, and no backup commits on \
                  a detached HEAD; its files were copied to "
             ) && cloud.ends_with(
-                " first, and the --hard switch overwrites any of them origin/main tracks (only that copy has those now); the \
-                 commits of its detached HEAD stay on the pod only in its reflog (`git reflog`)"
+                " first, and the --hard switch overwrites any of them origin/main tracks; the commits of its detached HEAD stay \
+                 on the pod only in its reflog (`git reflog`)"
             ),
             "{cloud}"
         );
@@ -23460,7 +23488,8 @@ mod remote_tests {
                 "it is copied into ./backup too, and the --hard switch then ends it, discarding its uncommitted changes to tracked \
                  files; so is a pod on main/master or a detached HEAD, which no backup commits, with an operation in progress, \
                  changes to tracked files, commits no remote has or untracked files (the --hard switch overwrites any the new \
-                 branch tracks); "
+                 branch tracks); on every pod, what the --hard reset discards is saved there first, in \
+                 .git/arena-discarded/<time>/; "
             ),
             "{hard}"
         );
