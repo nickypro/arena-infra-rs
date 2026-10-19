@@ -5719,14 +5719,14 @@ async fn handle_full_backup(
         handle_backup(remote.clone(), cfg, !dry_run, message.clone(), &sel, &mut locks, &mut unpushed).await
     };
     locks.held.clear();
-    // The pods with an operation in progress (BUSY): a look at each before their copy, which,
-    // after it, finishes the ones left alone long enough (`resolve`).
+    // The pods with an operation in progress (BUSY): a look at each first, which paces their copy
+    // and, after it, finishes the ones left alone long enough (`resolve`).
     let busy = resolve::Busy::look(&remote, cfg, &dir, &sel, &unpushed).await;
     if !no_pull && !sel.pods.is_empty() {
         println!();
         let args = PullRun { label: None, max_size: None, remote_path: None, no_git: false, no_big: false, dry_run, yes: true };
         let pulled = pull_pods(&remote, cfg, &dir, args, &sel, rsync, LockMode::Take(POD_LOCK_WAIT)).await;
-        let settled = busy.settle(&remote, cfg, &pulled, message.as_deref()).await;
+        let settled = busy.settle(&remote, cfg, &pulled, true, message.as_deref()).await;
         print_fallback_copies(&settled.unsettled(&unpushed), &pulled);
         settled.print();
         return both_failures(settled.git(git_result, &unpushed), pulled.and_then(Pulled::result), &locks.busy);
@@ -5737,9 +5737,10 @@ async fn handle_full_backup(
              {dir} by rsync — even under --no-pull)"
         );
     }
-    let pulled = copy_unpushed(&remote, cfg, &dir, &sel, &unpushed, rsync, LockMode::Take(POD_LOCK_WAIT)).await;
-    let settled = busy.settle(&remote, cfg, &pulled, message.as_deref()).await;
-    print_fallback_copies(&settled.unsettled(&unpushed), &pulled);
+    let copying = busy.to_copy(&unpushed);
+    let pulled = copy_unpushed(&remote, cfg, &dir, &sel, &copying, rsync, LockMode::Take(POD_LOCK_WAIT)).await;
+    let settled = busy.settle(&remote, cfg, &pulled, false, message.as_deref()).await;
+    print_fallback_copies(&settled.unsettled(&copying), &pulled);
     settled.print();
     both_failures(settled.git(git_result, &unpushed), pulled.and_then(Pulled::result), &locks.busy)
 }

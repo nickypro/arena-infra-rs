@@ -1,17 +1,19 @@
 //! `pods backup`'s step for the pods whose backup said BUSY (an operation in progress, nothing
-//! committed): a read-only look at each, under its lock, before their copy; then,
-//! `BUSY_AUTO_RESOLVE_HOURS` on and the pod quiet that long with this run's copy holding its
-//! state, the operation finished on the pod and the pod backed up again — in the same run, under
-//! its lock. The decisions are core's (`arena_core::resolve`); this is the I/O, beside the backup
-//! flow in main.rs rather than in it: `pods backup` calls [`Busy::look`] after its git step and
-//! [`Busy::settle`] after its copy.
+//! committed): a read-only look at each, under its lock; their copy paced by it (part 2: only
+//! when nothing since the operation started is recorded, the work tree changed, or the last copy
+//! is an hour old); then, `BUSY_AUTO_RESOLVE_HOURS` on and the pod quiet that long with a copy
+//! holding its state, the operation finished on the pod and the pod backed up again — in the same
+//! run, under its lock. The decisions are core's (`arena_core::resolve`); this is the I/O, beside
+//! the backup flow in main.rs rather than in it: `pods backup` calls [`Busy::look`] after its git
+//! step and [`Busy::settle`] after its copy.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use arena_core::backup::{self, parse_backup_report};
 use arena_core::remote::{describe_error, Remote};
-use arena_core::resolve::{self as core_resolve, CopiedNow, Look};
+use arena_core::resolve::{self as core_resolve, BusyCopies, BusyCopy, CopiedNow, CopyWhy, Look};
 use arena_core::ssh::SshTarget;
 use arena_core::Config;
 
@@ -29,17 +31,27 @@ const RESOLVE_TIMEOUT: Duration = Duration::from_secs(300);
 struct BusyPod {
     name: String,
     target: SshTarget,
+    /// Its backup's failure, in a few words ([`Unpushed::why`]).
+    why: String,
     /// What the look before the copy saw (`None`: it failed, or another backup held the lock).
     look: Option<Look>,
+    /// Why it's copied this tick (`None`: not — unchanged since its recorded copy, under an hour).
+    copy: Option<CopyWhy>,
 }
 
-/// The BUSY pods of a `pods backup` run, looked at.
+/// The BUSY pods of a `pods backup` run, looked at, each one's copy decided.
 pub(crate) struct Busy {
     /// `BUSY_AUTO_RESOLVE_HOURS` (`None`: off, or invalid — said).
     hours: Option<u64>,
+    /// The copy record ([`core_resolve::BUSY_COPIES_FILE`]; `None`: no state dir — every BUSY pod
+    /// is copied each tick, as before).
+    record: Option<PathBuf>,
+    copies: BusyCopies,
     pods: Vec<BusyPod>,
     /// The backup dir (its per-pod locks).
     dir: String,
+    /// This machine's clock at the look.
+    now: u64,
 }
 
 /// What [`Busy::settle`] did.
@@ -51,10 +63,25 @@ pub(crate) struct Settled {
     done: Vec<String>,
 }
 
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// `14:02 UTC` (`at` today, by `now`), else `2026-10-18 14:02 UTC`.
+fn at_words(at: u64, now: u64) -> String {
+    let hm = format!("{:02}:{:02} UTC", at % 86_400 / 3600, at % 3600 / 60);
+    if at / 86_400 == now / 86_400 {
+        hm
+    } else {
+        format!("{} {hm}", arena_core::schedule::ymd_string((at / 86_400) as i64))
+    }
+}
+
 impl Busy {
     /// The run's BUSY pods (`unpushed` with `busy`): each looked at, read-only, under its lock
-    /// (a short wait: one another backup holds is copied as before and not finished). Nothing
-    /// BUSY: nothing done.
+    /// (a short wait: one another backup holds is copied as before and not finished); the copy
+    /// record loaded; each one's copy decided ([`core_resolve::copy_needed`]). Nothing BUSY:
+    /// nothing done.
     pub(crate) async fn look(remote: &Arc<dyn Remote>, cfg: &Config, dir: &str, sel: &Selected, unpushed: &[Unpushed]) -> Busy {
         let hours = core_resolve::auto_resolve_hours(cfg.get(core_resolve::AUTO_RESOLVE_KEY)).unwrap_or_else(|e| {
             eprintln!("warning: {e} — no operation left in progress is finished this run");
@@ -66,9 +93,15 @@ impl Busy {
             .into_iter()
             .filter(|(n, _)| unpushed.iter().any(|u| u.busy.is_some() && u.pod == *n))
             .collect();
-        let mut out = Busy { hours, pods: Vec::new(), dir: dir.to_string() };
+        let record = arena_core::snapshot::state_file_path_for(cfg, core_resolve::BUSY_COPIES_FILE).ok();
+        let mut out = Busy { hours, record, copies: BusyCopies::default(), pods: Vec::new(), dir: dir.to_string(), now: now_secs() };
         if busy.is_empty() {
             return out;
+        }
+        if let Some(path) = &out.record {
+            let (copies, warning) = BusyCopies::load(path);
+            warning.iter().for_each(|w| eprintln!("{w}"));
+            out.copies = copies;
         }
         let names: Vec<String> = busy.iter().map(|(n, _)| n.clone()).collect();
         let locks = take_pod_locks(dir, &names, LOOK_LOCK_WAIT).await;
@@ -82,33 +115,77 @@ impl Busy {
         })
         .await;
         drop(locks);
-        out.pods = busy.into_iter().map(|(name, target)| BusyPod { look: looks.remove(&name), name, target }).collect();
+        out.now = now_secs();
+        out.pods = busy
+            .into_iter()
+            .map(|(name, target)| {
+                let look = looks.remove(&name);
+                let copy = core_resolve::copy_needed(look.as_ref(), out.copies.pods.get(&name), out.now);
+                let why = unpushed.iter().find(|u| u.pod == name).map(|u| u.why.clone()).unwrap_or_default();
+                BusyPod { name, target, why, look, copy }
+            })
+            .collect();
         out
     }
 
-    /// After the copy (`pulled`, every BUSY pod's): finish each BUSY pod [`core_resolve::hold`]
-    /// lets through — this run's copy done and holding its checkout — under its lock, the resolve
-    /// and then its backup again (`message`: the backup's commit message, `pods backup -m`), and
-    /// say what became of each.
-    pub(crate) async fn settle(self, remote: &Arc<dyn Remote>, cfg: &Config, pulled: &anyhow::Result<Pulled>, message: Option<&str>) -> Settled {
+    /// The pods `pods backup --no-pull` copies instead of their git backup: `unpushed`'s, less the
+    /// BUSY pods whose recorded copy still holds them (unchanged since, under an hour old).
+    pub(crate) fn to_copy(&self, unpushed: &[Unpushed]) -> Vec<Unpushed> {
+        unpushed.iter().filter(|u| !self.pods.iter().any(|p| p.name == u.pod && p.copy.is_none())).cloned().collect()
+    }
+
+    /// After the copy (`pulled`; `all`: the run pulled every pod, BUSY ones included, whatever
+    /// [`Busy::to_copy`] said): record each BUSY pod's copy that held its checkout; then finish
+    /// each BUSY pod [`core_resolve::hold`] lets through — under its lock, the resolve and then its
+    /// backup again (`message`: the backup's commit message, `pods backup -m`), its record
+    /// forgotten once finished — and say what became of each.
+    pub(crate) async fn settle(self, remote: &Arc<dyn Remote>, cfg: &Config, pulled: &anyhow::Result<Pulled>, all: bool, message: Option<&str>) -> Settled {
         let mut out = Settled::default();
-        let Busy { hours, pods, dir } = self;
+        let Busy { hours, record, mut copies, pods, dir, now } = self;
         let remote_path = cfg.get("BACKUP_REMOTE_PATH").filter(|s| !s.is_empty()).unwrap_or_default().to_string();
+        let mut changes: Vec<(String, Option<BusyCopy>)> = Vec::new();
         let mut candidates = Vec::new();
         for pod in &pods {
-            // This run's copy: where it is (the snapshot), as the commit names it (`<wNdM>/<pod>`).
-            let copy = match (pulled, &pod.look) {
-                (Ok(p), Some(look)) if !p.failed.iter().any(|(q, _)| *q == pod.name) && core_resolve::copy_holds(&remote_path, look, &pod.target.user) => {
-                    let label = p.snapshot_root.rsplit('/').next().unwrap_or_default();
-                    Some((format!("{}/{}", p.snapshot_root, pod.name), format!("{label}/{}", pod.name)))
+            let tried = all || pod.copy.is_some();
+            let copied = match (tried, pulled, &pod.look) {
+                (false, ..) => CopiedNow::No,
+                (true, Ok(p), Some(look)) if !p.failed.iter().any(|(q, _)| *q == pod.name) => {
+                    if core_resolve::copy_holds(&remote_path, look, &pod.target.user) {
+                        let label = p.snapshot_root.rsplit('/').next().unwrap_or_default();
+                        let copy = BusyCopy {
+                            op: look.op_key(),
+                            print: look.print.clone(),
+                            newest: look.newest,
+                            at: now,
+                            to: format!("{}/{}", p.snapshot_root, pod.name),
+                            label: format!("{label}/{}", pod.name),
+                        };
+                        copies.pods.insert(pod.name.clone(), copy.clone());
+                        changes.push((pod.name.clone(), Some(copy)));
+                        CopiedNow::Yes
+                    } else {
+                        CopiedNow::Failed
+                    }
                 }
-                _ => None,
+                (true, ..) => CopiedNow::Failed,
             };
-            let copied = if copy.is_some() { CopiedNow::Yes } else { CopiedNow::Failed };
-            if let (Ok(()), Some(copy)) = (core_resolve::hold(hours, pod.look.as_ref(), copied), copy) {
-                candidates.push((pod.name.clone(), pod.target.clone(), pod.look.clone(), copy));
+            if !tried {
+                // Not copied this tick: said so, with the copy that still holds it.
+                if let Some(last) = copies.pods.get(&pod.name) {
+                    out.lines.push(format!(
+                        "✗ {}: not backed up to git ({}) — copied at {} to {}, unchanged since",
+                        pod.name,
+                        pod.why,
+                        at_words(last.at, now),
+                        last.to
+                    ));
+                }
+            }
+            if let Ok(last) = core_resolve::hold(hours, pod.look.as_ref(), copied, copies.pods.get(&pod.name)) {
+                candidates.push((pod.name.clone(), pod.target.clone(), pod.look.clone(), last.clone()));
             }
         }
+        save(record.as_deref(), &changes, now);
         let Some(hours) = hours.filter(|_| !candidates.is_empty()) else { return out };
         // Finish each, under its lock: the resolve looks again and goes ahead only if nothing
         // changed since the look this copy followed; then the backup, as any run's.
@@ -123,9 +200,9 @@ impl Busy {
         let jobs = candidates
             .into_iter()
             .filter(|(n, ..)| !locks.busy.contains(n))
-            .filter_map(|(name, target, look, (to, label))| {
+            .filter_map(|(name, target, look, last)| {
                 let look = look?;
-                let resolve = core_resolve::resolve_command(&repo, hours, &look.op_key(), &look.print, &label);
+                let resolve = core_resolve::resolve_command(&repo, hours, &look.op_key(), &look.print, &last.label);
                 // The backup's own message, as `pods backup` gave it.
                 let msg = message.map_or_else(|| format!("arena backup {name}"), String::from);
                 let again = backup::backup_command(&repo, key.as_deref(), &msg, origin.as_deref());
@@ -134,7 +211,7 @@ impl Busy {
                     let resolved = remote.exec(&target, &resolve, Some(RESOLVE_TIMEOUT)).await.map_err(|e| describe_error(&e));
                     let finished = matches!(&resolved, Ok(o) if o.success && core_resolve::parse_resolve(&o.stdout).resolved.is_some());
                     let backed = if finished { Some(remote.exec(&target, &again, Some(BACKUP_TIMEOUT)).await.map_err(|e| describe_error(&e))) } else { None };
-                    (resolved, backed, to)
+                    (resolved, backed, last)
                 };
                 Some((name, job))
             })
@@ -142,15 +219,27 @@ impl Busy {
         let mut finished = Vec::new();
         each_pod(jobs, |_, _, name, result| {
             let line = match result {
-                Ok((resolved, backed, to)) => finished_line(name, hours, &repo, resolved, backed, &to, &mut finished),
+                Ok((resolved, backed, last)) => finished_line(name, hours, &repo, resolved, backed, &last, &mut finished),
                 Err(why) => format!("✗ {name}: finishing its operation in progress failed: {why}"),
             };
             out.lines.push(line);
         })
         .await;
         drop(locks);
+        let forget: Vec<(String, Option<BusyCopy>)> = finished.iter().map(|n| (n.clone(), None)).collect();
+        save(record.as_deref(), &forget, now);
         out.done = finished;
         out
+    }
+}
+
+/// Record `changes` in the copy record at `path` (none: nothing written), said on stderr when it
+/// can't be — the BUSY pods are then copied again next run.
+fn save(path: Option<&std::path::Path>, changes: &[(String, Option<BusyCopy>)], now: u64) {
+    let Some(path) = path.filter(|_| !changes.is_empty()) else { return };
+    match core_resolve::record_busy_copies(path, changes, now) {
+        Ok(warning) => warning.iter().for_each(|w| eprintln!("{w}")),
+        Err(e) => eprintln!("warning: couldn't record the BUSY pods' copies in {} ({e}) — they're copied again next run", path.display()),
     }
 }
 
@@ -162,7 +251,7 @@ fn finished_line(
     repo: &str,
     resolved: crate::PodCall,
     backed: Option<crate::PodCall>,
-    to: &str,
+    last: &BusyCopy,
     done: &mut Vec<String>,
 ) -> String {
     let report = resolved.as_ref().map(|o| core_resolve::parse_resolve(&o.stdout)).unwrap_or_default();
@@ -172,9 +261,9 @@ fn finished_line(
     if report.resolved.is_none() {
         let saved = report.saved.as_ref().map_or_else(String::new, |s| format!("; the conflicted files as they were are in {s} on the pod"));
         let step = report.failed.as_ref().map_or_else(|| failure_why(&resolved), |s| format!("at {s}"));
-        return format!("✗ {name}: finishing its operation in progress failed ({step}){saved} — the copy {to} has it as it was");
+        return format!("✗ {name}: finishing its operation in progress failed ({step}){saved} — the copy {} has it as it was", last.to);
     }
-    let note = core_resolve::resolved_note(&report, hours, to);
+    let note = core_resolve::resolved_note(&report, hours, &last.to);
     let Some(backed) = backed else { return format!("✗ {name}: {note}, but its backup wasn't run") };
     let b = backed.as_ref().map(|o| parse_backup_report(&o.stdout)).unwrap_or_default();
     match (&backed, &b.outcome) {

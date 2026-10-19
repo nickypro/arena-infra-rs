@@ -1,13 +1,14 @@
 //! `pods backup` with a BUSY pod over a scripted `FakeRemote` and a stand-in rsync: the order
-//! (its backup, its look, its copy, its resolve, its backup again), its line, and what keeps it
-//! from being finished (a failed copy, `BUSY_AUTO_RESOLVE_HOURS=0`, the resolve refusing or
-//! failing).
+//! (its backup, its look, its copy, its resolve, its backup again), its line, what keeps it from
+//! being finished (a failed copy, `BUSY_AUTO_RESOLVE_HOURS=0`, the resolve refusing or failing),
+//! and part 2's pacing of its copies (unchanged: none; changed or an hour old: copied; the record
+//! missing or corrupt: copied).
 
 use super::Settled;
 use crate::{handle_full_backup, Selected, Unpushed, BACKUP_TIMEOUT};
 use arena_core::backup::{backup_command, BACKUP_BUSY_EXIT};
 use arena_core::remote::{FakeRemote, FakeReply, RemoteCall, PROBE_TIMEOUT};
-use arena_core::resolve as core_resolve;
+use arena_core::resolve::{self as core_resolve, BusyCopy};
 use arena_core::{Config, Pod};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -89,6 +90,14 @@ impl World {
         ))
     }
 
+    fn record(&self) -> PathBuf {
+        self.base.join("state").join("devtest").join(core_resolve::BUSY_COPIES_FILE)
+    }
+
+    fn recorded(&self) -> Option<BusyCopy> {
+        core_resolve::BusyCopies::load(&self.record()).0.pods.get("devtest-bloom").cloned()
+    }
+
     /// Where a copy of this run goes: `<backups>/<wNdM>`.
     fn snapshot_root(&self, cfg: &Config) -> String {
         let (w, d) = crate::resolve_week_day(cfg, None, None).unwrap();
@@ -146,6 +155,9 @@ fn backup(name: &str) -> (String, Option<Duration>) {
     (backup_command(REPO, Some(KEY), &format!("arena backup devtest-{name}"), None), Some(BACKUP_TIMEOUT))
 }
 
+const MERGE_WHY: &str = "a merge is in progress on autocommit-b — not committed; resolve the conflicts and `git add` them, then \
+                         `git commit` — or abort it (`git merge --abort`) on the pod";
+
 /// The cron's `pods backup --no-pull`, and `pods backup` with its pull: a merge left alone for 3h+
 /// (a day old, nothing changed for 4h) is backed up, looked at, copied (both tiers), finished on
 /// the pod from the look the copy followed — then backed up again in the same run, under its lock.
@@ -183,11 +195,12 @@ async fn a_merge_left_alone_is_backed_up_copied_finished_and_backed_up_again() {
              hand-resolved version of 1; before: {root}/devtest-bloom, and {REPO}/.git/arena-resolved/20261019T140200Z on the pod)"
         );
         assert!(said.contains(&line), "{said:#?}");
+        assert_eq!(w.recorded(), None, "finished: its record forgotten");
     }
 }
 
 /// A copy that fails is never followed by a resolve: bloom stays as it is, the run fails, its
-/// line says both failures.
+/// line says both failures — and nothing is recorded (the next run copies it again).
 #[tokio::test]
 async fn a_failed_copy_is_never_followed_by_a_resolve() {
     let w = World::new("copyfail");
@@ -201,22 +214,132 @@ async fn a_failed_copy_is_never_followed_by_a_resolve() {
     assert!(err.to_string().starts_with("1 pod(s) failed to back up; "), "{err}");
     let calls = execs(&fake, 22002);
     assert_eq!(calls.len(), 3, "its backup, look and copy only: {calls:#?}");
+    assert_eq!(w.recorded(), None);
     assert!(!crate::take_said().iter().any(|l| l.starts_with("✓ devtest-bloom")));
 }
 
-/// `BUSY_AUTO_RESOLVE_HOURS=0`: never finished, however quiet — copied as before.
+/// `BUSY_AUTO_RESOLVE_HOURS=0`: never finished, however quiet — the copies are paced all the same.
 #[tokio::test]
-async fn off_means_never_finished() {
+async fn off_means_never_finished_and_copies_still_paced() {
     let w = World::new("off");
     let cfg = w.cfg("BUSY_AUTO_RESOLVE_HOURS=0");
+    let n = now();
+    for (run, copies) in [("first", true), ("second", false)] {
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [pushed("autocommit-a")]);
+        let mut bloom = vec![busy(), look(n, 4 * HOUR, "11-22")];
+        if copies {
+            bloom.push(repo_in_place());
+        }
+        bloom.extend([resolved(), pushed("autocommit-b")]);
+        fake.script(&host(22002), bloom);
+        let _ = crate::take_said();
+        let err = handle_full_backup(fake.clone(), &cfg, &fleet(), true, None, false, true, &w.rsync_path()).await.unwrap_err();
+        assert_eq!(err.to_string(), "1 pod(s) failed to back up", "{run}");
+        assert_eq!(execs(&fake, 22002).len(), if copies { 3 } else { 2 }, "{run}: no resolve");
+        assert_eq!(w.copied().is_empty(), !copies, "{run}");
+        assert!(w.recorded().is_some(), "{run}");
+    }
+}
+
+/// Part 2: bloom, BUSY every tick and its merge too recent to finish, is copied the first tick;
+/// the next tick, unchanged, it isn't — its line says when it was copied, and where; its work tree
+/// changed: copied; the recorded copy an hour old: copied; the record corrupt or gone: copied.
+#[tokio::test]
+async fn a_busy_pods_copy_is_paced_by_its_look() {
+    let w = World::new("paced");
+    let cfg = w.cfg("");
+    let root = w.snapshot_root(&cfg);
+    let n = now();
+    // One tick with bloom's look saying `print`: (bloom copied, the run's lines).
+    let tick = |print: &'static str| {
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [pushed("autocommit-a")]);
+        // Its newest file changed 10 minutes ago: never finished.
+        fake.script(&host(22002), [busy(), look(n, 600, print), repo_in_place()]);
+        let cfg = cfg.clone();
+        let rsync = w.rsync_path();
+        async move {
+            let _ = crate::take_said();
+            let err = handle_full_backup(fake.clone(), &cfg, &fleet(), true, None, false, true, &rsync).await.unwrap_err();
+            assert_eq!(err.to_string(), "1 pod(s) failed to back up");
+            let calls = execs(&fake, 22002);
+            assert!(calls.len() <= 3 && !calls.iter().any(|(c, _)| c.contains("arena-resolve")), "{calls:#?}");
+            (calls.len() == 3, crate::take_said())
+        }
+    };
+    let (copied, said) = tick("11-22").await;
+    assert!(copied, "no record: copied");
+    assert_eq!(w.copied().len(), 3);
+    let first = w.recorded().expect("its copy recorded");
+    assert_eq!((first.print.as_str(), first.to.clone(), first.label.clone()), ("11-22", format!("{root}/devtest-bloom"), format!("{}/devtest-bloom", root.rsplit('/').next().unwrap())));
+    assert_eq!(first.op, format!("merge {} {SHA}", n - 24 * HOUR));
+    assert!(!said.iter().any(|l| l.contains("unchanged since")), "{said:#?}");
+
+    let (copied, said) = tick("11-22").await;
+    assert!(!copied, "unchanged since its copy, under an hour: not copied");
+    assert!(w.copied().is_empty());
+    let at = format!("{:02}:{:02} UTC", first.at % 86_400 / 3600, first.at % 3600 / 60);
+    let line = format!("✗ devtest-bloom: not backed up to git ({MERGE_WHY}) — copied at {at} to {root}/devtest-bloom, unchanged since");
+    assert!(said.contains(&line), "{line}\n{said:#?}");
+    assert_eq!(w.recorded(), Some(first.clone()), "the record kept as it was");
+
+    let (copied, _) = tick("33-44").await;
+    assert!(copied, "its work tree changed: copied");
+    assert_eq!(w.copied().len(), 3);
+    assert_eq!(w.recorded().map(|r| r.print), Some("33-44".to_string()));
+
+    // The recorded copy an hour old.
+    let old = BusyCopy { at: now() - HOUR, ..w.recorded().unwrap() };
+    core_resolve::record_busy_copies(&w.record(), &[("devtest-bloom".into(), Some(old))], now()).unwrap();
+    let (copied, _) = tick("33-44").await;
+    assert!(copied, "an hour old: copied");
+    assert_eq!(w.copied().len(), 3);
+
+    // Corrupt, then gone: copied each time.
+    for (case, damage) in [("corrupt", Some("{not json")), ("gone", None)] {
+        match damage {
+            Some(text) => std::fs::write(w.record(), text).unwrap(),
+            None => std::fs::remove_file(w.record()).unwrap(),
+        }
+        let (copied, _) = tick("33-44").await;
+        assert!(copied, "{case}: copied");
+        assert_eq!(w.copied().len(), 3, "{case}");
+        assert_eq!(w.recorded().map(|r| r.print), Some("33-44".to_string()), "{case}: recorded again");
+    }
+}
+
+/// Finished from the recorded copy (part 2): quiet now, unchanged since a copy recorded earlier —
+/// not copied again, finished, backed up; its line names that copy.
+#[tokio::test]
+async fn a_paced_pod_is_finished_from_its_recorded_copy() {
+    let w = World::new("paced-resolve");
+    let cfg = w.cfg("");
     let fake = Arc::new(FakeRemote::new());
     fake.script(&host(22001), [pushed("autocommit-a")]);
-    fake.script(&host(22002), [busy(), look(now(), 4 * HOUR, "11-22"), repo_in_place(), resolved(), pushed("autocommit-b")]);
+    let n = now();
+    fake.script(&host(22002), [busy(), look(n, 4 * HOUR, "55-66"), repo_in_place(), FakeReply::exit(7, "").with_stdout("REFUSED changed: files changed since the copy\n")]);
     let _ = crate::take_said();
+    // First tick: copied, then the resolve refuses (something changed meanwhile): said, not finished.
     let err = handle_full_backup(fake.clone(), &cfg, &fleet(), true, None, false, true, &w.rsync_path()).await.unwrap_err();
     assert_eq!(err.to_string(), "1 pod(s) failed to back up");
-    assert_eq!(execs(&fake, 22002).len(), 3, "its backup, look and copy: no resolve");
+    assert_eq!(execs(&fake, 22002).len(), 4, "backup, look, copy, resolve — no backup after a refusal");
+    let said = crate::take_said();
+    assert!(said.contains(&"⊘ devtest-bloom: not finished automatically — changed: files changed since the copy".to_string()), "{said:#?}");
+    let copy = w.recorded().unwrap();
     assert_eq!(w.copied().len(), 3);
+    // Next tick: unchanged since that copy — not copied, finished, backed up.
+    let fake = Arc::new(FakeRemote::new());
+    fake.script(&host(22001), [pushed("autocommit-a")]);
+    fake.script(&host(22002), [busy(), look(n, 4 * HOUR, "55-66"), resolved(), pushed("autocommit-b")]);
+    handle_full_backup(fake.clone(), &cfg, &fleet(), true, None, false, true, &w.rsync_path()).await.unwrap();
+    let calls = execs(&fake, 22002);
+    assert_eq!(calls.len(), 4, "{calls:#?}");
+    assert!(calls[2].0.contains(" arena-resolve ") && calls[3] == backup("bloom"), "{calls:#?}");
+    assert!(w.copied().is_empty(), "not copied again");
+    let said = crate::take_said();
+    assert!(said.iter().any(|l| l.starts_with("✓ devtest-bloom -> autocommit-b — finished a merge left for 3h+ (") && l.contains(&format!("before: {}, and ", copy.to))), "{said:#?}");
+    assert!(said.iter().any(|l| l.starts_with("✗ devtest-bloom: not backed up to git (") && l.ends_with("unchanged since")), "the paced line first: {said:#?}");
 }
 
 /// What else the resolve can end in, each said on the pod's line and still a failure: it failed
@@ -254,6 +377,7 @@ async fn a_resolve_that_fails_or_a_backup_after_it_that_fails_is_said() {
         if case == "backup after" {
             assert!(line.contains(", but its backup then failed: "), "{line}");
         }
+        assert!(w.recorded().is_some(), "{case}: not finished, its record kept");
     }
 }
 

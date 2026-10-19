@@ -6,10 +6,19 @@
 //! change, and backed up again in the same run (the human's call, 2026-10-19: "backup files + some
 //! automated heuristic … whatever changes are most recent … after like 3h of no activity").
 //!
-//! Pure here: the setting, the scripts (the read-only look and the resolve) and their parsers, and
-//! the decision. The run step is the CLI's (`crates/cli/src/resolve.rs`).
+//! Meanwhile such a pod is copied by rsync instead of its git backup, but not every 15-minute
+//! tick: only when nothing since the operation started is recorded, when its work tree changed
+//! since the last recorded copy, or when that copy is an hour old ([`copy_needed`]) — so a course
+//! push that leaves many pods conflicted can't make one tick outlast the next (whose `flock -n`
+//! then skips the healthy pods' backups too).
+//!
+//! Pure here: the setting, the scripts (the read-only look and the resolve) and their parsers, the
+//! copy record and the decisions. The run step is the CLI's (`crates/cli/src/resolve.rs`).
 
 use std::collections::BTreeMap;
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::ssh::shell_word;
@@ -128,8 +137,8 @@ pub struct Look {
 }
 
 impl Look {
-    /// The operation's identity: `<what> <started> <commit>` — what the resolve checks is still
-    /// there.
+    /// The operation's identity: `<what> <started> <commit>` — what the copy record is for, and
+    /// what the resolve checks is still there.
     pub fn op_key(&self) -> String {
         format!("{} {} {}", self.what, self.since.map_or_else(|| "-".to_string(), |s| s.to_string()), self.head)
     }
@@ -216,6 +225,117 @@ pub fn copy_holds(remote_path: &str, look: &Look, user: &str) -> bool {
     top.starts_with('/') && (top == root || root.is_empty() || top.starts_with(&format!("{root}/")))
 }
 
+/// The copy record's file, in the fleet's state dir ([`crate::snapshot::state_file_path`]).
+pub const BUSY_COPIES_FILE: &str = "busy-copies.json";
+const BUSY_COPIES_VERSION: u32 = 1;
+
+/// The last copy of a BUSY pod that succeeded: for which operation ([`Look::op_key`]), the work
+/// tree it held ([`Look::print`], [`Look::newest`]: what the look before it saw), when (this
+/// machine's clock), and where (`to`: the snapshot dir; `label`: `<wNdM>/<pod>`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BusyCopy {
+    pub op: String,
+    pub print: String,
+    pub newest: u64,
+    pub at: u64,
+    pub to: String,
+    pub label: String,
+}
+
+/// Every pod's [`BusyCopy`], by name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BusyCopies {
+    pub version: u32,
+    pub pods: BTreeMap<String, BusyCopy>,
+}
+
+impl Default for BusyCopies {
+    fn default() -> Self {
+        BusyCopies { version: BUSY_COPIES_VERSION, pods: BTreeMap::new() }
+    }
+}
+
+impl BusyCopies {
+    /// Load tolerantly: missing = none recorded; unreadable or corrupt = none recorded plus a
+    /// warning — every BUSY pod is then copied again, the safe side.
+    pub fn load(path: &Path) -> (Self, Option<String>) {
+        match std::fs::read_to_string(path) {
+            Ok(text) => match serde_json::from_str::<BusyCopies>(&text) {
+                Ok(c) if c.version == BUSY_COPIES_VERSION => (c, None),
+                Ok(c) => (Self::default(), Some(format!("warning: ignoring {} (version {})", path.display(), c.version))),
+                Err(e) => (Self::default(), Some(format!("warning: ignoring {} ({e}) — copying every BUSY pod again", path.display()))),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Self::default(), None),
+            Err(e) => (Self::default(), Some(format!("warning: can't read {} ({e}) — copying every BUSY pod again", path.display()))),
+        }
+    }
+}
+
+/// A record this old (by this machine's clock) is a pod's that is no longer BUSY — a BUSY pod's is
+/// renewed at least every [`COPY_EVERY_SECS`] — and is dropped at the next write.
+pub const FORGET_AFTER_SECS: u64 = 24 * 3600;
+
+/// Apply `changes` to the record at `path` — each pod's new copy, or `None` to forget it (a pod
+/// finished) — drop the records [`FORGET_AFTER_SECS`] old at `now`, and save it atomically
+/// (owner-only), under an exclusive lock on the state dir so two runs (the cron's and an
+/// operator's) can't drop each other's records. `Ok` carries the load warning, if the old file had
+/// to be ignored.
+pub fn record_busy_copies(path: &Path, changes: &[(String, Option<BusyCopy>)], now: u64) -> std::io::Result<Option<String>> {
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    crate::snapshot::create_private_dir(dir)?;
+    let lock = std::fs::File::open(dir).ok().filter(|f| f.lock().is_ok());
+    let (mut copies, warning) = BusyCopies::load(path);
+    copies.pods.retain(|_, c| now.saturating_sub(c.at) < FORGET_AFTER_SECS);
+    for (pod, copy) in changes {
+        match copy {
+            Some(c) => {
+                copies.pods.insert(pod.clone(), c.clone());
+            }
+            None => {
+                copies.pods.remove(pod);
+            }
+        }
+    }
+    let mut json = serde_json::to_string_pretty(&copies).unwrap_or_default();
+    json.push('\n');
+    let saved = crate::snapshot::write_atomic(path, json.as_bytes(), 0o600);
+    if let Some(l) = &lock {
+        let _ = l.unlock();
+    }
+    saved.map(|()| warning)
+}
+
+/// A BUSY pod is copied again at least this often (its last copy older: copied).
+pub const COPY_EVERY_SECS: u64 = 3600;
+
+/// Why a BUSY pod is copied this tick ([`copy_needed`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyWhy {
+    /// No look (it failed): copied as before.
+    NoLook,
+    /// No copy recorded since this operation started (none, or one of another operation).
+    First,
+    /// Its work tree changed since the last recorded copy.
+    Changed,
+    /// The last recorded copy is [`COPY_EVERY_SECS`] old.
+    Stale,
+}
+
+/// Whether to copy a BUSY pod this tick, given its look and its last recorded copy (`now`: this
+/// machine's clock, the record's): `Some(why)`, or `None` — copied since the operation started,
+/// unchanged since, under an hour ago. Pure.
+pub fn copy_needed(look: Option<&Look>, last: Option<&BusyCopy>, now: u64) -> Option<CopyWhy> {
+    let Some(look) = look else { return Some(CopyWhy::NoLook) };
+    let Some(last) = last.filter(|l| l.op == look.op_key()) else { return Some(CopyWhy::First) };
+    if last.print != look.print {
+        return Some(CopyWhy::Changed);
+    }
+    if now.saturating_sub(last.at) >= COPY_EVERY_SECS || last.at > now {
+        return Some(CopyWhy::Stale);
+    }
+    None
+}
+
 /// This run's copy of a BUSY pod.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CopiedNow {
@@ -223,6 +343,8 @@ pub enum CopiedNow {
     Yes,
     /// Tried, and failed (or it didn't hold the checkout): never resolved this run.
     Failed,
+    /// Not copied this tick ([`copy_needed`]: unchanged since the recorded copy).
+    No,
 }
 
 /// Why a BUSY pod is not finished this run ([`hold`]).
@@ -236,15 +358,18 @@ pub enum Hold {
     Never(String),
     /// Not quiet long enough ([`not_quiet`]).
     Recent(String),
-    /// This run's copy failed (or didn't hold the checkout).
+    /// This run's copy failed.
     CopyFailed,
+    /// No recorded copy holds its work tree as it is now.
+    NoCopy,
 }
 
-/// Whether to finish a BUSY pod's operation now (`Ok`), or why not. Every condition: the setting
-/// on (`hours`), a look, an operation this finishes and not a sequence, quiet for `hours`
-/// ([`not_quiet`]), and this run's copy — taken after that look — done and holding its checkout:
-/// the resolve then goes ahead only if nothing changed since that look. Pure.
-pub fn hold(hours: Option<u64>, look: Option<&Look>, copied: CopiedNow) -> std::result::Result<(), Hold> {
+/// Whether to finish a BUSY pod's operation now (`Ok`, with the copy that holds its state before),
+/// or why not. Every condition: the setting on (`hours`), a look, an operation this finishes and
+/// not a sequence, quiet for `hours` ([`not_quiet`]), this run's copy not failed, and a recorded
+/// copy of this operation taken after the work tree's last change — its look's files the same as
+/// now (`last`, which this run's own copy has just updated when there was one). Pure.
+pub fn hold<'a>(hours: Option<u64>, look: Option<&Look>, copied: CopiedNow, last: Option<&'a BusyCopy>) -> std::result::Result<&'a BusyCopy, Hold> {
     let Some(hours) = hours else { return Err(Hold::Off) };
     let Some(look) = look else { return Err(Hold::NoLook) };
     if !finishes(&look.what) {
@@ -259,7 +384,7 @@ pub fn hold(hours: Option<u64>, look: Option<&Look>, copied: CopiedNow) -> std::
     if copied == CopiedNow::Failed {
         return Err(Hold::CopyFailed);
     }
-    Ok(())
+    last.filter(|l| l.op == look.op_key() && l.print == look.print).ok_or(Hold::NoCopy)
 }
 
 /// What a resolve said ([`parse_resolve`]).

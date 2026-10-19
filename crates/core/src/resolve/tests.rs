@@ -126,26 +126,104 @@ fn quiet_means_the_operation_the_files_and_any_login_older_than_the_threshold() 
     assert_eq!(not_quiet(&look_at(n, Some(n - 5 * HOUR), n - 5 * HOUR, None), 6).as_deref(), Some("the merge started less than 6h ago"));
 }
 
-/// The gate: on, a look, an operation finished here and not a sequence, quiet, and this run's copy
-/// (taken after that look) done.
+fn copy_of(look: &Look, at: u64) -> BusyCopy {
+    BusyCopy { op: look.op_key(), print: look.print.clone(), newest: look.newest, at, to: "/b/w1d1/devtest-a".into(), label: "w1d1/devtest-a".into() }
+}
+
+/// Part 2: a BUSY pod is copied when nothing since the operation started is recorded, when its
+/// work tree changed since the last recorded copy, or when that copy is an hour old — else not.
 #[test]
-fn the_resolve_waits_for_quiet_and_this_runs_copy() {
+fn a_busy_pod_is_copied_only_when_unrecorded_changed_or_an_hour_old() {
+    let n = 1_760_900_000;
+    let look = look_at(n, Some(n - DAY), n - DAY, None);
+    let fresh = copy_of(&look, n - 600);
+    let other_op = BusyCopy { op: "merge 1 abc123".into(), ..fresh.clone() };
+    let changed = BusyCopy { print: "999-1".into(), ..fresh.clone() };
+    let (young, hour, ahead) = (copy_of(&look, n - COPY_EVERY_SECS + 1), copy_of(&look, n - COPY_EVERY_SECS), copy_of(&look, n + 60));
+    let cases: Vec<(Option<&Look>, Option<&BusyCopy>, Option<CopyWhy>)> = vec![
+        (None, Some(&fresh), Some(CopyWhy::NoLook)),
+        (Some(&look), None, Some(CopyWhy::First)),
+        (Some(&look), Some(&other_op), Some(CopyWhy::First)),
+        (Some(&look), Some(&changed), Some(CopyWhy::Changed)),
+        (Some(&look), Some(&fresh), None),
+        (Some(&look), Some(&young), None),
+        (Some(&look), Some(&hour), Some(CopyWhy::Stale)),
+        (Some(&look), Some(&ahead), Some(CopyWhy::Stale)),
+    ];
+    for (l, last, want) in cases {
+        assert_eq!(copy_needed(l, last, n), want, "{last:?}");
+    }
+}
+
+/// Part 1's gate: on, a look, an operation finished here and not a sequence, quiet, this run's
+/// copy not failed, and a recorded copy of this operation with the work tree as it is now.
+#[test]
+fn the_resolve_waits_for_quiet_and_a_copy_taken_after_the_last_change() {
     let n = 1_760_900_000;
     let look = look_at(n, Some(n - DAY), n - 4 * HOUR, None);
-    assert_eq!(hold(Some(3), Some(&look), CopiedNow::Yes), Ok(()));
-    assert_eq!(hold(None, Some(&look), CopiedNow::Yes), Err(Hold::Off));
-    assert_eq!(hold(Some(3), None, CopiedNow::Yes), Err(Hold::NoLook));
+    let copy = copy_of(&look, n - 600);
+    let ok = |h, l: Option<&Look>, c, last: Option<&BusyCopy>| hold(h, l, c, last).cloned();
+    assert_eq!(ok(Some(3), Some(&look), CopiedNow::Yes, Some(&copy)), Ok(copy.clone()));
+    assert_eq!(ok(Some(3), Some(&look), CopiedNow::No, Some(&copy)), Ok(copy.clone()), "paced: the recorded copy holds it");
+    assert_eq!(ok(None, Some(&look), CopiedNow::Yes, Some(&copy)), Err(Hold::Off));
+    assert_eq!(ok(Some(3), None, CopiedNow::Yes, Some(&copy)), Err(Hold::NoLook));
     for what in ["am", "rebase", "sequence", "none"] {
         let l = Look { what: what.into(), since: None, ..look.clone() };
-        assert_eq!(hold(Some(3), Some(&l), CopiedNow::Yes), Err(Hold::Never(what.into())));
+        assert_eq!(ok(Some(3), Some(&l), CopiedNow::Yes, Some(&copy)), Err(Hold::Never(what.into())));
     }
     let seq = Look { what: "cherry-pick".into(), sequence: true, ..look.clone() };
-    assert_eq!(hold(Some(3), Some(&seq), CopiedNow::Yes), Err(Hold::Never("sequence".into())));
+    assert_eq!(ok(Some(3), Some(&seq), CopiedNow::Yes, Some(&copy)), Err(Hold::Never("sequence".into())));
     let busy = look_at(n, Some(n - DAY), n - 600, None);
-    assert_eq!(hold(Some(3), Some(&busy), CopiedNow::Yes), Err(Hold::Recent("a file changed less than 3h ago".into())));
-    assert_eq!(hold(Some(5), Some(&look), CopiedNow::Yes), Err(Hold::Recent("a file changed less than 5h ago".into())));
-    // A copy that failed: never.
-    assert_eq!(hold(Some(3), Some(&look), CopiedNow::Failed), Err(Hold::CopyFailed));
+    assert_eq!(ok(Some(3), Some(&busy), CopiedNow::Yes, Some(&copy_of(&busy, n))), Err(Hold::Recent("a file changed less than 3h ago".into())));
+    assert_eq!(ok(Some(5), Some(&look), CopiedNow::Yes, Some(&copy)), Err(Hold::Recent("a file changed less than 5h ago".into())));
+    // A copy that failed: never, even with an older copy recorded.
+    assert_eq!(ok(Some(3), Some(&look), CopiedNow::Failed, Some(&copy)), Err(Hold::CopyFailed));
+    // No copy after the last change: none, one of another operation, one of the work tree before.
+    assert_eq!(ok(Some(3), Some(&look), CopiedNow::No, None), Err(Hold::NoCopy));
+    assert_eq!(ok(Some(3), Some(&look), CopiedNow::No, Some(&BusyCopy { op: "merge 7 abc123".into(), ..copy.clone() })), Err(Hold::NoCopy));
+    assert_eq!(ok(Some(3), Some(&look), CopiedNow::No, Some(&BusyCopy { print: "1-1".into(), ..copy.clone() })), Err(Hold::NoCopy));
+}
+
+/// The record: missing = nothing recorded (copy); corrupt or another version = nothing recorded
+/// plus a warning (copy); written atomically, owner-only, each pod's own; a pod finished is
+/// forgotten, and a record a day old dropped.
+#[test]
+fn the_copy_record_round_trips_and_a_missing_or_corrupt_one_means_copy() {
+    let dir = std::env::temp_dir().join(format!("arena-busy-copies-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("devtest").join(BUSY_COPIES_FILE);
+    let n = 1_760_900_000;
+    let look = look_at(n, Some(n - DAY), n - DAY, None);
+    assert_eq!(BusyCopies::load(&path), (BusyCopies::default(), None), "missing: nothing recorded, no warning");
+    assert_eq!(copy_needed(Some(&look), BusyCopies::load(&path).0.pods.get("devtest-a"), n), Some(CopyWhy::First));
+    let a = copy_of(&look, n - 60);
+    let b = BusyCopy { to: "/b/w1d1/devtest-b".into(), label: "w1d1/devtest-b".into(), ..a.clone() };
+    assert_eq!(record_busy_copies(&path, &[("devtest-a".into(), Some(a.clone())), ("devtest-b".into(), Some(b.clone()))], n).unwrap(), None);
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+    }
+    let (got, warning) = BusyCopies::load(&path);
+    assert_eq!((got.pods.get("devtest-a"), got.pods.get("devtest-b"), warning), (Some(&a), Some(&b), None));
+    assert_eq!(copy_needed(Some(&look), got.pods.get("devtest-a"), n), None, "recorded and unchanged: not copied");
+    // Finished: forgotten; the other kept. A day later, a write drops what's left.
+    record_busy_copies(&path, &[("devtest-a".into(), None)], n).unwrap();
+    assert_eq!(BusyCopies::load(&path).0.pods.keys().collect::<Vec<_>>(), ["devtest-b"]);
+    record_busy_copies(&path, &[], n + FORGET_AFTER_SECS).unwrap();
+    assert!(BusyCopies::load(&path).0.pods.is_empty(), "a day old: dropped");
+    // Corrupt, or another version: nothing recorded (every BUSY pod copied), said; the next write replaces it.
+    for bad in ["{not json", "{\"version\": 2, \"pods\": {}}", ""] {
+        std::fs::write(&path, bad).unwrap();
+        let (got, warning) = BusyCopies::load(&path);
+        assert!(got.pods.is_empty(), "{bad}");
+        assert!(warning.as_deref().is_some_and(|w| w.starts_with("warning: ignoring ")), "{bad}: {warning:?}");
+        assert_eq!(copy_needed(Some(&look), got.pods.get("devtest-a"), n), Some(CopyWhy::First), "{bad}");
+        let warned = record_busy_copies(&path, &[("devtest-a".into(), Some(a.clone()))], n).unwrap();
+        assert!(warned.is_some(), "{bad}");
+        assert_eq!(BusyCopies::load(&path).0.pods.get("devtest-a"), Some(&a));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -659,7 +737,7 @@ fn am_a_rebase_and_a_sequence_are_left_alone() {
     r.age(4 * HOUR);
     let look = r.look();
     assert_eq!((look.what.as_str(), look.since), ("am", None));
-    assert_eq!(hold(Some(3), Some(&look), CopiedNow::Yes), Err(Hold::Never("am".into())));
+    assert_eq!(hold(Some(3), Some(&look), CopiedNow::Yes, Some(&copy_of(&look, r.now))), Err(Hold::Never("am".into())));
     let (code, rep, _) = r.resolve(3, &look);
     assert_eq!((code, rep.refused.as_deref()), (Some(RESOLVE_REFUSED_EXIT), Some("a git am is in progress: never finished automatically")));
     assert!(r.work.join(".git/rebase-apply/applying").exists() && !r.work.join(".git/arena-resolved").exists());
@@ -692,7 +770,7 @@ fn am_a_rebase_and_a_sequence_are_left_alone() {
     r.age(4 * HOUR);
     let look = r.look();
     assert_eq!((look.what.as_str(), look.sequence), ("cherry-pick", true));
-    assert_eq!(hold(Some(3), Some(&look), CopiedNow::Yes), Err(Hold::Never("sequence".into())));
+    assert_eq!(hold(Some(3), Some(&look), CopiedNow::Yes, Some(&copy_of(&look, r.now))), Err(Hold::Never("sequence".into())));
     let (code, rep, _) = r.resolve(3, &look);
     assert_eq!((code, rep.refused.as_deref()), (Some(RESOLVE_REFUSED_EXIT), Some("a cherry-pick or revert sequence: never finished automatically")));
     assert!(r.work.join(".git/CHERRY_PICK_HEAD").exists() && !r.unmerged().is_empty());

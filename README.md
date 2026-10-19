@@ -672,41 +672,49 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     staging and right before the commit, so an operation the participant starts while the backup
     scans is caught too (what's left is the instant before git takes its index lock: git has no
     lock that spans commands).
-    It is rsynced like a failed push, even under `--no-pull`, every run until it's ended (the
-    reaper doesn't reap it meanwhile: its git step fails, retried every 6 h, and the run's table
-    and its notification say `a merge is in progress on <branch> — not reaped until it's finished
-    or aborted` with how to end it, while `reap log` and `reap status` keep their fixed words:
-    `git_failed`, `backoff_after_failure`); the backup after that commits as always. A rebase detaches
-    HEAD, so it is skipped like `main` — and said (`UNCOMMITTED HEAD rebase`), so `set-branch
-    --hard` copies it first.
+    It is rsynced like a failed push, even under `--no-pull`, until it's ended — but not every
+    tick: a read-only look at the pod first (under its lock) says whether anything changed, and
+    it is copied only when no copy since the operation started is recorded, when its work tree
+    changed since the last recorded copy (every file git lists: mtime, size, path), or when that
+    copy is an hour old; else its line says so (`✗ <pod>: not backed up to git (…) — copied at
+    14:02 UTC to <dir>/w2d1/<pod>, unchanged since`). So a course push that leaves many pods
+    conflicted can't make one cron tick outlast the next (whose `flock -n` would skip the healthy
+    pods' backups too). The record is `busy-copies.json` in the fleet's state dir (written
+    atomically, owner-only; missing or corrupt = copy again). (The reaper doesn't reap such a pod
+    meanwhile: its git step fails, retried every 6 h, and the run's table and its notification say
+    `a merge is in progress on <branch> — not reaped until it's finished or aborted` with how to
+    end it, while `reap log` and `reap status` keep their fixed words: `git_failed`,
+    `backoff_after_failure`.) The backup after that commits as always. A rebase detaches HEAD, so
+    it is skipped like `main` — and said (`UNCOMMITTED HEAD rebase`), so `set-branch --hard`
+    copies it first.
     **Left alone, it is finished** — `BUSY_AUTO_RESOLVE_HOURS` whole hours (default 3; `0`/`off`:
     never), the human's rule (2026-10-19: "backup files + some automated heuristic … whatever
-    changes are most recent … after like 3h of no activity"). Before its copy, `pods backup` looks
-    at the pod (read-only, under its lock), and it needs all of: the operation started (its
-    `MERGE_HEAD`/`CHERRY_PICK_HEAD`/`REVERT_HEAD`; the index for a stash pop's conflicts), every
-    file git lists (tracked, and untracked but not ignored; never `.git`) and any terminal login's
-    typing (`who`'s ttys) older than that, on the pod's own clock; and this run's copy, taken after
-    that look, done with its `.git` (a copy that failed: never). Then, on the pod, under its lock,
-    each conflicted path is kept as the participant resolved it — a regular text file with no
-    conflict marker left, both sides there — or else taken from the side whose commit is newer
-    (committer time of HEAD vs `MERGE_HEAD`/`CHERRY_PICK_HEAD`/`REVERT_HEAD`, or the stash entry;
-    a tie keeps HEAD's): `git checkout --ours|--theirs`, a binary file and a symlink the same way,
-    a path that side deleted removed. The conflicted files as they were are kept first in
+    changes are most recent … after like 3h of no activity"). It needs all of: the operation
+    started (its `MERGE_HEAD`/`CHERRY_PICK_HEAD`/`REVERT_HEAD`; the index for a stash pop's
+    conflicts), every file git lists (tracked, and untracked but not ignored; never `.git`) and
+    any terminal login's typing (`who`'s ttys) older than that, on the pod's own clock; and a copy
+    recorded after its work tree's last change, `.git` with it (this run's or an earlier one's —
+    never when this run's copy failed). Then, on the pod, under its lock, each conflicted path is
+    kept as the participant resolved it — a regular text file with no conflict marker left, both
+    sides there — or else taken from the side whose commit is newer (committer time of HEAD vs
+    `MERGE_HEAD`/`CHERRY_PICK_HEAD`/`REVERT_HEAD`, or the stash entry; a tie keeps HEAD's):
+    `git checkout --ours|--theirs`, a binary file and a symlink the same way, a path that side
+    deleted removed. The conflicted files as they were are kept first in
     `.git/arena-resolved/<UTC stamp>/` (on the pod, and in every later copy). A merge becomes a
-    real merge commit, a cherry-pick or revert is `--continue`d (one left empty is committed empty,
-    as git advises), a stash pop's conflicts are added (its stash entry stays) — in the repo's own
-    identity, never `-c user.*` — the message saying so (`arena: finished a merge left in progress
-    for 3h+` … `kept the newer side (HEAD 2026-10-19 / MERGE_HEAD 2026-10-12) for a.py, b.ipynb;
-    kept your hand-resolved c.py; the state before is in the backup copy w2d1/<pod> and on this
-    machine in .git/arena-resolved/…/`). The resolve looks again first and touches nothing if
-    anything changed since the look its copy followed (`⊘ <pod>: not finished automatically —
-    changed: files changed since the copy`). Then the pod is backed up again in the same run, as
-    any — `✓ <pod> -> <branch> — finished a merge left for 3h+ (kept the newer side, MERGE_HEAD's,
-    for 2 files and the hand-resolved version of 1; before: <dir>/w2d1/<pod>, and
-    <repo>/.git/arena-resolved/… on the pod)` — and it isn't a failure of the run. Never a `git
-    am`, a rebase or a sequence (what they'd go on to apply is the participant's), nor anything
-    unusual — conflicts not from the newest stash entry, a submodule in conflict, a merge of
-    several branches, no git identity in the repo: those stay BUSY. The TUI's backup and the
+    real merge commit, a cherry-pick or revert is `--continue`d (one left empty is committed
+    empty, as git advises), a stash pop's conflicts are added (its stash entry stays) — in the
+    repo's own identity, never `-c user.*` — the message saying so (`arena: finished a merge left
+    in progress for 3h+` … `kept the newer side (HEAD 2026-10-19 / MERGE_HEAD 2026-10-12) for
+    a.py, b.ipynb; kept your hand-resolved c.py; the state before is in the backup copy w2d1/<pod>
+    and on this machine in .git/arena-resolved/…/`). The resolve looks again first and touches
+    nothing if anything changed since the look its copy followed (`⊘ <pod>: not finished
+    automatically — changed: files changed since the copy`). Then the pod is backed up again in
+    the same run, as any — `✓ <pod> -> <branch> — finished a merge left for 3h+ (kept the newer
+    side, MERGE_HEAD's, for 2 files and the hand-resolved version of 1; before: <dir>/w2d1/<pod>,
+    and <repo>/.git/arena-resolved/… on the pod)` — and it isn't a failure of the run. Never a
+    `git am`, a rebase or a sequence (what they'd go on to apply is the participant's), nor
+    anything unusual — conflicts not from the newest stash entry, a submodule in conflict, a merge
+    of several branches, no git identity in the repo: those stay BUSY. The TUI's backup and the
     reaper's git step copy nothing first, so they don't finish one; the next cron backup does, and
     the reaper's retry then finds the pod backed up. Nothing tells the participant but the commit
     (the reaper's `~/.arena/NOTICE` is its own).
