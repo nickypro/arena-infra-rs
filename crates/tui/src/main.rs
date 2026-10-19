@@ -4953,10 +4953,12 @@ deep_check_end=1
     /// aren't known to — from the real fleet's answers, as the refresh records them; a marked
     /// set's menu says the worst of its pods'. It used to say "WIPES" for every pod. The confirm
     /// is as strict as before: the name typed back, and a ⚠ wherever the backend may wipe.
+    /// A config without `RUNPOD_API` ("") is v2's: its RunPod pods say WIPES.
     #[test]
     fn the_restart_label_follows_each_pods_backend() {
         let fleet = |api: &str| -> Arc<dyn Provider> {
-            let keys = format!("RUNPOD_API_KEY=r\nRUNPOD_API={api}\nVAST_API_KEY=v\nHETZNER_API_KEY=h\n");
+            let line = if api.is_empty() { String::new() } else { format!("RUNPOD_API={api}\n") };
+            let keys = format!("RUNPOD_API_KEY=r\n{line}VAST_API_KEY=v\nHETZNER_API_KEY=h\n");
             Arc::from(arena_core::provider::build_fleet("runpod", &Config::parse(&keys), false).unwrap())
         };
         let (rp, va, hz) = (pod("alpha", "runpod", "rp1", 1, Some(22001)), pod("bravo", "vast", "va1", 2, Some(22002)), pod("charlie", "hetzner", "hz1", 3, Some(22)));
@@ -4969,7 +4971,7 @@ deep_check_end=1
         // Nothing recorded yet: never "keeps", never "WIPES".
         ui.mode = Mode::Menu { sel: 0 };
         assert!(draw(120, 40, &shared.lock().unwrap(), &ui).join("\n").contains("restart — may wipe the container disk"));
-        for (api, runpod) in [("v2", "WIPES the container disk"), ("v1", "may wipe the container disk")] {
+        for (api, runpod) in [("v2", "WIPES the container disk"), ("v1", "may wipe the container disk"), ("", "WIPES the container disk")] {
             let f = fleet(api);
             shared.lock().unwrap().resets = backend_resets(f.as_ref(), &pods);
             for (id, want) in [("rp1", runpod), ("va1", "may wipe the container disk"), ("hz1", "keeps the disk")] {
@@ -4986,7 +4988,7 @@ deep_check_end=1
             ui.marked.clear();
             // The single-pod confirm: the name typed back whatever the answer; the warning where
             // the backend may wipe, worded by its answer.
-            for (id, warn) in [("rp1", if api == "v2" { "⚠ WIPES THE CONTAINER DISK" } else { "⚠ MAY WIPE THE CONTAINER DISK" }), ("va1", "⚠ MAY WIPE"), ("hz1", "the disk is kept")] {
+            for (id, warn) in [("rp1", if api == "v1" { "⚠ MAY WIPE THE CONTAINER DISK" } else { "⚠ WIPES THE CONTAINER DISK" }), ("va1", "⚠ MAY WIPE"), ("hz1", "the disk is kept")] {
                 (ui.selected, ui.mode) = (at(id), Mode::List);
                 choose_pod_action(&shared, &mut ui, &f, Action::Restart);
                 let Mode::Confirm(c) = &ui.mode else { panic!("{:?}", ui.mode) };

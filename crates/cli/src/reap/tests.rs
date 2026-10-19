@@ -2111,7 +2111,7 @@ async fn rs2_the_reaps_big_tier_keeps_dot_dirs() {
 // ---------------------------------------------------------------------------------------
 
 /// RR: `up/create --expire-in` on a pod the reaper never acts on — Vast, or RunPod on REST v1
-/// (the default `RUNPOD_API`, which lists `locked: None`) — is recorded without a word (`reap
+/// (`RUNPOD_API=v1`, the default when this was found; it lists `locked: None`) — is recorded without a word (`reap
 /// set` refuses the very same pod), and `pods list`'s ENDS column then counts down to the end
 /// time and shows `OVERDUE …` past it, as if the pod were going to be reaped. It never is (R3 /
 /// R8 every run): the operator replaced `at` + destroy with `up --expire-in` and the pod bills on.
@@ -2390,16 +2390,30 @@ async fn rr_locks_make_only_their_own_folder() {
 }
 
 /// RR2: `up/create --expire-*/--idle-after` refuse a provider the reaper never acts on — before
-/// anything is created — with `reap set`'s words; RunPod v2 and Hetzner are fine.
+/// anything is created — with `reap set`'s words; RunPod v2 (the default) and Hetzner are
+/// fine. RunPod's refusal says how to leave v1; Vast's has nothing to say about RunPod's API.
 #[test]
 fn rr_create_flags_refuse_never_reaped_providers() {
+    use arena_core::provider::RUNPOD_V1_REMEDY;
     let v1 = Config::parse("RUNPOD_API=v1");
     let v2 = Config::parse("RUNPOD_API=v2");
     let r = super::create_flags_refusal(&v1, "runpod").unwrap();
-    assert!(r.contains("RunPod REST v1") && r.contains("only acts on RunPod (RUNPOD_API=v2) and Hetzner") && r.contains("nothing was created"), "{r}");
-    assert!(super::create_flags_refusal(&v2, "vast").unwrap().contains("pods on vast"));
+    assert!(
+        r.contains("RunPod REST v1") && r.contains("only acts on RunPod (REST v2) and Hetzner") && r.contains(RUNPOD_V1_REMEDY)
+            && r.contains("nothing was created"),
+        "{r}"
+    );
+    let r = super::create_flags_refusal(&v2, "vast").unwrap();
+    assert!(r.contains("pods on vast") && !r.contains("RUNPOD_API"), "{r}");
     assert_eq!(super::create_flags_refusal(&v2, "runpod"), None);
+    assert_eq!(super::create_flags_refusal(&Config::parse(""), "runpod"), None, "unset RUNPOD_API is v2");
     assert_eq!(super::create_flags_refusal(&v1, "hetzner"), None);
+    // `reap set`'s refusal of the same pod, in the same words.
+    let cohort = Config::parse("MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=( alpha )\nRUNPOD_API=v1\n");
+    let naming = Naming::from_config(&cohort);
+    let pod = rp("devtest-alpha", "pa", 22001);
+    let why = never_reaped(&pod, std::slice::from_ref(&pod), &naming, false).unwrap_or_default();
+    assert!(why.contains("only acts on RunPod (REST v2) and Hetzner") && why.contains(RUNPOD_V1_REMEDY), "{why}");
     // ENDS: a record made inert by a rename outside arena, or a shared name, says so too.
     let w = World::new("rr-inert", "");
     let a = rp("devtest-alpha", "pa", 22001);
@@ -2435,6 +2449,27 @@ fn rr_config_check_reaper_rows_off_and_on() {
     let on = Config::parse("MACHINE_NAME_PREFIX=devtest\nREAP_ENABLED=1\n");
     let (lines, blockers) = super::readiness_rows_for(&on, "/nonexistent/rsync", true);
     assert!(lines.iter().any(|l| l.contains('✗') && l.contains("rsync")) && blockers.contains(&"rsync".to_string()), "{lines:#?}");
+}
+
+/// The reaper's RUNPOD_API row follows RunPod's default: unset (or empty) is v2 — ✓, RunPod
+/// pods report their lock; an explicit v1 is ⚠ with the way back; an invalid value says so
+/// without suggesting v1 is the trouble (its ✗ row is `config check`'s RunPod section's).
+#[test]
+fn reaper_runpod_api_row_follows_the_default() {
+    use arena_core::provider::RUNPOD_V1_REMEDY;
+    let row = |extra: &str| {
+        let cfg = Config::parse(&format!("MACHINE_NAME_PREFIX=devtest\nREAP_ENABLED=1\n{extra}"));
+        let (lines, _) = super::readiness_rows_for(&cfg, "/nonexistent/rsync", true);
+        lines.into_iter().find(|l| l.contains("RUNPOD_API")).unwrap_or_default()
+    };
+    for extra in ["", "RUNPOD_API=\n", "RUNPOD_API=v2\n"] {
+        let l = row(extra);
+        assert!(l.trim_start().starts_with("✓ RUNPOD_API") && l.contains("v2 — RunPod pods report their lock"), "{extra:?}: {l}");
+    }
+    let l = row("RUNPOD_API=v1\n");
+    assert!(l.trim_start().starts_with("⚠ RUNPOD_API") && l.contains("no RunPod pod is ever reaped") && l.contains(RUNPOD_V1_REMEDY), "{l}");
+    let l = row("RUNPOD_API=v3\n");
+    assert!(l.trim_start().starts_with("⚠ RUNPOD_API") && l.contains("invalid") && !l.contains(RUNPOD_V1_REMEDY), "{l}");
 }
 
 /// RR9: `--json` errors are one JSON document too.

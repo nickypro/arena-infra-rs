@@ -535,10 +535,12 @@ mod tests {
 
     #[test]
     fn api_base_follows_runpod_api_and_names_the_key() {
-        let v1 = Config::parse("RUNPOD_API_KEY=k");
+        let v1 = Config::parse("RUNPOD_API_KEY=k\nRUNPOD_API=v1");
         let v2 = Config::parse("RUNPOD_API_KEY=k\nRUNPOD_API=v2");
         assert_eq!(api_base("runpod", &v1).unwrap().url, "https://rest.runpod.io/v1");
         assert_eq!(api_base("runpod", &v2).unwrap().url, V2);
+        let default = Config::parse("RUNPOD_API_KEY=k");
+        assert_eq!(api_base("runpod", &default).unwrap(), ApiBase { provider: "runpod-v2", url: V2, key: "RUNPOD_API_KEY" });
         assert_eq!(api_base("RunPod-V2", &v1).unwrap().provider, "runpod-v2");
         assert_eq!(api_base("runpod-v1", &v2).unwrap().url, "https://rest.runpod.io/v1");
         assert_eq!(api_base("vast", &v1).unwrap(), ApiBase { provider: "vast", url: VAST, key: "VAST_API_KEY" });

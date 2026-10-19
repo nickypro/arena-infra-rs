@@ -63,9 +63,9 @@ impl Config {
         // it empty so no lifecycle sync can reload the system nginx, whatever its config file
         // says — absent from the file, the default reload would run.
         "SSH_PROXY_RELOAD_CMD",
-        // Which RunPod REST API to use (`v1`/`v2`): lets an operator trial the v2 backend
-        // for one command — or roll straight back to v1 — without editing the shared,
-        // read-only prod config (`RUNPOD_API=v2 arena pods list`).
+        // Which RunPod REST API to use (`v1`/`v2`; unset = v2): lets an operator roll back to
+        // the retiring v1 for one command — or force v2 over a file that still says v1 —
+        // without editing the shared, read-only prod config (`RUNPOD_API=v1 arena pods list`).
         "RUNPOD_API",
         // Where the health cache lives (`snapshot::health_cache_path`): lets the sandbox, a
         // cron job or a test point it somewhere explicit without editing the shared config.
@@ -376,14 +376,28 @@ MACHINE_NAME_LIST=(
 
     #[test]
     fn env_can_introduce_runpod_api() {
-        // Absent from the file, `RUNPOD_API=v2` from the environment still selects v2 — and
-        // it overrides a file value both ways (trial v2, or roll back to v1).
+        use crate::provider::RunpodApi;
+        let api = |c: &Config| RunpodApi::from_config(c).unwrap();
+        // Absent from the file, the default (v2) — and `RUNPOD_API=v1` from the environment
+        // still selects v1 for one command; `v2` too, spelled out.
+        let mut c = Config::parse("IMAGE=base:1");
+        assert_eq!(api(&c), RunpodApi::V2);
+        c.apply_overrides(|k| (k == "RUNPOD_API").then(|| "v1".to_string()));
+        assert_eq!((c.get("RUNPOD_API"), api(&c)), (Some("v1"), RunpodApi::V1));
         let mut c = Config::parse("IMAGE=base:1");
         c.apply_overrides(|k| (k == "RUNPOD_API").then(|| "v2".to_string()));
-        assert_eq!(c.get("RUNPOD_API"), Some("v2"));
+        assert_eq!((c.get("RUNPOD_API"), api(&c)), (Some("v2"), RunpodApi::V2));
+        // It overrides a file value both ways (roll back to v1, or force v2) — and an empty
+        // one, as unset, means the default again.
         let mut c = Config::parse("RUNPOD_API=v2");
         c.apply_overrides(|k| (k == "RUNPOD_API").then(|| "v1".to_string()));
-        assert_eq!(c.get("RUNPOD_API"), Some("v1"));
+        assert_eq!((c.get("RUNPOD_API"), api(&c)), (Some("v1"), RunpodApi::V1));
+        let mut c = Config::parse("RUNPOD_API=v1");
+        c.apply_overrides(|k| (k == "RUNPOD_API").then(|| "v2".to_string()));
+        assert_eq!((c.get("RUNPOD_API"), api(&c)), (Some("v2"), RunpodApi::V2));
+        let mut c = Config::parse("RUNPOD_API=v1");
+        c.apply_overrides(|k| (k == "RUNPOD_API").then(String::new));
+        assert_eq!((c.get("RUNPOD_API"), api(&c)), (Some(""), RunpodApi::V2));
     }
 
     #[test]

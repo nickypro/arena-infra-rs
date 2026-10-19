@@ -456,10 +456,24 @@ pub(crate) fn create_flags_refusal(cfg: &Config, provider: &str) -> Option<Strin
     (!judge::provider_supported(&probe, runpod_v2(cfg))).then(|| {
         format!(
             "refusing --expire-in/--expire-at/--idle-after: pods on {} are never reaped — the reaper only acts on RunPod \
-             (RUNPOD_API=v2) and Hetzner pods; nothing was created",
-            if provider == "runpod" { "RunPod REST v1" } else { provider }
+             ({ONLY_ON}) and Hetzner pods{}; nothing was created",
+            if provider == "runpod" { "RunPod REST v1" } else { provider },
+            v1_remedy(provider)
         )
     })
+}
+
+/// The RunPod the reaper acts on, as its refusals word it (a RunPod pod's refusal then says
+/// v2 is the default — [`v1_remedy`]).
+const ONLY_ON: &str = "REST v2";
+
+/// What a refusal adds for a RunPod pod: it is on v1 only because the config says so.
+fn v1_remedy(provider: &str) -> String {
+    if provider == "runpod" {
+        format!(" — {}", arena_core::provider::RUNPOD_V1_REMEDY)
+    } else {
+        String::new()
+    }
 }
 
 /// Record `policy` for a pod the moment its create returned (`up`/`create`, `--check`
@@ -509,9 +523,10 @@ fn never_reaped(pod: &Pod, all: &[Pod], naming: &Naming, runpod_v2: bool) -> Opt
     }
     if !judge::provider_supported(pod, runpod_v2) {
         return Some(format!(
-            "{} is on {} — the reaper only acts on RunPod (RUNPOD_API=v2) and Hetzner pods",
+            "{} is on {} — the reaper only acts on RunPod ({ONLY_ON}) and Hetzner pods{}",
             pod.name,
-            if pod.provider == "runpod" { "RunPod REST v1" } else { &pod.provider }
+            if pod.provider == "runpod" { "RunPod REST v1" } else { &pod.provider },
+            v1_remedy(&pod.provider)
         ));
     }
     None
@@ -2596,13 +2611,16 @@ pub(crate) fn readiness_rows_for(cfg: &Config, rsync: &str, full: bool) -> (Vec<
         Err(e) if is_invalid_state_dir(&e) => row(Some(false), "state (ARENA_STATE_DIR)", e, Gap::Invalid(Some("ARENA_STATE_DIR (explicit, absolute)"))),
         Err(e) => row(Some(false), "state (ARENA_STATE_DIR)", e, Gap::Blocks("ARENA_STATE_DIR (explicit, absolute)")),
     }
-    let v2 = runpod_v2(cfg);
-    row(
-        Some(v2),
-        "RUNPOD_API",
-        if v2 { "v2 — RunPod pods report their lock".into() } else { "reaper needs RUNPOD_API=v2 (on v1 no RunPod pod is ever reaped)".into() },
-        Gap::None,
-    );
+    let (v2, detail) = match arena_core::provider::RunpodApi::from_config(cfg) {
+        Ok(arena_core::provider::RunpodApi::V2) => (true, "v2 — RunPod pods report their lock".to_string()),
+        Ok(arena_core::provider::RunpodApi::V1) => (
+            false,
+            format!("v1 — no RunPod pod is ever reaped (the reaper needs REST v2): {}", arena_core::provider::RUNPOD_V1_REMEDY),
+        ),
+        // Its own ✗ row (`config check`'s RunPod section) says what's wrong with it.
+        Err(_) => (false, "invalid — no RunPod pod is ever reaped (the reaper needs REST v2, the default)".to_string()),
+    };
+    row(Some(v2), "RUNPOD_API", detail, Gap::None);
     let snap = cfg.get("LOCAL_BACKUP_DIR").map(str::trim).filter(|d| !d.is_empty()).unwrap_or("./backup").to_string();
     let big = arena_core::pull::big_root(&snap, cfg.get("LOCAL_BACKUP_BIG_DIR"));
     for (root, tier) in [(snap.clone(), arena_core::pull::Tier::Snapshot), (big, arena_core::pull::Tier::Big)] {

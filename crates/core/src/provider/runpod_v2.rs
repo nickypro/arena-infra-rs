@@ -1,6 +1,7 @@
-//! RunPod backend on the REST **v2** API (`https://api.runpod.io/v2`), selected with
-//! `RUNPOD_API=v2`. RunPod retires REST v1 ([`super::runpod`]) on 2026-11-15; this is its
-//! replacement, opt-in until it has been live-tested on a sandbox pod.
+//! RunPod backend on the REST **v2** API (`https://api.runpod.io/v2`) — the default:
+//! `RUNPOD_API` unset, empty or `v2` (see [`super::RunpodApi`]). RunPod retires REST v1
+//! ([`super::runpod`]) on 2026-11-15; this is its replacement, live-tested on sandbox pods
+//! before it became the default.
 //!
 //! What differs from v1, and why the code looks the way it does:
 //! - **Listing is cursor-paginated** (`{pods, pagination: {nextCursor, hasNextPage}}`).
@@ -42,7 +43,7 @@
 //! ## GraphQL dependency inventory
 //!
 //! RunPod's GraphQL API is reportedly being retired as well ("early 2027" — unverified). On
-//! `RUNPOD_API=v2` it is left only where REST v2 has no equivalent, and each use degrades
+//! v2 it is left only where REST v2 has no equivalent, and each use degrades
 //! instead of breaking when GraphQL goes:
 //! - **Maintenance windows** — [`Provider::enrich`] (`myself.pods.machine.maintenance*`,
 //!   shared with v1 as `runpod::enrich_via_graphql`): v2 has no such field. Best-effort at
@@ -804,8 +805,8 @@ fn parse_catalog(body: &Value) -> Result<Vec<GpuType>> {
 }
 
 /// RunPod's GPU catalog from REST v2, with list prices for both tiers and pod stock for
-/// `cloud` (COMMUNITY/SECURE). The v2 counterpart of [`runpod::fetch_gpu_types`]; on
-/// `RUNPOD_API=v2` it is the only catalog source (`arena gpus`, `offers`, placement prices,
+/// `cloud` (COMMUNITY/SECURE). The v2 counterpart of [`runpod::fetch_gpu_types`]; on v2
+/// (the default) it is the only catalog source (`arena gpus`, `offers`, placement prices,
 /// the `--gpu` check — no GraphQL fallback, see the module's GraphQL inventory). Every
 /// tier's answer lists every GPU (the recorded COMMUNITY answer includes secure-only cards),
 /// so any one tier's catalog serves the `--gpu` check.

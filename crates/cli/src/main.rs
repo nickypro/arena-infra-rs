@@ -932,12 +932,13 @@ enum PodCmd {
         #[command(flatten)]
         sel: Select,
     },
-    /// Restart a pod in place (RunPod v2 WIPES its disk; v1 and Vast may)
+    /// Restart a pod in place (RunPod WIPES its disk; RunPod v1, Vast may)
     ///
-    /// On RunPod v2 everything outside a /workspace volume is lost (files, ~/.name, keys); RunPod
-    /// v1 and Vast may lose it, so they're gated the same. Refused without --wipe-ok unless the
-    /// pod's repo is on a volume, even with --yes. Then waits for SSH, re-runs setup and syncs the
-    /// proxy. Hetzner's reset keeps the disk. A stopped pod is refused: use `pods start`.
+    /// On RunPod (REST v2, the default) everything outside a /workspace volume (VOLUME_GB) is
+    /// lost (files, ~/.name, keys); RunPod v1 and Vast may lose it, so they're gated the same.
+    /// Refused without --wipe-ok unless the pod's repo is on a volume, even with --yes. Then
+    /// waits for SSH, re-runs setup and syncs the proxy. Hetzner's reset keeps the disk. A
+    /// stopped pod is refused: use `pods start`.
     #[command(verbatim_doc_comment)]
     Restart {
         /// Machine name (e.g. arena8-apple) or raw provider id.
@@ -2402,8 +2403,8 @@ async fn checked_gpu(cfg: &Config, provider_name: &str, gpu: Option<String>) -> 
 /// live catalog: live (finding #22), `PRO 6000 MIG 24GB` passed the catalog check, ranked
 /// first in `offers`, and its create was a `400 … schema requirements`. So on v1, with the
 /// enum at hand, a `--gpu` id outside it is refused before anything is listed or created —
-/// naming RUNPOD_API=v2, whose create takes it. An empty enum (couldn't be read) refuses
-/// nothing: placement then skips an option the API rejects. Pure.
+/// saying how to get back to v2 (the default), whose create takes it. An empty enum
+/// (couldn't be read) refuses nothing: placement then skips an option the API rejects. Pure.
 fn v1_creatable_check(ids: &str, catalog: &[arena_core::provider::runpod::GpuType], creatable: &[String]) -> Result<()> {
     if creatable.is_empty() {
         return Ok(());
@@ -2421,8 +2422,9 @@ fn v1_creatable_check(ids: &str, catalog: &[arena_core::provider::runpod::GpuTyp
     }
     anyhow::bail!(
         "--gpu {}: in RunPod's catalog, but REST v1's create API rejects it (not in its gpuTypeIds list) — \
-         set RUNPOD_API=v2 (which creates it), or pick another --gpu (`arena gpus` hides what v1 can't create)",
-        bad.join(", ")
+         v2's create takes it: {}, or pick another --gpu (`arena gpus` hides what v1 can't create)",
+        bad.join(", "),
+        arena_core::provider::RUNPOD_V1_REMEDY
     )
 }
 
@@ -4957,17 +4959,22 @@ fn create_extra_row(cfg: &Config) -> Option<(String, bool)> {
 }
 
 /// The `config check` row for `RUNPOD_API`, and whether it's valid. Pure, for testing.
-/// v1 gets a warning with the retirement date: past it, every RunPod call fails.
+/// v2 is the default (unset or empty, said so). An explicit v1 still works but gets a
+/// warning with the retirement date — past it, every RunPod call fails — and the way back.
 fn runpod_api_row(cfg: &Config) -> (String, bool) {
-    use arena_core::provider::{RunpodApi, RUNPOD_V1_RETIREMENT};
+    use arena_core::provider::{RunpodApi, RUNPOD_V1_REMEDY, RUNPOD_V1_RETIREMENT};
     let key = "RUNPOD_API";
     match RunpodApi::from_config(cfg) {
-        Ok(RunpodApi::V2) => (format!("  ✓ {key:<24} v2 (api.runpod.io/v2)"), true),
+        Ok(RunpodApi::V2) => (
+            format!(
+                "  ✓ {key:<24} v2{} (api.runpod.io/v2)",
+                if cfg.get(key).is_some_and(|v| !v.trim().is_empty()) { "" } else { " (default)" }
+            ),
+            true,
+        ),
         Ok(RunpodApi::V1) => (
             format!(
-                "  ⚠ {key:<24} v1{} (rest.runpod.io/v1) — RunPod retires REST v1 on {RUNPOD_V1_RETIREMENT}; \
-                 set RUNPOD_API=v2 once it's been live-tested",
-                if cfg.get(key).is_some_and(|v| !v.trim().is_empty()) { "" } else { " (default)" }
+                "  ⚠ {key:<24} v1 (rest.runpod.io/v1) — RunPod retires REST v1 on {RUNPOD_V1_RETIREMENT}; {RUNPOD_V1_REMEDY}"
             ),
             true,
         ),
@@ -4982,7 +4989,8 @@ fn runpod_api_row(cfg: &Config) -> (String, bool) {
 /// - ⚠ an exact set — RunPod matches it exactly, so a host on a newer CUDA is "no capacity";
 ///   ⚠ an `ALLOWED_CUDA_VERSIONS` list (it used to be an exact set; now only its lowest
 ///   version counts); ⚠ keys shadowed by a stronger one.
-/// - ✗ (not ok) on RunPod v1 when its schema can't express the constraint (13.1+).
+/// - ✗ (not ok) on RunPod v1 (only ever an explicit `RUNPOD_API=v1`) when its schema can't
+///   express the constraint (13.1+).
 /// - ✗ alone, in place of the ✓/⚠ row, for a value that isn't a version (`13.x`): creates
 ///   are refused, so nothing about it is fine (live BPF S5 printed `✓ ≥ 13.x` above the ✗).
 ///
@@ -5026,17 +5034,18 @@ fn cuda_rows(cfg: &Config, runpod_v1: bool) -> (Vec<String>, std::result::Result
     }
     let mut ok = Ok(());
     if runpod_v1 {
+        use arena_core::provider::RUNPOD_V1_REMEDY;
         let spec = PodSpec { allowed_cuda: cuda.exact.clone(), min_cuda: cuda.floor.clone(), ..PodSpec::from_config(cfg) };
         match arena_core::provider::runpod::v1_cuda_versions(&spec) {
             Ok(Some(_)) if cuda.exact.is_empty() => out.push(format!(
                 "      └ RUNPOD_API=v1 has no real floor: it sends its list's versions ≥ the floor, newest {} — \
-                 RUNPOD_API=v2 reaches newer hosts",
+                 {RUNPOD_V1_REMEDY} to reach newer hosts",
                 arena_core::provider::runpod::V1_CUDA_VERSIONS[0]
             )),
             Ok(_) => {}
             Err(e) => {
                 out.push(format!("  ✗ {key:<27}{e}"));
-                ok = Err("a host CUDA constraint RunPod v1 can express (or RUNPOD_API=v2)".to_string());
+                ok = Err(format!("a host CUDA constraint RunPod v1 can express, or {RUNPOD_V1_REMEDY}"));
             }
         }
     }
@@ -5202,8 +5211,8 @@ fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<String>) {
             missing.push(key.to_string());
         }
     }
-    // Which RunPod REST generation `runpod` talks to — shown whenever RunPod is in play,
-    // because v1 is retired by RunPod and this is the switch.
+    // Which RunPod REST generation `runpod` talks to — shown whenever RunPod is in play:
+    // v2 by default, and a leftover `RUNPOD_API=v1` (which RunPod retires) is flagged here.
     if provider_name == "runpod" || cfg.get("RUNPOD_API_KEY").is_some_and(|v| !v.is_empty()) || cfg.get("RUNPOD_API").is_some() {
         let (line, ok) = runpod_api_row(cfg);
         println!("{line}");
@@ -15699,8 +15708,8 @@ mod replacement_spec_tests {
     }
 
     /// Finding #22: on REST v1 a catalog GPU its create enum lacks (the PRO 6000 MIG slices)
-    /// is refused before any create, by its display name, pointing at RUNPOD_API=v2; an
-    /// unreadable enum refuses nothing.
+    /// is refused before any create, by its display name, saying how to get back to v2 (the
+    /// default); an unreadable enum refuses nothing.
     #[test]
     fn v1_refuses_a_gpu_its_create_api_rejects() {
         use super::v1_creatable_check;
@@ -15712,7 +15721,11 @@ mod replacement_spec_tests {
         let creatable = vec!["NVIDIA RTX A4000".to_string(), "NVIDIA B300 SXM6 AC MIG 1g.34gb".to_string()];
         assert!(v1_creatable_check("NVIDIA RTX A4000", &catalog, &creatable).is_ok());
         let e = v1_creatable_check(&format!("NVIDIA RTX A4000,{mig}"), &catalog, &creatable).unwrap_err().to_string();
-        assert!(e.contains("`PRO 6000 MIG 24GB`") && e.contains("REST v1's create API rejects it") && e.contains("RUNPOD_API=v2"), "{e}");
+        assert!(
+            e.contains("`PRO 6000 MIG 24GB`") && e.contains("REST v1's create API rejects it")
+                && e.contains("v2's create takes it: remove RUNPOD_API=v1 (v2 is the default), or pick another --gpu"),
+            "{e}"
+        );
         assert!(!e.contains("`RTX A4000`"), "only the bad token: {e}");
         assert!(v1_creatable_check(mig, &catalog, &[]).is_ok(), "no enum: nothing refused");
     }
@@ -17226,22 +17239,57 @@ mod setup_tests {
 mod tests {
     use super::{strip_arena_block, with_arena_block, CRON_BEGIN, CRON_END};
 
-    /// `config check` says which RunPod API is selected, warns on v1 with the retirement
-    /// date, and fails on a value that's neither.
+    /// `config check` says which RunPod API is selected — v2, "(default)" when RUNPOD_API is
+    /// unset or empty — warns on an explicit v1 with the retirement date and the way back,
+    /// and fails on a value that's neither.
     #[test]
     fn config_check_runpod_api_row() {
         use super::{runpod_api_row, Config};
-        let (line, ok) = runpod_api_row(&Config::parse("RUNPOD_API_KEY=k"));
-        assert!(ok && line.contains("⚠") && line.contains("v1 (default)") && line.contains("2026-11-15"), "{line}");
-        let (line, ok) = runpod_api_row(&Config::parse("RUNPOD_API=v1"));
-        assert!(ok && line.contains("v1 (rest.runpod.io/v1)") && line.contains("2026-11-15"), "{line}");
-        let (line, ok) = runpod_api_row(&Config::parse("RUNPOD_API=v2"));
-        assert!(ok && line.contains("✓") && line.contains("v2") && !line.contains("retires"), "{line}");
+        let key = format!("{:<24}", "RUNPOD_API");
+        for text in ["RUNPOD_API_KEY=k", "RUNPOD_API=", "RUNPOD_API=\"  \""] {
+            let row = runpod_api_row(&Config::parse(text));
+            assert_eq!(row, (format!("  ✓ {key} v2 (default) (api.runpod.io/v2)"), true), "{text:?}");
+        }
+        for text in ["RUNPOD_API=v2", "RUNPOD_API=V2"] {
+            let row = runpod_api_row(&Config::parse(text));
+            assert_eq!(row, (format!("  ✓ {key} v2 (api.runpod.io/v2)"), true), "{text:?}");
+        }
+        for text in ["RUNPOD_API=v1", "RUNPOD_API=\"V1\""] {
+            let row = runpod_api_row(&Config::parse(text));
+            let want = format!(
+                "  ⚠ {key} v1 (rest.runpod.io/v1) — RunPod retires REST v1 on 2026-11-15; remove RUNPOD_API=v1 (v2 is the default)"
+            );
+            assert_eq!(row, (want, true), "{text:?}: a warning, not a failure");
+        }
         let (line, ok) = runpod_api_row(&Config::parse("RUNPOD_API=v3"));
         assert!(!ok && line.contains("✗") && line.contains("must be `v1` or `v2`"), "{line}");
         // `config check` never shows secret values — not even a key pasted into RUNPOD_API.
         let (line, ok) = runpod_api_row(&Config::parse("RUNPOD_API=rpa_SECRETKEY123"));
         assert!(!ok && line.contains("✗") && !line.contains("SECRETKEY"), "{line}");
+    }
+
+    /// The whole `config check` of a RunPod config without RUNPOD_API: v2, said to be the
+    /// default, and a CUDA floor above 13.0 is fine (v2 sends a real floor). The same config
+    /// with an explicit `RUNPOD_API=v1` still passes that row (⚠, not ✗) but fails on the
+    /// floor v1 can't ask for — both saying how to get back to v2.
+    #[test]
+    fn config_check_without_runpod_api_is_v2_and_an_explicit_v1_warns() {
+        use super::{config_report, Config};
+        let base = "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple)\nRUNPOD_API_KEY=not-a-real-key\n\
+                    GPU_TYPE=\"NVIDIA RTX A4000\"\nIMAGE=img:1\nMIN_CUDA_VERSION=13.1\n";
+        let row = |report: &str| report.lines().find(|l| l.contains("RUNPOD_API ")).unwrap_or_default().trim_start().to_string();
+        let (report, missing) = config_report(&Config::parse(base), "runpod");
+        assert!(row(&report).starts_with("✓ RUNPOD_API") && row(&report).ends_with(" v2 (default) (api.runpod.io/v2)"), "{report}");
+        assert!(report.contains("✓ host CUDA") && report.contains("≥ 13.1 (a floor, from MIN_CUDA_VERSION)"), "{report}");
+        assert!(missing.is_empty() && !report.contains("rest.runpod.io/v1"), "{missing:?}\n{report}");
+        let (report, missing) = config_report(&Config::parse(&format!("{base}RUNPOD_API=v1\n")), "runpod");
+        assert!(
+            row(&report).starts_with("⚠ RUNPOD_API")
+                && row(&report).ends_with(" v1 (rest.runpod.io/v1) — RunPod retires REST v1 on 2026-11-15; remove RUNPOD_API=v1 (v2 is the default)"),
+            "{report}"
+        );
+        assert!(report.contains("✗ host CUDA") && report.contains("can't ask for it"), "{report}");
+        assert_eq!(missing, ["a host CUDA constraint RunPod v1 can express, or remove RUNPOD_API=v1 (v2 is the default)"]);
     }
 
     /// "✗ means fail": every key set to a value its parser refuses shows a ✗ row and is named —
@@ -17383,7 +17431,7 @@ mod tests {
         let (l, ok) = rows("ALLOWED_CUDA_VERSIONS=\"13.0\"", false);
         assert!(ok && l.contains("✓") && l.contains("≥ 13.0 (a floor, from ALLOWED_CUDA_VERSIONS)") && !l.contains("└"), "{l}");
         let (l, ok) = rows("ALLOWED_CUDA_VERSIONS=\"13.0\"", true);
-        assert!(ok && l.contains("has no real floor") && l.contains("RUNPOD_API=v2"), "{l}");
+        assert!(ok && l.contains("has no real floor") && l.contains("remove RUNPOD_API=v1 (v2 is the default) to reach newer hosts"), "{l}");
         let (l, _) = rows("ALLOWED_CUDA_VERSIONS=\"13.0, 12.8\"", false);
         assert!(l.contains("≥ 12.8") && l.contains("lists several versions"), "{l}");
         let (l, ok) = rows("EXACT_CUDA_VERSIONS=13.0", false);
@@ -17391,7 +17439,7 @@ mod tests {
         let (l, _) = rows("MIN_CUDA_VERSION=13.0\nALLOWED_CUDA_VERSIONS=12.8", false);
         assert!(l.contains("≥ 13.0 (a floor, from MIN_CUDA_VERSION)") && l.contains("ALLOWED_CUDA_VERSIONS is ignored"), "{l}");
         let (l, ok) = rows("MIN_CUDA_VERSION=13.1", true);
-        assert!(!ok && l.contains("✗") && l.contains("RUNPOD_API=v2"), "{l}");
+        assert!(!ok && l.contains("✗") && l.contains("remove RUNPOD_API=v1 (v2 is the default)"), "{l}");
         assert!(rows("MIN_CUDA_VERSION=13.1", false).1, "v2 sends any floor");
         let (l, ok) = rows("EXACT_CUDA_VERSIONS=13.0,13.2", true);
         assert!(!ok && l.contains("13.2"), "{l}");
@@ -17415,7 +17463,7 @@ mod tests {
         assert_eq!(ok, Err("EXACT_CUDA_VERSIONS (`latest` isn't a version like 13.0)".to_string()));
         // What v1 can't express keeps its own wording.
         let (_, ok) = cuda_rows(&Config::parse("MIN_CUDA_VERSION=13.1"), true);
-        assert_eq!(ok, Err("a host CUDA constraint RunPod v1 can express (or RUNPOD_API=v2)".to_string()));
+        assert_eq!(ok, Err("a host CUDA constraint RunPod v1 can express, or remove RUNPOD_API=v1 (v2 is the default)".to_string()));
     }
 
     /// `config check` shows CREATE_EXTRA_JSON's keys (never its values) and fails a value
@@ -24786,7 +24834,7 @@ mod lifecycle_tests {
         fn lock_support(&self, pod: &Pod) -> Result<()> {
             match pod.provider.as_str() {
                 "runpod" => Ok(()),
-                other => Err(Error::NotImplemented(format!("not supported on {other} — only RunPod pods can be locked, with RUNPOD_API=v2"))),
+                other => Err(Error::NotImplemented(format!("not supported on {other} — only RunPod pods can be locked (on RunPod REST v2, the default)"))),
             }
         }
         async fn set_locked(&self, id: &str, locked: bool) -> Result<()> {

@@ -636,7 +636,7 @@ mod tests {
         m.backends.push(Box::new(Locks { seen: seen.clone() }));
         assert!(m.lock_support(&tagged_pod("r1", "runpod")).is_ok());
         let e = m.lock_support(&tagged_pod("v1", "vast")).unwrap_err().to_string();
-        assert!(e.contains("not supported on vast") && e.contains("RUNPOD_API=v2"), "{e}");
+        assert!(e.contains("not supported on vast") && e.contains("only RunPod pods can be locked (on RunPod REST v2, the default)"), "{e}");
         assert!(m.lock_support(&tagged_pod("x1", "lambda")).unwrap_err().to_string().contains("no configured provider owns"));
         m.set_locked("r1", true).await.unwrap();
         m.set_locked("r1", false).await.unwrap();

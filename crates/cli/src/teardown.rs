@@ -162,8 +162,9 @@ async fn collect(
     report
 }
 
-/// RunPod's network volumes: REST v2 on `RUNPOD_API=v2` (falling back to GraphQL once), else
-/// GraphQL. Bounded like a provider listing; any failure is "couldn't check", never "none".
+/// RunPod's network volumes: REST v2 by default (falling back to GraphQL once), GraphQL alone
+/// on `RUNPOD_API=v1` (REST v1 has no volumes route). Bounded like a provider listing; any
+/// failure is "couldn't check", never "none".
 async fn read_volumes(cfg: &Config) -> Probe<Vec<NetworkVolume>> {
     let Some(key) = cfg.get("RUNPOD_API_KEY").filter(|k| !k.is_empty()) else {
         return Probe::Skipped("RunPod isn't configured (no RUNPOD_API_KEY) — not checked".into());
