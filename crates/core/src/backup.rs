@@ -470,7 +470,9 @@ pub fn backup_script() -> String {
 /// On a branch it backs up, an operation in progress — a conflicted merge, cherry-pick or revert,
 /// or a `git stash pop`'s conflicts ([`BUSY_OP_SH`]) — ends the run before anything is staged:
 /// `BUSY <branch> <what>`, [`BACKUP_BUSY_EXIT`], nothing committed or pushed, so the participant
-/// can still finish or abort it ([`BackupReport::failure`] says how). On one it skips, the work
+/// can still finish or abort it ([`BackupReport::failure`] says how). It is checked again right
+/// before the staging and right before the commit, so one started during the scans is caught
+/// too (review ai-review codex #1). On one it skips, the work
 /// there no backup saves — that, changes to tracked files, commits no remote has, or untracked
 /// files — is only said (`UNCOMMITTED`, [`BackupReport::uncommitted`]) before the `SKIP`,
 /// read-only: the run still skips it, exit 0, and `set-branch --hard` copies the pod before
@@ -3202,18 +3204,24 @@ done
     }
 
     /// The check is rendered into the script once, after the branch is known (the SKIP before it)
-    /// and before anything is staged — the nested-clone adoption, `update-index`, `git add`.
+    /// and before anything is staged — the nested-clone adoption, `update-index`, `git add` — and
+    /// called again right before the staging and right before the commit (codex #1).
     #[test]
     fn the_busy_check_comes_before_anything_is_staged() {
         let s = backup_script();
         assert!(!s.contains("@ARENA_BUSY_OP_SH@") && s.matches(BUSY_OP_SH).count() == 1);
-        let check = s.find("W=$(busy_op \"$G\")").expect("the check");
+        assert!(s.contains("busy_stop() {\n    W=$(busy_op \"$G\")\n    if [ -n \"$W\" ]; then echo \"BUSY $B $W\"; exit 6; fi\n}"));
+        let calls: Vec<usize> = s.match_indices("\nbusy_stop\n").map(|(i, _)| i).collect();
+        assert_eq!(calls.len(), 3, "first, before the staging, before the commit");
+        let check = calls[0];
         assert!(s.find("echo \"SKIP $B\"").unwrap() < check && s.find("G=$(git rev-parse --absolute-git-dir)").unwrap() < check);
         let branch = s.find("echo \"BRANCH $B\"").unwrap();
         for later in ["update-index", "git add -A", "git rm -q --cached", "git commit", "git push"] {
             assert!(check < branch + s[branch..].find(later).unwrap(), "{later}");
         }
-        assert!(s.contains("echo \"BUSY $B $W\"; exit 6"));
+        // Right before each: nothing in between.
+        assert!(s.contains("\nbusy_stop\ngit add -A -- \"$@\"\n") && calls[1] == s.find("\nbusy_stop\ngit add -A").unwrap());
+        assert!(calls[2] == s.find("\nbusy_stop\nif ! git diff --cached --quiet; then git commit").unwrap());
         // The gentle switch and init-branches check it too, first; --hard doesn't.
         let gentle = checkout_command("/r", "main", None, false);
         assert!(gentle.contains(BUSY_OP_SH) && gentle.find("busy_op").unwrap() < gentle.find("git fetch").unwrap());
@@ -3478,6 +3486,99 @@ done
         let o = s.run(&init_branch_command(&cfg, "devtest-x"));
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
         assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), cfg.branch_for("devtest-x"));
+    }
+
+    /// The real `git`'s path, for a stand-in to hand on to.
+    #[cfg(unix)]
+    fn real_git() -> String {
+        let o = std::process::Command::new("sh").args(["-c", "command -v git"]).output().expect("sh");
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    }
+
+    /// A PATH whose `git` is the real one, but runs `script` first (`sh -c`, from where it was
+    /// called) — once, its output dropped — on the call whose arguments are exactly `at`: the
+    /// participant's own command, at one precise moment of a run.
+    #[cfg(unix)]
+    fn git_acting_at(s: &GitSandbox, at: &str, script: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = s.base.join("bin-hook");
+        std::fs::create_dir_all(&bin).unwrap();
+        let once = s.base.join("hook.sh");
+        let _ = std::fs::remove_file(s.base.join("hook.sh.ran"));
+        std::fs::write(&once, script).unwrap();
+        let once = shell_quote(once.to_str().unwrap());
+        std::fs::write(
+            bin.join("git"),
+            format!(
+                "#!/bin/sh\nif [ \"$*\" = {} ] && [ -f {once} ]; then mv {once} {once}.ran; sh {once}.ran >/dev/null 2>&1; fi\nexec {} \"$@\"\n",
+                shell_quote(at),
+                shell_quote(&real_git())
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(bin.join("git"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default())
+    }
+
+    /// `bash -c cmd` with this PATH: (exit code, stdout, stderr).
+    #[cfg(unix)]
+    fn run_on_path(cmd: &str, path: &str) -> (Option<i32>, String, String) {
+        let o = std::process::Command::new("bash").arg("-c").arg(cmd).env("PATH", path).output().expect("bash");
+        (o.status.code(), String::from_utf8_lossy(&o.stdout).into_owned(), String::from_utf8_lossy(&o.stderr).into_owned())
+    }
+
+    /// Review ai-review codex #1: the operation check ran once, before the scans. A participant's
+    /// `git pull upstream main` that conflicted while the backup scanned the nested repos and the
+    /// files had its conflicts staged as resolved by `add -A`; a `git merge --no-commit` begun
+    /// after the staging was ended by the backup's own commit (a merge commit, pushed). Now the
+    /// check runs again right before each: the run stops `BUSY`, nothing staged or committed, the
+    /// operation where the participant left it. (A stand-in `git` starts the participant's command
+    /// at the exact moment: the BIGSKIP scan, then the key scan.)
+    #[cfg(unix)]
+    #[test]
+    fn an_operation_begun_during_the_scans_is_caught_before_the_staging_and_the_commit() {
+        let s = GitSandbox::new("busy-late", 1_000_000);
+        let course = with_conflicting_upstream(&s);
+        let origin_ref = || s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "rev-parse", "refs/heads/autocommit-x"]);
+        let script = backup_command_limited(s.work.to_str().unwrap(), None, "arena backup", s.skip, s.limit, None);
+        std::fs::write(s.work.join("notes.md"), "notes\n").unwrap();
+        let before = (s.git(&s.work, &["rev-parse", "HEAD"]), origin_ref());
+        // A conflicted pull, begun while the files are scanned: after the first check.
+        let path = git_acting_at(
+            &s,
+            "ls-files -z -o -m --exclude-standard",
+            "git -c user.name=u -c user.email=u@u pull -q --no-rebase --no-edit upstream main\n",
+        );
+        let (code, out, err) = run_on_path(&script, &path);
+        assert!(s.base.join("hook.sh.ran").exists(), "the pull ran mid-backup");
+        assert_eq!((code, out.as_str()), (Some(BACKUP_BUSY_EXIT), "BRANCH autocommit-x\nBUSY autocommit-x merge unmerged\n"), "{err}");
+        assert_eq!(s.git(&s.work, &["status", "--porcelain"]), "UU README.md\n?? notes.md", "its conflict not staged, nor anything else");
+        assert_eq!((s.git(&s.work, &["rev-parse", "HEAD"]), origin_ref()), before, "nothing committed or pushed");
+        s.git(&s.work, &["merge", "--abort"]);
+        assert_eq!(s.read("README.md"), b"the participant's version\n", "the abort works");
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into()))), "{err}");
+
+        // A clean merge left uncommitted (`--no-commit`), begun after the staging (at the key scan):
+        // the backup's commit would have made it a merge commit and ended it.
+        s.git(&course, &["checkout", "-q", "-b", "extra", "main~1"]);
+        std::fs::write(course.join("extra.py"), "x = 1\n").unwrap();
+        s.git(&course, &["add", "extra.py"]);
+        s.git(&course, &["-c", "user.name=u", "-c", "user.email=u@u", "commit", "-q", "-m", "extra"]);
+        s.git(&s.work, &["fetch", "-q", "upstream"]);
+        let before = (s.git(&s.work, &["rev-parse", "HEAD"]), origin_ref());
+        let path = git_acting_at(&s, "diff --cached --raw --no-renames --diff-filter=d --no-abbrev", "git merge -q --no-commit --no-ff upstream/extra\n");
+        let (code, out, err) = run_on_path(&script, &path);
+        assert!(s.base.join("hook.sh.ran").exists(), "the merge ran mid-backup");
+        assert_eq!((code, out.as_str()), (Some(BACKUP_BUSY_EXIT), "BRANCH autocommit-x\nBUSY autocommit-x merge\n"), "{err}");
+        assert_eq!((s.git(&s.work, &["rev-parse", "HEAD"]), origin_ref()), before, "not committed: still the participant's merge");
+        assert!(s.work.join(".git/MERGE_HEAD").exists());
+        assert_eq!(s.git(&s.work, &["diff", "--cached", "--name-only"]), "extra.py");
+        // The participant finishes it; the next backup pushes their merge.
+        s.git(&s.work, &["commit", "-q", "--no-edit"]);
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into()))), "{err}");
+        assert_eq!(s.git(&s.work, &["rev-list", "--parents", "-n1", "origin/autocommit-x"]).split(' ').count(), 3, "their merge, pushed");
     }
 
     /// Review ai-review claude #9: on main the check for changes to tracked files was the porcelain

@@ -111,9 +111,16 @@ G=$(git rev-parse --absolute-git-dir)
 # the caller copies the pod by rsync instead. So does a `git am` (HEAD attached, often nothing
 # unmerged: a patch that didn't apply) and a sequence paused between its commits. A rebase
 # detaches HEAD (SKIP), unless it kept HEAD attached.
-# (`busy_op` is defined above, before the SKIP.)
-W=$(busy_op "$G")
-if [ -n "$W" ]; then echo "BUSY $B $W"; exit 6; fi
+# (`busy_op` is defined above, before the SKIP.) Checked here, and again right before the staging
+# and right before the commit (review ai-review codex #1): a merge the participant starts while
+# the nested repos and the files are scanned is caught there, before `add -A` resolves its
+# conflicts or the commit ends it. What's left is the moment between the last check and git
+# taking its index lock — git has no lock that spans commands, so no check can close it.
+busy_stop() {
+    W=$(busy_op "$G")
+    if [ -n "$W" ]; then echo "BUSY $B $W"; exit 6; fi
+}
+busy_stop
 
 T="$G/arena-backup.$$"
 trap 'rm -f "$T".*' EXIT
@@ -217,6 +224,7 @@ while IFS= read -r f; do
     set -- "$@" ":(exclude,literal)$f"
     echo "BIGSKIP $(stat -c %s -- "$f" 2>/dev/null || echo 0) $f"
 done < "$T.big"
+busy_stop
 git add -A -- "$@"
 # One staged by hand (`git add` of a checkpoint) is taken back out of the index, before it's
 # committed — the file itself untouched.
@@ -244,6 +252,7 @@ git diff --cached --raw --no-renames --diff-filter=d --no-abbrev \
 redact_index "$T.map" > "$T.upd"
 tr '\0' '\n' < "$T.upd" \
     | awk 'NR == FNR { n[$2] = $3; next } { i = index($0, "\t"); split(substr($0, 1, i - 1), m, " "); print "REDACTED " n[m[2]] " " substr($0, i + 1) }' "$T.map" -
+busy_stop
 if ! git diff --cached --quiet; then git commit -q -m "$MSG"; fi
 
 # --- Push -----------------------------------------------------------------------------------

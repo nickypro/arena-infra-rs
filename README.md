@@ -665,7 +665,10 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     (`BUSY <branch> am`) and a rebase each get their own `--continue`/`--abort`; a paused sequence
     (`sequence`) names both `git cherry-pick --continue` and `git revert --continue`, since only
     the right one works; a `git stash pop`'s conflicts `resolve them and \`git add\` them, or
-    undo them (\`git reset --merge\`)`. The run fails.
+    undo them (\`git reset --merge\`)`. The run fails. The check runs again right before the
+    staging and right before the commit, so an operation the participant starts while the backup
+    scans is caught too (what's left is the instant before git takes its index lock: git has no
+    lock that spans commands).
     It is rsynced like a failed push, even under `--no-pull`, every run until it's ended (the
     reaper doesn't reap it meanwhile: its git step fails, retried every 6 h, and the run's table
     and its notification say `a merge is in progress on <branch> — not reaped until it's finished
