@@ -723,9 +723,14 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     doesn't drop the key; a later set-aside never overwrites an earlier one) and put back when
     the pod returns to that branch. Landing pods on `main`/`master` ends with the reminder
     ``⚠ N cohort pods on main: not backed up until `arena pods init-branches` ``;
-    `--init-branches` runs `init-branches` on the same pods once every one has switched (the
-    start date is checked first; a pod whose switch failed, or that wasn't switched, inits nobody;
-    a pod mid-merge that `--hard` copied and switched is switched, so the init goes on).
+    `--init-branches` then runs `init-branches` on every pod that switched (the start date is
+    checked first) — one copied first because its push failed included, whatever failed it (the
+    network, push protection, a non-fast-forward, an operation in progress): one participant's
+    failed push used to leave the whole fleet on main, where no backup commits (review pr4). The
+    run still fails afterwards, naming the pods copied instead of pushed. A pod that didn't
+    switch (no copy, its switch failed, the gentle switch refused it, its lock stayed busy, the
+    wrong origin) is left out of the init — `init-branches on the N pod(s) that switched — not on
+    …` — and fails the run too; with none switched, no init.
   - `pods init-branches` — create each pod's `autocommit-…-wNdM-…` branch and push it
     upstream **without committing** (legacy `init_branches`), so a new day's branch
     exists before `backup` runs. `--week`/`--day` override; `--dry-run` previews. 2-min

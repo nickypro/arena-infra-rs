@@ -1268,7 +1268,7 @@ enum PodCmd {
         /// DESTRUCTIVE: reset to `origin/<branch>`, dropping local commits/changes; overwrites files it tracks
         #[arg(long)]
         hard: bool,
-        /// Then create + push each pod's day branch, as `init-branches` does
+        /// Then create + push the day branch of each pod that switched, as `init-branches` does
         #[arg(long)]
         init_branches: bool,
         /// Preview only: print what would happen, change nothing.
@@ -8386,7 +8386,7 @@ fn duplicate_names(pods: &[arena_core::Pod]) -> Vec<(String, Vec<String>)> {
 }
 
 /// What `pods set-branch` was asked: the branch, `--hard`, `--dry-run`, `--yes`, and
-/// `--init-branches` (init the same pods once every one has switched).
+/// `--init-branches` (init the pods it switched, once every one has had its switch).
 struct SetBranchRun<'a> {
     branch: &'a str,
     hard: bool,
@@ -8395,40 +8395,98 @@ struct SetBranchRun<'a> {
     init_branches: bool,
 }
 
-/// `pods set-branch`, then — with `--init-branches`, once every pod has switched —
-/// `pods init-branches` on the same pods. A switch that failed, or a pod not switched at all,
-/// stops it there (its run's error): init-branches would leave that pod behind. A pod that was
-/// switched is on the branch like the rest, so the init goes on — a pod mid-merge `--hard` ended
-/// after copying it included (review fb2 F2: one participant's conflicted pull used to skip the
-/// init for the whole fleet, leaving every pod on main where no backup commits).
-async fn set_branch_and_init(remote: Arc<dyn Remote>, cfg: &Config, sel: &Selected, how: &SetBranchRun<'_>, rsync: &str) -> Result<()> {
-    handle_set_branch(remote.clone(), cfg, how.branch, sel, how.hard, how.dry_run, how.yes, rsync).await?;
-    if how.init_branches {
-        println!();
-        handle_init_branches(remote, cfg, None, None, sel, how.dry_run, how.yes, rsync).await?;
-    }
-    Ok(())
+/// How a `set-branch` run ended ([`switch_branch`]), for `--init-branches` to go on from.
+enum SwitchEnd {
+    /// A dry run: the init's dry run follows, for every selected pod.
+    Previewed,
+    /// Nothing switched — no pod to switch, or the operator said no: no init either.
+    Stopped,
+    /// The switches ran: the pods that switched (`landed`, their branch copied first or not), and
+    /// the run's verdict ([`Switched::result`]).
+    Ran { landed: Vec<String>, verdict: Result<()> },
 }
 
-/// Switch the selected pods (those with an SSH endpoint) to `branch` over SSH.
-/// Gentle (fetch+checkout+ff-pull) by default; `hard` force-resets to `origin/<branch>`,
-/// discarding local commits/changes. Dry-run prints the exact command per pod. Pods run
-/// concurrently, each within [`BRANCH_TIMEOUT`] (it used to be serial, so one wedged pod
-/// held up every pod after it).
+/// `pods set-branch`, then — with `--init-branches` — `pods init-branches` on every pod that
+/// switched. A pod that switched is on the branch like the rest, whatever its switch said: one
+/// whose push failed (the network, push protection, a non-fast-forward, an operation in progress)
+/// and was copied first included — so one participant's failed push never leaves the whole fleet
+/// on main, where no backup commits (review pr4; fb2 F2 for a merge in progress). A pod that
+/// didn't switch (no copy, its switch failed, the gentle switch refused it, its lock was busy, the
+/// wrong origin) is left out: an init would branch its day from where it still is. The run
+/// still fails after the init, with set-branch's verdict (naming every pod copied instead of
+/// pushed, and every one not switched) and then the init's own.
+async fn set_branch_and_init(remote: Arc<dyn Remote>, cfg: &Config, sel: &Selected, how: &SetBranchRun<'_>, rsync: &str) -> Result<()> {
+    let (landed, verdict) = match switch_branch(remote.clone(), cfg, sel, how, rsync).await? {
+        SwitchEnd::Previewed if how.init_branches => {
+            println!();
+            return handle_init_branches(remote, cfg, None, None, sel, true, how.yes, rsync).await;
+        }
+        SwitchEnd::Previewed | SwitchEnd::Stopped => return Ok(()),
+        SwitchEnd::Ran { landed, verdict } => (landed, verdict),
+    };
+    if !how.init_branches {
+        return verdict;
+    }
+    println!();
+    let init = match init_selection(sel, &landed) {
+        None => {
+            say("init-branches NOT run: no pod switched");
+            Ok(())
+        }
+        Some((on, left_out)) => {
+            if !left_out.is_empty() {
+                say(&format!(
+                    "init-branches on the {} pod(s) that switched — not on {}, which didn't (see each one's line above)",
+                    on.pods.len(),
+                    left_out.join(", ")
+                ));
+            }
+            handle_init_branches(remote, cfg, None, None, &on, false, how.yes, rsync).await
+        }
+    };
+    match (verdict, init) {
+        (Ok(()), init) => init,
+        (Err(e), Ok(())) => Err(e),
+        (Err(e), Err(i)) => Err(anyhow::anyhow!("{e}; then init-branches: {i}")),
+    }
+}
+
+/// The pods `--init-branches` inits after a set-branch run: those of `sel` that switched
+/// (`landed`), in selection order, and the names of the rest — left out. `None` when none did.
+/// Pure.
+fn init_selection(sel: &Selected, landed: &[String]) -> Option<(Selected, Vec<String>)> {
+    let (on, out): (Vec<arena_core::Pod>, Vec<arena_core::Pod>) = sel.pods.iter().cloned().partition(|p| landed.contains(&p.name));
+    (!on.is_empty()).then(|| (Selected { pods: on, named: sel.named }, out.into_iter().map(|p| p.name).collect()))
+}
+
+/// `pods set-branch` alone, as its tests drive it: [`switch_branch`] and its verdict.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn handle_set_branch(
-    // How we reach pods: `SshRemote` for real, `FakeRemote` in tests.
     remote: Arc<dyn Remote>,
     cfg: &Config,
     branch: &str,
-    // The pods to switch, resolved by the caller (which demands names or --all).
     sel: &Selected,
     hard: bool,
     dry_run: bool,
     yes: bool,
-    // The rsync a pod whose branch can't be pushed is copied with: [`RSYNC`], a stub in tests.
     rsync: &str,
 ) -> Result<()> {
+    let how = SetBranchRun { branch, hard, dry_run, yes, init_branches: false };
+    match switch_branch(remote, cfg, sel, &how, rsync).await? {
+        SwitchEnd::Ran { verdict, .. } => verdict,
+        SwitchEnd::Previewed | SwitchEnd::Stopped => Ok(()),
+    }
+}
+
+/// Switch the selected pods (those with an SSH endpoint) to `how.branch` over SSH.
+/// Gentle (fetch+checkout+ff-pull) by default; `how.hard` force-resets to `origin/<branch>`,
+/// discarding local commits/changes. Dry-run prints the exact command per pod. Pods run
+/// concurrently, each within [`BRANCH_TIMEOUT`] (it used to be serial, so one wedged pod
+/// held up every pod after it). `rsync`: the rsync a pod whose branch can't be pushed is copied
+/// with ([`RSYNC`], a stub in tests); `remote`: `SshRemote` for real, `FakeRemote` in tests.
+async fn switch_branch(remote: Arc<dyn Remote>, cfg: &Config, sel: &Selected, how: &SetBranchRun<'_>, rsync: &str) -> Result<SwitchEnd> {
+    let SetBranchRun { branch, hard, dry_run, yes, .. } = *how;
     let repo_path = cfg.get("BACKUP_REPO_PATH").map(String::from).unwrap_or_else(|| {
         format!("/root/{}", cfg.get("ARENA_REPO_NAME").unwrap_or("ARENA_materials"))
     });
@@ -8440,7 +8498,7 @@ async fn handle_set_branch(
     let targets = sel.named_targets(cfg)?;
     if targets.is_empty() {
         println!("(no pods with an SSH endpoint to switch)");
-        return Ok(());
+        return Ok(SwitchEnd::Stopped);
     }
 
     if dry_run {
@@ -8450,9 +8508,9 @@ async fn handle_set_branch(
             println!("{}\n", t.display_command(&cmd));
         }
         println!("Dry-run only — nothing changed (preview).");
-        return Ok(());
+        return Ok(SwitchEnd::Previewed);
     }
-    let how = if hard {
+    let what = if hard {
         format!("HARD-reset {} pod(s) to 'origin/{branch}' — DISCARDS local commits/changes", targets.len())
     } else {
         format!("switch {} pod(s) to branch '{branch}' (gentle, no reset)", targets.len())
@@ -8462,9 +8520,9 @@ async fn handle_set_branch(
     if let Some(line) = switch_unlocked_line(cfg) {
         say(&line);
     }
-    if !confirm(yes, &format!("Will {how} (each pod's current branch committed + pushed first): {names}"))? {
+    if !confirm(yes, &format!("Will {what} (each pod's current branch committed + pushed first): {names}"))? {
         println!("aborted.");
-        return Ok(());
+        return Ok(SwitchEnd::Stopped);
     }
     let total = targets.len();
     let doing = format!("to '{branch}'");
@@ -8484,7 +8542,7 @@ async fn handle_set_branch(
     if let Some(line) = set_branch_reminder(&Naming::from_config(cfg), branch, &landed, !sel.named) {
         say(&line);
     }
-    run.result("switch branch")
+    Ok(SwitchEnd::Ran { landed, verdict: run.result("switch branch") })
 }
 
 /// What a dry run of a branch switch says first: the push that comes before it — under each
@@ -8545,7 +8603,9 @@ struct Switched {
 
 impl Switched {
     /// The command's result: every pod switched after its push, else what went wrong (`verb`:
-    /// what a failed switch failed to do — "switch branch", "init branch").
+    /// what a failed switch failed to do — "switch branch", "init branch"). A pod copied because
+    /// its push failed and then switched is named here, so the run fails and the operator sees it
+    /// — but it did switch: `--init-branches` still inits it ([`set_branch_and_init`]).
     fn result(self, verb: &str) -> Result<()> {
         let mut problems = Vec::new();
         if !self.failed.is_empty() {
@@ -22937,12 +22997,14 @@ mod remote_tests {
     }
 
     /// The reverse of [`hard_init_branches_goes_on_past_a_pod_mid_merge_it_switched`]: a pod that
-    /// really failed still stops the chain before any init — its copy failed (not switched), its
-    /// `--hard` switch failed, or the gentle switch refused its merge (a BUSY pod not switched is a
-    /// failure, as before). No init on any pod.
+    /// really wasn't switched — its copy failed, its `--hard` switch failed, or the gentle switch
+    /// refused its merge (a BUSY pod not switched is a failure, as before) — is left out of the
+    /// init, said in one line, and the run fails naming it. The pods that did switch are init'd
+    /// all the same (review pr4: one pod used to stop the init for the whole fleet). With none
+    /// switched, no init at all.
     #[tokio::test]
-    async fn init_branches_never_runs_after_a_pod_mid_merge_that_wasnt_switched() {
-        use super::{set_branch_and_init, SetBranchRun};
+    async fn init_branches_leaves_out_a_pod_that_wasnt_switched_and_inits_the_rest() {
+        use super::{resolve_week_day, set_branch_and_init, SetBranchRun};
         let stub = StubRsync::new("chain-busy-fail");
         let failing = StubRsync::new("chain-busy-copyfail");
         std::fs::write(
@@ -22953,6 +23015,7 @@ mod remote_tests {
         .unwrap();
         let pushed = || FakeReply::stdout("BRANCH autocommit-a\nPUSHED autocommit-a\n");
         let refused = FakeReply::exit(BACKUP_BUSY_EXIT, "arena set-branch: a merge is in progress on autocommit-b — not switched");
+        let left_out = "init-branches on the 1 pod(s) that switched — not on devtest-bloom, which didn't (see each one's line above)";
         // (case, hard, the rsync, bloom's replies after its backup, the run's error)
         let cases: Vec<(&str, bool, &StubRsync, Vec<FakeReply>, &str)> = vec![
             ("copy failed", true, &failing, vec![repo_in_place()], "1 pod(s) NOT switched — each one's line says why: devtest-bloom"),
@@ -22961,6 +23024,8 @@ mod remote_tests {
         ];
         for (case, hard, rsync, after, want) in cases {
             let cfg = cfg_at(rsync);
+            let (week, day) = resolve_week_day(&cfg, None, None).unwrap();
+            let apple_init = (init_branch_command(&BackupConfig::from_config(&cfg, week, day), "devtest-apple"), Some(BRANCH_TIMEOUT));
             let fake = Arc::new(FakeRemote::new());
             fake.script(&host(22001), [pushed(), FakeReply::ok(), FakeReply::stdout("SKIP main\n"), FakeReply::ok()]);
             fake.script(&host(22002), std::iter::once(busy_merge("autocommit-b")).chain(after).collect::<Vec<_>>());
@@ -22970,12 +23035,80 @@ mod remote_tests {
                 .await
                 .unwrap_err();
             assert_eq!(err.to_string(), want, "{case}");
-            for port in [22001, 22002] {
-                assert!(!execs(&fake, port).iter().any(|(c, _)| c.contains("git checkout -b")), "{case}: {port} init'd");
-            }
-            assert_eq!(execs(&fake, 22001).len(), 2, "{case}: apple backed up and switched, nothing more");
-            assert!(!crate::take_said().iter().any(|l| l.starts_with("⚠ ") && l.contains("had uncommitted work")), "{case}");
+            assert!(!execs(&fake, 22002).iter().any(|(c, _)| c.contains("git checkout -b")), "{case}: bloom init'd");
+            let apple = execs(&fake, 22001);
+            assert_eq!((apple.len(), apple.last()), (4, Some(&apple_init)), "{case}: apple switched, then init'd");
+            let said = crate::take_said();
+            assert!(said.iter().any(|l| l == left_out), "{case}: {said:#?}");
+            assert!(!said.iter().any(|l| l.starts_with("⚠ ") && l.contains("had work no backup had saved")), "{case}");
         }
+        // Nobody switched: no init at all, said.
+        let cfg = cfg_at(&failing);
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22002), [busy_merge("autocommit-b"), repo_in_place()]);
+        let how = SetBranchRun { branch: "main", hard: true, dry_run: false, yes: true, init_branches: true };
+        let err = set_branch_and_init(fake.clone(), &cfg, &everyone(&fleet_of(&[("bloom", 22002)])), &how, &failing.path()).await.unwrap_err();
+        assert_eq!(err.to_string(), "1 pod(s) NOT switched — each one's line says why: devtest-bloom");
+        assert_eq!(execs(&fake, 22002).len(), 2, "its backup and the copy's probe, nothing more");
+        assert!(crate::take_said().iter().any(|l| l == "init-branches NOT run: no pod switched"));
+    }
+
+    /// Review pr4: a pod whose push failed for an ordinary reason — the network, a non-fast-forward,
+    /// GitHub's push protection — was copied and switched like the rest, yet `set-branch main
+    /// --hard --init-branches` then skipped the init for the whole fleet, leaving every pod on main
+    /// where no backup commits (the */15 cron SKIPs them all). Now every pod that switched is
+    /// init'd, the copied one too; the run still fails after the init, naming that pod.
+    #[tokio::test]
+    async fn init_branches_runs_on_every_switched_pod_even_one_copied_after_a_failed_push() {
+        use super::{resolve_week_day, set_branch_and_init, SetBranchRun};
+        let stub = StubRsync::new("chain-pushfail");
+        let cfg = cfg_at(&stub);
+        let (week, day) = resolve_week_day(&cfg, None, None).unwrap();
+        let bcfg = BackupConfig::from_config(&cfg, week, day);
+        let pushed = |b: &str| FakeReply::stdout(&format!("BRANCH {b}\nPUSHED {b}\n"));
+        let on_main = || FakeReply::stdout("SKIP main\n");
+        let push_failed = |stderr: &str| FakeReply::exit(1, stderr).with_stdout("BRANCH autocommit-b\nPUSH_FAILED\n");
+        let backup = |name: &str| (backup_command(REPO, Some(KEY), &format!("arena backup devtest-{name}"), None), Some(BACKUP_TIMEOUT));
+        let hard = (checkout_command(REPO, "main", Some(KEY), true), Some(BRANCH_TIMEOUT));
+        let init = |name: &str| (init_branch_command(&bcfg, &format!("devtest-{name}")), Some(BRANCH_TIMEOUT));
+        let probe = (arena_core::volume::probe_command(REPO), Some(PROBE_TIMEOUT));
+        let failures = [
+            ("network", push_failed("ssh: connect to host github.com port 22: Connection timed out\nfatal: Could not read from remote repository.")),
+            ("non-fast-forward", push_failed(" ! [rejected]        autocommit-b -> autocommit-b (fetch first)\nerror: failed to push some refs")),
+            ("push protection", push_blocked("autocommit-b")),
+        ];
+        for (case, failed) in failures {
+            let fake = Arc::new(FakeRemote::new());
+            fake.script(&host(22001), [pushed("autocommit-a"), FakeReply::ok(), on_main(), FakeReply::ok()]);
+            fake.script(&host(22002), [failed, repo_in_place(), FakeReply::ok(), on_main(), FakeReply::ok()]);
+            fake.script(&host(22003), [pushed("autocommit-c"), FakeReply::ok(), on_main(), FakeReply::ok()]);
+            let _ = crate::take_said();
+            let how = SetBranchRun { branch: "main", hard: true, dry_run: false, yes: true, init_branches: true };
+            let err = set_branch_and_init(fake.clone(), &cfg, &everyone(&fleet()), &how, &stub.path()).await.unwrap_err();
+            assert_eq!(err.to_string(), "1 pod(s) switched with their branch copied, not pushed (see each one's line): devtest-bloom", "{case}");
+            assert_eq!(execs(&fake, 22002), [backup("bloom"), probe.clone(), hard.clone(), backup("bloom"), init("bloom")], "{case}");
+            for (name, port) in [("apple", 22001), ("cloud", 22003)] {
+                assert_eq!(execs(&fake, port), [backup(name), hard.clone(), backup(name), init(name)], "{case}: {name}");
+            }
+            assert!(stub.take().iter().all(|d| d.ends_with("/devtest-bloom")), "{case}: only bloom copied");
+            let said = unnumbered(&crate::take_said());
+            assert!(said.iter().any(|l| l.starts_with("✓ devtest-bloom (on main) — ⚠ NOT PUSHED FIRST: branch autocommit-b (")), "{case}: {said:#?}");
+            for name in ["apple", "bloom", "cloud"] {
+                let line = format!("✓ devtest-{name} -> {}", bcfg.branch_for(&format!("devtest-{name}")));
+                assert!(said.contains(&line), "{case}: {line}: {said:#?}");
+            }
+            assert!(!said.iter().any(|l| l.starts_with("init-branches")), "{case}: nobody left out");
+        }
+        // An init that fails too: both said, set-branch's first.
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22002), [push_blocked("autocommit-b"), repo_in_place(), FakeReply::ok(), on_main(), FakeReply::exit(1, "fatal: the remote end hung up")]);
+        let how = SetBranchRun { branch: "main", hard: true, dry_run: false, yes: true, init_branches: true };
+        let err = set_branch_and_init(fake.clone(), &cfg, &everyone(&fleet_of(&[("bloom", 22002)])), &how, &stub.path()).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "1 pod(s) switched with their branch copied, not pushed (see each one's line): devtest-bloom; then init-branches: 1 \
+             pod(s) failed to init branch"
+        );
     }
 
     /// Review fb2 F3: a pod on main — where no backup commits — with a merge in progress or
@@ -24768,7 +24901,7 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
         }
 
         #[tokio::test(start_paused = true)]
-        async fn set_branch_init_branches_inits_the_same_pods_once_every_one_has_switched() {
+        async fn set_branch_init_branches_inits_the_pods_that_switched() {
             let cfg = account_cfg("ARENA_START_DATE=2026-10-05\n");
             let (week, day) = resolve_week_day(&cfg, None, None).unwrap();
             let bcfg = BackupConfig::from_config(&cfg, week, day);
@@ -24789,14 +24922,19 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
                 );
             }
             take_said();
-            // A failed switch: no pod gets a day branch (the operator re-runs once all are on main).
+            // A failed switch: that pod gets no day branch — it isn't on main — the others do, and the
+            // run fails naming it (review pr4: one failed pod used to keep every pod on main).
             let fake = Arc::new(FakeRemote::new());
             fake.script(&host(22002), [FakeReply::ok(), FakeReply::exit(1, "fatal: unable to access")]);
             let err = handle_pods(pods(&["set-branch", "main", "--all", "--hard", "--init-branches"]), &account(), fake.clone(), &cfg, true)
                 .await
                 .unwrap_err();
             assert_eq!(err.to_string(), "1 pod(s) failed to switch branch");
-            assert!(COHORT_PORTS.iter().all(|&p| execs(&fake, p).len() == 2), "its backup and the switch, no init: {:?}", fake.calls());
+            assert_eq!(execs(&fake, 22002).len(), 2, "bloom: its backup and the switch, no init: {:?}", fake.calls());
+            for (name, port) in [("devtest-apple", 22001), ("devtest-extra", 22003)] {
+                let init = (init_branch_command(&bcfg, name), Some(BRANCH_TIMEOUT));
+                assert_eq!(execs(&fake, port).last(), Some(&init), "{name}: init'd");
+            }
             // No start date to name the day: refused before any pod is switched.
             let fake = Arc::new(FakeRemote::new());
             let err = handle_pods(pods(&["set-branch", "main", "--all", "--hard", "--init-branches"]), &account(), fake.clone(), &account_cfg(""), true)
