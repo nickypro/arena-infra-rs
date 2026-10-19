@@ -1812,6 +1812,51 @@ after 8 rounds without one it prints the commands to finish by hand. Only Ctrl+C
 it, so after an interrupted run check `teardown --check`. A COMMUNITY pod that never gets a
 public IP fails as `FAILED endpoint` (see `docs/TODO.md`); the guard still cleans it up.
 
+## AI review before merging
+
+`scripts/ai-review` gets a second-opinion code review of a change from **codex** (OpenAI's CLI)
+and/or **Claude Code** (`claude -p`), both by default, run in parallel:
+
+```bash
+git fetch origin
+scripts/ai-review                        # origin/master..HEAD, codex + claude
+scripts/ai-review 7fface8..04968c3 --codex --focus "the new cron tidy-up"
+scripts/ai-review --pr 4                 # gh pr diff/view (GH_REPO=owner/name picks the repo)
+scripts/ai-review --dry-run              # only write prompt.txt: nothing is sent
+```
+
+- **What it sends, and where.** One prompt, built from git objects only (never the working tree,
+  never a file outside the repository): fixed review instructions with this repo's production
+  risks (backup.sh under root's cron on every pod, the cron lines, set-branch/init-branches, the
+  reaper, the archive, participants' files and the control box's home), `git log --oneline`, the
+  diff (from the range's merge base) and the full text of every changed `*.sh`. With `--both`
+  that goes to **OpenAI** (codex) **and Anthropic** (claude); `--codex`/`--claude` sends it to one.
+  Over `--max-bytes` (600 KB) it keeps the stat and the riskiest files and names the rest as left
+  out. A changed path that looks like a secret (`config.env`, `*.key`, `id_rsa*`, …) is refused.
+- **No tools.** Everything the reviewer needs is in the prompt, so it runs with none, in an empty
+  temporary directory: claude with `--tools ''`, `--safe-mode` (no hooks, MCP servers or
+  CLAUDE.md) and no saved session; codex `exec` read-only and ephemeral, with its shell, code
+  mode, apps, plugins, browser and web search turned off. (Here codex's sandbox can't run a
+  command anyway: bubblewrap fails.)
+- **Output** goes to `${XDG_STATE_HOME:-~/.local/state}/arena-review/<UTC time>-<range|prN>/`
+  (`--out DIR` for another parent): `prompt.txt`, `codex.md`, `claude.md`, and each reviewer's
+  stderr in `codex.log`/`claude.log`. It ends by printing those paths and each review's last line,
+  `Blocks merging: yes|no (…)`. Exit 0 when every reviewer that ran answered, whatever it found;
+  1 when one failed or timed out (`--timeout`, 3600 s each) or none could run (a missing `codex`
+  or `claude` is skipped with a message); 2 for a usage error or an empty diff (refused).
+- **Cost.** It runs on the operator's own codex and Claude Code logins, so it spends their
+  subscriptions' usage, not the project's API keys: a 16-commit, ~420 KB prompt is roughly 125k
+  input tokens per reviewer, and took codex 2½ minutes and claude 5. `--effort` (default `high`,
+  for both) sets how hard they think: codex's own default here is `none`, a skim that answers in
+  25 s. `--model-codex`/`--model-claude` pick the models.
+- It's a second opinion, not a gate: read the findings, fix what's real, note what isn't.
+
+## Release process
+
+Work on `dev/phase0` → `cargo test --release` + the live smoke in the sandbox → PR to master,
+**running `scripts/ai-review` (or `--pr N`) before merging it** → `cargo install` to prod only
+between cohort sessions, keeping the previous binary as `arena.prev` for an instant rollback.
+
 ## Layout
 
 ```
@@ -1819,6 +1864,8 @@ crates/
   core/   library: config, provider trait + impls, Remote, planners/judges (see ARCHITECTURE.md)
   cli/    `arena` binary (clap); tests/live_smoke.rs = the opt-in live smoke test
   tui/    `arena-tui` binary (ratatui)
+scripts/
+  ai-review   a second-opinion review by codex/claude (see "AI review before merging")
 web/
   fleet.html  the public fleet page (reads fleet.json next to it)
 docs/     RunPod API notes, known issues
