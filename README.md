@@ -550,9 +550,10 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     named (no targets, `all`/`--all`) — **this cohort's**: `<prefix>-…` pods (one off
     `MACHINE_NAME_LIST` too: an extra pod made for someone, a parked `-old` twin), never an `@`
     staff entry. The rest (staff boxes, another prefix, a pod the provider named) get one
-    `⊘ skipped N non-cohort pods (…): a, b — name one to include it` line, never a failure;
-    named, they're backed up like any pod (list a staff box that wears the prefix as
-    `@<prefix>-name` to leave it out). Cohort pods on `main`/`master` (after `set-branch main`,
+    `⊘ skipped N non-cohort pods (…): a, b — name one to include it, or pass --include-non-cohort`
+    line, never a failure; named, they're backed up like any pod (list a staff box that wears the
+    prefix as `@<prefix>-name` to leave it out). `--include-non-cohort` (on `backup`, `pull`,
+    `init-branches`, `set-branch`) takes every pod instead. Cohort pods on `main`/`master` (after `set-branch main`,
     until `init-branches`) get one line after the run, not a SKIP each:
     ``⚠ 12 cohort pods on main: not backed up until `arena pods init-branches` `` (it names the
     pods when only some are). Not a failure — the exit stays 0: the reset window is routine

@@ -306,6 +306,15 @@ impl SelectOpts {
     }
 }
 
+/// Who a fleet-wide backup command (`backup`, `pull`, `init-branches`, `set-branch --all`)
+/// acts on when it names no pod: this cohort's ([`split_cohort`]), or with the flag every pod.
+#[derive(clap::Args, Debug, Clone, Copy, Default)]
+struct CohortScope {
+    /// With no pods named (or --all): every pod, staff boxes and other prefixes too
+    #[arg(long)]
+    include_non_cohort: bool,
+}
+
 #[derive(clap::Args, Debug, Clone, Default)]
 #[command(next_help_heading = "Target selection")]
 struct Select {
@@ -1114,7 +1123,7 @@ enum PodCmd {
     ///
     /// Pushes the current branch (never main/master), then runs `pods pull`; --no-pull = git
     /// only. No targets (or --all) = this cohort's reachable pods (`<prefix>-*`, not @ staff
-    /// entries); name a staff box to include it.
+    /// entries); name a staff box to include it, or --include-non-cohort for every pod.
     #[command(verbatim_doc_comment)]
     Backup {
         /// Only do the git push; skip the rsync file backup.
@@ -1127,12 +1136,15 @@ enum PodCmd {
         #[arg(long)]
         message: Option<String>,
         #[command(flatten)]
+        cohort: CohortScope,
+        #[command(flatten)]
         sel: Select,
     },
     /// Rsync each pod's home to the local backup folder
     ///
     /// Writes a dated snapshot (files under --max-size) and the complete `big/` mirror. No
-    /// targets (or --all) = this cohort's pods with an SSH endpoint (not @ staff entries).
+    /// targets (or --all) = this cohort's pods with an SSH endpoint (not @ staff entries;
+    /// --include-non-cohort: every pod).
     /// Each pod's rsync is time-limited (BACKUP_TIMEOUT_SECS).
     #[command(verbatim_doc_comment)]
     Pull {
@@ -1160,6 +1172,8 @@ enum PodCmd {
         /// The old spelling of the targets (`pods pull -t bravo`), still accepted.
         #[arg(long = "target", short = 't', value_name = "TARGET", hide = true)]
         target_flag: Vec<String>,
+        #[command(flatten)]
+        cohort: CohortScope,
         #[command(flatten)]
         sel: Select,
     },
@@ -1221,7 +1235,8 @@ enum PodCmd {
     },
     /// Create + push each pod's wNdM autocommit branch
     ///
-    /// No targets (or --all) = this cohort's pods (`<prefix>-*`, not @ staff entries).
+    /// No targets (or --all) = this cohort's pods (`<prefix>-*`, not @ staff entries;
+    /// --include-non-cohort: every pod).
     #[command(verbatim_doc_comment)]
     InitBranches {
         /// Override the iteration week (default: computed from ARENA_START_DATE).
@@ -1234,12 +1249,15 @@ enum PodCmd {
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
         #[command(flatten)]
+        cohort: CohortScope,
+        #[command(flatten)]
         sel: Select,
     },
     /// Switch pods' git branch (ff-only; --hard force-resets)
     ///
     /// --all = this cohort's pods (`<prefix>-*`, not @ staff entries); name a staff box to
-    /// include it. On main/master no backup commits until `init-branches` (or --init-branches).
+    /// include it, or --include-non-cohort for every pod. On main/master no backup commits until
+    /// `init-branches` (or --init-branches).
     #[command(verbatim_doc_comment)]
     SetBranch {
         /// Branch to check out (e.g. main, or a feature branch).
@@ -1253,6 +1271,8 @@ enum PodCmd {
         /// Preview only: print what would happen, change nothing.
         #[arg(long, visible_aliases = ["dryrun", "dry"])]
         dry_run: bool,
+        #[command(flatten)]
+        cohort: CohortScope,
         #[command(flatten)]
         sel: Select,
     },
@@ -4845,9 +4865,10 @@ fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<String>) {
     println!("\nMachine naming:");
     cfg_row(&mut out, cfg, &mut missing, "MACHINE_NAME_PREFIX", false, false);
     println!(
-        "  {} MACHINE_NAME_LIST          {} names",
+        "  {} MACHINE_NAME_LIST          {} name{}",
         if cfg.machine_names.is_empty() { "✗" } else { "✓" },
-        cfg.machine_names.len()
+        cfg.machine_names.len(),
+        if cfg.machine_names.len() == 1 { "" } else { "s" }
     );
     if cfg.machine_names.is_empty() {
         missing.push("MACHINE_NAME_LIST".into());
@@ -5399,14 +5420,19 @@ fn failure_why(call: &PodCall) -> String {
 
 /// The stderr line that says what went wrong: the first one that starts (trimmed) like git's or
 /// ssh's own verdict — `ERROR:`, `fatal:`, `error:`, `remote: error`, `! [rejected]`,
-/// `! [remote rejected]` — else the last non-empty line. The last line alone is often the tail
-/// of a longer message (live: a push to a missing repo gave `and the repository exists.`, the end
-/// of git's advice, where its first line said `ERROR: Repository not found.`). `None` for an
-/// empty stderr. Pure.
+/// `! [remote rejected]`, `ssh:` — or that holds `Permission denied`, else the last non-empty
+/// line. The last line alone is often the tail of a longer message (live: a push to a missing
+/// repo gave `and the repository exists.`, the end of git's advice, where its first line said
+/// `ERROR: Repository not found.`). ssh's own line comes before git's `fatal: Could not read
+/// from remote repository.` and names the cause that one hides: `git@github.com: Permission
+/// denied (publickey).` (live: the deploy key gone), `ssh: connect to host … timed out`.
+/// `None` for an empty stderr. Pure.
 fn telling_line(stderr: &str) -> Option<&str> {
-    const VERDICTS: &[&str] = &["ERROR:", "fatal:", "error:", "remote: error", "! [rejected]", "! [remote rejected]"];
+    const VERDICTS: &[&str] = &["ERROR:", "fatal:", "error:", "remote: error", "! [rejected]", "! [remote rejected]", "ssh:"];
     let lines = || stderr.lines().map(str::trim).filter(|l| !l.is_empty());
-    lines().find(|l| VERDICTS.iter().any(|v| l.starts_with(v))).or_else(|| lines().next_back())
+    lines()
+        .find(|l| VERDICTS.iter().any(|v| l.starts_with(v)) || l.contains("Permission denied"))
+        .or_else(|| lines().next_back())
 }
 
 /// Is `branch` one `pods backup` never commits on (`backup.sh`'s SKIP: main, master, a
@@ -7121,19 +7147,19 @@ async fn handle_pods_bal(
         }
 
 
-        PodCmd::InitBranches { sel, week, day, dry_run } => {
+        PodCmd::InitBranches { sel, cohort, week, day, dry_run } => {
             let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
-            let sel = cohort_only(cfg, sel);
+            let sel = cohort_only(cfg, sel, cohort);
             handle_init_branches(remote, cfg, week, day, &sel, dry_run, yes, RSYNC).await?;
         }
 
-        PodCmd::Pull { label, dir, max_size, remote_path, no_git, no_big, target_flag, sel, dry_run } => {
+        PodCmd::Pull { label, dir, max_size, remote_path, no_git, no_big, target_flag, cohort, sel, dry_run } => {
             let dir = dir.unwrap_or_else(|| local_backup_dir(cfg));
             let (label, sel, note) = resolve_pull(provider, cfg, label, sel, &target_flag).await?;
             if let Some(note) = &note {
                 eprintln!("{note}");
             }
-            let mut sel = cohort_only(cfg, sel);
+            let mut sel = cohort_only(cfg, sel, cohort);
             refresh_missing_endpoints(provider, &mut sel, ENDPOINT_RETRY).await;
             handle_pull(&remote, cfg, label, &dir, max_size, remote_path, no_git, no_big, &sel, dry_run, yes, RSYNC).await?;
         }
@@ -7240,11 +7266,11 @@ async fn handle_pods_bal(
             handle_terminate(provider, cfg, &book, target.as_deref(), opts).await?;
         }
 
-        PodCmd::Backup { sel, no_pull, dry_run, message } => {
+        PodCmd::Backup { sel, cohort, no_pull, dry_run, message } => {
             // Resolved once, before the prompt (a typo fails before asking), and shared by the
             // git push and the pull.
             let sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
-            let mut sel = cohort_only(cfg, sel);
+            let mut sel = cohort_only(cfg, sel, cohort);
             refresh_missing_endpoints(provider, &mut sel, ENDPOINT_RETRY).await;
             handle_full_backup(remote, cfg, &sel, no_pull, message, dry_run, yes, RSYNC).await?;
         }
@@ -7275,9 +7301,9 @@ async fn handle_pods_bal(
             handle_setup(remote, cfg, !dry_run, force, hf_token, cc_token, zsh_install, no_vscode, timeouts, &sel, KEYS_DIR, Some(provider))
                 .await?;
         }
-        PodCmd::SetBranch { branch, sel, hard, dry_run, init_branches } => {
+        PodCmd::SetBranch { branch, sel, cohort, hard, dry_run, init_branches } => {
             let sel = select(provider, cfg, &sel.args(), Unscoped::Refuse("switch")).await?;
-            let sel = cohort_only(cfg, sel);
+            let sel = cohort_only(cfg, sel, cohort);
             // The day `--init-branches` would init, before anything switches: a missing start
             // date fails here, not after the reset.
             if init_branches {
@@ -8026,8 +8052,8 @@ struct Switched {
     ok: usize,
     /// The switch command itself failed on these.
     failed: Vec<String>,
-    /// Not switched: their branch could be neither pushed nor copied, or another backup held
-    /// their lock — `(pod, why)`.
+    /// Not switched: their branch could be neither pushed nor copied, their origin isn't the
+    /// configured repo, or another backup held their lock — `(pod, why)`.
     not_switched: Vec<(String, String)>,
     /// Switched after their files were copied, their push having failed.
     copied: Vec<String>,
@@ -8042,9 +8068,11 @@ impl Switched {
             problems.push(format!("{} pod(s) failed to {verb}", self.failed.len()));
         }
         if !self.not_switched.is_empty() {
+            // The reasons differ (no push and no copy, the wrong origin, a busy lock): each pod's
+            // own line has its why, so this one only counts and names them.
             let names: Vec<&str> = self.not_switched.iter().map(|(n, _)| n.as_str()).collect();
             problems.push(format!(
-                "{} pod(s) NOT switched — their branch could be neither pushed nor copied first (see each one's line): {}",
+                "{} pod(s) NOT switched — each one's line says why: {}",
                 names.len(),
                 names.join(", ")
             ));
@@ -12552,8 +12580,12 @@ async fn select(provider: &dyn Provider, cfg: &Config, sel: &SelectArgs, unscope
 
 /// Narrow a fleet-wide selection of the git backup commands (`pods backup`, `pull`,
 /// `init-branches`, `set-branch`) to this cohort's machines, saying in one line who was left
-/// out ([`split_cohort`], [`non_cohort_line`]). A selection that named pods comes back as it was.
-fn cohort_only(cfg: &Config, sel: Selected) -> Selected {
+/// out ([`split_cohort`], [`non_cohort_line`]). A selection that named pods comes back as it was,
+/// and so does every selection with `--include-non-cohort` (nothing left out, nothing said).
+fn cohort_only(cfg: &Config, sel: Selected, scope: CohortScope) -> Selected {
+    if scope.include_non_cohort {
+        return sel;
+    }
     let naming = Naming::from_config(cfg);
     let (kept, left_out) = split_cohort(&naming, sel);
     if let Some(line) = non_cohort_line(naming.prefix, &left_out) {
@@ -12594,7 +12626,7 @@ fn non_cohort_line(prefix: &str, names: &[String]) -> Option<String> {
     }
     let n = names.len();
     Some(format!(
-        "⊘ skipped {n} non-cohort pod{} (not {prefix}-…, or an @ staff entry): {list} — name one to include it",
+        "⊘ skipped {n} non-cohort pod{} (not {prefix}-…, or an @ staff entry): {list} — name one to include it, or pass --include-non-cohort",
         if n == 1 { "" } else { "s" }
     ))
 }
@@ -20878,7 +20910,9 @@ mod remote_tests {
                        Please make sure you have the correct access rights\nand the repository exists.\n";
         let cases: &[(&str, Option<&str>)] = &[
             (missing, Some("ERROR: Repository not found.")),
-            ("ssh: connect to host github.com port 22: Connection timed out\r\nfatal: Could not read from remote repository.\r\n\r\nand the repository exists.\r\n", Some("fatal: Could not read from remote repository.")),
+            ("ssh: connect to host github.com port 22: Connection timed out\r\nfatal: Could not read from remote repository.\r\n\r\nand the repository exists.\r\n", Some("ssh: connect to host github.com port 22: Connection timed out")),
+            // Live (hz2): the deploy key moved away — ssh's line names the cause git's `fatal:` hides.
+            ("Warning: Identity file /root/.ssh/id_ed25519 not accessible: No such file or directory.\nno such identity: /root/.ssh/id_ed25519: No such file or directory\ngit@github.com: Permission denied (publickey).\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n", Some("git@github.com: Permission denied (publickey).")),
             ("To github.com:o/r.git\n ! [rejected]        autocommit-x -> autocommit-x (non-fast-forward)\nerror: failed to push some refs to 'github.com:o/r.git'\nhint: Updates were rejected\n", Some("! [rejected]        autocommit-x -> autocommit-x (non-fast-forward)")),
             ("remote: Resolving deltas: 100% (3/3)\nremote: error: File big.bin is 120.00 MB; this exceeds GitHub's file size limit\nTo github.com:o/r.git\n ! [remote rejected] x -> x (pre-receive hook declined)\nerror: failed to push some refs\n", Some("remote: error: File big.bin is 120.00 MB; this exceeds GitHub's file size limit")),
             ("To /root/gh013.git\n ! [remote rejected] x -> x (pre-receive hook declined)\n", Some("! [remote rejected] x -> x (pre-receive hook declined)")),
@@ -21028,7 +21062,7 @@ mod remote_tests {
         let err = handle_set_branch(fake.clone(), &cfg, "main", &everyone(&fleet()), true, false, true, &stub.path()).await.unwrap_err();
         assert_eq!(
             err.to_string(),
-            "1 pod(s) NOT switched — their branch could be neither pushed nor copied first (see each one's line): devtest-bloom"
+            "1 pod(s) NOT switched — each one's line says why: devtest-bloom"
         );
         assert!(crate::take_said().contains(&refused), "{refused}");
         assert_eq!(execs(&fake, 22002), [backup("bloom")], "bloom: refused, never copied or switched");
@@ -21321,7 +21355,7 @@ mod remote_tests {
         let probe = Arc::new(LockProbe { inner: fake.clone(), dir: base.display().to_string(), seen: Default::default() });
         let err = handle_set_branch(probe.clone(), &cfg, "main", &everyone(&fleet()), true, false, true, &failing.path()).await.unwrap_err();
         let msg = err.to_string();
-        assert!(msg.starts_with("2 pod(s) NOT switched — their branch could be neither pushed nor copied first"), "{msg}");
+        assert!(msg.starts_with("2 pod(s) NOT switched — each one's line says why: "), "{msg}");
         assert!(msg.contains("devtest-bloom") && msg.contains("devtest-cloud") && !msg.contains("devtest-apple"), "{msg}");
         let hard = checkout_command(REPO, "main", Some(KEY), true);
         let backup = |name: &str| (backup_command(REPO, Some(KEY), &format!("arena backup devtest-{name}"), None), Some(BACKUP_TIMEOUT));
@@ -21355,7 +21389,7 @@ mod remote_tests {
         let err = handle_set_branch(fake.clone(), &cfg, "main", &everyone(&fleet()), true, false, true, "rsync").await.unwrap_err();
         assert_eq!(
             err.to_string(),
-            "1 pod(s) NOT switched — their branch could be neither pushed nor copied first (see each one's line): devtest-bloom"
+            "1 pod(s) NOT switched — each one's line says why: devtest-bloom"
         );
         assert!(fake.calls_to(&host(22002)).is_empty(), "bloom touched: {:?}", fake.calls_to(&host(22002)));
         let hard = checkout_command(REPO, "main", Some(KEY), true);
@@ -22467,8 +22501,8 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
     /// pods it left out and the cohort pods it found on main (spec items 2 and 3).
     mod cohort_scope {
         use super::super::{
-            non_cohort_line, on_protected_line, on_protected_lines, resolve_week_day, restored_note, set_branch_reminder,
-            split_cohort, take_said,
+            cohort_only, non_cohort_line, on_protected_line, on_protected_lines, resolve_week_day, restored_note,
+            set_branch_reminder, split_cohort, take_said, Cli, Cmd, CohortScope, PodCmd,
         };
         use super::*;
 
@@ -22505,7 +22539,7 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
         /// The cohort's three; the line for the other four (in selection order: list slot, then name).
         const COHORT_PORTS: [u16; 3] = [22001, 22002, 22003];
         const LEFT_OUT: &str = "⊘ skipped 4 non-cohort pods (not devtest-…, or an @ staff entry): \
-            devtest-zebra, staff-gpu, devtest2-apple, quiet_blue_fox — name one to include it";
+            devtest-zebra, staff-gpu, devtest2-apple, quiet_blue_fox — name one to include it, or pass --include-non-cohort";
         /// What a branch switch says first with [`account_cfg`]'s legacy `./backup` (no locks).
         const NO_LOCKS: &str = "(no per-pod backup locks: LOCAL_BACKUP_DIR (./backup) is relative — set an absolute path to keep \
             other backups out during the switch)";
@@ -22552,6 +22586,40 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
             assert_eq!(split_cohort(&naming, Selected::all(vec![nameless])).1, ["id-x"]);
         }
 
+        /// The human (2026-10-19): fleet-wide = cohort pods only, with a way to take the others
+        /// too. `--include-non-cohort` parses on all four commands, and with it the selection
+        /// comes back whole and nothing is said; without it, the cohort's and the one line.
+        #[test]
+        fn include_non_cohort_takes_every_pod_and_says_nothing() {
+            let scope = |argv: &[&str]| -> CohortScope {
+                use clap::Parser;
+                let cli = Cli::try_parse_from(["arena", "pods"].iter().chain(argv).copied()).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+                match cli.cmd {
+                    Cmd::Pods(PodCmd::Backup { cohort, .. })
+                    | Cmd::Pods(PodCmd::Pull { cohort, .. })
+                    | Cmd::Pods(PodCmd::InitBranches { cohort, .. })
+                    | Cmd::Pods(PodCmd::SetBranch { cohort, .. }) => cohort,
+                    _ => panic!("{argv:?}: not a backup command"),
+                }
+            };
+            for argv in [&["backup"][..], &["pull"], &["init-branches"], &["set-branch", "main", "--all"]] {
+                assert!(!scope(argv).include_non_cohort, "{argv:?}: off by default");
+                let with = [argv, &["--include-non-cohort"]].concat();
+                assert!(scope(&with).include_non_cohort, "{with:?}");
+            }
+            let cfg = account_cfg("");
+            let every = || Selected::all(account().pods);
+            let _ = take_said();
+            let sel = cohort_only(&cfg, every(), CohortScope { include_non_cohort: true });
+            assert_eq!(names(&sel), names(&every()), "every pod, in order");
+            assert!(take_said().is_empty(), "nothing left out, nothing said");
+            let sel = cohort_only(&cfg, every(), CohortScope::default());
+            assert_eq!(names(&sel), ["devtest-apple", "devtest-bloom", "devtest-extra"]);
+            // (In fleet order here: `select` orders a real run's by list slot, as LEFT_OUT has it.)
+            let out = ["devtest-zebra", "staff-gpu", "quiet_blue_fox", "devtest2-apple"].map(String::from);
+            assert_eq!(take_said(), [non_cohort_line("devtest", &out).unwrap()]);
+        }
+
         #[test]
         fn the_left_out_pods_get_one_line() {
             let many: Vec<String> = (1..=8).map(|i| format!("box{i}")).collect();
@@ -22559,17 +22627,17 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
                 (&[], None),
                 (
                     &many[..1],
-                    Some("⊘ skipped 1 non-cohort pod (not devtest-…, or an @ staff entry): box1 — name one to include it"),
+                    Some("⊘ skipped 1 non-cohort pod (not devtest-…, or an @ staff entry): box1 — name one to include it, or pass --include-non-cohort"),
                 ),
                 (
                     &many[..2],
-                    Some("⊘ skipped 2 non-cohort pods (not devtest-…, or an @ staff entry): box1, box2 — name one to include it"),
+                    Some("⊘ skipped 2 non-cohort pods (not devtest-…, or an @ staff entry): box1, box2 — name one to include it, or pass --include-non-cohort"),
                 ),
                 (
                     &many,
                     Some(
                         "⊘ skipped 8 non-cohort pods (not devtest-…, or an @ staff entry): box1, box2, box3, box4, box5, box6 \
-                         (+2 more) — name one to include it",
+                         (+2 more) — name one to include it, or pass --include-non-cohort",
                     ),
                 ),
             ];
