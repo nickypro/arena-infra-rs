@@ -1933,9 +1933,9 @@ enum Kept {
 /// way, which copies the files first and then discards the uncommitted changes to tracked files,
 /// the operation with them. Pure.
 fn busy_not_switched(pod: &str, branch: &str, what: &str, on: &str, unmerged: bool) -> String {
-    use arena_core::backup::{busy_advice, busy_noun, busy_situation};
+    use arena_core::backup::{busy_advice, busy_noun, busy_situation, busy_switch_why};
     let noun = busy_noun(what);
-    let why = if what == "conflicts" { String::new() } else { format!(" (a switch now would end {noun})") };
+    let why = busy_switch_why(what).map_or_else(String::new, |w| format!(" ({w})"));
     format!(
         "✗ {pod} not switched to {branch}: {} — not committed or switched{why}; {} on the pod, then switch again. Or, \
          destructively: `arena pods set-branch {branch} {pod} --hard` copies its files first, then discards its uncommitted \
@@ -4670,6 +4670,17 @@ deep_check_end=1
                  them and `git add` them, or undo them (`git reset --merge`) on the pod, then switch again. Or, destructively: \
                  `arena pods set-branch w1d2 devtest-alpha --hard` copies its files first, then discards its uncommitted changes to \
                  tracked files (the unresolved conflicts with them)",
+                vec![BACKUP_TIMEOUT],
+            ),
+            // Review pr4: `git am` (HEAD attached) — a gentle switch would carry it onto the other
+            // branch, half-done, not end it.
+            (
+                "set-branch",
+                vec![FakeReply::exit(6, "").with_stdout("BRANCH autocommit-x\nBUSY autocommit-x am\n"), FakeReply::ok()],
+                "✗ devtest-alpha not switched to w1d2: a `git am` is in progress on autocommit-x — not committed or switched (a \
+                 switch now would carry the `git am`, half-done, onto the other branch); finish it (`git am --continue`) or abort it \
+                 (`git am --abort`) on the pod, then switch again. Or, destructively: `arena pods set-branch w1d2 devtest-alpha \
+                 --hard` copies its files first, then discards its uncommitted changes to tracked files (the `git am` with them)",
                 vec![BACKUP_TIMEOUT],
             ),
             (

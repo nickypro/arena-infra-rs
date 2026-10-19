@@ -19,11 +19,12 @@
 #   BIGSTUCK <bytes> <path>    a file over <push limit bytes> already in unpushed commits (exit 3)
 #   BIGSTUCK_BASE <sha>|none   what `git reset` to, to rewrite those commits without it
 #   BRANCH <branch>            the branch it backs up (before anything else, unless SKIP)
-#   BUSY <branch> <what> [unmerged]  an operation is in progress on it — <what> is merge, cherry-pick,
-#                              revert, or conflicts (unmerged paths with none of those: a `git stash pop`
-#                              that conflicted); `unmerged` after an operation while some of its conflicts
-#                              aren't resolved and added yet: nothing staged, committed or pushed, so it
-#                              stays resumable and abortable (exit 6)
+#   BUSY <branch> <what> [unmerged]  an operation is in progress on it — <what> is rebase, am, merge,
+#                              cherry-pick, revert, sequence (a multi-commit cherry-pick or revert paused
+#                              between commits), or conflicts (unmerged paths with none of those: a `git
+#                              stash pop` that conflicted); `unmerged` after an operation while some of its
+#                              conflicts aren't resolved and added yet: nothing staged, committed or
+#                              pushed, so it stays resumable and abortable (exit 6)
 #   REDACTED <n> <path>        a file committed with its n key(s) redacted; the file on disk keeps them
 #   REDACTED_HISTORY <n> <old> <new>  a key in older unpushed commits (an earlier backup's, or one the
 #                              participant made): those n commits rewritten redacted, pushed as a fast-forward
@@ -76,7 +77,9 @@ G=$(git rev-parse --absolute-git-dir)
 # merge, markers and all, then pushed), after which `git merge --abort` and the editor's conflict
 # view no longer work. So while one lasts nothing is staged, committed or pushed: the run says
 # what is in progress and stops (exit 6), the operation stays where the participant left it, and
-# the caller copies the pod by rsync instead. A rebase never gets here: it detaches HEAD (SKIP).
+# the caller copies the pod by rsync instead. So does a `git am` (HEAD attached, often nothing
+# unmerged: a patch that didn't apply) and a sequence paused between its commits. A rebase
+# detaches HEAD (SKIP), unless it kept HEAD attached.
 # (`busy_op` is defined above, before the SKIP.)
 W=$(busy_op "$G")
 if [ -n "$W" ]; then echo "BUSY $B $W"; exit 6; fi

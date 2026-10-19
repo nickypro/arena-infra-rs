@@ -256,29 +256,59 @@ pub fn redact_sed() -> String {
 pub const NO_BYPASS_URL_SH: &str = "no_bypass_url() { LC_ALL=C grep -viE 'https?://[^ ]*(unblock|bypass|secret-scanning)' || true; }";
 
 /// `busy_op <git dir>`, run from the checkout's top: what is in progress there that a commit or a
-/// branch switch would end — `merge`, `cherry-pick` or `revert` (its `*_HEAD` file), followed by
-/// ` unmerged` while the index still has unmerged paths (conflicts not yet resolved and added),
-/// else `conflicts` (unmerged paths and none of those: a `git stash pop` that conflicted) — or
-/// nothing. The `unmerged` word lets the words name conflicts only when there are some, and give
-/// the step git wants first (review F4: a merge whose conflicts are all staged, a clean `git merge
-/// --no-commit` or `git revert -n` has none; with some, `git commit` is refused until they're
-/// added). A rebase detaches HEAD, which the backup already skips. Shared by the backup script
+/// branch switch would end or break — the first of `rebase` (`rebase-merge/`, or `rebase-apply/`
+/// without `applying`), `am` (`rebase-apply/applying`: `git am`, which keeps HEAD attached),
+/// `merge`, `cherry-pick` or `revert` (its `*_HEAD` file), `sequence` (`sequencer/` alone: a
+/// multi-commit cherry-pick or revert paused between its commits, e.g. after one was resolved and
+/// committed by hand) — git's own tests for them (`wt-status.c`), in the order git checks them —
+/// followed by ` unmerged` while the index still has unmerged paths (conflicts not yet resolved
+/// and added), else `conflicts` (unmerged paths and none of those: a `git stash pop` that
+/// conflicted) — or nothing. Every path is under `<git dir>`, the worktree's own (`git rev-parse
+/// --absolute-git-dir`: in a linked worktree, `.git/worktrees/<name>`, where git keeps these). The
+/// `unmerged` word lets the words name conflicts only when there are some, and give the step git
+/// wants first (review F4: a merge whose conflicts are all staged, a clean `git merge --no-commit`
+/// or `git revert -n` has none; with some, `git commit` is refused until they're added). Review
+/// pr4: `git am` with a patch that didn't apply has no unmerged path and no `*_HEAD`, so the
+/// backup committed and pushed the participant's half-applied patch mid-`am`. A rebase detaches
+/// HEAD, so on a branch the backup commits only a rebase that kept HEAD attached meets this; on
+/// a detached HEAD it's said before the `SKIP` (`UNCOMMITTED`). Shared by the backup script
 /// (`BUSY`, [`BACKUP_BUSY_EXIT`]) and the switches that refuse to end one ([`checkout_command`]'s
 /// gentle switch, [`init_branch_command`]).
 pub const BUSY_OP_SH: &str = "busy_op() { if [ -n \"$(git ls-files -u | head -n 1)\" ]; then busy_u=' unmerged'; else busy_u=; fi; \
-     if [ -e \"$1/MERGE_HEAD\" ]; then echo \"merge$busy_u\"; elif [ -e \"$1/CHERRY_PICK_HEAD\" ]; then echo \"cherry-pick$busy_u\"; \
-     elif [ -e \"$1/REVERT_HEAD\" ]; then echo \"revert$busy_u\"; elif [ -n \"$busy_u\" ]; then echo conflicts; fi; }";
+     if [ -d \"$1/rebase-merge\" ]; then echo \"rebase$busy_u\"; \
+     elif [ -d \"$1/rebase-apply\" ]; then if [ -e \"$1/rebase-apply/applying\" ]; then echo \"am$busy_u\"; else echo \"rebase$busy_u\"; fi; \
+     elif [ -e \"$1/MERGE_HEAD\" ]; then echo \"merge$busy_u\"; elif [ -e \"$1/CHERRY_PICK_HEAD\" ]; then echo \"cherry-pick$busy_u\"; \
+     elif [ -e \"$1/REVERT_HEAD\" ]; then echo \"revert$busy_u\"; elif [ -d \"$1/sequencer\" ]; then echo \"sequence$busy_u\"; \
+     elif [ -n \"$busy_u\" ]; then echo conflicts; fi; }";
+
+/// Every word [`BUSY_OP_SH`] prints first: the operations, then `conflicts` (a `git stash pop`'s).
+pub const BUSY_WORDS: [&str; 7] = ["merge", "cherry-pick", "revert", "am", "rebase", "sequence", "conflicts"];
 
 /// Every line [`BUSY_OP_SH`] prints, as `(what, unmerged)`: each operation with its conflicts
 /// resolved or not, and `conflicts` (unmerged by definition).
-const BUSY_LINES: [(&str, bool); 7] =
-    [("merge", false), ("merge", true), ("cherry-pick", false), ("cherry-pick", true), ("revert", false), ("revert", true), ("conflicts", true)];
+const BUSY_LINES: [(&str, bool); 13] = [
+    ("merge", false),
+    ("merge", true),
+    ("cherry-pick", false),
+    ("cherry-pick", true),
+    ("revert", false),
+    ("revert", true),
+    ("am", false),
+    ("am", true),
+    ("rebase", false),
+    ("rebase", true),
+    ("sequence", false),
+    ("sequence", true),
+    ("conflicts", true),
+];
 
 /// What is in progress on `branch` (`what`: [`BUSY_OP_SH`]'s word), in words: "a merge is in
-/// progress on b", "b has unresolved conflicts".
+/// progress on b", "a `git am` is in progress on b", "b has unresolved conflicts".
 pub fn busy_situation(what: &str, branch: &str) -> String {
     match what {
-        "merge" | "cherry-pick" | "revert" => format!("a {what} is in progress on {branch}"),
+        "merge" | "cherry-pick" | "revert" | "rebase" => format!("a {what} is in progress on {branch}"),
+        "am" => format!("a `git am` is in progress on {branch}"),
+        "sequence" => format!("a cherry-pick or revert sequence is in progress on {branch}"),
         "conflicts" => format!("{branch} has unresolved conflicts"),
         _ => format!("a git operation ({what}) is in progress on {branch}"),
     }
@@ -289,40 +319,60 @@ pub fn busy_situation(what: &str, branch: &str) -> String {
 /// `--continue`) is refused until they're resolved and added (review F4), so that comes first.
 /// A merge: "finish it (`git commit`) or abort it (`git merge --abort`)", or with unmerged paths
 /// "resolve the conflicts and `git add` them, then `git commit` — or abort it (`git merge
-/// --abort`)". A `git stash pop`'s conflicts have nothing to commit or continue: resolve and add
-/// them, or undo them.
+/// --abort`)"; `git am`, a rebase: their own `--continue`/`--abort`. A sequence paused between its
+/// commits may be a cherry-pick's or a revert's (only `--continue` with the right one works), so
+/// both are named. A `git stash pop`'s conflicts have nothing to commit or continue: resolve and
+/// add them, or undo them.
 pub fn busy_advice(what: &str, unmerged: bool) -> String {
     let (finish, abort) = match what {
-        "merge" => ("git commit", "git merge --abort"),
-        "cherry-pick" => ("git cherry-pick --continue", "git cherry-pick --abort"),
-        "revert" => ("git revert --continue", "git revert --abort"),
+        "merge" => ("`git commit`", "`git merge --abort`"),
+        "cherry-pick" => ("`git cherry-pick --continue`", "`git cherry-pick --abort`"),
+        "revert" => ("`git revert --continue`", "`git revert --abort`"),
+        "am" => ("`git am --continue`", "`git am --abort`"),
+        "rebase" => ("`git rebase --continue`", "`git rebase --abort`"),
+        "sequence" => ("`git cherry-pick --continue`, or `git revert --continue` for a revert", "`git cherry-pick --abort`, or `git revert --abort`"),
         "conflicts" => return "resolve them and `git add` them, or undo them (`git reset --merge`)".to_string(),
         _ => return "finish it or abort it".to_string(),
     };
     if unmerged {
-        format!("resolve the conflicts and `git add` them, then `{finish}` — or abort it (`{abort}`)")
+        format!("resolve the conflicts and `git add` them, then {finish} — or abort it ({abort})")
     } else {
-        format!("finish it (`{finish}`) or abort it (`{abort}`)")
+        format!("finish it ({finish}) or abort it ({abort})")
     }
 }
 
-/// [`busy_situation`]'s operation as the object of a sentence: `the merge`, `the unresolved
-/// conflicts`.
+/// [`busy_situation`]'s operation as the object of a sentence: `the merge`, `the \`git am\``,
+/// `the sequence`, `the unresolved conflicts`.
 pub fn busy_noun(what: &str) -> String {
     match what {
         "conflicts" => "the unresolved conflicts".to_string(),
+        "am" => "the `git am`".to_string(),
         _ => format!("the {what}"),
+    }
+}
+
+/// Why a branch switch must not happen mid-operation, as the parenthesis of a refusal: a merge,
+/// cherry-pick or revert would be ended (its `*_HEAD` dropped); `git am`, a rebase or a paused
+/// sequence would be carried, half-done, onto the other branch (their state stays: a `--continue`
+/// there applies the rest onto it). `None` for a `git stash pop`'s conflicts: nothing to end.
+pub fn busy_switch_why(what: &str) -> Option<String> {
+    match what {
+        "conflicts" => None,
+        "am" | "rebase" | "sequence" => Some(format!("a switch now would carry {}, half-done, onto the other branch", busy_noun(what))),
+        _ => Some(format!("a switch now would end {}", busy_noun(what))),
     }
 }
 
 /// What a backup's commit would do now, mid-operation: commit the operation's state — its
 /// conflicts named only when there are unmerged paths (a merge with its conflicts staged, a clean
-/// `git revert -n`, has no conflict markers to commit: review F4) — and end it.
+/// `git revert -n`, has no conflict markers to commit: review F4) — and end it; for `git am`, a
+/// rebase or a sequence, commit what is there in the middle of it.
 fn busy_would(what: &str, unmerged: bool) -> String {
+    let conflicts = if unmerged { ", unresolved conflicts and all," } else { "" };
     match what {
         "conflicts" => "a backup now would commit the conflicted files as they are".to_string(),
-        _ if unmerged => format!("a backup now would commit the {what}'s state, unresolved conflicts and all, and end {}", busy_noun(what)),
-        _ => format!("a backup now would commit the {what}'s state and end {}", busy_noun(what)),
+        "am" | "rebase" | "sequence" => format!("a backup now would commit what is there{conflicts} in the middle of {}", busy_noun(what)),
+        _ => format!("a backup now would commit the {what}'s state{conflicts} and end {}", busy_noun(what)),
     }
 }
 
@@ -332,13 +382,14 @@ fn busy_would(what: &str, unmerged: bool) -> String {
 /// anything is touched. Checked with real git, mid-merge: `git checkout -b` (init-branches)
 /// succeeds and drops `MERGE_HEAD`, leaving the conflicted index on the new branch with no merge to
 /// abort; a gentle `git checkout` refuses unmerged paths but silently ends a merge whose conflicts
-/// are resolved and staged, carrying them onto the other branch. `--hard` doesn't run this: it
+/// are resolved and staged, carrying them onto the other branch. Mid-`git am` (a patch that didn't
+/// apply) a gentle checkout goes through and takes the `am` along. `--hard` doesn't run this: it
 /// discards uncommitted changes to tracked files by design, the operation with them.
 fn busy_refusal_sh(who: &str) -> String {
     let cases: String = BUSY_LINES
         .iter()
         .map(|&(what, unmerged)| {
-            let why = if what == "conflicts" { String::new() } else { format!(" (a switch now would end {})", busy_noun(what)) };
+            let why = busy_switch_why(what).map_or_else(String::new, |w| format!(" ({w})"));
             let msg = format!(
                 "{who}: {} — not switched{why}; {} on the pod, then switch again",
                 busy_situation(what, "@BRANCH@"),
@@ -853,8 +904,13 @@ pub fn init_branch_command(cfg: &BackupConfig, machine_name: &str) -> String {
 /// diverged/dirty tree makes the `--ff-only` pull fail loudly rather than clobbering
 /// work. `hard == true`: **destructive** — fetch, then force the local branch to exactly
 /// match `origin/<branch>` (`checkout -f -B … origin/<branch>` + `reset --hard`),
-/// **discarding any local commits/changes on it** (untracked files are left in place).
-/// Used by `pods set-branch [--hard]` (e.g. reset everyone back to `main`).
+/// **discarding any local commits/changes on it** (untracked files are left in place). A `git
+/// am`, rebase or paused cherry-pick/revert sequence it switches away from would outlive the reset
+/// (git keeps their state across a checkout) and stop every later switch and backup as `BUSY`,
+/// and a `git rebase --abort` would then take the pod back off the branch: once switched, `--hard`
+/// ends them as it ends a merge (`--quit`: their state only — the stash a rebase's `--autostash`
+/// made is kept in the stash list). Used by `pods set-branch [--hard]` (e.g. reset everyone back
+/// to `main`).
 ///
 /// A nested clone the backup adopted (its files tracked by the course repo) is tracked on the
 /// autocommit branches only — the course's `main` doesn't have it — so switching to such a
@@ -902,8 +958,13 @@ pub fn checkout_command(repo_path: &str, branch: &str, git_ssh_key: Option<&str>
     parts.push("OLD=$(git rev-parse -q --verify HEAD) || OLD=".into());
     let switch = if hard {
         let remote_ref = shell_quote(&format!("origin/{branch}"));
-        // Force-switch to the branch reset to origin (discards local changes/commits on it).
-        format!("git checkout -f -B {} {remote_ref} && git reset --hard {remote_ref}", shell_quote(branch))
+        // Force-switch to the branch reset to origin (discards local changes/commits on it), then
+        // end any `git am`, rebase or sequence the switch left behind (their state only).
+        format!(
+            "git checkout -f -B {} {remote_ref} && git reset --hard {remote_ref} && {{ git rebase --quit >/dev/null 2>&1; \
+             git am --quit >/dev/null 2>&1; git cherry-pick --quit >/dev/null 2>&1; true; }}",
+            shell_quote(branch)
+        )
     } else {
         // `checkout.defaultRemote`: with an `upstream` remote too (the course repo, whose branch
         // names the cohort's copy shares), a plain checkout of a branch both have refused as
@@ -2826,11 +2887,58 @@ done
                 "b has unresolved conflicts — not committed (a backup now would commit the conflicted files as they are); resolve \
                  them and `git add` them, or undo them (`git reset --merge`) on the pod",
             ),
+            // Review pr4: `git am`, a rebase that kept HEAD attached, a sequence paused between
+            // its commits — each with its own way out (a sequence's may be a cherry-pick's or a
+            // revert's).
+            (
+                "BUSY b am",
+                "a `git am` is in progress on b — not committed (a backup now would commit what is there in the middle of the `git \
+                 am`); finish it (`git am --continue`) or abort it (`git am --abort`) on the pod",
+            ),
+            (
+                "BUSY b am unmerged",
+                "a `git am` is in progress on b — not committed (a backup now would commit what is there, unresolved conflicts and \
+                 all, in the middle of the `git am`); resolve the conflicts and `git add` them, then `git am --continue` — or abort \
+                 it (`git am --abort`) on the pod",
+            ),
+            (
+                "BUSY b rebase",
+                "a rebase is in progress on b — not committed (a backup now would commit what is there in the middle of the \
+                 rebase); finish it (`git rebase --continue`) or abort it (`git rebase --abort`) on the pod",
+            ),
+            (
+                "BUSY b rebase unmerged",
+                "a rebase is in progress on b — not committed (a backup now would commit what is there, unresolved conflicts and \
+                 all, in the middle of the rebase); resolve the conflicts and `git add` them, then `git rebase --continue` — or \
+                 abort it (`git rebase --abort`) on the pod",
+            ),
+            (
+                "BUSY b sequence",
+                "a cherry-pick or revert sequence is in progress on b — not committed (a backup now would commit what is there in \
+                 the middle of the sequence); finish it (`git cherry-pick --continue`, or `git revert --continue` for a revert) or \
+                 abort it (`git cherry-pick --abort`, or `git revert --abort`) on the pod",
+            ),
+            (
+                "BUSY b sequence unmerged",
+                "a cherry-pick or revert sequence is in progress on b — not committed (a backup now would commit what is there, \
+                 unresolved conflicts and all, in the middle of the sequence); resolve the conflicts and `git add` them, then `git \
+                 cherry-pick --continue`, or `git revert --continue` for a revert — or abort it (`git cherry-pick --abort`, or `git \
+                 revert --abort`) on the pod",
+            ),
         ];
         for (line, want) in cases {
             let r = parse_backup_report(&format!("BRANCH b\n{line}\n"));
             assert_eq!(r.failure("/r", "p", code).unwrap(), *want, "{line}");
             assert!(!r.failure("/r", "p", code).unwrap().contains("conflict markers"), "{line}");
+        }
+        // Every word the script prints has its own words — none falls back to the generic ones —
+        // and every line it can print is a case of the switches' refusal.
+        assert_eq!(cases.len(), BUSY_LINES.len());
+        for what in BUSY_WORDS {
+            assert!(!busy_situation(what, "b").contains("git operation (") && busy_advice(what, false) != "finish it or abort it", "{what}");
+            assert!(BUSY_LINES.iter().any(|(w, _)| *w == what), "{what}");
+            let printed = if what == "conflicts" { "BUSY b conflicts".to_string() } else { format!("BUSY b {what}") };
+            assert!(cases.iter().any(|(l, _)| *l == printed), "{what}");
         }
         // A conflicts line is unmerged by definition; an unknown word after the operation isn't.
         assert!(parse_backup_report("BUSY b conflicts\n").unmerged);
@@ -3088,6 +3196,11 @@ done
         // On a branch it skips, the work there is only said, read-only, before the SKIP.
         let skip = &s[s.find("if [ \"$B\" = main ]").unwrap()..s.find("echo \"SKIP $B\"").unwrap()];
         assert!(skip.contains("echo \"UNCOMMITTED $B $W\"") && skip.contains("git --no-optional-locks diff --quiet HEAD --"), "{skip}");
+        // The --hard switch ends a `git am`, rebase or sequence once it has switched; gentle never does.
+        let hard = checkout_command("/r", "main", None, true);
+        let quits = hard.find("git rebase --quit").expect("quit");
+        assert!(hard.find("git reset --hard").unwrap() < quits && hard.contains("git am --quit") && hard.contains("git cherry-pick --quit"));
+        assert!(!checkout_command("/r", "main", None, false).contains("--quit"));
         for write in ["git add", "update-index", "git commit", "git push", "git stash", "git reset"] {
             assert!(!skip.contains(write), "{write}");
         }
@@ -3138,5 +3251,126 @@ done
             parse_backup_report("UNCOMMITTED HEAD conflicts\nSKIP HEAD\n").uncommitted_why().unwrap(),
             "a detached HEAD has unresolved conflicts — no backup commits on a detached HEAD"
         );
+    }
+
+    /// Review pr4: `git am` keeps HEAD attached, and a patch that doesn't apply leaves no unmerged
+    /// path and no `*_HEAD` — only `rebase-apply/` — so the backup committed and pushed what the
+    /// participant had half-applied by hand, mid-`am`; a rebase (`rebase-merge/`) and a cherry-pick
+    /// sequence paused between its commits (`sequencer/` alone, one conflict resolved and committed
+    /// by hand) went unseen too. Now each is `BUSY` on a branch the backup commits (`am`,
+    /// `sequence`) and said before the SKIP elsewhere (`UNCOMMITTED HEAD rebase …`): nothing
+    /// staged, committed or pushed; the gentle switch and init-branches refuse it, its own way out
+    /// named; `--hard` switches and ends it, so the init and the backup after it go on; and the way
+    /// out each names works.
+    #[cfg(unix)]
+    #[test]
+    fn a_git_am_a_rebase_or_a_paused_sequence_is_never_committed_or_switched_away_from() {
+        let s = GitSandbox::new("busy-am", 1_000_000);
+        let repo = s.work.to_str().unwrap();
+        let cfg = BackupConfig { repo_path: repo.into(), prefix: "devtest".into(), week: 1, day: 2, git_ssh_key: None, origin: None };
+        let origin_ref = || s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "rev-parse", "refs/heads/autocommit-x"]);
+        let state = || (s.git(&s.work, &["rev-parse", "HEAD"]), s.git(&s.work, &["status", "--porcelain"]));
+        let refused = |cmd: &str, want: &str| {
+            let before = state();
+            let o = s.run(cmd);
+            assert_eq!((o.status.code(), String::from_utf8_lossy(&o.stderr).into_owned()), (Some(BACKUP_BUSY_EXIT), want.to_string()));
+            assert_eq!(state(), before, "{want}: nothing touched");
+        };
+        // A patch of README.md from a side branch, and three commits to cherry-pick (the first conflicting).
+        s.git(&s.work, &["checkout", "-q", "-b", "side", "main"]);
+        std::fs::write(s.work.join("README.md"), "the side branch's version\n").unwrap();
+        s.git(&s.work, &["commit", "-q", "-am", "side"]);
+        let patches = s.base.join("patches");
+        s.git(&s.work, &["format-patch", "-q", "-1", "-o", patches.to_str().unwrap()]);
+        let patch = std::fs::read_dir(&patches).unwrap().next().unwrap().unwrap().path();
+        for f in ["x.py", "y.py"] {
+            s.put(f, 3);
+            s.git(&s.work, &["add", f]);
+            s.git(&s.work, &["commit", "-q", "-m", f]);
+        }
+        s.git(&s.work, &["checkout", "-q", "autocommit-x"]);
+        std::fs::write(s.work.join("README.md"), "the participant's version\n").unwrap();
+        s.git(&s.work, &["commit", "-q", "-am", "mine"]);
+        assert_eq!(s.backup().1.outcome, Some((BACKUP_PUSHED, "autocommit-x".into())));
+
+        // `git am`: the patch doesn't apply; the participant applies it by hand, half-way.
+        let (code, said) = git_failing(&s.work, &["am", patch.to_str().unwrap()]);
+        assert_ne!(code, Some(0), "{said}");
+        assert!(s.work.join(".git/rebase-apply/applying").exists() && s.git(&s.work, &["ls-files", "-u"]).is_empty());
+        assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "autocommit-x", "HEAD attached");
+        std::fs::write(s.work.join("README.md"), "half-applied by hand\n").unwrap();
+        let (before, pushed) = (state(), origin_ref());
+        let (code, out, err) = s.backup_raw();
+        assert_eq!((code, out.as_str()), (Some(BACKUP_BUSY_EXIT), "BRANCH autocommit-x\nBUSY autocommit-x am\n"), "{err}");
+        assert_eq!((state(), origin_ref()), (before, pushed), "nothing staged, committed or pushed");
+        assert_eq!(
+            parse_backup_report(&out).failure("/r", "p", code).unwrap(),
+            "a `git am` is in progress on autocommit-x — not committed (a backup now would commit what is there in the middle of \
+             the `git am`); finish it (`git am --continue`) or abort it (`git am --abort`) on the pod"
+        );
+        // git's own checkout takes the `am` along to the other branch; the switches refuse.
+        let am = "a `git am` is in progress on autocommit-x — not switched (a switch now would carry the `git am`, half-done, onto \
+                  the other branch); finish it (`git am --continue`) or abort it (`git am --abort`) on the pod, then switch again\n";
+        refused(&checkout_command(repo, "main", None, false), &format!("arena set-branch: {am}"));
+        refused(&init_branch_command(&cfg, "devtest-x"), &format!("arena init-branches: {am}"));
+        assert!(s.work.join(".git/rebase-apply").exists());
+        // Its way out works; the next backup goes on.
+        s.git(&s.work, &["am", "--abort"]);
+        assert!(!s.work.join(".git/rebase-apply").exists());
+        // (`am --abort` keeps an edit made since: the backup commits it, now the `am` is over.)
+        assert_eq!(s.read("README.md"), b"half-applied by hand\n");
+        assert_eq!(s.backup().1.outcome, Some((BACKUP_PUSHED, "autocommit-x".into())));
+
+        // A cherry-pick of three commits: the first conflicts (`cherry-pick unmerged`); resolved and
+        // committed by hand, two still to come: only `sequencer/` is left (`sequence`).
+        let (code, said) = git_failing(&s.work, &["cherry-pick", "main..side"]);
+        assert_ne!(code, Some(0), "{said}");
+        let (code, out, _) = s.backup_raw();
+        assert_eq!((code, out.as_str()), (Some(BACKUP_BUSY_EXIT), "BRANCH autocommit-x\nBUSY autocommit-x cherry-pick unmerged\n"));
+        std::fs::write(s.work.join("README.md"), "resolved\n").unwrap();
+        s.git(&s.work, &["add", "README.md"]);
+        s.git(&s.work, &["commit", "-q", "--no-edit"]);
+        assert!(s.work.join(".git/sequencer").is_dir() && !s.work.join(".git/CHERRY_PICK_HEAD").exists());
+        let (before, pushed) = (state(), origin_ref());
+        let (code, out, _) = s.backup_raw();
+        assert_eq!((code, out.as_str()), (Some(BACKUP_BUSY_EXIT), "BRANCH autocommit-x\nBUSY autocommit-x sequence\n"));
+        assert_eq!((state(), origin_ref()), (before, pushed), "the commit made by hand isn't pushed mid-sequence either");
+        refused(
+            &init_branch_command(&cfg, "devtest-x"),
+            "arena init-branches: a cherry-pick or revert sequence is in progress on autocommit-x — not switched (a switch now \
+             would carry the sequence, half-done, onto the other branch); finish it (`git cherry-pick --continue`, or `git revert \
+             --continue` for a revert) or abort it (`git cherry-pick --abort`, or `git revert --abort`) on the pod, then switch \
+             again\n",
+        );
+        s.git(&s.work, &["-c", "core.editor=true", "cherry-pick", "--continue"]);
+        assert!(!s.work.join(".git/sequencer").exists());
+        assert_eq!(s.backup().1.outcome, Some((BACKUP_PUSHED, "autocommit-x".into())), "finished: backed up");
+        let pushed: Vec<String> = s.origin_tree("autocommit-x").into_iter().map(|(_, p)| p).collect();
+        assert!(pushed.contains(&"x.py".to_string()) && pushed.contains(&"y.py".to_string()), "{pushed:?}");
+
+        // A rebase detaches HEAD: said before the SKIP; --hard switches and ends it, and the init goes on.
+        let (code, said) = git_failing(&s.work, &["rebase", "side"]);
+        assert_ne!(code, Some(0), "{said}");
+        assert!(s.work.join(".git/rebase-merge").is_dir());
+        let (code, out, _) = s.backup_raw();
+        assert_eq!((code, out.as_str()), (Some(0), "UNCOMMITTED HEAD rebase unmerged\nSKIP HEAD\n"));
+        let o = s.run(&checkout_command(repo, "main", None, true));
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+        assert!(!s.work.join(".git/rebase-merge").exists(), "ended with the switch");
+        assert_eq!(s.backup_raw().1, "SKIP main\n");
+
+        // `git am` on main: said before the SKIP; --hard ends it too, and init-branches goes on.
+        std::fs::write(s.work.join("README.md"), "edited on main\n").unwrap();
+        s.git(&s.work, &["commit", "-q", "-am", "main edit"]);
+        git_failing(&s.work, &["am", patch.to_str().unwrap()]);
+        assert_eq!(s.backup_raw().1, "UNCOMMITTED main am\nSKIP main\n");
+        let o = s.run(&checkout_command(repo, "main", None, true));
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert!(!s.work.join(".git/rebase-apply").exists(), "ended with the switch");
+        assert_eq!(s.backup_raw().1, "SKIP main\n");
+        let o = s.run(&init_branch_command(&cfg, "devtest-x"));
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), cfg.branch_for("devtest-x"));
     }
 }

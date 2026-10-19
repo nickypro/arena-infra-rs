@@ -8507,8 +8507,8 @@ fn push_first_note(cfg: &Config, hard: bool) -> String {
     let mut note = format!(
         "(first, each pod's current branch is backed up — the `pods backup --no-pull` commit + push, keys redacted{under_lock}; \
          a pod whose push fails is copied into {dir} and then switched, its line saying so; a pod with a merge (cherry-pick, \
-         revert, conflicts) in progress can't be committed: it is copied into {dir} too, and {busy}; a pod that can be neither \
-         pushed nor copied{or_busy} is NOT switched{origin})",
+         revert, `git am`, rebase, conflicts) in progress can't be committed: it is copied into {dir} too, and {busy}; a pod that \
+         can be neither pushed nor copied{or_busy} is NOT switched{origin})",
         dir = local_backup_dir(cfg)
     );
     if let Some(line) = unlocked {
@@ -23237,8 +23237,9 @@ mod remote_tests {
         let gentle = push_first_note(&cfg(), false);
         assert!(
             gentle.contains(
-                "; a pod with a merge (cherry-pick, revert, conflicts) in progress can't be committed: it is copied into ./backup \
-                 too, and then NOT switched: the switch refuses to end it; a pod that can be neither pushed nor copied"
+                "; a pod with a merge (cherry-pick, revert, `git am`, rebase, conflicts) in progress can't be committed: it is \
+                 copied into ./backup too, and then NOT switched: the switch refuses to end it; a pod that can be neither pushed \
+                 nor copied"
             ),
             "{gentle}"
         );

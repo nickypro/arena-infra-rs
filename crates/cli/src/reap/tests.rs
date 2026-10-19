@@ -1027,6 +1027,13 @@ async fn a_merge_in_progress_holds_the_reap_and_says_so() {
             "a cherry-pick is in progress on autocommit-x — not reaped until it's finished or aborted; on the pod: finish it (`git \
              cherry-pick --continue`) or abort it (`git cherry-pick --abort`); retried in 6h",
         ),
+        // Review pr4: `git am` (and a rebase, a paused sequence) is one of the fixed words too.
+        (
+            "busy-am",
+            "BUSY autocommit-x am\n",
+            "a `git am` is in progress on autocommit-x — not reaped until it's finished or aborted; on the pod: finish it (`git \
+             am --continue`) or abort it (`git am --abort`); retried in 6h",
+        ),
         (
             "busy-conflicts",
             "BUSY $(reboot)\u{1b}[2J conflicts\n",

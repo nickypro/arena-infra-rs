@@ -80,7 +80,7 @@ impl GitBusy {
     /// its own exit and one of the fixed words — anything else stays the generic "git backup
     /// failed".
     pub fn of(report: &crate::backup::BackupReport, code: i32) -> Option<GitBusy> {
-        let what = report.in_progress(Some(code)).filter(|w| matches!(*w, "merge" | "cherry-pick" | "revert" | "conflicts"))?;
+        let what = report.in_progress(Some(code)).filter(|w| crate::backup::BUSY_WORDS.contains(w))?;
         Some(GitBusy { what: what.to_string(), branch: report.branch.clone().unwrap_or_default(), unmerged: report.unmerged })
     }
 

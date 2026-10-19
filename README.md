@@ -649,7 +649,10 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `init-branches` don't switch it, and the reaper doesn't reap it until `pods setup`. No
     configured repo: no check. **A branch with an operation in progress** — a participant
     mid-way through a conflicted `git pull upstream main` (a merge), a cherry-pick or a revert,
-    or with the conflicts a `git stash pop` left — is left exactly as it is (review R3: the
+    a `git am` (HEAD attached; a patch that didn't apply leaves no conflict at all), a rebase that
+    kept HEAD attached, a multi-commit cherry-pick or revert paused between its commits (git's
+    `sequencer/` alone, once one was resolved and committed by hand), or with the conflicts a `git
+    stash pop` left — is left exactly as it is (review R3: the
     backup committed the conflict markers as a merge commit and pushed it, after which `git
     merge --abort` and VS Code's conflict view no longer worked): nothing staged, committed or
     pushed (`BUSY`, exit 6), `✗ <pod>: a merge is in progress on <branch> — not committed (a
@@ -658,15 +661,18 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     --abort\`) on the pod`. Conflicts are named only while some are unresolved (git refuses the
     commit until they're added); with none left (all resolved and added, or a clean `git merge
     --no-commit` / `git revert -n`) it's `… commit the merge's state and end the merge); finish it
-    (\`git commit\`) or abort it (\`git merge --abort\`)`. A cherry-pick or a revert gets its own
-    `--continue`/`--abort`; a `git stash pop`'s conflicts `resolve them and \`git add\` them, or
+    (\`git commit\`) or abort it (\`git merge --abort\`)`. A cherry-pick, a revert, a `git am`
+    (`BUSY <branch> am`) and a rebase each get their own `--continue`/`--abort`; a paused sequence
+    (`sequence`) names both `git cherry-pick --continue` and `git revert --continue`, since only
+    the right one works; a `git stash pop`'s conflicts `resolve them and \`git add\` them, or
     undo them (\`git reset --merge\`)`. The run fails.
     It is rsynced like a failed push, even under `--no-pull`, every run until it's ended (the
     reaper doesn't reap it meanwhile: its git step fails, retried every 6 h, and the run's table
     and its notification say `a merge is in progress on <branch> — not reaped until it's finished
     or aborted` with how to end it, while `reap log` and `reap status` keep their fixed words:
     `git_failed`, `backoff_after_failure`); the backup after that commits as always. A rebase detaches
-    HEAD, so it is skipped like `main`.
+    HEAD, so it is skipped like `main` — and said (`UNCOMMITTED HEAD rebase`), so `set-branch
+    --hard` copies it first.
   - `pods set-branch <branch> <targets|--all> [--hard] [--init-branches]` — switch pods'
     ARENA checkout to a branch. Gentle by default (fetch + checkout + ff-only pull — fails on a diverged/dirty
     tree rather than clobbering work). **`--hard` is destructive**: force the branch to
@@ -695,7 +701,10 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     the pod, then switch again`, exit 6 — git's own checkout would drop a merge whose conflicts
     are staged; the TUI's set-branch says the same, naming `--hard` as the destructive way), and
     `--hard` ends it, discarding its uncommitted changes to tracked files (untracked files stay),
-    its line saying only the copy has them. On `main`/`master` (or a detached HEAD) no backup
+    its line saying only the copy has them (a `git am`, rebase or paused sequence too: git keeps
+    their state across a checkout, so once switched `--hard` quits it — its state only — rather
+    than let it stop the next init and every backup, or a later `git rebase --abort` take the pod
+    back off `main`). On `main`/`master` (or a detached HEAD) no backup
     commits: the backup there only says what a reset would discard — a merge in progress, or
     changes to tracked files — and **`--hard` copies such a pod first** too (`⚠ NOT COMMITTED
     FIRST: main has uncommitted changes to tracked files, and no backup commits on main; …`),
@@ -714,10 +723,12 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     upstream **without committing** (legacy `init_branches`), so a new day's branch
     exists before `backup` runs. `--week`/`--day` override; `--dry-run` previews. 2-min
     budget per pod. A pod still on another branch has it backed up first, as `set-branch` does
-    (and isn't switched if it can be neither pushed nor copied). A pod with a merge (cherry-pick,
-    revert, conflicts) in progress is refused, touching nothing (`arena init-branches: a merge
-    is in progress on <branch> — not switched …`, exit 6): `git checkout -b` would drop the
-    merge and carry its conflicts onto the new branch, with nothing left to abort. No targets =
+    (and isn't switched if it can be neither pushed nor copied). A pod with an operation in
+    progress (a merge, cherry-pick, revert, `git am`, rebase, paused sequence, conflicts) is
+    refused, touching nothing (`arena init-branches: a merge is in progress on <branch> — not
+    switched …`, exit 6): `git checkout -b` would drop the merge and carry its conflicts onto the
+    new branch, with nothing left to abort — and carry a `git am`, rebase or sequence onto it
+    half-done. No targets =
     this cohort's pods, as for `backup`.
   - `pods run [-t <targets>] [--timeout <secs>] <cmd>` / `pods test [targets]` — run an
     arbitrary command on every (selected) pod (concurrent, confirms first naming the pods;
