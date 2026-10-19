@@ -3209,8 +3209,9 @@ done
         assert!(!s.contains("@ARENA_BUSY_OP_SH@") && s.matches(BUSY_OP_SH).count() == 1);
         let check = s.find("W=$(busy_op \"$G\")").expect("the check");
         assert!(s.find("echo \"SKIP $B\"").unwrap() < check && s.find("G=$(git rev-parse --absolute-git-dir)").unwrap() < check);
+        let branch = s.find("echo \"BRANCH $B\"").unwrap();
         for later in ["update-index", "git add -A", "git rm -q --cached", "git commit", "git push"] {
-            assert!(check < s.find(later).unwrap(), "{later}");
+            assert!(check < branch + s[branch..].find(later).unwrap(), "{later}");
         }
         assert!(s.contains("echo \"BUSY $B $W\"; exit 6"));
         // The gentle switch and init-branches check it too, first; --hard doesn't.
@@ -3221,7 +3222,13 @@ done
         assert!(init.find("busy_op").unwrap() < init.find("git checkout -b").unwrap());
         // On a branch it skips, the work there is only said, read-only, before the SKIP.
         let skip = &s[s.find("if [ \"$B\" = main ]").unwrap()..s.find("echo \"SKIP $B\"").unwrap()];
-        assert!(skip.contains("echo \"UNCOMMITTED $B $W\"") && skip.contains("git --no-optional-locks diff --quiet HEAD --"), "{skip}");
+        assert!(skip.contains("echo \"UNCOMMITTED $B $W\"") && skip.contains("tracked_changed \"$GD\""), "{skip}");
+        // Changes to tracked files: through a copy of the index, never the participant's (claude #9).
+        let tracked = &s[s.find("tracked_changed() {").unwrap()..s.find("if [ \"$B\" = main ]").unwrap()];
+        assert!(tracked.contains("cp \"$1/index\" \"$_ti\"") && tracked.contains("rm -f \"$_ti\" \"$_ti.lock\""), "{tracked}");
+        for plumbing in ["git update-index -q --refresh", "git diff-index --quiet HEAD --"] {
+            assert!(tracked.contains(&format!("GIT_INDEX_FILE=\"$_ti\" {plumbing}")), "{plumbing}");
+        }
         // Commits no remote has, untracked files (review pr4): read-only too.
         assert!(skip.contains("git --no-optional-locks rev-list -n1 HEAD --not --remotes"), "{skip}");
         assert!(skip.contains("git --no-optional-locks ls-files --others --exclude-standard"), "{skip}");
@@ -3471,5 +3478,45 @@ done
         let o = s.run(&init_branch_command(&cfg, "devtest-x"));
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
         assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), cfg.branch_for("devtest-x"));
+    }
+
+    /// Review ai-review claude #9: on main the check for changes to tracked files was the porcelain
+    /// diff under `--no-optional-locks`. Now it is plumbing, as the review asked, on a copy of the
+    /// index — refreshed there, `diff-index` there, removed after — so the participant's index,
+    /// its bytes and its mtime, is never written; a file whose stat changed but not its content is
+    /// no change (the refresh sees that: without it `diff-index` reads it as changed); a real one,
+    /// in the tree or staged, still is.
+    #[cfg(unix)]
+    #[test]
+    fn the_main_check_compares_through_a_copy_of_the_index_and_never_writes_it() {
+        let s = GitSandbox::new("main-index", 1_000_000);
+        s.git(&s.work, &["checkout", "-q", "main"]);
+        let index = s.work.join(".git/index");
+        let snap = || (std::fs::read(&index).unwrap(), std::fs::metadata(&index).unwrap().modified().unwrap());
+        let touch = |rel: &str| {
+            let f = std::fs::File::options().write(true).open(s.work.join(rel)).unwrap();
+            f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000)).unwrap();
+        };
+        let ours = || std::fs::read_dir(s.work.join(".git")).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with("arena-backup")).count();
+        let check = |want: &str| {
+            let before = snap();
+            let (code, out, err) = s.backup_raw();
+            assert_eq!((code, out.as_str()), (Some(0), want), "{err}");
+            assert_eq!(snap(), before, "{want}: the participant's index never written");
+            assert_eq!(ours(), 0, "{want}: the copy is gone");
+        };
+        check("SKIP main\n");
+        // Touched: its stat changed, not its content — no change.
+        touch("README.md");
+        check("SKIP main\n");
+        // Its content changed (the same size, the same old mtime): a change.
+        std::fs::write(s.work.join("README.md"), b"XXXXX").unwrap();
+        touch("README.md");
+        check("UNCOMMITTED main changes\nSKIP main\n");
+        // Staged, the tree as staged: still a change against HEAD.
+        s.git(&s.work, &["add", "README.md"]);
+        check("UNCOMMITTED main changes\nSKIP main\n");
+        s.git(&s.work, &["reset", "-q", "--hard"]);
+        check("SKIP main\n");
     }
 }

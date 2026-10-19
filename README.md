@@ -706,8 +706,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     checkout, so once switched `--hard` quits it — its state only — rather than let it stop the
     next init and every backup, or a later `git rebase --abort` take the pod back off `main`). On
     `main`/`master` (or a detached HEAD) no backup commits or pushes: the backup there only says
-    what a reset could discard — the first of an operation in progress, changes to tracked files,
-    commits no remote has, untracked files git doesn't ignore — and **`--hard` copies such a pod
+    what a reset could discard — the first of an operation in progress, changes to tracked files
+    (compared through a copy of the index, so the participant's own is never written), commits no
+    remote has, untracked files git doesn't ignore — and **`--hard` copies such a pod
     first** too, `.git` and all (`⚠ NOT COMMITTED FIRST: main has uncommitted changes to tracked
     files, and no backup commits on main; …`, `⚠ NOT PUSHED FIRST: main has commits no remote has,
     and no backup pushes main; … that copy has its .git, those commits with it; …`), never

@@ -55,6 +55,25 @@ fi
 # Stay on the current branch; never push a protected/detached one.
 B=$(git rev-parse --abbrev-ref HEAD)
 # @ARENA_BUSY_OP_SH@
+# `tracked_changed <git dir>`: whether any tracked file differs from HEAD (staged or not), with the
+# participant's index never written — not even its stat cache (review ai-review claude #9). The
+# check runs on a copy of the index: `update-index --refresh` brings the copy's stat data up to date
+# (a file whose stat changed but whose content didn't — after a restore, an rsync, a `touch` — is
+# hashed and then reads as clean), and `diff-index` then compares HEAD with the work tree through
+# it. Plumbing alone, so no porcelain refresh and no index.lock of ours. The copy is gone after,
+# its refresh with it: such a file is hashed again next run, until the participant's own git
+# refreshes their index (an editor's `git status` does, often). Without an index to copy, the
+# porcelain diff, read-only.
+tracked_changed() {
+    _ti="$1/arena-backup.$$.index"
+    if cp "$1/index" "$_ti" 2>/dev/null; then
+        GIT_INDEX_FILE="$_ti" git update-index -q --refresh >/dev/null 2>&1 || true
+        if GIT_INDEX_FILE="$_ti" git diff-index --quiet HEAD -- 2>/dev/null; then _tc=1; else _tc=0; fi
+        rm -f "$_ti" "$_ti.lock"
+        return "$_tc"
+    fi
+    ! git --no-optional-locks diff --quiet HEAD -- 2>/dev/null
+}
 if [ "$B" = main ] || [ "$B" = master ] || [ "$B" = HEAD ]; then
     # No backup commits or pushes here, so the work a `set-branch --hard` could discard is said
     # first, and it copies the pod — .git and all — before resetting it (review fb2 F3). The first
@@ -63,10 +82,12 @@ if [ "$B" = main ] || [ "$B" = master ] || [ "$B" = HEAD ]; then
     # untracked files git doesn't ignore (review pr4: --hard overwrites one wherever the branch it
     # resets to tracks the same path, and which branch that is, or what origin's copy of it holds
     # since the switch's own fetch, nothing here knows — so any counts). A nested repo (listed as
-    # `dir/`) doesn't: the image ships clones like that, and the switch leaves them be. Read-only:
-    # no optional locks, so the participant's own git never meets an index.lock of ours.
-    W=$(busy_op "$(git rev-parse --absolute-git-dir)")
-    if [ -z "$W" ] && ! git --no-optional-locks diff --quiet HEAD -- 2>/dev/null; then W=changes; fi
+    # `dir/`) doesn't: the image ships clones like that, and the switch leaves them be. Read-only
+    # for the participant's git: no optional locks, the tracked files compared through a copy of
+    # the index (`tracked_changed`), so their own git never meets an index.lock of ours.
+    GD=$(git rev-parse --absolute-git-dir)
+    W=$(busy_op "$GD")
+    if [ -z "$W" ] && tracked_changed "$GD"; then W=changes; fi
     if [ -z "$W" ] && [ -n "$(git --no-optional-locks rev-list -n1 HEAD --not --remotes 2>/dev/null)" ]; then W=commits; fi
     if [ -z "$W" ] && [ -n "$(git --no-optional-locks ls-files --others --exclude-standard 2>/dev/null | grep -v '/$' | head -n 1)" ]; then
         W=untracked
