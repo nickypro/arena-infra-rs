@@ -97,6 +97,7 @@ Add these on top. [Getting started](#getting-started) walks through them in orde
 | `arena pods backup` | Git-push each pod's branch, then rsync its home (what cron runs) |
 | `arena pods pull` | Rsync each pod's home into `LOCAL_BACKUP_DIR` (the file backup alone) |
 | `arena pods test --deep` | Is this pod usable? A pass / warn / fail row per pod (read-only) |
+| `arena pods ask apple "why is it slow?"` | Ask claude or codex about pods' current state (read-only; keys masked) |
 | `arena tui` | The live dashboard |
 | `arena proxy apply` | Write the proxy forwards and reload nginx |
 | `arena ssh-config --proxy` | Print the participants' `~/.ssh/config` |
@@ -260,7 +261,8 @@ name typed back.
 ```
 
 <sup>A made-up fleet, drawn by the dashboard's own renderer from test fixtures.</sup>
-`a` acts on the selected pod, `A` on the fleet, `d` deep-checks, `n` adds pods.
+`a` acts on the selected pod, `A` on the fleet, `d` deep-checks, `n` adds pods, and `?` asks
+claude or codex about the pod ([`pods ask`](docs/REFERENCE.md#pods-ask)).
 [All the keys and columns](docs/REFERENCE.md#the-dashboard-arena-tui).
 
 ## The proxy

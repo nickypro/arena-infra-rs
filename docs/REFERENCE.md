@@ -43,6 +43,7 @@ backups, branches, pulls, the archive and the reaper — has its own page,
   - [`pods run` / `pods test`](#pods-run--pods-test)
   - [Background jobs: `run --background`, `jobs`, `logs`](#background-jobs-run---background-jobs-logs)
   - [`pods test --deep`](#pods-test---deep)
+  - [`pods ask`](#pods-ask)
 - [Fleet status and money](#fleet-status-and-money)
   - [`snapshot`](#snapshot)
   - [`teardown --check`](#teardown---check)
@@ -58,6 +59,7 @@ backups, branches, pulls, the archive and the reaper — has its own page,
   - [Columns](#columns)
   - [Fleet columns from the core snapshot](#fleet-columns-from-the-core-snapshot)
   - [Deep checks and marked sets](#deep-checks-and-marked-sets)
+  - [Asking an AI about pods](#asking-an-ai-about-pods)
   - [SSH time budgets](#ssh-time-budgets)
   - [Navigating](#navigating)
   - [Acting on pods](#acting-on-pods)
@@ -394,6 +396,9 @@ Spec and recorded fixtures: `specs/shadeform.md`, `crates/core/src/provider/fixt
   max(billed, metered) spend, else `?`; burn, runway, levels, the `balance.json` state and every
   surface's rendering (Hetzner postpaid); `idle` — the read-only `pods idle` probe script, its reply
   parser and the verdict/report (unknown ≠ idle).
+- `ask` — `pods ask` and the TUI's `?`: a read-only, masked, size-capped state bundle per pod (one
+  SSH call reusing the metrics probe and the jobs reads, plus `probe.sh`), the one prompt for all of
+  them, and claude/codex run with no tools (see [`pods ask`](#pods-ask)).
 - `reap` — the opt-in auto-reaper (`pods reap`), pure but for its state store: the strict
   `reap.json` types and settings (`REAP_*`, file-only), the read-only probe (`idle_probe.sh`, framed
   by a nonce, indexed and `cksum`-closed so a damaged reply is never "idle") and its parser,
@@ -1211,6 +1216,75 @@ dropped 72 h after their failure or when a complete check on the machine passes,
 `pods test --deep` adds none (its pods are in use, and a participant's own job can fail a check),
 but its passes clear them.
 
+### `pods ask`
+
+`pods ask [targets] [--all] [--ai claude|codex] [--model M] [--timeout S] [--dry-run] ["question"]`
+— ask claude (Claude Code) or codex what state a pod is in, or several pods compared, and whether
+anything is wrong or needs attention: **read-only** on the pods (one SSH call each), every pod in
+one prompt, masked, the AI with no tools; the answer printed and saved with the prompt in the state
+dir. The answer is per pod one line of state, then the problems, each with the `arena` command that
+fixes or investigates it; `unknown` where the data doesn't say. The dashboard's `?` asks the same
+([Asking an AI about pods](#asking-an-ai-about-pods)); [`ASK_AI`](#ask_ai) picks the AI or turns it
+off.
+
+```bash
+arena pods ask apple                            # the default question about one pod
+arena pods ask apple "why is its GPU idle?"     # your own (quote it: the word with a space or ? is the question)
+arena pods ask apple..delta -q "who is behind on backups?"
+arena pods ask --all                            # a fleet overview: this cohort's pods, one prompt
+arena pods ask --all --include-non-cohort --ai codex   # every pod, asked of codex (default: ASK_AI)
+arena pods ask apple --model opus --timeout 600
+arena pods ask apple --dry-run                  # print the exact prompt and the AI's command line; send nothing
+```
+
+Name pods or pass `--all` (this cohort's; `--include-non-cohort` for every pod; `--on`, `--exclude`,
+`--gpus` as everywhere). The answer goes to stdout, progress and notes to stderr.
+
+#### What it reads
+
+Read-only, one SSH call per pod (60 s budget; `GIT_OPTIONAL_LOCKS=0`, so not even git's index is
+written): the dashboard's metrics probe (GPUs and their processes, CPU, memory, the root disk, the
+repo's branch, origin, commits not pushed, recent commit subjects, whether `~/.name`, the deploy key
+and the API/HF/Claude Code tokens are set up), `pods jobs`' listing and the newest job's last 40 log
+lines, and a small probe: the pod's clock and uptime, load, `/`, `/workspace` and the home's size,
+logins (user, tty, time — **not** where from), tmux sessions, the busiest processes by CPU and
+memory with their arguments, the repo's working tree (counts, the first 20 changed file **names**, a
+merge/cherry-pick/revert/rebase in progress, stashes, the last commit). With it, from this machine:
+the pod's listing row (status, GPU, $/h, endpoint, age, lock, maintenance), its last `pods test
+--deep` verdict, which local file backups (`pods pull`) exist of it, and the branch today's backups
+go to. A stopped or unreachable pod is its listing and why.
+
+**Never read or sent**: file contents, shell history, the environment, `~/.arena` beyond the jobs'
+status and the newest log tail, where a login comes from, arena's config or keys.
+
+#### Masked before anything leaves
+
+Every text field is masked through the backup's own key patterns
+(`arena_core::backup::SECRET_PATTERNS`: OpenRouter, Anthropic incl. Claude Code tokens, OpenAI,
+Hugging Face, GitHub, Google, Groq, AWS — the same replacements, `REDACTED-…`). Also masked: the
+value of anything named like a secret (`HF_TOKEN=…`, `--api-key …`, `password=…`, `Bearer …`,
+`https://user:pass@…`), any run of 32+ `[A-Za-z0-9_-]` in arguments, commands, commit subjects and
+log lines (`<redacted>`), and a private-key block in a log. Each pod's part is at most 6 KB (less
+when many pods share a prompt: 240 KB in all), trimmed from the log's oldest lines first.
+
+#### Where it goes
+
+claude sends the prompt to **Anthropic**, codex to **OpenAI**, through your own `claude`/`codex`
+login on this machine (a one-line note says so on first use). Both get **no tools** — the prompt
+says the pod data is data, never instructions, and they can't act on it anyway: claude runs as
+`scripts/ai-review` runs it (`claude -p --safe-mode --tools '' --strict-mcp-config
+--disable-slash-commands --no-session-persistence --output-format text`), codex as `codex exec -s
+read-only --skip-git-repo-check --ephemeral` with web search and every tool feature its `features
+list` names turned off; the prompt goes on stdin (never argv), in an empty private temporary
+directory; `--timeout` (default 300 s) stops it. A missing binary is an error naming the other one.
+
+#### Where answers are saved
+
+In arena's state dir, never in the home or the working directory — `<state>/<prefix>/ask/<UTC
+time>-<pod or N-pods>/` with `prompt.txt` (exactly what was sent), `answer.md` (or why there is
+none) and `run.txt`; folders 0700, files 0600, the newest 50 kept. `<state>` is `$ARENA_STATE_DIR`,
+else `$XDG_STATE_HOME/arena`, else `~/.local/state/arena`. A `--dry-run` saves nothing.
+
 ## Fleet status and money
 
 ### `snapshot`
@@ -1393,6 +1467,13 @@ on stdin** (`printf %s "$TOK" | arena config set HF_TOKEN`, script-friendly, kee
 `config which` shows the active config file (path, readable/**writable**), what parsed, and any keys
 coming from the environment.
 
+#### `ASK_AI`
+
+Which AI [`pods ask`](#pods-ask) and the dashboard's `?` ask: `claude` (the default), `codex`, or
+`off` — which turns `pods ask` and `?` off whatever `--ai` says (`--ai` picks between claude and
+codex only). `config check` shows it in its "Asking an AI (`pods ask`, the dashboard's `?`)" section
+(and where the binary is, or a ⚠); any other value fails the check and refuses to run.
+
 ### `plan check | show`
 
 `plan check | show` — a scheduled provisioning plan (`arena-plan.json`, see
@@ -1511,6 +1592,15 @@ terminate/restart/stop on a marked set of more than 5 pods — or of every liste
 like the whole fleet (smaller sets: the pod count). A marked-set confirm names the pods once (the
 first 10, then `… and N more`), with the token prompt always on screen. `Esc` on the list clears the
 marks (it never quits).
+
+### Asking an AI about pods
+
+**`?`** asks claude or codex (`ASK_AI`) about the cursor pod — or the marked set, compared in one
+prompt — exactly what [`arena pods ask`](#pods-ask) does: a one-line question, prefilled with the
+default and saying where the data goes (`ctrl-u` clears it); Enter asks **in the background** like
+`d` (the footer says `asking claude about devtest-alpha…`), and the answer opens in its own
+scrollable popup when it lands (Esc closes it; a modal open meanwhile keeps it waiting). Saved like
+`pods ask`'s. With `ASK_AI=off` it opens nothing and the footer says how to turn it on.
 
 ### SSH time budgets
 

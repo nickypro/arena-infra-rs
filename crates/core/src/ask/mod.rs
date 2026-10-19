@@ -57,7 +57,7 @@ pub fn privacy_note(ai: Ai) -> String {
     format!(
         "note: `pods ask` sends each pod's state — listing, GPU, disks, logins, top processes' arguments, the repo's \
          changed file names, the newest job's last lines; keys and tokens masked — to {} through your `{}` login \
-         (README: \"Asking an AI about pods\")",
+         (docs/REFERENCE.md: \"`pods ask`\")",
         ai.vendor(),
         ai.name()
     )
