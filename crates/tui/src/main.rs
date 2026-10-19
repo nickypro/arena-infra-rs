@@ -7,6 +7,7 @@
 //! soon as each sweep finishes. Move the cursor with `↑/↓`/`j/k`, open a per-pod detail
 //! pane (per-GPU breakdown + util/temp sparklines) with `Enter`, act on the selected
 //! pod with `a` (restart / stop / terminate / backup / setup / test / run / set-branch),
+//! ask claude or codex about it (or the marked set) with `?` (`ask.rs`, in the background),
 //! `f` cycles the refresh cadence, `r` refreshes now.
 //!
 //! Each refresh is one `arena_core::snapshot` [`FleetSnapshot`] — the pods as listed, the
@@ -30,6 +31,7 @@
 //! Provider is chosen by `ARENA_PROVIDER` (default `runpod`); config path by
 //! `ARENA_CONFIG`; initial cadence by `ARENA_REFRESH_SECS` (default 5).
 
+mod ask;
 mod prefs;
 mod state;
 
@@ -149,6 +151,11 @@ enum Mode {
     Working(String),
     /// The outcome of the last action; any key dismisses (then we nudge a refresh).
     Result(String),
+    /// `?`: the question about the cursor pod or the marked set, prefilled; Enter asks `ai` in
+    /// the background (`ask.rs`).
+    Ask { scope: InputScope, value: String, ai: arena_core::ask::Ai },
+    /// An answer to a `?` question: scrollable; Esc closes.
+    Answer(ask::Answer),
 }
 
 /// Which pods a multi-pod action targets.
@@ -209,6 +216,10 @@ struct Shared {
     /// (`Provider::restart_resets_container`, pure), set with the rows each refresh — what the
     /// action menus' restart label says ([`Shared::restart_reset`]).
     resets: HashMap<String, ContainerReset>,
+    /// A `?` question out (`asking claude about …`, for the footer); `None` when none is.
+    ask_running: Option<String>,
+    /// Its answer, set by the background task; the loop opens it ([`ask::land`]).
+    ask_answer: Option<ask::Answer>,
 }
 
 impl Shared {
@@ -263,6 +274,8 @@ struct Ui {
     /// frame so mouse clicks can be mapped back to a pod row. Cell because `view` borrows
     /// `&Ui` (the TUI is single-threaded, so interior mutability is safe here).
     last_table: std::cell::Cell<(Rect, usize)>,
+    /// What answers `?` ([`ask::real_asker`]; a fake in tests).
+    asker: ask::Asker,
 }
 
 impl Ui {
@@ -356,6 +369,7 @@ async fn main() -> Result<()> {
     let ui = Ui {
         provider_name,
         config_path,
+        asker: ask::real_asker(remote.clone(), cfg.clone()),
         remote,
         prefix,
         short_names: Prefs::load().short_names,
@@ -942,6 +956,8 @@ async fn run(
                 nudge.notify_one();
             }
         }
+        // A `?` answer landed: its popup (from the list/detail view; otherwise it waits).
+        ask::land(&mut ui, shared);
         // `n`'s listing landed: the add-pod form (or why not).
         {
             let listed = shared.lock().unwrap().new_pod_listing.take();
@@ -979,6 +995,10 @@ async fn run(
             break;
         }
         let code = k.code;
+        // `?` and its two popups (ask.rs).
+        if ask::key(&mut ui, shared, code, k.modifiers) {
+            continue;
+        }
 
         match ui.mode.clone() {
             Mode::List | Mode::Detail => match list_key(&mut ui, code, len) {
@@ -1254,6 +1274,8 @@ async fn run(
             },
             // A background action is running — ignore keys (Ctrl+C still quits, above).
             Mode::Working(_) => {}
+            // Handled by `ask::key` above.
+            Mode::Ask { .. } | Mode::Answer(_) => {}
             Mode::Result(_) => match code {
                 // Scroll long outputs (e.g. a fleet test); other keys dismiss.
                 KeyCode::Up | KeyCode::Char('k') => {
@@ -2257,6 +2279,8 @@ fn view(f: &mut Frame, shared: &Shared, ui: &Ui, secs: u64) {
         Mode::Select { value } => render_select(f, value),
         Mode::Working(msg) => render_result(f, msg, 0),
         Mode::Result(msg) => render_result(f, msg, ui.result_scroll),
+        Mode::Ask { scope, value, ai } => ask::render_input(f, shared, ui, scope, value, *ai),
+        Mode::Answer(answer) => ask::render_answer(f, answer, ui.result_scroll),
         _ => {}
     }
 }
@@ -2979,9 +3003,13 @@ fn footer_hint(shared: &Shared, ui: &Ui, secs: u64) -> Line<'static> {
         0 => String::new(),
         n => format!(" · deep-checking {n}"),
     };
+    let checking = match &shared.ask_running {
+        Some(asking) => format!("{checking} · {asking}"),
+        None => checking,
+    };
     let keys = match &ui.mode {
-        Mode::List => "[q] quit  [enter] detail  [c] ssh  [space] mark  [/] select  [x] unmark all  [a] act  [A] all  [d] deep check  [n] new  [r] refresh",
-        Mode::Detail => "[esc] back  [q] quit  [c] ssh  [space] mark  [/] select  [x] unmark all  [a] act  [A] all  [d] deep check  [n] new  [r] refresh",
+        Mode::List => "[q] quit  [enter] detail  [c] ssh  [space] mark  [/] select  [x] unmark all  [a] act  [A] all  [d] deep check  [?] ask AI  [n] new  [r] refresh",
+        Mode::Detail => "[esc] back  [q] quit  [c] ssh  [space] mark  [/] select  [x] unmark all  [a] act  [A] all  [d] deep check  [?] ask AI  [n] new  [r] refresh",
         Mode::Menu { .. } => "[↑↓] move  [enter] choose  [letter] pick  [esc] cancel",
         Mode::Confirm(c) if c.action.requires_typed_name() => "type the pod's name  [enter] apply  [esc] cancel",
         Mode::Confirm(c) if c.preview.is_some() => "[y] apply  [v] full command  [n/esc] cancel",
@@ -2993,6 +3021,8 @@ fn footer_hint(shared: &Shared, ui: &Ui, secs: u64) -> Line<'static> {
         Mode::Select { .. } => "type a selection  [enter] mark  [esc] cancel",
         Mode::Working(_) => "working… (background) — please wait",
         Mode::Result(_) => "[↑↓] scroll  ·  [any other key] dismiss",
+        Mode::Ask { .. } => "type the question  [enter] ask  [ctrl-u] clear  [esc] cancel",
+        Mode::Answer(_) => "[↑↓ PgUp PgDn] scroll  [esc] close",
     };
     match shared.notice.as_ref().filter(|n| n.at.elapsed() < NOTICE_FOR) {
         Some(n) => {
@@ -3540,7 +3570,23 @@ deep_check_end=1
             marked: HashSet::new(),
             result_scroll: 0,
             last_table: std::cell::Cell::new((Rect::default(), 0)),
+            asker: fake_asker(Arc::default()),
         }
+    }
+
+    /// Every `?` question a [`fake_asker`] got: the pods' names, the question, the AI.
+    type Asked = Arc<Mutex<Vec<(Vec<String>, String, arena_core::ask::Ai)>>>;
+
+    /// An asker that records each question and answers `ANSWER to <question>` at once — never
+    /// a real AI.
+    fn fake_asker(log: Asked) -> ask::Asker {
+        Arc::new(move |pods: Vec<Pod>, question: String, ai: arena_core::ask::Ai| {
+            let log = log.clone();
+            Box::pin(async move {
+                log.lock().unwrap().push((pods.iter().map(|p| p.name.clone()).collect(), question.clone(), ai));
+                ask::Answer { title: format!("{} · test", ai.name()), text: format!("ANSWER to {question}") }
+            })
+        })
     }
 
     /// Forwards alpha → its endpoint (live) and bravo → an old one (stale).
@@ -4843,6 +4889,118 @@ deep_check_end=1
             let footer = draw(80, 12, &shared, &ui).pop().unwrap();
             assert!(footer.contains("[q] quit"), "{footer}");
         }
+    }
+
+    /// `?` opens the question for the cursor pod, prefilled; typing edits it (Ctrl+U clears),
+    /// Enter asks in the background — the dashboard stays live, the footer says so — and the
+    /// answer opens in its own popup when it lands (a modal open meanwhile keeps it waiting),
+    /// scrolls, and Esc closes it. With pods marked it asks about the marked set; Esc on the
+    /// input asks nothing; `ASK_AI=off` opens nothing and says how to turn it on. The footer
+    /// lists the key.
+    #[tokio::test]
+    async fn question_mark_asks_in_the_background_and_shows_the_answer() {
+        use arena_core::ask::Ai;
+        let shared = Arc::new(Mutex::new(fixture_shared()));
+        let asked: Asked = Arc::default();
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        ui.asker = fake_asker(asked.clone());
+        let none = KeyModifiers::NONE;
+        let screen = |ui: &Ui, w: u16, h: u16| draw(w, h, &shared.lock().unwrap(), ui);
+        for mode in [Mode::List, Mode::Detail] {
+            ui.mode = mode;
+            let footer = screen(&ui, 240, 12).pop().unwrap();
+            assert!(footer.contains("[?] ask AI"), "{footer}");
+        }
+        ui.mode = Mode::List;
+        ui.selected = 2;
+        let cursor = shared.lock().unwrap().pods[2].name.clone();
+        let answered = || async {
+            for _ in 0..400 {
+                if shared.lock().unwrap().ask_answer.is_some() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            panic!("no answer landed");
+        };
+
+        // `?`: the input, prefilled, saying where the data goes.
+        assert!(ask::key(&mut ui, &shared, KeyCode::Char('?'), none));
+        let Mode::Ask { value, ai, .. } = &ui.mode else { panic!("{:?}", ui.mode) };
+        assert_eq!((value.as_str(), *ai), ("What is the current state of this pod? Is anything wrong or needing attention?", Ai::Claude));
+        let text = screen(&ui, 140, 40).join("\n");
+        assert!(text.contains("ask claude about") && text.contains("goes") && text.contains("to Anthropic with no tools"), "{text}");
+        assert!(screen(&ui, 240, 40).pop().unwrap().contains("[enter] ask"));
+        ask::key(&mut ui, &shared, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        for c in "is it busy?x".chars() {
+            ask::key(&mut ui, &shared, KeyCode::Char(c), none);
+        }
+        ask::key(&mut ui, &shared, KeyCode::Backspace, none);
+        assert!(matches!(&ui.mode, Mode::Ask { value, .. } if value == "is it busy?"), "{:?}", ui.mode);
+
+        // Enter: asked in the background, the footer says so, the list is back at once.
+        assert!(ask::key(&mut ui, &shared, KeyCode::Enter, none));
+        assert!(matches!(ui.mode, Mode::List));
+        let status = format!("asking claude about {cursor}…");
+        assert_eq!(shared.lock().unwrap().ask_running.as_deref(), Some(status.as_str()));
+        let footer = screen(&ui, 240, 12).pop().unwrap();
+        assert!(footer.contains(&status) && footer.contains("[q] quit"), "{footer}");
+        answered().await;
+        assert!(shared.lock().unwrap().ask_running.is_none());
+        assert_eq!(asked.lock().unwrap().clone(), [(vec![cursor.clone()], "is it busy?".to_string(), Ai::Claude)]);
+
+        // The answer opens; it scrolls; Esc closes it.
+        ask::land(&mut ui, &shared);
+        assert!(matches!(&ui.mode, Mode::Answer(a) if a.text == "ANSWER to is it busy?"), "{:?}", ui.mode);
+        let text = screen(&ui, 140, 40).join("\n");
+        assert!(text.contains("claude · test") && text.contains("ANSWER to is it busy?"), "{text}");
+        ask::key(&mut ui, &shared, KeyCode::Down, none);
+        assert_eq!(ui.result_scroll, 1);
+        assert!(ask::key(&mut ui, &shared, KeyCode::Esc, none));
+        assert!(matches!(ui.mode, Mode::List) && ui.result_scroll == 0);
+
+        // An answer landing while a modal is open waits for it to close.
+        shared.lock().unwrap().ask_answer = Some(ask::Answer { title: "t".into(), text: "later".into() });
+        ui.mode = Mode::Select { value: String::new() };
+        ask::land(&mut ui, &shared);
+        assert!(matches!(ui.mode, Mode::Select { .. }));
+        ui.mode = Mode::List;
+        ask::land(&mut ui, &shared);
+        assert!(matches!(&ui.mode, Mode::Answer(a) if a.text == "later"));
+        ui.mode = Mode::List;
+
+        // Pods marked: the question is about them, compared in one ask.
+        let marked: Vec<Pod> = shared.lock().unwrap().pods.iter().take(2).cloned().collect();
+        ui.marked = marked.iter().map(mark_key).collect();
+        ask::key(&mut ui, &shared, KeyCode::Char('?'), none);
+        assert!(
+            matches!(&ui.mode, Mode::Ask { scope: InputScope::Set(Scope::Marked), value, .. } if value.starts_with("What is the current state of these pods?")),
+            "{:?}",
+            ui.mode
+        );
+        ask::key(&mut ui, &shared, KeyCode::Enter, none);
+        answered().await;
+        let names: Vec<String> = marked.iter().map(|p| p.name.clone()).collect();
+        assert_eq!(asked.lock().unwrap().last().map(|(n, _, _)| n.clone()), Some(names));
+        ask::land(&mut ui, &shared);
+        ask::key(&mut ui, &shared, KeyCode::Esc, none);
+
+        // Esc on the input asks nothing.
+        ui.marked.clear();
+        ask::key(&mut ui, &shared, KeyCode::Char('?'), none);
+        ask::key(&mut ui, &shared, KeyCode::Esc, none);
+        assert!(matches!(ui.mode, Mode::List));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(asked.lock().unwrap().len(), 2);
+
+        // ASK_AI=off: nothing opens; the footer says how to turn it on.
+        ui.cfg = cfg("ASK_AI=off\n");
+        assert!(ask::key(&mut ui, &shared, KeyCode::Char('?'), none));
+        assert!(matches!(ui.mode, Mode::List));
+        let notice = shared.lock().unwrap().notice.clone().unwrap();
+        assert!(notice.error && notice.text.contains("ASK_AI=off") && notice.text.contains("ASK_AI=claude"), "{}", notice.text);
+        // Other keys on the list aren't ask's.
+        assert!(!ask::key(&mut ui, &shared, KeyCode::Char('r'), none));
     }
 
     /// `run` shows what the command printed — every line, not the last one (live: `nvidia-smi
