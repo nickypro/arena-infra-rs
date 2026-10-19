@@ -884,8 +884,17 @@ pub(crate) struct SyncOpts {
     pub dry_run: bool,
 }
 
-/// A held sync lock (`flock`, released when dropped).
-struct Lock(#[allow(dead_code)] std::fs::File);
+/// A held sync lock (`flock`). Dropping it unlocks rather than only closing the file: a process
+/// forked meanwhile by another thread holds a copy of the descriptor until its `exec`, and a
+/// close alone leaves the lock held through that copy — so an `unforget` right after a sync
+/// (it doesn't wait) was refused with "a sync is running" (a test flaked on the build VM).
+struct Lock(std::fs::File);
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
 
 /// Take a tier's lock without waiting: `None` = another sync of that tier holds it.
 fn try_lock(path: &Path) -> Result<Option<Lock>> {
@@ -909,8 +918,9 @@ fn try_lock(path: &Path) -> Result<Option<Lock>> {
 const LOCK_PATIENCE: Duration = Duration::from_secs(2);
 
 /// [`try_lock`], retried for up to `patience`: a lock just released can still look held for a
-/// moment — any process forked meanwhile (cron, another thread's spawn) holds a copy of the
-/// descriptor until its `exec` closes it.
+/// moment — one released by a close alone (a run that was killed) stays held while a process
+/// forked meanwhile (cron, another thread's spawn) keeps a copy of the descriptor, until its
+/// `exec` closes it. ([`Lock`] itself unlocks when dropped.)
 async fn lock_within(path: &Path, patience: Duration) -> Result<Option<Lock>> {
     let deadline = tokio::time::Instant::now() + patience;
     loop {
@@ -3788,6 +3798,21 @@ mod tests {
         assert!(try_lock(&paths.sync_lock(Tier::Snap)).unwrap().is_none(), "still held");
         drop(held);
         assert!(lock_within(&paths.sync_lock(Tier::Snap), Duration::from_secs(5)).await.unwrap().is_some());
+    }
+
+    /// A dropped lock is free at once, even while a copy of its descriptor lives on (what a
+    /// process forked meanwhile holds until its `exec`): a check that doesn't wait finds it free.
+    #[test]
+    fn a_dropped_lock_is_free_while_a_copy_of_its_descriptor_lives() {
+        let w = world("lock-copy");
+        let path = w.env().paths.sync_lock(Tier::Snap);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let held = try_lock(&path).unwrap().expect("free");
+        assert!(try_lock(&path).unwrap().is_none(), "held");
+        let copy = held.0.try_clone().unwrap();
+        drop(held);
+        assert!(try_lock(&path).unwrap().is_some(), "free once dropped, the copy notwithstanding");
+        drop(copy);
     }
 
     /// No state for this user / no start date / a dry run: nothing is spawned. AD9: a dry run
