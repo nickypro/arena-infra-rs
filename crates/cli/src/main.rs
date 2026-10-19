@@ -22,6 +22,7 @@ use arena_core::volume::RepoSite;
 use arena_core::{Config, PodSpec};
 
 mod archive;
+mod ask;
 #[cfg(test)]
 mod gpu_vm_setup_tests;
 #[cfg(test)]
@@ -364,6 +365,11 @@ enum BalanceCmd {
         #[arg(value_parser = arena_core::balance::parse_amount, allow_negative_numbers = true)]
         usd: f64,
     },
+}
+
+/// `pods ask --ai`: claude or codex.
+fn parse_ai(s: &str) -> std::result::Result<arena_core::ask::Ai, String> {
+    arena_core::ask::Ai::parse(s).ok_or_else(|| format!("`{s}` isn't claude or codex"))
 }
 
 /// `balance set`'s account: a prepaid one.
@@ -1367,6 +1373,35 @@ enum PodCmd {
         /// Print the report as JSON (verdicts, readings, suggested commands).
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        sel: Select,
+    },
+    /// Ask claude or codex about pods' current state (reads only)
+    ///
+    /// Reads each pod once over SSH (listing, GPU, disks, logins, top processes, the repo's
+    /// working tree, jobs and the newest job's log — keys and tokens masked) and sends it all in
+    /// one prompt to claude (ASK_AI, the default) or codex, with no tools. The answer is printed,
+    /// and saved with the prompt under the state dir (<state>/<prefix>/ask/). Name pods, or
+    /// --all for this cohort's. Quote the question: `arena pods ask apple "why is it slow?"`.
+    #[command(verbatim_doc_comment)]
+    Ask {
+        /// claude or codex (default: ASK_AI, else claude)
+        #[arg(long, value_parser = parse_ai)]
+        ai: Option<arena_core::ask::Ai>,
+        /// The AI's model (default: its CLI's own)
+        #[arg(long)]
+        model: Option<String>,
+        /// Seconds the AI may take to answer
+        #[arg(long, default_value_t = arena_core::ask::DEFAULT_TIMEOUT.as_secs(), value_parser = clap::value_parser!(u64).range(1..=3600))]
+        timeout: u64,
+        /// Print the prompt that would be sent; send (and save) nothing
+        #[arg(long, visible_aliases = ["dryrun", "dry"])]
+        dry_run: bool,
+        /// The question (or a quoted word among the pods; default: their state, anything wrong?)
+        #[arg(short = 'q', long)]
+        question: Option<String>,
+        #[command(flatten)]
+        cohort: CohortScope,
         #[command(flatten)]
         sel: Select,
     },
@@ -5217,6 +5252,32 @@ fn hetzner_rows(cfg: &Config) -> Vec<String> {
     ]
 }
 
+/// `config check`'s rows for `ASK_AI`: which AI `pods ask` (and the dashboard's `?`) sends to
+/// — `(default)` when unset — or `off`; where its binary is, or a ⚠ when it isn't installed for
+/// this user (advice: nothing fails until it's used). A value that isn't claude/codex/off is a
+/// ✗ row and the error the check fails on. Pure but for the binary lookup in `env`.
+fn ask_ai_rows(cfg: &Config, env: &arena_core::ask::AiEnv) -> (Vec<String>, Option<String>) {
+    use arena_core::ask::{ai, Setting};
+    let key = ai::ASK_AI;
+    match Setting::from_config(cfg) {
+        Err(e) => (vec![format!("  ✗ {key:<28} {e}")], Some(e)),
+        Ok(Setting::Off) => (vec![format!("  ✓ {key:<28} off — `pods ask` and the dashboard's `?` refuse: nothing goes to an AI")], None),
+        Ok(Setting::Use(a)) => {
+            let (mark, default) = if Setting::is_default(cfg) { ("·", " (default)") } else { ("✓", "") };
+            let mut rows = vec![format!(
+                "  {mark} {key:<28} {}{default} — `pods ask` sends pods' state (keys masked) to {}; `off` turns it off",
+                a.name(),
+                a.vendor()
+            )];
+            rows.push(match ai::find_bin(a.name(), env) {
+                Some(p) => format!("      └ {}: {}", a.name(), p.display()),
+                None => format!("  ⚠ {:<28} {}", format!("{} binary", a.name()), ai::missing(a)),
+            });
+            (rows, None)
+        }
+    }
+}
+
 /// Print a config checklist for the selected provider + proxy + backup, never showing
 /// secret values. Returns an error if a required key is missing.
 fn config_check(cfg: &Config, provider_name: &str) -> Result<()> {
@@ -5474,6 +5535,13 @@ fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<String>) {
 
     println!("\nDashboard (optional):");
     cfg_row(&mut out, cfg, &mut missing, "PROGRESS_CMD", false, false);
+
+    println!("\nAsking an AI (`pods ask`, the dashboard's `?`):");
+    let (rows, bad) = ask_ai_rows(cfg, &arena_core::ask::AiEnv::from_process());
+    rows.iter().for_each(|l| println!("{l}"));
+    if let Some(e) = bad {
+        note_invalid_text(&mut missing, &e);
+    }
 
     println!("\nEvals / model access (optional, `pods copy-keys` / `arena keys`):");
     cfg_row(&mut out, cfg, &mut missing, "HF_TOKEN", false, true); // broadcast for gated repos (Llama 3 …)
@@ -7901,6 +7969,17 @@ async fn handle_pods_bal(
                 config_file: cfg.source().map(std::path::Path::to_path_buf),
             };
             reap::handle_reap(cmd, &env).await?;
+        }
+        PodCmd::Ask { ai, model, timeout, dry_run, question, cohort, sel } => {
+            // Read-only on the pods, but it sends what it reads off this machine: `ASK_AI=off`
+            // (or a malformed value) refuses before anything is listed or read.
+            let (targets, question) = ask::split_question(&sel.targets, question).map_err(anyhow::Error::msg)?;
+            let chosen = arena_core::ask::ai::choose(cfg, ai).map_err(anyhow::Error::msg)?;
+            let sel = select(provider, cfg, &Select { targets, opts: sel.opts }.args(), Unscoped::Refuse("ask about")).await?;
+            let sel = cohort_only(cfg, sel, cohort);
+            let run = ask::AskRun { ai: chosen, model, timeout: Duration::from_secs(timeout), dry_run, question };
+            let env = arena_core::ask::AiEnv::from_process();
+            ask::handle_ask(remote, cfg, &sel, run, &env, &mut |l| println!("{l}"), &mut |l| eprintln!("{l}")).await?;
         }
         PodCmd::Idle { hours, json, sel } => {
             // Read-only: no confirm. The report prints commands; it never runs them.
@@ -17652,6 +17731,49 @@ mod tests {
         assert_eq!(missing, ["a host CUDA constraint RunPod v1 can express, or remove RUNPOD_API=v1 (v2 is the default)"]);
     }
 
+    /// `config check`'s ASK_AI rows: the AI (and `(default)` when unset) with where its data goes,
+    /// `off`, where the binary is or a ⚠ naming the other option; a bad value is ✗ and the error
+    /// — a pasted key never echoed.
+    #[test]
+    fn config_check_ask_ai_rows() {
+        use super::{ask_ai_rows, config_report, Config};
+        let dir = std::env::temp_dir().join(format!("arena-cli-askrow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let empty = arena_core::ask::AiEnv { path: Some(dir.clone().into_os_string()), home: None, tmp: dir.clone() };
+        let key = format!("{:<28}", "ASK_AI");
+        let rows = |text: &str| ask_ai_rows(&Config::parse(text), &empty);
+        assert_eq!(
+            rows(""),
+            (
+                vec![
+                    format!("  · {key} claude (default) — `pods ask` sends pods' state (keys masked) to Anthropic; `off` turns it off"),
+                    format!("  ⚠ {:<28} claude not found on PATH or in ~/.local/bin — install it and log in, or use codex instead (`--ai codex`, or ASK_AI=codex)", "claude binary"),
+                ],
+                None
+            )
+        );
+        assert!(rows("ASK_AI=codex").0[0].starts_with(&format!("  ✓ {key} codex — `pods ask` sends pods' state (keys masked) to OpenAI")));
+        assert_eq!(rows("ASK_AI=off"), (vec![format!("  ✓ {key} off — `pods ask` and the dashboard's `?` refuse: nothing goes to an AI")], None));
+        let (r, e) = rows("ASK_AI=gpt");
+        assert_eq!((r, e.as_deref()), (vec![format!("  ✗ {key} ASK_AI must be claude, codex or off (got gpt)")], Some("ASK_AI must be claude, codex or off (got gpt)")));
+        let (r, _) = rows("ASK_AI=sk-ant-0123456789012345678901234567890");
+        assert!(!r[0].contains("sk-ant"), "{r:?}");
+        #[cfg(unix)]
+        {
+            arena_core::ask::ai::fixtures::stub(&dir, "claude", "true");
+            assert_eq!(rows("ASK_AI=claude").0[1], format!("      └ claude: {}", dir.join("claude").display()));
+        }
+        // In the whole report, in its own section; a bad value is a named failure.
+        let (report, missing) = config_report(&Config::parse("MACHINE_NAME_PREFIX=devtest
+MACHINE_NAME_LIST=(apple)
+ASK_AI=gpt
+"), "hetzner");
+        assert!(report.contains("\nAsking an AI (`pods ask`, the dashboard's `?`):\n  ✗ ASK_AI"), "{report}");
+        assert!(missing.iter().any(|m| m == "ASK_AI (must be claude, codex or off)"), "{missing:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// "✗ means fail": every key set to a value its parser refuses shows a ✗ row and is named —
     /// once, however many rows it breaks — in `config check`'s "missing or invalid keys"
     /// error, and every ✗ row names a key that error names; a valid config has neither,
@@ -17664,8 +17786,9 @@ mod tests {
         let base = "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple)\nRUNPOD_API_KEY=not-a-real-key\n\
                     HETZNER_API_KEY=not-a-real-key\nGPU_TYPE=\"NVIDIA RTX A4000\"\nIMAGE=img:1\n";
         // (what's added to the base, the keys the check must fail on)
-        let cases: [(&str, &[&str]); 30] = [
+        let cases: [(&str, &[&str]); 31] = [
             ("", &[]),
+            ("ASK_AI=gpt", &["ASK_AI"]),
             ("SHARED_SSH_KEY_PATH=/nonexistent/k\nGIT_SSH_KEY_LOCAL=/nonexistent/d", &[]),
             ("BACKUP_TIMEOUT_SECS=soon", &["BACKUP_TIMEOUT_SECS"]),
             // `set-branch --hard`'s save limit (review ai-review claude #6).
@@ -25349,6 +25472,44 @@ same host? 10.0.0.1: 2 failing (devtest-bloom, devtest-cloud). A bad host breaks
             for (hard, scope, named) in [(true, on, true), (false, on, false), (true, CohortScope::default(), false)] {
                 assert_eq!(hard_non_cohort_refusal(hard, scope, named), None, "{hard} {scope:?} {named}");
             }
+        }
+
+        /// `pods ask --all` reads this cohort's pods (the others named in one line), every pod with
+        /// `--include-non-cohort`; named pods exactly. Dry runs: nothing is sent.
+        #[tokio::test(start_paused = true)]
+        async fn ask_all_reads_the_cohort_and_include_non_cohort_every_pod() {
+            let cfg = account_cfg("");
+            take_said();
+            let fake = Arc::new(FakeRemote::new());
+            handle_pods(pods(&["ask", "--all", "--dry-run"]), &account(), fake.clone(), &cfg, false).await.unwrap();
+            assert_eq!(take_said(), [LEFT_OUT]);
+            assert_eq!(ports(&fake), COHORT_PORTS);
+            let fake = Arc::new(FakeRemote::new());
+            handle_pods(pods(&["ask", "--all", "--include-non-cohort", "--dry-run"]), &account(), fake.clone(), &cfg, false).await.unwrap();
+            assert!(take_said().is_empty());
+            assert_eq!(ports(&fake), [22001, 22002, 22003, 22004, 22005, 22006, 22007]);
+            let fake = Arc::new(FakeRemote::new());
+            handle_pods(pods(&["ask", "bloom", "@devtest-zebra", "is it busy?", "--dry-run"]), &account(), fake.clone(), &cfg, false).await.unwrap();
+            assert_eq!(ports(&fake), [22002, 22004]);
+        }
+
+        /// `ASK_AI=off` refuses — whatever `--ai` says — and so does an unscoped ask or two
+        /// questions, all before any pod is read.
+        #[tokio::test(start_paused = true)]
+        async fn ask_refuses_off_unscoped_or_two_questions_before_reading_a_pod() {
+            let fake = Arc::new(FakeRemote::new());
+            let cases: [(&str, &[&str], &str); 5] = [
+                ("ASK_AI=off\n", &["ask", "apple"], "ASK_AI=off"),
+                ("ASK_AI=off\n", &["ask", "apple", "--ai", "claude"], "ASK_AI=off"),
+                ("ASK_AI=gpt\n", &["ask", "apple"], "ASK_AI must be claude, codex or off"),
+                ("", &["ask"], "name the pods to ask about"),
+                ("", &["ask", "apple", "is it up?", "and busy?"], "one question at a time"),
+            ];
+            for (extra, argv, want) in cases {
+                let e = handle_pods(pods(argv), &account(), fake.clone(), &account_cfg(extra), false).await.unwrap_err();
+                assert!(e.to_string().contains(want), "{argv:?}: {e}");
+            }
+            assert!(fake.calls().is_empty(), "{:?}", fake.calls());
         }
 
         #[tokio::test(start_paused = true)]

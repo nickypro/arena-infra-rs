@@ -89,9 +89,9 @@ impl Setting {
         Ai::parse(raw).map(Setting::Use).ok_or_else(|| {
             let shown = raw.len() <= 12 && raw.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
             if shown {
-                format!("{ASK_AI}={raw} isn't claude, codex or off")
+                format!("{ASK_AI} must be claude, codex or off (got {raw})")
             } else {
-                format!("{ASK_AI} isn't claude, codex or off")
+                format!("{ASK_AI} must be claude, codex or off")
             }
         })
     }
@@ -331,29 +331,14 @@ pub async fn ask(ai: Ai, prompt: &str, model: Option<&str>, timeout: Duration, e
     Ok(text)
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
+/// Stub `claude`/`codex` binaries for tests here and in the CLI.
+#[cfg(any(test, feature = "test-util"))]
+pub mod fixtures {
     use super::*;
-
-    /// A temp dir for one test, removed after.
-    pub(crate) struct Tmp(pub PathBuf);
-    impl Tmp {
-        pub(crate) fn new(tag: &str) -> Tmp {
-            let d = std::env::temp_dir().join(format!("arena-ask-test-{tag}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&d);
-            std::fs::create_dir_all(&d).unwrap();
-            Tmp(d)
-        }
-    }
-    impl Drop for Tmp {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
 
     /// An executable `name` in `dir` running `body` under sh.
     #[cfg(unix)]
-    pub(crate) fn stub(dir: &Path, name: &str, body: &str) {
+    pub fn stub(dir: &Path, name: &str, body: &str) {
         use std::os::unix::fs::PermissionsExt;
         let f = dir.join(name);
         std::fs::write(&f, format!("#!/bin/sh\n{body}\n")).unwrap();
@@ -364,7 +349,7 @@ pub(crate) mod tests {
     /// and working directory under `<tmp>/rec/<name>.*` and answer `ANSWER from <name>` — codex
     /// into its `-o` file, as the real one does; `codex features list` lists a few features.
     #[cfg(unix)]
-    pub(crate) fn recording_stubs(tmp: &Path) -> AiEnv {
+    pub fn recording_stubs(tmp: &Path) -> AiEnv {
         let (bin, rec) = (tmp.join("bin"), tmp.join("rec"));
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::create_dir_all(&rec).unwrap();
@@ -390,9 +375,31 @@ pub(crate) mod tests {
     /// `PATH` with `dir` first: the stubs found before any real `claude`/`codex`, the tools
     /// they run (`cat`, `sleep`) still there.
     #[cfg(unix)]
-    pub(crate) fn on_path(dir: &Path) -> OsString {
+    pub fn on_path(dir: &Path) -> OsString {
         let rest = std::env::var_os("PATH").unwrap_or_default();
         std::env::join_paths(std::iter::once(dir.to_path_buf()).chain(std::env::split_paths(&rest))).unwrap()
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use super::fixtures::*;
+
+    /// A temp dir for one test, removed after.
+    pub(crate) struct Tmp(pub PathBuf);
+    impl Tmp {
+        pub(crate) fn new(tag: &str) -> Tmp {
+            let d = std::env::temp_dir().join(format!("arena-ask-test-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            Tmp(d)
+        }
+    }
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     fn rec(tmp: &Path, f: &str) -> String {
@@ -407,10 +414,10 @@ pub(crate) mod tests {
         assert_eq!(s("ASK_AI=Codex"), Ok(Setting::Use(Ai::Codex)));
         assert_eq!(s("ASK_AI=\" claude \""), Ok(Setting::Use(Ai::Claude)));
         assert_eq!(s("ASK_AI=OFF"), Ok(Setting::Off));
-        assert_eq!(s("ASK_AI=gpt").unwrap_err(), "ASK_AI=gpt isn't claude, codex or off");
+        assert_eq!(s("ASK_AI=gpt").unwrap_err(), "ASK_AI must be claude, codex or off (got gpt)");
         // A pasted key is never echoed.
         let e = s("ASK_AI=sk-0123456789abcdefghij").unwrap_err();
-        assert_eq!(e, "ASK_AI isn't claude, codex or off");
+        assert_eq!(e, "ASK_AI must be claude, codex or off");
         assert!(Setting::is_default(&Config::parse("")) && !Setting::is_default(&Config::parse("ASK_AI=codex")));
         // --ai picks; off refuses whatever --ai says; a bad value refuses too.
         let c = |text: &str, flag| choose(&Config::parse(text), flag);
