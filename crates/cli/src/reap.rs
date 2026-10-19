@@ -986,6 +986,9 @@ struct RunCtx<'a, 'b> {
     notes: std::sync::Mutex<Vec<String>>,
     /// Notifications to send: (pod key or None for run-level, kind, line).
     notify: std::sync::Mutex<Vec<(Option<String>, NotifyKind, String)>>,
+    /// The plan's WHY for an acted-on pod, by key, where its row's own words would say less
+    /// (a git step that found a merge in progress: [`render::git_busy_why`]).
+    whys: std::sync::Mutex<BTreeMap<String, String>>,
     attention: std::sync::atomic::AtomicBool,
 }
 
@@ -1312,6 +1315,7 @@ async fn handle_run(env: &ReapEnv<'_>, sel: &Select, asked: Mode, max: Option<u3
         log: Default::default(),
         notes: Default::default(),
         notify: Default::default(),
+        whys: Default::default(),
         attention: Default::default(),
     };
     if let Some(d) = &demoted {
@@ -1623,6 +1627,7 @@ async fn handle_run(env: &ReapEnv<'_>, sel: &Select, asked: Mode, max: Option<u3
 
     // 13: the table.
     let final_state = store.load().unwrap_or(state);
+    let whys = std::mem::take(&mut *ctx.whys.lock().unwrap());
     let mut rows: Vec<PlanRow> = Vec::new();
     for (k, d) in &decided {
         let row = outcomes.get(k).copied().unwrap_or(d.row);
@@ -1636,7 +1641,7 @@ async fn handle_run(env: &ReapEnv<'_>, sel: &Select, asked: Mode, max: Option<u3
             state: render::state_label(pol, row, now),
             row,
             next: render::next_label(row).to_string(),
-            why: render::why_label(row, &reasons),
+            why: whys.get(k).cloned().unwrap_or_else(|| render::why_label(row, &reasons)),
         });
     }
     let mut footer: Vec<String> = std::mem::take(&mut *ctx.notes.lock().unwrap());
@@ -1908,6 +1913,15 @@ async fn act_one(ctx: &RunCtx<'_, '_>, dest: &Dest, mut pol: PodPolicy, pod: Pod
     let backup_proof = match BackupProof::check(&ev) {
         Ok(b) => b,
         Err(f) => {
+            // A git step that stopped because an operation is in progress on the pod (`BUSY`):
+            // said as what it is and how to end it (review fb2 F1). Only the words: the row, the
+            // retry and the backoff stay the git step's.
+            let busy = match (f.row, ev.git.as_ref()) {
+                (Row::GitFailed, Some(StepEnd::Exit { code, stdout })) => {
+                    render::GitBusy::of(&arena_core::backup::parse_backup_report(stdout), *code)
+                }
+                _ => None,
+            };
             let (retry, obs) = match f.row {
                 // A failed freeze too (R2-3): it would fail the same way next tick, after the
                 // pod's whole backup again and another write-ahead against the daily cap.
@@ -1933,7 +1947,13 @@ async fn act_one(ctx: &RunCtx<'_, '_>, dest: &Dest, mut pol: PodPolicy, pod: Pod
                     ctx.queue(Some(&key), NotifyKind::FreezeFailed, Some(&name), "the verified backup couldn't be frozen into reaped/ — not reaped; retried in 6h");
                     ctx.attention();
                 }
-                Row::GitFailed => ctx.queue(Some(&key), NotifyKind::GitFailed, Some(&name), "the reap's git backup failed — not reaped; retried in 6h"),
+                Row::GitFailed => match &busy {
+                    Some(b) => {
+                        ctx.queue(Some(&key), NotifyKind::GitFailed, Some(&name), &render::git_busy_notice(b));
+                        ctx.whys.lock().unwrap().insert(key.clone(), render::git_busy_why(b));
+                    }
+                    None => ctx.queue(Some(&key), NotifyKind::GitFailed, Some(&name), "the reap's git backup failed — not reaped; retried in 6h"),
+                },
                 Row::RsyncFailed => ctx.queue(Some(&key), NotifyKind::RsyncFailed, Some(&name), "the reap's file backup failed — not reaped; retried in 6h"),
                 Row::DestUnhealthy => ctx.queue(None, NotifyKind::DestUnhealthy, Some(&name), "backup destination unhealthy at the reap's backup"),
                 _ => {}

@@ -985,6 +985,75 @@ async fn a_directory_in_the_way_of_the_reaps_snapshot_rsync_is_moved_aside_and_t
     assert_eq!(std::fs::read_to_string(Path::new(tomb.snapshot_dir.as_deref().unwrap()).join(&aside).join("old.py")).unwrap(), "old snap work\n");
 }
 
+/// Review fb2 F1: a pod left mid-merge isn't reaped — its backup's git step says `BUSY` (exit 6),
+/// a failed git step (R32) like any other: not reaped, no rsync, retried in 6 h, backing off
+/// meanwhile. That decision is unchanged; what changed is what's said. The run's WHY and the
+/// notification name what is in progress and that it holds the reap, and the notification says
+/// how to end it either way — not a generic "git backup failed". A branch that isn't a plain ref
+/// name is never echoed; any other git failure keeps the generic words.
+#[tokio::test]
+async fn a_merge_in_progress_holds_the_reap_and_says_so() {
+    let (w, a) = due_world("git-busy", "").await;
+    w.sim(22001, |s| s.git = (6, "BRANCH autocommit-x\nBUSY autocommit-x merge unmerged\n".into()));
+    let (r, out) = w.run("apply").await;
+    assert!(w.terminated().is_empty(), "{out}");
+    assert_eq!(exit_code(&r), Some(3), "a failed git step needs attention, as before");
+    assert!(!w.order().iter().any(|l| l.starts_with("rsync")), "no rsync after a failed git step");
+    let why = "a merge is in progress on autocommit-x — not reaped until it's finished or aborted";
+    assert!(out.contains(why) && !out.contains("git backup failed"), "{out}");
+    let p = &w.state().pods[&core_reap::key("runpod", &a.id)];
+    assert!(p.retry_after.is_some_and(|t| t >= w.now() + core_reap::BACKUP_FAIL_RETRY - 5), "{p:?}");
+    assert_eq!(
+        w.notified(),
+        [format!(
+            "arena reap [devtest] git_failed devtest-alpha: {why}; on the pod: resolve the conflicts and `git add` them, then `git \
+             commit` — or abort it (`git merge --abort`); retried in 6h"
+        )]
+    );
+    // The log keeps its fixed vocabulary: the row is the git step's.
+    let log = w.store().read_log().unwrap();
+    assert!(log.iter().any(|l| l.contains("\"kind\":\"act\"") && l.contains("\"row\":\"git_failed\"")), "{log:#?}");
+    // And the next run backs off, as for any failed backup.
+    w.tick(300);
+    w.step("apply").await;
+    assert!(w.terminated().is_empty());
+    assert_eq!(w.last_row(&a), Some(Row::BackoffAfterFailure));
+
+    // The other operations' words; a branch that isn't a plain ref name isn't echoed.
+    for (case, git, said) in [
+        (
+            "busy-cherry",
+            "BUSY autocommit-x cherry-pick\n",
+            "a cherry-pick is in progress on autocommit-x — not reaped until it's finished or aborted; on the pod: finish it (`git \
+             cherry-pick --continue`) or abort it (`git cherry-pick --abort`); retried in 6h",
+        ),
+        (
+            "busy-conflicts",
+            "BUSY $(reboot)\u{1b}[2J conflicts\n",
+            "its branch has unresolved conflicts — not reaped until they're resolved or undone; on the pod: resolve them and `git \
+             add` them, or undo them (`git reset --merge`); retried in 6h",
+        ),
+    ] {
+        let (w, _) = due_world(case, "").await;
+        w.sim(22001, |s| s.git = (6, git.into()));
+        let (_, out) = w.run("apply").await;
+        assert!(w.terminated().is_empty(), "{case}");
+        assert_eq!(w.notified(), [format!("arena reap [devtest] git_failed devtest-alpha: {said}")], "{case}");
+        let why = said.split("; on the pod").next().unwrap();
+        assert!(out.contains(why), "{case}: {out}");
+    }
+    // Any other git failure — exit 6 without a BUSY line, a BUSY line with another exit — is the
+    // git step failing, said as before.
+    for (case, git) in [("git-6-bare", (6, "BRANCH b\n")), ("git-busy-exit1", (1, "BUSY b merge\n"))] {
+        let (w, _) = due_world(case, "").await;
+        w.sim(22001, |s| s.git = (git.0, git.1.into()));
+        let (_, out) = w.run("apply").await;
+        assert!(w.terminated().is_empty(), "{case}");
+        assert_eq!(w.notified(), ["arena reap [devtest] git_failed devtest-alpha: the reap's git backup failed — not reaped; retried in 6h"], "{case}");
+        assert!(out.contains("git backup failed"), "{case}: {out}");
+    }
+}
+
 /// The reap's git step is the backup's, with the configured repo: a pod whose `origin` isn't it
 /// is refused there (nothing pushed), so it isn't reaped until `pods setup`.
 #[tokio::test]

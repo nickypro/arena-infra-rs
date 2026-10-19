@@ -646,7 +646,10 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `--continue`/`--abort`; a `git stash pop`'s conflicts `resolve them and \`git add\` them, or
     undo them (\`git reset --merge\`)`. The run fails.
     It is rsynced like a failed push, even under `--no-pull`, every run until it's ended (the
-    reaper doesn't reap it meanwhile); the backup after that commits as always. A rebase detaches
+    reaper doesn't reap it meanwhile: its git step fails, retried every 6 h, and the run's table
+    and its notification say `a merge is in progress on <branch> — not reaped until it's finished
+    or aborted` with how to end it, while `reap log` and `reap status` keep their fixed words:
+    `git_failed`, `backoff_after_failure`); the backup after that commits as always. A rebase detaches
     HEAD, so it is skipped like `main`.
   - `pods set-branch <branch> <targets|--all> [--hard] [--init-branches]` — switch pods'
     ARENA checkout to a branch. Gentle by default (fetch + checkout + ff-only pull — fails on a diverged/dirty
