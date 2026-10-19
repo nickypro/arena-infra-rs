@@ -12,7 +12,7 @@
 #                              saves there (what a `set-branch --hard` copies first, .git and all):
 #                              <what> is the first of BUSY's word, `changes` (to tracked files),
 #                              `commits` (that no remote has), `untracked` (files not ignored)
-#   NO_CHANGES <branch>        clean tree and HEAD == its upstream: nothing to push (exit 0)
+#   NO_CHANGES <branch>        clean tree and HEAD == origin's <branch>: nothing to push (exit 0)
 #   PUSHED <branch>            committed what there was and/or pushed unpushed commits (exit 0)
 #   BIGSKIP <bytes> <path>     a file over <max file bytes>, kept out of the commit (stays on disk)
 #   NESTED_ADOPTED <path>      a nested clone whose files this repo now tracks (its .git untouched)
@@ -84,7 +84,9 @@ if [ "$B" = main ] || [ "$B" = master ] || [ "$B" = HEAD ]; then
     # since the switch's own fetch, nothing here knows — so any counts). A nested repo (listed as
     # `dir/`) doesn't: the image ships clones like that, and the switch leaves them be. Read-only
     # for the participant's git: no optional locks, the tracked files compared through a copy of
-    # the index (`tracked_changed`), so their own git never meets an index.lock of ours.
+    # the index (`tracked_changed`), so their own git never meets an index.lock of ours. Commits
+    # count only when *no* remote has them, `upstream` included: those a `git pull upstream main`
+    # brought are the course's, which a reset doesn't lose.
     GD=$(git rev-parse --absolute-git-dir)
     W=$(busy_op "$GD")
     if [ -z "$W" ] && tracked_changed "$GD"; then W=changes; fi
@@ -256,15 +258,19 @@ busy_stop
 if ! git diff --cached --quiet; then git commit -q -m "$MSG"; fi
 
 # --- Push -----------------------------------------------------------------------------------
-# Ahead of the upstream (or no upstream yet) → there is something to push, whether it was
-# committed just now or by an earlier run whose push failed: "nothing staged" isn't "nothing to
-# do". Only a clean tree *and* HEAD == @{u} is NO_CHANGES.
-if git rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
-    AHEAD=$(git rev-list --count '@{u}..HEAD')
-    set -- '@{u}..HEAD'
+# Ahead of origin's copy of the branch (or origin has none yet) → there is something to push,
+# whether it was committed just now or by an earlier run whose push failed: "nothing staged"
+# isn't "nothing to do". Only a clean tree *and* HEAD == origin's branch is NO_CHANGES. Origin's
+# — the remote this pushes to — never "any remote's" or the branch's configured upstream: setup
+# adds the course repo as `upstream`, and a commit only it has (a `git pull upstream main`), or a
+# branch made from `upstream/main` and tracking it, read as already pushed while origin had none
+# of it (review ai-review claude #6).
+if git rev-parse -q --verify "refs/remotes/origin/$B" >/dev/null; then
+    AHEAD=$(git rev-list --count "refs/remotes/origin/$B..HEAD")
+    set -- "refs/remotes/origin/$B..HEAD"
 else
     AHEAD=new
-    set -- HEAD --not --remotes
+    set -- HEAD --not --remotes=origin
 fi
 if [ "$AHEAD" = 0 ]; then echo "NO_CHANGES $B"; exit 0; fi
 # A file over GitHub's own limit already in the unpushed commits (committed before this guard,
@@ -280,7 +286,7 @@ if [ -s "$T.stuck" ]; then
         oldest=$(git rev-list "$@" | tail -n 1)
         base=$(git rev-parse -q --verify "$oldest^" 2>/dev/null) || base=none
     else
-        base=$(git rev-parse '@{u}')
+        base=$(git rev-parse "refs/remotes/origin/$B")
     fi
     echo "BIGSTUCK_BASE $base"
     echo "a file over $((LIMIT / 1048576)) MB is in the unpushed commits of $B: GitHub refuses every push of it (GH001) until they're rewritten." >&2
@@ -316,18 +322,19 @@ push_block_reason() {
 # 14-24 commits each, fixed by hand with filter-branch) or by the participant by hand ("commit
 # all" on a file whose key the backup keeps out of git). Whether GitHub refuses it depends on
 # the repo's push-protection settings; it must never leave the pod either way. So the blobs of
-# the commits going out — only those on no remote branch, `HEAD --not --remotes`, never anything
-# GitHub already has — are scanned before the push (one `cat-file --batch | grep -q`: usually a
-# single commit this run made, already clean), and if one holds a key those commits are
-# rewritten with it redacted, by plumbing alone: each commit's tree through a temporary index,
-# then `commit-tree` with its own author, committer, dates, message and (mapped) parents, merges
-# included. Deterministic, and a commit with nothing to redact and unchanged parents keeps its
+# the commits going out — only those on no branch of origin's, `HEAD --not --remotes=origin`,
+# never anything this repo on GitHub already has (a commit only `upstream`, the course repo, has
+# is scanned: origin has never had it) — are scanned before the push (one `cat-file --batch |
+# grep -q`: usually a single commit this run made, already clean), and if one holds a key those
+# commits are rewritten with it redacted, by plumbing alone: each commit's tree through a
+# temporary index, then `commit-tree` with its own author, committer, dates, message and
+# (mapped) parents, merges included. Deterministic, and a commit with nothing to redact and unchanged parents keeps its
 # id. The participant's files are never read or written. The new tip is pushed as a
 # fast-forward (never forced), and only then does the branch move — compare-and-swap, so a
 # commit made meanwhile is never lost: the run stops there (HEAL_ABORTED), and the next one redoes
 # the same rewrite (same ids: a fast-forward of what was pushed) with that commit on top.
 TIP=$(git rev-parse HEAD)
-git rev-list --objects HEAD --not --remotes | git cat-file --batch-check='%(objecttype) %(objectname) %(rest)' \
+git rev-list --objects HEAD --not --remotes=origin | git cat-file --batch-check='%(objecttype) %(objectname) %(rest)' \
     | awk '$1 == "blob" { print $2 }' | sort -u > "$T.blobs"
 : > "$T.hmap"
 if [ -s "$T.blobs" ]; then
@@ -344,7 +351,7 @@ fi
 N=0
 NEW=$TIP
 if [ -s "$T.hmap" ]; then
-    git rev-list --reverse --topo-order HEAD --not --remotes > "$T.commits"
+    git rev-list --reverse --topo-order HEAD --not --remotes=origin > "$T.commits"
     while read -r c; do
         ps=
         same=1

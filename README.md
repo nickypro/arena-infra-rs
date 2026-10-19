@@ -585,7 +585,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
   - `pods backup [targets]` — the **full save**: git-push the ARENA tree **and** rsync the
     home to the local backups folder (`pull`). The git push is on **whatever branch the
     pod is on** (never switches/creates one, so bespoke branches are respected) and
-    **skips `main`/`master`**; clean trees report `NO_CHANGES`. Selected pods, or — none
+    **skips `main`/`master`**; clean trees in step with origin's copy of the branch report
+    `NO_CHANGES` (origin's — never the branch's own upstream: a branch made from `upstream/main`,
+    tracking it, is pushed like any other). Selected pods, or — none
     named (no targets, `all`/`--all`) — **this cohort's**: `<prefix>-…` pods (one off
     `MACHINE_NAME_LIST` too: an extra pod made for someone, a parked `-old` twin), never an `@`
     staff entry. The rest (staff boxes, another prefix, a pod the provider named) get one
@@ -631,7 +633,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     keeps the key (the code still runs) and shows as modified; reported per pod (`redacted N
     pasted key(s) in …`). **Unpushed commits holding a key** — an older backup's, or one the
     participant made by hand — are rewritten before the push, whatever GitHub would do: just
-    those commits (none a remote has), the key redacted — same messages, authors, dates — and
+    those commits (none origin has — one only the course's `upstream` has, its `main` merged in,
+    is scanned too: origin never had it), the key redacted — same messages, authors, dates — and
     pushed as a fast-forward, never forced; files on disk untouched. A secret the patterns don't
     know, refused by GitHub, fails the pod with GitHub's name for it and its path:line (never the
     secret, never GitHub's allow-URL). **A pod whose push itself fails** (a refusal, a big file,
@@ -711,7 +714,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `main`/`master` (or a detached HEAD) no backup commits or pushes: the backup there only says
     what a reset could discard — the first of an operation in progress, changes to tracked files
     (compared through a copy of the index, so the participant's own is never written), commits no
-    remote has, untracked files git doesn't ignore — and **`--hard` copies such a pod
+    remote has (one only `upstream` has is the course's, not lost), untracked files git doesn't
+    ignore — and **`--hard` copies such a pod
     first** too, `.git` and all (`⚠ NOT COMMITTED FIRST: main has uncommitted changes to tracked
     files, and no backup commits on main; …`, `⚠ NOT PUSHED FIRST: main has commits no remote has,
     and no backup pushes main; … that copy has its .git, those commits with it; …`), never

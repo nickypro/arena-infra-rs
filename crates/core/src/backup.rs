@@ -454,11 +454,14 @@ pub fn backup_script() -> String {
 /// Flow: resolve the current branch; skip if protected; ensure a git identity; adopt the
 /// image's nested clones into the repo once (their files tracked in place, their own `.git`
 /// untouched), keep any other nested repo out of the commit (never a gitlink); stage everything but files over the limit; commit if anything is
-/// staged; then push whenever the branch has **no upstream yet or is ahead of it** — not
-/// only when this run committed. A push that failed last tick (network blip, GitHub outage,
-/// a key briefly missing) leaves its commit local and the tree clean, so "nothing staged"
-/// must not read as "nothing to do": the next tick retries the push. Only a clean tree *and*
-/// `HEAD == @{u}` prints `NO_CHANGES <branch>` (exit 0); a push prints `PUSHED <branch>`. A
+/// staged; then push whenever **origin has no such branch yet or the branch is ahead of
+/// origin's** — not only when this run committed. A push that failed last tick (network blip,
+/// GitHub outage, a key briefly missing) leaves its commit local and the tree clean, so "nothing
+/// staged" must not read as "nothing to do": the next tick retries the push. Only a clean tree
+/// *and* `HEAD == refs/remotes/origin/<branch>` prints `NO_CHANGES <branch>` (exit 0); a push
+/// prints `PUSHED <branch>`. "Already pushed" always means on origin — the branch's configured
+/// upstream and the course repo setup adds as `upstream` don't count (review ai-review claude
+/// #6): a commit only `upstream` has is scanned for keys and redacted like any other. A
 /// file over GitHub's limit already in the unpushed commits fails it with
 /// [`BACKUP_STUCK_EXIT`] and what to reset to — before a push GitHub would refuse.
 /// `set -e` aborts on any other error, so a rejected push is a failure.
@@ -1080,8 +1083,9 @@ mod tests {
         assert!(s.contains(r#"git add -A -- "$@""#));
         assert!(s.contains("NO_CHANGES $B"));
         assert!(s.contains(r#"git commit -q -m "$MSG""#));
-        // "Nothing staged" isn't "nothing to do": push whenever ahead of / without an upstream.
-        assert!(s.contains("git rev-list --count '@{u}..HEAD'"));
+        // "Nothing staged" isn't "nothing to do": push whenever ahead of origin's branch, or origin
+        // has none — origin's, never the branch's own upstream (ai-review claude #6).
+        assert!(s.contains(r#"git rev-list --count "refs/remotes/origin/$B..HEAD""#) && !s.contains("@{u}"));
         assert!(s.contains(r#"set -- -u origin "$B""#) && s.contains(r#"git push "$@""#) && s.contains("PUSHED $B"));
         assert!(s.contains("Arena Autocommit"));
         assert!(s.contains(r#"export GIT_SSH_COMMAND="ssh -i $KEY"#));
@@ -3525,6 +3529,54 @@ done
     fn run_on_path(cmd: &str, path: &str) -> (Option<i32>, String, String) {
         let o = std::process::Command::new("bash").arg("-c").arg(cmd).env("PATH", path).output().expect("bash");
         (o.status.code(), String::from_utf8_lossy(&o.stdout).into_owned(), String::from_utf8_lossy(&o.stderr).into_owned())
+    }
+
+    /// Review ai-review claude #6: setup adds the course repo as `upstream`, and "already pushed"
+    /// meant "on any remote" — so a commit only `upstream` had (its `main` merged into the day's
+    /// branch) was never scanned for keys and went to origin with the course's key-shaped example
+    /// in it (or was refused by push protection every tick); and a branch made from
+    /// `upstream/main`, tracking it, read as in sync (`NO_CHANGES`) though origin had none of it.
+    /// Now "pushed" means on origin: the course's commit goes out redacted, the file on disk and
+    /// upstream's own ref untouched, and that branch is pushed.
+    #[cfg(unix)]
+    #[test]
+    fn a_key_in_a_commit_only_upstream_has_is_redacted_before_it_reaches_origin() {
+        let s = GitSandbox::new("upstream-key", 1_000_000);
+        let key = openrouter_key(21);
+        let course = s.base.join("course");
+        s.git(&s.base, &["clone", "-q", "-b", "main", s.origin.to_str().unwrap(), course.to_str().unwrap()]);
+        let example = format!("Set your key: OPENROUTER_API_KEY = \"{key}\"\n");
+        std::fs::write(course.join("course_key.md"), &example).unwrap();
+        s.git(&course, &["add", "course_key.md"]);
+        s.git(&course, &["-c", "user.name=u", "-c", "user.email=u@u", "commit", "-q", "-m", "course update"]);
+        let theirs = s.git(&course, &["rev-parse", "HEAD"]);
+        s.git(&s.work, &["remote", "add", "upstream", course.to_str().unwrap()]);
+        s.git(&s.work, &["fetch", "-q", "upstream"]);
+        // The participant's own work, backed up; then the course's update merged in.
+        std::fs::write(s.work.join("mine.py"), "mine = 1\n").unwrap();
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into()))), "{err}");
+        s.git(&s.work, &["merge", "-q", "--no-edit", "--no-ff", "upstream/main"]);
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome.clone()), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into()))), "{err}");
+        assert_eq!(r.history.as_ref().map(|h| h.0), Some(2), "the course's commit and the merge, rewritten");
+        assert!(!s.origin_holds(&key), "the key reached origin");
+        assert_eq!(
+            s.git(&s.work, &["show", "origin/autocommit-x:course_key.md"]),
+            "Set your key: OPENROUTER_API_KEY = \"REDACTED-OPENROUTER-KEY\""
+        );
+        assert_eq!(s.read("course_key.md"), example.as_bytes(), "the file on disk keeps it");
+        assert_eq!(s.git(&s.work, &["rev-parse", "upstream/main"]), theirs, "upstream's own ref untouched");
+        // A branch made from upstream's main, tracking it: origin has none of it, so it's pushed
+        // (redacted), and from then on tracks origin's.
+        s.git(&s.work, &["checkout", "-q", "-f", "-b", "mine", "upstream/main"]);
+        assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "mine@{u}"]), "upstream/main");
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome), (Some(0), Some((BACKUP_PUSHED, "mine".into()))), "{err}");
+        assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "mine@{u}"]), "origin/mine");
+        assert!(!s.origin_holds(&key));
+        let (code, r, _) = s.backup();
+        assert_eq!((code, r.outcome), (Some(0), Some((BACKUP_NO_CHANGES, "mine".into()))));
     }
 
     /// Review ai-review codex #1: the operation check ran once, before the scans. A participant's
