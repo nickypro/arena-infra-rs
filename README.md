@@ -18,11 +18,16 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     the legacy bash/python scripts.
   - `provider::Provider` — the single trait every backend implements.
   - `provider::runpod` — RunPod REST **v1** backend: list / create / stop / terminate.
-    RunPod retires REST v1 on **2026-11-15**.
-  - `provider::runpod_v2` — RunPod REST **v2** backend (`api.runpod.io/v2`), opt-in via
-    `RUNPOD_API=v2` (default `v1`; any other value is an error, which quotes the value only
-    if it's short and version-like — never a pasted key; `config check` shows which is
-    active). Same provider name and commands. Differences: real lifecycle statuses
+    RunPod retires REST v1 on **2026-11-15**; used only with an explicit `RUNPOD_API=v1`
+    (which `config check` warns about, with the date and `remove RUNPOD_API=v1 (v2 is the
+    default)`).
+  - `provider::runpod_v2` — RunPod REST **v2** backend (`api.runpod.io/v2`), the **default**:
+    `RUNPOD_API` unset or empty means v2 (`v1`/`v2` in any case select one; any other value
+    is an error, which quotes the value only if it's short and version-like — never a
+    pasted key; `config check` shows which is active, `(default)` when unset). Why the
+    default: v1 retires on 2026-11-15, and v1 can only ask for hosts on CUDA ≤ 13.0 (below),
+    which starved RunPod placement — "no capacity" all day once the 13.0 hosts were taken.
+    Same provider name and commands. Differences: real lifecycle statuses
     (`PROVISIONING`/`STARTING`/`RUNNING`/`EXITED`/`ERROR`); the SSH endpoint comes from
     `ssh.direct` only; create always sends `cloud` (v2 defaults to SECURE) and merges the
     account's registered SSH keys into `PUBLIC_KEY` (v2 skips them when it's set);
@@ -47,7 +52,7 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     qualifies (an exact `["13.0"]` had made every 13.1/13.2 host — all B300 MIG ones — "no
     capacity"). REST v1 has no floor and its schema stops at 13.0: it sends every listed
     version ≥ the floor (13.1+ hosts unreachable; a 13.1+ floor or `EXACT_CUDA_VERSIONS`
-    entry is refused before the request, naming `RUNPOD_API=v2`). `EXACT_CUDA_VERSIONS` is
+    entry is refused before the request: `remove RUNPOD_API=v1 (v2 is the default)`). `EXACT_CUDA_VERSIONS` is
     the opt-in exact set (`allowedCudaVersions`; never sent with a floor). A value that isn't
     a version (`13.x`, `newest`) fails closed everywhere — every create (RunPod and Vast) is
     refused and the deep check won't derive a driver floor from it — never read as "no floor".
@@ -204,15 +209,16 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     nudge when unknown; an opt-in account — Shadeform, never in the default provider chain —
     at $0 with nothing billing there reads plainly, `shadeform $0.00 live unfunded`: it's
     unfunded on purpose, and alarms like any other once a pod bills there), observed while the list runs — within 5 s, a live read only when
-    the last one is 5 min old, silent whatever happens; `--json` reads no balance at all. GPU/$/maintenance come from one extra read-only
-    RunPod GraphQL query per `list` (on `RUNPOD_API=v2` the REST list already has GPU and $,
-    so GraphQL adds only maintenance) (best-effort: if it fails you get one warning line and
+    the last one is 5 min old, silent whatever happens; `--json` reads no balance at all. The maintenance window comes from one extra read-only
+    RunPod GraphQL query per `list` (on REST v2, the default, the REST list already has GPU and
+    $; on `RUNPOD_API=v1` that query supplies them too) (best-effort: if it fails you get one warning line and
     the list still renders); the `nvidia-smi` probe over SSH (default for the table,
     `--probe`/`--no-probe`) overrides the GPU when a pod answers. `list --json` emits the
     pods incl. `gpu_count`/`cost_per_hr`/`maintenance`. **`restart` WIPES a RunPod pod's
-    container disk** (live finding: on `RUNPOD_API=v2` the container is reset to its image —
-    everything outside a `/workspace` volume, `~/.name`, setup's git remote and keys are gone;
-    a v1 restart was seen keeping it, so on v1 it is gated and set up again the same way, but
+    container disk** (live finding: on REST v2 — the default — the container is reset to its
+    image — everything outside a `/workspace` volume, `~/.name`, setup's git remote and keys
+    are gone, so only `VOLUME_GB` keeps work across a restart;
+    a v1 restart (`RUNPOD_API=v1`) was seen keeping it, so on v1 it is gated and set up again the same way, but
     the output only ever says it *may* have reset; Vast's stop+start is treated the same,
     unverified; a Hetzner hard reset keeps the VM disk). The
     prompt says what's lost and what survives (the volume size comes from the pod's spec);
@@ -274,12 +280,13 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     name that already has its own row or key is left alone and warned about), then syncs
     the proxy. The pod's `MACHINE_NAME` env var keeps the old name (env only changes with a
     reimage) — the output says so. `--dry-run` lists every step.
-  - `pods lock [targets]` / `pods unlock [targets]` (targets or `--all`; RunPod with
-    `RUNPOD_API=v2`) — a **locked** pod is refused stop, restart and terminate by RunPod
+  - `pods lock [targets]` / `pods unlock [targets]` (targets or `--all`; RunPod on REST v2,
+    the default) — a **locked** pod is refused stop, restart and terminate by RunPod
     itself, from **any** client (this tool, scripts, RunPod's web console; live-verified
     2026-10-08) — the protection for a running cohort. Setup, backups, `run` and SSH are
     unaffected. Already-locked pods are left alone; a pod on a backend that can't lock
-    (v1, Vast, Hetzner) is reported (`not supported — … RUNPOD_API=v2`) and makes the exit
+    (`RUNPOD_API=v1`, Vast, Hetzner) is reported (`not supported on … — …`; on v1 `remove
+    RUNPOD_API=v1 (v2 is the default) to lock RunPod pods`) and makes the exit
     non-zero. `pods up --lock` locks each pod as the pipeline's **last** step (after
     `--check`, whose replacement needs to terminate; a lock that fails is `FAILED lock`, the
     pod left running, unlocked); `--lock` is refused up front where pods can't be locked.
@@ -343,16 +350,17 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     (`RTX PRO 6000`, `B300 MIG 34GB` — checked before the aliases, so `RTX PRO 6000` is the
     Server Edition, as listed), an alias (`3070`, `4080super`, `L4`, `2000ada`, `A4500`, …)
     or a unique catalog short name (`RTX 3070`, `H100 SXM`) — must be in RunPod's
-    live GPU catalog (GraphQL on v1, `GET /v2/catalog/gpus` on `RUNPOD_API=v2`), else the
+    live GPU catalog (`GET /v2/catalog/gpus` on v2, the default; GraphQL on `RUNPOD_API=v1`), else the
     command stops before anything is created: ``--gpu: `3070x`
     isn't a RunPod GPU type — did you mean `NVIDIA GeForce RTX 3070` (RTX 3070)?``. If the
     catalog can't be fetched it warns and passes the flag through unchecked. On REST v1 an
     id outside v1's create enum (it lags the catalog — the PRO 6000 MIG slices) is refused
-    too, pointing at `RUNPOD_API=v2`. Vast/Hetzner: passed through as before.
+    too, saying v2's create takes it: `remove RUNPOD_API=v1 (v2 is the default)`. Vast/Hetzner:
+    passed through as before.
   - **Multi-option placement** (`create`/`up`): `--gpu A4000,4000Ada,3090 --cloud
     community,secure --max-price 0.5 [--order cheapest|listed]`. The gpu × cloud options
-    are priced (RunPod's live catalog — v2 `/catalog/gpus` per tier on `RUNPOD_API=v2`, once
-    per tier per run, GraphQL on v1 — falling back to preset estimates, shown `~`), capped
+    are priced (RunPod's live catalog — v2 `/catalog/gpus` per tier (the default), once
+    per tier per run, GraphQL on `RUNPOD_API=v1` — falling back to preset estimates, shown `~`), capped
     per pod (price × `--gpus`; with a cap an option with no known price is dropped, not
     risked) and ordered: `cheapest`
     (default; a price tie goes to the better stock hint, then the listed order) or `listed`
@@ -992,8 +1000,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     "locked" sets an automatic hold. Needs an explicit absolute `ARENA_STATE_DIR` **in the
     config file** (state: `reap.json`, log: `reap-log.jsonl`) — a shell exporting a different
     one is refused (it would put a `hold` where the cron never looks); every state change
-    prints the file it wrote — RunPod on `RUNPOD_API=v2` (v1 and Vast are never
-    reaped), absolute `LOCAL_BACKUP_DIR`, a `.arena-backup-tier` marker on each backup root
+    prints the file it wrote — RunPod on REST v2, the default (pods on `RUNPOD_API=v1` and Vast
+    are never reaped), absolute `LOCAL_BACKUP_DIR`, a `.arena-backup-tier` marker on each backup root
     (`snapshot` / `big`; the big tier's root is `LOCAL_BACKUP_BIG_DIR`, default
     `<LOCAL_BACKUP_DIR>/big`), `ARENA_START_DATE` and no `BACKUP_REMOTE_PATH`; `config check`
     lists what's missing once the reaper is on or its cron line is installed (off: one `·
@@ -1014,7 +1022,7 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     writable mount, any file in a `TEMP_FOLDER_FOR_SWEEPS/`, data written outside the home since
     the pod was created (or a link out of the home), a pod whose provider gives no creation
     time, a MIG GPU slice (`[N/A]` utilisation reads as unknown), RunPod
-    on `RUNPOD_API=v1` (the default) and Vast (no lock state — `up --expire-*` refuses them,
+    on `RUNPOD_API=v1` and Vast (no lock state — `up --expire-*` refuses them,
     ENDS shows `not reapable (…)`), a pod renamed outside arena or sharing its name, a home
     that's a link to another filesystem, `~/.arena/keep`. A tmux session whose panes run only
     a shell doesn't count (its utmp entries aren't logins); one running anything else does.
@@ -1250,11 +1258,11 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     Secrets are redacted (env values, key/token/password fields, `rpa_`/`sk-`/`hf_` tokens,
     SSH key material) unless `--raw`; the API key itself is never printed, `--raw` included
     (scrubbed from the body as received, before an error message clips it).
-  - `gpus` — list the GPU types for `--gpu`: RunPod's **full live catalog** (via GraphQL;
-    on `RUNPOD_API=v2` via `GET /v2/catalog/gpus` for both tiers — STOCK shown as
+  - `gpus` — list the GPU types for `--gpu`: RunPod's **full live catalog** (via
+    `GET /v2/catalog/gpus` for both tiers, the default — STOCK shown as
     `community/secure`, counted over hosts at or above the CUDA floor, and the best signal the
-    answer carries (a data center's level, a CUDA version tagged available) — no GraphQL)
-    when on RunPod with a key, else the local presets. Shows VRAM, **live**
+    answer carries (a data center's level, a CUDA version tagged available) — no GraphQL; via
+    GraphQL on `RUNPOD_API=v1`) when on RunPod with a key, else the local presets. Shows VRAM, **live**
     community/secure $/hr (a tier that doesn't offer the card shows `-`: v1's GraphQL quotes
     phantom prices for those, dropped by its `secureCloud`/`communityCloud` flags) and
     RunPod's stock hint (`~` marks a preset estimate). On
@@ -1561,8 +1569,8 @@ Notes / sharp edges to know:
 
 Any key in `config.env` can be overridden by an **environment variable of the same
 name** (env wins; it can't introduce brand-new keys — except a short allowlist such as
-`ARENA_START_DATE`, `SSH_PROXY_RELOAD_CMD` and `RUNPOD_API`, e.g. `RUNPOD_API=v2 arena pods
-list` to try the RunPod v2 backend for one command). This is how you point at an SSH
+`ARENA_START_DATE`, `SSH_PROXY_RELOAD_CMD` and `RUNPOD_API`, e.g. `RUNPOD_API=v1 arena pods
+list` to use the retiring RunPod v1 backend for one command, until 2026-11-15; v2 is the default). This is how you point at an SSH
 key the current user can actually read, without editing the shared, read-only prod
 config — e.g. when the dashboard's metrics show `ssh connect failed … key unreadable`
 because the configured key lives under `/root`:
@@ -1779,7 +1787,7 @@ cd /home/dev/sandbox/arena-infra-rs
 ARENA_LIVE_SMOKE=1 ARENA_LIVE_CONFIG=/home/dev/sandbox/config.env \
   ARENA_LIVE_BIN=/home/dev/sandbox/bin/arena-dev \
   cargo test --release -p arena-cli --test live_smoke -- --ignored --nocapture
-# also: RUNPOD_API=v2 (smoke the v2 backend) · ARENA_LIVE_GPU=3070 (the --gpu list)
+# also: RUNPOD_API=v1 (smoke the retiring v1 backend; unset = the config's line, else v2) · ARENA_LIVE_GPU=3070 (the --gpu list)
 ```
 
 `ARENA_LIVE_BIN` (optional, recommended in the sandbox) runs the commands through a wrapper

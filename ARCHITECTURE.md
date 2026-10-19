@@ -26,8 +26,8 @@ flowchart TD
     subgraph core[arena-core · library · all logic + safety]
         Config["config<br/>config.env + env overrides"]
         Fleet{{"Provider (trait)<br/>provider::build_fleet → MultiProvider<br/>list · list_by_provider · enrich · create · stop<br/>restart · start · terminate · rename · reimage · pod_spec · set_locked"}}
-        RP1["runpod<br/>REST v1 + GraphQL"]
-        RP2["runpod_v2<br/>REST v2 (RUNPOD_API=v2)"]
+        RP1["runpod<br/>REST v1 + GraphQL (RUNPOD_API=v1)"]
+        RP2["runpod_v2<br/>REST v2 (the default)"]
         Vast["vast<br/>(offer-search rent)"]
         Hz["hetzner<br/>(CPU VMs)"]
         Sf["shadeform<br/>(GPU VMs, opt-in)"]
@@ -96,7 +96,7 @@ flowchart TD
 |--------|------|-------|
 | `config` | tolerant `config.env` parser (`KEY=val` + the `MACHINE_NAME_LIST` bash array); any present key but the file-only `REAP_*` ones can be overridden from the environment, and a short allowlist (`ARENA_START_DATE`, `EXTRA_SSH_KEYS`, `HF_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `SSH_PROXY_RELOAD_CMD`, `RUNPOD_API`, `ARENA_STATE_DIR`) may be introduced from it | parse: yes |
 | `provider` | the `Provider` trait, `build` (one backend by name) and `build_fleet` (`MultiProvider`: lists every configured backend, creates on the `--provider` one, routes per-pod calls to the owner). `list_by_provider` keeps each backend's own Ok/Err — a failed listing is never "no pods"; `list_complete` (every name-picking caller: create/up, placement retry rounds, rename, the TUI's add form) fails if any backend didn't answer — between retry rounds (`placement::relist`, both create paths) a recoverable failure (429/5xx, or a list stalled past its bound) skips that round instead of ending the run. List calls bounded at 60 s (`LIST_TIMEOUT`, an `Error::Timeout`); mutating calls deliberately aren't | trait + I/O |
-| `provider::runpod` / `runpod_v2` | RunPod REST v1 (which RunPod retires on 2026-11-15) and REST v2 (`RUNPOD_API=v2`: paginated listing, real lifecycle statuses, explicit `cloud`, account SSH keys merged into `PUBLIC_KEY`). v1 uses GraphQL for rename, maintenance windows, the GPU catalog and network volumes; v2 renames (name-only `PATCH`), locks/unlocks (`{"locked"}`-only `PATCH`) and reads the catalog over REST, keeping GraphQL only for maintenance windows, the balance and a volume-listing fallback (the "GraphQL dependency inventory" in `runpod_v2.rs`); contract tests replay recorded v2 responses (`provider/fixtures/runpod_v2/`) | builders/parsers pure |
+| `provider::runpod` / `runpod_v2` | RunPod REST v2 (the default — `RUNPOD_API` unset, empty or `v2` — paginated listing, a real host CUDA floor, real lifecycle statuses, explicit `cloud`, account SSH keys merged into `PUBLIC_KEY`, a restart that resets the container) and REST v1 (only with `RUNPOD_API=v1`, which `config check` warns about; RunPod retires it on 2026-11-15). v1 uses GraphQL for rename, maintenance windows, the GPU catalog and network volumes; v2 renames (name-only `PATCH`), locks/unlocks (`{"locked"}`-only `PATCH`) and reads the catalog over REST, keeping GraphQL only for maintenance windows, the balance and a volume-listing fallback (the "GraphQL dependency inventory" in `runpod_v2.rs`); contract tests replay recorded v2 responses (`provider/fixtures/runpod_v2/`) | builders/parsers pure |
 | `provider::vast`, `provider::hetzner` | Vast rents the cheapest matching *offer* (name carried as the instance label — its offer search still sends the flat query body Vast now rejects, see FEATURE_MAP); Hetzner creates CPU VMs sized by `HETZNER_*` | parsers pure |
 | `provider::shadeform` | opt-in overflow GPU VMs (`--provider shadeform`): catalog → `fitting_entries` (clouds/regions allowlists, VM, on-demand, `best_os` at the CUDA floor, boot time, price cap) → create with a nonce tag and a rendered bootstrap script (`shadeform_bootstrap.sh`: cohort keys for root, the nonce file); an unsure create is settled by listing for the nonce (`create_outcome`, `find_by_nonce`), a created one price-checked (`price_guard`); ownership (`is_ours`: prefix name + `arena-<prefix>` tag) guards terminate/rename/restart; no stop (`stop_support`), a ready deadline (`ready_deadline`) that `up` turns into delete + next option; `/sshkeys` and `/account` typed at parse (no private key, no personal data kept); contract tests replay recorded GETs (`provider/fixtures/shadeform/`) | catalog/create/parse pure; loopback-tested I/O |
 | `http`, `retry` | every response's **status is read before its body is parsed**, so a 401 with an HTML body is classified `Auth`, a 429/5xx transient, a capacity message `Capacity`; `retry` backs off on transient errors only | yes |
@@ -127,8 +127,8 @@ flowchart TD
 
 1. `Config::load` reads `--config` (default: the read-only prod copy) and applies
    environment overrides.
-2. `provider::build_fleet("runpod", cfg)` builds the RunPod backend (v1 or v2 per
-   `RUNPOD_API`, validated up front) plus every other provider that has credentials.
+2. `provider::build_fleet("runpod", cfg)` builds the RunPod backend (v2, or v1 when
+   `RUNPOD_API=v1`; validated up front) plus every other provider that has credentials.
 3. `--gpu` is checked against RunPod's live GPU catalog (`gpu::check_gpu_flag`; on v1 also
    its create enum): a typo stops here, before anything is listed or created.
 4. The fleet is listed (`provider::list_complete`, transient errors retried; if *any*
