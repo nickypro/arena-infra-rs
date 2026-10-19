@@ -679,6 +679,37 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `git_failed`, `backoff_after_failure`); the backup after that commits as always. A rebase detaches
     HEAD, so it is skipped like `main` — and said (`UNCOMMITTED HEAD rebase`), so `set-branch
     --hard` copies it first.
+    **Left alone, it is finished** — `BUSY_AUTO_RESOLVE_HOURS` whole hours (default 3; `0`/`off`:
+    never), the human's rule (2026-10-19: "backup files + some automated heuristic … whatever
+    changes are most recent … after like 3h of no activity"). Before its copy, `pods backup` looks
+    at the pod (read-only, under its lock), and it needs all of: the operation started (its
+    `MERGE_HEAD`/`CHERRY_PICK_HEAD`/`REVERT_HEAD`; the index for a stash pop's conflicts), every
+    file git lists (tracked, and untracked but not ignored; never `.git`) and any terminal login's
+    typing (`who`'s ttys) older than that, on the pod's own clock; and this run's copy, taken after
+    that look, done with its `.git` (a copy that failed: never). Then, on the pod, under its lock,
+    each conflicted path is kept as the participant resolved it — a regular text file with no
+    conflict marker left, both sides there — or else taken from the side whose commit is newer
+    (committer time of HEAD vs `MERGE_HEAD`/`CHERRY_PICK_HEAD`/`REVERT_HEAD`, or the stash entry;
+    a tie keeps HEAD's): `git checkout --ours|--theirs`, a binary file and a symlink the same way,
+    a path that side deleted removed. The conflicted files as they were are kept first in
+    `.git/arena-resolved/<UTC stamp>/` (on the pod, and in every later copy). A merge becomes a
+    real merge commit, a cherry-pick or revert is `--continue`d (one left empty is committed empty,
+    as git advises), a stash pop's conflicts are added (its stash entry stays) — in the repo's own
+    identity, never `-c user.*` — the message saying so (`arena: finished a merge left in progress
+    for 3h+` … `kept the newer side (HEAD 2026-10-19 / MERGE_HEAD 2026-10-12) for a.py, b.ipynb;
+    kept your hand-resolved c.py; the state before is in the backup copy w2d1/<pod> and on this
+    machine in .git/arena-resolved/…/`). The resolve looks again first and touches nothing if
+    anything changed since the look its copy followed (`⊘ <pod>: not finished automatically —
+    changed: files changed since the copy`). Then the pod is backed up again in the same run, as
+    any — `✓ <pod> -> <branch> — finished a merge left for 3h+ (kept the newer side, MERGE_HEAD's,
+    for 2 files and the hand-resolved version of 1; before: <dir>/w2d1/<pod>, and
+    <repo>/.git/arena-resolved/… on the pod)` — and it isn't a failure of the run. Never a `git
+    am`, a rebase or a sequence (what they'd go on to apply is the participant's), nor anything
+    unusual — conflicts not from the newest stash entry, a submodule in conflict, a merge of
+    several branches, no git identity in the repo: those stay BUSY. The TUI's backup and the
+    reaper's git step copy nothing first, so they don't finish one; the next cron backup does, and
+    the reaper's retry then finds the pod backed up. Nothing tells the participant but the commit
+    (the reaper's `~/.arena/NOTICE` is its own).
   - `pods set-branch <branch> <targets|--all> [--hard] [--init-branches]` — switch pods'
     ARENA checkout to a branch. Gentle by default (fetch origin + checkout + fast-forward to
     origin's branch, by name — fails on a diverged/dirty tree rather than clobbering work; never

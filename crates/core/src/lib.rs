@@ -35,6 +35,7 @@ pub mod reap;
 pub mod pull;
 pub mod remote;
 pub mod replica;
+pub mod resolve;
 pub mod restore;
 pub mod retry;
 pub mod schedule;

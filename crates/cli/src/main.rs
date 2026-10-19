@@ -31,6 +31,7 @@ mod hetzner_setup_tests;
 mod jobs;
 mod money;
 mod reap;
+mod resolve;
 mod teardown;
 mod up;
 
@@ -1127,6 +1128,8 @@ enum PodCmd {
     /// Pushes the current branch (never main/master), then runs `pods pull`; --no-pull = git
     /// only. No targets (or --all) = this cohort's reachable pods (`<prefix>-*`, not @ staff
     /// entries); name a staff box to include it, or --include-non-cohort for every pod.
+    /// A pod mid-merge is copied instead; one left alone BUSY_AUTO_RESOLVE_HOURS (3) is
+    /// finished by the newer side, then backed up.
     #[command(verbatim_doc_comment)]
     Backup {
         /// Only do the git push; skip the rsync file backup.
@@ -5412,6 +5415,18 @@ fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<String>) {
             note_invalid(&mut missing, &e);
         }
     }
+    // When `pods backup` finishes an operation left in progress on a pod (a bad value: never).
+    let resolve_key = arena_core::resolve::AUTO_RESOLVE_KEY;
+    match arena_core::resolve::auto_resolve_hours(cfg.get(resolve_key)) {
+        Ok(h) => println!(
+            "  · finish a BUSY pod's merge  {} ({resolve_key})",
+            arena_core::resolve::auto_resolve_words(h, cfg.get(resolve_key).is_some_and(|v| !v.trim().is_empty()))
+        ),
+        Err(e) => {
+            println!("  ✗ finish a BUSY pod's merge  {e}");
+            note_invalid(&mut missing, &e);
+        }
+    }
 
     println!("\nBackup archive (optional, `arena archive`):");
     for line in archive::config_check_lines(cfg, &mut missing) {
@@ -5701,15 +5716,20 @@ async fn handle_full_backup(
     let git_result = if sel.pods.is_empty() {
         Ok(())
     } else {
-        handle_backup(remote.clone(), cfg, !dry_run, message, &sel, &mut locks, &mut unpushed).await
+        handle_backup(remote.clone(), cfg, !dry_run, message.clone(), &sel, &mut locks, &mut unpushed).await
     };
     locks.held.clear();
+    // The pods with an operation in progress (BUSY): a look at each before their copy, which,
+    // after it, finishes the ones left alone long enough (`resolve`).
+    let busy = resolve::Busy::look(&remote, cfg, &dir, &sel, &unpushed).await;
     if !no_pull && !sel.pods.is_empty() {
         println!();
         let args = PullRun { label: None, max_size: None, remote_path: None, no_git: false, no_big: false, dry_run, yes: true };
         let pulled = pull_pods(&remote, cfg, &dir, args, &sel, rsync, LockMode::Take(POD_LOCK_WAIT)).await;
-        print_fallback_copies(&unpushed, &pulled);
-        return both_failures(git_result, pulled.and_then(Pulled::result), &locks.busy);
+        let settled = busy.settle(&remote, cfg, &pulled, message.as_deref()).await;
+        print_fallback_copies(&settled.unsettled(&unpushed), &pulled);
+        settled.print();
+        return both_failures(settled.git(git_result, &unpushed), pulled.and_then(Pulled::result), &locks.busy);
     }
     if no_pull && dry_run {
         println!(
@@ -5718,8 +5738,10 @@ async fn handle_full_backup(
         );
     }
     let pulled = copy_unpushed(&remote, cfg, &dir, &sel, &unpushed, rsync, LockMode::Take(POD_LOCK_WAIT)).await;
-    print_fallback_copies(&unpushed, &pulled);
-    both_failures(git_result, pulled.and_then(Pulled::result), &locks.busy)
+    let settled = busy.settle(&remote, cfg, &pulled, message.as_deref()).await;
+    print_fallback_copies(&settled.unsettled(&unpushed), &pulled);
+    settled.print();
+    both_failures(settled.git(git_result, &unpushed), pulled.and_then(Pulled::result), &locks.busy)
 }
 
 /// A pod whose git push failed must never be left with no copy at all: live, the */15 cron runs
@@ -17483,11 +17505,14 @@ mod tests {
         let base = "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple)\nRUNPOD_API_KEY=not-a-real-key\n\
                     HETZNER_API_KEY=not-a-real-key\nGPU_TYPE=\"NVIDIA RTX A4000\"\nIMAGE=img:1\n";
         // (what's added to the base, the keys the check must fail on)
-        let cases: [(&str, &[&str]); 24] = [
+        let cases: [(&str, &[&str]); 27] = [
             ("", &[]),
             ("SHARED_SSH_KEY_PATH=/nonexistent/k\nGIT_SSH_KEY_LOCAL=/nonexistent/d", &[]),
             ("BACKUP_TIMEOUT_SECS=soon", &["BACKUP_TIMEOUT_SECS"]),
             ("BACKUP_TIMEOUT_SECS=0", &["BACKUP_TIMEOUT_SECS"]),
+            ("BUSY_AUTO_RESOLVE_HOURS=3h", &["BUSY_AUTO_RESOLVE_HOURS"]),
+            ("BUSY_AUTO_RESOLVE_HOURS=721", &["BUSY_AUTO_RESOLVE_HOURS"]),
+            ("BUSY_AUTO_RESOLVE_HOURS=off", &[]),
             ("SETUP_TIMEOUT_SECS=5m", &["SETUP_TIMEOUT_SECS"]),
             ("MIN_DRIVER_VERSION=abc", &["MIN_DRIVER_VERSION"]),
             ("VSCODE_PREINSTALL=maybe", &["VSCODE_PREINSTALL"]),
@@ -22884,9 +22909,10 @@ mod remote_tests {
     /// else), and the run fails. The other pods back up as always.
     #[tokio::test]
     async fn a_pod_mid_merge_is_left_as_it_is_said_how_to_end_it_and_copied() {
+        // bloom's look at its merge (`resolve`) fails here: it is copied as before, never finished.
         let script = |fake: &FakeRemote| {
             fake.script(&host(22001), [FakeReply::stdout("BRANCH autocommit-a\nPUSHED autocommit-a\n")]);
-            fake.script(&host(22002), [busy_merge("autocommit-b"), repo_in_place()]);
+            fake.script(&host(22002), [busy_merge("autocommit-b"), FakeReply::exit(2, "sh: cd: no such dir"), repo_in_place()]);
             fake.script(&host(22003), [FakeReply::stdout("BRANCH autocommit-c\nNO_CHANGES autocommit-c\n")]);
         };
         // Each pod's line: bloom's says what is in progress and both ways to end it.
@@ -22929,7 +22955,10 @@ mod remote_tests {
         assert_eq!(err.to_string(), "1 pod(s) failed to back up");
         let copied = stub.take();
         assert!(copied.len() == 3 && copied.iter().all(|d| d.ends_with("/devtest-bloom")), "only bloom, both tiers: {copied:?}");
-        assert_eq!(execs(&fake, 22002)[1], (arena_core::volume::probe_command(REPO), Some(PROBE_TIMEOUT)), "bloom's copy");
+        let bloom_calls = execs(&fake, 22002);
+        assert_eq!(bloom_calls.len(), 3, "its backup, its look, its copy");
+        assert_eq!(bloom_calls[1].0, arena_core::resolve::look_command(REPO), "bloom's look");
+        assert_eq!(bloom_calls[2], (arena_core::volume::probe_command(REPO), Some(PROBE_TIMEOUT)), "bloom's copy");
         for port in [22001, 22003] {
             assert_eq!(execs(&fake, port).len(), 1, "{port}: its backup only");
         }
