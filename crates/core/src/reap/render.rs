@@ -432,13 +432,15 @@ pub const CRON_PATH: &str = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/
 /// keeps the lock from being inherited by what arena spawns (an rsync, ssh, the notify
 /// command): one of them outliving an arena that was killed would otherwise hold it, and every
 /// later tick would skip without a word (RR4; the backup line has had `-o` for that reason).
-/// Its lock and log are in arena's cron folder, which the line recreates first
-/// ([`crate::cron::mkdir`]: without it, a deleted folder would silently stop the reaper).
-pub fn cron_line(apply: bool, exe: &str, config: &str, home: &str, env: &[(String, String)]) -> String {
+/// Its lock is in arena's cron folder, and so is its log unless `log` keeps one the installed
+/// line already used elsewhere; the line recreates both folders first ([`crate::cron::mkdir`]:
+/// without it, a deleted folder would silently stop the reaper).
+pub fn cron_line(apply: bool, exe: &str, config: &str, home: &str, log: Option<&str>, env: &[(String, String)]) -> String {
     use crate::cron::{self, Job};
     let env: String = env.iter().map(|(k, v)| format!("{k}={v} ")).collect();
     let act = if apply { " --apply --yes" } else { "" };
-    let (mkdir, lock, log) = (cron::mkdir(home), cron::lock(home, Job::Reap), cron::log(home, Job::Reap));
+    let log = log.map_or_else(|| cron::log(home, Job::Reap), String::from);
+    let (mkdir, lock) = (cron::mkdir(home, &log), cron::lock(home, Job::Reap));
     format!("{CRON_SCHEDULE} {mkdir}{CRON_PATH} {env}flock -n -o {lock} {exe} --config {config} pods reap run{act} >> {log} 2>&1")
 }
 

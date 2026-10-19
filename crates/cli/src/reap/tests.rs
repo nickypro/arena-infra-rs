@@ -1565,26 +1565,28 @@ fn reap_cron_line_rules() {
     let write = |text: &str| std::fs::write(&path, text).unwrap();
     let state = w.dir.join("state").display().to_string();
     write(&format!("ARENA_STATE_DIR={state}\nMACHINE_NAME_PREFIX=devtest\n"));
-    let e = super::super::reap_cron_line(true, &path, "/usr/local/bin/arena", "/root/c.env", "/root").unwrap_err().to_string();
+    let e = super::super::reap_cron_line(true, &path, "/usr/local/bin/arena", "/root/c.env", "/root", None).unwrap_err().to_string();
     assert!(e.contains("REAP_ENABLED isn't 1") && e.contains("--reap observe"), "{e}");
-    let observe = super::super::reap_cron_line(false, &path, "/usr/local/bin/arena", "/root/c.env", "/root").unwrap();
-    assert!(observe.ends_with("pods reap run >> /root/.local/state/arena/cron/reap.log 2>&1") && !observe.contains("ARENA_STATE_DIR="), "{observe}");
+    let observe = super::super::reap_cron_line(false, &path, "/usr/local/bin/arena", "/root/c.env", "/root", None).unwrap();
+    assert!(observe.ends_with("pods reap run >> /root/.local/state/arena-cron/reap.log 2>&1") && !observe.contains("ARENA_STATE_DIR="), "{observe}");
     assert_eq!(super::super::CronKind::of(&observe), Some(super::super::CronKind::Reap));
     write(&format!("ARENA_STATE_DIR={state}\nREAP_ENABLED=1\n"));
-    let apply = super::super::reap_cron_line(true, &path, "/usr/local/bin/arena", "/root/c.env", "/root").unwrap();
-    assert!(apply.contains(" pods reap run --apply --yes >> ") && apply.contains("flock -n -o /root/.local/state/arena/cron/reap.lock"), "{apply}");
+    let apply = super::super::reap_cron_line(true, &path, "/usr/local/bin/arena", "/root/c.env", "/root", None).unwrap();
+    assert!(apply.contains(" pods reap run --apply --yes >> ") && apply.contains("flock -n -o /root/.local/state/arena-cron/reap.lock"), "{apply}");
     assert_eq!(super::super::CronKind::of(&apply), Some(super::super::CronKind::Reap));
     // No state dir anywhere: refused.
     write("REAP_ENABLED=1\n");
-    assert!(super::super::reap_cron_line(false, &path, "/a", "/c", "/root").unwrap_err().to_string().contains("ARENA_STATE_DIR"));
+    assert!(super::super::reap_cron_line(false, &path, "/a", "/c", "/root", None).unwrap_err().to_string().contains("ARENA_STATE_DIR"));
     // Invalid settings: refused.
     write(&format!("ARENA_STATE_DIR={state}\nREAP_MAX_PER_DAY=500\n"));
-    assert!(super::super::reap_cron_line(false, &path, "/a", "/c", "/root").unwrap_err().to_string().contains("REAP_MAX_PER_DAY"));
+    assert!(super::super::reap_cron_line(false, &path, "/a", "/c", "/root", None).unwrap_err().to_string().contains("REAP_MAX_PER_DAY"));
     // The other lines are never taken for it.
     for other in [
         "*/15 * * * * flock -n -o /root/.arena-backup-cron.lock /a --config /c pods backup --yes >> /root/arena-cron.log 2>&1",
         "*/15 * * * * mkdir -p /root/.local/state/arena/cron && flock -n -o /root/.local/state/arena/cron/backup.lock /a --config /c \
          pods backup --yes >> /root/.local/state/arena/cron/backup.log 2>&1",
+        "*/15 * * * * mkdir -p /root/.local/state/arena-cron /root/logs/cron && flock -n -o /root/.local/state/arena-cron/backup.lock \
+         /a --config /c pods backup --yes >> /root/logs/cron/arena-cron.log 2>&1",
         "# 7 * * * * arena pods reap run",
     ] {
         assert_ne!(super::super::CronKind::of(other), Some(super::super::CronKind::Reap), "{other}");
@@ -2246,7 +2248,7 @@ async fn review_rr_two_pods_sharing_a_name_are_still_backed_up() {
 /// killed would otherwise keep every later tick skipping").
 #[test]
 fn review_rr_reap_cron_lock_is_not_inherited_by_arenas_children() {
-    let line = arena_core::reap::render::cron_line(true, "/usr/local/bin/arena", "/root/c.env", "/root", &[]);
+    let line = arena_core::reap::render::cron_line(true, "/usr/local/bin/arena", "/root/c.env", "/root", None, &[]);
     assert!(line.contains("flock -n -o "), "{line}");
 }
 

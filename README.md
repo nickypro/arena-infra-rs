@@ -532,17 +532,30 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `nice`, log `archive.log`, each tier locked in-process; refused without this
     user's archive state, an absolute `LOCAL_BACKUP_DIR` or a start date). Every line runs under `flock -n` (a tick that
     finds the previous one still running exits instead of stacking — the backup's lock is
-    `backup.lock`, held by `flock -o` itself so no stray rsync can keep it). **Logs and locks
-    live in one folder, `~/.local/state/arena/cron/`** (`backup.log`, `proxy.log`,
-    `snapshot.log`, `archive.log`, `reap.log` and the `.lock`s) — arena's default state root,
-    so nothing new appears in your home — and every line starts with `mkdir -p` of it: cron's
-    `sh` doesn't run a command whose `>>` (or lock) points into a missing directory, so a
-    deleted folder would otherwise silently stop the backups. Older versions kept these in the
-    home (`~/arena-cron.log`, `~/arena-<line>-cron.log`, `~/.arena-<line>-cron.lock`):
-    re-running your `cron install …` replaces each old line in place and, once the crontab is
-    written, moves the rewritten lines' old logs into the folder (appended if the new log
-    exists; only regular files — a symlink is left alone) and deletes their old locks, saying
-    so in one `· cron logs now in …` line.
+    `backup.lock`, held by `flock -o` itself so no stray rsync can keep it). **Locks live in
+    `~/.local/state/arena-cron/`** (`backup.lock`, `proxy.lock`, …), **and so do the logs by
+    default** (`backup.log`, `proxy.log`, `snapshot.log`, `archive.log`, `reap.log`), so nothing
+    new appears in your home. **A line that already logs somewhere else keeps doing so**: a
+    re-install keeps the installed line's `>> PATH` (say `/root/logs/cron/arena-cron.log`, a
+    folder logrotate rotates) — only arena's own old defaults move. Every line starts with
+    `mkdir -p` of the cron folder and of a kept log's folder: cron's `sh` doesn't run a command
+    whose `>>` (or lock) points into a missing directory, so a deleted folder would otherwise
+    silently stop the backups. arena doesn't rotate its logs: add a logrotate rule for whichever
+    folder your lines log to (e.g. `/root/.local/state/arena-cron/*.log { weekly rotate 4
+    compress missingok notifempty copytruncate }` — `copytruncate`, since each line holds its
+    log open with `>>`). Older versions logged and locked directly in the home
+    (`~/arena-cron.log`, `~/arena-<line>-cron.log`, `~/.arena-<line>-cron.lock`; one build used
+    `~/.local/state/arena/cron/`): re-running your `cron install …` replaces each old line in
+    place and, once the crontab is written, moves exactly the old default files the replaced
+    lines named into the folder (appended if the new log exists; regular files of yours only — a
+    symlink, or a new log that isn't a regular file, is left alone) and deletes their old locks,
+    saying so in one `· cron logs now in …` line. The lock moved too: a hand-written job or
+    script that took `~/.arena-backup-cron.lock` to stay out of the cron's way no longer
+    serializes with it (take `~/.local/state/arena-cron/backup.lock` instead), and a run the old
+    line started may overlap the new line's first tick — re-install when no backup is running.
+    `install` and `remove` refuse a `$HOME` that isn't this user's (unset, relative, owned by
+    someone else — `sudo -E` — or holding whitespace, `%` or a newline): run them as the user
+    whose crontab it is (`sudo -i`).
     `remove --backup|--proxy|--snapshot` drops just those; plain `remove` drops the whole
     block. Both print the block's before → after diff (every removed copy of a duplicate
     shown) and confirm (`--yes` for scripts, `--dry-run` to preview); `show` labels each line
@@ -965,7 +978,7 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     lists what's missing once the reaper is on or its cron line is installed (off: one `·
     reaper off (opt-in)` row, a ✗ only for a `REAP_*` value set but invalid). Every `pods reap
     … --json` prints exactly one JSON document on stdout — `{"error": …}` on a failure,
-    `{"skipped": …}` when another run holds the lock — and everything else on stderr. Rollout: `cron install --reap observe` first (logs `would_reap`; the line runs at :11/:27/:41/:57 — minutes no other arena line uses — its output in `~/.local/state/arena/cron/reap.log`), then
+    `{"skipped": …}` when another run holds the lock — and everything else on stderr. Rollout: `cron install --reap observe` first (logs `would_reap`; the line runs at :11/:27/:41/:57 — minutes no other arena line uses — its output in `~/.local/state/arena-cron/reap.log` unless the line logs elsewhere already), then
     `--reap apply` (refused unless REAP_ENABLED=1). `reap set` also writes `~/.arena/NOTICE` and
     an interactive-only login banner on the pod (also written after `up`'s setup for a pod
     created with a policy, after `pods setup`, and after a restart's re-provision — the 1-hour

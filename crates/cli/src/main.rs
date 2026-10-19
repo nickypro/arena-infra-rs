@@ -463,8 +463,8 @@ enum CronCmd {
     /// Each flag names one line (backup, proxy, snapshot, archive, reap); only those are
     /// (re)written and the rest are kept. No flag = the backup line. A rewritten backup line
     /// keeps the installed one's --pull, start date and schedule unless you change them.
-    /// Logs and locks live in ~/.local/state/arena/cron/ (backup.log, proxy.log, …); re-installing
-    /// an older line moves its ~/arena-*cron.log there.
+    /// Locks live in ~/.local/state/arena-cron/, logs too (backup.log, …) unless the installed
+    /// line logs elsewhere already: that path is kept. Old default logs (~/arena-cron.log) move.
     #[command(verbatim_doc_comment)]
     Install {
         /// The backup line: `pods backup` every 15 min (git only unless --pull)
@@ -2804,7 +2804,7 @@ async fn run() -> Result<()> {
         Cmd::Tui => launch_tui(&cli.provider, &cli.config),
         Cmd::Plan(c) => handle_plan(c, provider.unwrap().as_ref(), &cfg).await,
         Cmd::Config(c) => handle_config(c, &cfg, &cli.provider, &cli.config),
-        Cmd::Cron(c) => handle_cron(c, &cfg, &cli.config, cli.yes, CRONTAB, &std::env::var("HOME").unwrap_or_else(|_| ".".into())).await,
+        Cmd::Cron(c) => handle_cron(c, &cfg, &cli.config, cli.yes, CRONTAB, std::env::var("HOME").ok().as_deref()).await,
         Cmd::Archive(c) => archive::handle_archive(c, &cfg, remote.as_ref(), cli.yes).await,
         Cmd::Pods(p) => handle_pods(p, provider.unwrap().as_ref(), remote, &cfg, cli.yes).await,
         Cmd::Proxy(p) => handle_proxy(p, provider.unwrap().as_ref(), &cfg, cli.yes).await,
@@ -3644,9 +3644,9 @@ fn with_arena_block(existing: &str, lines: &[String]) -> String {
 const CRONTAB: &str = "crontab";
 
 /// `arena cron …`. `crontab` is the program that reads (`-l`) and replaces (`-`) the user's
-/// crontab: [`CRONTAB`] for real, a stub over a file in tests. `home` is the home the lines
-/// run in and whose old cron files an install tidies: `$HOME`, a temp dir in tests.
-async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::path::Path, yes: bool, crontab: &str, home: &str) -> Result<()> {
+/// crontab: [`CRONTAB`] for real, a stub over a file in tests. `home` is `$HOME` (a temp dir in
+/// tests): the home the lines run in, which `install`/`remove` check first ([`cron_home`]).
+async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::path::Path, yes: bool, crontab: &str, home: Option<&str>) -> Result<()> {
     use tokio::process::Command;
 
     // Read the current crontab (no crontab installed => empty, not an error).
@@ -3671,6 +3671,7 @@ async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::path::Path, 
             Ok(())
         }
         CronCmd::Remove { backup, proxy, snapshot, archive, reap, dry_run } => {
+            cron_home(home, effective_uid()?)?;
             let mut kinds = CronKind::selected(backup, proxy, snapshot, archive);
             if reap {
                 kinds.push(CronKind::Reap);
@@ -3680,9 +3681,15 @@ async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::path::Path, 
             apply_cron_change(&current, &before, &after, &[], dry_run, yes, crontab).await.map(|_| ())
         }
         CronCmd::Install { backup, schedule, start_date, no_start_date, pull, no_pull, proxy, snapshot, archive, reap, dry_run } => {
+            let home = &cron_home(home, effective_uid()?)?;
             let exe = std::env::current_exe().context("finding the arena executable path")?;
             let cfg_abs = std::fs::canonicalize(config_path)
                 .unwrap_or_else(|_| config_path.to_path_buf());
+            crontab_word("the arena binary", &exe.display().to_string())?;
+            crontab_word("the config path", &cfg_abs.display().to_string())?;
+            // The logs the installed lines chose themselves: kept (arena never moves those).
+            let kept_logs = kept_logs(&before, home);
+            let kept_log = |k: CronKind| kept_logs.iter().find(|(x, _)| *x == k).map(|(_, l)| l.as_str());
             let start_date = start_date.map(|d| d.trim().to_string());
             if let Some(d) = &start_date {
                 arena_core::schedule::parse_ymd(d).context("--start-date must be YYYY-MM-DD")?;
@@ -3699,7 +3706,7 @@ async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::path::Path, 
             );
             let reap_line = reap
                 .as_deref()
-                .map(|mode| reap_cron_line(mode == "apply", config_path, &exe.display().to_string(), &cfg_abs.display().to_string(), home))
+                .map(|mode| reap_cron_line(mode == "apply", config_path, &exe.display().to_string(), &cfg_abs.display().to_string(), home, kept_log(CronKind::Reap)))
                 .transpose()?;
             let mut notes = Vec::new();
             // The backup line's options: each flag, else the installed line's (so a
@@ -3773,6 +3780,7 @@ async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::path::Path, 
                 snapshot_dir: snapshot_dir.as_deref(),
                 archive: archive || rerender_archive,
                 archive_state_dir: archive_state_dir.as_deref(),
+                kept_logs: &kept_logs,
             });
             let mut lines = lines;
             if let Some(l) = reap_line {
@@ -3780,6 +3788,15 @@ async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::path::Path, 
             }
             let kinds: Vec<CronKind> = lines.iter().map(|(k, _)| *k).collect();
             let after = merge_cron_block(&before, &kinds, &lines);
+            let kept: Vec<String> =
+                kinds.iter().filter_map(|&k| kept_log(k).map(|l| format!("{l} ({})", k.label()))).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+            if !kept.is_empty() {
+                notes.push(format!(
+                    "note: keeping each installed line's own log: {} (arena's default, for a new line: ~/{}/)",
+                    kept.join(", "),
+                    arena_core::cron::DIR
+                ));
+            }
             // The archive pushes what the backup line's `--pull` writes: without it there is
             // nothing new to push.
             if archive && !after.iter().any(|l| BackupOpts::of_line(l).is_some_and(|o| o.pull)) {
@@ -3800,8 +3817,8 @@ async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::path::Path, 
             }
             if apply_cron_change(&current, &before, &after, &notes, dry_run, yes, crontab).await? {
                 // Only once it's written: until then, the old lines still use their old files.
-                let jobs = jobs_to_tidy(&kinds, &before, &after, home, &with_arena_block(&current, &after));
-                if let Some(line) = tidy_line(&tidy_old_cron_files(home, &jobs)) {
+                let plan = tidy_plan(&kinds, &before, &after, home, &with_arena_block(&current, &after));
+                if let Some(line) = tidy_line(&tidy_old_cron_files(&plan, home, effective_uid()?)) {
                     println!("{line}");
                 }
             }
@@ -3850,59 +3867,162 @@ async fn apply_cron_change(
     Ok(true)
 }
 
-/// The jobs whose old files in the home `cron install` tidies once the crontab is written
-/// ([`tidy_old_cron_files`]): each of the installed `kinds` whose lines it changed — never one
-/// it left alone, whose line may still use them — unless the `written` crontab still names the
-/// job's old log (a hand-added or commented-out line that would append to it again). Pure.
-fn jobs_to_tidy(kinds: &[CronKind], before: &[String], after: &[String], home: &str, written: &str) -> Vec<arena_core::cron::Job> {
-    let of = |lines: &[String], k: CronKind| lines.iter().filter(|l| CronKind::of(l) == Some(k)).cloned().collect::<Vec<_>>();
-    let mut jobs = Vec::new();
-    for &k in kinds {
-        let job = k.job();
-        if of(before, k) != of(after, k) && !jobs.contains(&job) && !written.contains(&format!("{home}/{}", job.legacy_log())) {
-            jobs.push(job);
+/// The home `cron install`/`remove` writes lines for: `$HOME`, checked — set, absolute, free
+/// of whitespace, `%` and newlines (the lines carry it unquoted, and crontab turns a `%` into a
+/// newline), and a directory the effective user (`euid`) owns. Under `sudo -E` it would be
+/// another user's home: root's lines would create folders there, and the tidy would act on
+/// that user's files.
+fn cron_home(home: Option<&str>, euid: u32) -> Result<String> {
+    use std::os::unix::fs::MetadataExt;
+    const AS_USER: &str = "run as the user whose crontab this is (sudo -i / sudo -H)";
+    let home = match home {
+        None | Some("") => anyhow::bail!("HOME isn't set — {AS_USER}"),
+        Some(h) if !h.starts_with('/') => anyhow::bail!("HOME={h} isn't an absolute path — {AS_USER}"),
+        Some(h) if h.chars().any(|c| c.is_whitespace() || c == '%') => {
+            anyhow::bail!("HOME={h:?} holds whitespace, `%` or a newline, which a crontab line can't carry")
         }
+        Some(h) => h,
+    };
+    let meta = std::fs::metadata(home).map_err(|e| anyhow::anyhow!("HOME={home}: {e} — {AS_USER}"))?;
+    if !meta.is_dir() {
+        anyhow::bail!("HOME={home} isn't a directory — {AS_USER}");
     }
-    jobs
+    if meta.uid() != euid {
+        anyhow::bail!("HOME={home} isn't this user's home (owner uid {}, running as {euid}) — {AS_USER}, not sudo -E", meta.uid());
+    }
+    Ok(home.to_string())
 }
 
-/// What [`tidy_old_cron_files`] did, by old file name.
+/// This process's effective uid: the owner of `/proc/self` (Linux), else `id -u`.
+fn effective_uid() -> Result<u32> {
+    use std::os::unix::fs::MetadataExt;
+    if let Ok(m) = std::fs::metadata("/proc/self") {
+        return Ok(m.uid());
+    }
+    let out = std::process::Command::new("id").arg("-u").output().context("running `id -u`")?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().context("reading the effective uid from `id -u`")
+}
+
+/// `value` (`what`: the arena binary, the config path) as one word of a crontab line: refused
+/// with whitespace (the lines carry it unquoted), `%` (crontab turns it into a newline) or a
+/// newline — any of them would silently cut the command short.
+fn crontab_word(what: &str, value: &str) -> Result<()> {
+    if value.chars().any(|c| c.is_whitespace() || c == '%') {
+        anyhow::bail!("{what} ({value:?}) can't go into a crontab line: it holds whitespace, `%` or a newline");
+    }
+    Ok(())
+}
+
+/// A crontab line's log: `PATH` when the line ends in `>> PATH 2>&1`, as arena's lines do.
+fn cron_log_target(line: &str) -> Option<&str> {
+    match line.split_whitespace().collect::<Vec<_>>()[..] {
+        [.., ">>", path, "2>&1"] => Some(path),
+        _ => None,
+    }
+}
+
+/// A crontab line's `flock` file: the word after `flock` and its `-…` options.
+fn cron_lock_target(line: &str) -> Option<&str> {
+    let mut words = line.split_whitespace().skip_while(|w| *w != "flock").skip(1);
+    words.find(|w| !w.starts_with('-'))
+}
+
+/// The logs the installed lines chose themselves ([`arena_core::cron::LogPlace::Chosen`]), by
+/// kind: a re-install keeps each, so arena never moves a log path someone picked (a folder
+/// logrotate rotates, say). The first line of a kind decides — the one a re-install replaces in
+/// place. Pure.
+fn kept_logs(before: &[String], home: &str) -> Vec<(CronKind, String)> {
+    let mut seen = Vec::new();
+    let mut out = Vec::new();
+    for line in before {
+        let Some(kind) = CronKind::of(line).filter(|k| !seen.contains(k)) else { continue };
+        seen.push(kind);
+        if let Some(log) = cron_log_target(line).filter(|l| arena_core::cron::log_place(home, kind.job(), l) == arena_core::cron::LogPlace::Chosen) {
+            out.push((kind, log.to_string()));
+        }
+    }
+    out
+}
+
+/// An old file of a line `cron install` replaced, tidied once the crontab is written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OldCronFile {
+    /// An earlier default log: moved to the new line's log.
+    Log { old: String, new: String },
+    /// An earlier default lock: deleted.
+    Lock(String),
+}
+
+/// What to tidy after an install: for each of the installed `kinds` whose lines it changed and
+/// whose new line logs to arena's default (a kept log means no tidy for that kind), the exact
+/// paths each replaced line named — its log and its lock — when that path is an earlier arena
+/// default for `home` ([`arena_core::cron::log_place`], [`arena_core::cron::is_old_lock`]) and
+/// the `written` crontab doesn't still name it (by its path under the home, so a hand-added
+/// line's `~/arena-cron.log` counts). Never `$HOME` plus a name: only paths the replaced lines
+/// themselves used. Pure.
+fn tidy_plan(kinds: &[CronKind], before: &[String], after: &[String], home: &str, written: &str) -> Vec<OldCronFile> {
+    use arena_core::cron::{self, LogPlace};
+    let of = |lines: &[String], k: CronKind| lines.iter().filter(|l| CronKind::of(l) == Some(k)).cloned().collect::<Vec<_>>();
+    let still_named = |path: &str| written.contains(path.strip_prefix(&format!("{home}/")).unwrap_or(path));
+    let mut plan = Vec::new();
+    for &k in kinds {
+        let (old_lines, new_lines) = (of(before, k), of(after, k));
+        let Some(new) = new_lines.first().and_then(|l| cron_log_target(l)).filter(|l| *l == cron::log(home, k.job())) else { continue };
+        if old_lines == new_lines {
+            continue;
+        }
+        for line in &old_lines {
+            let log = cron_log_target(line).filter(|l| cron::log_place(home, k.job(), l) == LogPlace::OldDefault && !still_named(l));
+            let lock = cron_lock_target(line).filter(|l| cron::is_old_lock(home, k.job(), l) && !still_named(l));
+            for file in [log.map(|old| OldCronFile::Log { old: old.into(), new: new.into() }), lock.map(|l| OldCronFile::Lock(l.into()))].into_iter().flatten() {
+                if !plan.contains(&file) {
+                    plan.push(file);
+                }
+            }
+        }
+    }
+    plan
+}
+
+/// What [`tidy_old_cron_files`] did, by old path.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct CronTidy {
-    /// Old logs moved into the cron folder (appended to the new log when there was one).
-    moved: Vec<&'static str>,
-    /// Old logs left where they are: not a regular file (a symlink is never followed).
-    left: Vec<&'static str>,
+    /// Old logs moved to the new ones (appended when a new log was already there).
+    moved: Vec<String>,
+    /// Old logs left where they are, with why: not a regular file of this user's (a symlink is
+    /// never followed), or a new log that isn't a regular file.
+    left: Vec<String>,
     /// Old files that couldn't be moved or removed, with why.
     failed: Vec<String>,
 }
 
-/// After `cron install` rewrote the lines of `jobs`: their old files directly in `home`,
-/// which nothing uses any more ([`arena_core::cron::Job::legacy_log`] / `legacy_lock`). Each
-/// visible log moves into the cron folder — appended to the new log if that exists already, so
-/// nothing is lost — and each hidden lock is deleted (a run still holding it keeps its lock on
-/// the inode). Those exact names only, regular files only: a symlink is left alone, never
-/// followed.
-fn tidy_old_cron_files(home: &str, jobs: &[arena_core::cron::Job]) -> CronTidy {
+/// Carry out a [`tidy_plan`] once the crontab is written: each old log moves to its new log,
+/// each old lock is deleted (nothing uses that path any more; a run still holding it keeps its
+/// lock on the inode). Only regular files the effective user (`euid`) owns: a symlink is left
+/// alone, never followed, and so is a new log that isn't a regular file.
+fn tidy_old_cron_files(plan: &[OldCronFile], home: &str, euid: u32) -> CronTidy {
+    use std::os::unix::fs::MetadataExt;
     let mut out = CronTidy::default();
-    let regular = |p: &std::path::Path| std::fs::symlink_metadata(p).map(|m| m.file_type().is_file());
-    for &job in jobs {
-        let name = job.legacy_log();
-        let old = std::path::Path::new(home).join(name);
-        match regular(&old) {
-            Ok(true) => match move_cron_log(&old, std::path::Path::new(&arena_core::cron::log(home, job))) {
-                Ok(()) => out.moved.push(name),
-                Err(e) => out.failed.push(format!("{name}: {e}")),
+    let shown = |p: &str| p.strip_prefix(home).filter(|r| r.starts_with('/')).map_or_else(|| p.to_string(), |r| format!("~{r}"));
+    // Ok(true): a regular file of this user's; Ok(false): something else, left alone.
+    let ours = |p: &str| std::fs::symlink_metadata(p).map(|m| m.file_type().is_file() && m.uid() == euid);
+    for file in plan {
+        match file {
+            OldCronFile::Log { old, new } => match ours(old) {
+                Ok(true) => match move_cron_log(std::path::Path::new(old), std::path::Path::new(new)) {
+                    Ok(true) => out.moved.push(shown(old)),
+                    Ok(false) => out.left.push(format!("{} ({} isn't a regular file)", shown(old), shown(new))),
+                    Err(e) => out.failed.push(format!("{}: {e}", shown(old))),
+                },
+                Ok(false) => out.left.push(format!("{} (not a regular file of this user's)", shown(old))),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => out.failed.push(format!("{}: {e}", shown(old))),
             },
-            Ok(false) => out.left.push(name),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => out.failed.push(format!("{name}: {e}")),
-        }
-        if let Some(lock) = job.legacy_lock() {
-            let old = std::path::Path::new(home).join(lock);
-            if regular(&old).unwrap_or(false) {
-                if let Err(e) = std::fs::remove_file(&old) {
-                    out.failed.push(format!("{lock}: {e}"));
+            OldCronFile::Lock(lock) => {
+                if ours(lock).unwrap_or(false) {
+                    if let Err(e) = std::fs::remove_file(lock) {
+                        out.failed.push(format!("{}: {e}", shown(lock)));
+                    }
                 }
             }
         }
@@ -3910,14 +4030,21 @@ fn tidy_old_cron_files(home: &str, jobs: &[arena_core::cron::Job]) -> CronTidy {
     out
 }
 
-/// Move the old log `old` (a regular file) to `new`: hard-linked, then unlinked, when `new`
-/// doesn't exist yet — the same file, so a run still appending to it goes on logging into the
-/// new place, and never over a `new` a tick created meanwhile (as a rename would) — else (`new`
-/// already there, or on another filesystem) appended to `new`, then removed. `new` already
-/// being `old` (a tidy cut short between its link and its unlink) is just unlinked: appending a
-/// file to itself would never end. And only `old`'s length as it was is copied, so a run still
-/// writing to it can't keep the copy going either.
-fn move_cron_log(old: &std::path::Path, new: &std::path::Path) -> std::io::Result<()> {
+/// Move the old log `old` (a regular file) to `new`; `Ok(false)`, touching nothing, when `new`
+/// exists and isn't a regular file (a symlink, a directory). Hard-linked, then unlinked, when
+/// `new` doesn't exist yet — the same file, so a run still appending to it goes on logging into
+/// the new place, and never over a `new` a tick created meanwhile (as a rename would) — else
+/// (`new` already there, or on another filesystem) appended to `new`, then removed. `new`
+/// already being `old` (a tidy cut short between its link and its unlink) is just unlinked:
+/// appending a file to itself would never end. And only `old`'s length as it was is copied, so
+/// a run still writing to it can't keep the copy going either.
+///
+/// The append path's known rough edges, accepted as rare (it needs a tick that already wrote
+/// the new log, or `~/.local` on another filesystem): what a still-running old-line job writes
+/// after the copy is lost with the unlinked file; on a full disk a partial copy stays in the new
+/// log (and the old file too, for a later retry by hand); the old lines land after the new log's
+/// first ones; a new log created here gets the default mode, not the old one's.
+fn move_cron_log(old: &std::path::Path, new: &std::path::Path) -> std::io::Result<bool> {
     use std::io::Read;
     use std::os::unix::fs::MetadataExt;
     if let Some(dir) = new.parent() {
@@ -3926,9 +4053,7 @@ fn move_cron_log(old: &std::path::Path, new: &std::path::Path) -> std::io::Resul
     if std::fs::hard_link(old, new).is_err() {
         let was = std::fs::symlink_metadata(old)?;
         match std::fs::symlink_metadata(new) {
-            Ok(m) if !m.file_type().is_file() => {
-                return Err(std::io::Error::other(format!("{} isn't a regular file", new.display())));
-            }
+            Ok(m) if !m.file_type().is_file() => return Ok(false),
             Ok(m) if (m.dev(), m.ino()) == (was.dev(), was.ino()) => {}
             _ => {
                 let from = std::fs::File::open(old)?;
@@ -3937,7 +4062,8 @@ fn move_cron_log(old: &std::path::Path, new: &std::path::Path) -> std::io::Resul
             }
         }
     }
-    std::fs::remove_file(old)
+    std::fs::remove_file(old)?;
+    Ok(true)
 }
 
 /// The one line `cron install` prints after [`tidy_old_cron_files`]; `None` when it found
@@ -3948,7 +4074,7 @@ fn tidy_line(t: &CronTidy) -> Option<String> {
         parts.push(format!("moved: {}", t.moved.join(", ")));
     }
     if !t.left.is_empty() {
-        parts.push(format!("left alone, not a regular file: {}", t.left.join(", ")));
+        parts.push(format!("left alone: {}", t.left.join(", ")));
     }
     if !t.failed.is_empty() {
         parts.push(format!("couldn't tidy: {}", t.failed.join("; ")));
@@ -4073,8 +4199,9 @@ impl BackupOpts {
     /// fields, or one `@…` macro), an `ARENA_START_DATE=` among the inline env assignments
     /// before the command (only a valid date; after the `mkdir -p … &&` this version's line
     /// starts with: [`cron_line_parts`]), and whether it pulls (`pods backup` does
-    /// unless `--no-pull`). `None` for a line that isn't a backup line or has no readable
-    /// schedule. Pure.
+    /// unless `--no-pull`). `None` for a line that isn't a backup line, has no readable
+    /// schedule, or names a start date that can't be read that way (the install then says it
+    /// couldn't read the line, rather than drop the date unannounced). Pure.
     fn of_line(line: &str) -> Option<BackupOpts> {
         if CronKind::of(line) != Some(CronKind::Backup) {
             return None;
@@ -4093,6 +4220,11 @@ impl BackupOpts {
             .filter_map(|w| w.strip_prefix("ARENA_START_DATE="))
             .find(|d| arena_core::schedule::parse_ymd(d).is_some())
             .map(String::from);
+        // A start date somewhere in the line that wasn't read (behind a `cd … &&`, invalid, …):
+        // unreadable, so the install says so instead of silently dropping it.
+        if start_date.is_none() && line.contains("ARENA_START_DATE=") {
+            return None;
+        }
         Some(BackupOpts { schedule, start_date, pull: !words.contains(&"--no-pull") })
     }
 }
@@ -4235,6 +4367,9 @@ struct CronJob<'a> {
     archive: bool,
     /// The state root (`ARENA_STATE_DIR`) those lines run with.
     archive_state_dir: Option<&'a str>,
+    /// The logs the installed lines chose themselves, kept ([`kept_logs`]); any other line logs
+    /// to arena's default.
+    kept_logs: &'a [(CronKind, String)],
 }
 
 /// The backup line's default schedule: every 15 minutes.
@@ -4294,31 +4429,35 @@ const PROXY_CRON_PATH: &str = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/us
 ///   which later ticks would read as up to date.
 /// - **snapshot** (`snapshot_dir`): the public dashboard JSON every 2 minutes.
 ///
-/// Each line's log and lock are in one folder under arena's state root
-/// ([`arena_core::cron::DIR`]), so they add nothing to the home, and each line recreates that
-/// folder before anything else ([`arena_core::cron::mkdir`]): cron's `sh` skips a command
-/// whose `>>` or lock points into a missing directory, so a deleted folder would otherwise
-/// silently stop the backups.
+/// Each line's lock is in one hidden folder ([`arena_core::cron::DIR`]), and so is its log
+/// unless the installed line already logged somewhere else (`kept_logs`: arena never moves a
+/// log path someone chose), so they add nothing to the home. Each line recreates those folders
+/// before anything else ([`arena_core::cron::mkdir`]): cron's `sh` skips a command whose `>>`
+/// or lock points into a missing directory, so a deleted folder would otherwise silently stop
+/// the backups.
 fn cron_lines(job: &CronJob) -> Vec<(CronKind, String)> {
-    use arena_core::cron::{self, Job};
-    let CronJob { schedule, env_prefix, exe, config, home, backup, pull, proxy, snapshot_dir, archive, archive_state_dir } = job;
-    // Every line recreates the folder first: cron's `sh` skips a line whose `>>`/lock dir is gone.
-    let mkdir = cron::mkdir(home);
-    let (lock_of, log_of) = (|j| cron::lock(home, j), |j| cron::log(home, j));
+    use arena_core::cron;
+    let CronJob { schedule, env_prefix, exe, config, home, backup, pull, proxy, snapshot_dir, archive, archive_state_dir, kept_logs } = job;
+    // A line's `mkdir -p … && `, lock and log: the kept log, else the default. Every line
+    // recreates its folders first: cron's `sh` skips a line whose `>>`/lock dir is gone.
+    let files = |k: CronKind| {
+        let log = kept_logs.iter().find(|(x, _)| *x == k).map_or_else(|| cron::log(home, k.job()), |(_, l)| l.clone());
+        (cron::mkdir(home, &log), cron::lock(home, k.job()), log)
+    };
     let mut lines = Vec::new();
     if *backup {
         // `pods backup` also rsyncs the home (the file backup); default the cron to git-only
         // (`--no-pull`) since it runs frequently, and let `--pull` opt into the full backup
         // each tick (rsync is incremental, so repeats only move deltas).
         let no_pull = if *pull { "" } else { " --no-pull" };
-        let (lock, log) = (lock_of(Job::Backup), log_of(Job::Backup));
+        let (mkdir, lock, log) = files(CronKind::Backup);
         lines.push((
             CronKind::Backup,
             format!("{schedule} {mkdir}{env_prefix}flock -n -o {lock} {exe} --config {config} pods backup{no_pull} --yes >> {log} 2>&1"),
         ));
     }
     if *proxy {
-        let (lock, log) = (lock_of(Job::Proxy), log_of(Job::Proxy));
+        let (mkdir, lock, log) = files(CronKind::Proxy);
         lines.push((
             CronKind::Proxy,
             format!("{PROXY_CRON_SCHEDULE} {mkdir}{PROXY_CRON_PATH} flock -n {lock} {exe} --config {config} proxy apply --yes >> {log} 2>&1"),
@@ -4330,7 +4469,7 @@ fn cron_lines(job: &CronJob) -> Vec<(CronKind, String)> {
     // file (a killed tick just leaves the previous one, which the page then shows as stale).
     if let Some(dir) = snapshot_dir {
         let out = shell_quote(&format!("{}/fleet.json", dir.trim_end_matches('/')));
-        let (lock, log) = (lock_of(Job::Snapshot), log_of(Job::Snapshot));
+        let (mkdir, lock, log) = files(CronKind::Snapshot);
         lines.push((
             CronKind::Snapshot,
             format!("{SNAPSHOT_CRON_SCHEDULE} {mkdir}flock -n {lock} {exe} --config {config} snapshot --public --out {out} >> {log} 2>&1"),
@@ -4344,8 +4483,8 @@ fn cron_lines(job: &CronJob) -> Vec<(CronKind, String)> {
     // backup.
     if *archive {
         let state = archive_state_dir.map(|d| format!("ARENA_STATE_DIR={d} ")).unwrap_or_default();
-        let log = log_of(Job::Archive);
         for (kind, sched, tier) in [(CronKind::ArchiveSnap, ARCHIVE_SNAP_CRON_SCHEDULE, "snap"), (CronKind::ArchiveBig, ARCHIVE_BIG_CRON_SCHEDULE, "big")] {
+            let (mkdir, _, log) = files(kind);
             lines.push((
                 kind,
                 format!(
@@ -4365,16 +4504,20 @@ fn env_assignment(line: &str, name: &str) -> Option<String> {
 }
 
 /// A crontab line's schedule (five fields, or one `@…` macro) and its command's words — after
-/// the `mkdir -p <dir> &&` this version's lines start with (the cron folder, recreated), so the
-/// inline env assignments before the command (`ARENA_START_DATE=…`) are read the same from
-/// every version's line. `None`: no schedule, or nothing after it. Pure.
+/// the `mkdir -p <dir>… &&` arena's lines start with (their folders, recreated), so the inline
+/// env assignments before the command (`ARENA_START_DATE=…`) are read the same from every
+/// version's line. `None`: no schedule, or nothing after it. Pure.
 fn cron_line_parts(line: &str) -> Option<(String, Vec<&str>)> {
     let words: Vec<&str> = line.split_whitespace().collect();
     let n = if words.first()?.starts_with('@') { 1 } else { 5 };
-    let command = match words.get(n..)? {
+    let command = words.get(n..)?;
+    let command = match command {
         [] => return None,
-        ["mkdir", "-p", _, "&&", rest @ ..] => rest,
-        rest => rest,
+        ["mkdir", "-p", dirs @ ..] => match dirs.iter().position(|w| *w == "&&") {
+            Some(i) if i > 0 => &dirs[i + 1..],
+            _ => command,
+        },
+        _ => command,
     };
     Some((words[..n].join(" "), command.to_vec()))
 }
@@ -4390,8 +4533,9 @@ const ARCHIVE_BIG_CRON_SCHEDULE: &str = "40 * * * *";
 /// settings and an explicit, absolute ARENA_STATE_DIR in the config FILE (the reaper reads the
 /// file's only — RS3 — so a hold set from any shell lands where the cron looks).
 /// ARENA_START_DATE is written into the line when it comes from the environment rather than the
-/// file (cron doesn't inherit a shell's environment).
-fn reap_cron_line(apply: bool, config_path: &std::path::Path, exe: &str, cfg_abs: &str, home: &str) -> Result<String> {
+/// file (cron doesn't inherit a shell's environment). `log`: the log the installed reap line
+/// chose, kept ([`kept_logs`]).
+fn reap_cron_line(apply: bool, config_path: &std::path::Path, exe: &str, cfg_abs: &str, home: &str, log: Option<&str>) -> Result<String> {
     let text = std::fs::read_to_string(config_path).with_context(|| format!("reading {}", config_path.display()))?;
     let file = Config::parse(&text);
     let cfg = Config::load(config_path)?;
@@ -4419,7 +4563,7 @@ fn reap_cron_line(apply: bool, config_path: &std::path::Path, exe: &str, cfg_abs
             anyhow::bail!("--reap: {what} ({v}) can't hold `%` or a newline in a crontab line");
         }
     }
-    Ok(arena_core::reap::render::cron_line(apply, exe, cfg_abs, home, &env))
+    Ok(arena_core::reap::render::cron_line(apply, exe, cfg_abs, home, log, &env))
 }
 
 /// Whether this user's crontab has the reap line — `config check` then shows the reaper's
@@ -5601,7 +5745,7 @@ fn is_protected_branch(branch: &str) -> bool {
 /// on disk, and the window between the reset and `init-branches` is routine every morning — a
 /// non-zero exit there would be a daily false alarm that teaches the operator to ignore the one
 /// that means a push or a pod broke. The cron's exit status goes nowhere anyway (its line
-/// appends to `~/.local/state/arena/cron/backup.log`); this line, and `set-branch`'s reminder at the reset itself,
+/// appends to `~/.local/state/arena-cron/backup.log`); this line, and `set-branch`'s reminder at the reset itself,
 /// are what make the gap loud.
 fn on_protected_line(pods: &[(String, String)], fleet_wide: bool) -> Option<String> {
     if pods.is_empty() {
@@ -17336,6 +17480,7 @@ mod tests {
             snapshot_dir,
             archive: false,
             archive_state_dir: None,
+            kept_logs: &[],
         })
     }
 
@@ -17347,9 +17492,9 @@ mod tests {
         // Every 2 minutes, flock'd like the proxy line, public JSON only, atomically to DIR/fleet.json.
         assert_eq!(
             lines[2],
-            "*/2 * * * * mkdir -p /home/u/.local/state/arena/cron && flock -n /home/u/.local/state/arena/cron/snapshot.lock \
+            "*/2 * * * * mkdir -p /home/u/.local/state/arena-cron && flock -n /home/u/.local/state/arena-cron/snapshot.lock \
              /opt/arena --config /srv/config.env snapshot --public --out '/var/www/fleet/fleet.json' \
-             >> /home/u/.local/state/arena/cron/snapshot.log 2>&1"
+             >> /home/u/.local/state/arena-cron/snapshot.log 2>&1"
         );
         // A quote in the directory can't break out of the shell word.
         let odd = cron_job_with(false, false, Some("/srv/it's"));
@@ -17383,8 +17528,8 @@ mod tests {
         // and log are in the cron folder, which it recreates first.
         assert_eq!(
             cron_job(false, false),
-            ["*/15 * * * * mkdir -p /home/u/.local/state/arena/cron && flock -n -o /home/u/.local/state/arena/cron/backup.lock \
-              /opt/arena --config /srv/config.env pods backup --no-pull --yes >> /home/u/.local/state/arena/cron/backup.log 2>&1"]
+            ["*/15 * * * * mkdir -p /home/u/.local/state/arena-cron && flock -n -o /home/u/.local/state/arena-cron/backup.lock \
+              /opt/arena --config /srv/config.env pods backup --no-pull --yes >> /home/u/.local/state/arena-cron/backup.log 2>&1"]
         );
         // The proxy line carries a PATH with /usr/sbin (cron's default lacks it, and that's
         // where nginx lives on Ubuntu) and a `flock -n` so a slow tick can't pile up.
@@ -17392,11 +17537,11 @@ mod tests {
         assert_eq!(
             both,
             [
-                "*/15 * * * * mkdir -p /home/u/.local/state/arena/cron && flock -n -o /home/u/.local/state/arena/cron/backup.lock \
-                 /opt/arena --config /srv/config.env pods backup --yes >> /home/u/.local/state/arena/cron/backup.log 2>&1",
-                "*/5 * * * * mkdir -p /home/u/.local/state/arena/cron && PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-                 flock -n /home/u/.local/state/arena/cron/proxy.lock /opt/arena --config /srv/config.env proxy apply --yes \
-                 >> /home/u/.local/state/arena/cron/proxy.log 2>&1",
+                "*/15 * * * * mkdir -p /home/u/.local/state/arena-cron && flock -n -o /home/u/.local/state/arena-cron/backup.lock \
+                 /opt/arena --config /srv/config.env pods backup --yes >> /home/u/.local/state/arena-cron/backup.log 2>&1",
+                "*/5 * * * * mkdir -p /home/u/.local/state/arena-cron && PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+                 flock -n /home/u/.local/state/arena-cron/proxy.lock /opt/arena --config /srv/config.env proxy apply --yes \
+                 >> /home/u/.local/state/arena-cron/proxy.log 2>&1",
             ]
         );
         // Without the backup line selected, only the asked-for lines render.
@@ -17448,14 +17593,15 @@ mod tests {
             snapshot_dir: None,
             archive: false,
             archive_state_dir: None,
+            kept_logs: &[],
         });
         assert_eq!(
             lines,
             [(
                 super::CronKind::Backup,
-                "0 * * * * mkdir -p /root/.local/state/arena/cron && ARENA_START_DATE=2026-10-05 flock -n -o \
-                 /root/.local/state/arena/cron/backup.lock /opt/arena --config /srv/config.env pods backup --yes \
-                 >> /root/.local/state/arena/cron/backup.log 2>&1"
+                "0 * * * * mkdir -p /root/.local/state/arena-cron && ARENA_START_DATE=2026-10-05 flock -n -o \
+                 /root/.local/state/arena-cron/backup.lock /opt/arena --config /srv/config.env pods backup --yes \
+                 >> /root/.local/state/arena-cron/backup.log 2>&1"
                     .to_string()
             )]
         );
@@ -17468,7 +17614,13 @@ mod tests {
     fn cron_kind_of_lines_table() {
         use super::CronKind::{self, *};
         let cases: &[(&str, Option<CronKind>)] = &[
-            // This version's: the cron folder recreated first, its lock and log in there.
+            // This version's: the cron folder (and a kept log's) recreated first, the lock in there.
+            ("*/15 * * * * mkdir -p /h/.local/state/arena-cron && ARENA_START_DATE=2026-01-05 flock -n -o /h/.local/state/arena-cron/backup.lock /opt/arena --config /c pods backup --yes >> /h/.local/state/arena-cron/backup.log 2>&1", Some(Backup)),
+            ("*/5 * * * * mkdir -p /h/.local/state/arena-cron /h/logs/cron && PATH=/usr/sbin:/usr/bin flock -n /h/.local/state/arena-cron/proxy.lock /opt/arena --config /c proxy apply --yes >> /h/logs/cron/arena-proxy-cron.log 2>&1", Some(Proxy)),
+            ("*/2 * * * * mkdir -p /h/.local/state/arena-cron && flock -n /h/.local/state/arena-cron/snapshot.lock /opt/arena --config /c snapshot --public --out '/w/fleet.json' >> /h/.local/state/arena-cron/snapshot.log 2>&1", Some(Snapshot)),
+            ("40 * * * * mkdir -p /h/.local/state/arena-cron /h/logs && nice -n 10 /opt/arena --config /c archive sync --tier big >> /h/logs/archive.log 2>&1", Some(ArchiveBig)),
+            ("11 * * * * mkdir -p /h/.local/state/arena-cron && PATH=/bin flock -n -o /h/.local/state/arena-cron/reap.lock /opt/arena --config /c pods reap run >> /h/.local/state/arena-cron/reap.log 2>&1", Some(Reap)),
+            // a663f65's: one folder under the state root.
             ("*/15 * * * * mkdir -p /h/.local/state/arena/cron && ARENA_START_DATE=2026-01-05 flock -n -o /h/.local/state/arena/cron/backup.lock /opt/arena --config /c pods backup --yes >> /h/.local/state/arena/cron/backup.log 2>&1", Some(Backup)),
             ("*/5 * * * * mkdir -p /h/.local/state/arena/cron && PATH=/usr/sbin:/usr/bin flock -n /h/.local/state/arena/cron/proxy.lock /opt/arena --config /c proxy apply --yes >> /h/.local/state/arena/cron/proxy.log 2>&1", Some(Proxy)),
             ("*/2 * * * * mkdir -p /h/.local/state/arena/cron && flock -n /h/.local/state/arena/cron/snapshot.lock /opt/arena --config /c snapshot --public --out '/w/fleet.json' >> /h/.local/state/arena/cron/snapshot.log 2>&1", Some(Snapshot)),
@@ -17574,11 +17726,11 @@ mod tests {
         assert_eq!(with_arena_block(&tab, &merge_cron_block(&[backup[0].1.clone()], &[Backup], &[])), "0 9 * * * keep-me\n");
     }
 
-    /// `line` as the previous version wrote it: no `mkdir -p … &&`, and its lock and log
-    /// directly in `home` under their old names ([`arena_core::cron::Job::legacy_log`]).
+    /// `line` (logging to arena's default) as 026c308 wrote it: no `mkdir -p … &&`, and its
+    /// lock and log directly in `home` under their old names ([`arena_core::cron::Job::legacy_log`]).
     fn legacy_cron_line(line: &str, home: &str) -> String {
         use arena_core::cron::{self, Job};
-        let mut old = line.replacen(&cron::mkdir(home), "", 1);
+        let mut old = line.replacen(&format!("mkdir -p {} && ", cron::dir(home)), "", 1);
         for job in Job::ALL {
             old = old.replace(&format!(" >> {} ", cron::log(home, job)), &format!(" >> {home}/{} ", job.legacy_log()));
             if let Some(lock) = job.legacy_lock() {
@@ -17588,32 +17740,36 @@ mod tests {
         old
     }
 
-    /// The cron folder: a crontab holding the lines the previous version wrote — each logging
-    /// (and locking) directly in the home — is upgraded in place by `cron install`: each line
-    /// is replaced by its new one, never doubled, since a line's kind is the command it runs,
-    /// not its files. Once written, the jobs whose old files are tidied are exactly the ones
-    /// rewritten: never a line the install didn't touch, nor one whose old log the crontab
-    /// still names.
-    #[test]
-    fn cron_install_replaces_the_old_lines_in_place() {
-        use super::{cron_diff, cron_lines, jobs_to_tidy, merge_cron_block, CronJob, CronKind::*};
-        use arena_core::cron::Job;
-        // Exactly what the previous version's `cron install --pull --start-date 2026-10-05
-        // --proxy --archive --reap observe` wrote for root.
-        let old_backup = "*/15 * * * * ARENA_START_DATE=2026-10-05 flock -n -o /root/.arena-backup-cron.lock /usr/local/bin/arena \
-                          --config /root/arena/config.env pods backup --yes >> /root/arena-cron.log 2>&1";
-        let old_proxy = "*/5 * * * * PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin flock -n \
-                         /root/.arena-proxy-cron.lock /usr/local/bin/arena --config /root/arena/config.env proxy apply --yes \
-                         >> /root/arena-proxy-cron.log 2>&1";
-        let old_snap = "7,22,37,52 * * * * ARENA_START_DATE=2026-10-05 ARENA_STATE_DIR=/var/lib/arena nice -n 10 /usr/local/bin/arena \
-                        --config /root/arena/config.env archive sync --tier snap >> /root/arena-archive-cron.log 2>&1";
-        let old_big = "40 * * * * ARENA_START_DATE=2026-10-05 ARENA_STATE_DIR=/var/lib/arena nice -n 10 /usr/local/bin/arena \
-                       --config /root/arena/config.env archive sync --tier big >> /root/arena-archive-cron.log 2>&1";
-        let old_reap = "11,27,41,57 * * * * PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin flock -n -o \
-                        /root/.arena-reap-cron.lock /usr/local/bin/arena --config /root/arena/config.env pods reap run \
-                        >> /root/arena-reap-cron.log 2>&1";
-        let before: Vec<String> = [old_backup, old_proxy, old_snap, old_big, old_reap].map(String::from).to_vec();
-        let job = CronJob {
+    /// `line` (logging to arena's default) as a663f65 wrote it: the same, in its folder under the
+    /// state root ([`arena_core::cron::PREV_DIR`]).
+    fn prev_cron_line(line: &str, home: &str) -> String {
+        line.replace(&arena_core::cron::dir(home), &format!("{home}/{}", arena_core::cron::PREV_DIR))
+    }
+
+    /// Exactly what 026c308's `cron install --pull --start-date 2026-10-05 --proxy --archive
+    /// --reap observe` wrote for root, and the job that renders today's lines for the same flags.
+    fn root_cron_026c308() -> Vec<String> {
+        [
+            "*/15 * * * * ARENA_START_DATE=2026-10-05 flock -n -o /root/.arena-backup-cron.lock /usr/local/bin/arena \
+             --config /root/arena/config.env pods backup --yes >> /root/arena-cron.log 2>&1",
+            "*/5 * * * * PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin flock -n \
+             /root/.arena-proxy-cron.lock /usr/local/bin/arena --config /root/arena/config.env proxy apply --yes \
+             >> /root/arena-proxy-cron.log 2>&1",
+            "7,22,37,52 * * * * ARENA_START_DATE=2026-10-05 ARENA_STATE_DIR=/var/lib/arena nice -n 10 /usr/local/bin/arena \
+             --config /root/arena/config.env archive sync --tier snap >> /root/arena-archive-cron.log 2>&1",
+            "40 * * * * ARENA_START_DATE=2026-10-05 ARENA_STATE_DIR=/var/lib/arena nice -n 10 /usr/local/bin/arena \
+             --config /root/arena/config.env archive sync --tier big >> /root/arena-archive-cron.log 2>&1",
+            "11,27,41,57 * * * * PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin flock -n -o \
+             /root/.arena-reap-cron.lock /usr/local/bin/arena --config /root/arena/config.env pods reap run \
+             >> /root/arena-reap-cron.log 2>&1",
+        ]
+        .map(String::from)
+        .to_vec()
+    }
+
+    /// Today's lines for those flags, root's, logging where `kept` says (else the default).
+    fn root_cron_now(kept: &[(super::CronKind, String)]) -> Vec<(super::CronKind, String)> {
+        let job = super::CronJob {
             schedule: "*/15 * * * *",
             env_prefix: "ARENA_START_DATE=2026-10-05 ",
             exe: "/usr/local/bin/arena",
@@ -17625,9 +17781,26 @@ mod tests {
             snapshot_dir: None,
             archive: true,
             archive_state_dir: Some("/var/lib/arena"),
+            kept_logs: kept,
         };
-        let mut new = cron_lines(&job);
-        new.push((Reap, arena_core::reap::render::cron_line(false, "/usr/local/bin/arena", "/root/arena/config.env", "/root", &[])));
+        let mut lines = super::cron_lines(&job);
+        let reap = kept.iter().find(|(k, _)| *k == super::CronKind::Reap).map(|(_, l)| l.as_str());
+        lines.push((super::CronKind::Reap, arena_core::reap::render::cron_line(false, "/usr/local/bin/arena", "/root/arena/config.env", "/root", reap, &[])));
+        lines
+    }
+
+    /// The upgrade: a crontab holding the lines 026c308 wrote — each logging (and locking) at
+    /// arena's old default directly in the home — or a663f65's (in the state root) is upgraded in
+    /// place by `cron install`: each line replaced by its new one, never doubled, since a line's
+    /// kind is the command it runs, not its files. The tidy plan names exactly the old default
+    /// files those replaced lines used: never a line the install didn't touch, nor a path the
+    /// crontab still names.
+    #[test]
+    fn cron_install_replaces_the_old_lines_in_place() {
+        use super::{cron_diff, kept_logs, merge_cron_block, tidy_plan, CronKind::*, OldCronFile};
+        let before = root_cron_026c308();
+        assert_eq!(kept_logs(&before, "/root"), [], "arena's own old defaults: nothing kept");
+        let new = root_cron_now(&[]);
         let kinds: Vec<super::CronKind> = new.iter().map(|(k, _)| *k).collect();
         assert_eq!(kinds, [Backup, Proxy, ArchiveSnap, ArchiveBig, Reap]);
         let tab = |lines: &[String]| with_arena_block("0 9 * * * keep-me\n", lines);
@@ -17637,104 +17810,266 @@ mod tests {
         let after = merge_cron_block(&before, &kinds, &new);
         assert_eq!(after, new.iter().map(|(_, l)| l.clone()).collect::<Vec<_>>());
         for (old, now) in before.iter().zip(&after) {
-            assert!(now.contains(" >> /root/.local/state/arena/cron/") && !now.contains("/root/arena-"), "{now}");
+            assert!(now.contains(" >> /root/.local/state/arena-cron/") && !now.contains("/root/arena-"), "{now}");
             assert_eq!(legacy_cron_line(now, "/root"), *old, "only the folder and the files change");
         }
         for k in &kinds {
             assert_eq!(after.iter().filter(|l| super::CronKind::of(l) == Some(*k)).count(), 1, "one {} line", k.label());
         }
         assert_eq!(cron_diff(&before, &after).iter().filter(|l| l.starts_with("- ")).count(), 5, "every old line goes");
-        // Every rewritten job's old files are tidied — the archive's two lines are one job.
-        assert_eq!(jobs_to_tidy(&kinds, &before, &after, "/root", &tab(&after)), [Job::Backup, Job::Proxy, Job::Archive, Job::Reap]);
+        let log = |old: &str, job: &str| OldCronFile::Log { old: format!("/root/{old}"), new: format!("/root/.local/state/arena-cron/{job}.log") };
+        let lock = |old: &str| OldCronFile::Lock(format!("/root/{old}"));
+        assert_eq!(
+            tidy_plan(&kinds, &before, &after, "/root", &tab(&after)),
+            [
+                log("arena-cron.log", "backup"),
+                lock(".arena-backup-cron.lock"),
+                log("arena-proxy-cron.log", "proxy"),
+                lock(".arena-proxy-cron.lock"),
+                log("arena-archive-cron.log", "archive"),
+                log("arena-reap-cron.log", "reap"),
+                lock(".arena-reap-cron.lock"),
+            ]
+        );
         // Again: nothing changes, nothing to tidy.
         assert_eq!(merge_cron_block(&after, &kinds, &new), after);
-        assert_eq!(jobs_to_tidy(&kinds, &after, &after, "/root", &tab(&after)), []);
+        assert_eq!(tidy_plan(&kinds, &after, &after, "/root", &tab(&after)), []);
 
-        // `cron install --proxy` alone: only the proxy line is rewritten, and only its old files
-        // go; the others keep using theirs.
+        // `cron install --proxy` alone: only the proxy line's old files go.
         let proxy_only = merge_cron_block(&before, &[Proxy], &new[1..2]);
-        assert_eq!(proxy_only, [old_backup, new[1].1.as_str(), old_snap, old_big, old_reap]);
-        assert_eq!(jobs_to_tidy(&[Proxy], &before, &proxy_only, "/root", &tab(&proxy_only)), [Job::Proxy]);
-        // A paused (commented-out) old backup line would append to the old log again once
-        // un-paused: that log stays.
-        let paused = format!("# {old_backup}");
-        let with_paused: Vec<String> = vec![old_backup.into(), paused.clone()];
+        assert_eq!(proxy_only[1], new[1].1);
+        assert_eq!(proxy_only.iter().filter(|l| *l != &new[1].1).collect::<Vec<_>>(), before.iter().filter(|l| *l != &before[1]).collect::<Vec<_>>());
+        assert_eq!(tidy_plan(&[Proxy], &before, &proxy_only, "/root", &tab(&proxy_only)), [log("arena-proxy-cron.log", "proxy"), lock(".arena-proxy-cron.lock")]);
+        // A paused (commented-out) old backup line would use the old files again once
+        // un-paused: they stay.
+        let paused = format!("# {}", before[0]);
+        let with_paused: Vec<String> = vec![before[0].clone(), paused.clone()];
         let rewritten = merge_cron_block(&with_paused, &[Backup], &new[..1]);
         assert_eq!(rewritten, [new[0].1.clone(), paused]);
-        assert_eq!(jobs_to_tidy(&[Backup], &with_paused, &rewritten, "/root", &tab(&rewritten)), []);
+        assert_eq!(tidy_plan(&[Backup], &with_paused, &rewritten, "/root", &tab(&rewritten)), []);
+
+        // a663f65's lines (one folder in the state root) are arena's own too: moved to the new
+        // folder, their files tidied from those exact paths.
+        let prev: Vec<String> = after.iter().map(|l| prev_cron_line(l, "/root")).collect();
+        assert!(prev.iter().all(|l| l.contains("/root/.local/state/arena/cron/") && !l.contains("arena-cron")), "{prev:?}");
+        assert_eq!(kept_logs(&prev, "/root"), []);
+        let upgraded = merge_cron_block(&prev, &kinds, &new);
+        assert_eq!(upgraded, after);
+        let plan = tidy_plan(&kinds, &prev, &upgraded, "/root", &tab(&upgraded));
+        assert_eq!(plan.len(), 7, "{plan:?}");
+        assert_eq!(plan[..2], [log(".local/state/arena/cron/backup.log", "backup"), lock(".local/state/arena/cron/backup.lock")]);
     }
 
-    /// After the install, the rewritten jobs' old files in the home: each old log moved into the
-    /// cron folder (appended to a new log that's there already), each old lock deleted — exact
-    /// names, regular files only: a symlink is left alone and never followed, and a job that
-    /// wasn't rewritten keeps its files. The home ends up with nothing of arena's at the top
-    /// but the `.local` it already had.
+    /// CL1: a line that logs somewhere someone chose (a folder logrotate rotates, another home)
+    /// keeps that log on a re-install — only the lock moves into arena's folder, and the mkdir
+    /// makes the kept log's folder too. Nothing of that kind is tidied. Again is a no-op.
+    #[test]
+    fn cron_install_keeps_a_log_path_someone_chose() {
+        use super::{kept_logs, merge_cron_block, tidy_plan, CronKind::*};
+        let chosen = |l: &str, log: &str| l.replace(" >> /root/arena-", &format!(" >> {log}/arena-"));
+        let mut before = root_cron_026c308();
+        before[0] = chosen(&before[0], "/srv/x/logs/cron");
+        before[1] = chosen(&before[1], "/home/other");
+        let kept = kept_logs(&before, "/root");
+        assert_eq!(kept, [(Backup, "/srv/x/logs/cron/arena-cron.log".to_string()), (Proxy, "/home/other/arena-proxy-cron.log".to_string())]);
+        let new = root_cron_now(&kept);
+        let kinds: Vec<super::CronKind> = new.iter().map(|(k, _)| *k).collect();
+        let after = merge_cron_block(&before, &kinds, &new);
+        assert_eq!(
+            after[0],
+            "*/15 * * * * mkdir -p /root/.local/state/arena-cron /srv/x/logs/cron && ARENA_START_DATE=2026-10-05 flock -n -o \
+             /root/.local/state/arena-cron/backup.lock /usr/local/bin/arena --config /root/arena/config.env pods backup --yes \
+             >> /srv/x/logs/cron/arena-cron.log 2>&1"
+        );
+        assert!(after[1].starts_with("*/5 * * * * mkdir -p /root/.local/state/arena-cron /home/other && PATH="), "{}", after[1]);
+        assert!(after[1].ends_with(" >> /home/other/arena-proxy-cron.log 2>&1") && after[1].contains(" /root/.local/state/arena-cron/proxy.lock "));
+        // The kept kinds tidy nothing (not even their old locks); the others as before.
+        let plan = tidy_plan(&kinds, &before, &after, "/root", &with_arena_block("", &after));
+        assert!(
+            plan.iter().all(|f| !format!("{f:?}").contains("backup") && !format!("{f:?}").contains("proxy") && !format!("{f:?}").contains("/root/arena-cron.log")),
+            "{plan:?}"
+        );
+        assert_eq!(plan.len(), 3, "the archive's log, the reap's log and lock: {plan:?}");
+        // Re-installed: read back as kept again, the same lines, nothing to change.
+        assert_eq!(kept_logs(&after, "/root"), kept);
+        assert_eq!(merge_cron_block(&after, &kinds, &root_cron_now(&kept_logs(&after, "/root"))), after);
+    }
+
+    /// The home `cron install`/`remove` work in (CL2/CL5): `$HOME` set, absolute, a directory the
+    /// effective user owns, free of whitespace, `%` and newlines — `sudo -E` is refused, by name.
+    /// The arena binary and config path go into the lines unquoted: the same characters refused.
     #[cfg(unix)]
     #[test]
-    fn tidy_moves_the_old_logs_into_the_cron_folder() {
-        use super::{tidy_line, tidy_old_cron_files, CronTidy};
+    fn cron_home_must_be_this_users_and_fit_a_crontab_line() {
+        use super::{cron_home, crontab_word};
+        use std::os::unix::fs::MetadataExt;
+        let base = std::env::temp_dir().join(format!("arena-cron-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("home")).unwrap();
+        std::fs::write(base.join("file"), "").unwrap();
+        let home = base.join("home").display().to_string();
+        let uid = std::fs::metadata(&home).unwrap().uid();
+        assert_eq!(cron_home(Some(&home), uid).unwrap(), home);
+        let refused = |h: Option<&str>, euid: u32| cron_home(h, euid).unwrap_err().to_string();
+        let file = base.join("file").display().to_string();
+        let missing = base.join("missing").display().to_string();
+        let cases: Vec<(Option<&str>, u32, String)> = vec![
+            (None, uid, "HOME isn't set — run as the user whose crontab this is (sudo -i / sudo -H)".into()),
+            (Some(""), uid, "HOME isn't set".into()),
+            (Some("home/dev"), uid, "HOME=home/dev isn't an absolute path".into()),
+            (Some("/home/a b"), uid, "holds whitespace, `%` or a newline".into()),
+            (Some("/home/50%"), uid, "holds whitespace, `%` or a newline".into()),
+            (Some("/home/a\nb"), uid, "HOME=\"/home/a\\nb\" holds whitespace".into()),
+            (Some(&file), uid, format!("HOME={file} isn't a directory")),
+            (Some(&missing), uid, format!("HOME={missing}: ")),
+            (
+                Some(&home),
+                uid + 1,
+                format!(
+                    "HOME={home} isn't this user's home (owner uid {uid}, running as {}) — run as the user whose crontab this is \
+                     (sudo -i / sudo -H), not sudo -E",
+                    uid + 1
+                ),
+            ),
+        ];
+        for (h, euid, want) in cases {
+            let e = refused(h, euid);
+            assert!(e.contains(&want), "{h:?}: {e}");
+        }
+        assert!(crontab_word("the config path", "/srv/arena/config.env").is_ok());
+        for bad in ["/srv/my arena/config.env", "/srv/50%/config.env", "/srv/a\nb", "/srv/a\tb"] {
+            assert!(crontab_word("the arena binary", bad).unwrap_err().to_string().starts_with("the arena binary ("), "{bad:?}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The tidy (CL2/CL7/CL12): exactly the old default files the replaced lines named — never
+    /// `$HOME` plus a name. Each old log is moved (hard-linked, or appended to a new log that's
+    /// there already); each old lock deleted; regular files of this user's only — a symlink is
+    /// left alone, never followed, and so is a new log that's a symlink or a directory; a stale
+    /// file at an old default name the replaced line didn't use stays; files of a kind that
+    /// wasn't rewritten stay. A tidy cut short (old and new already one file) just unlinks.
+    #[cfg(unix)]
+    #[test]
+    fn tidy_moves_exactly_the_old_files_the_replaced_lines_named() {
+        use super::{merge_cron_block, tidy_line, tidy_old_cron_files, tidy_plan, CronKind::*, CronTidy};
         use arena_core::cron::{self, Job};
+        use std::os::unix::fs::MetadataExt;
         let home = std::env::temp_dir().join(format!("arena-cron-tidy-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).unwrap();
         let h = home.display().to_string();
-        let put = |name: &str, text: &str| std::fs::write(home.join(name), text).unwrap();
+        let euid = std::fs::metadata(&home).unwrap().uid();
+        let put = |name: &str, text: &str| {
+            std::fs::create_dir_all(home.join(name).parent().unwrap()).unwrap();
+            std::fs::write(home.join(name), text).unwrap()
+        };
         let read = |path: &str| std::fs::read_to_string(path).unwrap();
+        // Lines logging to arena's defaults in this home, as 026c308 wrote them — but the
+        // archive's as a663f65 did (its folder under the state root).
+        let job = super::CronJob {
+            schedule: "*/15 * * * *",
+            env_prefix: "",
+            exe: "/a",
+            config: "/c",
+            home: &h,
+            backup: true,
+            pull: false,
+            proxy: true,
+            snapshot_dir: Some("/w"),
+            archive: true,
+            archive_state_dir: None,
+            kept_logs: &[],
+        };
+        let mut new = super::cron_lines(&job);
+        new.push((Reap, arena_core::reap::render::cron_line(false, "/a", "/c", &h, None, &[])));
+        let before: Vec<String> = new
+            .iter()
+            .map(|(k, l)| if matches!(k, ArchiveSnap | ArchiveBig) { prev_cron_line(l, &h) } else { legacy_cron_line(l, &h) })
+            .collect();
+        let kinds: Vec<super::CronKind> = new.iter().map(|(k, _)| *k).collect();
+        let after = merge_cron_block(&before, &kinds, &new);
+        let plan = tidy_plan(&kinds, &before, &after, &h, &with_arena_block("", &after));
+
         put("arena-cron.log", "old backup\n");
         put(".arena-backup-cron.lock", "");
         // The new proxy log is there already (a tick ran): the old one is appended to it.
         put("arena-proxy-cron.log", "old proxy\n");
         put(".arena-proxy-cron.lock", "");
-        std::fs::create_dir_all(cron::dir(&h)).unwrap();
-        std::fs::write(cron::log(&h, Job::Proxy), "new proxy\n").unwrap();
-        // A symlink where the old reap log was: left alone, its target never touched.
-        put("elsewhere.log", "not arena's\n");
-        std::os::unix::fs::symlink(home.join("elsewhere.log"), home.join("arena-reap-cron.log")).unwrap();
-        put(".arena-reap-cron.lock", "");
-        // The snapshot line wasn't rewritten: its old files stay.
+        put(".local/state/arena-cron/proxy.log", "new proxy\n");
+        // The new snapshot log is a symlink, the new archive log a directory: left alone.
         put("arena-snapshot-cron.log", "old snapshot\n");
-        put(".arena-snapshot-cron.lock", "");
+        put("elsewhere.log", "not arena's\n");
+        std::os::unix::fs::symlink(home.join("elsewhere.log"), cron::log(&h, Job::Snapshot)).unwrap();
+        put(".local/state/arena/cron/archive.log", "old archive\n");
+        std::fs::create_dir_all(cron::log(&h, Job::Archive)).unwrap();
+        // A stale file at the archive's 026c308 name: the replaced (a663f65) line didn't use it.
+        put("arena-archive-cron.log", "stale\n");
+        // The old reap log is a symlink: left alone, never followed; its old lock a symlink too.
+        std::os::unix::fs::symlink(home.join("elsewhere.log"), home.join("arena-reap-cron.log")).unwrap();
+        std::os::unix::fs::symlink(home.join("elsewhere.log"), home.join(".arena-reap-cron.lock")).unwrap();
 
-        let t = tidy_old_cron_files(&h, &[Job::Backup, Job::Proxy, Job::Archive, Job::Reap]);
-        assert_eq!(t, CronTidy { moved: vec!["arena-cron.log", "arena-proxy-cron.log"], left: vec!["arena-reap-cron.log"], failed: vec![] });
+        // Not this user's (another euid): nothing touched.
+        let other = tidy_old_cron_files(&plan, &h, euid + 1);
+        assert!(other.moved.is_empty() && other.failed.is_empty() && other.left.len() == 5, "{other:?}");
+        assert_eq!(read(&home.join("arena-cron.log").display().to_string()), "old backup\n");
+
+        let t = tidy_old_cron_files(&plan, &h, euid);
+        assert_eq!(
+            t,
+            CronTidy {
+                moved: vec!["~/arena-cron.log".into(), "~/arena-proxy-cron.log".into()],
+                left: vec![
+                    "~/arena-snapshot-cron.log (~/.local/state/arena-cron/snapshot.log isn't a regular file)".into(),
+                    "~/.local/state/arena/cron/archive.log (~/.local/state/arena-cron/archive.log isn't a regular file)".into(),
+                    "~/arena-reap-cron.log (not a regular file of this user's)".into(),
+                ],
+                failed: vec![],
+            }
+        );
         assert_eq!(read(&cron::log(&h, Job::Backup)), "old backup\n");
         assert_eq!(read(&cron::log(&h, Job::Proxy)), "new proxy\nold proxy\n");
-        assert!(std::fs::symlink_metadata(home.join("arena-reap-cron.log")).unwrap().file_type().is_symlink());
         assert_eq!(read(&home.join("elsewhere.log").display().to_string()), "not arena's\n");
-        assert!(std::fs::symlink_metadata(cron::log(&h, Job::Reap)).is_err(), "nothing moved through the symlink");
+        assert!(std::fs::symlink_metadata(home.join(".arena-reap-cron.lock")).unwrap().file_type().is_symlink());
         let mut top: Vec<String> = std::fs::read_dir(&home).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
         top.sort();
-        assert_eq!(top, [".arena-snapshot-cron.lock", ".local", "arena-reap-cron.log", "arena-snapshot-cron.log", "elsewhere.log"]);
+        assert_eq!(
+            top,
+            [".arena-reap-cron.lock", ".local", "arena-archive-cron.log", "arena-reap-cron.log", "arena-snapshot-cron.log", "elsewhere.log"],
+            "moved: backup, proxy; their locks gone; left: the snapshot's (its new log a symlink), the stale archive name, the reap symlinks"
+        );
+        assert_eq!(read(&home.join("arena-archive-cron.log").display().to_string()), "stale\n");
         assert_eq!(
             tidy_line(&t).as_deref(),
             Some(
-                "· cron logs now in ~/.local/state/arena/cron/ (moved: arena-cron.log, arena-proxy-cron.log; left alone, \
-                 not a regular file: arena-reap-cron.log)"
+                "· cron logs now in ~/.local/state/arena-cron/ (moved: ~/arena-cron.log, ~/arena-proxy-cron.log; left alone: \
+                 ~/arena-snapshot-cron.log (~/.local/state/arena-cron/snapshot.log isn't a regular file), \
+                 ~/.local/state/arena/cron/archive.log (~/.local/state/arena-cron/archive.log isn't a regular file), \
+                 ~/arena-reap-cron.log (not a regular file of this user's))"
             )
         );
-        // Again: nothing left to move, nothing said.
-        let again = tidy_old_cron_files(&h, &[Job::Backup, Job::Proxy]);
-        assert_eq!((again, tidy_line(&CronTidy::default())), (CronTidy::default(), None));
+        assert_eq!(tidy_line(&CronTidy::default()), None);
         // A tidy cut short between its link and its unlink: the old log already is the new one —
         // just unlinked, never appended to itself.
         put("arena-cron.log", "once\n");
         std::fs::remove_file(cron::log(&h, Job::Backup)).unwrap();
         std::fs::hard_link(home.join("arena-cron.log"), cron::log(&h, Job::Backup)).unwrap();
-        let t = tidy_old_cron_files(&h, &[Job::Backup]);
-        assert_eq!(t.moved, ["arena-cron.log"]);
+        let t = tidy_old_cron_files(&plan[..1], &h, euid);
+        assert_eq!(t.moved, ["~/arena-cron.log"]);
         assert_eq!(read(&cron::log(&h, Job::Backup)), "once\n");
         assert!(!home.join("arena-cron.log").exists());
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// Every line recreates the cron folder first: cron's `sh` doesn't run a command whose `>>`
-    /// (or flock's lock) points into a missing directory, so without it a deleted folder would
-    /// silently stop the backups. Each line `cron install` renders — its schedule stripped —
-    /// run by a real `sh` the way cron would, the folder deleted before each: a fake arena runs,
-    /// and its output lands in the recreated folder's log.
+    /// Every line recreates its folders first — arena's cron folder, and a kept log's own: cron's
+    /// `sh` doesn't run a command whose `>>` (or flock's lock) points into a missing directory, so
+    /// without it a deleted folder would silently stop the backups. Each line `cron install`
+    /// renders — its schedule stripped — run by a real `sh` the way cron would, with both folders
+    /// deleted before each: a fake arena runs, sees the line's inline env (ARENA_START_DATE,
+    /// ARENA_STATE_DIR) through `&&` and flock/nice, and its output lands in the recreated log.
     #[cfg(unix)]
     #[test]
-    fn every_cron_line_runs_with_its_folder_deleted() {
+    fn every_cron_line_runs_with_its_folders_deleted() {
         use super::{cron_lines, CronJob, CronKind};
         use arena_core::cron;
         use std::os::unix::fs::PermissionsExt;
@@ -17747,9 +18082,10 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         let h = home.display().to_string();
         let exe = home.join("fake-arena");
-        std::fs::write(&exe, "#!/bin/sh\necho \"fake arena ran: $*\"\n").unwrap();
+        std::fs::write(&exe, "#!/bin/sh\necho \"fake arena ran: $*\"\nenv | grep '^ARENA_' | sort\n").unwrap();
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
         let exe = exe.display().to_string();
+        let kept = [(CronKind::Proxy, format!("{h}/logs/cron/arena-proxy-cron.log")), (CronKind::ArchiveBig, format!("{h}/logs/big.log"))];
         let job = CronJob {
             schedule: "*/15 * * * *",
             env_prefix: "ARENA_START_DATE=2026-10-05 ",
@@ -17762,12 +18098,16 @@ mod tests {
             snapshot_dir: Some(&h),
             archive: true,
             archive_state_dir: Some(&h),
+            kept_logs: &kept,
         };
         let mut lines = cron_lines(&job);
-        lines.push((CronKind::Reap, arena_core::reap::render::cron_line(false, &exe, "/c", &h, &[])));
+        let state = vec![("ARENA_STATE_DIR".to_string(), h.clone())];
+        let reap_log = format!("{h}/logs/reap/reap.log");
+        lines.push((CronKind::Reap, arena_core::reap::render::cron_line(false, &exe, "/c", &h, Some(&reap_log), &state)));
         assert_eq!(lines.len(), 6);
         for (kind, line) in &lines {
             let _ = std::fs::remove_dir_all(cron::dir(&h));
+            let _ = std::fs::remove_dir_all(home.join("logs"));
             let command = line.splitn(6, ' ').nth(5).unwrap();
             let out = std::process::Command::new("sh")
                 .args(["-c", command])
@@ -17777,20 +18117,36 @@ mod tests {
                 .output()
                 .unwrap();
             assert!(out.status.success(), "{}: {command}\n{}", kind.label(), String::from_utf8_lossy(&out.stderr));
-            let log = std::fs::read_to_string(cron::log(&h, kind.job())).unwrap_or_default();
+            let log_path = super::cron_log_target(line).unwrap();
+            let log = std::fs::read_to_string(log_path).unwrap_or_default();
             assert!(log.starts_with("fake arena ran: --config /c "), "{}: the log in the recreated folder: {log:?}", kind.label());
+            let start = log.contains("\nARENA_START_DATE=2026-10-05\n");
+            let state = log.contains(&format!("\nARENA_STATE_DIR={h}\n"));
+            let want = match kind {
+                CronKind::Backup => (true, false),
+                CronKind::ArchiveSnap | CronKind::ArchiveBig => (true, true),
+                CronKind::Reap => (false, true),
+                CronKind::Proxy | CronKind::Snapshot => (false, false),
+            };
+            assert_eq!((start, state), want, "{}: the env arena saw: {log:?}", kind.label());
         }
         let _ = std::fs::remove_dir_all(&home);
     }
 
     /// The inline env a line carries (`ARENA_START_DATE`, the archive's `ARENA_STATE_DIR`) is read
-    /// from every version's line: this one's after its `mkdir -p … &&`, the older ones' straight
-    /// after the schedule — never from an argument.
+    /// from every version's line: this one's after its `mkdir -p … &&` (one folder or more), the
+    /// older ones' straight after the schedule — never from an argument.
     #[test]
     fn env_assignments_are_read_from_every_versions_line() {
         use super::env_assignment;
         // (line, ARENA_START_DATE, ARENA_STATE_DIR)
         let cases: &[(&str, Option<&str>, Option<&str>)] = &[
+            (
+                "40 * * * * mkdir -p /h/.local/state/arena-cron /h/logs && ARENA_START_DATE=2026-10-01 ARENA_STATE_DIR=/s nice -n 10 \
+                 /a --config /c archive sync --tier big >> /h/logs/archive.log 2>&1",
+                Some("2026-10-01"),
+                Some("/s"),
+            ),
             (
                 "40 * * * * mkdir -p /h/.local/state/arena/cron && ARENA_START_DATE=2026-10-01 ARENA_STATE_DIR=/s nice -n 10 /a --config /c \
                  archive sync --tier big >> /h/.local/state/arena/cron/archive.log 2>&1",
@@ -17804,6 +18160,7 @@ mod tests {
             ),
             ("@hourly mkdir -p /d && ARENA_STATE_DIR=/s /a archive sync --tier big", None, Some("/s")),
             ("40 * * * * mkdir -p /d && nice -n 10 /a --x ARENA_STATE_DIR=/s", None, None),
+            ("40 * * * * mkdir -p && ARENA_STATE_DIR=/s /a", None, None),
             ("40 * * * * nice ARENA_START_DATE=2026-10-01", None, None),
             ("40 * * * *", None, None),
         ];
@@ -17856,8 +18213,9 @@ mod tests {
             snapshot_dir: None,
             archive: true,
             archive_state_dir: Some("/var/lib/arena"),
+            kept_logs: &[],
         };
-        let reap = |apply: bool| (Reap, arena_core::reap::render::cron_line(apply, "/opt/arena", "/srv/config.env", "/home/u", &[]));
+        let reap = |apply: bool| (Reap, arena_core::reap::render::cron_line(apply, "/opt/arena", "/srv/config.env", "/home/u", None, &[]));
         let mut lines = cron_lines(&job);
         lines.push(reap(false));
         let mut kinds: Vec<super::CronKind> = lines.iter().map(|(k, _)| *k).collect();
@@ -17921,11 +18279,12 @@ mod tests {
             snapshot_dir: Some("/srv/www"),
             archive: true,
             archive_state_dir: None,
+            kept_logs: &[],
         };
         let lines = cron_lines(&job);
         let kinds: Vec<super::CronKind> = lines.iter().map(|(k, _)| *k).collect();
         assert_eq!(kinds, [Backup, Proxy, Snapshot, ArchiveSnap, ArchiveBig], "every other line arena renders");
-        let reap = minutes(&arena_core::reap::render::cron_line(true, "/opt/arena", "/srv/config.env", "/home/u", &[]));
+        let reap = minutes(&arena_core::reap::render::cron_line(true, "/opt/arena", "/srv/config.env", "/home/u", None, &[]));
         assert_eq!(reap.len(), 4, "four times an hour: {reap:?}");
         for (k, l) in &lines {
             let other = minutes(l);
@@ -17985,9 +18344,17 @@ mod tests {
             ("*/15 * * * * ARENA_START_DATE=2026-01-05 /usr/local/bin/arena --config /c pods backup --yes >> /root/arena-cron.log 2>&1", o("*/15 * * * *", Some("2026-01-05"), true)),
             // Tabs, a macro schedule, another env var first.
             ("@hourly\tPATH=/usr/bin ARENA_START_DATE=2026-02-02 /opt/arena pods backup --no-pull --yes", o("@hourly", Some("2026-02-02"), false)),
-            // A start date that isn't one, or one that isn't an env assignment, isn't read.
-            ("*/15 * * * * ARENA_START_DATE=soon /opt/arena pods backup --yes", o("*/15 * * * *", None, true)),
-            ("*/15 * * * * /opt/arena pods backup --yes # ARENA_START_DATE=2026-01-05", o("*/15 * * * *", None, true)),
+            // A start date that isn't one, one that isn't a leading env assignment (a hand edit
+            // behind `cd … &&`, an argument): unreadable — the install says so rather than drop it.
+            ("*/15 * * * * ARENA_START_DATE=soon /opt/arena pods backup --yes", None),
+            ("*/15 * * * * /opt/arena pods backup --yes # ARENA_START_DATE=2026-01-05", None),
+            ("*/15 * * * * cd /root && ARENA_START_DATE=2026-10-05 flock -n /l /opt/arena pods backup --yes", None),
+            // Several folders made first (a kept log elsewhere): still read.
+            (
+                "*/15 * * * * mkdir -p /h/.local/state/arena-cron /h/logs/cron && ARENA_START_DATE=2026-01-05 flock -n -o \
+                 /h/.local/state/arena-cron/backup.lock /opt/arena pods backup --no-pull --yes >> /h/logs/cron/arena-cron.log 2>&1",
+                o("*/15 * * * *", Some("2026-01-05"), false),
+            ),
             // Not a backup line, a paused one, or no schedule to read.
             ("*/5 * * * * /opt/arena proxy apply --yes", None),
             ("# */15 * * * * /opt/arena pods backup --yes", None),
@@ -18040,51 +18407,94 @@ mod tests {
         }
     }
 
-    /// `arena cron …` end to end against a stub `crontab` over a file (the real crontab is
-    /// never touched): a later `--proxy` keeps the earlier `--pull --start-date` backup line
-    /// byte for byte, `--snapshot` adds its line, `remove --proxy` drops only that one, a
-    /// dry run writes nothing, the previous version's lines are upgraded in place (their old
-    /// files in the home tidied into the cron folder), and plain `remove` clears the block —
-    /// the user's own entries surviving throughout.
+    /// `arena cron …` end to end against a stub `crontab` over a file (the real crontab is never
+    /// touched), in a temp dir whose `home/` is the HOME the lines run in.
+    #[cfg(unix)]
+    struct CronStub {
+        dir: std::path::PathBuf,
+        stub: String,
+        config: std::path::PathBuf,
+        home: String,
+    }
+
+    #[cfg(unix)]
+    impl CronStub {
+        fn new(tag: &str) -> CronStub {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = std::env::temp_dir().join(format!("arena-cron-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("www")).unwrap();
+            std::fs::create_dir_all(dir.join("home")).unwrap();
+            let stub = dir.join("crontab");
+            std::fs::write(
+                &stub,
+                "#!/bin/sh\ntab=\"$(dirname \"$0\")/tab\"\ncase \"$1\" in\n  \
+                 -l) [ -f \"$tab\" ] && exec cat \"$tab\"; echo 'no crontab for u' >&2; exit 1;;\n  \
+                 -) cat > \"$tab\";;\nesac\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let config = dir.join("config.env");
+            std::fs::write(&config, "").unwrap();
+            CronStub { stub: stub.display().to_string(), config, home: dir.join("home").display().to_string(), dir }
+        }
+
+        /// `arena cron <args>`, confirming with `--yes` (`yes`), with this `home` as `$HOME`.
+        async fn run_as(&self, args: &[&str], yes: bool, home: Option<&str>) -> anyhow::Result<()> {
+            use clap::Parser;
+            let argv = ["arena", "cron"].iter().chain(args).copied();
+            let super::Cmd::Cron(c) = super::Cli::try_parse_from(argv).unwrap().cmd else { unreachable!() };
+            super::handle_cron(c, &arena_core::Config::default(), &self.config, yes, &self.stub, home).await
+        }
+
+        async fn run(&self, args: &[&str]) {
+            self.run_as(args, true, Some(&self.home)).await.unwrap()
+        }
+
+        fn tab(&self) -> String {
+            std::fs::read_to_string(self.dir.join("tab")).unwrap_or_default()
+        }
+
+        fn set_tab(&self, text: &str) {
+            std::fs::write(self.dir.join("tab"), text).unwrap()
+        }
+
+        fn lines(&self) -> Vec<String> {
+            super::arena_cron_lines(&self.tab()).managed
+        }
+
+        /// What's directly in the home, sorted.
+        fn home_entries(&self) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(&self.home).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+            names.sort();
+            names
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for CronStub {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// `arena cron …` end to end: a later `--proxy` keeps the earlier `--pull --start-date`
+    /// backup line byte for byte, `--snapshot` adds its line, `remove --proxy` drops only that
+    /// one, a dry run writes nothing, 026c308's lines are upgraded in place — their old default
+    /// files moved into the cron folder only once the crontab is written: never on a dry run, a
+    /// refused prompt or a no-op — and plain `remove` clears the block, the user's own entries
+    /// surviving throughout.
     #[cfg(unix)]
     #[tokio::test]
     async fn cron_commands_merge_lines_into_the_real_crontab_text() {
-        use super::{handle_cron, Cli, Cmd};
-        use clap::Parser;
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("arena-cron-e2e-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("www")).unwrap();
-        let stub = dir.join("crontab");
-        std::fs::write(
-            &stub,
-            "#!/bin/sh\ntab=\"$(dirname \"$0\")/tab\"\ncase \"$1\" in\n  \
-             -l) [ -f \"$tab\" ] && exec cat \"$tab\"; echo 'no crontab for u' >&2; exit 1;;\n  \
-             -) cat > \"$tab\";;\nesac\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let (stub, tab) = (stub.display().to_string(), dir.join("tab"));
-        let config = dir.join("config.env");
-        std::fs::write(&config, "").unwrap();
-        let www = dir.join("www").display().to_string();
-        let home = dir.join("home").display().to_string();
-        std::fs::create_dir_all(&home).unwrap();
-        let mkdir = arena_core::cron::mkdir(&home);
-        let run = |args: Vec<String>| {
-            let (stub, config, home) = (stub.clone(), config.clone(), home.clone());
-            async move {
-                let argv = ["arena".to_string(), "cron".to_string()].into_iter().chain(args);
-                let Cmd::Cron(c) = Cli::try_parse_from(argv).unwrap().cmd else { unreachable!() };
-                handle_cron(c, &arena_core::Config::default(), &config, true, &stub, &home).await.unwrap();
-            }
-        };
-        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let lines = || super::arena_cron_lines(&std::fs::read_to_string(&tab).unwrap()).managed;
+        use std::io::IsTerminal;
+        let s = CronStub::new("e2e");
+        let (home, www) = (s.home.clone(), s.dir.join("www").display().to_string());
+        let mkdir = format!("mkdir -p {} && ", arena_core::cron::dir(&home));
 
         // No crontab yet: the backup line with --pull and the start date, flock'd.
-        run(args(&["install", "--pull", "--start-date", "2026-01-05"])).await;
-        let backup = lines();
+        s.run(&["install", "--pull", "--start-date", "2026-01-05"]).await;
+        let backup = s.lines();
         assert_eq!(backup.len(), 1, "{backup:?}");
         assert!(
             backup[0].starts_with(&format!("*/15 * * * * {mkdir}ARENA_START_DATE=2026-01-05 flock -n -o "))
@@ -18092,76 +18502,153 @@ mod tests {
             "{backup:?}"
         );
         // The user adds their own entry by hand.
-        let tab_text = std::fs::read_to_string(&tab).unwrap();
-        std::fs::write(&tab, format!("0 9 * * * /usr/bin/keep-me\n{tab_text}")).unwrap();
+        s.set_tab(&format!("0 9 * * * /usr/bin/keep-me\n{}", s.tab()));
 
         // `--proxy` then `--snapshot`: each adds only its own line.
-        run(args(&["install", "--proxy"])).await;
-        run(args(&["install", "--snapshot", &www])).await;
-        let all = lines();
+        s.run(&["install", "--proxy"]).await;
+        s.run(&["install", "--snapshot", &www]).await;
+        let all = s.lines();
         assert_eq!(all.len(), 3, "{all:?}");
         assert_eq!(all[0], backup[0], "the backup line is untouched");
         assert!(all[1].contains(" proxy apply --yes ") && all[2].contains(" snapshot --public --out "), "{all:?}");
 
         // A dry run changes nothing; `remove --proxy` drops just that line.
-        run(args(&["remove", "--backup", "--dry-run"])).await;
-        assert_eq!(lines(), all);
-        run(args(&["remove", "--proxy"])).await;
-        assert_eq!(lines(), [all[0].clone(), all[2].clone()]);
+        s.run(&["remove", "--backup", "--dry-run"]).await;
+        assert_eq!(s.lines(), all);
+        s.run(&["remove", "--proxy"]).await;
+        assert_eq!(s.lines(), [all[0].clone(), all[2].clone()]);
         // Re-installing what's there is a no-op.
-        run(args(&["install", "--snapshot", &www])).await;
-        assert_eq!(lines(), [all[0].clone(), all[2].clone()]);
+        s.run(&["install", "--snapshot", &www]).await;
+        assert_eq!(s.lines(), [all[0].clone(), all[2].clone()]);
 
         // Re-installing the backup line (to pick up a new line shape) keeps its --pull and
         // start date — even from an older version's line, which it upgrades in place — and
         // only the opposite flags drop them. The other lines never move.
         let legacy = legacy_cron_line(&all[0], &home).replace(" flock -n -o ", " flock -n ");
-        let tab_text = std::fs::read_to_string(&tab).unwrap().replace(&all[0], &legacy);
-        std::fs::write(&tab, tab_text).unwrap();
-        assert_eq!(lines()[0], legacy);
-        run(args(&["install", "--backup"])).await;
-        assert_eq!(lines(), [all[0].clone(), all[2].clone()], "the legacy line upgraded, --pull and the start date kept");
-        run(args(&["install", "--no-pull"])).await;
-        let git_only = lines();
+        s.set_tab(&s.tab().replace(&all[0], &legacy));
+        assert_eq!(s.lines()[0], legacy);
+        s.run(&["install", "--backup"]).await;
+        assert_eq!(s.lines(), [all[0].clone(), all[2].clone()], "the legacy line upgraded, --pull and the start date kept");
+        s.run(&["install", "--no-pull"]).await;
+        let git_only = s.lines();
         assert!(
             git_only[0].starts_with(&format!("*/15 * * * * {mkdir}ARENA_START_DATE=2026-01-05 flock -n -o "))
                 && git_only[0].contains(" pods backup --no-pull --yes >> "),
             "{git_only:?}"
         );
-        run(args(&["install", "--schedule", "0 * * * *"])).await;
-        let hourly = lines();
+        s.run(&["install", "--schedule", "0 * * * *"]).await;
+        let hourly = s.lines();
         assert!(hourly[0].starts_with(&format!("0 * * * * {mkdir}ARENA_START_DATE=2026-01-05 flock")) && hourly[0].contains("--no-pull"), "{hourly:?}");
-        run(args(&["install", "--no-start-date", "--pull"])).await;
-        let undated = lines();
+        s.run(&["install", "--no-start-date", "--pull"]).await;
+        let undated = s.lines();
         assert!(undated[0].starts_with(&format!("0 * * * * {mkdir}flock -n -o ")) && undated[0].contains(" pods backup --yes >> "), "{undated:?}");
         assert_eq!(undated[1], all[2], "the snapshot line never moved");
 
-        // The previous version's lines, their logs and locks directly in the home: a re-install
-        // replaces each in place — never doubled — the backup line keeping its options, read
-        // back from the old line; then the rewritten lines' old logs move into the cron folder
-        // and their locks go. The proxy's old log stays: no line was rewritten for it.
+        // 026c308's lines, their logs and locks directly in the home, and those files there.
         let old: Vec<String> = undated.iter().map(|l| legacy_cron_line(l, &home)).collect();
         assert!(old.iter().zip(&undated).all(|(o, n)| o != n && !o.contains(".local/state")), "{old:?}");
-        let tab_text = std::fs::read_to_string(&tab).unwrap().replace(&undated[0], &old[0]).replace(&undated[1], &old[1]);
-        std::fs::write(&tab, tab_text).unwrap();
-        assert_eq!(lines(), old);
+        s.set_tab(&s.tab().replace(&undated[0], &old[0]).replace(&undated[1], &old[1]));
+        assert_eq!(s.lines(), old);
+        let put = |f: &str, text: &str| std::fs::write(std::path::Path::new(&home).join(f), text).unwrap();
         for f in ["arena-cron.log", ".arena-backup-cron.lock", "arena-snapshot-cron.log", ".arena-snapshot-cron.lock", "arena-proxy-cron.log"] {
-            std::fs::write(std::path::Path::new(&home).join(f), format!("{f}\n")).unwrap();
+            put(f, &format!("{f}\n"));
         }
-        run(args(&["install", "--backup", "--snapshot", &www])).await;
-        assert_eq!(lines(), undated, "upgraded in place, one line each");
-        let in_home: Vec<String> = std::fs::read_dir(&home).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
-        assert_eq!(in_home.len(), 2, "{in_home:?}");
-        assert!(in_home.contains(&".local".to_string()) && in_home.contains(&"arena-proxy-cron.log".to_string()), "{in_home:?}");
+        let files = s.home_entries();
+        // A dry run, and a prompt refused (no terminal, no --yes): nothing written, nothing tidied.
+        s.run(&["install", "--backup", "--snapshot", &www, "--dry-run"]).await;
+        assert_eq!((s.lines(), s.home_entries()), (old.clone(), files.clone()), "a dry run tidies nothing");
+        if !std::io::stdin().is_terminal() {
+            let e = s.run_as(&["install", "--backup", "--snapshot", &www], false, Some(&home)).await.unwrap_err();
+            assert!(e.downcast_ref::<super::NoTerminal>().is_some(), "{e}");
+            assert_eq!((s.lines(), s.home_entries()), (old.clone(), files.clone()), "a refused prompt tidies nothing");
+        }
+        // Written: each line replaced in place — never doubled — the backup line keeping its
+        // options, read back from the old line; then the rewritten lines' old logs move into the
+        // cron folder and their locks go. The proxy's old log stays: no line was rewritten for it.
+        s.run(&["install", "--backup", "--snapshot", &www]).await;
+        assert_eq!(s.lines(), undated, "upgraded in place, one line each");
+        assert_eq!(s.home_entries(), [".local", "arena-proxy-cron.log"]);
         for (job, was) in [(arena_core::cron::Job::Backup, "arena-cron.log"), (arena_core::cron::Job::Snapshot, "arena-snapshot-cron.log")] {
             assert_eq!(std::fs::read_to_string(arena_core::cron::log(&home, job)).unwrap(), format!("{was}\n"));
         }
+        // A no-op install tidies nothing either: an old default log put back stays.
+        put("arena-cron.log", "again\n");
+        s.run(&["install", "--backup", "--snapshot", &www]).await;
+        assert_eq!(s.home_entries(), [".local", "arena-cron.log", "arena-proxy-cron.log"]);
 
         // Plain `remove`: the whole block goes; the user's entry stays.
-        run(args(&["remove"])).await;
-        let text = std::fs::read_to_string(&tab).unwrap();
-        assert_eq!(text, "0 9 * * * /usr/bin/keep-me\n");
-        let _ = std::fs::remove_dir_all(&dir);
+        s.run(&["remove"]).await;
+        assert_eq!(s.tab(), "0 9 * * * /usr/bin/keep-me\n");
+    }
+
+    /// CL1 end to end: an installed backup line logging to a folder someone chose (its lock in
+    /// another home) is re-installed with that log kept, its folder in the mkdir, the lock in
+    /// arena's folder — and nothing tidied: the chosen log, the line's old lock, and old-default
+    /// files sitting in this HOME all stay. Again: nothing to change.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cron_install_keeps_a_chosen_log_and_tidies_nothing_of_it() {
+        use arena_core::cron::{self, Job};
+        let s = CronStub::new("kept");
+        let home = s.home.clone();
+        let logs = s.dir.join("srv/x/logs/cron").display().to_string();
+        let other = s.dir.join("oldhome").display().to_string();
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let chosen = format!("{logs}/arena-cron.log");
+        let line = format!(
+            "*/15 * * * * ARENA_START_DATE=2026-10-05 flock -n -o {other}/.arena-backup-cron.lock /usr/local/bin/arena --config /c \
+             pods backup --yes >> {chosen} 2>&1"
+        );
+        s.set_tab(&with_arena_block("", std::slice::from_ref(&line)));
+        let mut old_files = vec![chosen.clone()];
+        for d in [&home, &other] {
+            for f in ["arena-cron.log", ".arena-backup-cron.lock"] {
+                old_files.push(format!("{d}/{f}"));
+            }
+        }
+        for f in &old_files {
+            std::fs::write(f, "old\n").unwrap();
+        }
+        s.run(&["install", "--backup"]).await;
+        let now = s.lines();
+        assert_eq!(now.len(), 1, "{now:?}");
+        assert!(
+            now[0].starts_with(&format!(
+                "*/15 * * * * mkdir -p {} {logs} && ARENA_START_DATE=2026-10-05 flock -n -o {} ",
+                cron::dir(&home),
+                cron::lock(&home, Job::Backup)
+            )) && now[0].ends_with(&format!(" pods backup --yes >> {chosen} 2>&1")),
+            "{now:?}"
+        );
+        for f in &old_files {
+            assert_eq!(std::fs::read_to_string(f).unwrap(), "old\n", "{f} untouched");
+        }
+        assert!(!std::path::Path::new(&cron::log(&home, Job::Backup)).exists());
+        s.run(&["install", "--backup"]).await;
+        assert_eq!(s.lines(), now, "kept again: nothing to change");
+    }
+
+    /// CL2/CL5 end to end: `install` and `remove` refuse a HOME they can't use (unset, relative,
+    /// not a directory) and a config path a crontab line can't carry — before anything changes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cron_install_and_remove_refuse_a_home_or_config_a_line_cant_carry() {
+        let mut s = CronStub::new("refuse");
+        s.run(&["install", "--backup"]).await;
+        let tab = s.tab();
+        let file = s.dir.join("config.env").display().to_string();
+        for home in [None, Some("home/dev"), Some(file.as_str())] {
+            for args in [&["install", "--backup", "--no-pull"][..], &["remove"][..]] {
+                let e = s.run_as(args, true, home).await.unwrap_err().to_string();
+                assert!(e.starts_with("HOME") && e.contains("run as the user whose crontab this is"), "{home:?} {args:?}: {e}");
+            }
+        }
+        s.config = s.dir.join("50%.env");
+        std::fs::write(&s.config, "").unwrap();
+        let e = s.run_as(&["install", "--backup", "--no-pull"], true, Some(&s.home)).await.unwrap_err().to_string();
+        assert!(e.starts_with("the config path (") && e.contains("`%`"), "{e}");
+        assert_eq!(s.tab(), tab, "nothing changed");
     }
 
     #[test]

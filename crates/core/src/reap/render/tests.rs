@@ -159,16 +159,24 @@ fn banner_is_silent_unless_interactive_and_then_on_stderr() {
 #[test]
 fn cron_line_both_modes() {
     let env = vec![("ARENA_STATE_DIR".to_string(), "/var/lib/arena".to_string())];
-    let observe = cron_line(false, "/usr/local/bin/arena", "/root/arena/config.env", "/root", &env);
+    let observe = cron_line(false, "/usr/local/bin/arena", "/root/arena/config.env", "/root", None, &env);
     assert_eq!(
         observe,
-        "11,27,41,57 * * * * mkdir -p /root/.local/state/arena/cron && PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-         ARENA_STATE_DIR=/var/lib/arena flock -n -o /root/.local/state/arena/cron/reap.lock /usr/local/bin/arena \
-         --config /root/arena/config.env pods reap run >> /root/.local/state/arena/cron/reap.log 2>&1"
+        "11,27,41,57 * * * * mkdir -p /root/.local/state/arena-cron && PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+         ARENA_STATE_DIR=/var/lib/arena flock -n -o /root/.local/state/arena-cron/reap.lock /usr/local/bin/arena \
+         --config /root/arena/config.env pods reap run >> /root/.local/state/arena-cron/reap.log 2>&1"
     );
-    let apply = cron_line(true, "/usr/local/bin/arena", "/root/arena/config.env", "/root", &[]);
+    let apply = cron_line(true, "/usr/local/bin/arena", "/root/arena/config.env", "/root", None, &[]);
     assert!(apply.contains(" pods reap run --apply --yes >> "), "{apply}");
     assert!(!apply.contains("ARENA_STATE_DIR"));
+    // A log the installed line kept elsewhere: its folder made too; the lock stays in arena's.
+    let kept = cron_line(false, "/a", "/c", "/root", Some("/root/logs/cron/arena-reap-cron.log"), &[]);
+    assert!(
+        kept.starts_with("11,27,41,57 * * * * mkdir -p /root/.local/state/arena-cron /root/logs/cron && PATH=")
+            && kept.contains(" flock -n -o /root/.local/state/arena-cron/reap.lock ")
+            && kept.ends_with(" >> /root/logs/cron/arena-reap-cron.log 2>&1"),
+        "{kept}"
+    );
 }
 
 /// Notifications: fixed words, one line, rate-limited.
