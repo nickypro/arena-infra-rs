@@ -4746,8 +4746,7 @@ deep_check_end=1
             "ARENA_REPO_OWNER=nickypro\nARENA_REPO_NAME=arena-sandbox-materials\nGIT_SSH_KEY_LOCAL=/nonexistent/deploy_key\nLOCAL_BACKUP_DIR={}\n",
             dir.display()
         ));
-        let held = arena_core::pull::open_pod_lock(&dir.display().to_string(), &alpha.name).unwrap();
-        assert!(arena_core::pull::try_lock(&held).unwrap());
+        let held = arena_core::pull::try_lock(arena_core::pull::open_pod_lock(&dir.display().to_string(), &alpha.name).unwrap()).unwrap().expect("free");
         let quiet = FakeRemote::new();
         let line = run_backup(&quiet, &locked, &alpha).await;
         assert!(line.starts_with("⊘ ") && line.contains("busy"), "{line}");

@@ -1128,15 +1128,18 @@ async fn notify_one(cmd: Option<&str>, line: &str) {
 /// Take a pod's backup lock without waiting (beyond [`store::LOCK_GRACE`]): `Ok(Some(lock))`;
 /// `Err(())` busy. With no usable lock dir (or a lock file that can't be opened) there's no
 /// lock to take: `Ok(None)` — the probe goes ahead (the reap's backup doesn't: it needs one).
-async fn try_pod_lock(lock_dir: Option<&str>, pod: &str) -> std::result::Result<Option<std::fs::File>, ()> {
+async fn try_pod_lock(lock_dir: Option<&str>, pod: &str) -> std::result::Result<Option<arena_core::pull::PodLock>, ()> {
     let Some(dir) = lock_dir else { return Ok(None) };
-    let Ok(f) = arena_core::pull::open_pod_lock(dir, pod) else { return Ok(None) };
+    let Ok(mut f) = arena_core::pull::open_pod_lock(dir, pod) else { return Ok(None) };
     let deadline = tokio::time::Instant::now() + store::LOCK_GRACE;
     loop {
-        match arena_core::pull::try_lock(&f) {
-            Ok(true) => return Ok(Some(f)),
-            Ok(false) if tokio::time::Instant::now() < deadline => tokio::time::sleep(Duration::from_millis(50)).await,
-            Ok(false) => return Err(()),
+        match arena_core::pull::try_lock(f) {
+            Ok(Ok(lock)) => return Ok(Some(lock)),
+            Ok(Err(back)) if tokio::time::Instant::now() < deadline => {
+                f = back;
+                tokio::time::sleep(Duration::from_millis(50)).await
+            }
+            Ok(Err(_)) => return Err(()),
             Err(_) => return Ok(None),
         }
     }

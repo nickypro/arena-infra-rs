@@ -3558,11 +3558,11 @@ mod tests {
     /// The real rsync, its `-e` swapped for a shim that runs the push key's forced command (the
     /// real rrsync, `-munge -wo -no-del -no-lock`, rooted at `<w>/push`) as sshd would: `archive
     /// sync` end to end, offline. `None` without rsync, python3 or rrsync.
-    /// Let go of a pod's backup lock as a finished pull does, and wait until it really is free:
-    /// a child that another test thread forked (and hasn't exec'd yet) holds a copy of the lock's
-    /// descriptor for a moment, and flock frees the lock only when every copy is closed (seen on
-    /// a loaded CI runner).
-    fn release_pull(pull: std::fs::File, backup: &str, pod: &str) {
+    /// Let go of a pod's backup lock as a finished pull does, and check that it really is free
+    /// (within 10 s): before [`arena_core::pull::PodLock`] unlocked on drop, a child that another
+    /// test thread forked (and hadn't exec'd yet) held a copy of the lock's descriptor for a
+    /// moment, and flock freed the lock only when every copy was closed (seen on a loaded CI runner).
+    fn release_pull(pull: arena_core::pull::PodLock, backup: &str, pod: &str) {
         drop(pull);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while arena_core::pull::try_pod_lock_now(backup, pod).is_err() {

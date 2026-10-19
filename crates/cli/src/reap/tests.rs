@@ -1407,8 +1407,7 @@ async fn inv_hold() {
 async fn a_held_backup_lock_skips_the_look_without_breaking_the_streak() {
     let (w, a) = due_world("lock-held", "").await;
     let dir = w.cfg.get("LOCAL_BACKUP_DIR").unwrap().to_string();
-    let held = arena_core::pull::open_pod_lock(&dir, &a.name).unwrap();
-    assert!(arena_core::pull::try_lock(&held).unwrap());
+    let held = arena_core::pull::try_lock(arena_core::pull::open_pod_lock(&dir, &a.name).unwrap()).unwrap().expect("free");
     w.tick(0);
     let before = w.calls_to(22001).len();
     w.step("apply").await;
@@ -1700,9 +1699,8 @@ async fn pull_two_volume_markers_and_the_per_pod_lock() {
     assert!(!std::path::Path::new(&snap.join("big")).exists(), "no big/ under the snapshot root");
     // Busy: another backup holds the pod's lock.
     std::fs::remove_file(w.dir.join("calls.log")).unwrap();
-    let held = arena_core::pull::open_pod_lock(&dir, "devtest-alpha").unwrap();
-    // The pull above released it; a fork in another test thread can keep it a moment longer.
-    assert!(super::super::lock_settles_free(&held));
+    // The pull above released it (a fork in another test thread can't keep it: it unlocks).
+    let held = super::super::lock_settles(arena_core::pull::open_pod_lock(&dir, "devtest-alpha").unwrap()).expect("free");
     let e = pull(super::super::LockMode::Take(Duration::from_millis(300))).await.unwrap_err().to_string();
     assert!(e.contains("devtest-alpha (busy)"), "{e}");
     assert!(w.order().is_empty(), "no rsync of a busy pod: {:?}", w.order());
@@ -2251,7 +2249,7 @@ async fn review_rr_a_pull_releases_each_pods_lock_when_that_pod_is_done() {
         assert!(mark.exists(), "alpha's big tier never ran");
         tokio::time::sleep(Duration::from_millis(1000)).await; // alpha's jobs are all done; bravo still sleeping
         let f = arena_core::pull::open_pod_lock(&dir, "devtest-alpha").unwrap();
-        arena_core::pull::try_lock(&f).unwrap()
+        arena_core::pull::try_lock(f).unwrap().is_ok()
     };
     let (r, alpha_free) = tokio::join!(pull, check);
     r.unwrap();
@@ -2360,7 +2358,7 @@ async fn rr_pod_locks_once_per_name_released_per_pod() {
         locks.expect(n);
     }
     locks.release_idle();
-    let free = |n: &str| arena_core::pull::try_lock(&arena_core::pull::open_pod_lock(&d, n).unwrap()).unwrap();
+    let free = |n: &str| arena_core::pull::try_lock(arena_core::pull::open_pod_lock(&d, n).unwrap()).unwrap().is_ok();
     assert!(free("devtest-charlie"), "no work under it: released at once");
     assert!(!free("devtest-alpha") && !free("devtest-bravo"));
     locks.done("devtest-alpha");
@@ -2371,8 +2369,7 @@ async fn rr_pod_locks_once_per_name_released_per_pod() {
     drop(locks);
     assert!(free("devtest-bravo"));
     // Another process's hold (here: an open lock of our own, outside the run) is "busy".
-    let other = arena_core::pull::open_pod_lock(&d, "devtest-bravo").unwrap();
-    assert!(arena_core::pull::try_lock(&other).unwrap());
+    let _other = arena_core::pull::try_lock(arena_core::pull::open_pod_lock(&d, "devtest-bravo").unwrap()).unwrap().expect("free");
     let locks = super::super::take_pod_locks(&d, &names, Duration::from_millis(200)).await;
     assert_eq!(locks.busy, ["devtest-bravo"]);
 }

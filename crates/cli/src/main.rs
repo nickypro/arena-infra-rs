@@ -8998,23 +8998,33 @@ fn take_would_refuse() -> Vec<String> {
 }
 
 /// Under test: take `lock` (a per-pod backup lock file), retrying for up to 2 s — whether a lock
-/// this process just released is free. It can read as held for a moment after its release: a
-/// child another test thread forks meanwhile (a git, an rsync stub) holds a copy of every open
-/// file — the lock's too — until it execs (`O_CLOEXEC` closes it only then), and a flock belongs
-/// to the open file, not to the process. A lock still held after 2 s is a real one. Says on
-/// stderr when it had to wait (`--nocapture` shows it).
+/// this process just released is free. A [`arena_core::pull::PodLock`] unlocks when dropped, so
+/// one of ours is free at once; one released by a close alone (a run that was killed) can read
+/// as held for a moment: a child another test thread forks meanwhile (a git, an rsync stub)
+/// holds a copy of every open file — the lock's too — until it execs (`O_CLOEXEC` closes it only
+/// then), and a flock belongs to the open file, not to the process. A lock still held after 2 s
+/// is a real one. Says on stderr when it had to wait (`--nocapture` shows it).
 #[cfg(test)]
-fn lock_settles_free(lock: &std::fs::File) -> bool {
+fn lock_settles_free(lock: std::fs::File) -> bool {
+    lock_settles(lock).is_some()
+}
+
+/// Under test: [`lock_settles_free`]'s lock, taken and held (until the guard is dropped).
+#[cfg(test)]
+fn lock_settles(mut lock: std::fs::File) -> Option<arena_core::pull::PodLock> {
     let start = std::time::Instant::now();
     loop {
-        if arena_core::pull::try_lock(lock).unwrap() {
-            if !start.elapsed().is_zero() {
-                eprintln!("(lock_settles_free: free after {:?})", start.elapsed());
+        match arena_core::pull::try_lock(lock).unwrap() {
+            Ok(held) => {
+                if !start.elapsed().is_zero() {
+                    eprintln!("(lock_settles_free: free after {:?})", start.elapsed());
+                }
+                return Some(held);
             }
-            return true;
+            Err(f) => lock = f,
         }
         if start.elapsed() > Duration::from_secs(2) {
-            return false;
+            return None;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -13486,7 +13496,7 @@ const POD_LOCK_WAIT: Duration = Duration::from_secs(120);
 struct PodLocks {
     /// Held (until released or this is dropped), with how many pieces of this run's work are
     /// still to end under each.
-    held: std::collections::HashMap<String, (std::fs::File, usize)>,
+    held: std::collections::HashMap<String, (arena_core::pull::PodLock, usize)>,
     /// Names whose lock stayed busy: skipped, a failure.
     busy: Vec<String>,
 }
@@ -13555,11 +13565,11 @@ async fn take_pod_locks(dir: &str, names: &[String], wait: Duration) -> PodLocks
     loop {
         let mut still = Vec::new();
         for (name, f) in pending {
-            match arena_core::pull::try_lock(&f) {
-                Ok(true) => {
-                    out.held.insert(name, (f, 0));
+            match arena_core::pull::try_lock(f) {
+                Ok(Ok(lock)) => {
+                    out.held.insert(name, (lock, 0));
                 }
-                Ok(false) => still.push((name, f)),
+                Ok(Err(f)) => still.push((name, f)),
                 Err(e) => {
                     eprintln!("warning: locking {name}'s backup failed ({e}) — going ahead without its lock");
                 }
@@ -22356,8 +22366,8 @@ mod remote_tests {
         let names: Vec<String> = f.pods.iter().map(|p| p.name.clone()).collect();
         let mut locks = crate::take_pod_locks(&d, &names, Duration::from_millis(10)).await;
         assert!(locks.holds("devtest-apple") && locks.holds("devtest-bloom"));
-        let held = |n: &str| !arena_core::pull::try_lock(&arena_core::pull::open_pod_lock(&d, n).unwrap()).unwrap();
-        let free = |n: &str| crate::lock_settles_free(&arena_core::pull::open_pod_lock(&d, n).unwrap());
+        let held = |n: &str| arena_core::pull::try_lock(arena_core::pull::open_pod_lock(&d, n).unwrap()).unwrap().is_err();
+        let free = |n: &str| crate::lock_settles_free(arena_core::pull::open_pod_lock(&d, n).unwrap());
         let (sel, c) = (everyone(&f), cfg());
         let mut unpushed = Vec::new();
         let backup = handle_backup(fake.clone(), &c, true, None, &sel, &mut locks, &mut unpushed);
@@ -23375,8 +23385,7 @@ mod remote_tests {
         async fn exec(&self, t: &SshTarget, cmd: &str, timeout: Option<Duration>) -> Result<arena_core::ssh::SshOutput> {
             let pod = fleet().pods.into_iter().find(|p| p.ssh_port == Some(t.port)).map(|p| p.name).unwrap();
             let f = arena_core::pull::open_pod_lock(&self.dir, &pod).unwrap();
-            let free = arena_core::pull::try_lock(&f).unwrap();
-            drop(f);
+            let free = arena_core::pull::try_lock(f).unwrap().is_ok();
             self.seen.lock().unwrap().push((t.port, !free));
             self.inner.exec(t, cmd, timeout).await
         }
@@ -23430,7 +23439,7 @@ mod remote_tests {
         assert_eq!(probe.held(22003), [true]);
         for pod in ["devtest-apple", "devtest-bloom", "devtest-cloud"] {
             let f = arena_core::pull::open_pod_lock(&base.display().to_string(), pod).unwrap();
-            assert!(crate::lock_settles_free(&f), "{pod}'s lock still held after the run");
+            assert!(crate::lock_settles_free(f), "{pod}'s lock still held after the run");
         }
     }
 
@@ -23443,8 +23452,7 @@ mod remote_tests {
         let _ = std::fs::remove_dir_all(&dir);
         let cfg = backup_cfg(&dir);
         let d = dir.display().to_string();
-        let held = arena_core::pull::open_pod_lock(&d, "devtest-bloom").unwrap();
-        assert!(arena_core::pull::try_lock(&held).unwrap());
+        let held = arena_core::pull::try_lock(arena_core::pull::open_pod_lock(&d, "devtest-bloom").unwrap()).unwrap().expect("free");
         let fake = Arc::new(FakeRemote::new());
         let err = handle_set_branch(fake.clone(), &cfg, "main", &everyone(&fleet()), true, false, true, "rsync").await.unwrap_err();
         assert_eq!(
