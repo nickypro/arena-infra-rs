@@ -1220,7 +1220,9 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     (`ARENA_UPSTREAM_REPO`, default `ARENA-education/ARENA_materials`, `none` to skip) is added
     as the checkout's `upstream` remote over https when it has none — so a participant can
     `git pull upstream main` the course's own fixes. Setup never fetches it, and an `upstream`
-    already there (a participant's own) is left alone.
+    already there (a participant's own) is left alone; `checkout.defaultRemote=origin` makes a
+    plain `git checkout <branch>` both repos have take origin's. arena's own fetches name origin
+    (init-branches, set-branch), so an unreachable upstream never stops them.
     The repo update fetches **only the default branch, without tags** (a bare `git fetch`
     would pull every participant's autocommit branch); a tracked non-default branch pulls
     just its own upstream; the default branch is fast-forwarded only when the checkout has

@@ -641,7 +641,10 @@ pub fn init_branch_command(cfg: &BackupConfig, machine_name: &str) -> String {
             ))
         ));
     }
-    parts.push("git fetch --all --prune".into());
+    // Origin only — the remote this pushes to and branches from. Not `--all`: setup adds the
+    // public course repo as `upstream`, and under `set -e` one unreachable remote (a typo, an
+    // outage, a renamed repo) stopped every pod's day branch (review fb2 R1).
+    parts.push("git fetch --prune origin".into());
     // Create the branch from the current HEAD, or switch to it if it already exists.
     parts.push(format!("git checkout -b {bq} 2>/dev/null || git checkout {bq}"));
     // Landing on a day branch that already exists (`set-branch main --hard --init-branches` run
@@ -705,7 +708,10 @@ pub fn checkout_command(repo_path: &str, branch: &str, git_ssh_key: Option<&str>
         // Force-switch to the branch reset to origin (discards local changes/commits on it).
         format!("git checkout -f -B {} {remote_ref} && git reset --hard {remote_ref}", shell_quote(branch))
     } else {
-        format!("git checkout {} && git pull --ff-only", shell_quote(branch))
+        // `checkout.defaultRemote`: with an `upstream` remote too (the course repo, whose branch
+        // names the cohort's copy shares), a plain checkout of a branch both have refused as
+        // "matched multiple remote tracking branches" (review fb2 R2); origin's is the one.
+        format!("git -c checkout.defaultRemote=origin checkout {} && git pull --ff-only", shell_quote(branch))
     };
     let mut lines = vec![parts.join("; ")];
     // The keys set aside around the switch (from the repo's top: git's paths are relative to it).
@@ -2064,6 +2070,48 @@ done
         assert_eq!(s.read("ex.py"), day2.as_bytes());
     }
 
+    /// Review (fb2 R1, R2): setup adds the public course repo as `upstream`. The switches must not
+    /// depend on it: init-branches fetched `--all` under `set -e`, so an unreachable upstream (a
+    /// typo, an outage) stopped every pod's day branch; and a gentle switch to a branch both
+    /// remotes have (the cohort repo is a copy of the course's) failed as "matched multiple remote
+    /// tracking branches" once upstream's refs were there. Now init fetches origin only, and the
+    /// switch takes origin's branch.
+    #[cfg(unix)]
+    #[test]
+    fn the_switches_never_depend_on_an_upstream_remote() {
+        let s = GitSandbox::new("upstream-switch", 1_000_000);
+        let repo = s.work.to_str().unwrap();
+        let up = s.base.join("upstream.git");
+        s.git(&s.base, &["init", "-q", "--bare", up.to_str().unwrap()]);
+        // `feat` on both: origin's with one more commit, upstream's = main.
+        s.git(&s.work, &["checkout", "-q", "-b", "feat", "main"]);
+        s.put("feat.txt", 3);
+        s.git(&s.work, &["add", "-A"]);
+        s.git(&s.work, &["commit", "-q", "-m", "feat"]);
+        s.git(&s.work, &["push", "-q", "origin", "feat"]);
+        s.git(&s.work, &["push", "-q", up.to_str().unwrap(), "main:feat"]);
+        s.git(&s.work, &["remote", "add", "upstream", up.to_str().unwrap()]);
+        s.git(&s.work, &["fetch", "-q", "upstream"]);
+        s.git(&s.work, &["checkout", "-q", "autocommit-x"]);
+        s.git(&s.work, &["branch", "-q", "-D", "feat"]);
+        let run = |cmd: String| {
+            let o = s.run(&cmd);
+            (o.status.success(), format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)))
+        };
+        let (ok, out) = run(checkout_command(repo, "feat", None, false));
+        assert!(ok, "{out}");
+        assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), s.git(&s.work, &["rev-parse", "origin/feat"]));
+        assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "feat@{u}"]), "origin/feat");
+        // Upstream unreachable: https, which this sandbox's git refuses at once (as a typo'd or
+        // down repo would fail on a pod).
+        s.git(&s.work, &["remote", "set-url", "upstream", "https://github.com/ARENA-education/ARENA_material.git"]);
+        let cfg = BackupConfig { repo_path: repo.to_string(), prefix: "devtest".into(), week: 1, day: 4, git_ssh_key: None, origin: None };
+        let (ok, out) = run(init_branch_command(&cfg, "devtest-x"));
+        assert!(ok, "{out}");
+        assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "autocommit-devtest-w1d4-x");
+        assert_eq!(s.git(&s.origin, &["rev-parse", "autocommit-devtest-w1d4-x"]), s.git(&s.work, &["rev-parse", "HEAD"]));
+    }
+
     /// Live (bsec O1): `set-branch main --hard --init-branches` run twice in a day landed the pod
     /// back on its day branch with the real keys still set aside, and nothing said so — init's
     /// checkout ran no restore. Now it runs set-branch's: back, byte for byte, and said. A new
@@ -2236,7 +2284,7 @@ done
         c.week = 1;
         c.day = 4;
         let cmd = init_branch_command(&c, "arena8-apple");
-        assert!(cmd.contains("git fetch --all --prune"));
+        assert!(cmd.contains("git fetch --prune origin") && !cmd.contains("--all"), "{cmd}");
         assert!(cmd.contains("git checkout -b 'autocommit-arena8-w1d4-apple'"));
         assert!(cmd.contains("git push -u origin 'autocommit-arena8-w1d4-apple'"));
         // It only creates/pushes the branch — never stages or commits work.
@@ -2249,7 +2297,7 @@ done
         let c = checkout_command("/root/ARENA_3.0", "main", Some("/root/.ssh/id_ed25519"), false);
         assert!(c.contains("cd '/root/ARENA_3.0'"));
         assert!(c.contains("git fetch origin"));
-        assert!(c.contains("git checkout 'main'"));
+        assert!(c.contains("git -c checkout.defaultRemote=origin checkout 'main'"));
         assert!(c.contains("git pull --ff-only")); // no hard reset
         assert!(!c.contains("reset --hard"));
         assert!(c.contains("GIT_SSH_COMMAND='ssh -i /root/.ssh/id_ed25519"));
