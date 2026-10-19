@@ -680,8 +680,10 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     HEAD, so it is skipped like `main` — and said (`UNCOMMITTED HEAD rebase`), so `set-branch
     --hard` copies it first.
   - `pods set-branch <branch> <targets|--all> [--hard] [--init-branches]` — switch pods'
-    ARENA checkout to a branch. Gentle by default (fetch + checkout + ff-only pull — fails on a diverged/dirty
-    tree rather than clobbering work). **`--hard` is destructive**: force the branch to
+    ARENA checkout to a branch. Gentle by default (fetch origin + checkout + fast-forward to
+    origin's branch, by name — fails on a diverged/dirty tree rather than clobbering work; never
+    the local branch's own upstream, so a participant's `feat` tracking `upstream/feat` lands on
+    origin's, and an unreachable `upstream` doesn't matter). **`--hard` is destructive**: force the branch to
     match `origin/<branch>`, discarding local commits/changes — and overwriting any untracked file
     at a path `origin/<branch>` tracks (other untracked files stay) —
     e.g. `set-branch main --all --hard` resets the fleet to `main`. Confirms first;

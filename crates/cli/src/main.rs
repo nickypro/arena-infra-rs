@@ -3174,7 +3174,7 @@ const RUN_TIMEOUT_SECS: u64 = 30 * 60;
 /// a first push of notebooks/outputs can take minutes. 5 min.
 const BACKUP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
-/// `pods set-branch` / `init-branches`: a fetch + checkout (+ ff-pull or push) against
+/// `pods set-branch` / `init-branches`: a fetch + checkout (+ fast-forward or push) against
 /// GitHub — seconds normally, so 2 min means stuck (a hung fetch, a held lock).
 const BRANCH_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 
@@ -8480,8 +8480,9 @@ async fn handle_set_branch(
 }
 
 /// Switch the selected pods (those with an SSH endpoint) to `how.branch` over SSH.
-/// Gentle (fetch+checkout+ff-pull) by default; `how.hard` force-resets to `origin/<branch>`,
-/// discarding local commits/changes. Dry-run prints the exact command per pod. Pods run
+/// Gentle (fetch+checkout+fast-forward to origin's branch) by default; `how.hard` force-resets
+/// to `origin/<branch>`, discarding local commits/changes. Dry-run prints the exact command per
+/// pod. Pods run
 /// concurrently, each within [`BRANCH_TIMEOUT`] (it used to be serial, so one wedged pod
 /// held up every pod after it). `rsync`: the rsync a pod whose branch can't be pushed is copied
 /// with ([`RSYNC`], a stub in tests); `remote`: `SshRemote` for real, `FakeRemote` in tests.

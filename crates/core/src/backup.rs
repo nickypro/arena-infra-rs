@@ -928,13 +928,18 @@ pub fn init_branch_command(cfg: &BackupConfig, machine_name: &str) -> String {
 
 /// Render the remote command that switches a pod's ARENA checkout to `branch`.
 ///
-/// `hard == false` (default): **gentle** — fetch, checkout, fast-forward pull. A
-/// diverged/dirty tree makes the `--ff-only` pull fail loudly rather than clobbering
-/// work, and git refuses to overwrite an untracked file. `hard == true`: **destructive** —
-/// fetch, then force the local branch to exactly match `origin/<branch>` (`checkout -f -B …
-/// origin/<branch>` + `reset --hard`), **discarding any local commits/changes on it** — and
-/// **overwriting any untracked file at a path `origin/<branch>` tracks** (review pr4: checked with
-/// real git, a participant's untracked `solutions.py` on main became origin's); other untracked
+/// `hard == false` (default): **gentle** — fetch origin, checkout, then fast-forward to
+/// origin's branch (`git merge --ff-only refs/remotes/origin/<branch>`). A diverged/dirty tree
+/// makes the fast-forward fail loudly rather than clobbering work, and git refuses to overwrite an
+/// untracked file. Origin's branch, named outright — never the local branch's configured upstream
+/// (review ai-review codex #5: a `git pull --ff-only` there followed the upstream a participant's
+/// own `feat` tracked, `upstream/feat`, so it reached the course repo — failing the switch when that
+/// was unreachable, and merging the course's branch rather than the cohort's when it wasn't).
+/// `hard == true`: **destructive** — fetch, then force the local branch to exactly match
+/// `origin/<branch>` (`checkout -f -B … origin/<branch>` + `reset --hard`), **discarding any
+/// local commits/changes on it** — and **overwriting any untracked file at a path
+/// `origin/<branch>` tracks** (review pr4: checked with real git, a participant's untracked
+/// `solutions.py` on main became origin's); other untracked
 /// files stay. So `set-branch --hard` copies a pod on main with untracked files first. A `git am`,
 /// rebase or paused cherry-pick/revert sequence it switches away from would outlive the reset (git
 /// keeps their state across a checkout) and stop every later switch and backup as `BUSY`, and a
@@ -985,7 +990,8 @@ pub fn checkout_command(repo_path: &str, branch: &str, git_ssh_key: Option<&str>
             ))
         ));
     }
-    parts.push("git fetch origin".into());
+    // Origin only, pruned: a branch origin no longer has is no branch to switch to.
+    parts.push("git fetch --prune origin".into());
     parts.push("OLD=$(git rev-parse -q --verify HEAD) || OLD=".into());
     let switch = if hard {
         let remote_ref = shell_quote(&format!("origin/{branch}"));
@@ -999,8 +1005,13 @@ pub fn checkout_command(repo_path: &str, branch: &str, git_ssh_key: Option<&str>
     } else {
         // `checkout.defaultRemote`: with an `upstream` remote too (the course repo, whose branch
         // names the cohort's copy shares), a plain checkout of a branch both have refused as
-        // "matched multiple remote tracking branches" (review fb2 R2); origin's is the one.
-        format!("git -c checkout.defaultRemote=origin checkout {} && git pull --ff-only", shell_quote(branch))
+        // "matched multiple remote tracking branches" (review fb2 R2); origin's is the one. Then
+        // origin's branch, by its full name — never the branch's own upstream (codex #5).
+        format!(
+            "git -c checkout.defaultRemote=origin checkout {} && git merge --ff-only {}",
+            shell_quote(branch),
+            shell_quote(&format!("refs/remotes/origin/{branch}"))
+        )
     };
     let mut lines = vec![parts.join("; ")];
     // The keys set aside around the switch (from the repo's top: git's paths are relative to it).
@@ -2365,7 +2376,8 @@ done
     /// typo, an outage) stopped every pod's day branch; and a gentle switch to a branch both
     /// remotes have (the cohort repo is a copy of the course's) failed as "matched multiple remote
     /// tracking branches" once upstream's refs were there. Now init fetches origin only, and the
-    /// switch takes origin's branch.
+    /// switch takes origin's branch — fast-forwarding to it by name, even for a local branch that
+    /// tracks upstream's (ai-review codex #5).
     #[cfg(unix)]
     #[test]
     fn the_switches_never_depend_on_an_upstream_remote() {
@@ -2392,6 +2404,18 @@ done
         assert!(ok, "{out}");
         assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), s.git(&s.work, &["rev-parse", "origin/feat"]));
         assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "feat@{u}"]), "origin/feat");
+        // A `feat` of the participant's own, tracking upstream's (review ai-review codex #5): the
+        // switch fast-forwards it to origin's. (A `git pull --ff-only` merged from upstream's —
+        // nothing new there — and left it behind origin's.)
+        let own_feat = || {
+            s.git(&s.work, &["checkout", "-q", "autocommit-x"]);
+            s.git(&s.work, &["branch", "-q", "-f", "--track", "feat", "upstream/feat"]);
+            assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "feat@{u}"]), "upstream/feat");
+        };
+        own_feat();
+        let (ok, out) = run(checkout_command(repo, "feat", None, false));
+        assert!(ok, "{out}");
+        assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), s.git(&s.work, &["rev-parse", "origin/feat"]), "origin's feat");
         // Upstream unreachable: https, which this sandbox's git refuses at once (as a typo'd or
         // down repo would fail on a pod).
         s.git(&s.work, &["remote", "set-url", "upstream", "https://github.com/ARENA-education/ARENA_material.git"]);
@@ -2400,6 +2424,11 @@ done
         assert!(ok, "{out}");
         assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "autocommit-devtest-w1d4-x");
         assert_eq!(s.git(&s.origin, &["rev-parse", "autocommit-devtest-w1d4-x"]), s.git(&s.work, &["rev-parse", "HEAD"]));
+        // …and the gentle switch never asks upstream either: its own `feat` still lands on origin's.
+        own_feat();
+        let (ok, out) = run(checkout_command(repo, "feat", None, false));
+        assert!(ok, "{out}");
+        assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), s.git(&s.work, &["rev-parse", "origin/feat"]), "origin's feat");
     }
 
     /// Live (bsec O1): `set-branch main --hard --init-branches` run twice in a day landed the pod
@@ -2590,9 +2619,10 @@ done
     fn checkout_is_gentle_ff_only() {
         let c = checkout_command("/root/ARENA_3.0", "main", Some("/root/.ssh/id_ed25519"), false);
         assert!(c.contains("cd '/root/ARENA_3.0'"));
-        assert!(c.contains("git fetch origin"));
-        assert!(c.contains("git -c checkout.defaultRemote=origin checkout 'main'"));
-        assert!(c.contains("git pull --ff-only")); // no hard reset
+        assert!(c.contains("git fetch --prune origin"));
+        // Origin's branch by its full name, never the local branch's upstream (codex #5).
+        assert!(c.contains("git -c checkout.defaultRemote=origin checkout 'main' && git merge --ff-only 'refs/remotes/origin/main'"));
+        assert!(!c.contains("git pull") && !c.contains("@{u}")); // no hard reset
         assert!(!c.contains("reset --hard"));
         assert!(c.contains("GIT_SSH_COMMAND='ssh -i /root/.ssh/id_ed25519"));
     }
@@ -2600,7 +2630,7 @@ done
     #[test]
     fn checkout_hard_resets_to_origin() {
         let c = checkout_command("/root/ARENA_3.0", "main", None, true);
-        assert!(c.contains("git fetch origin"));
+        assert!(c.contains("git fetch --prune origin"));
         // Force-switch the branch to origin and hard-reset (destructive).
         assert!(c.contains("git checkout -f -B 'main' 'origin/main'"));
         assert!(c.contains("git reset --hard 'origin/main'"));

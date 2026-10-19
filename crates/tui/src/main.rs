@@ -101,7 +101,7 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// minutes. 5 min, as `pods backup`.
 const BACKUP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
-/// `set-branch`: fetch + checkout + ff-pull against GitHub — 2 min means stuck, as `pods
+/// `set-branch`: fetch + checkout + fast-forward against GitHub — 2 min means stuck, as `pods
 /// set-branch`.
 const BRANCH_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 

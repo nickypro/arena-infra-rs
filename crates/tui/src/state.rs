@@ -902,7 +902,7 @@ impl Action {
     pub fn input_prompt(&self) -> &'static str {
         match self {
             Action::Run => "shell command to run on the pod(s):",
-            Action::SetBranch => "branch to switch to (fetch + checkout + ff-pull):",
+            Action::SetBranch => "branch to switch to (fetch + checkout + fast-forward):",
             _ => "",
         }
     }
