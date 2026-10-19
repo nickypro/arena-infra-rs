@@ -419,7 +419,9 @@ pub fn backup_script() -> String {
 /// On a branch it backs up, an operation in progress — a conflicted merge, cherry-pick or revert,
 /// or a `git stash pop`'s conflicts ([`BUSY_OP_SH`]) — ends the run before anything is staged:
 /// `BUSY <branch> <what>`, [`BACKUP_BUSY_EXIT`], nothing committed or pushed, so the participant
-/// can still finish or abort it ([`BackupReport::failure`] says how).
+/// can still finish or abort it ([`BackupReport::failure`] says how). On one it skips, such work
+/// is only said (`UNCOMMITTED`, [`BackupReport::uncommitted`]) before the `SKIP`, read-only: the
+/// run still skips it, exit 0, and `set-branch --hard` copies the pod before resetting it.
 pub fn backup_command(repo_path: &str, git_ssh_key: Option<&str>, commit_msg: &str, origin: Option<&str>) -> String {
     backup_command_limited(repo_path, git_ssh_key, commit_msg, GIT_MAX_FILE_BYTES, GITHUB_FILE_LIMIT_BYTES, origin)
 }
@@ -525,9 +527,13 @@ pub struct BackupReport {
     /// What is in progress on the branch (`BUSY <branch> <what>`: `merge`, `cherry-pick`, `revert`
     /// or `conflicts`), so nothing was staged, committed or pushed.
     pub busy: Option<String>,
-    /// The index has unmerged paths — conflicts not yet resolved and added (`BUSY`'s `unmerged`
-    /// word; always so for `conflicts`).
+    /// The index has unmerged paths — conflicts not yet resolved and added (`BUSY`'s or
+    /// `UNCOMMITTED`'s `unmerged` word; always so for `conflicts`).
     pub unmerged: bool,
+    /// On a branch no backup commits (a `SKIP`), the work there that a `--hard` reset would
+    /// discard (`UNCOMMITTED <branch> <what>`): an operation in progress ([`BUSY_OP_SH`]'s word) or
+    /// `changes` to tracked files. `set-branch --hard` copies such a pod first.
+    pub uncommitted: Option<String>,
 }
 
 /// Parse a backup's stdout ([`backup_script`]'s header lists the lines). Unknown lines (git's
@@ -566,6 +572,12 @@ pub fn parse_backup_report(stdout: &str) -> BackupReport {
                     r.busy = Some(what.to_string());
                     r.unmerged = what == "conflicts" || more.contains(&"unmerged");
                     r.branch.get_or_insert_with(|| branch.to_string());
+                }
+            }
+            "UNCOMMITTED" => {
+                if let [_, what, ref more @ ..] = rest.split_whitespace().collect::<Vec<_>>()[..] {
+                    r.uncommitted = Some(what.to_string());
+                    r.unmerged = what == "conflicts" || more.contains(&"unmerged");
                 }
             }
             "PUSH_BLOCKED" => {
@@ -734,6 +746,21 @@ impl BackupReport {
     /// any other run.
     pub fn in_progress(&self, code: Option<i32>) -> Option<&str> {
         self.busy.as_deref().filter(|_| code == Some(BACKUP_BUSY_EXIT))
+    }
+
+    /// For a run that skipped a protected branch (`SKIP`) with work there no backup commits
+    /// ([`Self::uncommitted`]): that work in words, and why only a copy can keep it — "main has
+    /// uncommitted changes to tracked files — no backup commits on main", "a merge is in progress
+    /// on main — no backup commits on main". `None` for any other run.
+    pub fn uncommitted_why(&self) -> Option<String> {
+        let what = self.uncommitted.as_deref()?;
+        let (_, branch) = self.outcome.as_ref().filter(|(sentinel, _)| *sentinel == BACKUP_SKIPPED)?;
+        let on = if branch == "HEAD" { "a detached HEAD" } else { branch.as_str() };
+        let situation = match what {
+            "changes" => format!("{on} has uncommitted changes to tracked files"),
+            _ => busy_situation(what, on),
+        };
+        Some(format!("{situation} — no backup commits on {on}"))
     }
 
     /// For a run that found files over GitHub's limit in the unpushed commits: why nothing can be
@@ -3058,5 +3085,58 @@ done
         assert!(!checkout_command("/r", "main", None, true).contains("busy_op"));
         let init = init_branch_command(&cfg(), "arena8-apple");
         assert!(init.find("busy_op").unwrap() < init.find("git checkout -b").unwrap());
+        // On a branch it skips, the work there is only said, read-only, before the SKIP.
+        let skip = &s[s.find("if [ \"$B\" = main ]").unwrap()..s.find("echo \"SKIP $B\"").unwrap()];
+        assert!(skip.contains("echo \"UNCOMMITTED $B $W\"") && skip.contains("git --no-optional-locks diff --quiet HEAD --"), "{skip}");
+        for write in ["git add", "update-index", "git commit", "git push", "git stash", "git reset"] {
+            assert!(!skip.contains(write), "{write}");
+        }
+    }
+
+    /// Review fb2 F3: a pod on main — no backup commits there — with a merge in progress or
+    /// changes to tracked files was reset by `set-branch --hard` with no copy: its backup said
+    /// only `SKIP`. Now the run says what a reset would discard first (`UNCOMMITTED main <what>`),
+    /// still exit 0 and SKIP, touching nothing — not even the index's stat cache — and nothing
+    /// for untracked files alone (a reset keeps them) or a clean tree.
+    #[cfg(unix)]
+    #[test]
+    fn on_main_the_work_a_hard_reset_would_discard_is_said_before_the_skip() {
+        let s = GitSandbox::new("uncommitted", 1_000_000);
+        with_conflicting_upstream(&s);
+        s.git(&s.work, &["checkout", "-q", "main"]);
+        let index = || std::fs::read(s.work.join(".git/index")).unwrap();
+        let said = |want: &str| {
+            let before = (s.git(&s.work, &["rev-parse", "HEAD"]), s.git(&s.work, &["status", "--porcelain"]));
+            let index_before = index();
+            let (code, out, err) = s.backup_raw();
+            assert_eq!(index(), index_before, "{want}: the index untouched");
+            assert_eq!((code, out.as_str()), (Some(0), want), "{err}");
+            assert_eq!((s.git(&s.work, &["rev-parse", "HEAD"]), s.git(&s.work, &["status", "--porcelain"])), before, "{want}");
+            parse_backup_report(&out)
+        };
+        let r = said("SKIP main\n");
+        assert_eq!((r.uncommitted.as_deref(), r.uncommitted_why()), (None, None), "clean");
+        s.put("scratch.py", 4);
+        assert_eq!(said("SKIP main\n").uncommitted, None, "untracked files survive a reset");
+        std::fs::write(s.work.join("README.md"), "edited on main\n").unwrap();
+        let r = said("UNCOMMITTED main changes\nSKIP main\n");
+        assert_eq!(r.outcome, Some((BACKUP_SKIPPED, "main".into())));
+        assert_eq!(r.uncommitted_why().unwrap(), "main has uncommitted changes to tracked files — no backup commits on main");
+        // A conflicted `git pull upstream main` on main itself.
+        s.git(&s.work, &["commit", "-q", "-am", "committed on main"]);
+        git_failing(&s.work, &["pull", "-q", "--no-rebase", "--no-edit", "upstream", "main"]);
+        assert!(s.work.join(".git/MERGE_HEAD").exists());
+        let r = said("UNCOMMITTED main merge unmerged\nSKIP main\n");
+        assert!(r.unmerged && r.busy.is_none() && !r.failed_at_push(), "{r:?}");
+        assert_eq!(r.uncommitted_why().unwrap(), "a merge is in progress on main — no backup commits on main");
+        s.git(&s.work, &["merge", "--abort"]);
+        assert_eq!(said("SKIP main\n").uncommitted, None, "aborted: the committed edit is all there is");
+        // Parsed only with its words; never on a run that didn't skip.
+        assert_eq!(parse_backup_report("UNCOMMITTED main\nSKIP main\n").uncommitted, None);
+        assert_eq!(parse_backup_report("UNCOMMITTED main changes\nBRANCH b\nPUSHED b\n").uncommitted_why(), None);
+        assert_eq!(
+            parse_backup_report("UNCOMMITTED HEAD conflicts\nSKIP HEAD\n").uncommitted_why().unwrap(),
+            "a detached HEAD has unresolved conflicts — no backup commits on a detached HEAD"
+        );
     }
 }

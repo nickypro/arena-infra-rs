@@ -8,6 +8,9 @@
 #                              none): checked first, before the SKIP; nothing committed or pushed (exit 5).
 #                              The URL is printed with any credentials taken out.
 #   SKIP <branch>              on main/master/a detached HEAD: nothing done (exit 0)
+#   UNCOMMITTED <branch> <what> [unmerged]  before a SKIP, when the tree has work no backup commits
+#                              there (what a `set-branch --hard` copies first): <what> is BUSY's, or
+#                              `changes` (to tracked files) when nothing is in progress
 #   NO_CHANGES <branch>        clean tree and HEAD == its upstream: nothing to push (exit 0)
 #   PUSHED <branch>            committed what there was and/or pushed unpushed commits (exit 0)
 #   BIGSKIP <bytes> <path>     a file over <max file bytes>, kept out of the commit (stays on disk)
@@ -49,7 +52,17 @@ if [ -n "$KEY" ]; then
 fi
 # Stay on the current branch; never push a protected/detached one.
 B=$(git rev-parse --abbrev-ref HEAD)
-if [ "$B" = main ] || [ "$B" = master ] || [ "$B" = HEAD ]; then echo "SKIP $B"; exit 0; fi
+# @ARENA_BUSY_OP_SH@
+if [ "$B" = main ] || [ "$B" = master ] || [ "$B" = HEAD ]; then
+    # No backup commits here, so what a `set-branch --hard` would discard is said first — an
+    # operation in progress, else changes to tracked files (untracked files survive a reset) — and
+    # it copies the pod before resetting it (review fb2 F3). Read-only: no optional locks, so the
+    # participant's own git never meets an index.lock of ours.
+    W=$(busy_op "$(git rev-parse --absolute-git-dir)")
+    if [ -z "$W" ] && ! git --no-optional-locks diff --quiet HEAD -- 2>/dev/null; then W=changes; fi
+    if [ -n "$W" ]; then echo "UNCOMMITTED $B $W"; fi
+    echo "SKIP $B"; exit 0
+fi
 echo "BRANCH $B"
 # A committer identity, in case the pod has none configured.
 git config user.name >/dev/null 2>&1 || git config user.name 'Arena Autocommit'
@@ -64,7 +77,7 @@ G=$(git rev-parse --absolute-git-dir)
 # view no longer work. So while one lasts nothing is staged, committed or pushed: the run says
 # what is in progress and stops (exit 6), the operation stays where the participant left it, and
 # the caller copies the pod by rsync instead. A rebase never gets here: it detaches HEAD (SKIP).
-# @ARENA_BUSY_OP_SH@
+# (`busy_op` is defined above, before the SKIP.)
 W=$(busy_op "$G")
 if [ -n "$W" ]; then echo "BUSY $B $W"; exit 6; fi
 

@@ -669,21 +669,28 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     that same branch, in its reflog); a pod that can be **neither pushed nor copied** (the copy
     failed too, the backup failed before its push, or another backup held its lock for the whole
     2-min wait) is **not switched** (`✗ … not switched: <why>`), and the run fails. A pod with
-    an operation in progress (a merge, …: see `pods backup`) is copied first the same way, its
-    line saying `⚠ NOT COMMITTED FIRST: a merge is in progress on <branch>…`; the gentle switch
-    then refuses to end it (`arena set-branch: a merge is in progress on <branch> — not switched
-    (a switch now would end the merge); <how to end it> on the pod, then switch again`, exit 6 —
-    git's own checkout would drop a merge whose conflicts are staged; the TUI's set-branch says
-    the same, naming `--hard` as the destructive way), and `--hard` ends it, discarding its
-    uncommitted changes to tracked files (untracked files stay), its line saying only the copy
-    has them. A file the
+    an operation in progress on a branch the backup commits (a merge, …: see `pods backup`) is
+    copied first the same way, its line saying `⚠ NOT COMMITTED FIRST: a merge is in progress on
+    <branch>…`; the gentle switch then refuses to end it (`arena set-branch: a merge is in
+    progress on <branch> — not switched (a switch now would end the merge); <how to end it> on
+    the pod, then switch again`, exit 6 — git's own checkout would drop a merge whose conflicts
+    are staged; the TUI's set-branch says the same, naming `--hard` as the destructive way), and
+    `--hard` ends it, discarding its uncommitted changes to tracked files (untracked files stay),
+    its line saying only the copy has them. On `main`/`master` (or a detached HEAD) no backup
+    commits: the backup there only says what a reset would discard — a merge in progress, or
+    changes to tracked files — and **`--hard` copies such a pod first** too (`⚠ NOT COMMITTED
+    FIRST: main has uncommitted changes to tracked files, and no backup commits on main; …`),
+    never resetting it if the copy fails; a clean one isn't copied. A pod `--hard` switched after
+    copying its uncommitted work is switched, not a failure; one line after the run names those
+    pods. A file the
     backup committed with a key redacted keeps the real key on disk: around the switch it's set
     aside in `.git/arena-unredacted/<time>-<pid>/` (so gentle doesn't refuse it and `--hard`
     doesn't drop the key; a later set-aside never overwrites an earlier one) and put back when
     the pod returns to that branch. Landing pods on `main`/`master` ends with the reminder
     ``⚠ N cohort pods on main: not backed up until `arena pods init-branches` ``;
     `--init-branches` runs `init-branches` on the same pods once every one has switched (the
-    start date is checked first; a failed switch inits nobody).
+    start date is checked first; a pod whose switch failed, or that wasn't switched, inits nobody;
+    a pod mid-merge that `--hard` copied and switched is switched, so the init goes on).
   - `pods init-branches` — create each pod's `autocommit-…-wNdM-…` branch and push it
     upstream **without committing** (legacy `init_branches`), so a new day's branch
     exists before `backup` runs. `--week`/`--day` override; `--dry-run` previews. 2-min
