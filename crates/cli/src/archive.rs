@@ -2486,12 +2486,19 @@ pub(crate) fn cron_refusals(cfg: &Config, start_date: bool) -> Vec<String> {
 
 /// The state ROOT (`ARENA_STATE_DIR`) the archive's cron lines carry, as this run resolves it —
 /// so cron, without this shell's environment, finds the same state (AD10). Refused when it can't
-/// go into a crontab line plainly.
+/// go into a crontab line plainly: it's carried unquoted (`ARENA_STATE_DIR=<root>`), so held to
+/// the same alphabet as the other paths there (`crate::crontab_word`; review pr4: a `(` or `&`
+/// passed the old check, a quote-and-space one).
 pub(crate) fn cron_state_root(cfg: &Config) -> std::result::Result<String, String> {
     let dir = arena_core::snapshot::state_dir_for(cfg)?;
     let root = dir.parent().ok_or("the state dir has no parent")?.display().to_string();
-    if root.chars().any(|c| c.is_whitespace() || "%'\"\\$`".contains(c)) {
-        return Err(format!("the state dir {root} holds a space, `%` or a quote, which a crontab line can't carry — set ARENA_STATE_DIR"));
+    if let Some(c) = crate::cron_unsafe_char(&root) {
+        return Err(format!(
+            "the state dir {root:?} holds {} — a crontab line carries it unquoted, so only letters, digits and `{}` may be in \
+             it; set ARENA_STATE_DIR",
+            crate::char_named(c),
+            crate::CRON_PATH_CHARS
+        ));
     }
     Ok(root)
 }

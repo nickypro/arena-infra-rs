@@ -3687,6 +3687,8 @@ async fn handle_cron(cmd: CronCmd, cfg: &Config, config_path: &std::path::Path, 
             let exe = std::env::current_exe().context("finding the arena executable path")?;
             let cfg_abs = std::fs::canonicalize(config_path)
                 .unwrap_or_else(|_| config_path.to_path_buf());
+            // Every path the lines carry unquoted: refused before anything is shown or written.
+            crontab_word("HOME", home)?;
             crontab_word("the arena binary", &exe.display().to_string())?;
             crontab_word("the config path", &cfg_abs.display().to_string())?;
             // The logs the installed lines chose themselves: kept (arena never moves those).
@@ -3868,18 +3870,19 @@ async fn apply_cron_change(
 /// of whitespace, `%` and newlines (the lines carry it unquoted, and crontab turns a `%` into a
 /// newline), and a directory the effective user (`euid`) owns. Under `sudo -E` it would be
 /// another user's home: root's lines would create folders there, and the tidy would act on
-/// that user's files.
+/// that user's files. (`install` also holds it to [`crontab_word`]'s alphabet: `remove` writes
+/// no path.)
 fn cron_home(home: Option<&str>, euid: u32) -> Result<String> {
     use std::os::unix::fs::MetadataExt;
     const AS_USER: &str = "run as the user whose crontab this is (sudo -i / sudo -H)";
     let home = match home {
         None | Some("") => anyhow::bail!("HOME isn't set — {AS_USER}"),
         Some(h) if !h.starts_with('/') => anyhow::bail!("HOME={h} isn't an absolute path — {AS_USER}"),
-        Some(h) if h.chars().any(|c| c.is_whitespace() || c == '%') => {
-            anyhow::bail!("HOME={h:?} holds whitespace, `%` or a newline, which a crontab line can't carry")
-        }
         Some(h) => h,
     };
+    if let Some(c) = home.chars().find(|c| c.is_whitespace() || *c == '%') {
+        anyhow::bail!("HOME={home:?} holds {}, which a crontab line can't carry", char_named(c));
+    }
     let meta = std::fs::metadata(home).map_err(|e| anyhow::anyhow!("HOME={home}: {e} — {AS_USER}"))?;
     if !meta.is_dir() {
         anyhow::bail!("HOME={home} isn't a directory — {AS_USER}");
@@ -3922,14 +3925,50 @@ fn created_file_owner(dir: &std::path::Path) -> Option<u32> {
     })
 }
 
-/// `value` (`what`: the arena binary, the config path) as one word of a crontab line: refused
-/// with whitespace (the lines carry it unquoted), `%` (crontab turns it into a newline) or a
-/// newline — any of them would silently cut the command short.
+/// `value` (`what`: HOME, the arena binary, the config path), an absolute path `cron install`
+/// writes into its lines as one plain, unquoted shell word — refused, in one line naming the
+/// first character at fault, unless it is absolute and every character is in
+/// [`CRON_PATH_CHARS`]. Whitespace or `%` (crontab turns it into a newline) silently cut the
+/// command short, but so does more (review pr4): a valid, owned HOME `/srv/o'neil` or a config
+/// `/srv/course(2026)/config.env` is a shell syntax error on every tick, so arena never runs;
+/// `&`, `;`, `$`, a backtick change what the line runs. Refused rather than quoted, so reading an
+/// installed line back stays splitting it into words.
 fn crontab_word(what: &str, value: &str) -> Result<()> {
-    if value.chars().any(|c| c.is_whitespace() || c == '%') {
-        anyhow::bail!("{what} ({value:?}) can't go into a crontab line: it holds whitespace, `%` or a newline");
+    if !value.starts_with('/') {
+        anyhow::bail!("{what} ({value:?}) can't go into a crontab line: it isn't an absolute path");
+    }
+    if let Some(c) = cron_unsafe_char(value) {
+        anyhow::bail!(
+            "{what} ({value:?}) can't go into a crontab line: it holds {} — the line carries it unquoted, so only letters, \
+             digits and `{CRON_PATH_CHARS}` may be in it; use a path without it",
+            char_named(c)
+        );
     }
     Ok(())
+}
+
+/// The characters besides ASCII letters and digits a path may hold to go into a crontab line
+/// unquoted ([`crontab_word`]): none of them means anything to `sh` inside a word that starts with
+/// `/` (no `~`, `$`, quotes, globs, `#`, separators or redirections), nor to crontab (no `%`).
+const CRON_PATH_CHARS: &str = "./_+@:,=-";
+
+/// The first character of `path` outside ASCII letters, digits and [`CRON_PATH_CHARS`], if any.
+/// Pure.
+fn cron_unsafe_char(path: &str) -> Option<char> {
+    path.chars().find(|c| !c.is_ascii_alphanumeric() && !CRON_PATH_CHARS.contains(*c))
+}
+
+/// A character as a refusal names it: `' (U+0027)`, `a space (U+0020)` — whitespace and control
+/// characters by name, so the line stays one line. Pure.
+fn char_named(c: char) -> String {
+    let name = match c {
+        ' ' => "a space".to_string(),
+        '\t' => "a tab".to_string(),
+        '\n' => "a newline".to_string(),
+        c if c.is_whitespace() || c.is_control() => "a control or space character".to_string(),
+        c => c.to_string(),
+    };
+    format!("{name} (U+{:04X})", u32::from(c))
 }
 
 /// A crontab line's log: `PATH` when the line ends in an append of its output to one file —
@@ -18142,9 +18181,9 @@ mod tests {
             (None, uid, "HOME isn't set — run as the user whose crontab this is (sudo -i / sudo -H)".into()),
             (Some(""), uid, "HOME isn't set".into()),
             (Some("home/dev"), uid, "HOME=home/dev isn't an absolute path".into()),
-            (Some("/home/a b"), uid, "holds whitespace, `%` or a newline".into()),
-            (Some("/home/50%"), uid, "holds whitespace, `%` or a newline".into()),
-            (Some("/home/a\nb"), uid, "HOME=\"/home/a\\nb\" holds whitespace".into()),
+            (Some("/home/a b"), uid, "HOME=\"/home/a b\" holds a space (U+0020), which a crontab line can't carry".into()),
+            (Some("/home/50%"), uid, "HOME=\"/home/50%\" holds % (U+0025), which a crontab line can't carry".into()),
+            (Some("/home/a\nb"), uid, "HOME=\"/home/a\\nb\" holds a newline (U+000A)".into()),
             (Some(&file), uid, format!("HOME={file} isn't a directory")),
             (Some(&missing), uid, format!("HOME={missing}: ")),
             (
@@ -18166,6 +18205,77 @@ mod tests {
             assert!(crontab_word("the arena binary", bad).unwrap_err().to_string().starts_with("the arena binary ("), "{bad:?}");
         }
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Review pr4: a crontab line carries HOME, the arena binary and the config path unquoted, and
+    /// refusing only whitespace and `%` let through paths `sh` can't run (a valid, owned HOME
+    /// `/srv/o'neil`, a config in `course(2026)/`: a syntax error on every tick, so arena never
+    /// ran) or runs as something else (`&`, `;`, `$`, a backtick). `cron install` now refuses
+    /// any character outside letters, digits and `./_+@:,=-`, in one line naming it, before
+    /// anything is written — and the archive's state dir, carried the same way, by the same rule.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cron_install_refuses_a_path_a_crontab_line_cant_carry_unquoted() {
+        use super::{cron_unsafe_char, crontab_word};
+        // (the path, the character as named)
+        let cases = [
+            ("/srv/o'neil", "' (U+0027)"),
+            ("/srv/course(2026)/config.env", "( (U+0028)"),
+            ("/srv/a&b", "& (U+0026)"),
+            ("/srv/a;b", "; (U+003B)"),
+            ("/srv/$HOME/x", "$ (U+0024)"),
+            ("/srv/a`id`", "` (U+0060)"),
+            ("/srv/my arena", "a space (U+0020)"),
+            ("/srv/a\tb", "a tab (U+0009)"),
+            ("/srv/a\nb", "a newline (U+000A)"),
+            ("/srv/50%", "% (U+0025)"),
+            ("/srv/~/x", "~ (U+007E)"),
+            ("/srv/a\"b", "\" (U+0022)"),
+            ("/srv/a|b", "| (U+007C)"),
+            ("/srv/a#b", "# (U+0023)"),
+            ("/srv/a*", "* (U+002A)"),
+            ("/srv/caf\u{e9}", "\u{e9} (U+00E9)"),
+        ];
+        for (path, named) in cases {
+            for what in ["HOME", "the arena binary", "the config path"] {
+                let e = crontab_word(what, path).unwrap_err().to_string();
+                assert_eq!(
+                    e,
+                    format!(
+                        "{what} ({path:?}) can't go into a crontab line: it holds {named} — the line carries it unquoted, so only \
+                         letters, digits and `./_+@:,=-` may be in it; use a path without it"
+                    )
+                );
+                assert!(!e.contains('\n'), "one line: {e:?}");
+            }
+        }
+        for ok in ["/root", "/home/dev/.local/bin/arena", "/srv/arena-2026/config.env", "/opt/a_b+c@d:e,f=g/x.y"] {
+            assert_eq!((crontab_word("the config path", ok).ok(), cron_unsafe_char(ok)), (Some(()), None), "{ok}");
+        }
+        assert_eq!(
+            crontab_word("the config path", "config.env").unwrap_err().to_string(),
+            "the config path (\"config.env\") can't go into a crontab line: it isn't an absolute path"
+        );
+        // End to end: refused before anything is written — a HOME this user owns, a config path.
+        let mut s = CronStub::new("unsafe-path");
+        let home = s.dir.join("o'neil");
+        std::fs::create_dir_all(&home).unwrap();
+        let e = s.run_as(&["install", "--backup"], true, Some(home.to_str().unwrap())).await.unwrap_err().to_string();
+        assert!(e.starts_with(&format!("HOME ({:?}) can't go into a crontab line: it holds ' (U+0027)", home.display().to_string())), "{e}");
+        s.config = s.dir.join("course(2026)").join("config.env");
+        std::fs::create_dir_all(s.config.parent().unwrap()).unwrap();
+        std::fs::write(&s.config, "").unwrap();
+        let e = s.run_as(&["install", "--backup"], true, Some(&s.home)).await.unwrap_err().to_string();
+        assert!(e.starts_with("the config path (") && e.contains("course(2026)/config.env\") can't go into a crontab line: it holds ( (U+0028)"), "{e}");
+        assert!(!s.dir.join("tab").exists(), "no crontab written");
+        // The archive's state dir, carried as `ARENA_STATE_DIR=<root>`: the same rule.
+        for (dir, named) in [("/srv/course(2026)/state", "( (U+0028)"), ("/srv/a&b/state", "& (U+0026)"), ("/srv/o'neil/state", "' (U+0027)")] {
+            let cfg = arena_core::Config::parse(&format!("MACHINE_NAME_PREFIX=devtest\nARENA_STATE_DIR={dir}\n"));
+            let e = super::archive::cron_state_root(&cfg).unwrap_err();
+            assert!(e.starts_with(&format!("the state dir {dir:?} holds {named} — a crontab line carries it unquoted")), "{e}");
+        }
+        let cfg = arena_core::Config::parse("MACHINE_NAME_PREFIX=devtest\nARENA_STATE_DIR=/srv/arena-state\n");
+        assert_eq!(super::archive::cron_state_root(&cfg).unwrap(), "/srv/arena-state");
     }
 
     /// The tidy (CL2/CL7/CL12): exactly the old default files the replaced lines named — never
@@ -19002,7 +19112,7 @@ mod tests {
         s.config = s.dir.join("50%.env");
         std::fs::write(&s.config, "").unwrap();
         let e = s.run_as(&["install", "--backup", "--no-pull"], true, Some(&s.home)).await.unwrap_err().to_string();
-        assert!(e.starts_with("the config path (") && e.contains("`%`"), "{e}");
+        assert!(e.starts_with("the config path (") && e.contains("it holds % (U+0025)"), "{e}");
         assert_eq!(s.tab(), tab, "nothing changed");
     }
 

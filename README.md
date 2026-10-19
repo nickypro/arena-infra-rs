@@ -567,7 +567,11 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     line started may overlap the new line's first tick — re-install when no backup is running.
     `install` and `remove` refuse a `$HOME` that isn't this user's (unset, relative, owned by
     someone else — `sudo -E` — or holding whitespace, `%` or a newline): run them as the user
-    whose crontab it is (`sudo -i`).
+    whose crontab it is (`sudo -i`). The lines carry `$HOME`, the arena binary, the config path
+    and the archive's state dir unquoted, so `install` refuses any of them holding a character
+    other than letters, digits and `./_+@:,=-`, naming the first one (`/srv/o'neil` or a config
+    in `course(2026)/` was a shell syntax error on every tick, so arena never ran; `&`, `;`, `$`
+    or a backtick would run something else). Use a path without it.
     `remove --backup|--proxy|--snapshot` drops just those; plain `remove` drops the whole
     block. Both print the block's before → after diff (every removed copy of a duplicate
     shown) and confirm (`--yes` for scripts, `--dry-run` to preview); `show` labels each line
