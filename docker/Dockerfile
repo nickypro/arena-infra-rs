@@ -2,9 +2,9 @@
 #
 # Build (defaults to ARENA-education/ARENA_materials@main; override with
 # --build-arg ARENA_REPO_ARG=owner/repo --build-arg ARENA_BRANCH_ARG=branch):
-#   docker build -t nickypro/arena-env:9.0 docker/
+#   docker build -t nickypro/arena-env:9.2 docker/
 # Push:
-#   docker login -u nickypro && docker push nickypro/arena-env:9.0
+#   docker login -u nickypro && docker push nickypro/arena-env:9.2
 # Needs ~120GB free disk (the image is ~50GB uncompressed); a throwaway Hetzner cpx41 works.
 # (Run from the repo root; docker/ is the build context. Mirrored from nickypro/arena-infra's
 # Dockerfile_arena_env — keep the two in sync until arena-infra is retired.)
@@ -29,8 +29,9 @@ ENV PATH="/opt/arena-env/bin:/root/.local/bin:${PATH}"
 # Source for RUN: bash with pipefail so failures in pipelines abort the build.
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-# 1) Python env via uv (arena-env, python 3.13, as upstream install.sh), all subrepos cloned.
-COPY ./scripts/docker_uv_setup.sh /usr/local/bin/docker_uv_setup.sh
+# 1) Python env via uv (arena-env, python 3.13, as upstream install_uv.sh), all subrepos cloned,
+#    plus arena_cpu_threads.pth (caps OMP/MKL/OPENBLAS threads to the cgroup CPU quota at runtime).
+COPY ./scripts/docker_uv_setup.sh ./scripts/arena_cpu_threads.py /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker_uv_setup.sh && \
     /usr/local/bin/docker_uv_setup.sh "${ARENA_REPO_ARG}" "${ARENA_BRANCH_ARG}"
 
