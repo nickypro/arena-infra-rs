@@ -681,7 +681,7 @@ pub fn cron_item(cron: &Probe<CronLines>, user: &str) -> Item {
         let n = lines.managed.len() + lines.unmanaged.len();
         let mut item = Item::new(Area::Cron, user, Verdict::Remaining, format!("{n} arena line(s) still scheduled"));
         for (set, managed) in [(&lines.managed, true), (&lines.unmanaged, false)] {
-            item.entries.extend(set.iter().map(|l| Entry::CronLine { line: clip(&redact(l.trim())), managed }));
+            item.entries.extend(set.iter().map(|l| Entry::CronLine { line: clip(&cron_shown(&redact(l.trim()))), managed }));
         }
         if !lines.managed.is_empty() {
             item.fix.push("arena cron remove".into());
@@ -1097,6 +1097,44 @@ fn total(amounts: impl Iterator<Item = f64>) -> f64 {
 }
 
 /// A shell identifier (`[A-Za-z_][A-Za-z0-9_]*`).
+/// A cron line as the checklist shows it: an arena line's leading `mkdir -p <dirs> &&` and the
+/// inline env after it (`PATH=…`, `ARENA_START_DATE=…`) left out, so the cut to
+/// [`MAX_SHOWN`] never hides what the line runs; any other line as it is.
+fn cron_shown(line: &str) -> String {
+    // (start, end) of each whitespace-separated word, so the rest keeps its own spacing.
+    let mut spans = Vec::new();
+    let mut start = None;
+    for (i, c) in line.char_indices() {
+        match (c.is_whitespace(), start) {
+            (true, Some(s)) => {
+                spans.push((s, i));
+                start = None;
+            }
+            (false, None) => start = Some(i),
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        spans.push((s, line.len()));
+    }
+    let word = |i: usize| spans.get(i).map(|&(a, b)| &line[a..b]);
+    let n = if word(0).is_some_and(|w| w.starts_with('@')) { 1 } else { 5 };
+    if word(n) != Some("mkdir") || word(n + 1) != Some("-p") {
+        return line.to_string();
+    }
+    let Some(amp) = (n + 2..spans.len()).find(|&i| word(i) == Some("&&")) else {
+        return line.to_string();
+    };
+    let mut cmd = amp + 1;
+    while word(cmd).is_some_and(|w| w.split_once('=').is_some_and(|(k, _)| is_identifier(k))) {
+        cmd += 1;
+    }
+    match (spans.get(n - 1), spans.get(cmd)) {
+        (Some(&(_, schedule_end)), Some(&(cmd_start, _))) => format!("{} {}", &line[..schedule_end], &line[cmd_start..]),
+        _ => line.to_string(),
+    }
+}
+
 fn is_identifier(s: &str) -> bool {
     let mut chars = s.chars();
     chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -1697,12 +1735,38 @@ mod tests {
         assert!(odd.fix[0].starts_with("arena keys revoke 'arena8-a b;rm'  #"), "{:?}", odd.fix);
     }
 
+    /// An arena line's `mkdir -p … &&` and inline env aren't shown: what it runs stays inside
+    /// the 200-character cut — for root's proxy line too, whose PATH alone is 66. Other lines
+    /// are shown as they are.
+    #[test]
+    fn the_checklist_shows_what_an_arena_cron_line_runs() {
+        let proxy = "*/5 * * * * mkdir -p /root/.local/state/arena-cron /root/logs/cron && \
+                     PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin flock -n /root/.local/state/arena-cron/proxy.lock \
+                     /usr/local/bin/arena --config /root/arena/config.env proxy apply --yes >> /root/logs/cron/arena-proxy-cron.log 2>&1";
+        assert!(proxy.chars().count() > MAX_SHOWN);
+        let item = cron_item(&Probe::Got(CronLines { managed: vec![proxy.into()], unmanaged: vec![] }), "root");
+        let Entry::CronLine { line, .. } = &item.entries[0] else { panic!("{:?}", item.entries) };
+        assert!(
+            line.starts_with("*/5 * * * * flock -n /root/.local/state/arena-cron/proxy.lock /usr/local/bin/arena --config /root/arena/config.env proxy apply --yes"),
+            "{line}"
+        );
+        for other in [
+            "*/15 * * * * /usr/local/bin/arena --config /c pods backup --no-pull --yes >> /h/arena-cron.log 2>&1",
+            "0 9 * * *\tOPENROUTER_PROVISIONING_KEY=…\t/usr/local/bin/arena keys gen --yes",
+            "@hourly mkdir -p /d",
+        ] {
+            assert_eq!(cron_shown(other), other);
+        }
+        assert_eq!(cron_shown("@hourly mkdir -p /d && X=1 arena pods backup"), "@hourly arena pods backup");
+    }
+
     #[test]
     fn crontab_lines_outside_the_block_are_jobs_that_mention_arena() {
         for (line, arena) in [
             ("*/15 * * * * /usr/local/bin/arena --config /x pods backup --yes", true),
-            // This version's shape: the cron folder recreated first.
+            // The shapes with the cron folders recreated first.
             ("*/15 * * * * mkdir -p /h/.local/state/arena/cron && flock -n -o /h/.local/state/arena/cron/backup.lock /x/arena pods backup --yes", true),
+            ("*/15 * * * * mkdir -p /h/.local/state/arena-cron /h/logs && flock -n -o /h/.local/state/arena-cron/backup.lock /x/arena pods backup --yes", true),
             ("0 3 * * * /home/dev/ARENA_materials/sync.sh", true),
             ("0 * * * * destroy_pods --yes apple", true),
             ("0 3 * * * /usr/bin/certbot renew", false),
