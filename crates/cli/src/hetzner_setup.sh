@@ -109,13 +109,19 @@ elif [ -n "$REPO_URL" ] && [ -d "$REPO_DIR/.git" ]; then
     fi
 fi
 # Only when there's none: an `upstream` a participant set is theirs. Never fetched here, and
-# never fatal — a convenience, not something the setup needs.
-if [ -n "$UPSTREAM_URL" ] && [ -d "$REPO_DIR/.git" ] && ! git -C "$REPO_DIR" remote get-url upstream >/dev/null 2>&1; then
-    if git -C "$REPO_DIR" remote add upstream "$UPSTREAM_URL"; then
-        echo "upstream: $UPSTREAM_URL"
-    else
-        echo "WARN: couldn't add the upstream remote $UPSTREAM_URL"
+# never fatal — a convenience, not something the setup needs (a failed add is a warning on the
+# pod's line). With two remotes sharing branch names (the cohort repo is a copy of the course's),
+# a plain `git checkout <branch>` takes origin's, unless the participant set their own default.
+if [ -n "$UPSTREAM_URL" ] && [ -d "$REPO_DIR/.git" ]; then
+    if ! git -C "$REPO_DIR" remote get-url upstream >/dev/null 2>&1; then
+        if git -C "$REPO_DIR" remote add upstream "$UPSTREAM_URL"; then
+            echo "upstream: $UPSTREAM_URL"
+        else
+            echo "arena-warning: couldn't add the upstream remote $UPSTREAM_URL"
+        fi
     fi
+    git -C "$REPO_DIR" config --get checkout.defaultRemote >/dev/null 2>&1 \
+        || git -C "$REPO_DIR" config checkout.defaultRemote origin || true
 fi
 cd "$REPO_DIR" || die "no repo at $REPO_DIR"
 

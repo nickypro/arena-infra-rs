@@ -415,6 +415,8 @@ fn the_public_course_repo_becomes_upstream_when_the_checkout_has_none() {
     assert!(r.ok, "{}", r.stderr);
     assert!(r.git_log.lines().any(|l| l == format!("git -C {} remote add upstream {up}", repo.display())), "{}", r.git_log);
     assert!(r.stdout.lines().any(|l| l == format!("upstream: {up}")), "{}", r.stdout);
+    let default_remote = format!("git -C {} config checkout.defaultRemote origin", repo.display());
+    assert!(r.git_log.lines().any(|l| l == default_remote), "{}", r.git_log);
     let r = with(&[("UPSTREAM_URL", up), ("GIT_UPSTREAM", "https://github.com/someone/fork.git")]);
     assert!(r.ok && !r.git_log.contains("remote add") && !r.stdout.contains("upstream: "), "{}\n{}", r.git_log, r.stdout);
     let r = with(&[]);
@@ -422,5 +424,6 @@ fn the_public_course_repo_becomes_upstream_when_the_checkout_has_none() {
     assert!(!r.git_log.contains("remote get-url upstream") && !r.git_log.contains("remote add upstream"), "{}", r.git_log);
     let r = with(&[("UPSTREAM_URL", up), ("GIT_ADD_FAILS", "1")]);
     assert!(r.ok, "{}", r.stderr);
-    assert!(r.stdout.lines().any(|l| l == format!("WARN: couldn't add the upstream remote {up}")), "{}", r.stdout);
+    // On the pod's line: setup shows its `arena-warning:` lines (review fb2 R4).
+    assert!(r.stdout.lines().any(|l| l == format!("arena-warning: couldn't add the upstream remote {up}")), "{}", r.stdout);
 }

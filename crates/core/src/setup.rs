@@ -289,11 +289,15 @@ ZSH_BIN=$(command -v zsh); [ -n "$ZSH_BIN" ] && chsh -s "$ZSH_BIN" "$(id -un)" >
         // course's own fixes — `origin` is the cohort's private copy, where backups push. Added
         // only when the checkout has no `upstream` (one a participant set is theirs), never
         // fetched here, and never fatal: it's a convenience, not something setup needs.
+        // With two remotes sharing branch names, a participant's plain `git checkout <branch>`
+        // takes origin's (`checkout.defaultRemote`), unless they set their own. A failed add is a
+        // warning on the pod's line.
         let upstream = self.upstream_url.as_ref().map_or_else(String::new, |u| {
             format!(
-                "git remote get-url upstream >/dev/null 2>&1 || git remote add upstream {u} || echo {warn} >&2; ",
+                "git remote get-url upstream >/dev/null 2>&1 || git remote add upstream {u} || echo {warn}; \
+                 git config --get checkout.defaultRemote >/dev/null 2>&1 || git config checkout.defaultRemote origin || true; ",
                 u = q(u),
-                warn = q(&format!("arena setup: couldn't add the upstream remote {u}")),
+                warn = q(&format!("{}couldn't add the upstream remote {u}", crate::volume::WARNING_PREFIX)),
             )
         });
         format!(
@@ -318,18 +322,24 @@ pub const DEFAULT_UPSTREAM_REPO: &str = "ARENA-education/ARENA_materials";
 /// (`ARENA_UPSTREAM_REPO`, default [`DEFAULT_UPSTREAM_REPO`]) over https — public, so no key —
 /// while `origin` is the cohort's private copy that backups push to. `None` for `none` (or an
 /// empty value), and when it is the cohort repo itself (`ARENA_REPO_OWNER/NAME`): a second name
-/// for origin helps no one. An error for anything but a plain `owner/name` (it goes into a
-/// shell command and a URL). Pure.
+/// for origin helps no one. Its GitHub URL (https or ssh) is taken as the same `owner/name`; an
+/// error for anything else (it goes into a shell command and a URL). Pure.
 pub fn upstream_url(cfg: &Config) -> Result<Option<String>> {
     let raw = cfg.get("ARENA_UPSTREAM_REPO").map(str::trim).unwrap_or(DEFAULT_UPSTREAM_REPO);
     if raw.is_empty() || raw.eq_ignore_ascii_case("none") {
         return Ok(None);
     }
+    // The GitHub URL an operator pastes is the same repo (review fb2 R6).
+    let bare = ["https://github.com/", "http://github.com/", "git@github.com:", "ssh://git@github.com/"]
+        .iter()
+        .find_map(|p| raw.strip_prefix(p))
+        .unwrap_or(raw)
+        .trim_end_matches('/');
     let plain = |p: &str| !p.is_empty() && p != "." && p != ".." && p.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
-    let parts = raw.split_once('/').map(|(o, n)| (o, n.strip_suffix(".git").unwrap_or(n)));
+    let parts = bare.split_once('/').map(|(o, n)| (o, n.strip_suffix(".git").unwrap_or(n)));
     let Some((owner, name)) = parts.filter(|(o, n)| plain(o) && plain(n)) else {
         return Err(Error::Config(format!(
-            "ARENA_UPSTREAM_REPO must be owner/name (e.g. {DEFAULT_UPSTREAM_REPO}) or none, not {raw:?}"
+            "ARENA_UPSTREAM_REPO must be owner/name (e.g. {DEFAULT_UPSTREAM_REPO}) or its GitHub URL, or none, not {raw:?}"
         )));
     };
     let same = |key: &str, v: &str| cfg.get(key).is_some_and(|c| c.trim().eq_ignore_ascii_case(v));
@@ -1185,11 +1195,16 @@ mod tests {
             ("ARENA_UPSTREAM_REPO=\n", None),
             // The cohort repo itself, any case: a second name for origin, so none.
             ("ARENA_UPSTREAM_REPO=styme3279/arena_materials\n", None),
+            // Its GitHub URL, as pasted (review fb2 R6): the same repo.
+            ("ARENA_UPSTREAM_REPO=https://github.com/ARENA-education/ARENA_materials\n", Some("https://github.com/ARENA-education/ARENA_materials.git")),
+            ("ARENA_UPSTREAM_REPO=git@github.com:o/r.git\n", Some("https://github.com/o/r.git")),
+            ("ARENA_UPSTREAM_REPO=ssh://git@github.com/o/r/\n", Some("https://github.com/o/r.git")),
+            ("ARENA_UPSTREAM_REPO=https://github.com/Styme3279/ARENA_materials.git\n", None),
         ];
         for (extra, want) in ok {
             assert_eq!(url(extra).unwrap().as_deref(), *want, "{extra:?}");
         }
-        for bad in ["o", "o/r/x", "a b/c", "o/;rm -rf ~", "../x", "o/..", "/r", "o/", "o/.git", "o/r'"] {
+        for bad in ["o", "o/r/x", "a b/c", "o/;rm -rf ~", "../x", "o/..", "/r", "o/", "o/.git", "o/r$(id)", "https://gitlab.com/o/r", "https://github.com/o"] {
             let e = url(&format!("ARENA_UPSTREAM_REPO={bad}\n")).unwrap_err().to_string();
             assert!(e.contains("ARENA_UPSTREAM_REPO must be owner/name"), "{bad}: {e}");
         }
@@ -1208,8 +1223,9 @@ mod tests {
         let with = SetupConfig { upstream_url: Some(up.into()), ..steps_cfg() };
         let cmd = with.repo_update_command(false);
         let add = format!(
-            "git remote get-url upstream >/dev/null 2>&1 || git remote add upstream '{up}' || echo 'arena setup: couldn'\\''t \
-             add the upstream remote {up}' >&2; "
+            "git remote get-url upstream >/dev/null 2>&1 || git remote add upstream '{up}' || echo 'arena-warning: couldn'\\''t \
+             add the upstream remote {up}'; git config --get checkout.defaultRemote >/dev/null 2>&1 || git config \
+             checkout.defaultRemote origin || true; "
         );
         assert!(cmd.contains(&add), "{cmd}");
         let at = |s: &str| cmd.find(s).unwrap_or_else(|| panic!("{s}: {cmd}"));
@@ -2092,17 +2108,24 @@ mod tests {
         fn the_course_repo_becomes_upstream_only_where_there_is_none() {
             let Some(f) = Fixture::new("upstream") else { return };
             f.clone_pod(&[]);
-            let up = "https://github.com/ARENA-education/ARENA_materials.git";
-            f.run_update_with(false, Some(up));
+            // A reachable course repo with branches (a local copy of origin): a fetch of it would
+            // leave refs/remotes/upstream/* behind (review fb2 R7).
+            let course = f.root.join("course.git");
+            f.git(&f.root, &["clone", "-q", "--bare", "origin.git", "course.git"]);
+            let up = course.to_string_lossy().into_owned();
+            f.run_update_with(false, Some(&up));
             assert_eq!(f.git(&f.pod, &["remote", "get-url", "upstream"]), up);
             assert_eq!(f.git(&f.pod, &["remote", "get-url", "origin"]), f.origin.to_string_lossy());
+            assert_eq!(f.git(&f.pod, &["config", "checkout.defaultRemote"]), "origin", "a plain checkout takes origin's");
             let refs = f.git(&f.pod, &["for-each-ref", "--format=%(refname)"]);
             assert!(!refs.contains("refs/remotes/upstream"), "setup fetched upstream:\n{refs}");
             // A participant's own upstream (a fork, say) stays.
             let theirs = "https://github.com/someone/fork.git";
             f.git(&f.pod, &["remote", "set-url", "upstream", theirs]);
-            f.run_update_with(false, Some(up));
+            f.git(&f.pod, &["config", "checkout.defaultRemote", "upstream"]);
+            f.run_update_with(false, Some(&up));
             assert_eq!(f.git(&f.pod, &["remote", "get-url", "upstream"]), theirs);
+            assert_eq!(f.git(&f.pod, &["config", "checkout.defaultRemote"]), "upstream", "theirs too");
             // None configured (`ARENA_UPSTREAM_REPO=none`): none added.
             f.git(&f.pod, &["remote", "remove", "upstream"]);
             f.run_update_with(true, None);
