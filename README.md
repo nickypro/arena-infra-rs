@@ -767,13 +767,17 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     with nothing of its own on main — main as on origin — isn't copied, and `pods backup` and the
     cron say nothing of any of it. A pod `--hard` switched after copying such work is switched, not
     a failure; one line after the run names those pods. **Before any `--hard` reset, what it
-    discards is saved on the pod** — in `.git/arena-discarded/<UTC time>/`: `changes.patch` (`git
-    diff --binary HEAD`), the files with unresolved conflicts, the operation's state (`MERGE_HEAD`,
+    discards is saved on the pod** — in `.git/arena-discarded/<UTC time>/`: `changes.patch` (HEAD →
+    the files), and `staged.patch` (HEAD → the index) and `unstaged.patch` (the index → the files)
+    apart — a version staged and then undone in the files is in the staged one only —, the files
+    with unresolved conflicts, the operation's state (`MERGE_HEAD`,
     `MERGE_MSG`, `rebase-merge/`, …), the untracked or ignored files, links and directories the
     reset removes (a directory where the branch has a file or a link goes whole — ignored
     contents, a nested repo's `.git` and all — so it's copied whole, its links kept as links;
     a big one costs its size there), and a
-    README on getting them back (`git apply --index …` on the commit it was on, which it names) —
+    README on getting them back (`git apply --index …staged.patch && git apply …unstaged.patch` on
+    the commit it was on, which it names; the ref `refs/arena-discarded/<UTC time>` keeps that
+    commit from git's gc — `git update-ref -d` it, and remove the folder, once it's not wanted) —
     and the pod's line says `what it discarded was saved to .git/arena-discarded/<time>/ on the
     pod first`. In `.git`, so the reset doesn't touch it and every later copy (snapshot, big,
     archive) carries it under a name no later save reuses: the copy into `LOCAL_BACKUP_DIR` is the

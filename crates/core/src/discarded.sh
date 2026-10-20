@@ -7,15 +7,25 @@
 # very paths the next `pods pull` re-rsyncs from the reset pod, overwriting it. So first it is saved
 # in $1/arena-discarded/<UTC time>/ (in .git: the reset never touches it, no push carries it, and
 # every later copy — snapshot, big, archive — carries it under a name no later save reuses):
-#   changes.patch   `git diff --binary HEAD`: every uncommitted change to tracked files, staged or
-#                   not (the conflicted files' too, markers and all)
+#   changes.patch   every uncommitted change to tracked files, staged or not, in one: HEAD -> the
+#                   files (the conflicted files' too, markers and all)
+#   staged.patch    what was staged: HEAD -> the index (review ai-review codex #3: a file staged in
+#                   one version and then changed again — or put back to HEAD's — in the work tree has
+#                   that staged version nowhere else). The files with unresolved conflicts have no one
+#                   staged version: it lists them as `* Unmerged path …`, which `git apply` passes over
+#   unstaged.patch  what wasn't: the index -> the files, the conflicted files left out (their diff
+#                   is a combined one no `git apply` takes; conflicted/ has them)
 #   conflicted/     the files with unresolved conflicts, as they were
 #   state/          the operation's own files (MERGE_HEAD, MERGE_MSG, rebase-merge/, sequencer/, …)
 #   untracked/      what the reset removes that no patch has: untracked or ignored files, links and
 #                   directories at a path <ref> tracks — or in its way (a file or link where <ref>
 #                   has a directory)
 #   README          what this is and how to get it back
-# Nothing to keep, no folder. Prints, on stdout:
+# The patches are plumbing (`diff-index`, `diff-files`, binary and full-index): no participant's diff
+# config (colour, no prefix, an external diff) gets into them, and the index is never refreshed.
+# The commit it was on is kept by the ref refs/arena-discarded/<the folder's name> (review
+# ai-review claude #11): the patches apply to it, and once the reflog expires nothing else may keep
+# it from git's gc. Nothing to keep, no folder and no ref. Prints, on stdout:
 #   DISCARDED_SAVED <path>   the folder, relative to the repo's top
 # `discarded_save <git dir> <ref>`: non-zero, said on stderr, when it couldn't save — the caller then
 # doesn't reset, and the part saved so far is removed (the work is all still in place; a copy cut
@@ -36,17 +46,32 @@ discarded_save() {
     ds_made=1
     ds_w="$ds_d/.lists"
     if ! mkdir "$ds_w"; then ds_fail "$ds_d" "its lists"; return 1; fi
-    # Every uncommitted change to tracked files.
-    if [ -n "$ds_head" ]; then
-        if ! git diff --binary --full-index HEAD > "$ds_d/changes.patch"; then ds_fail "$ds_d" "the diff"; return 1; fi
-        if [ ! -s "$ds_d/changes.patch" ]; then rm -f "$ds_d/changes.patch"; fi
-    fi
     # The conflicted files, as they are on disk.
     if ! { git ls-files -u -z > "$ds_w/u" && tr '\0' '\n' < "$ds_w/u" | cut -f2- | LC_ALL=C sort -u > "$ds_w/conflicted"; } \
         || ! ds_copy "$ds_w/conflicted" "$ds_d/conflicted"; then
         ds_fail "$ds_d" "the conflicted files"
         return 1
     fi
+    # Every uncommitted change to tracked files: in one, and staged and not apart.
+    if [ -n "$ds_head" ]; then
+        if ! git diff-index -p --binary --full-index HEAD > "$ds_d/changes.patch"; then ds_fail "$ds_d" "the diff"; return 1; fi
+        if ! git diff-index -p --binary --full-index --cached HEAD > "$ds_d/staged.patch"; then ds_fail "$ds_d" "the staged diff"; return 1; fi
+    fi
+    # Unstaged: each changed path but the conflicted ones, named (literally; xargs may split the
+    # list, and patches put one after the other are one patch).
+    if ! { git diff-files --name-only -z > "$ds_w/f" && tr '\0' '\n' < "$ds_w/f" | LC_ALL=C sort -u > "$ds_w/changed" \
+        && LC_ALL=C comm -23 "$ds_w/changed" "$ds_w/conflicted" > "$ds_w/unstaged" \
+        && : > "$ds_d/unstaged.patch" \
+        && { [ ! -s "$ds_w/unstaged" ] || tr '\n' '\0' < "$ds_w/unstaged" \
+            | GIT_LITERAL_PATHSPECS=1 xargs -0 git diff-files -p --binary --full-index -- > "$ds_d/unstaged.patch"; }; }; then
+        ds_fail "$ds_d" "the unstaged diff"
+        return 1
+    fi
+    # No diff in it, no patch: `git apply` refuses one with nothing to apply (a staged.patch of
+    # `* Unmerged path` lines alone, say).
+    for f in changes staged unstaged; do
+        if [ -f "$ds_d/$f.patch" ] && ! grep -q '^diff --git ' "$ds_d/$f.patch"; then rm -f "$ds_d/$f.patch"; fi
+    done
     # The operation's state: what it was merging or applying, its message, its todo list.
     for f in MERGE_HEAD MERGE_MSG MERGE_MODE MERGE_AUTOSTASH AUTO_MERGE CHERRY_PICK_HEAD REVERT_HEAD SQUASH_MSG \
         rebase-merge rebase-apply sequencer; do
@@ -105,7 +130,11 @@ discarded_save() {
         rmdir "$1/arena-discarded" 2>/dev/null || true
         return 0
     fi
-    if ! ds_readme "$ds_d" "$2" "$ds_on" "$ds_head" > "$ds_d/README"; then ds_fail "$ds_d" "its README"; return 1; fi
+    ds_pin="refs/arena-discarded/$(basename -- "$ds_d")"
+    if [ -z "$ds_head" ]; then ds_pin=; fi
+    if ! ds_readme "$ds_d" "$2" "$ds_on" "$ds_head" "$ds_pin" > "$ds_d/README"; then ds_fail "$ds_d" "its README"; return 1; fi
+    # The base the patches apply to, kept from git's gc (no reflog of its own: it's no branch).
+    if [ -n "$ds_pin" ] && ! git update-ref "$ds_pin" "$ds_head"; then ds_fail "$ds_d" "the ref $ds_pin"; return 1; fi
     printf 'DISCARDED_SAVED %s\n' "${ds_d#"$(pwd)/"}"
 }
 
@@ -129,20 +158,34 @@ ds_fail() {
     fi
 }
 
-# `ds_readme <dir> <ref> <branch> <commit>`: the README, naming only the parts this save has.
+# `ds_readme <dir> <ref> <branch> <commit> <pin>`: the README, naming only the parts this save has
+# (<commit> and <pin> empty: there was no commit).
 ds_readme() {
     printf '%s\n' "What \`arena pods set-branch --hard\` discarded when it reset this checkout to $2 (UTC $(basename -- "$1"))." \
         "Saved here first; nothing here is pushed, and the rsync backups copy it with the rest of .git."
     if [ -n "$4" ]; then
-        printf '%s\n' "It was on $3 at commit $4: \`git branch rescue $4\` brings that commit back, and any commits before it no branch has."
+        printf '%s\n' "It was on $3 at commit $4 (the ref $5 keeps it from git's gc: the patches below apply to it)." \
+            "\`git branch rescue $4\` brings that commit back, and any commits before it no branch has."
+    fi
+    if [ -f "$1/staged.patch" ] || [ -f "$1/unstaged.patch" ]; then
+        _rd="git branch rescue $4 && git checkout rescue"
+        if [ -f "$1/staged.patch" ]; then _rd="$_rd && git apply --index $1/staged.patch"; fi
+        if [ -f "$1/unstaged.patch" ]; then _rd="$_rd && git apply $1/unstaged.patch"; fi
+        printf '%s\n' "- staged.patch, unstaged.patch: its uncommitted changes to tracked files, what was staged (the commit -> the" \
+            "  index) and what wasn't (the index -> the files); one is missing when it had nothing. To get the index and the" \
+            "  files back exactly as they were, from the checkout's top:" \
+            "    $_rd"
     fi
     if [ -f "$1/changes.patch" ]; then
-        printf '%s\n' "- changes.patch: its uncommitted changes to tracked files. To get them back, from the checkout's top:" \
+        printf '%s\n' "- changes.patch: the same changes in one (the commit -> the files, staged or not) — simpler, but a file staged" \
+            "  in one version and changed again after comes back as the files had it, its staged version lost:" \
             "    git branch rescue $4 && git checkout rescue && git apply --index $1/changes.patch" \
             "  or onto the commit it is on now: git apply --3way $1/changes.patch"
     fi
     if [ -d "$1/conflicted" ]; then
-        printf '%s\n' "- conflicted/: the files whose conflicts weren't resolved yet, as they were (conflict markers and all)."
+        printf '%s\n' "- conflicted/: the files whose conflicts weren't resolved yet, as they were (conflict markers and all). No one" \
+            "  staged version of them exists, so staged.patch and unstaged.patch leave them out (staged.patch names them," \
+            "  \"* Unmerged path ...\", lines git apply passes over); changes.patch has them, markers and all."
     fi
     if [ -d "$1/state" ]; then
         printf '%s\n' "- state/: the git operation that was in progress (MERGE_HEAD: the commit being merged; MERGE_MSG; rebase-merge/, ...)."
@@ -150,5 +193,10 @@ ds_readme() {
     if [ -d "$1/untracked" ]; then
         printf '%s\n' "- untracked/: untracked or ignored files, links and directories the reset removed (it replaced them with $2's" \
             "  version, or a directory of $2's went where they were): copy them back from here, e.g. cp -pPR $1/untracked/<path> <path>"
+    fi
+    if [ -n "$5" ]; then
+        printf '%s\n' "When none of it is wanted any more: git update-ref -d $5 && rm -rf $1"
+    else
+        printf '%s\n' "When none of it is wanted any more: rm -rf $1"
     fi
 }

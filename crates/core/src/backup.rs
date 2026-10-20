@@ -949,7 +949,10 @@ pub fn init_branch_command(cfg: &BackupConfig, machine_name: &str) -> String {
 /// `main`).
 ///
 /// What `--hard` is about to discard is first saved on the pod (`discarded.sh`): the uncommitted
-/// changes to tracked files (`git diff --binary HEAD`), the files with unresolved conflicts, an
+/// changes to tracked files — in one (HEAD -> the files) and staged and not apart (review ai-review
+/// codex #3: a version staged, then undone in the work tree, was in no patch), the commit they
+/// apply to kept by `refs/arena-discarded/<save>` (claude #11: else git's gc drops it once the
+/// reflog expires) — the files with unresolved conflicts, an
 /// operation's state files (`MERGE_HEAD`, …) and the untracked or ignored files, links and
 /// directories the reset removes — a directory where the branch has a file or a link goes whole
 /// (`checkout -f` deletes it, ignored contents and a nested repo's `.git` with it: review
@@ -3814,6 +3817,11 @@ done
         let read = |rel: &str| std::fs::read_to_string(d.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"));
         let patch = read("changes.patch");
         assert!(patch.contains("+v = 2  # the participant's edit") && patch.contains("+<<<<<<< "), "{patch}");
+        // Apart: the edit unstaged; the conflicted file in neither (no one staged version of it), and
+        // nothing else staged — so no staged.patch.
+        let unstaged = read("unstaged.patch");
+        assert!(unstaged.contains("+v = 2  # the participant's edit") && !unstaged.contains("README.md"), "{unstaged}");
+        assert!(!d.join("staged.patch").exists());
         assert!(read("conflicted/README.md").contains("<<<<<<< "));
         assert_eq!(read("state/MERGE_HEAD").trim(), merging);
         assert!(d.join("state/MERGE_MSG").is_file());
@@ -3824,6 +3832,7 @@ done
         assert!(!d.join("untracked/notes.md").exists() && !d.join(".lists").exists());
         let readme = read("README");
         assert!(readme.contains(&format!("It was on autocommit-x at commit {tip}")) && readme.contains("git apply --index"), "{readme}");
+        assert!(readme.contains("Unmerged path") && readme.contains("git apply") && readme.contains("unstaged.patch"), "{readme}");
         // What the README says gets the edit back.
         s.git(&s.work, &["branch", "rescue", &tip]);
         s.git(&s.work, &["checkout", "-q", "rescue"]);
@@ -3837,6 +3846,72 @@ done
         assert!(o.status.success() && !String::from_utf8_lossy(&o.stdout).contains("DISCARDED_SAVED"), "{}", String::from_utf8_lossy(&o.stderr));
         assert_eq!(saves(), std::slice::from_ref(&d));
         assert_eq!(read("untracked/solutions.py"), "mine\n");
+    }
+
+    /// Review ai-review codex #3 / claude #11: `changes.patch` is HEAD -> the files, so a version
+    /// staged and then undone in the work tree (B staged, the file put back to HEAD's A) was in no
+    /// patch at all — the save was empty, and the reset discarded B. And no ref kept the commit the
+    /// patch applies to: on main with a local commit, `checkout -f -B main origin/main` left it to
+    /// the reflog, and once that expired git's gc dropped it. Now the staged and unstaged changes
+    /// are saved apart (`staged.patch`: HEAD -> the index; `unstaged.patch`: the index -> the
+    /// files), and `refs/arena-discarded/<save>` keeps the old HEAD; what the README says brings
+    /// back the index and the files exactly, after a gc, and deleting that ref as it says lets go.
+    #[cfg(unix)]
+    #[test]
+    fn hard_saves_the_staged_version_apart_and_keeps_its_base() {
+        let s = GitSandbox::new("discarded-staged", 1_000_000);
+        let repo = s.work.to_str().unwrap();
+        // On main: a commit of its own (never pushed), then version B of README.md staged, and the
+        // file put back to HEAD's version A.
+        s.git(&s.work, &["checkout", "-q", "main"]);
+        std::fs::write(s.work.join("mine.py"), "mine = 1\n").unwrap();
+        s.git(&s.work, &["add", "mine.py"]);
+        s.git(&s.work, &["commit", "-q", "-m", "mine"]);
+        let old = s.git(&s.work, &["rev-parse", "HEAD"]);
+        let a = s.read("README.md");
+        std::fs::write(s.work.join("README.md"), "version B, staged\n").unwrap();
+        s.git(&s.work, &["add", "README.md"]);
+        std::fs::write(s.work.join("README.md"), &a).unwrap();
+        assert_eq!(s.git(&s.work, &["status", "--porcelain"]), "MM README.md");
+
+        let o = s.run(&checkout_command(repo, "main", None, true));
+        let out = String::from_utf8_lossy(&o.stdout).into_owned();
+        assert!(o.status.success(), "{out}{}", String::from_utf8_lossy(&o.stderr));
+        let saved: Vec<&str> = out.lines().filter_map(|l| l.strip_prefix("DISCARDED_SAVED ")).collect();
+        assert_eq!(saved.len(), 1, "{out}");
+        let d = s.work.join(saved[0]);
+        let name = d.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), s.git(&s.work, &["rev-parse", "origin/main"]), "reset");
+        assert!(!d.join("changes.patch").exists(), "HEAD -> the files: nothing");
+        assert!(d.join("staged.patch").is_file() && d.join("unstaged.patch").is_file());
+        let pin = format!("refs/arena-discarded/{name}");
+        assert_eq!(s.git(&s.work, &["rev-parse", &pin]), old, "the base kept by a ref");
+        let readme = std::fs::read_to_string(d.join("README")).unwrap();
+        let undo = format!("git update-ref -d {pin}");
+        assert!(readme.contains(&pin) && readme.contains(&undo), "{readme}");
+        // Nothing but that ref keeps the old commit now: gc after the reflog expires keeps it.
+        let gc = || {
+            s.git(&s.work, &["reflog", "expire", "--expire=now", "--all"]);
+            s.git(&s.work, &["gc", "-q", "--prune=now"]);
+        };
+        gc();
+        // What the README says brings back the index and the files exactly.
+        let restore = readme.lines().find(|l| l.contains("git apply --index") && l.contains("staged.patch")).expect("the README's line").trim();
+        assert_eq!(
+            restore,
+            format!("git branch rescue {old} && git checkout rescue && git apply --index {0}/staged.patch && git apply {0}/unstaged.patch", d.display())
+        );
+        let o = s.run(&format!("cd {} && {restore}", shell_quote(repo)));
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(s.git(&s.work, &["show", ":README.md"]), "version B, staged", "the staged version, staged again");
+        assert_eq!(s.read("README.md"), a, "the file as it was");
+        assert_eq!(s.git(&s.work, &["status", "--porcelain"]), "MM README.md");
+        // Done with it: what the README says to delete lets git drop it.
+        s.git(&s.work, &["checkout", "-q", "-f", "main"]);
+        s.git(&s.work, &["branch", "-D", "-q", "rescue"]);
+        s.git(&s.work, &["update-ref", "-d", &pin]);
+        gc();
+        assert!(!s.run(&format!("git -C {} cat-file -e {old}", shell_quote(repo))).status.success(), "gone without the ref");
     }
 
     /// Review ai-review codex #1 / claude #7: the save kept only files and links, but `checkout -f`
