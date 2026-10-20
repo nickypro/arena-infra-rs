@@ -991,24 +991,62 @@ fn continuations(lines: Vec<String>) -> Vec<String> {
                 continue;
             }
         }
-        carry = if l == PEM_MASK { None } else { masked(&crate::jobs::sanitize(&l)).1 };
+        carry = if l == PEM_MASK || l == CONT_MASK { None } else { masked(&crate::jobs::sanitize(&l)).1 };
         first = true;
         out.push(l);
     }
     out
 }
 
+/// Whether `l` holds an odd number of `q` that no backslash escapes — a quote it closes (or opens)
+/// without the other end.
+fn odd_quotes(l: &str, q: u8) -> bool {
+    let (mut n, mut escaped) = (0usize, false);
+    for c in l.bytes() {
+        if escaped {
+            escaped = false;
+        } else if c == b'\\' {
+            escaped = true;
+        } else if c == q {
+            n += 1;
+        }
+    }
+    n % 2 == 1
+}
+
+/// When the window begins part-way into the log, the lines at its top that a value from above it
+/// — whose name the read never saw — may run on into, as one [`CONT_MASK`] (review ai-review
+/// claude #6: a read starting after `password: |-` showed `  cohort-db-pass`): every line before
+/// the first non-blank one at indentation 0 (a YAML block scalar's, a value on the lines below its
+/// name, a bracket's members), and that line too when it holds an odd number of `"` or of `'` (the
+/// close of a quote opened above: `cohort-db-pass"`). No line at indentation 0 at all: the whole
+/// window. Conservative — a traceback's indented lines at the top go too, and a first line with an
+/// apostrophe — as a key block's body without its header is ([`pem_blocks`]).
+fn window_start(lines: Vec<String>) -> Vec<String> {
+    let top = lines.iter().position(|l| !l.trim().is_empty() && indent_of(l) == 0).unwrap_or(lines.len());
+    let closes = lines.get(top).is_some_and(|l| l != PEM_MASK && (odd_quotes(l, b'"') || odd_quotes(l, b'\'')));
+    let n = top + usize::from(closes);
+    if lines[..n].iter().all(|l| l.trim().is_empty()) {
+        return lines;
+    }
+    std::iter::once(CONT_MASK.to_string()).chain(lines.into_iter().skip(n)).collect()
+}
+
 /// A log's last `keep` lines for the prompt, from `lines` — the whole window read (the remote
-/// read's last bytes; `starts_cut`: it begins part-way into the log, its partial first line
-/// already gone). Private-key blocks are masked over the whole window **first** ([`pem_blocks`]),
-/// so neither cut can keep a key's body without the header that marks it, and so are a secret's
-/// values that run on over lines ([`continuations`]); then at each cut — the window's start when
-/// `starts_cut`, and the `keep`-line cut — leading base64-looking lines are dropped
-/// ([`drop_leading_base64`]): a key printed without its armour, or one whose END is past the
-/// window. Each line left goes through [`text`]. The lines, and how many older lines of the
-/// window aren't shown.
+/// read's last bytes, 16 KiB; `starts_cut`: it begins part-way into the log, its partial first
+/// line already gone). Everything that runs over lines is tracked over that whole window
+/// **before** the `keep`-line cut (lane ASK7 item C), so a key block or a secret's value that
+/// starts above the cut stays masked below it: private-key blocks first ([`pem_blocks`]), so
+/// neither cut can keep a key's body without the header that marks it, then — where the window
+/// starts part-way — what a value from above the read may have left at its top
+/// ([`window_start`]), then a secret's values that run on over lines ([`continuations`]). Then
+/// at each cut — the window's start when `starts_cut`, and the `keep`-line cut — leading
+/// base64-looking lines are dropped ([`drop_leading_base64`]): a key printed without its armour,
+/// or one whose END is past the window. Each line left goes through [`text`]. The lines, and how
+/// many older lines of the window aren't shown.
 pub fn log_tail(lines: &[String], starts_cut: bool, keep: usize, max: usize) -> (Vec<String>, usize) {
-    let mut v = continuations(pem_blocks(lines, starts_cut));
+    let pem = pem_blocks(lines, starts_cut);
+    let mut v = continuations(if starts_cut { window_start(pem) } else { pem });
     let mut hidden = if starts_cut { drop_leading_base64(&mut v) } else { 0 };
     let over = v.len().saturating_sub(keep);
     if over > 0 {
@@ -1297,6 +1335,52 @@ pub(crate) mod tests {
         // Hidden from every shape: no fragment of a value on a line below.
         let all = tail(&["api_key: |", "  Qx7alpha", "\"token\":", "\"Qx7bravo\"", "PASSWORD='x", "Qx7charlie'", "end"]);
         assert!(!all.join("\n").contains("Qx7"), "{all:?}");
+    }
+
+    /// Lane ASK7 item C: what runs over lines is tracked over the whole 16 KiB read before its
+    /// last 40 lines are taken — a YAML block scalar, a quote and a bracket opened above the cut
+    /// with their values running on below it show none of them, though the raw last 40 lines are
+    /// all value (cut first, then masked, they'd all be shown).
+    #[test]
+    fn a_value_that_starts_above_the_40_line_cut_stays_masked_below_it() {
+        let steps: Vec<String> = (0..100).map(|i| format!("step {i} loss 0.{i}")).collect();
+        for (open, value, close) in [
+            ("api_key: |-", "    Qx7yaml{}", None),
+            ("TOKEN=\"first", "Qx7quote{} more", Some("Qx7end\"")),
+            ("\"credentials\": {", "  \"k{0}\": \"Qx7json{0}\",", Some("}")),
+        ] {
+            let mut lines = steps.clone();
+            lines.push(open.to_string());
+            lines.extend((0..60).map(|i| value.replace("{}", &i.to_string()).replace("{0}", &i.to_string())));
+            lines.extend(close.map(String::from));
+            assert!(lines[lines.len() - 40..].iter().filter(|l| l.contains("Qx7")).count() >= 39, "the raw cut would be all value");
+            let (shown, hidden) = log_tail(&lines, false, 40, 200);
+            assert!(!shown.join("\n").contains("Qx7"), "{open}: {shown:?}");
+            assert_eq!(shown.len(), 40, "{open}");
+            assert_eq!(shown.last().map(String::as_str), Some(CONT_MASK), "{open}");
+            assert_eq!(hidden, lines.len() - 40 - (60 + usize::from(close.is_some()) - 1), "{open}");
+        }
+    }
+
+    /// Review ai-review claude #6: a read that starts part-way into the log (its first partial
+    /// line already gone) after a value's name — below `password: |-`, `"token":` or the open
+    /// quote of `PASSWORD="…` — shows none of the value left at its top; the lines after it are
+    /// kept. Not cut, the same lines are just lines.
+    #[test]
+    fn a_read_that_starts_inside_a_value_shows_none_of_it() {
+        let tail = |lines: &[&str], cut: bool| log_tail(&strings(lines), cut, 40, 200).0;
+        assert_eq!(tail(&["    Qx7yaml-pass", "    Qx7more", "  user: bob", "step 1"], true), strings(&[CONT_MASK, "step 1"]));
+        assert_eq!(tail(&["", "  \"Qx7json\"", "}", "step 1"], true), strings(&[CONT_MASK, "}", "step 1"]));
+        assert_eq!(tail(&["Qx7pass\"", "step 1"], true), strings(&[CONT_MASK, "step 1"]));
+        assert_eq!(tail(&["Qx7pass' # end", "step 1"], true), strings(&[CONT_MASK, "step 1"]));
+        assert_eq!(tail(&["    Qx7 all indented", "    Qx7 still"], true), strings(&[CONT_MASK]));
+        // A balanced first line, or a first line that isn't indented: nothing to hide.
+        assert_eq!(tail(&["\"a\": \"b\"", "step 1"], true), strings(&["\"a\": \"b\"", "step 1"]));
+        assert_eq!(tail(&["", "step 0", "  detail"], true), strings(&["", "step 0", "detail"]));
+        // Not cut: the read is the whole log, its first line its first.
+        assert_eq!(tail(&["    indented", "Qx7x\"", "step 1"], false), strings(&["indented", "Qx7x\"", "step 1"]));
+        // A key's END at the top is still one key block, not a value.
+        assert_eq!(tail(&["-----END OPENSSH PRIVATE KEY-----", "step 1"], true), strings(&[PEM_MASK, "step 1"]));
     }
 
     /// Review ai-review claude #7: a private key or base64 key material pasted into a process's

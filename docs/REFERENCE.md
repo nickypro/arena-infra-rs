@@ -1297,10 +1297,12 @@ scalar, a value on the line after its name, a quote or bracket closed lines late
 `[A-Za-z0-9_-]` in commit subjects and log lines (`<redacted>`), any run of 40+ of `[A-Za-z0-9+/=]`
 with upper case, lower case and digits (base64 key material), and a private-key block — in a log
 masked over the whole 16 KB read before its last 40 lines are taken, so neither cut can keep a key's
-body without its header; at the start of a cut window, lines that look like base64 key material (40+
-of `[A-Za-z0-9+/=]`, nothing else) are dropped. The AI CLI's own error line, printed and saved when
-it fails, is masked the same way. Each pod's part is at most 6 KB (less when many pods share a
-prompt: 240 KB in all), trimmed from the log's oldest lines first.
+body without its header, nor a value whose name is above the cut; at the start of a cut window,
+lines that look like base64 key material (40+ of `[A-Za-z0-9+/=]`, nothing else) are dropped, and
+where the read starts part-way into the log, the indented lines at its top (and a first line that
+closes a quote) are masked: a value whose name the read never saw may run on into them. The AI CLI's
+own error line, printed and saved when it fails, is masked the same way. Each pod's part is at most
+6 KB (less when many pods share a prompt: 240 KB in all), trimmed from the log's oldest lines first.
 
 **Framing a pod can't forge.** Each pod's reply is framed by marker lines carrying a random nonce of
 that call's own, and so is every line of the small probe's: pod text that runs over lines (a path,
