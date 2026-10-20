@@ -648,6 +648,11 @@ pub struct BackupReport {
     /// (`COURSE_UNVERIFIED <url>`), so none were exempt: a key-like string in what `upstream/main`
     /// brought was scanned, and redacted, like the participant's own. The URL.
     pub course_unverified: Option<String>,
+    /// Held (`COURSE_HELD`, after [`Self::course_unverified`]): the scan found a key-like string in a
+    /// blob `upstream/main` has, and with the course unreachable nothing tells whether it is the
+    /// course's own (public, never rewritten) or not — so nothing was rewritten and nothing pushed
+    /// this run (exit 1, a failure at the push: the pod is copied), and the next run asks again.
+    pub course_held: bool,
     /// The push itself failed otherwise (the network, a non-fast-forward…): `PUSH_FAILED`.
     pub push_failed: bool,
     /// `origin` isn't the configured repo, so nothing was committed or pushed (`WRONG_ORIGIN`):
@@ -714,6 +719,7 @@ pub fn parse_backup_report(stdout: &str) -> BackupReport {
             }
             "PUSH_BLOCKED_COURSE" => r.push_blocked_course = Some(rest.trim().to_string()),
             "COURSE_UNVERIFIED" => r.course_unverified = Some(rest.trim().to_string()),
+            "COURSE_HELD" => r.course_held = true,
             "PUSH_BLOCKED" => {
                 let why = rest.trim();
                 r.push_blocked = Some(if why.is_empty() { "refused by GitHub push protection".into() } else { why.to_string() });
@@ -796,7 +802,7 @@ impl BackupReport {
                 short_id(new)
             ));
         }
-        if let Some(url) = &self.course_unverified {
+        if let Some(url) = self.course_unverified.as_ref().filter(|_| !self.course_held) {
             let then = if self.history.is_some() {
                 ": the course's own key-like strings were redacted with the rest, so a later `git pull upstream main` may conflict \
                  on those lines"
@@ -825,6 +831,9 @@ impl BackupReport {
             if let Some(fix) = self.stuck_fix(repo, pod) {
                 return Some(fix);
             }
+        }
+        if let Some(why) = self.held_why(code) {
+            return Some(format!("{why}: nothing pushed this run, and nothing rewritten — the next backup asks the course again"));
         }
         if let (Some(BACKUP_BLOCKED_EXIT), Some(why), Some(commits)) = (code, &self.push_blocked, &self.push_blocked_course) {
             let branch = self.branch.as_deref().unwrap_or("its branch");
@@ -861,7 +870,7 @@ impl BackupReport {
     /// minutes. A wrong `origin` is not one of these
     /// either (nothing was tried): what to do with it is the caller's ([`Self::wrong_origin`]).
     pub fn failed_at_push(&self) -> bool {
-        self.push_failed || self.push_blocked.is_some() || self.heal_aborted.is_some() || !self.big_stuck.is_empty() || self.busy.is_some()
+        self.push_failed || self.course_held || self.push_blocked.is_some() || self.heal_aborted.is_some() || !self.big_stuck.is_empty() || self.busy.is_some()
     }
 
     /// [`Self::failure`] in a few words, for a line that says what else happened (the fallback
@@ -877,6 +886,9 @@ impl BackupReport {
         if code == Some(BACKUP_STUCK_EXIT) && !self.big_stuck.is_empty() {
             return Some(format!("file(s) over {} MB in unpushed commits", GITHUB_FILE_LIMIT_BYTES / (1024 * 1024)));
         }
+        if let Some(why) = self.held_why(code) {
+            return Some(format!("{why}: push held, retried next tick"));
+        }
         if let (Some(BACKUP_BLOCKED_EXIT), Some(why)) = (code, &self.push_blocked) {
             if self.push_blocked_course.is_some() {
                 return Some(format!("GitHub push protection: {why} (the course's own commit, public already — not the participant's key)"));
@@ -884,6 +896,19 @@ impl BackupReport {
             return Some(format!("GitHub push protection: {why}"));
         }
         self.heal_aborted.as_ref().map(|_| "the branch moved while its commits were being redacted".to_string())
+    }
+
+    /// For a run held because the course couldn't be reached ([`Self::course_held`], exit 1): why,
+    /// in words. `None` for any other run.
+    fn held_why(&self, code: Option<i32>) -> Option<String> {
+        if !self.course_held || code != Some(1) {
+            return None;
+        }
+        let url = self.course_unverified.as_deref().unwrap_or("its URL");
+        Some(format!(
+            "couldn't reach the course repo ({url}) to verify its own commits — a key-like string is in what `git pull upstream \
+             main` brought, the course's own (left as published) or not"
+        ))
     }
 
     /// For a run that stopped because `origin` isn't the configured repo (`WRONG_ORIGIN`, exit
@@ -4355,10 +4380,8 @@ done
     /// `upstream/main`, then `upstream` repointed at the course (both URLs), left their own
     /// key-bearing commit there, and it went out unscanned. Now only what the course repo itself
     /// has is exempt, fetched from it then and there: the fork's commit, which the course doesn't
-    /// have, is redacted. The course unreachable: nothing is exempt — not even what an earlier
-    /// fetch left in `refs/arena/course-main` — the course's own commit is redacted too, and the
-    /// line says so, once. A key on `upstream/experiment`, upstream's main clean: redacted, the
-    /// course never asked.
+    /// have, is redacted. (The course unreachable: `a_course_that_cant_be_reached_holds_the_push_…`.)
+    /// A key on `upstream/experiment`, upstream's main clean: redacted, the course never asked.
     #[cfg(unix)]
     #[test]
     fn only_what_the_course_itself_has_goes_out_unscanned() {
@@ -4390,24 +4413,6 @@ done
         assert_eq!(r.course_unverified, None, "{out}");
         assert_eq!(course_main(&s), Some(s.git(&s.work, &["rev-parse", "origin/main"])), "the course asked: its main is origin's");
 
-        // The course unreachable, a ref an earlier fetch left in place: nothing exempt, said once.
-        let mut s = GitSandbox::new("course-unreachable", 1_000_000);
-        let key = openrouter_key(30);
-        course_upstream(&s, "ARENA-education/ARENA_materials", &key);
-        s.git(&s.work, &["update-ref", "refs/arena/course-main", "upstream/main"]);
-        let gone = s.base.join("no-such-course.git");
-        s.course = Some(gone.to_str().unwrap().to_string());
-        let (out, err, r) = check(&s, &key, "upstream/main");
-        assert_eq!(out.lines().filter(|l| l.starts_with("COURSE_UNVERIFIED ")).count(), 1, "{out}");
-        assert_eq!(r.course_unverified.as_deref(), gone.to_str(), "{out}");
-        assert!(err.contains("arena backup: fetching the course to verify its commits: "), "{err}");
-        let note = format!(
-            "couldn't reach the course repo ({}) to verify which commits are its own, so none were left unscanned: the course's own \
-             key-like strings were redacted with the rest, so a later `git pull upstream main` may conflict on those lines",
-            gone.display()
-        );
-        assert!(r.notes().contains(&note), "{:?}", r.notes());
-
         // The course alone, but the key on another of its refs: the course isn't asked.
         let mut s = GitSandbox::new("course-experiment", 1_000_000);
         s.course = Some(the_course(&s));
@@ -4416,6 +4421,68 @@ done
         assert!(!s.run(&format!("git -C {} cat-file -e upstream/main:course_key.md", shell_quote(s.work.to_str().unwrap()))).status.success());
         let (out, _, r) = check(&s, &key, "upstream/experiment");
         assert_eq!((r.course_unverified, course_main(&s)), (None, None), "{out}");
+    }
+
+    /// Review ai-review claude #2 (FIX7): one failed verification rewrote the course's own commits
+    /// for good — their redacted copies pushed, the pod's history off the course's from then on,
+    /// every later `git pull upstream main` conflicting on those lines — for one timeout or GitHub
+    /// hiccup at one tick. Now a key-like string in what upstream's main brought, with the course
+    /// unreachable, holds the push: nothing rewritten, nothing pushed (exit 1, a failure at the
+    /// push, so the pod is copied), said once — a key of the participant's beside it held too — and
+    /// the next run, the course back, pushes the course's commits as published (the participant's
+    /// key redacted). And the participant's FETCH_HEAD is as it was after every verification, one
+    /// that failed or worked: put back, or still absent (`--no-write-fetch-head`, git 2.29+, is
+    /// gone — Ubuntu 20.04's git is 2.25, where every fetch failed with it).
+    #[cfg(unix)]
+    #[test]
+    fn a_course_that_cant_be_reached_holds_the_push_and_rewrites_nothing() {
+        let origin_ref = |s: &GitSandbox| s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "rev-parse", "refs/heads/autocommit-x"]);
+        for mine in [false, true] {
+            let case = if mine { "a key of the participant's too" } else { "the course's alone" };
+            let mut s = GitSandbox::new(if mine { "course-held-mine" } else { "course-held" }, 1_000_000);
+            let (key, own) = (openrouter_key(30), openrouter_key(32));
+            course_upstream(&s, "ARENA-education/ARENA_materials", &key);
+            let course = s.github("ARENA-education/ARENA_materials");
+            if mine {
+                std::fs::write(s.work.join("mine.py"), format!("KEY = \"{own}\"\n")).unwrap();
+                s.git(&s.work, &["add", "mine.py"]);
+                s.git(&s.work, &["commit", "-q", "-m", "mine"]);
+            }
+            s.git(&s.work, &["merge", "-q", "--no-edit", "--no-ff", "upstream/main"]);
+            // FETCH_HEAD: the one `git fetch upstream` wrote (with the participant's key), or none.
+            let fetch_head = s.work.join(".git/FETCH_HEAD");
+            if !mine {
+                std::fs::remove_file(&fetch_head).unwrap();
+            }
+            let fetched = std::fs::read(&fetch_head).ok();
+            let (head, before) = (s.git(&s.work, &["rev-parse", "HEAD"]), origin_ref(&s));
+            let gone = s.base.join("no-such-course.git");
+            s.course = Some(gone.to_str().unwrap().to_string());
+            let (code, out, err) = s.backup_raw();
+            let r = parse_backup_report(&out);
+            assert_eq!(code, Some(1), "{case}: {out}{err}");
+            assert_eq!(out.lines().filter(|l| l.starts_with("COURSE_UNVERIFIED ")).count(), 1, "{case}: {out}");
+            assert!(r.course_held && r.failed_at_push() && r.outcome.is_none() && r.history.is_none(), "{case}: {r:?}");
+            let fail = r.failure("/r", "devtest-x", code).unwrap_or_default();
+            assert!(
+                fail.starts_with(&format!("couldn't reach the course repo ({}) to verify its own commits — ", gone.display()))
+                    && fail.ends_with(": nothing pushed this run, and nothing rewritten — the next backup asks the course again"),
+                "{case}: {fail}"
+            );
+            assert!(r.failure_brief(code).unwrap_or_default().ends_with(": push held, retried next tick"), "{case}");
+            assert!(r.notes().is_empty(), "{case}: {:?}", r.notes());
+            assert_eq!((s.git(&s.work, &["rev-parse", "HEAD"]), origin_ref(&s)), (head.clone(), before), "{case}: nothing rewritten or pushed");
+            assert!(!s.origin_holds(&key) && !s.origin_holds(&own), "{case}");
+            assert_eq!(std::fs::read(&fetch_head).ok(), fetched, "{case}: FETCH_HEAD as it was");
+            // The course back: its commit goes out as published, the participant's key redacted.
+            s.course = Some(course.to_str().unwrap().to_string());
+            let (code, r, err) = s.backup();
+            assert_eq!((code, r.outcome, r.course_held), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into())), false), "{case}: {err}");
+            assert_eq!(r.history.map(|h| h.0), mine.then_some(2), "{case}: the participant's commit and the merge rewritten, or nothing");
+            s.git(&s.work, &["merge-base", "--is-ancestor", &s.git(&s.work, &["rev-parse", "upstream/main"]), "origin/autocommit-x"]);
+            assert!(s.origin_holds(&key) && !s.origin_holds(&own), "{case}");
+            assert_eq!(std::fs::read(&fetch_head).ok(), fetched, "{case}: FETCH_HEAD as it was");
+        }
     }
 
     /// The course's key-like string, refused by GitHub's push protection, is said for what it is:

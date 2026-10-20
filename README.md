@@ -650,10 +650,14 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     participant's fork fetched as `upstream/main`, then `upstream` repointed at the course, left
     their own key-bearing commit trusted), so a fork's commit, or one on any other `upstream/*`
     ref, is scanned and redacted like the rest, and a dead push URL (`no_push`) changes nothing. A
-    fetch that fails (GitHub unreachable, a private course repo) exempts nothing — the course's
-    commits holding a key-like string are redacted with the rest, and a later `git pull upstream
-    main` may conflict on those lines — and the pod's line says the course couldn't be reached to
-    verify. `none` exempts nothing. And `ARENA_UPSTREAM_REPO` should name a public repo: what its
+    fetch that fails (GitHub unreachable, a timeout, a private course repo) holds that run's push
+    (review ai-review claude #2): nothing rewritten and nothing pushed — a redacted copy of the
+    course's own commits would break their ancestry for good, every later `git pull upstream
+    main` conflicting on those lines — the pod is rsynced as for a failed push, its line says the
+    course couldn't be reached to verify its own commits, and the next tick asks again (a key of
+    the participant's in the same push waits with it). So a course repo the pods can never reach
+    holds the git backup of each pod that pulled a key-like string from it, until it can. `none`
+    exempts nothing. And `ARENA_UPSTREAM_REPO` should name a public repo: what its
     `main` has goes into the cohort repo unscanned (claude #6). The auto-resolve reads the same
     ref: it keeps the other side's content as published only for a merge of a commit it has. If
     GitHub's push protection refuses a course's string — one the redaction knows, or one only

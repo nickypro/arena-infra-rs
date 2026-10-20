@@ -37,7 +37,11 @@
 #                              verified: refs/arena/course-main) — the course's own key-like string,
 #                              public already, not a leak
 #   COURSE_UNVERIFIED <url>    the course's main couldn't be fetched from <url> to verify which commits
-#                              are its own, so none were exempt (said once; the run goes on)
+#                              are its own, so none were exempt (said once)
+#   COURSE_HELD                after COURSE_UNVERIFIED, when the scan found a key-like string in a blob
+#                              upstream's main has: the course's own (public, never rewritten) or not,
+#                              unverified — so nothing is rewritten and nothing pushed this run, and
+#                              the next run asks again (exit 1, as a failed push: the pod is copied)
 #   PUSH_FAILED                the push failed otherwise (the network, a non-fast-forward…; exit 1)
 # Any other failure exits non-zero via `set -e`.
 set -e
@@ -360,17 +364,32 @@ push_block_reason() {
 # proof that commits are the course's own, which the resolve reads too, by that name — and exempt
 # what it holds ($COURSE_REFS). Over https with no credentials (no helper, no prompt: a private
 # course can't be verified, so its commits are scanned like the rest), bounded (`timeout 60`, where
-# there is one), never touching the participant's FETCH_HEAD or tags. Tried once a run: a fetch
-# that fails exempts nothing — not even a ref an earlier fetch left — and is said once
-# (`COURSE_UNVERIFIED`, git's own words on stderr).
+# there is one), never touching the participant's tags — nor their FETCH_HEAD, which every fetch
+# writes: it's kept aside and put back after, or removed when there was none
+# (`--no-write-fetch-head` needs git 2.29, and Ubuntu 20.04's is 2.25: there every fetch failed,
+# review ai-review claude #2). Tried once a run: a fetch that fails exempts nothing — not even a
+# ref an earlier fetch left — and is said once (`COURSE_UNVERIFIED`, git's own words on stderr).
+# Its outcome stays in $COURSE_TRIED: `ok`, or `failed`.
 course_verify() {
-    if [ -n "$COURSE_TRIED" ]; then [ -n "$COURSE_REFS" ]; return; fi
-    COURSE_TRIED=1
+    if [ -n "$COURSE_TRIED" ]; then [ "$COURSE_TRIED" = ok ]; return; fi
+    COURSE_TRIED=failed
+    _cvh=$(git rev-parse --git-path FETCH_HEAD)
+    _cvk=none
+    if [ -e "$_cvh" ]; then
+        if cp -p "$_cvh" "$T.fhead" 2>/dev/null; then _cvk=kept; else _cvk=; fi
+    fi
     _cvt=
     if timeout 1 true >/dev/null 2>&1; then _cvt='timeout 60'; fi
-    if GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= SSH_ASKPASS= $_cvt git -c credential.helper= fetch --no-tags --no-write-fetch-head --quiet \
+    if GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= SSH_ASKPASS= $_cvt git -c credential.helper= fetch --no-tags --quiet \
         "$COURSE_URL" '+refs/heads/main:refs/arena/course-main' > /dev/null 2> "$T.cfetch" \
         && git rev-parse -q --verify 'refs/arena/course-main^{commit}' > /dev/null; then
+        COURSE_TRIED=ok
+    fi
+    case $_cvk in
+        kept) mv -f "$T.fhead" "$_cvh" || true ;;
+        none) rm -f "$_cvh" ;;
+    esac
+    if [ "$COURSE_TRIED" = ok ]; then
         COURSE_REFS=refs/arena/course-main
         return 0
     fi
@@ -448,11 +467,21 @@ scan_out
 # A key in a blob upstream's main has too (what `git pull upstream main` brought — or a fork's
 # commit, fetched before `upstream` was repointed): then, and only then, the course is asked which
 # commits are its own (`course_verify`), and the scan runs again without them. Never on a run with
-# no such key: most runs fetch nothing.
+# no such key: most runs fetch nothing. If the course can't be reached, that key-like string may
+# be the course's own, which a rewrite would break the ancestry of for good (every later `git pull
+# upstream main` conflicting on it, on every pod that pulled it — review ai-review claude #2, one
+# timeout at one tick enough), or not: so this run rewrites nothing and pushes nothing, a key of
+# the participant's beside it included — said, and asked again next run. The pod is copied as for
+# a failed push meanwhile.
 if [ -s "$T.hmap" ] && [ -n "$COURSE_URL" ] && git rev-parse -q --verify 'refs/remotes/upstream/main^{commit}' > /dev/null; then
     git rev-list --objects refs/remotes/upstream/main --not --remotes=origin | cut -d' ' -f1 | LC_ALL=C sort -u > "$T.upstream"
-    if cut -d' ' -f1 "$T.hmap" | LC_ALL=C sort -u | LC_ALL=C comm -12 - "$T.upstream" | grep -q . && course_verify; then
-        scan_out
+    if cut -d' ' -f1 "$T.hmap" | LC_ALL=C sort -u | LC_ALL=C comm -12 - "$T.upstream" | grep -q .; then
+        if course_verify; then
+            scan_out
+        else
+            echo "COURSE_HELD"
+            exit 1
+        fi
     fi
 fi
 : > "$T.cmap"
