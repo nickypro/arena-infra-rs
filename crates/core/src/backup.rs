@@ -5547,6 +5547,11 @@ done
         );
         suggested_move(line, repo, "checkpoints");
         assert!(err.find(line).unwrap() < err.find("was stopped there").unwrap(), "{err}");
+        // …and with no stderr to say it on (a dropped connection; review ai-review claude #4): the
+        // save removed all the same — the words come after it, a failed write passed over.
+        let (code, out, err) = run_in("bash", &format!("{} 2>&-", bounded_switch(&switch_script(repo, "main", None, true, KB_DEFAULT), 2, 1)), &slow);
+        assert_eq!((code, err.as_str()), (Some(124), ""), "{out}");
+        untouched("stopped mid-copy, stderr closed");
         // Stopped while it totals the size first (a `du` that hangs): said, with no size to say yet.
         let slow_du = stand_in("bin-slow-du", "du", "#!/bin/sh\nsleep 30\n");
         let (code, out, err) = run_in("bash", &bounded_switch(&switch_script(repo, "main", None, true, KB_DEFAULT), 2, 1), &slow_du);

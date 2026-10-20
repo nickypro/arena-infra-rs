@@ -196,13 +196,17 @@ discarded_save() {
 # was doing (review ai-review claude #6: "ran past its 100 s" alone said nothing of why, and each
 # retry was stopped the same way): stopped mid-copy, what it was copying, how big, and how to move
 # it out of the way (`ds_move`). A completed save always stays, whatever happens to the reset
-# after it. (A KILL runs no trap: a save it cuts short stays.)
+# after it. (A KILL runs no trap: a save it cuts short stays.) The words are worked out first and
+# said last, after the save is gone, a write that fails passed over (review ai-review claude #4):
+# a stop that is a dropped connection has no stderr to write to, and the write — a SIGPIPE, or
+# under `set -e` a failed redirection — ended the shell inside its trap, the partial save left in
+# .git.
 ds_abandon() {
     if [ -n "${ds_made:-}${ds_refs:-}" ] && [ -z "${ds_done:-}" ]; then
         ds_why="arena set-branch: stopped while ${ds_step:-saving}, before the --hard reset — the partial save removed, not reset"
         if [ -n "${ds_big:-}" ]; then ds_why="$ds_why: move it out of the checkout $(ds_move "$ds_big"), or delete it, then switch again"; fi
-        printf '%s\n' "$ds_why" >&2
         ds_remove "$ds_d"
+        printf '%s\n' "$ds_why" >&2 || true
     fi
     return 0
 }
