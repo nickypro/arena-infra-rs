@@ -4430,10 +4430,43 @@ done
         std::fs::write(s.work.join("notes.md"), "notes\n").unwrap();
         let (code, r, err) = s.backup();
         assert_eq!((code, r.outcome), (Some(0), Some((BACKUP_PUSHED, "autocommit-y".into()))), "{err}");
-        let tracked = s.run(&format!("git -C {} rev-parse -q --verify refs/remotes/origin/autocommit-y", shell_quote(s.work.to_str().unwrap())));
-        assert!(!tracked.status.success(), "no remote-tracking ref: the fetch is narrowed");
         let config = |key: &str| s.git(&s.work, &["config", &format!("branch.autocommit-y.{key}")]);
         assert_eq!((config("remote"), config("merge")), ("origin".to_string(), "refs/heads/autocommit-y".to_string()));
+    }
+
+    /// Review claude #4 (FIX9B item 4): a push sets no remote-tracking ref the fetch doesn't map, so
+    /// a checkout whose `remote.origin.fetch` is narrowed (a `--single-branch` clone: origin's main
+    /// alone) never settled — every run took its branch as new: never `NO_CHANGES`, pushing,
+    /// re-scanning and size-checking every commit since origin's main, more each day. Now the
+    /// backup sets `refs/remotes/origin/<branch>` to what it pushed: the second run says
+    /// `NO_CHANGES`, nothing already pushed is left to scan (`HEAD --not --remotes=origin` is empty),
+    /// and a new commit is all the next one scans.
+    #[cfg(unix)]
+    #[test]
+    fn a_narrowed_fetch_settles_after_a_push_and_scans_nothing_already_pushed() {
+        let s = GitSandbox::new("narrow-settle", 1_000_000);
+        s.git(&s.work, &["config", "remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/main"]);
+        s.git(&s.work, &["update-ref", "-d", "refs/remotes/origin/autocommit-x"]);
+        s.git(&s.work, &["checkout", "-q", "-b", "autocommit-y"]);
+        let unscanned = || s.git(&s.work, &["rev-list", "--count", "HEAD", "--not", "--remotes=origin"]);
+        let origins = || s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "rev-parse", "autocommit-y"]);
+        std::fs::write(s.work.join("notes.md"), "notes\n").unwrap();
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome), (Some(0), Some((BACKUP_PUSHED, "autocommit-y".into()))), "{err}");
+        assert_eq!(s.git(&s.work, &["rev-parse", "refs/remotes/origin/autocommit-y"]), origins());
+        assert_eq!(unscanned(), "0", "what was pushed is still read as unpushed");
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome), (Some(0), Some((BACKUP_NO_CHANGES, "autocommit-y".into()))), "{err}");
+        // A new commit: it alone is left to scan, and once pushed, nothing is.
+        std::fs::write(s.work.join("more.md"), "more\n").unwrap();
+        s.git(&s.work, &["add", "-A"]);
+        s.git(&s.work, &["commit", "-q", "-m", "more"]);
+        assert_eq!(unscanned(), "1");
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome), (Some(0), Some((BACKUP_PUSHED, "autocommit-y".into()))), "{err}");
+        assert_eq!((unscanned(), s.git(&s.work, &["rev-parse", "HEAD"])), ("0".to_string(), origins()));
+        let (code, r, _) = s.backup();
+        assert_eq!((code, r.outcome), (Some(0), Some((BACKUP_NO_CHANGES, "autocommit-y".into()))));
     }
 
     /// Review claude #3 (FIX9B item 3): the upstream was written only when `branch.<b>.remote` was

@@ -590,7 +590,10 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     tracking it, is pushed like any other, its upstream left as it is; a branch with none tracks
     origin's after its first push, written to its config even where `remote.origin.fetch` is
     narrowed — `branch.<b>.remote` and `.merge` each on its own, so one half-written, or set alone
-    by the participant, gets the other at the next push). Selected pods, or — none
+    by the participant, gets the other at the next push; and every push sets
+    `refs/remotes/origin/<b>` to what it pushed, which a narrowed fetch never maps: such a checkout
+    then reads `NO_CHANGES` and scans only what's new, instead of pushing and re-scanning every
+    commit since origin's main each run). Selected pods, or — none
     named (no targets, `all`/`--all`) — **this cohort's**: `<prefix>-…` pods (one off
     `MACHINE_NAME_LIST` too: an extra pod made for someone, a parked `-old` twin), never an `@`
     staff entry. The rest (staff boxes, another prefix, a pod the provider named) get one

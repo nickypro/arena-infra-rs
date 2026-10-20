@@ -432,6 +432,13 @@ if [ -z "$pushed" ]; then
     echo "PUSH_FAILED"
     exit 1
 fi
+# Origin has $NEW now: so says its remote-tracking ref, set here (review claude #4, FIX9B). A push
+# updates it only where `remote.origin.fetch` maps the branch; a checkout whose fetch is narrowed
+# (an image cloned `--single-branch`) never had it, so every run took the branch as new — never
+# NO_CHANGES, pushing, re-scanning and size-checking every commit since origin's main, a cost
+# growing through the cohort; and a pattern learnt later would rewrite commits origin already has,
+# a push refused as a non-fast-forward every run. Where the fetch maps it, the push set it already.
+git update-ref "refs/remotes/origin/$B" "$NEW" || true
 if [ "$NEW" != "$TIP" ]; then
     echo "REDACTED_HISTORY $N $TIP $NEW"
     if ! git update-ref -m "arena backup: keys redacted from unpushed commits" "refs/heads/$B" "$NEW" "$TIP"; then
