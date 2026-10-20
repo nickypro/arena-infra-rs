@@ -418,12 +418,13 @@ fi
 
 # The tip, or its redacted rewrite (as a fast-forward of the remote branch): that commit, by its
 # id, to origin's branch — never the branch by name, which is wherever the participant has moved it
-# since.
+# since. That commit alone: `--no-follow-tags`, since a participant's `push.followTags` sent every
+# annotated tag on the commits going out along with them, its message scanned by nothing.
 if [ "$NEW" != "$TIP" ] && [ "$(git rev-parse HEAD)" != "$TIP" ]; then
     echo "HEAL_ABORTED $B moved while its unpushed commits were being redacted — the next backup redoes it"
     exit 1
 fi
-if git push origin "$NEW:refs/heads/$B" 2>"$T.push"; then pushed=1; else pushed=; fi
+if git push --no-follow-tags origin "$NEW:refs/heads/$B" 2>"$T.push"; then pushed=1; else pushed=; fi
 no_bypass_url < "$T.push" >&2
 if [ -z "$pushed" ]; then
     # Still refused: a secret the patterns don't know (or a binary GitHub scans) — said, by type.

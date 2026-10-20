@@ -959,7 +959,9 @@ fn init_branch_script(cfg: &BackupConfig, machine_name: &str) -> String {
 /// the branch when that is an ancestor (a second init the same day), so the push stays a
 /// fast-forward — or no push at all when origin has none of it. The rest stays on the new branch
 /// on the pod, said (`UNPUSHED <n> <id>|none`, [`parse_init_unpushed`]), and goes out with the next
-/// backup, which scans it. A refusal reaches the operator without GitHub's allow-the-secret URL
+/// backup, which scans it. That commit alone, as the backup pushes (`--no-follow-tags`: a
+/// participant's `push.followTags` sends annotated tags along, unscanned). A refusal reaches the
+/// operator without GitHub's allow-the-secret URL
 /// (`no_bypass_url`). Pushed, the branch tracks origin's, as `push -u` made it (an id pushed sets
 /// no upstream), written to the config itself (a narrowed fetch has no remote-tracking ref).
 const INIT_PUSH_SH: &str = r#"TIP=$(git rev-parse HEAD)
@@ -976,7 +978,7 @@ if [ "$U" != 0 ]; then
 fi
 if [ -z "$AT" ]; then exit 0; fi
 P=$(git rev-parse --absolute-git-dir)/arena-init-push.$$
-if git push origin "$AT:refs/heads/$NB" 2>"$P"; then R=0; else R=$?; fi
+if git push --no-follow-tags origin "$AT:refs/heads/$NB" 2>"$P"; then R=0; else R=$?; fi
 no_bypass_url < "$P" >&2; rm -f "$P"
 if [ "$R" = 0 ]; then git config "branch.$NB.remote" origin && git config "branch.$NB.merge" "refs/heads/$NB" || true; fi
 exit $R
@@ -1381,7 +1383,7 @@ mod tests {
         assert!(s.contains(r#"git rev-list --count "refs/remotes/origin/$B..$TIP""#) && !s.contains("@{u}"));
         // Exactly the commit it scanned, by its id (review ai-review codex #1, FIX7), a branch with
         // no upstream then tracking origin's as `push -u` made it — in the config itself (claude #7).
-        assert!(s.contains(r#"git push origin "$NEW:refs/heads/$B""#) && !s.contains(r#"git push -u"#) && s.contains("PUSHED $B"));
+        assert!(s.contains(r#"git push --no-follow-tags origin "$NEW:refs/heads/$B""#) && !s.contains(r#"git push -u"#) && s.contains("PUSHED $B"));
         assert!(s.contains(r#"git config "branch.$B.remote" origin && git config "branch.$B.merge" "refs/heads/$B""#) && !s.contains("git branch --set-upstream-to"));
         assert!(s.contains("Arena Autocommit"));
         assert!(s.contains(r#"export GIT_SSH_COMMAND="ssh -i $KEY"#));
@@ -2622,6 +2624,28 @@ done
         assert!(!s.origin_holds(&key) && !s.origin_holds(&in_msg));
     }
 
+    /// FIX9B: with the participant's `push.followTags` set, a push of a commit took every annotated
+    /// tag on the commits going out along with it — a tag's message scanned by nothing, a key in it
+    /// on GitHub. Both pushes now send the commit alone: the backup's and init-branches'.
+    #[cfg(unix)]
+    #[test]
+    fn neither_push_takes_the_participants_tags_along() {
+        let s = GitSandbox::new("follow-tags", 1_000_000);
+        let key = openrouter_key(44);
+        s.git(&s.work, &["config", "push.followTags", "true"]);
+        std::fs::write(s.work.join("notes.md"), "n\n").unwrap();
+        s.git(&s.work, &["add", "-A"]);
+        s.git(&s.work, &["commit", "-q", "-m", "mine"]);
+        s.git(&s.work, &["tag", "-a", "v1", "-m", &format!("works with {key}")]);
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into()))), "{err}");
+        let cfg = BackupConfig { repo_path: s.work.display().to_string(), prefix: "devtest".into(), week: 1, day: 2, git_ssh_key: None, origin: None };
+        let o = s.run(&init_branch_command(&cfg, "devtest-x"));
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "tag"]), "", "a tag was pushed");
+        assert!(!s.origin_holds(&key), "a tag's message reached origin");
+    }
+
     /// FIX9B item 2, the other two cases: a second init the same day, on a day branch origin has
     /// with a commit on top that it doesn't — origin's copy stays as it is (the push a no-op, never
     /// a non-fast-forward), the commit said and kept; and a HEAD origin has none of (no commit of it
@@ -3161,7 +3185,7 @@ done
         assert!(cmd.contains("git checkout -b 'autocommit-arena8-w1d4-apple'"));
         // Pushed by id, only what origin has (FIX9B item 2), never the branch by name.
         assert!(cmd.contains("NB='autocommit-arena8-w1d4-apple'") && cmd.contains(INIT_PUSH_SH.trim_end()), "{cmd}");
-        assert!(INIT_PUSH_SH.contains(r#"git push origin "$AT:refs/heads/$NB""#) && !cmd.contains("git push -u"), "{cmd}");
+        assert!(INIT_PUSH_SH.contains(r#"git push --no-follow-tags origin "$AT:refs/heads/$NB""#) && !cmd.contains("git push -u"), "{cmd}");
         // It only creates/pushes the branch — never stages or commits work. (The refusal of a
         // checkout mid-merge names `git add`/`git commit` in the words it prints, never runs them.)
         let refusal = busy_refusal_sh("arena init-branches");
