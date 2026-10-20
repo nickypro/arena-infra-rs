@@ -641,20 +641,18 @@ fn disk_line(m: Option<&PodMetrics>, x: Option<&Extra>) -> String {
     format!("disk: {}", parts.join(" · "))
 }
 
+/// The setup flags. Never a progress value: the ask doesn't run `PROGRESS_CMD`
+/// (`super::probe_opts`), so a `progress=` line in a reply is none of its own.
 fn setup_line(m: Option<&PodMetrics>) -> Option<String> {
     let m = m?;
-    let mut line = format!(
+    Some(format!(
         "setup: ~/.name {} · deploy key {} · API keys in the shell rc {} · HF token {} · Claude Code token {}",
         yes_no(m.has_name),
         yes_no(m.has_key),
         yes_no(m.has_api_key),
         yes_no(m.has_hf_token),
         yes_no(m.has_cc_token)
-    );
-    if let Some(p) = &m.progress {
-        line.push_str(&format!(" · progress (PROGRESS_CMD): {}", redact::text(p, NAME_MAX)));
-    }
-    Some(line)
+    ))
 }
 
 fn sessions_line(x: Option<&Extra>, now: Option<u64>) -> String {

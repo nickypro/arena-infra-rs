@@ -71,10 +71,14 @@ pub fn pod_cap(pods: usize) -> usize {
     (TOTAL_CAP / pods.max(1)).clamp(bundle::MIN_CAP, bundle::BUNDLE_CAP)
 }
 
-/// The metrics probe's options, as the dashboard sets them from the config.
+/// The metrics probe's options, as the dashboard sets them from the config — less
+/// `PROGRESS_CMD`, which an ask never runs (review ai-review codex #4): it is the operator's own
+/// command, run on the pod as root, and nothing holds it to reading — it may write a file or a
+/// cache, or run a plain `git status` (an fsmonitor hook, a filter: what `ro_git` keeps out).
+/// `pods ask` only reads.
 pub fn probe_opts(cfg: &Config) -> ProbeOpts {
     ProbeOpts {
-        progress_cmd: cfg.get("PROGRESS_CMD").filter(|s| !s.trim().is_empty()).map(String::from),
+        progress_cmd: None,
         repo_path: Some(crate::backup::repo_path(cfg)),
         key_remote: Some(cfg.get("GIT_SSH_KEY_REMOTE").unwrap_or("/root/.ssh/id_ed25519").to_string()),
     }
@@ -553,6 +557,23 @@ mod tests {
         assert!(data.contains("reached: no — not tried: no SSH endpoint yet"), "{data}");
         assert!(p.contains("Reminder: answer \"which pods are idle?\""));
         assert_eq!(default_question(3), "What is the current state of these pods? Is anything wrong or needing attention?");
+    }
+
+    /// Review ai-review codex #4: an ask never runs `PROGRESS_CMD` — the operator's own command,
+    /// which may write — whatever the config says: the one command each pod gets holds none of
+    /// it, and a `progress=` line in a reply (none of the ask's own) isn't in the bundle.
+    #[tokio::test(start_paused = true)]
+    async fn an_ask_never_runs_the_progress_command() {
+        let c = cfg("PROGRESS_CMD=touch /root/.progress-ran; cat /root/progress.txt\n");
+        assert_eq!(probe_opts(&c).progress_cmd, None);
+        let fake = Arc::new(FakeRemote::new());
+        let reply = busy_reply("", "", "pytest").replace("\ncpu=37\n", "\ncpu=37\nprogress=epoch 3/10\n");
+        fake.script("10.0.0.1:22001", [FakeReply::stdout(&reply)]);
+        let remote: Arc<dyn Remote> = fake.clone();
+        let b = bundles(&remote, &c, &[pod("alpha", 1, Some(22001))], NOW).await;
+        let [RemoteCall::Exec { cmd, .. }] = &fake.calls()[..] else { panic!("{:?}", fake.calls()) };
+        assert!(!cmd.contains("progress.txt") && !cmd.contains(".progress-ran") && !cmd.contains("progress="), "{cmd}");
+        assert!(b[0].contains("setup: ~/.name yes") && !b[0].contains("epoch 3/10") && !b[0].contains("PROGRESS_CMD"), "{}", b[0]);
     }
 
     #[test]
