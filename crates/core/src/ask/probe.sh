@@ -57,18 +57,24 @@ if [ -d /workspace ]; then o df_workspace "$(dfl /workspace)"; else o df_workspa
 o home_kb "$(t 10 du -skx "$HOME" 2>/dev/null | cut -f1)"
 
 # --- Logins and tmux ------------------------------------------------------------------------------
+# This runs in the C locale (env -i), where `who` prints the time as `Oct 20 15:27` (one field
+# more than ISO's `2026-10-20 15:27`): every field up to the `(source)` comment is kept, never it.
 if command -v who >/dev/null 2>&1; then
     if w=$(t 5 who 2>/dev/null); then
         o who ok
-        printf '%s\n' "$w" | awk 'NF >= 2 { print "ARENA_ASK_WHO " $1 " " $2 " " $3 " " $4 }' | head -n 20
+        printf '%s\n' "$w" |
+            awk 'NF >= 2 { s = "ARENA_ASK_WHO " $1; for (i = 2; i <= NF && i <= 6 && substr($i, 1, 1) != "("; i++) s = s " " $i; print s }' |
+            head -n 20
     else
         o who err
     fi
 else
     o who absent
 fi
+# tmux, in the C locale, turns a tab in its -F output into `_` (tmux 3.4 on Ubuntu 24.04): the
+# fields are `:`-separated, the name last (tmux allows no `:` in one); `-u` keeps a UTF-8 name.
 if command -v tmux >/dev/null 2>&1; then
-    if out=$(t 5 tmux list-sessions -F '#{session_name}	#{session_windows}	#{session_attached}	#{session_activity}' 2>&1); then
+    if out=$(t 5 tmux -u list-sessions -F '#{session_windows}:#{session_attached}:#{session_activity}:#{session_name}' 2>&1); then
         o tmux ok
         printf '%s\n' "$out" | grep . | head -n 20 | sed -e 's/^/ARENA_ASK_TMUX /'
     else

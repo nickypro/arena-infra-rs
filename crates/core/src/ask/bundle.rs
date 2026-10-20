@@ -268,13 +268,16 @@ fn parse_proc(line: &str) -> Option<Proc> {
     Some(Proc { pid: number(pid)?, user: user.to_string(), cpu: float(cpu)?, mem: float(mem)?, age: number(age)?, args: r.trim().to_string() })
 }
 
+/// One `ARENA_ASK_TMUX` line: `windows:attached:activity:name` (probe.sh's format — `:`, as
+/// tmux in the C locale turns a tab into `_`; the name last, since tmux allows no `:` in one).
+/// Tolerant: a count it can't read is unknown, and a line not in that shape is all name.
 fn parse_tmux(line: &str) -> Tmux {
-    let mut f = line.split('\t');
-    Tmux {
-        name: f.next().unwrap_or("").to_string(),
-        windows: f.next().and_then(number),
-        attached: f.next().and_then(number),
-        activity: f.next().and_then(number),
+    let f: Vec<&str> = line.splitn(4, ':').collect();
+    match f.as_slice() {
+        [w, a, act, name] if number::<u32>(w).is_some() => {
+            Tmux { name: name.to_string(), windows: number(w), attached: number(a), activity: number(act) }
+        }
+        _ => Tmux { name: line.to_string(), windows: None, attached: None, activity: None },
     }
 }
 
@@ -928,7 +931,7 @@ pub mod fixtures {
             "ARENA_ASK now=2026-10-19T12:00:00Z\nARENA_ASK uptime=1036800\nARENA_ASK load=1.02 0.98 0.90\nARENA_ASK cpus=16\nARENA_ASK pid1=sleep\n\
              ARENA_ASK pid1_age=11400\nARENA_ASK nvsmi=yes\nARENA_ASK df_root=12582912 104857600 /\nARENA_ASK home=/root\n\
              ARENA_ASK df_home=12582912 104857600 /\nARENA_ASK df_workspace=5242880 52428800 /workspace\nARENA_ASK home_kb=3355443\n\
-             ARENA_ASK who=ok\nARENA_ASK_WHO root pts/0 2026-10-19 10:00\nARENA_ASK tmux=ok\nARENA_ASK_TMUX lab\t2\t1\t1792410900\n\
+             ARENA_ASK who=ok\nARENA_ASK_WHO root pts/0 2026-10-19 10:00\nARENA_ASK tmux=ok\nARENA_ASK_TMUX 2:1:1792410900:lab\n\
              ARENA_ASK ps=ok\nARENA_ASK_PS  4242 root      98.5  6.1   7200 python train.py --epochs 3 {extra_args}\n\
              ARENA_ASK_PS   777 root       0.0  0.0   3600 sh /root/.arena/jobs/20261019-101500-pytest/run\n\
              ARENA_ASK_PS  4242 root      98.5  6.1   7200 python train.py (a duplicate pid, from the by-memory list)\n\
@@ -1078,7 +1081,7 @@ mod tests {
         let log = all.iter().map(|k| format!("Using key {k} for the run")).collect::<Vec<_>>().join("\n");
         let cmd = format!("python eval.py --key={} --hf {}", keys[0].0, keys[5].0);
         let mut reply = busy_reply(&args, &log, &cmd);
-        reply = reply.replace("ARENA_ASK_TMUX lab\t", &format!("ARENA_ASK_TMUX lab-{}\t", keys[6].0));
+        reply = reply.replace("ARENA_ASK_TMUX 2:1:1792410900:lab\n", &format!("ARENA_ASK_TMUX 2:1:1792410900:lab-{}\n", keys[6].0));
         reply = reply.replace("ARENA_ASK last=1792403200 Merge branch main", &format!("ARENA_ASK last=1792403200 add key {}", keys[1].0));
         reply = reply.replace("ARENA_ASK_FILE ?? notes.txt", &format!("ARENA_ASK_FILE ?? {}.txt", keys[11].0));
         // Room for every planted line: the cap is the size test's business.
@@ -1428,6 +1431,49 @@ mod tests {
                 && text.contains("the participant ends it: finish it (`git commit`) or abort it (`git merge --abort`)"),
             "{text}"
         );
+    }
+
+    /// probe.sh runs in the C locale: tmux 3.4 there turns each tab of its `-F` output into `_`,
+    /// and `who` prints `Oct 20 15:27`. A stub tmux doing exactly that, and a stub who in both
+    /// time formats (with a source host): the sessions read whole, the logins keep their time
+    /// of day, and the source host never appears.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tmux_and_who_read_right_in_the_c_locale() {
+        use std::process::Command;
+        let t = crate::ask::ai::tests::Tmp::new("locale");
+        let (bin, home) = (t.0.join("bin"), t.0.join("home"));
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        crate::ask::ai::fixtures::stub(
+            &bin,
+            "tmux",
+            "fmt=; prev=; for a; do [ \"$prev\" = -F ] && fmt=$a; prev=$a; done\n\
+             for s in 'notes 2 1 1792506455' 'train 1 0 1792506400'; do\n\
+             set -- $s\n\
+             printf '%s\\n' \"$fmt\" | sed -e \"s/#{session_name}/$1/g\" -e \"s/#{session_windows}/$2/g\" -e \"s/#{session_attached}/$3/g\" \
+             -e \"s/#{session_activity}/$4/g\" | tr '\\t' '_'\n\
+             done",
+        );
+        crate::ask::ai::fixtures::stub(&bin, "who", "printf 'root     pts/0        Oct 20 15:27 (10.1.2.3)\\nubuntu   pts/1        2026-10-20 15:30 (host.example)\\n'");
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(probe_script())
+            .args(["arena-ask-probe", ""])
+            .env_clear()
+            .env("PATH", format!("{}:/usr/local/bin:/usr/bin:/bin", bin.display()))
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let x = parse_extra(&stdout);
+        let tmux = |name: &str, w, a, act| Tmux { name: name.into(), windows: Some(w), attached: Some(a), activity: Some(act) };
+        assert_eq!(x.tmux, Some(Ok(vec![tmux("notes", 2, 1, 1_792_506_455), tmux("train", 1, 0, 1_792_506_400)])), "{stdout}");
+        assert_eq!(x.who, Some(Ok(vec!["root pts/0 Oct 20 15:27".to_string(), "ubuntu pts/1 2026-10-20 15:30".into()])), "{stdout}");
+        assert!(!stdout.contains("10.1.2.3") && !stdout.contains("host.example"), "{stdout}");
+        // The parse, tolerant: a count it can't read is unknown; a line of another shape is a name.
+        assert_eq!(parse_tmux("2:1::lab"), Tmux { name: "lab".into(), windows: Some(2), attached: Some(1), activity: None });
+        assert_eq!(parse_tmux("notes_2_1_1792506455"), Tmux { name: "notes_2_1_1792506455".into(), windows: None, attached: None, activity: None });
     }
 
     #[test]
