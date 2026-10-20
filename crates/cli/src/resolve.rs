@@ -1,9 +1,10 @@
 //! `pods backup`'s step for the pods whose backup said BUSY (an operation in progress, nothing
 //! committed): a read-only look at each, under its lock; their copy paced by it (part 2: only
-//! when nothing since the operation started is recorded, the work tree changed, or the last copy
-//! is an hour old); then, `BUSY_AUTO_RESOLVE_HOURS` on and the pod quiet that long with a copy
-//! holding its state, the operation finished on the pod and the pod backed up again — in the same
-//! run, under its lock. The decisions are core's (`arena_core::resolve`); this is the I/O, beside
+//! when nothing since the operation started is recorded — or the recorded copy is gone, or of
+//! another backup dir —, the work tree changed, or the last copy is an hour old); then,
+//! `BUSY_AUTO_RESOLVE_HOURS` on and the pod quiet that long with a whole copy holding its state,
+//! the operation finished on the pod and the pod backed up again — in the same run, under its
+//! lock. The decisions are core's (`arena_core::resolve`); this is the I/O, beside
 //! the backup flow in main.rs rather than in it: `pods backup` calls [`Busy::look`] after its git
 //! step and [`Busy::settle`] after its copy.
 
@@ -80,8 +81,9 @@ fn at_words(at: u64, now: u64) -> String {
 impl Busy {
     /// The run's BUSY pods (`unpushed` with `busy`): each looked at, read-only, under its lock
     /// (a short wait: one another backup holds is copied as before and not finished); the copy
-    /// record loaded; each one's copy decided ([`core_resolve::copy_needed`]). Nothing BUSY:
-    /// nothing done.
+    /// record loaded, each pod's record trusted only while its copy is still there
+    /// ([`core_resolve::copy_still_there`]); each one's copy decided
+    /// ([`core_resolve::copy_needed`]). Nothing BUSY: nothing done.
     pub(crate) async fn look(remote: &Arc<dyn Remote>, cfg: &Config, dir: &str, sel: &Selected, unpushed: &[Unpushed]) -> Busy {
         let hours = core_resolve::auto_resolve_hours(cfg.get(core_resolve::AUTO_RESOLVE_KEY)).unwrap_or_else(|e| {
             eprintln!("warning: {e} — no operation left in progress is finished this run");
@@ -120,7 +122,9 @@ impl Busy {
             .into_iter()
             .map(|(name, target)| {
                 let look = looks.remove(&name);
-                let copy = core_resolve::copy_needed(look.as_ref(), out.copies.pods.get(&name), out.now);
+                // An earlier run's copy counts only while it is still there, under this backup dir.
+                let last = out.copies.pods.get(&name).filter(|l| core_resolve::copy_still_there(l, &out.dir));
+                let copy = core_resolve::copy_needed(look.as_ref(), last, out.now);
                 let why = unpushed.iter().find(|u| u.pod == name).map(|u| u.why.clone()).unwrap_or_default();
                 BusyPod { name, target, why, look, copy }
             })
@@ -135,10 +139,12 @@ impl Busy {
     }
 
     /// After the copy (`pulled`; `all`: the run pulled every pod, BUSY ones included, whatever
-    /// [`Busy::to_copy`] said): record each BUSY pod's copy that held its checkout; then finish
-    /// each BUSY pod [`core_resolve::hold`] lets through — under its lock, the resolve and then its
-    /// backup again (`message`: the backup's commit message, `pods backup -m`), its record
-    /// forgotten once finished — and say what became of each.
+    /// [`Busy::to_copy`] said): record each BUSY pod's copy that was whole ([`Pulled::whole`]: every
+    /// rsync of both tiers, `.git` pass included) and held its checkout, with where its `.git` is;
+    /// then finish each BUSY pod [`core_resolve::hold`] lets through, on a recorded copy that is
+    /// still there — under its lock, the resolve and then its backup again (`message`: the
+    /// backup's commit message, `pods backup -m`), its record forgotten once finished — and say
+    /// what became of each.
     pub(crate) async fn settle(self, remote: &Arc<dyn Remote>, cfg: &Config, pulled: &anyhow::Result<Pulled>, all: bool, message: Option<&str>) -> Settled {
         let mut out = Settled::default();
         let Busy { hours, record, mut copies, pods, dir, now } = self;
@@ -149,24 +155,26 @@ impl Busy {
             let tried = all || pod.copy.is_some();
             let copied = match (tried, pulled, &pod.look) {
                 (false, ..) => CopiedNow::No,
-                (true, Ok(p), Some(look)) if !p.failed.iter().any(|(q, _)| *q == pod.name) => {
-                    if core_resolve::copy_holds(&remote_path, look, &pod.target.user) {
+                (true, Ok(p), Some(look)) if p.whole.contains(&pod.name) => match core_resolve::copy_place(&remote_path, look, &pod.target.user) {
+                    Some(place) => {
                         let label = p.snapshot_root.rsplit('/').next().unwrap_or_default();
+                        let to = format!("{}/{}", p.snapshot_root, pod.name);
+                        let git = std::path::Path::new(&to).join(place).join(".git").display().to_string();
                         let copy = BusyCopy {
                             op: look.op_key(),
                             print: look.print.clone(),
                             newest: look.newest,
                             at: now,
-                            to: format!("{}/{}", p.snapshot_root, pod.name),
+                            to,
                             label: format!("{label}/{}", pod.name),
+                            git,
                         };
                         copies.pods.insert(pod.name.clone(), copy.clone());
                         changes.push((pod.name.clone(), Some(copy)));
                         CopiedNow::Yes
-                    } else {
-                        CopiedNow::Failed
                     }
-                }
+                    None => CopiedNow::Failed,
+                },
                 (true, ..) => CopiedNow::Failed,
             };
             if !tried {
@@ -181,11 +189,12 @@ impl Busy {
                     ));
                 }
             }
-            if let Ok(last) = core_resolve::hold(hours, pod.look.as_ref(), copied, copies.pods.get(&pod.name)) {
+            let last = copies.pods.get(&pod.name).filter(|l| core_resolve::copy_still_there(l, &dir));
+            if let Ok(last) = core_resolve::hold(hours, pod.look.as_ref(), copied, last) {
                 candidates.push((pod.name.clone(), pod.target.clone(), pod.look.clone(), last.clone()));
             }
         }
-        save(record.as_deref(), &changes, now);
+        save(record.clone(), changes, now).await;
         let Some(hours) = hours.filter(|_| !candidates.is_empty()) else { return out };
         // Finish each, under its lock: the resolve looks again and goes ahead only if nothing
         // changed since the look this copy followed; then the backup, as any run's.
@@ -227,19 +236,23 @@ impl Busy {
         .await;
         drop(locks);
         let forget: Vec<(String, Option<BusyCopy>)> = finished.iter().map(|n| (n.clone(), None)).collect();
-        save(record.as_deref(), &forget, now);
+        save(record, forget, now).await;
         out.done = finished;
         out
     }
 }
 
 /// Record `changes` in the copy record at `path` (none: nothing written), said on stderr when it
-/// can't be — the BUSY pods are then copied again next run.
-fn save(path: Option<&std::path::Path>, changes: &[(String, Option<BusyCopy>)], now: u64) {
+/// can't be — the BUSY pods are then copied again next run. Off the async runtime: the record
+/// waits (bounded) for the state dir's lock ([`core_resolve::record_busy_copies`]).
+async fn save(path: Option<PathBuf>, changes: Vec<(String, Option<BusyCopy>)>, now: u64) {
     let Some(path) = path.filter(|_| !changes.is_empty()) else { return };
-    match core_resolve::record_busy_copies(path, changes, now) {
-        Ok(warning) => warning.iter().for_each(|w| eprintln!("{w}")),
-        Err(e) => eprintln!("warning: couldn't record the BUSY pods' copies in {} ({e}) — they're copied again next run", path.display()),
+    let shown = path.display().to_string();
+    let wrote = tokio::task::spawn_blocking(move || core_resolve::record_busy_copies(&path, &changes, now, core_resolve::RECORD_LOCK_WAIT)).await;
+    match wrote {
+        Ok(Ok(warning)) => warning.iter().for_each(|w| eprintln!("{w}")),
+        Ok(Err(e)) => eprintln!("warning: couldn't record the BUSY pods' copies in {shown} ({e}) — they're copied again next run"),
+        Err(e) => eprintln!("warning: couldn't record the BUSY pods' copies in {shown} ({e}) — they're copied again next run"),
     }
 }
 

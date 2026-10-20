@@ -1,6 +1,7 @@
 //! The look, the resolve and the decisions around them: the pure parts by table; the scripts
 //! against real git — a participant's checkout left mid-merge, mid-cherry-pick, mid-revert, with a
-//! `git stash pop`'s conflicts, mid-`git am`/rebase/sequence — its files made old with `touch -d`.
+//! `git stash pop`'s conflicts, mid-`git am`/rebase/sequence — its files made old with `touch -d`,
+//! the pod's terminals and processes stood in for by directories the tests fill.
 
 use super::*;
 use crate::backup::{backup_command_limited, parse_backup_report, BackupReport, BACKUP_BUSY_EXIT, BACKUP_PUSHED};
@@ -18,6 +19,7 @@ fn look_at(now: u64, since: Option<u64>, newest: u64, input: Option<u64>) -> Loo
     Look {
         now,
         top: "/root/ARENA_materials".into(),
+        repo: Some("/root/ARENA_materials".into()),
         home: "/root".into(),
         what: "merge".into(),
         since,
@@ -26,7 +28,11 @@ fn look_at(now: u64, since: Option<u64>, newest: u64, input: Option<u64>) -> Loo
         newest,
         files: 12,
         print: "111-222".into(),
+        index: since,
+        locked: false,
         input,
+        tty: None,
+        at_work: None,
     }
 }
 
@@ -63,14 +69,16 @@ fn the_setting_is_whole_hours_on_by_default_and_0_or_off_turns_it_off() {
 
 #[test]
 fn a_look_is_read_back_and_an_incomplete_one_is_none() {
-    let out = "NOW 1760900000\nTOP /root/ARENA_materials\nHOME /root\nOP merge 1760800000 0123abcd 0\nNEWEST 1760700000 42\n\
-               PRINT 3735928559-1234\nINPUT 1760600000\n";
+    let out = "NOW 1760900000\nTOP /workspace/ARENA_materials\nREPO /root/ARENA_materials\nHOME /root\nOP merge 1760800000 0123abcd 0\n\
+               NEWEST 1760700000 42\nPRINT 3735928559-1234\nINDEX 1760750000\nLOCKED index.lock\nINPUT 1760600000\nTTY 1760650000\n\
+               PROC 4242 vim\n";
     let l = parse_look(out).unwrap();
     assert_eq!(
         l,
         Look {
             now: 1_760_900_000,
-            top: "/root/ARENA_materials".into(),
+            top: "/workspace/ARENA_materials".into(),
+            repo: Some("/root/ARENA_materials".into()),
             home: "/root".into(),
             what: "merge".into(),
             since: Some(1_760_800_000),
@@ -79,7 +87,11 @@ fn a_look_is_read_back_and_an_incomplete_one_is_none() {
             newest: 1_760_700_000,
             files: 42,
             print: "3735928559-1234".into(),
+            index: Some(1_760_750_000),
+            locked: true,
             input: Some(1_760_600_000),
+            tty: Some(1_760_650_000),
+            at_work: Some("4242 vim".into()),
         }
     );
     assert_eq!(l.op_key(), "merge 1760800000 0123abcd");
@@ -92,7 +104,12 @@ fn a_look_is_read_back_and_an_incomplete_one_is_none() {
         let l = parse_look(&out.replace("OP merge 1760800000 0123abcd 0", &format!("OP {what}"))).unwrap();
         assert_eq!((l.what.as_str(), l.since, l.op_key()), (what, None, format!("{what} - -")));
     }
-    assert_eq!(parse_look(&out.replace("INPUT 1760600000\n", "")).unwrap().input, None, "nobody logged in");
+    // The lines said only when there is something to say: none of them, all off.
+    let bare = ["REPO /root/ARENA_materials\n", "INDEX 1760750000\n", "LOCKED index.lock\n", "INPUT 1760600000\n", "TTY 1760650000\n", "PROC 4242 vim\n"]
+        .iter()
+        .fold(out.to_string(), |o, l| o.replace(l, ""));
+    let l = parse_look(&bare).unwrap();
+    assert_eq!((l.repo, l.index, l.locked, l.input, l.tty, l.at_work), (None, None, false, None, None, None));
     // Any line it always prints missing or unreadable: no look.
     for broken in ["NOW 1760900000\n", "NEWEST 1760700000 42\n", "PRINT 3735928559-1234\n", "OP merge 1760800000 0123abcd 0\n"] {
         assert_eq!(parse_look(&out.replace(broken, "")), None, "{broken}");
@@ -102,14 +119,21 @@ fn a_look_is_read_back_and_an_incomplete_one_is_none() {
     assert_eq!(parse_look(""), None);
 }
 
-/// The quiet check: the operation, every file git lists and any terminal login, all older than
-/// the threshold — on the pod's clock; a time in the future never counts as quiet.
+/// The quiet check: the operation, every file git lists, the index (anything staged), any terminal
+/// login and any terminal, all older than the threshold, git's index unlocked and nobody at work
+/// in git — on the pod's clock; a time in the future never counts as quiet.
 #[test]
-fn quiet_means_the_operation_the_files_and_any_login_older_than_the_threshold() {
+fn quiet_means_nothing_and_nobody_at_work_for_the_threshold() {
     let n = 1_760_900_000;
     let old = n - 3 * HOUR;
+    let base = look_at(n, Some(old), old, None);
+    let with = |f: &dyn Fn(&mut Look)| {
+        let mut l = base.clone();
+        f(&mut l);
+        l
+    };
     let cases: Vec<(Look, Option<&str>)> = vec![
-        (look_at(n, Some(old), old, None), None),
+        (base.clone(), None),
         (look_at(n, Some(n - 10 * DAY), n - 4 * HOUR, Some(n - 5 * HOUR)), None),
         (look_at(n, Some(old + 1), old, None), Some("the merge started less than 3h ago")),
         (look_at(n, Some(old), n - 600, None), Some("a file changed less than 3h ago")),
@@ -119,6 +143,16 @@ fn quiet_means_the_operation_the_files_and_any_login_older_than_the_threshold() 
         (look_at(n, Some(old), n + 600, None), Some("a file changed less than 3h ago")),
         (look_at(n, None, old, None), Some("no start time for the merge")),
         (look_at(n, Some(old), 0, None), None),
+        // Something staged since; git's index locked; a terminal used (no login); a git command or
+        // an editor it waits on.
+        (with(&|l| l.index = Some(n - 600)), Some("git's index changed less than 3h ago (something was staged)")),
+        (with(&|l| l.index = Some(n + 600)), Some("git's index changed less than 3h ago (something was staged)")),
+        (with(&|l| l.index = None), None),
+        (with(&|l| l.locked = true), Some("git's index is locked (.git/index.lock): a git command is at work, or died holding it")),
+        (with(&|l| l.tty = Some(n - 600)), Some("a terminal was used less than 3h ago")),
+        (with(&|l| l.tty = Some(n - 4 * HOUR)), None),
+        (with(&|l| l.at_work = Some("4242 git".into())), Some("a git command, or an editor one waits on, is running (pid 4242: git)")),
+        (with(&|l| l.at_work = Some("4343 vim".into())), Some("a git command, or an editor one waits on, is running (pid 4343: vim)")),
     ];
     for (look, want) in cases {
         assert_eq!(not_quiet(&look, 3).as_deref(), want, "{look:?}");
@@ -127,7 +161,15 @@ fn quiet_means_the_operation_the_files_and_any_login_older_than_the_threshold() 
 }
 
 fn copy_of(look: &Look, at: u64) -> BusyCopy {
-    BusyCopy { op: look.op_key(), print: look.print.clone(), newest: look.newest, at, to: "/b/w1d1/devtest-a".into(), label: "w1d1/devtest-a".into() }
+    BusyCopy {
+        op: look.op_key(),
+        print: look.print.clone(),
+        newest: look.newest,
+        at,
+        to: "/b/w1d1/devtest-a".into(),
+        label: "w1d1/devtest-a".into(),
+        git: "/b/w1d1/devtest-a/ARENA_materials/.git".into(),
+    }
 }
 
 /// Part 2: a BUSY pod is copied when nothing since the operation started is recorded, when its
@@ -153,6 +195,38 @@ fn a_busy_pod_is_copied_only_when_unrecorded_changed_or_an_hour_old() {
     for (l, last, want) in cases {
         assert_eq!(copy_needed(l, last, n), want, "{last:?}");
     }
+}
+
+/// An earlier run's copy is trusted (to skip a copy, or to resolve on) only while it is under the
+/// backup dir as configured now and its `.git` is still on this machine (review ai-review codex
+/// #7): a copy deleted or moved since, a `LOCAL_BACKUP_DIR` changed since, or a record from before
+/// the `.git` was kept, is none — the pod is copied now.
+#[test]
+fn a_recorded_copy_counts_only_while_it_is_still_there_under_this_backup_dir() {
+    let base = std::env::temp_dir().join(format!("arena-copy-there-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let dir = base.join("backups").display().to_string();
+    let to = format!("{dir}/w1d1/devtest-a");
+    let git = format!("{to}/ARENA_materials/.git");
+    std::fs::create_dir_all(&git).unwrap();
+    let copy = BusyCopy { op: "merge 1 a".into(), print: "1-2".into(), newest: 1, at: 1, to: to.clone(), label: "w1d1/devtest-a".into(), git: git.clone() };
+    assert!(copy_still_there(&copy, &dir));
+    assert!(copy_still_there(&copy, &format!("{dir}/")), "a trailing slash is the same dir");
+    // LOCAL_BACKUP_DIR changed since (another dir; one that merely starts the same).
+    assert!(!copy_still_there(&copy, &base.join("elsewhere").display().to_string()));
+    assert!(!copy_still_there(&copy, &format!("{dir}-old")));
+    assert!(!copy_still_there(&copy, ""));
+    // A record from before the `.git` was kept, or one pointing outside its copy.
+    assert!(!copy_still_there(&BusyCopy { git: String::new(), ..copy.clone() }, &dir));
+    assert!(!copy_still_there(&BusyCopy { git: base.join("x/.git").display().to_string(), ..copy.clone() }, &dir));
+    // The copy gone (its `.git`, or the whole of it).
+    std::fs::remove_dir_all(&git).unwrap();
+    assert!(!copy_still_there(&copy, &dir));
+    std::fs::remove_dir_all(&base).unwrap();
+    assert!(!copy_still_there(&copy, &dir));
+    // An old record (no `git` field) reads back as none recorded there.
+    let old: BusyCopy = serde_json::from_str(r#"{"op":"merge 1 a","print":"1-2","newest":1,"at":1,"to":"/b/x","label":"w1d1/x"}"#).unwrap();
+    assert_eq!(old.git, "");
 }
 
 /// Part 1's gate: on, a look, an operation finished here and not a sequence, quiet, this run's
@@ -186,19 +260,21 @@ fn the_resolve_waits_for_quiet_and_a_copy_taken_after_the_last_change() {
 
 /// The record: missing = nothing recorded (copy); corrupt or another version = nothing recorded
 /// plus a warning (copy); written atomically, owner-only, each pod's own; a pod finished is
-/// forgotten, and a record a day old dropped.
+/// forgotten, and a record a day old dropped. Its state-dir lock is waited for only so long
+/// (review ai-review claude #12): held by another past the wait — an error, nothing written.
 #[test]
 fn the_copy_record_round_trips_and_a_missing_or_corrupt_one_means_copy() {
     let dir = std::env::temp_dir().join(format!("arena-busy-copies-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let path = dir.join("devtest").join(BUSY_COPIES_FILE);
     let n = 1_760_900_000;
+    let wait = RECORD_LOCK_WAIT;
     let look = look_at(n, Some(n - DAY), n - DAY, None);
     assert_eq!(BusyCopies::load(&path), (BusyCopies::default(), None), "missing: nothing recorded, no warning");
     assert_eq!(copy_needed(Some(&look), BusyCopies::load(&path).0.pods.get("devtest-a"), n), Some(CopyWhy::First));
     let a = copy_of(&look, n - 60);
     let b = BusyCopy { to: "/b/w1d1/devtest-b".into(), label: "w1d1/devtest-b".into(), ..a.clone() };
-    assert_eq!(record_busy_copies(&path, &[("devtest-a".into(), Some(a.clone())), ("devtest-b".into(), Some(b.clone()))], n).unwrap(), None);
+    assert_eq!(record_busy_copies(&path, &[("devtest-a".into(), Some(a.clone())), ("devtest-b".into(), Some(b.clone()))], n, wait).unwrap(), None);
     {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
@@ -208,44 +284,73 @@ fn the_copy_record_round_trips_and_a_missing_or_corrupt_one_means_copy() {
     assert_eq!((got.pods.get("devtest-a"), got.pods.get("devtest-b"), warning), (Some(&a), Some(&b), None));
     assert_eq!(copy_needed(Some(&look), got.pods.get("devtest-a"), n), None, "recorded and unchanged: not copied");
     // Finished: forgotten; the other kept. A day later, a write drops what's left.
-    record_busy_copies(&path, &[("devtest-a".into(), None)], n).unwrap();
+    record_busy_copies(&path, &[("devtest-a".into(), None)], n, wait).unwrap();
     assert_eq!(BusyCopies::load(&path).0.pods.keys().collect::<Vec<_>>(), ["devtest-b"]);
-    record_busy_copies(&path, &[], n + FORGET_AFTER_SECS).unwrap();
+    record_busy_copies(&path, &[], n + FORGET_AFTER_SECS, wait).unwrap();
     assert!(BusyCopies::load(&path).0.pods.is_empty(), "a day old: dropped");
     // Corrupt, or another version: nothing recorded (every BUSY pod copied), said; the next write replaces it.
     for bad in ["{not json", "{\"version\": 2, \"pods\": {}}", ""] {
         std::fs::write(&path, bad).unwrap();
         let (got, warning) = BusyCopies::load(&path);
         assert!(got.pods.is_empty(), "{bad}");
-        assert!(warning.as_deref().is_some_and(|w| w.starts_with("warning: ignoring ")), "{bad}: {warning:?}");
+        assert!(warning.as_deref().is_some_and(|w| w.starts_with("warning: ignoring ")), "{bad}");
         assert_eq!(copy_needed(Some(&look), got.pods.get("devtest-a"), n), Some(CopyWhy::First), "{bad}");
-        let warned = record_busy_copies(&path, &[("devtest-a".into(), Some(a.clone()))], n).unwrap();
+        let warned = record_busy_copies(&path, &[("devtest-a".into(), Some(a.clone()))], n, wait).unwrap();
         assert!(warned.is_some(), "{bad}");
         assert_eq!(BusyCopies::load(&path).0.pods.get("devtest-a"), Some(&a));
     }
+    // The state dir locked by another (the balance state, the health cache): waited for, not past
+    // the wait — then nothing written. Free again: written.
+    let holder = std::fs::File::open(path.parent().unwrap()).unwrap();
+    holder.lock().unwrap();
+    let started = std::time::Instant::now();
+    let e = record_busy_copies(&path, &[("devtest-a".into(), None)], n, std::time::Duration::from_millis(300)).unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "{e}");
+    assert!(started.elapsed() >= std::time::Duration::from_millis(300) && started.elapsed() < std::time::Duration::from_secs(5));
+    assert_eq!(BusyCopies::load(&path).0.pods.get("devtest-a"), Some(&a), "nothing written");
+    holder.unlock().unwrap();
+    record_busy_copies(&path, &[("devtest-a".into(), None)], n, std::time::Duration::from_millis(300)).unwrap();
+    assert!(BusyCopies::load(&path).0.pods.is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Where a copy holds the checkout: the pull is the home or a directory the checkout's top is in
+/// (or is) — the top every link resolved, or the configured repo path when it names that top
+/// through a link (setup's `/root/ARENA_materials -> /workspace/ARENA_materials`, which the pull
+/// splits out and copies as a tree in its place: review ai-review claude #6).
 #[test]
 fn a_copy_holds_the_checkout_when_it_pulls_the_home_or_a_dir_the_checkout_is_in() {
-    let look = |top: &str, home: &str| Look { top: top.into(), home: home.into(), ..look_at(1, Some(1), 1, None) };
-    let repo = look("/root/ARENA_materials", "/root");
-    let cases: [(&str, &Look, &str, bool); 11] = [
-        ("", &repo, "root", true),
-        ("~/", &repo, "root", true),
-        ("/root", &repo, "root", true),
-        ("/root/ARENA_materials/", &repo, "root", true),
-        ("/", &repo, "root", true),
-        ("/root/ARENA_materials/chapter1", &repo, "root", false),
-        ("/workspace", &repo, "root", false),
-        ("/root/ARENA", &repo, "root", false),
-        ("$HOME", &repo, "root", false),
+    let look = |top: &str, repo: Option<&str>, home: &str| Look { top: top.into(), repo: repo.map(String::from), home: home.into(), ..look_at(1, Some(1), 1, None) };
+    let repo = look("/root/ARENA_materials", Some("/root/ARENA_materials"), "/root");
+    // On the volume, linked from the home: the look's top is the volume's, its REPO the link.
+    let linked = look("/workspace/ARENA_materials", Some("/root/ARENA_materials"), "/root");
+    let unlinked = look("/workspace/ARENA_materials", None, "/root");
+    let cases: [(&str, &Look, &str, Option<&str>); 18] = [
+        ("", &repo, "root", Some("ARENA_materials")),
+        ("~/", &repo, "root", Some("ARENA_materials")),
+        ("/root", &repo, "root", Some("root/ARENA_materials")),
+        ("/root/", &repo, "root", Some("ARENA_materials")),
+        ("/root/ARENA_materials/", &repo, "root", Some("")),
+        ("/root/ARENA_materials", &repo, "root", Some("ARENA_materials")),
+        ("/", &repo, "root", Some("root/ARENA_materials")),
+        ("/root/ARENA_materials/chapter1", &repo, "root", None),
+        ("/workspace", &repo, "root", None),
+        ("/root/ARENA", &repo, "root", None),
+        ("$HOME", &repo, "root", None),
         // The home the look didn't say: the login's.
-        ("", &look("/home/ubuntu/ARENA_materials", ""), "ubuntu", true),
-        ("", &look("/root/ARENA_materials", ""), "ubuntu", false),
+        ("", &look("/home/ubuntu/ARENA_materials", None, ""), "ubuntu", Some("ARENA_materials")),
+        ("", &look("/root/ARENA_materials", None, ""), "ubuntu", None),
+        // Linked onto the volume: the home pull holds it where the link is; a pull of the volume
+        // where it really is.
+        ("", &linked, "root", Some("ARENA_materials")),
+        ("~/", &linked, "root", Some("ARENA_materials")),
+        ("/workspace/", &linked, "root", Some("ARENA_materials")),
+        ("", &unlinked, "root", None),
+        ("/workspace/", &unlinked, "root", Some("ARENA_materials")),
     ];
     for (remote_path, l, user, want) in cases {
-        assert_eq!(copy_holds(remote_path, l, user), want, "{remote_path:?} {} {user}", l.top);
+        assert_eq!(copy_place(remote_path, l, user).as_deref(), want, "{remote_path:?} {} {:?} {user}", l.top, l.repo);
+        assert_eq!(copy_holds(remote_path, l, user), want.is_some(), "{remote_path:?} {} {user}", l.top);
     }
 }
 
@@ -295,10 +400,12 @@ fn the_scripts_parse_under_sh() {
 
 /// A participant's checkout `work` on `autocommit-x` (pushed, with an upstream, to the bare
 /// `origin`), the course repo as its `upstream`; every git run with its own empty HOME and no
-/// system config (the build machine's own settings never count), and a `who` that lists nobody
-/// unless [`Repo::login`] says otherwise. The base commit, 20 days old, has `README.md`,
-/// `notes.py`, `old.py`, `data.bin` (binary), `link` (→ README.md), `sub dir/we*ird.py`, and a
-/// `.gitignore` of `ignored/`.
+/// system config (the build machine's own settings never count), a `who` that lists nobody
+/// unless [`Repo::login`] says otherwise, and the pod's `/dev/pts` and `/proc` stood in for by
+/// two directories of the sandbox, empty unless [`Repo::pts`] / [`Repo::process`] fill them (the
+/// build machine's own terminals and git processes — other tests' — never count). The base
+/// commit, 20 days old, has `README.md`, `notes.py`, `old.py`, `data.bin` (binary), `link` (→
+/// README.md), `sub dir/we*ird.py`, and a `.gitignore` of `ignored/`.
 #[cfg(unix)]
 struct Repo {
     base: PathBuf,
@@ -313,8 +420,9 @@ impl Repo {
     fn new(tag: &str) -> Repo {
         let base = std::env::temp_dir().join(format!("arena-resolve-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(base.join("home")).unwrap();
-        std::fs::create_dir_all(base.join("bin")).unwrap();
+        for d in ["home", "bin", "proc", "pts"] {
+            std::fs::create_dir_all(base.join(d)).unwrap();
+        }
         let r = Repo { origin: base.join("origin.git"), course: base.join("course"), work: base.join("work"), now: now(), base };
         r.login(None);
         r.git(&r.base, &["init", "-q", "--bare", r.origin.to_str().unwrap()]);
@@ -340,6 +448,12 @@ impl Repo {
         r
     }
 
+    /// `git pull upstream main`, which must conflict.
+    fn pull_conflicted(&self) {
+        let (ok, said) = self.git_try(&self.work, &["pull", "-q", "--no-rebase", "--no-edit", "upstream", "main"]);
+        assert!(!ok && self.work.join(".git/MERGE_HEAD").exists(), "no conflict: {said}");
+    }
+
     /// The stand-in `who`: nobody, or one login on a "tty" whose atime is `typed` seconds ago
     /// (a file under the sandbox, reached from `/dev/` by `..`).
     fn login(&self, typed: Option<u64>) {
@@ -359,6 +473,32 @@ impl Repo {
         std::fs::set_permissions(&who, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    /// A pseudo-terminal `/dev/pts/<n>` of the stand-in, last read `read` and written `written`
+    /// seconds ago; `None` removes it.
+    fn pts(&self, n: u32, used: Option<(u64, u64)>) {
+        let f = self.base.join("pts").join(n.to_string());
+        let Some((read, written)) = used else {
+            let _ = std::fs::remove_file(&f);
+            return;
+        };
+        std::fs::write(&f, "").unwrap();
+        for (flag, ago) in [("-a", read), ("-m", written)] {
+            let o = std::process::Command::new("touch").args([flag, "-d", &format!("@{}", self.now - ago)]).arg(&f).output().unwrap();
+            assert!(o.status.success());
+        }
+    }
+
+    /// A process of the stand-in `/proc`: its name, its arguments and its session; `None` removes it.
+    fn process(&self, pid: u32, it: Option<(&str, &[&str], u64)>) {
+        let d = self.base.join("proc").join(pid.to_string());
+        let _ = std::fs::remove_dir_all(&d);
+        let Some((name, args, sid)) = it else { return };
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("comm"), format!("{name}\n")).unwrap();
+        std::fs::write(d.join("cmdline"), args.iter().map(|a| format!("{a}\0")).collect::<String>()).unwrap();
+        std::fs::write(d.join("stat"), format!("{pid} ({name}) S 1 {pid} {sid} 0 -1 4194560 0 0 0 0\n")).unwrap();
+    }
+
     /// A command with the sandbox's environment.
     fn cmd(&self, dir: &Path, prog: &str) -> std::process::Command {
         let mut c = std::process::Command::new(prog);
@@ -369,6 +509,8 @@ impl Repo {
             .env("GIT_ALLOW_PROTOCOL", "file")
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_EDITOR", "true")
+            .env("ARENA_TEST_PROC_DIR", self.base.join("proc"))
+            .env("ARENA_TEST_PTS_DIR", self.base.join("pts"))
             .env("PATH", path);
         c
     }
@@ -438,7 +580,12 @@ impl Repo {
     }
 
     fn look(&self) -> Look {
-        let (code, out, err) = self.sh(&look_command(self.work.to_str().unwrap()));
+        self.look_of(self.work.to_str().unwrap())
+    }
+
+    /// The look of the repo at `repo` (as configured: a link to the checkout, say).
+    fn look_of(&self, repo: &str) -> Look {
+        let (code, out, err) = self.sh(&look_command(repo));
         assert_eq!(code, Some(0), "{out}{err}");
         parse_look(&out).unwrap_or_else(|| panic!("no look in: {out}{err}"))
     }
@@ -490,13 +637,19 @@ impl Repo {
     /// data.bin, link and `sub dir/we*ird.py` both changed, old.py changed here and deleted there.
     fn merge_conflict(&self, course_at: u64, mine_at: u64) {
         self.diverge(course_at, mine_at);
-        let (ok, said) = self.git_try(&self.work, &["pull", "-q", "--no-rebase", "--no-edit", "upstream", "main"]);
-        assert!(!ok, "no conflict: {said}");
-        assert!(self.work.join(".git/MERGE_HEAD").exists());
+        self.pull_conflicted();
     }
 
     fn unmerged(&self) -> String {
         self.git(&self.work, &["ls-files", "-u"])
+    }
+
+    /// Nothing touched by a refused resolve: the merge as it was (`conflicts`: `git ls-files -u`
+    /// before), nothing kept in `.git/arena-resolved/`.
+    fn untouched(&self, conflicts: &str, why: &str) {
+        assert!(self.work.join(".git/MERGE_HEAD").exists(), "{why}: the merge ended");
+        assert_eq!(self.unmerged(), conflicts, "{why}: a conflict resolved");
+        assert!(!self.work.join(".git/arena-resolved").exists(), "{why}: something done");
     }
 }
 
@@ -505,6 +658,14 @@ impl Drop for Repo {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.base);
     }
+}
+
+/// This test process's session (the 4th field after its name in `/proc/self/stat`): what the
+/// look, run from here, shares — its own processes.
+#[cfg(unix)]
+fn own_session() -> u64 {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+    stat.rsplit_once(") ").unwrap().1.split_whitespace().nth(3).unwrap().parse().unwrap()
 }
 
 /// The human's rule, on a merge left alone for 3h+: each conflicted path from the side whose
@@ -776,47 +937,77 @@ fn am_a_rebase_and_a_sequence_are_left_alone() {
     assert!(r.work.join(".git/CHERRY_PICK_HEAD").exists() && !r.unmerged().is_empty());
 }
 
-/// Activity keeps it BUSY: a merge started 10 minutes ago, a tracked or an untracked file changed
-/// 10 minutes ago (an operation older than the threshold, but recent edits), a terminal login that
-/// typed 10 minutes ago — the gate says so, and the script, called all the same, refuses and
-/// touches nothing. An ignored file changing counts for nothing, nor does an old login. And a
-/// change after the look the copy followed (even one that keeps the file's old mtime): refused.
+/// Activity keeps it BUSY (review ai-review codex #4, claude #5): a merge started 10 minutes ago, a
+/// tracked or an untracked file changed 10 minutes ago (an operation older than the threshold, but
+/// recent edits), something staged 10 minutes ago (the index), git's index locked, a terminal login
+/// that typed 10 minutes ago — and with no login at all (no utmp in the images' containers, VS
+/// Code's or Jupyter's terminals), a pseudo-terminal read or written 10 minutes ago, a git command
+/// running, an editor open on git's merge message: the gate says so, and the script, called all
+/// the same, refuses and touches nothing. Not activity: an ignored file changing, an old login or
+/// terminal, the look's own processes (its session), a filesystem monitor's daemon, a process that
+/// isn't git's. And a change after the look the copy followed (even one that keeps the file's old
+/// mtime): refused.
 #[cfg(unix)]
 #[test]
 fn recent_activity_or_a_change_since_the_copy_leaves_it_busy() {
     let r = Repo::new("recent");
     r.merge_conflict(r.now - 10 * DAY, r.now - 5 * DAY);
     let conflicts = r.unmerged();
-    let untouched = |r: &Repo, why: &str| {
-        assert!(r.work.join(".git/MERGE_HEAD").exists(), "{why}: the merge ended");
-        assert_eq!(r.unmerged(), conflicts, "{why}: a conflict resolved");
-        assert!(!r.work.join(".git/arena-resolved").exists(), "{why}: something done");
-    };
-    // (what changed 10 minutes ago, the gate's words, the script's)
-    type Recent<'a> = (Box<dyn Fn(&Repo)>, &'a str, &'a str);
-    let cases: Vec<Recent> = vec![
-        (Box::new(|r: &Repo| r.touch(".git/MERGE_HEAD", 600)), "the merge started less than 3h ago", "recent: the merge started less than 3h ago"),
-        (Box::new(|r: &Repo| r.touch("notes.py", 600)), "a file changed less than 3h ago", "recent: a file changed less than 3h ago"),
+    let busy = "a git command, or an editor one waits on, is running";
+    // (what happened, the gate's words, the script's)
+    type Recent<'a> = (Box<dyn Fn(&Repo)>, String, String);
+    let recent = |gate: &str| (gate.to_string(), format!("recent: {gate}"));
+    let mut cases: Vec<Recent> = Vec::new();
+    let mut add = |f: Box<dyn Fn(&Repo)>, (gate, script): (String, String)| cases.push((f, gate, script));
+    add(Box::new(|r: &Repo| r.touch(".git/MERGE_HEAD", 600)), recent("the merge started less than 3h ago"));
+    add(Box::new(|r: &Repo| r.touch("notes.py", 600)), recent("a file changed less than 3h ago"));
+    add(
+        Box::new(|r: &Repo| {
+            r.put("new.txt", b"new\n");
+            r.touch("new.txt", 600);
+        }),
+        recent("a file changed less than 3h ago"),
+    );
+    add(Box::new(|r: &Repo| r.touch(".git/index", 600)), recent("git's index changed less than 3h ago (something was staged)"));
+    add(
+        Box::new(|r: &Repo| std::fs::write(r.work.join(".git/index.lock"), "").unwrap()),
         (
-            Box::new(|r: &Repo| {
-                r.put("new.txt", b"new\n");
-                r.touch("new.txt", 600);
-            }),
-            "a file changed less than 3h ago",
-            "recent: a file changed less than 3h ago",
+            "git's index is locked (.git/index.lock): a git command is at work, or died holding it".to_string(),
+            "busy: git's index is locked (.git/index.lock): a git command is at work, or died holding it".to_string(),
         ),
-        (Box::new(|r: &Repo| r.login(Some(600))), "a terminal login typed less than 3h ago", "recent: a terminal login typed less than 3h ago"),
-    ];
-    for (recent, gate, script) in cases {
+    );
+    add(Box::new(|r: &Repo| r.login(Some(600))), recent("a terminal login typed less than 3h ago"));
+    add(Box::new(|r: &Repo| r.pts(3, Some((600, 5 * HOUR)))), recent("a terminal was used less than 3h ago"));
+    add(Box::new(|r: &Repo| r.pts(4, Some((5 * HOUR, 600)))), recent("a terminal was used less than 3h ago"));
+    add(
+        Box::new(|r: &Repo| r.process(4242, Some(("git", &["git", "commit"], 4242)))),
+        (format!("{busy} (pid 4242: git)"), format!("busy: {busy} (pid 4242: git)")),
+    );
+    add(
+        Box::new(|r: &Repo| r.process(4343, Some(("vim", &["vim", "/root/ARENA_materials/.git/MERGE_MSG"], 4300)))),
+        (format!("{busy} (pid 4343: vim)"), format!("busy: {busy} (pid 4343: vim)")),
+    );
+    add(
+        Box::new(|r: &Repo| r.process(4444, Some(("nano", &["nano", ".git/COMMIT_EDITMSG"], 4300)))),
+        (format!("{busy} (pid 4444: nano)"), format!("busy: {busy} (pid 4444: nano)")),
+    );
+    for (happened, gate, script) in cases {
         r.age(4 * HOUR);
-        recent(&r);
+        happened(&r);
         let look = r.look();
-        assert_eq!(not_quiet(&look, 3).as_deref(), Some(gate));
+        assert_eq!(not_quiet(&look, 3).as_deref(), Some(gate.as_str()), "{look:?}");
         let (code, rep, said) = r.resolve(3, &look);
-        assert_eq!((code, rep.refused.as_deref()), (Some(RESOLVE_REFUSED_EXIT), Some(script)), "{said}");
-        untouched(&r, gate);
+        assert_eq!((code, rep.refused.as_deref()), (Some(RESOLVE_REFUSED_EXIT), Some(script.as_str())), "{said}");
+        r.untouched(&conflicts, &gate);
         let _ = std::fs::remove_file(r.work.join("new.txt"));
+        let _ = std::fs::remove_file(r.work.join(".git/index.lock"));
         r.login(None);
+        for n in [3, 4] {
+            r.pts(n, None);
+        }
+        for pid in [4242, 4343, 4444] {
+            r.process(pid, None);
+        }
     }
     // Changed after the look the copy followed — same mtime, new content: refused.
     r.age(4 * HOUR);
@@ -825,16 +1016,69 @@ fn recent_activity_or_a_change_since_the_copy_leaves_it_busy() {
     r.touch("README.md", 4 * HOUR);
     let (code, rep, said) = r.resolve(3, &look);
     assert_eq!((code, rep.refused.as_deref()), (Some(RESOLVE_REFUSED_EXIT), Some("changed: files changed since the copy")), "{said}");
-    untouched(&r, "changed");
-    // An ignored file written now, an old login: quiet — finished.
+    r.untouched(&conflicts, "changed");
+    // An ignored file written now, an old login and terminal, the look's own git (its session), a
+    // filesystem monitor's daemon, a process that isn't git's: quiet — finished.
+    r.git(&r.work, &["checkout", "--conflict=merge", "--", "README.md"]);
     r.age(4 * HOUR);
     r.put("ignored/run.log", b"step 1\n");
     r.login(Some(5 * HOUR));
+    r.pts(5, Some((5 * HOUR, 5 * HOUR)));
+    r.process(5001, Some(("git", &["git", "status"], own_session())));
+    r.process(5002, Some(("git", &["git", "fsmonitor--daemon", "run"], 5002)));
+    r.process(5003, Some(("python3", &["python3", "train.py", "--resume"], 5003)));
     let look = r.look();
     assert_eq!(not_quiet(&look, 3), None, "{look:?}");
-    assert_eq!(look.input, Some(r.now - 5 * HOUR));
+    assert_eq!((look.input, look.tty), (Some(r.now - 5 * HOUR), Some(r.now - 5 * HOUR)));
     let (code, rep, said) = r.resolve(3, &look);
     assert_eq!((code, rep.resolved.map(|(w, s, ..)| (w, s))), (Some(0), Some(("merge".to_string(), "ours".to_string()))), "{said}");
+}
+
+/// A repo linked onto the volume (review ai-review claude #6): the look gives the checkout's top as
+/// it really is and the configured path that names it, so a pull of the home — which copies the
+/// tree in the link's place — counts as holding it.
+#[cfg(unix)]
+#[test]
+fn a_repo_linked_onto_a_volume_is_held_by_a_pull_of_the_home() {
+    let r = Repo::new("linked");
+    let home = r.base.join("home");
+    std::os::unix::fs::symlink(&r.work, home.join("ARENA_materials")).unwrap();
+    let configured = home.join("ARENA_materials").display().to_string();
+    let look = r.look_of(&configured);
+    let top = std::fs::canonicalize(&r.work).unwrap().display().to_string();
+    assert_eq!((look.top.clone(), look.repo.clone(), look.home.clone()), (top.clone(), Some(configured.clone()), home.display().to_string()));
+    assert_eq!(copy_place("", &look, "root").as_deref(), Some("ARENA_materials"));
+    assert_eq!(copy_place("", &Look { repo: None, ..look.clone() }, "root"), None, "the top alone isn't in the home");
+    // The configured path a directory elsewhere than the top (here: inside it): no REPO.
+    let inside = r.work.join("sub dir").display().to_string();
+    assert_eq!(r.look_of(&inside).repo, None);
+}
+
+/// The copy's fingerprint holds each file's ctime (review ai-review codex #6): a file replaced
+/// after the look by one of the same size, its old mtime kept (`cp -p`, `rsync -a`), is a change —
+/// refused. Quiet is judged by mtime still: files aged with `touch -d` are old.
+#[cfg(unix)]
+#[test]
+fn an_equal_size_replacement_that_keeps_the_mtime_is_a_change() {
+    let r = Repo::new("ctime");
+    r.merge_conflict(r.now - 5 * DAY, r.now - 10 * DAY);
+    r.age(4 * HOUR);
+    let look = r.look();
+    let conflicts = r.unmerged();
+    let was = r.read("README.md");
+    let mut now = was.clone();
+    let i = now.iter().position(|b| *b == b'c').unwrap();
+    now[i] = b'C';
+    let swap = r.base.join("swap");
+    std::fs::write(&swap, &now).unwrap();
+    let (code, _, err) = r.sh(&format!("touch -d @{} '{}' && cp -p '{}' '{}'", r.now - 4 * HOUR, swap.display(), swap.display(), r.work.join("README.md").display()));
+    assert_eq!(code, Some(0), "{err}");
+    let again = r.look();
+    assert_eq!((again.newest, r.read("README.md").len()), (look.newest, was.len()), "same mtime, same size");
+    assert_ne!(again.print, look.print);
+    let (code, rep, said) = r.resolve(3, &look);
+    assert_eq!((code, rep.refused.as_deref()), (Some(RESOLVE_REFUSED_EXIT), Some("changed: files changed since the copy")), "{said}");
+    r.untouched(&conflicts, "ctime");
 }
 
 /// A missing identity: refused, nothing touched — the resolve never makes one up (`-c user.*`).

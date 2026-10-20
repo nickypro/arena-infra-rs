@@ -13734,6 +13734,12 @@ struct Pulled {
     /// `<big root>/<pod>` — the pod's name is appended.
     snapshot_root: String,
     big_root: Option<String>,
+    /// The pods copied whole: every rsync planned for them, in both tiers — the snapshot's
+    /// uncapped `.git` pass among them — succeeded. Only such a copy may hold an operation's state
+    /// before it is finished (`resolve`): a pod left out for any reason (its lock busy, no
+    /// endpoint, a timeout, a tier or a pass that failed, not pulled at all) isn't here. Empty for a
+    /// pull with `--no-big` or `--no-git`.
+    whole: Vec<String>,
 }
 
 impl Pulled {
@@ -13843,9 +13849,17 @@ async fn pull_pods(
     );
 
     let targets = sel.named_targets(cfg)?;
+    // A pod with no endpoint isn't pulled: a failure for a caller that reports per pod (the
+    // backup's copy of a pod git didn't back up), though not a failed rsync for `pods pull`.
+    let unreachable: Vec<(String, String)> = sel
+        .pods
+        .iter()
+        .filter(|p| !targets.iter().any(|(n, _)| *n == p.name))
+        .map(|p| (p.name.clone(), "no SSH endpoint to pull from".to_string()))
+        .collect();
     if targets.is_empty() {
         println!("(no pods with an SSH endpoint to pull)");
-        return Ok(Pulled::default());
+        return Ok(Pulled { failed: unreachable, ..Pulled::default() });
     }
 
     // Per-pod tiers: (tier name, dest, config). `big` is dropped when --no-big. The snapshot
@@ -13910,7 +13924,7 @@ async fn pull_pods(
     // the whole wait is skipped — a failure of this run, named.
     let mut lock_failures: Vec<String> = Vec::new();
     // Every failure by pod too (`Pulled::failed`), for a caller that reports per pod.
-    let mut by_pod: Vec<(String, String)> = Vec::new();
+    let mut by_pod: Vec<(String, String)> = unreachable;
     let mut locks = match locking {
         LockMode::Held => PodLocks::default(),
         LockMode::Take(wait) => {
@@ -13962,6 +13976,8 @@ async fn pull_pods(
     println!("Pulling {total_pods} pod(s) into {dest_msg}…");
     // Every rsync: per pod, per tier, the home job — plus the repo job when it's split out.
     let mut planned = Vec::new();
+    // How many rsync jobs each pod has, and how many succeeded: all of them = copied whole.
+    let mut jobs_of: std::collections::HashMap<String, (usize, usize)> = Default::default();
     for (name, t) in &targets {
         for (tier, dest, pc) in tiers_for(name) {
             for job in arena_core::volume::pull_jobs(&pc, &dest, splits.get(name)) {
@@ -13970,6 +13986,7 @@ async fn pull_pods(
                     (true, "big") => "big repo",
                     (true, _) => "snapshot repo",
                 };
+                jobs_of.entry(name.clone()).or_default().0 += 1;
                 planned.push((name, t, tier, job));
             }
         }
@@ -14103,6 +14120,7 @@ async fn pull_pods(
                 let summary = stats.map_or_else(|| "done".into(), |s| s.summary());
                 say(&format!("[{done}/{jobs}] ✓ {name} [{tier}] ({summary}){moved}"));
                 ok += 1;
+                jobs_of.entry(name.clone()).or_default().1 += 1;
             }
             Err((git, Ok(o))) => {
                 let pass = if git { ", .git" } else { "" };
@@ -14143,7 +14161,16 @@ async fn pull_pods(
     }
     println!("\nDone: {ok} rsync job(s) ok, {failed} failed across {total_pods} pod(s).");
     failures.splice(0..0, lock_failures.iter().cloned());
-    Ok(Pulled { failures, failed: by_pod, snapshot_root: format!("{dir}/{label}"), big_root: (!no_big).then_some(big_root) })
+    let whole = if no_big || no_git {
+        Vec::new()
+    } else {
+        targets
+            .iter()
+            .map(|(n, _)| n.clone())
+            .filter(|n| jobs_of.get(n).is_some_and(|(all, ok)| *all > 0 && ok == all) && !by_pod.iter().any(|(p, _)| p == n))
+            .collect()
+    };
+    Ok(Pulled { failures, failed: by_pod, snapshot_root: format!("{dir}/{label}"), big_root: (!no_big).then_some(big_root), whole })
 }
 
 /// `p` absolute: canonical once it exists, else made absolute against the working directory (the
@@ -22632,6 +22659,7 @@ mod remote_tests {
             failed: vec![("devtest-cloud".into(), "[big] rsync exit 12".into())],
             snapshot_root: "/b/w41d5".into(),
             big_root: Some("/b/big".into()),
+            whole: vec![],
         });
         assert_eq!(
             fallback_lines(&unpushed, &pulled),
@@ -22716,7 +22744,7 @@ mod remote_tests {
         assert!(copied.len() == 3 && copied.iter().all(|d| d.ends_with("/devtest-bloom")), "only bloom, both tiers: {copied:?}");
         // Its line once copied.
         let pulled: anyhow::Result<Pulled> =
-            Ok(Pulled { failures: vec![], failed: vec![], snapshot_root: "/b/w41d5".into(), big_root: Some("/b/big".into()) });
+            Ok(Pulled { failures: vec![], failed: vec![], snapshot_root: "/b/w41d5".into(), big_root: Some("/b/big".into()), whole: vec![] });
         assert_eq!(
             fallback_lines(&[bloom], &pulled),
             [format!("✗ devtest-bloom: not backed up to git ({WRONG_WHY}) → files copied to /b/w41d5/devtest-bloom (and /b/big/devtest-bloom)")]
@@ -23049,7 +23077,7 @@ mod remote_tests {
         }
         // Its line after the copy: not "git push failed" — nothing was committed.
         let pulled: anyhow::Result<Pulled> =
-            Ok(Pulled { failures: vec![], failed: vec![], snapshot_root: "/b/w41d5".into(), big_root: Some("/b/big".into()) });
+            Ok(Pulled { failures: vec![], failed: vec![], snapshot_root: "/b/w41d5".into(), big_root: Some("/b/big".into()), whole: vec![] });
         assert_eq!(
             fallback_lines(std::slice::from_ref(&bloom), &pulled),
             [format!("✗ devtest-bloom: not backed up to git ({MERGE_WHY}) → files copied to /b/w41d5/devtest-bloom (and /b/big/devtest-bloom)")]

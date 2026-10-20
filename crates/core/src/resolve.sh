@@ -6,7 +6,7 @@
 # Rendered and parsed by arena_core::resolve (resolve_command / parse_resolve). <op> (`OP`'s
 # `<what> <mtime> <commit>`) and <print> (`PRINT`) are what the look before the copy saw: the
 # checkout is looked at again first, and anything changed since — or younger than <quiet secs>,
-# or unusual — and nothing is touched. Then each conflicted path is kept as the participant
+# anyone at work in git there, or unusual — and nothing is touched. Then each conflicted path is kept as the participant
 # resolved it by hand (a regular text file with no conflict markers left, both sides there),
 # else taken from the side whose commit is newer (committer time; a tie keeps HEAD's) — removed
 # when that side deleted it; the operation is finished (a merge: a merge commit; a cherry-pick or
@@ -63,6 +63,13 @@ input=$(val INPUT)
 [ $((now - mt)) -ge "$SECS" ] || refuse "recent: the $what started less than ${HOURS}h ago"
 [ $((now - newest)) -ge "$SECS" ] || refuse "recent: a file changed less than ${HOURS}h ago"
 [ -z "$input" ] || [ $((now - input)) -ge "$SECS" ] || refuse "recent: a terminal login typed less than ${HOURS}h ago"
+# Old enough (or not there): at least <quiet secs> before the pod's clock, never in its future.
+old() { [ -z "$1" ] || { [ "$1" -le "$now" ] && [ $((now - $1)) -ge "$SECS" ]; }; }
+old "$(val INDEX)" || refuse "recent: git's index changed less than ${HOURS}h ago (something was staged)"
+[ -z "$(val LOCKED)" ] || refuse "busy: git's index is locked (.git/index.lock): a git command is at work, or died holding it"
+old "$(val TTY)" || refuse "recent: a terminal was used less than ${HOURS}h ago"
+set -- $(val PROC)
+[ $# -eq 0 ] || refuse "busy: a git command, or an editor one waits on, is running (pid $1: ${2:-?})"
 [ -n "$(git config user.name)" ] && [ -n "$(git config user.email)" ] || refuse "no git identity configured in the repo"
 
 # --- Which side is newer ---------------------------------------------------------------------

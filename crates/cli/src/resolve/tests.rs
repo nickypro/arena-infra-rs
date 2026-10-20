@@ -1,14 +1,15 @@
 //! `pods backup` with a BUSY pod over a scripted `FakeRemote` and a stand-in rsync: the order
 //! (its backup, its look, its copy, its resolve, its backup again), its line, what keeps it from
-//! being finished (a failed copy, `BUSY_AUTO_RESOLVE_HOURS=0`, the resolve refusing or failing),
-//! and part 2's pacing of its copies (unchanged: none; changed or an hour old: copied; the record
-//! missing or corrupt: copied).
+//! being finished (a copy that failed in any part, `BUSY_AUTO_RESOLVE_HOURS=0`, the resolve
+//! refusing or failing), part 2's pacing of its copies (unchanged: none; changed or an
+//! hour old: copied; the record missing, corrupt, or of a copy gone since: copied), and the run's
+//! failures once a pod is finished.
 
-use super::Settled;
-use crate::{handle_full_backup, BackupFailed, Selected, Unpushed, BACKUP_TIMEOUT};
+use super::{Busy, BusyPod, Settled};
+use crate::{handle_full_backup, BackupFailed, LockMode, Selected, Unpushed, BACKUP_TIMEOUT};
 use arena_core::backup::{backup_command, BACKUP_BUSY_EXIT};
 use arena_core::remote::{FakeRemote, FakeReply, RemoteCall, PROBE_TIMEOUT};
-use arena_core::resolve::{self as core_resolve, BusyCopy};
+use arena_core::resolve::{self as core_resolve, BusyCopy, CopyWhy};
 use arena_core::{Config, Pod};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -45,8 +46,8 @@ fn fleet() -> Selected {
     Selected::all(vec![pod("apple", 22001), pod("bloom", 22002)])
 }
 
-/// A backup dir, a state dir and a stand-in rsync that logs each destination — and fails for
-/// bloom when `fail_bloom`.
+/// A backup dir, a state dir and a stand-in rsync that logs each destination and makes the copy's
+/// `.git` there (`<dest>/ARENA_materials/.git`) — and fails for bloom when `fail_bloom`.
 struct World {
     base: PathBuf,
 }
@@ -62,11 +63,35 @@ impl World {
     }
 
     fn rsync(&self, fail_bloom: bool) {
+        self.rsync_failing(if fail_bloom { "*devtest-bloom*" } else { "" }, "");
+    }
+
+    /// The stand-in rsync, failing when its destination matches `dest` (a `case` pattern) or its
+    /// arguments match `args`.
+    fn rsync_failing(&self, dest: &str, args: &str) {
         use std::os::unix::fs::PermissionsExt;
-        let fail = if fail_bloom { "case \"$last\" in *devtest-bloom*) echo 'rsync: No space left on device (28)' >&2; exit 11;; esac\n" } else { "" };
+        let mut fail = String::new();
+        if !dest.is_empty() {
+            fail.push_str(&format!("case \"$last\" in {dest}) echo 'rsync: No space left on device (28)' >&2; exit 11;; esac\n"));
+        }
+        if !args.is_empty() {
+            fail.push_str(&format!("case \"$*\" in {args}) echo 'rsync: read error' >&2; exit 23;; esac\n"));
+        }
         let script = self.base.join("rsync");
-        std::fs::write(&script, format!("#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\necho \"$last\" >> \"$(dirname \"$0\")/calls.log\"\n{fail}")).unwrap();
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\necho \"$last\" >> \"$(dirname \"$0\")/calls.log\"\n{fail}\
+                 mkdir -p \"$last/ARENA_materials/.git\"\n"
+            ),
+        )
+        .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// The backup dir.
+    fn dir(&self) -> String {
+        self.base.join("backups").display().to_string()
     }
 
     fn rsync_path(&self) -> String {
@@ -123,11 +148,16 @@ fn pushed(b: &str) -> FakeReply {
 /// bloom's look on the pod's clock `n`: a merge a day old; its newest file changed `newest_ago`
 /// seconds ago; the files' checksum `print`.
 fn look(n: u64, newest_ago: u64, print: &str) -> FakeReply {
-    FakeReply::stdout(&format!(
-        "NOW {n}\nTOP {REPO}\nHOME /root\nOP merge {} {SHA} 0\nNEWEST {} 40\nPRINT {print}\n",
+    FakeReply::stdout(&look_text(n, newest_ago, print))
+}
+
+fn look_text(n: u64, newest_ago: u64, print: &str) -> String {
+    format!(
+        "NOW {n}\nTOP {REPO}\nREPO {REPO}\nHOME /root\nOP merge {} {SHA} 0\nNEWEST {} 40\nPRINT {print}\nINDEX {}\n",
         n - 24 * HOUR,
-        n - newest_ago
-    ))
+        n - newest_ago,
+        n - 24 * HOUR
+    )
 }
 
 /// The pull's question to the pod: its repo is a plain directory.
@@ -264,7 +294,7 @@ async fn a_busy_pods_copy_is_paced_by_its_look() {
             let err = handle_full_backup(fake.clone(), &cfg, &fleet(), true, None, false, true, &rsync).await.unwrap_err();
             assert_eq!(err.to_string(), "1 pod(s) failed to back up");
             let calls = execs(&fake, 22002);
-            assert!(calls.len() <= 3 && !calls.iter().any(|(c, _)| c.contains("arena-resolve")), "{calls:#?}");
+            assert!(calls.len() <= 3 && !calls.iter().any(|(c, _)| c.contains(" arena-resolve ")), "{calls:#?}");
             (calls.len() == 3, crate::take_said())
         }
     };
@@ -291,7 +321,7 @@ async fn a_busy_pods_copy_is_paced_by_its_look() {
 
     // The recorded copy an hour old.
     let old = BusyCopy { at: now() - HOUR, ..w.recorded().unwrap() };
-    core_resolve::record_busy_copies(&w.record(), &[("devtest-bloom".into(), Some(old))], now()).unwrap();
+    core_resolve::record_busy_copies(&w.record(), &[("devtest-bloom".into(), Some(old))], now(), core_resolve::RECORD_LOCK_WAIT).unwrap();
     let (copied, _) = tick("33-44").await;
     assert!(copied, "an hour old: copied");
     assert_eq!(w.copied().len(), 3);
@@ -427,6 +457,136 @@ async fn a_pod_that_failed_before_its_push_stays_a_failure_when_another_is_finis
         assert_eq!(err.downcast_ref::<BackupFailed>().map(|f| f.pods.clone()), Some(vec!["devtest-apple".to_string()]), "{case}");
         let said = crate::take_said();
         assert!(said.iter().any(|l| l.starts_with("✓ devtest-bloom -> autocommit-b — finished a merge")), "{case}: {said:#?}");
+    }
+}
+
+/// A repo linked onto the `/workspace` volume (review ai-review claude #6): the look's top is the
+/// volume's, its configured path the link in the home — a pull of the home copies the tree in the
+/// link's place, so the copy holds it: recorded (its `.git` there), and the merge finished.
+#[tokio::test]
+async fn a_repo_linked_onto_the_volume_is_finished_from_a_pull_of_the_home() {
+    let w = World::new("linked");
+    let cfg = w.cfg("");
+    let fake = Arc::new(FakeRemote::new());
+    fake.script(&host(22001), [pushed("autocommit-a")]);
+    let n = now();
+    let linked = look_text(n, 4 * HOUR, "11-22").replace(&format!("TOP {REPO}\n"), "TOP /workspace/ARENA_materials\n");
+    fake.script(&host(22002), [busy(), FakeReply::stdout(&linked), repo_in_place(), resolved(), pushed("autocommit-b")]);
+    let _ = crate::take_said();
+    handle_full_backup(fake.clone(), &cfg, &fleet(), true, None, false, true, &w.rsync_path()).await.unwrap();
+    let calls = execs(&fake, 22002);
+    assert!(calls.len() == 5 && calls[3].0.contains(" arena-resolve "), "{calls:#?}");
+    // Without the link's path in the look, the top alone isn't in the home: no resolve.
+    let w = World::new("linked-unseen");
+    let fake = Arc::new(FakeRemote::new());
+    fake.script(&host(22001), [pushed("autocommit-a")]);
+    let unseen = linked.replace(&format!("REPO {REPO}\n"), "");
+    fake.script(&host(22002), [busy(), FakeReply::stdout(&unseen), repo_in_place(), resolved(), pushed("autocommit-b")]);
+    let err = handle_full_backup(fake.clone(), &w.cfg(""), &fleet(), true, None, false, true, &w.rsync_path()).await.unwrap_err();
+    assert_eq!(err.to_string(), "1 pod(s) failed to back up");
+    assert_eq!(execs(&fake, 22002).len(), 3, "no resolve");
+}
+
+/// An earlier run's record is trusted only while its copy is still there, under this backup dir
+/// (review ai-review codex #7): the copy deleted since — copied again (and a copy that then fails
+/// is never followed by a resolve, as it would be on the stale record); `LOCAL_BACKUP_DIR`
+/// changed since — copied into the new one.
+#[tokio::test]
+async fn a_record_whose_copy_is_gone_or_elsewhere_means_copy_now() {
+    let w = World::new("gone");
+    let cfg = w.cfg("");
+    let n = now();
+    // A tick whose resolve refuses: bloom copied and recorded, not finished.
+    let refuse = || FakeReply::exit(7, "").with_stdout("REFUSED changed: files changed since the copy\n");
+    let fake = Arc::new(FakeRemote::new());
+    fake.script(&host(22001), [pushed("autocommit-a")]);
+    fake.script(&host(22002), [busy(), look(n, 4 * HOUR, "55-66"), repo_in_place(), refuse()]);
+    let _ = handle_full_backup(fake.clone(), &cfg, &fleet(), true, None, false, true, &w.rsync_path()).await.unwrap_err();
+    let first = w.recorded().unwrap();
+    assert_eq!(first.git, format!("{}/ARENA_materials/.git", first.to));
+    assert_eq!(w.copied().len(), 3);
+    // Its copy deleted since; this tick's copy fails: not finished — the stale record never counts.
+    std::fs::remove_dir_all(&first.to).unwrap();
+    w.rsync(true);
+    let fake = Arc::new(FakeRemote::new());
+    fake.script(&host(22001), [pushed("autocommit-a")]);
+    fake.script(&host(22002), [busy(), look(n, 4 * HOUR, "55-66"), repo_in_place(), resolved(), pushed("autocommit-b")]);
+    let _ = handle_full_backup(fake.clone(), &cfg, &fleet(), true, None, false, true, &w.rsync_path()).await.unwrap_err();
+    let calls = execs(&fake, 22002);
+    assert_eq!(calls.len(), 3, "copied again (it failed), never resolved: {calls:#?}");
+    assert!(w.copied().iter().any(|p| p == "devtest-bloom"), "copied again");
+    // LOCAL_BACKUP_DIR changed since (the same state dir): copied into the new one, unchanged as it is.
+    w.rsync(false);
+    let fake = Arc::new(FakeRemote::new());
+    fake.script(&host(22001), [pushed("autocommit-a")]);
+    fake.script(&host(22002), [busy(), look(n, 600, "55-66"), repo_in_place()]);
+    let elsewhere = w.base.join("backups2");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let moved = w.cfg(&format!("LOCAL_BACKUP_DIR={}", elsewhere.display()));
+    let _ = handle_full_backup(fake.clone(), &moved, &fleet(), true, None, false, true, &w.rsync_path()).await.unwrap_err();
+    assert_eq!(execs(&fake, 22002).len(), 3, "copied");
+    let now_to = w.recorded().unwrap().to;
+    assert!(now_to.starts_with(&elsewhere.display().to_string()), "{now_to}");
+}
+
+/// A BUSY pod's copy counts — for its record and a resolve — only when whole (review ai-review
+/// claude #8): every rsync of both tiers, the snapshot's `.git` pass among them. Each way a copy
+/// can fall short leaves the pod in the pull's failures (but one never pulled at all) and out of
+/// its whole copies, and then it is neither recorded nor finished: its lock held by another
+/// backup, no endpoint, a timeout, the big tier failing, the `.git` pass failing, not pulled at all.
+#[tokio::test]
+async fn a_busy_pods_copy_counts_only_when_whole() {
+    // (case, the stand-in rsync's failing destination and arguments, extra config, bloom reachable,
+    // bloom copied instead of its git backup, the lock held, finished)
+    type Case<'a> = (&'a str, &'a str, &'a str, &'a str, bool, bool, bool, bool);
+    let cases: [Case; 7] = [
+        ("whole", "", "", "", true, true, false, true),
+        ("lock-busy", "", "", "", true, true, true, false),
+        ("no-endpoint", "", "", "", false, true, false, false),
+        ("timeout", "", "", "BACKUP_TIMEOUT_SECS=1", true, true, false, false),
+        ("big-tier", "*/big/devtest-bloom*", "", "", true, true, false, false),
+        ("git-pass", "", "*'--include */ --exclude *'*", "", true, true, false, false),
+        ("not-pulled", "", "", "", true, false, false, false),
+    ];
+    for (case, dest, args, extra, reachable, copied_instead, locked, finished) in cases {
+        let w = World::new(&format!("whole-{case}"));
+        w.rsync_failing(dest, args);
+        if case == "timeout" {
+            std::fs::write(w.base.join("rsync"), "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\nsleep 5\nmkdir -p \"$last/ARENA_materials/.git\"\n").unwrap();
+        }
+        let cfg = w.cfg(extra);
+        let n = now();
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22002), [repo_in_place(), resolved(), pushed("autocommit-b")]);
+        let remote: Arc<dyn arena_core::remote::Remote> = fake.clone();
+        let bloom = pod("bloom", 22002);
+        let (name, target) = Selected::all(vec![bloom.clone()]).named_targets(&cfg).unwrap().remove(0);
+        // apple, copied too (a failed push), always reachable: the pull isn't bloom's alone.
+        let sel = Selected::all(vec![pod("apple", 22001), arena_core::Pod { ssh_ip: reachable.then(|| "10.0.0.1".to_string()), ..bloom }]);
+        let u = |pod: &str, at_push| Unpushed { pod: pod.into(), why: "w".into(), branch: None, at_push, wrong_origin: false, busy: Some("merge".into()) };
+        let unpushed = [u("devtest-apple", true), u(&name, copied_instead)];
+        let held = locked.then(|| arena_core::pull::try_pod_lock_now(&w.dir(), &name).unwrap().unwrap());
+        let pulled = crate::copy_unpushed(&remote, &cfg, &w.dir(), &sel, &unpushed, &w.rsync_path(), LockMode::Take(Duration::from_millis(300))).await;
+        drop(held);
+        let p = pulled.as_ref().unwrap();
+        assert_eq!(p.whole.contains(&name), finished, "{case}: {:?}", p.whole);
+        assert_eq!(p.whole.contains(&"devtest-apple".to_string()), !matches!(case, "timeout" | "git-pass"), "{case}: apple {:?}", p.whole);
+        if !finished && copied_instead {
+            assert!(p.failed.iter().any(|(q, _)| *q == name), "{case}: in the pull's failures: {:?}", p.failed);
+        }
+        let look = core_resolve::parse_look(&look_text(n, 4 * HOUR, "11-22")).unwrap();
+        let busy = Busy {
+            hours: Some(3),
+            record: Some(w.record()),
+            copies: Default::default(),
+            pods: vec![BusyPod { name: name.clone(), target, why: "w".into(), look: Some(look), copy: Some(CopyWhy::First) }],
+            dir: w.dir(),
+            now: n,
+        };
+        let settled = busy.settle(&remote, &cfg, &pulled, false, None).await;
+        let resolves = execs(&fake, 22002).iter().filter(|(c, _)| c.contains(" arena-resolve ")).count();
+        assert_eq!((resolves, settled.done.contains(&name)), (usize::from(finished), finished), "{case}");
+        assert!(w.recorded().is_none(), "{case}: forgotten once finished, else never recorded");
     }
 }
 

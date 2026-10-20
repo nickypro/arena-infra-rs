@@ -60,16 +60,18 @@ pub fn auto_resolve_words(hours: Option<u64>, set: bool) -> String {
 const BUSY_OP_MARK: &str = "# @ARENA_BUSY_OP_SH@";
 const LOOK_SH_MARK: &str = "# @ARENA_LOOK_SH@";
 
-/// The look's shell function (`resolve_look.sh`): what is in progress and when anything in the
-/// checkout last changed, read-only. Its header lists the lines it prints ([`parse_look`]).
+/// The look's shell function (`resolve_look.sh`): what is in progress, when anything in the
+/// checkout last changed and whether anyone is at work in it, read-only. Its header lists the
+/// lines it prints ([`parse_look`]).
 fn look_sh() -> &'static str {
     include_str!("resolve_look.sh")
 }
 
-/// The look as a script of its own: `sh -c` it with the repo path. From the checkout's top.
+/// The look as a script of its own: `sh -c` it with the repo path (as configured: `REPO`). From
+/// the checkout's top.
 pub fn look_script() -> String {
     format!(
-        "set -u\ncd \"$1\" || exit 2\ncd \"$(git rev-parse --show-toplevel)\" || exit 2\nG=$(git rev-parse --absolute-git-dir) || exit 2\n\
+        "set -u\nREPO=$1\ncd \"$REPO\" || exit 2\ncd \"$(git rev-parse --show-toplevel)\" || exit 2\nG=$(git rev-parse --absolute-git-dir) || exit 2\n\
          {}\n{}\narena_look\n",
         crate::backup::BUSY_OP_SH,
         look_sh().trim_end()
@@ -113,8 +115,11 @@ pub const RESOLVE_FAILED_EXIT: i32 = 8;
 pub struct Look {
     /// The pod's clock.
     pub now: u64,
-    /// The checkout's top.
+    /// The checkout's top, every link resolved.
     pub top: String,
+    /// The configured repo path, when it names that top (a link onto the volume, or the top
+    /// itself): where a pull of the home finds the checkout.
+    pub repo: Option<String>,
     /// The login's home.
     pub home: String,
     /// What is in progress: `busy_op`'s word, or `none`.
@@ -130,10 +135,18 @@ pub struct Look {
     pub newest: u64,
     /// How many files that is.
     pub files: u64,
-    /// A checksum of every such file's mtime, size and path.
+    /// A checksum of every such file's mtime, size, ctime and path.
     pub print: String,
+    /// The index's mtime: something staged since.
+    pub index: Option<u64>,
+    /// git's index is locked (`.git/index.lock`): a git command is at work.
+    pub locked: bool,
     /// The latest keyboard input on a terminal login, if anyone is logged in.
     pub input: Option<u64>,
+    /// The latest use of any pseudo-terminal (`/dev/pts/N`), if there is one.
+    pub tty: Option<u64>,
+    /// A process at work in git (`<pid> <name>`): a `git` running, or an editor on its message.
+    pub at_work: Option<String>,
 }
 
 impl Look {
@@ -151,7 +164,7 @@ pub fn parse_look(stdout: &str) -> Option<Look> {
     for line in stdout.lines() {
         let line = line.trim_end_matches('\r');
         let (word, rest) = line.split_once(' ').unwrap_or((line, ""));
-        if matches!(word, "NOW" | "TOP" | "HOME" | "OP" | "NEWEST" | "PRINT" | "INPUT") {
+        if matches!(word, "NOW" | "TOP" | "REPO" | "HOME" | "OP" | "NEWEST" | "PRINT" | "INDEX" | "LOCKED" | "INPUT" | "TTY" | "PROC") {
             v.entry(word).or_insert(rest);
         }
     }
@@ -168,9 +181,11 @@ pub fn parse_look(stdout: &str) -> Option<Look> {
     if print.is_empty() {
         return None;
     }
+    let text = |k: &str| v.get(k).map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
     Some(Look {
         now: num(v.get("NOW")?)?,
         top: v.get("TOP")?.to_string(),
+        repo: text("REPO"),
         home: v.get("HOME").map(|h| h.to_string()).unwrap_or_default(),
         what,
         since,
@@ -179,7 +194,11 @@ pub fn parse_look(stdout: &str) -> Option<Look> {
         newest: num(newest)?,
         files: num(files)?,
         print: print.to_string(),
+        index: v.get("INDEX").and_then(|i| num(i)),
+        locked: v.contains_key("LOCKED"),
         input: v.get("INPUT").and_then(|i| num(i)),
+        tty: v.get("TTY").and_then(|i| num(i)),
+        at_work: text("PROC"),
     })
 }
 
@@ -191,9 +210,12 @@ pub fn finishes(what: &str) -> bool {
 }
 
 /// Why a look says the pod isn't quiet for `hours` — all on the pod's clock: the operation
-/// started less than that ago, a file git lists changed since, or a terminal login typed since
-/// (the one activity signal the pod has for free: `who`'s ttys). `None`: quiet. A time in the
-/// future (a clock set back) is never quiet. Pure.
+/// started less than that ago, a file git lists changed since, something was staged since (the
+/// index), git's index is locked, a terminal login typed or any terminal was used since, or a git
+/// command (or an editor one waits on) is running. `None`: quiet. A time in the future (a clock
+/// set back) is never quiet. Unsaved buffers in an editor or a notebook can't be seen: what
+/// reaches the disk is all a look knows, and the copy and `.git/arena-resolved/` keep the state
+/// before. Pure.
 pub fn not_quiet(look: &Look, hours: u64) -> Option<String> {
     let quiet = |t: u64| look.now.saturating_sub(t) >= hours * 3600 && t <= look.now;
     let Some(since) = look.since else { return Some(format!("no start time for the {}", look.what)) };
@@ -203,26 +225,68 @@ pub fn not_quiet(look: &Look, hours: u64) -> Option<String> {
     if !quiet(look.newest) {
         return Some(format!("a file changed less than {hours}h ago"));
     }
+    if look.index.is_some_and(|i| !quiet(i)) {
+        return Some(format!("git's index changed less than {hours}h ago (something was staged)"));
+    }
+    if look.locked {
+        return Some("git's index is locked (.git/index.lock): a git command is at work, or died holding it".to_string());
+    }
     if look.input.is_some_and(|i| !quiet(i)) {
         return Some(format!("a terminal login typed less than {hours}h ago"));
+    }
+    if look.tty.is_some_and(|i| !quiet(i)) {
+        return Some(format!("a terminal was used less than {hours}h ago"));
+    }
+    if let Some(p) = &look.at_work {
+        let (pid, name) = p.split_once(' ').unwrap_or((p.as_str(), "?"));
+        return Some(format!("a git command, or an editor one waits on, is running (pid {pid}: {name})"));
     }
     None
 }
 
-/// Whether the copy a pull makes holds the pod's checkout — its `.git` with it: the pull is the
-/// home (`remote_path` empty) or a directory the checkout's top is in (or is), the home being
-/// the one the look saw (else `/root` for root, `/home/<user>`). A pull of another path
-/// (`BACKUP_REMOTE_PATH`) may hold none of it, and a resolve then would leave the state before
-/// nowhere but on the pod. Pure.
-pub fn copy_holds(remote_path: &str, look: &Look, user: &str) -> bool {
+/// Where a pull's copy holds the pod's checkout — its `.git` with it — relative to the pod's
+/// directory in the copy (`ARENA_materials`; empty when the copy is the checkout itself), or
+/// `None` when it holds none of it. The pull is the home (`remote_path` empty) or a directory
+/// (`BACKUP_REMOTE_PATH`), the home being the one the look saw (else `/root` for root,
+/// `/home/<user>`). The checkout is found in it at its top, every link resolved ([`Look::top`]) —
+/// or, where the configured repo path names the top through a link ([`Look::repo`]: setup's
+/// `/root/ARENA_materials -> /workspace/ARENA_materials`), at that path, which the pull's own
+/// probe splits out and copies as a tree in its place (`volume::repo_pull_from`). A pull of
+/// another path may hold none of it, and a resolve then would leave the state before nowhere but
+/// on the pod. Pure.
+pub fn copy_place(remote_path: &str, look: &Look, user: &str) -> Option<String> {
     let home = match look.home.trim() {
         "" if user == "root" => "/root".to_string(),
         "" => format!("/home/{user}"),
         h => h.to_string(),
     };
-    let Some((root, _)) = crate::volume::resolve_remote_path(remote_path, &home) else { return false };
-    let (root, top) = (root.trim_end_matches('/'), look.top.trim_end_matches('/'));
-    top.starts_with('/') && (top == root || root.is_empty() || top.starts_with(&format!("{root}/")))
+    let (root, contents) = crate::volume::resolve_remote_path(remote_path, &home)?;
+    let root = root.trim_end_matches('/');
+    // rsync names a source without a trailing slash by its last component, under which it lands.
+    let named = root.rsplit('/').next().unwrap_or_default();
+    [Some(look.top.as_str()), look.repo.as_deref()].into_iter().flatten().find_map(|top| {
+        let top = top.trim_end_matches('/');
+        if !top.starts_with('/') {
+            return None;
+        }
+        let inner = if top == root {
+            ""
+        } else if root.is_empty() {
+            &top[1..]
+        } else {
+            top.strip_prefix(root)?.strip_prefix('/')?
+        };
+        Some(match (contents, inner) {
+            (true, inner) => inner.to_string(),
+            (false, "") => named.to_string(),
+            (false, inner) => format!("{named}/{inner}"),
+        })
+    })
+}
+
+/// Whether the copy a pull makes holds the pod's checkout, `.git` and all ([`copy_place`]). Pure.
+pub fn copy_holds(remote_path: &str, look: &Look, user: &str) -> bool {
+    copy_place(remote_path, look, user).is_some()
 }
 
 /// The copy record's file, in the fleet's state dir ([`crate::snapshot::state_file_path`]).
@@ -231,7 +295,9 @@ const BUSY_COPIES_VERSION: u32 = 1;
 
 /// The last copy of a BUSY pod that succeeded: for which operation ([`Look::op_key`]), the work
 /// tree it held ([`Look::print`], [`Look::newest`]: what the look before it saw), when (this
-/// machine's clock), and where (`to`: the snapshot dir; `label`: `<wNdM>/<pod>`).
+/// machine's clock), where (`to`: the snapshot dir; `label`: `<wNdM>/<pod>`), and where in it the
+/// checkout's `.git` is (`git`, on this machine: [`copy_still_there`]; empty in a record written
+/// before it was kept, which then counts as no copy).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BusyCopy {
     pub op: String,
@@ -240,6 +306,19 @@ pub struct BusyCopy {
     pub at: u64,
     pub to: String,
     pub label: String,
+    #[serde(default)]
+    pub git: String,
+}
+
+/// Whether an earlier run's record of a copy may still be trusted — to skip this tick's copy, or
+/// to resolve on: its copy is under the backup dir as it is configured now (`backup_dir`:
+/// `LOCAL_BACKUP_DIR` — one changed since means the record is of another tree), and the copy's
+/// `.git` is still there on this machine (a copy moved or deleted since is no copy). Else the pod
+/// is copied now. Reads the disk (one `stat`).
+pub fn copy_still_there(last: &BusyCopy, backup_dir: &str) -> bool {
+    let (to, git) = (Path::new(&last.to), Path::new(&last.git));
+    let dir = backup_dir.trim_end_matches('/');
+    !dir.is_empty() && to.starts_with(dir) && to != Path::new(dir) && git.starts_with(to) && git.is_dir()
 }
 
 /// Every pod's [`BusyCopy`], by name.
@@ -275,15 +354,48 @@ impl BusyCopies {
 /// renewed at least every [`COPY_EVERY_SECS`] — and is dropped at the next write.
 pub const FORGET_AFTER_SECS: u64 = 24 * 3600;
 
+/// How long [`record_busy_copies`] waits for the state dir's lock. Its other holders (the balance
+/// state, the health cache) hold it for a load and an atomic write; one held longer means
+/// something is wrong, and this run's record is then skipped (said) — every BUSY pod is copied
+/// again next run, the safe side — rather than the backup hanging on it.
+pub const RECORD_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Apply `changes` to the record at `path` — each pod's new copy, or `None` to forget it (a pod
 /// finished) — drop the records [`FORGET_AFTER_SECS`] old at `now`, and save it atomically
 /// (owner-only), under an exclusive lock on the state dir so two runs (the cron's and an
-/// operator's) can't drop each other's records. `Ok` carries the load warning, if the old file had
-/// to be ignored.
-pub fn record_busy_copies(path: &Path, changes: &[(String, Option<BusyCopy>)], now: u64) -> std::io::Result<Option<String>> {
+/// operator's) can't drop each other's records. The lock is tried, not waited on, for up to
+/// `wait` (blocking I/O: an async caller runs this off its runtime, `spawn_blocking`); still held
+/// then — `Err` (`WouldBlock`), nothing written. A filesystem with no `flock` still gets the
+/// atomic write. `Ok` carries the load warning, if the old file had to be ignored.
+pub fn record_busy_copies(
+    path: &Path,
+    changes: &[(String, Option<BusyCopy>)],
+    now: u64,
+    wait: std::time::Duration,
+) -> std::io::Result<Option<String>> {
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     crate::snapshot::create_private_dir(dir)?;
-    let lock = std::fs::File::open(dir).ok().filter(|f| f.lock().is_ok());
+    let lock = match std::fs::File::open(dir) {
+        Ok(f) => {
+            let deadline = std::time::Instant::now() + wait;
+            loop {
+                match f.try_lock() {
+                    Ok(()) => break Some(f),
+                    Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    Err(std::fs::TryLockError::WouldBlock) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            format!("{} stayed locked by another arena for {}s", dir.display(), wait.as_secs_f32()),
+                        ))
+                    }
+                    Err(std::fs::TryLockError::Error(_)) => break None,
+                }
+            }
+        }
+        Err(_) => None,
+    };
     let (mut copies, warning) = BusyCopies::load(path);
     copies.pods.retain(|_, c| now.saturating_sub(c.at) < FORGET_AFTER_SECS);
     for (pod, copy) in changes {
@@ -339,9 +451,10 @@ pub fn copy_needed(look: Option<&Look>, last: Option<&BusyCopy>, now: u64) -> Op
 /// This run's copy of a BUSY pod.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CopiedNow {
-    /// Copied, and the copy held its checkout ([`copy_holds`]).
+    /// Copied whole — every rsync of both tiers, the snapshot's uncapped `.git` pass among them —
+    /// and the copy held its checkout ([`copy_place`]).
     Yes,
-    /// Tried, and failed (or it didn't hold the checkout): never resolved this run.
+    /// Tried, and failed in any part (or it didn't hold the checkout): never resolved this run.
     Failed,
     /// Not copied this tick ([`copy_needed`]: unchanged since the recorded copy).
     No,
@@ -368,7 +481,8 @@ pub enum Hold {
 /// or why not. Every condition: the setting on (`hours`), a look, an operation this finishes and
 /// not a sequence, quiet for `hours` ([`not_quiet`]), this run's copy not failed, and a recorded
 /// copy of this operation taken after the work tree's last change — its look's files the same as
-/// now (`last`, which this run's own copy has just updated when there was one). Pure.
+/// now (`last`, which this run's own copy has just updated when there was one; the caller passes
+/// only a record whose copy is still there, [`copy_still_there`]). Pure.
 pub fn hold<'a>(hours: Option<u64>, look: Option<&Look>, copied: CopiedNow, last: Option<&'a BusyCopy>) -> std::result::Result<&'a BusyCopy, Hold> {
     let Some(hours) = hours else { return Err(Hold::Off) };
     let Some(look) = look else { return Err(Hold::NoLook) };
