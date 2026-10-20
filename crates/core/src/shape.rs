@@ -20,7 +20,12 @@
 //! (and nothing like a key), else it is `…` too; a command whose quoting doesn't close is
 //! `<command>` whole — where its words begin and end, and so which is the program, can't be told
 //! (review ai-review codex #1: `APP_CONFIG='{"password": "cohort-db-pass" }' python train.py`, cut
-//! at blanks, showed `cohort-db-pass` as the program and put it in the job's id).
+//! at blanks, showed `cohort-db-pass` as the program and put it in the job's id). So is one with a
+//! construct whose words this reading doesn't follow — `$(`, a backtick, `${`, `<(`, `>(`, `<<` —
+//! anywhere but in a `-c` script, which is `…` whatever it holds: a quote inside `"$(… "x" …)"` is
+//! the substitution's, not the end of the outer one, and read as the end it made a value the
+//! program (review ai-review codex #1, round two: `APP_CONFIG="$(printf '%s' "password:↵
+//! cohort-db-pass↵host: db")" python train.py` showed `cohort-db-pass`).
 //!
 //! What can still show is a word spelled exactly like a flag name (`-x`, `--fast`), a script's or
 //! a program's name: a value written so is the one shape that can't be told without knowing every
@@ -36,8 +41,14 @@ pub const ELIDED: &str = "…";
 pub const JOB: &str = "<job>";
 
 /// What a command whose words can't be told becomes (`words`: a quote left open, a backslash
-/// at its very end).
+/// at its very end; a construct this reading doesn't follow, [`FOREIGN`]).
 pub const UNREAD: &str = "<command>";
+
+/// What starts a construct whose words `words` doesn't follow — a command substitution (`$(`,
+/// a backtick), a parameter expansion with braces (`${`), a process substitution (`<(`, `>(`), a
+/// here-document (`<<`) — quoted or not: a command holding one outside a `-c` script is
+/// [`UNREAD`].
+const FOREIGN: [&str; 6] = ["$(", "`", "${", "<(", ">(", "<<"];
 
 /// A script or notebook a program runs, by its extension.
 const SCRIPTS: [&str; 4] = [".py", ".sh", ".ipynb", ".js"];
@@ -60,6 +71,8 @@ struct Word {
     quoted: bool,
     /// It begins with a bare `NAME=`: an environment assignment, when it comes before the program.
     assigns: bool,
+    /// Where it begins and ends in the command (char offsets, quotes included).
+    span: (usize, usize),
 }
 
 /// `cmd`'s words as POSIX `sh` splits them: blanks between words; `'…'` taken as it is; `"…"`, in
@@ -68,13 +81,14 @@ struct Word {
 /// is nothing at all. `None` when the quoting doesn't close — a quote left open, a backslash
 /// ending it all: where a word ends can't be told, nor which word is the program. Operators
 /// (`;`, `&&`, `|`, `>`), expansions and comments are read as a word's characters: a shape needs
-/// no more than where each word begins and ends.
+/// no more than where each word begins and ends — and where that can't be told past a
+/// [`FOREIGN`] construct, [`command`] reads no further than it.
 fn words(cmd: &str) -> Option<Vec<Word>> {
     let mut out = Vec::new();
     let mut word: Option<Word> = None;
-    let mut it = cmd.chars().peekable();
+    let mut it = Counted { chars: cmd.chars().peekable(), read: 0 };
     while let Some(c) = it.next() {
-        if c == '\\' && it.peek() == Some(&'\n') {
+        if c == '\\' && it.chars.peek() == Some(&'\n') {
             it.next();
             continue;
         }
@@ -82,7 +96,8 @@ fn words(cmd: &str) -> Option<Vec<Word>> {
             out.extend(word.take());
             continue;
         }
-        let w = word.get_or_insert_with(Word::default);
+        let at = it.read - 1;
+        let w = word.get_or_insert_with(|| Word { span: (at, at), ..Word::default() });
         match c {
             '\'' => {
                 w.quoted = true;
@@ -120,9 +135,34 @@ fn words(cmd: &str) -> Option<Vec<Word>> {
             }
             c => w.text.push(c),
         }
+        w.span.1 = it.read;
     }
     out.extend(word);
     Some(out)
+}
+
+/// A command's chars, counting those read: where each word begins and ends.
+struct Counted<'a> {
+    chars: std::iter::Peekable<std::str::Chars<'a>>,
+    read: usize,
+}
+
+impl Iterator for Counted<'_> {
+    type Item = char;
+
+    fn next(&mut self) -> Option<char> {
+        let c = self.chars.next()?;
+        self.read += 1;
+        Some(c)
+    }
+}
+
+/// Where each [`FOREIGN`] construct in `cmd` begins (char offsets).
+fn foreign_at(cmd: &str) -> Vec<usize> {
+    let chars: Vec<char> = cmd.chars().collect();
+    (0..chars.len())
+        .filter(|&i| FOREIGN.iter().any(|f| f.chars().enumerate().all(|(k, c)| chars.get(i + k) == Some(&c))))
+        .collect()
 }
 
 /// A shell variable's name: `[A-Za-z_][A-Za-z0-9_]*`.
@@ -243,9 +283,14 @@ enum Last {
 /// - `bash -lc 'sshpass -p X ssh host'` → `bash -c …` (and `python -c '…'` → `python -c …`);
 /// - `sh /root/.arena/jobs/<id>/run` → `sh <job>`;
 /// - `APP_CONFIG='{"password": "x y" }' python train.py` → `… python train.py`;
-/// - `python -c 'print(1)` (a quote left open) → `<command>`.
+/// - `python -c 'print(1)` (a quote left open) → `<command>`;
+/// - `X="$(cat k)" python x.py`, `python x.py --k ${K}`, `cat <<EOF` → `<command>`, but
+///   `bash -c 'echo $(date)'` → `bash -c …`.
 pub fn command(cmd: &str) -> String {
     let Some(words) = words(cmd) else { return UNREAD.to_string() };
+    // The first word a FOREIGN construct is in: the words from it on can't be told.
+    let foreign = foreign_at(cmd);
+    let odd = words.iter().position(|w| foreign.iter().any(|&i| (w.span.0..w.span.1).contains(&i)));
     let mut out: Vec<String> = Vec::new();
     // Every leading `NAME=value` — each a whole word, its value's quoted blanks in it: the
     // shell's assignments, before the program.
@@ -253,12 +298,20 @@ pub fn command(cmd: &str) -> String {
     if at > 0 {
         out.push(ELIDED.to_string());
     }
-    let words: Vec<&str> = words[at..].iter().map(|w| w.text.as_str()).collect();
-    let Some(&first) = words.first() else { return out.join(" ") };
+    let texts: Vec<&str> = words[at..].iter().map(|w| w.text.as_str()).collect();
+    let Some(&first) = texts.first() else {
+        return if odd.is_some() { UNREAD.to_string() } else { out.join(" ") };
+    };
     let prog = program(first);
-    let rest = &words[1..];
-    if runs_code(&prog, rest) {
+    let rest = &texts[1..];
+    // A `-c` script is `…` whatever it holds: a construct in it, or after it, is fine — every word
+    // before it (assignments, the program, its flags) read whole.
+    let code_at = at + 1 + rest.iter().take_while(|w| w.starts_with('-')).count();
+    if runs_code(&prog, rest) && odd.is_none_or(|odd| odd >= code_at) {
         return [out, vec![prog, "-c".to_string(), ELIDED.to_string()]].concat().join(" ");
+    }
+    if odd.is_some() {
+        return UNREAD.to_string();
     }
     let py = python(&prog);
     out.push(prog);
@@ -465,6 +518,44 @@ mod tests {
         assert_eq!(command("python train.py \\\n --token \"cohort\""), "python train.py --token …");
     }
 
+    /// Review ai-review codex #1, round two (lane ASK9 item 2): a construct whose words this
+    /// reading doesn't follow — `$(`, a backtick, `${`, `<(`, `>(`, `<<`, quoted or not — makes
+    /// the whole command `<command>` (the review's example: the quote inside `"$(… "password:`
+    /// read as the outer one's end made `cohort-db-pass` the program), unless it's in a `-c`
+    /// script or after it, which is `…` whatever it holds; before that script — an assignment, the
+    /// program, a flag — it's `<command>` too. A plain `$NAME` is no such construct.
+    #[test]
+    fn a_construct_this_reading_doesnt_follow_is_unread() {
+        let example = "APP_CONFIG=\"$(printf '%s' \"password:\n  cohort-db-pass\nhost: db\")\" python train.py";
+        for cmd in [
+            example,
+            "TOKEN=$(echo hunter2 | base64) python x.py",
+            "python x.py --key `cat cohort.key`",
+            "python x.py --key ${COHORT_KEY}",
+            "diff <(cat cohort.txt) b.py",
+            "tee >(gzip > cohort.gz) x.py",
+            "cat <<EOF\ncohort-db-pass\nEOF",
+            "python x.py --k '$(cohort)'",
+            "X=$(cohort) bash -c 'python x.py'",
+            "bash --rcfile=$(cohort) -c 'python x.py'",
+            "${COHORT} x.py",
+            "$(cohort)",
+        ] {
+            assert_eq!(command(cmd), UNREAD, "{cmd}");
+        }
+        for (cmd, want) in [
+            ("bash -c 'echo $(date) `whoami` ${HOME} <(x) <<EOF'", "bash -c …"),
+            ("sh -c \"x=\\\"$(printf '%s' \\\"cohort pass\\\")\\\"; y\"", "sh -c …"),
+            ("bash -lc 'run' $(cohort) `cohort`", "bash -c …"),
+            ("python3 -c \"import os; os.system('$(cohort)')\"", "python3 -c …"),
+            ("X=1 bash -c 'echo ${X}'", "… bash -c …"),
+            ("\"$PY\" x.py --dir $HOME/w", "… x.py --dir …"),
+            ("python x.py 2>&1 > log", "python x.py …"),
+        ] {
+            assert_eq!(command(cmd), want, "{cmd}");
+        }
+    }
+
     /// Lane ASK8 item 1: a program's, a script's or a module's name is shown only as 1 to 40 of
     /// `[A-Za-z0-9._+-]` — quotes, braces, an expansion, or a 41st byte make it `…`.
     #[test]
@@ -508,6 +599,9 @@ mod tests {
             Some(vec![w("a", false), w("b c", false), w("d \" $e \\x", false), w("f g", false), w("hi", false), w("", false), w("X=1", true), w("Y=2", false), w("Z=3", false), w("_q=a b=c", true)])
         );
         assert_eq!(read("  \t\n "), Some(vec![]));
+        // Where each word is in the command, quotes included.
+        let spans = |cmd: &str| words(cmd).unwrap().into_iter().map(|w| w.span).collect::<Vec<_>>();
+        assert_eq!(spans(" ab 'c d'\\\n e\"f\" "), vec![(1, 3), (4, 9), (12, 16)]);
         assert_eq!(read("a \\\n b"), Some(vec![w("a", false), w("b", false)]));
         for open in ["'", "\"", "a\\", "\"a\\\"", "'a'\"b"] {
             assert!(read(open).is_none(), "{open}");

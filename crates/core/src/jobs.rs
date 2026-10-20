@@ -87,7 +87,8 @@ const SALT_LEN: usize = 6;
 const PARTIAL_MAX: usize = 64 * 1024;
 
 /// A job's id: `YYYYMMDD-HHMMSS-<slug>--<salt>` (UTC start time, a slug of the command's shape,
-/// six random hex digits), e.g. `20261008-142301-pytest-x-k--3fa9c1`; one made before has no
+/// six random hex digits), e.g. `20261008-142301-pytest-x-k--3fa9c1` — or `YYYYMMDD-HHMMSS--<salt>`
+/// when the command's shape can't be told (`<command>`: no slug); one made before has no
 /// salt and slugs the command as typed (`20261008-142301-pytest-x-tests`) — it keeps its name,
 /// and every read and `--kill` takes it as before. Sorting ids sorts jobs by start time, the same
 /// id names the run on every pod of a fleet start, and the alphabet (`[0-9a-z-]`) is safe to
@@ -113,7 +114,9 @@ impl JobId {
     pub fn named(unix_secs: u64, cmd: &str, salt: &str) -> JobId {
         let (y, m, d) = crate::schedule::civil_from_days((unix_secs / 86_400) as i64);
         let s = unix_secs % 86_400;
-        JobId(format!("{y:04}{m:02}{d:02}-{:02}{:02}{:02}-{}--{salt}", s / 3600, s % 3600 / 60, s % 60, masked_slug(cmd)))
+        let slug = masked_slug(cmd);
+        let slug = if slug.is_empty() { slug } else { format!("-{slug}") };
+        JobId(format!("{y:04}{m:02}{d:02}-{:02}{:02}{:02}{slug}--{salt}", s / 3600, s % 3600 / 60, s % 60))
     }
 
     /// Whether this id is one [`JobId::generate`] made for `cmd`: its time, the slug of `cmd`'s
@@ -121,8 +124,9 @@ impl JobId {
     /// one carrying its command as typed is never taken for one (`pods ask` shows only these
     /// whole).
     pub fn named_from(&self, cmd: &str) -> bool {
-        let tail = self.0.get(15..).and_then(|t| t.strip_prefix('-'));
-        let salt = tail.and_then(|t| t.strip_prefix(masked_slug(cmd).as_str())).and_then(|r| r.strip_prefix("--"));
+        let slug = masked_slug(cmd);
+        let tail = self.0.get(15..).and_then(|t| if slug.is_empty() { Some(t) } else { t.strip_prefix('-') });
+        let salt = tail.and_then(|t| t.strip_prefix(slug.as_str())).and_then(|r| r.strip_prefix("--"));
         salt.is_some_and(|s| s.len() == SALT_LEN && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
     }
 
@@ -183,9 +187,15 @@ pub fn split_job_arg(words: &[String]) -> Result<(Vec<String>, Option<JobId>), S
 /// An id's slug for `cmd` ([`JobId::generate`]): [`slug`] of the command's shape
 /// ([`crate::shape::command`]: the program, the script it runs, its flag names — no value of it),
 /// the pure, small rule `pods ask` sends commands by — never `ask::redact`'s masking, whose
-/// patterns job creation has no business reading.
+/// patterns job creation has no business reading. Empty — no slug, the id the time and the salt
+/// alone — when the shape can't be told ([`crate::shape::UNREAD`]): nothing of such a command
+/// names a job.
 pub fn masked_slug(cmd: &str) -> String {
-    slug(&crate::shape::command(cmd))
+    let shape = crate::shape::command(cmd);
+    if shape == crate::shape::UNREAD {
+        return String::new();
+    }
+    slug(&shape)
 }
 
 /// [`SALT_LEN`] hex digits that differ per call: std's randomly keyed hasher (keyed from the OS's
@@ -1046,10 +1056,14 @@ mod tests {
             ("MY_SECRET='two words' python x.py", "20261008-142301-python-x-py--c0ffee"),
             // The shell's words (review ai-review codex #1, lane ASK8 item 1): a quoted value with
             // blanks is one word, every leading assignment is taken before the program, and
-            // quoting that doesn't close leaves nothing of the command but `<command>`.
+            // quoting that doesn't close leaves nothing of the command but `<command>`, and no slug.
             ("APP_CONFIG='{\"password\": \"cohort-db-pass\" }' python train.py", "20261008-142301-python-train-py--c0ffee"),
             ("DB_PASS='correct horse battery staple' python train.py", "20261008-142301-python-train-py--c0ffee"),
-            ("APP_CONFIG='{\"password\": \"cohort-db-pass\" } python train.py", "20261008-142301-command--c0ffee"),
+            ("APP_CONFIG='{\"password\": \"cohort-db-pass\" } python train.py", "20261008-142301--c0ffee"),
+            // A construct the shape's reading doesn't follow (review ai-review codex #1, lane ASK9
+            // item 2): no slug either.
+            ("APP_CONFIG=\"$(printf '%s' \"password:\n  cohort-db-pass\nhost: db\")\" python train.py", "20261008-142301--c0ffee"),
+            ("python train.py --token ${TOKEN}", "20261008-142301--c0ffee"),
             ("ÜBER — ✓", "20261008-142301-job--c0ffee"),
             ("'$@!'", "20261008-142301-job--c0ffee"),
             ("", "20261008-142301-job--c0ffee"),
@@ -1110,13 +1124,14 @@ mod tests {
             "python train.py --token \"cohort horse",
             "'{cohort}' train.py",
             "\"cohort horse\" train.py",
+            "APP_CONFIG=\"$(printf '%s' \"password:\n  cohort-db-pass\nhost: db\")\" python train.py",
         ] {
             let id = JobId::generate(t, cmd);
             for value in ["cohort", "password", "horse", "staple", "db-pass"] {
                 assert!(!id.as_str().contains(value), "{value} in {id} ({cmd})");
             }
             assert!(id.named_from(cmd) && JobId::parse(id.as_str()).is_ok(), "{id}");
-            assert!(id.as_str().contains("-train-py--") || id.as_str().contains("-command--"), "{id}");
+            assert!(id.as_str().contains("-train-py--") || id.as_str()[15..].starts_with("--"), "{id}");
         }
     }
 

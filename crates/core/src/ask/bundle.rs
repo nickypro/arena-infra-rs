@@ -1431,22 +1431,26 @@ mod tests {
     /// Review ai-review codex #1 (lane ASK8 item 1), through the bundle: a job started with a quoted
     /// assignment in front — `APP_CONFIG='{"password": "cohort-db-pass" }' python train.py` — is
     /// sent as `… python train.py`, under an id named `python-train-py` and shown whole; a job
-    /// whose quoting doesn't close as `<command>`, its id `command`. No piece of a value in
-    /// either — neither in the jobs, nor in the log's header, nor in the wrapper's process.
+    /// whose quoting doesn't close as `<command>`, its id the time and the salt alone — and so is
+    /// one whose assignment holds a command substitution with quotes of its own (codex #1 again,
+    /// lane ASK9 item 2: `APP_CONFIG="$(printf '%s' "password:↵  cohort-db-pass↵host: db")"
+    /// python train.py`). No piece of a value in any — neither in the jobs, nor in the log's
+    /// header, nor in the wrapper's process.
     #[test]
     fn a_quoted_assignment_reaches_the_bundle_as_its_shape_alone() {
         for (cmd, shape, slug) in [
-            ("APP_CONFIG='{\"password\": \"cohort-db-pass\" }' python train.py", "… python train.py", "python-train-py"),
-            ("DB_PASS='correct horse battery staple' python train.py --lr 7e-5", "… python train.py --lr …", "python-train-py-lr"),
-            ("APP_CONFIG='{\"password\": \"cohort-db-pass\" } python train.py", "<command>", "command"),
+            ("APP_CONFIG='{\"password\": \"cohort-db-pass\" }' python train.py", "… python train.py", "-python-train-py"),
+            ("DB_PASS='correct horse battery staple' python train.py --lr 7e-5", "… python train.py --lr …", "-python-train-py-lr"),
+            ("APP_CONFIG='{\"password\": \"cohort-db-pass\" } python train.py", "<command>", ""),
+            ("APP_CONFIG=\"$(printf '%s' \"password:\n  cohort-db-pass\nhost: db\")\" python train.py", "<command>", ""),
         ] {
             let id = jobs::JobId::named(1_792_404_900, cmd, fixtures::SALT).as_str().to_string();
-            assert_eq!(id, format!("20261019-101500-{slug}--c0ffee"));
+            assert_eq!(id, format!("20261019-101500{slug}--c0ffee"));
             let text = bundle(&busy_reply("", "", cmd), BUNDLE_CAP);
             for want in [format!("{id} — running (pid 777), started 2026-10-08T14:23:01Z: {shape}\n"), format!("newest job's log ({id}, still running)"), "up 1h0m: sh <job>\n".into()] {
                 assert!(text.contains(&want), "missing {want:?} in\n{text}");
             }
-            for value in ["cohort", "password", "horse", "staple", "7e-5", "APP_CONFIG", "DB_PASS"] {
+            for value in ["cohort", "password", "horse", "staple", "7e-5", "APP_CONFIG", "DB_PASS", "db-pass", "printf"] {
                 assert!(!text.contains(value), "{value} reached the bundle:\n{text}");
             }
         }
