@@ -250,7 +250,8 @@ impl DeepFacts {
     /// than `nvidia-smi -L` lists slices. Each slice has one parent card, so the rest are whole,
     /// and the slices are no count to hold torch to: such a machine is counted as whole GPUs, as
     /// before the MIG fallback. One whose whole cards don't outnumber its slices can't be told
-    /// from a pure MIG one by these facts — not supported (README); it is counted as MIG.
+    /// from a pure MIG one by these facts — not supported (docs/REFERENCE.md); it is counted as
+    /// MIG.
     fn mixed_inventory(&self) -> bool {
         match (self.mig_devices.filter(|&s| s > 0), self.smi_count()) {
             (Some(slices), Some(cards)) => cards > slices,

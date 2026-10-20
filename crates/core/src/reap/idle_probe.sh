@@ -175,7 +175,7 @@ o scan_from "$S"
 
 # --- Outside the home: what the reap's backup (the home, links copied as links) never reads ----
 # The system, installed software and caches — never a participant's only copy (documented in
-# the README): where a link from the home may point, and what the roots scan passes over.
+# docs/BACKUPS.md): where a link from the home may point, and what the roots scan passes over.
 junk() {
     case "$1" in
         /usr | /usr/* | /etc | /etc/* | /bin | /bin/* | /sbin | /sbin/* | /lib | /lib/* | /lib32 | /lib32/* | /lib64 | /lib64/* \

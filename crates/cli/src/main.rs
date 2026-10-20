@@ -16113,7 +16113,7 @@ mod replacement_spec_tests {
     /// common path, `placement_request` → `None`) labels its option through
     /// `single_option_plan`, with an unpriced book: no catalog, so a MIG slice keeps its id in
     /// the READY line and placement text (`READY … — 1×B300 SXM6 AC MIG 1g.34gb SECURE`, live
-    /// BPF S6) while `pods list` says `1×B300 MIG 34GB` — README claims they now match.
+    /// BPF S6) while `pods list` says `1×B300 MIG 34GB` — docs/REFERENCE.md claims they now match.
     #[test]
     fn review_g4_single_spec_up_labels_a_mig_slice_as_pods_list_does() {
         let spec = PodSpec {
@@ -16716,7 +16716,7 @@ mod selection_tests {
     /// summary (`about`: its line in the parent's command list) of at most 70 characters,
     /// every argument has help whose first line is at most 100 and whose `--help` text is at
     /// most 300, and every command's `--help` text (`long_about`) is at most 800. Details
-    /// belong in README.md / FEATURE_MAP.md, not here.
+    /// belong in docs/REFERENCE.md / FEATURE_MAP.md, not here.
     #[test]
     fn help_text_stays_short() {
         use clap::CommandFactory;
@@ -16756,7 +16756,7 @@ mod selection_tests {
         cli.build();
         let mut bad = Vec::new();
         walk(&cli, "arena".to_string(), &mut bad);
-        assert!(bad.is_empty(), "help text missing or too long (details go in README.md):\n{}", bad.join("\n"));
+        assert!(bad.is_empty(), "help text missing or too long (details go in docs/REFERENCE.md):\n{}", bad.join("\n"));
     }
 
     /// Shortening the help never drops a warning: the commands and flags that wipe, delete or
@@ -21965,7 +21965,7 @@ mod remote_tests {
             .unwrap();
         assert_eq!(fake.calls().len(), 3);
         assert_eq!(stub.take_args().len(), 9);
-        // BACKUP_REMOTE_PATH=~/ (the README's default, what the */15 cron reads) used to skip
+        // BACKUP_REMOTE_PATH=~/ (docs/BACKUPS.md's default, what the */15 cron reads) used to skip
         // the question and back up the link alone; it's the home: split like one.
         let linked = || FakeReply::stdout("arena-repo-home=/root\narena-repo-real=/workspace/ARENA_materials\narena-repo-mount=yes\n");
         let cron = Config::parse(&format!("{text}BACKUP_REMOTE_PATH=~/\n"));

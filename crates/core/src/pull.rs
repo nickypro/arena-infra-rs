@@ -355,7 +355,7 @@ impl PullConfig {
 /// B-RS2: the earlier list left out all of `~/.cache` and more, while the commit, the checklist
 /// and the participant's notice promised otherwise — a dataset `datasets.map()` spent hours on
 /// lives in `~/.cache/huggingface/datasets`, a W&B run's files in `~/.cache/wandb`). Said in
-/// the participant notice ([`REAP_NOT_KEPT_SUMMARY`]) and the README.
+/// the participant notice ([`REAP_NOT_KEPT_SUMMARY`]) and docs/BACKUPS.md.
 /// - Python environments and installed packages: `venv/`, `.venv/`, `site-packages/`,
 ///   `~/.local/lib/` (pip `--user`), uv's managed Pythons (`~/.local/share/uv/`), conda's `envs/`
 ///   and `pkgs/` under a conda root in the home (by its usual names — never a bare `envs/`, which
@@ -409,7 +409,7 @@ pub const REAP_NOT_KEPT: &[&str] = &[
 ];
 
 /// [`REAP_NOT_KEPT`] in the participant's words — the notice on every pod with a reap policy says
-/// exactly this, and so does the README (a test holds both to it).
+/// exactly this, and so does docs/BACKUPS.md (a test holds both to it).
 /// Every entry is named (W7LR-2): `.ssh/` matches a folder of that name at any depth — "every .ssh
 /// folder"; `__pycache__/` is "Python bytecode"; `*.arena-aside-*/` is "arena's moved-aside copy".
 pub const REAP_NOT_KEPT_SUMMARY: &str = "not kept: only what can be downloaded or installed again — Python environments and \

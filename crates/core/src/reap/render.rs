@@ -420,7 +420,7 @@ pub fn notice_text(name: &str, p: &PodPolicy, tz: i64) -> String {
             fmt_span(w)
         ));
     }
-    // What the reap's backup leaves out: the one wording code, notice and README share.
+    // What the reap's backup leaves out: the one wording code, notice and docs/BACKUPS.md share.
     s.push_str(&format!(
         "  Your home directory is backed up first ({}) — only your home. Nothing happens while the machine is in use, \
          while a TEMP_FOLDER_FOR_SWEEPS/ holds any results, or while you have data outside your home (/data, /tmp, \
