@@ -1304,11 +1304,12 @@ b'`) is replaced whole, and in a log so is every line such a value runs on into 
 scalar, a value on the line after its name, a quote or bracket closed lines later) — any run of 32+
 `[A-Za-z0-9_-]` in commit subjects and log lines (`<redacted>`), any run of 40+ of `[A-Za-z0-9+/=]`
 with upper case, lower case and digits (base64 key material), and a private-key block — in a log
-masked over the whole 16 KB read before its last 40 lines are taken, so neither cut can keep a key's
-body without its header, nor a value whose name is above the cut; at the start of a cut window,
-lines that look like base64 key material (40+ of `[A-Za-z0-9+/=]`, nothing else) are dropped, and
-where the read starts part-way into the log, the indented lines at its top (and a first line that
-closes a quote) are masked: a value whose name the read never saw may run on into them. The AI CLI's
+masked over the whole read (the log's last 64 KB) before its last 40 lines are taken, so neither cut
+can keep a key's body without its header, nor a value whose name is above the cut. Where the read
+starts part-way into the log, a value whose name it never saw may run on at its top over any lines,
+so nothing is shown from its first 16 KB: what's shown begins where that tracking has settled (a
+log that fits in the read is tracked from its first byte). At the start of what's shown, lines that
+look like base64 key material (40+ of `[A-Za-z0-9+/=]`, nothing else) are dropped. The AI CLI's
 own error line, printed and saved when it fails, is masked the same way. Each pod's part is at most
 6 KB (less when many pods share a prompt: 240 KB in all), trimmed from the log's oldest lines first.
 

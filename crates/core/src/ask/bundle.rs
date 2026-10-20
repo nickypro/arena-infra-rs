@@ -56,9 +56,19 @@ pub const BUNDLE_CAP: usize = 6 * 1024;
 /// The least a pod's bundle is cut to when many pods share a prompt ([`super::pod_cap`]).
 pub const MIN_CAP: usize = 1536;
 
-/// Lines of the newest job's log in a bundle, read from at most [`LOG_BYTES`].
+/// Lines of the newest job's log in a bundle, from a read of its last [`LOG_BYTES`] at most.
 pub const LOG_LINES: usize = 40;
-pub const LOG_BYTES: u64 = 16 * 1024;
+
+/// How much of the newest job's log is read: far more than [`LOG_LINES`] take, so what's shown
+/// is masked with what runs over lines tracked from well above it ([`LOG_SETTLE`]).
+pub const LOG_BYTES: u64 = 64 * 1024;
+
+/// How far into a read that starts part-way into the log (the log longer than [`LOG_BYTES`]) the
+/// shown lines must begin: a value whose name is above the read — a quote, a YAML block — can run
+/// on at its top over lines that look like nothing (review ai-review codex #2: unindented,
+/// quote-free middle lines of `PASSWORD="…"`), so the masking's state is only taken as settled
+/// this far in ([`redact::log_tail`]'s `shown_from`). A read that is the whole log starts settled.
+pub const LOG_SETTLE: usize = 16 * 1024;
 
 const FILES_SHOWN: usize = 20;
 const PROCS_SHOWN: usize = 15;
@@ -993,13 +1003,21 @@ fn jobs_blocks(r: &Reply) -> Vec<Block> {
     match &r.log {
         Some(Ok(ReadReply::Job { info, chunk })) => {
             // The whole window read, masked before it's cut to the last LOG_LINES (a key block
-            // across the cut must be seen whole to be masked at all).
+            // across the cut must be seen whole to be masked at all), and — read from part-way
+            // into the log — none of it shown from its first LOG_SETTLE bytes.
             let (window, _) = jobs::snapshot_lines(chunk, usize::MAX);
-            let (lines, hidden) = redact::log_tail(&window, chunk.start > 0, LOG_LINES, LINE_MAX);
+            let starts_cut = chunk.start > 0;
+            let shown_from = if starts_cut { jobs::snapshot_offsets(chunk).iter().take_while(|at| **at < LOG_SETTLE).count() } else { 0 };
+            let (lines, hidden) = redact::log_tail(&window, starts_cut, shown_from, LOG_LINES, LINE_MAX);
             let state = if info.state == JobState::Running { "still running".to_string() } else { jobs::state_label(info) };
-            let more = if hidden > 0 || chunk.start > 0 { ", older lines exist" } else { "" };
-            if lines.is_empty() {
+            let more = if hidden > 0 || starts_cut { ", older lines exist" } else { "" };
+            if lines.is_empty() && hidden == 0 {
                 v.push(Block::fixed(vec![format!("newest job's log ({}, {state}): empty", shown_id(&info.id, &info.cmd))]));
+            } else if lines.is_empty() {
+                v.push(Block::fixed(vec![format!(
+                    "newest job's log ({}, {state}): nothing shown (what was read of it can't be masked with certainty)",
+                    shown_id(&info.id, &info.cmd)
+                )]));
             } else {
                 let id = shown_id(&info.id, &info.cmd);
                 v.push(Block::list(format!("newest job's log ({id}, {state}), last {} lines{more}:", lines.len()), lines, 1, 8, true));
@@ -1432,35 +1450,66 @@ mod tests {
         }
     }
 
-    /// The bundle for real at both cuts: the remote read's last bytes begin inside a key (its
-    /// END in the window, or not), and a whole key block straddles where the 40-line cut falls —
-    /// no 12-character piece of any key line reaches the bundle.
-    #[test]
-    fn a_log_tail_starting_inside_a_key_never_shows_it() {
-        use crate::ask::redact::tests::key_body;
+    /// [`busy_reply`] with the newest job's log read as `log`, from byte `start` of the log (its
+    /// size `start` + `log`'s length): a read that starts part-way into the log when `start` > 0.
+    fn reply_with_log(start: u64, log: &str) -> String {
         let id = jobs::JobId::named(1_792_404_900, "pytest", fixtures::SALT);
         let job = jobs::fixtures::job_line(id.as_str(), "running", None, Some(777), "pytest");
         let [_, _, log_m, extra_m, _] = marks();
-        let with_log = |start: u64, log: &str| {
-            let full = busy_reply("", "", "pytest");
-            let (head, rest) = full.split_once(&format!("{log_m}\n")).unwrap();
-            let (_, tail) = rest.split_once(&format!("{extra_m}\n")).unwrap();
-            let read = jobs::fixtures::read_reply(&job, start, start + log.len() as u64, log.as_bytes());
-            format!("{head}{log_m}\n{read}{extra_m}\n{tail}")
-        };
+        let full = busy_reply("", "", "pytest");
+        let (head, rest) = full.split_once(&format!("{log_m}\n")).unwrap();
+        let (_, tail) = rest.split_once(&format!("{extra_m}\n")).unwrap();
+        let read = jobs::fixtures::read_reply(&job, start, start + log.len() as u64, log.as_bytes());
+        format!("{head}{log_m}\n{read}{extra_m}\n{tail}")
+    }
+
+    /// `head`, then lines of about 2 KiB (`step <i> loss …`) and a last one (`last ...`), to
+    /// exactly [`LOG_BYTES`]: what a read that starts part-way into a log is.
+    fn filled(head: &str) -> String {
+        let mut log = head.to_string();
+        let mut i = 0;
+        while log.len() + 2 * 2100 < LOG_BYTES as usize {
+            log.push_str(&format!("step {i} {}\n", "loss 0.25 ".repeat(200)));
+            i += 1;
+        }
+        let rest = LOG_BYTES as usize - log.len() - "last \n".len();
+        log.push_str(&format!("last {}\n", ".".repeat(rest)));
+        assert_eq!(log.len(), LOG_BYTES as usize);
+        log
+    }
+
+    /// The pytest job's id, as [`reply_with_log`]'s reply shows it.
+    fn log_id() -> String {
+        jobs::JobId::named(1_792_404_900, "pytest", fixtures::SALT).as_str().to_string()
+    }
+
+    /// The bundle for real at both cuts: the remote read (its last [`LOG_BYTES`]) begins inside a
+    /// key — its END in the window, or not — or a whole key block straddles where the shown part
+    /// may begin ([`LOG_SETTLE`] into the read), or, the read being the whole log, where the
+    /// 40-line cut falls: no 12-character piece of any key line reaches the bundle; a block that
+    /// reaches the shown part is one mask there.
+    #[test]
+    fn a_log_tail_starting_inside_a_key_never_shows_it() {
+        use crate::ask::redact::tests::key_body;
+        let id = log_id();
         let key = key_body(40, 7);
         let lines = |v: &[String]| v.iter().map(|l| format!("{l}\n")).collect::<String>();
         let progress: String = (0..30).map(|i| format!("step {i} loss 0.{i}\n")).collect();
+        let warmup: String = (0..1190).map(|i| format!("warmup {i:05}\n")).collect();
+        let (begin, end) = ("-----BEGIN OPENSSH PRIVATE KEY-----", "-----END OPENSSH PRIVATE KEY-----");
         let cases = [
-            // The 16 KiB read began mid-line inside the key; its END is in the window.
-            (9000, format!("{}{}-----END OPENSSH PRIVATE KEY-----\n{progress}", &key[4][10..], lines(&key[5..]))),
+            // The read began mid-line inside the key; its END is in the window.
+            (200_000, filled(&format!("{}{}{end}\n", &key[4][10..], lines(&key[5..]))), false),
             // The same, the key still being printed (no END yet), then a line.
-            (9000, format!("{}{}still printing\n", &key[4][10..], lines(&key[5..30]))),
+            (200_000, filled(&format!("{}{}still printing\n", &key[4][10..], lines(&key[5..30]))), false),
             // The whole log: a block, then 30 lines — the 40-line cut lands in its body.
-            (0, format!("start\n-----BEGIN OPENSSH PRIVATE KEY-----\n{}-----END OPENSSH PRIVATE KEY-----\n{progress}", lines(&key))),
+            (0, format!("start\n{begin}\n{}{end}\n{progress}", lines(&key)), true),
+            // A whole block from 15.5 KiB into the read to past 16: shown as one mask.
+            (200_000, filled(&format!("{warmup}{begin}\n{}{end}\n", lines(&key))), true),
         ];
-        for (n, (start, log)) in cases.iter().enumerate() {
-            let text = bundle(&with_log(*start, log), 64 * 1024);
+        assert!(warmup.len() < LOG_SETTLE && warmup.len() + 40 * 65 > LOG_SETTLE);
+        for (n, (start, log, masked)) in cases.iter().enumerate() {
+            let text = bundle(&reply_with_log(*start, log), 64 * 1024);
             assert!(text.contains(&format!("newest job's log ({id}, still running), last ")), "{n}: {text}");
             for l in &key {
                 for piece in l.as_bytes().chunks(12).filter(|c| c.len() == 12) {
@@ -1468,7 +1517,30 @@ mod tests {
                     assert!(!text.contains(piece), "case {n}: {piece} of a key line reached the bundle:\n{text}");
                 }
             }
-            assert_eq!(text.contains(redact::PEM_MASK), n != 1, "{n}: {text}");
+            assert_eq!(text.contains(redact::PEM_MASK), *masked, "{n}: {text}");
+        }
+    }
+
+    /// Review ai-review codex #2 (lane ASK8 item 2), the bundle for real. The read — the log's last
+    /// [`LOG_BYTES`] — begins inside a multi-line quoted value, mid-line in its second line, its
+    /// middle lines unindented and quote-free, with about 30 lines after it, so the last 40 would
+    /// hold the value's own: none of it reaches the bundle, the lines after it do. A value whose
+    /// name the read does see, past [`LOG_SETTLE`]: masked whole, as before.
+    #[test]
+    fn a_read_starting_inside_a_quoted_value_never_shows_it() {
+        let id = log_id();
+        let inside = filled("ther fragment\ncohort-db-pass\nQx7 middle one\nQx7 middle two\nfinal fragment\"\n");
+        assert!(inside.lines().count() < 40);
+        let mut seen: String = (0..1600).map(|i| format!("warmup {i:05}\n")).collect();
+        assert!(seen.len() > LOG_SETTLE);
+        seen.push_str("PASSWORD=\"first fragment\nanother fragment\ncohort-db-pass\nQx7 middle\nfinal fragment\"\n");
+        for (n, log) in [inside, filled(&seen)].iter().enumerate() {
+            let text = bundle(&reply_with_log(200_000, log), 64 * 1024);
+            for value in ["cohort", "Qx7", "fragment"] {
+                assert!(!text.contains(value), "case {n}: {value} reached the bundle:\n{text}");
+            }
+            assert!(text.contains(&format!("newest job's log ({id}, still running), last ")) && text.contains(", older lines exist:"), "{n}: {text}");
+            assert!(text.contains("step 10 loss 0.25") && text.contains("last ....."), "{n}: {text}");
         }
     }
 

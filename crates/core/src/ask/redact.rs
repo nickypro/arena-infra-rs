@@ -889,30 +889,38 @@ fn pem_end(l: &str) -> bool {
     l.contains("-----END") && l.contains("PRIVATE KEY")
 }
 
+/// A log line as [`log_tail`]'s passes carry it: the index, in the window read, of the last line
+/// it stands for — a mask ([`PEM_MASK`], [`CONT_MASK`]) stands for every line of its run — and
+/// its text. Where the window's shown part begins ([`log_tail`]'s `shown_from`) is told by it.
+type Line = (usize, String);
+
 /// `lines` with every private-key block — `-----BEGIN … PRIVATE KEY-----` to its `-----END`,
 /// or to the last line — as one [`PEM_MASK`] line: its base64 lines are broken up by `+` and
 /// `/`, so no single run need reach [`LONG_TOKEN`]. When `starts_cut` (the lines begin part-way
 /// into the log) and an `-----END … PRIVATE KEY-----` comes before any `BEGIN`, the window
 /// begins inside a key: everything up to that END is one [`PEM_MASK`] too.
-fn pem_blocks(lines: &[String], starts_cut: bool) -> Vec<String> {
-    let mut out = Vec::with_capacity(lines.len());
-    let mut rest = lines;
+fn pem_blocks(lines: &[String], starts_cut: bool) -> Vec<Line> {
+    let mut out: Vec<Line> = Vec::with_capacity(lines.len());
+    let mut from = 0;
     if starts_cut {
         let first_begin = lines.iter().position(|l| pem_begin(l)).unwrap_or(lines.len());
         if let Some(end) = lines[..first_begin].iter().position(|l| pem_end(l)) {
-            out.push(PEM_MASK.to_string());
-            rest = &lines[end + 1..];
+            out.push((end, PEM_MASK.to_string()));
+            from = end + 1;
         }
     }
     let mut in_pem = false;
-    for l in rest {
+    for (i, l) in lines.iter().enumerate().skip(from) {
         if in_pem {
             in_pem = !l.contains("-----END");
+            if let Some(mask) = out.last_mut() {
+                mask.0 = i;
+            }
         } else if pem_begin(l) {
-            out.push(PEM_MASK.to_string());
+            out.push((i, PEM_MASK.to_string()));
             in_pem = !l.contains("-----END");
         } else {
-            out.push(l.clone());
+            out.push((i, l.clone()));
         }
     }
     out
@@ -921,8 +929,8 @@ fn pem_blocks(lines: &[String], starts_cut: bool) -> Vec<String> {
 /// Leading lines that look like key material ([`base64_like`]) taken off `lines`: what a cut
 /// that landed inside a key (or any base64 blob) leaves at its start. Conservative — a harmless
 /// hash or a line of `=` there goes too. How many went.
-fn drop_leading_base64(lines: &mut Vec<String>) -> usize {
-    let n = lines.iter().take_while(|l| base64_like(l)).count();
+fn drop_leading_base64(lines: &mut Vec<Line>) -> usize {
+    let n = lines.iter().take_while(|(_, l)| base64_like(l)).count();
     lines.drain(..n);
     n
 }
@@ -959,10 +967,10 @@ fn indent_of(l: &str) -> usize {
 /// that really closes it ([`closes_quote`]); unbalanced brackets — until they balance; an end that
 /// can't be told — the rest of the window. Lines masked whole already ([`PEM_MASK`]) are left as
 /// they are.
-fn continuations(lines: Vec<String>) -> Vec<String> {
-    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+fn continuations(lines: Vec<Line>) -> Vec<Line> {
+    let mut out: Vec<Line> = Vec::with_capacity(lines.len());
     let (mut carry, mut first) = (None, false);
-    for l in lines {
+    for (i, l) in lines {
         if let Some(c) = carry {
             let hidden = match c {
                 Carry::Below { .. } if l.trim().is_empty() => true,
@@ -985,15 +993,16 @@ fn continuations(lines: Vec<String>) -> Vec<String> {
                 Carry::Rest => true,
             };
             if hidden {
-                if out.last().map(String::as_str) != Some(CONT_MASK) {
-                    out.push(CONT_MASK.to_string());
+                match out.last_mut() {
+                    Some(mask) if mask.1 == CONT_MASK => mask.0 = i,
+                    _ => out.push((i, CONT_MASK.to_string())),
                 }
                 continue;
             }
         }
         carry = if l == PEM_MASK || l == CONT_MASK { None } else { masked(&crate::jobs::sanitize(&l)).1 };
         first = true;
-        out.push(l);
+        out.push((i, l));
     }
     out
 }
@@ -1022,38 +1031,51 @@ fn odd_quotes(l: &str, q: u8) -> bool {
 /// close of a quote opened above: `cohort-db-pass"`). No line at indentation 0 at all: the whole
 /// window. Conservative — a traceback's indented lines at the top go too, and a first line with an
 /// apostrophe — as a key block's body without its header is ([`pem_blocks`]).
-fn window_start(lines: Vec<String>) -> Vec<String> {
-    let top = lines.iter().position(|l| !l.trim().is_empty() && indent_of(l) == 0).unwrap_or(lines.len());
-    let closes = lines.get(top).is_some_and(|l| l != PEM_MASK && (odd_quotes(l, b'"') || odd_quotes(l, b'\'')));
+fn window_start(lines: Vec<Line>) -> Vec<Line> {
+    let top = lines.iter().position(|(_, l)| !l.trim().is_empty() && indent_of(l) == 0).unwrap_or(lines.len());
+    let closes = lines.get(top).is_some_and(|(_, l)| l != PEM_MASK && (odd_quotes(l, b'"') || odd_quotes(l, b'\'')));
     let n = top + usize::from(closes);
-    if lines[..n].iter().all(|l| l.trim().is_empty()) {
+    if lines[..n].iter().all(|(_, l)| l.trim().is_empty()) {
         return lines;
     }
-    std::iter::once(CONT_MASK.to_string()).chain(lines.into_iter().skip(n)).collect()
+    let last = lines[n - 1].0;
+    std::iter::once((last, CONT_MASK.to_string())).chain(lines.into_iter().skip(n)).collect()
 }
 
 /// A log's last `keep` lines for the prompt, from `lines` — the whole window read (the remote
-/// read's last bytes, 16 KiB; `starts_cut`: it begins part-way into the log, its partial first
-/// line already gone). Everything that runs over lines is tracked over that whole window
-/// **before** the `keep`-line cut (lane ASK7 item C), so a key block or a secret's value that
-/// starts above the cut stays masked below it: private-key blocks first ([`pem_blocks`]), so
-/// neither cut can keep a key's body without the header that marks it, then — where the window
-/// starts part-way — what a value from above the read may have left at its top
-/// ([`window_start`]), then a secret's values that run on over lines ([`continuations`]). Then
-/// at each cut — the window's start when `starts_cut`, and the `keep`-line cut — leading
-/// base64-looking lines are dropped ([`drop_leading_base64`]): a key printed without its armour,
-/// or one whose END is past the window. Each line left goes through [`text`]. The lines, and how
-/// many older lines of the window aren't shown.
-pub fn log_tail(lines: &[String], starts_cut: bool, keep: usize, max: usize) -> (Vec<String>, usize) {
+/// read's last bytes; `starts_cut`: it begins part-way into the log, its partial first line
+/// already gone), none of it before line `shown_from`. Everything that runs over lines is
+/// tracked from the window's first line, so a key block or a secret's value that starts above
+/// what's shown stays masked in it (lane ASK7 item C): private-key blocks first
+/// ([`pem_blocks`]), so no cut can keep a key's body without the header that marks it, then —
+/// where the window starts part-way — what a value from above the read may have left at its top
+/// ([`window_start`]), then a secret's values that run on over lines ([`continuations`]).
+///
+/// Where the read starts part-way, what that tracking knows at its top is a guess: a value whose
+/// name the read never saw can run on there over any lines — unindented, quote-free ones too
+/// (review ai-review codex #2: `cohort-db-pass` in the middle of `PASSWORD="…⏎…⏎…"`). So the
+/// caller reads far more than it shows and passes `shown_from`, the first line far enough in for
+/// the tracking to have settled (lane ASK8 item 2: [`crate::ask::bundle::LOG_SETTLE`] bytes into
+/// a [`crate::ask::bundle::LOG_BYTES`] read); nothing standing only for lines before it is shown —
+/// a mask that runs on past it is. A window that is the whole log (`starts_cut` false) is known
+/// from its first byte: `shown_from` 0.
+///
+/// Then at each cut — the shown part's start when `starts_cut`, and the `keep`-line cut —
+/// leading base64-looking lines are dropped ([`drop_leading_base64`]): a key printed without its
+/// armour, or one whose END is past the window. Each line left goes through [`text`]. The lines,
+/// and how many older lines of the window aren't shown.
+pub fn log_tail(lines: &[String], starts_cut: bool, shown_from: usize, keep: usize, max: usize) -> (Vec<String>, usize) {
     let pem = pem_blocks(lines, starts_cut);
     let mut v = continuations(if starts_cut { window_start(pem) } else { pem });
-    let mut hidden = if starts_cut { drop_leading_base64(&mut v) } else { 0 };
+    let early = v.iter().take_while(|(last, _)| *last < shown_from).count();
+    v.drain(..early);
+    let mut hidden = early + if starts_cut { drop_leading_base64(&mut v) } else { 0 };
     let over = v.len().saturating_sub(keep);
     if over > 0 {
         v.drain(..over);
         hidden += over + drop_leading_base64(&mut v);
     }
-    let shown = v.into_iter().map(|l| if l == PEM_MASK || l == CONT_MASK { l } else { text(&l, max) }).collect();
+    let shown = v.into_iter().map(|(_, l)| if l == PEM_MASK || l == CONT_MASK { l } else { text(&l, max) }).collect();
     (shown, hidden)
 }
 
@@ -1304,7 +1326,7 @@ pub(crate) mod tests {
     /// are kept. One that never closes takes the rest of the window.
     #[test]
     fn a_secret_value_over_several_lines_is_masked_on_each() {
-        let tail = |lines: &[&str]| log_tail(&strings(lines), false, 40, 200).0;
+        let tail = |lines: &[&str]| log_tail(&strings(lines), false, 0, 40, 200).0;
         assert_eq!(tail(&["password: |-", "  cohort-db-pass", "next"]), strings(&["password: <redacted>", CONT_MASK, "next"]));
         assert_eq!(
             tail(&["db:", "  password: >", "    cohort db", "", "    pass", "  user: bob", "done"]),
@@ -1337,7 +1359,7 @@ pub(crate) mod tests {
         assert!(!all.join("\n").contains("Qx7"), "{all:?}");
     }
 
-    /// Lane ASK7 item C: what runs over lines is tracked over the whole 16 KiB read before its
+    /// Lane ASK7 item C: what runs over lines is tracked over the whole read before its
     /// last 40 lines are taken — a YAML block scalar, a quote and a bracket opened above the cut
     /// with their values running on below it show none of them, though the raw last 40 lines are
     /// all value (cut first, then masked, they'd all be shown).
@@ -1354,7 +1376,7 @@ pub(crate) mod tests {
             lines.extend((0..60).map(|i| value.replace("{}", &i.to_string()).replace("{0}", &i.to_string())));
             lines.extend(close.map(String::from));
             assert!(lines[lines.len() - 40..].iter().filter(|l| l.contains("Qx7")).count() >= 39, "the raw cut would be all value");
-            let (shown, hidden) = log_tail(&lines, false, 40, 200);
+            let (shown, hidden) = log_tail(&lines, false, 0, 40, 200);
             assert!(!shown.join("\n").contains("Qx7"), "{open}: {shown:?}");
             assert_eq!(shown.len(), 40, "{open}");
             assert_eq!(shown.last().map(String::as_str), Some(CONT_MASK), "{open}");
@@ -1368,7 +1390,7 @@ pub(crate) mod tests {
     /// kept. Not cut, the same lines are just lines.
     #[test]
     fn a_read_that_starts_inside_a_value_shows_none_of_it() {
-        let tail = |lines: &[&str], cut: bool| log_tail(&strings(lines), cut, 40, 200).0;
+        let tail = |lines: &[&str], cut: bool| log_tail(&strings(lines), cut, 0, 40, 200).0;
         assert_eq!(tail(&["    Qx7yaml-pass", "    Qx7more", "  user: bob", "step 1"], true), strings(&[CONT_MASK, "step 1"]));
         assert_eq!(tail(&["", "  \"Qx7json\"", "}", "step 1"], true), strings(&[CONT_MASK, "}", "step 1"]));
         assert_eq!(tail(&["Qx7pass\"", "step 1"], true), strings(&[CONT_MASK, "step 1"]));
@@ -1381,6 +1403,65 @@ pub(crate) mod tests {
         assert_eq!(tail(&["    indented", "Qx7x\"", "step 1"], false), strings(&["indented", "Qx7x\"", "step 1"]));
         // A key's END at the top is still one key block, not a value.
         assert_eq!(tail(&["-----END OPENSSH PRIVATE KEY-----", "step 1"], true), strings(&[PEM_MASK, "step 1"]));
+    }
+
+    /// Review ai-review codex #2 (lane ASK8 item 2): a read that starts inside a quoted value whose
+    /// middle lines are unindented and quote-free — `PASSWORD="first fragment⏎another
+    /// fragment⏎cohort-db-pass⏎…⏎final fragment"`, the read beginning in `another fragment` —
+    /// shows none of it once nothing before the settled line (`shown_from`) is shown, though the
+    /// 40-line cut alone would keep it. Taken as settled at the read's start, the same window
+    /// showed `cohort-db-pass`.
+    #[test]
+    fn a_read_starting_inside_a_quoted_value_shows_none_of_it_once_settled() {
+        let value = ["cohort-db-pass", "Qx7 middle one", "Qx7 middle two", "final fragment\""];
+        let mut lines = strings(&value);
+        lines.extend((0..30).map(|i| format!("step {i}")));
+        let (unsettled, _) = log_tail(&lines, true, 0, 40, 200);
+        assert!(unsettled.iter().any(|l| l == "cohort-db-pass"), "what this guards: {unsettled:?}");
+        let (shown, hidden) = log_tail(&lines, true, value.len(), 40, 200);
+        assert_eq!((shown, hidden), (lines[value.len()..].to_vec(), value.len()));
+        // However many unindented lines it has above the settled line.
+        let mut long: Vec<String> = (0..200).map(|i| format!("Qx7 fragment {i}")).collect();
+        long.push("Qx7 end\"".into());
+        long.extend((0..10).map(|i| format!("step {i}")));
+        let (shown, hidden) = log_tail(&long, true, 201, 40, 200);
+        assert_eq!((shown.len(), hidden), (10, 201));
+        assert!(!shown.join("\n").contains("Qx7"), "{shown:?}");
+    }
+
+    /// Lane ASK8 item 2: what is shown begins at the settled line (`shown_from`) or later: the
+    /// 40-line cut when it falls below it, else the settled line, every line above it tracked but
+    /// not shown. A mask whose run reaches the settled line is shown (its value runs on into
+    /// what's shown); one that ends above it isn't. And base64-looking lines at the shown part's
+    /// start go, as at any cut.
+    #[test]
+    fn nothing_above_the_settled_line_is_shown() {
+        let steps: Vec<String> = (0..100).map(|i| format!("step {i}")).collect();
+        let (shown, hidden) = log_tail(&steps, true, 70, 40, 200);
+        assert_eq!((shown, hidden), (steps[70..].to_vec(), 70));
+        let (shown, hidden) = log_tail(&steps, true, 10, 40, 200);
+        assert_eq!((shown, hidden), (steps[60..].to_vec(), 60));
+        // A quote opened above the settled line and closed below it: its mask is shown, the
+        // line that opened it isn't.
+        let lines = strings(&["x", "TOKEN=\"Qx7a", "Qx7b", "Qx7c", "Qx7d\"", "after"]);
+        assert_eq!(log_tail(&lines, true, 3, 40, 200), (strings(&[CONT_MASK, "after"]), 2));
+        // Closed above it: nothing of it.
+        assert_eq!(log_tail(&lines, true, 5, 40, 200), (strings(&["after"]), 3));
+        // A key block across the settled line: one mask, shown.
+        let key = key_body(4, 5);
+        let mut lines = strings(&["a", "-----BEGIN OPENSSH PRIVATE KEY-----"]);
+        lines.extend(key.iter().cloned());
+        lines.extend(strings(&["-----END OPENSSH PRIVATE KEY-----", "b"]));
+        let (shown, hidden) = log_tail(&lines, true, 3, 40, 200);
+        assert_eq!((shown.clone(), hidden), (strings(&[PEM_MASK, "b"]), 1));
+        no_body_in(&shown, &key);
+        // Key material with no armour at the settled line: dropped there.
+        let mut lines = strings(&["a", "b"]);
+        lines.extend(key[..3].iter().cloned());
+        lines.push("c".into());
+        assert_eq!(log_tail(&lines, true, 2, 40, 200), (strings(&["c"]), 5));
+        // A whole log: shown from its first line.
+        assert_eq!(log_tail(&steps[..5], false, 0, 40, 200), (steps[..5].to_vec(), 0));
     }
 
     /// Review ai-review claude #7: a private key or base64 key material pasted into a process's
@@ -1524,7 +1605,7 @@ pub(crate) mod tests {
         ]
         .map(String::from)
         .to_vec();
-        assert_eq!(log_tail(&lines, false, 40, 200), (vec!["loading".to_string(), PEM_MASK.into(), "done".into(), PEM_MASK.into()], 0));
+        assert_eq!(log_tail(&lines, false, 0, 40, 200), (vec!["loading".to_string(), PEM_MASK.into(), "done".into(), PEM_MASK.into()], 0));
     }
 
     /// A key's body lines: base64 with `+` and `/` (no run reaches [`LONG_TOKEN`]), 64 wide, the
@@ -1562,15 +1643,15 @@ pub(crate) mod tests {
         // The read's start: inside the body, the END in the window.
         let mut lines = key[3..].to_vec();
         lines.extend([end.clone(), "epoch 1 loss 0.5".into(), "epoch 2 loss 0.4".into()]);
-        let (shown, hidden) = log_tail(&lines, true, 40, 200);
+        let (shown, hidden) = log_tail(&lines, true, 0, 40, 200);
         assert_eq!((shown.clone(), hidden), (strings(&[PEM_MASK, "epoch 1 loss 0.5", "epoch 2 loss 0.4"]), 0));
         // Not cut: an END with no BEGIN is just a line (nothing before it is a key's).
-        let (shown, _) = log_tail(&strings(&["a", "-----END OPENSSH PRIVATE KEY-----", "b"]), false, 40, 200);
+        let (shown, _) = log_tail(&strings(&["a", "-----END OPENSSH PRIVATE KEY-----", "b"]), false, 0, 40, 200);
         assert_eq!(shown, strings(&["a", "-----END OPENSSH PRIVATE KEY-----", "b"]));
         // The read's start: inside a key still being printed, or one without armour.
         let mut lines = key[..10].to_vec();
         lines.push("step 3 done".into());
-        let (shown, hidden) = log_tail(&lines, true, 40, 200);
+        let (shown, hidden) = log_tail(&lines, true, 0, 40, 200);
         assert_eq!((shown.clone(), hidden), (strings(&["step 3 done"]), 10));
         no_body_in(&shown, &key);
         // The 40-line cut: a whole block, then 20 lines — the old order (cut, then mask) kept
@@ -1580,7 +1661,7 @@ pub(crate) mod tests {
         lines.extend(big.iter().cloned());
         lines.push(end.clone());
         lines.extend((0..20).map(|i| format!("progress {i}")));
-        let (shown, hidden) = log_tail(&lines, false, 40, 200);
+        let (shown, hidden) = log_tail(&lines, false, 0, 40, 200);
         no_body_in(&shown, &big);
         assert_eq!(shown.len(), 22, "{shown:?}");
         assert_eq!((shown[0].as_str(), shown[1].as_str(), hidden), ("start", PEM_MASK, 0));
@@ -1589,7 +1670,7 @@ pub(crate) mod tests {
         let mut lines: Vec<String> = (0..100).map(|i| format!("warmup {i}")).collect();
         lines.extend(blob[..30].iter().cloned());
         lines.extend((0..20).map(|i| format!("progress {i}")));
-        let (shown, hidden) = log_tail(&lines, false, 40, 200);
+        let (shown, hidden) = log_tail(&lines, false, 0, 40, 200);
         no_body_in(&shown, &blob);
         assert_eq!((shown.len(), shown[0].as_str(), hidden), (20, "progress 0", 130));
         // Only whole lines of base64 alphabet, 40 or more, are taken for key material.

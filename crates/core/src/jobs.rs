@@ -901,6 +901,33 @@ pub fn snapshot_lines(chunk: &LogChunk, tail: usize) -> (Vec<String>, bool) {
     (shown, cut)
 }
 
+/// Where, in `chunk`'s bytes, the text of each line [`snapshot_lines`] makes of the whole window
+/// (`tail` unbounded) begins: the line's first byte, or — a progress bar redrawn with `\r` — the
+/// byte after its last `\r` (a CRLF's aside), where what [`display_line`] shows of it begins.
+/// One offset per line, in order (`pods ask` shows none that begins too near a cut read's start:
+/// `crate::ask::bundle::LOG_SETTLE`).
+pub fn snapshot_offsets(chunk: &LogChunk) -> Vec<usize> {
+    let b = &chunk.bytes;
+    let mut starts: Vec<usize> = std::iter::once(0).chain(b.iter().enumerate().filter(|(_, c)| **c == b'\n').map(|(i, _)| i + 1)).collect();
+    // After the last newline: a line only when something is there.
+    if starts.last() == Some(&b.len()) {
+        starts.pop();
+    }
+    // A window starting mid-file starts mid-line: its first line (one with a newline after it)
+    // is dropped.
+    if chunk.start > 0 && b.contains(&b'\n') {
+        starts.remove(0);
+    }
+    starts
+        .into_iter()
+        .map(|start| {
+            let end = b[start..].iter().position(|c| *c == b'\n').map_or(b.len(), |n| start + n);
+            let line = b[start..end].strip_suffix(b"\r").unwrap_or(&b[start..end]);
+            line.iter().rposition(|c| *c == b'\r').map_or(start, |r| start + r + 1)
+        })
+        .collect()
+}
+
 /// One pod's position in a `pods logs --follow`: the next byte to read and an unfinished
 /// line held back until its newline arrives (so a line split across two reads prints
 /// once, whole).
@@ -1419,6 +1446,35 @@ mod tests {
         ];
         for (c, tail, want, cut) in cases {
             assert_eq!(snapshot_lines(c, *tail), (want.iter().map(|s| s.to_string()).collect(), *cut), "{c:?} tail {tail}");
+        }
+    }
+
+    /// Lane ASK8 item 2: where each line of the whole window begins in the read — one offset per
+    /// [`snapshot_lines`] line, at the text it shows (past a progress bar's last `\r`).
+    #[test]
+    fn snapshot_offsets_say_where_each_shown_line_begins() {
+        let chunk = |start: u64, bytes: &[u8]| LogChunk { start, size: start + bytes.len() as u64, bytes: bytes.to_vec() };
+        let cases: &[(LogChunk, &[usize])] = &[
+            (chunk(0, b"a\nbb\nccc\n"), &[0, 2, 5]),
+            (chunk(0, b"a\nbb\nccc"), &[0, 2, 5]),
+            (chunk(0, b""), &[]),
+            (chunk(0, b"\n\n"), &[0, 1]),
+            (chunk(0, b"a\r\nb\n50%\r80%\r100%\n"), &[0, 3, 13]),
+            (chunk(0, b"x\n10%\r20%"), &[0, 6]),
+            (chunk(100, b"tail of x\ny\nz\n"), &[10, 12]),
+            (chunk(100, b"tail of x\ny"), &[10]),
+            (chunk(100, b"tail of x\n"), &[]),
+            (chunk(100, b"one huge line"), &[0]),
+            (chunk(100, b"one huge bar 10%\r20%\r30%"), &[21]),
+        ];
+        for (c, want) in cases {
+            let got = snapshot_offsets(c);
+            assert_eq!(got, *want, "{c:?}");
+            let (lines, _) = snapshot_lines(c, usize::MAX);
+            assert_eq!(got.len(), lines.len(), "{c:?}");
+            for (at, line) in got.iter().zip(&lines) {
+                assert!(c.bytes[*at..].starts_with(line.as_bytes()), "{c:?}: {line:?} at {at}");
+            }
         }
     }
 
