@@ -142,7 +142,8 @@ pub struct DeepFacts {
     pub slice: Option<String>,
     /// Not measured: how many GPUs the provider reports for the pod ([`Pod::gpu_count`]) — what
     /// torch's count is held to beside nvidia-smi's, so a GPU gone from both (fallen off the
-    /// bus, nvidia-smi listing only the survivors or unable to count) still shows. Set by
+    /// bus, nvidia-smi listing only the survivors or unable to count) still shows. Never, alone,
+    /// evidence to remember the machine by ([`condemns_machine`]). Set by
     /// [`PodHealth::checked`]. Not in `--json`: it is the listing's (`pods list --json`).
     #[serde(skip)]
     pub provider_gpus: Option<u32>,
@@ -807,8 +808,7 @@ pub fn failure_kind_of(name: &str, facts: Option<&DeepFacts>) -> FailureKind {
 /// - `nvidia-smi` answered with an error, or listed no GPUs;
 /// - `cuda`: torch imported, isn't CPU-only, and CUDA failed to initialise (torch's error,
 ///   e.g. `CUDA unknown error`) while nvidia-smi lists the GPU;
-/// - `device_count`: torch's count disagrees with nvidia-smi's (or is 0), falls short of the
-///   GPUs the provider rented the pod with, or it raised;
+/// - `device_count`: torch's count disagrees with nvidia-smi's (or is 0), or it raised;
 /// - `gpuN`: the tensor op reported an error or a wrong result (NaN matmul);
 /// - `peer_copy`: a copy reported garbage (`mismatch`) or an error.
 ///
@@ -816,7 +816,10 @@ pub fn failure_kind_of(name: &str, facts: Option<&DeepFacts>) -> FailureKind {
 /// or being killed before it reported (a crash, the OOM killer — `torch`, and any GPU check
 /// left `not reported`), a driver below the configured floor or one torch calls too old for
 /// its CUDA (policy: placement filters by it), NCCL at all, and any check this doesn't know.
-/// Pure.
+/// Nor a `device_count` that FAILs only by the provider's count ([`held_to_provider`]: nvidia-smi
+/// agrees with torch, or can't count): still a FAIL, replaced now, but one wrong provider field
+/// would turn every machine it touched away for days, fleet-wide (review of `db8dff8..da53b0c`,
+/// claude #2). Pure.
 pub fn condemns_machine(c: &Check, f: &DeepFacts) -> bool {
     let timed_out = |s: &str| {
         let s = s.to_ascii_lowercase();
@@ -840,7 +843,10 @@ pub fn condemns_machine(c: &Check, f: &DeepFacts) -> bool {
                 && smi_lists_gpus
                 && f.cuda_error.as_deref().is_some_and(|e| error(e) && !e.to_ascii_lowercase().contains("too old"))
         }
-        "device_count" => f.device_count.is_some() || f.device_count_error.as_deref().is_some_and(error),
+        "device_count" => {
+            (f.device_count.is_some() || f.device_count_error.as_deref().is_some_and(error))
+                && count_check(f).status == Status::Fail
+        }
         "peer_copy" => f.peer.values().any(|r| r == "mismatch" || (r.starts_with("error") && error(r))),
         name => match name.strip_prefix("gpu").and_then(|i| i.parse::<u32>().ok()) {
             Some(i) => f.tensor.get(&i).is_some_and(|r| r != "ok" && error(r)),
@@ -1151,15 +1157,17 @@ fn held_to_provider(f: &DeepFacts, c: Check) -> Check {
     Check::new(c.name, Fail, format!("torch sees {t} GPU(s), the provider reports {p}"))
 }
 
-/// Device count, per-GPU tensor op, peer copies and NCCL — only once CUDA is available.
-fn gpu_checks(f: &DeepFacts, out: &mut Vec<Check>) {
+/// The `device_count` check on what the machine itself shows: torch's count against
+/// nvidia-smi's (or, under MIG, the slices `-L` lists), 0, or torch raising — the provider's
+/// count aside ([`held_to_provider`] adds that). Apart so that [`condemns_machine`] can tell a
+/// count the machine contradicts from one only the provider's field does.
+fn count_check(f: &DeepFacts) -> Check {
     use Status::*;
-    let n = f.device_count;
     // Under MIG torch sees the slices, and `--query-gpu` lists only their parent card(s): the
     // count to match is the slices `nvidia-smi -L` lists — unless whole cards sit beside them.
     let slices = f.mig_devices.filter(|&m| m > 0 && !f.mixed_inventory());
     let smi = slices.map(|m| (m, format!("{m} MIG slice(s)"))).or_else(|| f.smi_count().map(|s| (s, s.to_string())));
-    let count = match (n, smi) {
+    match (f.device_count, smi) {
         (None, _) => Check::new(
             "device_count",
             Fail,
@@ -1184,8 +1192,14 @@ fn gpu_checks(f: &DeepFacts, out: &mut Vec<Check>) {
             Check::new("device_count", Pass, format!("{t} (MIG slice(s); nvidia-smi count unknown)"))
         }
         (Some(t), None) => Check::new("device_count", Pass, format!("{t} (nvidia-smi count unknown)")),
-    };
-    out.push(held_to_provider(f, count));
+    }
+}
+
+/// Device count, per-GPU tensor op, peer copies and NCCL — only once CUDA is available.
+fn gpu_checks(f: &DeepFacts, out: &mut Vec<Check>) {
+    use Status::*;
+    let n = f.device_count;
+    out.push(held_to_provider(f, count_check(f)));
 
     // One line per GPU torch can see (plus any result reported beyond that count).
     let mut indices: std::collections::BTreeSet<u32> = (0..n.unwrap_or(0)).collect();
@@ -2885,11 +2899,23 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
         let no_driver = edit(&mig_unknown, &[("driver_proc", None), ("torch_driver_cuda", None)]);
         let driver = |n: u32| check(&PodHealth::checked(&slices(Some(n)), parse_deep(&no_driver), &cuda124()).checks, "driver").clone();
         assert_eq!((driver(1).status, driver(2)), (Warn, Check::new("driver", Skip, "needs nvidia-smi")));
-        // The case only the provider's count catches: a host failure, and evidence enough to
-        // remember the machine by.
-        let h = PodHealth::checked(&rented(Some(8)), parse_deep(&smi_rows(&torch_ok(7), 7)), &cuda124());
-        assert_eq!(h.failure_kind(), Some(FailureKind::Host));
-        assert!(condemns_machine(check(&h.checks, "device_count"), h.facts.as_ref().unwrap()));
+        // The case only the provider's count catches: a host failure, replaced now — but never
+        // evidence to remember the machine by (review of `db8dff8..da53b0c`, claude #2): a wrong
+        // provider field would turn every machine it touched away. Where nvidia-smi can't count,
+        // the same. Where nvidia-smi contradicts torch itself, the machine is remembered.
+        let now = 1_760_000_000;
+        let timed_out = edit(&torch_ok(7), &[("smi", Some("error: nvidia-smi timed out after 10s"))]);
+        for (label, out) in [("nvidia-smi 7", smi_rows(&torch_ok(7), 7)), ("nvidia-smi timed out", timed_out)] {
+            let h = PodHealth::checked(&rented(Some(8)), parse_deep(&out), &cuda124());
+            let c = check(&h.checks, "device_count");
+            assert_eq!((c.status, h.status, h.failure_kind()), (Fail, Fail, Some(FailureKind::Host)), "{label}: {:#?}", h.checks);
+            assert!(!condemns_machine(c, h.facts.as_ref().unwrap()), "{label}");
+            assert_eq!(crate::snapshot::bad_host_record(&rented(Some(8)), &h, now), None, "{label}: {:#?}", h.checks);
+        }
+        let h = PodHealth::checked(&rented(Some(8)), parse_deep(&smi_rows(&torch_ok(7), 8)), &cuda124());
+        assert!(condemns_machine(check(&h.checks, "device_count"), h.facts.as_ref().unwrap()), "{:#?}", h.checks);
+        let (key, bad) = crate::snapshot::bad_host_record(&rented(Some(8)), &h, now).expect("remembered");
+        assert_eq!((key.as_str(), bad.reason.as_str()), ("runpod machine m8x2k", "device_count: torch sees 7 GPU(s), nvidia-smi 8"));
         // The live MIG slice, its provider counting 1: PASS.
         let live = Pod { gpu_type: Some("B300 MIG 34GB".into()), gpu_count: Some(1), ..pod("mig8", "1.2.3.4") };
         assert_eq!(PodHealth::checked(&live, parse_deep(&live8_b300_slice()), &cuda13()).status, Pass);

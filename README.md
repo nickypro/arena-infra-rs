@@ -430,10 +430,12 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     terminated (even with no attempt left). A host FAIL on a machine the provider names
     (RunPod/Vast machine id — never an IP) is also **remembered for 72 h** in the health cache
     — but only for definite, machine-level evidence: a CUDA/driver error from torch while
-    nvidia-smi lists the GPU, an nvidia-smi error or missing GPUs, a GPU count mismatch, a
-    wrong result (NaN matmul, garbage peer copy). Never a timeout (python's 75 s, nvidia-smi's
-    10 s, NCCL), python dying before it reported, a driver below the floor, or NCCL: those
-    still replace the pod in that run, and are forgotten with it. Any pod that lands on a
+    nvidia-smi lists the GPU, an nvidia-smi error or missing GPUs, a GPU count mismatch
+    between torch and nvidia-smi, a wrong result (NaN matmul, garbage peer copy). Never a
+    timeout (python's 75 s, nvidia-smi's 10 s, NCCL), python dying before it reported, a
+    driver below the floor, NCCL, or fewer GPUs than the provider's count where nvidia-smi
+    agrees with torch or can't count (one wrong provider field would ban machines
+    fleet-wide): those still replace the pod in that run, and are forgotten with it. Any pod that lands on a
     remembered machine later — another name's first pod, or any pod of a later `up` — is
     turned away the same way before setup (`landed on runpod machine …, which failed the deep
     check 3h ago (<UTC time>, <pod>: cuda: …) — rejecting it`; the summary says so too);
