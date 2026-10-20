@@ -537,7 +537,7 @@ fn a_resolve_is_read_back_and_said_in_a_line() {
 #[test]
 fn the_scripts_parse_under_sh() {
     let cmd = resolve_command("/root/ARENA_materials", 3, "merge 1760000000 abc", "1-2", "w1d1/devtest-a");
-    let script = format!("set -- /root/ARENA_materials 10800 'merge 1760000000 abc' 1-2 3 w1d1/devtest-a 99614720\n{}", resolve_script());
+    let script = format!("set -- /root/ARENA_materials 10800 'merge 1760000000 abc' 1-2 3 w1d1/devtest-a 99614720 104857600\n{}", resolve_script());
     for (name, script) in [("look", look_script()), ("resolve", resolve_script()), ("resolve with its arguments", script.clone())] {
         let o = std::process::Command::new("sh").arg("-n").arg("-c").arg(&script).output().unwrap();
         assert!(o.status.success(), "{name}: {}", String::from_utf8_lossy(&o.stderr));
@@ -1845,6 +1845,116 @@ fn only_the_verified_courses_content_escapes_redaction() {
     assert_eq!((code, rep.resolved.as_deref()), (Some(0), Some("merge")), "{said}");
     assert_eq!(rep.redacted, ["keyed.py"], "{said}");
     redacted_in_head(&r, "keyed.py", redacted, &keyed, "own merge");
+}
+
+/// The course's own content isn't refused as the participant's (review ai-review claude #3). What
+/// a verified course merge stages as MERGE_HEAD has it is sized by GitHub's limit (100 MiB), as the
+/// backup sizes what it pushes: a 96 MB course file goes in. Unverified (no course ref), git's
+/// 95 MB limit holds and it stays BUSY — in words that never tell the participant to unstage what
+/// they never staged. A course submodule (a gitlink the staged .gitmodules lists, as the backup's
+/// `is_submodule` reads it) isn't refused; a course gitlink .gitmodules doesn't list is, in the
+/// course's words. And a conflicted binary file taken whole from the verified course is sized the
+/// same way (a 1000-byte limit here).
+#[cfg(unix)]
+#[test]
+fn the_courses_own_content_is_sized_by_githubs_limit_and_its_submodules_kept() {
+    // A 96 MB file only the course added, beside the usual conflicts.
+    for verified in [true, false] {
+        let r = Repo::new(if verified { "course-big" } else { "course-big-unverified" });
+        r.course_commit(&[("model.pt", &vec![0u8; 96 << 20][..])], r.now - 6 * DAY);
+        r.merge_conflict(r.now - 5 * DAY, r.now - 10 * DAY);
+        if verified {
+            r.verified_course("MERGE_HEAD");
+        }
+        r.age(4 * HOUR);
+        let conflicts = r.unmerged();
+        let (code, rep, said) = r.resolve(3, &r.look());
+        if verified {
+            assert_eq!((code, rep.resolved.as_deref()), (Some(0), Some("merge")), "{said}");
+            assert_eq!(r.git(&r.work, &["cat-file", "-s", "HEAD:model.pt"]), (96u64 << 20).to_string());
+        } else {
+            let why = format!(
+                "model.pt comes in from the merged branch (MERGE_HEAD) at {} bytes, over git's {GIT_MAX_FILE_BYTES_FOR_TESTS}-byte limit: \
+                 arena won't commit it — finish the merge yourself, or abort it, on the pod",
+                96 << 20
+            );
+            assert_eq!((code, rep.refused.as_deref()), (Some(RESOLVE_REFUSED_EXIT), Some(why.as_str())), "{said}");
+            r.untouched(&conflicts, "unverified");
+        }
+    }
+
+    // A course commit adding a gitlink (`lib` listed in .gitmodules, or `vendor` not), after the
+    // course's conflicting fix, the course verified.
+    for (case, gitmodules, why) in [
+        ("course-submodule", true, None),
+        (
+            "course-gitlink",
+            false,
+            Some(
+                "vendor comes in from the merged branch (MERGE_HEAD) as a nested repo (a gitlink: its commit id, none of its files) that \
+                 .gitmodules doesn't list: arena won't commit it — finish the merge yourself, or abort it, on the pod",
+            ),
+        ),
+    ] {
+        let r = Repo::new(case);
+        r.diverge(r.now - 5 * DAY, r.now - 10 * DAY);
+        let path = if gitmodules { "lib" } else { "vendor" };
+        let pinned = r.git(&r.course, &["rev-parse", "HEAD"]);
+        if gitmodules {
+            r.put_in(&r.course, ".gitmodules", b"[submodule \"lib\"]\n\tpath = lib\n\turl = https://example.invalid/lib.git\n");
+            r.git(&r.course, &["add", ".gitmodules"]);
+        }
+        r.git(&r.course, &["update-index", "--add", "--cacheinfo", &format!("160000,{pinned},{path}")]);
+        let (ok, said) = r.git_at(&r.course, r.now - 5 * DAY + 60, &["commit", "-q", "-m", "a nested repo"]);
+        assert!(ok, "{said}");
+        r.pull_conflicted();
+        r.verified_course("MERGE_HEAD");
+        r.age(4 * HOUR);
+        let conflicts = r.unmerged();
+        let (code, rep, said) = r.resolve(3, &r.look());
+        match why {
+            None => {
+                assert_eq!((code, rep.resolved.as_deref()), (Some(0), Some("merge")), "{case}: {said}");
+                assert_eq!(r.git(&r.work, &["ls-tree", "HEAD", "lib"]), format!("160000 commit {pinned}\tlib"), "{case}: the submodule committed");
+            }
+            Some(why) => {
+                assert_eq!((code, rep.refused.as_deref()), (Some(RESOLVE_REFUSED_EXIT), Some(why)), "{case}: {said}");
+                r.untouched(&conflicts, case);
+            }
+        }
+    }
+
+    // A binary file both changed, the course's side newer and taken whole: under a 1000-byte limit,
+    // 4096 bytes go in from the verified course, and are refused unverified.
+    let bin = |b: u8| {
+        let mut v = vec![b; 4096];
+        v[0] = 0;
+        v
+    };
+    for verified in [true, false] {
+        let r = Repo::new(if verified { "course-bin" } else { "course-bin-unverified" });
+        r.add_base(&[("w.bin", &bin(1)[..])]);
+        r.course_commit(&[("w.bin", &bin(2)[..])], r.now - 5 * DAY);
+        r.my_commit(&[("w.bin", &bin(3)[..])], r.now - 10 * DAY);
+        r.pull_conflicted();
+        if verified {
+            r.verified_course("MERGE_HEAD");
+        }
+        r.age(4 * HOUR);
+        let conflicts = r.unmerged();
+        let (code, rep, said) = r.resolve_with(3, &r.look(), 1000, &[]);
+        if verified {
+            assert_eq!((code, taken(&rep)), (Some(0), vec![("w.bin".to_string(), "theirs".to_string(), Taken::File)]), "{said}");
+            assert_eq!(r.read("w.bin"), bin(2));
+        } else {
+            assert_eq!(
+                (code, rep.refused.as_deref()),
+                (Some(RESOLVE_REFUSED_EXIT), Some("w.bin would be 4096 bytes, over git's 1000-byte limit: never committed — resolve it on the pod")),
+                "{said}"
+            );
+            r.untouched(&conflicts, "bin unverified");
+        }
+    }
 }
 
 /// A notebook stays valid JSON (review ai-review claude #3), and is never taken whole from one

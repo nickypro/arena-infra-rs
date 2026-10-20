@@ -126,8 +126,9 @@ pub const RESOLVE_KILL_AFTER_SECS: u64 = 10;
 /// The resolve of one pod: [`resolve_script`] with the repo, the quiet period (`hours`), the
 /// operation and the files as the look before the copy saw them ([`Look::op_key`],
 /// [`Look::print`]), the copy's name for the commit's words (`copy`: `w2d1/devtest-alice`), and
-/// the largest file it may commit (`max_bytes`; tests pass a small one) — bounded on the pod
-/// ([`RESOLVE_BOUND_SECS`]).
+/// the largest file it may commit (`max_bytes`; tests pass a small one) — the verified course's
+/// own content by GitHub's limit instead ([`crate::backup::GITHUB_FILE_LIMIT_BYTES`], what the
+/// backup sizes the commits it pushes by) — bounded on the pod ([`RESOLVE_BOUND_SECS`]).
 pub fn resolve_command_limited(repo: &str, hours: u64, op: &str, print: &str, copy: &str, max_bytes: u64) -> String {
     resolve_command_bounded(repo, hours, op, print, copy, max_bytes, (RESOLVE_BOUND_SECS, RESOLVE_KILL_AFTER_SECS))
 }
@@ -142,7 +143,8 @@ pub fn resolve_command_limited(repo: &str, hours: u64, op: &str, print: &str, co
 fn resolve_command_bounded(repo: &str, hours: u64, op: &str, print: &str, copy: &str, max_bytes: u64, bound: (u64, u64)) -> String {
     let (secs, kill_after) = bound;
     let (quiet, h, max) = ((hours * 3600).to_string(), hours.to_string(), max_bytes.to_string());
-    let args = [repo, &quiet, op, print, &h, copy, &max].map(shell_word).join(" ");
+    let limit = crate::backup::GITHUB_FILE_LIMIT_BYTES.to_string();
+    let args = [repo, &quiet, op, print, &h, copy, &max, &limit].map(shell_word).join(" ");
     let script = format!("set -- {args}\n{}", resolve_script());
     let (stopped, killed) = resolve_stop_words(secs, kill_after);
     crate::backup::bounded_sh(&script, "arena-resolve", secs, kill_after, &stopped, &killed)

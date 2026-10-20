@@ -1,7 +1,7 @@
 # arena resolve: finish an operation left in progress in one pod's checkout once nothing in it has
 # changed for a while — what `pods backup` runs on a pod whose backup said BUSY, after copying it.
 #
-#   set -- <repo> <quiet secs> <op> <print> <hours> <copy> <max file bytes>   (its first line)
+#   set -- <repo> <quiet secs> <op> <print> <hours> <copy> <max file bytes> <limit bytes>   (its first line)
 #
 # Rendered and parsed by arena_core::resolve (resolve_command / parse_resolve), which prepends that
 # first line and runs it under `sh -c`, whatever the pod's login shell, bounded by `timeout` there
@@ -24,8 +24,10 @@
 #     leaves the operation alone, said: never taken whole from one side instead.
 # A file over <max file bytes> (the backup's git limit) anywhere in that is never committed: left
 # alone, said — nor, for a merge or a cherry-pick (whose commit takes the whole index), any path
-# already staged: a blob over that limit, a new gitlink, or a notebook that isn't valid JSON (or
-# can't be checked). The state before is kept first in
+# already staged: a blob over that limit, a new gitlink no submodule in .gitmodules, or a notebook
+# that isn't valid JSON (or can't be checked). The verified course's own content (below) is sized
+# by <limit bytes> instead — GitHub's, which the backup sizes what it pushes by — and what the
+# participant never staged is never said as theirs to unstage. The state before is kept first in
 # <git dir>/arena-resolved/<UTC stamp>/ (the conflicted files as they were, git's own state files,
 # the old HEAD, the index, a README), then the state is read again — the operation and its commit,
 # HEAD, the conflicts, the index, every file — and the pod looked at again for anyone at work
@@ -70,6 +72,7 @@ WANT_PRINT=$4
 HOURS=$5
 COPY=$6
 MAX=$7
+LIMIT=$8
 cd "$REPO" || exit 2
 cd "$(git rev-parse --show-toplevel)" || exit 2
 TOP=$(pwd)
@@ -240,16 +243,39 @@ unfit() {
     # staged is the other side's — would make the second read as the first.)
     awk 'FILENAME == ARGV[1] { o[$0] = 1; next } { i = index($0, "\t"); p = substr($0, i + 1)
         print substr($0, 1, i - 1) " " ((p in o) ? "yours" : "theirs") "\t" p }' "$T.so" "$T.sd" > "$T.st"
-    _g=$(awk '{ i = index($0, "\t"); split(substr($0, 1, i - 1), m, " ") } m[2] == "160000" && m[1] != "160000" { print substr($0, i + 1); exit }' "$T.st")
+    # A submodule is no nested repo to refuse: a gitlink whose path .gitmodules lists, as the
+    # backup's `is_submodule` reads it (review ai-review claude #3) — here the .gitmodules staged,
+    # the one the commit takes.
+    git config --blob :.gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null | cut -d' ' -f2- > "$T.subs"
+    _g=$(awk 'FILENAME == ARGV[1] { s[$0] = 1; next } { i = index($0, "\t"); p = substr($0, i + 1); split(substr($0, 1, i - 1), m, " ") }
+        m[2] == "160000" && m[1] != "160000" && !(p in s) { print m[5] "\t" p; exit }' "$T.subs" "$T.st")
     if [ -n "$_g" ]; then
-        echo "$_g is staged as a nested repo (a gitlink: its commit id, none of its files): never committed — unstage it, or abort, on the pod"
+        # What the other side brings, the participant never staged: never theirs to unstage.
+        if [ "${_g%%"$TAB"*}" = theirs ]; then
+            echo "${_g#*"$TAB"} comes in from $them ($ref) as a nested repo (a gitlink: its commit id, none of its files) that .gitmodules doesn't list: arena won't commit it — finish the $what yourself, or abort it, on the pod"
+        else
+            echo "${_g#*"$TAB"} is staged as a nested repo (a gitlink: its commit id, none of its files): never committed — unstage it, or abort, on the pod"
+        fi
         return
     fi
     awk '{ split($0, m, " ") } m[2] == "100644" || m[2] == "100755" || m[2] == "120000" { print m[3] }' "$T.st" | sort -u \
         | git cat-file --batch-check='%(objectname) %(objectsize)' > "$T.ss" || { echo "the staged files' sizes couldn't be read"; return; }
-    _s=$(awk -v max="$MAX" 'FILENAME == ARGV[1] { s[$1] = $2; next } { i = index($0, "\t"); split(substr($0, 1, i - 1), m, " ") }
-        (m[3] in s) && s[m[3]] + 0 > max + 0 {
-            printf "%s is staged at %s bytes, over git'"'"'s %s-byte limit: never committed — unstage it, or abort, on the pod\n", substr($0, i + 1), s[m[3]], max
+    # Sized by git's limit (<max file bytes>) — but the verified course's own content (COURSE, and
+    # staged as MERGE_HEAD has it) by GitHub's (<limit bytes>): the backup pushes a file between the
+    # two, and the course's own would otherwise leave every such merge BUSY for good (review
+    # ai-review claude #3).
+    _s=$(awk -v max="$MAX" -v limit="$LIMIT" -v course="$COURSE" -v them="$them ($ref)" -v what="$what" '
+        FILENAME == ARGV[1] { s[$1] = $2; next }
+        { i = index($0, "\t"); p = substr($0, i + 1); split(substr($0, 1, i - 1), m, " ") }
+        !(m[3] in s) { next }
+        { theirs = m[5] == "theirs"; lim = (theirs && course == "yes") ? limit : max }
+        s[m[3]] + 0 > lim + 0 && !theirs {
+            printf "%s is staged at %s bytes, over git'"'"'s %s-byte limit: never committed — unstage it, or abort, on the pod\n", p, s[m[3]], lim
+            exit
+        }
+        s[m[3]] + 0 > lim + 0 {
+            printf "%s comes in from %s at %s bytes, over %s %s-byte limit: arena won'"'"'t commit it — finish the %s yourself, or abort it, on the pod\n",
+                p, them, s[m[3]], (lim == limit ? "GitHub'"'"'s" : "git'"'"'s"), lim, what
             exit
         }' "$T.ss" "$T.st")
     if [ -n "$_s" ]; then
@@ -442,7 +468,12 @@ while IFS="$TAB" read -r st m1 b1 m2 b2 m3 b3 p; do
         file) size=$(git cat-file -s "$wb") ;;
         *) size=0 ;;
     esac
-    [ "$size" -le "$MAX" ] || refuse "$p would be $size bytes, over git's $MAX-byte limit: never committed — resolve it on the pod"
+    # The verified course's own version, taken whole, is sized as `unfit` sizes it: by GitHub's limit.
+    if [ "$COURSE" = yes ] && [ "$act" = file ] && [ "$wb" = "$(git rev-parse -q --verify "$head:$p" 2>/dev/null)" ]; then
+        [ "$size" -le "$LIMIT" ] || refuse "$p would be $size bytes, over GitHub's $LIMIT-byte limit: never committed — resolve it on the pod"
+    else
+        [ "$size" -le "$MAX" ] || refuse "$p would be $size bytes, over git's $MAX-byte limit: never committed — resolve it on the pod"
+    fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$act" "$side" "$ot" "$tt" "$i" "$wm" "$p" >> "$T.plan"
 done < "$T.p"
 
