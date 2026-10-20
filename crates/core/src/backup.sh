@@ -422,8 +422,13 @@ if [ "$NEW" != "$TIP" ]; then
     # keys as modified — the state the redaction above leaves. No file on disk is touched.
     redact_index "$T.hmap" > /dev/null
 fi
-# The branch tracks origin's, as `push -u` made it (an id pushed sets no upstream): set once.
-if [ "$(git rev-parse --symbolic-full-name "$B@{upstream}" 2>/dev/null)" != "refs/remotes/origin/$B" ]; then
-    git branch --set-upstream-to="origin/$B" "$B" > /dev/null 2>&1 || true
+# The branch tracks origin's, as `push -u` made it (an id pushed sets no upstream), when it tracks
+# nothing yet — written to the config itself: `--set-upstream-to=origin/$B` needs the
+# remote-tracking ref, which a checkout whose `remote.origin.fetch` is narrowed (an image cloned
+# `--single-branch`, `origin` repointed by setup) never gets, and that branch had no upstream for
+# good — a bare `git push`/`git pull` saying so (review ai-review claude #7). An upstream the
+# branch has already is left as it is.
+if [ -z "$(git config "branch.$B.remote")" ]; then
+    git config "branch.$B.remote" origin && git config "branch.$B.merge" "refs/heads/$B" || true
 fi
 echo "PUSHED $B"

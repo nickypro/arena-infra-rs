@@ -1333,10 +1333,10 @@ mod tests {
         // "Nothing staged" isn't "nothing to do": push whenever ahead of origin's branch, or origin
         // has none — origin's, never the branch's own upstream (ai-review claude #6).
         assert!(s.contains(r#"git rev-list --count "refs/remotes/origin/$B..$TIP""#) && !s.contains("@{u}"));
-        // Exactly the commit it scanned, by its id (review ai-review codex #1, FIX7), the branch
-        // tracking origin's as `push -u` made it.
+        // Exactly the commit it scanned, by its id (review ai-review codex #1, FIX7), a branch with
+        // no upstream then tracking origin's as `push -u` made it — in the config itself (claude #7).
         assert!(s.contains(r#"git push origin "$NEW:refs/heads/$B""#) && !s.contains(r#"git push -u"#) && s.contains("PUSHED $B"));
-        assert!(s.contains(r#"git branch --set-upstream-to="origin/$B" "$B""#));
+        assert!(s.contains(r#"git config "branch.$B.remote" origin && git config "branch.$B.merge" "refs/heads/$B""#) && !s.contains("git branch --set-upstream-to"));
         assert!(s.contains("Arena Autocommit"));
         assert!(s.contains(r#"export GIT_SSH_COMMAND="ssh -i $KEY"#));
         assert_eq!(GIT_MAX_FILE_BYTES, 99_614_720, "95 MiB: headroom under GitHub's 100 MiB");
@@ -4112,12 +4112,13 @@ done
         assert_eq!(s.read("course_key.md"), example.as_bytes(), "the file on disk keeps it");
         assert_eq!(s.git(&s.work, &["rev-parse", "upstream/main"]), theirs, "upstream's own ref untouched");
         // A branch made from upstream's main, tracking it: origin has none of it, so it's pushed
-        // (redacted), and from then on tracks origin's.
+        // (redacted). The upstream it has is left as it is (FIX8, claude #7: only a branch with
+        // none is given origin's).
         s.git(&s.work, &["checkout", "-q", "-f", "-b", "mine", "upstream/main"]);
         assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "mine@{u}"]), "upstream/main");
         let (code, r, err) = s.backup();
         assert_eq!((code, r.outcome), (Some(0), Some((BACKUP_PUSHED, "mine".into()))), "{err}");
-        assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "mine@{u}"]), "origin/mine");
+        assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "mine@{u}"]), "upstream/main");
         assert!(!s.origin_holds(&key));
         let (code, r, _) = s.backup();
         assert_eq!((code, r.outcome), (Some(0), Some((BACKUP_NO_CHANGES, "mine".into()))));
@@ -4209,6 +4210,27 @@ done
         assert!(!s.origin_holds(&key));
         assert_eq!(s.git(&s.work, &["show", "origin/autocommit-x:late.py"]), "KEY = \"REDACTED-OPENROUTER-KEY\"");
         assert_eq!(origin_ref(), s.git(&s.work, &["rev-parse", "HEAD"]), "the rewrite, pushed and checked out");
+    }
+
+    /// Review ai-review claude #7 (FIX7's verification): pushing an id sets no upstream, and the
+    /// `--set-upstream-to=origin/<branch>` that stood in for `push -u` needs the remote-tracking
+    /// ref, which a checkout whose `remote.origin.fetch` is narrowed (an image cloned
+    /// `--single-branch`, `origin` repointed by setup) never gets: its branch had no upstream for
+    /// good, and the participant's bare `git push`/`git pull` said so. Now the first push writes
+    /// `branch.<branch>.remote`/`.merge` itself when the branch tracks nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_branch_with_no_upstream_tracks_origins_after_its_first_push_whatever_the_fetch() {
+        let s = GitSandbox::new("narrow-fetch", 1_000_000);
+        s.git(&s.work, &["config", "remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/main"]);
+        s.git(&s.work, &["checkout", "-q", "-b", "autocommit-y"]);
+        std::fs::write(s.work.join("notes.md"), "notes\n").unwrap();
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome), (Some(0), Some((BACKUP_PUSHED, "autocommit-y".into()))), "{err}");
+        let tracked = s.run(&format!("git -C {} rev-parse -q --verify refs/remotes/origin/autocommit-y", shell_quote(s.work.to_str().unwrap())));
+        assert!(!tracked.status.success(), "no remote-tracking ref: the fetch is narrowed");
+        let config = |key: &str| s.git(&s.work, &["config", &format!("branch.autocommit-y.{key}")]);
+        assert_eq!((config("remote"), config("merge")), ("origin".to_string(), "refs/heads/autocommit-y".to_string()));
     }
 
     /// Review ai-review claude #9: on main the check for changes to tracked files was the porcelain
