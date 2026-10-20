@@ -1036,13 +1036,19 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     checks stand in (its count, a tensor op on each, the memory it reports) and the slice
     PASSes if they all pass. Anywhere else a failing nvidia-smi FAILs whatever torch says: on
     whole cards that is how a GPU fallen off the bus looks, and torch sees only the survivors.
+    A slice somewhere isn't enough: every GPU of the pod must be shown to be one — the
+    provider's GPU count, when known, no more than the slices `nvidia-smi -L` lists (else
+    those torch names `… MIG …`), nor than torch sees where nvidia-smi can't count, and torch
+    naming no whole card beside a slice. Else (a mixed pod that lost its whole card, its slice
+    still there) it FAILs as whole GPUs do.
     With no driver version from nvidia-smi, the driver comes from
     `/proc/driver/nvidia/version` or, failing that, the CUDA version the driver supports
     (libcuda's, else torch's) against the CUDA floor (the CUDA column marks it `12.8*`). Under
     MIG, torch's count is matched with the slices `nvidia-smi -L` lists and the provider's
     count: the same PASSes, more FAILs, fewer **WARNs** — `torch sees 1 of the 2 MIG slices —
     CUDA may show a process one slice; check each with CUDA_VISIBLE_DEVICES=<MIG uuid>`, as the
-    other slice may be inaccessible or broken. A machine with whole cards beside its slices is
+    other slice may be inaccessible or broken — where every GPU is shown to be a slice (as
+    above), else fewer than the provider's count FAILs. A machine with whole cards beside its slices is
     counted as whole GPUs when `--query-gpu` lists more cards than there are slices; one whose
     whole cards don't outnumber its slices can't be told from a pure MIG one, and isn't
     supported. **WARN**: download < 2 MB/s or unreachable, < 10 GB free, host load above

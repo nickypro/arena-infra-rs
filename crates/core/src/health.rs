@@ -257,6 +257,38 @@ impl DeepFacts {
         }
     }
 
+    /// The MIG slices seen: those `nvidia-smi -L` lists, else torch's devices named as slices
+    /// (`… MIG 1g.5gb`). `None` when neither shows one.
+    fn mig_seen(&self) -> Option<u32> {
+        let named = self.torch_gpus.iter().filter(|g| g.name.as_deref().is_some_and(names_mig)).count() as u32;
+        self.mig_devices.filter(|&n| n > 0).or((named > 0).then_some(named))
+    }
+
+    /// Positive evidence that every GPU the pod was given is a MIG slice: what the MIG fallback
+    /// ([`smi_check`]) and a provider undercount's WARN ([`held_to_provider`]) need (review of
+    /// `db8dff8..da53b0c`, codex). [`Self::is_mig`] shows only that slices *exist*. Take a mixed
+    /// pod, a whole card beside a slice, whose whole card fell off the bus: `--query-gpu` fails,
+    /// so there is no inventory to call it mixed by ([`Self::mixed_inventory`]), and `-L` and
+    /// torch still show the slice. It passed through the fallback, and its missing card read as
+    /// a MIG undercount (a WARN, exit 0). So, besides MIG and no whole cards in the inventory:
+    /// - the GPUs the provider rented the pod with, when known, are no more than the slices
+    ///   seen ([`Self::mig_seen`]);
+    /// - with nvidia-smi unable to count them, no more than torch sees;
+    /// - torch names no whole card beside a slice.
+    ///
+    /// Anything short of that is ambiguous, and is judged as whole GPUs: a FAIL. Without the
+    /// provider's count, MIG and an inventory that isn't mixed are all there is to go on.
+    fn only_slices(&self) -> bool {
+        let named_whole = self.torch_gpus.iter().any(|g| g.name.as_deref().is_some_and(|n| !names_mig(n)));
+        let named_slice = self.torch_gpus.iter().any(|g| g.name.as_deref().is_some_and(names_mig));
+        if !self.is_mig() || self.mixed_inventory() || (named_whole && named_slice) {
+            return false;
+        }
+        let Some(p) = self.provider_gpus else { return true };
+        let uncounted_short = self.smi_count().is_none() && self.device_count.is_none_or(|t| p > t);
+        p <= self.mig_seen().unwrap_or(0) && !uncounted_short
+    }
+
     /// torch's own proof that the GPUs work: imported, CUDA available, at least one device, and
     /// the tensor op `ok` on every one (none missing, none failed). What stands in for
     /// nvidia-smi when it can't answer on a MIG slice — and nothing short of all of it: a GPU
@@ -1003,7 +1035,9 @@ fn vscode_check(f: &DeepFacts, p: &HealthPolicy) -> Check {
 /// as before the fallback: on whole cards the same symptoms are a GPU fallen off the bus
 /// (`--query-gpu`'s `Unable to determine the device handle`), and torch, which enumerates only
 /// the GPUs that survived, proves nothing about the one that didn't (review of `27adfe4..db8dff8`,
-/// #1: an 8-GPU pod with one lost read as a WARN — exit 0, not replaced, not remembered).
+/// #1: an 8-GPU pod with one lost read as a WARN — exit 0, not replaced, not remembered). A
+/// slice is not enough either: every GPU of the pod must be one ([`DeepFacts::only_slices`]),
+/// else a mixed pod's lost whole card hides behind its surviving slice.
 fn smi_check(f: &DeepFacts) -> Check {
     use Status::*;
     // (the FAIL detail; what the fallback's detail says went wrong, short)
@@ -1027,7 +1061,7 @@ fn smi_check(f: &DeepFacts) -> Check {
         Some(e) => error(e),
         None => same("not reported"),
     };
-    if !(f.is_mig() && f.torch_proves_gpus()) {
+    if !(f.only_slices() && f.torch_proves_gpus()) {
         return Check::new("nvidia-smi", Fail, fail);
     }
     let (label, mem) = (f.gpu_label(), f.torch_mem().map(|m| format!(", {m}")).unwrap_or_default());
@@ -1078,7 +1112,7 @@ fn driver_check_by_cuda(f: &DeepFacts, p: &HealthPolicy) -> Check {
             };
         }
     }
-    if smi_ok || (f.is_mig() && f.torch_proves_gpus()) {
+    if smi_ok || (f.only_slices() && f.torch_proves_gpus()) {
         let torch = f
             .torch_driver_cuda
             .as_deref()
@@ -1102,25 +1136,19 @@ const MIG_UNDERCOUNT_HINT: &str = "CUDA may show a process one slice; check each
 /// The `device_count` check `c` (torch against nvidia-smi) with torch's count also held to the
 /// provider's ([`DeepFacts::provider_gpus`]): a GPU gone from nvidia-smi's view too — fallen
 /// off the bus, nvidia-smi listing only the survivors or unable to count — is still one fewer
-/// than the pod was rented with (review of `27adfe4..db8dff8`, #1). Fewer FAILs on whole GPUs,
-/// and WARNs under MIG as fewer slices do; as many or more says nothing (an API count of 0 is
-/// [`PodHealth::checked`]'s `provider` WARN). It only ever makes `c` worse: never a FAIL into
-/// a PASS, and where both say the same the detail stays nvidia-smi's.
+/// than the pod was rented with (review of `27adfe4..db8dff8`, #1). Fewer FAILs, unless every
+/// GPU of the pod is shown to be a slice ([`DeepFacts::only_slices`]: else the missing one may be
+/// a whole card). There it is `-L`'s undercount, already a WARN — `only_slices` needs `-L` to list
+/// as many slices as the provider rented — and stays as it is. As many or more says nothing (an
+/// API count of 0 is [`PodHealth::checked`]'s `provider` WARN). It only ever makes `c` worse:
+/// never a FAIL into a PASS, and a FAIL keeps nvidia-smi's detail.
 fn held_to_provider(f: &DeepFacts, c: Check) -> Check {
     use Status::*;
     let (Some(t), Some(p)) = (f.device_count, f.provider_gpus) else { return c };
-    if t >= p {
+    if t >= p || f.only_slices() || c.status == Fail {
         return c;
     }
-    let (status, detail) = if f.is_mig() && !f.mixed_inventory() {
-        (Warn, format!("torch sees {t} of the {p} MIG slices the provider reports — {MIG_UNDERCOUNT_HINT}"))
-    } else {
-        (Fail, format!("torch sees {t} GPU(s), the provider reports {p}"))
-    };
-    match (c.status, status) {
-        (Pass | Skip, _) | (Warn, Fail) => Check::new(c.name, status, detail),
-        _ => c,
-    }
+    Check::new(c.name, Fail, format!("torch sees {t} GPU(s), the provider reports {p}"))
 }
 
 /// Device count, per-GPU tensor op, peer copies and NCCL — only once CUDA is available.
@@ -2805,8 +2833,9 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
 
     /// torch's count held to the GPUs the provider reports for the pod as well as to
     /// nvidia-smi's (review of `27adfe4..db8dff8`, #1's third fix): fewer FAILs on whole GPUs —
-    /// above all where nvidia-smi lost the GPU too — and WARNs under MIG. It never turns a FAIL
-    /// into a PASS, and as many or more GPUs than the provider says changes nothing.
+    /// above all where nvidia-smi lost the GPU too — and under MIG unless every GPU rented is
+    /// shown to be a slice (FIX10), where `-L`'s undercount WARNs. It never turns a FAIL into a
+    /// PASS, and as many or more GPUs than the provider says changes nothing.
     #[test]
     fn torchs_count_is_held_to_the_providers() {
         use Status::*;
@@ -2821,8 +2850,6 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
         );
         let mig_unknown = smi_down("error: Failed to initialize NVML: Insufficient Permissions", A100_SLICE);
         let (whole_7, whole_8) = ("torch sees 7 GPU(s), the provider reports 8", "torch sees 8 GPU(s), nvidia-smi 9");
-        let mig_2 = "torch sees 1 of the 2 MIG slices the provider reports — CUDA may show a process one slice; check each \
-                     with CUDA_VISIBLE_DEVICES=<MIG uuid>";
         let mig_l = "torch sees 1 of the 2 MIG slices — CUDA may show a process one slice; check each with \
                      CUDA_VISIBLE_DEVICES=<MIG uuid>";
         // (label, pod, output, device_count's status and detail, the pod's verdict)
@@ -2836,10 +2863,16 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
             ("1 rented, torch 2", rented(Some(1)), smi_rows(&torch_ok(2), 2), Pass, "2 (matches nvidia-smi)", Pass),
             // A FAIL stays the FAIL it was.
             ("8 rented, nvidia-smi 9, torch 8", rented(Some(8)), smi_rows(&torch_ok(8), 9), Fail, whole_8, Fail),
-            // MIG: fewer slices WARN, as `-L`'s undercount does; the same count PASSes.
+            // MIG: fewer slices stay `-L`'s WARN where every GPU rented is shown to be a slice;
+            // the same count PASSes.
             ("MIG, 1 rented, torch 1", slices(Some(1)), mig_unknown.clone(), Pass, "1 (MIG slice(s); nvidia-smi count unknown)", Pass),
-            ("MIG, 2 rented, nvidia-smi can't count, torch 1", slices(Some(2)), mig_unknown, Warn, mig_2, Warn),
-            ("MIG, 2 rented, -L lists 2, torch 1", slices(Some(2)), mig_two_listed, Warn, mig_l, Warn),
+            ("MIG, 2 rented, -L lists 2, torch 1", slices(Some(2)), mig_two_listed.clone(), Warn, mig_l, Warn),
+            // Not shown (FIX10): the 1 slice torch names is all there is to see, nvidia-smi can't
+            // count, and the provider rented 2 — the other may be a whole card, lost. As on whole
+            // GPUs (no fallback either: nvidia-smi FAILs).
+            ("MIG, 2 rented, nvidia-smi can't count, torch 1", slices(Some(2)), mig_unknown.clone(), Fail, "torch sees 1 GPU(s), the provider reports 2", Fail),
+            // More rented than `-L` lists slices: the rest aren't slices.
+            ("MIG, 3 rented, -L lists 2, torch 1", slices(Some(3)), mig_two_listed, Fail, "torch sees 1 GPU(s), the provider reports 3", Fail),
         ];
         // (A 12.4 floor: `smi_down`'s /proc driver is 570.)
         for (label, p, out, status, detail, verdict) in cases {
@@ -2847,6 +2880,11 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
             assert_eq!(check(&h.checks, "device_count"), &Check::new("device_count", status, detail), "{label}");
             assert_eq!(h.status, verdict, "{label}: {:#?}", h.checks);
         }
+        // No driver version anywhere: the driver check stands in for nvidia-smi only where the
+        // fallback does — a WARN with the provider's 1, waiting on nvidia-smi with its 2.
+        let no_driver = edit(&mig_unknown, &[("driver_proc", None), ("torch_driver_cuda", None)]);
+        let driver = |n: u32| check(&PodHealth::checked(&slices(Some(n)), parse_deep(&no_driver), &cuda124()).checks, "driver").clone();
+        assert_eq!((driver(1).status, driver(2)), (Warn, Check::new("driver", Skip, "needs nvidia-smi")));
         // The case only the provider's count catches: a host failure, and evidence enough to
         // remember the machine by.
         let h = PodHealth::checked(&rented(Some(8)), parse_deep(&smi_rows(&torch_ok(7), 7)), &cuda124());
@@ -2860,14 +2898,10 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
         assert!(v.get("provider_gpus").is_none(), "{v}");
     }
 
-    /// Two slices of one parent: `--query-gpu` lists the 1 parent — the count to match is the
-    /// slices `nvidia-smi -L` lists. CUDA may show a process just one of them, or the other may
-    /// be inaccessible or broken: torch seeing fewer WARNs (codex #2 of the review of
-    /// `27adfe4..db8dff8`); more FAILs. Whole cards beside the slices: counted as before MIG.
-    #[test]
-    fn mig_slices_are_counted_against_nvidia_smi_l() {
-        use Status::*;
-        let two_slices = edit(
+    /// Two MIG slices of one A100, torch seeing and proving both: `--query-gpu` lists the parent,
+    /// `-L` the 2 slices.
+    fn mig_two_slices() -> String {
+        edit(
             HEALTHY_2GPU,
             &[
                 ("gpu.0.name", Some("NVIDIA A100-SXM4-40GB")),
@@ -2879,16 +2913,78 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
                 ("mig_devices", Some("2")),
                 ("mig_profile", Some("1g.5gb")),
             ],
+        )
+    }
+
+    /// A mixed machine: one A100 cut into a slice, one whole (`--query-gpu` lists both cards,
+    /// `-L` the one slice), torch seeing and proving both.
+    fn mig_mixed() -> String {
+        edit(&mig_two_slices(), &[("gpu.1.name", Some("NVIDIA A100-SXM4-40GB")), ("smi_gpus", Some("2")), ("mig_devices", Some("1"))])
+    }
+
+    /// Review of `db8dff8..da53b0c`, codex: the MIG fallback took a slice's presence for proof
+    /// that the pod is all slices. The mixed pod loses its whole card: `--query-gpu` fails, so no
+    /// inventory says it is mixed; `-L` still lists the slice, and torch sees and proves just
+    /// that one. With the provider counting 2, nvidia-smi PASSed through the fallback and the
+    /// missing card read as a MIG undercount (a WARN, exit 0: not replaced). Now the fallback and
+    /// that WARN need every GPU of the pod shown to be a slice: the provider's 2 is more than the
+    /// 1 slice seen, so it FAILs as a whole-GPU pod does. Where the count fits the slices seen,
+    /// both stand; torch naming a whole card beside a slice is no pure-MIG pod whatever the
+    /// provider says.
+    #[test]
+    fn a_mixed_pod_that_lost_its_whole_gpu_fails_though_its_slice_survives() {
+        use Status::*;
+        let query = "Unable to determine the device handle for GPU 0000:41:00.0: Unknown Error";
+        let query_error = format!("error: {query}");
+        let query_failed = edit(
+            &without(&mig_mixed(), &["gpu.", "smi_gpus"]),
+            &[("smi_query", Some(query_error.as_str())), ("driver_proc", Some("580.65.06")), ("tgpu.0.name", Some(A100_SLICE))],
         );
+        let lost = edit(
+            &without(&query_failed, &["tensor.1", "peer.", "nccl"]),
+            &[("device_count", Some("1")), ("peer", Some("skipped (1 GPU)")), ("nccl", Some("skipped (1 GPU)"))],
+        );
+        let f = parse_deep(&lost);
+        assert_eq!((f.smi_count(), f.mig_devices, f.device_count, f.mixed_inventory()), (None, Some(1), Some(1), false), "{lost}");
+        let rented = |n: Option<u32>| Pod { gpu_count: n, machine_id: Some("m8x2k".into()), ..pod("india", "1.2.3.4") };
+
+        let h = PodHealth::checked(&rented(Some(2)), f.clone(), &cuda124());
+        assert_eq!(check(&h.checks, "nvidia-smi"), &Check::new("nvidia-smi", Fail, query));
+        assert_eq!(check(&h.checks, "device_count"), &Check::new("device_count", Fail, "torch sees 1 GPU(s), the provider reports 2"));
+        assert_eq!((h.status, h.failure_kind()), (Fail, Some(FailureKind::Host)), "{:#?}", h.checks);
+
+        // The provider's count fits the one slice seen: the fallback stands, nothing is short.
+        let h = PodHealth::checked(&rented(Some(1)), f.clone(), &cuda124());
+        assert_eq!(check(&h.checks, "nvidia-smi").status, Pass, "{:#?}", h.checks);
+        assert_eq!(check(&h.checks, "device_count"), &Check::new("device_count", Pass, "1 (matches nvidia-smi's 1 MIG slice(s))"));
+        assert_eq!(h.status, Pass, "{:#?}", h.checks);
+
+        // torch sees a whole card beside the slice (both proven): a mixed pod by torch's own
+        // names, with or without the provider's count.
+        let named_whole = edit(&query_failed, &[("tgpu.1.name", Some("NVIDIA A100-SXM4-40GB"))]);
+        for n in [None, Some(2)] {
+            let h = PodHealth::checked(&rented(n), parse_deep(&named_whole), &cuda124());
+            assert_eq!(check(&h.checks, "nvidia-smi"), &Check::new("nvidia-smi", Fail, query), "provider {n:?}");
+            assert_eq!(h.status, Fail, "provider {n:?}: {:#?}", h.checks);
+        }
+    }
+
+    /// Two slices of one parent: `--query-gpu` lists the 1 parent — the count to match is the
+    /// slices `nvidia-smi -L` lists. CUDA may show a process just one of them, or the other may
+    /// be inaccessible or broken: torch seeing fewer WARNs (codex #2 of the review of
+    /// `27adfe4..db8dff8`); more FAILs. Whole cards beside the slices: counted as before MIG.
+    #[test]
+    fn mig_slices_are_counted_against_nvidia_smi_l() {
+        use Status::*;
+        let two_slices = mig_two_slices();
         let one_seen = edit(
             &without(&two_slices, &["tensor.1", "peer.", "nccl"]),
             &[("device_count", Some("1")), ("peer", Some("skipped (1 GPU)")), ("nccl", Some("skipped (1 GPU)"))],
         );
         let three_seen = edit(&two_slices, &[("device_count", Some("3")), ("tensor.2", Some("ok"))]);
         let mig_unknown = smi_down("error: Failed to initialize NVML: Insufficient Permissions", A100_SLICE);
-        // A mixed machine: one card cut into a slice, one whole (`--query-gpu` lists both, `-L`
-        // the one slice). More cards than slices: counted as whole GPUs, as before MIG.
-        let mixed = edit(&two_slices, &[("gpu.1.name", Some("NVIDIA A100-SXM4-40GB")), ("smi_gpus", Some("2")), ("mig_devices", Some("1"))]);
+        // More cards than slices: counted as whole GPUs, as before MIG.
+        let mixed = mig_mixed();
         let mixed_one_seen = edit(
             &without(&mixed, &["tensor.1", "peer.", "nccl"]),
             &[("device_count", Some("1")), ("peer", Some("skipped (1 GPU)")), ("nccl", Some("skipped (1 GPU)"))],
