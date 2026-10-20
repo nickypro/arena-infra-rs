@@ -1642,6 +1642,31 @@ fn the_state_is_read_again_right_before_changing_anything_and_before_the_commit(
             assert!(r.work.join(".git/MERGE_HEAD").exists(), "{case}: the merge still in progress");
         }
     }
+    // The checks cover exactly what is committed (FIX7, review ai-review codex #2, claude #5): the
+    // index was taken as a tree only after the checks and the redaction, so a `git add` landing
+    // between the checks' listing and that went in unchecked. Now it's taken before the checks
+    // and again after them, and the tree the commit must take is that one, redacted apart. A file
+    // staged right after the first `write-tree` (one no check would refuse): stopped once checked.
+    // An oversized file, or a key, staged while the redaction is worked out (after every check):
+    // stopped before the commit. Nothing committed either way.
+    let checking = "the index changed while arena was checking it — nothing committed — ";
+    let cases: [(&str, &str, String, &str); 3] = [
+        ("snap-late", "ARENA_TEST_HOOK_AFTER_SNAPSHOT", "echo 'late = 1' > late.py && git add late.py".into(), checking),
+        ("redact-big", "ARENA_TEST_HOOK_DURING_REDACTION", "head -c 4096 /dev/zero > big.bin && git add big.bin".into(), changed),
+        ("redact-key", "ARENA_TEST_HOOK_DURING_REDACTION", format!("printf 'KEY = \"{key}\"\\n' > secret.py && git add secret.py"), changed),
+    ];
+    for (case, hook, cmd, why) in cases {
+        let r = Repo::new(case);
+        r.merge_conflict(r.now - 5 * DAY, r.now - 10 * DAY);
+        let head = r.git(&r.work, &["rev-parse", "HEAD"]);
+        r.age(4 * HOUR);
+        let (code, rep, said) = r.resolve_with(3, &r.look(), 1000, &[(hook, &format!("cd '{}' && {cmd}", r.work.display()))]);
+        assert_eq!(code, Some(RESOLVE_FAILED_EXIT), "{case}: {said}");
+        let stamp = rep.saved.as_deref().and_then(|s| s.rsplit('/').next()).unwrap_or("?").to_string();
+        assert_eq!(rep.failed.unwrap_or_default(), format!("{why}the state before is in .git/arena-resolved/{stamp}/"), "{case}: {said}");
+        assert_eq!(r.git(&r.work, &["rev-parse", "HEAD"]), head, "{case}: nothing committed");
+        assert!(r.work.join(".git/MERGE_HEAD").exists(), "{case}: the merge still in progress");
+    }
 }
 
 /// What the resolve stages goes through the backup's redaction (review ai-review codex #5): a key

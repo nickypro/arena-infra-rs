@@ -61,7 +61,8 @@
 #   RESOLVED <what>          finished (exit 0)
 #   FAILED <step>            a step failed midway (exit 8): SAVED has the state before
 # ARENA_TEST_HOOK_BEFORE_CHANGE and ARENA_TEST_HOOK_BEFORE_FINISH, commands run right before the
-# re-reads, are set by tests only.
+# re-reads, and ARENA_TEST_HOOK_AFTER_SNAPSHOT and ARENA_TEST_HOOK_DURING_REDACTION, run after the
+# index is first taken as a tree and once the redaction is worked out, are set by tests only.
 set -u
 # A hangup, an interrupt, a TERM (the bound above, sent to the whole process group) or a broken
 # pipe ends the run as an exit, so the EXIT trap that removes its temporary files ($T.*, in the
@@ -656,10 +657,24 @@ done < "$T.plan"
 # history) — what is staged as MERGE_HEAD has it — goes in as it was published; HEAD's is
 # committed already. A stash pop's conflicts make no commit here: the backup after commits them,
 # redacted.
+#
+# The checks cover exactly what is committed (review ai-review codex #2, claude #5): the index is
+# taken as a tree first ($TREE0), then checked — `unfit` (sizes, gitlinks, notebooks) and the
+# staged markers — then taken again, and anything staged meanwhile, which a check may have missed,
+# stops it here. The redaction is applied to that tree apart, in an index of its own: $TREE, the
+# tree the commit must take, owes nothing to the participant's index after the checks. (Before, the
+# tree was taken after the checks and the redaction: a `git add` landing between the checks'
+# listing and it went in unchecked — a big file, or a key.)
+kept="the state before is in ${S#"$TOP"/}/"
 case $what in
     merge | cherry-pick)
+        TREE0=$(git write-tree) || fail "writing the index as a tree"
+        if [ -n "${ARENA_TEST_HOOK_AFTER_SNAPSHOT:-}" ]; then (sh -c "$ARENA_TEST_HOOK_AFTER_SNAPSHOT") > /dev/null 2>&1; fi
         why=$(unfit)
         [ -z "$why" ] || fail "$why"
+        p=$(staged_markers)
+        [ -z "$p" ] || fail "conflict markers were added in $p"
+        [ "$(git write-tree 2>/dev/null)" = "$TREE0" ] || fail "the index changed while arena was checking it — nothing committed — $kept"
         # Each such file: `<mode> <blob><TAB><path>`.
         awk -v course="$COURSE" '{ i = index($0, "\t"); split(substr($0, 1, i - 1), m, " ") }
             (m[2] == "100644" || m[2] == "100755") && !(course == "yes" && m[5] == "theirs") { print m[2] " " m[3] "\t" substr($0, i + 1) }' "$T.st" > "$T.rc"
@@ -670,25 +685,34 @@ case $what in
             # Those paths alone (the same blob elsewhere, the course's, stays as it is).
             awk 'FILENAME == ARGV[1] { r[$1] = $2; next } { i = index($0, "\t"); split(substr($0, 1, i - 1), m, " ") }
                 m[2] in r { print m[1] " " r[m[2]] " 0\t" substr($0, i + 1) }' "$T.map" "$T.rc" > "$T.upd"
+        ) || fail "redacting keys in the staged files"
+        if [ -n "${ARENA_TEST_HOOK_DURING_REDACTION:-}" ]; then (sh -c "$ARENA_TEST_HOOK_DURING_REDACTION") > /dev/null 2>&1; fi
+        # The checked tree, redacted apart: what the commit must take, exactly. Then the same
+        # redaction in the index the commit takes, which must come out as that tree right before
+        # the commit — a `git add` the participant finishes after the checks (a key, a big file, a
+        # gitlink none of them saw) can't (review ai-review codex #2).
+        (
+            set -e
+            rm -f "$T.idx"
+            GIT_INDEX_FILE="$T.idx" git read-tree "$TREE0"
+            tr '\n' '\0' < "$T.upd" | GIT_INDEX_FILE="$T.idx" git update-index -z --index-info
+            GIT_INDEX_FILE="$T.idx" git write-tree > "$T.tree"
             tr '\n' '\0' < "$T.upd" | git update-index -z --index-info
         ) || fail "redacting keys in the staged files"
+        TREE=$(cat "$T.tree")
         awk 'FILENAME == ARGV[1] { n[$2] = $3; next } { i = index($0, "\t"); split(substr($0, 1, i - 1), m, " "); print "REDACTED " n[m[2]] " " substr($0, i + 1) }' "$T.map" "$T.upd"
-        # The index as checked and redacted, as a tree (its conflicts are resolved by now): what
-        # the commit must take, exactly. A `git add` the participant finishes after this — a key,
-        # a big file, a gitlink none of the checks saw — would go in with it (review ai-review
-        # codex #2), so it's compared again right before the commit.
-        TREE=$(git write-tree) || fail "writing the index as a tree"
+        ;;
+    *)
+        p=$(staged_markers)
+        [ -z "$p" ] || fail "conflict markers were added in $p"
         ;;
 esac
-p=$(staged_markers)
-[ -z "$p" ] || fail "conflict markers were added in $p"
 
 # --- Finish ----------------------------------------------------------------------------------
 # Once more, right before the commit: still this operation, on this HEAD, git's index free, and
 # the index still the tree checked above — nothing staged since. (What's left is the instant
 # between that and git's own index lock in the commit: git has no lock that spans commands.)
 if [ -n "${ARENA_TEST_HOOK_BEFORE_FINISH:-}" ]; then (sh -c "$ARENA_TEST_HOOK_BEFORE_FINISH") > /dev/null 2>&1; fi
-kept="the state before is in ${S#"$TOP"/}/"
 case $what in
     merge | cherry-pick)
         cur=$(busy_op "$G")

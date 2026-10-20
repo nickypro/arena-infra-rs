@@ -817,10 +817,12 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     config: said on the pod's line) is redacted like the participant's own. (A stash pop's conflicts make no
     commit there: the backup after redacts what it commits.) Right before the commit the
     operation, HEAD and the index lock are checked once more, every staged path's size and kind
-    again, and the index must still be the tree checked and redacted (`git write-tree` then and
-    now): a `git add` the participant finishes in between — a key, a big file, a nested repo none
-    of the checks saw — stops it, `the index changed while arena was finishing it — nothing
-    committed` (review ai-review codex #2). A merge becomes a real merge commit, a cherry-pick is
+    again — on the index taken as a tree first and again after those checks (anything staged
+    meanwhile stops it, `the index changed while arena was checking it — nothing committed`:
+    review ai-review codex #2, claude #5) — and the tree the commit must take is that one,
+    redacted apart, which the index must still come out as right before the commit: a `git add`
+    the participant finishes after the checks — a key, a big file, a nested repo none of them
+    saw — stops it, `the index changed while arena was finishing it — nothing committed`. A merge becomes a real merge commit, a cherry-pick is
     `--continue`d (one left empty is committed empty, as git advises), a stash pop's conflicts
     are added (its stash entry stays) — in the repo's own identity, never
     `-c user.*` — the message saying, per path, which side won and both sides' last change to it,
