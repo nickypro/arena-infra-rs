@@ -633,45 +633,15 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     keeps the key (the code still runs) and shows as modified; reported per pod (`redacted N
     pasted key(s) in …`). **Unpushed commits holding a key** — an older backup's, or one the
     participant made by hand — are rewritten before the push, whatever GitHub would do: just
-    those commits (none origin has — one only an `upstream` elsewhere has is scanned too: origin
-    never had it), the key redacted — same messages, authors, dates — and pushed as a
-    fast-forward, never forced; files on disk untouched. **The course's own commits are left as
-    the course published them** — public already, and a redacted copy of a course commit broke
-    its ancestry, so every later `git pull upstream main` conflicted on the redacted lines (review
-    ai-review claude #4); they're pushed with their commit ids unchanged. Which commits are the
-    course's is verified, never read off the pod. When the scan finds a key in a blob
-    `refs/remotes/upstream/main` has too — and only then: most runs fetch nothing — the backup
-    fetches the course repo's own `main` (`ARENA_UPSTREAM_REPO`, default
-    `ARENA-education/ARENA_materials`, from `https://github.com/<owner>/<name>.git`: no
-    credentials, `timeout 60`, no submodules, no global or system git config, the participant's
-    FETCH_HEAD put back as it was, a ref lock an earlier killed fetch left removed) into the pod's
-    `refs/arena/course-main`, leaves out of the scan and the rewrite only the commits that ref
-    has, and scans again. The trust boundary: that ref, which only this fetch writes, is the one
-    proof; `upstream`'s refs and URLs prove nothing (review ai-review codex #1, FIX6 — a
-    participant's fork fetched as `upstream/main`, then `upstream` repointed at the course, left
-    their own key-bearing commit trusted), so a fork's commit, or one on any other `upstream/*`
-    ref, is scanned and redacted like the rest, and a dead push URL (`no_push`) changes nothing.
-    Nor can the pod's git config steer the fetch (review ai-review claude #3): when a
-    `url.<base>.insteadOf` in the repo's config rewrites the course URL (`git ls-remote
-    --get-url`) — to a fork, whose commits would all be exempt, or to ssh — the course isn't
-    asked: nothing exempt, and the pod's line says its git config rewrites the course URL. A
-    fetch that fails (GitHub unreachable, a timeout, a private course repo) holds that run's push
-    (review ai-review claude #2): nothing rewritten and nothing pushed — a redacted copy of the
-    course's own commits would break their ancestry for good, every later `git pull upstream
-    main` conflicting on those lines — the pod is rsynced as for a failed push, its line says the
-    course couldn't be reached to verify its own commits, and the next tick asks again (a key of
-    the participant's in the same push waits with it). So a course repo the pods can never reach
-    holds the git backup of each pod that pulled a key-like string from it, until it can. `none`
-    exempts nothing. And `ARENA_UPSTREAM_REPO` should name a public repo: what its
-    `main` has goes into the cohort repo unscanned (claude #6). A ref an earlier fetch left is
-    trusted as this run's (nothing else writes it), unless the pod's git config rewrites the
-    course URL; the auto-resolve reads it by the same rule, and fetches it the same way, keeping
-    the other side's content as published only for a merge of a commit it has. If
-    GitHub's push protection refuses a course's string — one the redaction knows, or one only
-    GitHub does (then the course is asked at the refusal) — the pod's line says it's the course's
-    own key-like string, public already — allow it in the cohort repo's push protection — not a
-    participant's leak. A secret the patterns don't
-    know, refused by GitHub, fails the pod with GitHub's name for it and its path:line (never the
+    those commits (none origin has — one only the course's `upstream` has, its `main` merged in,
+    is scanned too: origin never had it), the key redacted — same messages, authors, dates — and
+    pushed as a fast-forward, never forced; files on disk untouched. **The course's own commits
+    get no exemption** (FIX8): every exemption tried (FIX4B to FIX7) trusted something a pod could
+    get wrong, and Live 7 found no key-like string in the real course's 2187 commits. What that
+    leaves: if the course ever commits a key-like string, each pod that merges it pushes those
+    commits rewritten redacted, and a later `git pull upstream main` may conflict on those lines —
+    the fix is to take the string out of the course. A secret the patterns don't know, refused by
+    GitHub, fails the pod with GitHub's name for it and its path:line (never the
     secret, never GitHub's allow-URL). **A pod whose push itself fails** (a refusal, a big file,
     the network) **is rsynced into `LOCAL_BACKUP_DIR` in the same run — even under `--no-pull`**
     (the cron's) — and its line says where its files went (or why that failed too); the run still
@@ -788,7 +758,7 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     never staged, and the words say so (`… comes in from the merged branch (MERGE_HEAD) at …
     bytes, …: arena won't commit it — finish the merge yourself, or abort it, on the pod`); what
     is staged exactly as the other side has it — taken whole, merged per hunk, or by hand into
-    that very blob — is sized by GitHub's 100 MiB instead, verified or not, as the backup sizes
+    that very blob — is sized by GitHub's 100 MiB instead, as the backup sizes
     what it pushes (its blob goes out with the other side's commit anyway), so a course file
     between the two goes in. The state before is
     kept first in `.git/arena-resolved/<UTC stamp>/` on the pod — the conflicted files as they
@@ -800,22 +770,15 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     (a terminal used, a login typing, a git command running — someone back at a terminal,
     typing into a buffer not saved yet, touches no file): any difference — the participant
     aborted the merge, started a rebase, staged a file, used a terminal — and nothing is touched.
-    For a merge or a cherry-pick, every staged regular file that isn't HEAD's version — resolved
-    by hand (now, or added before), merged per hunk, taken whole from either side, added
-    mid-merge, changed by the other side alone — goes through the backup's key redaction (the
-    redacted blob is committed, the file on disk keeps its key). Only the course's own content
-    goes in as it was published, and only once verified: a merge whose `MERGE_HEAD` is in
-    `refs/arena/course-main` — the ref nothing but a fetch from `ARENA_UPSTREAM_REPO` writes,
-    trusted by the backup's own rule — what is staged as `MERGE_HEAD` has it (review ai-review
-    codex #3: matching the other side proves nothing, and a participant's own commit,
-    cherry-picked, committed their key unredacted). A BUSY pod's backup stops before its own scan,
-    so nothing fetched that ref for a conflicted `git pull upstream main` (review ai-review claude
-    #1): the resolve asks the course itself, the backup's way (the same fetch, the same checks), when
-    `MERGE_HEAD` is one `upstream/main` has, the ref doesn't, and a key-like string is in what may
-    be staged from it — before anything is touched. A cherry-pick, a merge of any other branch, or
-    a course merge the course can't confirm (unreachable, its URL rewritten by the pod's git
-    config: said on the pod's line) is redacted like the participant's own. (A stash pop's conflicts make no
-    commit there: the backup after redacts what it commits.) Right before the commit the
+    For a merge or a cherry-pick, every staged regular file the participant made — neither
+    HEAD's version nor the other side's: resolved by hand (now, or added before), merged per hunk
+    into something of both sides, added mid-merge — goes through the backup's key redaction (the
+    redacted blob is committed, the file on disk keeps its key). What is staged exactly as
+    `MERGE_HEAD` or `CHERRY_PICK_HEAD` has it goes in as that side has it, whoever's side it is:
+    the backup after it scans every commit origin doesn't have, that side's and the resolve's
+    own, and rewrites one holding a key redacted before anything is pushed (FIX8; the course's
+    own commits are no exception, above). (A stash pop's conflicts make no commit there: the
+    backup after redacts what it commits.) Right before the commit the
     operation, HEAD and the index lock are checked once more, every staged path's size and kind
     again — on the index taken as a tree first and again after those checks (anything staged
     meanwhile stops it, `the index changed while arena was checking it — nothing committed`:
