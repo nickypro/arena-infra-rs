@@ -636,14 +636,24 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     those commits (none origin has — one only an `upstream` elsewhere has is scanned too: origin
     never had it), the key redacted — same messages, authors, dates — and pushed as a
     fast-forward, never forced; files on disk untouched. **The course's own commits are left as
-    the course published them**: on a pod whose `upstream` is the course repo
-    (`ARENA_UPSTREAM_REPO`, default `ARENA-education/ARENA_materials`; any spelling of its URL),
-    what `upstream` has is never scanned or rewritten — it's public already, and a redacted copy
-    of a course commit broke its ancestry, so every later `git pull upstream main` conflicted on
-    the redacted lines (review ai-review claude #4); they're pushed with their commit ids
-    unchanged. If GitHub's push protection refuses one, the pod's line says it's the course's
-    own key-like string, public already — allow it in the cohort repo's push protection — not a
-    participant's leak. A secret the patterns don't
+    the course published them**: on a pod whose `upstream` fetches from and pushes to the course
+    repo alone (`ARENA_UPSTREAM_REPO`, default `ARENA-education/ARENA_materials`; any spelling of
+    its URLs — every `git remote get-url --all upstream` and `--push --all` one), what
+    `refs/remotes/upstream/main` holds is never scanned or rewritten — it's public already, and a
+    redacted copy of a course commit broke its ancestry, so every later `git pull upstream main`
+    conflicted on the redacted lines (review ai-review claude #4); they're pushed with their commit
+    ids unchanged. Only that one ref: any other `upstream/*` ref, and every ref of an `upstream`
+    with a fetch or push URL elsewhere (a pushurl of the participant's fork, where a successful
+    `git push upstream` updates the ref), is scanned like the rest (review ai-review codex #1,
+    claude #5). The trust boundary: the exemption trusts whatever the pod's
+    `refs/remotes/upstream/main` holds — the URLs are checked, not where the ref's commits came
+    from, so a ref fetched from another URL before `upstream` was repointed at the course (or set
+    by hand) stays trusted until the next fetch from the course replaces it. And
+    `ARENA_UPSTREAM_REPO` should name a public repo: its commits go into the cohort repo unscanned
+    (claude #6), so a staff key committed to a private course repo would be pushed with them. If
+    GitHub's push protection refuses one, the pod's line says it's the course's own key-like
+    string, public already — allow it in the cohort repo's push protection — not a participant's
+    leak. A secret the patterns don't
     know, refused by GitHub, fails the pod with GitHub's name for it and its path:line (never the
     secret, never GitHub's allow-URL). **A pod whose push itself fails** (a refusal, a big file,
     the network) **is rsynced into `LOCAL_BACKUP_DIR` in the same run — even under `--no-pull`**

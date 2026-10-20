@@ -33,8 +33,8 @@
 #   PUSH_BLOCKED <reason>      GitHub's push protection still refuses the push — a secret the redaction
 #                              doesn't know; the reason names GitHub's secret type and path:line (exit 4)
 #   PUSH_BLOCKED_COURSE <commit>…  after PUSH_BLOCKED: every secret GitHub named is in a file as the
-#                              course published it (`upstream` is the course repo, and the blob is in its
-#                              history) — the course's own key-like string, public already, not a leak
+#                              course published it (`upstream` is the course repo, and the blob is in the
+#                              history of its main) — the course's own key-like string, public already, not a leak
 #   PUSH_FAILED                the push failed otherwise (the network, a non-fast-forward…; exit 1)
 # Any other failure exits non-zero via `set -e`.
 set -e
@@ -60,13 +60,20 @@ TOP=$(pwd)
 # git and nothing said so (live, 2026-10-17). An empty ORIGIN (no repo configured) checks nothing.
 # @ARENA_ORIGIN_SH@
 origin_check "$ORIGIN"
-# The course's own commits — what `upstream` has, when it is the configured course repo (any spelling)
-# — are never scanned for keys or rewritten (review ai-review claude #4): they are public already, and
-# a rewritten copy breaks their ancestry with the course, so every later `git pull upstream main`
-# re-applied them, conflicted on the redacted lines and was rewritten again. An `upstream` anywhere
-# else (or a participant's own remote) is scanned like the rest. "Pushed" still means on origin.
+# The course's own commits — what refs/remotes/upstream/main has, when `upstream` fetches from and
+# pushes to the configured course repo alone (any spelling) — are never scanned for keys or
+# rewritten (review ai-review claude #4): they are public already, and a rewritten copy breaks
+# their ancestry with the course, so every later `git pull upstream main` re-applied them,
+# conflicted on the redacted lines and was rewritten again. Only `main` (review ai-review codex #1,
+# claude #5): any other upstream/* ref — one a successful `git push upstream`, or a fetch from
+# before `upstream` was repointed at the course, left holding the participant's own commit — is
+# scanned like the rest, and so is an `upstream` anywhere else, or a participant's own remote. What
+# that one ref holds is trusted as the course's (a fetch from another URL before the repointing
+# stays trusted until the next fetch: the README says so). "Pushed" still means on origin.
 COURSE_REFS=
-if [ -n "$COURSE" ] && upstream_is_course "$COURSE"; then COURSE_REFS=--remotes=upstream; fi
+if [ -n "$COURSE" ] && upstream_is_course "$COURSE" && git rev-parse -q --verify 'refs/remotes/upstream/main^{commit}' >/dev/null; then
+    COURSE_REFS=refs/remotes/upstream/main
+fi
 if [ -n "$KEY" ]; then
     export GIT_SSH_COMMAND="ssh -i $KEY -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
 fi
@@ -339,8 +346,8 @@ push_block_reason() {
 
 # `course_blocked <push output>`: whether every secret GitHub's refusal names (each location's
 # `commit:` and `path: <path>:<line>`) is in a file as the course published it — that commit's blob
-# at that path is one the course's history has (`--remotes=upstream`: what $COURSE_REFS left out of
-# the scan) — printing those commits. Not when any location is otherwise, or none could be read:
+# at that path is one the course's history has (`$COURSE_REFS`, upstream's main: what the scan left
+# out) — printing those commits. Not when any location is otherwise, or none could be read:
 # then it's a secret the redaction doesn't know, as ever.
 course_blocked() {
     tr -d '\r' < "$1" | LC_ALL=C awk '
@@ -348,7 +355,7 @@ course_blocked() {
         /^remote: *path: / && c != "" { p = $0; sub(/^remote: *path: */, "", p); sub(/:[0-9]+ *$/, "", p); print c "\t" p }' \
         | awk '!seen[$0]++' > "$T.where"
     [ -s "$T.where" ] || return 1
-    git rev-list --objects --remotes=upstream | cut -d' ' -f1 | LC_ALL=C sort -u > "$T.course-objects"
+    git rev-list --objects "$COURSE_REFS" | cut -d' ' -f1 | LC_ALL=C sort -u > "$T.course-objects"
     while IFS="$(printf '\t')" read -r _bc _bp; do
         _bb=$(git rev-parse -q --verify "$_bc:$_bp" 2>/dev/null) || return 1
         LC_ALL=C grep -qxF -- "$_bb" "$T.course-objects" || return 1
@@ -364,8 +371,9 @@ course_blocked() {
 # the repo's push-protection settings; it must never leave the pod either way. So the blobs of
 # the commits going out — only those on no branch of origin's, `HEAD --not --remotes=origin`,
 # never anything this repo on GitHub already has (a commit only `upstream` has is scanned: origin
-# has never had it — unless `upstream` is the course repo, $COURSE_REFS: the course's own commits
-# and their files are left as the course published them) — are scanned before the push (one `cat-file --batch |
+# has never had it — unless it is on upstream's main and `upstream` is the course repo,
+# $COURSE_REFS: the course's own commits and their files are left as the course published them) —
+# are scanned before the push (one `cat-file --batch |
 # grep -q`: usually a single commit this run made, already clean), and if one holds a key those
 # commits are rewritten with it redacted, by plumbing alone: each commit's tree through a
 # temporary index, then `commit-tree` with its own author, committer, dates, message and

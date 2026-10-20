@@ -30,13 +30,16 @@ origin_shown() {
     printf '%s\n' "$1" | LC_ALL=C sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://).*@#\1#; t q; s#^[^/]*@##; :q; s|[?#].*$||'
 }
 # upstream_is_course OWNER/NAME: whether this repo's `upstream` remote is that GitHub repo — every
-# URL it fetches from (`git remote get-url --all`, insteadOf applied), however each is spelled — so
-# what refs/remotes/upstream/* hold is that repo's published history. No `upstream`, a URL elsewhere
-# (a local path included: it has no key), or an OWNER/NAME with no key of its own: no.
+# URL it fetches from (`git remote get-url --all`, insteadOf applied) and every URL it pushes to
+# (`--push --all`, pushInsteadOf applied), however each is spelled — so what a fetch writes into
+# refs/remotes/upstream/main is that repo's published history. The push URLs too (review ai-review
+# claude #5): a `git push upstream <branch>` that succeeds updates refs/remotes/upstream/<branch>,
+# and with a pushurl of the participant's own fork it would hold their commit. No `upstream`, a
+# URL elsewhere (a local path included: it has no key), or an OWNER/NAME with no key of its own: no.
 upstream_is_course() {
     _cw=$(origin_key "git@github.com:$1.git")
     [ -n "$_cw" ] || return 1
-    _cu=$(git remote get-url --all upstream 2>/dev/null) || return 1
+    _cu=$({ git remote get-url --all upstream && git remote get-url --push --all upstream; } 2>/dev/null) || return 1
     [ -n "$_cu" ] || return 1
     printf '%s\n' "$_cu" | while IFS= read -r _u; do [ "$(origin_key "$_u")" = "$_cw" ] || exit 1; done
 }
