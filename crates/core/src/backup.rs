@@ -5274,9 +5274,10 @@ done
     }
 
     /// The move a refused `--hard` save's line suggests for `path` (review ai-review claude #5,
-    /// codex #4): `(cd '<repo>' && [ ! -e '<dest>' ] && [ ! -L '<dest>' ] && mv -n -- '<path>'
-    /// '<dest>')`, `<dest>` `../<name>.kept-<UTC time>`, every word as [`shell_quote`] quotes it.
-    /// Returns the command and the kept copy's name.
+    /// codex #4, claude #7): `(cd '<repo>' && if [ -e '<dest>' ] || [ -L '<dest>' ]; then printf
+    /// '%s\n' 'not moved: <dest> exists' >&2; exit 1; fi && mv -n -- '<path>' '<dest>')`, `<dest>`
+    /// `../<name>.kept-<UTC time>`, every word as [`shell_quote`] quotes it. Returns the command and
+    /// the kept copy's name.
     #[cfg(unix)]
     fn suggested_move(line: &str, repo: &str, path: &str) -> (String, String) {
         let fix = line
@@ -5293,7 +5294,15 @@ done
         );
         let kept = format!("{name}.kept-{stamp}");
         let dest = shell_quote(&format!("../{kept}"));
-        assert_eq!(fix, format!("(cd {} && [ ! -e {dest} ] && [ ! -L {dest} ] && mv -n -- {} {dest})", shell_quote(repo), shell_quote(path)));
+        let said = shell_quote(&format!("not moved: ../{kept} exists"));
+        assert_eq!(
+            fix,
+            format!(
+                "(cd {} && if [ -e {dest} ] || [ -L {dest} ]; then printf '%s\\n' {said} >&2; exit 1; fi && mv -n -- {} {dest})",
+                shell_quote(repo),
+                shell_quote(path)
+            )
+        );
         (fix, kept)
     }
 
@@ -5305,7 +5314,8 @@ done
     /// paste again fails, the first copy and the new file both kept. A directory, pasted again once
     /// made anew, isn't moved inside the kept copy either (review ai-review codex #4: `mv -n`
     /// alone nested it, and FIX7's `-T` was GNU's alone, `mv -n` again where `mv` had none): run
-    /// for real, twice.
+    /// for real, twice. The second paste says why it moved nothing (review claude #7, FIX9B: it
+    /// exited 1 with no output, as if it had moved something), the first says nothing.
     #[cfg(unix)]
     #[test]
     fn the_suggested_move_pastes_as_it_is_and_never_replaces_a_kept_copy() {
@@ -5325,13 +5335,17 @@ done
         let (code, out, err) = run_on_path(&checkout_command_limited(repo, "main", None, true, 1), &plain);
         assert_ne!(code, Some(0), "{out}{err}");
         let line = err.lines().find(|l| l.starts_with("arena set-branch: not reset — ")).unwrap_or_else(|| panic!("{err}"));
-        let (fix, kept) = suggested_move(line, repo, name);
-        let kept = s.base.join(kept);
-        assert!(s.run(&fix).status.success(), "{fix}");
+        let (fix, kept_name) = suggested_move(line, repo, name);
+        let kept = s.base.join(&kept_name);
+        let pasted = |fix: &str| {
+            let o = s.run(fix);
+            (o.status.success(), String::from_utf8_lossy(&o.stderr).into_owned())
+        };
+        assert_eq!(pasted(&fix), (true, String::new()), "{fix}");
         assert_eq!((std::fs::read_to_string(&kept).unwrap(), s.work.join(name).exists()), (first.clone(), false), "moved: {fix}");
-        // The same paste again, a new file there: refused, nothing replaced.
+        // The same paste again, a new file there: refused, said, nothing replaced.
         std::fs::write(s.work.join(name), &second).unwrap();
-        assert!(!s.run(&fix).status.success(), "{fix}");
+        assert_eq!(pasted(&fix), (false, format!("not moved: ../{kept_name} exists\n")), "{fix}");
         assert_eq!((std::fs::read_to_string(&kept).unwrap(), s.read(name)), (first.clone(), second.clone().into_bytes()), "{fix}");
 
         // A directory (review ai-review codex #4): `mv -n` alone, pasted again once it was made
@@ -5349,13 +5363,13 @@ done
         let (code, out, err) = run_on_path(&checkout_command_limited(repo, "main", None, true, 1), &plain);
         assert_ne!(code, Some(0), "{out}{err}");
         let line = err.lines().find(|l| l.starts_with("arena set-branch: not reset — ")).unwrap_or_else(|| panic!("{err}"));
-        let (fix, kept) = suggested_move(line, repo, dir);
-        let kept = s.base.join(kept);
-        assert!(s.run(&fix).status.success(), "{fix}");
+        let (fix, kept_name) = suggested_move(line, repo, dir);
+        let kept = s.base.join(&kept_name);
+        assert_eq!(pasted(&fix), (true, String::new()), "{fix}");
         assert_eq!(std::fs::read_to_string(kept.join("model.pt")).unwrap(), first, "moved: {fix}");
         std::fs::create_dir_all(s.work.join(dir)).unwrap();
         std::fs::write(s.work.join(dir).join("model.pt"), &second).unwrap();
-        assert!(!s.run(&fix).status.success(), "{fix}");
+        assert_eq!(pasted(&fix), (false, format!("not moved: ../{kept_name} exists\n")), "{fix}");
         assert!(!kept.join(dir).exists(), "nested into the kept copy: {fix}");
         assert_eq!((std::fs::read_to_string(kept.join("model.pt")).unwrap(), s.read(&format!("{dir}/model.pt"))), (first, second.into_bytes()));
         assert_eq!(std::fs::read_dir(&kept).unwrap().count(), 1, "the kept copy as the first paste left it");

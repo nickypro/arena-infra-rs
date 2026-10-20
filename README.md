@@ -918,12 +918,14 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     from there) or over half what's free on that disk (`df`), nothing of it is copied and the pod
     isn't reset — `arena set-branch: not reset — the --hard reset would remove checkpoints (31.2
     GiB), which is more than DISCARD_MAX_GB allows (1.0 GiB) to save first: move it out of the
-    checkout (cd '/root/ARENA_materials' && [ ! -e '../checkpoints.kept-20261020T071500Z' ] &&
-    [ ! -L '../checkpoints.kept-20261020T071500Z' ] && mv -n -- 'checkpoints'
+    checkout (cd '/root/ARENA_materials' && if [ -e '../checkpoints.kept-20261020T071500Z' ] ||
+    [ -L '../checkpoints.kept-20261020T071500Z' ]; then printf '%s\n' 'not moved:
+    ../checkpoints.kept-20261020T071500Z exists' >&2; exit 1; fi && mv -n -- 'checkpoints'
     '../checkpoints.kept-20261020T071500Z'), or delete it, then switch again` — every word quoted
     (a `'` in a path pastes as it is), the kept copy under a name of its own, never over an earlier
-    one nor into it: pasted twice, the second paste fails and moves nothing (review ai-review
-    claude #5, codex #4; plain POSIX, busybox's `mv` too). `--hard` with `--include-non-cohort` is refused unless the pods are
+    one nor into it: pasted twice, the second paste fails, moves nothing and says so (`not moved:
+    ../checkpoints.kept-… exists`; review ai-review claude #5, codex #4, claude #7; plain POSIX,
+    busybox's `mv` too). `--hard` with `--include-non-cohort` is refused unless the pods are
     named: it would reset staff boxes and other cohorts' pods too. A file the
     backup committed with a key redacted keeps the real key on disk: around the switch it's set
     aside in `.git/arena-unredacted/<time>-<pid>/` (so gentle doesn't refuse it and `--hard`

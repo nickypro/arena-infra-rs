@@ -237,15 +237,19 @@ ds_fits() {
 
 # `ds_move <path>`: the command that moves <path> (relative to the repo's top) out of the checkout,
 # next to it, as `<its name>.kept-<UTC time>` (review ai-review claude #5): a name no earlier
-# kept copy has. It moves nothing once that name is taken — `[ ! -e … ] && [ ! -L … ]` first,
-# then `mv -n` — so the same advice pasted again (the directory made anew since) fails, never
-# replacing the kept copy nor moving the new directory inside it, as `mv -n` alone did (review
-# ai-review codex #4). Plain POSIX: no `-T`, which busybox's `mv` lacks (FIX7 asked a probe and
-# fell back to that very `mv -n`). Each word quoted by `ds_quote`: a path with a `'` in it pastes
-# as it is.
+# kept copy has. It moves nothing once that name is taken — the test for it first, then `mv -n` —
+# so the same advice pasted again (the directory made anew since) fails, never replacing the kept
+# copy nor moving the new directory inside it, as `mv -n` alone did (review ai-review codex #4).
+# And says so, `not moved: <dest> exists` on stderr (review claude #7, FIX9B: a second paste exited
+# 1 with no output, so the operator could believe it had moved something) — only then: a `cd` or
+# `mv` that fails says why itself, never that the name is taken. Plain POSIX: no `-T`, which
+# busybox's `mv` lacks (FIX7 asked a probe and fell back to that very `mv -n`). Each word quoted by
+# `ds_quote`: a path with a `'` in it pastes as it is.
 ds_move() {
-    ds_to=$(ds_quote "../$(basename -- "$1").kept-$(date -u +%Y%m%dT%H%M%SZ)")
-    printf '(cd %s && [ ! -e %s ] && [ ! -L %s ] && mv -n -- %s %s)' "$(ds_quote "$(pwd)")" "$ds_to" "$ds_to" "$(ds_quote "$1")" "$ds_to"
+    ds_rel="../$(basename -- "$1").kept-$(date -u +%Y%m%dT%H%M%SZ)"
+    ds_to=$(ds_quote "$ds_rel")
+    printf '(cd %s && if [ -e %s ] || [ -L %s ]; then printf %s %s >&2; exit 1; fi && mv -n -- %s %s)' "$(ds_quote "$(pwd)")" \
+        "$ds_to" "$ds_to" "'%s\n'" "$(ds_quote "not moved: $ds_rel exists")" "$(ds_quote "$1")" "$ds_to"
 }
 
 # `ds_quote <word>`: <word> single-quoted for a POSIX shell, each `'` in it as `'\''` —
