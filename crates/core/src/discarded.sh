@@ -51,7 +51,7 @@ discarded_save() {
     ds_head=$(git rev-parse -q --verify HEAD 2>/dev/null) || ds_head=
     ds_on=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || ds_on=HEAD
     ds_d="$1/arena-discarded/$(date -u +%Y%m%dT%H%M%SZ)"
-    ds_made= ds_refs= ds_done=
+    ds_made= ds_refs= ds_done= ds_big= ds_what=
     # Never into an earlier save's folder: a second reset in the same second gets its own.
     mkdir -p "$1/arena-discarded" 2>/dev/null || true
     if ! mkdir "$ds_d" 2>/dev/null; then
@@ -59,6 +59,8 @@ discarded_save() {
         if ! mkdir "$ds_d"; then ds_fail "$ds_d" "anything"; return 1; fi
     fi
     ds_made=1
+    # What it's doing ($ds_step), for the line of a save stopped in the middle (`ds_abandon`).
+    ds_step='saving the conflicted files'
     ds_w="$ds_d/.lists"
     if ! mkdir "$ds_w"; then ds_fail "$ds_d" "its lists"; return 1; fi
     # The conflicted files, as they are on disk.
@@ -68,6 +70,7 @@ discarded_save() {
         return 1
     fi
     # Every uncommitted change to tracked files: in one, and staged and not apart.
+    ds_step='saving the diffs of the tracked files'
     if [ -n "$ds_head" ]; then
         if ! git diff-index -p --binary --full-index HEAD > "$ds_d/changes.patch"; then ds_fail "$ds_d" "the diff"; return 1; fi
         if ! git diff-index -p --binary --full-index --cached HEAD > "$ds_d/staged.patch"; then ds_fail "$ds_d" "the staged diff"; return 1; fi
@@ -88,6 +91,7 @@ discarded_save() {
         if [ -f "$ds_d/$f.patch" ] && ! grep -q '^diff --git ' "$ds_d/$f.patch"; then rm -f "$ds_d/$f.patch"; fi
     done
     # The operation's state: what it was merging or applying, its message, its todo list.
+    ds_step="saving the operation's state"
     for f in MERGE_HEAD MERGE_MSG MERGE_MODE MERGE_AUTOSTASH AUTO_MERGE CHERRY_PICK_HEAD REVERT_HEAD SQUASH_MSG \
         rebase-merge rebase-apply sequencer; do
         if [ -e "$1/$f" ]; then
@@ -107,6 +111,7 @@ discarded_save() {
     # A file the index tracks, at its own path, is in the patch. The walk goes from the top, so a
     # link on the way is what's saved, not the files reached through it. Directories are copied
     # whole (`cp -pPR`: links kept as links, never followed), so a big one costs its size here.
+    ds_step='listing what the reset would remove'
     if ! { git ls-tree -r -z "$2" > "$ds_w/t" && git ls-files -z > "$ds_w/i" \
         && tr '\0' '\n' < "$ds_w/t" | cut -f2- | LC_ALL=C sort -u > "$ds_w/ref" \
         && tr '\0' '\n' < "$ds_w/t" | awk 'index($0, "160000 ") == 1 { print substr($0, index($0, "\t") + 1) }' | LC_ALL=C sort -u > "$ds_w/gitlinks" \
@@ -137,8 +142,13 @@ discarded_save() {
     done < "$ds_w/walk"
     if ! LC_ALL=C sort -u "$ds_w/hit" > "$ds_w/untracked"; then ds_fail "$ds_d" "the untracked files"; return 1; fi
     # Whether it fits, before any of it is copied: a directory goes whole.
-    if [ -s "$ds_w/untracked" ] && ! ds_fits "$ds_w/untracked" "$1" "$4"; then ds_remove "$ds_d"; return 1; fi
+    if [ -s "$ds_w/untracked" ]; then
+        ds_step="totalling the size of what the reset would remove ($(wc -l < "$ds_w/untracked") path(s))"
+        if ! ds_fits "$ds_w/untracked" "$1" "$4"; then ds_remove "$ds_d"; return 1; fi
+        ds_step="copying $ds_what into the save"
+    fi
     if ! ds_copy "$ds_w/untracked" "$ds_d/untracked"; then ds_fail "$ds_d" "the untracked files"; return 1; fi
+    ds_step='writing its README and refs' ds_big=
     rm -rf "$ds_w"
     # The refs (above), whether or not anything else was saved.
     ds_name=$(basename -- "$ds_d")
@@ -182,10 +192,18 @@ discarded_save() {
 # `ds_abandon`: for the switch's EXIT trap. A save this run began and didn't complete — the switch
 # stopped in the middle of it (review ai-review claude #2: a 30 GB directory copied under the
 # switch's 100 s bound was cut short by its TERM, and each try left another partial copy in
-# .git) — is removed, folder and refs; the pod wasn't reset. A completed save always stays,
-# whatever happens to the reset after it. (A KILL runs no trap: a save it cuts short stays.)
+# .git) — is removed, folder and refs; the pod wasn't reset. And it says on stderr what the save
+# was doing (review ai-review claude #6: "ran past its 100 s" alone said nothing of why, and each
+# retry was stopped the same way): stopped mid-copy, what it was copying, how big, and how to move
+# it out of the way (`ds_move`). A completed save always stays, whatever happens to the reset
+# after it. (A KILL runs no trap: a save it cuts short stays.)
 ds_abandon() {
-    if [ -n "${ds_made:-}${ds_refs:-}" ] && [ -z "${ds_done:-}" ]; then ds_remove "$ds_d"; fi
+    if [ -n "${ds_made:-}${ds_refs:-}" ] && [ -z "${ds_done:-}" ]; then
+        ds_why="arena set-branch: stopped while ${ds_step:-saving}, before the --hard reset — the partial save removed, not reset"
+        if [ -n "${ds_big:-}" ]; then ds_why="$ds_why: move it out of the checkout $(ds_move "$ds_big"), or delete it, then switch again"; fi
+        printf '%s\n' "$ds_why" >&2
+        ds_remove "$ds_d"
+    fi
     return 0
 }
 
@@ -197,6 +215,11 @@ ds_abandon() {
 ds_fits() {
     tr '\n' '\0' < "$1" | xargs -0 du -sk -- 2>/dev/null | LC_ALL=C sort -rn > "$1.du" || true
     ds_kb=$(awk '{ s += $1 } END { printf "%.0f\n", s + 0 }' "$1.du")
+    # What it is, in words — set either way: the line of a save stopped mid-copy says it too.
+    ds_big=$(head -n 1 "$1.du" | cut -f2-)
+    ds_what="$ds_big ($(ds_size "$(head -n 1 "$1.du" | cut -f1)"))"
+    ds_n=$(wc -l < "$1.du")
+    if [ "$ds_n" -gt 1 ]; then ds_what="$ds_what and $((ds_n - 1)) more path(s), $(ds_size "$ds_kb") in all"; fi
     ds_free=$(df -Pk -- "$2" 2>/dev/null | awk 'NR == 2 && $4 ~ /^[0-9]+$/ { print $4 }')
     ds_over=
     if [ "$ds_kb" -gt "$3" ]; then ds_over="more than DISCARD_MAX_GB allows ($(ds_size "$3"))"; fi
@@ -204,10 +227,6 @@ ds_fits() {
         ds_over="${ds_over:+$ds_over, and }more than half the $(ds_size "$ds_free") free on its disk"
     fi
     if [ -z "$ds_over" ]; then return 0; fi
-    ds_big=$(head -n 1 "$1.du" | cut -f2-)
-    ds_what="$ds_big ($(ds_size "$(head -n 1 "$1.du" | cut -f1)"))"
-    ds_n=$(wc -l < "$1.du")
-    if [ "$ds_n" -gt 1 ]; then ds_what="$ds_what and $((ds_n - 1)) more path(s), $(ds_size "$ds_kb") in all"; fi
     printf '%s\n' "arena set-branch: not reset — the --hard reset would remove $ds_what, which is $ds_over to save first: move it out of the checkout $(ds_move "$ds_big"), or delete it, then switch again" >&2
     return 1
 }

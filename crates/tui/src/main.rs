@@ -4769,6 +4769,31 @@ deep_check_end=1
         let _ = std::fs::remove_dir_all(&dir);
         assert!(fake.calls().is_empty());
     }
+    /// Review ai-review claude #6, checked: does the TUI's set-branch honour `DISCARD_MAX_GB`, the
+    /// most a `--hard` save copies? It has nothing to honour: the TUI only ever switches gently —
+    /// `--hard` is the CLI's — and a gentle switch saves nothing. Pinned: the switch it sends is
+    /// `checkout_command(…, false)`, holding no save, the same whatever the limit says (a bad value
+    /// included), and the same as the limited command with any limit. Were the TUI ever to switch
+    /// with `--hard`, this fails, and the limit would have to be passed as the CLI passes it.
+    #[tokio::test]
+    async fn the_tuis_set_branch_is_gentle_so_no_save_limit_applies() {
+        use arena_core::backup::{checkout_command, checkout_command_limited, discard_max_kb};
+        let alpha = pod("alpha", "runpod", "rp1", 1, Some(22001));
+        for extra in ["", "DISCARD_MAX_GB=0.001\n", "DISCARD_MAX_GB=lots\n"] {
+            let cfg = cfg(&format!("GIT_SSH_KEY_REMOTE=/k\n{extra}"));
+            let fake = FakeRemote::new();
+            fake.script("10.0.0.1:22001", vec![FakeReply::stdout("NO_CHANGES autocommit-x\n"), FakeReply::ok()]);
+            assert_eq!(run_set_branch(&fake, &cfg, &alpha, "w1d2").await, "✓ devtest-alpha → w1d2", "{extra:?}");
+            let sent: Vec<String> = fake.calls().into_iter().filter_map(|c| match c { RemoteCall::Exec { cmd, .. } => Some(cmd), _ => None }).collect();
+            let gentle = checkout_command("/root/ARENA_materials", "w1d2", Some("/k"), false);
+            assert_eq!(sent.get(1), Some(&gentle), "{extra:?}");
+            assert!(!gentle.contains("discarded_save"));
+            if let Ok(kb) = discard_max_kb(&cfg) {
+                assert_eq!(checkout_command_limited("/root/ARENA_materials", "w1d2", Some("/k"), false, kb), gentle, "{extra:?}");
+            }
+        }
+    }
+
     /// A provider for the action tests that never answers a fleet call it isn't asked.
     fn quiet_fleet() -> FakeFleet {
         FakeFleet { pods: vec![], lists: AtomicUsize::new(0), details: AtomicUsize::new(0), details_error: None }

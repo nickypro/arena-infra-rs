@@ -917,10 +917,12 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     switch is stopped in the middle of — its 100 s bound's TERM, a dropped connection (review
     ai-review claude #2: a 30 GB directory's copy never finished, and each try left another partial
     copy in `.git`): the switch's exit trap puts the keys back, then removes it (a KILL runs no
-    trap). And what `untracked/` would hold is totalled first (`du -sk`): over `DISCARD_MAX_GB`
-    (default 5) or over half what's free on that disk (`df`), nothing of it is copied and the pod
+    trap), and says what it was saving — stopped mid-copy, what and how big, and the same move
+    out of the way as below (claude #6). And what `untracked/` would hold is totalled first (`du -sk`): over `DISCARD_MAX_GB`
+    (default 1: the save runs within the switch's 100 s — review ai-review claude #6; `config check`
+    shows it) or over half what's free on that disk (`df`), nothing of it is copied and the pod
     isn't reset — `arena set-branch: not reset — the --hard reset would remove checkpoints (31.2
-    GB), which is more than DISCARD_MAX_GB allows (5.0 GB) to save first: move it out of the
+    GB), which is more than DISCARD_MAX_GB allows (1.0 GB) to save first: move it out of the
     checkout (cd '/root/ARENA_materials' && mv -n -- 'checkpoints'
     '../checkpoints.kept-20261020T071500Z'), or delete it, then switch again` — every word quoted
     (a `'` in a path pastes as it is), the kept copy under a name of its own, never over an earlier

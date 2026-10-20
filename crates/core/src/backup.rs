@@ -1150,11 +1150,15 @@ pub fn checkout_command_limited(repo_path: &str, branch: &str, git_ssh_key: Opti
 }
 
 /// The most a `--hard` save copies into `.git/arena-discarded/<save>/untracked/` by default, in GB
-/// (config `DISCARD_MAX_GB`, [`discard_max_kb`]).
-pub const DISCARD_MAX_GB: u64 = 5;
+/// (config `DISCARD_MAX_GB`, [`discard_max_kb`]). 1, not 5 (review ai-review claude #6): the copy —
+/// and the `du` before it, over a tree of many files — runs within the switch's
+/// [`SWITCH_BOUND_SECS`] (100 s, the fetch included), which near 5 GB on a RunPod network volume
+/// it often didn't, and each try was stopped the same way.
+pub const DISCARD_MAX_GB: u64 = 1;
 
 /// [`checkout_command_limited`]'s limit, in KiB: config `DISCARD_MAX_GB` (GB, a positive number:
-/// `5`, `0.5`, `40`), else [`DISCARD_MAX_GB`]. `Err` names the key and the value it can't read.
+/// `5`, `0.5`, `40`), else [`DISCARD_MAX_GB`]. `Err` names the key and the value it can't read —
+/// `config check` shows both ([`discard_max_words`]).
 pub fn discard_max_kb(cfg: &Config) -> std::result::Result<u64, String> {
     match cfg.get("DISCARD_MAX_GB").map(str::trim).filter(|v| !v.is_empty()) {
         None => Ok(DISCARD_MAX_GB * 1024 * 1024),
@@ -1162,6 +1166,16 @@ pub fn discard_max_kb(cfg: &Config) -> std::result::Result<u64, String> {
             Ok(gb) if gb.is_finite() && gb > 0.0 && gb <= 1_000_000.0 => Ok(((gb * 1024.0 * 1024.0).round() as u64).max(1)),
             _ => Err(format!("DISCARD_MAX_GB must be a number of GB above 0, like 5 or 0.5 (got `{raw}`)")),
         },
+    }
+}
+
+/// A `--hard` save's limit ([`discard_max_kb`]) in words, as the save's own line says sizes
+/// (`discarded.sh`'s `ds_size`): GB to one decimal, else whole MB, else KB.
+pub fn discard_max_words(kb: u64) -> String {
+    match kb {
+        k if k >= 1024 * 1024 => format!("{:.1} GB", k as f64 / (1024.0 * 1024.0)),
+        k if k >= 1024 => format!("{} MB", k / 1024),
+        k => format!("{k} KB"),
     }
 }
 
@@ -1362,7 +1376,7 @@ mod tests {
     use super::*;
 
     /// The default limit of a `--hard` save, in KiB ([`DISCARD_MAX_GB`]).
-    const KB5: u64 = DISCARD_MAX_GB * 1024 * 1024;
+    const KB_DEFAULT: u64 = DISCARD_MAX_GB * 1024 * 1024;
 
     fn cfg() -> BackupConfig {
         BackupConfig {
@@ -1694,15 +1708,15 @@ mod tests {
             assert!(secret_regex().contains(&format!("{}{}", p.lead, p.re)));
             assert!(redact_sed().contains(&format!("s#{}{}#\\1{}#g", p.lead, p.re, p.replacement)));
         }
-        let set_branch = switch_script("/r", "main", None, false, KB5);
+        let set_branch = switch_script("/r", "main", None, false, KB_DEFAULT);
         assert!(set_branch.contains(&format!("REDACT_SED='{}'", redact_sed())));
         assert!(set_branch.contains("unredacted_aside()") && set_branch.contains("unredacted_restore()"));
         for shell in ["sh", "bash"] {
             for cmd in [
                 checkout_command("/r", "main", None, false),
                 checkout_command("/r", "main", Some("/k"), true),
-                switch_script("/r", "main", None, false, KB5),
-                switch_script("/r", "main", Some("/k"), true, KB5),
+                switch_script("/r", "main", None, false, KB_DEFAULT),
+                switch_script("/r", "main", Some("/k"), true, KB_DEFAULT),
             ] {
                 let o = std::process::Command::new(shell).arg("-n").arg("-c").arg(&cmd).output().expect(shell);
                 assert!(o.status.success(), "{shell} -n: {}", String::from_utf8_lossy(&o.stderr));
@@ -3078,7 +3092,7 @@ done
 
     #[test]
     fn checkout_is_gentle_ff_only() {
-        let c = switch_script("/root/ARENA_3.0", "main", Some("/root/.ssh/id_ed25519"), false, KB5);
+        let c = switch_script("/root/ARENA_3.0", "main", Some("/root/.ssh/id_ed25519"), false, KB_DEFAULT);
         assert!(c.contains("cd '/root/ARENA_3.0'"));
         assert!(c.contains("git fetch --prune origin"));
         // Origin's branch by its full name, never the local branch's upstream (codex #5).
@@ -3093,22 +3107,22 @@ done
 
     #[test]
     fn checkout_hard_resets_to_origin() {
-        let c = switch_script("/root/ARENA_3.0", "main", None, true, KB5);
+        let c = switch_script("/root/ARENA_3.0", "main", None, true, KB_DEFAULT);
         assert!(c.contains("git fetch --prune origin"));
         // What it discards saved first — no save, no reset — then force-switch the branch to
         // origin and hard-reset (destructive).
-        assert!(c.contains("discarded_save() {") && c.contains("if discarded_save \"$G\" 'origin/main' 'main' 5242880 && git checkout -f -B 'main' 'origin/main'"));
+        assert!(c.contains("discarded_save() {") && c.contains("if discarded_save \"$G\" 'origin/main' 'main' 1048576 && git checkout -f -B 'main' 'origin/main'"));
         assert!(c.contains("git reset --hard 'origin/main'"));
         assert!(!c.contains("--ff-only"));
         // The keys' restore is the EXIT trap, set before the set-aside (claude #4) — under --hard,
         // followed by the removal of a save stopped part-way (claude #2), a failed restore still
         // failing the command.
         let hard_trap = "trap 'ds_rc=0; unredacted_restore \"$G/arena-unredacted\" || ds_rc=$?; ds_abandon; [ \"$ds_rc\" = 0 ]' EXIT";
-        for (cmd, trap) in [(c.clone(), hard_trap), (switch_script("/r", "main", None, false, KB5), "trap 'unredacted_restore \"$G/arena-unredacted\"' EXIT")] {
+        for (cmd, trap) in [(c.clone(), hard_trap), (switch_script("/r", "main", None, false, KB_DEFAULT), "trap 'unredacted_restore \"$G/arena-unredacted\"' EXIT")] {
             let trap = cmd.find(trap).expect("the trap");
             assert!(trap < cmd.find("unredacted_aside \"$G").unwrap() && cmd.contains("trap 'exit 143' TERM"));
         }
-        assert!(!switch_script("/r", "main", None, false, KB5).contains("ds_abandon"));
+        assert!(!switch_script("/r", "main", None, false, KB_DEFAULT).contains("ds_abandon"));
         assert!(switch_script("/r", "main", None, true, 77).contains("'origin/main' 'main' 77 && git checkout"));
     }
 
@@ -3140,7 +3154,7 @@ done
         for shell in login_shells() {
             for hard in [false, true] {
                 let w = words(shell, &checkout_command("/r", "main", Some("/k"), hard));
-                assert_eq!(w[1..], ["arena-set-branch".to_string(), switch_script("/r", "main", Some("/k"), hard, KB5)], "{shell} hard={hard}");
+                assert_eq!(w[1..], ["arena-set-branch".to_string(), switch_script("/r", "main", Some("/k"), hard, KB_DEFAULT)], "{shell} hard={hard}");
                 wrapper(&w[0], "arena-set-branch", "the switch ran past its 100 s on the pod and was stopped there");
             }
             // init-branches the same way (FIX4B item 9: it puts real keys back too).
@@ -3163,11 +3177,17 @@ done
         shells
     }
 
-    /// `DISCARD_MAX_GB`: GB, a positive number, else 5 — in KiB, as the save's `du -sk` counts.
+    /// `DISCARD_MAX_GB`: GB, a positive number, else 1 (review ai-review claude #6: 5 GB didn't fit
+    /// in the switch's 100 s) — in KiB, as the save's `du -sk` counts; in words as its line says
+    /// sizes.
     #[test]
-    fn the_discard_limit_is_the_configs_gb_else_five() {
-        for (text, want) in [("", KB5), ("DISCARD_MAX_GB= \n", KB5), ("DISCARD_MAX_GB=20\n", 20 * 1024 * 1024), ("DISCARD_MAX_GB=0.5\n", 512 * 1024)] {
+    fn the_discard_limit_is_the_configs_gb_else_one() {
+        assert_eq!((DISCARD_MAX_GB, KB_DEFAULT), (1, 1024 * 1024));
+        for (text, want) in [("", KB_DEFAULT), ("DISCARD_MAX_GB= \n", KB_DEFAULT), ("DISCARD_MAX_GB=20\n", 20 * 1024 * 1024), ("DISCARD_MAX_GB=0.5\n", 512 * 1024)] {
             assert_eq!(discard_max_kb(&Config::parse(text)), Ok(want), "{text:?}");
+        }
+        for (kb, words) in [(KB_DEFAULT, "1.0 GB"), (20 * 1024 * 1024, "20.0 GB"), (512 * 1024, "512 MB"), (1049, "1 MB"), (100, "100 KB")] {
+            assert_eq!(discard_max_words(kb), words, "{kb}");
         }
         for bad in ["0", "-1", "lots", "5GB", "inf", "NaN"] {
             let err = discard_max_kb(&Config::parse(&format!("DISCARD_MAX_GB={bad}\n"))).unwrap_err();
@@ -3849,9 +3869,9 @@ done
         assert!(s.contains("\nbusy_stop\ngit add -A -- \"$@\"\n") && calls[1] == s.find("\nbusy_stop\ngit add -A").unwrap());
         assert!(calls[2] == s.find("\nbusy_stop\nif ! git diff --cached --quiet; then git commit").unwrap());
         // The gentle switch and init-branches check it too, first; --hard doesn't.
-        let gentle = switch_script("/r", "main", None, false, KB5);
+        let gentle = switch_script("/r", "main", None, false, KB_DEFAULT);
         assert!(gentle.contains(BUSY_OP_SH) && gentle.find("busy_op").unwrap() < gentle.find("git fetch").unwrap());
-        assert!(!switch_script("/r", "main", None, true, KB5).contains("busy_op"));
+        assert!(!switch_script("/r", "main", None, true, KB_DEFAULT).contains("busy_op"));
         let init = init_branch_script(&cfg(), "arena8-apple");
         assert!(init.find("busy_op").unwrap() < init.find("git checkout -b").unwrap());
         // On a branch it skips, the work there is only said, read-only, before the SKIP.
@@ -3869,10 +3889,10 @@ done
         let order = ["W=changes", "W=commits", "W=untracked"].map(|w| skip.find(w).unwrap_or_else(|| panic!("{w}")));
         assert!(order.windows(2).all(|p| p[0] < p[1]), "{order:?}");
         // The --hard switch ends a `git am`, rebase or sequence once it has switched; gentle never does.
-        let hard = switch_script("/r", "main", None, true, KB5);
+        let hard = switch_script("/r", "main", None, true, KB_DEFAULT);
         let quits = hard.find("git rebase --quit").expect("quit");
         assert!(hard.find("git reset --hard").unwrap() < quits && hard.contains("git am --quit") && hard.contains("git cherry-pick --quit"));
-        assert!(!switch_script("/r", "main", None, false, KB5).contains("--quit"));
+        assert!(!switch_script("/r", "main", None, false, KB_DEFAULT).contains("--quit"));
         for write in ["git add", "update-index", "git commit", "git push", "git stash", "git reset"] {
             assert!(!skip.contains(write), "{write}");
         }
@@ -4800,7 +4820,7 @@ done
         for shell in &shells {
             for hard in [false, true] {
                 let t0 = std::time::Instant::now();
-                let (code, out, err) = run_in(shell, &bounded_switch(&switch_script(repo, "main", None, hard, KB5), 2, 1), &hang);
+                let (code, out, err) = run_in(shell, &bounded_switch(&switch_script(repo, "main", None, hard, KB_DEFAULT), 2, 1), &hang);
                 assert_eq!(code, Some(124), "{shell} hard={hard}: {out}{err}");
                 assert!(t0.elapsed() < std::time::Duration::from_secs(20), "{shell} hard={hard}: bounded");
                 assert!(err.contains("the switch ran past its 2 s on the pod and was stopped there"), "{shell} hard={hard}: {err}");
@@ -5164,7 +5184,9 @@ done
     /// mid-copy, nothing is left and nothing is reset. And what the save would copy is totalled
     /// first: over `DISCARD_MAX_GB`, or over half what's free on the pod's disk, the switch is
     /// refused before any of it is copied — not reset — saying what was too big and how to move it
-    /// out of the way, which then lets the switch through.
+    /// out of the way, which then lets the switch through. A save stopped says what it was doing
+    /// (review ai-review claude #6: "ran past its 100 s" alone said nothing): mid-copy, what it was
+    /// copying, how big, and the same move out of the way; while it totals the sizes, that.
     #[cfg(unix)]
     #[test]
     fn a_save_stopped_midway_leaves_nothing_and_one_too_big_is_refused() {
@@ -5215,10 +5237,31 @@ done
             &format!("#!/bin/sh\ncase \"$*\" in *arena-discarded/*) {0} \"$@\"; sleep 30; exit 1;; esac\nexec {0} \"$@\"\n", real("cp")),
         );
         let t0 = std::time::Instant::now();
-        let (code, out, err) = run_in("bash", &bounded_switch(&switch_script(repo, "main", None, true, KB5), 2, 1), &slow);
+        let (code, out, err) = run_in("bash", &bounded_switch(&switch_script(repo, "main", None, true, KB_DEFAULT), 2, 1), &slow);
         assert_eq!(code, Some(124), "{out}{err}");
         assert!(t0.elapsed() < std::time::Duration::from_secs(20) && err.contains("was stopped there"), "{err}");
         untouched("stopped mid-copy");
+        // …and it said what it was copying, how big, and how to move it out of the way (review
+        // ai-review claude #6), before the bound's own line.
+        let line = err.lines().find(|l| l.starts_with("arena set-branch: stopped while copying checkpoints (")).unwrap_or_else(|| panic!("{err}"));
+        assert!(
+            line.contains(" KB) into the save, before the --hard reset — the partial save removed, not reset: move it out of the checkout (cd "),
+            "{line}"
+        );
+        suggested_move(line, repo, "checkpoints");
+        assert!(err.find(line).unwrap() < err.find("was stopped there").unwrap(), "{err}");
+        // Stopped while it totals the size first (a `du` that hangs): said, with no size to say yet.
+        let slow_du = stand_in("bin-slow-du", "du", "#!/bin/sh\nsleep 30\n");
+        let (code, out, err) = run_in("bash", &bounded_switch(&switch_script(repo, "main", None, true, KB_DEFAULT), 2, 1), &slow_du);
+        assert_eq!(code, Some(124), "{out}{err}");
+        assert!(
+            err.contains(
+                "arena set-branch: stopped while totalling the size of what the reset would remove (1 path(s)), before the --hard reset — \
+                 the partial save removed, not reset\n"
+            ),
+            "{err}"
+        );
+        untouched("stopped while totalling");
         // Over DISCARD_MAX_GB (here 100 KiB): refused, nothing copied.
         let plain = std::env::var("PATH").unwrap_or_default();
         let (code, out, err) = run_on_path(&checkout_command_limited(repo, "main", None, true, 100), &plain);

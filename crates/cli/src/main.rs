@@ -5432,6 +5432,19 @@ fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<String>) {
             note_invalid(&mut missing, &e);
         }
     }
+    // The most `set-branch --hard` saves on a pod before its reset (review ai-review claude #6: a
+    // bad value used to surface only when `--hard` ran, and stops it there before anything else).
+    match arena_core::backup::discard_max_kb(cfg) {
+        Ok(kb) => println!(
+            "  · --hard save max per pod    {}{} (DISCARD_MAX_GB)",
+            arena_core::backup::discard_max_words(kb),
+            if cfg.get("DISCARD_MAX_GB").is_some_and(|v| !v.trim().is_empty()) { "" } else { " (default)" }
+        ),
+        Err(e) => {
+            println!("  ✗ --hard save max per pod    {e}");
+            note_invalid_text(&mut missing, &e);
+        }
+    }
 
     println!("\nBackup archive (optional, `arena archive`):");
     for line in archive::config_check_lines(cfg, &mut missing) {
@@ -17636,10 +17649,14 @@ mod tests {
         let base = "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple)\nRUNPOD_API_KEY=not-a-real-key\n\
                     HETZNER_API_KEY=not-a-real-key\nGPU_TYPE=\"NVIDIA RTX A4000\"\nIMAGE=img:1\n";
         // (what's added to the base, the keys the check must fail on)
-        let cases: [(&str, &[&str]); 27] = [
+        let cases: [(&str, &[&str]); 30] = [
             ("", &[]),
             ("SHARED_SSH_KEY_PATH=/nonexistent/k\nGIT_SSH_KEY_LOCAL=/nonexistent/d", &[]),
             ("BACKUP_TIMEOUT_SECS=soon", &["BACKUP_TIMEOUT_SECS"]),
+            // `set-branch --hard`'s save limit (review ai-review claude #6).
+            ("DISCARD_MAX_GB=lots", &["DISCARD_MAX_GB"]),
+            ("DISCARD_MAX_GB=0", &["DISCARD_MAX_GB"]),
+            ("DISCARD_MAX_GB=0.5", &[]),
             ("BACKUP_TIMEOUT_SECS=0", &["BACKUP_TIMEOUT_SECS"]),
             ("BUSY_AUTO_RESOLVE_HOURS=3h", &["BUSY_AUTO_RESOLVE_HOURS"]),
             ("BUSY_AUTO_RESOLVE_HOURS=721", &["BUSY_AUTO_RESOLVE_HOURS"]),
@@ -17695,6 +17712,17 @@ mod tests {
                 "MIN_DRIVER_VERSION (\"abc\" is not a driver version like 580 or 580.65.06)",
             ]
         );
+        let (_, missing) = config_report(&Config::parse(&format!("{base}DISCARD_MAX_GB=lots\n")), "runpod");
+        assert_eq!(missing, ["DISCARD_MAX_GB (must be a number of GB above 0, like 5 or 0.5)"]);
+        // The save limit is shown, its default said so.
+        for (extra, row) in [
+            ("", "  · --hard save max per pod    1.0 GB (default) (DISCARD_MAX_GB)"),
+            ("DISCARD_MAX_GB=0.5\n", "  · --hard save max per pod    512 MB (DISCARD_MAX_GB)"),
+            ("DISCARD_MAX_GB=lots\n", "  ✗ --hard save max per pod    DISCARD_MAX_GB must be a number of GB above 0, like 5 or 0.5 (got `lots`)"),
+        ] {
+            let (report, _) = config_report(&Config::parse(&format!("{base}{extra}")), "runpod");
+            assert!(report.lines().any(|l| l == row), "{extra:?}:\n{report}");
+        }
         // Not ready here is ⚠, and named.
         let (report, _) = config_report(&Config::parse(&format!("{base}SHARED_SSH_KEY_PATH=/nonexistent/k\n")), "runpod");
         assert!(report.contains("  ⚠ shared SSH key") && report.contains("  ⚠ iteration start date       unset"), "{report}");
@@ -23275,7 +23303,7 @@ mod remote_tests {
         let apple = everyone(&fleet_of(&[("apple", 22001)]));
         let backup = (backup_command(REPO, Some(KEY), "arena backup devtest-apple", None), Some(BACKUP_TIMEOUT));
         let pushed = || [FakeReply::stdout("BRANCH autocommit-a\nPUSHED autocommit-a\n"), FakeReply::ok()];
-        for (extra, kb) in [("", 5 * 1024 * 1024), ("DISCARD_MAX_GB=0.5\n", 512 * 1024)] {
+        for (extra, kb) in [("", 1024 * 1024), ("DISCARD_MAX_GB=0.5\n", 512 * 1024)] {
             let fake = Arc::new(FakeRemote::new());
             fake.script(&host(22001), pushed());
             handle_set_branch(fake.clone(), &cfg(extra), "main", &apple, true, false, true, &stub.path()).await.unwrap();
