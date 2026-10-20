@@ -517,7 +517,8 @@ enum Carry {
     /// (`password: |-`): the next non-blank line is the value, and so is each line after it
     /// indented deeper than the name's line (`indent`).
     Below { indent: usize },
-    /// A quote the value opened that its line doesn't close: up to the line that does.
+    /// A quote the value opened that its line doesn't close: up to the line that does — with a
+    /// quote no backslash escapes ([`closes_quote`]).
     Quote(u8),
     /// Brackets the value opened that its line doesn't close (`depth` still open): until they
     /// balance.
@@ -926,6 +927,26 @@ fn drop_leading_base64(lines: &mut Vec<String>) -> usize {
     n
 }
 
+/// Whether `line` closes a quoted value carried from a line above (`q`): it holds a `q` that no
+/// backslash escapes (review ai-review codex #2: `middle \" still secret` ended the carry, and the
+/// value's last line, `cohort-db-pass"`, went out as it was). An escaped backslash escapes
+/// nothing (`\\"` closes). Inside `'` too — the shell's don't escape, so a `\'` there keeps the
+/// value masked a line longer than it runs: the safe way to be wrong. A backslash ending a line
+/// takes the line break, as in the shell and python, not the next line's first byte.
+fn closes_quote(line: &[u8], q: u8) -> bool {
+    let mut escaped = false;
+    for &c in line {
+        if escaped {
+            escaped = false;
+        } else if c == b'\\' {
+            escaped = true;
+        } else if c == q {
+            return true;
+        }
+    }
+    false
+}
+
 /// The leading spaces and tabs of `l`.
 fn indent_of(l: &str) -> usize {
     l.bytes().take_while(|c| *c == b' ' || *c == b'\t').count()
@@ -935,8 +956,9 @@ fn indent_of(l: &str) -> usize {
 /// one [`CONT_MASK`] line a run (review ai-review codex #3): a YAML block scalar
 /// (`password: |-`) or a value on the lines below its name (`"password":`) — the next non-blank
 /// line, and each after it indented deeper than the name; an unclosed quote — through the line
-/// that closes it; unbalanced brackets — until they balance; an end that can't be told — the
-/// rest of the window. Lines masked whole already ([`PEM_MASK`]) are left as they are.
+/// that really closes it ([`closes_quote`]); unbalanced brackets — until they balance; an end that
+/// can't be told — the rest of the window. Lines masked whole already ([`PEM_MASK`]) are left as
+/// they are.
 fn continuations(lines: Vec<String>) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let (mut carry, mut first) = (None, false);
@@ -950,7 +972,7 @@ fn continuations(lines: Vec<String>) -> Vec<String> {
                     below
                 }
                 Carry::Quote(q) => {
-                    if l.as_bytes().contains(&q) {
+                    if closes_quote(l.as_bytes(), q) {
                         carry = None;
                     }
                     true
@@ -1262,6 +1284,13 @@ pub(crate) mod tests {
             strings(&[LINE_MASK, CONT_MASK, "done"])
         );
         assert_eq!(tail(&["TOKEN=\"never closed", "x", "y"]), strings(&[LINE_MASK, CONT_MASK]));
+        // Review ai-review codex #2: an escaped quote doesn't end it — the review's own example,
+        // its last line `cohort-db-pass"` included — nor in a `'` value; an escaped backslash
+        // before the real close does.
+        assert_eq!(tail(&["MY_SECRET=\"first", "middle \\\" still secret", "cohort-db-pass\"", "after"]), strings(&[LINE_MASK, CONT_MASK, "after"]));
+        assert_eq!(tail(&["--password 'a", "it\\'s secret", "still secret'", "after"]), strings(&[LINE_MASK, CONT_MASK, "after"]));
+        assert_eq!(tail(&["TOKEN=\"a", "ends in a backslash \\\\\"", "after"]), strings(&[LINE_MASK, CONT_MASK, "after"]));
+        assert!(!tail(&["MY_SECRET=\"first", "middle \\\" still", "cohort-db-pass\"", "after"]).join("\n").contains("cohort"));
         // Not a secret's: nothing hidden.
         let plain = ["name: |", "some text", "message: \"open", "more\"", "done"];
         assert_eq!(tail(&plain), strings(&plain));
