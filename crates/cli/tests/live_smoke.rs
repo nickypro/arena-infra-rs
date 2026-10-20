@@ -3,7 +3,7 @@
 //! it, publish `snapshot --public`, `pods rename` it there and back, terminate it, and confirm
 //! with `teardown --check` that nothing it made is left. Unit tests, fakes and fixtures can't
 //! catch an API that changed under us; this does, in a few minutes for a few cents. Run it
-//! before each cohort — how: README "Testing".
+//! before each cohort — how: docs/REFERENCE.md "Testing".
 //!
 //! It spends real money, so it is `#[ignore]`d and **refuses to start** unless every guard
 //! holds. Each guard is a pure function with an ordinary (offline, always-run) test below:
@@ -811,7 +811,7 @@ fn preflight() -> Result<Plan, String> {
 }
 
 #[test]
-#[ignore = "LIVE: creates, checks and terminates one cheap RunPod pod — see README \"Testing\""]
+#[ignore = "LIVE: creates, checks and terminates one cheap RunPod pod — see docs/REFERENCE.md \"Testing\""]
 fn live_smoke() {
     let plan = preflight().unwrap_or_else(|why| panic!("live smoke refused: {why}"));
     let Plan { arena, prefix, gpu, create, rename_to } = plan;

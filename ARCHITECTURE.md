@@ -238,7 +238,7 @@ provider behaviour runs against fake `Provider`s (capacity, flapping endpoints, 
 listing failures); every SSH path runs against `FakeRemote` on a paused clock; provider
 parsers run against schema-shaped and recorded fixtures. `crates/cli/tests/live_smoke.rs`
 is the opt-in, `#[ignore]`d live smoke test that drives the built binary against a sandbox
-account (README "Testing").
+account ([docs/REFERENCE.md "Testing"](docs/REFERENCE.md#testing)).
 
 ## Extending
 

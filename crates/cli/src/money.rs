@@ -1345,10 +1345,10 @@ mod tests {
     }
 
     /// Review BC5 / BC1 through `arena balance` itself: it lists without details, and RunPod
-    /// v1's REST list has no $/h (README: "on RUNPOD_API=v2 the REST list already has GPU and
-    /// $"), so a running pod is unpriced. With live working, the provider's whole rate is
-    /// blamed on volumes; under `--no-live` ("what the fallback says") the running pod reads
-    /// as "no burn".
+    /// v1's REST list has no $/h (docs/REFERENCE.md, `pods list`: "on REST v2, the default, the
+    /// REST list already has GPU and $"), so a running pod is unpriced. With live working, the
+    /// provider's whole rate is blamed on volumes; under `--no-live` ("what the fallback says")
+    /// the running pod reads as "no burn".
     #[tokio::test]
     async fn review_bc5_unpriced_v1_pod_in_arena_balance() {
         let dir = StateDir::new("review-bc5");
