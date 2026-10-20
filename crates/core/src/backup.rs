@@ -1105,8 +1105,9 @@ fn init_branch_script(cfg: &BackupConfig, machine_name: &str) -> String {
 /// unbounded, as before. Nor does any trap cover the pod itself going away (a stop, a reboot).
 ///
 /// The switch's script runs under `sh -c` (dash on the images), whatever the pod's login shell:
-/// sshd hands the command to the login shell's `-c` — zsh on the pods — which now runs only the
-/// few POSIX lines that start the script under `timeout` and `sh`.
+/// sshd hands the command to the login shell's `-c` — zsh on the pods — which now parses only one
+/// simple command, `sh -c '<wrapper>' arena-set-branch '<script>'` ([`bounded_sh`]): the wrapper
+/// starts the script under `timeout` and `sh`.
 ///
 /// An operation in progress (a participant's conflicted `git pull upstream main`, a cherry-pick,
 /// a revert, a `git stash pop`'s conflicts: [`BUSY_OP_SH`]) is never ended by the gentle switch:
@@ -1152,16 +1153,41 @@ pub fn discard_max_kb(cfg: &Config) -> std::result::Result<u64, String> {
 /// doesn't run) a script that sets real keys aside or puts them back must never meet — bounded by
 /// `timeout -k <kill_after> <secs>` when the pod has a `timeout` that takes `-k` (coreutils'; a
 /// probe finds out), else unbounded. A run `timeout` stopped says `stopped` (exit 124), or
-/// `killed` (137), on stderr. The script is in a variable, so it's carried once.
-fn bounded_sh(script: &str, name: &str, secs: u64, kill_after: u64, stopped: &str, killed: &str) -> String {
-    format!(
-        "ARENA_SH={}\nif timeout -k 1 1 true >/dev/null 2>&1; then timeout -k {kill_after} {secs} sh -c \"$ARENA_SH\" {name}; \
-         r=$?; if [ \"$r\" = 124 ]; then printf '%s\\n' {} >&2; elif [ \"$r\" = 137 ]; then printf '%s\\n' {} >&2; fi; exit \"$r\"; \
-         else exec sh -c \"$ARENA_SH\" {name}; fi",
-        shell_quote(script),
+/// `killed` (137), on stderr.
+///
+/// The command is one simple command — `sh -c '<wrapper>' <name> '<script>'` — so the login shell
+/// only ever parses that (review ai-review claude #11: the wrapper was an assignment and an
+/// `if … fi`, which bash and zsh take but fish refuses, so nothing ran there). The wrapper, under
+/// `sh`, holds the probe and the fallback, and starts the script from its `$1`. Each word is
+/// quoted for any login shell ([`login_quote`]). Shared with the resolve's command (FIX5A).
+pub fn bounded_sh(script: &str, name: &str, secs: u64, kill_after: u64, stopped: &str, killed: &str) -> String {
+    let wrapper = format!(
+        "if timeout -k 1 1 true >/dev/null 2>&1; then timeout -k {kill_after} {secs} sh -c \"$1\" \"$0\"; r=$?; \
+         if [ \"$r\" = 124 ]; then printf '%s\\n' {} >&2; elif [ \"$r\" = 137 ]; then printf '%s\\n' {} >&2; fi; exit \"$r\"; \
+         else exec sh -c \"$1\" \"$0\"; fi",
         shell_quote(stopped),
         shell_quote(killed)
-    )
+    );
+    format!("sh -c {} {} {}", login_quote(&wrapper), login_quote(name), login_quote(script))
+}
+
+/// `s` single-quoted for whichever login shell sshd hands a command to: the POSIX ones (sh, bash,
+/// zsh) and fish read it the same. Inside single quotes fish takes `\\` and `\'` as escapes, where
+/// a POSIX shell takes nothing — so a script with a backslash in it (the redaction's sed has many)
+/// came out changed under fish. Every backslash and quote goes outside the quotes, escaped (`'\\'`,
+/// `'\''`), where each of them reads the one character.
+fn login_quote(s: &str) -> String {
+    let mut q = String::with_capacity(s.len() + 2);
+    q.push('\'');
+    for c in s.chars() {
+        match c {
+            '\'' => q.push_str("'\\''"),
+            '\\' => q.push_str("'\\\\'"),
+            c => q.push(c),
+        }
+    }
+    q.push('\'');
+    q
 }
 
 /// How long a branch switch may run on the pod before `timeout` stops it there with TERM
@@ -2862,19 +2888,14 @@ done
     /// working code — and ran under the login shell's `-c`, zsh on the pods, where a glob with no
     /// match is fatal: a set-aside run left without its `.branch` ended the whole command at the
     /// restore's `"$1"/*.branch`, before the push (nor did an EXIT trap run after it). Now its script
-    /// runs under `sh` whatever the login shell: under bash and zsh, the restore onto a day branch
+    /// runs under `sh` whatever the login shell: under bash, zsh and fish, the restore onto a day branch
     /// that exists brings the key back, and in that no-match state the day's branch is still made
     /// and pushed, the stray run left as it was.
     #[cfg(unix)]
     #[test]
     fn init_branches_runs_under_sh_whatever_the_login_shell() {
-        let has = |sh: &str| std::process::Command::new(sh).args(["-c", "true"]).output().is_ok_and(|o| o.status.success());
-        let shells: Vec<&str> = ["bash", "zsh"].into_iter().filter(|sh| has(sh)).collect();
-        if !shells.contains(&"zsh") {
-            eprintln!("zsh isn't installed here: init-branches runs under bash only");
-        }
         let path = std::env::var("PATH").unwrap_or_default();
-        for shell in shells {
+        for shell in login_shells() {
             let s = GitSandbox::new(&format!("init-{shell}"), 1_000_000);
             let repo = s.work.to_str().unwrap();
             let day = |d: u32| BackupConfig { repo_path: repo.to_string(), prefix: "devtest".into(), week: 1, day: d, git_ssh_key: None, origin: None };
@@ -3084,28 +3105,53 @@ done
 
     /// The switch runs under `sh`, whatever the login shell that `-c`s the command (zsh on the
     /// pods), bounded on the pod by `timeout` a little under arena's own 2 minutes — a pod without
-    /// one runs it unbounded (review ai-review claude #13).
+    /// one runs it unbounded (review ai-review claude #13). The command is one simple command,
+    /// `sh -c '<wrapper>' <name> '<script>'` (claude #11: the login shell parsed an assignment and
+    /// an `if … fi`, which fish refuses): every login shell here — bash, zsh, fish — reads it as
+    /// those words, the script byte for byte (its backslashes too, which fish reads differently
+    /// inside single quotes).
+    #[cfg(unix)]
     #[test]
     fn the_switch_bounds_itself_on_the_pod_under_sh() {
-        for hard in [false, true] {
-            let c = checkout_command("/r", "main", Some("/k"), hard);
-            let script = switch_script("/r", "main", Some("/k"), hard, KB5);
-            let head = format!("ARENA_SH={}\n", shell_quote(&script));
-            assert!(c.starts_with(&head), "{c}");
-            let rest = &c[head.len()..];
-            assert!(rest.starts_with("if timeout -k 1 1 true >/dev/null 2>&1; then timeout -k 10 100 sh -c \"$ARENA_SH\" arena-set-branch; r=$?;"), "{rest}");
-            assert!(rest.ends_with("exit \"$r\"; else exec sh -c \"$ARENA_SH\" arena-set-branch; fi"), "{rest}");
-            assert!(rest.contains("if [ \"$r\" = 124 ]") && rest.contains("ran past its 100 s on the pod and was stopped there"));
-            assert!(rest.contains("elif [ \"$r\" = 137 ]") && rest.contains("was killed there (10 s after the TERM)"));
+        let words = |shell: &str, cmd: &str| -> Vec<String> {
+            let rest = cmd.strip_prefix("sh -c ").unwrap_or_else(|| panic!("one `sh -c` command: {cmd}"));
+            let o = std::process::Command::new(shell).arg("-c").arg(format!("command printf '%s\\0' {rest}")).output().unwrap();
+            assert!(o.status.success(), "{shell}: {}", String::from_utf8_lossy(&o.stderr));
+            let mut w: Vec<String> = o.stdout.split(|b| *b == 0).map(|w| String::from_utf8_lossy(w).into_owned()).collect();
+            assert_eq!(w.pop().as_deref(), Some(""), "{shell}");
+            w
+        };
+        let wrapper = |w: &str, name: &str, stopped: &str| {
+            assert!(w.starts_with("if timeout -k 1 1 true >/dev/null 2>&1; then timeout -k 10 100 sh -c \"$1\" \"$0\"; r=$?;"), "{name}: {w}");
+            assert!(w.ends_with("exit \"$r\"; else exec sh -c \"$1\" \"$0\"; fi"), "{name}: {w}");
+            assert!(w.contains("if [ \"$r\" = 124 ]") && w.contains(stopped), "{name}: {w}");
+            assert!(w.contains("elif [ \"$r\" = 137 ]") && w.contains("was killed there (10 s after the TERM)"), "{name}: {w}");
+        };
+        assert!(redact_sed().contains('\\'), "a script with backslashes in it");
+        for shell in login_shells() {
+            for hard in [false, true] {
+                let w = words(shell, &checkout_command("/r", "main", Some("/k"), hard));
+                assert_eq!(w[1..], ["arena-set-branch".to_string(), switch_script("/r", "main", Some("/k"), hard, KB5)], "{shell} hard={hard}");
+                wrapper(&w[0], "arena-set-branch", "the switch ran past its 100 s on the pod and was stopped there");
+            }
+            // init-branches the same way (FIX4B item 9: it puts real keys back too).
+            let w = words(shell, &init_branch_command(&cfg(), "arena8-apple"));
+            assert_eq!(w[1..], ["arena-init-branches".to_string(), init_branch_script(&cfg(), "arena8-apple")], "{shell}");
+            wrapper(&w[0], "arena-init-branches", "arena init-branches: it ran past its 100 s on the pod and was stopped there");
         }
         assert_eq!((SWITCH_BOUND_SECS, SWITCH_KILL_AFTER_SECS), (100, 10));
-        // init-branches the same way (FIX4B item 9: it puts real keys back too).
-        let init = init_branch_command(&cfg(), "arena8-apple");
-        let head = format!("ARENA_SH={}\n", shell_quote(&init_branch_script(&cfg(), "arena8-apple")));
-        assert!(init.starts_with(&head), "{init}");
-        let rest = &init[head.len()..];
-        assert!(rest.starts_with("if timeout -k 1 1 true >/dev/null 2>&1; then timeout -k 10 100 sh -c \"$ARENA_SH\" arena-init-branches; r=$?;"), "{rest}");
-        assert!(rest.ends_with("else exec sh -c \"$ARENA_SH\" arena-init-branches; fi") && rest.contains("arena init-branches: it ran past its 100 s"), "{rest}");
+    }
+
+    /// The login shells a remote command is tried under here: bash, and zsh (the pods') and fish
+    /// when installed — said when one isn't.
+    #[cfg(unix)]
+    fn login_shells() -> Vec<&'static str> {
+        let has = |sh: &str| std::process::Command::new(sh).args(["-c", "true"]).output().is_ok_and(|o| o.status.success());
+        let shells: Vec<&str> = ["bash", "zsh", "fish"].into_iter().filter(|sh| has(sh)).collect();
+        for sh in ["zsh", "fish"].into_iter().filter(|sh| !shells.contains(sh)) {
+            eprintln!("{sh} isn't installed here: not tried as the login shell");
+        }
+        shells
     }
 
     /// `DISCARD_MAX_GB`: GB, a positive number, else 5 — in KiB, as the save's `du -sk` counts.
@@ -4657,8 +4703,8 @@ done
     /// session's shell is usually never signalled: the switch ran on, and could land after arena
     /// had reported a timeout and released the pod's lock. Now it bounds itself on the pod — under
     /// `timeout`, TERM to its process group (here after 2 s, at a checkout that hangs): exit 124,
-    /// said, the real keys back, the pod on its branch. Under bash and under zsh, the pods' login
-    /// shell, which `-c`s the command (sshd), so it starts the switch's script under `sh`: the
+    /// said, the real keys back, the pod on its branch. Under bash, zsh (the pods' login shell,
+    /// which `-c`s the command: sshd) and fish, so it starts the switch's script under `sh`: the
     /// real command switches and switches back, the keys with it. A pod whose `timeout` doesn't
     /// work runs it unbounded, as before.
     #[cfg(unix)]
@@ -4673,11 +4719,7 @@ done
         assert_eq!((code, r.redacted.len()), (Some(0), 1), "{err}");
         let aside = s.work.join(".git/arena-unredacted");
         let branch = || s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]);
-        let has = |sh: &str| std::process::Command::new(sh).args(["-c", "true"]).output().is_ok_and(|o| o.status.success());
-        let shells: Vec<&str> = ["bash", "zsh"].into_iter().filter(|sh| has(sh)).collect();
-        if !shells.contains(&"zsh") {
-            eprintln!("zsh isn't installed here: the login-shell checks run under bash only");
-        }
+        let shells = login_shells();
         let stand_in = |dir: &str, body: &str| {
             let bin = s.base.join(dir);
             std::fs::create_dir_all(&bin).unwrap();

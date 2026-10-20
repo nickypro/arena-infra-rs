@@ -875,7 +875,10 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     it runs under `timeout` for 100 s (TERM, the keys put back; KILL 10 s later if still running,
     which runs no trap: keys then stay set aside until a switch back to their branch), said on the
     pod's line if it ran out; a pod without coreutils' `timeout` runs it unbounded. Its script
-    runs under `sh`, whatever the login shell (zsh on the pods).
+    runs under `sh`, whatever the login shell (zsh on the pods): the command sshd hands the login
+    shell is one simple command, `sh -c '<wrapper>' arena-set-branch '<script>'`, quoted so bash,
+    zsh and fish all read it the same (review ai-review claude #11: fish refused the old
+    assignment-and-`if` wrapper); the wrapper, under `sh`, holds the `timeout` probe and fallback.
     Landing pods on `main`/`master` ends with the reminder
     ``⚠ N cohort pods on main: not backed up until `arena pods init-branches` ``;
     `--init-branches` then runs `init-branches` on every pod that switched (the start date is
@@ -899,7 +902,7 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     on it; its script runs under `sh`, whatever the login shell (zsh on the pods, where a glob
     with no match is fatal: a set-aside run left without its `.branch` ended the whole command
     before the push), bounded on the pod like `set-branch`'s switch (100 s, then a KILL 10 s
-    later). No targets =
+    later), through the same one simple command. No targets =
     this cohort's pods, as for `backup`.
   - `pods run [-t <targets>] [--timeout <secs>] <cmd>` / `pods test [targets]` — run an
     arbitrary command on every (selected) pod (concurrent, confirms first naming the pods;
