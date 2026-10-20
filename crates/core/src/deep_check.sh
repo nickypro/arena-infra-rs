@@ -9,7 +9,8 @@
 #     that never appears also reads as unknown.
 #   * every sub-step is bounded with `timeout` and the network probe runs alongside the
 #     GPU checks, so a run ends in under ~2 minutes even on a sick host (worst case ≈
-#     10+10 nvidia-smi, 75 python, 5+5 df; the caller's budget is DEEP_CHECK_TIMEOUT).
+#     10+10+10 nvidia-smi, 5 driver file, 75 python, 5+5 df; the caller's budget is
+#     DEEP_CHECK_TIMEOUT).
 # Read-only apart from its own temp dir (removed on exit). Needs no TTY, reads no stdin.
 # The caller runs it inside the participants' login env (conda env active), so `python`
 # is the interpreter participants actually use.
@@ -124,6 +125,21 @@ else
   kv smi missing
 fi
 
+# ---- the driver as its kernel module reports it ----
+# A container usually sees this file even where NVML is blocked (a MIG slice's "Insufficient
+# Permissions", "No devices were found"), so it stands in for nvidia-smi's driver version.
+# The `NVRM version:` line's first dotted number. ARENA_TEST_NVIDIA_VERSION_FILE: tests only
+# (a fake file — the test machines have no GPU).
+nvver=${ARENA_TEST_NVIDIA_VERSION_FILE:-/proc/driver/nvidia/version}
+if [ -r "$nvver" ]; then
+  v=$(bounded 5 head -c 4096 "$nvver" 2>/dev/null | sed -n 's/^NVRM version:\(.*\)$/\1/p' | head -n 1 |
+    grep -oE '(^|[[:space:]])[0-9]+(\.[0-9]+)+([[:space:]]|$)' | head -n 1)
+  v=$(trim "$v")
+  kv driver_proc "${v:-unknown}"
+else
+  kv driver_proc missing
+fi
+
 # ---- torch / CUDA (python, written to a file: the NCCL test's spawned workers re-import it) ----
 PY=$(command -v python 2>/dev/null || command -v python3 2>/dev/null)
 if [ -z "$PY" ]; then
@@ -154,6 +170,25 @@ def kv(k, v):
 
 def err(e):
     return f"error: {type(e).__name__}: {e}"
+
+
+def fact(k, get):
+    """A fact only torch can give when nvidia-smi can't answer (a MIG slice): printed when
+    `get()` works, left out when it raises (an older torch, a slice's limits) — never failing
+    the run or the checks after it."""
+    try:
+        kv(k, get())
+    except BaseException:
+        pass
+
+
+def driver_cuda(torch):
+    """The newest CUDA the driver supports, as torch reads it (12080 -> 12.8): nvidia-smi's
+    "CUDA Version", for when nvidia-smi can't run. A private torch API, so it may be gone."""
+    v = int(torch._C._cuda_getDriverVersion())
+    if v <= 0:
+        raise ValueError(v)
+    return f"{v // 1000}.{v % 1000 // 10}"
 
 
 def tensor_check(torch, i):
@@ -290,13 +325,20 @@ def main():
         n = 0
     if not available:
         return
+    fact("torch_driver_cuda", lambda: driver_cuda(torch))
 
+    mib = 1 << 20
     for i in range(n):
+        # Name and memory as torch sees them (under MIG it names the slice): what labels and
+        # the nvidia-smi check fall back on when nvidia-smi can't list the GPUs.
+        fact(f"tgpu.{i}.name", lambda: torch.cuda.get_device_name(i))
+        fact(f"tgpu.{i}.mem_total_mib", lambda: torch.cuda.get_device_properties(i).total_memory // mib)
         try:
             res = tensor_check(torch, i)
         except BaseException as e:
             res = err(e)
         kv(f"tensor.{i}", res)
+        fact(f"tgpu.{i}.mem_free_mib", lambda: torch.cuda.mem_get_info(i)[0] // mib)
 
     if n < 2:
         kv("peer", f"skipped ({n} GPU)")

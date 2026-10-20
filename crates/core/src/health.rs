@@ -38,7 +38,7 @@ use crate::table::{self, Align};
 /// operator needs, and versioned with the parser that reads its output.
 pub const DEEP_CHECK_SCRIPT: &str = include_str!("deep_check.sh");
 
-/// The whole remote call's budget. The script bounds itself to ≈110s worst case (each
+/// The whole remote call's budget. The script bounds itself to ≈120s worst case (each
 /// sub-step under `timeout`, the network probe in parallel with the GPU checks); on top
 /// come the ssh connect (10s) and sourcing the participants' `~/.zshrc`. Past this the pod
 /// is wedged and counts as a FAIL — the fleet run never waits on it longer.
@@ -88,6 +88,18 @@ pub struct GpuFact {
     pub mem_used_mib: Option<u64>,
 }
 
+/// One GPU as torch sees it (`tgpu.<i>.*`, printed only when CUDA is available). Under MIG
+/// torch names the slice (`NVIDIA A100-SXM4-40GB MIG 1g.5gb`), and it answers where nvidia-smi
+/// can't (a slice's container without NVML access): what labels fall back on.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct TorchGpuFact {
+    pub index: u32,
+    pub name: Option<String>,
+    pub mem_total_mib: Option<u64>,
+    /// Free after the tensor op (`torch.cuda.mem_get_info`).
+    pub mem_free_mib: Option<u64>,
+}
+
 /// What the check script measured on one pod. Every field is optional: `None` means the
 /// script didn't say (or said `unknown`), and [`evaluate`] decides what an unknown means
 /// for each check. Result strings (`torch`, `tensor`, `peer`, `nccl`, …) are the script's
@@ -111,6 +123,10 @@ pub struct DeepFacts {
     pub smi: Option<String>,
     /// The "CUDA Version" in nvidia-smi's header: the newest CUDA the driver supports.
     pub smi_cuda: Option<String>,
+    /// The driver version in `/proc/driver/nvidia/version` (its `NVRM version:` line): what the
+    /// driver check reads when nvidia-smi gives none — a container usually sees the file even
+    /// where NVML is blocked (a MIG slice). Only ever a dotted version.
+    pub driver_proc: Option<String>,
     /// Error from the `--query-gpu` call, when the header call worked but that didn't.
     pub smi_query: Option<String>,
     pub smi_gpus: Option<u32>,
@@ -135,6 +151,11 @@ pub struct DeepFacts {
     pub torch_version: Option<String>,
     /// The CUDA torch was built against (`torch.version.cuda`).
     pub torch_cuda: Option<String>,
+    /// The newest CUDA the driver supports, as torch reads it (`_cuda_getDriverVersion`, 12080
+    /// → `12.8`): nvidia-smi's "CUDA Version" when nvidia-smi can't answer. `major.minor` only.
+    pub torch_driver_cuda: Option<String>,
+    /// The GPUs as torch sees them (`tgpu.<i>.*`), by index.
+    pub torch_gpus: Vec<TorchGpuFact>,
     pub cuda_available: Option<bool>,
     /// Why CUDA is unavailable (what `torch.cuda.init()` raised).
     pub cuda_error: Option<String>,
@@ -260,6 +281,7 @@ impl DeepFacts {
 pub fn parse_deep(stdout: &str) -> DeepFacts {
     let mut f = DeepFacts::default();
     let mut gpus: BTreeMap<u32, GpuFact> = BTreeMap::new();
+    let mut tgpus: BTreeMap<u32, TorchGpuFact> = BTreeMap::new();
     for line in stdout.lines() {
         let Some((key, value)) = line.trim_end_matches('\r').split_once('=') else { continue };
         let (key, value) = (key.trim(), value.trim());
@@ -287,6 +309,7 @@ pub fn parse_deep(stdout: &str) -> DeepFacts {
             "uptime_secs" => f.uptime_secs = int(),
             "smi" => f.smi = text(),
             "smi_cuda" => f.smi_cuda = text(),
+            "driver_proc" => f.driver_proc = text().filter(|v| parse_version(v).is_some_and(|d| d[0] > 0)),
             "smi_query" => f.smi_query = text(),
             "smi_gpus" => f.smi_gpus = small(),
             "mig_devices" => f.mig_devices = small(),
@@ -298,6 +321,9 @@ pub fn parse_deep(stdout: &str) -> DeepFacts {
             "torch" => f.torch = text(),
             "torch_version" => f.torch_version = text(),
             "torch_cuda" => f.torch_cuda = text(),
+            "torch_driver_cuda" => {
+                f.torch_driver_cuda = text().filter(|v| parse_version(v).is_some_and(|c| c.len() == 2 && c[0] > 0))
+            }
             "cuda_available" => {
                 f.cuda_available = match value {
                     "true" => Some(true),
@@ -323,7 +349,7 @@ pub fn parse_deep(stdout: &str) -> DeepFacts {
             "vscode.python" => f.vscode_python = text(),
             _ => {
                 if let Some(v) = text() {
-                    if !indexed_fact(&mut f, &mut gpus, key, v.clone()) {
+                    if !indexed_fact(&mut f, &mut gpus, &mut tgpus, key, v.clone()) {
                         f.other.insert(key.to_string(), v);
                     }
                 }
@@ -331,24 +357,48 @@ pub fn parse_deep(stdout: &str) -> DeepFacts {
         }
     }
     f.gpus = gpus.into_values().collect();
+    f.torch_gpus = tgpus.into_values().collect();
     f
 }
 
-/// `gpu.<i>.<field>`, `tensor.<i>`, `peer.<i>-<j>`: the per-device facts. `false` if `key`
-/// isn't one of them.
-fn indexed_fact(f: &mut DeepFacts, gpus: &mut BTreeMap<u32, GpuFact>, key: &str, value: String) -> bool {
+/// `gpu.<i>.<field>`, `tgpu.<i>.<field>`, `tensor.<i>`, `peer.<i>-<j>`: the per-device facts.
+/// `false` if `key` isn't one of them.
+fn indexed_fact(
+    f: &mut DeepFacts,
+    gpus: &mut BTreeMap<u32, GpuFact>,
+    tgpus: &mut BTreeMap<u32, TorchGpuFact>,
+    key: &str,
+    value: String,
+) -> bool {
     if let Some(rest) = key.strip_prefix("gpu.") {
         let Some((idx, field)) = rest.split_once('.') else { return false };
         let Ok(index) = idx.parse::<u32>() else { return false };
         if !matches!(field, "name" | "driver" | "mem_total_mib" | "mem_used_mib") {
             return false;
         }
+        // nvidia-smi's placeholders (`[N/A]`, `[Insufficient Permissions]` — a MIG slice's
+        // fields) are no value: the row is there, the field unknown.
+        let value = Some(value).filter(|v| !(v.starts_with('[') && v.ends_with(']')));
         let g = gpus.entry(index).or_insert_with(|| GpuFact { index, ..Default::default() });
         match field {
+            "name" => g.name = value,
+            "driver" => g.driver = value,
+            "mem_total_mib" => g.mem_total_mib = value.and_then(|v| v.parse().ok()),
+            _ => g.mem_used_mib = value.and_then(|v| v.parse().ok()),
+        }
+        return true;
+    }
+    if let Some(rest) = key.strip_prefix("tgpu.") {
+        let Some((idx, field)) = rest.split_once('.') else { return false };
+        let Ok(index) = idx.parse::<u32>() else { return false };
+        if !matches!(field, "name" | "mem_total_mib" | "mem_free_mib") {
+            return false;
+        }
+        let g = tgpus.entry(index).or_insert_with(|| TorchGpuFact { index, ..Default::default() });
+        match field {
             "name" => g.name = Some(value),
-            "driver" => g.driver = Some(value),
             "mem_total_mib" => g.mem_total_mib = value.parse().ok(),
-            _ => g.mem_used_mib = value.parse().ok(),
+            _ => g.mem_free_mib = value.parse().ok(),
         }
         return true;
     }
@@ -2241,6 +2291,64 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
         assert_eq!(v[1]["status"], "fail");
         assert!(v[1]["facts"].is_null());
         assert!(!v.to_string().contains("1.1.1.1"), "no IPs in the JSON");
+    }
+
+    // ---- MIG: nvidia-smi can't answer, torch can (lane MIG, 2026-10-20) ----
+
+    const A100_SLICE: &str = "NVIDIA A100-SXM4-40GB MIG 1g.5gb";
+
+    #[test]
+    fn parse_reads_torchs_gpus_and_the_proc_driver() {
+        let out = edit(
+            HEALTHY_2GPU,
+            &[
+                ("gpu.0.name", Some("[N/A]")),
+                ("gpu.0.driver", Some("[Insufficient Permissions]")),
+                ("gpu.1.mem_total_mib", Some("[N/A]")),
+                ("driver_proc", Some("570.86.15")),
+                ("torch_driver_cuda", Some("12.8")),
+                ("tgpu.0.name", Some(A100_SLICE)),
+                ("tgpu.0.mem_total_mib", Some("4864")),
+                ("tgpu.0.mem_free_mib", Some("4600")),
+                ("tgpu.1.mem_total_mib", Some("lots")),
+                ("tgpu.x.name", Some("odd")),
+                ("tgpu.0.bogus", Some("1")),
+            ],
+        );
+        let f = parse_deep(&out);
+        assert_eq!(f.driver_proc.as_deref(), Some("570.86.15"));
+        assert_eq!(f.torch_driver_cuda.as_deref(), Some("12.8"));
+        assert_eq!(
+            f.torch_gpus,
+            [
+                TorchGpuFact { index: 0, name: Some(A100_SLICE.into()), mem_total_mib: Some(4864), mem_free_mib: Some(4600) },
+                TorchGpuFact { index: 1, ..Default::default() },
+            ]
+        );
+        // nvidia-smi's placeholders are no value: the row stays, the field is unknown.
+        assert_eq!((f.gpus.len(), f.gpus[0].name.as_deref(), f.gpus[0].driver.as_deref()), (2, None, None));
+        assert_eq!((f.gpus[1].mem_total_mib, f.driver()), (None, Some("580.65.06")));
+        // A malformed per-device key is kept as an unknown fact, as `gpu.x.name` is.
+        assert_eq!(f.other.get("tgpu.x.name").map(String::as_str), Some("odd"));
+        assert_eq!(f.other.get("tgpu.0.bogus").map(String::as_str), Some("1"));
+        // `--json` (the facts as they are) carries them.
+        let v = serde_json::to_value(&f).unwrap();
+        assert_eq!((v["driver_proc"].as_str(), v["torch_driver_cuda"].as_str()), (Some("570.86.15"), Some("12.8")));
+        assert_eq!(
+            v["torch_gpus"][0],
+            serde_json::json!({"index": 0, "name": A100_SLICE, "mem_total_mib": 4864, "mem_free_mib": 4600})
+        );
+
+        // Garbage versions are unknown.
+        for bad in ["missing", "unknown", "NVIDIA UNIX", "580.x", "0", ""] {
+            assert_eq!(parse_deep(&edit(HEALTHY_2GPU, &[("driver_proc", Some(bad))])).driver_proc, None, "{bad:?}");
+        }
+        for bad in ["12080", "12", "12.8.1", "12.x", "0.0", "none", "unknown"] {
+            assert_eq!(parse_deep(&edit(HEALTHY_2GPU, &[("torch_driver_cuda", Some(bad))])).torch_driver_cuda, None, "{bad:?}");
+        }
+        // An older script prints none of it.
+        let f = parse_deep(HEALTHY_2GPU);
+        assert_eq!((f.driver_proc, f.torch_driver_cuda, f.torch_gpus.len()), (None, None, 0));
     }
 
     // ---- the script itself (run locally; no network, no GPU) ----
