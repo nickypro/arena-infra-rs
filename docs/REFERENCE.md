@@ -1114,7 +1114,7 @@ retrying", never as a clean failure.
 
 One id per run, e.g. `20261008-142301-pytest-x-k--3fa9c1`: the UTC start, a slug of the command's
 shape — its program, script and flag names, never a value, as `pods ask` sends commands (`curl -u
-bob:pw …` makes `…-curl-u--…`) — and six random hex digits, so two runs whose commands differ only in
+bob:pw …` makes `…-curl-u--…`, a command whose quoting doesn't close `…-command--…`) — and six random hex digits, so two runs whose commands differ only in
 a value never share one. Ids made before keep their names and work as ever. Everything stays on
 the pod under `~/.arena/jobs/<id>/` (`cmd`, `run`, `log` = stdout+stderr, `pid`, `started_at`,
 `exit`), so it survives your SSH session and any operator can look — but not a pod restart
@@ -1284,7 +1284,11 @@ notebook it runs (`train.py`, `part1.ipynb`, or python's `-m pytest`), each flag
 `-p`, `--token=…`), and `…` for every value — `python3 /w/train.py --lr 0.1 --token X` is `python3
 train.py --lr … --token …`, `sshpass -p pw ssh host` is `sshpass -p … …`. A shell's or python's `-c`
 code is `bash -c …`, a path under the jobs dir `<job>`, and a name that looks like a key (a long run
-of letters and digits) a value too. Only a value spelled exactly like a flag's name (`-x`, `--fast`)
+of letters and digits) a value too. The words are the shell's (quotes and backslashes taken out, a
+quoted value with blanks one word), every leading `NAME=value` is one `…` before the program
+(`APP_CONFIG='{"password": "x y"}' python train.py` is `… python train.py`), a program's, script's
+or module's name shows only as 1–40 of `[A-Za-z0-9._+-]` (else `…`), and a command whose quoting
+doesn't close is `<command>` whole. Only a value spelled exactly like a flag's name (`-x`, `--fast`)
 can still show: no shape can tell it without knowing every program's options.
 
 Every other text field is masked through the backup's own key patterns

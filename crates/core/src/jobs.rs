@@ -1016,7 +1016,13 @@ mod tests {
             ("supercalifragilistic", "20261008-142301-supercalifragilistic--c0ffee"),
             // No value in a new id (live ASK2 G1, review ai-review claude #10): the command's shape.
             ("curl -u bob:hunter2pass http://127.0.0.1:9/", "20261008-142301-curl-u--c0ffee"),
-            ("MY_SECRET='two words' python x.py", "20261008-142301-x-py--c0ffee"),
+            ("MY_SECRET='two words' python x.py", "20261008-142301-python-x-py--c0ffee"),
+            // The shell's words (review ai-review codex #1, lane ASK8 item 1): a quoted value with
+            // blanks is one word, every leading assignment is taken before the program, and
+            // quoting that doesn't close leaves nothing of the command but `<command>`.
+            ("APP_CONFIG='{\"password\": \"cohort-db-pass\" }' python train.py", "20261008-142301-python-train-py--c0ffee"),
+            ("DB_PASS='correct horse battery staple' python train.py", "20261008-142301-python-train-py--c0ffee"),
+            ("APP_CONFIG='{\"password\": \"cohort-db-pass\" } python train.py", "20261008-142301-command--c0ffee"),
             ("ÜBER — ✓", "20261008-142301-job--c0ffee"),
             ("'$@!'", "20261008-142301-job--c0ffee"),
             ("", "20261008-142301-job--c0ffee"),
@@ -1059,6 +1065,32 @@ mod tests {
         }
         assert!(JobId::named(t, cmd, "c0ffee").named_from(cmd) && !JobId::named(t, cmd, "c0ffee").named_from("wget http://127.0.0.1:9/"));
         assert!(!include_str!("jobs.rs").contains(&format!("crate::{}::redact", "ask")), "job creation reads no ask masking");
+    }
+
+    /// Review ai-review codex #1, claude #1 (lane ASK8 item 1): a quoted assignment's value —
+    /// blanks, braces and quotes in it — never reaches a new id, the program's or script's name
+    /// taken in its place; nor does a quote left open, nor a name with quotes or braces. Each id is
+    /// still one made for its command.
+    #[test]
+    fn no_piece_of_a_quoted_value_names_a_job() {
+        let t = 1_791_469_381;
+        for cmd in [
+            "APP_CONFIG='{\"password\": \"cohort-db-pass\" }' python train.py",
+            "DB_PASS='correct horse battery staple' python train.py",
+            "PASS=correct\\ horse python train.py",
+            "A=1 B=\"cohort pass\" python train.py",
+            "APP_CONFIG='{\"password\": \"cohort-db-pass\" } python train.py",
+            "python train.py --token \"cohort horse",
+            "'{cohort}' train.py",
+            "\"cohort horse\" train.py",
+        ] {
+            let id = JobId::generate(t, cmd);
+            for value in ["cohort", "password", "horse", "staple", "db-pass"] {
+                assert!(!id.as_str().contains(value), "{value} in {id} ({cmd})");
+            }
+            assert!(id.named_from(cmd) && JobId::parse(id.as_str()).is_ok(), "{id}");
+            assert!(id.as_str().contains("-train-py--") || id.as_str().contains("-command--"), "{id}");
+        }
     }
 
     #[test]

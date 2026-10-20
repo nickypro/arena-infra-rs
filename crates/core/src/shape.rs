@@ -4,8 +4,10 @@
 //! Masking a command's free-form shell words one value at a time kept leaking new forms, each
 //! review another (`bash -lc 'sshpass -p X …'`, `mysql -p'two words'`, `sshpass -p -hunter2`, an
 //! old job id in a wrapper's path). So a process's arguments and a job's command aren't masked:
-//! their values are dropped. [`command`] keeps only
-//! - the program's name (`python3`, `jupyter-lab`, `sshpass`: a path's last part),
+//! their values are dropped. [`command`] reads the words as the shell would (`words`: quotes
+//! and backslashes taken out, a quoted value with blanks in it one word) and keeps only
+//! - the program's name (`python3`, `jupyter-lab`, `sshpass`: a path's last part), after every
+//!   leading `NAME=value` (one `…` for them all),
 //! - the first script or notebook it runs (`train.py`, `run.sh`, `part1.ipynb`, `server.js`: the
 //!   last part of its path) or, for python, `-m <module>`,
 //! - each flag's name (`--lr`, `-p`, `--token=` for one glued to its value),
@@ -13,7 +15,12 @@
 //!   id made before ids were named from this carries the command as typed),
 //!
 //! and writes every other word as `…`: a flag's value one `…`, any other run of words one more. A
-//! shell's `-c` script is `bash -c …`, whatever it holds, and python's `-c` code `python -c …`.
+//! shell's `-c` script is `bash -c …`, whatever it holds, and python's `-c` code `python -c …`. A
+//! program's, a script's or a module's name is shown only when it is 1 to 40 of `[A-Za-z0-9._+-]`
+//! (and nothing like a key), else it is `…` too; a command whose quoting doesn't close is
+//! `<command>` whole — where its words begin and end, and so which is the program, can't be told
+//! (review ai-review codex #1: `APP_CONFIG='{"password": "cohort-db-pass" }' python train.py`, cut
+//! at blanks, showed `cohort-db-pass` as the program and put it in the job's id).
 //!
 //! What can still show is a word spelled exactly like a flag name (`-x`, `--fast`), a script's or
 //! a program's name: a value written so is the one shape that can't be told without knowing every
@@ -28,23 +35,99 @@ pub const ELIDED: &str = "…";
 /// What a path under arena's jobs dir becomes.
 pub const JOB: &str = "<job>";
 
+/// What a command whose words can't be told becomes (`words`: a quote left open, a backslash
+/// at its very end).
+pub const UNREAD: &str = "<command>";
+
 /// A script or notebook a program runs, by its extension.
 const SCRIPTS: [&str; 4] = [".py", ".sh", ".ipynb", ".js"];
 
 /// Shells whose `-c` takes a script — shown as `-c …` and nothing more (and so is python's).
 const SHELLS: [&str; 8] = ["sh", "bash", "dash", "zsh", "ksh", "ash", "mksh", "yash"];
 
-/// The longest program, script, module or flag name shown; a longer one is a value.
-const NAME_MAX: usize = 64;
+/// The longest program, script or module name shown; a longer one is a value.
+const NAME_MAX: usize = 40;
 
-/// `word` without a pair of matching quotes around it (a job's command is shell: `"train.py"`).
-fn unquoted(word: &str) -> &str {
-    let b = word.as_bytes();
-    if b.len() >= 2 && matches!(b[0], b'"' | b'\'') && b[b.len() - 1] == b[0] {
-        &word[1..word.len() - 1]
-    } else {
-        word
+/// The longest flag name shown; a longer one is a value.
+const FLAG_MAX: usize = 64;
+
+/// One word of a command, as the shell reads it.
+#[derive(Default)]
+struct Word {
+    /// Its text with the quoting taken out (`'a b'` → `a b`, `\"` → `"`).
+    text: String,
+    /// Some of it was quoted or escaped so far (a `NAME=` must be bare to assign).
+    quoted: bool,
+    /// It begins with a bare `NAME=`: an environment assignment, when it comes before the program.
+    assigns: bool,
+}
+
+/// `cmd`'s words as POSIX `sh` splits them: blanks between words; `'…'` taken as it is; `"…"`, in
+/// which a backslash escapes `$`, `` ` ``, `"`, `\` or a line break (and is kept before anything
+/// else); a backslash outside quotes escapes the next character, and with a line break after it
+/// is nothing at all. `None` when the quoting doesn't close — a quote left open, a backslash
+/// ending it all: where a word ends can't be told, nor which word is the program. Operators
+/// (`;`, `&&`, `|`, `>`), expansions and comments are read as a word's characters: a shape needs
+/// no more than where each word begins and ends.
+fn words(cmd: &str) -> Option<Vec<Word>> {
+    let mut out = Vec::new();
+    let mut word: Option<Word> = None;
+    let mut it = cmd.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '\\' && it.peek() == Some(&'\n') {
+            it.next();
+            continue;
+        }
+        if c.is_whitespace() {
+            out.extend(word.take());
+            continue;
+        }
+        let w = word.get_or_insert_with(Word::default);
+        match c {
+            '\'' => {
+                w.quoted = true;
+                loop {
+                    match it.next()? {
+                        '\'' => break,
+                        c => w.text.push(c),
+                    }
+                }
+            }
+            '"' => {
+                w.quoted = true;
+                loop {
+                    match it.next()? {
+                        '"' => break,
+                        '\\' => match it.next()? {
+                            '\n' => {}
+                            c @ ('$' | '`' | '"' | '\\') => w.text.push(c),
+                            c => {
+                                w.text.push('\\');
+                                w.text.push(c);
+                            }
+                        },
+                        c => w.text.push(c),
+                    }
+                }
+            }
+            '\\' => {
+                w.quoted = true;
+                w.text.push(it.next()?);
+            }
+            '=' if !w.quoted && !w.assigns && shell_name(&w.text) => {
+                w.assigns = true;
+                w.text.push(c);
+            }
+            c => w.text.push(c),
+        }
     }
+    out.extend(word);
+    Some(out)
+}
+
+/// A shell variable's name: `[A-Za-z_][A-Za-z0-9_]*`.
+fn shell_name(s: &str) -> bool {
+    s.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 /// A path's last part.
@@ -52,10 +135,10 @@ fn base(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-/// `name` is 1 to [`NAME_MAX`] bytes, each alphanumeric or one of `._+-` or `more`, and holds
-/// nothing like a key ([`keyish`]).
-fn plain(name: &str, more: &[u8]) -> bool {
-    (1..=NAME_MAX).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b) || more.contains(&b)) && !keyish(name)
+/// `name` is 1 to `max` bytes of `[A-Za-z0-9._+-]` and holds nothing like a key ([`keyish`]): a
+/// program's, a script's or a module's name ([`NAME_MAX`]) or a flag's ([`FLAG_MAX`]).
+fn plain(name: &str, max: usize) -> bool {
+    (1..=max).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b)) && !keyish(name)
 }
 
 /// Whether a name holds what looks like a key rather than words — a key pasted as the command
@@ -75,59 +158,50 @@ fn job_path(word: &str) -> bool {
     word.contains(".arena/jobs")
 }
 
-/// A leading `NAME=value` of a shell command (an environment assignment, not the program).
-fn assignment(word: &str) -> bool {
-    word.split_once('=').is_some_and(|(name, _)| {
-        name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-    })
-}
-
-/// The program's name as shown: the last part of its path; a kernel thread's `[name]` whole
-/// (`[kswapd0]`); `<job>` under the jobs dir; anything else (an expansion, an escape sequence) a
-/// value.
+/// The program's name as shown: the last part of its path, when it is [`plain`] — and so is a
+/// process title's `name:` (`sshd: root@pts/0`, `postgres: …`); a kernel thread's `[name]` whole
+/// (`[kswapd0]`, `[kworker/0:1-events]`); `<job>` under the jobs dir; anything else (quotes,
+/// braces, an expansion, an escape sequence, a name over [`NAME_MAX`]) a value.
 fn program(word: &str) -> String {
-    let w = unquoted(word);
-    if job_path(w) {
+    if job_path(word) {
         return JOB.to_string();
     }
-    if let Some(inner) = w.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
-        if plain(inner, b":/") {
-            return w.to_string();
+    if let Some(inner) = word.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+        if plain(&inner.replace(['/', ':'], "-"), NAME_MAX) {
+            return word.to_string();
         }
     }
-    let b = base(w);
-    if plain(b, b":") {
+    let b = base(word);
+    if plain(b.strip_suffix(':').unwrap_or(b), NAME_MAX) {
         b.to_string()
     } else {
         ELIDED.to_string()
     }
 }
 
-/// A script or notebook it runs: its path's last part.
+/// A script or notebook it runs: its path's last part, when that is [`plain`].
 fn script(word: &str) -> Option<&str> {
-    let b = base(unquoted(word));
-    (plain(b, b"") && SCRIPTS.iter().any(|e| b.len() > e.len() && b.ends_with(e))).then_some(b)
+    let b = base(word);
+    (plain(b, NAME_MAX) && SCRIPTS.iter().any(|e| b.len() > e.len() && b.ends_with(e))).then_some(b)
 }
 
-/// A python module (`-m pytest`, `-m torch.distributed.run`).
+/// A python module (`-m pytest`, `-m torch.distributed.run`), when its name is [`plain`].
 fn module(word: &str) -> Option<&str> {
-    let w = unquoted(word);
-    (plain(w, b"") && w.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') && w.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.'))
-        .then_some(w)
+    (plain(word, NAME_MAX) && word.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') && word.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.'))
+        .then_some(word)
 }
 
 /// A flag's name as shown, and whether its value is glued to it (`--lr=0.1`: shown `--lr=…`, and
 /// the next word isn't its value): `--` alone, `--name`, `--name=…`, a dash and one letter (`-p`).
 /// `None`: not a flag — a dash with more than one byte after it included (`-pPASS`, `-lc`,
 /// `-5`, `-hunter2`): a value may be glued to it, or be it.
-fn flag(word: &str) -> Option<(String, bool)> {
-    let w = unquoted(word);
+fn flag(w: &str) -> Option<(String, bool)> {
     if w == "--" {
         return Some((w.to_string(), false));
     }
     if let Some(long) = w.strip_prefix("--") {
         let (name, glued) = long.split_once('=').map_or((long, false), |(n, _)| (n, true));
-        let ok = plain(name, b"") && name.starts_with(|c: char| c.is_ascii_alphabetic()) && !name.contains('+');
+        let ok = plain(name, FLAG_MAX) && name.starts_with(|c: char| c.is_ascii_alphabetic()) && !name.contains('+');
         return ok.then(|| if glued { (format!("--{name}={ELIDED}"), true) } else { (format!("--{name}"), false) });
     }
     let b = w.as_bytes();
@@ -138,7 +212,7 @@ fn flag(word: &str) -> Option<(String, bool)> {
 /// flags before its first other word, alone or in a cluster (`-lc`, `-ec`, `-uc`).
 fn runs_code(program: &str, rest: &[&str]) -> bool {
     (SHELLS.contains(&program.trim_start_matches('-')) || python(program))
-        && rest.iter().map(|w| unquoted(w)).take_while(|w| w.starts_with('-')).any(|w| {
+        && rest.iter().take_while(|w| w.starts_with('-')).any(|w| {
             let short = &w[1..];
             !short.starts_with('-') && short.contains('c') && short.bytes().all(|b| b.is_ascii_alphabetic())
         })
@@ -167,18 +241,22 @@ enum Last {
 /// - `python3 /w/train.py --lr 0.1 --token X` → `python3 train.py --lr … --token …`;
 /// - `sshpass -p hunter2 ssh host` → `sshpass -p … …`;
 /// - `bash -lc 'sshpass -p X ssh host'` → `bash -c …` (and `python -c '…'` → `python -c …`);
-/// - `sh /root/.arena/jobs/<id>/run` → `sh <job>`.
+/// - `sh /root/.arena/jobs/<id>/run` → `sh <job>`;
+/// - `APP_CONFIG='{"password": "x y" }' python train.py` → `… python train.py`;
+/// - `python -c 'print(1)` (a quote left open) → `<command>`.
 pub fn command(cmd: &str) -> String {
-    let words: Vec<&str> = cmd.split_whitespace().collect();
+    let Some(words) = words(cmd) else { return UNREAD.to_string() };
     let mut out: Vec<String> = Vec::new();
-    // Leading `NAME=value`s: the shell's assignments, before the program.
-    let at = words.iter().position(|w| !assignment(w)).unwrap_or(words.len());
+    // Every leading `NAME=value` — each a whole word, its value's quoted blanks in it: the
+    // shell's assignments, before the program.
+    let at = words.iter().position(|w| !w.assigns).unwrap_or(words.len());
     if at > 0 {
         out.push(ELIDED.to_string());
     }
-    let Some(first) = words.get(at) else { return out.join(" ") };
+    let words: Vec<&str> = words[at..].iter().map(|w| w.text.as_str()).collect();
+    let Some(&first) = words.first() else { return out.join(" ") };
     let prog = program(first);
-    let rest = &words[at + 1..];
+    let rest = &words[1..];
     if runs_code(&prog, rest) {
         return [out, vec![prog, "-c".to_string(), ELIDED.to_string()]].concat().join(" ");
     }
@@ -189,7 +267,7 @@ pub fn command(cmd: &str) -> String {
         let w = rest[i];
         let shown = if job_path(w) {
             Some((JOB.to_string(), Last::Shown))
-        } else if let Some(m) = rest.get(i + 1).filter(|_| py && !ran && unquoted(w) == "-m").and_then(|m| module(m)) {
+        } else if let Some(m) = rest.get(i + 1).filter(|_| py && !ran && w == "-m").and_then(|m| module(m)) {
             ran = true;
             i += 1;
             Some((format!("-m {m}"), Last::Shown))
@@ -262,7 +340,7 @@ mod tests {
         let cases = [
             ("/opt/conda/envs/arena-env/bin/python /root/ARENA_materials/chapter1/train.py --lr 3e-4 --epochs=3", "python train.py --lr … --epochs=…"),
             ("/opt/conda/envs/arena-env/bin/python -m ipykernel_launcher -f /root/.local/share/jupyter/runtime/kernel-Qx7a.json", "python -m ipykernel_launcher -f …"),
-            ("python -m pytest -x tests/ -k 'part1 and not Qx7slow'", "python -m pytest -x … -k … …"),
+            ("python -m pytest -x tests/ -k 'part1 and not Qx7slow'", "python -m pytest -x … -k …"),
             ("python -m torch.distributed.run --nproc_per_node=4 train.py --cfg Qx7.yaml", "python -m torch.distributed.run --nproc_per_node=… … --cfg …"),
             ("torchrun --nproc_per_node 4 train.py --wandb-key Qx7key", "torchrun --nproc_per_node … train.py --wandb-key …"),
             ("jupyter-lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root --NotebookApp.token=Qx7tok", "jupyter-lab --ip=… --port=… --no-browser --allow-root --NotebookApp.token=…"),
@@ -315,15 +393,16 @@ mod tests {
     fn flags_scripts_and_programs_are_told_strictly() {
         assert_eq!(flag("--lr"), Some(("--lr".into(), false)));
         assert_eq!(flag("--token=x"), Some(("--token=…".into(), true)));
-        assert_eq!(flag("'--lr'"), Some(("--lr".into(), false)));
         assert_eq!(flag("-p"), Some(("-p".into(), false)));
         for value in ["-pPASS", "-lc", "-5", "-hunter2", "-", "--5x", "--", "---x", "--a b", "--ünï", &format!("--{}", "x".repeat(65))] {
             assert!(flag(value).is_none_or(|(f, _)| f == "--" && value == "--"), "{value}");
         }
         assert_eq!(script("/w/a/train.py"), Some("train.py"));
-        assert_eq!(script("\"nb.ipynb\""), Some("nb.ipynb"));
-        assert_eq!((script(".py"), script("x.py;"), script("x.pyc")), (None, None, None));
-        assert_eq!((module("torch.distributed.run"), module("x/y"), module("'a'")), (Some("torch.distributed.run"), None, Some("a")));
+        assert_eq!((script(".py"), script("x.py;"), script("x.pyc"), script("\"nb.ipynb\"")), (None, None, None, None));
+        assert_eq!((module("torch.distributed.run"), module("x/y"), module("'a'")), (Some("torch.distributed.run"), None, None));
+        // Quoted, they're the shell's words: the quotes are taken out first.
+        assert_eq!(command("python \"nb.ipynb\" '--lr' 1"), "python nb.ipynb --lr …");
+        assert_eq!(command("python -m 'pytest' -x"), "python -m pytest -x");
         assert_eq!((program("/usr/bin/python3"), program("$(cat /k)"), program("\u{1b}[31mx")), ("python3".into(), ELIDED.into(), ELIDED.into()));
         // A key as a program's, a script's or a flag's name is a value; long names of words aren't.
         let key = "3AHPWdlsz7ELTahpw3BIPXelt07FMTbipx4BJQXf";
@@ -334,5 +413,104 @@ mod tests {
         assert_eq!(command("python part4_interp_on_algorithmic_model.ipynb --per_device_train_batch_size 8 --IdentityProvider.token=x"),
             "python part4_interp_on_algorithmic_model.ipynb --per_device_train_batch_size … --IdentityProvider.token=…");
         assert!(runs_code("bash", &["-xec", "x"]) && runs_code("python3", &["-u", "-c", "x"]) && !runs_code("bash", &["x.sh", "-c"]) && !runs_code("node", &["-c", "x"]));
+    }
+
+    /// Review ai-review codex #1, claude #1 (lane ASK8 item 1): a command's words are the shell's.
+    /// A quoted assignment's value with blanks in it (or an escaped blank) is one word, and every
+    /// leading assignment is taken before the program — so no piece of a value is ever taken for
+    /// the program (`APP_CONFIG='{"password": "cohort-db-pass" }' python train.py`, cut at
+    /// blanks, showed `cohort-db-pass` as one).
+    #[test]
+    fn a_quoted_assignments_value_is_never_the_program() {
+        let cases = [
+            ("APP_CONFIG='{\"password\": \"cohort-db-pass\" }' python train.py", "… python train.py"),
+            ("DB_PASS='correct horse battery staple' python train.py", "… python train.py"),
+            ("PASS=correct\\ horse python x.py", "… python x.py"),
+            ("ARGS='--lr 0.1 --token sk-cohort' python run.py", "… python run.py"),
+            ("A=1 B=\"two cohort words\" C='{\"k\": \"v w\"}' D= E=\"x \\\" y\" python3 run.py --lr 3", "… python3 run.py --lr …"),
+            ("CFG=\"a\nb cohort\" python x.py", "… python x.py"),
+            ("python train.py --name 'cohort run 1' --lr 0.1", "python train.py --name … --lr …"),
+            // A `NAME=` quoted or escaped isn't an assignment: it's the program, and not a plain name.
+            ("'X=cohort pass' python x.py", "… … x.py"),
+            ("X\\=cohort python x.py", "… … x.py"),
+            // Quotes inside a word are the shell's too: this program is python.
+            ("py'th'on train.py", "python train.py"),
+        ];
+        for (cmd, want) in cases {
+            let got = command(cmd);
+            assert_eq!(got, want, "{cmd}");
+            for value in ["cohort", "password", "horse", "staple", "0.1", "sk-", "two", "{"] {
+                assert!(!got.contains(value), "{value} survived: {cmd} -> {got}");
+            }
+        }
+    }
+
+    /// Lane ASK8 item 1: quoting that doesn't close — a quote left open, a backslash at the very
+    /// end — leaves the words, and so the program, unknown: the whole command is `<command>`.
+    #[test]
+    fn a_command_whose_quoting_doesnt_close_is_unread() {
+        for cmd in [
+            "APP_CONFIG='{\"password\": \"cohort-db-pass\" } python train.py",
+            "APP_CONFIG=\"{'password': 'cohort-db-pass' } python train.py",
+            "python -c 'print(1)",
+            "python train.py --token \"cohort",
+            "python train.py --token \"cohort \\\"",
+            "python train.py \\",
+            "echo it's cohort",
+        ] {
+            assert_eq!(command(cmd), UNREAD, "{cmd}");
+        }
+        // Closed, the same are words again.
+        assert_eq!(command("python -c 'print(1)'"), "python -c …");
+        assert_eq!(command("python train.py \\\n --token \"cohort\""), "python train.py --token …");
+    }
+
+    /// Lane ASK8 item 1: a program's, a script's or a module's name is shown only as 1 to 40 of
+    /// `[A-Za-z0-9._+-]` — quotes, braces, an expansion, or a 41st byte make it `…`.
+    #[test]
+    fn a_name_with_quotes_braces_or_over_40_bytes_is_a_value() {
+        for (cmd, want) in [
+            ("'{\"password\": \"cohort\"}' --go", "… --go"),
+            ("{cohort,pass} x.py", "… x.py"),
+            ("/opt/{cohort}/bin/run --go", "run --go"),
+            ("/opt/bin/{cohort} --go", "… --go"),
+            ("'my\"cohort' x", "… …"),
+            ("\"\" x.py", "… x.py"),
+            ("python '{cohort}.py'", "python …"),
+            ("python 'cohort pass.py'", "python …"),
+            ("python -m '{cohort}'", "python -m …"),
+            ("sshd: root@pts/0", "sshd: …"),
+            ("'sshd:cohort' x", "… …"),
+        ] {
+            assert_eq!(command(cmd), want, "{cmd}");
+        }
+        let (p40, p41) = ("ab-".repeat(13) + "a", "ab-".repeat(13) + "ab");
+        assert_eq!(command(&format!("/bin/{p40} --go")), format!("{p40} --go"));
+        assert_eq!(command(&format!("/bin/{p41} --go")), "… --go");
+        let (s40, s41) = (format!("{}x.py", "ab-".repeat(12)), format!("{}xy.py", "ab-".repeat(12)));
+        assert_eq!(command(&format!("python /w/{s40} -x")), format!("python {s40} -x"));
+        assert_eq!(command(&format!("python /w/{s41} -x")), "python … -x");
+        let (m40, m41) = ("ab.".repeat(13) + "a", "ab.".repeat(13) + "ab");
+        assert_eq!(command(&format!("python -m {m40}")), format!("python -m {m40}"));
+        assert_eq!(command(&format!("python -m {m41}")), "python -m …");
+        assert_eq!(command(&format!("[{p40}]")), format!("[{p40}]"));
+        assert_eq!(command(&format!("[{p41}]")), "…");
+    }
+
+    /// The lexer itself: quotes and escapes taken out, a line continuation nothing, an empty
+    /// quoted word a word, and only a bare leading `NAME=` an assignment.
+    #[test]
+    fn words_split_as_the_shell_splits() {
+        let read = |cmd: &str| words(cmd).map(|v| v.into_iter().map(|w| (w.text, w.assigns)).collect::<Vec<_>>());
+        let w = |t: &str, a: bool| (t.to_string(), a);
+        assert_eq!(
+            read("a 'b c' \"d \\\" \\$e \\x\" f\\ g h\\\ni '' X=1 'Y=2' Z\\=3 _q='a b'=c"),
+            Some(vec![w("a", false), w("b c", false), w("d \" $e \\x", false), w("f g", false), w("hi", false), w("", false), w("X=1", true), w("Y=2", false), w("Z=3", false), w("_q=a b=c", true)])
+        );
+        assert_eq!(read("  \t\n "), Some(vec![]));
+        assert_eq!(read("a \\\n b"), Some(vec![w("a", false), w("b", false)]));
+        for open in ["'", "\"", "a\\", "\"a\\\"", "'a'\"b"] {
+            assert!(read(open).is_none(), "{open}");
+        }
     }
 }
