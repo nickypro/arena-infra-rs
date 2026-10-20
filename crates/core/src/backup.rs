@@ -73,11 +73,12 @@ pub fn configured_repo(cfg: &Config) -> Option<String> {
 /// repo setup adds as each checkout's `upstream` remote (`ARENA_UPSTREAM_REPO`, default
 /// [`crate::setup::DEFAULT_UPSTREAM_REPO`]; [`crate::setup::upstream_url`]). The commits this
 /// repo's own `main` has — fetched from `https://github.com/<owner>/<name>.git` by the backup
-/// itself into the pod's `refs/arena/course-main`, never read off the pod's `upstream` (review
-/// ai-review codex #1, FIX6) — are never scanned for keys or rewritten: public already, and a
-/// rewritten copy breaks their ancestry with the course (claude #4). The fetch has no credentials,
-/// so a private repo can't be verified and its commits are scanned like the rest. `None` (nothing
-/// exempt) for `none`, the cohort repo itself, or a value setup refuses.
+/// itself (or by the resolve, given the same, FIX7) into the pod's `refs/arena/course-main`, never
+/// read off the pod's `upstream` (review ai-review codex #1, FIX6) — are never scanned for keys or
+/// rewritten: public already, and a rewritten copy breaks their ancestry with the course (claude
+/// #4). The fetch has no credentials, so a private repo can't be verified: a key-like string in
+/// what its `main` brought holds that pod's push until it can (FIX7). `None` (nothing exempt) for
+/// `none`, the cohort repo itself, or a value setup refuses.
 pub fn course_repo(cfg: &Config) -> Option<String> {
     let url = crate::setup::upstream_url(cfg).ok().flatten()?;
     url.strip_prefix("https://github.com/").and_then(|r| r.strip_suffix(".git")).map(String::from)
@@ -481,7 +482,9 @@ pub fn backup_script() -> String {
 /// image's nested clones into the repo once (their files tracked in place, their own `.git`
 /// untouched), keep any other nested repo out of the commit (never a gitlink); stage everything but files over the limit; commit if anything is
 /// staged; then push whenever **origin has no such branch yet or the branch is ahead of
-/// origin's** — not only when this run committed. A push that failed last tick (network blip,
+/// origin's** — not only when this run committed — exactly the commit the run fixed and scanned
+/// (or its rewrite), by its id: a commit the participant makes meanwhile waits for the next run
+/// (review ai-review codex #1, FIX7). A push that failed last tick (network blip,
 /// GitHub outage, a key briefly missing) leaves its commit local and the tree clean, so "nothing
 /// staged" must not read as "nothing to do": the next tick retries the push. Only a clean tree
 /// *and* `HEAD == refs/remotes/origin/<branch>` prints `NO_CHANGES <branch>` (exit 0); a push
@@ -495,8 +498,13 @@ pub fn backup_script() -> String {
 /// `main` ([`course_repo`], over https, no credentials, `timeout 60`) into `refs/arena/course-main`,
 /// leaves out of the scan and the rewrite only the commits that ref has, and scans again. What the
 /// pod's `upstream` holds, or its URLs say, proves nothing: a fork's commit fetched before
-/// `upstream` was repointed at the course is scanned and redacted like any other. A fetch that
-/// fails exempts nothing (`COURSE_UNVERIFIED`, [`BackupReport::course_unverified`]). If GitHub's
+/// `upstream` was repointed at the course is scanned and redacted like any other. A ref an earlier
+/// fetch left (this backup's, or the resolve's) is trusted as this run's, by the one rule both go
+/// by (`course.sh`, FIX7). A course URL the pod's git config rewrites is never asked: nothing
+/// exempt ([`BackupReport::course_rewritten`]). A fetch that fails exempts nothing new
+/// (`COURSE_UNVERIFIED`, [`BackupReport::course_unverified`]) and holds the push of that run, nothing
+/// rewritten ([`BackupReport::course_held`]: whether that key-like string is the course's can't be
+/// told, and a rewrite of the course's own would break its ancestry for good). If GitHub's
 /// push protection then refuses a course's key-like string, the report says so
 /// (`PUSH_BLOCKED_COURSE`), never a participant's leak. This takes the default course repo
 /// ([`crate::setup::DEFAULT_UPSTREAM_REPO`]); a caller with the config passes [`course_repo`] to
