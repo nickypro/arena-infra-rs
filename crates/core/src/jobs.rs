@@ -75,32 +75,55 @@ pub const LOG_READ_CAP: u64 = 1024 * 1024;
 /// Longest command slug in a [`JobId`].
 const SLUG_MAX: usize = 24;
 
-/// Longest id accepted from the operator (a generated one is at most 40).
+/// Longest id accepted from the operator (a generated one is at most 48).
 const ID_MAX: usize = 64;
+
+/// Hex digits of a new id's random part ([`JobId::generate`]).
+const SALT_LEN: usize = 6;
 
 /// Longest unfinished line a follow holds back waiting for its newline (a progress bar
 /// redrawn with `\r` never prints one): past this it is shown as is, so memory stays
 /// bounded.
 const PARTIAL_MAX: usize = 64 * 1024;
 
-/// A job's id: `YYYYMMDD-HHMMSS-<slug>` (UTC start time, then a slug of the command), e.g.
-/// `20261008-142301-pytest-x-tests`. Sorting ids sorts jobs by start time, the same id
-/// names the run on every pod of a fleet start, and the alphabet (`[0-9a-z-]`) is safe to
+/// A job's id: `YYYYMMDD-HHMMSS-<slug>--<salt>` (UTC start time, a slug of the command's shape,
+/// six random hex digits), e.g. `20261008-142301-pytest-x-k--3fa9c1`; one made before has no
+/// salt and slugs the command as typed (`20261008-142301-pytest-x-tests`) — it keeps its name,
+/// and every read and `--kill` takes it as before. Sorting ids sorts jobs by start time, the same
+/// id names the run on every pod of a fleet start, and the alphabet (`[0-9a-z-]`) is safe to
 /// splice into a remote path or shell word — which is why operator input goes through
 /// [`JobId::parse`].
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct JobId(String);
 
 impl JobId {
-    /// The id for `cmd` started at `unix_secs` (UTC). Its slug is made from the command with its
-    /// secrets masked ([`masked_slug`]): an id is echoed when the job starts, listed by `pods
-    /// jobs`, sent with `pods ask`'s bundle and spelled in remote paths, and one made from the
-    /// command as typed carried what the masking takes out of it (live ASK2 G1: `curl -u
-    /// bob:hunter2pass …` → `…-curl-u-bob-hunter2pass`). Ids already made stay as they are.
+    /// The id for `cmd` started at `unix_secs` (UTC): the time, the slug of the command's shape
+    /// ([`masked_slug`]: its program, script and flag names, never a value), and a random salt
+    /// ([`JobId::named`]). An id is echoed when the job starts, listed by `pods jobs`, sent with
+    /// `pods ask`'s bundle and spelled in remote paths: one made from the command as typed carried
+    /// what masking takes out of it (live ASK2 G1: `curl -u bob:hunter2pass …` →
+    /// `…-curl-u-bob-hunter2pass`), and one made from the masked command alone was the same for
+    /// two commands that differ only in a secret (review ai-review claude #10: started in the same
+    /// second, the second refused). Ids already made stay as they are.
     pub fn generate(unix_secs: u64, cmd: &str) -> JobId {
+        JobId::named(unix_secs, cmd, &salt())
+    }
+
+    /// [`JobId::generate`]'s id with its random part given (`salt`: [`SALT_LEN`] hex digits).
+    pub fn named(unix_secs: u64, cmd: &str, salt: &str) -> JobId {
         let (y, m, d) = crate::schedule::civil_from_days((unix_secs / 86_400) as i64);
         let s = unix_secs % 86_400;
-        JobId(format!("{y:04}{m:02}{d:02}-{:02}{:02}{:02}-{}", s / 3600, s % 3600 / 60, s % 60, masked_slug(cmd)))
+        JobId(format!("{y:04}{m:02}{d:02}-{:02}{:02}{:02}-{}--{salt}", s / 3600, s % 3600 / 60, s % 60, masked_slug(cmd)))
+    }
+
+    /// Whether this id is one [`JobId::generate`] made for `cmd`: its time, the slug of `cmd`'s
+    /// shape, `--` and a salt — what an id made before never has (a slug never holds `--`), so
+    /// one carrying its command as typed is never taken for one (`pods ask` shows only these
+    /// whole).
+    pub fn named_from(&self, cmd: &str) -> bool {
+        let tail = self.0.get(15..).and_then(|t| t.strip_prefix('-'));
+        let salt = tail.and_then(|t| t.strip_prefix(masked_slug(cmd).as_str())).and_then(|r| r.strip_prefix("--"));
+        salt.is_some_and(|s| s.len() == SALT_LEN && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
     }
 
     /// An id the operator typed: must have the generated shape and alphabet — anything else
@@ -157,11 +180,22 @@ pub fn split_job_arg(words: &[String]) -> Result<(Vec<String>, Option<JobId>), S
     Ok((targets.into_iter().cloned().collect(), job))
 }
 
-/// An id's tail for `cmd` ([`JobId::generate`]): [`slug`] of the command as `pods ask` masks it
-/// ([`crate::ask::redact::text`]: keys, secret-named values, long tokens out). Also how the
-/// bundle tells an id made before that from one it may show.
+/// An id's slug for `cmd` ([`JobId::generate`]): [`slug`] of the command's shape
+/// ([`crate::shape::command`]: the program, the script it runs, its flag names — no value of it),
+/// the pure, small rule `pods ask` sends commands by — never `ask::redact`'s masking, whose
+/// patterns job creation has no business reading.
 pub fn masked_slug(cmd: &str) -> String {
-    slug(&crate::ask::redact::text(cmd, usize::MAX))
+    slug(&crate::shape::command(cmd))
+}
+
+/// [`SALT_LEN`] hex digits that differ per call: std's randomly keyed hasher (keyed from the OS's
+/// randomness, a new key each time) over the time. Not secret — two jobs started in the same
+/// second with the same shape of command just mustn't share an id.
+fn salt() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+    format!("{:0w$x}", h.finish() & 0xff_ffff, w = SALT_LEN)
 }
 
 /// The id's tail: the command's words, lowercased, as `[a-z0-9]` runs joined by `-`,
@@ -973,30 +1007,58 @@ mod tests {
         // 2026-10-08 14:23:01 UTC
         let t = 1_791_469_381;
         for (cmd, want) in [
-            ("pytest -x tests/ -k 'part1'", "20261008-142301-pytest-x-tests-k-part1"),
-            ("  /usr/bin/python3 run.py  ", "20261008-142301-usr-bin-python3-run-py"),
-            ("echo \"$HOME\"; ls\nrm -rf x", "20261008-142301-echo-home-ls-rm-rf-x"),
-            ("python -c 'print(1)' && nvidia-smi --query", "20261008-142301-python-c-print-1-nvidia"),
-            ("pytest -x tests/ -k 'part1 and not $SLOW'", "20261008-142301-pytest-x-tests-k-part1"),
-            ("supercalifragilisticexpialidocious01", "20261008-142301-redacted"),
-            ("supercalifragilistic", "20261008-142301-supercalifragilistic"),
-            // Secrets out of new ids (live ASK2 G1): masked as `pods ask` masks the command.
-            ("curl -u bob:hunter2pass http://127.0.0.1:9/", "20261008-142301-curl-u-redacted-http-127"),
-            ("MY_SECRET='two words' python x.py", "20261008-142301-my-secret-redacted"),
-            ("ÜBER — ✓", "20261008-142301-ber"),
-            ("'$@!'", "20261008-142301-job"),
-            ("", "20261008-142301-job"),
+            ("pytest -x tests/ -k 'part1'", "20261008-142301-pytest-x-k--c0ffee"),
+            ("  /usr/bin/python3 run.py  ", "20261008-142301-python3-run-py--c0ffee"),
+            ("echo \"$HOME\"; ls\nrm -rf x", "20261008-142301-echo--c0ffee"),
+            ("python -c 'print(1)' && nvidia-smi --query", "20261008-142301-python-c--c0ffee"),
+            ("python3 /w/chapter1/train.py --lr 0.1 --epochs=3", "20261008-142301-python3-train-py-lr--c0ffee"),
+            ("supercalifragilisticexpialidocious01", "20261008-142301-job--c0ffee"),
+            ("supercalifragilistic", "20261008-142301-supercalifragilistic--c0ffee"),
+            // No value in a new id (live ASK2 G1, review ai-review claude #10): the command's shape.
+            ("curl -u bob:hunter2pass http://127.0.0.1:9/", "20261008-142301-curl-u--c0ffee"),
+            ("MY_SECRET='two words' python x.py", "20261008-142301-x-py--c0ffee"),
+            ("ÜBER — ✓", "20261008-142301-job--c0ffee"),
+            ("'$@!'", "20261008-142301-job--c0ffee"),
+            ("", "20261008-142301-job--c0ffee"),
         ] {
-            let got = JobId::generate(t, cmd);
+            let got = JobId::named(t, cmd, "c0ffee");
             assert_eq!(got.as_str(), want, "{cmd:?}");
-            // Every generated id is one `parse` accepts (and so is safe in a remote path).
+            // Every generated id is one `parse` accepts (and so is safe in a remote path), and one
+            // made for its command.
             assert_eq!(JobId::parse(got.as_str()), Ok(got.clone()), "{cmd:?}");
+            assert!(got.named_from(cmd) && got.as_str().len() <= 48, "{cmd:?}");
+            let made = JobId::generate(t, cmd);
+            assert!(made.as_str().starts_with(&want[..want.len() - 6]) && made.named_from(cmd) && JobId::parse(made.as_str()).is_ok(), "{made}");
         }
         // The epoch, a leap day, and lexical order = time order.
-        assert_eq!(JobId::generate(0, "x").as_str(), "19700101-000000-x");
-        assert_eq!(JobId::generate(1_709_164_799, "x").as_str(), "20240228-235959-x");
-        assert_eq!(JobId::generate(1_709_164_800, "x").as_str(), "20240229-000000-x");
+        assert_eq!(JobId::named(0, "x", "000000").as_str(), "19700101-000000-x--000000");
+        assert_eq!(JobId::named(1_709_164_799, "x", "000000").as_str(), "20240228-235959-x--000000");
+        assert_eq!(JobId::named(1_709_164_800, "x", "000000").as_str(), "20240229-000000-x--000000");
         assert!(JobId::generate(t, "zzz") < JobId::generate(t + 1, "aaa"));
+    }
+
+    /// Review ai-review claude #10 (lane ASK7 item J): two commands that differ only in a secret,
+    /// started in the same second, get ids of their own — the time and the shape's words alike,
+    /// the salt not (24 random bits) — and neither id holds the secret. An id made before — the
+    /// command as typed, or lane ASK5's masked slug — is never taken for one made for its command
+    /// (a slug never holds `--`), nor is a salt that isn't hex or is short; and it still parses.
+    /// No `ask::redact` in it: the shape is `crate::shape`'s.
+    #[test]
+    fn ids_of_commands_differing_in_a_secret_differ_and_hold_none() {
+        let t = 1_791_469_381;
+        let ids: Vec<JobId> = ["--token Qx7alpha", "--token Qx7bravo", "X_PASS=a", "X_PASS=b"].iter().map(|v| JobId::generate(t, &format!("python run.py {v}"))).collect();
+        let mut unique: Vec<&str> = ids.iter().map(JobId::as_str).collect();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), ids.len(), "{ids:?}");
+        assert!(ids.iter().all(|id| id.as_str().starts_with("20261008-142301-python-run-py") && !id.as_str().contains("qx7")), "{ids:?}");
+        let cmd = "curl -u bob:hunter2pass http://127.0.0.1:9/";
+        for old in ["20261008-142301-curl-u-bob-hunter2pass", "20261008-142301-curl-u-redacted-http-127", "20261008-142301-curl-u--zzzzzz", "20261008-142301-curl-u--c0ffe", "20261008-142301-curl-u-x--c0ffee"] {
+            let id = JobId::parse(old).unwrap();
+            assert!(!id.named_from(cmd), "{old}");
+        }
+        assert!(JobId::named(t, cmd, "c0ffee").named_from(cmd) && !JobId::named(t, cmd, "c0ffee").named_from("wget http://127.0.0.1:9/"));
+        assert!(!include_str!("jobs.rs").contains(&format!("crate::{}::redact", "ask")), "job creation reads no ask masking");
     }
 
     #[test]

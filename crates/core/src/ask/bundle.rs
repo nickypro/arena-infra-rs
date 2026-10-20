@@ -913,18 +913,17 @@ fn status_line(line: &str) -> String {
     }
 }
 
-/// A job's id as the prompt may show it: whole when its command-derived part is what the masked
-/// command makes ([`jobs::masked_slug`] — every id made since), else its time part and
-/// `<masked>`. An id made before was the command as typed (live ASK2 G1:
-/// `20261020-161820-curl-u-bob-hunter2pass`, the command shown masked, the id not). `cmd`: the
-/// job's command as the pod lists it.
+/// A job's id as the prompt may show it: whole when it is one made for its command
+/// ([`jobs::JobId::named_from`]: the time, the slug of the command's shape, a salt — no value of
+/// the command in it), else its time and `<masked>`: an id made before carried the command as
+/// typed (live ASK2 G1: `20261020-161820-curl-u-bob-hunter2pass`), and one that isn't what its
+/// command makes is shown as nothing it might carry. `cmd`: the job's command as the pod lists it.
 fn shown_id(id: &jobs::JobId, cmd: &str) -> String {
-    let s = id.as_str();
-    let (time, tail) = s.split_at(s.len().min(15));
-    match tail.strip_prefix('-') {
-        Some(slug) if slug != jobs::masked_slug(cmd) => format!("{time}-<masked>"),
-        _ => s.to_string(),
+    if id.named_from(cmd) {
+        return id.as_str().to_string();
     }
+    let s = id.as_str();
+    format!("{}-<masked>", &s[..s.len().min(15)])
 }
 
 /// A command from the pod — a process's arguments, a job's command — as the prompt may show it:
@@ -1051,6 +1050,9 @@ pub mod fixtures {
     /// The nonce [`busy_reply`] carries; [`busy`] answers with the call's own.
     pub const NONCE: &str = "0123456789abcdef";
 
+    /// The salt of the fixtures' job ids (`jobs::JobId::named`).
+    pub const SALT: &str = "c0ffee";
+
     /// `text` with each extra-probe line's kind (`ARENA_ASK`, `ARENA_ASK_PS`, …) tagged with
     /// `nonce`, as probe.sh prints it (`ARENA_ASK.<nonce> k=v`); other lines as they are.
     pub fn tagged(text: &str, nonce: &str) -> String {
@@ -1094,8 +1096,9 @@ pub mod fixtures {
             metrics::SENTINEL,
             metrics::PROC_SENTINEL
         );
-        // The job's id as `pods run --background` makes it from the command.
-        let id = format!("20261019-101500-{}", jobs::masked_slug(job_cmd));
+        // The job's id as `pods run --background` makes it from the command (2026-10-19 10:15:00
+        // UTC, the salt fixed).
+        let id = jobs::JobId::named(1_792_404_900, job_cmd, SALT).as_str().to_string();
         let job = jobs::fixtures::job_line(&id, "running", None, Some(777), job_cmd);
         let log: String = ["collecting ...", "test_a PASSED", log_extra, "test_b PASSED"].iter().filter(|l| !l.is_empty()).map(|l| format!("{l}\n")).collect();
         let extra = tagged(
@@ -1214,8 +1217,8 @@ mod tests {
             "    ?? notes.txt",
             "4242 root cpu 98.5% mem 6.1% up 2h0m: python train.py --epochs …\n",
             "777 root cpu 0.0% mem 0.0% up 1h0m: sh <job>\n",
-            "20261019-101500-pytest-x-chapter1 — running (pid 777), started 2026-10-08T14:23:01Z: pytest -x …\n",
-            "newest job's log (20261019-101500-pytest-x-chapter1, still running), last 3 lines:",
+            "20261019-101500-pytest-x--c0ffee — running (pid 777), started 2026-10-08T14:23:01Z: pytest -x …\n",
+            "newest job's log (20261019-101500-pytest-x--c0ffee, still running), last 3 lines:",
             "    test_b PASSED",
         ] {
             assert!(text.contains(want), "missing {want:?} in\n{text}");
@@ -1361,35 +1364,35 @@ mod tests {
         }
     }
 
-    /// Live ASK2 G1: a job's id is made from its command, and one made before ids were masked
-    /// carries what the masking takes out of the command — `pods run --background 'curl -u
-    /// bob:hunter2pass http://127.0.0.1:9/'` was `…-curl-u-bob-hunter2pass`, in the bundle
-    /// twice, the command itself masked. Such an id shows as its time and `<masked>` — in the
-    /// jobs, the log's header and the wrapper's process — and so does one whose command starts
-    /// with a long key (its first 24 characters were the slug). An id made now, from the masked
-    /// command, shows whole and holds none of it.
+    /// Live ASK2 G1, review ai-review claude #10: a job's id carries nothing its command's values
+    /// hold. One made now — the time, the slug of the command's shape, a salt — shows whole; one
+    /// made before shows as its time and `<masked>` in the jobs and the log's header (the
+    /// wrapper's process is `sh <job>` whatever its id): the command as typed (`pods run
+    /// --background 'curl -u bob:hunter2pass http://127.0.0.1:9/'` was `…-curl-u-bob-hunter2pass`),
+    /// one starting with a long key (its first 24 characters were the slug), and lane ASK5's
+    /// masked slug alike.
     #[test]
     fn a_jobs_id_never_carries_what_its_command_masks() {
         let token = body(ALNUM, 40, 9);
         let long = format!("{token} --go");
-        for (cmd, secret, old) in [
-            ("curl -u bob:hunter2pass http://127.0.0.1:9/", "hunter2pass".to_string(), "curl-u-bob-hunter2pass".to_string()),
-            (long.as_str(), token[..24].to_lowercase(), token[..24].to_lowercase()),
+        for (cmd, secret, olds) in [
+            ("curl -u bob:hunter2pass http://127.0.0.1:9/", "hunter2pass".to_string(), vec!["curl-u-bob-hunter2pass".to_string(), "curl-u-redacted-http-127".into()]),
+            (long.as_str(), token[..24].to_lowercase(), vec![token[..24].to_lowercase(), "redacted-go".into()]),
         ] {
-            let new = format!("20261019-101500-{}", jobs::masked_slug(cmd));
-            assert!(!new.contains(&secret), "{new}");
-            assert_eq!(jobs::JobId::generate(NOW, cmd).as_str().split_at(15).1, &new[15..], "made the same way");
+            let new = jobs::JobId::named(1_792_404_900, cmd, fixtures::SALT).as_str().to_string();
+            assert!(!new.contains(&secret) && new.ends_with("--c0ffee"), "{new}");
             let text = bundle(&busy_reply("", "", cmd), BUNDLE_CAP);
             assert!(text.contains(&format!("{new} — running")) && text.contains(&format!("newest job's log ({new}, ")), "{text}");
-            // The id made before, from the command as typed.
-            let reply = busy_reply("", "", cmd).replace(&new, &format!("20261019-101500-{old}"));
-            let text = bundle(&reply, BUNDLE_CAP);
-            assert!(!text.to_lowercase().contains(&secret), "{secret} reached the bundle:\n{text}");
-            for want in ["20261019-101500-<masked> — running (pid 777)", "newest job's log (20261019-101500-<masked>, still running)", "up 1h0m: sh <job>\n"] {
-                assert!(text.contains(want), "missing {want:?} in\n{text}");
+            for old in olds {
+                let reply = busy_reply("", "", cmd).replace(&new, &format!("20261019-101500-{old}"));
+                let text = bundle(&reply, BUNDLE_CAP);
+                assert!(!text.to_lowercase().contains(&secret), "{secret} reached the bundle:\n{text}");
+                for want in ["20261019-101500-<masked> — running (pid 777)", "newest job's log (20261019-101500-<masked>, still running)", "up 1h0m: sh <job>\n"] {
+                    assert!(text.contains(want), "missing {want:?} in\n{text}");
+                }
             }
         }
-        assert_eq!(jobs::JobId::generate(NOW, "curl -u bob:hunter2pass http://127.0.0.1:9/").as_str(), "20261019-120000-curl-u-redacted-http-127");
+        assert_eq!(jobs::JobId::named(NOW, "curl -u bob:hunter2pass http://127.0.0.1:9/", "c0ffee").as_str(), "20261019-120000-curl-u--c0ffee");
     }
 
     /// The bundle for real at both cuts: the remote read's last bytes begin inside a key (its
@@ -1398,7 +1401,8 @@ mod tests {
     #[test]
     fn a_log_tail_starting_inside_a_key_never_shows_it() {
         use crate::ask::redact::tests::key_body;
-        let job = jobs::fixtures::job_line("20261019-101500-pytest", "running", None, Some(777), "pytest");
+        let id = jobs::JobId::named(1_792_404_900, "pytest", fixtures::SALT);
+        let job = jobs::fixtures::job_line(id.as_str(), "running", None, Some(777), "pytest");
         let [_, _, log_m, extra_m, _] = marks();
         let with_log = |start: u64, log: &str| {
             let full = busy_reply("", "", "pytest");
@@ -1420,7 +1424,7 @@ mod tests {
         ];
         for (n, (start, log)) in cases.iter().enumerate() {
             let text = bundle(&with_log(*start, log), 64 * 1024);
-            assert!(text.contains("newest job's log (20261019-101500-pytest, still running), last "), "{n}: {text}");
+            assert!(text.contains(&format!("newest job's log ({id}, still running), last ")), "{n}: {text}");
             for l in &key {
                 for piece in l.as_bytes().chunks(12).filter(|c| c.len() == 12) {
                     let piece = std::str::from_utf8(piece).unwrap();

@@ -7920,8 +7920,9 @@ async fn handle_pods_bal(
             refresh_missing_endpoints(provider, &mut sel, ENDPOINT_RETRY).await;
             if background {
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+                let id = arena_core::jobs::JobId::generate(now, &cmd);
                 let ask = &mut |what: &str| confirm(yes, what);
-                jobs::handle_start(remote, cfg, &sel, &cmd, now, dry_run, ask, &mut |l| println!("{l}")).await?;
+                jobs::handle_start(remote, cfg, &sel, &cmd, id, dry_run, ask, &mut |l| println!("{l}")).await?;
             } else {
                 handle_run(remote, cfg, &sel, &cmd, budget, dry_run, yes, /*confirm*/ true, /*compact*/ false).await?;
             }
