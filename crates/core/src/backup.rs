@@ -1384,7 +1384,8 @@ mod tests {
         // Exactly the commit it scanned, by its id (review ai-review codex #1, FIX7), a branch with
         // no upstream then tracking origin's as `push -u` made it — in the config itself (claude #7).
         assert!(s.contains(r#"git push --no-follow-tags origin "$NEW:refs/heads/$B""#) && !s.contains(r#"git push -u"#) && s.contains("PUSHED $B"));
-        assert!(s.contains(r#"git config "branch.$B.remote" origin && git config "branch.$B.merge" "refs/heads/$B""#) && !s.contains("git branch --set-upstream-to"));
+        assert!(s.contains(r#"git config "branch.$B.remote" origin"#) && s.contains(r#"git config "branch.$B.merge" "refs/heads/$B""#));
+        assert!(!s.contains("git branch --set-upstream-to"));
         assert!(s.contains("Arena Autocommit"));
         assert!(s.contains(r#"export GIT_SSH_COMMAND="ssh -i $KEY"#));
         assert_eq!(GIT_MAX_FILE_BYTES, 99_614_720, "95 MiB: headroom under GitHub's 100 MiB");
@@ -4433,6 +4434,29 @@ done
         assert!(!tracked.status.success(), "no remote-tracking ref: the fetch is narrowed");
         let config = |key: &str| s.git(&s.work, &["config", &format!("branch.autocommit-y.{key}")]);
         assert_eq!((config("remote"), config("merge")), ("origin".to_string(), "refs/heads/autocommit-y".to_string()));
+    }
+
+    /// Review claude #3 (FIX9B item 3): the upstream was written only when `branch.<b>.remote` was
+    /// unset, both keys at once — so one run's failed second write (a `config.lock` the
+    /// participant's git held) left `remote` without `merge` for good, and a `merge` the
+    /// participant set alone never got its `remote`. Each key is now checked on its own: with one
+    /// of them pre-set, the next push writes the other and leaves the pre-set one as it was.
+    #[cfg(unix)]
+    #[test]
+    fn a_half_written_upstream_gets_the_missing_key_and_keeps_the_other() {
+        for (preset, value, want_remote, want_merge) in [
+            ("remote", "origin", "origin", "refs/heads/autocommit-x"),
+            ("merge", "refs/heads/elsewhere", "origin", "refs/heads/elsewhere"),
+        ] {
+            let s = GitSandbox::new(&format!("half-upstream-{preset}"), 1_000_000);
+            s.git(&s.work, &["branch", "--unset-upstream"]);
+            s.git(&s.work, &["config", &format!("branch.autocommit-x.{preset}"), value]);
+            std::fs::write(s.work.join("notes.md"), "notes\n").unwrap();
+            let (code, r, err) = s.backup();
+            assert_eq!((code, r.outcome), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into()))), "{preset}: {err}");
+            let config = |key: &str| s.git(&s.work, &["config", &format!("branch.autocommit-x.{key}")]);
+            assert_eq!((config("remote"), config("merge")), (want_remote.to_string(), want_merge.to_string()), "{preset}");
+        }
     }
 
     /// Review ai-review claude #9: on main the check for changes to tracked files was the porcelain

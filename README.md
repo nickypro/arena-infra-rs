@@ -589,7 +589,8 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `NO_CHANGES` (origin's — never the branch's own upstream: a branch made from `upstream/main`,
     tracking it, is pushed like any other, its upstream left as it is; a branch with none tracks
     origin's after its first push, written to its config even where `remote.origin.fetch` is
-    narrowed). Selected pods, or — none
+    narrowed — `branch.<b>.remote` and `.merge` each on its own, so one half-written, or set alone
+    by the participant, gets the other at the next push). Selected pods, or — none
     named (no targets, `all`/`--all`) — **this cohort's**: `<prefix>-…` pods (one off
     `MACHINE_NAME_LIST` too: an extra pod made for someone, a parked `-old` twin), never an `@`
     staff entry. The rest (staff boxes, another prefix, a pod the provider named) get one

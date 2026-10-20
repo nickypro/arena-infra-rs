@@ -448,8 +448,10 @@ fi
 # remote-tracking ref, which a checkout whose `remote.origin.fetch` is narrowed (an image cloned
 # `--single-branch`, `origin` repointed by setup) never gets, and that branch had no upstream for
 # good — a bare `git push`/`git pull` saying so (review ai-review claude #7). An upstream the
-# branch has already is left as it is.
-if [ -z "$(git config "branch.$B.remote")" ]; then
-    git config "branch.$B.remote" origin && git config "branch.$B.merge" "refs/heads/$B" || true
-fi
+# branch has already is left as it is. Each key on its own (review claude #3, FIX9B): a run whose
+# second write failed (the participant's git holding `config.lock`) left `remote` without `merge`,
+# and every later run, seeing `remote`, skipped — the bare `git pull` failing for good; and a
+# `merge` the participant set alone was never given its `remote`. Whichever is missing is written.
+if [ -z "$(git config "branch.$B.remote")" ]; then git config "branch.$B.remote" origin || true; fi
+if [ -z "$(git config "branch.$B.merge")" ]; then git config "branch.$B.merge" "refs/heads/$B" || true; fi
 echo "PUSHED $B"
