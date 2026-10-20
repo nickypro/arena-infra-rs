@@ -189,7 +189,8 @@ pub struct Repo {
     pub files: Vec<String>,
     /// The last commit: committer time (unix) and subject.
     pub last: Option<(u64, String)>,
-    /// The branch's upstream; `Some("")` = none (git says there is none), `None` = unknown.
+    /// The branch's upstream; `Some("")` = none (git says there is none, in its own words: no
+    /// upstream configured, no such branch, a detached HEAD), `None` = unknown.
     pub upstream: Option<String>,
     pub stashes: Option<u32>,
 }
@@ -203,7 +204,8 @@ pub enum Git {
     Missing,
     /// No `git` on the pod.
     NoGit,
-    /// The path isn't a git checkout.
+    /// The path isn't a git checkout: git said `not a git repository` (any other failure of its
+    /// is unknown — probe.sh's `git err`).
     NotRepo,
     Repo(Repo),
 }
@@ -2153,13 +2155,13 @@ mod tests {
             assert!(text.contains(want), "missing {want:?} in\n{text}");
         }
         // git's own answers: none, and 0.
-        let x = probe(git("pwd", "echo 'fatal: no upstream configured' >&2; exit 128", "true", "true"));
+        let x = probe(git("pwd", "echo \"fatal: no upstream configured for branch 'main'\" >&2; exit 128", "true", "true"));
         let Some(Git::Repo(r)) = &x.git else { panic!("{x:?}") };
         assert_eq!((r.op.as_deref(), r.upstream.as_deref(), r.stashes), (Some(""), Some(""), Some(0)), "{x:?}");
         let text = shown(&x);
         assert!(text.contains("upstream none ·") && text.contains("operation in progress: none · stashes 0"), "{text}");
         // The toplevel: git's own "not a repository" vs a git that couldn't answer.
-        assert_eq!(probe(git("exit 128", "true", "true", "true")).git, Some(Git::NotRepo));
+        assert_eq!(probe(git("echo 'fatal: not a git repository (or any of the parent directories): .git' >&2; exit 128", "true", "true", "true")).git, Some(Git::NotRepo));
         assert_eq!(probe(git("exit 124", "true", "true", "true")).git, None);
         // tmux with no uid to look for its socket directory by: unknown.
         stub(&bin, "id", "exit 1");
@@ -2171,6 +2173,139 @@ mod tests {
         let mut out = String::new();
         procs_block(Some(&Extra { procs: Some(Ok(Vec::new())), ..Default::default() })).render(&mut out);
         assert_eq!(out, "processes: unknown (ps listed none, not even this probe's own session)\n");
+    }
+
+    /// Review ai-review codex #3 (lane ASK8 item 3): git's exit 128 is any fatal error of its, not
+    /// only the absence asked about. Only git's own message — read in the C locale, case aside, at
+    /// a line's start — makes the toplevel "not a checkout" (`not a git repository`) or the
+    /// upstream none (`no upstream configured`, `no such branch` for an unborn one, `HEAD does not
+    /// point to a branch` for a detached HEAD); any other 128 — dubious ownership, permissions, a
+    /// bad config, those words inside another message, no message at all — is unknown. A stub git
+    /// saying each; then real git: a checkout read, the same checkout refused as another user's
+    /// (`GIT_TEST_ASSUME_DIFFERENT_OWNER`, git's own switch for its safe.directory tests — a test
+    /// can't chown), a directory that's no checkout, a detached HEAD, an unborn branch, and an
+    /// upstream configured but never fetched (unknown: not git's absence message).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn git_exit_128_is_absent_only_when_git_says_so() {
+        use crate::ask::ai::fixtures::stub;
+        use std::process::Command;
+        let t = crate::ask::ai::tests::Tmp::new("git128");
+        let (bin, home) = (t.0.join("bin"), t.0.join("home"));
+        let stubbed_repo = home.join("stubbed");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(stubbed_repo.join(".git")).unwrap();
+        let home_s = home.display().to_string();
+        let probe = |repo: &std::path::Path, path: &str, extra: &[(&str, &str)]| {
+            let o = Command::new("sh")
+                .arg("-c")
+                .arg(probe_script())
+                .args(["arena-ask-probe", &repo.display().to_string(), NONCE])
+                .env_clear()
+                .env("PATH", path)
+                .env("HOME", &home)
+                .envs([("GIT_CONFIG_NOSYSTEM", "1"), ("GIT_CEILING_DIRECTORIES", home_s.as_str())])
+                .envs(extra.iter().copied())
+                .output()
+                .unwrap();
+            parse_extra(&String::from_utf8_lossy(&o.stdout), NONCE)
+        };
+        let stubbed = |toplevel: &str, upstream: &str| {
+            stub(
+                &bin,
+                "git",
+                &format!(
+                    "while [ $# -gt 0 ]; do case $1 in --no-optional-locks) shift ;; -c) shift 2 ;; *) break ;; esac; done\n\
+                     case \"$*\" in\n\
+                     'rev-parse --show-toplevel') {toplevel} ;;\n\
+                     'rev-parse --abbrev-ref HEAD') echo main ;;\n\
+                     'rev-parse --absolute-git-dir') echo \"$PWD/.git\" ;;\n\
+                     'config --name-only --get-regexp ^filter[.]') exit 1 ;;\n\
+                     'rev-parse --abbrev-ref @{{u}}') {upstream} ;;\n\
+                     *) true ;;\n\
+                     esac"
+                ),
+            );
+            probe(&stubbed_repo, &format!("{}:/usr/bin:/bin", bin.display()), &[])
+        };
+        let dubious = r#"printf '%s\n' "fatal: detected dubious ownership in repository at '/r'" 'To add an exception for this directory, call:' '' '	git config --global --add safe.directory /r' >&2; exit 128"#;
+        for (toplevel, want) in [
+            (r#"echo 'fatal: not a git repository (or any of the parent directories): .git' >&2; exit 128"#, Some(Git::NotRepo)),
+            (r#"echo 'fatal: Not a git repository (or any of the parent directories): .git' >&2; exit 128"#, Some(Git::NotRepo)),
+            (dubious, None),
+            (r#"echo "fatal: unable to access '/r/.git/config': Permission denied" >&2; exit 128"#, None),
+            (r#"echo 'fatal: bad config line 3 in file .git/config' >&2; exit 128"#, None),
+            (r#"echo "fatal: detected dubious ownership in repository at '/x/fatal: not a git repository'" >&2; exit 128"#, None),
+            ("exit 128", None),
+            (r#"echo 'fatal: not a git repository' >&2; exit 1"#, None),
+        ] {
+            assert_eq!(stubbed(toplevel, "true").git, want, "{toplevel}");
+        }
+        for (upstream, want) in [
+            (r#"echo "fatal: no upstream configured for branch 'main'" >&2; exit 128"#, Some("")),
+            (r#"echo "fatal: No upstream configured for branch 'main'" >&2; exit 128"#, Some("")),
+            (r#"echo "fatal: no such branch: 'main'" >&2; exit 128"#, Some("")),
+            (r#"echo 'fatal: HEAD does not point to a branch' >&2; exit 128"#, Some("")),
+            (dubious, None),
+            (r#"echo "fatal: ambiguous argument '@{u}': unknown revision or path not in the working tree." >&2; exit 128"#, None),
+            (r#"echo "fatal: upstream branch 'refs/heads/main' not stored as a remote-tracking branch" >&2; exit 128"#, None),
+            ("exit 128", None),
+            (r#"echo "fatal: no upstream configured for branch 'main'" >&2; exit 1"#, None),
+        ] {
+            let x = stubbed("pwd", upstream);
+            let Some(Git::Repo(r)) = &x.git else { panic!("{upstream}: {x:?}") };
+            assert_eq!(r.upstream.as_deref(), want, "{upstream}");
+        }
+
+        // Real git.
+        if !Command::new("git").arg("--version").output().is_ok_and(|o| o.status.success()) {
+            eprintln!("git missing — skipping the real git part");
+            return;
+        }
+        let git = |dir: &std::path::Path, args: &[&str], extra: &[(&str, &str)]| {
+            Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "init.defaultBranch=main"])
+                .args(args)
+                .current_dir(dir)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", &home)
+                .envs([("GIT_CONFIG_NOSYSTEM", "1"), ("LC_ALL", "C")])
+                .envs(extra.iter().copied())
+                .output()
+                .unwrap()
+        };
+        let ok = |dir: &std::path::Path, args: &[&str]| assert!(git(dir, args, &[]).status.success(), "git {args:?}");
+        let (checkout, nothing, unborn) = (home.join("checkout"), home.join("nothing"), home.join("unborn"));
+        for d in [&checkout, &nothing, &unborn] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        ok(&checkout, &["init", "-q"]);
+        ok(&checkout, &["commit", "-q", "--allow-empty", "-m", "first"]);
+        ok(&unborn, &["init", "-q"]);
+        let real = |repo: &std::path::Path, extra: &[(&str, &str)]| probe(repo, "/usr/bin:/bin", extra);
+        let upstream = |x: &Extra| match &x.git {
+            Some(Git::Repo(r)) => r.upstream.clone(),
+            other => panic!("{other:?}"),
+        };
+        // Read: no upstream, git's own message.
+        assert_eq!(upstream(&real(&checkout, &[])), Some(String::new()));
+        // Refused as another user's: git's 128, unknown — never "not a checkout".
+        let refused = git(&checkout, &["rev-parse", "--show-toplevel"], &[("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")]);
+        assert!(refused.status.code() == Some(128) && String::from_utf8_lossy(&refused.stderr).contains("detected dubious ownership"), "{refused:?}");
+        assert_eq!(real(&checkout, &[("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")]).git, None);
+        // No checkout at all.
+        assert_eq!(real(&nothing, &[]).git, Some(Git::NotRepo));
+        // An unborn branch and a detached HEAD: no upstream.
+        assert_eq!(upstream(&real(&unborn, &[])), Some(String::new()));
+        ok(&checkout, &["checkout", "-q", "--detach"]);
+        assert_eq!(upstream(&real(&checkout, &[])), Some(String::new()));
+        ok(&checkout, &["checkout", "-q", "main"]);
+        // An upstream configured, its branch never fetched: git's 128, but not its absence.
+        for (k, v) in [("branch.main.remote", "origin"), ("branch.main.merge", "refs/heads/main"), ("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")] {
+            ok(&checkout, &["config", k, v]);
+        }
+        assert_eq!(upstream(&real(&checkout, &[])), None);
     }
 
     /// Review ai-review claude #5: `tmux list-sessions` makes its socket directory when there is

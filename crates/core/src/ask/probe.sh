@@ -134,14 +134,27 @@ else
     # fsmonitor hook would run) and ro_setup's config read included; `ro_git` itself reaches the
     # binary. Each within 10 s, the whole repo section through (a hung /workspace volume costs
     # this section, never the lines above it). A fact a git couldn't read — it timed out (124,
-    # 137) or failed — is said empty, unknown: never "not a checkout", "none" or 0.
+    # 137) or failed, a fatal error other than the absence asked about included — is said
+    # empty, unknown: never "not a checkout", "none" or 0.
     git() { ro_git "$@"; }
+    # Whether git, asked `$2…` again, says what `$1` (an ERE, case aside) matches at the start of
+    # a line of its stderr — read in the C locale (LC_ALL above), so in git's own English. Asked
+    # only after an exit 128, which is every fatal error of git's, not only the absence it means
+    # here: a checkout git refuses (dubious ownership), one it can't read (permissions, corrupt
+    # metadata). So only the absence's own message says absent; any other is unknown. Asked
+    # again because one call can't give its stdout and its stderr apart in POSIX sh without a
+    # file, and this probe writes none.
+    git_says() {
+        gs_re=$1
+        shift
+        git "$@" 2>&1 >/dev/null | head -c 4000 | grep -Eiq "^($gs_re)"
+    }
     ro_timeout=10
     top=$(git rev-parse --show-toplevel 2>/dev/null)
     rc=$?
     if [ "$rc" -ne 0 ] || ! cd "$top" 2>/dev/null; then
-        # git's own "not a git repository" is 128.
-        if [ "$rc" -eq 128 ]; then o git notrepo; else o git err; fi
+        # Not a checkout only when git says so: 128 and "not a git repository".
+        if [ "$rc" -eq 128 ] && git_says 'fatal: not a git repository' rev-parse --show-toplevel; then o git notrepo; else o git err; fi
     else
         o git ok
         o real "$(pwd -P)"
@@ -167,10 +180,11 @@ else
             o status err
         fi
         o last "$(git log -1 --format='%ct %s' 2>/dev/null | head -c 300)"
-        # No upstream is git's 128 ("no upstream configured", a detached HEAD): `-`, none.
+        # No upstream — `-`, none — only when git says so: 128 and "no upstream configured", "no
+        # such branch" (an unborn one) or "HEAD does not point to a branch" (a detached HEAD).
         if up=$(git rev-parse --abbrev-ref '@{u}' 2>/dev/null); then
             o upstream "$up"
-        elif [ $? -eq 128 ]; then
+        elif [ $? -eq 128 ] && git_says 'fatal: (no upstream configured|no such branch|HEAD does not point to a branch)' rev-parse --abbrev-ref '@{u}'; then
             o upstream -
         else
             o upstream ""

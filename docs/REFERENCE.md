@@ -1266,7 +1266,11 @@ endpoint, age, lock, maintenance), its last `pods test --deep` verdict, which lo
 (`busy-copies.json`: the operation, how long ago, the snapshot label and whether that copy is still
 here — never the local path), and the branch today's backups go to. A stopped or unreachable pod is
 its listing and why. What couldn't be read — a git that timed out, a list that failed, the health
-cache or the backup dir unreadable here — is sent as `unknown`, never as none or 0.
+cache or the backup dir unreadable here — is sent as `unknown`, never as none or 0. A checkout is
+"not a git checkout", and an upstream none, only when git says so in its own words (`not a git
+repository`; `no upstream configured`, `no such branch`, `HEAD does not point to a branch`): any
+other fatal error of git's — a checkout it refuses as another user's (dubious ownership), one it
+can't read — is unknown.
 
 Its git — the dashboard's probe's too — writes nothing and runs nothing the participant's repo
 configures: no optional locks (not even the index is refreshed), no fsmonitor hook, no clean/process
