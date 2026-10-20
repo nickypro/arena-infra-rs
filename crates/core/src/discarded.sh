@@ -237,16 +237,15 @@ ds_fits() {
 
 # `ds_move <path>`: the command that moves <path> (relative to the repo's top) out of the checkout,
 # next to it, as `<its name>.kept-<UTC time>` (review ai-review claude #5): a name no earlier
-# kept copy has, and `mv -n` besides, so a second switch's advice never replaces the first's copy.
-# And `-T` (GNU's): the kept copy's name is the target itself, never a directory to move into —
-# with `-n` alone, the same advice pasted again after the directory was made anew moved it inside
-# the kept copy (review ai-review codex #4). A `mv` without `-T` (busybox's) gets `mv -n`: a probe
-# asks (`-nT --help` is refused there, and only prints help where `-T` is known). Each word quoted
-# by `ds_quote`: a path with a `'` in it pastes as it is.
+# kept copy has. It moves nothing once that name is taken — `[ ! -e … ] && [ ! -L … ]` first,
+# then `mv -n` — so the same advice pasted again (the directory made anew since) fails, never
+# replacing the kept copy nor moving the new directory inside it, as `mv -n` alone did (review
+# ai-review codex #4). Plain POSIX: no `-T`, which busybox's `mv` lacks (FIX7 asked a probe and
+# fell back to that very `mv -n`). Each word quoted by `ds_quote`: a path with a `'` in it pastes
+# as it is.
 ds_move() {
-    if mv -nT --help > /dev/null 2>&1; then ds_mv='mv -nT'; else ds_mv='mv -n'; fi
-    printf '(cd %s && %s -- %s %s)' "$(ds_quote "$(pwd)")" "$ds_mv" "$(ds_quote "$1")" \
-        "$(ds_quote "../$(basename -- "$1").kept-$(date -u +%Y%m%dT%H%M%SZ)")"
+    ds_to=$(ds_quote "../$(basename -- "$1").kept-$(date -u +%Y%m%dT%H%M%SZ)")
+    printf '(cd %s && [ ! -e %s ] && [ ! -L %s ] && mv -n -- %s %s)' "$(ds_quote "$(pwd)")" "$ds_to" "$ds_to" "$(ds_quote "$1")" "$ds_to"
 }
 
 # `ds_quote <word>`: <word> single-quoted for a POSIX shell, each `'` in it as `'\''` —
