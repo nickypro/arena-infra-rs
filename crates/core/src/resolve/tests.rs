@@ -1586,6 +1586,87 @@ fn every_path_the_commit_takes_is_checked_not_only_the_conflicted_ones() {
     assert_eq!(format!("{}\n", r.committed("example.md")), example, "as the course published it");
 }
 
+/// A notebook stays valid JSON (review ai-review claude #3). Merged per hunk, one side's conflict
+/// beside the other side's clean hunk can break it: the participant grouped cells into a list (an
+/// opening `[` three lines above the conflict, a clean hunk), the course changed the cell where
+/// the list closes (the conflict) — the course's side of it drops the `]`. So the result is parsed
+/// (python3, else jq): not valid — the whole notebook from the newer side, said; valid (the
+/// participant's side newer) — per hunk as any file. With nothing to parse it, whole too, said. A
+/// notebook resolved by hand that isn't valid JSON leaves the merge BUSY; a valid one is kept.
+#[cfg(unix)]
+#[test]
+fn a_notebook_merged_per_hunk_stays_valid_json_or_is_taken_whole() {
+    let base = b"{\n \"cells\": [\n  \"a\",\n  \"b\",\n  \"c\",\n  \"d\"\n ]\n}\n";
+    let course = b"{\n \"cells\": [\n  \"a\",\n  \"b\",\n  \"C\",\n  \"d\"\n ]\n}\n";
+    let mine = b"{\n \"cells\": [\n  [\"a\",\n  \"b\",\n  \"c\"],\n  \"d\"\n ]\n}\n";
+    let has = |tool: &str| std::process::Command::new("sh").args(["-c", &format!("command -v {tool}")]).output().is_ok_and(|o| o.status.success());
+    // A merge of nb.ipynb, the course's side newer or not, left alone 4h.
+    let merged = |case: &str, course_newer: bool| {
+        let r = Repo::new(case);
+        r.add_base(&[("nb.ipynb", base)]);
+        let (course_at, mine_at) = if course_newer { (r.now - 5 * DAY, r.now - 10 * DAY) } else { (r.now - 10 * DAY, r.now - 5 * DAY) };
+        r.course_commit(&[("nb.ipynb", course)], course_at);
+        r.my_commit(&[("nb.ipynb", mine)], mine_at);
+        r.pull_conflicted();
+        r
+    };
+    let parses = |r: &Repo| serde_json::from_slice::<serde_json::Value>(&r.read("nb.ipynb")).is_ok();
+    // (case, the JSON tools the resolve may use, the course's side newer, how it's taken, the words)
+    let mut cases: Vec<(&str, &str, bool, Taken, &str)> = vec![
+        ("nb-python", "python3", true, Taken::NotJson, "its whole version: merged per hunk, the notebook wasn't valid JSON"),
+        ("nb-valid", "python3", false, Taken::Hunks, "your side of each conflict; the other changes of both sides kept"),
+        ("nb-none", "", true, Taken::NoCheck, "its whole version: no python3 or jq here to check a notebook merged per hunk"),
+    ];
+    if has("jq") {
+        cases.push(("nb-jq", "jq", true, Taken::NotJson, "its whole version: merged per hunk, the notebook wasn't valid JSON"));
+        cases.push(("nb-jq-valid", "jq", false, Taken::Hunks, "your side of each conflict; the other changes of both sides kept"));
+    } else {
+        eprintln!("jq isn't installed here: the notebook checks run with python3 alone");
+    }
+    assert!(has("python3"), "python3, the images' own, is what the check uses first");
+    for (case, tools, course_newer, how, words) in cases {
+        let r = merged(case, course_newer);
+        r.age(4 * HOUR);
+        let (code, rep, said) = r.resolve_with(3, &r.look(), GIT_MAX_FILE_BYTES_FOR_TESTS, &[("ARENA_TEST_JSON_TOOLS", tools)]);
+        assert_eq!((code, rep.resolved.as_deref()), (Some(0), Some("merge")), "{case}: {said}");
+        let side = if course_newer { "theirs" } else { "ours" };
+        assert_eq!(taken(&rep), [("nb.ipynb".to_string(), side.to_string(), how)], "{case}: {said}");
+        assert!(parses(&r), "{case}: {}", r.text("nb.ipynb"));
+        assert_eq!(r.read("nb.ipynb"), if course_newer { course.to_vec() } else { mine.to_vec() }, "{case}: the newer side's");
+        let body = r.git(&r.work, &["log", "-1", "--format=%B"]);
+        let won = if course_newer { "the merged branch won" } else { "yours won" };
+        assert!(body.contains(&format!("- nb.ipynb: {won} ({words}) — last changed: ")), "{case}: {body}");
+    }
+    // The line names it too.
+    let r = parse_resolve("NEWER theirs notjson 1760000000 1760500000 nb.ipynb\nNEWER ours nocheck 1760600000 1760500000 b.ipynb\nRESOLVED merge\n");
+    assert_eq!(
+        resolved_note(&r, 3, "/b/x"),
+        "finished a merge left for 3h+ (nb.ipynb: MERGE_HEAD's version, whole: merged per hunk the notebook wasn't valid JSON, HEAD \
+         2025-10-09 08:53Z / MERGE_HEAD 2025-10-15 03:46Z; b.ipynb: HEAD's version, whole: no python3 or jq on the pod to check the \
+         notebook merged per hunk, HEAD 2025-10-16 07:33Z / MERGE_HEAD 2025-10-15 03:46Z; today's copy: /b/x)"
+    );
+
+    // Resolved by hand: not valid JSON (a comma lost) — BUSY, said, untouched; valid — kept.
+    for (case, by_hand, kept) in [("nb-hand-bad", &b"{\n \"cells\": [\n  \"a\"\n  \"C\"\n ]\n}\n"[..], false), ("nb-hand", &mine[..], true)] {
+        let r = merged(case, true);
+        r.put("nb.ipynb", by_hand);
+        r.age(4 * HOUR);
+        let conflicts = r.unmerged();
+        let (code, rep, said) = r.resolve(3, &r.look());
+        if kept {
+            assert_eq!((code, rep.hand.clone()), (Some(0), vec!["nb.ipynb".to_string()]), "{case}: {said}");
+            assert_eq!(r.read("nb.ipynb"), by_hand, "{case}");
+        } else {
+            assert_eq!(
+                (code, rep.refused.as_deref()),
+                (Some(RESOLVE_REFUSED_EXIT), Some("nb.ipynb isn't valid JSON: Jupyter can't open it as it is — fix it (and git add it) or abort, on the pod")),
+                "{case}: {said}"
+            );
+            r.untouched(&conflicts, case);
+        }
+    }
+}
+
 /// The path's `conflict-marker-size` (review ai-review codex #9): with 10, git's markers are ten
 /// characters long, and the file still has them — not resolved by hand: taken per hunk from the
 /// newer side, no marker committed.

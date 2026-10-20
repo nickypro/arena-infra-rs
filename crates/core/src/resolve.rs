@@ -529,6 +529,10 @@ pub enum Taken {
     Hunks,
     /// The whole file (a binary file, a symlink, a modify/delete).
     File,
+    /// The whole notebook: merged per hunk, it wasn't valid JSON (Jupyter wouldn't open it).
+    NotJson,
+    /// The whole notebook: nothing on the pod (python3, jq) could check one merged per hunk.
+    NoCheck,
     /// Removed: that side deleted it.
     Gone,
 }
@@ -583,6 +587,8 @@ pub fn parse_resolve(stdout: &str) -> ResolveReport {
                     let taken = match how {
                         "hunks" => Some(Taken::Hunks),
                         "file" => Some(Taken::File),
+                        "notjson" => Some(Taken::NotJson),
+                        "nocheck" => Some(Taken::NoCheck),
                         _ => None,
                     };
                     r.newer.extend(taken.and_then(|t| choice(side, t, ours, theirs, path)));
@@ -647,6 +653,8 @@ pub fn resolved_note(r: &ResolveReport, hours: u64, copy: &str) -> String {
             let way = match c.taken {
                 Taken::Hunks => format!("{side}'s side of each conflict"),
                 Taken::File => format!("{side}'s version"),
+                Taken::NotJson => format!("{side}'s version, whole: merged per hunk the notebook wasn't valid JSON"),
+                Taken::NoCheck => format!("{side}'s version, whole: no python3 or jq on the pod to check the notebook merged per hunk"),
                 Taken::Gone => format!("removed, as on {side}"),
             };
             format!("{}: {way}, HEAD {} / {other} {}", c.path, minute_words(c.ours), minute_words(c.theirs))

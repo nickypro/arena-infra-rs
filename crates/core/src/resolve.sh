@@ -16,8 +16,10 @@
 #   - else the side whose last change to that path is the more recent (`git log -1 --format=%ct
 #     <side> -- <path>`, HEAD's against the operation's other side; a tie keeps HEAD's) — for a
 #     text file per hunk: `git merge-file --ours|--theirs` keeps the clean hunks of both sides and
-#     takes that side of each conflict; for a binary file, a symlink or a modify/delete, the whole
-#     side, removed when that side deleted it.
+#     takes that side of each conflict — but a notebook (`*.ipynb`) that isn't valid JSON merged so
+#     (or can't be checked) whole; for a binary file, a symlink or a modify/delete, the whole side,
+#     removed when that side deleted it. A notebook resolved by hand that isn't valid JSON leaves
+#     the operation alone, said.
 # A file over <max file bytes> (the backup's git limit) anywhere in that is never committed: left
 # alone, said — nor, for a merge or a cherry-pick (whose commit takes the whole index), any path
 # already staged: a blob over that limit, or a new gitlink. The state before is kept first in
@@ -38,8 +40,10 @@
 #   SAVED <dir>              where the state before was kept
 #   NEWER <side> <how> <HEAD's time> <the other side's time> <path>   taken from the newer side
 #                            (<side> ours|theirs; <how> hunks: that side of each conflict, the
-#                            clean hunks of both kept; file: the whole file); the times are each
-#                            side's last change to the path
+#                            clean hunks of both kept; file: the whole file; notjson, nocheck: the
+#                            whole notebook, since merged per hunk it wasn't valid JSON / no
+#                            python3 or jq was there to tell); the times are each side's last
+#                            change to the path
 #   GONE <side> <HEAD's time> <the other side's time> <path>   removed: the newer side deleted it
 #   HAND <path>              kept as it is on disk (resolved by hand) and added
 #   REDACTED <n> <path>      staged with its n key(s) redacted; the file on disk keeps them
@@ -210,6 +214,21 @@ tr '\0' '\n' < "$T.u" | awk '
 # git's binary test: a NUL in the first 8000 bytes (of a file, of a blob).
 binary_file() { [ "$(head -c 8000 -- "$1" | tr -d -c '\000' | wc -c)" -ne 0 ]; }
 binary_blob() { [ "$(git cat-file blob "$1" | head -c 8000 | tr -d -c '\000' | wc -c)" -ne 0 ]; }
+# Whether file $1 is one JSON document, as Jupyter needs a notebook to be: `yes`/`no` by python3's
+# json (the images have it), else jq's (one value, nothing after it); `none` when neither is here.
+# ARENA_TEST_JSON_TOOLS, set by tests only, names the tools to try instead.
+json_ok() {
+    for _j in ${ARENA_TEST_JSON_TOOLS-python3 jq}; do
+        command -v "$_j" > /dev/null 2>&1 || continue
+        case $_j in
+            python3) python3 -c 'import json, sys; json.load(open(sys.argv[1], "rb"))' "$1" ;;
+            jq) jq -e -s 'length == 1' "$1" ;;
+            *) false ;;
+        esac > /dev/null 2>&1 && echo yes || echo no
+        return 0
+    done
+    echo none
+}
 # Merged as text: not `-merge`/`merge=binary`, and no filter (an LFS pointer is no text to merge).
 text_attrs() {
     _a=$(git check-attr merge filter -- "$1") || return 1
@@ -313,10 +332,32 @@ while IFS="$TAB" read -r st m1 b1 m2 b2 m3 b3 p; do
         hunks)
             git merge-file -p "--$side" --marker-size="$n" "$T.s2" "$T.s1" "$T.s3" > "$T.r$i" 2>/dev/null \
                 || refuse "$p couldn't be merged per hunk"
-            size=$(wc -c < "$T.r$i")
+            # A notebook merged per hunk must still be one JSON document, or Jupyter won't open it:
+            # one side's conflict next to the other side's clean hunk can leave a bracket or a comma
+            # wrong (review ai-review claude #3). If it doesn't parse — or nothing here can tell —
+            # the whole notebook comes from the newer side instead, and the words say why.
+            case $p in
+                *.ipynb)
+                    case $(json_ok "$T.r$i") in
+                        yes) ;;
+                        no) act=notjson ;;
+                        *) act=nocheck ;;
+                    esac
+                    ;;
+            esac
             ;;
+        hand)
+            # A notebook resolved by hand that doesn't parse is the participant's to fix: committed,
+            # Jupyter would refuse it (with no parser here, it's taken as it is).
+            case $p in
+                *.ipynb) [ "$(json_ok "$p")" != no ] || refuse "$p isn't valid JSON: Jupyter can't open it as it is — fix it (and git add it) or abort, on the pod" ;;
+            esac
+            ;;
+    esac
+    case $act in
+        hunks) size=$(wc -c < "$T.r$i") ;;
         hand) size=$(stat -c %s -- "$p") ;;
-        file) size=$(git cat-file -s "$wb") ;;
+        file | notjson | nocheck) size=$(git cat-file -s "$wb") ;;
         *) size=0 ;;
     esac
     [ "$size" -le "$MAX" ] || refuse "$p would be $size bytes, over git's $MAX-byte limit: never committed — resolve it on the pod"
@@ -342,6 +383,8 @@ choices() {
             hand) echo "- $p: kept as you resolved it by hand" ;;
             hunks) echo "- $p: $won ($its side of each conflict; the other changes of both sides kept) — $dates" ;;
             file) echo "- $p: $won ($its whole version) — $dates" ;;
+            notjson) echo "- $p: $won ($its whole version: merged per hunk, the notebook wasn't valid JSON) — $dates" ;;
+            nocheck) echo "- $p: $won ($its whole version: no python3 or jq here to check a notebook merged per hunk) — $dates" ;;
             gone) echo "- $p: $won (removed: deleted there) — $dates" ;;
         esac
     done < "$T.plan"
@@ -428,10 +471,10 @@ while IFS="$TAB" read -r act side ot tt i wm p; do
             git rm -q -f -- ":(literal)$p" > /dev/null || fail "git rm $p"
             echo "GONE $side $ot $tt $p"
             ;;
-        file)
+        file | notjson | nocheck)
             git checkout "--$side" -- ":(literal)$p" || fail "git checkout --$side $p"
             git add -- ":(literal)$p" || fail "git add $p"
-            echo "NEWER $side file $ot $tt $p"
+            echo "NEWER $side $act $ot $tt $p"
             ;;
         hunks)
             cat "$T.r$i" > "$p" || fail "writing $p"
