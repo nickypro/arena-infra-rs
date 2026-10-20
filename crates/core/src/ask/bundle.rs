@@ -1202,6 +1202,26 @@ mod tests {
         assert!(text.contains("Using key REDACTED-AWS-ACCESS-KEY-ID for the run"), "{text}");
     }
 
+    /// Review ai-review codex #2-#3, end to end: a process run as `redis-cli -a cohort-db-pass
+    /// ping`, a job started as `sshpass -p cohort-login-pass ssh …`, and a log printing a YAML
+    /// block scalar, a JSON value on the line after its name, `password:hunter2` and an ambiguous
+    /// `Couldn't … PASSWORD='hunter two'` — none of the passwords reaches the bundle.
+    #[test]
+    fn short_options_and_values_over_lines_never_reach_the_bundle() {
+        let log = "config:\n  password: |-\n    cohort-yaml-pass\n  user: bob\n{\n  \"token\":\n    \"cohort-json-pass\"\n}\nlogin password:hunter2\nCouldn't connect with PASSWORD='hunter two'";
+        let mut reply = busy_reply("", log, "sshpass -p cohort-login-pass ssh root@10.0.0.9 pytest");
+        reply = reply.replace(&t("ARENA_ASK git=ok\n"), &t("ARENA_ASK_PS 5100 root 0.1 0.1 60 redis-cli -a cohort-db-pass ping\nARENA_ASK git=ok\n"));
+        let text = bundle(&reply, 64 * 1024);
+        for secret in ["cohort-db-pass", "cohort-login-pass", "cohort-yaml-pass", "cohort-json-pass", "hunter"] {
+            assert!(!text.contains(secret), "{secret} reached the bundle:\n{text}");
+        }
+        for want in ["5100 root cpu 0.1% mem 0.1% up 1m: redis-cli -a <redacted> ping", "sshpass -p <redacted> ssh root@10.0.0.9 pytest", "password: <redacted>", "login password:<redacted>"] {
+            assert!(text.contains(want), "missing {want:?} in\n{text}");
+        }
+        assert_eq!(text.matches(redact::CONT_MASK).count(), 2, "{text}");
+        assert!(text.contains(redact::LINE_MASK), "{text}");
+    }
+
     /// The bundle for real at both cuts: the remote read's last bytes begin inside a key (its
     /// END in the window, or not), and a whole key block straddles where the 40-line cut falls —
     /// no 12-character piece of any key line reaches the bundle.

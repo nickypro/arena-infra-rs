@@ -501,10 +501,12 @@ impl Drop for Scratch {
 /// How long `claude --help` / `codex features list` may take (at most the ask's own budget).
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// The last non-empty stderr line, made printable and short — what a failed run says.
+/// The last non-empty stderr line, made printable and short — what a failed run says, printed
+/// and saved in `answer.md` — and masked as pod text is ([`super::redact::text`]): an auth error
+/// can echo the operator's own API key (review ai-review claude #7).
 fn last_line(stderr: &str) -> String {
     let l = stderr.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("(no output)");
-    crate::fleet::clip(&crate::jobs::sanitize(l), 200)
+    super::redact::text(l, 200)
 }
 
 /// Text from the AI, safe for the operator's terminal: escape sequences and control characters
@@ -1116,6 +1118,18 @@ pub(crate) mod tests {
         stub(&bin, "claude", &format!("{help}\ncat > /dev/null; printf '  \\n'"));
         let e = ask(Ai::Claude, "p", None, Duration::from_secs(10), &env).await.unwrap_err();
         assert!(e.starts_with("claude answered nothing"), "{e}");
+    }
+
+    /// Review ai-review claude #7: a failed run's stderr line — printed, and saved in
+    /// `answer.md` — is masked as pod text is: an auth error echoing the operator's key.
+    #[test]
+    fn a_failed_runs_stderr_line_is_masked() {
+        let key = format!("{}{}AA", "sk-ant-api03-", crate::ask::redact::tests::body(crate::ask::redact::tests::URLSAFE, 93, 3));
+        let line = last_line(&format!("starting\nError: invalid x-api-key {key} (401)\n\n"));
+        assert_eq!(line, "Error: invalid x-api-key REDACTED-ANTHROPIC-KEY (401)");
+        assert_eq!(last_line("auth failed: OPENAI_API_KEY=short-one\n"), "auth failed: OPENAI_API_KEY=<redacted>");
+        assert_eq!(last_line("Error: not logged in"), "Error: not logged in");
+        assert_eq!(last_line(""), "(no output)");
     }
 
     #[test]

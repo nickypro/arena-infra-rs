@@ -11,13 +11,17 @@
 //!   test catches and [`ready`] refuses at run time — never a silently unredacted bundle.
 //! - [`named_values`]: the whole value of anything *named* like a secret, whatever its shape (a
 //!   short password matches no pattern): `HF_TOKEN=…` and `MY_SECRET='x y'`, `--api-key …`,
-//!   JSON/YAML/Python fields (`"password": "a b"`, `'token': '…'`, `api_key: …`), `Bearer …`,
-//!   basic auth (`curl -u user:pass`, `--user user:pass`, `https://user:pass@…`). A value it
-//!   can't find the end of (an unclosed quote or bracket) makes the whole line [`LINE_MASK`].
+//!   JSON/YAML/Python fields (`"password": "a b"`, `'token': '…'`, `api_key: …`, `password:x`),
+//!   `Bearer …`, basic auth (`curl -u user:pass`, `--user user:pass`, `https://user:pass@…`), a
+//!   command's password option (`redis-cli -a …`, `sshpass -p …`, `mysql -p…`). A value it can't
+//!   find the end of (an unclosed quote or bracket), or whose quoting it can't tell, makes the
+//!   whole line [`LINE_MASK`]; in a log, the lines such a value runs on into go too
+//!   ([`CONT_MASK`]).
 //! - [`long_tokens`]: any run of 32 or more `[A-Za-z0-9_-]` — the shape of almost every API key,
-//!   session id and bearer token — becomes [`MASK`]. Applied to free text (process arguments,
-//!   log lines, commands, commit subjects), not to names (a branch, a file name), which can
-//!   legitimately run that long and carry no secret of their own.
+//!   session id and bearer token — becomes [`MASK`], and so does base64 key material
+//!   ([`base64_runs`]) and a private-key block ([`PEM_MASK`]). Applied to free text (process
+//!   arguments, log lines, commands, commit subjects), not to names (a branch, a file name), which
+//!   can legitimately run that long and carry no secret of their own.
 //!
 //! Everything here is pure.
 
@@ -35,8 +39,13 @@ pub const LONG_TOKEN: usize = 32;
 pub const PEM_MASK: &str = "<redacted: private key block>";
 
 /// What a line becomes when [`named_values`] finds a secret-named value it can't delimit (an
-/// unclosed quote or bracket: the value may run on past this line, so nothing of it is kept).
+/// unclosed quote or bracket: the value may run on past this line, so nothing of it is kept) or
+/// whose quoting it can't tell (an apostrophe before a quoted value: `Couldn't … PASSWORD='a b'`).
 pub const LINE_MASK: &str = "<redacted: a line holding a secret that couldn't be masked>";
+
+/// What a log's lines become where a secret's value runs on from a line above ([`log_tail`]): a
+/// YAML block scalar or a value on the lines below its name, an unclosed quote or bracket.
+pub const CONT_MASK: &str = "<redacted: a secret's value continued on these lines>";
 
 type Set = Box<[bool; 256]>;
 
@@ -374,13 +383,15 @@ pub fn long_tokens(text: &str) -> String {
 /// purpose — over-masking a harmless value costs a word in the prompt.
 fn secret_name(name: &str) -> bool {
     let n = name.trim_start_matches('-').to_ascii_lowercase();
-    ["token", "secret", "passw", "passwd", "pwd", "credential", "auth", "cookie", "apikey", "api_key", "api-key", "private"]
+    ["token", "secret", "passw", "passphrase", "pwd", "credential", "auth", "cookie", "apikey", "api_key", "api-key", "private"]
         .iter()
         .any(|w| n.contains(w))
         || n == "key"
         || n.ends_with("_key")
         || n.ends_with("-key")
         || n.ends_with(".key")
+        // `--pass`, `DB_PASS`, `redis.pass` — a word of its own, not `bypass` or `--num-passes`.
+        || n.split(['_', '-', '.']).any(|w| w == "pass")
 }
 
 /// A byte of a name: a variable, a flag (its leading `-`s too), a JSON/YAML key.
@@ -495,15 +506,76 @@ fn value_end(b: &[u8], at: usize, sep: Sep, enclosing: Option<u8>) -> Option<usi
     }
 }
 
+/// How a secret-named value runs on past its line — into a log's next lines ([`continuations`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Carry {
+    /// Nothing after the name on its line (`password:`, `"token":`), or a YAML block scalar
+    /// (`password: |-`): the next non-blank line is the value, and so is each line after it
+    /// indented deeper than the name's line (`indent`).
+    Below { indent: usize },
+    /// A quote the value opened that its line doesn't close: up to the line that does.
+    Quote(u8),
+    /// Brackets the value opened that its line doesn't close (`depth` still open): until they
+    /// balance.
+    Bracket(usize),
+    /// An end that can't be told: the rest of the window.
+    Rest,
+}
+
+/// A YAML block scalar's header as a whole value (`|`, `|-`, `>+`, `|2`, a comment after it).
+fn block_scalar(v: &str) -> bool {
+    let v = v.split(" #").next().unwrap_or("").trim();
+    let mut c = v.chars();
+    matches!(c.next(), Some('|' | '>')) && c.all(|c| matches!(c, '+' | '-' | '0'..='9'))
+}
+
+/// Brackets still open after `b` with `depth` open before it, quoted runs skipped (one that
+/// doesn't close ends the count there).
+fn depth_after(b: &[u8], mut depth: usize) -> usize {
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            q if quote_byte(q) => match quoted_end(b, i, true) {
+                Some(e) => {
+                    i = e;
+                    continue;
+                }
+                None => return depth.max(1),
+            },
+            _ => {}
+        }
+        i += 1;
+    }
+    depth
+}
+
+/// How a value starting at `b[v]` that doesn't end on its line runs on: to its quote, to its
+/// brackets' close, else to the end of the window.
+fn open_at(b: &[u8], v: usize) -> Carry {
+    match b[v] {
+        q if quote_byte(q) => Carry::Quote(q),
+        b'(' | b'[' | b'{' => Carry::Bracket(depth_after(&b[v..], 0).max(1)),
+        _ => Carry::Rest,
+    }
+}
+
 /// `text` with the value of every secret-named field masked whole: `NAME=value` (the value a
 /// shell word: `X='a b'` is all of `'a b'`), `name: value` and `"name": value` (JSON, YAML,
 /// a Python dict, a header — a quoted value to its closing quote, a bracketed one to its
-/// closing bracket, a bare one to the end of the line or the field). A `:` separates only
-/// after a quoted key or before a space or quote, so `auth.py:42:` and `https://` aren't
-/// fields. `None`: a secret-named value whose end can't be told.
-fn fields(text: &str) -> Option<String> {
+/// closing bracket, a bare one to the end of the line or the field), and `name:value` glued (a
+/// shell word, as after `=`). A `:` separates only after a quoted key, before a space or quote,
+/// or glued after a name with no `.` and before no `/`, so `auth.py:42:` and `https://` aren't
+/// fields. `Ok`: the text, and how a value runs on below it ([`Carry::Below`]). `Err`: a
+/// secret-named value whose end can't be told (and how it runs on), or whose quoting can't — an
+/// apostrophe earlier read as opening a quote (`Couldn't … PASSWORD='hunter two'`: review
+/// ai-review codex #1) — the whole line is to go.
+fn fields(text: &str) -> Result<(String, Option<Carry>), Option<Carry>> {
     let b = text.as_bytes();
     let states = quote_states(b);
+    let indent = b.iter().take_while(|c| c.is_ascii_whitespace()).count();
+    let mut carry = None;
     let mut out = String::with_capacity(text.len());
     let (mut i, mut copied) = (0, 0);
     while i < b.len() {
@@ -529,6 +601,7 @@ fn fields(text: &str) -> Option<String> {
             (Some(b':'), Some(b'=')) => Some((Sep::Equals, k + 2)),
             (Some(b':'), _) if quoted => Some((Sep::ColonQuoted, k + 1)),
             (Some(b':'), next) if next.is_none_or(|&c| c == b' ' || quote_byte(c)) => Some((Sep::Colon, k + 1)),
+            (Some(b':'), Some(&c)) if k == j && c != b'/' && !c.is_ascii_whitespace() && !text[start..j].contains('.') => Some((Sep::Equals, k + 1)),
             _ => None,
         };
         let Some((sep, after)) = sep else {
@@ -544,11 +617,27 @@ fn fields(text: &str) -> Option<String> {
         while v < b.len() && b[v] == b' ' {
             v += 1;
         }
-        if v >= b.len() || Some(b[v]) == enclosing {
+        if v >= b.len() {
+            // Nothing after the name: a YAML or JSON value is on the lines below.
+            if sep != Sep::Equals {
+                carry = Some(Carry::Below { indent });
+            }
             i = v;
             continue;
         }
-        let end = value_end(b, v, sep, enclosing)?;
+        if Some(b[v]) == enclosing {
+            // The quote around the name closes right after it — an empty value (`echo "TOKEN="`)
+            // — unless a value follows: then the quoting can't be told.
+            if b.get(v + 1).is_none_or(|c| c.is_ascii_whitespace() || matches!(c, b';' | b',' | b')' | b'}' | b']')) {
+                i = v;
+                continue;
+            }
+            return Err(quoted_end(b, v, true).is_none().then_some(Carry::Quote(b[v])));
+        }
+        if sep != Sep::Equals && block_scalar(&text[v..]) {
+            carry = Some(Carry::Below { indent });
+        }
+        let Some(end) = value_end(b, v, sep, enclosing) else { return Err(Some(open_at(b, v))) };
         if end > v {
             out.push_str(&text[copied..v]);
             out.push_str(MASK);
@@ -557,7 +646,7 @@ fn fields(text: &str) -> Option<String> {
         i = end.max(v + 1);
     }
     out.push_str(&text[copied..]);
-    Some(out)
+    Ok((out, carry))
 }
 
 /// What the previous word asks of the next one.
@@ -588,15 +677,29 @@ fn attached_user(word: &str) -> Option<String> {
     value.contains(':').then(|| format!("{flag}{MASK}"))
 }
 
+/// The short option a command takes its password with (review ai-review codex #2, claude #7):
+/// `redis-cli -a PASS`, `sshpass -p PASS`, mysql's `-pPASS` — and `-p NAME`, there the database,
+/// masked all the same. `word`: the program, as typed (a path too).
+fn password_flag(word: &str) -> Option<&'static str> {
+    match word.rsplit('/').next().unwrap_or(word) {
+        "redis-cli" => Some("-a"),
+        "sshpass" => Some("-p"),
+        "mysql" | "mysqldump" | "mysqladmin" | "mysqlimport" | "mysqlshow" | "mysqlcheck" | "mariadb" | "mariadb-dump" | "mariadb-admin" => Some("-p"),
+        _ => None,
+    }
+}
+
 /// `text` with the word after a secret-named flag (`--api-key x`, `--password "a b"`: the
-/// value a shell word, quotes and all), after `Bearer` or `Authorization: Basic`, and basic
-/// auth (`-u user:pass`, `--user user:pass`, either glued, the credentials in a URL) masked.
-/// Whitespace is kept as it was. `None`: a value opens a quote that never closes.
-fn flag_values(text: &str) -> Option<String> {
+/// value a shell word, quotes and all), after `Bearer` or `Authorization: Basic`, after a
+/// command's password option ([`password_flag`], glued too), and basic auth (`-u user:pass`,
+/// `--user user:pass`, either glued, the credentials in a URL) masked. Whitespace is kept as it
+/// was. `Err`: a value opens a quote that never closes (and how it runs on).
+fn flag_values(text: &str) -> Result<String, Option<Carry>> {
     let b = text.as_bytes();
     let states = quote_states(b);
     let mut out = String::with_capacity(text.len());
     let (mut next, mut after_authorization) = (Next::Keep, false);
+    let mut tool: Option<&'static str> = None;
     let mut i = 0;
     while i < b.len() {
         if b[i].is_ascii_whitespace() {
@@ -608,7 +711,7 @@ fn flag_values(text: &str) -> Option<String> {
         let end = b[i..].iter().position(u8::is_ascii_whitespace).map_or(b.len(), |n| i + n);
         let word = &text[i..end];
         if next != Next::Keep && !word.starts_with('-') {
-            let value_end = shell_value_end(b, i, states[i])?;
+            let Some(value_end) = shell_value_end(b, i, states[i]) else { return Err(Some(open_at(b, i))) };
             let value = &text[i..value_end];
             out.push_str(if next == Next::Secret || value.contains(':') { MASK } else { value });
             next = Next::Keep;
@@ -619,25 +722,48 @@ fn flag_values(text: &str) -> Option<String> {
         let basic = after_authorization && bare.eq_ignore_ascii_case("basic");
         after_authorization = bare.eq_ignore_ascii_case("authorization");
         next = Next::Keep;
+        let glued = tool.filter(|f| word.strip_prefix(f).is_some_and(|v| !v.is_empty()));
         if let Some(masked) = url_credentials(word).or_else(|| attached_user(word)) {
             out.push_str(&masked);
+        } else if let Some(flag) = glued {
+            out.push_str(flag);
+            out.push_str(MASK);
         } else {
             out.push_str(word);
-            if (word.starts_with('-') && !word.contains('=') && secret_name(word)) || basic || bare.eq_ignore_ascii_case("bearer") {
+            let secret_flag = word.starts_with('-') && !word.contains('=') && secret_name(word);
+            if secret_flag || basic || bare.eq_ignore_ascii_case("bearer") || tool == Some(word) {
                 next = Next::Secret;
             } else if matches!(word, "-u" | "--user" | "--proxy-user") {
                 next = Next::UserPass;
             }
         }
+        // The command each word belongs to, for its password option: the last program named,
+        // until a command ends.
+        if let Some(flag) = password_flag(word) {
+            tool = Some(flag);
+        } else if word.ends_with([';', '&', '|']) {
+            tool = None;
+        }
         i = end;
     }
-    Some(out)
+    Ok(out)
 }
 
 /// `text` with the values of secret-named things masked whole ([`fields`], then
 /// [`flag_values`]) — or, when one can't be delimited, [`LINE_MASK`] in place of all of it.
 pub fn named_values(text: &str) -> String {
-    fields(text).and_then(|t| flag_values(&t)).unwrap_or_else(|| LINE_MASK.to_string())
+    masked(text).0
+}
+
+/// [`named_values`]' text, and how a value in it runs on past the line ([`Carry`]).
+fn masked(text: &str) -> (String, Option<Carry>) {
+    match fields(text) {
+        Err(carry) => (LINE_MASK.to_string(), carry),
+        Ok((t, carry)) => match flag_values(&t) {
+            Ok(t) => (t, carry),
+            Err(c) => (LINE_MASK.to_string(), c.or(carry)),
+        },
+    }
 }
 
 /// One line of pod text made safe to show and send: line breaks and tabs are spaces, other
@@ -675,14 +801,74 @@ pub fn name(s: &str, max: usize) -> String {
 }
 
 /// Free text from a pod (a process's arguments, a log line, a command, a commit subject) for
-/// the prompt: [`name`]'s treatment, then the secret-named values ([`named_values`]) and any
-/// long token ([`long_tokens`]) masked, then clipped to `max` characters.
+/// the prompt: [`name`]'s treatment, then a private-key block in it ([`pem_inline`]), the
+/// secret-named values ([`named_values`]), base64 key material ([`base64_runs`]) and any long
+/// token ([`long_tokens`]) masked, then clipped to `max` characters. (The heuristics a log gets
+/// across its lines — [`log_tail`] — work on one line here too: a key pasted into a command's
+/// arguments is on one; review ai-review claude #7.)
 pub fn text(s: &str, max: usize) -> String {
-    crate::fleet::clip(&long_tokens(&named_values(&secrets(&one_line(&secrets(s))))), max)
+    crate::fleet::clip(&long_tokens(&base64_runs(&named_values(&pem_inline(&secrets(&one_line(&secrets(s))))))), max)
 }
 
-/// The shortest line [`base64_like`] takes for key material.
+/// The shortest line [`base64_like`] takes for key material, and the shortest run
+/// [`base64_runs`] masks.
 pub const BASE64_LINE: usize = 40;
+
+/// `s` (one line) with each private-key block in it — `-----BEGIN … PRIVATE KEY-----` through its
+/// `-----END …-----`, or to the end — as [`PEM_MASK`].
+fn pem_inline(s: &str) -> String {
+    const BEGIN: &str = "-----BEGIN";
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(at) = rest.find(BEGIN) {
+        let after = at + BEGIN.len();
+        let head_end = rest[after..].find("-----").map(|e| after + e + 5);
+        if !rest[at..head_end.unwrap_or(rest.len())].contains("PRIVATE KEY") {
+            out.push_str(&rest[..after]);
+            rest = &rest[after..];
+            continue;
+        }
+        out.push_str(&rest[..at]);
+        out.push_str(PEM_MASK);
+        let body = &rest[head_end.unwrap_or(rest.len())..];
+        rest = body.find("-----END").and_then(|e| body[e + 8..].find("-----").map(|x| &body[e + 8 + x + 5..])).unwrap_or("");
+    }
+    out.push_str(rest);
+    out
+}
+
+fn base64_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=')
+}
+
+/// `text` with every run of [`BASE64_LINE`] or more of `[A-Za-z0-9+/=]` holding an upper- and a
+/// lower-case letter and a digit — base64 key material, which `+` and `/` keep under
+/// [`LONG_TOKEN`]'s runs — replaced by [`MASK`]. A path is rarely all three (and its `.`, `-`
+/// and `_` end a run); a hex hash has no upper case.
+pub fn base64_runs(text: &str) -> String {
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let (mut i, mut copied) = (0, 0);
+    while i < b.len() {
+        if !base64_byte(b[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < b.len() && base64_byte(b[i]) {
+            i += 1;
+        }
+        let run = &b[start..i];
+        let mixed = run.iter().any(u8::is_ascii_uppercase) && run.iter().any(u8::is_ascii_lowercase) && run.iter().any(u8::is_ascii_digit);
+        if run.len() >= BASE64_LINE && mixed {
+            out.push_str(&text[copied..start]);
+            out.push_str(MASK);
+            copied = i;
+        }
+    }
+    out.push_str(&text[copied..]);
+    out
+}
 
 /// Whether a log line looks like a line of base64 key material: [`BASE64_LINE`] or more of
 /// `[A-Za-z0-9+/=]` and nothing else (surrounding whitespace aside).
@@ -737,23 +923,74 @@ fn drop_leading_base64(lines: &mut Vec<String>) -> usize {
     n
 }
 
+/// The leading spaces and tabs of `l`.
+fn indent_of(l: &str) -> usize {
+    l.bytes().take_while(|c| *c == b' ' || *c == b'\t').count()
+}
+
+/// `lines` with every line a secret's value runs on into ([`Carry`], from the line above) as
+/// one [`CONT_MASK`] line a run (review ai-review codex #3): a YAML block scalar
+/// (`password: |-`) or a value on the lines below its name (`"password":`) — the next non-blank
+/// line, and each after it indented deeper than the name; an unclosed quote — through the line
+/// that closes it; unbalanced brackets — until they balance; an end that can't be told — the
+/// rest of the window. Lines masked whole already ([`PEM_MASK`]) are left as they are.
+fn continuations(lines: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let (mut carry, mut first) = (None, false);
+    for l in lines {
+        if let Some(c) = carry {
+            let hidden = match c {
+                Carry::Below { .. } if l.trim().is_empty() => true,
+                Carry::Below { indent } => {
+                    let below = first || indent_of(&l) > indent;
+                    first = false;
+                    below
+                }
+                Carry::Quote(q) => {
+                    if l.as_bytes().contains(&q) {
+                        carry = None;
+                    }
+                    true
+                }
+                Carry::Bracket(depth) => {
+                    let d = depth_after(l.as_bytes(), depth);
+                    carry = (d > 0).then_some(Carry::Bracket(d));
+                    true
+                }
+                Carry::Rest => true,
+            };
+            if hidden {
+                if out.last().map(String::as_str) != Some(CONT_MASK) {
+                    out.push(CONT_MASK.to_string());
+                }
+                continue;
+            }
+        }
+        carry = if l == PEM_MASK { None } else { masked(&crate::jobs::sanitize(&l)).1 };
+        first = true;
+        out.push(l);
+    }
+    out
+}
+
 /// A log's last `keep` lines for the prompt, from `lines` — the whole window read (the remote
 /// read's last bytes; `starts_cut`: it begins part-way into the log, its partial first line
 /// already gone). Private-key blocks are masked over the whole window **first** ([`pem_blocks`]),
-/// so neither cut can keep a key's body without the header that marks it; then at each cut —
-/// the window's start when `starts_cut`, and the `keep`-line cut — leading base64-looking
-/// lines are dropped ([`drop_leading_base64`]): a key printed without its armour, or one whose
-/// END is past the window. Each line left goes through [`text`]. The lines, and how many older
-/// lines of the window aren't shown.
+/// so neither cut can keep a key's body without the header that marks it, and so are a secret's
+/// values that run on over lines ([`continuations`]); then at each cut — the window's start when
+/// `starts_cut`, and the `keep`-line cut — leading base64-looking lines are dropped
+/// ([`drop_leading_base64`]): a key printed without its armour, or one whose END is past the
+/// window. Each line left goes through [`text`]. The lines, and how many older lines of the
+/// window aren't shown.
 pub fn log_tail(lines: &[String], starts_cut: bool, keep: usize, max: usize) -> (Vec<String>, usize) {
-    let mut v = pem_blocks(lines, starts_cut);
+    let mut v = continuations(pem_blocks(lines, starts_cut));
     let mut hidden = if starts_cut { drop_leading_base64(&mut v) } else { 0 };
     let over = v.len().saturating_sub(keep);
     if over > 0 {
         v.drain(..over);
         hidden += over + drop_leading_base64(&mut v);
     }
-    let shown = v.into_iter().map(|l| if l == PEM_MASK { l } else { text(&l, max) }).collect();
+    let shown = v.into_iter().map(|l| if l == PEM_MASK || l == CONT_MASK { l } else { text(&l, max) }).collect();
     (shown, hidden)
 }
 
@@ -954,6 +1191,100 @@ pub(crate) mod tests {
         ];
         for (input, want) in cases {
             assert_eq!(named_values(input), want, "{input}");
+        }
+    }
+
+    /// Review ai-review codex #1-#2, claude #7, the exact examples and their kin: ambiguous
+    /// quoting takes the line; a command's password option is masked (glued too) — only after
+    /// that command, until a `;`, `&` or `|` ends it; `pass`, `passphrase` and `pwd` are secret names; `name:value` glued is a field
+    /// unless the name has a `.` or a `/` follows (a file's line, a URL).
+    #[test]
+    fn short_password_options_glued_values_and_ambiguous_quotes() {
+        let cases = [
+            ("Couldn't connect with PASSWORD='hunter two'", LINE_MASK),
+            ("Couldn't connect: password: 'hunter two'", LINE_MASK),
+            ("it's set: echo 'TOKEN='abc", LINE_MASK),
+            ("Couldn't connect with PASSWORD=\"hunter two\" (retrying)", "Couldn't connect with PASSWORD=<redacted> (retrying)"),
+            ("redis-cli -a cohort-db-pass ping", "redis-cli -a <redacted> ping"),
+            ("/usr/bin/redis-cli -h db -a 'two words' ping", "/usr/bin/redis-cli -h db -a <redacted> ping"),
+            ("sshpass -p cohort-login-pass ssh root@10.0.0.1", "sshpass -p <redacted> ssh root@10.0.0.1"),
+            ("sshpass -pPASS ssh x", "sshpass -p<redacted> ssh x"),
+            ("mysql -h db -u root -pPASS app", "mysql -h db -u root -p<redacted> app"),
+            ("mysql -u root -p PASS", "mysql -u root -p <redacted>"),
+            ("cd /x && mysqldump -psecret db > d.sql", "cd /x && mysqldump -p<redacted> db > d.sql"),
+            ("gpg --batch --passphrase X --decrypt f", "gpg --batch --passphrase <redacted> --decrypt f"),
+            ("tool --pass hunter2 --v", "tool --pass <redacted> --v"),
+            ("DB_PASS=hunter2 MYSQL_PWD=x2 run", "DB_PASS=<redacted> MYSQL_PWD=<redacted> run"),
+            ("password:hunter2", "password:<redacted>"),
+            ("INFO token:abc def", "INFO token:<redacted> def"),
+            // Look-alikes, kept: the option without its command, another command's, words.
+            ("ls -a -p dir", "ls -a -p dir"),
+            ("ps -p 123; redis-cli ping", "ps -p 123; redis-cli ping"),
+            ("mysql -e 'show tables'; ps -p 4", "mysql -e 'show tables'; ps -p 4"),
+            ("bypass=1 --num-passes 3 compass: north", "bypass=1 --num-passes 3 compass: north"),
+            ("auth.py:42: warning", "auth.py:42: warning"),
+            ("see https://github.com/x and C:\\data", "see https://github.com/x and C:\\data"),
+            ("at 12:30:45 INFO:root:started", "at 12:30:45 INFO:root:started"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(named_values(input), want, "{input}");
+        }
+        // Through `text`, a short password is gone from each.
+        for line in ["Couldn't connect with PASSWORD='hunter two'", "redis-cli -a hunter2 ping", "sshpass -p hunter2 ssh h", "mysql -phunter2", "password:hunter2"] {
+            assert!(!text(line, 200).contains("hunter"), "{line}");
+        }
+    }
+
+    /// Review ai-review codex #3: a value that runs on over a log's lines — a YAML block scalar
+    /// after a secret's name, a YAML or JSON value on the line after it, an unclosed quote or
+    /// bracket — is masked on every line it takes, as one [`CONT_MASK`] line; the lines after it
+    /// are kept. One that never closes takes the rest of the window.
+    #[test]
+    fn a_secret_value_over_several_lines_is_masked_on_each() {
+        let tail = |lines: &[&str]| log_tail(&strings(lines), false, 40, 200).0;
+        assert_eq!(tail(&["password: |-", "  cohort-db-pass", "next"]), strings(&["password: <redacted>", CONT_MASK, "next"]));
+        assert_eq!(
+            tail(&["db:", "  password: >", "    cohort db", "", "    pass", "  user: bob", "done"]),
+            strings(&["db:", "password: <redacted>", CONT_MASK, "user: bob", "done"])
+        );
+        assert_eq!(tail(&["password:", "  hunter2", "user: x"]), strings(&["password:", CONT_MASK, "user: x"]));
+        assert_eq!(
+            tail(&["{", "  \"password\":", "  \"hunter2\",", "  \"user\": \"bob\"", "}"]),
+            strings(&["{", "\"password\":", CONT_MASK, "\"user\": \"bob\"", "}"])
+        );
+        assert_eq!(tail(&["MY_SECRET=\"first part", "second part\"", "after"]), strings(&[LINE_MASK, CONT_MASK, "after"]));
+        assert_eq!(tail(&["--password 'a", "b", "c' --lr 1", "after"]), strings(&[LINE_MASK, CONT_MASK, "after"]));
+        assert_eq!(
+            tail(&["\"credentials\": {", "  \"u\": \"a\",", "  \"p\": {\"x\": \"b c\"}", "}", "done"]),
+            strings(&[LINE_MASK, CONT_MASK, "done"])
+        );
+        assert_eq!(tail(&["TOKEN=\"never closed", "x", "y"]), strings(&[LINE_MASK, CONT_MASK]));
+        // Not a secret's: nothing hidden.
+        let plain = ["name: |", "some text", "message: \"open", "more\"", "done"];
+        assert_eq!(tail(&plain), strings(&plain));
+        // Hidden from every shape: no fragment of a value on a line below.
+        let all = tail(&["api_key: |", "  Qx7alpha", "\"token\":", "\"Qx7bravo\"", "PASSWORD='x", "Qx7charlie'", "end"]);
+        assert!(!all.join("\n").contains("Qx7"), "{all:?}");
+    }
+
+    /// Review ai-review claude #7: a private key or base64 key material pasted into a process's
+    /// arguments (one line, where the log's line heuristics don't reach) is masked; a path, a
+    /// hex hash and short words are not.
+    #[test]
+    fn a_key_in_one_lines_arguments_is_masked() {
+        let body = key_body(3, 4);
+        let pem = format!("ssh-add - <<< '-----BEGIN OPENSSH PRIVATE KEY----- {} -----END OPENSSH PRIVATE KEY-----' && run", body.join(" "));
+        let out = text(&pem, 2000);
+        assert!(out.starts_with("ssh-add - <<< '<redacted: private key block>' && run"), "{out}");
+        no_body_in(&[out], &body);
+        let cut = text(&format!("echo -----BEGIN RSA PRIVATE KEY----- {}", body[0]), 2000);
+        assert_eq!(cut, "echo <redacted: private key block>");
+        assert_eq!(text("-----BEGIN CERTIFICATE----- x", 200), "-----BEGIN CERTIFICATE----- x", "not a private key");
+        let args = format!("python sign.py --key-material {} --out x", body[1]);
+        let out = text(&args, 2000);
+        assert_eq!(out, format!("python sign.py --key-material {MASK} --out x"));
+        for kept in ["/usr/lib/python3/dist/site/packages/torch/lib/libtorch/x", "0123456789abcdef0123456789abcdef01234567", "a b c"] {
+            assert_eq!(base64_runs(kept), kept);
         }
     }
 

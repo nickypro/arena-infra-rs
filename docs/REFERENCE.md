@@ -1273,15 +1273,21 @@ Every text field is masked through the backup's own key patterns
 (`arena_core::backup::SECRET_PATTERNS`: OpenRouter, Anthropic incl. Claude Code tokens, OpenAI,
 Hugging Face, GitHub, Google, Groq, AWS — the same replacements, `REDACTED-…`). Also masked: the
 whole value of anything named like a secret (`HF_TOKEN=…` and `MY_SECRET='x y'`, `--api-key …`,
-JSON/YAML/Python-dict fields such as `"password": "a b"` or `api_key: …`, `Authorization: …`,
-`Bearer …`, basic auth: `curl -u user:pass`, `--user user:pass`, `https://user:pass@…`) — a line
-whose secret value can't be delimited (an unclosed quote or bracket) is replaced whole — any run of
-32+ `[A-Za-z0-9_-]` in arguments, commands, commit subjects and log lines (`<redacted>`), and a
-private-key block in a log — masked over the whole 16 KB read before its last 40 lines are taken, so
-neither cut can keep a key's body without its header; at the start of a cut window, lines that look
-like base64 key material (40+ of `[A-Za-z0-9+/=]`, nothing else) are dropped. Each pod's part is at
-most 6 KB (less when many pods share a prompt: 240 KB in all), trimmed from the log's oldest lines
-first.
+`--pass`/`--passphrase …`, `DB_PASS`, `MYSQL_PWD`, JSON/YAML/Python-dict fields such as `"password":
+"a b"` or `api_key: …`, `password:x` glued, `Authorization: …`, `Bearer …`, basic auth: `curl -u
+user:pass`, `--user user:pass`, `https://user:pass@…`) and a command's own password option
+(`redis-cli -a …`, `sshpass -p …`, mysql's `-p…`, glued or not) — a line whose secret value can't be
+delimited (an unclosed quote or bracket) or whose quoting can't be told (`Couldn't … PASSWORD='a
+b'`) is replaced whole, and in a log so is every line such a value runs on into (a YAML block
+scalar, a value on the line after its name, a quote or bracket closed lines later) — any run of 32+
+`[A-Za-z0-9_-]` in arguments, commands, commit subjects and log lines (`<redacted>`), any run of 40+
+of `[A-Za-z0-9+/=]` with upper case, lower case and digits (base64 key material), and a private-key
+block, in an argument list or a log — in a log masked over the whole 16 KB read before its last 40
+lines are taken, so neither cut can keep a key's body without its header; at the start of a cut
+window, lines that look like base64 key material (40+ of `[A-Za-z0-9+/=]`, nothing else) are
+dropped. The AI CLI's own error line, printed and saved when it fails, is masked the same way. Each
+pod's part is at most 6 KB (less when many pods share a prompt: 240 KB in all), trimmed from the
+log's oldest lines first.
 
 **Framing a pod can't forge.** Each pod's reply is framed by marker lines carrying a random nonce of
 that call's own, and so is every line of the small probe's: pod text that runs over lines (a path,
