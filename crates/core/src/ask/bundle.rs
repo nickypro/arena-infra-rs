@@ -179,6 +179,7 @@ pub struct Repo {
     pub files: Vec<String>,
     /// The last commit: committer time (unix) and subject.
     pub last: Option<(u64, String)>,
+    /// The branch's upstream; `Some("")` = none (git says there is none), `None` = unknown.
     pub upstream: Option<String>,
     pub stashes: Option<u32>,
 }
@@ -217,13 +218,16 @@ pub struct Login {
     pub line: String,
 }
 
-/// A list the probe read (`ok`, its items), couldn't (`absent`: not installed; anything else),
-/// or didn't say (`None`: unknown).
+/// What a list the probe couldn't read says: unknown, and why — never read as an empty list.
+const UNREAD: &str = "unknown (couldn't be read)";
+
+/// A list the probe read (`ok`, its items), couldn't (`absent`: not installed; anything else:
+/// [`UNREAD`]), or didn't say (`None`: unknown).
 fn listed<T>(state: Option<&str>, items: Vec<T>) -> Option<Result<Vec<T>, String>> {
     match state {
         Some("ok") => Some(Ok(items)),
         Some("absent") => Some(Err("not installed".to_string())),
-        Some(_) => Some(Err("couldn't be read".to_string())),
+        Some(_) => Some(Err(UNREAD.to_string())),
         None => None,
     }
 }
@@ -423,7 +427,11 @@ pub fn parse_extra(text: &str, nonce: &str) -> Extra {
                 untracked: status_ok.then(|| get("untracked").and_then(number)).flatten(),
                 files: if status_ok { files.into_iter().take(FILES_SHOWN).collect() } else { Vec::new() },
                 last,
-                upstream: get("upstream").map(String::from),
+                upstream: match raw("upstream") {
+                    Some("-") => Some(String::new()),
+                    Some(v) if !v.is_empty() => Some(v.to_string()),
+                    _ => None,
+                },
                 stashes: get("stashes").and_then(number),
             }))
         }
@@ -450,14 +458,14 @@ pub fn parse_extra(text: &str, nonce: &str) -> Extra {
         tmux: match get("tmux") {
             Some("ok") => Some(Ok(tmux.into_iter().take(20).collect())),
             Some("absent") => Some(Err("not installed".to_string())),
-            Some(_) => Some(Err("couldn't be read".to_string())),
+            Some(_) => Some(Err(UNREAD.to_string())),
             None => None,
         },
         procs: match get("ps") {
             // Lines that don't read as processes, and none that do: garbled, not "none".
-            Some("ok") if ps.is_empty() && bad_ps > 0 => Some(Err("couldn't be read".to_string())),
+            Some("ok") if ps.is_empty() && bad_ps > 0 => Some(Err(UNREAD.to_string())),
             Some("ok") => Some(Ok(ps)),
-            Some(_) => Some(Err("ps unavailable".to_string())),
+            Some(_) => Some(Err(format!("{UNKNOWN} (ps unavailable)"))),
             None => None,
         },
         git,
@@ -865,7 +873,11 @@ fn repo_blocks(repo_path: &str, m: Option<&PodMetrics>, x: Option<&Extra>, local
     let mut head = Vec::new();
     let real = repo.real.as_deref().filter(|r| *r != repo_path).map(|r| format!(" (really {})", redact::name(r, NAME_MAX))).unwrap_or_default();
     let branch = repo.branch.as_deref().map_or(UNKNOWN.to_string(), |b| redact::name(b, NAME_MAX));
-    let upstream = repo.upstream.as_deref().map_or("none".to_string(), |u| redact::name(u, NAME_MAX));
+    let upstream = match repo.upstream.as_deref() {
+        Some("") => "none".to_string(),
+        Some(u) => redact::name(u, NAME_MAX),
+        None => UNKNOWN.to_string(),
+    };
     head.push(format!("repo {path}{real}: branch {branch} · upstream {upstream} · origin {origin} · {sync}"));
     let op = match repo.op.as_deref() {
         Some("") => "none".to_string(),
@@ -952,7 +964,8 @@ fn procs_block(x: Option<&Extra>) -> Block {
                 false,
             )
         }
-        Some(Ok(_)) => Block::fixed(vec!["processes: none listed".into()]),
+        // There's always one: this probe's own session. None listed is a listing that failed.
+        Some(Ok(_)) => Block::fixed(vec![format!("processes: {UNKNOWN} (ps listed none, not even this probe's own session)")]),
         Some(Err(why)) => Block::fixed(vec![format!("processes: {why}")]),
         None => Block::fixed(vec![format!("processes: {UNKNOWN}")]),
     }
@@ -974,7 +987,7 @@ fn jobs_blocks(r: &Reply) -> Vec<Block> {
             2,
             false,
         )),
-        Some(Err(e)) => v.push(Block::fixed(vec![format!("jobs: couldn't be read ({})", redact::text(e, NAME_MAX))])),
+        Some(Err(e)) => v.push(Block::fixed(vec![format!("jobs: {UNKNOWN} (couldn't be read: {})", redact::text(e, NAME_MAX))])),
         None => v.push(Block::fixed(vec![format!("jobs: {UNKNOWN}")])),
     }
     match &r.log {
@@ -994,7 +1007,7 @@ fn jobs_blocks(r: &Reply) -> Vec<Block> {
         }
         // No jobs (or no such job): the jobs line already says so.
         Some(Ok(_)) => {}
-        Some(Err(e)) => v.push(Block::fixed(vec![format!("newest job's log: couldn't be read ({})", redact::text(e, NAME_MAX))])),
+        Some(Err(e)) => v.push(Block::fixed(vec![format!("newest job's log: {UNKNOWN} (couldn't be read: {})", redact::text(e, NAME_MAX))])),
         None => v.push(Block::fixed(vec![format!("newest job's log: {UNKNOWN}")])),
     }
     v
@@ -1257,9 +1270,9 @@ mod tests {
             t("ARENA_ASK git=ok\nARENA_ASK_PS x y z\nARENA_ASK ps=ok\nARENA_ASK uptime=12abc\n")
         );
         let text = bundle(&junk, BUNDLE_CAP);
-        assert!(text.contains("jobs: couldn't be read") && text.contains("newest job's log: couldn't be read"), "{text}");
+        assert!(text.contains("jobs: unknown (couldn't be read: ") && text.contains("newest job's log: unknown (couldn't be read: "), "{text}");
         assert!(text.contains("machine up unknown") && text.contains("working tree: unknown modified/staged"), "{text}");
-        assert!(text.contains("processes: couldn't be read"), "a garbled ps line isn't \"none\": {text}");
+        assert!(text.contains("processes: unknown (couldn't be read)"), "a garbled ps line isn't \"none\": {text}");
         assert!(!text.contains('\u{1b}') && !text.contains('\u{0}'), "{text:?}");
         // Not our reply at all.
         assert_eq!(parse_reply("bash: sh: command not found\n", NONCE).err(), Some(NotReply::Missing));
@@ -1781,7 +1794,7 @@ mod tests {
         assert_eq!((g.modified, g.untracked, g.op.as_deref(), g.stashes), (Some(2), Some(1), Some("merge"), Some(0)), "{stdout}");
         assert_eq!(g.files, [" M a.py", " M b.py", "?? notes.txt"]);
         assert_eq!(g.last.as_ref().map(|(_, s)| s.as_str()), Some("first"));
-        assert_eq!(g.upstream, None);
+        assert_eq!(g.upstream.as_deref(), Some(""), "no upstream: none, not unknown");
         assert!(x.df_root.is_some() && x.home_kb.is_some() && x.uptime.is_some() && x.nvidia_smi.is_some(), "{x:?}");
         assert_eq!(x.home.as_deref(), Some(home.display().to_string().as_str()));
         let ps = x.procs.as_ref().unwrap().as_ref().unwrap();
@@ -1846,7 +1859,7 @@ mod tests {
         assert!(matches!(&r.jobs, Some(Ok(j)) if j.is_empty()) && matches!(&r.log, Some(Ok(ReadReply::NoJobs))), "{stdout}");
         let x = r.extra.as_ref().unwrap();
         assert!(x.done && x.df_root.is_some() && x.uptime.is_some() && matches!(&x.procs, Some(Ok(p)) if !p.is_empty()), "{x:?}");
-        assert!(!matches!(&x.git, Some(Git::Repo(_))), "{x:?}");
+        assert_eq!(x.git, None, "a git that couldn't answer is unknown, never \"not a checkout\": {x:?}");
         let m = r.metrics.as_ref().unwrap();
         assert_eq!((m.branch.as_deref(), m.origin.as_deref(), m.dirty_files), (None, None, None), "{stdout}");
         assert!(m.cpu_pct.is_some() && m.host_mem_summary().is_some(), "the metrics after its repo part: {stdout}");
@@ -1986,6 +1999,82 @@ mod tests {
         // The stub does follow the zone it's given: London's own clock read 13:00.
         let there = Command::new("sh").arg("-c").arg(at).env("TZ", london).output().unwrap();
         assert_eq!(String::from_utf8_lossy(&there.stdout).trim(), "Oct 19 13:00");
+    }
+
+    /// Review ai-review claude #11 (lane ASK7 item K): what the probe couldn't read is `unknown`,
+    /// never "none" or 0. A stub git answering some calls and failing the rest as `timeout` does
+    /// (124): the operation in progress, the upstream, the stash count and the working tree read
+    /// unknown; git's own answers — no upstream (128), no stash, nothing unmerged — read none and
+    /// 0; a toplevel git couldn't read is unknown, a "not a git repository" (128) not a checkout.
+    /// tmux with no uid to find its socket directory by: unknown, not "no sessions"; a process
+    /// listing with nothing in it (there's always the probe's own session): unknown.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn what_the_probe_couldnt_read_is_unknown_never_none() {
+        use crate::ask::ai::fixtures::stub;
+        use std::process::Command;
+        let t = crate::ask::ai::tests::Tmp::new("unknown");
+        let (bin, home) = (t.0.join("bin"), t.0.join("home"));
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let git = |toplevel: &str, upstream: &str, stash: &str, unmerged: &str| {
+            format!(
+                "while [ $# -gt 0 ]; do case $1 in --no-optional-locks) shift ;; -c) shift 2 ;; *) break ;; esac; done\n\
+                 case \"$*\" in\n\
+                 'rev-parse --show-toplevel') {toplevel} ;;\n\
+                 'rev-parse --abbrev-ref HEAD') echo main ;;\n\
+                 'rev-parse --absolute-git-dir') echo \"$PWD/.git\" ;;\n\
+                 'ls-files -u') {unmerged} ;;\n\
+                 'config --name-only --get-regexp ^filter[.]') exit 1 ;;\n\
+                 'log -1 --format=%ct %s') echo '1792403200 subject' ;;\n\
+                 'rev-parse --abbrev-ref @{{u}}') {upstream} ;;\n\
+                 'stash list') {stash} ;;\n\
+                 *) exit 124 ;;\n\
+                 esac"
+            )
+        };
+        let probe = |git: String| {
+            stub(&bin, "git", &git);
+            let o = Command::new("sh")
+                .arg("-c")
+                .arg(probe_script())
+                .args(["arena-ask-probe", &repo.display().to_string(), NONCE])
+                .env_clear()
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .env("HOME", &home)
+                .output()
+                .unwrap();
+            parse_extra(&String::from_utf8_lossy(&o.stdout), NONCE)
+        };
+        let shown = |x: &Extra| render_blocks(&repo_blocks("/r", None, Some(x), &Local::default(), NOW));
+        // Timed out (124) past the branch: each fact unknown.
+        let x = probe(git("pwd", "exit 124", "exit 124", "exit 124"));
+        let Some(Git::Repo(r)) = &x.git else { panic!("{x:?}") };
+        assert_eq!((r.branch.as_deref(), r.op.as_deref(), r.upstream.as_deref(), r.stashes, r.modified), (Some("main"), None, None, None, None), "{x:?}");
+        let text = shown(&x);
+        for want in ["upstream unknown ·", "working tree: unknown modified/staged, unknown untracked · operation in progress: unknown · stashes unknown"] {
+            assert!(text.contains(want), "missing {want:?} in\n{text}");
+        }
+        // git's own answers: none, and 0.
+        let x = probe(git("pwd", "echo 'fatal: no upstream configured' >&2; exit 128", "true", "true"));
+        let Some(Git::Repo(r)) = &x.git else { panic!("{x:?}") };
+        assert_eq!((r.op.as_deref(), r.upstream.as_deref(), r.stashes), (Some(""), Some(""), Some(0)), "{x:?}");
+        let text = shown(&x);
+        assert!(text.contains("upstream none ·") && text.contains("operation in progress: none · stashes 0"), "{text}");
+        // The toplevel: git's own "not a repository" vs a git that couldn't answer.
+        assert_eq!(probe(git("exit 128", "true", "true", "true")).git, Some(Git::NotRepo));
+        assert_eq!(probe(git("exit 124", "true", "true", "true")).git, None);
+        // tmux with no uid to look for its socket directory by: unknown.
+        stub(&bin, "id", "exit 1");
+        stub(&bin, "tmux", "echo '1:0:1792506455:lab'");
+        let x = probe(git("pwd", "true", "true", "true"));
+        assert_eq!(x.tmux, Some(Err(UNREAD.to_string())));
+        assert!(sessions_line(Some(&x), None).ends_with(" · tmux: unknown (couldn't be read)"), "{}", sessions_line(Some(&x), None));
+        // A process listing with nothing in it.
+        let mut out = String::new();
+        procs_block(Some(&Extra { procs: Some(Ok(Vec::new())), ..Default::default() })).render(&mut out);
+        assert_eq!(out, "processes: unknown (ps listed none, not even this probe's own session)\n");
     }
 
     /// Review ai-review claude #5: `tmux list-sessions` makes its socket directory when there is

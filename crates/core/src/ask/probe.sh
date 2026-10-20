@@ -87,8 +87,12 @@ fi
 # fields are `:`-separated, the name last (tmux allows no `:` in one); `-u` keeps a UTF-8 name.
 # Asked only when its socket directory is there: `tmux list-sessions` makes that directory when
 # it isn't (and then finds no server) — and with no directory no server has run as this user.
+# Without a uid there's no directory to look for: unknown, never "no sessions".
 if command -v tmux >/dev/null 2>&1; then
-    if [ ! -d "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u 2>/dev/null)" ]; then
+    uid=$(id -u 2>/dev/null)
+    if [ -z "$uid" ]; then
+        o tmux err
+    elif [ ! -d "${TMUX_TMPDIR:-/tmp}/tmux-$uid" ]; then
         o tmux ok
     elif out=$(t 5 tmux -u list-sessions -F '#{session_windows}:#{session_attached}:#{session_activity}:#{session_name}' 2>&1); then
         o tmux ok
@@ -129,20 +133,29 @@ else
     # From here every `git` is `ro_git`, busy_op's `git ls-files -u` (an index read: an
     # fsmonitor hook would run) and ro_setup's config read included; `ro_git` itself reaches the
     # binary. Each within 10 s, the whole repo section through (a hung /workspace volume costs
-    # this section, never the lines above it).
+    # this section, never the lines above it). A fact a git couldn't read — it timed out (124,
+    # 137) or failed — is said empty, unknown: never "not a checkout", "none" or 0.
     git() { ro_git "$@"; }
     ro_timeout=10
-    if ! top=$(git rev-parse --show-toplevel 2>/dev/null) || ! cd "$top" 2>/dev/null; then
-        o git notrepo
+    top=$(git rev-parse --show-toplevel 2>/dev/null)
+    rc=$?
+    if [ "$rc" -ne 0 ] || ! cd "$top" 2>/dev/null; then
+        # git's own "not a git repository" is 128.
+        if [ "$rc" -eq 128 ]; then o git notrepo; else o git err; fi
     else
         o git ok
         o real "$(pwd -P)"
         o branch "$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
         gd=$(git rev-parse --absolute-git-dir 2>/dev/null)
-        op=$(busy_op "$gd" 2>/dev/null)
-        if [ -z "$op" ] && { [ -d "$gd/rebase-merge" ] || [ -d "$gd/rebase-apply" ]; }; then op=rebase; fi
-        if [ -z "$op" ] && [ -f "$gd/BISECT_LOG" ]; then op=bisect; fi
-        o op "${op:--}"
+        # busy_op takes an index it can't read for one with nothing unmerged: read it first.
+        if [ -z "$gd" ] || ! git ls-files -u >/dev/null 2>&1; then
+            o op ""
+        else
+            op=$(busy_op "$gd" 2>/dev/null)
+            if [ -z "$op" ] && { [ -d "$gd/rebase-merge" ] || [ -d "$gd/rebase-apply" ]; }; then op=rebase; fi
+            if [ -z "$op" ] && [ -f "$gd/BISECT_LOG" ]; then op=bisect; fi
+            o op "${op:--}"
+        fi
         # The working tree from plumbing (`ro_changes`: a file only touched may count as
         # modified).
         if ro_setup && s=$(ro_changes 2>/dev/null); then
@@ -154,8 +167,15 @@ else
             o status err
         fi
         o last "$(git log -1 --format='%ct %s' 2>/dev/null | head -c 300)"
-        o upstream "$(git rev-parse --abbrev-ref '@{u}' 2>/dev/null)"
-        o stashes "$(git stash list 2>/dev/null | wc -l | tr -cd '0-9')"
+        # No upstream is git's 128 ("no upstream configured", a detached HEAD): `-`, none.
+        if up=$(git rev-parse --abbrev-ref '@{u}' 2>/dev/null); then
+            o upstream "$up"
+        elif [ $? -eq 128 ]; then
+            o upstream -
+        else
+            o upstream ""
+        fi
+        if st=$(git stash list 2>/dev/null); then o stashes "$(printf '%s\n' "$st" | grep -c .)"; else o stashes ""; fi
     fi
     ro_timeout=
 fi

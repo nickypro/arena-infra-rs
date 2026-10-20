@@ -162,6 +162,10 @@ fn backups_line(cfg: &Config, pod: &str) -> String {
         // Not the path itself: where this machine keeps things is none of the prompt's business.
         return "none found (LOCAL_BACKUP_DIR isn't a directory on this machine)".to_string();
     }
+    if std::fs::read_dir(base).is_err() {
+        // There, but not readable here: unknown, never "no snapshot".
+        return format!("{} (LOCAL_BACKUP_DIR can't be read on this machine)", bundle::UNKNOWN);
+    }
     let big = crate::pull::big_root(dir, cfg.get("LOCAL_BACKUP_BIG_DIR"));
     let labels = crate::restore::all_labels(base, Path::new(&big), pod);
     let dated: Vec<&String> = labels.iter().filter(|l| crate::restore::parse_label(l).is_some()).collect();
@@ -231,19 +235,23 @@ fn auto_finish_words(cfg: &Config) -> String {
 }
 
 /// What this machine knows about `pod` besides the pod itself: its last deep check (the
-/// health cache `pods test --deep` and the dashboard's `d` keep), its local file backups, the
+/// health cache `pods test --deep` and the dashboard's `d` keep — `None`: it can't be read, so
+/// the check is unknown, never "never run"), its local file backups, the
 /// backup's last copy of it while an operation was in progress (`busy`: [`load_busy_copies`])
 /// and whether it would finish one, and — for a cohort pod, when the start date is set — the
 /// branch today's backups go to.
-pub fn local_context(cfg: &Config, pod: &Pod, now: u64, health: &HealthCache, busy: Option<&BusyCopies>) -> Local {
-    let health = health.get(pod).map(|h| {
-        let mut s = format!("{} {} ago", h.status.label(), bundle::age(now.saturating_sub(h.checked_at)));
-        if !h.reasons.is_empty() {
-            let reasons: Vec<String> = h.reasons.iter().take(2).map(|r| redact::text(r, 150)).collect();
-            s.push_str(&format!(": {}", reasons.join("; ")));
-        }
-        s
-    });
+pub fn local_context(cfg: &Config, pod: &Pod, now: u64, health: Option<&HealthCache>, busy: Option<&BusyCopies>) -> Local {
+    let health = match health {
+        None => Some(format!("{} (the health cache can't be read here)", bundle::UNKNOWN)),
+        Some(cache) => cache.get(pod).map(|h| {
+            let mut s = format!("{} {} ago", h.status.label(), bundle::age(now.saturating_sub(h.checked_at)));
+            if !h.reasons.is_empty() {
+                let reasons: Vec<String> = h.reasons.iter().take(2).map(|r| redact::text(r, 150)).collect();
+                s.push_str(&format!(": {}", reasons.join("; ")));
+            }
+            s
+        }),
+    };
     let naming = Naming::from_config(cfg);
     let expected_branch = naming
         .is_cohort(&pod.name)
@@ -258,10 +266,15 @@ pub fn local_context(cfg: &Config, pod: &Pod, now: u64, health: &HealthCache, bu
     }
 }
 
-/// The health cache as `pods test --deep` keeps it (empty when there is none or it can't be
-/// read: a pod then reads "never run from here").
-pub fn load_health(cfg: &Config) -> HealthCache {
-    crate::snapshot::health_cache_path_for(cfg).map(|p| HealthCache::load(&p).0).unwrap_or_default()
+/// The health cache as `pods test --deep` keeps it: empty when there is none (a pod then reads
+/// "never run from here"), `None` when it can't be read (no state dir, unreadable, garbled: each
+/// pod's check is unknown — never "never run").
+pub fn load_health(cfg: &Config) -> Option<HealthCache> {
+    let path = crate::snapshot::health_cache_path_for(cfg).ok()?;
+    match HealthCache::load(&path) {
+        (cache, None) => Some(cache),
+        (_, Some(_)) => None,
+    }
 }
 
 /// Every pod's bundle, in `pods`' order: [`look`], then [`bundle::render`] with its
@@ -274,7 +287,7 @@ pub async fn bundles(remote: &Arc<dyn Remote>, cfg: &Config, pods: &[Pod], now: 
     let cap = pod_cap(pods.len());
     pods.iter()
         .zip(&looks)
-        .map(|(p, l)| bundle::render(p, l, &local_context(cfg, p, now, &health, busy.as_ref()), &repo, now, cap))
+        .map(|(p, l)| bundle::render(p, l, &local_context(cfg, p, now, health.as_ref(), busy.as_ref()), &repo, now, cap))
         .collect()
 }
 
@@ -708,7 +721,7 @@ mod tests {
             NOW - 7_300,
         );
         let none = BusyCopies::default();
-        let l = local_context(&c, &p, NOW, &cache, Some(&none));
+        let l = local_context(&c, &p, NOW, Some(&cache), Some(&none));
         assert_eq!(l.health.as_deref(), Some("fail 2h1m ago: cuda: Error 999 token=<redacted>"));
         assert_eq!(
             l.backups.as_deref(),
@@ -719,9 +732,27 @@ mod tests {
         assert_eq!((l.busy_copy, l.auto_finish.as_deref()), (None, Some("after 3h with nothing changed (default)")));
         // A staff box: no branch to expect; never checked: no verdict.
         let staff = Pod { name: "staffbox".into(), ..p.clone() };
-        let l = local_context(&c, &staff, NOW, &HealthCache::new(), Some(&none));
+        let l = local_context(&c, &staff, NOW, Some(&HealthCache::new()), Some(&none));
         assert_eq!((l.health, l.expected_branch), (None, None));
         assert!(l.backups.unwrap().starts_with("no dated snapshot; all-files mirror: no"));
+        // Lane ASK7 item K: what can't be read here is unknown, never "never run" or "no
+        // snapshot" — a health cache that's garbled, a backup dir that can't be listed.
+        let c = cfg(&format!("LOCAL_BACKUP_DIR={}\nARENA_STATE_DIR={}\n", base.display(), t.0.join("state").display()));
+        assert_eq!(load_health(&c).map(|h| h.get(&p).is_none()), Some(true), "no cache yet: never run");
+        let file = crate::snapshot::health_cache_path_for(&c).unwrap();
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "{ garbled").unwrap();
+        assert!(load_health(&c).is_none());
+        let l = local_context(&c, &p, NOW, load_health(&c).as_ref(), Some(&none));
+        assert_eq!(l.health.as_deref(), Some("unknown (the health cache can't be read here)"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let backups = local_context(&c, &p, NOW, None, Some(&none)).backups;
+            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(backups.as_deref(), Some("unknown (LOCAL_BACKUP_DIR can't be read on this machine)"));
+        }
     }
 
     /// The backup's BUSY copy record (`busy-copies.json`) and `BUSY_AUTO_RESOLVE_HOURS`, read
@@ -763,7 +794,7 @@ mod tests {
         ];
         record_busy_copies(&file, &changes, NOW - 2_400, RECORD_LOCK_WAIT).unwrap();
         let record = load_busy_copies(&c).expect("readable");
-        let l = local_context(&c, &p, NOW, &health, Some(&record));
+        let l = local_context(&c, &p, NOW, Some(&health), Some(&record));
         let line = l.busy_copy.unwrap();
         assert_eq!(
             line,
@@ -771,20 +802,20 @@ mod tests {
              entry is kept up to 24h after its last copy: not by itself a sign the pod is still BUSY)"
         );
         assert!(!line.contains(&t.0.display().to_string()) && !line.contains(head), "no local path, no commit: {line}");
-        let line = local_context(&c, &pod("bravo", 2, None), NOW, &health, Some(&record)).busy_copy.unwrap();
+        let line = local_context(&c, &pod("bravo", 2, None), NOW, Some(&health), Some(&record)).busy_copy.unwrap();
         assert!(line.starts_with("last whole copy while BUSY with a `git stash pop`'s conflicts: taken 40m ago"), "{line}");
         assert!(line.contains("snapshot w1d1/REDACTED-HUGGINGFACE-TOKEN,") && !line.contains(&key), "{line}");
-        let line = local_context(&c, &pod("gone", 3, None), NOW, &health, Some(&record)).busy_copy.unwrap();
+        let line = local_context(&c, &pod("gone", 3, None), NOW, Some(&health), Some(&record)).busy_copy.unwrap();
         assert!(line.contains("no longer on this machine (or LOCAL_BACKUP_DIR changed since)"), "{line}");
-        assert_eq!(local_context(&c, &pod("delta", 4, None), NOW, &health, Some(&record)).busy_copy, None, "no entry: no line");
+        assert_eq!(local_context(&c, &pod("delta", 4, None), NOW, Some(&health), Some(&record)).busy_copy, None, "no entry: no line");
         // Unreadable (corrupt, or no state dir): unknown — never "none recorded".
         std::fs::write(&file, "{ not json").unwrap();
         assert_eq!(load_busy_copies(&c), None);
-        assert_eq!(local_context(&c, &p, NOW, &health, None).busy_copy.as_deref(), Some("unknown (it can't be read here)"));
+        assert_eq!(local_context(&c, &p, NOW, Some(&health), None).busy_copy.as_deref(), Some("unknown (it can't be read here)"));
         assert_eq!(load_busy_copies(&cfg("ARENA_STATE_DIR=relative/state\n")), None, "a state dir that can't be used");
 
         // BUSY_AUTO_RESOLVE_HOURS, in config check's words; an invalid value never repeated.
-        let finish = |extra: &str| local_context(&cfg(extra), &p, NOW, &health, Some(&record)).auto_finish.unwrap();
+        let finish = |extra: &str| local_context(&cfg(extra), &p, NOW, Some(&health), Some(&record)).auto_finish.unwrap();
         assert_eq!(finish(""), "after 3h with nothing changed (default)");
         assert_eq!(finish("BUSY_AUTO_RESOLVE_HOURS=5\n"), "after 5h with nothing changed");
         assert_eq!(finish("BUSY_AUTO_RESOLVE_HOURS=off\n"), "off — an operation left in progress stays until the participant ends it");

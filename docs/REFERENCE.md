@@ -1265,7 +1265,8 @@ endpoint, age, lock, maintenance), its last `pods test --deep` verdict, which lo
 (`pods pull`) exist of it, the backup's record of its last whole copy while BUSY
 (`busy-copies.json`: the operation, how long ago, the snapshot label and whether that copy is still
 here — never the local path), and the branch today's backups go to. A stopped or unreachable pod is
-its listing and why.
+its listing and why. What couldn't be read — a git that timed out, a list that failed, the health
+cache or the backup dir unreadable here — is sent as `unknown`, never as none or 0.
 
 Its git — the dashboard's probe's too — writes nothing and runs nothing the participant's repo
 configures: no optional locks (not even the index is refreshed), no fsmonitor hook, no clean/process
