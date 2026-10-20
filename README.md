@@ -798,7 +798,13 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     doesn't drop the key; a later set-aside never overwrites an earlier one) and put back when
     the pod returns to that branch. A gentle switch that refuses a pod mid-merge does so before
     setting anything aside, and the putting back is the command's exit trap: a switch that fails,
-    stops on an error, or is killed (a hangup, an interrupt, a TERM) puts the keys back first.
+    stops on an error, or gets a hangup, an interrupt or a TERM puts the keys back first. arena's
+    own 2-minute timeout kills only its ssh client — a non-pty session's shell is usually never
+    signalled, and ran on (review ai-review claude #13) — so the switch bounds itself on the pod:
+    it runs under `timeout` for 100 s (TERM, the keys put back; KILL 10 s later if still running,
+    which runs no trap: keys then stay set aside until a switch back to their branch), said on the
+    pod's line if it ran out; a pod without coreutils' `timeout` runs it unbounded. Its script
+    runs under `sh`, whatever the login shell (zsh on the pods).
     Landing pods on `main`/`master` ends with the reminder
     ``⚠ N cohort pods on main: not backed up until `arena pods init-branches` ``;
     `--init-branches` then runs `init-branches` on every pod that switched (the start date is

@@ -3181,6 +3181,10 @@ const BACKUP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// GitHub — seconds normally, so 2 min means stuck (a hung fetch, a held lock).
 const BRANCH_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 
+// The switch bounds itself on the pod (`timeout`, then a KILL) inside that budget, so its pod side
+// has ended before arena reports a timeout and releases the pod's lock (review ai-review claude #13).
+const _: () = assert!(arena_core::backup::SWITCH_BOUND_SECS + arena_core::backup::SWITCH_KILL_AFTER_SECS < BRANCH_TIMEOUT.as_secs());
+
 /// `pods cp`'s scp budget floor: connection setup, a small file, a slow start — 10 min.
 /// What's copied adds to it ([`cp_timeout`]). Its `mkdir -p` and post-copy size check are
 /// quick probes.

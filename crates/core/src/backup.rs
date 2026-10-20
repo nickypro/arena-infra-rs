@@ -1058,10 +1058,26 @@ pub fn init_branch_command(cfg: &BackupConfig, machine_name: &str) -> String {
 /// holds exactly that version again gets its real keys back (`UNREDACTED_RESTORED <path>`), the
 /// rest stay set aside (`UNREDACTED_KEPT <path>`) until a switch back. The putting back is the
 /// command's EXIT trap, set just before the set-aside (review ai-review claude #4): a failed
-/// switch, a step that fails under `set -e` and a hangup, interrupt or termination (each made
-/// an exit) all put them back before the command ends — never a participant left with the
-/// redacted placeholder in their code. A file with any other uncommitted change is left to the
-/// switch, as before.
+/// switch, a step that fails under `set -e`, and a hangup, interrupt or TERM sent to the switch's
+/// shell (each made an exit) all put them back before the command ends — never a participant left
+/// with the redacted placeholder in their code. A file with any other uncommitted change is left
+/// to the switch, as before.
+///
+/// What that trap does *not* cover: arena's own timeout (the CLI's and the TUI's 2-minute
+/// `BRANCH_TIMEOUT`) kills only the local ssh client, and the shell of a non-pty ssh session is
+/// usually never signalled — it ran on, and could switch the pod after arena had reported a
+/// timeout and released the pod's lock (review ai-review claude #13). So the switch bounds itself
+/// on the pod: it runs under coreutils' `timeout` ([`SWITCH_BOUND_SECS`], a little under
+/// `BRANCH_TIMEOUT`), which sends TERM to the switch's process group — the trap puts the keys
+/// back — and KILL [`SWITCH_KILL_AFTER_SECS`] later if it's still running (a KILL runs no trap:
+/// keys set aside then stay in `.git/arena-unredacted/` until a switch back to their branch puts
+/// them back). Stopped there, it says so on stderr (exit 124, or 137 after the KILL); it may have
+/// stopped part-way through the checkout. A pod without a working `timeout` runs the switch
+/// unbounded, as before. Nor does any trap cover the pod itself going away (a stop, a reboot).
+///
+/// The switch's script runs under `sh -c` (dash on the images), whatever the pod's login shell:
+/// sshd hands the command to the login shell's `-c` — zsh on the pods — which now runs only the
+/// few POSIX lines that start the script under `timeout` and `sh`.
 ///
 /// An operation in progress (a participant's conflicted `git pull upstream main`, a cherry-pick,
 /// a revert, a `git stash pop`'s conflicts: [`BUSY_OP_SH`]) is never ended by the gentle switch:
@@ -1071,6 +1087,45 @@ pub fn init_branch_command(cfg: &BackupConfig, machine_name: &str) -> String {
 /// onto the other branch. `--hard` goes ahead and ends it with the other local changes it
 /// discards — saved first, as above (`set-branch` copies such a pod too, and says so).
 pub fn checkout_command(repo_path: &str, branch: &str, git_ssh_key: Option<&str>, hard: bool) -> String {
+    bounded_switch(&switch_script(repo_path, branch, git_ssh_key, hard), SWITCH_BOUND_SECS, SWITCH_KILL_AFTER_SECS)
+}
+
+/// How long a branch switch may run on the pod before `timeout` stops it there with TERM
+/// ([`checkout_command`]): a little under the CLI's and the TUI's `BRANCH_TIMEOUT` (2 min, which
+/// each checks at compile time against this plus [`SWITCH_KILL_AFTER_SECS`]), so the pod's side
+/// has ended before arena reports a timeout and releases the pod's lock.
+pub const SWITCH_BOUND_SECS: u64 = 100;
+
+/// After the TERM, how long the switch has to end (its EXIT trap puts the keys back) before
+/// `timeout` KILLs it.
+pub const SWITCH_KILL_AFTER_SECS: u64 = 10;
+
+/// `script` as the pod runs it: under `sh -c` (whatever the login shell that `-c`s this), bounded by
+/// `timeout -k <kill_after> <secs>` when the pod has a `timeout` that takes `-k` (coreutils'; a
+/// probe finds out), else unbounded. A run `timeout` stopped says so on stderr. The script is in a
+/// variable, so it's carried once.
+fn bounded_switch(script: &str, secs: u64, kill_after: u64) -> String {
+    let stopped = format!(
+        "arena set-branch: the switch ran past its {secs} s on the pod and was stopped there (TERM, the real keys put back) — not switched, \
+         or stopped part-way through the checkout: check the branch and `git status` on the pod"
+    );
+    let killed = format!(
+        "arena set-branch: the switch ran past its {secs} s on the pod and was killed there ({kill_after} s after the TERM) — not \
+         switched, or stopped part-way: check the branch and `git status` on the pod; real keys it set aside may still be in \
+         .git/arena-unredacted/"
+    );
+    format!(
+        "ARENA_SWITCH={}\nif timeout -k 1 1 true >/dev/null 2>&1; then timeout -k {kill_after} {secs} sh -c \"$ARENA_SWITCH\" arena-set-branch; \
+         r=$?; if [ \"$r\" = 124 ]; then printf '%s\\n' {} >&2; elif [ \"$r\" = 137 ]; then printf '%s\\n' {} >&2; fi; exit \"$r\"; \
+         else exec sh -c \"$ARENA_SWITCH\" arena-set-branch; fi",
+        shell_quote(script),
+        shell_quote(&stopped),
+        shell_quote(&killed)
+    )
+}
+
+/// The switch itself ([`checkout_command`]), a POSIX `sh` script.
+fn switch_script(repo_path: &str, branch: &str, git_ssh_key: Option<&str>, hard: bool) -> String {
     let mut parts: Vec<String> = vec!["set -e".into(), format!("cd {}", shell_quote(repo_path))];
     if !hard {
         // A participant's merge (cherry-pick, revert, conflicts) is never ended by the gentle
@@ -1395,11 +1450,16 @@ mod tests {
             assert!(secret_regex().contains(&format!("{}{}", p.lead, p.re)));
             assert!(redact_sed().contains(&format!("s#{}{}#\\1{}#g", p.lead, p.re, p.replacement)));
         }
-        let set_branch = checkout_command("/r", "main", None, false);
+        let set_branch = switch_script("/r", "main", None, false);
         assert!(set_branch.contains(&format!("REDACT_SED='{}'", redact_sed())));
         assert!(set_branch.contains("unredacted_aside()") && set_branch.contains("unredacted_restore()"));
         for shell in ["sh", "bash"] {
-            for cmd in [checkout_command("/r", "main", None, false), checkout_command("/r", "main", Some("/k"), true)] {
+            for cmd in [
+                checkout_command("/r", "main", None, false),
+                checkout_command("/r", "main", Some("/k"), true),
+                switch_script("/r", "main", None, false),
+                switch_script("/r", "main", Some("/k"), true),
+            ] {
                 let o = std::process::Command::new(shell).arg("-n").arg("-c").arg(&cmd).output().expect(shell);
                 assert!(o.status.success(), "{shell} -n: {}", String::from_utf8_lossy(&o.stderr));
             }
@@ -2734,7 +2794,7 @@ done
 
     #[test]
     fn checkout_is_gentle_ff_only() {
-        let c = checkout_command("/root/ARENA_3.0", "main", Some("/root/.ssh/id_ed25519"), false);
+        let c = switch_script("/root/ARENA_3.0", "main", Some("/root/.ssh/id_ed25519"), false);
         assert!(c.contains("cd '/root/ARENA_3.0'"));
         assert!(c.contains("git fetch --prune origin"));
         // Origin's branch by its full name, never the local branch's upstream (codex #5).
@@ -2746,7 +2806,7 @@ done
 
     #[test]
     fn checkout_hard_resets_to_origin() {
-        let c = checkout_command("/root/ARENA_3.0", "main", None, true);
+        let c = switch_script("/root/ARENA_3.0", "main", None, true);
         assert!(c.contains("git fetch --prune origin"));
         // What it discards saved first — no save, no reset — then force-switch the branch to
         // origin and hard-reset (destructive).
@@ -2754,10 +2814,29 @@ done
         assert!(c.contains("git reset --hard 'origin/main'"));
         assert!(!c.contains("--ff-only"));
         // The keys' restore is the EXIT trap, set before the set-aside (claude #4).
-        for cmd in [c.clone(), checkout_command("/r", "main", None, false)] {
+        for cmd in [c.clone(), switch_script("/r", "main", None, false)] {
             let trap = cmd.find("trap 'unredacted_restore \"$G/arena-unredacted\"' EXIT").expect("the trap");
             assert!(trap < cmd.find("unredacted_aside \"$G").unwrap() && cmd.contains("trap 'exit 143' TERM"));
         }
+    }
+
+    /// The switch runs under `sh`, whatever the login shell that `-c`s the command (zsh on the
+    /// pods), bounded on the pod by `timeout` a little under arena's own 2 minutes — a pod without
+    /// one runs it unbounded (review ai-review claude #13).
+    #[test]
+    fn the_switch_bounds_itself_on_the_pod_under_sh() {
+        for hard in [false, true] {
+            let c = checkout_command("/r", "main", Some("/k"), hard);
+            let script = switch_script("/r", "main", Some("/k"), hard);
+            let head = format!("ARENA_SWITCH={}\n", shell_quote(&script));
+            assert!(c.starts_with(&head), "{c}");
+            let rest = &c[head.len()..];
+            assert!(rest.starts_with("if timeout -k 1 1 true >/dev/null 2>&1; then timeout -k 10 100 sh -c \"$ARENA_SWITCH\" arena-set-branch; r=$?;"), "{rest}");
+            assert!(rest.ends_with("exit \"$r\"; else exec sh -c \"$ARENA_SWITCH\" arena-set-branch; fi"), "{rest}");
+            assert!(rest.contains("if [ \"$r\" = 124 ]") && rest.contains("ran past its 100 s on the pod and was stopped there"));
+            assert!(rest.contains("elif [ \"$r\" = 137 ]") && rest.contains("was killed there (10 s after the TERM)"));
+        }
+        assert_eq!((SWITCH_BOUND_SECS, SWITCH_KILL_AFTER_SECS), (100, 10));
     }
 
     #[test]
@@ -3436,9 +3515,9 @@ done
         assert!(s.contains("\nbusy_stop\ngit add -A -- \"$@\"\n") && calls[1] == s.find("\nbusy_stop\ngit add -A").unwrap());
         assert!(calls[2] == s.find("\nbusy_stop\nif ! git diff --cached --quiet; then git commit").unwrap());
         // The gentle switch and init-branches check it too, first; --hard doesn't.
-        let gentle = checkout_command("/r", "main", None, false);
+        let gentle = switch_script("/r", "main", None, false);
         assert!(gentle.contains(BUSY_OP_SH) && gentle.find("busy_op").unwrap() < gentle.find("git fetch").unwrap());
-        assert!(!checkout_command("/r", "main", None, true).contains("busy_op"));
+        assert!(!switch_script("/r", "main", None, true).contains("busy_op"));
         let init = init_branch_command(&cfg(), "arena8-apple");
         assert!(init.find("busy_op").unwrap() < init.find("git checkout -b").unwrap());
         // On a branch it skips, the work there is only said, read-only, before the SKIP.
@@ -3456,10 +3535,10 @@ done
         let order = ["W=changes", "W=commits", "W=untracked"].map(|w| skip.find(w).unwrap_or_else(|| panic!("{w}")));
         assert!(order.windows(2).all(|p| p[0] < p[1]), "{order:?}");
         // The --hard switch ends a `git am`, rebase or sequence once it has switched; gentle never does.
-        let hard = checkout_command("/r", "main", None, true);
+        let hard = switch_script("/r", "main", None, true);
         let quits = hard.find("git rebase --quit").expect("quit");
         assert!(hard.find("git reset --hard").unwrap() < quits && hard.contains("git am --quit") && hard.contains("git cherry-pick --quit"));
-        assert!(!checkout_command("/r", "main", None, false).contains("--quit"));
+        assert!(!switch_script("/r", "main", None, false).contains("--quit"));
         for write in ["git add", "update-index", "git commit", "git push", "git stash", "git reset"] {
             assert!(!skip.contains(write), "{write}");
         }
@@ -3736,7 +3815,14 @@ done
     /// `bash -c cmd` with this PATH: (exit code, stdout, stderr).
     #[cfg(unix)]
     fn run_on_path(cmd: &str, path: &str) -> (Option<i32>, String, String) {
-        let o = std::process::Command::new("bash").arg("-c").arg(cmd).env("PATH", path).output().expect("bash");
+        run_in("bash", cmd, path)
+    }
+
+    /// `<shell> -c cmd` with this PATH — as sshd runs a command under the login shell: (exit code,
+    /// stdout, stderr).
+    #[cfg(unix)]
+    fn run_in(shell: &str, cmd: &str, path: &str) -> (Option<i32>, String, String) {
+        let o = std::process::Command::new(shell).arg("-c").arg(cmd).env("PATH", path).output().expect(shell);
         (o.status.code(), String::from_utf8_lossy(&o.stdout).into_owned(), String::from_utf8_lossy(&o.stderr).into_owned())
     }
 
@@ -4133,6 +4219,74 @@ done
         assert!(o.status.success() && !String::from_utf8_lossy(&o.stdout).contains("DISCARDED_SAVED"), "{}", String::from_utf8_lossy(&o.stderr));
         assert_eq!(saves(), std::slice::from_ref(&d));
         assert_eq!(read("untracked/solutions.py"), "mine\n");
+    }
+
+    /// Review ai-review claude #13: the switch's HUP/INT/TERM trap (the keys put back) was said to
+    /// cover a timeout, but arena's timeout kills only the local ssh client, and a non-pty
+    /// session's shell is usually never signalled: the switch ran on, and could land after arena
+    /// had reported a timeout and released the pod's lock. Now it bounds itself on the pod — under
+    /// `timeout`, TERM to its process group (here after 2 s, at a checkout that hangs): exit 124,
+    /// said, the real keys back, the pod on its branch. Under bash and under zsh, the pods' login
+    /// shell, which `-c`s the command (sshd), so it starts the switch's script under `sh`: the
+    /// real command switches and switches back, the keys with it. A pod whose `timeout` doesn't
+    /// work runs it unbounded, as before.
+    #[cfg(unix)]
+    #[test]
+    fn a_switch_bounds_itself_on_the_pod_and_puts_the_keys_back_under_any_login_shell() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = GitSandbox::new("switch-bound", 1_000_000);
+        let repo = s.work.to_str().unwrap();
+        let ex = format!("KEY = \"{}\"\n", openrouter_key(25));
+        std::fs::write(s.work.join("ex.py"), &ex).unwrap();
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.redacted.len()), (Some(0), 1), "{err}");
+        let aside = s.work.join(".git/arena-unredacted");
+        let branch = || s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let has = |sh: &str| std::process::Command::new(sh).args(["-c", "true"]).output().is_ok_and(|o| o.status.success());
+        let shells: Vec<&str> = ["bash", "zsh"].into_iter().filter(|sh| has(sh)).collect();
+        if !shells.contains(&"zsh") {
+            eprintln!("zsh isn't installed here: the login-shell checks run under bash only");
+        }
+        let stand_in = |dir: &str, body: &str| {
+            let bin = s.base.join(dir);
+            std::fs::create_dir_all(&bin).unwrap();
+            let (name, text) = body.split_once('\n').unwrap();
+            std::fs::write(bin.join(name), text).unwrap();
+            std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755)).unwrap();
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default())
+        };
+        let hang = stand_in(
+            "bin-hang",
+            &format!(
+                "git\n#!/bin/sh\ncase \"$*\" in *\" checkout main\" | \"checkout -f -B main origin/main\") sleep 30; exit 1;; esac\nexec {} \"$@\"\n",
+                shell_quote(&real_git())
+            ),
+        );
+        let plain = std::env::var("PATH").unwrap_or_default();
+        for shell in &shells {
+            for hard in [false, true] {
+                let t0 = std::time::Instant::now();
+                let (code, out, err) = run_in(shell, &bounded_switch(&switch_script(repo, "main", None, hard), 2, 1), &hang);
+                assert_eq!(code, Some(124), "{shell} hard={hard}: {out}{err}");
+                assert!(t0.elapsed() < std::time::Duration::from_secs(20), "{shell} hard={hard}: bounded");
+                assert!(err.contains("the switch ran past its 2 s on the pod and was stopped there"), "{shell} hard={hard}: {err}");
+                assert_eq!(s.read("ex.py"), ex.as_bytes(), "{shell} hard={hard}: the real key put back");
+                assert!(!aside.exists(), "{shell} hard={hard}");
+                assert_eq!(branch(), "autocommit-x", "{shell} hard={hard}");
+            }
+            // The real command under that login shell: to main (ex.py's key kept aside: main has
+            // no ex.py) and back (the key back in it).
+            let (code, out, err) = run_in(shell, &checkout_command(repo, "main", None, false), &plain);
+            assert_eq!((code, branch()), (Some(0), "main".to_string()), "{shell}: {out}{err}");
+            assert!(out.contains("UNREDACTED_KEPT ex.py"), "{shell}: {out}");
+            let (code, out, err) = run_in(shell, &checkout_command(repo, "autocommit-x", None, false), &plain);
+            assert_eq!((code, branch()), (Some(0), "autocommit-x".to_string()), "{shell}: {out}{err}");
+            assert!(out.contains("UNREDACTED_RESTORED ex.py") && s.read("ex.py") == ex.as_bytes(), "{shell}: {out}");
+        }
+        // A `timeout` that doesn't work (absent, or not coreutils'): the switch runs unbounded.
+        let broken = stand_in("bin-no-timeout", "timeout\n#!/bin/sh\nexit 127\n");
+        let (code, out, err) = run_in("bash", &checkout_command(repo, "main", None, false), &broken);
+        assert_eq!((code, branch()), (Some(0), "main".to_string()), "{out}{err}");
     }
 
     /// Review ai-review codex #3 / claude #11: `changes.patch` is HEAD -> the files, so a version
