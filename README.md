@@ -33,7 +33,58 @@ flowchart LR
   course["course repo<br/>(upstream)"] -. "git pull upstream main" .-> pods
 ```
 
-## TL;DR for organisers
+## TL;DR
+
+### Just want some GPU pods?
+
+Pods up, SSH in, pods down: no proxy, no backups, no day branches.
+
+```bash
+git clone https://github.com/nickypro/arena-infra-rs.git && cd arena-infra-rs
+cargo build --release                              # target/release/arena
+alias arena="$PWD/target/release/arena --config $PWD/config.env"
+ssh-keygen -t ed25519 -N "" -f ~/.ssh/arena_key    # the key your pods will let in
+cp config.env.example config.env                   # then set the four keys below
+arena config set RUNPOD_API_KEY                    # prompts; never echoes the value
+```
+
+| Key in `config.env` | Set it to |
+| --- | --- |
+| `RUNPOD_API_KEY` | Your RunPod API key (the `config set` above) |
+| `SHARED_SSH_KEY_PATH` | `~/.ssh/arena_key`: each new pod lets it in; `ssh-config` makes it the `IdentityFile` |
+| `MACHINE_NAME_PREFIX` | e.g. `arena`, so the pods are `arena-apple`, `arena-bloom`, … |
+| `MACHINE_NAME_LIST` | The names, used in order: `MACHINE_NAME_LIST=(apple bloom cedar)` |
+
+The example sets `SSH_PROXY_HOST`: comment it out (no proxy). Its GPU, image and disk are fine as
+they are.
+
+```bash
+arena pods up -n 2 --no-setup              # create 2 pods; wait until each answers SSH
+arena ssh-config --out ~/.ssh/arena.conf   # a Host per pod (printed too)
+# once: make "Include ~/.ssh/arena.conf" the first line of ~/.ssh/config
+ssh arena-apple                            # or VS Code: Remote-SSH: Connect to Host…
+arena pods list                            # GPU, $/h, endpoint; the fleet's cost and balance
+arena pods terminate --all                 # EVERY pod on the account, prefix or not; asks first
+```
+
+`--no-setup` skips provisioning, the one step that needs a cohort repo and its deploy key
+(without the flag, `up` stops before creating anything while they're unset): each pod is the
+image as it boots. A pod's endpoint moves when it restarts, so run `ssh-config --out` again
+after any change.
+
+### Running a cohort, or anything for an org?
+
+Add these on top. [Getting started](#getting-started) walks through them in order:
+
+| Add | What you get | Config keys |
+| --- | --- | --- |
+| **[The proxy](#the-proxy)** (recommended) | One stable address per machine: participants' `~/.ssh/config` never changes | `SSH_PROXY_HOST`, `SSH_PROXY_STARTING_PORT` |
+| **Setup** (drop `--no-setup`) | Each pod gets the deploy key, the cohort repo, tokens and the VS Code warm-up | `ARENA_REPO_OWNER`, `ARENA_REPO_NAME`, `GIT_SSH_KEY_LOCAL` |
+| **Day branches** | Each pod's work on its own `autocommit-<prefix>-w1d2-<machine>` branch | `ARENA_START_DATE` |
+| **Backups on cron** | A git push and an rsync copy of every pod, every 15 minutes | `LOCAL_BACKUP_DIR` |
+
+<details>
+<summary>Every organiser command at a glance</summary>
 
 | Command | What it does |
 | --- | --- |
@@ -57,12 +108,16 @@ flowchart LR
 | `arena config check` | Which config keys are set, missing or unusable (never prints values) |
 | `arena teardown --check` | End of the program: what's still billing, with the command that cleans it up |
 
+</details>
+
 Every mutating command shows what it will do and asks first; `--dry-run` previews it.
 Subcommands take any unambiguous prefix (`arena po l` = `arena pods list`). Pods are named
 `apple`, `arena-apple`, `apple..mayor`, `--all`, … — see
 [targeting](docs/REFERENCE.md#targeting--concurrency).
 
 ## Getting started
+
+The cohort route, in order. Only want pods? [The TL;DR](#just-want-some-gpu-pods) is all of it.
 
 ### 1. Build
 
@@ -78,7 +133,8 @@ Keep the two binaries side by side on your `PATH`: `arena tui` starts the `arena
 - a **provider API key**: RunPod (Vast, Hetzner and Shadeform are optional);
 - a **shared SSH key** for the cohort — the pods authorize it, the participants get it:
   `ssh-keygen -t ed25519 -N "" -C "arena-cohort" -f ~/.ssh/arena_cohort_key`
-- a **deploy key** with write access to the cohort's GitHub repo, which the pods push to.
+- a **deploy key** with write access to the cohort's GitHub repo, which the pods push to (setup
+  and backups need it).
 
 <details>
 <summary>Why one key shared by every participant?</summary>
@@ -107,7 +163,7 @@ arena --config ./config.env config check                   # a ✓ / ✗ row per
 | `GIT_SSH_KEY_LOCAL`, `GIT_SSH_KEY_REMOTE` | The deploy key here, and where it goes on each pod |
 | `ARENA_START_DATE` | The program's first Monday: day branches are named `w<week>d<day>` from it |
 | `LOCAL_BACKUP_DIR` | Where the rsync backups go (make it absolute) |
-| `SSH_PROXY_HOST`, `SSH_PROXY_STARTING_PORT` | The proxy's public host, and the first machine's port |
+| `SSH_PROXY_HOST`, `SSH_PROXY_STARTING_PORT` | The proxy's public host, and the first machine's port ([step 4](#4-set-up-the-proxy-recommended-for-a-cohort)) |
 
 Every key, with its default: [`config.env.example`](config.env.example) and the
 [config key table](FEATURE_MAP.md#config-keys-added-in-phases-04). The built-in `--config`
@@ -115,7 +171,13 @@ default is a path on ARENA's own control box, so pass `--config` (an `alias aren
 --config ~/arena/config.env'` saves typing). A key in the file can be overridden for one run by
 an environment variable of the same name ([details](docs/REFERENCE.md#overriding-config-without-editing-it)).
 
-### 4. The first pods
+### 4. Set up the proxy (recommended for a cohort)
+
+More than one person on the pods? **Set up the proxy now**, before the first pods, so `up` gives
+each pod its stable address as it comes up: [the six steps](#setting-up-the-proxy). On your own,
+skip it.
+
+### 5. The first pods
 
 ```bash
 arena pods up -n 4 --dry-run     # preview: the names and the pipeline; nothing is created
@@ -124,12 +186,13 @@ arena ssh-config --proxy         # the ~/.ssh/config to hand to the participants
 ```
 
 `up` syncs the proxy itself. Participants get the shared key and that `~/.ssh/config`, and
-connect with VS Code's `Remote-SSH: Connect to Host…`.
+connect with VS Code's `Remote-SSH: Connect to Host…`. No proxy? Hand out
+`arena ssh-config --out …` instead, and again after every restart.
 
-### 5. Turn the backups on
+### 6. Turn the backups on
 
 ```bash
-arena cron install --pull --proxy    # shows the crontab diff, asks first
+arena cron install --pull --proxy    # shows the crontab diff, asks first (no proxy: drop --proxy)
 arena cron show
 ```
 
@@ -202,14 +265,60 @@ name typed back.
 
 ## The proxy
 
+> **Running a cohort, or anything with more than one person? Set up the proxy.** On your own,
+> you can skip it.
+
 ![Manual SSH config vs the proxy: participants keep one static config while the proxy follows the pods](https://raw.githubusercontent.com/nickypro/arena-infra/refs/heads/main/management/arena-infra-diagram.png)
 
-A provider moves a pod's SSH endpoint whenever it restarts, so each machine gets a **stable
-public port** on the proxy host (`proxy.example.com:7000`, `:7001`, …), anchored to its place in
-`MACHINE_NAME_LIST`. nginx's `stream` module forwards it to wherever the pod is now. Participants'
-`~/.ssh/config` never changes; `arena` rewrites only the forwards, after every create, rename or
-terminate, and cron catches the rest every 5 minutes.
-[How the forwards are planned](docs/REFERENCE.md#proxy-and-ssh-config).
+A provider moves a pod's SSH endpoint whenever it restarts, and without a proxy everyone's
+`~/.ssh/config` goes stale with it. With one, each machine gets a **stable public port** on the
+proxy host (`proxy.example.com:7000`, `:7001`, …), anchored to its place in `MACHINE_NAME_LIST`,
+and nginx's `stream` module forwards it to wherever the pod is now. Participants' `~/.ssh/config`
+never changes; `arena` rewrites only the forwards, after every create, rename or terminate, and
+cron catches the rest every 5 minutes.
+
+### Setting up the proxy
+
+1. **A proxy host**: an always-on server with a public address. Simplest is to run `arena` and its
+   cron on it, which is the default. For a proxy on another box, set `PROXY_LOCAL=false` (step 3):
+   arena then installs the file there over SSH (port 22), offering the shared key and whatever
+   your `~/.ssh/config` gives that host. Let your own key in there, not the participants' shared one.
+2. **nginx with the `stream` module** (Debian/Ubuntu: `libnginx-mod-stream`), with the TCP ports
+   open: `SSH_PROXY_STARTING_PORT` onwards, one per name in `MACHINE_NAME_LIST`. arena writes a
+   file of bare `server` blocks, so include it from nginx's top-level `stream {}` block:
+
+   ```nginx
+   # /etc/nginx/nginx.conf, at the top level (not inside http { … })
+   stream { include /etc/nginx/streams-enabled/*.conf; }
+   ```
+
+   Then `sudo mkdir -p /etc/nginx/streams-enabled && sudo nginx -t`
+   (`unknown directive "stream"` = the module is missing). arena must be able to write there, as
+   the user it runs as (or as `SSH_PROXY_USER` on a remote proxy).
+3. **The keys** in `config.env`:
+
+   | Key | What it is | Unset |
+   | --- | --- | --- |
+   | `SSH_PROXY_HOST` | The public name or IP the participants connect to | no proxy |
+   | `SSH_PROXY_STARTING_PORT` | The first name's port; the next name gets +1, and so on | `7000` |
+   | `SSH_PROXY_NGINX_CONFIG_PATH` | The file arena writes, e.g. `/etc/nginx/streams-enabled/arena.conf` | `~/proxy.conf` |
+   | `SSH_PROXY_RELOAD_CMD` | Run after each write: `sudo nginx -t && sudo nginx -s reload` when not root; empty = write the file, never reload | `nginx -t && nginx -s reload` |
+   | `PROXY_LOCAL`, `SSH_PROXY_USER` | `false` = the proxy is another box, reached over SSH as this user | this box, `root` |
+
+4. **Write the forwards**: `arena proxy plan` previews them (read-only); `arena proxy apply`
+   writes the file and reloads nginx. From then on `create`, `up`, `terminate`, `rename` and
+   `replace` sync it themselves.
+5. **Hand out the config, once**: `arena ssh-config --proxy --out arena.conf` has a `Host` for
+   every name in `MACHINE_NAME_LIST`, running or not. Participants save it as
+   `~/.ssh/arena.conf` beside the shared key and make `Include ~/.ssh/arena.conf` the first line
+   of their `~/.ssh/config`. Its `IdentityFile` is `SHARED_SSH_KEY_PATH` as written, so a
+   `~/.ssh/…` path works on their machines too.
+6. **Keep it in sync**: `arena cron install --proxy` runs `proxy apply` every 5 minutes, which
+   catches changes made outside arena.
+
+**Without a proxy**, `arena ssh-config --out ~/.ssh/arena.conf` writes each pod's current
+endpoint. Run it again after any create, restart or replace; everyone who connects needs the
+new file. [How the forwards are planned](docs/REFERENCE.md#proxy-and-ssh-config).
 
 ## Backups
 
