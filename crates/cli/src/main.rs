@@ -8586,7 +8586,14 @@ async fn switch_branch(remote: Arc<dyn Remote>, cfg: &Config, sel: &Selected, ho
         format!("/root/{}", cfg.get("ARENA_REPO_NAME").unwrap_or("ARENA_materials"))
     });
     let key = cfg.get("GIT_SSH_KEY_REMOTE");
-    let cmd = arena_core::backup::checkout_command(&repo_path, branch, key, hard);
+    // `--hard`'s save is bounded by DISCARD_MAX_GB (a value it can't read stops the run here,
+    // before anything is backed up or switched); the gentle switch saves nothing.
+    let cmd = if hard {
+        let max = arena_core::backup::discard_max_kb(cfg).map_err(anyhow::Error::msg)?;
+        arena_core::backup::checkout_command_limited(&repo_path, branch, key, hard, max)
+    } else {
+        arena_core::backup::checkout_command(&repo_path, branch, key, hard)
+    };
 
     // Unreachable pods are reported — a silently-skipped pod left on a stale/diverged branch
     // (especially under --hard) is exactly what we don't want.
@@ -21154,7 +21161,7 @@ mod remote_tests {
     use super::{copy_failure_reason, discarded_note, fallback_lines, mirror_refusal_text, not_pushed_note, sync_time_label, unredacted_note, Pulled};
     use super::{failure_why, local_backup_dir, push_first_note, take_pod_locks, take_said, telling_line, PodCall};
     use arena_core::selector::{Naming, SelectArgs};
-    use arena_core::backup::{backup_command, checkout_command, init_branch_command, BackupConfig, BACKUP_BUSY_EXIT};
+    use arena_core::backup::{backup_command, checkout_command, checkout_command_limited, init_branch_command, BackupConfig, BACKUP_BUSY_EXIT};
     use arena_core::remote::{FakeRemote, FakeReply, Remote, RemoteCall, PROBE_TIMEOUT};
     use arena_core::ssh::{login_shell_wrap, SshTarget};
     use arena_core::{Config, Pod, PodSpec, Provider, Result};
@@ -23201,6 +23208,41 @@ mod remote_tests {
                                files on a branch no backup commits), copied before the --hard switch discarded or overwrote it — what \
                                it discarded is also saved on the pod, in .git/arena-discarded/<time>/, which no later copy overwrites \
                                (see each one's line): devtest-bloom";
+
+    /// Review ai-review claude #2: the most a `--hard` save copies (`DISCARD_MAX_GB`, GB) reaches
+    /// the switch's command from the config; a value it can't read stops the run before anything
+    /// is backed up or switched. The gentle switch saves nothing, so never reads it.
+    #[tokio::test]
+    async fn hard_takes_its_save_limit_from_the_config_and_a_bad_one_stops_it_first() {
+        let stub = StubRsync::new("discard-limit");
+        let dir = stub.0.join("backups");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = |extra: &str| {
+            Config::parse(&format!(
+                "MACHINE_NAME_PREFIX=devtest\nMACHINE_NAME_LIST=(apple bloom cloud)\nBACKUP_REPO_PATH={REPO}\n\
+                 GIT_SSH_KEY_REMOTE={KEY}\nSHARED_SSH_KEY_PATH=/nonexistent/devtest_key\nARENA_START_DATE=2026-01-05\n\
+                 LOCAL_BACKUP_DIR={}\n{extra}",
+                dir.display()
+            ))
+        };
+        let apple = everyone(&fleet_of(&[("apple", 22001)]));
+        let backup = (backup_command(REPO, Some(KEY), "arena backup devtest-apple", None), Some(BACKUP_TIMEOUT));
+        let pushed = || [FakeReply::stdout("BRANCH autocommit-a\nPUSHED autocommit-a\n"), FakeReply::ok()];
+        for (extra, kb) in [("", 5 * 1024 * 1024), ("DISCARD_MAX_GB=0.5\n", 512 * 1024)] {
+            let fake = Arc::new(FakeRemote::new());
+            fake.script(&host(22001), pushed());
+            handle_set_branch(fake.clone(), &cfg(extra), "main", &apple, true, false, true, &stub.path()).await.unwrap();
+            let hard = (checkout_command_limited(REPO, "main", Some(KEY), true, kb), Some(BRANCH_TIMEOUT));
+            assert_eq!(execs(&fake, 22001), [backup.clone(), hard], "{extra:?}");
+        }
+        let fake = Arc::new(FakeRemote::new());
+        let err = handle_set_branch(fake.clone(), &cfg("DISCARD_MAX_GB=lots\n"), "main", &apple, true, false, true, &stub.path()).await.unwrap_err();
+        assert_eq!(err.to_string(), "DISCARD_MAX_GB must be a number of GB above 0, like 5 or 0.5 (got `lots`)");
+        assert!(execs(&fake, 22001).is_empty(), "nothing backed up or switched");
+        fake.script(&host(22001), pushed());
+        handle_set_branch(fake.clone(), &cfg("DISCARD_MAX_GB=lots\n"), "main", &apple, false, false, true, &stub.path()).await.unwrap();
+        assert_eq!(execs(&fake, 22001), [backup, (checkout_command(REPO, "main", Some(KEY), false), Some(BRANCH_TIMEOUT))]);
+    }
 
     /// What a `--hard` switch prints when it saved what it discarded ([`checkout_command`]).
     const SAVED_BLOOM: &str = "Switched to and reset branch 'main'\nDISCARDED_SAVED .git/arena-discarded/20261019T090102Z\n";

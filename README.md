@@ -853,7 +853,16 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     archive) carries it under a name no later save reuses: the copy into `LOCAL_BACKUP_DIR` is the
     day's label, which the next pull of that label overwrites from the reset pod (review ai-review
     claude #2). Nothing to discard, no folder; a save that fails leaves the pod as it was, not
-    reset (a failed switch), and removes what it had copied. `--hard` with `--include-non-cohort` is refused unless the pods are
+    reset (a failed switch), and removes what it had copied, refs and all. So does a save the
+    switch is stopped in the middle of — its 100 s bound's TERM, a dropped connection (review
+    ai-review claude #2: a 30 GB directory's copy never finished, and each try left another partial
+    copy in `.git`): the switch's exit trap puts the keys back, then removes it (a KILL runs no
+    trap). And what `untracked/` would hold is totalled first (`du -sk`): over `DISCARD_MAX_GB`
+    (default 5) or over half what's free on that disk (`df`), nothing of it is copied and the pod
+    isn't reset — `arena set-branch: not reset — the --hard reset would remove checkpoints (31.2
+    GB), which is more than DISCARD_MAX_GB allows (5.0 GB) to save first: move it out of the
+    checkout (cd '/root/ARENA_materials' && mv -- 'checkpoints' '../checkpoints.kept'), or delete
+    it, then switch again`. `--hard` with `--include-non-cohort` is refused unless the pods are
     named: it would reset staff boxes and other cohorts' pods too. A file the
     backup committed with a key redacted keeps the real key on disk: around the switch it's set
     aside in `.git/arena-unredacted/<time>-<pid>/` (so gentle doesn't refuse it and `--hard`

@@ -1116,7 +1116,35 @@ fn init_branch_script(cfg: &BackupConfig, machine_name: &str) -> String {
 /// onto the other branch. `--hard` goes ahead and ends it with the other local changes it
 /// discards — saved first, as above (`set-branch` copies such a pod too, and says so).
 pub fn checkout_command(repo_path: &str, branch: &str, git_ssh_key: Option<&str>, hard: bool) -> String {
-    bounded_switch(&switch_script(repo_path, branch, git_ssh_key, hard), SWITCH_BOUND_SECS, SWITCH_KILL_AFTER_SECS)
+    checkout_command_limited(repo_path, branch, git_ssh_key, hard, DISCARD_MAX_GB * 1024 * 1024)
+}
+
+/// [`checkout_command`] with the most a `--hard` save may copy into `untracked/`, in KiB
+/// ([`discard_max_kb`]: config `DISCARD_MAX_GB`). Over that, or over half what's free on the
+/// pod's disk there, the save is refused before anything of it is copied — not reset, and the
+/// line says what was too big and how to move it out of the way (review ai-review claude #2: a
+/// 30 GB directory copied under the switch's bound was cut short every time, each try leaving
+/// another partial copy in `.git`). A save the bound (or a dropped connection) stops in the middle
+/// of is removed by the switch's EXIT trap, after the keys are put back: no partial folder or ref
+/// is left, and the pod isn't reset.
+pub fn checkout_command_limited(repo_path: &str, branch: &str, git_ssh_key: Option<&str>, hard: bool, discard_max_kb: u64) -> String {
+    bounded_switch(&switch_script(repo_path, branch, git_ssh_key, hard, discard_max_kb), SWITCH_BOUND_SECS, SWITCH_KILL_AFTER_SECS)
+}
+
+/// The most a `--hard` save copies into `.git/arena-discarded/<save>/untracked/` by default, in GB
+/// (config `DISCARD_MAX_GB`, [`discard_max_kb`]).
+pub const DISCARD_MAX_GB: u64 = 5;
+
+/// [`checkout_command_limited`]'s limit, in KiB: config `DISCARD_MAX_GB` (GB, a positive number:
+/// `5`, `0.5`, `40`), else [`DISCARD_MAX_GB`]. `Err` names the key and the value it can't read.
+pub fn discard_max_kb(cfg: &Config) -> std::result::Result<u64, String> {
+    match cfg.get("DISCARD_MAX_GB").map(str::trim).filter(|v| !v.is_empty()) {
+        None => Ok(DISCARD_MAX_GB * 1024 * 1024),
+        Some(raw) => match raw.parse::<f64>() {
+            Ok(gb) if gb.is_finite() && gb > 0.0 && gb <= 1_000_000.0 => Ok(((gb * 1024.0 * 1024.0).round() as u64).max(1)),
+            _ => Err(format!("DISCARD_MAX_GB must be a number of GB above 0, like 5 or 0.5 (got `{raw}`)")),
+        },
+    }
 }
 
 /// `script` as the pod runs it: under `sh -c` (`$0` = `name`), whatever the login shell that `-c`s
@@ -1160,8 +1188,9 @@ fn bounded_switch(script: &str, secs: u64, kill_after: u64) -> String {
     bounded_sh(script, "arena-set-branch", secs, kill_after, &stopped, &killed)
 }
 
-/// The switch itself ([`checkout_command`]), a POSIX `sh` script.
-fn switch_script(repo_path: &str, branch: &str, git_ssh_key: Option<&str>, hard: bool) -> String {
+/// The switch itself ([`checkout_command`]), a POSIX `sh` script; `discard_max_kb`: the most a
+/// `--hard` save copies into `untracked/` ([`checkout_command_limited`]).
+fn switch_script(repo_path: &str, branch: &str, git_ssh_key: Option<&str>, hard: bool, discard_max_kb: u64) -> String {
     let mut parts: Vec<String> = vec!["set -e".into(), format!("cd {}", shell_quote(repo_path))];
     if !hard {
         // A participant's merge (cherry-pick, revert, conflicts) is never ended by the gentle
@@ -1188,7 +1217,7 @@ fn switch_script(repo_path: &str, branch: &str, git_ssh_key: Option<&str>, hard:
         // branch reset to origin (discards local changes/commits on it), then end any `git am`,
         // rebase or sequence the switch left behind (their state only).
         format!(
-            "discarded_save \"$G\" {remote_ref} {b} && git checkout -f -B {b} {remote_ref} && git reset --hard {remote_ref} && \
+            "discarded_save \"$G\" {remote_ref} {b} {discard_max_kb} && git checkout -f -B {b} {remote_ref} && git reset --hard {remote_ref} && \
              {{ git rebase --quit >/dev/null 2>&1; git am --quit >/dev/null 2>&1; git cherry-pick --quit >/dev/null 2>&1; true; }}",
             b = shell_quote(branch)
         )
@@ -1215,13 +1244,20 @@ fn switch_script(repo_path: &str, branch: &str, git_ssh_key: Option<&str>, hard:
     }
     // The putting back is the EXIT trap, set before anything is set aside: whatever ends the
     // command from here on — the switch failing, `set -e`, a signal (made an exit, so the trap
-    // runs) — the keys go back first (claude #4).
-    lines.push(
+    // runs) — the keys go back first (claude #4). Under `--hard`, then a save the switch was
+    // stopped in the middle of is removed (`ds_abandon`, review ai-review claude #2), and a restore
+    // that failed still fails the command, as it did alone.
+    let on_exit = if hard {
+        "ds_rc=0; unredacted_restore \"$G/arena-unredacted\" || ds_rc=$?; ds_abandon; [ \"$ds_rc\" = 0 ]"
+    } else {
+        "unredacted_restore \"$G/arena-unredacted\""
+    };
+    lines.push(format!(
         "cd \"$(git rev-parse --show-toplevel)\"; G=$(git rev-parse --absolute-git-dir); \
-         trap 'unredacted_restore \"$G/arena-unredacted\"' EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; \
-         unredacted_aside \"$G/arena-unredacted\""
-            .into(),
-    );
+         trap {} EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; \
+         unredacted_aside \"$G/arena-unredacted\"",
+        shell_quote(on_exit)
+    ));
     lines.push(format!("if {switch}; then SWITCHED=1; else SWITCHED=; fi"));
     // The adopted clones (listed by the backup in `$G/arena-nested`) the switch removed: back
     // from the old HEAD, staged.
@@ -1281,6 +1317,9 @@ fn shell_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The default limit of a `--hard` save, in KiB ([`DISCARD_MAX_GB`]).
+    const KB5: u64 = DISCARD_MAX_GB * 1024 * 1024;
 
     fn cfg() -> BackupConfig {
         BackupConfig {
@@ -1612,15 +1651,15 @@ mod tests {
             assert!(secret_regex().contains(&format!("{}{}", p.lead, p.re)));
             assert!(redact_sed().contains(&format!("s#{}{}#\\1{}#g", p.lead, p.re, p.replacement)));
         }
-        let set_branch = switch_script("/r", "main", None, false);
+        let set_branch = switch_script("/r", "main", None, false, KB5);
         assert!(set_branch.contains(&format!("REDACT_SED='{}'", redact_sed())));
         assert!(set_branch.contains("unredacted_aside()") && set_branch.contains("unredacted_restore()"));
         for shell in ["sh", "bash"] {
             for cmd in [
                 checkout_command("/r", "main", None, false),
                 checkout_command("/r", "main", Some("/k"), true),
-                switch_script("/r", "main", None, false),
-                switch_script("/r", "main", Some("/k"), true),
+                switch_script("/r", "main", None, false, KB5),
+                switch_script("/r", "main", Some("/k"), true, KB5),
             ] {
                 let o = std::process::Command::new(shell).arg("-n").arg("-c").arg(&cmd).output().expect(shell);
                 assert!(o.status.success(), "{shell} -n: {}", String::from_utf8_lossy(&o.stderr));
@@ -3009,7 +3048,7 @@ done
 
     #[test]
     fn checkout_is_gentle_ff_only() {
-        let c = switch_script("/root/ARENA_3.0", "main", Some("/root/.ssh/id_ed25519"), false);
+        let c = switch_script("/root/ARENA_3.0", "main", Some("/root/.ssh/id_ed25519"), false, KB5);
         assert!(c.contains("cd '/root/ARENA_3.0'"));
         assert!(c.contains("git fetch --prune origin"));
         // Origin's branch by its full name, never the local branch's upstream (codex #5).
@@ -3024,18 +3063,23 @@ done
 
     #[test]
     fn checkout_hard_resets_to_origin() {
-        let c = switch_script("/root/ARENA_3.0", "main", None, true);
+        let c = switch_script("/root/ARENA_3.0", "main", None, true, KB5);
         assert!(c.contains("git fetch --prune origin"));
         // What it discards saved first — no save, no reset — then force-switch the branch to
         // origin and hard-reset (destructive).
-        assert!(c.contains("discarded_save() {") && c.contains("if discarded_save \"$G\" 'origin/main' 'main' && git checkout -f -B 'main' 'origin/main'"));
+        assert!(c.contains("discarded_save() {") && c.contains("if discarded_save \"$G\" 'origin/main' 'main' 5242880 && git checkout -f -B 'main' 'origin/main'"));
         assert!(c.contains("git reset --hard 'origin/main'"));
         assert!(!c.contains("--ff-only"));
-        // The keys' restore is the EXIT trap, set before the set-aside (claude #4).
-        for cmd in [c.clone(), switch_script("/r", "main", None, false)] {
-            let trap = cmd.find("trap 'unredacted_restore \"$G/arena-unredacted\"' EXIT").expect("the trap");
+        // The keys' restore is the EXIT trap, set before the set-aside (claude #4) — under --hard,
+        // followed by the removal of a save stopped part-way (claude #2), a failed restore still
+        // failing the command.
+        let hard_trap = "trap 'ds_rc=0; unredacted_restore \"$G/arena-unredacted\" || ds_rc=$?; ds_abandon; [ \"$ds_rc\" = 0 ]' EXIT";
+        for (cmd, trap) in [(c.clone(), hard_trap), (switch_script("/r", "main", None, false, KB5), "trap 'unredacted_restore \"$G/arena-unredacted\"' EXIT")] {
+            let trap = cmd.find(trap).expect("the trap");
             assert!(trap < cmd.find("unredacted_aside \"$G").unwrap() && cmd.contains("trap 'exit 143' TERM"));
         }
+        assert!(!switch_script("/r", "main", None, false, KB5).contains("ds_abandon"));
+        assert!(switch_script("/r", "main", None, true, 77).contains("'origin/main' 'main' 77 && git checkout"));
     }
 
     /// The switch runs under `sh`, whatever the login shell that `-c`s the command (zsh on the
@@ -3045,7 +3089,7 @@ done
     fn the_switch_bounds_itself_on_the_pod_under_sh() {
         for hard in [false, true] {
             let c = checkout_command("/r", "main", Some("/k"), hard);
-            let script = switch_script("/r", "main", Some("/k"), hard);
+            let script = switch_script("/r", "main", Some("/k"), hard, KB5);
             let head = format!("ARENA_SH={}\n", shell_quote(&script));
             assert!(c.starts_with(&head), "{c}");
             let rest = &c[head.len()..];
@@ -3062,6 +3106,18 @@ done
         let rest = &init[head.len()..];
         assert!(rest.starts_with("if timeout -k 1 1 true >/dev/null 2>&1; then timeout -k 10 100 sh -c \"$ARENA_SH\" arena-init-branches; r=$?;"), "{rest}");
         assert!(rest.ends_with("else exec sh -c \"$ARENA_SH\" arena-init-branches; fi") && rest.contains("arena init-branches: it ran past its 100 s"), "{rest}");
+    }
+
+    /// `DISCARD_MAX_GB`: GB, a positive number, else 5 — in KiB, as the save's `du -sk` counts.
+    #[test]
+    fn the_discard_limit_is_the_configs_gb_else_five() {
+        for (text, want) in [("", KB5), ("DISCARD_MAX_GB= \n", KB5), ("DISCARD_MAX_GB=20\n", 20 * 1024 * 1024), ("DISCARD_MAX_GB=0.5\n", 512 * 1024)] {
+            assert_eq!(discard_max_kb(&Config::parse(text)), Ok(want), "{text:?}");
+        }
+        for bad in ["0", "-1", "lots", "5GB", "inf", "NaN"] {
+            let err = discard_max_kb(&Config::parse(&format!("DISCARD_MAX_GB={bad}\n"))).unwrap_err();
+            assert!(err.starts_with("DISCARD_MAX_GB must be a number of GB above 0") && err.contains(&format!("`{bad}`")), "{err}");
+        }
     }
 
     #[test]
@@ -3755,9 +3811,9 @@ done
         assert!(s.contains("\nbusy_stop\ngit add -A -- \"$@\"\n") && calls[1] == s.find("\nbusy_stop\ngit add -A").unwrap());
         assert!(calls[2] == s.find("\nbusy_stop\nif ! git diff --cached --quiet; then git commit").unwrap());
         // The gentle switch and init-branches check it too, first; --hard doesn't.
-        let gentle = switch_script("/r", "main", None, false);
+        let gentle = switch_script("/r", "main", None, false, KB5);
         assert!(gentle.contains(BUSY_OP_SH) && gentle.find("busy_op").unwrap() < gentle.find("git fetch").unwrap());
-        assert!(!switch_script("/r", "main", None, true).contains("busy_op"));
+        assert!(!switch_script("/r", "main", None, true, KB5).contains("busy_op"));
         let init = init_branch_script(&cfg(), "arena8-apple");
         assert!(init.find("busy_op").unwrap() < init.find("git checkout -b").unwrap());
         // On a branch it skips, the work there is only said, read-only, before the SKIP.
@@ -3775,10 +3831,10 @@ done
         let order = ["W=changes", "W=commits", "W=untracked"].map(|w| skip.find(w).unwrap_or_else(|| panic!("{w}")));
         assert!(order.windows(2).all(|p| p[0] < p[1]), "{order:?}");
         // The --hard switch ends a `git am`, rebase or sequence once it has switched; gentle never does.
-        let hard = switch_script("/r", "main", None, true);
+        let hard = switch_script("/r", "main", None, true, KB5);
         let quits = hard.find("git rebase --quit").expect("quit");
         assert!(hard.find("git reset --hard").unwrap() < quits && hard.contains("git am --quit") && hard.contains("git cherry-pick --quit"));
-        assert!(!switch_script("/r", "main", None, false).contains("--quit"));
+        assert!(!switch_script("/r", "main", None, false, KB5).contains("--quit"));
         for write in ["git add", "update-index", "git commit", "git push", "git stash", "git reset"] {
             assert!(!skip.contains(write), "{write}");
         }
@@ -4641,7 +4697,7 @@ done
         for shell in &shells {
             for hard in [false, true] {
                 let t0 = std::time::Instant::now();
-                let (code, out, err) = run_in(shell, &bounded_switch(&switch_script(repo, "main", None, hard), 2, 1), &hang);
+                let (code, out, err) = run_in(shell, &bounded_switch(&switch_script(repo, "main", None, hard, KB5), 2, 1), &hang);
                 assert_eq!(code, Some(124), "{shell} hard={hard}: {out}{err}");
                 assert!(t0.elapsed() < std::time::Duration::from_secs(20), "{shell} hard={hard}: bounded");
                 assert!(err.contains("the switch ran past its 2 s on the pod and was stopped there"), "{shell} hard={hard}: {err}");
@@ -4893,6 +4949,97 @@ done
         assert_eq!(read(&d.join("data.bin/part1")), "mine\n");
         assert_eq!(std::fs::read_link(d.join("exercises")).unwrap(), elsewhere);
         assert_eq!(read(&elsewhere.join("mine.py")), "mine = 1\n", "what the link pointed to, untouched");
+    }
+
+    /// Review ai-review claude #2: under the switch's bound (100 s on the pod), a `--hard` save whose
+    /// directory copy couldn't finish was stopped by the TERM, and only the keys were put back: the
+    /// partial copy stayed in `.git/arena-discarded/`, and every retry left another. Now the
+    /// switch's EXIT trap removes a save it didn't complete, after putting the keys back: stopped
+    /// mid-copy, nothing is left and nothing is reset. And what the save would copy is totalled
+    /// first: over `DISCARD_MAX_GB`, or over half what's free on the pod's disk, the switch is
+    /// refused before any of it is copied — not reset — saying what was too big and how to move it
+    /// out of the way, which then lets the switch through.
+    #[cfg(unix)]
+    #[test]
+    fn a_save_stopped_midway_leaves_nothing_and_one_too_big_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = GitSandbox::new("discarded-bounds", 1_000_000);
+        let repo = s.work.to_str().unwrap();
+        // A real key the backup committed redacted (set aside around the switch).
+        let ex = format!("KEY = \"{}\"\n", openrouter_key(29));
+        std::fs::write(s.work.join("ex.py"), &ex).unwrap();
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.redacted.len()), (Some(0), 1), "{err}");
+        // The staff's main now tracks a `checkpoints` file; the pod has an ignored checkpoints/.
+        let staff = s.base.join("staff");
+        s.git(&s.base, &["clone", "-q", "-b", "main", s.origin.to_str().unwrap(), staff.to_str().unwrap()]);
+        std::fs::write(staff.join("checkpoints"), "the staff's checkpoints file\n").unwrap();
+        s.git(&staff, &["add", "-A"]);
+        s.git(&staff, &["-c", "user.name=u", "-c", "user.email=u@u", "commit", "-q", "-m", "staff"]);
+        s.git(&staff, &["push", "-q", "origin", "main"]);
+        std::fs::write(s.work.join(".git/info/exclude"), "checkpoints/\n").unwrap();
+        std::fs::create_dir_all(s.work.join("checkpoints")).unwrap();
+        let weights = body("0123456789abcdef", 200 * 1024, 3);
+        std::fs::write(s.work.join("checkpoints/model.pt"), &weights).unwrap();
+        let head = s.git(&s.work, &["rev-parse", "HEAD"]);
+        let untouched = |what: &str| {
+            assert_eq!(
+                (s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), s.git(&s.work, &["rev-parse", "HEAD"])),
+                ("autocommit-x".to_string(), head.clone()),
+                "{what}: not reset"
+            );
+            assert_eq!(s.read("checkpoints/model.pt"), weights.as_bytes(), "{what}");
+            assert_eq!(s.read("ex.py"), ex.as_bytes(), "{what}: the real key put back");
+            assert!(!s.work.join(".git/arena-discarded").exists(), "{what}: nothing of the save left");
+            assert_eq!(s.git(&s.work, &["for-each-ref", "refs/arena-discarded/"]), "", "{what}: no ref left");
+        };
+        let stand_in = |dir: &str, name: &str, text: &str| {
+            let bin = s.base.join(dir);
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::write(bin.join(name), text).unwrap();
+            std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755)).unwrap();
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default())
+        };
+        let real = |tool: &str| {
+            let o = std::process::Command::new("sh").args(["-c", &format!("command -v {tool}")]).output().unwrap();
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        // Stopped mid-copy: a `cp` that copies into the save, then hangs; the bound's TERM at 2 s.
+        let slow = stand_in(
+            "bin-slow-cp",
+            "cp",
+            &format!("#!/bin/sh\ncase \"$*\" in *arena-discarded/*) {0} \"$@\"; sleep 30; exit 1;; esac\nexec {0} \"$@\"\n", real("cp")),
+        );
+        let t0 = std::time::Instant::now();
+        let (code, out, err) = run_in("bash", &bounded_switch(&switch_script(repo, "main", None, true, KB5), 2, 1), &slow);
+        assert_eq!(code, Some(124), "{out}{err}");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(20) && err.contains("was stopped there"), "{err}");
+        untouched("stopped mid-copy");
+        // Over DISCARD_MAX_GB (here 100 KiB): refused, nothing copied.
+        let plain = std::env::var("PATH").unwrap_or_default();
+        let (code, out, err) = run_on_path(&checkout_command_limited(repo, "main", None, true, 100), &plain);
+        assert_ne!(code, Some(0), "{out}");
+        let line = err.lines().find(|l| l.starts_with("arena set-branch: not reset — the --hard reset would remove checkpoints (")).unwrap_or_else(|| panic!("{err}"));
+        assert!(line.contains(" KB), which is more than DISCARD_MAX_GB allows (100 KB) to save first: move it out of the checkout"), "{line}");
+        untouched("over DISCARD_MAX_GB");
+        // Over half what's free on its disk (a `df` that says 300 KB): refused the same way.
+        let full = stand_in(
+            "bin-full",
+            "df",
+            "#!/bin/sh\necho 'Filesystem 1024-blocks Used Available Capacity Mounted on'\necho 'overlay 1000 700 300 70% /'\n",
+        );
+        let (code, out, err) = run_on_path(&checkout_command(repo, "main", None, true), &full);
+        assert_ne!(code, Some(0), "{out}");
+        assert!(err.contains("which is more than half the 300 KB free on its disk to save first") && !err.contains("DISCARD_MAX_GB"), "{err}");
+        untouched("over half the free space");
+        // What the line says moves it out of the way, and the switch then goes through.
+        let fix = line.split_once("(cd ").and_then(|(_, r)| r.split_once("), or delete it")).map(|(f, _)| f).expect("the move");
+        assert_eq!(fix, format!("'{repo}' && mv -- 'checkpoints' '../checkpoints.kept'"));
+        assert!(s.run(&format!("cd {fix}")).status.success());
+        let o = s.run(&checkout_command_limited(repo, "main", None, true, 100));
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), s.git(&s.work, &["rev-parse", "origin/main"]));
+        assert_eq!(std::fs::read(s.base.join("checkpoints.kept/model.pt")).unwrap(), weights.as_bytes());
     }
 
     /// Review ai-review claude #4, to verify: could the gentle switch's refusal of a pod mid-merge

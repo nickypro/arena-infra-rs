@@ -36,16 +36,22 @@
 # and no ref. Prints, on stdout:
 #   DISCARDED_SAVED <path>   the folder, relative to the repo's top
 #   DISCARDED_PINNED <ref>   each ref it made
-# `discarded_save <git dir> <ref> <branch>`: non-zero, said on stderr, when it couldn't save — the
-# caller then doesn't reset, and the part saved so far is removed, refs and all (the work is all
-# still in place; a copy cut short by a full disk mustn't stay to fill it). A <ref> that isn't a
-# commit saves nothing: the switch fails on it, discarding nothing.
+# `discarded_save <git dir> <ref> <branch> <max KiB>`: non-zero, said on stderr, when it couldn't
+# save — the caller then doesn't reset, and the part saved so far is removed, refs and all (the
+# work is all still in place; a copy cut short by a full disk mustn't stay to fill it). So when
+# what untracked/ would hold is over <max KiB> (DISCARD_MAX_GB) or over half what's free on the
+# filesystem of <git dir> (review ai-review claude #2): totalled first, nothing of it copied, and
+# the line says what was too big and how to move it out of the way (`ds_fits`). A save the switch
+# is stopped in the middle of (a TERM from its bound, a dropped connection: an exit, so the EXIT
+# trap runs) is removed by `ds_abandon`, the switch's EXIT trap; only a completed one ($ds_done,
+# set after its last step) stays. A <ref> that isn't a commit saves nothing: the switch fails on
+# it, discarding nothing.
 discarded_save() {
     if ! git rev-parse -q --verify "$2^{commit}" >/dev/null 2>&1; then return 0; fi
     ds_head=$(git rev-parse -q --verify HEAD 2>/dev/null) || ds_head=
     ds_on=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || ds_on=HEAD
     ds_d="$1/arena-discarded/$(date -u +%Y%m%dT%H%M%SZ)"
-    ds_made= ds_refs=
+    ds_made= ds_refs= ds_done=
     # Never into an earlier save's folder: a second reset in the same second gets its own.
     mkdir -p "$1/arena-discarded" 2>/dev/null || true
     if ! mkdir "$ds_d" 2>/dev/null; then
@@ -129,10 +135,10 @@ discarded_save() {
             fi
         done
     done < "$ds_w/walk"
-    if ! { LC_ALL=C sort -u "$ds_w/hit" > "$ds_w/untracked" && ds_copy "$ds_w/untracked" "$ds_d/untracked"; }; then
-        ds_fail "$ds_d" "the untracked files"
-        return 1
-    fi
+    if ! LC_ALL=C sort -u "$ds_w/hit" > "$ds_w/untracked"; then ds_fail "$ds_d" "the untracked files"; return 1; fi
+    # Whether it fits, before any of it is copied: a directory goes whole.
+    if [ -s "$ds_w/untracked" ] && ! ds_fits "$ds_w/untracked" "$1" "$4"; then ds_remove "$ds_d"; return 1; fi
+    if ! ds_copy "$ds_w/untracked" "$ds_d/untracked"; then ds_fail "$ds_d" "the untracked files"; return 1; fi
     rm -rf "$ds_w"
     # The refs (above), whether or not anything else was saved.
     ds_name=$(basename -- "$ds_d")
@@ -165,8 +171,46 @@ discarded_save() {
         if ! git update-ref "$ds_bpin" "$ds_tip"; then ds_fail "$ds_d" "the ref $ds_bpin"; return 1; fi
         ds_refs="$ds_refs $ds_bpin"
     fi
+    ds_done=1
     printf 'DISCARDED_SAVED %s\n' "${ds_d#"$(pwd)/"}"
     for ds_r in $ds_refs; do printf 'DISCARDED_PINNED %s\n' "$ds_r"; done
+}
+
+# `ds_abandon`: for the switch's EXIT trap. A save this run began and didn't complete — the switch
+# stopped in the middle of it (review ai-review claude #2: a 30 GB directory copied under the
+# switch's 100 s bound was cut short by its TERM, and each try left another partial copy in
+# .git) — is removed, folder and refs; the pod wasn't reset. A completed save always stays,
+# whatever happens to the reset after it. (A KILL runs no trap: a save it cuts short stays.)
+ds_abandon() {
+    if [ -n "${ds_made:-}${ds_refs:-}" ] && [ -z "${ds_done:-}" ]; then ds_remove "$ds_d"; fi
+    return 0
+}
+
+# `ds_fits <list> <git dir> <max KiB>`: whether the paths listed (relative to the repo's top) fit
+# in a save — `du -sk` of each, totalled — under <max KiB> and under half what's free on the
+# filesystem of <git dir> (`df -Pk`; a `df` that can't tell leaves only the max). If not, says on
+# stderr which path is biggest, how much is too much, and how to move it out of the way.
+ds_fits() {
+    tr '\n' '\0' < "$1" | xargs -0 du -sk -- 2>/dev/null | LC_ALL=C sort -rn > "$1.du" || true
+    ds_kb=$(awk '{ s += $1 } END { printf "%.0f\n", s + 0 }' "$1.du")
+    ds_free=$(df -Pk -- "$2" 2>/dev/null | awk 'NR == 2 && $4 ~ /^[0-9]+$/ { print $4 }')
+    ds_over=
+    if [ "$ds_kb" -gt "$3" ]; then ds_over="more than DISCARD_MAX_GB allows ($(ds_size "$3"))"; fi
+    if [ -n "$ds_free" ] && [ "$((ds_kb * 2))" -gt "$ds_free" ]; then
+        ds_over="${ds_over:+$ds_over, and }more than half the $(ds_size "$ds_free") free on its disk"
+    fi
+    if [ -z "$ds_over" ]; then return 0; fi
+    ds_big=$(head -n 1 "$1.du" | cut -f2-)
+    ds_what="$ds_big ($(ds_size "$(head -n 1 "$1.du" | cut -f1)"))"
+    ds_n=$(wc -l < "$1.du")
+    if [ "$ds_n" -gt 1 ]; then ds_what="$ds_what and $((ds_n - 1)) more path(s), $(ds_size "$ds_kb") in all"; fi
+    printf '%s\n' "arena set-branch: not reset — the --hard reset would remove $ds_what, which is $ds_over to save first: move it out of the checkout (cd '$(pwd)' && mv -- '$ds_big' '../$(basename -- "$ds_big").kept'), or delete it, then switch again" >&2
+    return 1
+}
+
+# `ds_size <KiB>`: in words, GB to one decimal.
+ds_size() {
+    awk -v k="$1" 'BEGIN { if (k >= 1048576) printf "%.1f GB", k / 1048576; else if (k >= 1024) printf "%d MB", k / 1024; else printf "%d KB", k }'
 }
 
 # `ds_copy <list> <dir>`: each path listed (one per line, relative to the repo's top) copied into
@@ -179,11 +223,16 @@ ds_copy() {
     done < "$1"
 }
 
-# `ds_fail <dir> <what>`: says what couldn't be saved, and removes the save's own folder (made by
-# this run: $ds_made) and the refs it made ($ds_refs) — the pod isn't reset, so nothing in it is
-# needed.
+# `ds_fail <dir> <what>`: says what couldn't be saved, and removes the save (`ds_remove`) — the pod
+# isn't reset, so nothing in it is needed.
 ds_fail() {
     printf '%s\n' "arena set-branch: couldn't save $2 into $1 before the --hard reset - not reset" >&2
+    ds_remove "$1"
+}
+
+# `ds_remove <dir>`: removes the save's own folder (made by this run: $ds_made) and the refs it
+# made ($ds_refs).
+ds_remove() {
     if [ -n "$ds_made" ]; then
         rm -rf "$1"
         rmdir "$(dirname -- "$1")" 2>/dev/null || true
