@@ -752,16 +752,26 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
       clean changes of both sides kept — so a course fix elsewhere in the file is never recorded
       as merged and dropped), a binary file, a symlink or a modify/delete whole, a path that side
       deleted removed. A notebook (`*.ipynb`) merged per hunk must still parse as JSON (python3's
-      json, else jq): one side's conflict beside the other side's clean hunk can leave a bracket
-      or a comma wrong, and Jupyter wouldn't open it — then, or with neither on the pod, it is
-      taken whole from that side, and the message and the line say why. A notebook resolved by
-      hand that doesn't parse leaves it BUSY (`x.ipynb isn't valid JSON: …`).
+      json, run isolated — `-I`, so a participant's `json.py` at the checkout's top is never
+      imported nor a `__pycache__` written there — else jq): one side's conflict beside the other
+      side's clean hunk can leave a bracket or a comma wrong, and Jupyter wouldn't open it. Then —
+      or when nothing on the pod can tell (no python3 or jq, or one that fails some other way than
+      "not JSON": a broken conda shim) — it stays BUSY, `x.ipynb can't be merged per hunk into
+      valid JSON — resolve it in Jupyter, or abort`: never taken whole from one side, which would
+      drop the other side's changes to it. A notebook resolved by hand that doesn't parse (or
+      can't be checked) leaves it BUSY too (`x.ipynb isn't valid JSON: …`).
     A file over 95 MB anywhere in that, or conflict markers the participant already staged
     (`git add` of a file still in conflict), leaves it BUSY, said. A merge's or a cherry-pick's
     commit takes the whole index, so every path staged against HEAD counts, not only the
-    conflicted ones — a file resolved or added and `git add`ed before: a blob over 95 MB or a
-    nested repo staged as a gitlink leaves it BUSY too (`model.pt is staged at … bytes, over
-    git's …-byte limit: never committed — unstage it, or abort, on the pod`). The state before is
+    conflicted ones — a file resolved or added and `git add`ed before: a blob over 95 MB, a
+    nested repo staged as a gitlink (not a submodule the staged `.gitmodules` lists, as the
+    backup's own check reads it), or a notebook that isn't valid JSON (or can't be checked)
+    leaves it BUSY too (`model.pt is staged at … bytes, over git's …-byte limit: never committed —
+    unstage it, or abort, on the pod`). What the other side brings as it has it, the participant
+    never staged, and the words say so (`… comes in from the merged branch (MERGE_HEAD) at …
+    bytes, …: arena won't commit it — finish the merge yourself, or abort it, on the pod`); the
+    verified course's own (below) is sized by GitHub's 100 MiB instead, as the backup sizes what
+    it pushes, so a course file between the two goes in. The state before is
     kept first in `.git/arena-resolved/<UTC stamp>/` on the pod — the conflicted files as they
     were, git's own `MERGE_HEAD`/`MERGE_MSG`/`CHERRY_PICK_HEAD`/`ORIG_HEAD`, the old HEAD, the
     index with its conflicts, and a README that says how to see it or do it again — which no
@@ -771,15 +781,24 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     (a terminal used, a login typing, a git command running — someone back at a terminal,
     typing into a buffer not saved yet, touches no file): any difference — the participant
     aborted the merge, started a rebase, staged a file, used a terminal — and nothing is touched.
-    For a merge or a cherry-pick, every staged regular file that is neither HEAD's version nor
-    the other side's — what the participant made: resolved by hand (now, or added before), merged
-    per hunk, added mid-merge — goes through the backup's key redaction (the redacted blob is
-    committed, the file on disk keeps its key); the course's or the picked commit's own content
-    goes in as it was published. (A stash pop's conflicts make no commit there: the backup after
-    redacts what it commits.) Right before the commit the operation, HEAD and the index lock are
-    checked once more, and every staged path's size and kind again. A merge becomes a real merge
-    commit, a cherry-pick is `--continue`d (one left empty is committed empty, as git advises), a
-    stash pop's conflicts are added (its stash entry stays) — in the repo's own identity, never
+    For a merge or a cherry-pick, every staged regular file that isn't HEAD's version — resolved
+    by hand (now, or added before), merged per hunk, taken whole from either side, added
+    mid-merge, changed by the other side alone — goes through the backup's key redaction (the
+    redacted blob is committed, the file on disk keeps its key). Only the course's own content
+    goes in as it was published, and only once verified: a merge whose `MERGE_HEAD` is in
+    `refs/arena/course-main` — the ref nothing but the backup's fetch from `ARENA_UPSTREAM_REPO`
+    writes — what is staged as `MERGE_HEAD` has it (review ai-review codex #3: matching the other
+    side proves nothing, and a participant's own commit, cherry-picked, committed their key
+    unredacted). A cherry-pick, a merge of any other branch, or a course merge with that ref
+    missing or behind it is redacted like the participant's own. (A stash pop's conflicts make no
+    commit there: the backup after redacts what it commits.) Right before the commit the
+    operation, HEAD and the index lock are checked once more, every staged path's size and kind
+    again, and the index must still be the tree checked and redacted (`git write-tree` then and
+    now): a `git add` the participant finishes in between — a key, a big file, a nested repo none
+    of the checks saw — stops it, `the index changed while arena was finishing it — nothing
+    committed` (review ai-review codex #2). A merge becomes a real merge commit, a cherry-pick is
+    `--continue`d (one left empty is committed empty, as git advises), a stash pop's conflicts
+    are added (its stash entry stays) — in the repo's own identity, never
     `-c user.*` — the message saying, per path, which side won and both sides' last change to it,
     UTC to the minute (`- README.md: the merged branch won (its side of each conflict; the other
     changes of both sides kept) — last changed: yours (HEAD) 2026-10-19 09:12Z, the merged branch
