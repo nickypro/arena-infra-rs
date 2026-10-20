@@ -92,11 +92,15 @@ const PARTIAL_MAX: usize = 64 * 1024;
 pub struct JobId(String);
 
 impl JobId {
-    /// The id for `cmd` started at `unix_secs` (UTC).
+    /// The id for `cmd` started at `unix_secs` (UTC). Its slug is made from the command with its
+    /// secrets masked ([`masked_slug`]): an id is echoed when the job starts, listed by `pods
+    /// jobs`, sent with `pods ask`'s bundle and spelled in remote paths, and one made from the
+    /// command as typed carried what the masking takes out of it (live ASK2 G1: `curl -u
+    /// bob:hunter2pass …` → `…-curl-u-bob-hunter2pass`). Ids already made stay as they are.
     pub fn generate(unix_secs: u64, cmd: &str) -> JobId {
         let (y, m, d) = crate::schedule::civil_from_days((unix_secs / 86_400) as i64);
         let s = unix_secs % 86_400;
-        JobId(format!("{y:04}{m:02}{d:02}-{:02}{:02}{:02}-{}", s / 3600, s % 3600 / 60, s % 60, slug(cmd)))
+        JobId(format!("{y:04}{m:02}{d:02}-{:02}{:02}{:02}-{}", s / 3600, s % 3600 / 60, s % 60, masked_slug(cmd)))
     }
 
     /// An id the operator typed: must have the generated shape and alphabet — anything else
@@ -151,6 +155,13 @@ pub fn split_job_arg(words: &[String]) -> Result<(Vec<String>, Option<JobId>), S
         }
     };
     Ok((targets.into_iter().cloned().collect(), job))
+}
+
+/// An id's tail for `cmd` ([`JobId::generate`]): [`slug`] of the command as `pods ask` masks it
+/// ([`crate::ask::redact::text`]: keys, secret-named values, long tokens out). Also how the
+/// bundle tells an id made before that from one it may show.
+pub fn masked_slug(cmd: &str) -> String {
+    slug(&crate::ask::redact::text(cmd, usize::MAX))
 }
 
 /// The id's tail: the command's words, lowercased, as `[a-z0-9]` runs joined by `-`,
@@ -967,7 +978,11 @@ mod tests {
             ("echo \"$HOME\"; ls\nrm -rf x", "20261008-142301-echo-home-ls-rm-rf-x"),
             ("python -c 'print(1)' && nvidia-smi --query", "20261008-142301-python-c-print-1-nvidia"),
             ("pytest -x tests/ -k 'part1 and not $SLOW'", "20261008-142301-pytest-x-tests-k-part1"),
-            ("supercalifragilisticexpialidocious", "20261008-142301-supercalifragilisticexpi"),
+            ("supercalifragilisticexpialidocious01", "20261008-142301-redacted"),
+            ("supercalifragilistic", "20261008-142301-supercalifragilistic"),
+            // Secrets out of new ids (live ASK2 G1): masked as `pods ask` masks the command.
+            ("curl -u bob:hunter2pass http://127.0.0.1:9/", "20261008-142301-curl-u-redacted-http-127"),
+            ("MY_SECRET='two words' python x.py", "20261008-142301-my-secret-redacted"),
             ("ÜBER — ✓", "20261008-142301-ber"),
             ("'$@!'", "20261008-142301-job"),
             ("", "20261008-142301-job"),

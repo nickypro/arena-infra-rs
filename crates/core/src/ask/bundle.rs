@@ -851,14 +851,52 @@ fn status_line(line: &str) -> String {
     }
 }
 
-fn procs_block(x: Option<&Extra>) -> Block {
+/// A job's id as the prompt may show it: whole when its command-derived part is what the masked
+/// command makes ([`jobs::masked_slug`] — every id made since), else its time part and
+/// `<masked>`. An id made before was the command as typed (live ASK2 G1:
+/// `20261020-161820-curl-u-bob-hunter2pass`, the command shown masked, the id not). `cmd`: the
+/// job's command as the pod lists it.
+fn shown_id(id: &jobs::JobId, cmd: &str) -> String {
+    let s = id.as_str();
+    let (time, tail) = s.split_at(s.len().min(15));
+    match tail.strip_prefix('-') {
+        Some(slug) if slug != jobs::masked_slug(cmd) => format!("{time}-<masked>"),
+        _ => s.to_string(),
+    }
+}
+
+/// Every job id `r` names that [`shown_id`] doesn't show whole, and what it shows instead — to
+/// take out of the processes' arguments too (a job's wrapper runs as `sh …/jobs/<id>/run`).
+fn masked_ids(r: &Reply) -> Vec<(String, String)> {
+    let listed = r.jobs.iter().flatten().flatten().map(|j| (&j.id, j.cmd.as_str()));
+    let read = match &r.log {
+        Some(Ok(ReadReply::Job { info, .. })) => Some((&info.id, info.cmd.as_str())),
+        _ => None,
+    };
+    let mut v: Vec<(String, String)> = Vec::new();
+    for (id, cmd) in listed.chain(read) {
+        let shown = shown_id(id, cmd);
+        if shown != id.as_str() && !v.iter().any(|(raw, _)| raw == id.as_str()) {
+            v.push((id.as_str().to_string(), shown));
+        }
+    }
+    v
+}
+
+/// `args` with each id of `ids` in its shown form.
+fn without_ids(args: &str, ids: &[(String, String)]) -> String {
+    ids.iter().fold(args.to_string(), |a, (raw, shown)| a.replace(raw.as_str(), shown))
+}
+
+fn procs_block(x: Option<&Extra>, ids: &[(String, String)]) -> Block {
     match x.and_then(|x| x.procs.as_ref()) {
         Some(Ok(ps)) if !ps.is_empty() => {
             let items = ps
                 .iter()
                 .take(PROCS_SHOWN)
                 .map(|p| {
-                    format!("{} {} cpu {:.1}% mem {:.1}% up {}: {}", p.pid, redact::name(&p.user, 20), p.cpu, p.mem, age(p.age), redact::text(&p.args, ARGS_MAX))
+                    let args = redact::text(&without_ids(&p.args, ids), ARGS_MAX);
+                    format!("{} {} cpu {:.1}% mem {:.1}% up {}: {args}", p.pid, redact::name(&p.user, 20), p.cpu, p.mem, age(p.age))
                 })
                 .collect();
             Block::list(
@@ -877,7 +915,7 @@ fn procs_block(x: Option<&Extra>) -> Block {
 
 fn job_text(j: &JobInfo) -> String {
     let started = j.started.as_deref().map(|s| format!(", started {}", redact::name(s, 30))).unwrap_or_default();
-    format!("{} — {}{started}: {}", j.id, jobs::state_label(j), redact::text(&j.cmd, ARGS_MAX))
+    format!("{} — {}{started}: {}", shown_id(&j.id, &j.cmd), jobs::state_label(j), redact::text(&j.cmd, ARGS_MAX))
 }
 
 fn jobs_blocks(r: &Reply) -> Vec<Block> {
@@ -903,9 +941,10 @@ fn jobs_blocks(r: &Reply) -> Vec<Block> {
             let state = if info.state == JobState::Running { "still running".to_string() } else { jobs::state_label(info) };
             let more = if hidden > 0 || chunk.start > 0 { ", older lines exist" } else { "" };
             if lines.is_empty() {
-                v.push(Block::fixed(vec![format!("newest job's log ({}, {state}): empty", info.id)]));
+                v.push(Block::fixed(vec![format!("newest job's log ({}, {state}): empty", shown_id(&info.id, &info.cmd))]));
             } else {
-                v.push(Block::list(format!("newest job's log ({}, {state}), last {} lines{more}:", info.id, lines.len()), lines, 1, 8, true));
+                let id = shown_id(&info.id, &info.cmd);
+                v.push(Block::list(format!("newest job's log ({id}, {state}), last {} lines{more}:", lines.len()), lines, 1, 8, true));
             }
         }
         // No jobs (or no such job): the jobs line already says so.
@@ -952,7 +991,7 @@ pub fn render(pod: &Pod, look: &Look, local: &Local, repo_path: &str, now: u64, 
     // shouldn't make a fresh commit look old).
     let clock = pod_now(x).unwrap_or(now);
     blocks.extend(repo_blocks(repo_path, m, x, local, clock));
-    blocks.push(procs_block(x));
+    blocks.push(procs_block(x, &masked_ids(reply)));
     blocks.extend(jobs_blocks(reply));
     fit(blocks, cap)
 }
@@ -1009,7 +1048,9 @@ pub mod fixtures {
             metrics::SENTINEL,
             metrics::PROC_SENTINEL
         );
-        let job = jobs::fixtures::job_line("20261019-101500-pytest", "running", None, Some(777), job_cmd);
+        // The job's id as `pods run --background` makes it from the command.
+        let id = format!("20261019-101500-{}", jobs::masked_slug(job_cmd));
+        let job = jobs::fixtures::job_line(&id, "running", None, Some(777), job_cmd);
         let log: String = ["collecting ...", "test_a PASSED", log_extra, "test_b PASSED"].iter().filter(|l| !l.is_empty()).map(|l| format!("{l}\n")).collect();
         let extra = tagged(
             &format!(
@@ -1018,7 +1059,7 @@ pub mod fixtures {
                  ARENA_ASK df_home=12582912 104857600 /\nARENA_ASK df_workspace=5242880 52428800 /workspace\nARENA_ASK home_kb=3355443\n\
                  ARENA_ASK who=ok\nARENA_ASK_WHO root pts/0 2026-10-19 10:00\nARENA_ASK tmux=ok\nARENA_ASK_TMUX 2:1:1792410900:lab\n\
                  ARENA_ASK ps=ok\nARENA_ASK_PS  4242 root      98.5  6.1   7200 python train.py --epochs 3 {extra_args}\n\
-                 ARENA_ASK_PS   777 root       0.0  0.0   3600 sh /root/.arena/jobs/20261019-101500-pytest/run\n\
+                 ARENA_ASK_PS   777 root       0.0  0.0   3600 sh /root/.arena/jobs/{id}/run\n\
                  ARENA_ASK_PS  4242 root      98.5  6.1   7200 python train.py (a duplicate pid, from the by-memory list)\n\
                  ARENA_ASK git=ok\nARENA_ASK real=/workspace/ARENA_materials\nARENA_ASK branch=autocommit-devtest-w1d2-alpha\nARENA_ASK op=merge unmerged\n\
                  ARENA_ASK status=ok\nARENA_ASK modified=2\nARENA_ASK untracked=1\nARENA_ASK_FILE UU chapter1/solutions.py\n\
@@ -1126,8 +1167,8 @@ mod tests {
             "    .M chapter1/part4_interp_on_algorithmic_model.ipynb",
             "    ?? notes.txt",
             "4242 root cpu 98.5% mem 6.1% up 2h0m: python train.py --epochs 3",
-            "20261019-101500-pytest — running (pid 777), started 2026-10-08T14:23:01Z: pytest -x chapter1",
-            "newest job's log (20261019-101500-pytest, still running), last 3 lines:",
+            "20261019-101500-pytest-x-chapter1 — running (pid 777), started 2026-10-08T14:23:01Z: pytest -x chapter1",
+            "newest job's log (20261019-101500-pytest-x-chapter1, still running), last 3 lines:",
             "    test_b PASSED",
         ] {
             assert!(text.contains(want), "missing {want:?} in\n{text}");
@@ -1224,6 +1265,37 @@ mod tests {
         }
         assert_eq!(text.matches(redact::CONT_MASK).count(), 2, "{text}");
         assert!(text.contains(redact::LINE_MASK), "{text}");
+    }
+
+    /// Live ASK2 G1: a job's id is made from its command, and one made before ids were masked
+    /// carries what the masking takes out of the command — `pods run --background 'curl -u
+    /// bob:hunter2pass http://127.0.0.1:9/'` was `…-curl-u-bob-hunter2pass`, in the bundle
+    /// twice, the command itself masked. Such an id shows as its time and `<masked>` — in the
+    /// jobs, the log's header and the wrapper's process — and so does one whose command starts
+    /// with a long key (its first 24 characters were the slug). An id made now, from the masked
+    /// command, shows whole and holds none of it.
+    #[test]
+    fn a_jobs_id_never_carries_what_its_command_masks() {
+        let token = body(ALNUM, 40, 9);
+        let long = format!("{token} --go");
+        for (cmd, secret, old) in [
+            ("curl -u bob:hunter2pass http://127.0.0.1:9/", "hunter2pass".to_string(), "curl-u-bob-hunter2pass".to_string()),
+            (long.as_str(), token[..24].to_lowercase(), token[..24].to_lowercase()),
+        ] {
+            let new = format!("20261019-101500-{}", jobs::masked_slug(cmd));
+            assert!(!new.contains(&secret), "{new}");
+            assert_eq!(jobs::JobId::generate(NOW, cmd).as_str().split_at(15).1, &new[15..], "made the same way");
+            let text = bundle(&busy_reply("", "", cmd), BUNDLE_CAP);
+            assert!(text.contains(&format!("{new} — running")) && text.contains(&format!("newest job's log ({new}, ")), "{text}");
+            // The id made before, from the command as typed.
+            let reply = busy_reply("", "", cmd).replace(&new, &format!("20261019-101500-{old}"));
+            let text = bundle(&reply, BUNDLE_CAP);
+            assert!(!text.to_lowercase().contains(&secret), "{secret} reached the bundle:\n{text}");
+            for want in ["20261019-101500-<masked> — running (pid 777)", "newest job's log (20261019-101500-<masked>, still running)", "sh /root/.arena/jobs/20261019-101500-<masked>/run"] {
+                assert!(text.contains(want), "missing {want:?} in\n{text}");
+            }
+        }
+        assert_eq!(jobs::JobId::generate(NOW, "curl -u bob:hunter2pass http://127.0.0.1:9/").as_str(), "20261019-120000-curl-u-redacted-http-127");
     }
 
     /// The bundle for real at both cuts: the remote read's last bytes begin inside a key (its

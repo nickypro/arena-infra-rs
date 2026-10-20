@@ -1112,10 +1112,12 @@ at once: `[n/N] ✓ <pod>: job <id> (pid …)`. A job that can't record its pid 
 125`); no pid within 5s is reported as "may have started anyway — check `arena pods jobs` before
 retrying", never as a clean failure.
 
-One id per run, e.g. `20261008-142301-pytest-x` (UTC start + command slug); everything stays on the
-pod under `~/.arena/jobs/<id>/` (`cmd`, `run`, `log` = stdout+stderr, `pid`, `started_at`, `exit`),
-so it survives your SSH session and any operator can look — but not a pod restart (container disk),
-and logs are never rotated or pruned. No time limit; `--timeout` is refused with it.
+One id per run, e.g. `20261008-142301-pytest-x` (UTC start + a slug of the command with its secrets
+masked, as `pods ask` masks it: `curl -u bob:pw …` makes `…-curl-u-redacted-…`); everything stays on
+the pod under `~/.arena/jobs/<id>/` (`cmd`, `run`, `log` = stdout+stderr, `pid`, `started_at`,
+`exit`), so it survives your SSH session and any operator can look — but not a pod restart
+(container disk), and logs are never rotated or pruned. No time limit; `--timeout` is refused with
+it.
 
 `pods jobs`: a table of each pod's jobs, newest first (`running (pid N)` — the pid must still be
 that job's wrapper, not a recycled one — / `exit N` / `lost` = ended without an exit code, or still
