@@ -846,10 +846,12 @@ fn jobs_blocks(r: &Reply) -> Vec<Block> {
     }
     match &r.log {
         Some(Ok(ReadReply::Job { info, chunk })) => {
-            let (lines, cut) = jobs::snapshot_lines(chunk, LOG_LINES);
-            let lines = redact::log_lines(&lines, LINE_MAX);
+            // The whole window read, masked before it's cut to the last LOG_LINES (a key block
+            // across the cut must be seen whole to be masked at all).
+            let (window, _) = jobs::snapshot_lines(chunk, usize::MAX);
+            let (lines, hidden) = redact::log_tail(&window, chunk.start > 0, LOG_LINES, LINE_MAX);
             let state = if info.state == JobState::Running { "still running".to_string() } else { jobs::state_label(info) };
-            let more = if cut || chunk.start > 0 { ", older lines exist" } else { "" };
+            let more = if hidden > 0 || chunk.start > 0 { ", older lines exist" } else { "" };
             if lines.is_empty() {
                 v.push(Block::fixed(vec![format!("newest job's log ({}, {state}): empty", info.id)]));
             } else {
@@ -1091,6 +1093,44 @@ mod tests {
         // The rest of those lines survives.
         assert!(text.contains("python train.py --epochs 3 --opt0 REDACTED-OPENROUTER-KEY"), "{text}");
         assert!(text.contains("Using key REDACTED-AWS-ACCESS-KEY-ID for the run"), "{text}");
+    }
+
+    /// The bundle for real at both cuts: the remote read's last bytes begin inside a key (its
+    /// END in the window, or not), and a whole key block straddles where the 40-line cut falls —
+    /// no 12-character piece of any key line reaches the bundle.
+    #[test]
+    fn a_log_tail_starting_inside_a_key_never_shows_it() {
+        use crate::ask::redact::tests::key_body;
+        let job = jobs::fixtures::job_line("20261019-101500-pytest", "running", None, Some(777), "pytest");
+        let with_log = |start: u64, log: &str| {
+            let full = busy_reply("", "", "pytest");
+            let (head, rest) = full.split_once(&format!("{LOG}\n")).unwrap();
+            let (_, tail) = rest.split_once(&format!("{EXTRA}\n")).unwrap();
+            let read = jobs::fixtures::read_reply(&job, start, start + log.len() as u64, log.as_bytes());
+            format!("{head}{LOG}\n{read}{EXTRA}\n{tail}")
+        };
+        let key = key_body(40, 7);
+        let lines = |v: &[String]| v.iter().map(|l| format!("{l}\n")).collect::<String>();
+        let progress: String = (0..30).map(|i| format!("step {i} loss 0.{i}\n")).collect();
+        let cases = [
+            // The 16 KiB read began mid-line inside the key; its END is in the window.
+            (9000, format!("{}{}-----END OPENSSH PRIVATE KEY-----\n{progress}", &key[4][10..], lines(&key[5..]))),
+            // The same, the key still being printed (no END yet), then a line.
+            (9000, format!("{}{}still printing\n", &key[4][10..], lines(&key[5..30]))),
+            // The whole log: a block, then 30 lines — the 40-line cut lands in its body.
+            (0, format!("start\n-----BEGIN OPENSSH PRIVATE KEY-----\n{}-----END OPENSSH PRIVATE KEY-----\n{progress}", lines(&key))),
+        ];
+        for (n, (start, log)) in cases.iter().enumerate() {
+            let text = bundle(&with_log(*start, log), 64 * 1024);
+            assert!(text.contains("newest job's log (20261019-101500-pytest, still running), last "), "{n}: {text}");
+            for l in &key {
+                for piece in l.as_bytes().chunks(12).filter(|c| c.len() == 12) {
+                    let piece = std::str::from_utf8(piece).unwrap();
+                    assert!(!text.contains(piece), "case {n}: {piece} of a key line reached the bundle:\n{text}");
+                }
+            }
+            assert_eq!(text.contains(redact::PEM_MASK), n != 1, "{n}: {text}");
+        }
     }
 
     /// A pod with a flood of everything still fits the cap: the log's oldest lines go first, then

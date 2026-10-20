@@ -31,7 +31,7 @@ pub const MASK: &str = crate::apiget::REDACTED;
 /// The shortest run of `[A-Za-z0-9_-]` that [`long_tokens`] masks.
 pub const LONG_TOKEN: usize = 32;
 
-/// What a private-key block in a log becomes ([`log_lines`]).
+/// What a private-key block in a log becomes ([`log_tail`]).
 pub const PEM_MASK: &str = "<redacted: private key block>";
 
 /// What a line becomes when [`named_values`] finds a secret-named value it can't delimit (an
@@ -662,25 +662,80 @@ pub fn text(s: &str, max: usize) -> String {
     crate::fleet::clip(&long_tokens(&named_values(&secrets(&one_line(&secrets(s))))), max)
 }
 
-/// A log's lines for the prompt, each through [`text`] — and a private-key block (`-----BEGIN
-/// … PRIVATE KEY-----` to its `-----END`, or to the end) as one [`PEM_MASK`] line: its base64
-/// lines are broken up by `+` and `/`, so no single run need reach [`LONG_TOKEN`].
-pub fn log_lines(lines: &[String], max: usize) -> Vec<String> {
+/// The shortest line [`base64_like`] takes for key material.
+pub const BASE64_LINE: usize = 40;
+
+/// Whether a log line looks like a line of base64 key material: [`BASE64_LINE`] or more of
+/// `[A-Za-z0-9+/=]` and nothing else (surrounding whitespace aside).
+fn base64_like(line: &str) -> bool {
+    let t = line.trim();
+    t.len() >= BASE64_LINE && t.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+}
+
+fn pem_begin(l: &str) -> bool {
+    l.contains("-----BEGIN") && l.contains("PRIVATE KEY")
+}
+
+fn pem_end(l: &str) -> bool {
+    l.contains("-----END") && l.contains("PRIVATE KEY")
+}
+
+/// `lines` with every private-key block — `-----BEGIN … PRIVATE KEY-----` to its `-----END`,
+/// or to the last line — as one [`PEM_MASK`] line: its base64 lines are broken up by `+` and
+/// `/`, so no single run need reach [`LONG_TOKEN`]. When `starts_cut` (the lines begin part-way
+/// into the log) and an `-----END … PRIVATE KEY-----` comes before any `BEGIN`, the window
+/// begins inside a key: everything up to that END is one [`PEM_MASK`] too.
+fn pem_blocks(lines: &[String], starts_cut: bool) -> Vec<String> {
     let mut out = Vec::with_capacity(lines.len());
+    let mut rest = lines;
+    if starts_cut {
+        let first_begin = lines.iter().position(|l| pem_begin(l)).unwrap_or(lines.len());
+        if let Some(end) = lines[..first_begin].iter().position(|l| pem_end(l)) {
+            out.push(PEM_MASK.to_string());
+            rest = &lines[end + 1..];
+        }
+    }
     let mut in_pem = false;
-    for l in lines {
+    for l in rest {
         if in_pem {
             in_pem = !l.contains("-----END");
-            continue;
-        }
-        if l.contains("-----BEGIN") && l.contains("PRIVATE KEY") {
+        } else if pem_begin(l) {
             out.push(PEM_MASK.to_string());
             in_pem = !l.contains("-----END");
-            continue;
+        } else {
+            out.push(l.clone());
         }
-        out.push(text(l, max));
     }
     out
+}
+
+/// Leading lines that look like key material ([`base64_like`]) taken off `lines`: what a cut
+/// that landed inside a key (or any base64 blob) leaves at its start. Conservative — a harmless
+/// hash or a line of `=` there goes too. How many went.
+fn drop_leading_base64(lines: &mut Vec<String>) -> usize {
+    let n = lines.iter().take_while(|l| base64_like(l)).count();
+    lines.drain(..n);
+    n
+}
+
+/// A log's last `keep` lines for the prompt, from `lines` — the whole window read (the remote
+/// read's last bytes; `starts_cut`: it begins part-way into the log, its partial first line
+/// already gone). Private-key blocks are masked over the whole window **first** ([`pem_blocks`]),
+/// so neither cut can keep a key's body without the header that marks it; then at each cut —
+/// the window's start when `starts_cut`, and the `keep`-line cut — leading base64-looking
+/// lines are dropped ([`drop_leading_base64`]): a key printed without its armour, or one whose
+/// END is past the window. Each line left goes through [`text`]. The lines, and how many older
+/// lines of the window aren't shown.
+pub fn log_tail(lines: &[String], starts_cut: bool, keep: usize, max: usize) -> (Vec<String>, usize) {
+    let mut v = pem_blocks(lines, starts_cut);
+    let mut hidden = if starts_cut { drop_leading_base64(&mut v) } else { 0 };
+    let over = v.len().saturating_sub(keep);
+    if over > 0 {
+        v.drain(..over);
+        hidden += over + drop_leading_base64(&mut v);
+    }
+    let shown = v.into_iter().map(|l| if l == PEM_MASK { l } else { text(&l, max) }).collect();
+    (shown, hidden)
 }
 
 #[cfg(test)]
@@ -990,6 +1045,75 @@ pub(crate) mod tests {
         ]
         .map(String::from)
         .to_vec();
-        assert_eq!(log_lines(&lines, 200), vec!["loading", PEM_MASK, "done", PEM_MASK]);
+        assert_eq!(log_tail(&lines, false, 40, 200), (vec!["loading".to_string(), PEM_MASK.into(), "done".into(), PEM_MASK.into()], 0));
+    }
+
+    /// A key's body lines: base64 with `+` and `/` (no run reaches [`LONG_TOKEN`]), 64 wide, the
+    /// last one short — as `ssh-keygen` and openssl print them.
+    pub(crate) fn key_body(lines: usize, seed: usize) -> Vec<String> {
+        let b64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut v: Vec<String> = (0..lines).map(|i| body(b64, 64, seed * 100 + i)).collect();
+        v.push(format!("{}==", body(b64, 22, seed * 100 + lines)));
+        v
+    }
+
+    fn strings(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Asserts nothing of `body` — no 12-character piece of any line — is in `shown`.
+    fn no_body_in(shown: &[String], body: &[String]) {
+        let all = shown.join("\n");
+        for l in body {
+            for piece in l.as_bytes().chunks(12).filter(|c| c.len() == 12) {
+                let piece = std::str::from_utf8(piece).unwrap();
+                assert!(!all.contains(piece), "{piece} of a key line is in:\n{all}");
+            }
+        }
+    }
+
+    /// The window starts inside a key — the remote read's last bytes, or the 40-line cut: its
+    /// END is there without its BEGIN (everything up to the END is one mask), or not at all
+    /// (the leading base64 lines go), or a complete block sits just past where the line cut
+    /// falls (masked before the cut, so the cut can't split it).
+    #[test]
+    fn a_tail_that_starts_inside_a_key_shows_none_of_it() {
+        let key = key_body(12, 1);
+        let end = "-----END OPENSSH PRIVATE KEY-----".to_string();
+        // The read's start: inside the body, the END in the window.
+        let mut lines = key[3..].to_vec();
+        lines.extend([end.clone(), "epoch 1 loss 0.5".into(), "epoch 2 loss 0.4".into()]);
+        let (shown, hidden) = log_tail(&lines, true, 40, 200);
+        assert_eq!((shown.clone(), hidden), (strings(&[PEM_MASK, "epoch 1 loss 0.5", "epoch 2 loss 0.4"]), 0));
+        // Not cut: an END with no BEGIN is just a line (nothing before it is a key's).
+        let (shown, _) = log_tail(&strings(&["a", "-----END OPENSSH PRIVATE KEY-----", "b"]), false, 40, 200);
+        assert_eq!(shown, strings(&["a", "-----END OPENSSH PRIVATE KEY-----", "b"]));
+        // The read's start: inside a key still being printed, or one without armour.
+        let mut lines = key[..10].to_vec();
+        lines.push("step 3 done".into());
+        let (shown, hidden) = log_tail(&lines, true, 40, 200);
+        assert_eq!((shown.clone(), hidden), (strings(&["step 3 done"]), 10));
+        no_body_in(&shown, &key);
+        // The 40-line cut: a whole block, then 20 lines — the old order (cut, then mask) kept
+        // 19 body lines and the END.
+        let mut lines = vec!["start".to_string(), "-----BEGIN OPENSSH PRIVATE KEY-----".into()];
+        let big = key_body(30, 2);
+        lines.extend(big.iter().cloned());
+        lines.push(end.clone());
+        lines.extend((0..20).map(|i| format!("progress {i}")));
+        let (shown, hidden) = log_tail(&lines, false, 40, 200);
+        no_body_in(&shown, &big);
+        assert_eq!(shown.len(), 22, "{shown:?}");
+        assert_eq!((shown[0].as_str(), shown[1].as_str(), hidden), ("start", PEM_MASK, 0));
+        // The 40-line cut inside a base64 blob with no armour: its leading lines go too.
+        let blob = key_body(30, 3);
+        let mut lines: Vec<String> = (0..100).map(|i| format!("warmup {i}")).collect();
+        lines.extend(blob[..30].iter().cloned());
+        lines.extend((0..20).map(|i| format!("progress {i}")));
+        let (shown, hidden) = log_tail(&lines, false, 40, 200);
+        no_body_in(&shown, &blob);
+        assert_eq!((shown.len(), shown[0].as_str(), hidden), (20, "progress 0", 130));
+        // Only whole lines of base64 alphabet, 40 or more, are taken for key material.
+        assert!(base64_like(&format!("  {}  ", key[0])) && !base64_like(&key[12]) && !base64_like("step 1 loss 0.25 lr 0.001 0.002 0.003 0.004"));
     }
 }

@@ -1272,8 +1272,11 @@ JSON/YAML/Python-dict fields such as `"password": "a b"` or `api_key: …`, `Aut
 `Bearer …`, basic auth: `curl -u user:pass`, `--user user:pass`, `https://user:pass@…`) — a line
 whose secret value can't be delimited (an unclosed quote or bracket) is replaced whole — any run of
 32+ `[A-Za-z0-9_-]` in arguments, commands, commit subjects and log lines (`<redacted>`), and a
-private-key block in a log. Each pod's part is at most 6 KB (less when many pods share a prompt: 240
-KB in all), trimmed from the log's oldest lines first.
+private-key block in a log — masked over the whole 16 KB read before its last 40 lines are taken, so
+neither cut can keep a key's body without its header; at the start of a cut window, lines that look
+like base64 key material (40+ of `[A-Za-z0-9+/=]`, nothing else) are dropped. Each pod's part is at
+most 6 KB (less when many pods share a prompt: 240 KB in all), trimmed from the log's oldest lines
+first.
 
 #### Where it goes
 
