@@ -239,8 +239,9 @@ impl DeepFacts {
 
     /// torch's own proof that the GPUs work: imported, CUDA available, at least one device, and
     /// the tensor op `ok` on every one (none missing, none failed). What stands in for
-    /// nvidia-smi when it can't answer — and nothing short of all of it: a GPU torch can't use
-    /// is exactly what nvidia-smi's FAIL would have been about.
+    /// nvidia-smi when it can't answer on a MIG slice — and nothing short of all of it: a GPU
+    /// torch can't use is exactly what nvidia-smi's FAIL would have been about. It says nothing
+    /// of a GPU torch doesn't enumerate, which is why it stands in nowhere else ([`smi_check`]).
     fn torch_proves_gpus(&self) -> bool {
         let Some(n) = self.device_count.filter(|&n| n > 0) else { return false };
         self.torch.as_deref() == Some("ok")
@@ -305,14 +306,17 @@ impl DeepFacts {
     /// How many GPUs nvidia-smi listed — only when it actually listed them. The header
     /// call working isn't enough: if `--query-gpu` then failed (`smi_query`, the classic
     /// GPU-fell-off-the-bus error) the count is unknown, not 0, and must not read as
-    /// "nvidia-smi sees 0 GPUs" next to torch's count. Nor is a listing of none a count: that
-    /// is nvidia-smi unable to see the GPUs (a MIG slice's container), which the nvidia-smi
-    /// check judges — FAIL, or torch's proof.
+    /// "nvidia-smi sees 0 GPUs" next to torch's count. Nor, on a MIG slice, is a listing of
+    /// none a count: that is nvidia-smi unable to see the slice from its container, which the
+    /// nvidia-smi check judges (FAIL, or torch's proof). On whole GPUs it is one — 0, which
+    /// torch's count then disagrees with — as it was before the MIG fallback.
     fn smi_count(&self) -> Option<u32> {
         if self.smi.as_deref() != Some("ok") || self.smi_query.is_some() {
             return None;
         }
-        self.smi_gpus.or_else(|| (!self.gpus.is_empty()).then_some(self.gpus.len() as u32)).filter(|&n| n > 0)
+        self.smi_gpus
+            .or_else(|| (!self.gpus.is_empty()).then_some(self.gpus.len() as u32))
+            .filter(|&n| n > 0 || !self.is_mig())
     }
 
     /// torch imported, built without CUDA (`torch.version.cuda` is None: `torch_cuda=none`).
@@ -970,23 +974,23 @@ fn vscode_check(f: &DeepFacts, p: &HealthPolicy) -> Check {
     Check::new("vscode", status, parts.join("; "))
 }
 
-/// nvidia-smi as the machine's view of its GPUs. When it can't answer (missing, an error, no
-/// GPUs listed, its query failing) the GPUs may still be fine: in a MIG slice's container NVML
-/// is often blocked (`Insufficient Permissions`, `No devices were found`) while CUDA works. So
-/// where torch proves the GPUs work ([`DeepFacts::torch_proves_gpus`]) that is no FAIL: a PASS
-/// on a MIG slice, where it is expected, and a WARN elsewhere (a broken nvidia-smi on a whole
-/// card is worth knowing). Without that proof it FAILs as before.
+/// nvidia-smi as the machine's view of its GPUs. When it can't answer (missing, an error, a
+/// timeout, no GPUs listed, its query failing) on a **MIG slice**, the GPUs may still be fine:
+/// in a slice's container NVML is often blocked (`Insufficient Permissions`, `No devices were
+/// found`) while CUDA works. There, torch's proof that the GPUs work
+/// ([`DeepFacts::torch_proves_gpus`]) is a PASS. Anywhere else it FAILs whatever torch says,
+/// as before the fallback: on whole cards the same symptoms are a GPU fallen off the bus
+/// (`--query-gpu`'s `Unable to determine the device handle`), and torch, which enumerates only
+/// the GPUs that survived, proves nothing about the one that didn't (review of `27adfe4..db8dff8`,
+/// #1: an 8-GPU pod with one lost read as a WARN — exit 0, not replaced, not remembered).
 fn smi_check(f: &DeepFacts) -> Check {
     use Status::*;
-    // (the FAIL detail; what the fallback's detail says went wrong: short, and as a phrase)
-    let error = |e: &str, verb: &str| {
-        let short = clip(&reason(e), 60);
-        (reason(e), short.clone(), format!("{verb} ({short})"))
-    };
-    let same = |s: &str| (s.to_string(), s.to_string(), s.to_string());
-    let (fail, short, phrase) = match f.smi.as_deref() {
+    // (the FAIL detail; what the fallback's detail says went wrong, short)
+    let error = |e: &str| (reason(e), clip(&reason(e), 60));
+    let same = |s: &str| (s.to_string(), s.to_string());
+    let (fail, short) = match f.smi.as_deref() {
         Some("ok") if f.gpus.is_empty() => match f.smi_query.as_deref() {
-            Some(e) => error(e, "--query-gpu failed"),
+            Some(e) => error(e),
             None => same("lists no GPUs"),
         },
         Some("ok") => {
@@ -998,20 +1002,15 @@ fn smi_check(f: &DeepFacts) -> Check {
             };
             return Check::new("nvidia-smi", Pass, detail);
         }
-        Some("missing") => ("not found (no NVIDIA driver in the container)".into(), "not found".into(), "not found".into()),
-        Some(e) => error(e, "failed"),
+        Some("missing") => ("not found (no NVIDIA driver in the container)".into(), "not found".into()),
+        Some(e) => error(e),
         None => same("not reported"),
     };
-    if !f.torch_proves_gpus() {
+    if !(f.is_mig() && f.torch_proves_gpus()) {
         return Check::new("nvidia-smi", Fail, fail);
     }
-    let label = f.gpu_label();
-    if f.is_mig() {
-        let mem = f.torch_mem().map(|m| format!(", {m}")).unwrap_or_default();
-        Check::new("nvidia-smi", Pass, format!("nvidia-smi can't read this MIG slice ({short}) — torch: {label}{mem}"))
-    } else {
-        Check::new("nvidia-smi", Warn, format!("nvidia-smi {phrase} — torch sees the GPUs and they work: {label}"))
-    }
+    let (label, mem) = (f.gpu_label(), f.torch_mem().map(|m| format!(", {m}")).unwrap_or_default());
+    Check::new("nvidia-smi", Pass, format!("nvidia-smi can't read this MIG slice ({short}) — torch: {label}{mem}"))
 }
 
 /// The driver against the floor: nvidia-smi's version, else `/proc/driver/nvidia/version`'s
@@ -1038,8 +1037,9 @@ fn driver_check(f: &DeepFacts, p: &HealthPolicy) -> Check {
 /// No driver version anywhere: judge the CUDA version torch says the driver supports against
 /// the CUDA floor the minimum was derived from ([`driver_cuda_needed`]). An explicit
 /// `MIN_DRIVER_VERSION` can't be judged that way (a CUDA version only bounds the driver
-/// branch), nor can anything without torch's reading: today's WARN, or a Skip where the
-/// nvidia-smi check FAILs anyway.
+/// branch), nor can anything without torch's reading: today's WARN where nvidia-smi answered
+/// or torch stood in for it (a MIG slice, [`smi_check`]), else a Skip — the nvidia-smi check
+/// FAILs anyway.
 fn driver_check_by_cuda(f: &DeepFacts, p: &HealthPolicy) -> Check {
     use Status::*;
     let smi_ok = f.smi.as_deref() == Some("ok");
@@ -1057,7 +1057,7 @@ fn driver_check_by_cuda(f: &DeepFacts, p: &HealthPolicy) -> Check {
             };
         }
     }
-    if smi_ok || f.torch_proves_gpus() {
+    if smi_ok || (f.is_mig() && f.torch_proves_gpus()) {
         let torch = f
             .torch_driver_cuda
             .as_deref()
@@ -1943,18 +1943,16 @@ deep_check_end=1
                 ("device_count", Some("0")),
             ],
         );
-        // With a GPU torch can't use beside it: were torch to prove every GPU works, nvidia-smi's
-        // failure would be no FAIL (a MIG slice's blocked NVML — see
-        // `nvidia_smi_failing_falls_back_on_torchs_proof`).
-        let gpu1_broken = ("tensor.1", Some("error: RuntimeError: CUDA error: unknown error"));
+        // torch working on every GPU it sees changes neither: off a MIG slice there is no
+        // fallback on torch's proof (`a_gpu_fallen_off_the_bus_fails_whatever_torch_says`).
         let smi_error = edit(
             &without(HEALTHY_2GPU, &["smi_", "gpu."]),
-            &[("smi", Some("error: NVIDIA-SMI has failed because it couldn't communicate with the NVIDIA driver.")), gpu1_broken],
+            &[("smi", Some("error: NVIDIA-SMI has failed because it couldn't communicate with the NVIDIA driver."))],
         );
         // The header call worked, the per-GPU query didn't: a GPU fallen off the bus.
         let smi_query_error = edit(
             &without(HEALTHY_2GPU, &["gpu.", "smi_gpus"]),
-            &[("smi_query", Some("error: Unable to determine the device handle for GPU 0000:41:00.0: Unknown Error")), gpu1_broken],
+            &[("smi_query", Some("error: Unable to determine the device handle for GPU 0000:41:00.0: Unknown Error"))],
         );
         let count_mismatch = edit(
             &without(HEALTHY_2GPU, &["tensor.1", "peer.", "nccl"]),
@@ -2562,8 +2560,8 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
 
     /// The false FAILs on a MIG slice (nvidia-smi can't run in its container: NVML blocked,
     /// no devices found) and their neighbours: torch's proof that the GPUs work turns an
-    /// nvidia-smi that can't answer into a PASS on a MIG slice and a WARN elsewhere; without the
-    /// whole proof it FAILs as before.
+    /// nvidia-smi that can't answer into a PASS on a MIG slice. Without the whole proof, or on
+    /// whole cards whatever torch says, it FAILs as before.
     #[test]
     fn nvidia_smi_failing_falls_back_on_torchs_proof() {
         use Status::*;
@@ -2586,6 +2584,7 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
         let smi_missing = edit(&a4000_down, &[("smi", Some("missing"))]);
         // nvidia-smi runs, but lists nothing / its query fails (a slice's NVML half-blocked).
         let listed_none = edit(&mig_nvml, &[("smi", Some("ok")), ("smi_gpus", Some("0"))]);
+        let listed_none_whole = edit(&a4000_down, &[("smi", Some("ok")), ("smi_gpus", Some("0"))]);
         let query_failed = edit(
             &a4000_down,
             &[("smi", Some("ok")), ("smi_query", Some("error: Unable to determine the device handle for GPU 0000:41:00.0: Unknown Error"))],
@@ -2593,7 +2592,6 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
         // `nvidia-smi -L` lists the slice though `--query-gpu` fails: MIG by that alone.
         let l_lists_slice = edit(&query_failed, &[("mig_devices", Some("1")), ("mig_profile", Some("1g.5gb"))]);
 
-        let fallback_warn = "— torch sees the GPUs and they work: 1×RTX A4000";
         // (label, output, nvidia-smi's status, its detail contains, overall)
         let cases: &[(&str, &str, Status, &str, Status)] = &[
             (
@@ -2606,10 +2604,12 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
             ),
             ("MIG slice, nvidia-smi lists none", &listed_none, Pass, "can't read this MIG slice (lists no GPUs)", Pass),
             ("MIG by nvidia-smi -L", &l_lists_slice, Pass, "can't read this MIG slice (Unable to determine the device handle", Pass),
-            ("whole card, no devices found", &a4000_down, Warn, "nvidia-smi failed (No devices were found) — torch sees the GPUs and they work: 1×RTX A4000", Warn),
-            ("whole card, NVML unknown error", &unknown_error, Warn, fallback_warn, Warn),
-            ("whole card, nvidia-smi missing", &smi_missing, Warn, "nvidia-smi not found — torch sees", Warn),
-            ("whole card, query failed", &query_failed, Warn, "nvidia-smi --query-gpu failed (Unable to determine the device handle", Warn),
+            // A whole card: no fallback, whatever torch says — exactly as before.
+            ("whole card, no devices found", &a4000_down, Fail, "No devices were found", Fail),
+            ("whole card, NVML unknown error", &unknown_error, Fail, "Failed to initialize NVML: Unknown Error", Fail),
+            ("whole card, nvidia-smi missing", &smi_missing, Fail, "not found (no NVIDIA driver in the container)", Fail),
+            ("whole card, query failed", &query_failed, Fail, "Unable to determine the device handle for GPU 0000:41:00.0", Fail),
+            ("whole card, lists none", &listed_none_whole, Fail, "lists no GPUs", Fail),
             // Without torch's whole proof: exactly as before.
             ("CUDA unavailable", &cuda_off, Fail, "Failed to initialize NVML: Insufficient Permissions", Fail),
             ("a tensor op failed", &op_failed, Fail, "Failed to initialize NVML: Insufficient Permissions", Fail),
@@ -2626,10 +2626,23 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
             assert!(c.detail.contains(detail), "{label}: {:?} lacks {detail:?}", c.detail);
             assert_eq!(overall(&checks), *verdict, "{label}: {checks:#?}");
         }
+        // A whole card's FAIL says what nvidia-smi said, as it did before the fallback; and with
+        // nvidia-smi listing none, torch's count disagrees with its 0 (on a MIG slice that 0 is
+        // no count: `MIG slice, nvidia-smi lists none` passes).
+        let whole = evaluate(&parse_deep(&a4000_down), &cuda124(), None);
+        assert_eq!(check(&whole, "nvidia-smi"), &Check::new("nvidia-smi", Fail, "No devices were found"));
         assert_eq!(
-            check(&evaluate(&parse_deep(&a4000_down), &cuda124(), None), "nvidia-smi").detail,
-            "nvidia-smi failed (No devices were found) — torch sees the GPUs and they work: 1×RTX A4000"
+            check(&evaluate(&parse_deep(&listed_none_whole), &cuda124(), None), "device_count"),
+            &Check::new("device_count", Fail, "torch sees 1 GPU(s), nvidia-smi 0")
         );
+        // No driver version anywhere: the driver check waits on nvidia-smi off a MIG slice (as
+        // before), and WARNs where torch stood in for it.
+        let no_driver = |out: &str| edit(out, &[("driver_proc", None), ("torch_driver_cuda", None)]);
+        assert_eq!(
+            check(&evaluate(&parse_deep(&no_driver(&a4000_down)), &cuda124(), None), "driver"),
+            &Check::new("driver", Skip, "needs nvidia-smi")
+        );
+        assert_eq!(check(&evaluate(&parse_deep(&no_driver(&mig_nvml)), &cuda124(), None), "driver").status, Warn);
 
         // nvidia-smi lists the parent card but not the slice (no `-L` line), torch names the
         // slice: MIG by torch's name, and said so.
@@ -2647,16 +2660,82 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
         // ...and by the provider's name alone, torch naming the bare card.
         let h = PodHealth::checked(&p, parse_deep(&smi_missing), &cuda124());
         assert_eq!(check(&h.checks, "nvidia-smi").status, Pass, "{:#?}", h.checks);
-        assert_eq!(PodHealth::checked(&pod("delta", "1.2.3.4"), parse_deep(&smi_missing), &cuda124()).status, Warn);
+        // The same output from a pod nothing calls MIG: a FAIL.
+        assert_eq!(PodHealth::checked(&pod("delta", "1.2.3.4"), parse_deep(&smi_missing), &cuda124()).status, Fail);
 
-        // Only a FAIL replaces a pod or condemns a machine: a fallback PASS/WARN does neither.
-        for out in [&mig_nvml, &a4000_down] {
+        // Only a FAIL replaces a pod or condemns a machine: the fallback's PASS does neither; a
+        // whole card's nvidia-smi error, or a MIG slice's without torch's proof, does both.
+        let h = PodHealth::checked(&pod("delta", "1.2.3.4"), parse_deep(&mig_nvml), &cuda124());
+        assert_eq!(h.failure_kind(), None, "{:#?}", h.checks);
+        for out in [&a4000_down, &op_failed] {
             let h = PodHealth::checked(&pod("delta", "1.2.3.4"), parse_deep(out), &cuda124());
-            assert_eq!(h.failure_kind(), None, "{:#?}", h.checks);
+            assert_eq!(h.failure_kind(), Some(FailureKind::Host), "{:#?}", h.checks);
+            assert!(condemns_machine(check(&h.checks, "nvidia-smi"), h.facts.as_ref().unwrap()));
         }
-        let h = PodHealth::checked(&pod("delta", "1.2.3.4"), parse_deep(&op_failed), &cuda124());
-        assert_eq!(h.failure_kind(), Some(FailureKind::Host));
-        assert!(condemns_machine(check(&h.checks, "nvidia-smi"), h.facts.as_ref().unwrap()));
+    }
+
+    /// Review of `27adfe4..db8dff8`, #1: an 8×H100 pod takes an Xid 79 on one GPU —
+    /// `--query-gpu` fails (`Unable to determine the device handle … Unknown Error`), CUDA
+    /// enumerates the 7 survivors, and the tensor ops, peer copies and NCCL all pass on those 7.
+    /// The MIG fallback, applied to every machine, made that a WARN: exit 0, not replaced, not
+    /// remembered. Off a MIG slice there is no fallback: torch proves nothing about a GPU it
+    /// doesn't enumerate, so every way nvidia-smi can fail (an error, its query, a timeout, no
+    /// GPUs listed, missing) is a FAIL whatever torch says, as before the fallback.
+    #[test]
+    fn a_gpu_fallen_off_the_bus_fails_whatever_torch_says() {
+        use Status::*;
+        // torch's side of an `n`-GPU pod where every GPU it sees works: tensor ops, and with
+        // more than one a ring of peer copies and NCCL across them. nvidia-smi's left to edit.
+        let torch_ok = |n: u32| -> String {
+            let mut out = without(HEALTHY_2GPU, &["smi_", "gpu.", "device_count", "tensor.", "peer.", "nccl", "deep_check_end"]);
+            out += &format!("smi_cuda=13.0\ndevice_count={n}\n");
+            for i in 0..n {
+                out += &format!("tensor.{i}=ok\ntgpu.{i}.name=NVIDIA H100 80GB HBM3\n");
+                if n > 1 {
+                    out += &format!("peer.{i}-{}=ok\n", (i + 1) % n);
+                }
+            }
+            out += &if n > 1 { format!("nccl=ok\nnccl_ranks={n}\n") } else { "peer=skipped (1 GPU)\nnccl=skipped (1 GPU)\n".into() };
+            out + "deep_check_end=1\n"
+        };
+        let off_the_bus = edit(
+            &torch_ok(7),
+            &[("smi", Some("ok")), ("smi_query", Some("error: Unable to determine the device handle for GPU 0000:41:00.0: Unknown Error"))],
+        );
+        let f = parse_deep(&off_the_bus);
+        assert_eq!((f.device_count, f.tensor.len(), f.peer.len(), f.smi_count()), (Some(7), 7, 7, None), "{off_the_bus}");
+
+        let checks = evaluate(&f, &cuda13(), None);
+        assert_eq!(
+            check(&checks, "nvidia-smi"),
+            &Check::new("nvidia-smi", Fail, "Unable to determine the device handle for GPU 0000:41:00.0: Unknown Error")
+        );
+        assert_eq!(overall(&checks), Fail, "{checks:#?}");
+        // A FAIL about the machine: replaced now, and remembered (`snapshot::bad_host_record`
+        // keeps what `condemns_machine` names).
+        let p = Pod { machine_id: Some("m8x2k".into()), ..pod("hotel", "1.2.3.4") };
+        let h = PodHealth::checked(&p, f, &cuda13());
+        assert_eq!((h.status, h.failure_kind()), (Fail, Some(FailureKind::Host)), "{:#?}", h.checks);
+        let condemned: Vec<&str> =
+            h.checks.iter().filter(|c| condemns_machine(c, h.facts.as_ref().unwrap())).map(|c| c.name.as_str()).collect();
+        assert_eq!(condemned, ["nvidia-smi"]);
+        assert!(crate::snapshot::bad_host_record(&p, &h, 1_760_000_000).is_some(), "{:#?}", h.checks);
+
+        // Every other way nvidia-smi can't answer on a whole card, torch proving the GPUs it sees.
+        let one = torch_ok(1);
+        // (what, the edits, nvidia-smi's FAIL detail)
+        type Case<'a> = (&'a str, &'a [(&'a str, Option<&'a str>)], &'a str);
+        let cases: &[Case] = &[
+            ("an error", &[("smi", Some("error: Failed to initialize NVML: Unknown Error"))], "Failed to initialize NVML: Unknown Error"),
+            ("a timeout", &[("smi", Some("error: nvidia-smi timed out after 10s"))], "nvidia-smi timed out after 10s"),
+            ("no GPUs listed", &[("smi", Some("ok")), ("smi_gpus", Some("0"))], "lists no GPUs"),
+            ("missing", &[("smi", Some("missing"))], "not found (no NVIDIA driver in the container)"),
+        ];
+        for (what, edits, detail) in cases {
+            let checks = evaluate(&parse_deep(&edit(&one, edits)), &cuda13(), None);
+            assert_eq!(check(&checks, "nvidia-smi"), &Check::new("nvidia-smi", Fail, *detail), "{what}");
+            assert_eq!(overall(&checks), Fail, "{what}: {checks:#?}");
+        }
     }
 
     /// Two slices of one parent: `--query-gpu` lists the 1 parent — the count to match is the
