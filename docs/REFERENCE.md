@@ -1325,9 +1325,12 @@ viewing, hooks) — and so is every web search feature, sleep tool, skill search
 goal or worktree feature it lists. **It fails closed**: neither is sent anything until `claude
 --help` lists every one of those flags, or `codex features list` names every one of those features
 and then, run again with the ask's own overrides (and an empty `CODEX_HOME`, as the ask reads no
-`config.toml`), shows nothing on beyond a reviewed list of features known to give it no tool
-(`arena_core::ask::ai::CODEX_SAFE_FEATURES`, from codex 0.163) — a check that fails, times out, or
-finds one missing or a feature on it doesn't know refuses the ask (`codex: couldn't confirm its
+`config.toml`), names each one it turns off and shows nothing on beyond a reviewed list of features
+known to give it no tool (`arena_core::ask::ai::CODEX_SAFE_FEATURES`, from codex 0.163). Both
+listings are read strictly — every row `<name> <stage> true|false`, the state exactly `true` or
+`false`, a stage codex is known to print — so a changed format can't read as "off". A check that
+fails, times out, can't be read whole, or finds one missing or a feature on it doesn't know refuses
+the ask (`codex: couldn't confirm its
 tools are off — not asked (…)`, naming it). The prompt goes on stdin (never argv), in an empty
 private temporary directory, with a minimal environment (`PATH`, `HOME`, the locale, XDG and proxy
 variables, and the AI's own config dir and API key — not the rest of yours), and in a session of its
@@ -1783,11 +1786,12 @@ scripts/ai-review --dry-run              # only write prompt.txt: nothing is sen
   feature it lists too, and its sleep tool, skill search, tool suggestion, goals and worktrees).
   Neither is sent anything until it has confirmed it knows every one of those switches — `codex
   features list` names each feature, `claude --help` lists each flag — and codex until that list,
-  run again with the review's overrides and an empty `CODEX_HOME`, shows nothing else on but the
-  features `pods ask` allows; a check that fails, times out (20 s), or finds one missing or one more
-  on refuses that reviewer (`ai-review: codex: couldn't confirm its tools are off — not asked
-  (…)`), and the other still runs. (Here codex's sandbox can't run a command anyway: bubblewrap
-  fails.)
+  run again with the review's overrides and an empty `CODEX_HOME`, names each one it turns off and
+  shows nothing else on but the features `pods ask` allows; both listings are read strictly, as
+  `pods ask` reads them (every row `<name> <stage> true|false`). A check that fails, times out
+  (20s), can't be read whole, or finds one missing or one more on refuses that reviewer (`ai-review:
+  codex: couldn't confirm its tools are off — not asked (…)`), and the other still runs. (Here
+  codex's sandbox can't run a command anyway: bubblewrap fails.)
 - **Output** goes to `${XDG_STATE_HOME:-~/.local/state}/arena-review/<UTC time>-<range|prN>/`
   (`--out DIR` for another parent): `prompt.txt`, `codex.md`, `claude.md`, and each reviewer's
   stderr in `codex.log`/`claude.log`. It ends by printing those paths and each review's last line,

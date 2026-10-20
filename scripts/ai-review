@@ -85,6 +85,9 @@ CODEX_SAFE_FEATURES=(api_key_cyber_access_programs api_key_model_discovery auth_
   code_mode_interrupt plugin_sharing tool_call_mcp_elicitation collaboration_modes item_ids
   resize_all_images sqlite steer terminal_resize_reflow tool_search_always_defer_mcp_tools
   tui_app_server)
+# - the stages `features list` prints between a feature's name and its state: every row must be
+#   `<name> <stage> true|false` with one of these (features_ok), or the reviewer is refused;
+CODEX_STAGES=(stable experimental deprecated removed 'under development')
 # - the flags that take claude's tools away — its `--help` must list each (a whole word);
 CLAUDE_NO_TOOL_FLAGS=(--tools --safe-mode --strict-mcp-config --mcp-config --disable-slash-commands
   --no-session-persistence)
@@ -537,16 +540,49 @@ describe() { # <reviewer> <args...>
   fi
 }
 
+# A `features list` (in <listing>) read strictly, as arena_core::ask::ai::parse_features reads one
+# (review ai-review codex #3, claude #1): every non-blank row `<name> <stage> true|false` — a name
+# of [a-z0-9_.-], one of CODEX_STAGES, the state exactly true or false — no name twice, something
+# listed, and every one of <required...> named. Reading `enabled`, a header or a column more as
+# "off" is how a changed format could pass a new tool as off: anything else prints why and fails.
+FEATURES_AWK='
+  function bad(why) { printf "has a row that can\047t be read: `%s` — %s\n", row, why; failed = 1; exit 1 }
+  NF == 0 { next }
+  {
+    row = $1; for (i = 2; i <= NF; i++) row = row " " $i
+    if (length(row) > 80) row = substr(row, 1, 79) "…"
+    if (NF < 3) bad("it isn\047t `<name> <stage> true|false`")
+    if ($NF != "true" && $NF != "false") bad("its state `" $NF "` isn\047t true or false")
+    stage = $2; for (i = 3; i < NF; i++) stage = stage " " $i
+    if (index(stages, "|" stage "|") == 0) bad("`" stage "` isn\047t a stage it\047s known to print")
+    if ($1 !~ /^[a-z0-9_.-]+$/) bad("`" $1 "` isn\047t a feature\047s name")
+    if ($1 in seen) { printf "names %s twice\n", $1; failed = 1; exit 1 }
+    seen[$1] = 1; n++
+  }
+  END { if (failed) exit 1; if (n == 0) { print "listed nothing"; exit 1 } }'
+features_ok() { # <listing> <required...>
+  local file=$1 f stages
+  local -a missing=()
+  shift
+  stages="|$(IFS='|'; echo "${CODEX_STAGES[*]}")|"
+  LC_ALL=C awk -v stages="$stages" "$FEATURES_AWK" "$file" || return 1
+  for f in "$@"; do awk -v f="$f" '$1 == f { found = 1 } END { exit !found }' "$file" || missing+=("$f"); done
+  [ ${#missing[@]} -eq 0 ] && return 0
+  echo "doesn't name $(IFS=,; echo "${missing[*]}" | sed 's/,/, /g')"
+  return 1
+}
+
 # Fail closed: a reviewer is sent nothing until it has confirmed it knows every switch its argv
 # takes its tools away with — claude's `--help` lists each of CLAUDE_NO_TOOL_FLAGS, codex's
-# `features list` names each of CODEX_TOOL_FEATURES — and, for codex, that nothing else stays on:
-# its `features list` run again with the review's own overrides (every one of CODEX_TOOL_FEATURES,
-# then each web search one and each of CODEX_OFF_WHEN_LISTED it lists, disabled: written to
-# $WORK/codex.disable for codex_args) may show on only CODEX_SAFE_FEATURES. A check that fails,
-# times out, or finds a switch missing or one more feature on refuses that reviewer. Status 0,
-# printing nothing, only when confirmed; else it prints why not.
+# `features list` reads whole and names each of CODEX_TOOL_FEATURES (features_ok) — and, for codex,
+# that nothing else stays on: its `features list` run again with the review's own overrides (every
+# one of CODEX_TOOL_FEATURES, then each web search one and each of CODEX_OFF_WHEN_LISTED it lists,
+# disabled: written to $WORK/codex.disable for codex_args) must read whole too, name each of
+# those, and show on only CODEX_SAFE_FEATURES. A check that fails, times out, can't be read, or
+# finds a switch missing or one more feature on refuses that reviewer. Status 0, printing
+# nothing, only when confirmed; else it prints why not.
 tools_off() { # <reviewer>
-  local r=$1 f
+  local r=$1 f why
   local -a missing=() on=() disable args
   if [ "$r" = claude ]; then
     describe claude --help || return 1
@@ -557,12 +593,8 @@ tools_off() { # <reviewer>
     return 1
   fi
   describe codex features list -c 'web_search="disabled"' -c 'mcp_servers={}' || return 1
+  why=$(features_ok "$WORK/codex.check" "${CODEX_TOOL_FEATURES[@]}") || { echo "\`codex features list\` $why"; return 1; }
   awk '{ print $1 }' "$WORK/codex.check" >"$WORK/codex.known"
-  for f in "${CODEX_TOOL_FEATURES[@]}"; do grep -qxF -- "$f" "$WORK/codex.known" || missing+=("$f"); done
-  if [ ${#missing[@]} -gt 0 ]; then
-    echo "\`codex features list\` doesn't name $(IFS=,; echo "${missing[*]}" | sed 's/,/, /g')"
-    return 1
-  fi
   {
     printf '%s\n' "${CODEX_TOOL_FEATURES[@]}"
     while read -r f; do
@@ -575,6 +607,10 @@ tools_off() { # <reviewer>
   args=(features list -c 'web_search="disabled"' -c 'mcp_servers={}')
   for f in "${disable[@]}"; do args+=(--disable "$f"); done
   describe codex "${args[@]}" || return 1
+  why=$(features_ok "$WORK/codex.check" "${disable[@]}") || {
+    echo "\`codex features list\` with the review's overrides $why"
+    return 1
+  }
   while read -r f; do
     case " ${CODEX_SAFE_FEATURES[*]} " in *" $f "*) ;; *) on+=("$f") ;; esac
   done < <(awk '$NF == "true" { print $1 }' "$WORK/codex.check")

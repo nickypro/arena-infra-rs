@@ -15,7 +15,8 @@
 //!
 //! **Fail closed.** Neither is sent anything until the CLI itself has confirmed it knows every
 //! switch that takes its tools away — claude's `--help` lists each of [`CLAUDE_NO_TOOL_FLAGS`],
-//! codex's `features list` names each of [`CODEX_TOOL_FEATURES`] ([`confirm_tools_off`]) — and,
+//! codex's `features list`, read strictly ([`parse_features`]), names each of
+//! [`CODEX_TOOL_FEATURES`] ([`confirm_tools_off`]) — and,
 //! for codex, that nothing else stays on: its `features list` run again with the very overrides
 //! the ask gets may show on only what [`CODEX_SAFE_FEATURES`] allows ([`codex_still_on`]; review
 //! ai-review claude #1: a feature it has under a name not listed here, or an override it ignored,
@@ -309,16 +310,58 @@ pub fn codex_args(workdir: &Path, out: &Path, model: Option<&str>, disabled: &[S
     a
 }
 
-/// `codex features list`'s rows: each line's first word, and whether its last is `true` (on).
-pub fn parse_features(stdout: &str) -> Vec<(String, bool)> {
-    stdout
-        .lines()
-        .filter_map(|l| {
-            let mut w = l.split_whitespace();
-            let name = w.next()?;
-            Some((name.to_string(), w.next_back() == Some("true")))
-        })
-        .collect()
+/// The stages `codex features list` prints between a feature's name and its state (codex 0.163).
+pub const CODEX_STAGES: &[&str] = &["stable", "experimental", "deprecated", "removed", "under development"];
+
+/// `codex features list`'s rows, read strictly (review ai-review codex #3, claude #1): every
+/// non-blank line `<name> <stage> true|false` — a name of `[a-z0-9_.-]`, one of [`CODEX_STAGES`],
+/// the state exactly `true` or `false` — no name twice, and something listed. Anything else is
+/// `Err`, naming the row and what's wrong with it: reading `enabled`, a header or a column more as
+/// "off" was how a changed format could pass a new tool as off, and a listing that can't be read
+/// whole proves nothing about what is on.
+pub fn parse_features(stdout: &str) -> Result<Vec<(String, bool)>, String> {
+    let mut rows: Vec<(String, bool)> = Vec::new();
+    for line in stdout.lines().filter(|l| !l.trim().is_empty()) {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let bad = |why: String| format!("has a row that can't be read: `{}` — {why}", crate::fleet::clip(&crate::jobs::sanitize(&words.join(" ")), 80));
+        let [name, stage @ .., state] = words.as_slice() else { return Err(bad("it isn't `<name> <stage> true|false`".into())) };
+        if stage.is_empty() {
+            return Err(bad("it isn't `<name> <stage> true|false`".into()));
+        }
+        let on = match *state {
+            "true" => true,
+            "false" => false,
+            other => return Err(bad(format!("its state `{other}` isn't true or false"))),
+        };
+        let stage = stage.join(" ");
+        if !CODEX_STAGES.contains(&stage.as_str()) {
+            return Err(bad(format!("`{stage}` isn't a stage it's known to print")));
+        }
+        if !name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_.-".contains(&b)) {
+            return Err(bad(format!("`{name}` isn't a feature's name")));
+        }
+        if rows.iter().any(|(n, _)| n == name) {
+            return Err(format!("names {name} twice"));
+        }
+        rows.push((name.to_string(), on));
+    }
+    if rows.is_empty() {
+        return Err("listed nothing".into());
+    }
+    Ok(rows)
+}
+
+/// A `codex features list` that reads whole ([`parse_features`]) and names every one of
+/// `required` — its rows, else why not. Both of the check's listings are held to it: the first
+/// to [`CODEX_TOOL_FEATURES`], the one with the ask's overrides to every feature it disables.
+pub fn codex_listing<S: AsRef<str>>(stdout: &str, required: &[S]) -> Result<Vec<(String, bool)>, String> {
+    let rows = parse_features(stdout)?;
+    let missing: Vec<&str> = required.iter().map(AsRef::as_ref).filter(|f| !rows.iter().any(|(n, _)| n == f)).collect();
+    if missing.is_empty() {
+        Ok(rows)
+    } else {
+        Err(format!("doesn't name {}", missing.join(", ")))
+    }
 }
 
 /// How `ai` describes itself before it is asked anything: `claude --help`, `codex features list`.
@@ -331,23 +374,21 @@ pub fn discovery_args(ai: Ai) -> Vec<String> {
 
 /// Whether `ai`'s self-description ([`discovery_args`]'s output) shows it knows every switch
 /// its argv takes its tools away with: claude's `--help` lists each of [`CLAUDE_NO_TOOL_FLAGS`]
-/// (as a word: `--tools,` or `--tools <tools...>`), codex's `features list` names each of
-/// [`CODEX_TOOL_FEATURES`]. `Err`: the ones it doesn't.
-pub fn confirm_tools_off(ai: Ai, described: &str) -> Result<(), Vec<&'static str>> {
-    let missing: Vec<&'static str> = match ai {
+/// (as a word: `--tools,` or `--tools <tools...>`), codex's `features list` reads whole and names
+/// each of [`CODEX_TOOL_FEATURES`] ([`codex_listing`]). `Err`: what it doesn't (`doesn't list
+/// --tools, --mcp-config`), or why its listing can't be read.
+pub fn confirm_tools_off(ai: Ai, described: &str) -> Result<(), String> {
+    match ai {
         Ai::Claude => {
             let words: Vec<&str> = described.split(|c: char| c.is_whitespace() || c == ',').collect();
-            CLAUDE_NO_TOOL_FLAGS.iter().copied().filter(|f| !words.contains(f)).collect()
+            let missing: Vec<&str> = CLAUDE_NO_TOOL_FLAGS.iter().copied().filter(|f| !words.contains(f)).collect();
+            if missing.is_empty() {
+                Ok(())
+            } else {
+                Err(format!("doesn't list {}", missing.join(", ")))
+            }
         }
-        Ai::Codex => {
-            let known = parse_features(described);
-            CODEX_TOOL_FEATURES.iter().copied().filter(|f| !known.iter().any(|(k, _)| k == f)).collect()
-        }
-    };
-    if missing.is_empty() {
-        Ok(())
-    } else {
-        Err(missing)
+        Ai::Codex => codex_listing(described, CODEX_TOOL_FEATURES).map(|_| ()),
     }
 }
 
@@ -531,8 +572,9 @@ async fn describe(ai: Ai, bin: &Path, extra: &[String], cwd: &Path, vars: &[(OsS
 
 /// Hold `ai` to its own description before it is sent anything, each run within `budget`:
 /// claude's `--help` must list every one of [`CLAUDE_NO_TOOL_FLAGS`]; codex's `features list` must
-/// name every one of [`CODEX_TOOL_FEATURES`] ([`confirm_tools_off`]), then — run again with the
-/// overrides the ask will get ([`codex_overrides`] of [`codex_disabled`]) — show nothing on that
+/// read whole and name every one of [`CODEX_TOOL_FEATURES`] ([`confirm_tools_off`]), then — run
+/// again with the overrides the ask will get ([`codex_overrides`] of [`codex_disabled`]) — read
+/// whole, name every feature it disables ([`codex_listing`]) and show nothing on that
 /// [`CODEX_SAFE_FEATURES`] doesn't allow ([`codex_still_on`]). codex's checks run with an empty
 /// `CODEX_HOME` of their own (`codex_home`): `features list` has no `--ignore-user-config`, and the
 /// operator's `config.toml` that the ask doesn't read must not show a feature off there that the
@@ -544,17 +586,18 @@ async fn check_tools_off(ai: Ai, bin: &Path, cwd: &Path, vars: &[(OsString, OsSt
     match ai {
         Ai::Claude => {
             let help = describe(ai, bin, &[], cwd, vars, budget).await.map_err(refuse)?;
-            confirm_tools_off(ai, &help).map_err(|missing| refuse(format!("`{cmd}` doesn't list {}", missing.join(", "))))?;
+            confirm_tools_off(ai, &help).map_err(|why| refuse(format!("`{cmd}` {why}")))?;
             Ok(Vec::new())
         }
         Ai::Codex => {
             let home = (OsString::from("CODEX_HOME"), codex_home.as_os_str().to_os_string());
             let vars: Vec<(OsString, OsString)> = vars.iter().filter(|(k, _)| k != "CODEX_HOME").cloned().chain([home]).collect();
             let listed = describe(ai, bin, &codex_overrides(&[]), cwd, &vars, budget).await.map_err(refuse)?;
-            confirm_tools_off(ai, &listed).map_err(|missing| refuse(format!("`{cmd}` doesn't name {}", missing.join(", "))))?;
-            let disabled = codex_disabled(&parse_features(&listed));
+            let rows = codex_listing(&listed, CODEX_TOOL_FEATURES).map_err(|why| refuse(format!("`{cmd}` {why}")))?;
+            let disabled = codex_disabled(&rows);
             let after = describe(ai, bin, &codex_overrides(&disabled), cwd, &vars, budget).await.map_err(refuse)?;
-            match codex_still_on(&parse_features(&after)).as_slice() {
+            let rows = codex_listing(&after, &disabled).map_err(|why| refuse(format!("`{cmd}` with the ask's overrides {why}")))?;
+            match codex_still_on(&rows).as_slice() {
                 [] => Ok(disabled),
                 on => Err(refuse(format!(
                     "`{cmd}` shows {} on with the ask's overrides — not known to give it no tool (arena_core::ask::ai::CODEX_SAFE_FEATURES)",
@@ -830,7 +873,7 @@ pub(crate) mod tests {
         assert_eq!(codex_args(Path::new("/t/empty"), Path::new("/t/a.md"), Some("gpt-x"), &disabled), want);
         assert_eq!(codex_args(Path::new("/t/empty"), Path::new("/t/a.md"), None, &disabled).last().map(String::as_str), Some("-"), "the prompt on stdin");
         let rows = |v: &[(&str, bool)]| v.iter().map(|(n, on)| (n.to_string(), *on)).collect::<Vec<_>>();
-        assert_eq!(parse_features("shell_tool stable true\n\napps beta false\nin_app_voice under development  true\nlonely\n"), rows(&[("shell_tool", true), ("apps", false), ("in_app_voice", true), ("lonely", false)]));
+        assert_eq!(parse_features("shell_tool stable true\n\napps experimental false\nin_app_voice under development  true\n"), Ok(rows(&[("shell_tool", true), ("apps", false), ("in_app_voice", true)])));
     }
 
     /// The check before anything is sent: claude's --help must list every no-tools flag (as a
@@ -839,14 +882,14 @@ pub(crate) mod tests {
     #[test]
     fn tools_off_is_confirmed_by_the_clis_own_description() {
         assert_eq!(confirm_tools_off(Ai::Claude, &fixtures::claude_help(&[])), Ok(()));
-        assert_eq!(confirm_tools_off(Ai::Claude, &fixtures::claude_help(&["--strict-mcp-config", "--tools"])), Err(vec!["--tools", "--strict-mcp-config"]));
+        assert_eq!(confirm_tools_off(Ai::Claude, &fixtures::claude_help(&["--strict-mcp-config", "--tools"])), Err("doesn't list --tools, --strict-mcp-config".into()));
         let lookalikes = "  --tools-extra <x>\n  --safe-mode\n  --strict-mcp-config\n  --mcp-config-file\n  --disable-slash-commands\n  --no-session-persistence\n";
-        assert_eq!(confirm_tools_off(Ai::Claude, lookalikes), Err(vec!["--tools", "--mcp-config"]));
-        assert_eq!(confirm_tools_off(Ai::Claude, ""), Err(CLAUDE_NO_TOOL_FLAGS.to_vec()));
+        assert_eq!(confirm_tools_off(Ai::Claude, lookalikes), Err("doesn't list --tools, --mcp-config".into()));
+        assert_eq!(confirm_tools_off(Ai::Claude, ""), Err(format!("doesn't list {}", CLAUDE_NO_TOOL_FLAGS.join(", "))));
         assert_eq!(confirm_tools_off(Ai::Codex, &fixtures::codex_features(&[])), Ok(()));
-        assert_eq!(confirm_tools_off(Ai::Codex, &fixtures::codex_features(&["hooks", "view_image"])), Err(vec!["hooks", "view_image"]));
-        // A name inside another line's text isn't a feature it lists.
-        assert_eq!(confirm_tools_off(Ai::Codex, "web_search  stable  true  (not shell_tool)\n").unwrap_err().len(), CODEX_TOOL_FEATURES.len());
+        assert_eq!(confirm_tools_off(Ai::Codex, &fixtures::codex_features(&["hooks", "view_image"])), Err("doesn't name hooks, view_image".into()));
+        // A name inside another line's text isn't a feature it lists: that line can't be read.
+        assert!(confirm_tools_off(Ai::Codex, "web_search  stable  true  (not shell_tool)\n").unwrap_err().starts_with("has a row that can't be read"));
         assert_eq!(discovery_args(Ai::Claude), ["--help"]);
         assert_eq!(discovery_args(Ai::Codex), ["features", "list"]);
     }
@@ -880,13 +923,25 @@ pub(crate) mod tests {
     #[test]
     fn ai_review_runs_claude_and_codex_as_ask_does() {
         let script = include_str!("../../../../scripts/ai-review");
-        let array = |name: &str| -> Vec<&str> {
+        // A bash array's words, a `'…'` one word (a stage of two).
+        let array = |name: &str| -> Vec<String> {
             let start = script.find(&format!("\n{name}=(")).unwrap_or_else(|| panic!("{name} in ai-review")) + name.len() + 3;
-            script[start..start + script[start..].find(')').unwrap()].split_whitespace().collect()
+            let mut rest = script[start..start + script[start..].find(')').unwrap()].trim_start();
+            let mut words = Vec::new();
+            while !rest.is_empty() {
+                let (w, r) = match rest.strip_prefix('\'') {
+                    Some(quoted) => quoted.split_once('\'').unwrap(),
+                    None => rest.split_once(char::is_whitespace).unwrap_or((rest, "")),
+                };
+                words.push(w.to_string());
+                rest = r.trim_start();
+            }
+            words
         };
         assert_eq!(array("CODEX_TOOL_FEATURES"), CODEX_TOOL_FEATURES);
         assert_eq!(array("CODEX_OFF_WHEN_LISTED"), CODEX_OFF_WHEN_LISTED);
         assert_eq!(array("CODEX_SAFE_FEATURES"), CODEX_SAFE_FEATURES);
+        assert_eq!(array("CODEX_STAGES"), CODEX_STAGES);
         assert_eq!(array("CLAUDE_NO_TOOL_FLAGS"), CLAUDE_NO_TOOL_FLAGS);
         assert_eq!(array("COMMON_VARS"), COMMON_VARS);
         assert_eq!(array("CLAUDE_VARS"), own_vars(Ai::Claude));
@@ -913,6 +968,12 @@ pub(crate) mod tests {
         assert!(text.contains(r#"printf '%s\n' "${CODEX_TOOL_FEATURES[@]}""#), "every tool feature, always");
         assert!(text.contains(r#"case $f in *web_search*) echo "$f" ;; esac"#), "web search, as off_when_listed");
         assert!(text.contains(r#"args=(features list -c 'web_search="disabled"' -c 'mcp_servers={}')"#), "its check gets the overrides");
+        // Both listings read strictly, as `parse_features` and `codex_listing` read them.
+        assert!(text.contains(r#"why=$(features_ok "$WORK/codex.check" "${CODEX_TOOL_FEATURES[@]}")"#), "the first, every tool feature named");
+        assert!(text.contains(r#"why=$(features_ok "$WORK/codex.check" "${disable[@]}")"#), "the second, every disabled one named");
+        for rule in [r#"if ($NF != "true" && $NF != "false")"#, r#"if (index(stages, "|" stage "|") == 0)"#, r#"if ($1 in seen)"#, r#"print "listed nothing""#] {
+            assert!(text.contains(rule), "{rule}");
+        }
         assert!(text.contains(r#"envs+=("CODEX_HOME=$WORK/codex-home")"#), "its check: an empty CODEX_HOME");
         assert_eq!(text.matches(r#"exec timeout -k "#).count(), 2, "the check and the review");
         assert_eq!(text.matches(r#"env -i "${envs[@]}" "$bin" "${args[@]}""#).count(), 2, "both under env -i");
@@ -968,7 +1029,7 @@ pub(crate) mod tests {
         let at = |flag: &str| argv.iter().position(|a| a == flag).map(|i| argv[i + 1].clone()).unwrap();
         let (cwd, out) = (at("-C"), at("-o"));
         assert_eq!(cwd, rec(&t.0, "codex.cwd").trim(), "-C is where it runs: the empty dir");
-        let disabled = codex_disabled(&parse_features(&codex_features(&[])));
+        let disabled = codex_disabled(&parse_features(&codex_features(&[])).unwrap());
         assert_eq!(argv, codex_args(Path::new(&cwd), Path::new(&out), None, &disabled), "exactly the no-tools argv, the MCP override included");
         assert_eq!(rec(&t.0, "codex.stdin"), "PROMPT");
         assert!(!rec(&t.0, "codex.env").lines().any(|l| l.starts_with("CARGO")), "{}", rec(&t.0, "codex.env"));
@@ -989,7 +1050,7 @@ pub(crate) mod tests {
             (Ai::Codex, "echo 'error: unrecognized subcommand' >&2; exit 2".into(), 10, "(`codex features list` failed (exit 2): error: unrecognized subcommand)"),
             (Ai::Codex, "exec sleep 30".into(), 1, "(`codex features list` didn't answer within 1s)"),
             (Ai::Codex, format!("cat <<'EOF'\n{}EOF", codex_features(&["hooks", "view_image"])), 10, "(`codex features list` doesn't name hooks, view_image)"),
-            (Ai::Codex, "true".into(), 10, "doesn't name shell_tool, unified_exec,"),
+            (Ai::Codex, "true".into(), 10, "(`codex features list` listed nothing)"),
             (Ai::Claude, "echo 'Error: unknown option' >&2; exit 1".into(), 10, "(`claude --help` failed (exit 1): Error: unknown option)"),
             (Ai::Claude, format!("cat <<'EOF'\n{}EOF", claude_help(&["--strict-mcp-config", "--mcp-config"])), 10, "(`claude --help` doesn't list --strict-mcp-config, --mcp-config)"),
         ];
@@ -1005,6 +1066,78 @@ pub(crate) mod tests {
         }
     }
 
+    /// Review ai-review codex #3, claude #1: `codex features list` is read whole or not at all —
+    /// every row `<name> <stage> true|false`, its state exactly `true` or `false`, a stage codex is
+    /// known to print, no name twice, something listed — and must name what's required. Each way a
+    /// changed format could read as "off" is a refusal naming it: an empty listing, an `enabled`
+    /// state, an extra column (after the state, or between), a header, a missing feature.
+    #[test]
+    fn codex_features_list_is_read_strictly() {
+        assert_eq!(parse_features(&codex_features(&[])).unwrap().len(), CODEX_TOOL_FEATURES.len() + 5);
+        let err = |text: &str| parse_features(text).unwrap_err();
+        let row = |r: &str, why: &str| format!("has a row that can't be read: `{r}` — {why}");
+        assert_eq!(err(""), "listed nothing");
+        assert_eq!(err("\n   \n"), "listed nothing");
+        assert_eq!(err("shell_tool    stable    enabled\n"), row("shell_tool stable enabled", "its state `enabled` isn't true or false"));
+        assert_eq!(err("apps stable true\nshell_tool stable true extra\n"), row("shell_tool stable true extra", "its state `extra` isn't true or false"));
+        assert_eq!(err("shell_tool stable 0.163 true\n"), row("shell_tool stable 0.163 true", "`stable 0.163` isn't a stage it's known to print"));
+        assert_eq!(err("shell_tool beta true\n"), row("shell_tool beta true", "`beta` isn't a stage it's known to print"));
+        assert_eq!(err("NAME STAGE ENABLED\nshell_tool stable true\n"), row("NAME STAGE ENABLED", "its state `ENABLED` isn't true or false"));
+        assert_eq!(err("feature stage on\n"), row("feature stage on", "its state `on` isn't true or false"));
+        assert_eq!(err("shell_tool true\n"), row("shell_tool true", "it isn't `<name> <stage> true|false`"));
+        assert_eq!(err("Shell_Tool stable true\n"), row("Shell_Tool stable true", "`Shell_Tool` isn't a feature's name"));
+        assert_eq!(err("shell_tool stable true\nshell_tool stable false\n"), "names shell_tool twice");
+        // A missing feature, in the first listing or in the one with the overrides.
+        assert_eq!(codex_listing(&codex_features(&["hooks"]), CODEX_TOOL_FEATURES).unwrap_err(), "doesn't name hooks");
+        assert_eq!(codex_listing(&codex_features(&["goals"]), &["goals".to_string(), "steer".into()]).unwrap_err(), "doesn't name goals");
+        assert_eq!(confirm_tools_off(Ai::Codex, ""), Err("listed nothing".into()));
+        assert!(codex_listing(&codex_features(&[]), CODEX_TOOL_FEATURES).is_ok());
+    }
+
+    /// The same, end to end: a listing that can't be read whole — the first, or the one run with
+    /// the ask's overrides — refuses the ask naming the problem, and codex is never sent the
+    /// prompt: an `enabled` state, an extra column, a feature it disables no longer named, an
+    /// empty listing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_is_refused_when_a_listing_cant_be_read_whole() {
+        let t = Tmp::new("strict");
+        let (bin, ran) = (t.0.join("bin"), t.0.join("ran"));
+        std::fs::create_dir_all(&bin).unwrap();
+        let (first, second) = (t.0.join("first.txt"), t.0.join("second.txt"));
+        stub(
+            &bin,
+            "codex",
+            &format!(
+                "if [ \"$1\" = features ]; then case \"$*\" in *--disable*) cat '{}' ;; *) cat '{}' ;; esac; exit 0; fi\ncat > {}\necho ANSWER",
+                second.display(),
+                first.display(),
+                ran.display()
+            ),
+        );
+        let env = AiEnv { path: Some(on_path(&bin)), home: None, tmp: t.0.clone(), vars: Vec::new() };
+        let good = codex_features(&[]);
+        let off = good.replace(" true\n", " false\n");
+        let without = |f: &str| off.lines().filter(|l| l.split_whitespace().next() != Some(f)).map(|l| format!("{l}\n")).collect::<String>();
+        let cases = [
+            (good.replace(" true\n", " enabled\n"), off.clone(), "(`codex features list` has a row that can't be read: `shell_tool stable enabled` — its state `enabled` isn't true or false)"),
+            (good.clone(), off.replace(" false\n", " false 0.163\n"), "(`codex features list` with the ask's overrides has a row that can't be read: `shell_tool stable false 0.163` — its state `0.163` isn't true or false)"),
+            (good.clone(), without("sleep_tool"), "(`codex features list` with the ask's overrides doesn't name sleep_tool)"),
+            (good.clone(), String::new(), "(`codex features list` with the ask's overrides listed nothing)"),
+        ];
+        for (one, two, why) in cases {
+            std::fs::write(&first, one).unwrap();
+            std::fs::write(&second, two).unwrap();
+            let e = ask(Ai::Codex, "the PROMPT", None, Duration::from_secs(20), &env).await.unwrap_err();
+            assert!(e.starts_with("codex: couldn't confirm its tools are off — not asked (") && e.ends_with(why), "{why}: {e}");
+            assert!(!ran.exists(), "{why}: it was sent the prompt");
+        }
+        // Both read whole, nothing unreviewed on: asked.
+        std::fs::write(&first, &good).unwrap();
+        std::fs::write(&second, &off).unwrap();
+        assert_eq!(ask(Ai::Codex, "the PROMPT", None, Duration::from_secs(20), &env).await.unwrap(), "ANSWER");
+    }
+
     /// Review ai-review claude #1: what may stay on. The features turned off are every tool
     /// feature, then each web search one and each of [`CODEX_OFF_WHEN_LISTED`] that codex lists;
     /// once they are, anything it still shows on outside [`CODEX_SAFE_FEATURES`] is named — an
@@ -1012,7 +1145,7 @@ pub(crate) mod tests {
     /// `unified_exec` (the shell's implementation, which codex 0.163 keeps on), never `shell_tool`.
     #[test]
     fn codex_may_keep_on_only_the_reviewed_features() {
-        let listed = parse_features(&codex_features(&[]));
+        let listed = parse_features(&codex_features(&[])).unwrap();
         let disabled = codex_disabled(&listed);
         assert_eq!(disabled[..CODEX_TOOL_FEATURES.len()], *CODEX_TOOL_FEATURES);
         assert_eq!(disabled[CODEX_TOOL_FEATURES.len()..], ["web_search_request", "goals", "sleep_tool"]);
@@ -1033,7 +1166,7 @@ pub(crate) mod tests {
     /// feature is one it has on, and what it was told to turn off is off — but `unified_exec`.
     #[test]
     fn codex_0_163_keeps_on_only_what_is_allowed() {
-        let listed = parse_features(include_str!("testdata/codex-0.163-features-list.txt"));
+        let listed = parse_features(include_str!("testdata/codex-0.163-features-list.txt")).unwrap();
         assert_eq!(listed.len(), 175);
         assert_eq!(codex_still_on(&listed), Vec::<String>::new());
         for f in CODEX_SAFE_FEATURES {
@@ -1065,7 +1198,7 @@ pub(crate) mod tests {
             assert!(argv.contains(&format!("--disable\n{f}\n")), "{f}: {argv}");
         }
         let checks: Vec<String> = rec(&t.0, "codex.features.argv").lines().map(String::from).collect();
-        let disabled = codex_disabled(&parse_features(&codex_features(&[])));
+        let disabled = codex_disabled(&parse_features(&codex_features(&[])).unwrap());
         let line = |d: &[String]| ["features", "list"].map(String::from).into_iter().chain(codex_overrides(d)).collect::<Vec<_>>().join(" ");
         assert_eq!(checks, [line(&[]), line(&disabled)], "the names, then the overrides the ask gets");
         let homes: Vec<String> = rec(&t.0, "codex.features.home").lines().map(String::from).collect();
