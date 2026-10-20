@@ -70,7 +70,6 @@ impl World {
     /// The stand-in rsync, failing when its destination matches `dest` (a `case` pattern) or its
     /// arguments match `args`.
     fn rsync_failing(&self, dest: &str, args: &str) {
-        use std::os::unix::fs::PermissionsExt;
         let mut fail = String::new();
         if !dest.is_empty() {
             fail.push_str(&format!("case \"$last\" in {dest}) echo 'rsync: No space left on device (28)' >&2; exit 11;; esac\n"));
@@ -78,16 +77,14 @@ impl World {
         if !args.is_empty() {
             fail.push_str(&format!("case \"$*\" in {args}) echo 'rsync: read error' >&2; exit 23;; esac\n"));
         }
-        let script = self.base.join("rsync");
-        std::fs::write(
-            &script,
+        arena_core::remote::write_test_script(
+            self.base.join("rsync"),
             format!(
                 "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\necho \"$last\" >> \"$(dirname \"$0\")/calls.log\"\n{fail}\
                  mkdir -p \"$last/ARENA_materials/.git\"\n"
             ),
         )
         .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     /// The backup dir.
@@ -511,7 +508,7 @@ async fn a_pod_left_past_the_threshold_but_held_back_says_why() {
         let w = World::new(&format!("held-{case}"));
         match copy {
             "fail" => w.rsync(true),
-            "no-git" => std::fs::write(w.base.join("rsync"), "#!/bin/sh\nexit 0\n").unwrap(),
+            "no-git" => arena_core::remote::write_test_script(w.base.join("rsync"), "#!/bin/sh\nexit 0\n").unwrap(),
             _ => {}
         }
         let cfg = w.cfg(extra);
@@ -707,7 +704,7 @@ async fn a_busy_pods_copy_counts_only_when_whole() {
         let w = World::new(&format!("whole-{case}"));
         w.rsync_failing(dest, args);
         if case == "timeout" {
-            std::fs::write(w.base.join("rsync"), "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\nsleep 5\nmkdir -p \"$last/ARENA_materials/.git\"\n").unwrap();
+            arena_core::remote::write_test_script(w.base.join("rsync"), "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\nsleep 5\nmkdir -p \"$last/ARENA_materials/.git\"\n").unwrap();
         }
         let cfg = w.cfg(extra);
         let n = now();

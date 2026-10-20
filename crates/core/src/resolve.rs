@@ -144,6 +144,13 @@ fn resolve_command_bounded(repo: &str, hours: u64, op: &str, print: &str, copy: 
     let (quiet, h, max) = ((hours * 3600).to_string(), hours.to_string(), max_bytes.to_string());
     let args = [repo, &quiet, op, print, &h, copy, &max].map(shell_word).join(" ");
     let script = format!("set -- {args}\n{}", resolve_script());
+    let (stopped, killed) = resolve_stop_words(secs, kill_after);
+    crate::backup::bounded_sh(&script, "arena-resolve", secs, kill_after, &stopped, &killed)
+}
+
+/// What the pod says when the bound stopped the resolve: TERM after `secs` (exit 124), and KILL
+/// `kill_after` later (137, no trap run).
+fn resolve_stop_words(secs: u64, kill_after: u64) -> (String, String) {
     let stopped = format!(
         "arena resolve: it ran past its {secs} s on the pod and was stopped there (TERM) — it may have stopped part-way: see `git \
          status` on the pod; the state before, once kept, is in .git/arena-resolved/"
@@ -153,7 +160,7 @@ fn resolve_command_bounded(repo: &str, hours: u64, op: &str, print: &str, copy: 
          part-way: see `git status` on the pod; the state before, once kept, is in .git/arena-resolved/, and its temporary files may \
          be left in .git/ (arena-resolve.*)"
     );
-    crate::backup::bounded_sh(&script, "arena-resolve", secs, kill_after, &stopped, &killed)
+    (stopped, killed)
 }
 
 /// The resolve's exit when it touched nothing (`REFUSED`).

@@ -519,14 +519,11 @@ fn a_resolve_is_read_back_and_said_in_a_line() {
     }
 }
 
-/// `s` as one single-quoted shell word, as the wrapper carries a script.
-fn quoted(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
-/// The scripts are POSIX sh: dash (the images' `sh`) parses them. The resolve's command carries
-/// its script once — its arguments its first line — bounded on the pod a little under the CLI's
-/// timeout (review ai-review claude #7): `timeout -k 10 270`, under `sh -c`.
+/// The scripts are POSIX sh: dash (the images' `sh`) parses them. The resolve's command is
+/// `backup::bounded_sh`'s for its script — its arguments its first line — bounded on the pod a
+/// little under the CLI's timeout (review ai-review claude #7): 270 s, then a KILL 10 s later,
+/// with its own words for a resolve the bound stopped. Checked against `bounded_sh`'s own output,
+/// never the wrapper's text, which is backup's to change.
 #[cfg(unix)]
 #[test]
 fn the_scripts_parse_under_sh() {
@@ -539,10 +536,10 @@ fn the_scripts_parse_under_sh() {
     }
     assert!(resolve_script().contains(&format!("REVERT_WORDS={}", shell_word(REVERT_WORDS))));
     assert!(look_command("/root/my repo").ends_with(" arena-look '/root/my repo'"));
-    assert_eq!(cmd.matches(&quoted(&script)).count(), 1, "the script, carried once");
-    let wrapper = cmd.replace(&quoted(&script), "<script>");
-    assert!(wrapper.contains("timeout -k 10 270 sh -c ") && wrapper.contains("arena-resolve"), "{wrapper}");
-    assert!(wrapper.contains("ran past its 270 s on the pod and was stopped there (TERM)"), "{wrapper}");
+    let (stopped, killed) = resolve_stop_words(270, 10);
+    assert!(cmd == crate::backup::bounded_sh(&script, "arena-resolve", 270, 10, &stopped, &killed), "bounded_sh's, for the resolve's script");
+    assert!(stopped.starts_with("arena resolve: it ran past its 270 s on the pod and was stopped there (TERM)"), "{stopped}");
+    assert!(killed.starts_with("arena resolve: it ran past its 270 s on the pod and was killed there (10 s after the TERM)"), "{killed}");
     assert_eq!((RESOLVE_BOUND_SECS, RESOLVE_KILL_AFTER_SECS), (270, 10));
     // A resolve's temporary files go when a signal ends it: HUP, INT, TERM and PIPE are exits.
     for (sig, code) in [("HUP", 129), ("INT", 130), ("TERM", 143), ("PIPE", 141)] {
@@ -639,7 +636,6 @@ impl Repo {
     /// The stand-in `who`: nobody, or one login on a "tty" whose atime is `typed` seconds ago
     /// (a file under the sandbox, reached from `/dev/` by `..`).
     fn login(&self, typed: Option<u64>) {
-        use std::os::unix::fs::PermissionsExt;
         let who = self.base.join("bin/who");
         let script = match typed {
             None => "#!/bin/sh\n".to_string(),
@@ -651,8 +647,7 @@ impl Repo {
                 format!("#!/bin/sh\necho 'root     ..{}        2026-10-19 10:00 (10.0.0.9)'\n", tty.display())
             }
         };
-        std::fs::write(&who, script).unwrap();
-        std::fs::set_permissions(&who, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::remote::write_test_script(&who, script).unwrap();
     }
 
     /// A pseudo-terminal `/dev/pts/<n>` of the stand-in, last read `read` and written `written`
