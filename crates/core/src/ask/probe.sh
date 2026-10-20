@@ -77,8 +77,12 @@ else
 fi
 # tmux, in the C locale, turns a tab in its -F output into `_` (tmux 3.4 on Ubuntu 24.04): the
 # fields are `:`-separated, the name last (tmux allows no `:` in one); `-u` keeps a UTF-8 name.
+# Asked only when its socket directory is there: `tmux list-sessions` makes that directory when
+# it isn't (and then finds no server) — and with no directory no server has run as this user.
 if command -v tmux >/dev/null 2>&1; then
-    if out=$(t 5 tmux -u list-sessions -F '#{session_windows}:#{session_attached}:#{session_activity}:#{session_name}' 2>&1); then
+    if [ ! -d "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u 2>/dev/null)" ]; then
+        o tmux ok
+    elif out=$(t 5 tmux -u list-sessions -F '#{session_windows}:#{session_attached}:#{session_activity}:#{session_name}' 2>&1); then
         o tmux ok
         printf '%s\n' "$out" | grep . | head -n 20 | sed -e "s/^/ARENA_ASK_TMUX.$N /"
     else

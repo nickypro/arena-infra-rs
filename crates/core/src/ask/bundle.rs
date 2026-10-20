@@ -1626,6 +1626,12 @@ mod tests {
         );
     }
 
+    /// The user's id, for tmux's socket directory (`tmux-<uid>`).
+    #[cfg(target_os = "linux")]
+    fn uid() -> String {
+        String::from_utf8(std::process::Command::new("id").arg("-u").output().unwrap().stdout).unwrap().trim().to_string()
+    }
+
     /// probe.sh runs in the C locale: tmux 3.4 there turns each tab of its `-F` output into `_`,
     /// and `who` prints `Oct 20 15:27`. A stub tmux doing exactly that, and a stub who in both
     /// time formats (with a source host): the sessions read whole, the logins keep their time
@@ -1638,6 +1644,8 @@ mod tests {
         let (bin, home) = (t.0.join("bin"), t.0.join("home"));
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::create_dir_all(&home).unwrap();
+        // A tmux server has run here: its socket directory is there.
+        std::fs::create_dir_all(t.0.join("tmux").join(format!("tmux-{}", uid()))).unwrap();
         crate::ask::ai::fixtures::stub(
             &bin,
             "tmux",
@@ -1656,6 +1664,7 @@ mod tests {
             .env_clear()
             .env("PATH", format!("{}:/usr/local/bin:/usr/bin:/bin", bin.display()))
             .env("HOME", &home)
+            .env("TMUX_TMPDIR", t.0.join("tmux"))
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1667,6 +1676,48 @@ mod tests {
         // The parse, tolerant: a count it can't read is unknown; a line of another shape is a name.
         assert_eq!(parse_tmux("2:1::lab"), Tmux { name: "lab".into(), windows: Some(2), attached: Some(1), activity: None });
         assert_eq!(parse_tmux("notes_2_1_1792506455"), Tmux { name: "notes_2_1_1792506455".into(), windows: None, attached: None, activity: None });
+    }
+
+    /// Review ai-review claude #5: `tmux list-sessions` makes its socket directory when there is
+    /// none, so the probe — which writes nothing — asks tmux only when `${TMUX_TMPDIR:-/tmp}/
+    /// tmux-<uid>` is there. Without it: no sessions, and tmux never runs (a stub that says so
+    /// isn't called; the real tmux, where there is one, makes nothing). With it: tmux is asked.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tmux_is_asked_only_when_its_socket_directory_is_there() {
+        use std::process::Command;
+        let t = crate::ask::ai::tests::Tmp::new("tmuxdir");
+        let (bin, home, tmpdir) = (t.0.join("bin"), t.0.join("home"), t.0.join("tmux"));
+        for d in [&bin, &home, &tmpdir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let called = t.0.join("tmux-called");
+        crate::ask::ai::fixtures::stub(&bin, "tmux", &format!("echo \"$*\" >> {}\necho '1:0:1792506455:lab'", called.display()));
+        let probe = |path: String| {
+            let o = Command::new("sh")
+                .arg("-c")
+                .arg(probe_script())
+                .args(["arena-ask-probe", "", NONCE])
+                .env_clear()
+                .env("PATH", path)
+                .env("HOME", &home)
+                .env("TMUX_TMPDIR", &tmpdir)
+                .output()
+                .unwrap();
+            parse_extra(&String::from_utf8_lossy(&o.stdout), NONCE).tmux
+        };
+        let stubbed = format!("{}:/usr/bin:/bin", bin.display());
+        let socket = tmpdir.join(format!("tmux-{}", uid()));
+        assert_eq!(probe(stubbed.clone()), Some(Ok(vec![])), "no directory: no sessions");
+        assert!(!called.exists(), "tmux was run with no socket directory");
+        if Command::new("sh").arg("-c").arg("command -v tmux").output().is_ok_and(|o| o.status.success()) {
+            assert_eq!(probe("/usr/bin:/bin".to_string()), Some(Ok(vec![])));
+            assert!(!socket.exists(), "the probe made tmux's socket directory");
+        }
+        std::fs::create_dir_all(&socket).unwrap();
+        let lab = Tmux { name: "lab".into(), windows: Some(1), attached: Some(0), activity: Some(1_792_506_455) };
+        assert_eq!(probe(stubbed), Some(Ok(vec![lab])), "the directory there: tmux asked");
+        assert!(std::fs::read_to_string(&called).unwrap().starts_with("-u list-sessions -F "));
     }
 
     #[test]
