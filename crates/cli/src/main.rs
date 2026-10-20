@@ -7803,6 +7803,10 @@ async fn handle_pods_bal(
             let cmd = command.join(" ");
             let budget = Duration::from_secs(timeout);
             let mut sel = select(provider, cfg, &sel.args(), Unscoped::All).await?;
+            let names: Vec<(&str, &str)> = sel.pods.iter().map(|p| (p.name.as_str(), short_of(cfg, &p.name))).collect();
+            if let Some(why) = pod_name_as_command(&command, &names) {
+                anyhow::bail!("{why}");
+            }
             refresh_missing_endpoints(provider, &mut sel, ENDPOINT_RETRY).await;
             if background {
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
@@ -7921,6 +7925,25 @@ fn misplaced_run_flags(command: &[String]) -> Option<String> {
         hits.join(" "),
         command.join(" "),
         command.join(" ")
+    ))
+}
+
+/// Why `run`'s command can't be taken as typed: its first word is the name of a selected pod
+/// (full, `devtest-apple`, or short, `apple`). `pods run apple 'ls'` — the `-t` forgotten — runs
+/// `apple ls` on every pod; a live test did exactly that once, and only the missing terminal (no
+/// `-y`) stopped it. `names` = each selected pod's (full, short) name. A command that really
+/// starts with such a word can be written `command apple …`. Pure, so table-tested.
+fn pod_name_as_command(command: &[String], names: &[(&str, &str)]) -> Option<String> {
+    let first = command.first()?.split_whitespace().next()?;
+    let (full, _) = names.iter().find(|(full, short)| first == *full || first == *short)?;
+    let rest = command.join(" ");
+    let rest = rest.trim_start().strip_prefix(first).unwrap_or(&rest).trim_start();
+    Some(format!(
+        "`{first}` is a pod's name ({full}) — as typed, `pods run` would run `{}` on all {} selected pod(s), \
+         since the pods are named with -t BEFORE the command. Nothing was run. Did you mean `arena pods run -t \
+         {first} '{rest}'`? (A command that really starts with `{first}`: `arena pods run 'command {first} …'`.)",
+        command.join(" "),
+        names.len()
     ))
 }
 
@@ -16042,7 +16065,7 @@ mod replacement_spec_tests {
 mod selection_tests {
     use super::lifecycle_tests::FakeKeys;
     use super::{
-        handle_keys, handle_pods, keys_preview, keys_targets, keys_with, misplaced_run_flags, select, Cli, Cmd, KeysAction,
+        handle_keys, handle_pods, keys_preview, keys_targets, keys_with, misplaced_run_flags, pod_name_as_command, select, Cli, Cmd, KeysAction,
         KeysCmd, PodCmd, Unscoped,
     };
     use arena_core::remote::FakeRemote;
@@ -16710,6 +16733,36 @@ mod selection_tests {
                 Some(b) => assert!(got.as_deref().is_some_and(|e| e.starts_with(b)), "{cmd:?}: {got:?}"),
             }
         }
+    }
+
+    #[test]
+    fn run_refuses_a_command_that_starts_with_a_pods_name() {
+        let words = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let names = [("devtest-hz4", "hz4"), ("devtest-apple", "apple")];
+        for (cmd, bad) in [
+            // the `-t` forgotten: the pod's name (full or short) taken as the command
+            (&["devtest-hz4", "git status"][..], Some(("devtest-hz4", "devtest-hz4"))),
+            (&["apple", "ls", "-la"], Some(("apple", "devtest-apple"))),
+            (&["apple ls"], Some(("apple", "devtest-apple"))),
+            // ordinary commands, a name inside a command, the `command` escape, other words
+            (&["git", "status"], None),
+            (&["ls apple"], None),
+            (&["command", "apple", "x"], None),
+            (&["apples"], None),
+            (&["devtest-hz"], None),
+        ] {
+            let got = pod_name_as_command(&words(cmd), &names);
+            match bad {
+                None => assert_eq!(got, None, "{cmd:?}"),
+                Some((first, full)) => {
+                    let e = got.unwrap_or_else(|| panic!("{cmd:?}: not refused"));
+                    assert!(e.starts_with(&format!("`{first}` is a pod's name ({full})")), "{cmd:?}: {e}");
+                    assert!(e.contains("Nothing was run") && e.contains(&format!("-t {first} '")), "{cmd:?}: {e}");
+                }
+            }
+        }
+        assert_eq!(pod_name_as_command(&[], &names), None);
+        assert!(pod_name_as_command(&words(&["apple"]), &names).is_some_and(|e| e.contains("on all 2 selected pod(s)")));
     }
 
     #[test]
