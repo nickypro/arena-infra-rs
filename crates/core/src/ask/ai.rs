@@ -502,8 +502,25 @@ pub fn missing(ai: Ai) -> String {
 
 /// A private scratch directory (0700), removed when dropped: the AI's empty working directory
 /// is `empty/` inside it, codex's answer file beside that, and the empty `CODEX_HOME` its
-/// `features list` check runs with (`codex-home/`).
+/// `features list` check runs with (`codex-home/`). Listed in [`SCRATCH`] while it lives.
 struct Scratch(PathBuf);
+
+/// Every [`Scratch`] made and not yet dropped: what [`remove_scratch`] removes.
+static SCRATCH: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+fn scratch_dirs() -> std::sync::MutexGuard<'static, Vec<PathBuf>> {
+    SCRATCH.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Remove the scratch directory of every ask still out — for a process about to `exit` without
+/// dropping its calls (the dashboard on a hangup or a TERM: live ASK4 3c), once their AI children
+/// are stopped (`crate::remote::stop_all_groups`), so nothing runs in them any more. Each
+/// would otherwise be left in the temp dir, as after a SIGKILL.
+pub fn remove_scratch() {
+    for dir in scratch_dirs().drain(..) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
 
 impl Scratch {
     fn new(tmp: &Path) -> std::io::Result<Scratch> {
@@ -518,6 +535,7 @@ impl Scratch {
             b.mode(0o700);
         }
         b.create(&dir)?;
+        scratch_dirs().push(dir.clone());
         let s = Scratch(dir);
         b.create(s.empty())?;
         b.create(s.codex_home())?;
@@ -535,6 +553,7 @@ impl Scratch {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
+        scratch_dirs().retain(|d| d != &self.0);
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }

@@ -49,6 +49,7 @@ pub mod ssh;
 pub mod status;
 pub mod table;
 pub mod teardown;
+pub mod tty;
 pub mod volume;
 pub mod vscode;
 

@@ -386,11 +386,25 @@ async fn main() -> Result<()> {
         last_table: std::cell::Cell::new((Rect::default(), 0)),
     };
 
-    let quit = quit_signals();
+    exit_on_signals();
     let mut terminal = setup_terminal()?;
-    let res = run(&mut terminal, &shared, &provider, &interval, &nudge, &details_wanted, &quit, ui).await;
+    exit_on_hangup();
+    let res = run(&mut terminal, &shared, &provider, &interval, &nudge, &details_wanted, ui).await;
+    // However the loop ended — `q`, Ctrl-C, or the terminal failing under a read or a draw — a
+    // question still being asked (`?`) is stopped first: its whole group, TERM, then KILL after
+    // the grace.
+    arena_core::remote::stop_all_groups().await;
+    if let Err(e) = res {
+        // A terminal that fails a read or a draw is taken as gone: no retry, the terminal put
+        // back as far as it can be, the error said where stderr still goes.
+        arena_core::ask::ai::remove_scratch();
+        restore_best_effort();
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "arena-tui: {e:#}");
+        std::process::exit(1);
+    }
     restore_terminal(&mut terminal)?;
-    res
+    Ok(())
 }
 
 /// When the background refresh runs: every `interval` seconds, or at once on `nudge`;
@@ -702,7 +716,13 @@ fn status_line(s: &FleetSummary, warnings: &[&str]) -> String {
     out
 }
 
+/// Whether the terminal is the dashboard's now — raw mode, the alternate screen, the mouse — so
+/// ending from outside the loop should put it back ([`restore_best_effort`]); not while `c`'s
+/// ssh has it.
+static TERMINAL_OURS: AtomicBool = AtomicBool::new(false);
+
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
+    TERMINAL_OURS.store(true, Ordering::SeqCst);
     enable_raw_mode()?;
     let mut out = stdout();
     // EnableMouseCapture: wheel-scroll the list + click to select/multi-select rows.
@@ -711,10 +731,62 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
 }
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    TERMINAL_OURS.store(false, Ordering::SeqCst);
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+/// How long [`restore_best_effort`] waits for the terminal to take its last writes.
+const RESTORE_WAIT: Duration = Duration::from_millis(300);
+
+/// The terminal put back as [`restore_terminal`] does — raw mode off, the main screen, no mouse
+/// capture, the cursor shown — when the dashboard ends from outside its loop: best effort (on a
+/// hung-up terminal every step fails, and that's fine), on a thread of its own waited for no more
+/// than [`RESTORE_WAIT`] (a terminal that has stopped reading would hold a write for ever).
+/// Nothing when the terminal isn't the dashboard's ([`TERMINAL_OURS`]).
+fn restore_best_effort() {
+    if !TERMINAL_OURS.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    let (done, wait) = std::sync::mpsc::channel();
+    let restoring = std::thread::Builder::new().name("restore".into()).spawn(move || {
+        let _ = disable_raw_mode();
+        let _ = execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture, crossterm::cursor::Show);
+        let _ = done.send(());
+    });
+    if restoring.is_ok() {
+        let _ = wait.recv_timeout(RESTORE_WAIT);
+    }
+}
+
+/// The signals that end the dashboard ([`exit_on_signals`]), by number: the exit status is 128 +
+/// it, as a shell reports a process the signal killed (the same on Linux and macOS).
+const SIGHUP: i32 = 1;
+const SIGTERM: i32 = 15;
+
+/// How often [`exit_on_hangup`] looks at the terminal.
+const HANGUP_POLL: Duration = Duration::from_millis(200);
+
+/// Set by the first [`end_now`]: a second cause (the hangup's SIGHUP and the dead terminal seen,
+/// a TERM after a HUP) waits for that one's exit.
+static ENDING: AtomicBool = AtomicBool::new(false);
+
+/// End the dashboard now, from outside its event loop — which may never come round again: on a
+/// hung-up terminal crossterm's read spins for ever (live ASK4 3c) — so nothing here waits on
+/// it. Every AI child's group still running is stopped as an ask's is (TERM, then KILL after the
+/// grace: `arena_core::remote::stop_all_groups`), its scratch directory removed (`exit` drops
+/// nothing: `arena_core::ask::ai::remove_scratch`), the terminal put back as far as it can be
+/// ([`restore_best_effort`]), then `exit(code)`.
+async fn end_now(code: i32) {
+    if ENDING.swap(true, Ordering::SeqCst) {
+        return std::future::pending().await;
+    }
+    arena_core::remote::stop_all_groups().await;
+    arena_core::ask::ai::remove_scratch();
+    restore_best_effort();
+    std::process::exit(code)
 }
 
 /// Mouse handling: wheel-scroll the pod list (or the result modal), and in the list
@@ -945,25 +1017,41 @@ fn new_pod_mode(ui: &Ui, listed: std::result::Result<Vec<Pod>, String>) -> Mode 
     }
 }
 
-/// A hangup or a TERM, latched: the dashboard quits on either as on Ctrl-C (review ai-review
-/// claude #2) — the terminal restored, and a question still being asked (`?`) dropped, which stops
-/// the AI and everything it started (`arena_core::remote::run_local_input`). Before, either signal
-/// killed the dashboard outright, and the AI, in a session of its own, ran on. Listened for from
-/// this call on.
-fn quit_signals() -> Arc<AtomicBool> {
+/// A hangup or a TERM ends the dashboard at once ([`end_now`], exit status 129 or 143), from a
+/// task of its own: a question still being asked (`?`) stopped with everything it started
+/// (review ai-review claude #2: the AI, in a session of its own, ran on when either signal killed
+/// the dashboard outright), the terminal put back. Never through the event loop (lane ASK7 H
+/// latched a flag there): after a hangup crossterm's read never returns, so the flag was never
+/// seen — the dashboard spun a core for ever, SIGTERM no longer stopping it, and its `?` ran on
+/// (live ASK4 3c). Listened for from this call on.
+fn exit_on_signals() {
     use tokio::signal::unix::{signal, SignalKind};
-    let quit = Arc::new(AtomicBool::new(false));
-    for kind in [SignalKind::hangup(), SignalKind::terminate()] {
+    for (kind, signo) in [(SignalKind::hangup(), SIGHUP), (SignalKind::terminate(), SIGTERM)] {
         if let Ok(mut listener) = signal(kind) {
-            let quit = quit.clone();
             tokio::spawn(async move {
                 if listener.recv().await.is_some() {
-                    quit.store(true, Ordering::SeqCst);
+                    end_now(128 + signo).await;
                 }
             });
         }
     }
-    quit
+}
+
+/// A terminal that has hung up (`arena_core::tty::hung_up`: stdout's, and stdin's when it is one)
+/// ends the dashboard as a hangup does ([`end_now`], 129), looked at every [`HANGUP_POLL`] from a
+/// task of its own: without the SIGHUP — ignored, or never sent to this process — the event loop
+/// would spin on the dead terminal for ever.
+fn exit_on_hangup() {
+    use std::io::IsTerminal;
+    let fds: Vec<i32> = [(0, std::io::stdin().is_terminal()), (1, std::io::stdout().is_terminal())].into_iter().filter(|(_, tty)| *tty).map(|(fd, _)| fd).collect();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(HANGUP_POLL).await;
+            if fds.iter().any(|&fd| arena_core::tty::hung_up(fd)) {
+                end_now(128 + SIGHUP).await;
+            }
+        }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -974,14 +1062,9 @@ async fn run(
     interval: &AtomicU64,
     nudge: &Notify,
     details_wanted: &AtomicBool,
-    quit: &AtomicBool,
     mut ui: Ui,
 ) -> Result<()> {
     loop {
-        // A hangup or a TERM ([`quit_signals`]): as Ctrl-C.
-        if quit.load(Ordering::SeqCst) {
-            break;
-        }
         // A finished background action surfaces as a Result modal (then nudge a refresh).
         {
             let msg = shared.lock().unwrap().action_result.take();
@@ -5571,23 +5654,98 @@ deep_check_end=1
         assert!(matches!(new_pod_mode(&ui, Err("vast 429".into())), Mode::Result(r) if r == "✗ list failed: vast 429"));
     }
 
-    /// Review ai-review claude #2 (lane ASK7 item H): a hangup or a TERM latches `quit_signals`,
-    /// which the loop takes as Ctrl-C at its next round — the terminal restored, a question still
-    /// out dropped and with it the AI's whole group — where either signal used to kill the
-    /// dashboard outright, the AI running on in its own session. The signal is sent to this test
-    /// process, its listeners registered before.
-    #[tokio::test]
-    async fn a_hangup_or_a_term_quits_like_ctrl_c() {
-        for sig in ["-HUP", "-TERM"] {
-            let quit = quit_signals();
-            assert!(!quit.load(Ordering::SeqCst), "{sig}");
-            let sent = std::process::Command::new("kill").args([sig, &std::process::id().to_string()]).status().unwrap();
-            assert!(sent.success(), "{sig}");
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while !quit.load(Ordering::SeqCst) && Instant::now() < deadline {
-                tokio::time::sleep(Duration::from_millis(20)).await;
+    /// Live ASK4 3c (lane ASK8 item 4): a hangup or a TERM ends the dashboard from a task of its
+    /// own — never by way of its event loop, which a hung-up terminal never lets come round again
+    /// (crossterm's read spins) — stopping a question still being asked with everything it
+    /// started, and exiting 128 + the signal. A copy of this test binary plays the dashboard: its
+    /// loop's thread stuck as that read leaves it, a question out (`arena_core::ask::ai::ask`, as
+    /// `?` asks it, to a stub claude that — and what it starts — ignores TERM: KILLed after the
+    /// grace), [`exit_on_signals`] listening. Each signal ends it within the grace and a little,
+    /// with its status, and nothing of the AI is left: no process, no scratch directory. (Lane
+    /// ASK7's latch, never looked at by a stuck loop, ended nothing.)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_hangup_or_a_term_ends_the_dashboard_and_its_ask_at_once() {
+        use arena_core::ask::ai::fixtures::{claude_help, on_path, stub};
+        const ROLE: &str = "ARENA_TEST_TUI_EXIT_DIR";
+        if let Some(dir) = std::env::var_os(ROLE) {
+            // The dashboard's part, in the copy.
+            let dir = PathBuf::from(dir);
+            let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+            rt.block_on(async {
+                exit_on_signals();
+                tokio::spawn(async move {
+                    let env = arena_core::ask::AiEnv { path: Some(on_path(&dir.join("bin"))), home: None, tmp: dir.clone(), vars: Vec::new() };
+                    let _ = arena_core::ask::ai::ask(arena_core::ask::Ai::Claude, "is it ok?", None, Duration::from_secs(120), &env).await;
+                });
+                // The loop, on a dead terminal: its thread never comes back.
+                std::thread::sleep(Duration::from_secs(60));
+            });
+            std::process::exit(3);
+        }
+        let alive = |pid: &str| std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| s.rsplit(')').next().and_then(|r| r.split_whitespace().next()).is_some_and(|st| st != "Z" && st != "X"));
+        for (sig, code) in [("-HUP", 129), ("-TERM", 143)] {
+            let dir = std::env::temp_dir().join(format!("arena-tui-exit-{}-{code}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let (ai, left, bin) = (dir.join("ai.pid"), dir.join("left.pid"), dir.join("bin"));
+            std::fs::create_dir_all(&bin).unwrap();
+            stub(
+                &bin,
+                "claude",
+                &format!(
+                    "if [ \"$1\" = --help ]; then cat <<'EOF'\n{}EOF\nexit 0; fi\n\
+                     trap '' TERM\nsleep 60 &\necho $! > '{}'\necho $$ > '{2}.tmp'\nmv '{2}.tmp' '{2}'\nwait",
+                    claude_help(&[]),
+                    left.display(),
+                    ai.display()
+                ),
+            );
+            let mut tui = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tests::a_hangup_or_a_term_ends_the_dashboard_and_its_ask_at_once", "--test-threads=1"])
+                .env(ROLE, &dir)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !ai.exists() {
+                assert!(Instant::now() < deadline, "{sig}: the AI never started");
+                std::thread::sleep(Duration::from_millis(20));
             }
-            assert!(quit.load(Ordering::SeqCst), "{sig}: not latched");
+            let pids: Vec<String> = [&ai, &left].iter().map(|p| std::fs::read_to_string(p).unwrap().trim().to_string()).collect();
+            assert!(pids.iter().all(|p| alive(p)), "{sig}: {pids:?}");
+            let scratch = || std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).filter(|n| n.to_string_lossy().starts_with("arena-ask-")).collect::<Vec<_>>();
+            assert_eq!(scratch().len(), 1, "{sig}: the ask's scratch directory");
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(std::process::Command::new("kill").args([sig, &tui.id().to_string()]).status().unwrap().success());
+            let sent = Instant::now();
+            let status = loop {
+                if let Some(status) = tui.try_wait().unwrap() {
+                    break status;
+                }
+                if sent.elapsed() > arena_core::remote::TERM_GRACE + Duration::from_secs(4) {
+                    let _ = tui.kill();
+                    let _ = tui.wait();
+                    for p in &pids {
+                        let _ = std::process::Command::new("kill").args(["-9", p]).status();
+                    }
+                    panic!("{sig}: the dashboard is still running {:?} after it", sent.elapsed());
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            assert_eq!(status.code(), Some(code), "{sig}");
+            // KILLed before the exit: gone as soon as the kernel has them exit.
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while pids.iter().any(|p| alive(p)) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            for pid in &pids {
+                assert!(!alive(pid), "{sig}: the AI's {pid} outlived the dashboard");
+            }
+            let left_behind = scratch();
+            assert!(left_behind.is_empty(), "{sig}: the ask's scratch directory was left: {left_behind:?}");
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }
