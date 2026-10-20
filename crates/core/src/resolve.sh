@@ -19,14 +19,17 @@
 #     takes that side of each conflict; for a binary file, a symlink or a modify/delete, the whole
 #     side, removed when that side deleted it.
 # A file over <max file bytes> (the backup's git limit) anywhere in that is never committed: left
-# alone, said. The state before is kept first in <git dir>/arena-resolved/<UTC stamp>/ (the
-# conflicted files as they were, git's own state files, the old HEAD, the index, a README), then
-# the state is read again — the operation and its commit, HEAD, the conflicts, the index, every
-# file — and the pod looked at again for anyone at work (every condition of the first look: a
-# terminal used, a git command running, …), and if any of it changed, nothing is touched. Then the
-# paths are staged, each staged
-# file's keys redacted in the index as the backup redacts them (the file on disk keeps its keys),
-# and — HEAD and the operation checked once more, and no conflict marker staged — the operation is
+# alone, said — nor, for a merge or a cherry-pick (whose commit takes the whole index), any path
+# already staged: a blob over that limit, or a new gitlink. The state before is kept first in
+# <git dir>/arena-resolved/<UTC stamp>/ (the conflicted files as they were, git's own state files,
+# the old HEAD, the index, a README), then the state is read again — the operation and its commit,
+# HEAD, the conflicts, the index, every file — and the pod looked at again for anyone at work
+# (every condition of the first look: a terminal used, a git command running, …), and if any of it
+# changed, nothing is touched. Then the paths are staged; for a merge or a cherry-pick every staged
+# path is checked again, and each staged regular file that is neither HEAD's version nor the other
+# side's (what the participant made) has its keys redacted in the index as the backup redacts them
+# (the file on disk keeps its keys); and — HEAD and the operation checked once more, and no
+# conflict marker staged — the operation is
 # finished: a merge, a merge commit; a cherry-pick, `--continue`; a `git stash pop`'s conflicts,
 # added (the stash entry kept) — in the repo's own identity. A revert is never finished: its other
 # side is the commit it undoes, always older, so "the newer side" would undo nothing. <hours> and
@@ -161,6 +164,38 @@ staged_markers() {
 }
 p=$(staged_markers)
 [ -z "$p" ] || refuse "conflict markers were added in $p (staged with them still in it): resolve it, or abort, on the pod"
+
+# The commit takes the whole index, not only the paths in conflict: a file the participant
+# resolved, or added, and `git add`ed before this ran goes in too (review ai-review codex #4,
+# claude #4). So every path staged against HEAD is checked as the backup checks what it commits —
+# `unfit` says the first that can't go in, in words: a blob over <max file bytes> (GitHub refuses
+# the push, and every later backup is stuck), or a gitlink new to HEAD (a nested repo's commit id,
+# none of its files: the backup takes those back out of the index). Nothing: all fit. It leaves
+# the staged changes in $T.st, one per line: `<HEAD's mode> <mode> <blob> <status><TAB><path>`.
+unfit() {
+    git diff-index --cached --no-renames -z HEAD -- > "$T.sz" || { echo "the staged changes couldn't be listed"; return; }
+    if [ "$(tr -d -c '\n' < "$T.sz" | wc -c)" -ne 0 ]; then echo "a staged path has a newline in its name"; return; fi
+    tr '\0' '\n' < "$T.sz" | awk 'NR % 2 == 1 { split(substr($0, 2), m, " "); next } { print m[1] " " m[2] " " m[4] " " m[5] "\t" $0 }' > "$T.st"
+    _g=$(awk '{ i = index($0, "\t"); split(substr($0, 1, i - 1), m, " ") } m[2] == "160000" && m[1] != "160000" { print substr($0, i + 1); exit }' "$T.st")
+    if [ -n "$_g" ]; then
+        echo "$_g is staged as a nested repo (a gitlink: its commit id, none of its files): never committed — unstage it, or abort, on the pod"
+        return
+    fi
+    awk '{ split($0, m, " ") } m[2] == "100644" || m[2] == "100755" || m[2] == "120000" { print m[3] }' "$T.st" | sort -u \
+        | git cat-file --batch-check='%(objectname) %(objectsize)' > "$T.ss" || { echo "the staged files' sizes couldn't be read"; return; }
+    awk -v max="$MAX" 'NR == FNR { s[$1] = $2; next } { i = index($0, "\t"); split(substr($0, 1, i - 1), m, " ") }
+        (m[3] in s) && s[m[3]] + 0 > max + 0 {
+            printf "%s is staged at %s bytes, over git'"'"'s %s-byte limit: never committed — unstage it, or abort, on the pod\n", substr($0, i + 1), s[m[3]], max
+            exit
+        }' "$T.ss" "$T.st"
+}
+# A stash pop's conflicts make no commit here: the backup after commits them, as it commits anything.
+case $what in
+    merge | cherry-pick)
+        why=$(unfit)
+        [ -z "$why" ] || refuse "$why"
+        ;;
+esac
 
 # --- Each conflicted path's way (nothing touched yet) ---------------------------------------
 TAB=$(printf '\t')
@@ -409,20 +444,38 @@ while IFS="$TAB" read -r act side ot tt i wm p; do
 done < "$T.plan"
 [ -z "$(git ls-files -u | head -n 1)" ] || fail "conflicts were left"
 
-# --- Keys, as the backup commits them --------------------------------------------------------
-# Every file staged above goes into the commit with the keys redact.sh knows redacted — in the
-# index only: the file on disk keeps them, so the participant's code still runs. A key the
-# participant pasted into a file they resolved by hand never enters a commit (the backup after
-# this would redact what it commits, but this commit is made first).
-cut -f7- "$T.plan" | while IFS= read -r p; do git ls-files -s -- ":(literal)$p"; done \
-    | awk '$1 == "100644" || $1 == "100755" { print $2 }' | sort -u > "$T.sb"
-(
-    set -e
-    while read -r b; do redact_blob "$b"; done < "$T.sb" > "$T.map"
-    redact_index "$T.map" > "$T.upd"
-) || fail "redacting keys in the resolved files"
-tr '\0' '\n' < "$T.upd" \
-    | awk 'NR == FNR { n[$2] = $3; next } { i = index($0, "\t"); split(substr($0, 1, i - 1), m, " "); print "REDACTED " n[m[2]] " " substr($0, i + 1) }' "$T.map" -
+# --- What the commit takes: every staged path, keys redacted ---------------------------------
+# Every path staged against HEAD fits (`unfit`, as before anything was touched — now with what was
+# staged above). Then each regular file the commit takes whose staged version is neither HEAD's
+# nor the operation's other side's (MERGE_HEAD's, CHERRY_PICK_HEAD's) — content the participant
+# made: a file resolved by hand, now or `git add`ed before this ran, one merged per hunk, one
+# added mid-merge — goes in with the keys redact.sh knows redacted, in the index only: the file on
+# disk keeps them, so the participant's code still runs. A key in it never enters a commit (the
+# backup after this would redact what it commits, but this commit is made first). The course's or
+# the picked commit's own content — a file only that side changed, one taken whole from it — goes
+# in as it was published, and HEAD's is committed already. A stash pop's conflicts make no commit
+# here: the backup after commits them, redacted.
+case $what in
+    merge | cherry-pick)
+        why=$(unfit)
+        [ -z "$why" ] || fail "$why"
+        git diff-index --cached --no-renames --name-only -z "$head" -- > "$T.soz" || fail "listing the staged changes"
+        tr '\0' '\n' < "$T.soz" > "$T.so"
+        # Each such file: `<mode> <blob><TAB><path>`.
+        awk 'NR == FNR { o[$0] = 1; next } { i = index($0, "\t"); p = substr($0, i + 1); split(substr($0, 1, i - 1), m, " ") }
+            (m[2] == "100644" || m[2] == "100755") && (p in o) { print m[2] " " m[3] "\t" p }' "$T.so" "$T.st" > "$T.rc"
+        (
+            set -e
+            cut -f1 "$T.rc" | cut -d' ' -f2 | sort -u > "$T.rcb"
+            while read -r b; do redact_blob "$b"; done < "$T.rcb" > "$T.map"
+            # Those paths alone (the same blob elsewhere, the course's, stays as it is).
+            awk 'NR == FNR { r[$1] = $2; next } { i = index($0, "\t"); split(substr($0, 1, i - 1), m, " ") }
+                m[2] in r { print m[1] " " r[m[2]] " 0\t" substr($0, i + 1) }' "$T.map" "$T.rc" > "$T.upd"
+            tr '\n' '\0' < "$T.upd" | git update-index -z --index-info
+        ) || fail "redacting keys in the staged files"
+        awk 'NR == FNR { n[$2] = $3; next } { i = index($0, "\t"); split(substr($0, 1, i - 1), m, " "); print "REDACTED " n[m[2]] " " substr($0, i + 1) }' "$T.map" "$T.upd"
+        ;;
+esac
 p=$(staged_markers)
 [ -z "$p" ] || fail "conflict markers were added in $p"
 

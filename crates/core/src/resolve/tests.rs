@@ -1466,6 +1466,126 @@ fn keys_are_redacted_and_a_file_over_the_limit_is_left_alone() {
     r.untouched(&conflicts, "limit");
 }
 
+/// The commit takes the whole index, not only the paths in conflict (review ai-review codex #4,
+/// claude #4): every path staged against HEAD is checked. A key in a file the participant resolved
+/// and `git add`ed before the resolve ran — while another file is still in conflict, or with
+/// every conflict already staged (an empty plan) — is committed redacted, the disk keeping it; so
+/// is one in a file added mid-cherry-pick. A 96 MB file or a nested repo (a gitlink) staged by hand
+/// is never committed: BUSY, said, nothing touched. And what only the course changed goes in as
+/// the course published it, a key-like string in it and all.
+#[cfg(unix)]
+#[test]
+fn every_path_the_commit_takes_is_checked_not_only_the_conflicted_ones() {
+    let key = format!("sk-or-v1-{}", "ab".repeat(32));
+    let with_key = format!("KEY = \"{key}\"\nx = 3\n");
+    let redacted = "KEY = \"REDACTED-OPENROUTER-KEY\"\nx = 3";
+    // Committed redacted, the disk keeping the key, no key anywhere in the commit's tree.
+    let redacted_in_head = |r: &Repo, rel: &str, case: &str| {
+        assert_eq!(r.committed(rel), redacted, "{case}: the commit has it redacted");
+        assert_eq!(r.text(rel), with_key, "{case}: the disk keeps the key");
+        assert!(!r.git_try(&r.work, &["grep", "-q", "-F", &key, "HEAD"]).0, "{case}: no key in the commit's tree");
+    };
+
+    // Partly staged: notes.py resolved by hand, a key in it, and added; README.md and the rest still
+    // in conflict — the plan has only those.
+    let r = Repo::new("staged-part");
+    r.merge_conflict(r.now - 5 * DAY, r.now - 10 * DAY);
+    r.put("notes.py", with_key.as_bytes());
+    r.git(&r.work, &["add", "notes.py"]);
+    r.age(4 * HOUR);
+    let (code, rep, said) = r.resolve(3, &r.look());
+    assert_eq!((code, rep.resolved.as_deref()), (Some(0), Some("merge")), "{said}");
+    assert!(rep.hand.is_empty() && !rep.newer.iter().any(|c| c.path == "notes.py"), "not in the plan: {said}");
+    assert_eq!(rep.redacted, ["notes.py"], "{said}");
+    redacted_in_head(&r, "notes.py", "part");
+
+    // Fully staged: every conflict resolved and added, nothing left in the plan — still checked.
+    let r = Repo::new("staged-all");
+    r.merge_conflict(r.now - 5 * DAY, r.now - 10 * DAY);
+    let merged = r.git(&r.work, &["rev-parse", "MERGE_HEAD"]);
+    r.put("README.md", b"resolved\n");
+    r.put("sub dir/we*ird.py", b"w = 3\n");
+    r.put("notes.py", with_key.as_bytes());
+    r.git(&r.work, &["add", "-A"]);
+    assert!(r.unmerged().is_empty());
+    r.age(4 * HOUR);
+    let (code, rep, said) = r.resolve(3, &r.look());
+    assert_eq!((code, rep.resolved.as_deref()), (Some(0), Some("merge")), "{said}");
+    assert!(rep.newer.is_empty() && rep.hand.is_empty(), "an empty plan: {said}");
+    assert_eq!(rep.redacted, ["notes.py"], "{said}");
+    redacted_in_head(&r, "notes.py", "all");
+    assert_eq!(r.committed("README.md"), "resolved");
+    assert!(r.git(&r.work, &["rev-list", "--parents", "-n1", "HEAD"]).ends_with(&merged), "a merge commit");
+
+    // A file added mid-cherry-pick, a key in it: the pick's commit has it redacted.
+    let r = Repo::new("staged-pick");
+    r.git(&r.work, &["checkout", "-q", "-b", "side", "main"]);
+    r.put("README.md", b"side\n");
+    r.commit_all(&r.work, "the side's change", r.now - 5 * DAY);
+    r.git(&r.work, &["checkout", "-q", "autocommit-x"]);
+    r.put("README.md", b"mine\n");
+    r.commit_all(&r.work, "mine", r.now - 10 * DAY);
+    assert!(!r.git_try(&r.work, &["cherry-pick", "side"]).0);
+    r.put("mine.py", with_key.as_bytes());
+    r.git(&r.work, &["add", "mine.py"]);
+    r.age(4 * HOUR);
+    let (code, rep, said) = r.resolve(3, &r.look());
+    assert_eq!((code, rep.resolved.as_deref()), (Some(0), Some("cherry-pick")), "{said}");
+    assert_eq!(rep.redacted, ["mine.py"], "{said}");
+    redacted_in_head(&r, "mine.py", "pick");
+
+    // A 96 MB file, or a nested repo (a gitlink), staged by hand mid-merge: never committed.
+    for (case, stage, why) in [
+        (
+            "staged-big",
+            Box::new(|r: &Repo| {
+                r.put("model.pt", &vec![0u8; 96 << 20]);
+                r.git(&r.work, &["add", "model.pt"]);
+            }) as Box<dyn Fn(&Repo)>,
+            format!(
+                "model.pt is staged at {} bytes, over git's {GIT_MAX_FILE_BYTES_FOR_TESTS}-byte limit: never committed — unstage it, or \
+                 abort, on the pod",
+                96 << 20
+            ),
+        ),
+        (
+            "staged-gitlink",
+            Box::new(|r: &Repo| {
+                let nested = r.work.join("nested");
+                r.git(&r.work, &["init", "-q", "nested"]);
+                std::fs::write(nested.join("n.py"), "n = 1\n").unwrap();
+                r.git(&nested, &["add", "n.py"]);
+                r.git(&nested, &["-c", "user.name=n", "-c", "user.email=n@n", "commit", "-q", "-m", "n"]);
+                r.git(&r.work, &["add", "nested"]);
+            }),
+            "nested is staged as a nested repo (a gitlink: its commit id, none of its files): never committed — unstage it, or abort, \
+             on the pod"
+                .to_string(),
+        ),
+    ] {
+        let r = Repo::new(case);
+        r.merge_conflict(r.now - 5 * DAY, r.now - 10 * DAY);
+        stage(&r);
+        r.age(4 * HOUR);
+        let conflicts = r.unmerged();
+        let (code, rep, said) = r.resolve(3, &r.look());
+        assert_eq!((code, rep.refused.as_deref()), (Some(RESOLVE_REFUSED_EXIT), Some(why.as_str())), "{case}: {said}");
+        r.untouched(&conflicts, case);
+    }
+
+    // The course's own file, a key-like string in it (only the course changed it): committed as the
+    // course has it — the participant made none of it.
+    let r = Repo::new("staged-theirs");
+    let example = format!("# Set your key: OPENROUTER_API_KEY = \"{key}\"\n");
+    r.course_commit(&[("example.md", example.as_bytes())], r.now - 6 * DAY);
+    r.merge_conflict(r.now - 5 * DAY, r.now - 10 * DAY);
+    r.age(4 * HOUR);
+    let (code, rep, said) = r.resolve(3, &r.look());
+    assert_eq!((code, rep.resolved.as_deref()), (Some(0), Some("merge")), "{said}");
+    assert!(rep.redacted.is_empty(), "{said}");
+    assert_eq!(format!("{}\n", r.committed("example.md")), example, "as the course published it");
+}
+
 /// The path's `conflict-marker-size` (review ai-review codex #9): with 10, git's markers are ten
 /// characters long, and the file still has them — not resolved by hand: taken per hunk from the
 /// newer side, no marker committed.
