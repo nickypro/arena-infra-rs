@@ -1283,6 +1283,13 @@ like base64 key material (40+ of `[A-Za-z0-9+/=]`, nothing else) are dropped. Ea
 most 6 KB (less when many pods share a prompt: 240 KB in all), trimmed from the log's oldest lines
 first.
 
+**Framing a pod can't forge.** Each pod's reply is framed by marker lines carrying a random nonce of
+that call's own, and so is every line of the small probe's: pod text that runs over lines (a path,
+a git config value) can't make one of them. A reply with one of the call's markers twice or out of
+order reads `unknown: the probe's reply was malformed`, and a fact the probe gives twice is
+`unknown`. In the prompt, the pod data sits between delimiters with a tag random per prompt, and no
+pod string can spell one (a run of `=` is cut to three).
+
 #### Where it goes
 
 claude sends the prompt to **Anthropic**, codex to **OpenAI**, through your own `claude`/`codex`

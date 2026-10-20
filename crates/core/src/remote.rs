@@ -387,14 +387,32 @@ mod fake {
     use crate::error::{Error, Result};
     use crate::ssh::{SshOutput, SshTarget};
 
-    /// One scripted answer: what the call returns, after how long.
-    #[derive(Debug, Clone)]
+    /// What makes a [`FakeReply::from_cmd`] answer from the exec's command.
+    type MakeReply = std::sync::Arc<dyn Fn(&str) -> FakeReply + Send + Sync>;
+
+    /// One scripted answer: what the call returns, after how long — or the answer made from the
+    /// command when the call comes ([`FakeReply::from_cmd`]).
+    #[derive(Clone)]
     pub struct FakeReply {
         delay: Duration,
         result: std::result::Result<SshOutput, String>,
+        make: Option<MakeReply>,
+    }
+
+    impl std::fmt::Debug for FakeReply {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("FakeReply").field("delay", &self.delay).field("result", &self.result).field("from_cmd", &self.make.is_some()).finish()
+        }
     }
 
     impl FakeReply {
+        /// The answer `make` gives for the exec's command, made when the call comes: for a command
+        /// that carries a per-call value its reply must hold (`pods ask`'s nonce). A copy gets
+        /// success.
+        pub fn from_cmd(make: impl Fn(&str) -> FakeReply + Send + Sync + 'static) -> Self {
+            Self { make: Some(std::sync::Arc::new(make)), ..Self::ok() }
+        }
+
         /// Exit 0, no output.
         pub fn ok() -> Self {
             Self::exit(0, "")
@@ -425,12 +443,13 @@ mod fake {
                     stdout: String::new(),
                     stderr: stderr.to_string(),
                 }),
+                make: None,
             }
         }
 
         /// The call itself fails (`Err(Error::provider(msg))`), like a spawn error.
         pub fn error(msg: &str) -> Self {
-            Self { delay: Duration::ZERO, result: Err(msg.to_string()) }
+            Self { delay: Duration::ZERO, result: Err(msg.to_string()), make: None }
         }
 
         /// Never answers within any sane timeout (a wedged pod).
@@ -503,7 +522,8 @@ mod fake {
         }
 
         /// Record the call (at its *start*, so a hung call is visible) and pop its reply —
-        /// else a standing rule's ([`FakeRemote::on`]), else success.
+        /// else a standing rule's ([`FakeRemote::on`]), else success — made from the command
+        /// when it is a [`FakeReply::from_cmd`].
         fn begin(&self, call: RemoteCall) -> FakeReply {
             let host = call.host().to_string();
             let cmd = match &call {
@@ -511,13 +531,18 @@ mod fake {
                 RemoteCall::Copy { .. } => None,
             };
             self.calls.lock().unwrap().push(call);
-            if let Some(reply) = self.script.lock().unwrap().get_mut(&host).and_then(VecDeque::pop_front) {
-                return reply;
+            let queued = self.script.lock().unwrap().get_mut(&host).and_then(VecDeque::pop_front);
+            let reply = queued
+                .or_else(|| {
+                    let cmd = cmd.as_deref()?;
+                    self.rules.lock().unwrap().iter().find(|(h, needle, _)| *h == host && cmd.contains(needle.as_str())).map(|(_, _, r)| r.clone())
+                })
+                .unwrap_or_else(FakeReply::ok);
+            match (&reply.make, cmd) {
+                (Some(make), Some(cmd)) => make(&cmd),
+                (Some(_), None) => FakeReply::ok(),
+                (None, _) => reply,
             }
-            cmd.and_then(|cmd| {
-                self.rules.lock().unwrap().iter().find(|(h, needle, _)| *h == host && cmd.contains(needle.as_str())).map(|(_, _, r)| r.clone())
-            })
-            .unwrap_or_else(FakeReply::ok)
         }
 
         async fn answer(what: &str, reply: FakeReply, timeout: Option<Duration>) -> Result<SshOutput> {

@@ -145,8 +145,8 @@ pub(crate) async fn handle_ask(
 mod tests {
     use super::*;
     use arena_core::ask::ai::fixtures::recording_stubs;
-    use arena_core::ask::bundle::fixtures::busy_reply;
-    use arena_core::remote::{FakeRemote, FakeReply};
+    use arena_core::ask::bundle::fixtures::busy;
+    use arena_core::remote::FakeRemote;
     use arena_core::Pod;
 
     fn pod(name: &str, port: Option<u16>) -> Pod {
@@ -186,7 +186,7 @@ mod tests {
 
     fn fake_alpha() -> Arc<dyn Remote> {
         let fake = FakeRemote::new();
-        fake.script("10.0.0.1:22001", [FakeReply::stdout(&busy_reply("", "", "pytest"))]);
+        fake.script("10.0.0.1:22001", [busy("", "", "pytest")]);
         Arc::new(fake)
     }
 

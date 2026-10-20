@@ -308,8 +308,10 @@ fn remote_command(opts: &ProbeOpts) -> String {
         s.push_str(&format!(
             "echo \"branch=$(cd {q} 2>/dev/null && ro_git rev-parse --abbrev-ref HEAD 2>/dev/null)\"; "
         ));
+        // Its first line only: git reads `\n` in a quoted config value as a newline, and a value
+        // run over lines could plant `key=value` lines of its own (review ai-review claude #2).
         s.push_str(&format!(
-            "echo \"origin=$(cd {q} 2>/dev/null && ro_git config --get remote.origin.url 2>/dev/null)\"; "
+            "echo \"origin=$(cd {q} 2>/dev/null && ro_git config --get remote.origin.url 2>/dev/null | head -n 1)\"; "
         ));
         // Last commit time (= last backup, since `pods backup` commits + pushes) and how
         // many entries are uncommitted (work since that backup; 0 = clean tree — a file only

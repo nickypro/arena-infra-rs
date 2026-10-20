@@ -1,6 +1,6 @@
 # arena ask probe (`arena pods ask`): READ-ONLY — it writes nothing anywhere.
 #
-#   env -i PATH=… HOME="$HOME" sh -c "$THIS" arena-ask-probe <repo>
+#   env -i PATH=… HOME="$HOME" sh -c "$THIS" arena-ask-probe <repo> <nonce>
 #
 # The facts an operator's question needs that the dashboard's metrics probe and the jobs reads
 # (sent in the same call, before this) don't give: the pod's clock and uptime, load, disks,
@@ -11,17 +11,21 @@
 # refreshed, written or locked from under a participant's git), and nothing the repository
 # configures is run — no fsmonitor hook, no clean/process filter, no gpg.program. No `git status`.
 #
-# Output, on stdout: `ARENA_ASK <key>=<value>` lines, and repeated `ARENA_ASK_<KIND> <fields>`
-# lines (PS, WHO, TMUX, FILE). Never a file's contents, shell history or the environment:
-# process arguments, login names and ttys (not where they come from), tmux session names, and
-# file *names* only.
+# Output, on stdout: `ARENA_ASK.<nonce> <key>=<value>` lines, and repeated
+# `ARENA_ASK_<KIND>.<nonce> <fields>` lines (PS, WHO, TMUX, FILE). The nonce is the call's own
+# (hex, else nothing is printed): a value that runs over a line — a path with a newline in it —
+# can't make a line of ours without it. Never a file's contents, shell history or the
+# environment: process arguments, login names and ttys (not where they come from), tmux session
+# names, and file *names* only.
 LC_ALL=C
 export LC_ALL
 GIT_OPTIONAL_LOCKS=0
 export GIT_OPTIONAL_LOCKS
 REPO=${1:-}
+N=${2:-}
+case "$N" in '' | *[!0-9a-f]*) exit 3 ;; esac
 o() {
-    printf 'ARENA_ASK %s=%s\n' "$1" "$2"
+    printf 'ARENA_ASK.%s %s=%s\n' "$N" "$1" "$2"
 }
 num() {
     case "$1" in '' | *[!0-9]*) return 1 ;; *) return 0 ;; esac
@@ -63,7 +67,7 @@ if command -v who >/dev/null 2>&1; then
     if w=$(t 5 who 2>/dev/null); then
         o who ok
         printf '%s\n' "$w" |
-            awk 'NF >= 2 { s = "ARENA_ASK_WHO " $1; for (i = 2; i <= NF && i <= 6 && substr($i, 1, 1) != "("; i++) s = s " " $i; print s }' |
+            awk -v t="ARENA_ASK_WHO.$N" 'NF >= 2 { s = t " " $1; for (i = 2; i <= NF && i <= 6 && substr($i, 1, 1) != "("; i++) s = s " " $i; print s }' |
             head -n 20
     else
         o who err
@@ -76,7 +80,7 @@ fi
 if command -v tmux >/dev/null 2>&1; then
     if out=$(t 5 tmux -u list-sessions -F '#{session_windows}:#{session_attached}:#{session_activity}:#{session_name}' 2>&1); then
         o tmux ok
-        printf '%s\n' "$out" | grep . | head -n 20 | sed -e 's/^/ARENA_ASK_TMUX /'
+        printf '%s\n' "$out" | grep . | head -n 20 | sed -e "s/^/ARENA_ASK_TMUX.$N /"
     else
         case "$out" in
             *"no server running"* | *"error connecting to"* | *"No such file or directory"*) o tmux ok ;;
@@ -90,7 +94,7 @@ fi
 # --- Processes: the busiest by CPU (lifetime average, as ps reports it), then by memory -----------
 pss() {
     t 10 ps -eo pid=,user=,pcpu=,pmem=,etimes=,args= --sort="$1" 2>/dev/null |
-        grep -v -e arena-ask-probe -e ' ps -eo pid=' | head -n "$2" | cut -c 1-1000 | sed -e 's/^ */ARENA_ASK_PS /'
+        grep -v -e arena-ask-probe -e ' ps -eo pid=' | head -n "$2" | cut -c 1-1000 | sed -e "s/^ */ARENA_ASK_PS.$N /"
 }
 if t 10 ps -eo pid=,etimes= --sort=-pcpu >/dev/null 2>&1; then
     o ps ok
@@ -131,7 +135,7 @@ else
             o status ok
             o modified "$(printf '%s\n' "$s" | grep . | grep -c -v '^??')"
             o untracked "$(printf '%s\n' "$s" | grep -c '^??')"
-            printf '%s\n' "$s" | grep . | head -n 20 | sed -e 's/^/ARENA_ASK_FILE /'
+            printf '%s\n' "$s" | grep . | head -n 20 | sed -e "s/^/ARENA_ASK_FILE.$N /"
         else
             o status err
         fi
