@@ -467,6 +467,68 @@ async fn a_pod_that_failed_before_its_push_stays_a_failure_when_another_is_finis
     }
 }
 
+/// A pod whose operation is older than `BUSY_AUTO_RESOLVE_HOURS` but which isn't finished says why,
+/// with how long ago (Live 5: one sat unfinished and nothing said — its index had been written by
+/// a `git status` minutes before): its index written 12 minutes ago, a terminal used 5 minutes
+/// ago, notes.py changed 40 minutes ago, a git command running, this run's copy failing, no copy
+/// recorded after its last change (the copy left no `.git`). One line each, besides its BUSY line;
+/// no resolve. An operation younger than the threshold isn't a candidate yet: no line — nor with
+/// the setting off.
+#[tokio::test]
+async fn a_pod_left_past_the_threshold_but_held_back_says_why() {
+    let n = now();
+    let quiet = look_text(n, 4 * HOUR, "11-22");
+    let waits = " — it waits for 3h of quiet";
+    let line = |why: &str| Some(format!("⊘ devtest-bloom: not finished automatically — {why}"));
+    let index = quiet.replace(&format!("INDEX {}\n", n - 24 * HOUR), &format!("INDEX {}\n", n - 12 * 60));
+    let young = quiet.replace(&format!("OP merge {} ", n - 24 * HOUR), &format!("OP merge {} ", n - 600));
+    assert!(index != quiet && young != quiet);
+    // (case, bloom's look, its copy: "" whole, "fail" failing, "no-git" leaving no `.git`; extra
+    // config; its line)
+    let cases: Vec<(&str, String, &str, &str, Option<String>)> = vec![
+        (
+            "index",
+            index,
+            "",
+            "",
+            line(&format!("git's index was written 12 min ago (something staged, or a git command such as `git status` refreshing it){waits}")),
+        ),
+        ("tty", format!("{quiet}TTY {}\n", n - 5 * 60), "", "", line(&format!("a terminal was used 5 min ago{waits}"))),
+        ("file", format!("{}CHANGED notes.py\n", look_text(n, 40 * 60, "11-22")), "", "", line(&format!("notes.py changed 40 min ago{waits}"))),
+        ("git", format!("{quiet}PROC 4242 git\n"), "", "", line("a git command, or an editor one waits on, is running (pid 4242: git)")),
+        (
+            "copy-failed",
+            quiet.clone(),
+            "fail",
+            "",
+            line("this run's copy of it failed (said above): it's finished only from a whole copy taken after its last change"),
+        ),
+        ("no-copy", quiet.clone(), "no-git", "", line("no copy recorded after its last change: it's finished only from a whole copy taken after it")),
+        ("young", young, "", "", None),
+        ("off", format!("{quiet}TTY {}\n", n - 5 * 60), "", "BUSY_AUTO_RESOLVE_HOURS=0", None),
+    ];
+    for (case, look, copy, extra, want) in cases {
+        let w = World::new(&format!("held-{case}"));
+        match copy {
+            "fail" => w.rsync(true),
+            "no-git" => std::fs::write(w.base.join("rsync"), "#!/bin/sh\nexit 0\n").unwrap(),
+            _ => {}
+        }
+        let cfg = w.cfg(extra);
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22001), [pushed("autocommit-a")]);
+        fake.script(&host(22002), [busy(), FakeReply::stdout(&look), repo_in_place(), resolved(), pushed("autocommit-b")]);
+        let _ = crate::take_said();
+        let err = handle_full_backup(fake.clone(), &cfg, &fleet(), true, None, false, true, &w.rsync_path()).await.unwrap_err();
+        assert!(err.to_string().starts_with("1 pod(s) failed to back up"), "{case}: {err}");
+        let calls = execs(&fake, 22002);
+        assert_eq!(calls.len(), 3, "{case}: its backup, look and copy — no resolve: {calls:#?}");
+        let said = crate::take_said();
+        let held: Vec<String> = said.iter().filter(|l| l.starts_with("⊘ devtest-bloom")).cloned().collect();
+        assert_eq!(held, want.into_iter().collect::<Vec<_>>(), "{case}: {said:#?}");
+    }
+}
+
 /// A revert stays BUSY however quiet, and its line says arena won't finish one; it is copied and
 /// paced as any BUSY pod.
 #[tokio::test]

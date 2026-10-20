@@ -147,7 +147,9 @@ impl Busy {
     /// then finish each BUSY pod [`core_resolve::hold`] lets through, on a recorded copy that is
     /// still there — under its lock, the resolve and then its backup again (`message`: the
     /// backup's commit message, `pods backup -m`), its record forgotten once finished — and say
-    /// what became of each (a revert: that arena won't finish it).
+    /// what became of each: a revert, that arena won't finish it; one whose operation is older
+    /// than the threshold but held back, why ([`core_resolve::held_words`]: what changed or was
+    /// used, how long ago).
     pub(crate) async fn settle(self, remote: &Arc<dyn Remote>, cfg: &Config, pulled: &anyhow::Result<Pulled>, all: bool, message: Option<&str>) -> Settled {
         let mut out = Settled::default();
         let Busy { hours, record, mut copies, pods, dir, now } = self;
@@ -201,7 +203,13 @@ impl Busy {
                 Err(Hold::Never(what)) if what == "revert" => {
                     out.lines.push(format!("⊘ {}: not finished automatically — {}", pod.name, core_resolve::REVERT_WORDS));
                 }
-                Err(_) => {}
+                // Left past the threshold but held back: why, with how long ago (an operation
+                // younger than that isn't a candidate yet — no line).
+                Err(why) => {
+                    if let Some(words) = core_resolve::held_words(&why, pod.look.as_ref(), hours) {
+                        out.lines.push(format!("⊘ {}: not finished automatically — {words}", pod.name));
+                    }
+                }
             }
         }
         save(record.clone(), changes, now).await;

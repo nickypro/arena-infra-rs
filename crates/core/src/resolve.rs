@@ -187,6 +187,8 @@ pub struct Look {
     pub newest: u64,
     /// How many files that is.
     pub files: u64,
+    /// That newest file's path (what a pod's line names when a recent change holds it back).
+    pub changed: Option<String>,
     /// A checksum of every such file's mtime, size, ctime and path.
     pub print: String,
     /// The index's mtime: something staged since.
@@ -216,7 +218,7 @@ pub fn parse_look(stdout: &str) -> Option<Look> {
     for line in stdout.lines() {
         let line = line.trim_end_matches('\r');
         let (word, rest) = line.split_once(' ').unwrap_or((line, ""));
-        if matches!(word, "NOW" | "TOP" | "REPO" | "HOME" | "OP" | "NEWEST" | "PRINT" | "INDEX" | "LOCKED" | "INPUT" | "TTY" | "PROC") {
+        if matches!(word, "NOW" | "TOP" | "REPO" | "HOME" | "OP" | "NEWEST" | "CHANGED" | "PRINT" | "INDEX" | "LOCKED" | "INPUT" | "TTY" | "PROC") {
             v.entry(word).or_insert(rest);
         }
     }
@@ -245,6 +247,7 @@ pub fn parse_look(stdout: &str) -> Option<Look> {
         sequence,
         newest: num(newest)?,
         files: num(files)?,
+        changed: text("CHANGED"),
         print: print.to_string(),
         index: v.get("INDEX").and_then(|i| num(i)),
         locked: v.contains_key("LOCKED"),
@@ -563,6 +566,64 @@ pub fn hold<'a>(hours: Option<u64>, look: Option<&Look>, copied: CopiedNow, last
         return Err(Hold::CopyFailed);
     }
     last.filter(|l| l.op == look.op_key() && l.print == look.print).ok_or(Hold::NoCopy)
+}
+
+/// How long before the look's clock `now` a time `t` on that clock was, as a line says it: `40 s
+/// ago`, `12 min ago`, `3 h ago`, `4 h 5 min ago`; a time after it, `in the future, by the pod's
+/// clock`. Pure.
+pub fn ago_words(now: u64, t: u64) -> String {
+    let Some(d) = now.checked_sub(t) else { return "in the future, by the pod's clock".to_string() };
+    match (d / 3600, d % 3600 / 60) {
+        (0, 0) => format!("{d} s ago"),
+        (0, m) => format!("{m} min ago"),
+        (h, 0) => format!("{h} h ago"),
+        (h, m) => format!("{h} h {m} min ago"),
+    }
+}
+
+/// Why a BUSY pod whose operation is older than the threshold (`hours`) isn't finished this run,
+/// in words for its line (`⊘ <pod>: not finished automatically — <these>`): each time with how
+/// long ago, on the pod's clock — `notes.py changed 40 min ago`, `git's index was written 12 min
+/// ago (…)`, `a terminal was used 5 min ago`, a git command running, the copy failed, no copy
+/// recorded after the last change… An operator could tell nothing from a pod left for 3h+ that
+/// stayed BUSY (Live 5: its index had been written by a `git status` minutes before). `None` —
+/// no line — when the setting is off, there's no look (its age is unknown), a revert (its own
+/// line), or the operation itself is younger than the threshold (not a candidate yet: the tick
+/// stays quiet). Pure.
+pub fn held_words(hold: &Hold, look: Option<&Look>, hours: Option<u64>) -> Option<String> {
+    let (Some(hours), Some(look)) = (hours, look) else { return None };
+    let quiet = |t: u64| look.now.saturating_sub(t) >= hours * 3600 && t <= look.now;
+    if !look.since.is_some_and(quiet) {
+        return None;
+    }
+    let ago = |t: u64| ago_words(look.now, t);
+    let waits = format!(" — it waits for {hours}h of quiet");
+    Some(match hold {
+        Hold::Off | Hold::NoLook => return None,
+        Hold::Never(what) if what == "revert" => return None,
+        Hold::Never(what) if what == "sequence" => "a cherry-pick or revert sequence is in progress: never finished automatically".to_string(),
+        Hold::Never(what) => format!("a {what} is in progress: never finished automatically"),
+        Hold::Recent(why) => {
+            if !quiet(look.newest) {
+                format!("{} changed {}{waits}", look.changed.as_deref().unwrap_or("a file"), ago(look.newest))
+            } else if let Some(i) = look.index.filter(|i| !quiet(*i)) {
+                format!("git's index was written {} (something staged, or a git command such as `git status` refreshing it){waits}", ago(i))
+            } else if look.locked {
+                "git's index is locked (.git/index.lock): a git command is at work, or died holding it".to_string()
+            } else if let Some(i) = look.input.filter(|i| !quiet(*i)) {
+                format!("a terminal login typed {}{waits}", ago(i))
+            } else if let Some(i) = look.tty.filter(|i| !quiet(*i)) {
+                format!("a terminal was used {}{waits}", ago(i))
+            } else if let Some(p) = &look.at_work {
+                let (pid, name) = p.split_once(' ').unwrap_or((p.as_str(), "?"));
+                format!("a git command, or an editor one waits on, is running (pid {pid}: {name})")
+            } else {
+                why.clone()
+            }
+        }
+        Hold::CopyFailed => "this run's copy of it failed (said above): it's finished only from a whole copy taken after its last change".to_string(),
+        Hold::NoCopy => "no copy recorded after its last change: it's finished only from a whole copy taken after it".to_string(),
+    })
 }
 
 /// How a conflicted path was taken from its newer side ([`Choice`]).

@@ -27,6 +27,7 @@ fn look_at(now: u64, since: Option<u64>, newest: u64, input: Option<u64>) -> Loo
         sequence: false,
         newest,
         files: 12,
+        changed: Some("notes.py".into()),
         print: "111-222".into(),
         index: since,
         locked: false,
@@ -70,8 +71,8 @@ fn the_setting_is_whole_hours_on_by_default_and_0_or_off_turns_it_off() {
 #[test]
 fn a_look_is_read_back_and_an_incomplete_one_is_none() {
     let out = "NOW 1760900000\nTOP /workspace/ARENA_materials\nREPO /root/ARENA_materials\nHOME /root\nOP merge 1760800000 0123abcd 0\n\
-               NEWEST 1760700000 42\nPRINT 3735928559-1234\nINDEX 1760750000\nLOCKED index.lock\nINPUT 1760600000\nTTY 1760650000\n\
-               PROC 4242 vim\n";
+               NEWEST 1760700000 42\nCHANGED sub dir/we*ird.py\nPRINT 3735928559-1234\nINDEX 1760750000\nLOCKED index.lock\nINPUT 1760600000\n\
+               TTY 1760650000\nPROC 4242 vim\n";
     let l = parse_look(out).unwrap();
     assert_eq!(
         l,
@@ -86,6 +87,7 @@ fn a_look_is_read_back_and_an_incomplete_one_is_none() {
             sequence: false,
             newest: 1_760_700_000,
             files: 42,
+            changed: Some("sub dir/we*ird.py".into()),
             print: "3735928559-1234".into(),
             index: Some(1_760_750_000),
             locked: true,
@@ -105,11 +107,19 @@ fn a_look_is_read_back_and_an_incomplete_one_is_none() {
         assert_eq!((l.what.as_str(), l.since, l.op_key()), (what, None, format!("{what} - -")));
     }
     // The lines said only when there is something to say: none of them, all off.
-    let bare = ["REPO /root/ARENA_materials\n", "INDEX 1760750000\n", "LOCKED index.lock\n", "INPUT 1760600000\n", "TTY 1760650000\n", "PROC 4242 vim\n"]
-        .iter()
-        .fold(out.to_string(), |o, l| o.replace(l, ""));
+    let bare = [
+        "REPO /root/ARENA_materials\n",
+        "CHANGED sub dir/we*ird.py\n",
+        "INDEX 1760750000\n",
+        "LOCKED index.lock\n",
+        "INPUT 1760600000\n",
+        "TTY 1760650000\n",
+        "PROC 4242 vim\n",
+    ]
+    .iter()
+    .fold(out.to_string(), |o, l| o.replace(l, ""));
     let l = parse_look(&bare).unwrap();
-    assert_eq!((l.repo, l.index, l.locked, l.input, l.tty, l.at_work), (None, None, false, None, None, None));
+    assert_eq!((l.repo, l.changed, l.index, l.locked, l.input, l.tty, l.at_work), (None, None, None, false, None, None, None));
     // Any line it always prints missing or unreadable: no look.
     for broken in ["NOW 1760900000\n", "NEWEST 1760700000 42\n", "PRINT 3735928559-1234\n", "OP merge 1760800000 0123abcd 0\n"] {
         assert_eq!(parse_look(&out.replace(broken, "")), None, "{broken}");
@@ -158,6 +168,69 @@ fn quiet_means_nothing_and_nobody_at_work_for_the_threshold() {
         assert_eq!(not_quiet(&look, 3).as_deref(), want, "{look:?}");
     }
     assert_eq!(not_quiet(&look_at(n, Some(n - 5 * HOUR), n - 5 * HOUR, None), 6).as_deref(), Some("the merge started less than 6h ago"));
+}
+
+/// A BUSY pod left past the threshold but held back says why, with how long ago on the pod's clock
+/// (Live 5: one sat unfinished, nothing said — its index had been written by a `git status`). An
+/// operation younger than the threshold is no candidate yet: nothing said; nor with the setting
+/// off, no look, or a revert (its own line).
+#[test]
+fn a_pod_held_back_past_the_threshold_is_said_why_with_how_long_ago() {
+    assert_eq!(
+        [0, 59, 60, 12 * 60 + 59, 3600, 3600 + 5 * 60, 26 * 3600].map(|d| ago_words(10_000_000, 10_000_000 - d)),
+        ["0 s ago", "59 s ago", "1 min ago", "12 min ago", "1 h ago", "1 h 5 min ago", "26 h ago"].map(String::from)
+    );
+    assert_eq!(ago_words(100, 160), "in the future, by the pod's clock");
+    let n = 1_760_900_000;
+    let base = look_at(n, Some(n - DAY), n - 4 * HOUR, None);
+    let with = |f: &dyn Fn(&mut Look)| {
+        let mut l = base.clone();
+        f(&mut l);
+        l
+    };
+    let recent = |l: &Look| Hold::Recent(not_quiet(l, 3).unwrap());
+    let waits = " — it waits for 3h of quiet";
+    let file = with(&|l| l.newest = n - 40 * 60);
+    let unnamed = with(&|l| {
+        l.newest = n - 40 * 60;
+        l.changed = None
+    });
+    let index = with(&|l| l.index = Some(n - 12 * 60));
+    let locked = with(&|l| l.locked = true);
+    let typed = with(&|l| l.input = Some(n - 90));
+    let tty = with(&|l| l.tty = Some(n - 5 * 60));
+    let git = with(&|l| l.at_work = Some("4242 git".into()));
+    let sequence = with(&|l| {
+        l.what = "cherry-pick".into();
+        l.sequence = true
+    });
+    let cases: Vec<(Hold, &Look, Option<String>)> = vec![
+        (recent(&file), &file, Some(format!("notes.py changed 40 min ago{waits}"))),
+        (recent(&unnamed), &unnamed, Some(format!("a file changed 40 min ago{waits}"))),
+        (recent(&index), &index, Some(format!("git's index was written 12 min ago (something staged, or a git command such as `git status` refreshing it){waits}"))),
+        (recent(&locked), &locked, Some("git's index is locked (.git/index.lock): a git command is at work, or died holding it".into())),
+        (recent(&typed), &typed, Some(format!("a terminal login typed 1 min ago{waits}"))),
+        (recent(&tty), &tty, Some(format!("a terminal was used 5 min ago{waits}"))),
+        (recent(&git), &git, Some("a git command, or an editor one waits on, is running (pid 4242: git)".into())),
+        (Hold::CopyFailed, &base, Some("this run's copy of it failed (said above): it's finished only from a whole copy taken after its last change".into())),
+        (Hold::NoCopy, &base, Some("no copy recorded after its last change: it's finished only from a whole copy taken after it".into())),
+        (Hold::Never("sequence".into()), &sequence, Some("a cherry-pick or revert sequence is in progress: never finished automatically".into())),
+        (Hold::Never("revert".into()), &base, None),
+    ];
+    for (hold, look, want) in cases {
+        assert_eq!(held_words(&hold, Some(look), Some(3)), want, "{hold:?}");
+    }
+    // Nothing said: the operation younger than the threshold (or in the pod's future), the setting
+    // off, no look.
+    for since in [n - 3 * HOUR + 1, n - 600, n + 60] {
+        let young = Look { since: Some(since), ..file.clone() };
+        assert_eq!(held_words(&recent(&young), Some(&young), Some(3)), None, "{since}");
+    }
+    assert_eq!(held_words(&Hold::NoCopy, Some(&Look { since: None, ..base.clone() }), Some(3)), None);
+    assert_eq!(held_words(&Hold::Off, Some(&base), None), None);
+    assert_eq!(held_words(&Hold::NoLook, None, Some(3)), None);
+    // Its own threshold: 5h, a merge a day old, a file 4h old.
+    assert_eq!(held_words(&Hold::Recent(String::new()), Some(&base), Some(5)), Some("notes.py changed 4 h ago — it waits for 5h of quiet".into()));
 }
 
 fn copy_of(look: &Look, at: u64) -> BusyCopy {
@@ -1296,6 +1369,11 @@ fn recent_activity_or_a_change_since_the_copy_leaves_it_busy() {
             r.process(pid, None);
         }
     }
+    // The look names the newest file, an odd name and all.
+    r.age(4 * HOUR);
+    r.touch("sub dir/we*ird.py", 600);
+    let look = r.look();
+    assert_eq!((look.newest, look.changed.as_deref()), (r.now - 600, Some("sub dir/we*ird.py")));
     // Changed after the look the copy followed — same mtime, new content: refused.
     r.age(4 * HOUR);
     let look = r.look();

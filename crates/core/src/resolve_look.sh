@@ -16,6 +16,8 @@
 #                            multi-commit cherry-pick or revert)
 #   NEWEST <epoch> <n>       the newest mtime of the n files git lists — tracked, and untracked but not
 #                            ignored (`.git` never) — 0 0 for none
+#   CHANGED <path>           that newest file, when there is one: what a pod's line names when a
+#                            recent change keeps its operation from being finished
 #   PRINT <crc>-<size>       a checksum of every such file's mtime, size, ctime (to the nanosecond) and
 #                            path: any edit, new file, deletion or rename changes it — and so does a
 #                            replacement that keeps the old mtime and size (`cp -p`, `rsync -a`),
@@ -59,7 +61,9 @@ arena_look() {
     fi
     _l=$(git --no-optional-locks ls-files -z --cached --others --exclude-standard \
         | xargs -0 -r stat -c '%Y %s %z %n' -- 2>/dev/null | LC_ALL=C sort -u)
-    printf '%s\n' "$_l" | awk 'NF { n++; if ($1 + 0 > m) m = $1 + 0 } END { print "NEWEST " m + 0 " " n + 0 }'
+    # Each line: `<mtime> <size> <ctime: 3 words> <path>`.
+    printf '%s\n' "$_l" | awk 'NF { n++; if (n == 1 || $1 + 0 > m) { m = $1 + 0; c = $0 } }
+        END { print "NEWEST " m + 0 " " n + 0; if (n) { sub(/^[^ ]+ [^ ]+ [^ ]+ [^ ]+ [^ ]+ /, "", c); print "CHANGED " c } }'
     echo "PRINT $(printf '%s\n' "$_l" | cksum | tr ' ' '-')"
     if [ -e "$G/index" ]; then echo "INDEX $(stat -c %Y -- "$G/index")"; fi
     if [ -e "$G/index.lock" ]; then echo "LOCKED index.lock"; fi

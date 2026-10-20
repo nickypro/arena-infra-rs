@@ -727,7 +727,13 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     folder below hold the state before. It also needs a whole copy recorded after the work
     tree's last change, `.git` with it (this run's or an earlier one's, still there — never when
     this run's copy failed); a repo linked onto the `/workspace` volume counts as held by a pull
-    of the home, which copies it in the link's place. Then, on the pod, under its lock, each
+    of the home, which copies it in the link's place. A pod whose operation is older than that
+    but held back says why, each run, besides its BUSY line — what changed or was used, how long
+    ago on the pod's clock: `⊘ <pod>: not finished automatically — notes.py changed 40 min ago —
+    it waits for 3h of quiet` (or git's index written, something staged or a `git status`
+    refreshing it; a terminal used; a login typing; the index locked; a git command running; this
+    run's copy failed; no copy recorded after its last change); one whose operation is younger
+    isn't a candidate yet, and gets no such line. Then, on the pod, under its lock, each
     conflicted path, nothing changed yet:
     - a regular text file with no conflict marker left (at the path's `conflict-marker-size`),
       both sides there, is kept as the participant resolved it;
