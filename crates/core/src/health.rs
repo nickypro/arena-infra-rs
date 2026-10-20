@@ -228,6 +228,15 @@ impl DeepFacts {
         }
     }
 
+    /// Whether the pod is (on) a MIG slice: the provider's name for its GPU says so (`slice`),
+    /// `nvidia-smi -L` lists slices, or torch names one (`… MIG 1g.5gb`) — the last is all
+    /// there is when nvidia-smi can't run in the slice's container.
+    fn is_mig(&self) -> bool {
+        self.slice.as_deref().is_some_and(|s| !s.trim().is_empty())
+            || self.mig_devices.is_some_and(|n| n > 0)
+            || self.torch_gpus.iter().any(|g| g.name.as_deref().is_some_and(names_mig))
+    }
+
     /// torch's own proof that the GPUs work: imported, CUDA available, at least one device, and
     /// the tensor op `ok` on every one (none missing, none failed). What stands in for
     /// nvidia-smi when it can't answer — and nothing short of all of it: a GPU torch can't use
@@ -238,6 +247,17 @@ impl DeepFacts {
             && self.cuda_available == Some(true)
             && (0..n).all(|i| self.tensor.get(&i).is_some_and(|r| r == "ok"))
             && self.tensor.values().all(|r| r == "ok")
+    }
+
+    /// The GPU memory torch reports (`4.8 GB`, `80 GB each`; GiB, as GPU memory is sold), when
+    /// every GPU it lists says the same — else `None`.
+    fn torch_mem(&self) -> Option<String> {
+        let first = self.torch_gpus.first()?.mem_total_mib?;
+        if self.torch_gpus.iter().any(|g| g.mem_total_mib != Some(first)) {
+            return None;
+        }
+        let each = if self.torch_gpus.len() > 1 { " each" } else { "" };
+        Some(format!("{}{each}", fmt_gb(first as f64 / 1024.0)))
     }
 
     /// GPUs as the machine sees them — `2×RTX A4000`, `1×A100 80GB PCIe+1×H100` for a
@@ -285,12 +305,14 @@ impl DeepFacts {
     /// How many GPUs nvidia-smi listed — only when it actually listed them. The header
     /// call working isn't enough: if `--query-gpu` then failed (`smi_query`, the classic
     /// GPU-fell-off-the-bus error) the count is unknown, not 0, and must not read as
-    /// "nvidia-smi sees 0 GPUs" next to torch's count.
+    /// "nvidia-smi sees 0 GPUs" next to torch's count. Nor is a listing of none a count: that
+    /// is nvidia-smi unable to see the GPUs (a MIG slice's container), which the nvidia-smi
+    /// check judges — FAIL, or torch's proof.
     fn smi_count(&self) -> Option<u32> {
         if self.smi.as_deref() != Some("ok") || self.smi_query.is_some() {
             return None;
         }
-        self.smi_gpus.or_else(|| (!self.gpus.is_empty()).then_some(self.gpus.len() as u32))
+        self.smi_gpus.or_else(|| (!self.gpus.is_empty()).then_some(self.gpus.len() as u32)).filter(|&n| n > 0)
     }
 
     /// torch imported, built without CUDA (`torch.version.cuda` is None: `torch_cuda=none`).
@@ -948,25 +970,47 @@ fn vscode_check(f: &DeepFacts, p: &HealthPolicy) -> Check {
     Check::new("vscode", status, parts.join("; "))
 }
 
+/// nvidia-smi as the machine's view of its GPUs. When it can't answer (missing, an error, no
+/// GPUs listed, its query failing) the GPUs may still be fine: in a MIG slice's container NVML
+/// is often blocked (`Insufficient Permissions`, `No devices were found`) while CUDA works. So
+/// where torch proves the GPUs work ([`DeepFacts::torch_proves_gpus`]) that is no FAIL: a PASS
+/// on a MIG slice, where it is expected, and a WARN elsewhere (a broken nvidia-smi on a whole
+/// card is worth knowing). Without that proof it FAILs as before.
 fn smi_check(f: &DeepFacts) -> Check {
     use Status::*;
-    match f.smi.as_deref() {
+    // (the FAIL detail; what the fallback's detail says went wrong: short, and as a phrase)
+    let error = |e: &str, verb: &str| {
+        let short = clip(&reason(e), 60);
+        (reason(e), short.clone(), format!("{verb} ({short})"))
+    };
+    let same = |s: &str| (s.to_string(), s.to_string(), s.to_string());
+    let (fail, short, phrase) = match f.smi.as_deref() {
         Some("ok") if f.gpus.is_empty() => match f.smi_query.as_deref() {
-            Some(e) => Check::new("nvidia-smi", Fail, reason(e)),
-            None => Check::new("nvidia-smi", Fail, "lists no GPUs"),
+            Some(e) => error(e, "--query-gpu failed"),
+            None => same("lists no GPUs"),
         },
         Some("ok") => {
             // Under MIG, say what the slice is cut from (the parent nvidia-smi names).
             let parent = f.gpus.first().and_then(|g| g.name.as_deref()).map(normalize_gpu_name);
-            let detail = match (f.mig_devices.filter(|&n| n > 0).or(f.slice.as_ref().map(|_| 1)), parent) {
-                (Some(_), Some(parent)) => format!("{} (MIG slice of {parent})", f.gpu_label()),
+            let detail = match (f.is_mig(), parent) {
+                (true, Some(parent)) => format!("{} (MIG slice of {parent})", f.gpu_label()),
                 _ => f.gpu_label(),
             };
-            Check::new("nvidia-smi", Pass, detail)
+            return Check::new("nvidia-smi", Pass, detail);
         }
-        Some("missing") => Check::new("nvidia-smi", Fail, "not found (no NVIDIA driver in the container)"),
-        Some(e) => Check::new("nvidia-smi", Fail, reason(e)),
-        None => Check::new("nvidia-smi", Fail, "not reported"),
+        Some("missing") => ("not found (no NVIDIA driver in the container)".into(), "not found".into(), "not found".into()),
+        Some(e) => error(e, "failed"),
+        None => same("not reported"),
+    };
+    if !f.torch_proves_gpus() {
+        return Check::new("nvidia-smi", Fail, fail);
+    }
+    let label = f.gpu_label();
+    if f.is_mig() {
+        let mem = f.torch_mem().map(|m| format!(", {m}")).unwrap_or_default();
+        Check::new("nvidia-smi", Pass, format!("nvidia-smi can't read this MIG slice ({short}) — torch: {label}{mem}"))
+    } else {
+        Check::new("nvidia-smi", Warn, format!("nvidia-smi {phrase} — torch sees the GPUs and they work: {label}"))
     }
 }
 
@@ -1034,17 +1078,27 @@ fn dotted(v: &[u32]) -> String {
 fn gpu_checks(f: &DeepFacts, out: &mut Vec<Check>) {
     use Status::*;
     let n = f.device_count;
-    out.push(match (n, f.smi_count()) {
+    // Under MIG torch sees the slices, and `--query-gpu` lists only their parent card(s): the
+    // count to match is the slices `nvidia-smi -L` lists.
+    let slices = f.mig_devices.filter(|&m| m > 0);
+    let smi = slices.map(|m| (m, format!("{m} MIG slice(s)"))).or_else(|| f.smi_count().map(|s| (s, s.to_string())));
+    out.push(match (n, smi) {
         (None, _) => Check::new(
             "device_count",
             Fail,
             f.device_count_error.as_deref().map(reason).unwrap_or_else(|| f.python_cut()),
         ),
         (Some(0), _) => Check::new("device_count", Fail, "torch sees no GPU"),
-        (Some(t), Some(s)) if t != s => {
-            Check::new("device_count", Fail, format!("torch sees {t} GPU(s), nvidia-smi {s}"))
+        (Some(t), Some((s, said))) if t != s => {
+            Check::new("device_count", Fail, format!("torch sees {t} GPU(s), nvidia-smi {said}"))
+        }
+        (Some(t), Some((_, said))) if slices.is_some() => {
+            Check::new("device_count", Pass, format!("{t} (matches nvidia-smi's {said})"))
         }
         (Some(t), Some(_)) => Check::new("device_count", Pass, format!("{t} (matches nvidia-smi)")),
+        (Some(t), None) if f.is_mig() => {
+            Check::new("device_count", Pass, format!("{t} (MIG slice(s); nvidia-smi count unknown)"))
+        }
         (Some(t), None) => Check::new("device_count", Pass, format!("{t} (nvidia-smi count unknown)")),
     });
 
@@ -1880,14 +1934,18 @@ deep_check_end=1
                 ("device_count", Some("0")),
             ],
         );
+        // With a GPU torch can't use beside it: were torch to prove every GPU works, nvidia-smi's
+        // failure would be no FAIL (a MIG slice's blocked NVML — see
+        // `nvidia_smi_failing_falls_back_on_torchs_proof`).
+        let gpu1_broken = ("tensor.1", Some("error: RuntimeError: CUDA error: unknown error"));
         let smi_error = edit(
             &without(HEALTHY_2GPU, &["smi_", "gpu."]),
-            &[("smi", Some("error: NVIDIA-SMI has failed because it couldn't communicate with the NVIDIA driver."))],
+            &[("smi", Some("error: NVIDIA-SMI has failed because it couldn't communicate with the NVIDIA driver.")), gpu1_broken],
         );
         // The header call worked, the per-GPU query didn't: a GPU fallen off the bus.
         let smi_query_error = edit(
             &without(HEALTHY_2GPU, &["gpu.", "smi_gpus"]),
-            &[("smi_query", Some("error: Unable to determine the device handle for GPU 0000:41:00.0: Unknown Error"))],
+            &[("smi_query", Some("error: Unable to determine the device handle for GPU 0000:41:00.0: Unknown Error")), gpu1_broken],
         );
         let count_mismatch = edit(
             &without(HEALTHY_2GPU, &["tensor.1", "peer.", "nccl"]),
@@ -2493,6 +2551,144 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
         assert_eq!((f.driver_proc, f.torch_driver_cuda, f.torch_gpus.len()), (None, None, 0));
     }
 
+    /// The false FAILs on a MIG slice (nvidia-smi can't run in its container: NVML blocked,
+    /// no devices found) and their neighbours: torch's proof that the GPUs work turns an
+    /// nvidia-smi that can't answer into a PASS on a MIG slice and a WARN elsewhere; without the
+    /// whole proof it FAILs as before.
+    #[test]
+    fn nvidia_smi_failing_falls_back_on_torchs_proof() {
+        use Status::*;
+        let nvml = "error: Failed to initialize NVML: Insufficient Permissions";
+        let no_devices = "error: No devices were found";
+        let mig_nvml = smi_down(nvml, A100_SLICE);
+        let a4000_down = smi_down(no_devices, "NVIDIA RTX A4000");
+        let unknown_error = smi_down("error: Failed to initialize NVML: Unknown Error", "NVIDIA RTX A4000");
+        let cuda_off = edit(
+            &without(&mig_nvml, &["tensor.", "tgpu.", "torch_driver_cuda"]),
+            &[("cuda_available", Some("false")), ("cuda_error", Some("error: RuntimeError: CUDA unknown error"))],
+        );
+        let op_failed = edit(&mig_nvml, &[("tensor.0", Some("error: RuntimeError: CUDA error: unknown error"))]);
+        // Two devices, the second never reported (python cut off): not a proof.
+        let op_missing = edit(&mig_nvml, &[("device_count", Some("2")), ("py_done", None)]);
+        let no_torch = edit(
+            &without(&mig_nvml, &["torch_", "cuda_", "device_count", "tensor.", "tgpu.", "peer", "nccl"]),
+            &[("torch", Some("error: ModuleNotFoundError: No module named 'torch'"))],
+        );
+        let smi_missing = edit(&a4000_down, &[("smi", Some("missing"))]);
+        // nvidia-smi runs, but lists nothing / its query fails (a slice's NVML half-blocked).
+        let listed_none = edit(&mig_nvml, &[("smi", Some("ok")), ("smi_gpus", Some("0"))]);
+        let query_failed = edit(
+            &a4000_down,
+            &[("smi", Some("ok")), ("smi_query", Some("error: Unable to determine the device handle for GPU 0000:41:00.0: Unknown Error"))],
+        );
+        // `nvidia-smi -L` lists the slice though `--query-gpu` fails: MIG by that alone.
+        let l_lists_slice = edit(&query_failed, &[("mig_devices", Some("1")), ("mig_profile", Some("1g.5gb"))]);
+
+        let fallback_warn = "— torch sees the GPUs and they work: 1×RTX A4000";
+        // (label, output, nvidia-smi's status, its detail contains, overall)
+        let cases: &[(&str, &str, Status, &str, Status)] = &[
+            (
+                "MIG slice, NVML blocked",
+                &mig_nvml,
+                Pass,
+                "nvidia-smi can't read this MIG slice (Failed to initialize NVML: Insufficient Permissions) — torch: \
+                 1×A100-SXM4-40GB MIG 1g.5gb, 4.8 GB",
+                Pass,
+            ),
+            ("MIG slice, nvidia-smi lists none", &listed_none, Pass, "can't read this MIG slice (lists no GPUs)", Pass),
+            ("MIG by nvidia-smi -L", &l_lists_slice, Pass, "can't read this MIG slice (Unable to determine the device handle", Pass),
+            ("whole card, no devices found", &a4000_down, Warn, "nvidia-smi failed (No devices were found) — torch sees the GPUs and they work: 1×RTX A4000", Warn),
+            ("whole card, NVML unknown error", &unknown_error, Warn, fallback_warn, Warn),
+            ("whole card, nvidia-smi missing", &smi_missing, Warn, "nvidia-smi not found — torch sees", Warn),
+            ("whole card, query failed", &query_failed, Warn, "nvidia-smi --query-gpu failed (Unable to determine the device handle", Warn),
+            // Without torch's whole proof: exactly as before.
+            ("CUDA unavailable", &cuda_off, Fail, "Failed to initialize NVML: Insufficient Permissions", Fail),
+            ("a tensor op failed", &op_failed, Fail, "Failed to initialize NVML: Insufficient Permissions", Fail),
+            ("a tensor op missing", &op_missing, Fail, "Failed to initialize NVML: Insufficient Permissions", Fail),
+            ("torch missing", &no_torch, Fail, "Failed to initialize NVML: Insufficient Permissions", Fail),
+            ("nvidia-smi missing, CUDA unavailable", &edit(&cuda_off, &[("smi", Some("missing"))]), Fail, "not found (no NVIDIA driver in the container)", Fail),
+        ];
+        for (label, out, status, detail, verdict) in cases {
+            let checks = evaluate(&parse_deep(out), &cuda124(), None);
+            let c = check(&checks, "nvidia-smi");
+            assert_eq!(c.status, *status, "{label}: {c:?}");
+            assert!(c.detail.contains(detail), "{label}: {:?} lacks {detail:?}", c.detail);
+            assert_eq!(overall(&checks), *verdict, "{label}: {checks:#?}");
+        }
+        assert_eq!(
+            check(&evaluate(&parse_deep(&a4000_down), &cuda124(), None), "nvidia-smi").detail,
+            "nvidia-smi failed (No devices were found) — torch sees the GPUs and they work: 1×RTX A4000"
+        );
+
+        // nvidia-smi lists the parent card but not the slice (no `-L` line), torch names the
+        // slice: MIG by torch's name, and said so.
+        let parent_row = edit(&mig_nvml, &[("smi", Some("ok")), ("gpu.0.name", Some("NVIDIA A100-SXM4-40GB")), ("smi_gpus", Some("1"))]);
+        let h = PodHealth::checked(&pod("delta", "1.2.3.4"), parse_deep(&parent_row), &cuda124());
+        assert_eq!(check(&h.checks, "nvidia-smi").detail, "1×A100-SXM4-40GB MIG 1g.5gb (MIG slice of A100-SXM4-40GB)");
+        assert_eq!(check(&h.checks, "device_count").detail, "1 (matches nvidia-smi)");
+
+        // nvidia-smi missing on a pod the provider lists as a MIG slice: PASS, named as the slice.
+        let p = Pod { gpu_type: Some("B300 MIG 34GB".into()), ..pod("delta", "1.2.3.4") };
+        let b300 = edit(&smi_missing, &[("tgpu.0.name", Some("NVIDIA B300 SXM6 AC MIG 1g.34gb")), ("tgpu.0.mem_total_mib", Some("34560"))]);
+        let h = PodHealth::checked(&p, parse_deep(&b300), &cuda124());
+        assert_eq!(check(&h.checks, "nvidia-smi"), &Check::new("nvidia-smi", Pass, "nvidia-smi can't read this MIG slice (not found) — torch: 1×B300 MIG 34GB, 34 GB"));
+        assert_eq!(h.status, Pass, "{:#?}", h.checks);
+        // ...and by the provider's name alone, torch naming the bare card.
+        let h = PodHealth::checked(&p, parse_deep(&smi_missing), &cuda124());
+        assert_eq!(check(&h.checks, "nvidia-smi").status, Pass, "{:#?}", h.checks);
+        assert_eq!(PodHealth::checked(&pod("delta", "1.2.3.4"), parse_deep(&smi_missing), &cuda124()).status, Warn);
+
+        // Only a FAIL replaces a pod or condemns a machine: a fallback PASS/WARN does neither.
+        for out in [&mig_nvml, &a4000_down] {
+            let h = PodHealth::checked(&pod("delta", "1.2.3.4"), parse_deep(out), &cuda124());
+            assert_eq!(h.failure_kind(), None, "{:#?}", h.checks);
+        }
+        let h = PodHealth::checked(&pod("delta", "1.2.3.4"), parse_deep(&op_failed), &cuda124());
+        assert_eq!(h.failure_kind(), Some(FailureKind::Host));
+        assert!(condemns_machine(check(&h.checks, "nvidia-smi"), h.facts.as_ref().unwrap()));
+    }
+
+    /// Two slices of one parent: torch sees 2, `--query-gpu` lists the 1 parent — the count to
+    /// match is the slices `nvidia-smi -L` lists.
+    #[test]
+    fn mig_slices_are_counted_against_nvidia_smi_l() {
+        use Status::*;
+        let two_slices = edit(
+            HEALTHY_2GPU,
+            &[
+                ("gpu.0.name", Some("NVIDIA A100-SXM4-40GB")),
+                ("gpu.1.name", None),
+                ("gpu.1.driver", None),
+                ("gpu.1.mem_total_mib", None),
+                ("gpu.1.mem_used_mib", None),
+                ("smi_gpus", Some("1")),
+                ("mig_devices", Some("2")),
+                ("mig_profile", Some("1g.5gb")),
+            ],
+        );
+        let one_seen = edit(
+            &without(&two_slices, &["tensor.1", "peer.", "nccl"]),
+            &[("device_count", Some("1")), ("peer", Some("skipped (1 GPU)")), ("nccl", Some("skipped (1 GPU)"))],
+        );
+        let three_seen = edit(&two_slices, &[("device_count", Some("3")), ("tensor.2", Some("ok"))]);
+        let mig_unknown = smi_down("error: Failed to initialize NVML: Insufficient Permissions", A100_SLICE);
+        // (label, output, status, detail)
+        let cases: &[(&str, &str, Status, &str)] = &[
+            ("2 slices, 1 parent row", &two_slices, Pass, "2 (matches nvidia-smi's 2 MIG slice(s))"),
+            ("2 slices, torch sees 1", &one_seen, Fail, "torch sees 1 GPU(s), nvidia-smi 2 MIG slice(s)"),
+            ("2 slices, torch sees 3", &three_seen, Fail, "torch sees 3 GPU(s), nvidia-smi 2 MIG slice(s)"),
+            ("a slice, nvidia-smi can't count", &mig_unknown, Pass, "1 (MIG slice(s); nvidia-smi count unknown)"),
+            // Not MIG: as before.
+            ("whole cards", HEALTHY_2GPU, Pass, "2 (matches nvidia-smi)"),
+        ];
+        for (label, out, status, detail) in cases {
+            let c = check(&evaluate(&parse_deep(out), &cuda13(), None), "device_count").clone();
+            assert_eq!((c.status, c.detail.as_str()), (*status, *detail), "{label}");
+        }
+        assert_eq!(overall(&evaluate(&parse_deep(&two_slices), &cuda13(), None)), Pass);
+        assert_eq!(parse_deep(&two_slices).gpu_label(), "2×A100-SXM4-40GB MIG 1g.5gb");
+    }
+
     /// No driver version from nvidia-smi: `/proc/driver/nvidia/version`'s, judged the same way;
     /// else the CUDA version torch says the driver supports, against the CUDA floor the minimum
     /// was derived from; else as before.
@@ -2793,5 +2989,170 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
             assert_eq!(check(&checks, name).status, Status::Pass, "{name}: {checks:#?}");
         }
         assert_eq!(check(&checks, "vscode").detail, "server 2a59476; 3 extensions; python /opt/arena-env/bin/python");
+    }
+
+    /// A stand-in `torch` for the script test (first on PYTHONPATH): one CUDA device that is a
+    /// MIG slice, without a GPU — so the inline python's new facts (torch's names, memory, the
+    /// driver's CUDA) run for real. Just enough tensor for `tensor_check`: `arange(n) * 2 + 1`
+    /// sums to n², a matmul's sum is finite.
+    const FAKE_TORCH: &str = r#"
+__version__ = "2.9.0+cu128"
+int64 = "int64"
+
+
+class version:
+    cuda = "12.8"
+
+
+class _C:
+    @staticmethod
+    def _cuda_getDriverVersion():
+        return 12080
+
+
+class _T:
+    def __init__(self, n=0, a=1, b=0):
+        self.n, self.a, self.b = n, a, b
+
+    def __mul__(self, k):
+        return _T(self.n, self.a * k, self.b * k)
+
+    def __add__(self, k):
+        return _T(self.n, self.a, self.b + k)
+
+    def __matmul__(self, other):
+        return self
+
+    def abs(self):
+        return self
+
+    def sum(self):
+        return _T(0, 0, self.a * self.n * (self.n - 1) // 2 + self.b * self.n)
+
+    def item(self):
+        return self.b
+
+
+def arange(n, device=None, dtype=None):
+    return _T(n)
+
+
+def randn(*shape, device=None):
+    return _T(0, 0, 1)
+
+
+class _Props:
+    total_memory = 4864 << 20
+
+
+class cuda:
+    @staticmethod
+    def is_available():
+        return True
+
+    @staticmethod
+    def device_count():
+        return 1
+
+    @staticmethod
+    def get_device_name(i):
+        return "NVIDIA A100-SXM4-40GB MIG 1g.5gb"
+
+    @staticmethod
+    def get_device_properties(i):
+        return _Props()
+
+    @staticmethod
+    def mem_get_info(i):
+        return (4600 << 20, 4864 << 20)
+
+    @staticmethod
+    def synchronize(i=None):
+        pass
+"#;
+
+    /// The MIG fallback end to end: nvidia-smi failing as it does in a slice's container (exit
+    /// 6 "No devices were found"; NVML "Insufficient Permissions"), torch working (the fake
+    /// module above, run by the real python), the driver in a fake `/proc/driver/nvidia/version`
+    /// (or none) — the script's facts give a PASS for the slice, the driver judged from `/proc`,
+    /// else from torch's CUDA.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn script_falls_back_on_torch_when_nvidia_smi_cant_answer() {
+        if !(have("bash") && have("timeout") && have("base64") && have("python3")) {
+            eprintln!("bash/timeout/base64/python3 missing — skipping");
+            return;
+        }
+        let nvrm = "NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  570.86.15  Release Build  \
+                    (dvs-builder@U16-I3-B03-4-3)  Thu Jan 23 00:43:02 UTC 2025\n\
+                    GCC version:  gcc version 12.3.0 (Ubuntu 12.3.0-1ubuntu1~22.04)\n";
+        // (nvidia-smi's exit and message, /proc file present, the smi fact, the driver check's detail)
+        let cases = [
+            ((6, "No devices were found"), true, "error: No devices were found", "570.86.15 ≥ 550 (CUDA 12.4; from /proc/driver/nvidia/version)"),
+            (
+                (4, "Failed to initialize NVML: Insufficient Permissions"),
+                false,
+                "error: Failed to initialize NVML: Insufficient Permissions",
+                "driver supports CUDA 12.8 ≥ 12.4 (via torch; nvidia-smi unavailable)",
+            ),
+        ];
+        for ((code, msg), proc_file, smi, driver) in cases {
+            let dir = scratch(&format!("stubs-mig-down-{code}"));
+            let stub = |name: &str, body: &str| {
+                crate::remote::write_test_script(dir.join(name), format!("#!/bin/sh\n{body}")).unwrap();
+            };
+            stub("nvidia-smi", &format!("echo '{msg}'\nexit {code}\n"));
+            stub("curl", "exit 3\n");
+            stub("python", "exec python3 \"$@\"\n");
+            std::fs::create_dir_all(dir.join("pylib")).unwrap();
+            std::fs::write(dir.join("pylib/torch.py"), FAKE_TORCH).unwrap();
+            let version = dir.join("nvidia-version");
+            if proc_file {
+                std::fs::write(&version, nvrm).unwrap();
+            }
+            let path = format!("{}:{}", dir.display(), std::env::var("PATH").unwrap_or_default());
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(deep_check_inner_command())
+                .env("PATH", path)
+                .env("HOME", &dir)
+                .env("PYTHONPATH", dir.join("pylib"))
+                .env("ARENA_TEST_NVIDIA_VERSION_FILE", &version)
+                .output()
+                .unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            for line in stdout.lines() {
+                assert!(line.contains('='), "stray stdout line {line:?}\n{stdout}");
+            }
+            let f = parse_deep(&stdout);
+            assert!(f.started && f.complete && f.py_done, "{stdout}\n{stderr}");
+            assert_eq!(f.smi.as_deref(), Some(smi), "{stdout}");
+            assert_eq!(f.driver_proc.as_deref(), proc_file.then_some("570.86.15"), "{stdout}");
+            assert!(stdout.contains(if proc_file { "\ndriver_proc=570.86.15\n" } else { "\ndriver_proc=missing\n" }), "{stdout}");
+            assert_eq!(f.torch_driver_cuda.as_deref(), Some("12.8"), "{stdout}");
+            assert_eq!(
+                f.torch_gpus,
+                [TorchGpuFact { index: 0, name: Some(A100_SLICE.into()), mem_total_mib: Some(4864), mem_free_mib: Some(4600) }],
+                "{stdout}"
+            );
+            assert_eq!((f.device_count, f.tensor.get(&0).map(String::as_str)), (Some(1), Some("ok")), "{stdout}");
+
+            let checks = evaluate(&f, &cuda124(), None);
+            assert_eq!(
+                check(&checks, "nvidia-smi"),
+                &Check::new(
+                    "nvidia-smi",
+                    Status::Pass,
+                    format!("nvidia-smi can't read this MIG slice ({msg}) — torch: 1×A100-SXM4-40GB MIG 1g.5gb, 4.8 GB")
+                ),
+                "{stdout}"
+            );
+            assert_eq!(check(&checks, "driver"), &Check::new("driver", Status::Pass, driver), "{stdout}");
+            for name in ["torch", "cuda", "device_count", "gpu0"] {
+                assert_eq!(check(&checks, name).status, Status::Pass, "{name}: {checks:#?}");
+            }
+        }
     }
 }

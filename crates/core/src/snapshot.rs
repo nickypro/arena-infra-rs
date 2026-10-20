@@ -1650,18 +1650,26 @@ mod tests {
             tensor: BTreeMap::new(),
             ..one()
         };
+        // nvidia-smi failing beside a CUDA that fails too: with torch proving the GPUs work it
+        // is no FAIL at all (health's MIG fallback), so nothing to remember.
+        let smi_down = |smi: &str, smi_gpus: Option<u32>| DeepFacts {
+            smi: Some(smi.into()),
+            gpus: vec![],
+            smi_gpus,
+            ..cuda_fail("error: RuntimeError: CUDA unknown error")
+        };
         // (what, facts, policy, remembered?)
         let cases: Vec<(&str, DeepFacts, &crate::health::HealthPolicy, bool)> = vec![
             ("CUDA unknown error, GPU listed", cuda_fail("error: RuntimeError: CUDA unknown error"), &default, true),
             ("cuInit 999", cuda_fail("error: RuntimeError: Unexpected error from cudaGetDeviceCount(). Error 999: unknown error"), &default, true),
-            ("nvidia-smi error", DeepFacts { smi: Some("error: Unable to determine the device handle for GPU0000:01:00.0: Unknown Error".into()), gpus: vec![], smi_gpus: None, ..one() }, &default, true),
-            ("nvidia-smi lists no GPU", DeepFacts { gpus: vec![], smi_gpus: Some(0), ..one() }, &default, true),
+            ("nvidia-smi error", smi_down("error: Unable to determine the device handle for GPU0000:01:00.0: Unknown Error", None), &default, true),
+            ("nvidia-smi lists no GPU", smi_down("ok", Some(0)), &default, true),
             ("count mismatch", DeepFacts { device_count: Some(1), tensor: [(0, "ok".to_string())].into(), ..two() }, &default, true),
             ("wrong result", DeepFacts { tensor: [(0, "wrong result: matmul is not finite".to_string())].into(), ..one() }, &default, true),
             ("tensor CUDA error", DeepFacts { tensor: [(0, "error: RuntimeError: CUDA error: an illegal memory access was encountered".to_string())].into(), ..one() }, &default, true),
             ("peer garbage", DeepFacts { peer: [("0-1".to_string(), "mismatch".to_string()), ("1-0".to_string(), "ok".to_string())].into(), ..two() }, &default, true),
             // Never:
-            ("nvidia-smi timed out", DeepFacts { smi: Some("error: nvidia-smi timed out after 10s".into()), gpus: vec![], smi_gpus: None, ..one() }, &default, false),
+            ("nvidia-smi timed out", smi_down("error: nvidia-smi timed out after 10s", None), &default, false),
             ("python timed out", DeepFacts { py_exit: Some(124), py_done: false, torch: None, torch_version: None, torch_cuda: None, cuda_available: None, device_count: None, tensor: BTreeMap::new(), nccl: None, ..one() }, &default, false),
             ("python OOM-killed", DeepFacts { py_exit: Some(137), py_done: false, torch: None, torch_version: None, torch_cuda: None, cuda_available: None, device_count: None, tensor: BTreeMap::new(), nccl: None, ..one() }, &default, false),
             ("python crashed mid-way", DeepFacts { py_exit: Some(139), py_done: false, tensor: BTreeMap::new(), nccl: None, ..one() }, &default, false),
@@ -1679,6 +1687,11 @@ mod tests {
             }
             assert_eq!(bad_host_record(&p, &h, NOW).is_some(), remembered, "{what}: {:#?}", h.checks);
         }
+        // nvidia-smi failing while torch proves the GPUs work: a WARN (a PASS on a MIG slice),
+        // never remembered.
+        let smi_error_torch_ok = DeepFacts { smi: Some("error: Failed to initialize NVML: Unknown Error".into()), gpus: vec![], smi_gpus: None, ..one() };
+        let h = crate::health::PodHealth::checked(&p, smi_error_torch_ok, &default);
+        assert_eq!((h.status, bad_host_record(&p, &h, NOW).is_some()), (Status::Warn, false), "{:#?}", h.checks);
     }
 
     /// Review G1: a later complete check that doesn't FAIL clears its machine's record — on
@@ -1803,7 +1816,8 @@ mod tests {
             py_exit: Some(124),
             ..Default::default()
         });
-        // nvidia-smi took longer than its 10 s bound (no persistence mode, a busy host).
+        // nvidia-smi took longer than its 10 s bound (no persistence mode, a busy host), and the
+        // GPU's tensor op said nothing either (python timed out after `import torch`).
         let smi_timeout = DeepFacts {
             started: true,
             complete: true,
@@ -1814,16 +1828,19 @@ mod tests {
             torch_version: Some("2.9.0".into()),
             cuda_available: Some(true),
             device_count: Some(1),
-            tensor: [(0, "ok".to_string())].into_iter().collect(),
-            py_exit: Some(0),
-            py_done: true,
+            py_exit: Some(124),
             ..Default::default()
         };
-        for (what, facts) in [("nvidia-smi timed out", smi_timeout), ("python timed out", py_timeout)] {
+        for (what, facts) in [("nvidia-smi timed out", smi_timeout.clone()), ("python timed out", py_timeout)] {
             let h = PodHealth::checked(&runpod, facts, &policy);
             assert_eq!((h.status, h.failure_kind()), (Status::Fail, Some(FailureKind::Host)), "{what}: {:#?}", h.checks);
             assert_eq!(bad_host_record(&runpod, &h, NOW), None, "{what}: a timeout is remembered for 72 h: {:#?}", h.checks);
         }
+        // With the tensor op reporting `ok`, torch proves the GPU works: nvidia-smi's timeout is
+        // a WARN, not a FAIL (health's MIG fallback) — so certainly not remembered.
+        let proven = DeepFacts { tensor: [(0, "ok".to_string())].into_iter().collect(), py_exit: Some(0), py_done: true, ..smi_timeout };
+        let h = PodHealth::checked(&runpod, proven, &policy);
+        assert_eq!((h.status, bad_host_record(&runpod, &h, NOW)), (Status::Warn, None), "{:#?}", h.checks);
     }
 
     /// Remembered for [`BAD_HOST_TTL_SECS`], then forgotten — and a record from the future
