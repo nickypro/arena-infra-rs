@@ -643,13 +643,18 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     `refs/remotes/upstream/main` has too — and only then: most runs fetch nothing — the backup
     fetches the course repo's own `main` (`ARENA_UPSTREAM_REPO`, default
     `ARENA-education/ARENA_materials`, from `https://github.com/<owner>/<name>.git`: no
-    credentials, `timeout 60`, the participant's FETCH_HEAD untouched) into the pod's
+    credentials, `timeout 60`, no submodules, no global or system git config, the participant's
+    FETCH_HEAD put back as it was, a ref lock an earlier killed fetch left removed) into the pod's
     `refs/arena/course-main`, leaves out of the scan and the rewrite only the commits that ref
     has, and scans again. The trust boundary: that ref, which only this fetch writes, is the one
     proof; `upstream`'s refs and URLs prove nothing (review ai-review codex #1, FIX6 — a
     participant's fork fetched as `upstream/main`, then `upstream` repointed at the course, left
     their own key-bearing commit trusted), so a fork's commit, or one on any other `upstream/*`
-    ref, is scanned and redacted like the rest, and a dead push URL (`no_push`) changes nothing. A
+    ref, is scanned and redacted like the rest, and a dead push URL (`no_push`) changes nothing.
+    Nor can the pod's git config steer the fetch (review ai-review claude #3): when a
+    `url.<base>.insteadOf` in the repo's config rewrites the course URL (`git ls-remote
+    --get-url`) — to a fork, whose commits would all be exempt, or to ssh — the course isn't
+    asked: nothing exempt, and the pod's line says its git config rewrites the course URL. A
     fetch that fails (GitHub unreachable, a timeout, a private course repo) holds that run's push
     (review ai-review claude #2): nothing rewritten and nothing pushed — a redacted copy of the
     course's own commits would break their ancestry for good, every later `git pull upstream
