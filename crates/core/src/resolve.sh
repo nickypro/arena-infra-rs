@@ -230,9 +230,9 @@ json_ok() {
 # `unfit` says the first that can't go in, in words: a blob over <max file bytes> (GitHub refuses
 # the push, and every later backup is stuck), a gitlink new to HEAD (a nested repo's commit id,
 # none of its files: the backup takes those back out of the index), or a notebook that isn't one
-# JSON document (or can't be checked). Nothing: all fit. It leaves
-# the staged changes in $T.st, one per line: `<HEAD's mode> <mode> <blob> <status> <whose><TAB><path>`
-# — <whose> `theirs` when it's staged as the other side has it (mode and blob), else `yours`.
+# JSON document (or can't be checked). Nothing: all fit. It leaves the staged changes in $T.st,
+# one per line: `<HEAD's mode> <mode> <blob> <status> <whose><TAB><path>` — <whose> `theirs` when
+# it's staged as the other side has it (mode and blob), else `yours`.
 unfit() {
     git diff-index --cached --no-renames -z HEAD -- > "$T.sz" || { echo "the staged changes couldn't be listed"; return; }
     if [ "$(tr -d -c '\n' < "$T.sz" | wc -c)" -ne 0 ]; then echo "a staged path has a newline in its name"; return; fi
