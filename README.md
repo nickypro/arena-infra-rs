@@ -939,10 +939,13 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     copy in `.git`): the switch's exit trap puts the keys back, then removes it (a KILL runs no
     trap), and says what it was saving — stopped mid-copy, what and how big, and the same move
     out of the way as below (claude #6). And what `untracked/` would hold is totalled first (`du -sk`): over `DISCARD_MAX_GB`
-    (default 1: the save runs within the switch's 100 s — review ai-review claude #6; `config check`
-    shows it; settable from the environment for one `--hard`, even when the file lacks it) or over half what's free on that disk (`df`), nothing of it is copied and the pod
+    (in GiB, binary as `du` counts — a fraction too, `0.5`; every size said in GiB/MiB/KiB;
+    default 1: the save runs within the switch's 100 s — review ai-review claude #6; `config check`
+    shows it; settable from the environment for one run, `DISCARD_MAX_GB=0.5 arena pods
+    set-branch main <pod> --hard`, even when the file lacks it, and `config check` says it came
+    from there) or over half what's free on that disk (`df`), nothing of it is copied and the pod
     isn't reset — `arena set-branch: not reset — the --hard reset would remove checkpoints (31.2
-    GB), which is more than DISCARD_MAX_GB allows (1.0 GB) to save first: move it out of the
+    GiB), which is more than DISCARD_MAX_GB allows (1.0 GiB) to save first: move it out of the
     checkout (cd '/root/ARENA_materials' && mv -nT -- 'checkpoints'
     '../checkpoints.kept-20261020T071500Z'), or delete it, then switch again` — every word quoted
     (a `'` in a path pastes as it is), the kept copy under a name of its own, never over an earlier

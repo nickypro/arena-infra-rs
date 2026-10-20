@@ -5431,11 +5431,16 @@ fn config_report(cfg: &Config, provider_name: &str) -> (String, Vec<String>) {
     }
     // The most `set-branch --hard` saves on a pod before its reset (review ai-review claude #6: a
     // bad value used to surface only when `--hard` ran, and stops it there before anything else).
+    // A value the environment gave (for one run) is said so, as the file doesn't have it.
     match arena_core::backup::discard_max_kb(cfg) {
         Ok(kb) => println!(
             "  · --hard save max per pod    {}{} (DISCARD_MAX_GB)",
             arena_core::backup::discard_max_words(kb),
-            if cfg.get("DISCARD_MAX_GB").is_some_and(|v| !v.trim().is_empty()) { "" } else { " (default)" }
+            match cfg.get("DISCARD_MAX_GB").filter(|v| !v.trim().is_empty()) {
+                None => " (default)",
+                Some(v) if cfg.file_value("DISCARD_MAX_GB") != Some(v) => " (from the environment)",
+                Some(_) => "",
+            }
         ),
         Err(e) => {
             println!("  ✗ --hard save max per pod    {e}");
@@ -17710,12 +17715,16 @@ mod tests {
             ]
         );
         let (_, missing) = config_report(&Config::parse(&format!("{base}DISCARD_MAX_GB=lots\n")), "runpod");
-        assert_eq!(missing, ["DISCARD_MAX_GB (must be a number of GB above 0, like 5 or 0.5)"]);
-        // The save limit is shown, its default said so.
+        assert_eq!(missing, ["DISCARD_MAX_GB (must be a number of GiB above 0, a fraction too, like 1 or 0.5)"]);
+        // The save limit is shown, in binary units labelled so, its default said so.
         for (extra, row) in [
-            ("", "  · --hard save max per pod    1.0 GB (default) (DISCARD_MAX_GB)"),
-            ("DISCARD_MAX_GB=0.5\n", "  · --hard save max per pod    512 MB (DISCARD_MAX_GB)"),
-            ("DISCARD_MAX_GB=lots\n", "  ✗ --hard save max per pod    DISCARD_MAX_GB must be a number of GB above 0, like 5 or 0.5 (got `lots`)"),
+            ("", "  · --hard save max per pod    1.0 GiB (default) (DISCARD_MAX_GB)"),
+            ("DISCARD_MAX_GB=0.5\n", "  · --hard save max per pod    512 MiB (DISCARD_MAX_GB)"),
+            ("DISCARD_MAX_GB=0.05\n", "  · --hard save max per pod    51 MiB (DISCARD_MAX_GB)"),
+            (
+                "DISCARD_MAX_GB=lots\n",
+                "  ✗ --hard save max per pod    DISCARD_MAX_GB must be a number of GiB above 0, a fraction too, like 1 or 0.5 (got `lots`)",
+            ),
         ] {
             let (report, _) = config_report(&Config::parse(&format!("{base}{extra}")), "runpod");
             assert!(report.lines().any(|l| l == row), "{extra:?}:\n{report}");
@@ -17739,13 +17748,19 @@ mod tests {
         let cfg = Config::parse_with_env(base, env("0.001"));
         assert_eq!(env_keys(&cfg, |k| env("0.001")(k).is_some()), (vec!["DISCARD_MAX_GB"], vec!["REAP_ENABLED"]));
         let (report, missing) = config_report(&cfg, "runpod");
-        assert!(report.lines().any(|l| l == "  · --hard save max per pod    1 MB (DISCARD_MAX_GB)"), "{report}");
+        assert!(report.lines().any(|l| l == "  · --hard save max per pod    1 MiB (from the environment) (DISCARD_MAX_GB)"), "{report}");
         assert!(missing.is_empty(), "{missing:?}");
         let (report, missing) = config_report(&Config::parse_with_env(base, env("lots")), "runpod");
-        assert!(report.contains("\n  ✗ --hard save max per pod    DISCARD_MAX_GB must be a number of GB above 0"), "{report}");
-        assert_eq!(missing, ["DISCARD_MAX_GB (must be a number of GB above 0, like 5 or 0.5)"]);
+        assert!(report.contains("\n  ✗ --hard save max per pod    DISCARD_MAX_GB must be a number of GiB above 0"), "{report}");
+        assert_eq!(missing, ["DISCARD_MAX_GB (must be a number of GiB above 0, a fraction too, like 1 or 0.5)"]);
         let cfg = Config::parse_with_env(&format!("{base}DISCARD_MAX_GB=2\n"), |_| None);
         assert_eq!(env_keys(&cfg, |_| false), (vec![], vec![]));
+        // The file's value, then the environment's over it (Live 7): said where it came from.
+        let (report, _) = config_report(&cfg, "runpod");
+        assert!(report.lines().any(|l| l == "  · --hard save max per pod    2.0 GiB (DISCARD_MAX_GB)"), "{report}");
+        let cfg = Config::parse_with_env(&format!("{base}DISCARD_MAX_GB=2\n"), env("0.5"));
+        let (report, _) = config_report(&cfg, "runpod");
+        assert!(report.lines().any(|l| l == "  · --hard save max per pod    512 MiB (from the environment) (DISCARD_MAX_GB)"), "{report}");
     }
 
     /// Merge of wave 7 reaper ("✗ means fail"): switched on (REAP_ENABLED=1), every ✗ row in the
@@ -23349,7 +23364,7 @@ mod remote_tests {
         assert_eq!(execs(&fake, 22001), [backup.clone(), hard]);
         let fake = Arc::new(FakeRemote::new());
         let err = handle_set_branch(fake.clone(), &cfg("DISCARD_MAX_GB=lots\n"), "main", &apple, true, false, true, &stub.path()).await.unwrap_err();
-        assert_eq!(err.to_string(), "DISCARD_MAX_GB must be a number of GB above 0, like 5 or 0.5 (got `lots`)");
+        assert_eq!(err.to_string(), "DISCARD_MAX_GB must be a number of GiB above 0, a fraction too, like 1 or 0.5 (got `lots`)");
         assert!(execs(&fake, 22001).is_empty(), "nothing backed up or switched");
         fake.script(&host(22001), pushed());
         handle_set_branch(fake.clone(), &cfg("DISCARD_MAX_GB=lots\n"), "main", &apple, false, false, true, &stub.path()).await.unwrap();

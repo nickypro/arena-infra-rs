@@ -256,9 +256,10 @@ ds_quote() {
     printf "'%s'" "${ds_qw%.}"
 }
 
-# `ds_size <KiB>`: in words, GB to one decimal.
+# `ds_size <KiB>`: in words — binary units, labelled so (Live 7: a binary count said `MB`), GiB to
+# one decimal, else whole MiB, else KiB: as arena_core::backup::discard_max_words, `config check`'s.
 ds_size() {
-    awk -v k="$1" 'BEGIN { if (k >= 1048576) printf "%.1f GB", k / 1048576; else if (k >= 1024) printf "%d MB", k / 1024; else printf "%d KB", k }'
+    awk -v k="$1" 'BEGIN { if (k >= 1048576) printf "%.1f GiB", k / 1048576; else if (k >= 1024) printf "%d MiB", k / 1024; else printf "%d KiB", k }'
 }
 
 # `ds_copy <list> <dir>`: each path listed (one per line, relative to the repo's top) copied into

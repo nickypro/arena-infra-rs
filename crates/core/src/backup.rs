@@ -1204,26 +1204,28 @@ pub fn checkout_command_limited(repo_path: &str, branch: &str, git_ssh_key: Opti
 /// it often didn't, and each try was stopped the same way.
 pub const DISCARD_MAX_GB: u64 = 1;
 
-/// [`checkout_command_limited`]'s limit, in KiB: config `DISCARD_MAX_GB` (GB, a positive number:
-/// `5`, `0.5`, `40`), else [`DISCARD_MAX_GB`]. `Err` names the key and the value it can't read —
-/// `config check` shows both ([`discard_max_words`]).
+/// [`checkout_command_limited`]'s limit, in KiB: config `DISCARD_MAX_GB` (in GiB — the `GB` of its
+/// name is binary, as the save's `du -sk` counts — a positive number, a fraction too: `1`, `0.5`,
+/// `40`), else [`DISCARD_MAX_GB`]. `Err` names the key and the value it can't read — `config
+/// check` shows both ([`discard_max_words`]).
 pub fn discard_max_kb(cfg: &Config) -> std::result::Result<u64, String> {
     match cfg.get("DISCARD_MAX_GB").map(str::trim).filter(|v| !v.is_empty()) {
         None => Ok(DISCARD_MAX_GB * 1024 * 1024),
         Some(raw) => match raw.parse::<f64>() {
             Ok(gb) if gb.is_finite() && gb > 0.0 && gb <= 1_000_000.0 => Ok(((gb * 1024.0 * 1024.0).round() as u64).max(1)),
-            _ => Err(format!("DISCARD_MAX_GB must be a number of GB above 0, like 5 or 0.5 (got `{raw}`)")),
+            _ => Err(format!("DISCARD_MAX_GB must be a number of GiB above 0, a fraction too, like 1 or 0.5 (got `{raw}`)")),
         },
     }
 }
 
-/// A `--hard` save's limit ([`discard_max_kb`]) in words, as the save's own line says sizes
-/// (`discarded.sh`'s `ds_size`): GB to one decimal, else whole MB, else KB.
+/// A `--hard` save's limit ([`discard_max_kb`]) in words, the same words the save's own lines give
+/// a size (`discarded.sh`'s `ds_size`): binary units, labelled so — GiB to one decimal, else whole
+/// MiB, else KiB (Live 7: `0.05` showed as `51 MB`, a binary count under a decimal label).
 pub fn discard_max_words(kb: u64) -> String {
     match kb {
-        k if k >= 1024 * 1024 => format!("{:.1} GB", k as f64 / (1024.0 * 1024.0)),
-        k if k >= 1024 => format!("{} MB", k / 1024),
-        k => format!("{k} KB"),
+        k if k >= 1024 * 1024 => format!("{:.1} GiB", k as f64 / (1024.0 * 1024.0)),
+        k if k >= 1024 => format!("{} MiB", k / 1024),
+        k => format!("{k} KiB"),
     }
 }
 
@@ -3233,21 +3235,43 @@ done
         shells
     }
 
-    /// `DISCARD_MAX_GB`: GB, a positive number, else 1 (review ai-review claude #6: 5 GB didn't fit
-    /// in the switch's 100 s) — in KiB, as the save's `du -sk` counts; in words as its line says
-    /// sizes.
+    /// `DISCARD_MAX_GB`: GiB, a positive number, a fraction too, else 1 (review ai-review claude #6:
+    /// 5 GB didn't fit in the switch's 100 s) — in KiB, as the save's `du -sk` counts; in words as
+    /// its lines say sizes, binary and labelled so (Live 7: `0.05` showed as `51 MB`): the very same
+    /// words from the shell's `ds_size` (the refusal's and the stopped save's lines) and from
+    /// `config check`'s row, for the same KiB. A bad value's message leads with the default, 1, and a
+    /// fraction.
     #[test]
     fn the_discard_limit_is_the_configs_gb_else_one() {
         assert_eq!((DISCARD_MAX_GB, KB_DEFAULT), (1, 1024 * 1024));
-        for (text, want) in [("", KB_DEFAULT), ("DISCARD_MAX_GB= \n", KB_DEFAULT), ("DISCARD_MAX_GB=20\n", 20 * 1024 * 1024), ("DISCARD_MAX_GB=0.5\n", 512 * 1024)] {
+        for (text, want) in [
+            ("", KB_DEFAULT),
+            ("DISCARD_MAX_GB= \n", KB_DEFAULT),
+            ("DISCARD_MAX_GB=20\n", 20 * 1024 * 1024),
+            ("DISCARD_MAX_GB=0.5\n", 512 * 1024),
+            ("DISCARD_MAX_GB=0.05\n", 52_429),
+        ] {
             assert_eq!(discard_max_kb(&Config::parse(text)), Ok(want), "{text:?}");
         }
-        for (kb, words) in [(KB_DEFAULT, "1.0 GB"), (20 * 1024 * 1024, "20.0 GB"), (512 * 1024, "512 MB"), (1049, "1 MB"), (100, "100 KB")] {
-            assert_eq!(discard_max_words(kb), words, "{kb}");
+        let sizes: [(u64, &str); 7] = [
+            (KB_DEFAULT, "1.0 GiB"),
+            (20 * 1024 * 1024, "20.0 GiB"),
+            (3 * 512 * 1024, "1.5 GiB"),
+            (512 * 1024, "512 MiB"),
+            (52_429, "51 MiB"),
+            (1049, "1 MiB"),
+            (100, "100 KiB"),
+        ];
+        let script = format!("{}\nfor k; do ds_size \"$k\"; echo; done", discarded_sh());
+        let o = std::process::Command::new("sh").arg("-c").arg(&script).arg("sh").args(sizes.iter().map(|(k, _)| k.to_string())).output().unwrap();
+        let shell: Vec<String> = String::from_utf8_lossy(&o.stdout).lines().map(String::from).collect();
+        for (i, (kb, words)) in sizes.iter().enumerate() {
+            assert_eq!(discard_max_words(*kb), *words, "{kb}");
+            assert_eq!(shell.get(i).map(String::as_str), Some(*words), "ds_size {kb}");
         }
         for bad in ["0", "-1", "lots", "5GB", "inf", "NaN"] {
             let err = discard_max_kb(&Config::parse(&format!("DISCARD_MAX_GB={bad}\n"))).unwrap_err();
-            assert!(err.starts_with("DISCARD_MAX_GB must be a number of GB above 0") && err.contains(&format!("`{bad}`")), "{err}");
+            assert_eq!(err, format!("DISCARD_MAX_GB must be a number of GiB above 0, a fraction too, like 1 or 0.5 (got `{bad}`)"));
         }
     }
 
@@ -5542,7 +5566,7 @@ done
         // ai-review claude #6), before the bound's own line.
         let line = err.lines().find(|l| l.starts_with("arena set-branch: stopped while copying checkpoints (")).unwrap_or_else(|| panic!("{err}"));
         assert!(
-            line.contains(" KB) into the save, before the --hard reset — the partial save removed, not reset: move it out of the checkout (cd "),
+            line.contains(" KiB) into the save, before the --hard reset — the partial save removed, not reset: move it out of the checkout (cd "),
             "{line}"
         );
         suggested_move(line, repo, "checkpoints");
@@ -5569,9 +5593,9 @@ done
         let (code, out, err) = run_on_path(&checkout_command_limited(repo, "main", None, true, 100), &plain);
         assert_ne!(code, Some(0), "{out}");
         let line = err.lines().find(|l| l.starts_with("arena set-branch: not reset — the --hard reset would remove checkpoints (")).unwrap_or_else(|| panic!("{err}"));
-        assert!(line.contains(" KB), which is more than DISCARD_MAX_GB allows (100 KB) to save first: move it out of the checkout"), "{line}");
+        assert!(line.contains(" KiB), which is more than DISCARD_MAX_GB allows (100 KiB) to save first: move it out of the checkout"), "{line}");
         untouched("over DISCARD_MAX_GB");
-        // Over half what's free on its disk (a `df` that says 300 KB): refused the same way.
+        // Over half what's free on its disk (a `df` that says 300 KiB): refused the same way.
         let full = stand_in(
             "bin-full",
             "df",
@@ -5579,7 +5603,7 @@ done
         );
         let (code, out, err) = run_on_path(&checkout_command(repo, "main", None, true), &full);
         assert_ne!(code, Some(0), "{out}");
-        assert!(err.contains("which is more than half the 300 KB free on its disk to save first") && !err.contains("DISCARD_MAX_GB"), "{err}");
+        assert!(err.contains("which is more than half the 300 KiB free on its disk to save first") && !err.contains("DISCARD_MAX_GB"), "{err}");
         untouched("over half the free space");
         // What the line says moves it out of the way, and the switch then goes through.
         let (fix, kept) = suggested_move(line, repo, "checkpoints");
