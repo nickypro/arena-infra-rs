@@ -694,8 +694,10 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     tick: a read-only look at the pod first (under its lock) says whether anything changed, and
     it is copied only when no copy since the operation started is recorded — or the recorded copy
     is gone from this machine (its `.git` no longer there), or isn't under `LOCAL_BACKUP_DIR` as
-    it is now —, when its work tree changed since the last recorded copy (every file git lists:
-    mtime, size, ctime and path, so a `cp -p`/`rsync -a` replacement that keeps the old mtime and
+    it is now (compared as real paths: the record holds the copy's own, every link resolved, so a
+    dir spelled through a link or relative to the working directory is the same dir) —, when its
+    work tree changed since the last recorded copy (every file git lists: mtime, size, ctime and
+    path, so a `cp -p`/`rsync -a` replacement that keeps the old mtime and
     size counts too), or when that copy is an hour old; else its line says so (`✗ <pod>: not
     backed up to git (…) — copied at 14:02 UTC to <dir>/w2d1/<pod>, unchanged since`). So a
     course push that leaves many pods conflicted can't make one cron tick outlast the next (whose
@@ -732,34 +734,50 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     - one whose markers are still there but which isn't what the merge left — git's conflicted
       output made again from its stages (`git merge-file` with the file's own labels and marker
       size, `--diff3`/`--zdiff3` for base sections; else the merge's own way, `checkout
-      --conflict` into a scratch tree, labels aside; with no labels to read, a file changed more
-      than 2 minutes after the operation started) — leaves the whole operation BUSY: `⊘ <pod>: not
-      finished automatically — you started resolving x.py by hand — finish it (and git add it) or
-      abort, on the pod`;
+      --conflict` into a scratch tree, labels aside) — leaves the whole operation BUSY: `⊘ <pod>:
+      not finished automatically — you started resolving x.py by hand — finish it (and git add it)
+      or abort, on the pod`; so does one that can't be compared (a marker line or its label deleted,
+      or a binary side: `can't tell whether you started resolving x.py by hand …`), however soon
+      after the operation it was written;
     - else it takes the side whose last change to that path is the more recent (`git log -1
       --format=%ct <side> -- <path>`, HEAD against `MERGE_HEAD`/`CHERRY_PICK_HEAD` or the stash
       entry; a tie keeps HEAD's; a path renamed on one side counts from that side's own commit):
       a text file per hunk (`git merge-file --ours|--theirs`: that side of each conflict, the
       clean changes of both sides kept — so a course fix elsewhere in the file is never recorded
       as merged and dropped), a binary file, a symlink or a modify/delete whole, a path that side
-      deleted removed.
+      deleted removed. A notebook (`*.ipynb`) merged per hunk must still parse as JSON (python3's
+      json, else jq): one side's conflict beside the other side's clean hunk can leave a bracket
+      or a comma wrong, and Jupyter wouldn't open it — then, or with neither on the pod, it is
+      taken whole from that side, and the message and the line say why. A notebook resolved by
+      hand that doesn't parse leaves it BUSY (`x.ipynb isn't valid JSON: …`).
     A file over 95 MB anywhere in that, or conflict markers the participant already staged
-    (`git add` of a file still in conflict), leaves it BUSY, said. The state before is kept first
-    in `.git/arena-resolved/<UTC stamp>/` on the pod — the conflicted files as they were, git's
-    own `MERGE_HEAD`/`MERGE_MSG`/`CHERRY_PICK_HEAD`/`ORIG_HEAD`, the old HEAD, the index with its
-    conflicts, and a README that says how to see it or do it again — which no later copy
-    overwrites (the day's snapshot is updated by every pull that day). Right before anything
+    (`git add` of a file still in conflict), leaves it BUSY, said. A merge's or a cherry-pick's
+    commit takes the whole index, so every path staged against HEAD counts, not only the
+    conflicted ones — a file resolved or added and `git add`ed before: a blob over 95 MB or a
+    nested repo staged as a gitlink leaves it BUSY too (`model.pt is staged at … bytes, over
+    git's …-byte limit: never committed — unstage it, or abort, on the pod`). The state before is
+    kept first in `.git/arena-resolved/<UTC stamp>/` on the pod — the conflicted files as they
+    were, git's own `MERGE_HEAD`/`MERGE_MSG`/`CHERRY_PICK_HEAD`/`ORIG_HEAD`, the old HEAD, the
+    index with its conflicts, and a README that says how to see it or do it again — which no
+    later copy overwrites (the day's snapshot is updated by every pull that day). Right before anything
     changes, the state is read again (the operation and its commit, HEAD, the conflicts, the
-    index's mtime and size, every file, no index lock): any difference — the participant aborted
-    the merge, started a rebase, staged a file — and nothing is touched. Each staged file goes
-    through the backup's key redaction (the redacted blob is committed, the file on disk keeps
-    its key). Right before the commit the operation, HEAD and the index lock are checked once
-    more. A merge becomes a real merge commit, a cherry-pick is `--continue`d (one left empty is
-    committed empty, as git advises), a stash pop's conflicts are added (its stash entry stays) —
-    in the repo's own identity, never `-c user.*` — the message saying, per path, which side won
-    and both sides' last change to it, UTC to the minute (`- README.md: the merged branch won
-    (its side of each conflict; the other changes of both sides kept) — last changed: yours
-    (HEAD) 2026-10-19 09:12Z, the merged branch (MERGE_HEAD) 2026-10-20 13:05Z`), then where the
+    index's mtime and size, every file, no index lock), and every condition of quiet asked again
+    (a terminal used, a login typing, a git command running — someone back at a terminal,
+    typing into a buffer not saved yet, touches no file): any difference — the participant
+    aborted the merge, started a rebase, staged a file, used a terminal — and nothing is touched.
+    For a merge or a cherry-pick, every staged regular file that is neither HEAD's version nor
+    the other side's — what the participant made: resolved by hand (now, or added before), merged
+    per hunk, added mid-merge — goes through the backup's key redaction (the redacted blob is
+    committed, the file on disk keeps its key); the course's or the picked commit's own content
+    goes in as it was published. (A stash pop's conflicts make no commit there: the backup after
+    redacts what it commits.) Right before the commit the operation, HEAD and the index lock are
+    checked once more, and every staged path's size and kind again. A merge becomes a real merge
+    commit, a cherry-pick is `--continue`d (one left empty is committed empty, as git advises), a
+    stash pop's conflicts are added (its stash entry stays) — in the repo's own identity, never
+    `-c user.*` — the message saying, per path, which side won and both sides' last change to it,
+    UTC to the minute (`- README.md: the merged branch won (its side of each conflict; the other
+    changes of both sides kept) — last changed: yours (HEAD) 2026-10-19 09:12Z, the merged branch
+    (MERGE_HEAD) 2026-10-20 13:05Z`), then where the
     state before is and today's copy. The resolve looks again first and touches nothing if
     anything changed since the look its copy followed (`⊘ <pod>: not finished automatically —
     changed: files changed since the copy`). Then the pod is backed up again in the same run, as
@@ -773,7 +791,12 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     participant's), nor anything unusual — conflicts not from the newest stash entry, a submodule
     in conflict, a merge of several branches, no git identity in the repo: those stay BUSY. The
     TUI's backup and the reaper's git step copy nothing first, so they don't finish one; the next
-    cron backup does, and the reaper's retry then finds the pod backed up. Nothing tells the
+    cron backup does, and the reaper's retry then finds the pod backed up. The resolve runs under
+    `sh` on the pod, whatever its login shell, bounded there by `timeout` (270 s, then a KILL
+    10 s later — under arena's own 5-minute timeout, which kills only the local ssh client), so
+    it has ended before arena reports a timeout and lets go of the pod's lock; stopped so, its
+    line says it may have stopped part-way. A HUP, INT, TERM or broken pipe removes its
+    temporary files from the git dir; a KILL doesn't. Nothing tells the
     participant but the commit and the folder (the reaper's `~/.arena/NOTICE` is its own).
   - `pods set-branch <branch> <targets|--all> [--hard] [--init-branches]` — switch pods'
     ARENA checkout to a branch. Gentle by default (fetch origin + checkout + fast-forward to
