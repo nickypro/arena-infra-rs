@@ -2844,15 +2844,15 @@ async fn w7_b_h3b_what_the_post_backup_look_sees_counts() {
 /// Live W7 B-RS2: the reap tier left out all of `~/.cache` (and more), while the commit, the
 /// checklist and the participant notice promised otherwise. Decision: only what can be
 /// downloaded or installed again, plus secrets — the rest of `~/.cache` is kept. Through the
-/// real rsync with the reap's own filter; and code, notice and README say the same thing.
+/// real rsync with the reap's own filter; and code, notice and docs/BACKUPS.md say the same thing.
 #[test]
 fn w7_rs2_the_reap_tier_keeps_what_nobody_can_download_again() {
     use arena_core::pull::{PullConfig, REAP_NOT_KEPT_SUMMARY};
-    // The notice and the README carry the one wording.
+    // The notice and docs/BACKUPS.md (the reaper's section) carry the one wording.
     let pol = PodPolicy::new(&rp("devtest-alpha", "pa", 22001), None, Some(8 * 3600), T0, "set", None);
     assert!(render::notice_text("devtest-alpha", &pol, 0).contains(REAP_NOT_KEPT_SUMMARY));
     let squash = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(squash(include_str!("../../../../README.md")).contains(&squash(REAP_NOT_KEPT_SUMMARY)), "the README says otherwise");
+    assert!(squash(include_str!("../../../../docs/BACKUPS.md")).contains(&squash(REAP_NOT_KEPT_SUMMARY)), "docs/BACKUPS.md says otherwise");
     if std::process::Command::new("rsync").arg("--version").output().is_err() {
         eprintln!("rsync not installed — skipping the copy");
         return;
