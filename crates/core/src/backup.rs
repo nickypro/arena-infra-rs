@@ -1352,7 +1352,7 @@ fn shell_quote(s: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The default limit of a `--hard` save, in KiB ([`DISCARD_MAX_GB`]).
@@ -3401,9 +3401,9 @@ done
     }
 
     /// The login shells a remote command is tried under here: bash, and zsh (the pods') and fish
-    /// when installed — said when one isn't.
+    /// when installed — said when one isn't. Also the dashboard probe's (`metrics`' tests).
     #[cfg(unix)]
-    fn login_shells() -> Vec<&'static str> {
+    pub(crate) fn login_shells() -> Vec<&'static str> {
         let has = |sh: &str| std::process::Command::new(sh).args(["-c", "true"]).output().is_ok_and(|o| o.status.success());
         let shells: Vec<&str> = ["bash", "zsh", "fish"].into_iter().filter(|sh| has(sh)).collect();
         for sh in ["zsh", "fish"].into_iter().filter(|sh| !shells.contains(sh)) {

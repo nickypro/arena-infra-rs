@@ -34,14 +34,19 @@ pub const PROC_SENTINEL: &str = "@@ARENA_PROC@@";
 /// - `ro_git ARGS…`: `git --no-optional-locks` (no index refresh written, no `index.lock`), with
 ///   `core.fsmonitor=` (no fsmonitor hook or daemon: an *empty* value is off in every git —
 ///   `false` would be run as a hook path by git < 2.36), `core.untrackedCache=false`,
-///   `log.showSignature=false` (a signed commit would run `gpg.program`), and `$ro_filters`.
-///   `-c` reaches git's own children too (`stash list`'s `git log`). With `$ro_timeout` set, under
-///   `timeout` where the pod has it.
-/// - `ro_setup` (in the repo): `$ro_filters` empties every filter driver the config defines —
-///   no clean/smudge/process, not required: git hashes a racily-clean file's content even in
-///   plumbing, and that would run its clean filter. A driver a `.gitattributes` names but no
-///   config defines runs nothing anyway. Fails (nothing to compare with) when the config can't
-///   be read or a driver's name couldn't be passed back as one `-c` word.
+///   `log.showSignature=false` (a signed commit would run `gpg.program`), and four `-c` words
+///   per driver `ro_setup` found. `-c` reaches git's own children too (`stash list`'s `git log`).
+///   With `$ro_timeout` set, under `timeout` where the pod has it. The words are built with
+///   `set --`, never as an unquoted `$var`: the dashboard's probe runs in the pod user's login
+///   shell — zsh on the pods — which doesn't split one, so git got all of them as one argument,
+///   refused it, and every repo with a filter driver (git-lfs puts `filter.lfs.*` in the global
+///   config) read `dirty` unknown (review ai-review claude #8). sh, bash and zsh read it alike.
+/// - `ro_setup` (in the repo): `$ro_drivers` (each name then a space) is every filter driver the
+///   config defines, for `ro_git` to empty — no clean/smudge/process, not required: git hashes a
+///   racily-clean file's content even in plumbing, and that would run its clean filter. A driver
+///   a `.gitattributes` names but no config defines runs nothing anyway. Fails (nothing to
+///   compare with) when the config can't be read or a driver's name has anything but
+///   `[A-Za-z0-9._-]` in it (a space would end it in that list).
 /// - `ro_changes`: `git status --porcelain`'s `XY path` lines, from plumbing that never reads a
 ///   file's contents unless racily clean (then without filters): `diff-index --cached` (X),
 ///   `diff-files` without refreshing (Y; submodules ignored — their `git status` would run their
@@ -49,21 +54,31 @@ pub const PROC_SENTINEL: &str = "@@ARENA_PROC@@";
 ///   overcount: a file only touched (its stat changed, its content not) reads as modified until
 ///   git refreshes the index — fine for a count. Fails when any of them does.
 pub const RO_GIT_SH: &str = r#"ro_git() {
+    ro_n=$#
+    ro_r=${ro_drivers:-}
+    while [ -n "$ro_r" ]; do
+        ro_d=${ro_r%% *}
+        ro_r=${ro_r#* }
+        set -- "$@" -c "filter.$ro_d.clean=" -c "filter.$ro_d.smudge=" -c "filter.$ro_d.process=" -c "filter.$ro_d.required=false"
+    done
+    while [ "$ro_n" -gt 0 ]; do
+        set -- "$@" "$1"
+        shift
+        ro_n=$((ro_n - 1))
+    done
     if [ -n "${ro_timeout:-}" ] && command -v timeout >/dev/null 2>&1; then
-        set -- timeout "$ro_timeout" git --no-optional-locks -c core.fsmonitor= -c core.untrackedCache=false -c log.showSignature=false $ro_filters "$@"
+        set -- timeout "$ro_timeout" git --no-optional-locks -c core.fsmonitor= -c core.untrackedCache=false -c log.showSignature=false "$@"
     else
-        set -- command git --no-optional-locks -c core.fsmonitor= -c core.untrackedCache=false -c log.showSignature=false $ro_filters "$@"
+        set -- command git --no-optional-locks -c core.fsmonitor= -c core.untrackedCache=false -c log.showSignature=false "$@"
     fi
     "$@"
 }
 ro_setup() {
-    ro_filters=
+    ro_drivers=
     ro_k=$(command git -c core.fsmonitor= config --name-only --get-regexp '^filter[.]' 2>/dev/null)
     case $? in 0 | 1) ;; *) return 1 ;; esac
     if printf '%s\n' "$ro_k" | LC_ALL=C grep -q '[^A-Za-z0-9._-]'; then return 1; fi
-    for ro_d in $(printf '%s\n' "$ro_k" | sed -e 's/^filter[.]//' -e 's/[.][^.]*$//' | sort -u); do
-        ro_filters="$ro_filters -c filter.$ro_d.clean= -c filter.$ro_d.smudge= -c filter.$ro_d.process= -c filter.$ro_d.required=false"
-    done
+    ro_drivers=$(printf '%s\n' "$ro_k" | sed -e '/^$/d' -e 's/^filter[.]//' -e 's/[.][^.]*$//' | sort -u | tr '\n' ' ')
 }
 ro_changes() {
     ro_base=HEAD
@@ -182,8 +197,12 @@ pub struct PodMetrics {
     /// In this workflow a commit *is* a backup (`pods backup` commits + pushes), so this
     /// is "when the pod was last backed up".
     pub last_commit: Option<i64>,
-    /// Number of uncommitted entries in the working tree (`git status --porcelain`), if
-    /// reported — i.e. work done since the last backup. `Some(0)` means a clean tree.
+    /// Number of uncommitted entries in the working tree (`git status --porcelain`'s, from
+    /// `ro_changes`), if reported — i.e. work done since the last backup. For the dashboard's
+    /// eyes only: a file only touched counts until git refreshes the index, and a submodule's
+    /// own edits never count (`--ignore-submodules=all`), so `Some(0)` is "nothing the
+    /// checkout's git sees", never "nothing to lose" — no reset, replace or terminate goes by it
+    /// (each reads the pod itself first).
     pub dirty_files: Option<u32>,
     /// Commits the local branch is **ahead** of its upstream (`origin/<branch>`) — i.e.
     /// committed but not pushed (a blocked/failed push, e.g. GitHub secret-scanning,
@@ -294,7 +313,8 @@ fn remote_command(opts: &ProbeOpts) -> String {
         ));
         // Last commit time (= last backup, since `pods backup` commits + pushes) and how
         // many entries are uncommitted (work since that backup; 0 = clean tree — a file only
-        // touched counts until git refreshes the index: see `ro_changes`).
+        // touched counts until git refreshes the index, a submodule's edits never: see
+        // `ro_changes` and `PodMetrics::dirty_files`).
         s.push_str(&format!(
             "echo \"committed=$(cd {q} 2>/dev/null && ro_git log -1 --format=%ct 2>/dev/null)\"; "
         ));
@@ -710,5 +730,85 @@ mod tests {
         // which would otherwise exit 127 as the chain's last command) isn't reported as a
         // wholly-failed probe — see remote_command's trailing `true`.
         assert!(cmd.trim_end().ends_with("true"));
+    }
+
+    /// Review ai-review claude #8: the dashboard's probe runs in the pod user's login shell — zsh
+    /// on the pods — which doesn't split an unquoted `$var`. `ro_git`'s filter-emptying `-c` words
+    /// went to git as one argument, git refused it, and in any repo with a filter driver configured
+    /// (`git lfs install` puts `filter.lfs.*` in the global config) `dirty` read unknown. Under sh,
+    /// bash and zsh (fish runs none of this probe: its functions are POSIX), with git-lfs's global
+    /// config: `dirty` is the right count, and the filter never ran — though an unchanged lfs file
+    /// is racily clean, so plain plumbing hashes it through the filter (the fixture is armed).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dirty_counts_right_under_each_login_shell_with_a_global_lfs_filter() {
+        use std::process::Command;
+        let have = |t: &str| Command::new("sh").arg("-c").arg(format!("command -v {t}")).output().is_ok_and(|o| o.status.success());
+        if !["git", "touch"].iter().all(|t| have(t)) {
+            eprintln!("git/touch missing — skipping");
+            return;
+        }
+        let t = crate::ask::ai::tests::Tmp::new("lfs-dirty");
+        let (home, marks) = (t.0.join("home"), t.0.join("marks"));
+        let repo = home.join("ARENA_materials");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&marks).unwrap();
+        // Git as the pod's: this home's global config, no system one.
+        let isolated = |c: &mut Command| {
+            c.env("HOME", &home).env("GIT_CONFIG_NOSYSTEM", "1").env_remove("GIT_CONFIG_GLOBAL").env_remove("XDG_CONFIG_HOME");
+        };
+        let git = |args: &[&str]| {
+            let mut c = Command::new("git");
+            c.args(["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "init.defaultBranch=main"]).args(args).current_dir(&repo);
+            isolated(&mut c);
+            c.output().unwrap()
+        };
+        let ok = |args: &[&str]| {
+            let o = git(args);
+            assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        };
+        ok(&["init", "-q"]);
+        std::fs::write(repo.join(".gitattributes"), "*.bin filter=lfs diff=lfs merge=lfs -text\n").unwrap();
+        for f in ["model.bin", "data.bin", "train.py"] {
+            std::fs::write(repo.join(f), format!("{f} v1\n")).unwrap();
+        }
+        ok(&["add", "."]);
+        ok(&["commit", "-q", "-m", "first"]);
+        std::fs::write(repo.join("train.py"), "train.py v2\n").unwrap();
+        ok(&["add", "train.py"]);
+        // git-lfs's global config, its helper a stand-in that says it ran.
+        let lfs = t.0.join("git-lfs");
+        crate::remote::write_test_script(&lfs, format!("#!/bin/sh\necho \"$*\" >> {}/lfs\n[ \"$1\" = filter-process ] && exit 1\ncat\n", marks.display()))
+            .unwrap();
+        let l = lfs.display();
+        std::fs::write(
+            home.join(".gitconfig"),
+            format!("[filter \"lfs\"]\n\tclean = {l} clean -- %f\n\tsmudge = {l} smudge -- %f\n\tprocess = {l} filter-process\n\trequired = true\n"),
+        )
+        .unwrap();
+        // Work: train.py staged, model.bin (lfs) modified, a new file — 3 entries; data.bin as
+        // committed, every index entry racily clean.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(repo.join("model.bin"), "model.bin v2\n").unwrap();
+        std::fs::write(repo.join("scratch.txt"), "s\n").unwrap();
+        assert!(Command::new("touch").args(["-d", "@978307200"]).arg(repo.join(".git/index")).status().unwrap().success());
+        let index = std::fs::read(repo.join(".git/index")).unwrap();
+        let fired = || std::fs::read_to_string(marks.join("lfs")).unwrap_or_default();
+
+        let opts = ProbeOpts { repo_path: Some(repo.display().to_string()), ..Default::default() };
+        let shells: Vec<&str> = std::iter::once("sh").chain(crate::backup::tests::login_shells().into_iter().filter(|s| *s != "fish")).collect();
+        for shell in shells {
+            let mut c = Command::new(shell);
+            c.arg("-c").arg(remote_command(&opts)).current_dir(&home);
+            isolated(&mut c);
+            let o = c.output().unwrap();
+            let m = parse_probe_output(&String::from_utf8_lossy(&o.stdout));
+            assert_eq!((m.branch.as_deref(), m.dirty_files), (Some("main"), Some(3)), "{shell}: {}", String::from_utf8_lossy(&o.stderr));
+            assert_eq!(fired(), "", "{shell}: the probe ran the lfs filter");
+            assert_eq!(std::fs::read(repo.join(".git/index")).unwrap(), index, "{shell}: the index was written");
+        }
+        // Armed: plain plumbing, on the same repo, runs it.
+        git(&["-c", "core.fsmonitor=", "diff-files"]);
+        assert!(fired().contains("filter-process"), "{}", fired());
     }
 }
