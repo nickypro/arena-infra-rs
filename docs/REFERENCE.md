@@ -1644,7 +1644,10 @@ prompt — exactly what [`arena pods ask`](#pods-ask) does: a one-line question,
 default and saying where the data goes (`ctrl-u` clears it); Enter asks **in the background** like
 `d` (the footer says `asking claude about devtest-alpha…`), and the answer opens in its own
 scrollable popup when it lands (Esc closes it; a modal open meanwhile keeps it waiting). Saved like
-`pods ask`'s. With `ASK_AI=off` it opens nothing and the footer says how to turn it on.
+`pods ask`'s. With `ASK_AI=off` it opens nothing and the footer says how to turn it on. A marked set
+keeps to this cohort's pods, as `pods ask --all` does: a staff box or another cohort's pod marked
+along is left out (the input names it, the footer says how many); to ask about one, put the cursor
+on it with nothing marked.
 
 ### SSH time budgets
 

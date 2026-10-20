@@ -5076,6 +5076,63 @@ deep_check_end=1
         assert!(!ask::key(&mut ui, &shared, KeyCode::Char('r'), none));
     }
 
+    /// Review ai-review claude #9: `?` on a marked set keeps to this cohort, as `pods ask` does
+    /// when no pod is named: a non-cohort pod marked along is left out of the question — the
+    /// input names it, the footer says how many — and a set of only such pods asks nothing; the
+    /// cursor pod alone is asked about whatever it is.
+    #[tokio::test]
+    async fn question_mark_keeps_a_marked_set_to_the_cohort() {
+        use arena_core::ask::Ai;
+        let c = cfg("");
+        let mut pods = fixture_pods();
+        let mut staff = pod("x", "runpod", "rp9", 9, Some(22009));
+        staff.name = "jamesbox".into();
+        pods.push(staff);
+        let snap = dashboard_snapshot(&pods, &[], None, &HealthCache::new(), &Naming::from_config(&c), NOW);
+        let mut fleet = Shared::default();
+        fleet.publish(snap);
+        let shared = Arc::new(Mutex::new(fleet));
+        let asked: Asked = Arc::default();
+        let mut ui = ui(c, Arc::new(FakeRemote::new()));
+        ui.asker = fake_asker(asked.clone());
+        let none = KeyModifiers::NONE;
+        let key_of = |name: &str| mark_key(shared.lock().unwrap().pods.iter().find(|p| p.name == name).unwrap());
+        let answered = || async {
+            for _ in 0..400 {
+                if shared.lock().unwrap().ask_answer.take().is_some() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            panic!("no answer landed");
+        };
+
+        ui.marked = [key_of("jamesbox"), key_of("devtest-alpha")].into_iter().collect();
+        assert!(ask::key(&mut ui, &shared, KeyCode::Char('?'), none));
+        assert!(matches!(&ui.mode, Mode::Ask { scope: InputScope::Set(Scope::Marked), value, .. } if value.starts_with("What is the current state of this pod?")), "{:?}", ui.mode);
+        let text = draw(160, 40, &shared.lock().unwrap(), &ui).join("\n");
+        assert!(text.contains("ask claude about alpha — 1 non-cohort pod left out: jamesbox"), "{text}");
+        ask::key(&mut ui, &shared, KeyCode::Enter, none);
+        assert_eq!(shared.lock().unwrap().ask_running.as_deref(), Some("asking claude about devtest-alpha (1 non-cohort pod left out)…"));
+        answered().await;
+        assert_eq!(asked.lock().unwrap().last().cloned(), Some((vec!["devtest-alpha".to_string()], "What is the current state of this pod? Is anything wrong or needing attention?".to_string(), Ai::Claude)));
+
+        // Only non-cohort pods marked: nothing opens, and the footer says why.
+        ui.marked = [key_of("jamesbox")].into_iter().collect();
+        ask::key(&mut ui, &shared, KeyCode::Char('?'), none);
+        assert!(matches!(ui.mode, Mode::List), "{:?}", ui.mode);
+        let notice = shared.lock().unwrap().notice.clone().unwrap();
+        assert!(notice.error && notice.text.contains("none of the marked pods is this cohort's (jamesbox)"), "{}", notice.text);
+
+        // The cursor on it, nothing marked: asked about, as a named pod.
+        ui.marked.clear();
+        ui.selected = shared.lock().unwrap().pods.iter().position(|p| p.name == "jamesbox").unwrap();
+        ask::key(&mut ui, &shared, KeyCode::Char('?'), none);
+        ask::key(&mut ui, &shared, KeyCode::Enter, none);
+        answered().await;
+        assert_eq!(asked.lock().unwrap().last().map(|(n, _, _)| n.clone()), Some(vec!["jamesbox".to_string()]));
+    }
+
     /// Review ai-review claude #4: a question whose task panics — here the asker itself, as a
     /// poisoned lock would — doesn't leave `?` refusing ("one question at a time") until the
     /// dashboard restarts: the footer's `asking …` clears, and `?` opens the question again.

@@ -2,6 +2,10 @@
 //! in one prompt — what `arena pods ask` does (`arena_core::ask`: the same bundles, masking,
 //! prompt, no-tools run and saved runs).
 //!
+//! A marked set keeps to this cohort's pods, as `pods ask` does when no pod is named: a staff
+//! box or another cohort's pod marked along is left out, and the input and the footer say how
+//! many; the cursor pod alone is asked about whatever it is (chosen, as a named pod is).
+//!
 //! `?` opens a one-line question, prefilled with the default; Enter asks **in the background**,
 //! like `d`: the dashboard stays live, the footer says `asking claude about devtest-alpha…`, and
 //! the answer opens in its own scrollable popup when it lands (on the list or detail view — a
@@ -15,12 +19,13 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use arena_core::ask::{self, Ai};
 use arena_core::remote::Remote;
+use arena_core::selector::Naming;
 use arena_core::{Config, Pod};
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
-use super::{centered_rect, marked_pods, scope_names, scope_pods, scroll_by, InputScope, Mode, Scope, Shared, Ui};
+use super::{centered_rect, marked_pods, scroll_by, InputScope, Mode, Scope, Shared, Ui};
 
 /// An answer to show: the popup's title and its text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,9 +92,25 @@ async fn ask_now(remote: &Arc<dyn Remote>, cfg: &Config, pods: &[Pod], question:
     Answer { title, text }
 }
 
-/// `?` on the list or detail view: the question input for the marked set (when pods are
-/// marked) or the cursor pod, prefilled with the default question. Opens nothing — saying why
-/// in the footer — while another question is out, or with `ASK_AI` off or malformed.
+/// The marked pods a question may be about — this cohort's only ([`Naming::is_cohort`]), as
+/// `pods ask` narrows a selection that names no pod (review ai-review claude #9: a staff box or
+/// another cohort's pod marked from the dashboard was read and sent along) — and the shown names
+/// of the marked pods that leaves out.
+fn cohort_marked(shared: &Shared, ui: &Ui) -> (Vec<Pod>, Vec<String>) {
+    let naming = Naming::from_config(&ui.cfg);
+    let (kept, out): (Vec<&Pod>, Vec<&Pod>) = marked_pods(&shared.pods, &ui.marked).into_iter().partition(|p| naming.is_cohort(&p.name));
+    (kept.into_iter().cloned().collect(), out.into_iter().map(|p| ui.shown_name(&p.name)).collect())
+}
+
+/// `N non-cohort pod(s) left out` — for the input and the footer.
+fn left_out(n: usize) -> String {
+    format!("{n} non-cohort pod{} left out", if n == 1 { "" } else { "s" })
+}
+
+/// `?` on the list or detail view: the question input for the marked set's cohort pods (when
+/// pods are marked) or the cursor pod, prefilled with the default question. Opens nothing —
+/// saying why in the footer — while another question is out, with `ASK_AI` off or malformed, or
+/// when no marked pod is this cohort's.
 fn open(ui: &mut Ui, shared: &mut Shared) {
     if let Some(running) = &shared.ask_running {
         let why = format!("still {running} — one question at a time");
@@ -107,12 +128,18 @@ fn open(ui: &mut Ui, shared: &mut Shared) {
         let Some(p) = shared.pods.get(ui.selected) else { return };
         (InputScope::Pod { name: p.name.clone(), id: p.id.clone() }, 1)
     } else {
-        match marked_pods(&shared.pods, &ui.marked).len() {
-            0 => {
+        let (pods, out) = cohort_marked(shared, ui);
+        match (pods.len(), out.as_slice()) {
+            (0, []) => {
                 shared.notify("✗ none of the marked pods is listed now — refresh, or mark again", true);
                 return;
             }
-            n => (InputScope::Set(Scope::Marked), n),
+            (0, out) => {
+                let why = format!("✗ none of the marked pods is this cohort's ({}) — put the cursor on one to ask about it alone", out.join(", "));
+                shared.notify(why, true);
+                return;
+            }
+            (n, _) => (InputScope::Set(Scope::Marked), n),
         }
     };
     ui.mode = Mode::Ask { scope, value: ask::default_question(n), ai };
@@ -129,10 +156,11 @@ impl Drop for Running {
     }
 }
 
-/// Ask in the background: the footer says so (`asking claude about …`) until the answer lands
-/// in [`Shared::ask_answer`].
-fn start(shared: &Arc<Mutex<Shared>>, ui: &Ui, pods: Vec<Pod>, question: String, ai: Ai) {
-    shared.lock().unwrap().ask_running = Some(format!("asking {} about {}…", ai.name(), about(&pods)));
+/// Ask in the background: the footer says so (`asking claude about …`, and how many marked pods
+/// were left out, `left`) until the answer lands in [`Shared::ask_answer`].
+fn start(shared: &Arc<Mutex<Shared>>, ui: &Ui, pods: Vec<Pod>, left: usize, question: String, ai: Ai) {
+    let out = if left > 0 { format!(" ({})", left_out(left)) } else { String::new() };
+    shared.lock().unwrap().ask_running = Some(format!("asking {} about {}{out}…", ai.name(), about(&pods)));
     let (shared, asker) = (shared.clone(), ui.asker.clone());
     tokio::spawn(async move {
         let running = Running(shared.clone());
@@ -154,16 +182,19 @@ pub(crate) fn key(ui: &mut Ui, shared: &Arc<Mutex<Shared>>, code: KeyCode, mods:
             match code {
                 KeyCode::Esc => ui.mode = Mode::List,
                 KeyCode::Enter if !value.trim().is_empty() => {
-                    let pods: Vec<Pod> = match &scope {
+                    let (pods, left): (Vec<Pod>, usize) = match &scope {
                         InputScope::Pod { name, id } => {
-                            shared.lock().unwrap().pods.iter().filter(|p| p.id == *id && p.name == *name).take(1).cloned().collect()
+                            (shared.lock().unwrap().pods.iter().filter(|p| p.id == *id && p.name == *name).take(1).cloned().collect(), 0)
                         }
-                        InputScope::Set(sc) => scope_pods(shared, &ui.marked, *sc),
+                        InputScope::Set(_) => {
+                            let (pods, out) = cohort_marked(&shared.lock().unwrap(), ui);
+                            (pods, out.len())
+                        }
                     };
                     if pods.is_empty() {
                         shared.lock().unwrap().notify("✗ the pod isn't listed any more — refresh", true);
                     } else {
-                        start(shared, ui, pods, value.trim().to_string(), ai);
+                        start(shared, ui, pods, left, value.trim().to_string(), ai);
                     }
                     ui.mode = Mode::List;
                 }
@@ -219,15 +250,21 @@ pub(crate) fn land(ui: &mut Ui, shared: &Arc<Mutex<Shared>>) {
 
 /// The question input: who it's about, where the data goes, the question as typed.
 pub(crate) fn render_input(f: &mut Frame, shared: &Shared, ui: &Ui, scope: &InputScope, value: &str, ai: Ai) {
-    let names = match scope {
-        InputScope::Pod { name, .. } => vec![ui.shown_name(name)],
-        InputScope::Set(sc) => scope_names(shared, ui, *sc),
+    let (names, out) = match scope {
+        InputScope::Pod { name, .. } => (vec![ui.shown_name(name)], Vec::new()),
+        InputScope::Set(_) => {
+            let (pods, out) = cohort_marked(shared, ui);
+            (pods.iter().map(|p| ui.shown_name(&p.name)).collect(), out)
+        }
     };
-    let who = match names.as_slice() {
+    let mut who = match names.as_slice() {
         [one] => one.clone(),
         many if many.len() <= 6 => many.join(", "),
         many => format!("{} … and {} more", many[..6].join(", "), many.len() - 6),
     };
+    if !out.is_empty() {
+        who.push_str(&format!(" — {}: {} (put the cursor on one to ask about it alone)", left_out(out.len()), out.join(", ")));
+    }
     let text = format!(
         "ask {} about {who}\n\nEach pod is read once (read-only); its state — listing, GPU, disks, logins, the busiest \
          processes' arguments, the repo's changed file names, the newest job's last lines, keys and tokens masked — goes \
