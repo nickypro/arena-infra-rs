@@ -30,7 +30,9 @@
 //! foreground group, so an operator's Ctrl-C would no longer reach them — they'd outlive
 //! the CLI.) Stopping the client closes the connection; the remote side then dies on its
 //! next write to the closed channel, and our provisioning commands are idempotent, so a
-//! re-run is safe either way.
+//! re-run is safe either way. The one exception is [`run_local_input`]'s child (`pods ask`'s
+//! claude/codex): it gets a session of its own, so no controlling terminal, and its whole group
+//! is what is stopped (its caller stops it on Ctrl-C).
 
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
@@ -185,11 +187,23 @@ pub struct LocalRun<'a> {
 /// error here. Same budget and SIGTERM-then-SIGKILL stop as [`run_local`]. The child gets
 /// `run.env` and nothing else (the AI CLIs run on the fleet's control box, whose environment can
 /// hold the operator's provider keys).
+///
+/// It runs in a session of its own (`setsid`; review ai-review claude #4): no controlling
+/// terminal, so a CLI that opens `/dev/tty` — a login prompt, an update notice — can neither
+/// draw on the dashboard's raw-mode screen nor read the operator's keys; and its process group is
+/// what is stopped — SIGTERM, SIGKILL after [`TERM_GRACE`] — whatever it started. Ctrl-C no longer
+/// reaches it from the terminal: its caller stops it by dropping the call (`pods ask` does on
+/// Ctrl-C). Once it has exited, what it left in its group is sent SIGTERM.
 pub async fn run_local_input(run: &LocalRun<'_>, what: &str, timeout: Option<Duration>) -> Result<SshOutput> {
     let mut c = Command::new(run.program);
     c.args(run.args).current_dir(run.cwd).stdin(Stdio::piped()).kill_on_drop(true);
     c.env_clear().envs(run.env.iter().map(|(k, v)| (k, v)));
-    output_feeding(c, Some(run.input.to_vec()), what, timeout).await
+    #[cfg(unix)]
+    // SAFETY: `setsid` is async-signal-safe, the only call between fork and exec here.
+    unsafe {
+        c.pre_exec(|| if libc::setsid() == -1 { Err(std::io::Error::last_os_error()) } else { Ok(()) });
+    }
+    output_feeding(c, Some(run.input.to_vec()), what, timeout, true).await
 }
 
 /// A child process that can't wedge on a prompt (stdin closed) and dies with its future
@@ -210,11 +224,13 @@ pub const TERM_GRACE: Duration = Duration::from_secs(2);
 /// is stopped *before* this returns ([`Stopper::stop`]); if this future is dropped instead,
 /// [`Stopper`]'s `Drop` does it in the background.
 async fn output_within(cmd: Command, what: &str, timeout: Option<Duration>) -> Result<SshOutput> {
-    output_feeding(cmd, None, what, timeout).await
+    output_feeding(cmd, None, what, timeout, false).await
 }
 
 /// [`output_within`], writing `input` to the child's stdin (piped by the caller) meanwhile.
-async fn output_feeding(mut cmd: Command, input: Option<Vec<u8>>, what: &str, timeout: Option<Duration>) -> Result<SshOutput> {
+/// `group`: the child leads a process group of its own (a session: [`run_local_input`]), and
+/// the whole group is what is stopped ([`Stopper`]).
+async fn output_feeding(mut cmd: Command, input: Option<Vec<u8>>, what: &str, timeout: Option<Duration>, group: bool) -> Result<SshOutput> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut spawned = cmd.spawn().map_err(|e| Error::provider(format!("spawning {what}: {e}")))?;
     let stdin = spawned.stdin.take();
@@ -225,7 +241,7 @@ async fn output_feeding(mut cmd: Command, input: Option<Vec<u8>>, what: &str, ti
             let _ = pipe.shutdown().await;
         }
     };
-    let mut child = Stopper(Some(spawned));
+    let mut child = Stopper::new(spawned, group);
     let result = within(what, timeout, async {
         let ((), out) = tokio::join!(feed, child.output(what));
         out
@@ -253,23 +269,49 @@ async fn output_feeding(mut cmd: Command, input: Option<Vec<u8>>, what: &str, ti
 /// `Drop` is the backstop for a caller that abandons the call (drops the future), where
 /// nothing can be awaited. Holding the `Child` — rather than handing it to
 /// `wait_with_output`, whose drop SIGKILLs at once — is what makes SIGTERM-first possible.
-struct Stopper(Option<Child>);
+/// `group`: the child leads its own process group ([`run_local_input`]), signalled whole —
+/// TERM, then KILL whether or not the leader is gone (what it started may linger) — and,
+/// once the leader has exited by itself, what is left of the group gets a TERM. A process
+/// group's id isn't given to a new process while anything is left in it, so after its leader
+/// is reaped the signal reaches only what the leader left (or, with nothing left, no one).
+struct Stopper {
+    child: Option<Child>,
+    /// The child's process group, when it leads one of its own: its pid.
+    group: Option<u32>,
+}
 
 impl Stopper {
+    fn new(child: Child, group: bool) -> Stopper {
+        let group = if group { child.id() } else { None };
+        Stopper { child: Some(child), group }
+    }
+
     /// Wait for exit while draining stdout/stderr (concurrently, so a chatty child can't
     /// block on a full pipe).
     async fn output(&mut self, what: &str) -> Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
-        let child = self.0.as_mut().expect("the child is only taken when stopping");
+        let child = self.child.as_mut().expect("the child is only taken when stopping");
         let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
         tokio::try_join!(child.wait(), read_all(stdout), read_all(stderr))
             .map_err(|e| Error::provider(format!("waiting for {what}: {e}")))
     }
 
     /// Stop the child and wait until it is gone: SIGTERM, up to [`TERM_GRACE`] for it to
-    /// exit (rsync/scp take their ssh transport down meanwhile), then SIGKILL and reap.
-    /// Awaited, so when it returns the stop is over — whatever the caller does next.
+    /// exit (rsync/scp take their ssh transport down meanwhile), then SIGKILL and reap — its
+    /// whole group, for a group's leader. Awaited, so when it returns the stop is over —
+    /// whatever the caller does next.
     async fn stop(&mut self) {
-        let Some(mut child) = self.0.take() else { return };
+        let Some(mut child) = self.child.take() else { return };
+        if let Some(group) = self.group.take() {
+            // The whole group, its leader gone or not: what it started can hold the output
+            // pipes open after it exits (the wait that timed out was for them too).
+            signal_group(group, Signal::Term);
+            if child.id().is_some() {
+                let _ = tokio::time::timeout(TERM_GRACE, child.wait()).await;
+            }
+            signal_group(group, Signal::Kill);
+            let _ = child.kill().await;
+            return;
+        }
         // Already reaped (it finished as the clock ran out): nothing to stop, and the pid
         // may belong to another process by now — never signal it.
         let Some(pid) = child.id() else { return };
@@ -283,11 +325,30 @@ impl Stopper {
 
 impl Drop for Stopper {
     fn drop(&mut self) {
-        let Some(mut child) = self.0.take() else { return };
+        let group = self.group.take();
+        let Some(mut child) = self.child.take() else {
+            // It exited by itself (or was stopped, which took the group): what it left in its
+            // group — a process group id isn't reused while any of it is left — gets a TERM.
+            if let Some(group) = group {
+                signal_group(group, Signal::Term);
+            }
+            return;
+        };
         // `id()` is `None` once the child has been reaped (it finished normally): nothing
         // to stop — and its pid may already belong to another process, so never signal it.
-        let Some(pid) = child.id() else { return };
-        terminate(pid);
+        let Some(pid) = child.id() else {
+            if let Some(group) = group {
+                signal_group(group, Signal::Term);
+            }
+            return;
+        };
+        match group {
+            Some(group) => signal_group(group, Signal::Term),
+            None => terminate(pid),
+        }
+        // The group's KILL comes after the grace — or at once if that wait is cancelled (the
+        // runtime shut down): the guard's drop sends it either way.
+        let killer = group.map(GroupKiller);
         match tokio::runtime::Handle::try_current() {
             // Let it exit on SIGTERM (scp first takes its ssh transport down); if it is
             // still running after the grace, dropping `child` SIGKILLs it. Best effort: a
@@ -296,13 +357,53 @@ impl Drop for Stopper {
             Ok(rt) => {
                 rt.spawn(async move {
                     let _ = tokio::time::timeout(TERM_GRACE, child.wait()).await;
+                    drop(killer);
                 });
             }
-            // No runtime to wait on: SIGKILL now, via `kill_on_drop`.
-            Err(_) => drop(child),
+            // No runtime to wait on: SIGKILL now, via `kill_on_drop` (and the guard).
+            Err(_) => {
+                drop(killer);
+                drop(child);
+            }
         }
     }
 }
+
+/// SIGKILLs a process group when dropped — after the grace, or when the wait for it is
+/// cancelled.
+struct GroupKiller(u32);
+
+impl Drop for GroupKiller {
+    fn drop(&mut self) {
+        signal_group(self.0, Signal::Kill);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Signal {
+    Term,
+    Kill,
+}
+
+/// Signal the whole process group `group` (its leader's pid): every process still in it.
+#[cfg(unix)]
+fn signal_group(group: u32, sig: Signal) {
+    let sig = match sig {
+        Signal::Term => libc::SIGTERM,
+        Signal::Kill => libc::SIGKILL,
+    };
+    if let Ok(group) = libc::pid_t::try_from(group) {
+        if group > 1 {
+            // SAFETY: a plain kill(2) of a process group our own child leads; no memory is involved.
+            unsafe {
+                libc::kill(-group, sig);
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_group(_group: u32, _sig: Signal) {}
 
 /// SIGTERM `pid` (a child we have not reaped, so the pid can't have been reused).
 #[cfg(unix)]
@@ -774,6 +875,70 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// [`run_local_input`]'s child (`pods ask`'s claude/codex; review ai-review claude #4) leads a
+    /// session of its own: no controlling terminal (`tty_nr` 0, and `/dev/tty` can't be opened —
+    /// with a terminal or without), not this process's session. And its whole group is stopped:
+    /// on a timeout, when the call is dropped (the dashboard closing, Ctrl-C), and what it left
+    /// behind once it exited by itself — a process it started is never left running.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_ai_child_has_no_terminal_and_its_whole_group_is_stopped() {
+        let dir = scratch("ai-child");
+        let script = |name: &str, body: &str| {
+            let p = dir.join(name);
+            write_test_script(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            p
+        };
+        let run_it = |program: std::path::PathBuf, timeout: Option<Duration>| {
+            let dir = dir.clone();
+            async move {
+                let run = LocalRun { program: &program, args: &[], cwd: &dir, env: &[(std::ffi::OsString::from("PATH"), std::ffi::OsString::from("/usr/bin:/bin"))], input: b"" };
+                run_local_input(&run, "the AI", timeout).await
+            }
+        };
+        // Its session and terminal, as the kernel has them.
+        let looks = script(
+            "looks",
+            "read -r line < /proc/self/stat\nset -- ${line##*) }\necho \"$$ $3 $4 $5\"\n\
+             if (exec 3<>/dev/tty) 2>/dev/null; then echo tty; else echo notty; fi",
+        );
+        let out = run_it(looks, Some(Duration::from_secs(10))).await.unwrap();
+        let words: Vec<&str> = out.stdout.split_whitespace().collect();
+        let (pid, pgrp, session, tty) = (words[0], words[1], words[2], words[3]);
+        assert_eq!((pgrp, session, tty, words[4]), (pid, pid, "0", "notty"), "{}", out.stdout);
+        let ours = std::fs::read_to_string("/proc/self/stat").unwrap();
+        let ours: Vec<&str> = ours.rsplit(')').next().unwrap().split_whitespace().collect();
+        assert_ne!(session, ours[3], "in this process's session");
+
+        // A process it started, and itself, both waiting: the timeout stops the group.
+        let (leader, left) = (dir.join("leader.pid"), dir.join("left.pid"));
+        let hang = script("hang", &format!("sleep 60 & echo $! > '{}'\necho $$ > '{}'\nexec sleep 60", left.display(), leader.display()));
+        let err = run_it(hang.clone(), Some(Duration::from_millis(500))).await.unwrap_err();
+        assert!(matches!(err, Error::Timeout { .. }), "{err}");
+        let pid_of = |p: &std::path::Path| std::fs::read_to_string(p).unwrap().trim().to_string();
+        assert_dies(&pid_of(&leader), Duration::from_secs(5), "the AI").await;
+        assert_dies(&pid_of(&left), Duration::from_secs(5), "what the AI started").await;
+
+        // The call dropped mid-run: the same, from `Drop`.
+        let _ = std::fs::remove_file(&leader);
+        let task = tokio::spawn(run_it(hang, None));
+        while !leader.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        task.abort();
+        let _ = task.await;
+        assert_dies(&pid_of(&leader), Duration::from_secs(5), "the dropped AI").await;
+        assert_dies(&pid_of(&left), Duration::from_secs(5), "what the dropped AI started").await;
+
+        // It answered and exited, leaving a process behind (its pipes let go): that goes too.
+        let leaves = script("leaves", &format!("sleep 60 > /dev/null 2>&1 < /dev/null & echo $! > '{}'\necho answered", left.display()));
+        let out = run_it(leaves, Some(Duration::from_secs(10))).await.unwrap();
+        assert_eq!(out.stdout, "answered\n");
+        assert_dies(&pid_of(&left), Duration::from_secs(5), "what the finished AI left").await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The finding behind SIGTERM-first: scp runs its ssh transport as a child, and a

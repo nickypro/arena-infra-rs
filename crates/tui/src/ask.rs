@@ -11,7 +11,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use arena_core::ask::{self, Ai};
 use arena_core::remote::Remote;
@@ -118,16 +118,27 @@ fn open(ui: &mut Ui, shared: &mut Shared) {
     ui.mode = Mode::Ask { scope, value: ask::default_question(n), ai };
 }
 
+/// Clears [`Shared::ask_running`] when dropped — however the question's task ends, a panic or
+/// the runtime closing included — so `?` is never refused for good ("one question at a time";
+/// review ai-review claude #4). A poisoned lock is taken all the same.
+struct Running(Arc<Mutex<Shared>>);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).ask_running = None;
+    }
+}
+
 /// Ask in the background: the footer says so (`asking claude about …`) until the answer lands
 /// in [`Shared::ask_answer`].
 fn start(shared: &Arc<Mutex<Shared>>, ui: &Ui, pods: Vec<Pod>, question: String, ai: Ai) {
     shared.lock().unwrap().ask_running = Some(format!("asking {} about {}…", ai.name(), about(&pods)));
     let (shared, asker) = (shared.clone(), ui.asker.clone());
     tokio::spawn(async move {
+        let running = Running(shared.clone());
         let answer = asker(pods, question, ai).await;
-        let mut s = shared.lock().unwrap();
-        s.ask_running = None;
-        s.ask_answer = Some(answer);
+        shared.lock().unwrap_or_else(PoisonError::into_inner).ask_answer = Some(answer);
+        drop(running);
     });
 }
 

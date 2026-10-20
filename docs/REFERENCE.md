@@ -1315,8 +1315,10 @@ and then, run again with the ask's own overrides (and an empty `CODEX_HOME`, as 
 finds one missing or a feature on it doesn't know refuses the ask (`codex: couldn't confirm its
 tools are off — not asked (…)`, naming it). The prompt goes on stdin (never argv), in an empty
 private temporary directory, with a minimal environment (`PATH`, `HOME`, the locale, XDG and proxy
-variables, and the AI's own config dir and API key — not the rest of yours); `--timeout` (default
-300 s) stops it. A missing binary is an error naming the other one.
+variables, and the AI's own config dir and API key — not the rest of yours), and in a session of its
+own: no controlling terminal, so it can't draw on the dashboard or read your keys through
+`/dev/tty`. `--timeout` (default 300 s), Ctrl-C, or closing the dashboard stops it and everything it
+started. A missing binary is an error naming the other one.
 
 #### Where answers are saved
 

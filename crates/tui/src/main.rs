@@ -5075,6 +5075,36 @@ deep_check_end=1
         assert!(!ask::key(&mut ui, &shared, KeyCode::Char('r'), none));
     }
 
+    /// Review ai-review claude #4: a question whose task panics — here the asker itself, as a
+    /// poisoned lock would — doesn't leave `?` refusing ("one question at a time") until the
+    /// dashboard restarts: the footer's `asking …` clears, and `?` opens the question again.
+    #[tokio::test]
+    async fn a_question_whose_task_panics_frees_question_mark() {
+        let shared = Arc::new(Mutex::new(fixture_shared()));
+        let mut ui = ui(cfg(""), Arc::new(FakeRemote::new()));
+        ui.asker = Arc::new(|_pods: Vec<Pod>, _question: String, _ai: arena_core::ask::Ai| -> std::pin::Pin<Box<dyn std::future::Future<Output = ask::Answer> + Send>> {
+            Box::pin(async {
+                tokio::task::yield_now().await;
+                let nothing: Option<ask::Answer> = std::hint::black_box(None);
+                nothing.expect("the asker panicked (a test)")
+            })
+        });
+        let none = KeyModifiers::NONE;
+        ask::key(&mut ui, &shared, KeyCode::Char('?'), none);
+        ask::key(&mut ui, &shared, KeyCode::Enter, none);
+        assert!(shared.lock().unwrap().ask_running.is_some(), "asked");
+        for _ in 0..400 {
+            if shared.lock().unwrap().ask_running.is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(shared.lock().unwrap().ask_running, None, "the panic left `?` refusing");
+        assert!(shared.lock().unwrap().ask_answer.is_none());
+        assert!(ask::key(&mut ui, &shared, KeyCode::Char('?'), none));
+        assert!(matches!(ui.mode, Mode::Ask { .. }), "{:?}", ui.mode);
+    }
+
     /// `run` shows what the command printed — every line, not the last one (live: `nvidia-smi
     /// -L; hostname` read as just the hostname) — with stderr when it fails, as a terminal would
     /// show it, and past RUN_OUTPUT_LINES the earlier lines counted; per pod for several pods.

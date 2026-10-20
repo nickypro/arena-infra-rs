@@ -84,13 +84,17 @@ fn ai_command_line(ai: Ai, model: Option<&str>) -> String {
 /// in one prompt, sent to `run.ai` with no tools; the answer on `out`, progress and notes on
 /// `note`. A dry run prints the exact prompt and sends — and saves — nothing. A real run saves
 /// the prompt and the answer (or why there is none) under the fleet's state dir and fails when
-/// the AI did.
-pub(crate) async fn handle_ask(
+/// the AI did. `stop` (the operator's Ctrl-C, listened for once the AI is started) stops the AI —
+/// the terminal's own Ctrl-C doesn't reach it, in a session of its own
+/// (`arena_core::remote::run_local_input`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handle_ask<S: std::future::Future<Output = ()>>(
     remote: Arc<dyn Remote>,
     cfg: &Config,
     sel: &Selected,
     run: AskRun,
     env: &AiEnv,
+    stop: impl FnOnce() -> S,
     out: Say<'_>,
     note: Say<'_>,
 ) -> Result<()> {
@@ -130,7 +134,11 @@ pub(crate) async fn handle_ask(
     };
     note(&format!("asking {} about {about}…", run.ai.name()));
     let started = Instant::now();
-    let outcome = ai::ask(run.ai, &prompt, run.model.as_deref(), run.timeout, env).await;
+    let stop = stop();
+    let outcome = tokio::select! {
+        outcome = ai::ask(run.ai, &prompt, run.model.as_deref(), run.timeout, env) => outcome,
+        () = stop => Err(format!("interrupted (Ctrl-C): {} was stopped", run.ai.name())),
+    };
     if let Ok(answer) = &outcome {
         out(answer);
     }
@@ -202,6 +210,11 @@ mod tests {
         Arc::new(fake)
     }
 
+    /// A Ctrl-C that never comes.
+    fn never() -> std::future::Pending<()> {
+        std::future::pending()
+    }
+
     fn run(ai: Ai, dry_run: bool, question: Option<&str>) -> AskRun {
         AskRun { ai, model: None, timeout: Duration::from_secs(20), dry_run, question: question.map(String::from) }
     }
@@ -229,7 +242,7 @@ mod tests {
         let c = cfg(&t.0.join("state"));
         let sel = Selected::all(vec![pod("alpha", Some(22001)), pod("bravo", None)]);
         let (mut out, mut notes) = (Vec::new(), Vec::new());
-        handle_ask(fake_alpha(), &c, &sel, run(Ai::Claude, true, Some("anything odd?")), &env, &mut |l| out.push(l.to_string()), &mut |l| notes.push(l.to_string()))
+        handle_ask(fake_alpha(), &c, &sel, run(Ai::Claude, true, Some("anything odd?")), &env, never, &mut |l| out.push(l.to_string()), &mut |l| notes.push(l.to_string()))
             .await
             .unwrap();
         assert_eq!(out.len(), 1, "the prompt, once");
@@ -258,7 +271,7 @@ mod tests {
         let c = cfg(&t.0.join("state"));
         let sel = Selected::all(vec![pod("alpha", Some(22001))]);
         let (mut out, mut notes) = (Vec::new(), Vec::new());
-        handle_ask(fake_alpha(), &c, &sel, run(Ai::Codex, false, None), &env, &mut |l| out.push(l.to_string()), &mut |l| notes.push(l.to_string()))
+        handle_ask(fake_alpha(), &c, &sel, run(Ai::Codex, false, None), &env, never, &mut |l| out.push(l.to_string()), &mut |l| notes.push(l.to_string()))
             .await
             .unwrap();
         assert_eq!(out, ["ANSWER from codex"]);
@@ -274,11 +287,60 @@ mod tests {
 
         // The second time: no note.
         let (mut out, mut notes) = (Vec::new(), Vec::new());
-        handle_ask(fake_alpha(), &c, &sel, run(Ai::Claude, false, Some("ok?")), &env, &mut |l| out.push(l.to_string()), &mut |l| notes.push(l.to_string()))
+        handle_ask(fake_alpha(), &c, &sel, run(Ai::Claude, false, Some("ok?")), &env, never, &mut |l| out.push(l.to_string()), &mut |l| notes.push(l.to_string()))
             .await
             .unwrap();
         assert_eq!(out, ["ANSWER from claude"]);
         assert!(!notes.iter().any(|n| n.starts_with("note:")), "{notes:?}");
+    }
+
+    /// Ctrl-C while the AI is thinking (review ai-review claude #4): the AI runs in a session of
+    /// its own, out of the terminal's reach, so `pods ask` stops it — and what it started — and
+    /// says so; the run is saved with why there's no answer.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn ctrl_c_stops_the_ai_and_what_it_started() {
+        use arena_core::ask::ai::fixtures::{claude_help, on_path, stub};
+        let t = Tmp::new("ctrl-c");
+        let bin = t.0.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let (leader, left) = (t.0.join("leader.pid"), t.0.join("left.pid"));
+        stub(
+            &bin,
+            "claude",
+            &format!(
+                "if [ \"$1\" = --help ]; then cat <<'EOF'\n{}EOF\nexit 0; fi\nsleep 60 & echo $! > {}\necho $$ > {}\ncat > /dev/null\nexec sleep 60",
+                claude_help(&[]),
+                left.display(),
+                leader.display()
+            ),
+        );
+        let env = AiEnv { path: Some(on_path(&bin)), home: None, tmp: t.0.clone(), vars: Vec::new() };
+        let c = cfg(&t.0.join("state"));
+        let sel = Selected::all(vec![pod("alpha", Some(22001))]);
+        let leader_seen = leader.clone();
+        let ctrl_c = move || async move {
+            while !leader_seen.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        let started = Instant::now();
+        let mut notes = Vec::new();
+        let e = handle_ask(fake_alpha(), &c, &sel, run(Ai::Claude, false, None), &env, ctrl_c, &mut |_| {}, &mut |l| notes.push(l.to_string())).await.unwrap_err();
+        assert!(e.to_string().contains("interrupted (Ctrl-C): claude was stopped"), "{e}");
+        assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+        let saved = notes.iter().find_map(|n| n.strip_prefix("saved: ")).expect("saved");
+        assert_eq!(std::fs::read_to_string(std::path::Path::new(saved).join("answer.md")).unwrap(), "(no answer: interrupted (Ctrl-C): claude was stopped)\n");
+        let alive = |p: &std::path::Path| {
+            let pid = std::fs::read_to_string(p).unwrap().trim().to_string();
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).ok().and_then(|s| s.rsplit(')').next().and_then(|r| r.split_whitespace().next()).map(|st| st != "Z" && st != "X")).unwrap_or(false)
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while (alive(&leader) || alive(&left)) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!alive(&leader) && !alive(&left), "the AI, or what it started, is still running");
     }
 
     /// The AI missing: an error naming the other one — and the failed run is still saved.
@@ -290,7 +352,7 @@ mod tests {
         let c = cfg(&t.0.join("state"));
         let sel = Selected::all(vec![pod("alpha", Some(22001))]);
         let mut notes = Vec::new();
-        let e = handle_ask(fake_alpha(), &c, &sel, run(Ai::Claude, false, None), &env, &mut |_| {}, &mut |l| notes.push(l.to_string())).await.unwrap_err();
+        let e = handle_ask(fake_alpha(), &c, &sel, run(Ai::Claude, false, None), &env, never, &mut |_| {}, &mut |l| notes.push(l.to_string())).await.unwrap_err();
         assert!(e.to_string().contains("claude not found") && e.to_string().contains("--ai codex"), "{e}");
         let saved = notes.iter().find_map(|n| n.strip_prefix("saved: ")).expect("saved");
         assert!(std::fs::read_to_string(std::path::Path::new(saved).join("answer.md")).unwrap().starts_with("(no answer: claude not found"));
