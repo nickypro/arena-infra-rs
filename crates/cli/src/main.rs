@@ -5604,10 +5604,8 @@ async fn handle_backup(
     });
     let key = cfg.get("GIT_SSH_KEY_REMOTE").map(String::from);
     let msg_for = |name: &str| message.clone().unwrap_or_else(|| format!("arena backup {name}"));
-    // The repo every pod's `origin` must be (else WRONG_ORIGIN: nothing committed or pushed), and
-    // the course repo whose own commits it leaves as they are.
+    // The repo every pod's `origin` must be (else WRONG_ORIGIN: nothing committed or pushed).
     let origin = backup::configured_repo(cfg);
-    let course = backup::course_repo(cfg);
 
     // Back up only pods that actually have an SSH endpoint; report the rest.
     let targets = sel.named_targets(cfg)?;
@@ -5628,7 +5626,7 @@ async fn handle_backup(
         // writes the file each pod's line reads (so both paste); the arguments are exact.
         for (name, target) in &targets {
             println!("# {name}");
-            println!("{}\n", backup::backup_dry_run_line(target, &repo_path, key.as_deref(), &msg_for(name), origin.as_deref(), course.as_deref()));
+            println!("{}\n", backup::backup_dry_run_line(target, &repo_path, key.as_deref(), &msg_for(name), origin.as_deref()));
         }
         println!(
             "# The backup script, run under sh on each pod — paste this first: it writes ./{}, which the lines above read\n{}",
@@ -5654,7 +5652,7 @@ async fn handle_backup(
     let jobs = targets
         .into_iter()
         .map(|(name, target)| {
-            let cmd = backup::backup_command_with_course(&repo_path, key.as_deref(), &msg_for(&name), origin.as_deref(), course.as_deref());
+            let cmd = backup::backup_command(&repo_path, key.as_deref(), &msg_for(&name), origin.as_deref());
             (name, target, cmd)
         })
         .collect();
@@ -8841,13 +8839,9 @@ async fn switch_guarded(
     // so it is never switched: `init-branches` would push its new branch to that origin, and
     // `set-branch` would fetch (and `--hard` reset to) that repo's branch.
     let origin = arena_core::backup::configured_repo(cfg);
-    let course = arena_core::backup::course_repo(cfg);
     let jobs = targets
         .iter()
-        .map(|(n, t)| {
-            let cmd = arena_core::backup::backup_command_with_course(&repo, key, &format!("arena backup {n}"), origin.as_deref(), course.as_deref());
-            (n.clone(), t.clone(), cmd)
-        })
+        .map(|(n, t)| (n.clone(), t.clone(), arena_core::backup::backup_command(&repo, key, &format!("arena backup {n}"), origin.as_deref())))
         .collect();
     // Each pod's lock stays held through its push: it goes as that pod's switch ends.
     let t = backup_fleet(remote, jobs, &repo, |l| println!("{l}"), |_| {}).await;
@@ -22891,8 +22885,8 @@ mod remote_tests {
             fallback_lines(&[bloom], &pulled),
             [format!("✗ devtest-bloom: not backed up to git ({WRONG_WHY}) → files copied to /b/w41d5/devtest-bloom (and /b/big/devtest-bloom)")]
         );
-        // No configured repo: no check asked for (an empty origin argument; the course repo after it).
-        assert!(backup_command(REPO, Some(KEY), "m", None).ends_with(&format!("'{KEY}' '' 'ARENA-education/ARENA_materials'")));
+        // No configured repo: no check asked for (an empty last argument).
+        assert!(backup_command(REPO, Some(KEY), "m", None).ends_with(&format!("'{KEY}' ''")));
     }
 
     /// `init-branches` would push a participant's new branch to whatever `origin` is, and

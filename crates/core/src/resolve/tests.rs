@@ -1782,11 +1782,14 @@ fn every_path_the_commit_takes_is_checked_not_only_the_conflicted_ones() {
 
 /// What is staged exactly as the operation's other side has it — a file only that side changed, a
 /// conflicted one merged per hunk into that side's version — goes in as that side has it,
-/// key-like strings and all: the resolve redacts only what the participant made (FIX8: the course
-/// exemption is gone, and with it any question of whose commit the other side is) — here a file
-/// they added mid-operation, a key of their own in it. A course merge (a conflicted `git pull
-/// upstream main`), a cherry-pick of the participant's own commit and a merge of their own branch
-/// alike, each BUSY at the backup first, as the pod's tick finds it.
+/// key-like strings and all, whoever's side it is: the resolve redacts only what the participant
+/// made (FIX8) — here a file they added mid-operation, a key of their own in it. The backup after
+/// it scans every commit origin doesn't have — the other side's and the resolve's own — and
+/// rewrites those holding a key redacted before anything is pushed: no key reaches origin, and
+/// the files on disk keep theirs. A course merge (a conflicted `git pull upstream main`), a
+/// cherry-pick of the participant's own commit and a merge of their own branch alike, each BUSY at
+/// the backup first, as the pod's tick finds it. Against the local bare origin; nothing reaches
+/// the network.
 #[cfg(unix)]
 #[test]
 fn the_resolve_leaves_the_other_sides_content_to_the_backup() {
@@ -1826,6 +1829,22 @@ fn the_resolve_leaves_the_other_sides_content_to_the_backup() {
         if case == "course" {
             assert_eq!(format!("{}\n", r.committed("example.md")), example, "{case}: as the course has it");
         }
+        // The backup after, as `pods backup` runs it: the other side's key-like string redacted
+        // before the push, in the commit that brought it and in the resolve's.
+        let resolved = r.git(&r.work, &["rev-parse", "HEAD"]);
+        let (code, b, said) = r.backup();
+        assert_eq!((code, b.outcome), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".to_string()))), "{case}: {said}");
+        assert_eq!(b.history.as_ref().map(|h| h.1.as_str()), Some(resolved.as_str()), "{case}: rewritten redacted: {said}");
+        let pushed = |rel: &str| r.git(&r.work, &["show", &format!("origin/autocommit-x:{rel}")]);
+        assert_eq!(pushed("keyed.py"), "k = \"REDACTED-OPENROUTER-KEY\"", "{case}");
+        if case == "course" {
+            assert_eq!(pushed("example.md"), "# Set your key: OPENROUTER_API_KEY = \"REDACTED-OPENROUTER-KEY\"", "{case}");
+        }
+        let origin = r.cmd(&r.base, "git").args(["--git-dir", r.origin.to_str().unwrap(), "cat-file", "--batch-all-objects", "--batch"]).output().unwrap();
+        for k in [&key, &own] {
+            assert!(!origin.stdout.windows(k.len()).any(|w| w == k.as_bytes()), "{case}: a key reached origin");
+        }
+        assert_eq!((r.text("keyed.py"), r.text("mine.py")), (keyed.clone(), mine.clone()), "{case}: the disk keeps them");
     }
 }
 

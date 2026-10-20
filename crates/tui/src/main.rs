@@ -1968,14 +1968,7 @@ async fn backup_and_report(remote: &dyn Remote, cfg: &Config, pod: &Pod) -> (Str
     };
     let repo = backup_repo_path(cfg);
     let origin = backup::configured_repo(cfg);
-    let course = backup::course_repo(cfg);
-    let cmd = backup::backup_command_with_course(
-        &repo,
-        cfg.get("GIT_SSH_KEY_REMOTE"),
-        &format!("arena-tui backup {}", pod.name),
-        origin.as_deref(),
-        course.as_deref(),
-    );
+    let cmd = backup::backup_command(&repo, cfg.get("GIT_SSH_KEY_REMOTE"), &format!("arena-tui backup {}", pod.name), origin.as_deref());
     match remote.exec(&target, &cmd, Some(BACKUP_TIMEOUT)).await {
         Ok(out) if out.success => {
             let report = parse_backup_report(&out.stdout);
@@ -2064,8 +2057,7 @@ fn build_preview(cfg: &Config, action: Action, pod: &Pod) -> Option<String> {
                 // as the here-doc that writes the file this line reads).
                 let msg = format!("arena-tui backup {}", pod.name);
                 let origin = arena_core::backup::configured_repo(cfg);
-                let course = arena_core::backup::course_repo(cfg);
-                arena_core::backup::backup_dry_run_line(t, &backup_repo_path(cfg), cfg.get("GIT_SSH_KEY_REMOTE"), &msg, origin.as_deref(), course.as_deref())
+                arena_core::backup::backup_dry_run_line(t, &backup_repo_path(cfg), cfg.get("GIT_SSH_KEY_REMOTE"), &msg, origin.as_deref())
             }
             Err(e) => format!("⚠ {e}"),
         }),
@@ -4742,12 +4734,11 @@ deep_check_end=1
             assert_eq!(line, want, "{what}");
             assert_eq!(budgets(&fake), budget.into_iter().map(Some).collect::<Vec<_>>(), "{what}");
         }
-        // The backup it runs carries the configured repo for that check, and the course repo whose
-        // own commits it leaves as they are.
+        // The backup it runs carries the configured repo for that check.
         let fake = FakeRemote::new();
         run_backup(&fake, &cfg, &alpha).await;
         let sent: Vec<String> = fake.calls().into_iter().filter_map(|c| match c { RemoteCall::Exec { cmd, .. } => Some(cmd), _ => None }).collect();
-        assert!(sent.len() == 1 && sent[0].ends_with(" 'nickypro/arena-sandbox-materials' 'ARENA-education/ARENA_materials'"), "{sent:?}");
+        assert!(sent.len() == 1 && sent[0].ends_with(" 'nickypro/arena-sandbox-materials'"), "{sent:?}");
         // No endpoint: said, and nothing is attempted.
         let fake = FakeRemote::new();
         let charlie = pod("charlie", "runpod", "rp3", 3, None);
