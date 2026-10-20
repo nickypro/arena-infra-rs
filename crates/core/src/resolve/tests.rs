@@ -1374,6 +1374,41 @@ fn the_state_is_read_again_right_before_changing_anything_and_before_the_commit(
             assert_eq!(r.git(&r.work, &["rev-parse", "HEAD"]), head, "{case}");
         }
     }
+    // Someone back at work while the plan was made, no file touched (review ai-review codex #6):
+    // a terminal used (its timestamp only), a terminal login typing, a git command started. The
+    // re-read asks every condition of the first look again — nothing touched.
+    type Back = (&'static str, fn(&Repo), fn(&Repo) -> String, &'static str);
+    let back: [Back; 3] = [
+        (
+            "pts",
+            |r| r.pts(3, Some((5 * HOUR, 5 * HOUR))),
+            |r| format!("touch -a {}", r.base.join("pts/3").display()),
+            "recent: a terminal was used less than 3h ago while the state before was kept",
+        ),
+        ("login", |r| r.login(Some(5 * HOUR)), |r| format!("touch -a {}", r.base.join("tty").display()), "recent: a terminal login typed less than 3h ago while the state before was kept"),
+        (
+            "git",
+            |_| {},
+            |r| {
+                let d = r.base.join("proc/4242");
+                format!("mkdir -p {0} && echo git > {0}/comm && echo '4242 (git) S 1 4242 4242 0 -1 0' > {0}/stat", d.display())
+            },
+            "busy: a git command, or an editor one waits on, is running (pid 4242: git) while the state before was kept",
+        ),
+    ];
+    for (case, before, hook_cmd, why) in back {
+        let r = Repo::new(&format!("again-back-{case}"));
+        r.merge_conflict(r.now - 5 * DAY, r.now - 10 * DAY);
+        let (head, conflicts) = (r.git(&r.work, &["rev-parse", "HEAD"]), r.unmerged());
+        before(&r);
+        r.age(4 * HOUR);
+        let look = r.look();
+        assert_eq!(not_quiet(&look, 3), None, "{case}: quiet at the look");
+        let (code, rep, said) = r.resolve_with(3, &look, GIT_MAX_FILE_BYTES_FOR_TESTS, &[(hook, &hook_cmd(&r))]);
+        assert_eq!((code, rep.refused.as_deref()), (Some(RESOLVE_REFUSED_EXIT), Some(why)), "{case}: {said}");
+        r.untouched(&conflicts, case);
+        assert_eq!(r.git(&r.work, &["rev-parse", "HEAD"]), head, "{case}");
+    }
     // Right before the commit.
     let hook = "ARENA_TEST_HOOK_BEFORE_FINISH";
     for (case, cmd, why) in [

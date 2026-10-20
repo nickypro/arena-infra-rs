@@ -22,7 +22,9 @@
 # alone, said. The state before is kept first in <git dir>/arena-resolved/<UTC stamp>/ (the
 # conflicted files as they were, git's own state files, the old HEAD, the index, a README), then
 # the state is read again — the operation and its commit, HEAD, the conflicts, the index, every
-# file — and if any of it changed, nothing is touched. Then the paths are staged, each staged
+# file — and the pod looked at again for anyone at work (every condition of the first look: a
+# terminal used, a git command running, …), and if any of it changed, nothing is touched. Then the
+# paths are staged, each staged
 # file's keys redacted in the index as the backup redacts them (the file on disk keeps its keys),
 # and — HEAD and the operation checked once more, and no conflict marker staged — the operation is
 # finished: a merge, a merge commit; a cherry-pick, `--continue`; a `git stash pop`'s conflicts,
@@ -66,7 +68,9 @@ trap 'rm -rf "$T".*' EXIT
 refuse() { echo "REFUSED $*"; exit 7; }
 fail() { echo "FAILED $*"; exit 8; }
 LOOKED=$(arena_look)
-val() { printf '%s\n' "$LOOKED" | sed -n "s/^$1 //p" | head -n 1; }
+# The value on line $2 of look $1 (its first such line); `val`: of the first look.
+val_in() { printf '%s\n' "$1" | sed -n "s/^$2 //p" | head -n 1; }
+val() { val_in "$LOOKED" "$1"; }
 
 # --- The same, and quiet ---------------------------------------------------------------------
 set -- $(val OP)
@@ -86,18 +90,31 @@ seq=$4
 [ "$what $mt $head" = "$WANT_OP" ] || refuse "changed: not the $what seen before the copy"
 [ "$(val PRINT)" = "$WANT_PRINT" ] || refuse "changed: files changed since the copy"
 [ "$seq" = 0 ] || refuse "a cherry-pick or revert sequence: never finished automatically"
-now=$(val NOW)
-# Old enough (or not there): at least <quiet secs> before the pod's clock, never in its future.
+# Old enough (or not there): at least <quiet secs> before the look's clock ($now), never in its
+# future.
 old() { [ -z "$1" ] || { [ "$1" -le "$now" ] && [ $((now - $1)) -ge "$SECS" ]; }; }
-old "$mt" || refuse "recent: the $what started less than ${HOURS}h ago"
-set -- $(val NEWEST)
-old "${1:-0}" || refuse "recent: a file changed less than ${HOURS}h ago"
-old "$(val INDEX)" || refuse "recent: git's index changed less than ${HOURS}h ago (something was staged)"
-[ -z "$(val LOCKED)" ] || refuse "busy: git's index is locked (.git/index.lock): a git command is at work, or died holding it"
-old "$(val INPUT)" || refuse "recent: a terminal login typed less than ${HOURS}h ago"
-old "$(val TTY)" || refuse "recent: a terminal was used less than ${HOURS}h ago"
-set -- $(val PROC)
-[ $# -eq 0 ] || refuse "busy: a git command, or an editor one waits on, is running (pid $1: ${2:-?})"
+# Why look $1 says someone may be at work here, in words — on that look's own clock: the operation
+# (started at $mt) younger than <quiet secs>, a file git lists changed since, something staged
+# since (the index), git's index locked, a terminal login typed or any terminal used since, a git
+# command (or an editor one waits on) running; nothing: quiet. Asked of the first look, and again —
+# every condition — of the one right before the changes (`again`): a participant back at a
+# terminal while the plan was made, typing into an editor's buffer, touches no file (review
+# ai-review codex #6).
+unquiet() {
+    _q=$1
+    now=$(val_in "$_q" NOW)
+    if ! old "$mt"; then echo "recent: the $what started less than ${HOURS}h ago"; return; fi
+    set -- $(val_in "$_q" NEWEST)
+    if ! old "${1:-0}"; then echo "recent: a file changed less than ${HOURS}h ago"; return; fi
+    if ! old "$(val_in "$_q" INDEX)"; then echo "recent: git's index changed less than ${HOURS}h ago (something was staged)"; return; fi
+    if [ -n "$(val_in "$_q" LOCKED)" ]; then echo "busy: git's index is locked (.git/index.lock): a git command is at work, or died holding it"; return; fi
+    if ! old "$(val_in "$_q" INPUT)"; then echo "recent: a terminal login typed less than ${HOURS}h ago"; return; fi
+    if ! old "$(val_in "$_q" TTY)"; then echo "recent: a terminal was used less than ${HOURS}h ago"; return; fi
+    set -- $(val_in "$_q" PROC)
+    if [ $# -ne 0 ]; then echo "busy: a git command, or an editor one waits on, is running (pid $1: ${2:-?})"; fi
+}
+why=$(unquiet "$LOOKED")
+[ -z "$why" ] || refuse "$why"
 [ -n "$(git config user.name)" ] && [ -n "$(git config user.email)" ] || refuse "no git identity configured in the repo"
 
 # --- What is in progress, as it is now ------------------------------------------------------
@@ -345,22 +362,24 @@ echo "SAVED $S"
 
 # --- Nothing changed since? ------------------------------------------------------------------
 # The changes start here. Right before, the state the look saw is read again — the operation and
-# its commit, HEAD, the conflicts, the index, every file, no index lock, nobody at work in git —
-# and nothing is touched if any of it changed: the participant may have aborted the merge and
-# started a rebase meanwhile, and the plan made for the merge must never be applied to that.
+# its commit, HEAD, the conflicts, the index, every file, no index lock — and the pod looked at
+# again for anyone at work, every condition of the first look (`unquiet`: a terminal used, a git
+# command running, …); nothing is touched if any of it changed: the participant may have aborted
+# the merge and started a rebase meanwhile, and the plan made for the merge must never be applied
+# to that — or come back to a terminal and be typing into a buffer not saved yet.
 if [ -n "${ARENA_TEST_HOOK_BEFORE_CHANGE:-}" ]; then (sh -c "$ARENA_TEST_HOOK_BEFORE_CHANGE") > /dev/null 2>&1; fi
 again() {
     _l=$(arena_look)
-    if [ "$(printf '%s\n' "$_l" | sed -n 's/^OP //p')" != "$what $mt $head $seq" ]; then echo "the $what isn't the one planned for any more"; return; fi
-    if [ "$(printf '%s\n' "$_l" | sed -n 's/^PRINT //p')" != "$WANT_PRINT" ]; then echo "files changed"; return; fi
-    if [ -n "$(printf '%s\n' "$_l" | sed -n 's/^PROC //p')" ]; then echo "a git command started"; return; fi
-    if [ "$(git rev-parse -q --verify HEAD)" != "$HEAD0" ]; then echo "HEAD moved"; return; fi
-    if [ -e "$G/index.lock" ]; then echo "git's index is locked"; return; fi
-    if [ "$(stat -c '%y %s' -- "$G/index" 2>/dev/null)" != "$INDEX0" ]; then echo "git's index changed"; return; fi
-    if ! git ls-files -u -z | cmp -s - "$T.u"; then echo "the conflicts changed"; return; fi
+    if [ "$(val_in "$_l" OP)" != "$what $mt $head $seq" ]; then echo "changed: the $what isn't the one planned for any more"; return; fi
+    if [ "$(val_in "$_l" PRINT)" != "$WANT_PRINT" ]; then echo "changed: files changed"; return; fi
+    if [ "$(git rev-parse -q --verify HEAD)" != "$HEAD0" ]; then echo "changed: HEAD moved"; return; fi
+    if [ -e "$G/index.lock" ]; then echo "changed: git's index is locked"; return; fi
+    if [ "$(stat -c '%y %s' -- "$G/index" 2>/dev/null)" != "$INDEX0" ]; then echo "changed: git's index changed"; return; fi
+    if ! git ls-files -u -z | cmp -s - "$T.u"; then echo "changed: the conflicts changed"; return; fi
+    unquiet "$_l"
 }
 why=$(again)
-[ -z "$why" ] || unkept "changed: $why while the state before was kept"
+[ -z "$why" ] || unkept "$why while the state before was kept"
 unset GIT_OPTIONAL_LOCKS
 
 # --- Resolve ---------------------------------------------------------------------------------
