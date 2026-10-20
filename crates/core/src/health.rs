@@ -151,8 +151,10 @@ pub struct DeepFacts {
     pub torch_version: Option<String>,
     /// The CUDA torch was built against (`torch.version.cuda`).
     pub torch_cuda: Option<String>,
-    /// The newest CUDA the driver supports, as torch reads it (`_cuda_getDriverVersion`, 12080
-    /// → `12.8`): nvidia-smi's "CUDA Version" when nvidia-smi can't answer. `major.minor` only.
+    /// The newest CUDA the driver supports, as the torch step reads it (13020 → `13.2`):
+    /// nvidia-smi's "CUDA Version" when nvidia-smi can't answer. From the driver library
+    /// (`cuDriverGetVersion` in libcuda), else torch's private `_cuda_getDriverVersion` — which
+    /// torch 2.14 doesn't have (live, a B300 MIG slice: it was never known). `major.minor` only.
     pub torch_driver_cuda: Option<String>,
     /// The GPUs as torch sees them (`tgpu.<i>.*`), by index.
     pub torch_gpus: Vec<TorchGpuFact>,
@@ -2815,6 +2817,47 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
         assert_eq!((h.status, h.failure_kind()), (Warn, None), "{:#?}", h.checks);
     }
 
+    /// Live 8 (2026-10-20, a RunPod `1×B300 MIG 34GB` pod), its facts as the script printed
+    /// them: nvidia-smi answers (driver 595.91.07, CUDA 13.2) but `--query-gpu`'s memory is
+    /// `[Insufficient Permissions]`, `-L` lists the slice, `/proc` has the driver too, and torch
+    /// 2.14.1 sees the slice — without `_cuda_getDriverVersion`, so no driver CUDA from it.
+    fn live8_b300_slice() -> String {
+        edit(
+            &one_gpu(),
+            &[
+                ("smi_cuda", Some("13.2")),
+                ("gpu.0.name", Some("NVIDIA B300 SXM6 AC")),
+                ("gpu.0.driver", Some("595.91.07")),
+                ("gpu.0.mem_total_mib", Some("[Insufficient Permissions]")),
+                ("gpu.0.mem_used_mib", Some("[Insufficient Permissions]")),
+                ("mig_devices", Some("1")),
+                ("mig_profile", Some("1g.34gb")),
+                ("driver_proc", Some("595.91.07")),
+                ("torch_version", Some("2.14.1+cu130")),
+                ("tgpu.0.name", Some("NVIDIA B300 SXM6 AC MIG 1g.34gb")),
+                ("tgpu.0.mem_total_mib", Some("31232")),
+                ("tgpu.0.mem_free_mib", Some("30955")),
+            ],
+        )
+    }
+
+    /// The live MIG slice PASSes as it did live, the driver judged by nvidia-smi's version.
+    #[test]
+    fn a_live_b300_mig_slice_passes_with_the_driver_from_nvidia_smi() {
+        let p = Pod { gpu_type: Some("B300 MIG 34GB".into()), gpu_count: Some(1), ..pod("mig8", "1.2.3.4") };
+        let f = parse_deep(&live8_b300_slice());
+        assert_eq!((f.gpus[0].mem_total_mib, f.gpus[0].mem_used_mib, f.torch_driver_cuda.as_deref()), (None, None, None));
+        let h = PodHealth::checked(&p, f, &cuda13());
+        assert_eq!(h.status, Status::Pass, "{:#?}", h.checks);
+        let detail = |name: &str| check(&h.checks, name).detail.clone();
+        assert_eq!(detail("nvidia-smi"), "1×B300 MIG 34GB (MIG slice of B300 SXM6 AC)");
+        assert_eq!(detail("driver"), "595.91.07 ≥ 580 (CUDA 13.0)");
+        assert_eq!(detail("device_count"), "1 (matches nvidia-smi's 1 MIG slice(s))");
+        let table = render_health_table(std::slice::from_ref(&h));
+        assert!(table.contains("1×B300 MIG 34GB") && table.contains("595.91.07") && table.contains("13.2"), "{table}");
+        assert!(!table.contains('*'), "nvidia-smi's CUDA, unmarked: {table}");
+    }
+
     /// No driver version from nvidia-smi: `/proc/driver/nvidia/version`'s, judged the same way;
     /// else the CUDA version torch says the driver supports, against the CUDA floor the minimum
     /// was derived from; else as before.
@@ -3120,8 +3163,11 @@ devtest-echo   fail    -            -          -             -  ssh: exit 255: C
     /// A stand-in `torch` for the script test (first on PYTHONPATH): one CUDA device that is a
     /// MIG slice, without a GPU — so the inline python's new facts (torch's names, memory, the
     /// driver's CUDA) run for real. Just enough tensor for `tensor_check`: `arange(n) * 2 + 1`
-    /// sums to n², a matmul's sum is finite.
+    /// sums to n², a matmul's sum is finite. `FAKE_TORCH_DRIVER_API=gone`: no private
+    /// `_cuda_getDriverVersion`, as in torch 2.14.
     const FAKE_TORCH: &str = r#"
+import os
+
 __version__ = "2.9.0+cu128"
 int64 = "int64"
 
@@ -3133,6 +3179,8 @@ class version:
 class _C:
     @staticmethod
     def _cuda_getDriverVersion():
+        if os.environ.get("FAKE_TORCH_DRIVER_API") == "gone":
+            raise AttributeError("module 'torch._C' has no attribute '_cuda_getDriverVersion'")
         return 12080
 
 
@@ -3197,14 +3245,47 @@ class cuda:
         pass
 "#;
 
+    /// A stand-in `ctypes` beside [`FAKE_TORCH`] (stdlib modules come after PYTHONPATH): the
+    /// script's libcuda read, without a GPU or a libcuda — and none of the test machine's own,
+    /// which would make the result the machine's. `FAKE_LIBCUDA`: the version
+    /// `cuDriverGetVersion` reports, or `error` for a call that fails; unset, no libcuda.
+    const FAKE_CTYPES: &str = r#"
+import os
+
+
+class c_int:
+    def __init__(self, value=0):
+        self.value = value
+
+
+def byref(obj):
+    return obj
+
+
+class CDLL:
+    def __init__(self, name):
+        self._v = os.environ.get("FAKE_LIBCUDA")
+        if name != "libcuda.so.1" or not self._v:
+            raise OSError(f"{name}: cannot open shared object file: No such file or directory")
+
+    def cuDriverGetVersion(self, ref):
+        if self._v == "error":
+            return 100  # CUDA_ERROR_NO_DEVICE
+        ref.value = int(self._v)
+        return 0
+"#;
+
     /// The MIG fallback end to end: nvidia-smi failing as it does in a slice's container (exit
     /// 6 "No devices were found"; NVML "Insufficient Permissions"), torch working (the fake
     /// module above, run by the real python), the driver in a fake `/proc/driver/nvidia/version`
     /// (or none) — the script's facts give a PASS for the slice, the driver judged from `/proc`,
-    /// else from torch's CUDA.
+    /// else from the CUDA version the driver supports: libcuda's (the fake `ctypes`), else
+    /// torch's private reading, else unknown (live, torch 2.14 on a B300 MIG slice: no
+    /// `_cuda_getDriverVersion`).
     #[cfg(target_os = "linux")]
     #[test]
     fn script_falls_back_on_torch_when_nvidia_smi_cant_answer() {
+        use Status::*;
         if !(have("bash") && have("timeout") && have("base64") && have("python3")) {
             eprintln!("bash/timeout/base64/python3 missing — skipping");
             return;
@@ -3212,18 +3293,23 @@ class cuda:
         let nvrm = "NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  570.86.15  Release Build  \
                     (dvs-builder@U16-I3-B03-4-3)  Thu Jan 23 00:43:02 UTC 2025\n\
                     GCC version:  gcc version 12.3.0 (Ubuntu 12.3.0-1ubuntu1~22.04)\n";
-        // (nvidia-smi's exit and message, /proc file present, the smi fact, the driver check's detail)
-        let cases = [
-            ((6, "No devices were found"), true, "error: No devices were found", "570.86.15 ≥ 550 (CUDA 12.4; from /proc/driver/nvidia/version)"),
-            (
-                (4, "Failed to initialize NVML: Insufficient Permissions"),
-                false,
-                "error: Failed to initialize NVML: Insufficient Permissions",
-                "driver supports CUDA 12.8 ≥ 12.4 (via torch; nvidia-smi unavailable)",
-            ),
+        let (no_devices, nvml) = ((6, "No devices were found"), (4, "Failed to initialize NVML: Insufficient Permissions"));
+        let via = |c: &str| Check::new("driver", Pass, format!("driver supports CUDA {c} ≥ 12.4 (via torch; nvidia-smi unavailable)"));
+        // (nvidia-smi's exit and message, /proc file present, FAKE_LIBCUDA, torch's private API
+        // there, the driver's CUDA fact, the driver check)
+        type Case<'a> = ((i32, &'a str), bool, Option<&'a str>, bool, Option<&'a str>, Check);
+        let cases: Vec<Case> = vec![
+            (no_devices, true, Some("13020"), true, Some("13.2"), Check::new("driver", Pass, "570.86.15 ≥ 550 (CUDA 12.4; from /proc/driver/nvidia/version)")),
+            // libcuda first; torch's reading (12.8) only when libcuda can't say.
+            (nvml, false, Some("13020"), true, Some("13.2"), via("13.2")),
+            (nvml, false, None, true, Some("12.8"), via("12.8")),
+            (nvml, false, Some("error"), true, Some("12.8"), via("12.8")),
+            (nvml, false, Some("13020"), false, Some("13.2"), via("13.2")),
+            // Neither: unknown, the script and every other fact unharmed.
+            (nvml, false, None, false, None, Check::new("driver", Warn, "version not reported")),
         ];
-        for ((code, msg), proc_file, smi, driver) in cases {
-            let dir = scratch(&format!("stubs-mig-down-{code}"));
+        for (n, ((code, msg), proc_file, libcuda, torch_api, cuda, driver)) in cases.into_iter().enumerate() {
+            let dir = scratch(&format!("stubs-mig-down-{n}"));
             let stub = |name: &str, body: &str| {
                 crate::remote::write_test_script(dir.join(name), format!("#!/bin/sh\n{body}")).unwrap();
             };
@@ -3232,20 +3318,25 @@ class cuda:
             stub("python", "exec python3 \"$@\"\n");
             std::fs::create_dir_all(dir.join("pylib")).unwrap();
             std::fs::write(dir.join("pylib/torch.py"), FAKE_TORCH).unwrap();
+            std::fs::write(dir.join("pylib/ctypes.py"), FAKE_CTYPES).unwrap();
             let version = dir.join("nvidia-version");
             if proc_file {
                 std::fs::write(&version, nvrm).unwrap();
             }
             let path = format!("{}:{}", dir.display(), std::env::var("PATH").unwrap_or_default());
-            let out = std::process::Command::new("sh")
-                .arg("-c")
+            let mut cmd = std::process::Command::new("sh");
+            cmd.arg("-c")
                 .arg(deep_check_inner_command())
                 .env("PATH", path)
                 .env("HOME", &dir)
                 .env("PYTHONPATH", dir.join("pylib"))
                 .env("ARENA_TEST_NVIDIA_VERSION_FILE", &version)
-                .output()
-                .unwrap();
+                .env_remove("FAKE_LIBCUDA")
+                .env("FAKE_TORCH_DRIVER_API", if torch_api { "there" } else { "gone" });
+            if let Some(v) = libcuda {
+                cmd.env("FAKE_LIBCUDA", v);
+            }
+            let out = cmd.output().unwrap();
             let _ = std::fs::remove_dir_all(&dir);
             let stdout = String::from_utf8_lossy(&out.stdout);
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -3254,10 +3345,10 @@ class cuda:
             }
             let f = parse_deep(&stdout);
             assert!(f.started && f.complete && f.py_done, "{stdout}\n{stderr}");
-            assert_eq!(f.smi.as_deref(), Some(smi), "{stdout}");
+            assert_eq!(f.smi, Some(format!("error: {msg}")), "{stdout}");
             assert_eq!(f.driver_proc.as_deref(), proc_file.then_some("570.86.15"), "{stdout}");
             assert!(stdout.contains(if proc_file { "\ndriver_proc=570.86.15\n" } else { "\ndriver_proc=missing\n" }), "{stdout}");
-            assert_eq!(f.torch_driver_cuda.as_deref(), Some("12.8"), "{stdout}");
+            assert_eq!(f.torch_driver_cuda.as_deref(), cuda, "{stdout}");
             assert_eq!(
                 f.torch_gpus,
                 [TorchGpuFact { index: 0, name: Some(A100_SLICE.into()), mem_total_mib: Some(4864), mem_free_mib: Some(4600) }],
@@ -3270,15 +3361,113 @@ class cuda:
                 check(&checks, "nvidia-smi"),
                 &Check::new(
                     "nvidia-smi",
-                    Status::Pass,
+                    Pass,
                     format!("nvidia-smi can't read this MIG slice ({msg}) — torch: 1×A100-SXM4-40GB MIG 1g.5gb, 4.8 GB")
                 ),
                 "{stdout}"
             );
-            assert_eq!(check(&checks, "driver"), &Check::new("driver", Status::Pass, driver), "{stdout}");
+            assert_eq!(check(&checks, "driver"), &driver, "{stdout}");
             for name in ["torch", "cuda", "device_count", "gpu0"] {
-                assert_eq!(check(&checks, name).status, Status::Pass, "{name}: {checks:#?}");
+                assert_eq!(check(&checks, name).status, Pass, "{name}: {checks:#?}");
             }
+        }
+    }
+
+    /// The driver's CUDA version as the driver API encodes it (1000 × major + 10 × minor) →
+    /// `major.minor`, and the order it is asked in: libcuda, then torch's private API. The
+    /// script's own python functions, imported (its `main` is behind `__main__`), with stand-in
+    /// `ctypes` and `torch` objects — no GPU, no libcuda.
+    #[test]
+    fn script_reads_the_drivers_cuda_from_libcuda_then_torch() {
+        if !have("python3") {
+            eprintln!("python3 not installed — skipping");
+            return;
+        }
+        let start = DEEP_CHECK_SCRIPT.find("<<'PYEOF'\n").expect("python heredoc") + "<<'PYEOF'\n".len();
+        let len = DEEP_CHECK_SCRIPT[start..].find("\nPYEOF\n").expect("heredoc end");
+        let dir = scratch("pydriver");
+        std::fs::write(dir.join("deep_check.py"), &DEEP_CHECK_SCRIPT[start..start + len]).unwrap();
+        let probe = r#"
+import sys, types
+sys.path.insert(0, sys.argv[1])
+import deep_check as d
+
+
+def show(f, *a):
+    try:
+        return f(*a)
+    except Exception as e:
+        return type(e).__name__
+
+
+for v in [13020, 12080, 12040, 13000, 9020, "13020", 0, -1, "x", None]:
+    print("version", v, show(d.cuda_version, v))
+
+
+def libcuda(code, value):
+    m = types.ModuleType("ctypes")
+
+    class c_int:
+        def __init__(self, value=0):
+            self.value = value
+
+    class CDLL:
+        def __init__(self, name):
+            if code is None:
+                raise OSError(name)
+
+        def cuDriverGetVersion(self, ref):
+            ref.value = value
+            return code
+
+    m.c_int, m.byref, m.CDLL = c_int, lambda x: x, CDLL
+    return m
+
+
+def torch(v):
+    t = types.SimpleNamespace(_C=types.SimpleNamespace())
+    if v is not None:
+        t._C._cuda_getDriverVersion = lambda: v
+    return t
+
+
+for what, lib, tv in [
+    ("libcuda", libcuda(0, 13020), 12080),
+    ("libcuda, torch gone", libcuda(0, 13020), None),
+    ("libcuda fails", libcuda(100, 0), 12080),
+    ("libcuda says 0", libcuda(0, 0), 12080),
+    ("no libcuda", libcuda(None, 0), 12080),
+    ("neither", libcuda(None, 0), None),
+]:
+    sys.modules["ctypes"] = lib
+    print("driver", what, show(d.driver_cuda, torch(tv)))
+"#;
+        let out = std::process::Command::new("python3").arg("-I").arg("-c").arg(probe).arg(&dir).output().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+        let want = "\
+version 13020 13.2
+version 12080 12.8
+version 12040 12.4
+version 13000 13.0
+version 9020 9.2
+version 13020 13.2
+version 0 ValueError
+version -1 ValueError
+version x ValueError
+version None TypeError
+driver libcuda 13.2
+driver libcuda, torch gone 13.2
+driver libcuda fails 12.8
+driver libcuda says 0 12.8
+driver no libcuda 12.8
+driver neither AttributeError
+";
+        assert_eq!(stdout, want);
+        // What the parser keeps of it: `major.minor`, nothing else.
+        for (v, want) in [("13.2", Some("13.2")), ("9.2", Some("9.2")), ("13020", None), ("13.2.0", None)] {
+            assert_eq!(parse_deep(&edit(HEALTHY_2GPU, &[("torch_driver_cuda", Some(v))])).torch_driver_cuda.as_deref(), want, "{v}");
         }
     }
 }

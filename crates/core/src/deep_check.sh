@@ -182,13 +182,29 @@ def fact(k, get):
         pass
 
 
-def driver_cuda(torch):
-    """The newest CUDA the driver supports, as torch reads it (12080 -> 12.8): nvidia-smi's
-    "CUDA Version", for when nvidia-smi can't run. A private torch API, so it may be gone."""
-    v = int(torch._C._cuda_getDriverVersion())
+def cuda_version(v):
+    """A CUDA version as the driver API encodes it (1000 * major + 10 * minor) as major.minor:
+    13020 -> 13.2. Raises on anything that isn't one (0, negative, not a number)."""
+    v = int(v)
     if v <= 0:
         raise ValueError(v)
     return f"{v // 1000}.{v % 1000 // 10}"
+
+
+def driver_cuda(torch):
+    """The newest CUDA the driver supports: nvidia-smi's "CUDA Version", for when nvidia-smi
+    can't run. Asked of the driver library itself (cuDriverGetVersion, which needs no
+    context); torch's private reading of it only as a second try - torch 2.14 has none (live,
+    a B300 MIG slice: never known). Raises when neither answers, so `fact` leaves it out."""
+    try:
+        import ctypes
+
+        v = ctypes.c_int()
+        if ctypes.CDLL("libcuda.so.1").cuDriverGetVersion(ctypes.byref(v)) == 0:
+            return cuda_version(v.value)
+    except BaseException:
+        pass
+    return cuda_version(torch._C._cuda_getDriverVersion())
 
 
 def tensor_check(torch, i):
