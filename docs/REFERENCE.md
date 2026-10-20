@@ -1244,9 +1244,10 @@ Name pods or pass `--all` (this cohort's; `--include-non-cohort` for every pod; 
 
 #### What it reads
 
-Read-only, one SSH call per pod (60 s budget; each `nvidia-smi`, each git call of the repo's part,
-and the small probe's `du`, `df`, `ps`, `who` and `tmux` bounded on the pod, so a wedged GPU or a
-hung volume costs only its own facts). It reads: the dashboard's metrics probe (GPUs and their
+Read-only, one SSH call per pod (60 s budget; on the pod each `nvidia-smi` within 10 s, the
+metrics probe's repo part as a whole within 15 s, each git call of the small probe's within 10 s,
+and its `du`, `df`, `ps`, `who` and `tmux` bounded too — each KILLed 2 s after its TERM — so a
+wedged GPU or a hung volume costs only its own facts, never the sections after them). It reads: the dashboard's metrics probe (GPUs and their
 processes, CPU, memory, the root disk, the repo's branch, origin, commits not pushed, recent commit
 subjects, whether `~/.name`, the deploy key and the API/HF/Claude Code tokens are set up — never
 `PROGRESS_CMD`, your own command, which may write), `pods jobs`' listing and the newest job's last

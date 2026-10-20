@@ -420,6 +420,7 @@ async fn fetch_loop(
         repo_path: Some(repo_path),
         key_remote: Some(cfg.get("GIT_SSH_KEY_REMOTE").unwrap_or("/root/.ssh/id_ed25519").to_string()),
         nvidia_smi_timeout: None,
+        repo_timeout: None,
     };
     let mut details = DetailsState { balance, ..Default::default() };
     loop {

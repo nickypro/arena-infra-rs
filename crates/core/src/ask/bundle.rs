@@ -37,12 +37,18 @@ use crate::metrics::{self, PodMetrics, ProbeOpts};
 use crate::pod::Pod;
 
 /// The budget for one pod's call: its slow steps are bounded on the pod — each `nvidia-smi`
-/// ([`NVIDIA_SMI_SECS`]), the extra probe's `du`, `df`, `ps`, `who`, `tmux`, and each git call of
-/// its repo section (10 s) — so a hang there costs that section, not the sections after it.
+/// ([`NVIDIA_SMI_SECS`]), the metrics probe's repo part as a whole ([`REPO_SECS`]), the extra
+/// probe's `du`, `df`, `ps`, `who`, `tmux`, and each git call of its repo section (10 s), every one
+/// KILLed 2 s after its TERM — so a hang there costs that section, not the sections after it.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How long each `nvidia-smi` in the call may take (`super::probe_opts`).
 pub const NVIDIA_SMI_SECS: u64 = 10;
+
+/// How long the metrics probe's repo part — its `cd` into the checkout and each of its git calls,
+/// as one `sh` — may take in the call (`super::probe_opts`): a hung volume costs that part, then
+/// the jobs and the small probe still run.
+pub const REPO_SECS: u64 = 15;
 
 /// Most bytes one pod's bundle takes in a prompt.
 pub const BUNDLE_CAP: usize = 6 * 1024;
@@ -1771,7 +1777,13 @@ mod tests {
         std::fs::write(repo.join("b.py"), "y = 1\n").unwrap();
         let index = std::fs::read(repo.join(".git/index")).unwrap();
 
-        let opts = ProbeOpts { repo_path: Some(repo.display().to_string()), key_remote: Some("/nonexistent/key".into()), progress_cmd: None, nvidia_smi_timeout: Some(10) };
+        let opts = ProbeOpts {
+            repo_path: Some(repo.display().to_string()),
+            key_remote: Some("/nonexistent/key".into()),
+            progress_cmd: None,
+            nvidia_smi_timeout: Some(NVIDIA_SMI_SECS),
+            repo_timeout: Some(REPO_SECS),
+        };
         let out = Command::new("sh")
             .arg("-c")
             .arg(probe_command(&opts, &repo.display().to_string(), NONCE))
@@ -1808,6 +1820,67 @@ mod tests {
                 && text.contains("the participant ends it: finish it (`git commit`) or abort it (`git merge --abort`)"),
             "{text}"
         );
+    }
+
+    /// Review ai-review codex #4, claude #7 (lane ASK7 item G): the ask's whole call stays within
+    /// its budget when the pod's git hangs and ignores SIGTERM (a hung `/workspace` volume): the
+    /// metrics probe's repo part is bounded as a whole ([`REPO_SECS`]), each git of the small
+    /// probe's within 10 s, each `timeout` KILLing 2 s after its TERM — so the jobs, the log and
+    /// the small probe's sections after them are all there, the repo's facts unknown, and no git
+    /// is left running. The ask's own command for real, under `sh`, its fixed `PATH` with the stub
+    /// git's directory put first.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_hung_git_costs_the_repo_sections_not_the_call() {
+        use std::process::Command;
+        let have = |t: &str| Command::new("sh").arg("-c").arg(format!("command -v {t}")).output().is_ok_and(|o| o.status.success());
+        if !["timeout", "ps", "base64", "df", "du"].iter().all(|t| have(t)) {
+            eprintln!("timeout/ps/base64/df/du missing — skipping");
+            return;
+        }
+        let t = crate::ask::ai::tests::Tmp::new("hung-git");
+        let (bin, home) = (t.0.join("bin"), t.0.join("home"));
+        let repo = home.join("ARENA_materials");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        let pids = t.0.join("git.pids");
+        crate::remote::write_test_script(bin.join("git"), format!("#!/bin/sh\necho $$ >> '{}'\ntrap '' TERM\nexec sleep 300\n", pids.display())).unwrap();
+        let cfg = crate::config::Config::parse(&format!("BACKUP_REPO_PATH={}\n", repo.display()));
+        let cmd = probe_command(&super::super::probe_opts(&cfg), &repo.display().to_string(), NONCE);
+        let fixed = "env -i PATH=/usr/local/sbin:";
+        assert_eq!(cmd.matches(fixed).count(), 1, "{cmd}");
+        let cmd = cmd.replace(fixed, &format!("env -i PATH={}:/usr/local/sbin:", bin.display()));
+        let started = std::time::Instant::now();
+        let out = Command::new("timeout")
+            .args(["-k", "5", "90", "sh", "-c", &cmd])
+            .env("HOME", &home)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .output()
+            .unwrap();
+        let took = started.elapsed();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(took < PROBE_TIMEOUT, "took {took:?}, over the call's budget: {stdout}");
+        let r = parse_reply(&stdout, NONCE).unwrap_or_else(|e| panic!("{e:?}: {stdout}"));
+        assert!(r.complete, "{stdout}");
+        // The sections after the repo's are all there.
+        assert!(matches!(&r.jobs, Some(Ok(j)) if j.is_empty()) && matches!(&r.log, Some(Ok(ReadReply::NoJobs))), "{stdout}");
+        let x = r.extra.as_ref().unwrap();
+        assert!(x.done && x.df_root.is_some() && x.uptime.is_some() && matches!(&x.procs, Some(Ok(p)) if !p.is_empty()), "{x:?}");
+        assert!(!matches!(&x.git, Some(Git::Repo(_))), "{x:?}");
+        let m = r.metrics.as_ref().unwrap();
+        assert_eq!((m.branch.as_deref(), m.origin.as_deref(), m.dirty_files), (None, None, None), "{stdout}");
+        assert!(m.cpu_pct.is_some() && m.host_mem_summary().is_some(), "the metrics after its repo part: {stdout}");
+        // Both repo parts reached git, and every git is gone.
+        let started: Vec<String> = std::fs::read_to_string(&pids).unwrap().lines().map(String::from).collect();
+        assert!(started.len() >= 2, "{started:?}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        for pid in started {
+            let alive = || std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| s.rsplit(')').next().and_then(|r| r.split_whitespace().next()).is_some_and(|st| st != "Z" && st != "X"));
+            while alive() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            assert!(!alive(), "the hung git {pid} is still running");
+        }
     }
 
     /// The user's id, for tmux's socket directory (`tmux-<uid>`).

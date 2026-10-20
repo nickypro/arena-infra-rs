@@ -76,14 +76,16 @@ pub fn pod_cap(pods: usize) -> usize {
 /// command, run on the pod as root, and nothing holds it to reading — it may write a file or a
 /// cache, or run a plain `git status` (an fsmonitor hook, a filter: what `ro_git` keeps out).
 /// `pods ask` only reads. Each `nvidia-smi` within [`bundle::NVIDIA_SMI_SECS`] (review ai-review
-/// claude #6): the GPU facts come first in the call, so a wedged GPU would otherwise take the
-/// whole budget and every section after it.
+/// claude #6), and the repo's part within [`bundle::REPO_SECS`] (codex #4): the GPU and repo facts
+/// come first in the call, so a wedged GPU or a hung volume would otherwise take the whole budget
+/// and every section after it.
 pub fn probe_opts(cfg: &Config) -> ProbeOpts {
     ProbeOpts {
         progress_cmd: None,
         repo_path: Some(crate::backup::repo_path(cfg)),
         key_remote: Some(cfg.get("GIT_SSH_KEY_REMOTE").unwrap_or("/root/.ssh/id_ed25519").to_string()),
         nvidia_smi_timeout: Some(bundle::NVIDIA_SMI_SECS),
+        repo_timeout: Some(bundle::REPO_SECS),
     }
 }
 
@@ -642,17 +644,25 @@ mod tests {
         assert!(tag(&one) != tag(&two) && tag(&one).len() == 16, "{} {}", tag(&one), tag(&two));
     }
 
-    /// Review ai-review claude #6: the call's slow steps are bounded on the pod. Each
-    /// `nvidia-smi` within 10 s where the pod has `timeout` (the GPU facts come first in the call:
-    /// a wedged GPU took the whole budget, every section after it lost); every git of the repo
-    /// section within 10 s — `ro_timeout=10` before its first (the toplevel's), cleared after its
-    /// last, `ro_setup`'s config read through `ro_git` too. The dashboard's own probe keeps
-    /// `nvidia-smi` as it was.
+    /// Review ai-review claude #6, codex #4: the call's slow steps are bounded on the pod, each
+    /// `timeout` KILLing 2 s after its TERM. Each `nvidia-smi` within 10 s where the pod has
+    /// `timeout` (the GPU facts come first in the call: a wedged GPU took the whole budget, every
+    /// section after it lost); the metrics probe's repo part, its `cd` and every git, within 15 s
+    /// as one `sh`; every git of the small probe's repo section within 10 s — `ro_timeout=10`
+    /// before its first (the toplevel's), cleared after its last, `ro_setup`'s config read through
+    /// `ro_git` too. The dashboard's own probe keeps `nvidia-smi` and its repo part as they were.
     #[test]
     fn the_calls_slow_steps_are_bounded_on_the_pod() {
         let cmd = bundle::probe_command(&probe_opts(&cfg("")), "/root/ARENA_materials", "0123456789abcdef");
-        let bounded = "sh -c 'if command -v timeout >/dev/null 2>&1; then exec timeout 10 nvidia-smi \"$@\"; else exec nvidia-smi \"$@\"; fi' nvidia-smi --query-";
+        let bounded = "sh -c 'if command -v timeout >/dev/null 2>&1; then exec timeout -k 2 10 nvidia-smi \"$@\"; else exec nvidia-smi \"$@\"; fi' nvidia-smi --query-";
         assert_eq!((cmd.matches(bounded).count(), cmd.matches("nvidia-smi --query-").count()), (2, 2), "{cmd}");
+        let repo = "sh -c 'if command -v timeout >/dev/null 2>&1; then exec timeout -k 2 15 sh -c \"$0\"; else exec sh -c \"$0\"; fi' 'trap : TERM\nro_drivers=";
+        assert_eq!(cmd.matches(repo).count(), 1, "{cmd}");
+        let part = &cmd[cmd.find(repo).unwrap()..];
+        let part = &part[..part.find("2>/dev/null); '; ").unwrap() + "2>/dev/null); '".len()];
+        assert!(part.contains("echo \"branch=$(cd '\\''/root/ARENA_materials'\\'' 2>/dev/null && ro_git") && part.contains("clog=%h"), "{part}");
+        assert!(!cmd.replace(part, "").contains("ro_git"), "every git of the metrics probe is inside the bound");
+        assert!(crate::metrics::RO_GIT_SH.contains("set -- timeout -k 2 \"$ro_timeout\" git") && bundle::PROBE_SCRIPT.contains("then timeout -k 2 \"$t_secs\" \"$@\";"));
         let script = bundle::probe_script();
         let at = |needle: &str| script.find(needle).unwrap_or_else(|| panic!("{needle} in probe.sh"));
         assert!(at("\n    ro_timeout=10\n") < at("top=$(git rev-parse --show-toplevel"), "set before the repo's first git");
@@ -661,6 +671,7 @@ mod tests {
         assert!(crate::metrics::RO_GIT_SH.contains("ro_k=$(ro_git config --name-only --get-regexp '^filter[.]' 2>/dev/null)"));
         let dashboard = crate::metrics::probe_command(&ProbeOpts { repo_path: Some("/r".into()), ..Default::default() });
         assert!(dashboard.starts_with("nvidia-smi --query-gpu=") && !dashboard.contains("exec timeout"), "{dashboard}");
+        assert!(dashboard.contains("echo \"branch=$(cd '/r' 2>/dev/null && ro_git"), "{dashboard}");
     }
 
     #[test]

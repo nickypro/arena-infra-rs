@@ -36,7 +36,9 @@ pub const PROC_SENTINEL: &str = "@@ARENA_PROC@@";
 ///   `false` would be run as a hook path by git < 2.36), `core.untrackedCache=false`,
 ///   `log.showSignature=false` (a signed commit would run `gpg.program`), and four `-c` words
 ///   per driver `ro_setup` found. `-c` reaches git's own children too (`stash list`'s `git log`).
-///   With `$ro_timeout` set, under `timeout` where the pod has it. The words are built with
+///   With `$ro_timeout` set, under `timeout` where the pod has it — and a KILL 2 s after its TERM
+///   (`-k 2`; review ai-review codex #4: a git that ignores TERM, or waits on a hung volume, would
+///   otherwise hold `timeout` forever). The words are built with
 ///   `set --`, never as an unquoted `$var`: the dashboard's probe runs in the pod user's login
 ///   shell — zsh on the pods — which doesn't split one, so git got all of them as one argument,
 ///   refused it, and every repo with a filter driver (git-lfs puts `filter.lfs.*` in the global
@@ -78,7 +80,7 @@ ro_git() {
         ro_n=$((ro_n - 1))
     done
     if [ -n "${ro_timeout:-}" ] && command -v timeout >/dev/null 2>&1; then
-        set -- timeout "$ro_timeout" git --no-optional-locks -c core.fsmonitor= -c core.untrackedCache=false -c log.showSignature=false "$@"
+        set -- timeout -k 2 "$ro_timeout" git --no-optional-locks -c core.fsmonitor= -c core.untrackedCache=false -c log.showSignature=false "$@"
     else
         set -- command git --no-optional-locks -c core.fsmonitor= -c core.untrackedCache=false -c log.showSignature=false "$@"
     fi
@@ -145,17 +147,35 @@ pub struct ProbeOpts {
     /// probe: a wedged GPU must cost only the GPU's facts, not the whole call's budget); `None`:
     /// unbounded but for the probe's own budget (the dashboard's).
     pub nvidia_smi_timeout: Option<u64>,
+    /// Bound the repo's part — its `cd` into the checkout and every git of it, as one `sh` — to
+    /// this many seconds where the pod has `timeout` (`pods ask`'s probe; review ai-review codex
+    /// #4: a hung `/workspace` volume took the whole call's budget, and every section after it);
+    /// `None`: unbounded but for the probe's own budget (the dashboard's).
+    pub repo_timeout: Option<u64>,
 }
 
-/// `nvidia-smi ARGS`, within `secs` where the pod has `timeout` — one simple command, which any
-/// login shell reads alike — else as it is.
+/// `nvidia-smi ARGS`, within `secs` (KILLed 2 s after its TERM) where the pod has `timeout` — one
+/// simple command, which any login shell reads alike — else as it is.
 fn nvidia_smi(args: &str, secs: Option<u64>) -> String {
     match secs {
         None => format!("nvidia-smi {args}"),
         Some(s) => format!(
-            "sh -c 'if command -v timeout >/dev/null 2>&1; then exec timeout {s} nvidia-smi \"$@\"; else exec nvidia-smi \"$@\"; fi' nvidia-smi {args}"
+            "sh -c 'if command -v timeout >/dev/null 2>&1; then exec timeout -k 2 {s} nvidia-smi \"$@\"; else exec nvidia-smi \"$@\"; fi' nvidia-smi {args}"
         ),
     }
+}
+
+/// `script` run as one `sh -c` within `secs` where the pod has `timeout`, else as it is — a part of
+/// the probe that can hang as a whole (a hung volume under every step of it). What it printed
+/// before is kept. Its whole process group is KILLed 2 s after the TERM, what it started too: the
+/// `sh` traps TERM (a handler, so what it runs still gets TERM's default), because `timeout` sends
+/// its KILL only while the process it runs is alive — a `sh` that died on the TERM let a step that
+/// ignores TERM (a git waiting on a hung volume) outlive the bound.
+fn bounded_sh(script: &str, secs: u64) -> String {
+    format!(
+        "sh -c 'if command -v timeout >/dev/null 2>&1; then exec timeout -k 2 {secs} sh -c \"$0\"; else exec sh -c \"$0\"; fi' {}; ",
+        shell_quote(&format!("trap : TERM\n{script}"))
+    )
 }
 
 /// Parse `nvidia-smi --format=csv,noheader,nounits` output into one stat per GPU.
@@ -328,39 +348,44 @@ fn remote_command(opts: &ProbeOpts) -> String {
     let mut s = format!("{} 2>/dev/null; echo '{SENTINEL}'; ", nvidia_smi(query, opts.nvidia_smi_timeout));
     if let Some(repo) = &opts.repo_path {
         let q = shell_quote(repo);
+        let mut part = String::new();
         // Every git here is `ro_git` ([`RO_GIT_SH`]): nothing the participant's repo configures
         // runs, nothing is written (a plain `git status` would refresh and write the index
         // under `index.lock`, so a refresh could fail the participant's own `git commit`).
-        s.push_str(RO_GIT_SH);
-        s.push_str(&format!(
+        part.push_str(RO_GIT_SH);
+        part.push_str(&format!(
             "echo \"branch=$(cd {q} 2>/dev/null && ro_git rev-parse --abbrev-ref HEAD 2>/dev/null)\"; "
         ));
         // Its first line only: git reads `\n` in a quoted config value as a newline, and a value
         // run over lines could plant `key=value` lines of its own (review ai-review claude #2).
-        s.push_str(&format!(
+        part.push_str(&format!(
             "echo \"origin=$(cd {q} 2>/dev/null && ro_git config --get remote.origin.url 2>/dev/null | head -n 1)\"; "
         ));
         // Last commit time (= last backup, since `pods backup` commits + pushes) and how
         // many entries are uncommitted (work since that backup; 0 = clean tree — a file only
         // touched counts until git refreshes the index, a submodule's edits never: see
         // `ro_changes` and `PodMetrics::dirty_files`).
-        s.push_str(&format!(
+        part.push_str(&format!(
             "echo \"committed=$(cd {q} 2>/dev/null && ro_git log -1 --format=%ct 2>/dev/null)\"; "
         ));
-        s.push_str(&format!(
+        part.push_str(&format!(
             "echo \"dirty=$(cd {q} 2>/dev/null && ro_setup && ro_c=$(ro_changes 2>/dev/null) && printf '%s\\n' \"$ro_c\" | grep -c .)\"; "
         ));
         // Divergence vs the upstream: "<behind>\t<ahead>" (empty when there's no
         // upstream). ahead>0 means committed-but-unpushed — e.g. a push GitHub blocked.
-        s.push_str(&format!(
+        part.push_str(&format!(
             "echo \"sync=$(cd {q} 2>/dev/null && ro_git rev-list --left-right --count '@{{u}}...HEAD' 2>/dev/null)\"; "
         ));
         // The last few commits, newest first — a compact backup/work history. One
         // `clog=` line per commit; the subject is free text (may contain '=') but it's
         // the whole value after the first '=', so it survives the key=value parse.
-        s.push_str(&format!(
+        part.push_str(&format!(
             "(cd {q} 2>/dev/null && ro_git log -n 4 --format='clog=%h  %cr  %s' 2>/dev/null); "
         ));
+        match opts.repo_timeout {
+            Some(secs) => s.push_str(&bounded_sh(&part, secs)),
+            None => s.push_str(&part),
+        }
     }
     s.push_str("([ -e \"$HOME/.name\" ] && echo name=1 || echo name=0); ");
     // Any LLM API key exported in the shell rc files (i.e. `copy-keys` has run)?
@@ -738,6 +763,7 @@ mod tests {
             repo_path: Some("/root/ARENA_3.0".into()),
             key_remote: Some("/root/.ssh/id_ed25519".into()),
             nvidia_smi_timeout: None,
+            repo_timeout: None,
         });
         assert!(cmd.contains("nvidia-smi"));
         assert!(cmd.contains("git rev-parse --abbrev-ref HEAD"));

@@ -6,7 +6,8 @@
 # (sent in the same call, before this) don't give: the pod's clock and uptime, load, disks,
 # logins and tmux sessions, the busiest processes, and the repo's working tree. Rendered and
 # parsed by arena_core::ask::bundle. POSIX sh (dash on the images); every step that could hang
-# runs under `timeout` where the pod has it. Every git — `busy_op`'s included — is `ro_git`
+# runs under `timeout` where the pod has it, KILLed 2 s after its TERM (`-k 2`: a step that ignores
+# TERM, or waits on a hung volume, would otherwise hold `timeout` forever). Every git — `busy_op`'s included — is `ro_git`
 # (arena_core::metrics::RO_GIT_SH, rendered in below): no optional locks (the index is never
 # refreshed, written or locked from under a participant's git), and nothing the repository
 # configures is run — no fsmonitor hook, no clean/process filter, no gpg.program. No `git status`.
@@ -33,7 +34,7 @@ num() {
 t() {
     t_secs=$1
     shift
-    if command -v timeout >/dev/null 2>&1; then timeout "$t_secs" "$@"; else "$@"; fi
+    if command -v timeout >/dev/null 2>&1; then timeout -k 2 "$t_secs" "$@"; else "$@"; fi
 }
 
 # --- Clock, uptime, load ------------------------------------------------------------------------
