@@ -873,7 +873,10 @@ pub fn uncommitted_reason(what: &str, on: &str) -> String {
 /// Render the remote command that *creates* (or switches to) a machine's autocommit
 /// branch for the iteration and pushes it upstream — **without committing any work**
 /// (legacy `init_branches.sh`). Run at the start of a day so the branch exists (with an
-/// upstream) before any `backup`; later backups then just commit onto it. `set -e`
+/// upstream) before any `backup`; later backups then just commit onto it. It pushes only
+/// commits origin already has, never one no backup has scanned ([`INIT_PUSH_SH`]): the rest stay
+/// on the new branch on the pod (`UNPUSHED`, [`parse_init_unpushed`]) for the next backup, which
+/// scans them for keys and pushes them. `set -e`
 /// aborts on the first real error. A checkout whose `origin` isn't the configured repo
 /// (`cfg.origin`) is refused before anything else, as the backup refuses it (`WRONG_ORIGIN`,
 /// [`BACKUP_WRONG_ORIGIN_EXIT`]): the new branch is neither made nor pushed. After the checkout,
@@ -940,13 +943,55 @@ fn init_branch_script(cfg: &BackupConfig, machine_name: &str) -> String {
     parts.push(format!("REDACT_SED={}", shell_quote(&redact_sed())));
     parts.push(unredacted_sh());
     parts.push("cd \"$(git rev-parse --show-toplevel)\"; unredacted_restore \"$(git rev-parse --absolute-git-dir)/arena-unredacted\"".into());
-    // The new branch carries any commit of the old one GitHub refuses (the next backup redacts
-    // and pushes it): the refusal goes to the operator without GitHub's allow-the-secret URL.
+    // Only what origin already has is pushed (review claude #2, FIX9B): [`INIT_PUSH_SH`].
+    parts.push(format!("NB={bq}"));
     parts.push(NO_BYPASS_URL_SH.into());
-    parts.push("P=$(git rev-parse --absolute-git-dir)/arena-init-push.$$".into());
-    parts.push(format!("if git push -u origin {bq} 2>\"$P\"; then R=0; else R=$?; fi"));
-    parts.push("no_bypass_url < \"$P\" >&2; rm -f \"$P\"; exit $R".into());
+    parts.push(INIT_PUSH_SH.trim_end().into());
     parts.join("; ")
+}
+
+/// How [`init_branch_command`] pushes the new branch `$NB`, now checked out: only what origin
+/// already has (review claude #2, FIX9B). The branch starts from HEAD, which may hold commits no
+/// backup has scanned — yesterday's whose push failed (the pod was rsynced and switched anyway),
+/// one the participant made since, a resolve's — and a push of the branch by name sent them raw: a
+/// key in them reached GitHub whenever its push protection didn't catch it. So the push is by id:
+/// HEAD when origin has all of it; else the newest commit of it origin has — origin's own copy of
+/// the branch when that is an ancestor (a second init the same day), so the push stays a
+/// fast-forward — or no push at all when origin has none of it. The rest stays on the new branch
+/// on the pod, said (`UNPUSHED <n> <id>|none`, [`parse_init_unpushed`]), and goes out with the next
+/// backup, which scans it. A refusal reaches the operator without GitHub's allow-the-secret URL
+/// (`no_bypass_url`). Pushed, the branch tracks origin's, as `push -u` made it (an id pushed sets
+/// no upstream), written to the config itself (a narrowed fetch has no remote-tracking ref).
+const INIT_PUSH_SH: &str = r#"TIP=$(git rev-parse HEAD)
+U=$(git rev-list --count "$TIP" --not --remotes=origin)
+AT=$TIP
+if [ "$U" != 0 ]; then
+    if git rev-parse -q --verify "refs/remotes/origin/$NB" >/dev/null && git merge-base --is-ancestor "refs/remotes/origin/$NB" "$TIP"; then
+        AT=$(git rev-parse "refs/remotes/origin/$NB")
+    else
+        AT=$(git rev-list --boundary "$TIP" --not --remotes=origin | sed -n 's/^-//p')
+        if [ -n "$AT" ]; then AT=$(git rev-list --no-walk $AT | head -n 1); fi
+    fi
+    echo "UNPUSHED $U ${AT:-none}"
+fi
+if [ -z "$AT" ]; then exit 0; fi
+P=$(git rev-parse --absolute-git-dir)/arena-init-push.$$
+if git push origin "$AT:refs/heads/$NB" 2>"$P"; then R=0; else R=$?; fi
+no_bypass_url < "$P" >&2; rm -f "$P"
+if [ "$R" = 0 ]; then git config "branch.$NB.remote" origin && git config "branch.$NB.merge" "refs/heads/$NB" || true; fi
+exit $R
+"#;
+
+/// What [`init_branch_command`] said it left unpushed (`UNPUSHED <n> <id>|none`): `n` commits of
+/// the new branch that origin doesn't have, left on the pod for the next backup to scan and push,
+/// and the commit the branch was pushed at (`None`: not pushed, origin has none of it). `None`
+/// when it pushed the whole branch.
+pub fn parse_init_unpushed(stdout: &str) -> Option<(u64, Option<String>)> {
+    stdout.lines().find_map(|l| {
+        let f: Vec<&str> = l.trim_end_matches('\r').strip_prefix("UNPUSHED ")?.split_whitespace().collect();
+        let [n, at] = f[..] else { return None };
+        Some((n.parse().ok()?, Some(at).filter(|a| *a != "none").map(String::from)))
+    })
 }
 
 /// Render the remote command that switches a pod's ARENA checkout to `branch`.
@@ -2529,31 +2574,94 @@ done
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `init-branches` from a branch whose unpushed commits GitHub refuses: the new day's branch
-    /// carries them (created from HEAD), so its first push is refused too — and the next backup
-    /// heals the new branch (no upstream yet). Nothing of the old branch is left behind.
+    /// Review claude #2 (FIX9B item 2): `init-branches` pushed the new day's branch by name, from
+    /// HEAD — so a pod still on yesterday's branch, whose push had failed (it was rsynced and
+    /// switched anyway), sent yesterday's unscanned commits out raw, a key in them reaching GitHub
+    /// wherever push protection didn't stop it (this origin stops nothing). Now the new branch
+    /// goes to origin at the newest commit origin has, said (`UNPUSHED 1 <id>`), the participant's
+    /// commit kept on it on the pod; no object on origin holds either key (one in the file, one in
+    /// the message); the next backup scans the commit and pushes it redacted, a fast-forward.
     #[cfg(unix)]
     #[test]
-    fn a_new_days_branch_carrying_a_refused_commit_is_healed_by_the_next_backup() {
-        let s = GitSandbox::new("init-heal", 1_000_000);
-        s.push_protect("");
-        let key = openrouter_key(8);
+    fn init_branches_never_pushes_unscanned_commits_and_the_next_backup_pushes_them_redacted() {
+        let s = GitSandbox::new("init-unscanned", 1_000_000);
+        let pushed = s.git(&s.work, &["rev-parse", "HEAD"]);
+        let (key, in_msg) = (openrouter_key(8), format!("{}{}", "hf_", body(LETTERS, 34, 43)));
+        // Yesterday: the participant's own commit, a key in the file and another in the message…
         std::fs::write(s.work.join("ex.py"), format!("k = '{key}'\n")).unwrap();
         s.git(&s.work, &["add", "-A"]);
-        s.git(&s.work, &["commit", "-q", "-m", "yesterday, with a key"]);
-        let cfg = BackupConfig { repo_path: s.work.display().to_string(), prefix: "devtest".into(), week: 1, day: 2, git_ssh_key: None, origin: None };
-        let o = std::process::Command::new("bash").arg("-c").arg(init_branch_command(&cfg, "devtest-x")).output().unwrap();
-        assert!(!o.status.success(), "the new branch's push carries the key");
-        // Its refusal reaches the operator — without GitHub's allow-the-secret URL (review: it
-        // used to pass the push's stderr through as it was).
-        let err = String::from_utf8_lossy(&o.stderr);
-        assert!(err.contains("GH013") && err.contains("locations:"), "{err}");
-        assert!(!err.contains("unblock-secret") && !err.contains("secret-scanning") && !err.contains(&key), "{err}");
-        assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "autocommit-devtest-w1d2-x");
+        s.git(&s.work, &["commit", "-q", "-m", &format!("yesterday, with {in_msg}")]);
+        let mine = s.git(&s.work, &["rev-parse", "HEAD"]);
+        // …and the backup's push of it failed (the network): nothing of it on origin.
+        let hook = s.origin.join("hooks/pre-receive");
+        crate::remote::write_test_script(&hook, "#!/bin/sh\necho 'fatal: the network is down' >&2\nexit 1\n").unwrap();
         let (code, r, err) = s.backup();
-        assert_eq!((code, r.outcome, r.history.map(|h| h.0)), (Some(0), Some((BACKUP_PUSHED, "autocommit-devtest-w1d2-x".into())), Some(1)), "{err}");
-        assert_eq!(s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "log", "-1", "--format=%s", "autocommit-devtest-w1d2-x"]), "yesterday, with a key");
-        assert!(!s.origin_holds(&key));
+        assert_eq!((code, r.push_failed), (Some(1), true), "{err}");
+        std::fs::remove_file(&hook).unwrap();
+        assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), mine, "a failed push moves nothing");
+
+        let cfg = BackupConfig { repo_path: s.work.display().to_string(), prefix: "devtest".into(), week: 1, day: 2, git_ssh_key: None, origin: None };
+        let o = s.run(&init_branch_command(&cfg, "devtest-x"));
+        let (out, err) = (String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        assert!(o.status.success(), "{out}{err}");
+        assert_eq!(parse_init_unpushed(&out), Some((1, Some(pushed.clone()))), "{out}");
+        assert!(!s.origin_holds(&key) && !s.origin_holds(&in_msg), "init-branches pushed an unscanned commit's key");
+        let new = "autocommit-devtest-w1d2-x";
+        assert_eq!(s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "rev-parse", new]), pushed, "at the newest commit origin has");
+        // The participant's work is on the new branch, on the pod; it tracks origin's.
+        assert_eq!((s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), s.git(&s.work, &["rev-parse", "HEAD"])), (new.to_string(), mine));
+        let config = |k: &str| s.git(&s.work, &["config", &format!("branch.{new}.{k}")]);
+        assert_eq!((config("remote"), config("merge")), ("origin".to_string(), format!("refs/heads/{new}")));
+
+        // The next backup scans it: both keys redacted, pushed as a fast-forward of the new branch.
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome, r.history.map(|h| h.0)), (Some(0), Some((BACKUP_PUSHED, new.into())), Some(1)), "{err}");
+        assert_eq!(s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "log", "-1", "--format=%s", new]), "yesterday, with REDACTED-HUGGINGFACE-TOKEN");
+        assert_eq!(s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "rev-parse", &format!("{new}^")]), pushed);
+        assert_eq!(s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "show", &format!("{new}:ex.py")]), "k = 'REDACTED-OPENROUTER-KEY'");
+        assert!(!s.origin_holds(&key) && !s.origin_holds(&in_msg));
+    }
+
+    /// FIX9B item 2, the other two cases: a second init the same day, on a day branch origin has
+    /// with a commit on top that it doesn't — origin's copy stays as it is (the push a no-op, never
+    /// a non-fast-forward), the commit said and kept; and a HEAD origin has none of (no commit of it
+    /// on origin at all) — the branch made on the pod, not pushed, said, and the next backup
+    /// creates it on origin. A HEAD origin has all of goes out whole, as before, said nothing.
+    #[cfg(unix)]
+    #[test]
+    fn init_branches_pushes_only_what_origin_has_and_says_what_waits_for_the_backup() {
+        let s = GitSandbox::new("init-only-origins", 1_000_000);
+        let origin_ref = |b: &str| s.run(&format!("git --git-dir {} rev-parse -q --verify refs/heads/{b}", shell_quote(s.origin.to_str().unwrap())));
+        let cfg = |d: u32| BackupConfig { repo_path: s.work.display().to_string(), prefix: "devtest".into(), week: 1, day: d, git_ssh_key: None, origin: None };
+        let init = |d: u32| {
+            let o = s.run(&init_branch_command(&cfg(d), "devtest-x"));
+            let out = String::from_utf8_lossy(&o.stdout).into_owned();
+            assert!(o.status.success(), "{out}{}", String::from_utf8_lossy(&o.stderr));
+            out
+        };
+        // All on origin: pushed whole, nothing said.
+        let out = init(2);
+        assert_eq!(parse_init_unpushed(&out), None, "{out}");
+        let day2 = s.git(&s.work, &["rev-parse", "HEAD"]);
+        assert_eq!(String::from_utf8_lossy(&origin_ref("autocommit-devtest-w1d2-x").stdout).trim(), day2);
+        // A commit on it origin doesn't have, then init again the same day.
+        std::fs::write(s.work.join("notes.md"), "n\n").unwrap();
+        s.git(&s.work, &["add", "-A"]);
+        s.git(&s.work, &["commit", "-q", "-m", "not pushed yet"]);
+        let out = init(2);
+        assert_eq!(parse_init_unpushed(&out), Some((1, Some(day2.clone()))), "{out}");
+        assert_eq!(String::from_utf8_lossy(&origin_ref("autocommit-devtest-w1d2-x").stdout).trim(), day2, "origin's copy as it was");
+        assert_eq!(s.git(&s.work, &["log", "-1", "--format=%s"]), "not pushed yet");
+        // A history origin has none of: the branch made, not pushed.
+        s.git(&s.work, &["checkout", "-q", "--orphan", "fresh"]);
+        s.git(&s.work, &["commit", "-q", "-m", "a root of its own"]);
+        let out = init(3);
+        assert_eq!(parse_init_unpushed(&out), Some((1, None)), "{out}");
+        assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "autocommit-devtest-w1d3-x");
+        assert!(!origin_ref("autocommit-devtest-w1d3-x").status.success(), "pushed with no commit on origin");
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome), (Some(0), Some((BACKUP_PUSHED, "autocommit-devtest-w1d3-x".into()))), "{err}");
+        assert_eq!(String::from_utf8_lossy(&origin_ref("autocommit-devtest-w1d3-x").stdout).trim(), s.git(&s.work, &["rev-parse", "HEAD"]));
     }
 
     /// `set-branch` on a pod with a key the backup redacted (the file on disk keeps the real key,
@@ -3051,7 +3159,9 @@ done
         let cmd = init_branch_script(&c, "arena8-apple");
         assert!(cmd.contains("git fetch --prune origin") && !cmd.contains("--all"), "{cmd}");
         assert!(cmd.contains("git checkout -b 'autocommit-arena8-w1d4-apple'"));
-        assert!(cmd.contains("git push -u origin 'autocommit-arena8-w1d4-apple'"));
+        // Pushed by id, only what origin has (FIX9B item 2), never the branch by name.
+        assert!(cmd.contains("NB='autocommit-arena8-w1d4-apple'") && cmd.contains(INIT_PUSH_SH.trim_end()), "{cmd}");
+        assert!(INIT_PUSH_SH.contains(r#"git push origin "$AT:refs/heads/$NB""#) && !cmd.contains("git push -u"), "{cmd}");
         // It only creates/pushes the branch — never stages or commits work. (The refusal of a
         // checkout mid-merge names `git add`/`git commit` in the words it prints, never runs them.)
         let refusal = busy_refusal_sh("arena init-branches");
@@ -3418,7 +3528,10 @@ done
         assert_eq!(s.git(&s.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "autocommit-x", "no branch made or switched to");
         assert!(s.git(&s.work, &["branch", "--list", "autocommit-devtest-w1d2-x"]).is_empty());
         assert!(s.ssh_calls().is_empty());
-        // The configured repo (scp-style, served by the stand-in): made and pushed, as before.
+        // The configured repo (scp-style, served by the stand-in), holding the course's main as a
+        // cohort repo does: made and pushed, as before. (On a repo with none of HEAD's commits it
+        // would be made and left for the next backup to push: FIX9B item 2.)
+        s.git(&s.work, &["push", "-q", github.to_str().unwrap(), "main"]);
         s.git(&s.work, &["remote", "set-url", "origin", "git@github.com:Styme3279/ARENA_materials.git"]);
         let o = s.run(&init_branch_command(&cfg, "devtest-x"));
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));

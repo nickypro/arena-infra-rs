@@ -9015,6 +9015,25 @@ fn unredacted_note(stdout: &str) -> String {
     note
 }
 
+/// What `init-branches` left unpushed on the new branch ([`arena_core::backup::parse_init_unpushed`]):
+/// commits origin doesn't have, which it never pushes unscanned (review claude #2, FIX9B) — the
+/// next backup scans them for keys and pushes them. The branch went to origin at the newest
+/// commit origin has, or not at all when origin has none of it. Empty when it pushed the whole
+/// branch.
+fn unpushed_note(stdout: &str) -> String {
+    match arena_core::backup::parse_init_unpushed(stdout) {
+        None => String::new(),
+        Some((n, Some(at))) => format!(
+            " — {n} commit(s) origin doesn't have stay on it on the pod, unpushed (the branch went to origin at {}, the newest \
+             commit origin has): the next backup scans them for keys and pushes them",
+            at.get(..10).unwrap_or(&at)
+        ),
+        Some((n, None)) => format!(
+            " — not pushed: origin has none of its {n} commit(s); the next backup scans them for keys and pushes the branch"
+        ),
+    }
+}
+
 /// Where a `--hard` switch saved, on the pod, what it then discarded (`DISCARDED_SAVED <path>`:
 /// its uncommitted changes, an operation's state, untracked files the reset replaced —
 /// [`arena_core::backup::checkout_command`]), for the pod's line: a folder no later save or copy
@@ -13515,7 +13534,7 @@ async fn handle_init_branches(
     // A day branch that already exists gets back the real keys set aside on it (the morning's
     // `set-branch main` run twice): said as set-branch says it.
     let run = switch_guarded(&remote, cfg, sel, targets, rsync, None, cmd_for, BRANCH_TIMEOUT, &doing, |name, out, note| {
-        format!("✓ {name} -> {}{}{note}", bcfg.branch_for(name), unredacted_note(&out.stdout))
+        format!("✓ {name} -> {}{}{}{note}", bcfg.branch_for(name), unpushed_note(&out.stdout), unredacted_note(&out.stdout))
     })
     .await;
     println!("\nDone: {} initialized, {} failed, {} not switched (of {total}).", run.ok, run.failed.len(), run.not_switched.len());
@@ -21220,7 +21239,7 @@ mod remote_tests {
         target_is_pod, BackupTally, Unpushed, Cli, Cmd, CopyLeg, CopyPlan, PodCmd, RestoreOpts, RestoreSource, RunResult, Select, SelectByFlag, Selected,
         Unscoped, BACKUP_TIMEOUT, BRANCH_TIMEOUT, CP_BASE_TIMEOUT, POD_COPY_TIMEOUT, RUN_TIMEOUT_SECS, TEST_TIMEOUT,
     };
-    use super::{copy_failure_reason, discarded_note, fallback_lines, mirror_refusal_text, not_pushed_note, sync_time_label, unredacted_note, Pulled};
+    use super::{copy_failure_reason, discarded_note, fallback_lines, mirror_refusal_text, not_pushed_note, sync_time_label, unpushed_note, unredacted_note, Pulled};
     use super::{failure_why, local_backup_dir, push_first_note, take_pod_locks, take_said, telling_line, PodCall};
     use arena_core::selector::{Naming, SelectArgs};
     use arena_core::backup::{backup_command, checkout_command, checkout_command_limited, init_branch_command, BackupConfig, BACKUP_BUSY_EXIT};
@@ -23136,6 +23155,17 @@ mod remote_tests {
         );
         assert_eq!(unredacted_note("UNREDACTED_RESTORED joep.py\n"), " — real key(s) back in 1 file(s) git has redacted: joep.py");
         assert_eq!(unredacted_note("RESTORED Grokking\n"), "");
+        // What init-branches left for the next backup to scan and push (FIX9B item 2).
+        assert_eq!(
+            unpushed_note("Switched to a new branch 'x'\nUNPUSHED 2 0123456789abcdef0123456789abcdef01234567\n"),
+            " — 2 commit(s) origin doesn't have stay on it on the pod, unpushed (the branch went to origin at 0123456789, the \
+             newest commit origin has): the next backup scans them for keys and pushes them"
+        );
+        assert_eq!(
+            unpushed_note("UNPUSHED 3 none\n"),
+            " — not pushed: origin has none of its 3 commit(s); the next backup scans them for keys and pushes the branch"
+        );
+        assert_eq!(unpushed_note("Switched to a new branch 'x'\nUNREDACTED_RESTORED a.py\n"), "");
     }
 
     /// A backup that found a merge in progress on the pod, its conflicts unresolved (a conflicted
@@ -23963,6 +23993,26 @@ mod remote_tests {
             "{said:#?}"
         );
         assert!(init_branch_command(&BackupConfig::from_config(&cfg(), 1, 2), "devtest-apple").contains("unredacted_restore "));
+    }
+
+    /// Review claude #2 (FIX9B item 2): init-branches no longer pushes commits origin doesn't have
+    /// (no backup has scanned them). Its line says so, and that the next backup scans and pushes
+    /// them — the run still succeeds: the day's branch is made and on origin.
+    #[tokio::test(start_paused = true)]
+    async fn init_branches_says_what_it_left_for_the_next_backup() {
+        let fake = Arc::new(FakeRemote::new());
+        let at = "89abcdef0123456789abcdef0123456789abcdef";
+        fake.script(&host(22001), [FakeReply::stdout("SKIP main\n"), FakeReply::stdout(&format!("Switched to a new branch 'x'\nUNPUSHED 2 {at}\n"))]);
+        take_said();
+        handle_init_branches(fake.clone(), &cfg(), Some(1), Some(2), &everyone(&fleet_of(&[("apple", 22001)])), false, true, "rsync").await.unwrap();
+        let said = take_said();
+        assert!(
+            said.iter().any(|l| l
+                == "[1/1] ✓ devtest-apple -> autocommit-devtest-w1d2-apple — 2 commit(s) origin doesn't have stay on it on the pod, \
+                    unpushed (the branch went to origin at 89abcdef01, the newest commit origin has): the next backup scans them for \
+                    keys and pushes them"),
+            "{said:#?}"
+        );
     }
 
     /// A local file to copy, removed on drop.

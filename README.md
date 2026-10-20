@@ -950,7 +950,13 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     upstream **without committing** (legacy `init_branches`), so a new day's branch
     exists before `backup` runs. `--week`/`--day` override; `--dry-run` previews. 2-min
     budget per pod. A pod still on another branch has it backed up first, as `set-branch` does
-    (and isn't switched if it can be neither pushed nor copied). A pod with an operation in
+    (and isn't switched if it can be neither pushed nor copied). It pushes only commits origin
+    already has, by id — never one no backup has scanned (review claude #2: a pod whose backup
+    push had failed, rsynced and switched anyway, sent yesterday's unscanned commits out with the
+    new branch): if the new branch holds commits origin doesn't, it goes to origin at the newest
+    commit origin has (or isn't pushed at all, when origin has none of it), and the rest stay on it
+    on the pod, said on its line (`— 2 commit(s) origin doesn't have stay on it on the pod,
+    unpushed (…): the next backup scans them for keys and pushes them`). A pod with an operation in
     progress (a merge, cherry-pick, revert, `git am`, rebase, paused sequence, conflicts) is
     refused, touching nothing (`arena init-branches: a merge is in progress on <branch> — not
     switched …`, exit 6): `git checkout -b` would drop the merge and carry its conflicts onto the
