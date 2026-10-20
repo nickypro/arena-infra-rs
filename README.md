@@ -6,7 +6,7 @@
 
 **One CLI and a live dashboard for running an [ARENA](https://arena.education/) cohort's GPU pods**
 
-[![CI](https://github.com/nickypro/arena-infra-rs/actions/workflows/ci.yml/badge.svg?branch=dev%2Fphase0)](https://github.com/nickypro/arena-infra-rs/actions/workflows/ci.yml)
+[![CI](https://github.com/nickypro/arena-infra-rs/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/nickypro/arena-infra-rs/actions/workflows/ci.yml)
 [![Rust 1.96](https://img.shields.io/badge/rust-1.96-orange?logo=rust)](.github/workflows/ci.yml)
 [![Providers](https://img.shields.io/badge/providers-RunPod%20%C2%B7%20Vast%20%C2%B7%20Hetzner%20%C2%B7%20Shadeform-blue)](docs/REFERENCE.md#providers)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
