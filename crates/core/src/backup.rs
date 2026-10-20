@@ -118,8 +118,16 @@ pub const GITHUB_FILE_LIMIT_BYTES: u64 = 100 * 1024 * 1024;
 pub const BACKUP_STUCK_EXIT: i32 = 3;
 
 /// The exit status of a backup whose push GitHub's push protection still refuses after the
-/// redaction and the heal: a key [`SECRET_PATTERNS`] doesn't know (`PUSH_BLOCKED <reason>`).
+/// redaction and the heal: a key [`SECRET_PATTERNS`] doesn't know (`PUSH_BLOCKED <reason>`) — or
+/// whose own last scan found a key still in what would go out, so it never pushed ([`KEY_LEFT`]).
 pub const BACKUP_BLOCKED_EXIT: i32 = 4;
+
+/// `PUSH_BLOCKED`'s reason when the backup's last scan before the push — of exactly the commits
+/// and blobs going out — still finds a key (review claude #1, FIX10): in a commit's header (an
+/// author's or committer's name or email, a merged signed tag's `mergetag`), in a file the
+/// redaction never rewrites (binary, a symlink's target), or one a redaction missed. Nothing was
+/// pushed; the pod is copied as for a refused push ([`BackupReport::failed_at_push`]).
+pub const KEY_LEFT: &str = "key left after redaction";
 
 /// The exit status of a backup (or `init-branches`) on a pod whose `origin` isn't the configured
 /// repo ([`configured_repo`]): `WRONG_ORIGIN`, checked before anything else, so nothing is
@@ -748,6 +756,13 @@ impl BackupReport {
         }
         if let (Some(BACKUP_BLOCKED_EXIT), Some(why)) = (code, &self.push_blocked) {
             let branch = self.branch.as_deref().unwrap_or("its branch");
+            if why == KEY_LEFT {
+                return Some(format!(
+                    "a key is still in the unpushed commits of {branch} after the redaction — in a commit's author, committer \
+                     or merged tag, a binary file or a symlink, or a redaction that didn't take — so nothing was pushed. Take \
+                     it out of those commits on {pod} by hand"
+                ));
+            }
             return Some(format!(
                 "GitHub push protection refuses {branch}: {why} — a secret the backup doesn't redact. Its pattern belongs in \
                  arena_core::backup::SECRET_PATTERNS; until then, take it out of the unpushed commits on {pod} by hand \
@@ -787,6 +802,9 @@ impl BackupReport {
             return Some(format!("file(s) over {} MB in unpushed commits", GITHUB_FILE_LIMIT_BYTES / (1024 * 1024)));
         }
         if let (Some(BACKUP_BLOCKED_EXIT), Some(why)) = (code, &self.push_blocked) {
+            if why == KEY_LEFT {
+                return Some("a key left in the unpushed commits after the redaction".into());
+            }
             return Some(format!("GitHub push protection: {why}"));
         }
         self.heal_aborted.as_ref().map(|_| "the branch moved while its commits were being redacted".to_string())
@@ -964,6 +982,9 @@ fn init_branch_script(cfg: &BackupConfig, machine_name: &str) -> String {
 /// operator without GitHub's allow-the-secret URL
 /// (`no_bypass_url`). Pushed, the branch tracks origin's, as `push -u` made it (an id pushed sets
 /// no upstream), written to the config itself (a narrowed fetch has no remote-tracking ref).
+/// Before the push, that the commit is one origin has is checked, not assumed (review claude #1,
+/// FIX10): by the choice above it always is, so no key scan is needed — and a later change to that
+/// choice fails closed (not pushed, said, exit 1) instead of sending unscanned commits out.
 const INIT_PUSH_SH: &str = r#"TIP=$(git rev-parse HEAD)
 U=$(git rev-list --count "$TIP" --not --remotes=origin)
 AT=$TIP
@@ -977,6 +998,10 @@ if [ "$U" != 0 ]; then
     echo "UNPUSHED $U ${AT:-none}"
 fi
 if [ -z "$AT" ]; then exit 0; fi
+if ! UNSEEN=$(git rev-list -n 1 "$AT" --not --remotes=origin) || [ -n "$UNSEEN" ]; then
+    echo "arena init-branches: $AT has commits origin doesn't have - not pushed (the next backup scans and pushes them)" >&2
+    exit 1
+fi
 P=$(git rev-parse --absolute-git-dir)/arena-init-push.$$
 if git push --no-follow-tags origin "$AT:refs/heads/$NB" 2>"$P"; then R=0; else R=$?; fi
 no_bypass_url < "$P" >&2; rm -f "$P"
@@ -2275,31 +2300,41 @@ done
     }
 
     /// Only text files are rewritten: a binary file (a NUL in its first 8000 bytes) holding a
-    /// key's bytes and a symlink whose target is key-shaped are committed exactly as they are
-    /// (origin here scans nothing — GitHub skips binaries; the symlink is just a shape test).
+    /// key's bytes and a symlink whose target is key-shaped are committed exactly as they are (the
+    /// symlink is just a shape test). Pushed, they would put the key on GitHub, whose push
+    /// protection skips binaries; so the last scan before the push stops it (FIX10): nothing
+    /// leaves the pod, the commit stays on it as it was, each file a separate case.
     #[cfg(unix)]
     #[test]
-    fn binary_files_and_symlinks_are_never_rewritten() {
-        let s = GitSandbox::new("redact-skip", 1_000_000);
+    fn binary_files_and_symlinks_are_never_rewritten_and_a_key_in_them_never_pushed() {
         let key = openrouter_key(3);
         let mut bin = vec![0u8, 1, 2];
         bin.extend_from_slice(format!(" {key} ").as_bytes());
-        std::fs::write(s.work.join("weights.bin"), &bin).unwrap();
-        std::os::unix::fs::symlink(&key, s.work.join("link")).unwrap();
-        std::fs::write(s.work.join("a.py"), format!("k='{key}'\n")).unwrap();
-        let (code, r, err) = s.backup();
-        assert_eq!((code, r.redacted.clone()), (Some(0), vec![(1, "a.py".to_string())]), "{err}");
-        let blob = |path: &str| {
-            let o = std::process::Command::new("git")
-                .args(["--git-dir", s.origin.to_str().unwrap(), "cat-file", "blob", &format!("autocommit-x:{path}")])
-                .output()
-                .unwrap();
-            o.stdout
-        };
-        assert_eq!(blob("weights.bin"), bin, "a binary file is committed byte for byte");
-        assert_eq!(blob("link"), key.as_bytes(), "a symlink is committed as it is");
-        assert!(s.origin_tree("autocommit-x").contains(&("120000".to_string(), "link".to_string())));
-        assert_eq!(blob("a.py"), b"k='REDACTED-OPENROUTER-KEY'\n");
+        for case in ["binary", "symlink"] {
+            let s = GitSandbox::new(&format!("redact-skip-{case}"), 1_000_000);
+            let pushed = s.git(&s.work, &["rev-parse", "HEAD"]);
+            if case == "binary" {
+                std::fs::write(s.work.join("weights.bin"), &bin).unwrap();
+            } else {
+                std::os::unix::fs::symlink(&key, s.work.join("link")).unwrap();
+            }
+            std::fs::write(s.work.join("a.py"), format!("k='{key}'\n")).unwrap();
+            let (code, r, err) = s.backup();
+            assert_eq!((code, r.redacted.clone(), r.push_blocked.as_deref()), (Some(BACKUP_BLOCKED_EXIT), vec![(1, "a.py".to_string())], Some(KEY_LEFT)), "{case}: {err}");
+            let blob = |path: &str| {
+                let o = std::process::Command::new("git").current_dir(&s.work).args(["cat-file", "blob", &format!("HEAD:{path}")]).output().unwrap();
+                o.stdout
+            };
+            if case == "binary" {
+                assert_eq!(blob("weights.bin"), bin, "a binary file is committed byte for byte");
+            } else {
+                assert_eq!(blob("link"), key.as_bytes(), "a symlink is committed as it is");
+                assert!(s.git(&s.work, &["ls-tree", "HEAD", "link"]).starts_with("120000 "), "{case}");
+            }
+            assert_eq!(blob("a.py"), b"k='REDACTED-OPENROUTER-KEY'\n", "{case}");
+            assert!(!s.origin_holds(&key), "{case}: the key reached origin");
+            assert_eq!(s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "rev-parse", "autocommit-x"]), pushed, "{case}");
+        }
     }
 
     /// The live case: keys committed by backups from before the redaction, 3 unpushed commits,
@@ -2689,6 +2724,37 @@ done
         assert_eq!(String::from_utf8_lossy(&origin_ref("autocommit-devtest-w1d3-x").stdout).trim(), s.git(&s.work, &["rev-parse", "HEAD"]));
     }
 
+    /// FIX10 (review claude #1): init-branches pushes only a commit origin already has — by its
+    /// choice of the commit, so it needs no key scan of its own — and checks that before the push
+    /// rather than assume it. Were that choice ever to pick a commit origin lacks (here the choice
+    /// skipped: HEAD, an unscanned commit with a key on top of what origin has), nothing is
+    /// pushed, it says why, and it fails. The script as it is pushes the newest commit origin has.
+    #[cfg(unix)]
+    #[test]
+    fn init_branches_checks_it_pushes_only_what_origin_has() {
+        let s = GitSandbox::new("init-guard", 1_000_000);
+        let pushed = s.git(&s.work, &["rev-parse", "HEAD"]);
+        let key = openrouter_key(54);
+        std::fs::write(s.work.join("ex.py"), format!("k = '{key}'\n")).unwrap();
+        s.git(&s.work, &["add", "ex.py"]);
+        s.git(&s.work, &["commit", "-q", "-m", "not scanned yet"]);
+        let origin_ref = || s.run(&format!("git --git-dir {} rev-parse -q --verify refs/heads/autocommit-new", shell_quote(s.origin.to_str().unwrap())));
+        let push = |script: &str| s.run(&format!("cd {} && NB=autocommit-new; {NO_BYPASS_URL_SH}; {script}", shell_quote(s.work.to_str().unwrap())));
+        let drifted = INIT_PUSH_SH.replacen(r#"if [ "$U" != 0 ]; then"#, "if false; then", 1);
+        assert_ne!(drifted, INIT_PUSH_SH);
+        let o = push(&drifted);
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert_eq!(o.status.code(), Some(1), "{err}");
+        assert!(err.contains("has commits origin doesn't have - not pushed (the next backup scans and pushes them)"), "{err}");
+        assert!(!origin_ref().status.success() && !s.origin_holds(&key), "{err}");
+        let o = push(INIT_PUSH_SH);
+        let out = String::from_utf8_lossy(&o.stdout);
+        assert!(o.status.success(), "{out}{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(parse_init_unpushed(&out), Some((1, Some(pushed.clone()))), "{out}");
+        assert_eq!(String::from_utf8_lossy(&origin_ref().stdout).trim(), pushed);
+        assert!(!s.origin_holds(&key));
+    }
+
     /// `set-branch` on a pod with a key the backup redacted (the file on disk keeps the real key,
     /// so it is modified for good). Gentle to `main` used to refuse — every day — and `--hard`
     /// threw the key away (no commit has it). Now both switch, the real-key files set aside in
@@ -2831,6 +2897,69 @@ done
         assert_eq!(s.git(&s.work, &["log", "-1", "--format=%B", "HEAD"]), "login with REDACTED-HUGGINGFACE-TOKEN");
         assert_eq!(s.git(&s.work, &["rev-parse", "HEAD"]), s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "rev-parse", "autocommit-x"]));
         assert_eq!(s.read("ex.py"), format!("k = '{in_file}'\n").as_bytes(), "the file on disk keeps its key");
+    }
+
+    /// Review claude #1 (FIX10): the rewrite takes keys out of messages and text files only, and
+    /// the push went ahead whatever was left — a key in a commit's header (here the author's name
+    /// alone) went to GitHub as it was. Now a last scan of exactly what goes out (`$NEW --not
+    /// --remotes=origin`, commits and blobs) stops the push: `PUSH_BLOCKED key left after
+    /// redaction`, exit 4, a failure at the push (the pod is copied by rsync) — every run, nothing
+    /// on origin, the commit kept on the pod as it was. A key in a file is redacted and pushed as
+    /// before: the last scan passes it. So does a redaction that didn't take (a sed drifting from
+    /// the scan's grep; here one that leaves the text as it was): the key is committed, never
+    /// pushed.
+    #[cfg(unix)]
+    #[test]
+    fn a_key_left_after_the_redaction_is_never_pushed() {
+        let s = GitSandbox::new("key-left", 1_000_000);
+        let origin_tip = || s.git(&s.base, &["--git-dir", s.origin.to_str().unwrap(), "rev-parse", "autocommit-x"]);
+        // A key in a file: redacted, pushed.
+        let in_file = openrouter_key(51);
+        std::fs::write(s.work.join("ex.py"), format!("k = '{in_file}'\n")).unwrap();
+        let (code, r, err) = s.backup();
+        assert_eq!((code, r.outcome, r.redacted), (Some(0), Some((BACKUP_PUSHED, "autocommit-x".into())), vec![(1, "ex.py".to_string())]), "{err}");
+        let pushed = s.git(&s.work, &["rev-parse", "HEAD"]);
+        assert_eq!(origin_tip(), pushed);
+        assert!(!s.origin_holds(&in_file), "the file's key reached origin");
+        // A key in the author's name only: committer, message and files clean.
+        let in_author = format!("{}{}", "hf_", body(LETTERS, 34, 52));
+        s.put("notes.md", 20);
+        s.git(&s.work, &["add", "notes.md"]);
+        s.git(&s.work, &["commit", "-q", "--author", &format!("Dev {in_author} <dev@example.invalid>"), "-m", "notes"]);
+        let tip = s.git(&s.work, &["rev-parse", "HEAD"]);
+        for run in 1..=2 {
+            let (code, out, err) = s.backup_raw();
+            let r = parse_backup_report(&out);
+            assert_eq!((code, r.push_blocked.as_deref()), (Some(BACKUP_BLOCKED_EXIT), Some(KEY_LEFT)), "run {run}: {out}{err}");
+            assert!(r.outcome.is_none() && r.history.is_none() && r.failed_at_push(), "run {run}: {r:?}");
+            assert!(!out.contains(&in_author) && !err.contains(&in_author), "run {run}: the key printed: {out}{err}");
+            assert!(!s.origin_holds(&in_author), "run {run}: the author's key reached origin");
+            assert_eq!((origin_tip(), s.git(&s.work, &["rev-parse", "HEAD"])), (pushed.clone(), tip.clone()), "run {run}");
+            let fail = r.failure("/root/ARENA_materials", "devtest-x", code).unwrap();
+            assert!(fail.starts_with("a key is still in the unpushed commits of autocommit-x after the redaction — "), "{fail}");
+            assert!(fail.ends_with("so nothing was pushed. Take it out of those commits on devtest-x by hand"), "{fail}");
+            assert_eq!(r.failure_brief(code).as_deref(), Some("a key left in the unpushed commits after the redaction"));
+        }
+
+        // A redaction that didn't take: a sed that, given the redaction, leaves the text as it was.
+        let s = GitSandbox::new("key-left-sed", 1_000_000);
+        let bin = s.base.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let sed = ["/usr/bin/sed", "/bin/sed"].into_iter().find(|p| std::path::Path::new(p).exists()).unwrap();
+        crate::remote::write_test_script(
+            bin.join("sed"),
+            format!("#!/bin/sh\ncase \"$*\" in *REDACTED-*) for a; do last=$a; done; exec cat \"$last\";; esac\nexec {sed} \"$@\"\n"),
+        )
+        .unwrap();
+        let key = openrouter_key(53);
+        std::fs::write(s.work.join("ex.py"), format!("k = '{key}'\n")).unwrap();
+        let cmd = backup_command_limited(s.work.to_str().unwrap(), None, "arena backup", s.skip, s.limit, None);
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        let o = std::process::Command::new("bash").arg("-c").arg(cmd).env("PATH", path).output().unwrap();
+        let (out, err) = (String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        assert_eq!((o.status.code(), parse_backup_report(&out).push_blocked.as_deref()), (Some(BACKUP_BLOCKED_EXIT), Some(KEY_LEFT)), "{out}{err}");
+        assert_eq!(s.git(&s.work, &["show", "HEAD:ex.py"]), format!("k = '{key}'"), "committed as it was, on the pod");
+        assert!(!s.origin_holds(&key), "the key reached origin");
     }
 
     /// Review: `redact_blob` failed open — a grep that couldn't run read as "no key", and a sed

@@ -646,7 +646,14 @@ GPU/progress dashboard, proxy/port-forwarding), behind a CLI and an interactive 
     never had it), the key redacted — same messages (a key in one redacted the same way), authors,
     dates — and pushed as a fast-forward, never forced, the commit alone (`--no-follow-tags`: a
     participant's `push.followTags` sent the annotated tags on it too, their messages unscanned);
-    files on disk untouched. **The course's own commits
+    files on disk untouched. **Right before the push, what goes out is scanned once more**, fail
+    closed (FIX10): any key still in those commits or files — in a commit's author, committer or
+    merged signed tag (headers the rewrite doesn't touch), in a binary file or a symlink (never
+    rewritten), or one a redaction missed — and nothing is pushed: `✗ <pod>: a key is still in
+    the unpushed commits of <branch> after the redaction — … so nothing was pushed. Take it out of
+    those commits on <pod> by hand`, the pod rsynced as for a refused push, every run until it's
+    out. `init-branches` pushes only a commit origin already has, and checks so before its push
+    (else nothing pushed, exit 1). **The course's own commits
     get no exemption** (FIX8): every exemption tried (FIX4B to FIX7) trusted something a pod could
     get wrong, and Live 7 found no key-like string in the real course's 2187 commits. What that
     leaves: if the course ever commits a key-like string, each pod that merges it pushes those

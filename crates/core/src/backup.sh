@@ -32,7 +32,10 @@
 #                              redacted, pushed as a fast-forward
 #   HEAL_ABORTED <why>         that rewrite stopped short (the branch moved meanwhile): the next run ends it (exit 1)
 #   PUSH_BLOCKED <reason>      GitHub's push protection still refuses the push — a secret the redaction
-#                              doesn't know; the reason names GitHub's secret type and path:line (exit 4)
+#                              doesn't know; the reason names GitHub's secret type and path:line (exit 4).
+#                              `PUSH_BLOCKED key left after redaction`: the last scan found a key still in
+#                              what would go out (a header, a binary file, a redaction that didn't take),
+#                              so nothing was pushed (exit 4)
 #   PUSH_FAILED                the push failed otherwise (the network, a non-fast-forward…; exit 1)
 # Any other failure exits non-zero via `set -e`.
 set -e
@@ -357,8 +360,9 @@ push_block_reason() {
 # (one more `cat-file --batch | grep -q`), and on a hit the rewrite runs: each commit's message
 # goes through the same sed as the files, and one whose message changes is rewritten — so are its
 # descendants (their parents change). A hit outside every message (a key in an author's name) is
-# no message's: the rewrite then changes nothing, every id kept. A rewrite for a file's key
-# redacts the messages of the commits it writes the same way.
+# no message's: the rewrite then changes nothing, every id kept — and the last scan, right before
+# the push, stops it there. A rewrite for a file's key redacts the messages of the commits it
+# writes the same way.
 git rev-list --reverse --topo-order "$TIP" --not --remotes=origin > "$T.commits"
 git rev-list --objects "$TIP" --not --remotes=origin | git cat-file --batch-check='%(objecttype) %(objectname) %(rest)' \
     | awk '$1 == "blob" { print $2 }' | sort -u > "$T.blobs"
@@ -423,6 +427,23 @@ fi
 if [ "$NEW" != "$TIP" ] && [ "$(git rev-parse HEAD)" != "$TIP" ]; then
     echo "HEAL_ABORTED $B moved while its unpushed commits were being redacted — the next backup redoes it"
     exit 1
+fi
+# A last scan of exactly what goes out, fail closed (review claude #1, FIX10): the commits and
+# blobs of `$NEW --not --remotes=origin`, by the same `scan_hits`. The rewrite above takes keys
+# out of commit messages and text files only, so a hit it couldn't redact went out with the
+# push: a key in a commit's header (an author's or committer's name or email, a `mergetag`
+# carrying a signed tag's message), in a file it never rewrites (a binary one, a symlink's
+# target), or one a redaction missed (the sed and the scan's grep drifting apart). Any hit:
+# nothing is pushed, `PUSH_BLOCKED key left after redaction`, and the pod is copied by rsync as
+# for any refused push (exit 4) — every run, until the key is taken out of the unpushed commits
+# by hand. Each step its own command under `set -e`: a rev-list or cat-file that fails stops the
+# run, never leaves a shorter list to scan.
+git rev-list --objects "$NEW" --not --remotes=origin > "$T.last"
+git cat-file --batch-check='%(objecttype) %(objectname) %(rest)' < "$T.last" > "$T.lastk"
+awk '$1 == "commit" || $1 == "blob" { print $2 }' "$T.lastk" > "$T.lasto"
+if [ -s "$T.lasto" ] && scan_hits "$T.lasto"; then
+    echo "PUSH_BLOCKED key left after redaction"
+    exit 4
 fi
 if git push --no-follow-tags origin "$NEW:refs/heads/$B" 2>"$T.push"; then pushed=1; else pushed=; fi
 no_bypass_url < "$T.push" >&2

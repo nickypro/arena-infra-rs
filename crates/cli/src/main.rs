@@ -22835,6 +22835,37 @@ mod remote_tests {
         assert!(fallback_lines(&unpushed[2..], &pulled).is_empty(), "never copied: never said to be");
     }
 
+    /// FIX10: the backup's own last scan finding a key left after the redaction (exit 4,
+    /// `PUSH_BLOCKED key left after redaction`) fails at the push like GitHub's refusal: the pod
+    /// goes to the fallback copy, and its line says what was left and what to do — never that
+    /// GitHub refused it, or that a pattern is missing.
+    #[tokio::test]
+    async fn a_key_left_after_the_redaction_fails_at_the_push_and_is_copied() {
+        let f = fleet_of(&[("bloom", 22002)]);
+        let fake = Arc::new(FakeRemote::new());
+        fake.script(&host(22002), [FakeReply::exit(4, "").with_stdout("BRANCH autocommit-b\nPUSH_BLOCKED key left after redaction\n")]);
+        let remote: Arc<dyn Remote> = fake.clone();
+        let jobs = targets(&f).into_iter().map(|(n, t)| (n, t, "backup".to_string())).collect();
+        let mut lines = Vec::new();
+        let tally = backup_fleet(&remote, jobs, REPO, |l| lines.push(l.to_string()), |_| {}).await;
+        assert_eq!(
+            lines,
+            ["[1/1] ✗ devtest-bloom: a key is still in the unpushed commits of autocommit-b after the redaction — in a commit's \
+              author, committer or merged tag, a binary file or a symlink, or a redaction that didn't take — so nothing was \
+              pushed. Take it out of those commits on devtest-bloom by hand"]
+        );
+        let why = "a key left in the unpushed commits after the redaction";
+        let left = Unpushed { pod: "devtest-bloom".into(), why: why.into(), branch: Some("autocommit-b".into()), at_push: true, wrong_origin: false, busy: None };
+        assert_eq!(tally.failed, ["devtest-bloom"]);
+        assert_eq!(tally.unpushed, [left]);
+        let pulled: anyhow::Result<Pulled> =
+            Ok(Pulled { failures: vec![], failed: vec![], snapshot_root: "/b/w41d5".into(), big_root: Some("/b/big".into()), whole: vec![] });
+        assert_eq!(
+            fallback_lines(&tally.unpushed, &pulled),
+            [format!("✗ devtest-bloom: git push failed ({why}) → files copied to /b/w41d5/devtest-bloom (and /b/big/devtest-bloom)")]
+        );
+    }
+
     /// [`backup_cfg`] with a configured repo, `o/r`: every backup checks each pod's `origin`.
     fn origin_cfg(base: &std::path::Path) -> Config {
         std::fs::create_dir_all(base).unwrap();
